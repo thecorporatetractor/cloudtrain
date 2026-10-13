@@ -10,6 +10,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -232,17 +233,23 @@ func TestLinkStatusesAndCapture(t *testing.T) {
 }
 
 func newFake(objs ...client.Object) client.Client {
-	return fake.NewClientBuilder().WithScheme(runtime.NewScheme()).WithObjects(objs...).Build()
+	s := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(s)
+	return fake.NewClientBuilder().WithScheme(s).WithObjects(objs...).Build()
 }
 
 func setReady(t *testing.T, c client.Client, name string) {
+	setCond(t, c, name, "Ready")
+}
+
+func setCond(t *testing.T, c client.Client, name, typ string) {
 	t.Helper()
 	o := &unstructured.Unstructured{}
 	o.SetGroupVersionKind(SubnetGVK)
 	if err := c.Get(context.Background(), client.ObjectKey{Name: name}, o); err != nil {
 		t.Fatal(err)
 	}
-	_ = unstructured.SetNestedSlice(o.Object, []any{map[string]any{"type": "Ready", "status": "True"}}, "status", "conditions")
+	_ = unstructured.SetNestedSlice(o.Object, []any{map[string]any{"type": typ, "status": "True"}}, "status", "conditions")
 	if err := c.Update(context.Background(), o); err != nil {
 		t.Fatal(err)
 	}
@@ -280,7 +287,20 @@ func TestManagerEnsureAndDelete(t *testing.T) {
 	if ready, _ := m.Ensure(ctx, p); ready {
 		t.Error("ready before subnets are")
 	}
+	vpc0 := &unstructured.Unstructured{}
+	vpc0.SetGroupVersionKind(VpcGVK)
+	if err := c.Get(ctx, client.ObjectKey{Name: p.VPC}, vpc0); err != nil {
+		t.Fatal(err)
+	}
+	_ = unstructured.SetNestedField(vpc0.Object, true, "status", "standby")
+	if err := c.Update(ctx, vpc0); err != nil {
+		t.Fatal(err)
+	}
 	setReady(t, c, p.Mgmt.Subnet)
+	setCond(t, c, p.Links[0].Segment.Subnet, "Validated")
+	if ready, _ := m.Ensure(ctx, p); ready {
+		t.Error("Validated is not Ready")
+	}
 	for _, l := range p.Links {
 		setReady(t, c, l.Segment.Subnet)
 	}

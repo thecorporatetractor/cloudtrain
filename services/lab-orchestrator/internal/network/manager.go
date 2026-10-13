@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -102,7 +103,6 @@ func (m *Manager) subnet(p *Plan, seg Segment, id string, _ *labsv1.LinkImpairme
 		"cidrBlock":  seg.CIDR.String(),
 		"gateway":    seg.Gateway.String(),
 		"excludeIps": []any{seg.Gateway.String()},
-		"namespaces": []any{p.Session.Namespace},
 	}
 	if seg.Provider != "" {
 		spec["provider"] = seg.Provider
@@ -145,8 +145,11 @@ func (m *Manager) Ensure(ctx context.Context, p *Plan) (bool, error) {
 			return false, fmt.Errorf("%s %s exists but does not belong to session %s/%s: %w",
 				got.GetKind(), got.GetName(), p.Session.Namespace, p.Session.Name, ErrConflict)
 		}
-		if got.GetKind() == SubnetGVK.Kind && !subnetReady(got) {
-			ready = false
+		switch got.GetKind() {
+		case SubnetGVK.Kind:
+			ready = ready && subnetReady(got)
+		case VpcGVK.Kind:
+			ready = ready && vpcReady(got)
 		}
 	}
 	return ready, nil
@@ -164,7 +167,14 @@ func subnetReady(o *unstructured.Unstructured) bool {
 		st, _ := cm["status"].(string)
 		cs = append(cs, metav1.Condition{Type: t, Status: metav1.ConditionStatus(st)})
 	}
+	// Validated only means the spec was accepted; Ready is set once the
+	// logical switch exists in OVN.
 	return meta.IsStatusConditionTrue(cs, "Ready")
+}
+
+func vpcReady(o *unstructured.Unstructured) bool {
+	standby, _, _ := unstructured.NestedBool(o.Object, "status", "standby")
+	return standby
 }
 
 // Delete removes every network object of the session (NADs, link subnets,
@@ -174,6 +184,18 @@ func subnetReady(o *unstructured.Unstructured) bool {
 // It returns done=false while objects are still terminating.
 func (m *Manager) Delete(ctx context.Context, s Session) (bool, error) {
 	sel := client.MatchingLabels(m.labels(s, ""))
+	// Segments go only after the session's pods are gone, so no port is
+	// left on a deleted logical switch.
+	if s.UID != "" {
+		pods := &corev1.PodList{}
+		if err := m.Client.List(ctx, pods, client.InNamespace(s.Namespace),
+			client.MatchingLabels{LabelSessionUID: string(s.UID), LabelManagedBy: ManagedBy}); err != nil {
+			return false, err
+		}
+		if len(pods.Items) > 0 {
+			return false, nil
+		}
+	}
 	done := true
 	for _, step := range []struct {
 		gvk schema.GroupVersionKind

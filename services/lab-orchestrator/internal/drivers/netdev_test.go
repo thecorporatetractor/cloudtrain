@@ -213,7 +213,13 @@ func TestLinkNetworkTopology(t *testing.T) {
 	if _, err := ln.CaptureTarget(sref, "edge-1", "eth9", network.CaptureOptions{}); !errors.Is(err, ErrUnsupported) {
 		t.Errorf("unknown end: %v", err)
 	}
-	// Teardown retries until everything is gone, then succeeds.
+	// Teardown waits for the session's pods, then removes the network.
+	if err := d.DestroyTopology(ctx, sref); !errors.Is(err, errNetworkTerminating) {
+		t.Fatalf("destroy with pods left: %v", err)
+	}
+	if err := d.ContainerDriver.Destroy(ctx, ref); err != nil {
+		t.Fatal(err)
+	}
 	var derr error
 	for i := 0; i < 5; i++ {
 		if derr = d.DestroyTopology(ctx, sref); derr == nil {
