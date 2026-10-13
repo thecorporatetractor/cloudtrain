@@ -22,6 +22,11 @@ export interface Config {
   /** Optional session TTL override in minutes (default: the controller's 2 x estimatedMinutes, min 30). */
   sessionTtlMinutes?: number;
   logLevel: string;
+  /** Postgres as the RLS-bound app role (cloudtrain_app). */
+  databaseUrl: string;
+  /** Postgres as the schema owner (migrations, seed). */
+  databaseOwnerUrl?: string;
+  databaseAppRole: string;
 }
 
 /** Relative paths in settings are relative to the repository root (pnpm runs the gateway from its package dir). */
@@ -46,5 +51,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     validateTimeoutMs: num(env.CT_VALIDATE_TIMEOUT_MS, 60_000),
     ...(ttl > 0 ? { sessionTtlMinutes: ttl } : {}),
     logLevel: env.CT_LOG_LEVEL ?? 'info',
+    databaseUrl: env.CT_DATABASE_URL ?? 'postgres://cloudtrain_app:app-dev-only@127.0.0.1:55432/cloudtrain',
+    ...(env.CT_DATABASE_OWNER_URL || env.NODE_ENV !== 'production' ? { databaseOwnerUrl: env.CT_DATABASE_OWNER_URL ?? 'postgres://cloudtrain_owner:owner-dev-only@127.0.0.1:55432/cloudtrain' } : {}),
+    databaseAppRole: env.CT_DATABASE_APP_ROLE ?? 'cloudtrain_app',
   };
 }
