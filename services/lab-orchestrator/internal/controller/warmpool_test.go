@@ -636,3 +636,43 @@ func TestHibernateUnsupportedNodeKeepsRunning(t *testing.T) {
 		}
 	}
 }
+
+func TestResumeWhileStillStoppingNoSetupRerun(t *testing.T) {
+	h := newHarness(t, template(), session())
+	h.cont.instance["workstation"] = "pod-a/0"
+	reg, err := drivers.NewRegistry(&slowHibernator{fakeDriver: h.cont}, hibernatingDriver{h.netdev})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.r.Drivers = reg
+	h.reconcile()
+	s := h.get()
+	s.Spec.Hibernate = true
+	if err := h.c.Update(context.Background(), s); err != nil {
+		t.Fatal(err)
+	}
+	h.reconcile()
+	s = h.get()
+	if c := cond(s, labsv1.ConditionHibernated); c == nil || c.Status != metav1.ConditionFalse || s.Status.Nodes[0].Phase != labsv1.NodeProvisioning {
+		t.Fatalf("expected a node still stopping: %+v %+v", c, s.Status.Nodes)
+	}
+	// Resume before the pod was gone; the new pod is a new instance.
+	h.cont.instance["workstation"] = "pod-b/0"
+	s.Spec.Hibernate = false
+	if err := h.c.Update(context.Background(), s); err != nil {
+		t.Fatal(err)
+	}
+	h.reconcile()
+	if s := h.get(); s.Status.Phase != labsv1.SessionReady || len(h.cont.execs) != 1 {
+		t.Errorf("phase %s, setup execs %d (want no re-run)", s.Status.Phase, len(h.cont.execs))
+	}
+}
+
+// slowHibernator hibernates but reports the node as still stopping.
+type slowHibernator struct{ *fakeDriver }
+
+func (d *slowHibernator) Hibernate(context.Context, drivers.NodeRef) error { return nil }
+
+func (d *slowHibernator) Status(context.Context, drivers.NodeRef) (drivers.NodeState, error) {
+	return drivers.NodeState{Phase: labsv1.NodeProvisioning, Message: "pod terminating"}, nil
+}

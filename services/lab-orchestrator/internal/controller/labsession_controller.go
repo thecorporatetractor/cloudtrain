@@ -307,12 +307,12 @@ func (r *LabSessionReconciler) reconcileSession(ctx context.Context, s *labsv1.L
 		// Resuming is not a reset: hibernated nodes come back with their
 		// state (persistent disks, the learner's home volume), so a new
 		// backing instance must not re-run setup over the learner's work.
-		// Forgetting their instance ids makes the next observation the
-		// baseline again.
+		// Forgetting the instance ids makes the next observation the
+		// baseline again. This covers every node, also those still stopping
+		// when the resume arrived; nodes that kept running report the same
+		// instance anyway.
 		for i := range st.Nodes {
-			if st.Nodes[i].Phase == labsv1.NodeHibernated {
-				st.Nodes[i].InstanceID = ""
-			}
+			st.Nodes[i].InstanceID = ""
 		}
 		r.setCondition(s, labsv1.ConditionHibernated, metav1.ConditionFalse, ReasonAwake, "session resumed")
 		r.setCondition(s, labsv1.ConditionReady, metav1.ConditionFalse, ReasonProvisioning, "resuming nodes")

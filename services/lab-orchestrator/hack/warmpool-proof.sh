@@ -40,6 +40,7 @@ wait_for() {
   done
 }
 jp() { K -n "$NS" get "$1" "$2" -o jsonpath="$3" 2>/dev/null; }
+hibernated() { [[ $(jp ls "$1" '{.status.conditions[?(@.type=="Hibernated")].status}') == True ]]; }
 phase_is() { [[ $(jp ls "$1" '{.status.phase}') == "$2" ]]; }
 pool_ready_is() { [[ $(jp wp "$1" '{.status.ready}') == "$2" ]]; }
 gone() { ! K -n "$NS" get "$@" >/dev/null 2>&1; }
@@ -144,7 +145,7 @@ EOF
   hdr "5. hibernate x1"
   t=$(now)
   K -n "$NS" patch ls x1 --type merge -p '{"spec":{"hibernate":true}}' >/dev/null
-  wait_for 300 "x1 Hibernated" phase_is x1 Hibernated && ok "Hibernated after $(since "$t")s"
+  wait_for 300 "x1 Hibernated" hibernated x1 && ok "Hibernated (all nodes stopped) after $(since "$t")s"
   K -n "$NS" get ls x1 -o json | jq -c '{phase: .status.phase, hibernated: .status.hibernated, endpoints: (.status.endpoints // []), nodes: [.status.nodes[] | {name, phase, message}]}'
   echo "--- pods / statefulsets / PVCs of the pooled session $POOLED"
   K -n "$NS" get pods,sts,pvc -l "labs.cloudtrain.dev/session=$POOLED" -o wide 2>&1
@@ -219,7 +220,7 @@ if [[ $PART == kubeadm ]]; then
   hdr "3. hibernate k1 (runStrategy Halted, entry pod deleted)"
   t=$(now)
   K -n "$NS" patch ls k1 --type merge -p '{"spec":{"hibernate":true}}' >/dev/null
-  wait_for 600 "k1 Hibernated" phase_is k1 Hibernated && ok "Hibernated after $(since "$t")s"
+  wait_for 600 "k1 Hibernated" hibernated k1 && ok "Hibernated (all VMs stopped) after $(since "$t")s"
   K -n "$NS" get vm,vmi,pods,pvc
   [[ -z $(K -n "$NS" get vmi -o name) ]] && ok "no VMI runs while hibernated" || bad "VMIs still running"
   [[ -z $(K -n "$NS" get pods -o name | grep -v importer) ]] && ok "no pod runs while hibernated" || bad "pods still running"
