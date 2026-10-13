@@ -1,7 +1,7 @@
 import type { Lab, LabSummary, Path, DomainInfo, Topology, LabCheck, LabHint } from '@/api/types';
 
 /* ------------------------------------------------------------------ */
-/* Reusable topologies (fictional org: Tessera Freight)                */
+/* Reusable topologies (fictional org: Quillmoor Logistics)                */
 /* ------------------------------------------------------------------ */
 
 const orchardTopology: Topology = {
@@ -122,7 +122,7 @@ export const labs: Lab[] = [
       tags: ['network-policy', 'segmentation'],
       version: 3,
     },
-    `Tessera Freight runs its card-settlement service in the \`payments\` namespace of the **orchard** cluster. An internal review found that any pod in the cluster can reach the settlement API.
+    `Quillmoor Logistics runs its card-settlement service in the \`payments\` namespace of the **orchard** cluster. An internal review found that any pod in the cluster can reach the settlement API.
 
 Lock the namespace down so that:
 
@@ -220,7 +220,7 @@ Work from the \`workstation\` jumphost. The kubeconfig context for the cluster i
   ),
   lab(
     { id: 'orchard-ingress-tls-rotation', title: 'Rotate the expiring TLS certificate on the portal ingress', domain: 'kubernetes', frameworks: ['cka:services-networking', 'cks:cluster-setup'], difficulty: 'easy', estimatedMinutes: 20, tags: ['ingress', 'tls'] },
-    `The certificate behind \`portal.tessera.internal\` expires tomorrow. Issue a new one from the internal CA on the jumphost and rotate the Secret without downtime.`,
+    `The certificate behind \`portal.quillmoor.internal\` expires tomorrow. Issue a new one from the internal CA on the jumphost and rotate the Secret without downtime.`,
     ['Generate a new key and CSR', 'Replace the TLS secret', 'Confirm the ingress serves the new certificate'],
     orchardTopology,
     [

@@ -36,7 +36,7 @@ Chromium (playwright-core) and writes `docs/screenshots/real/`.
 | `src/lib/remoteShell.ts` | Real-mode terminal: xterm.js over the gateway WebSocket. |
 | `src/lib/personalize.ts` | Fills a session's `{{params}}` and revealed hints into the lab. |
 | `src/api` | Query hooks; types come from `packages/api-types` (shared with the gateway); `mode.ts` picks mock or real. |
-| `src/mocks` | MSW handlers and fixtures. Shapes follow `packages/lab-schema` (`cloudtrain.dev/v3`). All names are fictional (Tessera Freight). |
+| `src/mocks` | MSW handlers and fixtures. Shapes follow `packages/lab-schema` (`cloudtrain.dev/v3`). All names are fictional (Quillmoor Logistics). |
 | `src/routes` | One file per screen: Home, Catalog, LabOverview, Workspace, Skills, Studio, StudioDraft, Team. |
 | `src/app` | Shell (nav, theme, user menu, toasts), command palette, shortcut cheatsheet. |
 
