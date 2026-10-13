@@ -167,13 +167,13 @@ func vclusterFixture(t *testing.T, replicas int32) (*VClusterDriver, client.Clie
 	tpl := kubeadmTopology()
 	ref := NodeRef{Session: testSession(), Template: tpl, Node: tpl.Topology.Nodes[3]}
 	rel := VClusterRelease(ref.Session, ref.Node.Name)
-	sts := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: rel, Namespace: "labs", Labels: SessionLabels(ref.Session)},
+	sts := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: rel, Namespace: VClusterNamespace(ref.Session, ref.Node.Name), Labels: SessionLabels(ref.Session)},
 		Spec: appsv1.StatefulSetSpec{Replicas: ptr.To(replicas)}}
-	cp := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: rel + "-0", Namespace: "labs", UID: "cp-uid",
+	cp := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: rel + "-0", Namespace: VClusterNamespace(ref.Session, ref.Node.Name), UID: "cp-uid",
 		Labels: map[string]string{"app": "vcluster", "release": rel}}}
-	synced := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "web-x-dock-" + rel, Namespace: "labs",
+	synced := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "web-x-dock-" + rel, Namespace: VClusterNamespace(ref.Session, ref.Node.Name),
 		Labels: map[string]string{LabelVClusterManagedBy: rel}}}
-	data := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: DataClaimName(rel), Namespace: "labs", UID: "data-uid",
+	data := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: DataClaimName(rel), Namespace: VClusterNamespace(ref.Session, ref.Node.Name), UID: "data-uid",
 		Labels: map[string]string{"app": "vcluster", "release": rel}}}
 	c := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(sts, cp, synced, data).Build()
 	return &VClusterDriver{Client: c, Persistent: true}, c, ref, rel
@@ -202,10 +202,10 @@ func TestVClusterHibernateResume(t *testing.T) {
 		t.Fatal(err)
 	}
 	sts := &appsv1.StatefulSet{}
-	if err := c.Get(ctx, client.ObjectKey{Namespace: "labs", Name: rel}, sts); err != nil || *sts.Spec.Replicas != 0 {
+	if err := c.Get(ctx, client.ObjectKey{Namespace: VClusterNamespace(ref.Session, ref.Node.Name), Name: rel}, sts); err != nil || *sts.Spec.Replicas != 0 {
 		t.Fatalf("statefulset not scaled to zero: %v %v", err, sts.Spec.Replicas)
 	}
-	if err := c.Get(ctx, client.ObjectKey{Namespace: "labs", Name: "web-x-dock-" + rel}, &corev1.Pod{}); !apierrors.IsNotFound(err) {
+	if err := c.Get(ctx, client.ObjectKey{Namespace: VClusterNamespace(ref.Session, ref.Node.Name), Name: "web-x-dock-" + rel}, &corev1.Pod{}); !apierrors.IsNotFound(err) {
 		t.Errorf("synced workload pod kept running: %v", err)
 	}
 	// The StatefulSet controller removes the control-plane pod.
@@ -213,13 +213,13 @@ func TestVClusterHibernateResume(t *testing.T) {
 	if st.Phase != labsv1.NodeProvisioning {
 		t.Errorf("status with pod left = %+v", st)
 	}
-	if err := c.Delete(ctx, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: rel + "-0", Namespace: "labs"}}); err != nil {
+	if err := c.Delete(ctx, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: rel + "-0", Namespace: VClusterNamespace(ref.Session, ref.Node.Name)}}); err != nil {
 		t.Fatal(err)
 	}
 	if st, _ := d.Status(ctx, ref); st.Phase != labsv1.NodeHibernated {
 		t.Errorf("status = %+v", st)
 	}
-	if err := c.Get(ctx, client.ObjectKey{Namespace: "labs", Name: DataClaimName(rel)}, &corev1.PersistentVolumeClaim{}); err != nil {
+	if err := c.Get(ctx, client.ObjectKey{Namespace: VClusterNamespace(ref.Session, ref.Node.Name), Name: DataClaimName(rel)}, &corev1.PersistentVolumeClaim{}); err != nil {
 		t.Errorf("database volume lost on hibernate: %v", err)
 	}
 	// Resume scales back up.
@@ -228,7 +228,7 @@ func TestVClusterHibernateResume(t *testing.T) {
 	if err != nil || st.Phase != labsv1.NodeProvisioning {
 		t.Fatalf("provision = %+v %v", st, err)
 	}
-	if err := c.Get(ctx, client.ObjectKey{Namespace: "labs", Name: rel}, sts); err != nil || *sts.Spec.Replicas != 1 {
+	if err := c.Get(ctx, client.ObjectKey{Namespace: VClusterNamespace(ref.Session, ref.Node.Name), Name: rel}, sts); err != nil || *sts.Spec.Replicas != 1 {
 		t.Errorf("not scaled up: %v", sts.Spec.Replicas)
 	}
 }
@@ -247,15 +247,15 @@ func TestVClusterResetDeletesDatabase(t *testing.T) {
 	if err := d.Reset(ctx, ref); !errors.Is(err, ErrInProgress) {
 		t.Fatalf("reset with the control plane still running: %v", err)
 	}
-	_ = c.Delete(ctx, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: rel + "-0", Namespace: "labs"}})
+	_ = c.Delete(ctx, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: rel + "-0", Namespace: VClusterNamespace(ref.Session, ref.Node.Name)}})
 	if err := d.Reset(ctx, ref); err != nil {
 		t.Fatalf("reset: %v", err)
 	}
-	if err := c.Get(ctx, client.ObjectKey{Namespace: "labs", Name: DataClaimName(rel)}, &corev1.PersistentVolumeClaim{}); !apierrors.IsNotFound(err) {
+	if err := c.Get(ctx, client.ObjectKey{Namespace: VClusterNamespace(ref.Session, ref.Node.Name), Name: DataClaimName(rel)}, &corev1.PersistentVolumeClaim{}); !apierrors.IsNotFound(err) {
 		t.Errorf("database volume survived reset: %v", err)
 	}
 	sts := &appsv1.StatefulSet{}
-	if err := c.Get(ctx, client.ObjectKey{Namespace: "labs", Name: rel}, sts); err != nil || *sts.Spec.Replicas != 0 {
+	if err := c.Get(ctx, client.ObjectKey{Namespace: VClusterNamespace(ref.Session, ref.Node.Name), Name: rel}, sts); err != nil || *sts.Spec.Replicas != 0 {
 		t.Errorf("replicas = %v", sts.Spec.Replicas)
 	}
 }
@@ -264,7 +264,7 @@ func TestVClusterWithoutPersistenceKeepsRunning(t *testing.T) {
 	tpl := kubeadmTopology()
 	ref := NodeRef{Session: testSession(), Template: tpl, Node: tpl.Topology.Nodes[3]}
 	rel := VClusterRelease(ref.Session, ref.Node.Name)
-	dep := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: rel, Namespace: "labs", Labels: SessionLabels(ref.Session)}}
+	dep := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: rel, Namespace: VClusterNamespace(ref.Session, ref.Node.Name), Labels: SessionLabels(ref.Session)}}
 	c := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(dep).Build()
 	if err := (&VClusterDriver{Client: c}).Hibernate(context.Background(), ref); !errors.Is(err, ErrUnsupported) {
 		t.Errorf("emptyDir vcluster: %v", err)
@@ -407,5 +407,38 @@ func TestKubeadmResumeScript(t *testing.T) {
 	}
 	if strings.Contains(s, "kubectl label") {
 		t.Error("resume must not re-apply template labels over learner changes")
+	}
+}
+
+func TestVClusterOwnHostNamespace(t *testing.T) {
+	ctx := context.Background()
+	tpl := kubeadmTopology()
+	ref := NodeRef{Session: testSession(), Template: tpl, Node: tpl.Topology.Nodes[3]}
+	c := fake.NewClientBuilder().WithScheme(testScheme(t)).Build()
+	d := &VClusterDriver{Client: c}
+	if ready, err := d.ensureHostNamespace(ctx, ref); err != nil || !ready {
+		t.Fatalf("ensure = %v %v", ready, err)
+	}
+	ns := &corev1.Namespace{}
+	if err := c.Get(ctx, client.ObjectKey{Name: VClusterNamespace(ref.Session, ref.Node.Name)}, ns); err != nil {
+		t.Fatal(err)
+	}
+	if ns.Labels[LabelSessionUID] != "uid-1" || ns.Labels[LabelSessionNamespace] != "labs" {
+		t.Errorf("labels = %v", ns.Labels)
+	}
+	if err := d.Destroy(ctx, ref); !errors.Is(err, ErrInProgress) {
+		t.Fatalf("first destroy pass: %v", err)
+	}
+	if err := d.Destroy(ctx, ref); err != nil {
+		t.Fatalf("destroy: %v", err)
+	}
+	if err := c.Get(ctx, client.ObjectKey{Name: ns.Name}, &corev1.Namespace{}); !apierrors.IsNotFound(err) {
+		t.Errorf("host namespace survived destroy: %v", err)
+	}
+	// Two sessions in one namespace get two host namespaces.
+	other := testSession()
+	other.Name, other.UID = "s2", "uid-2"
+	if VClusterNamespace(other, "qm-virt") == ns.Name {
+		t.Error("host namespaces collide")
 	}
 }

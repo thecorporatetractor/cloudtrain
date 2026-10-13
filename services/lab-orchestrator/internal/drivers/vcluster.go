@@ -102,6 +102,45 @@ func VClusterRelease(s *labsv1.LabSession, node string) string {
 	return "vc-" + hex.EncodeToString(sum[:])[:10]
 }
 
+// VClusterNamespace is the host namespace of a virtual cluster node. Every
+// vcluster gets its own namespace (vcluster >= 0.25 refuses to start next to
+// another vcluster in the same namespace, and a session namespace holds many
+// sessions: warm pools, several learners). It is cluster-scoped, so it
+// carries the session labels (plus labs.cloudtrain.dev/session-namespace)
+// instead of an owner reference and is deleted explicitly by Destroy.
+func VClusterNamespace(s *labsv1.LabSession, node string) string {
+	return "ct-" + VClusterRelease(s, node)
+}
+
+// LabelSessionNamespace on cluster-scoped session objects names the
+// session's namespace.
+const LabelSessionNamespace = "labs.cloudtrain.dev/session-namespace"
+
+func (d *VClusterDriver) hostNS(ref NodeRef) string { return VClusterNamespace(ref.Session, ref.Node.Name) }
+
+// ensureHostNamespace creates the vcluster's namespace. ready=false while a
+// previous one is still terminating.
+func (d *VClusterDriver) ensureHostNamespace(ctx context.Context, ref NodeRef) (bool, error) {
+	ns := &corev1.Namespace{}
+	err := d.reader().Get(ctx, client.ObjectKey{Name: d.hostNS(ref)}, ns)
+	switch {
+	case err == nil && !ownedBySession(ref.Session, ns):
+		return false, fmt.Errorf("namespace %s exists but does not belong to session %s: %w", ns.Name, ref.Session.Name, ErrConflict)
+	case err == nil:
+		return ns.DeletionTimestamp == nil, nil
+	case !apierrors.IsNotFound(err):
+		return false, err
+	}
+	labels := SessionLabels(ref.Session)
+	labels[LabelSessionNamespace] = LabelValue(ref.Namespace())
+	labels[LabelNode] = LabelValue(ref.Node.Name)
+	ns = &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: d.hostNS(ref), Labels: labels}}
+	if err := d.Client.Create(ctx, ns); err != nil && !apierrors.IsAlreadyExists(err) {
+		return false, err
+	}
+	return true, nil
+}
+
 // VClusterReleases lists the releases of the topology's virtual clusters.
 func VClusterReleases(s *labsv1.LabSession, topo *labsv1.Topology) []string {
 	var out []string
@@ -122,7 +161,7 @@ func (d *VClusterDriver) workloadPolicy(ref NodeRef, release string) *networking
 	udp, tcp := corev1.ProtocolUDP, corev1.ProtocolTCP
 	dns, api := intstr.FromInt32(53), intstr.FromInt32(8443)
 	np := &networkingv1.NetworkPolicy{
-		ObjectMeta: metav1.ObjectMeta{Name: d.policyName(release), Namespace: ref.Namespace(), Labels: SessionLabels(ref.Session)},
+		ObjectMeta: metav1.ObjectMeta{Name: d.policyName(release), Namespace: d.hostNS(ref), Labels: SessionLabels(ref.Session)},
 		Spec: networkingv1.NetworkPolicySpec{
 			PodSelector: metav1.LabelSelector{MatchLabels: map[string]string{LabelVClusterManagedBy: release}},
 			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeEgress},
@@ -166,7 +205,7 @@ func (d *VClusterDriver) values(ref NodeRef, release string) ([]byte, error) {
 	}
 	return yaml.Marshal(map[string]any{
 		"controlPlane": map[string]any{
-			"proxy": map[string]any{"extraSANs": []string{release + "." + ref.Namespace() + ".svc"}},
+			"proxy": map[string]any{"extraSANs": []string{release + "." + d.hostNS(ref) + ".svc"}},
 			"statefulSet": map[string]any{
 				"persistence": map[string]any{"volumeClaim": vc},
 				"labels":      labels,
@@ -180,10 +219,17 @@ func (d *VClusterDriver) values(ref NodeRef, release string) ([]byte, error) {
 // kubeconfig Secret.
 func (d *VClusterDriver) Provision(ctx context.Context, ref NodeRef) (NodeState, error) {
 	release := VClusterRelease(ref.Session, ref.Node.Name)
-	np := d.workloadPolicy(ref, release)
-	if err := setOwner(ref.Session, np, d.Client); err != nil {
-		return NodeState{Phase: labsv1.NodeFailed, Message: err.Error()}, err
+	ready, err := d.ensureHostNamespace(ctx, ref)
+	if err != nil {
+		if IsPermanent(err) {
+			return NodeState{Phase: labsv1.NodeFailed, Message: err.Error()}, err
+		}
+		return NodeState{Phase: labsv1.NodeProvisioning, Message: err.Error()}, err
 	}
+	if !ready {
+		return NodeState{Phase: labsv1.NodeProvisioning, Message: "previous vcluster namespace is terminating"}, nil
+	}
+	np := d.workloadPolicy(ref, release)
 	if err := ensure(ctx, d.Client, d.reader(), ref.Session, np); err != nil {
 		return NodeState{Phase: labsv1.NodeProvisioning, Message: err.Error()}, err
 	}
@@ -214,7 +260,7 @@ func (d *VClusterDriver) Provision(ctx context.Context, ref NodeRef) (NodeState,
 // workload returns the vcluster control plane (a Deployment without
 // persistence, a StatefulSet with it), or nil if not installed.
 func (d *VClusterDriver) workload(ctx context.Context, ref NodeRef, release string) (client.Object, error) {
-	key := client.ObjectKey{Namespace: ref.Namespace(), Name: release}
+	key := client.ObjectKey{Namespace: d.hostNS(ref), Name: release}
 	for _, obj := range []client.Object{&appsv1.Deployment{}, &appsv1.StatefulSet{}} {
 		err := d.reader().Get(ctx, key, obj)
 		if err == nil {
@@ -230,7 +276,7 @@ func (d *VClusterDriver) workload(ctx context.Context, ref NodeRef, release stri
 // controlPlanePods lists the vcluster control-plane pods of a release.
 func (d *VClusterDriver) controlPlanePods(ctx context.Context, ref NodeRef, release string) ([]corev1.Pod, error) {
 	pods := &corev1.PodList{}
-	err := d.reader().List(ctx, pods, client.InNamespace(ref.Namespace()), client.MatchingLabels{"app": "vcluster", "release": release})
+	err := d.reader().List(ctx, pods, client.InNamespace(d.hostNS(ref)), client.MatchingLabels{"app": "vcluster", "release": release})
 	return pods.Items, err
 }
 
@@ -251,7 +297,7 @@ func (d *VClusterDriver) install(ctx context.Context, ref NodeRef, release strin
 	if err := os.WriteFile(overlay, vals, 0o600); err != nil {
 		return err
 	}
-	args := []string{"upgrade", "--install", release, d.Chart, "--namespace", ref.Namespace()}
+	args := []string{"upgrade", "--install", release, d.Chart, "--namespace", d.hostNS(ref)}
 	if d.ValuesFile != "" {
 		args = append(args, "-f", d.ValuesFile)
 	}
@@ -303,14 +349,14 @@ func (d *VClusterDriver) observe(ctx context.Context, ref NodeRef, release strin
 }
 
 func (d *VClusterDriver) server(ref NodeRef, release string) string {
-	return "https://" + release + "." + ref.Namespace() + ".svc:443"
+	return "https://" + release + "." + d.hostNS(ref) + ".svc:443"
 }
 
 // publish converts vcluster's own kubeconfig Secret (vc-<release>) into the
 // node's kubeconfig Secret.
 func (d *VClusterDriver) publish(ctx context.Context, ref NodeRef, release, instance string) error {
 	src := &corev1.Secret{}
-	if err := d.reader().Get(ctx, client.ObjectKey{Namespace: ref.Namespace(), Name: "vc-" + release}, src); err != nil {
+	if err := d.reader().Get(ctx, client.ObjectKey{Namespace: d.hostNS(ref), Name: "vc-" + release}, src); err != nil {
 		if apierrors.IsNotFound(err) {
 			return fmt.Errorf("waiting for vcluster kubeconfig")
 		}
@@ -408,7 +454,7 @@ func (d *VClusterDriver) Reset(ctx context.Context, ref NodeRef) error {
 // deleteSynced deletes the objects vcluster synced into the host namespace.
 func (d *VClusterDriver) deleteSynced(ctx context.Context, ref NodeRef, release string) error {
 	sel := client.MatchingLabels{LabelVClusterManagedBy: release}
-	ns := client.InNamespace(ref.Namespace())
+	ns := client.InNamespace(d.hostNS(ref))
 	for _, obj := range []client.Object{&corev1.Pod{}, &corev1.Service{}, &corev1.ConfigMap{}, &corev1.Secret{},
 		&corev1.PersistentVolumeClaim{}, &corev1.ServiceAccount{}, &corev1.Endpoints{}} {
 		if err := d.Client.DeleteAllOf(ctx, obj, ns, sel); err != nil && !apierrors.IsNotFound(err) {
@@ -433,7 +479,7 @@ func (d *VClusterDriver) Destroy(ctx context.Context, ref NodeRef) error {
 		if d.Helm == nil {
 			return &NotImplementedError{Driver: labsv1.DriverK8sCluster, Backend: "vcluster", Op: "uninstall without helm"}
 		}
-		if out, err := d.Helm.Helm(ctx, "uninstall", release, "--namespace", ref.Namespace(), "--ignore-not-found"); err != nil {
+		if out, err := d.Helm.Helm(ctx, "uninstall", release, "--namespace", d.hostNS(ref), "--ignore-not-found"); err != nil {
 			return fmt.Errorf("%w: %s", err, out)
 		}
 	}
@@ -441,10 +487,10 @@ func (d *VClusterDriver) Destroy(ctx context.Context, ref NodeRef) error {
 		return err
 	}
 	for _, obj := range []client.Object{
-		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: ref.Namespace(), Name: "vc-" + release}},
-		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: ref.Namespace(), Name: "vc-config-" + release}},
-		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: ref.Namespace(), Name: release + "-certs"}},
-		&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: ref.Namespace(), Name: "vc-" + release}},
+		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: d.hostNS(ref), Name: "vc-" + release}},
+		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: d.hostNS(ref), Name: "vc-config-" + release}},
+		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: d.hostNS(ref), Name: release + "-certs"}},
+		&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: d.hostNS(ref), Name: "vc-" + release}},
 	} {
 		if err := d.Client.Delete(ctx, obj); err != nil && !apierrors.IsNotFound(err) {
 			return err
@@ -452,7 +498,7 @@ func (d *VClusterDriver) Destroy(ctx context.Context, ref NodeRef) error {
 	}
 	// The chart's cluster-scoped RBAC: helm uninstall misses it when the
 	// release record went first (e.g. the whole namespace is being deleted).
-	crName := "vc-" + release + "-v-" + ref.Namespace()
+	crName := "vc-" + release + "-v-" + d.hostNS(ref)
 	for _, obj := range []client.Object{
 		&rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: crName}},
 		&rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: crName}},
@@ -463,7 +509,7 @@ func (d *VClusterDriver) Destroy(ctx context.Context, ref NodeRef) error {
 	}
 	for _, obj := range []client.Object{
 		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: ref.Namespace(), Name: KubeconfigSecretName(ref)}},
-		&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Namespace: ref.Namespace(), Name: d.policyName(release)}},
+		&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Namespace: d.hostNS(ref), Name: d.policyName(release)}},
 	} {
 		if _, err := deleteIfOwned(ctx, d.Client, d.reader(), ref.Session, obj); err != nil {
 			return err
@@ -476,7 +522,7 @@ func (d *VClusterDriver) Destroy(ctx context.Context, ref NodeRef) error {
 		return err
 	}
 	pods := &corev1.PodList{}
-	if err := d.reader().List(ctx, pods, client.InNamespace(ref.Namespace()), client.MatchingLabels{LabelVClusterManagedBy: release}); err != nil {
+	if err := d.reader().List(ctx, pods, client.InNamespace(d.hostNS(ref)), client.MatchingLabels{LabelVClusterManagedBy: release}); err != nil {
 		return err
 	}
 	cps, err := d.controlPlanePods(ctx, ref, release)
@@ -488,6 +534,13 @@ func (d *VClusterDriver) Destroy(ctx context.Context, ref NodeRef) error {
 	}
 	if !dataGone {
 		return inProgress("vcluster %s data volume is being deleted", release)
+	}
+	nsGone, err := deleteIfOwned(ctx, d.Client, d.reader(), ref.Session, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: d.hostNS(ref)}})
+	if err != nil {
+		return err
+	}
+	if !nsGone {
+		return inProgress("vcluster namespace %s is terminating", d.hostNS(ref))
 	}
 	return nil
 }
@@ -501,7 +554,7 @@ func DataClaimName(release string) string { return "data-" + release + "-0" }
 // (an emptyDir database dies with the pod).
 func (d *VClusterDriver) instance(ctx context.Context, ref NodeRef, release string, pod *corev1.Pod) (string, error) {
 	pvc := &corev1.PersistentVolumeClaim{}
-	err := d.reader().Get(ctx, client.ObjectKey{Namespace: ref.Namespace(), Name: DataClaimName(release)}, pvc)
+	err := d.reader().Get(ctx, client.ObjectKey{Namespace: d.hostNS(ref), Name: DataClaimName(release)}, pvc)
 	switch {
 	case err == nil:
 		return "pvc:" + string(pvc.UID), nil
@@ -557,7 +610,7 @@ func (d *VClusterDriver) Hibernate(ctx context.Context, ref NodeRef) error {
 		}
 	}
 	pods := &corev1.PodList{}
-	if err := d.reader().List(ctx, pods, client.InNamespace(ref.Namespace()), client.MatchingLabels{LabelVClusterManagedBy: release}); err != nil {
+	if err := d.reader().List(ctx, pods, client.InNamespace(d.hostNS(ref)), client.MatchingLabels{LabelVClusterManagedBy: release}); err != nil {
 		return err
 	}
 	for i := range pods.Items {
@@ -583,7 +636,7 @@ func (d *VClusterDriver) hibernateState(ctx context.Context, ref NodeRef, releas
 		return NodeState{}, err
 	}
 	pods := &corev1.PodList{}
-	if err := d.reader().List(ctx, pods, client.InNamespace(ref.Namespace()), client.MatchingLabels{LabelVClusterManagedBy: release}); err != nil {
+	if err := d.reader().List(ctx, pods, client.InNamespace(d.hostNS(ref)), client.MatchingLabels{LabelVClusterManagedBy: release}); err != nil {
 		return NodeState{}, err
 	}
 	if n := len(cps) + len(pods.Items); n > 0 {
@@ -622,7 +675,7 @@ func (d *VClusterDriver) resetPersistent(ctx context.Context, ref NodeRef, relea
 // it is identified by name and by the release's StatefulSet selector labels.
 func (d *VClusterDriver) deleteData(ctx context.Context, ref NodeRef, release string) (bool, error) {
 	pvc := &corev1.PersistentVolumeClaim{}
-	err := d.reader().Get(ctx, client.ObjectKey{Namespace: ref.Namespace(), Name: DataClaimName(release)}, pvc)
+	err := d.reader().Get(ctx, client.ObjectKey{Namespace: d.hostNS(ref), Name: DataClaimName(release)}, pvc)
 	if apierrors.IsNotFound(err) {
 		return true, nil
 	}
@@ -638,7 +691,7 @@ func (d *VClusterDriver) deleteData(ctx context.Context, ref NodeRef, release st
 			return apierrors.IsNotFound(err), client.IgnoreNotFound(err)
 		}
 		// Without a protection finalizer the claim is gone right away.
-		if err := d.reader().Get(ctx, client.ObjectKey{Namespace: ref.Namespace(), Name: DataClaimName(release)}, pvc); apierrors.IsNotFound(err) {
+		if err := d.reader().Get(ctx, client.ObjectKey{Namespace: d.hostNS(ref), Name: DataClaimName(release)}, pvc); apierrors.IsNotFound(err) {
 			return true, nil
 		}
 	}

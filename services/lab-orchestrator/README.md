@@ -9,7 +9,7 @@ see `packages/lab-schema`) into running, isolated topologies.
 |---|---|
 | `LabTemplate` (`lt`) | Compiled, immutable lab definition: source metadata + digest, params, topology (nodes, links, entry), setup/teardown actions, checks, hints, misconceptions, solution. `{{params}}` stay unresolved; the spec is immutable (CEL rule). |
 | `LabSession` (`ls`) | One learner attempt: `templateRef`, `learner`, `seed`, `ttl`/`expiresAt`, `hibernate`, optional `warmPoolRef`. `resetGeneration`. Status: phase (`Pending`, `Provisioning`, `Ready`, `Grading`, `Hibernated`, `Expired`, `Failed`), recorded topology, setup progress, conditions, resolved params, per-node status, access endpoints, entry node, expiry. |
-| `WarmPool` (`wp`) | `templateRef` + `size`; status reports the `ready` count. (Controller not built yet.) |
+| `WarmPool` (`wp`) | `templateRef`, `size`, `maxSurge`, `maxIdle`; keeps `size` Ready, unclaimed sessions; status `ready` / `provisioning` / `claimed` + conditions `Ready`, `Degraded` (see "Warm pools"). |
 
 CRDs are generated into `config/crd`, RBAC into `config/rbac`.
 
@@ -41,8 +41,8 @@ an object it did not create (`ErrConflict`).
 | Driver | Backend | What it builds |
 |---|---|---|
 | `container` | Pod + ClusterIP Service (RuntimeClass, e.g. `kata`) | Image from the catalog. The **entry node** gets an admin sidecar, host aliases for every VM host and, with VMs, a second NIC on the lab network. |
-| `vm` | KubeVirt `VirtualMachine` | Catalog containerDisk on the lab network; cloud-init: `learner` (key, passwordless sudo), root with the admin key only, pinned host key, static `/etc/hosts`. Ready once cloud-init finished. |
-| `k8s-cluster` `virtual` | vcluster (Helm, vendored chart + `deploy/vcluster/values.yaml`) | One vcluster per node, embedded DB in an emptyDir (no PVC), kubeconfig rewritten to `https://<release>.<ns>.svc` and published as `<node>-kubeconfig`; synced workloads isolated by a NetworkPolicy. |
+| `vm` | KubeVirt `VirtualMachine` | Catalog image on the lab network, root disk a CDI DataVolume imported from the containerDisk (`--vm-disks=persistent`, default) or the containerDisk itself; cloud-init: `learner` (key, passwordless sudo), root with the admin key only, pinned host key, static `/etc/hosts`. Ready once cloud-init finished. |
+| `k8s-cluster` `virtual` | vcluster (Helm, vendored chart + `deploy/vcluster/values.yaml`) | One vcluster per node, embedded DB on a StatefulSet PVC (`--vcluster-persistence`; emptyDir without it), kubeconfig rewritten to `https://<release>.<ns>.svc` and published as `<node>-kubeconfig`; synced workloads isolated by a NetworkPolicy. |
 | `k8s-cluster` `kubeadm` | one KubeVirt VM per `cluster.nodes[]` | The orchestrator owns the PKI (CA, bootstrap token, admin/learner client certs, host keys), so kubeconfigs exist before boot. Control plane: `kubeadm init` with the pre-seeded CA, version = the image's kubeadm, CNI via the image's `/opt/cloudtrain/bin/cni-install <podCIDR>` (fallback: bundled Flannel manifest), pod CIDR 10.244.0.0/16. Workers join with a pinned CA hash. Declared taints are exact (`[]` = untainted), labels applied after join, `state: notready` = joined, Ready once, then kubelet stopped and disabled. Ready once every member matches its declared state and CoreDNS is available. |
 | `netdev` | Pod per device (FRR); vrnetlab VMs / Clabernetes later | implemented for FRR (see "Lab network and netdev") |
 
@@ -209,7 +209,8 @@ mutation, checks, capture) and `hack/netdev-proof.sh` is the end-to-end proof
    expiry it destroys all recorded nodes and only then sets `Expired` (terminal).
 4. Records the resolved topology in status before provisioning anything.
 5. `spec.hibernate`: hibernates nodes whose driver supports it, withdraws
-   endpoints, phase `Hibernated`.
+   endpoints, phase `Hibernated`; resuming does **not** re-run setup (see
+   "Hibernate, resume, reset").
 6. `spec.resetGeneration` above `status.observedResetGeneration`: `Reset`s every
    node and re-runs setup.
 7. Provisions every node (`NodesReady`); fails the session after
@@ -228,8 +229,97 @@ Kubernetes authn/authz when set), `--watch-namespace`, `--leader-elect`,
 `--max-concurrent-reconciles`, `--provision-timeout`, `--image-registry`,
 `--runtime-class`, `--image-catalog`, `--admin-image-ref`, `--helm`,
 `--vcluster-chart`, `--vcluster-values`, `--session-selector`,
-`--leader-election-id`, `--net-tools-image` (default `nettools:1`). The cache only holds Pods/Services labelled
+`--leader-election-id`, `--net-tools-image` (default `nettools:1`),
+`--persistent-home`, `--vcluster-persistence`, `--vm-disks`
+(`persistent`|`ephemeral`), `--storage-class`. The cache only holds Pods/Services labelled
 `app.kubernetes.io/managed-by=cloudtrain-lab-orchestrator`.
+
+## Warm pools
+
+`WarmPool` (`internal/controller/warmpool_controller.go`) keeps `spec.size`
+Ready, unclaimed sessions of `spec.templateRef`:
+
+- Pooled sessions are `LabSession`s `<pool>-<random>` owned by the pool,
+  labelled `labs.cloudtrain.dev/warm-pool=<pool>` **plus every label of the
+  pool** (a manager scoped with `--session-selector` reconciles a pool and its
+  sessions when the pool carries the selector labels; `--session-selector`
+  also filters WarmPools). Learner id `warmpool:<pool>`.
+- **Params: fixed seed per pooled session.** Each pooled session gets its own
+  random seed and is fully set up with it; a claim does not re-seed (setup
+  is not reversible in general, e.g. `count-schedulable-nodes` taints a node
+  with a seeded effect). The claimant's `status.resolvedParams` shows the
+  effective params; the claimant's own `spec.seed` is not used.
+- At most `maxSurge` (default 1) pooled sessions provision at once; surplus
+  sessions (pool shrunk) are deleted, not-ready ones first, then the newest;
+  Failed pooled sessions are deleted and replaced after a 30s backoff
+  (`Degraded=True`); `maxIdle` recycles Ready sessions older than that.
+  Deleting the pool garbage-collects its unclaimed sessions (owner refs).
+- **Expiry:** an unclaimed pooled session never expires (`status.expiresAt`
+  empty); use `maxIdle` to bound its age. The claim sets its
+  `spec.expiresAt` to the claimant's expiry.
+- Metrics (manager metrics endpoint): `cloudtrain_warmpool_sessions{state}`,
+  `cloudtrain_warmpool_size`, `cloudtrain_warmpool_claims_total{result}`.
+
+**Claim** (`internal/controller/claim.go`): a `LabSession` with
+`spec.warmPoolRef` (same namespace and template) is the *claimant*. On its
+first reconcile it picks the longest-Ready unclaimed pooled session and takes
+it over with **one optimistic-locked merge patch** (resourceVersion
+precondition): label `labs.cloudtrain.dev/claimed-by=<claimant UID>`,
+annotation `claimed-by-name`, controller owner pool -> claimant, learner and
+expiry. A concurrent claimant gets a conflict and tries the next candidate,
+so no pooled session is ever claimed twice (`TestClaimConcurrentNoDoubleClaim`);
+the claimant looks up an earlier claim uncached (`claimed-by` label) before
+claiming, so it never holds two either. From then on the claimant forwards
+`learner`, expiry, `hibernate`, `resetGeneration`, `validateRequest` to the
+pooled session and mirrors its status (phase, conditions, endpoints, entry
+node, nodes, params, validation, links) plus `status.pooledSession` and
+condition `Claimed=True`. Node resources keep the pooled session's names.
+Deleting the claimant deletes the pooled session and waits until it is torn
+down. No Ready pooled session (or pool missing / other template): condition
+`Claimed=False` (`PoolExhausted`, `PoolNotFound`, `TemplateMismatch`) and the
+claimant provisions itself like any session; it never claims later.
+
+## Hibernate, resume, reset
+
+What survives `spec.hibernate: true` -> `false`, per driver (manager flags in
+parentheses, all on by default):
+
+| Node | Hibernate | Survives | Does not survive |
+|---|---|---|---|
+| `container` (`--persistent-home`) | pod deleted; Service and PVC `<node>-home` kept | `/home/learner` (PVC, seeded once from the image by the `home-init` init container), incl. the learner's kubeconfig/current context and ssh config (wiring is skipped when the home already holds the same access) | everything outside `/home/learner` (root fs, `/etc`, `/tmp`, installed packages), running processes, open shells |
+| `k8s-cluster` virtual (`--vcluster-persistence`) | StatefulSet scaled to 0, synced workload pods deleted | every API object (embedded DB on PVC `data-<release>-0`); Deployments etc. recreate their pods on resume | bare pods the learner created directly, emptyDir data of workloads |
+| `vm`, `k8s-cluster` kubeadm (`--vm-disks=persistent`) | `runStrategy: Halted` | the whole disk (CDI DataVolume `<vm>-root` per VM): files, packages, kubelet state, etcd | guest memory / running processes (a reboot) |
+| `netdev` | keeps running | everything | - |
+
+`--persistent-home=false`, `--vcluster-persistence=false` or
+`--vm-disks=ephemeral` (containerDisk) make those nodes keep running while
+hibernated instead (`ErrUnsupported`, silently skipped).
+
+**Resume** never re-runs setup: the reconciler forgets the instance ids of
+hibernated nodes, so the new pod / boot is the baseline. VM nodes report the
+*state* identity (VM object UIDs, stable across stop/start) as instance id
+and only wait for ssh (vm) or the API server plus every member's ssh
+(kubeadm) after a restart, instead of converging to the template again
+(labels, declared Ready states). A container node's state outside
+`/home/learner` is therefore gone after a resume: setup actions on container
+nodes that must survive hibernation should write under `/home/learner`.
+An unexpected node replacement (crash, eviction) still re-runs setup.
+
+**Reset** (`spec.resetGeneration`): every node's `Reset` (container: pod and
+home PVC; vcluster: scale to 0, delete the DB PVC; VMs: delete VM and disk)
+returns `ErrInProgress` until the old state is gone (the reconciler requeues
+every 3s, `observedResetGeneration` is set only once all nodes reset), then
+nodes are provisioned fresh and setup runs again.
+
+**Persistent VM disks, measured** (kind on WSL2, local-path, 10 GiB golden
+`cloudtrain/kubeadm-node:v1.37.1`, 1.1 GB qcow2): CDI import with
+`pullMethod: node` 71s for one disk, 93s for six in parallel (a kubeadm
+session); host-assisted clone from a golden PVC 88s (slower than importing,
+so no golden PVC); 2.7 GB allocated per disk (11 GiB sparse raw), i.e.
+~16 GB for a 6-node kubeadm session. See
+`deploy/.results/warmpool-*-proof.txt` for session-level timings. KubeVirt
+pause was rejected: it keeps the virt-launcher pods and their memory and CPU
+requests, so it frees no schedulable capacity.
 
 ## Grading
 

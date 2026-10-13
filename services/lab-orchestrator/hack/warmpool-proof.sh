@@ -91,13 +91,13 @@ $2
 EOF
 }
 
-hdr "setup: namespace $NS, template from $LAB"
-K create namespace "$NS" --dry-run=client -o yaml | K apply -f - >/dev/null
 case $PART in
 virtual) LAB=$LABS/scale-berth-planner ;;
 kubeadm) LAB=$LABS/count-schedulable-nodes ;;
 *) echo "PART must be virtual or kubeadm" >&2; exit 2 ;;
 esac
+hdr "setup: namespace $NS, template from $LAB"
+K create namespace "$NS" --dry-run=client -o yaml | K apply -f - >/dev/null
 bin/labctl compile "$LAB/lab.yaml" | K -n "$NS" apply -f - >/dev/null
 TPL=$(bin/labctl compile "$LAB/lab.yaml" | yq '.metadata.name')
 echo "template $TPL"

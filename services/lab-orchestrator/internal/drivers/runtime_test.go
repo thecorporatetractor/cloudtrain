@@ -256,7 +256,7 @@ func TestVClusterValuesAndPolicy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, w := range []string{rel + ".labs.svc", "enabled: false", LabelSessionUID + ": uid-1"} {
+	for _, w := range []string{rel + ".ct-" + rel + ".svc", "enabled: false", LabelSessionUID + ": uid-1"} {
 		if !strings.Contains(string(v), w) {
 			t.Errorf("values lack %q:\n%s", w, v)
 		}
