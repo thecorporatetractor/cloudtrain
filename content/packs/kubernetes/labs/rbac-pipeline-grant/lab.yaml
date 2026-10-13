@@ -1,0 +1,288 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: rbac-pipeline-grant
+  title: Scoped create-only access for a release pipeline
+  domain: kubernetes
+  frameworks: [cka:cluster-architecture, cks:cluster-hardening]
+  difficulty: medium
+  estimatedMinutes: 12
+  tags: [rbac, serviceaccount, least-privilege]
+  version: 1
+spec:
+  description: |
+    Quillmoor Logistics is moving another product team onto the shared depot
+    cluster. The team's release robot must be able to roll out new controllers
+    in the team namespace `{{ns}}`, and nothing else.
+
+    Work in context `qm-depot`:
+
+    ```bash
+    kubectl config use-context qm-depot
+    ```
+
+    1. Create a ClusterRole named `{{role}}` that grants **only** the `create`
+       verb on **Deployments, StatefulSets and DaemonSets**.
+    2. Create a ServiceAccount named `{{sa}}` in the existing namespace `{{ns}}`.
+    3. Grant `{{role}}` to `{{sa}}` so the permission applies **only inside
+       `{{ns}}`**. The robot must not gain any rights in other namespaces
+       (for example `qm-sandbox`).
+  objectives:
+    - Write a ClusterRole limited to one verb and three apps/v1 resources
+    - Create a ServiceAccount in a given namespace
+    - Scope a ClusterRole to a single namespace with a RoleBinding
+    - Prove the result with kubectl auth can-i --as
+  params:
+    ns:
+      type: choice
+      values: [parcel-intake, route-optimiser, customs-manifest]
+    sa:
+      type: choice
+      values: [bosun-releaser, conveyor-bot, quay-deployer]
+    role:
+      type: choice
+      values: [controller-launcher, rollout-creator, workload-spawner]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-depot
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "1.35"
+          context: qm-depot
+  setup:
+    - on: qm-depot
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata:
+          name: {{ns}}
+          labels:
+            quillmoor.example/team: owned
+        ---
+        apiVersion: v1
+        kind: Namespace
+        metadata:
+          name: qm-sandbox
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: label-printer
+          namespace: {{ns}}
+        spec:
+          replicas: 1
+          selector:
+            matchLabels: {app: label-printer}
+          template:
+            metadata:
+              labels: {app: label-printer}
+            spec:
+              containers:
+                - name: printer
+                  image: busybox:1.37
+                  command: ["sh", "-c", "sleep 1d"]
+  teardown:
+    - on: qm-depot
+      run: |
+        for b in $(kubectl get clusterrolebinding -o jsonpath='{range .items[?(@.roleRef.name=="{{role}}")]}{.metadata.name}{" "}{end}'); do
+          kubectl delete clusterrolebinding "$b" --ignore-not-found
+        done
+        kubectl delete clusterrole {{role}} --ignore-not-found
+        kubectl delete namespace {{ns}} qm-sandbox --ignore-not-found --wait=false
+  checks:
+    - id: context
+      description: Terminal is using context qm-depot
+      type: k8s-context
+      on: workstation
+      skills: [k8s.cli.contexts]
+      weight: 0.5
+      expect: {match: exact, value: qm-depot}
+    - id: role-exists
+      description: ClusterRole {{role}} exists
+      type: k8s-query
+      skills: [k8s.rbac.clusterroles]
+      query: {cluster: qm-depot, resource: clusterrole, name: "{{role}}", jsonpath: "{.metadata.name}"}
+      expect: {match: exact, value: "{{role}}"}
+    - id: role-verbs
+      description: The ClusterRole grants the create verb and no other verb
+      type: shell
+      on: qm-depot
+      skills: [k8s.rbac.clusterroles]
+      command: |
+        kubectl get clusterrole {{role}} -o jsonpath='{range .rules[*]}{range .verbs[*]}{@}{"\n"}{end}{end}' | sort -u | paste -sd, -
+      expect: {match: exact, value: create}
+    - id: role-resources
+      description: The rules cover exactly deployments, statefulsets and daemonsets in the apps group
+      type: shell
+      on: qm-depot
+      skills: [k8s.rbac.clusterroles]
+      command: |
+        r=$(kubectl get clusterrole {{role}} -o jsonpath='{range .rules[*]}{range .resources[*]}{@}{"\n"}{end}{end}' | sort -u | paste -sd, -)
+        g=$(kubectl get clusterrole {{role}} -o jsonpath='{range .rules[*]}{range .apiGroups[*]}{@}{"\n"}{end}{end}' | sort -u | paste -sd, -)
+        echo "$r|$g"
+      expect: {match: exact, value: "daemonsets,deployments,statefulsets|apps"}
+    - id: sa-exists
+      description: ServiceAccount {{sa}} exists in {{ns}}
+      type: k8s-query
+      skills: [k8s.rbac.service-accounts]
+      query: {cluster: qm-depot, resource: serviceaccount, name: "{{sa}}", namespace: "{{ns}}", jsonpath: "{.metadata.name}"}
+      expect: {match: exact, value: "{{sa}}"}
+    - id: can-create-deployments
+      description: The robot can create Deployments in {{ns}}
+      type: k8s-can-i
+      skills: [k8s.rbac.binding-scope, k8s.rbac.auth-can-i]
+      query: {cluster: qm-depot, verb: create, resource: deployments.apps, namespace: "{{ns}}", as: "system:serviceaccount:{{ns}}:{{sa}}"}
+      expect: {match: exact, value: "yes"}
+    - id: can-create-statefulsets
+      description: The robot can create StatefulSets in {{ns}}
+      type: k8s-can-i
+      skills: [k8s.rbac.binding-scope]
+      query: {cluster: qm-depot, verb: create, resource: statefulsets.apps, namespace: "{{ns}}", as: "system:serviceaccount:{{ns}}:{{sa}}"}
+      expect: {match: exact, value: "yes"}
+    - id: can-create-daemonsets
+      description: The robot can create DaemonSets in {{ns}}
+      type: k8s-can-i
+      skills: [k8s.rbac.binding-scope]
+      query: {cluster: qm-depot, verb: create, resource: daemonsets.apps, namespace: "{{ns}}", as: "system:serviceaccount:{{ns}}:{{sa}}"}
+      expect: {match: exact, value: "yes"}
+    - id: cannot-delete
+      description: The robot cannot delete Deployments (create only)
+      type: k8s-can-i
+      skills: [k8s.rbac.clusterroles, k8s.security.rbac-least-privilege]
+      query: {cluster: qm-depot, verb: delete, resource: deployments.apps, namespace: "{{ns}}", as: "system:serviceaccount:{{ns}}:{{sa}}"}
+      expect: {match: exact, value: "no"}
+    - id: cannot-create-pods
+      description: The robot cannot create bare Pods
+      type: k8s-can-i
+      skills: [k8s.rbac.clusterroles, k8s.security.rbac-least-privilege]
+      query: {cluster: qm-depot, verb: create, resource: pods, namespace: "{{ns}}", as: "system:serviceaccount:{{ns}}:{{sa}}"}
+      expect: {match: exact, value: "no"}
+    - id: scoped-to-namespace
+      description: The grant does not reach other namespaces (qm-sandbox)
+      type: k8s-can-i
+      skills: [k8s.rbac.binding-scope, k8s.rbac.auth-can-i]
+      weight: 2
+      query: {cluster: qm-depot, verb: create, resource: deployments.apps, namespace: qm-sandbox, as: "system:serviceaccount:{{ns}}:{{sa}}"}
+      expect: {match: exact, value: "no"}
+  hints:
+    - title: Pick the right context first
+      body: Every task names a context. Commands run elsewhere change the wrong cluster.
+      command: kubectl config use-context qm-depot
+      cost: 0
+    - title: One imperative command builds the role
+      body: |
+        `kubectl create clusterrole` accepts a comma-separated verb list and
+        resource list and fills in the apps API group for you.
+      command: kubectl create clusterrole {{role}} --verb=create --resource=deployments,statefulsets,daemonsets
+      cost: 1
+    - title: Which binding kind limits scope?
+      body: |
+        The kind of the *binding*, not of the role, decides where a grant applies.
+        A RoleBinding lives in one namespace and may reference a ClusterRole; its
+        permissions then apply only in that namespace.
+      cost: 2
+    - title: Test as the robot
+      body: Impersonate the ServiceAccount to see its effective permissions.
+      command: kubectl auth can-i create deployments -n {{ns}} --as=system:serviceaccount:{{ns}}:{{sa}}
+      cost: 1
+  misconceptions:
+    - id: cluster-wide-binding
+      description: Binds the ClusterRole with a ClusterRoleBinding, granting it in every namespace.
+      feedback: |
+        A ClusterRoleBinding applies its role everywhere. To limit a ClusterRole to
+        one namespace, reference it from a RoleBinding created in that namespace.
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl create clusterrole {{role}} --verb=create --resource=deployments,statefulsets,daemonsets
+          kubectl -n {{ns}} create serviceaccount {{sa}}
+          kubectl create clusterrolebinding {{role}}-grant --clusterrole={{role}} --serviceaccount={{ns}}:{{sa}}
+    - id: wildcard-verbs
+      description: Grants all verbs ("*") instead of create only.
+      feedback: Least privilege means listing exactly the verbs needed. `*` also allows delete, patch and escalate-adjacent actions.
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl create clusterrole {{role}} --verb='*' --resource=deployments,statefulsets,daemonsets
+          kubectl -n {{ns}} create serviceaccount {{sa}}
+          kubectl -n {{ns}} create rolebinding {{role}}-grant --clusterrole={{role}} --serviceaccount={{ns}}:{{sa}}
+    - id: namespaced-role
+      description: Creates a namespaced Role instead of the requested ClusterRole.
+      feedback: The access works, but the task asks for a reusable ClusterRole that other teams can bind in their own namespaces.
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl -n {{ns}} create role {{role}} --verb=create --resource=deployments,statefulsets,daemonsets
+          kubectl -n {{ns}} create serviceaccount {{sa}}
+          kubectl -n {{ns}} create rolebinding {{role}}-grant --role={{role}} --serviceaccount={{ns}}:{{sa}}
+    - id: binding-in-default
+      description: Creates the RoleBinding in the default namespace, so it never applies to {{ns}}.
+      feedback: A RoleBinding grants permissions in the namespace it lives in, regardless of where the subject lives.
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl create clusterrole {{role}} --verb=create --resource=deployments,statefulsets,daemonsets
+          kubectl -n {{ns}} create serviceaccount {{sa}}
+          kubectl -n default create rolebinding {{role}}-grant --clusterrole={{role}} --serviceaccount={{ns}}:{{sa}}
+  solution:
+    explanation: |
+      The ClusterRole only *describes* permissions. Where they apply is decided by
+      the binding: a RoleBinding in `{{ns}}` that references the ClusterRole grants
+      it in that namespace alone.
+    steps:
+      - on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-depot
+          kubectl create clusterrole {{role}} --verb=create --resource=deployments,statefulsets,daemonsets
+          kubectl -n {{ns}} create serviceaccount {{sa}}
+          kubectl -n {{ns}} create rolebinding {{role}}-grant --clusterrole={{role}} --serviceaccount={{ns}}:{{sa}}
+          kubectl auth can-i create deployments -n {{ns}} --as=system:serviceaccount:{{ns}}:{{sa}}
+    alternatives:
+      - id: declarative-manifests
+        description: Apply the three objects from YAML. Any RoleBinding name is accepted.
+        steps:
+          - on: workstation
+            as: learner
+            run: |
+              kubectl config use-context qm-depot
+              kubectl apply -f - <<'YAML'
+              apiVersion: rbac.authorization.k8s.io/v1
+              kind: ClusterRole
+              metadata:
+                name: {{role}}
+              rules:
+                - apiGroups: ["apps"]
+                  resources: ["deployments", "statefulsets", "daemonsets"]
+                  verbs: ["create"]
+              ---
+              apiVersion: v1
+              kind: ServiceAccount
+              metadata:
+                name: {{sa}}
+                namespace: {{ns}}
+              ---
+              apiVersion: rbac.authorization.k8s.io/v1
+              kind: RoleBinding
+              metadata:
+                name: release-robot
+                namespace: {{ns}}
+              roleRef:
+                apiGroup: rbac.authorization.k8s.io
+                kind: ClusterRole
+                name: {{role}}
+              subjects:
+                - kind: ServiceAccount
+                  name: {{sa}}
+                  namespace: {{ns}}
+              YAML

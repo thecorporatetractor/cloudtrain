@@ -1,0 +1,387 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: netpol-namespace-port
+  title: Admit one namespace on one port with a NetworkPolicy
+  domain: kubernetes
+  frameworks: [cka:services-networking, cks:cluster-setup]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [networkpolicy, namespaces, ingress]
+  version: 1
+spec:
+  description: |
+    Quillmoor Logistics' customs gateway exposes a declaration API to the
+    brokers' portal. Security wants the gateway namespace locked down.
+
+    Work in context `qm-customs`:
+
+    ```bash
+    kubectl config use-context qm-customs
+    ```
+
+    Create a NetworkPolicy named `{{policy}}` in the existing namespace
+    `customs-clearance` that:
+
+    - allows Pods in namespace `{{source}}` to connect to **TCP port
+      {{port}}** of the Pods in `customs-clearance`;
+    - does **not** allow traffic to any other port of those Pods;
+    - does **not** allow traffic from Pods in any other namespace.
+
+    Test clients: every namespace involved (`{{source}}`, `public-kiosk`) has a
+    Pod named `probe` with `wget` available. The server Pod in
+    `customs-clearance` is `declaration-api`; it listens on {{port}} and
+    on {{otherPort}}.
+  objectives:
+    - Isolate Pods for ingress with a NetworkPolicy
+    - Select a peer namespace by label
+    - Restrict an ingress rule to a single port
+    - Prove allowed and denied paths with probes
+  params:
+    policy:
+      type: choice
+      values: [admit-broker-portal, broker-api-ingress, declarations-from-brokers]
+    source:
+      type: choice
+      values: [broker-portal, tariff-desk]
+    port:
+      type: choice
+      values: [7443, 8181, 9300]
+    otherPort:
+      type: choice
+      values: [6060, 5050]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-customs
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "1.35"
+          context: qm-customs
+  setup:
+    - on: qm-customs
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: customs-clearance}
+        ---
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: "{{source}}"}
+        ---
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: public-kiosk}
+        ---
+        apiVersion: v1
+        kind: Pod
+        metadata:
+          name: declaration-api
+          namespace: customs-clearance
+          labels: {app: declaration-api}
+        spec:
+          containers:
+            - name: api
+              image: busybox:1.37
+              command: ["sh", "-c"]
+              args:
+                - |
+                  mkdir -p /www && echo "declarations ok" > /www/index.html
+                  httpd -p {{otherPort}} -h /www
+                  exec httpd -f -p {{port}} -h /www
+              ports:
+                - {name: api, containerPort: {{port}}}
+                - {name: admin, containerPort: {{otherPort}}}
+        ---
+        apiVersion: v1
+        kind: Pod
+        metadata: {name: probe, namespace: "{{source}}", labels: {role: probe}}
+        spec:
+          containers:
+            - {name: probe, image: "busybox:1.37", command: ["sleep", "1d"]}
+        ---
+        apiVersion: v1
+        kind: Pod
+        metadata: {name: probe, namespace: public-kiosk, labels: {role: probe}}
+        spec:
+          containers:
+            - {name: probe, image: "busybox:1.37", command: ["sleep", "1d"]}
+    - on: qm-customs
+      timeoutSec: 120
+      run: |
+        kubectl -n customs-clearance wait pod/declaration-api --for=condition=Ready --timeout=100s
+        kubectl -n {{source}} wait pod/probe --for=condition=Ready --timeout=100s
+        kubectl -n public-kiosk wait pod/probe --for=condition=Ready --timeout=100s
+  teardown:
+    - on: qm-customs
+      run: kubectl delete namespace customs-clearance {{source}} public-kiosk --ignore-not-found --wait=false
+  checks:
+    - id: context
+      description: Terminal is using context qm-customs
+      type: k8s-context
+      on: workstation
+      skills: [k8s.cli.contexts]
+      weight: 0.5
+      expect: {match: exact, value: qm-customs}
+    - id: policy-exists
+      description: NetworkPolicy {{policy}} exists in customs-clearance
+      type: k8s-query
+      skills: [k8s.networking.netpol-basics]
+      query: {cluster: qm-customs, resource: networkpolicy, name: "{{policy}}", namespace: customs-clearance, jsonpath: "{.metadata.name}"}
+      expect: {match: exact, value: "{{policy}}"}
+    - id: policy-type-ingress
+      description: The policy governs Ingress
+      type: k8s-query
+      skills: [k8s.networking.netpol-basics]
+      query: {cluster: qm-customs, resource: networkpolicy, name: "{{policy}}", namespace: customs-clearance, jsonpath: "{.spec.policyTypes}"}
+      expect: {match: contains, value: Ingress}
+    - id: rules-have-ports
+      description: Every ingress rule carries a port restriction
+      type: shell
+      on: qm-customs
+      skills: [k8s.networking.netpol-ports]
+      command: |
+        out=$(kubectl -n customs-clearance get networkpolicy {{policy}} -o jsonpath='{range .spec.ingress[*]}[{.ports}]{"\n"}{end}')
+        echo "rules=$(printf '%s\n' "$out" | awk 'NF' | wc -l) missing=$(printf '%s\n' "$out" | grep -c '^\[\]$')"
+      expect: {match: regex, value: "^rules=[1-9][0-9]* missing=0$"}
+    - id: allowed-path
+      description: "{{source}}/probe reaches declaration-api on {{port}}"
+      type: shell
+      on: qm-customs
+      skills: [k8s.networking.netpol-selectors, k8s.networking.connectivity-testing]
+      weight: 2
+      command: |
+        ip=$(kubectl -n customs-clearance get pod declaration-api -o jsonpath='{.status.podIP}')
+        kubectl -n {{source}} exec probe -- wget -qO- -T 3 "http://$ip:{{port}}/" 2>/dev/null || echo blocked
+      expect: {match: contains, value: declarations ok}
+    - id: other-port-denied
+      description: "{{source}}/probe cannot reach declaration-api on {{otherPort}}"
+      type: shell
+      on: qm-customs
+      skills: [k8s.networking.netpol-ports, k8s.networking.connectivity-testing]
+      weight: 2
+      command: |
+        ip=$(kubectl -n customs-clearance get pod declaration-api -o jsonpath='{.status.podIP}')
+        kubectl -n {{source}} exec probe -- wget -qO- -T 3 "http://$ip:{{otherPort}}/" >/dev/null 2>&1 && echo open || echo blocked
+      expect: {match: exact, value: blocked}
+    - id: other-namespace-denied
+      description: public-kiosk/probe cannot reach declaration-api on {{port}}
+      type: shell
+      on: qm-customs
+      skills: [k8s.networking.netpol-selectors, k8s.networking.connectivity-testing]
+      weight: 2
+      command: |
+        ip=$(kubectl -n customs-clearance get pod declaration-api -o jsonpath='{.status.podIP}')
+        kubectl -n public-kiosk exec probe -- wget -qO- -T 3 "http://$ip:{{port}}/" >/dev/null 2>&1 && echo open || echo blocked
+      expect: {match: exact, value: blocked}
+    - id: same-namespace-denied
+      description: Pods inside customs-clearance itself are not admitted either
+      type: shell
+      on: qm-customs
+      skills: [k8s.networking.netpol-selectors]
+      command: |
+        ip=$(kubectl -n customs-clearance get pod declaration-api -o jsonpath='{.status.podIP}')
+        kubectl -n customs-clearance run nettest-{{port}} --rm -i --restart=Never --image=busybox:1.37 --quiet -- \
+          wget -qO- -T 3 "http://$ip:{{port}}/" >/dev/null 2>&1 && echo open || echo blocked
+      expect: {match: exact, value: blocked}
+  hints:
+    - title: Switch context
+      body: The gateway lives in the customs cluster.
+      command: kubectl config use-context qm-customs
+      cost: 0
+    - title: Selecting a namespace
+      body: |
+        A `namespaceSelector` matches namespace *labels*. Every namespace carries
+        the automatic label `kubernetes.io/metadata.name=<name>`, so you do not need
+        to add one.
+      command: kubectl get ns {{source}} --show-labels
+      cost: 1
+    - title: One rule, two conditions
+      body: |
+        Inside a single ingress rule, `from` and `ports` are ANDed: traffic must
+        match a listed source *and* a listed port. An empty `podSelector: {}`
+        applies the policy to every Pod in the namespace.
+      cost: 2
+    - title: Skeleton
+      body: Fill in the selector and port.
+      command: |
+        cat <<'YAML' | kubectl apply -f -
+        apiVersion: networking.k8s.io/v1
+        kind: NetworkPolicy
+        metadata:
+          name: {{policy}}
+          namespace: customs-clearance
+        spec:
+          podSelector: {}
+          policyTypes: [Ingress]
+          ingress:
+            - from:
+                - namespaceSelector:
+                    matchLabels:
+                      kubernetes.io/metadata.name: ???
+              ports:
+                - protocol: TCP
+                  port: ???
+        YAML
+      cost: 3
+    - title: Test both directions
+      body: Prove the allowed path works and the denied ones time out.
+      command: |
+        IP=$(kubectl -n customs-clearance get pod declaration-api -o jsonpath='{.status.podIP}')
+        kubectl -n {{source}} exec probe -- wget -qO- -T 3 http://$IP:{{port}}/
+        kubectl -n {{source}} exec probe -- wget -qO- -T 3 http://$IP:{{otherPort}}/
+        kubectl -n public-kiosk exec probe -- wget -qO- -T 3 http://$IP:{{port}}/
+      cost: 1
+  misconceptions:
+    - id: no-port-restriction
+      description: Admits the source namespace on every port.
+      feedback: Without a `ports` list the rule admits all ports. Add the port to the same rule as the namespace selector.
+      mutation:
+        on: qm-customs
+        as: learner
+        apply: |
+          apiVersion: networking.k8s.io/v1
+          kind: NetworkPolicy
+          metadata: {name: "{{policy}}", namespace: customs-clearance}
+          spec:
+            podSelector: {}
+            policyTypes: [Ingress]
+            ingress:
+              - from:
+                  - namespaceSelector:
+                      matchLabels: {kubernetes.io/metadata.name: "{{source}}"}
+    - id: or-instead-of-and
+      description: Splits source and port into two separate rules, which ORs them and admits every namespace on the port.
+      feedback: Each entry under `ingress` is an independent rule. Put `from` and `ports` in the **same** rule so both must match.
+      mutation:
+        on: qm-customs
+        as: learner
+        apply: |
+          apiVersion: networking.k8s.io/v1
+          kind: NetworkPolicy
+          metadata: {name: "{{policy}}", namespace: customs-clearance}
+          spec:
+            podSelector: {}
+            policyTypes: [Ingress]
+            ingress:
+              - from:
+                  - namespaceSelector:
+                      matchLabels: {kubernetes.io/metadata.name: "{{source}}"}
+              - ports:
+                  - {protocol: TCP, port: {{port}}}
+    - id: podselector-as-source
+      description: Uses a podSelector instead of a namespaceSelector, which only matches Pods in the policy's own namespace.
+      feedback: A `podSelector` peer without a `namespaceSelector` selects Pods in the policy's namespace, never in another one.
+      mutation:
+        on: qm-customs
+        as: learner
+        apply: |
+          apiVersion: networking.k8s.io/v1
+          kind: NetworkPolicy
+          metadata: {name: "{{policy}}", namespace: customs-clearance}
+          spec:
+            podSelector: {}
+            policyTypes: [Ingress]
+            ingress:
+              - from:
+                  - podSelector: {matchLabels: {role: probe}}
+                ports:
+                  - {protocol: TCP, port: {{port}}}
+    - id: empty-namespace-selector
+      description: "Uses `namespaceSelector: {}`, which admits every namespace."
+      feedback: An empty selector matches everything. Match the source namespace by its label.
+      mutation:
+        on: qm-customs
+        as: learner
+        apply: |
+          apiVersion: networking.k8s.io/v1
+          kind: NetworkPolicy
+          metadata: {name: "{{policy}}", namespace: customs-clearance}
+          spec:
+            podSelector: {}
+            policyTypes: [Ingress]
+            ingress:
+              - from:
+                  - namespaceSelector: {}
+                ports:
+                  - {protocol: TCP, port: {{port}}}
+  solution:
+    explanation: |
+      One ingress rule whose `from` (namespace selector) and `ports` are ANDed.
+      Selecting all Pods (`podSelector: {}`) puts every Pod in the namespace into
+      ingress isolation, so everything not matched by the rule is dropped.
+    steps:
+      - on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-customs
+          kubectl apply -f - <<'YAML'
+          apiVersion: networking.k8s.io/v1
+          kind: NetworkPolicy
+          metadata:
+            name: {{policy}}
+            namespace: customs-clearance
+          spec:
+            podSelector: {}
+            policyTypes: [Ingress]
+            ingress:
+              - from:
+                  - namespaceSelector:
+                      matchLabels:
+                        kubernetes.io/metadata.name: {{source}}
+                ports:
+                  - protocol: TCP
+                    port: {{port}}
+          YAML
+    alternatives:
+      - id: custom-label
+        description: Label the source namespace yourself and select that label; target only the declaration-api Pod.
+        steps:
+          - on: workstation
+            as: learner
+            run: |
+              kubectl config use-context qm-customs
+              kubectl label namespace {{source}} quillmoor.example/zone=brokers --overwrite
+              kubectl apply -f - <<'YAML'
+              apiVersion: networking.k8s.io/v1
+              kind: NetworkPolicy
+              metadata:
+                name: {{policy}}
+                namespace: customs-clearance
+              spec:
+                podSelector:
+                  matchLabels: {app: declaration-api}
+                policyTypes: [Ingress]
+                ingress:
+                  - from:
+                      - namespaceSelector:
+                          matchLabels: {quillmoor.example/zone: brokers}
+                    ports:
+                      - {protocol: TCP, port: {{port}}}
+              YAML
+      - id: named-port
+        description: Reference the container's named port `api` instead of the number.
+        steps:
+          - on: workstation
+            as: learner
+            run: |
+              kubectl config use-context qm-customs
+              kubectl apply -f - <<'YAML'
+              apiVersion: networking.k8s.io/v1
+              kind: NetworkPolicy
+              metadata: {name: {{policy}}, namespace: customs-clearance}
+              spec:
+                podSelector: {}
+                policyTypes: [Ingress]
+                ingress:
+                  - from:
+                      - namespaceSelector:
+                          matchLabels: {kubernetes.io/metadata.name: {{source}}}
+                    ports:
+                      - {protocol: TCP, port: api}
+              YAML

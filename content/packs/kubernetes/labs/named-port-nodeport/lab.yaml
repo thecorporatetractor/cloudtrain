@@ -1,0 +1,289 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: named-port-nodeport
+  title: Publish a tracking UI through a named port and NodePort
+  domain: kubernetes
+  frameworks: [cka:services-networking, cka:workloads-scheduling]
+  difficulty: easy
+  estimatedMinutes: 12
+  tags: [service, nodeport, ports, deployment]
+  version: 1
+spec:
+  description: |
+    Quillmoor Logistics' warehouse kiosks need to open the shipment-tracking UI
+    directly on the cluster nodes.
+
+    Work in context `qm-tracking`:
+
+    ```bash
+    kubectl config use-context qm-tracking
+    ```
+
+    1. In namespace `parcel-tracking`, change the Deployment
+       `shipment-tracker` so that its existing container `ui` declares a port
+       named **`{{portName}}`** for **80/TCP**.
+    2. Create a Service named **`{{svc}}`** in the same namespace that targets
+       the container port `{{portName}}`.
+    3. Make the Service reachable on a **port of every node** (NodePort).
+
+    Leave the Deployment `eta-predictor` exactly as it is.
+  objectives:
+    - Add a named container port to a Deployment's Pod template
+    - Create a Service that targets a named port
+    - Expose a Service with type NodePort and verify it from outside the cluster
+  params:
+    portName:
+      type: choice
+      values: [web, ui-http, kiosk]
+    svc:
+      type: choice
+      values: [tracker-kiosk, shipment-tracker-np, tracking-ui-public]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-tracking
+        driver: k8s-cluster
+        image: kubeadm:1.35
+        cluster:
+          mode: kubeadm
+          version: "1.35"
+          context: qm-tracking
+          nodes:
+            - {name: tracking-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: tracking-wk-1, role: worker}
+  setup:
+    - on: qm-tracking
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: parcel-tracking}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: shipment-tracker, namespace: parcel-tracking}
+        spec:
+          replicas: 3
+          selector: {matchLabels: {app: shipment-tracker}}
+          template:
+            metadata: {labels: {app: shipment-tracker, tier: customer-web}}
+            spec:
+              containers:
+                - name: ui
+                  image: httpd:2.4-alpine
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: eta-predictor, namespace: parcel-tracking}
+        spec:
+          replicas: 2
+          selector: {matchLabels: {app: eta-predictor}}
+          template:
+            metadata: {labels: {app: eta-predictor, tier: customer-web}}
+            spec:
+              containers:
+                - name: model
+                  image: httpd:2.4-alpine
+    - on: qm-tracking
+      timeoutSec: 150
+      run: |
+        kubectl -n parcel-tracking rollout status deploy/shipment-tracker --timeout=120s
+        kubectl -n parcel-tracking rollout status deploy/eta-predictor --timeout=120s
+  teardown:
+    - on: qm-tracking
+      run: kubectl delete namespace parcel-tracking --ignore-not-found --wait=false
+  checks:
+    - id: context
+      description: Terminal is using context qm-tracking
+      type: k8s-context
+      on: workstation
+      skills: [k8s.cli.contexts]
+      weight: 0.5
+      expect: {match: exact, value: qm-tracking}
+    - id: named-port
+      description: Container ui declares port {{portName}} = 80
+      type: k8s-query
+      skills: [k8s.networking.named-ports, k8s.cli.edit-patch]
+      query:
+        cluster: qm-tracking
+        resource: deployment
+        name: shipment-tracker
+        namespace: parcel-tracking
+        jsonpath: '{.spec.template.spec.containers[?(@.name=="ui")].ports[?(@.name=="{{portName}}")].containerPort}'
+      expect: {match: exact, value: "80"}
+    - id: named-port-protocol
+      description: Port {{portName}} uses TCP
+      type: k8s-query
+      skills: [k8s.networking.named-ports]
+      weight: 0.5
+      query:
+        cluster: qm-tracking
+        resource: deployment
+        name: shipment-tracker
+        namespace: parcel-tracking
+        jsonpath: '{.spec.template.spec.containers[?(@.name=="ui")].ports[?(@.name=="{{portName}}")].protocol}'
+      expect: {match: exact, value: TCP}
+    - id: single-container
+      description: The Pod template still has exactly one container, ui, on its original image
+      type: k8s-query
+      skills: [k8s.cli.edit-patch]
+      query: {cluster: qm-tracking, resource: deployment, name: shipment-tracker, namespace: parcel-tracking, jsonpath: '{range .spec.template.spec.containers[*]}{.name}={.image};{end}'}
+      expect: {match: exact, value: "ui=httpd:2.4-alpine;"}
+    - id: rollout-complete
+      description: The change rolled out (3/3 updated, ready, available)
+      type: k8s-query
+      skills: [k8s.workloads.rollouts]
+      query: {cluster: qm-tracking, resource: deployment, name: shipment-tracker, namespace: parcel-tracking, jsonpath: '{.metadata.generation}={.status.observedGeneration} {.status.updatedReplicas}/{.status.readyReplicas}/{.status.availableReplicas}/{.status.replicas}'}
+      expect: {match: regex, value: '^(\d+)=\1 3/3/3/3$'}
+    - id: service-type
+      description: Service {{svc}} exists with type NodePort
+      type: k8s-query
+      skills: [k8s.networking.nodeport]
+      query: {cluster: qm-tracking, resource: service, name: "{{svc}}", namespace: parcel-tracking, jsonpath: "{.spec.type}"}
+      expect: {match: exact, value: NodePort}
+    - id: service-target
+      description: The Service port is TCP and targets {{portName}} (or 80)
+      type: k8s-query
+      skills: [k8s.networking.named-ports, k8s.networking.services]
+      query: {cluster: qm-tracking, resource: service, name: "{{svc}}", namespace: parcel-tracking, jsonpath: "{.spec.ports[0].protocol}/{.spec.ports[0].targetPort}"}
+      expect: {match: regex, value: "^TCP/({{portName}}|80)$"}
+    - id: endpoints
+      description: The Service's ready endpoints are exactly the 3 shipment-tracker Pods on port 80
+      type: shell
+      on: qm-tracking
+      skills: [k8s.networking.endpoints, k8s.networking.services]
+      weight: 2
+      command: |
+        kubectl -n parcel-tracking get endpointslices -l kubernetes.io/service-name={{svc}} \
+          -o jsonpath='{range .items[*]}{range .endpoints[*]}{.targetRef.name} {.conditions.ready}{"\n"}{end}{end}' \
+          | awk '$2=="true"{split($1,a,"-"); print a[1]"-"a[2]}' | sort | uniq -c | awk '{print $2"="$1}' | paste -sd, -
+        kubectl -n parcel-tracking get endpointslices -l kubernetes.io/service-name={{svc}} -o jsonpath='{.items[*].ports[*].port}' | tr ' ' '\n' | sort -u | paste -sd, -
+      expect: {match: exact, value: "shipment-tracker=3\n80"}
+    - id: reachable-on-node-port
+      description: The UI answers on the NodePort of tracking-wk-1 (requested from the control-plane node)
+      type: shell
+      on: qm-tracking/tracking-cp-1
+      skills: [k8s.networking.nodeport, linux.net.troubleshooting]
+      weight: 2
+      command: |
+        export KUBECONFIG=/etc/kubernetes/admin.conf
+        np=$(kubectl -n parcel-tracking get svc {{svc}} -o jsonpath='{.spec.ports[0].nodePort}')
+        ip=$(kubectl get node tracking-wk-1 -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}')
+        curl -s -m 3 "http://$ip:${np:-0}/" | grep -o -m1 'It works!' || echo unreachable
+      expect: {match: exact, value: "It works!"}
+    - id: decoy-untouched
+      description: eta-predictor is unchanged (2/2 ready, no ports declared)
+      type: k8s-query
+      skills: [k8s.cli.edit-patch]
+      query: {cluster: qm-tracking, resource: deployment, name: eta-predictor, namespace: parcel-tracking, jsonpath: '{.spec.replicas}/{.status.readyReplicas} ports=[{.spec.template.spec.containers[*].ports}]'}
+      expect: {match: exact, value: "2/2 ports=[]"}
+  hints:
+    - title: Switch context
+      body: The tracking UI runs in its own cluster.
+      command: kubectl config use-context qm-tracking
+      cost: 0
+    - title: Where ports live
+      body: |
+        Container ports belong to `spec.template.spec.containers[].ports` of the
+        Deployment. A strategic merge patch matches containers by name, so it adds
+        to `ui` instead of replacing the list.
+      command: |
+        kubectl -n parcel-tracking patch deployment shipment-tracker \
+          -p '{"spec":{"template":{"spec":{"containers":[{"name":"ui","ports":[{"name":"{{portName}}","containerPort":80,"protocol":"TCP"}]}]}}}}'
+      cost: 2
+    - title: Expose reuses the Deployment's selector
+      body: --target-port can be a port name. --type=NodePort allocates a port from 30000-32767 on every node.
+      command: kubectl -n parcel-tracking expose deployment shipment-tracker --name={{svc}} --port=80 --target-port={{portName}} --type=NodePort
+      cost: 2
+    - title: Try it like a kiosk would
+      body: Read the allocated node port and request it on a worker.
+      command: |
+        NP=$(kubectl -n parcel-tracking get svc {{svc}} -o jsonpath='{.spec.ports[0].nodePort}')
+        curl -s http://tracking-wk-1:$NP/
+      cost: 1
+  misconceptions:
+    - id: clusterip-service
+      description: Creates a ClusterIP Service, which is not reachable from the nodes' addresses.
+      feedback: ClusterIP is internal only. NodePort (or LoadBalancer, which builds on it) is what opens a port on each node.
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-tracking
+          kubectl -n parcel-tracking patch deployment shipment-tracker -p '{"spec":{"template":{"spec":{"containers":[{"name":"ui","ports":[{"name":"{{portName}}","containerPort":80,"protocol":"TCP"}]}]}}}}'
+          kubectl -n parcel-tracking expose deployment shipment-tracker --name={{svc}} --port=80 --target-port={{portName}}
+    - id: shared-label-selector
+      description: Selects Pods by the shared tier label, so the Service also sends traffic to eta-predictor.
+      feedback: A Service selects every Pod carrying its labels. Use the label unique to the target workload (`app=shipment-tracker`).
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-tracking
+          kubectl -n parcel-tracking patch deployment shipment-tracker -p '{"spec":{"template":{"spec":{"containers":[{"name":"ui","ports":[{"name":"{{portName}}","containerPort":80,"protocol":"TCP"}]}]}}}}'
+          kubectl -n parcel-tracking create service nodeport {{svc}} --tcp=80:80 --dry-run=client -o yaml \
+            | sed 's/app: {{svc}}/tier: customer-web/' | kubectl apply -f -
+    - id: wrong-target-port
+      description: Targets port 8080 because "web apps listen on 8080".
+      feedback: The targetPort must match what the container actually listens on. Using the port name avoids this kind of drift.
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-tracking
+          kubectl -n parcel-tracking patch deployment shipment-tracker -p '{"spec":{"template":{"spec":{"containers":[{"name":"ui","ports":[{"name":"{{portName}}","containerPort":80,"protocol":"TCP"}]}]}}}}'
+          kubectl -n parcel-tracking expose deployment shipment-tracker --name={{svc}} --port=80 --target-port=8080 --type=NodePort
+    - id: replaced-container-list
+      description: Uses a JSON merge patch that replaces the containers list and drops the image.
+      feedback: |
+        `--type=merge` replaces whole lists. Prefer the default strategic merge patch
+        (or `kubectl edit`) so the container is updated in place.
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-tracking
+          kubectl -n parcel-tracking patch deployment shipment-tracker --type=merge -p '{"spec":{"template":{"spec":{"containers":[{"name":"ui","image":"httpd:2.4","ports":[{"name":"{{portName}}","containerPort":80}]}]}}}}'
+          kubectl -n parcel-tracking expose deployment shipment-tracker --name={{svc}} --port=80 --target-port={{portName}} --type=NodePort
+  solution:
+    explanation: |
+      Name the container port in the Pod template, then create a NodePort Service
+      whose selector matches only `app=shipment-tracker` and whose targetPort is
+      the port name. kube-proxy then opens the allocated node port on every node.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-tracking
+          kubectl -n parcel-tracking patch deployment shipment-tracker \
+            -p '{"spec":{"template":{"spec":{"containers":[{"name":"ui","ports":[{"name":"{{portName}}","containerPort":80,"protocol":"TCP"}]}]}}}}'
+          kubectl -n parcel-tracking rollout status deployment shipment-tracker --timeout=120s
+          kubectl -n parcel-tracking expose deployment shipment-tracker --name={{svc}} --port=80 --target-port={{portName}} --type=NodePort
+    alternatives:
+      - id: declarative-service
+        description: Edit the Deployment and write the Service manifest by hand (fixed nodePort allowed).
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 150
+            run: |
+              kubectl config use-context qm-tracking
+              kubectl -n parcel-tracking get deploy shipment-tracker -o yaml \
+                | sed '/- image: httpd:2.4-alpine/a\        ports:\n        - name: {{portName}}\n          containerPort: 80\n          protocol: TCP' \
+                | kubectl apply -f -
+              kubectl -n parcel-tracking rollout status deployment shipment-tracker --timeout=120s
+              kubectl apply -f - <<'YAML'
+              apiVersion: v1
+              kind: Service
+              metadata: {name: {{svc}}, namespace: parcel-tracking}
+              spec:
+                type: NodePort
+                selector: {app: shipment-tracker}
+                ports:
+                  - {name: http, protocol: TCP, port: 8000, targetPort: {{portName}}, nodePort: 31480}
+              YAML
