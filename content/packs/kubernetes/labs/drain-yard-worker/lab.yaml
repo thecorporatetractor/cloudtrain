@@ -4,7 +4,7 @@ metadata:
   id: drain-yard-worker
   title: Take a worker out of service for maintenance
   domain: kubernetes
-  frameworks: [cka:cluster-architecture, cka:workloads-scheduling]
+  frameworks: [cka:cluster-architecture]
   difficulty: easy
   estimatedMinutes: 10
   tags: [nodes, maintenance, drain, daemonset]
@@ -15,14 +15,17 @@ spec:
     worker **`{{target}}`**. Facilities will power it off as soon as you report
     that it is safe.
 
-    Work in context `qm-yard`:
+    From your workstation, switch to context `qm-yard` first:
 
     ```bash
     kubectl config use-context qm-yard
     ```
 
-    Mark `{{target}}` as unschedulable and move every workload Pod it is
-    running onto the remaining workers. Leave the other nodes schedulable.
+    Mark `{{target}}` as unschedulable and move every Pod it is running onto
+    the remaining workers, except Pods managed by DaemonSets: node agents such
+    as `node-telemetry` (namespace `qm-platform`) must keep running on every
+    worker. Leave the other nodes schedulable and keep `{{target}}` registered
+    in the cluster.
   objectives:
     - Find what is running on a node
     - Drain a node that runs DaemonSet Pods and Pods with emptyDir volumes
@@ -40,10 +43,10 @@ spec:
         access: [shell]
       - name: qm-yard
         driver: k8s-cluster
-        image: kubeadm:1.35
+        image: kubeadm:1.37
         cluster:
           mode: kubeadm
-          version: "1.35"
+          version: "v1.37.1"
           context: qm-yard
           nodes:
             - {name: yard-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
@@ -137,31 +140,37 @@ spec:
       description: No Pods other than DaemonSet Pods remain on {{target}}
       type: shell
       on: qm-yard
-      skills: [k8s.scheduling.cordon-drain, k8s.workloads.daemonsets]
+      skills: [k8s.scheduling.cordon-drain]
       weight: 2
       command: |
         kubectl get pods -A --field-selector spec.nodeName={{target}},status.phase!=Succeeded,status.phase!=Failed \
           -o jsonpath='{range .items[*]}{.metadata.ownerReferences[0].kind}{"\n"}{end}' | grep -vc '^DaemonSet$' || true
       expect: {match: exact, value: "0"}
     - id: dispatcher-healthy
-      description: crane-dispatcher is back at 3 ready replicas
-      type: k8s-query
-      skills: [k8s.scheduling.cordon-drain, k8s.workloads.deployments]
-      query: {cluster: qm-yard, resource: deployment, name: crane-dispatcher, namespace: yard-ops, jsonpath: "{.status.readyReplicas}"}
-      expect: {match: exact, value: "3"}
-    - id: buffer-healthy
-      description: scan-buffer (emptyDir volume) is running again elsewhere
+      description: 3 ready crane-dispatcher Pods run on other workers
       type: shell
       on: qm-yard
       skills: [k8s.scheduling.cordon-drain]
       command: |
-        kubectl -n yard-ops get pods -l app=scan-buffer --field-selector status.phase=Running \
-          -o jsonpath='{range .items[*]}{.spec.nodeName}{"\n"}{end}' | grep -v '^{{target}}$' | wc -l
+        kubectl -n yard-ops get pods -l app=crane-dispatcher \
+          -o jsonpath='{range .items[*]}{.spec.nodeName}|{.status.conditions[?(@.type=="Ready")].status}|{.metadata.deletionTimestamp}{"\n"}{end}' \
+          | awk -F'|' '$1 != "{{target}}" && $2 == "True" && $3 == ""' | wc -l
+      expect: {match: exact, value: "3"}
+    - id: buffer-healthy
+      description: scan-buffer (emptyDir volume) is ready again on another worker
+      type: shell
+      on: qm-yard
+      skills: [k8s.scheduling.cordon-drain]
+      command: |
+        kubectl -n yard-ops get pods -l app=scan-buffer \
+          -o jsonpath='{range .items[*]}{.spec.nodeName}|{.status.conditions[?(@.type=="Ready")].status}|{.metadata.deletionTimestamp}{"\n"}{end}' \
+          | awk -F'|' '$1 != "{{target}}" && $2 == "True" && $3 == ""' | wc -l
       expect: {match: exact, value: "1"}
     - id: daemonset-intact
       description: The node-telemetry DaemonSet was not deleted and is ready on every worker
       type: k8s-query
-      skills: [k8s.workloads.daemonsets]
+      skills: [k8s.scheduling.cordon-drain]
+      weight: 0.5
       query: {cluster: qm-yard, resource: daemonset, name: node-telemetry, namespace: qm-platform, jsonpath: "{.status.numberReady}"}
       expect: {match: exact, value: "3"}
     - id: workers-registered
@@ -169,6 +178,7 @@ spec:
       type: shell
       on: qm-yard
       skills: [k8s.scheduling.cordon-drain]
+      weight: 0.5
       command: kubectl get nodes -l '!node-role.kubernetes.io/control-plane' --no-headers | wc -l
       expect: {match: exact, value: "3"}
     - id: only-target-cordoned
@@ -228,7 +238,7 @@ spec:
         timeoutSec: 180
         run: |
           kubectl config use-context qm-yard
-          kubectl -n qm-platform delete ds node-telemetry
+          kubectl -n qm-platform delete ds node-telemetry --cascade=foreground
           kubectl drain {{target}} --delete-emptydir-data --timeout=120s
     - id: wrong-node
       description: Drains a different worker.
@@ -257,7 +267,7 @@ spec:
           kubectl -n yard-ops rollout status deploy/scan-buffer --timeout=60s
     alternatives:
       - id: cordon-then-evict
-        description: Cordon first, then delete the workload Pods by hand so their controllers recreate them elsewhere.
+        description: Cordon first, then delete every non-DaemonSet Pod on the node (in all namespaces) so its controller recreates it elsewhere.
         steps:
           - on: workstation
             as: learner
@@ -265,6 +275,9 @@ spec:
             run: |
               kubectl config use-context qm-yard
               kubectl cordon {{target}}
-              kubectl -n yard-ops delete pod --field-selector spec.nodeName={{target}}
+              kubectl get pods -A --field-selector spec.nodeName={{target}} \
+                -o jsonpath='{range .items[*]}{.metadata.namespace} {.metadata.name} {.metadata.ownerReferences[0].kind}{"\n"}{end}' \
+                | awk '$3 != "DaemonSet" {print $1, $2}' \
+                | while read -r ns pod; do kubectl -n "$ns" delete pod "$pod" --wait=false; done
               kubectl -n yard-ops rollout status deploy/crane-dispatcher --timeout=90s
               kubectl -n yard-ops rollout status deploy/scan-buffer --timeout=90s

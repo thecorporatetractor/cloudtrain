@@ -5,7 +5,10 @@ import YAML from "yaml";
 import { validateLab, referencedParams } from "@cloudtrain/lab-schema";
 import { scanText } from "./denylist.mjs";
 
-/** @typedef {{ level: "error" | "warn", file: string, path?: string, message: string }} Finding */
+/** @typedef {{ level: "error" | "warn" | "info", file: string, path?: string, message: string }} Finding */
+
+/** A check tagged with more skills than this is probably padded. */
+export const MAX_CHECK_SKILLS = 4;
 
 async function walk(dir, out = []) {
   for (const e of await readdir(dir, { withFileTypes: true })) {
@@ -70,10 +73,14 @@ export async function checkSkills(contentDir, findings) {
   return skills;
 }
 
-/** Loads content/frameworks/*.yaml; returns Set of 'fw:objective' refs. */
+/**
+ * Loads content/frameworks/*.yaml; returns Map of 'fw:objective' ref -> Set of skill ids.
+ * Topics are either plain strings or `{id, title, skills}`; structured topics must only
+ * use skills the objective lists, and every objective skill should belong to a topic.
+ */
 export async function checkFrameworks(contentDir, skills, findings) {
   const dir = path.join(contentDir, "frameworks");
-  const refs = new Set();
+  const refs = new Map();
   if (!existsSync(dir)) return refs;
   for (const name of (await readdir(dir)).filter((n) => n.endsWith(".yaml")).sort()) {
     const file = path.join(dir, name);
@@ -83,10 +90,30 @@ export async function checkFrameworks(contentDir, skills, findings) {
     for (const o of doc.objectives ?? []) {
       const ref = `${doc.id}:${o.id}`;
       if (refs.has(ref)) findings.push({ level: "error", file, path: o.id, message: `duplicate objective '${ref}'` });
-      refs.add(ref);
-      if (!o.skills?.length) findings.push({ level: "warn", file, path: o.id, message: "objective maps to no skills" });
-      for (const s of o.skills ?? []) {
+      const own = new Set(o.skills ?? []);
+      refs.set(ref, own);
+      if (!own.size) findings.push({ level: "warn", file, path: o.id, message: "objective maps to no skills" });
+      for (const s of own) {
         if (!skills.has(s)) findings.push({ level: "error", file, path: o.id, message: `unknown skill '${s}'` });
+      }
+      const structured = (o.topics ?? []).filter((t) => t && typeof t === "object");
+      if (!structured.length) continue;
+      const inTopics = new Set();
+      const topicIds = new Set();
+      for (const t of structured) {
+        const where = `${o.id}/${t.id ?? "?"}`;
+        if (!t.id) findings.push({ level: "error", file, path: where, message: "topic needs an id" });
+        else if (topicIds.has(t.id)) findings.push({ level: "error", file, path: where, message: `duplicate topic '${t.id}'` });
+        topicIds.add(t.id);
+        if (!t.skills?.length) findings.push({ level: "warn", file, path: where, message: "topic maps to no skills" });
+        for (const s of t.skills ?? []) {
+          inTopics.add(s);
+          if (!skills.has(s)) findings.push({ level: "error", file, path: where, message: `unknown skill '${s}'` });
+          else if (!own.has(s)) findings.push({ level: "error", file, path: where, message: `topic skill '${s}' is missing from the objective's skills` });
+        }
+      }
+      for (const s of own) {
+        if (!inTopics.has(s)) findings.push({ level: "warn", file, path: o.id, message: `skill '${s}' belongs to no topic` });
       }
     }
   }
@@ -134,8 +161,47 @@ export function re2Problems(re) {
   return [...found];
 }
 
+/**
+ * Loads deploy/images/catalog.yaml. Returns `{ file, images: Map<ref, entry>, workload: Set<ref> }`,
+ * or undefined (with a warning) when the catalog is missing.
+ */
+export async function loadCatalog(catalogFile, findings) {
+  if (!catalogFile || !existsSync(catalogFile)) {
+    findings.push({ level: "warn", file: catalogFile ?? "deploy/images/catalog.yaml", message: "image catalog not found; image refs were not checked" });
+    return undefined;
+  }
+  const doc = await loadYaml(catalogFile, findings);
+  if (!doc) return undefined;
+  return {
+    file: catalogFile,
+    images: new Map(Object.entries(doc.images ?? {})),
+    workload: new Set((doc.workloadImages ?? []).map(String)),
+  };
+}
+
+const minorOf = (v) => String(v ?? "").replace(/^v/, "").split(".").slice(0, 2).join(".");
+
+/**
+ * Container image refs a text creates Pods with: `--image=X`, JSON `"image":"X"` and
+ * YAML `image: X` (block or flow style). Refs with unresolved params or shell
+ * variables are skipped. Jsonpath like `{.spec.containers[0].image}` never matches.
+ * @param {string} text
+ */
+export function podImageRefs(text) {
+  const refs = new Set();
+  const patterns = [/--image[= ]+['"]?([^\s'"]+)/g, /"image"\s*:\s*"([^"]+)"/g, /(?<![\w.-])image:\s*['"]?([^\s'",}\]#]+)/g];
+  for (const re of patterns) {
+    for (const m of text.matchAll(re)) {
+      const ref = m[1];
+      if (ref.includes("{{") || ref.includes("$") || ref.includes("<")) continue;
+      refs.add(ref);
+    }
+  }
+  return refs;
+}
+
 /** Validates one lab directory. */
-export async function checkLab(labFile, skills, frameworkRefs, findings) {
+export async function checkLab(labFile, skills, frameworkRefs, findings, ctx = {}) {
   const doc = await loadYaml(labFile, findings);
   if (!doc) return undefined;
   const { valid, issues } = validateLab(doc);
@@ -156,8 +222,22 @@ export async function checkLab(labFile, skills, frameworkRefs, findings) {
     checkIds.add(c.id);
     for (const s of c.skills) {
       if (!skills.has(s)) findings.push({ level: "error", file: labFile, path: `/spec/checks/${i}/skills`, message: `unknown skill '${s}'` });
+      ctx.usedSkills?.add(s);
+    }
+    if (new Set(c.skills).size !== c.skills.length) findings.push({ level: "error", file: labFile, path: `/spec/checks/${i}/skills`, message: "duplicate skill" });
+    if (c.skills.length > MAX_CHECK_SKILLS) {
+      findings.push({ level: "warn", file: labFile, path: `/spec/checks/${i}/skills`, message: `check '${c.id}' is tagged with ${c.skills.length} skills (max ${MAX_CHECK_SKILLS}); tag only what it gives evidence for` });
     }
   });
+
+  // Framework objectives must share at least one skill with the lab's checks.
+  const labSkills = new Set(spec.checks.flatMap((c) => c.skills));
+  for (const f of doc.metadata.frameworks ?? []) {
+    const objSkills = frameworkRefs.get(f);
+    if (objSkills && ![...objSkills].some((s) => labSkills.has(s))) {
+      findings.push({ level: "warn", file: labFile, path: "/metadata/frameworks", message: `'${f}' maps none of the skills this lab's checks are tagged with` });
+    }
+  }
 
   // Node references in actions and checks must resolve to topology nodes.
   const nodes = new Map(spec.topology.nodes.map((n) => [n.name, n]));
@@ -216,6 +296,43 @@ export async function checkLab(labFile, skills, frameworkRefs, findings) {
       }
     }
   });
+
+  // Images: node images and every Pod image must come from deploy/images/catalog.yaml
+  // (lab VMs have no internet, so an unlisted image can never be pulled).
+  const catalog = ctx.catalog;
+  if (catalog) {
+    spec.topology.nodes.forEach((n, i) => {
+      const where = `/spec/topology/nodes/${i}/image`;
+      const kubeadm = n.driver === "k8s-cluster" && n.cluster?.mode === "kubeadm";
+      if (!n.image) {
+        if (kubeadm) findings.push({ level: "error", file: labFile, path: where, message: `kubeadm cluster '${n.name}' needs a catalog image (e.g. kubeadm:1.37)` });
+        return;
+      }
+      const entry = catalog.images.get(n.image);
+      if (!entry) {
+        findings.push({ level: "error", file: labFile, path: where, message: `image '${n.image}' is not in ${path.basename(catalog.file)}` });
+        return;
+      }
+      if (kubeadm && entry.kubernetesVersion && n.cluster?.version && minorOf(entry.kubernetesVersion) !== minorOf(n.cluster.version)) {
+        findings.push({ level: "error", file: labFile, path: `/spec/topology/nodes/${i}/cluster/version`, message: `cluster version '${n.cluster.version}' does not match image '${n.image}' (${entry.kubernetesVersion})` });
+      }
+    });
+    const texts = [];
+    for (const [where, list] of actions) {
+      list.forEach((a, i) => {
+        const at = where.endsWith("/mutation") ? `/spec/${where}` : `/spec/${where}/${i}`;
+        for (const t of [a.run, a.apply, a.file?.content]) if (t) texts.push([at, t]);
+      });
+    }
+    (spec.hints ?? []).forEach((h, i) => h.command && texts.push([`/spec/hints/${i}/command`, h.command]));
+    for (const [at, t] of texts) {
+      for (const ref of podImageRefs(t)) {
+        if (!catalog.workload.has(ref)) {
+          findings.push({ level: "error", file: labFile, path: at, message: `Pod image '${ref}' is not in workloadImages of ${path.basename(catalog.file)}` });
+        }
+      }
+    }
+  }
 
   // Misconceptions: every one should be a mutation test aimed at specific checks.
   const contextChecks = spec.checks.filter((c) => c.type === "k8s-context");
@@ -296,12 +413,18 @@ export async function scanDenylist(contentDir) {
   return hits;
 }
 
-/** Full run over a content directory. */
-export async function verifyContent(contentDir) {
+/**
+ * Full run over a content directory.
+ * @param {string} contentDir
+ * @param {{ catalogFile?: string }} [opts] catalogFile defaults to ../deploy/images/catalog.yaml beside contentDir.
+ */
+export async function verifyContent(contentDir, opts = {}) {
   /** @type {Finding[]} */
   const findings = [];
   const skills = await checkSkills(contentDir, findings);
   const frameworkRefs = await checkFrameworks(contentDir, skills, findings);
+  const catalog = await loadCatalog(opts.catalogFile ?? path.resolve(contentDir, "../deploy/images/catalog.yaml"), findings);
+  const usedSkills = new Set();
   const labs = [];
   const packsDir = path.join(contentDir, "packs");
   for (const pack of existsSync(packsDir) ? (await readdir(packsDir)).sort() : []) {
@@ -315,12 +438,17 @@ export async function verifyContent(contentDir) {
         continue;
       }
       const before = findings.filter((f) => f.level === "error").length;
-      const doc = await checkLab(labFile, skills, frameworkRefs, findings);
+      const doc = await checkLab(labFile, skills, frameworkRefs, findings, { catalog, usedSkills });
       const ok = findings.filter((f) => f.level === "error").length === before;
       labs.push({ file: labFile, id: doc?.metadata?.id ?? lab, ok, checks: doc?.spec?.checks?.length ?? 0 });
       labIds.add(lab);
     }
     await checkPack(packDir, labIds, findings);
+  }
+  // Info only: skills no lab gives evidence for yet (the lab backlog).
+  const skillsFile = path.join(contentDir, "skills.yaml");
+  for (const id of skills.keys()) {
+    if (!usedSkills.has(id)) findings.push({ level: "info", file: skillsFile, path: id, message: "no lab check is tagged with this skill" });
   }
   const denylistHits = await scanDenylist(contentDir);
   return { skills: skills.size, frameworks: frameworkRefs.size, labs, findings, denylistHits };

@@ -17,8 +17,9 @@ spec:
 
     etcd runs on the VM `ledger-etcd` as the systemd unit `etcd.service`
     (`/etc/systemd/system/etcd.service`), listening on
-    `https://127.0.0.1:2379`. Connect with `ssh ledger-etcd`; `sudo` works
-    without a password.
+    `https://127.0.0.1:2379`. From your workstation, connect with
+    `ssh ledger-etcd`; `sudo` works without a password. `etcdctl` and `etcdutl`
+    are installed there.
 
     1. Save a **snapshot of the running instance** to
        `/srv/qm-dr/archive/{{snap}}.db`.
@@ -106,6 +107,7 @@ spec:
       on: ledger-etcd
       target: etcd.service
       skills: [linux.systemd.units]
+      weight: 0.5
       expect: {match: exact, value: active}
     - id: serves-baseline
       description: The endpoint serves the baseline dataset (marker key reads "baseline")
@@ -129,6 +131,7 @@ spec:
       type: shell
       on: ledger-etcd
       skills: [k8s.cluster.etcd-tls]
+      weight: 0.5
       command: |
         etcdctl --endpoints=https://127.0.0.1:2379 --cacert=/etc/qm-etcd/pki/ca.crt --dial-timeout=2s --command-timeout=2s \
           get /quillmoor/dataset >/dev/null 2>&1 && echo open || echo enforced
@@ -233,7 +236,7 @@ spec:
             --key=/srv/qm-dr/tls/dr-operator-key.pem snapshot save /srv/qm-dr/archive/{{snap}}.db
           sudo etcdutl snapshot restore /srv/qm-dr/archive/ledger-baseline.db --data-dir=/var/lib/etcd-baseline
     - id: tls-disabled
-      description: Turns off client-certificate authentication to make etcdctl "work".
+      description: Turns off client-certificate authentication to make etcdctl "work" (drops --client-cert-auth and the trusted CA, which also enforces client certificates on its own).
       feedback: Weakening the server's TLS settings to get a backup is a security incident of its own. Use the supplied client identity.
       expectFail: [tls-still-enforced]
       mutation:
@@ -248,7 +251,7 @@ spec:
           sudo etcdutl snapshot restore /srv/qm-dr/archive/ledger-baseline.db --data-dir=/var/lib/etcd-baseline
           sudo chown -R etcd:etcd /var/lib/etcd-baseline
           sudo sed -i -e 's#--data-dir=/var/lib/etcd #--data-dir=/var/lib/etcd-baseline #' \
-            -e 's#--client-cert-auth=true#--client-cert-auth=false#' /etc/systemd/system/etcd.service
+            -e '/--client-cert-auth=true/d' -e '/--trusted-ca-file=/d' /etc/systemd/system/etcd.service
           sudo systemctl daemon-reload
           sudo systemctl start etcd
   solution:

@@ -4,7 +4,7 @@ metadata:
   id: netpol-namespace-port
   title: Admit one namespace on one port with a NetworkPolicy
   domain: kubernetes
-  frameworks: [cka:services-networking, cks:cluster-setup]
+  frameworks: [cka:services-networking, ckad:services-networking, cks:cluster-setup]
   difficulty: medium
   estimatedMinutes: 15
   tags: [networkpolicy, namespaces, ingress]
@@ -14,7 +14,7 @@ spec:
     Quillmoor Logistics' customs gateway exposes a declaration API to the
     brokers' portal. Security wants the gateway namespace locked down.
 
-    Work in context `qm-customs`:
+    From your workstation, switch to context `qm-customs` first:
 
     ```bash
     kubectl config use-context qm-customs
@@ -26,7 +26,8 @@ spec:
     - allows Pods in namespace `{{source}}` to connect to **TCP port
       {{port}}** of the Pods in `customs-clearance`;
     - does **not** allow traffic to any other port of those Pods;
-    - does **not** allow traffic from Pods in any other namespace.
+    - does **not** allow traffic from Pods in any other namespace, including
+      other Pods in `customs-clearance` itself.
 
     Test clients: every namespace involved (`{{source}}`, `public-kiosk` and
     `customs-clearance` itself) has a Pod named `probe` with `wget` available. The server Pod in
@@ -63,10 +64,10 @@ spec:
       # Setup self-tests enforcement and aborts if policies are not applied.
       - name: qm-customs
         driver: k8s-cluster
-        image: kubeadm:1.35
+        image: kubeadm:1.37
         cluster:
           mode: kubeadm
-          version: "1.35"
+          version: "v1.37.1"
           context: qm-customs
           nodes:
             - {name: customs-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
@@ -199,7 +200,7 @@ spec:
       description: "{{source}}/probe reaches declaration-api on {{port}}"
       type: shell
       on: qm-customs
-      skills: [k8s.networking.netpol-selectors, k8s.networking.connectivity-testing]
+      skills: [k8s.networking.netpol-selectors]
       weight: 2
       timeoutSec: 30
       command: |
@@ -208,7 +209,7 @@ spec:
         if [ -z "$ip" ] || [ "$phase" != Running ]; then echo "error: server IP '$ip', {{source}}/probe phase '$phase'"; exit 0; fi
         res=$(kubectl -n {{source}} exec probe -- sh -c 'wget -qO- -T 5 "http://$1/" 2>&1 >/dev/null; echo "rc=$?"' sh "$ip:{{port}}" 2>/dev/null)
         case "$res" in
-          *"timed out"*) echo blocked ;;
+          *"timed out"*|*"Connection refused"*|*"No route to host"*) echo blocked ;;
           rc=0) echo open ;;
           rc=1) echo blocked ;;
           *) echo "error: ${res:-kubectl exec failed}" | tr '\n' ' ' ;;
@@ -218,7 +219,7 @@ spec:
       description: "{{source}}/probe cannot reach declaration-api on {{otherPort}}"
       type: shell
       on: qm-customs
-      skills: [k8s.networking.netpol-ports, k8s.networking.connectivity-testing]
+      skills: [k8s.networking.netpol-ports]
       weight: 2
       timeoutSec: 30
       command: |
@@ -227,7 +228,7 @@ spec:
         if [ -z "$ip" ] || [ "$phase" != Running ]; then echo "error: server IP '$ip', {{source}}/probe phase '$phase'"; exit 0; fi
         res=$(kubectl -n {{source}} exec probe -- sh -c 'wget -qO- -T 5 "http://$1/" 2>&1 >/dev/null; echo "rc=$?"' sh "$ip:{{otherPort}}" 2>/dev/null)
         case "$res" in
-          *"timed out"*) echo blocked ;;
+          *"timed out"*|*"Connection refused"*|*"No route to host"*) echo blocked ;;
           rc=0) echo open ;;
           rc=1) echo blocked ;;
           *) echo "error: ${res:-kubectl exec failed}" | tr '\n' ' ' ;;
@@ -237,7 +238,7 @@ spec:
       description: public-kiosk/probe cannot reach declaration-api on {{port}}
       type: shell
       on: qm-customs
-      skills: [k8s.networking.netpol-selectors, k8s.networking.connectivity-testing]
+      skills: [k8s.networking.netpol-selectors]
       weight: 2
       timeoutSec: 30
       command: |
@@ -246,7 +247,7 @@ spec:
         if [ -z "$ip" ] || [ "$phase" != Running ]; then echo "error: server IP '$ip', public-kiosk/probe phase '$phase'"; exit 0; fi
         res=$(kubectl -n public-kiosk exec probe -- sh -c 'wget -qO- -T 5 "http://$1/" 2>&1 >/dev/null; echo "rc=$?"' sh "$ip:{{port}}" 2>/dev/null)
         case "$res" in
-          *"timed out"*) echo blocked ;;
+          *"timed out"*|*"Connection refused"*|*"No route to host"*) echo blocked ;;
           rc=0) echo open ;;
           rc=1) echo blocked ;;
           *) echo "error: ${res:-kubectl exec failed}" | tr '\n' ' ' ;;
@@ -264,7 +265,7 @@ spec:
         if [ -z "$ip" ] || [ "$phase" != Running ]; then echo "error: server IP '$ip', customs-clearance/probe phase '$phase'"; exit 0; fi
         res=$(kubectl -n customs-clearance exec probe -- sh -c 'wget -qO- -T 5 "http://$1/" 2>&1 >/dev/null; echo "rc=$?"' sh "$ip:{{port}}" 2>/dev/null)
         case "$res" in
-          *"timed out"*) echo blocked ;;
+          *"timed out"*|*"Connection refused"*|*"No route to host"*) echo blocked ;;
           rc=0) echo open ;;
           rc=1) echo blocked ;;
           *) echo "error: ${res:-kubectl exec failed}" | tr '\n' ' ' ;;
