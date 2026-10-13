@@ -21,10 +21,10 @@ Last updated: 2026-10-14.
 | Runtime | Grader (all check types, learner-safe messages, Running state) | verified | used by `labctl verify` | |
 | Runtime | `labctl verify` (Studio verifier cycle, reports) | verified | 6 of 11 K8s labs pass | all 11 |
 | Runtime | Orchestrator deployed in-cluster (`task orchestrator:deploy`) | verified | runtime stream | |
-| Runtime | WarmPool, claim, hibernate/resume with state, reset | in progress | branch `k8s/warmpool` | live proof, merge |
+| Runtime | WarmPool, claim, hibernate/resume with state, reset | verified (vcluster) / built (kubeadm) | `deploy/.results/warmpool-virtual-proof.txt`: claim Ready in 0.5 s, resume keeps learner work | kubeadm proof once Docker is back |
 | Images | Golden kubeadm node v1.37.1 (Calico, workload images preloaded, cni-install) | verified | `task lab:demo` PASS on the Calico image | |
-| Images | kubeadm v1.36 upgrade image (v1.37.1 staged offline) | in progress | branch `k8s/images` | build + boot test |
-| Images | etcd-host 3.6 VM image | built | image built | boot test via lab |
+| Images | kubeadm v1.36 upgrade image (v1.37.1 staged offline) | in progress | disk built; packaging interrupted by the Docker Desktop crash | `PACKAGE_ONLY=1` + boot test |
+| Images | etcd-host 3.6 VM image | verified | boot test: TLS health, lab setup + solution pass | full lab verify |
 | Images | jumphost:1, frr:10, nettools:1 | verified | used in live runs | |
 | Images | Image builds without nested KVM (TCG), one at a time | verified | no WSL crash since the change | |
 | Content | Lab schema v3 (+ expectFail, alternatives, file.source) | verified | compiler + lab-verify + Go tests | curriculum schema |
@@ -42,6 +42,7 @@ Last updated: 2026-10-14.
 | Exams | Exam simulation mode (timed multi-task, no hints, pass mark, report) | planned | definitions in curriculum proposal | engine + UI after approval |
 | Studio | Scenario Studio generation + real-lab verification | planned (UI mocked) | | after exam mode |
 | Tutor | AI tutor / failure explainer | planned | | needs AI data policy decision |
+| Ops | Local stack stability: Docker Desktop crashed under heavy load (01:10, SIGBUS) | open | crash log `~/cloudtrain-crashlog` | user restart; cap parallel heavy builds |
 | Ops | Production on vCenter (nested virt, Kata, node pools) | planned | | vCenter details needed |
 | Legal | BUSL-1.1 + CC BY-NC 4.0, NOTICE, third-party inventory | done | `LICENSE`, `content/LICENSE` | |
 | Legal | CLA (draft), legal review, licensor entity name, contact | planned | `CLA.md` | |
