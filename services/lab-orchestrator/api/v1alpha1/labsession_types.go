@@ -77,6 +77,11 @@ type LabSessionSpec struct {
 	// WarmPoolRef names the WarmPool that pre-provisioned this session, if any.
 	// +optional
 	WarmPoolRef string `json:"warmPoolRef,omitempty"`
+	// ValidateRequest asks the controller to grade the session: every time
+	// it changes, the grader runs all checks once and publishes the result
+	// in status.validation with the same observedRequest.
+	// +optional
+	ValidateRequest int64 `json:"validateRequest,omitempty"`
 }
 
 // NodePhase is the lifecycle phase of a single topology node.
@@ -177,6 +182,56 @@ type LabSessionStatus struct {
 	// ObservedResetGeneration is the last spec.resetGeneration acted upon.
 	// +optional
 	ObservedResetGeneration int64 `json:"observedResetGeneration,omitempty"`
+	// Validation is the latest grading result.
+	// +optional
+	Validation *ValidationStatus `json:"validation,omitempty"`
+}
+
+// ValidationPhase is the state of one grading run.
+// +kubebuilder:validation:Enum=Running;Complete;Failed
+type ValidationPhase string
+
+const (
+	ValidationRunning  ValidationPhase = "Running"
+	ValidationComplete ValidationPhase = "Complete"
+	// ValidationFailed means grading itself failed (not that checks failed).
+	ValidationFailed ValidationPhase = "Failed"
+)
+
+// ValidationStatus is the result of grading a session.
+type ValidationStatus struct {
+	// ObservedRequest is the spec.validateRequest this result answers.
+	ObservedRequest int64           `json:"observedRequest"`
+	Phase           ValidationPhase `json:"phase"`
+	// +optional
+	Message string `json:"message,omitempty"`
+	// +optional
+	StartedAt *metav1.Time `json:"startedAt,omitempty"`
+	// +optional
+	CompletedAt *metav1.Time `json:"completedAt,omitempty"`
+	// Score is the weighted percentage of passed checks, 0-100.
+	Score int32 `json:"score"`
+	// +optional
+	Checks []CheckResult `json:"checks,omitempty"`
+}
+
+// CheckResult is the outcome of one check.
+type CheckResult struct {
+	ID     string `json:"id"`
+	Passed bool   `json:"passed"`
+	// Weight is a decimal, as in the template.
+	// +optional
+	Weight string `json:"weight,omitempty"`
+	// +optional
+	Skills []string `json:"skills,omitempty"`
+	// Message is a short learner-safe explanation (never the expected value).
+	// +optional
+	Message string `json:"message,omitempty"`
+	// Output is the check's raw output, truncated to 2 KiB, for authors.
+	// +optional
+	Output string `json:"output,omitempty"`
+	// +optional
+	DurationMs int64 `json:"durationMs,omitempty"`
 }
 
 // +kubebuilder:object:root=true
