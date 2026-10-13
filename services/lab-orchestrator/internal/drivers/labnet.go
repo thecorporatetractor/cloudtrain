@@ -50,6 +50,7 @@ var (
 	GVKNAD            = schema.GroupVersionKind{Group: "k8s.cni.cncf.io", Version: "v1", Kind: "NetworkAttachmentDefinition"}
 	GVKVirtualMachine = schema.GroupVersionKind{Group: "kubevirt.io", Version: "v1", Kind: "VirtualMachine"}
 	GVKVMI            = schema.GroupVersionKind{Group: "kubevirt.io", Version: "v1", Kind: "VirtualMachineInstance"}
+	GVKDataVolume     = schema.GroupVersionKind{Group: "cdi.kubevirt.io", Version: "v1beta1", Kind: "DataVolume"}
 )
 
 // PlannedHost is a VM-backed host on the lab subnet.
@@ -324,12 +325,18 @@ func EntryNetworkPolicy(s *labsv1.LabSession, entry string, vclusterReleases []s
 	if len(vclusterReleases) > 0 {
 		vcPort := intstr.FromInt32(8443)
 		egress = append(egress, networkingv1.NetworkPolicyEgressRule{
-			To: []networkingv1.NetworkPolicyPeer{{PodSelector: &metav1.LabelSelector{
-				MatchLabels: map[string]string{"app": "vcluster"},
-				MatchExpressions: []metav1.LabelSelectorRequirement{{
-					Key: "release", Operator: metav1.LabelSelectorOpIn, Values: vclusterReleases,
-				}},
-			}}},
+			To: []networkingv1.NetworkPolicyPeer{{
+				// Each vcluster runs in its own namespace "ct-<release>".
+				NamespaceSelector: &metav1.LabelSelector{MatchExpressions: []metav1.LabelSelectorRequirement{{
+					Key: "kubernetes.io/metadata.name", Operator: metav1.LabelSelectorOpIn, Values: vclusterNamespaces(vclusterReleases),
+				}}},
+				PodSelector: &metav1.LabelSelector{
+					MatchLabels: map[string]string{"app": "vcluster"},
+					MatchExpressions: []metav1.LabelSelectorRequirement{{
+						Key: "release", Operator: metav1.LabelSelectorOpIn, Values: vclusterReleases,
+					}},
+				},
+			}},
 			Ports: []networkingv1.NetworkPolicyPort{{Protocol: &tcp, Port: &vcPort}},
 		})
 	}
@@ -345,6 +352,14 @@ func EntryNetworkPolicy(s *labsv1.LabSession, entry string, vclusterReleases []s
 			Egress:      egress,
 		},
 	}
+}
+
+func vclusterNamespaces(releases []string) []string {
+	out := make([]string, len(releases))
+	for i, r := range releases {
+		out[i] = "ct-" + r
+	}
+	return out
 }
 
 // ipInLab reports whether ip is on the lab subnet (sanity check for tests).

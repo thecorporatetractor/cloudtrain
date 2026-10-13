@@ -63,6 +63,9 @@ func TestCatalog(t *testing.T) {
 	if _, err := c.Resolve("jumphost:1", ImageKindContainerDisk); !errors.Is(err, ErrUnsupported) {
 		t.Errorf("kind mismatch: %v", err)
 	}
+	if _, err := LoadCatalog("../../../../deploy/images/catalog.yaml"); err != nil {
+		t.Errorf("repository catalog: %v", err)
+	}
 	if _, err := ParseCatalog([]byte("images:\n  x: {kind: vm, image: a}\n")); err == nil {
 		t.Error("unknown kind must fail")
 	}
@@ -253,7 +256,7 @@ func TestVClusterValuesAndPolicy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, w := range []string{rel + ".labs.svc", "enabled: false", LabelSessionUID + ": uid-1"} {
+	for _, w := range []string{rel + ".ct-" + rel + ".svc", "enabled: false", LabelSessionUID + ": uid-1"} {
 		if !strings.Contains(string(v), w) {
 			t.Errorf("values lack %q:\n%s", w, v)
 		}

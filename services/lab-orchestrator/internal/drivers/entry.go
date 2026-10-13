@@ -283,6 +283,15 @@ func adminFiles(a EntryAccess) []tarFile {
 	return files
 }
 
+// wiredMarker records the access digest last written into the learner's home.
+const wiredMarker = LearnerHome + "/.cloudtrain-wired"
+
+// learnerWireScript extracts the learner's files (tar on stdin) unless the
+// home already carries the same access ($1 = digest).
+const learnerWireScript = `m=` + wiredMarker + `
+if [ "$(cat "$m" 2>/dev/null)" = "$1" ]; then cat >/dev/null; exit 0; fi
+tar -x -C / -f - && printf '%s' "$1" > "$m"`
+
 // AdminKubeconfigPath is where the admin sidecar keeps a cluster's admin kubeconfig.
 func AdminKubeconfigPath(clusterNode string) string { return "/root/.kube/" + clusterNode + ".conf" }
 
@@ -312,7 +321,10 @@ func (d *ContainerDriver) Wire(ctx context.Context, ref NodeRef, access EntryAcc
 		files     []tarFile
 		args      []string
 	}{
-		{ContainerName, lf, []string{"tar", "-x", "-C", "/", "-f", "-"}},
+		// The learner's files are skipped when the (persistent) home already
+		// holds exactly this access: a resumed pod must not overwrite the
+		// learner's kubeconfig (current context, namespaces) or ssh config.
+		{ContainerName, lf, []string{"/bin/sh", "-c", learnerWireScript, "sh", access.Digest()}},
 		{AdminContainerName, adminFiles(access), []string{"tar", "--no-same-owner", "-x", "-C", "/", "-f", "-"}},
 	} {
 		data, err := buildTar(w.files)

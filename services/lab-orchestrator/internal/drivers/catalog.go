@@ -22,6 +22,12 @@ type CatalogImage struct {
 	Image             string   `json:"image"`
 	KubernetesVersion string   `json:"kubernetesVersion,omitempty"`
 	StagedUpgrades    []string `json:"stagedUpgrades,omitempty"`
+	// Netdev names the device family of a network-OS image (e.g. "frr");
+	// informational, families match by ref (see DeviceFamily).
+	Netdev string `json:"netdev,omitempty"`
+	// DiskSize of a persistent root disk imported from a containerDisk
+	// (default DefaultVMDiskSize); at least the image's virtual size.
+	DiskSize string `json:"diskSize,omitempty"`
 }
 
 // ImageCatalog maps the image refs used in lab.yaml (topology.nodes[].image)
