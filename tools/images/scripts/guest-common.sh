@@ -10,6 +10,7 @@ B=/opt/cloudtrain/build
 # shellcheck source=/dev/null
 source "$B/build.env"
 export DEBIAN_FRONTEND=noninteractive
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 # Grow root fs into the resized virtual disk. Inside the libguestfs appliance the
 # guest disk is not necessarily /dev/sda, so derive it from the mounted root.
