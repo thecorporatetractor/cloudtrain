@@ -84,7 +84,7 @@ test("check with more than 4 skills warns", async () => {
 });
 
 test("lab framework that shares no skill with its checks warns", async () => {
-  const f = await findingsAfter("scale-berth-planner", (s) => s.replace("frameworks: [cka:workloads-scheduling]", "frameworks: [cka:workloads-scheduling, cka:storage]"));
+  const f = await findingsAfter("scale-berth-planner", (s) => s.replace("frameworks: [cka:workloads-scheduling, ckad:deployment]", "frameworks: [cka:workloads-scheduling, ckad:deployment, cka:storage]"));
   assert.ok(f.some((x) => x.level === "warn" && /'cka:storage' maps none/.test(x.message)), JSON.stringify(f));
 });
 
