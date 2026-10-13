@@ -126,7 +126,8 @@ function progressGates(draft: StudioDraft) {
 /* Handlers                                                             */
 /* ------------------------------------------------------------------ */
 
-export const handlers = [
+/** Everything the gateway serves in real mode (catalog, labs, sessions, skills, home). */
+const coreHandlers = [
   http.get('/api/me', async () => {
     await latency();
     return HttpResponse.json(homeData.learner);
@@ -159,6 +160,11 @@ export const handlers = [
     if (!s) return HttpResponse.json({ error: 'Session not found' }, { status: 404 });
     return HttpResponse.json(s);
   }),
+  http.delete('/api/sessions/:id', async ({ params }) => {
+    await delay(150);
+    sessions.delete(String(params.id));
+    return new HttpResponse(null, { status: 204 });
+  }),
   http.post('/api/sessions/:id/validate', async ({ params }) => {
     await delay(1200 + Math.random() * 600);
     const s = sessions.get(String(params.id));
@@ -187,6 +193,14 @@ export const handlers = [
     return HttpResponse.json({ skills, states: skillStates, frameworks });
   }),
 
+];
+
+
+/**
+ * Team and Scenario Studio have no backend yet: in real API mode (VITE_API_MODE=real)
+ * only these run in the browser and every other request goes to the gateway.
+ */
+export const sampleOnlyHandlers = [
   http.get('/api/team', async () => {
     await latency();
     return HttpResponse.json(teamData);
@@ -240,3 +254,5 @@ export const handlers = [
     return HttpResponse.json(d);
   }),
 ];
+
+export const handlers = [...coreHandlers, ...sampleOnlyHandlers];

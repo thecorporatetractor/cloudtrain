@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import type { AccessKind, Lab, TopologyLink } from '@/api/types';
 import { DriverIcon } from '@/components/domain';
 import { Dropdown, Tooltip } from '@/components/ui';
+import { clusterMembers, findConsoleNode } from '@/lib/personalize';
 import { cn } from '@/lib/utils';
 import { TerminalView, type TerminalSource } from './TerminalView';
 
@@ -30,14 +31,15 @@ export function focusActiveTerminal() {
 let counter = 0;
 const uid = (p: string) => `${p}-${++counter}`;
 
-export function useTerminalModel(lab: Lab | undefined) {
+/** `real`: consoles may also open on kubeadm cluster members (ssh from the jumphost). */
+export function useTerminalModel(lab: Lab | undefined, real = false) {
   const [model, setModel] = useState<TermModel>({ panes: [], activePane: '' });
 
   const entry = lab?.spec.topology.entry ?? lab?.spec.topology.nodes[0]?.name;
 
   const openConsole = useCallback(
     (nodeName: string, access?: AccessKind) => {
-      const node = lab?.spec.topology.nodes.find((n) => n.name === nodeName);
+      const node = lab && findConsoleNode(lab, nodeName, real);
       if (!node) return;
       const acc = access ?? node.access?.[0] ?? 'shell';
       setModel((m) => {
@@ -54,7 +56,7 @@ export function useTerminalModel(lab: Lab | undefined) {
         return { ...m, panes: m.panes.map((p) => (p.id === target.id ? { ...p, tabs: [...p.tabs, tab], active: tab.id } : p)), activePane: target.id };
       });
     },
-    [lab],
+    [lab, real],
   );
 
   const openCapture = useCallback((link: TopologyLink) => {
@@ -142,12 +144,15 @@ interface AreaProps {
   onCapture?: (link: TopologyLink) => void;
   onSplit: () => void;
   ownsKey: (e: KeyboardEvent) => boolean;
+  /** Real API mode: the lab session the consoles attach to. */
+  sessionId?: string;
 }
 
 const nodeOf = (endpoint: string) => endpoint.split(':')[0]!;
 
-export function TerminalArea({ lab, model, onFocus, onClose, onOpenConsole, onCapture, onSplit, ownsKey }: AreaProps) {
-  const accessPoints = lab.spec.topology.nodes.flatMap((n) => (n.access ?? []).map((a) => ({ node: n, access: a })));
+export function TerminalArea({ lab, model, onFocus, onClose, onOpenConsole, onCapture, onSplit, ownsKey, sessionId }: AreaProps) {
+  const consoleNodes = sessionId ? [...lab.spec.topology.nodes, ...clusterMembers(lab)] : lab.spec.topology.nodes;
+  const accessPoints = consoleNodes.flatMap((n) => (n.access ?? []).map((a) => ({ node: n, access: a })));
   const links = lab.spec.topology.links ?? [];
   // The last console must stay open, so its close button is not offered.
   const canClose = (pane: Pane) => !(model.panes.length === 1 && pane.tabs.length === 1);
@@ -274,7 +279,7 @@ export function TerminalArea({ lab, model, onFocus, onClose, onOpenConsole, onCa
               </div>
               <div className="pane-body">
                 {pane.tabs.map((t) => (
-                  <TerminalView key={t.id} lab={lab} source={t.source} active={pane.active === t.id} onOpenNode={(n) => onOpenConsole(n)} ownsKey={ownsKey} />
+                  <TerminalView key={t.id} lab={lab} source={t.source} active={pane.active === t.id} onOpenNode={(n) => onOpenConsole(n)} ownsKey={ownsKey} sessionId={sessionId} />
                 ))}
               </div>
             </div>

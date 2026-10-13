@@ -11,6 +11,7 @@ import './styles/shell.css';
 import './styles/pages.css';
 import './styles/workspace.css';
 import { router } from './router';
+import { API_MODE } from './api/mode';
 import { ThemeProvider } from './lib/theme';
 import { TooltipProvider } from './components/ui';
 
@@ -21,7 +22,11 @@ const queryClient = new QueryClient({
 });
 
 async function boot() {
-  if (import.meta.env.DEV || import.meta.env.VITE_MOCK_API === '1') {
+  if (API_MODE === 'real') {
+    // The gateway serves everything except Team and Studio, which stay sample data.
+    const { startMocks } = await import('./mocks/browser');
+    await startMocks({ sampleOnly: true });
+  } else if (import.meta.env.DEV || import.meta.env.VITE_MOCK_API === '1') {
     const { startMocks } = await import('./mocks/browser');
     await startMocks();
   }
