@@ -20,6 +20,20 @@ need() { command -v "$1" >/dev/null 2>&1 || die "missing '$1' (run: task tools)"
 
 cluster_exists() { kind get clusters 2>/dev/null | grep -qx "$CLUSTER_NAME"; }
 
+# fetch_pinned <url> <sha256> <dest>: download once into a cache and refuse any
+# file whose sha256 differs from the pinned one (versions.env).
+fetch_pinned() {
+  local url=$1 sum=$2 dest=$3
+  if ! echo "$sum  $dest" | sha256sum -c --status 2>/dev/null; then
+    mkdir -p "$(dirname "$dest")"
+    curl -fsSL --retry 3 -o "$dest.tmp" "$url" || die "download failed: $url"
+    echo "$sum  $dest.tmp" | sha256sum -c --status \
+      || die "sha256 mismatch for $url (got $(sha256sum "$dest.tmp" | cut -d' ' -f1), pinned $sum)"
+    mv "$dest.tmp" "$dest"
+  fi
+}
+MANIFEST_CACHE="$REPO_ROOT/deploy/.cache"
+
 # wait_for <description> <timeout-seconds> <command...>
 wait_for() {
   local desc=$1 timeout=$2; shift 2

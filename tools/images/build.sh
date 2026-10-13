@@ -10,7 +10,7 @@
 #
 # Output: docker image ${GOLDEN_IMAGE_REPO}:${LAB_K8S_VERSION} and .cache/out/disk.qcow2
 source "$(dirname "$0")/../../deploy/scripts/lib.sh"
-need docker; need curl
+need docker; need curl; need jq
 
 HERE="$REPO_ROOT/tools/images"
 CACHE="$HERE/.cache"
@@ -36,33 +36,60 @@ if [[ ! -x $KUBEADM_BIN ]]; then
   chmod +x "$KUBEADM_BIN"
 fi
 FLANNEL_YAML="$CACHE/kube-flannel-${FLANNEL_VERSION}.yml"
-[[ -s $FLANNEL_YAML ]] || curl -fsSL -o "$FLANNEL_YAML" \
-  "https://github.com/flannel-io/flannel/releases/download/${FLANNEL_VERSION}/kube-flannel.yml"
+fetch_pinned "https://github.com/flannel-io/flannel/releases/download/${FLANNEL_VERSION}/kube-flannel.yml" \
+  "$FLANNEL_MANIFEST_SHA256" "$FLANNEL_YAML"
 
+KUBEADM_IMAGES=$("$KUBEADM_BIN" config images list --kubernetes-version "$LAB_K8S_VERSION") \
+  || die "kubeadm config images list failed"
 mapfile -t IMAGES < <(
-  "$KUBEADM_BIN" config images list --kubernetes-version "$LAB_K8S_VERSION" 2>/dev/null
+  printf '%s\n' "$KUBEADM_IMAGES"
   grep -oE 'image: *[^ ]+' "$FLANNEL_YAML" | awk '{print $2}' | sort -u
 )
+for want in /kube-apiserver: /pause: /etcd: /coredns: flannel:; do
+  printf '%s\n' "${IMAGES[@]}" | grep -q -- "$want" || die "image list has no '$want' image: ${IMAGES[*]}"
+done
 PAUSE_IMAGE=$(printf '%s\n' "${IMAGES[@]}" | grep '/pause:')
+
+# Pin every image by digest (images.lock, committed). The list itself is derived
+# from the pinned versions, so a version bump that changes it must refresh the lock.
+LOCK="$HERE/images.lock"
+if [[ ${UPDATE_LOCK:-0} == 1 ]]; then
+  log "resolving image digests into $LOCK"
+  { sed -n '/^#/p' "$LOCK" 2>/dev/null
+    for img in "${IMAGES[@]}"; do
+      d=$(docker buildx imagetools inspect "$img" --format '{{json .Manifest}}' | jq -r .digest)
+      [[ $d == sha256:* ]] || die "cannot resolve digest of $img"
+      echo "$img@$d"
+    done; } > "$LOCK.tmp" && mv "$LOCK.tmp" "$LOCK"
+fi
+mapfile -t LOCKED < <(grep -v '^#' "$LOCK" | grep .)
+diff <(printf '%s\n' "${IMAGES[@]}" | sort) <(printf '%s\n' "${LOCKED[@]}" | sed 's/@sha256:.*//' | sort) >&2 \
+  || die "$LOCK does not match the image list for LAB_K8S_VERSION/FLANNEL_VERSION (run: UPDATE_LOCK=1 task image:build)"
 # The images are pulled INSIDE the guest by containerd (ctr pull, linux/amd64 only)
 # rather than `docker save`d here: Docker 27 with the containerd image store
 # saves multi-arch indexes without the other platforms' blobs, and
 # `ctr images import` then fails with "content digest ... not found".
-printf '%s\n' "${IMAGES[@]}" > "$CACHE/images.txt"
-log "images to pre-load: ${IMAGES[*]}"
+printf '%s\n' "${LOCKED[@]}" > "$CACHE/images.txt"
+log "images to pre-load (by digest): ${IMAGES[*]}"
 
 # --- 3. customize -----------------------------------------------------------------
 # Builder tag = hash of its Dockerfile, so edits rebuild it automatically.
-BUILDER="cloudtrain/image-builder:$(sha256sum "$HERE/builder/Dockerfile" | cut -c1-12)"
+BUILDER="cloudtrain/image-builder:$( { cat "$HERE/builder/Dockerfile"; echo "$UBUNTU_APT_SNAPSHOT"; } | sha256sum | cut -c1-12)"
 docker image inspect "$BUILDER" >/dev/null 2>&1 || {
   log "building image-builder container $BUILDER"
-  docker build -q -t "$BUILDER" "$HERE/builder" >/dev/null
+  docker build -q -t "$BUILDER" --build-arg UBUNTU_APT_SNAPSHOT="$UBUNTU_APT_SNAPSHOT" "$HERE/builder" >/dev/null
 }
 cat > "$CACHE/build.env" <<EOF
 LAB_K8S_MINOR=${LAB_K8S_MINOR}
 LAB_K8S_VERSION=${LAB_K8S_VERSION}
 PAUSE_IMAGE=${PAUSE_IMAGE}
 FLANNEL_VERSION=${FLANNEL_VERSION}
+CONTAINERD_VERSION=${CONTAINERD_VERSION}
+CRI_TOOLS_VERSION=${CRI_TOOLS_VERSION}
+KUBERNETES_CNI_VERSION=${KUBERNETES_CNI_VERSION}
+UBUNTU_APT_SNAPSHOT=${UBUNTU_APT_SNAPSHOT}
+DOCKER_APT_KEY_FPR=${DOCKER_APT_KEY_FPR}
+K8S_APT_KEY_FPR=${K8S_APT_KEY_FPR}
 BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 GIT_REV=$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)
 EOF

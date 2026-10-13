@@ -10,6 +10,9 @@
 #   workstation pod (learner@workstation): eth0 on the platform network (reaches the
 #     vcluster API), net1 into the lab VPC (reaches the VMs).
 #   vcluster "virtual" in the same namespace.
+#   NetworkPolicies: the workstation may only reach DNS, its own vcluster and the lab
+#     VPC; pods synced from the vcluster may only reach DNS and their own namespace.
+#     Step 8 asserts this isolation (and the VPC's) and fails the demo otherwise.
 #
 # kubeadm init/join run unattended from cloud-init. The CA and bootstrap token
 # are generated here, so the worker can join with a pinned CA hash.
@@ -218,6 +221,35 @@ kind: NetworkAttachmentDefinition
 metadata: { name: access, namespace: $NS }
 spec:
   config: '{"cniVersion":"0.3.1","type":"kube-ovn","server_socket":"/run/openvswitch/kube-ovn-daemon.sock","provider":"access.$NS.ovn"}'
+---
+# The learner shell sits on the platform pod network (eth0). Without this it could
+# reach the host API server, the OVN DBs, KubeVirt, other labs and the internet.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: workstation-isolation, namespace: $NS }
+spec:
+  podSelector: { matchLabels: { cloudtrain.dev/node: workstation } }
+  policyTypes: [Ingress, Egress]
+  ingress: []
+  egress:
+    - to: [{ namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: kube-system } }, podSelector: { matchLabels: { k8s-app: kube-dns } } }]
+      ports: [{ protocol: UDP, port: 53 }, { protocol: TCP, port: 53 }]
+    - to: [{ podSelector: { matchLabels: { app: vcluster, release: virtual } } }]
+      ports: [{ protocol: TCP, port: 8443 }]
+    - to: [{ ipBlock: { cidr: 192.168.99.0/24 } }, { ipBlock: { cidr: 192.168.100.0/24 } }]
+---
+# Pods the learner creates inside the vcluster are synced into this namespace on the
+# platform network: same rule, they may only talk to DNS and to their own lab.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: virtual-workloads-isolation, namespace: $NS }
+spec:
+  podSelector: { matchLabels: { vcluster.loft.sh/managed-by: virtual } }
+  policyTypes: [Egress]
+  egress:
+    - to: [{ namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: kube-system } }, podSelector: { matchLabels: { k8s-app: kube-dns } } }]
+      ports: [{ protocol: UDP, port: 53 }, { protocol: TCP, port: 53 }]
+    - to: [{ podSelector: {} }]
 EOF
 wait_for "subnets ready" 60 bash -c "[[ \$(kubectl --context $KUBECONTEXT get subnet $NS-lab $NS-access -o jsonpath='{.items[*].status.conditions[?(@.type==\"Ready\")].status}') == 'True True' ]]"
 
@@ -344,12 +376,13 @@ jh 'set -e
   chmod 600 ~/.kube/config; rm ~/.kube/kubeadm.conf ~/.kube/virtual.conf
   kubectl config use-context kubeadm >/dev/null'
 
-jh "kubectl -n kube-system rollout status deploy/coredns --timeout=180s" >/dev/null || warn "lab CoreDNS not Available yet"
+jh "kubectl --context kubeadm -n kube-system wait deploy/coredns --for=condition=Available --timeout=180s" >/dev/null \
+  || { jh "kubectl --context kubeadm -n kube-system get pods -o wide" || true; die "lab CoreDNS not Available"; }
 T_SYS=$(date +%s.%N)
 
 # --- 8. the learner view (this is the proof) ------------------------------------
 PROOF="$RESULTS/$NS.txt"
-jh 'set -x
+jh 'set -ex
   whoami; hostname
   ssh ctl-1 "hostname; cat /etc/cloudtrain-release | head -2"
   kubectl config get-contexts
@@ -360,7 +393,56 @@ jh 'set -x
   kubectl get ns
   kubectl version | grep Server
   kubectl config use-context kubeadm
-  kubectl -n kube-system get pods -o wide' 2>&1 | tee "$PROOF"
+  kubectl -n kube-system get pods -o wide' 2>&1 | tee "$PROOF" || die "learner view failed (see $PROOF)"
+
+# Assertions: two different, real clusters behind the two contexts.
+server_version() { jh "kubectl --context $1 version -o json" 2>/dev/null | jq -r '.serverVersion.gitVersion // empty'; }
+V_KUBEADM=$(server_version kubeadm); V_VIRTUAL=$(server_version virtual)
+[[ -n $V_KUBEADM && -n $V_VIRTUAL ]] || die "server version missing (kubeadm='$V_KUBEADM' virtual='$V_VIRTUAL')"
+[[ $V_KUBEADM != "$V_VIRTUAL" ]] || die "kubeadm and virtual contexts report the same server version ($V_KUBEADM)"
+[[ $V_KUBEADM == "$LAB_K8S_VERSION" ]] || die "kubeadm context serves $V_KUBEADM, expected $LAB_K8S_VERSION"
+N_READY=$(jh "kubectl --context kubeadm get nodes --no-headers" | awk '$2=="Ready"' | wc -l)
+(( N_READY == 2 )) || die "expected 2 Ready kubeadm nodes, got $N_READY"
+log "ok: contexts kubeadm=$V_KUBEADM ($N_READY Ready nodes) virtual=$V_VIRTUAL"
+
+# Isolation. reach <where> <ip> <port>: exit 0 iff a TCP connect succeeds within 3s.
+reach() {
+  local cmd="timeout 3 bash -c '</dev/tcp/$2/$3' 2>/dev/null"
+  case $1 in
+    workstation) k -n "$NS" exec workstation -- bash -c "$cmd" 2>/dev/null ;;
+    *)           jh "ssh $1 \"$cmd\"" 2>/dev/null ;;
+  esac
+}
+expect() {  # expect <open|closed> <where> <ip> <port> <what>
+  local got=closed
+  reach "$2" "$3" "$4" && got=open
+  if [[ $got == "$1" ]]; then echo "isolation ok: $2 -> $5 ($3:$4) $got"
+  else echo "ISOLATION FAIL: $2 -> $5 ($3:$4) is $got, expected $1"; fi
+}
+svc_ip() { k -n "$1" get svc "$2" -o jsonpath='{.spec.clusterIP}'; }
+OVN_NB_IP=$(svc_ip kube-system ovn-nb)
+OVN_NB_EP=$(k -n kube-system get endpointslice -l kubernetes.io/service-name=ovn-nb -o jsonpath='{.items[0].endpoints[0].addresses[0]}')
+VIRT_API_IP=$(svc_ip kubevirt virt-api)
+VC_IP=$(svc_ip "$NS" virtual)
+DNS_POD_IP=$(k -n kube-system get pod -l k8s-app=kube-dns -o jsonpath='{.items[0].status.podIP}')
+NODE_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "${CLUSTER_NAME}-control-plane")
+{
+  expect open   workstation "$VC_IP"       443  "own vcluster API"
+  expect open   workstation "$CP_IP"       22   "ctl-1 ssh (net1, lab VPC)"
+  expect closed workstation "$OVN_NB_IP"   6641 "OVN NB DB service"
+  expect closed workstation "$OVN_NB_EP"   6641 "OVN NB DB endpoint"
+  expect closed workstation 10.96.0.1      443  "host kube-apiserver service"
+  expect closed workstation "$NODE_IP"     6443 "host kube-apiserver on kind node"
+  expect closed workstation "$VIRT_API_IP" 443  "KubeVirt virt-api"
+  expect closed workstation 1.1.1.1        443  "internet"
+  expect closed ctl-1       "$DNS_POD_IP"  53   "platform pod network (10.16.0.0/16)"
+  expect closed ctl-1       "$VC_IP"       443  "vcluster service"
+  expect closed ctl-1       "$NODE_IP"     6443 "kind node"
+  expect closed ctl-1       1.1.1.1        443  "internet"
+  expect open   ctl-1       "$WK_IP"       10250 "wrk-1 kubelet (inside the VPC)"
+} 2>&1 | tee -a "$PROOF"
+mapfile -t FAILS < <(grep '^ISOLATION FAIL' "$PROOF")
+((${#FAILS[@]} == 0)) || die "lab isolation broken: ${#FAILS[@]} check(s) failed (see $PROOF)"
 
 # --- 9. RAM per VM ---------------------------------------------------------------
 mem_report() {

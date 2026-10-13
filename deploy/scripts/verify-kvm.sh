@@ -12,6 +12,10 @@ wait_for "nodes advertise devices.kubevirt.io/kvm" 300 bash -c \
   "[[ \$(kubectl --context $KUBECONTEXT get nodes -o jsonpath='{.items[*].status.allocatable.devices\.kubevirt\.io/kvm}' | wc -w) -ge 1 ]]"
 k get nodes -o custom-columns='NODE:.metadata.name,KVM:.status.allocatable.devices\.kubevirt\.io/kvm,VHOST:.status.allocatable.devices\.kubevirt\.io/vhost-net,TUN:.status.allocatable.devices\.kubevirt\.io/tun'
 
+# A previous run's namespace may still be terminating: wait it out, then remove
+# the probe namespace however this script exits.
+k delete ns "$NS" --ignore-not-found --wait=true --timeout=180s >/dev/null || die "old $NS namespace did not go away"
+trap 'k delete ns "$NS" --wait=false --ignore-not-found >/dev/null 2>&1 || true' EXIT
 k create ns "$NS" --dry-run=client -o yaml | k apply -f - >/dev/null
 cat <<EOF | k apply -f - >/dev/null
 apiVersion: kubevirt.io/v1
@@ -29,7 +33,7 @@ spec:
   networks: [{ name: default, pod: {} }]
   volumes:
     - name: root
-      containerDisk: { image: quay.io/kubevirt/cirros-container-disk-demo:${KUBEVIRT_VERSION} }
+      containerDisk: { image: $CIRROS_CONTAINERDISK }
 EOF
 start=$SECONDS
 k -n "$NS" wait vmi/kvm-probe --for=condition=Ready --timeout=300s >/dev/null \
@@ -41,6 +45,5 @@ dtype=$(k -n "$NS" exec "$pod" -c compute -- virsh -c qemu+unix:///session?socke
 if [[ -z $dtype ]]; then
   dtype=$(k -n "$NS" exec "$pod" -c compute -- sh -c 'virsh list --name | head -1 | xargs -r virsh dumpxml' 2>/dev/null | grep -o "<domain type='[a-z]*'" || true)
 fi
-k delete ns "$NS" --wait=false >/dev/null
 [[ $dtype == "<domain type='kvm'" ]] || die "probe VMI is not using KVM (libvirt: '${dtype:-unknown}')"
 log "KVM verified: libvirt $dtype"

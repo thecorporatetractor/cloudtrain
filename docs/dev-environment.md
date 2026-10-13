@@ -20,18 +20,25 @@ containerd image store, nested virtualization on (`/dev/kvm` present).
 | about 8 GB free RAM, 20 GB disk | platform takes about 3 GB idle, one demo lab about 3 GB | |
 
 Every version is pinned in **`deploy/versions.env`**, which is the only place versions are
-set:
+set. Pinning goes below the tag where that is possible: the kind node image, the Multus
+image, the KVM probe disk and every image baked into the golden image are pinned by
+digest (golden image list: `tools/images/images.lock`); the KubeVirt, CDI and Flannel
+manifests are checked against sha256 sums; Multus is vendored (`deploy/multus/`, see
+"Known gaps" 4); the golden image's apt packages are exact versions, Ubuntu packages come
+from a fixed `snapshot.ubuntu.com` point in time, and the Docker and pkgs.k8s.io repo keys
+must match pinned fingerprints:
 
 | Component | Version | Note |
 |---|---|---|
 | kind / node image | v0.33.0 / `kindest/node:v1.36.4@sha256:099e…` | KubeVirt 1.9 supports K8s 1.34–1.36, so the host cluster stays on 1.36 |
-| Kube-OVN (helm chart) | v1.16.13 | primary CNI, geneve overlay, one VPC per lab |
-| Multus (thick) | v4.3.1 | adds the jumphost's second NIC into the lab VPC |
+| Kube-OVN (helm chart) | v1.16.13 | primary CNI, geneve overlay, one VPC per lab, `ENABLE_SSL: true` (NB/SB/raft over mutual TLS) |
+| Multus (thick) | v4.3.1 (`v4.3.1-thick@sha256:a357…`) | adds the jumphost's second NIC into the lab VPC; upstream manifest ships the floating `snapshot-thick` tag |
 | KubeVirt / virtctl | v1.9.1 | `useEmulation: false` |
 | CDI | v1.66.1 | installed; the demo uses containerDisks |
 | vcluster CLI and chart | v0.37.2 | the virtual cluster serves K8s v1.36.0 |
 | Lab Kubernetes (inside VMs) | v1.37.1 from `pkgs.k8s.io/core:/stable:/v1.37` | current minor |
-| Ubuntu cloud image | noble `release-20260926`, sha256 pinned | |
+| Lab node runtime | containerd.io `2.4.1-2~ubuntu.24.04~noble`, cri-tools `1.37.0-1.1`, kubernetes-cni `1.9.1-1.1` | installed as `pkg=version` and held |
+| Ubuntu cloud image | noble `release-20260926`, sha256 pinned | apt archive snapshot `20261010T000000Z` |
 | Flannel (lab CNI inside VMs) | v0.28.10 | |
 | go-task | v3.54.0 | |
 
@@ -48,20 +55,58 @@ task lab:clean      # delete leftover demo labs (namespace + VPC + subnets)
 task dev:down       # delete ONLY the cloudtrain-dev kind cluster
 ```
 
-`dev:up` is idempotent. It also recovers the cluster after a WSL or Docker restart; see
-"Known gaps".
+`dev:up` is idempotent: a re-run on a converged cluster changes nothing (no DaemonSet or
+Deployment generation bump, no pod replaced; checked by comparing pod UIDs before and
+after, about 20 s). It also brings the cluster back after its node containers stop:
+
+- it runs `host-prep.sh` first, then `docker start`s any stopped node container of
+  `cloudtrain-dev` (`kind get clusters` also lists clusters whose nodes have exited, and
+  Docker does not restart kind nodes on its own);
+- it checks that `/dev/kvm`, `/dev/vhost-net` and `/dev/net/tun` are character devices in
+  every node and restarts a node that lacks one (a privileged container only gets the
+  host device nodes that exist when it starts);
+- it handles the control-plane IP drift that a restart can cause (see "Known gaps" 2).
+
+`dev:up` never changes your kubeconfig's current-context: every call passes
+`--context kind-cloudtrain-dev`, and after `kind create cluster` (which switches it) the
+previous context is restored.
+
+Tested: `docker stop` of both node containers, then `dev:up` (135 s, including an IP
+drift .4 → .2 and OVN DB reset); and a node with `/dev/vhost-net` removed (restarted,
+83 s). **Not tested:** a real `wsl --shutdown` cycle (it would kill the session running the
+test). It should be the same as the `docker stop` case plus host-prep reloading modules.
 
 ## What `lab:demo` builds
 
 ```
-Kube-OVN VPC <ns>  (isolated: no route to the platform pod network or the internet; verified)
+Kube-OVN VPC <ns>  (no route to the platform pod network, kind nodes or the internet; asserted by lab:demo)
  ├─ subnet <ns>-lab     192.168.100.0/24   ctl-1 .10  wrk-1 .11   (KubeVirt VMs, golden containerDisk, bridge binding)
  └─ subnet <ns>-access  192.168.99.0/24    workstation .5         (provider access.<ns>.ovn, Multus NAD)
 workstation pod (learner@workstation)
-   eth0 -> platform network (reaches the vcluster API service)
+   eth0 -> platform network, NetworkPolicy workstation-isolation: egress ONLY to
+           kube-dns :53, its own vcluster (virtual-0 :8443 via svc virtual:443) and the
+           lab VPC CIDRs; no ingress
    net1 -> lab VPC (static route 192.168.100.0/24 via 192.168.99.1)
 vcluster "virtual" in the same namespace (its pods stay on the platform network)
+   pods synced from it: NetworkPolicy virtual-workloads-isolation, egress ONLY to
+   kube-dns :53 and pods in the lab namespace (no internet, no external DNS)
 ```
+
+**Isolation is asserted, not assumed.** Step 8 of `lab-demo.sh` probes TCP connects and
+fails the demo on any mismatch:
+
+| From | Must reach | Must NOT reach |
+|---|---|---|
+| workstation | own vcluster API (`virtual.<ns>.svc:443`), `ctl-1:22` over net1 | `ovn-nb` service and endpoint `:6641`, host API (`10.96.0.1:443` and kind node `:6443`), `virt-api`, internet (`1.1.1.1:443`) |
+| ctl-1 (VM) | `wrk-1:10250` | platform pod network (a `10.16.0.0/16` CoreDNS pod), the vcluster service, kind node `:6443`, internet |
+
+An earlier version of this page said "isolated; verified", but only the VM side had
+been checked: the workstation reached the unauthenticated OVN NB DB, the host API server,
+virt-api, other labs' vclusters and the internet. That is fixed by the policies above and
+by Kube-OVN `ENABLE_SSL` (the NB/SB DBs now require a client certificate; a plain
+JSON-RPC `list_dbs` gets no answer). Removing the workstation policy from a running lab
+makes `ovn-nb:6641`, `10.96.0.1:443` and `1.1.1.1:443` reachable again, so the policy is
+what blocks them.
 
 1. For each lab, the script generates an SSH key, a cluster CA (so the worker can join
    with a pinned `caCertHashes`) and a bootstrap token. All of them go into Secrets.
@@ -75,9 +120,12 @@ vcluster "virtual" in the same namespace (its pods stay on the platform network)
    contexts are renamed to `kubeadm` and `virtual`. The workstation pod has
    `automountServiceAccountToken: false`, so the learner never holds a token for the host
    cluster.
-4. The script prints the learner's view (saved to `deploy/.results/<ns>.txt`), measures
-   timings and RAM (appended to `deploy/.results/timings.log`), and then deletes the
-   namespace, VPC and subnets.
+4. The script prints the learner's view (saved to `deploy/.results/<ns>.txt`) and asserts
+   it: both contexts return a server version, the versions differ, `kubeadm` serves
+   `LAB_K8S_VERSION` with 2 Ready nodes, and lab CoreDNS is Available. Then it runs the
+   isolation checks above, measures timings and RAM (appended to
+   `deploy/.results/timings.log`), and deletes the namespace, VPC and subnets. Any failed
+   check exits non-zero.
 
 Proof excerpt (run `ctlab-demo-185308`):
 
@@ -96,7 +144,8 @@ default kube-node-lease kube-public kube-system ...   Server Version: v1.36.0
 ```
 
 The two contexts report different server versions (v1.37.1 and v1.36.0), which shows
-that `use-context` switches between two real clusters. The kept lab was also checked by
+that `use-context` switches between two real clusters; the script now fails if they do
+not. The kept lab was also checked by
 hand: CoreDNS Running with 0 restarts, and a pod pinned to `wrk-1` ran with pod IP
 `10.244.1.2`, so the Flannel overlay works across the VMs.
 
@@ -111,9 +160,19 @@ node.
 | ctlab-demo-185644 | 13.2 s | 55.2 s | 89.0 s | 142.4 s |
 | ctlab-demo-190031 | 14.4 s | 56.5 s | 99.4 s | 139.7 s |
 | ctlab-demo-190804 (after node restart + IP drift) | 15.6 s | 63.4 s | 106.5 s | 167.2 s |
+| two review runs (kept lab ctlab-demo-191948 and one other) | n/a | 64.3–65.2 s | 105.6–109.4 s | n/a |
+| ctlab-demo-194258 (NetworkPolicies + Kube-OVN SSL) | 16.1 s | 67.6 s | 116.5 s | 160.9 s |
+| ctlab-demo-202340 (rebuilt golden image: digests, apt snapshot, pinned packages) | 16.2 s | 60.2 s | 98.8 s | 139.8 s |
 
 \* This includes waiting for the vcluster and assembling the kubeconfig. It is not a pure
 cluster metric.
+
+Across all runs: VMs Running in 13–17 s, SSH ready in 55–68 s, both nodes Ready in
+89–117 s.
+**End to end, `task lab:demo` takes about 3.5–4 minutes of wall time** (3m37s in review,
+3m39s for ctlab-demo-194258 with the lab kept; 5m02s for ctlab-demo-202340, of which
+about 62 s was the one-off `kind load` of the rebuilt golden image), which includes image checks, vcluster creation, the assertions, and
+deleting the lab.
 
 | VM | Guest RAM | Guest used (`free -m`) | virt-launcher pod cgroup |
 |---|---|---|---|
@@ -129,8 +188,9 @@ Other measurements:
 | Step | Time |
 |---|---|
 | `dev:up` from nothing | 401 s (cold image pulls; KubeVirt 173 s, CDI 49 s) |
-| `dev:up` re-run after node restart with IP drift | 144 s |
-| `image:build` (base image cached) | 304 s (virt-customize 116 s, sparsify, containerDisk build) |
+| `dev:up` re-run after node restart with IP drift | 144 s (forced IP change), 135 s (`docker stop` of both nodes) |
+| `dev:up` re-run on a converged cluster | about 20 s, no changes |
+| `image:build` (base image cached) | 304 s (virt-customize 116 s, sparsify, containerDisk build); 3072 s when the builder image is rebuilt, because `snapshot.ubuntu.com` served about 370 KB/s here (builder 40 min, virt-customize 457 s) |
 | KVM probe VMI (cirros) to Ready | 13–16 s |
 | `kind load` of the golden image (2.26 GB containerDisk) | about 65 s per node; the demo skips nodes that already have it |
 | Platform idle footprint (both kind nodes) | about 3.1 GB |
@@ -143,15 +203,22 @@ warm pools, not faster scheduling.
 
 Choice: **virt-customize at build time**, not cloud-init at first boot. Packages and all
 control-plane and CNI images are baked in. This is what lets the VMs run in an isolated
-VPC with no internet and keeps boot-to-Ready around 90–100 s.
+VPC with no internet and keeps boot-to-Ready around 90–117 s.
 
-- `builder/Dockerfile`: Ubuntu 24.04 + libguestfs, run with `--device /dev/kvm`. The tag is
-  derived from the Dockerfile hash, so editing it triggers a rebuild.
+- `builder/Dockerfile`: Ubuntu 24.04 (by digest) + libguestfs from the pinned apt snapshot
+  (only the `ca-certificates` bootstrap comes from the live archive), run with
+  `--device /dev/kvm`. The tag is derived from the Dockerfile and snapshot, so changing
+  either triggers a rebuild.
 - `build.sh`: fetches the pinned cloud image and checks its sha256. It resolves the image
-  list with the pinned `kubeadm config images list` plus the Flannel manifest, grows the
-  disk to 10G, runs `scripts/guest-setup.sh` inside the guest (containerd.io with
-  SystemdCgroup, kubelet/kubeadm/kubectl `1.37.1-1.1` held, sysctls/modules, then
-  `ctr pull --platform linux/amd64` of 9 images into `k8s.io`), generalizes the image
+  list with the pinned `kubeadm config images list` plus the Flannel manifest (sha256
+  checked), fails if kubeadm fails or the list lacks kube-apiserver, pause, etcd, coredns
+  or flannel, and requires the list to match `images.lock` (`UPDATE_LOCK=1` refreshes
+  the digests after a version bump). It grows the disk to 10G, runs
+  `scripts/guest-setup.sh` inside the guest (apt from the pinned Ubuntu snapshot, repo
+  keys checked against pinned fingerprints, containerd.io/cri-tools/kubernetes-cni and
+  kubelet/kubeadm/kubectl `1.37.1-1.1` at exact versions and held, SystemdCgroup,
+  sysctls/modules, then `ctr pull --platform linux/amd64` of 9 images by digest into
+  `k8s.io`, tagged by name for kubeadm), generalizes the image
   (machine-id, ssh host keys, cloud-init clean), runs `virt-sparsify --compress` (about
   1.06 GiB qcow2), and packages the result as a containerDisk `FROM scratch`, with
   `/disk/disk.qcow2` owned by 107.
@@ -177,11 +244,18 @@ VPC with no internet and keeps boot-to-Ready around 90–100 s.
    missing when a node starts (vhost_net is not loaded after a WSL reboot), Docker creates
    an empty *directory* `/dev/vhost-net` on the host and `modprobe vhost_net` can no
    longer create the node. kind nodes are privileged and get host devices anyway, so only
-   `/dev/kvm` is mounted. `host-prep.sh` repairs a stray directory.
+   `/dev/kvm` is mounted. `host-prep.sh` repairs a stray directory, but that repair path
+   has **not been tested** since it was written (it needs the broken state from a WSL
+   reboot). host-prep runs `modprobe` in the kind node image (pinned by digest, ships
+   kmod), so it fetches nothing at runtime.
 4. **Multus thick daemon limits (50Mi/100m upstream) are too small.** Delegate plugins
    such as portmap run in its cgroup, hit `memory.max` about 300k times, and sandboxes fail
-   with `failed to reserve sandbox name`. `dev:up` patches the limits to 100Mi request /
-   512Mi limit with no CPU limit.
+   with `failed to reserve sandbox name`. The manifest is vendored in
+   `deploy/multus/multus-daemonset-thick.yaml` with 100Mi request / 512Mi limit and no CPU
+   limit, and with the image pinned to `v4.3.1-thick` by digest. It is applied as is, so a
+   re-run of `dev:up` is a no-op (the earlier apply-then-patch bumped the DaemonSet twice
+   and bounced a Multus pod on every run). The upstream file's sha256 is recorded in
+   `versions.env`; re-vendor it when bumping `MULTUS_VERSION`.
 5. **CoreDNS loop in lab clusters.** KubeVirt DHCP gives the VM the host cluster DNS
    (10.96.0.10), which is also the lab cluster's own DNS service IP, so CoreDNS forwarded
    to itself and died in loop detection. The lab kubelet now uses `resolvConf:

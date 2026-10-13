@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Load the kernel modules the runtime needs, without sudo: a short-lived
-# privileged container runs modprobe against the host kernel.
+# privileged container runs modprobe against the host kernel. The container is
+# the kind node image (pinned by digest, ships kmod), so nothing is fetched at runtime.
 #   openvswitch, geneve : Kube-OVN datapath (OVS kernel module + geneve tunnels)
 #   vhost_net, tun      : KubeVirt virtio-net (creates /dev/vhost-net)
 # Must run BEFORE `kind create cluster`: privileged containers only see device
@@ -27,8 +28,8 @@ fi
 
 if ((${#missing[@]})); then
   log "loading kernel modules: ${missing[*]}"
-  docker run --rm --privileged -v /lib/modules:/lib/modules:ro -v /dev:/hostdev alpine:3.22 \
-    sh -c "apk add -q kmod >/dev/null && ${fix_vhost}for m in ${missing[*]}; do modprobe \$m; done" \
+  docker run --rm --privileged --entrypoint sh -v /lib/modules:/lib/modules:ro -v /dev:/hostdev "$KIND_NODE_IMAGE" \
+    -c "${fix_vhost}for m in ${missing[*]}; do modprobe \$m; done" \
     || die "modprobe failed; on WSL2 check that /lib/modules/$(uname -r) exists"
 fi
 
