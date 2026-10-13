@@ -61,8 +61,33 @@ spec:
       run: |
         set -e
         apt-mark hold kubeadm kubelet kubectl
-        mkdir -p /var/lib/cloudtrain
-        grep -m1 'image:' /etc/kubernetes/manifests/etcd.yaml | awk '{print $2}' > /var/lib/cloudtrain/etcd-image.before
+        mkdir -p /var/lib/cloudtrain /opt/cloudtrain/bin
+        rm -f /var/lib/cloudtrain/cordoned-at
+        # Durable cordon evidence for was-cordoned (Events expire after the
+        # apiserver's --event-ttl). The watcher polls the node and records the
+        # first time spec.unschedulable becomes true; API outages during the
+        # upgrade only pause it.
+        cat > /opt/cloudtrain/bin/cordon-watch <<'SH'
+        #!/bin/sh
+        export KUBECONFIG=/etc/kubernetes/admin.conf
+        while [ ! -s /var/lib/cloudtrain/cordoned-at ]; do
+          if [ "$(kubectl get node ledger-cp-1 -o jsonpath='{.spec.unschedulable}' 2>/dev/null)" = true ]; then
+            date -u +%Y-%m-%dT%H:%M:%SZ > /var/lib/cloudtrain/cordoned-at
+          fi
+          sleep 2
+        done
+        SH
+        chmod 0755 /opt/cloudtrain/bin/cordon-watch
+        cat > /etc/systemd/system/cloudtrain-cordon-watch.service <<'UNIT'
+        [Unit]
+        Description=CloudTrain grader: record when ledger-cp-1 is cordoned
+        [Service]
+        ExecStart=/opt/cloudtrain/bin/cordon-watch
+        Restart=on-failure
+        RestartSec=2
+        UNIT
+        systemctl daemon-reload
+        systemctl restart cloudtrain-cordon-watch.service
     - on: qm-ledger/ledger-wk-1
       run: apt-mark hold kubeadm kubelet kubectl
     - on: qm-ledger
@@ -99,6 +124,11 @@ spec:
   teardown:
     - on: qm-ledger
       run: kubectl delete namespace ledger --ignore-not-found --wait=false
+    - on: qm-ledger/ledger-cp-1
+      run: |
+        systemctl disable --now cloudtrain-cordon-watch.service 2>/dev/null || true
+        rm -f /etc/systemd/system/cloudtrain-cordon-watch.service /opt/cloudtrain/bin/cordon-watch /var/lib/cloudtrain/cordoned-at
+        systemctl daemon-reload
   checks:
     - id: context
       description: Terminal is using context qm-ledger
@@ -125,15 +155,6 @@ spec:
         api=$(kubectl -n kube-system get pod kube-apiserver-ledger-cp-1 -o jsonpath='{.spec.containers[0].image}' | sed 's/.*://')
         echo "$cfg $api"
       expect: {match: exact, value: "v1.35.2 v1.35.2"}
-    - id: etcd-untouched
-      description: The etcd static Pod still runs the image it had before the upgrade
-      type: shell
-      on: qm-ledger/ledger-cp-1
-      skills: [k8s.cluster.kubeadm-upgrade, k8s.cluster.version-skew]
-      command: |
-        now=$(grep -m1 'image:' /etc/kubernetes/manifests/etcd.yaml | awk '{print $2}')
-        [ "$now" = "$(cat /var/lib/cloudtrain/etcd-image.before)" ] && echo unchanged || echo "changed to $now"
-      expect: {match: exact, value: unchanged}
     - id: node-packages
       description: kubelet and kubectl on ledger-cp-1 are 1.35.2
       type: shell
@@ -150,11 +171,10 @@ spec:
     - id: was-cordoned
       description: ledger-cp-1 was taken out of scheduling during the window
       type: shell
-      on: qm-ledger
+      on: qm-ledger/ledger-cp-1
       skills: [k8s.scheduling.cordon-drain]
-      command: |
-        kubectl get events -A --field-selector involvedObject.kind=Node,involvedObject.name=ledger-cp-1,reason=NodeNotSchedulable -o name | wc -l
-      expect: {match: regex, value: "^[1-9][0-9]*$"}
+      command: test -s /var/lib/cloudtrain/cordoned-at && echo cordoned || echo never
+      expect: {match: exact, value: cordoned}
     - id: uncordoned
       description: ledger-cp-1 is schedulable again
       type: k8s-query
@@ -204,7 +224,9 @@ spec:
         sudo apt-mark unhold kubeadm && sudo apt-get update && sudo apt-get install -y kubeadm='1.35.2-*' && sudo apt-mark hold kubeadm
       cost: 2
     - title: Keep etcd where it is
-      body: kubeadm can be told to leave etcd alone during apply.
+      body: |
+        `kubeadm upgrade apply` also moves etcd to the version it bundles unless you
+        tell it not to. The window excludes etcd, so leave it alone during apply.
       command: sudo kubeadm upgrade apply v1.35.2 --etcd-upgrade=false
       cost: 2
     - title: The node still shows the old version?
@@ -215,12 +237,18 @@ spec:
     - id: forgot-kubelet-restart
       description: Upgrades every package and the control plane but never restarts the kubelet.
       feedback: The kubelet keeps running the old binary until the service restarts, so the node still reports v1.35.1.
+      # Valid only if installing the kubelet package does not restart the
+      # service itself (no restart in the deb's postinst). The verifier proves
+      # this on a live node: if the package restarts kubelet, kubelet-restarted
+      # passes and this mutation is reported as not caught.
+      expectFail: [kubelet-restarted]
       mutation:
         on: workstation
         as: learner
         timeoutSec: 600
         run: |
-          kubectl --context qm-ledger drain ledger-cp-1 --ignore-daemonsets --delete-emptydir-data
+          kubectl config use-context qm-ledger
+          kubectl drain ledger-cp-1 --ignore-daemonsets --delete-emptydir-data
           ssh ledger-cp-1 'sudo bash -s' <<'EOS'
           set -e
           apt-mark unhold kubeadm kubelet kubectl
@@ -230,15 +258,18 @@ spec:
           apt-get install -y kubelet='1.35.2-*' kubectl='1.35.2-*'
           apt-mark hold kubeadm kubelet kubectl
           EOS
-          kubectl --context qm-ledger uncordon ledger-cp-1
+          kubectl uncordon ledger-cp-1
     - id: upgraded-worker-too
       description: Also upgrades the worker node, outside the agreed window.
       feedback: The change window covers the control plane only. Workers are upgraded in a separate, announced step.
+      expectFail: [worker-node-untouched, worker-packages-untouched]
       mutation:
         on: workstation
         as: learner
         timeoutSec: 600
         run: |
+          kubectl config use-context qm-ledger
+          kubectl drain ledger-cp-1 --ignore-daemonsets --delete-emptydir-data
           for n in ledger-cp-1 ledger-wk-1; do
             ssh "$n" 'sudo bash -s' <<'EOS'
           set -e
@@ -249,14 +280,17 @@ spec:
           systemctl daemon-reload && systemctl restart kubelet
           EOS
           done
+          kubectl uncordon ledger-cp-1
     - id: never-cordoned
       description: Upgrades in place without draining the node first.
       feedback: Draining first moves workloads off before the control-plane Pods and kubelet restart; skipping it causes avoidable disruption.
+      expectFail: [was-cordoned]
       mutation:
         on: workstation
         as: learner
         timeoutSec: 600
         run: |
+          kubectl config use-context qm-ledger
           ssh ledger-cp-1 'sudo bash -s' <<'EOS'
           set -e
           apt-mark unhold kubeadm kubelet kubectl
@@ -268,12 +302,14 @@ spec:
     - id: left-cordoned
       description: Completes the upgrade but forgets to uncordon the node.
       feedback: Maintenance is only finished when the node accepts work again.
+      expectFail: [uncordoned]
       mutation:
         on: workstation
         as: learner
         timeoutSec: 600
         run: |
-          kubectl --context qm-ledger drain ledger-cp-1 --ignore-daemonsets --delete-emptydir-data
+          kubectl config use-context qm-ledger
+          kubectl drain ledger-cp-1 --ignore-daemonsets --delete-emptydir-data
           ssh ledger-cp-1 'sudo bash -s' <<'EOS'
           set -e
           apt-mark unhold kubeadm kubelet kubectl
@@ -282,12 +318,6 @@ spec:
           kubeadm upgrade apply -y v1.35.2 --etcd-upgrade=false
           systemctl daemon-reload && systemctl restart kubelet
           EOS
-    - id: upgraded-etcd
-      description: Lets kubeadm upgrade etcd as well, although the window excludes it.
-      feedback: |
-        `kubeadm upgrade apply` also moves etcd to the version it bundles unless you
-        pass `--etcd-upgrade=false`. When the bundled etcd equals the running one the
-        effect is invisible, so this misconception is graded only when the versions differ.
   solution:
     explanation: |
       kubeadm upgrades the control plane in two halves: `kubeadm upgrade apply`

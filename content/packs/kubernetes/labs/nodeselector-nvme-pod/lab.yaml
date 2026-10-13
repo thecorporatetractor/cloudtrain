@@ -134,10 +134,13 @@ spec:
     - id: node-name
       description: Pins the Pod with spec.nodeName instead of a nodeSelector.
       feedback: nodeName bypasses the scheduler and ties the Pod to one host name. A nodeSelector expresses the requirement (fast storage) so any matching node will do.
+      expectFail: [pod-selector]
       mutation:
-        on: qm-fleet
+        on: workstation
         as: learner
-        apply: |
+        run: |
+          kubectl config use-context qm-fleet
+          kubectl apply -f - <<'YAML'
           apiVersion: v1
           kind: Pod
           metadata: {name: "{{pod}}", namespace: fleet-ops}
@@ -145,22 +148,28 @@ spec:
             nodeName: fleet-wk-2
             containers:
               - {name: "{{pod}}", image: "httpd:2.4-alpine"}
+          YAML
     - id: relabelled-node
       description: Labels a different node to match instead of selecting the existing label.
       feedback: The task was to place the Pod, not to change the fleet's inventory labels.
+      expectFail: [nodes-unchanged]
       mutation:
         on: workstation
         as: learner
         run: |
-          kubectl --context qm-fleet label node fleet-wk-3 storage-tier={{tier}}
-          kubectl --context qm-fleet -n fleet-ops run {{pod}} --image=httpd:2.4-alpine --overrides='{"spec":{"nodeSelector":{"storage-tier":"{{tier}}"}}}'
+          kubectl config use-context qm-fleet
+          kubectl label node fleet-wk-3 storage-tier={{tier}}
+          kubectl -n fleet-ops run {{pod}} --image=httpd:2.4-alpine --overrides='{"spec":{"nodeSelector":{"storage-tier":"{{tier}}"}}}'
     - id: label-on-pod
       description: Puts storage-tier={{tier}} into the Pod's own labels, which has no effect on scheduling.
       feedback: Pod labels describe the Pod. Placement constraints go in `spec.nodeSelector` (or affinity).
+      expectFail: [pod-selector]
       mutation:
         on: workstation
         as: learner
-        run: kubectl --context qm-fleet -n fleet-ops run {{pod}} --image=httpd:2.4-alpine --labels=storage-tier={{tier}}
+        run: |
+          kubectl config use-context qm-fleet
+          kubectl -n fleet-ops run {{pod}} --image=httpd:2.4-alpine --labels=storage-tier={{tier}}
   solution:
     explanation: The scheduler only considers nodes whose labels contain every key/value in `nodeSelector`.
     steps:

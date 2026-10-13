@@ -43,3 +43,29 @@ test("file action needs exactly one of content/source", () => {
 test("referencedParams finds template references", () => {
   assert.deepEqual([...referencedParams(minimal)], ["word"]);
 });
+
+test("alternatives need at least one step", () => {
+  const bad = structuredClone(minimal);
+  delete bad.spec.solution.alternatives[0].steps;
+  assert.equal(validateLab(bad).valid, false);
+  bad.spec.solution.alternatives[0].steps = [];
+  assert.equal(validateLab(bad).valid, false);
+});
+
+test("file.source must stay inside the lab directory", () => {
+  for (const source of ["../x", "/etc/passwd", "assets/../../x", "./x"]) {
+    const bad = structuredClone(minimal);
+    bad.spec.solution.alternatives[0].steps[0].file.source = source;
+    assert.equal(validateLab(bad).valid, false, source);
+  }
+});
+
+test("a mutation needs expectFail and vice versa", () => {
+  const lab = structuredClone(minimal);
+  lab.spec.misconceptions = [{ id: "m", description: "d", mutation: { on: "box", run: "true" } }];
+  assert.equal(validateLab(lab).valid, false);
+  lab.spec.misconceptions[0].expectFail = ["c1"];
+  assert.deepEqual(validateLab(lab).issues, []);
+  delete lab.spec.misconceptions[0].mutation;
+  assert.equal(validateLab(lab).valid, false);
+});

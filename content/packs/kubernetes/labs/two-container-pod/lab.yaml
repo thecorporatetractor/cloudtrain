@@ -134,19 +134,24 @@ spec:
     - id: two-pods
       description: Creates two separate Pods instead of one Pod with two containers.
       feedback: Containers that must be co-scheduled and share network/storage belong in the same Pod.
+      expectFail: [container-names]
       mutation:
         on: workstation
         as: learner
         run: |
-          kubectl --context qm-depot -n depot-kiosk run {{pod}} --image=httpd:2.4-alpine
-          kubectl --context qm-depot -n depot-kiosk run {{pod}}-cache --image=redis:7.4-alpine
+          kubectl config use-context qm-depot
+          kubectl -n depot-kiosk run {{pod}} --image=httpd:2.4-alpine
+          kubectl -n depot-kiosk run {{pod}}-cache --image=redis:7.4-alpine
     - id: cache-as-init
       description: Declares the cache as an init container; a long-running init container blocks the Pod forever.
       feedback: Init containers must exit before app containers start. A server process belongs in `containers` (or a native sidecar, which the task did not ask for).
+      expectFail: [no-init-containers]
       mutation:
-        on: qm-depot
+        on: workstation
         as: learner
-        apply: |
+        run: |
+          kubectl config use-context qm-depot
+          kubectl apply -f - <<'YAML'
           apiVersion: v1
           kind: Pod
           metadata: {name: "{{pod}}", namespace: depot-kiosk}
@@ -155,13 +160,17 @@ spec:
               - {name: cache, image: "redis:7.4-alpine"}
             containers:
               - {name: web, image: "httpd:2.4-alpine"}
+          YAML
     - id: default-container-name
       description: Keeps the generated container name instead of naming it web.
       feedback: kubectl run names the container after the Pod; the task fixes the container names.
+      expectFail: [container-names]
       mutation:
-        on: qm-depot
+        on: workstation
         as: learner
-        apply: |
+        run: |
+          kubectl config use-context qm-depot
+          kubectl apply -f - <<'YAML'
           apiVersion: v1
           kind: Pod
           metadata: {name: "{{pod}}", namespace: depot-kiosk}
@@ -169,6 +178,7 @@ spec:
             containers:
               - {name: "{{pod}}", image: "httpd:2.4-alpine"}
               - {name: cache, image: "redis:7.4-alpine"}
+          YAML
   solution:
     explanation: Both processes are entries in the same `spec.containers` list, so they share the Pod's lifecycle, network namespace and node.
     steps:

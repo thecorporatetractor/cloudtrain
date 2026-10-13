@@ -17,6 +17,9 @@ test("flags original identifiers in their leaking roles", () => {
     "nodeSelector: {disk: ssd}",
     "kubectl label node x disk=ssd",
     "serviceaccount cicd-token in app-team1",
+    "write the answer to /opt/KUQX0815/out.txt",
+    "task kucm00302 asks for",
+    "kubectl config use-context wk8s",
   ];
   for (const line of bad) assert.ok(scanText(line).length > 0, `expected a hit for: ${line}`);
 });
@@ -27,6 +30,8 @@ test("does not flag legitimate uses of generic tokens", () => {
     "The internal network uses Kube-OVN.",
     "kubectl config use-context qm-yard",
     "nodeSelector: {storage-tier: nvme}",
+    "image: kubeadm:1.35",
+    "kubectl -n kube-system get pods",
   ];
   for (const line of ok) assert.deepEqual(scanText(line), [], `unexpected hit for: ${line}`);
 });

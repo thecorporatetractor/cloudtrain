@@ -91,12 +91,18 @@ export interface Lab {
       cost?: number;
     }[];
     /**
-     * Plausible wrong approaches. Each is also a mutation test: applying `mutation` instead of the solution must fail at least one check.
+     * Plausible wrong approaches. Each one with a `mutation` is also a mutation test: the verifier applies `mutation` instead of the solution and requires every check listed in `expectFail` to fail. A misconception without a mutation is advisory only.
      */
     misconceptions?: {
       id: string;
       description: string;
       mutation?: Action;
+      /**
+       * Ids of the checks aimed at this misconception. Each must fail after `mutation`; failures of other checks (e.g. the context check) do not count.
+       *
+       * @minItems 1
+       */
+      expectFail?: [string, ...string[]];
       feedback?: string;
     }[];
     solution: {
@@ -111,7 +117,10 @@ export interface Lab {
       alternatives?: {
         id: string;
         description: string;
-        steps?: Action[];
+        /**
+         * @minItems 1
+         */
+        steps: [Action, ...Action[]];
       }[];
     };
   };

@@ -34,8 +34,9 @@ spec:
     | Client certificate | `/srv/qm-dr/tls/dr-operator.pem` |
     | Client key | `/srv/qm-dr/tls/dr-operator-key.pem` |
 
-    > Saving a snapshot of this instance takes a second or two. If the command
-    > seems to hang, cancel it with `Ctrl+C` and check your flags.
+    > The dataset is tiny, so a correct snapshot finishes almost at once. A
+    > command that just sits there usually means the TLS handshake is not
+    > completing.
   objectives:
     - Authenticate to etcd with a CA, client certificate and key
     - Take and verify a snapshot of a live member
@@ -173,9 +174,11 @@ spec:
     - id: snapshot-after-restore
       description: Restores the baseline first and snapshots afterwards, so the "evidence" is the baseline.
       feedback: Order matters. A snapshot taken after the restore can no longer show what the live cluster contained.
+      expectFail: [snapshot-is-live-state]
       mutation:
         on: ledger-etcd
         as: learner
+        timeoutSec: 120
         run: |
           set -e
           sudo systemctl stop etcd
@@ -188,9 +191,11 @@ spec:
     - id: missing-tls-flags
       description: Calls etcdctl without the CA, certificate and key, so the snapshot never gets written.
       feedback: The endpoint is https with client-certificate authentication. Pass --cacert, --cert and --key on every online etcdctl command.
+      expectFail: [snapshot-exists]
       mutation:
         on: ledger-etcd
         as: learner
+        timeoutSec: 120
         run: |
           sudo timeout 10 etcdctl --endpoints=https://127.0.0.1:2379 snapshot save /srv/qm-dr/archive/{{snap}}.db || true
           sudo systemctl stop etcd
@@ -201,9 +206,11 @@ spec:
     - id: no-daemon-reload
       description: Edits the unit file but restarts without daemon-reload, so etcd keeps serving the old data dir.
       feedback: systemd caches unit files. After editing one, run `systemctl daemon-reload` or the restart uses the old command line.
+      expectFail: [serves-baseline]
       mutation:
         on: ledger-etcd
         as: learner
+        timeoutSec: 120
         run: |
           set -e
           sudo etcdctl --endpoints=https://127.0.0.1:2379 --cacert=/srv/qm-dr/tls/ca.pem --cert=/srv/qm-dr/tls/dr-operator.pem \
@@ -215,9 +222,11 @@ spec:
     - id: restore-not-applied
       description: Restores into a new directory but never points the service at it.
       feedback: A restore only produces files. Nothing changes until etcd is started on that directory.
+      expectFail: [serves-baseline, keyspace-replaced]
       mutation:
         on: ledger-etcd
         as: learner
+        timeoutSec: 120
         run: |
           set -e
           sudo etcdctl --endpoints=https://127.0.0.1:2379 --cacert=/srv/qm-dr/tls/ca.pem --cert=/srv/qm-dr/tls/dr-operator.pem \
@@ -226,6 +235,22 @@ spec:
     - id: tls-disabled
       description: Turns off client-certificate authentication to make etcdctl "work".
       feedback: Weakening the server's TLS settings to get a backup is a security incident of its own. Use the supplied client identity.
+      expectFail: [tls-still-enforced]
+      mutation:
+        on: ledger-etcd
+        as: learner
+        timeoutSec: 120
+        run: |
+          set -e
+          sudo etcdctl --endpoints=https://127.0.0.1:2379 --cacert=/srv/qm-dr/tls/ca.pem --cert=/srv/qm-dr/tls/dr-operator.pem \
+            --key=/srv/qm-dr/tls/dr-operator-key.pem snapshot save /srv/qm-dr/archive/{{snap}}.db
+          sudo systemctl stop etcd
+          sudo etcdutl snapshot restore /srv/qm-dr/archive/ledger-baseline.db --data-dir=/var/lib/etcd-baseline
+          sudo chown -R etcd:etcd /var/lib/etcd-baseline
+          sudo sed -i -e 's#--data-dir=/var/lib/etcd #--data-dir=/var/lib/etcd-baseline #' \
+            -e 's#--client-cert-auth=true#--client-cert-auth=false#' /etc/systemd/system/etcd.service
+          sudo systemctl daemon-reload
+          sudo systemctl start etcd
   solution:
     explanation: |
       `etcdctl snapshot save` is an online operation against the authenticated

@@ -52,6 +52,10 @@ export const DENYLIST = [
     reason: "original file path",
     patterns: [anywhere(s)],
   })),
+  // Generic shapes, so a new leak is caught even when its exact code is not listed above.
+  { id: "exam-task-code", reason: "exam task code shape (ku + 2 letters + digits)", patterns: [/\bku[a-z]{2}\d{2,}\b/i] },
+  { id: "/opt/KUxx", reason: "exam task directory shape", patterns: [/\/opt\/KU[A-Z]{2}/i] },
+  { id: "xk8s", reason: "original cluster/context token shape", patterns: [/\b(?:hk8s|mk8s|ek8s|wk8s|bk8s|nk8s)\b/i] },
   {
     id: "disk=ssd",
     reason: "original node label",

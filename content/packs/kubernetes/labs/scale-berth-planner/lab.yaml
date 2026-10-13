@@ -140,20 +140,34 @@ spec:
     - id: scaled-all
       description: Scales every Deployment in the namespace at once.
       feedback: "`--all` and broad label selectors change neighbouring workloads too. Name the one Deployment you mean."
-      mutation: {on: workstation, as: learner, run: "kubectl --context qm-dispatch -n dock-scheduling scale deployment --all --replicas={{replicas}}"}
-    - id: wrong-namespace
-      description: Forgets the namespace, so the command targets `default` and fails.
-      feedback: Deployments are namespaced. Pass `-n dock-scheduling` or set the namespace on your context.
-      mutation: {on: workstation, as: learner, run: "kubectl --context qm-dispatch scale deployment berth-planner --replicas={{replicas}} || true"}
-    - id: scaled-replicaset
-      description: Scales the ReplicaSet instead of the Deployment; the Deployment controller scales it straight back.
-      feedback: The Deployment owns its ReplicaSets and reconciles their size. Always scale the owner.
+      expectFail: [others-unchanged]
       mutation:
         on: workstation
         as: learner
         run: |
-          rs=$(kubectl --context qm-dispatch -n dock-scheduling get rs -l app=berth-planner -o jsonpath='{.items[0].metadata.name}')
-          kubectl --context qm-dispatch -n dock-scheduling scale rs "$rs" --replicas={{replicas}}
+          kubectl config use-context qm-dispatch
+          kubectl -n dock-scheduling scale deployment --all --replicas={{replicas}}
+    - id: wrong-namespace
+      description: Forgets the namespace, so the command targets `default` and fails.
+      feedback: Deployments are namespaced. Pass `-n dock-scheduling` or set the namespace on your context.
+      expectFail: [desired-replicas]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl scale deployment berth-planner --replicas={{replicas}} || true
+    - id: scaled-replicaset
+      description: Scales the ReplicaSet instead of the Deployment; the Deployment controller scales it straight back.
+      feedback: The Deployment owns its ReplicaSets and reconciles their size. Always scale the owner.
+      expectFail: [desired-replicas]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-dispatch
+          rs=$(kubectl -n dock-scheduling get rs -l app=berth-planner -o jsonpath='{.items[0].metadata.name}')
+          kubectl -n dock-scheduling scale rs "$rs" --replicas={{replicas}}
   solution:
     explanation: "`kubectl scale` updates `.spec.replicas` on the Deployment; its ReplicaSet then creates the extra Pods."
     steps:

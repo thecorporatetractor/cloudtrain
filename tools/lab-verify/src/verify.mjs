@@ -93,6 +93,47 @@ export async function checkFrameworks(contentDir, skills, findings) {
   return refs;
 }
 
+/**
+ * Returns the RE2-incompatible features used by a regex (JS syntax), e.g.
+ * backreferences and lookaround. Escapes and character classes are respected.
+ * @param {string} re
+ */
+export function re2Problems(re) {
+  const found = new Set();
+  let inClass = false;
+  for (let i = 0; i < re.length; i++) {
+    const ch = re[i];
+    if (ch === "\\") {
+      const next = re[i + 1] ?? "";
+      if (/[1-9]/.test(next)) found.add(`backreference '\\${next}'`);
+      else if (next === "k" && re[i + 2] === "<") found.add("named backreference '\\k<...>'");
+      i++;
+      continue;
+    }
+    if (inClass) {
+      if (ch === "]") inClass = false;
+      continue;
+    }
+    if (ch === "[") {
+      inClass = true;
+      if (re[i + 1] === "^") i++;
+      if (re[i + 1] === "]") i++; // literal ] first in class
+      continue;
+    }
+    if (ch === "(" && re[i + 1] === "?") {
+      const rest = re.slice(i + 2, i + 4);
+      if (rest.startsWith("=")) found.add("lookahead '(?=...)'");
+      else if (rest.startsWith("!")) found.add("negative lookahead '(?!...)'");
+      else if (rest === "<=") found.add("lookbehind '(?<=...)'");
+      else if (rest === "<!") found.add("negative lookbehind '(?<!...)'");
+      else if (rest.startsWith(">")) found.add("atomic group '(?>...)'");
+      continue;
+    }
+    if ("*+?}".includes(ch) && re[i + 1] === "+" && i > 0) found.add("possessive quantifier");
+  }
+  return [...found];
+}
+
 /** Validates one lab directory. */
 export async function checkLab(labFile, skills, frameworkRefs, findings) {
   const doc = await loadYaml(labFile, findings);
@@ -142,15 +183,17 @@ export async function checkLab(labFile, skills, frameworkRefs, findings) {
     ["teardown", spec.teardown ?? []],
     ["solution/steps", spec.solution.steps],
     ...(spec.solution.alternatives ?? []).map((a, i) => [`solution/alternatives/${i}/steps`, a.steps ?? []]),
-    ...(spec.misconceptions ?? []).filter((m) => m.mutation).map((m, i) => [`misconceptions/${i}/mutation`, [m.mutation]]),
+    // Map before filtering so the path index matches the misconception's position.
+    ...(spec.misconceptions ?? []).map((m, i) => [`misconceptions/${i}/mutation`, m.mutation ? [m.mutation] : []]),
   ];
   for (const [where, list] of actions) {
     list.forEach((a, i) => {
-      resolveOn(a.on, `/spec/${where}/${i}/on`);
+      const at = where.endsWith("/mutation") ? `/spec/${where}` : `/spec/${where}/${i}`;
+      resolveOn(a.on, `${at}/on`);
       if (a.file?.source) {
         const src = path.resolve(path.dirname(labFile), a.file.source);
         if (!src.startsWith(path.dirname(labFile) + path.sep) || !existsSync(src)) {
-          findings.push({ level: "error", file: labFile, path: `/spec/${where}/${i}/file/source`, message: `asset '${a.file.source}' not found beside lab.yaml` });
+          findings.push({ level: "error", file: labFile, path: `${at}/file/source`, message: `asset '${a.file.source}' not found beside lab.yaml` });
         }
       }
     });
@@ -166,6 +209,37 @@ export async function checkLab(labFile, skills, frameworkRefs, findings) {
     if (["k8s-query", "k8s-can-i"].includes(c.type) && !c.query?.cluster) {
       findings.push({ level: "error", file: labFile, path: `/spec/checks/${i}`, message: `check type '${c.type}' needs query.cluster` });
     }
+    // The grader and orchestrator are Go: regex expectations must compile under RE2.
+    if (c.expect?.match === "regex") {
+      for (const problem of re2Problems(c.expect.value)) {
+        findings.push({ level: "error", file: labFile, path: `/spec/checks/${i}/expect/value`, message: `regex uses ${problem}, which Go's RE2 does not support` });
+      }
+    }
+  });
+
+  // Misconceptions: every one should be a mutation test aimed at specific checks.
+  const contextChecks = spec.checks.filter((c) => c.type === "k8s-context");
+  (spec.misconceptions ?? []).forEach((m, i) => {
+    const where = `/spec/misconceptions/${i}`;
+    if (!m.mutation) {
+      findings.push({ level: "warn", file: labFile, path: where, message: `misconception '${m.id}' has no mutation, so nothing proves a check catches it` });
+      return;
+    }
+    for (const id of m.expectFail ?? []) {
+      if (!checkIds.has(id)) findings.push({ level: "error", file: labFile, path: `${where}/expectFail`, message: `unknown check '${id}'` });
+    }
+    const aimed = (m.expectFail ?? []).filter((id) => !contextChecks.some((c) => c.id === id));
+    if (contextChecks.length && (m.expectFail ?? []).length && !aimed.length) {
+      findings.push({ level: "warn", file: labFile, path: `${where}/expectFail`, message: `misconception '${m.id}' is only caught by the context check` });
+    }
+    // A mutation that never switches context fails the context check for free, which hides weak checks.
+    const text = JSON.stringify(m.mutation);
+    for (const c of contextChecks) {
+      const want = c.expect?.value;
+      if (want && !(m.expectFail ?? []).includes(c.id) && !text.includes(`use-context ${want}`)) {
+        findings.push({ level: "warn", file: labFile, path: `${where}/mutation`, message: `mutation does not run 'kubectl config use-context ${want}' like the solution, so it fails check '${c.id}' regardless` });
+      }
+    }
   });
 
   // Params: every {{ref}} declared; every declared param used.
@@ -180,7 +254,7 @@ export async function checkLab(labFile, skills, frameworkRefs, findings) {
 
   // Authoring quality bar for the pack.
   if (!spec.hints?.length) findings.push({ level: "warn", file: labFile, message: "no hints" });
-  if (!spec.misconceptions?.some((m) => m.mutation)) findings.push({ level: "warn", file: labFile, message: "no misconception with a mutation" });
+  if (!spec.misconceptions?.length) findings.push({ level: "warn", file: labFile, message: "no misconceptions" });
 
   return doc;
 }

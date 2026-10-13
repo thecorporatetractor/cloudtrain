@@ -70,6 +70,19 @@ spec:
         # cap-wk-4: GPU node, effect randomised per learner.
         kubectl taint node cap-wk-4 quillmoor.example/gpu- 2>/dev/null || true
         kubectl taint node cap-wk-4 quillmoor.example/gpu=present:{{gpuEffect}} --overwrite
+    - on: qm-capacity/cap-cp-1
+      run: |
+        # Baseline for nodes-untouched: every node's cordon flag and its taints
+        # (key=value:effect), one line per taint. Taints the node controller
+        # manages itself (node.kubernetes.io/*) are left out because they change
+        # on their own, e.g. not-ready -> unreachable on cap-wk-5.
+        set -e
+        export KUBECONFIG=/etc/kubernetes/admin.conf
+        mkdir -p /var/lib/cloudtrain
+        kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"|"}{.spec.unschedulable}{"|"}{range .spec.taints[*]}{.key}={.value}:{.effect}{" "}{end}{"\n"}{end}' \
+          | awk -F'|' '{n=split($3,t," "); c=0; for(i=1;i<=n;i++) if (t[i] !~ /^node\.kubernetes\.io\//) {print $1"|"$2"|"t[i]; c++} if(!c) print $1"|"$2"|-"}' \
+          | sort > /var/lib/cloudtrain/capacity-nodes.baseline
+        test -s /var/lib/cloudtrain/capacity-nodes.baseline
     - on: workstation
       run: |
         mkdir -p "$(dirname '{{report}}')"
@@ -80,6 +93,8 @@ spec:
       run: |
         kubectl taint node cap-wk-3 quillmoor.example/batch-only- 2>/dev/null || true
         kubectl taint node cap-wk-4 quillmoor.example/gpu- 2>/dev/null || true
+    - on: qm-capacity/cap-cp-1
+      run: rm -f /var/lib/cloudtrain/capacity-nodes.baseline
     - on: workstation
       run: rm -f '{{report}}'
   checks:
@@ -106,18 +121,25 @@ spec:
       skills: [k8s.scheduling.node-status, k8s.scheduling.taints-tolerations, k8s.cli.output-formatting]
       weight: 3
       command: |
-        want=$(kubectl --context qm-capacity get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"|"}{.status.conditions[?(@.type=="Ready")].status}{"|"}{.spec.taints[*].effect}{"\n"}{end}' \
-          | awk -F'|' '$2=="True" && $3 !~ /(^| )NoSchedule( |$)/' | wc -l)
-        got=$(tr -d '[:space:]' < '{{report}}')
+        # Static answer from the topology, never from the live cluster, so changing
+        # nodes cannot move the target: cap-wk-1 and cap-wk-3 always count
+        # (cap-cp-1, cap-wk-2 are NoSchedule, cap-wk-5 is NotReady); cap-wk-4
+        # counts only when its GPU taint is PreferNoSchedule.
+        case '{{gpuEffect}}' in NoSchedule) want=2 ;; *) want=3 ;; esac
+        got=$(tr -d '[:space:]' < '{{report}}' 2>/dev/null)
         [ "$want" = "$got" ] && echo match || echo "expected $want got $got"
       expect: {match: exact, value: match}
     - id: nodes-untouched
-      description: No node taints were removed to make the count easier
+      description: No node was cordoned, uncordoned, tainted or untainted (compared with the state at setup)
       type: shell
-      on: qm-capacity
+      on: qm-capacity/cap-cp-1
       skills: [k8s.scheduling.taints-tolerations]
-      command: kubectl get node cap-wk-2 cap-wk-4 -o jsonpath='{range .items[*]}{.spec.taints[*].effect}{"\n"}{end}' | grep -c . || true
-      expect: {match: exact, value: "2"}
+      command: |
+        export KUBECONFIG=/etc/kubernetes/admin.conf
+        kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"|"}{.spec.unschedulable}{"|"}{range .spec.taints[*]}{.key}={.value}:{.effect}{" "}{end}{"\n"}{end}' \
+          | awk -F'|' '{n=split($3,t," "); c=0; for(i=1;i<=n;i++) if (t[i] !~ /^node\.kubernetes\.io\//) {print $1"|"$2"|"t[i]; c++} if(!c) print $1"|"$2"|-"}' \
+          | sort | cmp -s /var/lib/cloudtrain/capacity-nodes.baseline - && echo unchanged || echo changed
+      expect: {match: exact, value: unchanged}
   hints:
     - title: Switch context
       body: The question is about the capacity cluster.
@@ -138,6 +160,7 @@ spec:
     - id: count-all-ready
       description: Counts every Ready node and ignores taints.
       feedback: A node tainted NoSchedule rejects Pods without a matching toleration, so it cannot take new workloads.
+      expectFail: [count-correct]
       mutation:
         on: workstation
         as: learner
@@ -145,6 +168,7 @@ spec:
     - id: exclude-prefer-noschedule
       description: Treats PreferNoSchedule (or any taint) as excluding the node.
       feedback: Only the NoSchedule effect is a hard block. PreferNoSchedule merely tells the scheduler to avoid the node when it can.
+      expectFail: [count-correct]
       mutation:
         on: workstation
         as: learner
@@ -154,6 +178,7 @@ spec:
     - id: grep-ready
       description: Uses `grep -c Ready` on the node table.
       feedback: The pattern Ready also matches NotReady, and the table says nothing about taints. Filter on the Ready condition and the taint effects explicitly.
+      expectFail: [count-correct]
       mutation:
         on: workstation
         as: learner
@@ -161,6 +186,7 @@ spec:
     - id: verbose-answer
       description: Writes a sentence or the node list instead of a bare number.
       feedback: Automated consumers read this file; it must contain only the number.
+      expectFail: [report-only-number, count-correct]
       mutation:
         on: workstation
         as: learner

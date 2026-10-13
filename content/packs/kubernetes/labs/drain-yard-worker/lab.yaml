@@ -201,24 +201,46 @@ spec:
     - id: cordon-only
       description: Cordons the node but never evicts its Pods.
       feedback: Cordon only stops *new* Pods from landing. Running Pods stay until they are evicted, which is the second half of drain.
-      mutation: {on: workstation, as: learner, run: "kubectl --context qm-yard cordon {{target}}"}
-    - id: delete-node
-      description: Deletes the Node object to get rid of its Pods.
-      feedback: Deleting the Node removes it from the cluster rather than marking it for maintenance; the kubelet re-registers it schedulable as soon as it restarts.
-      mutation: {on: workstation, as: learner, run: "kubectl --context qm-yard delete node {{target}}"}
-    - id: delete-daemonset
-      description: Removes the DaemonSet so that drain stops complaining.
-      feedback: DaemonSet Pods are meant to stay on every node. Use --ignore-daemonsets instead of deleting the platform agent.
+      expectFail: [target-emptied]
       mutation:
         on: workstation
         as: learner
         run: |
-          kubectl --context qm-yard -n qm-platform delete ds node-telemetry
-          kubectl --context qm-yard drain {{target}} --delete-emptydir-data
+          kubectl config use-context qm-yard
+          kubectl cordon {{target}}
+    - id: delete-node
+      description: Deletes the Node object to get rid of its Pods.
+      feedback: Deleting the Node removes it from the cluster rather than marking it for maintenance; the kubelet re-registers it schedulable as soon as it restarts.
+      expectFail: [workers-registered]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-yard
+          kubectl delete node {{target}}
+    - id: delete-daemonset
+      description: Removes the DaemonSet so that drain stops complaining.
+      feedback: DaemonSet Pods are meant to stay on every node. Use --ignore-daemonsets instead of deleting the platform agent.
+      expectFail: [daemonset-intact]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 180
+        run: |
+          kubectl config use-context qm-yard
+          kubectl -n qm-platform delete ds node-telemetry
+          kubectl drain {{target}} --delete-emptydir-data --timeout=120s
     - id: wrong-node
       description: Drains a different worker.
       feedback: Double-check the node name in the task before running disruptive commands.
-      mutation: {on: workstation, as: learner, run: "kubectl --context qm-yard drain yard-wk-1 --ignore-daemonsets --delete-emptydir-data"}
+      expectFail: [target-unschedulable, only-target-cordoned]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 180
+        run: |
+          kubectl config use-context qm-yard
+          kubectl drain yard-wk-1 --ignore-daemonsets --delete-emptydir-data --timeout=120s
   solution:
     explanation: |
       `drain` = cordon + evict. DaemonSet Pods are skipped with
