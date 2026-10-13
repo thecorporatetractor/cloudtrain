@@ -44,3 +44,50 @@ tasks:
   lab:clean:
     desc: Delete all demo lab namespaces
     cmds: [bash deploy/scripts/lab-demo.sh --clean]
+
+  # ---------------------------------------------------------------- web + gateway
+  # Real-mode development: `task dev:orchestrator`, `task dev:gateway` and
+  # `task dev:web` in three terminals. Every kubectl/manager call is pinned to
+  # CT_KUBE_CONTEXT; the kubeconfig's current-context is never changed.
+
+  gateway:labctl:
+    desc: Build the Go lab compiler the gateway shells out to (services/lab-orchestrator/bin/labctl)
+    sources: ['services/lab-orchestrator/**/*.go', 'services/lab-orchestrator/internal/labschema/lab.schema.json']
+    generates: [services/lab-orchestrator/bin/labctl]
+    cmds: [go build -o services/lab-orchestrator/bin/labctl ./services/lab-orchestrator/cmd/labctl]
+
+  dev:orchestrator:
+    desc: Install the lab CRDs and run the lab-orchestrator manager locally against CT_KUBE_CONTEXT (default kind-cloudtrain-dev)
+    vars:
+      CTX: '{{.CT_KUBE_CONTEXT | default "kind-cloudtrain-dev"}}'
+      KCFG: '{{.ROOT_DIR}}/.cache/kubeconfig-{{.CTX}}'
+    cmds:
+      - mkdir -p .cache
+      # A one-context kubeconfig: controller-runtime uses the current context, and this keeps the user's file untouched.
+      - kubectl config view --minify --flatten --context {{.CTX}} > {{.KCFG}}
+      - kubectl --context {{.CTX}} apply -f services/lab-orchestrator/config/crd
+      - KUBECONFIG={{.KCFG}} go run ./services/lab-orchestrator/cmd/manager --health-probe-bind-address=127.0.0.1:8081
+
+  dev:gateway:
+    desc: Run services/gateway (BFF for apps/web) against CT_KUBE_CONTEXT, sessions in CT_NAMESPACE (default cloudtrain-sessions)
+    deps: [gateway:labctl]
+    vars:
+      CTX: '{{.CT_KUBE_CONTEXT | default "kind-cloudtrain-dev"}}'
+      NS: '{{.CT_NAMESPACE | default "cloudtrain-sessions"}}'
+    env:
+      CT_KUBE_CONTEXT: '{{.CTX}}'
+      CT_NAMESPACE: '{{.NS}}'
+    cmds:
+      - pnpm --filter @cloudtrain/lab-schema build
+      - kubectl --context {{.CTX}} get namespace {{.NS}} >/dev/null 2>&1 || kubectl --context {{.CTX}} create namespace {{.NS}}
+      - pnpm --filter @cloudtrain/gateway dev
+
+  dev:web:
+    desc: Run apps/web in real API mode (proxies /api and the terminal WebSocket to the gateway on :8787)
+    env:
+      VITE_API_MODE: real
+    cmds: [pnpm --filter web dev]
+
+  dev:web:mock:
+    desc: Run apps/web with the in-browser mock API (no cluster needed)
+    cmds: [pnpm --filter web dev]
