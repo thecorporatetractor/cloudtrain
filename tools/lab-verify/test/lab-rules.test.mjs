@@ -4,26 +4,30 @@ import { cp, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { verifyContent } from "../src/verify.mjs";
+import { podImageRefs, verifyContent } from "../src/verify.mjs";
 
 const contentDir = fileURLToPath(new URL("../../../content", import.meta.url));
+const catalogFile = fileURLToPath(new URL("../../../deploy/images/catalog.yaml", import.meta.url));
 
-/** Copies content/, applies `edit` to one lab.yaml, and returns the findings for that lab. */
-async function findingsAfter(lab, edit) {
+/** Copies content/, applies `edit` to one file (relative to content/), and returns the findings for that file. */
+async function findingsAfterFile(rel, edit) {
   const dir = await mkdtemp(path.join(tmpdir(), "lab-verify-"));
   try {
     await cp(contentDir, dir, { recursive: true });
-    const file = path.join(dir, "packs/kubernetes/labs", lab, "lab.yaml");
+    const file = path.join(dir, rel);
     const before = await readFile(file, "utf8");
     const after = edit(before);
-    assert.notEqual(after, before, "edit did not change the lab");
+    assert.notEqual(after, before, "edit did not change the file");
     await writeFile(file, after);
-    const r = await verifyContent(dir);
+    const r = await verifyContent(dir, { catalogFile });
     return r.findings.filter((f) => f.file === file);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
 }
+
+/** Copies content/, applies `edit` to one lab.yaml, and returns the findings for that lab. */
+const findingsAfter = (lab, edit) => findingsAfterFile(path.join("packs/kubernetes/labs", lab, "lab.yaml"), edit);
 
 test("regex backreference is rejected (RE2)", async () => {
   const f = await findingsAfter("hostpath-pv-readonly", (s) => s.replace(`value: '^\\["ReadOnlyMany"\\]$'`, () => "value: '^(\\w+)\\1$'"));
@@ -45,4 +49,68 @@ test("misconception without a mutation warns at its own index", async () => {
     s.replace(/(    - id: wrong-namespace\n(?:      .*\n)*?)      expectFail: .*\n      mutation:\n(?:        .*\n)+?(?=    - id: )/, "$1"),
   );
   assert.ok(f.some((x) => x.level === "warn" && x.path === "/spec/misconceptions/1"), JSON.stringify(f));
+});
+
+test("topology image missing from the catalog is an error", async () => {
+  const f = await findingsAfter("drain-yard-worker", (s) => s.replace("image: kubeadm:1.37", "image: kubeadm:1.35"));
+  assert.ok(f.some((x) => x.level === "error" && x.path === "/spec/topology/nodes/1/image" && /not in catalog/.test(x.message)), JSON.stringify(f));
+});
+
+test("kubeadm cluster without an image is an error", async () => {
+  const f = await findingsAfter("drain-yard-worker", (s) => s.replace("        image: kubeadm:1.37\n", ""));
+  assert.ok(f.some((x) => x.level === "error" && /needs a catalog image/.test(x.message)), JSON.stringify(f));
+});
+
+test("kubeadm cluster version must match the image", async () => {
+  const f = await findingsAfter("drain-yard-worker", (s) => s.replace('version: "v1.37.1"', 'version: "v1.36.4"'));
+  assert.ok(f.some((x) => x.level === "error" && x.path === "/spec/topology/nodes/1/cluster/version"), JSON.stringify(f));
+});
+
+test("Pod image in a manifest that is not a workload image is an error", async () => {
+  const f = await findingsAfter("drain-yard-worker", (s) => s.replace("image: redis:7.4-alpine", "image: redis:8"));
+  assert.ok(f.some((x) => x.level === "error" && /'redis:8' is not in workloadImages/.test(x.message)), JSON.stringify(f));
+});
+
+test("--image in a hint command is checked too", async () => {
+  const f = await findingsAfter("nodeselector-nvme-pod", (s) => s.replace("run {{pod}} --image=httpd:2.4-alpine --dry-run", "run {{pod}} --image=httpd:latest --dry-run"));
+  assert.ok(f.some((x) => x.level === "error" && /^\/spec\/hints\//.test(x.path) && /httpd:latest/.test(x.message)), JSON.stringify(f));
+});
+
+test("check with more than 4 skills warns", async () => {
+  const f = await findingsAfter("scale-berth-planner", (s) =>
+    s.replace("skills: [k8s.cli.scoped-changes]", "skills: [k8s.cli.scoped-changes, k8s.cli.imperative, k8s.cli.manifests, k8s.workloads.scaling, k8s.workloads.deployments]"),
+  );
+  assert.ok(f.some((x) => x.level === "warn" && /tagged with 5 skills/.test(x.message)), JSON.stringify(f));
+});
+
+test("lab framework that shares no skill with its checks warns", async () => {
+  const f = await findingsAfter("scale-berth-planner", (s) => s.replace("frameworks: [cka:workloads-scheduling]", "frameworks: [cka:workloads-scheduling, cka:storage]"));
+  assert.ok(f.some((x) => x.level === "warn" && /'cka:storage' maps none/.test(x.message)), JSON.stringify(f));
+});
+
+test("framework topic skill must be listed by its objective", async () => {
+  const f = await findingsAfterFile("frameworks/cka.yaml", (s) => s.replace("skills: [k8s.cluster.ha-control-plane]", "skills: [k8s.cluster.ha-control-plane, k8s.security.sbom]"));
+  assert.ok(f.some((x) => x.level === "error" && /missing from the objective/.test(x.message)), JSON.stringify(f));
+});
+
+test("skills no lab uses are reported as info, never as warnings", async () => {
+  const r = await verifyContent(contentDir, { catalogFile });
+  const info = r.findings.filter((x) => x.level === "info");
+  assert.ok(info.some((x) => x.path === "k8s.security.sbom"), "sbom has no lab yet");
+  assert.ok(!info.some((x) => x.path === "k8s.scheduling.cordon-drain"), "cordon-drain is exercised");
+  assert.deepEqual(r.findings.filter((x) => x.level === "warn"), []);
+});
+
+test("podImageRefs finds manifest, flag and JSON refs and skips jsonpath and params", () => {
+  const text = [
+    "containers:",
+    "  - name: a",
+    "    image: busybox:1.37",
+    '  - {name: b, image: "redis:7.4-alpine"}',
+    "kubectl run x --image=httpd:2.4-alpine --overrides='{\"spec\":{\"containers\":[{\"name\":\"c\",\"image\":\"caddy:2-alpine\"}]}}'",
+    "kubectl get pod x -o jsonpath='{.spec.containers[0].image}'",
+    "kubectl run y --image={{img}} --image=$IMG",
+    "imagePullPolicy: Always",
+  ].join("\n");
+  assert.deepEqual([...podImageRefs(text)].sort(), ["busybox:1.37", "caddy:2-alpine", "httpd:2.4-alpine", "redis:7.4-alpine"]);
 });
