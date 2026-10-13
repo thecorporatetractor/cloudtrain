@@ -11,7 +11,7 @@
 #
 # Steps:
 #   1. fetch + verify the pinned Ubuntu cloud image
-#   2. resolve the image lists (kubeadm control plane per K8s version, Flannel, the
+#   2. resolve the image lists (kubeadm control plane per K8s version, Calico, the
 #      catalog's workloadImages) and check them against tools/images/lock/*.lock
 #   3. virt-customize (in a container, KVM-accelerated) with scripts/guest-<kind>.sh
 #   4. sparsify + compress, wrap as a KubeVirt containerDisk image
@@ -117,12 +117,25 @@ mapfile -t WORKLOADS < <(yq -r '.workloadImages[]' "$CATALOG" | while read -r i;
 lock_check "$LOCKDIR/workloads.lock" "${WORKLOADS[@]}"
 
 if [[ $GUEST == kubeadm ]]; then
-  FLANNEL_YAML="$CACHE/kube-flannel-${FLANNEL_VERSION}.yml"
-  fetch_pinned "https://github.com/flannel-io/flannel/releases/download/${FLANNEL_VERSION}/kube-flannel.yml" \
-    "$FLANNEL_MANIFEST_SHA256" "$FLANNEL_YAML"
-  mapfile -t FLANNEL_IMAGES < <(grep -oE 'image: *[^ ]+' "$FLANNEL_YAML" | awk '{print $2}' | sort -u)
-  printf '%s\n' "${FLANNEL_IMAGES[@]}" | grep -q 'flannel:' || die "no flannel image in $FLANNEL_YAML"
-  lock_check "$LOCKDIR/flannel.lock" "${FLANNEL_IMAGES[@]}"
+  # Calico (enforces NetworkPolicy). Upstream calico-vxlan.yaml, sha256-checked, then two
+  # edits: the IPv4 pool is the kubeadm podSubnet (the default 192.168.0.0/16 overlaps the
+  # lab VPC) and VXLAN is Always (pod traffic never leaves a VM unencapsulated, like
+  # Flannel before it, so the lab network never sees pod IPs).
+  CALICO_UPSTREAM="$CACHE/calico-vxlan-${CALICO_VERSION}.yaml"
+  fetch_pinned "https://raw.githubusercontent.com/projectcalico/calico/${CALICO_VERSION}/manifests/calico-vxlan.yaml" \
+    "$CALICO_MANIFEST_SHA256" "$CALICO_UPSTREAM"
+  CALICO_YAML="$WORK/in/calico.yaml"
+  sed -e 's|^            # - name: CALICO_IPV4POOL_CIDR|            - name: CALICO_IPV4POOL_CIDR|' \
+      -e 's|^            #   value: "192.168.0.0/16"|              value: "'"$LAB_POD_CIDR"'"|' \
+      -e '/name: CALICO_IPV4POOL_VXLAN$/{n;s|value: "CrossSubnet"|value: "Always"|}' \
+      "$CALICO_UPSTREAM" > "$CALICO_YAML"
+  grep -A1 'name: CALICO_IPV4POOL_CIDR$' "$CALICO_YAML" | grep -q "value: \"$LAB_POD_CIDR\"" \
+    || die "could not set CALICO_IPV4POOL_CIDR in $CALICO_YAML"
+  grep -A1 'name: CALICO_IPV4POOL_VXLAN$' "$CALICO_YAML" | grep -q 'value: "Always"' \
+    || die "could not set CALICO_IPV4POOL_VXLAN in $CALICO_YAML"
+  mapfile -t CALICO_IMAGES < <(grep -oE 'image: *[^ ]+' "$CALICO_YAML" | awk '{print $2}' | tr -d '"' | sort -u)
+  printf '%s\n' "${CALICO_IMAGES[@]}" | grep -q '/calico/node:' || die "no calico/node image in $CALICO_YAML"
+  lock_check "$LOCKDIR/calico.lock" "${CALICO_IMAGES[@]}"
   kubeadm_images "$K8S_VERSION"
   lock_check "$LOCKDIR/kubernetes-$K8S_VERSION.lock" "${KIMAGES[@]}"
   PAUSE_IMAGE=$(printf '%s\n' "${KIMAGES[@]}" | grep '/pause:')
@@ -130,7 +143,6 @@ if [[ $GUEST == kubeadm ]]; then
     kubeadm_images "$STAGED_VERSION"
     lock_check "$LOCKDIR/kubernetes-$STAGED_VERSION.lock" "${KIMAGES[@]}"
   fi
-  cp "$FLANNEL_YAML" "$WORK/in/kube-flannel.yml"
 else
   ETCD_TGZ="$CACHE/etcd-${ETCD_VERSION}-linux-amd64.tar.gz"
   fetch_pinned "https://github.com/etcd-io/etcd/releases/download/${ETCD_VERSION}/etcd-${ETCD_VERSION}-linux-amd64.tar.gz" \
@@ -166,7 +178,9 @@ K8S_CRI_TOOLS_VERSION=${K8S_CRI_TOOLS:-}
 STAGED_K8S_MINOR=${STAGED_MINOR:-}
 STAGED_K8S_VERSION=${STAGED_VERSION:-}
 PAUSE_IMAGE=${PAUSE_IMAGE:-}
-FLANNEL_VERSION=${FLANNEL_VERSION}
+CALICO_VERSION=${CALICO_VERSION}
+LAB_POD_CIDR=${LAB_POD_CIDR}
+STAGED_CRI_TOOLS_VERSION=${CRI_TOOLS_VERSION}
 ETCD_VERSION=${ETCD_VERSION}
 CONTAINERD_VERSION=${CONTAINERD_VERSION}
 KUBERNETES_CNI_VERSION=${KUBERNETES_CNI_VERSION}
@@ -181,9 +195,9 @@ EOF
 # -> Hyper-V) crashed WSL several times and once blue-screened Windows (bugcheck 0x7f,
 # double fault). GUESTFS_KVM=1 re-enables KVM where nested virt is known to be stable.
 # The appliance gets at most 2 GiB and the builder container at most 6 GiB.
-GUESTFS_ARGS=(-e LIBGUESTFS_BACKEND=direct -e LIBGUESTFS_MEMSIZE=2048)
-if [[ ${GUESTFS_KVM:-0} == 1 ]]; then GUESTFS_ARGS+=(--device /dev/kvm)
-else GUESTFS_ARGS+=(-e LIBGUESTFS_BACKEND_SETTINGS=force_tcg); fi
+GUESTFS_ARGS=(-e LIBGUESTFS_BACKEND=direct -e LIBGUESTFS_MEMSIZE=2048 -e GUESTFS_VERBOSE="${GUESTFS_VERBOSE:-0}")
+if [[ ${GUESTFS_KVM:-0} == 1 ]]; then GUESTFS_ARGS+=(--device /dev/kvm -e GUESTFS_SMP=4)
+else GUESTFS_ARGS+=(-e LIBGUESTFS_BACKEND_SETTINGS=force_tcg -e GUESTFS_SMP="${GUESTFS_SMP:-2}"); fi
 log "customizing $VARIANT (virt-customize, $([[ ${GUESTFS_KVM:-0} == 1 ]] && echo KVM || echo 'TCG; GUESTFS_KVM=1 for KVM'))"
 docker run --rm --memory 6g "${GUESTFS_ARGS[@]}" \
   -v "$HERE:/src:ro" -v "$CACHE:/work" -e TMPDIR="/work/$VARIANT/tmp" \

@@ -147,7 +147,7 @@ EOF
       resolvConf: /etc/cloudtrain/resolv.conf
 runcmd:
   - [bash, -c, "date +%s.%N > /var/log/cloudtrain-boot.ts"]
-  - [bash, -c, "kubeadm init --config /root/kubeadm.yaml --skip-token-print > /var/log/kubeadm.log 2>&1 && kubectl --kubeconfig /etc/kubernetes/admin.conf apply -f /opt/cloudtrain/manifests/kube-flannel.yml >> /var/log/kubeadm.log 2>&1 && install -d -o learner -g learner /home/learner/.kube && install -o learner -g learner -m 600 /etc/kubernetes/admin.conf /home/learner/.kube/config"]
+  - [bash, -c, "kubeadm init --config /root/kubeadm.yaml --skip-token-print > /var/log/kubeadm.log 2>&1 && kubectl --kubeconfig /etc/kubernetes/admin.conf apply -f /opt/cloudtrain/manifests/calico.yaml >> /var/log/kubeadm.log 2>&1 && install -d -o learner -g learner /home/learner/.kube && install -o learner -g learner -m 600 /etc/kubernetes/admin.conf /home/learner/.kube/config"]
 EOF
 } > "$WORK/ctl-1.yaml"
 

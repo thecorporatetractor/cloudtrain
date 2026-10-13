@@ -12,11 +12,14 @@
 #
 #   all           VM Running, ssh as learner, /etc/cloudtrain-release, no internet
 #   kubeadm-node  `crictl images` lists every locked workload image; single-node
-#                 `kubeadm init` + Flannel; one Pod per workload image Running offline
-#   kubeadm-upgrade  as above on the N-1 release, then the offline upgrade:
-#                 apt-get update/install of the staged kubeadm/kubelet/kubectl,
-#                 `kubeadm upgrade apply <staged> --etcd-upgrade=false`, kubelet restart,
-#                 node and kube-apiserver report the staged version
+#                 `kubeadm init` + Calico; one Pod per workload image Running offline;
+#                 a deny-all NetworkPolicy actually blocks traffic (Calico enforces it)
+#   kubeadm-upgrade  as above on the N-1 release, then the offline upgrade the lab
+#                 teaches: switch kubernetes.list to the staged minor, apt-get update/
+#                 install kubeadm, `kubeadm upgrade plan` (reported), `kubeadm upgrade
+#                 apply <staged> --etcd-upgrade=false`, kubelet/kubectl install (reports
+#                 whether the package restarts kubelet), restart, node and kube-apiserver
+#                 report the staged version
 #   etcd-host     etcd.service active, `etcdctl endpoint health` over mutual TLS passes,
 #                 a client without a certificate is refused, then the
 #                 etcd-snapshot-restore lab's own provision script + solution run
@@ -185,8 +188,9 @@ resolvConf: /etc/cloudtrain/resolv.conf
 EOF
 kubeadm init --config /root/kubeadm.yaml > /var/log/kubeadm.log 2>&1 || { tail -30 /var/log/kubeadm.log; exit 1; }
 export KUBECONFIG=/etc/kubernetes/admin.conf
-kubectl apply -f /opt/cloudtrain/manifests/kube-flannel.yml >/dev/null
-for i in \$(seq 90); do kubectl get node vm --no-headers 2>/dev/null | grep -qw Ready && break; sleep 2; done
+kubectl apply -f /opt/cloudtrain/manifests/calico.yaml >/dev/null
+for i in \$(seq 120); do kubectl get node vm --no-headers 2>/dev/null | grep -qw Ready && break; sleep 2; done
+kubectl -n kube-system rollout status ds/calico-node --timeout=240s
 kubectl get nodes -o wide
 EOS
 }
@@ -216,10 +220,33 @@ crictl_has_workloads() {
   done < <(grep -v '^#' "$HERE/lock/workloads.lock" | grep .)
 }
 
+# netpol_enforced: httpd reachable from a client Pod, then unreachable once a deny-all
+# ingress NetworkPolicy selects it (Flannel would let it through; Calico must not).
+netpol_enforced() {
+  cat <<'EOS'
+set -e; export KUBECONFIG=/etc/kubernetes/admin.conf
+kubectl run web --image=httpd:2.4-alpine --labels=app=web --image-pull-policy=Never --port=80
+kubectl run client --image=busybox:1.37 --image-pull-policy=Never -- sleep 3600
+kubectl wait pod web client --for=condition=Ready --timeout=120s
+ip=$(kubectl get pod web -o jsonpath='{.status.podIP}')
+kubectl exec client -- wget -qO- -T 3 "http://$ip/" | head -1
+echo "ok: web reachable before the policy"
+cat <<'EOF' | kubectl apply -f -
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: deny-web }
+spec: { podSelector: { matchLabels: { app: web } }, policyTypes: [Ingress] }
+EOF
+for i in $(seq 15); do kubectl exec client -- wget -qO- -T 2 "http://$ip/" >/dev/null 2>&1 || { echo "ok: NetworkPolicy enforced (web blocked)"; exit 0; }; sleep 2; done
+echo "FAIL: NetworkPolicy not enforced"; exit 1
+EOS
+}
+
 test_kubeadm-node() {
   crictl_has_workloads | vmrun || return 1
   kubeadm_single_node "$LAB_K8S_VERSION" | vmrun || return 1
-  workload_pods | vmrun
+  workload_pods | vmrun || return 1
+  netpol_enforced | vmrun
 }
 
 test_kubeadm-upgrade() {
@@ -236,18 +263,36 @@ apt-mark showhold
 EOS
   kubeadm_single_node "$UPGRADE_K8S_VERSION" | vmrun || return 1
   workload_pods | vmrun || return 1
+  local from=$UPGRADE_K8S_MINOR tominor=$LAB_K8S_MINOR
   vmrun <<EOS
 set -e
 export KUBECONFIG=/etc/kubernetes/admin.conf
-echo "== offline apt"; time apt-get update
+echo "== apt sources"; grep -rh '^deb\|^URIs' /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null || true
+echo "== offline apt-get update ($from)"; time apt-get update
+apt-cache madison kubeadm
+echo "== learner switches the repo to $tominor"
+sed -i 's#/$from/#/$tominor/#' /etc/apt/sources.list.d/kubernetes.list
+cat /etc/apt/sources.list.d/kubernetes.list
+time apt-get update
 apt-cache madison kubeadm
 apt-mark unhold kubeadm kubelet kubectl
 apt-get install -y kubeadm='${to#v}-*'
 kubeadm version -o short
-kubeadm upgrade plan $to 2>&1 | tail -15
+echo "== REPORT kubeadm upgrade plan (no version, offline)"
+if timeout 120 kubeadm upgrade plan > /tmp/plan.log 2>&1; then echo "REPORT: 'kubeadm upgrade plan' exit 0"; else echo "REPORT: 'kubeadm upgrade plan' exit \$?"; fi
+tail -25 /tmp/plan.log
+echo "== REPORT kubeadm upgrade plan $to (offline)"
+if timeout 120 kubeadm upgrade plan $to > /tmp/plan2.log 2>&1; then echo "REPORT: 'kubeadm upgrade plan $to' exit 0"; else echo "REPORT: 'kubeadm upgrade plan $to' exit \$?"; fi
+tail -25 /tmp/plan2.log
 kubeadm upgrade apply -y $to --etcd-upgrade=false > /var/log/kubeadm-upgrade.log 2>&1 || { tail -40 /var/log/kubeadm-upgrade.log; exit 1; }
 tail -3 /var/log/kubeadm-upgrade.log
+before=\$(systemctl show kubelet -p MainPID -p ActiveEnterTimestampMonotonic --value | paste -sd/)
 apt-get install -y kubelet='${to#v}-*' kubectl='${to#v}-*'
+sleep 5
+after=\$(systemctl show kubelet -p MainPID -p ActiveEnterTimestampMonotonic --value | paste -sd/)
+running=\$(kubectl get node vm -o jsonpath='{.status.nodeInfo.kubeletVersion}')
+if [ "\$before" = "\$after" ]; then echo "REPORT: installing the kubelet package does NOT restart kubelet (pid/start \$before unchanged; node still reports \$running)"
+else echo "REPORT: installing the kubelet package RESTARTED kubelet (\$before -> \$after; node reports \$running)"; fi
 apt-mark hold kubeadm kubelet kubectl
 systemctl daemon-reload && systemctl restart kubelet
 for i in \$(seq 60); do [ "\$(kubectl get node vm -o jsonpath='{.status.nodeInfo.kubeletVersion}' 2>/dev/null)" = $to ] && break; sleep 3; done
@@ -264,7 +309,8 @@ test_etcd-host() {
 set -e
 for i in $(seq 30); do systemctl is-active -q etcd && break; sleep 2; done
 systemctl is-active etcd
-etcd --version | head -1; etcdctl version | head -1; etcdutl version | head -1
+etcd --version | head -1; etcdctl version | head -1; etcdutl version | head -1; openssl version
+id learner; test -f /etc/sudoers.d/90-cloudtrain-learner; echo "ok: learner baked in with sudo rule"
 ls -l /etc/qm-etcd/pki
 P=/etc/qm-etcd/pki
 etcdctl --endpoints=https://127.0.0.1:2379 --cacert=$P/ca.crt --cert=$P/admin.crt --key=$P/admin.key endpoint health

@@ -22,7 +22,7 @@ containerd image store, nested virtualization on (`/dev/kvm` present).
 Every version is pinned in **`deploy/versions.env`**, which is the only place versions are
 set. Pinning goes below the tag where that is possible: the kind node image, the Multus
 image, the KVM probe disk and every image baked into the golden image are pinned by
-digest (VM image contents: `tools/images/lock/*.lock`); the KubeVirt, CDI and Flannel
+digest (VM image contents: `tools/images/lock/*.lock`); the KubeVirt, CDI and Calico
 manifests are checked against sha256 sums; Multus is vendored (`deploy/multus/`, see
 "Known gaps" 4); the golden image's apt packages are exact versions, Ubuntu packages come
 from a fixed `snapshot.ubuntu.com` point in time, and the Docker and pkgs.k8s.io repo keys
@@ -39,7 +39,7 @@ must match pinned fingerprints:
 | Lab Kubernetes (inside VMs) | v1.37.1 from `pkgs.k8s.io/core:/stable:/v1.37` | current minor |
 | Lab node runtime | containerd.io `2.4.1-2~ubuntu.24.04~noble`, cri-tools `1.37.0-1.1`, kubernetes-cni `1.9.1-1.1` | installed as `pkg=version` and held |
 | Ubuntu cloud image | noble `release-20260926`, sha256 pinned | apt archive snapshot `20261010T000000Z` |
-| Flannel (lab CNI inside VMs) | v0.28.10 | |
+| Calico (lab CNI inside VMs) | v3.33.0 (`calico-vxlan.yaml`, VXLAN Always, pool 10.244.0.0/16) | replaced Flannel, which does not enforce NetworkPolicy |
 | go-task | v3.54.0 | |
 
 ## Commands
@@ -115,7 +115,7 @@ what blocks them.
    with a pinned `caCertHashes`) and a bootstrap token. All of them go into Secrets.
 2. Two `VirtualMachine`s boot from `cloudtrain/kubeadm-node:v1.37.1`. Each gets a fixed IP
    through `ovn.kubernetes.io/ip_address`, so every lab uses the same private IPs.
-   cloud-init runs `kubeadm init` and applies Flannel on `ctl-1`. On `wrk-1` it waits for
+   cloud-init runs `kubeadm init` and applies Calico on `ctl-1`. On `wrk-1` it waits for
    `:6443` and then runs `kubeadm join`. The VMs have no internet: every image comes from
    the golden image.
 3. The learner kubeconfig on the workstation is built from `admin.conf` (fetched over
@@ -150,7 +150,7 @@ The two contexts report different server versions (v1.37.1 and v1.36.0), which s
 that `use-context` switches between two real clusters; the script now fails if they do
 not. The kept lab was also checked by
 hand: CoreDNS Running with 0 restarts, and a pod pinned to `wrk-1` ran with pod IP
-`10.244.1.2`, so the Flannel overlay works across the VMs.
+`10.244.1.2`, so the overlay works across the VMs (that run used Flannel; Calico replaced it).
 
 ## Measured timings and memory
 
@@ -211,7 +211,7 @@ pins disagree.
 
 | Catalog ref | Image | Contents | Build |
 |---|---|---|---|
-| `kubeadm:1.37` | `cloudtrain/kubeadm-node:v1.37.1` (containerDisk) | kubeadm/kubelet/kubectl 1.37.1 held, containerd, control-plane + Flannel + workload images | `task image:build:kubeadm-node` |
+| `kubeadm:1.37` | `cloudtrain/kubeadm-node:v1.37.1` (containerDisk) | kubeadm/kubelet/kubectl 1.37.1 held, containerd, control-plane + Calico + workload images, curl | `task image:build:kubeadm-node` |
 | `kubeadm:1.36` | `cloudtrain/kubeadm-node:v1.36-upgrade` (containerDisk) | v1.36.5 installed and held; v1.37.1 staged offline (see below) | `task image:build:kubeadm-upgrade` |
 | `etcd-host:3.6` | `cloudtrain/etcd-host:3.6` (containerDisk) | etcd v3.6.15 + etcdctl/etcdutl in `/usr/local/bin`, `etcd.service` with mutual TLS | `task image:build:etcd-host` |
 | `jumphost:1` | `cloudtrain/jumphost:1` (container) | kubectl v1.37.1, helm v4.3.0, etcdctl/etcdutl, yq, jq, ssh, vim/nano, tmux, user `learner` (uid 1000), `k` alias with completion, prompt with the kube context | `task image:build:jumphost` |
@@ -225,16 +225,25 @@ kubeadm node image's containerd (`k8s.io` namespace, CRI-managed, named by tag s
 for `mode: virtual` labs (`task image:load:workloads`, idempotent). Adding an image:
 add it to `workloadImages`, run `task image:lock`, rebuild the kubeadm images.
 
-**Upgrade image (`kubeadm:1.36`).** Built from the v1.36 pkgs.k8s.io repo, then the
-v1.37.1 kubeadm/kubelet/kubectl debs are downloaded through the signed v1.37 repo (apt
-checks signatures and sha256) into `/opt/cloudtrain/apt`, next to the installed v1.36.5
-debs. That directory is an apt repo signed with a throwaway build key (only the public
-key stays, in `/etc/apt/keyrings/cloudtrain-offline.gpg`) and it is the **only** apt
-source: the Ubuntu and Docker sources are renamed `*.disabled`, so `apt-get update`
-succeeds offline in about a second and `apt-cache madison kubeadm` lists 1.36.5 and
-1.37.1. The v1.36.5 and v1.37.1 control-plane images are both in containerd, so
-`apt-get install kubeadm=1.37.1-*` and `kubeadm upgrade apply v1.37.1` run with no
-network.
+**Upgrade image (`kubeadm:1.36`).** v1.36.5 is installed from the v1.36 pkgs.k8s.io repo
+and kubeadm/kubelet/kubectl are held. The build then mirrors the two minors the lab needs
+as flat apt repos, downloading through the signed pkgs.k8s.io repos (apt checks the
+signatures and every .deb's sha256): `/opt/k8s-apt/v1.36/` (kubeadm/kubelet/kubectl
+1.36.5, cri-tools 1.36.0, kubernetes-cni) and `/opt/k8s-apt/v1.37/` (1.37.1, cri-tools
+1.37.0, kubernetes-cni). Both are signed with a throwaway build key whose public half is
+appended to `/etc/apt/keyrings/kubernetes-apt-keyring.gpg` (next to the pkgs.k8s.io key),
+and `/etc/apt/sources.list.d/kubernetes.list` has the same shape as the online one:
+
+```
+deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] file:/opt/k8s-apt/v1.36/ /
+```
+
+so the learner upgrades exactly as online: change `v1.36` to `v1.37` in that file,
+`apt-get update`, `apt-get install kubeadm=1.37.1-*`. No apt source needs the internet
+(the Ubuntu and Docker sources are renamed `*.disabled`), so `apt-get update` succeeds
+offline. Every image of `kubeadm config images list --kubernetes-version v1.37.1`
+(etcd, CoreDNS and pause included) is preloaded next to the v1.36.5 set, so
+`kubeadm upgrade apply v1.37.1` runs with no network.
 
 **etcd-host.** Ubuntu 24.04 with etcd from the sha256-pinned release tarball, a system
 user `etcd`, and an enabled `etcd.service` (single member, client and peer mutual TLS on
@@ -246,9 +255,11 @@ the TLS flags. The etcd-snapshot-restore lab replaces the unit and PKI with its 
 (`provision-etcd.sh` tears them down first); `task image:test` runs that lab's provision
 script and solution on the image.
 
-All VM images share the kubeadm node conventions: users and SSH keys come from
-cloud-init at boot (the runtime creates `learner` with passwordless sudo), apt timers
-and snapd are gone, and `/etc/cloudtrain-release` records versions and the catalog ref.
+All VM images share the same conventions: user `learner` is baked in (password locked,
+passwordless sudo via `/etc/sudoers.d/90-cloudtrain-learner`) and its SSH keys come from
+cloud-init at boot (a cloud-init `users:` entry for `learner` adds keys to the existing
+account), apt timers and snapd are gone, and `/etc/cloudtrain-release` records versions
+and the catalog ref.
 
 ### Build pipeline
 
@@ -269,9 +280,9 @@ and keeps boot-to-Ready around 90–117 s.
   image at a time (`image:build:all` is sequential).
 - `build.sh <variant>` (`kubeadm-node`, `kubeadm-upgrade`, `etcd-host`): fetches the
   pinned cloud image and checks its sha256. It resolves the image lists (pinned
-  `kubeadm config images list` per Kubernetes version, the Flannel manifest checked by
-  sha256, the catalog's `workloadImages`) and requires each to match its lock file
-  (`lock/kubernetes-<version>.lock`, `lock/flannel.lock`, `lock/workloads.lock`;
+  `kubeadm config images list` per Kubernetes version, the Calico manifest checked by
+  sha256 (then pool CIDR and VXLAN mode set, see `build.sh`), the catalog's `workloadImages`) and requires each to match its lock file
+  (`lock/kubernetes-<version>.lock`, `lock/calico.lock`, `lock/workloads.lock`;
   `task image:lock` refreshes the digests after a version bump). It grows the disk, runs
   `scripts/guest-<kind>.sh` inside the guest (shared steps in `scripts/guest-common.sh`:
   apt from the pinned Ubuntu snapshot, repo keys checked against pinned fingerprints,

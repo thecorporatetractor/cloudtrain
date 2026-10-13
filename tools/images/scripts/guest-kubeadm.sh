@@ -5,14 +5,15 @@
 # containerd's k8s.io store, so `kubeadm init/join` and the labs' Pods need no registry.
 #
 # With STAGED_K8S_VERSION set (upgrade image) the node also carries that release
-# OFFLINE: its kubeadm/kubelet/kubectl debs in a local, signed apt repo that is the
-# only apt source, and its control-plane images in containerd, so
-# `apt-get install kubeadm=<staged>-*` and `kubeadm upgrade apply <staged>` work with
-# no network.
+# OFFLINE: flat signed apt repos /opt/k8s-apt/<minor>/ for the installed and the staged
+# minor (no apt source needs the internet) and the staged control-plane images in
+# containerd, so `apt-get install kubeadm=<staged>-*` and `kubeadm upgrade apply
+# <staged>` work with no network.
 source /opt/cloudtrain/build/guest-common.sh
 
 grow_root
 base_setup conntrack socat ethtool ipset ebtables apt-utils
+create_learner
 
 install -m 0755 -d /etc/apt/keyrings
 fetch_key https://download.docker.com/linux/ubuntu/gpg "$DOCKER_APT_KEY_FPR" /etc/apt/keyrings/docker.gpg
@@ -37,51 +38,69 @@ apt-get install -y "containerd.io=${CONTAINERD_VERSION}" "kubelet=$KV" "kubeadm=
   "cri-tools=${K8S_CRI_TOOLS_VERSION}" "kubernetes-cni=${KUBERNETES_CNI_VERSION}"
 apt-mark hold kubelet kubeadm kubectl containerd.io cri-tools kubernetes-cni
 
-# --- staged upgrade target: local signed apt repo, the only apt source --------------
+# --- staged upgrade target: offline, signed, flat apt repos -------------------------
+# /opt/k8s-apt/<minor>/ mirrors https://pkgs.k8s.io/core:/stable:/<minor>/deb/ for the
+# installed and the staged release. kubernetes.list points at the installed minor, the
+# same shape as the online repo, so the learner upgrades the way they would online:
+#   sed -i 's#/v1.36/#/v1.37/#' /etc/apt/sources.list.d/kubernetes.list
+#   apt-get update && apt-get install kubeadm=1.37.1-*
 if [ -n "${STAGED_K8S_VERSION}" ]; then
-  REPO=/opt/cloudtrain/apt
-  install -d "$REPO"
-  # The installed release, so `apt-cache madison` shows both and a reinstall works.
-  (cd "$REPO" && apt-get download "kubeadm=$KV" "kubelet=$KV" "kubectl=$KV" \
-     "cri-tools=${K8S_CRI_TOOLS_VERSION}" "kubernetes-cni=${KUBERNETES_CNI_VERSION}")
-  # The target release, downloaded through the signed pkgs.k8s.io repo (apt checks the
-  # Release signature and every .deb's sha256).
-  k8s_repo "$STAGED_K8S_MINOR" /etc/apt/sources.list.d/kubernetes-staged.list
-  apt-get -o APT::Update::Error-Mode=any update
-  SV=$(pkg_version kubeadm "$STAGED_K8S_VERSION")
-  [ -n "$SV" ] || { echo "kubeadm ${STAGED_K8S_VERSION} not in repo"; exit 1; }
-  (cd "$REPO" && apt-get download "kubeadm=$SV" "kubelet=$SV" "kubectl=$SV")
-  rm -f /etc/apt/sources.list.d/kubernetes-staged.list
+  APTROOT=/opt/k8s-apt
+  # stage_repo <minor> <kubernetes version> <cri-tools version>: download through the signed
+  # pkgs.k8s.io repo (apt checks the Release signature and every .deb's sha256).
+  stage_repo() {
+    local minor=$1 v=$2 cri=$3 dir=$APTROOT/$1 pv
+    k8s_repo "$minor" /etc/apt/sources.list.d/kubernetes-stage.list
+    apt-get -o APT::Update::Error-Mode=any update
+    pv=$(pkg_version kubeadm "$v")
+    [ -n "$pv" ] || { echo "kubeadm $v not in the $minor repo"; exit 1; }
+    install -d "$dir"
+    (cd "$dir" && apt-get download "kubeadm=$pv" "kubelet=$pv" "kubectl=$pv" \
+       "cri-tools=$cri" "kubernetes-cni=${KUBERNETES_CNI_VERSION}")
+    rm -f /etc/apt/sources.list.d/kubernetes-stage.list
+  }
+  stage_repo "$K8S_MINOR" "$K8S_VERSION" "$K8S_CRI_TOOLS_VERSION"
+  stage_repo "$STAGED_K8S_MINOR" "$STAGED_K8S_VERSION" "$STAGED_CRI_TOOLS_VERSION"
 
-  # Sign the repo with a throwaway key: only its public half stays in the image.
-  (cd "$REPO" && apt-ftparchive packages . > Packages && gzip -9kf Packages \
-     && apt-ftparchive -o APT::FTPArchive::Release::Origin=CloudTrain \
-          -o APT::FTPArchive::Release::Label="CloudTrain offline Kubernetes" release . > Release)
+  # Sign both repos with a throwaway key (only its public half stays) and add that key to
+  # the keyring kubernetes.list already names, next to the pkgs.k8s.io key, so editing
+  # the minor in the URL is all a learner has to do.
   GNUPGHOME=$(mktemp -d); export GNUPGHOME
-  gpg --batch --pinentry-mode loopback --passphrase '' --quick-gen-key "CloudTrain offline apt repo" ed25519 sign never
-  gpg --batch --yes --clearsign -o "$REPO/InRelease" "$REPO/Release"
-  gpg --batch --export > /etc/apt/keyrings/cloudtrain-offline.gpg
+  gpg --batch --pinentry-mode loopback --passphrase '' --quick-gen-key "CloudTrain offline Kubernetes apt repo" ed25519 sign never
+  for dir in "$APTROOT"/*/; do
+    (cd "$dir" && apt-ftparchive packages . > Packages && gzip -9kf Packages \
+       && apt-ftparchive -o APT::FTPArchive::Release::Origin=CloudTrain \
+            -o APT::FTPArchive::Release::Label="CloudTrain offline Kubernetes $(basename "$dir")" release . > Release \
+       && gpg --batch --yes --clearsign -o InRelease Release)
+  done
+  gpg --batch --export > /tmp/offline.gpg
   gpgconf --kill all || true
   rm -rf "$GNUPGHOME"; unset GNUPGHOME
+  cat /tmp/offline.gpg >> /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+  rm -f /tmp/offline.gpg
 
-  # Lab VMs have no internet: the local repo is the only source, so `apt-get update`
-  # succeeds offline and quickly. The online sources are kept, disabled, for reference.
   cat > /etc/apt/sources.list.d/kubernetes.list <<EOF
-# CloudTrain offline Kubernetes repository (staged upgrade ${STAGED_K8S_VERSION}).
-# Online equivalent: https://pkgs.k8s.io/core:/stable:/${K8S_MINOR}/deb/ and :/${STAGED_K8S_MINOR}/deb/
-deb [signed-by=/etc/apt/keyrings/cloudtrain-offline.gpg] file:${REPO} ./
+deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] file:${APTROOT}/${K8S_MINOR}/ /
 EOF
+  # Lab VMs have no internet: no apt source may need it, so `apt-get update` succeeds
+  # offline. The online sources are kept, disabled, for reference.
   for f in /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list.d/docker.list; do
     if [ -f "$f" ]; then mv "$f" "$f.disabled"; fi
   done
   if grep -q '^deb ' /etc/apt/sources.list 2>/dev/null; then mv /etc/apt/sources.list /etc/apt/sources.list.disabled; fi
-  # A dependency missing from the local repo would show up here, not in the lab.
   rm -f /etc/apt/apt.conf.d/99-build-snapshot
-  # Prove it: the staged versions resolve from the local repo alone.
+  # Prove it from the local repos alone: the installed minor, then the switch.
   apt-get -o APT::Update::Error-Mode=any update
-  apt-cache madison kubeadm kubelet kubectl | tee "$REPO/MADISON"
-  apt-get install -s --allow-change-held-packages "kubeadm=$SV" "kubelet=$SV" "kubectl=$SV" | grep -E '^Inst '
-  echo "$SV" > "$REPO/STAGED_VERSION"
+  apt-cache madison kubeadm
+  sed "s#/${K8S_MINOR}/#/${STAGED_K8S_MINOR}/#" /etc/apt/sources.list.d/kubernetes.list > /tmp/staged.list
+  mkdir -p /tmp/noparts
+  apt-get -o Dir::Etc::SourceList=/tmp/staged.list -o Dir::Etc::SourceParts=/tmp/noparts \
+    -o APT::Update::Error-Mode=any update
+  apt-get -o Dir::Etc::SourceList=/tmp/staged.list -o Dir::Etc::SourceParts=/tmp/noparts \
+    install -s --allow-change-held-packages "kubeadm=${STAGED_K8S_VERSION#v}-*" "kubelet=${STAGED_K8S_VERSION#v}-*" \
+    "kubectl=${STAGED_K8S_VERSION#v}-*" | grep -E '^Inst '
+  rm -rf /tmp/staged.list /tmp/noparts
+  apt-get update
 fi
 
 # --- containerd: systemd cgroups, CRI enabled, sandbox image = kubeadm's pause ---
@@ -112,12 +131,14 @@ systemctl enable containerd kubelet || true
 # --- pre-load images into containerd (k8s.io namespace) ---
 install -d /opt/cloudtrain/images /opt/cloudtrain/manifests
 cp /opt/cloudtrain/build/images.txt /opt/cloudtrain/images/images.txt
-cp /opt/cloudtrain/build/kube-flannel.yml /opt/cloudtrain/manifests/kube-flannel.yml
+# The lab CNI manifest (Calico, pool = kubeadm podSubnet); cni.yaml is the stable name.
+cp /opt/cloudtrain/build/calico.yaml /opt/cloudtrain/manifests/calico.yaml
+ln -sf calico.yaml /opt/cloudtrain/manifests/cni.yaml
 containerd >/tmp/containerd.log 2>&1 &
 CPID=$!
 for i in $(seq 1 30); do ctr version >/dev/null 2>&1 && break; sleep 1; done
 # images.txt lines are <name>:<tag>@<digest>: pull by digest, then name it by tag
-# (what kubeadm, the Flannel manifest and the labs' Pods reference).
+# (what kubeadm, the Calico manifest and the labs' Pods reference).
 while read -r ref; do
   [ -n "$ref" ] || continue
   tagged=${ref%@*}; bydigest=${tagged%:*}@${ref#*@}
@@ -142,7 +163,8 @@ kubectl completion bash > /etc/bash_completion.d/kubectl
 write_release \
   "KUBERNETES_VERSION=${K8S_VERSION}" \
   "STAGED_KUBERNETES_VERSION=${STAGED_K8S_VERSION}" \
-  "FLANNEL_VERSION=${FLANNEL_VERSION}" \
+  "CALICO_VERSION=${CALICO_VERSION}" \
+  "POD_CIDR=${LAB_POD_CIDR}" \
   "CONTAINERD_VERSION=$(containerd --version | awk '{print $3}')" \
   "CONTAINERD_PACKAGE=${CONTAINERD_VERSION}"
 
