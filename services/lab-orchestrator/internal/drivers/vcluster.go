@@ -21,6 +21,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -398,6 +399,17 @@ func (d *VClusterDriver) Destroy(ctx context.Context, ref NodeRef) error {
 		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: ref.Namespace(), Name: "vc-config-" + release}},
 		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: ref.Namespace(), Name: release + "-certs"}},
 		&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: ref.Namespace(), Name: "vc-" + release}},
+	} {
+		if err := d.Client.Delete(ctx, obj); err != nil && !apierrors.IsNotFound(err) {
+			return err
+		}
+	}
+	// The chart's cluster-scoped RBAC: helm uninstall misses it when the
+	// release record went first (e.g. the whole namespace is being deleted).
+	crName := "vc-" + release + "-v-" + ref.Namespace()
+	for _, obj := range []client.Object{
+		&rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: crName}},
+		&rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: crName}},
 	} {
 		if err := d.Client.Delete(ctx, obj); err != nil && !apierrors.IsNotFound(err) {
 			return err
