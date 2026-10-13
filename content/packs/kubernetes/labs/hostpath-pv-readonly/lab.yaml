@@ -1,0 +1,253 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: hostpath-pv-readonly
+  title: Publish a read-only hostPath PersistentVolume
+  domain: kubernetes
+  frameworks: [cka:storage]
+  difficulty: easy
+  estimatedMinutes: 8
+  tags: [storage, persistentvolume, hostpath, access-modes]
+  version: 1
+spec:
+  description: |
+    Quillmoor Logistics keeps signed customs manifests in an audit archive that many
+    reporting Pods read but none may modify. The storage team will place the archive
+    in a host directory on the nodes; your job is to publish that directory to the
+    cluster as a volume. Nothing needs to exist on disk yet.
+
+    Work in context `qm-archive`:
+
+    ```bash
+    kubectl config use-context qm-archive
+    ```
+
+    Create a **PersistentVolume** with these properties:
+
+    | Field | Value |
+    |---|---|
+    | Name | `{{pv}}` |
+    | Capacity | `{{size}}Gi` |
+    | Access mode | `ReadOnlyMany` |
+    | Volume type | `hostPath` |
+    | Host path | `{{hostdir}}` |
+
+    PersistentVolumes are cluster-scoped. No StorageClass is needed.
+  objectives:
+    - Write a PersistentVolume manifest from scratch
+    - Choose the correct access mode
+    - Verify capacity and status with kubectl get pv
+  params:
+    pv:
+      type: choice
+      values: [manifest-archive, customs-ledger-ro, audit-vault]
+    size:
+      type: int
+      min: 3
+      max: 8
+    hostdir:
+      type: choice
+      values: [/opt/quillmoor/audit/manifests, /data/customs/signed, /var/quillmoor/archive]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-archive
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "1.35"
+          context: qm-archive
+  setup:
+    - on: qm-archive
+      run: kubectl delete pv {{pv}} --ignore-not-found --wait=false
+  teardown:
+    - on: qm-archive
+      run: |
+        kubectl patch pv {{pv}} --type=merge -p '{"metadata":{"finalizers":null}}' 2>/dev/null || true
+        kubectl delete pv {{pv}} --ignore-not-found --wait=false
+  checks:
+    - id: context
+      description: Terminal is using context qm-archive
+      type: k8s-context
+      on: workstation
+      skills: [k8s.cli.contexts]
+      weight: 0.5
+      expect: {match: exact, value: qm-archive}
+    - id: pv-exists
+      description: PersistentVolume {{pv}} exists
+      type: k8s-query
+      skills: [k8s.storage.persistent-volumes, k8s.cli.manifests]
+      query: {cluster: qm-archive, resource: pv, name: "{{pv}}", jsonpath: "{.metadata.name}"}
+      expect: {match: exact, value: "{{pv}}"}
+    - id: capacity
+      description: Capacity is {{size}}Gi
+      type: k8s-query
+      skills: [k8s.storage.capacity-units]
+      query: {cluster: qm-archive, resource: pv, name: "{{pv}}", jsonpath: "{.spec.capacity.storage}"}
+      expect: {match: exact, value: "{{size}}Gi"}
+    - id: access-mode
+      description: The only access mode is ReadOnlyMany
+      type: k8s-query
+      skills: [k8s.storage.access-modes]
+      weight: 2
+      query: {cluster: qm-archive, resource: pv, name: "{{pv}}", jsonpath: "{.spec.accessModes}"}
+      expect: {match: regex, value: '^\["ReadOnlyMany"\]$'}
+    - id: hostpath
+      description: The volume is a hostPath at {{hostdir}}
+      type: k8s-query
+      skills: [k8s.storage.persistent-volumes]
+      query: {cluster: qm-archive, resource: pv, name: "{{pv}}", jsonpath: "{.spec.hostPath.path}"}
+      expect: {match: exact, value: "{{hostdir}}"}
+    - id: available
+      description: The PV is Available (not bound or failed)
+      type: k8s-query
+      skills: [k8s.storage.persistent-volumes]
+      weight: 0.5
+      query: {cluster: qm-archive, resource: pv, name: "{{pv}}", jsonpath: "{.status.phase}"}
+      expect: {match: exact, value: Available}
+  hints:
+    - title: Switch context
+      body: The archive lives in its own cluster.
+      command: kubectl config use-context qm-archive
+      cost: 0
+    - title: No imperative shortcut
+      body: "`kubectl create` has no PersistentVolume subcommand. Start from the API reference: `kubectl explain pv.spec` lists every field."
+      command: kubectl explain pv.spec.hostPath
+      cost: 1
+    - title: Access mode abbreviations
+      body: ReadOnlyMany shows up as ROX in `kubectl get pv`. RWX (ReadWriteMany) and RWO (ReadWriteOnce) would let Pods write to the archive.
+      cost: 2
+    - title: Skeleton
+      body: Fill in the blanks and apply it with `kubectl apply -f`.
+      command: |
+        cat <<'EOF' > pv.yaml
+        apiVersion: v1
+        kind: PersistentVolume
+        metadata:
+          name: <name>
+        spec:
+          capacity:
+            storage: <size>
+          accessModes: [<mode>]
+          hostPath:
+            path: <dir>
+        EOF
+      cost: 3
+  misconceptions:
+    - id: rwx-instead-of-rox
+      description: Uses ReadWriteMany because "many readers" sounds like "many".
+      feedback: ReadWriteMany allows every Pod to write. The archive must be ReadOnlyMany (ROX).
+      expectFail: [access-mode]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-archive
+          kubectl apply -f - <<'EOF'
+          apiVersion: v1
+          kind: PersistentVolume
+          metadata: {name: "{{pv}}"}
+          spec:
+            capacity: {storage: "{{size}}Gi"}
+            accessModes: [ReadWriteMany]
+            hostPath: {path: "{{hostdir}}"}
+          EOF
+    - id: extra-access-mode
+      description: Lists both ReadWriteOnce and ReadOnlyMany to be safe.
+      feedback: A PV advertises every listed mode, so adding ReadWriteOnce lets a claim mount it writable. List only ReadOnlyMany.
+      expectFail: [access-mode]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-archive
+          kubectl apply -f - <<'EOF'
+          apiVersion: v1
+          kind: PersistentVolume
+          metadata: {name: "{{pv}}"}
+          spec:
+            capacity: {storage: "{{size}}Gi"}
+            accessModes: [ReadWriteOnce, ReadOnlyMany]
+            hostPath: {path: "{{hostdir}}"}
+          EOF
+    - id: decimal-units
+      description: Writes the capacity in decimal gigabytes (G) instead of binary gibibytes (Gi).
+      feedback: Kubernetes quantities distinguish G (10^9 bytes) from Gi (2^30 bytes). The task asks for Gi.
+      expectFail: [capacity]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-archive
+          kubectl apply -f - <<'EOF'
+          apiVersion: v1
+          kind: PersistentVolume
+          metadata: {name: "{{pv}}"}
+          spec:
+            capacity: {storage: "{{size}}G"}
+            accessModes: [ReadOnlyMany]
+            hostPath: {path: "{{hostdir}}"}
+          EOF
+    - id: pvc-instead-of-pv
+      description: Creates a PersistentVolumeClaim instead of a PersistentVolume.
+      feedback: A claim requests storage; the task asks you to provide the volume itself.
+      expectFail: [pv-exists]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-archive
+          kubectl apply -f - <<'EOF'
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata: {name: "{{pv}}", namespace: default}
+          spec:
+            accessModes: [ReadOnlyMany]
+            resources: {requests: {storage: "{{size}}Gi"}}
+          EOF
+  solution:
+    explanation: |
+      There is no imperative generator for PVs, so write the manifest. Exactly one
+      access mode, `ReadOnlyMany`, a binary `Gi` capacity and a `hostPath` source.
+      With no claim yet, the PV reports phase `Available`.
+    steps:
+      - on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-archive
+          kubectl apply -f - <<'EOF'
+          apiVersion: v1
+          kind: PersistentVolume
+          metadata:
+            name: {{pv}}
+          spec:
+            capacity:
+              storage: {{size}}Gi
+            accessModes:
+              - ReadOnlyMany
+            hostPath:
+              path: {{hostdir}}
+          EOF
+          kubectl get pv {{pv}}
+    alternatives:
+      - id: explicit-type-and-reclaim
+        description: "Also sets `hostPath.type: DirectoryOrCreate` and `persistentVolumeReclaimPolicy: Retain`. Both are compatible with the requirements."
+        steps:
+          - on: workstation
+            as: learner
+            run: |
+              kubectl config use-context qm-archive
+              kubectl apply -f - <<'EOF'
+              apiVersion: v1
+              kind: PersistentVolume
+              metadata: {name: "{{pv}}"}
+              spec:
+                capacity: {storage: "{{size}}Gi"}
+                accessModes: [ReadOnlyMany]
+                persistentVolumeReclaimPolicy: Retain
+                hostPath: {path: "{{hostdir}}", type: DirectoryOrCreate}
+              EOF

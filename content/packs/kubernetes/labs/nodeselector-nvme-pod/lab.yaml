@@ -1,0 +1,206 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: nodeselector-nvme-pod
+  title: Pin a Pod to fast-storage nodes with nodeSelector
+  domain: kubernetes
+  frameworks: [cka:workloads-scheduling]
+  difficulty: easy
+  estimatedMinutes: 8
+  tags: [scheduling, nodeselector, labels]
+  version: 1
+spec:
+  description: |
+    Quillmoor Logistics renders thousands of shipping labels per minute, and
+    the renderer needs local fast storage. Only some fleet workers have it, and
+    they are labelled accordingly.
+
+    Work in context `qm-fleet`:
+
+    ```bash
+    kubectl config use-context qm-fleet
+    ```
+
+    In namespace `fleet-ops`, create a Pod with:
+
+    | Field | Value |
+    |---|---|
+    | Name | `{{pod}}` |
+    | Image | `httpd:2.4-alpine` |
+    | Node selector | `storage-tier={{tier}}` |
+
+    Make sure the Pod is **Running**. Do not change any node.
+  objectives:
+    - Discover node labels
+    - Add a nodeSelector to a Pod manifest
+    - Confirm placement with -o wide
+  params:
+    pod:
+      type: choice
+      values: [label-renderer, waybill-printer, pallet-tagger]
+    tier:
+      type: choice
+      values: [nvme, flash]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-fleet
+        driver: k8s-cluster
+        image: kubeadm:1.35
+        cluster:
+          mode: kubeadm
+          version: "1.35"
+          context: qm-fleet
+          nodes:
+            - {name: fleet-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: fleet-wk-1, role: worker, labels: {storage-tier: spinning}}
+            - {name: fleet-wk-2, role: worker}
+            - {name: fleet-wk-3, role: worker}
+  setup:
+    - on: qm-fleet
+      run: |
+        kubectl label node fleet-wk-2 storage-tier={{tier}} --overwrite
+        kubectl label node fleet-wk-3 storage-tier- 2>/dev/null || true
+        kubectl create namespace fleet-ops --dry-run=client -o yaml | kubectl apply -f -
+  teardown:
+    - on: qm-fleet
+      run: |
+        kubectl delete namespace fleet-ops --ignore-not-found --wait=false
+        kubectl label node fleet-wk-2 storage-tier- 2>/dev/null || true
+  checks:
+    - id: context
+      description: Terminal is using context qm-fleet
+      type: k8s-context
+      on: workstation
+      skills: [k8s.cli.contexts]
+      weight: 0.5
+      expect: {match: exact, value: qm-fleet}
+    - id: pod-image
+      description: Pod {{pod}} exists in fleet-ops with image httpd:2.4-alpine
+      type: k8s-query
+      skills: [k8s.workloads.pods]
+      query: {cluster: qm-fleet, resource: pod, name: "{{pod}}", namespace: fleet-ops, jsonpath: "{.spec.containers[0].image}"}
+      expect: {match: exact, value: httpd:2.4-alpine}
+    - id: pod-selector
+      description: The Pod's nodeSelector is storage-tier={{tier}}
+      type: k8s-query
+      skills: [k8s.scheduling.node-selector]
+      weight: 2
+      query: {cluster: qm-fleet, resource: pod, name: "{{pod}}", namespace: fleet-ops, jsonpath: "{.spec.nodeSelector.storage-tier}"}
+      expect: {match: exact, value: "{{tier}}"}
+    - id: pod-running
+      description: The Pod is Running
+      type: k8s-query
+      skills: [k8s.workloads.pods]
+      query: {cluster: qm-fleet, resource: pod, name: "{{pod}}", namespace: fleet-ops, jsonpath: "{.status.phase}"}
+      expect: {match: exact, value: Running}
+    - id: placed-on-tier
+      description: The Pod runs on fleet-wk-2, the only {{tier}} node
+      type: k8s-query
+      skills: [k8s.scheduling.node-selector, k8s.scheduling.node-labels]
+      query: {cluster: qm-fleet, resource: pod, name: "{{pod}}", namespace: fleet-ops, jsonpath: "{.spec.nodeName}"}
+      expect: {match: exact, value: fleet-wk-2}
+    - id: nodes-unchanged
+      description: Node labels were not changed
+      type: shell
+      on: qm-fleet
+      skills: [k8s.scheduling.node-labels]
+      command: kubectl get nodes -L storage-tier --no-headers | awk '{print $1"="$6}' | sort | paste -sd' ' -
+      expect: {match: exact, value: "fleet-cp-1= fleet-wk-1=spinning fleet-wk-2={{tier}} fleet-wk-3="}
+  hints:
+    - title: Switch context
+      body: The fleet cluster owns the label renderers.
+      command: kubectl config use-context qm-fleet
+      cost: 0
+    - title: Which nodes qualify?
+      body: -L adds a column for a label key.
+      command: kubectl get nodes -L storage-tier
+      cost: 1
+    - title: Generate, then edit
+      body: kubectl run can write the manifest for you; add `nodeSelector` under `spec`.
+      command: kubectl -n fleet-ops run {{pod}} --image=httpd:2.4-alpine --dry-run=client -o yaml > pod.yaml
+      cost: 1
+    - title: One-liner with overrides
+      body: --overrides merges JSON into the generated Pod.
+      command: |
+        kubectl -n fleet-ops run {{pod}} --image=httpd:2.4-alpine \
+          --overrides='{"spec":{"nodeSelector":{"storage-tier":"{{tier}}"}}}'
+      cost: 3
+  misconceptions:
+    - id: node-name
+      description: Pins the Pod with spec.nodeName instead of a nodeSelector.
+      feedback: nodeName bypasses the scheduler and ties the Pod to one host name. A nodeSelector expresses the requirement (fast storage) so any matching node will do.
+      expectFail: [pod-selector]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-fleet
+          kubectl apply -f - <<'YAML'
+          apiVersion: v1
+          kind: Pod
+          metadata: {name: "{{pod}}", namespace: fleet-ops}
+          spec:
+            nodeName: fleet-wk-2
+            containers:
+              - {name: "{{pod}}", image: "httpd:2.4-alpine"}
+          YAML
+    - id: relabelled-node
+      description: Labels a different node to match instead of selecting the existing label.
+      feedback: The task was to place the Pod, not to change the fleet's inventory labels.
+      expectFail: [nodes-unchanged]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-fleet
+          kubectl label node fleet-wk-3 storage-tier={{tier}}
+          kubectl -n fleet-ops run {{pod}} --image=httpd:2.4-alpine --overrides='{"spec":{"nodeSelector":{"storage-tier":"{{tier}}"}}}'
+    - id: label-on-pod
+      description: Puts storage-tier={{tier}} into the Pod's own labels, which has no effect on scheduling.
+      feedback: Pod labels describe the Pod. Placement constraints go in `spec.nodeSelector` (or affinity).
+      expectFail: [pod-selector]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-fleet
+          kubectl -n fleet-ops run {{pod}} --image=httpd:2.4-alpine --labels=storage-tier={{tier}}
+  solution:
+    explanation: The scheduler only considers nodes whose labels contain every key/value in `nodeSelector`.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 90
+        run: |
+          kubectl config use-context qm-fleet
+          kubectl apply -f - <<'YAML'
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: {{pod}}
+            namespace: fleet-ops
+          spec:
+            nodeSelector:
+              storage-tier: {{tier}}
+            containers:
+              - name: {{pod}}
+                image: httpd:2.4-alpine
+          YAML
+          kubectl -n fleet-ops wait pod/{{pod}} --for=condition=Ready --timeout=80s
+    alternatives:
+      - id: run-overrides
+        description: Create the Pod in one command with --overrides.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 90
+            run: |
+              kubectl config use-context qm-fleet
+              kubectl -n fleet-ops run {{pod}} --image=httpd:2.4-alpine \
+                --overrides='{"apiVersion":"v1","spec":{"nodeSelector":{"storage-tier":"{{tier}}"}}}'
+              kubectl -n fleet-ops wait pod/{{pod}} --for=condition=Ready --timeout=80s

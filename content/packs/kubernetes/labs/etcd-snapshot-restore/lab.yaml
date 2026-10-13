@@ -1,0 +1,294 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: etcd-snapshot-restore
+  title: Snapshot a TLS-secured etcd and roll back to a baseline
+  domain: kubernetes
+  frameworks: [cka:cluster-architecture, lfcs:operations-deployment]
+  difficulty: hard
+  estimatedMinutes: 30
+  tags: [etcd, backup, restore, tls, systemd]
+  version: 1
+spec:
+  description: |
+    A faulty migration corrupted the billing ledger's etcd at Quillmoor
+    Logistics. Finance wants evidence of the current state **and** a roll-back
+    to the approved baseline.
+
+    etcd runs on the VM `ledger-etcd` as the systemd unit `etcd.service`
+    (`/etc/systemd/system/etcd.service`), listening on
+    `https://127.0.0.1:2379`. Connect with `ssh ledger-etcd`; `sudo` works
+    without a password.
+
+    1. Save a **snapshot of the running instance** to
+       `/srv/qm-dr/archive/{{snap}}.db`.
+    2. Then **restore** the baseline snapshot
+       `/srv/qm-dr/archive/ledger-baseline.db` so that `etcd.service` serves
+       the baseline data on the same endpoint.
+
+    The server only accepts clients that present a certificate. Use:
+
+    | File | Path |
+    |---|---|
+    | CA certificate | `/srv/qm-dr/tls/ca.pem` |
+    | Client certificate | `/srv/qm-dr/tls/dr-operator.pem` |
+    | Client key | `/srv/qm-dr/tls/dr-operator-key.pem` |
+
+    > The dataset is tiny, so a correct snapshot finishes almost at once. A
+    > command that just sits there usually means the TLS handshake is not
+    > completing.
+  objectives:
+    - Authenticate to etcd with a CA, client certificate and key
+    - Take and verify a snapshot of a live member
+    - Restore a snapshot offline into a new data directory
+    - Point a systemd unit at restored data and reload it correctly
+  params:
+    snap:
+      type: choice
+      values: [ledger-incident-0417, ledger-pre-rollback, ledger-evidence-q3]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: ledger-etcd
+        driver: vm
+        image: etcd-host:3.6
+        resources: {cpu: 1, memoryMiB: 1024}
+        access: [ssh, console]
+  setup:
+    - on: ledger-etcd
+      file: {path: /opt/cloudtrain/lab/provision-etcd.sh, source: assets/provision-etcd.sh, mode: "0755"}
+    - on: ledger-etcd
+      file: {path: /opt/cloudtrain/lab/teardown-etcd.sh, source: assets/teardown-etcd.sh, mode: "0755"}
+    - on: ledger-etcd
+      file: {path: /opt/cloudtrain/lab/etcd.service, source: assets/etcd.service, mode: "0644"}
+    - on: ledger-etcd
+      file: {path: /opt/cloudtrain/bin/grader-etcdctl, source: assets/grader-etcdctl.sh, mode: "0700"}
+    - on: ledger-etcd
+      timeoutSec: 120
+      run: bash /opt/cloudtrain/lab/provision-etcd.sh
+  teardown:
+    - on: ledger-etcd
+      run: bash /opt/cloudtrain/lab/teardown-etcd.sh
+  checks:
+    - id: snapshot-exists
+      description: The snapshot file /srv/qm-dr/archive/{{snap}}.db exists and is not empty
+      type: shell
+      on: ledger-etcd
+      skills: [k8s.cluster.etcd-snapshot]
+      command: test -s /srv/qm-dr/archive/{{snap}}.db && echo present || echo missing
+      expect: {match: exact, value: present}
+    - id: snapshot-valid
+      description: etcdutl recognises the file as a snapshot with keys in it
+      type: shell
+      on: ledger-etcd
+      skills: [k8s.cluster.etcd-snapshot]
+      command: |
+        etcdutl snapshot status /srv/qm-dr/archive/{{snap}}.db -w json 2>/dev/null \
+          | grep -o '"totalKey":[0-9]*' | cut -d: -f2 | awk '{print ($1 > 0) ? "valid" : "empty"}'
+      expect: {match: exact, value: valid}
+    - id: snapshot-is-live-state
+      description: The snapshot captures the live dataset (taken before the restore)
+      type: shell
+      on: ledger-etcd
+      skills: [k8s.cluster.etcd-snapshot, k8s.cluster.etcd-tls]
+      weight: 2
+      command: |
+        f=/srv/qm-dr/archive/{{snap}}.db
+        if grep -aq '/registry/namespaces/freight-quotes' "$f" 2>/dev/null; then echo live; else echo not-live; fi
+      expect: {match: exact, value: live}
+    - id: service-active
+      description: etcd.service is active
+      type: service-state
+      on: ledger-etcd
+      target: etcd.service
+      skills: [linux.systemd.units]
+      expect: {match: exact, value: active}
+    - id: serves-baseline
+      description: The endpoint serves the baseline dataset (marker key reads "baseline")
+      type: shell
+      on: ledger-etcd
+      skills: [k8s.cluster.etcd-restore]
+      weight: 3
+      command: /opt/cloudtrain/bin/grader-etcdctl get /quillmoor/dataset --print-value-only
+      expect: {match: exact, value: baseline}
+    - id: keyspace-replaced
+      description: The whole keyspace was replaced (archived-waybills present, freight-quotes gone)
+      type: shell
+      on: ledger-etcd
+      skills: [k8s.cluster.etcd-restore]
+      command: |
+        /opt/cloudtrain/bin/grader-etcdctl get /registry/namespaces/ --prefix --keys-only \
+          | grep -E '^/registry/namespaces/(freight-quotes|archived-waybills)$' | sort | paste -sd' ' -
+      expect: {match: exact, value: /registry/namespaces/archived-waybills}
+    - id: tls-still-enforced
+      description: etcd still requires client certificates (TLS settings were not weakened)
+      type: shell
+      on: ledger-etcd
+      skills: [k8s.cluster.etcd-tls]
+      command: |
+        etcdctl --endpoints=https://127.0.0.1:2379 --cacert=/etc/qm-etcd/pki/ca.crt --dial-timeout=2s --command-timeout=2s \
+          get /quillmoor/dataset >/dev/null 2>&1 && echo open || echo enforced
+      expect: {match: exact, value: enforced}
+  hints:
+    - title: Three TLS flags
+      body: |
+        A server that demands client certificates needs `--cacert`, `--cert` and
+        `--key`. Without them the handshake never completes, which looks like a hang.
+      command: |
+        sudo etcdctl --endpoints=https://127.0.0.1:2379 \
+          --cacert=/srv/qm-dr/tls/ca.pem --cert=/srv/qm-dr/tls/dr-operator.pem --key=/srv/qm-dr/tls/dr-operator-key.pem \
+          snapshot save /srv/qm-dr/archive/{{snap}}.db
+      cost: 2
+    - title: Snapshot first, restore second
+      body: The evidence snapshot must contain the current data, so take it before you touch the data directory.
+      cost: 1
+    - title: Restore is an offline file operation
+      body: |
+        In etcd 3.6 restore lives in `etcdutl`, not `etcdctl`. It needs no
+        certificates and writes a **new** data directory; it refuses to overwrite
+        an existing one.
+      command: sudo etcdutl snapshot restore /srv/qm-dr/archive/ledger-baseline.db --data-dir=/var/lib/etcd-baseline
+      cost: 2
+    - title: Make the service use the restored data
+      body: |
+        Stop etcd, point `--data-dir` in the unit at the restored directory, give
+        the `etcd` user ownership of it, then `daemon-reload` so systemd sees the
+        edited unit, and start the service again.
+      command: |
+        sudo systemctl stop etcd
+        sudo chown -R etcd:etcd /var/lib/etcd-baseline
+        sudo sed -i 's#--data-dir=/var/lib/etcd #--data-dir=/var/lib/etcd-baseline #' /etc/systemd/system/etcd.service
+        sudo systemctl daemon-reload && sudo systemctl start etcd
+      cost: 3
+    - title: Check your work
+      body: The marker key reads "live" before the restore and "baseline" after it.
+      command: |
+        sudo etcdctl --endpoints=https://127.0.0.1:2379 --cacert=/srv/qm-dr/tls/ca.pem \
+          --cert=/srv/qm-dr/tls/dr-operator.pem --key=/srv/qm-dr/tls/dr-operator-key.pem get /quillmoor/dataset
+      cost: 1
+  misconceptions:
+    - id: snapshot-after-restore
+      description: Restores the baseline first and snapshots afterwards, so the "evidence" is the baseline.
+      feedback: Order matters. A snapshot taken after the restore can no longer show what the live cluster contained.
+      expectFail: [snapshot-is-live-state]
+      mutation:
+        on: ledger-etcd
+        as: learner
+        timeoutSec: 120
+        run: |
+          set -e
+          sudo systemctl stop etcd
+          sudo etcdutl snapshot restore /srv/qm-dr/archive/ledger-baseline.db --data-dir=/var/lib/etcd-baseline
+          sudo chown -R etcd:etcd /var/lib/etcd-baseline
+          sudo sed -i 's#--data-dir=/var/lib/etcd #--data-dir=/var/lib/etcd-baseline #' /etc/systemd/system/etcd.service
+          sudo systemctl daemon-reload && sudo systemctl start etcd
+          sudo etcdctl --endpoints=https://127.0.0.1:2379 --cacert=/srv/qm-dr/tls/ca.pem --cert=/srv/qm-dr/tls/dr-operator.pem \
+            --key=/srv/qm-dr/tls/dr-operator-key.pem snapshot save /srv/qm-dr/archive/{{snap}}.db
+    - id: missing-tls-flags
+      description: Calls etcdctl without the CA, certificate and key, so the snapshot never gets written.
+      feedback: The endpoint is https with client-certificate authentication. Pass --cacert, --cert and --key on every online etcdctl command.
+      expectFail: [snapshot-exists]
+      mutation:
+        on: ledger-etcd
+        as: learner
+        timeoutSec: 120
+        run: |
+          sudo timeout 10 etcdctl --endpoints=https://127.0.0.1:2379 snapshot save /srv/qm-dr/archive/{{snap}}.db || true
+          sudo systemctl stop etcd
+          sudo etcdutl snapshot restore /srv/qm-dr/archive/ledger-baseline.db --data-dir=/var/lib/etcd-baseline
+          sudo chown -R etcd:etcd /var/lib/etcd-baseline
+          sudo sed -i 's#--data-dir=/var/lib/etcd #--data-dir=/var/lib/etcd-baseline #' /etc/systemd/system/etcd.service
+          sudo systemctl daemon-reload && sudo systemctl start etcd
+    - id: no-daemon-reload
+      description: Edits the unit file but restarts without daemon-reload, so etcd keeps serving the old data dir.
+      feedback: systemd caches unit files. After editing one, run `systemctl daemon-reload` or the restart uses the old command line.
+      expectFail: [serves-baseline]
+      mutation:
+        on: ledger-etcd
+        as: learner
+        timeoutSec: 120
+        run: |
+          set -e
+          sudo etcdctl --endpoints=https://127.0.0.1:2379 --cacert=/srv/qm-dr/tls/ca.pem --cert=/srv/qm-dr/tls/dr-operator.pem \
+            --key=/srv/qm-dr/tls/dr-operator-key.pem snapshot save /srv/qm-dr/archive/{{snap}}.db
+          sudo etcdutl snapshot restore /srv/qm-dr/archive/ledger-baseline.db --data-dir=/var/lib/etcd-baseline
+          sudo chown -R etcd:etcd /var/lib/etcd-baseline
+          sudo sed -i 's#--data-dir=/var/lib/etcd #--data-dir=/var/lib/etcd-baseline #' /etc/systemd/system/etcd.service
+          sudo systemctl restart etcd
+    - id: restore-not-applied
+      description: Restores into a new directory but never points the service at it.
+      feedback: A restore only produces files. Nothing changes until etcd is started on that directory.
+      expectFail: [serves-baseline, keyspace-replaced]
+      mutation:
+        on: ledger-etcd
+        as: learner
+        timeoutSec: 120
+        run: |
+          set -e
+          sudo etcdctl --endpoints=https://127.0.0.1:2379 --cacert=/srv/qm-dr/tls/ca.pem --cert=/srv/qm-dr/tls/dr-operator.pem \
+            --key=/srv/qm-dr/tls/dr-operator-key.pem snapshot save /srv/qm-dr/archive/{{snap}}.db
+          sudo etcdutl snapshot restore /srv/qm-dr/archive/ledger-baseline.db --data-dir=/var/lib/etcd-baseline
+    - id: tls-disabled
+      description: Turns off client-certificate authentication to make etcdctl "work".
+      feedback: Weakening the server's TLS settings to get a backup is a security incident of its own. Use the supplied client identity.
+      expectFail: [tls-still-enforced]
+      mutation:
+        on: ledger-etcd
+        as: learner
+        timeoutSec: 120
+        run: |
+          set -e
+          sudo etcdctl --endpoints=https://127.0.0.1:2379 --cacert=/srv/qm-dr/tls/ca.pem --cert=/srv/qm-dr/tls/dr-operator.pem \
+            --key=/srv/qm-dr/tls/dr-operator-key.pem snapshot save /srv/qm-dr/archive/{{snap}}.db
+          sudo systemctl stop etcd
+          sudo etcdutl snapshot restore /srv/qm-dr/archive/ledger-baseline.db --data-dir=/var/lib/etcd-baseline
+          sudo chown -R etcd:etcd /var/lib/etcd-baseline
+          sudo sed -i -e 's#--data-dir=/var/lib/etcd #--data-dir=/var/lib/etcd-baseline #' \
+            -e 's#--client-cert-auth=true#--client-cert-auth=false#' /etc/systemd/system/etcd.service
+          sudo systemctl daemon-reload
+          sudo systemctl start etcd
+  solution:
+    explanation: |
+      `etcdctl snapshot save` is an online operation against the authenticated
+      endpoint. `etcdutl snapshot restore` is offline: it builds a fresh data
+      directory, which the service only uses once the unit points at it, systemd
+      has reloaded the unit, and the `etcd` user owns the files.
+    steps:
+      - on: ledger-etcd
+        as: learner
+        timeoutSec: 120
+        run: |
+          set -e
+          sudo etcdctl --endpoints=https://127.0.0.1:2379 \
+            --cacert=/srv/qm-dr/tls/ca.pem --cert=/srv/qm-dr/tls/dr-operator.pem --key=/srv/qm-dr/tls/dr-operator-key.pem \
+            snapshot save /srv/qm-dr/archive/{{snap}}.db
+          sudo etcdutl snapshot status /srv/qm-dr/archive/{{snap}}.db -w table
+          sudo systemctl stop etcd
+          sudo etcdutl snapshot restore /srv/qm-dr/archive/ledger-baseline.db --data-dir=/var/lib/etcd-baseline
+          sudo chown -R etcd:etcd /var/lib/etcd-baseline
+          sudo sed -i 's#--data-dir=/var/lib/etcd #--data-dir=/var/lib/etcd-baseline #' /etc/systemd/system/etcd.service
+          sudo systemctl daemon-reload
+          sudo systemctl start etcd
+    alternatives:
+      - id: swap-data-dir
+        description: Keep the unit unchanged; move the old data directory aside and restore into the original path.
+        steps:
+          - on: ledger-etcd
+            as: learner
+            timeoutSec: 120
+            run: |
+              set -e
+              sudo etcdctl --endpoints=https://127.0.0.1:2379 \
+                --cacert=/srv/qm-dr/tls/ca.pem --cert=/srv/qm-dr/tls/dr-operator.pem --key=/srv/qm-dr/tls/dr-operator-key.pem \
+                snapshot save /srv/qm-dr/archive/{{snap}}.db
+              sudo systemctl stop etcd
+              sudo mv /var/lib/etcd /var/lib/etcd.before-rollback
+              sudo etcdutl snapshot restore /srv/qm-dr/archive/ledger-baseline.db --data-dir=/var/lib/etcd \
+                --name=ledger-etcd --initial-cluster=ledger-etcd=http://127.0.0.1:2380 \
+                --initial-advertise-peer-urls=http://127.0.0.1:2380
+              sudo chown -R etcd:etcd /var/lib/etcd && sudo chmod 0700 /var/lib/etcd
+              sudo systemctl start etcd

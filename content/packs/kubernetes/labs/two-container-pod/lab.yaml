@@ -1,0 +1,215 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: two-container-pod
+  title: Run a web server and its cache in one Pod
+  domain: kubernetes
+  frameworks: [cka:workloads-scheduling]
+  difficulty: easy
+  estimatedMinutes: 8
+  tags: [pods, multi-container]
+  version: 1
+spec:
+  description: |
+    Quillmoor's depot kiosks use a tiny web front with a co-located cache. The
+    two processes must always be scheduled together.
+
+    Work in context `qm-depot`:
+
+    ```bash
+    kubectl config use-context qm-depot
+    ```
+
+    In namespace `depot-kiosk`, create a Pod with:
+
+    | Field | Value |
+    |---|---|
+    | Name | `{{pod}}` |
+    | App containers | 2 |
+    | Container `web` | image `httpd:2.4-alpine` |
+    | Container `cache` | image `redis:7.4-alpine` |
+
+    Both containers must be **running and ready** (`2/2`). Leave the other
+    workloads in the namespace alone.
+  objectives:
+    - Write a Pod manifest with two app containers
+    - Distinguish app containers from init containers
+    - Verify per-container readiness
+  params:
+    pod:
+      type: choice
+      values: [kiosk-duo, dock-display, gate-panel]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-depot
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "1.35"
+          context: qm-depot
+  setup:
+    - on: qm-depot
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: depot-kiosk}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: queue-ticker, namespace: depot-kiosk}
+        spec:
+          replicas: 2
+          selector: {matchLabels: {app: queue-ticker}}
+          template:
+            metadata: {labels: {app: queue-ticker}}
+            spec:
+              containers:
+                - {name: ticker, image: "busybox:1.37", command: ["sleep", "1d"]}
+  teardown:
+    - on: qm-depot
+      run: kubectl delete namespace depot-kiosk --ignore-not-found --wait=false
+  checks:
+    - id: context
+      description: Terminal is using context qm-depot
+      type: k8s-context
+      on: workstation
+      skills: [k8s.cli.contexts]
+      weight: 0.5
+      expect: {match: exact, value: qm-depot}
+    - id: container-names
+      description: Pod {{pod}} has exactly the app containers web and cache
+      type: k8s-query
+      skills: [k8s.workloads.multi-container-pods]
+      weight: 2
+      query: {cluster: qm-depot, resource: pod, name: "{{pod}}", namespace: depot-kiosk, jsonpath: '{range .spec.containers[*]}{.name}{"\n"}{end}'}
+      expect: {match: regex, value: '^(web\ncache|cache\nweb)\n?$'}
+    - id: images
+      description: web runs httpd:2.4-alpine and cache runs redis:7.4-alpine
+      type: k8s-query
+      skills: [k8s.workloads.multi-container-pods, k8s.cli.manifests]
+      query: {cluster: qm-depot, resource: pod, name: "{{pod}}", namespace: depot-kiosk, jsonpath: '{.spec.containers[?(@.name=="web")].image} {.spec.containers[?(@.name=="cache")].image}'}
+      expect: {match: exact, value: httpd:2.4-alpine redis:7.4-alpine}
+    - id: no-init-containers
+      description: No init containers are used
+      type: k8s-query
+      skills: [k8s.workloads.native-sidecars]
+      weight: 0.5
+      query: {cluster: qm-depot, resource: pod, name: "{{pod}}", namespace: depot-kiosk, jsonpath: "[{.spec.initContainers}]"}
+      expect: {match: exact, value: "[]"}
+    - id: all-ready
+      description: The Pod is Running and both containers are ready
+      type: k8s-query
+      skills: [k8s.workloads.pods]
+      query: {cluster: qm-depot, resource: pod, name: "{{pod}}", namespace: depot-kiosk, jsonpath: '{.status.phase} {range .status.containerStatuses[*]}{.ready}{" "}{end}'}
+      expect: {match: exact, value: "Running true true "}
+    - id: neighbours-unchanged
+      description: queue-ticker is still running with 2 replicas
+      type: k8s-query
+      skills: [k8s.cli.imperative]
+      weight: 0.5
+      query: {cluster: qm-depot, resource: deployment, name: queue-ticker, namespace: depot-kiosk, jsonpath: "{.spec.replicas}/{.status.readyReplicas}"}
+      expect: {match: exact, value: "2/2"}
+  hints:
+    - title: Switch context
+      body: The kiosks run on the depot cluster.
+      command: kubectl config use-context qm-depot
+      cost: 0
+    - title: Start from a generated manifest
+      body: kubectl run gives you one container; add the second under the same `containers` list.
+      command: kubectl -n depot-kiosk run {{pod}} --image=httpd:2.4-alpine --dry-run=client -o yaml > {{pod}}.yaml
+      cost: 1
+    - title: The container name
+      body: kubectl run names the container after the Pod. Rename it to `web`.
+      cost: 1
+    - title: Check each container
+      body: READY 2/2 means both containers passed readiness. describe shows per-container state.
+      command: kubectl -n depot-kiosk get pod {{pod}} && kubectl -n depot-kiosk describe pod {{pod}} | grep -A3 -E '^  (web|cache):'
+      cost: 1
+  misconceptions:
+    - id: two-pods
+      description: Creates two separate Pods instead of one Pod with two containers.
+      feedback: Containers that must be co-scheduled and share network/storage belong in the same Pod.
+      expectFail: [container-names]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n depot-kiosk run {{pod}} --image=httpd:2.4-alpine
+          kubectl -n depot-kiosk run {{pod}}-cache --image=redis:7.4-alpine
+    - id: cache-as-init
+      description: Declares the cache as an init container; a long-running init container blocks the Pod forever.
+      feedback: Init containers must exit before app containers start. A server process belongs in `containers` (or a native sidecar, which the task did not ask for).
+      expectFail: [no-init-containers]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-depot
+          kubectl apply -f - <<'YAML'
+          apiVersion: v1
+          kind: Pod
+          metadata: {name: "{{pod}}", namespace: depot-kiosk}
+          spec:
+            initContainers:
+              - {name: cache, image: "redis:7.4-alpine"}
+            containers:
+              - {name: web, image: "httpd:2.4-alpine"}
+          YAML
+    - id: default-container-name
+      description: Keeps the generated container name instead of naming it web.
+      feedback: kubectl run names the container after the Pod; the task fixes the container names.
+      expectFail: [container-names]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-depot
+          kubectl apply -f - <<'YAML'
+          apiVersion: v1
+          kind: Pod
+          metadata: {name: "{{pod}}", namespace: depot-kiosk}
+          spec:
+            containers:
+              - {name: "{{pod}}", image: "httpd:2.4-alpine"}
+              - {name: cache, image: "redis:7.4-alpine"}
+          YAML
+  solution:
+    explanation: Both processes are entries in the same `spec.containers` list, so they share the Pod's lifecycle, network namespace and node.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 90
+        run: |
+          kubectl config use-context qm-depot
+          kubectl apply -f - <<'YAML'
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: {{pod}}
+            namespace: depot-kiosk
+          spec:
+            containers:
+              - name: web
+                image: httpd:2.4-alpine
+              - name: cache
+                image: redis:7.4-alpine
+          YAML
+          kubectl -n depot-kiosk wait pod/{{pod}} --for=condition=Ready --timeout=80s
+    alternatives:
+      - id: run-with-overrides
+        description: One imperative command that overrides the generated container list.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 90
+            run: |
+              kubectl config use-context qm-depot
+              kubectl -n depot-kiosk run {{pod}} --image=httpd:2.4-alpine \
+                --overrides='{"apiVersion":"v1","spec":{"containers":[{"name":"web","image":"httpd:2.4-alpine"},{"name":"cache","image":"redis:7.4-alpine"}]}}'
+              kubectl -n depot-kiosk wait pod/{{pod}} --for=condition=Ready --timeout=80s

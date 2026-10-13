@@ -1,0 +1,191 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: scale-berth-planner
+  title: Scale one Deployment among several
+  domain: kubernetes
+  frameworks: [cka:workloads-scheduling]
+  difficulty: easy
+  estimatedMinutes: 5
+  tags: [deployment, scaling]
+  version: 1
+spec:
+  description: |
+    A cruise ship docks early at Quillmoor's harbour terminal and the berth
+    planner is falling behind.
+
+    Work in context `qm-dispatch`:
+
+    ```bash
+    kubectl config use-context qm-dispatch
+    ```
+
+    In namespace `dock-scheduling`, scale the Deployment **`berth-planner`** to
+    **{{replicas}}** Pods. Do not change any other workload.
+  objectives:
+    - Find a Deployment in a namespace
+    - Scale it and confirm the new Pods become ready
+  params:
+    replicas:
+      type: int
+      min: 4
+      max: 6
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-dispatch
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "1.35"
+          context: qm-dispatch
+  setup:
+    - on: qm-dispatch
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: dock-scheduling}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: berth-planner, namespace: dock-scheduling}
+        spec:
+          replicas: 1
+          selector: {matchLabels: {app: berth-planner}}
+          template:
+            metadata: {labels: {app: berth-planner, suite: harbour}}
+            spec:
+              containers:
+                - name: planner
+                  image: caddy:2-alpine
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: gate-watcher, namespace: dock-scheduling}
+        spec:
+          replicas: 3
+          selector: {matchLabels: {app: gate-watcher}}
+          template:
+            metadata: {labels: {app: gate-watcher, suite: harbour}}
+            spec:
+              containers:
+                - name: watcher
+                  image: caddy:2-alpine
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: tide-feed, namespace: dock-scheduling}
+        spec:
+          replicas: 1
+          selector: {matchLabels: {app: tide-feed}}
+          template:
+            metadata: {labels: {app: tide-feed, suite: harbour}}
+            spec:
+              containers:
+                - name: feed
+                  image: caddy:2-alpine
+    - on: qm-dispatch
+      timeoutSec: 120
+      run: |
+        for d in berth-planner gate-watcher tide-feed; do kubectl -n dock-scheduling rollout status deploy/$d --timeout=100s; done
+  teardown:
+    - on: qm-dispatch
+      run: kubectl delete namespace dock-scheduling --ignore-not-found --wait=false
+  checks:
+    - id: context
+      description: Terminal is using context qm-dispatch
+      type: k8s-context
+      on: workstation
+      skills: [k8s.cli.contexts]
+      weight: 0.5
+      expect: {match: exact, value: qm-dispatch}
+    - id: desired-replicas
+      description: berth-planner is set to {{replicas}} replicas
+      type: k8s-query
+      skills: [k8s.workloads.scaling]
+      query: {cluster: qm-dispatch, resource: deployment, name: berth-planner, namespace: dock-scheduling, jsonpath: "{.spec.replicas}"}
+      expect: {match: exact, value: "{{replicas}}"}
+    - id: ready-replicas
+      description: "{{replicas}} berth-planner Pods are ready"
+      type: k8s-query
+      skills: [k8s.workloads.scaling]
+      query: {cluster: qm-dispatch, resource: deployment, name: berth-planner, namespace: dock-scheduling, jsonpath: "{.status.readyReplicas}"}
+      expect: {match: exact, value: "{{replicas}}"}
+    - id: others-unchanged
+      description: gate-watcher (3) and tide-feed (1) keep their replica counts
+      type: shell
+      on: qm-dispatch
+      skills: [k8s.workloads.scaling, k8s.cli.imperative]
+      command: |
+        kubectl -n dock-scheduling get deploy gate-watcher tide-feed -o jsonpath='{range .items[*]}{.metadata.name}={.spec.replicas} {end}'
+      expect: {match: exact, value: "gate-watcher=3 tide-feed=1 "}
+  hints:
+    - title: Switch context
+      body: The dispatch cluster hosts the harbour workloads.
+      command: kubectl config use-context qm-dispatch
+      cost: 0
+    - title: Look before you scale
+      body: List the Deployments in the namespace and their current sizes.
+      command: kubectl -n dock-scheduling get deployments
+      cost: 1
+    - title: Scale exactly one object
+      body: Name the Deployment explicitly; avoid label selectors or --all here.
+      command: kubectl -n dock-scheduling scale deployment berth-planner --replicas={{replicas}}
+      cost: 2
+  misconceptions:
+    - id: scaled-all
+      description: Scales every Deployment in the namespace at once.
+      feedback: "`--all` and broad label selectors change neighbouring workloads too. Name the one Deployment you mean."
+      expectFail: [others-unchanged]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl -n dock-scheduling scale deployment --all --replicas={{replicas}}
+    - id: wrong-namespace
+      description: Forgets the namespace, so the command targets `default` and fails.
+      feedback: Deployments are namespaced. Pass `-n dock-scheduling` or set the namespace on your context.
+      expectFail: [desired-replicas]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl scale deployment berth-planner --replicas={{replicas}} || true
+    - id: scaled-replicaset
+      description: Scales the ReplicaSet instead of the Deployment; the Deployment controller scales it straight back.
+      feedback: The Deployment owns its ReplicaSets and reconciles their size. Always scale the owner.
+      expectFail: [desired-replicas]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-dispatch
+          rs=$(kubectl -n dock-scheduling get rs -l app=berth-planner -o jsonpath='{.items[0].metadata.name}')
+          kubectl -n dock-scheduling scale rs "$rs" --replicas={{replicas}}
+  solution:
+    explanation: "`kubectl scale` updates `.spec.replicas` on the Deployment; its ReplicaSet then creates the extra Pods."
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl -n dock-scheduling scale deployment berth-planner --replicas={{replicas}}
+          kubectl -n dock-scheduling rollout status deployment berth-planner --timeout=100s
+    alternatives:
+      - id: patch-replicas
+        description: Patch or edit `.spec.replicas` directly.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 120
+            run: |
+              kubectl config use-context qm-dispatch
+              kubectl -n dock-scheduling patch deployment berth-planner -p '{"spec":{"replicas":{{replicas}}}}'
+              kubectl -n dock-scheduling rollout status deployment berth-planner --timeout=100s
