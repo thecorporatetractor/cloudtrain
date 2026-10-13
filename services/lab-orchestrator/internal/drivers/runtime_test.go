@@ -63,6 +63,9 @@ func TestCatalog(t *testing.T) {
 	if _, err := c.Resolve("jumphost:1", ImageKindContainerDisk); !errors.Is(err, ErrUnsupported) {
 		t.Errorf("kind mismatch: %v", err)
 	}
+	if _, err := LoadCatalog("../../../../deploy/images/catalog.yaml"); err != nil {
+		t.Errorf("repository catalog: %v", err)
+	}
 	if _, err := ParseCatalog([]byte("images:\n  x: {kind: vm, image: a}\n")); err == nil {
 		t.Error("unknown kind must fail")
 	}
