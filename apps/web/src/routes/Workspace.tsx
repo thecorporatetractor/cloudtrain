@@ -1,9 +1,10 @@
 import { Link, useNavigate } from '@tanstack/react-router';
 import { Panel, PanelGroup, PanelResizeHandle, type ImperativePanelHandle } from 'react-resizable-panels';
-import { CheckCircle2, ChevronLeft, Keyboard, Maximize2, Minimize2, Network, PanelLeft, PanelLeftClose, PanelRight, Play, X } from 'lucide-react';
-import { useCallback, useEffect, useRef, useState } from 'react';
-import { ApiError, useLab, useRevealHint, useSession, useStartSession, useValidate } from '@/api/client';
-import type { TopologyLink, ValidateResponse } from '@/api/types';
+import { AlertTriangle, CheckCircle2, ChevronLeft, Keyboard, Loader2, Maximize2, Minimize2, Network, PanelLeft, PanelLeftClose, PanelRight, Play, Power, X } from 'lucide-react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { ApiError, useEndSession, useLab, useRevealHint, useSession, useStartSession, useValidate } from '@/api/client';
+import { isRealApi } from '@/api/mode';
+import type { LabSession, TopologyLink, ValidateResponse } from '@/api/types';
 import { useScreenShortcuts, useShell } from '@/app/shell-context';
 import { DifficultyBadge, SkillTags, StatusDot } from '@/components/domain';
 import { Badge, Button, ErrorState, Kbd, Skeleton, Tooltip } from '@/components/ui';
@@ -12,6 +13,7 @@ import { TerminalArea, focusActiveTerminal, useTerminalModel } from '@/component
 import { Timer } from '@/components/workspace/Timer';
 import { TopologyCanvas } from '@/components/workspace/Topology';
 import { useHotkeys } from '@/lib/hotkeys';
+import { personalize } from '@/lib/personalize';
 import { cn } from '@/lib/utils';
 import { workspaceRoute } from '@/router';
 
@@ -78,6 +80,7 @@ export function Workspace() {
   const start = useStartSession(labId);
   const validate = useValidate(search.s);
   const reveal = useRevealHint(search.s);
+  const end = useEndSession(search.s);
   const [lastResult, setLastResult] = useState<ValidateResponse | null>(null);
 
   // Start (or restart) a session when none is attached or it is gone.
@@ -142,8 +145,11 @@ export function Workspace() {
     [shell],
   );
 
+  // The lab as this attempt sees it: resolved {{params}}, revealed hint content.
+  const effLab = useMemo(() => (lab.data ? personalize(lab.data, session.data) : undefined), [lab.data, session.data]);
+
   // Terminals
-  const terminals = useTerminalModel(lab.data);
+  const terminals = useTerminalModel(effLab, isRealApi);
   const { toast } = shell;
 
   const onCapture = useCallback(
@@ -160,11 +166,26 @@ export function Workspace() {
     validate.mutate(undefined, {
       onSuccess: (r) => {
         setLastResult(r);
+        if (r.grading && r.grading.state !== 'complete') {
+          toast({ title: r.grading.state === 'timeout' ? 'No grading result yet' : 'Grading failed', description: r.grading.message, tone: 'warn' });
+          return;
+        }
         const all = r.summary.passed === r.summary.total;
         toast({ title: all ? 'All checks passed' : `${r.summary.passed} of ${r.summary.total} checks passed`, description: `Score ${r.summary.score} / 100`, tone: all ? 'ok' : r.summary.passed ? 'neutral' : 'warn' });
       },
     });
   }, [search.s, validate, toast]);
+
+  const endLab = useCallback(() => {
+    if (!search.s || end.isPending) return;
+    end.mutate(undefined, {
+      onSuccess: () => {
+        toast({ title: 'Lab ended', description: 'The environment is being torn down.', tone: 'neutral' });
+        void navigate({ to: '/labs/$labId', params: { labId } });
+      },
+      onError: (e) => toast({ title: 'Could not end the lab', description: e.message, tone: 'warn' }),
+    });
+  }, [search.s, end, toast, navigate, labId]);
 
   const revealNext = useCallback(() => {
     const hints = lab.data?.spec.hints ?? [];
@@ -194,7 +215,7 @@ export function Workspace() {
     { keys: 'mod+shift+arrowright', description: 'Dock task panel right', group: 'Lab', global: true, handler: () => dock('right') },
     { keys: 'mod+shift+g', description: 'Toggle topology', group: 'Lab', global: true, handler: toggleTopo },
     { keys: 'mod+shift+f', description: 'Full-screen terminal', group: 'Lab', global: true, handler: () => setChromeless(!chromeless) },
-    { keys: 'mod+shift+o', description: 'New console', group: 'Terminals', global: true, handler: () => lab.data && terminals.openConsole(lab.data.spec.topology.entry ?? lab.data.spec.topology.nodes[0]!.name) },
+    { keys: 'mod+shift+o', description: 'New console', group: 'Terminals', global: true, handler: () => effLab && terminals.openConsole(effLab.spec.topology.entry ?? effLab.spec.topology.nodes[0]!.name) },
     { keys: 'mod+shift+x', description: 'Close tab', group: 'Terminals', global: true, handler: () => terminals.closeTab() },
     { keys: 'mod+shift+d', description: 'Split pane', group: 'Terminals', global: true, handler: terminals.split },
     { keys: 'alt+]', description: 'Next tab', group: 'Terminals', global: true, handler: () => terminals.cycleTab(1) },
@@ -232,9 +253,12 @@ export function Workspace() {
     );
   }
 
-  const l = lab.data;
+  const l = effLab!;
   const s = session.data;
-  const provisioning = s?.nodes.filter((n) => n.status === 'provisioning').length ?? 0;
+  const ended = s?.phase === 'failed' || s?.phase === 'expired' || s?.status === 'failed' || s?.status === 'expired';
+  const provisioning = ended ? 0 : (s?.nodes.filter((n) => n.status === 'provisioning').length ?? 0);
+  const envReady = !!s && !ended && provisioning === 0 && (s.phase === undefined || s.phase === 'ready' || s.phase === 'grading');
+  const gradingNote = lastResult?.grading && lastResult.grading.state !== 'complete' ? lastResult.grading : undefined;
   const passedCount = s?.results.filter((r) => r.status === 'pass').length ?? 0;
   const done = s?.status === 'passed';
 
@@ -267,6 +291,12 @@ export function Workspace() {
               <CheckCircle2 size={11} /> complete
             </Badge>
           )}
+          {s?.status === 'failed' && (
+            <Badge tone="err">
+              <AlertTriangle size={11} /> environment failed
+            </Badge>
+          )}
+          {s?.status === 'expired' && <Badge tone="neutral">session ended</Badge>}
         </div>
 
         <div className="row" style={{ gap: 6 }}>
@@ -288,10 +318,17 @@ export function Workspace() {
             </>
           )}
           <Tooltip content="Validate all checks" shortcut="mod+enter">
-            <Button variant="primary" size="sm" icon={<Play size={13} />} loading={validate.isPending} disabled={!s || provisioning > 0} onClick={runValidate}>
+            <Button variant="primary" size="sm" icon={<Play size={13} />} loading={validate.isPending} disabled={!envReady} onClick={runValidate}>
               Validate
             </Button>
           </Tooltip>
+          {isRealApi && s && !ended && (
+            <Tooltip content="End the lab and remove its environment">
+              <Button variant="ghost" size="sm" icon={<Power size={13} />} loading={end.isPending} onClick={endLab}>
+                End lab
+              </Button>
+            </Tooltip>
+          )}
           <span className="vdivider" style={{ height: 18, margin: '0 4px' }} />
           <div className="segmented segmented-sm" role="group" aria-label="Task panel position">
             <Tooltip content="Dock task panel left" shortcut="mod+shift+arrowleft">
@@ -325,7 +362,17 @@ export function Workspace() {
         </div>
       </header>
 
-      {lastResult && (
+      {lastResult && gradingNote && (
+        <div className="ws-result ws-result-partial" role="status">
+          <span className="row small" style={{ gap: 8 }}>
+            <AlertTriangle size={13} className="text-warn" />
+            <strong>{gradingNote.state === 'timeout' ? 'No grading result yet' : 'Grading failed'}</strong>
+            {gradingNote.message && <span className="muted">· {gradingNote.message}</span>}
+          </span>
+          <Button variant="ghost" size="sm" iconOnly aria-label="Dismiss" icon={<X size={12} />} onClick={() => setLastResult(null)} />
+        </div>
+      )}
+      {lastResult && !gradingNote && (
         <div className={cn('ws-result', lastResult.summary.passed === lastResult.summary.total ? 'ws-result-ok' : 'ws-result-partial')} role="status">
           <span className="row small" style={{ gap: 8 }}>
             <strong>
@@ -369,7 +416,11 @@ export function Workspace() {
               </Panel>
               <PanelResizeHandle className="splitter splitter-h" />
               <Panel id="terminals" minSize={30} order={1}>
-                <TerminalArea lab={l} model={terminals.model} onFocus={terminals.focus} onClose={terminals.closeTab} onOpenConsole={terminals.openConsole} onCapture={onCapture} onSplit={terminals.split} ownsKey={ownsKey} />
+                {isRealApi && !envReady ? (
+                  <EnvironmentState session={s} onRestart={() => void navigate({ search: {}, replace: true })} />
+                ) : (
+                  <TerminalArea lab={l} model={terminals.model} onFocus={terminals.focus} onClose={terminals.closeTab} onOpenConsole={terminals.openConsole} onCapture={onCapture} onSplit={terminals.split} ownsKey={ownsKey} sessionId={isRealApi ? s?.id : undefined} />
+                )}
               </Panel>
             </PanelGroup>
           </Panel>
@@ -378,6 +429,56 @@ export function Workspace() {
         </PanelGroup>
       </div>
 
+    </div>
+  );
+}
+
+const phaseLabel: Record<NonNullable<LabSession['phase']>, string> = {
+  pending: 'Queued',
+  provisioning: 'Provisioning',
+  ready: 'Ready',
+  grading: 'Grading',
+  hibernated: 'Hibernated',
+  expired: 'Ended',
+  failed: 'Failed',
+};
+
+/** Real API mode: what stands in for the terminals until the environment is ready (or after it failed). */
+function EnvironmentState({ session, onRestart }: { session: LabSession | undefined; onRestart: () => void }) {
+  const failed = session?.status === 'failed' || session?.phase === 'failed';
+  const over = session?.status === 'expired' || session?.phase === 'expired';
+  const ready = session?.nodes.filter((n) => n.status === 'ready').length ?? 0;
+  const total = session?.nodes.length ?? 0;
+  return (
+    <div className="ws-env" role="status" aria-live="polite">
+      <div className="ws-env-card">
+        <div className="row" style={{ gap: 8 }}>
+          {failed ? <AlertTriangle size={15} className="text-err" /> : over ? <Power size={15} className="subtle" /> : <Loader2 size={15} className="spin subtle" aria-hidden />}
+          <strong>{failed ? 'The lab environment could not start' : over ? 'This session has ended' : session ? `Starting your lab environment · ${ready}/${total} nodes ready` : 'Requesting a lab environment'}</strong>
+          {session?.phase && <Badge tone={failed ? 'err' : 'neutral'}>{phaseLabel[session.phase]}</Badge>}
+        </div>
+        {session?.message && <p className="small muted ws-env-msg">{session.message}</p>}
+        {session && session.nodes.length > 0 && (
+          <ul className="ws-env-nodes">
+            {session.nodes.map((n) => (
+              <li key={n.name} className="row small" style={{ gap: 8 }}>
+                <StatusDot status={n.status} />
+                <span className="mono">{n.name}</span>
+                <span className="subtle xs">{n.status}</span>
+                {n.ip && <span className="subtle xs mono">{n.ip}</span>}
+                {n.message && <span className="subtle xs truncate">{n.message}</span>}
+              </li>
+            ))}
+          </ul>
+        )}
+        {(failed || over) && (
+          <div className="row" style={{ gap: 8 }}>
+            <Button variant="primary" size="sm" onClick={onRestart}>
+              Start a new session
+            </Button>
+          </div>
+        )}
+      </div>
     </div>
   );
 }

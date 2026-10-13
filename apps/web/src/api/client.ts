@@ -65,7 +65,12 @@ export const queries = {
       queryKey: ['session', id],
       queryFn: () => request<LabSession>(`/api/sessions/${id}`),
       enabled: !!id,
-      refetchInterval: (q) => (q.state.data?.nodes.some((n) => n.status === 'provisioning') ? 1000 : false),
+      refetchInterval: (q) => {
+        const s = q.state.data;
+        if (!s || s.phase === 'failed' || s.phase === 'expired') return false;
+        if (s.phase === 'pending' || s.phase === 'provisioning') return 1500;
+        return s.nodes.some((n) => n.status === 'provisioning') ? 1000 : false;
+      },
     }),
   skills: (member?: string) =>
     queryOptions({
@@ -111,6 +116,17 @@ export function useValidate(sessionId: string | undefined) {
   return useMutation({
     mutationFn: () => post<ValidateResponse>(`/api/sessions/${sessionId}/validate`),
     onSuccess: (r) => qc.setQueryData(['session', r.session.id], r.session),
+  });
+}
+
+export function useEndSession(sessionId: string | undefined) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async () => {
+      const res = await fetch(`/api/sessions/${sessionId}`, { method: 'DELETE' });
+      if (!res.ok && res.status !== 404) throw new ApiError(res.status, res.statusText || 'Could not end the session');
+    },
+    onSuccess: () => qc.removeQueries({ queryKey: ['session', sessionId] }),
   });
 }
 

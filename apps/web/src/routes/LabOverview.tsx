@@ -6,6 +6,7 @@ import { Prose } from '@/components/prose';
 import { Badge, Card, ErrorState, PageSkeleton, Stat } from '@/components/ui';
 import { TopologyCanvas } from '@/components/workspace/Topology';
 import { labRoute } from '@/router';
+import { personalize } from '@/lib/personalize';
 import { frameworkDomainLabel } from '@/lib/readiness';
 import { formatMinutes, titleCase } from '@/lib/utils';
 
@@ -29,7 +30,8 @@ export function LabOverview() {
       </div>
     );
   }
-  const { metadata, spec } = lab.data;
+  // Params are drawn per attempt; until then they read as ‹name›.
+  const { metadata, spec } = personalize(lab.data);
   const summary = catalog.data?.labs.find((l) => l.id === metadata.id);
   const resume = summary?.completion === 'in-progress';
   const hintCost = (spec.hints ?? []).reduce((a, h) => a + (h.cost ?? 1), 0);

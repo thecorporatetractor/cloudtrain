@@ -4,6 +4,7 @@ import '@xterm/xterm/css/xterm.css';
 import { useEffect, useRef } from 'react';
 import type { Lab, TopologyLink, TopologyNode, AccessKind } from '@/api/types';
 import { FakeCapture, FakeShell } from '@/lib/fakeShell';
+import { RemoteShell } from '@/lib/remoteShell';
 import { useTheme } from '@/lib/theme';
 
 export type TerminalSource = { kind: 'console'; node: TopologyNode; access: AccessKind } | { kind: 'capture'; link: TopologyLink };
@@ -15,6 +16,8 @@ interface Props {
   onOpenNode?: (name: string) => void;
   /** Keys the workspace owns; xterm must not swallow them. */
   ownsKey?: (e: KeyboardEvent) => boolean;
+  /** Real API mode: consoles attach to this lab session through the gateway instead of the fake shell. */
+  sessionId?: string;
 }
 
 /** The whole xterm palette comes from the --term-* tokens, so every theme (including the light ones) applies to the terminal. */
@@ -50,7 +53,7 @@ function readTheme(): ITheme {
 /**
  * One xterm instance. Stays mounted while its tab is hidden so scrollback and the fake shell survive.
  */
-export function TerminalView({ lab, source, active, onOpenNode, ownsKey }: Props) {
+export function TerminalView({ lab, source, active, onOpenNode, ownsKey, sessionId }: Props) {
   const ref = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
@@ -73,7 +76,8 @@ export function TerminalView({ lab, source, active, onOpenNode, ownsKey }: Props
       scrollback: 4000,
       allowProposedApi: true,
       theme: readTheme(),
-      convertEol: true,
+      // A real PTY already sends CRLF; the fake shell writes bare LF.
+      convertEol: !(sessionId && source.kind === 'console'),
     });
     const fit = new FitAddon();
     term.loadAddon(fit);
@@ -83,7 +87,10 @@ export function TerminalView({ lab, source, active, onOpenNode, ownsKey }: Props
     fitRef.current = fit;
 
     let session: { start(): void; dispose(): void };
-    if (source.kind === 'console') {
+    if (source.kind === 'console' && sessionId) {
+      const entry = lab.spec.topology.entry ?? lab.spec.topology.nodes[0]?.name;
+      session = new RemoteShell(term, { sessionId, node: source.node.name, entry: source.node.name === entry });
+    } else if (source.kind === 'console') {
       session = new FakeShell(term, { lab, node: source.node, access: source.access, onOpenNode: (n) => openNodeRef.current?.(n) });
     } else {
       session = new FakeCapture(term, source.link);
