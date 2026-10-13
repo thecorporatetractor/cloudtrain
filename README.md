@@ -75,4 +75,13 @@ Early development. Working today: the web app (mock and real mode), the gateway,
 
 All lab content is original: fictional organisations, node names and resources.
 
+## License
+
+CloudTrain is **source-available**, not open source.
+
+- **Software:** [Business Source License 1.1](LICENSE). You may use, modify and run it for any non-production purpose. Production use is free **only for training your own organization's personnel**. Offering CloudTrain-based training, labs or assessments to third parties (hosted, managed, embedded or as a commercial training service) needs a commercial license from AzarGuard. Each version becomes Apache-2.0 four years after its first public release.
+- **Lab content** (`content/`: labs, skill graph, framework mappings): [CC BY-NC 4.0](content/LICENSE). Share and adapt with credit to "CloudTrain by AzarGuard", for non-commercial purposes only.
+- **Third-party software:** see [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) and [NOTICE](NOTICE).
+- **Contributing:** see [CONTRIBUTING.md](CONTRIBUTING.md); contributors sign the [CLA](CLA.md).
+
 Screenshots are regenerated with `node apps/web/scripts/readme-shots.mjs` against the mock-mode dev server.
