@@ -198,6 +198,7 @@ workload_pods() {
   echo "cat <<'EOF' | kubectl apply -f -"
   while read -r ref; do
     ref=${ref%@*}
+    echo '---'
     echo "{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"metadata\":{\"name\":\"w$i\",\"labels\":{\"t\":\"w\"}},\"spec\":{\"containers\":[{\"name\":\"c\",\"image\":\"${ref#docker.io/library/}\",\"imagePullPolicy\":\"Never\",\"command\":[\"sleep\",\"3600\"]}]}}"
     i=$((i + 1))
   done < <(grep -v '^#' "$HERE/lock/workloads.lock" | grep .)
@@ -227,7 +228,8 @@ test_kubeadm-upgrade() {
   vmrun <<EOS || return 1
 set -e
 for i in kube-apiserver kube-controller-manager kube-scheduler kube-proxy; do
-  crictl images | grep -qE "registry.k8s.io/\$i +$to " && echo "ok: staged \$i:$to preloaded"
+  crictl images | grep -qE "registry.k8s.io/\$i +$to " || { echo "FAIL: staged \$i:$to not preloaded"; exit 1; }
+  echo "ok: staged \$i:$to preloaded"
 done
 dpkg-query -W -f='\${Package} \${Version}\n' kubeadm kubelet kubectl
 apt-mark showhold

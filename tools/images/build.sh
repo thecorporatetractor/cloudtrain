@@ -176,8 +176,16 @@ K8S_APT_KEY_FPR=${K8S_APT_KEY_FPR}
 BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 GIT_REV=$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)
 EOF
-log "customizing $VARIANT (virt-customize, KVM)"
-docker run --rm --device /dev/kvm \
+# libguestfs runs its appliance under TCG (software emulation) by default: on the WSL2
+# reference machine, nested KVM inside the appliance (docker --device /dev/kvm -> WSL2
+# -> Hyper-V) crashed WSL several times and once blue-screened Windows (bugcheck 0x7f,
+# double fault). GUESTFS_KVM=1 re-enables KVM where nested virt is known to be stable.
+# The appliance gets at most 2 GiB and the builder container at most 6 GiB.
+GUESTFS_ARGS=(-e LIBGUESTFS_BACKEND=direct -e LIBGUESTFS_MEMSIZE=2048)
+if [[ ${GUESTFS_KVM:-0} == 1 ]]; then GUESTFS_ARGS+=(--device /dev/kvm)
+else GUESTFS_ARGS+=(-e LIBGUESTFS_BACKEND_SETTINGS=force_tcg); fi
+log "customizing $VARIANT (virt-customize, $([[ ${GUESTFS_KVM:-0} == 1 ]] && echo KVM || echo 'TCG; GUESTFS_KVM=1 for KVM'))"
+docker run --rm --memory 6g "${GUESTFS_ARGS[@]}" \
   -v "$HERE:/src:ro" -v "$CACHE:/work" -e TMPDIR="/work/$VARIANT/tmp" \
   -e BASE="/work/$(basename "$BASE")" -e VARIANT_DIR="/work/$VARIANT" \
   -e GUEST_SCRIPT="guest-$GUEST.sh" -e DISK_SIZE="$DISK_SIZE" \

@@ -15,7 +15,7 @@ cp --sparse=always "$BASE" "$DISK"
 qemu-img resize -q "$DISK" "$DISK_SIZE"
 
 # Build inputs land in /opt/cloudtrain/build; the guest script moves what it keeps.
-virt-customize -a "$DISK" --memsize 2048 --smp 4 --network \
+virt-customize -a "$DISK" --memsize "${LIBGUESTFS_MEMSIZE:-2048}" --smp 4 --network \
   --mkdir /opt/cloudtrain \
   --copy-in "$VARIANT_DIR/in:/opt/cloudtrain" \
   --run-command "mv /opt/cloudtrain/in /opt/cloudtrain/build" \
