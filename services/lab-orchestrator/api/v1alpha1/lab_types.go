@@ -203,7 +203,7 @@ const (
 )
 
 // Action runs on a node. Exactly one of run/apply/file/config is set.
-// +kubebuilder:validation:XValidation:rule="[has(self.run), has(self.apply), has(self.file), has(self.config)].filter(x, x).size() == 1",message="exactly one of run, apply, file, config must be set"
+// +kubebuilder:validation:XValidation:rule="(has(self.run) ? 1 : 0) + (has(self.apply) ? 1 : 0) + (has(self.file) ? 1 : 0) + (has(self.config) ? 1 : 0) == 1",message="exactly one of run, apply, file, config must be set"
 type Action struct {
 	// On is a node name, or node/cluster-node for kubeadm cluster members.
 	On string `json:"on"`
