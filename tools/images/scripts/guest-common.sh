@@ -36,13 +36,18 @@ base_setup() {
   # Ubuntu archive packages come from a fixed snapshot.ubuntu.com point in time, so
   # a rebuild resolves the same versions (third-party repos are pinned per package).
   echo "APT::Snapshot \"${UBUNTU_APT_SNAPSHOT}\";" > /etc/apt/apt.conf.d/99-build-snapshot
-  # Everything the images install is in `main`: index only that component, without
-  # translations, during the build (a few MB instead of ~40 MB from the snapshot
-  # service). The image's own sources are restored by restore_ubuntu_sources.
-  echo 'Acquire::Languages "none";' >> /etc/apt/apt.conf.d/99-build-ipv4
+  # Everything the images install is in main + universe (qemu-guest-agent): index only
+  # those, without translations, DEP-11 and command-not-found metadata, during the
+  # build (about half of the ~40 MB the snapshot service would otherwise serve). The
+  # image's own sources are restored by restore_ubuntu_sources.
+  printf '%s\n' 'Acquire::Languages "none";' \
+    'Acquire::IndexTargets::deb::DEP-11::DefaultEnabled "false";' \
+    'Acquire::IndexTargets::deb::DEP-11-icons::DefaultEnabled "false";' \
+    'Acquire::IndexTargets::deb::DEP-11-icons-hidpi::DefaultEnabled "false";' \
+    'Acquire::IndexTargets::deb::CNF::DefaultEnabled "false";' >> /etc/apt/apt.conf.d/99-build-ipv4
   if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
     cp /etc/apt/sources.list.d/ubuntu.sources "$B/ubuntu.sources.orig"
-    sed -i 's/^Components: .*/Components: main/' /etc/apt/sources.list.d/ubuntu.sources
+    sed -i 's/^Components: .*/Components: main universe/' /etc/apt/sources.list.d/ubuntu.sources
   fi
   apt-get -o APT::Update::Error-Mode=any update
   apt-get install -y --no-install-recommends ca-certificates curl gpg apt-transport-https \
