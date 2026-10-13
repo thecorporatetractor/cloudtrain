@@ -2,37 +2,40 @@ apiVersion: cloudtrain.dev/v3
 kind: Lab
 metadata:
   id: kubeadm-control-plane-upgrade
-  title: Patch-upgrade a kubeadm control plane
+  title: Upgrade a kubeadm control plane to the next minor release
   domain: kubernetes
   frameworks: [cka:cluster-architecture, cks:cluster-hardening, lfcs:operations-deployment]
   difficulty: hard
-  estimatedMinutes: 35
+  estimatedMinutes: 40
   tags: [kubeadm, upgrade, apt, kubelet, maintenance]
-  version: 1
+  version: 2
 spec:
   description: |
-    The billing-ledger cluster at Quillmoor Logistics runs Kubernetes
-    **v1.35.1** and must receive the **v1.35.2** patch release tonight. The
-    change window covers the **control-plane node `ledger-cp-1` only**.
+    The billing-ledger cluster at Quillmoor Logistics runs Kubernetes **v1.36**
+    and must move to **v1.37.1** tonight. The change window covers the
+    **control-plane node `ledger-cp-1` only**.
 
-    Work in context `qm-ledger`:
+    From your workstation, switch to context `qm-ledger` first:
 
     ```bash
     kubectl config use-context qm-ledger
     ```
 
-    - Upgrade the control-plane components on `ledger-cp-1` to v1.35.2 with
-      kubeadm, and upgrade the `kubeadm`, `kubelet` and `kubectl` packages on
-      that node to the matching version.
     - Take `ledger-cp-1` out of scheduling before you start and return it to
       service when you are done.
-    - Do **not** touch the worker `ledger-wk-1`, and do **not** upgrade etcd,
-      the container runtime, the CNI plugin or CoreDNS beyond what the
-      control-plane upgrade requires.
+    - Upgrade the control plane on `ledger-cp-1` to v1.37.1 with kubeadm, and
+      upgrade the `kubeadm`, `kubelet` and `kubectl` packages on that node to
+      the matching version. The running kubelet must report v1.37.1.
+    - The three packages are on hold; they must be on hold again afterwards.
+    - Do **not** touch the worker `ledger-wk-1`; it is upgraded in a later window.
 
     Reach the node with `ssh ledger-cp-1`; `sudo` works without a password.
-    The node's apt sources already point at the v1.35 package repository.
+    Lab nodes have no internet access. The node's Kubernetes apt source
+    (`/etc/apt/sources.list.d/kubernetes.list`) points at the local **v1.36**
+    package mirror under `/opt/k8s-apt/`; the **v1.37** mirror sits next to it
+    and is laid out the same way.
   objectives:
+    - Switch the package repository to the next minor release
     - Plan and apply a kubeadm control-plane upgrade
     - Install exact package versions and manage apt holds
     - Restart the kubelet after a package upgrade
@@ -46,12 +49,14 @@ spec:
         access: [shell]
       - name: qm-ledger
         driver: k8s-cluster
-        image: kubeadm:1.35.1
+        # Starts on v1.36 (exact patch pinned by the image); v1.37.1 packages and
+        # control-plane images are staged offline in the image.
+        image: kubeadm:1.36
         resources: {cpu: 2, memoryMiB: 3072}
         access: [ssh]
         cluster:
           mode: kubeadm
-          version: "1.35.1"
+          version: "v1.36"
           context: qm-ledger
           nodes:
             - {name: ledger-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
@@ -138,36 +143,44 @@ spec:
       weight: 0.5
       expect: {match: exact, value: qm-ledger}
     - id: kubeadm-package
-      description: The kubeadm package on ledger-cp-1 is 1.35.2
+      description: The kubeadm package on ledger-cp-1 is 1.37.1 (from the v1.37 repository)
       type: shell
       on: qm-ledger/ledger-cp-1
-      skills: [linux.packages.version-pinning, k8s.cluster.kubeadm-upgrade]
+      skills: [linux.packages.repositories, linux.packages.version-pinning]
       command: dpkg-query -W -f='${Version}' kubeadm
-      expect: {match: regex, value: "^1\\.35\\.2-"}
+      expect: {match: regex, value: "^1\\.37\\.1-"}
     - id: control-plane-version
-      description: The cluster configuration and kube-apiserver run v1.35.2
+      description: The cluster configuration and kube-apiserver run v1.37.1
       type: shell
       on: qm-ledger
       skills: [k8s.cluster.kubeadm-upgrade]
-      weight: 2
+      weight: 3
       command: |
         cfg=$(kubectl -n kube-system get cm kubeadm-config -o jsonpath='{.data.ClusterConfiguration}' | awk '/kubernetesVersion:/{print $2}')
         api=$(kubectl -n kube-system get pod kube-apiserver-ledger-cp-1 -o jsonpath='{.spec.containers[0].image}' | sed 's/.*://')
         echo "$cfg $api"
-      expect: {match: exact, value: "v1.35.2 v1.35.2"}
+      expect: {match: exact, value: "v1.37.1 v1.37.1"}
     - id: node-packages
-      description: kubelet and kubectl on ledger-cp-1 are 1.35.2
+      description: kubelet and kubectl on ledger-cp-1 are 1.37.1
       type: shell
       on: qm-ledger/ledger-cp-1
       skills: [linux.packages.version-pinning, k8s.cluster.kubelet]
       command: dpkg-query -W -f='${Version} ' kubelet kubectl
-      expect: {match: regex, value: "^1\\.35\\.2-\\S+ 1\\.35\\.2-\\S+ ?$"}
+      expect: {match: regex, value: "^1\\.37\\.1-\\S+ 1\\.37\\.1-\\S+ ?$"}
+    - id: packages-held
+      description: kubeadm, kubelet and kubectl are on hold again on ledger-cp-1
+      type: shell
+      on: qm-ledger/ledger-cp-1
+      skills: [linux.packages.version-pinning]
+      weight: 0.5
+      command: apt-mark showhold | grep -E '^(kubeadm|kubelet|kubectl)$' | sort | paste -sd, -
+      expect: {match: exact, value: "kubeadm,kubectl,kubelet"}
     - id: kubelet-restarted
-      description: ledger-cp-1 reports kubelet v1.35.2 (the new kubelet is running)
+      description: ledger-cp-1 reports kubelet v1.37.1 (the new kubelet is running)
       type: k8s-query
-      skills: [k8s.cluster.kubelet, linux.systemd.units]
+      skills: [k8s.cluster.kubelet]
       query: {cluster: qm-ledger, resource: node, name: ledger-cp-1, jsonpath: "{.status.nodeInfo.kubeletVersion}"}
-      expect: {match: exact, value: v1.35.2}
+      expect: {match: exact, value: v1.37.1}
     - id: was-cordoned
       description: ledger-cp-1 was taken out of scheduling during the window
       type: shell
@@ -182,23 +195,24 @@ spec:
       query: {cluster: qm-ledger, resource: node, name: ledger-cp-1, jsonpath: "{.spec.unschedulable}"}
       expect: {match: not_exact, value: "true"}
     - id: worker-node-untouched
-      description: ledger-wk-1 still reports kubelet v1.35.1
+      description: ledger-wk-1 still runs a v1.36 kubelet
       type: k8s-query
       skills: [k8s.cluster.version-skew]
       query: {cluster: qm-ledger, resource: node, name: ledger-wk-1, jsonpath: "{.status.nodeInfo.kubeletVersion}"}
-      expect: {match: exact, value: v1.35.1}
+      expect: {match: regex, value: "^v1\\.36\\.[0-9]+$"}
     - id: worker-packages-untouched
-      description: Packages on ledger-wk-1 are still 1.35.1
+      description: kubeadm and kubelet on ledger-wk-1 are still 1.36
       type: shell
       on: qm-ledger/ledger-wk-1
       skills: [k8s.cluster.version-skew]
       command: dpkg-query -W -f='${Version} ' kubeadm kubelet
-      expect: {match: regex, value: "^1\\.35\\.1-\\S+ 1\\.35\\.1-\\S+ ?$"}
+      expect: {match: regex, value: "^1\\.36\\.[0-9]+-\\S+ 1\\.36\\.[0-9]+-\\S+ ?$"}
     - id: workloads-recovered
       description: CoreDNS and ledger-reconciler are fully ready again
       type: shell
       on: qm-ledger
-      skills: [k8s.scheduling.cordon-drain, k8s.workloads.deployments]
+      skills: [k8s.scheduling.cordon-drain]
+      weight: 0.5
       command: |
         a=$(kubectl -n kube-system get deploy coredns -o jsonpath='{.status.readyReplicas}/{.spec.replicas}')
         b=$(kubectl -n ledger get deploy ledger-reconciler -o jsonpath='{.status.readyReplicas}/{.spec.replicas}')
@@ -207,27 +221,28 @@ spec:
   hints:
     - title: Order of operations
       body: |
-        drain node -> upgrade the kubeadm package -> `kubeadm upgrade plan` ->
-        `kubeadm upgrade apply` -> upgrade kubelet and kubectl packages ->
-        restart kubelet -> uncordon.
+        drain node -> switch the apt source to v1.37 -> upgrade the kubeadm package ->
+        `kubeadm upgrade plan` -> `kubeadm upgrade apply` -> upgrade kubelet and
+        kubectl packages -> restart kubelet -> uncordon.
       cost: 1
     - title: Drain from the workstation
       body: Drain uses the API, so run it where your kubeconfig lives, before you ssh.
       command: kubectl drain ledger-cp-1 --ignore-daemonsets
       cost: 1
+    - title: One repository per minor release
+      body: |
+        Kubernetes packages are published in one repository per minor version, so a
+        minor upgrade starts by pointing the apt source at the new minor. Here that
+        means changing `v1.36` to `v1.37` in the source line, then `apt-get update`.
+      command: cat /etc/apt/sources.list.d/kubernetes.list
+      cost: 2
     - title: Held packages
       body: |
         The packages are on hold so routine updates cannot move them. Release the
         hold, install the exact version, and put the hold back. `apt-cache madison kubeadm`
         lists the available versions.
       command: |
-        sudo apt-mark unhold kubeadm && sudo apt-get update && sudo apt-get install -y kubeadm='1.35.2-*' && sudo apt-mark hold kubeadm
-      cost: 2
-    - title: Keep etcd where it is
-      body: |
-        `kubeadm upgrade apply` also moves etcd to the version it bundles unless you
-        tell it not to. The window excludes etcd, so leave it alone during apply.
-      command: sudo kubeadm upgrade apply v1.35.2 --etcd-upgrade=false
+        sudo apt-mark unhold kubeadm && sudo apt-get update && sudo apt-get install -y kubeadm='1.37.1-*' && sudo apt-mark hold kubeadm
       cost: 2
     - title: The node still shows the old version?
       body: The node's VERSION column is the running kubelet's version. Upgrading the package does not restart the service.
@@ -236,26 +251,28 @@ spec:
   misconceptions:
     - id: forgot-kubelet-restart
       description: Upgrades every package and the control plane but never restarts the kubelet.
-      feedback: The kubelet keeps running the old binary until the service restarts, so the node still reports v1.35.1.
+      feedback: The kubelet keeps running the old binary until the service restarts, so the node still reports v1.36.
+      expectFail: [kubelet-restarted]
       # Valid only if installing the kubelet package does not restart the
       # service itself (no restart in the deb's postinst). The verifier proves
       # this on a live node: if the package restarts kubelet, kubelet-restarted
       # passes and this mutation is reported as not caught.
-      expectFail: [kubelet-restarted]
       mutation:
         on: workstation
         as: learner
-        timeoutSec: 600
+        timeoutSec: 900
         run: |
           kubectl config use-context qm-ledger
           kubectl drain ledger-cp-1 --ignore-daemonsets --delete-emptydir-data
           ssh ledger-cp-1 'sudo bash -s' <<'EOS'
           set -e
+          sed -i 's#/v1\.36/#/v1.37/#' /etc/apt/sources.list.d/kubernetes.list
           apt-mark unhold kubeadm kubelet kubectl
           apt-get update -q
-          apt-get install -y kubeadm='1.35.2-*'
-          kubeadm upgrade apply -y v1.35.2 --etcd-upgrade=false
-          apt-get install -y kubelet='1.35.2-*' kubectl='1.35.2-*'
+          apt-get install -y kubeadm='1.37.1-*'
+          kubeadm upgrade plan v1.37.1
+          kubeadm upgrade apply -y v1.37.1
+          apt-get install -y kubelet='1.37.1-*' kubectl='1.37.1-*'
           apt-mark hold kubeadm kubelet kubectl
           EOS
           kubectl uncordon ledger-cp-1
@@ -266,21 +283,36 @@ spec:
       mutation:
         on: workstation
         as: learner
-        timeoutSec: 600
+        timeoutSec: 900
         run: |
           kubectl config use-context qm-ledger
           kubectl drain ledger-cp-1 --ignore-daemonsets --delete-emptydir-data
-          for n in ledger-cp-1 ledger-wk-1; do
-            ssh "$n" 'sudo bash -s' <<'EOS'
+          ssh ledger-cp-1 'sudo bash -s' <<'EOS'
           set -e
+          sed -i 's#/v1\.36/#/v1.37/#' /etc/apt/sources.list.d/kubernetes.list
           apt-mark unhold kubeadm kubelet kubectl
           apt-get update -q
-          apt-get install -y kubeadm='1.35.2-*' kubelet='1.35.2-*' kubectl='1.35.2-*'
-          if [ -f /etc/kubernetes/manifests/kube-apiserver.yaml ]; then kubeadm upgrade apply -y v1.35.2 --etcd-upgrade=false; else kubeadm upgrade node; fi
-          systemctl daemon-reload && systemctl restart kubelet
+          apt-get install -y kubeadm='1.37.1-*'
+          kubeadm upgrade plan v1.37.1
+          kubeadm upgrade apply -y v1.37.1
+          apt-get install -y kubelet='1.37.1-*' kubectl='1.37.1-*'
+          apt-mark hold kubeadm kubelet kubectl
+          systemctl daemon-reload
+          systemctl restart kubelet
           EOS
-          done
           kubectl uncordon ledger-cp-1
+          ssh ledger-wk-1 'sudo bash -s' <<'EOS'
+          set -e
+          sed -i 's#/v1\.36/#/v1.37/#' /etc/apt/sources.list.d/kubernetes.list
+          apt-mark unhold kubeadm kubelet kubectl
+          apt-get update -q
+          apt-get install -y kubeadm='1.37.1-*'
+          kubeadm upgrade node
+          apt-get install -y kubelet='1.37.1-*' kubectl='1.37.1-*'
+          apt-mark hold kubeadm kubelet kubectl
+          systemctl daemon-reload
+          systemctl restart kubelet
+          EOS
     - id: never-cordoned
       description: Upgrades in place without draining the node first.
       feedback: Draining first moves workloads off before the control-plane Pods and kubelet restart; skipping it causes avoidable disruption.
@@ -288,16 +320,21 @@ spec:
       mutation:
         on: workstation
         as: learner
-        timeoutSec: 600
+        timeoutSec: 900
         run: |
           kubectl config use-context qm-ledger
           ssh ledger-cp-1 'sudo bash -s' <<'EOS'
           set -e
+          sed -i 's#/v1\.36/#/v1.37/#' /etc/apt/sources.list.d/kubernetes.list
           apt-mark unhold kubeadm kubelet kubectl
           apt-get update -q
-          apt-get install -y kubeadm='1.35.2-*' kubelet='1.35.2-*' kubectl='1.35.2-*'
-          kubeadm upgrade apply -y v1.35.2 --etcd-upgrade=false
-          systemctl daemon-reload && systemctl restart kubelet
+          apt-get install -y kubeadm='1.37.1-*'
+          kubeadm upgrade plan v1.37.1
+          kubeadm upgrade apply -y v1.37.1
+          apt-get install -y kubelet='1.37.1-*' kubectl='1.37.1-*'
+          apt-mark hold kubeadm kubelet kubectl
+          systemctl daemon-reload
+          systemctl restart kubelet
           EOS
     - id: left-cordoned
       description: Completes the upgrade but forgets to uncordon the node.
@@ -306,24 +343,54 @@ spec:
       mutation:
         on: workstation
         as: learner
-        timeoutSec: 600
+        timeoutSec: 900
         run: |
           kubectl config use-context qm-ledger
           kubectl drain ledger-cp-1 --ignore-daemonsets --delete-emptydir-data
           ssh ledger-cp-1 'sudo bash -s' <<'EOS'
           set -e
+          sed -i 's#/v1\.36/#/v1.37/#' /etc/apt/sources.list.d/kubernetes.list
           apt-mark unhold kubeadm kubelet kubectl
           apt-get update -q
-          apt-get install -y kubeadm='1.35.2-*' kubelet='1.35.2-*' kubectl='1.35.2-*'
-          kubeadm upgrade apply -y v1.35.2 --etcd-upgrade=false
-          systemctl daemon-reload && systemctl restart kubelet
+          apt-get install -y kubeadm='1.37.1-*'
+          kubeadm upgrade plan v1.37.1
+          kubeadm upgrade apply -y v1.37.1
+          apt-get install -y kubelet='1.37.1-*' kubectl='1.37.1-*'
+          apt-mark hold kubeadm kubelet kubectl
+          systemctl daemon-reload
+          systemctl restart kubelet
           EOS
+    - id: same-minor-repository
+      description: Leaves the apt source on v1.36 and tries to install 1.37.1 from it, so apt finds no such version and nothing is upgraded.
+      feedback: Each minor release has its own package repository. Point the apt source at v1.37 before you look for 1.37.1 packages.
+      expectFail: [kubeadm-package, control-plane-version]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 900
+        run: |
+          kubectl config use-context qm-ledger
+          kubectl drain ledger-cp-1 --ignore-daemonsets --delete-emptydir-data
+          ssh ledger-cp-1 'sudo bash -s' <<'EOS'
+          apt-mark unhold kubeadm kubelet kubectl
+          apt-get update -q
+          apt-get install -y kubeadm='1.37.1-*'
+          kubeadm upgrade plan v1.37.1
+          kubeadm upgrade apply -y v1.37.1
+          apt-get install -y kubelet='1.37.1-*' kubectl='1.37.1-*'
+          apt-mark hold kubeadm kubelet kubectl
+          systemctl daemon-reload
+          systemctl restart kubelet
+          EOS
+          kubectl uncordon ledger-cp-1
   solution:
     explanation: |
-      kubeadm upgrades the control plane in two halves: `kubeadm upgrade apply`
-      rewrites the static Pod manifests (apiserver, controller-manager, scheduler)
-      and cluster add-ons, while the kubelet and kubectl are ordinary packages that
-      need their own install and a kubelet restart.
+      A minor upgrade starts with the package repository: Kubernetes publishes one
+      apt repository per minor release. Then kubeadm upgrades the control plane in
+      two halves: `kubeadm upgrade apply` rewrites the static Pod manifests
+      (apiserver, controller-manager, scheduler, etcd) and cluster add-ons, while
+      the kubelet and kubectl are ordinary packages that need their own install and
+      a kubelet restart. Holds keep routine updates from moving them afterwards.
     steps:
       - on: workstation
         as: learner
@@ -333,12 +400,13 @@ spec:
           kubectl drain ledger-cp-1 --ignore-daemonsets --delete-emptydir-data
           ssh ledger-cp-1 'sudo bash -s' <<'EOS'
           set -e
+          sed -i 's#/v1\.36/#/v1.37/#' /etc/apt/sources.list.d/kubernetes.list
           apt-mark unhold kubeadm kubelet kubectl
           apt-get update -q
-          apt-get install -y kubeadm='1.35.2-*'
-          kubeadm upgrade plan v1.35.2
-          kubeadm upgrade apply -y v1.35.2 --etcd-upgrade=false
-          apt-get install -y kubelet='1.35.2-*' kubectl='1.35.2-*'
+          apt-get install -y kubeadm='1.37.1-*'
+          kubeadm upgrade plan v1.37.1
+          kubeadm upgrade apply -y v1.37.1
+          apt-get install -y kubelet='1.37.1-*' kubectl='1.37.1-*'
           apt-mark hold kubeadm kubelet kubectl
           systemctl daemon-reload
           systemctl restart kubelet
@@ -347,7 +415,7 @@ spec:
           kubectl get nodes
     alternatives:
       - id: allow-change-held
-        description: Install over the hold with --allow-change-held-packages instead of unhold/hold; the grader only checks versions.
+        description: Install over the hold with --allow-change-held-packages instead of unhold/hold; the holds stay in place.
         steps:
           - on: workstation
             as: learner
@@ -357,10 +425,11 @@ spec:
               kubectl drain ledger-cp-1 --ignore-daemonsets --delete-emptydir-data
               ssh ledger-cp-1 'sudo bash -s' <<'EOS'
               set -e
+              sed -i 's#/v1\.36/#/v1.37/#' /etc/apt/sources.list.d/kubernetes.list
               apt-get update -q
-              apt-get install -y --allow-change-held-packages kubeadm='1.35.2-*'
-              kubeadm upgrade apply -y v1.35.2 --etcd-upgrade=false
-              apt-get install -y --allow-change-held-packages kubelet='1.35.2-*' kubectl='1.35.2-*'
+              apt-get install -y --allow-change-held-packages kubeadm='1.37.1-*'
+              kubeadm upgrade apply -y v1.37.1
+              apt-get install -y --allow-change-held-packages kubelet='1.37.1-*' kubectl='1.37.1-*'
               systemctl daemon-reload && systemctl restart kubelet
               EOS
               kubectl uncordon ledger-cp-1
