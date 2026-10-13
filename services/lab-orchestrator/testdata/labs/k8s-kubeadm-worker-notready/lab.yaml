@@ -1,0 +1,137 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: k8s-kubeadm-worker-notready
+  title: Recover a NotReady worker in a kubeadm cluster
+  domain: kubernetes
+  frameworks: ["cka:troubleshooting"]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [kubelet, kubeadm, troubleshooting]
+spec:
+  description: |
+    The Larkspur Analytics platform team runs the `{{ctx}}` cluster. Worker
+    `orchard-w2` went NotReady overnight and workloads in namespace
+    `{{ns}}` are stuck Pending.
+
+    Bring `orchard-w2` back to Ready without recreating the node, and make sure
+    the fix survives a reboot. Then confirm the `ledger` Deployment in `{{ns}}`
+    has {{replicas}} ready replicas.
+  params:
+    ns:
+      type: name
+      prefix: ledger
+    ctx:
+      type: choice
+      values: [orchard-prod, orchard-stage]
+    replicas:
+      type: int
+      min: 2
+      max: 4
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell, web]
+        resources: { cpu: 0.5, memoryMiB: 512 }
+      - name: orchard
+        driver: k8s-cluster
+        image: kubeadm:1.35
+        access: [ssh]
+        cluster:
+          mode: kubeadm
+          version: "1.35"
+          context: "{{ctx}}"
+          nodes:
+            - name: orchard-cp1
+              role: control-plane
+              taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]
+            - name: orchard-w1
+              role: worker
+              labels: { tier: general }
+            - name: orchard-w2
+              role: worker
+              labels: { tier: general }
+              state: notready
+  setup:
+    - on: orchard
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata:
+          name: {{ns}}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: ledger
+          namespace: {{ns}}
+        spec:
+          replicas: {{replicas}}
+          selector: { matchLabels: { app: ledger } }
+          template:
+            metadata: { labels: { app: ledger } }
+            spec:
+              nodeSelector: { kubernetes.io/hostname: orchard-w2 }
+              containers:
+                - name: ledger
+                  image: registry.cloudtrain.local/samples/ledger:1
+    - on: orchard/orchard-w2
+      run: systemctl disable --now kubelet
+      timeoutSec: 120
+  checks:
+    - id: node-ready
+      description: orchard-w2 reports Ready
+      type: k8s-query
+      query:
+        cluster: "{{ctx}}"
+        resource: node
+        name: orchard-w2
+        jsonpath: '{.status.conditions[?(@.type=="Ready")].status}'
+      expect: { match: exact, value: "True" }
+      skills: [k8s.troubleshoot.node]
+      weight: 2
+    - id: kubelet-enabled
+      description: kubelet is enabled so the fix survives a reboot
+      type: service-state
+      on: orchard/orchard-w2
+      command: systemctl is-enabled kubelet
+      expect: { match: exact, value: enabled }
+      skills: [linux.systemd.units]
+    - id: workload-ready
+      description: ledger has all replicas ready
+      type: k8s-query
+      query:
+        cluster: "{{ctx}}"
+        resource: deployment
+        namespace: "{{ns}}"
+        name: ledger
+        jsonpath: "{.status.readyReplicas}"
+      expect: { match: exact, value: "{{replicas}}" }
+      skills: [k8s.workloads.deployments]
+    - id: context-selected
+      description: The learner's current context is the troubled cluster
+      type: k8s-context
+      on: workstation
+      expect: { match: exact, value: "{{ctx}}" }
+      skills: [k8s.kubectl.contexts]
+      weight: 0.5
+  hints:
+    - title: Start from the node
+      body: Look at the node conditions, then SSH to the worker and inspect the kubelet unit.
+      command: kubectl describe node orchard-w2
+      cost: 2
+  misconceptions:
+    - id: start-not-enable
+      description: Starts kubelet but leaves it disabled
+      mutation:
+        on: orchard/orchard-w2
+        run: systemctl start kubelet
+      feedback: The node recovers now but will be NotReady again after the next reboot.
+  solution:
+    explanation: kubelet was stopped and disabled on the worker; enable and start it.
+    steps:
+      - on: orchard/orchard-w2
+        run: systemctl enable --now kubelet
