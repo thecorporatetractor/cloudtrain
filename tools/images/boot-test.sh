@@ -35,7 +35,7 @@ clean_ns() {
   local ns=$1
   log "deleting $ns"
   k delete ns "$ns" --wait=true --timeout=300s >/dev/null 2>&1 || true
-  k delete subnet "$ns" --ignore-not-found >/dev/null
+  k delete subnet "$ns-lab" --ignore-not-found >/dev/null
   k delete vpc "$ns" --ignore-not-found >/dev/null
 }
 if [[ ${1:-} == --clean ]]; then
@@ -97,10 +97,10 @@ spec: {}
 ---
 apiVersion: kubeovn.io/v1
 kind: Subnet
-metadata: { name: $ns, labels: { $LABEL: $variant } }
+metadata: { name: $ns-lab, labels: { $LABEL: $variant } }
 spec: { vpc: $ns, protocol: IPv4, cidrBlock: 192.168.100.0/24, gateway: 192.168.100.1 }
 EOF
-  wait_for "subnet $ns ready" 60 bash -c "[[ \$(kubectl --context $KUBECONTEXT get subnet $ns -o jsonpath='{.status.conditions[?(@.type==\"Ready\")].status}') == True ]]"
+  wait_for "subnet $ns-lab ready" 60 bash -c "[[ \$(kubectl --context $KUBECONTEXT get subnet $ns-lab -o jsonpath='{.status.conditions[?(@.type==\"Ready\")].status}') == True ]]"
   cat <<EOF | k apply -f - >/dev/null
 apiVersion: kubevirt.io/v1
 kind: VirtualMachine
@@ -109,7 +109,7 @@ spec:
   runStrategy: Always
   template:
     metadata:
-      annotations: { ovn.kubernetes.io/logical_switch: $ns, ovn.kubernetes.io/ip_address: $VM_IP }
+      annotations: { ovn.kubernetes.io/logical_switch: $ns-lab, ovn.kubernetes.io/ip_address: $VM_IP }
     spec:
       domain:
         cpu: { cores: 2 }
@@ -131,7 +131,7 @@ kind: Pod
 metadata:
   name: tester
   namespace: $ns
-  annotations: { ovn.kubernetes.io/logical_switch: $ns, ovn.kubernetes.io/ip_address: $TESTER_IP }
+  annotations: { ovn.kubernetes.io/logical_switch: $ns-lab, ovn.kubernetes.io/ip_address: $TESTER_IP }
 spec:
   automountServiceAccountToken: false
   securityContext: { runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000 }
