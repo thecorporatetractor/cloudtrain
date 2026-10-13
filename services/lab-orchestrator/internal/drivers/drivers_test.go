@@ -244,7 +244,7 @@ func TestContainerExec(t *testing.T) {
 		wantErr  error
 	}{
 		{name: "admin shell", req: ExecRequest{Command: []string{"sh", "-c", "id"}, Stdin: []byte("in")}, wantCmd: pfx + "sh -c id"},
-		{name: "as learner", req: ExecRequest{User: labsv1.ActionAsLearner, Command: []string{"whoami"}}, wantCmd: pfx + "runuser -u learner -- whoami"},
+		{name: "as learner", req: ExecRequest{User: labsv1.ActionAsLearner, Command: []string{"whoami"}}, wantCmd: pfx + "runuser -u learner -- " + strings.Join(learnerEnv, " ") + " whoami"},
 		{name: "non-zero exit", req: ExecRequest{Command: []string{"false"}}, execErr: utilexec.CodeExitError{Err: errors.New("x"), Code: 3}, wantCmd: pfx + "false", wantExit: 3},
 		{name: "apply unsupported", req: ExecRequest{Kind: ExecKubeApply, Command: []string{"x"}}, wantErr: ErrUnsupported},
 		{name: "no executor", req: ExecRequest{Command: []string{"x"}}, noExec: true, wantErr: ErrNotImplemented},
