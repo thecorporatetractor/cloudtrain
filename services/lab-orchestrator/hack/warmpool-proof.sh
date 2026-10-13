@@ -88,7 +88,7 @@ spec:
   learner: {id: learner-$1}
   seed: 7
   ttl: 2h
-$2
+${2:-}
 EOF
 }
 
@@ -198,7 +198,7 @@ fi
 if [[ $PART == kubeadm ]]; then
   hdr "1. cold start k1 (6 kubeadm VMs on persistent DataVolume disks)"
   t=$(now)
-  session_yaml k1 | K apply -f - >/dev/null
+  session_yaml k1 "" | K apply -f - >/dev/null
   wait_for 1200 "k1 Ready" phase_is k1 Ready && ok "k1 Ready after $(since "$t")s"
   K -n "$NS" get vm,vmi,dv,pvc
   for p in $(K -n "$NS" get pvc -o name | grep -- '-root$'); do
