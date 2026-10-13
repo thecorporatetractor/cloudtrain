@@ -22,13 +22,14 @@ import (
 	labsv1 "github.com/cloudtrain/cloudtrain/services/lab-orchestrator/api/v1alpha1"
 	"github.com/cloudtrain/cloudtrain/services/lab-orchestrator/internal/controller"
 	"github.com/cloudtrain/cloudtrain/services/lab-orchestrator/internal/drivers"
+	"github.com/cloudtrain/cloudtrain/services/lab-orchestrator/internal/network"
 )
 
 func main() {
 	var (
 		metricsAddr, probeAddr, registry, runtimeClass, watchNamespace      string
 		catalogPaths, adminImageRef, helmBin, vclusterChart, vclusterValues string
-		sessionSelector, leaderElectionID                                   string
+		sessionSelector, leaderElectionID, netToolsImage                    string
 		leaderElect, metricsSecure                                          bool
 		concurrency                                                         int
 		provisionTimeout                                                    time.Duration
@@ -41,6 +42,7 @@ func main() {
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "health probe address")
 	flag.BoolVar(&leaderElect, "leader-elect", false, "enable leader election")
 	flag.StringVar(&registry, "image-registry", "", "registry prefix for catalog images (e.g. registry.cloudtrain.local/images)")
+	flag.StringVar(&netToolsImage, "net-tools-image", "nettools:1", "catalog image for link init/sidecar containers (iproute2, tc, tcpdump)")
 	flag.StringVar(&runtimeClass, "runtime-class", "", "RuntimeClass for container nodes (e.g. kata); empty = cluster default")
 	flag.StringVar(&catalogPaths, "image-catalog", "/etc/cloudtrain/catalog", "image catalog files or directories, comma separated; later ones override earlier ones")
 	flag.StringVar(&adminImageRef, "admin-image-ref", "jumphost:1", "catalog ref of the entry node's admin sidecar image")
@@ -120,6 +122,16 @@ func main() {
 		os.Exit(1)
 	}
 	reg := rt.Registry
+	// Lab network (Kube-OVN VPC + Multus link segments) for container and netdev nodes.
+	toolsImage := netToolsImage
+	if img, err := catalog.Resolve(netToolsImage, drivers.ImageKindContainer); err == nil {
+		toolsImage = img.Image
+	}
+	rt.Container.Network = &drivers.LinkNetwork{
+		Manager:    &network.Manager{Client: mgr.GetClient()},
+		ToolsImage: rt.Container.ImageFor(toolsImage),
+	}
+	reg.Replace(drivers.NewNetdev(rt.Container))
 
 	if err := (&controller.LabSessionReconciler{
 		Client: mgr.GetClient(), Scheme: scheme, Drivers: reg,
