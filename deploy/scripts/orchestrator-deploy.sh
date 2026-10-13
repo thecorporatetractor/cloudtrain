@@ -6,8 +6,9 @@
 # The image catalog ConfigMap is built from deploy/images/catalog.yaml plus an
 # optional local overlay (CATALOG_OVERLAY=<file>, merged over it; use it to
 # alias refs during development without editing the shared catalog).
-# LOAD_LAB_IMAGES=1 (default) also loads every catalog image that exists in
-# the local Docker into the kind nodes (containerDisks only where KVM is).
+# LOAD_LAB_IMAGES=1 (default) also loads every catalog image and workload image
+# that exists in the local Docker into the kind nodes (containerDisks only where
+# KVM is).
 source "$(dirname "$0")/lib.sh"
 for t in kubectl docker kind jq yq; do need "$t"; done
 cluster_exists || die "kind cluster $CLUSTER_NAME not found (run: task dev:up)"
@@ -49,6 +50,11 @@ if [[ ${LOAD_LAB_IMAGES:-1} == 1 ]]; then
     docker image inspect "$image" >/dev/null 2>&1 || { warn "catalog image $image not in local Docker; skipping"; continue; }
     if [[ $kind == containerDisk ]]; then load_image "$image" "${VM_NODES[@]}"; else load_image "$image" "${ALL_NODES[@]}"; fi
   done < <(jq -r '.images[] | [.kind, .image] | @tsv' <<<"$merged" | sort -u)
+  # Pods of virtual clusters run on the kind nodes: preload the workload images there.
+  while read -r image; do
+    docker image inspect "$image" >/dev/null 2>&1 || { warn "workload image $image not in local Docker; kind will pull it"; continue; }
+    load_image "$image" "${ALL_NODES[@]}"
+  done < <(jq -r '.workloadImages[]? // empty' <<<"$merged" | sort -u)
 fi
 
 # ORCH_NAMESPACE deploys a separate instance (its own namespace, ClusterRoleBinding
