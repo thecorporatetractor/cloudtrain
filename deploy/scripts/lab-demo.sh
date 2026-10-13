@@ -37,7 +37,7 @@ fi
 
 NS="ctlab-demo-$(date +%H%M%S)"
 NODE_IMAGE="${GOLDEN_IMAGE_REPO}:${LAB_K8S_VERSION}"
-JUMP_IMAGE="cloudtrain/jumphost:${LAB_K8S_VERSION}"
+JUMP_IMAGE="$JUMPHOST_IMAGE"   # catalog ref jumphost:1
 CP_IP=192.168.100.10
 WK_IP=192.168.100.11
 JH_IP=192.168.99.5
