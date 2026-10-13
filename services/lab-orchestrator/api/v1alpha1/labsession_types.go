@@ -185,6 +185,38 @@ type LabSessionStatus struct {
 	// Validation is the latest grading result.
 	// +optional
 	Validation *ValidationStatus `json:"validation,omitempty"`
+	// Links are the provisioned topology links (L2 segments), for the grader
+	// and the UI.
+	// +optional
+	Links []LinkStatus `json:"links,omitempty"`
+}
+
+// LinkStatus describes one provisioned topology link.
+type LinkStatus struct {
+	// ID is "link-<index>" (index into topology.links).
+	ID string `json:"id"`
+	// Segment is the Kube-OVN logical switch (Subnet) carrying the link.
+	Segment string `json:"segment"`
+	// Network is the Multus NetworkAttachmentDefinition ("namespace/name").
+	Network string `json:"network"`
+	// Subnet is the lab subnet declared on the link, if any.
+	// +optional
+	Subnet string `json:"subnet,omitempty"`
+	// +optional
+	Impair *LinkImpairment `json:"impair,omitempty"`
+	Ends   []LinkEndStatus `json:"ends"`
+}
+
+// LinkEndStatus is one end of a link.
+type LinkEndStatus struct {
+	Node      string `json:"node"`
+	Interface string `json:"interface"`
+	// AddressMode is "platform" (Address assigned by the platform), "lab"
+	// (configured by the lab: device config or setup) or "none" (no subnet).
+	AddressMode string `json:"addressMode"`
+	// Address in CIDR notation when AddressMode is "platform".
+	// +optional
+	Address string `json:"address,omitempty"`
 }
 
 // ValidationPhase is the state of one grading run.
