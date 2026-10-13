@@ -57,16 +57,20 @@ tasks:
     cmds: [go build -o services/lab-orchestrator/bin/labctl ./services/lab-orchestrator/cmd/labctl]
 
   dev:orchestrator:
-    desc: Install the lab CRDs and run the lab-orchestrator manager locally against CT_KUBE_CONTEXT (default kind-cloudtrain-dev)
+    desc: Run the lab-orchestrator manager locally, scoped to CT_NAMESPACE (default cloudtrain-sessions) on CT_KUBE_CONTEXT
     vars:
       CTX: '{{.CT_KUBE_CONTEXT | default "kind-cloudtrain-dev"}}'
+      NS: '{{.CT_NAMESPACE | default "cloudtrain-sessions"}}'
       KCFG: '{{.ROOT_DIR}}/.cache/kubeconfig-{{.CTX}}'
     cmds:
       - mkdir -p .cache
       # A one-context kubeconfig: controller-runtime uses the current context, and this keeps the user's file untouched.
       - kubectl config view --minify --flatten --context {{.CTX}} > {{.KCFG}}
-      - kubectl --context {{.CTX}} apply -f services/lab-orchestrator/config/crd
-      - KUBECONFIG={{.KCFG}} go run ./services/lab-orchestrator/cmd/manager --health-probe-bind-address=127.0.0.1:8081
+      # Install the CRDs only when absent: other streams' managers may share them.
+      - for f in services/lab-orchestrator/config/crd/*.yaml; do kubectl --context {{.CTX}} get -f "$f" >/dev/null 2>&1 || kubectl --context {{.CTX}} apply -f "$f"; done
+      - kubectl --context {{.CTX}} get namespace {{.NS}} >/dev/null 2>&1 || kubectl --context {{.CTX}} create namespace {{.NS}}
+      # Always namespace-scoped: an unscoped manager would reconcile (and fail) other sessions in the cluster.
+      - KUBECONFIG={{.KCFG}} go run ./services/lab-orchestrator/cmd/manager --watch-namespace={{.NS}} --health-probe-bind-address=127.0.0.1:8081
 
   dev:gateway:
     desc: Run services/gateway (BFF for apps/web) against CT_KUBE_CONTEXT, sessions in CT_NAMESPACE (default cloudtrain-sessions)
