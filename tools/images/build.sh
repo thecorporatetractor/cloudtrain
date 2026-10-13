@@ -136,6 +136,7 @@ if [[ $GUEST == kubeadm ]]; then
   mapfile -t CALICO_IMAGES < <(grep -oE 'image: *[^ ]+' "$CALICO_YAML" | awk '{print $2}' | tr -d '"' | sort -u)
   printf '%s\n' "${CALICO_IMAGES[@]}" | grep -q '/calico/node:' || die "no calico/node image in $CALICO_YAML"
   lock_check "$LOCKDIR/calico.lock" "${CALICO_IMAGES[@]}"
+  cp "$HERE/kubeadm-node/cni-install" "$WORK/in/cni-install"
   kubeadm_images "$K8S_VERSION"
   lock_check "$LOCKDIR/kubernetes-$K8S_VERSION.lock" "${KIMAGES[@]}"
   PAUSE_IMAGE=$(printf '%s\n' "${KIMAGES[@]}" | grep '/pause:')

@@ -13,7 +13,6 @@ source /opt/cloudtrain/build/guest-common.sh
 
 grow_root
 base_setup conntrack socat ethtool ipset ebtables apt-utils
-create_learner
 
 install -m 0755 -d /etc/apt/keyrings
 fetch_key https://download.docker.com/linux/ubuntu/gpg "$DOCKER_APT_KEY_FPR" /etc/apt/keyrings/docker.gpg
@@ -131,9 +130,14 @@ systemctl enable containerd kubelet || true
 # --- pre-load images into containerd (k8s.io namespace) ---
 install -d /opt/cloudtrain/images /opt/cloudtrain/manifests
 cp /opt/cloudtrain/build/images.txt /opt/cloudtrain/images/images.txt
-# The lab CNI manifest (Calico, pool = kubeadm podSubnet); cni.yaml is the stable name.
+# Lab CNI: Calico manifest (pool = LAB_POD_CIDR) + its sha256, and the runtime's entry
+# point `/opt/cloudtrain/bin/cni-install <podCIDR>`, which re-checks the sha256 and
+# applies the manifest with the pool set to <podCIDR>.
 cp /opt/cloudtrain/build/calico.yaml /opt/cloudtrain/manifests/calico.yaml
-ln -sf calico.yaml /opt/cloudtrain/manifests/cni.yaml
+(cd /opt/cloudtrain/manifests && sha256sum calico.yaml > calico.yaml.sha256)
+echo "${CALICO_VERSION}" > /opt/cloudtrain/manifests/calico.version
+install -d /opt/cloudtrain/bin
+install -m 0755 /opt/cloudtrain/build/cni-install /opt/cloudtrain/bin/cni-install
 containerd >/tmp/containerd.log 2>&1 &
 CPID=$!
 for i in $(seq 1 30); do ctr version >/dev/null 2>&1 && break; sleep 1; done

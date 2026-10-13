@@ -56,18 +56,6 @@ base_setup() {
   systemctl enable qemu-guest-agent || true
 }
 
-# The learner account every lab VM uses (the runtime's model): non-root, password
-# locked, passwordless sudo. SSH keys arrive with cloud-init at boot (a cloud-init
-# `users:` entry for learner adds its keys to this existing account).
-create_learner() {
-  id learner >/dev/null 2>&1 || useradd -m -s /bin/bash -c "CloudTrain learner" -G sudo learner
-  passwd -l learner
-  install -d -m 0700 -o learner -g learner /home/learner/.ssh
-  echo 'learner ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/90-cloudtrain-learner
-  chmod 0440 /etc/sudoers.d/90-cloudtrain-learner
-  visudo -cf /etc/sudoers.d/90-cloudtrain-learner
-}
-
 # restore_ubuntu_sources: put the image's original Ubuntu sources back (also when a
 # later step renamed the file to *.disabled).
 restore_ubuntu_sources() {

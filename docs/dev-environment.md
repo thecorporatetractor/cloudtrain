@@ -255,11 +255,18 @@ the TLS flags. The etcd-snapshot-restore lab replaces the unit and PKI with its 
 (`provision-etcd.sh` tears them down first); `task image:test` runs that lab's provision
 script and solution on the image.
 
-All VM images share the same conventions: user `learner` is baked in (password locked,
-passwordless sudo via `/etc/sudoers.d/90-cloudtrain-learner`) and its SSH keys come from
-cloud-init at boot (a cloud-init `users:` entry for `learner` adds keys to the existing
-account), apt timers and snapd are gone, and `/etc/cloudtrain-release` records versions
-and the catalog ref.
+All VM images share the same conventions: Ubuntu cloud image with cloud-init and sshd,
+**no users or keys baked in** (the runtime injects `learner` with passwordless sudo,
+root's authorized_keys and the ssh host key through cloud-init), apt timers and snapd
+are gone, and `/etc/cloudtrain-release` records versions and the catalog ref.
+
+**CNI contract (kubeadm images).** The runtime calls `/opt/cloudtrain/bin/cni-install
+<podCIDR>` on the control plane after `kubeadm init` (with `10.244.0.0/16`). It checks
+`/opt/cloudtrain/manifests/calico.yaml` against the sha256 recorded at build time
+(`calico.yaml.sha256`), sets Calico's default IPv4 pool to `<podCIDR>` (Calico's own
+default, 192.168.0.0/16, overlaps the lab VPCs 192.168.99.0/24 and 192.168.100.0/24)
+and applies it with `/etc/kubernetes/admin.conf`; `--wait` also waits for the rollout.
+All Calico images are preloaded. `lab:demo` and `image:test` use the same script.
 
 ### Build pipeline
 

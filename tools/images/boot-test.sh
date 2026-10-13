@@ -188,7 +188,7 @@ resolvConf: /etc/cloudtrain/resolv.conf
 EOF
 kubeadm init --config /root/kubeadm.yaml > /var/log/kubeadm.log 2>&1 || { tail -30 /var/log/kubeadm.log; exit 1; }
 export KUBECONFIG=/etc/kubernetes/admin.conf
-kubectl apply -f /opt/cloudtrain/manifests/calico.yaml >/dev/null
+/opt/cloudtrain/bin/cni-install 10.244.0.0/16
 for i in \$(seq 120); do kubectl get node vm --no-headers 2>/dev/null | grep -qw Ready && break; sleep 2; done
 kubectl -n kube-system rollout status ds/calico-node --timeout=240s
 kubectl get nodes -o wide
@@ -310,7 +310,7 @@ set -e
 for i in $(seq 30); do systemctl is-active -q etcd && break; sleep 2; done
 systemctl is-active etcd
 etcd --version | head -1; etcdctl version | head -1; etcdutl version | head -1; openssl version
-id learner; test -f /etc/sudoers.d/90-cloudtrain-learner; echo "ok: learner baked in with sudo rule"
+id learner; sudo -n -u learner sudo -n true && echo "ok: learner from cloud-init has passwordless sudo"
 ls -l /etc/qm-etcd/pki
 P=/etc/qm-etcd/pki
 etcdctl --endpoints=https://127.0.0.1:2379 --cacert=$P/ca.crt --cert=$P/admin.crt --key=$P/admin.key endpoint health

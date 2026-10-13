@@ -3,12 +3,12 @@
 # Ubuntu 24.04 + etcd/etcdctl/etcdutl (ETCD_VERSION, sha256-pinned release tarball)
 # in /usr/local/bin, a system user `etcd`, and etcd.service running a single TLS
 # member on 127.0.0.1:2379 with per-VM certificates under /etc/qm-etcd/pki.
-# User `learner` (passwordless sudo) is baked in; its ssh keys come from cloud-init.
+# No users or keys are baked in: the runtime injects `learner` (passwordless sudo),
+# root's authorized_keys and the ssh host key through cloud-init.
 source /opt/cloudtrain/build/guest-common.sh
 
 grow_root
 base_setup
-create_learner
 
 tmp=$(mktemp -d)
 tar -xzf /opt/cloudtrain/build/etcd.tar.gz -C "$tmp" --strip-components=1
