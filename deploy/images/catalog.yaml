@@ -9,28 +9,42 @@
 # Lab VMs have no internet access, so every image a lab pulls inside a VM must be
 # listed in workloadImages and is preloaded into each kubeadm node image. The same
 # list is loaded into the host (kind) nodes for `mode: virtual` clusters.
+#
+# Exact versions and digests live in deploy/versions.env and tools/images/lock/*.lock;
+# tools/images/build.sh refuses to build an image whose entry here disagrees with them.
+# Optional informational fields (consumers may ignore them): kubernetesVersion,
+# stagedUpgrades, etcdVersion, kubectlVersion.
 apiVersion: cloudtrain.dev/v1
 kind: ImageCatalog
 images:
+  # Learner workstation: kubectl (LAB_K8S_VERSION, works against N-1), helm, etcdctl,
+  # ssh, jq/yq, vim/nano; non-root user `learner` (uid 1000), `k` alias with completion.
   jumphost:1:
     kind: container
     image: cloudtrain/jumphost:1
+    kubectlVersion: v1.37.1
   kubeadm:1.37:
     kind: containerDisk
     image: cloudtrain/kubeadm-node:v1.37.1
     kubernetesVersion: v1.37.1
   # Upgrade labs start one minor behind and have the target release staged
-  # offline in a local apt repo inside the image.
+  # offline: kubeadm/kubelet/kubectl debs in a local signed apt repo (the only apt
+  # source, file:/opt/cloudtrain/apt) and its control-plane images in containerd.
+  # kubeadm/kubelet/kubectl are held at kubernetesVersion.
   kubeadm:1.36:
     kind: containerDisk
     image: cloudtrain/kubeadm-node:v1.36-upgrade
-    kubernetesVersion: v1.36.x   # exact patch pinned by tools/images
+    kubernetesVersion: v1.36.5
     stagedUpgrades: [v1.37.1]
+  # etcd/etcdctl/etcdutl in /usr/local/bin, etcd.service with mutual TLS on
+  # 127.0.0.1:2379 (per-VM PKI in /etc/qm-etcd/pki), system user `etcd`.
   etcd-host:3.6:
     kind: containerDisk
     image: cloudtrain/etcd-host:3.6
+    etcdVersion: v3.6.15
 workloadImages:
   - busybox:1.37
   - httpd:2.4-alpine
   - redis:7.4-alpine
   - caddy:2-alpine
+  - httpd:2.4   # named-port-nodeport misconception (JSON merge patch drifts the image)

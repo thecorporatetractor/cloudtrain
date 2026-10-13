@@ -34,8 +34,48 @@ tasks:
     cmds: [bash deploy/scripts/verify-kvm.sh]
 
   image:build:
-    desc: Build the golden kubeadm node image (Ubuntu 24.04 + containerd + kubeadm) as a KubeVirt containerDisk
-    cmds: [bash tools/images/build.sh]
+    desc: Build the golden kubeadm node image (alias of image:build:kubeadm-node)
+    cmds: [task: 'image:build:kubeadm-node']
+
+  image:build:kubeadm-node:
+    desc: 'containerDisk cloudtrain/kubeadm-node:<LAB_K8S_VERSION> (catalog kubeadm:1.37): kubeadm node + preloaded images'
+    cmds: [bash tools/images/build.sh kubeadm-node]
+
+  image:build:kubeadm-upgrade:
+    desc: 'containerDisk cloudtrain/kubeadm-node:<UPGRADE_IMAGE_TAG> (catalog kubeadm:1.36): N-1 node, LAB_K8S_VERSION staged offline'
+    cmds: [bash tools/images/build.sh kubeadm-upgrade]
+
+  image:build:etcd-host:
+    desc: 'containerDisk <ETCD_HOST_IMAGE> (catalog etcd-host:3.6): etcd as a TLS systemd service + etcdctl/etcdutl'
+    cmds: [bash tools/images/build.sh etcd-host]
+
+  image:build:jumphost:
+    desc: 'Learner workstation image <JUMPHOST_IMAGE> (catalog jumphost:1)'
+    cmds: [bash tools/images/build-jumphost.sh]
+
+  image:build:all:
+    desc: Build every lab image, one at a time (VM builds are memory heavy)
+    cmds:
+      - task: 'image:build:jumphost'
+      - task: 'image:build:kubeadm-node'
+      - task: 'image:build:kubeadm-upgrade'
+      - task: 'image:build:etcd-host'
+
+  image:lock:
+    desc: Re-resolve image digests into tools/images/lock/*.lock (after a version or catalog workloadImages change)
+    cmds: [UPDATE_LOCK=1 LOCK_ONLY=1 bash tools/images/build.sh kubeadm-upgrade]
+
+  image:load:
+    desc: 'Load built images into kind (all, or IMAGES="kubeadm-node jumphost workloads")'
+    cmds: ['bash tools/images/load.sh {{.IMAGES}}']
+
+  image:load:workloads:
+    desc: Pull the locked lab workload images (by digest) into every kind node, for virtual labs
+    cmds: [bash tools/images/load.sh workloads]
+
+  image:test:
+    desc: 'Boot-test VM images on the dev cluster (all, or IMAGES="etcd-host")'
+    cmds: ['bash tools/images/boot-test.sh {{.IMAGES}}']
 
   lab:demo:
     desc: 'End-to-end lab proof: 2 kubeadm VMs + jumphost + vcluster in a fresh namespace (KEEP=1 to keep it)'

@@ -1,24 +1,29 @@
 #!/usr/bin/env bash
-# Runs INSIDE cloudtrain/image-builder (libguestfs). Inputs via env + /src, /work.
+# Runs INSIDE cloudtrain/image-builder (libguestfs). Inputs via env:
+#   BASE          pinned Ubuntu cloud image (read only)
+#   VARIANT_DIR   per-variant work dir: in/ (build inputs) and out/disk.qcow2 (result)
+#   GUEST_SCRIPT  scripts/<name> run inside the guest
+#   DISK_SIZE     virtual disk size of the result
 set -euo pipefail
-mkdir -p "$TMPDIR" /work/out
-WORK=/work/tmp/node.qcow2
+mkdir -p "$TMPDIR" "$VARIANT_DIR/out"
+DISK="$TMPDIR/node.qcow2"
 
-cp --sparse=always "$BASE" "$WORK"
+cp --sparse=always "$BASE" "$DISK"
 # Grow the virtual disk so packages + pre-loaded images fit; the root partition
 # is grown inside the guest (growpart) during customization. cloud-init's
 # growpart grows it again to whatever size the VM disk has at boot.
-qemu-img resize -q "$WORK" 10G
+qemu-img resize -q "$DISK" "$DISK_SIZE"
 
-virt-customize -a "$WORK" --memsize 2048 --smp 4 --network \
-  --mkdir /opt/cloudtrain/images --mkdir /opt/cloudtrain/manifests \
-  --upload /work/build.env:/opt/cloudtrain/build.env \
-  --upload /work/images.txt:/opt/cloudtrain/images/images.txt \
-  --upload "$FLANNEL_YAML":/opt/cloudtrain/manifests/kube-flannel.yml \
-  --upload /src/scripts/guest-setup.sh:/opt/cloudtrain/guest-setup.sh \
-  --run-command "bash /opt/cloudtrain/guest-setup.sh"
+# Build inputs land in /opt/cloudtrain/build; the guest script moves what it keeps.
+virt-customize -a "$DISK" --memsize 2048 --smp 4 --network \
+  --mkdir /opt/cloudtrain \
+  --copy-in "$VARIANT_DIR/in:/opt/cloudtrain" \
+  --run-command "mv /opt/cloudtrain/in /opt/cloudtrain/build" \
+  --upload /src/scripts/guest-common.sh:/opt/cloudtrain/build/guest-common.sh \
+  --upload "/src/scripts/$GUEST_SCRIPT:/opt/cloudtrain/build/$GUEST_SCRIPT" \
+  --run-command "bash /opt/cloudtrain/build/$GUEST_SCRIPT"
 
 echo "sparsifying + compressing"
-virt-sparsify --quiet --compress "$WORK" /work/out/disk.qcow2
-rm -f "$WORK"
-qemu-img info /work/out/disk.qcow2 | grep -E 'virtual size|disk size'
+virt-sparsify --quiet --compress "$DISK" "$VARIANT_DIR/out/disk.qcow2"
+rm -f "$DISK"
+qemu-img info "$VARIANT_DIR/out/disk.qcow2" | grep -E 'virtual size|disk size'
