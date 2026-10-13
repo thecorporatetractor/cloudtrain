@@ -26,6 +26,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -38,6 +39,7 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	ctrllog "sigs.k8s.io/controller-runtime/pkg/log"
 
 	labsv1 "github.com/cloudtrain/cloudtrain/services/lab-orchestrator/api/v1alpha1"
 	"github.com/cloudtrain/cloudtrain/services/lab-orchestrator/internal/compile"
@@ -242,6 +244,9 @@ func restConfig(kubeconfig, context string) (*rest.Config, error) {
 		return nil, err
 	}
 	cfg.QPS, cfg.Burst = 50, 100
+	// Deprecation warnings (e.g. KubeVirt presets during discovery) are noise here.
+	cfg.WarningHandler = rest.NoWarnings{}
+	ctrllog.SetLogger(logr.Discard())
 	return cfg, nil
 }
 
