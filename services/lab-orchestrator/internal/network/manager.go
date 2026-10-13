@@ -192,8 +192,11 @@ func (m *Manager) Delete(ctx context.Context, s Session) (bool, error) {
 			client.MatchingLabels{LabelSessionUID: string(s.UID), LabelManagedBy: ManagedBy}); err != nil {
 			return false, err
 		}
-		if len(pods.Items) > 0 {
-			return false, nil
+		mgmt := ClusterName(s, "mgmt")
+		for _, p := range pods.Items {
+			if p.Annotations[AnnotationLogicalSwitch] == mgmt {
+				return false, nil // a wired pod is still terminating
+			}
 		}
 	}
 	done := true

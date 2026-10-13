@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -49,7 +50,7 @@ func newNetdev(t *testing.T) (*NetdevDriver, client.Client, *recordingExecutor) 
 	c := fake.NewClientBuilder().WithScheme(s).Build()
 	rec := &recordingExecutor{}
 	base := &ContainerDriver{Client: c, Scheme: s, ImageRegistry: "cloudtrain", Executor: rec}
-	base.Network = &LinkNetwork{Manager: &network.Manager{Client: c}, ToolsImage: base.ImageFor("nettools:1")}
+	base.Network = &LinkNetwork{Manager: &network.Manager{Client: c}, ToolsImage: base.ImageFor("nettools:1"), DestroyWait: time.Millisecond}
 	return NewNetdev(base), c, rec
 }
 

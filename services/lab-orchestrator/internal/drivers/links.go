@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 
@@ -35,6 +36,9 @@ type LinkNetwork struct {
 	Manager *network.Manager
 	// ToolsImage is the pullable nettools image for net-init and the link sidecar.
 	ToolsImage string
+	// DestroyWait bounds how long DestroyTopology waits for the network to
+	// be gone before returning a retryable error (default 45s).
+	DestroyWait time.Duration
 }
 
 var _ PodNetwork = (*LinkNetwork)(nil)
@@ -78,14 +82,35 @@ var errNetworkTerminating = errors.New("session network still terminating")
 // label, so it needs no topology). It errors until they are all gone, which
 // keeps the session finalizer in place.
 func (n *LinkNetwork) DestroyTopology(ctx context.Context, ref SessionRef) error {
-	done, err := n.Manager.Delete(ctx, network.SessionOf(ref.Session))
-	if err != nil {
-		return err
+	// Wired pods take a few seconds to terminate (5s grace). Wait here
+	// rather than return an error at once: every error grows the
+	// controller's exponential backoff, which would delay the final
+	// cleanup by minutes.
+	deadline := time.Now().Add(n.destroyWait())
+	for {
+		done, err := n.Manager.Delete(ctx, network.SessionOf(ref.Session))
+		if err != nil {
+			return err
+		}
+		if done {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return errNetworkTerminating
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Second):
+		}
 	}
-	if !done {
-		return errNetworkTerminating
+}
+
+func (n *LinkNetwork) destroyWait() time.Duration {
+	if n.DestroyWait > 0 {
+		return n.DestroyWait
 	}
-	return nil
+	return 45 * time.Second
 }
 
 // Links reports the link facts of the session.
