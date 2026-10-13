@@ -4,6 +4,7 @@ package main
 import (
 	"flag"
 	"os"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -25,10 +26,12 @@ import (
 
 func main() {
 	var (
-		metricsAddr, probeAddr, registry, runtimeClass, watchNamespace string
-		leaderElect, metricsSecure                                     bool
-		concurrency                                                    int
-		provisionTimeout                                               time.Duration
+		metricsAddr, probeAddr, registry, runtimeClass, watchNamespace      string
+		catalogPaths, adminImageRef, helmBin, vclusterChart, vclusterValues string
+		sessionSelector, leaderElectionID                                   string
+		leaderElect, metricsSecure                                          bool
+		concurrency                                                         int
+		provisionTimeout                                                    time.Duration
 	)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "metrics endpoint address (e.g. :8443); \"0\" disables metrics")
 	flag.BoolVar(&metricsSecure, "metrics-secure", true, "serve metrics over HTTPS with Kubernetes authn/authz")
@@ -39,6 +42,13 @@ func main() {
 	flag.BoolVar(&leaderElect, "leader-elect", false, "enable leader election")
 	flag.StringVar(&registry, "image-registry", "", "registry prefix for catalog images (e.g. registry.cloudtrain.local/images)")
 	flag.StringVar(&runtimeClass, "runtime-class", "", "RuntimeClass for container nodes (e.g. kata); empty = cluster default")
+	flag.StringVar(&catalogPaths, "image-catalog", "/etc/cloudtrain/catalog", "image catalog files or directories, comma separated; later ones override earlier ones")
+	flag.StringVar(&adminImageRef, "admin-image-ref", "jumphost:1", "catalog ref of the entry node's admin sidecar image")
+	flag.StringVar(&helmBin, "helm", "helm", "helm binary used to install virtual clusters")
+	flag.StringVar(&vclusterChart, "vcluster-chart", "/opt/cloudtrain/charts/vcluster.tgz", "vcluster Helm chart (.tgz or reference)")
+	flag.StringVar(&vclusterValues, "vcluster-values", "/opt/cloudtrain/charts/vcluster-values.yaml", "base values for virtual clusters (deploy/vcluster/values.yaml); empty = none")
+	flag.StringVar(&sessionSelector, "session-selector", "", "only reconcile LabSessions matching this label selector (e.g. labs.cloudtrain.dev/verify=true); empty = all")
+	flag.StringVar(&leaderElectionID, "leader-election-id", "lab-orchestrator.labs.cloudtrain.dev", "leader election lease name")
 	opts := zap.Options{}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
@@ -60,6 +70,14 @@ func main() {
 		&corev1.Pod{}:     {Label: managed},
 		&corev1.Service{}: {Label: managed},
 	}}
+	if sessionSelector != "" {
+		sel, err := labels.Parse(sessionSelector)
+		if err != nil {
+			log.Error(err, "invalid --session-selector")
+			os.Exit(1)
+		}
+		cacheOpts.ByObject[&labsv1.LabSession{}] = cache.ByObject{Label: sel}
+	}
 	if watchNamespace != "" {
 		cacheOpts.DefaultNamespaces = map[string]cache.Config{watchNamespace: {}}
 	}
@@ -75,7 +93,7 @@ func main() {
 		Metrics:                metricsOpts,
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         leaderElect,
-		LeaderElectionID:       "lab-orchestrator.labs.cloudtrain.dev",
+		LeaderElectionID:       leaderElectionID,
 	})
 	if err != nil {
 		log.Error(err, "unable to create manager")
@@ -87,19 +105,27 @@ func main() {
 		log.Error(err, "unable to create pod executor")
 		os.Exit(1)
 	}
-	reg, err := drivers.NewDefaultRegistry(&drivers.ContainerDriver{
-		Client: mgr.GetClient(), Reader: mgr.GetAPIReader(), Scheme: scheme, ImageRegistry: registry,
-		RuntimeClassName: runtimeClass, Executor: executor,
-	})
+	catalog, err := drivers.LoadCatalog(strings.Split(catalogPaths, ",")...)
 	if err != nil {
-		log.Error(err, "unable to build driver registry")
+		log.Error(err, "unable to load image catalog")
 		os.Exit(1)
 	}
+	rt, err := drivers.NewRuntime(drivers.RuntimeOptions{
+		Client: mgr.GetClient(), Reader: mgr.GetAPIReader(), Scheme: scheme, Executor: executor,
+		Catalog: catalog, ImageRegistry: registry, RuntimeClassName: runtimeClass, AdminImageRef: adminImageRef,
+		Helm: drivers.ExecHelm{Binary: helmBin}, VClusterChart: vclusterChart, VClusterValues: vclusterValues,
+	})
+	if err != nil {
+		log.Error(err, "unable to build drivers")
+		os.Exit(1)
+	}
+	reg := rt.Registry
 
 	if err := (&controller.LabSessionReconciler{
 		Client: mgr.GetClient(), Scheme: scheme, Drivers: reg,
 		Recorder:         mgr.GetEventRecorderFor("lab-orchestrator"),
 		ProvisionTimeout: provisionTimeout, MaxConcurrentReconciles: concurrency,
+		Session: rt.Session,
 	}).SetupWithManager(mgr); err != nil {
 		log.Error(err, "unable to set up LabSession controller")
 		os.Exit(1)

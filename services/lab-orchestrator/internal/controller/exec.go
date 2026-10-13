@@ -1,0 +1,54 @@
+package controller
+
+import (
+	"context"
+	"fmt"
+	"strings"
+
+	labsv1 "github.com/cloudtrain/cloudtrain/services/lab-orchestrator/api/v1alpha1"
+	"github.com/cloudtrain/cloudtrain/services/lab-orchestrator/internal/drivers"
+)
+
+// NodeExecutor runs requests on the nodes of one session ("node" or
+// "node/member") through their drivers. Setup actions, checks and the
+// verifier's solution steps all go through it.
+type NodeExecutor struct {
+	Drivers  *drivers.Registry
+	Session  *labsv1.LabSession
+	Template *labsv1.LabTemplateSpec
+}
+
+// Exec implements grader.Executor.
+func (e *NodeExecutor) Exec(ctx context.Context, on string, req drivers.ExecRequest) (drivers.ExecResult, error) {
+	nodeName, member, _ := strings.Cut(on, "/")
+	node, ok := findNode(e.Template.Topology.Nodes, nodeName)
+	if !ok {
+		return drivers.ExecResult{}, fmt.Errorf("unknown node %q: %w", on, drivers.ErrUnsupported)
+	}
+	d, err := e.Drivers.Get(node.Driver)
+	if err != nil {
+		return drivers.ExecResult{}, err
+	}
+	req.Member = member
+	return d.Exec(ctx, drivers.NodeRef{Session: e.Session, Template: e.Template, Node: node}, req)
+}
+
+// RunAction executes one lab action and fails on a non-zero exit.
+func (e *NodeExecutor) RunAction(ctx context.Context, a labsv1.Action) (drivers.ExecResult, error) {
+	res, err := e.Exec(ctx, a.On, ActionRequest(a))
+	if err != nil {
+		return res, fmt.Errorf("on %s: %w", a.On, err)
+	}
+	if res.ExitCode != 0 {
+		return res, fmt.Errorf("on %s exited %d: %s: %w", a.On, res.ExitCode, lastLines(res.Stderr, 5), errActionFailed)
+	}
+	return res, nil
+}
+
+func lastLines(s string, n int) string {
+	lines := strings.Split(strings.TrimSpace(s), "\n")
+	if len(lines) > n {
+		lines = lines[len(lines)-n:]
+	}
+	return strings.Join(lines, " | ")
+}

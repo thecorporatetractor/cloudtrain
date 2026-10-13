@@ -36,6 +36,7 @@ const (
 	// Requeue intervals.
 	requeueProvisioning  = 5 * time.Second
 	requeueTemplateWait  = 30 * time.Second
+	requeueTeardown      = 3 * time.Second
 	defaultActionTimeout = 2 * time.Minute
 	// maxActionTimeout caps a single setup action (the schema leaves
 	// timeoutSec unbounded) so one session cannot pin a worker indefinitely.
@@ -88,13 +89,30 @@ type LabSessionReconciler struct {
 	// Setup actions run inside Reconcile, so this must be > 1 for one slow
 	// session not to stall every other one.
 	MaxConcurrentReconciles int
+	// Session, when set, provisions session-scoped resources (keys, lab
+	// network, entry isolation) before any node and wires the entry node
+	// once the other nodes' access material exists.
+	Session drivers.SessionProvisioner
 }
 
 // +kubebuilder:rbac:groups=labs.cloudtrain.dev,resources=labsessions,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=labs.cloudtrain.dev,resources=labsessions/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=labs.cloudtrain.dev,resources=labsessions/finalizers,verbs=update
 // +kubebuilder:rbac:groups=labs.cloudtrain.dev,resources=labtemplates,verbs=get;list;watch
-// +kubebuilder:rbac:groups="",resources=pods;services,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=pods;services,verbs=get;list;watch;create;update;patch;delete;deletecollection
+// Drivers: session Secrets, vcluster Helm releases (the chart's own objects
+// and everything vcluster syncs into the session namespace), KubeVirt VMs and
+// the Kube-OVN lab network. escalate/bind let the vcluster chart create its
+// Roles without the manager holding every permission they grant.
+// +kubebuilder:rbac:groups="",resources=secrets;configmaps;serviceaccounts;endpoints;persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete;deletecollection
+// +kubebuilder:rbac:groups=apps,resources=statefulsets;deployments;replicasets,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles;rolebindings;clusterroles;clusterrolebindings,verbs=get;list;watch;create;update;patch;delete;escalate;bind
+// +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=discovery.k8s.io,resources=endpointslices,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=kubevirt.io,resources=virtualmachines;virtualmachineinstances,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=kubeovn.io,resources=vpcs;subnets,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=k8s.cni.cncf.io,resources=network-attachment-definitions,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=pods/exec,verbs=create
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
@@ -133,6 +151,10 @@ func (r *LabSessionReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	if !s.DeletionTimestamp.IsZero() {
 		if controllerutil.ContainsFinalizer(s, Finalizer) {
 			if err := r.teardown(ctx, s); err != nil {
+				if errors.Is(err, drivers.ErrInProgress) {
+					log.V(1).Info("teardown in progress", "reason", err.Error())
+					return ctrl.Result{RequeueAfter: requeueTeardown}, nil
+				}
 				return ctrl.Result{}, err
 			}
 			controllerutil.RemoveFinalizer(s, Finalizer)
@@ -234,6 +256,7 @@ func (r *LabSessionReconciler) reconcileSession(ctx context.Context, s *labsv1.L
 	}
 	if st.Phase == labsv1.SessionFailed {
 		// Failed sessions keep their resources for inspection until expiry or deletion.
+		r.rejectGrading(s, "the lab session failed; it cannot be graded")
 		return r.requeueBeforeExpiry(s, 0), nil
 	}
 
@@ -335,11 +358,34 @@ func (r *LabSessionReconciler) reconcileSession(ctx context.Context, s *labsv1.L
 	}
 	st.Nodes = nodes
 
+	// Give the entry node access to everything that is already reachable
+	// (cluster drivers need it to observe their clusters), and hold the
+	// session back until every node's access is wired.
+	wireMsg := ""
+	if r.Session != nil {
+		done, msg, err := r.Session.WireEntry(ctx, drivers.SessionRef{Session: s, Template: tpl.spec})
+		switch {
+		case err != nil && drivers.IsPermanent(err):
+			return r.fail(s, ReasonNodeFailed, fmt.Sprintf("entry wiring: %v", err)), nil
+		case err != nil:
+			transient = errors.Join(transient, fmt.Errorf("entry wiring: %w", err))
+			allReady = false
+		case !done:
+			wireMsg = msg
+			allReady = false
+		}
+	}
+
 	if !allReady {
 		if st.Phase != labsv1.SessionGrading {
 			st.Phase = labsv1.SessionProvisioning
 		}
 		summary := notReadySummary(nodes)
+		if wireMsg != "" && strings.HasSuffix(summary, ": ") {
+			summary = wireMsg
+		} else if wireMsg != "" {
+			summary += "; " + wireMsg
+		}
 		r.setCondition(s, labsv1.ConditionNodesReady, metav1.ConditionFalse, ReasonProvisioning, summary)
 		r.setCondition(s, labsv1.ConditionReady, metav1.ConditionFalse, ReasonProvisioning, "nodes are provisioning")
 		if c := meta.FindStatusCondition(st.Conditions, labsv1.ConditionNodesReady); c != nil &&
@@ -403,6 +449,11 @@ func (r *LabSessionReconciler) reconcileSession(ctx context.Context, s *labsv1.L
 		r.event(s, "Normal", ReasonReady, "lab session is ready")
 	}
 	r.setCondition(s, labsv1.ConditionReady, metav1.ConditionTrue, ReasonReady, "lab session is ready")
+	if gradingRequested(s) {
+		if err := r.grade(ctx, s, tpl, save); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
 	return r.requeueBeforeExpiry(s, 0), nil
 }
 
@@ -448,7 +499,11 @@ func (r *LabSessionReconciler) resetNodes(ctx context.Context, s *labsv1.LabSess
 // that has session-scoped resources. done=false means the caller must return
 // (res, err) now.
 func (r *LabSessionReconciler) provisionTopology(ctx context.Context, s *labsv1.LabSession, tpl *resolvedTemplate) (ctrl.Result, bool, error) {
-	for _, tp := range r.topologyProvisioners(&tpl.spec.Topology) {
+	tps := r.topologyProvisioners(&tpl.spec.Topology)
+	if r.Session != nil {
+		tps = append([]drivers.TopologyProvisioner{r.Session}, tps...)
+	}
+	for _, tp := range tps {
 		ready, err := tp.ProvisionTopology(ctx, drivers.SessionRef{Session: s, Template: tpl.spec})
 		switch {
 		case err != nil && drivers.IsPermanent(err):
@@ -490,6 +545,10 @@ func (r *LabSessionReconciler) topologyProvisioners(topo *labsv1.Topology) []dri
 // expire destroys all node resources and only then marks the session Expired.
 func (r *LabSessionReconciler) expire(ctx context.Context, s *labsv1.LabSession) (ctrl.Result, error) {
 	if err := r.teardown(ctx, s); err != nil {
+		if errors.Is(err, drivers.ErrInProgress) {
+			r.setCondition(s, labsv1.ConditionExpired, metav1.ConditionFalse, ReasonExpiring, "teardown in progress: "+err.Error())
+			return ctrl.Result{RequeueAfter: requeueTeardown}, nil
+		}
 		r.setCondition(s, labsv1.ConditionExpired, metav1.ConditionFalse, ReasonExpiring, "teardown failed: "+err.Error())
 		return ctrl.Result{}, err
 	}
@@ -500,6 +559,7 @@ func (r *LabSessionReconciler) expire(ctx context.Context, s *labsv1.LabSession)
 	}
 	s.Status.Phase = labsv1.SessionExpired
 	s.Status.Endpoints = nil
+	r.rejectGrading(s, "the lab session expired; it cannot be graded")
 	r.setCondition(s, labsv1.ConditionExpired, metav1.ConditionTrue, ReasonExpired, "session passed its expiry; resources released")
 	r.setCondition(s, labsv1.ConditionReady, metav1.ConditionFalse, ReasonExpired, "session expired")
 	r.event(s, "Normal", ReasonExpired, "lab session expired")
@@ -588,7 +648,11 @@ func (r *LabSessionReconciler) teardown(ctx context.Context, s *labsv1.LabSessio
 	if errs != nil {
 		return errs
 	}
-	for _, tp := range r.topologyProvisioners(&spec.Topology) {
+	tps := r.topologyProvisioners(&spec.Topology)
+	if r.Session != nil {
+		tps = append(tps, r.Session)
+	}
+	for _, tp := range tps {
 		if err := tp.DestroyTopology(ctx, drivers.SessionRef{Session: s, Template: spec}); err != nil && !drivers.IsPermanent(err) {
 			errs = errors.Join(errs, fmt.Errorf("destroy topology: %w", err))
 		}
@@ -645,24 +709,13 @@ var errActionFailed = errors.New("action failed")
 
 // runAction executes one action through the owning node's driver.
 func (r *LabSessionReconciler) runAction(ctx context.Context, s *labsv1.LabSession, tpl *resolvedTemplate, i int, a labsv1.Action) error {
-	nodeName, member, _ := strings.Cut(a.On, "/")
-	node, ok := findNode(tpl.spec.Topology.Nodes, nodeName)
-	if !ok {
+	nodeName, _, _ := strings.Cut(a.On, "/")
+	if _, ok := findNode(tpl.spec.Topology.Nodes, nodeName); !ok {
 		return fmt.Errorf("action %d: unknown node %q: %w", i, a.On, errActionFailed)
 	}
-	d, err := r.Drivers.Get(node.Driver)
-	if err != nil {
-		return fmt.Errorf("action %d: %w", i, err)
-	}
-	req := ActionRequest(a)
-	req.Member = member
-	res, err := d.Exec(ctx, r.ref(s, tpl, node), req)
-	if err != nil {
-		return fmt.Errorf("action %d on %s: %w", i, a.On, err)
-	}
-	if res.ExitCode != 0 {
-		return fmt.Errorf("action %d on %s exited %d: %s: %w", i, a.On, res.ExitCode,
-			strings.TrimSpace(res.Stderr), errActionFailed)
+	ex := &NodeExecutor{Drivers: r.Drivers, Session: s, Template: tpl.spec}
+	if _, err := ex.RunAction(ctx, a); err != nil {
+		return fmt.Errorf("action %d %w", i, err)
 	}
 	return nil
 }
@@ -705,6 +758,7 @@ func (r *LabSessionReconciler) ref(s *labsv1.LabSession, tpl *resolvedTemplate, 
 func (r *LabSessionReconciler) fail(s *labsv1.LabSession, reason, msg string) ctrl.Result {
 	s.Status.Phase = labsv1.SessionFailed
 	s.Status.Endpoints = nil
+	r.rejectGrading(s, "the lab session failed; it cannot be graded")
 	r.setCondition(s, labsv1.ConditionReady, metav1.ConditionFalse, reason, msg)
 	return r.requeueBeforeExpiry(s, 0)
 }

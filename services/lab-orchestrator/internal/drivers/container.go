@@ -71,6 +71,11 @@ type ContainerDriver struct {
 	ClusterDomain string
 	// Executor runs Exec requests; nil makes Exec return ErrNotImplemented.
 	Executor PodExecutor
+	// Catalog, when set, resolves node image refs (unknown refs fail the node).
+	Catalog *ImageCatalog
+	// AdminImage is the image of the entry node's admin sidecar (ssh client
+	// + kubectl); empty uses the entry node's own image.
+	AdminImage string
 }
 
 // ContainerDriver deliberately does not implement Hibernator: deleting the
@@ -168,7 +173,7 @@ func (d *ContainerDriver) BuildPod(ref NodeRef) *corev1.Pod {
 			EnableServiceLinks:           ptr.To(false),
 			Containers: []corev1.Container{{
 				Name:      ContainerName,
-				Image:     d.ImageFor(n.Image),
+				Image:     d.ImageFor(d.catalogImage(n.Image)),
 				Ports:     cports,
 				Resources: containerResources(n.Resources),
 				Stdin:     true,
@@ -179,7 +184,22 @@ func (d *ContainerDriver) BuildPod(ref NodeRef) *corev1.Pod {
 	if d.RuntimeClassName != "" {
 		pod.Spec.RuntimeClassName = ptr.To(d.RuntimeClassName)
 	}
+	if isEntry(ref) {
+		d.decorateEntryPod(ref, pod)
+	}
 	return pod
+}
+
+// catalogImage maps a catalog ref to its image; without a catalog (or for
+// an unknown ref, which Provision rejects) the ref is used as is.
+func (d *ContainerDriver) catalogImage(ref string) string {
+	if d.Catalog == nil {
+		return ref
+	}
+	if img, err := d.Catalog.Resolve(ref, ImageKindContainer); err == nil {
+		return img.Image
+	}
+	return ref
 }
 
 func containerResources(r *labsv1.NodeResources) corev1.ResourceRequirements {
@@ -267,6 +287,11 @@ func (d *ContainerDriver) Provision(ctx context.Context, ref NodeRef) (NodeState
 		err := fmt.Errorf("container node %q has no image: %w", ref.Node.Name, ErrUnsupported)
 		return NodeState{Phase: labsv1.NodeFailed, Message: err.Error()}, err
 	}
+	if d.Catalog != nil {
+		if _, err := d.Catalog.Resolve(ref.Node.Image, ImageKindContainer); err != nil {
+			return NodeState{Phase: labsv1.NodeFailed, Message: err.Error()}, err
+		}
+	}
 	if err := d.createIfAbsent(ctx, ref, d.BuildService(ref)); err != nil {
 		return NodeState{Phase: labsv1.NodePending, Message: err.Error()}, fmt.Errorf("service: %w", err)
 	}
@@ -327,8 +352,10 @@ func podState(pod *corev1.Pod) (NodeState, error) {
 func podInstanceID(pod *corev1.Pod) string {
 	var restarts int32
 	for _, cs := range pod.Status.ContainerStatuses {
-		if cs.Name == ContainerName {
-			restarts = cs.RestartCount
+		// The admin sidecar's files are wired at runtime too, so its restarts
+		// count as a reset as well.
+		if cs.Name == ContainerName || cs.Name == AdminContainerName {
+			restarts += cs.RestartCount
 		}
 	}
 	return fmt.Sprintf("%s/%d", pod.UID, restarts)
@@ -365,6 +392,20 @@ func (d *ContainerDriver) Exec(ctx context.Context, ref NodeRef, req ExecRequest
 	if req.Member != "" {
 		return ExecResult{}, fmt.Errorf("container driver: cluster member %q: %w", req.Member, ErrUnsupported)
 	}
+	return d.ExecIn(ctx, ref, ContainerName, req)
+}
+
+// learnerEnv is the environment of a learner login: commands run as the
+// learner see the learner's HOME (kubeconfig, ssh config) and start there.
+var learnerEnv = []string{
+	"env", "-i", "HOME=/home/" + LearnerUser, "USER=" + LearnerUser, "LOGNAME=" + LearnerUser,
+	"SHELL=/bin/bash", "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "TERM=dumb",
+	"/bin/sh", "-c", `cd "$HOME" && exec "$@"`, "sh",
+}
+
+// ExecIn runs req.Command in one container of the node's pod. User learner
+// switches to the learner account (runuser) with a login-like environment.
+func (d *ContainerDriver) ExecIn(ctx context.Context, ref NodeRef, container string, req ExecRequest) (ExecResult, error) {
 	if len(req.Command) == 0 {
 		return ExecResult{}, errors.New("container driver: empty command")
 	}
@@ -373,7 +414,7 @@ func (d *ContainerDriver) Exec(ctx context.Context, ref NodeRef, req ExecRequest
 	}
 	cmd := req.Command
 	if req.User == labsv1.ActionAsLearner {
-		cmd = append([]string{"runuser", "-u", LearnerUser, "--"}, cmd...)
+		cmd = append(append([]string{"runuser", "-u", LearnerUser, "--"}, learnerEnv...), cmd...)
 	}
 	if req.Timeout > 0 {
 		var cancel context.CancelFunc
@@ -385,12 +426,15 @@ func (d *ContainerDriver) Exec(ctx context.Context, ref NodeRef, req ExecRequest
 		stdin = bytes.NewReader(req.Stdin)
 	}
 	var stdout, stderr bytes.Buffer
-	err := d.Executor.Exec(ctx, ref.Namespace(), ref.ResourceName(), ContainerName, cmd, stdin, &stdout, &stderr)
+	err := d.Executor.Exec(ctx, ref.Namespace(), ref.ResourceName(), container, cmd, stdin, &stdout, &stderr)
 	res := ExecResult{Stdout: stdout.String(), Stderr: stderr.String()}
 	var exitErr utilexec.ExitError
 	if errors.As(err, &exitErr) {
 		res.ExitCode = exitErr.ExitStatus()
 		return res, nil
+	}
+	if err != nil && ctx.Err() != nil {
+		return res, fmt.Errorf("exec in %s/%s: %w", ref.ResourceName(), container, ctx.Err())
 	}
 	return res, err
 }
