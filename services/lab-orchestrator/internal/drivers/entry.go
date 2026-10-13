@@ -270,7 +270,9 @@ func learnerFiles(a EntryAccess) ([]tarFile, error) {
 
 // adminFiles renders the admin sidecar's files.
 func adminFiles(a EntryAccess) []tarFile {
-	f := func(p string, mode int64, data []byte) tarFile { return tarFile{path: "root/" + p, mode: mode, data: data} }
+	f := func(p string, mode int64, data []byte) tarFile {
+		return tarFile{path: "root/" + p, mode: mode, data: data}
+	}
 	files := []tarFile{{path: "root/.ssh", mode: 0o700, dir: true}, {path: "root/.kube", mode: 0o700, dir: true},
 		f(".ssh/id_ed25519", 0o600, a.AdminKey.Private),
 		f(".ssh/config", 0o600, sshConfig(a.Hosts, "root", "/root/.ssh/id_ed25519", "/root/.ssh/known_hosts", true)),
@@ -511,3 +513,14 @@ func (r *SessionRuntime) WireEntry(ctx context.Context, ref SessionRef) (bool, s
 	}
 	return true, "", nil
 }
+
+// SessionProvisioner is the session-scoped part of the runtime the
+// reconciler drives: topology-wide resources plus wiring of the entry node.
+type SessionProvisioner interface {
+	TopologyProvisioner
+	// WireEntry gives the entry node access to every other node. done is
+	// false (with a reason) until all access material is in place.
+	WireEntry(ctx context.Context, ref SessionRef) (done bool, msg string, err error)
+}
+
+var _ SessionProvisioner = (*SessionRuntime)(nil)

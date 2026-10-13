@@ -145,7 +145,7 @@ func (c cloudInit) Render() ([]byte, error) {
 		runcmd = append(runcmd, []any{"bash", "-c", r})
 	}
 	doc := map[string]any{
-		"hostname":                 c.Hostname,
+		"hostname":                  c.Hostname,
 		"prefer_fqdn_over_hostname": false,
 		"manage_etc_hosts":          false,
 		"ssh_pwauth":                false,

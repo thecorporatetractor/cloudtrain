@@ -102,7 +102,9 @@ type LabNet struct {
 }
 
 // NewLabNet returns the network names of a session.
-func NewLabNet(s *labsv1.LabSession) LabNet { return LabNet{Namespace: s.Namespace, Hash: SessionHash(s)} }
+func NewLabNet(s *labsv1.LabSession) LabNet {
+	return LabNet{Namespace: s.Namespace, Hash: SessionHash(s)}
+}
 
 func (n LabNet) VPC() string          { return "ct-" + n.Hash }
 func (n LabNet) LabSubnet() string    { return "ct-" + n.Hash + "-lab" }
@@ -350,4 +352,3 @@ func ipInLab(ip string) bool {
 	_, n, _ := net.ParseCIDR(LabCIDR)
 	return n.Contains(net.ParseIP(ip))
 }
-

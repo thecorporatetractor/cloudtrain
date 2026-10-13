@@ -312,6 +312,11 @@ func yamlDocs(docs ...any) (string, error) {
 
 const criSocket = "unix:///run/containerd/containerd.sock"
 
+// PodCIDR of kubeadm lab clusters. It must not overlap the lab network
+// (192.168.99.0/24, 192.168.100.0/24), so a CNI default such as Calico's
+// 192.168.0.0/16 is never used: the image's cni-install gets this CIDR.
+const PodCIDR = "10.244.0.0/16"
+
 // userdata renders a member's cloud-config.
 func (d *KubeadmDriver) userdata(ref NodeRef, l kubeadmLayout, m labsv1.ClusterNode, p clusterPKI, learnerPub, adminPub []byte) ([]byte, error) {
 	taints, err := memberTaints(m)
@@ -337,7 +342,7 @@ func (d *KubeadmDriver) userdata(ref NodeRef, l kubeadmLayout, m labsv1.ClusterN
 				"kubernetesVersion":    "__KUBE_VERSION__",
 				"clusterName":          clusterContext(ref.Node),
 				"controlPlaneEndpoint": cpIP + ":6443",
-				"networking":           map[string]any{"podSubnet": "10.244.0.0/16", "serviceSubnet": "10.96.0.0/12"},
+				"networking":           map[string]any{"podSubnet": PodCIDR, "serviceSubnet": "10.96.0.0/12"},
 				"apiServer":            map[string]any{"certSANs": []any{m.Name, h.IP}},
 			},
 			map[string]any{
@@ -353,12 +358,16 @@ func (d *KubeadmDriver) userdata(ref NodeRef, l kubeadmLayout, m labsv1.ClusterN
 			{Path: "/etc/kubernetes/pki/ca.key", Content: string(p.ca.Key), Permissions: "0600"},
 			{Path: "/root/kubeadm.yaml", Content: cfg, Permissions: "0600"},
 		}
-		ci.RunCmd = []string{`set -e
+		ci.RunCmd = []string{strings.ReplaceAll(`set -e
 sed -i "s/__KUBE_VERSION__/$(kubeadm version -o short)/" /root/kubeadm.yaml
 kubeadm init --config /root/kubeadm.yaml --skip-token-print > /var/log/kubeadm.log 2>&1
-kubectl --kubeconfig /etc/kubernetes/admin.conf apply -f /opt/cloudtrain/manifests/kube-flannel.yml >> /var/log/kubeadm.log 2>&1
+export KUBECONFIG=/etc/kubernetes/admin.conf
+# CNI: the image's installer if it ships one (called with the pod CIDR),
+# else the legacy Flannel manifest of the golden image.
+if [ -x /opt/cloudtrain/bin/cni-install ]; then /opt/cloudtrain/bin/cni-install "__POD_CIDR__" >> /var/log/kubeadm.log 2>&1
+else kubectl apply -f /opt/cloudtrain/manifests/kube-flannel.yml >> /var/log/kubeadm.log 2>&1; fi
 install -d -o learner -g learner /home/learner/.kube
-install -o learner -g learner -m 600 /etc/kubernetes/admin.conf /home/learner/.kube/config`}
+install -o learner -g learner -m 600 /etc/kubernetes/admin.conf /home/learner/.kube/config`, "__POD_CIDR__", PodCIDR)}
 		return ci.Render()
 	}
 	join, err := yamlDocs(map[string]any{
