@@ -1,0 +1,31 @@
+#!/bin/bash
+# Per-VM etcd PKI for the CloudTrain etcd-host image (ExecStartPre of etcd.service).
+# Creates, only if missing, under /etc/qm-etcd/pki (owned by etcd, keys 0600):
+#   ca.crt/key          cluster CA (per VM, 30 days)
+#   server.crt/key      client-facing serving cert: 127.0.0.1, localhost, hostname
+#   peer.crt/key        peer cert (server + client auth)
+#   grader.crt/key      client identity for platform checks (CN cloudtrain-grader)
+#   admin.crt/key       client identity for the node admin (CN root)
+set -euo pipefail
+PKI=/etc/qm-etcd/pki
+[ -s "$PKI/server.crt" ] && [ -s "$PKI/ca.crt" ] && exit 0
+install -d -m 0755 "$PKI"
+cd "$PKI"
+host=$(hostname -s 2>/dev/null || echo etcd-host)
+openssl req -x509 -newkey rsa:2048 -nodes -days 30 -subj "/O=CloudTrain/CN=etcd-ca" \
+  -keyout ca.key -out ca.crt 2>/dev/null
+issue() {  # issue <name> <cn> <ext lines...>
+  local name=$1 cn=$2; shift 2
+  printf '%s\n' "$@" > "$name.ext"
+  openssl req -newkey rsa:2048 -nodes -subj "/O=CloudTrain/CN=$cn" -keyout "$name.key" -out "$name.csr" 2>/dev/null
+  openssl x509 -req -in "$name.csr" -CA ca.crt -CAkey ca.key -CAcreateserial -days 30 -extfile "$name.ext" -out "$name.crt" 2>/dev/null
+  rm -f "$name.csr" "$name.ext"
+}
+san="subjectAltName=IP:127.0.0.1,DNS:localhost,DNS:$host"
+issue server "$host" "$san" "extendedKeyUsage=serverAuth,clientAuth"
+issue peer "$host" "$san" "extendedKeyUsage=serverAuth,clientAuth"
+issue grader cloudtrain-grader "extendedKeyUsage=clientAuth"
+issue admin root "extendedKeyUsage=clientAuth"
+chown -R etcd:etcd "$PKI"
+chmod 0600 "$PKI"/*.key
+install -d -m 0700 -o etcd -g etcd /var/lib/etcd

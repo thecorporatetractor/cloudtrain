@@ -37,7 +37,7 @@ fi
 
 NS="ctlab-demo-$(date +%H%M%S)"
 NODE_IMAGE="${GOLDEN_IMAGE_REPO}:${LAB_K8S_VERSION}"
-JUMP_IMAGE="cloudtrain/jumphost:${LAB_K8S_VERSION}"
+JUMP_IMAGE="$JUMPHOST_IMAGE"   # catalog ref jumphost:1
 CP_IP=192.168.100.10
 WK_IP=192.168.100.11
 JH_IP=192.168.99.5
@@ -147,7 +147,7 @@ EOF
       resolvConf: /etc/cloudtrain/resolv.conf
 runcmd:
   - [bash, -c, "date +%s.%N > /var/log/cloudtrain-boot.ts"]
-  - [bash, -c, "kubeadm init --config /root/kubeadm.yaml --skip-token-print > /var/log/kubeadm.log 2>&1 && kubectl --kubeconfig /etc/kubernetes/admin.conf apply -f /opt/cloudtrain/manifests/kube-flannel.yml >> /var/log/kubeadm.log 2>&1 && install -d -o learner -g learner /home/learner/.kube && install -o learner -g learner -m 600 /etc/kubernetes/admin.conf /home/learner/.kube/config"]
+  - [bash, -c, "kubeadm init --config /root/kubeadm.yaml --skip-token-print > /var/log/kubeadm.log 2>&1 && /opt/cloudtrain/bin/cni-install 10.244.0.0/16 >> /var/log/kubeadm.log 2>&1 && install -d -o learner -g learner /home/learner/.kube && install -o learner -g learner -m 600 /etc/kubernetes/admin.conf /home/learner/.kube/config"]
 EOF
 } > "$WORK/ctl-1.yaml"
 
