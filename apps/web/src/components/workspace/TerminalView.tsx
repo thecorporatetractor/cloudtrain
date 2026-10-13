@@ -17,32 +17,33 @@ interface Props {
   ownsKey?: (e: KeyboardEvent) => boolean;
 }
 
+/** The whole xterm palette comes from the --term-* tokens, so every theme (including the light ones) applies to the terminal. */
 function readTheme(): ITheme {
   const cs = getComputedStyle(document.documentElement);
   const v = (name: string) => cs.getPropertyValue(name).trim();
-  const fg = v('--term-fg');
+  const blue = v('--term-blue');
   return {
     background: v('--term-bg'),
-    foreground: fg,
+    foreground: v('--term-fg'),
     cursor: v('--term-cursor'),
     cursorAccent: v('--term-bg'),
     selectionBackground: v('--selection'),
-    black: '#1c1f24',
-    brightBlack: '#6b7280',
-    white: fg,
-    brightWhite: '#ffffff',
-    red: v('--err'),
-    green: v('--ok'),
-    yellow: v('--warn'),
-    blue: v('--accent'),
-    magenta: v('--accent'),
-    cyan: v('--accent'),
-    brightRed: v('--err'),
-    brightGreen: v('--ok'),
-    brightYellow: v('--warn'),
-    brightBlue: v('--accent'),
-    brightMagenta: v('--accent'),
-    brightCyan: v('--accent'),
+    black: v('--term-black'),
+    brightBlack: v('--term-bright-black'),
+    white: v('--term-white'),
+    brightWhite: v('--term-bright-white'),
+    red: v('--term-red'),
+    green: v('--term-green'),
+    yellow: v('--term-yellow'),
+    blue,
+    magenta: blue,
+    cyan: blue,
+    brightRed: v('--term-red'),
+    brightGreen: v('--term-green'),
+    brightYellow: v('--term-yellow'),
+    brightBlue: blue,
+    brightMagenta: blue,
+    brightCyan: blue,
   };
 }
 
@@ -135,7 +136,8 @@ export function TerminalView({ lab, source, active, onOpenNode, ownsKey }: Props
         } catch {
           /* ignore */
         }
-        termRef.current?.focus();
+        // Keep focus in the tab strip while the user is arrowing through tabs.
+        if (!document.activeElement?.closest('.tabstrip')) termRef.current?.focus();
       });
       return () => cancelAnimationFrame(id);
     }

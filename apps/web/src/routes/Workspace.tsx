@@ -34,24 +34,32 @@ function readLayout(): LayoutPrefs {
   return { taskSide: 'left', taskCollapsed: false, topoCollapsed: false };
 }
 
+/*
+ * Workspace shortcuts avoid keys a shell user relies on. Readline owns Alt+B/F/D/T
+ * (word motion, kill-word, transpose) and Ctrl+K/U/W/A/E/L, so actions use
+ * Ctrl/⌘+Shift+letter (never seen by the shell) and tab switching uses Alt with
+ * digits and brackets, which readline leaves alone in practice. Ctrl+Shift+T/W/N
+ * are reserved by browsers and are not used.
+ */
 const WORKSPACE_SHORTCUTS = [
   {
     title: 'Lab',
     items: [
       { keys: 'mod+enter', description: 'Validate' },
-      { keys: 'alt+h', description: 'Reveal next hint' },
-      { keys: 'alt+b', description: 'Toggle task panel' },
-      { keys: 'alt+shift+b', description: 'Dock task panel left / right' },
-      { keys: 'alt+g', description: 'Toggle topology' },
-      { keys: 'alt+f', description: 'Full-screen terminal' },
+      { keys: 'mod+shift+h', description: 'Reveal next hint' },
+      { keys: 'mod+shift+b', description: 'Toggle task panel' },
+      { keys: 'mod+shift+arrowleft', description: 'Dock task panel left' },
+      { keys: 'mod+shift+arrowright', description: 'Dock task panel right' },
+      { keys: 'mod+shift+g', description: 'Toggle topology' },
+      { keys: 'mod+shift+f', description: 'Full-screen terminal' },
     ],
   },
   {
     title: 'Terminals',
     items: [
-      { keys: 'alt+t', description: 'New console on the jumphost' },
-      { keys: 'alt+w', description: 'Close console tab' },
-      { keys: 'alt+d', description: 'Split pane' },
+      { keys: 'mod+shift+o', description: 'New console on the jumphost' },
+      { keys: 'mod+shift+x', description: 'Close console tab' },
+      { keys: 'mod+shift+d', description: 'Split pane' },
       { keys: 'alt+]', description: 'Next tab' },
       { keys: 'alt+[', description: 'Previous tab' },
       { keys: 'alt+1', description: 'Tab 1 … 9' },
@@ -121,8 +129,9 @@ export function Workspace() {
     else p.collapse();
     focusActiveTerminal();
   }, []);
-  const swapSide = useCallback(() => {
-    setLayout((l) => ({ ...l, taskSide: l.taskSide === 'left' ? 'right' : 'left' }));
+  const dock = useCallback((side: TaskSide) => {
+    setLayout((l) => ({ ...l, taskSide: side }));
+    taskRef.current?.expand();
     focusActiveTerminal();
   }, []);
   const setChromeless = useCallback(
@@ -164,22 +173,30 @@ export function Workspace() {
     if (next >= 0) reveal.mutate(next);
   }, [lab.data, session.data, reveal]);
 
+  /**
+   * Keys the workspace takes before xterm sees them. Matched on the physical key (e.code)
+   * so they work with Option on macOS. Everything else, including Alt+B/F/D, Ctrl+K and
+   * dead keys for accented input, reaches the shell.
+   */
   const ownsKey = useCallback((e: KeyboardEvent) => {
-    if (e.altKey && !e.ctrlKey && !e.metaKey) return /^[twdgbfh1-9\[\]]$/i.test(e.key) || e.key === 'Dead';
-    if ((e.ctrlKey || e.metaKey) && (e.key === 'Enter' || e.key === 'k' || e.key === '/' || (e.shiftKey && e.key.toLowerCase() === 'l'))) return true;
+    const mod = e.ctrlKey || e.metaKey;
+    if (mod && e.shiftKey && !e.altKey) return /^(Key[BDFGHOXL]|ArrowLeft|ArrowRight)$/.test(e.code);
+    if (mod && !e.shiftKey && !e.altKey) return e.key === 'Enter';
+    if (e.altKey && !mod && !e.shiftKey) return /^(Digit[1-9]|BracketLeft|BracketRight)$/.test(e.code);
     return false;
   }, []);
 
   useHotkeys([
     { keys: 'mod+enter', description: 'Validate', group: 'Lab', global: true, handler: runValidate },
-    { keys: 'alt+h', description: 'Reveal next hint', group: 'Lab', global: true, handler: revealNext },
-    { keys: 'alt+b', description: 'Toggle task panel', group: 'Lab', global: true, handler: toggleTask },
-    { keys: 'alt+shift+b', description: 'Swap task panel side', group: 'Lab', global: true, handler: swapSide },
-    { keys: 'alt+g', description: 'Toggle topology', group: 'Lab', global: true, handler: toggleTopo },
-    { keys: 'alt+f', description: 'Full-screen terminal', group: 'Lab', global: true, handler: () => setChromeless(!chromeless) },
-    { keys: 'alt+t', description: 'New console', group: 'Terminals', global: true, handler: () => lab.data && terminals.openConsole(lab.data.spec.topology.entry ?? lab.data.spec.topology.nodes[0]!.name) },
-    { keys: 'alt+w', description: 'Close tab', group: 'Terminals', global: true, handler: () => terminals.closeTab() },
-    { keys: 'alt+d', description: 'Split pane', group: 'Terminals', global: true, handler: terminals.split },
+    { keys: 'mod+shift+h', description: 'Reveal next hint', group: 'Lab', global: true, handler: revealNext },
+    { keys: 'mod+shift+b', description: 'Toggle task panel', group: 'Lab', global: true, handler: toggleTask },
+    { keys: 'mod+shift+arrowleft', description: 'Dock task panel left', group: 'Lab', global: true, handler: () => dock('left') },
+    { keys: 'mod+shift+arrowright', description: 'Dock task panel right', group: 'Lab', global: true, handler: () => dock('right') },
+    { keys: 'mod+shift+g', description: 'Toggle topology', group: 'Lab', global: true, handler: toggleTopo },
+    { keys: 'mod+shift+f', description: 'Full-screen terminal', group: 'Lab', global: true, handler: () => setChromeless(!chromeless) },
+    { keys: 'mod+shift+o', description: 'New console', group: 'Terminals', global: true, handler: () => lab.data && terminals.openConsole(lab.data.spec.topology.entry ?? lab.data.spec.topology.nodes[0]!.name) },
+    { keys: 'mod+shift+x', description: 'Close tab', group: 'Terminals', global: true, handler: () => terminals.closeTab() },
+    { keys: 'mod+shift+d', description: 'Split pane', group: 'Terminals', global: true, handler: terminals.split },
     { keys: 'alt+]', description: 'Next tab', group: 'Terminals', global: true, handler: () => terminals.cycleTab(1) },
     { keys: 'alt+[', description: 'Previous tab', group: 'Terminals', global: true, handler: () => terminals.cycleTab(-1) },
     ...[1, 2, 3, 4, 5, 6, 7, 8, 9].map((n) => ({ keys: `alt+${n}`, description: `Tab ${n}`, group: 'Terminals', global: true, handler: () => terminals.selectTab(n - 1) })),
@@ -255,7 +272,7 @@ export function Workspace() {
         <div className="row" style={{ gap: 6 }}>
           {chromeless && (
             <span className="ws-chromeless-hint xs subtle" aria-hidden>
-              <Kbd keys="alt+f" /> exit
+              <Kbd keys="mod+shift+f" /> exit
             </span>
           )}
           {s && (
@@ -277,21 +294,12 @@ export function Workspace() {
           </Tooltip>
           <span className="vdivider" style={{ height: 18, margin: '0 4px' }} />
           <div className="segmented segmented-sm" role="group" aria-label="Task panel position">
-            <Tooltip content="Dock task panel left" shortcut="alt+shift+b">
-              <button
-                className={cn('segmented-item', layout.taskSide === 'left' && !layout.taskCollapsed && 'is-active')}
-                aria-pressed={layout.taskSide === 'left' && !layout.taskCollapsed}
-                aria-label="Dock task panel left"
-                onClick={() => {
-                  setLayout((x) => ({ ...x, taskSide: 'left' }));
-                  taskRef.current?.expand();
-                  focusActiveTerminal();
-                }}
-              >
+            <Tooltip content="Dock task panel left" shortcut="mod+shift+arrowleft">
+              <button className={cn('segmented-item', layout.taskSide === 'left' && !layout.taskCollapsed && 'is-active')} aria-pressed={layout.taskSide === 'left' && !layout.taskCollapsed} aria-label="Dock task panel left" onClick={() => dock('left')}>
                 <PanelLeft size={13} />
               </button>
             </Tooltip>
-            <Tooltip content="Hide task panel" shortcut="alt+b">
+            <Tooltip content="Hide task panel" shortcut="mod+shift+b">
               <button className={cn('segmented-item', layout.taskCollapsed && 'is-active')} aria-pressed={layout.taskCollapsed} aria-label="Hide task panel" onClick={() => {
                   taskRef.current?.collapse();
                   focusActiveTerminal();
@@ -299,25 +307,16 @@ export function Workspace() {
                 <PanelLeftClose size={13} />
               </button>
             </Tooltip>
-            <Tooltip content="Dock task panel right" shortcut="alt+shift+b">
-              <button
-                className={cn('segmented-item', layout.taskSide === 'right' && !layout.taskCollapsed && 'is-active')}
-                aria-pressed={layout.taskSide === 'right' && !layout.taskCollapsed}
-                aria-label="Dock task panel right"
-                onClick={() => {
-                  setLayout((x) => ({ ...x, taskSide: 'right' }));
-                  taskRef.current?.expand();
-                  focusActiveTerminal();
-                }}
-              >
+            <Tooltip content="Dock task panel right" shortcut="mod+shift+arrowright">
+              <button className={cn('segmented-item', layout.taskSide === 'right' && !layout.taskCollapsed && 'is-active')} aria-pressed={layout.taskSide === 'right' && !layout.taskCollapsed} aria-label="Dock task panel right" onClick={() => dock('right')}>
                 <PanelRight size={13} />
               </button>
             </Tooltip>
           </div>
-          <Tooltip content={layout.topoCollapsed ? 'Show topology' : 'Hide topology'} shortcut="alt+g">
+          <Tooltip content={layout.topoCollapsed ? 'Show topology' : 'Hide topology'} shortcut="mod+shift+g">
             <Button variant="ghost" size="sm" iconOnly aria-label="Toggle topology" aria-pressed={!layout.topoCollapsed} onClick={toggleTopo} icon={<Network size={14} />} />
           </Tooltip>
-          <Tooltip content={chromeless ? 'Exit full-screen' : 'Full-screen terminal'} shortcut="alt+f">
+          <Tooltip content={chromeless ? 'Exit full-screen' : 'Full-screen terminal'} shortcut="mod+shift+f">
             <Button variant="ghost" size="sm" iconOnly aria-label="Toggle full-screen terminal" aria-pressed={chromeless} onClick={() => setChromeless(!chromeless)} icon={chromeless ? <Minimize2 size={14} /> : <Maximize2 size={14} />} />
           </Tooltip>
           <Tooltip content="Keyboard shortcuts" shortcut="?">
@@ -356,7 +355,7 @@ export function Workspace() {
               <Panel id="topo" ref={topoRef} collapsible collapsedSize={0} minSize={15} defaultSize={30} maxSize={60} order={0} onCollapse={() => setLayout((x) => ({ ...x, topoCollapsed: true }))} onExpand={() => setLayout((x) => ({ ...x, topoCollapsed: false }))} className="ws-topo-panel">
                 <div className="ws-topo">
                   <div className="ws-topo-head">
-                    <span className="xs subtle">Topology · click a node to open its console · right-click a link to capture</span>
+                    <span className="xs subtle">Topology · click a node to open its console · right-click a link (or Tab to it and press Enter) to capture</span>
                     <span className="row" style={{ gap: 8 }}>
                       {s?.nodes.map((n) => (
                         <span key={n.name} className="row xs mono muted" style={{ gap: 4 }} title={`${n.name}: ${n.status}${n.ip ? ` · ${n.ip}` : ''}`}>
@@ -370,7 +369,7 @@ export function Workspace() {
               </Panel>
               <PanelResizeHandle className="splitter splitter-h" />
               <Panel id="terminals" minSize={30} order={1}>
-                <TerminalArea lab={l} model={terminals.model} onFocus={terminals.focus} onClose={terminals.closeTab} onOpenConsole={terminals.openConsole} onSplit={terminals.split} ownsKey={ownsKey} />
+                <TerminalArea lab={l} model={terminals.model} onFocus={terminals.focus} onClose={terminals.closeTab} onOpenConsole={terminals.openConsole} onCapture={onCapture} onSplit={terminals.split} ownsKey={ownsKey} />
               </Panel>
             </PanelGroup>
           </Panel>

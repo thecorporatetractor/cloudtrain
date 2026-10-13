@@ -3,7 +3,7 @@ import type { CheckResult, LabSession, StudioDraft, ValidateResponse, Verificati
 import { domains, labById, labSummaries, paths } from './fixtures/labs';
 import { frameworks, skillStates, skills } from './fixtures/skills';
 import { homeData } from './fixtures/home';
-import { teamData } from './fixtures/team';
+import { memberById, memberSkillStates, teamData } from './fixtures/team';
 import { drafts as seedDrafts, freshGates, specFromPrompt } from './fixtures/studio';
 
 /* ------------------------------------------------------------------ */
@@ -175,8 +175,15 @@ export const handlers = [
     return HttpResponse.json(s);
   }),
 
-  http.get('/api/skills', async () => {
+  http.get('/api/skills', async ({ request }) => {
     await latency();
+    const memberId = new URL(request.url).searchParams.get('member');
+    if (memberId && memberId !== homeData.learner.id) {
+      const member = memberById(memberId);
+      const states = memberSkillStates(memberId);
+      if (!member || !states) return HttpResponse.json({ error: 'Team member not found' }, { status: 404 });
+      return HttpResponse.json({ skills, states, frameworks, member: { id: member.id, name: member.name, title: member.title } });
+    }
     return HttpResponse.json({ skills, states: skillStates, frameworks });
   }),
 

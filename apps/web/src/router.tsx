@@ -1,15 +1,27 @@
-import { createRootRoute, createRoute, createRouter } from '@tanstack/react-router';
+import { createRootRoute, createRoute, createRouter, lazyRouteComponent } from '@tanstack/react-router';
 import type { Difficulty, Domain, FrameworkId } from './api/types';
 import { Shell } from './app/Shell';
 import { NotFound } from './app/NotFound';
+import { PageSkeleton } from './components/ui';
 import { Home } from './routes/Home';
 import { Catalog } from './routes/Catalog';
-import { LabOverview } from './routes/LabOverview';
-import { Workspace } from './routes/Workspace';
-import { Skills } from './routes/Skills';
-import { Studio } from './routes/Studio';
-import { StudioDraft } from './routes/StudioDraft';
-import { Team } from './routes/Team';
+
+// Screens that pull in React Flow or xterm are loaded on demand so the other
+// pages do not download them (see vite.config.ts manualChunks).
+const LabOverview = lazyRouteComponent(() => import('./routes/LabOverview'), 'LabOverview');
+const Workspace = lazyRouteComponent(() => import('./routes/Workspace'), 'Workspace');
+const Skills = lazyRouteComponent(() => import('./routes/Skills'), 'Skills');
+const Studio = lazyRouteComponent(() => import('./routes/Studio'), 'Studio');
+const StudioDraft = lazyRouteComponent(() => import('./routes/StudioDraft'), 'StudioDraft');
+const Team = lazyRouteComponent(() => import('./routes/Team'), 'Team');
+
+function Pending() {
+  return (
+    <div className="page">
+      <PageSkeleton />
+    </div>
+  );
+}
 
 const rootRoute = createRootRoute({ component: Shell, notFoundComponent: NotFound });
 
@@ -55,6 +67,8 @@ export const workspaceRoute = createRoute({
 export interface SkillsSearch {
   framework: FrameworkId;
   skill?: string;
+  /** Another team member's skills (managers and admins). */
+  member?: string;
 }
 const FRAMEWORKS: FrameworkId[] = ['cka', 'cks', 'lfcs', 'ccna'];
 export const skillsRoute = createRoute({
@@ -63,6 +77,7 @@ export const skillsRoute = createRoute({
   validateSearch: (s: Record<string, unknown>): SkillsSearch => ({
     framework: FRAMEWORKS.includes(s.framework as FrameworkId) ? (s.framework as FrameworkId) : 'cks',
     ...(typeof s.skill === 'string' && s.skill ? { skill: s.skill } : {}),
+    ...(typeof s.member === 'string' && s.member ? { member: s.member } : {}),
   }),
   component: Skills,
 });
@@ -76,6 +91,8 @@ const routeTree = rootRoute.addChildren([homeRoute, catalogRoute, labRoute, work
 export const router = createRouter({
   routeTree,
   defaultPreload: 'intent',
+  defaultPendingComponent: Pending,
+  defaultPendingMs: 120,
   scrollRestoration: true,
   defaultPreloadStaleTime: 0,
 });

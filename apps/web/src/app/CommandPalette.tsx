@@ -2,10 +2,11 @@ import { Command } from 'cmdk';
 import * as DialogPrimitive from '@radix-ui/react-dialog';
 import { useNavigate } from '@tanstack/react-router';
 import { BookOpen, FlaskConical, Home, Keyboard, Moon, Palette, Sun, Sunset, Terminal, Users, Waypoints } from 'lucide-react';
-import { useCatalog } from '@/api/client';
+import { useCatalog, useMe } from '@/api/client';
 import { Kbd } from '@/components/ui';
 import { THEMES, useTheme } from '@/lib/theme';
 import { formatMinutes, titleCase } from '@/lib/utils';
+import { canAccess } from './access';
 import { useShell } from './shell-context';
 
 export function CommandPalette() {
@@ -13,6 +14,7 @@ export function CommandPalette() {
   const navigate = useNavigate();
   const { setTheme } = useTheme();
   const catalog = useCatalog();
+  const role = useMe().data?.role;
 
   const run = (fn: () => void) => () => {
     setPaletteOpen(false);
@@ -43,12 +45,16 @@ export function CommandPalette() {
                 <Command.Item className="palette-item" onSelect={run(() => void navigate({ to: '/skills', search: { framework: 'cks' } }))}>
                   <Waypoints size={14} /> Skills <Kbd keys="g s" />
                 </Command.Item>
-                <Command.Item className="palette-item" onSelect={run(() => void navigate({ to: '/team' }))}>
-                  <Users size={14} /> Team dashboard <Kbd keys="g t" />
-                </Command.Item>
-                <Command.Item className="palette-item" onSelect={run(() => void navigate({ to: '/studio' }))}>
-                  <FlaskConical size={14} /> Scenario Studio <Kbd keys="g a" />
-                </Command.Item>
+                {canAccess(role, '/team') && (
+                  <Command.Item className="palette-item" onSelect={run(() => void navigate({ to: '/team' }))}>
+                    <Users size={14} /> Team dashboard <Kbd keys="g t" />
+                  </Command.Item>
+                )}
+                {canAccess(role, '/studio') && (
+                  <Command.Item className="palette-item" onSelect={run(() => void navigate({ to: '/studio' }))}>
+                    <FlaskConical size={14} /> Scenario Studio <Kbd keys="g a" />
+                  </Command.Item>
+                )}
               </Command.Group>
 
               {catalog.data && (

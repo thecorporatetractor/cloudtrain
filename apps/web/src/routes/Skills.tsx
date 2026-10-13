@@ -1,5 +1,5 @@
 import { Link, useNavigate } from '@tanstack/react-router';
-import { ArrowRight, Info, Minus, TrendingDown, TrendingUp } from 'lucide-react';
+import { ArrowRight, ChevronLeft, Info, Minus, TrendingDown, TrendingUp } from 'lucide-react';
 import { useMemo } from 'react';
 import { useCatalog, useSkills } from '@/api/client';
 import type { FrameworkId, Skill, SkillState } from '@/api/types';
@@ -7,12 +7,13 @@ import { HeatCell, Ring } from '@/components/charts';
 import { DifficultyBadge } from '@/components/domain';
 import { Badge, Card, EmptyState, ErrorState, PageSkeleton, Segmented, Stat } from '@/components/ui';
 import { skillsRoute } from '@/router';
+import { domainReadiness, frameworkReadiness } from '@/lib/readiness';
 import { formatMinutes, pct, relativeTime } from '@/lib/utils';
 
 export function Skills() {
   const search = skillsRoute.useSearch();
   const navigate = useNavigate({ from: skillsRoute.fullPath });
-  const skills = useSkills();
+  const skills = useSkills(search.member);
   const catalog = useCatalog();
 
   const data = skills.data;
@@ -20,22 +21,8 @@ export function Skills() {
   const stateOf = useMemo(() => new Map(data?.states.map((s) => [s.skillId, s]) ?? []), [data]);
   const skillOf = useMemo(() => new Map(data?.skills.map((s) => [s.id, s]) ?? []), [data]);
 
-  const summary = useMemo(() => {
-    if (!framework) return null;
-    let weighted = 0;
-    let practised = 0;
-    let total = 0;
-    let maxSigma: SkillState | undefined;
-    for (const d of framework.domains) {
-      const states = d.skillIds.map((id) => stateOf.get(id)).filter((x): x is SkillState => !!x);
-      const mean = states.length ? states.reduce((a, s) => a + s.mu, 0) / states.length : 0;
-      weighted += mean * d.weight;
-      total += states.length;
-      practised += states.filter((s) => s.evidence > 0).length;
-      for (const s of states) if (!maxSigma || s.sigma > maxSigma.sigma) maxSigma = s;
-    }
-    return { readiness: weighted, practised, total, maxSigma };
-  }, [framework, stateOf]);
+  // The same selector Home uses for its goal forecast, so the two screens agree.
+  const summary = useMemo(() => (framework ? frameworkReadiness(framework, stateOf) : null), [framework, stateOf]);
 
   if (skills.isPending) {
     return (
@@ -52,19 +39,27 @@ export function Skills() {
     );
   }
 
+  const member = data.member;
   const selected = search.skill ? skillOf.get(search.skill) : undefined;
   const selectedState = search.skill ? stateOf.get(search.skill) : undefined;
   const select = (id?: string) => void navigate({ search: (prev) => ({ ...prev, skill: id === prev.skill ? undefined : id }), replace: true });
 
   return (
     <div className="page page-wide">
+      {member && (
+        <Link to="/team" className="link-quiet small row" style={{ gap: 4, marginBottom: 14, display: 'inline-flex' }}>
+          <ChevronLeft size={13} /> Team
+        </Link>
+      )}
       <header className="page-header">
         <div>
-          <div className="page-eyebrow">Skills</div>
+          <div className="page-eyebrow">{member ? `Skills · ${member.name}` : 'Skills'}</div>
           <h1>{framework?.fullName}</h1>
-          <p className="muted">Per-skill mastery estimate (μ) with uncertainty (σ). Darker is stronger; a dashed ring means the estimate is still uncertain.</p>
+          <p className="muted">
+            {member ? `${member.name} (${member.title}): per-skill` : 'Per-skill'} mastery estimate (μ) with uncertainty (σ). Darker is stronger; a dashed ring means the estimate is still uncertain.
+          </p>
         </div>
-        <Segmented<FrameworkId> label="Framework" value={search.framework} onChange={(v) => void navigate({ search: { framework: v } })} options={data.frameworks.map((f) => ({ value: f.id, label: f.name, title: f.fullName }))} />
+        <Segmented<FrameworkId> label="Framework" value={search.framework} onChange={(v) => void navigate({ search: (prev) => ({ framework: v, ...(prev.member ? { member: prev.member } : {}) }) })} options={data.frameworks.map((f) => ({ value: f.id, label: f.name, title: f.fullName }))} />
       </header>
 
       {framework && summary && (
@@ -98,14 +93,15 @@ export function Skills() {
             </Card>
 
             <Card className="card-flush">
-              <div className="heatmap" role="grid" aria-label={`${framework.name} skill heatmap`}>
+              {/* Rows of buttons grouped by exam domain; not an ARIA grid, since there is no 2-D keyboard navigation. */}
+              <div className="heatmap" aria-label={`${framework.name} skill heatmap`}>
                 {framework.domains.map((d) => {
-                  const states = d.skillIds.map((id) => stateOf.get(id)).filter((x): x is SkillState => !!x);
-                  const mean = states.length ? states.reduce((a, s) => a + s.mu, 0) / states.length : 0;
+                  const { mean } = domainReadiness(d, stateOf);
+                  const headId = `heat-${d.id.replace(/[^a-z0-9]/gi, '-')}`;
                   return (
-                    <div key={d.id} className="heat-row" role="row">
-                      <div className="heat-rowhead" role="rowheader">
-                        <div className="small truncate" title={d.name}>
+                    <div key={d.id} className="heat-row" role="group" aria-labelledby={headId}>
+                      <div className="heat-rowhead">
+                        <div className="small truncate" title={d.name} id={headId}>
                           {d.name}
                         </div>
                         <div className="xs subtle row" style={{ gap: 8 }}>
@@ -113,7 +109,7 @@ export function Skills() {
                           <span className="tnum">μ {mean.toFixed(2)}</span>
                         </div>
                       </div>
-                      <div className="heat-cells" role="presentation">
+                      <div className="heat-cells">
                         {d.skillIds.map((id) => {
                           const sk = skillOf.get(id);
                           const st = stateOf.get(id);
@@ -224,4 +220,3 @@ function SkillDetail({ skill, state, labs }: { skill: Skill; state: SkillState; 
     </Card>
   );
 }
-

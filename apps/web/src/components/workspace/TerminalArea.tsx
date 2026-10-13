@@ -138,40 +138,95 @@ interface AreaProps {
   onFocus: (paneId: string, tabId?: string) => void;
   onClose: (paneId: string, tabId: string) => void;
   onOpenConsole: (node: string, access?: AccessKind) => void;
+  /** Start a capture on a topology link (also reachable from the + menu, for keyboard and screen-reader users). */
+  onCapture?: (link: TopologyLink) => void;
   onSplit: () => void;
   ownsKey: (e: KeyboardEvent) => boolean;
 }
 
-export function TerminalArea({ lab, model, onFocus, onClose, onOpenConsole, onSplit, ownsKey }: AreaProps) {
+const nodeOf = (endpoint: string) => endpoint.split(':')[0]!;
+
+export function TerminalArea({ lab, model, onFocus, onClose, onOpenConsole, onCapture, onSplit, ownsKey }: AreaProps) {
   const accessPoints = lab.spec.topology.nodes.flatMap((n) => (n.access ?? []).map((a) => ({ node: n, access: a })));
+  const links = lab.spec.topology.links ?? [];
+  // The last console must stay open, so its close button is not offered.
+  const canClose = (pane: Pane) => !(model.panes.length === 1 && pane.tabs.length === 1);
+
+  const selectTab = (pane: Pane, tab: TermTab, list: HTMLElement | null, focusTerminal: boolean) => {
+    onFocus(pane.id, tab.id);
+    if (focusTerminal) focusActiveTerminal();
+    else requestAnimationFrame(() => list?.querySelector<HTMLElement>(`[role="tab"][data-tab="${tab.id}"]`)?.focus());
+  };
+
+  // Roving tabindex with arrow keys; Delete closes the current tab.
+  const onTablistKeyDown = (pane: Pane) => (e: React.KeyboardEvent<HTMLDivElement>) => {
+    if (!(e.target as HTMLElement).matches('[role="tab"]')) return;
+    const idx = Math.max(0, pane.tabs.findIndex((t) => t.id === pane.active));
+    const n = pane.tabs.length;
+    let next = -1;
+    if (e.key === 'ArrowRight') next = (idx + 1) % n;
+    else if (e.key === 'ArrowLeft') next = (idx - 1 + n) % n;
+    else if (e.key === 'Home') next = 0;
+    else if (e.key === 'End') next = n - 1;
+    else if (e.key === 'Delete') {
+      if (canClose(pane)) {
+        e.preventDefault();
+        onClose(pane.id, pane.active);
+      }
+      return;
+    } else return;
+    e.preventDefault();
+    const tab = pane.tabs[next];
+    if (tab) selectTab(pane, tab, e.currentTarget, false);
+  };
+
   return (
     <div className="termarea">
       <PanelGroup direction="horizontal" autoSaveId={undefined}>
         {model.panes.map((pane, i) => (
           <PaneSlot key={pane.id} id={pane.id} index={i}>
             <div className={cn('pane', model.activePane === pane.id && 'is-active')} onMouseDown={() => onFocus(pane.id)} onFocusCapture={() => model.activePane !== pane.id && onFocus(pane.id)}>
-              <div className="tabstrip" role="tablist" aria-label="Consoles">
+              <div className="tabstrip" role="tablist" aria-label="Consoles" onKeyDown={onTablistKeyDown(pane)}>
                 {pane.tabs.map((t, idx) => (
-                  <div key={t.id} role="tab" aria-selected={pane.active === t.id} tabIndex={pane.active === t.id ? 0 : -1} className={cn('tab', pane.active === t.id && 'is-active')} onClick={() => onFocus(pane.id, t.id)} onKeyDown={(e) => (e.key === 'Enter' || e.key === ' ') && onFocus(pane.id, t.id)} onAuxClick={(e) => e.button === 1 && onClose(pane.id, t.id)} title={t.source.kind === 'console' ? `${t.source.node.name} via ${t.source.access}${i === 0 && idx < 9 ? ` · Alt+${idx + 1}` : ''}` : t.title}>
+                  <div
+                    key={t.id}
+                    role="tab"
+                    data-tab={t.id}
+                    aria-selected={pane.active === t.id}
+                    tabIndex={pane.active === t.id ? 0 : -1}
+                    className={cn('tab', pane.active === t.id && 'is-active')}
+                    onClick={(e) => selectTab(pane, t, e.currentTarget.parentElement, true)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' || e.key === ' ') {
+                        e.preventDefault();
+                        selectTab(pane, t, null, true);
+                      }
+                    }}
+                    onAuxClick={(e) => e.button === 1 && canClose(pane) && onClose(pane.id, t.id)}
+                    title={t.source.kind === 'console' ? `${t.source.node.name} via ${t.source.access}${i === 0 && idx < 9 ? ` · Alt+${idx + 1}` : ''}` : t.title}
+                  >
                     {t.source.kind === 'console' ? <DriverIcon driver={t.source.node.driver} size={12} className="tab-icon" /> : <Activity size={12} className="tab-icon tab-icon-capture" />}
                     <span className="tab-title truncate">{t.title}</span>
-                    <button
-                      className="tab-close"
-                      aria-label={`Close ${t.title}`}
-                      tabIndex={-1}
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        onClose(pane.id, t.id);
-                      }}
-                    >
-                      <X size={11} />
-                    </button>
+                    {canClose(pane) && (
+                      <button
+                        className="tab-close"
+                        aria-label={`Close ${t.title}`}
+                        title="Close (Delete)"
+                        tabIndex={-1}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          onClose(pane.id, t.id);
+                        }}
+                      >
+                        <X size={11} />
+                      </button>
+                    )}
                   </div>
                 ))}
                 <Dropdown.Root>
-                  <Tooltip content="New console" shortcut="alt+t">
+                  <Tooltip content="New console" shortcut="mod+shift+o">
                     <Dropdown.Trigger asChild>
-                      <button className="tab-action" aria-label="Open console on a node">
+                      <button className="tab-action" aria-label="Open console on a node or capture on a link">
                         <Plus size={13} />
                       </button>
                     </Dropdown.Trigger>
@@ -191,11 +246,26 @@ export function TerminalArea({ lab, model, onFocus, onClose, onOpenConsole, onSp
                         <span className="xs subtle">{access}</span>
                       </Dropdown.Item>
                     ))}
+                    {onCapture && links.length > 0 && (
+                      <>
+                        <Dropdown.Separator />
+                        <Dropdown.Label>Capture on link</Dropdown.Label>
+                        {links.map((l, k) => (
+                          <Dropdown.Item key={`${l.a}--${l.b}-${k}`} onSelect={() => onCapture(l)}>
+                            <Activity size={13} className="muted" />
+                            <span className="mono grow">
+                              {nodeOf(l.a)} ↔ {nodeOf(l.b)}
+                            </span>
+                            {l.subnet && <span className="xs subtle mono">{l.subnet}</span>}
+                          </Dropdown.Item>
+                        ))}
+                      </>
+                    )}
                   </Dropdown.Content>
                 </Dropdown.Root>
                 <div className="grow" />
                 {i === model.panes.length - 1 && model.panes.length < 3 && (
-                  <Tooltip content="Split pane" shortcut="alt+d">
+                  <Tooltip content="Split pane" shortcut="mod+shift+d">
                     <button className="tab-action" aria-label="Split pane" onClick={onSplit}>
                       <Columns2 size={13} />
                     </button>

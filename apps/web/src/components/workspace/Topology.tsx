@@ -23,14 +23,36 @@ export interface TopologyCanvasProps {
   topology: Topology;
   nodeStates?: SessionNodeState[];
   readOnly?: boolean;
-  /** Small preview: hides link labels. */
+  /** Small preview: tighter layout, no link labels, and a zoom floor so node text stays legible. */
   compact?: boolean;
   onOpenNode?: (name: string, access: AccessKind) => void;
   onCapture?: (link: TopologyLink) => void;
   onImpair?: (link: TopologyLink) => void;
 }
 
-/** Layer nodes left-to-right from the entry node using BFS over links. */
+function nodeSubtitle(node: TopologyNode): string {
+  if (node.driver === 'k8s-cluster') {
+    return node.cluster?.nodes ? `${node.cluster.nodes.length} nodes · ${node.cluster.mode ?? 'kubeadm'} ${node.cluster.version ?? ''}` : `${node.cluster?.mode ?? 'virtual'} ${node.cluster?.version ?? ''}`;
+  }
+  return node.image ?? node.driver;
+}
+
+/* Approximate glyph widths for the fonts used on the canvas (nodes are not measured before layout). */
+const NAME_PX = 7.6; // JetBrains Mono 12.5px, weight 500
+const SUB_PX = 5.7; // Inter 10.5px
+const LABEL_PX = 6.1; // JetBrains Mono 10px edge labels
+
+function estimateNodeWidth(node: TopologyNode, compact: boolean): number {
+  const name = node.name.length * NAME_PX + 14; // status dot + gap
+  const sub = nodeSubtitle(node).length * SUB_PX;
+  // padding 10 + icon 28 + gap 10 + text + padding 12 + border 2
+  return Math.max(compact ? 148 : 168, 62 + Math.max(name, sub));
+}
+
+/**
+ * Layer nodes left-to-right from the entry node using BFS over links. The column pitch is the
+ * widest node plus room for the longest link label, so labels never sit on a node border.
+ */
 function layout(topology: Topology, compact: boolean): Map<string, { x: number; y: number }> {
   const adj = new Map<string, Set<string>>();
   for (const n of topology.nodes) adj.set(n.name, new Set());
@@ -66,7 +88,10 @@ function layout(topology: Topology, compact: boolean): Map<string, { x: number; 
     byLayer.set(d, [...(byLayer.get(d) ?? []), n.name]);
   }
   const pos = new Map<string, { x: number; y: number }>();
-  const colW = compact ? 232 : 272;
+  const maxNodeW = Math.max(0, ...topology.nodes.map((n) => estimateNodeWidth(n, compact)));
+  const labelW = compact ? 0 : Math.max(0, ...(topology.links ?? []).map((l) => (l.subnet?.length ?? 0) * LABEL_PX + 12));
+  const gap = Math.max(compact ? 36 : 56, labelW + 28);
+  const colW = maxNodeW + gap;
   const rowH = compact ? 76 : 92;
   const maxRows = Math.max(...Array.from(byLayer.values()).map((v) => v.length));
   for (const [d, names] of byLayer) {
@@ -80,12 +105,7 @@ function layout(topology: Topology, compact: boolean): Map<string, { x: number; 
 
 const TopoNode = memo(function TopoNode({ data, selected }: NodeProps<Node<NodeData>>) {
   const { node, status, isEntry, readOnly, onOpen } = data;
-  const sub =
-    node.driver === 'k8s-cluster'
-      ? node.cluster?.nodes
-        ? `${node.cluster.nodes.length} nodes · ${node.cluster.mode ?? 'kubeadm'} ${node.cluster.version ?? ''}`
-        : `${node.cluster?.mode ?? 'virtual'} ${node.cluster?.version ?? ''}`
-      : node.image ?? node.driver;
+  const sub = nodeSubtitle(node);
   const primaryAccess = node.access?.[0];
   return (
     <div
@@ -125,21 +145,31 @@ const TopoNode = memo(function TopoNode({ data, selected }: NodeProps<Node<NodeD
 const nodeTypes: NodeTypes = { topo: TopoNode };
 
 /** Re-fit whenever the canvas is resized (panels, collapse, window) or the topology changes. */
-function AutoFit({ padding, topologyKey }: { padding: number; topologyKey: unknown }) {
+function AutoFit({ padding, minZoom, topologyKey }: { padding: number; minZoom: number; topologyKey: unknown }) {
   const { fitView } = useReactFlow();
   const width = useStore((s) => s.width);
   const height = useStore((s) => s.height);
   useEffect(() => {
     if (!width || !height) return;
-    const id = requestAnimationFrame(() => void fitView({ padding, maxZoom: 1, duration: 0 }));
+    const id = requestAnimationFrame(() => void fitView({ padding, minZoom, maxZoom: 1, duration: 0 }));
     return () => cancelAnimationFrame(id);
-  }, [width, height, padding, topologyKey, fitView]);
+  }, [width, height, padding, minZoom, topologyKey, fitView]);
   return null;
 }
 
+interface LinkMenu {
+  x: number;
+  y: number;
+  link: TopologyLink;
+  /** Element to refocus when the menu closes from the keyboard. */
+  returnTo?: HTMLElement | null;
+}
+
 export function TopologyCanvas({ topology, nodeStates, readOnly, compact, onOpenNode, onCapture, onImpair }: TopologyCanvasProps) {
-  const positions = useMemo(() => layout(topology, !!readOnly), [topology, readOnly]);
+  const positions = useMemo(() => layout(topology, !!compact), [topology, compact]);
   const stateOf = useMemo(() => new Map(nodeStates?.map((s) => [s.name, s]) ?? []), [nodeStates]);
+  // A compact preview must not shrink below a legible size; the canvas pans instead.
+  const minZoom = compact ? 0.6 : readOnly ? 0.35 : 0.4;
 
   const computedNodes = useMemo<Node<NodeData>[]>(
     () =>
@@ -179,35 +209,69 @@ export function TopologyCanvas({ topology, nodeStates, readOnly, compact, onOpen
           source: a,
           target: b,
           type: 'default',
-          label: l.subnet,
+          label: compact ? undefined : l.subnet,
           className: cn('topo-edge', impaired && 'topo-edge-impaired'),
           data: { link: l },
-          focusable: false,
+          // Links are keyboard-reachable in a live workspace: Enter or Shift+F10 opens the capture menu.
+          focusable: !readOnly,
           selectable: !readOnly,
+          ariaLabel: `Link ${a} to ${b}${l.subnet ? `, ${l.subnet}` : ''}${impaired ? ', impaired' : ''}${readOnly ? '' : '. Press Enter to capture or impair.'}`,
         };
       }),
-    [topology, readOnly],
+    [topology, readOnly, compact],
   );
 
-  const [menu, setMenu] = useState<{ x: number; y: number; link: TopologyLink } | null>(null);
+  const [menu, setMenu] = useState<LinkMenu | null>(null);
   const wrap = useRef<HTMLDivElement>(null);
 
+  const openMenuFor = useCallback(
+    (edgeEl: HTMLElement, pointer?: { x: number; y: number }) => {
+      const rect = wrap.current?.getBoundingClientRect();
+      const edge = edges.find((x) => x.id === edgeEl.dataset.id);
+      const link = edge?.data?.link;
+      if (!link || !rect) return;
+      const er = edgeEl.getBoundingClientRect();
+      const at = pointer ?? { x: er.left + er.width / 2, y: er.top + er.height / 2 };
+      setMenu({ x: at.x - rect.left, y: at.y - rect.top, link, returnTo: pointer ? null : edgeEl });
+    },
+    [edges],
+  );
+
   const onEdgeContextMenu = useCallback(
-    (e: React.MouseEvent, edge: Edge) => {
+    (e: React.MouseEvent) => {
       if (readOnly) return;
       e.preventDefault();
-      const rect = wrap.current?.getBoundingClientRect();
-      const link = (edge.data as EdgeData | undefined)?.link;
-      if (!link || !rect) return;
-      setMenu({ x: e.clientX - rect.left, y: e.clientY - rect.top, link });
+      const edgeEl = (e.target as Element).closest<HTMLElement>('.react-flow__edge');
+      if (!edgeEl) return;
+      // A contextmenu raised from the keyboard carries no useful pointer position.
+      const fromPointer = e.clientX || e.clientY ? { x: e.clientX, y: e.clientY } : undefined;
+      openMenuFor(edgeEl, fromPointer);
     },
-    [readOnly],
+    [readOnly, openMenuFor],
+  );
+
+  const onCanvasKeyDown = useCallback(
+    (e: React.KeyboardEvent) => {
+      if (readOnly) return;
+      const edgeEl = (e.target as Element).closest<HTMLElement>('.react-flow__edge');
+      if (!edgeEl) return;
+      if (e.key === 'Enter' || e.key === ' ' || e.key === 'ContextMenu' || (e.key === 'F10' && e.shiftKey)) {
+        e.preventDefault();
+        e.stopPropagation();
+        openMenuFor(edgeEl);
+      }
+    },
+    [readOnly, openMenuFor],
   );
 
   useEffect(() => {
     if (!menu) return;
     const close = () => setMenu(null);
-    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && close();
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return;
+      close();
+      menu.returnTo?.focus();
+    };
     window.addEventListener('click', close);
     window.addEventListener('keydown', onKey);
     return () => {
@@ -217,15 +281,15 @@ export function TopologyCanvas({ topology, nodeStates, readOnly, compact, onOpen
   }, [menu]);
 
   return (
-    <div ref={wrap} className={cn('topo', readOnly && 'topo-readonly', compact && 'topo-compact')}>
+    <div ref={wrap} className={cn('topo', readOnly && 'topo-readonly', compact && 'topo-compact')} onKeyDown={onCanvasKeyDown}>
       <ReactFlow<Node<NodeData>, Edge<EdgeData>>
         nodes={nodes}
         onNodesChange={onNodesChange}
         edges={edges}
         nodeTypes={nodeTypes}
         fitView
-        fitViewOptions={{ padding: readOnly ? 0.25 : 0.3, maxZoom: 1 }}
-        minZoom={readOnly ? 0.3 : 0.4}
+        fitViewOptions={{ padding: readOnly ? 0.25 : 0.3, minZoom, maxZoom: 1 }}
+        minZoom={minZoom}
         maxZoom={1.6}
         panOnScroll
         zoomOnScroll={false}
@@ -240,10 +304,10 @@ export function TopologyCanvas({ topology, nodeStates, readOnly, compact, onOpen
         defaultEdgeOptions={{ type: 'default' }}
       >
         <Background variant={BackgroundVariant.Dots} gap={18} size={1} color="var(--fg-faint)" />
-        <AutoFit padding={readOnly ? 0.2 : 0.3} topologyKey={topology} />
+        <AutoFit padding={readOnly ? 0.2 : 0.3} minZoom={minZoom} topologyKey={topology} />
       </ReactFlow>
       {menu && (
-        <div className="menu topo-menu" role="menu" style={{ left: menu.x, top: menu.y }} onClick={(e) => e.stopPropagation()}>
+        <div className="menu topo-menu" role="menu" aria-label={`Link ${menu.link.a} to ${menu.link.b}`} style={{ left: menu.x, top: menu.y }} onClick={(e) => e.stopPropagation()}>
           <div className="menu-label mono" style={{ textTransform: 'none', letterSpacing: 0 }}>
             {menu.link.a} ↔ {menu.link.b}
           </div>
@@ -254,6 +318,7 @@ export function TopologyCanvas({ topology, nodeStates, readOnly, compact, onOpen
             onClick={() => {
               onCapture?.(menu.link);
               setMenu(null);
+              menu.returnTo?.focus();
             }}
           >
             <Activity size={14} /> Capture on this link
@@ -264,6 +329,7 @@ export function TopologyCanvas({ topology, nodeStates, readOnly, compact, onOpen
             onClick={() => {
               onImpair?.(menu.link);
               setMenu(null);
+              menu.returnTo?.focus();
             }}
           >
             <Gauge size={14} /> Impair (latency, loss)…

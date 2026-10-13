@@ -1,17 +1,19 @@
 import { Link } from '@tanstack/react-router';
 import { ChevronLeft, Clock, Lightbulb, Play, Tag } from 'lucide-react';
-import { useCatalog, useLab } from '@/api/client';
+import { useCatalog, useLab, useSkills } from '@/api/client';
 import { DifficultyBadge, DomainIcon, DriverIcon, SkillTags, domainLabel, driverLabel } from '@/components/domain';
 import { Prose } from '@/components/prose';
 import { Badge, Card, ErrorState, PageSkeleton, Stat } from '@/components/ui';
 import { TopologyCanvas } from '@/components/workspace/Topology';
 import { labRoute } from '@/router';
+import { frameworkDomainLabel } from '@/lib/readiness';
 import { formatMinutes, titleCase } from '@/lib/utils';
 
 export function LabOverview() {
   const { labId } = labRoute.useParams();
   const lab = useLab(labId);
   const catalog = useCatalog();
+  const skills = useSkills();
 
   if (lab.isPending) {
     return (
@@ -56,8 +58,8 @@ export function LabOverview() {
           <h1>{metadata.title}</h1>
           <div className="row" style={{ gap: 6, marginTop: 10, flexWrap: 'wrap' }}>
             {metadata.frameworks?.map((f) => (
-              <Badge key={f} tone="outline" className="mono">
-                {f}
+              <Badge key={f} tone="outline" title={f}>
+                {frameworkDomainLabel(f, skills.data?.frameworks)}
               </Badge>
             ))}
             {metadata.tags?.map((t) => (

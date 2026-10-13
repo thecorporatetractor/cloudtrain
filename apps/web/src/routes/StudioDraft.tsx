@@ -4,6 +4,7 @@ import { Check, ChevronDown, ChevronLeft, CircleDashed, Loader2, Minus, Rocket, 
 import type { ReactNode } from 'react';
 import { useDraft, useDraftAction } from '@/api/client';
 import type { GateStatus, VerificationGate } from '@/api/types';
+import { RequireRole } from '@/app/access';
 import { useShell } from '@/app/shell-context';
 import { DifficultyBadge, DomainIcon, DriverIcon, SkillTags, domainLabel } from '@/components/domain';
 import { Prose } from '@/components/prose';
@@ -14,6 +15,14 @@ import { cn, formatDuration, formatMinutes, relativeTime } from '@/lib/utils';
 import { STAGES } from './Studio';
 
 export function StudioDraft() {
+  return (
+    <RequireRole path="/studio">
+      <StudioDraftScreen />
+    </RequireRole>
+  );
+}
+
+function StudioDraftScreen() {
   const { draftId } = studioDraftRoute.useParams();
   const draft = useDraft(draftId);
   const act = useDraftAction(draftId);
@@ -174,7 +183,7 @@ export function StudioDraft() {
                   <div className="xs subtle" style={{ marginBottom: 6 }}>
                     Topology
                   </div>
-                  <div style={{ height: 160, border: '1px solid var(--border)', borderRadius: 'var(--r-md)', overflow: 'hidden' }}>
+                  <div style={{ height: 210, border: '1px solid var(--border)', borderRadius: 'var(--r-md)', overflow: 'hidden' }}>
                     <TopologyCanvas topology={spec.spec.topology} readOnly compact />
                   </div>
                   <ul className="node-list" style={{ borderTop: 0 }}>

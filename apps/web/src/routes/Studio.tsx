@@ -1,8 +1,9 @@
 import { Link, useNavigate } from '@tanstack/react-router';
-import { ArrowRight, Sparkles, WandSparkles } from 'lucide-react';
+import { ArrowRight, CircleDashed, Sparkles, WandSparkles } from 'lucide-react';
 import { useState } from 'react';
 import { useCreateDraft, useDrafts } from '@/api/client';
 import type { StudioDraft } from '@/api/types';
+import { RequireRole } from '@/app/access';
 import { DomainIcon } from '@/components/domain';
 import { Badge, Button, Card, EmptyState, ErrorState, PageSkeleton } from '@/components/ui';
 import { cn, relativeTime } from '@/lib/utils';
@@ -23,6 +24,14 @@ const EXAMPLES = [
 ];
 
 export function Studio() {
+  return (
+    <RequireRole path="/studio">
+      <StudioScreen />
+    </RequireRole>
+  );
+}
+
+function StudioScreen() {
   const drafts = useDrafts();
   const create = useCreateDraft();
   const navigate = useNavigate();
@@ -100,7 +109,9 @@ export function Studio() {
                   <Link to="/studio/$draftId" params={{ draftId: d.id }} className="draft-row">
                     <span className="stack grow" style={{ gap: 4, minWidth: 0 }}>
                       <span className="row" style={{ gap: 8 }}>
-                        {d.spec && <DomainIcon domain={d.spec.metadata.domain} size={13} className="subtle" />}
+                        <span className="draft-icon" aria-hidden>
+                          {d.spec ? <DomainIcon domain={d.spec.metadata.domain} size={13} /> : <CircleDashed size={13} />}
+                        </span>
                         <span className="truncate" style={{ fontWeight: 500 }}>
                           {d.title}
                         </span>

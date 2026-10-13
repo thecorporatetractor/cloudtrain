@@ -51,6 +51,8 @@ export interface SkillsData {
   skills: Skill[];
   states: SkillState[];
   frameworks: Framework[];
+  /** Present when the states belong to another team member (manager view). */
+  member?: { id: string; name: string; title: string };
 }
 
 export const queries = {
@@ -65,7 +67,12 @@ export const queries = {
       enabled: !!id,
       refetchInterval: (q) => (q.state.data?.nodes.some((n) => n.status === 'provisioning') ? 1000 : false),
     }),
-  skills: () => queryOptions({ queryKey: ['skills'], queryFn: () => request<SkillsData>('/api/skills'), staleTime: 60_000 }),
+  skills: (member?: string) =>
+    queryOptions({
+      queryKey: member ? ['skills', member] : ['skills'],
+      queryFn: () => request<SkillsData>(member ? `/api/skills?member=${encodeURIComponent(member)}` : '/api/skills'),
+      staleTime: 60_000,
+    }),
   team: () => queryOptions({ queryKey: ['team'], queryFn: () => request<TeamData>('/api/team') }),
   drafts: () =>
     queryOptions({
@@ -86,7 +93,7 @@ export const useHome = () => useQuery(queries.home());
 export const useCatalog = () => useQuery(queries.catalog());
 export const useLab = (id: string) => useQuery(queries.lab(id));
 export const useSession = (id: string | undefined) => useQuery(queries.session(id));
-export const useSkills = () => useQuery(queries.skills());
+export const useSkills = (member?: string) => useQuery(queries.skills(member));
 export const useTeam = () => useQuery(queries.team());
 export const useDrafts = () => useQuery(queries.drafts());
 export const useDraft = (id: string) => useQuery(queries.draft(id));

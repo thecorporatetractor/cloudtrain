@@ -6,6 +6,7 @@ import { Button, Dot, Dropdown, Kbd, Tooltip } from '@/components/ui';
 import { useHotkeys, type Hotkey } from '@/lib/hotkeys';
 import { THEMES, useTheme, type Theme } from '@/lib/theme';
 import { cn } from '@/lib/utils';
+import { canAccess } from './access';
 import { CommandPalette } from './CommandPalette';
 import { ShellProvider, useShell } from './shell-context';
 import { ShortcutsDialog } from './ShortcutsDialog';
@@ -23,12 +24,13 @@ interface NavLinkProps {
   'aria-current'?: 'page';
   children: ReactNode;
 }
-const NAV: { to: string; label: string; icon: ReactNode; keys: string; roles?: Array<'manager' | 'admin'>; link: (p: NavLinkProps) => ReactNode }[] = [
+/** Role gating lives in ROUTE_ROLES (app/access.tsx) and applies to nav, palette, hotkeys and the routes alike. */
+const NAV: { to: string; label: string; icon: ReactNode; keys: string; link: (p: NavLinkProps) => ReactNode }[] = [
   { to: '/', label: 'Home', icon: <HomeIcon size={16} />, keys: 'g h', link: (p) => <Link to="/" {...p} /> },
   { to: '/catalog', label: 'Catalog', icon: <BookOpen size={16} />, keys: 'g c', link: (p) => <Link to="/catalog" search={{}} {...p} /> },
   { to: '/skills', label: 'Skills', icon: <Waypoints size={16} />, keys: 'g s', link: (p) => <Link to="/skills" search={{ framework: 'cks' }} {...p} /> },
-  { to: '/team', label: 'Team', icon: <Users size={16} />, keys: 'g t', roles: ['manager', 'admin'], link: (p) => <Link to="/team" {...p} /> },
-  { to: '/studio', label: 'Scenario Studio', icon: <FlaskConical size={16} />, keys: 'g a', roles: ['admin'], link: (p) => <Link to="/studio" {...p} /> },
+  { to: '/team', label: 'Team', icon: <Users size={16} />, keys: 'g t', link: (p) => <Link to="/team" {...p} /> },
+  { to: '/studio', label: 'Scenario Studio', icon: <FlaskConical size={16} />, keys: 'g a', link: (p) => <Link to="/studio" {...p} /> },
 ];
 
 const themeIcon: Record<Theme, ReactNode> = { dark: <Moon size={14} />, light: <Sun size={14} />, cream: <Sunset size={14} /> };
@@ -48,22 +50,23 @@ function ShellInner() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [inWorkspace, shell.chromeless, shell.navCollapsed]);
 
+  const role = me.data?.role;
   const hotkeys: Hotkey[] = [
-    { keys: 'mod+k', description: 'Open command palette', group: 'Global', handler: () => shell.setPaletteOpen(true) },
+    // Ctrl+K and Ctrl+/ mean kill-line and undo in a shell, so they stay with the terminal there.
+    { keys: 'mod+k', description: 'Open command palette', group: 'Global', skipTerminal: true, handler: () => shell.setPaletteOpen(true) },
     { keys: '?', description: 'Keyboard shortcuts', group: 'Global', handler: () => shell.setShortcutsOpen(true) },
-    { keys: 'mod+/', description: 'Keyboard shortcuts', group: 'Global', handler: () => shell.setShortcutsOpen(true) },
+    { keys: 'mod+/', description: 'Keyboard shortcuts', group: 'Global', skipTerminal: true, handler: () => shell.setShortcutsOpen(true) },
     { keys: 'mod+shift+l', description: 'Cycle theme', group: 'Global', handler: cycle },
     { keys: '[', description: 'Collapse or expand navigation', group: 'Global', handler: () => !inWorkspace && shell.toggleNavCollapsed() },
     { keys: 'g h', description: 'Go to home', group: 'Navigate', handler: () => void navigate({ to: '/' }) },
     { keys: 'g c', description: 'Go to catalog', group: 'Navigate', handler: () => void navigate({ to: '/catalog', search: {} }) },
     { keys: 'g s', description: 'Go to skills', group: 'Navigate', handler: () => void navigate({ to: '/skills', search: { framework: 'cks' } }) },
-    { keys: 'g t', description: 'Go to team', group: 'Navigate', handler: () => void navigate({ to: '/team' }) },
-    { keys: 'g a', description: 'Go to Scenario Studio', group: 'Navigate', handler: () => void navigate({ to: '/studio' }) },
+    ...(canAccess(role, '/team') ? [{ keys: 'g t', description: 'Go to team', group: 'Navigate', handler: () => void navigate({ to: '/team' }) }] : []),
+    ...(canAccess(role, '/studio') ? [{ keys: 'g a', description: 'Go to Scenario Studio', group: 'Navigate', handler: () => void navigate({ to: '/studio' }) }] : []),
   ];
   useHotkeys(hotkeys);
 
-  const role = me.data?.role ?? 'learner';
-  const visibleNav = NAV.filter((n) => !n.roles || n.roles.includes(role as 'manager' | 'admin'));
+  const visibleNav = NAV.filter((n) => canAccess(role, n.to));
   const navMode = shell.navMode;
 
   return (
@@ -225,9 +228,9 @@ function ShellInner() {
 
 function Toasts() {
   const { toasts, dismissToast } = useShell();
-  if (!toasts.length) return null;
+  // The live region is always in the tree; only its children change, so screen readers announce new toasts.
   return (
-    <div className="toasts" role="status" aria-live="polite">
+    <div className="toasts" role="status" aria-live="polite" aria-relevant="additions">
       {toasts.map((t) => (
         <div key={t.id} className={cn('toast', `toast-${t.tone}`)}>
           <Dot tone={t.tone} />

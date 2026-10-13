@@ -1,7 +1,7 @@
 import type { CSSProperties, ReactNode } from 'react';
 import { cn } from '@/lib/utils';
 
-/** Circular progress. Monotone: track in surface, fill in accent or a status tone. */
+/** Circular progress. Monotone: track in surface, fill from the neutral ramp or a status tone. */
 export function Ring({ value, size = 64, stroke = 5, tone = 'accent', children, label }: { value: number; size?: number; stroke?: number; tone?: 'accent' | 'ok' | 'warn' | 'err' | 'neutral'; children?: ReactNode; label?: string }) {
   const v = Math.max(0, Math.min(1, value));
   const r = (size - stroke) / 2;
@@ -15,7 +15,7 @@ export function Ring({ value, size = 64, stroke = 5, tone = 'accent', children, 
           cy={size / 2}
           r={r}
           fill="none"
-          stroke={tone === 'accent' ? 'var(--accent)' : tone === 'neutral' ? 'var(--fg-subtle)' : `var(--${tone})`}
+          stroke={tone === 'accent' ? 'var(--ink)' : tone === 'neutral' ? 'var(--fg-subtle)' : `var(--${tone})`}
           strokeWidth={stroke}
           strokeLinecap="round"
           strokeDasharray={`${c * v} ${c}`}
@@ -29,20 +29,31 @@ export function Ring({ value, size = 64, stroke = 5, tone = 'accent', children, 
 }
 
 /**
- * Heat cell: fill opacity encodes mastery, a dashed ring encodes uncertainty.
- * Uses the accent only; status colours stay reserved for meaning.
+ * Opacity of the neutral ink laid over the cell for a mastery value.
+ *
+ * Two segments with a step at 0.5: below it the cell stays light enough for the
+ * normal text colour, above it the cell is dark enough for inverted text. A single
+ * linear ramp would pass through a band where neither text colour reaches 4.5:1.
+ */
+export function heatAlpha(v: number): number {
+  return v > 0.5 ? 0.72 + (v - 0.5) * 0.5 : 0.06 + v * 0.6;
+}
+
+/**
+ * Heat cell: ink opacity encodes mastery, a dashed ring encodes uncertainty.
+ * Drawn from the neutral ramp only; status colours stay reserved for meaning.
  */
 export function HeatCell({ value, sigma, children, className, style, onClick, selected, title, ...rest }: { value: number; sigma?: number; children?: ReactNode; className?: string; style?: CSSProperties; onClick?: () => void; selected?: boolean; title?: string; 'aria-label'?: string }) {
   const v = Math.max(0, Math.min(1, value));
-  const alpha = 0.08 + v * 0.8;
+  const strong = v > 0.5;
   const inner = (
     <>
-      <span className="heat-fill" style={{ opacity: alpha }} aria-hidden />
+      <span className="heat-fill" style={{ opacity: heatAlpha(v) }} aria-hidden />
       {sigma !== undefined && sigma > 0.18 && <span className={cn('heat-uncertain', sigma > 0.3 && 'heat-uncertain-high')} aria-hidden />}
       <span className="heat-content">{children}</span>
     </>
   );
-  const cls = cn('heat', v > 0.55 && 'heat-dark', selected && 'is-selected', onClick && 'heat-click', className);
+  const cls = cn('heat', strong && 'heat-strong', selected && 'is-selected', onClick && 'heat-click', className);
   if (onClick) {
     return (
       <button type="button" className={cls} style={style} onClick={onClick} title={title} aria-pressed={selected} {...rest}>

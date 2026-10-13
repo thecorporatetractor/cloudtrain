@@ -6,6 +6,7 @@ import type { Activity, LabSummary, Recommendation } from '@/api/types';
 import { Bar, Delta, Ring } from '@/components/charts';
 import { DifficultyBadge, DomainIcon, ReasonList, domainLabel } from '@/components/domain';
 import { Badge, Card, ErrorState, PageSkeleton, Stat } from '@/components/ui';
+import { frameworkDomainLabel } from '@/lib/readiness';
 import { daysUntil, formatDate, formatMinutes, pct, relativeTime } from '@/lib/utils';
 
 export function Home() {
@@ -172,6 +173,7 @@ export function Home() {
 }
 
 function HeroRecommendation({ rec, lab }: { rec: Recommendation; lab: LabSummary | undefined }) {
+  const frameworks = useSkills().data?.frameworks;
   if (!lab) return null;
   const resume = lab.completion === 'in-progress';
   return (
@@ -184,8 +186,8 @@ function HeroRecommendation({ rec, lab }: { rec: Recommendation; lab: LabSummary
           <DifficultyBadge difficulty={lab.difficulty} />
           <span>{formatMinutes(lab.estimatedMinutes)}</span>
           {lab.frameworks?.map((f) => (
-            <span key={f} className="mono">
-              {f}
+            <span key={f} title={f}>
+              {frameworkDomainLabel(f, frameworks)}
             </span>
           ))}
         </div>

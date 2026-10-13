@@ -5,6 +5,7 @@ import type { CheckResult, Lab, LabSession } from '@/api/types';
 import { SkillTags } from '@/components/domain';
 import { Prose } from '@/components/prose';
 import { Badge, Button } from '@/components/ui';
+import { percentages } from '@/lib/readiness';
 import { cn } from '@/lib/utils';
 
 interface Props {
@@ -26,7 +27,8 @@ export function TaskPanel({ lab, session, validating, onRevealHint, revealing }:
   const { spec } = lab;
   const results = new Map(session?.results.map((r) => [r.checkId, r]) ?? []);
   const passed = spec.checks.filter((c) => results.get(c.id)?.status === 'pass').length;
-  const totalWeight = spec.checks.reduce((a, c) => a + (c.weight ?? 1), 0);
+  // Largest-remainder rounding so the shares add up to exactly 100%.
+  const weightPct = percentages(spec.checks.map((c) => c.weight ?? 1));
 
   return (
     <div className="task">
@@ -56,7 +58,7 @@ export function TaskPanel({ lab, session, validating, onRevealHint, revealing }:
           </span>
         </div>
         <ul className="checks">
-          {spec.checks.map((c) => {
+          {spec.checks.map((c, i) => {
             const r = results.get(c.id);
             const status = validating ? 'running' : (r?.status ?? 'pending');
             return (
@@ -69,7 +71,7 @@ export function TaskPanel({ lab, session, validating, onRevealHint, revealing }:
                       </span>
                       <span className="check-desc grow">{c.description}</span>
                       <span className="xs subtle tnum" title="weight">
-                        {Math.round(((c.weight ?? 1) / totalWeight) * 100)}%
+                        {weightPct[i]}%
                       </span>
                       <ChevronDown size={13} className="check-chev subtle" aria-hidden />
                     </button>

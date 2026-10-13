@@ -1,17 +1,31 @@
 import { Link } from '@tanstack/react-router';
-import { AlertTriangle, CalendarClock, Users } from 'lucide-react';
-import { useMemo } from 'react';
+import { AlertTriangle, CalendarClock, Check, Users } from 'lucide-react';
+import { useMemo, useState } from 'react';
 import { useSkills, useTeam } from '@/api/client';
-import type { TeamMember } from '@/api/types';
+import type { TeamMember, Workshop } from '@/api/types';
+import { RequireRole } from '@/app/access';
+import { useShell } from '@/app/shell-context';
 import { HeatCell } from '@/components/charts';
 import { DomainIcon } from '@/components/domain';
 import { initials } from '@/app/Shell';
-import { Badge, Card, ErrorState, PageSkeleton, Stat, Tooltip } from '@/components/ui';
+import { Badge, Button, Card, ErrorState, PageSkeleton, Stat, Tooltip } from '@/components/ui';
 import { cn, daysUntil, formatDate, formatMinutes, pct } from '@/lib/utils';
 
 export function Team() {
+  return (
+    <RequireRole path="/team">
+      <TeamScreen />
+    </RequireRole>
+  );
+}
+
+function TeamScreen() {
   const team = useTeam();
   const skills = useSkills();
+  const { toast } = useShell();
+  // Workshop actions are mock-only until the scheduling service exists: they update local state.
+  const [dismissed, setDismissed] = useState<Set<string>>(() => new Set());
+  const [scheduled, setScheduled] = useState<Map<string, string>>(() => new Map());
 
   const stats = useMemo(() => {
     if (!team.data) return null;
@@ -43,6 +57,17 @@ export function Team() {
   }
   const { team: t, members, competencies, workshops } = team.data;
   const frameworkName = (id: string) => skills.data?.frameworks.find((f) => f.id === id)?.name ?? id.toUpperCase();
+  const visibleWorkshops = workshops.filter((w) => !dismissed.has(w.id));
+
+  const schedule = (w: Workshop) => {
+    const when = new Date(Date.now() + 7 * 86_400_000);
+    setScheduled((m) => new Map(m).set(w.id, when.toISOString()));
+    toast({ title: 'Workshop scheduled', description: `${w.title} · ${formatDate(when.toISOString())} · ${w.memberIds.length} invited`, tone: 'ok' });
+  };
+  const dismiss = (w: Workshop) => {
+    setDismissed((s) => new Set(s).add(w.id));
+    toast({ title: 'Suggestion dismissed', description: 'It will come back if the gap persists next week.', tone: 'neutral' });
+  };
 
   return (
     <div className="page page-wide">
@@ -67,7 +92,7 @@ export function Team() {
           <span className="subtle xs">Mean mastery per competency; click a name to open their skills</span>
         </div>
         <div className="team-heat-wrap">
-          <table className="team-heat" role="grid">
+          <table className="team-heat">
             <thead>
               <tr>
                 <th scope="col" className="team-heat-corner">
@@ -76,7 +101,7 @@ export function Team() {
                 {competencies.map((c) => (
                   <th key={c.id} scope="col">
                     <Tooltip content={`${c.name} · ${c.domain}`} side="top">
-                      <span className="team-heat-col">
+                      <span className="team-heat-col" lang="en">
                         <DomainIcon domain={c.domain} size={11} />
                         <span className="truncate">{c.name}</span>
                       </span>
@@ -166,57 +191,78 @@ export function Team() {
             <h2>Suggested workshops</h2>
             <span className="subtle xs">generated from gaps × deadlines</span>
           </div>
-          <ul className="workshop-list">
-            {workshops.map((w) => {
-              const comp = competencies.find((c) => c.id === w.competencyId);
-              return (
-                <li key={w.id} className="workshop">
-                  <div className="row-between" style={{ alignItems: 'flex-start' }}>
-                    <div className="stack" style={{ gap: 3 }}>
-                      <h3>{w.title}</h3>
-                      <div className="xs subtle row" style={{ gap: 8 }}>
-                        {comp && (
+          {visibleWorkshops.length === 0 ? (
+            <p className="small muted" style={{ padding: '16px 20px' }}>
+              Nothing suggested right now. Suggestions return when a gap and a deadline line up.
+            </p>
+          ) : (
+            <ul className="workshop-list">
+              {visibleWorkshops.map((w) => {
+                const comp = competencies.find((c) => c.id === w.competencyId);
+                const bookedAt = scheduled.get(w.id);
+                return (
+                  <li key={w.id} className="workshop">
+                    <div className="row-between" style={{ alignItems: 'flex-start' }}>
+                      <div className="stack" style={{ gap: 3 }}>
+                        <h3>{w.title}</h3>
+                        <div className="xs subtle row" style={{ gap: 8 }}>
+                          {comp && (
+                            <span className="row" style={{ gap: 4 }}>
+                              <DomainIcon domain={comp.domain} size={11} /> {comp.name}
+                            </span>
+                          )}
+                          <span>{formatMinutes(w.durationMinutes)}</span>
                           <span className="row" style={{ gap: 4 }}>
-                            <DomainIcon domain={comp.domain} size={11} /> {comp.name}
+                            <Users size={11} /> {w.memberIds.length}
                           </span>
-                        )}
-                        <span>{formatMinutes(w.durationMinutes)}</span>
-                        <span className="row" style={{ gap: 4 }}>
-                          <Users size={11} /> {w.memberIds.length}
-                        </span>
+                        </div>
+                      </div>
+                      <div className="avatar-stack" aria-label={`${w.memberIds.length} attendees`}>
+                        {w.memberIds.slice(0, 5).map((id) => {
+                          const m = members.find((x) => x.id === id);
+                          return (
+                            <span key={id} className="avatar" title={m?.name}>
+                              {initials(m?.name ?? '')}
+                            </span>
+                          );
+                        })}
                       </div>
                     </div>
-                    <div className="avatar-stack" aria-label={`${w.memberIds.length} attendees`}>
-                      {w.memberIds.slice(0, 5).map((id) => {
-                        const m = members.find((x) => x.id === id);
-                        return (
-                          <span key={id} className="avatar" title={m?.name}>
-                            {initials(m?.name ?? '')}
-                          </span>
-                        );
-                      })}
+                    <p className="small muted" style={{ marginTop: 8 }}>
+                      {w.reason}
+                    </p>
+                    <div className="row" style={{ gap: 8, marginTop: 10 }}>
+                      {bookedAt ? (
+                        <Badge tone="ok">
+                          <Check size={10} /> Scheduled for {formatDate(bookedAt)}
+                        </Badge>
+                      ) : (
+                        <>
+                          <Button variant="secondary" size="sm" onClick={() => schedule(w)}>
+                            Schedule
+                          </Button>
+                          <Button variant="ghost" size="sm" onClick={() => dismiss(w)}>
+                            Dismiss
+                          </Button>
+                        </>
+                      )}
                     </div>
-                  </div>
-                  <p className="small muted" style={{ marginTop: 8 }}>
-                    {w.reason}
-                  </p>
-                  <div className="row" style={{ gap: 8, marginTop: 10 }}>
-                    <button className="btn btn-secondary btn-sm">Schedule</button>
-                    <button className="btn btn-ghost btn-sm">Dismiss</button>
-                  </div>
-                </li>
-              );
-            })}
-          </ul>
+                  </li>
+                );
+              })}
+            </ul>
+          )}
         </Card>
       </div>
     </div>
   );
 }
 
+const roundHours = (minutes: number) => `${Math.round(minutes / 60)}h`;
+
 function MemberCell({ m }: { m: TeamMember }) {
   return (
-    <Link to="/skills" search={{ framework: m.certs[0]?.frameworkId ?? 'cks' }} className="member-cell">
+    <Link to="/skills" search={{ framework: m.certs[0]?.frameworkId ?? 'cks', member: m.id }} className="member-cell" title={`${m.name} · ${m.title} · ${formatMinutes(m.minutesThisMonth)} this month`}>
       <span className="avatar" aria-hidden>
         {initials(m.name)}
       </span>
@@ -225,7 +271,7 @@ function MemberCell({ m }: { m: TeamMember }) {
           {m.name}
         </span>
         <span className="xs subtle truncate">
-          {m.title} · {formatMinutes(m.minutesThisMonth)}
+          {m.title} · {roundHours(m.minutesThisMonth)}
         </span>
       </span>
     </Link>

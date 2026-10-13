@@ -22,7 +22,11 @@ pnpm --filter web build      # typecheck + production bundle
 
 ## Keyboard
 
-Press `?` anywhere for the cheatsheet. `Ctrl/⌘ K` opens the palette; `g` then `h/c/s/t/a` navigates. In the workspace: `Ctrl/⌘ ↵` validates, `Alt T/W/D` manages consoles, `Alt B` / `Alt Shift B` dock or hide the task panel, `Alt G` toggles the topology, `Alt F` goes full-screen.
+Press `?` anywhere for the cheatsheet. `Ctrl/⌘ K` opens the palette; `g` then `h/c/s/t/a` navigates. In the workspace: `Ctrl/⌘ ↵` validates, `Ctrl/⌘ ⇧ O/X/D` opens, closes and splits consoles, `Ctrl/⌘ ⇧ B` hides the task panel and `Ctrl/⌘ ⇧ ←/→` docks it, `Ctrl/⌘ ⇧ G` toggles the topology, `Ctrl/⌘ ⇧ F` goes full-screen, `Alt [ ]` and `Alt 1–9` switch console tabs.
+
+Workspace shortcuts deliberately avoid keys a shell owns: readline's `Alt B/F/D/T` and `Ctrl K/U/W/A/E/L` all reach the terminal, and `Ctrl K` / `Ctrl /` do not open the palette or cheatsheet while a terminal has focus. Modifier combinations match the physical key (`KeyboardEvent.code`), so they also work with Option on macOS and do not swallow dead keys.
+
+Role gating (`src/app/access.tsx`) applies to the nav, the command palette, the `g t` / `g a` hotkeys and the `/team` and `/studio` routes themselves.
 
 ## Mocks
 

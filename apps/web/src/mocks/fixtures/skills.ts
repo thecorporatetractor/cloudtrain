@@ -50,7 +50,7 @@ export const skills: Skill[] = [
 export const skillById = new Map(skills.map((s) => [s.id, s]));
 
 /** Deterministic pseudo-random helper so fixtures are stable between reloads. */
-function seeded(key: string): number {
+export function seeded(key: string): number {
   let h = 2166136261;
   for (let i = 0; i < key.length; i++) {
     h ^= key.charCodeAt(i);
