@@ -165,22 +165,44 @@ func (d *VClusterDriver) Provision(ctx context.Context, ref NodeRef) (NodeState,
 	if err := ensure(ctx, d.Client, d.reader(), ref.Session, np); err != nil {
 		return NodeState{Phase: labsv1.NodeProvisioning, Message: err.Error()}, err
 	}
-	sts := &appsv1.StatefulSet{}
-	err := d.reader().Get(ctx, client.ObjectKey{Namespace: ref.Namespace(), Name: release}, sts)
-	if apierrors.IsNotFound(err) {
+	wl, err := d.workload(ctx, ref, release)
+	if err != nil {
+		return NodeState{}, err
+	}
+	if wl == nil {
 		if err := d.install(ctx, ref, release); err != nil {
 			return NodeState{Phase: labsv1.NodeProvisioning, Message: err.Error()}, err
 		}
 		return NodeState{Phase: labsv1.NodeProvisioning, Message: "vcluster installing"}, nil
 	}
-	if err != nil {
-		return NodeState{}, err
-	}
-	if sts.Labels[LabelSessionUID] != string(ref.Session.UID) {
+	if wl.GetLabels()[LabelSessionUID] != string(ref.Session.UID) {
 		err := fmt.Errorf("StatefulSet %s exists but does not belong to session %s: %w", release, ref.Session.Name, ErrConflict)
 		return NodeState{Phase: labsv1.NodeFailed, Message: err.Error()}, err
 	}
 	return d.observe(ctx, ref, release, true)
+}
+
+// workload returns the vcluster control plane (a Deployment without
+// persistence, a StatefulSet with it), or nil if not installed.
+func (d *VClusterDriver) workload(ctx context.Context, ref NodeRef, release string) (client.Object, error) {
+	key := client.ObjectKey{Namespace: ref.Namespace(), Name: release}
+	for _, obj := range []client.Object{&appsv1.Deployment{}, &appsv1.StatefulSet{}} {
+		err := d.reader().Get(ctx, key, obj)
+		if err == nil {
+			return obj, nil
+		}
+		if !apierrors.IsNotFound(err) {
+			return nil, err
+		}
+	}
+	return nil, nil
+}
+
+// controlPlanePods lists the vcluster control-plane pods of a release.
+func (d *VClusterDriver) controlPlanePods(ctx context.Context, ref NodeRef, release string) ([]corev1.Pod, error) {
+	pods := &corev1.PodList{}
+	err := d.reader().List(ctx, pods, client.InNamespace(ref.Namespace()), client.MatchingLabels{"app": "vcluster", "release": release})
+	return pods.Items, err
 }
 
 func (d *VClusterDriver) install(ctx context.Context, ref NodeRef, release string) error {
@@ -210,13 +232,18 @@ func (d *VClusterDriver) install(ctx context.Context, ref NodeRef, release strin
 }
 
 func (d *VClusterDriver) observe(ctx context.Context, ref NodeRef, release string, publish bool) (NodeState, error) {
-	pod := &corev1.Pod{}
-	err := d.reader().Get(ctx, client.ObjectKey{Namespace: ref.Namespace(), Name: release + "-0"}, pod)
-	if apierrors.IsNotFound(err) {
-		return NodeState{Phase: labsv1.NodeProvisioning, Message: "vcluster pod not created"}, nil
-	}
+	pods, err := d.controlPlanePods(ctx, ref, release)
 	if err != nil {
 		return NodeState{}, err
+	}
+	var pod *corev1.Pod
+	for i := range pods {
+		if pods[i].DeletionTimestamp == nil {
+			pod = &pods[i]
+		}
+	}
+	if pod == nil {
+		return NodeState{Phase: labsv1.NodeProvisioning, Message: "vcluster pod not created"}, nil
 	}
 	st, _ := podState(pod)
 	if st.Phase != labsv1.NodeReady {
@@ -319,8 +346,16 @@ func (d *VClusterDriver) Reset(ctx context.Context, ref NodeRef) error {
 	if err := d.deleteSynced(ctx, ref, release); err != nil {
 		return err
 	}
-	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: ref.Namespace(), Name: release + "-0"}}
-	return client.IgnoreNotFound(d.Client.Delete(ctx, pod))
+	pods, err := d.controlPlanePods(ctx, ref, release)
+	if err != nil {
+		return err
+	}
+	for i := range pods {
+		if err := d.Client.Delete(ctx, &pods[i]); err != nil && !apierrors.IsNotFound(err) {
+			return err
+		}
+	}
+	return nil
 }
 
 // deleteSynced deletes the objects vcluster synced into the host namespace.
@@ -340,11 +375,12 @@ func (d *VClusterDriver) deleteSynced(ctx context.Context, ref NodeRef, release 
 // outside it. ErrInProgress until the control-plane and synced pods are gone.
 func (d *VClusterDriver) Destroy(ctx context.Context, ref NodeRef) error {
 	release := VClusterRelease(ref.Session, ref.Node.Name)
-	sts := &appsv1.StatefulSet{}
-	err := d.reader().Get(ctx, client.ObjectKey{Namespace: ref.Namespace(), Name: release}, sts)
+	wl, err := d.workload(ctx, ref, release)
 	switch {
-	case err == nil:
-		if sts.Labels[LabelSessionUID] != string(ref.Session.UID) {
+	case err != nil:
+		return err
+	case wl != nil:
+		if wl.GetLabels()[LabelSessionUID] != string(ref.Session.UID) {
 			return nil // not ours
 		}
 		if d.Helm == nil {
@@ -353,8 +389,6 @@ func (d *VClusterDriver) Destroy(ctx context.Context, ref NodeRef) error {
 		if out, err := d.Helm.Helm(ctx, "uninstall", release, "--namespace", ref.Namespace(), "--ignore-not-found"); err != nil {
 			return fmt.Errorf("%w: %s", err, out)
 		}
-	case !apierrors.IsNotFound(err):
-		return err
 	}
 	if err := d.deleteSynced(ctx, ref, release); err != nil {
 		return err
@@ -381,9 +415,11 @@ func (d *VClusterDriver) Destroy(ctx context.Context, ref NodeRef) error {
 	if err := d.reader().List(ctx, pods, client.InNamespace(ref.Namespace()), client.MatchingLabels{LabelVClusterManagedBy: release}); err != nil {
 		return err
 	}
-	cp := &corev1.Pod{}
-	cpErr := d.reader().Get(ctx, client.ObjectKey{Namespace: ref.Namespace(), Name: release + "-0"}, cp)
-	if len(pods.Items) > 0 || cpErr == nil {
+	cps, err := d.controlPlanePods(ctx, ref, release)
+	if err != nil {
+		return err
+	}
+	if len(pods.Items) > 0 || len(cps) > 0 {
 		return inProgress("vcluster %s pods are terminating", release)
 	}
 	return nil

@@ -55,7 +55,8 @@ fi
 # and leader-election lease); SESSION_SELECTOR restricts it to matching
 # LabSessions (e.g. labs.cloudtrain.dev/verify=true for labctl verify), so
 # several managers can share the cluster without reconciling each other's
-# sessions. Defaults: cloudtrain-system, all sessions.
+# sessions. Defaults: cloudtrain-system, all sessions. SKIP_CRDS=1 leaves the
+# cluster's CRDs alone (when other branches' API additions are installed).
 NS=${ORCH_NAMESPACE:-cloudtrain-system}
 manifests() {
   kubectl kustomize "$SVC/config/default" \
@@ -66,7 +67,8 @@ manifests() {
         (select(.kind == "ClusterRoleBinding") | .subjects[0].namespace) = strenv(NS) |
         (select(.kind == "Deployment") | .spec.template.spec.containers[0].image) = strenv(IMG) |
         (select(.kind == "Deployment") | .spec.template.spec.containers[0].args) += ["--leader-election-id=lab-orchestrator-" + strenv(NS)] |
-        (select(.kind == "Deployment" and strenv(SEL) != "") | .spec.template.spec.containers[0].args) += ["--session-selector=" + strenv(SEL)]'
+        (select(.kind == "Deployment" and strenv(SEL) != "") | .spec.template.spec.containers[0].args) += ["--session-selector=" + strenv(SEL)]' \
+    | if [[ ${SKIP_CRDS:-0} == 1 ]]; then yq 'select(.kind != "CustomResourceDefinition")'; else cat; fi
 }
 log "applying CRDs, RBAC and manager ($IMG) in $NS${SESSION_SELECTOR:+, sessions $SESSION_SELECTOR}"
 k apply -f <(manifests) >/dev/null

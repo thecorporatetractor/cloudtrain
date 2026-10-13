@@ -787,6 +787,19 @@ func (v *verifier) leftovers(ctx context.Context, ns, uid string) ([]string, err
 			}
 		}
 	}
+	// Cluster-scoped RBAC the vcluster chart names "vc-<release>-v-<namespace>".
+	for _, kind := range []string{"ClusterRole", "ClusterRoleBinding"} {
+		ul := &unstructured.UnstructuredList{}
+		ul.SetGroupVersionKind(schema.GroupVersionKind{Group: "rbac.authorization.k8s.io", Version: "v1", Kind: kind + "List"})
+		if err := v.c.List(ctx, ul); err != nil {
+			return nil, err
+		}
+		for _, it := range ul.Items {
+			if strings.HasSuffix(it.GetName(), "-v-"+ns) {
+				out = append(out, fmt.Sprintf("%s/%s", strings.ToLower(kind), it.GetName()))
+			}
+		}
+	}
 	if uid != "" {
 		for _, gvk := range []schema.GroupVersionKind{drivers.GVKVpc, drivers.GVKSubnet} {
 			ul := &unstructured.UnstructuredList{}
