@@ -22,7 +22,7 @@ containerd image store, nested virtualization on (`/dev/kvm` present).
 Every version is pinned in **`deploy/versions.env`**, which is the only place versions are
 set. Pinning goes below the tag where that is possible: the kind node image, the Multus
 image, the KVM probe disk and every image baked into the golden image are pinned by
-digest (golden image list: `tools/images/images.lock`); the KubeVirt, CDI and Flannel
+digest (VM image contents: `tools/images/lock/*.lock`); the KubeVirt, CDI and Flannel
 manifests are checked against sha256 sums; Multus is vendored (`deploy/multus/`, see
 "Known gaps" 4); the golden image's apt packages are exact versions, Ubuntu packages come
 from a fixed `snapshot.ubuntu.com` point in time, and the Docker and pkgs.k8s.io repo keys
@@ -49,7 +49,10 @@ task tools          # install pinned CLIs into ~/.local/bin (idempotent)
 task dev:up         # create or converge kind 'cloudtrain-dev' + Kube-OVN + Multus + KubeVirt + CDI, then prove KVM
 task dev:status     # nodes, KVM devices, add-on versions, unhealthy pods, lab namespaces, node memory
 task dev:verify-kvm # boot a throwaway VMI and check libvirt <domain type='kvm'>
-task image:build    # golden kubeadm node image -> containerDisk cloudtrain/kubeadm-node:v1.37.1
+task image:build:all   # every lab image, one at a time (see "Lab images" below)
+task image:build       # = image:build:kubeadm-node -> containerDisk cloudtrain/kubeadm-node:v1.37.1
+task image:load        # load built images + workload images into kind (IMAGES="..." for a subset)
+task image:test        # boot-test the VM images offline on the dev cluster (IMAGES="..." for a subset)
 task lab:demo       # end-to-end lab proof; the lab is deleted afterwards (KEEP=1 keeps it)
 task lab:clean      # delete leftover demo labs (namespace + VPC + subnets)
 task dev:down       # delete ONLY the cloudtrain-dev kind cluster
@@ -199,31 +202,99 @@ The VMs go from apply to Running in about 13 s, but most of the remaining ~100 s
 Ubuntu boot, cloud-init and `kubeadm init`. The next speed-up is VM snapshots or
 warm pools, not faster scheduling.
 
-## Golden image pipeline (`tools/images/`)
+## Lab images (`tools/images/`)
+
+Every image a lab references is listed in `deploy/images/catalog.yaml` (the contract the
+runtime reads). Versions come from `deploy/versions.env`, digests from
+`tools/images/lock/*.lock`, and every build refuses to run when the catalog entry and the
+pins disagree.
+
+| Catalog ref | Image | Contents | Build |
+|---|---|---|---|
+| `kubeadm:1.37` | `cloudtrain/kubeadm-node:v1.37.1` (containerDisk) | kubeadm/kubelet/kubectl 1.37.1 held, containerd, control-plane + Flannel + workload images | `task image:build:kubeadm-node` |
+| `kubeadm:1.36` | `cloudtrain/kubeadm-node:v1.36-upgrade` (containerDisk) | v1.36.5 installed and held; v1.37.1 staged offline (see below) | `task image:build:kubeadm-upgrade` |
+| `etcd-host:3.6` | `cloudtrain/etcd-host:3.6` (containerDisk) | etcd v3.6.15 + etcdctl/etcdutl in `/usr/local/bin`, `etcd.service` with mutual TLS | `task image:build:etcd-host` |
+| `jumphost:1` | `cloudtrain/jumphost:1` (container) | kubectl v1.37.1, helm v4.3.0, etcdctl/etcdutl, yq, jq, ssh, vim/nano, tmux, user `learner` (uid 1000), `k` alias with completion, prompt with the kube context | `task image:build:jumphost` |
+
+**Workload images.** Lab VMs have no internet, so every image a lab's Pods use is in the
+catalog's `workloadImages` (`busybox:1.37`, `httpd:2.4-alpine`, `redis:7.4-alpine`,
+`caddy:2-alpine`, and `httpd:2.4`, which the named-port-nodeport misconception drifts to).
+They are pinned by index digest in `lock/workloads.lock`, pulled by digest into every
+kubeadm node image's containerd (`k8s.io` namespace, CRI-managed, named by tag so
+`imagePullPolicy: IfNotPresent` finds them), and pulled the same way into the kind nodes
+for `mode: virtual` labs (`task image:load:workloads`, idempotent). Adding an image:
+add it to `workloadImages`, run `task image:lock`, rebuild the kubeadm images.
+
+**Upgrade image (`kubeadm:1.36`).** Built from the v1.36 pkgs.k8s.io repo, then the
+v1.37.1 kubeadm/kubelet/kubectl debs are downloaded through the signed v1.37 repo (apt
+checks signatures and sha256) into `/opt/cloudtrain/apt`, next to the installed v1.36.5
+debs. That directory is an apt repo signed with a throwaway build key (only the public
+key stays, in `/etc/apt/keyrings/cloudtrain-offline.gpg`) and it is the **only** apt
+source: the Ubuntu and Docker sources are renamed `*.disabled`, so `apt-get update`
+succeeds offline in about a second and `apt-cache madison kubeadm` lists 1.36.5 and
+1.37.1. The v1.36.5 and v1.37.1 control-plane images are both in containerd, so
+`apt-get install kubeadm=1.37.1-*` and `kubeadm upgrade apply v1.37.1` run with no
+network.
+
+**etcd-host.** Ubuntu 24.04 with etcd from the sha256-pinned release tarball, a system
+user `etcd`, and an enabled `etcd.service` (single member, client and peer mutual TLS on
+127.0.0.1:2379/2380). Its PKI is generated per VM on first start
+(`/usr/local/sbin/cloudtrain-etcd-pki`, `ExecStartPre`) under `/etc/qm-etcd/pki`:
+`ca`, `server`, `peer`, and client identities `grader` and `admin` (`.crt`/`.key`, keys
+0600, owned by `etcd`). No `ETCDCTL_*` variables are set, because the etcd lab teaches
+the TLS flags. The etcd-snapshot-restore lab replaces the unit and PKI with its own
+(`provision-etcd.sh` tears them down first); `task image:test` runs that lab's provision
+script and solution on the image.
+
+All VM images share the kubeadm node conventions: users and SSH keys come from
+cloud-init at boot (the runtime creates `learner` with passwordless sudo), apt timers
+and snapd are gone, and `/etc/cloudtrain-release` records versions and the catalog ref.
+
+### Build pipeline
 
 Choice: **virt-customize at build time**, not cloud-init at first boot. Packages and all
-control-plane and CNI images are baked in. This is what lets the VMs run in an isolated
-VPC with no internet and keeps boot-to-Ready around 90–117 s.
+images are baked in. This is what lets the VMs run in an isolated VPC with no internet
+and keeps boot-to-Ready around 90–117 s.
 
 - `builder/Dockerfile`: Ubuntu 24.04 (by digest) + libguestfs from the pinned apt snapshot
-  (only the `ca-certificates` bootstrap comes from the live archive), run with
-  `--device /dev/kvm`. The tag is derived from the Dockerfile and snapshot, so changing
-  either triggers a rebuild.
-- `build.sh`: fetches the pinned cloud image and checks its sha256. It resolves the image
-  list with the pinned `kubeadm config images list` plus the Flannel manifest (sha256
-  checked), fails if kubeadm fails or the list lacks kube-apiserver, pause, etcd, coredns
-  or flannel, and requires the list to match `images.lock` (`UPDATE_LOCK=1` refreshes
-  the digests after a version bump). It grows the disk to 10G, runs
-  `scripts/guest-setup.sh` inside the guest (apt from the pinned Ubuntu snapshot, repo
-  keys checked against pinned fingerprints, containerd.io/cri-tools/kubernetes-cni and
-  kubelet/kubeadm/kubectl `1.37.1-1.1` at exact versions and held, SystemdCgroup,
-  sysctls/modules, then `ctr pull --platform linux/amd64` of 9 images by digest into
-  `k8s.io`, tagged by name for kubeadm), generalizes the image
-  (machine-id, ssh host keys, cloud-init clean), runs `virt-sparsify --compress` (about
-  1.06 GiB qcow2), and packages the result as a containerDisk `FROM scratch`, with
-  `/disk/disk.qcow2` owned by 107.
-- `jumphost/Dockerfile` + `build-jumphost.sh`: the learner workstation image (ssh client,
-  pinned kubectl, bash completion, user `learner`).
+  (only the `ca-certificates` bootstrap comes from the live archive). The tag is derived
+  from the Dockerfile and snapshot, so changing either triggers a rebuild.
+- **libguestfs runs under TCG (software emulation), not KVM, by default.** On the
+  reference machine, nested KVM inside the libguestfs appliance (`docker --device
+  /dev/kvm` → WSL2 → Hyper-V) coincided with several WSL crashes and one Windows bugcheck
+  0x7f (double fault), while KubeVirt lab VMs on the same host ran cleanly.
+  `build.sh` now sets `LIBGUESTFS_BACKEND_SETTINGS=force_tcg`, caps the appliance at
+  2 GiB (`LIBGUESTFS_MEMSIZE=2048`) and the builder container at 6 GiB. `GUESTFS_KVM=1`
+  re-enables KVM on hosts where nested virtualization is known to be stable. Build one
+  image at a time (`image:build:all` is sequential).
+- `build.sh <variant>` (`kubeadm-node`, `kubeadm-upgrade`, `etcd-host`): fetches the
+  pinned cloud image and checks its sha256. It resolves the image lists (pinned
+  `kubeadm config images list` per Kubernetes version, the Flannel manifest checked by
+  sha256, the catalog's `workloadImages`) and requires each to match its lock file
+  (`lock/kubernetes-<version>.lock`, `lock/flannel.lock`, `lock/workloads.lock`;
+  `task image:lock` refreshes the digests after a version bump). It grows the disk, runs
+  `scripts/guest-<kind>.sh` inside the guest (shared steps in `scripts/guest-common.sh`:
+  apt from the pinned Ubuntu snapshot, repo keys checked against pinned fingerprints,
+  exact package versions held; images pulled by digest with
+  `ctr pull --platform linux/amd64`), generalizes the image (machine-id, ssh host keys,
+  cloud-init clean), runs `virt-sparsify --compress`, and packages the result as a
+  containerDisk `FROM scratch` with `/disk/disk.qcow2` owned by 107. Work files live in
+  `tools/images/.cache/<variant>/`.
+- `build-jumphost.sh`: `jumphost/Dockerfile` with apt from the same snapshot and helm,
+  etcd and yq checked against sha256 sums in `versions.env` (kubectl against dl.k8s.io's
+  `.sha256`).
+- `load.sh`: loads images into kind and skips any node that already has the same digest
+  (containerDisks only to nodes that run VMs).
+- `boot-test.sh`: per VM image, a fresh namespace with an isolated Kube-OVN VPC (no
+  internet, as in a lab), the VM booted with the runtime's cloud-init conventions, and a
+  `jumphost:1` tester pod in the VPC that runs every check over `ssh` as `learner`.
+  kubeadm-node: `crictl images` lists every workload image, a single-node `kubeadm init`,
+  and one Pod per workload image Running with `imagePullPolicy: Never`. kubeadm-upgrade:
+  the same on v1.36.5, then the offline `apt-get update`/`install` of 1.37.1,
+  `kubeadm upgrade apply v1.37.1 --etcd-upgrade=false`, kubelet restart, and the node and
+  kube-apiserver at v1.37.1. etcd-host: `etcdctl endpoint health` over mutual TLS, a client
+  without a certificate is refused, then the etcd lab's provision script and solution.
+  Results: `deploy/.results/image-test/<variant>.txt`. At most one test VM runs at a time.
 - CDI alternative: the same `disk.qcow2` can be served as a `DataVolume` source (`http` or
   `registry` import). A DataVolume is the better fit for persistent per-learner disks;
   containerDisk is the better fit for disposable labs.
