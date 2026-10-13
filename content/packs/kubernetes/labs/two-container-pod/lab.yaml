@@ -14,7 +14,7 @@ spec:
     Quillmoor's depot kiosks use a tiny web front with a co-located cache. The
     two processes must always be scheduled together.
 
-    Work in context `qm-depot`:
+    From your workstation, switch to context `qm-depot` first:
 
     ```bash
     kubectl config use-context qm-depot
@@ -25,12 +25,12 @@ spec:
     | Field | Value |
     |---|---|
     | Name | `{{pod}}` |
-    | App containers | 2 |
+    | App containers (in `spec.containers`) | 2 |
     | Container `web` | image `httpd:2.4-alpine` |
     | Container `cache` | image `redis:7.4-alpine` |
 
-    Both containers must be **running and ready** (`2/2`). Leave the other
-    workloads in the namespace alone.
+    Both containers must be **running and ready** (`2/2`). Leave the
+    `queue-ticker` Deployment in the namespace alone.
   objectives:
     - Write a Pod manifest with two app containers
     - Distinguish app containers from init containers
@@ -50,7 +50,7 @@ spec:
         driver: k8s-cluster
         cluster:
           mode: virtual
-          version: "1.35"
+          version: "v1.37"
           context: qm-depot
   setup:
     - on: qm-depot
@@ -91,26 +91,26 @@ spec:
     - id: images
       description: web runs httpd:2.4-alpine and cache runs redis:7.4-alpine
       type: k8s-query
-      skills: [k8s.workloads.multi-container-pods, k8s.cli.manifests]
+      skills: [k8s.workloads.multi-container-pods]
       query: {cluster: qm-depot, resource: pod, name: "{{pod}}", namespace: depot-kiosk, jsonpath: '{.spec.containers[?(@.name=="web")].image} {.spec.containers[?(@.name=="cache")].image}'}
       expect: {match: exact, value: httpd:2.4-alpine redis:7.4-alpine}
     - id: no-init-containers
       description: No init containers are used
       type: k8s-query
-      skills: [k8s.workloads.native-sidecars]
+      skills: [k8s.workloads.multi-container-pods]
       weight: 0.5
       query: {cluster: qm-depot, resource: pod, name: "{{pod}}", namespace: depot-kiosk, jsonpath: "[{.spec.initContainers}]"}
       expect: {match: exact, value: "[]"}
     - id: all-ready
       description: The Pod is Running and both containers are ready
       type: k8s-query
-      skills: [k8s.workloads.pods]
-      query: {cluster: qm-depot, resource: pod, name: "{{pod}}", namespace: depot-kiosk, jsonpath: '{.status.phase} {range .status.containerStatuses[*]}{.ready}{" "}{end}'}
-      expect: {match: exact, value: "Running true true "}
+      skills: [k8s.workloads.multi-container-pods]
+      query: {cluster: qm-depot, resource: pod, name: "{{pod}}", namespace: depot-kiosk, jsonpath: '{.status.phase}{range .status.containerStatuses[*]} {.ready}{end}'}
+      expect: {match: exact, value: "Running true true"}
     - id: neighbours-unchanged
       description: queue-ticker is still running with 2 replicas
       type: k8s-query
-      skills: [k8s.cli.imperative]
+      skills: [k8s.cli.scoped-changes]
       weight: 0.5
       query: {cluster: qm-depot, resource: deployment, name: queue-ticker, namespace: depot-kiosk, jsonpath: "{.spec.replicas}/{.status.readyReplicas}"}
       expect: {match: exact, value: "2/2"}

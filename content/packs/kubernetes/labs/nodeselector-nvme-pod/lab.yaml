@@ -15,7 +15,7 @@ spec:
     the renderer needs local fast storage. Only some fleet workers have it, and
     they are labelled accordingly.
 
-    Work in context `qm-fleet`:
+    From your workstation, switch to context `qm-fleet` first:
 
     ```bash
     kubectl config use-context qm-fleet
@@ -29,7 +29,8 @@ spec:
     | Image | `httpd:2.4-alpine` |
     | Node selector | `storage-tier={{tier}}` |
 
-    Make sure the Pod is **Running**. Do not change any node.
+    Make sure the Pod is **Running**. Do not add, change or remove any node
+    labels.
   objectives:
     - Discover node labels
     - Add a nodeSelector to a Pod manifest
@@ -50,10 +51,10 @@ spec:
         access: [shell]
       - name: qm-fleet
         driver: k8s-cluster
-        image: kubeadm:1.35
+        image: kubeadm:1.37
         cluster:
           mode: kubeadm
-          version: "1.35"
+          version: "v1.37.1"
           context: qm-fleet
           nodes:
             - {name: fleet-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
@@ -105,12 +106,13 @@ spec:
       query: {cluster: qm-fleet, resource: pod, name: "{{pod}}", namespace: fleet-ops, jsonpath: "{.spec.nodeName}"}
       expect: {match: exact, value: fleet-wk-2}
     - id: nodes-unchanged
-      description: Node labels were not changed
+      description: The storage-tier node labels were not changed
       type: shell
       on: qm-fleet
-      skills: [k8s.scheduling.node-labels]
-      command: kubectl get nodes -L storage-tier --no-headers | awk '{print $1"="$6}' | sort | paste -sd' ' -
-      expect: {match: exact, value: "fleet-cp-1= fleet-wk-1=spinning fleet-wk-2={{tier}} fleet-wk-3="}
+      skills: [k8s.cli.scoped-changes]
+      weight: 0.5
+      command: kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}={.metadata.labels.storage-tier};{end}'
+      expect: {match: exact, value: "fleet-cp-1=;fleet-wk-1=spinning;fleet-wk-2={{tier}};fleet-wk-3=;"}
   hints:
     - title: Switch context
       body: The fleet cluster owns the label renderers.
@@ -128,7 +130,7 @@ spec:
       body: --overrides merges JSON into the generated Pod.
       command: |
         kubectl -n fleet-ops run {{pod}} --image=httpd:2.4-alpine \
-          --overrides='{"spec":{"nodeSelector":{"storage-tier":"{{tier}}"}}}'
+          --overrides='{"apiVersion":"v1","spec":{"nodeSelector":{"storage-tier":"{{tier}}"}}}'
       cost: 3
   misconceptions:
     - id: node-name
@@ -159,7 +161,7 @@ spec:
         run: |
           kubectl config use-context qm-fleet
           kubectl label node fleet-wk-3 storage-tier={{tier}}
-          kubectl -n fleet-ops run {{pod}} --image=httpd:2.4-alpine --overrides='{"spec":{"nodeSelector":{"storage-tier":"{{tier}}"}}}'
+          kubectl -n fleet-ops run {{pod}} --image=httpd:2.4-alpine --overrides='{"apiVersion":"v1","spec":{"nodeSelector":{"storage-tier":"{{tier}}"}}}'
     - id: label-on-pod
       description: Puts storage-tier={{tier}} into the Pod's own labels, which has no effect on scheduling.
       feedback: Pod labels describe the Pod. Placement constraints go in `spec.nodeSelector` (or affinity).

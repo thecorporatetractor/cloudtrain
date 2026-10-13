@@ -15,14 +15,14 @@ spec:
     cluster. The team's release robot must be able to roll out new controllers
     in the team namespace `{{ns}}`, and nothing else.
 
-    Work in context `qm-depot`:
+    From your workstation, switch to context `qm-depot` first:
 
     ```bash
     kubectl config use-context qm-depot
     ```
 
     1. Create a ClusterRole named `{{role}}` that grants **only** the `create`
-       verb on **Deployments, StatefulSets and DaemonSets**.
+       verb on **Deployments, StatefulSets and DaemonSets** (API group `apps`).
     2. Create a ServiceAccount named `{{sa}}` in the existing namespace `{{ns}}`.
     3. Grant `{{role}}` to `{{sa}}` so the permission applies **only inside
        `{{ns}}`**. The robot must not gain any rights in other namespaces
@@ -53,7 +53,7 @@ spec:
         driver: k8s-cluster
         cluster:
           mode: virtual
-          version: "1.35"
+          version: "v1.37"
           context: qm-depot
   setup:
     - on: qm-depot
@@ -113,7 +113,7 @@ spec:
       description: The ClusterRole grants the create verb and no other verb
       type: shell
       on: qm-depot
-      skills: [k8s.rbac.clusterroles]
+      skills: [k8s.rbac.roles]
       command: |
         kubectl get clusterrole {{role}} -o jsonpath='{range .rules[*]}{range .verbs[*]}{@}{"\n"}{end}{end}' | sort -u | paste -sd, -
       expect: {match: exact, value: create}
@@ -121,7 +121,7 @@ spec:
       description: The rules cover exactly deployments, statefulsets and daemonsets in the apps group
       type: shell
       on: qm-depot
-      skills: [k8s.rbac.clusterroles]
+      skills: [k8s.rbac.roles]
       command: |
         r=$(kubectl get clusterrole {{role}} -o jsonpath='{range .rules[*]}{range .resources[*]}{@}{"\n"}{end}{end}' | sort -u | paste -sd, -)
         g=$(kubectl get clusterrole {{role}} -o jsonpath='{range .rules[*]}{range .apiGroups[*]}{@}{"\n"}{end}{end}' | sort -u | paste -sd, -)
@@ -136,7 +136,7 @@ spec:
     - id: can-create-deployments
       description: The robot can create Deployments in {{ns}}
       type: k8s-can-i
-      skills: [k8s.rbac.binding-scope, k8s.rbac.auth-can-i]
+      skills: [k8s.rbac.binding-scope]
       query: {cluster: qm-depot, verb: create, resource: deployments.apps, namespace: "{{ns}}", as: "system:serviceaccount:{{ns}}:{{sa}}"}
       expect: {match: exact, value: "yes"}
     - id: can-create-statefulsets
@@ -154,19 +154,19 @@ spec:
     - id: cannot-delete
       description: The robot cannot delete Deployments (create only)
       type: k8s-can-i
-      skills: [k8s.rbac.clusterroles, k8s.security.rbac-least-privilege]
+      skills: [k8s.rbac.roles]
       query: {cluster: qm-depot, verb: delete, resource: deployments.apps, namespace: "{{ns}}", as: "system:serviceaccount:{{ns}}:{{sa}}"}
       expect: {match: exact, value: "no"}
     - id: cannot-create-pods
       description: The robot cannot create bare Pods
       type: k8s-can-i
-      skills: [k8s.rbac.clusterroles, k8s.security.rbac-least-privilege]
+      skills: [k8s.rbac.roles]
       query: {cluster: qm-depot, verb: create, resource: pods, namespace: "{{ns}}", as: "system:serviceaccount:{{ns}}:{{sa}}"}
       expect: {match: exact, value: "no"}
     - id: scoped-to-namespace
       description: The grant does not reach other namespaces (qm-sandbox)
       type: k8s-can-i
-      skills: [k8s.rbac.binding-scope, k8s.rbac.auth-can-i]
+      skills: [k8s.rbac.binding-scope]
       weight: 2
       query: {cluster: qm-depot, verb: create, resource: deployments.apps, namespace: qm-sandbox, as: "system:serviceaccount:{{ns}}:{{sa}}"}
       expect: {match: exact, value: "no"}
