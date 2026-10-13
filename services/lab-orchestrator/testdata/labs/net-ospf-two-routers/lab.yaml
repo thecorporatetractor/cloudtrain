@@ -1,0 +1,136 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: net-ospf-two-routers
+  title: Bring up OSPF between two branch routers
+  domain: networking
+  frameworks: ["internal:routing-fundamentals"]
+  difficulty: medium
+  estimatedMinutes: 25
+  tags: [ospf, frr, routing]
+  version: 1
+spec:
+  description: |
+    Fjordline Freight connects its {{site}} warehouse to the core over two FRR
+    routers, `edge-1` and `edge-2`. Hosts on the warehouse LAN
+    (`10.{{octet}}.2.0/24`) cannot reach the core LAN (`10.{{octet}}.1.0/24`).
+
+    Configure OSPF area {{area}} on `edge-2` so that `wh-host` can ping
+    `core-host`. Do not add static routes.
+  objectives:
+    - Enable OSPF on the transit and warehouse interfaces of edge-2
+    - Verify the adjacency and the learned route
+  params:
+    site:
+      type: choice
+      values: [Tromso, Bodo, Alesund]
+    octet:
+      type: int
+      min: 20
+      max: 60
+    area:
+      type: choice
+      values: [0, 10]
+      default: 0
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: edge-1
+        driver: netdev
+        image: frr:10
+        access: [console, ssh]
+      - name: edge-2
+        driver: netdev
+        image: frr:10
+        access: [console, ssh]
+      - name: core-host
+        driver: container
+        image: nettools:1
+        resources: { cpu: 0.25, memoryMiB: 128 }
+      - name: wh-host
+        driver: container
+        image: nettools:1
+        resources: { cpu: 0.25, memoryMiB: 128 }
+    links:
+      - { a: "core-host:eth1", b: "edge-1:eth1", subnet: "10.{{octet}}.1.0/24" }
+      - a: "edge-1:eth2"
+        b: "edge-2:eth2"
+        subnet: "10.{{octet}}.0.0/30"
+        impair: { latencyMs: 15, lossPct: 0.5 }
+      - { a: "edge-2:eth1", b: "wh-host:eth1", subnet: "10.{{octet}}.2.0/24" }
+  setup:
+    - on: edge-1
+      config: |
+        interface eth1
+         ip address 10.{{octet}}.1.1/24
+        interface eth2
+         ip address 10.{{octet}}.0.1/30
+         ip ospf area {{area}}
+        router ospf
+         network 10.{{octet}}.1.0/24 area {{area}}
+    - on: edge-2
+      config: |
+        interface eth1
+         ip address 10.{{octet}}.2.1/24
+        interface eth2
+         ip address 10.{{octet}}.0.2/30
+    - on: core-host
+      run: ip addr add 10.{{octet}}.1.10/24 dev eth1 && ip route add 10.{{octet}}.0.0/16 via 10.{{octet}}.1.1
+    - on: wh-host
+      run: ip addr add 10.{{octet}}.2.10/24 dev eth1 && ip route add 10.{{octet}}.0.0/16 via 10.{{octet}}.2.1
+  checks:
+    - id: adjacency-full
+      description: edge-2 has a FULL OSPF adjacency with edge-1
+      type: device-cmd
+      on: edge-2
+      command: show ip ospf neighbor
+      expect: { match: contains, value: Full }
+      skills: [net.routing.ospf.adjacency]
+      weight: 1
+    - id: route-learned
+      description: edge-2 learned the core LAN via OSPF
+      type: device-cmd
+      on: edge-2
+      command: show ip route ospf
+      expect: { match: contains, value: "10.{{octet}}.1.0/24" }
+      skills: [net.routing.ospf.routes]
+    - id: end-to-end
+      description: wh-host reaches core-host
+      type: reachability
+      on: wh-host
+      target: 10.{{octet}}.1.10
+      skills: [net.routing.verification]
+      weight: 2
+    - id: no-static
+      description: No static routes were added on edge-2
+      type: device-cmd
+      on: edge-2
+      command: show running-config
+      expect: { match: not_contains, value: "ip route " }
+      skills: [net.routing.ospf.routes]
+      weight: 0.5
+  hints:
+    - title: Which interfaces?
+      body: OSPF must run on the link towards edge-1 and advertise the warehouse LAN.
+      command: show ip ospf interface
+  misconceptions:
+    - id: static-route
+      description: Adds a static route instead of enabling OSPF
+      mutation:
+        on: edge-2
+        config: |
+          ip route 10.{{octet}}.1.0/24 10.{{octet}}.0.1
+      feedback: The route works but bypasses OSPF; the task requires dynamic routing.
+  solution:
+    explanation: Enable OSPF on the transit link and advertise the warehouse LAN in the same area as edge-1.
+    steps:
+      - on: edge-2
+        config: |
+          interface eth2
+           ip ospf area {{area}}
+          router ospf
+           network 10.{{octet}}.2.0/24 area {{area}}
