@@ -4,12 +4,18 @@ package main
 import (
 	"flag"
 	"os"
+	"time"
 
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	labsv1 "github.com/cloudtrain/cloudtrain/services/lab-orchestrator/api/v1alpha1"
@@ -19,10 +25,16 @@ import (
 
 func main() {
 	var (
-		metricsAddr, probeAddr, registry, runtimeClass string
-		leaderElect                                    bool
+		metricsAddr, probeAddr, registry, runtimeClass, watchNamespace string
+		leaderElect, metricsSecure                                     bool
+		concurrency                                                    int
+		provisionTimeout                                               time.Duration
 	)
-	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "metrics endpoint address")
+	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "metrics endpoint address (e.g. :8443); \"0\" disables metrics")
+	flag.BoolVar(&metricsSecure, "metrics-secure", true, "serve metrics over HTTPS with Kubernetes authn/authz")
+	flag.StringVar(&watchNamespace, "watch-namespace", "", "restrict the manager to one namespace; empty = all namespaces")
+	flag.IntVar(&concurrency, "max-concurrent-reconciles", controller.DefaultMaxConcurrentReconciles, "parallel LabSession reconciles")
+	flag.DurationVar(&provisionTimeout, "provision-timeout", controller.DefaultProvisionTimeout, "fail sessions whose nodes are not ready within this time")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "health probe address")
 	flag.BoolVar(&leaderElect, "leader-elect", false, "enable leader election")
 	flag.StringVar(&registry, "image-registry", "", "registry prefix for catalog images (e.g. registry.cloudtrain.local/images)")
@@ -41,10 +53,26 @@ func main() {
 		panic(err)
 	}
 
+	// Only cache the Pods and Services this operator creates, not every one
+	// in the cluster.
+	managed := labels.SelectorFromSet(labels.Set{drivers.LabelManagedBy: drivers.ManagedBy})
+	cacheOpts := cache.Options{ByObject: map[client.Object]cache.ByObject{
+		&corev1.Pod{}:     {Label: managed},
+		&corev1.Service{}: {Label: managed},
+	}}
+	if watchNamespace != "" {
+		cacheOpts.DefaultNamespaces = map[string]cache.Config{watchNamespace: {}}
+	}
+	metricsOpts := metricsserver.Options{BindAddress: metricsAddr, SecureServing: metricsSecure}
+	if metricsSecure {
+		metricsOpts.FilterProvider = filters.WithAuthenticationAndAuthorization
+	}
+
 	cfg := ctrl.GetConfigOrDie()
 	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
 		Scheme:                 scheme,
-		Metrics:                metricsserver.Options{BindAddress: metricsAddr},
+		Cache:                  cacheOpts,
+		Metrics:                metricsOpts,
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         leaderElect,
 		LeaderElectionID:       "lab-orchestrator.labs.cloudtrain.dev",
@@ -60,7 +88,7 @@ func main() {
 		os.Exit(1)
 	}
 	reg, err := drivers.NewDefaultRegistry(&drivers.ContainerDriver{
-		Client: mgr.GetClient(), Scheme: scheme, ImageRegistry: registry,
+		Client: mgr.GetClient(), Reader: mgr.GetAPIReader(), Scheme: scheme, ImageRegistry: registry,
 		RuntimeClassName: runtimeClass, Executor: executor,
 	})
 	if err != nil {
@@ -70,7 +98,8 @@ func main() {
 
 	if err := (&controller.LabSessionReconciler{
 		Client: mgr.GetClient(), Scheme: scheme, Drivers: reg,
-		Recorder: mgr.GetEventRecorderFor("lab-orchestrator"),
+		Recorder:         mgr.GetEventRecorderFor("lab-orchestrator"),
+		ProvisionTimeout: provisionTimeout, MaxConcurrentReconciles: concurrency,
 	}).SetupWithManager(mgr); err != nil {
 		log.Error(err, "unable to set up LabSession controller")
 		os.Exit(1)

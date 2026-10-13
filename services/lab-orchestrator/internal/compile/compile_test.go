@@ -178,6 +178,9 @@ func TestCompileInvalid(t *testing.T) {
 		{"shell check without command", mutate(minimalLab, `, command: "test -f /tmp/{{file}}"`, ""), []string{"shell check requires command"}},
 		{"cluster on non-cluster node", mutate(minimalLab, "access: [shell]}", "access: [shell], cluster: {mode: kubeadm}}"), []string{"cluster is only allowed"}},
 		{"int param without bounds", mutate(minimalLab, "{type: name, prefix: notes}", "{type: int}"), []string{"int param needs min and max"}},
+		{"int default out of range", mutate(minimalLab, "{type: name, prefix: notes}", "{type: int, min: 1, max: 5, default: 9}"), []string{"/spec/params/file/default", "outside [min, max]"}},
+		{"choice default not a value", mutate(minimalLab, "{type: name, prefix: notes}", "{type: choice, values: [a, b], default: c}"), []string{"/spec/params/file/default", "not one of the values"}},
+		{"integer overflow", mutate(minimalLab, "{type: name, prefix: notes}", "{type: name, default: 99999999999999999999}"), []string{"out of range"}},
 		{
 			"kubeadm member and link checks",
 			[]byte(`
@@ -238,5 +241,18 @@ func TestValidationErrorType(t *testing.T) {
 func TestMinimalLabCompiles(t *testing.T) {
 	if _, err := Compile([]byte(minimalLab), Options{}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestParamDecoding(t *testing.T) {
+	// Extra keys the schema allows on params are accepted, and int64 values
+	// beyond float64 precision stay exact.
+	lt, err := Compile(mutate(minimalLab, "{type: name, prefix: notes}",
+		"{type: int, min: 9007199254740990, max: 9007199254740999, default: 9007199254740993, description: big}"), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d := lt.Spec.Params["file"].Default; d == nil || *d != "9007199254740993" {
+		t.Errorf("default = %v", d)
 	}
 }

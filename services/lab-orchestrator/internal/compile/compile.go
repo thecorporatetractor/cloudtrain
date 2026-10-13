@@ -130,7 +130,9 @@ func Compile(data []byte, opts Options) (*labsv1.LabTemplate, error) {
 	dec := json.NewDecoder(bytes.NewReader(js))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&src); err != nil {
-		return nil, fmt.Errorf("decode lab: %w", err)
+		// The schema accepted the document, so this is a field the compiler
+		// does not know; report it like any other validation issue.
+		return nil, &ValidationError{Issues: []Issue{{Message: "decode lab: " + err.Error()}}}
 	}
 
 	spec := convert(&src)
@@ -240,6 +242,8 @@ func stringify(v any) string {
 	switch x := v.(type) {
 	case string:
 		return x
+	case json.Number:
+		return x.String()
 	case float64:
 		return formatFloat(x)
 	case bool:

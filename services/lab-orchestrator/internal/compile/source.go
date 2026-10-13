@@ -1,5 +1,10 @@
 package compile
 
+import (
+	"bytes"
+	"encoding/json"
+)
+
 // Source types mirror lab.schema.json one-to-one for decoding. They are
 // converted into api/v1alpha1 types (with defaults applied) by Compile.
 
@@ -41,6 +46,21 @@ type sourceParam struct {
 	Max     *int64 `json:"max"`
 	Prefix  string `json:"prefix"`
 	Default any    `json:"default"`
+}
+
+// UnmarshalJSON decodes numbers in values/default as json.Number (exact), and
+// tolerates extra keys such as description: the shared schema allows them on
+// params, so the decoder must not be stricter than the schema.
+func (p *sourceParam) UnmarshalJSON(b []byte) error {
+	type plain sourceParam
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.UseNumber()
+	var v plain
+	if err := dec.Decode(&v); err != nil {
+		return err
+	}
+	*p = sourceParam(v)
+	return nil
 }
 
 type sourceTopology struct {

@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"slices"
 	"sort"
+	"strconv"
 	"strings"
 
 	labsv1 "github.com/cloudtrain/cloudtrain/services/lab-orchestrator/api/v1alpha1"
@@ -39,11 +41,23 @@ func validateSemantics(s *labsv1.LabTemplateSpec) []Issue {
 			if len(p.Values) == 0 {
 				add(path, "choice param needs at least one value")
 			}
+			if p.Default != nil && !slices.Contains(p.Values, *p.Default) {
+				add(path+"/default", "default %q is not one of the values", *p.Default)
+			}
 		case labsv1.ParamInt:
 			if p.Min == nil || p.Max == nil {
 				add(path, "int param needs min and max")
 			} else if *p.Min > *p.Max {
 				add(path, "min (%d) > max (%d)", *p.Min, *p.Max)
+			}
+			if p.Default != nil {
+				d, err := strconv.ParseInt(*p.Default, 10, 64)
+				switch {
+				case err != nil:
+					add(path+"/default", "default %q is not an integer", *p.Default)
+				case p.Min != nil && d < *p.Min, p.Max != nil && d > *p.Max:
+					add(path+"/default", "default %d is outside [min, max]", d)
+				}
 			}
 		case labsv1.ParamName:
 			if p.Prefix != "" && !dnsLabelRe.MatchString(p.Prefix) {

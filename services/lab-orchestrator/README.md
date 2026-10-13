@@ -8,7 +8,7 @@ see `packages/lab-schema`) into running, isolated topologies.
 | Kind | Purpose |
 |---|---|
 | `LabTemplate` (`lt`) | Compiled, immutable lab definition: source metadata + digest, params, topology (nodes, links, entry), setup/teardown actions, checks, hints, misconceptions, solution. `{{params}}` stay unresolved; the spec is immutable (CEL rule). |
-| `LabSession` (`ls`) | One learner attempt: `templateRef`, `learner`, `seed`, `ttl`/`expiresAt`, `hibernate`, optional `warmPoolRef`. Status: phase (`Pending`, `Provisioning`, `Ready`, `Grading`, `Expired`, `Failed`), conditions, resolved params, per-node status, access endpoints, entry node, expiry. |
+| `LabSession` (`ls`) | One learner attempt: `templateRef`, `learner`, `seed`, `ttl`/`expiresAt`, `hibernate`, optional `warmPoolRef`. `resetGeneration`. Status: phase (`Pending`, `Provisioning`, `Ready`, `Grading`, `Hibernated`, `Expired`, `Failed`), recorded topology, setup progress, conditions, resolved params, per-node status, access endpoints, entry node, expiry. |
 | `WarmPool` (`wp`) | `templateRef` + `size`; status reports the `ready` count. (Controller not built yet.) |
 
 CRDs are generated into `config/crd`, RBAC into `config/rbac`.
@@ -30,7 +30,15 @@ testdata/labs/         sample labs (networking OSPF, kubeadm cluster)
 ## Drivers
 
 `NodeDriver`: `Provision`, `Status`, `Exec`, `Connect(access)`, `Reset`,
-`Destroy` (all idempotent); optional `Hibernator`.
+`Destroy` (all idempotent); optional `Hibernator` (`Status` then reports
+`Hibernated`) and `TopologyProvisioner` (session-scoped links / networks,
+provisioned before and destroyed after the nodes). `NodeState` carries an
+`InstanceID` (a change means the node was recreated) and `Details` (addresses,
+member states). Endpoints can reference a credential Secret (`secretRef`).
+
+Container nodes are named `<session>-<node>-<hash>` (hash of session name, UID
+and node), labelled with the session UID, and the driver never adopts or
+deletes an object of that name it did not create (`ErrConflict`, permanent).
 
 | Driver | Backend | State |
 |---|---|---|
@@ -39,20 +47,39 @@ testdata/labs/         sample labs (networking OSPF, kubeadm cluster)
 | `k8s-cluster` | `virtual` = vcluster, `kubeadm` = VM nodes | stub, dispatches on `cluster.mode` |
 | `netdev` | Clabernetes / vrnetlab | stub |
 
-`ErrNotImplemented` / `ErrUnsupported` are permanent: the reconciler marks the
+`ErrNotImplemented` / `ErrUnsupported` / `ErrConflict` are permanent: the reconciler marks the
 node and session `Failed` instead of retrying.
 
 ## LabSession reconciler
 
-1. Adds a finalizer; on deletion destroys every node through its driver.
+1. Adds a finalizer. On deletion it destroys every node recorded in
+   `status.topology` (never only the live template) and keeps the finalizer until
+   that succeeded.
 2. Fetches the template and resolves params from `spec.seed` (`TemplateResolved`).
 3. Computes expiry: `spec.expiresAt`, else creation + `spec.ttl`, else creation +
-   max(2 x `estimatedMinutes`, 30m). Past expiry it destroys all nodes, withdraws
-   endpoints and sets `Expired` (terminal).
-4. `spec.hibernate`: hibernates nodes whose driver supports it, withdraws endpoints.
-5. Provisions every node (`NodesReady`), runs setup actions once
-   (`SetupComplete`), publishes endpoints, sets `Ready`. A `Grading` phase set by
-   the grader is preserved. Requeues while provisioning and at expiry.
+   max(2 x `estimatedMinutes`, 30m); without a template, creation + 30m. Past
+   expiry it destroys all recorded nodes and only then sets `Expired` (terminal).
+4. Records the resolved topology in status before provisioning anything.
+5. `spec.hibernate`: hibernates nodes whose driver supports it, withdraws
+   endpoints, phase `Hibernated`.
+6. `spec.resetGeneration` above `status.observedResetGeneration`: `Reset`s every
+   node and re-runs setup.
+7. Provisions every node (`NodesReady`); fails the session after
+   `--provision-timeout` (15m). Runs setup actions (`SetupComplete`), persisting
+   `status.setupProgress` after each one so retries resume; setup runs again when
+   a node's `instanceID` changes (pod recreated, container restarted). Publishes
+   endpoints and sets `Ready`. A `Grading` phase set by the grader is preserved.
+
+Status is written with a merge patch. Setup runs inside the reconcile (actions
+are capped at 10m; `--max-concurrent-reconciles`, default 8), and **setup
+actions must be idempotent**: an action whose progress could not be saved, or
+all of them after a node is recreated or reset, run again.
+
+Manager flags: `--metrics-bind-address` (default `0`, off; HTTPS with
+Kubernetes authn/authz when set), `--watch-namespace`, `--leader-elect`,
+`--max-concurrent-reconciles`, `--provision-timeout`, `--image-registry`,
+`--runtime-class`. The cache only holds Pods/Services labelled
+`app.kubernetes.io/managed-by=cloudtrain-lab-orchestrator`.
 
 ## labctl
 

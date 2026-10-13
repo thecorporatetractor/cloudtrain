@@ -34,14 +34,22 @@ type fakeDriver struct {
 	name     labsv1.DriverName
 	phase    map[string]labsv1.NodePhase // per node; default Ready
 	provErr  map[string]error
+	instance map[string]string // per node InstanceID
 	execExit int
+	// execErr fails the exec call with this (0-based) index.
+	execErrAt  int
+	execErr    error
+	destroyErr error
+	asleep     map[string]bool
 
-	provisioned, destroyed, hibernated []string
-	execs                              []drivers.ExecRequest
+	provisioned, destroyed, hibernated, resets []string
+	execs                                      []drivers.ExecRequest
+	execCalls                                  int
 }
 
 func newFakeDriver(name labsv1.DriverName) *fakeDriver {
-	return &fakeDriver{name: name, phase: map[string]labsv1.NodePhase{}, provErr: map[string]error{}}
+	return &fakeDriver{name: name, phase: map[string]labsv1.NodePhase{}, provErr: map[string]error{},
+		instance: map[string]string{}, asleep: map[string]bool{}, execErrAt: -1}
 }
 
 func (f *fakeDriver) Name() labsv1.DriverName { return f.name }
@@ -50,23 +58,38 @@ func (f *fakeDriver) Provision(_ context.Context, ref drivers.NodeRef) (drivers.
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.provisioned = append(f.provisioned, ref.Node.Name)
+	delete(f.asleep, ref.Node.Name)
 	if err := f.provErr[ref.Node.Name]; err != nil {
 		return drivers.NodeState{}, err
 	}
-	p, ok := f.phase[ref.Node.Name]
+	return f.state(ref.Node.Name), nil
+}
+
+func (f *fakeDriver) state(node string) drivers.NodeState {
+	if f.asleep[node] {
+		return drivers.NodeState{Phase: labsv1.NodeHibernated}
+	}
+	p, ok := f.phase[node]
 	if !ok {
 		p = labsv1.NodeReady
 	}
-	return drivers.NodeState{Phase: p}, nil
+	return drivers.NodeState{Phase: p, InstanceID: f.instance[node]}
 }
 
-func (f *fakeDriver) Status(ctx context.Context, ref drivers.NodeRef) (drivers.NodeState, error) {
-	return f.Provision(ctx, ref)
+func (f *fakeDriver) Status(_ context.Context, ref drivers.NodeRef) (drivers.NodeState, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.state(ref.Node.Name), nil
 }
 
 func (f *fakeDriver) Exec(_ context.Context, _ drivers.NodeRef, req drivers.ExecRequest) (drivers.ExecResult, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	call := f.execCalls
+	f.execCalls++
+	if call == f.execErrAt {
+		return drivers.ExecResult{}, f.execErr
+	}
 	f.execs = append(f.execs, req)
 	return drivers.ExecResult{ExitCode: f.execExit, Stderr: "boom"}, nil
 }
@@ -75,11 +98,19 @@ func (f *fakeDriver) Connect(_ context.Context, ref drivers.NodeRef, a labsv1.Ac
 	return labsv1.Endpoint{Node: ref.Node.Name, Access: a, Protocol: "fake", Host: ref.ResourceName()}, nil
 }
 
-func (f *fakeDriver) Reset(context.Context, drivers.NodeRef) error { return nil }
+func (f *fakeDriver) Reset(_ context.Context, ref drivers.NodeRef) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.resets = append(f.resets, ref.Node.Name)
+	return nil
+}
 
 func (f *fakeDriver) Destroy(_ context.Context, ref drivers.NodeRef) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.destroyErr != nil {
+		return f.destroyErr
+	}
 	f.destroyed = append(f.destroyed, ref.Node.Name)
 	return nil
 }
@@ -91,6 +122,7 @@ func (h hibernatingDriver) Hibernate(_ context.Context, ref drivers.NodeRef) err
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.hibernated = append(h.hibernated, ref.Node.Name)
+	h.asleep[ref.Node.Name] = true
 	return nil
 }
 
@@ -577,7 +609,7 @@ func TestReconcileWithContainerDriver(t *testing.T) {
 	if got.Status.Phase != labsv1.SessionProvisioning {
 		t.Fatalf("phase = %s", got.Status.Phase)
 	}
-	name := drivers.ResourceName("s1", "workstation")
+	name := drivers.ResourceName("s1", "uid-s1", "workstation")
 	pod := &corev1.Pod{}
 	if err := c.Get(ctx, client.ObjectKey{Namespace: ns, Name: name}, pod); err != nil {
 		t.Fatalf("pod not created: %v", err)
@@ -601,5 +633,223 @@ func TestReconcileWithContainerDriver(t *testing.T) {
 	if len(got.Status.Endpoints) != 1 || got.Status.Endpoints[0].Protocol != "k8s-exec" ||
 		got.Status.Endpoints[0].Target != ns+"/"+name+"/"+drivers.ContainerName {
 		t.Errorf("endpoints = %+v", got.Status.Endpoints)
+	}
+}
+
+func (h *harness) deleteTemplate() {
+	h.t.Helper()
+	if err := h.c.Delete(context.Background(), template()); err != nil {
+		h.t.Fatal(err)
+	}
+}
+
+func TestTopologySnapshotRecorded(t *testing.T) {
+	h := newHarness(t, template(), session())
+	h.reconcile()
+	s := h.get()
+	if s.Status.Topology == nil || len(s.Status.Topology.Nodes) != 2 {
+		t.Fatalf("topology snapshot = %+v", s.Status.Topology)
+	}
+}
+
+func TestExpiryWithoutTemplateStillTearsDown(t *testing.T) {
+	h := newHarness(t, template(), session(func(s *labsv1.LabSession) {
+		s.Spec.TTL = &metav1.Duration{Duration: 10 * time.Minute}
+	}))
+	h.reconcile()
+	h.deleteTemplate()
+
+	h.now = t0.Add(11 * time.Minute)
+	h.reconcile()
+	s := h.get()
+	if s.Status.Phase != labsv1.SessionExpired {
+		t.Fatalf("phase = %s", s.Status.Phase)
+	}
+	if fmt.Sprint(h.cont.destroyed) != "[workstation]" || fmt.Sprint(h.netdev.destroyed) != "[rtr]" {
+		t.Errorf("destroyed = %v %v", h.cont.destroyed, h.netdev.destroyed)
+	}
+}
+
+func TestExpiryWaitsForTeardown(t *testing.T) {
+	h := newHarness(t, template(), session(func(s *labsv1.LabSession) {
+		s.Spec.TTL = &metav1.Duration{Duration: 10 * time.Minute}
+	}))
+	h.reconcile()
+	h.now = t0.Add(11 * time.Minute)
+	h.cont.destroyErr = errors.New("apiserver hiccup")
+	if _, err := h.r.Reconcile(context.Background(), ctrl.Request{NamespacedName: h.sesName}); err == nil {
+		t.Fatal("expected teardown error")
+	}
+	if got := h.get().Status.Phase; got == labsv1.SessionExpired {
+		t.Fatal("session marked Expired although teardown failed")
+	}
+	h.cont.destroyErr = nil
+	h.reconcile()
+	if got := h.get().Status.Phase; got != labsv1.SessionExpired {
+		t.Fatalf("phase = %s", got)
+	}
+}
+
+func TestDeletionWithoutTemplateDestroysNodes(t *testing.T) {
+	h := newHarness(t, template(), session())
+	h.reconcile()
+	h.deleteTemplate()
+	if err := h.c.Delete(context.Background(), h.get()); err != nil {
+		t.Fatal(err)
+	}
+	h.cont.destroyErr = errors.New("transient")
+	if _, err := h.r.Reconcile(context.Background(), ctrl.Request{NamespacedName: h.sesName}); err == nil {
+		t.Fatal("expected destroy error")
+	}
+	if len(h.get().Finalizers) == 0 {
+		t.Fatal("finalizer removed although destroy failed")
+	}
+	h.cont.destroyErr = nil
+	h.reconcile()
+	// Destroy is idempotent; rtr was already destroyed on the failed pass.
+	if len(h.cont.destroyed) != 1 || len(h.netdev.destroyed) != 2 {
+		t.Errorf("destroyed = %v %v", h.cont.destroyed, h.netdev.destroyed)
+	}
+}
+
+func TestTemplateMissingStillExpires(t *testing.T) {
+	h := newHarness(t, session())
+	h.reconcile()
+	if got := h.get().Status.ExpiresAt; got == nil || !got.Time.Equal(t0.Add(MinDefaultTTL)) {
+		t.Fatalf("expiresAt = %v", got)
+	}
+	h.now = t0.Add(MinDefaultTTL + time.Second)
+	h.reconcile()
+	if got := h.get().Status.Phase; got != labsv1.SessionExpired {
+		t.Errorf("phase = %s", got)
+	}
+}
+
+func TestSetupResumesAfterTransientFailure(t *testing.T) {
+	h := newHarness(t, template(), session())
+	h.netdev.execErrAt, h.netdev.execErr = 0, errors.New("connection reset")
+	if _, err := h.r.Reconcile(context.Background(), ctrl.Request{NamespacedName: h.sesName}); err == nil {
+		t.Fatal("expected transient setup error")
+	}
+	if got := h.get().Status.SetupProgress; got != 1 {
+		t.Fatalf("setupProgress = %d, want 1", got)
+	}
+	h.reconcile()
+	s := h.get()
+	if s.Status.Phase != labsv1.SessionReady || s.Status.SetupProgress != 2 {
+		t.Fatalf("phase = %s progress = %d", s.Status.Phase, s.Status.SetupProgress)
+	}
+	if len(h.cont.execs) != 1 {
+		t.Errorf("completed action 0 re-ran: %d container execs", len(h.cont.execs))
+	}
+}
+
+func TestRecreatedNodeRerunsSetup(t *testing.T) {
+	h := newHarness(t, template(), session())
+	h.cont.instance["workstation"] = "pod-a/0"
+	h.reconcile()
+	if len(h.cont.execs) != 1 {
+		t.Fatalf("execs = %d", len(h.cont.execs))
+	}
+	h.reconcile()
+	if len(h.cont.execs) != 1 {
+		t.Fatal("setup re-ran without node change")
+	}
+	h.cont.instance["workstation"] = "pod-a/1" // container restarted
+	h.reconcile()
+	s := h.get()
+	if len(h.cont.execs) != 2 || len(h.netdev.execs) != 2 {
+		t.Errorf("setup not re-run: %d %d", len(h.cont.execs), len(h.netdev.execs))
+	}
+	if s.Status.Phase != labsv1.SessionReady || s.Status.Nodes[0].InstanceID != "pod-a/1" {
+		t.Errorf("status = %+v", s.Status)
+	}
+}
+
+func TestResetGeneration(t *testing.T) {
+	h := newHarness(t, template(), session())
+	h.reconcile()
+	s := h.get()
+	s.Spec.ResetGeneration = 1
+	if err := h.c.Update(context.Background(), s); err != nil {
+		t.Fatal(err)
+	}
+	h.reconcile()
+	s = h.get()
+	if fmt.Sprint(h.cont.resets, h.netdev.resets) != "[workstation] [rtr]" {
+		t.Errorf("resets = %v %v", h.cont.resets, h.netdev.resets)
+	}
+	if s.Status.ObservedResetGeneration != 1 || len(h.cont.execs) != 2 || s.Status.Phase != labsv1.SessionReady {
+		t.Errorf("status = %+v, execs = %d", s.Status, len(h.cont.execs))
+	}
+	h.reconcile()
+	if len(h.cont.resets) != 1 {
+		t.Error("reset repeated")
+	}
+}
+
+func TestProvisionTimeout(t *testing.T) {
+	h := newHarness(t, template(), session())
+	h.cont.phase["workstation"] = labsv1.NodeProvisioning
+	h.reconcile()
+	h.now = h.now.Add(DefaultProvisionTimeout + time.Second)
+	h.reconcile()
+	s := h.get()
+	if s.Status.Phase != labsv1.SessionFailed {
+		t.Fatalf("phase = %s", s.Status.Phase)
+	}
+	if c := cond(s, labsv1.ConditionReady); c == nil || c.Reason != ReasonProvisionTimeout {
+		t.Errorf("Ready = %+v", c)
+	}
+}
+
+func TestHibernatedPhase(t *testing.T) {
+	h := newHarness(t, template(), session())
+	h.reconcile()
+	s := h.get()
+	s.Spec.Hibernate = true
+	if err := h.c.Update(context.Background(), s); err != nil {
+		t.Fatal(err)
+	}
+	h.reconcile()
+	if got := h.get().Status.Phase; got != labsv1.SessionHibernated {
+		t.Errorf("phase = %s", got)
+	}
+}
+
+// topoDriver records session-scoped topology calls.
+type topoDriver struct {
+	*fakeDriver
+	provisioned, destroyed int
+}
+
+func (d *topoDriver) ProvisionTopology(context.Context, drivers.SessionRef) (bool, error) {
+	d.provisioned++
+	return true, nil
+}
+
+func (d *topoDriver) DestroyTopology(context.Context, drivers.SessionRef) error {
+	d.destroyed++
+	return nil
+}
+
+func TestTopologyProvisioner(t *testing.T) {
+	h := newHarness(t, template(), session())
+	td := &topoDriver{fakeDriver: h.netdev}
+	reg, err := drivers.NewRegistry(h.cont, td)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.r.Drivers = reg
+	h.reconcile()
+	if td.provisioned != 1 {
+		t.Errorf("ProvisionTopology calls = %d", td.provisioned)
+	}
+	if err := h.c.Delete(context.Background(), h.get()); err != nil {
+		t.Fatal(err)
+	}
+	h.reconcile()
+	if td.destroyed != 1 {
+		t.Errorf("DestroyTopology calls = %d", td.destroyed)
 	}
 }

@@ -29,10 +29,11 @@ import (
 
 // Labels set on every object a driver creates.
 const (
-	LabelSession   = "labs.cloudtrain.dev/session"
-	LabelNode      = "labs.cloudtrain.dev/node"
-	LabelManagedBy = "app.kubernetes.io/managed-by"
-	ManagedBy      = "cloudtrain-lab-orchestrator"
+	LabelSession    = "labs.cloudtrain.dev/session"
+	LabelSessionUID = "labs.cloudtrain.dev/session-uid"
+	LabelNode       = "labs.cloudtrain.dev/node"
+	LabelManagedBy  = "app.kubernetes.io/managed-by"
+	ManagedBy       = "cloudtrain-lab-orchestrator"
 
 	// ContainerName is the name of the main container of a container node.
 	ContainerName = "node"
@@ -55,6 +56,9 @@ type PodExecutor interface {
 // runc locally) plus a ClusterIP Service, e.g. the learner's jumphost.
 type ContainerDriver struct {
 	Client client.Client
+	// Reader, when set, is an uncached reader (mgr.GetAPIReader()) used to
+	// inspect name conflicts the label-filtered cache cannot see.
+	Reader client.Reader
 	// Scheme, when set, is used to make the session the controller owner of
 	// the Pod and Service so they are garbage-collected with it.
 	Scheme *runtime.Scheme
@@ -78,11 +82,45 @@ var _ NodeDriver = (*ContainerDriver)(nil)
 func (d *ContainerDriver) Name() labsv1.DriverName { return labsv1.DriverContainer }
 
 func (d *ContainerDriver) labels(ref NodeRef) map[string]string {
-	return map[string]string{
-		LabelSession:   ref.Session.Name,
-		LabelNode:      ref.Node.Name,
-		LabelManagedBy: ManagedBy,
+	l := d.selector(ref)
+	l[LabelManagedBy] = ManagedBy
+	return l
+}
+
+// selector identifies the node's objects; it includes the session UID so a
+// recreated session never adopts its predecessor's pod.
+func (d *ContainerDriver) selector(ref NodeRef) map[string]string {
+	l := map[string]string{
+		LabelSession: LabelValue(ref.Session.Name),
+		LabelNode:    LabelValue(ref.Node.Name),
 	}
+	if ref.Session.UID != "" {
+		l[LabelSessionUID] = string(ref.Session.UID)
+	}
+	return l
+}
+
+// owns reports whether obj was created by this driver for ref.
+func (d *ContainerDriver) owns(ref NodeRef, obj client.Object) bool {
+	got := obj.GetLabels()
+	for k, v := range d.labels(ref) {
+		if got[k] != v {
+			return false
+		}
+	}
+	if ref.Session.UID != "" {
+		for _, o := range obj.GetOwnerReferences() {
+			if o.Controller != nil && *o.Controller && o.UID != ref.Session.UID {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func (d *ContainerDriver) conflict(ref NodeRef, obj client.Object) error {
+	return fmt.Errorf("%T %s/%s exists but does not belong to session %s node %s: %w",
+		obj, obj.GetNamespace(), obj.GetName(), ref.Session.Name, ref.Node.Name, ErrConflict)
 }
 
 // ImageFor resolves a catalog image ref to a pullable image.
@@ -175,27 +213,50 @@ func (d *ContainerDriver) BuildService(ref NodeRef) *corev1.Service {
 		},
 		Spec: corev1.ServiceSpec{
 			Type:     corev1.ServiceTypeClusterIP,
-			Selector: map[string]string{LabelSession: ref.Session.Name, LabelNode: ref.Node.Name},
+			Selector: d.selector(ref),
 			Ports:    servicePorts(ref.Node),
 		},
 	}
 }
 
+// createIfAbsent creates obj unless an object of that name exists. An
+// existing object is only accepted if it carries this node's labels (and
+// owner); otherwise a permanent ErrConflict is returned.
 func (d *ContainerDriver) createIfAbsent(ctx context.Context, ref NodeRef, obj client.Object) error {
 	if d.Scheme != nil {
 		if err := controllerutil.SetControllerReference(ref.Session, obj, d.Scheme); err != nil {
 			return err
 		}
 	}
-	err := d.Client.Get(ctx, client.ObjectKeyFromObject(obj), obj.DeepCopyObject().(client.Object))
+	existing := obj.DeepCopyObject().(client.Object)
+	err := d.Client.Get(ctx, client.ObjectKeyFromObject(obj), existing)
 	if err == nil {
+		if !d.owns(ref, existing) {
+			return d.conflict(ref, existing)
+		}
 		return nil
 	}
 	if !apierrors.IsNotFound(err) {
 		return err
 	}
-	if err := d.Client.Create(ctx, obj); err != nil && !apierrors.IsAlreadyExists(err) {
+	err = d.Client.Create(ctx, obj)
+	if err == nil {
+		return nil
+	}
+	if !apierrors.IsAlreadyExists(err) {
 		return err
+	}
+	// Not in the (label-filtered) cache but present: inspect it directly.
+	r := d.Reader
+	if r == nil {
+		r = d.Client
+	}
+	existing = obj.DeepCopyObject().(client.Object)
+	if gerr := r.Get(ctx, client.ObjectKeyFromObject(obj), existing); gerr != nil {
+		return fmt.Errorf("%s exists but cannot be read: %w", obj.GetName(), gerr)
+	}
+	if !d.owns(ref, existing) {
+		return d.conflict(ref, existing)
 	}
 	return nil
 }
@@ -225,6 +286,15 @@ func (d *ContainerDriver) Status(ctx context.Context, ref NodeRef) (NodeState, e
 	if err != nil {
 		return NodeState{}, err
 	}
+	if !d.owns(ref, pod) {
+		return NodeState{Phase: labsv1.NodeFailed, Message: d.conflict(ref, pod).Error()}, d.conflict(ref, pod)
+	}
+	st, err := podState(pod)
+	st.InstanceID = podInstanceID(pod)
+	return st, err
+}
+
+func podState(pod *corev1.Pod) (NodeState, error) {
 	if pod.DeletionTimestamp != nil {
 		return NodeState{Phase: labsv1.NodeProvisioning, Message: "pod terminating"}, nil
 	}
@@ -234,7 +304,11 @@ func (d *ContainerDriver) Status(ctx context.Context, ref NodeRef) (NodeState, e
 	case corev1.PodRunning:
 		for _, c := range pod.Status.Conditions {
 			if c.Type == corev1.PodReady && c.Status == corev1.ConditionTrue {
-				return NodeState{Phase: labsv1.NodeReady}, nil
+				st := NodeState{Phase: labsv1.NodeReady}
+				if pod.Status.PodIP != "" {
+					st.Details = map[string]string{"ip": pod.Status.PodIP}
+				}
+				return st, nil
 			}
 		}
 	}
@@ -245,6 +319,19 @@ func (d *ContainerDriver) Status(ctx context.Context, ref NodeRef) (NodeState, e
 		}
 	}
 	return NodeState{Phase: labsv1.NodeProvisioning, Message: msg}, nil
+}
+
+// podInstanceID changes whenever the node's filesystem was reset: a new pod
+// (UID) or a container restart (RestartPolicy Always discards the writable
+// layer).
+func podInstanceID(pod *corev1.Pod) string {
+	var restarts int32
+	for _, cs := range pod.Status.ContainerStatuses {
+		if cs.Name == ContainerName {
+			restarts = cs.RestartCount
+		}
+	}
+	return fmt.Sprintf("%s/%d", pod.UID, restarts)
 }
 
 // Connect returns the endpoint for an access point.
@@ -318,13 +405,30 @@ func (d *ContainerDriver) Destroy(ctx context.Context, ref NodeRef) error {
 	if err := d.deletePod(ctx, ref); err != nil {
 		return err
 	}
-	svc := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Namespace: ref.Namespace(), Name: ref.ResourceName()}}
-	return client.IgnoreNotFound(d.Client.Delete(ctx, svc))
+	return d.deleteOwned(ctx, ref, &corev1.Service{})
 }
 
 func (d *ContainerDriver) deletePod(ctx context.Context, ref NodeRef) error {
-	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: ref.Namespace(), Name: ref.ResourceName()}}
-	return client.IgnoreNotFound(d.Client.Delete(ctx, pod, client.PropagationPolicy(metav1.DeletePropagationBackground)))
+	return d.deleteOwned(ctx, ref, &corev1.Pod{}, client.PropagationPolicy(metav1.DeletePropagationBackground))
+}
+
+// deleteOwned deletes the node's object of obj's kind, but only if it is
+// ours (and still the same object, via a UID precondition). Someone else's
+// object of that name yields ErrConflict and is left alone.
+func (d *ContainerDriver) deleteOwned(ctx context.Context, ref NodeRef, obj client.Object, opts ...client.DeleteOption) error {
+	err := d.Client.Get(ctx, client.ObjectKey{Namespace: ref.Namespace(), Name: ref.ResourceName()}, obj)
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !d.owns(ref, obj) {
+		return d.conflict(ref, obj)
+	}
+	uid := obj.GetUID()
+	opts = append(opts, client.Preconditions{UID: &uid})
+	return client.IgnoreNotFound(d.Client.Delete(ctx, obj, opts...))
 }
 
 // RESTPodExecutor execs into pods through the API server (SPDY, falling

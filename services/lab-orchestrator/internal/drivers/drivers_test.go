@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -65,7 +66,7 @@ func TestContainerProvisionCreatesPodAndService(t *testing.T) {
 	}
 
 	pod := &corev1.Pod{}
-	if err := c.Get(ctx, client.ObjectKey{Namespace: "labs", Name: "s-abc-workstation"}, pod); err != nil {
+	if err := c.Get(ctx, client.ObjectKey{Namespace: "labs", Name: ref.ResourceName()}, pod); err != nil {
 		t.Fatal(err)
 	}
 	ctr := pod.Spec.Containers[0]
@@ -81,7 +82,7 @@ func TestContainerProvisionCreatesPodAndService(t *testing.T) {
 	if pod.Spec.Hostname != "workstation" || *pod.Spec.RuntimeClassName != "kata" || *pod.Spec.AutomountServiceAccountToken {
 		t.Errorf("pod spec = %+v", pod.Spec)
 	}
-	if pod.Labels[LabelSession] != "s-abc" || pod.Labels[LabelNode] != "workstation" {
+	if pod.Labels[LabelSession] != "s-abc" || pod.Labels[LabelNode] != "workstation" || pod.Labels[LabelSessionUID] != "uid-1" {
 		t.Errorf("labels = %v", pod.Labels)
 	}
 	if len(pod.OwnerReferences) != 1 || pod.OwnerReferences[0].Kind != "LabSession" || !*pod.OwnerReferences[0].Controller {
@@ -89,7 +90,7 @@ func TestContainerProvisionCreatesPodAndService(t *testing.T) {
 	}
 
 	svc := &corev1.Service{}
-	if err := c.Get(ctx, client.ObjectKey{Namespace: "labs", Name: "s-abc-workstation"}, svc); err != nil {
+	if err := c.Get(ctx, client.ObjectKey{Namespace: "labs", Name: ref.ResourceName()}, svc); err != nil {
 		t.Fatal(err)
 	}
 	var ports []string
@@ -99,7 +100,7 @@ func TestContainerProvisionCreatesPodAndService(t *testing.T) {
 	if strings.Join(ports, ",") != "ssh,web" {
 		t.Errorf("ports = %v", ports)
 	}
-	if svc.Spec.Selector[LabelNode] != "workstation" {
+	if svc.Spec.Selector[LabelNode] != "workstation" || svc.Spec.Selector[LabelSessionUID] != "uid-1" {
 		t.Errorf("selector = %v", svc.Spec.Selector)
 	}
 
@@ -112,7 +113,8 @@ func TestContainerProvisionCreatesPodAndService(t *testing.T) {
 func TestContainerStatus(t *testing.T) {
 	ref := jumphostRef()
 	pod := func(mut func(p *corev1.Pod)) *corev1.Pod {
-		p := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "labs", Name: ref.ResourceName()}}
+		p := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "labs", Name: ref.ResourceName(),
+			Labels: (&ContainerDriver{}).labels(ref)}}
 		mut(p)
 		return p
 	}
@@ -151,14 +153,16 @@ func TestContainerStatus(t *testing.T) {
 func TestContainerConnect(t *testing.T) {
 	d, _ := newContainerDriver(t)
 	ref := jumphostRef()
+	rn := ref.ResourceName()
+	host := rn + ".labs.svc.cluster.local"
 	tests := []struct {
 		access  labsv1.AccessType
 		want    labsv1.Endpoint
 		wantErr error
 	}{
-		{labsv1.AccessShell, labsv1.Endpoint{Node: "workstation", Access: "shell", Protocol: "k8s-exec", Target: "labs/s-abc-workstation/node"}, nil},
-		{labsv1.AccessSSH, labsv1.Endpoint{Node: "workstation", Access: "ssh", Protocol: "ssh", Host: "s-abc-workstation.labs.svc.cluster.local", Port: 22}, nil},
-		{labsv1.AccessWeb, labsv1.Endpoint{Node: "workstation", Access: "web", Protocol: "http", Host: "s-abc-workstation.labs.svc.cluster.local", Port: 80, URL: "http://s-abc-workstation.labs.svc.cluster.local:80/"}, nil},
+		{labsv1.AccessShell, labsv1.Endpoint{Node: "workstation", Access: "shell", Protocol: "k8s-exec", Target: "labs/" + rn + "/node"}, nil},
+		{labsv1.AccessSSH, labsv1.Endpoint{Node: "workstation", Access: "ssh", Protocol: "ssh", Host: host, Port: 22}, nil},
+		{labsv1.AccessWeb, labsv1.Endpoint{Node: "workstation", Access: "web", Protocol: "http", Host: host, Port: 80, URL: "http://" + host + ":80/"}, nil},
 		{labsv1.AccessRDP, labsv1.Endpoint{}, ErrUnsupported},
 	}
 	for _, tt := range tests {
@@ -229,6 +233,7 @@ func (r *recordingExecutor) Exec(_ context.Context, ns, pod, container string, c
 func TestContainerExec(t *testing.T) {
 	ctx := context.Background()
 	ref := jumphostRef()
+	pfx := "labs " + ref.ResourceName() + " node "
 	tests := []struct {
 		name     string
 		req      ExecRequest
@@ -238,9 +243,9 @@ func TestContainerExec(t *testing.T) {
 		wantExit int
 		wantErr  error
 	}{
-		{name: "admin shell", req: ExecRequest{Command: []string{"sh", "-c", "id"}, Stdin: []byte("in")}, wantCmd: "labs s-abc-workstation node sh -c id"},
-		{name: "as learner", req: ExecRequest{User: labsv1.ActionAsLearner, Command: []string{"whoami"}}, wantCmd: "labs s-abc-workstation node runuser -u learner -- whoami"},
-		{name: "non-zero exit", req: ExecRequest{Command: []string{"false"}}, execErr: utilexec.CodeExitError{Err: errors.New("x"), Code: 3}, wantCmd: "labs s-abc-workstation node false", wantExit: 3},
+		{name: "admin shell", req: ExecRequest{Command: []string{"sh", "-c", "id"}, Stdin: []byte("in")}, wantCmd: pfx + "sh -c id"},
+		{name: "as learner", req: ExecRequest{User: labsv1.ActionAsLearner, Command: []string{"whoami"}}, wantCmd: pfx + "runuser -u learner -- whoami"},
+		{name: "non-zero exit", req: ExecRequest{Command: []string{"false"}}, execErr: utilexec.CodeExitError{Err: errors.New("x"), Code: 3}, wantCmd: pfx + "false", wantExit: 3},
 		{name: "apply unsupported", req: ExecRequest{Kind: ExecKubeApply, Command: []string{"x"}}, wantErr: ErrUnsupported},
 		{name: "no executor", req: ExecRequest{Command: []string{"x"}}, noExec: true, wantErr: ErrNotImplemented},
 	}
@@ -288,15 +293,72 @@ func TestImageFor(t *testing.T) {
 }
 
 func TestResourceName(t *testing.T) {
-	if got := ResourceName("s1", "ws"); got != "s1-ws" {
-		t.Errorf("got %q", got)
+	dns1035 := regexp.MustCompile(`^[a-z]([-a-z0-9]*[a-z0-9])?$`)
+	cases := []struct{ session, uid, node, prefix string }{
+		{"s1", "u", "ws", "s1-ws-"},
+		{"1s", "u", "ws", "ls-1s-ws-"},
+		{"lab.v2", "u", "web", "lab-v2-web-"},
+		{strings.Repeat("a", 60), "u", "workstation", "aaaa"},
 	}
-	if got := ResourceName("1s", "ws"); got != "ls-1s-ws" {
-		t.Errorf("got %q", got)
+	for _, c := range cases {
+		got := ResourceName(c.session, c.uid, c.node)
+		if !strings.HasPrefix(got, c.prefix) || len(got) > 63 || !dns1035.MatchString(got) {
+			t.Errorf("ResourceName(%q, %q) = %q", c.session, c.node, got)
+		}
+		if got != ResourceName(c.session, c.uid, c.node) {
+			t.Errorf("not deterministic: %q", got)
+		}
 	}
-	long := ResourceName(strings.Repeat("a", 60), "workstation")
-	if len(long) != 63 || long != ResourceName(strings.Repeat("a", 60), "workstation") {
-		t.Errorf("long name %q (%d)", long, len(long))
+	// "lab-x"/"web" and "lab"/"x-web" must not collide, nor a recreated session.
+	if ResourceName("lab-x", "u", "web") == ResourceName("lab", "u", "x-web") {
+		t.Error("ambiguous names collide")
+	}
+	if ResourceName("lab", "u1", "web") == ResourceName("lab", "u2", "web") {
+		t.Error("recreated session reuses names")
+	}
+}
+
+func TestContainerRefusesForeignObjects(t *testing.T) {
+	ctx := context.Background()
+	ref := jumphostRef()
+	foreign := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "labs", Name: ref.ResourceName(),
+		Labels: map[string]string{LabelSession: "other", LabelNode: "workstation"}}}
+	d, c := newContainerDriver(t, foreign)
+
+	if _, err := d.Provision(ctx, ref); !errors.Is(err, ErrConflict) || !IsPermanent(err) {
+		t.Fatalf("provision err = %v, want permanent ErrConflict", err)
+	}
+	if err := d.Destroy(ctx, ref); !errors.Is(err, ErrConflict) {
+		t.Fatalf("destroy err = %v, want ErrConflict", err)
+	}
+	if err := c.Get(ctx, client.ObjectKeyFromObject(foreign), &corev1.Pod{}); err != nil {
+		t.Errorf("foreign pod was deleted: %v", err)
+	}
+}
+
+func TestContainerInstanceID(t *testing.T) {
+	ref := jumphostRef()
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "labs", Name: ref.ResourceName(), UID: "pod-1"}}
+	d, c := newContainerDriver(t)
+	if _, err := d.Provision(context.Background(), ref); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(pod), pod); err != nil {
+		t.Fatal(err)
+	}
+	pod.Status.Phase = corev1.PodRunning
+	pod.Status.PodIP = "10.0.0.7"
+	pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
+	pod.Status.ContainerStatuses = []corev1.ContainerStatus{{Name: ContainerName, RestartCount: 2}}
+	if err := c.Status().Update(context.Background(), pod); err != nil {
+		t.Fatal(err)
+	}
+	st, err := d.Status(context.Background(), ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.InstanceID != string(pod.UID)+"/2" || st.Details["ip"] != "10.0.0.7" {
+		t.Errorf("state = %+v", st)
 	}
 }
 

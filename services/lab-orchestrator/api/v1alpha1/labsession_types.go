@@ -5,7 +5,7 @@ import (
 )
 
 // LabSessionPhase is the coarse lifecycle phase of a LabSession.
-// +kubebuilder:validation:Enum=Pending;Provisioning;Ready;Grading;Expired;Failed
+// +kubebuilder:validation:Enum=Pending;Provisioning;Ready;Grading;Hibernated;Expired;Failed
 type LabSessionPhase string
 
 const (
@@ -13,6 +13,7 @@ const (
 	SessionProvisioning LabSessionPhase = "Provisioning"
 	SessionReady        LabSessionPhase = "Ready"
 	SessionGrading      LabSessionPhase = "Grading"
+	SessionHibernated   LabSessionPhase = "Hibernated"
 	SessionExpired      LabSessionPhase = "Expired"
 	SessionFailed       LabSessionPhase = "Failed"
 )
@@ -67,6 +68,12 @@ type LabSessionSpec struct {
 	// support it stop their workloads; endpoints are withdrawn).
 	// +optional
 	Hibernate bool `json:"hibernate,omitempty"`
+	// ResetGeneration requests a lab reset: whenever it is raised above
+	// status.observedResetGeneration, every node is reset through its driver
+	// and the setup actions run again.
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	ResetGeneration int64 `json:"resetGeneration,omitempty"`
 	// WarmPoolRef names the WarmPool that pre-provisioned this session, if any.
 	// +optional
 	WarmPoolRef string `json:"warmPoolRef,omitempty"`
@@ -91,6 +98,22 @@ type NodeStatus struct {
 	Phase  NodePhase  `json:"phase"`
 	// +optional
 	Message string `json:"message,omitempty"`
+	// InstanceID identifies the node's current backing instance (e.g. pod UID
+	// plus restart count). A change means the node was recreated from its
+	// image and setup must run again.
+	// +optional
+	InstanceID string `json:"instanceID,omitempty"`
+	// Details are driver-reported facts about the node (addresses, cluster
+	// member states, ...) for the grader and other nodes.
+	// +optional
+	Details map[string]string `json:"details,omitempty"`
+}
+
+// SecretKeyRef selects a key of a Secret in the session's namespace.
+type SecretKeyRef struct {
+	Name string `json:"name"`
+	// +optional
+	Key string `json:"key,omitempty"`
 }
 
 // Endpoint is how the access gateway reaches one access point of a node.
@@ -109,6 +132,10 @@ type Endpoint struct {
 	Target string `json:"target,omitempty"`
 	// +optional
 	URL string `json:"url,omitempty"`
+	// SecretRef points at the credential for this endpoint (kubeconfig,
+	// password, private key) in the session's namespace.
+	// +optional
+	SecretRef *SecretKeyRef `json:"secretRef,omitempty"`
 }
 
 // LabSessionStatus is the observed state of a LabSession.
@@ -138,6 +165,18 @@ type LabSessionStatus struct {
 	ReadyAt *metav1.Time `json:"readyAt,omitempty"`
 	// +optional
 	Hibernated bool `json:"hibernated,omitempty"`
+	// Topology is the resolved topology the session's resources were
+	// provisioned from. It is recorded before anything is provisioned and
+	// drives teardown, so cleanup never depends on the live LabTemplate.
+	// +optional
+	Topology *Topology `json:"topology,omitempty"`
+	// SetupProgress is the number of setup actions completed so far; it is
+	// persisted after every action so retries resume instead of re-running.
+	// +optional
+	SetupProgress int32 `json:"setupProgress,omitempty"`
+	// ObservedResetGeneration is the last spec.resetGeneration acted upon.
+	// +optional
+	ObservedResetGeneration int64 `json:"observedResetGeneration,omitempty"`
 }
 
 // +kubebuilder:object:root=true

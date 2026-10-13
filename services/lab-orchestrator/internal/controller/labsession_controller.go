@@ -17,6 +17,7 @@ import (
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -36,6 +37,15 @@ const (
 	requeueProvisioning  = 5 * time.Second
 	requeueTemplateWait  = 30 * time.Second
 	defaultActionTimeout = 2 * time.Minute
+	// maxActionTimeout caps a single setup action (the schema leaves
+	// timeoutSec unbounded) so one session cannot pin a worker indefinitely.
+	maxActionTimeout = 10 * time.Minute
+
+	// DefaultProvisionTimeout fails a session whose nodes are not ready in time
+	// (ImagePullBackOff, CrashLoopBackOff, a VM that never boots).
+	DefaultProvisionTimeout = 15 * time.Minute
+	// DefaultMaxConcurrentReconciles bounds parallel session reconciles.
+	DefaultMaxConcurrentReconciles = 8
 )
 
 // Condition reasons.
@@ -55,6 +65,12 @@ const (
 	ReasonAwake            = "Awake"
 	ReasonExpired          = "Expired"
 	ReasonActive           = "Active"
+	ReasonExpiring         = "TeardownPending"
+	ReasonHibernating      = "Hibernating"
+	ReasonNodeReplaced     = "NodeReplaced"
+	ReasonResetRequested   = "ResetRequested"
+	ReasonResetFailed      = "ResetFailed"
+	ReasonProvisionTimeout = "ProvisionTimeout"
 )
 
 // LabSessionReconciler walks a session's topology nodes through their
@@ -66,6 +82,12 @@ type LabSessionReconciler struct {
 	Recorder record.EventRecorder
 	// Now is injectable for tests; defaults to time.Now.
 	Now func() time.Time
+	// ProvisionTimeout defaults to DefaultProvisionTimeout.
+	ProvisionTimeout time.Duration
+	// MaxConcurrentReconciles defaults to DefaultMaxConcurrentReconciles.
+	// Setup actions run inside Reconcile, so this must be > 1 for one slow
+	// session not to stall every other one.
+	MaxConcurrentReconciles int
 }
 
 // +kubebuilder:rbac:groups=labs.cloudtrain.dev,resources=labsessions,verbs=get;list;watch;update;patch
@@ -75,6 +97,10 @@ type LabSessionReconciler struct {
 // +kubebuilder:rbac:groups="",resources=pods;services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=pods/exec,verbs=create
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
+// +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
+// +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=authentication.k8s.io,resources=tokenreviews,verbs=create
+// +kubebuilder:rbac:groups=authorization.k8s.io,resources=subjectaccessreviews,verbs=create
 
 func (r *LabSessionReconciler) now() time.Time {
 	if r.Now != nil {
@@ -90,6 +116,10 @@ func (r *LabSessionReconciler) event(obj runtime.Object, typ, reason, msg string
 }
 
 // Reconcile drives one LabSession towards its desired state.
+//
+// Status is written with a JSON merge patch (no optimistic lock), so fields
+// other writers own (e.g. phase Grading) survive and our own progress is
+// never thrown away on a conflict.
 func (r *LabSessionReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
@@ -98,15 +128,12 @@ func (r *LabSessionReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	tpl, tplErr := r.template(ctx, s)
-
-	// Deletion: destroy node resources, then release the finalizer.
+	// Deletion: destroy node resources, then release the finalizer. Teardown
+	// uses the topology recorded in status, never only the live template.
 	if !s.DeletionTimestamp.IsZero() {
 		if controllerutil.ContainsFinalizer(s, Finalizer) {
-			if tpl != nil {
-				if err := r.destroyAll(ctx, s, tpl); err != nil {
-					return ctrl.Result{}, err
-				}
+			if err := r.teardown(ctx, s); err != nil {
+				return ctrl.Result{}, err
 			}
 			controllerutil.RemoveFinalizer(s, Finalizer)
 			if err := r.Update(ctx, s); err != nil {
@@ -122,16 +149,23 @@ func (r *LabSessionReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		}
 	}
 
-	orig := s.Status.DeepCopy()
-	res, err := r.reconcileSession(ctx, s, tpl, tplErr)
-	s.Status.ObservedGeneration = s.Generation
-	if !statusEqual(orig, &s.Status) {
-		if uerr := r.Status().Update(ctx, s); uerr != nil {
-			if apierrors.IsConflict(uerr) {
-				return ctrl.Result{Requeue: true}, nil
-			}
-			return ctrl.Result{}, errors.Join(err, uerr)
+	base := s.DeepCopy()
+	save := func(ctx context.Context) error {
+		s.Status.ObservedGeneration = s.Generation
+		if statusEqual(&base.Status, &s.Status) {
+			return nil
 		}
+		if err := r.Status().Patch(ctx, s, client.MergeFrom(base)); err != nil {
+			return err
+		}
+		base = s.DeepCopy()
+		return nil
+	}
+
+	tpl, tplErr := r.template(ctx, s)
+	res, err := r.reconcileSession(ctx, s, tpl, tplErr, save)
+	if uerr := save(ctx); uerr != nil {
+		return ctrl.Result{}, errors.Join(err, uerr)
 	}
 	if err != nil {
 		log.Error(err, "reconcile failed", "phase", s.Status.Phase)
@@ -161,24 +195,25 @@ type resolveError struct{ error }
 
 func (e *resolveError) Unwrap() error { return e.error }
 
-func (r *LabSessionReconciler) reconcileSession(ctx context.Context, s *labsv1.LabSession, tpl *resolvedTemplate, tplErr error) (ctrl.Result, error) {
+type saveFunc func(context.Context) error
+
+func (r *LabSessionReconciler) reconcileSession(ctx context.Context, s *labsv1.LabSession, tpl *resolvedTemplate, tplErr error, save saveFunc) (ctrl.Result, error) {
 	st := &s.Status
 	if st.Phase == "" {
 		st.Phase = labsv1.SessionPending
 	}
 
-	// Terminal phases: an expired session stays expired; resources are gone.
+	// Terminal phase: an expired session stays expired; its resources are gone
+	// (expire only sets it after teardown succeeded).
 	if st.Phase == labsv1.SessionExpired {
 		return ctrl.Result{}, nil
 	}
 
 	now := r.now()
-	if tpl != nil || s.Spec.ExpiresAt != nil || s.Spec.TTL != nil {
-		exp := expiry(s, tpl)
-		st.ExpiresAt = &exp
-	}
-	if st.ExpiresAt != nil && !now.Before(st.ExpiresAt.Time) {
-		return r.expire(ctx, s, tpl)
+	exp := expiry(s, tpl)
+	st.ExpiresAt = &exp
+	if !now.Before(exp.Time) {
+		return r.expire(ctx, s)
 	}
 	r.setCondition(s, labsv1.ConditionExpired, metav1.ConditionFalse, ReasonActive, "session has not expired")
 
@@ -202,6 +237,15 @@ func (r *LabSessionReconciler) reconcileSession(ctx context.Context, s *labsv1.L
 		return r.requeueBeforeExpiry(s, 0), nil
 	}
 
+	// Record what is about to be provisioned before provisioning anything,
+	// so teardown works even if the template disappears later.
+	if snap := snapshotTopology(st.Topology, &tpl.spec.Topology); !apiequality.Semantic.DeepEqual(snap, st.Topology) {
+		st.Topology = snap
+		if err := save(ctx); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
 	st.ResolvedParams = tpl.values
 	st.EntryNode = tpl.spec.Topology.Entry
 	r.setCondition(s, labsv1.ConditionTemplateResolved, metav1.ConditionTrue, ReasonResolved, "template found and params resolved")
@@ -211,8 +255,32 @@ func (r *LabSessionReconciler) reconcileSession(ctx context.Context, s *labsv1.L
 	}
 	if st.Hibernated {
 		st.Hibernated = false
+		if st.Phase == labsv1.SessionHibernated {
+			st.Phase = labsv1.SessionProvisioning
+		}
 		r.setCondition(s, labsv1.ConditionHibernated, metav1.ConditionFalse, ReasonAwake, "session resumed")
 		r.setCondition(s, labsv1.ConditionReady, metav1.ConditionFalse, ReasonProvisioning, "resuming nodes")
+	}
+
+	// Spec-driven reset: reset every node and run setup again.
+	if s.Spec.ResetGeneration > st.ObservedResetGeneration {
+		if err := r.resetNodes(ctx, s, tpl); err != nil {
+			if drivers.IsPermanent(err) {
+				st.ObservedResetGeneration = s.Spec.ResetGeneration
+				return r.fail(s, ReasonResetFailed, err.Error()), nil
+			}
+			return ctrl.Result{}, err
+		}
+		st.ObservedResetGeneration = s.Spec.ResetGeneration
+		r.rearmSetup(s, ReasonResetRequested, "lab reset requested")
+		if err := save(ctx); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
+	// Session-scoped resources (links, shared networks) come first.
+	if res, done, err := r.provisionTopology(ctx, s, tpl); !done {
+		return res, err
 	}
 
 	// Provision every node (idempotent).
@@ -221,6 +289,7 @@ func (r *LabSessionReconciler) reconcileSession(ctx context.Context, s *labsv1.L
 	var transient error
 	for _, n := range tpl.spec.Topology.Nodes {
 		ns := labsv1.NodeStatus{Name: n.Name, Driver: n.Driver}
+		prev, _ := findNodeStatus(st.Nodes, n.Name)
 		d, err := r.Drivers.Get(n.Driver)
 		var state drivers.NodeState
 		if err == nil {
@@ -235,7 +304,7 @@ func (r *LabSessionReconciler) reconcileSession(ctx context.Context, s *labsv1.L
 			r.event(s, "Warning", ReasonNodeFailed, fmt.Sprintf("node %s: %v", n.Name, err))
 			return r.fail(s, ReasonNodeFailed, fmt.Sprintf("node %s: %v", n.Name, err)), nil
 		case err != nil:
-			ns.Phase, ns.Message = labsv1.NodeProvisioning, err.Error()
+			ns.Phase, ns.Message, ns.InstanceID = labsv1.NodeProvisioning, err.Error(), prev.InstanceID
 			transient = errors.Join(transient, fmt.Errorf("node %s: %w", n.Name, err))
 			allReady = false
 		case state.Phase == labsv1.NodeFailed:
@@ -246,10 +315,21 @@ func (r *LabSessionReconciler) reconcileSession(ctx context.Context, s *labsv1.L
 			r.setCondition(s, labsv1.ConditionNodesReady, metav1.ConditionFalse, ReasonNodeFailed, msg)
 			return r.fail(s, ReasonNodeFailed, msg), nil
 		default:
-			ns.Phase, ns.Message = state.Phase, state.Message
+			ns.Phase, ns.Message, ns.Details = state.Phase, state.Message, state.Details
+			ns.InstanceID = state.InstanceID
+			if ns.InstanceID == "" {
+				ns.InstanceID = prev.InstanceID
+			}
 			if state.Phase != labsv1.NodeReady {
 				allReady = false
 			}
+		}
+		// A recreated node (new pod, restarted container, replaced VM) lost
+		// whatever setup did to it: run setup again.
+		if prev.InstanceID != "" && ns.InstanceID != prev.InstanceID && setupStarted(s) {
+			msg := fmt.Sprintf("node %s was recreated (%s -> %s); re-running setup", n.Name, prev.InstanceID, ns.InstanceID)
+			r.rearmSetup(s, ReasonNodeReplaced, msg)
+			r.event(s, "Warning", ReasonNodeReplaced, msg)
 		}
 		nodes = append(nodes, ns)
 	}
@@ -259,8 +339,15 @@ func (r *LabSessionReconciler) reconcileSession(ctx context.Context, s *labsv1.L
 		if st.Phase != labsv1.SessionGrading {
 			st.Phase = labsv1.SessionProvisioning
 		}
-		r.setCondition(s, labsv1.ConditionNodesReady, metav1.ConditionFalse, ReasonProvisioning, notReadySummary(nodes))
+		summary := notReadySummary(nodes)
+		r.setCondition(s, labsv1.ConditionNodesReady, metav1.ConditionFalse, ReasonProvisioning, summary)
 		r.setCondition(s, labsv1.ConditionReady, metav1.ConditionFalse, ReasonProvisioning, "nodes are provisioning")
+		if c := meta.FindStatusCondition(st.Conditions, labsv1.ConditionNodesReady); c != nil &&
+			now.Sub(c.LastTransitionTime.Time) > r.provisionTimeout() {
+			msg := fmt.Sprintf("nodes not ready after %s: %s", r.provisionTimeout(), summary)
+			r.event(s, "Warning", ReasonProvisionTimeout, msg)
+			return r.fail(s, ReasonProvisionTimeout, msg), nil
+		}
 		if transient != nil {
 			return ctrl.Result{}, transient
 		}
@@ -268,12 +355,13 @@ func (r *LabSessionReconciler) reconcileSession(ctx context.Context, s *labsv1.L
 	}
 	r.setCondition(s, labsv1.ConditionNodesReady, metav1.ConditionTrue, ReasonNodesReady, "all nodes are ready")
 
-	// Setup runs once per session.
+	// Setup runs once per node incarnation; progress is persisted per action.
 	if !meta.IsStatusConditionTrue(st.Conditions, labsv1.ConditionSetupComplete) {
 		if st.Phase != labsv1.SessionGrading {
 			st.Phase = labsv1.SessionProvisioning
 		}
-		if err := r.runActions(ctx, s, tpl, tpl.spec.Setup); err != nil {
+		st.Endpoints = nil
+		if err := r.runSetup(ctx, s, tpl, save); err != nil {
 			if drivers.IsPermanent(err) || errors.Is(err, errActionFailed) {
 				r.setCondition(s, labsv1.ConditionSetupComplete, metav1.ConditionFalse, ReasonSetupFailed, err.Error())
 				return r.fail(s, ReasonSetupFailed, err.Error()), nil
@@ -318,16 +406,97 @@ func (r *LabSessionReconciler) reconcileSession(ctx context.Context, s *labsv1.L
 	return r.requeueBeforeExpiry(s, 0), nil
 }
 
-// expire destroys all node resources and marks the session Expired.
-func (r *LabSessionReconciler) expire(ctx context.Context, s *labsv1.LabSession, tpl *resolvedTemplate) (ctrl.Result, error) {
-	if tpl != nil {
-		if err := r.destroyAll(ctx, s, tpl); err != nil {
-			return ctrl.Result{}, err
+func (r *LabSessionReconciler) provisionTimeout() time.Duration {
+	if r.ProvisionTimeout > 0 {
+		return r.ProvisionTimeout
+	}
+	return DefaultProvisionTimeout
+}
+
+// setupStarted reports whether any setup action has run on the current nodes.
+func setupStarted(s *labsv1.LabSession) bool {
+	return s.Status.SetupProgress > 0 || meta.IsStatusConditionTrue(s.Status.Conditions, labsv1.ConditionSetupComplete)
+}
+
+// rearmSetup makes setup run again from the first action.
+func (r *LabSessionReconciler) rearmSetup(s *labsv1.LabSession, reason, msg string) {
+	s.Status.SetupProgress = 0
+	s.Status.Endpoints = nil
+	r.setCondition(s, labsv1.ConditionSetupComplete, metav1.ConditionFalse, reason, msg)
+	r.setCondition(s, labsv1.ConditionReady, metav1.ConditionFalse, reason, msg)
+	if s.Status.Phase != labsv1.SessionGrading {
+		s.Status.Phase = labsv1.SessionProvisioning
+	}
+}
+
+// resetNodes resets every node through its driver.
+func (r *LabSessionReconciler) resetNodes(ctx context.Context, s *labsv1.LabSession, tpl *resolvedTemplate) error {
+	for _, n := range tpl.spec.Topology.Nodes {
+		d, err := r.Drivers.Get(n.Driver)
+		if err != nil {
+			return err
 		}
-		for i := range s.Status.Nodes {
-			s.Status.Nodes[i].Phase = labsv1.NodeDestroyed
-			s.Status.Nodes[i].Message = ""
+		if err := d.Reset(ctx, r.ref(s, tpl, n)); err != nil {
+			return fmt.Errorf("reset node %s: %w", n.Name, err)
 		}
+	}
+	r.event(s, "Normal", ReasonResetRequested, "lab nodes reset")
+	return nil
+}
+
+// provisionTopology runs ProvisionTopology for every driver of the topology
+// that has session-scoped resources. done=false means the caller must return
+// (res, err) now.
+func (r *LabSessionReconciler) provisionTopology(ctx context.Context, s *labsv1.LabSession, tpl *resolvedTemplate) (ctrl.Result, bool, error) {
+	for _, tp := range r.topologyProvisioners(&tpl.spec.Topology) {
+		ready, err := tp.ProvisionTopology(ctx, drivers.SessionRef{Session: s, Template: tpl.spec})
+		switch {
+		case err != nil && drivers.IsPermanent(err):
+			return r.fail(s, ReasonNodeFailed, fmt.Sprintf("topology: %v", err)), false, nil
+		case err != nil:
+			return ctrl.Result{}, false, fmt.Errorf("topology: %w", err)
+		case !ready:
+			if s.Status.Phase != labsv1.SessionGrading {
+				s.Status.Phase = labsv1.SessionProvisioning
+			}
+			r.setCondition(s, labsv1.ConditionReady, metav1.ConditionFalse, ReasonProvisioning, "topology is provisioning")
+			return r.requeueBeforeExpiry(s, requeueProvisioning), false, nil
+		}
+	}
+	return ctrl.Result{}, true, nil
+}
+
+// topologyProvisioners returns, once each and in topology order, the drivers
+// of topo that implement TopologyProvisioner.
+func (r *LabSessionReconciler) topologyProvisioners(topo *labsv1.Topology) []drivers.TopologyProvisioner {
+	var out []drivers.TopologyProvisioner
+	seen := map[labsv1.DriverName]bool{}
+	for _, n := range topo.Nodes {
+		if seen[n.Driver] {
+			continue
+		}
+		seen[n.Driver] = true
+		d, err := r.Drivers.Get(n.Driver)
+		if err != nil {
+			continue
+		}
+		if tp, ok := d.(drivers.TopologyProvisioner); ok {
+			out = append(out, tp)
+		}
+	}
+	return out
+}
+
+// expire destroys all node resources and only then marks the session Expired.
+func (r *LabSessionReconciler) expire(ctx context.Context, s *labsv1.LabSession) (ctrl.Result, error) {
+	if err := r.teardown(ctx, s); err != nil {
+		r.setCondition(s, labsv1.ConditionExpired, metav1.ConditionFalse, ReasonExpiring, "teardown failed: "+err.Error())
+		return ctrl.Result{}, err
+	}
+	for i := range s.Status.Nodes {
+		s.Status.Nodes[i].Phase = labsv1.NodeDestroyed
+		s.Status.Nodes[i].Message = ""
+		s.Status.Nodes[i].Details = nil
 	}
 	s.Status.Phase = labsv1.SessionExpired
 	s.Status.Endpoints = nil
@@ -341,6 +510,7 @@ func (r *LabSessionReconciler) expire(ctx context.Context, s *labsv1.LabSession,
 func (r *LabSessionReconciler) hibernate(ctx context.Context, s *labsv1.LabSession, tpl *resolvedTemplate) (ctrl.Result, error) {
 	st := &s.Status
 	nodes := mergeNodes(st.Nodes, tpl.spec.Topology.Nodes)
+	settled := true
 	for i, n := range tpl.spec.Topology.Nodes {
 		d, err := r.Drivers.Get(n.Driver)
 		if err != nil {
@@ -350,61 +520,149 @@ func (r *LabSessionReconciler) hibernate(ctx context.Context, s *labsv1.LabSessi
 		if !ok {
 			continue // e.g. container nodes keep running (see ContainerDriver)
 		}
-		if err := h.Hibernate(ctx, r.ref(s, tpl, n)); err != nil {
+		ref := r.ref(s, tpl, n)
+		if err := h.Hibernate(ctx, ref); err != nil {
 			if drivers.IsPermanent(err) {
 				nodes[i].Message = fmt.Sprintf("hibernate: %v", err)
 				continue
 			}
 			return ctrl.Result{}, err
 		}
-		nodes[i].Phase, nodes[i].Message = labsv1.NodeHibernated, ""
+		state, err := d.Status(ctx, ref)
+		if err != nil {
+			if !drivers.IsPermanent(err) {
+				return ctrl.Result{}, err
+			}
+			state = drivers.NodeState{Phase: labsv1.NodeHibernated}
+		}
+		nodes[i].Phase, nodes[i].Message = state.Phase, state.Message
+		if state.Phase != labsv1.NodeHibernated {
+			settled = false
+		}
 	}
 	st.Nodes = nodes
 	st.Hibernated = true
 	st.Endpoints = nil
-	r.setCondition(s, labsv1.ConditionHibernated, metav1.ConditionTrue, ReasonHibernated, "session is hibernated")
+	if st.Phase != labsv1.SessionGrading {
+		st.Phase = labsv1.SessionHibernated
+	}
 	r.setCondition(s, labsv1.ConditionReady, metav1.ConditionFalse, ReasonHibernated, "session is hibernated")
+	if !settled {
+		r.setCondition(s, labsv1.ConditionHibernated, metav1.ConditionFalse, ReasonHibernating, "nodes are stopping")
+		return r.requeueBeforeExpiry(s, requeueProvisioning), nil
+	}
+	r.setCondition(s, labsv1.ConditionHibernated, metav1.ConditionTrue, ReasonHibernated, "session is hibernated")
 	return r.requeueBeforeExpiry(s, 0), nil
 }
 
-func (r *LabSessionReconciler) destroyAll(ctx context.Context, s *labsv1.LabSession, tpl *resolvedTemplate) error {
+// teardown destroys every node recorded in status.topology (falling back to
+// the live template only if nothing was recorded), then session-scoped
+// topology resources. Errors keep the caller from releasing the session.
+func (r *LabSessionReconciler) teardown(ctx context.Context, s *labsv1.LabSession) error {
+	spec := &labsv1.LabTemplateSpec{}
+	switch {
+	case s.Status.Topology != nil:
+		spec.Topology = *s.Status.Topology
+	default:
+		tpl, err := r.template(ctx, s)
+		var re *resolveError
+		if apierrors.IsNotFound(err) || errors.As(err, &re) {
+			return nil // nothing was ever provisioned from it
+		}
+		if err != nil {
+			return err
+		}
+		spec = tpl.spec
+	}
 	var errs error
-	for _, n := range tpl.spec.Topology.Nodes {
+	for _, n := range spec.Topology.Nodes {
 		d, err := r.Drivers.Get(n.Driver)
 		if err != nil {
 			continue
 		}
-		if err := d.Destroy(ctx, r.ref(s, tpl, n)); err != nil && !drivers.IsPermanent(err) {
+		ref := drivers.NodeRef{Session: s, Template: spec, Node: n}
+		if err := d.Destroy(ctx, ref); err != nil && !drivers.IsPermanent(err) {
 			errs = errors.Join(errs, fmt.Errorf("destroy node %s: %w", n.Name, err))
+		}
+	}
+	if errs != nil {
+		return errs
+	}
+	for _, tp := range r.topologyProvisioners(&spec.Topology) {
+		if err := tp.DestroyTopology(ctx, drivers.SessionRef{Session: s, Template: spec}); err != nil && !drivers.IsPermanent(err) {
+			errs = errors.Join(errs, fmt.Errorf("destroy topology: %w", err))
 		}
 	}
 	return errs
 }
 
+// snapshotTopology returns the topology to record: the template's, plus any
+// previously recorded nodes the template no longer has (so they are still
+// torn down).
+func snapshotTopology(recorded, current *labsv1.Topology) *labsv1.Topology {
+	out := current.DeepCopy()
+	if recorded != nil {
+		for _, n := range recorded.Nodes {
+			if _, ok := findNode(out.Nodes, n.Name); !ok {
+				out.Nodes = append(out.Nodes, *n.DeepCopy())
+			}
+		}
+	}
+	return out
+}
+
+func findNodeStatus(nodes []labsv1.NodeStatus, name string) (labsv1.NodeStatus, bool) {
+	for _, n := range nodes {
+		if n.Name == name {
+			return n, true
+		}
+	}
+	return labsv1.NodeStatus{}, false
+}
+
+// runSetup executes the setup actions not yet completed, persisting
+// status.setupProgress after each, so a retry resumes after the last
+// completed action. Setup actions must still be idempotent: an action whose
+// result could not be persisted, or every action after a node was recreated
+// or reset, runs again.
+func (r *LabSessionReconciler) runSetup(ctx context.Context, s *labsv1.LabSession, tpl *resolvedTemplate, save saveFunc) error {
+	total := len(tpl.spec.Setup)
+	for i := int(s.Status.SetupProgress); i < total; i++ {
+		if err := r.runAction(ctx, s, tpl, i, tpl.spec.Setup[i]); err != nil {
+			return err
+		}
+		s.Status.SetupProgress = int32(i + 1)
+		r.setCondition(s, labsv1.ConditionSetupComplete, metav1.ConditionFalse, ReasonSetupPending,
+			fmt.Sprintf("%d/%d setup action(s) completed", i+1, total))
+		if err := save(ctx); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 var errActionFailed = errors.New("action failed")
 
-// runActions executes actions in order through the owning node's driver.
-func (r *LabSessionReconciler) runActions(ctx context.Context, s *labsv1.LabSession, tpl *resolvedTemplate, actions []labsv1.Action) error {
-	for i, a := range actions {
-		nodeName, member, _ := strings.Cut(a.On, "/")
-		node, ok := findNode(tpl.spec.Topology.Nodes, nodeName)
-		if !ok {
-			return fmt.Errorf("action %d: unknown node %q: %w", i, a.On, errActionFailed)
-		}
-		d, err := r.Drivers.Get(node.Driver)
-		if err != nil {
-			return fmt.Errorf("action %d: %w", i, err)
-		}
-		req := ActionRequest(a)
-		req.Member = member
-		res, err := d.Exec(ctx, r.ref(s, tpl, node), req)
-		if err != nil {
-			return fmt.Errorf("action %d on %s: %w", i, a.On, err)
-		}
-		if res.ExitCode != 0 {
-			return fmt.Errorf("action %d on %s exited %d: %s: %w", i, a.On, res.ExitCode,
-				strings.TrimSpace(res.Stderr), errActionFailed)
-		}
+// runAction executes one action through the owning node's driver.
+func (r *LabSessionReconciler) runAction(ctx context.Context, s *labsv1.LabSession, tpl *resolvedTemplate, i int, a labsv1.Action) error {
+	nodeName, member, _ := strings.Cut(a.On, "/")
+	node, ok := findNode(tpl.spec.Topology.Nodes, nodeName)
+	if !ok {
+		return fmt.Errorf("action %d: unknown node %q: %w", i, a.On, errActionFailed)
+	}
+	d, err := r.Drivers.Get(node.Driver)
+	if err != nil {
+		return fmt.Errorf("action %d: %w", i, err)
+	}
+	req := ActionRequest(a)
+	req.Member = member
+	res, err := d.Exec(ctx, r.ref(s, tpl, node), req)
+	if err != nil {
+		return fmt.Errorf("action %d on %s: %w", i, a.On, err)
+	}
+	if res.ExitCode != 0 {
+		return fmt.Errorf("action %d on %s exited %d: %s: %w", i, a.On, res.ExitCode,
+			strings.TrimSpace(res.Stderr), errActionFailed)
 	}
 	return nil
 }
@@ -417,6 +675,9 @@ func ActionRequest(a labsv1.Action) drivers.ExecRequest {
 	}
 	if a.TimeoutSec > 0 {
 		req.Timeout = time.Duration(a.TimeoutSec) * time.Second
+	}
+	if req.Timeout > maxActionTimeout {
+		req.Timeout = maxActionTimeout
 	}
 	switch {
 	case a.Run != nil:
@@ -471,18 +732,23 @@ func (r *LabSessionReconciler) setCondition(s *labsv1.LabSession, typ string, st
 }
 
 // expiry computes the absolute expiry: spec.expiresAt, else creation + TTL,
-// else creation + max(2 * estimatedMinutes, MinDefaultTTL).
+// else creation + max(2 * estimatedMinutes, MinDefaultTTL). Without a
+// template it keeps a previously computed expiry, or falls back to
+// creation + MinDefaultTTL, so every session eventually expires.
 func expiry(s *labsv1.LabSession, tpl *resolvedTemplate) metav1.Time {
 	if s.Spec.ExpiresAt != nil {
 		return *s.Spec.ExpiresAt
 	}
 	ttl := MinDefaultTTL
-	if s.Spec.TTL != nil {
+	switch {
+	case s.Spec.TTL != nil:
 		ttl = s.Spec.TTL.Duration
-	} else if tpl != nil {
+	case tpl != nil:
 		if d := 2 * time.Duration(tpl.spec.Source.EstimatedMinutes) * time.Minute; d > ttl {
 			ttl = d
 		}
+	case s.Status.ExpiresAt != nil:
+		return *s.Status.ExpiresAt
 	}
 	return metav1.NewTime(s.CreationTimestamp.Add(ttl))
 }
@@ -539,9 +805,14 @@ func statusEqual(a, b *labsv1.LabSessionStatus) bool {
 }
 
 // SetupWithManager registers the reconciler; it watches owned Pods and
-// Services and re-queues sessions when their template appears.
+// Services (the manager's cache is restricted to the ones we label).
 func (r *LabSessionReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	n := r.MaxConcurrentReconciles
+	if n <= 0 {
+		n = DefaultMaxConcurrentReconciles
+	}
 	return ctrl.NewControllerManagedBy(mgr).
+		WithOptions(controller.Options{MaxConcurrentReconciles: n}).
 		For(&labsv1.LabSession{}).
 		Owns(&corev1.Pod{}).
 		Owns(&corev1.Service{}).
