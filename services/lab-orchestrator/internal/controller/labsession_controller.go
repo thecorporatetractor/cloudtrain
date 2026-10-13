@@ -462,6 +462,12 @@ func (r *LabSessionReconciler) provisionTopology(ctx context.Context, s *labsv1.
 			r.setCondition(s, labsv1.ConditionReady, metav1.ConditionFalse, ReasonProvisioning, "topology is provisioning")
 			return r.requeueBeforeExpiry(s, requeueProvisioning), false, nil
 		}
+		// Link facts (segments, per-end interfaces/addresses) for grader and UI.
+		if lr, ok := tp.(drivers.LinkReporter); ok {
+			if links, err := lr.Links(drivers.SessionRef{Session: s, Template: tpl.spec}); err == nil && len(links) > 0 {
+				s.Status.Links = links
+			}
+		}
 	}
 	return ctrl.Result{}, true, nil
 }

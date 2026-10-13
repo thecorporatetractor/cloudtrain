@@ -21,11 +21,13 @@ import (
 	labsv1 "github.com/cloudtrain/cloudtrain/services/lab-orchestrator/api/v1alpha1"
 	"github.com/cloudtrain/cloudtrain/services/lab-orchestrator/internal/controller"
 	"github.com/cloudtrain/cloudtrain/services/lab-orchestrator/internal/drivers"
+	"github.com/cloudtrain/cloudtrain/services/lab-orchestrator/internal/network"
 )
 
 func main() {
 	var (
 		metricsAddr, probeAddr, registry, runtimeClass, watchNamespace string
+		netToolsImage                                                  string
 		leaderElect, metricsSecure                                     bool
 		concurrency                                                    int
 		provisionTimeout                                               time.Duration
@@ -38,6 +40,7 @@ func main() {
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "health probe address")
 	flag.BoolVar(&leaderElect, "leader-elect", false, "enable leader election")
 	flag.StringVar(&registry, "image-registry", "", "registry prefix for catalog images (e.g. registry.cloudtrain.local/images)")
+	flag.StringVar(&netToolsImage, "net-tools-image", "nettools:1", "catalog image for link init/sidecar containers (iproute2, tc, tcpdump)")
 	flag.StringVar(&runtimeClass, "runtime-class", "", "RuntimeClass for container nodes (e.g. kata); empty = cluster default")
 	opts := zap.Options{}
 	opts.BindFlags(flag.CommandLine)
@@ -87,14 +90,21 @@ func main() {
 		log.Error(err, "unable to create pod executor")
 		os.Exit(1)
 	}
-	reg, err := drivers.NewDefaultRegistry(&drivers.ContainerDriver{
+	container := &drivers.ContainerDriver{
 		Client: mgr.GetClient(), Reader: mgr.GetAPIReader(), Scheme: scheme, ImageRegistry: registry,
 		RuntimeClassName: runtimeClass, Executor: executor,
-	})
+	}
+	// Lab network (Kube-OVN VPC + Multus link segments) for container and netdev nodes.
+	container.Network = &drivers.LinkNetwork{
+		Manager:    &network.Manager{Client: mgr.GetClient()},
+		ToolsImage: container.ImageFor(netToolsImage),
+	}
+	reg, err := drivers.NewDefaultRegistry(container)
 	if err != nil {
 		log.Error(err, "unable to build driver registry")
 		os.Exit(1)
 	}
+	reg.Replace(drivers.NewNetdev(container))
 
 	if err := (&controller.LabSessionReconciler{
 		Client: mgr.GetClient(), Scheme: scheme, Drivers: reg,

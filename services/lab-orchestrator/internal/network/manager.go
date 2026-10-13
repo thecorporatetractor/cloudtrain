@@ -43,7 +43,6 @@ type Manager struct {
 	Client client.Client
 }
 
-
 func labelValue(s string) string {
 	if len(s) <= 63 {
 		return s

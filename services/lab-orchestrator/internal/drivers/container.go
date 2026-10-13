@@ -71,6 +71,9 @@ type ContainerDriver struct {
 	ClusterDomain string
 	// Executor runs Exec requests; nil makes Exec return ErrNotImplemented.
 	Executor PodExecutor
+	// Network, when set, wires nodes with topology links into the session
+	// network (see links.go); without it such nodes fail as unsupported.
+	Network PodNetwork
 }
 
 // ContainerDriver deliberately does not implement Hibernator: deleting the
@@ -270,7 +273,11 @@ func (d *ContainerDriver) Provision(ctx context.Context, ref NodeRef) (NodeState
 	if err := d.createIfAbsent(ctx, ref, d.BuildService(ref)); err != nil {
 		return NodeState{Phase: labsv1.NodePending, Message: err.Error()}, fmt.Errorf("service: %w", err)
 	}
-	if err := d.createIfAbsent(ctx, ref, d.BuildPod(ref)); err != nil {
+	pod := d.BuildPod(ref)
+	if err := d.decoratePod(ref, pod, false); err != nil {
+		return NodeState{Phase: labsv1.NodeFailed, Message: err.Error()}, err
+	}
+	if err := d.createIfAbsent(ctx, ref, pod); err != nil {
 		return NodeState{Phase: labsv1.NodePending, Message: err.Error()}, fmt.Errorf("pod: %w", err)
 	}
 	return d.Status(ctx, ref)

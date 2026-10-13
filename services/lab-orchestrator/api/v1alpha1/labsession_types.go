@@ -137,6 +137,11 @@ type Endpoint struct {
 	Target string `json:"target,omitempty"`
 	// +optional
 	URL string `json:"url,omitempty"`
+	// Command is the program the access gateway starts for a k8s-exec
+	// endpoint instead of a login shell, e.g. "vtysh" for a router console
+	// (whitespace-separated argv; empty = login shell).
+	// +optional
+	Command string `json:"command,omitempty"`
 	// SecretRef points at the credential for this endpoint (kubeconfig,
 	// password, private key) in the session's namespace.
 	// +optional
