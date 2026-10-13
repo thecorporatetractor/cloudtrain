@@ -26,11 +26,12 @@ import (
 
 func main() {
 	var (
-		metricsAddr, probeAddr, registry, runtimeClass, watchNamespace string
+		metricsAddr, probeAddr, registry, runtimeClass, watchNamespace      string
 		catalogPaths, adminImageRef, helmBin, vclusterChart, vclusterValues string
-		leaderElect, metricsSecure                                     bool
-		concurrency                                                    int
-		provisionTimeout                                               time.Duration
+		sessionSelector, leaderElectionID                                   string
+		leaderElect, metricsSecure                                          bool
+		concurrency                                                         int
+		provisionTimeout                                                    time.Duration
 	)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "metrics endpoint address (e.g. :8443); \"0\" disables metrics")
 	flag.BoolVar(&metricsSecure, "metrics-secure", true, "serve metrics over HTTPS with Kubernetes authn/authz")
@@ -46,6 +47,8 @@ func main() {
 	flag.StringVar(&helmBin, "helm", "helm", "helm binary used to install virtual clusters")
 	flag.StringVar(&vclusterChart, "vcluster-chart", "/opt/cloudtrain/charts/vcluster.tgz", "vcluster Helm chart (.tgz or reference)")
 	flag.StringVar(&vclusterValues, "vcluster-values", "/opt/cloudtrain/charts/vcluster-values.yaml", "base values for virtual clusters (deploy/vcluster/values.yaml); empty = none")
+	flag.StringVar(&sessionSelector, "session-selector", "", "only reconcile LabSessions matching this label selector (e.g. labs.cloudtrain.dev/verify=true); empty = all")
+	flag.StringVar(&leaderElectionID, "leader-election-id", "lab-orchestrator.labs.cloudtrain.dev", "leader election lease name")
 	opts := zap.Options{}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
@@ -67,6 +70,14 @@ func main() {
 		&corev1.Pod{}:     {Label: managed},
 		&corev1.Service{}: {Label: managed},
 	}}
+	if sessionSelector != "" {
+		sel, err := labels.Parse(sessionSelector)
+		if err != nil {
+			log.Error(err, "invalid --session-selector")
+			os.Exit(1)
+		}
+		cacheOpts.ByObject[&labsv1.LabSession{}] = cache.ByObject{Label: sel}
+	}
 	if watchNamespace != "" {
 		cacheOpts.DefaultNamespaces = map[string]cache.Config{watchNamespace: {}}
 	}
@@ -82,7 +93,7 @@ func main() {
 		Metrics:                metricsOpts,
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         leaderElect,
-		LeaderElectionID:       "lab-orchestrator.labs.cloudtrain.dev",
+		LeaderElectionID:       leaderElectionID,
 	})
 	if err != nil {
 		log.Error(err, "unable to create manager")

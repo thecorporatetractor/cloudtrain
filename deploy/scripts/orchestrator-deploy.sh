@@ -51,10 +51,27 @@ if [[ ${LOAD_LAB_IMAGES:-1} == 1 ]]; then
   done < <(jq -r '.images[] | [.kind, .image] | @tsv' <<<"$merged" | sort -u)
 fi
 
-log "applying CRDs, RBAC and manager ($IMG)"
-k apply -f <(kubectl kustomize "$SVC/config/default" | sed "s#image: cloudtrain/lab-orchestrator:dev\$#image: $IMG#") >/dev/null
-k -n cloudtrain-system create configmap lab-image-catalog "${CM_ARGS[@]}" --dry-run=client -o yaml | k apply -f - >/dev/null
+# ORCH_NAMESPACE deploys a separate instance (its own namespace, ClusterRoleBinding
+# and leader-election lease); SESSION_SELECTOR restricts it to matching
+# LabSessions (e.g. labs.cloudtrain.dev/verify=true for labctl verify), so
+# several managers can share the cluster without reconciling each other's
+# sessions. Defaults: cloudtrain-system, all sessions.
+NS=${ORCH_NAMESPACE:-cloudtrain-system}
+manifests() {
+  kubectl kustomize "$SVC/config/default" \
+    | NS="$NS" IMG="$IMG" SEL="${SESSION_SELECTOR:-}" yq '
+        (select(.kind == "Namespace") | .metadata.name) = strenv(NS) |
+        (select(.metadata.namespace == "cloudtrain-system") | .metadata.namespace) = strenv(NS) |
+        (select(.kind == "ClusterRoleBinding") | .metadata.name) = "lab-orchestrator-" + strenv(NS) |
+        (select(.kind == "ClusterRoleBinding") | .subjects[0].namespace) = strenv(NS) |
+        (select(.kind == "Deployment") | .spec.template.spec.containers[0].image) = strenv(IMG) |
+        (select(.kind == "Deployment") | .spec.template.spec.containers[0].args) += ["--leader-election-id=lab-orchestrator-" + strenv(NS)] |
+        (select(.kind == "Deployment" and strenv(SEL) != "") | .spec.template.spec.containers[0].args) += ["--session-selector=" + strenv(SEL)]'
+}
+log "applying CRDs, RBAC and manager ($IMG) in $NS${SESSION_SELECTOR:+, sessions $SESSION_SELECTOR}"
+k apply -f <(manifests) >/dev/null
+k -n "$NS" create configmap lab-image-catalog "${CM_ARGS[@]}" --dry-run=client -o yaml | k apply -f - >/dev/null
 # A catalog change alone does not change the pod template: restart to reload it.
-k -n cloudtrain-system rollout restart deploy/lab-orchestrator >/dev/null
-k -n cloudtrain-system rollout status deploy/lab-orchestrator --timeout=180s
-log "lab-orchestrator deployed ($IMG)"
+k -n "$NS" rollout restart deploy/lab-orchestrator >/dev/null
+k -n "$NS" rollout status deploy/lab-orchestrator --timeout=180s
+log "lab-orchestrator deployed in $NS ($IMG)"
