@@ -143,7 +143,7 @@ to `Ready`). A request on a Failed or Expired session is answered with phase
   `k8s-can-i` (`yes`/`no`), `k8s-context`, `file` (content of `target`; a
   missing file fails), `service-state` (`systemctl is-active`, default
   `active`), `reachability` (TCP connect to `target:port`, or ping), `http`
-  (body vs. expect, else 2xx/3xx). `device-cmd` is reported as unsupported.
+  (body vs. expect, else 2xx/3xx). `device-cmd` sends `ExecRequest{Kind: "device-cmd", Command: [command]}` to the node's driver (netdev); a driver without it reports "the check could not run".
 - **Output comparison**: the raw stdout with at most one trailing newline
   (`\n` or `\r\n`) stripped; nothing else is trimmed. The expected value is
   used verbatim. `regex` is Go RE2 and matches anywhere unless anchored.
