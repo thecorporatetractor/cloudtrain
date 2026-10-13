@@ -181,9 +181,22 @@ func (g *Grader) target(on string) string {
 	return g.Entry
 }
 
+// ExecDeviceCommand is the exec kind of device-cmd checks (the netdev
+// driver's drivers.ExecDeviceCommand, "device-cmd").
+const ExecDeviceCommand drivers.ExecKind = "device-cmd"
+
 // exec runs argv on a node with the check's deadline. Exit code 124/137 of
 // coreutils timeout is reported as errTimeout.
 func (g *Grader) exec(ctx context.Context, on string, user labsv1.ActionUser, t time.Duration, argv []string) (drivers.ExecResult, error) {
+	return g.run1(ctx, on, drivers.ExecShell, user, t, argv)
+}
+
+// execKind runs a non-shell request (argv is passed as is, no timeout wrapper).
+func (g *Grader) execKind(ctx context.Context, on string, kind drivers.ExecKind, t time.Duration, argv []string) (drivers.ExecResult, error) {
+	return g.run1(ctx, on, kind, labsv1.ActionAsAdmin, t, argv)
+}
+
+func (g *Grader) run1(ctx context.Context, on string, kind drivers.ExecKind, user labsv1.ActionUser, t time.Duration, argv []string) (drivers.ExecResult, error) {
 	if on == "" {
 		return drivers.ExecResult{}, fmt.Errorf("check has no target node: %w", drivers.ErrUnsupported)
 	}
@@ -193,7 +206,7 @@ func (g *Grader) exec(ctx context.Context, on string, user labsv1.ActionUser, t 
 	_, member, _ := strings.Cut(on, "/")
 	cctx, cancel := context.WithTimeout(ctx, t+transportSlack)
 	defer cancel()
-	res, err := g.Exec.Exec(cctx, on, drivers.ExecRequest{Kind: drivers.ExecShell, Member: member, User: user, Command: argv, Timeout: t + transportSlack})
+	res, err := g.Exec.Exec(cctx, on, drivers.ExecRequest{Kind: kind, Member: member, User: user, Command: argv, Timeout: t + transportSlack})
 	if err != nil {
 		if cctx.Err() != nil && ctx.Err() == nil {
 			return res, errTimeout
@@ -375,7 +388,15 @@ func (g *Grader) probe(ctx context.Context, c labsv1.Check) (outcome, error) {
 		return outcome{output: body, raw: code + "\n" + body, ok: ok}, nil
 
 	case "device-cmd":
-		return outcome{}, fmt.Errorf("device-cmd: %w", drivers.ErrUnsupported)
+		// Runs the device's own CLI command through the node's driver (netdev).
+		if c.Command == "" {
+			return outcome{}, fmt.Errorf("device-cmd check has no command")
+		}
+		res, err := g.execKind(ctx, g.target(c.On), ExecDeviceCommand, t, []string{c.Command})
+		if err != nil {
+			return outcome{raw: raw(res)}, err
+		}
+		return outcome{output: res.Stdout, raw: raw(res), ok: res.ExitCode == 0}, nil
 	}
 	return outcome{}, fmt.Errorf("check type %q: %w", c.Type, drivers.ErrUnsupported)
 }

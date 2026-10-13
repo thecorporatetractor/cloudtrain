@@ -88,6 +88,8 @@ func TestGradeChecks(t *testing.T) {
 			return drivers.ExecResult{Stdout: "the secret-value here"}, nil
 		case strings.Contains(cmd, "/dev/tcp"):
 			return drivers.ExecResult{Stdout: "reachable\n"}, nil
+		case req.Kind == ExecDeviceCommand:
+			return drivers.ExecResult{}, errors.New("netdev: " + drivers.ErrUnsupported.Error())
 		case strings.Contains(cmd, "sleep 99"):
 			return drivers.ExecResult{ExitCode: 124}, nil
 		}
@@ -115,7 +117,7 @@ func TestGradeChecks(t *testing.T) {
 	if byID["slow"].Message != MsgTimeout {
 		t.Errorf("slow message = %q", byID["slow"].Message)
 	}
-	if byID["dev"].Message != MsgUnsupported {
+	if byID["dev"].Message != MsgError {
 		t.Errorf("dev message = %q", byID["dev"].Message)
 	}
 	// Routing: shell defaults to the entry node, k8s-query to the cluster,
