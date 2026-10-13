@@ -116,7 +116,9 @@ func VClusterNamespace(s *labsv1.LabSession, node string) string {
 // session's namespace.
 const LabelSessionNamespace = "labs.cloudtrain.dev/session-namespace"
 
-func (d *VClusterDriver) hostNS(ref NodeRef) string { return VClusterNamespace(ref.Session, ref.Node.Name) }
+func (d *VClusterDriver) hostNS(ref NodeRef) string {
+	return VClusterNamespace(ref.Session, ref.Node.Name)
+}
 
 // ensureHostNamespace creates the vcluster's namespace. ready=false while a
 // previous one is still terminating.

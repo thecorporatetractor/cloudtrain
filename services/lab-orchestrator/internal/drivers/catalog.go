@@ -28,6 +28,9 @@ type CatalogImage struct {
 	// DiskSize of a persistent root disk imported from a containerDisk
 	// (default DefaultVMDiskSize); at least the image's virtual size.
 	DiskSize string `json:"diskSize,omitempty"`
+	// EtcdVersion and KubectlVersion are informational (written by tools/images).
+	EtcdVersion    string `json:"etcdVersion,omitempty"`
+	KubectlVersion string `json:"kubectlVersion,omitempty"`
 }
 
 // ImageCatalog maps the image refs used in lab.yaml (topology.nodes[].image)
