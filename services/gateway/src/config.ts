@@ -24,6 +24,9 @@ export interface Config {
   logLevel: string;
 }
 
+/** Relative paths in settings are relative to the repository root (pnpm runs the gateway from its package dir). */
+const fromRoot = (p: string) => path.resolve(repoRoot, p);
+
 function num(v: string | undefined, d: number): number {
   const n = v === undefined || v === '' ? NaN : Number(v);
   return Number.isFinite(n) ? n : d;
@@ -35,11 +38,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   return {
     host: env.CT_HOST ?? '127.0.0.1',
     port: num(env.CT_PORT, 8787),
-    contentDir: path.resolve(env.CT_CONTENT_DIR ?? path.join(repoRoot, 'content')),
-    extraLabDirs: list(env.CT_EXTRA_LAB_DIRS).map((p) => path.resolve(p)),
+    contentDir: fromRoot(env.CT_CONTENT_DIR ?? 'content'),
+    extraLabDirs: list(env.CT_EXTRA_LAB_DIRS).map(fromRoot),
     kubeContext: env.CT_KUBE_CONTEXT ?? 'kind-cloudtrain-dev',
     namespace: env.CT_NAMESPACE ?? 'cloudtrain-sessions',
-    labctl: path.resolve(env.CT_LABCTL ?? path.join(repoRoot, 'services/lab-orchestrator/bin/labctl')),
+    labctl: fromRoot(env.CT_LABCTL ?? 'services/lab-orchestrator/bin/labctl'),
     validateTimeoutMs: num(env.CT_VALIDATE_TIMEOUT_MS, 60_000),
     ...(ttl > 0 ? { sessionTtlMinutes: ttl } : {}),
     logLevel: env.CT_LOG_LEVEL ?? 'info',
