@@ -8,6 +8,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"math"
 	"sort"
@@ -31,7 +32,30 @@ const (
 	AnnotationBootstrapped = "labs.cloudtrain.dev/bootstrapped"
 	// LabelMember labels the VM of a kubeadm cluster member.
 	LabelMember = "labs.cloudtrain.dev/member"
+	// AnnotationBooted on a VM records the VMI (boot) whose liveness was
+	// confirmed after a restart of a VM with a persistent disk.
+	AnnotationBooted = "labs.cloudtrain.dev/booted"
+	// DefaultVMDiskSize fits the 10 GiB golden images plus filesystem overhead.
+	DefaultVMDiskSize = "11Gi"
 )
+
+// VMDiskOptions selects how VM root disks are backed.
+type VMDiskOptions struct {
+	// Persistent gives every VM a DataVolume "<vm>-root" (CDI, imported from
+	// the catalog containerDisk with pullMethod node, owned by the VM through
+	// dataVolumeTemplates). The VM can then be stopped (hibernate) and
+	// started again with its disk intact; a reset deletes the VM and with it
+	// the disk. Otherwise VMs boot from the ephemeral containerDisk: a
+	// restart loses every change, so such VMs keep running while hibernated.
+	Persistent bool
+	// StorageClass of the root disks (empty: cluster default).
+	StorageClass string
+	// Size of a root disk when the catalog entry has no diskSize.
+	Size string
+}
+
+// RootDiskName is the DataVolume (and PVC) of a VM's persistent root disk.
+func RootDiskName(vm string) string { return vm + "-root" }
 
 // vmSpec describes one VM-backed host.
 type vmSpec struct {
@@ -43,6 +67,10 @@ type vmSpec struct {
 	MemMiB   int64
 	CISecret string // Secret with key "userdata"
 	Labels   map[string]string
+	// Disk: persistent root disk (DataVolume) instead of the containerDisk.
+	Disk VMDiskOptions
+	// DiskSize overrides Disk.Size (catalog diskSize).
+	DiskSize string
 }
 
 // buildVM renders a KubeVirt VirtualMachine on the lab subnet.
@@ -54,6 +82,38 @@ func buildVM(s *labsv1.LabSession, net LabNet, v vmSpec) *unstructured.Unstructu
 		tplLabels[k] = val
 	}
 	mem := fmt.Sprintf("%dMi", v.MemMiB)
+	root := map[string]any{"name": "root", "containerDisk": map[string]any{"image": v.Image, "imagePullPolicy": "IfNotPresent"}}
+	var dvTemplates []any
+	if v.Disk.Persistent {
+		size := v.DiskSize
+		if size == "" {
+			size = v.Disk.Size
+		}
+		if size == "" {
+			size = DefaultVMDiskSize
+		}
+		storage := map[string]any{
+			"accessModes": []any{"ReadWriteOnce"}, "volumeMode": "Filesystem",
+			"resources": map[string]any{"requests": map[string]any{"storage": size}},
+		}
+		if v.Disk.StorageClass != "" {
+			storage["storageClassName"] = v.Disk.StorageClass
+		}
+		dvLabels := map[string]any{}
+		for k, val := range v.Labels {
+			dvLabels[k] = val
+		}
+		dvTemplates = []any{map[string]any{
+			"metadata": map[string]any{"name": RootDiskName(v.Name), "labels": dvLabels},
+			"spec": map[string]any{
+				// pullMethod node: the importer runs the image on the VM's
+				// node, so images loaded into the node (kind) work offline.
+				"source":  map[string]any{"registry": map[string]any{"url": "docker://" + v.Image, "pullMethod": "node"}},
+				"storage": storage,
+			},
+		}}
+		root = map[string]any{"name": "root", "dataVolume": map[string]any{"name": RootDiskName(v.Name)}}
+	}
 	vm.Object["spec"] = map[string]any{
 		"runStrategy": "Always",
 		"template": map[string]any{
@@ -81,11 +141,14 @@ func buildVM(s *labsv1.LabSession, net LabNet, v vmSpec) *unstructured.Unstructu
 				},
 				"networks": []any{map[string]any{"name": "default", "pod": map[string]any{}}},
 				"volumes": []any{
-					map[string]any{"name": "root", "containerDisk": map[string]any{"image": v.Image, "imagePullPolicy": "IfNotPresent"}},
+					root,
 					map[string]any{"name": "cloudinit", "cloudInitNoCloud": map[string]any{"secretRef": map[string]any{"name": v.CISecret}}},
 				},
 			},
 		},
+	}
+	if dvTemplates != nil {
+		vm.Object["spec"].(map[string]any)["dataVolumeTemplates"] = dvTemplates
 	}
 	return vm
 }
@@ -223,7 +286,8 @@ func observeVMIs(ctx context.Context, r client.Reader, ns string, names []string
 	return st, nil
 }
 
-// deleteVMs deletes the session's VMs and reports whether VMs and VMIs are gone.
+// deleteVMs deletes the session's VMs and reports whether VMs, VMIs and
+// their persistent root disks (DataVolume, PVC) are gone.
 func deleteVMs(ctx context.Context, c client.Client, r client.Reader, s *labsv1.LabSession, names []string) (bool, error) {
 	gone := true
 	for _, n := range names {
@@ -241,15 +305,95 @@ func deleteVMs(ctx context.Context, c client.Client, r client.Reader, s *labsv1.
 		} else if !apierrors.IsNotFound(err) && !meta.IsNoMatchError(err) {
 			return false, err
 		}
+		if !g {
+			continue // KubeVirt recreates a template DataVolume while its VM exists
+		}
+		// Root disks: owned by the VM (garbage-collected with it); deleted
+		// explicitly too so a reset does not wait for the collector.
+		g, err = deleteIfOwned(ctx, c, r, s, newObj(GVKDataVolume, s.Namespace, RootDiskName(n)))
+		if err != nil && !meta.IsNoMatchError(err) {
+			return false, err
+		}
+		if !g {
+			gone = false
+		}
+		pvc := &corev1.PersistentVolumeClaim{}
+		if err := r.Get(ctx, client.ObjectKey{Namespace: s.Namespace, Name: RootDiskName(n)}, pvc); err == nil {
+			gone = false
+		} else if !apierrors.IsNotFound(err) {
+			return false, err
+		}
 	}
 	return gone, nil
 }
 
 // annotateVM sets AnnotationBootstrapped on a VM.
 func annotateVM(ctx context.Context, c client.Client, ns, name, value string) error {
+	return annotateVMWith(ctx, c, ns, name, map[string]string{AnnotationBootstrapped: value})
+}
+
+// annotateVMWith merges annotations into a VM.
+func annotateVMWith(ctx context.Context, c client.Client, ns, name string, ann map[string]string) error {
 	vm := newObj(GVKVirtualMachine, ns, name)
-	patch := []byte(fmt.Sprintf(`{"metadata":{"annotations":{%q:%q}}}`, AnnotationBootstrapped, value))
-	return c.Patch(ctx, vm, client.RawPatch("application/merge-patch+json", patch))
+	b, err := json.Marshal(map[string]any{"metadata": map[string]any{"annotations": ann}})
+	if err != nil {
+		return err
+	}
+	return c.Patch(ctx, vm, client.RawPatch("application/merge-patch+json", b))
+}
+
+// vmIdentity hashes the VM object UIDs: the identity of VMs with persistent
+// disks, stable across stop/start and changed by a reset (new VMs, new disks).
+func vmIdentity(ctx context.Context, r client.Reader, ns string, names []string) (string, error) {
+	var uids []string
+	for _, n := range names {
+		vm := newObj(GVKVirtualMachine, ns, n)
+		if err := r.Get(ctx, client.ObjectKeyFromObject(vm), vm); err != nil {
+			return "", err
+		}
+		uids = append(uids, n+"="+string(vm.GetUID()))
+	}
+	sort.Strings(uids)
+	sum := sha256.Sum256([]byte("vm:" + strings.Join(uids, ",")))
+	return hex.EncodeToString(sum[:])[:16], nil
+}
+
+// setRunStrategy sets spec.runStrategy of the VMs ("Always" or "Halted")
+// where it differs.
+func setRunStrategy(ctx context.Context, c client.Client, r client.Reader, ns string, names []string, strategy string) error {
+	for _, n := range names {
+		vm := newObj(GVKVirtualMachine, ns, n)
+		if err := r.Get(ctx, client.ObjectKeyFromObject(vm), vm); err != nil {
+			return err
+		}
+		if cur, _, _ := unstructured.NestedString(vm.Object, "spec", "runStrategy"); cur == strategy {
+			continue
+		}
+		patch := []byte(fmt.Sprintf(`{"spec":{"runStrategy":%q}}`, strategy))
+		if err := c.Patch(ctx, vm, client.RawPatch("application/merge-patch+json", patch)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// stoppedState reports Hibernated once no VM of names has an instance left.
+func stoppedState(ctx context.Context, r client.Reader, ns string, names []string) (NodeState, error) {
+	left := 0
+	for _, n := range names {
+		vmi := newObj(GVKVMI, ns, n)
+		err := r.Get(ctx, client.ObjectKeyFromObject(vmi), vmi)
+		switch {
+		case err == nil:
+			left++
+		case !apierrors.IsNotFound(err):
+			return NodeState{}, err
+		}
+	}
+	if left > 0 {
+		return NodeState{Phase: labsv1.NodeProvisioning, Message: fmt.Sprintf("%d VM(s) shutting down", left)}, nil
+	}
+	return NodeState{Phase: labsv1.NodeHibernated, Message: "VMs stopped; disks kept"}, nil
 }
 
 // vmAnnotation reads one annotation of a VM ("" if absent).

@@ -121,6 +121,21 @@ func (c *ClusterDriver) Connect(ctx context.Context, ref NodeRef, a labsv1.Acces
 	return b.Connect(ctx, ref, a)
 }
 
+// Hibernate dispatches to the backend; a backend without hibernation keeps running.
+func (c *ClusterDriver) Hibernate(ctx context.Context, ref NodeRef) error {
+	b, err := c.backend(ref)
+	if err != nil {
+		return err
+	}
+	h, ok := b.(Hibernator)
+	if !ok {
+		return fmt.Errorf("cluster mode backend %T cannot hibernate: %w", b, ErrUnsupported)
+	}
+	return h.Hibernate(ctx, ref)
+}
+
+var _ Hibernator = (*ClusterDriver)(nil)
+
 func (c *ClusterDriver) Reset(ctx context.Context, ref NodeRef) error {
 	b, err := c.backend(ref)
 	if err != nil {

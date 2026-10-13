@@ -22,6 +22,9 @@ type CatalogImage struct {
 	Image             string   `json:"image"`
 	KubernetesVersion string   `json:"kubernetesVersion,omitempty"`
 	StagedUpgrades    []string `json:"stagedUpgrades,omitempty"`
+	// DiskSize of a persistent root disk imported from a containerDisk
+	// (default DefaultVMDiskSize); at least the image's virtual size.
+	DiskSize string `json:"diskSize,omitempty"`
 }
 
 // ImageCatalog maps the image refs used in lab.yaml (topology.nodes[].image)

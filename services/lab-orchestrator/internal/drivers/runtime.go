@@ -28,6 +28,15 @@ type RuntimeOptions struct {
 	Helm           HelmRunner
 	VClusterChart  string
 	VClusterValues string
+	// Lab state persistence (what hibernate/resume preserves):
+	// PersistentHome gives container nodes a /home/learner PVC,
+	// VClusterPersistence keeps vcluster databases on a PVC, VMDisks makes
+	// VM root disks persistent DataVolumes. StorageClass applies to all of
+	// them (empty: cluster default).
+	PersistentHome      bool
+	VClusterPersistence bool
+	VMDisks             VMDiskOptions
+	StorageClass        string
 }
 
 // Runtime is the assembled driver set.
@@ -48,6 +57,11 @@ func NewRuntime(o RuntimeOptions) (*Runtime, error) {
 	container := &ContainerDriver{
 		Client: o.Client, Reader: o.Reader, Scheme: o.Scheme, ImageRegistry: o.ImageRegistry,
 		RuntimeClassName: o.RuntimeClassName, Executor: o.Executor, Catalog: o.Catalog,
+		PersistentHome: o.PersistentHome, HomeStorageClass: o.StorageClass,
+	}
+	disks := o.VMDisks
+	if disks.StorageClass == "" {
+		disks.StorageClass = o.StorageClass
 	}
 	if o.Catalog != nil {
 		img, err := o.Catalog.Resolve(adminRef, ImageKindContainer)
@@ -60,12 +74,13 @@ func NewRuntime(o RuntimeOptions) (*Runtime, error) {
 		Client: o.Client, Reader: o.Reader, Container: container,
 		Network: &LabNetwork{Client: o.Client, Reader: o.Reader},
 	}
-	vm := &VMDriver{Client: o.Client, Reader: o.Reader, Catalog: o.Catalog, Container: container, Session: session, ImageRegistry: o.ImageRegistry}
+	vm := &VMDriver{Client: o.Client, Reader: o.Reader, Catalog: o.Catalog, Container: container, Session: session,
+		ImageRegistry: o.ImageRegistry, Disks: disks}
 	cluster := &ClusterDriver{
 		Virtual: &VClusterDriver{Client: o.Client, Reader: o.Reader, Container: container, Helm: o.Helm,
-			Chart: o.VClusterChart, ValuesFile: o.VClusterValues},
+			Chart: o.VClusterChart, ValuesFile: o.VClusterValues, Persistent: o.VClusterPersistence, StorageClass: o.StorageClass},
 		Kubeadm: &KubeadmDriver{Client: o.Client, Reader: o.Reader, Catalog: o.Catalog, Container: container,
-			Session: session, ImageRegistry: o.ImageRegistry},
+			Session: session, ImageRegistry: o.ImageRegistry, Disks: disks},
 	}
 	reg, err := NewRegistry(container, vm, cluster, NewNetdevDriver())
 	if err != nil {

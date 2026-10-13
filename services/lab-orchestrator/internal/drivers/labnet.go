@@ -50,6 +50,7 @@ var (
 	GVKNAD            = schema.GroupVersionKind{Group: "k8s.cni.cncf.io", Version: "v1", Kind: "NetworkAttachmentDefinition"}
 	GVKVirtualMachine = schema.GroupVersionKind{Group: "kubevirt.io", Version: "v1", Kind: "VirtualMachine"}
 	GVKVMI            = schema.GroupVersionKind{Group: "kubevirt.io", Version: "v1", Kind: "VirtualMachineInstance"}
+	GVKDataVolume     = schema.GroupVersionKind{Group: "cdi.kubevirt.io", Version: "v1beta1", Kind: "DataVolume"}
 )
 
 // PlannedHost is a VM-backed host on the lab subnet.

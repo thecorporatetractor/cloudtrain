@@ -71,11 +71,19 @@ type VClusterDriver struct {
 	Chart string
 	// ValuesFile is deploy/vcluster/values.yaml (optional).
 	ValuesFile string
+	// Persistent keeps the embedded database on a PVC (StatefulSet
+	// data-<release>-0) instead of an emptyDir, so the control plane can
+	// be scaled to zero (hibernate) and back without losing the cluster.
+	Persistent bool
+	// StorageClass and VolumeSize of that PVC (defaults: cluster default, 1Gi).
+	StorageClass string
+	VolumeSize   string
 }
 
 var (
 	_ NodeDriver     = (*VClusterDriver)(nil)
 	_ AccessProvider = (*VClusterDriver)(nil)
+	_ Hibernator     = (*VClusterDriver)(nil)
 )
 
 func (d *VClusterDriver) Name() labsv1.DriverName { return labsv1.DriverK8sCluster }
@@ -141,13 +149,26 @@ func (d *VClusterDriver) workloadPolicy(ref NodeRef, release string) *networking
 func (d *VClusterDriver) values(ref NodeRef, release string) ([]byte, error) {
 	labels := SessionLabels(ref.Session)
 	labels[LabelNode] = LabelValue(ref.Node.Name)
+	// Without persistence the embedded database lives in an emptyDir (no
+	// PVC to clean up; a restarted pod is an empty cluster). With it, the
+	// StatefulSet's PVC is deleted with the release (retentionPolicy Delete)
+	// and explicitly by Reset/Destroy.
+	vc := map[string]any{"enabled": false}
+	if d.Persistent {
+		size := d.VolumeSize
+		if size == "" {
+			size = "1Gi"
+		}
+		vc = map[string]any{"enabled": true, "retentionPolicy": "Delete", "size": size}
+		if d.StorageClass != "" {
+			vc["storageClass"] = d.StorageClass
+		}
+	}
 	return yaml.Marshal(map[string]any{
 		"controlPlane": map[string]any{
 			"proxy": map[string]any{"extraSANs": []string{release + "." + ref.Namespace() + ".svc"}},
 			"statefulSet": map[string]any{
-				// Disposable labs: the embedded database lives in an emptyDir
-				// (no PVC to clean up); a restarted pod is a new instance.
-				"persistence": map[string]any{"volumeClaim": map[string]any{"enabled": false}},
+				"persistence": map[string]any{"volumeClaim": vc},
 				"labels":      labels,
 				"pods":        map[string]any{"labels": labels},
 			},
@@ -179,6 +200,13 @@ func (d *VClusterDriver) Provision(ctx context.Context, ref NodeRef) (NodeState,
 	if wl.GetLabels()[LabelSessionUID] != string(ref.Session.UID) {
 		err := fmt.Errorf("StatefulSet %s exists but does not belong to session %s: %w", release, ref.Session.Name, ErrConflict)
 		return NodeState{Phase: labsv1.NodeFailed, Message: err.Error()}, err
+	}
+	// Resume after hibernate (or a reset): scale the control plane back up.
+	if replicas(wl) == 0 {
+		if err := d.scale(ctx, wl, 1); err != nil {
+			return NodeState{Phase: labsv1.NodeProvisioning, Message: err.Error()}, err
+		}
+		return NodeState{Phase: labsv1.NodeProvisioning, Message: "vcluster starting"}, nil
 	}
 	return d.observe(ctx, ref, release, true)
 }
@@ -251,7 +279,11 @@ func (d *VClusterDriver) observe(ctx context.Context, ref NodeRef, release strin
 		st.Phase, st.Message = labsv1.NodeProvisioning, "vcluster "+st.Message
 		return st, nil
 	}
-	state := NodeState{Phase: labsv1.NodeReady, InstanceID: string(pod.UID),
+	instance, err := d.instance(ctx, ref, release, pod)
+	if err != nil {
+		return NodeState{}, err
+	}
+	state := NodeState{Phase: labsv1.NodeReady, InstanceID: instance,
 		Details: map[string]string{"apiServer": d.server(ref, release), "context": clusterContext(ref.Node), "release": release}}
 	kc := &corev1.Secret{}
 	err = d.reader().Get(ctx, client.ObjectKey{Namespace: ref.Namespace(), Name: KubeconfigSecretName(ref)}, kc)
@@ -262,10 +294,10 @@ func (d *VClusterDriver) observe(ctx context.Context, ref NodeRef, release strin
 		return NodeState{}, err
 	}
 	if !publish {
-		return NodeState{Phase: labsv1.NodeProvisioning, Message: "kubeconfig not published", InstanceID: string(pod.UID)}, nil
+		return NodeState{Phase: labsv1.NodeProvisioning, Message: "kubeconfig not published", InstanceID: instance}, nil
 	}
 	if err := d.publish(ctx, ref, release, string(pod.UID)); err != nil {
-		return NodeState{Phase: labsv1.NodeProvisioning, Message: err.Error(), InstanceID: string(pod.UID)}, nil
+		return NodeState{Phase: labsv1.NodeProvisioning, Message: err.Error(), InstanceID: instance}, nil
 	}
 	return state, nil
 }
@@ -315,7 +347,11 @@ func (d *VClusterDriver) publish(ctx context.Context, ref NodeRef, release, inst
 
 // Status observes the vcluster.
 func (d *VClusterDriver) Status(ctx context.Context, ref NodeRef) (NodeState, error) {
-	return d.observe(ctx, ref, VClusterRelease(ref.Session, ref.Node.Name), false)
+	release := VClusterRelease(ref.Session, ref.Node.Name)
+	if ref.Session.Spec.Hibernate {
+		return d.hibernateState(ctx, ref, release)
+	}
+	return d.observe(ctx, ref, release, false)
 }
 
 // Access contributes the cluster's kubeconfigs once published.
@@ -341,11 +377,21 @@ func (d *VClusterDriver) Connect(_ context.Context, ref NodeRef, access labsv1.A
 	return labsv1.Endpoint{}, fmt.Errorf("virtual cluster %s: %s access: %w", ref.Node.Name, access, ErrUnsupported)
 }
 
-// Reset deletes the vcluster pod; with an emptyDir database it comes back empty.
+// Reset returns the virtual cluster to an empty one. With an emptyDir
+// database deleting the pod is enough; with a PVC the control plane is
+// scaled to zero, the PVC deleted (ErrInProgress until it is gone) and
+// Provision scales it back up on a fresh volume.
 func (d *VClusterDriver) Reset(ctx context.Context, ref NodeRef) error {
 	release := VClusterRelease(ref.Session, ref.Node.Name)
 	if err := d.deleteSynced(ctx, ref, release); err != nil {
 		return err
+	}
+	wl, err := d.workload(ctx, ref, release)
+	if err != nil {
+		return err
+	}
+	if sts, ok := wl.(*appsv1.StatefulSet); ok && sts.GetLabels()[LabelSessionUID] == string(ref.Session.UID) {
+		return d.resetPersistent(ctx, ref, release, sts)
 	}
 	pods, err := d.controlPlanePods(ctx, ref, release)
 	if err != nil {
@@ -423,6 +469,12 @@ func (d *VClusterDriver) Destroy(ctx context.Context, ref NodeRef) error {
 			return err
 		}
 	}
+	// The database PVC (retentionPolicy Delete covers a clean uninstall; a
+	// release that went first leaves it behind).
+	dataGone, err := d.deleteData(ctx, ref, release)
+	if err != nil {
+		return err
+	}
 	pods := &corev1.PodList{}
 	if err := d.reader().List(ctx, pods, client.InNamespace(ref.Namespace()), client.MatchingLabels{LabelVClusterManagedBy: release}); err != nil {
 		return err
@@ -434,5 +486,161 @@ func (d *VClusterDriver) Destroy(ctx context.Context, ref NodeRef) error {
 	if len(pods.Items) > 0 || len(cps) > 0 {
 		return inProgress("vcluster %s pods are terminating", release)
 	}
+	if !dataGone {
+		return inProgress("vcluster %s data volume is being deleted", release)
+	}
 	return nil
+}
+
+// DataClaimName is the PVC of a persistent vcluster's embedded database
+// (volumeClaimTemplate "data" of StatefulSet <release>, ordinal 0).
+func DataClaimName(release string) string { return "data-" + release + "-0" }
+
+// instance is the vcluster's state identity: the database PVC's UID when
+// persistent (stable across restarts and hibernation), else the pod UID
+// (an emptyDir database dies with the pod).
+func (d *VClusterDriver) instance(ctx context.Context, ref NodeRef, release string, pod *corev1.Pod) (string, error) {
+	pvc := &corev1.PersistentVolumeClaim{}
+	err := d.reader().Get(ctx, client.ObjectKey{Namespace: ref.Namespace(), Name: DataClaimName(release)}, pvc)
+	switch {
+	case err == nil:
+		return "pvc:" + string(pvc.UID), nil
+	case apierrors.IsNotFound(err):
+		return string(pod.UID), nil
+	default:
+		return "", err
+	}
+}
+
+func replicas(wl client.Object) int32 {
+	switch w := wl.(type) {
+	case *appsv1.StatefulSet:
+		if w.Spec.Replicas != nil {
+			return *w.Spec.Replicas
+		}
+	case *appsv1.Deployment:
+		if w.Spec.Replicas != nil {
+			return *w.Spec.Replicas
+		}
+	}
+	return 1
+}
+
+// scale sets the control plane's replica count.
+func (d *VClusterDriver) scale(ctx context.Context, wl client.Object, n int32) error {
+	patch := []byte(fmt.Sprintf(`{"spec":{"replicas":%d}}`, n))
+	return d.Client.Patch(ctx, wl, client.RawPatch("application/merge-patch+json", patch))
+}
+
+// Hibernate scales a persistent vcluster's control plane to zero and deletes
+// the workload pods it synced into the host namespace (they hold compute;
+// on resume vcluster drops the virtual pods whose host pods vanished and
+// their controllers, e.g. Deployments, recreate them). Bare pods created
+// directly by the learner therefore do not survive; every API object
+// (Deployments, Services, ConfigMaps, RBAC, ...) does. A vcluster without
+// persistence keeps running.
+func (d *VClusterDriver) Hibernate(ctx context.Context, ref NodeRef) error {
+	release := VClusterRelease(ref.Session, ref.Node.Name)
+	wl, err := d.workload(ctx, ref, release)
+	if err != nil || wl == nil {
+		return err
+	}
+	if wl.GetLabels()[LabelSessionUID] != string(ref.Session.UID) {
+		return fmt.Errorf("StatefulSet %s does not belong to session %s: %w", release, ref.Session.Name, ErrConflict)
+	}
+	if _, ok := wl.(*appsv1.StatefulSet); !ok {
+		return fmt.Errorf("vcluster %s has no persistent database: %w", release, ErrUnsupported)
+	}
+	if replicas(wl) != 0 {
+		if err := d.scale(ctx, wl, 0); err != nil {
+			return err
+		}
+	}
+	pods := &corev1.PodList{}
+	if err := d.reader().List(ctx, pods, client.InNamespace(ref.Namespace()), client.MatchingLabels{LabelVClusterManagedBy: release}); err != nil {
+		return err
+	}
+	for i := range pods.Items {
+		if err := d.Client.Delete(ctx, &pods.Items[i]); err != nil && !apierrors.IsNotFound(err) {
+			return err
+		}
+	}
+	return nil
+}
+
+// hibernateState reports Hibernated once the control plane and the synced
+// pods are gone.
+func (d *VClusterDriver) hibernateState(ctx context.Context, ref NodeRef, release string) (NodeState, error) {
+	wl, err := d.workload(ctx, ref, release)
+	if err != nil {
+		return NodeState{}, err
+	}
+	if wl != nil && replicas(wl) != 0 {
+		return NodeState{Phase: labsv1.NodeProvisioning, Message: "vcluster control plane still scaled up"}, nil
+	}
+	cps, err := d.controlPlanePods(ctx, ref, release)
+	if err != nil {
+		return NodeState{}, err
+	}
+	pods := &corev1.PodList{}
+	if err := d.reader().List(ctx, pods, client.InNamespace(ref.Namespace()), client.MatchingLabels{LabelVClusterManagedBy: release}); err != nil {
+		return NodeState{}, err
+	}
+	if n := len(cps) + len(pods.Items); n > 0 {
+		return NodeState{Phase: labsv1.NodeProvisioning, Message: fmt.Sprintf("vcluster stopping (%d pod(s) left)", n)}, nil
+	}
+	return NodeState{Phase: labsv1.NodeHibernated, Message: "vcluster scaled to zero; database volume kept"}, nil
+}
+
+// resetPersistent scales the StatefulSet to zero and deletes its database
+// PVC; ErrInProgress until both the pod and the PVC are gone.
+func (d *VClusterDriver) resetPersistent(ctx context.Context, ref NodeRef, release string, sts *appsv1.StatefulSet) error {
+	if replicas(sts) != 0 {
+		if err := d.scale(ctx, sts, 0); err != nil {
+			return err
+		}
+	}
+	cps, err := d.controlPlanePods(ctx, ref, release)
+	if err != nil {
+		return err
+	}
+	if len(cps) > 0 {
+		return inProgress("vcluster %s stopping for reset", release)
+	}
+	gone, err := d.deleteData(ctx, ref, release)
+	if err != nil {
+		return err
+	}
+	if !gone {
+		return inProgress("vcluster %s database volume is being deleted", release)
+	}
+	return nil
+}
+
+// deleteData deletes the database PVC of release; gone reports whether it
+// no longer exists. The PVC carries the chart's labels, not the session's:
+// it is identified by name and by the release's StatefulSet selector labels.
+func (d *VClusterDriver) deleteData(ctx context.Context, ref NodeRef, release string) (bool, error) {
+	pvc := &corev1.PersistentVolumeClaim{}
+	err := d.reader().Get(ctx, client.ObjectKey{Namespace: ref.Namespace(), Name: DataClaimName(release)}, pvc)
+	if apierrors.IsNotFound(err) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if pvc.Labels["release"] != release && pvc.Labels[LabelSessionUID] != string(ref.Session.UID) {
+		return true, nil // not this release's volume
+	}
+	if pvc.DeletionTimestamp == nil {
+		uid := pvc.UID
+		if err := d.Client.Delete(ctx, pvc, client.Preconditions{UID: &uid}); err != nil {
+			return apierrors.IsNotFound(err), client.IgnoreNotFound(err)
+		}
+		// Without a protection finalizer the claim is gone right away.
+		if err := d.reader().Get(ctx, client.ObjectKey{Namespace: ref.Namespace(), Name: DataClaimName(release)}, pvc); apierrors.IsNotFound(err) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
