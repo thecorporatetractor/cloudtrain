@@ -163,6 +163,12 @@ if [[ $GUEST == kubeadm ]]; then
 fi
 
 # --- 3. customize -----------------------------------------------------------------
+# PACKAGE_ONLY=1 reuses an existing $WORK/out/disk.qcow2 and only re-runs step 4 (e.g.
+# after the containerDisk `docker build` failed; virt-customize under TCG takes 10-40 min).
+if [[ ${PACKAGE_ONLY:-0} == 1 ]]; then
+  [[ -s $WORK/out/disk.qcow2 ]] || die "PACKAGE_ONLY=1 but $WORK/out/disk.qcow2 does not exist"
+  log "PACKAGE_ONLY=1: reusing $WORK/out/disk.qcow2 ($(date -r "$WORK/out/disk.qcow2" '+%F %T'))"
+else
 # Builder tag = hash of its Dockerfile, so edits rebuild it automatically.
 BUILDER="cloudtrain/image-builder:$( { cat "$HERE/builder/Dockerfile"; echo "$UBUNTU_APT_SNAPSHOT"; } | sha256sum | cut -c1-12)"
 docker image inspect "$BUILDER" >/dev/null 2>&1 || {
@@ -205,6 +211,7 @@ docker run --rm --memory 6g "${GUESTFS_ARGS[@]}" \
   -e BASE="/work/$(basename "$BASE")" -e VARIANT_DIR="/work/$VARIANT" \
   -e GUEST_SCRIPT="guest-$GUEST.sh" -e DISK_SIZE="$DISK_SIZE" \
   "$BUILDER" bash /src/scripts/customize.sh
+fi
 
 # --- 4. containerDisk -----------------------------------------------------------
 log "packaging containerDisk $TAG"
