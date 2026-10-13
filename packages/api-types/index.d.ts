@@ -4,7 +4,14 @@
  * packages/lab-schema/schema/lab.schema.json (cloudtrain.dev/v3), reduced to
  * what a learner may see: the gateway never sends expected values, check
  * commands, solutions or misconceptions.
+ *
+ * Platform shapes (identity, tenancy, roles, assignments, cohorts, admin,
+ * platform) live in ./platform.d.ts and are re-exported here.
  */
+
+import type { MyAssignment, SessionNotice } from './platform.js';
+
+export * from './platform.js';
 
 export type Domain = 'kubernetes' | 'linux' | 'networking';
 export type Difficulty = 'easy' | 'medium' | 'hard';
@@ -205,6 +212,10 @@ export interface HomeData {
   goal: GoalForecast;
   activity: Activity[];
   masteryByDomain: { domain: Domain; mastery: number; skills: number; practicedSkills: number }[];
+  /** Open assignments, soonest due first (platform API). */
+  assignmentsDue?: MyAssignment[];
+  /** `live`: computed from the learner's history; `empty`: no history yet, cold-start defaults. */
+  source?: 'live' | 'empty';
 }
 
 export type NodeStatus = 'provisioning' | 'ready' | 'degraded' | 'stopped';
@@ -252,6 +263,8 @@ export interface LabSession {
   params?: Record<string, string>;
   /** Content of revealed hints, by index, when the lab's hints are redacted. */
   hints?: Record<number, LabHint>;
+  /** Observer banners and cohort broadcasts for this session (platform API). */
+  notices?: SessionNotice[];
 }
 
 export interface ValidateResponse {
