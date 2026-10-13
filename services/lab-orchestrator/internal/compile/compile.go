@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -45,6 +46,9 @@ type Options struct {
 	Schema *jsonschema.Schema
 	// Namespace for the produced LabTemplate (optional).
 	Namespace string
+	// BaseDir is the lab directory that file.source assets resolve against.
+	// CompileFile sets it to the directory of lab.yaml.
+	BaseDir string
 }
 
 // Issue is one validation problem.
@@ -84,6 +88,9 @@ func CompileFile(path string, opts Options) (*labsv1.LabTemplate, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
+	}
+	if opts.BaseDir == "" {
+		opts.BaseDir = filepath.Dir(path)
 	}
 	t, err := Compile(b, opts)
 	if err != nil {
@@ -135,6 +142,9 @@ func Compile(data []byte, opts Options) (*labsv1.LabTemplate, error) {
 		return nil, &ValidationError{Issues: []Issue{{Message: "decode lab: " + err.Error()}}}
 	}
 
+	if issues := inlineSources(&src, opts.BaseDir); len(issues) > 0 {
+		return nil, &ValidationError{Issues: issues}
+	}
 	spec := convert(&src)
 	if issues := validateSemantics(spec); len(issues) > 0 {
 		return nil, &ValidationError{Issues: issues}
@@ -203,6 +213,11 @@ func convert(src *sourceLab) *labsv1.LabTemplateSpec {
 		Teardown:    convertActions(s.Teardown),
 		Solution:    labsv1.Solution{Explanation: s.Solution.Explanation, Steps: convertActions(s.Solution.Steps)},
 	}
+	for _, alt := range s.Solution.Alternatives {
+		out.Solution.Alternatives = append(out.Solution.Alternatives, labsv1.SolutionAlternative{
+			ID: alt.ID, Description: alt.Description, Steps: convertActions(alt.Steps),
+		})
+	}
 	if len(s.Params) > 0 {
 		out.Params = make(map[string]labsv1.ParamSpec, len(s.Params))
 		for name, p := range s.Params {
@@ -228,7 +243,7 @@ func convert(src *sourceLab) *labsv1.LabTemplateSpec {
 		out.Hints = append(out.Hints, labsv1.Hint{Title: h.Title, Body: h.Body, Command: h.Command, Cost: cost})
 	}
 	for _, mc := range s.Misconceptions {
-		o := labsv1.Misconception{ID: mc.ID, Description: mc.Description, Feedback: mc.Feedback}
+		o := labsv1.Misconception{ID: mc.ID, Description: mc.Description, ExpectFail: mc.ExpectFail, Feedback: mc.Feedback}
 		if mc.Mutation != nil {
 			a := convertAction(*mc.Mutation)
 			o.Mutation = &a
@@ -320,6 +335,48 @@ func defaultEntry(nodes []labsv1.Node) string {
 		return nodes[0].Name
 	}
 	return ""
+}
+
+// inlineSources replaces every file.source with the asset's content, read
+// from baseDir. Assets must stay inside the lab directory.
+func inlineSources(src *sourceLab, baseDir string) []Issue {
+	var issues []Issue
+	visit := func(path string, actions []sourceAction) {
+		for i := range actions {
+			f := actions[i].File
+			if f == nil || f.Source == "" {
+				continue
+			}
+			p := fmt.Sprintf("%s/%d/file/source", path, i)
+			if baseDir == "" {
+				issues = append(issues, Issue{Path: p, Message: "file.source needs the lab directory; compile the lab from its file"})
+				continue
+			}
+			if !filepath.IsLocal(f.Source) {
+				issues = append(issues, Issue{Path: p, Message: fmt.Sprintf("asset %q escapes the lab directory", f.Source)})
+				continue
+			}
+			b, err := os.ReadFile(filepath.Join(baseDir, f.Source))
+			if err != nil {
+				issues = append(issues, Issue{Path: p, Message: "read asset: " + err.Error()})
+				continue
+			}
+			f.Content, f.Source = string(b), ""
+		}
+	}
+	s := &src.Spec
+	visit("/spec/setup", s.Setup)
+	visit("/spec/teardown", s.Teardown)
+	visit("/spec/solution/steps", s.Solution.Steps)
+	for i := range s.Solution.Alternatives {
+		visit(fmt.Sprintf("/spec/solution/alternatives/%d/steps", i), s.Solution.Alternatives[i].Steps)
+	}
+	for i := range s.Misconceptions {
+		if m := s.Misconceptions[i].Mutation; m != nil {
+			visit(fmt.Sprintf("/spec/misconceptions/%d", i), []sourceAction{*m}) // File is a pointer, so the copy shares it
+		}
+	}
+	return issues
 }
 
 func convertActions(in []sourceAction) []labsv1.Action {

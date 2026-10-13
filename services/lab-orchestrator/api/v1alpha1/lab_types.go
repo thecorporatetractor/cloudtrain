@@ -221,7 +221,8 @@ type Action struct {
 	TimeoutSec int32 `json:"timeoutSec,omitempty"`
 }
 
-// FileAction writes a file on a node.
+// FileAction writes a file on a node. A lab's file.source asset is inlined
+// into Content at compile time.
 type FileAction struct {
 	Path    string `json:"path"`
 	Content string `json:"content"`
@@ -304,6 +305,9 @@ type Misconception struct {
 	Description string `json:"description"`
 	// +optional
 	Mutation *Action `json:"mutation,omitempty"`
+	// ExpectFail lists the check ids that must fail after Mutation.
+	// +optional
+	ExpectFail []string `json:"expectFail,omitempty"`
 	// +optional
 	Feedback string `json:"feedback,omitempty"`
 }
@@ -312,6 +316,17 @@ type Misconception struct {
 type Solution struct {
 	// +optional
 	Explanation string `json:"explanation,omitempty"`
+	// +kubebuilder:validation:MinItems=1
+	Steps []Action `json:"steps"`
+	// Alternatives are other valid solutions; each must pass every check.
+	// +optional
+	Alternatives []SolutionAlternative `json:"alternatives,omitempty"`
+}
+
+// SolutionAlternative is another valid way to solve a lab.
+type SolutionAlternative struct {
+	ID          string `json:"id"`
+	Description string `json:"description"`
 	// +kubebuilder:validation:MinItems=1
 	Steps []Action `json:"steps"`
 }

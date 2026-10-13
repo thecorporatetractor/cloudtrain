@@ -157,6 +157,17 @@ func validateSemantics(s *labsv1.LabTemplateSpec) []Issue {
 	for i, a := range s.Solution.Steps {
 		checkAction(fmt.Sprintf("/spec/solution/steps/%d", i), a)
 	}
+	altIDs := map[string]bool{}
+	for i, alt := range s.Solution.Alternatives {
+		path := fmt.Sprintf("/spec/solution/alternatives/%d", i)
+		if altIDs[alt.ID] {
+			add(path, "duplicate alternative id %q", alt.ID)
+		}
+		altIDs[alt.ID] = true
+		for j, a := range alt.Steps {
+			checkAction(fmt.Sprintf("%s/steps/%d", path, j), a)
+		}
+	}
 	mcIDs := map[string]bool{}
 	for i, m := range s.Misconceptions {
 		path := fmt.Sprintf("/spec/misconceptions/%d", i)
@@ -212,6 +223,15 @@ func validateSemantics(s *labsv1.LabTemplateSpec) []Issue {
 		case "reachability", "http":
 			if c.Target == "" {
 				add(path, "%s check requires target", c.Type)
+			}
+		}
+	}
+
+	// Mutations must name the checks they are expected to fail.
+	for i, m := range s.Misconceptions {
+		for j, id := range m.ExpectFail {
+			if !checkIDs[id] {
+				add(fmt.Sprintf("/spec/misconceptions/%d/expectFail/%d", i, j), "unknown check id %q", id)
 			}
 		}
 	}

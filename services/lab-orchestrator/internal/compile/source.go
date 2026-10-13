@@ -125,6 +125,7 @@ type sourceAction struct {
 type sourceFile struct {
 	Path    string `json:"path"`
 	Content string `json:"content"`
+	Source  string `json:"source"`
 	Mode    string `json:"mode"`
 }
 
@@ -169,10 +170,18 @@ type sourceMisconception struct {
 	ID          string        `json:"id"`
 	Description string        `json:"description"`
 	Mutation    *sourceAction `json:"mutation"`
+	ExpectFail  []string      `json:"expectFail"`
 	Feedback    string        `json:"feedback"`
 }
 
 type sourceSolution struct {
-	Explanation string         `json:"explanation"`
+	Explanation  string              `json:"explanation"`
+	Steps        []sourceAction      `json:"steps"`
+	Alternatives []sourceAlternative `json:"alternatives"`
+}
+
+type sourceAlternative struct {
+	ID          string         `json:"id"`
+	Description string         `json:"description"`
 	Steps       []sourceAction `json:"steps"`
 }

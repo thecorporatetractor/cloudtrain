@@ -159,7 +159,7 @@ func cmdValidate(args []string, stdout, stderr io.Writer) int {
 	for _, f := range files {
 		data, err := os.ReadFile(f)
 		if err == nil {
-			err = compile.Validate(data, compile.Options{Schema: schema})
+			err = compile.Validate(data, compile.Options{Schema: schema, BaseDir: filepath.Dir(f)})
 		}
 		if err != nil {
 			failed++
