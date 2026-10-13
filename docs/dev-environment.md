@@ -193,7 +193,7 @@ Other measurements:
 | `dev:up` from nothing | 401 s (cold image pulls; KubeVirt 173 s, CDI 49 s) |
 | `dev:up` re-run after node restart with IP drift | 144 s (forced IP change), 135 s (`docker stop` of both nodes) |
 | `dev:up` re-run on a converged cluster | about 20 s, no changes |
-| `image:build` (base image cached) | 304 s (virt-customize 116 s, sparsify, containerDisk build); 3072 s when the builder image is rebuilt, because `snapshot.ubuntu.com` served about 370 KB/s here (builder 40 min, virt-customize 457 s) |
+| `image:build:*` under TCG (default since the WSL crashes) | etcd-host 540–555 s, kubeadm-node 1450 s, kubeadm-upgrade about 2150 s through sparsify (most of it apt from `snapshot.ubuntu.com` and image pulls through the appliance's user-mode network). Earlier KVM numbers: 304 s for the kubeadm node image with a cached builder, 3072 s when the builder image was rebuilt |
 | KVM probe VMI (cirros) to Ready | 13–16 s |
 | `kind load` of the golden image (2.26 GB containerDisk) | about 65 s per node; the demo skips nodes that already have it |
 | Platform idle footprint (both kind nodes) | about 3.1 GB |
@@ -284,7 +284,11 @@ and keeps boot-to-Ready around 90–117 s.
   `build.sh` now sets `LIBGUESTFS_BACKEND_SETTINGS=force_tcg`, caps the appliance at
   2 GiB (`LIBGUESTFS_MEMSIZE=2048`) and the builder container at 6 GiB. `GUESTFS_KVM=1`
   re-enables KVM on hosts where nested virtualization is known to be stable. Build one
-  image at a time (`image:build:all` is sequential).
+  image at a time (`image:build:all` is sequential). `GUESTFS_VERBOSE=1` streams every
+  traced guest command to the log (otherwise a stalled build looks idle); apt in the
+  guest has timeouts and retries, because the appliance's user-mode network can stall
+  under TCG. `PACKAGE_ONLY=1` re-runs only the containerDisk packaging from an existing
+  `.cache/<variant>/out/disk.qcow2`.
 - `build.sh <variant>` (`kubeadm-node`, `kubeadm-upgrade`, `etcd-host`): fetches the
   pinned cloud image and checks its sha256. It resolves the image lists (pinned
   `kubeadm config images list` per Kubernetes version, the Calico manifest checked by
