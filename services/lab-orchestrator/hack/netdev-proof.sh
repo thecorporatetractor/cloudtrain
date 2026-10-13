@@ -45,7 +45,8 @@ for n in edge-1 edge-2; do
 done
 
 hdr "checks BEFORE the solution (adjacency and route must fail)"
-PROOF checks | tee /dev/stderr | grep -q '^--- check adjacency-full *FAIL' && ok "adjacency-full fails before solution" || bad "adjacency-full did not fail before solution"
+res=$(PROOF checks); echo "$res"
+grep -q '^--- check adjacency-full *FAIL' <<<"$res" && ok "adjacency-full fails before solution" || bad "adjacency-full did not fail before solution"
 
 hdr "apply solution through the netdev driver"
 PROOF solution
@@ -92,7 +93,9 @@ cap=$(PROOF capture edge-2:eth2 "proto ospf" 2>&1); echo "$cap"
 grep -q "OSPFv2, Hello" <<<"$cap" && ok "tcpdump shows OSPF hellos" || bad "no OSPF hellos captured"
 
 hdr "isolation"
-x core-host sh -c 'iperf3 -s -D -p 5201' >/dev/null 2>&1 || true
+# iperf3 -D keeps the exec stream open; start it detached and do not wait for it.
+timeout 10 kubectl --context "$CTX" -n "$NS" exec "$(pod core-host)" -c node -- \
+  sh -c 'setsid iperf3 -s -D -p 5201 --logfile /tmp/iperf3.log </dev/null >/dev/null 2>&1' || true
 sleep 1
 DNS_POD=$(K -n kube-system get pod -l k8s-app=kube-dns -o jsonpath='{.items[0].status.podIP}')
 NODE_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' cloudtrain-dev-control-plane)
@@ -104,7 +107,7 @@ expect() {  # expect <open|closed> <from> <ip> <port> <what>
   else
     tcp "$2" "$3" "$4" && got=open
   fi
-  [[ $got == "$1" ]] && ok "$2 -> $5 ($3:$4) $got" || bad "$2 -> $5 ($3:$4) is $got, expected $1"
+  [[ $got == "$1" ]] && ok "$2 -> $5 ($3:$4) $got [$(date +%T)]" || bad "$2 -> $5 ($3:$4) is $got, expected $1"
 }
 expect open   wh-host     "10.$O.1.10"  5201 "core-host iperf3 across both routers"
 for n in edge-1 wh-host; do
@@ -127,7 +130,10 @@ hdr "teardown"
 VPC=$(K get vpc -l "labs.cloudtrain.dev/session=$SESSION" -o name)
 T=$(date +%s)
 K -n "$NS" delete ls "$SESSION" --wait=true --timeout=300s
-echo "deleted in $(( $(date +%s) - T ))s"
+echo "LabSession gone (finalizer released) after $(( $(date +%s) - T ))s"
+# The jumphost (container driver) has the default 30s grace period.
+K -n "$NS" wait --for=delete pod --all --timeout=90s >/dev/null 2>&1 || true
+echo "all pods gone after $(( $(date +%s) - T ))s"
 left=$(K -n "$NS" get pods,svc,network-attachment-definitions -l "labs.cloudtrain.dev/session=$SESSION" -o name 2>/dev/null; \
        K get vpc,subnet -l "labs.cloudtrain.dev/session=$SESSION" -o name 2>/dev/null; \
        K -n "$NS" get pods -o name 2>/dev/null)
