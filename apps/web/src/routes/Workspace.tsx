@@ -94,9 +94,8 @@ export function Workspace() {
           void navigate({ search: { s: s.id }, replace: true });
           startingRef.current = false;
         },
-        onError: () => {
-          startingRef.current = false;
-        },
+        // Stay blocked after a failure: the error state's Retry unblocks (no request loop).
+        onError: () => undefined,
       });
     }
   }, [search.s, session.isError, session.error, lab.isSuccess, start, navigate]);
@@ -248,7 +247,14 @@ export function Workspace() {
   if (start.isError) {
     return (
       <div className="page page-narrow">
-        <ErrorState title="Could not start the lab environment" error={start.error} onRetry={() => start.reset()} />
+        <ErrorState
+          title="Could not start the lab environment"
+          error={start.error}
+          onRetry={() => {
+            startingRef.current = false;
+            start.reset();
+          }}
+        />
       </div>
     );
   }

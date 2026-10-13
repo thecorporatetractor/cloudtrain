@@ -29,6 +29,17 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   const app = Fastify({ logger: deps.logger ?? false });
   await app.register(websocket, { options: { maxPayload: 1 << 20 } });
 
+  // The web client sends content-type: application/json on body-less POSTs; treat an empty body as none.
+  app.removeContentTypeParser('application/json');
+  app.addContentTypeParser('application/json', { parseAs: 'string' }, (_req, body, done) => {
+    if (!body) return done(null, undefined);
+    try {
+      done(null, JSON.parse(body as string));
+    } catch {
+      done(new HttpError(400, 'Invalid JSON body'), undefined);
+    }
+  });
+
   const labViews = new Map<string, Lab>(Array.from(content.labs.values(), (l) => [l.lab.metadata.id, learnerLab(l.lab)]));
 
   app.decorateRequest('principal', null as never);

@@ -156,3 +156,13 @@ describe('terminal WebSocket', () => {
     await until(() => cluster.execs[0]?.closed === true);
   });
 });
+
+describe('request bodies', () => {
+  it('accepts body-less POSTs that still carry content-type: application/json', async () => {
+    const { app } = await make();
+    const r = await app.inject({ method: 'POST', url: '/api/labs/gateway-smoke/sessions', headers: { 'content-type': 'application/json' } });
+    expect(r.statusCode).toBe(201);
+    const bad = await app.inject({ method: 'POST', url: '/api/labs/gateway-smoke/sessions', headers: { 'content-type': 'application/json' }, payload: '{nope' });
+    expect(bad.statusCode).toBe(400);
+  });
+});
