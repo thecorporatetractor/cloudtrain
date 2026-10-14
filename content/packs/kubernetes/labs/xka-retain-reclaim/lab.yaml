@@ -1,0 +1,174 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xka-retain-reclaim
+  title: Keep a released volume's data
+  domain: kubernetes
+  frameworks: [cka:storage]
+  difficulty: medium
+  estimatedMinutes: 8
+  tags: [exam, pv, reclaim-policy]
+  version: 1
+spec:
+  description: |
+    **Context:** `qm-yard` (`kubectl config use-context qm-yard`)
+
+    The claim **`ledger-history`** in namespace **`ledger-archive`** is bound
+    to the PersistentVolume **`{{pv}}`**, whose reclaim policy is `Delete`.
+    The claim is no longer needed, but the data must be kept and reused:
+
+    1. Make sure the volume's data survives the claim: change the volume's
+       reclaim policy to **Retain** before anything else.
+    2. Delete the claim `ledger-history`.
+    3. Make the released volume **Available** again for a new claim, without
+       deleting and recreating the PersistentVolume.
+  objectives:
+    - Change a PersistentVolume's reclaim policy
+    - Return a Released volume to Available
+  params:
+    pv:
+      type: choice
+      values: [ledger-history-pv, ledger-2025-volume, ledger-archive-pv]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-yard
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-yard
+          nodes:
+            - {name: yard-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: yard-wk-1, role: worker}
+            - {name: yard-wk-2, role: worker}
+  setup:
+    - on: qm-yard/yard-wk-2
+      run: |
+        mkdir -p /srv/{{pv}}
+        echo "2025 closing balances" > /srv/{{pv}}/closing.txt
+    - on: qm-yard
+      apply: |
+        apiVersion: v1
+        kind: PersistentVolume
+        metadata: {name: "{{pv}}"}
+        spec:
+          capacity: {storage: 1Gi}
+          accessModes: [ReadWriteOnce]
+          persistentVolumeReclaimPolicy: Delete
+          storageClassName: ledger-local
+          hostPath: {path: "/srv/{{pv}}", type: Directory}
+          nodeAffinity:
+            required:
+              nodeSelectorTerms:
+                - matchExpressions:
+                    - {key: kubernetes.io/hostname, operator: In, values: [yard-wk-2]}
+        ---
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: ledger-archive}
+        ---
+        apiVersion: v1
+        kind: PersistentVolumeClaim
+        metadata: {name: ledger-history, namespace: ledger-archive}
+        spec:
+          accessModes: [ReadWriteOnce]
+          storageClassName: ledger-local
+          volumeName: "{{pv}}"
+          resources: {requests: {storage: 1Gi}}
+    - on: qm-yard
+      timeoutSec: 60
+      run: |
+        kubectl -n ledger-archive wait pvc/ledger-history --for=jsonpath='{.status.phase}'=Bound --timeout=50s
+        kubectl annotate pv {{pv}} --overwrite cloudtrain.dev/origin-uid=$(kubectl get pv {{pv}} -o jsonpath='{.metadata.uid}')
+  teardown:
+    - on: qm-yard
+      run: |
+        kubectl delete namespace ledger-archive --ignore-not-found --wait=false
+        kubectl delete pv {{pv}} --ignore-not-found --wait=false
+  checks:
+    - id: retain
+      description: The volume's reclaim policy is Retain
+      type: k8s-query
+      skills: [k8s.storage.reclaim-policy]
+      query: {cluster: qm-yard, resource: pv, name: "{{pv}}", jsonpath: '{.spec.persistentVolumeReclaimPolicy}'}
+      expect: {match: exact, value: Retain}
+    - id: claim-gone
+      description: The claim ledger-history is deleted
+      type: shell
+      on: qm-yard
+      skills: [k8s.storage.reclaim-policy]
+      weight: 0.5
+      command: kubectl -n ledger-archive get pvc ledger-history --ignore-not-found --no-headers | wc -l
+      expect: {match: exact, value: "0"}
+    - id: available
+      description: The same volume object is Available with no claim reference
+      type: shell
+      on: qm-yard
+      skills: [k8s.storage.reclaim-policy]
+      weight: 2
+      command: |
+        kubectl get pv {{pv}} -o json | jq -r '"\(.status.phase) claimRef=\(.spec.claimRef == null | not) same-object=\(.metadata.uid == .metadata.annotations["cloudtrain.dev/origin-uid"])"'
+      expect: {match: exact, value: Available claimRef=false same-object=true}
+    - id: never-deleted
+      description: Retain was in force before the claim went away (no delete attempt) and the data is intact
+      type: shell
+      on: qm-yard
+      skills: [k8s.storage.reclaim-policy]
+      weight: 2
+      command: |
+        echo "delete-attempts=$(kubectl get events -A --field-selector involvedObject.kind=PersistentVolume,involvedObject.name={{pv}} -o json | jq '[.items[] | select(.reason == "VolumeFailedDelete")] | length')"
+      expect: {match: exact, value: delete-attempts=0}
+    - id: data-kept
+      description: The volume's data is still on yard-wk-2
+      type: shell
+      on: qm-yard/yard-wk-2
+      skills: [k8s.storage.reclaim-policy]
+      weight: 0.5
+      command: cat /srv/{{pv}}/closing.txt 2>&1
+      expect: {match: exact, value: 2025 closing balances}
+  misconceptions:
+    - id: delete-claim-first
+      description: Deletes the claim before switching the policy to Retain.
+      feedback: With Delete in force, releasing the claim hands the volume to the deleter at once. Switch to Retain first.
+      expectFail: [never-deleted]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          kubectl config use-context qm-yard
+          kubectl -n ledger-archive delete pvc ledger-history --wait=true
+          sleep 10
+          kubectl patch pv {{pv}} -p '{"spec":{"persistentVolumeReclaimPolicy":"Retain"}}'
+          kubectl patch pv {{pv}} --type=json -p '[{"op":"remove","path":"/spec/claimRef"}]' || true
+          sleep 5
+    - id: left-released
+      description: Leaves the volume in Released.
+      feedback: A Released volume still references the deleted claim. Remove spec.claimRef to make it Available.
+      expectFail: [available]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          kubectl config use-context qm-yard
+          kubectl patch pv {{pv}} -p '{"spec":{"persistentVolumeReclaimPolicy":"Retain"}}'
+          kubectl -n ledger-archive delete pvc ledger-history --wait=true
+          sleep 5
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          kubectl config use-context qm-yard
+          kubectl patch pv {{pv}} -p '{"spec":{"persistentVolumeReclaimPolicy":"Retain"}}'
+          kubectl -n ledger-archive delete pvc ledger-history --wait=true
+          kubectl patch pv {{pv}} --type=json -p '[{"op":"remove","path":"/spec/claimRef"}]'
+          for i in $(seq 1 20); do [ "$(kubectl get pv {{pv}} -o jsonpath='{.status.phase}')" = Available ] && break; sleep 2; done

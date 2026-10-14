@@ -1,0 +1,119 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xka-crictl-container-id
+  title: Find a container on its node with crictl
+  domain: kubernetes
+  frameworks: [cka:troubleshooting]
+  difficulty: medium
+  estimatedMinutes: 6
+  tags: [exam, crictl, container-runtime]
+  version: 1
+spec:
+  description: |
+    **Host:** `yard-wk-1` (`ssh yard-wk-1`; `sudo` and `crictl` work there)
+
+    The Pod `gate-scanner` in namespace `yard-gates` of `qm-yard` runs a
+    container named **`{{container}}`** on `yard-wk-1`. Using `crictl` on that
+    node, write to **`/opt/exam/gate-scanner.txt`** on `yard-wk-1`:
+
+    - line 1: the container's **full** runtime ID (64 hex characters);
+    - line 2: the image reference the runtime reports for it (for example
+      `docker.io/library/redis:7.4-alpine`).
+  objectives:
+    - List and inspect containers with crictl
+  params:
+    container:
+      type: choice
+      values: [scanner, barcode-reader, gate-cam]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-yard
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-yard
+          nodes:
+            - {name: yard-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: yard-wk-1, role: worker}
+            - {name: yard-wk-2, role: worker}
+  setup:
+    - on: qm-yard
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: yard-gates}
+        ---
+        apiVersion: v1
+        kind: Pod
+        metadata: {name: gate-scanner, namespace: yard-gates}
+        spec:
+          terminationGracePeriodSeconds: 1
+          nodeSelector: {kubernetes.io/hostname: yard-wk-1}
+          containers:
+            - {name: "{{container}}", image: "httpd:2.4-alpine"}
+            - {name: uplink, image: "busybox:1.37", command: ["sleep", "1d"]}
+    - on: qm-yard
+      timeoutSec: 150
+      run: kubectl -n yard-gates wait pod/gate-scanner --for=condition=Ready --timeout=120s
+    - on: qm-yard/yard-wk-1
+      run: install -d -m 0777 /opt/exam
+  teardown:
+    - on: qm-yard
+      run: kubectl delete namespace yard-gates --ignore-not-found --wait=false
+  checks:
+    - id: container-id
+      description: Line 1 is the full ID of the running {{container}} container
+      type: shell
+      on: qm-yard/yard-wk-1
+      skills: [k8s.cluster.container-runtime]
+      weight: 2
+      command: |
+        id=$(crictl ps --name '^{{container}}$' --label io.kubernetes.pod.name=gate-scanner --state running -q --no-trunc | head -1)
+        got=$(sed -n 1p /opt/exam/gate-scanner.txt 2>/dev/null | tr -d '\r ')
+        [ -n "$id" ] && [ "$got" = "$id" ] && echo match || echo "no match"
+      expect: {match: exact, value: match}
+    - id: image
+      description: Line 2 is the container's image reference
+      type: shell
+      on: qm-yard/yard-wk-1
+      skills: [k8s.cluster.container-runtime]
+      command: sed -n 2p /opt/exam/gate-scanner.txt 2>/dev/null | tr -d '\r '
+      expect: {match: regex, value: '^(docker\.io/library/)?httpd:2\.4-alpine$'}
+  misconceptions:
+    - id: truncated-id
+      description: Copies the shortened ID that crictl ps prints by default.
+      feedback: crictl truncates IDs to 13 characters; use --no-trunc or crictl inspect for the full ID.
+      expectFail: [container-id]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          ssh yard-wk-1 'id=$(sudo crictl ps --name "^{{container}}$" -q | head -1); printf "%s\ndocker.io/library/httpd:2.4-alpine\n" "${id:0:13}" > /opt/exam/gate-scanner.txt'
+    - id: pod-sandbox-id
+      description: Writes the Pod sandbox ID instead of the container ID.
+      feedback: crictl pods lists sandboxes; the container has its own ID in crictl ps.
+      expectFail: [container-id]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          ssh yard-wk-1 'id=$(sudo crictl pods --name "^gate-scanner$" -q --no-trunc | head -1); printf "%s\ndocker.io/library/httpd:2.4-alpine\n" "$id" > /opt/exam/gate-scanner.txt'
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        run: |
+          ssh yard-wk-1 'sudo bash -s' <<'EOS'
+          id=$(crictl ps --name '^{{container}}$' --label io.kubernetes.pod.name=gate-scanner -q --no-trunc | head -1)
+          img=$(crictl inspect "$id" | grep -o -m1 'docker\.io/[^"]*')
+          printf '%s\n%s\n' "$id" "$img" > /opt/exam/gate-scanner.txt
+          cat /opt/exam/gate-scanner.txt
+          EOS

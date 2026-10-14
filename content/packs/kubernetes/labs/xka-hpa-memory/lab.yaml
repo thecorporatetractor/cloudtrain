@@ -1,0 +1,159 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xka-hpa-memory
+  title: Autoscale a Deployment
+  domain: kubernetes
+  frameworks: [cka:workloads-scheduling]
+  difficulty: medium
+  estimatedMinutes: 7
+  tags: [exam, hpa, autoscaling]
+  version: 1
+spec:
+  description: |
+    **Context:** `qm-fleet` (`kubectl config use-context qm-fleet`)
+
+    Create a HorizontalPodAutoscaler named **`label-queue`** (API
+    `autoscaling/v2`) in namespace **`label-batch`** for the Deployment
+    `label-queue` that keeps it between **{{min}}** and **6** replicas at
+    **70 %** average CPU utilisation, and that waits **120 seconds** before
+    acting on a lower recommendation when scaling down (scale-down
+    stabilisation window).
+  objectives:
+    - Write an autoscaling/v2 HPA with a CPU utilisation target
+    - Tune scale-down behaviour
+  params:
+    min:
+      type: int
+      min: 2
+      max: 3
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-fleet
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-fleet
+          nodes:
+            - {name: fleet-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: fleet-wk-1, role: worker}
+            - {name: fleet-wk-2, role: worker}
+  setup:
+    - on: qm-fleet
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: label-batch}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: label-queue, namespace: label-batch}
+        spec:
+          replicas: 1
+          selector: {matchLabels: {app: label-queue}}
+          template:
+            metadata: {labels: {app: label-queue}}
+            spec:
+              terminationGracePeriodSeconds: 1
+              containers:
+                - name: queue
+                  image: busybox:1.37
+                  command: ["sh", "-c", "while true; do sleep 30; done"]
+                  resources: {requests: {cpu: 50m, memory: 16Mi}}
+  teardown:
+    - on: qm-fleet
+      run: kubectl delete namespace label-batch --ignore-not-found --wait=false
+  checks:
+    - id: target
+      description: The HPA scales Deployment label-queue between {{min}} and 6 replicas
+      type: k8s-query
+      skills: [k8s.workloads.autoscaling]
+      weight: 2
+      query: {cluster: qm-fleet, resource: hpa.v2.autoscaling, name: label-queue, namespace: label-batch, jsonpath: '{.spec.scaleTargetRef.kind}/{.spec.scaleTargetRef.name} {.spec.minReplicas}-{.spec.maxReplicas}'}
+      expect: {match: exact, value: "Deployment/label-queue {{min}}-6"}
+    - id: cpu-metric
+      description: The only metric is 70 % average CPU utilisation
+      type: shell
+      on: qm-fleet
+      skills: [k8s.workloads.autoscaling]
+      weight: 2
+      command: |
+        kubectl -n label-batch get hpa.v2.autoscaling label-queue -o json | jq -c '[.spec.metrics[]? | {type, name: .resource.name, t: .resource.target.type, v: .resource.target.averageUtilization}]'
+      expect: {match: exact, value: '[{"type":"Resource","name":"cpu","t":"Utilization","v":70}]'}
+    - id: scale-down-window
+      description: Scale-down stabilisation window is 120 seconds
+      type: k8s-query
+      skills: [k8s.workloads.autoscaling]
+      query: {cluster: qm-fleet, resource: hpa.v2.autoscaling, name: label-queue, namespace: label-batch, jsonpath: '{.spec.behavior.scaleDown.stabilizationWindowSeconds}'}
+      expect: {match: exact, value: "120"}
+  misconceptions:
+    - id: no-behavior
+      description: Creates the HPA with kubectl autoscale and stops there.
+      feedback: kubectl autoscale cannot set behaviour; add spec.behavior.scaleDown.stabilizationWindowSeconds.
+      expectFail: [scale-down-window]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-fleet
+          kubectl -n label-batch autoscale deployment label-queue --min={{min}} --max=6 --cpu-percent=70
+    - id: scale-up-window
+      description: Sets the stabilisation window on scale-up instead.
+      feedback: The 120-second wait applies to scaling down.
+      expectFail: [scale-down-window]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-fleet
+          kubectl apply -f - <<'YAML'
+          apiVersion: autoscaling/v2
+          kind: HorizontalPodAutoscaler
+          metadata: {name: label-queue, namespace: label-batch}
+          spec:
+            scaleTargetRef: {apiVersion: apps/v1, kind: Deployment, name: label-queue}
+            minReplicas: {{min}}
+            maxReplicas: 6
+            metrics:
+              - type: Resource
+                resource: {name: cpu, target: {type: Utilization, averageUtilization: 70}}
+            behavior:
+              scaleUp: {stabilizationWindowSeconds: 120}
+          YAML
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-fleet
+          kubectl apply -f - <<'YAML'
+          apiVersion: autoscaling/v2
+          kind: HorizontalPodAutoscaler
+          metadata: {name: label-queue, namespace: label-batch}
+          spec:
+            scaleTargetRef: {apiVersion: apps/v1, kind: Deployment, name: label-queue}
+            minReplicas: {{min}}
+            maxReplicas: 6
+            metrics:
+              - type: Resource
+                resource: {name: cpu, target: {type: Utilization, averageUtilization: 70}}
+            behavior:
+              scaleDown: {stabilizationWindowSeconds: 120}
+          YAML
+    alternatives:
+      - id: autoscale-then-patch
+        description: kubectl autoscale, then patch in the behaviour.
+        steps:
+          - on: workstation
+            as: learner
+            run: |
+              kubectl config use-context qm-fleet
+              kubectl -n label-batch autoscale deployment label-queue --min={{min}} --max=6 --cpu-percent=70
+              kubectl -n label-batch patch hpa label-queue --type=merge -p '{"spec":{"behavior":{"scaleDown":{"stabilizationWindowSeconds":120}}}}'

@@ -1,0 +1,138 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xka-csr-user-access
+  title: Onboard a user with a certificate
+  domain: kubernetes
+  frameworks: [cka:cluster-architecture]
+  difficulty: medium
+  estimatedMinutes: 8
+  tags: [exam, csr, rbac, users]
+  version: 1
+spec:
+  description: |
+    **Context:** `qm-fleet` (`kubectl config use-context qm-fleet`)
+
+    The user **`{{user}}`** has submitted a CertificateSigningRequest named
+    **`{{user}}`**. Approve it, then allow `{{user}}` to **view Pods**
+    (`get`, `list`, `watch`) in namespace **`dock-scheduling`** only, with a
+    Role and a RoleBinding both named **`{{user}}-pods`**.
+  objectives:
+    - Approve a CertificateSigningRequest
+    - Grant a user namespaced read access to Pods
+  params:
+    user:
+      type: choice
+      values: [ops-mara, ops-tamsin, ops-hugo]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-fleet
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-fleet
+          nodes:
+            - {name: fleet-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: fleet-wk-1, role: worker}
+            - {name: fleet-wk-2, role: worker}
+  setup:
+    - on: qm-fleet
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: dock-scheduling}
+    - on: qm-fleet
+      timeoutSec: 60
+      run: |
+        set -e
+        d=$(mktemp -d)
+        openssl genrsa -out $d/u.key 2048 2>/dev/null
+        openssl req -new -key $d/u.key -subj "/CN={{user}}/O=dock-ops" -out $d/u.csr
+        kubectl get csr {{user}} >/dev/null 2>&1 || cat <<YAML | kubectl apply -f -
+        apiVersion: certificates.k8s.io/v1
+        kind: CertificateSigningRequest
+        metadata: {name: {{user}}}
+        spec:
+          request: $(base64 -w0 $d/u.csr)
+          signerName: kubernetes.io/kube-apiserver-client
+          usages: [client auth]
+        YAML
+        rm -rf $d
+  teardown:
+    - on: qm-fleet
+      run: |
+        kubectl delete csr {{user}} --ignore-not-found
+        kubectl delete namespace dock-scheduling --ignore-not-found --wait=false
+  checks:
+    - id: approved
+      description: CSR {{user}} is approved and a certificate was issued
+      type: shell
+      on: qm-fleet
+      skills: [k8s.rbac.user-certificates]
+      weight: 2
+      command: |
+        kubectl get csr {{user}} -o json | jq -r '"\([.status.conditions[]?.type] | join(",")) \((.status.certificate // "") | length > 0)"'
+      expect: {match: exact, value: Approved true}
+    - id: can-view-pods
+      description: "{{user}} can get, list and watch Pods in dock-scheduling"
+      type: shell
+      on: qm-fleet
+      skills: [k8s.rbac.user-certificates]
+      weight: 2
+      command: for v in get list watch; do kubectl auth can-i $v pods -n dock-scheduling --as={{user}}; done | paste -sd' ' -
+      expect: {match: exact, value: "yes yes yes"}
+    - id: nothing-more
+      description: "{{user}} cannot delete Pods there or list Pods in other namespaces"
+      type: shell
+      on: qm-fleet
+      skills: [k8s.rbac.user-certificates]
+      command: echo "$(kubectl auth can-i delete pods -n dock-scheduling --as={{user}}) $(kubectl auth can-i list pods -n kube-system --as={{user}})"
+      expect: {match: exact, value: "no no"}
+    - id: named-objects
+      description: Role and RoleBinding {{user}}-pods exist in dock-scheduling and bind the user
+      type: k8s-query
+      skills: [k8s.rbac.user-certificates]
+      weight: 0.5
+      query: {cluster: qm-fleet, resource: rolebinding, name: "{{user}}-pods", namespace: dock-scheduling, jsonpath: '{.roleRef.kind}/{.roleRef.name} {.subjects[0].kind}/{.subjects[0].name}'}
+      expect: {match: exact, value: "Role/{{user}}-pods User/{{user}}"}
+  misconceptions:
+    - id: not-approved
+      description: Creates the RBAC objects but never approves the CSR.
+      feedback: Without approval the user has no certificate to log in with.
+      expectFail: [approved]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-fleet
+          kubectl -n dock-scheduling create role {{user}}-pods --verb=get,list,watch --resource=pods
+          kubectl -n dock-scheduling create rolebinding {{user}}-pods --role={{user}}-pods --user={{user}}
+    - id: cluster-wide
+      description: Binds a ClusterRole cluster-wide.
+      feedback: Access is limited to dock-scheduling; use a Role and a RoleBinding there.
+      expectFail: [nothing-more, named-objects]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-fleet
+          kubectl certificate approve {{user}}
+          kubectl create clusterrole {{user}}-pods --verb=get,list,watch --resource=pods
+          kubectl create clusterrolebinding {{user}}-pods --clusterrole={{user}}-pods --user={{user}}
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-fleet
+          kubectl certificate approve {{user}}
+          kubectl -n dock-scheduling create role {{user}}-pods --verb=get,list,watch --resource=pods
+          kubectl -n dock-scheduling create rolebinding {{user}}-pods --role={{user}}-pods --user={{user}}
+          sleep 3

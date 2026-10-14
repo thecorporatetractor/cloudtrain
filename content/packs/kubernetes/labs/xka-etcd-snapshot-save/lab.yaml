@@ -1,0 +1,116 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xka-etcd-snapshot-save
+  title: Snapshot a cluster's etcd
+  domain: kubernetes
+  frameworks: [cka:cluster-architecture]
+  difficulty: medium
+  estimatedMinutes: 8
+  tags: [exam, etcd, backup]
+  version: 1
+spec:
+  description: |
+    **Host:** `yard-cp-1` (`ssh yard-cp-1`; `sudo`, `etcdctl` and `etcdutl`
+    are available there)
+
+    Save a snapshot of `qm-yard`'s etcd, which runs as a static Pod on
+    `yard-cp-1` and listens on `https://127.0.0.1:2379`, to
+    **`/srv/backup/{{file}}`** on `yard-cp-1`. Use the cluster's etcd
+    certificates for the connection. The snapshot must be complete and
+    readable by `etcdutl snapshot status`.
+  objectives:
+    - Connect etcdctl to a TLS-secured etcd with the cluster's certificates
+    - Save and verify an etcd snapshot
+  params:
+    file:
+      type: choice
+      values: [yard-etcd-snapshot.db, etcd-pre-upgrade.db, qm-yard-etcd.db]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-yard
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-yard
+          nodes:
+            - {name: yard-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: yard-wk-1, role: worker}
+            - {name: yard-wk-2, role: worker}
+  setup:
+    - on: qm-yard
+      run: |
+        set -e
+        for b in etcdctl etcdutl; do
+          ssh -o StrictHostKeyChecking=no -o BatchMode=yes root@yard-cp-1 "test -x /usr/local/bin/$b || { cat > /usr/local/bin/$b && chmod 0755 /usr/local/bin/$b; }" < /usr/local/bin/$b
+        done
+    - on: qm-yard/yard-cp-1
+      run: |
+        set -e
+        mkdir -p /srv/backup /var/lib/cloudtrain
+        # the snapshot must be newer than the start of the task
+        date +%s > /var/lib/cloudtrain/xka-etcd-snapshot.start
+  checks:
+    - id: snapshot-valid
+      description: /srv/backup/{{file}} is a valid etcd snapshot with keys
+      type: shell
+      on: qm-yard/yard-cp-1
+      skills: [k8s.cluster.etcd-snapshot]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        f=/srv/backup/{{file}}
+        [ -s "$f" ] || { echo missing; exit 0; }
+        keys=$(etcdutl snapshot status "$f" -w simple 2>/dev/null | awk -F', ' '{print $3}')
+        [ "${keys:-0}" -gt 100 ] && echo valid || echo "invalid ($keys keys)"
+      expect: {match: exact, value: valid}
+    - id: snapshot-fresh
+      description: The snapshot was taken during the task
+      type: shell
+      on: qm-yard/yard-cp-1
+      skills: [k8s.cluster.etcd-tls]
+      command: |
+        f=/srv/backup/{{file}}
+        [ -s "$f" ] && [ "$(stat -c %Y "$f")" -ge "$(cat /var/lib/cloudtrain/xka-etcd-snapshot.start)" ] && echo fresh || echo stale
+      expect: {match: exact, value: fresh}
+  misconceptions:
+    - id: copy-data-dir
+      description: Copies the bbolt database file from the data directory instead of using etcdctl snapshot save.
+      feedback: Copying a live database file can give an inconsistent copy that fails integrity checks. Use etcdctl snapshot save over TLS.
+      expectFail: [snapshot-valid]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          ssh yard-cp-1 'sudo mkdir -p /srv/backup && sudo dd if=/var/lib/etcd/member/snap/db of=/srv/backup/{{file}} bs=4k count=8 2>/dev/null'
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          ssh yard-cp-1 'sudo ETCDCTL_API=3 etcdctl --endpoints=https://127.0.0.1:2379 \
+            --cacert=/etc/kubernetes/pki/etcd/ca.crt --cert=/etc/kubernetes/pki/etcd/server.crt --key=/etc/kubernetes/pki/etcd/server.key \
+            snapshot save /srv/backup/{{file}} && sudo etcdutl snapshot status /srv/backup/{{file}} -w table'
+    alternatives:
+      - id: healthcheck-client-cert
+        description: Use the healthcheck client certificate and read the paths from the etcd manifest.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 120
+            run: |
+              ssh yard-cp-1 'sudo bash -s' <<'EOS'
+              set -e
+              grep -E -- '--(trusted-ca-file|cert-file|key-file)=' /etc/kubernetes/manifests/etcd.yaml
+              etcdctl --endpoints=https://127.0.0.1:2379 --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+                --cert=/etc/kubernetes/pki/etcd/healthcheck-client.crt --key=/etc/kubernetes/pki/etcd/healthcheck-client.key \
+                snapshot save /srv/backup/{{file}}
+              EOS

@@ -1,0 +1,99 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xka-tainted-node-count
+  title: Count nodes that accept new Pods
+  domain: kubernetes
+  frameworks: [cka:troubleshooting]
+  difficulty: easy
+  estimatedMinutes: 4
+  tags: [exam, nodes, taints]
+  version: 1
+spec:
+  description: |
+    **Context:** `qm-fleet` (`kubectl config use-context qm-fleet`)
+
+    Write the number of `qm-fleet` nodes that are **Ready** and carry **no
+    taint with the effect `NoSchedule`** to `/home/learner/exam/schedulable-nodes.txt`.
+    The file must contain only that number.
+  objectives:
+    - Read node conditions and taints
+  params:
+    effect:
+      type: choice
+      values: [NoSchedule, PreferNoSchedule]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-fleet
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-fleet
+          nodes:
+            - {name: fleet-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: fleet-wk-1, role: worker}
+            - {name: fleet-wk-2, role: worker}
+  setup:
+    - on: qm-fleet
+      run: |
+        kubectl taint node fleet-wk-1 quillmoor.example/firmware=pending:{{effect}} --overwrite
+        kubectl taint node fleet-wk-2 quillmoor.example/disk-pressure-watch=soft:PreferNoSchedule --overwrite
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/exam
+  teardown:
+    - on: qm-fleet
+      run: |
+        kubectl taint node fleet-wk-1 quillmoor.example/firmware- || true
+        kubectl taint node fleet-wk-2 quillmoor.example/disk-pressure-watch- || true
+  checks:
+    - id: count
+      description: The file holds the number of Ready nodes without a NoSchedule taint
+      type: shell
+      on: workstation
+      skills: [k8s.scheduling.node-status, k8s.scheduling.taints-tolerations]
+      weight: 2
+      command: |
+        exp=$(kubectl --kubeconfig /home/learner/.kube/config --context qm-fleet get nodes -o json | jq '[.items[]
+          | select(any(.status.conditions[]; .type == "Ready" and .status == "True"))
+          | select(all(.spec.taints[]?; .effect != "NoSchedule"))] | length')
+        got=$(tr -d ' \r\n' < /home/learner/exam/schedulable-nodes.txt 2>/dev/null)
+        [ -n "$exp" ] && [ "$got" = "$exp" ] && echo ok || echo "got '$got'"
+      expect: {match: exact, value: ok}
+  misconceptions:
+    - id: count-ready-only
+      description: Counts every Ready node.
+      feedback: Taints matter too; the control plane carries NoSchedule.
+      expectFail: [count]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-fleet
+          kubectl get nodes --no-headers | grep -cw Ready > ~/exam/schedulable-nodes.txt
+    - id: any-taint
+      description: Excludes every tainted node, whatever the effect.
+      feedback: Only NoSchedule taints keep new Pods off; PreferNoSchedule is a hint.
+      expectFail: [count]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-fleet
+          kubectl get nodes -o json | jq '[.items[] | select(.spec.taints == null)] | length' > ~/exam/schedulable-nodes.txt
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-fleet
+          kubectl describe nodes | grep -E '^(Name|Taints):'
+          kubectl get nodes -o json | jq '[.items[]
+            | select(any(.status.conditions[]; .type == "Ready" and .status == "True"))
+            | select(all(.spec.taints[]?; .effect != "NoSchedule"))] | length' > ~/exam/schedulable-nodes.txt
