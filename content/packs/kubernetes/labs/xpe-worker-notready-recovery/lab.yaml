@@ -1,0 +1,140 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xpe-worker-notready-recovery
+  title: Return a NotReady worker to service
+  domain: kubernetes
+  frameworks: [ct-platform:kubernetes-operations]
+  difficulty: hard
+  estimatedMinutes: 20
+  tags: [exam, nodes, kubelet, containerd]
+  version: 1
+spec:
+  description: |
+    **Context:** `qm-harbour` (`kubectl config use-context qm-harbour`);
+    **host** `harbour-wk-2` (`ssh harbour-wk-2`, `sudo` works)
+
+    Worker **`harbour-wk-2`** went NotReady right after last night's
+    node-agent rollout touched its configuration. Find the cause starting
+    from the kubelet's journal, repair it, and confirm that the node is Ready
+    and runs Pods again: the Pod **`wk2-canary`** in namespace
+    **`harbour-canary`** is pinned to the node and must be Running. The node
+    is rebooted before grading, so the fix must persist.
+  objectives:
+    - Follow a NotReady node from the kubelet journal to its container runtime
+    - Repair and re-enable a node service persistently
+  params:
+    key:
+      type: choice
+      values: [snapshotter_cache, telemetry_endpoint, agent_sidecar]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-harbour
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-harbour
+          nodes:
+            - {name: harbour-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: harbour-wk-1, role: worker}
+            - {name: harbour-wk-2, role: worker}
+  setup:
+    - on: qm-harbour
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: harbour-canary}
+    - on: qm-harbour/harbour-wk-2
+      run: |
+        set -e
+        cp -n /etc/containerd/config.toml /var/lib/containerd-config.before-agent || true
+        grep -q '^{{key}} = ' /etc/containerd/config.toml || sed -i '1i {{key}} = on # added by node-agent 3.2' /etc/containerd/config.toml
+        systemctl restart containerd || true
+    - on: qm-harbour
+      timeoutSec: 200
+      run: |
+        for i in $(seq 1 90); do
+          [ "$(kubectl get node harbour-wk-2 -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')" != True ] && break
+          sleep 2
+        done
+        kubectl apply -f - <<'YAML'
+        apiVersion: v1
+        kind: Pod
+        metadata: {name: wk2-canary, namespace: harbour-canary}
+        spec:
+          nodeSelector: {kubernetes.io/hostname: harbour-wk-2}
+          tolerations:
+            - {key: node.kubernetes.io/not-ready, operator: Exists, effect: NoSchedule}
+            - {key: node.kubernetes.io/unreachable, operator: Exists, effect: NoSchedule}
+          containers:
+            - {name: canary, image: "busybox:1.37", command: ["sleep", "1d"]}
+        YAML
+  teardown:
+    - on: qm-harbour
+      run: kubectl delete namespace harbour-canary --ignore-not-found --wait=false
+  checks:
+    - id: node-ready
+      description: harbour-wk-2 is Ready
+      type: k8s-query
+      skills: [k8s.troubleshooting.nodes]
+      weight: 2
+      query: {cluster: qm-harbour, resource: node, name: harbour-wk-2, jsonpath: '{.status.conditions[?(@.type=="Ready")].status}'}
+      expect: {match: exact, value: "True"}
+    - id: runtime-fixed
+      description: containerd on harbour-wk-2 is active, enabled and its configuration loads cleanly
+      type: shell
+      on: qm-harbour/harbour-wk-2
+      skills: [k8s.cluster.kubelet]
+      weight: 2
+      command: |
+        echo "$(systemctl is-active containerd) $(systemctl is-enabled containerd) $(grep -c '^{{key}} = ' /etc/containerd/config.toml) $(systemctl is-active kubelet)"
+      expect: {match: exact, value: active enabled 0 active}
+    - id: canary-running
+      description: wk2-canary runs on harbour-wk-2
+      type: k8s-query
+      skills: [k8s.troubleshooting.nodes]
+      query: {cluster: qm-harbour, resource: pod, name: wk2-canary, namespace: harbour-canary, jsonpath: '{.status.phase}@{.spec.nodeName}'}
+      expect: {match: exact, value: Running@harbour-wk-2}
+  misconceptions:
+    - id: restart-kubelet
+      description: Restarts the kubelet only.
+      feedback: The kubelet reports that the container runtime is unavailable; containerd fails to start because of the configuration line the agent added.
+      expectFail: [node-ready, runtime-fixed, canary-running]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          kubectl config use-context qm-harbour
+          ssh harbour-wk-2 'sudo systemctl restart kubelet'
+          sleep 40
+    - id: replace-config
+      description: Regenerates the default containerd configuration, losing the systemd cgroup setting.
+      feedback: containerd config default switches back to cgroupfs; the kubelet expects systemd. Remove only the bad line.
+      expectFail: [node-ready, canary-running]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 200
+        run: |
+          kubectl config use-context qm-harbour
+          ssh harbour-wk-2 'sudo sh -c "containerd config default > /etc/containerd/config.toml && systemctl restart containerd"'
+          sleep 90
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          kubectl config use-context qm-harbour
+          ssh harbour-wk-2 'sudo journalctl -u kubelet -n 5 --no-pager; sudo journalctl -u containerd -n 5 --no-pager'
+          ssh harbour-wk-2 'sudo sed -i "/^{{key}} = /d" /etc/containerd/config.toml && sudo systemctl enable --now containerd && sudo systemctl restart containerd kubelet'
+          kubectl wait node/harbour-wk-2 --for=condition=Ready --timeout=180s
+          kubectl -n harbour-canary wait pod/wk2-canary --for=condition=Ready --timeout=180s

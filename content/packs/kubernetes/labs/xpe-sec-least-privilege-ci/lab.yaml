@@ -1,0 +1,169 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xpe-sec-least-privilege-ci
+  title: Cut the CI service account down to what it uses
+  domain: kubernetes
+  frameworks: [ct-platform:security-hardening]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [exam, rbac, serviceaccounts, least-privilege]
+  version: 1
+spec:
+  description: |
+    **Context:** `qm-harbour` (`kubectl config use-context qm-harbour`)
+
+    The ServiceAccount **`ci-deployer`** in namespace **`{{ns}}`** is bound
+    to `cluster-admin` by the ClusterRoleBinding `ci-deployer-admin`. The
+    pipeline only ever updates Deployments and reads Pods in that namespace.
+
+    1. Replace the cluster-wide grant with a Role **`ci-deployer`** and a
+       RoleBinding **`ci-deployer`** in `{{ns}}` that allow exactly: `get`,
+       `list`, `update` and `patch` on Deployments, and `get`, `list` and
+       `watch` on Pods. Remove the ClusterRoleBinding.
+    2. Make sure Pods in `{{ns}}` that use the namespace's `default`
+       ServiceAccount no longer get an API token mounted automatically.
+  objectives:
+    - Replace a cluster-wide grant with a namespaced Role
+    - Turn off token automounting for a ServiceAccount
+  params:
+    ns:
+      type: choice
+      values: [tracking-ci, tracking-pipeline, tracking-release]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-harbour
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-harbour
+          nodes:
+            - {name: harbour-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: harbour-wk-1, role: worker}
+            - {name: harbour-wk-2, role: worker}
+  setup:
+    - on: qm-harbour
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: "{{ns}}"}
+        ---
+        apiVersion: v1
+        kind: ServiceAccount
+        metadata: {name: ci-deployer, namespace: "{{ns}}"}
+        ---
+        apiVersion: rbac.authorization.k8s.io/v1
+        kind: ClusterRoleBinding
+        metadata: {name: ci-deployer-admin}
+        roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: cluster-admin}
+        subjects: [{kind: ServiceAccount, name: ci-deployer, namespace: "{{ns}}"}]
+  teardown:
+    - on: qm-harbour
+      run: |
+        kubectl delete clusterrolebinding ci-deployer-admin --ignore-not-found
+        kubectl delete namespace {{ns}} --ignore-not-found --wait=false
+  checks:
+    - id: needed-rights
+      description: ci-deployer can update/patch/get/list Deployments and get/list/watch Pods in {{ns}}
+      type: shell
+      on: qm-harbour
+      skills: [k8s.security.rbac-least-privilege]
+      weight: 2
+      command: |
+        a=system:serviceaccount:{{ns}}:ci-deployer
+        { for v in get list update patch; do kubectl auth can-i $v deployments.apps -n {{ns}} --as=$a; done
+          for v in get list watch; do kubectl auth can-i $v pods -n {{ns}} --as=$a; done; } | paste -sd' ' -
+      expect: {match: exact, value: "yes yes yes yes yes yes yes"}
+    - id: nothing-more
+      description: ci-deployer cannot delete Deployments, read Secrets, or act outside {{ns}}
+      type: shell
+      on: qm-harbour
+      skills: [k8s.security.rbac-least-privilege]
+      weight: 2
+      command: |
+        a=system:serviceaccount:{{ns}}:ci-deployer
+        echo "$(kubectl auth can-i delete deployments.apps -n {{ns}} --as=$a) $(kubectl auth can-i get secrets -n {{ns}} --as=$a) $(kubectl auth can-i create deployments.apps -n {{ns}} --as=$a) $(kubectl auth can-i list pods -n kube-system --as=$a) $(kubectl get clusterrolebinding ci-deployer-admin --no-headers 2>/dev/null | wc -l)"
+      expect: {match: exact, value: no no no no 0}
+    - id: named-binding
+      description: RoleBinding ci-deployer binds Role ci-deployer to the ServiceAccount
+      type: k8s-query
+      skills: [k8s.security.rbac-least-privilege]
+      weight: 0.5
+      query: {cluster: qm-harbour, resource: rolebinding, name: ci-deployer, namespace: "{{ns}}", jsonpath: '{.roleRef.kind}/{.roleRef.name} {.subjects[0].kind}/{.subjects[0].name}'}
+      expect: {match: exact, value: Role/ci-deployer ServiceAccount/ci-deployer}
+    - id: no-automount
+      description: The default ServiceAccount of {{ns}} no longer automounts its token
+      type: k8s-query
+      skills: [k8s.security.sa-token-hygiene]
+      weight: 2
+      query: {cluster: qm-harbour, resource: serviceaccount, name: default, namespace: "{{ns}}", jsonpath: '{.automountServiceAccountToken}'}
+      expect: {match: exact, value: "false"}
+  misconceptions:
+    - id: edit-clusterrole
+      description: Binds the built-in edit ClusterRole in the namespace instead of a precise Role.
+      feedback: edit includes deleting workloads and reading Secrets. Write a Role with exactly the verbs the pipeline uses.
+      expectFail: [nothing-more, named-binding]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-harbour
+          kubectl delete clusterrolebinding ci-deployer-admin
+          kubectl -n {{ns}} create rolebinding ci-deployer --clusterrole=edit --serviceaccount={{ns}}:ci-deployer
+          kubectl -n {{ns}} patch serviceaccount default -p '{"automountServiceAccountToken":false}'
+    - id: crb-kept
+      description: Adds the Role but leaves the ClusterRoleBinding in place.
+      feedback: The cluster-admin binding still grants everything; remove it.
+      expectFail: [nothing-more]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-harbour
+          kubectl -n {{ns}} create role ci-deployer --verb=get,list,update,patch --resource=deployments.apps
+          kubectl -n {{ns}} patch role ci-deployer --type=json -p '[{"op":"add","path":"/rules/-","value":{"apiGroups":[""],"resources":["pods"],"verbs":["get","list","watch"]}}]'
+          kubectl -n {{ns}} create rolebinding ci-deployer --role=ci-deployer --serviceaccount={{ns}}:ci-deployer
+          kubectl -n {{ns}} patch serviceaccount default -p '{"automountServiceAccountToken":false}'
+    - id: automount-on-ci-only
+      description: Disables automounting on ci-deployer instead of the default ServiceAccount.
+      feedback: The task is about Pods using the namespace's default ServiceAccount.
+      expectFail: [no-automount]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-harbour
+          kubectl delete clusterrolebinding ci-deployer-admin
+          kubectl -n {{ns}} create role ci-deployer --verb=get,list,update,patch --resource=deployments.apps
+          kubectl -n {{ns}} patch role ci-deployer --type=json -p '[{"op":"add","path":"/rules/-","value":{"apiGroups":[""],"resources":["pods"],"verbs":["get","list","watch"]}}]'
+          kubectl -n {{ns}} create rolebinding ci-deployer --role=ci-deployer --serviceaccount={{ns}}:ci-deployer
+          kubectl -n {{ns}} patch serviceaccount ci-deployer -p '{"automountServiceAccountToken":false}'
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-harbour
+          kubectl apply -f - <<'YAML'
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: Role
+          metadata: {name: ci-deployer, namespace: {{ns}}}
+          rules:
+            - {apiGroups: [apps], resources: [deployments], verbs: [get, list, update, patch]}
+            - {apiGroups: [""], resources: [pods], verbs: [get, list, watch]}
+          ---
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: RoleBinding
+          metadata: {name: ci-deployer, namespace: {{ns}}}
+          roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: ci-deployer}
+          subjects: [{kind: ServiceAccount, name: ci-deployer, namespace: {{ns}}}]
+          YAML
+          kubectl delete clusterrolebinding ci-deployer-admin
+          kubectl -n {{ns}} patch serviceaccount default -p '{"automountServiceAccountToken":false}'
