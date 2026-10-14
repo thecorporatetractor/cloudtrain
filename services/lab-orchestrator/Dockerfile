@@ -3,8 +3,8 @@
 #   docker build -f services/lab-orchestrator/Dockerfile -t cloudtrain/lab-orchestrator:dev .
 # Versions are pinned here by digest / sha256; VCLUSTER_VERSION matches deploy/versions.env.
 FROM golang:1.26.9-bookworm@sha256:d9c68c2c51161e12fd77e4c6320687c9cd86e1af1e3ad6e6cd63ff970641453c AS build
-ARG HELM_VERSION=v3.19.0
-ARG HELM_SHA256=a7f81ce08007091b86d8bd696eb4d86b8d0f2e1b9f6c714be62f82f96a594496
+ARG HELM_VERSION=v3.22.0
+ARG HELM_SHA256=1e4ab49e429626cf6c6958d914248b78c9730803c2751b87627e171dc800e7bb
 ARG VCLUSTER_VERSION=0.37.2
 ARG VCLUSTER_CHART_SHA256=0e3e1df3802a1199653930cfadcf52ba309ea7d5282a1a8541452bea8a9cf707
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]

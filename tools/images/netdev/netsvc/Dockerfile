@@ -3,6 +3,8 @@
 # (chrony), syslog (rsyslog), SNMP (net-snmp), SSH, nftables/iptables, WireGuard,
 # strongSwan, Linux bridge/bond/VLAN tooling, tc, python3 with Jinja2/PyYAML.
 # No daemon starts by itself: labs start what they need from setup actions.
+# No SSH host keys are baked in (a published image would share them): a lab that
+# starts sshd runs `ssh-keygen -A` first, like the other lab images.
 # Built by tools/images/netdev/build.sh; base pinned by digest, packages to exact versions.
 FROM alpine:3.22@sha256:5291449c3df73caf6ed85e649dec1b9e818b39a5d8c871e97afc13e9cd5e8fa8
 RUN apk add --no-cache \
@@ -17,6 +19,5 @@ RUN apk add --no-cache \
       curl=8.14.1-r3 socat=1.8.1.3-r0 nmap=7.97-r0 nmap-ncat=7.97-r0 busybox-extras=1.37.0-r20 \
       python3=3.12.15-r0 py3-jinja2=3.1.6-r0 py3-yaml=6.0.2-r0 jq=1.8.2-r0 vim=9.1.1566-r0 nano=8.4-r0 \
  && adduser -D -u 1000 -s /bin/bash learner \
- && ssh-keygen -A >/dev/null \
  && printf 'cloudtrain/netsvc:1\n' > /etc/cloudtrain-release
 CMD ["sleep", "infinity"]

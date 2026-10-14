@@ -1,0 +1,217 @@
+# Container images that CI can build (not the KubeVirt golden VM images, which
+# need KVM, nor tools/images/linux-pod, which needs the package mirror as a
+# build context). Every run: build, Trivy + Grype (SARIF; fail on a CRITICAL
+# vulnerability that has a fix), SBOMs as artifacts. Push to main and v* tags
+# only: push to GHCR, cosign keyless signature, SLSA build provenance and SBOM
+# attestations (stored in the registry and in GitHub's attestation store).
+name: images
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    paths:
+      - services/lab-orchestrator/**
+      - tools/images/jumphost/**
+      - tools/images/netdev/**
+      - tools/images/linux-pod-interim/**
+      - deploy/versions.env
+      - deploy/vcluster/values.yaml
+      - .github/workflows/images.yml
+      - .github/scripts/install-tools.sh
+  schedule:
+    - cron: '23 1 * * *' # rescan for newly published vulnerabilities
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build-scan:
+    name: build + scan (${{ matrix.name }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix: &images
+        include:
+          - name: lab-orchestrator
+            context: .
+            file: services/lab-orchestrator/Dockerfile
+            args: ''
+          - name: jumphost
+            context: tools/images/jumphost
+            file: tools/images/jumphost/Dockerfile
+            # build arg (=versions.env variable when the names differ), see tools/images/build-jumphost.sh
+            args: >-
+              UBUNTU_APT_SNAPSHOT KUBECTL_VERSION=LAB_K8S_VERSION HELM_VERSION HELM_TARBALL_SHA256
+              ETCD_VERSION ETCD_TARBALL_SHA256 YQ_VERSION YQ_BINARY_SHA256
+          - name: frr
+            context: tools/images/netdev/frr
+            file: tools/images/netdev/frr/Dockerfile
+            args: ''
+          - name: nettools
+            context: tools/images/netdev/nettools
+            file: tools/images/netdev/nettools/Dockerfile
+            args: ''
+          - name: netsvc
+            context: tools/images/netdev/netsvc
+            file: tools/images/netdev/netsvc/Dockerfile
+            args: ''
+          - name: linux-pod-deb
+            context: tools/images/linux-pod-interim/deb
+            file: tools/images/linux-pod-interim/deb/Dockerfile
+            args: ''
+          - name: linux-pod-el
+            context: tools/images/linux-pod-interim/el
+            file: tools/images/linux-pod-interim/el/Dockerfile
+            args: ''
+    env:
+      IMAGE: ci.local/${{ matrix.name }}:scan
+    steps:
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build args from deploy/versions.env
+        id: args
+        env:
+          ARGS: ${{ matrix.args }}
+        run: bash .github/scripts/build-args.sh "$ARGS" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.file }}
+          build-args: ${{ steps.args.outputs.list }}
+          tags: ${{ env.IMAGE }}
+          load: true
+          push: false
+          provenance: false
+      - run: bash .github/scripts/install-tools.sh trivy grype syft
+      - name: Trivy (SARIF, all severities)
+        run: trivy image --scanners vuln,secret --format sarif --output trivy.sarif "$IMAGE"
+      - name: Grype (SARIF)
+        run: grype --output sarif --file grype.sarif "$IMAGE"
+      - name: SBOMs (SPDX + CycloneDX)
+        env:
+          NAME: ${{ matrix.name }}
+        run: |
+          syft scan "docker:$IMAGE" --source-name "$NAME" \
+            -o "spdx-json=sbom-$NAME.spdx.json" -o "cyclonedx-json=sbom-$NAME.cdx.json"
+      - uses: github/codeql-action/upload-sarif@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+        if: always() && hashFiles('trivy.sarif') != ''
+        with:
+          sarif_file: trivy.sarif
+          category: trivy-image-${{ matrix.name }}
+      - uses: github/codeql-action/upload-sarif@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+        if: always() && hashFiles('grype.sarif') != ''
+        with:
+          sarif_file: grype.sarif
+          category: grype-image-${{ matrix.name }}
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sbom-image-${{ matrix.name }}
+          path: sbom-${{ matrix.name }}.*.json
+          retention-days: 30
+      - name: Gate - no fixable CRITICAL vulnerability (Trivy)
+        run: trivy image --scanners vuln --severity CRITICAL --ignore-unfixed --exit-code 1 "$IMAGE"
+      - name: Gate - no fixable CRITICAL vulnerability (Grype)
+        if: always()
+        run: grype --only-fixed --fail-on critical "$IMAGE"
+
+  publish:
+    name: publish (${{ matrix.name }})
+    needs: build-scan
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write # push to GHCR
+      id-token: write # cosign keyless + attestations (Sigstore OIDC)
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix: *images
+    steps:
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Image name and build args
+        id: args
+        env:
+          ARGS: ${{ matrix.args }}
+          REPO: ${{ github.repository }}
+          NAME: ${{ matrix.name }}
+        run: |
+          echo "image=ghcr.io/${REPO,,}/$NAME" >> "$GITHUB_OUTPUT"
+          bash .github/scripts/build-args.sh "$ARGS" >> "$GITHUB_OUTPUT"
+      - uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        id: meta
+        with:
+          images: ${{ steps.args.outputs.image }}
+          tags: |
+            type=ref,event=branch
+            type=sha,format=long
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Build and push
+        id: push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.file }}
+          build-args: ${{ steps.args.outputs.list }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          push: true
+          provenance: false # SLSA provenance comes from attest-build-provenance below
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: cosign sign (keyless, by digest)
+        env:
+          REF: ${{ steps.args.outputs.image }}@${{ steps.push.outputs.digest }}
+        run: cosign sign --yes "$REF"
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ steps.args.outputs.image }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+      - run: bash .github/scripts/install-tools.sh syft
+      - name: SBOM of the pushed image
+        env:
+          REF: ${{ steps.args.outputs.image }}@${{ steps.push.outputs.digest }}
+          NAME: ${{ matrix.name }}
+        run: |
+          syft scan "registry:$REF" --source-name "$NAME" \
+            -o "spdx-json=sbom-$NAME.spdx.json" -o "cyclonedx-json=sbom-$NAME.cdx.json"
+      - uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-name: ${{ steps.args.outputs.image }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          sbom-path: sbom-${{ matrix.name }}.spdx.json
+          push-to-registry: true
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sbom-published-${{ matrix.name }}
+          path: sbom-${{ matrix.name }}.*.json
+          retention-days: 90
