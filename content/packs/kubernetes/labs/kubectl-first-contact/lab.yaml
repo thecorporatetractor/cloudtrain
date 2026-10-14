@@ -1,0 +1,275 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: kubectl-first-contact
+  title: Find your way around a cluster with kubectl
+  domain: kubernetes
+  frameworks: [cka:troubleshooting]
+  difficulty: easy
+  estimatedMinutes: 10
+  tags: [kubectl, contexts, namespaces, pods]
+  version: 1
+spec:
+  description: |
+    It is your first shift on Quillmoor Logistics' depot platform. Your
+    workstation can reach several clusters; the depot workloads live in the one
+    behind context `qm-depot`.
+
+    1. Make `qm-depot` your current context.
+    2. Set **`parcel-tracking`** as the default namespace of that context, so
+       that plain `kubectl get pods` shows the parcel-tracking Pods without `-n`.
+    3. Start a Pod named **`{{probe}}`** in `parcel-tracking` from image
+       `busybox:1.37` that runs `sleep 3600`. One `kubectl` command is enough;
+       no manifest file is needed.
+    4. Write the names of every Pod in `parcel-tracking` whose phase is
+       **Running** (your new Pod included) to
+       `/home/learner/reports/running-pods.txt`: one bare Pod name per line,
+       no `pod/` prefix, no header, any order. Pods that are not Running do not
+       belong in the report.
+
+    Do not change or delete the existing workloads.
+  objectives:
+    - List and switch kubeconfig contexts
+    - Set a default namespace on a context
+    - Start a Pod imperatively with kubectl run
+    - Filter Pods by phase and print bare names
+  params:
+    probe:
+      type: choice
+      values: [shift-probe, first-shift, depot-probe]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-depot
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: qm-depot
+  setup:
+    - on: qm-depot
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: parcel-tracking}
+        ---
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: dock-scheduling}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: parcel-api, namespace: parcel-tracking}
+        spec:
+          replicas: 2
+          selector: {matchLabels: {app: parcel-api}}
+          template:
+            metadata: {labels: {app: parcel-api}}
+            spec:
+              containers:
+                - {name: api, image: "httpd:2.4-alpine"}
+        ---
+        apiVersion: v1
+        kind: Pod
+        metadata: {name: scan-relay, namespace: parcel-tracking, labels: {app: scan-relay}}
+        spec:
+          containers:
+            - {name: relay, image: "busybox:1.37", command: ["sleep", "1d"]}
+        ---
+        apiVersion: v1
+        kind: Pod
+        metadata: {name: nightly-import, namespace: parcel-tracking, labels: {app: nightly-import}}
+        spec:
+          restartPolicy: Never
+          containers:
+            - {name: import, image: "busybox:1.37", command: ["sh", "-c", "echo 'import source unreachable'; exit 1"]}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: berth-planner, namespace: dock-scheduling}
+        spec:
+          replicas: 2
+          selector: {matchLabels: {app: berth-planner}}
+          template:
+            metadata: {labels: {app: berth-planner}}
+            spec:
+              containers:
+                - {name: planner, image: "caddy:2-alpine"}
+    - on: qm-depot
+      timeoutSec: 150
+      run: |
+        kubectl -n parcel-tracking rollout status deploy/parcel-api --timeout=120s
+        kubectl -n dock-scheduling rollout status deploy/berth-planner --timeout=120s
+        kubectl -n parcel-tracking wait pod/scan-relay --for=condition=Ready --timeout=120s
+        kubectl -n parcel-tracking wait pod/nightly-import --for=jsonpath='{.status.phase}'=Failed --timeout=120s
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/reports
+  teardown:
+    - on: qm-depot
+      run: kubectl delete namespace parcel-tracking dock-scheduling --ignore-not-found --wait=false
+  checks:
+    - id: context
+      description: Terminal is using context qm-depot
+      type: k8s-context
+      on: workstation
+      skills: [k8s.cli.contexts]
+      expect: {match: exact, value: qm-depot}
+    - id: default-namespace
+      description: The qm-depot context defaults to namespace parcel-tracking
+      type: shell
+      on: workstation
+      skills: [k8s.cli.contexts]
+      command: |
+        kubectl --kubeconfig /home/learner/.kube/config config view \
+          -o jsonpath='{.contexts[?(@.name=="qm-depot")].context.namespace}'
+      expect: {match: exact, value: parcel-tracking}
+    - id: probe-pod
+      description: Pod {{probe}} runs busybox:1.37 with sleep 3600 in parcel-tracking
+      type: k8s-query
+      skills: [k8s.cli.imperative, k8s.workloads.pods]
+      query:
+        cluster: qm-depot
+        resource: pod
+        name: "{{probe}}"
+        namespace: parcel-tracking
+        jsonpath: '{.status.phase} {.spec.containers[0].image} {.spec.containers[0].command}{.spec.containers[0].args}'
+      expect: {match: regex, value: '^Running busybox:1\.37 .*sleep.*3600'}
+    - id: report-matches
+      description: The report lists exactly the Running Pods of parcel-tracking, one bare name per line
+      type: shell
+      on: workstation
+      skills: [k8s.workloads.pods, k8s.cli.output-formatting]
+      weight: 2
+      command: |
+        f=/home/learner/reports/running-pods.txt
+        [ -f "$f" ] || { echo "no report"; exit 0; }
+        exp=$(kubectl --kubeconfig /home/learner/.kube/config --context qm-depot -n parcel-tracking get pods \
+          --field-selector=status.phase=Running -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | sort)
+        got=$(tr -d '\r' < "$f" | sed 's/[[:space:]]*$//; /^$/d' | sort)
+        if [ -n "$exp" ] && [ "$exp" = "$got" ]; then echo ok; else printf 'mismatch\nexpected:\n%s\ngot:\n%s\n' "$exp" "$got"; fi
+      expect: {match: exact, value: ok}
+    - id: workloads-intact
+      description: The existing workloads are unchanged (parcel-api 2/2, scan-relay and nightly-import still present)
+      type: shell
+      on: qm-depot
+      skills: [k8s.cli.scoped-changes]
+      weight: 0.5
+      command: |
+        echo "$(kubectl -n parcel-tracking get deploy parcel-api -o jsonpath='{.spec.replicas}/{.status.readyReplicas}') \
+        $(kubectl -n parcel-tracking get pod scan-relay nightly-import --no-headers 2>/dev/null | wc -l) \
+        $(kubectl -n dock-scheduling get deploy berth-planner -o jsonpath='{.spec.replicas}')"
+      expect: {match: exact, value: "2/2 2 2"}
+  hints:
+    - title: Which contexts exist?
+      body: Your kubeconfig holds one context per cluster; none is selected yet.
+      command: kubectl config get-contexts
+      cost: 0
+    - title: Contexts carry a namespace
+      body: |
+        `kubectl config set-context` can change a field of an existing context.
+        `--current` targets the context you are using.
+      command: kubectl config set-context --current --namespace=parcel-tracking
+      cost: 1
+    - title: kubectl run
+      body: Everything after `--` becomes the container command.
+      command: kubectl run {{probe}} --image=busybox:1.37 --restart=Never -- sleep 3600
+      cost: 2
+    - title: Only Running Pods, only names
+      body: |
+        A field selector filters on `status.phase`; `-o name` adds a `pod/`
+        prefix, while a jsonpath or custom-columns output prints bare names.
+      command: |
+        kubectl get pods --field-selector=status.phase=Running \
+          -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' > /home/learner/reports/running-pods.txt
+      cost: 2
+  misconceptions:
+    - id: namespace-flag-only
+      description: Uses `-n parcel-tracking` on every command but never sets the namespace on the context.
+      feedback: "`-n` works for one command. The task asks for the context's default namespace: `kubectl config set-context --current --namespace=...`."
+      expectFail: [default-namespace]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 90
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n parcel-tracking run {{probe}} --image=busybox:1.37 --restart=Never -- sleep 3600
+          kubectl -n parcel-tracking wait pod/{{probe}} --for=condition=Ready --timeout=60s
+          kubectl -n parcel-tracking get pods --field-selector=status.phase=Running \
+            -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' > /home/learner/reports/running-pods.txt
+    - id: all-pods-listed
+      description: Writes every Pod in the namespace, including the failed import Pod.
+      feedback: "`kubectl get pods` lists Pods in every phase. Filter on `status.phase=Running` (or read the STATUS column) before writing the report."
+      expectFail: [report-matches]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 90
+        run: |
+          kubectl config use-context qm-depot
+          kubectl config set-context --current --namespace=parcel-tracking
+          kubectl run {{probe}} --image=busybox:1.37 --restart=Never -- sleep 3600
+          kubectl wait pod/{{probe}} --for=condition=Ready --timeout=60s
+          kubectl get pods -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' > /home/learner/reports/running-pods.txt
+    - id: name-prefix
+      description: Uses `-o name`, so every line reads `pod/<name>`.
+      feedback: "`-o name` prints `<kind>/<name>`. The report wants bare names: use jsonpath, custom-columns, or strip the prefix."
+      expectFail: [report-matches]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 90
+        run: |
+          kubectl config use-context qm-depot
+          kubectl config set-context --current --namespace=parcel-tracking
+          kubectl run {{probe}} --image=busybox:1.37 --restart=Never -- sleep 3600
+          kubectl wait pod/{{probe}} --for=condition=Ready --timeout=60s
+          kubectl get pods --field-selector=status.phase=Running -o name > /home/learner/reports/running-pods.txt
+    - id: probe-in-default
+      description: Starts the probe Pod before switching the namespace, so it lands in `default`.
+      feedback: Without `-n` and without a namespace on the context, kubectl uses `default`. Set the context namespace first, or pass `-n`.
+      expectFail: [probe-pod]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 90
+        run: |
+          kubectl config use-context qm-depot
+          kubectl run {{probe}} --image=busybox:1.37 --restart=Never -- sleep 3600
+          kubectl config set-context --current --namespace=parcel-tracking
+          kubectl get pods --field-selector=status.phase=Running \
+            -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' > /home/learner/reports/running-pods.txt
+  solution:
+    explanation: |
+      `use-context` selects the cluster, `set-context --current --namespace`
+      stores a default namespace in that context, `kubectl run` creates a single
+      Pod imperatively, and a phase field selector with a jsonpath template
+      prints only the names of Running Pods.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 90
+        run: |
+          kubectl config use-context qm-depot
+          kubectl config set-context --current --namespace=parcel-tracking
+          kubectl run {{probe}} --image=busybox:1.37 --restart=Never -- sleep 3600
+          kubectl wait pod/{{probe}} --for=condition=Ready --timeout=60s
+          kubectl get pods --field-selector=status.phase=Running \
+            -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' > /home/learner/reports/running-pods.txt
+    alternatives:
+      - id: read-status-column
+        description: Name the context explicitly with set-context, use kubectl run with a shell command, and filter the STATUS column with awk.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 90
+            run: |
+              kubectl config use-context qm-depot
+              kubectl config set-context qm-depot --namespace=parcel-tracking
+              kubectl run {{probe}} --image=busybox:1.37 --command -- sh -c 'sleep 3600'
+              kubectl wait pod/{{probe}} --for=condition=Ready --timeout=60s
+              kubectl get pods --no-headers | awk '$3 == "Running" {print $1}' > /home/learner/reports/running-pods.txt

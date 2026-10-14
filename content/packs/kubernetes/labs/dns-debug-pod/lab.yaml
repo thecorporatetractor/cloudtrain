@@ -1,0 +1,231 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: dns-debug-pod
+  title: Resolve Services and Pods through cluster DNS
+  domain: kubernetes
+  frameworks: [cka:services-networking, ckad:services-networking]
+  difficulty: easy
+  estimatedMinutes: 8
+  tags: [dns, services, pods, debugging]
+  version: 1
+spec:
+  description: |
+    The depot's handheld scanners will call the parcel API by DNS name. Before
+    the firmware is configured, the network team wants the exact names and the
+    addresses they resolve to, as seen from inside the cluster.
+
+    Use context `qm-depot`:
+
+    ```bash
+    kubectl config use-context qm-depot
+    ```
+
+    1. Start a debug Pod named **`dns-debug`** in namespace `parcel-tracking`
+       from image `busybox:1.37` that stays running (for example
+       `sleep 3600`), and use `nslookup` inside it.
+    2. Write `/home/learner/reports/dns.txt` with two lines, each
+       `<fully qualified name> <IP address>`:
+       - line 1: the Service **`{{svc}}`** in `parcel-tracking`;
+       - line 2: the Pod **`scan-relay`** in `parcel-tracking`, using its
+         IP-based Pod DNS name.
+
+    Fully qualified means the complete name down to the cluster domain
+    (`cluster.local`), as the cluster's DNS server answers it.
+  objectives:
+    - Run a throwaway debug Pod and exec into it
+    - Resolve Service names and their search-path variants
+    - Build and resolve the DNS record of a Pod
+  params:
+    svc:
+      type: choice
+      values: [parcel-api, parcel-lookup, parcel-status]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-depot
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: qm-depot
+  setup:
+    - on: qm-depot
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: parcel-tracking}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: "{{svc}}", namespace: parcel-tracking}
+        spec:
+          replicas: 2
+          selector: {matchLabels: {app: "{{svc}}"}}
+          template:
+            metadata: {labels: {app: "{{svc}}"}}
+            spec:
+              containers:
+                - {name: api, image: "httpd:2.4-alpine"}
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata: {name: "{{svc}}", namespace: parcel-tracking}
+        spec:
+          selector: {app: "{{svc}}"}
+          ports:
+            - {name: http, port: 80, targetPort: 80}
+        ---
+        apiVersion: v1
+        kind: Pod
+        metadata: {name: scan-relay, namespace: parcel-tracking, labels: {app: scan-relay}}
+        spec:
+          containers:
+            - {name: relay, image: "busybox:1.37", command: ["sleep", "1d"]}
+    - on: qm-depot
+      timeoutSec: 150
+      run: |
+        kubectl -n parcel-tracking rollout status deploy/{{svc}} --timeout=120s
+        kubectl -n parcel-tracking wait pod/scan-relay --for=condition=Ready --timeout=120s
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/reports
+  teardown:
+    - on: qm-depot
+      run: kubectl delete namespace parcel-tracking --ignore-not-found --wait=false
+  checks:
+    - id: context
+      description: Terminal is using context qm-depot
+      type: k8s-context
+      on: workstation
+      skills: [k8s.cli.contexts]
+      weight: 0.5
+      expect: {match: exact, value: qm-depot}
+    - id: debug-pod
+      description: Pod dns-debug runs busybox:1.37 in parcel-tracking
+      type: k8s-query
+      skills: [k8s.networking.dns]
+      weight: 0.5
+      query: {cluster: qm-depot, resource: pod, name: dns-debug, namespace: parcel-tracking, jsonpath: '{.status.phase} {.spec.containers[0].image}'}
+      expect: {match: exact, value: Running busybox:1.37}
+    - id: service-record
+      description: Line 1 is the Service's fully qualified name and its ClusterIP
+      type: shell
+      on: workstation
+      skills: [k8s.networking.dns, k8s.networking.services]
+      weight: 2
+      command: |
+        ip=$(kubectl --kubeconfig /home/learner/.kube/config --context qm-depot -n parcel-tracking get svc {{svc}} -o jsonpath='{.spec.clusterIP}')
+        got=$(sed -n 1p /home/learner/reports/dns.txt 2>/dev/null | tr -d '\r' | awk '{sub(/\.$/, "", $1); print $1, $2}')
+        [ -n "$ip" ] && [ "$got" = "{{svc}}.parcel-tracking.svc.cluster.local $ip" ] && echo ok || echo "line 1: $got"
+      expect: {match: exact, value: ok}
+    - id: pod-record
+      description: Line 2 is the IP-based DNS name of Pod scan-relay and its Pod IP
+      type: shell
+      on: workstation
+      skills: [k8s.networking.dns]
+      weight: 2
+      command: |
+        ip=$(kubectl --kubeconfig /home/learner/.kube/config --context qm-depot -n parcel-tracking get pod scan-relay -o jsonpath='{.status.podIP}')
+        got=$(sed -n 2p /home/learner/reports/dns.txt 2>/dev/null | tr -d '\r' | awk '{sub(/\.$/, "", $1); print $1, $2}')
+        [ -n "$ip" ] && [ "$got" = "$(echo "$ip" | tr . -).parcel-tracking.pod.cluster.local $ip" ] && echo ok || echo "line 2: $got"
+      expect: {match: exact, value: ok}
+    - id: names-resolve
+      description: Both names in the report resolve from inside the cluster to the addresses written next to them
+      type: shell
+      on: qm-depot
+      skills: [k8s.networking.dns]
+      timeoutSec: 30
+      command: |
+        svcip=$(kubectl -n parcel-tracking get svc {{svc}} -o jsonpath='{.spec.clusterIP}')
+        podip=$(kubectl -n parcel-tracking get pod scan-relay -o jsonpath='{.status.podIP}')
+        a=$(kubectl -n parcel-tracking exec scan-relay -- nslookup {{svc}}.parcel-tracking.svc.cluster.local 2>/dev/null | awk '/^Address/ && !/#53/ {print $2}' | tail -1)
+        b=$(kubectl -n parcel-tracking exec scan-relay -- nslookup "$(echo "$podip" | tr . -).parcel-tracking.pod.cluster.local" 2>/dev/null | awk '/^Address/ && !/#53/ {print $2}' | tail -1)
+        [ "$a" = "$svcip" ] && [ "$b" = "$podip" ] && echo ok || echo "dns: $a/$svcip $b/$podip"
+      expect: {match: exact, value: ok}
+  hints:
+    - title: Switch context
+      body: The parcel services run in qm-depot.
+      command: kubectl config use-context qm-depot
+      cost: 0
+    - title: A Pod to ask from
+      body: Start the debug Pod, then run nslookup in it with kubectl exec.
+      command: |
+        kubectl -n parcel-tracking run dns-debug --image=busybox:1.37 -- sleep 3600
+        kubectl -n parcel-tracking exec dns-debug -- nslookup {{svc}}
+      cost: 1
+    - title: Read the search path
+      body: "`/etc/resolv.conf` in the Pod lists the search domains that turn a short name into the full one."
+      command: kubectl -n parcel-tracking exec dns-debug -- cat /etc/resolv.conf
+      cost: 1
+    - title: Pod records
+      body: A Pod's A record is its IP with dots replaced by dashes, followed by `<namespace>.pod.<cluster domain>`.
+      command: kubectl -n parcel-tracking get pod scan-relay -o wide
+      cost: 2
+  misconceptions:
+    - id: short-names
+      description: Writes the short names that worked in nslookup instead of the fully qualified ones.
+      feedback: nslookup completes short names through the search path in /etc/resolv.conf; the answer shows the full name it actually resolved.
+      expectFail: [service-record]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 90
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n parcel-tracking run dns-debug --image=busybox:1.37 -- sleep 3600
+          kubectl -n parcel-tracking wait pod/dns-debug --for=condition=Ready --timeout=60s
+          sip=$(kubectl -n parcel-tracking get svc {{svc}} -o jsonpath='{.spec.clusterIP}')
+          pip=$(kubectl -n parcel-tracking get pod scan-relay -o jsonpath='{.status.podIP}')
+          printf '%s %s\n%s %s\n' "{{svc}}" "$sip" "$(echo $pip | tr . -).parcel-tracking.pod.cluster.local" "$pip" > ~/reports/dns.txt
+    - id: pod-name-record
+      description: Builds the Pod record from the Pod name instead of its IP.
+      feedback: Plain Pods get an A record named after their IP (dashes for dots), not after the Pod name; hostname-based records need a headless Service and spec.subdomain.
+      expectFail: [pod-record]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 90
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n parcel-tracking run dns-debug --image=busybox:1.37 -- sleep 3600
+          kubectl -n parcel-tracking wait pod/dns-debug --for=condition=Ready --timeout=60s
+          sip=$(kubectl -n parcel-tracking get svc {{svc}} -o jsonpath='{.spec.clusterIP}')
+          pip=$(kubectl -n parcel-tracking get pod scan-relay -o jsonpath='{.status.podIP}')
+          printf '%s %s\n%s %s\n' "{{svc}}.parcel-tracking.svc.cluster.local" "$sip" "scan-relay.parcel-tracking.pod.cluster.local" "$pip" > ~/reports/dns.txt
+    - id: endpoint-ip
+      description: Writes the IP of one backend Pod for the Service instead of the ClusterIP.
+      feedback: A normal (non-headless) Service name resolves to its stable ClusterIP; the Pod IPs behind it change.
+      expectFail: [service-record]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 90
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n parcel-tracking run dns-debug --image=busybox:1.37 -- sleep 3600
+          kubectl -n parcel-tracking wait pod/dns-debug --for=condition=Ready --timeout=60s
+          eip=$(kubectl -n parcel-tracking get pod -l app={{svc}} -o jsonpath='{.items[0].status.podIP}')
+          pip=$(kubectl -n parcel-tracking get pod scan-relay -o jsonpath='{.status.podIP}')
+          printf '%s %s\n%s %s\n' "{{svc}}.parcel-tracking.svc.cluster.local" "$eip" "$(echo $pip | tr . -).parcel-tracking.pod.cluster.local" "$pip" > ~/reports/dns.txt
+  solution:
+    explanation: |
+      Inside a Pod, `nslookup <svc>` expands the short name through the search
+      path and answers with `<svc>.<namespace>.svc.cluster.local` and the
+      ClusterIP. Pods get records of the form
+      `<ip-with-dashes>.<namespace>.pod.cluster.local`.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n parcel-tracking run dns-debug --image=busybox:1.37 -- sleep 3600
+          kubectl -n parcel-tracking wait pod/dns-debug --for=condition=Ready --timeout=60s
+          svc=$(kubectl -n parcel-tracking exec dns-debug -- nslookup {{svc}} | awk '/^Name:/ {n=$2} /^Address/ && !/#53/ {a=$2} END {print n, a}')
+          pip=$(kubectl -n parcel-tracking get pod scan-relay -o jsonpath='{.status.podIP}')
+          pod=$(kubectl -n parcel-tracking exec dns-debug -- nslookup "$(echo $pip | tr . -).parcel-tracking.pod" | awk '/^Name:/ {n=$2} /^Address/ && !/#53/ {a=$2} END {print n, a}')
+          printf '%s\n%s\n' "$svc" "$pod" > ~/reports/dns.txt

@@ -1,0 +1,279 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: tariff-api-no-endpoints
+  title: Why does the tariff API return nothing?
+  domain: kubernetes
+  frameworks: [cka:troubleshooting, cka:services-networking, ckad:services-networking]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [troubleshooting, services, endpointslices, dns]
+  version: 1
+spec:
+  description: |
+    Customs brokers report that the broker portal shows "tariff lookup
+    FAILED" for every declaration. The tariff API Pods themselves are healthy.
+
+    Use context `qm-customs`:
+
+    ```bash
+    kubectl config use-context qm-customs
+    ```
+
+    - The tariff API runs as Deployment `tariff-api` behind Service
+      `tariff-api` in namespace `tariffs`.
+    - The portal runs as Deployment `broker-portal` in namespace `brokers` and
+      calls the URL in its `TARIFF_URL` environment variable every few
+      seconds; its log says whether the lookup worked.
+
+    Find every fault between the portal and the API and fix it, so the portal's
+    lookups succeed again through the `tariff-api` Service's DNS name. Fix the
+    faulty objects themselves: do not add Services, do not relabel the tariff
+    API Pods and do not point the portal at an IP address.
+  objectives:
+    - Trace Service-to-Pod wiring through selectors and EndpointSlices
+    - Resolve a Service across namespaces by DNS
+    - Fix a client's Service reference
+  params:
+    portal:
+      type: choice
+      values: ["tariffs-api", "tariff-svc", "tarif-api"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-customs
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: qm-customs
+  setup:
+    - on: qm-customs
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: tariffs}
+        ---
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: brokers}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: tariff-api, namespace: tariffs}
+        spec:
+          replicas: 2
+          selector: {matchLabels: {app: tariff-api}}
+          template:
+            metadata: {labels: {app: tariff-api, tier: backend}}
+            spec:
+              containers:
+                - name: api
+                  image: httpd:2.4-alpine
+                  ports: [{name: http, containerPort: 80}]
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata: {name: tariff-api, namespace: tariffs}
+        spec:
+          selector: {app: tarrif-api}
+          ports:
+            - {name: http, port: 80, targetPort: http}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: broker-portal, namespace: brokers}
+        spec:
+          replicas: 1
+          selector: {matchLabels: {app: broker-portal}}
+          template:
+            metadata: {labels: {app: broker-portal}}
+            spec:
+              containers:
+                - name: portal
+                  image: busybox:1.37
+                  env:
+                    - {name: TARIFF_URL, value: "http://{{portal}}.tariffs.svc.cluster.local/"}
+                  command:
+                    - sh
+                    - -c
+                    - |
+                      while true; do
+                        if wget -q -T 3 -O /dev/null "$TARIFF_URL"; then echo "tariff lookup OK"; else echo "tariff lookup FAILED ($TARIFF_URL)"; fi
+                        sleep 5
+                      done
+    - on: qm-customs
+      timeoutSec: 150
+      run: |
+        kubectl -n tariffs rollout status deploy/tariff-api --timeout=120s
+        kubectl -n brokers rollout status deploy/broker-portal --timeout=120s
+  teardown:
+    - on: qm-customs
+      run: kubectl delete namespace tariffs brokers --ignore-not-found --wait=false
+  checks:
+    - id: context
+      description: Terminal is using context qm-customs
+      type: k8s-context
+      on: workstation
+      skills: [k8s.cli.contexts]
+      weight: 0.5
+      expect: {match: exact, value: qm-customs}
+    - id: service-endpoints
+      description: Service tariff-api has exactly the 2 tariff-api Pods as ready endpoints on port 80
+      type: shell
+      on: qm-customs
+      skills: [k8s.networking.endpoints, k8s.troubleshooting.networking]
+      weight: 2
+      command: |
+        kubectl -n tariffs get endpointslices -l kubernetes.io/service-name=tariff-api -o json \
+          | jq -r '[.items[] | .ports[0].port as $p | .endpoints[]? | select(.conditions.ready) | "\(.targetRef.name | sub("-[a-z0-9]+-[a-z0-9]+$"; ""))@\($p)"] | sort | join(",")'
+      expect: {match: exact, value: "tariff-api@80,tariff-api@80"}
+    - id: portal-url
+      description: The portal's TARIFF_URL uses the tariff-api Service's DNS name in namespace tariffs
+      type: k8s-query
+      skills: [k8s.networking.dns]
+      query:
+        cluster: qm-customs
+        resource: deployment
+        name: broker-portal
+        namespace: brokers
+        jsonpath: '{.spec.template.spec.containers[0].env[?(@.name=="TARIFF_URL")].value}'
+      expect: {match: regex, value: '^http://tariff-api\.tariffs(\.svc(\.cluster\.local)?)?(:80)?/?$'}
+    - id: portal-gets-answers
+      description: From the running portal Pod, a request to TARIFF_URL returns the tariff API's page
+      type: shell
+      on: qm-customs
+      skills: [k8s.troubleshooting.networking]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        kubectl -n brokers rollout status deploy/broker-portal --timeout=10s >/dev/null 2>&1 || { echo "portal not rolled out"; exit 0; }
+        kubectl -n brokers exec deploy/broker-portal -c portal -- sh -c 'wget -q -T 5 -O - "$TARIFF_URL"' 2>&1 | grep -o -m1 'It works!' || echo "no answer"
+      expect: {match: exact, value: "It works!"}
+    - id: no-workarounds
+      description: No extra Services were added and the tariff API Pods keep their original labels
+      type: shell
+      on: qm-customs
+      skills: [k8s.cli.scoped-changes]
+      weight: 0.5
+      command: |
+        echo "$(kubectl -n tariffs get svc -o jsonpath='{.items[*].metadata.name}') $(kubectl -n brokers get svc -o name | wc -l) \
+        $(kubectl -n tariffs get deploy tariff-api -o jsonpath='{.spec.template.metadata.labels.app}/{.spec.selector.matchLabels.app}')"
+      expect: {match: exact, value: "tariff-api 0 tariff-api/tariff-api"}
+  hints:
+    - title: Switch context
+      body: The customs desk runs in qm-customs.
+      command: kubectl config use-context qm-customs
+      cost: 0
+    - title: What does the portal see?
+      command: kubectl -n brokers logs deploy/broker-portal --tail=3
+      body: The log line shows the exact URL it calls.
+      cost: 1
+    - title: Does the Service have backends?
+      body: An empty EndpointSlice means the Service's selector matches no ready Pod. Compare the selector with the Pod labels.
+      command: |
+        kubectl -n tariffs get endpointslices -l kubernetes.io/service-name=tariff-api
+        kubectl -n tariffs get svc tariff-api -o jsonpath='{.spec.selector}{"\n"}'; kubectl -n tariffs get pods --show-labels
+      cost: 2
+    - title: Cross-namespace names
+      body: From another namespace a Service is reached as `<service>.<namespace>` (or the full `.svc.cluster.local` form). Changing the env of a Deployment rolls out new Pods.
+      command: kubectl -n brokers set env deployment/broker-portal TARIFF_URL=http://tariff-api.tariffs.svc.cluster.local/
+      cost: 2
+  misconceptions:
+    - id: selector-only
+      description: Fixes the Service selector but not the portal's URL.
+      feedback: There were two faults. With endpoints in place, the portal still asks for a name that does not exist; check its log.
+      expectFail: [portal-url, portal-gets-answers]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 60
+        run: |
+          kubectl config use-context qm-customs
+          kubectl -n tariffs patch svc tariff-api -p '{"spec":{"selector":{"app":"tariff-api"}}}'
+    - id: url-only
+      description: Fixes the portal's URL but leaves the Service without endpoints.
+      feedback: The name now resolves to the ClusterIP, but a Service without matching Pods has nowhere to send the request.
+      expectFail: [service-endpoints, portal-gets-answers]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-customs
+          kubectl -n brokers set env deployment/broker-portal TARIFF_URL=http://tariff-api.tariffs.svc.cluster.local/
+          kubectl -n brokers rollout status deploy/broker-portal --timeout=120s
+    - id: relabel-pods
+      description: Changes the Pods' labels to match the misspelt selector.
+      feedback: The selector is the typo. Relabelling the workload spreads the mistake and breaks anything else selecting the correct label.
+      expectFail: [no-workarounds]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-customs
+          kubectl -n tariffs get deploy tariff-api -o yaml | sed 's/app: tariff-api/app: tarrif-api/' | kubectl replace --force -f -
+          kubectl -n tariffs rollout status deploy/tariff-api --timeout=120s
+          kubectl -n brokers set env deployment/broker-portal TARIFF_URL=http://tariff-api.tariffs.svc.cluster.local/
+          kubectl -n brokers rollout status deploy/broker-portal --timeout=120s
+    - id: alias-service
+      description: Creates a second Service under the name the portal asks for instead of fixing the portal.
+      feedback: An extra Service hides the wrong reference instead of fixing it, and both must now be maintained. Correct the portal's TARIFF_URL.
+      expectFail: [portal-url, no-workarounds]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 60
+        run: |
+          kubectl config use-context qm-customs
+          kubectl -n tariffs patch svc tariff-api -p '{"spec":{"selector":{"app":"tariff-api"}}}'
+          kubectl -n tariffs create service clusterip {{portal}} --tcp=80:80 --dry-run=client -o yaml \
+            | yq '.spec.selector = {"app": "tariff-api"}' | kubectl apply -f -
+    - id: cluster-ip-url
+      description: Points the portal at the Service's ClusterIP.
+      feedback: A ClusterIP changes when the Service is recreated; clients should use the Service's DNS name.
+      expectFail: [portal-url]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-customs
+          kubectl -n tariffs patch svc tariff-api -p '{"spec":{"selector":{"app":"tariff-api"}}}'
+          ip=$(kubectl -n tariffs get svc tariff-api -o jsonpath='{.spec.clusterIP}')
+          kubectl -n brokers set env deployment/broker-portal TARIFF_URL=http://$ip/
+          kubectl -n brokers rollout status deploy/broker-portal --timeout=120s
+  solution:
+    explanation: |
+      The Service selector `app: tarrif-api` matched no Pod, so its
+      EndpointSlice was empty. The portal also called `{{portal}}`, a name with
+      no Service behind it. Correcting the selector fills the EndpointSlice;
+      correcting TARIFF_URL to `tariff-api.tariffs.svc.cluster.local` rolls out
+      a portal Pod that reaches it.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-customs
+          kubectl -n tariffs patch svc tariff-api -p '{"spec":{"selector":{"app":"tariff-api"}}}'
+          kubectl -n brokers set env deployment/broker-portal TARIFF_URL=http://tariff-api.tariffs.svc.cluster.local/
+          kubectl -n brokers rollout status deploy/broker-portal --timeout=120s
+    alternatives:
+      - id: short-cross-namespace-name
+        description: Edit the selector with a JSON patch and use the short `<service>.<namespace>` form.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 150
+            run: |
+              kubectl config use-context qm-customs
+              kubectl -n tariffs patch svc tariff-api --type=json -p '[{"op":"replace","path":"/spec/selector/app","value":"tariff-api"}]'
+              kubectl -n brokers patch deployment broker-portal --type=json \
+                -p '[{"op":"replace","path":"/spec/template/spec/containers/0/env/0/value","value":"http://tariff-api.tariffs/"}]'
+              kubectl -n brokers rollout status deploy/broker-portal --timeout=120s

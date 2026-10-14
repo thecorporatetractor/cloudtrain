@@ -1,0 +1,288 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: label-printer-crashloop
+  title: Fix a crash-looping label printer
+  domain: kubernetes
+  frameworks: [cka:troubleshooting, ckad:observability-maintenance]
+  difficulty: easy
+  estimatedMinutes: 10
+  tags: [troubleshooting, logs, events, crashloopbackoff]
+  version: 1
+spec:
+  description: |
+    Parcels at the depot are leaving without labels: the **label-printer** Pod
+    in namespace `label-printing` restarts every few seconds. Someone changed
+    its arguments during last night's release.
+
+    Use context `qm-depot`:
+
+    ```bash
+    kubectl config use-context qm-depot
+    ```
+
+    1. Find out why the container exits. Write a two-line report to
+       `/home/learner/reports/label-printer.txt`:
+       - line 1: the `ERROR` line the crashed container printed, exactly as
+         printed;
+       - line 2: the **reason** of the Warning event Kubernetes records when it
+         delays the next restart (the event's REASON column).
+    2. Fix the wrong argument in the `label-printer` Deployment so that the
+       printer starts on queue `{{queue}}` at `300` dpi and keeps running
+       without restarts.
+
+    The start script in ConfigMap `label-printer-bin` is maintained by another
+    team: do not change it, and do not replace the container's command.
+  objectives:
+    - Read the logs of a previous container instance
+    - Read a Pod's events and their reasons
+    - Fix container arguments in a Deployment
+  params:
+    queue:
+      type: choice
+      values: [labels-east, labels-west, labels-express]
+    bad:
+      type: choice
+      values: ["--dpi=3OO", "--dpi=300dpi", "--dpl=300"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-depot
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: qm-depot
+  setup:
+    - on: qm-depot
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: label-printing}
+        ---
+        apiVersion: v1
+        kind: ConfigMap
+        metadata: {name: label-printer-bin, namespace: label-printing}
+        data:
+          start.sh: |
+            #!/bin/sh
+            echo "label-printer 4.2 starting"
+            queue=""; dpi=""
+            for a in "$@"; do
+              case "$a" in
+                --queue=?*) queue=${a#--queue=} ;;
+                --dpi=*[!0-9]*|--dpi=) echo "ERROR: rejected argument '$a' (expected --queue=<name> --dpi=<digits>)"; exit 2 ;;
+                --dpi=*) dpi=${a#--dpi=} ;;
+                *) echo "ERROR: rejected argument '$a' (expected --queue=<name> --dpi=<digits>)"; exit 2 ;;
+              esac
+            done
+            if [ -z "$queue" ] || [ -z "$dpi" ]; then
+              echo "ERROR: missing argument (expected --queue=<name> --dpi=<digits>)"; exit 2
+            fi
+            echo "label-printer: printing queue $queue at ${dpi}dpi"
+            while true; do sleep 30; done
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: label-printer, namespace: label-printing}
+        spec:
+          replicas: 1
+          selector: {matchLabels: {app: label-printer}}
+          template:
+            metadata: {labels: {app: label-printer}}
+            spec:
+              containers:
+                - name: printer
+                  image: busybox:1.37
+                  command: ["sh", "/opt/printer/start.sh"]
+                  args: ["--queue={{queue}}", "{{bad}}"]
+                  volumeMounts:
+                    - {name: bin, mountPath: /opt/printer}
+              volumes:
+                - name: bin
+                  configMap: {name: label-printer-bin}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: label-queue, namespace: label-printing}
+        spec:
+          replicas: 1
+          selector: {matchLabels: {app: label-queue}}
+          template:
+            metadata: {labels: {app: label-queue}}
+            spec:
+              containers:
+                - {name: queue, image: "redis:7.4-alpine"}
+    - on: qm-depot
+      timeoutSec: 150
+      run: |
+        kubectl -n label-printing rollout status deploy/label-queue --timeout=120s
+        # wait until the printer has crashed at least twice, so the BackOff event exists
+        for i in $(seq 1 60); do
+          r=$(kubectl -n label-printing get pods -l app=label-printer -o jsonpath='{.items[0].status.containerStatuses[0].restartCount}')
+          [ "${r:-0}" -ge 2 ] && exit 0
+          sleep 2
+        done
+        echo "printer did not crash-loop"; exit 1
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/reports
+  teardown:
+    - on: qm-depot
+      run: kubectl delete namespace label-printing --ignore-not-found --wait=false
+  checks:
+    - id: context
+      description: Terminal is using context qm-depot
+      type: k8s-context
+      on: workstation
+      skills: [k8s.cli.contexts]
+      weight: 0.5
+      expect: {match: exact, value: qm-depot}
+    - id: report-error-line
+      description: Line 1 of the report is the ERROR line from the crashed container
+      type: shell
+      on: workstation
+      skills: [k8s.troubleshooting.logs]
+      command: sed -n 1p /home/learner/reports/label-printer.txt | tr -d '\r' | sed 's/[[:space:]]*$//'
+      expect: {match: exact, value: "ERROR: rejected argument '{{bad}}' (expected --queue=<name> --dpi=<digits>)"}
+    - id: report-event-reason
+      description: Line 2 of the report is the reason of the restart back-off event
+      type: shell
+      on: workstation
+      skills: [k8s.troubleshooting.events]
+      command: sed -n 2p /home/learner/reports/label-printer.txt | tr -d '\r' | sed 's/[[:space:]]*$//'
+      expect: {match: exact, value: BackOff}
+    - id: printer-running
+      description: The printer Pod is Running and ready, printing queue {{queue}} at 300 dpi
+      type: shell
+      on: qm-depot
+      skills: [k8s.troubleshooting.logs]
+      weight: 2
+      timeoutSec: 15
+      command: |
+        kubectl -n label-printing rollout status deploy/label-printer --timeout=5s >/dev/null 2>&1 || { echo "not rolled out"; exit 0; }
+        kubectl -n label-printing logs deploy/label-printer -c printer | grep -x 'label-printer: printing queue {{queue}} at 300dpi' || echo "not printing"
+      expect: {match: exact, value: "label-printer: printing queue {{queue}} at 300dpi"}
+    - id: no-restarts
+      description: The current printer Pod has not restarted
+      type: shell
+      on: qm-depot
+      skills: [k8s.troubleshooting.events]
+      command: |
+        kubectl -n label-printing get pods -l app=label-printer -o json \
+          | jq -r '[.items[] | select(.metadata.deletionTimestamp == null) | "\(.status.containerStatuses[0].restartCount)|\(.status.containerStatuses[0].ready)"] | unique | join(" ")'
+      expect: {match: exact, value: "0|true"}
+    - id: command-kept
+      description: The container still runs the provided start script
+      type: k8s-query
+      skills: [k8s.cli.scoped-changes]
+      weight: 0.5
+      query:
+        cluster: qm-depot
+        resource: deployment
+        name: label-printer
+        namespace: label-printing
+        jsonpath: '{.spec.template.spec.containers[0].command}'
+      expect: {match: exact, value: '["sh","/opt/printer/start.sh"]'}
+    - id: script-intact
+      description: ConfigMap label-printer-bin is unchanged
+      type: shell
+      on: qm-depot
+      skills: [k8s.cli.scoped-changes]
+      weight: 0.5
+      command: kubectl -n label-printing get configmap label-printer-bin -o jsonpath='{.data.start\.sh}' | md5sum | cut -d' ' -f1
+      expect: {match: exact, value: 0519c5de459d7a37d75de59761b54328}
+  hints:
+    - title: Switch context
+      body: The printer runs in qm-depot.
+      command: kubectl config use-context qm-depot
+      cost: 0
+    - title: The container that crashed is gone
+      body: "`--previous` (`-p`) prints the logs of the last terminated instance of a container."
+      command: kubectl -n label-printing logs deploy/label-printer --previous
+      cost: 1
+    - title: Events of one Pod
+      body: Events list a type, a reason and a message. Look for the Warning that explains the growing restart delay.
+      command: kubectl -n label-printing events --for pod/$(kubectl -n label-printing get pod -l app=label-printer -o name | cut -d/ -f2)
+      cost: 1
+    - title: Arguments live in the Pod template
+      body: The script reads `args`; `command` points at the script. Change only `args`.
+      command: kubectl -n label-printing edit deployment label-printer
+      cost: 2
+  misconceptions:
+    - id: restart-pod
+      description: Deletes the Pod hoping a fresh one will start cleanly.
+      feedback: The Deployment recreates the Pod from the same template, with the same wrong argument. Fix the template.
+      expectFail: [printer-running, no-restarts]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 60
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n label-printing delete pod -l app=label-printer --wait=true
+          sleep 10
+    - id: replace-command
+      description: Replaces the command with sleep so the container stops crashing.
+      feedback: A container that only sleeps is Running, but it prints no labels. Fix the argument the script rejects.
+      expectFail: [printer-running, command-kept]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n label-printing patch deployment label-printer --type=json \
+            -p '[{"op":"replace","path":"/spec/template/spec/containers/0/command","value":["sleep","1d"]}]'
+          kubectl -n label-printing rollout status deploy/label-printer --timeout=120s
+    - id: container-state-as-reason
+      description: Writes CrashLoopBackOff (the container's waiting reason) instead of the event reason.
+      feedback: CrashLoopBackOff is the container state shown in STATUS. The event that records the delayed restart has the reason BackOff.
+      expectFail: [report-event-reason]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-depot
+          { kubectl -n label-printing logs deploy/label-printer --previous | grep '^ERROR'; echo CrashLoopBackOff; } > ~/reports/label-printer.txt
+          kubectl -n label-printing patch deployment label-printer --type=json \
+            -p '[{"op":"replace","path":"/spec/template/spec/containers/0/args","value":["--queue={{queue}}","--dpi=300"]}]'
+          kubectl -n label-printing rollout status deploy/label-printer --timeout=120s
+  solution:
+    explanation: |
+      `kubectl logs --previous` shows what the last crashed instance printed:
+      the script rejects one argument. The Pod's events show `BackOff` warnings
+      ("Back-off restarting failed container"), which is why the restarts get
+      slower. Correcting `args` in the Pod template rolls out a new Pod that
+      starts cleanly.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-depot
+          pod=$(kubectl -n label-printing get pod -l app=label-printer -o jsonpath='{.items[0].metadata.name}')
+          kubectl -n label-printing logs "$pod" --previous | grep '^ERROR' > ~/reports/label-printer.txt
+          kubectl -n label-printing events --for "pod/$pod" --types=Warning -o jsonpath='{.items[-1].reason}{"\n"}' >> ~/reports/label-printer.txt
+          kubectl -n label-printing patch deployment label-printer --type=json \
+            -p '[{"op":"replace","path":"/spec/template/spec/containers/0/args","value":["--queue={{queue}}","--dpi=300"]}]'
+          kubectl -n label-printing rollout status deploy/label-printer --timeout=120s
+    alternatives:
+      - id: describe-and-set-args
+        description: Read the reason from kubectl describe, write the report by hand and fix the args with an edited manifest.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 150
+            run: |
+              kubectl config use-context qm-depot
+              line=$(kubectl -n label-printing logs deploy/label-printer -p | grep ERROR)
+              reason=$(kubectl -n label-printing describe pod -l app=label-printer | awk '/Warning/ {print $2; exit}')
+              printf '%s\n%s\n' "$line" "$reason" > ~/reports/label-printer.txt
+              kubectl -n label-printing get deployment label-printer -o yaml \
+                | yq '.spec.template.spec.containers[0].args = ["--queue={{queue}}", "--dpi=300"]' | kubectl apply -f -
+              kubectl -n label-printing rollout status deploy/label-printer --timeout=120s
