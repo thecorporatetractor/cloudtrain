@@ -70,30 +70,10 @@ Three themes: dark, light and cream ([light](docs/images/workspace-light.png), [
 
 ## How it works
 
-```mermaid
-flowchart LR
-  subgraph Browser
-    W[Web app<br/>React · xterm.js · React Flow]
-  end
-  subgraph Platform
-    G[Gateway BFF<br/>TypeScript · Fastify]
-    K[Keycloak<br/>SSO broker]
-    P[(Postgres<br/>row-level security)]
-    O[Lab orchestrator<br/>Go operator]
-  end
-  IDP[Company IdP<br/>Entra ID · Okta · SAML]
-  subgraph Cluster[Kubernetes + KubeVirt + Kube-OVN]
-    L1[Lab: jumphost + kubeadm VMs]
-    L2[Lab: vcluster]
-    L3[Lab: FRR routers + hosts]
-  end
-  W -- HTTPS + WebSocket terminal --> G
-  G -- OIDC --> K -- federation --> IDP
-  G --> P
-  G -- LabSession / ExamSession --> O
-  O -- drivers: container · vm · kubeadm · vcluster · netdev --> Cluster
-  O -- grader --> Cluster
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/architecture-dark.svg">
+  <img alt="How CloudTrain works: people use the web app; the gateway signs them in through Keycloak and their company IdP, keeps data in Postgres with per-organisation row-level security, and asks the lab orchestrator for lab and exam sessions; the orchestrator runs isolated kubeadm, virtual-cluster and network labs on Kubernetes with KubeVirt and Kube-OVN and grades them; lab content is validated and verified live before publishing." src="docs/images/architecture-light.svg" width="100%">
+</picture>
 
 - **Labs are data.** Each lab is a `lab.yaml` (format `cloudtrain.dev/v3`):
   topology, setup, typed checks tagged with skills, hints, misconceptions and
