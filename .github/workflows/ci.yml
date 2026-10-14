@@ -1,0 +1,137 @@
+# Build, test and content gates. Every job here is a required check on main
+# (docs/security-ci.md).
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  node:
+    name: node (build, typecheck, test, content)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    services:
+      postgres:
+        image: postgres:17.11-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24
+        env:
+          POSTGRES_PASSWORD: postgres-ci-only
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 3s --health-timeout 3s --health-retries 30
+    env:
+      # Owner connection of the gateway's DB test suites (roles from deploy/dev/postgres/init.sql).
+      CT_TEST_DATABASE_URL: postgres://cloudtrain_owner:owner-dev-only@127.0.0.1:5432/cloudtrain
+    steps:
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: services/lab-orchestrator/go.mod
+          cache-dependency-path: services/lab-orchestrator/go.sum
+      - name: Postgres roles (deploy/dev/postgres/init.sql)
+        env:
+          PGPASSWORD: postgres-ci-only
+        run: psql -h 127.0.0.1 -U postgres -d postgres -v ON_ERROR_STOP=1 -f deploy/dev/postgres/init.sql
+      - run: pnpm install --frozen-lockfile
+      - name: labctl (the gateway's compiler tests use it)
+        run: go build -o services/lab-orchestrator/bin/labctl ./services/lab-orchestrator/cmd/labctl
+      - run: pnpm -r build
+      - run: pnpm -r --if-present typecheck
+      - run: pnpm -r test
+      - name: lab-verify --strict
+        run: node tools/lab-verify/bin/lab-verify.mjs --strict
+      - name: docs/curriculum.md is up to date
+        run: node tools/curriculum/render.mjs --check
+
+  go:
+    name: go (vet, test, build, generate drift, labs)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: services/lab-orchestrator
+    steps:
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: services/lab-orchestrator/go.mod
+          cache-dependency-path: services/lab-orchestrator/go.sum
+      - run: go vet ./...
+      - run: go test -race ./...
+      - run: make build
+      - name: make generate leaves no diff (schema copy, deepcopy, CRDs, RBAC)
+        run: |
+          make generate
+          git diff --exit-code -- . ../../packages/lab-schema
+          test -z "$(git status --porcelain -- .)"
+      - name: labctl validate (every pack)
+        run: |
+          for d in ../../content/packs/*/labs; do bin/labctl validate "$d"; done
+          make samples
+      - name: labctl exam compile (exams whose pools are complete)
+        # The other curriculum exams wait for their pool labs (docs/handoffs/security-ci.md);
+        # add an exam here once `bin/labctl exam compile <id>` passes.
+        run: |
+          bin/labctl exam compile sim-k8s-admin sim-k8s-developer sim-k8s-security >/dev/null
+          bin/labctl exam compile --exams testdata/exams/exams.yaml --labs testdata/exams/tasks sim-test-k8s-dev >/dev/null
+
+  licenses:
+    name: licenses (inventory drift, copyleft gate)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: services/lab-orchestrator/go.mod
+          cache-dependency-path: services/lab-orchestrator/go.sum
+      - run: pnpm install --frozen-lockfile
+      - name: go-licenses (built by the module's toolchain)
+        working-directory: services/lab-orchestrator
+        run: go install github.com/google/go-licenses/v2@v2.0.1
+      - name: THIRD_PARTY_LICENSES.md is up to date
+        run: |
+          bash tools/licenses/inventory.sh
+          git diff --exit-code -- THIRD_PARTY_LICENSES.md || {
+            echo "::error::THIRD_PARTY_LICENSES.md is stale: run tools/licenses/inventory.sh and commit it"; exit 1; }
+      - name: No GPL/LGPL/AGPL/SSPL in production dependencies
+        run: bash tools/licenses/check.sh
