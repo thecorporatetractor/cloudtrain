@@ -1,0 +1,192 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: control-plane-tour
+  title: Locate control-plane components and their config
+  domain: kubernetes
+  frameworks: [cka:cluster-architecture, cka:troubleshooting]
+  difficulty: easy
+  estimatedMinutes: 12
+  tags: [control-plane, static-pods, systemd, kubeadm]
+  version: 1
+spec:
+  description: |
+    You are joining the yard platform team. Before your first on-call shift,
+    find out how the control plane of `qm-yard` is put together on its
+    control-plane node `yard-cp-1` (reach it with `ssh yard-cp-1`; `sudo`
+    works there).
+
+    Some components run as **static Pods** (the kubelet starts them from
+    manifest files), others as **systemd units**. For each component below,
+    write one line to `/home/learner/reports/{{report}}`, in this order and
+    format (single spaces):
+
+    ```text
+    <component> <static-pod|systemd> <manifest or unit file path> <flag>=<value>
+    ```
+
+    | Component | Flag to report |
+    |---|---|
+    | `etcd` | `--data-dir` |
+    | `kube-apiserver` | `--etcd-servers` |
+    | `kube-controller-manager` | `--cluster-cidr` |
+    | `kube-scheduler` | `--kubeconfig` |
+    | `kubelet` | `--container-runtime-endpoint` |
+
+    For a systemd unit, give the path of its unit file (as `systemctl`
+    reports it). Report each flag with the value the running component was
+    started with. Example line:
+    `kube-proxy daemonset - --proxy-mode=iptables` (kube-proxy is not part
+    of the report).
+  objectives:
+    - Tell static Pods from systemd-managed components
+    - Find static Pod manifests and kubelet configuration on a kubeadm node
+    - Read a running component's flags
+  params:
+    report:
+      type: choice
+      values: [control-plane.txt, cp-tour.txt, yard-components.txt]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-yard
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-yard
+          nodes:
+            - {name: yard-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: yard-wk-1, role: worker}
+  setup:
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/reports
+  checks:
+    - id: line-etcd
+      description: Line 1 describes etcd (static Pod, manifest path, data dir)
+      type: shell
+      on: workstation
+      skills: [k8s.cluster.components]
+      command: sed -n 1p /home/learner/reports/{{report}} 2>/dev/null | tr -d '\r' | sed 's/[[:space:]]*$//'
+      expect: {match: exact, value: etcd static-pod /etc/kubernetes/manifests/etcd.yaml --data-dir=/var/lib/etcd}
+    - id: line-apiserver
+      description: Line 2 describes kube-apiserver (static Pod, manifest path, etcd servers)
+      type: shell
+      on: workstation
+      skills: [k8s.cluster.components]
+      command: sed -n 2p /home/learner/reports/{{report}} 2>/dev/null | tr -d '\r' | sed 's/[[:space:]]*$//'
+      expect: {match: exact, value: "kube-apiserver static-pod /etc/kubernetes/manifests/kube-apiserver.yaml --etcd-servers=https://127.0.0.1:2379"}
+    - id: line-controller-manager
+      description: Line 3 describes kube-controller-manager (static Pod, manifest path, cluster CIDR)
+      type: shell
+      on: workstation
+      skills: [k8s.cluster.components]
+      command: sed -n 3p /home/learner/reports/{{report}} 2>/dev/null | tr -d '\r' | sed 's/[[:space:]]*$//'
+      expect: {match: exact, value: kube-controller-manager static-pod /etc/kubernetes/manifests/kube-controller-manager.yaml --cluster-cidr=10.244.0.0/16}
+    - id: line-scheduler
+      description: Line 4 describes kube-scheduler (static Pod, manifest path, kubeconfig)
+      type: shell
+      on: workstation
+      skills: [k8s.cluster.components]
+      command: sed -n 4p /home/learner/reports/{{report}} 2>/dev/null | tr -d '\r' | sed 's/[[:space:]]*$//'
+      expect: {match: exact, value: kube-scheduler static-pod /etc/kubernetes/manifests/kube-scheduler.yaml --kubeconfig=/etc/kubernetes/scheduler.conf}
+    - id: line-kubelet
+      description: Line 5 describes the kubelet (systemd unit file, container runtime endpoint)
+      type: shell
+      on: workstation
+      skills: [k8s.cluster.components, k8s.cluster.container-runtime]
+      weight: 2
+      command: sed -n 5p /home/learner/reports/{{report}} 2>/dev/null | tr -d '\r' | sed 's/[[:space:]]*$//'
+      expect: {match: regex, value: '^kubelet systemd (/usr)?/lib/systemd/system/kubelet\.service --container-runtime-endpoint=unix:///(var/)?run/containerd/containerd\.sock$'}
+  hints:
+    - title: Static Pods
+      body: The kubelet watches one directory for Pod manifests; kubeadm puts the control-plane components there.
+      command: ssh yard-cp-1 'sudo ls /etc/kubernetes/manifests/'
+      cost: 1
+    - title: What runs under systemd?
+      command: ssh yard-cp-1 'systemctl list-units --type=service --state=running | grep -E "kubelet|containerd"'
+      body: "`systemctl status <unit>` and `systemctl cat <unit>` show the unit file and its drop-ins."
+      cost: 1
+    - title: Flags of a static Pod
+      command: ssh yard-cp-1 'sudo grep -- --etcd-servers /etc/kubernetes/manifests/kube-apiserver.yaml'
+      body: The command list in each manifest holds the flags; `kubectl -n kube-system get pod <name> -o yaml` shows the same.
+      cost: 1
+    - title: The kubelet's flags
+      body: kubeadm writes extra kubelet flags into `/var/lib/kubelet/kubeadm-flags.env`, which the unit's drop-in passes to the kubelet. `ps` shows the running command line.
+      command: ssh yard-cp-1 'cat /var/lib/kubelet/kubeadm-flags.env; ps -o args= -C kubelet'
+      cost: 2
+  misconceptions:
+    - id: kubelet-as-static-pod
+      description: Lists the kubelet as a static Pod like the other components.
+      feedback: The kubelet is what starts static Pods, so it cannot be one. It runs as a systemd service on every node.
+      expectFail: [line-kubelet]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 90
+        run: |
+          cat > ~/reports/{{report}} <<'EOF'
+          etcd static-pod /etc/kubernetes/manifests/etcd.yaml --data-dir=/var/lib/etcd
+          kube-apiserver static-pod /etc/kubernetes/manifests/kube-apiserver.yaml --etcd-servers=https://127.0.0.1:2379
+          kube-controller-manager static-pod /etc/kubernetes/manifests/kube-controller-manager.yaml --cluster-cidr=10.244.0.0/16
+          kube-scheduler static-pod /etc/kubernetes/manifests/kube-scheduler.yaml --kubeconfig=/etc/kubernetes/scheduler.conf
+          kubelet static-pod /etc/kubernetes/manifests/kubelet.yaml --container-runtime-endpoint=unix:///var/run/containerd/containerd.sock
+          EOF
+    - id: node-cidr
+      description: Reports the node's Pod CIDR slice as the controller manager's cluster CIDR.
+      feedback: "`--cluster-cidr` is the whole range the controller manager carves node slices from."
+      expectFail: [line-controller-manager]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 90
+        run: |
+          kubectl config use-context qm-yard
+          cidr=$(kubectl get node yard-cp-1 -o jsonpath='{.spec.podCIDR}')
+          {
+            echo "etcd static-pod /etc/kubernetes/manifests/etcd.yaml --data-dir=/var/lib/etcd"
+            echo "kube-apiserver static-pod /etc/kubernetes/manifests/kube-apiserver.yaml --etcd-servers=https://127.0.0.1:2379"
+            echo "kube-controller-manager static-pod /etc/kubernetes/manifests/kube-controller-manager.yaml --cluster-cidr=$cidr"
+            echo "kube-scheduler static-pod /etc/kubernetes/manifests/kube-scheduler.yaml --kubeconfig=/etc/kubernetes/scheduler.conf"
+          } > ~/reports/{{report}}
+    - id: client-kubeconfig
+      description: Gives the admin kubeconfig as the scheduler's kubeconfig.
+      feedback: Each control-plane component has its own kubeconfig and identity under /etc/kubernetes; read the flag from the scheduler's manifest.
+      expectFail: [line-scheduler]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 90
+        run: |
+          {
+            echo "etcd static-pod /etc/kubernetes/manifests/etcd.yaml --data-dir=/var/lib/etcd"
+            echo "kube-apiserver static-pod /etc/kubernetes/manifests/kube-apiserver.yaml --etcd-servers=https://127.0.0.1:2379"
+            echo "kube-controller-manager static-pod /etc/kubernetes/manifests/kube-controller-manager.yaml --cluster-cidr=10.244.0.0/16"
+            echo "kube-scheduler static-pod /etc/kubernetes/manifests/kube-scheduler.yaml --kubeconfig=/etc/kubernetes/admin.conf"
+          } > ~/reports/{{report}}
+  solution:
+    explanation: |
+      kubeadm runs etcd, the API server, the controller manager and the
+      scheduler as static Pods from `/etc/kubernetes/manifests`; their flags
+      are in each manifest's command. The kubelet (which starts those Pods)
+      and containerd are systemd services; the kubelet's runtime endpoint
+      comes from `/var/lib/kubelet/kubeadm-flags.env`.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          flag() { ssh yard-cp-1 "sudo grep -o -- '$2=[^ \"]*' /etc/kubernetes/manifests/$1.yaml" | head -1; }
+          {
+            echo "etcd static-pod /etc/kubernetes/manifests/etcd.yaml $(flag etcd --data-dir)"
+            echo "kube-apiserver static-pod /etc/kubernetes/manifests/kube-apiserver.yaml $(flag kube-apiserver --etcd-servers)"
+            echo "kube-controller-manager static-pod /etc/kubernetes/manifests/kube-controller-manager.yaml $(flag kube-controller-manager --cluster-cidr)"
+            echo "kube-scheduler static-pod /etc/kubernetes/manifests/kube-scheduler.yaml $(flag kube-scheduler --kubeconfig)"
+            echo "kubelet systemd $(ssh yard-cp-1 'systemctl show -p FragmentPath --value kubelet') $(ssh yard-cp-1 "ps -o args= -C kubelet" | grep -o -- '--container-runtime-endpoint=[^ ]*')"
+          } > ~/reports/{{report}}
+          cat ~/reports/{{report}}

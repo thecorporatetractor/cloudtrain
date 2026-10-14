@@ -1,0 +1,305 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: coredns-customs-forward
+  title: Forward a private zone in CoreDNS
+  domain: kubernetes
+  frameworks: [cka:services-networking]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [dns, coredns, corefile, forward]
+  version: 1
+spec:
+  description: |
+    The customs authority publishes its endpoints under the private zone
+    `customs.quillmoor.example`, served by the customs resolver that runs in
+    the cluster (Service `customs-resolver` in namespace `customs-dns`).
+    Pods do not use it: lookups such as
+    `declarations.customs.quillmoor.example` fail everywhere.
+
+    Use context `qm-customs`:
+
+    ```bash
+    kubectl config use-context qm-customs
+    ```
+
+    Change the cluster DNS (CoreDNS in `kube-system`) so that names in
+    **`customs.quillmoor.example`** are **forwarded to the customs
+    resolver**, for every Pod in every namespace, while all other lookups
+    keep working exactly as before. Make sure the running CoreDNS Pods use
+    the new configuration.
+
+    The probe Pods `dns-probe` in namespaces `brokers` and `customs-desk`
+    must resolve `declarations.customs.quillmoor.example`. Do not change the
+    resolver itself.
+  objectives:
+    - Read and edit the Corefile in the coredns ConfigMap
+    - Add a server block that forwards one zone
+    - Roll CoreDNS and test resolution from Pods
+  params:
+    ip:
+      type: choice
+      values: ["10.77.4.21", "10.77.9.13", "10.77.6.30"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-customs
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-customs
+          nodes:
+            - {name: customs-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: customs-wk-1, role: worker}
+  setup:
+    - on: qm-customs
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: customs-dns}
+        ---
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: brokers}
+        ---
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: customs-desk}
+        ---
+        apiVersion: v1
+        kind: ConfigMap
+        metadata: {name: customs-zone, namespace: customs-dns}
+        data:
+          Corefile: |
+            customs.quillmoor.example:53 {
+                hosts {
+                    {{ip}} declarations.customs.quillmoor.example
+                    10.77.1.5 tariffs.customs.quillmoor.example
+                }
+                log
+            }
+        ---
+        apiVersion: v1
+        kind: Pod
+        metadata: {name: dns-probe, namespace: brokers}
+        spec:
+          containers:
+            - {name: probe, image: "busybox:1.37", command: ["sleep", "1d"]}
+        ---
+        apiVersion: v1
+        kind: Pod
+        metadata: {name: dns-probe, namespace: customs-desk}
+        spec:
+          containers:
+            - {name: probe, image: "busybox:1.37", command: ["sleep", "1d"]}
+    - on: qm-customs
+      timeoutSec: 200
+      run: |
+        set -e
+        # The resolver reuses the cluster's own (preloaded) CoreDNS image.
+        img=$(kubectl -n kube-system get deploy coredns -o jsonpath='{.spec.template.spec.containers[0].image}')
+        kubectl -n customs-dns create deployment customs-resolver --image="$img" --dry-run=client -o json \
+          | jq '.spec.template.spec.containers[0].args = ["-conf", "/etc/coredns/Corefile"]
+                | .spec.template.spec.containers[0].volumeMounts = [{"name": "zone", "mountPath": "/etc/coredns"}]
+                | .spec.template.spec.volumes = [{"name": "zone", "configMap": {"name": "customs-zone"}}]' \
+          | kubectl apply -f -
+        kubectl -n customs-dns expose deployment customs-resolver --name=customs-resolver --port=53 --protocol=UDP
+        kubectl -n customs-dns rollout status deploy/customs-resolver --timeout=150s
+        kubectl -n brokers wait pod/dns-probe --for=condition=Ready --timeout=120s
+        kubectl -n customs-desk wait pod/dns-probe --for=condition=Ready --timeout=120s
+  teardown:
+    - on: qm-customs
+      run: kubectl delete namespace customs-dns brokers customs-desk --ignore-not-found --wait=false
+  checks:
+    - id: context
+      description: Terminal is using context qm-customs
+      type: k8s-context
+      on: workstation
+      skills: [k8s.cli.contexts]
+      weight: 0.5
+      expect: {match: exact, value: qm-customs}
+    - id: zone-block
+      description: The Corefile has a server block for customs.quillmoor.example that forwards to the customs resolver
+      type: shell
+      on: qm-customs
+      skills: [k8s.networking.coredns-config]
+      weight: 2
+      command: |
+        ip=$(kubectl -n customs-dns get svc customs-resolver -o jsonpath='{.spec.clusterIP}')
+        kubectl -n kube-system get configmap coredns -o jsonpath='{.data.Corefile}' | awk -v ip="$ip" '
+          /^[^ \t#].*\{/ { inzone = ($1 ~ /^customs\.quillmoor\.example\.?(:53)?$/) }
+          inzone && $1 == "forward" && $2 == "." { for (i = 3; i <= NF; i++) if ($i == ip || $i == ip":53" || $i == "dns://"ip || $i == "dns://"ip":53") ok = 1 }
+          END { print (ok ? "forwards" : "no forward to the resolver") }'
+      expect: {match: exact, value: forwards}
+    - id: default-block-intact
+      description: The main server block still serves cluster.local and forwards everything else to /etc/resolv.conf
+      type: shell
+      on: qm-customs
+      skills: [k8s.networking.coredns-config]
+      command: |
+        kubectl -n kube-system get configmap coredns -o jsonpath='{.data.Corefile}' | awk '
+          /^[^ \t#].*\{/ { inmain = ($1 ~ /^\.(:53)?$/) }
+          inmain && $1 == "kubernetes" && $2 == "cluster.local" { k = 1 }
+          inmain && $1 == "forward" && $2 == "." && $3 == "/etc/resolv.conf" { f = 1 }
+          END { print (k && f ? "intact" : "changed") }'
+      expect: {match: exact, value: intact}
+    - id: resolves-everywhere
+      description: Both probe Pods resolve declarations.customs.quillmoor.example to {{ip}}
+      type: shell
+      on: qm-customs
+      skills: [k8s.networking.dns, k8s.networking.coredns-config]
+      weight: 2
+      timeoutSec: 40
+      command: |
+        for ns in brokers customs-desk; do
+          kubectl -n $ns exec dns-probe -- nslookup declarations.customs.quillmoor.example 2>/dev/null \
+            | awk '/^Name:/ {n = 1} n && /^Address/ {print $2; exit}'
+        done | paste -sd' ' -
+      expect: {match: exact, value: "{{ip}} {{ip}}"}
+    - id: cluster-dns-works
+      description: Cluster names (kubernetes.default) still resolve from the probe Pods
+      type: shell
+      on: qm-customs
+      skills: [k8s.networking.dns]
+      timeoutSec: 30
+      command: |
+        kubectl -n brokers exec dns-probe -- nslookup kubernetes.default.svc.cluster.local 2>/dev/null \
+          | awk '/^Name:/ {n = 1} n && /^Address/ {print "resolved"; exit}'
+      expect: {match: exact, value: resolved}
+    - id: coredns-ready
+      description: CoreDNS runs with all replicas ready and no Pod uses a per-Pod DNS override
+      type: shell
+      on: qm-customs
+      skills: [k8s.networking.coredns-config]
+      weight: 0.5
+      command: |
+        echo "$(kubectl -n kube-system get deploy coredns -o jsonpath='{.status.readyReplicas}/{.spec.replicas}') \
+        $(kubectl get pods -A -o json | jq '[.items[] | select(.spec.dnsConfig.nameservers != null)] | length')"
+      expect: {match: exact, value: "2/2 0"}
+  hints:
+    - title: Switch context
+      body: The customs gateway is qm-customs.
+      command: kubectl config use-context qm-customs
+      cost: 0
+    - title: Where CoreDNS reads its configuration
+      command: kubectl -n kube-system get configmap coredns -o yaml
+      body: The Corefile is a list of server blocks. Each block starts with the zones it serves.
+      cost: 1
+    - title: A block per zone
+      body: |
+        Add a second block next to the `.:53` one; CoreDNS picks the most
+        specific matching zone. The resolver's address is its Service ClusterIP.
+        ```
+        customs.quillmoor.example:53 {
+            errors
+            cache 30
+            forward . <customs-resolver ClusterIP>
+        }
+        ```
+      command: kubectl -n customs-dns get svc customs-resolver -o jsonpath='{.spec.clusterIP}{"\n"}'
+      cost: 2
+    - title: Apply and roll
+      command: |
+        kubectl -n kube-system edit configmap coredns
+        kubectl -n kube-system rollout restart deployment coredns
+        kubectl -n brokers exec dns-probe -- nslookup declarations.customs.quillmoor.example
+      body: The reload plugin would pick the change up eventually; a rollout restart makes it immediate.
+      cost: 1
+  misconceptions:
+    - id: forward-everything
+      description: Points the main block's forward at the customs resolver.
+      feedback: That sends every external lookup to the customs resolver, which only knows its own zone. Add a separate block for the zone.
+      expectFail: [zone-block, default-block-intact]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 200
+        run: |
+          kubectl config use-context qm-customs
+          ip=$(kubectl -n customs-dns get svc customs-resolver -o jsonpath='{.spec.clusterIP}')
+          kubectl -n kube-system get configmap coredns -o json \
+            | jq --arg ip "$ip" '.data.Corefile |= sub("forward \\. /etc/resolv\\.conf"; "forward . \($ip)")' | kubectl apply -f -
+          kubectl -n kube-system rollout restart deployment coredns
+          kubectl -n kube-system rollout status deployment coredns --timeout=150s
+    - id: hard-coded-hosts
+      description: Copies the customs records into the cluster Corefile with the hosts plugin.
+      feedback: Copied records go stale as soon as customs changes them. Forward the zone to the authority instead.
+      expectFail: [zone-block]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 200
+        run: |
+          kubectl config use-context qm-customs
+          kubectl -n kube-system get configmap coredns -o json \
+            | jq '.data.Corefile += "customs.quillmoor.example:53 {\n    hosts {\n        {{ip}} declarations.customs.quillmoor.example\n    }\n}\n"' | kubectl apply -f -
+          kubectl -n kube-system rollout restart deployment coredns
+          kubectl -n kube-system rollout status deployment coredns --timeout=150s
+    - id: per-pod-dns
+      description: Sets dnsConfig nameservers on one probe Pod instead of changing cluster DNS.
+      feedback: dnsConfig changes one Pod. The zone has to resolve for every Pod, which is the cluster DNS's job.
+      expectFail: [zone-block, resolves-everywhere, coredns-ready]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 200
+        run: |
+          kubectl config use-context qm-customs
+          ip=$(kubectl -n customs-dns get svc customs-resolver -o jsonpath='{.spec.clusterIP}')
+          kubectl -n brokers delete pod dns-probe --wait=true
+          kubectl apply -f - <<YAML
+          apiVersion: v1
+          kind: Pod
+          metadata: {name: dns-probe, namespace: brokers}
+          spec:
+            dnsPolicy: None
+            dnsConfig: {nameservers: ["$ip"]}
+            containers:
+              - {name: probe, image: "busybox:1.37", command: ["sleep", "1d"]}
+          YAML
+          kubectl -n brokers wait pod/dns-probe --for=condition=Ready --timeout=120s
+  solution:
+    explanation: |
+      CoreDNS serves each query from the server block with the most specific
+      matching zone. A `customs.quillmoor.example:53` block with
+      `forward . <resolver ClusterIP>` sends only that zone to the customs
+      resolver; the `.:53` block still answers cluster names and forwards the
+      rest upstream. Restarting the Deployment makes CoreDNS read the new
+      Corefile immediately.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 240
+        run: |
+          kubectl config use-context qm-customs
+          ip=$(kubectl -n customs-dns get svc customs-resolver -o jsonpath='{.spec.clusterIP}')
+          kubectl -n kube-system get configmap coredns -o json \
+            | jq --arg ip "$ip" '.data.Corefile += "customs.quillmoor.example:53 {\n    errors\n    cache 30\n    forward . \($ip)\n}\n"' \
+            | kubectl apply -f -
+          kubectl -n kube-system rollout restart deployment coredns
+          kubectl -n kube-system rollout status deployment coredns --timeout=150s
+          kubectl -n brokers exec dns-probe -- nslookup declarations.customs.quillmoor.example
+    alternatives:
+      - id: wait-for-reload
+        description: Edit the Corefile with a trailing-dot zone name and let the reload plugin pick it up, without restarting.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 240
+            run: |
+              kubectl config use-context qm-customs
+              ip=$(kubectl -n customs-dns get svc customs-resolver -o jsonpath='{.spec.clusterIP}')
+              kubectl -n kube-system get configmap coredns -o json \
+                | jq --arg ip "$ip" '.data.Corefile += "customs.quillmoor.example.:53 {\n    forward . \($ip):53\n}\n"' \
+                | kubectl apply -f -
+              for i in $(seq 1 40); do
+                kubectl -n customs-desk exec dns-probe -- nslookup declarations.customs.quillmoor.example 2>/dev/null | grep -q '{{ip}}' \
+                  && kubectl -n brokers exec dns-probe -- nslookup declarations.customs.quillmoor.example 2>/dev/null | grep -q '{{ip}}' && break
+                sleep 5
+              done

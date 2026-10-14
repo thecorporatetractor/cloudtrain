@@ -1,0 +1,192 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: helm-shipment-events
+  title: Install and upgrade a chart with custom values
+  domain: kubernetes
+  frameworks: [cka:cluster-architecture, ckad:deployment]
+  difficulty: easy
+  estimatedMinutes: 12
+  tags: [helm, charts, values, upgrade]
+  version: 1
+spec:
+  description: |
+    The depot's shipment event relay is packaged as a Helm chart. Its charts
+    are kept in a local chart repository on your workstation: `~/charts`
+    holds the packaged chart versions and their `index.yaml`.
+
+    Use context `qm-depot`:
+
+    ```bash
+    kubectl config use-context qm-depot
+    ```
+
+    1. Install chart **`shipment-events`** version **1.2.0** from `~/charts`
+       as release **`{{release}}`** in its own namespace **`shipment-events`**
+       (create the namespace as part of the install), with **3 replicas** set
+       through the chart's values (the chart's default is 1).
+    2. Upgrade the release to chart version **1.3.0**, keeping the 3
+       replicas.
+
+    When you are done, the release must be deployed on chart 1.3.0 with the
+    replica count still supplied as a value, and its history must show that
+    it was installed with 1.2.0.
+  objectives:
+    - Inspect a chart's default values
+    - Install a chart with value overrides into a new namespace
+    - Upgrade a release without losing its values
+  params:
+    release:
+      type: choice
+      values: [events, shipment-relay, se-depot]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-depot
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: qm-depot
+  setup:
+    - on: workstation
+      file:
+        path: /opt/cloudtrain/build-charts.sh
+        source: assets/build-charts.sh
+        mode: "0755"
+    - on: workstation
+      as: learner
+      timeoutSec: 60
+      run: /opt/cloudtrain/build-charts.sh
+  teardown:
+    - on: qm-depot
+      run: kubectl delete namespace shipment-events --ignore-not-found --wait=false
+  checks:
+    - id: context
+      description: Terminal is using context qm-depot
+      type: k8s-context
+      on: workstation
+      skills: [k8s.cli.contexts]
+      weight: 0.5
+      expect: {match: exact, value: qm-depot}
+    - id: release-deployed
+      description: Release {{release}} in namespace shipment-events is deployed on chart shipment-events-1.3.0
+      type: shell
+      on: qm-depot
+      skills: [k8s.cluster.packaging]
+      weight: 2
+      command: |
+        helm -n shipment-events list -a -o json | jq -r '.[] | select(.name == "{{release}}") | "\(.status) \(.chart)"'
+      expect: {match: exact, value: deployed shipment-events-1.3.0}
+    - id: installed-from-1-2
+      description: The release history starts with chart 1.2.0
+      type: shell
+      on: qm-depot
+      skills: [k8s.cluster.packaging]
+      command: |
+        helm -n shipment-events history {{release}} -o json 2>/dev/null | jq -r 'sort_by(.revision) | .[0].chart'
+      expect: {match: exact, value: shipment-events-1.2.0}
+    - id: values-kept
+      description: The release's user-supplied values set replicaCount to 3
+      type: shell
+      on: qm-depot
+      skills: [k8s.cluster.packaging]
+      weight: 2
+      command: helm -n shipment-events get values {{release}} -o json 2>/dev/null | jq -r '.replicaCount'
+      expect: {match: exact, value: "3"}
+    - id: workload-running
+      description: The release's Deployment runs 3 ready Pods of chart 1.3.0
+      type: shell
+      on: qm-depot
+      skills: [k8s.cluster.packaging]
+      command: |
+        kubectl -n shipment-events get deployment {{release}} \
+          -o jsonpath='{.spec.replicas}/{.status.readyReplicas}/{.status.updatedReplicas} {.spec.template.metadata.labels.helm\.sh/chart}'
+      expect: {match: exact, value: 3/3/3 shipment-events-1.3.0}
+  hints:
+    - title: Switch context
+      body: The relay runs in qm-depot.
+      command: kubectl config use-context qm-depot
+      cost: 0
+    - title: What can be set?
+      body: "`helm show values` prints a chart's defaults; the replica count is a top-level value."
+      command: helm show values ~/charts/shipment-events-1.2.0.tgz
+      cost: 1
+    - title: Install
+      body: "`--create-namespace` creates the target namespace; `--set` or `-f` supplies values."
+      command: helm install {{release}} ~/charts/shipment-events-1.2.0.tgz -n shipment-events --create-namespace --set replicaCount=3
+      cost: 2
+    - title: Upgrades start from the new chart's defaults
+      body: Unless you pass the values again (or `--reuse-values`), `helm upgrade` renders the new chart with its defaults.
+      command: helm -n shipment-events get values {{release}}
+      cost: 2
+  misconceptions:
+    - id: values-lost-on-upgrade
+      description: Upgrades without passing the values again, so replicas drop back to 1.
+      feedback: "`helm upgrade` does not carry over earlier `--set` values by default. Pass them again, use `-f`, or `--reuse-values`, and check with `helm get values`."
+      expectFail: [values-kept, workload-running]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 180
+        run: |
+          kubectl config use-context qm-depot
+          helm install {{release}} ~/charts/shipment-events-1.2.0.tgz -n shipment-events --create-namespace --set replicaCount=3 --wait --timeout 2m
+          helm upgrade {{release}} ~/charts/shipment-events-1.3.0.tgz -n shipment-events --wait --timeout 2m
+    - id: installed-latest
+      description: Installs 1.3.0 straight away instead of installing 1.2.0 and upgrading.
+      feedback: The task is an upgrade path. The release history should show the install on 1.2.0 and the upgrade to 1.3.0.
+      expectFail: [installed-from-1-2]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 180
+        run: |
+          kubectl config use-context qm-depot
+          helm install {{release}} ~/charts/shipment-events-1.3.0.tgz -n shipment-events --create-namespace --set replicaCount=3 --wait --timeout 2m
+    - id: scaled-by-kubectl
+      description: Scales the Deployment with kubectl after upgrading without values.
+      feedback: The chart owns the Deployment; a kubectl scale is drift that the next helm upgrade undoes. Set the replica count as a value.
+      expectFail: [values-kept]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 180
+        run: |
+          kubectl config use-context qm-depot
+          helm install {{release}} ~/charts/shipment-events-1.2.0.tgz -n shipment-events --create-namespace --wait --timeout 2m
+          helm upgrade {{release}} ~/charts/shipment-events-1.3.0.tgz -n shipment-events --wait --timeout 2m
+          kubectl -n shipment-events scale deployment {{release}} --replicas=3
+          kubectl -n shipment-events rollout status deployment {{release}} --timeout=90s
+  solution:
+    explanation: |
+      `helm install --create-namespace --set replicaCount=3` installs 1.2.0
+      with the override stored in the release. `helm upgrade --reuse-values`
+      (or passing `--set replicaCount=3` again) renders 1.3.0 with the same
+      user-supplied values; the release history keeps both revisions.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 240
+        run: |
+          kubectl config use-context qm-depot
+          helm install {{release}} ~/charts/shipment-events-1.2.0.tgz -n shipment-events --create-namespace --set replicaCount=3 --wait --timeout 2m
+          helm upgrade {{release}} ~/charts/shipment-events-1.3.0.tgz -n shipment-events --reuse-values --wait --timeout 2m
+    alternatives:
+      - id: values-file
+        description: Keep the override in a values file and pass it to both install and upgrade, selecting the chart by version from the repository index.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 240
+            run: |
+              kubectl config use-context qm-depot
+              printf 'replicaCount: 3\n' > ~/se-values.yaml
+              v12=$(yq '.entries["shipment-events"][] | select(.version == "1.2.0") | .urls[0]' ~/charts/index.yaml)
+              v13=$(yq '.entries["shipment-events"][] | select(.version == "1.3.0") | .urls[0]' ~/charts/index.yaml)
+              helm upgrade --install {{release}} ~/charts/$v12 -n shipment-events --create-namespace -f ~/se-values.yaml --wait --timeout 2m
+              helm upgrade {{release}} ~/charts/$v13 -n shipment-events -f ~/se-values.yaml --wait --timeout 2m

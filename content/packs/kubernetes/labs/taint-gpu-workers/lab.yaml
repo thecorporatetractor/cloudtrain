@@ -1,0 +1,260 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: taint-gpu-workers
+  title: Reserve workers for one workload with taints
+  domain: kubernetes
+  frameworks: [cka:workloads-scheduling]
+  difficulty: easy
+  estimatedMinutes: 10
+  tags: [scheduling, taints, tolerations]
+  version: 1
+spec:
+  description: |
+    Two workers in the fleet cluster have GPUs for rendering label images.
+    Other workloads keep landing on them and slow the imaging down.
+
+    Use context `qm-fleet`:
+
+    ```bash
+    kubectl config use-context qm-fleet
+    ```
+
+    1. Taint the two workers labelled
+       `quillmoor.example/role=label-imaging` with
+       **`quillmoor.example/imaging={{val}}:NoSchedule`**. No other node gets
+       this taint.
+    2. Give Deployment **`label-imaging`** (namespace `label-printing`) the
+       toleration that matches this taint, so its Pods keep running on the
+       imaging workers.
+    3. Restart Deployment `parcel-sorter` (same namespace) so that none of its
+       Pods remain on the imaging workers.
+
+    In the end, all Pods of both Deployments must be Running.
+  objectives:
+    - Taint nodes selected by label
+    - Write a toleration that matches a taint's key, value and effect
+    - Understand that NoSchedule does not evict running Pods
+  params:
+    val:
+      type: choice
+      values: [reserved, gpu-only, imaging]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-fleet
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-fleet
+          nodes:
+            - {name: fleet-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: fleet-wk-1, role: worker, labels: {quillmoor.example/role: label-imaging}}
+            - {name: fleet-wk-2, role: worker, labels: {quillmoor.example/role: label-imaging}}
+            - {name: fleet-wk-3, role: worker, labels: {quillmoor.example/role: general}}
+  setup:
+    - on: qm-fleet
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: label-printing}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: label-imaging, namespace: label-printing}
+        spec:
+          replicas: 2
+          selector: {matchLabels: {app: label-imaging}}
+          template:
+            metadata: {labels: {app: label-imaging}}
+            spec:
+              nodeSelector: {quillmoor.example/role: label-imaging}
+              containers:
+                - {name: render, image: "busybox:1.37", command: ["sh", "-c", "while true; do sleep 30; done"]}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: parcel-sorter, namespace: label-printing}
+        spec:
+          replicas: 3
+          selector: {matchLabels: {app: parcel-sorter}}
+          template:
+            metadata: {labels: {app: parcel-sorter}}
+            spec:
+              topologySpreadConstraints:
+                - {maxSkew: 1, topologyKey: kubernetes.io/hostname, whenUnsatisfiable: ScheduleAnyway, labelSelector: {matchLabels: {app: parcel-sorter}}}
+              containers:
+                - {name: sorter, image: "httpd:2.4-alpine"}
+    - on: qm-fleet
+      timeoutSec: 200
+      run: |
+        kubectl -n label-printing rollout status deploy/label-imaging --timeout=150s
+        kubectl -n label-printing rollout status deploy/parcel-sorter --timeout=150s
+  teardown:
+    - on: qm-fleet
+      run: kubectl delete namespace label-printing --ignore-not-found --wait=false
+  checks:
+    - id: context
+      description: Terminal is using context qm-fleet
+      type: k8s-context
+      on: workstation
+      skills: [k8s.cli.contexts]
+      weight: 0.5
+      expect: {match: exact, value: qm-fleet}
+    - id: taints
+      description: Exactly fleet-wk-1 and fleet-wk-2 carry quillmoor.example/imaging={{val}}:NoSchedule
+      type: shell
+      on: qm-fleet
+      skills: [k8s.scheduling.taints-tolerations]
+      weight: 2
+      command: |
+        kubectl get nodes -o json | jq -r '
+          [.items[] | . as $n | .spec.taints[]? | select(.key == "quillmoor.example/imaging") | "\($n.metadata.name)=\(.value):\(.effect)"] | sort | join(" ")'
+      expect: {match: exact, value: "fleet-wk-1={{val}}:NoSchedule fleet-wk-2={{val}}:NoSchedule"}
+    - id: toleration
+      description: label-imaging tolerates the imaging taint
+      type: shell
+      on: qm-fleet
+      skills: [k8s.scheduling.taints-tolerations]
+      weight: 2
+      command: |
+        kubectl -n label-printing get deployment label-imaging -o json | jq -r '
+          [.spec.template.spec.tolerations[]? | select(.key == "quillmoor.example/imaging")
+           | select((.operator // "Equal") == "Exists" or .value == "{{val}}")
+           | select((.effect // "") == "" or .effect == "NoSchedule")] | if length > 0 then "ok" else "no matching toleration" end'
+      expect: {match: exact, value: ok}
+    - id: imaging-running
+      description: 2 ready label-imaging Pods run on the imaging workers
+      type: shell
+      on: qm-fleet
+      skills: [k8s.scheduling.taints-tolerations]
+      command: |
+        kubectl -n label-printing get pods -l app=label-imaging -o json | jq -r '
+          [.items[] | select(.metadata.deletionTimestamp == null)] as $p
+          | "\($p | length) \([$p[] | select(any(.status.conditions[]?; .type == "Ready" and .status == "True")) | .spec.nodeName | select(. == "fleet-wk-1" or . == "fleet-wk-2")] | length)"'
+      expect: {match: exact, value: "2 2"}
+    - id: sorter-moved
+      description: 3 ready parcel-sorter Pods, none on an imaging worker
+      type: shell
+      on: qm-fleet
+      skills: [k8s.scheduling.taints-tolerations]
+      weight: 2
+      command: |
+        kubectl -n label-printing get pods -l app=parcel-sorter -o json | jq -r '
+          [.items[] | select(.metadata.deletionTimestamp == null)] as $p
+          | "ready=\([$p[] | select(any(.status.conditions[]?; .type == "Ready" and .status == "True"))] | length) on-imaging=\([$p[] | select(.spec.nodeName == "fleet-wk-1" or .spec.nodeName == "fleet-wk-2")] | length) total=\($p | length)"'
+      expect: {match: exact, value: ready=3 on-imaging=0 total=3}
+  hints:
+    - title: Switch context
+      body: The fleet cluster is qm-fleet.
+      command: kubectl config use-context qm-fleet
+      cost: 0
+    - title: Taint by label
+      body: "`kubectl taint` accepts a label selector instead of node names."
+      command: kubectl taint nodes -l quillmoor.example/role=label-imaging quillmoor.example/imaging={{val}}:NoSchedule
+      cost: 2
+    - title: Toleration fields
+      body: "A toleration matches a taint when key and effect match and either `operator: Exists`, or `operator: Equal` with the same value."
+      cost: 1
+    - title: Running Pods stay put
+      body: NoSchedule only affects new placements. A rollout restart replaces the sorter Pods, and the new ones avoid the tainted nodes.
+      command: kubectl -n label-printing rollout restart deployment parcel-sorter
+      cost: 1
+  misconceptions:
+    - id: no-restart
+      description: Expects the NoSchedule taint to move the sorter Pods by itself.
+      feedback: NoSchedule keeps new Pods away but leaves running ones alone; only NoExecute evicts. Restart the sorter.
+      expectFail: [sorter-moved]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 200
+        run: |
+          kubectl config use-context qm-fleet
+          kubectl taint nodes -l quillmoor.example/role=label-imaging quillmoor.example/imaging={{val}}:NoSchedule
+          kubectl -n label-printing patch deployment label-imaging -p '{"spec":{"template":{"spec":{"tolerations":[{"key":"quillmoor.example/imaging","operator":"Equal","value":"{{val}}","effect":"NoSchedule"}]}}}}'
+          kubectl -n label-printing rollout status deploy/label-imaging --timeout=150s
+    - id: toleration-wrong-value
+      description: Tolerates the key with a different value.
+      feedback: With operator Equal the value must match exactly; otherwise the Pod does not tolerate the taint and stays Pending.
+      expectFail: [toleration, imaging-running]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          kubectl config use-context qm-fleet
+          kubectl taint nodes -l quillmoor.example/role=label-imaging quillmoor.example/imaging={{val}}:NoSchedule
+          kubectl -n label-printing patch deployment label-imaging -p '{"spec":{"template":{"spec":{"tolerations":[{"key":"quillmoor.example/imaging","operator":"Equal","value":"true","effect":"NoSchedule"}]}}}}'
+          kubectl -n label-printing rollout restart deployment parcel-sorter
+          sleep 45
+    - id: taint-every-worker
+      description: Taints all workers.
+      feedback: Only the imaging workers are reserved. With every worker tainted, the sorter has nowhere to run.
+      expectFail: [taints, sorter-moved]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          kubectl config use-context qm-fleet
+          kubectl taint nodes -l '!node-role.kubernetes.io/control-plane' quillmoor.example/imaging={{val}}:NoSchedule
+          kubectl -n label-printing patch deployment label-imaging -p '{"spec":{"template":{"spec":{"tolerations":[{"key":"quillmoor.example/imaging","operator":"Exists","effect":"NoSchedule"}]}}}}'
+          kubectl -n label-printing rollout restart deployment parcel-sorter
+          sleep 45
+    - id: prefer-effect
+      description: Uses PreferNoSchedule.
+      feedback: PreferNoSchedule is only a hint; other Pods can still be placed on the imaging workers.
+      expectFail: [taints]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 200
+        run: |
+          kubectl config use-context qm-fleet
+          kubectl taint nodes -l quillmoor.example/role=label-imaging quillmoor.example/imaging={{val}}:PreferNoSchedule
+          kubectl -n label-printing patch deployment label-imaging -p '{"spec":{"template":{"spec":{"tolerations":[{"key":"quillmoor.example/imaging","operator":"Exists"}]}}}}'
+          kubectl -n label-printing rollout status deploy/label-imaging --timeout=150s
+          kubectl -n label-printing rollout restart deployment parcel-sorter
+          kubectl -n label-printing rollout status deploy/parcel-sorter --timeout=150s
+  solution:
+    explanation: |
+      The taint repels every Pod that does not tolerate it from new placements
+      on the two imaging workers. The imaging Deployment gets a toleration with
+      the same key, value and effect (its nodeSelector still pins it to those
+      workers). NoSchedule never evicts, so the sorter is restarted and its new
+      Pods go to fleet-wk-3.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          kubectl config use-context qm-fleet
+          kubectl taint nodes -l quillmoor.example/role=label-imaging quillmoor.example/imaging={{val}}:NoSchedule
+          kubectl -n label-printing patch deployment label-imaging -p '{"spec":{"template":{"spec":{"tolerations":[{"key":"quillmoor.example/imaging","operator":"Equal","value":"{{val}}","effect":"NoSchedule"}]}}}}'
+          kubectl -n label-printing rollout status deploy/label-imaging --timeout=150s
+          kubectl -n label-printing rollout restart deployment parcel-sorter
+          kubectl -n label-printing rollout status deploy/parcel-sorter --timeout=150s
+    alternatives:
+      - id: exists-toleration
+        description: Taint each node by name and tolerate the key with operator Exists.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 300
+            run: |
+              kubectl config use-context qm-fleet
+              for n in $(kubectl get nodes -l quillmoor.example/role=label-imaging -o name); do
+                kubectl taint "$n" quillmoor.example/imaging={{val}}:NoSchedule
+              done
+              kubectl -n label-printing patch deployment label-imaging --type=json \
+                -p '[{"op":"add","path":"/spec/template/spec/tolerations","value":[{"key":"quillmoor.example/imaging","operator":"Exists","effect":"NoSchedule"}]}]'
+              kubectl -n label-printing rollout status deploy/label-imaging --timeout=150s
+              kubectl -n label-printing rollout restart deployment parcel-sorter
+              kubectl -n label-printing rollout status deploy/parcel-sorter --timeout=150s

@@ -1,0 +1,284 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: spread-tracking-replicas
+  title: Spread replicas across zones and away from each other
+  domain: kubernetes
+  frameworks: [cka:workloads-scheduling]
+  difficulty: hard
+  estimatedMinutes: 18
+  tags: [scheduling, topology-spread, pod-anti-affinity, zones]
+  version: 1
+spec:
+  description: |
+    The shipment-tracking API must survive the loss of a whole machine room,
+    and it must not share a machine with the CPU-hungry ETA predictor.
+
+    Use context `qm-tracking`:
+
+    ```bash
+    kubectl config use-context qm-tracking
+    ```
+
+    The workers are spread over two zones (label
+    `topology.kubernetes.io/zone`: `qm-north` or `qm-south`). In namespace
+    `parcel-tracking`, change Deployment **`tracking-api`** (6 replicas) so
+    that:
+
+    1. its Pods are spread **evenly over the zones**: the Pod counts per zone
+       may differ by at most 1, and the scheduler must leave a Pod Pending
+       rather than break that rule;
+    2. none of its Pods ever runs on a node that runs an **`eta-predictor`**
+       Pod (label `app=eta-predictor`); this is a hard rule.
+
+    All 6 replicas must end up running. Leave `eta-predictor`, the nodes and
+    their labels as they are.
+  objectives:
+    - Spread Pods across a topology domain with topologySpreadConstraints
+    - Keep Pods away from another workload with required pod anti-affinity
+    - Reason about which nodes remain feasible
+  params:
+    etaNode:
+      type: choice
+      values: [tracking-wk-1, tracking-wk-2]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-tracking
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-tracking
+          nodes:
+            - {name: tracking-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: tracking-wk-1, role: worker, labels: {topology.kubernetes.io/zone: qm-north}}
+            - {name: tracking-wk-2, role: worker, labels: {topology.kubernetes.io/zone: qm-north}}
+            - {name: tracking-wk-3, role: worker, labels: {topology.kubernetes.io/zone: qm-south}}
+  setup:
+    - on: qm-tracking
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: parcel-tracking}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: eta-predictor, namespace: parcel-tracking}
+        spec:
+          replicas: 1
+          selector: {matchLabels: {app: eta-predictor}}
+          template:
+            metadata: {labels: {app: eta-predictor, tier: tracking}}
+            spec:
+              nodeSelector: {kubernetes.io/hostname: "{{etaNode}}"}
+              containers:
+                - {name: model, image: "busybox:1.37", command: ["sh", "-c", "while true; do sleep 30; done"]}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: tracking-api, namespace: parcel-tracking}
+        spec:
+          replicas: 6
+          selector: {matchLabels: {app: tracking-api}}
+          template:
+            metadata: {labels: {app: tracking-api, tier: tracking}}
+            spec:
+              containers:
+                - {name: api, image: "httpd:2.4-alpine"}
+    - on: qm-tracking
+      timeoutSec: 200
+      run: |
+        kubectl -n parcel-tracking rollout status deploy/eta-predictor --timeout=150s
+        kubectl -n parcel-tracking rollout status deploy/tracking-api --timeout=150s
+  teardown:
+    - on: qm-tracking
+      run: kubectl delete namespace parcel-tracking --ignore-not-found --wait=false
+  checks:
+    - id: context
+      description: Terminal is using context qm-tracking
+      type: k8s-context
+      on: workstation
+      skills: [k8s.cli.contexts]
+      weight: 0.5
+      expect: {match: exact, value: qm-tracking}
+    - id: zone-spread
+      description: A hard topology spread constraint over zones with maxSkew 1 selects the tracking-api Pods
+      type: shell
+      on: qm-tracking
+      skills: [k8s.scheduling.pod-affinity]
+      weight: 2
+      command: |
+        kubectl -n parcel-tracking get deployment tracking-api -o json | jq -r '
+          [.spec.template.spec.topologySpreadConstraints[]?
+           | select(.topologyKey == "topology.kubernetes.io/zone" and .maxSkew == 1 and .whenUnsatisfiable == "DoNotSchedule")
+           | select((.labelSelector.matchLabels.app // "") == "tracking-api"
+                    or any(.labelSelector.matchExpressions[]?; .key == "app" and .operator == "In" and .values == ["tracking-api"]))]
+          | if length > 0 then "ok" else "missing" end'
+      expect: {match: exact, value: ok}
+    - id: anti-affinity
+      description: A required pod anti-affinity term keeps tracking-api off nodes running app=eta-predictor
+      type: shell
+      on: qm-tracking
+      skills: [k8s.scheduling.pod-affinity]
+      weight: 2
+      command: |
+        kubectl -n parcel-tracking get deployment tracking-api -o json | jq -r '
+          [.spec.template.spec.affinity.podAntiAffinity.requiredDuringSchedulingIgnoredDuringExecution[]?
+           | select(.topologyKey == "kubernetes.io/hostname")
+           | select((.labelSelector.matchLabels.app // "") == "eta-predictor"
+                    or any(.labelSelector.matchExpressions[]?; .key == "app" and .operator == "In" and .values == ["eta-predictor"]))]
+          | if length > 0 then "ok" else "missing" end'
+      expect: {match: exact, value: ok}
+    - id: placement
+      description: 6 ready tracking-api Pods, 3 per zone, none on the eta-predictor node
+      type: shell
+      on: qm-tracking
+      skills: [k8s.scheduling.pod-affinity]
+      weight: 2
+      command: |
+        kubectl -n parcel-tracking rollout status deploy/tracking-api --timeout=5s >/dev/null 2>&1 || { echo "not rolled out"; exit 0; }
+        eta=$(kubectl -n parcel-tracking get pods -l app=eta-predictor -o jsonpath='{.items[*].spec.nodeName}')
+        zones=$(kubectl get nodes -o json | jq -c '[.items[] | {(.metadata.name): .metadata.labels["topology.kubernetes.io/zone"]}] | add')
+        kubectl -n parcel-tracking get pods -l app=tracking-api -o json | jq -r --argjson z "$zones" --arg eta "$eta" '
+          [.items[] | select(.metadata.deletionTimestamp == null) | select(any(.status.conditions[]?; .type == "Ready" and .status == "True"))]
+          | "ready=\(length) north=\([.[] | select($z[.spec.nodeName] == "qm-north")] | length) south=\([.[] | select($z[.spec.nodeName] == "qm-south")] | length) on-eta=\([.[] | select(.spec.nodeName == $eta)] | length)"'
+      expect: {match: exact, value: ready=6 north=3 south=3 on-eta=0}
+    - id: rest-unchanged
+      description: eta-predictor and the node zone labels are unchanged
+      type: shell
+      on: qm-tracking
+      skills: [k8s.cli.scoped-changes]
+      weight: 0.5
+      command: |
+        echo "$(kubectl -n parcel-tracking get pods -l app=eta-predictor -o jsonpath='{.items[*].spec.nodeName}') \
+        $(kubectl get nodes -L topology.kubernetes.io/zone --no-headers | awk '$1 ~ /wk/ {print $6}' | paste -sd, -)"
+      expect: {match: exact, value: "{{etaNode}} qm-north,qm-north,qm-south"}
+  hints:
+    - title: Switch context
+      body: Shipment tracking runs in qm-tracking.
+      command: kubectl config use-context qm-tracking
+      cost: 0
+    - title: Map the room
+      command: |
+        kubectl get nodes -L topology.kubernetes.io/zone
+        kubectl -n parcel-tracking get pods -o wide
+      body: Find the zone of every worker and where eta-predictor runs.
+      cost: 0
+    - title: Spread vs anti-affinity
+      body: |
+        `topologySpreadConstraints` balances Pod counts across domains
+        (`whenUnsatisfiable: DoNotSchedule` makes it hard). Pod anti-affinity
+        with `topologyKey: kubernetes.io/hostname` keeps Pods off any node
+        where Pods matching its selector run.
+      cost: 1
+    - title: The Pod template fields
+      body: |
+        ```yaml
+        topologySpreadConstraints:
+          - maxSkew: 1
+            topologyKey: topology.kubernetes.io/zone
+            whenUnsatisfiable: DoNotSchedule
+            labelSelector: {matchLabels: {app: tracking-api}}
+        affinity:
+          podAntiAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              - topologyKey: kubernetes.io/hostname
+                labelSelector: {matchLabels: {app: eta-predictor}}
+        ```
+      cost: 3
+  misconceptions:
+    - id: soft-spread
+      description: Uses whenUnsatisfiable ScheduleAnyway, which only prefers balance.
+      feedback: ScheduleAnyway turns the spread into a scoring hint; the scheduler may still stack a zone. The task asks for a hard rule.
+      expectFail: [zone-spread]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 220
+        run: |
+          kubectl config use-context qm-tracking
+          kubectl -n parcel-tracking patch deployment tracking-api -p '{"spec":{"template":{"spec":{
+            "topologySpreadConstraints":[{"maxSkew":1,"topologyKey":"topology.kubernetes.io/zone","whenUnsatisfiable":"ScheduleAnyway","labelSelector":{"matchLabels":{"app":"tracking-api"}}}],
+            "affinity":{"podAntiAffinity":{"requiredDuringSchedulingIgnoredDuringExecution":[{"topologyKey":"kubernetes.io/hostname","labelSelector":{"matchLabels":{"app":"eta-predictor"}}}]}}}}}}'
+          kubectl -n parcel-tracking rollout status deploy/tracking-api --timeout=200s
+    - id: preferred-anti-affinity
+      description: Uses preferred anti-affinity, so co-location stays possible.
+      feedback: A preferred term is a weight in scoring. When other factors win, tracking Pods still land next to the predictor. Use the required form.
+      expectFail: [anti-affinity]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 220
+        run: |
+          kubectl config use-context qm-tracking
+          kubectl -n parcel-tracking patch deployment tracking-api -p '{"spec":{"template":{"spec":{
+            "topologySpreadConstraints":[{"maxSkew":1,"topologyKey":"topology.kubernetes.io/zone","whenUnsatisfiable":"DoNotSchedule","labelSelector":{"matchLabels":{"app":"tracking-api"}}}],
+            "affinity":{"podAntiAffinity":{"preferredDuringSchedulingIgnoredDuringExecution":[{"weight":100,"podAffinityTerm":{"topologyKey":"kubernetes.io/hostname","labelSelector":{"matchLabels":{"app":"eta-predictor"}}}}]}}}}}}'
+          kubectl -n parcel-tracking rollout status deploy/tracking-api --timeout=200s
+    - id: anti-affinity-to-self
+      description: Points the anti-affinity at the tracking-api Pods themselves.
+      feedback: Anti-affinity to its own label allows only one tracking Pod per node, so six replicas cannot fit on the remaining nodes and Pods stay Pending.
+      expectFail: [anti-affinity, placement]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          kubectl config use-context qm-tracking
+          kubectl -n parcel-tracking patch deployment tracking-api -p '{"spec":{"template":{"spec":{
+            "topologySpreadConstraints":[{"maxSkew":1,"topologyKey":"topology.kubernetes.io/zone","whenUnsatisfiable":"DoNotSchedule","labelSelector":{"matchLabels":{"app":"tracking-api"}}}],
+            "affinity":{"podAntiAffinity":{"requiredDuringSchedulingIgnoredDuringExecution":[{"topologyKey":"kubernetes.io/hostname","labelSelector":{"matchLabels":{"app":"tracking-api"}}}]}}}}}}'
+          sleep 60
+    - id: spread-by-host
+      description: Spreads over hostnames instead of zones.
+      feedback: The failure domain here is the zone. A hostname spread balances nodes, not machine rooms.
+      expectFail: [zone-spread]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 220
+        run: |
+          kubectl config use-context qm-tracking
+          kubectl -n parcel-tracking patch deployment tracking-api -p '{"spec":{"template":{"spec":{
+            "topologySpreadConstraints":[{"maxSkew":1,"topologyKey":"kubernetes.io/hostname","whenUnsatisfiable":"DoNotSchedule","labelSelector":{"matchLabels":{"app":"tracking-api"}}}],
+            "affinity":{"podAntiAffinity":{"requiredDuringSchedulingIgnoredDuringExecution":[{"topologyKey":"kubernetes.io/hostname","labelSelector":{"matchLabels":{"app":"eta-predictor"}}}]}}}}}}'
+          kubectl -n parcel-tracking rollout status deploy/tracking-api --timeout=200s || true
+  solution:
+    explanation: |
+      The spread constraint counts tracking-api Pods per zone and refuses any
+      placement that would make the counts differ by more than one. The
+      required anti-affinity removes {{etaNode}} from the feasible nodes. What
+      remains is one node in qm-north and tracking-wk-3 in qm-south, so the
+      six replicas end up three per zone.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 220
+        run: |
+          kubectl config use-context qm-tracking
+          kubectl -n parcel-tracking patch deployment tracking-api -p '{"spec":{"template":{"spec":{
+            "topologySpreadConstraints":[{"maxSkew":1,"topologyKey":"topology.kubernetes.io/zone","whenUnsatisfiable":"DoNotSchedule","labelSelector":{"matchLabels":{"app":"tracking-api"}}}],
+            "affinity":{"podAntiAffinity":{"requiredDuringSchedulingIgnoredDuringExecution":[{"topologyKey":"kubernetes.io/hostname","labelSelector":{"matchLabels":{"app":"eta-predictor"}}}]}}}}}}'
+          kubectl -n parcel-tracking rollout status deploy/tracking-api --timeout=200s
+    alternatives:
+      - id: match-expressions-and-label-keys
+        description: matchExpressions selectors and matchLabelKeys so only Pods of the current revision are counted.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 220
+            run: |
+              kubectl config use-context qm-tracking
+              kubectl -n parcel-tracking get deployment tracking-api -o yaml | yq '
+                .spec.template.spec.topologySpreadConstraints = [{"maxSkew": 1, "topologyKey": "topology.kubernetes.io/zone", "whenUnsatisfiable": "DoNotSchedule",
+                  "labelSelector": {"matchExpressions": [{"key": "app", "operator": "In", "values": ["tracking-api"]}]}, "matchLabelKeys": ["pod-template-hash"]}]
+                | .spec.template.spec.affinity.podAntiAffinity.requiredDuringSchedulingIgnoredDuringExecution = [{"topologyKey": "kubernetes.io/hostname",
+                  "labelSelector": {"matchExpressions": [{"key": "app", "operator": "In", "values": ["eta-predictor"]}]}}]' \
+                | kubectl apply -f -
+              kubectl -n parcel-tracking rollout status deploy/tracking-api --timeout=200s

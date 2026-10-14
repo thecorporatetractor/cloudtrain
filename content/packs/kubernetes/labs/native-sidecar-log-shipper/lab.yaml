@@ -1,0 +1,313 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: native-sidecar-log-shipper
+  title: Ship logs with a native sidecar and an init step
+  domain: kubernetes
+  frameworks: [cka:workloads-scheduling, ckad:design-build]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [init-containers, sidecars, emptydir, pods]
+  version: 1
+spec:
+  description: |
+    The depot's label printer needs the current carrier map before it can
+    print, and the operations team wants its print log on stdout where the
+    log collector picks it up. Right now the printer crashes on start because
+    the map is missing.
+
+    Use context `qm-depot`:
+
+    ```bash
+    kubectl config use-context qm-depot
+    ```
+
+    Change Deployment **`label-printer`** in namespace `label-printing` (keep
+    its `printer` container as it is, apart from volume mounts):
+
+    1. Add two `emptyDir` volumes: `carriers`, mounted at `/etc/carriers` in
+       the printer, and `logs`, mounted at `/var/log/printer`.
+    2. Add an **init container** `fetch-carriers` (image `busybox:1.37`) that
+       downloads `http://carrier-registry/map.txt` to `/etc/carriers/map.txt`
+       before anything else starts.
+    3. Add a **native sidecar** `log-shipper` (image `busybox:1.37`) that runs
+       `tail -F /var/log/printer/print.log` for the life of the Pod. It must be
+       declared as an init container with `restartPolicy: Always`, after
+       `fetch-carriers`, so it starts before the printer and is stopped only
+       after the printer has ended.
+
+    The printer must end up Running without restarts, and its print log must
+    be readable with `kubectl logs ... -c log-shipper`.
+  objectives:
+    - Order initialisation with an init container
+    - Declare a native sidecar (init container with restartPolicy Always)
+    - Share files between containers through emptyDir volumes
+  params:
+    carrier:
+      type: choice
+      values: [northline-freight, baywater-couriers, ridgeway-parcel]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-depot
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: qm-depot
+  setup:
+    - on: qm-depot
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: label-printing}
+        ---
+        apiVersion: v1
+        kind: ConfigMap
+        metadata: {name: carrier-registry-data, namespace: label-printing}
+        data:
+          map.txt: |
+            default={{carrier}}
+            express=skylane-air
+            bulky=harbourside-haulage
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: carrier-registry, namespace: label-printing}
+        spec:
+          replicas: 1
+          selector: {matchLabels: {app: carrier-registry}}
+          template:
+            metadata: {labels: {app: carrier-registry}}
+            spec:
+              containers:
+                - name: registry
+                  image: busybox:1.37
+                  command: ["httpd", "-f", "-p", "80", "-h", "/srv"]
+                  volumeMounts: [{name: data, mountPath: /srv}]
+              volumes:
+                - name: data
+                  configMap: {name: carrier-registry-data}
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata: {name: carrier-registry, namespace: label-printing}
+        spec:
+          selector: {app: carrier-registry}
+          ports: [{port: 80, targetPort: 80}]
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: label-printer, namespace: label-printing}
+        spec:
+          replicas: 1
+          selector: {matchLabels: {app: label-printer}}
+          template:
+            metadata: {labels: {app: label-printer}}
+            spec:
+              containers:
+                - name: printer
+                  image: busybox:1.37
+                  command:
+                    - sh
+                    - -c
+                    - |
+                      [ -s /etc/carriers/map.txt ] || { echo "carrier map missing"; exit 1; }
+                      carrier=$(sed -n 's/^default=//p' /etc/carriers/map.txt)
+                      mkdir -p /var/log/printer
+                      n=0
+                      while true; do
+                        n=$((n+1)); echo "printed label $n via $carrier" >> /var/log/printer/print.log
+                        sleep 5
+                      done
+    - on: qm-depot
+      timeoutSec: 150
+      run: kubectl -n label-printing rollout status deploy/carrier-registry --timeout=120s
+  teardown:
+    - on: qm-depot
+      run: kubectl delete namespace label-printing --ignore-not-found --wait=false
+  checks:
+    - id: context
+      description: Terminal is using context qm-depot
+      type: k8s-context
+      on: workstation
+      skills: [k8s.cli.contexts]
+      weight: 0.5
+      expect: {match: exact, value: qm-depot}
+    - id: init-order
+      description: "Init containers are, in order: fetch-carriers (run to completion), then log-shipper with restartPolicy Always"
+      type: k8s-query
+      skills: [k8s.workloads.native-sidecars]
+      weight: 2
+      query:
+        cluster: qm-depot
+        resource: deployment
+        name: label-printer
+        namespace: label-printing
+        jsonpath: '{range .spec.template.spec.initContainers[*]}{.name}:{.restartPolicy};{end} containers={range .spec.template.spec.containers[*]}{.name};{end}'
+      expect: {match: exact, value: "fetch-carriers:;log-shipper:Always; containers=printer;"}
+    - id: emptydir-volumes
+      description: carriers and logs are emptyDir volumes
+      type: shell
+      on: qm-depot
+      skills: [k8s.storage.ephemeral-volumes]
+      command: |
+        kubectl -n label-printing get deployment label-printer -o json \
+          | jq -r '[.spec.template.spec.volumes[]? | select(.name == "carriers" or .name == "logs") | "\(.name)=\(has("emptyDir"))"] | sort | join(",")'
+      expect: {match: exact, value: "carriers=true,logs=true"}
+    - id: printer-running
+      description: The current printer Pod is Running, the printer is ready and has not restarted
+      type: shell
+      on: qm-depot
+      skills: [k8s.workloads.native-sidecars]
+      weight: 2
+      command: |
+        kubectl -n label-printing get pods -l app=label-printer -o json | jq -r '
+          [.items[] | select(.metadata.deletionTimestamp == null)
+           | "\(.status.phase) " + ([.status.containerStatuses[] | select(.name == "printer") | "\(.ready)/\(.restartCount)"] | join(""))] | join(";")'
+      expect: {match: exact, value: Running true/0}
+    - id: map-fetched
+      description: The printer reads the carrier map fetched by the init container
+      type: shell
+      on: qm-depot
+      skills: [k8s.storage.ephemeral-volumes]
+      timeoutSec: 20
+      command: kubectl -n label-printing exec deploy/label-printer -c printer -- sed -n 1p /etc/carriers/map.txt
+      expect: {match: exact, value: "default={{carrier}}"}
+    - id: logs-shipped
+      description: The log-shipper sidecar prints the printer's log lines on its stdout
+      type: shell
+      on: qm-depot
+      skills: [k8s.workloads.native-sidecars, k8s.storage.ephemeral-volumes]
+      weight: 2
+      timeoutSec: 20
+      command: |
+        n=$(kubectl -n label-printing logs deploy/label-printer -c log-shipper --tail=50 | grep -c 'via {{carrier}}$')
+        [ "${n:-0}" -gt 0 ] && echo shipping || echo "nothing shipped"
+      expect: {match: exact, value: shipping}
+  hints:
+    - title: Switch context
+      body: The printer runs in qm-depot.
+      command: kubectl config use-context qm-depot
+      cost: 0
+    - title: Why does it crash?
+      command: kubectl -n label-printing logs deploy/label-printer
+      body: The printer expects a file that nothing provides yet.
+      cost: 0
+    - title: Native sidecars
+      body: |
+        Since Kubernetes 1.29 a sidecar is an entry in `initContainers` with
+        `restartPolicy: Always`. It starts in init order but does not need to
+        finish; later init containers and the app containers start once it is
+        running, and it is stopped after them.
+      cost: 2
+    - title: Pod spec sketch
+      body: |
+        ```yaml
+        initContainers:
+          - name: fetch-carriers
+            image: busybox:1.37
+            command: ["wget", "-O", "/etc/carriers/map.txt", "http://carrier-registry/map.txt"]
+            volumeMounts: [{name: carriers, mountPath: /etc/carriers}]
+          - name: log-shipper
+            image: busybox:1.37
+            restartPolicy: Always
+            command: ["tail", "-F", "/var/log/printer/print.log"]
+            volumeMounts: [{name: logs, mountPath: /var/log/printer}]
+        ```
+      cost: 3
+  misconceptions:
+    - id: sidecar-as-app-container
+      description: Adds log-shipper as a second regular container.
+      feedback: A regular container has no start order relative to the printer and is not stopped after it. Declare the sidecar in initContainers with restartPolicy Always.
+      expectFail: [init-order]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n label-printing patch deployment label-printer -p '{"spec":{"template":{"spec":{
+            "volumes":[{"name":"carriers","emptyDir":{}},{"name":"logs","emptyDir":{}}],
+            "initContainers":[{"name":"fetch-carriers","image":"busybox:1.37","command":["wget","-O","/etc/carriers/map.txt","http://carrier-registry/map.txt"],"volumeMounts":[{"name":"carriers","mountPath":"/etc/carriers"}]}],
+            "containers":[{"name":"printer","volumeMounts":[{"name":"carriers","mountPath":"/etc/carriers"},{"name":"logs","mountPath":"/var/log/printer"}]},
+                          {"name":"log-shipper","image":"busybox:1.37","command":["tail","-F","/var/log/printer/print.log"],"volumeMounts":[{"name":"logs","mountPath":"/var/log/printer"}]}]}}}}'
+          kubectl -n label-printing rollout status deploy/label-printer --timeout=120s
+    - id: init-without-restart-policy
+      description: Puts log-shipper in initContainers but without restartPolicy Always.
+      feedback: "A classic init container must exit before the next one starts. `tail -F` never exits, so the Pod stays in Init forever. Add `restartPolicy: Always`."
+      expectFail: [init-order, printer-running]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 90
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n label-printing patch deployment label-printer -p '{"spec":{"template":{"spec":{
+            "volumes":[{"name":"carriers","emptyDir":{}},{"name":"logs","emptyDir":{}}],
+            "initContainers":[{"name":"fetch-carriers","image":"busybox:1.37","command":["wget","-O","/etc/carriers/map.txt","http://carrier-registry/map.txt"],"volumeMounts":[{"name":"carriers","mountPath":"/etc/carriers"}]},
+                              {"name":"log-shipper","image":"busybox:1.37","command":["tail","-F","/var/log/printer/print.log"],"volumeMounts":[{"name":"logs","mountPath":"/var/log/printer"}]}],
+            "containers":[{"name":"printer","volumeMounts":[{"name":"carriers","mountPath":"/etc/carriers"},{"name":"logs","mountPath":"/var/log/printer"}]}]}}}}'
+          sleep 45
+    - id: unshared-log-volume
+      description: Mounts the logs volume in the sidecar only, so the printer writes to its own filesystem.
+      feedback: Containers in a Pod share files only through a volume mounted in both. Mount `logs` in the printer too.
+      expectFail: [logs-shipped]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n label-printing patch deployment label-printer -p '{"spec":{"template":{"spec":{
+            "volumes":[{"name":"carriers","emptyDir":{}},{"name":"logs","emptyDir":{}}],
+            "initContainers":[{"name":"fetch-carriers","image":"busybox:1.37","command":["wget","-O","/etc/carriers/map.txt","http://carrier-registry/map.txt"],"volumeMounts":[{"name":"carriers","mountPath":"/etc/carriers"}]},
+                              {"name":"log-shipper","image":"busybox:1.37","restartPolicy":"Always","command":["tail","-F","/var/log/printer/print.log"],"volumeMounts":[{"name":"logs","mountPath":"/var/log/printer"}]}],
+            "containers":[{"name":"printer","volumeMounts":[{"name":"carriers","mountPath":"/etc/carriers"}]}]}}}}'
+          kubectl -n label-printing rollout status deploy/label-printer --timeout=120s
+          sleep 10
+  solution:
+    explanation: |
+      `fetch-carriers` runs to completion first and leaves the map in the
+      shared `carriers` emptyDir. `log-shipper`, an init container with
+      `restartPolicy: Always`, is started next and kept running; once it is
+      up, the printer starts. Both mount the `logs` emptyDir, so `tail -F`
+      streams the printer's file to the sidecar's stdout.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n label-printing patch deployment label-printer -p '{"spec":{"template":{"spec":{
+            "volumes":[{"name":"carriers","emptyDir":{}},{"name":"logs","emptyDir":{}}],
+            "initContainers":[{"name":"fetch-carriers","image":"busybox:1.37","command":["wget","-O","/etc/carriers/map.txt","http://carrier-registry/map.txt"],"volumeMounts":[{"name":"carriers","mountPath":"/etc/carriers"}]},
+                              {"name":"log-shipper","image":"busybox:1.37","restartPolicy":"Always","command":["tail","-F","/var/log/printer/print.log"],"volumeMounts":[{"name":"logs","mountPath":"/var/log/printer"}]}],
+            "containers":[{"name":"printer","volumeMounts":[{"name":"carriers","mountPath":"/etc/carriers"},{"name":"logs","mountPath":"/var/log/printer"}]}]}}}}'
+          kubectl -n label-printing rollout status deploy/label-printer --timeout=120s
+          sleep 10
+    alternatives:
+      - id: edited-manifest
+        description: Export the Deployment, edit it with yq (read-only map mount, a sizeLimit on the log volume) and apply it.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 150
+            run: |
+              kubectl config use-context qm-depot
+              kubectl -n label-printing get deployment label-printer -o yaml | yq '
+                .spec.template.spec.volumes = [{"name": "carriers", "emptyDir": {}}, {"name": "logs", "emptyDir": {"sizeLimit": "64Mi"}}]
+                | .spec.template.spec.initContainers = [
+                    {"name": "fetch-carriers", "image": "busybox:1.37", "command": ["sh", "-c", "wget -q -O /etc/carriers/map.txt http://carrier-registry/map.txt"],
+                     "volumeMounts": [{"name": "carriers", "mountPath": "/etc/carriers"}]},
+                    {"name": "log-shipper", "image": "busybox:1.37", "restartPolicy": "Always", "command": ["tail", "-F", "/var/log/printer/print.log"],
+                     "volumeMounts": [{"name": "logs", "mountPath": "/var/log/printer", "readOnly": true}]}]
+                | .spec.template.spec.containers[0].volumeMounts = [
+                    {"name": "carriers", "mountPath": "/etc/carriers", "readOnly": true}, {"name": "logs", "mountPath": "/var/log/printer"}]' \
+                | kubectl apply -f -
+              kubectl -n label-printing rollout status deploy/label-printer --timeout=120s
+              sleep 10
