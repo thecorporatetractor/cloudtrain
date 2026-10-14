@@ -167,3 +167,12 @@ describe('request bodies', () => {
     expect(bad.statusCode).toBe(400);
   });
 });
+
+describe('security headers', () => {
+  it('sends nosniff and no-store on API responses', async () => {
+    const { app } = await make();
+    const res = await app.inject({ method: 'GET', url: '/api/health' });
+    expect(res.headers['x-content-type-options']).toBe('nosniff');
+    expect(res.headers['cache-control']).toBe('no-store');
+  });
+});

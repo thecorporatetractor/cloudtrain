@@ -1,0 +1,131 @@
+# OWASP ZAP (automation framework, plans in .zap/). Two targets:
+#  - gateway: services/gateway/test/dast-server.ts, the real API (routes, authz,
+#    Postgres 17 with RLS and the seeded fictional data) with the test fake
+#    cluster; identity = seeded org_admin. A CI test target only: it refuses
+#    NODE_ENV=production, like DevAuthenticator.
+#  - web: apps/web production build in mock mode served by `vite preview`.
+# PRs and main: passive baseline (the plan minus its active-scan block), fails on
+# High alerts. Nightly and manual "full": spider + active scan, report-only.
+# Reports (HTML, JSON, SARIF) are artifacts; SARIF also goes to code scanning.
+name: dast
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: '3 2 * * *'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: baseline (passive) or full (active scan)
+        type: choice
+        options: [full, baseline]
+        default: full
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # ghcr.io/zaproxy/zaproxy:stable (2.17.0), pinned by digest; bump deliberately.
+  ZAP_IMAGE: ghcr.io/zaproxy/zaproxy@sha256:7aaa659b0d43078febd82e29bad112285c370727e86ab8340444220e17d9f0d2
+  MODE: ${{ github.event_name == 'schedule' && 'full' || inputs.mode || 'baseline' }}
+
+jobs:
+  zap:
+    name: zap (${{ matrix.target }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [gateway, web]
+    services:
+      postgres:
+        image: postgres:17.11-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24
+        env:
+          POSTGRES_PASSWORD: postgres-ci-only
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 3s --health-timeout 3s --health-retries 30
+    env:
+      TARGET: ${{ matrix.target }}
+      CT_TEST_DATABASE_URL: postgres://cloudtrain_owner:owner-dev-only@127.0.0.1:5432/cloudtrain
+    steps:
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Pull ZAP
+        run: docker pull -q "$ZAP_IMAGE"
+
+      - name: Start the gateway DAST target
+        if: matrix.target == 'gateway'
+        env:
+          PGPASSWORD: postgres-ci-only
+        run: |
+          psql -h 127.0.0.1 -U postgres -d postgres -v ON_ERROR_STOP=1 -f deploy/dev/postgres/init.sql
+          pnpm --filter @cloudtrain/lab-schema build
+          cd services/gateway
+          nohup pnpm exec tsx test/dast-server.ts > "$RUNNER_TEMP/target.log" 2>&1 &
+          for _ in $(seq 1 60); do curl -fs http://127.0.0.1:8787/api/health >/dev/null && exit 0; sleep 1; done
+          cat "$RUNNER_TEMP/target.log"; exit 1
+      - name: Start the web DAST target (mock mode, vite preview)
+        if: matrix.target == 'web'
+        run: |
+          pnpm --filter web build
+          cd apps/web
+          nohup pnpm exec vite preview --host 127.0.0.1 --port 4173 --strictPort > "$RUNNER_TEMP/target.log" 2>&1 &
+          for _ in $(seq 1 60); do curl -fs http://127.0.0.1:4173/ >/dev/null && exit 0; sleep 1; done
+          cat "$RUNNER_TEMP/target.log"; exit 1
+
+      - name: ZAP (${{ env.MODE }})
+        id: zap
+        run: |
+          work="$GITHUB_WORKSPACE/zap-run" # under the workspace: hashFiles() only sees files there
+          mkdir -p "$work/out" && chmod -R 0777 "$work"
+          if [[ $MODE == full ]]; then cp ".zap/$TARGET.yaml" "$work/plan.yaml"
+          else bash .github/scripts/zap-baseline-plan.sh ".zap/$TARGET.yaml" > "$work/plan.yaml"; fi
+          set +e
+          docker run --rm --network host -v "$work:/zap/wrk:rw" "$ZAP_IMAGE" zap.sh -cmd -autorun /zap/wrk/plan.yaml
+          rc=$?
+          set -e
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          echo "ZAP $MODE scan of $TARGET exited $rc (0 ok, 1 High alerts, 2 plan warnings)"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: zap-${{ matrix.target }}-${{ env.MODE }}
+          path: zap-run/out/
+          retention-days: 30
+      - uses: github/codeql-action/upload-sarif@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+        if: always() && hashFiles(format('zap-run/out/{0}-report.sarif.json', matrix.target)) != ''
+        with:
+          sarif_file: zap-run/out/${{ matrix.target }}-report.sarif.json
+          category: zap-${{ matrix.target }}
+      - name: Gate (baseline fails on High alerts or plan errors; full is report-only)
+        if: always()
+        env:
+          RC: ${{ steps.zap.outputs.rc }}
+        run: |
+          if [[ $RC != 0 ]]; then
+            if [[ $MODE == baseline ]]; then echo "::error::ZAP baseline failed (exit $RC), see the zap-$TARGET artifact"; exit 1; fi
+            echo "::warning::ZAP full scan of $TARGET exited $RC (report-only), see the zap-$TARGET artifact"
+          fi
+      - name: Target log
+        if: failure()
+        run: cat "$RUNNER_TEMP/target.log" || true

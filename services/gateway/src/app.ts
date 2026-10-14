@@ -59,6 +59,11 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   const app = Fastify({ logger: deps.logger ?? false, trustProxy: '127.0.0.1' });
   // Fail at startup, not at request time: every /api route must declare a permission or be public.
   app.addHook('onRoute', requireDeclaredPermission);
+  // Every response is per-user API data or a download: never sniffed, never cached.
+  app.addHook('onSend', async (_req, reply) => {
+    reply.header('x-content-type-options', 'nosniff');
+    if (!reply.hasHeader('cache-control')) reply.header('cache-control', 'no-store');
+  });
   await app.register(cookie);
   await app.register(websocket, { options: { maxPayload: 1 << 20 } });
   app.addContentTypeParser('application/x-www-form-urlencoded', { parseAs: 'string' }, (_req, body, done) => done(null, Object.fromEntries(new URLSearchParams(body as string))));

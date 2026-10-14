@@ -1,0 +1,74 @@
+# ZAP automation plan: apps/web, production build in mock mode (MSW in the
+# browser, no backend) served by `vite preview` on 127.0.0.1:4173. Used by
+# .github/workflows/dast.yml:
+#   PR baseline:  this plan minus the marked active-scan block (passive only;
+#                 fails on High alerts), see .github/scripts/zap-baseline-plan.sh
+#   nightly full: the whole plan (active scan; report-only)
+# vite preview is not the production web server: header alerts (CSP,
+# anti-clickjacking, ...) are reported as guidance for the deployment's server
+# config, not failures. Noise is tuned in the alertFilter job (with reasons).
+env:
+  contexts:
+    - name: web
+      urls: ['http://127.0.0.1:4173/']
+      includePaths: ['http://127.0.0.1:4173.*']
+  parameters:
+    failOnError: true
+    failOnWarning: false
+    progressToStdout: true
+
+jobs:
+  - type: alertFilter
+    alertFilters:
+      # 10049 "Storable and Cacheable Content": hashed static assets are meant to be cached.
+      - ruleId: 10049
+        newRisk: False Positive
+      # 10109 "Modern Web Application": informational hint to use the AJAX spider (we do).
+      - ruleId: 10109
+        newRisk: False Positive
+
+  - type: spider
+    parameters:
+      context: web
+      maxDuration: 2
+  - type: spiderAjax
+    parameters:
+      context: web
+      browserId: firefox-headless
+      maxDuration: 3
+      maxCrawlDepth: 5
+
+  - type: passiveScan-wait
+    parameters:
+      maxDuration: 5
+
+  #>>> active-scan (removed for the PR baseline)
+  - type: activeScan
+    parameters:
+      context: web
+      maxScanDurationInMins: 30
+      maxRuleDurationInMins: 5
+    policyDefinition:
+      defaultStrength: Medium
+      defaultThreshold: Medium
+  #<<< active-scan
+
+  - type: report
+    parameters:
+      template: traditional-html
+      reportDir: /zap/wrk/out
+      reportFile: web-report.html
+  - type: report
+    parameters:
+      template: traditional-json
+      reportDir: /zap/wrk/out
+      reportFile: web-report.json
+  - type: report
+    parameters:
+      template: sarif-json
+      reportDir: /zap/wrk/out
+      reportFile: web-report.sarif.json
+
+  - type: exitStatus
+    parameters:
+      errorLevel: High

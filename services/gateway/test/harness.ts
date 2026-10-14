@@ -52,7 +52,7 @@ export const Q = {
   rhea: 'a1000000-0000-4000-8000-0000000000aa',
 };
 
-export async function harness(opts: { oidc?: FakeOidcProvider } = {}): Promise<Harness> {
+export async function harness(opts: { oidc?: FakeOidcProvider; auth?: (t: TestDb) => Authenticator } = {}): Promise<Harness> {
   const t = await createTestDb();
   const content = await realContent();
   await seed(t.owner, content, await readPeople(defaultPeopleFile(repo)));
@@ -70,7 +70,7 @@ export async function harness(opts: { oidc?: FakeOidcProvider } = {}): Promise<H
   });
   const sessions = new SessionService(content, cluster, new FakeCompiler(), { validateTimeoutMs: 300, pollMs: 10, hooks: ps });
   const hub = new TerminalHub();
-  let auth: Authenticator = new HeaderAuthenticator(t);
+  let auth: Authenticator = opts.auth ? opts.auth(t) : new HeaderAuthenticator(t);
   let oidc: { client: OidcClient; store: SessionStore } | undefined;
   if (opts.oidc) {
     const client = new OidcClient({ issuer: opts.oidc.issuer, clientId: opts.oidc.clientId, clientSecret: opts.oidc.clientSecret, redirectUri: 'http://gw.test/api/auth/callback' });

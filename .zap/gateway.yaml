@@ -1,0 +1,122 @@
+# ZAP automation plan: services/gateway API (test/dast-server.ts: real routes,
+# authz and Postgres/RLS with seeded fictional data; fake cluster). Used by
+# .github/workflows/dast.yml:
+#   PR baseline:  this plan minus the marked active-scan block (passive only;
+#                 fails on High alerts), see .github/scripts/zap-baseline-plan.sh
+#   nightly full: the whole plan (active scan; report-only)
+# Identity: dast-server answers as the seeded org_admin when no x-test-user
+# header is sent. Noise is tuned in the alertFilter job below (one entry per rule,
+# with a reason). Local run (gateway on :8787):
+#   docker run --rm --network host -v "$PWD/.zap:/zap/wrk:rw" \
+#     ghcr.io/zaproxy/zaproxy@sha256:<digest in dast.yml> zap.sh -cmd -autorun /zap/wrk/gateway.yaml
+env:
+  contexts:
+    - name: gateway
+      urls: ['http://127.0.0.1:8787/api']
+      includePaths: ['http://127.0.0.1:8787/api.*']
+  parameters:
+    failOnError: true
+    failOnWarning: false
+    progressToStdout: true
+
+jobs:
+  - type: alertFilter
+    alertFilters:
+      # 10049 "Storable and Cacheable Content" (informational) on JSON GETs that
+      # carry no credentials in the URL; cookies authenticate in production.
+      - ruleId: 10049
+        newRisk: False Positive
+      # 10104 "User Agent Fuzzer": the API does not vary by User-Agent.
+      - ruleId: 10104
+        newRisk: False Positive
+
+  - type: requestor
+    requests:
+      - {url: 'http://127.0.0.1:8787/api/health', method: GET}
+      - {url: 'http://127.0.0.1:8787/api/me', method: GET}
+      - {url: 'http://127.0.0.1:8787/api/home', method: GET}
+      - {url: 'http://127.0.0.1:8787/api/catalog', method: GET}
+      - {url: 'http://127.0.0.1:8787/api/skills', method: GET}
+      - {url: 'http://127.0.0.1:8787/api/labs/affinity-cold-chain', method: GET}
+      - {url: 'http://127.0.0.1:8787/api/labs/affinity-cold-chain/sessions', method: GET}
+      - {url: 'http://127.0.0.1:8787/api/sessions', method: GET}
+      - {url: 'http://127.0.0.1:8787/api/exams', method: GET}
+      - {url: 'http://127.0.0.1:8787/api/exams/sim-k8s-admin', method: GET}
+      - {url: 'http://127.0.0.1:8787/api/exams/attempts/mine', method: GET}
+      - {url: 'http://127.0.0.1:8787/api/exams/team-readiness', method: GET}
+      - {url: 'http://127.0.0.1:8787/api/attempts/mine', method: GET}
+      - {url: 'http://127.0.0.1:8787/api/assignments', method: GET}
+      - {url: 'http://127.0.0.1:8787/api/assignments/mine', method: GET}
+      - {url: 'http://127.0.0.1:8787/api/teams', method: GET}
+      - {url: 'http://127.0.0.1:8787/api/cohorts', method: GET}
+      - {url: 'http://127.0.0.1:8787/api/reports/progress.csv', method: GET}
+      - {url: 'http://127.0.0.1:8787/api/admin/overview', method: GET}
+      - {url: 'http://127.0.0.1:8787/api/admin/users', method: GET}
+      - {url: 'http://127.0.0.1:8787/api/admin/users/a1000000-0000-4000-8000-000000000006', method: GET}
+      - {url: 'http://127.0.0.1:8787/api/admin/teams', method: GET}
+      - {url: 'http://127.0.0.1:8787/api/admin/invitations', method: GET}
+      - {url: 'http://127.0.0.1:8787/api/admin/sso', method: GET}
+      - {url: 'http://127.0.0.1:8787/api/admin/sso/domains', method: GET}
+      - {url: 'http://127.0.0.1:8787/api/admin/settings', method: GET}
+      - {url: 'http://127.0.0.1:8787/api/admin/quotas', method: GET}
+      - {url: 'http://127.0.0.1:8787/api/admin/usage', method: GET}
+      - {url: 'http://127.0.0.1:8787/api/admin/sessions', method: GET}
+      - {url: 'http://127.0.0.1:8787/api/admin/content', method: GET}
+      - {url: 'http://127.0.0.1:8787/api/admin/audit?limit=20', method: GET}
+      - {url: 'http://127.0.0.1:8787/api/admin/audit.csv', method: GET}
+      - {url: 'http://127.0.0.1:8787/api/platform/orgs', method: GET}
+      - {url: 'http://127.0.0.1:8787/api/platform/capacity', method: GET}
+      - {url: 'http://127.0.0.1:8787/api/auth/discover?email=priya.raman%40quillmoor.example', method: GET}
+      - {url: 'http://127.0.0.1:8787/api/auth/invite/not-a-real-token', method: GET}
+      - url: 'http://127.0.0.1:8787/api/admin/teams'
+        method: POST
+        headers: ['Content-Type: application/json']
+        data: '{"name":"DAST probe team"}'
+      - url: 'http://127.0.0.1:8787/api/cohorts'
+        method: POST
+        headers: ['Content-Type: application/json']
+        data: '{"name":"DAST probe cohort"}'
+      - url: 'http://127.0.0.1:8787/api/admin/settings'
+        method: PATCH
+        headers: ['Content-Type: application/json']
+        data: '{"sessionMinutes":90}'
+      - url: 'http://127.0.0.1:8787/api/labs/affinity-cold-chain/sessions'
+        method: POST
+        headers: ['Content-Type: application/json']
+        data: '{}'
+
+  - type: passiveScan-wait
+    parameters:
+      maxDuration: 5
+
+  #>>> active-scan (removed for the PR baseline)
+  - type: activeScan
+    parameters:
+      context: gateway
+      maxScanDurationInMins: 40
+      maxRuleDurationInMins: 5
+    policyDefinition:
+      defaultStrength: Medium
+      defaultThreshold: Medium
+
+  #<<< active-scan
+
+  - type: report
+    parameters:
+      template: traditional-html
+      reportDir: /zap/wrk/out
+      reportFile: gateway-report.html
+  - type: report
+    parameters:
+      template: traditional-json
+      reportDir: /zap/wrk/out
+      reportFile: gateway-report.json
+  - type: report
+    parameters:
+      template: sarif-json
+      reportDir: /zap/wrk/out
+      reportFile: gateway-report.sarif.json
+
+  - type: exitStatus
+    parameters:
+      errorLevel: High
