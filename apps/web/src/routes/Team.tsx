@@ -9,7 +9,7 @@ import { initials } from '@/app/Shell';
 import { useShell } from '@/app/shell-context';
 import { Bar, Columns, HeatCell } from '@/components/charts';
 import { DomainIcon } from '@/components/domain';
-import { AssignmentStateBadge, DueDate, ItemLink, When } from '@/components/platform';
+import { AssignmentStateBadge, DueDate, ItemLink } from '@/components/platform';
 import { Badge, Button, Card, EmptyState, ErrorState, PageSkeleton, Select, Stat, Tooltip } from '@/components/ui';
 import { cn, formatMinutes, pct } from '@/lib/utils';
 import { teamRoute } from '@/router';
@@ -118,7 +118,7 @@ function TeamScreen() {
             <Stat label="Completion" value={pct(d.totals.completionRate)} hint="of assigned work" />
             <Stat label="Overdue" value={d.totals.assignmentsOverdue} tone={d.totals.assignmentsOverdue ? 'warn' : undefined} hint="assignments" />
             <Stat label="At risk" value={d.atRisk.length} tone={d.atRisk.length ? 'warn' : undefined} hint="people × items" />
-            <Stat label="Members" value={d.totals.members} hint={`${d.members.filter((m) => m.role === 'manager').length} managers`} />
+            <Stat label="Members" value={d.totals.members} hint={`${d.members.filter((m) => m.role === 'manager').length} ${d.members.filter((m) => m.role === 'manager').length === 1 ? 'manager' : 'managers'}`} />
           </div>
 
           <Heatmap d={d} />
@@ -301,7 +301,7 @@ function MemberCell({ m, teamId }: { m: DashboardMember; teamId: string }) {
           )}
         </span>
         <span className="xs subtle truncate">
-          {m.user.title} · {Math.round(m.minutesThisMonth / 60)}h · active <When iso={m.lastActiveAt} />
+          {m.user.title} · {Math.round(m.minutesThisMonth / 60)}h this month
         </span>
       </span>
       <ArrowRight size={12} className="subtle member-cell-arrow" />

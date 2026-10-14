@@ -8,7 +8,7 @@ import { RequireAccess } from '@/app/access';
 import { initials } from '@/app/Shell';
 import { useShell } from '@/app/shell-context';
 import { Badge, Button, Checkbox, Dialog, EmptyState, ErrorState, Field, Input, PageSkeleton, Select } from '@/components/ui';
-import { cn, formatDate } from '@/lib/utils';
+import { formatDate } from '@/lib/utils';
 
 export function Cohorts() {
   return (
@@ -56,7 +56,7 @@ function CohortsScreen() {
                     {statusMeta[g].label} <span className="subtle small tnum">{list.length}</span>
                   </h2>
                 </div>
-                <div className={cn(list.length > 1 ? 'grid-2' : '')}>
+                <div className="grid-2">
                   {list.map((c) => (
                     <CohortCard key={c.id} c={c} />
                   ))}
@@ -66,7 +66,7 @@ function CohortsScreen() {
           })}
         </div>
       )}
-      <CreateCohortDialog open={create} onOpenChange={setCreate} />
+      {create && <CreateCohortDialog open={create} onOpenChange={setCreate} />}
     </div>
   );
 }

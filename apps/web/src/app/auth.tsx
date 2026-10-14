@@ -1,3 +1,4 @@
+import { useQueryClient } from '@tanstack/react-query';
 import { useNavigate, useRouterState } from '@tanstack/react-router';
 import { useEffect, useRef, type ReactNode } from 'react';
 import { ApiError, UNAUTHENTICATED_EVENT, useMe } from '@/api/client';
@@ -15,6 +16,7 @@ export const isPublicPath = (pathname: string) => PUBLIC_PATHS.some((p) => pathn
 export function AuthGate({ children }: { children: ReactNode }) {
   const me = useMe();
   const navigate = useNavigate();
+  const qc = useQueryClient();
   const location = useRouterState({ select: (s) => s.location });
   const wasSignedIn = useRef(false);
   const publicPage = isPublicPath(location.pathname);
@@ -27,11 +29,14 @@ export function AuthGate({ children }: { children: ReactNode }) {
     const onExpired = () => {
       if (isPublicPath(window.location.pathname)) return;
       const returnTo = window.location.pathname + window.location.search;
+      // Drop everything cached under the old session, including the principal, so the
+      // sign-in page does not bounce back on stale data.
+      qc.clear();
       void navigate({ to: '/sign-in', search: { returnTo, reason: wasSignedIn.current ? 'expired' : undefined }, replace: true });
     };
     window.addEventListener(UNAUTHENTICATED_EVENT, onExpired);
     return () => window.removeEventListener(UNAUTHENTICATED_EVENT, onExpired);
-  }, [navigate]);
+  }, [navigate, qc]);
 
   if (publicPage) return <>{children}</>;
   if (me.isPending) {

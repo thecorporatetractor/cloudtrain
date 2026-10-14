@@ -106,7 +106,9 @@ function BoardScreen() {
                   <th scope="col" style={{ width: 150 }}>
                     Checks
                   </th>
-                  <th scope="col">On task</th>
+                  <th scope="col" style={{ whiteSpace: 'nowrap' }}>
+                    On task
+                  </th>
                   <th scope="col">Hints</th>
                   <th scope="col">Signal</th>
                   <th scope="col" style={{ width: 120 }}>
@@ -186,7 +188,7 @@ function BoardRow({ r, cohortId, onControl }: { r: CohortBoardRow; cohortId: str
           <span className="subtle xs">—</span>
         )}
       </td>
-      <td className="small tnum">{s ? `${s.minutesOnTask} min` : '—'}</td>
+      <td className="small tnum" style={{ whiteSpace: 'nowrap' }}>{s ? `${s.minutesOnTask} min` : '—'}</td>
       <td className="small tnum">
         {s ? (
           <span className={cn('row', s.hintsUsed >= 3 && 'text-warn')} style={{ gap: 4 }}>

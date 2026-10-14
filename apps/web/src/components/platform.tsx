@@ -31,7 +31,7 @@ export function DueDate({ dueAt, done }: { dueAt: string | null; done?: boolean 
   const late = days < 0 && !done;
   const soon = !late && !done && days <= 3;
   return (
-    <span className={cn('row xs tnum', late ? 'text-warn' : soon ? '' : 'subtle')} style={{ gap: 5 }} title={new Date(dueAt).toLocaleString()}>
+    <span className={cn('row xs tnum', late ? 'text-warn' : soon ? '' : 'subtle')} style={{ gap: 5, whiteSpace: 'nowrap' }} title={new Date(dueAt).toLocaleString()}>
       <CalendarClock size={11} />
       {formatDate(dueAt)}
       <span className={cn(late || soon ? '' : 'subtle')}>· {late ? `${-days}d late` : days === 0 ? 'today' : days === 1 ? 'tomorrow' : `${days}d`}</span>

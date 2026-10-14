@@ -96,10 +96,7 @@ function MemberScreen() {
                 const meta = competencies.find((c) => c.id === cid);
                 return (
                   <HeatCell key={cid} value={v ?? 0} title={`${meta?.name ?? cid} · ${v === null ? 'no evidence' : pct(v)}`}>
-                    <span className="heat-name row" style={{ gap: 4 }}>
-                      {meta && <DomainIcon domain={meta.domain} size={10} />}
-                      {meta ? meta.name : cid}
-                    </span>
+                    <span className="heat-name">{meta ? meta.name : cid}</span>
                     <span className="heat-mu tnum">{v === null ? '—' : Math.round(v * 100)}</span>
                   </HeatCell>
                 );

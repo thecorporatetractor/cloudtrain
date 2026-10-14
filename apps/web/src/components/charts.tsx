@@ -96,6 +96,8 @@ export function Columns({ values, height = 100, format, label }: { values: { lab
   const max = Math.max(1, ...values.map((v) => v.value));
   const w = 100 / Math.max(1, values.length);
   const fmt = format ?? ((v: number) => String(v));
+  // At most ~8 readable labels; the rest stay in the title/tooltip.
+  const step = Math.max(1, Math.ceil(values.length / 8));
   return (
     <figure className="columns" style={{ height }} aria-label={label ?? 'Column chart'}>
       <svg viewBox={`0 0 100 ${height}`} preserveAspectRatio="none" width="100%" height={height - 18} aria-hidden>
@@ -107,7 +109,7 @@ export function Columns({ values, height = 100, format, label }: { values: { lab
       <ul className="columns-labels" style={{ gridTemplateColumns: `repeat(${values.length}, 1fr)` }}>
         {values.map((v, i) => (
           <li key={i} title={`${v.label}: ${fmt(v.value)}`}>
-            <span className="xs subtle tnum">{v.label}</span>
+            {(i % step === 0 || i === values.length - 1) && <span className="xs subtle tnum">{v.label}</span>}
             <span className="sr-only">{fmt(v.value)}</span>
           </li>
         ))}

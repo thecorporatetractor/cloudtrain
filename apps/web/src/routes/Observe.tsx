@@ -1,5 +1,5 @@
 import { Link, useNavigate } from '@tanstack/react-router';
-import { AlertTriangle, ChevronLeft, Eye, Lightbulb, Power, RotateCcw, TimerReset } from 'lucide-react';
+import { AlertTriangle, CheckCircle2, ChevronLeft, Circle, Eye, Lightbulb, Power, RotateCcw, TimerReset } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { useLab } from '@/api/client';
 import { useCohortBoard, useObserveRegistration, useSessionControl } from '@/api/platform';
@@ -172,7 +172,7 @@ function ObserveScreen() {
                 <li key={c.id} className={cn('check', i < s.checksPassed ? 'check-pass' : 'check-fail')}>
                   <div className="check-head" style={{ cursor: 'default' }}>
                     <span className="check-icon" aria-hidden>
-                      {i < s.checksPassed ? '✓' : '·'}
+                      {i < s.checksPassed ? <CheckCircle2 size={11} /> : <Circle size={9} />}
                     </span>
                     <span className="check-desc">{c.description}</span>
                   </div>

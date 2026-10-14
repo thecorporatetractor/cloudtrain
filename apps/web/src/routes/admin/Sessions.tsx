@@ -80,7 +80,7 @@ function Screen() {
                     <td className="small">
                       <When iso={s.startedAt} />
                     </td>
-                    <td className="small tnum">{s.expiresAt ? new Date(s.expiresAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '—'}</td>
+                    <td className="small tnum" style={{ whiteSpace: 'nowrap' }}>{s.expiresAt ? new Date(s.expiresAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '—'}</td>
                     <td>
                       <div className="row" style={{ gap: 8 }}>
                         <Bar value={s.checksTotal ? s.checksPassed / s.checksTotal : 0} thin />

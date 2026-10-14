@@ -114,7 +114,7 @@ function AssignmentsScreen() {
                         </span>
                       </div>
                     </td>
-                    <td className="small">{a.assignedBy.name}</td>
+                    <td className="small" style={{ whiteSpace: 'nowrap' }}>{a.assignedBy.name}</td>
                     <td>
                       <DueDate dueAt={a.dueAt} done={a.status === 'completed'} />
                     </td>

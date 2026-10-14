@@ -41,7 +41,7 @@ import type {
   UpdateUserRequest,
   UserRef,
 } from '@/api/types';
-import { labSummaries, paths } from './fixtures/labs';
+import { labById, labSummaries, paths } from './fixtures/labs';
 import { frameworks } from './fixtures/skills';
 import {
   DEFAULT_PERSONA,
@@ -327,8 +327,11 @@ export const learnerHandlers = [
     const owner = people.find((p) => attemptsFor(p.id).some((a) => a.id === id));
     const a = owner && attemptsFor(owner.id).find((x) => x.id === id);
     if (!a || !owner) return notFound('Attempt');
-    const lab = labSummaries.find((l) => l.id === a.labId);
-    const checks = Array.from({ length: a.checksTotal }, (_, i) => ({ checkId: `check-${i + 1}`, passed: i < a.checksPassed, weight: 1, skills: lab?.skillIds.slice(i % Math.max(1, lab.skillIds.length), (i % Math.max(1, lab.skillIds.length)) + 1) ?? [], run: a.validations, gradedAt: a.endedAt ?? a.startedAt }));
+    const spec = labById.get(a.labId)?.spec.checks ?? [];
+    const checks = Array.from({ length: a.checksTotal }, (_, i) => {
+      const c = spec[i % Math.max(1, spec.length)];
+      return { checkId: c?.id ?? `check-${i + 1}`, passed: i < a.checksPassed, weight: c?.weight ?? 1, skills: c?.skills ?? [], run: a.validations, gradedAt: a.endedAt ?? a.startedAt, message: c?.description };
+    });
     return json({ ...a, user: userRef(owner.id), checks, history: checks });
   }),
 ];

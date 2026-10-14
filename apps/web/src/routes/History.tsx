@@ -165,7 +165,7 @@ function AttemptDrawer({ id, onClose, fallback }: { id: string | undefined; onCl
                   <li key={c.checkId} className={`check ${c.passed ? 'check-pass' : 'check-fail'}`}>
                     <div className="check-head" style={{ cursor: 'default' }}>
                       <span className="check-icon">{c.passed ? <CheckCircle2 size={11} /> : <XCircle size={11} />}</span>
-                      <span className="check-desc grow">{c.checkId}</span>
+                      <span className="check-desc grow">{c.message ?? c.checkId}</span>
                       <span className="xs subtle tnum">weight {c.weight}</span>
                     </div>
                     {c.skills.length > 0 && (

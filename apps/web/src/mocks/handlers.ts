@@ -3,7 +3,7 @@ import type { CheckResult, LabSession, StudioDraft, ValidateResponse, Verificati
 import { domains, labById, labSummaries, paths } from './fixtures/labs';
 import { frameworks, skillStates, skills } from './fixtures/skills';
 import { homeData } from './fixtures/home';
-import { myAssignments, personById, skillStatesOf, userRef } from './fixtures/platform';
+import { myAssignments, personById, skillStatesOf, teamSeedById, userRef } from './fixtures/platform';
 import { drafts as seedDrafts, freshGates, specFromPrompt } from './fixtures/studio';
 import { allPlatformHandlers, currentSession, currentUser, mockNotices } from './platformHandlers';
 
@@ -135,7 +135,7 @@ const coreHandlers = [
     if (!s) return HttpResponse.json({ error: 'Not signed in', code: 'unauthenticated' }, { status: 401 });
     // The recommendations and goal are the sample learner model; the greeting and assignments follow the persona.
     const p = personById.get(s.userId);
-    const learner = p ? { ...homeData.learner, id: p.id, name: p.name, email: p.email, team: p.teams[0] ? p.teams[0].teamId : '' } : homeData.learner;
+    const learner = p ? { ...homeData.learner, id: p.id, name: p.name, email: p.email, team: p.teams[0] ? (teamSeedById(p.teams[0].teamId)?.name ?? '') : '' } : homeData.learner;
     return HttpResponse.json({ ...homeData, learner, assignmentsDue: myAssignments(s.userId).filter((a) => a.status !== 'completed').slice(0, 5), source: 'live' });
   }),
 
