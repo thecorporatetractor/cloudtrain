@@ -11,11 +11,11 @@ metadata:
   version: 1
 spec:
   description: |
-    Context: `qm-dispatch` (`kubectl config use-context qm-dispatch`). Node
-    `dispatch-cp-1` is reachable with `ssh dispatch-cp-1` (`sudo` works).
+    Context: `qm-ledger` (`kubectl config use-context qm-ledger`). Node
+    `ledger-cp-1` is reachable with `ssh ledger-cp-1` (`sudo` works).
 
     The cluster's runtime detector forwards its alerts, one JSON object per
-    line, to `/var/log/qm-runtime/alerts.json` on `dispatch-cp-1`.
+    line, to `/var/log/qm-runtime/alerts.json` on `ledger-cp-1`.
 
     One alert reports a **package management process** launched inside a
     running container in namespace `intake-ops`. Find the Pod that triggered
@@ -34,19 +34,21 @@ spec:
         driver: container
         image: jumphost:1
         access: [shell]
-      - name: qm-dispatch
+      # Canonical sim-k8s-security cluster: every K-tier exam task shares it.
+      - name: qm-ledger
         driver: k8s-cluster
         image: kubeadm:1.37
         access: [ssh]
         cluster:
           mode: kubeadm
           version: "v1.37.1"
-          context: qm-dispatch
+          context: qm-ledger
           nodes:
-            - {name: dispatch-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
-            - {name: dispatch-wk-1, role: worker}
+            - {name: ledger-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: ledger-wk-1, role: worker}
+            - {name: ledger-wk-2, role: worker}
   setup:
-    - on: qm-dispatch
+    - on: qm-ledger
       apply: |
         apiVersion: v1
         kind: Namespace
@@ -95,11 +97,11 @@ spec:
             metadata: {labels: {app: manifest-check, tier: intake}}
             spec:
               containers: [{name: app, image: busybox:1.37, command: ["sleep", "1d"]}]
-    - on: qm-dispatch
+    - on: qm-ledger
       timeoutSec: 180
       run: |
         for d in doc-parser label-sync tariff-lookup manifest-check; do kubectl -n intake-ops rollout status deploy/$d --timeout=150s; done
-    - on: qm-dispatch/dispatch-cp-1
+    - on: qm-ledger/ledger-cp-1
       run: |
         set -e
         export KUBECONFIG=/etc/kubernetes/admin.conf
@@ -129,7 +131,7 @@ spec:
         PY
         chmod 0640 /var/log/qm-runtime/alerts.json
   teardown:
-    - on: qm-dispatch
+    - on: qm-ledger
       run: kubectl delete namespace intake-ops --ignore-not-found --wait=false
   checks:
     - id: target-scaled
@@ -137,12 +139,12 @@ spec:
       type: k8s-query
       skills: [k8s.security.runtime-detection]
       weight: 3
-      query: {cluster: qm-dispatch, resource: deployment, name: "{{target}}", namespace: intake-ops, jsonpath: "{.spec.replicas}"}
+      query: {cluster: qm-ledger, resource: deployment, name: "{{target}}", namespace: intake-ops, jsonpath: "{.spec.replicas}"}
       expect: {match: exact, value: "0"}
     - id: others-untouched
       description: The other three Deployments still have 2 replicas
       type: shell
-      on: qm-dispatch
+      on: qm-ledger
       skills: [k8s.security.runtime-detection]
       command: |
         n=0
@@ -161,8 +163,8 @@ spec:
         on: workstation
         as: learner
         run: |
-          kubectl config use-context qm-dispatch
-          pod=$(ssh dispatch-cp-1 "sudo jq -r 'select(.rule | test(\"Package Management\")) | .output_fields[\"k8s.pod.name\"]' /var/log/qm-runtime/alerts.json")
+          kubectl config use-context qm-ledger
+          pod=$(ssh ledger-cp-1 "sudo jq -r 'select(.rule | test(\"Package Management\")) | .output_fields[\"k8s.pod.name\"]' /var/log/qm-runtime/alerts.json")
           kubectl -n intake-ops delete pod "$pod"
     - id: wrong-alert
       description: Acts on the first alert in the file (a shell in a different Pod).
@@ -172,8 +174,8 @@ spec:
         on: workstation
         as: learner
         run: |
-          kubectl config use-context qm-dispatch
-          pod=$(ssh dispatch-cp-1 "sudo head -n1 /var/log/qm-runtime/alerts.json" | jq -r '.output_fields["k8s.pod.name"]')
+          kubectl config use-context qm-ledger
+          pod=$(ssh ledger-cp-1 "sudo head -n1 /var/log/qm-runtime/alerts.json" | jq -r '.output_fields["k8s.pod.name"]')
           app=$(kubectl -n intake-ops get pod "$pod" -o jsonpath='{.metadata.labels.app}')
           kubectl -n intake-ops scale deploy "$app" --replicas=0
   solution:
@@ -182,8 +184,8 @@ spec:
       - on: workstation
         as: learner
         run: |
-          kubectl config use-context qm-dispatch
-          pod=$(ssh dispatch-cp-1 "sudo jq -r 'select(.rule | test(\"Package Management\")) | .output_fields[\"k8s.pod.name\"]' /var/log/qm-runtime/alerts.json")
+          kubectl config use-context qm-ledger
+          pod=$(ssh ledger-cp-1 "sudo jq -r 'select(.rule | test(\"Package Management\")) | .output_fields[\"k8s.pod.name\"]' /var/log/qm-runtime/alerts.json")
           rs=$(kubectl -n intake-ops get pod "$pod" -o jsonpath='{.metadata.ownerReferences[0].name}')
           deploy=$(kubectl -n intake-ops get rs "$rs" -o jsonpath='{.metadata.ownerReferences[0].name}')
           kubectl -n intake-ops scale deploy "$deploy" --replicas=0
@@ -194,7 +196,7 @@ spec:
           - on: workstation
             as: learner
             run: |
-              kubectl config use-context qm-dispatch
-              pod=$(ssh dispatch-cp-1 'sudo grep -i "package management" /var/log/qm-runtime/alerts.json' | grep -o 'k8s.pod=[^ ]*' | cut -d= -f2)
+              kubectl config use-context qm-ledger
+              pod=$(ssh ledger-cp-1 'sudo grep -i "package management" /var/log/qm-runtime/alerts.json' | grep -o 'k8s.pod=[^ ]*' | cut -d= -f2)
               deploy=$(echo "$pod" | sed -E 's/-[a-z0-9]+-[a-z0-9]+$//')
               kubectl -n intake-ops scale deployment/"$deploy" --replicas=0

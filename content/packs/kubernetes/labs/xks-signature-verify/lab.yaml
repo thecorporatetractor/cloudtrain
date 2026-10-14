@@ -11,16 +11,16 @@ metadata:
   version: 1
 spec:
   description: |
-    Context: `qm-dispatch` (`kubectl config use-context qm-dispatch`). Node
-    `dispatch-cp-1` (`ssh dispatch-cp-1`, `sudo` works) has `cosign` and three
+    Context: `qm-ledger` (`kubectl config use-context qm-ledger`). Node
+    `ledger-cp-1` (`ssh ledger-cp-1`, `sudo` works) has `cosign` and three
     candidate builds of the parcel API as OCI image layouts:
     `/opt/qm-signing/parcel-api-{blue,green,amber}`. Each is also loaded in
-    containerd as `registry.quillmoor.example/parcel/api:<colour>`.
+    containerd on every node as `registry.quillmoor.example/parcel/api:<colour>`.
 
     1. Verify the signature of each build with the release public key
        `/opt/qm-signing/release.pub` (the lab is offline: there is no
        transparency log).
-    2. Create a Deployment `parcel-api` in namespace `intake` (1 replica)
+    2. Create a Deployment `parcel-api` in namespace `intake-release` (1 replica)
        that runs **only the build whose signature verifies**.
   objectives:
     - Verify image signatures with a public key
@@ -32,19 +32,21 @@ spec:
         driver: container
         image: jumphost:1
         access: [shell]
-      # Needs cosign and the signed image layouts on the node (kubeadm:1.37-sec + signing extras).
-      - name: qm-dispatch
+      # Canonical sim-k8s-security cluster: every K-tier exam task shares it.
+      - name: qm-ledger
         driver: k8s-cluster
         image: kubeadm:1.37
         access: [ssh]
         cluster:
           mode: kubeadm
           version: "v1.37.1"
-          context: qm-dispatch
+          context: qm-ledger
           nodes:
-            - {name: dispatch-cp-1, role: control-plane, taints: []}
+            - {name: ledger-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: ledger-wk-1, role: worker}
+            - {name: ledger-wk-2, role: worker}
   setup:
-    - on: qm-dispatch/dispatch-cp-1
+    - on: qm-ledger/ledger-cp-1
       timeoutSec: 300
       run: |
         set -e
@@ -57,27 +59,27 @@ spec:
           cosign verify --key /opt/qm-signing/release.pub --insecure-ignore-tlog --local-image /opt/qm-signing/parcel-api-$c >/dev/null 2>&1 && echo $c
         done > /var/lib/cloudtrain/verified.txt
         [ "$(wc -l < /var/lib/cloudtrain/verified.txt)" = 1 ] || { echo "expected exactly one verifying build" >&2; exit 1; }
-    - on: qm-dispatch
+    - on: qm-ledger
       apply: |
         apiVersion: v1
         kind: Namespace
-        metadata: {name: intake}
+        metadata: {name: intake-release}
   teardown:
-    - on: qm-dispatch
-      run: kubectl delete namespace intake --ignore-not-found --wait=false
+    - on: qm-ledger
+      run: kubectl delete namespace intake-release --ignore-not-found --wait=false
   checks:
     - id: verified-image-deployed
       description: parcel-api runs the build whose signature verifies, and is available
       type: shell
-      on: qm-dispatch/dispatch-cp-1
+      on: qm-ledger/ledger-cp-1
       skills: [k8s.security.image-signing]
       weight: 3
       timeoutSec: 90
       command: |
         export KUBECONFIG=/etc/kubernetes/admin.conf
         want=registry.quillmoor.example/parcel/api:$(cat /var/lib/cloudtrain/verified.txt)
-        kubectl -n intake rollout status deploy/parcel-api --timeout=60s >/dev/null 2>&1 || { echo "not available"; exit 0; }
-        img=$(kubectl -n intake get deploy parcel-api -o jsonpath='{.spec.template.spec.containers[*].image}')
+        kubectl -n intake-release rollout status deploy/parcel-api --timeout=60s >/dev/null 2>&1 || { echo "not available"; exit 0; }
+        img=$(kubectl -n intake-release get deploy parcel-api -o jsonpath='{.spec.template.spec.containers[*].image}')
         [ "$img" = "$want" ] && echo verified-build || echo "runs $img"
       expect: {match: exact, value: verified-build}
   misconceptions:
@@ -89,10 +91,10 @@ spec:
         on: workstation
         as: learner
         run: |
-          kubectl config use-context qm-dispatch
-          good=$(ssh dispatch-cp-1 'for c in blue green amber; do sudo cosign verify --key /opt/qm-signing/release.pub --insecure-ignore-tlog --local-image /opt/qm-signing/parcel-api-$c >/dev/null 2>&1 && echo $c; done')
+          kubectl config use-context qm-ledger
+          good=$(ssh ledger-cp-1 'for c in blue green amber; do sudo cosign verify --key /opt/qm-signing/release.pub --insecure-ignore-tlog --local-image /opt/qm-signing/parcel-api-$c >/dev/null 2>&1 && echo $c; done')
           for c in blue green amber; do [ "$c" != "$good" ] && { bad=$c; break; }; done
-          kubectl -n intake create deployment parcel-api --image=registry.quillmoor.example/parcel/api:$bad
+          kubectl -n intake-release create deployment parcel-api --image=registry.quillmoor.example/parcel/api:$bad
   solution:
     explanation: cosign verify --key with --local-image checks each layout offline; deploy the tag of the one that passes.
     steps:
@@ -100,7 +102,7 @@ spec:
         as: learner
         timeoutSec: 180
         run: |
-          kubectl config use-context qm-dispatch
-          good=$(ssh dispatch-cp-1 'for c in blue green amber; do sudo cosign verify --key /opt/qm-signing/release.pub --insecure-ignore-tlog --local-image /opt/qm-signing/parcel-api-$c >/dev/null 2>&1 && echo $c; done')
-          kubectl -n intake create deployment parcel-api --image=registry.quillmoor.example/parcel/api:$good
-          kubectl -n intake rollout status deploy/parcel-api --timeout=120s
+          kubectl config use-context qm-ledger
+          good=$(ssh ledger-cp-1 'for c in blue green amber; do sudo cosign verify --key /opt/qm-signing/release.pub --insecure-ignore-tlog --local-image /opt/qm-signing/parcel-api-$c >/dev/null 2>&1 && echo $c; done')
+          kubectl -n intake-release create deployment parcel-api --image=registry.quillmoor.example/parcel/api:$good
+          kubectl -n intake-release rollout status deploy/parcel-api --timeout=120s

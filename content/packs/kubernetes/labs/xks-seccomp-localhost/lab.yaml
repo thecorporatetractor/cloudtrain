@@ -11,14 +11,14 @@ metadata:
   version: 1
 spec:
   description: |
-    Context: `qm-fleet` (`kubectl config use-context qm-fleet`).
+    Context: `qm-ledger` (`kubectl config use-context qm-ledger`).
 
     The seccomp profile `label-render.json` has been placed on node
-    `fleet-wk-1` in `/var/lib/kubelet/seccomp/profiles/`. It blocks the
+    `ledger-wk-1` in `/var/lib/kubelet/seccomp/profiles/`. It blocks the
     `chmod` family of system calls.
 
     The Pod `label-render` in namespace `{{ns}}` runs without it. Recreate
-    `label-render` (same name, image and command, still on `fleet-wk-1`) so
+    `label-render` (same name, image and command, still on `ledger-wk-1`) so
     that its container runs with that **Localhost** seccomp profile.
   objectives:
     - Reference a Localhost seccomp profile relative to the kubelet seccomp root
@@ -33,18 +33,21 @@ spec:
         driver: container
         image: jumphost:1
         access: [shell]
-      - name: qm-fleet
+      # Canonical sim-k8s-security cluster: every K-tier exam task shares it.
+      - name: qm-ledger
         driver: k8s-cluster
         image: kubeadm:1.37
+        access: [ssh]
         cluster:
           mode: kubeadm
           version: "v1.37.1"
-          context: qm-fleet
+          context: qm-ledger
           nodes:
-            - {name: fleet-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
-            - {name: fleet-wk-1, role: worker}
+            - {name: ledger-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: ledger-wk-1, role: worker}
+            - {name: ledger-wk-2, role: worker}
   setup:
-    - on: qm-fleet/fleet-wk-1
+    - on: qm-ledger/ledger-wk-1
       run: |
         set -e
         mkdir -p /var/lib/kubelet/seccomp/profiles
@@ -57,7 +60,7 @@ spec:
           ]
         }
         EOF
-    - on: qm-fleet
+    - on: qm-ledger
       apply: |
         apiVersion: v1
         kind: Namespace
@@ -67,22 +70,22 @@ spec:
         kind: Pod
         metadata: {name: label-render, namespace: "{{ns}}", labels: {app: label-render}}
         spec:
-          nodeName: fleet-wk-1
+          nodeName: ledger-wk-1
           containers:
             - name: render
               image: busybox:1.37
               command: ["sh", "-c", "while true; do date > /tmp/last-render; sleep 10; done"]
-    - on: qm-fleet
+    - on: qm-ledger
       timeoutSec: 150
       run: kubectl -n {{ns}} wait pod/label-render --for=condition=Ready --timeout=140s
   teardown:
-    - on: qm-fleet
+    - on: qm-ledger
       run: kubectl delete namespace {{ns}} --ignore-not-found --wait=false
   checks:
     - id: profile-referenced
       description: label-render uses the Localhost profile profiles/label-render.json
       type: shell
-      on: qm-fleet
+      on: qm-ledger
       skills: [k8s.security.seccomp-apparmor]
       weight: 2
       command: |
@@ -90,19 +93,19 @@ spec:
           (.spec.containers[0].securityContext.seccompProfile // .spec.securityContext.seccompProfile // {}) | "\(.type)/\(.localhostProfile)"'
       expect: {match: exact, value: Localhost/profiles/label-render.json}
     - id: running
-      description: label-render is Running on fleet-wk-1 with busybox:1.37
+      description: label-render is Running on ledger-wk-1 with busybox:1.37
       type: shell
-      on: qm-fleet
+      on: qm-ledger
       skills: [k8s.security.seccomp-apparmor]
       timeoutSec: 60
       command: |
         kubectl -n {{ns}} wait pod/label-render --for=condition=Ready --timeout=40s >/dev/null 2>&1
         kubectl -n {{ns}} get pod label-render -o jsonpath='{.status.phase}/{.spec.nodeName}/{.spec.containers[0].image}' 2>/dev/null
-      expect: {match: exact, value: Running/fleet-wk-1/busybox:1.37}
+      expect: {match: exact, value: Running/ledger-wk-1/busybox:1.37}
     - id: chmod-blocked
       description: chmod inside the container is refused by seccomp
       type: shell
-      on: qm-fleet
+      on: qm-ledger
       skills: [k8s.security.seccomp-apparmor]
       weight: 2
       timeoutSec: 30
@@ -119,14 +122,14 @@ spec:
         on: workstation
         as: learner
         run: |
-          kubectl config use-context qm-fleet
+          kubectl config use-context qm-ledger
           kubectl -n {{ns}} delete pod label-render --now
           kubectl apply -f - <<'YAML'
           apiVersion: v1
           kind: Pod
           metadata: {name: label-render, namespace: "{{ns}}"}
           spec:
-            nodeName: fleet-wk-1
+            nodeName: ledger-wk-1
             securityContext:
               seccompProfile: {type: Localhost, localhostProfile: /var/lib/kubelet/seccomp/profiles/label-render.json}
             containers:
@@ -143,14 +146,14 @@ spec:
         on: workstation
         as: learner
         run: |
-          kubectl config use-context qm-fleet
+          kubectl config use-context qm-ledger
           kubectl -n {{ns}} delete pod label-render --now
           kubectl apply -f - <<'YAML'
           apiVersion: v1
           kind: Pod
           metadata: {name: label-render, namespace: "{{ns}}"}
           spec:
-            nodeName: fleet-wk-1
+            nodeName: ledger-wk-1
             securityContext:
               seccompProfile: {type: RuntimeDefault}
             containers:
@@ -165,7 +168,7 @@ spec:
       - on: workstation
         as: learner
         run: |
-          kubectl config use-context qm-fleet
+          kubectl config use-context qm-ledger
           kubectl -n {{ns}} get pod label-render -o json \
             | jq 'del(.status, .metadata.uid, .metadata.resourceVersion, .metadata.creationTimestamp, .metadata.managedFields)
                   | .spec.containers[0].securityContext.seccompProfile = {"type": "Localhost", "localhostProfile": "profiles/label-render.json"}' > /tmp/label-render.json
@@ -178,14 +181,14 @@ spec:
           - on: workstation
             as: learner
             run: |
-              kubectl config use-context qm-fleet
+              kubectl config use-context qm-ledger
               kubectl -n {{ns}} delete pod label-render --now
               kubectl apply -f - <<'YAML'
               apiVersion: v1
               kind: Pod
               metadata: {name: label-render, namespace: "{{ns}}"}
               spec:
-                nodeName: fleet-wk-1
+                nodeName: ledger-wk-1
                 securityContext:
                   seccompProfile:
                     type: Localhost

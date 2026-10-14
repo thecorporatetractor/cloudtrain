@@ -11,10 +11,10 @@ metadata:
   version: 1
 spec:
   description: |
-    Context: `qm-fleet`. Node `fleet-wk-2` is reachable with
-    `ssh fleet-wk-2` (`sudo` works).
+    Context: `qm-ledger`. Node `ledger-wk-2` is reachable with
+    `ssh ledger-wk-2` (`sudo` works).
 
-    Something on `fleet-wk-2` listens on TCP port **{{port}}**, which is not
+    Something on `ledger-wk-2` listens on TCP port **{{port}}**, which is not
     an expected port for a Kubernetes worker. Find the service behind it,
     **stop and disable** it, and **remove the package** that installed it,
     so the port is closed for good. The node must stay `Ready`.
@@ -31,19 +31,21 @@ spec:
         driver: container
         image: jumphost:1
         access: [shell]
-      - name: qm-fleet
+      # Canonical sim-k8s-security cluster: every K-tier exam task shares it.
+      - name: qm-ledger
         driver: k8s-cluster
         image: kubeadm:1.37
         access: [ssh]
         cluster:
           mode: kubeadm
           version: "v1.37.1"
-          context: qm-fleet
+          context: qm-ledger
           nodes:
-            - {name: fleet-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
-            - {name: fleet-wk-2, role: worker}
+            - {name: ledger-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: ledger-wk-1, role: worker}
+            - {name: ledger-wk-2, role: worker}
   setup:
-    - on: qm-fleet/fleet-wk-2
+    - on: qm-ledger/ledger-wk-2
       timeoutSec: 120
       run: |
         set -e
@@ -88,9 +90,9 @@ spec:
         exit 1
   checks:
     - id: port-closed
-      description: Nothing listens on TCP {{port}} on fleet-wk-2
+      description: Nothing listens on TCP {{port}} on ledger-wk-2
       type: shell
-      on: qm-fleet/fleet-wk-2
+      on: qm-ledger/ledger-wk-2
       skills: [linux.security.attack-surface]
       weight: 2
       command: echo "listeners=$(ss -Htln 'sport = :{{port}}' | wc -l)"
@@ -98,18 +100,18 @@ spec:
     - id: package-removed
       description: The package behind the listener is no longer installed
       type: shell
-      on: qm-fleet/fleet-wk-2
+      on: qm-ledger/ledger-wk-2
       skills: [linux.security.attack-surface]
       weight: 2
       command: dpkg-query -W -f='${db:Status-Status}' qm-console-bridge 2>/dev/null | grep -qx installed && echo installed || echo removed
       expect: {match: exact, value: removed}
     - id: node-ready
-      description: fleet-wk-2 is Ready
+      description: ledger-wk-2 is Ready
       type: shell
-      on: qm-fleet
+      on: qm-ledger
       skills: [linux.security.attack-surface]
       timeoutSec: 60
-      command: kubectl wait node/fleet-wk-2 --for=condition=Ready --timeout=40s >/dev/null 2>&1 && echo Ready || echo NotReady
+      command: kubectl wait node/ledger-wk-2 --for=condition=Ready --timeout=40s >/dev/null 2>&1 && echo Ready || echo NotReady
       expect: {match: exact, value: Ready}
   misconceptions:
     - id: killed-process
@@ -120,7 +122,7 @@ spec:
         on: workstation
         as: learner
         run: |
-          ssh fleet-wk-2 'sudo pkill -f qm-console-bridge; sleep 8'
+          ssh ledger-wk-2 'sudo pkill -f qm-console-bridge; sleep 8'
     - id: disabled-only
       description: Stops and disables the unit but keeps the package.
       feedback: The task requires removing the package as well.
@@ -129,14 +131,14 @@ spec:
         on: workstation
         as: learner
         run: |
-          ssh fleet-wk-2 'sudo systemctl disable --now qm-console-bridge.service'
+          ssh ledger-wk-2 'sudo systemctl disable --now qm-console-bridge.service'
   solution:
     explanation: ss -tlnp shows the process; systemctl status names the unit; dpkg -S names the package; removing it stops and disables the unit through its prerm script.
     steps:
       - on: workstation
         as: learner
         run: |
-          ssh fleet-wk-2 'sudo bash -s' <<'EOS'
+          ssh ledger-wk-2 'sudo bash -s' <<'EOS'
           ss -tlnp 'sport = :{{port}}'
           systemctl disable --now qm-console-bridge.service
           dpkg -S /usr/sbin/qm-console-bridge
@@ -149,4 +151,4 @@ spec:
           - on: workstation
             as: learner
             run: |
-              ssh fleet-wk-2 'sudo apt-get remove -y qm-console-bridge'
+              ssh ledger-wk-2 'sudo apt-get remove -y qm-console-bridge'

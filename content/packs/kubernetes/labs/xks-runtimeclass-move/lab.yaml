@@ -11,7 +11,7 @@ metadata:
   version: 1
 spec:
   description: |
-    Context: `qm-customs` (`kubectl config use-context qm-customs`). The
+    Context: `qm-ledger` (`kubectl config use-context qm-ledger`). The
     nodes have gVisor installed; containerd's handler is called `runsc`.
 
     1. Create a RuntimeClass named `sandboxed` for the handler `runsc`.
@@ -26,22 +26,24 @@ spec:
         driver: container
         image: jumphost:1
         access: [shell]
-      # Needs gVisor (runsc) and its containerd handler on the nodes (kubeadm:1.37-sec).
-      - name: qm-customs
+      # Canonical sim-k8s-security cluster: every K-tier exam task shares it.
+      - name: qm-ledger
         driver: k8s-cluster
         image: kubeadm:1.37
+        access: [ssh]
         cluster:
           mode: kubeadm
           version: "v1.37.1"
-          context: qm-customs
+          context: qm-ledger
           nodes:
-            - {name: customs-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
-            - {name: customs-wk-1, role: worker}
+            - {name: ledger-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: ledger-wk-1, role: worker}
+            - {name: ledger-wk-2, role: worker}
   setup:
-    - on: qm-customs/customs-wk-1
+    - on: qm-ledger/ledger-wk-1
       run: |
         command -v runsc >/dev/null || { echo "prerequisite missing: gVisor (runsc) is not installed on the node image (needs kubeadm:1.37-sec)" >&2; exit 1; }
-    - on: qm-customs
+    - on: qm-ledger
       apply: |
         apiVersion: v1
         kind: Namespace
@@ -59,7 +61,7 @@ spec:
               containers:
                 - {name: convert, image: busybox:1.37, command: ["sh", "-c", "while true; do sleep 30; done"]}
   teardown:
-    - on: qm-customs
+    - on: qm-ledger
       run: |
         kubectl delete namespace customs-print --ignore-not-found --wait=false
         kubectl delete runtimeclass sandboxed --ignore-not-found
@@ -68,12 +70,12 @@ spec:
       description: RuntimeClass sandboxed uses handler runsc
       type: k8s-query
       skills: [k8s.security.sandboxing]
-      query: {cluster: qm-customs, resource: runtimeclass, name: sandboxed, jsonpath: "{.handler}"}
+      query: {cluster: qm-ledger, resource: runtimeclass, name: sandboxed, jsonpath: "{.handler}"}
       expect: {match: exact, value: runsc}
     - id: deployment-sandboxed
       description: pdf-convert uses sandboxed and all replicas are available
       type: shell
-      on: qm-customs
+      on: qm-ledger
       skills: [k8s.security.sandboxing]
       weight: 2
       timeoutSec: 90
@@ -84,7 +86,7 @@ spec:
     - id: gvisor-kernel
       description: A pdf-convert Pod runs under gVisor
       type: shell
-      on: qm-customs
+      on: qm-ledger
       skills: [k8s.security.sandboxing]
       timeoutSec: 30
       command: kubectl -n customs-print exec deploy/pdf-convert -- dmesg 2>/dev/null | grep -qi gvisor && echo gvisor || echo "host kernel"
@@ -98,7 +100,7 @@ spec:
         on: workstation
         as: learner
         run: |
-          kubectl config use-context qm-customs
+          kubectl config use-context qm-ledger
           kubectl apply -f - <<'YAML'
           apiVersion: node.k8s.io/v1
           kind: RuntimeClass
@@ -113,7 +115,7 @@ spec:
       - on: workstation
         as: learner
         run: |
-          kubectl config use-context qm-customs
+          kubectl config use-context qm-ledger
           kubectl apply -f - <<'YAML'
           apiVersion: node.k8s.io/v1
           kind: RuntimeClass

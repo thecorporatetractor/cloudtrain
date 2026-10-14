@@ -11,7 +11,7 @@ metadata:
   version: 1
 spec:
   description: |
-    Context: `qm-archive` (`kubectl config use-context qm-archive`).
+    Context: `qm-depot` (`kubectl config use-context qm-depot`).
 
     1. Enforce the **restricted** Pod Security Standard on namespace
        `partner-apps`.
@@ -36,14 +36,15 @@ spec:
         driver: container
         image: jumphost:1
         access: [shell]
-      - name: qm-archive
+      # Canonical sim-k8s-security virtual cluster: every V-tier exam task shares it.
+      - name: qm-depot
         driver: k8s-cluster
         cluster:
           mode: virtual
           version: "v1.37"
-          context: qm-archive
+          context: qm-depot
   setup:
-    - on: qm-archive
+    - on: qm-depot
       apply: |
         apiVersion: v1
         kind: Namespace
@@ -62,11 +63,11 @@ spec:
                 - name: sync
                   image: busybox:1.37
                   command: ["sh", "-c", "while true; do echo syncing partner feeds; sleep 20; done"]
-    - on: qm-archive
+    - on: qm-depot
       timeoutSec: 150
       run: kubectl -n partner-apps rollout status deploy/partner-sync --timeout=140s
   teardown:
-    - on: qm-archive
+    - on: qm-depot
       run: kubectl delete namespace partner-apps --ignore-not-found --wait=false
   checks:
     - id: enforce-label
@@ -74,12 +75,12 @@ spec:
       type: k8s-query
       skills: [k8s.security.pod-security-admission]
       weight: 2
-      query: {cluster: qm-archive, resource: namespace, name: partner-apps, jsonpath: "{.metadata.labels.pod-security\\.kubernetes\\.io/enforce}"}
+      query: {cluster: qm-depot, resource: namespace, name: partner-apps, jsonpath: "{.metadata.labels.pod-security\\.kubernetes\\.io/enforce}"}
       expect: {match: exact, value: restricted}
     - id: noncompliant-rejected
       description: A plain root Pod is rejected in partner-apps
       type: shell
-      on: qm-archive
+      on: qm-depot
       skills: [k8s.security.pod-security-admission]
       command: |
         if out=$(kubectl -n partner-apps run qm-psa-probe --image=busybox:1.37 --restart=Never --dry-run=server -- sleep 1 2>&1); then echo admitted; else
@@ -88,7 +89,7 @@ spec:
     - id: template-compliant
       description: The partner-sync Pod template is admitted under the restricted level
       type: shell
-      on: qm-archive
+      on: qm-depot
       skills: [k8s.security.security-context]
       weight: 2
       command: |
@@ -99,7 +100,7 @@ spec:
     - id: rolled-out
       description: All {{replicas}} partner-sync replicas run the updated template
       type: shell
-      on: qm-archive
+      on: qm-depot
       skills: [k8s.security.security-context]
       weight: 2
       timeoutSec: 60
@@ -112,7 +113,7 @@ spec:
       type: k8s-query
       skills: [k8s.security.security-context]
       weight: 0.5
-      query: {cluster: qm-archive, resource: deployment, name: partner-sync, namespace: partner-apps, jsonpath: "{.spec.template.spec.containers[0].image}"}
+      query: {cluster: qm-depot, resource: deployment, name: partner-sync, namespace: partner-apps, jsonpath: "{.spec.template.spec.containers[0].image}"}
       expect: {match: exact, value: "busybox:1.37"}
   misconceptions:
     - id: warn-not-enforce
@@ -123,7 +124,7 @@ spec:
         on: workstation
         as: learner
         run: |
-          kubectl config use-context qm-archive
+          kubectl config use-context qm-depot
           kubectl label ns partner-apps pod-security.kubernetes.io/warn=restricted
     - id: missing-seccomp
       description: Fixes user and privilege escalation but forgets the seccomp profile and capability drop.
@@ -133,7 +134,7 @@ spec:
         on: workstation
         as: learner
         run: |
-          kubectl config use-context qm-archive
+          kubectl config use-context qm-depot
           kubectl label ns partner-apps pod-security.kubernetes.io/enforce=restricted
           kubectl -n partner-apps patch deploy partner-sync --type=json -p '[{"op":"add","path":"/spec/template/spec/containers/0/securityContext","value":{"runAsNonRoot":true,"runAsUser":{{uid}},"allowPrivilegeEscalation":false}}]'
     - id: label-only
@@ -144,7 +145,7 @@ spec:
         on: workstation
         as: learner
         run: |
-          kubectl config use-context qm-archive
+          kubectl config use-context qm-depot
           kubectl label ns partner-apps pod-security.kubernetes.io/enforce=restricted
   solution:
     explanation: |
@@ -155,7 +156,7 @@ spec:
       - on: workstation
         as: learner
         run: |
-          kubectl config use-context qm-archive
+          kubectl config use-context qm-depot
           kubectl label ns partner-apps pod-security.kubernetes.io/enforce=restricted --overwrite
           kubectl -n partner-apps patch deploy partner-sync --type=json -p '[{"op":"add","path":"/spec/template/spec/containers/0/securityContext","value":{"runAsNonRoot":true,"runAsUser":{{uid}},"allowPrivilegeEscalation":false,"capabilities":{"drop":["ALL"]},"seccompProfile":{"type":"RuntimeDefault"}}}]'
           kubectl -n partner-apps rollout status deploy/partner-sync
@@ -166,7 +167,7 @@ spec:
           - on: workstation
             as: learner
             run: |
-              kubectl config use-context qm-archive
+              kubectl config use-context qm-depot
               kubectl label ns partner-apps pod-security.kubernetes.io/enforce=restricted pod-security.kubernetes.io/enforce-version=latest --overwrite
               kubectl -n partner-apps patch deploy partner-sync --type=json -p '[
                 {"op":"add","path":"/spec/template/spec/securityContext","value":{"runAsNonRoot":true,"runAsUser":{{uid}},"seccompProfile":{"type":"RuntimeDefault"}}},

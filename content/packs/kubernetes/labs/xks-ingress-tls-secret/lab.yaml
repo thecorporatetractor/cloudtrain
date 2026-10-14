@@ -11,7 +11,7 @@ metadata:
   version: 1
 spec:
   description: |
-    Context: `qm-tracking` (`kubectl config use-context qm-tracking`).
+    Context: `qm-ledger` (`kubectl config use-context qm-ledger`).
 
     1. Create a TLS Secret `portal-tls` in namespace `partner-portal` from
        `~/exam/portal.crt` and `~/exam/portal.key`.
@@ -27,19 +27,21 @@ spec:
         driver: container
         image: jumphost:1
         access: [shell]
-      # Needs an Ingress controller (IngressClass nginx) in the kubeadm image.
-      - name: qm-tracking
+      # Canonical sim-k8s-security cluster: every K-tier exam task shares it.
+      - name: qm-ledger
         driver: k8s-cluster
         image: kubeadm:1.37
+        access: [ssh]
         cluster:
           mode: kubeadm
           version: "v1.37.1"
-          context: qm-tracking
+          context: qm-ledger
           nodes:
-            - {name: tracking-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
-            - {name: tracking-wk-1, role: worker}
+            - {name: ledger-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: ledger-wk-1, role: worker}
+            - {name: ledger-wk-2, role: worker}
   setup:
-    - on: qm-tracking
+    - on: qm-ledger
       timeoutSec: 200
       run: |
         for i in $(seq 1 36); do
@@ -56,7 +58,7 @@ spec:
         openssl req -x509 -newkey rsa:2048 -nodes -days 365 -subj "/O=Quillmoor Logistics/CN=portal.quillmoor.example" \
           -addext "subjectAltName=DNS:portal.quillmoor.example" -keyout portal.key -out portal.crt 2>/dev/null
         chown -R learner:learner /home/learner/exam
-    - on: qm-tracking
+    - on: qm-ledger
       apply: |
         apiVersion: v1
         kind: Namespace
@@ -87,19 +89,19 @@ spec:
                 paths:
                   - {path: /, pathType: Prefix, backend: {service: {name: portal, port: {number: 80}}}}
   teardown:
-    - on: qm-tracking
+    - on: qm-ledger
       run: kubectl delete namespace partner-portal --ignore-not-found --wait=false
   checks:
     - id: secret-tls
       description: portal-tls is a kubernetes.io/tls Secret
       type: k8s-query
       skills: [k8s.security.ingress-tls]
-      query: {cluster: qm-tracking, resource: secret, name: portal-tls, namespace: partner-portal, jsonpath: "{.type}"}
+      query: {cluster: qm-ledger, resource: secret, name: portal-tls, namespace: partner-portal, jsonpath: "{.type}"}
       expect: {match: exact, value: kubernetes.io/tls}
     - id: https-cert
       description: HTTPS for portal.quillmoor.example presents the provided certificate
       type: shell
-      on: qm-tracking/tracking-cp-1
+      on: qm-ledger/ledger-cp-1
       skills: [k8s.security.ingress-tls]
       weight: 3
       timeoutSec: 40
@@ -111,7 +113,7 @@ spec:
     - id: http-redirected
       description: Plain HTTP gets a redirect to HTTPS
       type: shell
-      on: qm-tracking/tracking-cp-1
+      on: qm-ledger/ledger-cp-1
       skills: [k8s.security.ingress-tls]
       timeoutSec: 30
       command: |
@@ -128,7 +130,7 @@ spec:
         on: workstation
         as: learner
         run: |
-          kubectl config use-context qm-tracking
+          kubectl config use-context qm-ledger
           kubectl -n default create secret tls portal-tls --cert ~/exam/portal.crt --key ~/exam/portal.key
           kubectl -n partner-portal patch ingress portal --type=merge -p '{"spec":{"tls":[{"hosts":["portal.quillmoor.example"],"secretName":"portal-tls"}]}}'
           sleep 10
@@ -138,7 +140,7 @@ spec:
       - on: workstation
         as: learner
         run: |
-          kubectl config use-context qm-tracking
+          kubectl config use-context qm-ledger
           kubectl -n partner-portal create secret tls portal-tls --cert ~/exam/portal.crt --key ~/exam/portal.key
           kubectl -n partner-portal patch ingress portal --type=merge -p '{"spec":{"tls":[{"hosts":["portal.quillmoor.example"],"secretName":"portal-tls"}]}}'
           sleep 10
@@ -149,7 +151,7 @@ spec:
           - on: workstation
             as: learner
             run: |
-              kubectl config use-context qm-tracking
+              kubectl config use-context qm-ledger
               kubectl apply -f - <<YAML
               apiVersion: v1
               kind: Secret

@@ -11,10 +11,10 @@ metadata:
   version: 1
 spec:
   description: |
-    Context: `qm-fleet` (`kubectl config use-context qm-fleet`). The control
-    plane runs on `fleet-cp-1` (`ssh fleet-cp-1`, `sudo` works).
+    Context: `qm-ledger` (`kubectl config use-context qm-ledger`). The control
+    plane runs on `ledger-cp-1` (`ssh ledger-cp-1`, `sudo` works).
 
-    Enable the **NodeRestriction** admission plugin on the qm-fleet API
+    Enable the **NodeRestriction** admission plugin on the qm-ledger API
     server, so that a kubelet can only modify its own Node object and the
     Pods bound to it. Keep every admission plugin that is already enabled.
   objectives:
@@ -26,19 +26,21 @@ spec:
         driver: container
         image: jumphost:1
         access: [shell]
-      - name: qm-fleet
+      # Canonical sim-k8s-security cluster: every K-tier exam task shares it.
+      - name: qm-ledger
         driver: k8s-cluster
         image: kubeadm:1.37
         access: [ssh]
         cluster:
           mode: kubeadm
           version: "v1.37.1"
-          context: qm-fleet
+          context: qm-ledger
           nodes:
-            - {name: fleet-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
-            - {name: fleet-wk-1, role: worker}
+            - {name: ledger-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: ledger-wk-1, role: worker}
+            - {name: ledger-wk-2, role: worker}
   setup:
-    - on: qm-fleet/fleet-cp-1
+    - on: qm-ledger/ledger-cp-1
       timeoutSec: 400
       run: |
         set -e
@@ -51,20 +53,20 @@ spec:
           sleep 5
         done
         echo "API server did not come back" >&2; exit 1
-    - on: qm-fleet/fleet-wk-1
+    - on: qm-ledger/ledger-wk-1
       timeoutSec: 120
       run: |
         # Baseline: the worker's kubelet credentials can label another node.
         for i in $(seq 1 20); do
-          kubectl --kubeconfig /etc/kubernetes/kubelet.conf label node fleet-cp-1 qm-baseline=1 --overwrite >/dev/null 2>&1 && break
+          kubectl --kubeconfig /etc/kubernetes/kubelet.conf label node ledger-cp-1 qm-baseline=1 --overwrite >/dev/null 2>&1 && break
           sleep 3
         done
-        kubectl --kubeconfig /etc/kubernetes/kubelet.conf label node fleet-cp-1 qm-baseline- >/dev/null
+        kubectl --kubeconfig /etc/kubernetes/kubelet.conf label node ledger-cp-1 qm-baseline- >/dev/null
   checks:
     - id: plugin-enabled
       description: The running kube-apiserver lists NodeRestriction in --enable-admission-plugins and keeps ServiceAccount
       type: shell
-      on: qm-fleet/fleet-cp-1
+      on: qm-ledger/ledger-cp-1
       skills: [k8s.security.api-server-hardening]
       command: |
         v=$(ps -C kube-apiserver -o args= | tr ' ' '\n' | sed -n 's/^--enable-admission-plugins=//p' | tail -n1 | tr ',' '\n')
@@ -74,26 +76,26 @@ spec:
         echo "noderestriction=$n serviceaccount=$s"
       expect: {match: exact, value: noderestriction=1 serviceaccount=1}
     - id: foreign-node-denied
-      description: fleet-wk-1's kubelet credentials can no longer label fleet-cp-1
+      description: ledger-wk-1's kubelet credentials can no longer label ledger-cp-1
       type: shell
-      on: qm-fleet/fleet-wk-1
+      on: qm-ledger/ledger-wk-1
       skills: [k8s.security.api-server-hardening]
       weight: 3
       timeoutSec: 30
       command: |
-        out=$(kubectl --kubeconfig /etc/kubernetes/kubelet.conf label node fleet-cp-1 qm-probe=1 --overwrite 2>&1)
-        case "$out" in *forbidden*|*Forbidden*) echo denied ;; *labeled*) kubectl --kubeconfig /etc/kubernetes/kubelet.conf label node fleet-cp-1 qm-probe- >/dev/null 2>&1; echo allowed ;; *) echo "error: $out" ;; esac
+        out=$(kubectl --kubeconfig /etc/kubernetes/kubelet.conf label node ledger-cp-1 qm-probe=1 --overwrite 2>&1)
+        case "$out" in *forbidden*|*Forbidden*) echo denied ;; *labeled*) kubectl --kubeconfig /etc/kubernetes/kubelet.conf label node ledger-cp-1 qm-probe- >/dev/null 2>&1; echo allowed ;; *) echo "error: $out" ;; esac
       expect: {match: exact, value: denied}
     - id: own-node-allowed
-      description: fleet-wk-1's kubelet can still update its own Node and the node is Ready
+      description: ledger-wk-1's kubelet can still update its own Node and the node is Ready
       type: shell
-      on: qm-fleet/fleet-wk-1
+      on: qm-ledger/ledger-wk-1
       skills: [k8s.security.api-server-hardening]
       timeoutSec: 30
       command: |
-        out=$(kubectl --kubeconfig /etc/kubernetes/kubelet.conf label node fleet-wk-1 qm-probe=1 --overwrite 2>&1)
-        kubectl --kubeconfig /etc/kubernetes/kubelet.conf label node fleet-wk-1 qm-probe- >/dev/null 2>&1
-        r=$(kubectl --kubeconfig /etc/kubernetes/kubelet.conf get node fleet-wk-1 -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)
+        out=$(kubectl --kubeconfig /etc/kubernetes/kubelet.conf label node ledger-wk-1 qm-probe=1 --overwrite 2>&1)
+        kubectl --kubeconfig /etc/kubernetes/kubelet.conf label node ledger-wk-1 qm-probe- >/dev/null 2>&1
+        r=$(kubectl --kubeconfig /etc/kubernetes/kubelet.conf get node ledger-wk-1 -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)
         case "$out" in *labeled*) echo "own=allowed ready=$r" ;; *) echo "own=denied ready=$r" ;; esac
       expect: {match: exact, value: own=allowed ready=True}
   misconceptions:
@@ -106,7 +108,7 @@ spec:
         as: learner
         timeoutSec: 500
         run: |
-          ssh fleet-cp-1 'sudo bash -s' <<'EOS'
+          ssh ledger-cp-1 'sudo bash -s' <<'EOS'
           sed -i 's/^    - --enable-admission-plugins=.*$/    - --enable-admission-plugins=NodeRestriction/' /etc/kubernetes/manifests/kube-apiserver.yaml
           for i in $(seq 1 75); do
             ps -C kube-apiserver -o args= | grep -q 'enable-admission-plugins=NodeRestriction' && curl -sfk https://127.0.0.1:6443/readyz >/dev/null && break
@@ -121,7 +123,7 @@ spec:
         on: workstation
         as: learner
         run: |
-          ssh fleet-cp-1 'sudo bash -s' <<'EOS'
+          ssh ledger-cp-1 'sudo bash -s' <<'EOS'
           cp /etc/kubernetes/manifests/kube-apiserver.yaml /root/kube-apiserver.yaml
           sed -i 's/--enable-admission-plugins=ServiceAccount/--enable-admission-plugins=ServiceAccount,NodeRestriction/' /root/kube-apiserver.yaml
           EOS
@@ -132,7 +134,7 @@ spec:
         as: learner
         timeoutSec: 500
         run: |
-          ssh fleet-cp-1 'sudo bash -s' <<'EOS'
+          ssh ledger-cp-1 'sudo bash -s' <<'EOS'
           sed -i 's/^\(    - --enable-admission-plugins=.*\)$/\1,NodeRestriction/' /etc/kubernetes/manifests/kube-apiserver.yaml
           grep enable-admission-plugins /etc/kubernetes/manifests/kube-apiserver.yaml
           for i in $(seq 1 75); do
@@ -148,7 +150,7 @@ spec:
             as: learner
             timeoutSec: 500
             run: |
-              ssh fleet-cp-1 'sudo bash -s' <<'EOS'
+              ssh ledger-cp-1 'sudo bash -s' <<'EOS'
               sed -i 's/--enable-admission-plugins=/--enable-admission-plugins=NodeRestriction,/' /etc/kubernetes/manifests/kube-apiserver.yaml
               for i in $(seq 1 75); do
                 ps -C kube-apiserver -o args= | grep -q 'NodeRestriction' && curl -sfk https://127.0.0.1:6443/readyz >/dev/null && break

@@ -11,11 +11,11 @@ metadata:
   version: 1
 spec:
   description: |
-    Context: `qm-dispatch` (`kubectl config use-context qm-dispatch`). Node
-    `dispatch-cp-1` has Trivy with an offline database (`ssh dispatch-cp-1`,
+    Context: `qm-ledger` (`kubectl config use-context qm-ledger`). Node
+    `ledger-cp-1` has Trivy with an offline database (`ssh ledger-cp-1`,
     `sudo` works) and all images used in the cluster.
 
-    Scan the images of the four Deployments in namespace `intake`. Scale
+    Scan the images of the four Deployments in namespace `intake-scan`. Scale
     every Deployment whose image has at least one **CRITICAL**
     vulnerability to **0** replicas. Leave the others unchanged.
   objectives:
@@ -27,27 +27,29 @@ spec:
         driver: container
         image: jumphost:1
         access: [shell]
-      # Needs Trivy with an offline DB on the node (kubeadm:1.37-sec).
-      - name: qm-dispatch
+      # Canonical sim-k8s-security cluster: every K-tier exam task shares it.
+      - name: qm-ledger
         driver: k8s-cluster
         image: kubeadm:1.37
         access: [ssh]
         cluster:
           mode: kubeadm
           version: "v1.37.1"
-          context: qm-dispatch
+          context: qm-ledger
           nodes:
-            - {name: dispatch-cp-1, role: control-plane, taints: []}
+            - {name: ledger-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: ledger-wk-1, role: worker}
+            - {name: ledger-wk-2, role: worker}
   setup:
-    - on: qm-dispatch
+    - on: qm-ledger
       apply: |
         apiVersion: v1
         kind: Namespace
-        metadata: {name: intake}
+        metadata: {name: intake-scan}
         ---
         apiVersion: apps/v1
         kind: Deployment
-        metadata: {name: intake-cache, namespace: intake}
+        metadata: {name: intake-cache, namespace: intake-scan}
         spec:
           replicas: 1
           selector: {matchLabels: {app: intake-cache}}
@@ -58,7 +60,7 @@ spec:
         ---
         apiVersion: apps/v1
         kind: Deployment
-        metadata: {name: intake-web, namespace: intake}
+        metadata: {name: intake-web, namespace: intake-scan}
         spec:
           replicas: 1
           selector: {matchLabels: {app: intake-web}}
@@ -69,7 +71,7 @@ spec:
         ---
         apiVersion: apps/v1
         kind: Deployment
-        metadata: {name: intake-proxy, namespace: intake}
+        metadata: {name: intake-proxy, namespace: intake-scan}
         spec:
           replicas: 1
           selector: {matchLabels: {app: intake-proxy}}
@@ -80,7 +82,7 @@ spec:
         ---
         apiVersion: apps/v1
         kind: Deployment
-        metadata: {name: intake-tools, namespace: intake}
+        metadata: {name: intake-tools, namespace: intake-scan}
         spec:
           replicas: 1
           selector: {matchLabels: {app: intake-tools}}
@@ -89,7 +91,7 @@ spec:
             spec:
               containers: [{name: c, image: "busybox:1.37", command: ["sleep", "1d"]}]
     # Ground truth from the same offline database the learner uses (root-only).
-    - on: qm-dispatch/dispatch-cp-1
+    - on: qm-ledger/ledger-cp-1
       timeoutSec: 600
       run: |
         set -e
@@ -104,13 +106,13 @@ spec:
         c=$(wc -l < /var/lib/cloudtrain/critical.txt)
         [ "$c" -ge 1 ] && [ "$c" -le 3 ] || { echo "offline DB gives $c of 4 images with CRITICAL findings; the task needs a mix" >&2; exit 1; }
   teardown:
-    - on: qm-dispatch
-      run: kubectl delete namespace intake --ignore-not-found --wait=false
+    - on: qm-ledger
+      run: kubectl delete namespace intake-scan --ignore-not-found --wait=false
   checks:
     - id: replicas
       description: Exactly the Deployments with CRITICAL findings are scaled to 0; the rest keep 1 replica
       type: shell
-      on: qm-dispatch/dispatch-cp-1
+      on: qm-ledger/ledger-cp-1
       skills: [k8s.security.supply-chain]
       weight: 3
       command: |
@@ -118,7 +120,7 @@ spec:
         bad=0
         for d in intake-cache intake-web intake-proxy intake-tools; do
           want=1; grep -qx "$d" /var/lib/cloudtrain/critical.txt && want=0
-          [ "$(kubectl -n intake get deploy $d -o jsonpath='{.spec.replicas}' 2>/dev/null)" = "$want" ] || bad=$((bad+1))
+          [ "$(kubectl -n intake-scan get deploy $d -o jsonpath='{.spec.replicas}' 2>/dev/null)" = "$want" ] || bad=$((bad+1))
         done
         echo "wrong=$bad"
       expect: {match: exact, value: wrong=0}
@@ -132,8 +134,8 @@ spec:
         as: learner
         timeoutSec: 600
         run: |
-          kubectl config use-context qm-dispatch
-          for d in intake-cache intake-web intake-proxy intake-tools; do kubectl -n intake scale deploy $d --replicas=0; done
+          kubectl config use-context qm-ledger
+          for d in intake-cache intake-web intake-proxy intake-tools; do kubectl -n intake-scan scale deploy $d --replicas=0; done
   solution:
     explanation: Scan each image with --severity CRITICAL and scale the Deployments whose scan returns findings.
     steps:
@@ -141,11 +143,11 @@ spec:
         as: learner
         timeoutSec: 600
         run: |
-          kubectl config use-context qm-dispatch
-          for d in $(kubectl -n intake get deploy -o jsonpath='{range .items[*]}{.metadata.name}={.spec.template.spec.containers[0].image}{"\n"}{end}'); do
+          kubectl config use-context qm-ledger
+          for d in $(kubectl -n intake-scan get deploy -o jsonpath='{range .items[*]}{.metadata.name}={.spec.template.spec.containers[0].image}{"\n"}{end}'); do
             name=${d%%=*}; img=${d#*=}
             case "$img" in */*) ;; *) img=docker.io/library/$img ;; esac
-            n=$(ssh dispatch-cp-1 "sudo trivy image --image-src containerd --offline-scan --skip-db-update --severity CRITICAL --format json $img 2>/dev/null" | jq '[.Results[]?.Vulnerabilities[]?] | length')
+            n=$(ssh ledger-cp-1 "sudo trivy image --image-src containerd --offline-scan --skip-db-update --severity CRITICAL --format json $img 2>/dev/null" | jq '[.Results[]?.Vulnerabilities[]?] | length')
             echo "$name $img critical=$n"
-            [ "$n" -gt 0 ] && kubectl -n intake scale deploy "$name" --replicas=0
+            [ "$n" -gt 0 ] && kubectl -n intake-scan scale deploy "$name" --replicas=0
           done

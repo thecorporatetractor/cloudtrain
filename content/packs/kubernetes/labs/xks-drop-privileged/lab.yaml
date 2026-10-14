@@ -11,7 +11,7 @@ metadata:
   version: 1
 spec:
   description: |
-    Context: `qm-archive` (`kubectl config use-context qm-archive`).
+    Context: `qm-depot` (`kubectl config use-context qm-depot`).
 
     The Deployment `log-collector` in namespace `fleet-logging` runs a
     privileged container and mounts a directory of the node.
@@ -29,14 +29,15 @@ spec:
         driver: container
         image: jumphost:1
         access: [shell]
-      - name: qm-archive
+      # Canonical sim-k8s-security virtual cluster: every V-tier exam task shares it.
+      - name: qm-depot
         driver: k8s-cluster
         cluster:
           mode: virtual
           version: "v1.37"
-          context: qm-archive
+          context: qm-depot
   setup:
-    - on: qm-archive
+    - on: qm-depot
       apply: |
         apiVersion: v1
         kind: Namespace
@@ -71,17 +72,17 @@ spec:
                   volumeMounts:
                     - {name: app-logs, mountPath: /logs}
                     - {name: node-scratch, mountPath: /node}
-    - on: qm-archive
+    - on: qm-depot
       timeoutSec: 150
       run: kubectl -n fleet-logging rollout status deploy/log-collector --timeout=140s
   teardown:
-    - on: qm-archive
+    - on: qm-depot
       run: kubectl delete namespace fleet-logging --ignore-not-found --wait=false
   checks:
     - id: not-privileged
       description: No container in the log-collector Pod template is privileged
       type: shell
-      on: qm-archive
+      on: qm-depot
       skills: [k8s.security.security-context]
       weight: 2
       command: |
@@ -90,7 +91,7 @@ spec:
     - id: no-hostpath
       description: The Pod template has no hostPath volume
       type: shell
-      on: qm-archive
+      on: qm-depot
       skills: [k8s.security.security-context]
       weight: 2
       command: |
@@ -99,7 +100,7 @@ spec:
     - id: emptydir-kept
       description: The collector still mounts the app-logs emptyDir
       type: shell
-      on: qm-archive
+      on: qm-depot
       skills: [k8s.security.security-context]
       command: |
         kubectl -n fleet-logging get deploy log-collector -o json | jq -r '
@@ -110,7 +111,7 @@ spec:
     - id: collector-ready
       description: The rolled-out log-collector Pods are Ready
       type: shell
-      on: qm-archive
+      on: qm-depot
       skills: [k8s.security.security-context]
       timeoutSec: 60
       command: |
@@ -125,7 +126,7 @@ spec:
         on: workstation
         as: learner
         run: |
-          kubectl config use-context qm-archive
+          kubectl config use-context qm-depot
           kubectl -n fleet-logging patch deploy log-collector --type=json -p '[{"op":"replace","path":"/spec/template/spec/containers/1/securityContext/privileged","value":false}]'
     - id: removed-all-volumes
       description: Deletes every volume, including the emptyDir the collector reads.
@@ -135,7 +136,7 @@ spec:
         on: workstation
         as: learner
         run: |
-          kubectl config use-context qm-archive
+          kubectl config use-context qm-depot
           kubectl -n fleet-logging patch deploy log-collector --type=json -p '[
             {"op":"remove","path":"/spec/template/spec/volumes"},
             {"op":"remove","path":"/spec/template/spec/containers/0/volumeMounts"},
@@ -149,7 +150,7 @@ spec:
         on: workstation
         as: learner
         run: |
-          kubectl config use-context qm-archive
+          kubectl config use-context qm-depot
           kubectl -n fleet-logging patch deploy log-collector --type=json -p '[
             {"op":"remove","path":"/spec/template/spec/volumes/1"},
             {"op":"remove","path":"/spec/template/spec/containers/1/volumeMounts/1"}]'
@@ -159,7 +160,7 @@ spec:
       - on: workstation
         as: learner
         run: |
-          kubectl config use-context qm-archive
+          kubectl config use-context qm-depot
           kubectl -n fleet-logging patch deploy log-collector --type=json -p '[
             {"op":"remove","path":"/spec/template/spec/volumes/1"},
             {"op":"remove","path":"/spec/template/spec/containers/1/volumeMounts/1"},
@@ -172,7 +173,7 @@ spec:
           - on: workstation
             as: learner
             run: |
-              kubectl config use-context qm-archive
+              kubectl config use-context qm-depot
               kubectl -n fleet-logging get deploy log-collector -o json \
                 | jq '.spec.template.spec.volumes |= map(select(.hostPath == null))
                       | .spec.template.spec.containers |= map(.volumeMounts |= map(select(.name != "node-scratch")) | .securityContext = {"privileged": false, "allowPrivilegeEscalation": false})' \

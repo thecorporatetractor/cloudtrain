@@ -11,7 +11,7 @@ metadata:
   version: 1
 spec:
   description: |
-    Context: `qm-archive` (`kubectl config use-context qm-archive`).
+    Context: `qm-depot` (`kubectl config use-context qm-depot`).
 
     In namespace `{{ns}}`, the Role `report-builder` grants far more than the
     report job needs. Change the Role so that it grants **exactly** the verbs
@@ -32,14 +32,15 @@ spec:
         driver: container
         image: jumphost:1
         access: [shell]
-      - name: qm-archive
+      # Canonical sim-k8s-security virtual cluster: every V-tier exam task shares it.
+      - name: qm-depot
         driver: k8s-cluster
         cluster:
           mode: virtual
           version: "v1.37"
-          context: qm-archive
+          context: qm-depot
   setup:
-    - on: qm-archive
+    - on: qm-depot
       apply: |
         apiVersion: v1
         kind: Namespace
@@ -70,13 +71,13 @@ spec:
         subjects:
           - {kind: ServiceAccount, name: report-builder, namespace: "{{ns}}"}
   teardown:
-    - on: qm-archive
+    - on: qm-depot
       run: kubectl delete namespace {{ns}} --ignore-not-found --wait=false
   checks:
     - id: rule-set
       description: The Role grants exactly get and list on pods and configmaps in the core group
       type: shell
-      on: qm-archive
+      on: qm-depot
       skills: [k8s.security.rbac-least-privilege]
       weight: 3
       command: |
@@ -87,25 +88,25 @@ spec:
       description: report-builder can still list Pods in {{ns}}
       type: k8s-can-i
       skills: [k8s.security.rbac-least-privilege]
-      query: {cluster: qm-archive, verb: list, resource: pods, namespace: "{{ns}}", as: "system:serviceaccount:{{ns}}:report-builder"}
+      query: {cluster: qm-depot, verb: list, resource: pods, namespace: "{{ns}}", as: "system:serviceaccount:{{ns}}:report-builder"}
       expect: {match: exact, value: "yes"}
     - id: sa-can-get-configmaps
       description: report-builder can still get ConfigMaps in {{ns}}
       type: k8s-can-i
       skills: [k8s.security.rbac-least-privilege]
-      query: {cluster: qm-archive, verb: get, resource: configmaps, namespace: "{{ns}}", as: "system:serviceaccount:{{ns}}:report-builder"}
+      query: {cluster: qm-depot, verb: get, resource: configmaps, namespace: "{{ns}}", as: "system:serviceaccount:{{ns}}:report-builder"}
       expect: {match: exact, value: "yes"}
     - id: sa-no-secrets
       description: report-builder can no longer read Secrets
       type: k8s-can-i
       skills: [k8s.security.rbac-least-privilege]
-      query: {cluster: qm-archive, verb: get, resource: secrets, namespace: "{{ns}}", as: "system:serviceaccount:{{ns}}:report-builder"}
+      query: {cluster: qm-depot, verb: get, resource: secrets, namespace: "{{ns}}", as: "system:serviceaccount:{{ns}}:report-builder"}
       expect: {match: exact, value: "no"}
     - id: sa-no-exec
       description: report-builder can no longer exec into Pods
       type: k8s-can-i
       skills: [k8s.security.rbac-least-privilege]
-      query: {cluster: qm-archive, verb: create, resource: pods/exec, namespace: "{{ns}}", as: "system:serviceaccount:{{ns}}:report-builder"}
+      query: {cluster: qm-depot, verb: create, resource: pods/exec, namespace: "{{ns}}", as: "system:serviceaccount:{{ns}}:report-builder"}
       expect: {match: exact, value: "no"}
   misconceptions:
     - id: kept-watch
@@ -116,7 +117,7 @@ spec:
         on: workstation
         as: learner
         run: |
-          kubectl config use-context qm-archive
+          kubectl config use-context qm-depot
           kubectl -n {{ns}} apply -f - <<'YAML'
           apiVersion: rbac.authorization.k8s.io/v1
           kind: Role
@@ -134,7 +135,7 @@ spec:
         on: workstation
         as: learner
         run: |
-          kubectl config use-context qm-archive
+          kubectl config use-context qm-depot
           kubectl -n {{ns}} create role report-builder-v2 --verb=get,list --resource=pods,configmaps
     - id: recreated-under-new-name
       description: Deletes the Role and recreates it under a different name.
@@ -144,7 +145,7 @@ spec:
         on: workstation
         as: learner
         run: |
-          kubectl config use-context qm-archive
+          kubectl config use-context qm-depot
           kubectl -n {{ns}} delete role report-builder
           kubectl -n {{ns}} create role report-reader --verb=get,list --resource=pods,configmaps
   solution:
@@ -153,7 +154,7 @@ spec:
       - on: workstation
         as: learner
         run: |
-          kubectl config use-context qm-archive
+          kubectl config use-context qm-depot
           kubectl -n {{ns}} create role report-builder --verb=get,list --resource=pods,configmaps --dry-run=client -o yaml | kubectl replace -f -
     alternatives:
       - id: json-patch
@@ -162,5 +163,5 @@ spec:
           - on: workstation
             as: learner
             run: |
-              kubectl config use-context qm-archive
+              kubectl config use-context qm-depot
               kubectl -n {{ns}} patch role report-builder --type=json -p '[{"op":"replace","path":"/rules","value":[{"apiGroups":[""],"resources":["pods","configmaps"],"verbs":["get","list"]}]}]'

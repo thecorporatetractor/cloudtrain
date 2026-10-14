@@ -11,11 +11,11 @@ metadata:
   version: 1
 spec:
   description: |
-    Context: `qm-fleet`. Node `fleet-wk-1` is reachable with `ssh fleet-wk-1`
+    Context: `qm-ledger`. Node `ledger-wk-1` is reachable with `ssh ledger-wk-1`
     (`sudo` works). Falco runs there as a systemd service.
 
     The rule **`Fleet secret file read`** in
-    `/etc/falco/rules.d/qm-fleet.yaml` alerts when a container reads
+    `/etc/falco/rules.d/qm-ledger.yaml` alerts when a container reads
     `/etc/shadow`, but its output lacks context.
 
     1. Change the rule's output so that every alert also contains the
@@ -32,25 +32,26 @@ spec:
         driver: container
         image: jumphost:1
         access: [shell]
-      # Needs Falco on the nodes (kubeadm:1.37-sec).
-      - name: qm-fleet
+      # Canonical sim-k8s-security cluster: every K-tier exam task shares it.
+      - name: qm-ledger
         driver: k8s-cluster
         image: kubeadm:1.37
         access: [ssh]
         cluster:
           mode: kubeadm
           version: "v1.37.1"
-          context: qm-fleet
+          context: qm-ledger
           nodes:
-            - {name: fleet-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
-            - {name: fleet-wk-1, role: worker}
+            - {name: ledger-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: ledger-wk-1, role: worker}
+            - {name: ledger-wk-2, role: worker}
   setup:
-    - on: qm-fleet/fleet-wk-1
+    - on: qm-ledger/ledger-wk-1
       timeoutSec: 120
       run: |
         command -v falco >/dev/null || { echo "prerequisite missing: Falco is not installed on the node image (needs kubeadm:1.37-sec)" >&2; exit 1; }
         mkdir -p /etc/falco/rules.d
-        cat > /etc/falco/rules.d/qm-fleet.yaml <<'EOF'
+        cat > /etc/falco/rules.d/qm-ledger.yaml <<'EOF'
         - rule: Fleet secret file read
           desc: A container in the fleet namespaces read /etc/shadow
           condition: open_read and container and fd.name = /etc/shadow and k8s.ns.name startswith "fleet-"
@@ -58,7 +59,7 @@ spec:
           priority: WARNING
         EOF
         systemctl restart $(systemctl list-units --type=service 'falco*' --no-legend | awk '{print $1}' | head -n1)
-    - on: qm-fleet
+    - on: qm-ledger
       apply: |
         apiVersion: v1
         kind: Namespace
@@ -68,7 +69,7 @@ spec:
         kind: Pod
         metadata: {name: tacho-collector, namespace: fleet-tacho}
         spec:
-          nodeName: fleet-wk-1
+          nodeName: ledger-wk-1
           containers:
             - name: collector
               image: busybox:1.37
@@ -76,13 +77,13 @@ spec:
     - on: workstation
       run: mkdir -p /home/learner/exam && chown learner:learner /home/learner/exam
   teardown:
-    - on: qm-fleet
+    - on: qm-ledger
       run: kubectl delete namespace fleet-tacho --ignore-not-found --wait=false
   checks:
     - id: rule-output-fields
       description: The loaded rule's output contains %container.name and %user.name
       type: shell
-      on: qm-fleet/fleet-wk-1
+      on: qm-ledger/ledger-wk-1
       skills: [k8s.security.runtime-detection]
       weight: 2
       timeoutSec: 60
@@ -109,8 +110,8 @@ spec:
         on: workstation
         as: learner
         run: |
-          ssh fleet-wk-1 'sudo sed -i "s/(file=%fd.name pod=%k8s.pod.name)/(file=%fd.name pod=%k8s.pod.name container=%container.name user=%user.name)/" /etc/falco/rules.d/qm-fleet.yaml'
-          ssh fleet-wk-1 'sudo journalctl -u "falco*" --no-pager -o cat | grep "Fleet secret file read" | tail -n1' > ~/exam/fleet-alert.txt
+          ssh ledger-wk-1 'sudo sed -i "s/(file=%fd.name pod=%k8s.pod.name)/(file=%fd.name pod=%k8s.pod.name container=%container.name user=%user.name)/" /etc/falco/rules.d/qm-ledger.yaml'
+          ssh ledger-wk-1 'sudo journalctl -u "falco*" --no-pager -o cat | grep "Fleet secret file read" | tail -n1' > ~/exam/fleet-alert.txt
   solution:
     explanation: Add container=%container.name and user=%user.name to the output, restart Falco, wait for the next alert and save it.
     steps:
@@ -118,10 +119,10 @@ spec:
         as: learner
         timeoutSec: 180
         run: |
-          ssh fleet-wk-1 'sudo bash -s' <<'EOS'
-          sed -i "s/(file=%fd.name pod=%k8s.pod.name)/(file=%fd.name pod=%k8s.pod.name container=%container.name user=%user.name)/" /etc/falco/rules.d/qm-fleet.yaml
+          ssh ledger-wk-1 'sudo bash -s' <<'EOS'
+          sed -i "s/(file=%fd.name pod=%k8s.pod.name)/(file=%fd.name pod=%k8s.pod.name container=%container.name user=%user.name)/" /etc/falco/rules.d/qm-ledger.yaml
           systemctl restart $(systemctl list-units --type=service 'falco*' --no-legend | awk '{print $1}' | head -n1)
           sleep 30
           EOS
-          ssh fleet-wk-1 'sudo journalctl -u "falco*" --since -20s --no-pager -o cat | grep "Fleet secret file read" | tail -n1' > ~/exam/fleet-alert.txt
+          ssh ledger-wk-1 'sudo journalctl -u "falco*" --since -20s --no-pager -o cat | grep "Fleet secret file read" | tail -n1' > ~/exam/fleet-alert.txt
           cat ~/exam/fleet-alert.txt

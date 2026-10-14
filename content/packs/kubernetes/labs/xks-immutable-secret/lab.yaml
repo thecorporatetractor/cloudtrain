@@ -11,7 +11,7 @@ metadata:
   version: 1
 spec:
   description: |
-    Context: `qm-dispatch` (`kubectl config use-context qm-dispatch`).
+    Context: `qm-depot` (`kubectl config use-context qm-depot`).
 
     In namespace `waybill-signing`:
 
@@ -34,14 +34,15 @@ spec:
         driver: container
         image: jumphost:1
         access: [shell]
-      - name: qm-dispatch
+      # Canonical sim-k8s-security virtual cluster: every V-tier exam task shares it.
+      - name: qm-depot
         driver: k8s-cluster
         cluster:
           mode: virtual
           version: "v1.37"
-          context: qm-dispatch
+          context: qm-depot
   setup:
-    - on: qm-dispatch
+    - on: qm-depot
       apply: |
         apiVersion: v1
         kind: Namespace
@@ -63,24 +64,24 @@ spec:
         spec:
           containers:
             - {name: signer, image: busybox:1.37, command: ["sh", "-c", "while true; do sleep 30; done"]}
-    - on: qm-dispatch
+    - on: qm-depot
       timeoutSec: 120
       run: |
         kubectl -n waybill-signing wait pod/signer --for=condition=Ready --timeout=100s
   teardown:
-    - on: qm-dispatch
+    - on: qm-depot
       run: kubectl delete namespace waybill-signing --ignore-not-found --wait=false
   checks:
     - id: secret-immutable
       description: Secret signing-key is immutable
       type: k8s-query
       skills: [k8s.security.secrets]
-      query: {cluster: qm-dispatch, resource: secret, name: signing-key, namespace: waybill-signing, jsonpath: "{.immutable}"}
+      query: {cluster: qm-depot, resource: secret, name: signing-key, namespace: waybill-signing, jsonpath: "{.immutable}"}
       expect: {match: exact, value: "true"}
     - id: secret-data-unchanged
       description: The Secret still holds key-id {{keyid}} and the same key.pem
       type: shell
-      on: qm-dispatch
+      on: qm-depot
       skills: [k8s.security.secrets]
       command: |
         id=$(kubectl -n waybill-signing get secret signing-key -o jsonpath='{.data.key-id}' | base64 -d)
@@ -91,7 +92,7 @@ spec:
     - id: pod-running
       description: Pod signer is Running with image busybox:1.37
       type: shell
-      on: qm-dispatch
+      on: qm-depot
       skills: [k8s.security.secrets]
       timeoutSec: 60
       command: |
@@ -101,7 +102,7 @@ spec:
     - id: mount-readonly
       description: signing-key is mounted read-only at /run/signing
       type: shell
-      on: qm-dispatch
+      on: qm-depot
       skills: [k8s.security.secrets]
       weight: 2
       command: |
@@ -114,7 +115,7 @@ spec:
     - id: key-visible
       description: The key file is readable inside the Pod at /run/signing/key-id
       type: shell
-      on: qm-dispatch
+      on: qm-depot
       skills: [k8s.security.secrets]
       timeoutSec: 30
       command: kubectl -n waybill-signing exec signer -- cat /run/signing/key-id 2>/dev/null || echo missing
@@ -128,7 +129,7 @@ spec:
         on: workstation
         as: learner
         run: |
-          kubectl config use-context qm-dispatch
+          kubectl config use-context qm-depot
           kubectl -n waybill-signing patch secret signing-key -p '{"immutable":true}'
           kubectl -n waybill-signing delete pod signer --now
           kubectl -n waybill-signing apply -f - <<'YAML'
@@ -151,7 +152,7 @@ spec:
         on: workstation
         as: learner
         run: |
-          kubectl config use-context qm-dispatch
+          kubectl config use-context qm-depot
           kubectl -n waybill-signing delete secret signing-key
           kubectl -n waybill-signing create secret generic signing-key --from-literal=key-id={{keyid}}
           kubectl -n waybill-signing patch secret signing-key -p '{"immutable":true}'
@@ -163,7 +164,7 @@ spec:
         on: workstation
         as: learner
         run: |
-          kubectl config use-context qm-dispatch
+          kubectl config use-context qm-depot
           kubectl -n waybill-signing delete pod signer --now
           kubectl -n waybill-signing apply -f - <<'YAML'
           apiVersion: v1
@@ -183,7 +184,7 @@ spec:
       - on: workstation
         as: learner
         run: |
-          kubectl config use-context qm-dispatch
+          kubectl config use-context qm-depot
           kubectl -n waybill-signing patch secret signing-key -p '{"immutable":true}'
           kubectl -n waybill-signing get pod signer -o json \
             | jq 'del(.status, .metadata.uid, .metadata.resourceVersion, .metadata.creationTimestamp)
@@ -198,7 +199,7 @@ spec:
           - on: workstation
             as: learner
             run: |
-              kubectl config use-context qm-dispatch
+              kubectl config use-context qm-depot
               kubectl -n waybill-signing get secret signing-key -o json \
                 | jq 'del(.metadata.uid, .metadata.resourceVersion, .metadata.creationTimestamp, .metadata.managedFields) | .immutable = true' > /tmp/key.json
               kubectl replace --force -f /tmp/key.json

@@ -11,13 +11,13 @@ metadata:
   version: 1
 spec:
   description: |
-    Context: `qm-fleet` (`kubectl config use-context qm-fleet`). Node
-    `fleet-wk-1` is reachable with `ssh fleet-wk-1` (`sudo` works).
+    Context: `qm-ledger` (`kubectl config use-context qm-ledger`). Node
+    `ledger-wk-1` is reachable with `ssh ledger-wk-1` (`sudo` works).
 
     1. Load the AppArmor profile in `/opt/qm-profiles/{{profile}}` on
-       `fleet-wk-1` in **enforce** mode.
+       `ledger-wk-1` in **enforce** mode.
     2. Create a Pod named `scanner` in namespace `fleet-scan` that runs image
-       `busybox:1.37` with command `sleep 1d` on node `fleet-wk-1`, confined
+       `busybox:1.37` with command `sleep 1d` on node `ledger-wk-1`, confined
        by that profile.
   objectives:
     - Load an AppArmor profile and reference it from a Pod
@@ -32,19 +32,21 @@ spec:
         driver: container
         image: jumphost:1
         access: [shell]
-      - name: qm-fleet
+      # Canonical sim-k8s-security cluster: every K-tier exam task shares it.
+      - name: qm-ledger
         driver: k8s-cluster
         image: kubeadm:1.37
         access: [ssh]
         cluster:
           mode: kubeadm
           version: "v1.37.1"
-          context: qm-fleet
+          context: qm-ledger
           nodes:
-            - {name: fleet-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
-            - {name: fleet-wk-1, role: worker}
+            - {name: ledger-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: ledger-wk-1, role: worker}
+            - {name: ledger-wk-2, role: worker}
   setup:
-    - on: qm-fleet/fleet-wk-1
+    - on: qm-ledger/ledger-wk-1
       run: |
         set -e
         mkdir -p /opt/qm-profiles
@@ -57,36 +59,36 @@ spec:
           deny /** w,
         }
         EOF
-    - on: qm-fleet
+    - on: qm-ledger
       apply: |
         apiVersion: v1
         kind: Namespace
         metadata: {name: fleet-scan}
   teardown:
-    - on: qm-fleet
+    - on: qm-ledger
       run: kubectl delete namespace fleet-scan --ignore-not-found --wait=false
   checks:
     - id: profile-enforced
-      description: "{{profile}} is loaded in enforce mode on fleet-wk-1"
+      description: "{{profile}} is loaded in enforce mode on ledger-wk-1"
       type: shell
-      on: qm-fleet/fleet-wk-1
+      on: qm-ledger/ledger-wk-1
       skills: [k8s.security.seccomp-apparmor]
       command: grep -qx '{{profile}} (enforce)' /sys/kernel/security/apparmor/profiles && echo enforce || echo missing
       expect: {match: exact, value: enforce}
     - id: pod-on-node
-      description: Pod scanner runs busybox:1.37 on fleet-wk-1
+      description: Pod scanner runs busybox:1.37 on ledger-wk-1
       type: shell
-      on: qm-fleet
+      on: qm-ledger
       skills: [k8s.security.seccomp-apparmor]
       timeoutSec: 60
       command: |
         kubectl -n fleet-scan wait pod/scanner --for=condition=Ready --timeout=40s >/dev/null 2>&1
         kubectl -n fleet-scan get pod scanner -o jsonpath='{.status.phase}/{.spec.nodeName}/{.spec.containers[0].image}' 2>/dev/null
-      expect: {match: exact, value: Running/fleet-wk-1/busybox:1.37}
+      expect: {match: exact, value: Running/ledger-wk-1/busybox:1.37}
     - id: confined
       description: The scanner process is confined by {{profile}} in enforce mode
       type: shell
-      on: qm-fleet
+      on: qm-ledger
       skills: [k8s.security.seccomp-apparmor]
       weight: 2
       timeoutSec: 30
@@ -101,14 +103,14 @@ spec:
         on: workstation
         as: learner
         run: |
-          kubectl config use-context qm-fleet
-          ssh fleet-wk-1 'sudo apparmor_parser -C -r /opt/qm-profiles/{{profile}}'
+          kubectl config use-context qm-ledger
+          ssh ledger-wk-1 'sudo apparmor_parser -C -r /opt/qm-profiles/{{profile}}'
           kubectl apply -f - <<'YAML'
           apiVersion: v1
           kind: Pod
           metadata: {name: scanner, namespace: fleet-scan}
           spec:
-            nodeName: fleet-wk-1
+            nodeName: ledger-wk-1
             securityContext:
               appArmorProfile: {type: Localhost, localhostProfile: "{{profile}}"}
             containers:
@@ -123,14 +125,14 @@ spec:
         on: workstation
         as: learner
         run: |
-          kubectl config use-context qm-fleet
-          ssh fleet-wk-1 'sudo apparmor_parser -r /opt/qm-profiles/{{profile}}'
+          kubectl config use-context qm-ledger
+          ssh ledger-wk-1 'sudo apparmor_parser -r /opt/qm-profiles/{{profile}}'
           kubectl apply -f - <<'YAML'
           apiVersion: v1
           kind: Pod
           metadata: {name: scanner, namespace: fleet-scan}
           spec:
-            nodeName: fleet-wk-1
+            nodeName: ledger-wk-1
             securityContext:
               appArmorProfile: {type: RuntimeDefault}
             containers:
@@ -138,19 +140,19 @@ spec:
           YAML
           kubectl -n fleet-scan wait pod/scanner --for=condition=Ready --timeout=90s
   solution:
-    explanation: apparmor_parser loads the profile in enforce mode; the Pod pins itself to fleet-wk-1 and references the profile as Localhost.
+    explanation: apparmor_parser loads the profile in enforce mode; the Pod pins itself to ledger-wk-1 and references the profile as Localhost.
     steps:
       - on: workstation
         as: learner
         run: |
-          kubectl config use-context qm-fleet
-          ssh fleet-wk-1 'sudo apparmor_parser -r /opt/qm-profiles/{{profile}}'
+          kubectl config use-context qm-ledger
+          ssh ledger-wk-1 'sudo apparmor_parser -r /opt/qm-profiles/{{profile}}'
           kubectl apply -f - <<'YAML'
           apiVersion: v1
           kind: Pod
           metadata: {name: scanner, namespace: fleet-scan}
           spec:
-            nodeSelector: {kubernetes.io/hostname: fleet-wk-1}
+            nodeSelector: {kubernetes.io/hostname: ledger-wk-1}
             containers:
               - name: scanner
                 image: busybox:1.37
@@ -168,8 +170,8 @@ spec:
           - on: workstation
             as: learner
             run: |
-              kubectl config use-context qm-fleet
-              ssh fleet-wk-1 'sudo apparmor_parser -q /opt/qm-profiles/{{profile}} || sudo apparmor_parser -r /opt/qm-profiles/{{profile}}'
+              kubectl config use-context qm-ledger
+              ssh ledger-wk-1 'sudo apparmor_parser -q /opt/qm-profiles/{{profile}} || sudo apparmor_parser -r /opt/qm-profiles/{{profile}}'
               kubectl -n fleet-scan run scanner --image=busybox:1.37 --restart=Never \
-                --overrides='{"spec":{"nodeName":"fleet-wk-1","securityContext":{"appArmorProfile":{"type":"Localhost","localhostProfile":"{{profile}}"}}}}' -- sleep 1d
+                --overrides='{"spec":{"nodeName":"ledger-wk-1","securityContext":{"appArmorProfile":{"type":"Localhost","localhostProfile":"{{profile}}"}}}}' -- sleep 1d
               kubectl -n fleet-scan wait pod/scanner --for=condition=Ready --timeout=90s

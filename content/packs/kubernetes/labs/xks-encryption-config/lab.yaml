@@ -11,14 +11,14 @@ metadata:
   version: 1
 spec:
   description: |
-    Context: `qm-capacity`. The API server is a static Pod on `capacity-cp-1`
-    (`ssh capacity-cp-1`, `sudo` works).
+    Context: `qm-ledger`. The API server is a static Pod on `ledger-cp-1`
+    (`ssh ledger-cp-1`, `sudo` works).
 
     1. Create the encryption configuration
        `/etc/kubernetes/enc/secrets-enc.yaml` that encrypts **Secrets** with
-       the **{{provider}}** provider, and configure the qm-capacity API server
+       the **{{provider}}** provider, and configure the qm-ledger API server
        to use it. Data that is not encrypted yet must stay readable.
-    2. Re-write all existing Secrets in namespace `billing` so that they are
+    2. Re-write all existing Secrets in namespace `forecast-billing` so that they are
        stored encrypted.
   objectives:
     - Configure encryption at rest and re-encrypt existing data
@@ -33,81 +33,84 @@ spec:
         driver: container
         image: jumphost:1
         access: [shell]
-      - name: qm-capacity
+      # Canonical sim-k8s-security cluster: every K-tier exam task shares it.
+      - name: qm-ledger
         driver: k8s-cluster
         image: kubeadm:1.37
         access: [ssh]
         cluster:
           mode: kubeadm
           version: "v1.37.1"
-          context: qm-capacity
+          context: qm-ledger
           nodes:
-            - {name: capacity-cp-1, role: control-plane, taints: []}
+            - {name: ledger-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: ledger-wk-1, role: worker}
+            - {name: ledger-wk-2, role: worker}
   setup:
-    - on: qm-capacity
+    - on: qm-ledger
       apply: |
         apiVersion: v1
         kind: Namespace
-        metadata: {name: billing}
+        metadata: {name: forecast-billing}
         ---
         apiVersion: v1
         kind: Secret
-        metadata: {name: forecast-db, namespace: billing}
+        metadata: {name: forecast-db, namespace: forecast-billing}
         stringData: {password: capacity-forecast-pw}
         ---
         apiVersion: v1
         kind: Secret
-        metadata: {name: warehouse-api, namespace: billing}
+        metadata: {name: warehouse-api, namespace: forecast-billing}
         stringData: {token: wh-api-token-0042}
   teardown:
-    - on: qm-capacity
-      run: kubectl delete namespace billing --ignore-not-found --wait=false
+    - on: qm-ledger
+      run: kubectl delete namespace forecast-billing --ignore-not-found --wait=false
   checks:
     - id: apiserver-uses-config
       description: kube-apiserver runs with --encryption-provider-config=/etc/kubernetes/enc/secrets-enc.yaml
       type: shell
-      on: qm-capacity/capacity-cp-1
+      on: qm-ledger/ledger-cp-1
       skills: [k8s.security.secrets]
       command: ps -C kube-apiserver -o args= | tr ' ' '\n' | sed -n 's/^--encryption-provider-config=//p'
       expect: {match: exact, value: /etc/kubernetes/enc/secrets-enc.yaml}
-    - id: billing-encrypted
-      description: Both billing Secrets are stored in etcd with the {{provider}} prefix
+    - id: forecast-billing-encrypted
+      description: Both forecast-billing Secrets are stored in etcd with the {{provider}} prefix
       type: shell
-      on: qm-capacity/capacity-cp-1
+      on: qm-ledger/ledger-cp-1
       skills: [k8s.security.secrets]
       weight: 3
       timeoutSec: 45
       command: |
         export KUBECONFIG=/etc/kubernetes/admin.conf
-        e="kubectl -n kube-system exec etcd-capacity-cp-1 -- etcdctl --cacert /etc/kubernetes/pki/etcd/ca.crt --cert /etc/kubernetes/pki/etcd/healthcheck-client.crt --key /etc/kubernetes/pki/etcd/healthcheck-client.key"
+        e="kubectl -n kube-system exec etcd-ledger-cp-1 -- etcdctl --cacert /etc/kubernetes/pki/etcd/ca.crt --cert /etc/kubernetes/pki/etcd/healthcheck-client.crt --key /etc/kubernetes/pki/etcd/healthcheck-client.key"
         ok=0; want="k8s:enc:{{provider}}:v1:"
         for s in forecast-db warehouse-api; do
-          [ "$($e get /registry/secrets/billing/$s --print-value-only 2>/dev/null | head -c ${#want} | tr -c '[:print:]' '.')" = "$want" ] && ok=$((ok+1))
+          [ "$($e get /registry/secrets/forecast-billing/$s --print-value-only 2>/dev/null | head -c ${#want} | tr -c '[:print:]' '.')" = "$want" ] && ok=$((ok+1))
         done
         echo "encrypted=$ok/2"
       expect: {match: exact, value: encrypted=2/2}
     - id: still-readable
-      description: The billing Secrets still return their values through the API
+      description: The forecast-billing Secrets still return their values through the API
       type: shell
-      on: qm-capacity
+      on: qm-ledger
       skills: [k8s.security.secrets]
       timeoutSec: 30
       command: |
-        a=$(kubectl -n billing get secret forecast-db -o jsonpath='{.data.password}' | base64 -d)
-        b=$(kubectl -n billing get secret warehouse-api -o jsonpath='{.data.token}' | base64 -d)
+        a=$(kubectl -n forecast-billing get secret forecast-db -o jsonpath='{.data.password}' | base64 -d)
+        b=$(kubectl -n forecast-billing get secret warehouse-api -o jsonpath='{.data.token}' | base64 -d)
         echo "$a $b"
       expect: {match: exact, value: "capacity-forecast-pw wh-api-token-0042"}
   misconceptions:
     - id: not-rewritten
-      description: Configures encryption but does not re-write the billing Secrets.
+      description: Configures encryption but does not re-write the forecast-billing Secrets.
       feedback: Existing objects are only encrypted when they are written again.
-      expectFail: [billing-encrypted]
+      expectFail: [forecast-billing-encrypted]
       mutation:
         on: workstation
         as: learner
         timeoutSec: 600
         run: |
-          ssh capacity-cp-1 'sudo bash -s' <<'EOS'
+          ssh ledger-cp-1 'sudo bash -s' <<'EOS'
           set -e
           mkdir -p /etc/kubernetes/enc
           KEY=$(head -c 32 /dev/urandom | base64)
@@ -130,13 +133,13 @@ spec:
     - id: identity-first
       description: Puts identity before the encrypting provider.
       feedback: The first provider encrypts writes; identity first means nothing gets encrypted.
-      expectFail: [billing-encrypted]
+      expectFail: [forecast-billing-encrypted]
       mutation:
         on: workstation
         as: learner
         timeoutSec: 600
         run: |
-          ssh capacity-cp-1 'sudo bash -s' <<'EOS'
+          ssh ledger-cp-1 'sudo bash -s' <<'EOS'
           set -e
           mkdir -p /etc/kubernetes/enc
           KEY=$(head -c 32 /dev/urandom | base64)
@@ -156,8 +159,8 @@ spec:
             sleep 5
           done
           EOS
-          kubectl config use-context qm-capacity
-          kubectl -n billing get secrets -o json | kubectl replace -f -
+          kubectl config use-context qm-ledger
+          kubectl -n forecast-billing get secrets -o json | kubectl replace -f -
   solution:
     explanation: |
       The provider takes a base64-encoded 32-byte key; identity stays last so
@@ -169,7 +172,7 @@ spec:
         as: learner
         timeoutSec: 600
         run: |
-          ssh capacity-cp-1 'sudo bash -s' <<'EOS'
+          ssh ledger-cp-1 'sudo bash -s' <<'EOS'
           set -e
           mkdir -p /etc/kubernetes/enc
           KEY=$(head -c 32 /dev/urandom | base64)
@@ -200,9 +203,9 @@ spec:
             sleep 5
           done
           EOS
-          kubectl config use-context qm-capacity
+          kubectl config use-context qm-ledger
           for i in $(seq 1 30); do kubectl get --raw /readyz >/dev/null 2>&1 && break; sleep 5; done
-          kubectl -n billing get secrets -o json | kubectl replace -f -
+          kubectl -n forecast-billing get secrets -o json | kubectl replace -f -
     alternatives:
       - id: annotate-rewrite
         description: Re-write each Secret by touching an annotation instead of replace.
@@ -211,7 +214,7 @@ spec:
             as: learner
             timeoutSec: 600
             run: |
-              ssh capacity-cp-1 'sudo bash -s' <<'EOS'
+              ssh ledger-cp-1 'sudo bash -s' <<'EOS'
               set -e
               install -d -m 0700 /etc/kubernetes/enc
               printf 'apiVersion: apiserver.config.k8s.io/v1\nkind: EncryptionConfiguration\nresources:\n- resources:\n  - secrets\n  providers:\n  - {{provider}}:\n      keys:\n      - name: k2026\n        secret: %s\n  - identity: {}\n' "$(head -c 32 /dev/urandom | base64)" > /etc/kubernetes/enc/secrets-enc.yaml
@@ -224,6 +227,6 @@ spec:
                 sleep 5
               done
               EOS
-              kubectl config use-context qm-capacity
+              kubectl config use-context qm-ledger
               for i in $(seq 1 30); do kubectl get --raw /readyz >/dev/null 2>&1 && break; sleep 5; done
-              for s in $(kubectl -n billing get secrets -o name); do kubectl -n billing annotate "$s" qm.example/reencrypted="$(date +%s)" --overwrite; done
+              for s in $(kubectl -n forecast-billing get secrets -o name); do kubectl -n forecast-billing annotate "$s" qm.example/reencrypted="$(date +%s)" --overwrite; done
