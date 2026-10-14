@@ -89,6 +89,34 @@ tasks:
     desc: Delete all demo lab namespaces
     cmds: [bash deploy/scripts/lab-demo.sh --clean]
 
+  # ------------------------------------------------------- platform dependencies
+  # Postgres 17 (127.0.0.1:55432), Keycloak 26 (http://localhost:8180, admin/admin-dev-only),
+  # Mailpit (http://localhost:8025, SMTP 1025). Compose project cloudtrain-dev-deps only.
+
+  dev:deps:
+    desc: 'Start Postgres, Keycloak and Mailpit (deploy/dev/compose.yaml), migrate, seed when empty, sync Keycloak organizations'
+    cmds:
+      - docker compose -f deploy/dev/compose.yaml up -d --wait
+      - pnpm --filter @cloudtrain/gateway db:migrate
+      - pnpm --filter @cloudtrain/gateway db:seed --if-empty
+      - pnpm --filter @cloudtrain/gateway kc:sync
+
+  dev:deps:down:
+    desc: Stop the platform dependencies (data volume kept; dev:deps:reset also deletes it)
+    cmds: [docker compose -f deploy/dev/compose.yaml down]
+
+  dev:deps:reset:
+    desc: Delete the platform dependencies and their data (fresh realm import and seed on next dev:deps)
+    cmds: [docker compose -f deploy/dev/compose.yaml down -v]
+
+  dev:seed:
+    desc: 'Re-seed the fictional dev data (replaces the seeded orgs; DEV ONLY)'
+    cmds: [pnpm --filter @cloudtrain/gateway db:seed, pnpm --filter @cloudtrain/gateway kc:sync]
+
+  dev:realms:
+    desc: Regenerate the Keycloak realm imports from deploy/dev/people.json (then dev:deps:reset + dev:deps)
+    cmds: [node deploy/dev/keycloak/gen-realms.mjs]
+
   # ---------------------------------------------------------------- web + gateway
   # Real-mode development: `task dev:orchestrator`, `task dev:gateway` and
   # `task dev:web` in three terminals. Every kubectl/manager call is pinned to
@@ -125,6 +153,10 @@ tasks:
     env:
       CT_KUBE_CONTEXT: '{{.CTX}}'
       CT_NAMESPACE: '{{.NS}}'
+      # Dev only: the acme-idp realm stands in for AzarGuard's Entra tenant (may grant platform_admin),
+      # and domain verification accepts without the DNS TXT record.
+      CT_PLATFORM_IDPS: '{{.CT_PLATFORM_IDPS | default "azarguard-entra,acme-idp"}}'
+      CT_DEV_DOMAIN_VERIFY_BYPASS: '{{.CT_DEV_DOMAIN_VERIFY_BYPASS | default "1"}}'
     cmds:
       - pnpm --filter @cloudtrain/lab-schema build
       - kubectl --context {{.CTX}} get namespace {{.NS}} >/dev/null 2>&1 || kubectl --context {{.CTX}} create namespace {{.NS}}
