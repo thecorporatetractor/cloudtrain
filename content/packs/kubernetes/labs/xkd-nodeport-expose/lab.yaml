@@ -1,0 +1,148 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xkd-nodeport-expose
+  title: Expose an app on a node port
+  domain: kubernetes
+  frameworks: [ckad:services-networking]
+  difficulty: easy
+  estimatedMinutes: 5
+  tags: [exam, nodeport, services]
+  version: 1
+spec:
+  description: |
+    **Context:** `qm-yard` (`kubectl config use-context qm-yard`)
+
+    In namespace `kiosk-front`, expose the Deployment **`kiosk-ui`** (port
+    80) as a **NodePort** Service named **`kiosk-ui`** with Service port
+    **80**. Let Kubernetes assign the node port, then write the assigned
+    **node port number** (only the number) to
+    **`/home/learner/answers/kiosk-ui-nodeport.txt`**.
+  objectives:
+    - Expose a Deployment with a NodePort Service and read the assigned port
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-yard
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-yard
+          nodes:
+            - {name: yard-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: yard-wk-1, role: worker}
+            - {name: yard-wk-2, role: worker}
+  setup:
+    - on: workstation
+      run: install -d -o learner -g learner -m 0755 /home/learner/answers
+    - on: qm-yard
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: kiosk-front}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: kiosk-ui, namespace: kiosk-front}
+        spec:
+          replicas: 2
+          selector: {matchLabels: {app: kiosk-ui}}
+          template:
+            metadata: {labels: {app: kiosk-ui}}
+            spec:
+              terminationGracePeriodSeconds: 2
+              containers:
+                - name: ui
+                  image: httpd:2.4-alpine
+                  ports: [{containerPort: 80}]
+    - on: qm-yard
+      timeoutSec: 150
+      run: kubectl -n kiosk-front rollout status deploy/kiosk-ui --timeout=140s
+  teardown:
+    - on: qm-yard
+      run: kubectl delete namespace kiosk-front --ignore-not-found --wait=false
+  checks:
+    - id: nodeport-service
+      description: Service kiosk-ui is a NodePort Service on port 80 to the kiosk-ui Pods
+      type: k8s-query
+      skills: [k8s.networking.nodeport]
+      query: {cluster: qm-yard, resource: service, name: kiosk-ui, namespace: kiosk-front, jsonpath: "{.spec.type} {.spec.ports[0].port}->{.spec.ports[0].targetPort} {.spec.selector.app}"}
+      expect: {match: exact, value: NodePort 80->80 kiosk-ui}
+    - id: answer
+      description: kiosk-ui-nodeport.txt holds the assigned node port
+      type: shell
+      on: qm-yard
+      skills: [k8s.networking.nodeport]
+      weight: 2
+      command: kubectl -n kiosk-front get svc kiosk-ui -o jsonpath='{.spec.ports[0].nodePort}' 2>/dev/null || echo none
+      expect: {match: regex, value: '^3[0-9]{4}$'}
+    - id: answer-matches
+      description: The file content equals the Service's node port
+      type: shell
+      on: workstation
+      skills: [k8s.networking.nodeport]
+      weight: 2
+      command: |
+        want=$(kubectl --kubeconfig /home/learner/.kube/config --context qm-yard -n kiosk-front get svc kiosk-ui -o jsonpath='{.spec.ports[0].nodePort}' 2>/dev/null)
+        got=$(tr -d ' \n\r\t' < /home/learner/answers/kiosk-ui-nodeport.txt 2>/dev/null)
+        [ -n "$want" ] && [ "$got" = "$want" ] && echo match || echo "mismatch"
+      expect: {match: exact, value: match}
+    - id: reachable
+      description: The app answers on yard-wk-2 at the node port
+      type: shell
+      on: qm-yard/yard-cp-1
+      skills: [k8s.networking.nodeport]
+      timeoutSec: 30
+      command: |
+        p=$(KUBECONFIG=/etc/kubernetes/admin.conf kubectl -n kiosk-front get svc kiosk-ui -o jsonpath='{.spec.ports[0].nodePort}' 2>/dev/null)
+        ip=$(KUBECONFIG=/etc/kubernetes/admin.conf kubectl get node yard-wk-2 -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}')
+        [ -n "$p" ] || { echo "no node port"; exit 0; }
+        curl -s -o /dev/null -w '%{http_code}' -m 5 "http://$ip:$p/" || echo unreachable
+      expect: {match: exact, value: "200"}
+  misconceptions:
+    - id: service-port-written
+      description: Writes the Service port (80) instead of the node port.
+      feedback: A NodePort Service has three ports; the node port is the one in the 30000-32767 range opened on every node.
+      expectFail: [answer-matches]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-yard
+          kubectl -n kiosk-front expose deployment kiosk-ui --type=NodePort --port=80
+          echo 80 > ~/answers/kiosk-ui-nodeport.txt
+    - id: clusterip
+      description: Creates a ClusterIP Service, which has no node port at all.
+      feedback: Pass `--type=NodePort`; the default type is ClusterIP.
+      expectFail: [nodeport-service, answer, reachable]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-yard
+          kubectl -n kiosk-front expose deployment kiosk-ui --port=80
+          kubectl -n kiosk-front get svc kiosk-ui -o jsonpath='{.spec.ports[0].nodePort}' > ~/answers/kiosk-ui-nodeport.txt
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-yard
+          kubectl -n kiosk-front expose deployment kiosk-ui --type=NodePort --port=80
+          kubectl -n kiosk-front get svc kiosk-ui -o jsonpath='{.spec.ports[0].nodePort}' > ~/answers/kiosk-ui-nodeport.txt
+    alternatives:
+      - id: create-service
+        description: kubectl create service nodeport (selector app=kiosk-ui comes from the name).
+        steps:
+          - on: workstation
+            as: learner
+            run: |
+              kubectl config use-context qm-yard
+              kubectl -n kiosk-front create service nodeport kiosk-ui --tcp=80:80
+              kubectl -n kiosk-front get svc kiosk-ui -o jsonpath='{.spec.ports[0].nodePort}{"\n"}' > ~/answers/kiosk-ui-nodeport.txt

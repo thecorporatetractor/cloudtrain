@@ -1,0 +1,283 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xkd-netpol-allow-frontend
+  title: Allow one client app with a NetworkPolicy
+  domain: kubernetes
+  frameworks: [ckad:services-networking]
+  difficulty: medium
+  estimatedMinutes: 7
+  tags: [exam, networkpolicy]
+  version: 1
+spec:
+  description: |
+    **Context:** `qm-yard` (`kubectl config use-context qm-yard`)
+
+    In namespace **`pricing`**, create a NetworkPolicy named **`{{policy}}`**
+    so that the Pods labelled `app=quote-db` accept connections **only**
+    from Pods labelled **`role=portal` in namespace `pricing`**, and only on
+    **TCP 6379**. Every other incoming connection to the quote-db Pods
+    (other Pods, other namespaces, other ports) must be blocked. Do not
+    affect other Pods in the namespace.
+
+    Test clients with `nc`: `pricing/portal` (role=portal), `pricing/batch`
+    (role=batch) and `pricing-reports/portal` (role=portal, other namespace).
+    quote-db also listens on 9121 (metrics).
+  objectives:
+    - Select target and source Pods in a NetworkPolicy and restrict the port
+  params:
+    policy:
+      type: choice
+      values: [quote-db-from-portal, allow-portal-to-quote-db, quote-db-ingress]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-yard
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-yard
+          nodes:
+            - {name: yard-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: yard-wk-1, role: worker}
+            - {name: yard-wk-2, role: worker}
+  setup:
+    - on: qm-yard
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: pricing}
+        ---
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: pricing-reports}
+        ---
+        apiVersion: v1
+        kind: Pod
+        metadata: {name: quote-db, namespace: pricing, labels: {app: quote-db}}
+        spec:
+          terminationGracePeriodSeconds: 1
+          containers:
+            - name: redis
+              image: redis:7.4-alpine
+              ports: [{name: redis, containerPort: 6379}]
+            - name: metrics
+              image: busybox:1.37
+              command: ["sh", "-c", "mkdir -p /www && echo metrics > /www/index.html && exec httpd -f -p 9121 -h /www"]
+              ports: [{name: metrics, containerPort: 9121}]
+        ---
+        apiVersion: v1
+        kind: Pod
+        metadata: {name: portal, namespace: pricing, labels: {role: portal}}
+        spec:
+          terminationGracePeriodSeconds: 1
+          containers: [{name: c, image: "busybox:1.37", command: ["sleep", "1d"]}]
+        ---
+        apiVersion: v1
+        kind: Pod
+        metadata: {name: batch, namespace: pricing, labels: {role: batch}}
+        spec:
+          terminationGracePeriodSeconds: 1
+          containers: [{name: c, image: "busybox:1.37", command: ["sleep", "1d"]}]
+        ---
+        apiVersion: v1
+        kind: Pod
+        metadata: {name: portal, namespace: pricing-reports, labels: {role: portal}}
+        spec:
+          terminationGracePeriodSeconds: 1
+          containers: [{name: c, image: "busybox:1.37", command: ["sleep", "1d"]}]
+    - on: qm-yard
+      timeoutSec: 150
+      run: |
+        kubectl -n pricing wait pod --all --for=condition=Ready --timeout=120s
+        kubectl -n pricing-reports wait pod --all --for=condition=Ready --timeout=60s
+    - on: qm-yard
+      timeoutSec: 120
+      run: |
+        # Self-test: the task is meaningless unless the CNI enforces NetworkPolicy.
+        ip=$(kubectl -n pricing get pod quote-db -o jsonpath='{.status.podIP}')
+        reach() { kubectl -n pricing exec batch -- nc -z -w 2 "$ip" 6379 >/dev/null 2>&1; }
+        reach || { echo "baseline: batch cannot reach quote-db" >&2; exit 1; }
+        printf 'apiVersion: networking.k8s.io/v1\nkind: NetworkPolicy\nmetadata: {name: cloudtrain-selftest, namespace: pricing}\nspec:\n  podSelector: {matchLabels: {app: quote-db}}\n  policyTypes: [Ingress]\n' | kubectl apply -f -
+        enforced=no
+        for i in $(seq 1 10); do if ! reach; then enforced=yes; break; fi; sleep 2; done
+        kubectl -n pricing delete networkpolicy cloudtrain-selftest --wait=true
+        [ "$enforced" = yes ] || { echo "NetworkPolicy is not enforced on qm-yard" >&2; exit 1; }
+        for i in $(seq 1 10); do reach && exit 0; sleep 2; done
+        echo "quote-db stayed unreachable after the self-test" >&2; exit 1
+  teardown:
+    - on: qm-yard
+      run: kubectl delete namespace pricing pricing-reports --ignore-not-found --wait=false
+  checks:
+    - id: portal-allowed
+      description: pricing/portal reaches quote-db on 6379
+      type: shell
+      on: qm-yard
+      skills: [k8s.networking.netpol-selectors]
+      weight: 2
+      timeoutSec: 20
+      command: |
+        ip=$(kubectl -n pricing get pod quote-db -o jsonpath='{.status.podIP}')
+        kubectl -n pricing exec portal -- nc -z -w 3 "$ip" 6379 >/dev/null 2>&1 && echo open || echo blocked
+      expect: {match: exact, value: open}
+    - id: batch-blocked
+      description: pricing/batch cannot reach quote-db on 6379
+      type: shell
+      on: qm-yard
+      skills: [k8s.networking.netpol-selectors]
+      timeoutSec: 20
+      command: |
+        ip=$(kubectl -n pricing get pod quote-db -o jsonpath='{.status.podIP}')
+        kubectl -n pricing exec batch -- nc -z -w 3 "$ip" 6379 >/dev/null 2>&1 && echo open || echo blocked
+      expect: {match: exact, value: blocked}
+    - id: other-namespace-blocked
+      description: pricing-reports/portal cannot reach quote-db on 6379
+      type: shell
+      on: qm-yard
+      skills: [k8s.networking.netpol-selectors]
+      weight: 2
+      timeoutSec: 20
+      command: |
+        ip=$(kubectl -n pricing get pod quote-db -o jsonpath='{.status.podIP}')
+        kubectl -n pricing-reports exec portal -- nc -z -w 3 "$ip" 6379 >/dev/null 2>&1 && echo open || echo blocked
+      expect: {match: exact, value: blocked}
+    - id: metrics-port-blocked
+      description: pricing/portal cannot reach quote-db on 9121
+      type: shell
+      on: qm-yard
+      skills: [k8s.networking.netpol-ports]
+      timeoutSec: 20
+      command: |
+        ip=$(kubectl -n pricing get pod quote-db -o jsonpath='{.status.podIP}')
+        kubectl -n pricing exec portal -- nc -z -w 3 "$ip" 9121 >/dev/null 2>&1 && echo open || echo blocked
+      expect: {match: exact, value: blocked}
+    - id: scoped
+      description: Policy {{policy}} selects only the quote-db Pods
+      type: k8s-query
+      skills: [k8s.networking.netpol-selectors]
+      weight: 0.5
+      query: {cluster: qm-yard, resource: networkpolicy, name: "{{policy}}", namespace: pricing, jsonpath: "{.spec.podSelector.matchLabels}"}
+      expect: {match: exact, value: '{"app":"quote-db"}'}
+  misconceptions:
+    - id: any-namespace
+      description: Combines podSelector role=portal with an empty namespaceSelector, which admits role=portal Pods from every namespace.
+      feedback: "`namespaceSelector: {}` in the same peer means any namespace. A podSelector alone already means the policy's namespace."
+      expectFail: [other-namespace-blocked]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-yard
+          kubectl apply -f - <<'YAML'
+          apiVersion: networking.k8s.io/v1
+          kind: NetworkPolicy
+          metadata: {name: "{{policy}}", namespace: pricing}
+          spec:
+            podSelector: {matchLabels: {app: quote-db}}
+            policyTypes: [Ingress]
+            ingress:
+              - from:
+                  - namespaceSelector: {}
+                    podSelector: {matchLabels: {role: portal}}
+                ports:
+                  - {protocol: TCP, port: 6379}
+          YAML
+          sleep 3
+    - id: no-port
+      description: Leaves out the port list, so portal also reaches the metrics port.
+      feedback: Without `ports` the rule allows every port. Add TCP 6379 to the same rule.
+      expectFail: [metrics-port-blocked]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-yard
+          kubectl apply -f - <<'YAML'
+          apiVersion: networking.k8s.io/v1
+          kind: NetworkPolicy
+          metadata: {name: "{{policy}}", namespace: pricing}
+          spec:
+            podSelector: {matchLabels: {app: quote-db}}
+            policyTypes: [Ingress]
+            ingress:
+              - from:
+                  - podSelector: {matchLabels: {role: portal}}
+          YAML
+          sleep 3
+    - id: whole-namespace
+      description: Applies the policy to every Pod in pricing (podSelector {}), which also cuts off the client Pods.
+      feedback: The policy's podSelector picks the Pods it protects. Select app=quote-db only.
+      expectFail: [scoped]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-yard
+          kubectl apply -f - <<'YAML'
+          apiVersion: networking.k8s.io/v1
+          kind: NetworkPolicy
+          metadata: {name: "{{policy}}", namespace: pricing}
+          spec:
+            podSelector: {}
+            policyTypes: [Ingress]
+            ingress:
+              - from:
+                  - podSelector: {matchLabels: {role: portal}}
+                ports:
+                  - {protocol: TCP, port: 6379}
+          YAML
+          sleep 3
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-yard
+          kubectl apply -f - <<'YAML'
+          apiVersion: networking.k8s.io/v1
+          kind: NetworkPolicy
+          metadata:
+            name: {{policy}}
+            namespace: pricing
+          spec:
+            podSelector:
+              matchLabels: {app: quote-db}
+            policyTypes: [Ingress]
+            ingress:
+              - from:
+                  - podSelector:
+                      matchLabels: {role: portal}
+                ports:
+                  - protocol: TCP
+                    port: 6379
+          YAML
+          sleep 3
+    alternatives:
+      - id: explicit-namespace
+        description: Pin the namespace explicitly with namespaceSelector AND podSelector in one peer, and use the named port.
+        steps:
+          - on: workstation
+            as: learner
+            run: |
+              kubectl config use-context qm-yard
+              kubectl apply -f - <<'YAML'
+              apiVersion: networking.k8s.io/v1
+              kind: NetworkPolicy
+              metadata: {name: "{{policy}}", namespace: pricing}
+              spec:
+                podSelector: {matchLabels: {app: quote-db}}
+                policyTypes: [Ingress]
+                ingress:
+                  - from:
+                      - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: pricing}}
+                        podSelector: {matchLabels: {role: portal}}
+                    ports:
+                      - {protocol: TCP, port: redis}
+              YAML
+              sleep 3
