@@ -33,8 +33,10 @@ export class Sealer {
   open(sealed: string): string | null {
     try {
       const [iv, tag, body] = sealed.split('.').map((s) => Buffer.from(s, 'base64url'));
-      const d = createDecipheriv('aes-256-gcm', this.key, iv!);
-      d.setAuthTag(tag!);
+      // Pin the tag length: without it Node accepts truncated (down to 4-byte) tags.
+      if (iv?.length !== 12 || tag?.length !== 16 || !body) return null;
+      const d = createDecipheriv('aes-256-gcm', this.key, iv, { authTagLength: 16 });
+      d.setAuthTag(tag);
       return Buffer.concat([d.update(body!), d.final()]).toString('utf8');
     } catch {
       return null;
