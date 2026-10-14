@@ -231,12 +231,15 @@ export class ExamService {
       kind: 'ExamSession',
       metadata: {
         name,
+        // Configured labels win (e.g. a scoped manager's selector replacing
+        // managed-by): the orchestrator copies them onto the environment
+        // LabSessions, which exactly one manager must reconcile.
         labels: {
-          ...(this.opts.sessionLabels ?? {}),
           [LABEL_EXAM_ID]: labelValue(examId),
           [LABEL_LEARNER]: labelValue(p.sub),
           [LABEL_ORG]: labelValue(p.orgId),
           [LABEL_MANAGED_BY]: MANAGED_BY,
+          ...(this.opts.sessionLabels ?? {}),
         },
       },
       spec: {
