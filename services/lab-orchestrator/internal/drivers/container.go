@@ -89,6 +89,10 @@ type ContainerDriver struct {
 	// default class, 1Gi).
 	HomeStorageClass string
 	HomeSize         string
+	// UserNamespaces: the cluster runtime supports pods with hostUsers: false
+	// (DetectUserNamespaces). Catalog images marked userNamespace then run in
+	// a user namespace (see userns.go).
+	UserNamespaces bool
 }
 
 var (
@@ -323,6 +327,7 @@ func (d *ContainerDriver) Provision(ctx context.Context, ref NodeRef) (NodeState
 	if err := d.decoratePod(ref, pod, false); err != nil {
 		return NodeState{Phase: labsv1.NodeFailed, Message: err.Error()}, err
 	}
+	d.applyUserNamespace(ref, pod)
 	if err := d.createIfAbsent(ctx, ref, pod); err != nil {
 		return NodeState{Phase: labsv1.NodePending, Message: err.Error()}, fmt.Errorf("pod: %w", err)
 	}

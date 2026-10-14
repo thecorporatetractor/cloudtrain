@@ -2,6 +2,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"os"
 	"strings"
@@ -30,7 +31,7 @@ func main() {
 		metricsAddr, probeAddr, registry, runtimeClass, watchNamespace      string
 		catalogPaths, adminImageRef, helmBin, vclusterChart, vclusterValues string
 		sessionSelector, leaderElectionID, netToolsImage                    string
-		storageClass, vmDisks                                               string
+		storageClass, vmDisks, userNamespaces                               string
 		leaderElect, metricsSecure, persistentHome, vclusterPersistence     bool
 		concurrency                                                         int
 		provisionTimeout                                                    time.Duration
@@ -52,6 +53,7 @@ func main() {
 	flag.StringVar(&vclusterValues, "vcluster-values", "/opt/cloudtrain/charts/vcluster-values.yaml", "base values for virtual clusters (deploy/vcluster/values.yaml); empty = none")
 	flag.StringVar(&sessionSelector, "session-selector", "", "only reconcile LabSessions matching this label selector (e.g. labs.cloudtrain.dev/verify=true); empty = all")
 	flag.StringVar(&leaderElectionID, "leader-election-id", "lab-orchestrator.labs.cloudtrain.dev", "leader election lease name")
+	flag.StringVar(&userNamespaces, "user-namespaces", "auto", "run catalog images marked userNamespace (tier A) with pod hostUsers: false: auto (when every node's runtime handler reports support), true, false")
 	flag.BoolVar(&persistentHome, "persistent-home", true, "give container nodes a PVC for /home/learner (survives hibernate/resume)")
 	flag.BoolVar(&vclusterPersistence, "vcluster-persistence", true, "keep vcluster databases on a PVC (vclusters can hibernate)")
 	flag.StringVar(&vmDisks, "vm-disks", "persistent", "VM root disks: persistent (CDI DataVolume per VM, VMs can hibernate) or ephemeral (containerDisk)")
@@ -123,12 +125,31 @@ func main() {
 		log.Error(nil, "--vm-disks must be persistent or ephemeral", "value", vmDisks)
 		os.Exit(1)
 	}
+	useUserNS := false
+	switch userNamespaces {
+	case "true":
+		useUserNS = true
+	case "false":
+	case "auto":
+		direct, err := client.New(cfg, client.Options{Scheme: scheme})
+		if err != nil {
+			log.Error(err, "unable to create client for user namespace detection")
+			os.Exit(1)
+		}
+		var why string
+		useUserNS, why = drivers.DetectUserNamespaces(context.Background(), direct, runtimeClass)
+		log.Info("user namespaces for tier-A container nodes", "enabled", useUserNS, "reason", why)
+	default:
+		log.Error(nil, "--user-namespaces must be auto, true or false", "value", userNamespaces)
+		os.Exit(1)
+	}
 	rt, err := drivers.NewRuntime(drivers.RuntimeOptions{
 		Client: mgr.GetClient(), Reader: mgr.GetAPIReader(), Scheme: scheme, Executor: executor,
 		Catalog: catalog, ImageRegistry: registry, RuntimeClassName: runtimeClass, AdminImageRef: adminImageRef,
 		Helm: drivers.ExecHelm{Binary: helmBin}, VClusterChart: vclusterChart, VClusterValues: vclusterValues,
 		PersistentHome: persistentHome, VClusterPersistence: vclusterPersistence, StorageClass: storageClass,
-		VMDisks: drivers.VMDiskOptions{Persistent: vmDisks == "persistent"},
+		VMDisks:        drivers.VMDiskOptions{Persistent: vmDisks == "persistent"},
+		UserNamespaces: useUserNS,
 	})
 	if err != nil {
 		log.Error(err, "unable to build drivers")

@@ -37,6 +37,9 @@ type RuntimeOptions struct {
 	VClusterPersistence bool
 	VMDisks             VMDiskOptions
 	StorageClass        string
+	// UserNamespaces: run catalog images marked userNamespace with pod
+	// hostUsers: false (resolve with DetectUserNamespaces).
+	UserNamespaces bool
 }
 
 // Runtime is the assembled driver set.
@@ -58,6 +61,7 @@ func NewRuntime(o RuntimeOptions) (*Runtime, error) {
 		Client: o.Client, Reader: o.Reader, Scheme: o.Scheme, ImageRegistry: o.ImageRegistry,
 		RuntimeClassName: o.RuntimeClassName, Executor: o.Executor, Catalog: o.Catalog,
 		PersistentHome: o.PersistentHome, HomeStorageClass: o.StorageClass,
+		UserNamespaces: o.UserNamespaces,
 	}
 	disks := o.VMDisks
 	if disks.StorageClass == "" {
