@@ -1,0 +1,152 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xks-remove-service-port
+  title: Remove an unneeded service from a node
+  domain: kubernetes
+  frameworks: [cks:system-hardening]
+  difficulty: medium
+  estimatedMinutes: 7
+  tags: [exam, node-hardening, systemd, packages]
+  version: 1
+spec:
+  description: |
+    Context: `qm-fleet`. Node `fleet-wk-2` is reachable with
+    `ssh fleet-wk-2` (`sudo` works).
+
+    Something on `fleet-wk-2` listens on TCP port **{{port}}**, which is not
+    an expected port for a Kubernetes worker. Find the service behind it,
+    **stop and disable** it, and **remove the package** that installed it,
+    so the port is closed for good. The node must stay `Ready`.
+  objectives:
+    - Trace a listening port to its unit and package and remove both
+  params:
+    port:
+      type: choice
+      values: [23, 2323, 7023]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-fleet
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        access: [ssh]
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-fleet
+          nodes:
+            - {name: fleet-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: fleet-wk-2, role: worker}
+  setup:
+    - on: qm-fleet/fleet-wk-2
+      timeoutSec: 120
+      run: |
+        set -e
+        b=$(mktemp -d)
+        mkdir -p $b/DEBIAN $b/usr/sbin $b/lib/systemd/system
+        cat > $b/DEBIAN/control <<'EOF'
+        Package: qm-console-bridge
+        Version: 1.4.0
+        Architecture: all
+        Maintainer: Quillmoor Depot IT <depot-it@quillmoor.example>
+        Depends: python3
+        Description: Remote console bridge for legacy depot terminals
+         Exposes an unauthenticated line console for old depot terminals.
+        EOF
+        printf '#!/bin/sh\nsystemctl daemon-reload || true\nsystemctl enable --now qm-console-bridge.service || true\n' > $b/DEBIAN/postinst
+        printf '#!/bin/sh\nsystemctl disable --now qm-console-bridge.service || true\n' > $b/DEBIAN/prerm
+        chmod 0755 $b/DEBIAN/postinst $b/DEBIAN/prerm
+        cat > $b/usr/sbin/qm-console-bridge <<'EOF'
+        #!/usr/bin/python3
+        import socket, sys
+        s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("0.0.0.0", int(sys.argv[1]))); s.listen(4)
+        while True:
+            c, _ = s.accept()
+            try: c.sendall(b"Quillmoor depot console (no login required)\r\n> ")
+            finally: c.close()
+        EOF
+        chmod 0755 $b/usr/sbin/qm-console-bridge
+        cat > $b/lib/systemd/system/qm-console-bridge.service <<'EOF'
+        [Unit]
+        Description=Depot terminal console bridge
+        [Service]
+        ExecStart=/usr/sbin/qm-console-bridge {{port}}
+        Restart=always
+        [Install]
+        WantedBy=multi-user.target
+        EOF
+        dpkg-deb --root-owner-group --build $b /var/cache/qm-console-bridge_1.4.0_all.deb >/dev/null
+        dpkg -i /var/cache/qm-console-bridge_1.4.0_all.deb >/dev/null
+        rm -rf $b /var/cache/qm-console-bridge_1.4.0_all.deb
+        for i in $(seq 1 20); do ss -Htln 'sport = :{{port}}' | grep -q . && exit 0; sleep 1; done
+        exit 1
+  checks:
+    - id: port-closed
+      description: Nothing listens on TCP {{port}} on fleet-wk-2
+      type: shell
+      on: qm-fleet/fleet-wk-2
+      skills: [linux.security.attack-surface]
+      weight: 2
+      command: echo "listeners=$(ss -Htln 'sport = :{{port}}' | wc -l)"
+      expect: {match: exact, value: listeners=0}
+    - id: package-removed
+      description: The package behind the listener is no longer installed
+      type: shell
+      on: qm-fleet/fleet-wk-2
+      skills: [linux.security.attack-surface]
+      weight: 2
+      command: dpkg-query -W -f='${db:Status-Status}' qm-console-bridge 2>/dev/null | grep -qx installed && echo installed || echo removed
+      expect: {match: exact, value: removed}
+    - id: node-ready
+      description: fleet-wk-2 is Ready
+      type: shell
+      on: qm-fleet
+      skills: [linux.security.attack-surface]
+      timeoutSec: 60
+      command: kubectl wait node/fleet-wk-2 --for=condition=Ready --timeout=40s >/dev/null 2>&1 && echo Ready || echo NotReady
+      expect: {match: exact, value: Ready}
+  misconceptions:
+    - id: killed-process
+      description: Kills the process instead of stopping the service.
+      feedback: systemd restarts it (Restart=always). Stop and disable the unit and remove the package.
+      expectFail: [port-closed, package-removed]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          ssh fleet-wk-2 'sudo pkill -f qm-console-bridge; sleep 8'
+    - id: disabled-only
+      description: Stops and disables the unit but keeps the package.
+      feedback: The task requires removing the package as well.
+      expectFail: [package-removed]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          ssh fleet-wk-2 'sudo systemctl disable --now qm-console-bridge.service'
+  solution:
+    explanation: ss -tlnp shows the process; systemctl status names the unit; dpkg -S names the package; removing it stops and disables the unit through its prerm script.
+    steps:
+      - on: workstation
+        as: learner
+        run: |
+          ssh fleet-wk-2 'sudo bash -s' <<'EOS'
+          ss -tlnp 'sport = :{{port}}'
+          systemctl disable --now qm-console-bridge.service
+          dpkg -S /usr/sbin/qm-console-bridge
+          apt-get purge -y qm-console-bridge
+          EOS
+    alternatives:
+      - id: apt-remove-only
+        description: apt-get remove alone (its prerm stops and disables the unit).
+        steps:
+          - on: workstation
+            as: learner
+            run: |
+              ssh fleet-wk-2 'sudo apt-get remove -y qm-console-bridge'

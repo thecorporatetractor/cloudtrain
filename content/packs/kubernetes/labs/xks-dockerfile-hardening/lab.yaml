@@ -1,0 +1,226 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xks-dockerfile-hardening
+  title: Harden a Containerfile
+  domain: kubernetes
+  frameworks: [cks:supply-chain-security]
+  difficulty: medium
+  estimatedMinutes: 7
+  tags: [exam, containerfile, image-footprint, non-root]
+  version: 1
+spec:
+  description: |
+    Edit `~/exam/waybill/Containerfile` on your workstation (you do not need
+    to build it) so that:
+
+    1. it is a **multi-stage** build: the existing Go build stays in a
+       builder stage, and the **final stage** starts from the pinned minimal
+       base
+
+       `registry.quillmoor.example/base/static-nonroot:2026.10@sha256:{{digest}}`
+
+       and copies only the `waybill-api` binary from the builder;
+    2. the final stage runs as a **non-root** user (UID `65532`);
+    3. the final stage contains **no build or debugging tools**: no package
+       installs and no compilers (drop the `curl`/`vim-tiny` install).
+
+    Keep the `ENTRYPOINT` and `EXPOSE` lines.
+  objectives:
+    - Split a build into builder and runtime stages
+    - Pin a minimal base image by digest
+    - Run the final image as a non-root user
+  params:
+    digest:
+      type: choice
+      values:
+        - 9f2c4e8a1b7d3f60c5e2a9b8d7c6f5e4a3b2c1d0e9f8a7b6c5d4e3f2a1b0c9d8
+        - 3a1b5c7d9e2f4a6b8c0d1e3f5a7b9c2d4e6f8a0b1c3d5e7f9a2b4c6d8e0f1a3b
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+  setup:
+    - on: workstation
+      file: {path: /home/learner/exam/waybill/Containerfile, source: assets/Containerfile, mode: "0644"}
+    - on: workstation
+      run: chown -R learner:learner /home/learner/exam
+  checks:
+    - id: final-base-pinned
+      description: The final stage starts FROM the pinned minimal base, and the build has at least two stages
+      type: shell
+      on: workstation
+      skills: [k8s.security.image-footprint]
+      weight: 2
+      command: |
+        f=/home/learner/exam/waybill/Containerfile
+        [ -f $f ] || { echo "missing"; exit 0; }
+        awk '
+          { sub(/\r$/, "") }
+          /^[ \t]*#/ || /^[ \t]*$/ { next }
+          toupper($1) == "FROM" { n++; img = ""; for (i = 2; i <= NF; i++) if ($i !~ /^--/) { img = $i; break }; final = img; next }
+          END { printf "stages=%d final=%s\n", n, final }
+        ' $f
+      expect: {match: regex, value: "^stages=[2-9] final=registry\\.quillmoor\\.example/base/static-nonroot:2026\\.10@sha256:{{digest}}$"}
+    - id: final-non-root
+      description: The final stage sets USER 65532 (non-root)
+      type: shell
+      on: workstation
+      skills: [k8s.security.image-footprint]
+      weight: 2
+      command: |
+        f=/home/learner/exam/waybill/Containerfile
+        awk '
+          { sub(/\r$/, "") }
+          /^[ \t]*#/ { next }
+          toupper($1) == "FROM" { user = "unset"; next }
+          toupper($1) == "USER" { user = $2 }
+          END { print "user=" user }
+        ' $f 2>/dev/null
+      expect: {match: regex, value: "^user=65532(:65532)?$"}
+    - id: final-no-tools
+      description: The final stage installs nothing and only copies the binary from the builder
+      type: shell
+      on: workstation
+      skills: [k8s.security.image-footprint]
+      weight: 2
+      command: |
+        f=/home/learner/exam/waybill/Containerfile
+        awk '
+          { sub(/\r$/, "") }
+          /^[ \t]*#/ { next }
+          toupper($1) == "FROM" { runs = 0; copyfrom = 0; plaincopy = 0; next }
+          toupper($1) == "RUN" { runs++ }
+          toupper($1) == "COPY" || toupper($1) == "ADD" { if ($0 ~ /--from=/) copyfrom++; else plaincopy++ }
+          END { printf "run=%d copy-from=%s plain-copy=%d\n", runs, (copyfrom > 0 ? "yes" : "no"), plaincopy }
+        ' $f 2>/dev/null
+      expect: {match: exact, value: run=0 copy-from=yes plain-copy=0}
+    - id: entrypoint-kept
+      description: ENTRYPOINT and EXPOSE are unchanged in the final stage
+      type: shell
+      on: workstation
+      skills: [k8s.security.image-footprint]
+      weight: 0.5
+      command: |
+        f=/home/learner/exam/waybill/Containerfile
+        awk '
+          { sub(/\r$/, "") }
+          toupper($1) == "FROM" { e = ""; x = ""; next }
+          toupper($1) == "ENTRYPOINT" { e = $0 }
+          toupper($1) == "EXPOSE" { x = $2 }
+          END { print (e ~ /\/usr\/local\/bin\/waybill-api/ ? "entrypoint=ok" : "entrypoint=missing") " expose=" x }
+        ' $f 2>/dev/null
+      expect: {match: exact, value: entrypoint=ok expose=8080}
+  misconceptions:
+    - id: tag-not-digest
+      description: Uses the base by tag only, without the digest.
+      feedback: A tag can be moved; pin the base by its sha256 digest as given.
+      expectFail: [final-base-pinned]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          cat > ~/exam/waybill/Containerfile <<'EOF'
+          FROM registry.quillmoor.example/mirror/golang:1.25 AS build
+          WORKDIR /src
+          COPY go.mod go.sum ./
+          RUN go mod download
+          COPY . .
+          RUN CGO_ENABLED=0 go build -trimpath -o /usr/local/bin/waybill-api ./cmd/waybill-api
+
+          FROM registry.quillmoor.example/base/static-nonroot:2026.10
+          COPY --from=build /usr/local/bin/waybill-api /usr/local/bin/waybill-api
+          USER 65532
+          EXPOSE 8080
+          ENTRYPOINT ["/usr/local/bin/waybill-api"]
+          EOF
+    - id: tools-in-final
+      description: Keeps the curl/vim-tiny install, now in the final stage.
+      feedback: The final image must carry nothing but the binary; drop the package install.
+      expectFail: [final-no-tools]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          cat > ~/exam/waybill/Containerfile <<'EOF'
+          FROM registry.quillmoor.example/mirror/golang:1.25 AS build
+          WORKDIR /src
+          COPY go.mod go.sum ./
+          RUN go mod download
+          COPY . .
+          RUN CGO_ENABLED=0 go build -trimpath -o /usr/local/bin/waybill-api ./cmd/waybill-api
+
+          FROM registry.quillmoor.example/base/static-nonroot:2026.10@sha256:{{digest}}
+          COPY --from=build /usr/local/bin/waybill-api /usr/local/bin/waybill-api
+          RUN apt-get update && apt-get install -y curl vim-tiny
+          USER 65532
+          EXPOSE 8080
+          ENTRYPOINT ["/usr/local/bin/waybill-api"]
+          EOF
+    - id: user-in-builder
+      description: Sets USER in the builder stage, which does not carry over to the final stage.
+      feedback: USER applies per stage; set it in the final stage.
+      expectFail: [final-non-root]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          cat > ~/exam/waybill/Containerfile <<'EOF'
+          FROM registry.quillmoor.example/mirror/golang:1.25 AS build
+          USER 65532
+          WORKDIR /src
+          COPY go.mod go.sum ./
+          RUN go mod download
+          COPY . .
+          RUN CGO_ENABLED=0 go build -trimpath -o /usr/local/bin/waybill-api ./cmd/waybill-api
+
+          FROM registry.quillmoor.example/base/static-nonroot:2026.10@sha256:{{digest}}
+          COPY --from=build /usr/local/bin/waybill-api /usr/local/bin/waybill-api
+          EXPOSE 8080
+          ENTRYPOINT ["/usr/local/bin/waybill-api"]
+          EOF
+  solution:
+    explanation: Name the Go stage, start a second stage from the digest-pinned base, copy just the binary, set USER 65532 and keep EXPOSE and ENTRYPOINT.
+    steps:
+      - on: workstation
+        as: learner
+        run: |
+          cat > ~/exam/waybill/Containerfile <<'EOF'
+          # waybill-api: prints and validates waybills for the depot scanners.
+          FROM registry.quillmoor.example/mirror/golang:1.25 AS build
+          WORKDIR /src
+          COPY go.mod go.sum ./
+          RUN go mod download
+          COPY . .
+          RUN CGO_ENABLED=0 go build -trimpath -o /usr/local/bin/waybill-api ./cmd/waybill-api
+
+          FROM registry.quillmoor.example/base/static-nonroot:2026.10@sha256:{{digest}}
+          COPY --from=build /usr/local/bin/waybill-api /usr/local/bin/waybill-api
+          USER 65532:65532
+          EXPOSE 8080
+          ENTRYPOINT ["/usr/local/bin/waybill-api"]
+          EOF
+    alternatives:
+      - id: stage-index
+        description: Refer to the builder by index and put USER before COPY.
+        steps:
+          - on: workstation
+            as: learner
+            run: |
+              cat > ~/exam/waybill/Containerfile <<'EOF'
+              FROM registry.quillmoor.example/mirror/golang:1.25
+              WORKDIR /src
+              COPY go.mod go.sum ./
+              RUN go mod download
+              COPY . .
+              RUN CGO_ENABLED=0 go build -trimpath -o /usr/local/bin/waybill-api ./cmd/waybill-api
+
+              FROM --platform=linux/amd64 registry.quillmoor.example/base/static-nonroot:2026.10@sha256:{{digest}}
+              USER 65532
+              COPY --from=0 --chown=65532:65532 /usr/local/bin/waybill-api /usr/local/bin/waybill-api
+              EXPOSE 8080
+              ENTRYPOINT ["/usr/local/bin/waybill-api"]
+              EOF

@@ -1,0 +1,198 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xks-seccomp-localhost
+  title: Apply a custom seccomp profile
+  domain: kubernetes
+  frameworks: [cks:system-hardening]
+  difficulty: medium
+  estimatedMinutes: 7
+  tags: [exam, seccomp]
+  version: 1
+spec:
+  description: |
+    Context: `qm-fleet` (`kubectl config use-context qm-fleet`).
+
+    The seccomp profile `label-render.json` has been placed on node
+    `fleet-wk-1` in `/var/lib/kubelet/seccomp/profiles/`. It blocks the
+    `chmod` family of system calls.
+
+    The Pod `label-render` in namespace `{{ns}}` runs without it. Recreate
+    `label-render` (same name, image and command, still on `fleet-wk-1`) so
+    that its container runs with that **Localhost** seccomp profile.
+  objectives:
+    - Reference a Localhost seccomp profile relative to the kubelet seccomp root
+  params:
+    ns:
+      type: choice
+      values: [fleet-labels, label-studio, print-farm]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-fleet
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-fleet
+          nodes:
+            - {name: fleet-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: fleet-wk-1, role: worker}
+  setup:
+    - on: qm-fleet/fleet-wk-1
+      run: |
+        set -e
+        mkdir -p /var/lib/kubelet/seccomp/profiles
+        cat > /var/lib/kubelet/seccomp/profiles/label-render.json <<'EOF'
+        {
+          "defaultAction": "SCMP_ACT_ALLOW",
+          "architectures": ["SCMP_ARCH_X86_64", "SCMP_ARCH_X86", "SCMP_ARCH_X32"],
+          "syscalls": [
+            {"names": ["chmod", "fchmod", "fchmodat", "fchmodat2"], "action": "SCMP_ACT_ERRNO"}
+          ]
+        }
+        EOF
+    - on: qm-fleet
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: "{{ns}}"}
+        ---
+        apiVersion: v1
+        kind: Pod
+        metadata: {name: label-render, namespace: "{{ns}}", labels: {app: label-render}}
+        spec:
+          nodeName: fleet-wk-1
+          containers:
+            - name: render
+              image: busybox:1.37
+              command: ["sh", "-c", "while true; do date > /tmp/last-render; sleep 10; done"]
+    - on: qm-fleet
+      timeoutSec: 150
+      run: kubectl -n {{ns}} wait pod/label-render --for=condition=Ready --timeout=140s
+  teardown:
+    - on: qm-fleet
+      run: kubectl delete namespace {{ns}} --ignore-not-found --wait=false
+  checks:
+    - id: profile-referenced
+      description: label-render uses the Localhost profile profiles/label-render.json
+      type: shell
+      on: qm-fleet
+      skills: [k8s.security.seccomp-apparmor]
+      weight: 2
+      command: |
+        kubectl -n {{ns}} get pod label-render -o json 2>/dev/null | jq -r '
+          (.spec.containers[0].securityContext.seccompProfile // .spec.securityContext.seccompProfile // {}) | "\(.type)/\(.localhostProfile)"'
+      expect: {match: exact, value: Localhost/profiles/label-render.json}
+    - id: running
+      description: label-render is Running on fleet-wk-1 with busybox:1.37
+      type: shell
+      on: qm-fleet
+      skills: [k8s.security.seccomp-apparmor]
+      timeoutSec: 60
+      command: |
+        kubectl -n {{ns}} wait pod/label-render --for=condition=Ready --timeout=40s >/dev/null 2>&1
+        kubectl -n {{ns}} get pod label-render -o jsonpath='{.status.phase}/{.spec.nodeName}/{.spec.containers[0].image}' 2>/dev/null
+      expect: {match: exact, value: Running/fleet-wk-1/busybox:1.37}
+    - id: chmod-blocked
+      description: chmod inside the container is refused by seccomp
+      type: shell
+      on: qm-fleet
+      skills: [k8s.security.seccomp-apparmor]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        out=$(kubectl -n {{ns}} exec label-render -- sh -c 'touch /tmp/qm-s && chmod 600 /tmp/qm-s && echo changed' 2>&1)
+        case "$out" in *changed*) echo allowed ;; *"not permitted"*) echo blocked ;; *) echo "unexpected: $out" ;; esac
+      expect: {match: exact, value: blocked}
+  misconceptions:
+    - id: absolute-path
+      description: Gives localhostProfile as the absolute path on the node.
+      feedback: localhostProfile is relative to the kubelet's seccomp root (/var/lib/kubelet/seccomp); the Pod fails to start with an absolute path.
+      expectFail: [profile-referenced, running]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-fleet
+          kubectl -n {{ns}} delete pod label-render --now
+          kubectl apply -f - <<'YAML'
+          apiVersion: v1
+          kind: Pod
+          metadata: {name: label-render, namespace: "{{ns}}"}
+          spec:
+            nodeName: fleet-wk-1
+            securityContext:
+              seccompProfile: {type: Localhost, localhostProfile: /var/lib/kubelet/seccomp/profiles/label-render.json}
+            containers:
+              - name: render
+                image: busybox:1.37
+                command: ["sh", "-c", "while true; do date > /tmp/last-render; sleep 10; done"]
+          YAML
+          sleep 20
+    - id: runtime-default
+      description: Uses RuntimeDefault instead of the provided profile.
+      feedback: RuntimeDefault allows chmod; reference the Localhost profile.
+      expectFail: [profile-referenced, chmod-blocked]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-fleet
+          kubectl -n {{ns}} delete pod label-render --now
+          kubectl apply -f - <<'YAML'
+          apiVersion: v1
+          kind: Pod
+          metadata: {name: label-render, namespace: "{{ns}}"}
+          spec:
+            nodeName: fleet-wk-1
+            securityContext:
+              seccompProfile: {type: RuntimeDefault}
+            containers:
+              - name: render
+                image: busybox:1.37
+                command: ["sh", "-c", "while true; do date > /tmp/last-render; sleep 10; done"]
+          YAML
+          kubectl -n {{ns}} wait pod/label-render --for=condition=Ready --timeout=90s
+  solution:
+    explanation: The localhostProfile path is relative to /var/lib/kubelet/seccomp, so it is profiles/label-render.json.
+    steps:
+      - on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-fleet
+          kubectl -n {{ns}} get pod label-render -o json \
+            | jq 'del(.status, .metadata.uid, .metadata.resourceVersion, .metadata.creationTimestamp, .metadata.managedFields)
+                  | .spec.containers[0].securityContext.seccompProfile = {"type": "Localhost", "localhostProfile": "profiles/label-render.json"}' > /tmp/label-render.json
+          kubectl replace --force -f /tmp/label-render.json
+          kubectl -n {{ns}} wait pod/label-render --for=condition=Ready --timeout=90s
+    alternatives:
+      - id: pod-level
+        description: Set the profile at Pod level in a fresh manifest.
+        steps:
+          - on: workstation
+            as: learner
+            run: |
+              kubectl config use-context qm-fleet
+              kubectl -n {{ns}} delete pod label-render --now
+              kubectl apply -f - <<'YAML'
+              apiVersion: v1
+              kind: Pod
+              metadata: {name: label-render, namespace: "{{ns}}"}
+              spec:
+                nodeName: fleet-wk-1
+                securityContext:
+                  seccompProfile:
+                    type: Localhost
+                    localhostProfile: profiles/label-render.json
+                containers:
+                  - name: render
+                    image: busybox:1.37
+                    command: ["sh", "-c", "while true; do date > /tmp/last-render; sleep 10; done"]
+              YAML
+              kubectl -n {{ns}} wait pod/label-render --for=condition=Ready --timeout=90s

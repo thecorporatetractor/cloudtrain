@@ -1,0 +1,132 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xks-wireguard-cni
+  title: Turn on pod-to-pod encryption
+  domain: kubernetes
+  frameworks: [cks:microservice-vulnerabilities]
+  difficulty: hard
+  estimatedMinutes: 10
+  tags: [exam, cni, calico, wireguard]
+  version: 1
+spec:
+  description: |
+    Context: `qm-customs` (`kubectl config use-context qm-customs`). The CNI
+    is Calico.
+
+    1. Enable Calico's **WireGuard** encryption for pod-to-pod traffic
+       between nodes.
+    2. Once it is active, write the WireGuard **public key** that Calico
+       reports for node `customs-wk-1` to `~/exam/wireguard-key.txt` on your
+       workstation (the key only, one line).
+  objectives:
+    - Enable WireGuard in Calico and read its status
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-customs
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-customs
+          nodes:
+            - {name: customs-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: customs-wk-1, role: worker}
+  setup:
+    - on: workstation
+      run: mkdir -p /home/learner/exam && chown learner:learner /home/learner/exam
+  checks:
+    - id: enabled
+      description: The default FelixConfiguration enables WireGuard
+      type: shell
+      on: qm-customs
+      skills: [k8s.security.mtls]
+      command: kubectl get felixconfigurations.crd.projectcalico.org default -o jsonpath='{.spec.wireguardEnabled}' 2>/dev/null || echo missing
+      expect: {match: exact, value: "true"}
+    - id: active
+      description: Both nodes report a WireGuard public key
+      type: shell
+      on: qm-customs
+      skills: [k8s.security.mtls]
+      timeoutSec: 60
+      command: |
+        for i in $(seq 1 10); do
+          n=$(kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.annotations.projectcalico\.org/WireguardPublicKey}{"\n"}{end}' | grep -c .)
+          [ "$n" = 2 ] && break; sleep 4
+        done
+        echo "keys=$n"
+      expect: {match: exact, value: keys=2}
+    - id: key-written
+      description: ~/exam/wireguard-key.txt holds customs-wk-1's WireGuard public key
+      type: shell
+      on: workstation
+      skills: [k8s.security.mtls]
+      weight: 2
+      command: |
+        want=$(kubectl --kubeconfig /home/learner/.kube/config --context qm-customs get node customs-wk-1 -o jsonpath='{.metadata.annotations.projectcalico\.org/WireguardPublicKey}' 2>/dev/null)
+        got=$(tr -d ' \r\n' < /home/learner/exam/wireguard-key.txt 2>/dev/null)
+        if [ -z "$want" ]; then echo "no key reported"; elif [ "$got" = "$want" ]; then echo match; else echo mismatch; fi
+      expect: {match: exact, value: match}
+  misconceptions:
+    - id: other-node-key
+      description: Writes the control plane's key instead of customs-wk-1's.
+      feedback: Each node has its own key pair; read the annotation of customs-wk-1.
+      expectFail: [key-written]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          kubectl config use-context qm-customs
+          kubectl patch felixconfigurations.crd.projectcalico.org default --type=merge -p '{"spec":{"wireguardEnabled":true}}'
+          for i in $(seq 1 60); do
+            n=$(kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.annotations.projectcalico\.org/WireguardPublicKey}{"\n"}{end}' | grep -c .)
+            [ "$n" = 2 ] && break; sleep 5
+          done
+          kubectl get node customs-cp-1 -o jsonpath='{.metadata.annotations.projectcalico\.org/WireguardPublicKey}' > ~/exam/wireguard-key.txt
+    - id: key-before-active
+      description: Writes the file right after the patch, before the key exists.
+      feedback: The key appears only after Felix has set up the tunnel; wait for the annotation.
+      expectFail: [key-written]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-customs
+          kubectl get node customs-wk-1 -o jsonpath='{.metadata.annotations.projectcalico\.org/WireguardPublicKey}' > ~/exam/wireguard-key.txt
+          kubectl patch felixconfigurations.crd.projectcalico.org default --type=merge -p '{"spec":{"wireguardEnabled":true}}'
+  solution:
+    explanation: Patch the default FelixConfiguration; when Felix has created the tunnel, each node carries the annotation projectcalico.org/WireguardPublicKey.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          kubectl config use-context qm-customs
+          kubectl patch felixconfigurations.crd.projectcalico.org default --type=merge -p '{"spec":{"wireguardEnabled":true}}'
+          for i in $(seq 1 60); do
+            k=$(kubectl get node customs-wk-1 -o jsonpath='{.metadata.annotations.projectcalico\.org/WireguardPublicKey}')
+            [ -n "$k" ] && break; sleep 5
+          done
+          echo "$k" > ~/exam/wireguard-key.txt
+    alternatives:
+      - id: calico-node-resource
+        description: Read the key from the Calico Node resource status instead of the Kubernetes Node annotation.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 300
+            run: |
+              kubectl config use-context qm-customs
+              kubectl get felixconfigurations.crd.projectcalico.org default -o json | jq '.spec.wireguardEnabled = true' | kubectl replace -f -
+              for i in $(seq 1 60); do
+                k=$(kubectl get nodes.crd.projectcalico.org customs-wk-1 -o jsonpath='{.status.wireguardPublicKey}' 2>/dev/null)
+                [ -n "$k" ] && break; sleep 5
+              done
+              echo "$k" > ~/exam/wireguard-key.txt

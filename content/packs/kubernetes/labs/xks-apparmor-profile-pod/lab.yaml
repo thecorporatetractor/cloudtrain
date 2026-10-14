@@ -1,0 +1,175 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xks-apparmor-profile-pod
+  title: Apply an AppArmor profile to a Pod
+  domain: kubernetes
+  frameworks: [cks:system-hardening]
+  difficulty: medium
+  estimatedMinutes: 8
+  tags: [exam, apparmor]
+  version: 1
+spec:
+  description: |
+    Context: `qm-fleet` (`kubectl config use-context qm-fleet`). Node
+    `fleet-wk-1` is reachable with `ssh fleet-wk-1` (`sudo` works).
+
+    1. Load the AppArmor profile in `/opt/qm-profiles/{{profile}}` on
+       `fleet-wk-1` in **enforce** mode.
+    2. Create a Pod named `scanner` in namespace `fleet-scan` that runs image
+       `busybox:1.37` with command `sleep 1d` on node `fleet-wk-1`, confined
+       by that profile.
+  objectives:
+    - Load an AppArmor profile and reference it from a Pod
+  params:
+    profile:
+      type: choice
+      values: [qm-scanner-readonly, scanner-no-write, qm-scan-confined]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-fleet
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        access: [ssh]
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-fleet
+          nodes:
+            - {name: fleet-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: fleet-wk-1, role: worker}
+  setup:
+    - on: qm-fleet/fleet-wk-1
+      run: |
+        set -e
+        mkdir -p /opt/qm-profiles
+        cat > /opt/qm-profiles/{{profile}} <<'EOF'
+        #include <tunables/global>
+
+        profile {{profile}} flags=(attach_disconnected) {
+          #include <abstractions/base>
+          file,
+          deny /** w,
+        }
+        EOF
+    - on: qm-fleet
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: fleet-scan}
+  teardown:
+    - on: qm-fleet
+      run: kubectl delete namespace fleet-scan --ignore-not-found --wait=false
+  checks:
+    - id: profile-enforced
+      description: "{{profile}} is loaded in enforce mode on fleet-wk-1"
+      type: shell
+      on: qm-fleet/fleet-wk-1
+      skills: [k8s.security.seccomp-apparmor]
+      command: grep -qx '{{profile}} (enforce)' /sys/kernel/security/apparmor/profiles && echo enforce || echo missing
+      expect: {match: exact, value: enforce}
+    - id: pod-on-node
+      description: Pod scanner runs busybox:1.37 on fleet-wk-1
+      type: shell
+      on: qm-fleet
+      skills: [k8s.security.seccomp-apparmor]
+      timeoutSec: 60
+      command: |
+        kubectl -n fleet-scan wait pod/scanner --for=condition=Ready --timeout=40s >/dev/null 2>&1
+        kubectl -n fleet-scan get pod scanner -o jsonpath='{.status.phase}/{.spec.nodeName}/{.spec.containers[0].image}' 2>/dev/null
+      expect: {match: exact, value: Running/fleet-wk-1/busybox:1.37}
+    - id: confined
+      description: The scanner process is confined by {{profile}} in enforce mode
+      type: shell
+      on: qm-fleet
+      skills: [k8s.security.seccomp-apparmor]
+      weight: 2
+      timeoutSec: 30
+      command: kubectl -n fleet-scan exec scanner -- cat /proc/1/attr/current 2>/dev/null || echo "exec failed"
+      expect: {match: exact, value: "{{profile}} (enforce)"}
+  misconceptions:
+    - id: complain-mode
+      description: Loads the profile in complain mode.
+      feedback: Complain mode only logs; load it without -C so it is enforced.
+      expectFail: [profile-enforced, confined]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-fleet
+          ssh fleet-wk-1 'sudo apparmor_parser -C -r /opt/qm-profiles/{{profile}}'
+          kubectl apply -f - <<'YAML'
+          apiVersion: v1
+          kind: Pod
+          metadata: {name: scanner, namespace: fleet-scan}
+          spec:
+            nodeName: fleet-wk-1
+            securityContext:
+              appArmorProfile: {type: Localhost, localhostProfile: "{{profile}}"}
+            containers:
+              - {name: scanner, image: busybox:1.37, command: ["sleep", "1d"]}
+          YAML
+          kubectl -n fleet-scan wait pod/scanner --for=condition=Ready --timeout=90s
+    - id: runtime-default
+      description: Uses the runtime's default AppArmor profile instead of the provided one.
+      feedback: Reference the loaded profile with type Localhost and its name.
+      expectFail: [confined]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-fleet
+          ssh fleet-wk-1 'sudo apparmor_parser -r /opt/qm-profiles/{{profile}}'
+          kubectl apply -f - <<'YAML'
+          apiVersion: v1
+          kind: Pod
+          metadata: {name: scanner, namespace: fleet-scan}
+          spec:
+            nodeName: fleet-wk-1
+            securityContext:
+              appArmorProfile: {type: RuntimeDefault}
+            containers:
+              - {name: scanner, image: busybox:1.37, command: ["sleep", "1d"]}
+          YAML
+          kubectl -n fleet-scan wait pod/scanner --for=condition=Ready --timeout=90s
+  solution:
+    explanation: apparmor_parser loads the profile in enforce mode; the Pod pins itself to fleet-wk-1 and references the profile as Localhost.
+    steps:
+      - on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-fleet
+          ssh fleet-wk-1 'sudo apparmor_parser -r /opt/qm-profiles/{{profile}}'
+          kubectl apply -f - <<'YAML'
+          apiVersion: v1
+          kind: Pod
+          metadata: {name: scanner, namespace: fleet-scan}
+          spec:
+            nodeSelector: {kubernetes.io/hostname: fleet-wk-1}
+            containers:
+              - name: scanner
+                image: busybox:1.37
+                command: ["sleep", "1d"]
+                securityContext:
+                  appArmorProfile:
+                    type: Localhost
+                    localhostProfile: {{profile}}
+          YAML
+          kubectl -n fleet-scan wait pod/scanner --for=condition=Ready --timeout=90s
+    alternatives:
+      - id: nodename-pod-level
+        description: Bind with nodeName and set the profile at Pod level.
+        steps:
+          - on: workstation
+            as: learner
+            run: |
+              kubectl config use-context qm-fleet
+              ssh fleet-wk-1 'sudo apparmor_parser -q /opt/qm-profiles/{{profile}} || sudo apparmor_parser -r /opt/qm-profiles/{{profile}}'
+              kubectl -n fleet-scan run scanner --image=busybox:1.37 --restart=Never \
+                --overrides='{"spec":{"nodeName":"fleet-wk-1","securityContext":{"appArmorProfile":{"type":"Localhost","localhostProfile":"{{profile}}"}}}}' -- sleep 1d
+              kubectl -n fleet-scan wait pod/scanner --for=condition=Ready --timeout=90s

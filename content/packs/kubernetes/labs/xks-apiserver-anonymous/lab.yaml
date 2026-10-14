@@ -1,0 +1,173 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xks-apiserver-anonymous
+  title: Disable anonymous API access
+  domain: kubernetes
+  frameworks: [cks:cluster-hardening]
+  difficulty: hard
+  estimatedMinutes: 10
+  tags: [exam, kube-apiserver, anonymous-auth, authentication]
+  version: 1
+spec:
+  description: |
+    Context: `qm-ledger`. The API server is a static Pod on `ledger-cp-1`
+    (`ssh ledger-cp-1`, `sudo` works).
+
+    Turn off anonymous authentication on the qm-ledger API server: every
+    unauthenticated request must get **HTTP 401**, except the health
+    endpoints `/livez`, `/readyz` and `/healthz`, which the kubelet probes
+    without credentials and which must keep answering.
+
+    Afterwards the admin kubeconfig (`kubectl --context qm-ledger`) must still
+    work.
+  objectives:
+    - Restrict anonymous authentication to health endpoints
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-ledger
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        access: [ssh]
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-ledger
+          nodes:
+            - {name: ledger-cp-1, role: control-plane, taints: []}
+  setup:
+    - on: qm-ledger
+      apply: |
+        apiVersion: rbac.authorization.k8s.io/v1
+        kind: ClusterRoleBinding
+        metadata: {name: ledger-public-read}
+        roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: view}
+        subjects:
+          - {apiGroup: rbac.authorization.k8s.io, kind: User, name: "system:anonymous"}
+  teardown:
+    - on: qm-ledger
+      run: kubectl delete clusterrolebinding ledger-public-read --ignore-not-found
+  checks:
+    - id: anonymous-401
+      description: Anonymous requests to /api/v1/namespaces and /version get 401
+      type: shell
+      on: qm-ledger/ledger-cp-1
+      skills: [k8s.security.api-server-hardening]
+      weight: 3
+      timeoutSec: 30
+      command: |
+        a=$(curl -sk -m 5 -o /dev/null -w '%{http_code}' https://127.0.0.1:6443/api/v1/namespaces)
+        b=$(curl -sk -m 5 -o /dev/null -w '%{http_code}' https://127.0.0.1:6443/version)
+        echo "api=$a version=$b"
+      expect: {match: exact, value: api=401 version=401}
+    - id: health-200
+      description: The health endpoints still answer 200 without credentials
+      type: shell
+      on: qm-ledger/ledger-cp-1
+      skills: [k8s.security.api-server-hardening]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        for p in livez readyz healthz; do printf '%s=%s ' $p "$(curl -sk -m 5 -o /dev/null -w '%{http_code}' https://127.0.0.1:6443/$p)"; done; echo
+      expect: {match: exact, value: "livez=200 readyz=200 healthz=200 "}
+    - id: admin-works
+      description: The admin kubeconfig still works
+      type: shell
+      on: qm-ledger
+      skills: [k8s.security.api-server-hardening]
+      timeoutSec: 30
+      command: kubectl get ns kube-system -o name 2>&1
+      expect: {match: exact, value: namespace/kube-system}
+  misconceptions:
+    - id: deleted-binding-only
+      description: Deletes the view binding for system:anonymous but leaves anonymous authentication on.
+      feedback: Anonymous requests then get 403, not 401; they are still authenticated as system:anonymous. Disable anonymous authentication itself.
+      expectFail: [anonymous-401]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-ledger
+          kubectl delete clusterrolebinding ledger-public-read
+    - id: anonymous-auth-false
+      description: Uses --anonymous-auth=false, which also closes the health endpoints.
+      feedback: The probes need unauthenticated /livez and /readyz. Use an AuthenticationConfiguration with anonymous.conditions for the health paths.
+      expectFail: [health-200]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 600
+        run: |
+          ssh ledger-cp-1 'sudo bash -s' <<'EOS'
+          sed -i 's#^    - kube-apiserver$#    - kube-apiserver\n    - --anonymous-auth=false#' /etc/kubernetes/manifests/kube-apiserver.yaml
+          for i in $(seq 1 90); do
+            ps -C kube-apiserver -o args= | grep -q -- --anonymous-auth=false && [ "$(curl -sk -o /dev/null -w '%{http_code}' https://127.0.0.1:6443/livez)" = 401 ] && break
+            sleep 5
+          done
+          EOS
+  solution:
+    explanation: |
+      An AuthenticationConfiguration with anonymous.enabled true and conditions
+      for the three health paths limits anonymous authentication to them; every
+      other unauthenticated request gets 401. The flag --authentication-config
+      replaces --anonymous-auth (the two must not be combined).
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 600
+        run: |
+          ssh ledger-cp-1 'sudo bash -s' <<'EOS'
+          set -e
+          mkdir -p /etc/kubernetes/authn
+          cat > /etc/kubernetes/authn/authn.yaml <<'EOF'
+          apiVersion: apiserver.config.k8s.io/v1
+          kind: AuthenticationConfiguration
+          anonymous:
+            enabled: true
+            conditions:
+              - path: /livez
+              - path: /readyz
+              - path: /healthz
+          EOF
+          python3 - <<'PY'
+          import yaml
+          p = "/etc/kubernetes/manifests/kube-apiserver.yaml"
+          m = yaml.safe_load(open(p))
+          c = m["spec"]["containers"][0]
+          c["command"] = [a for a in c["command"] if not a.startswith("--anonymous-auth")] + ["--authentication-config=/etc/kubernetes/authn/authn.yaml"]
+          c.setdefault("volumeMounts", []).append({"name": "authn", "mountPath": "/etc/kubernetes/authn", "readOnly": True})
+          m["spec"].setdefault("volumes", []).append({"name": "authn", "hostPath": {"path": "/etc/kubernetes/authn", "type": "Directory"}})
+          open(p, "w").write(yaml.safe_dump(m, default_flow_style=False))
+          PY
+          for i in $(seq 1 90); do
+            ps -C kube-apiserver -o args= | grep -q -- --authentication-config= && [ "$(curl -sk -o /dev/null -w '%{http_code}' https://127.0.0.1:6443/version)" = 401 ] && break
+            sleep 5
+          done
+          EOS
+          kubectl config use-context qm-ledger
+          kubectl get ns kube-system
+    alternatives:
+      - id: sed-and-file-mount
+        description: Mount just the file and edit the manifest with sed.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 600
+            run: |
+              ssh ledger-cp-1 'sudo bash -s' <<'EOS'
+              set -e
+              printf 'apiVersion: apiserver.config.k8s.io/v1\nkind: AuthenticationConfiguration\nanonymous:\n  enabled: true\n  conditions:\n  - path: /healthz\n  - path: /readyz\n  - path: /livez\n' > /etc/kubernetes/anonymous-health.yaml
+              m=/etc/kubernetes/manifests/kube-apiserver.yaml
+              sed -i 's#^    - kube-apiserver$#    - kube-apiserver\n    - --authentication-config=/etc/kubernetes/anonymous-health.yaml#' $m
+              sed -i 's#^    volumeMounts:$#    volumeMounts:\n    - mountPath: /etc/kubernetes/anonymous-health.yaml\n      name: authn\n      readOnly: true#' $m
+              sed -i 's#^  volumes:$#  volumes:\n  - hostPath:\n      path: /etc/kubernetes/anonymous-health.yaml\n      type: File\n    name: authn#' $m
+              for i in $(seq 1 90); do
+                ps -C kube-apiserver -o args= | grep -q -- --authentication-config= && [ "$(curl -sk -o /dev/null -w '%{http_code}' https://127.0.0.1:6443/version)" = 401 ] && break
+                sleep 5
+              done
+              EOS

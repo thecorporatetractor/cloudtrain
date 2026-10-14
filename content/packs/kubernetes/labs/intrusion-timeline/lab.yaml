@@ -1,0 +1,475 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: intrusion-timeline
+  title: Reconstruct an intrusion from audit and runtime data
+  domain: kubernetes
+  frameworks: [cks:monitoring-runtime-security]
+  difficulty: hard
+  estimatedMinutes: 35
+  tags: [incident-response, audit, runtime-detection, serviceaccount, forensics]
+  version: 1
+spec:
+  description: |
+    Quillmoor Logistics' billing team noticed that the payment gateway
+    credentials in namespace `billing` of the ledger cluster are being read
+    by something that should not touch them. The API server's audit log and
+    the runtime detector's alerts are your evidence.
+
+    From your workstation, switch to context `qm-ledger`
+    (`kubectl config use-context qm-ledger`). Nodes are reachable with
+    `ssh <node>` (`sudo` works).
+
+    Evidence:
+
+    - audit log (JSON lines): `/var/log/kubernetes/audit/audit.log` on
+      `ledger-cp-1`;
+    - runtime alerts (JSON lines): `/var/log/qm-runtime/alerts.json` on
+      `ledger-wk-1`;
+    - the running Pods and their processes.
+
+    1. Find out **which ServiceAccount's token** reads Secrets in `billing`,
+       **which Secret holds that token**, and **which Pod** the requests come
+       from. Write your findings to `~/incident/findings.txt` on the
+       workstation as three lines:
+
+       ```
+       serviceaccount=<namespace>/<name>
+       token-secret=<namespace>/<name>
+       pod=<namespace>/<name>
+       ```
+    2. **Revoke** the leaked token so it no longer authenticates. Legitimate
+       workloads that use the same ServiceAccount through their own (projected)
+       tokens must keep working.
+    3. **Isolate** the Pod with a NetworkPolicy that denies all its ingress
+       and egress, and label it `quarantine=true`. Do not delete or restart
+       it: it is evidence.
+  objectives:
+    - Correlate audit events (user, source IP) with Pods
+    - Use runtime alerts and process listings as corroborating evidence
+    - Revoke a legacy ServiceAccount token without breaking bound tokens
+    - Contain a compromised Pod without destroying it
+  params:
+    sa:
+      type: choice
+      values: [report-exporter, ledger-archiver, statement-builder]
+    pod:
+      type: choice
+      values: [pdf-renderer, invoice-thumbnailer, csv-formatter]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-ledger
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        access: [ssh]
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-ledger
+          nodes:
+            - {name: ledger-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: ledger-wk-1, role: worker}
+  setup:
+    # Audit logging (part of the scenario's existing monitoring).
+    - on: qm-ledger/ledger-cp-1
+      timeoutSec: 500
+      run: |
+        set -e
+        mkdir -p /etc/kubernetes/audit /var/log/kubernetes/audit
+        cat > /etc/kubernetes/audit/policy.yaml <<'EOF'
+        apiVersion: audit.k8s.io/v1
+        kind: Policy
+        omitStages: [RequestReceived]
+        rules:
+          - level: None
+            resources:
+              - group: ""
+                resources: [events]
+              - group: coordination.k8s.io
+                resources: [leases]
+          - level: None
+            users: ["system:kube-controller-manager", "system:kube-scheduler", "system:apiserver"]
+          - level: None
+            userGroups: ["system:nodes"]
+          - level: Metadata
+        EOF
+        python3 - <<'PY'
+        import yaml
+        p = "/etc/kubernetes/manifests/kube-apiserver.yaml"
+        m = yaml.safe_load(open(p))
+        c = m["spec"]["containers"][0]
+        c["command"] += ["--audit-policy-file=/etc/kubernetes/audit/policy.yaml", "--audit-log-path=/var/log/kubernetes/audit/audit.log"]
+        c.setdefault("volumeMounts", []).extend([{"name": "audit-policy", "mountPath": "/etc/kubernetes/audit", "readOnly": True}, {"name": "audit-log", "mountPath": "/var/log/kubernetes/audit"}])
+        m["spec"].setdefault("volumes", []).extend([{"name": "audit-policy", "hostPath": {"path": "/etc/kubernetes/audit", "type": "Directory"}}, {"name": "audit-log", "hostPath": {"path": "/var/log/kubernetes/audit", "type": "DirectoryOrCreate"}}])
+        open(p, "w").write(yaml.safe_dump(m, default_flow_style=False))
+        PY
+        sleep 10
+        for i in $(seq 1 90); do
+          ps -C kube-apiserver -o args= | grep -q -- --audit-policy-file= && curl -sfk https://127.0.0.1:6443/readyz >/dev/null && exit 0
+          sleep 5
+        done
+        exit 1
+    - on: qm-ledger
+      timeoutSec: 120
+      run: for i in $(seq 1 24); do kubectl get --raw /readyz >/dev/null 2>&1 && exit 0; sleep 5; done; exit 1
+    - on: qm-ledger
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: billing}
+        ---
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: ledger-reports}
+        ---
+        apiVersion: v1
+        kind: Secret
+        metadata: {name: payment-gateway, namespace: billing}
+        stringData: {api-key: pg-live-not-a-real-key}
+        ---
+        apiVersion: v1
+        kind: ServiceAccount
+        metadata: {name: "{{sa}}", namespace: ledger-reports}
+        ---
+        apiVersion: v1
+        kind: Secret
+        metadata:
+          name: "{{sa}}-legacy-token"
+          namespace: ledger-reports
+          annotations: {kubernetes.io/service-account.name: "{{sa}}"}
+        type: kubernetes.io/service-account-token
+        ---
+        apiVersion: rbac.authorization.k8s.io/v1
+        kind: Role
+        metadata: {name: report-inputs, namespace: billing}
+        rules:
+          - {apiGroups: [""], resources: [secrets, configmaps], verbs: [get, list]}
+        ---
+        apiVersion: rbac.authorization.k8s.io/v1
+        kind: RoleBinding
+        metadata: {name: report-inputs, namespace: billing}
+        roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: report-inputs}
+        subjects:
+          - {kind: ServiceAccount, name: "{{sa}}", namespace: ledger-reports}
+        ---
+        apiVersion: v1
+        kind: ConfigMap
+        metadata: {name: report-schedule, namespace: billing}
+        data: {cron: "0 2 * * *"}
+        ---
+        # Legitimate user of the ServiceAccount: projected (bound) token, reads a ConfigMap.
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: "{{sa}}", namespace: ledger-reports}
+        spec:
+          replicas: 1
+          selector: {matchLabels: {app: "{{sa}}"}}
+          template:
+            metadata: {labels: {app: "{{sa}}"}}
+            spec:
+              serviceAccountName: "{{sa}}"
+              containers:
+                - name: exporter
+                  image: busybox:1.37
+                  command: ["sh", "-c"]
+                  args:
+                    - |
+                      SA=/var/run/secrets/kubernetes.io/serviceaccount
+                      while true; do
+                        if wget -q -T 5 --no-check-certificate --header "Authorization: Bearer $(cat $SA/token)" -O /dev/null \
+                             https://kubernetes.default.svc/api/v1/namespaces/billing/configmaps/report-schedule; then touch /tmp/ok; else rm -f /tmp/ok; fi
+                        sleep 10
+                      done
+                  readinessProbe:
+                    exec: {command: ["test", "-f", "/tmp/ok"]}
+                    periodSeconds: 5
+        ---
+        # Compromised workload: runs as the default ServiceAccount (no token
+        # mounted) but somebody planted the legacy token in its environment.
+        apiVersion: v1
+        kind: Pod
+        metadata: {name: "{{pod}}", namespace: ledger-reports, labels: {app: "{{pod}}"}}
+        spec:
+          automountServiceAccountToken: false
+          containers:
+            - name: render
+              image: busybox:1.37
+              env:
+                - name: RENDER_CACHE_KEY
+                  valueFrom: {secretKeyRef: {name: "{{sa}}-legacy-token", key: token}}
+              command: ["sh", "-c"]
+              args:
+                - |
+                  while true; do
+                    wget -q -T 5 --no-check-certificate --header "Authorization: Bearer $RENDER_CACHE_KEY" -O /dev/null \
+                      https://kubernetes.default.svc/api/v1/namespaces/billing/secrets/payment-gateway 2>/dev/null
+                    sleep 15
+                  done
+        ---
+        # Decoy: an unrelated Pod that legitimately calls the API with its own identity.
+        apiVersion: v1
+        kind: ServiceAccount
+        metadata: {name: report-ui, namespace: ledger-reports}
+        ---
+        apiVersion: v1
+        kind: Pod
+        metadata: {name: report-ui, namespace: ledger-reports, labels: {app: report-ui}}
+        spec:
+          serviceAccountName: report-ui
+          containers:
+            - name: ui
+              image: busybox:1.37
+              command: ["sh", "-c"]
+              args:
+                - |
+                  SA=/var/run/secrets/kubernetes.io/serviceaccount
+                  while true; do
+                    wget -q -T 5 --no-check-certificate --header "Authorization: Bearer $(cat $SA/token)" -O /dev/null \
+                      https://kubernetes.default.svc/api/v1/namespaces/billing/secrets/payment-gateway 2>/dev/null
+                    sleep 20
+                  done
+    - on: qm-ledger
+      timeoutSec: 180
+      run: |
+        set -e
+        for i in $(seq 1 30); do [ -n "$(kubectl -n ledger-reports get secret {{sa}}-legacy-token -o jsonpath='{.data.token}' 2>/dev/null)" ] && break; sleep 2; done
+        kubectl -n ledger-reports rollout status deploy/{{sa}} --timeout=150s
+        kubectl -n ledger-reports wait pod/{{pod}} pod/report-ui --for=condition=Ready --timeout=120s
+    # Grader reference (root-only on the control plane): the leaked token and the Pod's identity.
+    - on: qm-ledger/ledger-cp-1
+      run: |
+        set -e
+        export KUBECONFIG=/etc/kubernetes/admin.conf
+        install -d -m 0700 /var/lib/cloudtrain
+        kubectl -n ledger-reports get secret {{sa}}-legacy-token -o jsonpath='{.data.token}' | base64 -d > /var/lib/cloudtrain/leaked-token
+        kubectl -n ledger-reports get pod {{pod}} -o jsonpath='{.metadata.uid}' > /var/lib/cloudtrain/pod-uid
+        chmod 0600 /var/lib/cloudtrain/*
+    # Runtime alerts forwarded to the worker, with the real container IDs.
+    - on: qm-ledger/ledger-wk-1
+      run: |
+        set -e
+        mkdir -p /var/log/qm-runtime
+        cid() { crictl ps --name "$1" -q 2>/dev/null | head -n1 | cut -c1-12; }
+        R=$(cid render); U=$(cid ui); E=$(cid exporter)
+        now=$(date -u +%Y-%m-%dT%H:%M:%S)
+        cat > /var/log/qm-runtime/alerts.json <<EOF
+        {"time":"${now}.104Z","rule":"Terminal shell in container","priority":"Notice","output":"A shell was spawned in a container (user=root container_id=$U k8s.ns=ledger-reports k8s.pod=report-ui shell=sh parent=runc cmdline=sh -c ...)","output_fields":{"container.id":"$U","k8s.ns.name":"ledger-reports","k8s.pod.name":"report-ui","proc.cmdline":"sh -c ..."}}
+        {"time":"${now}.611Z","rule":"Environment variable with credential material","priority":"Warning","output":"A container environment contains a token-shaped value (container_id=$R env=RENDER_CACHE_KEY image=busybox:1.37)","output_fields":{"container.id":"$R","env.name":"RENDER_CACHE_KEY","container.image":"busybox:1.37"}}
+        {"time":"${now}.902Z","rule":"Contact K8S API Server From Container","priority":"Notice","output":"Unexpected connection to the API server from a container (container_id=$R connection=kubernetes.default.svc:443 proc=wget)","output_fields":{"container.id":"$R","proc.name":"wget","fd.name":"kubernetes.default.svc:443"}}
+        {"time":"${now}.950Z","rule":"Contact K8S API Server From Container","priority":"Notice","output":"Unexpected connection to the API server from a container (container_id=$E connection=kubernetes.default.svc:443 proc=wget)","output_fields":{"container.id":"$E","proc.name":"wget","fd.name":"kubernetes.default.svc:443"}}
+        EOF
+        chmod 0640 /var/log/qm-runtime/alerts.json
+  teardown:
+    - on: qm-ledger
+      run: kubectl delete namespace billing ledger-reports --ignore-not-found --wait=false
+  checks:
+    - id: context
+      description: Terminal is using context qm-ledger
+      type: k8s-context
+      on: workstation
+      skills: [k8s.cli.contexts]
+      weight: 0.5
+      expect: {match: exact, value: qm-ledger}
+    - id: findings
+      description: ~/incident/findings.txt names the ServiceAccount, the token Secret and the Pod
+      type: shell
+      on: workstation
+      skills: [k8s.security.incident-investigation]
+      weight: 3
+      command: |
+        f=/home/learner/incident/findings.txt
+        [ -f $f ] || { echo "missing"; exit 0; }
+        tr -d ' \r' < $f | grep -E '^(serviceaccount|token-secret|pod)=' | sort | paste -sd'|' -
+      expect: {match: exact, value: "pod=ledger-reports/{{pod}}|serviceaccount=ledger-reports/{{sa}}|token-secret=ledger-reports/{{sa}}-legacy-token"}
+    - id: token-revoked
+      description: The leaked token no longer authenticates
+      type: shell
+      on: qm-ledger/ledger-cp-1
+      skills: [k8s.security.incident-investigation]
+      weight: 3
+      timeoutSec: 30
+      command: |
+        tok=$(cat /var/lib/cloudtrain/leaked-token)
+        echo "code=$(curl -sk -m 5 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $tok" https://127.0.0.1:6443/api/v1/namespaces/billing/secrets/payment-gateway)"
+      expect: {match: exact, value: code=401}
+    - id: legit-workload-ok
+      description: The {{sa}} Deployment still authenticates with its projected token (Ready)
+      type: shell
+      on: qm-ledger
+      skills: [k8s.security.incident-investigation]
+      weight: 2
+      timeoutSec: 60
+      command: |
+        kubectl -n ledger-reports get sa {{sa}} -o name >/dev/null 2>&1 || { echo "serviceaccount deleted"; exit 0; }
+        sleep 15
+        kubectl -n ledger-reports wait pod -l app={{sa}} --for=condition=Ready --timeout=30s >/dev/null 2>&1 && echo ready || echo "not ready"
+      expect: {match: exact, value: ready}
+    - id: pod-preserved
+      description: The compromised Pod is the same Pod as before, still Running and labelled quarantine=true
+      type: shell
+      on: qm-ledger/ledger-cp-1
+      skills: [k8s.security.incident-investigation]
+      weight: 2
+      command: |
+        export KUBECONFIG=/etc/kubernetes/admin.conf
+        uid=$(cat /var/lib/cloudtrain/pod-uid)
+        kubectl -n ledger-reports get pod {{pod}} -o jsonpath='{.metadata.uid}={.status.phase}={.metadata.labels.quarantine}' 2>/dev/null | sed "s/^$uid=/same=/"
+      expect: {match: exact, value: same=Running=true}
+    - id: pod-isolated
+      description: The compromised Pod can no longer reach the API server or other Pods
+      type: shell
+      on: qm-ledger
+      skills: [k8s.security.incident-investigation]
+      weight: 2
+      timeoutSec: 40
+      command: |
+        ui=$(kubectl -n ledger-reports get pod report-ui -o jsonpath='{.status.podIP}')
+        a=$(kubectl -n ledger-reports exec {{pod}} -- sh -c 'wget -q -T 4 --no-check-certificate -O /dev/null https://10.96.0.1/livez 2>/dev/null; echo $?' 2>/dev/null)
+        [ "$a" = 0 ] && echo "api=reachable" || echo "api=blocked"
+      expect: {match: exact, value: api=blocked}
+    - id: others-unaffected
+      description: report-ui still reaches the API server
+      type: shell
+      on: qm-ledger
+      skills: [k8s.security.incident-investigation]
+      timeoutSec: 30
+      command: |
+        a=$(kubectl -n ledger-reports exec report-ui -- sh -c 'wget -q -T 4 --no-check-certificate -O /dev/null https://10.96.0.1/livez 2>/dev/null; echo $?' 2>/dev/null)
+        [ "$a" = 0 ] && echo reachable || echo blocked
+      expect: {match: exact, value: reachable}
+  hints:
+    - title: Who reads the Secret?
+      body: Filter the audit log for the billing Secret and look at user.username, sourceIPs and user.extra.
+      command: |
+        ssh ledger-cp-1 "sudo jq -c 'select(.objectRef.namespace==\"billing\" and .objectRef.resource==\"secrets\") | {u: .user.username, ip: .sourceIPs[0], pod: .user.extra[\"authentication.kubernetes.io/pod-name\"], code: .responseStatus.code}' /var/log/kubernetes/audit/audit.log | sort | uniq -c"
+      cost: 2
+    - title: Bound or legacy?
+      body: |
+        Projected tokens carry the Pod's name in user.extra
+        (authentication.kubernetes.io/pod-name). A request without it used a
+        long-lived token from a Secret of type kubernetes.io/service-account-token.
+      command: kubectl -n ledger-reports get secrets --field-selector type=kubernetes.io/service-account-token
+      cost: 2
+    - title: From IP to Pod
+      command: kubectl get pods -A -o wide | grep <ip>
+      body: The audit event's sourceIPs is the Pod IP when a Pod calls the API directly.
+      cost: 1
+    - title: Revoke without collateral damage
+      body: Deleting a token Secret invalidates that token only. Deleting the ServiceAccount would also kill the legitimate projected tokens.
+      cost: 2
+  misconceptions:
+    - id: deleted-serviceaccount
+      description: Revokes by deleting the ServiceAccount.
+      feedback: That invalidates the leaked token but also every legitimate projected token of the ServiceAccount. Delete only the token Secret.
+      expectFail: [legit-workload-ok]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-ledger
+          mkdir -p ~/incident
+          printf 'serviceaccount=ledger-reports/{{sa}}\ntoken-secret=ledger-reports/{{sa}}-legacy-token\npod=ledger-reports/{{pod}}\n' > ~/incident/findings.txt
+          kubectl -n ledger-reports delete sa {{sa}}
+          kubectl -n ledger-reports label pod {{pod}} quarantine=true
+          kubectl apply -f - <<'YAML'
+          apiVersion: networking.k8s.io/v1
+          kind: NetworkPolicy
+          metadata: {name: quarantine, namespace: ledger-reports}
+          spec:
+            podSelector: {matchLabels: {quarantine: "true"}}
+            policyTypes: [Ingress, Egress]
+          YAML
+    - id: deleted-pod
+      description: Deletes the compromised Pod.
+      feedback: The Pod is evidence (memory, processes, filesystem). Isolate it instead.
+      expectFail: [pod-preserved]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-ledger
+          mkdir -p ~/incident
+          printf 'serviceaccount=ledger-reports/{{sa}}\ntoken-secret=ledger-reports/{{sa}}-legacy-token\npod=ledger-reports/{{pod}}\n' > ~/incident/findings.txt
+          kubectl -n ledger-reports delete secret {{sa}}-legacy-token
+          kubectl -n ledger-reports delete pod {{pod}} --now
+    - id: blamed-report-ui
+      description: Blames report-ui, which reads the Secret with its own identity and is refused.
+      feedback: report-ui's requests are denied (403) under its own ServiceAccount; the successful reads come from the {{sa}} token. Check responseStatus and the username.
+      expectFail: [findings, others-unaffected]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-ledger
+          mkdir -p ~/incident
+          printf 'serviceaccount=ledger-reports/report-ui\ntoken-secret=ledger-reports/{{sa}}-legacy-token\npod=ledger-reports/report-ui\n' > ~/incident/findings.txt
+          kubectl -n ledger-reports delete secret {{sa}}-legacy-token
+          kubectl -n ledger-reports label pod report-ui quarantine=true
+          kubectl apply -f - <<'YAML'
+          apiVersion: networking.k8s.io/v1
+          kind: NetworkPolicy
+          metadata: {name: quarantine, namespace: ledger-reports}
+          spec:
+            podSelector: {matchLabels: {quarantine: "true"}}
+            policyTypes: [Ingress, Egress]
+          YAML
+    - id: not-revoked
+      description: Isolates the Pod but leaves the token valid.
+      feedback: Whoever copied the token can still use it from anywhere. Delete the token Secret.
+      expectFail: [token-revoked]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-ledger
+          mkdir -p ~/incident
+          printf 'serviceaccount=ledger-reports/{{sa}}\ntoken-secret=ledger-reports/{{sa}}-legacy-token\npod=ledger-reports/{{pod}}\n' > ~/incident/findings.txt
+          kubectl -n ledger-reports label pod {{pod}} quarantine=true
+          kubectl apply -f - <<'YAML'
+          apiVersion: networking.k8s.io/v1
+          kind: NetworkPolicy
+          metadata: {name: quarantine, namespace: ledger-reports}
+          spec:
+            podSelector: {matchLabels: {quarantine: "true"}}
+            policyTypes: [Ingress, Egress]
+          YAML
+  solution:
+    explanation: |
+      The audit log shows successful GETs of billing/payment-gateway by
+      system:serviceaccount:ledger-reports:{{sa}} without a pod-name in
+      user.extra (a legacy Secret token), from the IP of {{pod}}; report-ui's
+      own reads fail with 403. The runtime alerts tie {{pod}}'s container to a
+      token-shaped environment variable and API connections, and its process
+      list shows the wget loop. Deleting the token Secret revokes only that
+      token; a label plus a deny-all policy contains the Pod without
+      destroying it.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          kubectl config use-context qm-ledger
+          ev=$(ssh ledger-cp-1 "sudo jq -r 'select(.objectRef.namespace==\"billing\" and .objectRef.resource==\"secrets\" and .responseStatus.code==200 and (.user.extra[\"authentication.kubernetes.io/pod-name\"] == null)) | \"\(.user.username) \(.sourceIPs[0])\"' /var/log/kubernetes/audit/audit.log" | sort -u | head -n1)
+          user=${ev% *}; ip=${ev#* }
+          sa_ns=$(echo "$user" | cut -d: -f3); sa=$(echo "$user" | cut -d: -f4)
+          pod=$(kubectl get pods -A -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name} {.status.podIP}{"\n"}{end}' | awk -v ip="$ip" '$2==ip{print $1}')
+          secret=$(kubectl -n "$sa_ns" get secrets --field-selector type=kubernetes.io/service-account-token -o json \
+            | jq -r --arg sa "$sa" '.items[] | select(.metadata.annotations["kubernetes.io/service-account.name"]==$sa) | .metadata.name')
+          mkdir -p ~/incident
+          printf 'serviceaccount=%s/%s\ntoken-secret=%s/%s\npod=%s\n' "$sa_ns" "$sa" "$sa_ns" "$secret" "$pod" > ~/incident/findings.txt
+          cat ~/incident/findings.txt
+          kubectl -n "$sa_ns" delete secret "$secret"
+          kubectl -n "${pod%/*}" label pod "${pod#*/}" quarantine=true
+          kubectl apply -f - <<YAML
+          apiVersion: networking.k8s.io/v1
+          kind: NetworkPolicy
+          metadata: {name: quarantine, namespace: ${pod%/*}}
+          spec:
+            podSelector: {matchLabels: {quarantine: "true"}}
+            policyTypes: [Ingress, Egress]
+          YAML
