@@ -51,7 +51,7 @@ install -d /etc/falco/rules.d
 # --- preload add-on images (by digest, named by tag, CRI-managed) ---
 containerd >/tmp/containerd.log 2>&1 &
 CPID=$!
-for i in $(seq 1 30); do ctr version >/dev/null 2>&1 && break; sleep 1; done
+for _ in $(seq 1 30); do ctr version >/dev/null 2>&1 && break; sleep 1; done
 while read -r ref; do
   [ -n "$ref" ] || continue
   tagged=${ref%@*}; bydigest=${tagged%:*}@${ref#*@}
@@ -71,7 +71,7 @@ kill $CPID; wait $CPID || true
 
 sed -i "s/^CLOUDTRAIN_IMAGE_TAG=.*/CLOUDTRAIN_IMAGE_TAG=${CLOUDTRAIN_IMAGE_TAG}/; s/^CLOUDTRAIN_CATALOG_REF=.*/CLOUDTRAIN_CATALOG_REF=${CLOUDTRAIN_CATALOG_REF}/" /etc/cloudtrain-release
 cat >> /etc/cloudtrain-release <<R
-ADDONS=$(ls /opt/cloudtrain/addons | grep -v SHA256SUMS | paste -sd,)
+ADDONS=$(cd /opt/cloudtrain/addons && printf '%s\n' * | grep -v SHA256SUMS | paste -sd,)
 GVISOR_RELEASE=${GVISOR_RELEASE}
 KUBE_BENCH_VERSION=${KUBE_BENCH_VERSION}
 R

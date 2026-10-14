@@ -1,0 +1,126 @@
+# Static analysis. Blocking: actionlint, zizmor (medium+), shellcheck (warning+),
+# hadolint (error). Report-only (SARIF to code scanning, triaged there): semgrep,
+# gosec, hadolint warnings, zizmor (all). See docs/security-ci.md.
+name: sast
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: '41 4 * * 1'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  semgrep:
+    name: semgrep (report)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+      - run: python -m pip install --disable-pip-version-check semgrep==1.180.0
+      - name: semgrep scan
+        # content/ is training material: lab assets are deliberately insecure
+        # (privileged pods, weak configs) for learners to find and fix.
+        run: >-
+          semgrep scan --metrics=off --timeout 60
+          --config p/default --config p/typescript --config p/golang --config p/secrets
+          --config p/dockerfile --config p/kubernetes
+          --exclude content --exclude docs
+          --sarif --output semgrep.sarif
+      - uses: github/codeql-action/upload-sarif@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+        if: always()
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
+
+  gosec:
+    name: gosec (report)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: services/lab-orchestrator/go.mod
+          cache-dependency-path: services/lab-orchestrator/go.sum
+      - run: bash .github/scripts/install-tools.sh gosec
+      - name: gosec
+        working-directory: services/lab-orchestrator
+        run: gosec -no-fail -exclude-generated -fmt sarif -out ../../gosec.sarif ./...
+      - uses: github/codeql-action/upload-sarif@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+        if: always()
+        with:
+          sarif_file: gosec.sarif
+          category: gosec
+
+  lint:
+    name: hadolint, shellcheck, actionlint, zizmor
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: bash .github/scripts/install-tools.sh actionlint hadolint shellcheck zizmor
+      - name: hadolint (SARIF, all levels)
+        run: git ls-files -z '*Dockerfile*' | xargs -0 hadolint --no-fail --format sarif > hadolint.sarif
+      - name: zizmor (SARIF, all levels)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: zizmor --format sarif .github > zizmor.sarif || true
+      - uses: github/codeql-action/upload-sarif@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+        if: always()
+        with:
+          sarif_file: hadolint.sarif
+          category: hadolint
+      - uses: github/codeql-action/upload-sarif@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+        if: always()
+        with:
+          sarif_file: zizmor.sarif
+          category: zizmor
+      - name: hadolint (blocking at error)
+        if: always()
+        run: git ls-files -z '*Dockerfile*' | xargs -0 hadolint --failure-threshold error
+      - name: shellcheck (blocking at warning; repo scripts, not lab content)
+        if: always()
+        run: git ls-files -z 'deploy/*.sh' 'tools/*.sh' 'services/*.sh' '.github/*.sh' | xargs -0 shellcheck -S warning
+      - name: actionlint (blocking)
+        if: always()
+        run: actionlint -shellcheck "$(command -v shellcheck)"
+      - name: zizmor (blocking at medium)
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: zizmor --min-severity medium .github
