@@ -296,6 +296,25 @@ func (r *LabSessionReconciler) reconcileSession(ctx context.Context, s *labsv1.L
 	st.EntryNode = tpl.spec.Topology.Entry
 	r.setCondition(s, labsv1.ConditionTemplateResolved, metav1.ConditionTrue, ReasonResolved, "template found and params resolved")
 
+	// Exam time is up: freeze the session for the learner (endpoints
+	// withdrawn, learner processes ended) while it keeps running for grading.
+	// A failure (node not reachable yet) is retried after this pass.
+	var revokeErr error
+	if accessRevoked(s) {
+		revokeErr = r.revokeAccess(ctx, s, tpl)
+	}
+	res, err := r.reconcileNodes(ctx, s, tpl, save)
+	if err == nil && revokeErr != nil {
+		return ctrl.Result{RequeueAfter: requeueProvisioning}, nil
+	}
+	return res, err
+}
+
+// reconcileNodes is the part of reconcileSession after the template was
+// resolved: hibernate/resume, reset, provisioning, setup, endpoints, grading.
+func (r *LabSessionReconciler) reconcileNodes(ctx context.Context, s *labsv1.LabSession, tpl *resolvedTemplate, save saveFunc) (ctrl.Result, error) {
+	st := &s.Status
+	now := r.now()
 	if s.Spec.Hibernate {
 		return r.hibernate(ctx, s, tpl)
 	}
@@ -477,6 +496,9 @@ func (r *LabSessionReconciler) reconcileSession(ctx context.Context, s *labsv1.L
 		}
 	}
 	st.Endpoints = eps
+	if accessRevoked(s) {
+		st.Endpoints = nil
+	}
 
 	if st.Phase != labsv1.SessionGrading {
 		st.Phase = labsv1.SessionReady

@@ -1,0 +1,77 @@
+# Test fixture for the exam engine (not curriculum content).
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xt-set-image-tally
+  title: Roll the tally board to a new image
+  domain: kubernetes
+  frameworks: [ckad:deployment]
+  difficulty: easy
+  estimatedMinutes: 5
+  tags: [exam-fixture]
+spec:
+  description: |
+    Use context `exam-core`.
+
+    The tally board in namespace `tally-board` still runs on the old web
+    server. Change the image of container `web` in Deployment `tally-board`
+    to `caddy:2-alpine`, record the change with the annotation
+    `kubernetes.io/change-cause: ticket QL-{{ticket}}` on the Deployment, and
+    wait until the rollout has finished.
+  params:
+    ticket: {type: int, min: 1000, max: 9999}
+  topology:
+    entry: workstation
+    nodes:
+      - {name: workstation, driver: container, image: "jumphost:1", access: [shell]}
+      - name: exam-core
+        driver: k8s-cluster
+        cluster: {mode: virtual, version: "v1.37", context: exam-core}
+  setup:
+    - on: exam-core
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: tally-board}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: tally-board, namespace: tally-board}
+        spec:
+          replicas: 2
+          selector: {matchLabels: {app: tally-board}}
+          template:
+            metadata: {labels: {app: tally-board}}
+            spec:
+              containers: [{name: web, image: "httpd:2.4-alpine"}]
+  checks:
+    - id: image
+      description: container web runs caddy:2-alpine
+      type: k8s-query
+      skills: [k8s.workloads.rollouts]
+      query: {cluster: exam-core, resource: deployment, name: tally-board, namespace: tally-board, jsonpath: "{.spec.template.spec.containers[?(@.name=='web')].image}"}
+      expect: {match: exact, value: "caddy:2-alpine"}
+    - id: change-cause
+      description: the change cause names the ticket
+      type: k8s-query
+      skills: [k8s.cli.edit-patch]
+      weight: 0.5
+      query: {cluster: exam-core, resource: deployment, name: tally-board, namespace: tally-board, jsonpath: "{.metadata.annotations.kubernetes\\.io/change-cause}"}
+      expect: {match: exact, value: "ticket QL-{{ticket}}"}
+    - id: rolled-out
+      description: the rollout finished (every replica updated and ready)
+      type: shell
+      on: exam-core
+      skills: [k8s.workloads.rollouts]
+      command: |
+        kubectl -n tally-board get deploy tally-board -o jsonpath='{.status.updatedReplicas}/{.status.readyReplicas}/{.spec.replicas}'
+      expect: {match: exact, value: "2/2/2"}
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          kubectl --context exam-core -n tally-board set image deployment/tally-board web=caddy:2-alpine
+          kubectl --context exam-core -n tally-board annotate deployment tally-board kubernetes.io/change-cause="ticket QL-{{ticket}}" --overwrite
+          kubectl --context exam-core -n tally-board rollout status deployment tally-board --timeout=100s

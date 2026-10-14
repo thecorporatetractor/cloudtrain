@@ -105,6 +105,12 @@ export interface Lab {
       expectFail?: [string, ...string[]];
       feedback?: string;
     }[];
+    /**
+     * Exam-task extras (labs drawn by exam simulations). `rerun` actions run after the first grading pass when the exam's rules set idempotencyRerun (e.g. re-run the candidate's saved playbook and assert it reports no changes); a failing action fails the task's checks, then every check is graded again.
+     */
+    exam?: {
+      rerun?: Action[];
+    };
     solution: {
       explanation?: string;
       /**

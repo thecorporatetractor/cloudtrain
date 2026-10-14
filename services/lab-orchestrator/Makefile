@@ -7,6 +7,8 @@ LOCALBIN       ?= $(HOME)/.local/bin
 CONTROLLER_GEN ?= $(shell command -v controller-gen 2>/dev/null || echo $(LOCALBIN)/controller-gen)
 SCHEMA_SRC     := ../../packages/lab-schema/schema/lab.schema.json
 SCHEMA_DST     := internal/labschema/lab.schema.json
+CURRICULUM_SRC := ../../packages/lab-schema/schema/curriculum.schema.json
+CURRICULUM_DST := internal/labschema/curriculum.schema.json
 BIN            := bin
 
 .PHONY: all generate schema deepcopy manifests fmt vet test build labctl manager samples clean controller-gen
@@ -18,6 +20,7 @@ generate: schema deepcopy manifests
 
 schema:
 	cp $(SCHEMA_SRC) $(SCHEMA_DST)
+	cp $(CURRICULUM_SRC) $(CURRICULUM_DST)
 
 deepcopy: controller-gen
 	$(CONTROLLER_GEN) object:headerFile=hack/boilerplate.go.txt paths=./api/...

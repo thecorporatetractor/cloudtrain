@@ -157,6 +157,11 @@ func validateSemantics(s *labsv1.LabTemplateSpec) []Issue {
 	for i, a := range s.Solution.Steps {
 		checkAction(fmt.Sprintf("/spec/solution/steps/%d", i), a)
 	}
+	if s.Exam != nil {
+		for i, a := range s.Exam.Rerun {
+			checkAction(fmt.Sprintf("/spec/exam/rerun/%d", i), a)
+		}
+	}
 	altIDs := map[string]bool{}
 	for i, alt := range s.Solution.Alternatives {
 		path := fmt.Sprintf("/spec/solution/alternatives/%d", i)

@@ -1,0 +1,70 @@
+# Test fixture for the exam engine (not curriculum content).
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xt-expose-clusterip
+  title: Expose the gate API inside the cluster
+  domain: kubernetes
+  frameworks: [ckad:services-networking]
+  difficulty: easy
+  estimatedMinutes: 4
+  tags: [exam-fixture]
+spec:
+  description: |
+    Use context `exam-edge`.
+
+    Expose the Deployment `gate-api` in namespace `gate-ops` inside the
+    cluster: a ClusterIP Service named `gate-api` on port **{{port}}** that
+    forwards to the containers' port 80.
+  params:
+    port: {type: choice, values: [8080, 8081, 8090, 9080]}
+  topology:
+    entry: workstation
+    nodes:
+      - {name: workstation, driver: container, image: "jumphost:1", access: [shell]}
+      - name: exam-edge
+        driver: k8s-cluster
+        cluster: {mode: virtual, version: "v1.37", context: exam-edge}
+  setup:
+    - on: exam-edge
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: gate-ops}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: gate-api, namespace: gate-ops}
+        spec:
+          replicas: 2
+          selector: {matchLabels: {app: gate-api}}
+          template:
+            metadata: {labels: {app: gate-api}}
+            spec:
+              containers: [{name: api, image: "caddy:2-alpine", ports: [{containerPort: 80}]}]
+  checks:
+    - id: service-type
+      description: gate-api is a ClusterIP Service
+      type: k8s-query
+      skills: [k8s.networking.services]
+      weight: 0.5
+      query: {cluster: exam-edge, resource: service, name: gate-api, namespace: gate-ops, jsonpath: "{.spec.type}"}
+      expect: {match: exact, value: "ClusterIP"}
+    - id: service-ports
+      description: the Service listens on the requested port and targets port 80
+      type: k8s-query
+      skills: [k8s.networking.services]
+      query: {cluster: exam-edge, resource: service, name: gate-api, namespace: gate-ops, jsonpath: "{.spec.ports[0].port}->{.spec.ports[0].targetPort}"}
+      expect: {match: exact, value: "{{port}}->80"}
+    - id: has-endpoints
+      description: the Service has both gate-api Pods as endpoints
+      type: shell
+      on: exam-edge
+      skills: [k8s.networking.endpoints]
+      command: kubectl -n gate-ops get endpointslices -l kubernetes.io/service-name=gate-api -o jsonpath='{range .items[*].endpoints[*]}{.addresses[0]}{"\n"}{end}' | grep -c .
+      expect: {match: exact, value: "2"}
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        run: kubectl --context exam-edge -n gate-ops expose deployment gate-api --name=gate-api --type=ClusterIP --port={{port}} --target-port=80
