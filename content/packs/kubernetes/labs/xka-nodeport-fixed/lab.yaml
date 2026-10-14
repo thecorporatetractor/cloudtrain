@@ -1,0 +1,141 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xka-nodeport-fixed
+  title: Expose a Deployment on a fixed node port
+  domain: kubernetes
+  frameworks: [cka:services-networking]
+  difficulty: easy
+  estimatedMinutes: 5
+  tags: [exam, nodeport, services]
+  version: 1
+spec:
+  description: |
+    **Context:** `qm-tracking` (`kubectl config use-context qm-tracking`)
+
+    Expose the Deployment **`gate-kiosk`** in namespace **`kiosk`** with a
+    Service named **`gate-kiosk`** of type **NodePort** on node port
+    **`{{nodeport}}`** (Service port 80, forwarding to the containers' port
+    80), so that the workstation reaches the kiosk page on that port of
+    every `qm-tracking` node.
+  objectives:
+    - Create a NodePort Service with a fixed nodePort
+  params:
+    nodeport:
+      type: choice
+      values: ["30880", "31880", "32080"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-tracking
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-tracking
+          nodes:
+            - {name: tracking-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: tracking-wk-1, role: worker}
+            - {name: tracking-wk-2, role: worker}
+  setup:
+    - on: qm-tracking
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: kiosk}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: gate-kiosk, namespace: kiosk}
+        spec:
+          replicas: 2
+          selector: {matchLabels: {app: gate-kiosk}}
+          template:
+            metadata: {labels: {app: gate-kiosk}}
+            spec:
+              terminationGracePeriodSeconds: 1
+              containers:
+                - name: kiosk
+                  image: busybox:1.37
+                  command: ["sh", "-c", "mkdir -p /www && echo gate-kiosk-ready > /www/index.html && exec httpd -f -p 80 -h /www"]
+    - on: qm-tracking
+      timeoutSec: 150
+      run: kubectl -n kiosk rollout status deploy/gate-kiosk --timeout=120s
+  teardown:
+    - on: qm-tracking
+      run: kubectl delete namespace kiosk --ignore-not-found --wait=false
+  checks:
+    - id: service
+      description: gate-kiosk is a NodePort Service on {{nodeport}}, port 80 to 80
+      type: k8s-query
+      skills: [k8s.networking.nodeport]
+      weight: 2
+      query: {cluster: qm-tracking, resource: service, name: gate-kiosk, namespace: kiosk, jsonpath: '{.spec.type} {.spec.ports[0].nodePort} {.spec.ports[0].port}->{.spec.ports[0].targetPort}'}
+      expect: {match: exact, value: "NodePort {{nodeport}} 80->80"}
+    - id: reachable-everywhere
+      description: The kiosk page answers on {{nodeport}} of every node, from the workstation
+      type: shell
+      on: workstation
+      skills: [k8s.networking.nodeport]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        for n in tracking-cp-1 tracking-wk-1 tracking-wk-2; do
+          curl -s -m 5 http://$n:{{nodeport}}/ || echo "fail-$n"
+        done | sort -u | paste -sd' ' -
+      expect: {match: exact, value: gate-kiosk-ready}
+  misconceptions:
+    - id: random-nodeport
+      description: Lets Kubernetes pick the node port.
+      feedback: Set spec.ports[].nodePort to the port the kiosks are configured for.
+      expectFail: [service, reachable-everywhere]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-tracking
+          kubectl -n kiosk expose deployment gate-kiosk --type=NodePort --port=80
+          sleep 5
+    - id: clusterip
+      description: Creates a ClusterIP Service.
+      feedback: ClusterIP is only reachable inside the cluster.
+      expectFail: [service, reachable-everywhere]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-tracking
+          kubectl -n kiosk expose deployment gate-kiosk --port=80
+          sleep 5
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-tracking
+          kubectl -n kiosk create service nodeport gate-kiosk --tcp=80:80 --node-port={{nodeport}} --dry-run=client -o yaml \
+            | yq '.spec.selector = {"app": "gate-kiosk"}' | kubectl apply -f -
+          sleep 5
+    alternatives:
+      - id: manifest
+        description: A Service manifest.
+        steps:
+          - on: workstation
+            as: learner
+            run: |
+              kubectl config use-context qm-tracking
+              kubectl apply -f - <<'YAML'
+              apiVersion: v1
+              kind: Service
+              metadata: {name: gate-kiosk, namespace: kiosk}
+              spec:
+                type: NodePort
+                selector: {app: gate-kiosk}
+                ports: [{port: 80, targetPort: 80, nodePort: {{nodeport}}}]
+              YAML
+              sleep 5

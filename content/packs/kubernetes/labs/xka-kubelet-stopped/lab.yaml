@@ -1,0 +1,113 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xka-kubelet-stopped
+  title: Return a NotReady node to service
+  domain: kubernetes
+  frameworks: [cka:troubleshooting]
+  difficulty: medium
+  estimatedMinutes: 10
+  tags: [exam, kubelet, nodes]
+  version: 1
+spec:
+  description: |
+    **Context:** `qm-dispatch` (`kubectl config use-context qm-dispatch`);
+    **host** `dispatch-wk-1` (`ssh dispatch-wk-1`, `sudo` works)
+
+    Node **`dispatch-wk-1`** is NotReady. Repair its kubelet so that the node
+    is Ready, and stays Ready when the kubelet is restarted or the machine
+    reboots.
+  objectives:
+    - Diagnose a stopped kubelet from the node
+    - Fix kubelet startup settings and enable the service
+  params:
+    flag:
+      type: choice
+      values: ["--node-labels-file=/etc/kubernetes/labels", "--kube-reserved-cgroup-path=/kube", "--register-node-taints=dispatch"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-dispatch
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-dispatch
+          nodes:
+            - {name: dispatch-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: dispatch-wk-1, role: worker}
+            - {name: dispatch-wk-2, role: worker}
+            - {name: dispatch-wk-3, role: worker}
+  setup:
+    - on: qm-dispatch/dispatch-wk-1
+      run: |
+        printf 'KUBELET_EXTRA_ARGS={{flag}}\n' > /etc/default/kubelet
+        systemctl disable --now kubelet
+    - on: qm-dispatch
+      timeoutSec: 150
+      run: |
+        for i in $(seq 1 60); do
+          [ "$(kubectl get node dispatch-wk-1 -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')" != True ] && exit 0
+          sleep 2
+        done
+        exit 1
+  teardown:
+    - on: qm-dispatch/dispatch-wk-1
+      run: rm -f /etc/default/kubelet; systemctl enable --now kubelet || true
+  checks:
+    - id: node-ready
+      description: dispatch-wk-1 is Ready
+      type: k8s-query
+      skills: [k8s.troubleshooting.nodes]
+      weight: 2
+      query: {cluster: qm-dispatch, resource: node, name: dispatch-wk-1, jsonpath: '{.status.conditions[?(@.type=="Ready")].status}'}
+      expect: {match: exact, value: "True"}
+    - id: survives-restart
+      description: The kubelet is enabled at boot and starts without the unknown flag
+      type: shell
+      on: qm-dispatch/dispatch-wk-1
+      skills: [k8s.cluster.kubelet]
+      weight: 2
+      command: |
+        echo "$(systemctl is-active kubelet) $(systemctl is-enabled kubelet) $(cat /etc/default/kubelet 2>/dev/null | grep -c -- '{{flag}}')"
+      expect: {match: exact, value: active enabled 0}
+  misconceptions:
+    - id: start-without-enable
+      description: Fixes the flag and starts the kubelet but does not enable it.
+      feedback: After a reboot the node would be NotReady again. Use systemctl enable --now.
+      expectFail: [survives-restart]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 200
+        run: |
+          kubectl config use-context qm-dispatch
+          ssh dispatch-wk-1 'sudo rm -f /etc/default/kubelet && sudo systemctl start kubelet'
+          kubectl wait node/dispatch-wk-1 --for=condition=Ready --timeout=150s
+    - id: enable-only
+      description: Enables and starts the kubelet without reading why it fails.
+      feedback: The kubelet exits on the unknown flag in /etc/default/kubelet; the journal says which one.
+      expectFail: [node-ready, survives-restart]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          kubectl config use-context qm-dispatch
+          ssh dispatch-wk-1 'sudo systemctl enable --now kubelet' || true
+          sleep 30
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 200
+        run: |
+          kubectl config use-context qm-dispatch
+          ssh dispatch-wk-1 'sudo systemctl start kubelet; sleep 3; sudo journalctl -u kubelet -n 5 --no-pager | grep -i flag || true'
+          ssh dispatch-wk-1 'echo "KUBELET_EXTRA_ARGS=" | sudo tee /etc/default/kubelet >/dev/null && sudo systemctl enable kubelet && sudo systemctl restart kubelet'
+          kubectl wait node/dispatch-wk-1 --for=condition=Ready --timeout=150s
