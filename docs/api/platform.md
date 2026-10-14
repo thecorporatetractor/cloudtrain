@@ -8,8 +8,8 @@ Types: [`packages/api-types/platform.d.ts`](../../packages/api-types/platform.d.
 
 - Base path `/api`, JSON. Session cookie `ct_session` (`HttpOnly; Secure; SameSite=Lax`;
   `Secure` is dropped only on plain-http localhost in dev).
-- **CSRF:** every `POST`/`PUT`/`PATCH`/`DELETE` under `/api` (except `/api/auth/*`
-  callbacks) needs header `x-csrf-token: <Me.csrfToken>`; a missing or wrong token is
+- **CSRF:** every `POST`/`PUT`/`PATCH`/`DELETE` under `/api` with a session
+  (everything except the public `/api/auth/backchannel-logout`) needs header `x-csrf-token: <Me.csrfToken>`; a missing or wrong token is
   `403 { code: "csrf" }`.
 - **Errors:** `ApiError` `{ error, code?, permission?, scope?, details? }`.
   `401 unauthenticated` (no/expired session), `403 forbidden` (with `permission` and
@@ -29,8 +29,8 @@ Types: [`packages/api-types/platform.d.ts`](../../packages/api-types/platform.d.
 | Method + path | Request | Response | Permission | Audit |
 |---|---|---|---|---|
 | `GET /auth/discover?email=` | | `AuthDiscovery` | public | |
-| `GET /auth/login?email=&returnTo=&org=` | | 302 to Keycloak (`kc_idp_hint` / organization hint, PKCE) | public | |
-| `GET /auth/callback?code=&state=` | | 302 to `returnTo` (sets `ct_session`) | public | `auth.login` / `auth.login_denied` |
+| `GET /auth/login?email=&returnTo=&org=&idp=` | | 302 to Keycloak (PKCE; `kc_idp_hint` when the verified domain has an active SSO connection, or `idp=` names one, e.g. the SSO test link; `login_hint` otherwise) | public | |
+| `GET /auth/callback?code=&state=` | | 302 to `<web>/<returnTo>` (sets `ct_session`); on refusal 302 to `<web>/login?error=<reason>&message=` (`sso_required`, `deactivated`, `no_membership`, `org_suspended`, `invalid_state`, `token_error`) | public | `auth.login` / `auth.login_denied` |
 | `POST /auth/logout` | | `LogoutResponse` (Keycloak end-session URL) | signed in | `auth.logout` |
 | `POST /auth/backchannel-logout` | form `logout_token` (Keycloak) | 200 | signed JWT from Keycloak | |
 | `GET /auth/invite/:token` | | 302 to login with the invited email | public | |
