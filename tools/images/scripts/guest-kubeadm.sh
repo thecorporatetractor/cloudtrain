@@ -140,7 +140,7 @@ install -d /opt/cloudtrain/bin
 install -m 0755 /opt/cloudtrain/build/cni-install /opt/cloudtrain/bin/cni-install
 containerd >/tmp/containerd.log 2>&1 &
 CPID=$!
-for i in $(seq 1 30); do ctr version >/dev/null 2>&1 && break; sleep 1; done
+for _ in $(seq 1 30); do ctr version >/dev/null 2>&1 && break; sleep 1; done
 # images.txt lines are <name>:<tag>@<digest>: pull by digest, then name it by tag
 # (what kubeadm, the Calico manifest and the labs' Pods reference).
 while read -r ref; do

@@ -17,4 +17,5 @@ echo; echo "== lab namespaces"
 k get ns -l cloudtrain.dev/lab --no-headers 2>/dev/null || true
 k get vmi -A 2>/dev/null || true
 echo; echo "== node container memory"
+# shellcheck disable=SC2046 # container ids, split on purpose
 docker stats --no-stream --format '{{.Name}} {{.MemUsage}} cpu={{.CPUPerc}}' $(docker ps -q --filter "label=io.x-k8s.kind.cluster=$CLUSTER_NAME")
