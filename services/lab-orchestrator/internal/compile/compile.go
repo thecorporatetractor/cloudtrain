@@ -359,7 +359,8 @@ func inlineSources(src *sourceLab, baseDir string) []Issue {
 				issues = append(issues, Issue{Path: p, Message: fmt.Sprintf("asset %q escapes the lab directory", f.Source)})
 				continue
 			}
-			b, err := os.ReadFile(filepath.Join(baseDir, f.Source))
+			// os.Root also refuses symlinks (and ..) that resolve outside baseDir.
+			b, err := readInRoot(baseDir, f.Source)
 			if err != nil {
 				issues = append(issues, Issue{Path: p, Message: "read asset: " + err.Error()})
 				continue
@@ -383,6 +384,16 @@ func inlineSources(src *sourceLab, baseDir string) []Issue {
 		}
 	}
 	return issues
+}
+
+// readInRoot reads name below dir without following anything out of dir.
+func readInRoot(dir, name string) ([]byte, error) {
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return nil, err
+	}
+	defer root.Close()
+	return root.ReadFile(name)
 }
 
 func convertActions(in []sourceAction) []labsv1.Action {
