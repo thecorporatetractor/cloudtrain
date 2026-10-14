@@ -1,0 +1,291 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: kubeadm-etcd-static-restore
+  title: Restore a kubeadm cluster's stacked etcd
+  domain: kubernetes
+  frameworks: [cka:cluster-architecture]
+  difficulty: hard
+  estimatedMinutes: 30
+  tags: [etcd, restore, static-pods, kubeadm, disaster-recovery]
+  version: 1
+spec:
+  description: |
+    A cleanup script on `qm-yard` deleted the namespaces `yard-ops` and
+    `yard-billing` with everything in them. Last night's etcd snapshot,
+    taken before the incident, is at
+    **`/var/backups/etcd/yard-nightly.db`** on the control-plane node
+    `yard-cp-1`.
+
+    Reach the node with `ssh yard-cp-1` (`sudo` works; `etcdctl` and
+    `etcdutl` are installed). Use context `qm-yard` to check the result.
+
+    1. Restore the snapshot into the **new** data directory
+       **`{{dir}}`** on `yard-cp-1`. Keep the current data directory
+       `/var/lib/etcd` untouched: the incident team wants to inspect it.
+    2. Make the cluster's etcd (a static Pod managed by kubeadm) run on the
+       restored data, so that both namespaces and their objects are back.
+
+    Do not recreate the lost objects by hand and do not modify the snapshot.
+  objectives:
+    - Restore an etcd snapshot with etcdutl into a new data directory
+    - Repoint the etcd static Pod at the restored data
+    - Confirm the API server serves the restored state
+  params:
+    dir:
+      type: choice
+      values: [/var/lib/etcd-restored, /var/lib/etcd-from-backup, /var/lib/etcd-nightly]
+    marker:
+      type: choice
+      values: [berths-7-12, berths-3-9, berths-1-14]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-yard
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        resources: {cpu: 2, memoryMiB: 3072}
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-yard
+          nodes:
+            - {name: yard-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: yard-wk-1, role: worker}
+  setup:
+    # etcdctl/etcdutl on the control-plane node, copied from the admin image.
+    - on: qm-yard
+      run: |
+        set -e
+        for b in etcdctl etcdutl; do
+          ssh -o StrictHostKeyChecking=no -o BatchMode=yes root@yard-cp-1 "cat > /usr/local/bin/$b && chmod 0755 /usr/local/bin/$b" < /usr/local/bin/$b
+        done
+    - on: qm-yard
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: yard-ops}
+        ---
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: yard-billing}
+        ---
+        apiVersion: v1
+        kind: ConfigMap
+        metadata: {name: berth-map, namespace: yard-ops}
+        data: {assignment: "{{marker}}"}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: crane-dispatcher, namespace: yard-ops}
+        spec:
+          replicas: 2
+          selector: {matchLabels: {app: crane-dispatcher}}
+          template:
+            metadata: {labels: {app: crane-dispatcher}}
+            spec:
+              containers:
+                - {name: dispatcher, image: "httpd:2.4-alpine"}
+        ---
+        apiVersion: v1
+        kind: Secret
+        metadata: {name: invoice-signing, namespace: yard-billing}
+        stringData: {key: not-a-real-key}
+    - on: qm-yard
+      timeoutSec: 200
+      run: |
+        set -e
+        kubectl -n yard-ops rollout status deploy/crane-dispatcher --timeout=150s
+        uid=$(kubectl -n yard-ops get configmap berth-map -o jsonpath='{.metadata.uid}')
+        ssh -o BatchMode=yes root@yard-cp-1 "mkdir -p /var/lib/cloudtrain /var/backups/etcd && echo $uid > /var/lib/cloudtrain/berth-map.uid"
+    - on: qm-yard/yard-cp-1
+      timeoutSec: 120
+      run: |
+        set -e
+        p=/etc/kubernetes/pki/etcd
+        ETCDCTL_API=3 etcdctl --endpoints=https://127.0.0.1:2379 --cacert=$p/ca.crt --cert=$p/server.crt --key=$p/server.key \
+          snapshot save /var/backups/etcd/yard-nightly.db >/dev/null
+        sha256sum /var/backups/etcd/yard-nightly.db | cut -d' ' -f1 > /var/lib/cloudtrain/snapshot.sha256
+        chmod 0600 /var/backups/etcd/yard-nightly.db
+    # The incident: a namespace created after the backup, then the bulk delete.
+    - on: qm-yard
+      timeoutSec: 200
+      run: |
+        kubectl create namespace yard-late-change --dry-run=client -o yaml | kubectl apply -f -
+        kubectl delete namespace yard-ops yard-billing --wait=true --timeout=180s
+  teardown:
+    - on: qm-yard
+      run: kubectl delete namespace yard-ops yard-billing yard-late-change --ignore-not-found --wait=false
+  checks:
+    - id: context
+      description: Terminal is using context qm-yard
+      type: k8s-context
+      on: workstation
+      skills: [k8s.cli.contexts]
+      weight: 0.5
+      expect: {match: exact, value: qm-yard}
+    - id: objects-restored
+      description: yard-ops and yard-billing are back with their ConfigMap, Secret and ready Deployment
+      type: shell
+      on: qm-yard
+      skills: [k8s.cluster.etcd-restore]
+      weight: 3
+      timeoutSec: 20
+      command: |
+        echo "$(kubectl -n yard-ops get configmap berth-map -o jsonpath='{.data.assignment}' 2>/dev/null) \
+        $(kubectl -n yard-billing get secret invoice-signing -o name 2>/dev/null) \
+        $(kubectl -n yard-ops get deploy crane-dispatcher -o jsonpath='{.status.readyReplicas}' 2>/dev/null)"
+      expect: {match: exact, value: "{{marker}} secret/invoice-signing 2"}
+    - id: restored-not-recreated
+      description: The objects come from the snapshot (same UID as before the incident)
+      type: shell
+      on: qm-yard/yard-cp-1
+      skills: [k8s.cluster.etcd-restore]
+      weight: 2
+      timeoutSec: 20
+      command: |
+        uid=$(kubectl --kubeconfig /etc/kubernetes/admin.conf -n yard-ops get configmap berth-map -o jsonpath='{.metadata.uid}' 2>/dev/null)
+        [ -n "$uid" ] && [ "$uid" = "$(cat /var/lib/cloudtrain/berth-map.uid)" ] && echo same || echo different
+      expect: {match: exact, value: same}
+    - id: etcd-on-restored-dir
+      description: The etcd static Pod's data volume is {{dir}}, which holds a restored member
+      type: shell
+      on: qm-yard/yard-cp-1
+      skills: [k8s.cluster.etcd-restore]
+      weight: 2
+      command: |
+        m=/etc/kubernetes/manifests/etcd.yaml
+        dir=$(awk '/hostPath:/ {h=1} h && /path:/ {print $2; h=0}' $m | grep -x '{{dir}}/*' | head -1)
+        [ -n "$dir" ] && [ -d {{dir}}/member/snap ] && echo "uses {{dir}}" || echo "not on {{dir}}"
+      expect: {match: exact, value: "uses {{dir}}"}
+    - id: old-data-kept
+      description: The original data directory /var/lib/etcd and the snapshot are untouched
+      type: shell
+      on: qm-yard/yard-cp-1
+      skills: [k8s.cluster.etcd-restore]
+      weight: 0.5
+      command: |
+        echo "$([ -d /var/lib/etcd/member/wal ] && echo old-dir-kept || echo old-dir-gone) \
+        $([ "$(sha256sum /var/backups/etcd/yard-nightly.db | cut -d' ' -f1)" = "$(cat /var/lib/cloudtrain/snapshot.sha256)" ] && echo snapshot-intact || echo snapshot-changed)"
+      expect: {match: exact, value: old-dir-kept snapshot-intact}
+    - id: etcd-healthy
+      description: etcd answers health checks over TLS
+      type: shell
+      on: qm-yard/yard-cp-1
+      skills: [k8s.cluster.etcd-tls]
+      timeoutSec: 20
+      command: |
+        p=/etc/kubernetes/pki/etcd
+        ETCDCTL_API=3 etcdctl --endpoints=https://127.0.0.1:2379 --cacert=$p/ca.crt --cert=$p/server.crt --key=$p/server.key \
+          endpoint health 2>&1 | grep -o 'is healthy' || echo unhealthy
+      expect: {match: exact, value: is healthy}
+  hints:
+    - title: Restore is an offline operation
+      body: "`etcdutl snapshot restore` writes a new data directory from the snapshot; it does not touch the running etcd."
+      command: ssh yard-cp-1 'sudo etcdutl snapshot restore /var/backups/etcd/yard-nightly.db --data-dir {{dir}}'
+      cost: 2
+    - title: Where etcd keeps its data
+      body: In the etcd manifest, `--data-dir` is the path inside the container; the `etcd-data` volume's hostPath decides which directory on the node that is.
+      command: ssh yard-cp-1 'sudo grep -n -A2 "hostPath" /etc/kubernetes/manifests/etcd.yaml'
+      cost: 2
+    - title: Let the kubelet do the restart
+      body: The kubelet watches /etc/kubernetes/manifests. Saving the changed manifest makes it recreate the etcd Pod; the API server reconnects on its own after a minute or two.
+      cost: 1
+    - title: Mind the editor
+      body: Do not leave backup copies of the manifest (e.g. etcd.yaml.bak) inside /etc/kubernetes/manifests; the kubelet would try to run them too. Keep backups elsewhere.
+      cost: 1
+  misconceptions:
+    - id: restore-without-repoint
+      description: Restores the snapshot but leaves the manifest pointing at /var/lib/etcd.
+      feedback: A restored directory is unused until etcd runs on it. Change the etcd-data hostPath in the static Pod manifest.
+      expectFail: [objects-restored, etcd-on-restored-dir]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          kubectl config use-context qm-yard
+          ssh yard-cp-1 'sudo etcdutl snapshot restore /var/backups/etcd/yard-nightly.db --data-dir {{dir}}'
+          sleep 30
+    - id: recreate-by-hand
+      description: Recreates the namespaces and objects from memory instead of restoring.
+      feedback: Hand-made objects get new identities and miss everything you did not remember. Restore from the snapshot.
+      expectFail: [restored-not-recreated, etcd-on-restored-dir]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          kubectl config use-context qm-yard
+          kubectl create namespace yard-ops
+          kubectl create namespace yard-billing
+          kubectl -n yard-ops create configmap berth-map --from-literal=assignment={{marker}}
+          kubectl -n yard-ops create deployment crane-dispatcher --image=httpd:2.4-alpine --replicas=2
+          kubectl -n yard-billing create secret generic invoice-signing --from-literal=key=not-a-real-key
+          kubectl -n yard-ops rollout status deploy/crane-dispatcher --timeout=150s
+    - id: restore-in-place
+      description: Wipes /var/lib/etcd and restores into it.
+      feedback: The incident team needed the old data directory. Restore into a new directory and repoint etcd at it.
+      expectFail: [old-data-kept, etcd-on-restored-dir]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 480
+        run: |
+          kubectl config use-context qm-yard
+          ssh yard-cp-1 'sudo bash -s' <<'EOS'
+          set -e
+          mv /etc/kubernetes/manifests/etcd.yaml /root/etcd.yaml
+          for i in $(seq 1 60); do crictl ps --name '^etcd$' -q | grep -q . || break; sleep 2; done
+          rm -rf /var/lib/etcd
+          etcdutl snapshot restore /var/backups/etcd/yard-nightly.db --data-dir /var/lib/etcd
+          mv /root/etcd.yaml /etc/kubernetes/manifests/etcd.yaml
+          EOS
+          for i in $(seq 1 60); do kubectl get ns yard-ops >/dev/null 2>&1 && break; sleep 5; done
+          kubectl -n yard-ops rollout status deploy/crane-dispatcher --timeout=150s
+  solution:
+    explanation: |
+      `etcdutl snapshot restore` builds a fresh data directory from the
+      snapshot. The etcd static Pod mounts its data from the `etcd-data`
+      hostPath volume, so changing that path in
+      /etc/kubernetes/manifests/etcd.yaml makes the kubelet restart etcd on
+      the restored data. The API server reconnects and serves the state of
+      the snapshot: the deleted namespaces return with their original UIDs,
+      and the namespace created after the backup is gone.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 480
+        run: |
+          kubectl config use-context qm-yard
+          ssh yard-cp-1 'sudo bash -s' <<'EOS'
+          set -e
+          etcdutl snapshot restore /var/backups/etcd/yard-nightly.db --data-dir {{dir}}
+          sed -i 's#path: /var/lib/etcd$#path: {{dir}}#' /etc/kubernetes/manifests/etcd.yaml
+          grep -n 'path: {{dir}}' /etc/kubernetes/manifests/etcd.yaml
+          EOS
+          for i in $(seq 1 60); do kubectl get ns yard-ops >/dev/null 2>&1 && break; sleep 5; done
+          kubectl -n yard-ops rollout status deploy/crane-dispatcher --timeout=200s
+    alternatives:
+      - id: data-dir-flag-and-mount
+        description: Restore with etcdutl's member flags, then change the container's --data-dir, mountPath and hostPath together.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 480
+            run: |
+              kubectl config use-context qm-yard
+              ssh yard-cp-1 'sudo bash -s' <<'EOS'
+              set -e
+              ip=$(sed -n 's/.*--advertise-client-urls=https:\/\/\([0-9.]*\):2379.*/\1/p' /etc/kubernetes/manifests/etcd.yaml)
+              etcdutl snapshot restore /var/backups/etcd/yard-nightly.db --data-dir {{dir}} \
+                --name yard-cp-1 --initial-cluster yard-cp-1=https://$ip:2380 --initial-advertise-peer-urls https://$ip:2380
+              cp /etc/kubernetes/manifests/etcd.yaml /root/etcd.yaml.before-restore
+              sed -i 's#/var/lib/etcd\b#{{dir}}#g' /etc/kubernetes/manifests/etcd.yaml
+              EOS
+              for i in $(seq 1 60); do kubectl get ns yard-ops >/dev/null 2>&1 && break; sleep 5; done
+              kubectl -n yard-ops rollout status deploy/crane-dispatcher --timeout=200s

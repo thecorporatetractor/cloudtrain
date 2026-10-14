@@ -1,0 +1,312 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: pending-pod-detective
+  title: Find out why Pods stay Pending
+  domain: kubernetes
+  frameworks: [cka:troubleshooting, cka:workloads-scheduling]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [troubleshooting, scheduling, pending, events]
+  version: 1
+spec:
+  description: |
+    Three new harbour services were deployed to `qm-dispatch` this morning,
+    and each of their Pods has been **Pending** ever since, each for a
+    different reason.
+
+    Use context `qm-dispatch`. In namespace `harbour-ops`, find out why the
+    Pods of these Deployments are not scheduled and fix each one so that its
+    Pod runs:
+
+    - **`berth-sync`** belongs on the dedicated harbour pool (nodes labelled
+      `quillmoor.example/pool=harbour`). The pool's taint is intentional and
+      must stay.
+    - **`manifest-cache`** must store its data on the pre-provisioned volume
+      `manifest-cache-pv` (owned by the storage team; do not change it).
+      Keep the claim's name `manifest-cache`.
+    - **`tide-model`** was given a CPU request far beyond any node. Its real
+      need is **{{cpu}}**: set that as its CPU request.
+
+    Do not change nodes, their labels or taints.
+  objectives:
+    - Read scheduler events (FailedScheduling) and claim events
+    - Match a toleration to a node pool's taint
+    - Fix a claim that cannot bind and a request that cannot fit
+  params:
+    cpu:
+      type: choice
+      values: [250m, 300m, 400m]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-dispatch
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-dispatch
+          nodes:
+            - {name: dispatch-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: dispatch-wk-1, role: worker, labels: {quillmoor.example/pool: general}}
+            - {name: dispatch-wk-2, role: worker, labels: {quillmoor.example/pool: harbour}, taints: ["quillmoor.example/dedicated=harbour:NoSchedule"]}
+  setup:
+    - on: qm-dispatch/dispatch-wk-1
+      run: mkdir -p /srv/manifest-cache
+    - on: qm-dispatch
+      apply: |
+        apiVersion: v1
+        kind: PersistentVolume
+        metadata: {name: manifest-cache-pv}
+        spec:
+          capacity: {storage: 2Gi}
+          accessModes: [ReadWriteOnce]
+          persistentVolumeReclaimPolicy: Retain
+          storageClassName: harbour-local
+          hostPath: {path: /srv/manifest-cache, type: Directory}
+          nodeAffinity:
+            required:
+              nodeSelectorTerms:
+                - matchExpressions:
+                    - {key: kubernetes.io/hostname, operator: In, values: [dispatch-wk-1]}
+        ---
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: harbour-ops}
+        ---
+        apiVersion: v1
+        kind: PersistentVolumeClaim
+        metadata: {name: manifest-cache, namespace: harbour-ops}
+        spec:
+          accessModes: [ReadWriteOnce]
+          storageClassName: harbour-local
+          resources: {requests: {storage: 5Gi}}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: berth-sync, namespace: harbour-ops}
+        spec:
+          replicas: 1
+          selector: {matchLabels: {app: berth-sync}}
+          template:
+            metadata: {labels: {app: berth-sync}}
+            spec:
+              nodeSelector: {quillmoor.example/pool: harbour}
+              containers:
+                - {name: sync, image: "busybox:1.37", command: ["sh", "-c", "while true; do sleep 30; done"]}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: manifest-cache, namespace: harbour-ops}
+        spec:
+          replicas: 1
+          selector: {matchLabels: {app: manifest-cache}}
+          template:
+            metadata: {labels: {app: manifest-cache}}
+            spec:
+              containers:
+                - name: cache
+                  image: redis:7.4-alpine
+                  volumeMounts: [{name: data, mountPath: /data}]
+              volumes:
+                - name: data
+                  persistentVolumeClaim: {claimName: manifest-cache}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: tide-model, namespace: harbour-ops}
+        spec:
+          replicas: 1
+          selector: {matchLabels: {app: tide-model}}
+          template:
+            metadata: {labels: {app: tide-model}}
+            spec:
+              containers:
+                - name: model
+                  image: busybox:1.37
+                  command: ["sh", "-c", "while true; do sleep 30; done"]
+                  resources: {requests: {cpu: "24", memory: 64Mi}}
+    - on: qm-dispatch
+      timeoutSec: 60
+      run: |
+        sleep 10
+        kubectl -n harbour-ops get pods --field-selector=status.phase=Pending --no-headers | wc -l | grep -qx 3
+  teardown:
+    - on: qm-dispatch
+      run: |
+        kubectl delete namespace harbour-ops --ignore-not-found --wait=false
+        kubectl delete pv manifest-cache-pv --ignore-not-found --wait=false
+  checks:
+    - id: context
+      description: Terminal is using context qm-dispatch
+      type: k8s-context
+      on: workstation
+      skills: [k8s.cli.contexts]
+      weight: 0.5
+      expect: {match: exact, value: qm-dispatch}
+    - id: berth-sync-runs
+      description: berth-sync runs on the harbour pool node
+      type: shell
+      on: qm-dispatch
+      skills: [k8s.troubleshooting.events, k8s.scheduling.taints-tolerations]
+      weight: 2
+      command: |
+        kubectl -n harbour-ops get pods -l app=berth-sync -o json | jq -r '
+          [.items[] | select(.metadata.deletionTimestamp == null) | "\(.status.phase)@\(.spec.nodeName)"] | join(" ")'
+      expect: {match: exact, value: Running@dispatch-wk-2}
+    - id: claim-bound
+      description: Claim manifest-cache is Bound to manifest-cache-pv and the cache Pod runs
+      type: shell
+      on: qm-dispatch
+      skills: [k8s.troubleshooting.events]
+      weight: 2
+      command: |
+        echo "$(kubectl -n harbour-ops get pvc manifest-cache -o jsonpath='{.status.phase}:{.spec.volumeName}' 2>/dev/null) \
+        $(kubectl -n harbour-ops get pods -l app=manifest-cache -o json | jq -r '[.items[] | select(.metadata.deletionTimestamp == null) | .status.phase] | join(",")')"
+      expect: {match: exact, value: Bound:manifest-cache-pv Running}
+    - id: tide-model-fits
+      description: tide-model requests {{cpu}} CPU and runs
+      type: shell
+      on: qm-dispatch
+      skills: [k8s.workloads.resources, k8s.troubleshooting.events]
+      weight: 2
+      command: |
+        echo "$(kubectl -n harbour-ops get deploy tide-model -o jsonpath='{.spec.template.spec.containers[0].resources.requests.cpu}') \
+        $(kubectl -n harbour-ops get pods -l app=tide-model -o json | jq -r '[.items[] | select(.metadata.deletionTimestamp == null) | .status.phase] | join(",")')"
+      expect: {match: exact, value: "{{cpu}} Running"}
+    - id: nodes-unchanged
+      description: Node labels and the harbour pool taint are unchanged
+      type: shell
+      on: qm-dispatch
+      skills: [k8s.cli.scoped-changes]
+      weight: 0.5
+      command: |
+        kubectl get nodes -o json | jq -r '[.items[] | select(.metadata.name | test("wk")) | "\(.metadata.name)=\(.metadata.labels["quillmoor.example/pool"]):" + ([.spec.taints[]? | "\(.key)=\(.value):\(.effect)"] | join(","))] | join(" ")'
+      expect: {match: exact, value: "dispatch-wk-1=general: dispatch-wk-2=harbour:quillmoor.example/dedicated=harbour:NoSchedule"}
+    - id: volume-unchanged
+      description: manifest-cache-pv keeps its size, class and access mode
+      type: k8s-query
+      skills: [k8s.cli.scoped-changes]
+      weight: 0.5
+      query: {cluster: qm-dispatch, resource: pv, name: manifest-cache-pv, jsonpath: '{.spec.capacity.storage} {.spec.storageClassName} {.spec.accessModes}'}
+      expect: {match: exact, value: '2Gi harbour-local ["ReadWriteOnce"]'}
+  hints:
+    - title: Switch context
+      body: The harbour services run in qm-dispatch.
+      command: kubectl config use-context qm-dispatch
+      cost: 0
+    - title: The scheduler says why
+      command: kubectl -n harbour-ops get events --field-selector reason=FailedScheduling
+      body: Each FailedScheduling event lists, per node, which filter rejected the Pod.
+      cost: 1
+    - title: Claims have events too
+      command: kubectl -n harbour-ops describe pvc manifest-cache; kubectl get pv manifest-cache-pv
+      body: Compare the request with what the volume offers.
+      cost: 1
+    - title: Three fixes
+      body: |
+        A toleration for `quillmoor.example/dedicated=harbour:NoSchedule` on
+        berth-sync; a recreated claim that fits the 2Gi volume (scale
+        manifest-cache to 0 while you replace it); and `kubectl set resources
+        -c model --requests=cpu={{cpu}}` on tide-model.
+      cost: 3
+  misconceptions:
+    - id: remove-pool-taint
+      description: Removes the harbour pool's taint.
+      feedback: The taint keeps general workloads off the dedicated pool. Tolerate it in berth-sync instead.
+      expectFail: [nodes-unchanged]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl taint node dispatch-wk-2 quillmoor.example/dedicated-
+          kubectl -n harbour-ops scale deploy manifest-cache --replicas=0
+          kubectl -n harbour-ops delete pvc manifest-cache --wait=true
+          kubectl apply -f - <<'YAML'
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata: {name: manifest-cache, namespace: harbour-ops}
+          spec:
+            accessModes: [ReadWriteOnce]
+            storageClassName: harbour-local
+            resources: {requests: {storage: 2Gi}}
+          YAML
+          kubectl -n harbour-ops scale deploy manifest-cache --replicas=1
+          kubectl -n harbour-ops set resources deploy tide-model -c model --requests=cpu={{cpu}}
+          for d in berth-sync manifest-cache tide-model; do kubectl -n harbour-ops rollout status deploy/$d --timeout=150s; done
+    - id: drop-node-selector
+      description: Deletes berth-sync's nodeSelector so it can run anywhere.
+      feedback: berth-sync must run on the harbour pool. Keep the selector and add the toleration.
+      expectFail: [berth-sync-runs]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl -n harbour-ops patch deploy berth-sync --type=json -p '[{"op":"remove","path":"/spec/template/spec/nodeSelector"}]'
+          kubectl -n harbour-ops scale deploy manifest-cache --replicas=0
+          kubectl -n harbour-ops delete pvc manifest-cache --wait=true
+          kubectl apply -f - <<'YAML'
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata: {name: manifest-cache, namespace: harbour-ops}
+          spec:
+            accessModes: [ReadWriteOnce]
+            storageClassName: harbour-local
+            resources: {requests: {storage: 2Gi}}
+          YAML
+          kubectl -n harbour-ops scale deploy manifest-cache --replicas=1
+          kubectl -n harbour-ops set resources deploy tide-model -c model --requests=cpu={{cpu}}
+          for d in berth-sync manifest-cache tide-model; do kubectl -n harbour-ops rollout status deploy/$d --timeout=150s; done
+    - id: emptydir-instead
+      description: Swaps the claim for an emptyDir so the cache Pod starts.
+      feedback: The cache must persist on the provided volume. An emptyDir disappears with the Pod.
+      expectFail: [claim-bound]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl -n harbour-ops patch deploy berth-sync -p '{"spec":{"template":{"spec":{"tolerations":[{"key":"quillmoor.example/dedicated","operator":"Equal","value":"harbour","effect":"NoSchedule"}]}}}}'
+          kubectl -n harbour-ops patch deploy manifest-cache --type=json -p '[{"op":"replace","path":"/spec/template/spec/volumes/0","value":{"name":"data","emptyDir":{}}}]'
+          kubectl -n harbour-ops set resources deploy tide-model -c model --requests=cpu={{cpu}}
+          for d in berth-sync manifest-cache tide-model; do kubectl -n harbour-ops rollout status deploy/$d --timeout=150s; done
+  solution:
+    explanation: |
+      FailedScheduling events name the cause for each Pod. berth-sync selects
+      the harbour pool, whose only node carries a NoSchedule taint the Pod did
+      not tolerate. The claim asked for 5Gi, more than the 2Gi volume, so it
+      never bound and the cache Pod waited for it; a claim's size cannot be
+      reduced, so it is replaced. tide-model requested 24 CPUs, more than any
+      node's allocatable CPU.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl -n harbour-ops get events --field-selector reason=FailedScheduling
+          kubectl -n harbour-ops patch deploy berth-sync -p '{"spec":{"template":{"spec":{"tolerations":[{"key":"quillmoor.example/dedicated","operator":"Equal","value":"harbour","effect":"NoSchedule"}]}}}}'
+          kubectl -n harbour-ops scale deploy manifest-cache --replicas=0
+          kubectl -n harbour-ops delete pvc manifest-cache --wait=true
+          kubectl apply -f - <<'YAML'
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata: {name: manifest-cache, namespace: harbour-ops}
+          spec:
+            accessModes: [ReadWriteOnce]
+            storageClassName: harbour-local
+            resources: {requests: {storage: 2Gi}}
+          YAML
+          kubectl -n harbour-ops scale deploy manifest-cache --replicas=1
+          kubectl -n harbour-ops set resources deploy tide-model -c model --requests=cpu={{cpu}}
+          for d in berth-sync manifest-cache tide-model; do kubectl -n harbour-ops rollout status deploy/$d --timeout=150s; done

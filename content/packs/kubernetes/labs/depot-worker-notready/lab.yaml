@@ -1,0 +1,204 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: depot-worker-notready
+  title: Bring a NotReady worker back
+  domain: kubernetes
+  frameworks: [cka:troubleshooting]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [troubleshooting, kubelet, journal, nodes]
+  version: 1
+spec:
+  description: |
+    After a configuration change pushed to the depot cluster's worker
+    **`depot-wk-2`**, the node went **NotReady** and the parcel scanners that
+    must run there are stuck.
+
+    Use context `qm-depot`; reach the node with `ssh depot-wk-2` (`sudo`
+    works).
+
+    Find out from the node itself why it is NotReady, fix the configuration
+    that was changed, and get `depot-wk-2` Ready again with the
+    `parcel-scan` Pods (namespace `depot-ops`) running on it. The fix must
+    survive a kubelet restart; do not remove the node from the cluster or
+    rejoin it.
+  objectives:
+    - Read a node's conditions and the kubelet's journal
+    - Find the kubelet's configuration file and fix it
+    - Restart the kubelet and confirm the node recovers
+  params:
+    badca:
+      type: choice
+      values: [/etc/kubernetes/pki/ca-bundle.crt, /etc/kubernetes/ca.crt, /etc/ssl/kubernetes/ca.crt]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-depot
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-depot
+          nodes:
+            - {name: depot-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: depot-wk-1, role: worker}
+            - {name: depot-wk-2, role: worker}
+  setup:
+    - on: qm-depot
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: depot-ops}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: parcel-scan, namespace: depot-ops}
+        spec:
+          replicas: 2
+          selector: {matchLabels: {app: parcel-scan}}
+          template:
+            metadata: {labels: {app: parcel-scan}}
+            spec:
+              nodeSelector: {kubernetes.io/hostname: depot-wk-2}
+              containers:
+                - {name: scan, image: "busybox:1.37", command: ["sh", "-c", "while true; do sleep 30; done"]}
+    - on: qm-depot
+      timeoutSec: 200
+      run: kubectl -n depot-ops rollout status deploy/parcel-scan --timeout=150s
+    - on: qm-depot/depot-wk-2
+      run: |
+        set -e
+        grep -q '^ *clientCAFile: {{badca}}' /var/lib/kubelet/config.yaml \
+          || sed -i 's#clientCAFile: .*#clientCAFile: {{badca}}#' /var/lib/kubelet/config.yaml
+        systemctl restart kubelet || true
+    - on: qm-depot
+      timeoutSec: 180
+      run: |
+        for i in $(seq 1 60); do
+          s=$(kubectl get node depot-wk-2 -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')
+          [ "$s" != True ] && exit 0
+          sleep 3
+        done
+        echo "depot-wk-2 did not go NotReady"; exit 1
+  teardown:
+    - on: qm-depot
+      run: kubectl delete namespace depot-ops --ignore-not-found --wait=false
+  checks:
+    - id: context
+      description: Terminal is using context qm-depot
+      type: k8s-context
+      on: workstation
+      skills: [k8s.cli.contexts]
+      weight: 0.5
+      expect: {match: exact, value: qm-depot}
+    - id: node-ready
+      description: depot-wk-2 is Ready
+      type: k8s-query
+      skills: [k8s.troubleshooting.nodes]
+      weight: 2
+      query: {cluster: qm-depot, resource: node, name: depot-wk-2, jsonpath: '{.status.conditions[?(@.type=="Ready")].status}'}
+      expect: {match: exact, value: "True"}
+    - id: config-fixed
+      description: The kubelet configuration file points at the cluster CA again
+      type: shell
+      on: qm-depot/depot-wk-2
+      skills: [k8s.cluster.kubelet]
+      weight: 2
+      command: awk '$1 == "clientCAFile:" {print $2}' /var/lib/kubelet/config.yaml
+      expect: {match: exact, value: /etc/kubernetes/pki/ca.crt}
+    - id: kubelet-service
+      description: The kubelet is active, enabled and runs from its usual configuration file without overrides
+      type: shell
+      on: qm-depot/depot-wk-2
+      skills: [k8s.cluster.kubelet]
+      command: |
+        echo "$(systemctl is-active kubelet) $(systemctl is-enabled kubelet) $(ps -o args= -C kubelet | grep -c -- '--client-ca-file')"
+      expect: {match: exact, value: active enabled 0}
+    - id: scanners-running
+      description: Both parcel-scan Pods are ready on depot-wk-2
+      type: shell
+      on: qm-depot
+      skills: [k8s.troubleshooting.nodes]
+      command: |
+        kubectl -n depot-ops get pods -l app=parcel-scan -o json | jq -r '
+          [.items[] | select(.metadata.deletionTimestamp == null) | select(.spec.nodeName == "depot-wk-2")
+           | select(any(.status.conditions[]?; .type == "Ready" and .status == "True"))] | length'
+      expect: {match: exact, value: "2"}
+    - id: node-kept
+      description: depot-wk-2 was not removed and rejoined (same node object as before)
+      type: shell
+      on: qm-depot
+      skills: [k8s.cli.scoped-changes]
+      weight: 0.5
+      command: |
+        n=$(kubectl get node depot-wk-2 -o jsonpath='{.metadata.creationTimestamp}')
+        c=$(kubectl get node depot-cp-1 -o jsonpath='{.metadata.creationTimestamp}')
+        # a rejoined node is created long after the control plane
+        echo $(( $(date -d "$n" +%s) - $(date -d "$c" +%s) < 900 ))
+      expect: {match: exact, value: "1"}
+  hints:
+    - title: Switch context
+      body: The depot cluster's context is qm-depot.
+      command: kubectl config use-context qm-depot
+      cost: 0
+    - title: What does the node report?
+      command: kubectl describe node depot-wk-2 | sed -n '/Conditions:/,/Addresses:/p'
+      body: "\"Kubelet stopped posting node status\" means the kubelet is not talking to the API server at all."
+      cost: 1
+    - title: Ask the kubelet
+      command: ssh depot-wk-2 'systemctl status kubelet --no-pager; sudo journalctl -u kubelet --no-pager -n 30'
+      body: The journal shows why the kubelet exits right after starting.
+      cost: 1
+    - title: Where its configuration lives
+      body: kubeadm nodes run the kubelet with `--config=/var/lib/kubelet/config.yaml` (see the unit's drop-in). The cluster CA is /etc/kubernetes/pki/ca.crt.
+      command: ssh depot-wk-2 'sudo grep -n clientCAFile /var/lib/kubelet/config.yaml; ls /etc/kubernetes/pki/'
+      cost: 2
+  misconceptions:
+    - id: restart-only
+      description: Restarts the kubelet without fixing the configuration.
+      feedback: A restart re-reads the same broken file. Fix clientCAFile first.
+      expectFail: [node-ready, config-fixed, scanners-running]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          kubectl config use-context qm-depot
+          ssh depot-wk-2 'sudo systemctl restart kubelet' || true
+          sleep 30
+    - id: flag-override
+      description: Leaves the file broken and overrides it with --client-ca-file in KUBELET_EXTRA_ARGS.
+      feedback: The flag masks the broken file. The next person who reads config.yaml is misled, and the flag is deprecated in favour of the file. Fix the file.
+      expectFail: [config-fixed, kubelet-service]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          kubectl config use-context qm-depot
+          ssh depot-wk-2 'echo "KUBELET_EXTRA_ARGS=--client-ca-file=/etc/kubernetes/pki/ca.crt" | sudo tee /etc/default/kubelet >/dev/null; sudo systemctl restart kubelet'
+          kubectl wait node/depot-wk-2 --for=condition=Ready --timeout=180s
+          kubectl -n depot-ops rollout status deploy/parcel-scan --timeout=120s
+  solution:
+    explanation: |
+      The node stopped posting status because the kubelet exits at start:
+      its journal says it cannot load the client CA file named in
+      /var/lib/kubelet/config.yaml. Pointing `clientCAFile` back to
+      /etc/kubernetes/pki/ca.crt and restarting the kubelet brings the node
+      back; the pinned parcel-scan Pods start on it again.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          kubectl config use-context qm-depot
+          ssh depot-wk-2 'sudo journalctl -u kubelet --no-pager -n 20 | grep -i ca || true'
+          ssh depot-wk-2 'sudo sed -i "s#clientCAFile: .*#clientCAFile: /etc/kubernetes/pki/ca.crt#" /var/lib/kubelet/config.yaml && sudo systemctl restart kubelet'
+          kubectl wait node/depot-wk-2 --for=condition=Ready --timeout=180s
+          kubectl -n depot-ops rollout status deploy/parcel-scan --timeout=180s

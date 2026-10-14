@@ -1,0 +1,339 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: night-shift-user-cert
+  title: Issue a user certificate through the CSR API
+  domain: kubernetes
+  frameworks: [cka:cluster-architecture]
+  difficulty: hard
+  estimatedMinutes: 20
+  tags: [rbac, certificates, csr, kubeconfig, users]
+  version: 1
+spec:
+  description: |
+    The yard's new night-shift lead, **{{user}}**, needs read-only access to
+    the dock scheduling workloads on `qm-yard`. Quillmoor issues user
+    credentials as client certificates signed by the cluster.
+
+    Work from your workstation (`openssl` is installed) with context
+    `qm-yard`:
+
+    1. Create a private key and a certificate signing request with common
+       name **`{{user}}`** and organisation `night-shift`. Keep the files in
+       `~/night-shift/`.
+    2. Submit it as a CertificateSigningRequest named **`{{user}}`** for the
+       signer `kubernetes.io/kube-apiserver-client` with the usage
+       `client auth`, approve it, and save the issued certificate as
+       `~/night-shift/{{user}}.crt`.
+    3. In namespace `dock-scheduling`, create a Role **`night-shift-read`**
+       that allows `get`, `list` and `watch` on Pods and Deployments, and bind
+       it to the user `{{user}}` (RoleBinding `night-shift-read`). Grant
+       nothing else.
+    4. Add a user `{{user}}` with the key and certificate to your kubeconfig,
+       and a context **`night-shift`** that uses the `qm-yard` cluster, that
+       user and the namespace `dock-scheduling`. Keep `qm-yard` as your
+       current context.
+  objectives:
+    - Generate a key and CSR with openssl
+    - Create, approve and read a CertificateSigningRequest
+    - Write a namespaced read-only Role and RoleBinding for a user
+    - Add credentials and a context to a kubeconfig
+  params:
+    user:
+      type: choice
+      values: [ines-okafor, tom-brannagh, mira-castell]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-yard
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-yard
+          nodes:
+            - {name: yard-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: yard-wk-1, role: worker}
+  setup:
+    - on: qm-yard
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: dock-scheduling}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: berth-planner, namespace: dock-scheduling}
+        spec:
+          replicas: 1
+          selector: {matchLabels: {app: berth-planner}}
+          template:
+            metadata: {labels: {app: berth-planner}}
+            spec:
+              containers:
+                - {name: planner, image: "caddy:2-alpine"}
+    - on: workstation
+      run: install -d -m 0700 -o learner -g learner /home/learner/night-shift
+  teardown:
+    - on: qm-yard
+      run: |
+        kubectl delete csr {{user}} --ignore-not-found
+        kubectl delete namespace dock-scheduling --ignore-not-found --wait=false
+  checks:
+    - id: context
+      description: The current context is still qm-yard
+      type: k8s-context
+      on: workstation
+      skills: [k8s.cli.contexts]
+      weight: 0.5
+      expect: {match: exact, value: qm-yard}
+    - id: csr-issued
+      description: CSR {{user}} for kube-apiserver-client with client auth is approved and issued for CN={{user}}, O=night-shift
+      type: shell
+      on: qm-yard
+      skills: [k8s.rbac.user-certificates]
+      weight: 2
+      command: |
+        c=$(kubectl get csr {{user}} -o json 2>/dev/null) || { echo "no csr"; exit 0; }
+        echo "$c" | jq -r '"\(.spec.signerName) \(.spec.usages | join(",")) \([.status.conditions[]?.type] | join(","))"'
+        s=$(echo "$c" | jq -r '.status.certificate // empty' | base64 -d 2>/dev/null | openssl x509 -noout -subject -nameopt multiline 2>/dev/null | sed 1d | tr -d ' ' | sort | paste -sd, -)
+        echo "${s:-not issued}"
+      expect: {match: exact, value: "kubernetes.io/kube-apiserver-client client auth Approved\ncommonName={{user}},organizationName=night-shift"}
+    - id: cert-saved
+      description: ~/night-shift/{{user}}.crt holds the issued certificate
+      type: shell
+      on: workstation
+      skills: [k8s.rbac.user-certificates]
+      command: |
+        s=$(openssl x509 -in /home/learner/night-shift/{{user}}.crt -noout -subject -nameopt multiline 2>/dev/null | sed 1d | tr -d ' ' | sort | paste -sd, -)
+        echo "${s:-no certificate}"
+      expect: {match: exact, value: "commonName={{user}},organizationName=night-shift"}
+    - id: can-list-pods
+      description: "{{user}} can list Pods in dock-scheduling"
+      type: k8s-can-i
+      skills: [k8s.rbac.auth-can-i]
+      query: {cluster: qm-yard, verb: list, resource: pods, namespace: dock-scheduling, as: "{{user}}"}
+      expect: {match: exact, value: "yes"}
+    - id: can-watch-deployments
+      description: "{{user}} can watch Deployments in dock-scheduling"
+      type: k8s-can-i
+      skills: [k8s.rbac.auth-can-i]
+      query: {cluster: qm-yard, verb: watch, resource: deployments.apps, namespace: dock-scheduling, as: "{{user}}"}
+      expect: {match: exact, value: "yes"}
+    - id: cannot-delete
+      description: "{{user}} cannot delete Pods in dock-scheduling"
+      type: k8s-can-i
+      skills: [k8s.rbac.auth-can-i]
+      query: {cluster: qm-yard, verb: delete, resource: pods, namespace: dock-scheduling, as: "{{user}}"}
+      expect: {match: exact, value: "no"}
+    - id: namespace-only
+      description: "{{user}} cannot list Pods in other namespaces"
+      type: k8s-can-i
+      skills: [k8s.rbac.auth-can-i]
+      query: {cluster: qm-yard, verb: list, resource: pods, namespace: kube-system, as: "{{user}}"}
+      expect: {match: exact, value: "no"}
+    - id: context-works
+      description: Context night-shift authenticates as {{user}}, defaults to dock-scheduling and lists its Pods
+      type: shell
+      on: workstation
+      skills: [k8s.rbac.user-certificates]
+      weight: 2
+      timeoutSec: 20
+      command: |
+        k() { kubectl --kubeconfig /home/learner/.kube/config --context night-shift "$@"; }
+        echo "$(k auth whoami -o jsonpath='{.status.userInfo.username}' 2>&1) \
+        $(kubectl --kubeconfig /home/learner/.kube/config config view -o jsonpath='{.contexts[?(@.name=="night-shift")].context.namespace}') \
+        $(k get pods --no-headers 2>&1 | grep -c berth-planner)"
+      expect: {match: exact, value: "{{user}} dock-scheduling 1"}
+  hints:
+    - title: Key and CSR
+      command: |
+        cd ~/night-shift
+        openssl genrsa -out {{user}}.key 2048
+        openssl req -new -key {{user}}.key -subj "/CN={{user}}/O=night-shift" -out {{user}}.csr
+      body: The common name becomes the Kubernetes user name, the organisation its group.
+      cost: 1
+    - title: The CSR object
+      body: |
+        `spec.request` is the base64-encoded PEM CSR (one line: `base64 -w0`).
+        `signerName: kubernetes.io/kube-apiserver-client` and
+        `usages: [client auth]` ask for a client certificate.
+      cost: 2
+    - title: Approve and fetch
+      command: |
+        kubectl certificate approve {{user}}
+        kubectl get csr {{user}} -o jsonpath='{.status.certificate}' | base64 -d > ~/night-shift/{{user}}.crt
+      body: The certificate appears in the CSR's status once the signer has issued it.
+      cost: 1
+    - title: Kubeconfig entries
+      command: |
+        kubectl config set-credentials {{user}} --client-key=$HOME/night-shift/{{user}}.key --client-certificate=$HOME/night-shift/{{user}}.crt --embed-certs
+        kubectl config set-context night-shift --cluster=$(kubectl config view -o jsonpath='{.contexts[?(@.name=="qm-yard")].context.cluster}') --user={{user}} --namespace=dock-scheduling
+      body: Look up the cluster entry that the qm-yard context uses.
+      cost: 2
+  misconceptions:
+    - id: wildcard-verbs
+      description: Grants all verbs on the resources.
+      feedback: "`*` includes delete, update and patch. The night-shift lead needs read-only: get, list, watch."
+      expectFail: [cannot-delete]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          kubectl config use-context qm-yard
+          cd ~/night-shift
+          openssl genrsa -out {{user}}.key 2048 2>/dev/null
+          openssl req -new -key {{user}}.key -subj "/CN={{user}}/O=night-shift" -out {{user}}.csr
+          kubectl apply -f - <<YAML
+          apiVersion: certificates.k8s.io/v1
+          kind: CertificateSigningRequest
+          metadata: {name: {{user}}}
+          spec:
+            request: $(base64 -w0 {{user}}.csr)
+            signerName: kubernetes.io/kube-apiserver-client
+            usages: [client auth]
+          YAML
+          kubectl certificate approve {{user}}
+          sleep 3
+          kubectl get csr {{user}} -o jsonpath='{.status.certificate}' | base64 -d > {{user}}.crt
+          kubectl -n dock-scheduling create role night-shift-read --verb='*' --resource=pods,deployments.apps
+          kubectl -n dock-scheduling create rolebinding night-shift-read --role=night-shift-read --user={{user}}
+          kubectl config set-credentials {{user}} --client-key=$HOME/night-shift/{{user}}.key --client-certificate=$HOME/night-shift/{{user}}.crt --embed-certs
+          kubectl config set-context night-shift --cluster="$(kubectl config view -o jsonpath='{.contexts[?(@.name=="qm-yard")].context.cluster}')" --user={{user}} --namespace=dock-scheduling
+    - id: cluster-wide-view
+      description: Binds the built-in view ClusterRole with a ClusterRoleBinding.
+      feedback: A ClusterRoleBinding grants the rights in every namespace. Use a RoleBinding in dock-scheduling.
+      expectFail: [namespace-only]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          kubectl config use-context qm-yard
+          cd ~/night-shift
+          openssl genrsa -out {{user}}.key 2048 2>/dev/null
+          openssl req -new -key {{user}}.key -subj "/CN={{user}}/O=night-shift" -out {{user}}.csr
+          kubectl apply -f - <<YAML
+          apiVersion: certificates.k8s.io/v1
+          kind: CertificateSigningRequest
+          metadata: {name: {{user}}}
+          spec:
+            request: $(base64 -w0 {{user}}.csr)
+            signerName: kubernetes.io/kube-apiserver-client
+            usages: [client auth]
+          YAML
+          kubectl certificate approve {{user}}
+          sleep 3
+          kubectl get csr {{user}} -o jsonpath='{.status.certificate}' | base64 -d > {{user}}.crt
+          kubectl create clusterrolebinding night-shift-read --clusterrole=view --user={{user}}
+          kubectl config set-credentials {{user}} --client-key=$HOME/night-shift/{{user}}.key --client-certificate=$HOME/night-shift/{{user}}.crt --embed-certs
+          kubectl config set-context night-shift --cluster="$(kubectl config view -o jsonpath='{.contexts[?(@.name=="qm-yard")].context.cluster}')" --user={{user}} --namespace=dock-scheduling
+    - id: no-approval
+      description: Creates the CSR but never approves it.
+      feedback: A CSR is only signed after an authorised user approves it; until then status.certificate stays empty.
+      expectFail: [csr-issued, cert-saved, context-works]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          kubectl config use-context qm-yard
+          cd ~/night-shift
+          openssl genrsa -out {{user}}.key 2048 2>/dev/null
+          openssl req -new -key {{user}}.key -subj "/CN={{user}}/O=night-shift" -out {{user}}.csr
+          kubectl apply -f - <<YAML
+          apiVersion: certificates.k8s.io/v1
+          kind: CertificateSigningRequest
+          metadata: {name: {{user}}}
+          spec:
+            request: $(base64 -w0 {{user}}.csr)
+            signerName: kubernetes.io/kube-apiserver-client
+            usages: [client auth]
+          YAML
+          kubectl -n dock-scheduling create role night-shift-read --verb=get,list,watch --resource=pods,deployments.apps
+          kubectl -n dock-scheduling create rolebinding night-shift-read --role=night-shift-read --user={{user}}
+  solution:
+    explanation: |
+      The CSR carries the public key and the subject; once approved, the
+      kube-apiserver-client signer issues a certificate signed by the cluster
+      CA, which the API server accepts as user `{{user}}` in group
+      `night-shift`. Authorisation is separate: a Role with read verbs and a
+      RoleBinding in dock-scheduling grant exactly that. The kubeconfig user
+      embeds key and certificate; the context ties it to the cluster and the
+      namespace.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          kubectl config use-context qm-yard
+          cd ~/night-shift
+          openssl genrsa -out {{user}}.key 2048 2>/dev/null
+          openssl req -new -key {{user}}.key -subj "/CN={{user}}/O=night-shift" -out {{user}}.csr
+          kubectl apply -f - <<YAML
+          apiVersion: certificates.k8s.io/v1
+          kind: CertificateSigningRequest
+          metadata: {name: {{user}}}
+          spec:
+            request: $(base64 -w0 {{user}}.csr)
+            signerName: kubernetes.io/kube-apiserver-client
+            expirationSeconds: 2592000
+            usages: [client auth]
+          YAML
+          kubectl certificate approve {{user}}
+          for i in $(seq 1 20); do
+            kubectl get csr {{user}} -o jsonpath='{.status.certificate}' | base64 -d > {{user}}.crt
+            [ -s {{user}}.crt ] && break; sleep 1
+          done
+          kubectl -n dock-scheduling create role night-shift-read --verb=get,list,watch --resource=pods,deployments.apps
+          kubectl -n dock-scheduling create rolebinding night-shift-read --role=night-shift-read --user={{user}}
+          kubectl config set-credentials {{user}} --client-key=$HOME/night-shift/{{user}}.key --client-certificate=$HOME/night-shift/{{user}}.crt --embed-certs
+          kubectl config set-context night-shift --cluster="$(kubectl config view -o jsonpath='{.contexts[?(@.name=="qm-yard")].context.cluster}')" --user={{user}} --namespace=dock-scheduling
+          kubectl --context night-shift get pods
+    alternatives:
+      - id: ec-key-and-file-paths
+        description: An EC key, the Role and binding as a manifest, and file references instead of embedded credentials.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 120
+            run: |
+              kubectl config use-context qm-yard
+              cd ~/night-shift
+              openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -keyout {{user}}.key -subj "/CN={{user}}/O=night-shift" -out {{user}}.csr 2>/dev/null
+              cat <<YAML | kubectl apply -f -
+              apiVersion: certificates.k8s.io/v1
+              kind: CertificateSigningRequest
+              metadata: {name: {{user}}}
+              spec:
+                request: $(base64 -w0 {{user}}.csr)
+                signerName: kubernetes.io/kube-apiserver-client
+                usages: [client auth]
+              ---
+              apiVersion: rbac.authorization.k8s.io/v1
+              kind: Role
+              metadata: {name: night-shift-read, namespace: dock-scheduling}
+              rules:
+                - {apiGroups: [""], resources: [pods], verbs: [get, list, watch]}
+                - {apiGroups: [apps], resources: [deployments], verbs: [get, list, watch]}
+              ---
+              apiVersion: rbac.authorization.k8s.io/v1
+              kind: RoleBinding
+              metadata: {name: night-shift-read, namespace: dock-scheduling}
+              roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: night-shift-read}
+              subjects: [{apiGroup: rbac.authorization.k8s.io, kind: User, name: {{user}}}]
+              YAML
+              kubectl certificate approve {{user}}
+              for i in $(seq 1 20); do
+                kubectl get csr {{user}} -o jsonpath='{.status.certificate}' | base64 -d > {{user}}.crt
+                [ -s {{user}}.crt ] && break; sleep 1
+              done
+              kubectl config set-credentials {{user}} --client-key=$HOME/night-shift/{{user}}.key --client-certificate=$HOME/night-shift/{{user}}.crt
+              cl=$(kubectl config view -o jsonpath='{.contexts[?(@.name=="qm-yard")].context.cluster}')
+              kubectl config set-context night-shift --cluster="$cl" --user={{user}} --namespace=dock-scheduling

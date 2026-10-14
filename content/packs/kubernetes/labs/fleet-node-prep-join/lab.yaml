@@ -1,0 +1,272 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: fleet-node-prep-join
+  title: Prepare a fresh host and join it as a worker
+  domain: kubernetes
+  frameworks: [cka:cluster-architecture]
+  difficulty: hard
+  estimatedMinutes: 35
+  tags: [kubeadm, join, node-prep, containerd, sysctl]
+  version: 1
+spec:
+  description: |
+    A new machine, `fleet-wk-3`, arrived for the label-printing fleet. It has
+    containerd, kubeadm and the kubelet installed, but nobody prepared the
+    host for Kubernetes and it is not part of the cluster yet.
+
+    From your workstation you can `ssh fleet-wk-3` and `ssh fleet-cp-1`
+    (`sudo` works on both). Use context `qm-fleet` to look at the cluster.
+
+    Prepare `fleet-wk-3` so the settings **survive a reboot**:
+
+    1. load the kernel modules `overlay` and `br_netfilter`, now and at boot;
+    2. set `net.ipv4.ip_forward`, `net.bridge.bridge-nf-call-iptables` and
+       `net.bridge.bridge-nf-call-ip6tables` to `1`, now and at boot;
+    3. turn swap off, now and at boot;
+    4. configure containerd to use the **systemd cgroup driver** (the
+       kubelet uses systemd) and restart it.
+
+    Then **join** `fleet-wk-3` to `qm-fleet` as a worker with `kubeadm join`,
+    using a bootstrap token you create on the control plane, so that the node
+    reports Ready and runs Pods.
+  objectives:
+    - Load kernel modules and set sysctls persistently
+    - Disable swap persistently
+    - Configure containerd's cgroup driver
+    - Create a join command and join a worker with kubeadm
+  params:
+    swapfile:
+      type: choice
+      values: [/swap.img, /var/swapfile, /srv/swap0]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-fleet
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-fleet
+          nodes:
+            - {name: fleet-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: fleet-wk-1, role: worker}
+            - {name: fleet-wk-3, role: worker}
+  setup:
+    # Turn fleet-wk-3 back into an unprepared host that is not in the cluster.
+    - on: qm-fleet
+      run: |
+        kubectl drain fleet-wk-3 --ignore-daemonsets --delete-emptydir-data --force --timeout=60s || true
+        kubectl delete node fleet-wk-3 --ignore-not-found --wait=true
+    - on: qm-fleet/fleet-wk-3
+      timeoutSec: 240
+      run: |
+        set -e
+        kubeadm reset -f >/dev/null 2>&1 || true
+        rm -rf /etc/cni/net.d/* /var/lib/kubelet/pki
+        systemctl stop kubelet || true
+        rm -f /etc/modules-load.d/k8s.conf /etc/sysctl.d/99-kubernetes.conf
+        printf 'net.ipv4.ip_forward = 0\n' > /etc/sysctl.d/60-host-defaults.conf
+        sysctl -w net.ipv4.ip_forward=0 >/dev/null
+        sysctl -w net.bridge.bridge-nf-call-iptables=0 net.bridge.bridge-nf-call-ip6tables=0 >/dev/null 2>&1 || true
+        modprobe -r br_netfilter 2>/dev/null || true
+        sed -i 's/SystemdCgroup = true/SystemdCgroup = false/' /etc/containerd/config.toml
+        systemctl restart containerd
+        if [ ! -f {{swapfile}} ]; then
+          fallocate -l 256M {{swapfile}} && chmod 600 {{swapfile}} && mkswap {{swapfile}} >/dev/null
+        fi
+        swapon {{swapfile}} 2>/dev/null || true
+        grep -q '{{swapfile}}' /etc/fstab || echo '{{swapfile}} none swap sw 0 0' >> /etc/fstab
+  checks:
+    - id: context
+      description: Terminal is using context qm-fleet
+      type: k8s-context
+      on: workstation
+      skills: [k8s.cli.contexts]
+      weight: 0.5
+      expect: {match: exact, value: qm-fleet}
+    - id: modules
+      description: overlay and br_netfilter are loaded and listed for loading at boot
+      type: shell
+      on: qm-fleet/fleet-wk-3
+      skills: [k8s.cluster.node-prep]
+      command: |
+        for m in overlay br_netfilter; do
+          l=$(grep -qw "^$m" /proc/modules && echo loaded || echo missing)
+          b=$(cat /etc/modules-load.d/*.conf 2>/dev/null | sed 's/#.*//' | grep -qx "[[:space:]]*$m[[:space:]]*" && echo boot || echo no-boot)
+          echo "$m:$l:$b"
+        done | paste -sd' ' -
+      expect: {match: exact, value: "overlay:loaded:boot br_netfilter:loaded:boot"}
+    - id: sysctls
+      description: The three sysctls are 1 now and in the boot configuration
+      type: shell
+      on: qm-fleet/fleet-wk-3
+      skills: [k8s.cluster.node-prep]
+      command: |
+        for k in net.ipv4.ip_forward net.bridge.bridge-nf-call-iptables net.bridge.bridge-nf-call-ip6tables; do
+          now=$(sysctl -n $k 2>/dev/null)
+          # files are applied in lexical order: the last definition wins
+          last=$(for f in $(ls /etc/sysctl.d/*.conf 2>/dev/null | sort) /etc/sysctl.conf; do sed 's/#.*//; s/[[:space:]]//g' "$f" 2>/dev/null | grep "^$k=" | sed "s|^|$f |"; done | tail -1 | cut -d= -f2)
+          echo "$k=$now/$last"
+        done | paste -sd' ' -
+      expect: {match: exact, value: "net.ipv4.ip_forward=1/1 net.bridge.bridge-nf-call-iptables=1/1 net.bridge.bridge-nf-call-ip6tables=1/1"}
+    - id: swap-off
+      description: No swap is active and none is configured in /etc/fstab
+      type: shell
+      on: qm-fleet/fleet-wk-3
+      skills: [k8s.cluster.node-prep]
+      command: echo "active=$(swapon --noheadings --show | wc -l) fstab=$(sed 's/#.*//' /etc/fstab | awk '$3 == "swap"' | wc -l)"
+      expect: {match: exact, value: active=0 fstab=0}
+    - id: containerd-systemd
+      description: containerd runs with SystemdCgroup = true
+      type: shell
+      on: qm-fleet/fleet-wk-3
+      skills: [k8s.cluster.node-prep]
+      command: |
+        echo "$(systemctl is-active containerd) $(grep -E '^[[:space:]]*SystemdCgroup[[:space:]]*=' /etc/containerd/config.toml | tr -d ' ' | sort -u | paste -sd, -)"
+      expect: {match: exact, value: active SystemdCgroup=true}
+    - id: node-ready
+      description: fleet-wk-3 is a Ready worker of qm-fleet
+      type: k8s-query
+      skills: [k8s.cluster.kubeadm-install]
+      weight: 2
+      query: {cluster: qm-fleet, resource: node, name: fleet-wk-3, jsonpath: '{.status.conditions[?(@.type=="Ready")].status}'}
+      expect: {match: exact, value: "True"}
+    - id: node-runs-pods
+      description: The CNI and kube-proxy Pods on fleet-wk-3 are ready and the kubelet is enabled
+      type: shell
+      on: qm-fleet
+      skills: [k8s.cluster.kubeadm-install, k8s.cluster.node-prep]
+      weight: 2
+      command: |
+        kubectl get pods -n kube-system --field-selector spec.nodeName=fleet-wk-3 -o json | jq -r '
+          [.items[] | select(.metadata.name | test("^(calico-node|kube-proxy)-"))
+           | select(any(.status.conditions[]?; .type == "Ready" and .status == "True")) | .metadata.name | sub("-[a-z0-9]+$"; "")] | sort | join(",")'
+      expect: {match: exact, value: "calico-node,kube-proxy"}
+    - id: kubelet-enabled
+      description: The kubelet on fleet-wk-3 is active and enabled at boot
+      type: shell
+      on: qm-fleet/fleet-wk-3
+      skills: [k8s.cluster.kubeadm-install]
+      weight: 0.5
+      command: echo "$(systemctl is-active kubelet) $(systemctl is-enabled kubelet)"
+      expect: {match: exact, value: active enabled}
+  hints:
+    - title: Kernel modules
+      command: |
+        printf 'overlay\nbr_netfilter\n' | sudo tee /etc/modules-load.d/k8s.conf
+        sudo modprobe overlay && sudo modprobe br_netfilter
+      body: Files in /etc/modules-load.d are read at boot; modprobe loads the module now.
+      cost: 1
+    - title: Sysctls, and who wins
+      body: |
+        Files in /etc/sysctl.d are applied in lexical order and the last
+        definition of a key wins; check what is already there. `sysctl --system`
+        applies them all now.
+      command: grep -r ip_forward /etc/sysctl.d/ /etc/sysctl.conf
+      cost: 2
+    - title: Swap
+      command: sudo swapoff -a && sudo sed -i '/\sswap\s/ s/^/#/' /etc/fstab
+      body: swapoff stops it now; the fstab entry would bring it back at boot.
+      cost: 1
+    - title: containerd cgroups
+      command: sudo sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml && sudo systemctl restart containerd
+      body: The runc options in /etc/containerd/config.toml select the cgroup driver.
+      cost: 1
+    - title: Join
+      command: |
+        ssh fleet-cp-1 'sudo kubeadm token create --print-join-command'
+        # run the printed command with sudo on fleet-wk-3
+      body: The printed command contains a fresh token and the CA certificate hash.
+      cost: 2
+  misconceptions:
+    - id: runtime-only-sysctl
+      description: Sets the sysctls with sysctl -w only.
+      feedback: sysctl -w changes the running kernel; after a reboot the old values come back. Write them to a file in /etc/sysctl.d that sorts after the existing ones.
+      expectFail: [sysctls]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          kubectl config use-context qm-fleet
+          cmd=$(ssh fleet-cp-1 'sudo kubeadm token create --print-join-command')
+          ssh fleet-wk-3 "printf 'overlay\nbr_netfilter\n' | sudo tee /etc/modules-load.d/k8s.conf >/dev/null
+            sudo modprobe overlay; sudo modprobe br_netfilter
+            sudo sysctl -w net.ipv4.ip_forward=1 net.bridge.bridge-nf-call-iptables=1 net.bridge.bridge-nf-call-ip6tables=1
+            sudo swapoff -a; sudo sed -i '/[[:space:]]swap[[:space:]]/d' /etc/fstab
+            sudo sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml; sudo systemctl restart containerd
+            sudo $cmd"
+          kubectl --context qm-fleet wait node/fleet-wk-3 --for=condition=Ready --timeout=180s
+    - id: swapoff-only
+      description: Runs swapoff -a but leaves the swap entry in /etc/fstab.
+      feedback: The fstab entry turns swap on again at the next boot, and the kubelet refuses to start with swap enabled.
+      expectFail: [swap-off]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          kubectl config use-context qm-fleet
+          cmd=$(ssh fleet-cp-1 'sudo kubeadm token create --print-join-command')
+          ssh fleet-wk-3 "printf 'overlay\nbr_netfilter\n' | sudo tee /etc/modules-load.d/k8s.conf >/dev/null
+            sudo modprobe overlay; sudo modprobe br_netfilter
+            printf 'net.ipv4.ip_forward = 1\nnet.bridge.bridge-nf-call-iptables = 1\nnet.bridge.bridge-nf-call-ip6tables = 1\n' | sudo tee /etc/sysctl.d/99-kubernetes.conf >/dev/null
+            sudo sysctl --system >/dev/null
+            sudo swapoff -a
+            sudo sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml; sudo systemctl restart containerd
+            sudo $cmd"
+          kubectl --context qm-fleet wait node/fleet-wk-3 --for=condition=Ready --timeout=180s
+    - id: early-sysctl-file
+      description: Writes the sysctls into a file that sorts before the host's own file, which sets ip_forward back to 0.
+      feedback: The host already sets net.ipv4.ip_forward = 0 in /etc/sysctl.d/60-host-defaults.conf. A file named 10-k8s.conf is read first and overridden.
+      expectFail: [sysctls]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          kubectl config use-context qm-fleet
+          cmd=$(ssh fleet-cp-1 'sudo kubeadm token create --print-join-command')
+          ssh fleet-wk-3 "printf 'overlay\nbr_netfilter\n' | sudo tee /etc/modules-load.d/k8s.conf >/dev/null
+            sudo modprobe overlay; sudo modprobe br_netfilter
+            printf 'net.ipv4.ip_forward = 1\nnet.bridge.bridge-nf-call-iptables = 1\nnet.bridge.bridge-nf-call-ip6tables = 1\n' | sudo tee /etc/sysctl.d/10-k8s.conf >/dev/null
+            sudo sysctl -p /etc/sysctl.d/10-k8s.conf >/dev/null
+            sudo swapoff -a; sudo sed -i '/[[:space:]]swap[[:space:]]/d' /etc/fstab
+            sudo sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml; sudo systemctl restart containerd
+            sudo $cmd"
+          kubectl --context qm-fleet wait node/fleet-wk-3 --for=condition=Ready --timeout=180s
+  solution:
+    explanation: |
+      Modules go to /etc/modules-load.d, sysctls to a late file in
+      /etc/sysctl.d (the host's 60-host-defaults.conf disables forwarding, so
+      the Kubernetes file must sort after it), swap is turned off and removed
+      from /etc/fstab, and containerd's runc options switch to the systemd
+      cgroup driver the kubelet expects. `kubeadm token create
+      --print-join-command` on the control plane prints a join command with a
+      fresh token and the CA hash; running it on the new host starts the
+      kubelet's TLS bootstrap.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 360
+        run: |
+          kubectl config use-context qm-fleet
+          ssh fleet-wk-3 'set -e
+            printf "overlay\nbr_netfilter\n" | sudo tee /etc/modules-load.d/k8s.conf >/dev/null
+            sudo modprobe overlay; sudo modprobe br_netfilter
+            printf "net.ipv4.ip_forward = 1\nnet.bridge.bridge-nf-call-iptables = 1\nnet.bridge.bridge-nf-call-ip6tables = 1\n" | sudo tee /etc/sysctl.d/99-kubernetes.conf >/dev/null
+            sudo sysctl --system >/dev/null
+            sudo swapoff -a
+            sudo sed -i "/[[:space:]]swap[[:space:]]/d" /etc/fstab
+            sudo sed -i "s/SystemdCgroup = false/SystemdCgroup = true/" /etc/containerd/config.toml
+            sudo systemctl restart containerd'
+          cmd=$(ssh fleet-cp-1 'sudo kubeadm token create --print-join-command')
+          ssh fleet-wk-3 "sudo $cmd"
+          kubectl wait node/fleet-wk-3 --for=condition=Ready --timeout=240s
+          kubectl -n kube-system wait pod -l k8s-app=calico-node --field-selector spec.nodeName=fleet-wk-3 --for=condition=Ready --timeout=180s
