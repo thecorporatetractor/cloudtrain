@@ -31,6 +31,18 @@ type CatalogImage struct {
 	// EtcdVersion and KubectlVersion are informational (written by tools/images).
 	EtcdVersion    string `json:"etcdVersion,omitempty"`
 	KubectlVersion string `json:"kubectlVersion,omitempty"`
+	// UserNamespace marks a container image built to run in a Kubernetes user
+	// namespace (tier A): the container driver sets pod hostUsers: false when
+	// the cluster supports it (see userns.go).
+	UserNamespace bool `json:"userNamespace,omitempty"`
+	// Tier is the curriculum environment tier (A, B, C, K, V, N); informational.
+	Tier string `json:"tier,omitempty"`
+	// Mirrors lists the in-cluster mirror services the image is configured to
+	// use (informational, e.g. [dnf, apt, pypi]; see deploy/mirrors).
+	Mirrors []string `json:"mirrors,omitempty"`
+	// Addons lists the add-ons /opt/cloudtrain/bin/addons-install can install
+	// on a kubeadm image (informational).
+	Addons []string `json:"addons,omitempty"`
 }
 
 // ImageCatalog maps the image refs used in lab.yaml (topology.nodes[].image)

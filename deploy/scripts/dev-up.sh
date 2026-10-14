@@ -85,6 +85,12 @@ log "installing Multus $MULTUS_VERSION (thick plugin)"
 k apply -f "$REPO_ROOT/deploy/multus/multus-daemonset-thick.yaml" >/dev/null
 wait_for "multus daemonset rolled out" 300 k -n kube-system rollout status ds/kube-multus-ds --timeout=5s
 
+# --- 3b. expired KubeVirt/CDI certificates ------------------------------------
+# After the cluster was stopped longer than the operators' 24 h cert lifetime, every
+# webhook answers "x509: certificate has expired" and the applies below fail. Detect
+# that and restart the operators so they re-issue the certs (no-op when healthy).
+"$REPO_ROOT/deploy/scripts/heal-virt-certs.sh"
+
 # --- 4. KubeVirt -------------------------------------------------------------
 log "installing KubeVirt $KUBEVIRT_VERSION"
 fetch_pinned "https://github.com/kubevirt/kubevirt/releases/download/${KUBEVIRT_VERSION}/kubevirt-operator.yaml" \

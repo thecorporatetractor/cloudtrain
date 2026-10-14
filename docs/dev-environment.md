@@ -69,6 +69,16 @@ after, about 20 s). It also brings the cluster back after its node containers st
   every node and restarts a node that lacks one (a privileged container only gets the
   host device nodes that exist when it starts);
 - it handles the control-plane IP drift that a restart can cause (see "Known gaps" 2).
+- it heals expired KubeVirt/CDI certificates (`deploy/scripts/heal-virt-certs.sh`, also
+  `task dev:heal-certs`). virt-operator and cdi-operator issue 24 h serving certificates
+  (CA 7 d) and rotate them only while running; after a stop longer than that (seen after
+  ~20 h) every webhook answers `x509: certificate has expired`. The script flags any
+  expired or soon-expiring `tls.crt` in the kubevirt/cdi Secrets, a CA bundle with no valid
+  certificate, or an x509 error from a server-side dry-run of a VMI and a DataVolume (and a
+  GET on `subresources.kubevirt.io`); it then restarts both operators, waits until every
+  certificate is valid, restarts serving components that still present the old one, and
+  waits until the probes pass. A healthy cluster costs ~3 s; a forced repair (`FORCE=1`)
+  took 50 s.
 
 `dev:up` never changes your kubeconfig's current-context: every call passes
 `--context kind-cloudtrain-dev`, and after `kind create cluster` (which switches it) the
@@ -317,6 +327,12 @@ and keeps boot-to-Ready around 90–117 s.
   kube-apiserver at v1.37.1. etcd-host: `etcdctl endpoint health` over mutual TLS, a client
   without a certificate is refused, then the etcd lab's provision script and solution.
   Results: `deploy/.results/image-test/<variant>.txt`. At most one test VM runs at a time.
+  kubeadm-upgrade (2026-10-14, image packaged with `PACKAGE_ONLY=1` from the TCG-built
+  disk, 4.51 GB containerDisk image): PASSED in 794 s. `kubeadm upgrade plan` and
+  `kubeadm upgrade plan v1.37.1` both exit 0 offline; installing the kubelet 1.37.1
+  package **restarts kubelet** (new PID; the node keeps reporting v1.36.5 until the
+  config is upgraded and kubelet restarted again by the learner); afterwards kube-apiserver
+  and kubelet report v1.37.1.
 - CDI alternative: the same `disk.qcow2` can be served as a `DataVolume` source (`http` or
   `registry` import). A DataVolume is the better fit for persistent per-learner disks;
   containerDisk is the better fit for disposable labs.
@@ -401,6 +417,33 @@ gateway only if it listens beyond loopback (`CT_HOST=0.0.0.0`); with the default
 4. `CloudTrain.PlatformAdmin` from Entra grants platform_admin because
    `azarguard-entra` is in `CT_PLATFORM_IDPS` (default). The mapping code is the
    one `acme-idp` exercises today.
+
+## Lab runtime tiers (foundations stream)
+
+Status and measurements: `docs/handoffs/foundations.md`.
+
+- **Tier A, unprivileged pods** (`el-lab:10`, `deb-lab:24.04`, `task image:build:linux-pod`).
+  Catalog `userNamespace: true`: the container driver sets `hostUsers: false` when every
+  schedulable node reports user namespace support for the runtime handler
+  (`--user-namespaces=auto|true|false`), except for pods with a privileged container
+  (topology links). Works on this kind cluster (K8s 1.36.4, containerd 2.3.4, runc 1.4.3,
+  kernel 6.18); idmapped PVC mounts keep uid 1000 on the node. Fallback: host users, with
+  the reason in the pod annotation `labs.cloudtrain.dev/user-namespace`. PID 1 is tini,
+  learner (uid 1000) has no sudo rights, package sources point only at the mirror.
+- **Tier B, Kata**: deferred (download size); tier-B labs run as tier-C VMs locally.
+- **Tier C, VMs** (`el-vm:10`, `ubuntu-vm:24.04`, `task image:build:el-vm|ubuntu-vm`). The
+  mirror snapshot is baked in as the only, local repo (`/opt/cloudtrain/repo/<el10|noble>`),
+  because lab VPCs have no route to cluster services. Extra blank disks: topology
+  `resources.disks: ["2Gi", "2Gi"]` -> `/dev/vdb..`, `/dev/disk/by-id/virtio-ct-dataN`.
+- **Mirrors** (`task mirror:content`, `task mirror:up`): namespace `cloudtrain-mirrors`.
+  Labs reference `http://mirror.cloudtrain-mirrors.svc/el10/`, `/noble/` (key
+  `/keys/cloudtrain-mirror.asc`), `/pypi/simple/`, `/ansible/`; registry
+  `registry.cloudtrain-mirrors.svc:5000` (zot, allowlist = catalog `workloadImages`,
+  anonymous read only); Gitea `http://git.cloudtrain-mirrors.svc:3000` (anonymous read, no
+  sign-up). Ingress only from pods labelled `labs.cloudtrain.dev/session`.
+- **kubeadm extras** (`kubeadm:1.37-full` = `kubeadm:1.37-sec`, `build.sh kubeadm-full`,
+  layered on kubeadm:1.37): `/opt/cloudtrain/bin/addons-install <list> [--wait] [--pool a-b]`
+  after `kubeadm init` + `cni-install`; see the catalog comment for the add-on list.
 
 ## Known gaps and problems hit (with the fix in place)
 

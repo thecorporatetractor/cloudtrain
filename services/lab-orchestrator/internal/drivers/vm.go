@@ -7,6 +7,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -91,10 +92,14 @@ func (d *VMDriver) Provision(ctx context.Context, ref NodeRef) (NodeState, error
 		return NodeState{Phase: labsv1.NodeProvisioning, Message: err.Error()}, err
 	}
 	cores, mem := vmResources(ref.Node.Resources, defaultVMCores, defaultVMMemMiB)
+	extra, err := extraDisks(ref.Node.Resources)
+	if err != nil {
+		return fail(err)
+	}
 	vm := buildVM(ref.Session, NewLabNet(ref.Session), vmSpec{
 		Name: ref.ResourceName(), Hostname: h.Name, IP: h.IP, Image: imageWithRegistry(d.ImageRegistry, img.Image),
 		Cores: cores, MemMiB: mem, CISecret: sec, Labels: vmLabels(ref, ""),
-		Disk: d.Disks, DiskSize: img.DiskSize,
+		Disk: d.Disks, DiskSize: img.DiskSize, ExtraDisks: extra,
 	})
 	if err := setOwner(ref.Session, vm, d.Client); err != nil {
 		return fail(err)
@@ -275,6 +280,27 @@ func (d *VMDriver) Destroy(ctx context.Context, ref NodeRef) error {
 		return inProgress("VM %s is terminating", ref.ResourceName())
 	}
 	return nil
+}
+
+// extraDisks validates topology resources.disks: each entry is the size of
+// a blank data disk (a Kubernetes quantity such as "2Gi", 64Mi..100Gi).
+func extraDisks(r *labsv1.NodeResources) ([]string, error) {
+	if r == nil || len(r.Disks) == 0 {
+		return nil, nil
+	}
+	if len(r.Disks) > MaxExtraDisks {
+		return nil, fmt.Errorf("resources.disks: %d disks, at most %d: %w", len(r.Disks), MaxExtraDisks, ErrUnsupported)
+	}
+	min, max := resource.MustParse("64Mi"), resource.MustParse("100Gi")
+	out := make([]string, 0, len(r.Disks))
+	for i, s := range r.Disks {
+		q, err := resource.ParseQuantity(strings.TrimSpace(s))
+		if err != nil || q.Cmp(min) < 0 || q.Cmp(max) > 0 {
+			return nil, fmt.Errorf("resources.disks[%d]=%q: want a size between 64Mi and 100Gi (e.g. 2Gi): %w", i, s, ErrUnsupported)
+		}
+		out = append(out, q.String())
+	}
+	return out, nil
 }
 
 // imageWithRegistry prefixes an unqualified image with registry.

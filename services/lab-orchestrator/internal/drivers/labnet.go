@@ -301,12 +301,33 @@ func conditionTrue(u *unstructured.Unstructured, typ string) bool {
 	return false
 }
 
+// MirrorNamespace holds the shared read-only lab mirrors (deploy/mirrors): content
+// (dnf/apt/PyPI/Ansible, pod port 8080), registry (5000) and Gitea (3000). Lab pods
+// may reach them; the mirrors' own NetworkPolicy admits only pods carrying LabelSession.
+const MirrorNamespace = "cloudtrain-mirrors"
+
+// MirrorEgressRule allows egress to the shared mirrors (pod ports).
+func MirrorEgressRule() networkingv1.NetworkPolicyEgressRule {
+	tcp := corev1.ProtocolTCP
+	var ports []networkingv1.NetworkPolicyPort
+	for _, p := range []int32{8080, 5000, 3000} {
+		port := intstr.FromInt32(p)
+		ports = append(ports, networkingv1.NetworkPolicyPort{Protocol: &tcp, Port: &port})
+	}
+	return networkingv1.NetworkPolicyEgressRule{
+		To: []networkingv1.NetworkPolicyPeer{{
+			NamespaceSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"kubernetes.io/metadata.name": MirrorNamespace}},
+		}},
+		Ports: ports,
+	}
+}
+
 // EntryPolicyName is the NetworkPolicy isolating a session's entry node.
 func EntryPolicyName(s *labsv1.LabSession) string { return "ct-" + SessionHash(s) + "-entry" }
 
 // EntryNetworkPolicy isolates the entry pod on the platform network (eth0):
 // no ingress; egress only to cluster DNS, the session's own vclusters and the
-// lab VPC CIDRs. Without it the learner shell could reach the host API
+// lab VPC CIDRs, plus the shared mirrors (MirrorNamespace). Without it the learner shell could reach the host API
 // server, the OVN databases, KubeVirt, other labs and the internet.
 func EntryNetworkPolicy(s *labsv1.LabSession, entry string, vclusterReleases []string) *networkingv1.NetworkPolicy {
 	udp, tcp := corev1.ProtocolUDP, corev1.ProtocolTCP
@@ -342,7 +363,7 @@ func EntryNetworkPolicy(s *labsv1.LabSession, entry string, vclusterReleases []s
 	}
 	egress = append(egress, networkingv1.NetworkPolicyEgressRule{
 		To: []networkingv1.NetworkPolicyPeer{{IPBlock: &networkingv1.IPBlock{CIDR: AccessCIDR}}, {IPBlock: &networkingv1.IPBlock{CIDR: LabCIDR}}},
-	})
+	}, MirrorEgressRule())
 	return &networkingv1.NetworkPolicy{
 		ObjectMeta: metav1.ObjectMeta{Name: EntryPolicyName(s), Namespace: s.Namespace, Labels: SessionLabels(s)},
 		Spec: networkingv1.NetworkPolicySpec{

@@ -71,7 +71,19 @@ type vmSpec struct {
 	Disk VMDiskOptions
 	// DiskSize overrides Disk.Size (catalog diskSize).
 	DiskSize string
+	// ExtraDisks are sizes of blank data disks (topology resources.disks, e.g.
+	// "2Gi"), attached after the root disk as virtio disks with serials
+	// ct-data1, ct-data2, ... (/dev/vdb.., /dev/disk/by-id/virtio-ct-dataN).
+	// Persistent VMs get blank DataVolumes (kept across hibernate); ephemeral
+	// VMs get KubeVirt emptyDisks (discarded with the VMI).
+	ExtraDisks []string
 }
+
+// MaxExtraDisks bounds topology resources.disks per VM.
+const MaxExtraDisks = 6
+
+// ExtraDiskName is the volume (and, when persistent, DataVolume suffix) of data disk i (1-based).
+func ExtraDiskName(i int) string { return fmt.Sprintf("data%d", i) }
 
 // buildVM renders a KubeVirt VirtualMachine on the lab subnet.
 func buildVM(s *labsv1.LabSession, net LabNet, v vmSpec) *unstructured.Unstructured {
@@ -114,6 +126,39 @@ func buildVM(s *labsv1.LabSession, net LabNet, v vmSpec) *unstructured.Unstructu
 		}}
 		root = map[string]any{"name": "root", "dataVolume": map[string]any{"name": RootDiskName(v.Name)}}
 	}
+	disks := []any{
+		map[string]any{"name": "root", "disk": map[string]any{"bus": "virtio"}},
+		map[string]any{"name": "cloudinit", "disk": map[string]any{"bus": "virtio"}},
+	}
+	volumes := []any{
+		root,
+		map[string]any{"name": "cloudinit", "cloudInitNoCloud": map[string]any{"secretRef": map[string]any{"name": v.CISecret}}},
+	}
+	for i, size := range v.ExtraDisks {
+		name := ExtraDiskName(i + 1)
+		disks = append(disks, map[string]any{"name": name, "serial": "ct-" + name, "disk": map[string]any{"bus": "virtio"}})
+		if !v.Disk.Persistent {
+			volumes = append(volumes, map[string]any{"name": name, "emptyDisk": map[string]any{"capacity": size}})
+			continue
+		}
+		storage := map[string]any{
+			"accessModes": []any{"ReadWriteOnce"}, "volumeMode": "Filesystem",
+			"resources": map[string]any{"requests": map[string]any{"storage": size}},
+		}
+		if v.Disk.StorageClass != "" {
+			storage["storageClassName"] = v.Disk.StorageClass
+		}
+		dvLabels := map[string]any{}
+		for k, val := range v.Labels {
+			dvLabels[k] = val
+		}
+		dvName := v.Name + "-" + name
+		dvTemplates = append(dvTemplates, map[string]any{
+			"metadata": map[string]any{"name": dvName, "labels": dvLabels},
+			"spec":     map[string]any{"source": map[string]any{"blank": map[string]any{}}, "storage": storage},
+		})
+		volumes = append(volumes, map[string]any{"name": name, "dataVolume": map[string]any{"name": dvName}})
+	}
 	vm.Object["spec"] = map[string]any{
 		"runStrategy": "Always",
 		"template": map[string]any{
@@ -131,19 +176,13 @@ func buildVM(s *labsv1.LabSession, net LabNet, v vmSpec) *unstructured.Unstructu
 					"memory":    map[string]any{"guest": mem},
 					"resources": map[string]any{"requests": map[string]any{"memory": mem}},
 					"devices": map[string]any{
-						"disks": []any{
-							map[string]any{"name": "root", "disk": map[string]any{"bus": "virtio"}},
-							map[string]any{"name": "cloudinit", "disk": map[string]any{"bus": "virtio"}},
-						},
+						"disks":      disks,
 						"interfaces": []any{map[string]any{"name": "default", "bridge": map[string]any{}}},
 						"rng":        map[string]any{},
 					},
 				},
 				"networks": []any{map[string]any{"name": "default", "pod": map[string]any{}}},
-				"volumes": []any{
-					root,
-					map[string]any{"name": "cloudinit", "cloudInitNoCloud": map[string]any{"secretRef": map[string]any{"name": v.CISecret}}},
-				},
+				"volumes":  volumes,
 			},
 		},
 	}

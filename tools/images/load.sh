@@ -3,7 +3,8 @@
 #
 # Usage: load.sh [name...]     default: all
 #   kubeadm-node | kubeadm-upgrade | etcd-host   containerDisks -> nodes that run VMs
-#   jumphost                                     -> every node
+#   jumphost, linux-pod-el, linux-pod-deb, mirror -> every node
+#   el-vm | ubuntu-vm                            containerDisks -> nodes that run VMs
 #   workloads                                    lab workload images (tools/images/lock/
 #                                                workloads.lock) -> every node, for
 #                                                `mode: virtual` labs whose Pods run on
@@ -66,8 +67,20 @@ for t in "${targets[@]}"; do
                      load_docker_image "$ETCD_HOST_IMAGE" $VM_NODES ;;
     jumphost)        # shellcheck disable=SC2086
                      load_docker_image "$JUMPHOST_IMAGE" $ALL_NODES ;;
+    linux-pod-el)    # shellcheck disable=SC2086
+                     load_docker_image "$LINUX_POD_EL_IMAGE" $ALL_NODES ;;
+    linux-pod-deb)   # shellcheck disable=SC2086
+                     load_docker_image "$LINUX_POD_DEB_IMAGE" $ALL_NODES ;;
+    kubeadm-full)    # shellcheck disable=SC2086
+                     load_docker_image "${GOLDEN_IMAGE_REPO}:${KUBEADM_FULL_IMAGE_TAG}" $VM_NODES ;;
+    el-vm)           # shellcheck disable=SC2086
+                     load_docker_image "$EL_VM_IMAGE" $VM_NODES ;;
+    ubuntu-vm)       # shellcheck disable=SC2086
+                     load_docker_image "$UBUNTU_VM_IMAGE" $VM_NODES ;;
+    mirror)          # shellcheck disable=SC2086
+                     load_docker_image "$MIRROR_CONTENT_IMAGE" $ALL_NODES ;;
     workloads)       # shellcheck disable=SC2086
                      load_workloads $ALL_NODES ;;
-    *) die "unknown image '$t' (kubeadm-node | kubeadm-upgrade | etcd-host | jumphost | workloads)" ;;
+    *) die "unknown image '$t' (kubeadm-node | kubeadm-upgrade | kubeadm-full | etcd-host | jumphost | workloads | linux-pod-el | linux-pod-deb | el-vm | ubuntu-vm | mirror)" ;;
   esac
 done

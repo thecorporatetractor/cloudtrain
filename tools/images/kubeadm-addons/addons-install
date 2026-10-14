@@ -1,0 +1,80 @@
+#!/bin/bash
+# /opt/cloudtrain/bin/addons-install <addon>[,<addon>...] [--wait] [--pool <first-last>]
+#
+# Runtime contract (kubeadm driver, post-init hook): run on the control plane after
+# `kubeadm init` and cni-install. Applies add-ons baked into this image from
+# /opt/cloudtrain/addons/<name>/ (sha256 recorded at build time and checked here); every
+# image they use is preloaded in containerd, so no registry is needed.
+#
+#   metrics-server  metrics-server (--kubelet-insecure-tls: lab kubelets use self-signed certs)
+#   gateway-api     Gateway API standard CRDs
+#   traefik         Traefik: IngressClass "traefik" (default) + GatewayClass "traefik"
+#                   (implies gateway-api); entry points :80/:443, Service LoadBalancer with
+#                   NodePorts 30080/30443 (works without a load balancer too)
+#   metallb         MetalLB (L2) with IPAddressPool "lab" = --pool (default
+#                   192.168.100.200-192.168.100.220, in the lab VPC subnet)
+#   local-path      local-path-provisioner, StorageClass "local-path" (default class)
+#   falco           Falco DaemonSet (modern eBPF), alerts in `kubectl -n falco logs ds/falco`
+# Aliases: ingress, gateway -> traefik; lb -> metallb; storage -> local-path; all = every
+# add-on except falco. Idempotent (kubectl apply).
+set -euo pipefail
+ROOT=/opt/cloudtrain/addons
+export KUBECONFIG=${KUBECONFIG:-/etc/kubernetes/admin.conf}
+usage() { sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+[[ $# -ge 1 ]] || usage
+list=$1; shift
+wait=0; pool=192.168.100.200-192.168.100.220
+while [[ $# -gt 0 ]]; do
+  case $1 in --wait) wait=1 ;; --pool) pool=${2:?}; shift ;; *) usage ;; esac; shift
+done
+want=()
+for a in ${list//,/ }; do
+  case $a in
+    ingress|gateway) a=traefik ;; lb) a=metallb ;; storage) a=local-path ;;
+    all) want+=(metrics-server gateway-api traefik metallb local-path); continue ;;
+  esac
+  [[ -d $ROOT/$a ]] || { echo "addons-install: unknown add-on '$a' (have: $(ls $ROOT | tr '\n' ' '))" >&2; exit 2; }
+  [[ $a == traefik ]] && want+=(gateway-api)
+  want+=("$a")
+done
+(cd "$ROOT" && sha256sum --quiet -c SHA256SUMS) || { echo "addons-install: add-on manifests do not match SHA256SUMS" >&2; exit 1; }
+done_list=" "
+for a in "${want[@]}"; do
+  [[ $done_list == *" $a "* ]] && continue; done_list+="$a "
+  case $a in
+    gateway-api) kubectl apply --server-side -f "$ROOT/gateway-api/standard-install.yaml" >/dev/null
+                 kubectl wait --for=condition=Established crd/gateways.gateway.networking.k8s.io crd/httproutes.gateway.networking.k8s.io --timeout=60s >/dev/null ;;
+    traefik)     kubectl create namespace traefik --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+                 kubectl apply --server-side -f "$ROOT/traefik/traefik-crds.yaml" >/dev/null
+                 kubectl apply -f "$ROOT/traefik/traefik.yaml" >/dev/null ;;
+    metallb)     kubectl apply -f "$ROOT/metallb/metallb-native.yaml" >/dev/null
+                 kubectl -n metallb-system rollout status deploy/controller --timeout=180s >/dev/null
+                 for i in $(seq 30); do
+                   kubectl apply -f - >/dev/null 2>&1 <<Y && break
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata: { name: lab, namespace: metallb-system }
+spec: { addresses: ["$pool"] }
+---
+apiVersion: metallb.io/v1beta1
+kind: L2Advertisement
+metadata: { name: lab, namespace: metallb-system }
+spec: { ipAddressPools: [lab] }
+Y
+                   sleep 3   # the webhook needs a moment after the controller is up
+                 done ;;
+    *)           kubectl apply -f "$ROOT/$a/" >/dev/null ;;
+  esac
+  echo "addons-install: $a applied"
+done
+if ((wait)); then
+  for a in "${want[@]}"; do
+    case $a in
+      metrics-server) kubectl -n kube-system rollout status deploy/metrics-server --timeout=300s ;;
+      traefik)        kubectl -n traefik rollout status deploy/traefik --timeout=300s ;;
+      metallb)        kubectl -n metallb-system rollout status ds/speaker --timeout=300s ;;
+      local-path)     kubectl -n local-path-storage rollout status deploy/local-path-provisioner --timeout=300s ;;
+      falco)          kubectl -n falco rollout status ds/falco --timeout=300s ;;
+    esac
+  done
+fi
