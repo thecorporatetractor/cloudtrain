@@ -12,13 +12,13 @@ Legend. **Type**: learn = guided first exposure, do = complete a task, fix = rep
 
 | Domain | Paths | Learning labs | Exam tasks | Exams | Verified | Built | Proposed | Tier mix (all labs) | Learning hours |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Kubernetes | 5 | 89 | 103 | 3 | 8 | 89 | 95 | C 1, K 112, V 79 | 25 |
+| Kubernetes | 5 | 89 | 103 | 3 | 9 | 88 | 95 | C 1, K 112, V 79 | 25 |
 | Linux administration | 11 | 159 | 119 | 3 | 0 | 0 | 278 | A 84, B 69, C 125 | 48 |
 | Containers with Docker | 11 | 91 | 44 | 2 | 0 | 0 | 135 | B 71, C 64 | 28 |
 | Infrastructure as code with Terraform | 5 | 54 | 45 | 2 | 0 | 0 | 99 | A 54, B 1, V 44 | 21 |
 | Configuration management and automation | 7 | 61 | 36 | 1 | 0 | 0 | 97 | A 39, B 7, C 45, N 6 | 26 |
 | Network administration | 4 | 45 | 32 | 1 | 0 | 0 | 77 | N 77 | 15 |
-| **Total** | 43 | 499 | 379 | 13 | 8 | 89 | 781 | A 177, B 148, C 235, K 112, V 123, N 83 | 161 |
+| **Total** | 43 | 499 | 379 | 13 | 9 | 88 | 781 | A 177, B 148, C 235, K 112, V 123, N 83 | 161 |
 
 Cross-domain exams: Platform engineer practical capstone. Exam tasks are counted under the domain of each task. Learning labs by type: learn 47, do 356, fix 83, hack 13. New skills proposed: 314.
 
@@ -114,7 +114,7 @@ _CloudTrain is not affiliated with or endorsed by the Cloud Native Computing Fou
 | `patch-without-clobbering` | Change a live Deployment without losing other fields | do | easy | 8 | V | verified | ckad:deployment | Raise the memory limit of one container in the dock-scheduler Deployment with kubectl patch or set while its sidecar, annotations and replica count stay exactly as they were. |
 | `waybill-rollback` | Roll back a bad image rollout to a named revision | fix | easy | 10 | V | built | cka:workloads-scheduling, ckad:deployment | The waybill API rollout to a broken image left Pods crash-looping; inspect rollout history and return the Deployment to the revision annotated as the last approved release. |
 | `rolling-update-surge` | Tune a rolling update so capacity never drops | do | medium | 12 | V | built | cka:workloads-scheduling, ckad:deployment | Configure the quote-engine Deployment's strategy so a new image rolls out with zero unavailable replicas and one surge Pod, then roll out the new tag and record the change cause. |
-| `routing-engine-config` | Feed configuration and secrets to the routing engine | do | easy | 12 | V | built | cka:workloads-scheduling, ckad:environment-config-security | Create a ConfigMap from the routing rules file and a Secret holding the map-service token, mount the rules at /etc/routing and expose the token as ROUTE_TOKEN in the routing-engine Deployment. |
+| `routing-engine-config` | Feed configuration and secrets to the routing engine | do | easy | 12 | V | verified | cka:workloads-scheduling, ckad:environment-config-security | Create a ConfigMap from the routing rules file and a Secret holding the map-service token, mount the rules at /etc/routing and expose the token as ROUTE_TOKEN in the routing-engine Deployment. |
 | `dock-scheduler-probes` | Add probes so a slow start stops causing restarts | fix | medium | 15 | V | built | cka:workloads-scheduling, ckad:observability-maintenance | The dock-scheduler takes 40 s to warm up and is killed in a restart loop; add startup, readiness and liveness probes so it becomes Ready without restarts and drops out of the Service when unhealthy. |
 | `ledger-export-cronjob` | Schedule the nightly ledger export | do | easy | 10 | V | proposed | ckad:design-build | Run the ledger export at 02:30 every night as a CronJob that never runs two copies at once, keeps three successful and one failed Job, and gives up after a 10-minute deadline. |
 | `parallel-manifest-job` | Process a manifest backlog with a parallel Job | do | medium | 12 | V | proposed | ckad:design-build | Reprocess 12 customs manifest batches with an indexed Job that runs four Pods at a time and tolerates two retries, and leave it Complete. |
