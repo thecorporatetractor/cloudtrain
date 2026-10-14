@@ -53,7 +53,7 @@ Last updated: 2026-10-14.
 |---|---|
 | Entra app registration for SSO (via the meetbot session / ~/terraform HCP module) | waiting on user |
 | Curriculum approval (domains, paths, labs, exams) | waiting on proposal |
-| Terraform CLI vs OpenTofu default (licensing) | proposed: OpenTofu default |
+| Terraform CLI vs OpenTofu default (licensing) | decided 2026-10-14: Terraform primary for internal training; external paying customers need written IBM/HashiCorp confirmation first (OpenTofu swap-in kept cheap) |
 | Cisco images (CML Enterprise backend) | open |
 | Domain order after Kubernetes | open |
 | AI data policy for terminal traces | open |

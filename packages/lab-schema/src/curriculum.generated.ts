@@ -115,6 +115,10 @@ export interface Curriculum {
       };
       notes?: string;
       /**
+       * Licensing constraints on the tools this domain teaches (for example a source-available CLI), and what must be confirmed before offering the domain to external customers.
+       */
+      licensingNote?: string;
+      /**
        * @minItems 1
        */
       competencies: [
@@ -144,6 +148,10 @@ export interface Curriculum {
         summary?: string;
       };
       notes?: string;
+      /**
+       * Licensing constraints on the tools this domain teaches (for example a source-available CLI), and what must be confirmed before offering the domain to external customers.
+       */
+      licensingNote?: string;
       /**
        * @minItems 1
        */

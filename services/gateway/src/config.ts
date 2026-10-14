@@ -22,6 +22,30 @@ export interface Config {
   /** Optional session TTL override in minutes (default: the controller's 2 x estimatedMinutes, min 30). */
   sessionTtlMinutes?: number;
   logLevel: string;
+  /** Postgres as the RLS-bound app role (cloudtrain_app). */
+  databaseUrl: string;
+  /** Postgres as the schema owner (migrations, seed). */
+  databaseOwnerUrl?: string;
+  databaseAppRole: string;
+  /** Where the browser reaches the gateway's /api (OIDC redirect URI base). */
+  publicUrl: string;
+  /** Where the web app lives (post-login and post-logout redirects). */
+  webUrl: string;
+  oidc: { issuer: string; clientId: string; clientSecret: string };
+  keycloak: { baseUrl: string; realm: string; adminClientId: string; adminClientSecret: string };
+  /** Seals refresh tokens at rest; at least 16 characters. */
+  sessionSecret: string;
+  sessionMaxAgeSeconds: number;
+  sessionIdleSeconds: number;
+  /** `Secure` cookie attribute; off only when publicUrl is plain http (local dev). */
+  cookieSecure: boolean;
+  smtp: { host: string; port: number; from: string };
+  /** IdP aliases trusted to grant platform_admin through the CloudTrain.PlatformAdmin app role. */
+  platformIdps: string[];
+  /** Dev only: accept domain verification without the DNS TXT record. */
+  devDomainVerifyBypass: boolean;
+  /** How often open lab attempts are reconciled with the cluster (ms, 0 = off). */
+  sweepIntervalMs: number;
 }
 
 /** Relative paths in settings are relative to the repository root (pnpm runs the gateway from its package dir). */
@@ -35,6 +59,10 @@ function num(v: string | undefined, d: number): number {
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const list = (v: string | undefined) => (v ?? '').split(path.delimiter).map((s) => s.trim()).filter(Boolean);
   const ttl = num(env.CT_SESSION_TTL_MINUTES, 0);
+  const prod = env.NODE_ENV === 'production';
+  const publicUrl = (env.CT_PUBLIC_URL ?? `http://localhost:${num(env.CT_PORT, 8787)}`).replace(/\/$/, '');
+  const kcBase = (env.CT_KEYCLOAK_URL ?? 'http://localhost:8180').replace(/\/$/, '');
+  const realm = env.CT_KEYCLOAK_REALM ?? 'cloudtrain';
   return {
     host: env.CT_HOST ?? '127.0.0.1',
     port: num(env.CT_PORT, 8787),
@@ -46,5 +74,29 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     validateTimeoutMs: num(env.CT_VALIDATE_TIMEOUT_MS, 60_000),
     ...(ttl > 0 ? { sessionTtlMinutes: ttl } : {}),
     logLevel: env.CT_LOG_LEVEL ?? 'info',
+    databaseUrl: env.CT_DATABASE_URL ?? 'postgres://cloudtrain_app:app-dev-only@127.0.0.1:55432/cloudtrain',
+    ...(env.CT_DATABASE_OWNER_URL || env.NODE_ENV !== 'production' ? { databaseOwnerUrl: env.CT_DATABASE_OWNER_URL ?? 'postgres://cloudtrain_owner:owner-dev-only@127.0.0.1:55432/cloudtrain' } : {}),
+    databaseAppRole: env.CT_DATABASE_APP_ROLE ?? 'cloudtrain_app',
+    publicUrl,
+    webUrl: (env.CT_WEB_URL ?? publicUrl).replace(/\/$/, ''),
+    oidc: {
+      issuer: env.CT_OIDC_ISSUER ?? `${kcBase}/realms/${realm}`,
+      clientId: env.CT_OIDC_CLIENT_ID ?? 'cloudtrain-gateway',
+      clientSecret: env.CT_OIDC_CLIENT_SECRET ?? (prod ? '' : 'gateway-dev-only-secret'),
+    },
+    keycloak: {
+      baseUrl: kcBase,
+      realm,
+      adminClientId: env.CT_KEYCLOAK_ADMIN_CLIENT_ID ?? 'cloudtrain-gateway-admin',
+      adminClientSecret: env.CT_KEYCLOAK_ADMIN_CLIENT_SECRET ?? (prod ? '' : 'gateway-admin-dev-only-secret'),
+    },
+    sessionSecret: env.CT_SESSION_SECRET ?? (prod ? '' : 'dev-only-session-secret-not-for-production'),
+    sessionMaxAgeSeconds: num(env.CT_SESSION_MAX_AGE_SECONDS, 12 * 3600),
+    sessionIdleSeconds: num(env.CT_SESSION_IDLE_SECONDS, 2 * 3600),
+    cookieSecure: env.CT_COOKIE_SECURE ? env.CT_COOKIE_SECURE === 'true' : !publicUrl.startsWith('http://'),
+    smtp: { host: env.CT_SMTP_HOST ?? '127.0.0.1', port: num(env.CT_SMTP_PORT, 1025), from: env.CT_SMTP_FROM ?? 'CloudTrain <no-reply@cloudtrain.local>' },
+    platformIdps: (env.CT_PLATFORM_IDPS ?? 'azarguard-entra').split(',').map((s) => s.trim()).filter(Boolean),
+    devDomainVerifyBypass: !prod && env.CT_DEV_DOMAIN_VERIFY_BYPASS === '1',
+    sweepIntervalMs: num(env.CT_SWEEP_INTERVAL_MS, 60_000),
   };
 }

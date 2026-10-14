@@ -3,8 +3,9 @@ import type { CheckResult, LabSession, StudioDraft, ValidateResponse, Verificati
 import { domains, labById, labSummaries, paths } from './fixtures/labs';
 import { frameworks, skillStates, skills } from './fixtures/skills';
 import { homeData } from './fixtures/home';
-import { memberById, memberSkillStates, teamData } from './fixtures/team';
+import { myAssignments, personById, skillStatesOf, teamSeedById, userRef } from './fixtures/platform';
 import { drafts as seedDrafts, freshGates, specFromPrompt } from './fixtures/studio';
+import { allPlatformHandlers, currentSession, currentUser, mockNotices } from './platformHandlers';
 
 /* ------------------------------------------------------------------ */
 /* In-memory state (resets on reload)                                  */
@@ -128,13 +129,14 @@ function progressGates(draft: StudioDraft) {
 
 /** Everything the gateway serves in real mode (catalog, labs, sessions, skills, home). */
 const coreHandlers = [
-  http.get('/api/me', async () => {
-    await latency();
-    return HttpResponse.json(homeData.learner);
-  }),
   http.get('/api/home', async () => {
     await latency();
-    return HttpResponse.json(homeData);
+    const s = currentSession();
+    if (!s) return HttpResponse.json({ error: 'Not signed in', code: 'unauthenticated' }, { status: 401 });
+    // The recommendations and goal are the sample learner model; the greeting and assignments follow the persona.
+    const p = personById.get(s.userId);
+    const learner = p ? { ...homeData.learner, id: p.id, name: p.name, email: p.email, team: p.teams[0] ? (teamSeedById(p.teams[0].teamId)?.name ?? '') : '' } : homeData.learner;
+    return HttpResponse.json({ ...homeData, learner, assignmentsDue: myAssignments(s.userId).filter((a) => a.status !== 'completed').slice(0, 5), source: 'live' });
   }),
 
   http.get('/api/catalog', async () => {
@@ -158,7 +160,7 @@ const coreHandlers = [
     await delay(120);
     const s = sessions.get(String(params.id));
     if (!s) return HttpResponse.json({ error: 'Session not found' }, { status: 404 });
-    return HttpResponse.json(s);
+    return HttpResponse.json({ ...s, notices: mockNotices(s.startedAt, s.id) });
   }),
   http.delete('/api/sessions/:id', async ({ params }) => {
     await delay(150);
@@ -184,28 +186,24 @@ const coreHandlers = [
   http.get('/api/skills', async ({ request }) => {
     await latency();
     const memberId = new URL(request.url).searchParams.get('member');
-    if (memberId && memberId !== homeData.learner.id) {
-      const member = memberById(memberId);
-      const states = memberSkillStates(memberId);
-      if (!member || !states) return HttpResponse.json({ error: 'Team member not found' }, { status: 404 });
-      return HttpResponse.json({ skills, states, frameworks, member: { id: member.id, name: member.name, title: member.title } });
+    const self = currentSession()?.userId;
+    if (memberId && memberId !== self) {
+      const member = personById.get(memberId);
+      if (!member) return HttpResponse.json({ error: 'Team member not found' }, { status: 404 });
+      return HttpResponse.json({ skills, states: skillStatesOf(memberId), frameworks, member: { id: member.id, name: member.name, title: member.title } });
     }
-    return HttpResponse.json({ skills, states: skillStates, frameworks });
+    // The signed-in learner keeps the sample model's states (Home, Skills and Team agree on them).
+    return HttpResponse.json({ skills, states: self && self !== 'u-ingrid' ? skillStatesOf(self) : skillStates, frameworks });
   }),
 
 ];
 
 
 /**
- * Team and Scenario Studio have no backend yet: in real API mode (VITE_API_MODE=real)
+ * Scenario Studio has no backend yet: in real API mode (VITE_API_MODE=real)
  * only these run in the browser and every other request goes to the gateway.
  */
 export const sampleOnlyHandlers = [
-  http.get('/api/team', async () => {
-    await latency();
-    return HttpResponse.json(teamData);
-  }),
-
   http.get('/api/studio/drafts', async () => {
     await latency();
     drafts.forEach(progressGates);
@@ -228,7 +226,7 @@ export const sampleOnlyHandlers = [
       title: spec.metadata.title,
       prompt: body.prompt,
       createdAt: new Date().toISOString(),
-      author: homeData.learner.name,
+      author: currentUser()?.name ?? userRef('u-aino').name,
       stage: 'spec',
       spec,
       gates: freshGates(),
@@ -255,4 +253,4 @@ export const sampleOnlyHandlers = [
   }),
 ];
 
-export const handlers = [...coreHandlers, ...sampleOnlyHandlers];
+export const handlers = [...allPlatformHandlers, ...coreHandlers, ...sampleOnlyHandlers];
