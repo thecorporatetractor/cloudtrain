@@ -1,0 +1,164 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xkd-debug-distroless
+  title: Inspect a shell-less Pod
+  domain: kubernetes
+  frameworks: [ckad:observability-maintenance]
+  difficulty: medium
+  estimatedMinutes: 7
+  tags: [exam, debugging, ephemeral-containers]
+  version: 1
+spec:
+  description: |
+    **Context:** `qm-dispatch` (`kubectl config use-context qm-dispatch`)
+
+    In namespace `rates-engine`, the Pod **`rates-engine`** (container
+    `engine`) ships without a shell or any tools, so `kubectl exec` cannot
+    help. It loaded its configuration from `/etc/rates/engine.conf` inside
+    the container at start-up.
+
+    Use an **ephemeral debug container** attached to the running Pod to read
+    that file, and write the value of its `region` setting (only the value)
+    to **`/home/learner/answers/rates-region.txt`**. Do not restart, replace
+    or copy the Pod.
+  objectives:
+    - Debug a running Pod with an ephemeral container that shares its process namespace
+  params:
+    region:
+      type: choice
+      values: [eu-north-harbour, eu-west-yard, uk-south-depot]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-dispatch
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: qm-dispatch
+  setup:
+    - on: workstation
+      run: install -d -o learner -g learner -m 0755 /home/learner/answers
+    - on: qm-dispatch
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: rates-engine}
+        ---
+        apiVersion: v1
+        kind: Pod
+        metadata: {name: rates-engine, namespace: rates-engine, labels: {app: rates-engine}}
+        spec:
+          terminationGracePeriodSeconds: 2
+          containers:
+            - name: engine
+              image: busybox:1.37
+              # Waits for its config, then removes every shell and tool so the
+              # container behaves like a distroless image.
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  while [ ! -f /etc/rates/engine.conf ]; do sleep 1; done
+                  mkdir -p /.engine /srv/empty
+                  cp /bin/busybox /.engine/busybox
+                  /.engine/busybox rm -rf /bin /sbin /usr/bin /usr/sbin
+                  exec /.engine/busybox httpd -f -p 8080 -h /srv/empty
+              readinessProbe:
+                tcpSocket: {port: 8080}
+                periodSeconds: 2
+    - on: qm-dispatch
+      timeoutSec: 120
+      run: |
+        for i in $(seq 1 50); do
+          kubectl -n rates-engine exec rates-engine -c engine -- /bin/sh -c 'mkdir -p /etc/rates && printf "# rates engine\nprecision=4\nregion={{region}}\ncurrency=EUR\n" > /etc/rates/engine.conf' 2>/dev/null && break
+          sleep 2
+        done
+        kubectl -n rates-engine wait pod/rates-engine --for=condition=Ready --timeout=60s
+        if kubectl -n rates-engine exec rates-engine -c engine -- sh -c true 2>/dev/null; then echo "shell still present" >&2; exit 1; fi
+  teardown:
+    - on: qm-dispatch
+      run: kubectl delete namespace rates-engine --ignore-not-found --wait=false
+  checks:
+    - id: answer
+      description: rates-region.txt holds the region from the loaded config
+      type: file
+      on: workstation
+      target: /home/learner/answers/rates-region.txt
+      skills: [k8s.troubleshooting.debug-containers]
+      weight: 2
+      expect: {match: regex, value: '^\s*{{region}}\s*$'}
+    - id: ephemeral-used
+      description: An ephemeral container was attached to rates-engine
+      type: k8s-query
+      skills: [k8s.troubleshooting.debug-containers]
+      query: {cluster: qm-dispatch, resource: pod, name: rates-engine, namespace: rates-engine, jsonpath: "{.spec.ephemeralContainers[*].name}"}
+      expect: {match: regex, value: '\S'}
+    - id: pod-untouched
+      description: The original Pod is still running without restarts
+      type: k8s-query
+      skills: [k8s.troubleshooting.debug-containers]
+      weight: 0.5
+      query: {cluster: qm-dispatch, resource: pod, name: rates-engine, namespace: rates-engine, jsonpath: '{.status.phase} {.status.containerStatuses[?(@.name=="engine")].restartCount}'}
+      expect: {match: exact, value: Running 0}
+  misconceptions:
+    - id: copy-pod
+      description: Debugs a copy of the Pod (kubectl debug --copy-to); the copy starts fresh and never loaded this config.
+      feedback: A copy is a new Pod with a new filesystem. To see what the running process loaded, attach an ephemeral container to the Pod itself.
+      expectFail: [answer, ephemeral-used]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl -n rates-engine debug rates-engine --copy-to=rates-engine-debug --image=busybox:1.37 --share-processes --container=dbg -- sleep 300
+          sleep 10
+          kubectl -n rates-engine exec rates-engine-debug -c dbg -- sh -c 'cat /proc/*/root/etc/rates/engine.conf 2>/dev/null | sed -n "s/^region=//p"' > ~/answers/rates-region.txt || true
+    - id: no-target
+      description: Starts the debug container without --target, so it cannot see the engine's processes or filesystem.
+      feedback: "`--target=<container>` puts the debug container into that container's process namespace, which exposes its root filesystem under /proc/<pid>/root."
+      expectFail: [answer]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl -n rates-engine debug rates-engine --image=busybox:1.37 --container=peek -- sleep 300
+          sleep 10
+          kubectl -n rates-engine exec rates-engine -c peek -- sh -c 'cat /etc/rates/engine.conf /proc/1/root/etc/rates/engine.conf 2>/dev/null | sed -n "s/^region=//p"' > ~/answers/rates-region.txt || true
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl -n rates-engine debug rates-engine --image=busybox:1.37 --target=engine --container=inspect -- sleep 600
+          for i in $(seq 1 30); do
+            kubectl -n rates-engine exec rates-engine -c inspect -- true 2>/dev/null && break
+            sleep 2
+          done
+          kubectl -n rates-engine exec rates-engine -c inspect -- sh -c 'sed -n "s/^region=//p" /proc/1/root/etc/rates/engine.conf' > ~/answers/rates-region.txt
+    alternatives:
+      - id: attach-and-read
+        description: Run the read itself as the ephemeral container's command and collect it from its logs.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 120
+            run: |
+              kubectl config use-context qm-dispatch
+              kubectl -n rates-engine debug rates-engine --image=busybox:1.37 --target=engine --container=reader -- sh -c 'grep "^region=" /proc/1/root/etc/rates/engine.conf; sleep 120'
+              for i in $(seq 1 30); do
+                out=$(kubectl -n rates-engine logs rates-engine -c reader 2>/dev/null)
+                [ -n "$out" ] && break
+                sleep 2
+              done
+              echo "$out" | cut -d= -f2 > ~/answers/rates-region.txt

@@ -1,0 +1,117 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xkd-logs-container-select
+  title: Save one container's logs
+  domain: kubernetes
+  frameworks: [ckad:observability-maintenance]
+  difficulty: easy
+  estimatedMinutes: 4
+  tags: [exam, logs]
+  version: 1
+spec:
+  description: |
+    **Context:** `qm-dispatch` (`kubectl config use-context qm-dispatch`)
+
+    In namespace `label-printing`, the Pod **`label-batch`** runs two
+    containers. Write the complete logs of its container **`uploader`** (and
+    only that container) to **`/home/learner/answers/uploader.log`**.
+  objectives:
+    - Read the logs of a specific container in a multi-container Pod
+  params:
+    batch:
+      type: choice
+      values: [B-4471, B-5820, B-6093]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-dispatch
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: qm-dispatch
+  setup:
+    - on: workstation
+      run: install -d -o learner -g learner -m 0755 /home/learner/answers
+    - on: qm-dispatch
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: label-printing}
+        ---
+        apiVersion: v1
+        kind: Pod
+        metadata:
+          name: label-batch
+          namespace: label-printing
+          annotations: {kubectl.kubernetes.io/default-container: printer}
+        spec:
+          terminationGracePeriodSeconds: 2
+          containers:
+            - name: printer
+              image: busybox:1.37
+              command: ["sh", "-c", "for i in 1 2 3; do echo \"printer: label $i of batch {{batch}} printed\"; done; exec sleep 1d"]
+            - name: uploader
+              image: busybox:1.37
+              command: ["sh", "-c", "for i in 1 2 3 4; do echo \"uploader: chunk $i of batch {{batch}} uploaded\"; done; echo 'uploader: batch {{batch}} complete'; exec sleep 1d"]
+    - on: qm-dispatch
+      timeoutSec: 90
+      run: kubectl -n label-printing wait pod/label-batch --for=condition=Ready --timeout=80s
+  teardown:
+    - on: qm-dispatch
+      run: kubectl delete namespace label-printing --ignore-not-found --wait=false
+  checks:
+    - id: uploader-log
+      description: uploader.log holds the uploader's five log lines
+      type: shell
+      on: workstation
+      skills: [k8s.troubleshooting.logs]
+      weight: 2
+      command: |
+        f=/home/learner/answers/uploader.log
+        [ -f "$f" ] || { echo missing; exit 0; }
+        echo "uploader=$(grep -c '^uploader: .*{{batch}}' "$f") complete=$(grep -c '^uploader: batch {{batch}} complete$' "$f")"
+      expect: {match: exact, value: uploader=5 complete=1}
+    - id: only-uploader
+      description: uploader.log contains no lines from other containers
+      type: shell
+      on: workstation
+      skills: [k8s.troubleshooting.logs]
+      command: |
+        f=/home/learner/answers/uploader.log
+        [ -f "$f" ] || { echo missing; exit 0; }
+        echo "foreign=$(grep -vc '^uploader: ' "$f")"
+      expect: {match: exact, value: foreign=0}
+  misconceptions:
+    - id: default-container
+      description: Runs kubectl logs without -c, which returns the default container (printer).
+      feedback: In a multi-container Pod, name the container with `-c`.
+      expectFail: [uploader-log, only-uploader]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl -n label-printing logs label-batch > ~/answers/uploader.log
+    - id: all-containers
+      description: Uses --all-containers, which mixes in the printer's lines.
+      feedback: "`--all-containers` concatenates every container's log; the task wants one."
+      expectFail: [only-uploader]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl -n label-printing logs label-batch --all-containers > ~/answers/uploader.log
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl -n label-printing logs label-batch -c uploader > ~/answers/uploader.log

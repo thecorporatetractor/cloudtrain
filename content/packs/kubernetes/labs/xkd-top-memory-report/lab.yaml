@@ -1,0 +1,103 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xkd-top-memory-report
+  title: Report the Pod using most memory
+  domain: kubernetes
+  frameworks: [ckad:observability-maintenance]
+  difficulty: easy
+  estimatedMinutes: 4
+  tags: [exam, metrics, kubectl-top]
+  version: 1
+spec:
+  description: |
+    **Context:** `qm-yard` (`kubectl config use-context qm-yard`)
+
+    Write the **name** of the Pod that currently uses the **most memory** in
+    namespace `parcel-sorting` (only the name, one line) to
+    **`/home/learner/answers/top-memory-pod.txt`**.
+  objectives:
+    - Read live resource usage with kubectl top
+  params:
+    hog:
+      type: choice
+      values: [sorter-belt-2, sorter-belt-4, label-matcher]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      # Needs metrics-server on the kubeadm cluster (kubectl top).
+      - name: qm-yard
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-yard
+          nodes:
+            - {name: yard-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: yard-wk-1, role: worker}
+            - {name: yard-wk-2, role: worker}
+  setup:
+    - on: workstation
+      run: install -d -o learner -g learner -m 0755 /home/learner/answers
+    - on: qm-yard
+      run: |
+        kubectl create namespace parcel-sorting --dry-run=client -o yaml | kubectl apply -f -
+        for p in sorter-belt-1 sorter-belt-2 sorter-belt-3 sorter-belt-4 label-matcher; do
+          if [ "$p" = "{{hog}}" ]; then mb=96; else mb=$(( 8 + ${#p} )); fi
+          kubectl -n parcel-sorting run "$p" --image=busybox:1.37 --labels=app=parcel-sorting --restart=Never \
+            --overrides='{"spec":{"terminationGracePeriodSeconds":2}}' \
+            -- sh -c "x=\$(head -c $((mb*1024*1024)) /dev/zero | tr '\\0' a); exec sleep 1d"
+        done
+    - on: qm-yard
+      timeoutSec: 240
+      run: |
+        kubectl -n parcel-sorting wait pod -l app=parcel-sorting --for=condition=Ready --timeout=120s
+        # metrics-server needs a scrape or two before kubectl top answers.
+        for i in $(seq 1 24); do kubectl -n parcel-sorting top pod --no-headers 2>/dev/null | grep -q {{hog}} && exit 0; sleep 5; done
+        echo "kubectl top returns no metrics (metrics-server missing?)" >&2; exit 1
+  teardown:
+    - on: qm-yard
+      run: kubectl delete namespace parcel-sorting --ignore-not-found --wait=false
+  checks:
+    - id: answer
+      description: top-memory-pod.txt names the Pod using the most memory
+      type: file
+      on: workstation
+      target: /home/learner/answers/top-memory-pod.txt
+      skills: [k8s.troubleshooting.resource-usage]
+      weight: 2
+      expect: {match: regex, value: '^\s*{{hog}}\s*$'}
+  misconceptions:
+    - id: highest-cpu
+      description: Sorts by CPU instead of memory.
+      feedback: "`kubectl top pod --sort-by=memory` sorts by memory; the default order is by name and --sort-by=cpu answers a different question."
+      expectFail: [answer]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-yard
+          kubectl -n parcel-sorting top pod --no-headers --sort-by=cpu | awk 'NR==1{print $1}' > ~/answers/top-memory-pod.txt
+          [ "$(cat ~/answers/top-memory-pod.txt)" != "{{hog}}" ] || echo sorter-belt-9 > ~/answers/top-memory-pod.txt
+    - id: whole-table
+      description: Saves the whole kubectl top table instead of the Pod name.
+      feedback: The task asks for the name only, one line.
+      expectFail: [answer]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-yard
+          kubectl -n parcel-sorting top pod --sort-by=memory > ~/answers/top-memory-pod.txt
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-yard
+          kubectl -n parcel-sorting top pod --no-headers --sort-by=memory | head -n1 | awk '{print $1}' > ~/answers/top-memory-pod.txt
