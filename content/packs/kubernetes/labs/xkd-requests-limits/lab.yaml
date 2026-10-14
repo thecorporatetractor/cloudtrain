@@ -1,0 +1,131 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xkd-requests-limits
+  title: Set requests and limits
+  domain: kubernetes
+  frameworks: [ckad:environment-config-security]
+  difficulty: easy
+  estimatedMinutes: 4
+  tags: [exam, resources]
+  version: 1
+spec:
+  description: |
+    **Context:** `qm-depot` (`kubectl config use-context qm-depot`)
+
+    In namespace `eta-service`, the Deployment `eta-service` has two
+    containers. Give the container **`eta-predictor`** (only that one)
+    requests of **200m CPU** and **256Mi memory**, and limits **twice as
+    large** for both. Leave the other container unchanged. All Pods must be
+    ready.
+  objectives:
+    - Set container resource requests and limits
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-depot
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: qm-depot
+  setup:
+    - on: qm-depot
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: eta-service}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: eta-service, namespace: eta-service}
+        spec:
+          replicas: 1
+          selector: {matchLabels: {app: eta-service}}
+          template:
+            metadata: {labels: {app: eta-service}}
+            spec:
+              terminationGracePeriodSeconds: 2
+              containers:
+                - name: eta-predictor
+                  image: busybox:1.37
+                  command: ["sleep", "1d"]
+                - name: log-forwarder
+                  image: busybox:1.37
+                  command: ["sleep", "1d"]
+    - on: qm-depot
+      timeoutSec: 120
+      run: kubectl -n eta-service rollout status deploy/eta-service --timeout=110s
+  teardown:
+    - on: qm-depot
+      run: kubectl delete namespace eta-service --ignore-not-found --wait=false
+  checks:
+    - id: predictor-resources
+      description: eta-predictor requests 200m/256Mi and is limited to 400m/512Mi
+      type: k8s-query
+      skills: [k8s.workloads.resources]
+      weight: 2
+      query: {cluster: qm-depot, resource: deployment, name: eta-service, namespace: eta-service, jsonpath: '{.spec.template.spec.containers[?(@.name=="eta-predictor")].resources.requests.cpu}/{.spec.template.spec.containers[?(@.name=="eta-predictor")].resources.requests.memory} {.spec.template.spec.containers[?(@.name=="eta-predictor")].resources.limits.cpu}/{.spec.template.spec.containers[?(@.name=="eta-predictor")].resources.limits.memory}'}
+      expect: {match: exact, value: 200m/256Mi 400m/512Mi}
+    - id: forwarder-unchanged
+      description: log-forwarder still has no resources set
+      type: k8s-query
+      skills: [k8s.workloads.resources]
+      query: {cluster: qm-depot, resource: deployment, name: eta-service, namespace: eta-service, jsonpath: '[{.spec.template.spec.containers[?(@.name=="log-forwarder")].resources}]'}
+      expect: {match: regex, value: '^\[(\{\})?\]$'}
+    - id: rolled-out
+      description: The Pod runs the new template and is ready
+      type: k8s-query
+      skills: [k8s.workloads.resources]
+      weight: 0.5
+      query: {cluster: qm-depot, resource: deployment, name: eta-service, namespace: eta-service, jsonpath: "{.status.updatedReplicas}/{.status.readyReplicas}/{.spec.replicas}"}
+      expect: {match: exact, value: 1/1/1}
+  misconceptions:
+    - id: all-containers
+      description: Runs kubectl set resources without -c, which changes both containers.
+      feedback: Without `-c` kubectl set resources applies to every container in the template.
+      expectFail: [forwarder-unchanged]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n eta-service set resources deploy/eta-service --requests=cpu=200m,memory=256Mi --limits=cpu=400m,memory=512Mi
+          kubectl -n eta-service rollout status deploy/eta-service --timeout=100s
+    - id: limits-equal
+      description: Sets limits equal to requests.
+      feedback: The task asks for limits twice the requests (400m CPU, 512Mi memory).
+      expectFail: [predictor-resources]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n eta-service set resources deploy/eta-service -c eta-predictor --requests=cpu=200m,memory=256Mi --limits=cpu=200m,memory=256Mi
+          kubectl -n eta-service rollout status deploy/eta-service --timeout=100s
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n eta-service set resources deployment/eta-service -c eta-predictor --requests=cpu=200m,memory=256Mi --limits=cpu=400m,memory=512Mi
+          kubectl -n eta-service rollout status deployment/eta-service --timeout=100s
+    alternatives:
+      - id: decimal-cpu
+        description: Patch with decimal CPU values (0.2 / 0.4), which the API server stores as 200m / 400m.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 120
+            run: |
+              kubectl config use-context qm-depot
+              kubectl -n eta-service patch deployment eta-service -p '{"spec":{"template":{"spec":{"containers":[{"name":"eta-predictor","resources":{"requests":{"cpu":"0.2","memory":"256Mi"},"limits":{"cpu":"0.4","memory":"512Mi"}}}]}}}}'
+              kubectl -n eta-service rollout status deployment/eta-service --timeout=100s

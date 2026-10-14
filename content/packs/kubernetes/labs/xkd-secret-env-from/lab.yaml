@@ -1,0 +1,162 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xkd-secret-env-from
+  title: Load all keys of a Secret as environment
+  domain: kubernetes
+  frameworks: [ckad:environment-config-security]
+  difficulty: easy
+  estimatedMinutes: 5
+  tags: [exam, secrets, env]
+  version: 1
+spec:
+  description: |
+    **Context:** `qm-depot` (`kubectl config use-context qm-depot`)
+
+    In namespace `carrier-sync`:
+
+    1. Create a Secret **`carrier-creds`** with two keys:
+       `CARRIER_USER={{user}}` and `CARRIER_TOKEN={{token}}`.
+    2. Load **all** keys of that Secret as environment variables into
+       container `sync` of the Deployment **`carrier-sync`** using
+       **`envFrom`**. All Pods must be ready and see both variables.
+  objectives:
+    - Create a Secret from literals and consume it with envFrom
+  params:
+    user:
+      type: choice
+      values: [qm-harbour-bot, qm-yard-sync, qm-depot-link]
+    token:
+      type: choice
+      values: [tk-7f3a9c21, tk-0b84e6d5, tk-c19f2a77]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-depot
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: qm-depot
+  setup:
+    - on: qm-depot
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: carrier-sync}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: carrier-sync, namespace: carrier-sync}
+        spec:
+          replicas: 1
+          selector: {matchLabels: {app: carrier-sync}}
+          template:
+            metadata: {labels: {app: carrier-sync}}
+            spec:
+              terminationGracePeriodSeconds: 2
+              containers:
+                - name: sync
+                  image: busybox:1.37
+                  command: ["sleep", "1d"]
+    - on: qm-depot
+      timeoutSec: 120
+      run: kubectl -n carrier-sync rollout status deploy/carrier-sync --timeout=110s
+  teardown:
+    - on: qm-depot
+      run: kubectl delete namespace carrier-sync --ignore-not-found --wait=false
+  checks:
+    - id: secret
+      description: Secret carrier-creds holds CARRIER_USER and CARRIER_TOKEN with the given values
+      type: shell
+      on: qm-depot
+      skills: [k8s.workloads.config]
+      command: |
+        kubectl -n carrier-sync get secret carrier-creds -o json 2>/dev/null \
+          | jq -r '.data | (keys | join(",")) + " " + (.CARRIER_USER // "" | @base64d) + " " + (.CARRIER_TOKEN // "" | @base64d)' || echo missing
+      expect: {match: exact, value: "CARRIER_TOKEN,CARRIER_USER {{user}} {{token}}"}
+    - id: env-from
+      description: Container sync loads carrier-creds with envFrom
+      type: k8s-query
+      skills: [k8s.workloads.config]
+      weight: 2
+      query: {cluster: qm-depot, resource: deployment, name: carrier-sync, namespace: carrier-sync, jsonpath: '{.spec.template.spec.containers[?(@.name=="sync")].envFrom[*].secretRef.name}'}
+      expect: {match: exact, value: carrier-creds}
+    - id: in-pod
+      description: A running carrier-sync Pod sees both variables
+      type: shell
+      on: qm-depot
+      skills: [k8s.workloads.config]
+      timeoutSec: 20
+      command: |
+        p=$(kubectl -n carrier-sync get pods -l app=carrier-sync -o json | jq -r '[.items[] | select(.metadata.deletionTimestamp == null and .status.phase == "Running")][0].metadata.name // empty')
+        [ -n "$p" ] || { echo "no pod"; exit 0; }
+        kubectl -n carrier-sync exec "$p" -c sync -- sh -c 'echo "$CARRIER_USER $CARRIER_TOKEN"' 2>/dev/null
+      expect: {match: exact, value: "{{user}} {{token}}"}
+  misconceptions:
+    - id: configmap
+      description: Stores the credentials in a ConfigMap instead of a Secret.
+      feedback: Credentials belong in a Secret; ConfigMaps are readable by everyone with read access to configuration.
+      expectFail: [secret, env-from]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n carrier-sync create configmap carrier-creds --from-literal=CARRIER_USER={{user}} --from-literal=CARRIER_TOKEN={{token}}
+          kubectl -n carrier-sync set env deploy/carrier-sync --from=configmap/carrier-creds
+          kubectl -n carrier-sync rollout status deploy/carrier-sync --timeout=120s
+    - id: single-key-refs
+      description: Maps each key with env/valueFrom instead of envFrom.
+      feedback: It works for two keys, but the task asks for envFrom, which picks up keys added later without editing the Deployment.
+      expectFail: [env-from]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n carrier-sync create secret generic carrier-creds --from-literal=CARRIER_USER={{user}} --from-literal=CARRIER_TOKEN={{token}}
+          kubectl -n carrier-sync patch deploy carrier-sync -p '{"spec":{"template":{"spec":{"containers":[{"name":"sync","env":[{"name":"CARRIER_USER","valueFrom":{"secretKeyRef":{"name":"carrier-creds","key":"CARRIER_USER"}}},{"name":"CARRIER_TOKEN","valueFrom":{"secretKeyRef":{"name":"carrier-creds","key":"CARRIER_TOKEN"}}}]}]}}}}'
+          kubectl -n carrier-sync rollout status deploy/carrier-sync --timeout=120s
+    - id: trailing-newline
+      description: Creates the Secret from files written with echo, so each value ends with a newline.
+      feedback: "`echo` adds a newline that becomes part of the value. Use --from-literal or `printf '%s'`."
+      expectFail: [secret]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-depot
+          d=$(mktemp -d); echo {{user}} > $d/CARRIER_USER; echo {{token}} > $d/CARRIER_TOKEN
+          kubectl -n carrier-sync create secret generic carrier-creds --from-file=$d
+          kubectl -n carrier-sync patch deploy carrier-sync -p '{"spec":{"template":{"spec":{"containers":[{"name":"sync","envFrom":[{"secretRef":{"name":"carrier-creds"}}]}]}}}}'
+          kubectl -n carrier-sync rollout status deploy/carrier-sync --timeout=120s
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n carrier-sync create secret generic carrier-creds --from-literal=CARRIER_USER={{user}} --from-literal=CARRIER_TOKEN={{token}}
+          kubectl -n carrier-sync patch deployment carrier-sync -p '{"spec":{"template":{"spec":{"containers":[{"name":"sync","envFrom":[{"secretRef":{"name":"carrier-creds"}}]}]}}}}'
+          kubectl -n carrier-sync rollout status deployment/carrier-sync --timeout=120s
+    alternatives:
+      - id: set-env-from-secret
+        description: kubectl set env --from=secret/... (which writes envFrom).
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 150
+            run: |
+              kubectl config use-context qm-depot
+              kubectl -n carrier-sync create secret generic carrier-creds --from-literal=CARRIER_USER={{user}} --from-literal=CARRIER_TOKEN={{token}}
+              kubectl -n carrier-sync get deploy carrier-sync -o yaml | yq '.spec.template.spec.containers[0].envFrom = [{"secretRef": {"name": "carrier-creds"}}]' | kubectl apply -f -
+              kubectl -n carrier-sync rollout status deployment/carrier-sync --timeout=120s

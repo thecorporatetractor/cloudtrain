@@ -1,0 +1,149 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xkd-custom-resource-create
+  title: Create a custom resource
+  domain: kubernetes
+  frameworks: [ckad:environment-config-security]
+  difficulty: easy
+  estimatedMinutes: 5
+  tags: [exam, crd, custom-resources]
+  version: 1
+spec:
+  description: |
+    **Context:** `qm-depot` (`kubectl config use-context qm-depot`)
+
+    The cluster has a CustomResourceDefinition for **DeliveryWindow**
+    objects (group `logistics.quillmoor.example`). In namespace
+    **`harbour-windows`**, create a DeliveryWindow named **`harbour-am`**
+    for dock **`{{dock}}`** that starts at **`{{start}}`** and ends at
+    **`{{end}}`**. Use the CRD's schema to find the field names and the API
+    version to use.
+  objectives:
+    - Discover a CRD's served version and schema and create a custom resource
+  params:
+    dock:
+      type: choice
+      values: [dock-3, dock-5, dock-7]
+    start:
+      type: choice
+      values: ["06:00", "06:30", "07:00"]
+    end:
+      type: choice
+      values: ["11:30", "12:00"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-depot
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: qm-depot
+  setup:
+    - on: qm-depot
+      apply: |
+        apiVersion: apiextensions.k8s.io/v1
+        kind: CustomResourceDefinition
+        metadata: {name: deliverywindows.logistics.quillmoor.example}
+        spec:
+          group: logistics.quillmoor.example
+          scope: Namespaced
+          names: {plural: deliverywindows, singular: deliverywindow, kind: DeliveryWindow, shortNames: [dw]}
+          versions:
+            - name: v1alpha1
+              served: false
+              storage: false
+              schema:
+                openAPIV3Schema: {type: object, x-kubernetes-preserve-unknown-fields: true}
+            - name: v1
+              served: true
+              storage: true
+              schema:
+                openAPIV3Schema:
+                  type: object
+                  properties:
+                    spec:
+                      type: object
+                      required: [dock, opensAt, closesAt]
+                      properties:
+                        dock: {type: string, description: "Dock identifier, e.g. dock-3"}
+                        opensAt: {type: string, pattern: '^([01][0-9]|2[0-3]):[0-5][0-9]$', description: "Start time HH:MM"}
+                        closesAt: {type: string, pattern: '^([01][0-9]|2[0-3]):[0-5][0-9]$', description: "End time HH:MM"}
+              additionalPrinterColumns:
+                - {name: Dock, type: string, jsonPath: .spec.dock}
+                - {name: Opens, type: string, jsonPath: .spec.opensAt}
+                - {name: Closes, type: string, jsonPath: .spec.closesAt}
+        ---
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: harbour-windows}
+    - on: qm-depot
+      timeoutSec: 60
+      run: kubectl wait crd/deliverywindows.logistics.quillmoor.example --for=condition=Established --timeout=50s
+  teardown:
+    - on: qm-depot
+      run: |
+        kubectl delete namespace harbour-windows --ignore-not-found --wait=false
+        kubectl delete crd deliverywindows.logistics.quillmoor.example --ignore-not-found --wait=false
+  checks:
+    - id: window
+      description: DeliveryWindow harbour-am exists in harbour-windows for {{dock}} from {{start}} to {{end}}
+      type: k8s-query
+      skills: [k8s.cluster.extensions]
+      weight: 2
+      query: {cluster: qm-depot, resource: deliverywindows.logistics.quillmoor.example, name: harbour-am, namespace: harbour-windows, jsonpath: "{.spec.dock} {.spec.opensAt}-{.spec.closesAt}"}
+      expect: {match: exact, value: "{{dock}} {{start}}-{{end}}"}
+  misconceptions:
+    - id: wrong-namespace
+      description: Creates the object in the default namespace.
+      feedback: DeliveryWindow is namespaced; set metadata.namespace or pass -n.
+      expectFail: [window]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-depot
+          kubectl apply -f - <<'YAML'
+          apiVersion: logistics.quillmoor.example/v1
+          kind: DeliveryWindow
+          metadata: {name: harbour-am}
+          spec: {dock: "{{dock}}", opensAt: "{{start}}", closesAt: "{{end}}"}
+          YAML
+    - id: guessed-fields
+      description: Guesses field names (start/end) instead of reading the schema; the API server prunes unknown fields and rejects the object for missing required ones.
+      feedback: "`kubectl explain deliverywindow.spec` shows the real field names."
+      expectFail: [window]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-depot
+          kubectl apply -f - <<'YAML' || true
+          apiVersion: logistics.quillmoor.example/v1
+          kind: DeliveryWindow
+          metadata: {name: harbour-am, namespace: harbour-windows}
+          spec: {dock: "{{dock}}", start: "{{start}}", end: "{{end}}"}
+          YAML
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-depot
+          kubectl explain deliverywindow.spec
+          kubectl apply -f - <<'YAML'
+          apiVersion: logistics.quillmoor.example/v1
+          kind: DeliveryWindow
+          metadata:
+            name: harbour-am
+            namespace: harbour-windows
+          spec:
+            dock: "{{dock}}"
+            opensAt: "{{start}}"
+            closesAt: "{{end}}"
+          YAML

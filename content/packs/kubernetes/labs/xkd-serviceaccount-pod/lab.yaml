@@ -1,0 +1,131 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xkd-serviceaccount-pod
+  title: Run a Pod under a dedicated ServiceAccount
+  domain: kubernetes
+  frameworks: [ckad:environment-config-security]
+  difficulty: easy
+  estimatedMinutes: 4
+  tags: [exam, serviceaccount]
+  version: 1
+spec:
+  description: |
+    **Context:** `qm-depot` (`kubectl config use-context qm-depot`)
+
+    In namespace `route-ops`, create a ServiceAccount named
+    **`route-reader`** and make the Deployment **`route-sync`** run its Pods
+    under it. All Pods must be running under the new ServiceAccount.
+  objectives:
+    - Create a ServiceAccount and assign it to a Deployment
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-depot
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: qm-depot
+  setup:
+    - on: qm-depot
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: route-ops}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: route-sync, namespace: route-ops}
+        spec:
+          replicas: 2
+          selector: {matchLabels: {app: route-sync}}
+          template:
+            metadata: {labels: {app: route-sync}}
+            spec:
+              terminationGracePeriodSeconds: 2
+              containers:
+                - name: sync
+                  image: busybox:1.37
+                  command: ["sleep", "1d"]
+    - on: qm-depot
+      timeoutSec: 120
+      run: kubectl -n route-ops rollout status deploy/route-sync --timeout=110s
+  teardown:
+    - on: qm-depot
+      run: kubectl delete namespace route-ops --ignore-not-found --wait=false
+  checks:
+    - id: sa
+      description: ServiceAccount route-reader exists in route-ops
+      type: k8s-query
+      skills: [k8s.rbac.service-accounts]
+      weight: 0.5
+      query: {cluster: qm-depot, resource: serviceaccount, name: route-reader, namespace: route-ops, jsonpath: "{.metadata.name}"}
+      expect: {match: exact, value: route-reader}
+    - id: template
+      description: route-sync's Pod template uses route-reader
+      type: k8s-query
+      skills: [k8s.rbac.service-accounts]
+      query: {cluster: qm-depot, resource: deployment, name: route-sync, namespace: route-ops, jsonpath: "{.spec.template.spec.serviceAccountName}"}
+      expect: {match: exact, value: route-reader}
+    - id: pods
+      description: Every live route-sync Pod runs as route-reader and the rollout is complete
+      type: shell
+      on: qm-depot
+      skills: [k8s.rbac.service-accounts]
+      weight: 2
+      command: |
+        sas=$(kubectl -n route-ops get pods -l app=route-sync -o json | jq -r '[.items[] | select(.metadata.deletionTimestamp == null) | .spec.serviceAccountName] | unique | join(",")')
+        r=$(kubectl -n route-ops get deploy route-sync -o jsonpath='{.status.updatedReplicas}/{.status.readyReplicas}/{.spec.replicas}')
+        echo "$sas $r"
+      expect: {match: exact, value: route-reader 2/2/2}
+  misconceptions:
+    - id: sa-in-default
+      description: Creates the ServiceAccount in the default namespace; the Pods in route-ops cannot use it and are never created.
+      feedback: ServiceAccounts are namespaced. A Pod can only use one from its own namespace.
+      expectFail: [sa, pods]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 60
+        run: |
+          kubectl config use-context qm-depot
+          kubectl create serviceaccount route-reader
+          kubectl -n route-ops set serviceaccount deployment route-sync route-reader
+          sleep 15
+    - id: sa-only
+      description: Creates the ServiceAccount but never assigns it to the Deployment.
+      feedback: Creating a ServiceAccount does nothing until a Pod spec names it in serviceAccountName.
+      expectFail: [template, pods]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n route-ops create serviceaccount route-reader
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n route-ops create serviceaccount route-reader
+          kubectl -n route-ops set serviceaccount deployment route-sync route-reader
+          kubectl -n route-ops rollout status deployment/route-sync --timeout=120s
+    alternatives:
+      - id: patch
+        description: Patch serviceAccountName into the Pod template.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 150
+            run: |
+              kubectl config use-context qm-depot
+              kubectl -n route-ops create serviceaccount route-reader
+              kubectl -n route-ops patch deployment route-sync -p '{"spec":{"template":{"spec":{"serviceAccountName":"route-reader"}}}}'
+              kubectl -n route-ops rollout status deployment/route-sync --timeout=120s

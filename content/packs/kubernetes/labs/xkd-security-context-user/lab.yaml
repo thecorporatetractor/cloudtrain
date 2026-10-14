@@ -1,0 +1,148 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xkd-security-context-user
+  title: Run a container as a non-root user
+  domain: kubernetes
+  frameworks: [ckad:environment-config-security]
+  difficulty: medium
+  estimatedMinutes: 6
+  tags: [exam, security-context]
+  version: 1
+spec:
+  description: |
+    **Context:** `qm-depot` (`kubectl config use-context qm-depot`)
+
+    In namespace `invoice-desk`, change container `api` of the Deployment
+    **`invoice-api`** so that it:
+
+    - runs as user ID **{{uid}}**;
+    - cannot gain more privileges than its parent process
+      (privilege escalation disabled);
+    - drops **all** Linux capabilities except **`NET_BIND_SERVICE`**.
+
+    All Pods must be running the new settings and be ready.
+  objectives:
+    - Set user, privilege escalation and capabilities in a securityContext
+  params:
+    uid:
+      type: choice
+      values: [1500, 1501, 1550]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-depot
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: qm-depot
+  setup:
+    - on: qm-depot
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: invoice-desk}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: invoice-api, namespace: invoice-desk}
+        spec:
+          replicas: 2
+          selector: {matchLabels: {app: invoice-api}}
+          template:
+            metadata: {labels: {app: invoice-api}}
+            spec:
+              terminationGracePeriodSeconds: 2
+              containers:
+                - name: api
+                  image: busybox:1.37
+                  command: ["sh", "-c", "mkdir -p /tmp/www && echo invoices > /tmp/www/index.html && exec httpd -f -p 8080 -h /tmp/www"]
+                  ports: [{name: http, containerPort: 8080}]
+                  readinessProbe:
+                    httpGet: {path: /, port: http}
+                    periodSeconds: 3
+    - on: qm-depot
+      timeoutSec: 120
+      run: kubectl -n invoice-desk rollout status deploy/invoice-api --timeout=110s
+  teardown:
+    - on: qm-depot
+      run: kubectl delete namespace invoice-desk --ignore-not-found --wait=false
+  checks:
+    - id: escalation-caps
+      description: Container api disables privilege escalation and drops ALL but adds NET_BIND_SERVICE
+      type: k8s-query
+      skills: [k8s.security.security-context]
+      weight: 2
+      query: {cluster: qm-depot, resource: deployment, name: invoice-api, namespace: invoice-desk, jsonpath: '{.spec.template.spec.containers[?(@.name=="api")].securityContext.allowPrivilegeEscalation} drop={.spec.template.spec.containers[?(@.name=="api")].securityContext.capabilities.drop} add={.spec.template.spec.containers[?(@.name=="api")].securityContext.capabilities.add}'}
+      expect: {match: regex, value: '^false drop=\["(ALL|all)"\] add=\["(CAP_)?NET_BIND_SERVICE"\]$'}
+    - id: runs-as-uid
+      description: The running api container has UID {{uid}} and only NET_BIND_SERVICE in its bounding set
+      type: shell
+      on: qm-depot
+      skills: [k8s.security.security-context]
+      weight: 2
+      timeoutSec: 20
+      command: |
+        p=$(kubectl -n invoice-desk get pods -l app=invoice-api -o json | jq -r '[.items[] | select(.metadata.deletionTimestamp == null and .status.phase == "Running")][0].metadata.name // empty')
+        [ -n "$p" ] || { echo "no pod"; exit 0; }
+        kubectl -n invoice-desk exec "$p" -c api -- sh -c 'echo "uid=$(id -u) capbnd=$(grep CapBnd /proc/self/status | cut -f2)"' 2>/dev/null
+      expect: {match: exact, value: "uid={{uid}} capbnd=0000000000000400"}
+    - id: rolled-out
+      description: All invoice-api Pods run the new template and are ready
+      type: k8s-query
+      skills: [k8s.security.security-context]
+      weight: 0.5
+      query: {cluster: qm-depot, resource: deployment, name: invoice-api, namespace: invoice-desk, jsonpath: "{.status.updatedReplicas}/{.status.readyReplicas}/{.spec.replicas}"}
+      expect: {match: exact, value: 2/2/2}
+  misconceptions:
+    - id: add-without-drop
+      description: Adds NET_BIND_SERVICE but never drops the default capability set.
+      feedback: "`add` only adds to the runtime's defaults. Drop ALL first, then add back what you need."
+      expectFail: [escalation-caps, runs-as-uid]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n invoice-desk patch deploy invoice-api -p '{"spec":{"template":{"spec":{"containers":[{"name":"api","securityContext":{"runAsUser":{{uid}},"allowPrivilegeEscalation":false,"capabilities":{"add":["NET_BIND_SERVICE"]}}}]}}}}'
+          kubectl -n invoice-desk rollout status deploy/invoice-api --timeout=120s
+    - id: drop-all-only
+      description: Drops ALL capabilities and forgets to add NET_BIND_SERVICE back.
+      feedback: The task keeps one capability. Add NET_BIND_SERVICE after dropping ALL.
+      expectFail: [escalation-caps, runs-as-uid]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n invoice-desk patch deploy invoice-api -p '{"spec":{"template":{"spec":{"containers":[{"name":"api","securityContext":{"runAsUser":{{uid}},"allowPrivilegeEscalation":false,"capabilities":{"drop":["ALL"]}}}]}}}}'
+          kubectl -n invoice-desk rollout status deploy/invoice-api --timeout=120s
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n invoice-desk patch deployment invoice-api -p '{"spec":{"template":{"spec":{"containers":[{"name":"api","securityContext":{"runAsUser":{{uid}},"allowPrivilegeEscalation":false,"capabilities":{"drop":["ALL"],"add":["NET_BIND_SERVICE"]}}}]}}}}'
+          kubectl -n invoice-desk rollout status deployment/invoice-api --timeout=120s
+    alternatives:
+      - id: pod-level-user
+        description: Set the user at Pod level and the rest at container level.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 150
+            run: |
+              kubectl config use-context qm-depot
+              kubectl -n invoice-desk get deploy invoice-api -o yaml \
+                | yq '.spec.template.spec.securityContext.runAsUser = {{uid}} | .spec.template.spec.containers[0].securityContext = {"allowPrivilegeEscalation": false, "capabilities": {"drop": ["ALL"], "add": ["NET_BIND_SERVICE"]}}' \
+                | kubectl apply -f -
+              kubectl -n invoice-desk rollout status deployment/invoice-api --timeout=120s
