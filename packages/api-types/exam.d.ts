@@ -47,6 +47,10 @@ export interface RetakeStatus {
   freeRetakesLeft: number;
   /** An attempt that is still running (resume it instead of starting another). */
   activeAttemptId?: string;
+  /** Open retake grants (each lifts the cooldown and the 30-day cap for one attempt). */
+  retakeGrants?: number;
+  /** The next attempt is allowed only because of a retake grant (starting it uses the grant). */
+  viaGrant?: boolean;
 }
 
 export interface ExamObjectiveInfo {
@@ -126,6 +130,8 @@ export interface ExamAttemptSummary {
   number: number;
   /** Whether the attempt counts for the retake policy. */
   counted: boolean;
+  /** Ended by an admin or instructor: not scored, not counted. */
+  voided?: { at: string; reason?: string };
 }
 
 export interface ExamTerminalTarget {
@@ -263,6 +269,8 @@ export interface TeamExamMember {
   weakestObjective?: { id: string; name?: string; score: number };
   /** ready: passed with margin; close: within 10 points of the pass mark; not-ready; not-attempted. */
   readiness: 'ready' | 'close' | 'not-ready' | 'not-attempted';
+  /** A running attempt (target of `POST /api/exams/attempts/:id/void`). */
+  activeAttemptId?: string;
 }
 
 export interface TeamExamReadiness {
@@ -276,4 +284,26 @@ export interface TeamExamReadiness {
     averageScore?: number;
     passRate: number;
   }[];
+}
+
+/* ------------------------------------------------------- interventions */
+
+/** `POST /api/exams/attempts/:id/void` (session.control on the candidate): ends a running attempt, not scored, not counted. */
+export interface VoidExamAttemptRequest {
+  reason?: string;
+}
+
+/** `POST /api/exams/:examId/retake-grants` (assignment.manage on the candidate). */
+export interface GrantExamRetakeRequest {
+  userId: string;
+  reason?: string;
+}
+
+export interface ExamRetakeGrant {
+  id: string;
+  examId: string;
+  userId: string;
+  grantedBy: string;
+  reason?: string;
+  createdAt: string;
 }

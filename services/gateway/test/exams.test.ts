@@ -1,170 +1,34 @@
-import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import type { RetakePolicy } from '@cloudtrain/api-types';
 import { buildApp } from '../src/app.js';
 import { DevAuthenticator, type Principal } from '../src/auth.js';
-import { loadContent, type Content } from '../src/content/load.js';
-import { loadExamCatalog, type ExamCatalog } from '../src/exams/catalog.js';
-import { parseCompiled, type CompiledExam, type ExamCompiler } from '../src/exams/compile.js';
 import { MemoryEvidenceSink, skillEvidence } from '../src/exams/evidence.js';
-import type { ExamCluster, ExamSession, ExamTemplate } from '../src/exams/kube.js';
 import { retakeStatus } from '../src/exams/policy.js';
 import { planExamTerminal } from '../src/exams/routes.js';
-import { AttemptTeamDirectory, ExamService } from '../src/exams/service.js';
+import { ExamService, type TeamDirectory } from '../src/exams/service.js';
+import { can } from '../src/authz.js';
 import { MemoryExamStore, type AttemptRecord } from '../src/exams/store.js';
-import type { LabSession, LabTemplate } from '../src/kube/types.js';
+import type { LabSession } from '../src/kube/types.js';
 import { SessionService } from '../src/sessions/service.js';
-import { alice, bob, FakeCluster, FakeCompiler, fixtureLabs, repo } from './fakes.js';
-
-const EXAM = 'sim-test-k8s-dev';
-const examDir = path.join(repo, 'services/lab-orchestrator/testdata/exams');
-
-let content: Promise<Content> | undefined;
-function examContent(): Promise<Content> {
-  content ??= loadContent(path.join(repo, 'content'), [fixtureLabs, path.join(examDir, 'tasks')]);
-  return content;
-}
-async function catalog(): Promise<ExamCatalog> {
-  return loadExamCatalog(await examContent(), path.join(repo, 'content'), path.join(repo, 'content/curriculum.yaml'), [path.join(examDir, 'exams.yaml')]);
-}
-
-const clone = <T>(v: T): T => structuredClone(v);
-function mergePatch(target: Record<string, unknown>, patch: Record<string, unknown>) {
-  for (const [k, v] of Object.entries(patch)) {
-    if (v && typeof v === 'object' && !Array.isArray(v)) target[k] = mergePatch((target[k] as Record<string, unknown>) ?? {}, v as Record<string, unknown>);
-    else target[k] = v;
-  }
-  return target;
-}
-
-/** In-memory exam objects; tests play the orchestrator by setting status. */
-class FakeExamCluster implements ExamCluster {
-  labTemplates = new Map<string, LabTemplate>();
-  examTemplates = new Map<string, ExamTemplate>();
-  sessions = new Map<string, ExamSession>();
-  async getLabTemplate(name: string) {
-    return this.labTemplates.get(name) ?? null;
-  }
-  async createLabTemplate(t: LabTemplate) {
-    this.labTemplates.set(t.metadata.name, clone(t));
-  }
-  async getExamTemplate(name: string) {
-    return this.examTemplates.get(name) ?? null;
-  }
-  async createExamTemplate(t: ExamTemplate) {
-    this.examTemplates.set(t.metadata.name, clone(t));
-  }
-  async getExamSession(name: string) {
-    const s = this.sessions.get(name);
-    return s ? clone(s) : null;
-  }
-  async createExamSession(s: ExamSession) {
-    this.sessions.set(s.metadata.name, clone(s));
-    return clone(s);
-  }
-  async patchExamSession(name: string, patch: Record<string, unknown>) {
-    const s = this.sessions.get(name)!;
-    mergePatch(s as unknown as Record<string, unknown>, patch);
-    return clone(s);
-  }
-  async deleteExamSession(name: string) {
-    this.sessions.delete(name);
-  }
-
-  /** The controller drew two tasks and the shared environment is ready. */
-  inProgress(name: string, startedAt: string) {
-    const s = this.sessions.get(name)!;
-    s.status = {
-      phase: 'InProgress',
-      message: 'The exam is in progress.',
-      examID: EXAM,
-      startedAt,
-      deadline: new Date(Date.parse(startedAt) + 30 * 60_000).toISOString(),
-      tasks: [
-        { index: 1, id: 'xt-scale-manifest-api', objective: 'ckad:deployment', weight: '40', seed: 1, templateRef: 't1', title: 'Scale the manifest API', statement: 'Scale to **4** replicas.', environment: `${name}-env`, nodes: ['workstation', 'exam-core'], contexts: ['exam-core'] },
-        { index: 2, id: 'xt-secret-literal', objective: 'ckad:environment-config-security', weight: '35', seed: 2, templateRef: 't2', title: 'Store the cargo API token', statement: 'Token qltok-abcde', environment: `${name}-env`, nodes: ['workstation', 'exam-core'], contexts: ['exam-core'] },
-        { index: 3, id: 'xt-expose-clusterip', objective: 'ckad:services-networking', weight: '25', seed: 3, templateRef: 't3', title: 'Expose', statement: 'Port 8080', environment: `${name}-env`, nodes: ['workstation', 'exam-edge'], contexts: ['exam-edge'] },
-      ],
-      environments: [
-        {
-          name: `${name}-env`,
-          tasks: [1, 2, 3],
-          phase: 'Ready',
-          entryNode: 'workstation',
-          nodes: ['workstation', 'exam-core', 'exam-edge'],
-          endpoints: [{ node: 'workstation', access: 'shell', protocol: 'k8s-exec', target: `ns/${name}-env-workstation-x/node` }],
-        },
-      ],
-    };
-  }
-
-  /** The controller graded the attempt. */
-  completed(name: string, score: string, passed: boolean) {
-    const s = this.sessions.get(name)!;
-    s.status = {
-      ...s.status,
-      phase: 'Completed',
-      message: 'Your exam has been graded.',
-      submittedAt: s.status?.startedAt,
-      frozenAt: new Date(Date.parse(s.status!.startedAt!) + 12 * 60_000).toISOString(),
-      completedAt: new Date(Date.parse(s.status!.startedAt!) + 13 * 60_000).toISOString(),
-      environmentReleased: true,
-      environments: s.status!.environments!.map((e) => ({ ...e, endpoints: [] })),
-      report: {
-        score,
-        passMark: '66',
-        passed,
-        partialCredit: 'per-check',
-        passes: ['initial', 'rerun'],
-        gradedAt: new Date(Date.parse(s.status!.startedAt!) + 13 * 60_000).toISOString(),
-        objectives: [
-          { id: 'ckad:deployment', weight: '40', tasks: 1, score: '100' },
-          { id: 'ckad:environment-config-security', weight: '35', tasks: 1, score: '50' },
-          { id: 'ckad:services-networking', weight: '25', tasks: 1, score: '0' },
-        ],
-        tasks: [
-          { index: 1, id: 'xt-scale-manifest-api', title: 'Scale', objective: 'ckad:deployment', weight: '40', outcome: 'pass', score: '100', checks: [{ id: 'desired-replicas', passed: true, weight: '1', skills: ['k8s.workloads.scaling'], message: 'passed' }] },
-          {
-            index: 2,
-            id: 'xt-secret-literal',
-            title: 'Secret',
-            objective: 'ckad:environment-config-security',
-            weight: '35',
-            outcome: 'partial',
-            score: '50',
-            checks: [
-              { id: 'token-value', passed: true, weight: '1', skills: ['k8s.security.secrets'], message: 'passed' },
-              { id: 'generic-type', passed: false, weight: '1', skills: ['k8s.security.secrets'], message: 'no longer satisfied after the idempotency re-run', failedOnRerun: true },
-            ],
-          },
-          { index: 3, id: 'xt-expose-clusterip', title: 'Expose', objective: 'ckad:services-networking', weight: '25', outcome: 'fail', score: '0', checks: [{ id: 'service-ports', passed: false, weight: '1', skills: ['k8s.networking.services'], message: 'not satisfied yet' }] },
-        ],
-      },
-    };
-  }
-}
-
-/** labctl stand-in: compiles nothing, returns an ExamTemplate + one task template. */
-class StubExamCompiler implements ExamCompiler {
-  calls = 0;
-  async compile(examId: string): Promise<CompiledExam> {
-    this.calls++;
-    return parseCompiled(`apiVersion: labs.cloudtrain.dev/v1alpha1
-kind: LabTemplate
-metadata: {name: xt-scale-manifest-api-v1-0123456789, creationTimestamp: null}
-spec: {source: {id: xt-scale-manifest-api, version: 1}}
----
-apiVersion: labs.cloudtrain.dev/v1alpha1
-kind: ExamTemplate
-metadata: {name: ${examId}-abcdef0123}
-spec: {source: {id: ${examId}, title: T}, durationMinutes: 30, passMark: "66"}
-`);
-  }
-}
+import { alice, bob, FakeCluster, FakeCompiler } from './fakes.js';
+import { catalog, EXAM, examContent, FakeExamCluster, StubExamCompiler } from './exam-fakes.js';
 
 let now = new Date('2026-10-14T10:00:00Z');
-const manager: Principal = { ...alice, sub: 'mara', name: 'Mara Lindqvist', roles: ['manager'] };
+const manager: Principal = { ...alice, sub: 'mara', name: 'Mara Lindqvist', roles: ['learner', 'manager'], managedTeamIds: ['t-ops'] };
+const admin: Principal = { ...alice, sub: 'olga', name: 'Olga Admin', roles: ['learner', 'org_admin'] };
+
+/** Stand-in for PgTeamDirectory (teams/team_members): team t-ops = mara (manager) + alice + bob. */
+class StaticTeamDirectory implements TeamDirectory {
+  async team(p: Principal, teamId?: string) {
+    const id = teamId ?? p.managedTeamIds[0] ?? 't-ops';
+    if (!can(p, 'progress.read.team', { kind: 'team', teamId: id })) return null;
+    return { id, name: 'Ops', members: [{ userId: 'mara', name: 'Mara Lindqvist' }, { userId: 'alice', name: 'Alice' }] };
+  }
+  async subject(_p: Principal, userId: string) {
+    return ['mara', 'alice', 'bob'].includes(userId) ? { kind: 'user' as const, userId, teamIds: ['t-ops'], cohortIds: [] } : null;
+  }
+}
 
 async function make() {
   const cat = await catalog();
@@ -172,7 +36,7 @@ async function make() {
   const store = new MemoryExamStore();
   const evidence = new MemoryEvidenceSink();
   const compiler = new StubExamCompiler();
-  const svc = new ExamService(cat, await examContent(), cluster, compiler, store, evidence, new AttemptTeamDirectory(store), {
+  const svc = new ExamService(cat, await examContent(), cluster, compiler, store, evidence, new StaticTeamDirectory(), {
     sessionLabels: { 'labs.cloudtrain.dev/exam-proof': 'true' },
     now: () => now,
   });
@@ -344,6 +208,76 @@ describe('exam service', () => {
     expect(ex.members.map((m) => [m.userId, m.readiness])).toEqual([['mara', 'not-attempted'], ['alice', 'ready']]);
     expect(ex.members[1]).toMatchObject({ bestScore: 80, lastScore: 80, passed: true, weakestObjective: { id: 'ckad:services-networking', score: 0 } });
     expect(ex).toMatchObject({ averageScore: 80, passRate: 0.5 });
+  });
+});
+
+describe('exam interventions and audit', () => {
+  afterEach(() => {
+    now = new Date('2026-10-14T10:00:00Z');
+  });
+
+  it('audits start and submit; a failed cluster start leaves an uncounted attempt', async () => {
+    const { svc, cluster, store } = await make();
+    const { id } = await svc.start(alice, EXAM, '10.0.0.7');
+    cluster.inProgress(id, '2026-10-14T10:05:00Z');
+    now = new Date('2026-10-14T10:20:00Z');
+    await svc.submit(alice, id, '10.0.0.7');
+    expect(store.audits.map((a) => [a.action, a.targetId, a.actorId, a.ip])).toEqual([
+      ['exam.start', id, 'alice', '10.0.0.7'],
+      ['exam.submit', id, 'alice', '10.0.0.7'],
+    ]);
+    expect(store.audits[1]!.details).toMatchObject({ examId: EXAM, secondsLeft: 900 });
+
+    const { svc: svc2, cluster: c2, store: s2 } = await make();
+    c2.createExamSession = async () => {
+      throw new Error('apiserver down');
+    };
+    await expect(svc2.start(alice, EXAM)).rejects.toThrow(/apiserver down/);
+    const [rec] = await s2.listByUser(alice.orgId, 'alice', EXAM);
+    expect(rec).toMatchObject({ phase: 'failed' });
+    expect((await svc2.list(alice)).find((e) => e.id === EXAM)!.retake).toMatchObject({ allowed: true, attemptsTotal: 0 });
+  });
+
+  it('lets an org admin void a running attempt (not counted, environment deleted) and refuses learners and managers', async () => {
+    const { svc, cluster, store } = await make();
+    const { id } = await svc.start(alice, EXAM);
+    cluster.inProgress(id, '2026-10-14T10:05:00Z');
+    await expect(svc.void(bob, id, 'x')).rejects.toMatchObject({ status: 403 }); // a learner holds no session.control
+    await expect(svc.void(manager, id, 'x')).rejects.toMatchObject({ status: 403 }); // managers hold no session.control
+    const out = await svc.void(admin, id, 'Proctoring incident', '10.9.9.9');
+    expect(out).toMatchObject({ phase: 'failed', counted: false, voided: { reason: 'Proctoring incident' } });
+    expect(cluster.sessions.has(id)).toBe(false);
+    const st = await svc.attempt(alice, id);
+    expect(st.message).toMatch(/ended by an administrator/);
+    expect(store.audits.at(-1)).toMatchObject({ action: 'exam.void', targetId: id, actorId: 'olga', details: { candidate: 'alice', reason: 'Proctoring incident' } });
+    await expect(svc.void(admin, id, undefined)).rejects.toThrow(/Only a running attempt/);
+    expect((await svc.list(alice)).find((e) => e.id === EXAM)!.retake).toMatchObject({ allowed: true, attemptsTotal: 0 });
+  });
+
+  it('enforces the 30-day cap from the curriculum retake policy server-side and lets a manager grant one retake past it', async () => {
+    const { svc, cluster, store } = await make();
+    // sim-test-k8s-dev: freeRetakes 1, cooldownHours 0, maxAttemptsPer30Days 5.
+    for (const score of ['40', '45', '50', '55', '60']) {
+      const { id } = await svc.start(alice, EXAM);
+      cluster.inProgress(id, now.toISOString());
+      cluster.completed(id, score, false);
+      await svc.attempt(alice, id);
+    }
+    const blocked = await svc.start(alice, EXAM).catch((e: unknown) => e as { status: number; message: string; extra: { details?: { nextAllowedAt?: string } } });
+    expect(blocked).toMatchObject({ status: 409 });
+    expect((blocked as { message: string }).message).toMatch(/all 5 attempts allowed in 30 days/);
+    expect((blocked as { extra: { details?: { nextAllowedAt?: string } } }).extra.details?.nextAllowedAt).toBeTruthy();
+
+    await expect(svc.grantRetake(alice, EXAM, 'alice', 'self')).rejects.toMatchObject({ status: 403 });
+    await expect(svc.grantRetake(manager, EXAM, 'nobody', undefined)).rejects.toThrow(/Member not found/);
+    const g = await svc.grantRetake(manager, EXAM, 'alice', 'Network outage during attempt 2', '10.1.1.1');
+    expect(g).toMatchObject({ examId: EXAM, userId: 'alice', grantedBy: 'mara', reason: 'Network outage during attempt 2' });
+    expect((await svc.list(alice)).find((e) => e.id === EXAM)!.retake).toMatchObject({ allowed: true, viaGrant: true, retakeGrants: 1 });
+    const third = await svc.start(alice, EXAM);
+    expect(third.number).toBe(6);
+    expect(store.audits.filter((a) => a.action === 'exam.start').at(-1)!.details).toMatchObject({ retakeGrant: true });
+    expect(await store.openGrants(alice.orgId, 'alice', EXAM)).toEqual([]);
+    expect(store.audits.find((a) => a.action === 'exam.retake_grant')).toMatchObject({ targetType: 'user', targetId: 'alice', actorId: 'mara' });
   });
 });
 

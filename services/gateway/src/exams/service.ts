@@ -7,12 +7,13 @@ import type {
   ExamReport,
   ExamSummary,
   ExamTaskView,
+  ExamRetakeGrant,
   ExamTerminalTarget,
   TeamExamMember,
   TeamExamReadiness,
 } from '@cloudtrain/api-types';
 import type { Principal } from '../auth.js';
-import { can } from '../authz.js';
+import { authorize, type AuthzTarget } from '../authz.js';
 import type { Content } from '../content/load.js';
 import { HttpError, notFound } from '../errors.js';
 import { ConflictError } from '../kube/cluster.js';
@@ -23,14 +24,20 @@ import type { ExamCompiler } from './compile.js';
 import { skillEvidence, type ExamEvidenceSink } from './evidence.js';
 import type { ExamCluster, ExamSession } from './kube.js';
 import { counted, isActive, retakeStatus } from './policy.js';
-import type { AttemptRecord, ExamStore } from './store.js';
+import { RunningAttemptExists, type AttemptRecord, type ExamAuditEntry, type ExamStore } from './store.js';
 
 export const LABEL_EXAM_ID = 'labs.cloudtrain.dev/exam-id';
 
-/** Members of the team a manager looks at (platform-api: teams + team_members). */
+/** Teams and people as the authz layer sees them (PgTeamDirectory: teams + team_members, cohort_members). */
 export interface TeamDirectory {
-  /** The team (default: the principal's first managed team) or null when the principal may not see it. */
+  /**
+   * The team (default: the principal's first managed team) with its members,
+   * or null when the principal may not read its progress (progress.read.team
+   * on that team).
+   */
   team(principal: Principal, teamId?: string): Promise<{ id: string; name: string; members: { userId: string; name: string }[] } | null>;
+  /** A person of the principal's org as an authz target (their teams and cohorts); null when not in the org. */
+  subject(principal: Principal, userId: string): Promise<Extract<AuthzTarget, { kind: 'user' }> | null>;
 }
 
 export interface ExamServiceOptions {
@@ -52,6 +59,18 @@ const PHASES: Record<string, ExamAttemptPhase> = {
 
 export const PREPARING_MESSAGE = 'Your exam environment is being prepared. The timer starts when it is ready.';
 const LOST_MESSAGE = 'The exam environment is no longer available. This attempt is not scored and does not count.';
+const VOID_MESSAGE = 'This attempt was ended by an administrator. It is not scored and does not count against your retakes.';
+
+const auditOf = (p: Principal, action: ExamAuditEntry['action'], targetType: ExamAuditEntry['targetType'], targetId: string, details: Record<string, unknown>, ip?: string, targetLabel?: string): ExamAuditEntry => ({
+  actorId: p.sub,
+  actorName: p.name,
+  ...(ip ? { ip } : {}),
+  action,
+  targetType,
+  targetId,
+  ...(targetLabel ? { targetLabel } : {}),
+  details,
+});
 
 /** Exam attempt names: "exam-<10 hex>" (short: environment names derive from it). */
 export function attemptName(): string {
@@ -99,6 +118,7 @@ export class ExamService {
     const mine = attempts ?? (await this.syncAll(p, ex.def.id));
     const def = ex.def;
     const policy = retakePolicy(def);
+    const grants = (await this.store.openGrants(p.orgId, p.sub, def.id)).length;
     const graded = mine.filter((a) => a.phase === 'completed' && a.score !== undefined);
     const best = graded.length ? Math.max(...graded.map((a) => a.score!)) : undefined;
     return {
@@ -117,7 +137,7 @@ export class ExamService {
       ...(ex.availabilityNote ? { availabilityNote: ex.availabilityNote } : {}),
       rules: examRules(def),
       retakePolicy: policy,
-      retake: retakeStatus(policy, mine, this.now()),
+      retake: retakeStatus(policy, mine, this.now(), grants),
       ...(mine[0] ? { lastAttempt: this.attemptSummary(mine[0]) } : {}),
       ...(best !== undefined ? { bestScore: best } : {}),
     };
@@ -179,6 +199,7 @@ export class ExamService {
       ...(a.passed !== undefined ? { passed: a.passed } : {}),
       number: a.number,
       counted: counted(a),
+      ...(a.voided ? { voided: { at: a.voided.at, ...(a.voided.reason ? { reason: a.voided.reason } : {}) } } : {}),
     };
   }
 
@@ -198,60 +219,25 @@ export class ExamService {
     return out;
   }
 
-  async start(p: Principal, examId: string): Promise<ExamAttemptState> {
+  /**
+   * Starts an attempt. The retake policy (curriculum `retakePolicy`) is
+   * enforced here; the attempt row is written first, so the store's
+   * one-running-attempt guarantee (a unique index in Postgres) also holds
+   * under concurrent starts. Audited as exam.start.
+   */
+  async start(p: Principal, examId: string, ip?: string): Promise<ExamAttemptState> {
     const ex = this.exam(examId);
     if (ex.availability !== 'available') throw new HttpError(409, ex.availabilityNote ?? 'This exam simulation is not available yet.');
     const mine = await this.syncAll(p, examId);
     const policy = retakePolicy(ex.def);
-    const status = retakeStatus(policy, mine, this.now());
-    if (!status.allowed) throw new HttpError(409, status.reason ?? 'You cannot start this exam now.');
+    const grants = (await this.store.openGrants(p.orgId, p.sub, examId)).length;
+    const status = retakeStatus(policy, mine, this.now(), grants);
+    if (!status.allowed) throw new HttpError(409, status.reason ?? 'You cannot start this exam now.', { code: 'conflict', details: { ...(status.nextAllowedAt ? { nextAllowedAt: status.nextAllowedAt } : {}), ...(status.activeAttemptId ? { activeAttemptId: status.activeAttemptId } : {}) } });
 
-    const compiled = await this.compiler.compile(examId, ex.file);
-    for (const t of compiled.tasks) {
-      if (!(await this.cluster.getLabTemplate(t.metadata.name))) {
-        try {
-          await this.cluster.createLabTemplate(t);
-        } catch (e) {
-          if (!(e instanceof ConflictError)) throw e;
-        }
-      }
-    }
-    if (!(await this.cluster.getExamTemplate(compiled.exam.metadata.name))) {
-      try {
-        await this.cluster.createExamTemplate(compiled.exam);
-      } catch (e) {
-        if (!(e instanceof ConflictError)) throw e;
-      }
-    }
     const avoid = policy.freshDraw ? Array.from(new Set(mine.filter(counted).flatMap((a) => a.tasks.map((t) => t.taskId)))) : [];
     const name = attemptName();
     const seed = randomInt(1, 2 ** 31 - 1);
     const minutes = this.duration(ex);
-    const es: ExamSession = {
-      apiVersion: LABS_API_VERSION,
-      kind: 'ExamSession',
-      metadata: {
-        name,
-        // Configured labels win (e.g. a scoped manager's selector replacing
-        // managed-by): the orchestrator copies them onto the environment
-        // LabSessions, which exactly one manager must reconcile.
-        labels: {
-          [LABEL_EXAM_ID]: labelValue(examId),
-          [LABEL_LEARNER]: labelValue(p.sub),
-          [LABEL_ORG]: labelValue(p.orgId),
-          [LABEL_MANAGED_BY]: MANAGED_BY,
-          ...(this.opts.sessionLabels ?? {}),
-        },
-      },
-      spec: {
-        examTemplateRef: { name: compiled.exam.metadata.name },
-        candidate: { id: p.sub, org: p.orgId },
-        seed,
-        ...(avoid.length ? { avoidTasks: avoid } : {}),
-        ...(this.opts.durationMinutes ? { duration: `${this.opts.durationMinutes}m` } : {}),
-      },
-    };
-    await this.cluster.createExamSession(es);
     const rec: AttemptRecord = {
       id: name,
       orgId: p.orgId,
@@ -268,7 +254,64 @@ export class ExamService {
       flagged: [],
       evidenceRecorded: false,
     };
-    await this.store.create(rec);
+    try {
+      await this.store.create(rec, {
+        audit: auditOf(p, 'exam.start', 'exam_attempt', name, { examId, number: rec.number, ...(status.viaGrant ? { retakeGrant: true } : {}), ...(avoid.length ? { avoidTasks: avoid.length } : {}) }, ip, ex.def.title),
+        useGrant: !!status.viaGrant,
+      });
+    } catch (e) {
+      if (e instanceof RunningAttemptExists) throw new HttpError(409, e.message, { code: 'conflict' });
+      throw e;
+    }
+
+    try {
+      const compiled = await this.compiler.compile(examId, ex.file);
+      for (const t of compiled.tasks) {
+        if (!(await this.cluster.getLabTemplate(t.metadata.name))) {
+          try {
+            await this.cluster.createLabTemplate(t);
+          } catch (e) {
+            if (!(e instanceof ConflictError)) throw e;
+          }
+        }
+      }
+      if (!(await this.cluster.getExamTemplate(compiled.exam.metadata.name))) {
+        try {
+          await this.cluster.createExamTemplate(compiled.exam);
+        } catch (e) {
+          if (!(e instanceof ConflictError)) throw e;
+        }
+      }
+      const es: ExamSession = {
+        apiVersion: LABS_API_VERSION,
+        kind: 'ExamSession',
+        metadata: {
+          name,
+          // Configured labels win (e.g. a scoped manager's selector replacing
+          // managed-by): the orchestrator copies them onto the environment
+          // LabSessions, which exactly one manager must reconcile.
+          labels: {
+            [LABEL_EXAM_ID]: labelValue(examId),
+            [LABEL_LEARNER]: labelValue(p.sub),
+            [LABEL_ORG]: labelValue(p.orgId),
+            [LABEL_MANAGED_BY]: MANAGED_BY,
+            ...(this.opts.sessionLabels ?? {}),
+          },
+        },
+        spec: {
+          examTemplateRef: { name: compiled.exam.metadata.name },
+          candidate: { id: p.sub, org: p.orgId },
+          seed,
+          ...(avoid.length ? { avoidTasks: avoid } : {}),
+          ...(this.opts.durationMinutes ? { duration: `${this.opts.durationMinutes}m` } : {}),
+        },
+      };
+      await this.cluster.createExamSession(es);
+    } catch (e) {
+      // The platform could not start it: not counted, the person may start again.
+      await this.store.update(rec.orgId, rec.id, (r) => ({ ...r, phase: 'failed', completedAt: this.now().toISOString() }));
+      throw e;
+    }
     return this.state(rec, null);
   }
 
@@ -280,6 +323,7 @@ export class ExamService {
 
   /** Reads the ExamSession and folds it into the record (persisting changes, report and evidence once). */
   private async sync(rec: AttemptRecord): Promise<{ rec: AttemptRecord; es: ExamSession | null }> {
+    if (rec.voided) return { rec, es: null };
     const es = await this.cluster.getExamSession(rec.id);
     if (!es) {
       if (isActive(rec)) {
@@ -432,8 +476,7 @@ export class ExamService {
     }));
     const envs = st.environments ?? [];
     const ready = envs.filter((e) => e.phase === 'Ready' || e.phase === 'Grading').length;
-    const message =
-      rec.phase === 'failed' && !es ? LOST_MESSAGE : (st.message ?? (rec.phase === 'preparing' ? PREPARING_MESSAGE : ''));
+    const message = rec.voided ? VOID_MESSAGE : rec.phase === 'failed' && !es ? LOST_MESSAGE : (st.message ?? (rec.phase === 'preparing' ? PREPARING_MESSAGE : ''));
     return {
       ...this.attemptSummary(rec),
       serverTime: this.now().toISOString(),
@@ -476,12 +519,61 @@ export class ExamService {
     return this.state(next, es);
   }
 
-  async submit(p: Principal, id: string): Promise<ExamAttemptState> {
+  async submit(p: Principal, id: string, ip?: string): Promise<ExamAttemptState> {
     const { rec } = await this.sync(await this.owned(p, id));
     if (rec.phase === 'grading' || rec.phase === 'completed') return this.attempt(p, id);
     if (rec.phase !== 'in-progress') throw new HttpError(409, rec.phase === 'preparing' ? 'The exam has not started yet.' : 'This attempt has ended.');
     await this.cluster.patchExamSession(rec.id, { spec: { submit: true } });
+    const at = this.now().toISOString();
+    await this.store.update(rec.orgId, rec.id, (r) => ({ ...r, submittedAt: r.submittedAt ?? at }), auditOf(p, 'exam.submit', 'exam_attempt', rec.id, { examId: rec.examId, flagged: rec.flagged.length, ...(rec.deadline ? { secondsLeft: Math.max(0, Math.round((Date.parse(rec.deadline) - Date.parse(at)) / 1000)) } : {}) }, ip, rec.examTitle));
     return this.attempt(p, id);
+  }
+
+  /* ---------------------------------------------------- interventions */
+
+  /**
+   * Ends someone's running attempt (session.control on the candidate: an
+   * instructor of their cohort, an org admin). The ExamSession and its
+   * environments are deleted; the attempt is not scored and never counts.
+   * Audited as exam.void.
+   */
+  async void(p: Principal, id: string, reason: string | undefined, ip?: string): Promise<ExamAttemptSummary> {
+    const found = await this.store.get(p.orgId, id);
+    if (!found) throw notFound('Attempt');
+    const subject = await this.teams.subject(p, found.userId);
+    if (!subject) throw notFound('Attempt');
+    authorize(p, 'session.control', subject);
+    const { rec } = await this.sync(found);
+    if (!isActive(rec)) throw new HttpError(409, 'Only a running attempt can be voided.', { code: 'conflict' });
+    await this.cluster.deleteExamSession(rec.id);
+    const at = this.now().toISOString();
+    const why = reason?.trim().slice(0, 500) || undefined;
+    const next = await this.store.update(
+      rec.orgId,
+      rec.id,
+      (r) => ({ ...r, phase: 'failed', completedAt: at, voided: { at, by: p.sub, ...(why ? { reason: why } : {}) } }),
+      auditOf(p, 'exam.void', 'exam_attempt', rec.id, { examId: rec.examId, candidate: rec.userId, phase: rec.phase, ...(why ? { reason: why } : {}) }, ip, `${rec.examTitle} · ${rec.userName}`),
+    );
+    return this.attemptSummary(next);
+  }
+
+  /**
+   * Grants one more attempt that ignores the cooldown and the 30-day cap
+   * (assignment.manage on the candidate: their manager or instructor, an org
+   * admin). Audited as exam.retake_grant.
+   */
+  async grantRetake(p: Principal, examId: string, userId: string, reason: string | undefined, ip?: string): Promise<ExamRetakeGrant> {
+    const ex = this.exam(examId);
+    if (!userId) throw new HttpError(422, 'userId is required', { code: 'invalid' });
+    const subject = await this.teams.subject(p, userId);
+    if (!subject) throw notFound('Member');
+    authorize(p, 'assignment.manage', subject);
+    const why = reason?.trim().slice(0, 500) || undefined;
+    const g = await this.store.addGrant(
+      { orgId: p.orgId, userId, examId, grantedBy: p.sub, ...(why ? { reason: why } : {}) },
+      auditOf(p, 'exam.retake_grant', 'user', userId, { examId, ...(why ? { reason: why } : {}) }, ip, ex.def.title),
+    );
+    return { id: g.id, examId, userId, grantedBy: g.grantedBy, ...(g.reason ? { reason: g.reason } : {}), createdAt: g.createdAt };
   }
 
   async report(p: Principal, id: string): Promise<ExamReport> {
@@ -519,6 +611,7 @@ export class ExamService {
             passed: graded.some((r) => r.passed),
             ...(weakest ? { weakestObjective: { id: weakest.id, ...(weakest.name ? { name: weakest.name } : {}), score: weakest.score } } : {}),
             readiness,
+            ...(mine.find(isActive) ? { activeAttemptId: mine.find(isActive)!.id } : {}),
           };
         });
         const attempted = members.filter((m) => m.lastScore !== undefined);
@@ -532,21 +625,5 @@ export class ExamService {
         };
       }),
     };
-  }
-}
-
-/**
- * Dev/test team directory: managers and admins see a team made of everyone in
- * their org who has an exam attempt, plus themselves. The platform-api
- * adapter replaces it with teams/team_members (scope: managedTeamIds).
- */
-export class AttemptTeamDirectory implements TeamDirectory {
-  constructor(private readonly store: ExamStore & { allUsers?(orgId: string): Promise<{ userId: string; name: string }[]> }) {}
-  async team(p: Principal, teamId?: string) {
-    if (!can(p, 'progress.read.team')) return null;
-    const id = teamId ?? `team-${labelValue(p.team || 'default').toLowerCase()}`;
-    const users = (await this.store.allUsers?.(p.orgId)) ?? [];
-    const members = [{ userId: p.sub, name: p.name }, ...users.filter((u) => u.userId !== p.sub)];
-    return { id, name: p.team || 'My team', members };
   }
 }

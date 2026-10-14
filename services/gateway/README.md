@@ -162,12 +162,28 @@ top of the orchestrator's `ExamTemplate`/`ExamSession`
 | `GET /api/exams/attempts/mine?exam=` | the caller's attempts |
 | `GET /api/exams/team-readiness?team=` | manager view: per exam and member, best/last score, readiness, weakest objective |
 | `GET /api/exams/attempts/:id/terminal?target=` | WebSocket, same protocol as lab terminals; refused once the environment is frozen |
+| `POST /api/exams/attempts/:id/void` | `{reason?}`: ends someone's running attempt (ExamSession deleted, not scored, not counted) |
+| `POST /api/exams/:examId/retake-grants` | `{userId, reason?}` (201): one more attempt past the cooldown / 30-day cap |
 
-Persistence is behind `ExamStore` (`MemoryExamStore` now; Postgres tables in
-`src/exams/schema.sql` for the platform-api migration) and learner-model
-feeding behind `ExamEvidenceSink` (once per graded attempt; the platform-api
-adapter calls `recordRun` per task). The dev team directory
-(`AttemptTeamDirectory`) stands in for teams/team_members.
+Permissions (declared on every route, checked in scope by the service):
+`lab.run` for the learner routes (own attempts only; someone else's attempt is
+404), `progress.read.team` for team readiness (the team must be one the caller
+may read: managed team, or any team for an org admin), `session.control` on
+the candidate for void, `assignment.manage` on the candidate for retake grants.
+Writes need the CSRF header like every other route. `exam.start`,
+`exam.submit`, `exam.void` and `exam.retake_grant` are written to `audit_log`
+in the same transaction as the change.
+
+Persistence (`src/exams/pg.ts`, migration `0003_exams`): `PgExamStore`
+(`exam_attempts`, `exam_task_results`, `exam_retake_grants`, RLS like every
+tenant table; a unique index keeps one running attempt per person and exam, so
+the curriculum retake policy holds under concurrent starts; the attempt row is
+written before the ExamSession and marked failed, uncounted, if the cluster
+refuses it), `PgEvidenceSink` (once per graded attempt: `recordRun` per task
+with session `<attempt>/t<index>`, hints 0, then the lab attempt is closed) and
+`PgTeamDirectory` (`teams`/`team_members`, people as authz targets with their
+teams and cohorts). `MemoryExamStore` and `MemoryEvidenceSink` remain for unit
+tests.
 
 Settings: `CT_CURRICULUM_FILE` (default `content/curriculum.yaml`),
 `CT_EXTRA_EXAM_FILES` (e.g.

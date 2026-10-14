@@ -16,10 +16,9 @@ import { SessionService } from './sessions/service.js';
 import { TerminalHub } from './terminal/hub.js';
 import { loadExamCatalog } from './exams/catalog.js';
 import { LabctlExamCompiler } from './exams/compile.js';
-import { MemoryEvidenceSink } from './exams/evidence.js';
 import { KubeExamCluster } from './exams/kube.js';
-import { AttemptTeamDirectory, ExamService } from './exams/service.js';
-import { MemoryExamStore } from './exams/store.js';
+import { PgEvidenceSink, PgExamStore, PgTeamDirectory } from './exams/pg.js';
+import { ExamService } from './exams/service.js';
 
 async function main() {
   const config = loadConfig();
@@ -64,18 +63,17 @@ async function main() {
   });
   sessions.hooks = platform;
 
-  // Exam simulations. Persistence and learner-model evidence are in-memory
-  // until the platform-api Postgres adapters are wired in (see exams/schema.sql).
+  // Exam simulations: attempts, results and retake grants in Postgres (RLS),
+  // evidence into the learner model, teams from teams/team_members.
   const examCatalog = await loadExamCatalog(content, config.contentDir, config.curriculumFile, config.extraExamFiles);
-  const examStore = new MemoryExamStore();
   const exams = new ExamService(
     examCatalog,
     content,
     new KubeExamCluster(kc, config.namespace),
     new LabctlExamCompiler(config.labctl, [path.join(config.contentDir, 'packs'), ...config.extraLabDirs]),
-    examStore,
-    new MemoryEvidenceSink(),
-    new AttemptTeamDirectory(examStore),
+    new PgExamStore(db),
+    new PgEvidenceSink(db, content),
+    new PgTeamDirectory(db),
     { sessionLabels: config.examSessionLabels, ...(config.examDurationMinutes ? { durationMinutes: config.examDurationMinutes } : {}) },
   );
 
