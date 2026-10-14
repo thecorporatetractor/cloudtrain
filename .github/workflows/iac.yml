@@ -1,0 +1,86 @@
+# Kubernetes/IaC configuration. Blocking: the lab-orchestrator's deployable
+# manifests (kustomize build of services/lab-orchestrator/config/default) must
+# pass kube-linter and Trivy at HIGH+ (accepted operator RBAC in
+# .github/iac/trivyignore.yaml). Report-only SARIF: Trivy and checkov over
+# deploy/ (local dev stack, vendored Multus), the rendered orchestrator
+# manifests and tools/images (lab add-ons, Dockerfiles), kube-linter over deploy/.
+name: iac
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - deploy/**
+      - services/lab-orchestrator/config/**
+      - tools/images/**
+      - .github/iac/**
+      - .github/workflows/iac.yml
+  schedule:
+    - cron: '51 4 * * 1'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  iac:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+      - run: bash .github/scripts/install-tools.sh trivy kube-linter
+      - run: python -m pip install --disable-pip-version-check checkov==3.3.29
+      - name: Render the orchestrator manifests (kustomize)
+        run: |
+          mkdir -p rendered
+          kubectl kustomize services/lab-orchestrator/config/default > rendered/lab-orchestrator.yaml
+      - name: Trivy config (SARIF, report)
+        run: >-
+          trivy config --format sarif --output trivy-config.sarif
+          --skip-dirs content --skip-dirs node_modules .
+      - name: checkov (SARIF, report)
+        run: >-
+          checkov --quiet --compact --soft-fail
+          --framework kubernetes dockerfile github_actions
+          -d deploy -d rendered -d tools/images -d .github
+          --output sarif --output-file-path checkov-out || true
+      - name: kube-linter deploy/ (SARIF, report)
+        run: kube-linter lint deploy --format sarif > kube-linter.sarif || true
+      - uses: github/codeql-action/upload-sarif@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+        if: always() && hashFiles('trivy-config.sarif') != ''
+        with:
+          sarif_file: trivy-config.sarif
+          category: trivy-config
+      - uses: github/codeql-action/upload-sarif@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+        if: always() && hashFiles('checkov-out/results_sarif.sarif') != ''
+        with:
+          sarif_file: checkov-out/results_sarif.sarif
+          category: checkov
+      - uses: github/codeql-action/upload-sarif@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+        if: always() && hashFiles('kube-linter.sarif') != ''
+        with:
+          sarif_file: kube-linter.sarif
+          category: kube-linter
+      - name: Gate - kube-linter on the orchestrator manifests
+        if: always()
+        run: kube-linter lint rendered/lab-orchestrator.yaml
+      - name: Gate - Trivy HIGH/CRITICAL on the orchestrator manifests
+        if: always()
+        run: >-
+          trivy config --severity HIGH,CRITICAL --exit-code 1
+          --ignorefile .github/iac/trivyignore.yaml rendered/lab-orchestrator.yaml
