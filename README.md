@@ -11,6 +11,17 @@
   <img alt="Status: early development" src="https://img.shields.io/badge/status-early%20development-orange">
 </p>
 
+<p align="center">
+  <a href="https://github.com/thecorporatetractor/cloudtrain/actions/workflows/ci.yml"><img alt="ci" src="https://github.com/thecorporatetractor/cloudtrain/actions/workflows/ci.yml/badge.svg?branch=main"></a>
+  <a href="https://github.com/thecorporatetractor/cloudtrain/actions/workflows/codeql.yml"><img alt="CodeQL" src="https://github.com/thecorporatetractor/cloudtrain/actions/workflows/codeql.yml/badge.svg?branch=main"></a>
+  <a href="https://github.com/thecorporatetractor/cloudtrain/actions/workflows/sast.yml"><img alt="SAST" src="https://github.com/thecorporatetractor/cloudtrain/actions/workflows/sast.yml/badge.svg?branch=main"></a>
+  <a href="https://github.com/thecorporatetractor/cloudtrain/actions/workflows/secrets.yml"><img alt="secrets" src="https://github.com/thecorporatetractor/cloudtrain/actions/workflows/secrets.yml/badge.svg?branch=main"></a>
+  <a href="https://github.com/thecorporatetractor/cloudtrain/actions/workflows/deps.yml"><img alt="dependencies" src="https://github.com/thecorporatetractor/cloudtrain/actions/workflows/deps.yml/badge.svg?branch=main"></a>
+  <a href="https://github.com/thecorporatetractor/cloudtrain/actions/workflows/images.yml"><img alt="images" src="https://github.com/thecorporatetractor/cloudtrain/actions/workflows/images.yml/badge.svg?branch=main"></a>
+  <a href="https://github.com/thecorporatetractor/cloudtrain/actions/workflows/dast.yml"><img alt="DAST" src="https://github.com/thecorporatetractor/cloudtrain/actions/workflows/dast.yml/badge.svg?branch=main"></a>
+  <a href="https://scorecard.dev/viewer/?uri=github.com/thecorporatetractor/cloudtrain"><img alt="OpenSSF Scorecard" src="https://api.scorecard.dev/projects/github.com/thecorporatetractor/cloudtrain/badge"></a>
+</p>
+
 ![A CloudTrain lab: task with live checks, topology of real nodes, terminal into the lab](docs/images/workspace.png)
 
 CloudTrain gives every learner their own real environment: kubeadm clusters on
@@ -211,9 +222,21 @@ cd services/lab-orchestrator && go vet ./... && go test ./...
 
 ## Security
 
-Report vulnerabilities privately through GitHub Security Advisories (see
-[SECURITY.md](SECURITY.md) once published). Never open a public issue for a
-vulnerability.
+Every change runs through security pipelines on GitHub Actions
+([details](docs/security-ci.md)):
+- **Static analysis:** CodeQL (JS/TS, Go, Actions), Semgrep, gosec, shellcheck, hadolint, actionlint, zizmor.
+- **Secrets:** gitleaks.
+- **Dependencies:** Dependabot, dependency review with a license gate, govulncheck, osv-scanner.
+- **SBOMs:** syft (CycloneDX, SPDX), submitted to the dependency graph.
+- **Images:** Trivy and Grype scans; signed with cosign; SLSA provenance and SBOM attestations.
+- **Infrastructure as code:** kube-linter, Trivy config, checkov.
+- **Running app:** OWASP ZAP against the web app and gateway.
+- **Other:** OpenSSF Scorecard and nightly Go fuzzing.
+
+All actions are pinned to commit SHAs with least-privilege permissions.
+
+Report vulnerabilities privately through GitHub Security Advisories; see
+[SECURITY.md](SECURITY.md). Never open a public issue for a vulnerability.
 
 ## License
 
