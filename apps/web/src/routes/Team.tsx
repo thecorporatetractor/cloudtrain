@@ -1,279 +1,312 @@
-import { Link } from '@tanstack/react-router';
-import { AlertTriangle, CalendarClock, Check, Users } from 'lucide-react';
-import { useMemo, useState } from 'react';
-import { useSkills, useTeam } from '@/api/client';
-import type { TeamMember, Workshop } from '@/api/types';
-import { RequireRole } from '@/app/access';
-import { useShell } from '@/app/shell-context';
-import { HeatCell } from '@/components/charts';
-import { DomainIcon } from '@/components/domain';
+import { Link, useNavigate } from '@tanstack/react-router';
+import { AlertTriangle, ArrowRight, ClipboardList, Download, GraduationCap, Plus, Users } from 'lucide-react';
+import { useEffect, useState } from 'react';
+import { useMe } from '@/api/client';
+import { downloadCsv, useTeamDashboard } from '@/api/platform';
+import type { AtRiskItem, DashboardMember, TeamDashboard } from '@/api/types';
+import { RequireAccess } from '@/app/access';
 import { initials } from '@/app/Shell';
-import { Badge, Button, Card, ErrorState, PageSkeleton, Stat, Tooltip } from '@/components/ui';
-import { cn, daysUntil, formatDate, formatMinutes, pct } from '@/lib/utils';
+import { useShell } from '@/app/shell-context';
+import { Bar, Columns, HeatCell } from '@/components/charts';
+import { DomainIcon } from '@/components/domain';
+import { AssignmentStateBadge, DueDate, ItemLink, When } from '@/components/platform';
+import { Badge, Button, Card, EmptyState, ErrorState, PageSkeleton, Select, Stat, Tooltip } from '@/components/ui';
+import { cn, formatMinutes, pct } from '@/lib/utils';
+import { teamRoute } from '@/router';
 
 export function Team() {
   return (
-    <RequireRole path="/team">
+    <RequireAccess path="/team">
       <TeamScreen />
-    </RequireRole>
+    </RequireAccess>
   );
 }
 
+/** Picks the team from the URL, falling back to the first team the principal may view. */
+export function useSelectedTeam(team: string | undefined) {
+  const me = useMe();
+  const teams = me.data?.managedTeams ?? [];
+  const selected = team && teams.some((t) => t.id === team) ? team : teams[0]?.id;
+  return { teams, selected, me: me.data };
+}
+
 function TeamScreen() {
-  const team = useTeam();
-  const skills = useSkills();
+  const search = teamRoute.useSearch();
+  const navigate = useNavigate({ from: teamRoute.fullPath });
+  const { teams, selected } = useSelectedTeam(search.team);
+  const dash = useTeamDashboard(selected);
   const { toast } = useShell();
-  // Workshop actions are mock-only until the scheduling service exists: they update local state.
-  const [dismissed, setDismissed] = useState<Set<string>>(() => new Set());
-  const [scheduled, setScheduled] = useState<Map<string, string>>(() => new Map());
+  const [exporting, setExporting] = useState(false);
 
-  const stats = useMemo(() => {
-    if (!team.data) return null;
-    const { members, competencies } = team.data;
-    const all = members.flatMap((m) => competencies.map((c) => m.skills[c.id] ?? 0));
-    const avg = all.reduce((a, b) => a + b, 0) / all.length;
-    const certs = members.flatMap((m) => m.certs.map((c) => ({ ...c, member: m })));
-    const atRisk = certs.filter((c) => new Date(c.forecast) > new Date(c.deadline));
-    const minutes = members.reduce((a, m) => a + m.minutesThisMonth, 0);
-    const weakest = competencies
-      .map((c) => ({ c, mean: members.reduce((a, m) => a + (m.skills[c.id] ?? 0), 0) / members.length }))
-      .sort((a, b) => a.mean - b.mean)[0];
-    return { avg, certs: certs.sort((a, b) => new Date(a.deadline).getTime() - new Date(b.deadline).getTime()), atRisk, minutes, weakest };
-  }, [team.data]);
+  // Keep the URL in sync with the chosen team so links from this page carry it.
+  useEffect(() => {
+    if (selected && search.team !== selected) void navigate({ search: { team: selected }, replace: true });
+  }, [selected, search.team, navigate]);
 
-  if (team.isPending) {
+  if (dash.isPending || !selected) {
     return (
       <div className="page page-wide">
         <PageSkeleton />
       </div>
     );
   }
-  if (team.isError || !stats) {
+  if (dash.isError) {
     return (
       <div className="page">
-        <ErrorState error={team.error} onRetry={() => void team.refetch()} />
+        <ErrorState error={dash.error} onRetry={() => void dash.refetch()} />
       </div>
     );
   }
-  const { team: t, members, competencies, workshops } = team.data;
-  const frameworkName = (id: string) => skills.data?.frameworks.find((f) => f.id === id)?.name ?? id.toUpperCase();
-  const visibleWorkshops = workshops.filter((w) => !dismissed.has(w.id));
+  const d = dash.data;
 
-  const schedule = (w: Workshop) => {
-    const when = new Date(Date.now() + 7 * 86_400_000);
-    setScheduled((m) => new Map(m).set(w.id, when.toISOString()));
-    toast({ title: 'Workshop scheduled', description: `${w.title} · ${formatDate(when.toISOString())} · ${w.memberIds.length} invited`, tone: 'ok' });
-  };
-  const dismiss = (w: Workshop) => {
-    setDismissed((s) => new Set(s).add(w.id));
-    toast({ title: 'Suggestion dismissed', description: 'It will come back if the gap persists next week.', tone: 'neutral' });
+  const exportCsv = async () => {
+    setExporting(true);
+    try {
+      await downloadCsv(`/api/reports/progress.csv?team=${encodeURIComponent(d.team.id)}`, `${d.team.name.replace(/\s+/g, '-').toLowerCase()}-progress.csv`);
+      toast({ title: 'Export ready', description: 'The progress report downloaded as CSV; the export is in the audit log.', tone: 'ok' });
+    } catch (e) {
+      toast({ title: 'Export failed', description: (e as Error).message, tone: 'err' });
+    } finally {
+      setExporting(false);
+    }
   };
 
   return (
     <div className="page page-wide">
       <header className="page-header">
         <div>
-          <div className="page-eyebrow">Team</div>
-          <h1>{t.name}</h1>
+          <div className="page-eyebrow">Team dashboard</div>
+          <div className="row" style={{ gap: 12 }}>
+            {teams.length > 1 ? (
+              <Select aria-label="Team" value={d.team.id} onChange={(e) => void navigate({ search: { team: e.target.value } })} className="select-title">
+                {teams.map((t) => (
+                  <option key={t.id} value={t.id}>
+                    {t.name}
+                  </option>
+                ))}
+              </Select>
+            ) : (
+              <h1>{d.team.name}</h1>
+            )}
+          </div>
           <p className="muted">
-            {members.length} members · managed by {t.manager}
+            {d.totals.members} members · {d.totals.activeThisWeek} active this week · managed by {d.team.managers.map((m) => m.name).join(', ') || 'nobody yet'}
           </p>
         </div>
-        <div className="row" style={{ gap: 28 }}>
-          <Stat label="Mean mastery" value={pct(stats.avg)} hint={`weakest: ${stats.weakest?.c.name ?? '—'}`} />
-          <Stat label="At-risk certs" value={stats.atRisk.length} tone={stats.atRisk.length ? 'warn' : undefined} hint={`${stats.certs.length} scheduled`} />
-          <Stat label="This month" value={formatMinutes(stats.minutes)} hint="hands-on time" />
+        <div className="row" style={{ gap: 8 }}>
+          <Button variant="secondary" icon={<Download size={14} />} loading={exporting} onClick={() => void exportCsv()}>
+            Export CSV
+          </Button>
+          <Link to="/team/exams" search={{ team: d.team.id }} className="btn btn-secondary btn-md">
+            <GraduationCap size={14} /> Exams
+          </Link>
+          <Link to="/team/assignments" search={{ team: d.team.id }} className="btn btn-secondary btn-md">
+            <ClipboardList size={14} /> Assignments
+          </Link>
+          <Link to="/team/assign" search={{ team: d.team.id }} className="btn btn-primary btn-md">
+            <Plus size={14} /> Assign
+          </Link>
         </div>
       </header>
 
-      <Card className="card-flush" style={{ marginBottom: 20 }}>
-        <div className="card-head">
-          <h2>Team × competency</h2>
-          <span className="subtle xs">Mean mastery per competency; click a name to open their skills</span>
-        </div>
-        <div className="team-heat-wrap">
-          <table className="team-heat">
-            <thead>
-              <tr>
-                <th scope="col" className="team-heat-corner">
-                  <span className="sr-only">Member</span>
-                </th>
-                {competencies.map((c) => (
-                  <th key={c.id} scope="col">
-                    <Tooltip content={`${c.name} · ${c.domain}`} side="top">
-                      <span className="team-heat-col" lang="en">
-                        <DomainIcon domain={c.domain} size={11} />
-                        <span className="truncate">{c.name}</span>
-                      </span>
-                    </Tooltip>
-                  </th>
-                ))}
-              </tr>
-            </thead>
-            <tbody>
-              {members.map((m) => (
-                <tr key={m.id}>
-                  <th scope="row">
-                    <MemberCell m={m} />
-                  </th>
-                  {competencies.map((c) => {
-                    const v = m.skills[c.id] ?? 0;
-                    return (
-                      <td key={c.id}>
-                        <HeatCell value={v} className="team-heat-cell" title={`${m.name} · ${c.name} · ${pct(v)}`} aria-label={`${m.name}, ${c.name}: ${pct(v)}`}>
-                          <span className="tnum">{Math.round(v * 100)}</span>
-                        </HeatCell>
-                      </td>
-                    );
-                  })}
-                </tr>
-              ))}
-              <tr className="team-heat-mean">
-                <th scope="row" className="xs subtle" style={{ textAlign: 'left', paddingLeft: 12 }}>
-                  Team mean
-                </th>
-                {competencies.map((c) => {
-                  const mean = members.reduce((a, m) => a + (m.skills[c.id] ?? 0), 0) / members.length;
-                  return (
-                    <td key={c.id} className={cn('xs tnum', mean < 0.4 && 'text-warn')} style={{ textAlign: 'center' }}>
-                      {Math.round(mean * 100)}
-                    </td>
-                  );
-                })}
-              </tr>
-            </tbody>
-          </table>
-        </div>
-      </Card>
-
-      <div className="grid-2" style={{ gridTemplateColumns: 'minmax(0, 5fr) minmax(0, 7fr)', gap: 20 }}>
-        <Card className="card-flush">
-          <div className="card-head">
-            <h2>Certification deadlines</h2>
-            <span className="subtle xs">forecast vs booked date</span>
+      {d.source === 'empty' ? (
+        <EmptyState icon={<Users size={20} />} title="No activity in this team yet" description="The heatmap fills in as members complete labs. Assign a path to get them started." action={<Link to="/team/assign" search={{ team: d.team.id }} className="btn btn-primary btn-md">Assign a path</Link>} />
+      ) : (
+        <>
+          <div className="stat-row" style={{ marginBottom: 20 }}>
+            <Stat label="Hands-on this month" value={formatMinutes(d.totals.minutesThisMonth)} hint={`${d.minutesByWeek.at(-1)?.minutes ?? 0} min this week`} />
+            <Stat label="Completion" value={pct(d.totals.completionRate)} hint="of assigned work" />
+            <Stat label="Overdue" value={d.totals.assignmentsOverdue} tone={d.totals.assignmentsOverdue ? 'warn' : undefined} hint="assignments" />
+            <Stat label="At risk" value={d.atRisk.length} tone={d.atRisk.length ? 'warn' : undefined} hint="people × items" />
+            <Stat label="Members" value={d.totals.members} hint={`${d.members.filter((m) => m.role === 'manager').length} managers`} />
           </div>
-          <ul className="cert-list">
-            {stats.certs.map((c) => {
-              const late = new Date(c.forecast) > new Date(c.deadline);
-              const days = daysUntil(c.deadline);
-              const slipDays = Math.round((new Date(c.forecast).getTime() - new Date(c.deadline).getTime()) / 86_400_000);
-              return (
-                <li key={`${c.member.id}-${c.frameworkId}`} className="cert-row">
-                  <span className="avatar" aria-hidden>
-                    {initials(c.member.name)}
-                  </span>
-                  <span className="stack grow" style={{ gap: 2, minWidth: 0 }}>
-                    <span className="row small" style={{ gap: 8 }}>
-                      <span className="truncate" style={{ fontWeight: 500 }}>
-                        {c.member.name}
-                      </span>
-                      <Badge tone="outline">{frameworkName(c.frameworkId)}</Badge>
-                    </span>
-                    <span className="xs subtle row" style={{ gap: 6 }}>
-                      <CalendarClock size={11} /> {formatDate(c.deadline)} · {days} days · ready {pct(c.readiness)}
-                    </span>
-                  </span>
-                  {late ? (
-                    <Badge tone="warn">
-                      <AlertTriangle size={10} /> {slipDays}d late
-                    </Badge>
-                  ) : (
-                    <Badge tone="ok">{-slipDays}d margin</Badge>
-                  )}
-                </li>
-              );
-            })}
-          </ul>
-        </Card>
 
-        <Card className="card-flush">
-          <div className="card-head">
-            <h2>Suggested workshops</h2>
-            <span className="subtle xs">generated from gaps × deadlines</span>
-          </div>
-          {visibleWorkshops.length === 0 ? (
-            <p className="small muted" style={{ padding: '16px 20px' }}>
-              Nothing suggested right now. Suggestions return when a gap and a deadline line up.
-            </p>
-          ) : (
-            <ul className="workshop-list">
-              {visibleWorkshops.map((w) => {
-                const comp = competencies.find((c) => c.id === w.competencyId);
-                const bookedAt = scheduled.get(w.id);
-                return (
-                  <li key={w.id} className="workshop">
-                    <div className="row-between" style={{ alignItems: 'flex-start' }}>
-                      <div className="stack" style={{ gap: 3 }}>
-                        <h3>{w.title}</h3>
-                        <div className="xs subtle row" style={{ gap: 8 }}>
-                          {comp && (
-                            <span className="row" style={{ gap: 4 }}>
-                              <DomainIcon domain={comp.domain} size={11} /> {comp.name}
-                            </span>
-                          )}
-                          <span>{formatMinutes(w.durationMinutes)}</span>
-                          <span className="row" style={{ gap: 4 }}>
-                            <Users size={11} /> {w.memberIds.length}
+          <Heatmap d={d} />
+
+          <div className="grid-2" style={{ gridTemplateColumns: 'minmax(0, 5fr) minmax(0, 7fr)', gap: 20, marginTop: 20 }}>
+            <div className="stack" style={{ gap: 20 }}>
+              <Card className="card-flush">
+                <div className="card-head">
+                  <h2>Framework readiness</h2>
+                  <span className="subtle xs">team mean · members ≥ 70%</span>
+                </div>
+                <ul className="domain-readiness" style={{ padding: '14px 20px 16px' }}>
+                  {d.frameworks.map((f) => (
+                    <li key={f.frameworkId} className="stack" style={{ gap: 5 }}>
+                      <div className="row-between small">
+                        <span>
+                          {f.name}
+                          <span className="subtle xs">
+                            {' '}
+                            · {f.ready} of {f.members} ready
                           </span>
-                        </div>
+                        </span>
+                        <span className="tnum">{pct(f.readiness)}</span>
                       </div>
-                      <div className="avatar-stack" aria-label={`${w.memberIds.length} attendees`}>
-                        {w.memberIds.slice(0, 5).map((id) => {
-                          const m = members.find((x) => x.id === id);
-                          return (
-                            <span key={id} className="avatar" title={m?.name}>
-                              {initials(m?.name ?? '')}
-                            </span>
-                          );
-                        })}
-                      </div>
-                    </div>
-                    <p className="small muted" style={{ marginTop: 8 }}>
-                      {w.reason}
-                    </p>
-                    <div className="row" style={{ gap: 8, marginTop: 10 }}>
-                      {bookedAt ? (
-                        <Badge tone="ok">
-                          <Check size={10} /> Scheduled for {formatDate(bookedAt)}
-                        </Badge>
-                      ) : (
-                        <>
-                          <Button variant="secondary" size="sm" onClick={() => schedule(w)}>
-                            Schedule
-                          </Button>
-                          <Button variant="ghost" size="sm" onClick={() => dismiss(w)}>
-                            Dismiss
-                          </Button>
-                        </>
-                      )}
-                    </div>
-                  </li>
-                );
-              })}
-            </ul>
-          )}
-        </Card>
-      </div>
+                      <Bar value={f.readiness} tone={f.readiness < 0.45 ? 'neutral' : 'accent'} thin />
+                    </li>
+                  ))}
+                </ul>
+              </Card>
+              <Card className="card-flush">
+                <div className="card-head">
+                  <h2>Lab minutes</h2>
+                  <span className="subtle xs">per week, last 8 weeks</span>
+                </div>
+                <div style={{ padding: '14px 20px 16px' }}>
+                  <Columns values={d.minutesByWeek.map((w) => ({ label: w.weekStart.slice(5), value: w.minutes }))} height={120} format={(v) => formatMinutes(v)} />
+                </div>
+              </Card>
+            </div>
+
+            <Card className="card-flush">
+              <div className="card-head">
+                <h2>At risk</h2>
+                <span className="subtle xs">overdue, due soon and untouched, or stalled required work</span>
+              </div>
+              {d.atRisk.length === 0 ? (
+                <p className="small muted" style={{ padding: '16px 20px' }}>
+                  Nobody is behind. Deadlines inside three days with no progress will show up here.
+                </p>
+              ) : (
+                <ul className="risk-list">
+                  {d.atRisk.map((r) => (
+                    <RiskRow key={`${r.user.id}-${r.assignmentId}`} r={r} teamId={d.team.id} />
+                  ))}
+                </ul>
+              )}
+            </Card>
+          </div>
+        </>
+      )}
     </div>
   );
 }
 
-const roundHours = (minutes: number) => `${Math.round(minutes / 60)}h`;
+const riskReason: Record<AtRiskItem['reason'], string> = { overdue: 'Overdue', due_soon_not_started: 'Due soon, not started', stalled: 'Stalled' };
 
-function MemberCell({ m }: { m: TeamMember }) {
+function RiskRow({ r, teamId }: { r: AtRiskItem; teamId: string }) {
   return (
-    <Link to="/skills" search={{ framework: m.certs[0]?.frameworkId ?? 'cks', member: m.id }} className="member-cell" title={`${m.name} · ${m.title} · ${formatMinutes(m.minutesThisMonth)} this month`}>
+    <li className="risk-row">
+      <Link to="/team/members/$userId" params={{ userId: r.user.id }} search={{ team: teamId }} className="member-cell" style={{ minWidth: 0 }}>
+        <span className="avatar" aria-hidden>
+          {initials(r.user.name)}
+        </span>
+        <span className="stack" style={{ gap: 0, minWidth: 0 }}>
+          <span className="small truncate" style={{ fontWeight: 500 }}>
+            {r.user.name}
+          </span>
+          <span className="xs subtle truncate">{r.user.title}</span>
+        </span>
+      </Link>
+      <span className="stack grow" style={{ gap: 2, minWidth: 0 }}>
+        <ItemLink item={r.item} className="small truncate link-strong" />
+        <DueDate dueAt={r.dueAt} />
+      </span>
+      <Badge tone={r.reason === 'overdue' ? 'warn' : 'neutral'}>
+        {r.reason === 'overdue' && <AlertTriangle size={10} />} {riskReason[r.reason]}
+      </Badge>
+    </li>
+  );
+}
+
+function Heatmap({ d }: { d: TeamDashboard }) {
+  const { members, competencies } = d;
+  const mean = (cid: string) => {
+    const vals = members.map((m) => m.mastery[cid]).filter((v): v is number => typeof v === 'number');
+    return vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : null;
+  };
+  return (
+    <Card className="card-flush">
+      <div className="card-head">
+        <h2>Members × competencies</h2>
+        <span className="subtle xs">Mean mastery per competency; open a member for skills, attempts and assignments</span>
+      </div>
+      <div className="team-heat-wrap">
+        <table className="team-heat">
+          <thead>
+            <tr>
+              <th scope="col" className="team-heat-corner">
+                <span className="sr-only">Member</span>
+              </th>
+              {competencies.map((c) => (
+                <th key={c.id} scope="col">
+                  <Tooltip content={`${c.name} · ${c.domain}`} side="top">
+                    <span className="team-heat-col" lang="en">
+                      <DomainIcon domain={c.domain} size={11} />
+                      <span className="truncate">{c.name}</span>
+                    </span>
+                  </Tooltip>
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {members.map((m) => (
+              <tr key={m.user.id}>
+                <th scope="row">
+                  <MemberCell m={m} teamId={d.team.id} />
+                </th>
+                {competencies.map((c) => {
+                  const v = m.mastery[c.id];
+                  return (
+                    <td key={c.id}>
+                      {typeof v === 'number' ? (
+                        <HeatCell value={v} className="team-heat-cell" title={`${m.user.name} · ${c.name} · ${pct(v)}`} aria-label={`${m.user.name}, ${c.name}: ${pct(v)}`}>
+                          <span className="tnum">{Math.round(v * 100)}</span>
+                        </HeatCell>
+                      ) : (
+                        <div className="team-heat-cell team-heat-empty" title={`${m.user.name} · ${c.name} · no evidence`} aria-label={`${m.user.name}, ${c.name}: no evidence`}>
+                          ·
+                        </div>
+                      )}
+                    </td>
+                  );
+                })}
+              </tr>
+            ))}
+            <tr className="team-heat-mean">
+              <th scope="row" className="xs subtle" style={{ textAlign: 'left', paddingLeft: 12 }}>
+                Team mean
+              </th>
+              {competencies.map((c) => {
+                const v = mean(c.id);
+                return (
+                  <td key={c.id} className={cn('xs tnum', v !== null && v < 0.4 && 'text-warn')} style={{ textAlign: 'center' }}>
+                    {v === null ? '—' : Math.round(v * 100)}
+                  </td>
+                );
+              })}
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </Card>
+  );
+}
+
+function MemberCell({ m, teamId }: { m: DashboardMember; teamId: string }) {
+  return (
+    <Link to="/team/members/$userId" params={{ userId: m.user.id }} search={{ team: teamId }} className="member-cell" title={`${m.user.name} · ${m.user.title ?? ''} · ${formatMinutes(m.minutesThisMonth)} this month`}>
       <span className="avatar" aria-hidden>
-        {initials(m.name)}
+        {initials(m.user.name)}
       </span>
       <span className="stack" style={{ gap: 0, minWidth: 0 }}>
-        <span className="small truncate" style={{ fontWeight: 500 }}>
-          {m.name}
+        <span className="small truncate row" style={{ fontWeight: 500, gap: 6 }}>
+          {m.user.name}
+          {m.atRisk && (
+            <span title="At risk" className="text-warn" aria-label="at risk">
+              <AlertTriangle size={11} />
+            </span>
+          )}
         </span>
         <span className="xs subtle truncate">
-          {m.title} · {roundHours(m.minutesThisMonth)}
+          {m.user.title} · {Math.round(m.minutesThisMonth / 60)}h · active <When iso={m.lastActiveAt} />
         </span>
       </span>
+      <ArrowRight size={12} className="subtle member-cell-arrow" />
     </Link>
   );
 }
+
+export { AssignmentStateBadge };

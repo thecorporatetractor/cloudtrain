@@ -4,7 +4,7 @@ import { Check, ChevronDown, ChevronLeft, CircleDashed, Loader2, Minus, Rocket, 
 import type { ReactNode } from 'react';
 import { useDraft, useDraftAction } from '@/api/client';
 import type { GateStatus, VerificationGate } from '@/api/types';
-import { RequireRole } from '@/app/access';
+import { RequireAccess } from '@/app/access';
 import { useShell } from '@/app/shell-context';
 import { DifficultyBadge, DomainIcon, DriverIcon, SkillTags, domainLabel } from '@/components/domain';
 import { Prose } from '@/components/prose';
@@ -16,9 +16,9 @@ import { STAGES } from './Studio';
 
 export function StudioDraft() {
   return (
-    <RequireRole path="/studio">
+    <RequireAccess path="/studio">
       <StudioDraftScreen />
-    </RequireRole>
+    </RequireAccess>
   );
 }
 

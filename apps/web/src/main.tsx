@@ -10,6 +10,7 @@ import './styles/components.css';
 import './styles/shell.css';
 import './styles/pages.css';
 import './styles/workspace.css';
+import './styles/platform.css';
 import { router } from './router';
 import { API_MODE } from './api/mode';
 import { ThemeProvider } from './lib/theme';
@@ -23,7 +24,7 @@ const queryClient = new QueryClient({
 
 async function boot() {
   if (API_MODE === 'real') {
-    // The gateway serves everything except Team and Studio, which stay sample data.
+    // The gateway serves everything except Scenario Studio, which stays sample data.
     const { startMocks } = await import('./mocks/browser');
     await startMocks({ sampleOnly: true });
   } else if (import.meta.env.DEV || import.meta.env.VITE_MOCK_API === '1') {

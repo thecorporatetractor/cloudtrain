@@ -3,7 +3,7 @@ import { ArrowRight, CircleDashed, Sparkles, WandSparkles } from 'lucide-react';
 import { useState } from 'react';
 import { useCreateDraft, useDrafts } from '@/api/client';
 import type { StudioDraft } from '@/api/types';
-import { RequireRole } from '@/app/access';
+import { RequireAccess } from '@/app/access';
 import { DomainIcon } from '@/components/domain';
 import { Badge, Button, Card, EmptyState, ErrorState, PageSkeleton } from '@/components/ui';
 import { cn, relativeTime } from '@/lib/utils';
@@ -25,9 +25,9 @@ const EXAMPLES = [
 
 export function Studio() {
   return (
-    <RequireRole path="/studio">
+    <RequireAccess path="/studio">
       <StudioScreen />
-    </RequireRole>
+    </RequireAccess>
   );
 }
 

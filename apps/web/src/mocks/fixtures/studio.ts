@@ -128,11 +128,11 @@ export const drafts: StudioDraft[] = [
   {
     id: 'draft-registry-mirror',
     title: 'Pin workloads to a signed internal registry mirror',
-    prompt: 'A CKS supply-chain lab: learners must configure an ImagePolicyWebhook (or a ValidatingAdmissionPolicy) on the meadow cluster so only images from registry.tessera.internal signed with the platform cosign key are admitted. Include a misconception where they allow by tag instead of digest.',
+    prompt: 'A CKS supply-chain lab: learners must configure an ImagePolicyWebhook (or a ValidatingAdmissionPolicy) on the meadow cluster so only images from registry.quillmoor.internal signed with the platform cosign key are admitted. Include a misconception where they allow by tag instead of digest.',
     createdAt: new Date(Date.now() - 26 * 3600000).toISOString(),
     author: 'Aino Lehto',
     stage: 'verify',
-    spec: specFromPrompt('Pin workloads to a signed internal registry mirror. Learners configure an ImagePolicyWebhook (or ValidatingAdmissionPolicy) on the meadow cluster so only images from registry.tessera.internal signed with the platform cosign key are admitted. Hard.', 'meadow-signed-registry'),
+    spec: specFromPrompt('Pin workloads to a signed internal registry mirror. Learners configure an ImagePolicyWebhook (or ValidatingAdmissionPolicy) on the meadow cluster so only images from registry.quillmoor.internal signed with the platform cosign key are admitted. Hard.', 'meadow-signed-registry'),
     gates: gatesFor([
       ['passed', 52, [{ label: 'second run: 0 changes', status: 'passed' }]],
       ['passed', 40, [{ label: '4 / 4 checks fail before solution', status: 'passed' }]],
