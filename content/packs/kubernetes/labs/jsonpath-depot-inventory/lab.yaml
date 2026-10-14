@@ -1,0 +1,247 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: jsonpath-depot-inventory
+  title: Extract an inventory with jsonpath and custom columns
+  domain: kubernetes
+  frameworks: [cka:troubleshooting, ckad:observability-maintenance]
+  difficulty: medium
+  estimatedMinutes: 12
+  tags: [kubectl, jsonpath, custom-columns, output]
+  version: 1
+spec:
+  description: |
+    Quillmoor's depot auditor wants to know which images run where. Their
+    import script is strict about the format, so the file must match it
+    exactly.
+
+    Use context `qm-depot`:
+
+    ```bash
+    kubectl config use-context qm-depot
+    ```
+
+    Write **`/home/learner/reports/depot-inventory.txt`** listing every Pod in
+    namespace **`depot-ops`**, one line per Pod:
+
+    ```text
+    <pod name> <node name> <image>[,<image>...]
+    ```
+
+    - fields separated by **one space**, no header line;
+    - images of the Pod's **app containers** (`spec.containers`) in the order
+      they are declared, joined by a comma without spaces; init containers are
+      not listed;
+    - lines sorted by Pod name.
+
+    Example line: `gate-cam-0 node-a httpd:2.4-alpine,busybox:1.37`
+
+    Build the file with `kubectl` output options (`-o jsonpath`,
+    `-o custom-columns`, `--sort-by`) and, if you need them, standard text
+    tools. Do not change anything in the cluster.
+  objectives:
+    - Read fields with -o jsonpath, including nested ranges
+    - Use -o custom-columns with --no-headers
+    - Shape output into an exact format
+  params:
+    scanner:
+      type: choice
+      values: [dock-scanner, bay-scanner, gate-scanner]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-depot
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: qm-depot
+  setup:
+    - on: qm-depot
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: depot-ops}
+        ---
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: depot-archive}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: parcel-router, namespace: depot-ops}
+        spec:
+          replicas: 2
+          selector: {matchLabels: {app: parcel-router}}
+          template:
+            metadata: {labels: {app: parcel-router}}
+            spec:
+              containers:
+                - {name: router, image: "caddy:2-alpine"}
+                - {name: stats, image: "busybox:1.37", command: ["sleep", "1d"]}
+        ---
+        apiVersion: v1
+        kind: Pod
+        metadata: {name: "{{scanner}}", namespace: depot-ops, labels: {app: scanner}}
+        spec:
+          initContainers:
+            - {name: calibrate, image: "busybox:1.37", command: ["true"]}
+          containers:
+            - {name: scanner, image: "httpd:2.4-alpine"}
+        ---
+        apiVersion: v1
+        kind: Pod
+        metadata: {name: label-cache, namespace: depot-ops, labels: {app: label-cache}}
+        spec:
+          containers:
+            - {name: cache, image: "redis:7.4-alpine"}
+            - {name: exporter, image: "busybox:1.37", command: ["sleep", "1d"]}
+            - {name: web, image: "httpd:2.4-alpine"}
+        ---
+        apiVersion: v1
+        kind: Pod
+        metadata: {name: old-manifests, namespace: depot-archive, labels: {app: old-manifests}}
+        spec:
+          containers:
+            - {name: archive, image: "busybox:1.37", command: ["sleep", "1d"]}
+    - on: qm-depot
+      timeoutSec: 150
+      run: |
+        kubectl -n depot-ops rollout status deploy/parcel-router --timeout=120s
+        kubectl -n depot-ops wait pod/{{scanner}} pod/label-cache --for=condition=Ready --timeout=120s
+        kubectl -n depot-archive wait pod/old-manifests --for=condition=Ready --timeout=120s
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/reports
+  teardown:
+    - on: qm-depot
+      run: kubectl delete namespace depot-ops depot-archive --ignore-not-found --wait=false
+  checks:
+    - id: report-exact
+      description: The inventory file matches the requested format and content exactly
+      type: shell
+      on: workstation
+      skills: [k8s.cli.output-formatting]
+      weight: 3
+      command: |
+        f=/home/learner/reports/depot-inventory.txt
+        [ -f "$f" ] || { echo "no report"; exit 0; }
+        exp=$(kubectl --kubeconfig /home/learner/.kube/config --context qm-depot -n depot-ops get pods -o json \
+          | jq -r '.items | sort_by(.metadata.name)[] | "\(.metadata.name) \(.spec.nodeName) \([.spec.containers[].image] | join(","))"')
+        got=$(tr -d '\r' < "$f" | sed -e :a -e '/^\n*$/{$d;N;ba' -e '}')
+        if [ "$(echo "$exp" | wc -l)" -ge 4 ] && [ "$exp" = "$got" ]; then echo ok; else printf 'mismatch\nexpected:\n%s\ngot:\n%s\n' "$exp" "$got"; fi
+      expect: {match: exact, value: ok}
+    - id: one-line-per-pod
+      description: The file has exactly one line per depot-ops Pod (no header, no other namespaces)
+      type: shell
+      on: workstation
+      skills: [k8s.cli.output-formatting]
+      command: |
+        f=/home/learner/reports/depot-inventory.txt
+        [ -f "$f" ] || { echo "no report"; exit 0; }
+        n=$(kubectl --kubeconfig /home/learner/.kube/config --context qm-depot -n depot-ops get pods --no-headers | wc -l)
+        [ "$(grep -c . "$f")" = "$n" ] && echo ok || echo "line count differs"
+      expect: {match: exact, value: ok}
+    - id: cluster-unchanged
+      description: Nothing in the cluster was changed (4 Pods in depot-ops, 1 in depot-archive)
+      type: shell
+      on: qm-depot
+      skills: [k8s.cli.scoped-changes]
+      weight: 0.5
+      command: echo "$(kubectl -n depot-ops get pods --no-headers | wc -l) $(kubectl -n depot-archive get pods --no-headers | wc -l)"
+      expect: {match: exact, value: "4 1"}
+  hints:
+    - title: Switch context
+      body: The depot workloads run in qm-depot.
+      command: kubectl config use-context qm-depot
+      cost: 0
+    - title: Start from the raw fields
+      body: Look at one Pod as JSON to find where the node name and images live.
+      command: kubectl -n depot-ops get pod label-cache -o json | jq '.spec.nodeName, [.spec.containers[].image]'
+      cost: 1
+    - title: custom-columns joins lists for you
+      body: |
+        A custom column over `.spec.containers[*].image` prints the images
+        comma-separated. `--no-headers` drops the header; the columns are padded
+        with spaces, which `awk` can squeeze.
+      command: kubectl -n depot-ops get pods --no-headers -o custom-columns=N:.metadata.name,NODE:.spec.nodeName,I:.spec.containers[*].image
+      cost: 2
+    - title: Or nest ranges in jsonpath
+      body: An inner `{range}` over the containers prints a separator after every image; strip the last one with sed.
+      command: |
+        kubectl -n depot-ops get pods -o jsonpath='{range .items[*]}{.metadata.name} {.spec.nodeName} {range .spec.containers[*]}{.image},{end}{"\n"}{end}' | sed 's/,$//'
+      cost: 3
+  misconceptions:
+    - id: header-line
+      description: Keeps the custom-columns header line.
+      feedback: The import script reads every line as a Pod. Use `--no-headers`.
+      expectFail: [report-exact, one-line-per-pod]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n depot-ops get pods -o custom-columns=NAME:.metadata.name,NODE:.spec.nodeName,IMAGES:.spec.containers[*].image \
+            | awk '{print $1, $2, $3}' > /home/learner/reports/depot-inventory.txt
+    - id: all-namespaces
+      description: Lists Pods of every namespace instead of depot-ops only.
+      feedback: "`-A` widens the query to all namespaces. The auditor asked for depot-ops."
+      expectFail: [report-exact, one-line-per-pod]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-depot
+          kubectl get pods -A --no-headers -o custom-columns=N:.metadata.name,NODE:.spec.nodeName,I:.spec.containers[*].image \
+            | awk '{print $1, $2, $3}' | sort > /home/learner/reports/depot-inventory.txt
+    - id: space-separated-images
+      description: Prints `{.spec.containers[*].image}` directly, which separates images with spaces.
+      feedback: A jsonpath wildcard prints list items separated by spaces. Nest a range with your own separator, or use custom-columns.
+      expectFail: [report-exact]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n depot-ops get pods -o jsonpath='{range .items[*]}{.metadata.name} {.spec.nodeName} {.spec.containers[*].image}{"\n"}{end}' \
+            > /home/learner/reports/depot-inventory.txt
+    - id: init-images-included
+      description: Includes the init container images as well.
+      feedback: Init containers are in `spec.initContainers`; the auditor wants app containers only.
+      expectFail: [report-exact]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n depot-ops get pods -o json \
+            | jq -r '.items | sort_by(.metadata.name)[] | "\(.metadata.name) \(.spec.nodeName) \([(.spec.initContainers // [])[].image, .spec.containers[].image] | join(","))"' \
+            > /home/learner/reports/depot-inventory.txt
+  solution:
+    explanation: |
+      `custom-columns` over `.spec.containers[*].image` joins the images with
+      commas; `--no-headers` drops the header and `awk` collapses the column
+      padding to single spaces. `kubectl get` already returns Pods sorted by
+      name within a namespace, and `--sort-by` makes that explicit.
+    steps:
+      - on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n depot-ops get pods --sort-by=.metadata.name --no-headers \
+            -o custom-columns=NAME:.metadata.name,NODE:.spec.nodeName,IMAGES:.spec.containers[*].image \
+            | awk '{print $1, $2, $3}' > /home/learner/reports/depot-inventory.txt
+    alternatives:
+      - id: nested-jsonpath
+        description: A nested jsonpath range with a trailing separator removed by sed, then sort.
+        steps:
+          - on: workstation
+            as: learner
+            run: |
+              kubectl config use-context qm-depot
+              kubectl -n depot-ops get pods \
+                -o jsonpath='{range .items[*]}{.metadata.name} {.spec.nodeName} {range .spec.containers[*]}{.image},{end}{"\n"}{end}' \
+                | sed 's/,$//' | sort > /home/learner/reports/depot-inventory.txt

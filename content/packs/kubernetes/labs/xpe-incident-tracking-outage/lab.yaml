@@ -1,0 +1,186 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xpe-incident-tracking-outage
+  title: Restore the tracking service and write the timeline
+  domain: kubernetes
+  frameworks: [ct-platform:incident-response]
+  difficulty: hard
+  estimatedMinutes: 30
+  tags: [exam, incident, ingress, troubleshooting]
+  version: 1
+spec:
+  description: |
+    **Context:** `qm-harbour` (`kubectl config use-context qm-harbour`)
+
+    Customers get **HTTP 503** from `http://track.quillmoor.example/` (the
+    Ingress `tracking-portal` in namespace **`tracking-portal`**, served on
+    port 30080 of every node). Restore the service end to end, changing
+    only what is broken, then record the incident in
+    `/home/learner/incident/summary.txt`, exactly three lines:
+
+    ```text
+    root-cause: <probe|selector|image>
+    fix: <kind>/<name> of the object you changed, kind in lower case
+    status: <HTTP status the portal returns after your fix>
+    ```
+
+    Test with `curl -s -o /dev/null -w '%{http_code}' -H 'Host: track.quillmoor.example' http://harbour-wk-1:30080/`.
+  objectives:
+    - Trace a 503 from the edge to the workload
+    - Fix the faulty object and record cause and change
+  params:
+    fault:
+      type: choice
+      values: [probe, selector]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-harbour
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-harbour
+          nodes:
+            - {name: harbour-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: harbour-wk-1, role: worker}
+            - {name: harbour-wk-2, role: worker}
+  setup:
+    - on: qm-harbour/harbour-cp-1
+      timeoutSec: 400
+      run: /opt/cloudtrain/bin/addons-install ingress --wait
+    - on: qm-harbour
+      timeoutSec: 240
+      run: |
+        set -e
+        probeport=80; sel=tracking-portal
+        [ "{{fault}}" = probe ] && probeport=8080
+        [ "{{fault}}" = selector ] && sel=tracking-portl
+        cat <<YAML | kubectl apply -f -
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: tracking-portal}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: tracking-portal, namespace: tracking-portal}
+        spec:
+          replicas: 2
+          selector: {matchLabels: {app: tracking-portal}}
+          template:
+            metadata: {labels: {app: tracking-portal}}
+            spec:
+              containers:
+                - name: portal
+                  image: busybox:1.37
+                  command: ["sh", "-c", "mkdir -p /www && echo tracking-portal-ok > /www/index.html && exec httpd -f -p 80 -h /www"]
+                  readinessProbe: {httpGet: {path: /, port: $probeport}, periodSeconds: 3}
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata: {name: tracking-portal, namespace: tracking-portal}
+        spec:
+          selector: {app: $sel}
+          ports: [{port: 80, targetPort: 80}]
+        ---
+        apiVersion: networking.k8s.io/v1
+        kind: Ingress
+        metadata: {name: tracking-portal, namespace: tracking-portal}
+        spec:
+          ingressClassName: traefik
+          rules:
+            - host: track.quillmoor.example
+              http:
+                paths:
+                  - {path: /, pathType: Prefix, backend: {service: {name: tracking-portal, port: {number: 80}}}}
+        YAML
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/incident
+  teardown:
+    - on: qm-harbour
+      run: kubectl delete namespace tracking-portal --ignore-not-found --wait=false
+  checks:
+    - id: restored
+      description: track.quillmoor.example answers 200 with the portal page
+      type: shell
+      on: workstation
+      skills: [k8s.troubleshooting.networking]
+      weight: 3
+      timeoutSec: 20
+      command: |
+        curl -s -m 5 -H 'Host: track.quillmoor.example' http://harbour-wk-1:30080/ || echo unreachable
+      expect: {match: exact, value: tracking-portal-ok}
+    - id: minimal-change
+      description: The Deployment still runs 2 replicas with a readiness probe and the Service keeps port 80
+      type: shell
+      on: qm-harbour
+      skills: [k8s.troubleshooting.events]
+      weight: 0.5
+      command: |
+        echo "$(kubectl -n tracking-portal get deploy tracking-portal -o jsonpath='{.spec.replicas} {.spec.template.spec.containers[0].readinessProbe.httpGet.port}') $(kubectl -n tracking-portal get svc tracking-portal -o jsonpath='{.spec.ports[0].port}')"
+      expect: {match: regex, value: '^2 (80|http) 80$'}
+    - id: summary
+      description: The summary names the root cause, the changed object and the final status
+      type: shell
+      on: workstation
+      skills: [k8s.troubleshooting.logs, k8s.troubleshooting.events]
+      weight: 2
+      command: |
+        case {{fault}} in probe) obj=deployment/tracking-portal ;; selector) obj=service/tracking-portal ;; esac
+        tr -d '\r' < /home/learner/incident/summary.txt 2>/dev/null | sed 's/[[:space:]]*$//' > /tmp/.sum
+        printf 'root-cause: {{fault}}\nfix: %s\nstatus: 200\n' "$obj" | diff -q - /tmp/.sum >/dev/null && echo match || echo mismatch
+        rm -f /tmp/.sum
+      expect: {match: exact, value: match}
+  misconceptions:
+    - id: restart-ingress
+      description: Restarts the Ingress controller.
+      feedback: Traefik answers 503 because the Service has no ready endpoints; the cause is in the workload or the Service.
+      expectFail: [restored, summary]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 200
+        run: |
+          kubectl config use-context qm-harbour
+          kubectl -n traefik rollout restart deploy/traefik
+          kubectl -n traefik rollout status deploy/traefik --timeout=150s
+          printf 'root-cause: image\nfix: deployment/traefik\nstatus: 503\n' > ~/incident/summary.txt
+    - id: drop-probe
+      description: Removes the readiness probe instead of fixing it.
+      feedback: Without readiness the Service sends traffic to Pods that may not be ready; fix the probe's port.
+      expectFail: [minimal-change]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 200
+        run: |
+          kubectl config use-context qm-harbour
+          kubectl -n tracking-portal patch deploy tracking-portal --type=json -p '[{"op":"remove","path":"/spec/template/spec/containers/0/readinessProbe"}]'
+          kubectl -n tracking-portal patch svc tracking-portal -p '{"spec":{"selector":{"app":"tracking-portal"}}}'
+          kubectl -n tracking-portal rollout status deploy/tracking-portal --timeout=150s
+          printf 'root-cause: {{fault}}\nfix: deployment/tracking-portal\nstatus: 200\n' > ~/incident/summary.txt
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 240
+        run: |
+          kubectl config use-context qm-harbour
+          kubectl -n tracking-portal get endpointslices
+          if [ "$(kubectl -n tracking-portal get svc tracking-portal -o jsonpath='{.spec.selector.app}')" != tracking-portal ]; then
+            kubectl -n tracking-portal patch svc tracking-portal -p '{"spec":{"selector":{"app":"tracking-portal"}}}'
+            fix=service/tracking-portal; cause=selector
+          else
+            kubectl -n tracking-portal patch deploy tracking-portal -p '{"spec":{"template":{"spec":{"containers":[{"name":"portal","readinessProbe":{"httpGet":{"path":"/","port":80}}}]}}}}'
+            kubectl -n tracking-portal rollout status deploy/tracking-portal --timeout=150s
+            fix=deployment/tracking-portal; cause=probe
+          fi
+          sleep 5
+          code=$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: track.quillmoor.example' http://harbour-wk-1:30080/)
+          printf 'root-cause: %s\nfix: %s\nstatus: %s\n' "$cause" "$fix" "$code" > ~/incident/summary.txt

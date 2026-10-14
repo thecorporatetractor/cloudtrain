@@ -1,0 +1,130 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xka-toleration-control-plane
+  title: Run a Pod on the control plane
+  domain: kubernetes
+  frameworks: [cka:workloads-scheduling]
+  difficulty: easy
+  estimatedMinutes: 5
+  tags: [exam, taints, tolerations, nodeselector]
+  version: 1
+spec:
+  description: |
+    **Context:** `qm-fleet` (`kubectl config use-context qm-fleet`)
+
+    In namespace **`cp-inspect`** (it exists), run a Pod named
+    **`cp-inspector`** from image `busybox:1.37` with the command
+    `sleep 3600` on the control-plane node **`fleet-cp-1`**. Use a
+    **toleration** and a **nodeSelector** (not `nodeName`), and do not
+    remove the node's taint.
+  objectives:
+    - Tolerate the control-plane taint
+    - Select a node with a nodeSelector
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-fleet
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-fleet
+          nodes:
+            - {name: fleet-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: fleet-wk-1, role: worker}
+            - {name: fleet-wk-2, role: worker}
+  setup:
+    - on: qm-fleet
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: cp-inspect}
+  teardown:
+    - on: qm-fleet
+      run: kubectl delete namespace cp-inspect --ignore-not-found --wait=false
+  checks:
+    - id: running-on-cp
+      description: cp-inspector runs on fleet-cp-1
+      type: k8s-query
+      skills: [k8s.scheduling.taints-tolerations]
+      weight: 2
+      query: {cluster: qm-fleet, resource: pod, name: cp-inspector, namespace: cp-inspect, jsonpath: '{.status.phase}@{.spec.nodeName}'}
+      expect: {match: exact, value: Running@fleet-cp-1}
+    - id: selector-and-toleration
+      description: The Pod uses a nodeSelector and a control-plane toleration, not nodeName binding by hand
+      type: shell
+      on: qm-fleet
+      skills: [k8s.scheduling.node-selector, k8s.scheduling.taints-tolerations]
+      command: |
+        kubectl -n cp-inspect get pod cp-inspector -o json | jq -r '
+          "selector=\((.spec.nodeSelector // {}) | length > 0) toleration=\(any(.spec.tolerations[]?; .key == "node-role.kubernetes.io/control-plane")) scheduled-by=\(any(.status.conditions[]?; .type == "PodScheduled" and .status == "True"))"'
+      expect: {match: exact, value: selector=true toleration=true scheduled-by=true}
+    - id: taint-kept
+      description: fleet-cp-1 keeps its NoSchedule control-plane taint
+      type: k8s-query
+      skills: [k8s.scheduling.taints-tolerations]
+      weight: 0.5
+      query: {cluster: qm-fleet, resource: node, name: fleet-cp-1, jsonpath: '{.spec.taints[?(@.key=="node-role.kubernetes.io/control-plane")].effect}'}
+      expect: {match: exact, value: NoSchedule}
+  misconceptions:
+    - id: untaint
+      description: Removes the control-plane taint instead of tolerating it.
+      feedback: The taint protects the control plane from every other workload. Tolerate it in the Pod.
+      expectFail: [selector-and-toleration, taint-kept]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          kubectl config use-context qm-fleet
+          kubectl taint node fleet-cp-1 node-role.kubernetes.io/control-plane:NoSchedule-
+          kubectl -n cp-inspect run cp-inspector --image=busybox:1.37 --overrides='{"spec":{"nodeSelector":{"kubernetes.io/hostname":"fleet-cp-1"}}}' -- sleep 3600
+          kubectl -n cp-inspect wait pod/cp-inspector --for=condition=Ready --timeout=90s
+    - id: selector-only
+      description: Sets the nodeSelector but forgets the toleration.
+      feedback: The selector points at a node whose taint the Pod does not tolerate, so it stays Pending.
+      expectFail: [running-on-cp, selector-and-toleration]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-fleet
+          kubectl -n cp-inspect run cp-inspector --image=busybox:1.37 --overrides='{"spec":{"nodeSelector":{"kubernetes.io/hostname":"fleet-cp-1"}}}' -- sleep 3600
+          sleep 15
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          kubectl config use-context qm-fleet
+          kubectl apply -f - <<'YAML'
+          apiVersion: v1
+          kind: Pod
+          metadata: {name: cp-inspector, namespace: cp-inspect}
+          spec:
+            nodeSelector: {kubernetes.io/hostname: fleet-cp-1}
+            tolerations:
+              - {key: node-role.kubernetes.io/control-plane, operator: Exists, effect: NoSchedule}
+            containers:
+              - {name: inspector, image: "busybox:1.37", command: ["sleep", "3600"]}
+          YAML
+          kubectl -n cp-inspect wait pod/cp-inspector --for=condition=Ready --timeout=90s
+    alternatives:
+      - id: role-label
+        description: Select by the node-role label (empty value) and tolerate with Exists and no effect.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 120
+            run: |
+              kubectl config use-context qm-fleet
+              kubectl -n cp-inspect run cp-inspector --image=busybox:1.37 \
+                --overrides='{"spec":{"nodeSelector":{"node-role.kubernetes.io/control-plane":""},"tolerations":[{"key":"node-role.kubernetes.io/control-plane","operator":"Exists"}]}}' -- sleep 3600
+              kubectl -n cp-inspect wait pod/cp-inspector --for=condition=Ready --timeout=90s

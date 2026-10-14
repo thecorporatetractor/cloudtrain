@@ -1,0 +1,216 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: manifest-store-dynamic
+  title: Provision volumes dynamically for the manifest store
+  domain: kubernetes
+  frameworks: [cka:storage]
+  difficulty: medium
+  estimatedMinutes: 18
+  tags: [storageclass, dynamic-provisioning, pvc, reclaim-policy]
+  version: 1
+spec:
+  description: |
+    The manifest store keeps scanned shipping manifests and needs its own
+    volume. The cluster has a provisioner, but no default StorageClass yet.
+
+    Use context `qm-archive`:
+
+    ```bash
+    kubectl config use-context qm-archive
+    ```
+
+    1. Make the StorageClass **`fast-local`** the cluster's **only** default
+       class.
+    2. In namespace **`manifest-store`**, create a claim **`manifest-data`**
+       for **{{size}}** (ReadWriteOnce) **without naming a class**, and mount
+       it at `/var/lib/manifests` in container `store` of Deployment
+       `manifest-store`.
+    3. The volume provisioned for the claim must survive a deleted claim:
+       switch that PersistentVolume's reclaim policy to **Retain**.
+  objectives:
+    - Mark a default StorageClass
+    - Claim and mount a dynamically provisioned volume
+    - Change a provisioned volume's reclaim policy
+  params:
+    size:
+      type: choice
+      values: [2Gi, 3Gi]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-archive
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-archive
+          nodes:
+            - {name: archive-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: archive-wk-1, role: worker}
+  setup:
+    - on: qm-archive/archive-cp-1
+      timeoutSec: 400
+      run: /opt/cloudtrain/bin/addons-install storage --wait
+    - on: qm-archive
+      run: |
+        kubectl annotate storageclass local-path storageclass.kubernetes.io/is-default-class- --overwrite
+    - on: qm-archive
+      apply: |
+        apiVersion: storage.k8s.io/v1
+        kind: StorageClass
+        metadata: {name: fast-local}
+        provisioner: rancher.io/local-path
+        volumeBindingMode: WaitForFirstConsumer
+        reclaimPolicy: Delete
+        ---
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: manifest-store}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: manifest-store, namespace: manifest-store}
+        spec:
+          replicas: 1
+          strategy: {type: Recreate}
+          selector: {matchLabels: {app: manifest-store}}
+          template:
+            metadata: {labels: {app: manifest-store}}
+            spec:
+              containers:
+                - {name: store, image: "busybox:1.37", command: ["sh", "-c", "mkdir -p /var/lib/manifests && while true; do date >> /var/lib/manifests/scan.log; sleep 30; done"]}
+  teardown:
+    - on: qm-archive
+      run: kubectl delete namespace manifest-store --ignore-not-found --wait=false
+  checks:
+    - id: context
+      description: Terminal is using context qm-archive
+      type: k8s-context
+      on: workstation
+      skills: [k8s.cli.contexts]
+      weight: 0.5
+      expect: {match: exact, value: qm-archive}
+    - id: only-default
+      description: fast-local is the only default StorageClass
+      type: shell
+      on: qm-archive
+      skills: [k8s.storage.storage-classes]
+      weight: 2
+      command: kubectl get storageclass -o json | jq -r '[.items[] | select(.metadata.annotations["storageclass.kubernetes.io/is-default-class"] == "true") | .metadata.name] | join(",")'
+      expect: {match: exact, value: fast-local}
+    - id: claim
+      description: manifest-data asks for {{size}} without a class in the manifest and is Bound through fast-local
+      type: shell
+      on: qm-archive
+      skills: [k8s.storage.claims]
+      weight: 2
+      command: |
+        kubectl -n manifest-store get pvc manifest-data -o json | jq -r '"\(.status.phase) \(.spec.storageClassName) \(.spec.resources.requests.storage) \((.metadata.annotations["kubectl.kubernetes.io/last-applied-configuration"] // "{}" | fromjson | .spec.storageClassName) // "none")"'
+      expect: {match: exact, value: "Bound fast-local {{size}} none"}
+    - id: mounted
+      description: The store writes to the claim at /var/lib/manifests
+      type: shell
+      on: qm-archive
+      skills: [k8s.storage.claims]
+      weight: 2
+      timeoutSec: 20
+      command: |
+        kubectl -n manifest-store get deploy manifest-store -o json | jq -r '.spec.template.spec as $s | [$s.volumes[]? | select(.persistentVolumeClaim.claimName == "manifest-data") | .name] as $v
+          | [$s.containers[] | select(.name == "store") | .volumeMounts[]? | select(.name as $n | $v | index($n)) | .mountPath] | join(",")'
+        kubectl -n manifest-store exec deploy/manifest-store -c store -- sh -c 'df /var/lib/manifests | tail -1 | grep -qv overlay && echo on-volume || echo on-container-fs'
+      expect: {match: exact, value: "/var/lib/manifests\non-volume"}
+    - id: retain
+      description: The provisioned volume is set to Retain
+      type: shell
+      on: qm-archive
+      skills: [k8s.storage.reclaim-policy]
+      command: |
+        pv=$(kubectl -n manifest-store get pvc manifest-data -o jsonpath='{.spec.volumeName}')
+        [ -n "$pv" ] && kubectl get pv "$pv" -o jsonpath='{.spec.persistentVolumeReclaimPolicy}' || echo no-volume
+      expect: {match: exact, value: Retain}
+  hints:
+    - title: Switch context
+      body: The archive cluster is qm-archive.
+      command: kubectl config use-context qm-archive
+      cost: 0
+    - title: The default class annotation
+      command: kubectl patch storageclass fast-local -p '{"metadata":{"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
+      body: A claim without storageClassName gets the default class when it is created.
+      cost: 2
+    - title: WaitForFirstConsumer
+      body: fast-local provisions only once a Pod uses the claim, so the claim stays Pending until the Deployment mounts it.
+      cost: 1
+    - title: Retain on the volume
+      command: kubectl patch pv $(kubectl -n manifest-store get pvc manifest-data -o jsonpath='{.spec.volumeName}') -p '{"spec":{"persistentVolumeReclaimPolicy":"Retain"}}'
+      body: The class's reclaimPolicy is copied into each new volume; change the volume itself.
+      cost: 2
+  misconceptions:
+    - id: class-named
+      description: Names fast-local in the claim instead of making it the default.
+      feedback: The task is about the default class; other teams' claims without a class must get fast-local too.
+      expectFail: [only-default, claim]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 200
+        run: |
+          kubectl config use-context qm-archive
+          kubectl apply -f - <<'YAML'
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata: {name: manifest-data, namespace: manifest-store}
+          spec:
+            storageClassName: fast-local
+            accessModes: [ReadWriteOnce]
+            resources: {requests: {storage: {{size}}}}
+          YAML
+          kubectl -n manifest-store patch deploy manifest-store -p '{"spec":{"template":{"spec":{"volumes":[{"name":"data","persistentVolumeClaim":{"claimName":"manifest-data"}}],"containers":[{"name":"store","volumeMounts":[{"name":"data","mountPath":"/var/lib/manifests"}]}]}}}}'
+          kubectl -n manifest-store rollout status deploy/manifest-store --timeout=150s
+          kubectl patch pv $(kubectl -n manifest-store get pvc manifest-data -o jsonpath='{.spec.volumeName}') -p '{"spec":{"persistentVolumeReclaimPolicy":"Retain"}}'
+    - id: class-policy
+      description: Tries to change the reclaim policy on the StorageClass afterwards.
+      feedback: A StorageClass's reclaimPolicy is immutable and only applies to new volumes; patch the existing PersistentVolume.
+      expectFail: [retain]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 200
+        run: |
+          kubectl config use-context qm-archive
+          kubectl annotate storageclass fast-local storageclass.kubernetes.io/is-default-class=true --overwrite
+          kubectl apply -f - <<'YAML'
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata: {name: manifest-data, namespace: manifest-store}
+          spec:
+            accessModes: [ReadWriteOnce]
+            resources: {requests: {storage: {{size}}}}
+          YAML
+          kubectl -n manifest-store patch deploy manifest-store -p '{"spec":{"template":{"spec":{"volumes":[{"name":"data","persistentVolumeClaim":{"claimName":"manifest-data"}}],"containers":[{"name":"store","volumeMounts":[{"name":"data","mountPath":"/var/lib/manifests"}]}]}}}}'
+          kubectl -n manifest-store rollout status deploy/manifest-store --timeout=150s
+          kubectl patch storageclass fast-local -p '{"reclaimPolicy":"Retain"}' || true
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 200
+        run: |
+          kubectl config use-context qm-archive
+          kubectl annotate storageclass fast-local storageclass.kubernetes.io/is-default-class=true --overwrite
+          kubectl apply -f - <<'YAML'
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata: {name: manifest-data, namespace: manifest-store}
+          spec:
+            accessModes: [ReadWriteOnce]
+            resources: {requests: {storage: {{size}}}}
+          YAML
+          kubectl -n manifest-store patch deploy manifest-store -p '{"spec":{"template":{"spec":{"volumes":[{"name":"data","persistentVolumeClaim":{"claimName":"manifest-data"}}],"containers":[{"name":"store","volumeMounts":[{"name":"data","mountPath":"/var/lib/manifests"}]}]}}}}'
+          kubectl -n manifest-store rollout status deploy/manifest-store --timeout=150s
+          kubectl patch pv $(kubectl -n manifest-store get pvc manifest-data -o jsonpath='{.spec.volumeName}') -p '{"spec":{"persistentVolumeReclaimPolicy":"Retain"}}'

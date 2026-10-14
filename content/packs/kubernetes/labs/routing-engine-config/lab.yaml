@@ -1,0 +1,270 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: routing-engine-config
+  title: Feed configuration and secrets to the routing engine
+  domain: kubernetes
+  frameworks: [cka:workloads-scheduling, ckad:environment-config-security]
+  difficulty: easy
+  estimatedMinutes: 12
+  tags: [configmap, secret, volumes, env]
+  version: 1
+spec:
+  description: |
+    Quillmoor's van routing engine reads its rules from a file and calls the
+    map service with a token. Both are still missing from its Deployment.
+
+    Use context `qm-depot`:
+
+    ```bash
+    kubectl config use-context qm-depot
+    ```
+
+    In namespace **`fleet-routing`**:
+
+    1. Create a ConfigMap **`routing-rules`** from the file
+       `~/routing/rules.yaml` on your workstation, keeping the key name
+       `rules.yaml`.
+    2. Create a Secret **`map-service-token`** with the key **`token`** whose
+       value is the content of `~/routing/token.txt` (`{{token}}`).
+    3. Change the Deployment **`routing-engine`** (container `engine`) so that:
+       - the rules file appears at **`/etc/routing/rules.yaml`** inside the
+         container, mounted from the ConfigMap;
+       - the environment variable **`ROUTE_TOKEN`** holds the token, read from
+         the Secret (not written into the Deployment).
+
+    Wait until all replicas run the new configuration.
+  objectives:
+    - Create a ConfigMap from a file and a Secret from a literal
+    - Mount a ConfigMap as a volume
+    - Expose a Secret key as an environment variable
+  params:
+    token:
+      type: choice
+      values: [mq-7f3a91c2, mq-2be04d8f, mq-c61d5a07]
+    region:
+      type: choice
+      values: [north-coast, inland-belt, harbour-ring]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-depot
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: qm-depot
+  setup:
+    - on: workstation
+      file:
+        path: /home/learner/routing/rules.yaml
+        content: |
+          region: {{region}}
+          maxStopsPerVan: 42
+          avoid: [toll-bridges, school-zones]
+          depotReturnBy: "19:30"
+    - on: workstation
+      run: |
+        printf '%s' '{{token}}' > /home/learner/routing/token.txt
+        chown -R learner:learner /home/learner/routing
+    - on: qm-depot
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: fleet-routing}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: routing-engine, namespace: fleet-routing}
+        spec:
+          replicas: 2
+          selector: {matchLabels: {app: routing-engine}}
+          template:
+            metadata: {labels: {app: routing-engine}}
+            spec:
+              containers:
+                - name: engine
+                  image: busybox:1.37
+                  command: ["sh", "-c", "while true; do sleep 30; done"]
+    - on: qm-depot
+      timeoutSec: 150
+      run: kubectl -n fleet-routing rollout status deploy/routing-engine --timeout=120s
+  teardown:
+    - on: qm-depot
+      run: kubectl delete namespace fleet-routing --ignore-not-found --wait=false
+  checks:
+    - id: context
+      description: Terminal is using context qm-depot
+      type: k8s-context
+      on: workstation
+      skills: [k8s.cli.contexts]
+      weight: 0.5
+      expect: {match: exact, value: qm-depot}
+    - id: configmap-key
+      description: ConfigMap routing-rules holds the rules file under key rules.yaml
+      type: shell
+      on: qm-depot
+      skills: [k8s.workloads.config]
+      command: kubectl -n fleet-routing get configmap routing-rules -o jsonpath='{.data.rules\.yaml}'
+      expect: {match: regex, value: '^region: {{region}}\nmaxStopsPerVan: 42\navoid: \[toll-bridges, school-zones\]\ndepotReturnBy: "19:30"\n?$'}
+    - id: secret-token
+      description: Secret map-service-token has key token with the map-service token
+      type: shell
+      on: qm-depot
+      skills: [k8s.workloads.config]
+      command: kubectl -n fleet-routing get secret map-service-token -o jsonpath='{.data.token}' | base64 -d; echo '|'
+      expect: {match: exact, value: "{{token}}|"}
+    - id: rules-mounted
+      description: A running engine container reads the rules at /etc/routing/rules.yaml
+      type: shell
+      on: qm-depot
+      skills: [k8s.workloads.config]
+      weight: 2
+      timeoutSec: 20
+      command: kubectl -n fleet-routing exec deploy/routing-engine -c engine -- cat /etc/routing/rules.yaml
+      expect: {match: regex, value: '^region: {{region}}\nmaxStopsPerVan: 42\n'}
+    - id: token-env
+      description: ROUTE_TOKEN inside the engine container holds the token
+      type: shell
+      on: qm-depot
+      skills: [k8s.workloads.config]
+      weight: 2
+      timeoutSec: 20
+      command: kubectl -n fleet-routing exec deploy/routing-engine -c engine -- printenv ROUTE_TOKEN
+      expect: {match: exact, value: "{{token}}"}
+    - id: token-from-secret
+      description: ROUTE_TOKEN is read from Secret map-service-token, key token (not a literal value)
+      type: k8s-query
+      skills: [k8s.workloads.config]
+      query:
+        cluster: qm-depot
+        resource: deployment
+        name: routing-engine
+        namespace: fleet-routing
+        jsonpath: '{.spec.template.spec.containers[?(@.name=="engine")].env[?(@.name=="ROUTE_TOKEN")].valueFrom.secretKeyRef.name}/{.spec.template.spec.containers[?(@.name=="engine")].env[?(@.name=="ROUTE_TOKEN")].valueFrom.secretKeyRef.key}|{.spec.template.spec.containers[?(@.name=="engine")].env[?(@.name=="ROUTE_TOKEN")].value}'
+      expect: {match: exact, value: "map-service-token/token|"}
+    - id: rolled-out
+      description: Both replicas run the updated Pod template and are ready
+      type: k8s-query
+      skills: [k8s.workloads.config]
+      query:
+        cluster: qm-depot
+        resource: deployment
+        name: routing-engine
+        namespace: fleet-routing
+        jsonpath: '{.spec.replicas}/{.status.updatedReplicas}/{.status.readyReplicas}/{.status.replicas}'
+      expect: {match: exact, value: 2/2/2/2}
+  hints:
+    - title: Switch context
+      body: The routing engine runs in qm-depot.
+      command: kubectl config use-context qm-depot
+      cost: 0
+    - title: Create both objects from your files
+      body: "`--from-file` uses the file name as the key; `--from-file=token=...` or `--from-literal` sets a key name yourself."
+      command: |
+        kubectl -n fleet-routing create configmap routing-rules --from-file=$HOME/routing/rules.yaml
+        kubectl -n fleet-routing create secret generic map-service-token --from-file=token=$HOME/routing/token.txt
+      cost: 1
+    - title: Two blocks in the Pod template
+      body: |
+        A ConfigMap mount needs `volumes` (with `configMap.name`) in the Pod spec
+        plus `volumeMounts` (mountPath `/etc/routing`) in the container. The
+        variable is an `env` entry with `valueFrom.secretKeyRef`.
+      cost: 2
+  misconceptions:
+    - id: literal-env
+      description: Copies the token into the Deployment as a plain env value.
+      feedback: A literal value is stored in the Deployment for anyone who can read it. Reference the Secret with `valueFrom.secretKeyRef`.
+      expectFail: [token-from-secret]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n fleet-routing create configmap routing-rules --from-file=$HOME/routing/rules.yaml
+          kubectl -n fleet-routing create secret generic map-service-token --from-file=token=$HOME/routing/token.txt
+          kubectl -n fleet-routing patch deployment routing-engine -p '{"spec":{"template":{"spec":{"volumes":[{"name":"rules","configMap":{"name":"routing-rules"}}],"containers":[{"name":"engine","env":[{"name":"ROUTE_TOKEN","value":"{{token}}"}],"volumeMounts":[{"name":"rules","mountPath":"/etc/routing"}]}]}}}}'
+          kubectl -n fleet-routing rollout status deploy/routing-engine --timeout=120s
+    - id: wrong-key-name
+      description: Creates the ConfigMap with a custom key, so the mounted file is not called rules.yaml.
+      feedback: Each ConfigMap key becomes one file name in the mounted directory. Keep the key `rules.yaml`.
+      expectFail: [configmap-key, rules-mounted]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n fleet-routing create configmap routing-rules --from-file=rules=$HOME/routing/rules.yaml
+          kubectl -n fleet-routing create secret generic map-service-token --from-file=token=$HOME/routing/token.txt
+          kubectl -n fleet-routing patch deployment routing-engine -p '{"spec":{"template":{"spec":{"volumes":[{"name":"rules","configMap":{"name":"routing-rules"}}],"containers":[{"name":"engine","env":[{"name":"ROUTE_TOKEN","valueFrom":{"secretKeyRef":{"name":"map-service-token","key":"token"}}}],"volumeMounts":[{"name":"rules","mountPath":"/etc/routing"}]}]}}}}'
+          kubectl -n fleet-routing rollout status deploy/routing-engine --timeout=120s
+    - id: secret-as-file
+      description: Mounts the Secret as a file instead of exposing it as ROUTE_TOKEN.
+      feedback: The engine reads the token from its environment. Use an `env` entry with `secretKeyRef`.
+      expectFail: [token-env, token-from-secret]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n fleet-routing create configmap routing-rules --from-file=$HOME/routing/rules.yaml
+          kubectl -n fleet-routing create secret generic map-service-token --from-file=token=$HOME/routing/token.txt
+          kubectl -n fleet-routing patch deployment routing-engine -p '{"spec":{"template":{"spec":{"volumes":[{"name":"rules","configMap":{"name":"routing-rules"}},{"name":"tok","secret":{"secretName":"map-service-token"}}],"containers":[{"name":"engine","volumeMounts":[{"name":"rules","mountPath":"/etc/routing"},{"name":"tok","mountPath":"/run/route-token"}]}]}}}}'
+          kubectl -n fleet-routing rollout status deploy/routing-engine --timeout=120s
+    - id: token-with-newline
+      description: Creates the Secret with echo, adding a trailing newline to the token.
+      feedback: "`echo` appends a newline that becomes part of the value. Use `--from-file` on the provided file, `--from-literal`, or `printf '%s'`."
+      expectFail: [secret-token]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n fleet-routing create configmap routing-rules --from-file=$HOME/routing/rules.yaml
+          echo '{{token}}' > /tmp/tok
+          kubectl -n fleet-routing create secret generic map-service-token --from-file=token=/tmp/tok
+          kubectl -n fleet-routing patch deployment routing-engine -p '{"spec":{"template":{"spec":{"volumes":[{"name":"rules","configMap":{"name":"routing-rules"}}],"containers":[{"name":"engine","env":[{"name":"ROUTE_TOKEN","valueFrom":{"secretKeyRef":{"name":"map-service-token","key":"token"}}}],"volumeMounts":[{"name":"rules","mountPath":"/etc/routing"}]}]}}}}'
+          kubectl -n fleet-routing rollout status deploy/routing-engine --timeout=120s
+  solution:
+    explanation: |
+      `create configmap --from-file` keys the data by file name and
+      `create secret generic --from-file=token=...` sets the key explicitly. In
+      the Pod template a `configMap` volume mounted at `/etc/routing` turns each
+      key into a file, and `env[].valueFrom.secretKeyRef` injects the token
+      without writing it into the Deployment.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n fleet-routing create configmap routing-rules --from-file=$HOME/routing/rules.yaml
+          kubectl -n fleet-routing create secret generic map-service-token --from-file=token=$HOME/routing/token.txt
+          kubectl -n fleet-routing patch deployment routing-engine -p '{"spec":{"template":{"spec":{"volumes":[{"name":"rules","configMap":{"name":"routing-rules"}}],"containers":[{"name":"engine","env":[{"name":"ROUTE_TOKEN","valueFrom":{"secretKeyRef":{"name":"map-service-token","key":"token"}}}],"volumeMounts":[{"name":"rules","mountPath":"/etc/routing"}]}]}}}}'
+          kubectl -n fleet-routing rollout status deploy/routing-engine --timeout=120s
+    alternatives:
+      - id: literal-and-apply
+        description: Secret from a literal, Deployment changed by applying an edited manifest.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 150
+            run: |
+              kubectl config use-context qm-depot
+              kubectl -n fleet-routing create configmap routing-rules --from-file=rules.yaml=$HOME/routing/rules.yaml
+              kubectl -n fleet-routing create secret generic map-service-token --from-literal=token="$(cat ~/routing/token.txt)"
+              kubectl -n fleet-routing get deployment routing-engine -o yaml \
+                | yq '.spec.template.spec.volumes = [{"name": "rules", "configMap": {"name": "routing-rules"}}]
+                      | (.spec.template.spec.containers[] | select(.name == "engine")) |= (
+                          .volumeMounts = [{"name": "rules", "mountPath": "/etc/routing", "readOnly": true}]
+                          | .env = [{"name": "ROUTE_TOKEN", "valueFrom": {"secretKeyRef": {"name": "map-service-token", "key": "token"}}}])' \
+                | kubectl apply -f -
+              kubectl -n fleet-routing rollout status deploy/routing-engine --timeout=120s

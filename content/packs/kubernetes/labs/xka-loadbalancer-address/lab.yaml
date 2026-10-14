@@ -1,0 +1,122 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xka-loadbalancer-address
+  title: Expose with a LoadBalancer and record the address
+  domain: kubernetes
+  frameworks: [cka:services-networking]
+  difficulty: easy
+  estimatedMinutes: 5
+  tags: [exam, loadbalancer]
+  version: 1
+spec:
+  description: |
+    **Context:** `qm-tracking` (`kubectl config use-context qm-tracking`)
+
+    Expose the Deployment **`quote-engine`** in namespace **`quotes-lb`** with
+    a Service **`quote-engine`** of type **LoadBalancer** on port **80**
+    (containers listen on 8080), and write the external address it receives
+    to `/home/learner/exam/lb-address.txt` (only the address).
+  objectives:
+    - Create a LoadBalancer Service and read its external address
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-tracking
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-tracking
+          nodes:
+            - {name: tracking-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: tracking-wk-1, role: worker}
+            - {name: tracking-wk-2, role: worker}
+  setup:
+    - on: qm-tracking/tracking-cp-1
+      timeoutSec: 400
+      run: /opt/cloudtrain/bin/addons-install lb --wait
+    - on: qm-tracking
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: quotes-lb}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: quote-engine, namespace: quotes-lb}
+        spec:
+          replicas: 2
+          selector: {matchLabels: {app: quote-engine}}
+          template:
+            metadata: {labels: {app: quote-engine}}
+            spec:
+              terminationGracePeriodSeconds: 1
+              containers:
+                - name: engine
+                  image: busybox:1.37
+                  command: ["sh", "-c", "mkdir -p /www && echo quote-engine-ok > /www/index.html && exec httpd -f -p 8080 -h /www"]
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/exam
+  teardown:
+    - on: qm-tracking
+      run: kubectl delete namespace quotes-lb --ignore-not-found --wait=false
+  checks:
+    - id: service
+      description: quote-engine is a LoadBalancer Service 80 -> 8080 with an external address
+      type: k8s-query
+      skills: [k8s.networking.loadbalancer]
+      weight: 2
+      query: {cluster: qm-tracking, resource: service, name: quote-engine, namespace: quotes-lb, jsonpath: '{.spec.type} {.spec.ports[0].port}->{.spec.ports[0].targetPort} {.status.loadBalancer.ingress[0].ip}'}
+      expect: {match: regex, value: '^LoadBalancer 80->8080 [0-9.]+$'}
+    - id: address
+      description: The file holds that address and it serves the quote engine
+      type: shell
+      on: workstation
+      skills: [k8s.networking.loadbalancer]
+      weight: 2
+      timeoutSec: 20
+      command: |
+        ip=$(tr -d ' \r\n' < /home/learner/exam/lb-address.txt 2>/dev/null)
+        exp=$(kubectl --kubeconfig /home/learner/.kube/config --context qm-tracking -n quotes-lb get svc quote-engine -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+        [ -n "$ip" ] && [ "$ip" = "$exp" ] && curl -s -m 5 "http://$ip/" || echo "address $ip"
+      expect: {match: exact, value: quote-engine-ok}
+  misconceptions:
+    - id: cluster-ip
+      description: Records the ClusterIP.
+      feedback: The external address is in status.loadBalancer.ingress (EXTERNAL-IP).
+      expectFail: [address]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-tracking
+          kubectl -n quotes-lb expose deploy/quote-engine --type=LoadBalancer --port=80 --target-port=8080
+          kubectl -n quotes-lb get svc quote-engine -o jsonpath='{.spec.clusterIP}' > ~/exam/lb-address.txt
+    - id: same-port
+      description: Leaves the target port at 80.
+      feedback: The containers listen on 8080.
+      expectFail: [service, address]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-tracking
+          kubectl -n quotes-lb expose deploy/quote-engine --type=LoadBalancer --port=80
+          sleep 10
+          kubectl -n quotes-lb get svc quote-engine -o jsonpath='{.status.loadBalancer.ingress[0].ip}' > ~/exam/lb-address.txt
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          kubectl config use-context qm-tracking
+          kubectl -n quotes-lb expose deploy/quote-engine --type=LoadBalancer --port=80 --target-port=8080
+          for i in $(seq 1 30); do ip=$(kubectl -n quotes-lb get svc quote-engine -o jsonpath='{.status.loadBalancer.ingress[0].ip}'); [ -n "$ip" ] && break; sleep 2; done
+          echo "$ip" > ~/exam/lb-address.txt

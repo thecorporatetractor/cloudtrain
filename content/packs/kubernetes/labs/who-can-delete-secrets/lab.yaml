@@ -1,0 +1,278 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: who-can-delete-secrets
+  title: Find out who can do what with auth can-i
+  domain: kubernetes
+  frameworks: [cka:cluster-architecture, ckad:environment-config-security]
+  difficulty: easy
+  estimatedMinutes: 10
+  tags: [rbac, auth-can-i, serviceaccounts, impersonation]
+  version: 1
+spec:
+  description: |
+    An auditor asks a simple question: which of the depot's automation
+    accounts could wipe the billing team's Secrets? Answer it from the API
+    server's point of view instead of reading every Role by hand.
+
+    Use context `qm-depot`:
+
+    ```bash
+    kubectl config use-context qm-depot
+    ```
+
+    Namespace `depot-apps` holds five ServiceAccounts: `billing-sync`,
+    `depot-ci`, `label-bot`, `audit-reader` and `night-ops`.
+
+    1. Write to `/home/learner/reports/can-delete-secrets.txt` the names of
+       those ServiceAccounts that are allowed to **delete Secrets in namespace
+       `billing`**: one bare ServiceAccount name per line, any order.
+    2. Write to `/home/learner/reports/label-bot-verbs.txt` the verbs that
+       `label-bot` holds on `secrets` in namespace `billing`, on one line,
+       sorted alphabetically and separated by commas (for example
+       `get,list`).
+
+    Use `kubectl auth can-i` with impersonation (`--as`) and `--list`. Do not
+    change any RBAC object.
+  objectives:
+    - Impersonate a ServiceAccount with --as
+    - Ask the API server whether an action is allowed in a namespace
+    - List an identity's permissions with auth can-i --list
+  params:
+    syncRole:
+      type: choice
+      values: [secret-janitor, secret-reader]
+    botRole:
+      type: choice
+      values: [secret-reader, secret-rotator]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-depot
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: qm-depot
+  setup:
+    - on: qm-depot
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: depot-apps}
+        ---
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: billing}
+        ---
+        apiVersion: v1
+        kind: Secret
+        metadata: {name: ledger-db, namespace: billing}
+        stringData: {password: not-a-real-password}
+        ---
+        apiVersion: v1
+        kind: ServiceAccount
+        metadata: {name: billing-sync, namespace: depot-apps}
+        ---
+        apiVersion: v1
+        kind: ServiceAccount
+        metadata: {name: depot-ci, namespace: depot-apps}
+        ---
+        apiVersion: v1
+        kind: ServiceAccount
+        metadata: {name: label-bot, namespace: depot-apps}
+        ---
+        apiVersion: v1
+        kind: ServiceAccount
+        metadata: {name: audit-reader, namespace: depot-apps}
+        ---
+        apiVersion: v1
+        kind: ServiceAccount
+        metadata: {name: night-ops, namespace: depot-apps}
+        ---
+        apiVersion: rbac.authorization.k8s.io/v1
+        kind: Role
+        metadata: {name: secret-janitor, namespace: billing}
+        rules:
+          - {apiGroups: [""], resources: [secrets], verbs: [get, list, delete]}
+        ---
+        apiVersion: rbac.authorization.k8s.io/v1
+        kind: Role
+        metadata: {name: secret-reader, namespace: billing}
+        rules:
+          - {apiGroups: [""], resources: [secrets], verbs: [get, list, watch]}
+        ---
+        apiVersion: rbac.authorization.k8s.io/v1
+        kind: Role
+        metadata: {name: secret-rotator, namespace: billing}
+        rules:
+          - {apiGroups: [""], resources: [secrets], verbs: [create, get, update, patch]}
+        ---
+        apiVersion: rbac.authorization.k8s.io/v1
+        kind: RoleBinding
+        metadata: {name: billing-sync, namespace: billing}
+        roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: "{{syncRole}}"}
+        subjects: [{kind: ServiceAccount, name: billing-sync, namespace: depot-apps}]
+        ---
+        apiVersion: rbac.authorization.k8s.io/v1
+        kind: RoleBinding
+        metadata: {name: label-bot, namespace: billing}
+        roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: "{{botRole}}"}
+        subjects: [{kind: ServiceAccount, name: label-bot, namespace: depot-apps}]
+        ---
+        apiVersion: rbac.authorization.k8s.io/v1
+        kind: ClusterRole
+        metadata: {name: depot-secret-admin}
+        rules:
+          - {apiGroups: [""], resources: [secrets, configmaps], verbs: ["*"]}
+        ---
+        apiVersion: rbac.authorization.k8s.io/v1
+        kind: ClusterRoleBinding
+        metadata: {name: depot-ci-secrets}
+        roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: depot-secret-admin}
+        subjects: [{kind: ServiceAccount, name: depot-ci, namespace: depot-apps}]
+        ---
+        apiVersion: rbac.authorization.k8s.io/v1
+        kind: RoleBinding
+        metadata: {name: audit-reader-view, namespace: billing}
+        roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: view}
+        subjects: [{kind: ServiceAccount, name: audit-reader, namespace: depot-apps}]
+        ---
+        apiVersion: rbac.authorization.k8s.io/v1
+        kind: RoleBinding
+        metadata: {name: night-ops-edit, namespace: depot-apps}
+        roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: edit}
+        subjects: [{kind: ServiceAccount, name: night-ops, namespace: depot-apps}]
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/reports
+  teardown:
+    - on: qm-depot
+      run: |
+        kubectl delete clusterrolebinding depot-ci-secrets --ignore-not-found
+        kubectl delete clusterrole depot-secret-admin --ignore-not-found
+        kubectl delete namespace depot-apps billing --ignore-not-found --wait=false
+  checks:
+    - id: context
+      description: Terminal is using context qm-depot
+      type: k8s-context
+      on: workstation
+      skills: [k8s.cli.contexts]
+      weight: 0.5
+      expect: {match: exact, value: qm-depot}
+    - id: deleters
+      description: The first report lists exactly the ServiceAccounts that may delete Secrets in billing
+      type: shell
+      on: workstation
+      skills: [k8s.rbac.auth-can-i]
+      weight: 3
+      command: |
+        f=/home/learner/reports/can-delete-secrets.txt
+        [ -f "$f" ] || { echo "no report"; exit 0; }
+        exp=$(for sa in billing-sync depot-ci label-bot audit-reader night-ops; do
+          [ "$(kubectl --kubeconfig /home/learner/.kube/config --context qm-depot auth can-i delete secrets -n billing --as=system:serviceaccount:depot-apps:$sa 2>/dev/null)" = yes ] && echo $sa
+        done | sort)
+        got=$(tr -d '\r' < "$f" | sed 's/[[:space:]]*$//; /^$/d' | sort)
+        [ -n "$exp" ] && [ "$exp" = "$got" ] && echo ok || printf 'mismatch\ngot:\n%s\n' "$got"
+      expect: {match: exact, value: ok}
+    - id: bot-verbs
+      description: The second report lists label-bot's verbs on secrets in billing
+      type: shell
+      on: workstation
+      skills: [k8s.rbac.auth-can-i]
+      weight: 2
+      command: |
+        f=/home/learner/reports/label-bot-verbs.txt
+        [ -f "$f" ] || { echo "no report"; exit 0; }
+        exp=$(for v in create delete deletecollection get list patch update watch; do
+          [ "$(kubectl --kubeconfig /home/learner/.kube/config --context qm-depot auth can-i $v secrets -n billing --as=system:serviceaccount:depot-apps:label-bot 2>/dev/null)" = yes ] && echo $v
+        done | paste -sd, -)
+        got=$(head -n1 "$f" | tr -d '\r ')
+        [ -n "$exp" ] && [ "$exp" = "$got" ] && echo ok || echo "mismatch: $got"
+      expect: {match: exact, value: ok}
+    - id: rbac-unchanged
+      description: No RBAC object was added, changed or removed
+      type: shell
+      on: qm-depot
+      skills: [k8s.cli.scoped-changes]
+      weight: 0.5
+      command: |
+        { kubectl get rolebindings,roles -n billing -o json; kubectl get rolebindings -n depot-apps -o json; kubectl get clusterrolebinding depot-ci-secrets clusterrole depot-secret-admin -o json; } \
+          | jq -r '.items[] | "\(.metadata.name):\(.roleRef.name // "")\(.rules // [] | tostring)\(.subjects // [] | tostring)"' | sort | md5sum | cut -c1-8
+        kubectl get rolebindings -n billing --no-headers | wc -l
+      expect: {match: regex, value: '^[0-9a-f]{8}\n3$'}
+  hints:
+    - title: Switch context
+      body: The depot accounts live in qm-depot.
+      command: kubectl config use-context qm-depot
+      cost: 0
+    - title: Impersonating a ServiceAccount
+      body: "A ServiceAccount's user name is `system:serviceaccount:<namespace>:<name>`; `--as=<name>` alone impersonates an ordinary user of that name."
+      command: kubectl auth can-i delete secrets -n billing --as=system:serviceaccount:depot-apps:billing-sync
+      cost: 1
+    - title: Mind the namespace
+      body: Permissions granted by a RoleBinding apply only in the RoleBinding's namespace; ClusterRoleBindings apply everywhere. Always pass `-n billing`.
+      cost: 1
+    - title: All five at once
+      command: |
+        for sa in billing-sync depot-ci label-bot audit-reader night-ops; do
+          echo "$sa $(kubectl auth can-i delete secrets -n billing --as=system:serviceaccount:depot-apps:$sa)"
+        done
+      body: Keep the names that answer yes.
+      cost: 2
+    - title: The --list view
+      command: kubectl auth can-i --list -n billing --as=system:serviceaccount:depot-apps:label-bot | grep -E '^secrets '
+      body: The Verbs column shows what the identity may do on each resource.
+      cost: 1
+  misconceptions:
+    - id: plain-user-as
+      description: Impersonates `--as=<name>`, a user, instead of the ServiceAccount.
+      feedback: Without the `system:serviceaccount:<ns>:` prefix you ask about a user that holds no bindings, so every answer is no.
+      expectFail: [deleters, bot-verbs]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-depot
+          for sa in billing-sync depot-ci label-bot audit-reader night-ops; do
+            [ "$(kubectl auth can-i delete secrets -n billing --as=$sa)" = yes ] && echo $sa
+          done > ~/reports/can-delete-secrets.txt || true
+          for v in create delete get list patch update watch; do
+            [ "$(kubectl auth can-i $v secrets -n billing --as=label-bot)" = yes ] && echo $v
+          done | paste -sd, - > ~/reports/label-bot-verbs.txt
+    - id: wrong-namespace
+      description: Asks about the ServiceAccounts' own namespace instead of billing.
+      feedback: A Role or RoleBinding grants rights only in its namespace. The question is about Secrets in billing, so ask with `-n billing`.
+      expectFail: [deleters]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-depot
+          for sa in billing-sync depot-ci label-bot audit-reader night-ops; do
+            [ "$(kubectl auth can-i delete secrets -n depot-apps --as=system:serviceaccount:depot-apps:$sa)" = yes ] && echo $sa
+          done > ~/reports/can-delete-secrets.txt || true
+          kubectl auth can-i --list -n billing --as=system:serviceaccount:depot-apps:label-bot \
+            | awk '$1 == "secrets" {print $4}' | tr -d '[]' | tr ' ' '\n' | sort | paste -sd, - > ~/reports/label-bot-verbs.txt
+  solution:
+    explanation: |
+      `kubectl auth can-i <verb> <resource> -n <ns> --as=system:serviceaccount:<ns>:<sa>`
+      asks the API server's authorizer directly, so every source of
+      permission counts: namespaced RoleBindings in billing, the
+      ClusterRoleBinding of depot-ci, and nothing from a RoleBinding in
+      another namespace. `--list` prints all rules that apply to one identity
+      in one namespace.
+    steps:
+      - on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-depot
+          for sa in billing-sync depot-ci label-bot audit-reader night-ops; do
+            [ "$(kubectl auth can-i delete secrets -n billing --as=system:serviceaccount:depot-apps:$sa)" = yes ] && echo $sa
+          done > ~/reports/can-delete-secrets.txt || true
+          kubectl auth can-i --list -n billing --as=system:serviceaccount:depot-apps:label-bot \
+            | awk '$1 == "secrets" {for (i = 4; i <= NF; i++) printf "%s ", $i; print ""}' \
+            | tr -d '[]' | tr ' ' '\n' | sed '/^$/d' | sort -u | paste -sd, - > ~/reports/label-bot-verbs.txt

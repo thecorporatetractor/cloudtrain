@@ -1,0 +1,228 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xka-netpol-egress-db
+  title: Restrict egress to one database
+  domain: kubernetes
+  frameworks: [cka:services-networking]
+  difficulty: medium
+  estimatedMinutes: 8
+  tags: [exam, networkpolicy, egress]
+  version: 1
+spec:
+  description: |
+    **Context:** `qm-fleet` (`kubectl config use-context qm-fleet`)
+
+    In namespace **`{{ns}}`**, create a NetworkPolicy **`invoicing-egress`**
+    so that Pods labelled **`app=invoicing`** can send traffic **only** to
+    the Pods labelled `app=ledger-db` on **TCP 5432**, and to the cluster DNS
+    (UDP and TCP 53), and nowhere else. Other Pods in the namespace must not
+    be restricted.
+
+    The Pod `invoicing` has `wget` and `nslookup` for testing; the Services
+    `ledger-db` (5432) and `ledger-cache` (6379) front the database Pods.
+  objectives:
+    - Write an egress NetworkPolicy with pod and port selectors
+    - Keep DNS working under an egress policy
+  params:
+    ns:
+      type: choice
+      values: [invoicing, invoice-runs, billing-invoices]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-fleet
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-fleet
+          nodes:
+            - {name: fleet-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: fleet-wk-1, role: worker}
+            - {name: fleet-wk-2, role: worker}
+  setup:
+    - on: qm-fleet
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: "{{ns}}"}
+        ---
+        apiVersion: v1
+        kind: Pod
+        metadata: {name: invoicing, namespace: "{{ns}}", labels: {app: invoicing}}
+        spec:
+          terminationGracePeriodSeconds: 1
+          containers:
+            - {name: app, image: "busybox:1.37", command: ["sleep", "1d"]}
+        ---
+        apiVersion: v1
+        kind: Pod
+        metadata: {name: reporting, namespace: "{{ns}}", labels: {app: reporting}}
+        spec:
+          terminationGracePeriodSeconds: 1
+          containers:
+            - {name: app, image: "busybox:1.37", command: ["sleep", "1d"]}
+        ---
+        apiVersion: v1
+        kind: Pod
+        metadata: {name: ledger-db, namespace: "{{ns}}", labels: {app: ledger-db}}
+        spec:
+          terminationGracePeriodSeconds: 1
+          containers:
+            - {name: db, image: "busybox:1.37", command: ["sh", "-c", "mkdir -p /w && echo ledger-db-ok > /w/index.html && exec httpd -f -p 5432 -h /w"]}
+        ---
+        apiVersion: v1
+        kind: Pod
+        metadata: {name: ledger-cache, namespace: "{{ns}}", labels: {app: ledger-cache}}
+        spec:
+          terminationGracePeriodSeconds: 1
+          containers:
+            - {name: cache, image: "busybox:1.37", command: ["sh", "-c", "mkdir -p /w && echo ledger-cache-ok > /w/index.html && exec httpd -f -p 6379 -h /w"]}
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata: {name: ledger-db, namespace: "{{ns}}"}
+        spec:
+          selector: {app: ledger-db}
+          ports: [{port: 5432, targetPort: 5432}]
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata: {name: ledger-cache, namespace: "{{ns}}"}
+        spec:
+          selector: {app: ledger-cache}
+          ports: [{port: 6379, targetPort: 6379}]
+    - on: qm-fleet
+      timeoutSec: 150
+      run: kubectl -n {{ns}} wait pod --all --for=condition=Ready --timeout=120s
+  teardown:
+    - on: qm-fleet
+      run: kubectl delete namespace {{ns}} --ignore-not-found --wait=false
+  checks:
+    - id: db-allowed
+      description: invoicing reaches ledger-db by name on 5432
+      type: shell
+      on: qm-fleet
+      skills: [k8s.networking.netpol-ports]
+      weight: 2
+      timeoutSec: 30
+      command: kubectl -n {{ns}} exec invoicing -- wget -q -T 5 -O - http://ledger-db:5432/ 2>/dev/null || echo blocked
+      expect: {match: exact, value: ledger-db-ok}
+    - id: cache-blocked
+      description: invoicing cannot reach ledger-cache
+      type: shell
+      on: qm-fleet
+      skills: [k8s.networking.netpol-selectors]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        ip=$(kubectl -n {{ns}} get pod ledger-cache -o jsonpath='{.status.podIP}')
+        kubectl -n {{ns}} exec invoicing -- wget -q -T 4 -O - http://$ip:6379/ 2>/dev/null || echo blocked
+      expect: {match: exact, value: blocked}
+    - id: others-unrestricted
+      description: The reporting Pod still reaches ledger-cache
+      type: shell
+      on: qm-fleet
+      skills: [k8s.networking.netpol-selectors]
+      timeoutSec: 30
+      command: kubectl -n {{ns}} exec reporting -- wget -q -T 5 -O - http://ledger-cache:6379/ 2>/dev/null || echo blocked
+      expect: {match: exact, value: ledger-cache-ok}
+    - id: policy
+      description: NetworkPolicy invoicing-egress selects app=invoicing for Egress
+      type: k8s-query
+      skills: [k8s.networking.netpol-selectors]
+      weight: 0.5
+      query: {cluster: qm-fleet, resource: networkpolicy, name: invoicing-egress, namespace: "{{ns}}", jsonpath: '{.spec.podSelector.matchLabels.app} {.spec.policyTypes}'}
+      expect: {match: regex, value: '^invoicing \[.*"Egress".*\]$'}
+  misconceptions:
+    - id: forgot-dns
+      description: Allows only the database, so name lookups fail.
+      feedback: An egress policy also blocks DNS. Allow UDP/TCP 53 to the cluster DNS Pods.
+      expectFail: [db-allowed]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-fleet
+          kubectl apply -f - <<'YAML'
+          apiVersion: networking.k8s.io/v1
+          kind: NetworkPolicy
+          metadata: {name: invoicing-egress, namespace: {{ns}}}
+          spec:
+            podSelector: {matchLabels: {app: invoicing}}
+            policyTypes: [Egress]
+            egress:
+              - to: [{podSelector: {matchLabels: {app: ledger-db}}}]
+                ports: [{protocol: TCP, port: 5432}]
+          YAML
+          sleep 5
+    - id: whole-namespace
+      description: Selects every Pod in the namespace.
+      feedback: An empty podSelector restricts all Pods; only app=invoicing should be limited.
+      expectFail: [others-unrestricted]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-fleet
+          kubectl apply -f - <<'YAML'
+          apiVersion: networking.k8s.io/v1
+          kind: NetworkPolicy
+          metadata: {name: invoicing-egress, namespace: {{ns}}}
+          spec:
+            podSelector: {}
+            policyTypes: [Egress]
+            egress:
+              - to: [{podSelector: {matchLabels: {app: ledger-db}}}]
+                ports: [{protocol: TCP, port: 5432}]
+              - to: [{namespaceSelector: {}, podSelector: {matchLabels: {k8s-app: kube-dns}}}]
+                ports: [{protocol: UDP, port: 53}, {protocol: TCP, port: 53}]
+          YAML
+          sleep 5
+    - id: ingress-instead
+      description: Writes an ingress rule on the database instead of an egress rule on the client.
+      feedback: The restriction is on what invoicing may reach, so it is an Egress policy selecting the invoicing Pods.
+      expectFail: [cache-blocked, policy]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-fleet
+          kubectl apply -f - <<'YAML'
+          apiVersion: networking.k8s.io/v1
+          kind: NetworkPolicy
+          metadata: {name: invoicing-egress, namespace: {{ns}}}
+          spec:
+            podSelector: {matchLabels: {app: ledger-db}}
+            policyTypes: [Ingress]
+            ingress:
+              - from: [{podSelector: {matchLabels: {app: invoicing}}}]
+                ports: [{protocol: TCP, port: 5432}]
+          YAML
+          sleep 5
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-fleet
+          kubectl apply -f - <<'YAML'
+          apiVersion: networking.k8s.io/v1
+          kind: NetworkPolicy
+          metadata: {name: invoicing-egress, namespace: {{ns}}}
+          spec:
+            podSelector: {matchLabels: {app: invoicing}}
+            policyTypes: [Egress]
+            egress:
+              - to: [{podSelector: {matchLabels: {app: ledger-db}}}]
+                ports: [{protocol: TCP, port: 5432}]
+              - to: [{namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: kube-system}}, podSelector: {matchLabels: {k8s-app: kube-dns}}}]
+                ports: [{protocol: UDP, port: 53}, {protocol: TCP, port: 53}]
+          YAML
+          sleep 5

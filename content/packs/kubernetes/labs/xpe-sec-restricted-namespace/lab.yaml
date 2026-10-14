@@ -1,0 +1,157 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xpe-sec-restricted-namespace
+  title: Enforce the restricted profile on the tracking namespace
+  domain: kubernetes
+  frameworks: [ct-platform:security-hardening]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [exam, pod-security, security-context]
+  version: 1
+spec:
+  description: |
+    **Context:** `qm-harbour` (`kubectl config use-context qm-harbour`)
+
+    1. Label namespace **`{{ns}}`** so that Pod Security Admission
+       **enforces** the **restricted** Pod Security Standard (latest version).
+    2. Change Deployment **`tracking-worker`** in that namespace so that its
+       Pods are admitted under that profile and run: non-root (user
+       `{{uid}}`), no privilege escalation, all capabilities dropped and the
+       `RuntimeDefault` seccomp profile. Keep its image and command.
+
+    All 2 replicas must be ready.
+  objectives:
+    - Enforce a Pod Security Standard on a namespace
+    - Write a restricted-compliant securityContext
+  params:
+    ns:
+      type: choice
+      values: [tracking-secure, tracking-workers, tracking-batch]
+    uid:
+      type: choice
+      values: ["10001", "20002", "31000"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-harbour
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-harbour
+          nodes:
+            - {name: harbour-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: harbour-wk-1, role: worker}
+            - {name: harbour-wk-2, role: worker}
+  setup:
+    - on: qm-harbour
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: "{{ns}}"}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: tracking-worker, namespace: "{{ns}}"}
+        spec:
+          replicas: 2
+          selector: {matchLabels: {app: tracking-worker}}
+          template:
+            metadata: {labels: {app: tracking-worker}}
+            spec:
+              terminationGracePeriodSeconds: 1
+              containers:
+                - name: worker
+                  image: busybox:1.37
+                  command: ["sh", "-c", "while true; do echo tracking-batch; sleep 30; done"]
+    - on: qm-harbour
+      timeoutSec: 150
+      run: kubectl -n {{ns}} rollout status deploy/tracking-worker --timeout=120s
+  teardown:
+    - on: qm-harbour
+      run: kubectl delete namespace {{ns}} --ignore-not-found --wait=false
+  checks:
+    - id: enforce-label
+      description: The namespace enforces the restricted profile
+      type: k8s-query
+      skills: [k8s.security.pod-security-admission]
+      weight: 2
+      query: {cluster: qm-harbour, resource: namespace, name: "{{ns}}", jsonpath: '{.metadata.labels.pod-security\.kubernetes\.io/enforce} {.metadata.labels.pod-security\.kubernetes\.io/enforce-version}'}
+      expect: {match: regex, value: '^restricted (latest)?$'}
+    - id: admitted-and-ready
+      description: The Pod template passes the restricted profile and 2 replicas are ready
+      type: shell
+      on: qm-harbour
+      skills: [k8s.security.security-context, k8s.security.pod-security-admission]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        w=$(kubectl -n {{ns}} get deploy tracking-worker -o json | jq '{apiVersion: "v1", kind: "Pod", metadata: {name: "psa-probe", namespace: "{{ns}}"}, spec: .spec.template.spec}' \
+          | kubectl create --dry-run=server -f - 2>&1 | grep -c -i forbidden)
+        echo "violations=$w ready=$(kubectl -n {{ns}} get deploy tracking-worker -o jsonpath='{.status.readyReplicas}/{.status.updatedReplicas}')"
+      expect: {match: exact, value: violations=0 ready=2/2}
+    - id: settings
+      description: Runs as user {{uid}} with no escalation, all capabilities dropped and RuntimeDefault seccomp
+      type: shell
+      on: qm-harbour
+      skills: [k8s.security.security-context]
+      command: |
+        kubectl -n {{ns}} get deploy tracking-worker -o json | jq -r '.spec.template.spec as $p | $p.containers[0] as $c
+          | "uid=\($c.securityContext.runAsUser // $p.securityContext.runAsUser) nonroot=\($c.securityContext.runAsNonRoot // $p.securityContext.runAsNonRoot) esc=\($c.securityContext.allowPrivilegeEscalation) drop=\($c.securityContext.capabilities.drop // [] | join(",")) seccomp=\($c.securityContext.seccompProfile.type // $p.securityContext.seccompProfile.type) image=\($c.image)"'
+      expect: {match: exact, value: "uid={{uid}} nonroot=true esc=false drop=ALL seccomp=RuntimeDefault image=busybox:1.37"}
+  misconceptions:
+    - id: warn-only
+      description: Sets the warn label instead of enforce.
+      feedback: warn only prints warnings; enforce rejects non-compliant Pods.
+      expectFail: [enforce-label]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-harbour
+          kubectl label namespace {{ns}} pod-security.kubernetes.io/warn=restricted
+          kubectl -n {{ns}} patch deploy tracking-worker -p '{"spec":{"template":{"spec":{"securityContext":{"runAsNonRoot":true,"runAsUser":{{uid}},"seccompProfile":{"type":"RuntimeDefault"}},"containers":[{"name":"worker","securityContext":{"allowPrivilegeEscalation":false,"capabilities":{"drop":["ALL"]}}}]}}}}'
+          kubectl -n {{ns}} rollout status deploy/tracking-worker --timeout=120s
+    - id: label-only
+      description: Enforces the profile without changing the Deployment.
+      feedback: Existing Pods keep running, but every new Pod (rollout, reschedule) is rejected. Fix the securityContext.
+      expectFail: [admitted-and-ready, settings]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 90
+        run: |
+          kubectl config use-context qm-harbour
+          kubectl label namespace {{ns}} pod-security.kubernetes.io/enforce=restricted
+          kubectl -n {{ns}} rollout restart deploy/tracking-worker
+          sleep 30
+    - id: no-seccomp
+      description: Forgets the seccomp profile.
+      feedback: restricted requires seccompProfile RuntimeDefault (or Localhost).
+      expectFail: [admitted-and-ready, settings]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 90
+        run: |
+          kubectl config use-context qm-harbour
+          kubectl label namespace {{ns}} pod-security.kubernetes.io/enforce=restricted
+          kubectl -n {{ns}} patch deploy tracking-worker -p '{"spec":{"template":{"spec":{"securityContext":{"runAsNonRoot":true,"runAsUser":{{uid}}},"containers":[{"name":"worker","securityContext":{"allowPrivilegeEscalation":false,"capabilities":{"drop":["ALL"]}}}]}}}}'
+          sleep 30
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-harbour
+          kubectl label namespace {{ns}} pod-security.kubernetes.io/enforce=restricted pod-security.kubernetes.io/enforce-version=latest
+          kubectl -n {{ns}} patch deploy tracking-worker -p '{"spec":{"template":{"spec":{"securityContext":{"runAsNonRoot":true,"runAsUser":{{uid}},"seccompProfile":{"type":"RuntimeDefault"}},"containers":[{"name":"worker","securityContext":{"allowPrivilegeEscalation":false,"capabilities":{"drop":["ALL"]}}}]}}}}'
+          kubectl -n {{ns}} rollout status deploy/tracking-worker --timeout=120s

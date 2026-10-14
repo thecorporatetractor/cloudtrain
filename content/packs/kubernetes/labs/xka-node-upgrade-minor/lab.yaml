@@ -1,0 +1,193 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xka-node-upgrade-minor
+  title: Upgrade a worker to the next minor
+  domain: kubernetes
+  frameworks: [cka:cluster-architecture]
+  difficulty: hard
+  estimatedMinutes: 15
+  tags: [exam, kubeadm, upgrade, kubelet]
+  version: 1
+spec:
+  description: |
+    **Context:** `qm-harbour` (`kubectl config use-context qm-harbour`);
+    **host** `harbour-wk-1` (`ssh harbour-wk-1`, `sudo` works)
+
+    The control plane of `qm-harbour` already runs **v1.37.1**. Upgrade the
+    worker **`harbour-wk-1`** to **v1.37.1**: drain it first, upgrade
+    `kubeadm` and run the kubeadm node upgrade, upgrade `kubelet` and
+    `kubectl`, make the node run the new kubelet, put the three packages back
+    on hold and uncordon the node.
+
+    The node has no internet access: its apt source points at the local
+    **v1.36** mirror under `/opt/k8s-apt/`; the **v1.37** mirror sits next
+    to it.
+  objectives:
+    - Upgrade a worker node with kubeadm and apt
+  params:
+    replicas:
+      type: int
+      min: 1
+      max: 2
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-harbour
+        driver: k8s-cluster
+        image: kubeadm:1.36
+        cluster:
+          mode: kubeadm
+          version: "v1.36"
+          context: qm-harbour
+          nodes:
+            - {name: harbour-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: harbour-wk-1, role: worker}
+  setup:
+    - on: qm-harbour/harbour-cp-1
+      timeoutSec: 600
+      run: |
+        set -e
+        if [ "$(kubeadm version -o short)" != v1.37.1 ]; then
+          sed -i 's#/v1\.36/#/v1.37/#' /etc/apt/sources.list.d/kubernetes.list
+          apt-get update -q >/dev/null
+          apt-get install -y -q --allow-change-held-packages kubeadm='1.37.1-*' >/dev/null
+        fi
+        export KUBECONFIG=/etc/kubernetes/admin.conf
+        grep -q 'kube-apiserver:v1.37.1' /etc/kubernetes/manifests/kube-apiserver.yaml \
+          || kubeadm upgrade apply -y v1.37.1 > /var/log/cp-upgrade.log 2>&1
+    - on: qm-harbour/harbour-cp-1
+      timeoutSec: 300
+      run: |
+        set -e
+        apt-get install -y -q --allow-change-held-packages kubelet='1.37.1-*' kubectl='1.37.1-*' >/dev/null
+        apt-mark hold kubeadm kubelet kubectl >/dev/null
+        systemctl daemon-reload && systemctl restart kubelet
+    - on: qm-harbour/harbour-wk-1
+      run: apt-mark hold kubeadm kubelet kubectl
+    - on: qm-harbour
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: harbour-pilots}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: pilot-roster, namespace: harbour-pilots}
+        spec:
+          replicas: {{replicas}}
+          selector: {matchLabels: {app: pilot-roster}}
+          template:
+            metadata: {labels: {app: pilot-roster}}
+            spec:
+              terminationGracePeriodSeconds: 1
+              containers:
+                - {name: roster, image: "busybox:1.37", command: ["sh", "-c", "sleep 1d"]}
+    - on: qm-harbour
+      timeoutSec: 200
+      run: |
+        kubectl wait node/harbour-cp-1 --for=condition=Ready --timeout=150s
+        kubectl -n harbour-pilots rollout status deploy/pilot-roster --timeout=150s
+  teardown:
+    - on: qm-harbour
+      run: kubectl delete namespace harbour-pilots --ignore-not-found --wait=false
+  checks:
+    - id: kubelet-version
+      description: harbour-wk-1 runs kubelet v1.37.1
+      type: k8s-query
+      skills: [k8s.cluster.kubelet]
+      weight: 2
+      query: {cluster: qm-harbour, resource: node, name: harbour-wk-1, jsonpath: '{.status.nodeInfo.kubeletVersion}'}
+      expect: {match: exact, value: v1.37.1}
+    - id: packages
+      description: kubeadm, kubelet and kubectl are 1.37.1 and on hold
+      type: shell
+      on: qm-harbour/harbour-wk-1
+      skills: [k8s.cluster.kubeadm-upgrade]
+      weight: 2
+      command: |
+        echo "$(dpkg-query -W -f='${Version} ' kubeadm kubelet kubectl | sed 's/-[^ ]*//g')/$(apt-mark showhold | grep -cE '^(kubeadm|kubelet|kubectl)$')"
+      expect: {match: exact, value: "1.37.1 1.37.1 1.37.1 /3"}
+    - id: node-config-upgraded
+      description: kubeadm upgraded the node's kubelet configuration
+      type: shell
+      on: qm-harbour/harbour-wk-1
+      skills: [k8s.cluster.kubeadm-upgrade]
+      command: ls -d /etc/kubernetes/tmp/kubeadm-kubelet-config* >/dev/null 2>&1 && echo upgraded || echo "not upgraded"
+      expect: {match: exact, value: upgraded}
+    - id: in-service
+      description: harbour-wk-1 is Ready and schedulable
+      type: k8s-query
+      skills: [k8s.cluster.kubeadm-upgrade]
+      query: {cluster: qm-harbour, resource: node, name: harbour-wk-1, jsonpath: '{.status.conditions[?(@.type=="Ready")].status} {.spec.unschedulable}'}
+      expect: {match: exact, value: "True "}
+  misconceptions:
+    - id: no-restart
+      description: Upgrades the packages but does not restart the kubelet.
+      feedback: The running kubelet keeps its old binary until restarted.
+      expectFail: [kubelet-version]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 600
+        run: |
+          kubectl config use-context qm-harbour
+          kubectl drain harbour-wk-1 --ignore-daemonsets --delete-emptydir-data --timeout=180s
+          ssh harbour-wk-1 'sudo bash -s' <<'EOS'
+          set -e
+          sed -i 's#/v1\.36/#/v1.37/#' /etc/apt/sources.list.d/kubernetes.list
+          apt-mark unhold kubeadm kubelet kubectl
+          apt-get update -q
+          apt-get install -y kubeadm='1.37.1-*'
+          kubeadm upgrade node
+          apt-get install -y kubelet='1.37.1-*' kubectl='1.37.1-*'
+          apt-mark hold kubeadm kubelet kubectl
+          EOS
+          kubectl uncordon harbour-wk-1
+    - id: left-cordoned
+      description: Forgets to uncordon.
+      feedback: The node takes no Pods until uncordoned.
+      expectFail: [in-service]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 600
+        run: |
+          kubectl config use-context qm-harbour
+          kubectl drain harbour-wk-1 --ignore-daemonsets --delete-emptydir-data --timeout=180s
+          ssh harbour-wk-1 'sudo bash -s' <<'EOS'
+          set -e
+          sed -i 's#/v1\.36/#/v1.37/#' /etc/apt/sources.list.d/kubernetes.list
+          apt-mark unhold kubeadm kubelet kubectl
+          apt-get update -q
+          apt-get install -y kubeadm='1.37.1-*'
+          kubeadm upgrade node
+          apt-get install -y kubelet='1.37.1-*' kubectl='1.37.1-*'
+          apt-mark hold kubeadm kubelet kubectl
+          systemctl daemon-reload && systemctl restart kubelet
+          EOS
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 600
+        run: |
+          kubectl config use-context qm-harbour
+          kubectl drain harbour-wk-1 --ignore-daemonsets --delete-emptydir-data --timeout=180s
+          ssh harbour-wk-1 'sudo bash -s' <<'EOS'
+          set -e
+          sed -i 's#/v1\.36/#/v1.37/#' /etc/apt/sources.list.d/kubernetes.list
+          apt-mark unhold kubeadm kubelet kubectl
+          apt-get update -q
+          apt-get install -y kubeadm='1.37.1-*'
+          kubeadm upgrade node
+          apt-get install -y kubelet='1.37.1-*' kubectl='1.37.1-*'
+          apt-mark hold kubeadm kubelet kubectl
+          systemctl daemon-reload && systemctl restart kubelet
+          EOS
+          kubectl wait node/harbour-wk-1 --for=condition=Ready --timeout=180s
+          kubectl uncordon harbour-wk-1

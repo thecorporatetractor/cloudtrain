@@ -1,0 +1,276 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: shared-scratch-emptydir
+  title: Share scratch data between containers
+  domain: kubernetes
+  frameworks: [cka:storage, ckad:design-build]
+  difficulty: easy
+  estimatedMinutes: 10
+  tags: [emptydir, projected, downward-api, secrets, volumes]
+  version: 1
+spec:
+  description: |
+    The depot's label renderer draws label images that its uploader container
+    sends to the carrier. The images are short-lived, so they should never
+    touch a disk; the uploader also needs the carrier's API key and the Pod's
+    labels (it tags each upload with them).
+
+    Use context `qm-depot`:
+
+    ```bash
+    kubectl config use-context qm-depot
+    ```
+
+    Change Deployment **`label-renderer`** in namespace `label-printing`:
+
+    1. Add a volume **`scratch`**: an `emptyDir` kept **in memory** and capped
+       at **{{size}}**. Mount it at `/scratch` in **both** containers
+       (`renderer` and `uploader`).
+    2. Add **one** volume **`meta`** of type `projected` that combines the
+       Pod's **labels** (downward API, file `labels`) and the key `api-key` of
+       Secret **`carrier-credentials`** (file `carrier/api-key`). Mount it
+       read-only at `/etc/podinfo` in the `uploader` container.
+
+    Wait until the change has rolled out.
+  objectives:
+    - Use a memory-backed emptyDir with a size limit
+    - Share a volume between containers of one Pod
+    - Combine downward API and Secret data in a projected volume
+  params:
+    size:
+      type: choice
+      values: [256Mi, 128Mi, 192Mi]
+    key:
+      type: choice
+      values: [nl-4c1e9a7f, nl-90b2d6e3, nl-5fa7c018]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-depot
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: qm-depot
+  setup:
+    - on: qm-depot
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: label-printing}
+        ---
+        apiVersion: v1
+        kind: Secret
+        metadata: {name: carrier-credentials, namespace: label-printing}
+        type: Opaque
+        stringData:
+          api-key: "{{key}}"
+          account: quillmoor-depot-7
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: label-renderer, namespace: label-printing}
+        spec:
+          replicas: 1
+          selector: {matchLabels: {app: label-renderer}}
+          template:
+            metadata: {labels: {app: label-renderer, depot: north-7}}
+            spec:
+              containers:
+                - name: renderer
+                  image: busybox:1.37
+                  command: ["sh", "-c", "while true; do sleep 30; done"]
+                - name: uploader
+                  image: busybox:1.37
+                  command: ["sh", "-c", "while true; do sleep 30; done"]
+    - on: qm-depot
+      timeoutSec: 150
+      run: kubectl -n label-printing rollout status deploy/label-renderer --timeout=120s
+  teardown:
+    - on: qm-depot
+      run: kubectl delete namespace label-printing --ignore-not-found --wait=false
+  checks:
+    - id: context
+      description: Terminal is using context qm-depot
+      type: k8s-context
+      on: workstation
+      skills: [k8s.cli.contexts]
+      weight: 0.5
+      expect: {match: exact, value: qm-depot}
+    - id: scratch-volume
+      description: Volume scratch is a memory-backed emptyDir with sizeLimit {{size}}
+      type: shell
+      on: qm-depot
+      skills: [k8s.storage.ephemeral-volumes, k8s.storage.capacity-units]
+      weight: 2
+      command: |
+        kubectl -n label-printing get deployment label-renderer -o json \
+          | jq -r '.spec.template.spec.volumes[]? | select(.name == "scratch") | "medium=\(.emptyDir.medium) size=\(.emptyDir.sizeLimit)"'
+      expect: {match: exact, value: "medium=Memory size={{size}}"}
+    - id: scratch-shared
+      description: A file written to /scratch by renderer is readable by uploader
+      type: shell
+      on: qm-depot
+      skills: [k8s.storage.ephemeral-volumes]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        f=/scratch/.ct-probe-$$
+        kubectl -n label-printing exec deploy/label-renderer -c renderer -- sh -c "echo shared > $f" 2>/dev/null
+        r=$(kubectl -n label-printing exec deploy/label-renderer -c uploader -- cat $f 2>/dev/null)
+        kubectl -n label-printing exec deploy/label-renderer -c renderer -- rm -f $f 2>/dev/null
+        echo "${r:-not shared}"
+      expect: {match: exact, value: shared}
+    - id: meta-projected
+      description: Volume meta is one projected volume with downward API labels and the carrier-credentials Secret
+      type: shell
+      on: qm-depot
+      skills: [k8s.storage.ephemeral-volumes]
+      command: |
+        kubectl -n label-printing get deployment label-renderer -o json | jq -r '
+          [.spec.template.spec.volumes[]? | select(.name == "meta") | .projected.sources[]?
+           | if .downwardAPI then "downward:" + ([.downwardAPI.items[] | "\(.path)=\(.fieldRef.fieldPath)"] | join(","))
+             elif .secret then "secret:\(.secret.name):" + ([.secret.items[]? | "\(.key)>\(.path)"] | join(","))
+             else "other" end] | sort | join(" ")'
+      expect: {match: exact, value: "downward:labels=metadata.labels secret:carrier-credentials:api-key>carrier/api-key"}
+    - id: meta-content
+      description: The uploader reads the Pod labels and the API key under /etc/podinfo, mounted read-only
+      type: shell
+      on: qm-depot
+      skills: [k8s.storage.ephemeral-volumes]
+      timeoutSec: 20
+      command: |
+        k() { kubectl -n label-printing exec deploy/label-renderer -c uploader -- "$@" 2>/dev/null; }
+        echo "$(k grep -c 'depot="north-7"' /etc/podinfo/labels) $(k cat /etc/podinfo/carrier/api-key) $(k sh -c 'touch /etc/podinfo/x 2>/dev/null && echo writable || echo ro')"
+      expect: {match: exact, value: "1 {{key}} ro"}
+    - id: rolled-out
+      description: The Deployment rolled out (1 updated, ready replica)
+      type: k8s-query
+      skills: [k8s.storage.ephemeral-volumes]
+      weight: 0.5
+      query: {cluster: qm-depot, resource: deployment, name: label-renderer, namespace: label-printing, jsonpath: '{.status.updatedReplicas}/{.status.readyReplicas}/{.status.replicas}'}
+      expect: {match: exact, value: 1/1/1}
+  hints:
+    - title: Switch context
+      body: The renderer runs in qm-depot.
+      command: kubectl config use-context qm-depot
+      cost: 0
+    - title: Memory-backed emptyDir
+      body: "`emptyDir.medium: Memory` puts the volume on tmpfs; `sizeLimit` caps it (and counts against the containers' memory)."
+      cost: 1
+    - title: Projected volumes
+      body: |
+        A `projected` volume has a list of `sources`; each can be a
+        `downwardAPI`, `secret`, `configMap` or `serviceAccountToken` source
+        with its own `items`.
+      command: kubectl explain deployment.spec.template.spec.volumes.projected.sources
+      cost: 1
+    - title: The volumes block
+      body: |
+        ```yaml
+        volumes:
+          - name: scratch
+            emptyDir: {medium: Memory, sizeLimit: {{size}}}
+          - name: meta
+            projected:
+              sources:
+                - downwardAPI:
+                    items: [{path: labels, fieldRef: {fieldPath: metadata.labels}}]
+                - secret:
+                    name: carrier-credentials
+                    items: [{key: api-key, path: carrier/api-key}]
+        ```
+      cost: 3
+  misconceptions:
+    - id: disk-backed
+      description: Uses a plain emptyDir, which lives on the node's disk.
+      feedback: "Without `medium: Memory` the emptyDir is a directory on the node's disk. Set the medium to keep the images in RAM."
+      expectFail: [scratch-volume]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n label-printing patch deployment label-renderer -p '{"spec":{"template":{"spec":{
+            "volumes":[{"name":"scratch","emptyDir":{"sizeLimit":"{{size}}"}},
+                       {"name":"meta","projected":{"sources":[{"downwardAPI":{"items":[{"path":"labels","fieldRef":{"fieldPath":"metadata.labels"}}]}},{"secret":{"name":"carrier-credentials","items":[{"key":"api-key","path":"carrier/api-key"}]}}]}}],
+            "containers":[{"name":"renderer","volumeMounts":[{"name":"scratch","mountPath":"/scratch"}]},
+                          {"name":"uploader","volumeMounts":[{"name":"scratch","mountPath":"/scratch"},{"name":"meta","mountPath":"/etc/podinfo","readOnly":true}]}]}}}}'
+          kubectl -n label-printing rollout status deploy/label-renderer --timeout=120s
+    - id: two-volumes
+      description: Creates a separate downwardAPI volume and a secret volume instead of one projected volume.
+      feedback: Two volumes cannot share one mount path. A projected volume merges several sources into one directory.
+      expectFail: [meta-projected]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n label-printing patch deployment label-renderer -p '{"spec":{"template":{"spec":{
+            "volumes":[{"name":"scratch","emptyDir":{"medium":"Memory","sizeLimit":"{{size}}"}},
+                       {"name":"meta","downwardAPI":{"items":[{"path":"labels","fieldRef":{"fieldPath":"metadata.labels"}}]}},
+                       {"name":"carrier","secret":{"secretName":"carrier-credentials","items":[{"key":"api-key","path":"api-key"}]}}],
+            "containers":[{"name":"renderer","volumeMounts":[{"name":"scratch","mountPath":"/scratch"}]},
+                          {"name":"uploader","volumeMounts":[{"name":"scratch","mountPath":"/scratch"},{"name":"meta","mountPath":"/etc/podinfo","readOnly":true},{"name":"carrier","mountPath":"/etc/carrier","readOnly":true}]}]}}}}'
+          kubectl -n label-printing rollout status deploy/label-renderer --timeout=120s
+    - id: scratch-in-one-container
+      description: Mounts scratch only in the renderer.
+      feedback: A volume is shared only by the containers that mount it. Add the mount to the uploader as well.
+      expectFail: [scratch-shared]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n label-printing patch deployment label-renderer -p '{"spec":{"template":{"spec":{
+            "volumes":[{"name":"scratch","emptyDir":{"medium":"Memory","sizeLimit":"{{size}}"}},
+                       {"name":"meta","projected":{"sources":[{"downwardAPI":{"items":[{"path":"labels","fieldRef":{"fieldPath":"metadata.labels"}}]}},{"secret":{"name":"carrier-credentials","items":[{"key":"api-key","path":"carrier/api-key"}]}}]}}],
+            "containers":[{"name":"renderer","volumeMounts":[{"name":"scratch","mountPath":"/scratch"}]},
+                          {"name":"uploader","volumeMounts":[{"name":"meta","mountPath":"/etc/podinfo","readOnly":true}]}]}}}}'
+          kubectl -n label-printing rollout status deploy/label-renderer --timeout=120s
+  solution:
+    explanation: |
+      `emptyDir: {medium: Memory, sizeLimit: ...}` is a tmpfs that lives as
+      long as the Pod and is shared by every container that mounts it. A
+      `projected` volume merges the downward API's `metadata.labels` and one
+      key of the Secret into a single read-only directory.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n label-printing patch deployment label-renderer -p '{"spec":{"template":{"spec":{
+            "volumes":[{"name":"scratch","emptyDir":{"medium":"Memory","sizeLimit":"{{size}}"}},
+                       {"name":"meta","projected":{"sources":[{"downwardAPI":{"items":[{"path":"labels","fieldRef":{"fieldPath":"metadata.labels"}}]}},{"secret":{"name":"carrier-credentials","items":[{"key":"api-key","path":"carrier/api-key"}]}}]}}],
+            "containers":[{"name":"renderer","volumeMounts":[{"name":"scratch","mountPath":"/scratch"}]},
+                          {"name":"uploader","volumeMounts":[{"name":"scratch","mountPath":"/scratch"},{"name":"meta","mountPath":"/etc/podinfo","readOnly":true}]}]}}}}'
+          kubectl -n label-printing rollout status deploy/label-renderer --timeout=120s
+    alternatives:
+      - id: yq-edit
+        description: Edit an exported manifest with yq and apply it.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 150
+            run: |
+              kubectl config use-context qm-depot
+              kubectl -n label-printing get deployment label-renderer -o yaml | yq '
+                .spec.template.spec.volumes = [
+                  {"name": "scratch", "emptyDir": {"medium": "Memory", "sizeLimit": "{{size}}"}},
+                  {"name": "meta", "projected": {"defaultMode": 0440, "sources": [
+                    {"secret": {"name": "carrier-credentials", "items": [{"key": "api-key", "path": "carrier/api-key"}]}},
+                    {"downwardAPI": {"items": [{"path": "labels", "fieldRef": {"fieldPath": "metadata.labels"}}]}}]}}]
+                | (.spec.template.spec.containers[] | select(.name == "renderer")).volumeMounts = [{"name": "scratch", "mountPath": "/scratch"}]
+                | (.spec.template.spec.containers[] | select(.name == "uploader")).volumeMounts = [
+                    {"name": "scratch", "mountPath": "/scratch"}, {"name": "meta", "mountPath": "/etc/podinfo", "readOnly": true}]' \
+                | kubectl apply -f -
+              kubectl -n label-printing rollout status deploy/label-renderer --timeout=120s

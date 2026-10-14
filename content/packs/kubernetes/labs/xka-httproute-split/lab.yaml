@@ -1,0 +1,197 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xka-httproute-split
+  title: Migrate an Ingress to Gateway API
+  domain: kubernetes
+  frameworks: [cka:services-networking]
+  difficulty: hard
+  estimatedMinutes: 12
+  tags: [exam, gateway-api, ingress, migration]
+  version: 1
+spec:
+  description: |
+    **Context:** `qm-tracking` (`kubectl config use-context qm-tracking`)
+
+    The Ingress **`berth-portal`** in namespace **`berth-portal`** routes host
+    `berths.quillmoor.example`. Replace it with Gateway API:
+
+    1. a Gateway **`berth-portal`** in the same namespace, on the cluster's
+       GatewayClass (`kubectl get gatewayclass`), with an HTTP listener on
+       port **80** for that host;
+    2. an HTTPRoute **`berth-portal`** attached to it that serves the same
+       paths with the same backends as the Ingress;
+    3. then delete the Ingress.
+
+    The controller listens on port 30080 of every node.
+  objectives:
+    - Translate Ingress rules into a Gateway and an HTTPRoute
+  params:
+    second:
+      type: choice
+      values: [status, timetable, pilots]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-tracking
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-tracking
+          nodes:
+            - {name: tracking-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: tracking-wk-1, role: worker}
+            - {name: tracking-wk-2, role: worker}
+  setup:
+    - on: qm-tracking/tracking-cp-1
+      timeoutSec: 400
+      run: /opt/cloudtrain/bin/addons-install gateway --wait
+    - on: qm-tracking
+      timeoutSec: 200
+      run: |
+        set -e
+        kubectl create namespace berth-portal --dry-run=client -o yaml | kubectl apply -f -
+        for p in schedule {{second}}; do
+          kubectl -n berth-portal create deployment berth-$p --image=busybox:1.37 --dry-run=client -o json -- \
+            sh -c "mkdir -p /www/$p && echo berth-$p > /www/$p/index.html && exec httpd -f -p 80 -h /www" | kubectl apply -f -
+          kubectl -n berth-portal create service clusterip berth-$p --tcp=80:80 --dry-run=client -o yaml | kubectl apply -f -
+        done
+        kubectl -n berth-portal create ingress berth-portal --class=traefik \
+          --rule="berths.quillmoor.example/schedule*=berth-schedule:80" --rule="berths.quillmoor.example/{{second}}*=berth-{{second}}:80" \
+          --dry-run=client -o yaml | kubectl apply -f -
+        kubectl -n berth-portal rollout status deploy/berth-schedule --timeout=150s
+        kubectl -n berth-portal rollout status deploy/berth-{{second}} --timeout=150s
+  teardown:
+    - on: qm-tracking
+      run: kubectl delete namespace berth-portal --ignore-not-found --wait=false
+  checks:
+    - id: gateway
+      description: Gateway berth-portal is programmed with an HTTP listener on 80 for the host
+      type: shell
+      on: qm-tracking
+      skills: [k8s.networking.gateway-api]
+      command: |
+        kubectl -n berth-portal get gateway berth-portal -o json 2>/dev/null | jq -r '"\(.spec.gatewayClassName) \([.spec.listeners[] | "\(.protocol):\(.port):\(.hostname // "*")"] | join(",")) \([.status.conditions[]? | select(.type == "Programmed") | .status] | join(""))"'
+      expect: {match: exact, value: traefik HTTP:80:berths.quillmoor.example True}
+    - id: routes
+      description: Both paths answer through the Gateway with the right backends
+      type: shell
+      on: workstation
+      skills: [k8s.networking.gateway-api]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        for p in schedule {{second}}; do curl -s -m 5 -H 'Host: berths.quillmoor.example' http://tracking-wk-1:30080/$p/ || echo "fail-$p"; done | paste -sd' ' -
+      expect: {match: exact, value: "berth-schedule berth-{{second}}"}
+    - id: route-object
+      description: HTTPRoute berth-portal is attached to the Gateway and accepted
+      type: shell
+      on: qm-tracking
+      skills: [k8s.networking.gateway-api]
+      command: |
+        kubectl -n berth-portal get httproute berth-portal -o json 2>/dev/null | jq -r '"\(.spec.parentRefs[0].name) \([.status.parents[]?.conditions[]? | select(.type == "Accepted") | .status] | join(""))"'
+      expect: {match: exact, value: berth-portal True}
+    - id: ingress-gone
+      description: The Ingress is deleted
+      type: shell
+      on: qm-tracking
+      skills: [k8s.networking.gateway-api]
+      weight: 0.5
+      command: kubectl -n berth-portal get ingress --no-headers 2>/dev/null | wc -l
+      expect: {match: exact, value: "0"}
+  misconceptions:
+    - id: ingress-kept
+      description: Creates the Gateway and route but leaves the Ingress.
+      feedback: Two objects now claim the same host; the migration ends with deleting the Ingress.
+      expectFail: [ingress-gone]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-tracking
+          kubectl apply -f - <<'YAML'
+          apiVersion: gateway.networking.k8s.io/v1
+          kind: Gateway
+          metadata: {name: berth-portal, namespace: berth-portal}
+          spec:
+            gatewayClassName: traefik
+            listeners: [{name: http, protocol: HTTP, port: 80, hostname: berths.quillmoor.example}]
+          ---
+          apiVersion: gateway.networking.k8s.io/v1
+          kind: HTTPRoute
+          metadata: {name: berth-portal, namespace: berth-portal}
+          spec:
+            parentRefs: [{name: berth-portal}]
+            hostnames: [berths.quillmoor.example]
+            rules:
+              - matches: [{path: {type: PathPrefix, value: /schedule}}]
+                backendRefs: [{name: berth-schedule, port: 80}]
+              - matches: [{path: {type: PathPrefix, value: /{{second}}}}]
+                backendRefs: [{name: berth-{{second}}, port: 80}]
+          YAML
+          kubectl -n berth-portal wait gateway/berth-portal --for=condition=Programmed --timeout=60s
+    - id: one-path
+      description: Migrates only the first path before deleting the Ingress.
+      feedback: Carry every Ingress rule over to the HTTPRoute.
+      expectFail: [routes]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-tracking
+          kubectl apply -f - <<'YAML'
+          apiVersion: gateway.networking.k8s.io/v1
+          kind: Gateway
+          metadata: {name: berth-portal, namespace: berth-portal}
+          spec:
+            gatewayClassName: traefik
+            listeners: [{name: http, protocol: HTTP, port: 80, hostname: berths.quillmoor.example}]
+          ---
+          apiVersion: gateway.networking.k8s.io/v1
+          kind: HTTPRoute
+          metadata: {name: berth-portal, namespace: berth-portal}
+          spec:
+            parentRefs: [{name: berth-portal}]
+            hostnames: [berths.quillmoor.example]
+            rules:
+              - matches: [{path: {type: PathPrefix, value: /schedule}}]
+                backendRefs: [{name: berth-schedule, port: 80}]
+          YAML
+          kubectl -n berth-portal delete ingress berth-portal
+          kubectl -n berth-portal wait gateway/berth-portal --for=condition=Programmed --timeout=60s
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-tracking
+          kubectl -n berth-portal get ingress berth-portal -o yaml
+          kubectl apply -f - <<'YAML'
+          apiVersion: gateway.networking.k8s.io/v1
+          kind: Gateway
+          metadata: {name: berth-portal, namespace: berth-portal}
+          spec:
+            gatewayClassName: traefik
+            listeners: [{name: http, protocol: HTTP, port: 80, hostname: berths.quillmoor.example}]
+          ---
+          apiVersion: gateway.networking.k8s.io/v1
+          kind: HTTPRoute
+          metadata: {name: berth-portal, namespace: berth-portal}
+          spec:
+            parentRefs: [{name: berth-portal}]
+            hostnames: [berths.quillmoor.example]
+            rules:
+              - matches: [{path: {type: PathPrefix, value: /schedule}}]
+                backendRefs: [{name: berth-schedule, port: 80}]
+              - matches: [{path: {type: PathPrefix, value: /{{second}}}}]
+                backendRefs: [{name: berth-{{second}}, port: 80}]
+          YAML
+          kubectl -n berth-portal delete ingress berth-portal
+          kubectl -n berth-portal wait gateway/berth-portal --for=condition=Programmed --timeout=60s
+          sleep 5

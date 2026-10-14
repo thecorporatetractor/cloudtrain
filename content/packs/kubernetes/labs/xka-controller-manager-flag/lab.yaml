@@ -1,0 +1,142 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xka-controller-manager-flag
+  title: Repair the controller manager
+  domain: kubernetes
+  frameworks: [cka:troubleshooting]
+  difficulty: hard
+  estimatedMinutes: 12
+  tags: [exam, controller-manager, static-pods]
+  version: 1
+spec:
+  description: |
+    **Context:** `qm-capacity` (`kubectl config use-context qm-capacity`);
+    **host** `capacity-cp-1` (`ssh capacity-cp-1`; `sudo` and `crictl`
+    work there)
+
+    New Deployments on `qm-capacity` create no Pods: the Deployment
+    **`forecast-runner`** in namespace **`capacity-plan`** has had no
+    ReplicaSet since it was created. Fix the broken control-plane component
+    (a static Pod on `capacity-cp-1`) so that the Deployment's
+    {{replicas}} Pods come up. Undo only the faulty change.
+  objectives:
+    - Tell which control-plane component owns ReplicaSets and Pods
+    - Repair a static Pod manifest using crictl output
+  params:
+    bad:
+      type: choice
+      values: [controller-manager.config, controller-manager.kubeconfig, kube-controller-manager.conf]
+    replicas:
+      type: int
+      min: 2
+      max: 3
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-capacity
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-capacity
+          nodes:
+            - {name: capacity-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: capacity-wk-1, role: worker}
+            - {name: capacity-wk-2, role: worker}
+  setup:
+    - on: qm-capacity/capacity-cp-1
+      timeoutSec: 150
+      run: |
+        set -e
+        m=/etc/kubernetes/manifests/kube-controller-manager.yaml
+        mkdir -p /var/lib/cloudtrain
+        [ -f /var/lib/cloudtrain/kcm-flags.orig ] || grep -- '- --' $m | sed 's/^ *//' | sort > /var/lib/cloudtrain/kcm-flags.orig
+        sed -i 's#--kubeconfig=/etc/kubernetes/controller-manager.conf$#--kubeconfig=/etc/kubernetes/{{bad}}#' $m
+        grep -q -- '--kubeconfig=/etc/kubernetes/{{bad}}' $m
+        for i in $(seq 1 40); do crictl ps --name '^kube-controller-manager$' --state running -q | grep -q . || break; sleep 3; done
+    - on: qm-capacity
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: capacity-plan}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: forecast-runner, namespace: capacity-plan}
+        spec:
+          replicas: {{replicas}}
+          selector: {matchLabels: {app: forecast-runner}}
+          template:
+            metadata: {labels: {app: forecast-runner}}
+            spec:
+              terminationGracePeriodSeconds: 1
+              containers:
+                - {name: runner, image: "busybox:1.37", command: ["sh", "-c", "while true; do sleep 30; done"]}
+  teardown:
+    - on: qm-capacity
+      run: kubectl delete namespace capacity-plan --ignore-not-found --wait=false
+  checks:
+    - id: kcm-running
+      description: kube-controller-manager runs on capacity-cp-1
+      type: shell
+      on: qm-capacity/capacity-cp-1
+      skills: [k8s.troubleshooting.control-plane, k8s.cluster.container-runtime]
+      command: echo "running=$(crictl ps --name '^kube-controller-manager$' --state running -q | wc -l)"
+      expect: {match: exact, value: running=1}
+    - id: manifest-restored
+      description: The manifest has exactly its original flags again
+      type: shell
+      on: qm-capacity/capacity-cp-1
+      skills: [k8s.troubleshooting.control-plane]
+      weight: 2
+      command: |
+        grep -- '- --' /etc/kubernetes/manifests/kube-controller-manager.yaml | sed 's/^ *//' | sort | diff -q - /var/lib/cloudtrain/kcm-flags.orig >/dev/null && echo original || echo changed
+      expect: {match: exact, value: original}
+    - id: pods-created
+      description: forecast-runner has {{replicas}} ready Pods
+      type: k8s-query
+      skills: [k8s.troubleshooting.control-plane]
+      weight: 2
+      query: {cluster: qm-capacity, resource: deployment, name: forecast-runner, namespace: capacity-plan, jsonpath: '{.status.readyReplicas}'}
+      expect: {match: exact, value: "{{replicas}}"}
+  misconceptions:
+    - id: create-pods-by-hand
+      description: Creates the Pods directly instead of fixing the controller manager.
+      feedback: Bare Pods are not managed by the Deployment, and every other controller stays down.
+      expectFail: [kcm-running, manifest-restored, pods-created]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          kubectl config use-context qm-capacity
+          for i in $(seq 1 {{replicas}}); do kubectl -n capacity-plan run forecast-runner-$i --image=busybox:1.37 -l app=forecast-runner -- sleep 3600; done
+          sleep 20
+    - id: copy-kubeconfig
+      description: Copies the kubeconfig to the wrong name instead of fixing the flag.
+      feedback: The manifest should match kubeadm's layout again; fix the flag.
+      expectFail: [manifest-restored]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          kubectl config use-context qm-capacity
+          ssh capacity-cp-1 'sudo cp /etc/kubernetes/controller-manager.conf /etc/kubernetes/{{bad}}'
+          kubectl -n capacity-plan rollout status deploy/forecast-runner --timeout=240s
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          kubectl config use-context qm-capacity
+          ssh capacity-cp-1 'sudo crictl logs $(sudo crictl ps -a --name kube-controller-manager -q | head -1) 2>&1 | tail -3'
+          ssh capacity-cp-1 'sudo sed -i "s#--kubeconfig=/etc/kubernetes/{{bad}}#--kubeconfig=/etc/kubernetes/controller-manager.conf#" /etc/kubernetes/manifests/kube-controller-manager.yaml'
+          kubectl -n capacity-plan rollout status deploy/forecast-runner --timeout=240s

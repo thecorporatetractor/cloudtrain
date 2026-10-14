@@ -1,0 +1,157 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xka-service-selector-fix
+  title: Restore traffic to a Service with no backends
+  domain: kubernetes
+  frameworks: [cka:troubleshooting]
+  difficulty: medium
+  estimatedMinutes: 7
+  tags: [exam, services, endpointslices]
+  version: 1
+spec:
+  description: |
+    **Context:** `qm-depot` (`kubectl config use-context qm-depot`)
+
+    In namespace **`berth-status`**, the Service **`berth-status`** has no
+    entries in its EndpointSlices, so the Pod `probe` gets no answer from
+    `http://berth-status`. Fix the **Service** so that `probe` receives HTTP
+    200 from it. Do not change the Deployment `berth-status-api`.
+  objectives:
+    - Compare a Service selector with Pod labels
+    - Match a Service targetPort to the container port
+  params:
+    port:
+      type: choice
+      values: ["8080", "8000", "9090"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-depot
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: qm-depot
+  setup:
+    - on: qm-depot
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: berth-status}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: berth-status-api, namespace: berth-status}
+        spec:
+          replicas: 2
+          selector: {matchLabels: {component: status-api}}
+          template:
+            metadata: {labels: {component: status-api, suite: berths}}
+            spec:
+              terminationGracePeriodSeconds: 1
+              containers:
+                - name: api
+                  image: busybox:1.37
+                  command: ["sh", "-c", "mkdir -p /www && echo berths-ok > /www/index.html && exec httpd -f -p {{port}} -h /www"]
+                  ports: [{name: http, containerPort: {{port}}}]
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata: {name: berth-status, namespace: berth-status}
+        spec:
+          selector: {app: berth-status}
+          ports: [{port: 80, targetPort: 80}]
+        ---
+        apiVersion: v1
+        kind: Pod
+        metadata: {name: probe, namespace: berth-status}
+        spec:
+          terminationGracePeriodSeconds: 1
+          containers:
+            - {name: probe, image: "busybox:1.37", command: ["sleep", "1d"]}
+    - on: qm-depot
+      timeoutSec: 120
+      run: |
+        kubectl -n berth-status rollout status deploy/berth-status-api --timeout=100s
+        kubectl -n berth-status wait pod/probe --for=condition=Ready --timeout=60s
+  teardown:
+    - on: qm-depot
+      run: kubectl delete namespace berth-status --ignore-not-found --wait=false
+  checks:
+    - id: endpoints
+      description: The Service's EndpointSlices list both API Pods as ready on port {{port}}
+      type: shell
+      on: qm-depot
+      skills: [k8s.networking.endpoints]
+      weight: 2
+      command: |
+        kubectl -n berth-status get endpointslices -l kubernetes.io/service-name=berth-status -o json | jq -r '
+          [.items[] | .ports[0].port as $p | .endpoints[]? | select(.conditions.ready) | "\(.targetRef.name | test("^berth-status-api-"))@\($p)"] | sort | join(",")'
+      expect: {match: exact, value: "true@{{port}},true@{{port}}"}
+    - id: probe-200
+      description: probe gets the page from http://berth-status
+      type: shell
+      on: qm-depot
+      skills: [k8s.troubleshooting.networking]
+      weight: 2
+      timeoutSec: 20
+      command: kubectl -n berth-status exec probe -- wget -q -T 5 -O - http://berth-status 2>/dev/null || echo "no answer"
+      expect: {match: exact, value: berths-ok}
+    - id: deployment-untouched
+      description: The Deployment was not changed
+      type: k8s-query
+      skills: [k8s.cli.scoped-changes]
+      weight: 0.5
+      query: {cluster: qm-depot, resource: deployment, name: berth-status-api, namespace: berth-status, jsonpath: '{.metadata.generation} {.spec.template.metadata.labels.component}'}
+      expect: {match: exact, value: 1 status-api}
+  misconceptions:
+    - id: selector-only
+      description: Fixes the selector but keeps targetPort 80.
+      feedback: The Pods listen on {{port}}. With the wrong targetPort the endpoints exist but connections fail.
+      expectFail: [endpoints, probe-200]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n berth-status patch svc berth-status --type=json -p '[{"op":"replace","path":"/spec/selector","value":{"component":"status-api"}}]'
+          sleep 5
+    - id: relabel-deployment
+      description: Adds the Service's label to the Deployment's Pods instead.
+      feedback: The task forbids changing the Deployment; fix the Service.
+      expectFail: [deployment-untouched]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n berth-status patch deploy berth-status-api -p '{"spec":{"template":{"metadata":{"labels":{"app":"berth-status"}}}}}'
+          kubectl -n berth-status patch svc berth-status -p '{"spec":{"ports":[{"port":80,"targetPort":{{port}}}]}}'
+          kubectl -n berth-status rollout status deploy/berth-status-api --timeout=100s
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n berth-status patch svc berth-status --type=json -p '[
+            {"op":"replace","path":"/spec/selector","value":{"component":"status-api"}},
+            {"op":"replace","path":"/spec/ports/0/targetPort","value":"http"}]'
+          sleep 5
+    alternatives:
+      - id: numeric-target-port
+        description: Edit the Service with yq and a numeric targetPort.
+        steps:
+          - on: workstation
+            as: learner
+            run: |
+              kubectl config use-context qm-depot
+              kubectl -n berth-status get svc berth-status -o yaml \
+                | yq '.spec.selector = {"component": "status-api", "suite": "berths"} | .spec.ports[0].targetPort = {{port}}' | kubectl apply -f -
+              sleep 5

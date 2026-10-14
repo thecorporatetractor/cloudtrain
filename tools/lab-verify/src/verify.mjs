@@ -213,7 +213,9 @@ export async function checkLab(labFile, skills, frameworkRefs, findings, ctx = {
   if (doc.metadata.id !== dirName) findings.push({ level: "error", file: labFile, path: "/metadata/id", message: `id '${doc.metadata.id}' must match directory '${dirName}'` });
 
   for (const f of doc.metadata.frameworks ?? []) {
-    if (!frameworkRefs.has(f)) findings.push({ level: "error", file: labFile, path: "/metadata/frameworks", message: `unknown framework objective '${f}'` });
+    // Objectives may also come from frameworks declared only in content/curriculum.yaml
+    // (CloudTrain's own capstone frameworks, e.g. ct-platform); those carry no skill map.
+    if (!frameworkRefs.has(f) && !ctx.curriculumRefs?.has(f)) findings.push({ level: "error", file: labFile, path: "/metadata/frameworks", message: `unknown framework objective '${f}'` });
   }
 
   const spec = doc.spec;
@@ -370,15 +372,18 @@ export async function checkLab(labFile, skills, frameworkRefs, findings, ctx = {
     if (p.type === "int" && !(Number.isInteger(p.min) && Number.isInteger(p.max) && p.min <= p.max)) findings.push({ level: "error", file: labFile, path: `/spec/params/${name}`, message: "int param needs min <= max" });
   }
 
-  // Authoring quality bar for the pack.
-  if (!spec.hints?.length) findings.push({ level: "warn", file: labFile, message: "no hints" });
+  // Authoring quality bar for the pack. Exam tasks (curriculum type exam) are
+  // graded without help, so they must have no hints instead.
+  if (ctx.examTasks?.has(doc.metadata.id)) {
+    if (spec.hints?.length) findings.push({ level: "error", file: labFile, path: "/spec/hints", message: "exam task must not have hints" });
+  } else if (!spec.hints?.length) findings.push({ level: "warn", file: labFile, message: "no hints" });
   if (!spec.misconceptions?.length) findings.push({ level: "warn", file: labFile, message: "no misconceptions" });
 
   return doc;
 }
 
 /** Checks pack.yaml course membership against the labs on disk. */
-export async function checkPack(packDir, labIds, findings) {
+export async function checkPack(packDir, labIds, findings, examTasks = new Set()) {
   const file = path.join(packDir, "pack.yaml");
   if (!existsSync(file)) {
     findings.push({ level: "error", file: packDir, message: "missing pack.yaml" });
@@ -393,7 +398,8 @@ export async function checkPack(packDir, labIds, findings) {
       inCourses.add(l);
     }
   }
-  for (const l of labIds) if (!inCourses.has(l)) findings.push({ level: "warn", file, message: `lab '${l}' is not in any course` });
+  // Exam tasks are drawn by exam simulations, never taken from a course.
+  for (const l of labIds) if (!inCourses.has(l) && !examTasks.has(l)) findings.push({ level: "warn", file, message: `lab '${l}' is not in any course` });
   const courseIds = new Set((doc.courses ?? []).map((c) => c.id));
   for (const p of doc.paths ?? []) {
     for (const c of p.courses ?? []) if (!courseIds.has(c)) findings.push({ level: "error", file, path: p.id, message: `path lists unknown course '${c}'` });
@@ -427,6 +433,15 @@ export async function verifyContent(contentDir, opts = {}) {
   const catalog = await loadCatalog(opts.catalogFile ?? path.resolve(contentDir, "../deploy/images/catalog.yaml"), findings);
   const usedSkills = new Set();
   const labs = [];
+  // Exam tasks (curriculum labs of type exam) follow exam rules: no hints, no course.
+  const examTasks = new Set();
+  const curriculumRefs = new Set();
+  const curriculumFile = path.join(contentDir, "curriculum.yaml");
+  if (existsSync(curriculumFile)) {
+    const cur = await loadYaml(curriculumFile, []);
+    for (const l of cur?.labs ?? []) if (l?.type === "exam") examTasks.add(l.id);
+    for (const f of cur?.frameworks ?? []) for (const o of f?.objectives ?? []) curriculumRefs.add(`${f.id}:${o.id}`);
+  }
   /** @type {Map<string, { domain?: string, frameworks?: string[] }>} */
   const packLabs = new Map();
   const packsDir = path.join(contentDir, "packs");
@@ -441,13 +456,13 @@ export async function verifyContent(contentDir, opts = {}) {
         continue;
       }
       const before = findings.filter((f) => f.level === "error").length;
-      const doc = await checkLab(labFile, skills, frameworkRefs, findings, { catalog, usedSkills });
+      const doc = await checkLab(labFile, skills, frameworkRefs, findings, { catalog, usedSkills, examTasks, curriculumRefs });
       const ok = findings.filter((f) => f.level === "error").length === before;
       labs.push({ file: labFile, id: doc?.metadata?.id ?? lab, ok, checks: doc?.spec?.checks?.length ?? 0 });
       packLabs.set(doc?.metadata?.id ?? lab, { domain: doc?.metadata?.domain, frameworks: doc?.metadata?.frameworks ?? [] });
       labIds.add(lab);
     }
-    await checkPack(packDir, labIds, findings);
+    await checkPack(packDir, labIds, findings, examTasks);
   }
   // Info only: skills no lab gives evidence for yet (the lab backlog).
   const skillsFile = path.join(contentDir, "skills.yaml");

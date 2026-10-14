@@ -1,0 +1,135 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xka-coredns-down
+  title: Fix cluster DNS
+  domain: kubernetes
+  frameworks: [cka:troubleshooting]
+  difficulty: hard
+  estimatedMinutes: 10
+  tags: [exam, dns, coredns]
+  version: 1
+spec:
+  description: |
+    **Context:** `qm-tracking` (`kubectl config use-context qm-tracking`)
+
+    Name lookups of cluster Services fail in every `qm-tracking` Pod since a
+    change to the cluster DNS last night. Repair CoreDNS so that the Pod
+    **`dns-probe`** in namespace **`track-dns`** resolves
+    `tracking-api.track-dns.svc.cluster.local` again. Keep two CoreDNS
+    replicas.
+  objectives:
+    - Troubleshoot cluster DNS from a Pod and from the CoreDNS configuration
+  params:
+    typo:
+      type: choice
+      values: [cluster.locl, cluster.lcoal, clster.local]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-tracking
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-tracking
+          nodes:
+            - {name: tracking-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: tracking-wk-1, role: worker}
+            - {name: tracking-wk-2, role: worker}
+  setup:
+    - on: qm-tracking
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: track-dns}
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata: {name: tracking-api, namespace: track-dns}
+        spec:
+          selector: {app: tracking-api}
+          ports: [{port: 80}]
+        ---
+        apiVersion: v1
+        kind: Pod
+        metadata: {name: dns-probe, namespace: track-dns}
+        spec:
+          terminationGracePeriodSeconds: 1
+          containers:
+            - {name: probe, image: "busybox:1.37", command: ["sleep", "1d"]}
+    - on: qm-tracking
+      timeoutSec: 200
+      run: |
+        set -e
+        kubectl -n track-dns wait pod/dns-probe --for=condition=Ready --timeout=120s
+        kubectl -n kube-system get configmap coredns -o json \
+          | jq '.data.Corefile |= sub("kubernetes cluster\\.local "; "kubernetes {{typo}} ")' | kubectl apply -f -
+        kubectl -n kube-system rollout restart deploy/coredns
+        kubectl -n kube-system rollout status deploy/coredns --timeout=150s
+  teardown:
+    - on: qm-tracking
+      run: kubectl delete namespace track-dns --ignore-not-found --wait=false
+  checks:
+    - id: resolves
+      description: dns-probe resolves the tracking-api Service
+      type: shell
+      on: qm-tracking
+      skills: [k8s.troubleshooting.networking]
+      weight: 3
+      timeoutSec: 30
+      command: |
+        ip=$(kubectl -n track-dns get svc tracking-api -o jsonpath='{.spec.clusterIP}')
+        got=$(kubectl -n track-dns exec dns-probe -- nslookup tracking-api.track-dns.svc.cluster.local 2>/dev/null | awk '/^Name:/ {n=1} n && /^Address/ {print $2; exit}')
+        [ -n "$ip" ] && [ "$got" = "$ip" ] && echo resolved || echo "not resolved"
+      expect: {match: exact, value: resolved}
+    - id: coredns-healthy
+      description: CoreDNS serves the cluster.local zone with 2 ready replicas
+      type: shell
+      on: qm-tracking
+      skills: [k8s.networking.coredns-config]
+      command: |
+        echo "$(kubectl -n kube-system get configmap coredns -o jsonpath='{.data.Corefile}' | awk '$1 == "kubernetes" {print $2}') \
+        $(kubectl -n kube-system get deploy coredns -o jsonpath='{.status.readyReplicas}/{.spec.replicas}')"
+      expect: {match: exact, value: cluster.local 2/2}
+  misconceptions:
+    - id: restart-only
+      description: Restarts CoreDNS without fixing its configuration.
+      feedback: The Pods reload the same Corefile. Read it and fix the zone the kubernetes plugin serves.
+      expectFail: [resolves, coredns-healthy]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 180
+        run: |
+          kubectl config use-context qm-tracking
+          kubectl -n kube-system rollout restart deploy/coredns
+          kubectl -n kube-system rollout status deploy/coredns --timeout=150s
+    - id: per-pod-dns
+      description: Points the probe's DNS config somewhere else instead of fixing CoreDNS.
+      feedback: Every Pod in the cluster depends on CoreDNS; fix it there.
+      expectFail: [coredns-healthy]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 180
+        run: |
+          kubectl config use-context qm-tracking
+          kubectl -n kube-system scale deploy/coredns --replicas=1
+          sleep 10
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 240
+        run: |
+          kubectl config use-context qm-tracking
+          kubectl -n kube-system get configmap coredns -o json \
+            | jq '.data.Corefile |= sub("kubernetes {{typo}} "; "kubernetes cluster.local ")' | kubectl apply -f -
+          kubectl -n kube-system rollout restart deploy/coredns
+          kubectl -n kube-system rollout status deploy/coredns --timeout=180s

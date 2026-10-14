@@ -1,0 +1,135 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xpe-k8s-ingress-route
+  title: Route the public tracking host to the API
+  domain: kubernetes
+  frameworks: [ct-platform:kubernetes-operations]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [exam, ingress, tls]
+  version: 1
+spec:
+  description: |
+    **Context:** `qm-harbour` (`kubectl config use-context qm-harbour`)
+
+    Publish the tracking API in namespace **`tracking-edge`** under
+    **`https://track.quillmoor.example/api`** through the cluster's Ingress
+    controller (IngressClass `traefik`):
+
+    - an Ingress **`tracking-edge`** for host `track.quillmoor.example` that
+      sends paths starting with `/api` to Service `tracking-api` (port 80);
+    - TLS terminated with the certificate in the existing Secret
+      **`{{secret}}`**.
+
+    The controller serves HTTPS on port **30443** of every node; test with
+    `curl -k --resolve track.quillmoor.example:30443:<node IP> https://track.quillmoor.example:30443/api/`.
+  objectives:
+    - Route a host and path with an Ingress
+    - Terminate TLS at the Ingress with a certificate Secret
+  params:
+    secret:
+      type: choice
+      values: [track-tls, tracking-public-tls, track-cert-2026]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-harbour
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-harbour
+          nodes:
+            - {name: harbour-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: harbour-wk-1, role: worker}
+            - {name: harbour-wk-2, role: worker}
+  setup:
+    - on: qm-harbour/harbour-cp-1
+      timeoutSec: 400
+      run: /opt/cloudtrain/bin/addons-install ingress --wait
+    - on: qm-harbour
+      timeoutSec: 200
+      run: |
+        set -e
+        kubectl create namespace tracking-edge --dry-run=client -o yaml | kubectl apply -f -
+        d=$(mktemp -d)
+        openssl req -x509 -newkey rsa:2048 -nodes -days 90 -subj "/CN=track.quillmoor.example/O=Quillmoor Logistics" \
+          -addext "subjectAltName=DNS:track.quillmoor.example" -keyout $d/tls.key -out $d/tls.crt 2>/dev/null
+        kubectl -n tracking-edge create secret tls {{secret}} --cert=$d/tls.crt --key=$d/tls.key --dry-run=client -o yaml | kubectl apply -f -
+        rm -rf $d
+        kubectl -n tracking-edge create deployment tracking-api --image=busybox:1.37 --replicas=2 --dry-run=client -o json -- \
+          sh -c "mkdir -p /www/api && echo tracking-api-v4 > /www/api/index.html && exec httpd -f -p 80 -h /www" | kubectl apply -f -
+        kubectl -n tracking-edge create service clusterip tracking-api --tcp=80:80 --dry-run=client -o yaml | kubectl apply -f -
+        kubectl -n tracking-edge rollout status deploy/tracking-api --timeout=150s
+  teardown:
+    - on: qm-harbour
+      run: kubectl delete namespace tracking-edge --ignore-not-found --wait=false
+  checks:
+    - id: ingress
+      description: Ingress tracking-edge routes track.quillmoor.example/api to tracking-api:80 with TLS from {{secret}}
+      type: k8s-query
+      skills: [k8s.networking.ingress-gateway, k8s.security.ingress-tls]
+      weight: 2
+      query: {cluster: qm-harbour, resource: ingress, name: tracking-edge, namespace: tracking-edge, jsonpath: '{.spec.rules[0].host} {.spec.rules[0].http.paths[0].path} {.spec.rules[0].http.paths[0].backend.service.name}:{.spec.rules[0].http.paths[0].backend.service.port.number} {.spec.tls[0].secretName} {.spec.tls[0].hosts[0]}'}
+      expect: {match: exact, value: "track.quillmoor.example /api tracking-api:80 {{secret}} track.quillmoor.example"}
+    - id: https-works
+      description: HTTPS on the tracking host serves the API with the provided certificate
+      type: shell
+      on: workstation
+      skills: [k8s.security.ingress-tls]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        ip=$(getent hosts harbour-wk-1 | awk '{print $1}')
+        body=$(curl -sk -m 5 --resolve track.quillmoor.example:30443:$ip https://track.quillmoor.example:30443/api/)
+        cn=$(echo | openssl s_client -connect $ip:30443 -servername track.quillmoor.example 2>/dev/null | openssl x509 -noout -subject 2>/dev/null | grep -o 'CN *= *track.quillmoor.example' | tr -d ' ')
+        echo "$body $cn"
+      expect: {match: exact, value: tracking-api-v4 CN=track.quillmoor.example}
+  misconceptions:
+    - id: no-tls
+      description: Creates the route without the tls section.
+      feedback: Without spec.tls the controller serves its default certificate.
+      expectFail: [ingress, https-works]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-harbour
+          kubectl -n tracking-edge create ingress tracking-edge --class=traefik --rule="track.quillmoor.example/api*=tracking-api:80"
+          sleep 5
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-harbour
+          kubectl -n tracking-edge create ingress tracking-edge --class=traefik --rule="track.quillmoor.example/api*=tracking-api:80,tls={{secret}}"
+          sleep 5
+    alternatives:
+      - id: manifest
+        description: Ingress manifest with spec.tls.
+        steps:
+          - on: workstation
+            as: learner
+            run: |
+              kubectl config use-context qm-harbour
+              kubectl apply -f - <<'YAML'
+              apiVersion: networking.k8s.io/v1
+              kind: Ingress
+              metadata: {name: tracking-edge, namespace: tracking-edge}
+              spec:
+                ingressClassName: traefik
+                tls: [{hosts: [track.quillmoor.example], secretName: {{secret}}}]
+                rules:
+                  - host: track.quillmoor.example
+                    http:
+                      paths:
+                        - {path: /api, pathType: Prefix, backend: {service: {name: tracking-api, port: {number: 80}}}}
+              YAML
+              sleep 5

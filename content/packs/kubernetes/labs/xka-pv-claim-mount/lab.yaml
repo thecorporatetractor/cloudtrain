@@ -1,0 +1,198 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xka-pv-claim-mount
+  title: Bind a pre-made volume to a reporting Pod
+  domain: kubernetes
+  frameworks: [cka:storage]
+  difficulty: medium
+  estimatedMinutes: 7
+  tags: [exam, pv, pvc, volumes]
+  version: 1
+spec:
+  description: |
+    **Context:** `qm-yard` (`kubectl config use-context qm-yard`)
+
+    The PersistentVolume **`{{pv}}`** (3Gi) holds the audit archive. In
+    namespace **`audit-reports`** (it exists):
+
+    1. Create a PersistentVolumeClaim **`archive-claim`** that binds to
+       `{{pv}}`.
+    2. Create a Pod **`archive-reader`** (image `busybox:1.37`, command
+       `sleep 3600`) that mounts the claim **read-only** at **`/data`**.
+
+    Do not change the PersistentVolume.
+  objectives:
+    - Claim a static PersistentVolume by class, access mode and size
+    - Mount a claim read-only in a Pod
+  params:
+    pv:
+      type: choice
+      values: [audit-archive-2026, archive-q3-volume, audit-history-pv]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-yard
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-yard
+          nodes:
+            - {name: yard-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: yard-wk-1, role: worker}
+            - {name: yard-wk-2, role: worker}
+  setup:
+    - on: qm-yard/yard-wk-2
+      run: |
+        mkdir -p /srv/{{pv}}
+        printf 'period,findings\n2026-Q3,12\n' > /srv/{{pv}}/summary.csv
+    - on: qm-yard
+      apply: |
+        apiVersion: v1
+        kind: PersistentVolume
+        metadata: {name: "{{pv}}"}
+        spec:
+          capacity: {storage: 3Gi}
+          accessModes: [ReadOnlyMany]
+          persistentVolumeReclaimPolicy: Retain
+          storageClassName: audit-archive
+          hostPath: {path: "/srv/{{pv}}", type: Directory}
+          nodeAffinity:
+            required:
+              nodeSelectorTerms:
+                - matchExpressions:
+                    - {key: kubernetes.io/hostname, operator: In, values: [yard-wk-2]}
+        ---
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: audit-reports}
+  teardown:
+    - on: qm-yard
+      run: |
+        kubectl delete namespace audit-reports --ignore-not-found --wait=false
+        kubectl delete pv {{pv}} --ignore-not-found --wait=false
+  checks:
+    - id: claim-bound
+      description: archive-claim is Bound to {{pv}}
+      type: k8s-query
+      skills: [k8s.storage.claims]
+      weight: 2
+      query: {cluster: qm-yard, resource: pvc, name: archive-claim, namespace: audit-reports, jsonpath: '{.status.phase}/{.spec.volumeName}'}
+      expect: {match: exact, value: "Bound/{{pv}}"}
+    - id: pod-reads
+      description: archive-reader runs and reads the archive at /data
+      type: shell
+      on: qm-yard
+      skills: [k8s.storage.claims]
+      weight: 2
+      timeoutSec: 20
+      command: kubectl -n audit-reports exec archive-reader -- tail -n1 /data/summary.csv 2>&1
+      expect: {match: exact, value: "2026-Q3,12"}
+    - id: read-only
+      description: The claim is mounted read-only at /data
+      type: shell
+      on: qm-yard
+      skills: [k8s.storage.access-modes]
+      command: |
+        kubectl -n audit-reports get pod archive-reader -o json | jq -r '
+          .spec as $s | [$s.volumes[] | select(.persistentVolumeClaim.claimName == "archive-claim") | .name] as $v
+          | [$s.containers[].volumeMounts[]? | select(.name as $n | $v | index($n)) | "\(.mountPath):\(.readOnly // false)"] | join(",")'
+      expect: {match: exact, value: /data:true}
+    - id: pv-unchanged
+      description: The PersistentVolume keeps its class, mode and size
+      type: k8s-query
+      skills: [k8s.cli.scoped-changes]
+      weight: 0.5
+      query: {cluster: qm-yard, resource: pv, name: "{{pv}}", jsonpath: '{.spec.storageClassName} {.spec.accessModes} {.spec.capacity.storage}'}
+      expect: {match: exact, value: 'audit-archive ["ReadOnlyMany"] 3Gi'}
+  misconceptions:
+    - id: rwo-claim
+      description: Asks for ReadWriteOnce, which the volume does not offer.
+      feedback: A claim binds only to a volume offering its access mode; this one is ReadOnlyMany.
+      expectFail: [claim-bound, pod-reads]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-yard
+          kubectl apply -f - <<'YAML'
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata: {name: archive-claim, namespace: audit-reports}
+          spec:
+            accessModes: [ReadWriteOnce]
+            storageClassName: audit-archive
+            resources: {requests: {storage: 3Gi}}
+          ---
+          apiVersion: v1
+          kind: Pod
+          metadata: {name: archive-reader, namespace: audit-reports}
+          spec:
+            containers:
+              - {name: reader, image: "busybox:1.37", command: ["sleep", "3600"], volumeMounts: [{name: archive, mountPath: /data, readOnly: true}]}
+            volumes:
+              - {name: archive, persistentVolumeClaim: {claimName: archive-claim, readOnly: true}}
+          YAML
+          sleep 15
+    - id: writable-mount
+      description: Mounts the claim without readOnly.
+      feedback: Set readOnly on the volumeMount (and the claim reference) so the Pod cannot change the archive.
+      expectFail: [read-only]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          kubectl config use-context qm-yard
+          kubectl apply -f - <<'YAML'
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata: {name: archive-claim, namespace: audit-reports}
+          spec:
+            accessModes: [ReadOnlyMany]
+            storageClassName: audit-archive
+            resources: {requests: {storage: 3Gi}}
+          ---
+          apiVersion: v1
+          kind: Pod
+          metadata: {name: archive-reader, namespace: audit-reports}
+          spec:
+            containers:
+              - {name: reader, image: "busybox:1.37", command: ["sleep", "3600"], volumeMounts: [{name: archive, mountPath: /data}]}
+            volumes:
+              - {name: archive, persistentVolumeClaim: {claimName: archive-claim}}
+          YAML
+          kubectl -n audit-reports wait pod/archive-reader --for=condition=Ready --timeout=90s
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          kubectl config use-context qm-yard
+          kubectl apply -f - <<'YAML'
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata: {name: archive-claim, namespace: audit-reports}
+          spec:
+            accessModes: [ReadOnlyMany]
+            storageClassName: audit-archive
+            volumeName: {{pv}}
+            resources: {requests: {storage: 3Gi}}
+          ---
+          apiVersion: v1
+          kind: Pod
+          metadata: {name: archive-reader, namespace: audit-reports}
+          spec:
+            containers:
+              - {name: reader, image: "busybox:1.37", command: ["sleep", "3600"], volumeMounts: [{name: archive, mountPath: /data, readOnly: true}]}
+            volumes:
+              - {name: archive, persistentVolumeClaim: {claimName: archive-claim, readOnly: true}}
+          YAML
+          kubectl -n audit-reports wait pod/archive-reader --for=condition=Ready --timeout=90s

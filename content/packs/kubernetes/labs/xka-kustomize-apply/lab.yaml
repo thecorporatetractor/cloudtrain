@@ -1,0 +1,169 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xka-kustomize-apply
+  title: Apply a Kustomize overlay
+  domain: kubernetes
+  frameworks: [cka:cluster-architecture]
+  difficulty: easy
+  estimatedMinutes: 6
+  tags: [exam, kustomize]
+  version: 1
+spec:
+  description: |
+    **Context:** `qm-depot` (`kubectl config use-context qm-depot`)
+
+    `~/exam/quay-display` holds a Kustomize base (`base/`) and a production
+    overlay (`overlays/production/`). Add a **patch** to the production
+    overlay so that the Deployment `quay-display` has **{{replicas}}
+    replicas** and the label **`quillmoor.example/env: prod`** on both the
+    Deployment and its Pods. Then apply the overlay with **`kubectl apply
+    -k`** (it deploys into namespace `quay-prod`, which exists).
+
+    Do not change the base.
+  objectives:
+    - Add a patch to a Kustomize overlay
+    - Apply an overlay with kubectl apply -k
+  params:
+    replicas:
+      type: int
+      min: 4
+      max: 5
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-depot
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: qm-depot
+  setup:
+    - on: workstation
+      file: {path: /home/learner/exam/quay-display/base/kustomization.yaml, source: assets/base-kustomization.yaml}
+    - on: workstation
+      file: {path: /home/learner/exam/quay-display/base/deployment.yaml, source: assets/base-deployment.yaml}
+    - on: workstation
+      file: {path: /home/learner/exam/quay-display/overlays/production/kustomization.yaml, source: assets/production-kustomization.yaml}
+    - on: workstation
+      run: chown -R learner:learner /home/learner/exam
+    - on: qm-depot
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: quay-prod}
+  teardown:
+    - on: qm-depot
+      run: kubectl delete namespace quay-prod --ignore-not-found --wait=false
+  checks:
+    - id: deployed
+      description: quay-display in quay-prod runs {{replicas}} ready replicas
+      type: k8s-query
+      skills: [k8s.cluster.kustomize]
+      weight: 2
+      query: {cluster: qm-depot, resource: deployment, name: quay-display, namespace: quay-prod, jsonpath: '{.spec.replicas}/{.status.readyReplicas}'}
+      expect: {match: exact, value: "{{replicas}}/{{replicas}}"}
+    - id: labels
+      description: The Deployment and its Pod template carry quillmoor.example/env=prod
+      type: k8s-query
+      skills: [k8s.cluster.kustomize]
+      weight: 2
+      query: {cluster: qm-depot, resource: deployment, name: quay-display, namespace: quay-prod, jsonpath: '{.metadata.labels.quillmoor\.example/env} {.spec.template.metadata.labels.quillmoor\.example/env}'}
+      expect: {match: exact, value: prod prod}
+    - id: overlay-patch
+      description: The production overlay renders the same and holds a patch, and the base is unchanged
+      type: shell
+      on: workstation
+      skills: [k8s.cluster.kustomize]
+      timeoutSec: 20
+      command: |
+        o=/home/learner/exam/quay-display/overlays/production
+        k=$(ls $o/kustomization.y*ml 2>/dev/null | head -1)
+        p=$(yq -o=json '.' "$k" 2>/dev/null | jq -r '[(.patches // []), (.patchesStrategicMerge // []), (.patchesJson6902 // [])] | flatten | length')
+        r=$(kubectl kustomize $o 2>/dev/null | yq 'select(.kind == "Deployment") | .spec.replicas')
+        b=$(cd /home/learner/exam/quay-display/base && cat kustomization.yaml deployment.yaml | md5sum | cut -d' ' -f1)
+        echo "patches=$([ "${p:-0}" -gt 0 ] && echo yes || echo no) replicas=$r base=$([ "$b" = 10e0b6a9e722acf82a1aa2eafb892aac ] && echo unchanged || echo changed)"
+      expect: {match: exact, value: "patches=yes replicas={{replicas}} base=unchanged"}
+  misconceptions:
+    - id: edited-base
+      description: Changes replicas and labels in the base instead of the overlay.
+      feedback: The base is shared with other environments. Put production differences into a patch in the overlay.
+      expectFail: [overlay-patch]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-depot
+          cd ~/exam/quay-display
+          yq -i '.spec.replicas = {{replicas}} | .metadata.labels["quillmoor.example/env"] = "prod" | .spec.template.metadata.labels["quillmoor.example/env"] = "prod"' base/deployment.yaml
+          kubectl apply -k overlays/production
+          kubectl -n quay-prod rollout status deploy/quay-display --timeout=120s
+    - id: scaled-imperatively
+      description: Applies the overlay unchanged and then scales and labels with kubectl.
+      feedback: Imperative changes are lost on the next apply -k. Encode them in the overlay.
+      expectFail: [overlay-patch]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-depot
+          kubectl apply -k ~/exam/quay-display/overlays/production
+          kubectl -n quay-prod scale deploy quay-display --replicas={{replicas}}
+          kubectl -n quay-prod label deploy quay-display quillmoor.example/env=prod
+          kubectl -n quay-prod patch deploy quay-display -p '{"spec":{"template":{"metadata":{"labels":{"quillmoor.example/env":"prod"}}}}}'
+          kubectl -n quay-prod rollout status deploy/quay-display --timeout=120s
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-depot
+          cd ~/exam/quay-display/overlays/production
+          cat > prod-patch.yaml <<'YAML'
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: quay-display
+            labels: {quillmoor.example/env: prod}
+          spec:
+            replicas: {{replicas}}
+            template:
+              metadata:
+                labels: {quillmoor.example/env: prod}
+          YAML
+          printf 'patches:\n  - path: prod-patch.yaml\n' >> kustomization.yaml
+          kubectl apply -k .
+          kubectl -n quay-prod rollout status deploy/quay-display --timeout=120s
+    alternatives:
+      - id: json6902-inline
+        description: An inline JSON patch with a target.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 150
+            run: |
+              kubectl config use-context qm-depot
+              cd ~/exam/quay-display/overlays/production
+              cat >> kustomization.yaml <<'YAML'
+              patches:
+                - target: {kind: Deployment, name: quay-display}
+                  patch: |-
+                    - op: replace
+                      path: /spec/replicas
+                      value: {{replicas}}
+                    - op: add
+                      path: /metadata/labels/quillmoor.example~1env
+                      value: prod
+                    - op: add
+                      path: /spec/template/metadata/labels/quillmoor.example~1env
+                      value: prod
+              YAML
+              kubectl apply -k .
+              kubectl -n quay-prod rollout status deploy/quay-display --timeout=120s

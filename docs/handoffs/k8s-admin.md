@@ -1,0 +1,174 @@
+# Handoff: k8s-admin stream (paused 2026-10-14)
+
+Branch `build/k8s-admin`, worktree `/home/hackrvl/cloudtrain/.worktrees/b-k8s-admin`.
+Owned labs: `docs/build-ownership.yaml` → `k8s-admin` (88). All work is committed and pushed.
+
+## Status at pause
+
+| Status | Count |
+|---|---|
+| verified (passed full `labctl verify` live) | 5 |
+| built, authored and validated, live verify still pending | 63 |
+| built, blocked on a platform prerequisite (note in `content/curriculum.yaml`) | 18 |
+| proposed (not authored, blocked) | 2 |
+
+`node tools/lab-verify/bin/lab-verify.mjs --strict` and `labctl validate` are clean;
+`labctl exam compile sim-k8s-admin` (exam-engine branch's labctl) compiles all 41 tasks
+(shared-node consistency OK).
+
+### Verified
+
+| Lab | Runs | Time |
+|---|---|---|
+| kubectl-first-contact | 2 seeds, 4 mutations, 1 alternative | 698 s |
+| patch-without-clobbering | 2 seeds, 4 mutations, 2 alternatives | ~2000 s (batch of 4, parallel 3) |
+| generate-manifest-dry-run | 2 seeds, 4 mutations, 1 alternative | 715 s |
+| jsonpath-depot-inventory | 2 seeds, 4 mutations, 1 alternative | 642 s |
+| routing-engine-config | 2 seeds, 4 mutations, 1 alternative | 585 s |
+
+### Built, live verify pending (no known blocker)
+
+Virtual cluster (pod slot): label-printer-crashloop (**failed once, see next steps**),
+dns-debug-pod, tariff-api-no-endpoints, waybill-rollback, rolling-update-surge,
+dock-scheduler-probes, qos-class-forecast, sandbox-quota-limitrange,
+native-sidecar-log-shipper, shared-scratch-emptydir, who-can-delete-secrets,
+helm-shipment-events, kustomize-depot-overlays; exam tasks xka-clusterrole-binding,
+xka-dns-lookup-record, xka-events-failing-pod, xka-helm-install-values,
+xka-kustomize-apply, xka-previous-logs-error, xka-rollout-undo, xka-secret-env-volume,
+xka-service-selector-fix, xka-sidecar-shared-log, xka-crd-custom-resource.
+
+kubeadm (vm slot): telemetry-daemonset, affinity-cold-chain, taint-gpu-workers,
+spread-tracking-replicas, priority-preemption-peak, pvc-pending-mismatch,
+coredns-customs-forward, cni-trace-pod-path, control-plane-tour, night-shift-user-cert,
+depot-worker-notready, yard-scheduler-revive, apiserver-down-cert-path,
+pending-pod-detective, oncall-depot-incident, kubeadm-etcd-static-restore,
+fleet-node-prep-join, kubeadm-bootstrap-cluster, ledger-second-control-plane,
+worker-kubelet-upgrade, csi-driver-inventory; exam tasks xka-tainted-node-count,
+xka-toleration-control-plane, xka-required-affinity, xka-netpol-egress-db,
+xka-csr-user-access, xka-hpa-memory, xka-etcd-snapshot-save, xka-crictl-container-id,
+xka-pv-claim-mount, xka-retain-reclaim, xka-coredns-down, xka-nodeport-fixed,
+xka-kubelet-stopped, xka-worker-join, xka-controller-manager-flag,
+xka-apiserver-etcd-endpoint, xka-node-upgrade-minor, xpe-k8s-deploy-tracking,
+xpe-worker-notready-recovery, xpe-sec-least-privilege-ci, xpe-sec-restricted-namespace.
+
+### Built, blocked (reason in the lab's `notes`)
+
+Setup calls the foundations stream's `/opt/cloudtrain/bin/addons-install <addon> --wait`
+(contract in `build/foundations:tools/images/kubeadm-addons/addons-install`), which the
+current `kubeadm:1.37` image does not ship:
+
+| Lab | Add-on |
+|---|---|
+| parcel-sorting-memory-hog, berth-planner-hpa, xka-top-cpu-pod, xpe-k8s-autoscale-tracking | metrics-server |
+| tracking-ingress-two-paths, xka-ingress-host-rule, xpe-k8s-ingress-route, xpe-incident-tracking-outage | traefik (IngressClass) |
+| brokers-gateway-routes, xka-httproute-split | gateway (Gateway API + GatewayClass traefik) |
+| loadbalancer-kiosk-ip, xka-loadbalancer-address | metallb |
+| manifest-store-dynamic, xka-default-storageclass | local-path |
+| xka-expand-claim | a CSI driver with volume expansion (`csi-hostpath`; foundations has no such add-on) |
+
+Foundations publishes the add-ons on a separate catalog ref `kubeadm:1.37-full`. Once
+merged, either the add-ons land in `kubeadm:1.37` or these labs (and their curriculum
+`images`, owned by the curriculum) must switch to `kubeadm:1.37-full`; for exam tasks
+every task sharing that cluster must switch together (identical node definitions).
+
+### Proposed (not authored)
+
+- distroless-invoice-debug: needs a distroless (shell-less) application image in
+  `workloadImages`; nothing in the catalog qualifies.
+- shipment-operator-crd: the learner installs an operator; needs an operator image (e.g.
+  a kubectl-based controller image) in `workloadImages`.
+
+## In flight at pause
+
+Nothing running. Interrupted cleanly: affinity-cold-chain (kubeadm runs never became
+Ready, see blocker 1), dns-debug-pod (just started). telemetry-daemonset was attempted
+twice; both times the kubeadm sessions never got Ready.
+
+## Next steps, in order
+
+1. Fix label-printer-crashloop: in the vcluster, `kubectl logs ... --previous` (solution
+   and alternative) returned no ERROR line, so line 1 of the report held `BackOff`. Check
+   whether the previous instance's log is reachable through vcluster (try
+   `kubectl logs <pod> -c printer --previous` vs. `deploy/...`), and if not, make the
+   script crash after a sleep so `--previous` has content, or read the line from the
+   current crash; then re-verify.
+2. Verify the remaining virtual-cluster labs and exam tasks (pod slot, `--parallel 3`).
+3. When the machine is less loaded (blocker 1), verify the kubeadm labs one at a time
+   (`--parallel 1`), starting with telemetry-daemonset and affinity-cold-chain.
+4. After foundations' add-ons merge: switch image refs if needed, verify the 17
+   add-on labs, clear their notes.
+5. Once main has the exam engine: `labctl exam run --auto-solve` (expect 100 %) and
+   `--no-solve` (expect fail) on sim-k8s-admin; sim-platform-engineer needs other
+   streams' tasks first.
+6. Merge main regularly; re-render `docs/curriculum.md` (`node tools/curriculum/render.mjs`).
+
+## Platform blockers and bugs
+
+1. **kubeadm init has no retry and fails under load** (bug). With host load 80-95 on 12
+   cores, `kubeadm init` on the control-plane VM failed with `error execution phase
+   wait-control-plane: ... unable to create ClusterRoleBinding: ... context deadline
+   exceeded` (`/var/log/kubeadm.log` on fleet-cp-1, session
+   ctv-telemetry-daemonset-aa51b88). cloud-init then stops (`set -e`), the CNI is never
+   installed, controller-manager/scheduler loop on lost leader election, and the session
+   waits until the provision timeout. Workers retry `kubeadm join` five times; the
+   control plane does not retry `init` (`internal/drivers/kubeadm.go`, userdata). Every
+   K-tier verify in this session failed this way.
+2. The manager's default `--provision-timeout=15m` is too short for kubeadm sessions on
+   a loaded machine; I patched my scoped manager to 40m by hand (deploy script has no
+   variable for it).
+3. lab-verify could not accept `ct-platform:*` objectives (declared only in
+   content/curriculum.yaml, which forbids redeclaring them under content/frameworks).
+   Fixed in this branch (`tools/lab-verify/src/verify.mjs`, commit f7ef682).
+4. lab-verify's image scan treats any `image:` text in shell scripts as a Pod image
+   (e.g. a `grep 'image: ...'` or a sed), and does not recognise digest references
+   (`httpd@sha256:...`) of catalog workload images. Worked around in content.
+5. The exam-task lab-verify rules (no hints / no course for `type: exam`) came from
+   build/k8s-dev; the same change is applied here so both merge cleanly.
+6. A full sim-k8s-admin draw needs up to 7 kubeadm clusters (about 16 VMs) in one
+   shared environment; check that against machine capacity before exam runs.
+
+## Gotchas and lessons
+
+- Never point `labctl verify` at the whole labs directory while authoring: it parses
+  every lab and one half-written file fails the run. `v.sh` passes the single lab dir.
+- Never edit a shell script that a running bash is executing (my old `v.sh` broke this
+  way); copy to a new file.
+- `{{...}}` anywhere in a lab (including inlined assets) is a param placeholder: Helm
+  templates and Go templates must be generated (e.g. `<% %>` converted in setup).
+- `kubectl get -o json` hides managedFields; use `--show-managed-fields`.
+- Go RE2: no backreferences in `expect.regex`.
+- yq (mikefarah) has no `\(...)` interpolation; convert with `yq -o=json` and use jq.
+- jq/yq exist in the admin sidecar (jumphost image) but not on kubeadm nodes; checks
+  with `on: <cluster>/<node>` use only coreutils, crictl, kubectl.
+- Exam tasks: one canonical node definition per cluster name per exam (generated by
+  `topo.py` in my scratch; see the shared blocks in any xka-* lab), task-specific
+  namespaces, no context checks; tasks that break a control plane get their own cluster.
+- Checks that compare a learner's file with live cluster state run on the workstation
+  with the learner's kubeconfig (`--context <name>`), since the admin sidecar cannot
+  read the node container's files.
+
+## How to resume
+
+```sh
+cd /home/hackrvl/cloudtrain/.worktrees/b-k8s-admin
+git pull && git merge main
+pnpm install --filter @cloudtrain/lab-verify... --offline && (cd packages/lab-schema && pnpm run build)
+(cd services/lab-orchestrator && make build)
+# scoped manager (CRDs unchanged: diff first, then SKIP_CRDS=1)
+ORCH_NAMESPACE=ct-k8sadmin-system SESSION_SELECTOR=labs.cloudtrain.dev/verify=k8s-admin \
+  SKIP_CRDS=1 LOAD_LAB_IMAGES=0 bash deploy/scripts/orchestrator-deploy.sh
+kubectl --context kind-cloudtrain-dev -n ct-k8sadmin-system patch deploy lab-orchestrator --type=json \
+  -p '[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--provision-timeout=40m"}]'
+# one lab (vm slot for kubeadm, pod slot for vcluster)
+cd services/lab-orchestrator
+../../tools/slots/run.sh pod -- bin/labctl verify --context kind-cloudtrain-dev --repo-root ../.. \
+  --session-label labs.cloudtrain.dev/verify=k8s-admin --only <lab> --parallel 3 ../../content/packs/kubernetes/labs/<lab>
+../../tools/slots/run.sh vm -- bin/labctl verify ... --parallel 1 --ready-timeout 45m ../../content/packs/kubernetes/labs/<lab>
+```
+
+Before each VM verify check C: free space
+(`powershell.exe -NoProfile -Command "[int]((Get-PSDrive C).Free/1GB)"`, stop under 15 GB).
+After a pass: set the lab's status line to `verified` in content/curriculum.yaml (only
+this stream's labs), re-render docs/curriculum.md, commit (the post-commit hook pushes).
+Teardown at the end: delete `ct-k8sadmin-system` and ClusterRoleBinding
+`lab-orchestrator-ct-k8sadmin-system`.

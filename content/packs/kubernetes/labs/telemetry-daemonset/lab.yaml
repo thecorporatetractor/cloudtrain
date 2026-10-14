@@ -1,0 +1,321 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: telemetry-daemonset
+  title: Run a telemetry agent on every node including the control plane
+  domain: kubernetes
+  frameworks: [cka:workloads-scheduling, ckad:design-build]
+  difficulty: medium
+  estimatedMinutes: 12
+  tags: [daemonset, taints, tolerations, control-plane]
+  version: 1
+spec:
+  description: |
+    The fleet team wants host metrics from every machine in the label-printing
+    cluster, the control-plane node included, so they can spot a struggling
+    host before the printers stall.
+
+    Use context `qm-fleet`:
+
+    ```bash
+    kubectl config use-context qm-fleet
+    ```
+
+    In namespace `qm-platform` (it exists), deploy the agent so that **exactly
+    one Pod runs on every node** of the cluster, including `fleet-cp-1`, and
+    new nodes get one automatically:
+
+    | Field | Value |
+    |---|---|
+    | Workload name | `{{ds}}` |
+    | Container | `collector`, image `busybox:1.37` |
+    | Command | `sh -c 'while true; do cat /proc/loadavg; sleep 30; done'` |
+
+    Keep the control-plane node's taint as it is: ordinary workloads must
+    still stay off it. Tolerate exactly what the agent needs, not everything.
+  objectives:
+    - Write a DaemonSet manifest
+    - Read a node's taints and add the matching toleration
+    - Verify one Pod per node
+  params:
+    ds:
+      type: choice
+      values: [node-telemetry, host-pulse, fleet-node-metrics]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-fleet
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-fleet
+          nodes:
+            - {name: fleet-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: fleet-wk-1, role: worker}
+            - {name: fleet-wk-2, role: worker}
+  setup:
+    - on: qm-fleet
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: qm-platform}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: label-spooler, namespace: qm-platform}
+        spec:
+          replicas: 2
+          selector: {matchLabels: {app: label-spooler}}
+          template:
+            metadata: {labels: {app: label-spooler}}
+            spec:
+              containers:
+                - {name: spooler, image: "redis:7.4-alpine"}
+    - on: qm-fleet
+      timeoutSec: 180
+      run: kubectl -n qm-platform rollout status deploy/label-spooler --timeout=150s
+  teardown:
+    - on: qm-fleet
+      run: kubectl delete namespace qm-platform --ignore-not-found --wait=false
+  checks:
+    - id: context
+      description: Terminal is using context qm-fleet
+      type: k8s-context
+      on: workstation
+      skills: [k8s.cli.contexts]
+      weight: 0.5
+      expect: {match: exact, value: qm-fleet}
+    - id: is-daemonset
+      description: "{{ds}} is a DaemonSet with container collector on busybox:1.37"
+      type: k8s-query
+      skills: [k8s.workloads.daemonsets]
+      query:
+        cluster: qm-fleet
+        resource: daemonset
+        name: "{{ds}}"
+        namespace: qm-platform
+        jsonpath: '{.spec.template.spec.containers[0].name} {.spec.template.spec.containers[0].image}'
+      expect: {match: exact, value: collector busybox:1.37}
+    - id: one-per-node
+      description: Exactly one ready {{ds}} Pod runs on each of the 3 nodes
+      type: shell
+      on: qm-fleet
+      skills: [k8s.workloads.daemonsets, k8s.scheduling.taints-tolerations]
+      weight: 2
+      command: |
+        ds=$(kubectl -n qm-platform get ds {{ds}} -o jsonpath='{.metadata.uid}')
+        [ -n "$ds" ] || { echo "no daemonset"; exit 0; }
+        kubectl -n qm-platform get pods -o json | jq -r --arg uid "$ds" '
+          [.items[] | select(.metadata.deletionTimestamp == null) | select(any(.metadata.ownerReferences[]?; .uid == $uid))
+           | select(any(.status.conditions[]?; .type == "Ready" and .status == "True")) | .spec.nodeName] | sort | join(",")'
+      expect: {match: exact, value: "fleet-cp-1,fleet-wk-1,fleet-wk-2"}
+    - id: precise-toleration
+      description: The Pods tolerate the control-plane taint by key, without a blanket toleration
+      type: shell
+      on: qm-fleet
+      skills: [k8s.scheduling.taints-tolerations]
+      command: |
+        kubectl -n qm-platform get ds {{ds}} -o json | jq -r '
+          (.spec.template.spec.tolerations // []) as $t
+          | if any($t[]; (.key // "") == "" and .operator == "Exists") then "blanket toleration"
+            elif any($t[]; .key == "node-role.kubernetes.io/control-plane" and ((.effect // "NoSchedule") == "NoSchedule")) then "ok"
+            else "no control-plane toleration" end'
+      expect: {match: exact, value: ok}
+    - id: taint-kept
+      description: fleet-cp-1 still carries node-role.kubernetes.io/control-plane:NoSchedule
+      type: k8s-query
+      skills: [k8s.scheduling.taints-tolerations]
+      query:
+        cluster: qm-fleet
+        resource: node
+        name: fleet-cp-1
+        jsonpath: '{.spec.taints[?(@.key=="node-role.kubernetes.io/control-plane")].effect}'
+      expect: {match: exact, value: NoSchedule}
+    - id: spooler-off-cp
+      description: The ordinary label-spooler Pods still run only on workers
+      type: shell
+      on: qm-fleet
+      skills: [k8s.cli.scoped-changes]
+      weight: 0.5
+      command: kubectl -n qm-platform get pods -l app=label-spooler -o jsonpath='{range .items[*]}{.spec.nodeName}{"\n"}{end}' | grep -c fleet-cp-1 || true
+      expect: {match: exact, value: "0"}
+  hints:
+    - title: Switch context
+      body: The label-printing fleet is cluster qm-fleet.
+      command: kubectl config use-context qm-fleet
+      cost: 0
+    - title: No generator for DaemonSets
+      body: "`kubectl create` cannot make a DaemonSet. Generate a Deployment, then change `kind` to DaemonSet and delete `replicas` and `strategy`."
+      command: kubectl -n qm-platform create deployment {{ds}} --image=busybox:1.37 --dry-run=client -o yaml > ds.yaml
+      cost: 1
+    - title: Why is the control plane skipped?
+      body: The DaemonSet controller respects NoSchedule taints that the Pod does not tolerate.
+      command: kubectl describe node fleet-cp-1 | grep -A2 Taints
+      cost: 1
+    - title: The toleration
+      body: |
+        ```yaml
+        tolerations:
+          - key: node-role.kubernetes.io/control-plane
+            operator: Exists
+            effect: NoSchedule
+        ```
+      cost: 2
+  misconceptions:
+    - id: no-toleration
+      description: Creates the DaemonSet without a toleration and expects it on every node.
+      feedback: DaemonSet Pods obey NoSchedule taints like any other Pod. Without the control-plane toleration the agent misses fleet-cp-1.
+      expectFail: [one-per-node, precise-toleration]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 200
+        run: |
+          kubectl config use-context qm-fleet
+          kubectl apply -f - <<'YAML'
+          apiVersion: apps/v1
+          kind: DaemonSet
+          metadata: {name: {{ds}}, namespace: qm-platform}
+          spec:
+            selector: {matchLabels: {app: {{ds}}}}
+            template:
+              metadata: {labels: {app: {{ds}}}}
+              spec:
+                containers:
+                  - name: collector
+                    image: busybox:1.37
+                    command: ["sh", "-c", "while true; do cat /proc/loadavg; sleep 30; done"]
+          YAML
+          kubectl -n qm-platform rollout status ds/{{ds}} --timeout=150s
+    - id: untaint-control-plane
+      description: Removes the control-plane taint so the agent can land there.
+      feedback: Removing the taint opens the control plane to every workload. Tolerate the taint in the agent's Pod template instead.
+      expectFail: [taint-kept, precise-toleration]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 200
+        run: |
+          kubectl config use-context qm-fleet
+          kubectl taint node fleet-cp-1 node-role.kubernetes.io/control-plane:NoSchedule-
+          kubectl apply -f - <<'YAML'
+          apiVersion: apps/v1
+          kind: DaemonSet
+          metadata: {name: {{ds}}, namespace: qm-platform}
+          spec:
+            selector: {matchLabels: {app: {{ds}}}}
+            template:
+              metadata: {labels: {app: {{ds}}}}
+              spec:
+                containers:
+                  - name: collector
+                    image: busybox:1.37
+                    command: ["sh", "-c", "while true; do cat /proc/loadavg; sleep 30; done"]
+          YAML
+          kubectl -n qm-platform rollout status ds/{{ds}} --timeout=150s
+    - id: blanket-toleration
+      description: "Adds `operator: Exists` without a key, tolerating every taint."
+      feedback: A keyless Exists toleration also tolerates taints meant to keep Pods off broken or isolated nodes. Name the control-plane taint.
+      expectFail: [precise-toleration]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 200
+        run: |
+          kubectl config use-context qm-fleet
+          kubectl apply -f - <<'YAML'
+          apiVersion: apps/v1
+          kind: DaemonSet
+          metadata: {name: {{ds}}, namespace: qm-platform}
+          spec:
+            selector: {matchLabels: {app: {{ds}}}}
+            template:
+              metadata: {labels: {app: {{ds}}}}
+              spec:
+                tolerations:
+                  - operator: Exists
+                containers:
+                  - name: collector
+                    image: busybox:1.37
+                    command: ["sh", "-c", "while true; do cat /proc/loadavg; sleep 30; done"]
+          YAML
+          kubectl -n qm-platform rollout status ds/{{ds}} --timeout=150s
+    - id: deployment-of-three
+      description: Uses a Deployment with 3 replicas, one per current node.
+      feedback: A Deployment does not pin one replica per node and does not follow new nodes; that is the DaemonSet's job.
+      expectFail: [is-daemonset, one-per-node]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 200
+        run: |
+          kubectl config use-context qm-fleet
+          kubectl apply -f - <<'YAML'
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata: {name: {{ds}}, namespace: qm-platform}
+          spec:
+            replicas: 3
+            selector: {matchLabels: {app: {{ds}}}}
+            template:
+              metadata: {labels: {app: {{ds}}}}
+              spec:
+                tolerations:
+                  - {key: node-role.kubernetes.io/control-plane, operator: Exists, effect: NoSchedule}
+                containers:
+                  - name: collector
+                    image: busybox:1.37
+                    command: ["sh", "-c", "while true; do cat /proc/loadavg; sleep 30; done"]
+          YAML
+          kubectl -n qm-platform rollout status deploy/{{ds}} --timeout=150s
+  solution:
+    explanation: |
+      A DaemonSet runs one Pod on every node its Pods can be scheduled to. The
+      control-plane node carries `node-role.kubernetes.io/control-plane:NoSchedule`,
+      so the Pod template needs a toleration for exactly that key and effect;
+      the taint itself stays and keeps other workloads off.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 200
+        run: |
+          kubectl config use-context qm-fleet
+          kubectl apply -f - <<'YAML'
+          apiVersion: apps/v1
+          kind: DaemonSet
+          metadata: {name: {{ds}}, namespace: qm-platform}
+          spec:
+            selector: {matchLabels: {app: {{ds}}}}
+            template:
+              metadata: {labels: {app: {{ds}}}}
+              spec:
+                tolerations:
+                  - {key: node-role.kubernetes.io/control-plane, operator: Exists, effect: NoSchedule}
+                containers:
+                  - name: collector
+                    image: busybox:1.37
+                    command: ["sh", "-c", "while true; do cat /proc/loadavg; sleep 30; done"]
+          YAML
+          kubectl -n qm-platform rollout status ds/{{ds}} --timeout=150s
+    alternatives:
+      - id: converted-deployment
+        description: Generate a Deployment with kubectl, convert it to a DaemonSet with yq, and tolerate the control-plane key for every effect.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 200
+            run: |
+              kubectl config use-context qm-fleet
+              kubectl -n qm-platform create deployment {{ds}} --image=busybox:1.37 --dry-run=client -o yaml \
+                -- sh -c 'while true; do cat /proc/loadavg; sleep 30; done' \
+                | yq '.kind = "DaemonSet" | del(.spec.replicas) | del(.spec.strategy) | del(.status)
+                      | .spec.template.spec.containers[0].name = "collector"
+                      | .spec.template.spec.tolerations = [{"key": "node-role.kubernetes.io/control-plane", "operator": "Exists"}]' \
+                | kubectl apply -f -
+              kubectl -n qm-platform rollout status ds/{{ds}} --timeout=150s

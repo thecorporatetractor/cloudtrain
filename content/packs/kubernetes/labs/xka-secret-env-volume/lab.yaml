@@ -1,0 +1,136 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xka-secret-env-volume
+  title: Wire a Secret into a Deployment
+  domain: kubernetes
+  frameworks: [cka:workloads-scheduling]
+  difficulty: easy
+  estimatedMinutes: 6
+  tags: [exam, secrets, env, volumes]
+  version: 1
+spec:
+  description: |
+    **Context:** `qm-depot` (`kubectl config use-context qm-depot`)
+
+    In namespace **`customs-clearance`**:
+
+    1. Create a Secret **`customs-api-key`** with the key **`api-key`** and
+       the value **`{{key}}`**.
+    2. Change Deployment **`clearance`** (container `clearance`) so that the
+       key is available both as the environment variable **`API_KEY`** and as
+       the file **`/run/keys/api-key`**, both read from the Secret.
+
+    Wait for the rollout to finish.
+  objectives:
+    - Create a generic Secret
+    - Consume one Secret as an environment variable and as a volume
+  params:
+    key:
+      type: choice
+      values: [cx-91f0a2d4, cx-3be7c815, cx-c04d6e9a]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-depot
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: qm-depot
+  setup:
+    - on: qm-depot
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: customs-clearance}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: clearance, namespace: customs-clearance}
+        spec:
+          replicas: 2
+          selector: {matchLabels: {app: clearance}}
+          template:
+            metadata: {labels: {app: clearance}}
+            spec:
+              terminationGracePeriodSeconds: 1
+              containers:
+                - name: clearance
+                  image: busybox:1.37
+                  command: ["sh", "-c", "while true; do sleep 30; done"]
+    - on: qm-depot
+      timeoutSec: 120
+      run: kubectl -n customs-clearance rollout status deploy/clearance --timeout=100s
+  teardown:
+    - on: qm-depot
+      run: kubectl delete namespace customs-clearance --ignore-not-found --wait=false
+  checks:
+    - id: secret
+      description: Secret customs-api-key holds api-key={{key}}
+      type: shell
+      on: qm-depot
+      skills: [k8s.workloads.config]
+      command: kubectl -n customs-clearance get secret customs-api-key -o jsonpath='{.data.api-key}' | base64 -d; echo '|'
+      expect: {match: exact, value: "{{key}}|"}
+    - id: env-and-file
+      description: A running clearance container sees API_KEY and /run/keys/api-key with the key
+      type: shell
+      on: qm-depot
+      skills: [k8s.workloads.config]
+      weight: 2
+      timeoutSec: 20
+      command: |
+        kubectl -n customs-clearance rollout status deploy/clearance --timeout=5s >/dev/null 2>&1 || { echo "not rolled out"; exit 0; }
+        kubectl -n customs-clearance exec deploy/clearance -c clearance -- sh -c 'echo "$API_KEY $(cat /run/keys/api-key)"' 2>&1
+      expect: {match: exact, value: "{{key}} {{key}}"}
+    - id: from-secret
+      description: Both the variable and the volume reference the Secret
+      type: shell
+      on: qm-depot
+      skills: [k8s.workloads.config]
+      command: |
+        kubectl -n customs-clearance get deploy clearance -o json | jq -r '
+          "\(.spec.template.spec.containers[0].env[]? | select(.name == "API_KEY") | .valueFrom.secretKeyRef.name // "literal") \([.spec.template.spec.volumes[]? | .secret.secretName // empty] | join(","))"'
+      expect: {match: exact, value: customs-api-key customs-api-key}
+  misconceptions:
+    - id: literal-env
+      description: Writes the key into the Deployment as a literal value.
+      feedback: Read the variable from the Secret with secretKeyRef.
+      expectFail: [from-secret]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n customs-clearance create secret generic customs-api-key --from-literal=api-key={{key}}
+          kubectl -n customs-clearance patch deploy clearance -p '{"spec":{"template":{"spec":{"volumes":[{"name":"keys","secret":{"secretName":"customs-api-key"}}],"containers":[{"name":"clearance","env":[{"name":"API_KEY","value":"{{key}}"}],"volumeMounts":[{"name":"keys","mountPath":"/run/keys"}]}]}}}}'
+          kubectl -n customs-clearance rollout status deploy/clearance --timeout=120s
+    - id: env-only
+      description: Exposes the key only as an environment variable.
+      feedback: The file under /run/keys is needed too; mount the Secret as a volume.
+      expectFail: [env-and-file, from-secret]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n customs-clearance create secret generic customs-api-key --from-literal=api-key={{key}}
+          kubectl -n customs-clearance patch deploy clearance -p '{"spec":{"template":{"spec":{"containers":[{"name":"clearance","env":[{"name":"API_KEY","valueFrom":{"secretKeyRef":{"name":"customs-api-key","key":"api-key"}}}]}]}}}}'
+          kubectl -n customs-clearance rollout status deploy/clearance --timeout=120s
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n customs-clearance create secret generic customs-api-key --from-literal=api-key={{key}}
+          kubectl -n customs-clearance patch deploy clearance -p '{"spec":{"template":{"spec":{"volumes":[{"name":"keys","secret":{"secretName":"customs-api-key"}}],"containers":[{"name":"clearance","env":[{"name":"API_KEY","valueFrom":{"secretKeyRef":{"name":"customs-api-key","key":"api-key"}}}],"volumeMounts":[{"name":"keys","mountPath":"/run/keys","readOnly":true}]}]}}}}'
+          kubectl -n customs-clearance rollout status deploy/clearance --timeout=120s

@@ -1,0 +1,291 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: priority-preemption-peak
+  title: Protect critical workloads with PriorityClasses
+  domain: kubernetes
+  frameworks: [cka:workloads-scheduling]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [scheduling, priorityclass, preemption]
+  version: 1
+spec:
+  description: |
+    During the evening peak the capacity cluster is full of batch reporting
+    jobs, and the customs clearance service cannot start: its Pods stay
+    Pending. Customs clearance must always win over reporting.
+
+    Use context `qm-capacity`:
+
+    ```bash
+    kubectl config use-context qm-capacity
+    ```
+
+    1. Create a PriorityClass **`customs-critical`** with value
+       **{{value}}** that may preempt lower-priority Pods. It must not become
+       the cluster's default class.
+    2. Make Deployment **`customs-clearance`** (namespace `customs`) use it,
+       so that both of its replicas get scheduled by preempting batch Pods
+       from namespace `batch-reports` (PriorityClass `batch-low`).
+    3. Write the names of the batch Pods that were **preempted** to
+       `/home/learner/reports/preempted.txt`, one name per line.
+
+    Do not scale, delete or otherwise change the batch workload yourself.
+  objectives:
+    - Create a PriorityClass with a preemption policy
+    - Assign a PriorityClass to a workload
+    - Find which Pods were preempted, and by whom
+  params:
+    value:
+      type: choice
+      values: ["1000000", "500000", "250000"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-capacity
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-capacity
+          nodes:
+            - {name: capacity-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: capacity-wk-1, role: worker}
+  setup:
+    - on: qm-capacity
+      apply: |
+        apiVersion: scheduling.k8s.io/v1
+        kind: PriorityClass
+        metadata: {name: batch-low}
+        value: 100
+        globalDefault: false
+        description: Overnight and peak-time reporting batch work.
+        ---
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: batch-reports}
+        ---
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: customs}
+    - on: qm-capacity
+      timeoutSec: 240
+      run: |
+        set -e
+        # Size the batch Pods so that 4 of them fill capacity-wk-1 and a customs Pod fits
+        # only where a batch Pod was: exactly two batch Pods must be preempted.
+        tomilli() { case $1 in *m) echo ${1%m};; *) echo $(( $1 * 1000 ));; esac; }
+        alloc=$(tomilli "$(kubectl get node capacity-wk-1 -o jsonpath='{.status.allocatable.cpu}')")
+        used=$(kubectl get pods -A --field-selector spec.nodeName=capacity-wk-1,status.phase=Running -o json \
+          | jq '[.items[].spec.containers[].resources.requests.cpu // "0" | if endswith("m") then (rtrimstr("m") | tonumber) else (tonumber * 1000) end] | add // 0')
+        each=$(( (alloc - used - 40) / 4 ))
+        echo "allocatable=${alloc}m used=${used}m batch=${each}m x4"
+        cat <<YAML | kubectl apply -f -
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: batch-reporting, namespace: batch-reports}
+        spec:
+          replicas: 4
+          selector: {matchLabels: {app: batch-reporting}}
+          template:
+            metadata: {labels: {app: batch-reporting}}
+            spec:
+              priorityClassName: batch-low
+              terminationGracePeriodSeconds: 1
+              containers:
+                - name: report
+                  image: busybox:1.37
+                  command: ["sh", "-c", "while true; do sleep 30; done"]
+                  resources: {requests: {cpu: ${each}m, memory: 16Mi}}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: customs-clearance, namespace: customs}
+        spec:
+          replicas: 2
+          selector: {matchLabels: {app: customs-clearance}}
+          template:
+            metadata: {labels: {app: customs-clearance}}
+            spec:
+              containers:
+                - name: clearance
+                  image: httpd:2.4-alpine
+                  resources: {requests: {cpu: ${each}m, memory: 16Mi}}
+        YAML
+        kubectl -n batch-reports rollout status deploy/batch-reporting --timeout=150s
+        sleep 5
+        pending=$(kubectl -n customs get pods -l app=customs-clearance --field-selector=status.phase=Pending --no-headers | wc -l)
+        [ "$pending" = 2 ] || { echo "expected 2 Pending customs Pods, got $pending"; exit 1; }
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/reports
+  teardown:
+    - on: qm-capacity
+      run: |
+        kubectl delete namespace customs batch-reports --ignore-not-found --wait=false
+        kubectl delete priorityclass customs-critical batch-low --ignore-not-found
+  checks:
+    - id: context
+      description: Terminal is using context qm-capacity
+      type: k8s-context
+      on: workstation
+      skills: [k8s.cli.contexts]
+      weight: 0.5
+      expect: {match: exact, value: qm-capacity}
+    - id: priority-class
+      description: PriorityClass customs-critical has value {{value}}, may preempt, and is not the global default
+      type: k8s-query
+      skills: [k8s.scheduling.priority-preemption]
+      weight: 2
+      query: {cluster: qm-capacity, resource: priorityclass, name: customs-critical, jsonpath: '{.value} {.preemptionPolicy} {.globalDefault}'}
+      expect: {match: regex, value: '^{{value}} PreemptLowerPriority (false)?$'}
+    - id: customs-running
+      description: customs-clearance uses customs-critical and both replicas are ready
+      type: k8s-query
+      skills: [k8s.scheduling.priority-preemption]
+      weight: 2
+      query: {cluster: qm-capacity, resource: deployment, name: customs-clearance, namespace: customs, jsonpath: '{.spec.template.spec.priorityClassName} {.status.readyReplicas}/{.spec.replicas}'}
+      expect: {match: exact, value: customs-critical 2/2}
+    - id: batch-untouched
+      description: The batch Deployment still asks for 4 replicas with priority class batch-low
+      type: k8s-query
+      skills: [k8s.cli.scoped-changes]
+      weight: 0.5
+      query: {cluster: qm-capacity, resource: deployment, name: batch-reporting, namespace: batch-reports, jsonpath: '{.spec.replicas} {.spec.template.spec.priorityClassName}'}
+      expect: {match: exact, value: 4 batch-low}
+    - id: preempted-report
+      description: The report names exactly the batch Pods the scheduler preempted
+      type: shell
+      on: workstation
+      skills: [k8s.scheduling.priority-preemption]
+      weight: 2
+      command: |
+        f=/home/learner/reports/preempted.txt
+        [ -f "$f" ] || { echo "no report"; exit 0; }
+        exp=$(kubectl --kubeconfig /home/learner/.kube/config --context qm-capacity -n batch-reports get events \
+          --field-selector reason=Preempted -o jsonpath='{range .items[*]}{.involvedObject.name}{"\n"}{end}' | sort -u)
+        got=$(tr -d '\r' < "$f" | sed 's/[[:space:]]*$//; s#^pod/##; /^$/d' | sort -u)
+        [ "$(echo "$exp" | grep -c .)" = 2 ] && [ "$exp" = "$got" ] && echo ok || printf 'mismatch\ngot:\n%s\n' "$got"
+      expect: {match: exact, value: ok}
+  hints:
+    - title: Switch context
+      body: The capacity cluster is qm-capacity.
+      command: kubectl config use-context qm-capacity
+      cost: 0
+    - title: Why Pending?
+      command: kubectl -n customs describe pod -l app=customs-clearance | sed -n '/Events:/,$p'
+      body: The scheduler reports insufficient CPU; no batch Pod has a lower priority than the customs Pods yet, because they have none.
+      cost: 1
+    - title: Create and assign
+      command: |
+        kubectl create priorityclass customs-critical --value={{value}} --preemption-policy=PreemptLowerPriority --description="customs clearance beats batch work"
+        kubectl -n customs patch deployment customs-clearance -p '{"spec":{"template":{"spec":{"priorityClassName":"customs-critical"}}}}'
+      body: "`priorityClassName` lives in the Pod template; existing Pending Pods are replaced by the rollout."
+      cost: 2
+    - title: Who was evicted?
+      command: kubectl -n batch-reports get events --field-selector reason=Preempted
+      body: The scheduler records a Preempted event on every victim Pod, naming the Pod that preempted it.
+      cost: 2
+  misconceptions:
+    - id: class-not-assigned
+      description: Creates the PriorityClass but never sets it on the Deployment.
+      feedback: A PriorityClass has no effect until Pods reference it by `priorityClassName`.
+      expectFail: [customs-running, preempted-report]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 90
+        run: |
+          kubectl config use-context qm-capacity
+          kubectl create priorityclass customs-critical --value={{value}} --preemption-policy=PreemptLowerPriority
+          sleep 30
+          kubectl -n batch-reports get events --field-selector reason=Preempted -o jsonpath='{range .items[*]}{.involvedObject.name}{"\n"}{end}' > ~/reports/preempted.txt
+    - id: never-preempt
+      description: Sets preemptionPolicy Never.
+      feedback: With Never, the Pods are only placed ahead in the scheduling queue; they wait for free capacity instead of preempting batch Pods.
+      expectFail: [priority-class, customs-running]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          kubectl config use-context qm-capacity
+          kubectl create priorityclass customs-critical --value={{value}} --preemption-policy=Never
+          kubectl -n customs patch deployment customs-clearance -p '{"spec":{"template":{"spec":{"priorityClassName":"customs-critical"}}}}'
+          sleep 45
+    - id: global-default
+      description: Marks the new class as the global default.
+      feedback: globalDefault applies the class to every new Pod without a class, including batch work, which defeats the point.
+      expectFail: [priority-class]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 200
+        run: |
+          kubectl config use-context qm-capacity
+          kubectl apply -f - <<'YAML'
+          apiVersion: scheduling.k8s.io/v1
+          kind: PriorityClass
+          metadata: {name: customs-critical}
+          value: {{value}}
+          globalDefault: true
+          YAML
+          kubectl -n customs patch deployment customs-clearance -p '{"spec":{"template":{"spec":{"priorityClassName":"customs-critical"}}}}'
+          kubectl -n customs rollout status deploy/customs-clearance --timeout=150s
+          kubectl -n batch-reports get events --field-selector reason=Preempted -o jsonpath='{range .items[*]}{.involvedObject.name}{"\n"}{end}' > ~/reports/preempted.txt
+    - id: scale-batch-down
+      description: Makes room by scaling the batch Deployment down instead.
+      feedback: Scaling batch work by hand does not protect customs at the next peak. Priority and preemption make the decision automatic.
+      expectFail: [batch-untouched, preempted-report]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 200
+        run: |
+          kubectl config use-context qm-capacity
+          kubectl -n batch-reports scale deployment batch-reporting --replicas=2
+          kubectl create priorityclass customs-critical --value={{value}}
+          kubectl -n customs patch deployment customs-clearance -p '{"spec":{"template":{"spec":{"priorityClassName":"customs-critical"}}}}'
+          kubectl -n customs rollout status deploy/customs-clearance --timeout=150s
+          kubectl -n batch-reports get pods -o name | head -2 > ~/reports/preempted.txt
+  solution:
+    explanation: |
+      Once the customs Pods carry a priority above batch-low, the scheduler
+      finds no free node, picks capacity-wk-1 and evicts the lowest-priority
+      Pods whose removal makes the customs Pod fit: two batch Pods. Each victim
+      gets a Preempted event. The batch Deployment recreates them, and the
+      replacements stay Pending until capacity frees up.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 240
+        run: |
+          kubectl config use-context qm-capacity
+          kubectl create priorityclass customs-critical --value={{value}} --preemption-policy=PreemptLowerPriority --description="customs clearance beats batch work"
+          kubectl -n customs patch deployment customs-clearance -p '{"spec":{"template":{"spec":{"priorityClassName":"customs-critical"}}}}'
+          kubectl -n customs rollout status deploy/customs-clearance --timeout=200s
+          kubectl -n batch-reports get events --field-selector reason=Preempted \
+            -o jsonpath='{range .items[*]}{.involvedObject.name}{"\n"}{end}' | sort -u > ~/reports/preempted.txt
+    alternatives:
+      - id: manifest-and-describe
+        description: PriorityClass from a manifest, assignment with kubectl edit-like yq, victims read from the events table.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 240
+            run: |
+              kubectl config use-context qm-capacity
+              kubectl apply -f - <<'YAML'
+              apiVersion: scheduling.k8s.io/v1
+              kind: PriorityClass
+              metadata: {name: customs-critical}
+              value: {{value}}
+              description: Customs clearance must preempt batch reporting.
+              YAML
+              kubectl -n customs get deployment customs-clearance -o yaml | yq '.spec.template.spec.priorityClassName = "customs-critical"' | kubectl apply -f -
+              kubectl -n customs rollout status deploy/customs-clearance --timeout=200s
+              kubectl -n batch-reports get events | awk '$2 == "Normal" && $3 == "Preempted" {sub("pod/", "", $4); print $4}' | sort -u > ~/reports/preempted.txt

@@ -1,0 +1,265 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: kubeadm-bootstrap-cluster
+  title: Bootstrap a new cluster with kubeadm
+  domain: kubernetes
+  frameworks: [cka:cluster-architecture]
+  difficulty: hard
+  estimatedMinutes: 40
+  tags: [kubeadm, init, join, cni, calico]
+  version: 1
+spec:
+  description: |
+    The harbour terminal gets its own cluster, `qm-harbour`. Two prepared
+    machines are waiting: `harbour-cp-1` (control plane) and `harbour-wk-1`
+    (worker). The packages, the container runtime and the cluster CA are in
+    place; nothing has been initialised yet.
+
+    From your workstation you can `ssh harbour-cp-1` and `ssh harbour-wk-1`
+    (`sudo` works on both).
+
+    1. On `harbour-cp-1`, initialise the control plane with `kubeadm init`
+       using the kubeadm configuration in `~/harbour/kubeadm-config.yaml` on
+       that node. Its Pod network setting is still missing: the cluster must
+       use the Pod CIDR **`10.244.0.0/16`**.
+    2. Install the CNI from the provided Calico manifest
+       `~/harbour/calico.yaml` on `harbour-cp-1`. Its IP pool must match the
+       cluster's Pod CIDR.
+    3. Join `harbour-wk-1` to the cluster as a worker.
+
+    When you are done, both nodes are Ready, CoreDNS runs, and your
+    workstation's context `qm-harbour` works against the new cluster.
+  objectives:
+    - Initialise a control plane with kubeadm init and a configuration file
+    - Install a CNI whose pool matches the cluster Pod CIDR
+    - Join a worker with a bootstrap token
+  params:
+    calicoDefault:
+      type: choice
+      values: [172.16.0.0/16, 172.20.0.0/16]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-harbour
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-harbour
+          nodes:
+            - {name: harbour-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: harbour-wk-1, role: worker}
+  setup:
+    # Undo the platform's bootstrap: both machines become uninitialised hosts.
+    - on: qm-harbour/harbour-wk-1
+      timeoutSec: 180
+      run: |
+        kubeadm reset -f >/dev/null 2>&1 || true
+        rm -rf /etc/cni/net.d/* /root/join.yaml
+        systemctl stop kubelet || true
+    - on: qm-harbour/harbour-cp-1
+      timeoutSec: 300
+      run: |
+        set -e
+        ip=$(sed -n 's/^ *advertiseAddress: *//p' /root/kubeadm.yaml | head -1)
+        [ -n "$ip" ] || ip=$(hostname -I | awk '{print $1}')
+        install -d -m 0700 /root/ca-keep
+        cp /etc/kubernetes/pki/ca.crt /etc/kubernetes/pki/ca.key /root/ca-keep/ 2>/dev/null || true
+        kubeadm reset -f >/dev/null 2>&1 || true
+        rm -rf /etc/cni/net.d/* /var/lib/etcd /root/kubeadm.yaml /home/learner/.kube/config /root/.kube
+        install -d -m 0755 /etc/kubernetes/pki
+        cp /root/ca-keep/ca.crt /root/ca-keep/ca.key /etc/kubernetes/pki/
+        chmod 600 /etc/kubernetes/pki/ca.key
+        rm -rf /root/ca-keep
+        systemctl stop kubelet || true
+        install -d -o learner -g learner /home/learner/harbour
+        cat > /home/learner/harbour/kubeadm-config.yaml <<EOF
+        apiVersion: kubeadm.k8s.io/v1beta4
+        kind: InitConfiguration
+        localAPIEndpoint:
+          advertiseAddress: $ip
+          bindPort: 6443
+        nodeRegistration:
+          name: harbour-cp-1
+          criSocket: unix:///run/containerd/containerd.sock
+          taints:
+            - {key: node-role.kubernetes.io/control-plane, effect: NoSchedule}
+        ---
+        apiVersion: kubeadm.k8s.io/v1beta4
+        kind: ClusterConfiguration
+        kubernetesVersion: $(kubeadm version -o short)
+        clusterName: qm-harbour
+        controlPlaneEndpoint: $ip:6443
+        apiServer:
+          certSANs: [harbour-cp-1, $ip]
+        networking:
+          serviceSubnet: 10.96.0.0/12
+        ---
+        apiVersion: kubelet.config.k8s.io/v1beta1
+        kind: KubeletConfiguration
+        cgroupDriver: systemd
+        resolvConf: /etc/cloudtrain/resolv.conf
+        EOF
+        sed "/- name: CALICO_IPV4POOL_CIDR\$/{n;s|value: \".*\"|value: \"{{calicoDefault}}\"|}" /opt/cloudtrain/manifests/calico.yaml > /home/learner/harbour/calico.yaml
+        chown -R learner:learner /home/learner/harbour
+  checks:
+    - id: api-up
+      description: The qm-harbour API server answers with the cluster CA
+      type: shell
+      on: qm-harbour
+      skills: [k8s.cluster.kubeadm-install]
+      timeoutSec: 15
+      command: kubectl get --raw=/readyz 2>&1 | head -1
+      expect: {match: exact, value: ok}
+    - id: pod-cidr
+      description: The cluster was initialised with Pod CIDR 10.244.0.0/16
+      type: shell
+      on: qm-harbour
+      skills: [k8s.cluster.kubeadm-install]
+      weight: 2
+      command: kubectl -n kube-system get configmap kubeadm-config -o jsonpath='{.data.ClusterConfiguration}' 2>/dev/null | yq '.networking.podSubnet'
+      expect: {match: exact, value: 10.244.0.0/16}
+    - id: control-plane-components
+      description: etcd, kube-apiserver, kube-controller-manager and kube-scheduler run as static Pods on harbour-cp-1
+      type: shell
+      on: qm-harbour
+      skills: [k8s.cluster.components]
+      command: |
+        kubectl -n kube-system get pods --field-selector spec.nodeName=harbour-cp-1 -o json 2>/dev/null | jq -r '
+          [.items[] | select(.metadata.ownerReferences[0].kind == "Node") | select(.status.phase == "Running")
+           | .metadata.name | sub("-harbour-cp-1$"; "")] | sort | join(",")'
+      expect: {match: exact, value: "etcd,kube-apiserver,kube-controller-manager,kube-scheduler"}
+    - id: cni-pool
+      description: Calico's default IP pool is 10.244.0.0/16 and calico-node is ready on both nodes
+      type: shell
+      on: qm-harbour
+      skills: [k8s.cluster.kubeadm-install]
+      weight: 2
+      command: |
+        echo "$(kubectl get ippools.crd.projectcalico.org -o jsonpath='{.items[*].spec.cidr}' 2>/dev/null) \
+        $(kubectl -n kube-system get ds calico-node -o jsonpath='{.status.numberReady}' 2>/dev/null)"
+      expect: {match: exact, value: 10.244.0.0/16 2}
+    - id: nodes-ready
+      description: harbour-cp-1 and harbour-wk-1 are both Ready
+      type: shell
+      on: qm-harbour
+      skills: [k8s.cluster.kubeadm-install]
+      weight: 2
+      command: |
+        kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}={.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}' 2>/dev/null | sort | paste -sd' ' -
+      expect: {match: exact, value: harbour-cp-1=True harbour-wk-1=True}
+    - id: coredns
+      description: CoreDNS is available
+      type: shell
+      on: qm-harbour
+      skills: [k8s.cluster.components]
+      command: kubectl -n kube-system get deploy coredns -o jsonpath='{.status.availableReplicas}' 2>/dev/null
+      expect: {match: exact, value: "2"}
+    - id: workstation-context
+      description: The workstation's qm-harbour context lists both nodes
+      type: shell
+      on: workstation
+      skills: [k8s.cluster.kubeadm-install]
+      weight: 0.5
+      timeoutSec: 15
+      command: kubectl --kubeconfig /home/learner/.kube/config --context qm-harbour get nodes --no-headers 2>&1 | wc -l
+      expect: {match: exact, value: "2"}
+  hints:
+    - title: Complete the configuration
+      body: In a kubeadm configuration file the Pod CIDR is `networking.podSubnet` of the ClusterConfiguration (the file replaces `--pod-network-cidr`).
+      command: ssh harbour-cp-1 'sed -n "/ClusterConfiguration/,/---/p" ~/harbour/kubeadm-config.yaml'
+      cost: 1
+    - title: Initialise
+      command: ssh harbour-cp-1 'sudo kubeadm init --config ~/harbour/kubeadm-config.yaml'
+      body: The output ends with how to use the admin kubeconfig and a join command for workers.
+      cost: 2
+    - title: The CNI's pool
+      body: Calico's manifest sets its default pool with the `CALICO_IPV4POOL_CIDR` variable of calico-node. Set it to the cluster Pod CIDR before applying.
+      command: ssh harbour-cp-1 'grep -A1 CALICO_IPV4POOL_CIDR ~/harbour/calico.yaml'
+      cost: 2
+    - title: Join the worker
+      command: |
+        cmd=$(ssh harbour-cp-1 'sudo kubeadm token create --print-join-command')
+        ssh harbour-wk-1 "sudo $cmd"
+      body: A join command carries the API endpoint, a bootstrap token and the CA certificate hash.
+      cost: 2
+  misconceptions:
+    - id: no-pod-cidr
+      description: Runs kubeadm init with the file as given, without a Pod CIDR.
+      feedback: Without podSubnet the controller manager allocates no node Pod ranges and the CNI pool has no matching cluster CIDR. Add networking.podSubnet before init.
+      expectFail: [pod-cidr]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 600
+        run: |
+          ssh harbour-cp-1 'set -e
+            sudo kubeadm init --config ~/harbour/kubeadm-config.yaml >/tmp/init.log 2>&1
+            sed "/- name: CALICO_IPV4POOL_CIDR\$/{n;s|value: \".*\"|value: \"10.244.0.0/16\"|}" ~/harbour/calico.yaml > /tmp/calico.yaml
+            sudo KUBECONFIG=/etc/kubernetes/admin.conf kubectl apply -f /tmp/calico.yaml >/dev/null'
+          cmd=$(ssh harbour-cp-1 'sudo kubeadm token create --print-join-command')
+          ssh harbour-wk-1 "sudo $cmd"
+          kubectl --context qm-harbour wait node --all --for=condition=Ready --timeout=300s || true
+    - id: calico-default-pool
+      description: Applies the Calico manifest without setting its pool.
+      feedback: The manifest's pool must equal the cluster Pod CIDR; Calico's default range does not match 10.244.0.0/16 and may collide with networks the nodes already use.
+      expectFail: [cni-pool]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 600
+        run: |
+          ssh harbour-cp-1 'set -e
+            printf "  podSubnet: 10.244.0.0/16\n" > /tmp/ps
+            sed -i "/^networking:/r /tmp/ps" ~/harbour/kubeadm-config.yaml
+            sudo kubeadm init --config ~/harbour/kubeadm-config.yaml >/tmp/init.log 2>&1
+            sudo KUBECONFIG=/etc/kubernetes/admin.conf kubectl apply -f ~/harbour/calico.yaml >/dev/null'
+          cmd=$(ssh harbour-cp-1 'sudo kubeadm token create --print-join-command')
+          ssh harbour-wk-1 "sudo $cmd"
+          sleep 60
+    - id: worker-not-joined
+      description: Initialises the control plane and the CNI but forgets the worker.
+      feedback: A cluster with only a tainted control-plane node cannot run workloads. Join harbour-wk-1 with the join command.
+      expectFail: [nodes-ready, cni-pool, coredns]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 600
+        run: |
+          ssh harbour-cp-1 'set -e
+            printf "  podSubnet: 10.244.0.0/16\n" > /tmp/ps
+            sed -i "/^networking:/r /tmp/ps" ~/harbour/kubeadm-config.yaml
+            sudo kubeadm init --config ~/harbour/kubeadm-config.yaml >/tmp/init.log 2>&1
+            sed "/- name: CALICO_IPV4POOL_CIDR\$/{n;s|value: \".*\"|value: \"10.244.0.0/16\"|}" ~/harbour/calico.yaml > /tmp/calico.yaml
+            sudo KUBECONFIG=/etc/kubernetes/admin.conf kubectl apply -f /tmp/calico.yaml >/dev/null'
+          sleep 60
+  solution:
+    explanation: |
+      `networking.podSubnet` in the ClusterConfiguration is what
+      `--pod-network-cidr` would set: the controller manager's cluster CIDR.
+      `kubeadm init` reuses the existing CA in /etc/kubernetes/pki, so the
+      workstation's credentials stay valid. Calico's pool is set to the same
+      range before applying the manifest; then a fresh join command adds the
+      worker, and CoreDNS starts once a schedulable node with a working CNI
+      exists.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 600
+        run: |
+          ssh harbour-cp-1 'set -e
+            printf "  podSubnet: 10.244.0.0/16\n" > /tmp/ps
+            sed -i "/^networking:/r /tmp/ps" ~/harbour/kubeadm-config.yaml
+            sudo kubeadm init --config ~/harbour/kubeadm-config.yaml >/tmp/init.log 2>&1
+            sed -i "/- name: CALICO_IPV4POOL_CIDR\$/{n;s|value: \".*\"|value: \"10.244.0.0/16\"|}" ~/harbour/calico.yaml
+            sudo KUBECONFIG=/etc/kubernetes/admin.conf kubectl apply -f ~/harbour/calico.yaml >/dev/null'
+          cmd=$(ssh harbour-cp-1 'sudo kubeadm token create --print-join-command')
+          ssh harbour-wk-1 "sudo $cmd"
+          kubectl --context qm-harbour wait node --all --for=condition=Ready --timeout=300s
+          kubectl --context qm-harbour -n kube-system rollout status deploy/coredns --timeout=240s

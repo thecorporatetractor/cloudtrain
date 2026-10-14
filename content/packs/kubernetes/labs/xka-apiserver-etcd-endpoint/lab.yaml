@@ -1,0 +1,111 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xka-apiserver-etcd-endpoint
+  title: Reconnect the API server to etcd
+  domain: kubernetes
+  frameworks: [cka:troubleshooting]
+  difficulty: hard
+  estimatedMinutes: 12
+  tags: [exam, kube-apiserver, etcd, static-pods]
+  version: 1
+spec:
+  description: |
+    **Host:** `ledger-cp-1` (`ssh ledger-cp-1`; `sudo` and `crictl` work
+    there); **context** `qm-ledger`
+
+    After a change on `ledger-cp-1`, the `qm-ledger` API server keeps
+    crashing and `kubectl` against `qm-ledger` fails. Fix the API server's
+    **etcd connection settings** so that it runs again and the context
+    `qm-ledger` works. Change nothing else.
+  objectives:
+    - Read a crashing API server's logs with crictl
+    - Fix the etcd endpoint of the API server
+  params:
+    port:
+      type: choice
+      values: ["2380", "2381", "4001"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-ledger
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-ledger
+          nodes:
+            - {name: ledger-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: ledger-wk-1, role: worker}
+  setup:
+    - on: qm-ledger/ledger-cp-1
+      timeoutSec: 240
+      run: |
+        set -e
+        m=/etc/kubernetes/manifests/kube-apiserver.yaml
+        mkdir -p /var/lib/cloudtrain
+        [ -f /var/lib/cloudtrain/apiserver-flags.orig ] || grep -- '- --' $m | sed 's/^ *//' | sort > /var/lib/cloudtrain/apiserver-flags.orig
+        sed -i 's#--etcd-servers=https://127.0.0.1:2379$#--etcd-servers=https://127.0.0.1:{{port}}#' $m
+        grep -q -- '--etcd-servers=https://127.0.0.1:{{port}}' $m
+        export KUBECONFIG=/etc/kubernetes/admin.conf
+        for i in $(seq 1 60); do sleep 3; kubectl get --raw=/readyz --request-timeout=3s >/dev/null 2>&1 || exit 0; done
+        exit 1
+  checks:
+    - id: api-answers
+      description: The qm-ledger API server answers /readyz
+      type: shell
+      on: qm-ledger/ledger-cp-1
+      skills: [k8s.troubleshooting.control-plane]
+      weight: 2
+      timeoutSec: 15
+      command: kubectl --kubeconfig /etc/kubernetes/admin.conf get --raw=/readyz --request-timeout=5s 2>&1 | head -1
+      expect: {match: exact, value: ok}
+    - id: manifest-restored
+      description: The kube-apiserver manifest has exactly its original flags again
+      type: shell
+      on: qm-ledger/ledger-cp-1
+      skills: [k8s.troubleshooting.logs, k8s.troubleshooting.control-plane]
+      weight: 2
+      command: |
+        grep -- '- --' /etc/kubernetes/manifests/kube-apiserver.yaml | sed 's/^ *//' | sort | diff -q - /var/lib/cloudtrain/apiserver-flags.orig >/dev/null && echo original || echo changed
+      expect: {match: exact, value: original}
+  misconceptions:
+    - id: restart-etcd
+      description: Restarts etcd and the kubelet instead of fixing the flag.
+      feedback: etcd is fine; the API server is pointed at the wrong port. The logs name the address it cannot reach.
+      expectFail: [api-answers, manifest-restored]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          ssh ledger-cp-1 'sudo systemctl restart kubelet'
+          sleep 60
+    - id: plain-http
+      description: Changes the endpoint to the right port but plain http.
+      feedback: kubeadm's etcd only accepts TLS clients; keep https.
+      expectFail: [api-answers, manifest-restored]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          ssh ledger-cp-1 'sudo sed -i "s#--etcd-servers=https://127.0.0.1:{{port}}#--etcd-servers=http://127.0.0.1:2379#" /etc/kubernetes/manifests/kube-apiserver.yaml'
+          sleep 60
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          ssh ledger-cp-1 'sudo bash -s' <<'EOS'
+          crictl logs $(crictl ps -a --name kube-apiserver -q | head -1) 2>&1 | grep -m2 -i etcd || true
+          sed -i 's#--etcd-servers=https://127.0.0.1:{{port}}#--etcd-servers=https://127.0.0.1:2379#' /etc/kubernetes/manifests/kube-apiserver.yaml
+          for i in $(seq 1 60); do kubectl --kubeconfig /etc/kubernetes/admin.conf get --raw=/readyz >/dev/null 2>&1 && break; sleep 5; done
+          EOS
+          kubectl --context qm-ledger get nodes

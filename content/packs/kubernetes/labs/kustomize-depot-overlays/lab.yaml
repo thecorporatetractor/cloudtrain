@@ -1,0 +1,334 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: kustomize-depot-overlays
+  title: Build staging and production overlays with Kustomize
+  domain: kubernetes
+  frameworks: [cka:cluster-architecture, ckad:deployment]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [kustomize, overlays, configmapgenerator, apply-k]
+  version: 1
+spec:
+  description: |
+    The depot portal's manifests live in `~/depot-portal/base` as a Kustomize
+    base (Deployment, Service and a generated ConfigMap `portal-settings`).
+    Staging and production need their own variants, without copying the base.
+
+    Use context `qm-depot`:
+
+    ```bash
+    kubectl config use-context qm-depot
+    ```
+
+    Create two overlays that both use `../../base` and leave the base files
+    untouched:
+
+    | | `~/depot-portal/overlays/staging` | `~/depot-portal/overlays/production` |
+    |---|---|---|
+    | namespace | `depot-staging` | `depot-prod` |
+    | replicas of `depot-portal` | 2 | {{prodReplicas}} |
+    | image | unchanged (`httpd:2.4-alpine`) | tag `2.4` (`httpd:2.4`) |
+    | `portal-settings` | `MAX_UPLOAD_MB=25` | `MAX_UPLOAD_MB={{prodUpload}}` |
+
+    The other keys of `portal-settings` (`THEME`, `LOCALE`) must keep their
+    base values in both overlays.
+
+    Apply **only production**, with `kubectl apply -k`. Both namespaces
+    already exist.
+  objectives:
+    - Structure a base and overlays
+    - Change replicas, image tags and generated ConfigMap values in an overlay
+    - Render with kubectl kustomize and apply with kubectl apply -k
+  params:
+    prodReplicas:
+      type: int
+      min: 3
+      max: 4
+    prodUpload:
+      type: choice
+      values: ["50", "75", "100"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-depot
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: qm-depot
+  setup:
+    - on: workstation
+      file: {path: /home/learner/depot-portal/base/kustomization.yaml, source: assets/kustomization.yaml}
+    - on: workstation
+      file: {path: /home/learner/depot-portal/base/deployment.yaml, source: assets/deployment.yaml}
+    - on: workstation
+      file: {path: /home/learner/depot-portal/base/service.yaml, source: assets/service.yaml}
+    - on: workstation
+      run: |
+        mkdir -p /home/learner/depot-portal/overlays
+        chown -R learner:learner /home/learner/depot-portal
+    - on: qm-depot
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: depot-staging}
+        ---
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: depot-prod}
+  teardown:
+    - on: qm-depot
+      run: kubectl delete namespace depot-staging depot-prod --ignore-not-found --wait=false
+  checks:
+    - id: context
+      description: Terminal is using context qm-depot
+      type: k8s-context
+      on: workstation
+      skills: [k8s.cli.contexts]
+      weight: 0.5
+      expect: {match: exact, value: qm-depot}
+    - id: staging-renders
+      description: The staging overlay renders depot-portal in depot-staging with 2 replicas, httpd:2.4-alpine and MAX_UPLOAD_MB=25
+      type: shell
+      on: workstation
+      skills: [k8s.cluster.kustomize]
+      weight: 2
+      timeoutSec: 20
+      command: |
+        cd /home/learner/depot-portal/overlays/staging 2>/dev/null || { echo "no staging overlay"; exit 0; }
+        out=$(kubectl kustomize . 2>&1) || { echo "does not build"; exit 0; }
+        echo "$out" | yq ea -o=json -I=0 '[.]' | jq -r '
+          (.[] | select(.kind == "Deployment") | "\(.metadata.namespace) \(.spec.replicas) \(.spec.template.spec.containers[0].image)"),
+          (.[] | select(.kind == "ConfigMap") | "\(.data.THEME) \(.data.LOCALE) \(.data.MAX_UPLOAD_MB)")'
+      expect: {match: exact, value: "depot-staging 2 httpd:2.4-alpine\nstandard en-GB 25"}
+    - id: production-renders
+      description: The production overlay renders depot-prod with {{prodReplicas}} replicas, httpd:2.4 and MAX_UPLOAD_MB={{prodUpload}}
+      type: shell
+      on: workstation
+      skills: [k8s.cluster.kustomize]
+      weight: 2
+      timeoutSec: 20
+      command: |
+        cd /home/learner/depot-portal/overlays/production 2>/dev/null || { echo "no production overlay"; exit 0; }
+        out=$(kubectl kustomize . 2>&1) || { echo "does not build"; exit 0; }
+        echo "$out" | yq ea -o=json -I=0 '[.]' | jq -r '
+          (.[] | select(.kind == "Deployment") | "\(.metadata.namespace) \(.spec.replicas) \(.spec.template.spec.containers[0].image)"),
+          (.[] | select(.kind == "ConfigMap") | "\(.data.THEME) \(.data.LOCALE) \(.data.MAX_UPLOAD_MB)")'
+      expect: {match: exact, value: "depot-prod {{prodReplicas}} httpd:2.4\nstandard en-GB {{prodUpload}}"}
+    - id: overlays-use-base
+      description: Both overlays reference ../../base as a resource
+      type: shell
+      on: workstation
+      skills: [k8s.cluster.kustomize]
+      command: |
+        for o in staging production; do
+          f=$(ls /home/learner/depot-portal/overlays/$o/kustomization.y*ml /home/learner/depot-portal/overlays/$o/Kustomization 2>/dev/null | head -1)
+          [ -n "$f" ] && yq -o=json '.' "$f" | jq -r '(.resources // []) + (.bases // []) | .[] | sub("/$"; "")' | grep -qx '../../base' && echo "$o:base" || echo "$o:no-base"
+        done | paste -sd' ' -
+      expect: {match: exact, value: "staging:base production:base"}
+    - id: base-untouched
+      description: The base files are unchanged
+      type: shell
+      on: workstation
+      skills: [k8s.cluster.kustomize]
+      weight: 0.5
+      command: cd /home/learner/depot-portal/base && md5sum kustomization.yaml deployment.yaml service.yaml | md5sum | cut -d' ' -f1
+      expect: {match: exact, value: 3807f4db1b29950cd886bf25fa64608e}
+    - id: production-live
+      description: depot-prod runs {{prodReplicas}} ready httpd:2.4 Pods using a ConfigMap with MAX_UPLOAD_MB={{prodUpload}} and THEME=standard
+      type: shell
+      on: qm-depot
+      skills: [k8s.cluster.kustomize]
+      weight: 2
+      command: |
+        d=$(kubectl -n depot-prod get deployment depot-portal -o json 2>/dev/null) || { echo "not deployed"; exit 0; }
+        cm=$(echo "$d" | jq -r '.spec.template.spec.containers[0].envFrom[0].configMapRef.name')
+        echo "$d" | jq -r '"\(.spec.replicas)/\(.status.readyReplicas) \(.spec.template.spec.containers[0].image)"'
+        kubectl -n depot-prod get configmap "$cm" -o jsonpath='{.data.MAX_UPLOAD_MB} {.data.THEME}'
+      expect: {match: exact, value: "{{prodReplicas}}/{{prodReplicas}} httpd:2.4\n{{prodUpload}} standard"}
+    - id: staging-not-applied
+      description: Nothing was applied to depot-staging
+      type: shell
+      on: qm-depot
+      skills: [k8s.cli.scoped-changes]
+      weight: 0.5
+      command: kubectl -n depot-staging get deployments,configmaps,services --no-headers 2>/dev/null | grep -vc kube-root-ca || true
+      expect: {match: exact, value: "0"}
+  hints:
+    - title: Switch context
+      body: The portal is deployed to qm-depot.
+      command: kubectl config use-context qm-depot
+      cost: 0
+    - title: An overlay is just another kustomization
+      body: "Its `resources` point at the base; `namespace`, `replicas` and `images` are built-in transformers."
+      cost: 1
+    - title: Changing one key of a generated ConfigMap
+      body: "A `configMapGenerator` entry with the base's name and `behavior: merge` adds or overrides keys; `replace` would drop the others."
+      cost: 2
+    - title: Production overlay
+      body: |
+        ```yaml
+        apiVersion: kustomize.config.k8s.io/v1beta1
+        kind: Kustomization
+        namespace: depot-prod
+        resources: [../../base]
+        replicas: [{name: depot-portal, count: {{prodReplicas}}}]
+        images: [{name: httpd, newTag: "2.4"}]
+        configMapGenerator:
+          - {name: portal-settings, behavior: merge, literals: [MAX_UPLOAD_MB={{prodUpload}}]}
+        ```
+      cost: 3
+    - title: Render before you apply
+      command: kubectl kustomize ~/depot-portal/overlays/production && kubectl apply -k ~/depot-portal/overlays/production
+      body: "`kubectl kustomize` prints what `apply -k` would send."
+      cost: 1
+  misconceptions:
+    - id: replace-behavior
+      description: Uses behavior replace for the ConfigMap, dropping THEME and LOCALE.
+      feedback: "`behavior: replace` swaps the whole generated ConfigMap for the overlay's literals. Use `merge` to change one key."
+      expectFail: [staging-renders, production-renders, production-live]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-depot
+          mk() { mkdir -p ~/depot-portal/overlays/$1; cat > ~/depot-portal/overlays/$1/kustomization.yaml <<YAML
+          apiVersion: kustomize.config.k8s.io/v1beta1
+          kind: Kustomization
+          namespace: $2
+          resources: [../../base]
+          replicas: [{name: depot-portal, count: $3}]
+          images: [{name: httpd, newTag: "$4"}]
+          configMapGenerator:
+            - {name: portal-settings, behavior: replace, literals: [MAX_UPLOAD_MB=$5]}
+          YAML
+          }
+          mk staging depot-staging 2 2.4-alpine 25
+          mk production depot-prod {{prodReplicas}} 2.4 {{prodUpload}}
+          kubectl apply -k ~/depot-portal/overlays/production
+          kubectl -n depot-prod rollout status deploy/depot-portal --timeout=120s
+    - id: edit-base
+      description: Changes the base for production instead of overriding it in the overlay.
+      feedback: The base is shared by every environment. Put environment differences in the overlays.
+      expectFail: [base-untouched, staging-renders]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-depot
+          yq -i '.spec.template.spec.containers[0].image = "httpd:2.4"' ~/depot-portal/base/deployment.yaml
+          mk() { mkdir -p ~/depot-portal/overlays/$1; cat > ~/depot-portal/overlays/$1/kustomization.yaml <<YAML
+          apiVersion: kustomize.config.k8s.io/v1beta1
+          kind: Kustomization
+          namespace: $2
+          resources: [../../base]
+          replicas: [{name: depot-portal, count: $3}]
+          configMapGenerator:
+            - {name: portal-settings, behavior: merge, literals: [MAX_UPLOAD_MB=$4]}
+          YAML
+          }
+          mk staging depot-staging 2 25
+          mk production depot-prod {{prodReplicas}} {{prodUpload}}
+          kubectl apply -k ~/depot-portal/overlays/production
+          kubectl -n depot-prod rollout status deploy/depot-portal --timeout=120s
+    - id: applied-both
+      description: Applies the staging overlay as well.
+      feedback: The task was to apply only production. Render staging with `kubectl kustomize` to check it.
+      expectFail: [staging-not-applied]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 200
+        run: |
+          kubectl config use-context qm-depot
+          mk() { mkdir -p ~/depot-portal/overlays/$1; cat > ~/depot-portal/overlays/$1/kustomization.yaml <<YAML
+          apiVersion: kustomize.config.k8s.io/v1beta1
+          kind: Kustomization
+          namespace: $2
+          resources: [../../base]
+          replicas: [{name: depot-portal, count: $3}]
+          images: [{name: httpd, newTag: "$4"}]
+          configMapGenerator:
+            - {name: portal-settings, behavior: merge, literals: [MAX_UPLOAD_MB=$5]}
+          YAML
+          }
+          mk staging depot-staging 2 2.4-alpine 25
+          mk production depot-prod {{prodReplicas}} 2.4 {{prodUpload}}
+          kubectl apply -k ~/depot-portal/overlays/production
+          kubectl apply -k ~/depot-portal/overlays/staging
+          kubectl -n depot-prod rollout status deploy/depot-portal --timeout=120s
+  solution:
+    explanation: |
+      Each overlay lists the base as a resource and changes only what differs:
+      `namespace`, the `replicas` and `images` transformers, and a
+      `configMapGenerator` entry with `behavior: merge` that overrides one key.
+      Because the ConfigMap name carries a content hash, changing a value also
+      rolls the Deployment. `kubectl apply -k` builds and applies in one step.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-depot
+          mk() { mkdir -p ~/depot-portal/overlays/$1; cat > ~/depot-portal/overlays/$1/kustomization.yaml <<YAML
+          apiVersion: kustomize.config.k8s.io/v1beta1
+          kind: Kustomization
+          namespace: $2
+          resources: [../../base]
+          replicas: [{name: depot-portal, count: $3}]
+          images: [{name: httpd, newTag: "$4"}]
+          configMapGenerator:
+            - {name: portal-settings, behavior: merge, literals: [MAX_UPLOAD_MB=$5]}
+          YAML
+          }
+          mk staging depot-staging 2 2.4-alpine 25
+          mk production depot-prod {{prodReplicas}} 2.4 {{prodUpload}}
+          kubectl kustomize ~/depot-portal/overlays/staging >/dev/null
+          kubectl apply -k ~/depot-portal/overlays/production
+          kubectl -n depot-prod rollout status deploy/depot-portal --timeout=120s
+    alternatives:
+      - id: patches
+        description: Use a strategic merge patch for replicas and image, and an env-file for the ConfigMap value.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 150
+            run: |
+              kubectl config use-context qm-depot
+              mk() {
+                o=~/depot-portal/overlays/$1; mkdir -p $o
+                printf 'MAX_UPLOAD_MB=%s\n' "$5" > $o/settings.env
+                cat > $o/deployment-patch.yaml <<YAML
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata: {name: depot-portal}
+              spec:
+                replicas: $3
+                template:
+                  spec:
+                    containers:
+                      - {name: portal, image: "$4"}
+              YAML
+                cat > $o/kustomization.yaml <<YAML
+              resources:
+                - ../../base
+              namespace: $2
+              patches:
+                - path: deployment-patch.yaml
+              configMapGenerator:
+                - name: portal-settings
+                  behavior: merge
+                  envs: [settings.env]
+              YAML
+              }
+              mk staging depot-staging 2 httpd:2.4-alpine 25
+              mk production depot-prod {{prodReplicas}} httpd:2.4 {{prodUpload}}
+              kubectl apply -k ~/depot-portal/overlays/production
+              kubectl -n depot-prod rollout status deploy/depot-portal --timeout=120s

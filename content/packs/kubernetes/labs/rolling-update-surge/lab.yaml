@@ -1,0 +1,246 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: rolling-update-surge
+  title: Tune a rolling update so capacity never drops
+  domain: kubernetes
+  frameworks: [cka:workloads-scheduling, ckad:deployment]
+  difficulty: medium
+  estimatedMinutes: 12
+  tags: [deployment, rollingupdate, strategy, change-cause]
+  version: 1
+spec:
+  description: |
+    The freight quote engine is busiest during business hours, and the last
+    release briefly took a quarter of its Pods away at once. From now on its
+    updates must never reduce serving capacity.
+
+    Use context `qm-dispatch`:
+
+    ```bash
+    kubectl config use-context qm-dispatch
+    ```
+
+    In namespace `freight-quotes`, for Deployment **`quote-engine`** (6
+    replicas):
+
+    1. Configure its update strategy as a rolling update that never has fewer
+       than 6 ready Pods (**0 unavailable**) and adds **exactly one** extra Pod
+       at a time (**surge of 1**, as an absolute number).
+    2. Then roll out the new image tag **`httpd:2.4`** for container `engine`
+       (currently `httpd:2.4-alpine`) and wait for the rollout to finish.
+    3. Record why: the new revision's change cause (the
+       `kubernetes.io/change-cause` annotation shown by
+       `kubectl rollout history`) must read exactly
+       **`{{cause}}`**.
+  objectives:
+    - Configure maxSurge and maxUnavailable of a rolling update
+    - Roll out a new image and watch the rollout
+    - Record a change cause in the rollout history
+  params:
+    cause:
+      type: choice
+      values: ["QE-512 move quote-engine to httpd 2.4", "QE-547 switch quote-engine to the full httpd image", "QE-603 quote-engine base image update"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-dispatch
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: qm-dispatch
+  setup:
+    - on: qm-dispatch
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: freight-quotes}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: quote-engine
+          namespace: freight-quotes
+          annotations: {kubernetes.io/change-cause: "QE-480 initial release"}
+        spec:
+          replicas: 6
+          selector: {matchLabels: {app: quote-engine}}
+          template:
+            metadata: {labels: {app: quote-engine}}
+            spec:
+              containers:
+                - name: engine
+                  image: httpd:2.4-alpine
+                  readinessProbe:
+                    httpGet: {path: /, port: 80}
+                    periodSeconds: 2
+    - on: qm-dispatch
+      timeoutSec: 150
+      run: kubectl -n freight-quotes rollout status deploy/quote-engine --timeout=120s
+  teardown:
+    - on: qm-dispatch
+      run: kubectl delete namespace freight-quotes --ignore-not-found --wait=false
+  checks:
+    - id: context
+      description: Terminal is using context qm-dispatch
+      type: k8s-context
+      on: workstation
+      skills: [k8s.cli.contexts]
+      weight: 0.5
+      expect: {match: exact, value: qm-dispatch}
+    - id: strategy
+      description: The strategy is RollingUpdate with maxUnavailable 0 and maxSurge 1
+      type: k8s-query
+      skills: [k8s.workloads.rollouts, k8s.cli.edit-patch]
+      weight: 2
+      query:
+        cluster: qm-dispatch
+        resource: deployment
+        name: quote-engine
+        namespace: freight-quotes
+        jsonpath: '{.spec.strategy.type} unavailable={.spec.strategy.rollingUpdate.maxUnavailable} surge={.spec.strategy.rollingUpdate.maxSurge}'
+      expect: {match: regex, value: '^RollingUpdate unavailable=0%? surge=1$'}
+    - id: new-image
+      description: Container engine runs httpd:2.4
+      type: k8s-query
+      skills: [k8s.workloads.rollouts]
+      query:
+        cluster: qm-dispatch
+        resource: deployment
+        name: quote-engine
+        namespace: freight-quotes
+        jsonpath: '{.spec.template.spec.containers[?(@.name=="engine")].image}'
+      expect: {match: exact, value: "httpd:2.4"}
+    - id: rollout-complete
+      description: All 6 replicas are updated, ready and available, and no old Pod is left
+      type: shell
+      on: qm-dispatch
+      skills: [k8s.workloads.rollouts]
+      command: |
+        kubectl -n freight-quotes get deployment quote-engine \
+          -o jsonpath='{.metadata.generation} {.status.observedGeneration} {.status.updatedReplicas}/{.status.readyReplicas}/{.status.availableReplicas}/{.status.replicas}' \
+          | awk '{print ($1 == $2 ? "observed" : "pending"), $3}'
+      expect: {match: exact, value: observed 6/6/6/6}
+    - id: change-cause
+      description: The revision running now records the requested change cause
+      type: shell
+      on: qm-dispatch
+      skills: [k8s.workloads.rollouts]
+      command: |
+        kubectl -n freight-quotes get rs -l app=quote-engine -o json \
+          | jq -r '[.items[] | select(.spec.replicas > 0) | .metadata.annotations["kubernetes.io/change-cause"] // "none"] | join(";")'
+      expect: {match: exact, value: "{{cause}}"}
+    - id: old-revision-kept
+      description: The initial revision is still in the history with its own change cause
+      type: shell
+      on: qm-dispatch
+      skills: [k8s.workloads.rollouts]
+      weight: 0.5
+      command: |
+        kubectl -n freight-quotes get rs -l app=quote-engine -o json \
+          | jq -r '[.items[] | select(.spec.template.spec.containers[0].image == "httpd:2.4-alpine") | .metadata.annotations["kubernetes.io/change-cause"]] | join(";")'
+      expect: {match: exact, value: "QE-480 initial release"}
+  hints:
+    - title: Switch context
+      body: The quote engine runs in qm-dispatch.
+      command: kubectl config use-context qm-dispatch
+      cost: 0
+    - title: Where the strategy lives
+      body: "`spec.strategy.rollingUpdate` holds `maxSurge` and `maxUnavailable`; both accept a number or a percentage. The default 25 % of 6 replicas is not what you want."
+      command: |
+        kubectl -n freight-quotes patch deployment quote-engine \
+          -p '{"spec":{"strategy":{"type":"RollingUpdate","rollingUpdate":{"maxSurge":1,"maxUnavailable":0}}}}'
+      cost: 2
+    - title: Change cause first, then the image
+      body: |
+        The Deployment's `kubernetes.io/change-cause` annotation is copied to
+        the ReplicaSet of the revision it creates, which is what
+        `rollout history` prints.
+      command: |
+        kubectl -n freight-quotes annotate deployment quote-engine kubernetes.io/change-cause="{{cause}}" --overwrite
+        kubectl -n freight-quotes set image deployment/quote-engine engine=httpd:2.4
+      cost: 2
+    - title: Watch it
+      command: kubectl -n freight-quotes rollout status deployment quote-engine
+      body: With a surge of 1 and nothing unavailable, the rollout replaces one Pod at a time.
+      cost: 0
+  misconceptions:
+    - id: recreate-strategy
+      description: Switches the strategy to Recreate to "avoid mixed versions".
+      feedback: Recreate stops every old Pod before starting new ones, the opposite of keeping capacity. Use RollingUpdate with maxUnavailable 0.
+      expectFail: [strategy]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 180
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl -n freight-quotes patch deployment quote-engine -p '{"spec":{"strategy":{"type":"Recreate","rollingUpdate":null}}}'
+          kubectl -n freight-quotes annotate deployment quote-engine kubernetes.io/change-cause="{{cause}}" --overwrite
+          kubectl -n freight-quotes set image deployment/quote-engine engine=httpd:2.4
+          kubectl -n freight-quotes rollout status deployment quote-engine --timeout=150s
+    - id: default-percentages
+      description: Leaves maxUnavailable at the default 25 %.
+      feedback: The default lets a quarter of the replicas (rounded down, here 1) be unavailable during the update. Set it to 0.
+      expectFail: [strategy]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 180
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl -n freight-quotes patch deployment quote-engine -p '{"spec":{"strategy":{"rollingUpdate":{"maxSurge":1}}}}'
+          kubectl -n freight-quotes annotate deployment quote-engine kubernetes.io/change-cause="{{cause}}" --overwrite
+          kubectl -n freight-quotes set image deployment/quote-engine engine=httpd:2.4
+          kubectl -n freight-quotes rollout status deployment quote-engine --timeout=150s
+    - id: cause-on-template
+      description: Puts the change cause on the Pod template instead of the Deployment.
+      feedback: "`rollout history` reads the annotation from each revision's ReplicaSet, which copies it from the Deployment's own metadata, not from the Pod template."
+      expectFail: [change-cause]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 180
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl -n freight-quotes patch deployment quote-engine -p '{"spec":{"strategy":{"type":"RollingUpdate","rollingUpdate":{"maxSurge":1,"maxUnavailable":0}}}}'
+          kubectl -n freight-quotes patch deployment quote-engine \
+            -p '{"spec":{"template":{"metadata":{"annotations":{"kubernetes.io/change-cause":"{{cause}}"}},"spec":{"containers":[{"name":"engine","image":"httpd:2.4"}]}}}}'
+          kubectl -n freight-quotes rollout status deployment quote-engine --timeout=150s
+  solution:
+    explanation: |
+      `maxUnavailable: 0` forbids taking a Pod away before its replacement is
+      ready and `maxSurge: 1` allows one extra Pod during the update, so the
+      rollout proceeds one Pod at a time at full capacity. The change cause
+      annotated on the Deployment is copied to the new revision's ReplicaSet.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 180
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl -n freight-quotes patch deployment quote-engine \
+            -p '{"spec":{"strategy":{"type":"RollingUpdate","rollingUpdate":{"maxSurge":1,"maxUnavailable":0}}}}'
+          kubectl -n freight-quotes annotate deployment quote-engine kubernetes.io/change-cause="{{cause}}" --overwrite
+          kubectl -n freight-quotes set image deployment/quote-engine engine=httpd:2.4
+          kubectl -n freight-quotes rollout status deployment quote-engine --timeout=150s
+    alternatives:
+      - id: one-apply
+        description: Change strategy, image and annotation in one edited manifest applied at once.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 180
+            run: |
+              kubectl config use-context qm-dispatch
+              kubectl -n freight-quotes get deployment quote-engine -o yaml \
+                | yq '.spec.strategy = {"type": "RollingUpdate", "rollingUpdate": {"maxSurge": 1, "maxUnavailable": "0%"}}
+                      | .spec.template.spec.containers[0].image = "httpd:2.4"
+                      | .metadata.annotations["kubernetes.io/change-cause"] = "{{cause}}"' \
+                | kubectl apply -f -
+              kubectl -n freight-quotes rollout status deployment quote-engine --timeout=150s

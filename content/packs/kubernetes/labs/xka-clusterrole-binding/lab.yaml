@@ -1,0 +1,168 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xka-clusterrole-binding
+  title: Grant a ServiceAccount cluster-wide read on nodes
+  domain: kubernetes
+  frameworks: [cka:cluster-architecture]
+  difficulty: medium
+  estimatedMinutes: 7
+  tags: [exam, rbac, clusterrole]
+  version: 1
+spec:
+  description: |
+    **Context:** `qm-depot` (`kubectl config use-context qm-depot`)
+
+    Quillmoor's fleet auditor runs as a ServiceAccount. In namespace
+    **`{{ns}}`** (it exists), create the ServiceAccount **`fleet-auditor`**
+    and allow it to **list** and **watch** **nodes** and
+    **PersistentVolumes** across the whole cluster, and nothing else.
+
+    Name the ClusterRole **`{{role}}`** and its binding **`{{role}}`**.
+  objectives:
+    - Write a ClusterRole for cluster-scoped resources
+    - Bind it to a ServiceAccount with a ClusterRoleBinding
+  params:
+    ns:
+      type: choice
+      values: [fleet-audit, audit-tools, fleet-ops-audit]
+    role:
+      type: choice
+      values: [fleet-auditor-read, node-pv-reader, fleet-inventory-read]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-depot
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: qm-depot
+  setup:
+    - on: qm-depot
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: "{{ns}}"}
+  teardown:
+    - on: qm-depot
+      run: |
+        kubectl delete clusterrolebinding {{role}} --ignore-not-found
+        kubectl delete clusterrole {{role}} --ignore-not-found
+        kubectl delete namespace {{ns}} --ignore-not-found --wait=false
+  checks:
+    - id: service-account
+      description: ServiceAccount fleet-auditor exists in {{ns}}
+      type: k8s-query
+      skills: [k8s.rbac.binding-scope]
+      weight: 0.5
+      query: {cluster: qm-depot, resource: serviceaccount, name: fleet-auditor, namespace: "{{ns}}", jsonpath: '{.metadata.name}'}
+      expect: {match: exact, value: fleet-auditor}
+    - id: can-list-nodes
+      description: fleet-auditor can list and watch nodes
+      type: shell
+      on: qm-depot
+      skills: [k8s.rbac.clusterroles]
+      command: |
+        a=system:serviceaccount:{{ns}}:fleet-auditor
+        echo "$(kubectl auth can-i list nodes --as=$a) $(kubectl auth can-i watch nodes --as=$a)"
+      expect: {match: exact, value: "yes yes"}
+    - id: can-list-pvs
+      description: fleet-auditor can list and watch PersistentVolumes
+      type: shell
+      on: qm-depot
+      skills: [k8s.rbac.clusterroles]
+      command: |
+        a=system:serviceaccount:{{ns}}:fleet-auditor
+        echo "$(kubectl auth can-i list persistentvolumes --as=$a) $(kubectl auth can-i watch persistentvolumes --as=$a)"
+      expect: {match: exact, value: "yes yes"}
+    - id: nothing-else
+      description: fleet-auditor cannot get or delete nodes, or list Pods or Secrets
+      type: shell
+      on: qm-depot
+      skills: [k8s.rbac.clusterroles]
+      weight: 2
+      command: |
+        a=system:serviceaccount:{{ns}}:fleet-auditor
+        echo "$(kubectl auth can-i delete nodes --as=$a) $(kubectl auth can-i get nodes --as=$a) $(kubectl auth can-i list pods -A --as=$a) $(kubectl auth can-i list secrets -n kube-system --as=$a)"
+      expect: {match: exact, value: "no no no no"}
+    - id: named-objects
+      description: ClusterRoleBinding {{role}} binds ClusterRole {{role}} to the ServiceAccount
+      type: k8s-query
+      skills: [k8s.rbac.binding-scope]
+      query: {cluster: qm-depot, resource: clusterrolebinding, name: "{{role}}", jsonpath: '{.roleRef.kind}/{.roleRef.name} {.subjects[0].kind}/{.subjects[0].namespace}/{.subjects[0].name}'}
+      expect: {match: exact, value: "ClusterRole/{{role}} ServiceAccount/{{ns}}/fleet-auditor"}
+  misconceptions:
+    - id: rolebinding-only
+      description: Binds the ClusterRole with a RoleBinding.
+      feedback: Nodes and PersistentVolumes are cluster-scoped; a RoleBinding only grants rights inside its namespace, so it never covers them.
+      expectFail: [can-list-nodes, can-list-pvs, named-objects]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n {{ns}} create serviceaccount fleet-auditor
+          kubectl create clusterrole {{role}} --verb=list,watch --resource=nodes,persistentvolumes
+          kubectl -n {{ns}} create rolebinding {{role}} --clusterrole={{role}} --serviceaccount={{ns}}:fleet-auditor
+    - id: view-clusterrole
+      description: Binds a broad built-in role instead of a precise one.
+      feedback: Built-in roles grant far more than nodes and PersistentVolumes. Write a ClusterRole with exactly the needed verbs and resources.
+      expectFail: [nothing-else, named-objects]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n {{ns}} create serviceaccount fleet-auditor
+          kubectl create clusterrolebinding {{role}} --clusterrole=cluster-admin --serviceaccount={{ns}}:fleet-auditor
+    - id: get-verb-too
+      description: Adds get alongside list and watch.
+      feedback: The task allows list and watch only.
+      expectFail: [nothing-else]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n {{ns}} create serviceaccount fleet-auditor
+          kubectl create clusterrole {{role}} --verb=get,list,watch --resource=nodes,persistentvolumes
+          kubectl create clusterrolebinding {{role}} --clusterrole={{role}} --serviceaccount={{ns}}:fleet-auditor
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n {{ns}} create serviceaccount fleet-auditor
+          kubectl create clusterrole {{role}} --verb=list,watch --resource=nodes,persistentvolumes
+          kubectl create clusterrolebinding {{role}} --clusterrole={{role}} --serviceaccount={{ns}}:fleet-auditor
+    alternatives:
+      - id: manifests
+        description: All three objects as one manifest.
+        steps:
+          - on: workstation
+            as: learner
+            run: |
+              kubectl config use-context qm-depot
+              kubectl apply -f - <<'YAML'
+              apiVersion: v1
+              kind: ServiceAccount
+              metadata: {name: fleet-auditor, namespace: {{ns}}}
+              ---
+              apiVersion: rbac.authorization.k8s.io/v1
+              kind: ClusterRole
+              metadata: {name: {{role}}}
+              rules:
+                - {apiGroups: [""], resources: [nodes, persistentvolumes], verbs: [list, watch]}
+              ---
+              apiVersion: rbac.authorization.k8s.io/v1
+              kind: ClusterRoleBinding
+              metadata: {name: {{role}}}
+              roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: {{role}}}
+              subjects: [{kind: ServiceAccount, name: fleet-auditor, namespace: {{ns}}}]
+              YAML

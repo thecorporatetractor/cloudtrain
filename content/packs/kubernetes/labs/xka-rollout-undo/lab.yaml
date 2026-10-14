@@ -1,0 +1,128 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xka-rollout-undo
+  title: Undo a broken rollout
+  domain: kubernetes
+  frameworks: [cka:workloads-scheduling]
+  difficulty: easy
+  estimatedMinutes: 5
+  tags: [exam, rollout, scaling]
+  version: 1
+spec:
+  description: |
+    **Context:** `qm-depot` (`kubectl config use-context qm-depot`)
+
+    The latest rollout of Deployment **`ferry-schedule`** in namespace
+    **`ferry-ops`** is broken. Roll the Deployment back to its **previous
+    revision**, then scale it to **{{replicas}}** replicas, all ready.
+  objectives:
+    - Roll a Deployment back one revision
+    - Scale a Deployment
+  params:
+    replicas:
+      type: int
+      min: 3
+      max: 4
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-depot
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: qm-depot
+  setup:
+    - on: qm-depot
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: ferry-ops}
+    - on: qm-depot
+      timeoutSec: 400
+      run: |
+        set -e
+        rel() {  # rel <image> <release> <command-json>
+          cat <<YAML | kubectl apply -f -
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: ferry-schedule, namespace: ferry-ops}
+        spec:
+          replicas: 2
+          selector: {matchLabels: {app: ferry-schedule}}
+          template:
+            metadata: {labels: {app: ferry-schedule}}
+            spec:
+              terminationGracePeriodSeconds: 1
+              containers:
+                - name: schedule
+                  image: $1
+                  command: $3
+                  env: [{name: RELEASE, value: "$2"}]
+        YAML
+        }
+        rel caddy:2-alpine 1.4 '["caddy","file-server","--root","/usr/share/caddy"]'
+        kubectl -n ferry-ops rollout status deploy/ferry-schedule --timeout=120s
+        rel httpd:2.4-alpine 1.5 '["httpd-foreground"]'
+        kubectl -n ferry-ops rollout status deploy/ferry-schedule --timeout=120s
+        rel busybox:1.37 1.6 '["sh","-c","echo timetable feed unreachable; exit 1"]'
+        sleep 5
+  teardown:
+    - on: qm-depot
+      run: kubectl delete namespace ferry-ops --ignore-not-found --wait=false
+  checks:
+    - id: rolled-back
+      description: The Pod template is release 1.5 again (httpd:2.4-alpine)
+      type: k8s-query
+      skills: [k8s.workloads.rollouts]
+      weight: 2
+      query: {cluster: qm-depot, resource: deployment, name: ferry-schedule, namespace: ferry-ops, jsonpath: '{.spec.template.spec.containers[0].image} {.spec.template.spec.containers[0].env[0].value}'}
+      expect: {match: exact, value: httpd:2.4-alpine 1.5}
+    - id: scaled
+      description: "{{replicas}} replicas, all updated and ready"
+      type: k8s-query
+      skills: [k8s.workloads.scaling]
+      weight: 2
+      query: {cluster: qm-depot, resource: deployment, name: ferry-schedule, namespace: ferry-ops, jsonpath: '{.spec.replicas}/{.status.updatedReplicas}/{.status.readyReplicas}/{.status.replicas}'}
+      expect: {match: exact, value: "{{replicas}}/{{replicas}}/{{replicas}}/{{replicas}}"}
+  misconceptions:
+    - id: undo-to-first
+      description: Rolls back to revision 1 instead of the previous one.
+      feedback: The previous revision is the one before the broken rollout, revision 2.
+      expectFail: [rolled-back]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n ferry-ops rollout undo deploy/ferry-schedule --to-revision=1
+          kubectl -n ferry-ops scale deploy/ferry-schedule --replicas={{replicas}}
+          kubectl -n ferry-ops rollout status deploy/ferry-schedule --timeout=120s
+    - id: scale-only
+      description: Scales the broken revision.
+      feedback: More replicas of a crashing release are still not ready. Undo first.
+      expectFail: [rolled-back, scaled]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 60
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n ferry-ops scale deploy/ferry-schedule --replicas={{replicas}}
+          sleep 20
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n ferry-ops rollout undo deploy/ferry-schedule
+          kubectl -n ferry-ops scale deploy/ferry-schedule --replicas={{replicas}}
+          kubectl -n ferry-ops rollout status deploy/ferry-schedule --timeout=120s

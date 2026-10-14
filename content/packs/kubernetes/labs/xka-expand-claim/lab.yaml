@@ -1,0 +1,127 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xka-expand-claim
+  title: Grow a claim in place
+  domain: kubernetes
+  frameworks: [cka:storage]
+  difficulty: easy
+  estimatedMinutes: 6
+  tags: [exam, pvc, volume-expansion]
+  version: 1
+spec:
+  description: |
+    **Context:** `qm-fleet` (`kubectl config use-context qm-fleet`)
+
+    The claim **`manifest-cache`** in namespace **`fleet-cache`** (1Gi, on the
+    expandable StorageClass `fleet-expandable`) is nearly full. Grow it to
+    **{{size}}** in place, without deleting the claim or its Pod, and write
+    the capacity the claim reports in its **status** once the resize is
+    done to `/home/learner/exam/cache-capacity.txt`.
+  objectives:
+    - Expand a PersistentVolumeClaim
+    - Read the resized capacity from the claim's status
+  params:
+    size:
+      type: choice
+      values: [3Gi, 2Gi]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-fleet
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-fleet
+          nodes:
+            - {name: fleet-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: fleet-wk-1, role: worker}
+            - {name: fleet-wk-2, role: worker}
+  setup:
+    - on: qm-fleet/fleet-cp-1
+      timeoutSec: 400
+      run: /opt/cloudtrain/bin/addons-install csi-hostpath --wait
+    - on: qm-fleet
+      apply: |
+        apiVersion: storage.k8s.io/v1
+        kind: StorageClass
+        metadata: {name: fleet-expandable}
+        provisioner: hostpath.csi.k8s.io
+        allowVolumeExpansion: true
+        volumeBindingMode: WaitForFirstConsumer
+        ---
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: fleet-cache}
+        ---
+        apiVersion: v1
+        kind: PersistentVolumeClaim
+        metadata: {name: manifest-cache, namespace: fleet-cache}
+        spec:
+          storageClassName: fleet-expandable
+          accessModes: [ReadWriteOnce]
+          resources: {requests: {storage: 1Gi}}
+        ---
+        apiVersion: v1
+        kind: Pod
+        metadata: {name: cache-writer, namespace: fleet-cache}
+        spec:
+          terminationGracePeriodSeconds: 1
+          containers: [{name: w, image: "busybox:1.37", command: ["sleep", "1d"], volumeMounts: [{name: v, mountPath: /cache}]}]
+          volumes: [{name: v, persistentVolumeClaim: {claimName: manifest-cache}}]
+    - on: qm-fleet
+      timeoutSec: 150
+      run: kubectl -n fleet-cache wait pod/cache-writer --for=condition=Ready --timeout=120s
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/exam
+  teardown:
+    - on: qm-fleet
+      run: kubectl delete namespace fleet-cache --ignore-not-found --wait=false
+  checks:
+    - id: expanded
+      description: The claim requests and reports {{size}}, and the original Pod still uses it
+      type: shell
+      on: qm-fleet
+      skills: [k8s.storage.claims]
+      weight: 2
+      command: |
+        echo "$(kubectl -n fleet-cache get pvc manifest-cache -o jsonpath='{.spec.resources.requests.storage} {.status.capacity.storage}') \
+        $(kubectl -n fleet-cache get pod cache-writer -o jsonpath='{.status.phase}')"
+      expect: {match: exact, value: "{{size}} {{size}} Running"}
+    - id: reported
+      description: The file holds the capacity from the claim's status
+      type: file
+      on: workstation
+      target: /home/learner/exam/cache-capacity.txt
+      skills: [k8s.storage.capacity-units]
+      expect: {match: regex, value: '^{{size}}\n?$'}
+  misconceptions:
+    - id: recreate-claim
+      description: Deletes and recreates the claim with the new size.
+      feedback: Recreating loses the data; expansion edits spec.resources.requests.storage of the existing claim.
+      expectFail: [expanded]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-fleet
+          kubectl -n fleet-cache delete pod cache-writer --wait=true
+          kubectl -n fleet-cache delete pvc manifest-cache --wait=true
+          echo {{size}} > ~/exam/cache-capacity.txt
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 200
+        run: |
+          kubectl config use-context qm-fleet
+          kubectl -n fleet-cache patch pvc manifest-cache -p '{"spec":{"resources":{"requests":{"storage":"{{size}}"}}}}'
+          for i in $(seq 1 60); do [ "$(kubectl -n fleet-cache get pvc manifest-cache -o jsonpath='{.status.capacity.storage}')" = {{size}} ] && break; sleep 3; done
+          kubectl -n fleet-cache get pvc manifest-cache -o jsonpath='{.status.capacity.storage}' > ~/exam/cache-capacity.txt

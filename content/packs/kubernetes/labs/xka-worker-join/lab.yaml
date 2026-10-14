@@ -1,0 +1,101 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xka-worker-join
+  title: Join a prepared worker
+  domain: kubernetes
+  frameworks: [cka:cluster-architecture]
+  difficulty: medium
+  estimatedMinutes: 10
+  tags: [exam, kubeadm, join]
+  version: 1
+spec:
+  description: |
+    **Context:** `qm-dispatch` (`kubectl config use-context qm-dispatch`);
+    **hosts** `dispatch-cp-1` and `dispatch-wk-3` (`ssh`, `sudo` works)
+
+    The machine **`dispatch-wk-3`** is prepared for Kubernetes (packages,
+    runtime and kernel settings are in place) but is not part of the cluster.
+    Create a **new bootstrap token** on the control plane and join
+    `dispatch-wk-3` to `qm-dispatch` as a worker so that it reports Ready.
+  objectives:
+    - Create a bootstrap token and join command
+    - Join a worker with kubeadm
+  params:
+    ttl:
+      type: choice
+      values: [2h, 4h]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-dispatch
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-dispatch
+          nodes:
+            - {name: dispatch-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: dispatch-wk-1, role: worker}
+            - {name: dispatch-wk-2, role: worker}
+            - {name: dispatch-wk-3, role: worker}
+  setup:
+    - on: qm-dispatch
+      run: |
+        kubectl drain dispatch-wk-3 --ignore-daemonsets --delete-emptydir-data --force --timeout=60s || true
+        kubectl delete node dispatch-wk-3 --ignore-not-found --wait=true
+        # the token the platform used at bootstrap is retired
+        for s in $(kubectl -n kube-system get secrets --field-selector type=bootstrap.kubernetes.io/token -o name); do kubectl -n kube-system delete $s; done
+    - on: qm-dispatch/dispatch-wk-3
+      timeoutSec: 180
+      run: |
+        kubeadm reset -f >/dev/null 2>&1 || true
+        rm -rf /etc/cni/net.d/* /root/join.yaml
+        systemctl stop kubelet || true
+  checks:
+    - id: node-ready
+      description: dispatch-wk-3 is a Ready worker
+      type: shell
+      on: qm-dispatch
+      skills: [k8s.cluster.kubeadm-install]
+      weight: 3
+      command: |
+        kubectl get node dispatch-wk-3 -o json 2>/dev/null | jq -r '"\(.status.conditions[] | select(.type == "Ready") | .status) cp=\(.metadata.labels | has("node-role.kubernetes.io/control-plane"))"'
+      expect: {match: exact, value: True cp=false}
+    - id: new-token
+      description: A bootstrap token was created on the control plane for the join
+      type: shell
+      on: qm-dispatch
+      skills: [k8s.cluster.kubeadm-install]
+      command: echo "tokens=$(kubectl -n kube-system get secrets --field-selector type=bootstrap.kubernetes.io/token --no-headers 2>/dev/null | wc -l)"
+      expect: {match: regex, value: '^tokens=[1-9][0-9]*$'}
+  misconceptions:
+    - id: control-plane-join
+      description: Joins the machine with --control-plane.
+      feedback: dispatch-wk-3 is a worker. A plain kubeadm join adds a worker.
+      expectFail: [node-ready]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 600
+        run: |
+          kubectl config use-context qm-dispatch
+          key=$(ssh dispatch-cp-1 'sudo kubeadm init phase upload-certs --upload-certs' | tail -1)
+          cmd=$(ssh dispatch-cp-1 'sudo kubeadm token create --print-join-command')
+          ssh dispatch-wk-3 "sudo $cmd --control-plane --certificate-key $key" || true
+          kubectl wait node/dispatch-wk-3 --for=condition=Ready --timeout=240s || true
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 400
+        run: |
+          kubectl config use-context qm-dispatch
+          cmd=$(ssh dispatch-cp-1 'sudo kubeadm token create --ttl {{ttl}} --print-join-command')
+          ssh dispatch-wk-3 "sudo $cmd"
+          kubectl wait node/dispatch-wk-3 --for=condition=Ready --timeout=300s

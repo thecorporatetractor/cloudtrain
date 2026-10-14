@@ -1,0 +1,280 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: generate-manifest-dry-run
+  title: Generate and apply manifests with dry-run
+  domain: kubernetes
+  frameworks: [ckad:design-build]
+  difficulty: easy
+  estimatedMinutes: 10
+  tags: [kubectl, manifests, dry-run, apply]
+  version: 1
+spec:
+  description: |
+    The depot team keeps every workload as a manifest file so that changes can
+    be reviewed. You are adding the new **parcel-label** service to the depot
+    platform. Writing YAML from scratch is slow and error-prone: let `kubectl`
+    generate it for you.
+
+    Use context `qm-depot`:
+
+    ```bash
+    kubectl config use-context qm-depot
+    ```
+
+    1. Generate (do not create yet) a Deployment manifest with
+       `kubectl ... --dry-run=client -o yaml`:
+
+       | Field | Value |
+       |---|---|
+       | Name | `parcel-label` |
+       | Namespace | `label-printing` (already exists) |
+       | Image | `httpd:2.4-alpine` |
+       | Replicas | {{replicas}} |
+
+    2. Save it as **`/home/learner/manifests/parcel-label.yaml`** and edit the
+       file: add the label **`quillmoor.example/cost-centre={{cc}}`** to the
+       Deployment object itself (its own `metadata.labels`, next to the
+       generated `app` label).
+    3. Create the Deployment **from the file** with `kubectl apply`, so the
+       file stays the source of truth for later changes. Afterwards the live
+       Deployment must match the file exactly: make any further change in the
+       file and apply it again, never with an imperative command.
+  objectives:
+    - Generate a manifest with --dry-run=client -o yaml
+    - Edit object metadata in a manifest
+    - Create objects declaratively with kubectl apply and confirm with kubectl diff
+  params:
+    replicas:
+      type: int
+      min: 2
+      max: 3
+    cc:
+      type: choice
+      values: [depot-ops, label-desk, print-hub]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-depot
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: qm-depot
+  setup:
+    - on: qm-depot
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: label-printing}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: label-queue, namespace: label-printing, labels: {app: label-queue}}
+        spec:
+          replicas: 1
+          selector: {matchLabels: {app: label-queue}}
+          template:
+            metadata: {labels: {app: label-queue}}
+            spec:
+              containers:
+                - {name: queue, image: "redis:7.4-alpine"}
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/manifests
+  teardown:
+    - on: qm-depot
+      run: kubectl delete namespace label-printing --ignore-not-found --wait=false
+  checks:
+    - id: context
+      description: Terminal is using context qm-depot
+      type: k8s-context
+      on: workstation
+      skills: [k8s.cli.contexts]
+      weight: 0.5
+      expect: {match: exact, value: qm-depot}
+    - id: manifest-file
+      description: The file holds one Deployment parcel-label with {{replicas}} replicas, image httpd:2.4-alpine and the cost-centre label on the Deployment
+      type: shell
+      on: workstation
+      skills: [k8s.cli.manifests]
+      weight: 2
+      command: |
+        f=/home/learner/manifests/parcel-label.yaml
+        [ -f "$f" ] || { echo "no file"; exit 0; }
+        yq ea '[.] | length' "$f"
+        yq '.kind + " " + .metadata.name + " " + (.spec.replicas | tostring) + " " + .spec.template.spec.containers[0].image + " " + .metadata.labels["quillmoor.example/cost-centre"]' "$f"
+      expect: {match: exact, value: "1\nDeployment parcel-label {{replicas}} httpd:2.4-alpine {{cc}}"}
+    - id: live-deployment
+      description: Deployment parcel-label in label-printing has {{replicas}} ready replicas of httpd:2.4-alpine
+      type: k8s-query
+      skills: [k8s.workloads.deployments]
+      query:
+        cluster: qm-depot
+        resource: deployment
+        name: parcel-label
+        namespace: label-printing
+        jsonpath: '{.spec.replicas}/{.status.readyReplicas} {.spec.template.spec.containers[0].image}'
+      expect: {match: exact, value: "{{replicas}}/{{replicas}} httpd:2.4-alpine"}
+    - id: live-label
+      description: The live Deployment carries quillmoor.example/cost-centre={{cc}}
+      type: k8s-query
+      skills: [k8s.cli.manifests]
+      query:
+        cluster: qm-depot
+        resource: deployment
+        name: parcel-label
+        namespace: label-printing
+        jsonpath: '{.metadata.labels.quillmoor\.example/cost-centre}'
+      expect: {match: exact, value: "{{cc}}"}
+    - id: applied-declaratively
+      description: The Deployment was created with kubectl apply (client- or server-side)
+      type: shell
+      on: qm-depot
+      skills: [k8s.cli.manifests]
+      command: |
+        kubectl -n label-printing get deployment parcel-label -o json --show-managed-fields \
+          | jq -r 'if ((.metadata.annotations // {}) | has("kubectl.kubernetes.io/last-applied-configuration"))
+                     or ([.metadata.managedFields[]? | select(.operation == "Apply")] | length > 0)
+                   then "applied" else "not applied" end'
+      expect: {match: exact, value: applied}
+    - id: file-matches-live
+      description: kubectl diff of the file against the cluster shows no difference
+      type: shell
+      on: workstation
+      skills: [k8s.cli.manifests]
+      weight: 2
+      timeoutSec: 20
+      command: |
+        f=/home/learner/manifests/parcel-label.yaml
+        [ -f "$f" ] || { echo "no file"; exit 0; }
+        k() { kubectl --kubeconfig /home/learner/.kube/config --context qm-depot -n label-printing "$@"; }
+        # client-side diff for kubectl apply, server-side diff for apply --server-side
+        if k diff -f "$f" >/tmp/.ct-diff 2>&1 || k diff --server-side --force-conflicts -f "$f" >>/tmp/.ct-diff 2>&1; then
+          echo same
+        else
+          head -c 1500 /tmp/.ct-diff
+        fi
+        rm -f /tmp/.ct-diff
+      expect: {match: exact, value: same}
+    - id: neighbour-untouched
+      description: label-queue is unchanged (1 replica)
+      type: k8s-query
+      skills: [k8s.cli.scoped-changes]
+      weight: 0.5
+      query: {cluster: qm-depot, resource: deployment, name: label-queue, namespace: label-printing, jsonpath: '{.spec.replicas}/{.status.readyReplicas}'}
+      expect: {match: exact, value: "1/1"}
+  hints:
+    - title: Switch context
+      body: The depot platform is behind context qm-depot.
+      command: kubectl config use-context qm-depot
+      cost: 0
+    - title: Let kubectl write the YAML
+      body: "`--dry-run=client` builds the object locally and sends nothing to the API server; `-o yaml` prints it."
+      command: kubectl -n label-printing create deployment parcel-label --image=httpd:2.4-alpine --replicas={{replicas}} --dry-run=client -o yaml > ~/manifests/parcel-label.yaml
+      cost: 1
+    - title: Which labels?
+      body: |
+        The generated file has `app: parcel-label` in three places: the
+        Deployment's `metadata.labels`, the selector and the Pod template. The
+        cost-centre label belongs only in the first.
+      cost: 1
+    - title: Declarative create
+      body: "`kubectl apply -f` creates the object and records the file as its last-applied configuration; `kubectl diff -f` shows any drift."
+      command: kubectl apply -f ~/manifests/parcel-label.yaml && kubectl diff -f ~/manifests/parcel-label.yaml
+      cost: 2
+  misconceptions:
+    - id: label-on-template
+      description: Adds the label to the Pod template instead of the Deployment object.
+      feedback: "`spec.template.metadata.labels` labels the Pods. A label on the Deployment itself goes into the top-level `metadata.labels`."
+      expectFail: [manifest-file, live-label]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          kubectl config use-context qm-depot
+          f=~/manifests/parcel-label.yaml
+          kubectl -n label-printing create deployment parcel-label --image=httpd:2.4-alpine --replicas={{replicas}} --dry-run=client -o yaml > $f
+          yq -i '.spec.template.metadata.labels["quillmoor.example/cost-centre"] = "{{cc}}"' $f
+          kubectl apply -f $f
+          kubectl -n label-printing rollout status deploy/parcel-label --timeout=90s
+    - id: imperative-create
+      description: Creates the Deployment directly with kubectl create and labels it afterwards, without keeping a file.
+      feedback: Imperative commands leave no reviewable file behind. Generate with --dry-run, save, edit, then apply the file.
+      expectFail: [manifest-file, applied-declaratively, file-matches-live]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n label-printing create deployment parcel-label --image=httpd:2.4-alpine --replicas={{replicas}}
+          kubectl -n label-printing label deployment parcel-label quillmoor.example/cost-centre={{cc}}
+          kubectl -n label-printing rollout status deploy/parcel-label --timeout=90s
+    - id: drift-after-apply
+      description: Applies the file, then fixes the replica count with kubectl scale instead of editing the file.
+      feedback: An imperative change after apply makes the cluster drift from the file. Change the file and apply it again.
+      expectFail: [file-matches-live]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          kubectl config use-context qm-depot
+          f=~/manifests/parcel-label.yaml
+          kubectl -n label-printing create deployment parcel-label --image=httpd:2.4-alpine --dry-run=client -o yaml > $f
+          yq -i '.metadata.labels["quillmoor.example/cost-centre"] = "{{cc}}"' $f
+          kubectl apply -f $f
+          kubectl -n label-printing scale deployment parcel-label --replicas={{replicas}}
+          kubectl -n label-printing rollout status deploy/parcel-label --timeout=90s
+    - id: create-from-file
+      description: Uses kubectl create -f on the file instead of kubectl apply.
+      feedback: "`create -f` makes the object but records no last-applied configuration, so later `apply` runs cannot compute what to remove. Use `kubectl apply -f`."
+      expectFail: [applied-declaratively]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          kubectl config use-context qm-depot
+          f=~/manifests/parcel-label.yaml
+          kubectl -n label-printing create deployment parcel-label --image=httpd:2.4-alpine --replicas={{replicas}} --dry-run=client -o yaml > $f
+          yq -i '.metadata.labels["quillmoor.example/cost-centre"] = "{{cc}}"' $f
+          kubectl create -f $f
+          kubectl -n label-printing rollout status deploy/parcel-label --timeout=90s
+  solution:
+    explanation: |
+      `kubectl create deployment ... --dry-run=client -o yaml` writes a complete,
+      valid manifest without touching the cluster. After adding the label to the
+      Deployment's own metadata, `kubectl apply -f` creates the object and stores
+      the file as its last-applied configuration; `kubectl diff -f` then reports
+      no drift.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          kubectl config use-context qm-depot
+          f=~/manifests/parcel-label.yaml
+          kubectl -n label-printing create deployment parcel-label --image=httpd:2.4-alpine --replicas={{replicas}} --dry-run=client -o yaml > $f
+          yq -i '.metadata.labels["quillmoor.example/cost-centre"] = "{{cc}}"' $f
+          kubectl apply -f $f
+          kubectl -n label-printing rollout status deploy/parcel-label --timeout=90s
+    alternatives:
+      - id: server-side-apply
+        description: Generate without a namespace, add the label with kubectl label --local, and create it with server-side apply.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 120
+            run: |
+              kubectl config use-context qm-depot
+              f=~/manifests/parcel-label.yaml
+              kubectl create deployment parcel-label --image=httpd:2.4-alpine --replicas={{replicas}} --dry-run=client -o yaml \
+                | kubectl label --local -f - quillmoor.example/cost-centre={{cc}} -o yaml > $f
+              kubectl -n label-printing apply --server-side -f $f
+              kubectl -n label-printing rollout status deploy/parcel-label --timeout=90s

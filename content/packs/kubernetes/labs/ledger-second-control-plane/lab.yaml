@@ -1,0 +1,251 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ledger-second-control-plane
+  title: Add a second control-plane node behind the shared endpoint
+  domain: kubernetes
+  frameworks: [cka:cluster-architecture]
+  difficulty: hard
+  estimatedMinutes: 40
+  tags: [kubeadm, high-availability, control-plane, etcd]
+  version: 1
+spec:
+  description: |
+    The billing-ledger cluster `qm-ledger` has a single control-plane node.
+    Finance wants it to survive the loss of one machine, and the first step
+    is a second control-plane node with its own stacked etcd member.
+
+    A prepared machine, **`ledger-cp-2`**, is waiting: packages, runtime and
+    kernel settings are in place, but it is not part of the cluster. From your
+    workstation you can `ssh ledger-cp-1` and `ssh ledger-cp-2` (`sudo`
+    works). Use context `qm-ledger`.
+
+    Join `ledger-cp-2` to `qm-ledger` as a **control-plane** node through the
+    cluster's shared API endpoint (the `controlPlaneEndpoint` kubeadm was
+    initialised with), so that:
+
+    - it runs its own API server, controller manager, scheduler and **etcd
+      member**;
+    - the etcd cluster has **two started, healthy members**;
+    - the node is Ready and keeps the control-plane taint.
+  objectives:
+    - Upload the control-plane certificates and get a certificate key
+    - Join a node with kubeadm join --control-plane
+    - Verify etcd membership and health
+  params:
+    replicas:
+      type: int
+      min: 2
+      max: 3
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-ledger
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        resources: {cpu: 2, memoryMiB: 3072}
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-ledger
+          nodes:
+            - {name: ledger-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: ledger-wk-1, role: worker}
+            - {name: ledger-cp-2, role: worker}
+  setup:
+    # ledger-cp-2 boots as a prepared but unjoined host.
+    - on: qm-ledger
+      run: |
+        kubectl drain ledger-cp-2 --ignore-daemonsets --delete-emptydir-data --force --timeout=60s || true
+        kubectl delete node ledger-cp-2 --ignore-not-found --wait=true
+    - on: qm-ledger/ledger-cp-2
+      timeoutSec: 180
+      run: |
+        kubeadm reset -f >/dev/null 2>&1 || true
+        rm -rf /etc/cni/net.d/* /root/join.yaml
+        systemctl stop kubelet || true
+    - on: qm-ledger
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: ledger}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: ledger-api, namespace: ledger}
+        spec:
+          replicas: {{replicas}}
+          selector: {matchLabels: {app: ledger-api}}
+          template:
+            metadata: {labels: {app: ledger-api}}
+            spec:
+              containers:
+                - {name: api, image: "httpd:2.4-alpine"}
+  teardown:
+    - on: qm-ledger
+      run: kubectl delete namespace ledger --ignore-not-found --wait=false
+  checks:
+    - id: context
+      description: Terminal is using context qm-ledger
+      type: k8s-context
+      on: workstation
+      skills: [k8s.cli.contexts]
+      weight: 0.5
+      expect: {match: exact, value: qm-ledger}
+    - id: node-control-plane
+      description: ledger-cp-2 is a Ready control-plane node with the control-plane NoSchedule taint
+      type: shell
+      on: qm-ledger
+      skills: [k8s.cluster.ha-control-plane]
+      weight: 2
+      command: |
+        kubectl get node ledger-cp-2 -o json 2>/dev/null | jq -r '
+          "\(.status.conditions[] | select(.type == "Ready") | .status) \(.metadata.labels | has("node-role.kubernetes.io/control-plane")) \([.spec.taints[]? | select(.key == "node-role.kubernetes.io/control-plane") | .effect] | join(","))"'
+      expect: {match: exact, value: "True true NoSchedule"}
+    - id: static-pods
+      description: etcd, kube-apiserver, kube-controller-manager and kube-scheduler run on ledger-cp-2
+      type: shell
+      on: qm-ledger
+      skills: [k8s.cluster.ha-control-plane, k8s.cluster.kubeadm-install]
+      weight: 2
+      command: |
+        kubectl -n kube-system get pods --field-selector spec.nodeName=ledger-cp-2 -o json 2>/dev/null | jq -r '
+          [.items[] | select(.metadata.ownerReferences[0].kind == "Node")
+           | select(any(.status.conditions[]?; .type == "Ready" and .status == "True")) | .metadata.name | sub("-ledger-cp-2$"; "")] | sort | join(",")'
+      expect: {match: exact, value: "etcd,kube-apiserver,kube-controller-manager,kube-scheduler"}
+    - id: etcd-members
+      description: The etcd cluster has two started members, ledger-cp-1 and ledger-cp-2, and both endpoints are healthy
+      type: shell
+      on: qm-ledger
+      skills: [k8s.cluster.ha-control-plane]
+      weight: 3
+      timeoutSec: 30
+      command: |
+        e() { kubectl -n kube-system exec etcd-ledger-cp-1 -- etcdctl --endpoints=https://127.0.0.1:2379 --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+          --cert=/etc/kubernetes/pki/etcd/server.crt --key=/etc/kubernetes/pki/etcd/server.key "$@"; }
+        m=$(e member list 2>/dev/null | awk -F', ' '$2 == "started" {print $3}' | sort | paste -sd, -)
+        h=$(e endpoint health --cluster 2>&1 | grep -c 'is healthy')
+        echo "$m healthy=$h"
+      expect: {match: exact, value: "ledger-cp-1,ledger-cp-2 healthy=2"}
+    - id: second-apiserver-serves
+      description: The API server on ledger-cp-2 answers with the cluster's certificates
+      type: shell
+      on: qm-ledger/ledger-cp-2
+      skills: [k8s.cluster.ha-control-plane]
+      timeoutSec: 20
+      command: |
+        ip=$(getent hosts ledger-cp-2 | awk '{print $1}')
+        kubectl --kubeconfig /etc/kubernetes/admin.conf --server "https://$ip:6443" get --raw=/readyz 2>&1 | head -1
+      expect: {match: exact, value: ok}
+    - id: workload-intact
+      description: ledger-api still runs {{replicas}} ready replicas
+      type: k8s-query
+      skills: [k8s.cli.scoped-changes]
+      weight: 0.5
+      query: {cluster: qm-ledger, resource: deployment, name: ledger-api, namespace: ledger, jsonpath: '{.status.readyReplicas}'}
+      expect: {match: exact, value: "{{replicas}}"}
+  hints:
+    - title: What a control-plane join needs
+      body: Besides a bootstrap token and the CA hash, a control-plane join needs the cluster's shared certificates (CA keys, service-account key, front-proxy and etcd CA). kubeadm can upload them encrypted to the cluster and print the key to decrypt them.
+      command: ssh ledger-cp-1 'sudo kubeadm init phase upload-certs --upload-certs'
+      cost: 2
+    - title: The join command
+      command: ssh ledger-cp-1 'sudo kubeadm token create --print-join-command'
+      body: Append `--control-plane --certificate-key <key>` to the printed command and run it on ledger-cp-2 with sudo.
+      cost: 2
+    - title: Check etcd from inside its Pod
+      command: |
+        kubectl -n kube-system exec etcd-ledger-cp-1 -- etcdctl --endpoints=https://127.0.0.1:2379 \
+          --cacert=/etc/kubernetes/pki/etcd/ca.crt --cert=/etc/kubernetes/pki/etcd/server.crt \
+          --key=/etc/kubernetes/pki/etcd/server.key member list
+      body: Each control-plane node with stacked etcd adds one member.
+      cost: 1
+  misconceptions:
+    - id: joined-as-worker
+      description: Runs the plain join command without --control-plane.
+      feedback: "Without --control-plane the node joins as a worker: no static control-plane Pods and no etcd member."
+      expectFail: [node-control-plane, static-pods, etcd-members]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 480
+        run: |
+          kubectl config use-context qm-ledger
+          cmd=$(ssh ledger-cp-1 'sudo kubeadm token create --print-join-command')
+          ssh ledger-cp-2 "sudo $cmd"
+          kubectl wait node/ledger-cp-2 --for=condition=Ready --timeout=240s
+    - id: removed-taint
+      description: Removes the control-plane taint so the new node also takes workloads.
+      feedback: The control-plane taint keeps ordinary workloads off nodes that run etcd and the API server; leave it in place.
+      expectFail: [node-control-plane]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 600
+        run: |
+          kubectl config use-context qm-ledger
+          key=$(ssh ledger-cp-1 'sudo kubeadm init phase upload-certs --upload-certs' | tail -1)
+          cmd=$(ssh ledger-cp-1 'sudo kubeadm token create --print-join-command')
+          ssh ledger-cp-2 "sudo $cmd --control-plane --certificate-key $key"
+          kubectl wait node/ledger-cp-2 --for=condition=Ready --timeout=300s
+          kubectl taint node ledger-cp-2 node-role.kubernetes.io/control-plane:NoSchedule-
+  solution:
+    explanation: |
+      `kubeadm init phase upload-certs --upload-certs` stores the shared
+      control-plane certificates in the kubeadm-certs Secret, encrypted with
+      the printed key. `kubeadm join <endpoint> --control-plane
+      --certificate-key <key>` on the new node downloads them, generates its
+      own serving certificates, adds a stacked etcd member and starts the
+      static control-plane Pods.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 600
+        run: |
+          kubectl config use-context qm-ledger
+          key=$(ssh ledger-cp-1 'sudo kubeadm init phase upload-certs --upload-certs' | tail -1)
+          cmd=$(ssh ledger-cp-1 'sudo kubeadm token create --print-join-command')
+          ssh ledger-cp-2 "sudo $cmd --control-plane --certificate-key $key"
+          kubectl wait node/ledger-cp-2 --for=condition=Ready --timeout=300s
+          for i in $(seq 1 30); do
+            n=$(kubectl -n kube-system get pods --field-selector spec.nodeName=ledger-cp-2 -l tier=control-plane --no-headers 2>/dev/null | grep -c Running)
+            [ "$n" -ge 4 ] && break; sleep 5
+          done
+    alternatives:
+      - id: join-config-file
+        description: Create a token and certificate key yourself and join with a JoinConfiguration file.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 600
+            run: |
+              kubectl config use-context qm-ledger
+              key=$(ssh ledger-cp-1 'sudo kubeadm certs certificate-key')
+              ssh ledger-cp-1 "sudo kubeadm init phase upload-certs --upload-certs --certificate-key $key" >/dev/null
+              token=$(ssh ledger-cp-1 'sudo kubeadm token create --ttl 1h')
+              hash=$(ssh ledger-cp-1 "sudo openssl x509 -pubkey -in /etc/kubernetes/pki/ca.crt | openssl rsa -pubin -outform der 2>/dev/null | openssl dgst -sha256 -hex | sed 's/^.* //'")
+              ep=$(kubectl -n kube-system get configmap kubeadm-config -o jsonpath='{.data.ClusterConfiguration}' | yq '.controlPlaneEndpoint')
+              ssh ledger-cp-2 'sudo tee /root/cp-join.yaml >/dev/null' <<YAML
+              apiVersion: kubeadm.k8s.io/v1beta4
+              kind: JoinConfiguration
+              discovery:
+                bootstrapToken:
+                  apiServerEndpoint: $ep
+                  token: $token
+                  caCertHashes: ["sha256:$hash"]
+              controlPlane:
+                certificateKey: $key
+              nodeRegistration:
+                name: ledger-cp-2
+                criSocket: unix:///run/containerd/containerd.sock
+              YAML
+              ssh ledger-cp-2 'sudo kubeadm join --config /root/cp-join.yaml'
+              kubectl wait node/ledger-cp-2 --for=condition=Ready --timeout=300s
+              for i in $(seq 1 30); do
+                n=$(kubectl -n kube-system get pods --field-selector spec.nodeName=ledger-cp-2 -l tier=control-plane --no-headers 2>/dev/null | grep -c Running)
+                [ "$n" -ge 4 ] && break; sleep 5
+              done

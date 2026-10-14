@@ -1,0 +1,207 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: yard-scheduler-revive
+  title: Revive a broken scheduler
+  domain: kubernetes
+  frameworks: [cka:troubleshooting]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [troubleshooting, scheduler, static-pods, crictl]
+  version: 1
+spec:
+  description: |
+    Since a late-night change on the container-yard cluster, new Pods in
+    `qm-yard` stay **Pending** with no node assigned: the gate team's new
+    `yard-gate` Deployment (namespace `yard-ops`) has not started a single
+    Pod.
+
+    Use context `qm-yard`; reach the control-plane node with
+    `ssh yard-cp-1` (`sudo` and `crictl` work there).
+
+    Find out what is wrong with the scheduler, using the container runtime
+    on the node and the component's manifest, and repair it so that
+    scheduling resumes and `yard-gate` runs. Undo only the faulty change:
+    every other setting of the scheduler stays as it was. Do not assign
+    Pods to nodes by hand.
+  objectives:
+    - Recognise a missing scheduler from Pending Pods without a node
+    - Inspect exited control-plane containers with crictl
+    - Repair a static Pod manifest
+  params:
+    badflag:
+      type: choice
+      values: ["--profiling-mode=true", "--scheduler-name-override=yard", "--kube-api-qps-limit=100"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-yard
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-yard
+          nodes:
+            - {name: yard-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: yard-wk-1, role: worker}
+  setup:
+    - on: qm-yard/yard-cp-1
+      timeoutSec: 120
+      run: |
+        set -e
+        m=/etc/kubernetes/manifests/kube-scheduler.yaml
+        mkdir -p /var/lib/cloudtrain
+        [ -f /var/lib/cloudtrain/scheduler-flags.orig ] || grep -- '- --' $m | sed 's/^ *//' | sort > /var/lib/cloudtrain/scheduler-flags.orig
+        grep -q -- '{{badflag}}' $m || sed -i 's#^\( *\)- --kubeconfig=\(.*\)$#\1- --kubeconfig=\2\n\1- {{badflag}}#' $m
+        grep -q -- '{{badflag}}' $m
+        for i in $(seq 1 40); do
+          crictl ps --name '^kube-scheduler$' -q | grep -q . || break
+          sleep 3
+        done
+    - on: qm-yard
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: yard-ops}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: yard-gate, namespace: yard-ops}
+        spec:
+          replicas: 2
+          selector: {matchLabels: {app: yard-gate}}
+          template:
+            metadata: {labels: {app: yard-gate}}
+            spec:
+              containers:
+                - {name: gate, image: "httpd:2.4-alpine"}
+  teardown:
+    - on: qm-yard
+      run: kubectl delete namespace yard-ops --ignore-not-found --wait=false
+  checks:
+    - id: context
+      description: Terminal is using context qm-yard
+      type: k8s-context
+      on: workstation
+      skills: [k8s.cli.contexts]
+      weight: 0.5
+      expect: {match: exact, value: qm-yard}
+    - id: scheduler-running
+      description: The kube-scheduler container runs on yard-cp-1 and has not exited since its last start
+      type: shell
+      on: qm-yard/yard-cp-1
+      skills: [k8s.troubleshooting.control-plane, k8s.cluster.container-runtime]
+      weight: 2
+      command: echo "running=$(crictl ps --name '^kube-scheduler$' --state running -q | wc -l)"
+      expect: {match: exact, value: running=1}
+    - id: manifest-restored
+      description: The scheduler manifest has exactly its original flags again
+      type: shell
+      on: qm-yard/yard-cp-1
+      skills: [k8s.troubleshooting.control-plane]
+      weight: 2
+      command: |
+        grep -- '- --' /etc/kubernetes/manifests/kube-scheduler.yaml | sed 's/^ *//' | sort | diff -q - /var/lib/cloudtrain/scheduler-flags.orig >/dev/null && echo original || echo changed
+      expect: {match: exact, value: original}
+    - id: no-stray-manifests
+      description: /etc/kubernetes/manifests holds only the four control-plane manifests
+      type: shell
+      on: qm-yard/yard-cp-1
+      skills: [k8s.troubleshooting.control-plane]
+      weight: 0.5
+      command: ls -A /etc/kubernetes/manifests | sort | paste -sd, -
+      expect: {match: exact, value: "etcd.yaml,kube-apiserver.yaml,kube-controller-manager.yaml,kube-scheduler.yaml"}
+    - id: gate-scheduled
+      description: Both yard-gate Pods were scheduled and are ready
+      type: shell
+      on: qm-yard
+      skills: [k8s.troubleshooting.control-plane]
+      weight: 2
+      command: |
+        kubectl -n yard-ops get pods -l app=yard-gate -o json | jq -r '
+          [.items[] | select(.metadata.deletionTimestamp == null) | select(any(.status.conditions[]?; .type == "Ready" and .status == "True"))
+           | select(any(.status.conditions[]?; .type == "PodScheduled" and .status == "True"))] | length'
+      expect: {match: exact, value: "2"}
+    - id: no-manual-binding
+      description: yard-gate does not bypass the scheduler with spec.nodeName
+      type: k8s-query
+      skills: [k8s.cli.scoped-changes]
+      weight: 0.5
+      query: {cluster: qm-yard, resource: deployment, name: yard-gate, namespace: yard-ops, jsonpath: '{.spec.template.spec.nodeName}'}
+      expect: {match: exact, value: ""}
+  hints:
+    - title: Pending without a node
+      command: kubectl -n yard-ops get pods -o wide; kubectl -n kube-system get pods -l component=kube-scheduler
+      body: Pods with no node and no FailedScheduling event mean no scheduler is looking at them.
+      cost: 1
+    - title: Ask the runtime
+      command: ssh yard-cp-1 'sudo crictl ps -a --name kube-scheduler'
+      body: Exited control-plane containers stay listed by crictl; `crictl logs <id>` shows their last output.
+      cost: 1
+    - title: Read the last words
+      command: ssh yard-cp-1 'sudo crictl logs $(sudo crictl ps -a --name kube-scheduler -q | head -1) 2>&1 | tail -5'
+      body: Then look for the offending line in /etc/kubernetes/manifests/kube-scheduler.yaml.
+      cost: 2
+    - title: Editing static Pod manifests
+      body: The kubelet restarts the Pod when the file changes. Keep any backup copy outside /etc/kubernetes/manifests.
+      cost: 1
+  misconceptions:
+    - id: bypass-scheduler
+      description: Sets nodeName in the Deployment so its Pods start without a scheduler.
+      feedback: That hides the outage instead of fixing it; every other new Pod in the cluster still stays Pending.
+      expectFail: [scheduler-running, manifest-restored, no-manual-binding]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 180
+        run: |
+          kubectl config use-context qm-yard
+          kubectl -n yard-ops patch deploy yard-gate -p '{"spec":{"template":{"spec":{"nodeName":"yard-wk-1"}}}}'
+          kubectl -n yard-ops rollout status deploy/yard-gate --timeout=150s
+    - id: backup-in-manifests-dir
+      description: Leaves a backup copy of the manifest in /etc/kubernetes/manifests.
+      feedback: The kubelet treats every manifest file in that directory as a static Pod, including backup copies. Keep backups elsewhere.
+      expectFail: [no-stray-manifests]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 240
+        run: |
+          kubectl config use-context qm-yard
+          ssh yard-cp-1 'sudo cp /etc/kubernetes/manifests/kube-scheduler.yaml /etc/kubernetes/manifests/kube-scheduler.yaml.bak
+            sudo sed -i "/- {{badflag}}$/d" /etc/kubernetes/manifests/kube-scheduler.yaml'
+          kubectl -n yard-ops rollout status deploy/yard-gate --timeout=200s
+    - id: dropped-other-flag
+      description: Deletes the line next to the bad flag as well, losing the scheduler's kubeconfig setting.
+      feedback: Remove only the faulty flag; the scheduler needs its other settings, such as --kubeconfig, to reach the API server.
+      expectFail: [manifest-restored]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          kubectl config use-context qm-yard
+          ssh yard-cp-1 'sudo sed -i -e "/- {{badflag}}$/d" -e "/- --kubeconfig=/d" /etc/kubernetes/manifests/kube-scheduler.yaml'
+          sleep 60
+  solution:
+    explanation: |
+      Without a running scheduler, new Pods are never bound to a node and no
+      FailedScheduling events appear. `crictl ps -a` on the control-plane
+      node shows the kube-scheduler container exiting, and `crictl logs`
+      prints the unknown flag that was added to its static Pod manifest.
+      Removing that one line makes the kubelet restart the scheduler, which
+      then binds the waiting Pods.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 240
+        run: |
+          kubectl config use-context qm-yard
+          ssh yard-cp-1 'sudo crictl logs $(sudo crictl ps -a --name kube-scheduler -q | head -1) 2>&1 | tail -3'
+          ssh yard-cp-1 'sudo sed -i "/- {{badflag}}$/d" /etc/kubernetes/manifests/kube-scheduler.yaml'
+          kubectl -n yard-ops rollout status deploy/yard-gate --timeout=200s

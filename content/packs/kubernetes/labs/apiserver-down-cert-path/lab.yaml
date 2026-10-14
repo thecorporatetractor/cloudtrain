@@ -1,0 +1,186 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: apiserver-down-cert-path
+  title: Bring the API server back after a bad edit
+  domain: kubernetes
+  frameworks: [cka:troubleshooting]
+  difficulty: hard
+  estimatedMinutes: 25
+  tags: [troubleshooting, kube-apiserver, static-pods, crictl, certificates]
+  version: 1
+spec:
+  description: |
+    Someone "tidied up" the API server manifest on the fleet cluster's
+    control-plane node, and now every `kubectl` command against `qm-fleet`
+    fails or times out.
+
+    Reach the node with `ssh fleet-cp-1` (`sudo` and `crictl` work there).
+    With the API server down, `kubectl` cannot help you: use the container
+    runtime and the logs on the node.
+
+    Find the faulty setting in the kube-apiserver static Pod manifest and fix
+    it so that the API server runs again and context `qm-fleet` works from
+    your workstation. Change nothing else in the manifest.
+  objectives:
+    - Troubleshoot a control plane when kubectl is unavailable
+    - Read logs of exited containers with crictl
+    - Fix a certificate path in the kube-apiserver manifest
+  params:
+    flag:
+      type: choice
+      values: [tls-cert-file, client-ca-file, kubelet-client-certificate]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-fleet
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        resources: {cpu: 2, memoryMiB: 3072}
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-fleet
+          nodes:
+            - {name: fleet-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: fleet-wk-1, role: worker}
+  setup:
+    - on: qm-fleet
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: label-printing}
+        ---
+        apiVersion: v1
+        kind: ConfigMap
+        metadata: {name: printer-queues, namespace: label-printing}
+        data: {east: lp-east-01, west: lp-west-04}
+    - on: qm-fleet/fleet-cp-1
+      timeoutSec: 240
+      run: |
+        set -e
+        m=/etc/kubernetes/manifests/kube-apiserver.yaml
+        mkdir -p /var/lib/cloudtrain
+        [ -f /var/lib/cloudtrain/apiserver-flags.orig ] || grep -- '- --' $m | sed 's/^ *//' | sort > /var/lib/cloudtrain/apiserver-flags.orig
+        grep -q -- '--{{flag}}=.*\.cert$' $m || sed -i 's#\(--{{flag}}=.*\)\.crt$#\1.cert#' $m
+        grep -q -- '--{{flag}}=.*\.cert$' $m
+        export KUBECONFIG=/etc/kubernetes/admin.conf
+        for i in $(seq 1 60); do
+          sleep 3
+          kubectl get --raw=/readyz --request-timeout=3s >/dev/null 2>&1 || exit 0
+        done
+        echo "API server still answering"; exit 1
+  teardown:
+    - on: qm-fleet
+      run: kubectl delete namespace label-printing --ignore-not-found --wait=false
+  checks:
+    - id: api-answers
+      description: The API server on fleet-cp-1 answers /readyz
+      type: shell
+      on: qm-fleet/fleet-cp-1
+      skills: [k8s.troubleshooting.control-plane]
+      weight: 2
+      timeoutSec: 15
+      command: kubectl --kubeconfig /etc/kubernetes/admin.conf get --raw=/readyz --request-timeout=5s 2>&1 | head -1
+      expect: {match: exact, value: ok}
+    - id: workstation-works
+      description: The workstation's qm-fleet context reads the cluster again
+      type: shell
+      on: workstation
+      skills: [k8s.troubleshooting.control-plane]
+      timeoutSec: 15
+      command: kubectl --kubeconfig /home/learner/.kube/config --context qm-fleet -n label-printing get configmap printer-queues -o jsonpath='{.data.east}' --request-timeout=5s 2>&1
+      expect: {match: exact, value: lp-east-01}
+    - id: manifest-restored
+      description: The kube-apiserver manifest has exactly its original flags again
+      type: shell
+      on: qm-fleet/fleet-cp-1
+      skills: [k8s.troubleshooting.control-plane]
+      weight: 2
+      command: |
+        grep -- '- --' /etc/kubernetes/manifests/kube-apiserver.yaml | sed 's/^ *//' | sort | diff -q - /var/lib/cloudtrain/apiserver-flags.orig >/dev/null && echo original || echo changed
+      expect: {match: exact, value: original}
+    - id: apiserver-container-stable
+      description: Exactly one kube-apiserver container is running and the manifests directory holds no extra files
+      type: shell
+      on: qm-fleet/fleet-cp-1
+      skills: [k8s.troubleshooting.logs]
+      weight: 0.5
+      command: echo "running=$(crictl ps --name '^kube-apiserver$' --state running -q | wc -l) files=$(ls -A /etc/kubernetes/manifests | wc -l)"
+      expect: {match: exact, value: running=1 files=4}
+  hints:
+    - title: Is it running at all?
+      command: ssh fleet-cp-1 'sudo crictl ps -a --name kube-apiserver'
+      body: A crash-looping API server shows exited containers with a growing attempt count.
+      cost: 1
+    - title: Its last words
+      command: ssh fleet-cp-1 'sudo crictl logs $(sudo crictl ps -a --name kube-apiserver -q | head -1) 2>&1 | tail -5'
+      body: The kubelet's journal and /var/log/pods/kube-system_kube-apiserver-*/ hold the same output.
+      cost: 1
+    - title: Compare with what exists
+      command: ssh fleet-cp-1 'sudo ls /etc/kubernetes/pki/; sudo grep -n "\.cert\b\|\.crt\b" /etc/kubernetes/manifests/kube-apiserver.yaml'
+      body: Every file a flag names must exist on the node; kubeadm names certificates *.crt and keys *.key.
+      cost: 2
+  misconceptions:
+    - id: rename-file
+      description: Copies the certificate to the wrong name instead of fixing the manifest.
+      feedback: The API server runs again, but the manifest still disagrees with kubeadm's layout, and the next certificate renewal or upgrade will not update the copy.
+      expectFail: [manifest-restored]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          ssh fleet-cp-1 'sudo bash -s' <<'EOS'
+          f=$(grep -o -- '--{{flag}}=[^ ]*' /etc/kubernetes/manifests/kube-apiserver.yaml | cut -d= -f2)
+          cp "${f%.cert}.crt" "$f"
+          for i in $(seq 1 60); do kubectl --kubeconfig /etc/kubernetes/admin.conf get --raw=/readyz >/dev/null 2>&1 && break; sleep 5; done
+          EOS
+    - id: restart-kubelet
+      description: Restarts the kubelet and containerd, hoping the API server comes back.
+      feedback: Restarts re-run the same broken manifest. Read the container's logs and fix the flag.
+      expectFail: [api-answers, workstation-works, manifest-restored]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 180
+        run: |
+          ssh fleet-cp-1 'sudo systemctl restart containerd kubelet'
+          sleep 60
+    - id: backup-left-behind
+      description: Fixes the flag but keeps a backup copy in the manifests directory.
+      feedback: The kubelet runs every manifest file in /etc/kubernetes/manifests. Keep backups elsewhere.
+      expectFail: [apiserver-container-stable]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          ssh fleet-cp-1 'sudo bash -s' <<'EOS'
+          cp /etc/kubernetes/manifests/kube-apiserver.yaml /etc/kubernetes/manifests/kube-apiserver.yaml.orig
+          sed -i 's#\(--{{flag}}=.*\)\.cert$#\1.crt#' /etc/kubernetes/manifests/kube-apiserver.yaml
+          for i in $(seq 1 60); do kubectl --kubeconfig /etc/kubernetes/admin.conf get --raw=/readyz >/dev/null 2>&1 && break; sleep 5; done
+          EOS
+  solution:
+    explanation: |
+      With the API server down, `crictl ps -a` and `crictl logs` on the node
+      are the way in: the container exits because a certificate file named in
+      its flags does not exist (`.cert` instead of `.crt`). Correcting the path
+      in /etc/kubernetes/manifests/kube-apiserver.yaml makes the kubelet start
+      a new API server Pod.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          ssh fleet-cp-1 'sudo bash -s' <<'EOS'
+          crictl logs $(crictl ps -a --name kube-apiserver -q | head -1) 2>&1 | tail -3
+          sed -i 's#\(--{{flag}}=.*\)\.cert$#\1.crt#' /etc/kubernetes/manifests/kube-apiserver.yaml
+          for i in $(seq 1 60); do kubectl --kubeconfig /etc/kubernetes/admin.conf get --raw=/readyz >/dev/null 2>&1 && break; sleep 5; done
+          EOS
+          kubectl config use-context qm-fleet
+          kubectl get nodes

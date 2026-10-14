@@ -1,0 +1,141 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xka-required-affinity
+  title: Constrain placement with node affinity
+  domain: kubernetes
+  frameworks: [cka:workloads-scheduling]
+  difficulty: medium
+  estimatedMinutes: 7
+  tags: [exam, node-affinity]
+  version: 1
+spec:
+  description: |
+    **Context:** `qm-fleet` (`kubectl config use-context qm-fleet`)
+
+    Change Deployment **`reefer-monitor`** in namespace **`reefer`** with
+    **node affinity** so that its Pods run **only** on nodes labelled
+    `reefer.quillmoor.example/zone=cold` and **preferably** on nodes labelled
+    `reefer.quillmoor.example/rack=a`. All {{replicas}} replicas must be
+    Running afterwards. Do not change node labels.
+  objectives:
+    - Combine required and preferred node affinity
+  params:
+    replicas:
+      type: int
+      min: 2
+      max: 3
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-fleet
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-fleet
+          nodes:
+            - {name: fleet-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: fleet-wk-1, role: worker}
+            - {name: fleet-wk-2, role: worker}
+  setup:
+    - on: qm-fleet
+      run: |
+        kubectl label node fleet-wk-2 reefer.quillmoor.example/zone=cold reefer.quillmoor.example/rack=a --overwrite
+        kubectl label node fleet-wk-1 reefer.quillmoor.example/zone=ambient reefer.quillmoor.example/rack=a --overwrite
+    - on: qm-fleet
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: reefer}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: reefer-monitor, namespace: reefer}
+        spec:
+          replicas: {{replicas}}
+          selector: {matchLabels: {app: reefer-monitor}}
+          template:
+            metadata: {labels: {app: reefer-monitor}}
+            spec:
+              terminationGracePeriodSeconds: 1
+              containers:
+                - {name: monitor, image: "busybox:1.37", command: ["sh", "-c", "while true; do sleep 30; done"]}
+  teardown:
+    - on: qm-fleet
+      run: |
+        kubectl delete namespace reefer --ignore-not-found --wait=false
+        kubectl label node fleet-wk-1 fleet-wk-2 reefer.quillmoor.example/zone- reefer.quillmoor.example/rack- || true
+  checks:
+    - id: required-term
+      description: Required node affinity selects reefer.quillmoor.example/zone In [cold]
+      type: shell
+      on: qm-fleet
+      skills: [k8s.scheduling.node-affinity]
+      weight: 2
+      command: |
+        kubectl -n reefer get deploy reefer-monitor -o json | jq -c '[.spec.template.spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[]?.matchExpressions[]? | {key, operator, values}]'
+      expect: {match: exact, value: '[{"key":"reefer.quillmoor.example/zone","operator":"In","values":["cold"]}]'}
+    - id: preferred-term
+      description: A weighted preference for reefer.quillmoor.example/rack=a
+      type: shell
+      on: qm-fleet
+      skills: [k8s.scheduling.node-affinity]
+      command: |
+        kubectl -n reefer get deploy reefer-monitor -o json | jq -r '[.spec.template.spec.affinity.nodeAffinity.preferredDuringSchedulingIgnoredDuringExecution[]?
+          | select(.weight > 0) | .preference.matchExpressions[]? | select(.key == "reefer.quillmoor.example/rack" and .operator == "In" and (.values | index("a")))] | length > 0'
+      expect: {match: exact, value: "true"}
+    - id: running-cold
+      description: All replicas run on cold-zone nodes
+      type: shell
+      on: qm-fleet
+      skills: [k8s.scheduling.node-affinity]
+      weight: 2
+      command: |
+        kubectl -n reefer rollout status deploy/reefer-monitor --timeout=5s >/dev/null 2>&1 || { echo "not rolled out"; exit 0; }
+        cold=" $(kubectl get nodes -l reefer.quillmoor.example/zone=cold -o jsonpath='{.items[*].metadata.name}') "
+        kubectl -n reefer get pods -l app=reefer-monitor -o json | jq -r --arg cold "$cold" '
+          [.items[] | select(.metadata.deletionTimestamp == null) | select(.status.phase == "Running") | .spec.nodeName as $n | ($cold | contains(" " + $n + " "))] | "\(length) \(all)"'
+      expect: {match: exact, value: "{{replicas}} true"}
+  misconceptions:
+    - id: both-required
+      description: Puts the rack label into the required term as well.
+      feedback: The rack is only a preference; required terms filter nodes.
+      expectFail: [required-term, preferred-term]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-fleet
+          kubectl -n reefer patch deploy reefer-monitor -p '{"spec":{"template":{"spec":{"affinity":{"nodeAffinity":{"requiredDuringSchedulingIgnoredDuringExecution":{"nodeSelectorTerms":[{"matchExpressions":[
+            {"key":"reefer.quillmoor.example/zone","operator":"In","values":["cold"]},{"key":"reefer.quillmoor.example/rack","operator":"In","values":["a"]}]}]}}}}}}}'
+          kubectl -n reefer rollout status deploy/reefer-monitor --timeout=120s
+    - id: nodeselector
+      description: Uses a nodeSelector for the zone and no affinity.
+      feedback: The task asks for node affinity, which also expresses the preference.
+      expectFail: [required-term, preferred-term]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-fleet
+          kubectl -n reefer patch deploy reefer-monitor -p '{"spec":{"template":{"spec":{"nodeSelector":{"reefer.quillmoor.example/zone":"cold"}}}}}'
+          kubectl -n reefer rollout status deploy/reefer-monitor --timeout=120s
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-fleet
+          kubectl -n reefer patch deploy reefer-monitor -p '{"spec":{"template":{"spec":{"affinity":{"nodeAffinity":{
+            "requiredDuringSchedulingIgnoredDuringExecution":{"nodeSelectorTerms":[{"matchExpressions":[{"key":"reefer.quillmoor.example/zone","operator":"In","values":["cold"]}]}]},
+            "preferredDuringSchedulingIgnoredDuringExecution":[{"weight":80,"preference":{"matchExpressions":[{"key":"reefer.quillmoor.example/rack","operator":"In","values":["a"]}]}}]}}}}}}'
+          kubectl -n reefer rollout status deploy/reefer-monitor --timeout=120s

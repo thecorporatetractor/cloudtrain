@@ -1,0 +1,299 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: patch-without-clobbering
+  title: Change a live Deployment without losing other fields
+  domain: kubernetes
+  frameworks: [ckad:deployment]
+  difficulty: easy
+  estimatedMinutes: 8
+  tags: [kubectl, patch, set, resources]
+  version: 1
+spec:
+  description: |
+    The harbour's dock-scheduler ran out of memory twice during the night
+    shift. The on-call engineer scaled it up and annotated the change ticket,
+    but the memory limit still needs raising.
+
+    Use context `qm-dispatch`:
+
+    ```bash
+    kubectl config use-context qm-dispatch
+    ```
+
+    In namespace `dock-scheduling`, raise the **memory limit** of container
+    **`scheduler`** in Deployment `dock-scheduler` to **{{mem}}** and let the
+    change roll out.
+
+    Everything else about the Deployment must stay exactly as it is now: its
+    replica count, its annotations, the other resource settings of `scheduler`
+    and the `metrics-relay` sidecar container. The file
+    `~/manifests/dock-scheduler.yaml` is the manifest from the original
+    release; it is out of date.
+  objectives:
+    - Change a single field of one container in a live Deployment
+    - Tell strategic merge, JSON merge and JSON patches apart
+    - Recognise when re-applying an old manifest reverts live changes
+  params:
+    mem:
+      type: choice
+      values: [256Mi, 320Mi, 384Mi]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-dispatch
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: qm-dispatch
+  setup:
+    - on: workstation
+      file:
+        path: /home/learner/manifests/dock-scheduler.yaml
+        content: |
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: dock-scheduler
+            namespace: dock-scheduling
+          spec:
+            replicas: 1
+            selector:
+              matchLabels: {app: dock-scheduler}
+            template:
+              metadata:
+                labels: {app: dock-scheduler}
+              spec:
+                containers:
+                  - name: scheduler
+                    image: caddy:2-alpine
+                    resources:
+                      requests: {cpu: 100m, memory: 96Mi}
+                      limits: {cpu: 500m, memory: 128Mi}
+                  - name: metrics-relay
+                    image: busybox:1.37
+                    command: ["sh", "-c", "while true; do sleep 30; done"]
+                    resources:
+                      requests: {cpu: 10m, memory: 16Mi}
+                      limits: {cpu: 50m, memory: 32Mi}
+    - on: workstation
+      run: chown -R learner:learner /home/learner/manifests
+    - on: qm-dispatch
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: dock-scheduling}
+    - on: qm-dispatch
+      timeoutSec: 150
+      run: |
+        cat <<'YAML' | kubectl apply -f -
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: dock-scheduler
+          namespace: dock-scheduling
+        spec:
+          replicas: 1
+          selector:
+            matchLabels: {app: dock-scheduler}
+          template:
+            metadata:
+              labels: {app: dock-scheduler}
+            spec:
+              containers:
+                - name: scheduler
+                  image: caddy:2-alpine
+                  resources:
+                    requests: {cpu: 100m, memory: 96Mi}
+                    limits: {cpu: 500m, memory: 128Mi}
+                - name: metrics-relay
+                  image: busybox:1.37
+                  command: ["sh", "-c", "while true; do sleep 30; done"]
+                  resources:
+                    requests: {cpu: 10m, memory: 16Mi}
+                    limits: {cpu: 50m, memory: 32Mi}
+        YAML
+        kubectl -n dock-scheduling scale deployment dock-scheduler --replicas=3
+        kubectl -n dock-scheduling annotate deployment dock-scheduler --overwrite \
+          quillmoor.example/change-ticket=HRB-4471 quillmoor.example/on-call=night-shift
+        kubectl -n dock-scheduling rollout status deployment dock-scheduler --timeout=120s
+  teardown:
+    - on: qm-dispatch
+      run: kubectl delete namespace dock-scheduling --ignore-not-found --wait=false
+  checks:
+    - id: context
+      description: Terminal is using context qm-dispatch
+      type: k8s-context
+      on: workstation
+      skills: [k8s.cli.contexts]
+      weight: 0.5
+      expect: {match: exact, value: qm-dispatch}
+    - id: memory-limit
+      description: Container scheduler has a memory limit of {{mem}}
+      type: k8s-query
+      skills: [k8s.cli.edit-patch]
+      weight: 2
+      query:
+        cluster: qm-dispatch
+        resource: deployment
+        name: dock-scheduler
+        namespace: dock-scheduling
+        jsonpath: '{.spec.template.spec.containers[?(@.name=="scheduler")].resources.limits.memory}'
+      expect: {match: exact, value: "{{mem}}"}
+    - id: other-resources
+      description: scheduler keeps image caddy:2-alpine, requests 100m/96Mi and CPU limit 500m
+      type: k8s-query
+      skills: [k8s.cli.edit-patch]
+      query:
+        cluster: qm-dispatch
+        resource: deployment
+        name: dock-scheduler
+        namespace: dock-scheduling
+        jsonpath: '{.spec.template.spec.containers[?(@.name=="scheduler")].image} {.spec.template.spec.containers[?(@.name=="scheduler")].resources.requests.cpu}/{.spec.template.spec.containers[?(@.name=="scheduler")].resources.requests.memory}/{.spec.template.spec.containers[?(@.name=="scheduler")].resources.limits.cpu}'
+      expect: {match: exact, value: "caddy:2-alpine 100m/96Mi/500m"}
+    - id: sidecar-intact
+      description: The metrics-relay sidecar is still there with its own resources (limits 50m/32Mi)
+      type: k8s-query
+      skills: [k8s.cli.scoped-changes, k8s.cli.edit-patch]
+      query:
+        cluster: qm-dispatch
+        resource: deployment
+        name: dock-scheduler
+        namespace: dock-scheduling
+        jsonpath: '{range .spec.template.spec.containers[*]}{.name}={.resources.limits.cpu}/{.resources.limits.memory};{end}'
+      expect: {match: exact, value: "scheduler=500m/{{mem}};metrics-relay=50m/32Mi;"}
+    - id: annotations-intact
+      description: The change-ticket and on-call annotations are still on the Deployment
+      type: k8s-query
+      skills: [k8s.cli.scoped-changes]
+      query:
+        cluster: qm-dispatch
+        resource: deployment
+        name: dock-scheduler
+        namespace: dock-scheduling
+        jsonpath: '{.metadata.annotations.quillmoor\.example/change-ticket} {.metadata.annotations.quillmoor\.example/on-call}'
+      expect: {match: exact, value: HRB-4471 night-shift}
+    - id: replicas-intact
+      description: The change rolled out and the Deployment still runs 3 replicas, all updated and ready
+      type: k8s-query
+      skills: [k8s.cli.scoped-changes, k8s.workloads.rollouts]
+      query:
+        cluster: qm-dispatch
+        resource: deployment
+        name: dock-scheduler
+        namespace: dock-scheduling
+        jsonpath: '{.spec.replicas}/{.status.updatedReplicas}/{.status.readyReplicas}/{.status.replicas}'
+      expect: {match: exact, value: 3/3/3/3}
+  hints:
+    - title: Switch context
+      body: The harbour workloads run in qm-dispatch.
+      command: kubectl config use-context qm-dispatch
+      cost: 0
+    - title: Look at what is live
+      body: The live object differs from the old manifest file; compare replicas and annotations.
+      command: kubectl -n dock-scheduling get deployment dock-scheduler -o yaml
+      cost: 1
+    - title: One container, one field
+      body: "`kubectl set resources` changes every container unless you name one with `-c`."
+      command: kubectl -n dock-scheduling set resources deployment dock-scheduler -c scheduler --limits=memory={{mem}}
+      cost: 2
+    - title: Patches that merge lists by name
+      body: |
+        A strategic merge patch (the default type of `kubectl patch`) matches
+        containers by `name` and changes only the fields you send. A JSON merge
+        patch (`--type=merge`) replaces the whole `containers` list.
+      cost: 2
+  misconceptions:
+    - id: set-all-containers
+      description: Runs kubectl set resources without -c, which changes the sidecar too.
+      feedback: Without `-c`, `set resources` applies to every container in the Pod template. Name the container.
+      expectFail: [sidecar-intact]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl -n dock-scheduling set resources deployment dock-scheduler --limits=memory={{mem}}
+          kubectl -n dock-scheduling rollout status deployment dock-scheduler --timeout=120s
+    - id: json-merge-patch
+      description: Sends a JSON merge patch with a one-element containers list, which replaces the list.
+      feedback: "A JSON merge patch replaces arrays wholesale: the sidecar and every field you did not repeat are gone. Use a strategic merge patch, `kubectl set` or a JSON patch with an exact path."
+      expectFail: [other-resources, sidecar-intact]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl -n dock-scheduling patch deployment dock-scheduler --type=merge \
+            -p '{"spec":{"template":{"spec":{"containers":[{"name":"scheduler","image":"caddy:2-alpine","resources":{"limits":{"memory":"{{mem}}"}}}]}}}}'
+          kubectl -n dock-scheduling rollout status deployment dock-scheduler --timeout=120s
+    - id: apply-stale-manifest
+      description: Edits the old manifest file and applies it, which also resets the replica count to 1.
+      feedback: Applying a file sets every field in it, including the stale `replicas` value. Read the live object first, or patch only the field you mean.
+      expectFail: [replicas-intact]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-dispatch
+          yq -i '(.spec.template.spec.containers[] | select(.name == "scheduler") | .resources.limits.memory) = "{{mem}}"' ~/manifests/dock-scheduler.yaml
+          kubectl apply -f ~/manifests/dock-scheduler.yaml
+          kubectl -n dock-scheduling rollout status deployment dock-scheduler --timeout=120s
+    - id: replace-stale-manifest
+      description: Edits the old manifest and runs kubectl replace, dropping the annotations and the scale-up.
+      feedback: "`replace` swaps the whole object for the file. Anything added live since (annotations, replicas) is lost."
+      expectFail: [annotations-intact, replicas-intact]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-dispatch
+          yq -i '(.spec.template.spec.containers[] | select(.name == "scheduler") | .resources.limits.memory) = "{{mem}}"' ~/manifests/dock-scheduler.yaml
+          kubectl replace -f ~/manifests/dock-scheduler.yaml
+          kubectl -n dock-scheduling rollout status deployment dock-scheduler --timeout=120s
+  solution:
+    explanation: |
+      `kubectl set resources -c scheduler --limits=memory=...` changes exactly
+      one key of one container. The Deployment controller rolls out new Pods;
+      replicas, annotations and the sidecar are untouched because nothing else
+      was sent to the API server.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl -n dock-scheduling set resources deployment dock-scheduler -c scheduler --limits=memory={{mem}}
+          kubectl -n dock-scheduling rollout status deployment dock-scheduler --timeout=120s
+    alternatives:
+      - id: strategic-merge-patch
+        description: A strategic merge patch that names the container.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 150
+            run: |
+              kubectl config use-context qm-dispatch
+              kubectl -n dock-scheduling patch deployment dock-scheduler \
+                -p '{"spec":{"template":{"spec":{"containers":[{"name":"scheduler","resources":{"limits":{"memory":"{{mem}}"}}}]}}}}'
+              kubectl -n dock-scheduling rollout status deployment dock-scheduler --timeout=120s
+      - id: json-patch-path
+        description: A JSON patch that replaces exactly the one field by path.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 150
+            run: |
+              kubectl config use-context qm-dispatch
+              kubectl -n dock-scheduling patch deployment dock-scheduler --type=json \
+                -p '[{"op":"replace","path":"/spec/template/spec/containers/0/resources/limits/memory","value":"{{mem}}"}]'
+              kubectl -n dock-scheduling rollout status deployment dock-scheduler --timeout=120s

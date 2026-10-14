@@ -1,0 +1,290 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: dock-scheduler-probes
+  title: Add probes so a slow start stops causing restarts
+  domain: kubernetes
+  frameworks: [cka:workloads-scheduling, ckad:observability-maintenance]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [probes, startupprobe, readiness, liveness, crashloop]
+  version: 1
+spec:
+  description: |
+    The harbour's dock-scheduler loads the berth plans before it answers
+    anything, which takes about **40 seconds**. Since someone added a liveness
+    probe, its Pods are killed before they ever finish starting.
+
+    Use context `qm-dispatch`:
+
+    ```bash
+    kubectl config use-context qm-dispatch
+    ```
+
+    The `scheduler` container in Deployment **`dock-scheduler`** (namespace
+    `dock-scheduling`) serves two HTTP endpoints on port **8080** once it has
+    started:
+
+    | Path | Meaning |
+    |---|---|
+    | `/healthz` | the process is alive |
+    | `/ready` | it can take traffic (missing while it is overloaded) |
+
+    Change the Deployment so that:
+
+    - a **startup probe** on `/healthz` gives the container at least
+      **60 seconds** to start before any other probe counts;
+    - the existing **liveness probe** on `/healthz` stays in place;
+    - a **readiness probe** on `/ready` takes a Pod out of the `dock-scheduler`
+      Service whenever it is not ready to take traffic.
+
+    Both replicas must end up Ready without any restarts.
+  objectives:
+    - Recognise a liveness probe that kills a slow-starting container
+    - Size a startup probe from periodSeconds and failureThreshold
+    - Separate readiness (traffic) from liveness (restart) checks
+  params:
+    period:
+      type: choice
+      values: ["5", "10"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-dispatch
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: qm-dispatch
+  setup:
+    - on: qm-dispatch
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: dock-scheduling}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: dock-scheduler, namespace: dock-scheduling}
+        spec:
+          replicas: 2
+          selector: {matchLabels: {app: dock-scheduler}}
+          template:
+            metadata: {labels: {app: dock-scheduler}}
+            spec:
+              containers:
+                - name: scheduler
+                  image: busybox:1.37
+                  command:
+                    - sh
+                    - -c
+                    - |
+                      echo "loading berth plans"; sleep 40
+                      mkdir -p /www && echo ok > /www/healthz && echo ready > /www/ready
+                      echo "dock-scheduler serving on :8080"
+                      exec httpd -f -p 8080 -h /www
+                  ports: [{name: http, containerPort: 8080}]
+                  livenessProbe:
+                    httpGet: {path: /healthz, port: 8080}
+                    initialDelaySeconds: 5
+                    periodSeconds: {{period}}
+                    failureThreshold: 3
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata: {name: dock-scheduler, namespace: dock-scheduling}
+        spec:
+          selector: {app: dock-scheduler}
+          ports: [{name: http, port: 80, targetPort: http}]
+    - on: qm-dispatch
+      timeoutSec: 180
+      run: |
+        # wait until the liveness probe has killed the container at least once
+        for i in $(seq 1 80); do
+          r=$(kubectl -n dock-scheduling get pods -l app=dock-scheduler -o jsonpath='{.items[0].status.containerStatuses[0].restartCount}')
+          [ "${r:-0}" -ge 1 ] && exit 0
+          sleep 2
+        done
+        echo "no restart observed"; exit 1
+  teardown:
+    - on: qm-dispatch
+      run: kubectl delete namespace dock-scheduling --ignore-not-found --wait=false
+  checks:
+    - id: context
+      description: Terminal is using context qm-dispatch
+      type: k8s-context
+      on: workstation
+      skills: [k8s.cli.contexts]
+      weight: 0.5
+      expect: {match: exact, value: qm-dispatch}
+    - id: startup-probe
+      description: A startup probe on /healthz:8080 allows at least 60 s for the start
+      type: shell
+      on: qm-dispatch
+      skills: [k8s.workloads.probes]
+      weight: 2
+      command: |
+        kubectl -n dock-scheduling get deployment dock-scheduler -o json | jq -r '
+          .spec.template.spec.containers[] | select(.name == "scheduler") | .startupProbe as $p
+          | if $p == null then "no startup probe"
+            elif ($p.httpGet.path != "/healthz" or (($p.httpGet.port | tostring) as $port | ($port != "8080" and $port != "http"))) then "wrong endpoint"
+            elif (($p.initialDelaySeconds // 0) + ($p.periodSeconds // 10) * ($p.failureThreshold // 3)) < 60 then "budget too small"
+            else "ok" end'
+      expect: {match: exact, value: ok}
+    - id: liveness-probe
+      description: The liveness probe on /healthz:8080 is still there
+      type: shell
+      on: qm-dispatch
+      skills: [k8s.workloads.probes]
+      command: |
+        kubectl -n dock-scheduling get deployment dock-scheduler -o json | jq -r '
+          .spec.template.spec.containers[] | select(.name == "scheduler") | .livenessProbe.httpGet
+          | if . == null then "missing" else "\(.path):\(.port)" end'
+      expect: {match: regex, value: '^/healthz:(8080|http)$'}
+    - id: readiness-probe
+      description: A readiness probe checks /ready on port 8080
+      type: shell
+      on: qm-dispatch
+      skills: [k8s.workloads.probes]
+      weight: 2
+      command: |
+        kubectl -n dock-scheduling get deployment dock-scheduler -o json | jq -r '
+          .spec.template.spec.containers[] | select(.name == "scheduler") | .readinessProbe.httpGet
+          | if . == null then "missing" else "\(.path):\(.port)" end'
+      expect: {match: regex, value: '^/ready:(8080|http)$'}
+    - id: ready-no-restarts
+      description: Both current Pods are Ready and have never restarted
+      type: shell
+      on: qm-dispatch
+      skills: [k8s.workloads.probes]
+      weight: 2
+      command: |
+        kubectl -n dock-scheduling get pods -l app=dock-scheduler -o json \
+          | jq -r '[.items[] | select(.metadata.deletionTimestamp == null)
+                   | "\(.status.containerStatuses[0].ready)/\(.status.containerStatuses[0].restartCount)"] | sort | join(" ")'
+      expect: {match: exact, value: "true/0 true/0"}
+    - id: service-endpoints
+      description: The dock-scheduler Service has 2 ready endpoints
+      type: shell
+      on: qm-dispatch
+      skills: [k8s.workloads.probes]
+      command: |
+        kubectl -n dock-scheduling get endpointslices -l kubernetes.io/service-name=dock-scheduler -o json \
+          | jq '[.items[].endpoints[]? | select(.conditions.ready)] | length'
+      expect: {match: exact, value: "2"}
+  hints:
+    - title: Switch context
+      body: The harbour workloads run in qm-dispatch.
+      command: kubectl config use-context qm-dispatch
+      cost: 0
+    - title: Why does it restart?
+      body: The Pod's events say which probe failed and that the container will be restarted.
+      command: kubectl -n dock-scheduling describe pod -l app=dock-scheduler | sed -n '/Events:/,$p'
+      cost: 1
+    - title: Startup probes hold the others back
+      body: |
+        Until a startup probe succeeds, liveness and readiness probes are not
+        run. Its time budget is roughly `initialDelaySeconds + periodSeconds x
+        failureThreshold`.
+      cost: 1
+    - title: Three probes in the container
+      body: Edit the container and add `startupProbe` and `readinessProbe` next to `livenessProbe`.
+      command: |
+        kubectl -n dock-scheduling patch deployment dock-scheduler -p '{"spec":{"template":{"spec":{"containers":[{"name":"scheduler",
+          "startupProbe":{"httpGet":{"path":"/healthz","port":8080},"periodSeconds":5,"failureThreshold":18},
+          "readinessProbe":{"httpGet":{"path":"/ready","port":8080},"periodSeconds":5}}]}}}}'
+      cost: 3
+  misconceptions:
+    - id: longer-initial-delay
+      description: Raises the liveness probe's initialDelaySeconds instead of adding a startup probe.
+      feedback: A long initial delay also delays detecting a hung container after every restart. A startup probe covers only the start phase.
+      expectFail: [startup-probe]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 200
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl -n dock-scheduling patch deployment dock-scheduler -p '{"spec":{"template":{"spec":{"containers":[{"name":"scheduler",
+            "livenessProbe":{"initialDelaySeconds":70},
+            "readinessProbe":{"httpGet":{"path":"/ready","port":8080},"periodSeconds":5}}]}}}}'
+          kubectl -n dock-scheduling rollout status deployment dock-scheduler --timeout=180s
+    - id: readiness-on-healthz
+      description: Points the readiness probe at /healthz.
+      feedback: /healthz only says the process is alive. Readiness must follow /ready, or overloaded Pods keep receiving traffic.
+      expectFail: [readiness-probe]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 200
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl -n dock-scheduling patch deployment dock-scheduler -p '{"spec":{"template":{"spec":{"containers":[{"name":"scheduler",
+            "startupProbe":{"httpGet":{"path":"/healthz","port":8080},"periodSeconds":5,"failureThreshold":18},
+            "readinessProbe":{"httpGet":{"path":"/healthz","port":8080},"periodSeconds":5}}]}}}}'
+          kubectl -n dock-scheduling rollout status deployment dock-scheduler --timeout=180s
+    - id: drop-liveness
+      description: Deletes the liveness probe so nothing kills the container any more.
+      feedback: Without liveness a hung scheduler is never restarted. Keep it and let a startup probe protect the start phase.
+      expectFail: [liveness-probe]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 200
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl -n dock-scheduling patch deployment dock-scheduler --type=json -p '[{"op":"remove","path":"/spec/template/spec/containers/0/livenessProbe"},
+            {"op":"add","path":"/spec/template/spec/containers/0/readinessProbe","value":{"httpGet":{"path":"/ready","port":8080},"periodSeconds":5}}]'
+          kubectl -n dock-scheduling rollout status deployment dock-scheduler --timeout=180s
+    - id: startup-too-short
+      description: Adds a startup probe with the default failureThreshold, which allows only about 15-30 seconds.
+      feedback: "failureThreshold defaults to 3: with periodSeconds 5 that is 15 seconds, far below the 40-second start. Multiply it out."
+      expectFail: [startup-probe, ready-no-restarts]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl -n dock-scheduling patch deployment dock-scheduler -p '{"spec":{"template":{"spec":{"containers":[{"name":"scheduler",
+            "startupProbe":{"httpGet":{"path":"/healthz","port":8080},"periodSeconds":5},
+            "readinessProbe":{"httpGet":{"path":"/ready","port":8080},"periodSeconds":5}}]}}}}'
+          sleep 90
+  solution:
+    explanation: |
+      The liveness probe started failing 5 seconds in and killed the container
+      after three failures, long before the 40-second warm-up ended. A startup
+      probe with `periodSeconds: 5` and `failureThreshold: 18` allows 90
+      seconds and suspends liveness and readiness until it first succeeds.
+      The readiness probe on `/ready` then controls Service membership, while
+      liveness on `/healthz` only restarts a hung process.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 200
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl -n dock-scheduling patch deployment dock-scheduler -p '{"spec":{"template":{"spec":{"containers":[{"name":"scheduler",
+            "startupProbe":{"httpGet":{"path":"/healthz","port":8080},"periodSeconds":5,"failureThreshold":18},
+            "readinessProbe":{"httpGet":{"path":"/ready","port":8080},"periodSeconds":5}}]}}}}'
+          kubectl -n dock-scheduling rollout status deployment dock-scheduler --timeout=180s
+    alternatives:
+      - id: named-port-and-initial-delay
+        description: Probes on the named port, with an initial delay on the startup probe.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 200
+            run: |
+              kubectl config use-context qm-dispatch
+              kubectl -n dock-scheduling get deployment dock-scheduler -o yaml \
+                | yq '(.spec.template.spec.containers[] | select(.name == "scheduler")) |= (
+                        .startupProbe = {"httpGet": {"path": "/healthz", "port": "http"}, "initialDelaySeconds": 30, "periodSeconds": 10, "failureThreshold": 4}
+                        | .readinessProbe = {"httpGet": {"path": "/ready", "port": "http"}, "periodSeconds": 3, "failureThreshold": 2}
+                        | .livenessProbe.httpGet.port = "http")' \
+                | kubectl apply -f -
+              kubectl -n dock-scheduling rollout status deployment dock-scheduler --timeout=180s

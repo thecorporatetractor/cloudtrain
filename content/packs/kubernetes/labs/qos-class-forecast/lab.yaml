@@ -1,0 +1,261 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: qos-class-forecast
+  title: Set requests and limits for a predictable QoS class
+  domain: kubernetes
+  frameworks: [cka:workloads-scheduling, ckad:environment-config-security]
+  difficulty: easy
+  estimatedMinutes: 10
+  tags: [resources, requests, limits, qos]
+  version: 1
+spec:
+  description: |
+    When a depot node runs short of memory, the kubelet evicts BestEffort Pods
+    first and Guaranteed Pods last. The billing team wants the payment
+    reconciler to be the last thing evicted, while the report renderer may
+    burst when memory is free.
+
+    Use context `qm-depot`:
+
+    ```bash
+    kubectl config use-context qm-depot
+    ```
+
+    In namespace `billing-batch`, set resources on two Deployments:
+
+    | Deployment / container | requests | limits |
+    |---|---|---|
+    | `payment-reconciler` / `reconciler` | CPU `{{cpu}}`, memory `{{mem}}` | the same |
+    | `payment-reconciler` / `audit-tail` | CPU `50m`, memory `32Mi` | the same |
+    | `report-renderer` / `renderer` | CPU `100m`, memory `128Mi` | memory `512Mi` only |
+
+    Afterwards the Pods of `payment-reconciler` must have the QoS class
+    **Guaranteed** and the Pods of `report-renderer` the QoS class
+    **Burstable**. Do not change images, commands or anything else.
+  objectives:
+    - Write requests and limits with the right quantity units
+    - Predict a Pod's QoS class from its containers' resources
+    - Confirm the QoS class Kubernetes assigned
+  params:
+    cpu:
+      type: choice
+      values: [250m, 300m, 400m]
+    mem:
+      type: choice
+      values: [256Mi, 384Mi, 192Mi]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-depot
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: qm-depot
+  setup:
+    - on: qm-depot
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: billing-batch}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: payment-reconciler, namespace: billing-batch}
+        spec:
+          replicas: 2
+          selector: {matchLabels: {app: payment-reconciler}}
+          template:
+            metadata: {labels: {app: payment-reconciler}}
+            spec:
+              containers:
+                - name: reconciler
+                  image: busybox:1.37
+                  command: ["sh", "-c", "while true; do echo reconciling; sleep 20; done"]
+                - name: audit-tail
+                  image: busybox:1.37
+                  command: ["sh", "-c", "while true; do sleep 30; done"]
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: report-renderer, namespace: billing-batch}
+        spec:
+          replicas: 1
+          selector: {matchLabels: {app: report-renderer}}
+          template:
+            metadata: {labels: {app: report-renderer}}
+            spec:
+              containers:
+                - name: renderer
+                  image: httpd:2.4-alpine
+    - on: qm-depot
+      timeoutSec: 150
+      run: |
+        kubectl -n billing-batch rollout status deploy/payment-reconciler --timeout=120s
+        kubectl -n billing-batch rollout status deploy/report-renderer --timeout=120s
+  teardown:
+    - on: qm-depot
+      run: kubectl delete namespace billing-batch --ignore-not-found --wait=false
+  checks:
+    - id: context
+      description: Terminal is using context qm-depot
+      type: k8s-context
+      on: workstation
+      skills: [k8s.cli.contexts]
+      weight: 0.5
+      expect: {match: exact, value: qm-depot}
+    - id: reconciler-values
+      description: payment-reconciler containers have the requested requests and limits
+      type: k8s-query
+      skills: [k8s.workloads.resources, k8s.storage.capacity-units]
+      query:
+        cluster: qm-depot
+        resource: deployment
+        name: payment-reconciler
+        namespace: billing-batch
+        jsonpath: '{range .spec.template.spec.containers[*]}{.name}:{.resources.requests.cpu}/{.resources.requests.memory}/{.resources.limits.cpu}/{.resources.limits.memory};{end}'
+      expect: {match: exact, value: "reconciler:{{cpu}}/{{mem}}/{{cpu}}/{{mem}};audit-tail:50m/32Mi/50m/32Mi;"}
+    - id: renderer-values
+      description: report-renderer requests 100m/128Mi and limits only memory to 512Mi
+      type: k8s-query
+      skills: [k8s.workloads.resources, k8s.storage.capacity-units]
+      query:
+        cluster: qm-depot
+        resource: deployment
+        name: report-renderer
+        namespace: billing-batch
+        jsonpath: '{.spec.template.spec.containers[0].resources.requests.cpu}/{.spec.template.spec.containers[0].resources.requests.memory}/{.spec.template.spec.containers[0].resources.limits.cpu}/{.spec.template.spec.containers[0].resources.limits.memory}'
+      expect: {match: exact, value: 100m/128Mi//512Mi}
+    - id: reconciler-guaranteed
+      description: Every running payment-reconciler Pod is in QoS class Guaranteed
+      type: shell
+      on: qm-depot
+      skills: [k8s.workloads.resources]
+      weight: 2
+      command: |
+        kubectl -n billing-batch get pods -l app=payment-reconciler -o json \
+          | jq -r '[.items[] | select(.metadata.deletionTimestamp == null) | "\(.status.phase)/\(.status.qosClass)"] | sort | join(" ")'
+      expect: {match: exact, value: Running/Guaranteed Running/Guaranteed}
+    - id: renderer-burstable
+      description: The running report-renderer Pod is in QoS class Burstable
+      type: shell
+      on: qm-depot
+      skills: [k8s.workloads.resources]
+      weight: 2
+      command: |
+        kubectl -n billing-batch get pods -l app=report-renderer -o json \
+          | jq -r '[.items[] | select(.metadata.deletionTimestamp == null) | "\(.status.phase)/\(.status.qosClass)"] | sort | join(" ")'
+      expect: {match: exact, value: Running/Burstable}
+    - id: nothing-else-changed
+      description: Images, commands and replica counts are unchanged
+      type: shell
+      on: qm-depot
+      skills: [k8s.cli.scoped-changes]
+      weight: 0.5
+      command: |
+        kubectl -n billing-batch get deploy payment-reconciler report-renderer -o json \
+          | jq -r '[.items[] | "\(.metadata.name)=\(.spec.replicas):" + ([.spec.template.spec.containers[] | "\(.image)\(.command // [] | length)"] | join(","))] | join(" ")'
+      expect: {match: exact, value: "payment-reconciler=2:busybox:1.373,busybox:1.373 report-renderer=1:httpd:2.4-alpine0"}
+  hints:
+    - title: Switch context
+      body: The billing batch jobs run in qm-depot.
+      command: kubectl config use-context qm-depot
+      cost: 0
+    - title: The QoS rules
+      body: |
+        Guaranteed: **every** container has CPU and memory limits, and its
+        requests equal them. Burstable: at least one request or limit, but not
+        Guaranteed. BestEffort: none at all.
+      cost: 1
+    - title: One container at a time
+      body: "`kubectl set resources -c <container>` sets requests and limits of one container."
+      command: kubectl -n billing-batch set resources deployment payment-reconciler -c audit-tail --requests=cpu=50m,memory=32Mi --limits=cpu=50m,memory=32Mi
+      cost: 2
+    - title: Read what Kubernetes decided
+      command: kubectl -n billing-batch get pods -o custom-columns=NAME:.metadata.name,QOS:.status.qosClass
+      body: The QoS class is computed when the Pod is created and stored in `status.qosClass`.
+      cost: 1
+  misconceptions:
+    - id: sidecar-forgotten
+      description: Sets requests equal to limits on the main container only.
+      feedback: One container without resources makes the whole Pod Burstable. Guaranteed needs equal requests and limits on every container.
+      expectFail: [reconciler-values, reconciler-guaranteed]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 200
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n billing-batch set resources deployment payment-reconciler -c reconciler --requests=cpu={{cpu}},memory={{mem}} --limits=cpu={{cpu}},memory={{mem}}
+          kubectl -n billing-batch set resources deployment report-renderer -c renderer --requests=cpu=100m,memory=128Mi --limits=memory=512Mi
+          kubectl -n billing-batch rollout status deploy/payment-reconciler --timeout=90s
+          kubectl -n billing-batch rollout status deploy/report-renderer --timeout=90s
+    - id: renderer-equal
+      description: Gives the renderer equal requests and limits as well, which makes it Guaranteed.
+      feedback: Equal CPU and memory requests and limits on every container is exactly the Guaranteed rule. The renderer should only cap memory.
+      expectFail: [renderer-values, renderer-burstable]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 200
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n billing-batch set resources deployment payment-reconciler -c reconciler --requests=cpu={{cpu}},memory={{mem}} --limits=cpu={{cpu}},memory={{mem}}
+          kubectl -n billing-batch set resources deployment payment-reconciler -c audit-tail --requests=cpu=50m,memory=32Mi --limits=cpu=50m,memory=32Mi
+          kubectl -n billing-batch set resources deployment report-renderer -c renderer --requests=cpu=100m,memory=128Mi --limits=cpu=100m,memory=128Mi
+          kubectl -n billing-batch rollout status deploy/payment-reconciler --timeout=90s
+          kubectl -n billing-batch rollout status deploy/report-renderer --timeout=90s
+    - id: decimal-megabytes
+      description: Writes memory as `M` (megabytes) instead of `Mi` (mebibytes).
+      feedback: "`128M` is 128,000,000 bytes, `128Mi` is 134,217,728 bytes. Kubernetes quantities distinguish the two; use the binary suffix asked for."
+      expectFail: [reconciler-values, renderer-values]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 200
+        run: |
+          kubectl config use-context qm-depot
+          m=$(echo {{mem}} | sed 's/Mi$/M/')
+          kubectl -n billing-batch set resources deployment payment-reconciler -c reconciler --requests=cpu={{cpu}},memory=$m --limits=cpu={{cpu}},memory=$m
+          kubectl -n billing-batch set resources deployment payment-reconciler -c audit-tail --requests=cpu=50m,memory=32M --limits=cpu=50m,memory=32M
+          kubectl -n billing-batch set resources deployment report-renderer -c renderer --requests=cpu=100m,memory=128M --limits=memory=512M
+          kubectl -n billing-batch rollout status deploy/payment-reconciler --timeout=90s
+          kubectl -n billing-batch rollout status deploy/report-renderer --timeout=90s
+  solution:
+    explanation: |
+      With requests equal to limits for CPU and memory on both containers, the
+      reconciler Pods are Guaranteed. The renderer has requests and a memory
+      limit, but no CPU limit, so it is Burstable. The QoS class is assigned
+      when each new Pod is created, so the Deployments must roll out.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 200
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n billing-batch set resources deployment payment-reconciler -c reconciler --requests=cpu={{cpu}},memory={{mem}} --limits=cpu={{cpu}},memory={{mem}}
+          kubectl -n billing-batch set resources deployment payment-reconciler -c audit-tail --requests=cpu=50m,memory=32Mi --limits=cpu=50m,memory=32Mi
+          kubectl -n billing-batch set resources deployment report-renderer -c renderer --requests=cpu=100m,memory=128Mi --limits=memory=512Mi
+          kubectl -n billing-batch rollout status deploy/payment-reconciler --timeout=90s
+          kubectl -n billing-batch rollout status deploy/report-renderer --timeout=90s
+    alternatives:
+      - id: one-patch-each
+        description: Strategic merge patches that set both containers' resources at once.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 200
+            run: |
+              kubectl config use-context qm-depot
+              kubectl -n billing-batch patch deployment payment-reconciler -p '{"spec":{"template":{"spec":{"containers":[
+                {"name":"reconciler","resources":{"requests":{"cpu":"{{cpu}}","memory":"{{mem}}"},"limits":{"cpu":"{{cpu}}","memory":"{{mem}}"}}},
+                {"name":"audit-tail","resources":{"requests":{"cpu":"50m","memory":"32Mi"},"limits":{"cpu":"50m","memory":"32Mi"}}}]}}}}'
+              kubectl -n billing-batch patch deployment report-renderer -p '{"spec":{"template":{"spec":{"containers":[
+                {"name":"renderer","resources":{"requests":{"cpu":"100m","memory":"128Mi"},"limits":{"memory":"512Mi"}}}]}}}}'
+              kubectl -n billing-batch rollout status deploy/payment-reconciler --timeout=90s
+              kubectl -n billing-batch rollout status deploy/report-renderer --timeout=90s

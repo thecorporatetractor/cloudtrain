@@ -1,0 +1,281 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: oncall-depot-incident
+  title: Clear a multi-fault depot incident
+  domain: kubernetes
+  frameworks: [cka:troubleshooting]
+  difficulty: hard
+  estimatedMinutes: 35
+  tags: [troubleshooting, incident, nodes, services, probes]
+  version: 1
+spec:
+  description: |
+    You are on call. The depot portal that drivers use to book loading bays
+    is down, and the morning shift starts soon. Several things went wrong
+    overnight on `qm-depot`.
+
+    Use context `qm-depot`; you can `ssh` to `depot-cp-1`, `depot-wk-1` and
+    `depot-wk-2` (`sudo` works).
+
+    Restore the service: the Deployment **`depot-portal`** in namespace
+    `depot-ops` must run **3 ready replicas** without restarts, spread over
+    the workers as its placement rules require, and the Service
+    **`depot-portal`** must route to exactly those Pods so that
+    `http://depot-portal.depot-ops` answers from inside the cluster.
+
+    Fix causes rather than symptoms: keep the Deployment's spread rule and
+    its liveness probe (you may tune the probe), and leave the Service's
+    name and port alone.
+  objectives:
+    - Triage several simultaneous faults from symptoms
+    - Recover a NotReady node
+    - Fix a Service selector and an over-eager liveness probe
+  params:
+    typo:
+      type: choice
+      values: [depot-portl, depot-protal, depotportal]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-depot
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-depot
+          nodes:
+            - {name: depot-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: depot-wk-1, role: worker}
+            - {name: depot-wk-2, role: worker, state: notready}
+  setup:
+    - on: qm-depot
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: depot-ops}
+        ---
+        apiVersion: v1
+        kind: ConfigMap
+        metadata: {name: portal-www, namespace: depot-ops}
+        data:
+          index.html: "<h1>Quillmoor depot portal: bay booking open</h1>\n"
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: depot-portal, namespace: depot-ops}
+        spec:
+          replicas: 3
+          selector: {matchLabels: {app: depot-portal}}
+          template:
+            metadata: {labels: {app: depot-portal}}
+            spec:
+              topologySpreadConstraints:
+                - {maxSkew: 1, topologyKey: kubernetes.io/hostname, whenUnsatisfiable: DoNotSchedule, labelSelector: {matchLabels: {app: depot-portal}}}
+              containers:
+                - name: portal
+                  image: busybox:1.37
+                  command: ["sh", "-c", "echo warming caches; sleep 8; exec httpd -f -p 80 -h /www"]
+                  ports: [{name: http, containerPort: 80}]
+                  volumeMounts: [{name: www, mountPath: /www}]
+                  livenessProbe:
+                    httpGet: {path: /, port: 80}
+                    periodSeconds: 2
+                    failureThreshold: 1
+              volumes:
+                - name: www
+                  configMap: {name: portal-www}
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata: {name: depot-portal, namespace: depot-ops}
+        spec:
+          selector: {app: "{{typo}}"}
+          ports: [{name: http, port: 80, targetPort: http}]
+        ---
+        apiVersion: v1
+        kind: Pod
+        metadata: {name: bay-kiosk, namespace: depot-ops}
+        spec:
+          containers:
+            - {name: kiosk, image: "busybox:1.37", command: ["sleep", "1d"]}
+    - on: qm-depot
+      timeoutSec: 150
+      run: kubectl -n depot-ops wait pod/bay-kiosk --for=condition=Ready --timeout=120s
+  teardown:
+    - on: qm-depot
+      run: kubectl delete namespace depot-ops --ignore-not-found --wait=false
+  checks:
+    - id: context
+      description: Terminal is using context qm-depot
+      type: k8s-context
+      on: workstation
+      skills: [k8s.cli.contexts]
+      weight: 0.5
+      expect: {match: exact, value: qm-depot}
+    - id: node-recovered
+      description: depot-wk-2 is Ready and its kubelet is enabled at boot
+      type: shell
+      on: qm-depot/depot-wk-2
+      skills: [k8s.troubleshooting.nodes]
+      weight: 2
+      command: |
+        echo "$(kubectl --kubeconfig /etc/kubernetes/kubelet.conf get node depot-wk-2 -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null) $(systemctl is-enabled kubelet)"
+      expect: {match: exact, value: "True enabled"}
+    - id: portal-ready
+      description: 3 ready depot-portal Pods without restarts, on both workers
+      type: shell
+      on: qm-depot
+      skills: [k8s.workloads.probes, k8s.troubleshooting.nodes]
+      weight: 2
+      command: |
+        kubectl -n depot-ops get pods -l app=depot-portal -o json | jq -r '
+          [.items[] | select(.metadata.deletionTimestamp == null)] as $p
+          | "ready=\([$p[] | select(any(.status.conditions[]?; .type == "Ready" and .status == "True"))] | length) restarts=\([$p[].status.containerStatuses[0].restartCount // 0] | add // 0) nodes=\([$p[].spec.nodeName] | unique | length)"'
+      expect: {match: exact, value: ready=3 restarts=0 nodes=2}
+    - id: service-routes
+      description: The Service's ready endpoints are exactly the 3 portal Pods
+      type: shell
+      on: qm-depot
+      skills: [k8s.troubleshooting.networking]
+      weight: 2
+      command: |
+        eps=$(kubectl -n depot-ops get endpointslices -l kubernetes.io/service-name=depot-portal -o json | jq -r '[.items[].endpoints[]? | select(.conditions.ready) | .targetRef.name] | sort | join(",")')
+        pods=$(kubectl -n depot-ops get pods -l app=depot-portal -o json | jq -r '[.items[] | select(.metadata.deletionTimestamp == null) | .metadata.name] | sort | join(",")')
+        [ -n "$pods" ] && [ "$eps" = "$pods" ] && echo "$(echo "$eps" | tr ',' '\n' | wc -l) endpoints" || echo "endpoints: $eps"
+      expect: {match: exact, value: 3 endpoints}
+    - id: portal-answers
+      description: The kiosk Pod gets the portal page through the Service name
+      type: shell
+      on: qm-depot
+      skills: [k8s.troubleshooting.networking]
+      timeoutSec: 20
+      command: kubectl -n depot-ops exec bay-kiosk -- wget -q -T 5 -O - http://depot-portal.depot-ops/ 2>&1 | grep -o 'bay booking open' || echo "no answer"
+      expect: {match: exact, value: bay booking open}
+    - id: guards-kept
+      description: The spread rule and a liveness probe are still in place, and the Service keeps port 80
+      type: shell
+      on: qm-depot
+      skills: [k8s.workloads.probes]
+      weight: 0.5
+      command: |
+        echo "$(kubectl -n depot-ops get deploy depot-portal -o json | jq -r '"\(.spec.template.spec.topologySpreadConstraints[0].whenUnsatisfiable) \(.spec.template.spec.containers[0].livenessProbe != null)"') \
+        $(kubectl -n depot-ops get svc depot-portal -o jsonpath='{.spec.ports[0].port}')"
+      expect: {match: exact, value: DoNotSchedule true 80}
+  hints:
+    - title: Start wide
+      command: |
+        kubectl get nodes
+        kubectl -n depot-ops get pods -o wide
+        kubectl -n depot-ops get endpointslices
+      body: List what is broken before fixing anything; there is more than one fault.
+      cost: 1
+    - title: Pending portal Pods
+      body: The spread rule counts every worker, including one that is NotReady; the scheduler cannot place Pods there, so the skew limit blocks the rest. Bring the node back rather than loosening the rule.
+      command: ssh depot-wk-2 'systemctl status kubelet --no-pager | head -5'
+      cost: 2
+    - title: Restarting Pods
+      command: kubectl -n depot-ops describe pod -l app=depot-portal | grep -A3 -i liveness
+      body: The portal needs about 8 seconds to warm up, but the liveness probe gives up after a single failed check 2 seconds in.
+      cost: 2
+    - title: No endpoints
+      command: kubectl -n depot-ops get svc depot-portal -o jsonpath='{.spec.selector}{"\n"}'; kubectl -n depot-ops get pods --show-labels
+      body: Compare the Service's selector with the Pods' labels.
+      cost: 1
+  misconceptions:
+    - id: loosen-spread
+      description: Switches the spread rule to ScheduleAnyway so the Pods pile up on depot-wk-1.
+      feedback: The rule protects the portal from a single node failure. Recover depot-wk-2 instead of weakening it.
+      expectFail: [node-recovered, guards-kept]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n depot-ops patch deploy depot-portal --type=json -p '[
+            {"op":"replace","path":"/spec/template/spec/topologySpreadConstraints/0/whenUnsatisfiable","value":"ScheduleAnyway"},
+            {"op":"add","path":"/spec/template/spec/containers/0/startupProbe","value":{"httpGet":{"path":"/","port":80},"periodSeconds":2,"failureThreshold":30}}]'
+          kubectl -n depot-ops patch svc depot-portal -p '{"spec":{"selector":{"app":"depot-portal"}}}'
+          kubectl -n depot-ops rollout status deploy/depot-portal --timeout=240s
+    - id: drop-liveness
+      description: Deletes the liveness probe to stop the restarts.
+      feedback: Without liveness a hung portal is never restarted. Give it time to start (startupProbe or initialDelaySeconds) instead.
+      expectFail: [guards-kept]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 400
+        run: |
+          kubectl config use-context qm-depot
+          ssh depot-wk-2 'sudo systemctl enable --now kubelet'
+          kubectl wait node/depot-wk-2 --for=condition=Ready --timeout=180s
+          kubectl -n depot-ops patch deploy depot-portal --type=json -p '[{"op":"remove","path":"/spec/template/spec/containers/0/livenessProbe"}]'
+          kubectl -n depot-ops patch svc depot-portal -p '{"spec":{"selector":{"app":"depot-portal"}}}'
+          kubectl -n depot-ops rollout status deploy/depot-portal --timeout=200s
+    - id: start-without-enable
+      description: Starts the kubelet on depot-wk-2 but leaves it disabled.
+      feedback: The node recovers now but goes NotReady again after the next reboot. Use `systemctl enable --now`.
+      expectFail: [node-recovered]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 400
+        run: |
+          kubectl config use-context qm-depot
+          ssh depot-wk-2 'sudo systemctl start kubelet'
+          kubectl wait node/depot-wk-2 --for=condition=Ready --timeout=180s
+          kubectl -n depot-ops patch deploy depot-portal -p '{"spec":{"template":{"spec":{"containers":[{"name":"portal","startupProbe":{"httpGet":{"path":"/","port":80},"periodSeconds":2,"failureThreshold":30}}]}}}}'
+          kubectl -n depot-ops patch svc depot-portal -p '{"spec":{"selector":{"app":"depot-portal"}}}'
+          kubectl -n depot-ops rollout status deploy/depot-portal --timeout=200s
+    - id: service-only
+      description: Fixes only the Service selector.
+      feedback: Endpoints come only from ready Pods; with the node down and the probe killing containers, there are not enough of them.
+      expectFail: [node-recovered, portal-ready]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n depot-ops patch svc depot-portal -p '{"spec":{"selector":{"app":"depot-portal"}}}'
+          sleep 30
+  solution:
+    explanation: |
+      Three faults overlapped. depot-wk-2's kubelet was stopped and disabled,
+      so the node was NotReady; the hard hostname spread rule still counts it,
+      which blocked two of the three portal Pods. The liveness probe gave up
+      after one failed check two seconds in, killing every container during
+      its 8-second warm-up. And the Service selected a misspelt label. Enabling
+      the kubelet, adding a startup probe (or a longer liveness threshold) and
+      correcting the selector restores three ready replicas behind the Service.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 480
+        run: |
+          kubectl config use-context qm-depot
+          ssh depot-wk-2 'sudo systemctl enable --now kubelet'
+          kubectl wait node/depot-wk-2 --for=condition=Ready --timeout=180s
+          kubectl -n depot-ops patch deploy depot-portal -p '{"spec":{"template":{"spec":{"containers":[{"name":"portal","startupProbe":{"httpGet":{"path":"/","port":80},"periodSeconds":2,"failureThreshold":30}}]}}}}'
+          kubectl -n depot-ops patch svc depot-portal -p '{"spec":{"selector":{"app":"depot-portal"}}}'
+          kubectl -n depot-ops rollout status deploy/depot-portal --timeout=240s
+    alternatives:
+      - id: tune-liveness
+        description: Give the liveness probe an initial delay and a higher failure threshold instead of a startup probe.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 480
+            run: |
+              kubectl config use-context qm-depot
+              ssh depot-wk-2 'sudo systemctl enable kubelet && sudo systemctl start kubelet'
+              kubectl wait node/depot-wk-2 --for=condition=Ready --timeout=180s
+              kubectl -n depot-ops patch deploy depot-portal -p '{"spec":{"template":{"spec":{"containers":[{"name":"portal","livenessProbe":{"initialDelaySeconds":15,"periodSeconds":5,"failureThreshold":3}}]}}}}'
+              kubectl -n depot-ops get svc depot-portal -o yaml | yq '.spec.selector.app = "depot-portal"' | kubectl apply -f -
+              kubectl -n depot-ops rollout status deploy/depot-portal --timeout=240s

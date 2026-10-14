@@ -1,0 +1,208 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: csi-driver-inventory
+  title: Identify CSI drivers and the volumes that use them
+  domain: kubernetes
+  frameworks: [cka:storage, cka:cluster-architecture]
+  difficulty: easy
+  estimatedMinutes: 10
+  tags: [csi, storageclass, pv, inventory]
+  version: 1
+spec:
+  description: |
+    Before a storage migration, the archive team wants an inventory of the
+    CSI drivers registered in `qm-archive` and what depends on them.
+
+    Use context `qm-archive`:
+
+    ```bash
+    kubectl config use-context qm-archive
+    ```
+
+    Write `/home/learner/reports/csi-inventory.txt` with:
+
+    - one line per registered CSI driver, sorted by driver name:
+      `<driver> <StorageClasses that use it, comma-separated and sorted, or ->`
+    - a last line: `hostpath-pvs <names of the PersistentVolumes provisioned by
+      the driver hostpath.csi.k8s.io, comma-separated and sorted>`
+
+    Use single spaces.
+  objectives:
+    - List CSIDriver objects
+    - Map StorageClasses to provisioners
+    - Find PersistentVolumes by CSI driver
+  params:
+    pv:
+      type: choice
+      values: [scan-batch, manifest-shard, waybill-scan]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-archive
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-archive
+          nodes:
+            - {name: archive-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: archive-wk-1, role: worker}
+  setup:
+    - on: qm-archive
+      apply: |
+        apiVersion: storage.k8s.io/v1
+        kind: CSIDriver
+        metadata: {name: hostpath.csi.k8s.io}
+        spec: {attachRequired: false, podInfoOnMount: true, volumeLifecycleModes: [Persistent]}
+        ---
+        apiVersion: storage.k8s.io/v1
+        kind: CSIDriver
+        metadata: {name: nfs.csi.k8s.io}
+        spec: {attachRequired: false}
+        ---
+        apiVersion: storage.k8s.io/v1
+        kind: CSIDriver
+        metadata: {name: smb.csi.k8s.io}
+        spec: {attachRequired: false}
+        ---
+        apiVersion: storage.k8s.io/v1
+        kind: StorageClass
+        metadata: {name: archive-fast}
+        provisioner: hostpath.csi.k8s.io
+        ---
+        apiVersion: storage.k8s.io/v1
+        kind: StorageClass
+        metadata: {name: archive-scratch}
+        provisioner: hostpath.csi.k8s.io
+        ---
+        apiVersion: storage.k8s.io/v1
+        kind: StorageClass
+        metadata: {name: archive-shared}
+        provisioner: nfs.csi.k8s.io
+        ---
+        apiVersion: storage.k8s.io/v1
+        kind: StorageClass
+        metadata: {name: legacy-manual}
+        provisioner: kubernetes.io/no-provisioner
+    - on: qm-archive
+      run: |
+        set -e
+        mk() {  # mk <name> <driver> <class>
+          cat <<YAML | kubectl apply -f -
+        apiVersion: v1
+        kind: PersistentVolume
+        metadata: {name: $1}
+        spec:
+          capacity: {storage: 1Gi}
+          accessModes: [ReadWriteOnce]
+          persistentVolumeReclaimPolicy: Retain
+          storageClassName: $3
+          csi: {driver: $2, volumeHandle: $1-handle}
+        YAML
+        }
+        mk {{pv}}-01 hostpath.csi.k8s.io archive-fast
+        mk {{pv}}-02 hostpath.csi.k8s.io archive-scratch
+        mk {{pv}}-03 nfs.csi.k8s.io archive-shared
+        mk ledger-shard-07 hostpath.csi.k8s.io archive-fast
+        mk shared-forms-02 nfs.csi.k8s.io archive-shared
+        cat <<'YAML' | kubectl apply -f -
+        apiVersion: v1
+        kind: PersistentVolume
+        metadata: {name: legacy-hostdir}
+        spec:
+          capacity: {storage: 1Gi}
+          accessModes: [ReadWriteOnce]
+          storageClassName: legacy-manual
+          hostPath: {path: /srv/legacy}
+        YAML
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/reports
+  teardown:
+    - on: qm-archive
+      run: kubectl delete pv {{pv}}-01 {{pv}}-02 {{pv}}-03 ledger-shard-07 shared-forms-02 legacy-hostdir --ignore-not-found --wait=false
+  checks:
+    - id: context
+      description: Terminal is using context qm-archive
+      type: k8s-context
+      on: workstation
+      skills: [k8s.cli.contexts]
+      weight: 0.5
+      expect: {match: exact, value: qm-archive}
+    - id: drivers
+      description: The driver lines list each CSI driver and its StorageClasses
+      type: shell
+      on: workstation
+      skills: [k8s.storage.csi-drivers]
+      weight: 2
+      command: head -n 3 /home/learner/reports/csi-inventory.txt 2>/dev/null | tr -d '\r' | sed 's/[[:space:]]*$//'
+      expect: {match: exact, value: "hostpath.csi.k8s.io archive-fast,archive-scratch\nnfs.csi.k8s.io archive-shared\nsmb.csi.k8s.io -"}
+    - id: hostpath-pvs
+      description: The last line lists the PersistentVolumes of the hostpath driver
+      type: shell
+      on: workstation
+      skills: [k8s.storage.csi-drivers, k8s.cli.output-formatting]
+      weight: 2
+      command: tail -n 1 /home/learner/reports/csi-inventory.txt 2>/dev/null | tr -d '\r' | sed 's/[[:space:]]*$//'
+      expect: {match: exact, value: "hostpath-pvs ledger-shard-07,{{pv}}-01,{{pv}}-02"}
+  hints:
+    - title: Switch context
+      body: The archive cluster is qm-archive.
+      command: kubectl config use-context qm-archive
+      cost: 0
+    - title: Registered drivers
+      command: kubectl get csidrivers
+      body: Each CSI driver registers a CSIDriver object.
+      cost: 1
+    - title: Who uses them
+      command: |
+        kubectl get storageclass -o custom-columns=NAME:.metadata.name,PROVISIONER:.provisioner
+        kubectl get pv -o custom-columns=NAME:.metadata.name,DRIVER:.spec.csi.driver
+      body: A StorageClass names its provisioner; a CSI PersistentVolume names its driver in spec.csi.driver.
+      cost: 2
+  misconceptions:
+    - id: by-class-not-driver
+      description: Lists the PVs of StorageClass archive-fast only.
+      feedback: A driver can back several StorageClasses; select PVs by spec.csi.driver.
+      expectFail: [hostpath-pvs]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-archive
+          {
+            echo "hostpath.csi.k8s.io archive-fast,archive-scratch"; echo "nfs.csi.k8s.io archive-shared"; echo "smb.csi.k8s.io -"
+            echo "hostpath-pvs $(kubectl get pv -o json | jq -r '[.items[] | select(.spec.storageClassName == "archive-fast") | .metadata.name] | sort | join(",")')"
+          } > ~/reports/csi-inventory.txt
+    - id: unused-driver-skipped
+      description: Leaves out the driver that no StorageClass uses.
+      feedback: The inventory covers every registered driver; mark unused ones with -.
+      expectFail: [drivers]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-archive
+          {
+            echo "hostpath.csi.k8s.io archive-fast,archive-scratch"; echo "nfs.csi.k8s.io archive-shared"
+            echo "hostpath-pvs $(kubectl get pv -o json | jq -r '[.items[] | select(.spec.csi.driver == "hostpath.csi.k8s.io") | .metadata.name] | sort | join(",")')"
+          } > ~/reports/csi-inventory.txt
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-archive
+          sc=$(kubectl get storageclass -o json)
+          {
+            for d in $(kubectl get csidrivers -o jsonpath='{.items[*].metadata.name}' | tr ' ' '\n' | sort); do
+              c=$(echo "$sc" | jq -r --arg d "$d" '[.items[] | select(.provisioner == $d) | .metadata.name] | sort | join(",")')
+              echo "$d ${c:--}"
+            done
+            echo "hostpath-pvs $(kubectl get pv -o json | jq -r '[.items[] | select(.spec.csi.driver == "hostpath.csi.k8s.io") | .metadata.name] | sort | join(",")')"
+          } > ~/reports/csi-inventory.txt

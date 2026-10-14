@@ -1,0 +1,224 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: tracking-ingress-two-paths
+  title: Route two paths of one host with an Ingress
+  domain: kubernetes
+  frameworks: [cka:services-networking, ckad:services-networking]
+  difficulty: easy
+  estimatedMinutes: 12
+  tags: [ingress, routing, services]
+  version: 1
+spec:
+  description: |
+    Customers and partners should reach shipment tracking under one host
+    name, `track.quillmoor.example`.
+
+    Use context `qm-tracking`:
+
+    ```bash
+    kubectl config use-context qm-tracking
+    ```
+
+    In namespace **`parcel-tracking`**, create an Ingress **`{{ingress}}`**
+    for the cluster's Ingress controller (IngressClass `traefik`) so that
+    requests to host **`track.quillmoor.example`**:
+
+    - with a path starting with **`/parcels`** go to Service `parcel-api`
+      (port 80);
+    - with a path starting with **`/eta`** go to Service `eta-predictor`
+      (port 8080).
+
+    The controller listens on port **30080** of every node; test with
+    `curl -H 'Host: track.quillmoor.example' http://tracking-wk-1:30080/parcels/`.
+  objectives:
+    - Write an Ingress with one host and two path rules
+    - Choose the path type and backend ports
+  params:
+    ingress:
+      type: choice
+      values: [tracking-public, track-site, tracking-web]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-tracking
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-tracking
+          nodes:
+            - {name: tracking-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: tracking-wk-1, role: worker}
+            - {name: tracking-wk-2, role: worker}
+  setup:
+    - on: qm-tracking/tracking-cp-1
+      timeoutSec: 400
+      run: /opt/cloudtrain/bin/addons-install traefik --wait
+    - on: qm-tracking
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: parcel-tracking}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: parcel-api, namespace: parcel-tracking}
+        spec:
+          replicas: 2
+          selector: {matchLabels: {app: parcel-api}}
+          template:
+            metadata: {labels: {app: parcel-api}}
+            spec:
+              containers:
+                - name: api
+                  image: busybox:1.37
+                  command: ["sh", "-c", "mkdir -p /www/parcels && echo parcel-api > /www/parcels/index.html && exec httpd -f -p 80 -h /www"]
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata: {name: parcel-api, namespace: parcel-tracking}
+        spec:
+          selector: {app: parcel-api}
+          ports: [{port: 80}]
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: eta-predictor, namespace: parcel-tracking}
+        spec:
+          replicas: 1
+          selector: {matchLabels: {app: eta-predictor}}
+          template:
+            metadata: {labels: {app: eta-predictor}}
+            spec:
+              containers:
+                - name: model
+                  image: busybox:1.37
+                  command: ["sh", "-c", "mkdir -p /www/eta && echo eta-predictor > /www/eta/index.html && exec httpd -f -p 8080 -h /www"]
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata: {name: eta-predictor, namespace: parcel-tracking}
+        spec:
+          selector: {app: eta-predictor}
+          ports: [{port: 8080}]
+    - on: qm-tracking
+      timeoutSec: 150
+      run: |
+        kubectl -n parcel-tracking rollout status deploy/parcel-api --timeout=120s
+        kubectl -n parcel-tracking rollout status deploy/eta-predictor --timeout=120s
+  teardown:
+    - on: qm-tracking
+      run: kubectl delete namespace parcel-tracking --ignore-not-found --wait=false
+  checks:
+    - id: context
+      description: Terminal is using context qm-tracking
+      type: k8s-context
+      on: workstation
+      skills: [k8s.cli.contexts]
+      weight: 0.5
+      expect: {match: exact, value: qm-tracking}
+    - id: ingress-spec
+      description: Ingress {{ingress}} uses class traefik and host track.quillmoor.example
+      type: k8s-query
+      skills: [k8s.networking.ingress-gateway]
+      query: {cluster: qm-tracking, resource: ingress, name: "{{ingress}}", namespace: parcel-tracking, jsonpath: '{.spec.ingressClassName} {.spec.rules[0].host}'}
+      expect: {match: exact, value: traefik track.quillmoor.example}
+    - id: parcels-routed
+      description: /parcels/ on the tracking host reaches parcel-api
+      type: shell
+      on: workstation
+      skills: [k8s.networking.ingress-gateway]
+      weight: 2
+      timeoutSec: 20
+      command: |
+        curl -s -m 5 -H 'Host: track.quillmoor.example' http://tracking-wk-1:30080/parcels/ || echo unreachable
+      expect: {match: exact, value: parcel-api}
+    - id: eta-routed
+      description: /eta/ on the tracking host reaches eta-predictor
+      type: shell
+      on: workstation
+      skills: [k8s.networking.ingress-gateway]
+      weight: 2
+      timeoutSec: 20
+      command: |
+        curl -s -m 5 -H 'Host: track.quillmoor.example' http://tracking-wk-2:30080/eta/ || echo unreachable
+      expect: {match: exact, value: eta-predictor}
+    - id: host-only
+      description: Other host names are not routed to the tracking services
+      type: shell
+      on: workstation
+      skills: [k8s.networking.ingress-gateway]
+      weight: 0.5
+      timeoutSec: 20
+      command: |
+        curl -s -o /dev/null -w '%{http_code}' -m 5 -H 'Host: other.quillmoor.example' http://tracking-wk-1:30080/parcels/
+      expect: {match: exact, value: "404"}
+  hints:
+    - title: Switch context
+      body: Tracking runs in qm-tracking.
+      command: kubectl config use-context qm-tracking
+      cost: 0
+    - title: One command
+      body: "`kubectl create ingress` takes one --rule per path: host/path*=service:port (the * makes it a Prefix path)."
+      command: kubectl -n parcel-tracking create ingress {{ingress}} --class=traefik --rule="track.quillmoor.example/parcels*=parcel-api:80" --rule="track.quillmoor.example/eta*=eta-predictor:8080"
+      cost: 3
+  misconceptions:
+    - id: no-host
+      description: Leaves out the host, so every name is routed.
+      feedback: Without host the rules apply to all host names; partners' other domains would hit tracking.
+      expectFail: [ingress-spec, host-only]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-tracking
+          kubectl -n parcel-tracking create ingress {{ingress}} --class=traefik --rule="/parcels*=parcel-api:80" --rule="/eta*=eta-predictor:8080"
+          sleep 5
+    - id: wrong-port
+      description: Sends /eta to port 80 of eta-predictor.
+      feedback: The backend port is the Service port, 8080 here.
+      expectFail: [eta-routed]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-tracking
+          kubectl -n parcel-tracking create ingress {{ingress}} --class=traefik --rule="track.quillmoor.example/parcels*=parcel-api:80" --rule="track.quillmoor.example/eta*=eta-predictor:80"
+          sleep 5
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-tracking
+          kubectl -n parcel-tracking create ingress {{ingress}} --class=traefik \
+            --rule="track.quillmoor.example/parcels*=parcel-api:80" --rule="track.quillmoor.example/eta*=eta-predictor:8080"
+          sleep 5
+    alternatives:
+      - id: manifest
+        description: An Ingress manifest with pathType Prefix.
+        steps:
+          - on: workstation
+            as: learner
+            run: |
+              kubectl config use-context qm-tracking
+              kubectl apply -f - <<'YAML'
+              apiVersion: networking.k8s.io/v1
+              kind: Ingress
+              metadata: {name: {{ingress}}, namespace: parcel-tracking}
+              spec:
+                ingressClassName: traefik
+                rules:
+                  - host: track.quillmoor.example
+                    http:
+                      paths:
+                        - {path: /parcels, pathType: Prefix, backend: {service: {name: parcel-api, port: {number: 80}}}}
+                        - {path: /eta, pathType: Prefix, backend: {service: {name: eta-predictor, port: {number: 8080}}}}
+              YAML
+              sleep 5

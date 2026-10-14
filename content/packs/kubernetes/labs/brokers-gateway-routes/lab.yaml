@@ -1,0 +1,230 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: brokers-gateway-routes
+  title: Route the brokers' portal with Gateway API
+  domain: kubernetes
+  frameworks: [cka:services-networking]
+  difficulty: medium
+  estimatedMinutes: 18
+  tags: [gateway-api, httproute, traffic-split]
+  version: 1
+spec:
+  description: |
+    Customs brokers get a new portal host, `brokers.quillmoor.example`, served
+    through Gateway API. A new declarations service version goes live as a
+    10 % canary.
+
+    Use context `qm-customs`:
+
+    ```bash
+    kubectl config use-context qm-customs
+    ```
+
+    In namespace **`brokers-portal`**:
+
+    1. Create a Gateway **`brokers`** on the cluster's GatewayClass
+       **`traefik`** with an HTTP listener on port **80** for host
+       `brokers.quillmoor.example`.
+    2. Create HTTPRoutes attached to it so that:
+       - path prefix **`/declarations`** goes to Service `declarations-v1`
+         with weight **90** and to `declarations-v2` with weight **10**
+         (both port 80);
+       - path prefix **`/tariffs`** goes to Service `tariffs` (port 80).
+
+    The Gateway is served on port **30080** of every node; test with
+    `curl -H 'Host: brokers.quillmoor.example' http://customs-wk-1:30080/tariffs/`.
+  objectives:
+    - Create a Gateway on an existing GatewayClass
+    - Attach HTTPRoutes with path matches and weighted backends
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-customs
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-customs
+          nodes:
+            - {name: customs-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: customs-wk-1, role: worker}
+  setup:
+    - on: qm-customs/customs-cp-1
+      timeoutSec: 400
+      run: /opt/cloudtrain/bin/addons-install gateway --wait
+    - on: qm-customs
+      timeoutSec: 200
+      run: |
+        set -e
+        kubectl create namespace brokers-portal --dry-run=client -o yaml | kubectl apply -f -
+        for app in declarations-v1 declarations-v2 tariffs; do
+          path=declarations; [ $app = tariffs ] && path=tariffs
+          kubectl -n brokers-portal create deployment $app --image=busybox:1.37 --dry-run=client -o json -- \
+            sh -c "mkdir -p /www/$path && echo $app > /www/$path/index.html && exec httpd -f -p 80 -h /www" | kubectl apply -f -
+          kubectl -n brokers-portal create service clusterip $app --tcp=80:80 --dry-run=client -o yaml | kubectl apply -f -
+        done
+        for app in declarations-v1 declarations-v2 tariffs; do kubectl -n brokers-portal rollout status deploy/$app --timeout=150s; done
+  teardown:
+    - on: qm-customs
+      run: kubectl delete namespace brokers-portal --ignore-not-found --wait=false
+  checks:
+    - id: context
+      description: Terminal is using context qm-customs
+      type: k8s-context
+      on: workstation
+      skills: [k8s.cli.contexts]
+      weight: 0.5
+      expect: {match: exact, value: qm-customs}
+    - id: gateway
+      description: Gateway brokers on class traefik is programmed with an HTTP listener on 80 for the brokers host
+      type: shell
+      on: qm-customs
+      skills: [k8s.networking.gateway-api]
+      command: |
+        kubectl -n brokers-portal get gateway brokers -o json | jq -r '"\(.spec.gatewayClassName) \([.spec.listeners[] | "\(.protocol):\(.port):\(.hostname // "*")"] | join(",")) \([.status.conditions[]? | select(.type == "Programmed") | .status] | join(""))"'
+      expect: {match: exact, value: traefik HTTP:80:brokers.quillmoor.example True}
+    - id: weights
+      description: /declarations is split 90/10 between declarations-v1 and declarations-v2
+      type: shell
+      on: qm-customs
+      skills: [k8s.networking.gateway-api]
+      weight: 2
+      command: |
+        kubectl -n brokers-portal get httproute -o json | jq -r '[.items[] | select(any(.spec.parentRefs[]; .name == "brokers")) | .spec.rules[]
+          | select(any(.matches[]?; .path.value == "/declarations")) | .backendRefs[] | "\(.name):\(.weight // 1)"] | sort | join(",")'
+      expect: {match: exact, value: "declarations-v1:90,declarations-v2:10"}
+    - id: tariffs-routed
+      description: /tariffs/ on the brokers host reaches the tariffs Service through the Gateway
+      type: shell
+      on: workstation
+      skills: [k8s.networking.gateway-api]
+      weight: 2
+      timeoutSec: 20
+      command: |
+        curl -s -m 5 -H 'Host: brokers.quillmoor.example' http://customs-wk-1:30080/tariffs/ || echo unreachable
+      expect: {match: exact, value: tariffs}
+    - id: declarations-routed
+      description: /declarations/ answers from one of the declarations versions
+      type: shell
+      on: workstation
+      skills: [k8s.networking.gateway-api]
+      timeoutSec: 30
+      command: |
+        for i in 1 2 3 4 5; do curl -s -m 5 -H 'Host: brokers.quillmoor.example' http://customs-wk-1:30080/declarations/; done | grep -c '^declarations-v[12]$'
+      expect: {match: exact, value: "5"}
+  hints:
+    - title: Switch context
+      body: The customs gateway cluster is qm-customs.
+      command: kubectl config use-context qm-customs
+      cost: 0
+    - title: What exists
+      command: kubectl get gatewayclass; kubectl explain httproute.spec.rules.backendRefs
+      cost: 1
+      body: The GatewayClass is installed; you create the Gateway and the routes.
+    - title: Weighted backends
+      body: |
+        A rule's `backendRefs` list can hold several Services, each with a
+        `weight`; traffic is split in proportion.
+        ```yaml
+        rules:
+          - matches: [{path: {type: PathPrefix, value: /declarations}}]
+            backendRefs:
+              - {name: declarations-v1, port: 80, weight: 90}
+              - {name: declarations-v2, port: 80, weight: 10}
+        ```
+      cost: 3
+  misconceptions:
+    - id: two-rules-no-weights
+      description: Writes a separate path rule per version instead of weighting one rule.
+      feedback: Two rules with the same match do not split traffic; one wins. Put both backends in one rule with weights.
+      expectFail: [weights]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-customs
+          kubectl apply -f - <<'YAML'
+          apiVersion: gateway.networking.k8s.io/v1
+          kind: Gateway
+          metadata: {name: brokers, namespace: brokers-portal}
+          spec:
+            gatewayClassName: traefik
+            listeners: [{name: http, protocol: HTTP, port: 80, hostname: brokers.quillmoor.example}]
+          ---
+          apiVersion: gateway.networking.k8s.io/v1
+          kind: HTTPRoute
+          metadata: {name: brokers, namespace: brokers-portal}
+          spec:
+            parentRefs: [{name: brokers}]
+            hostnames: [brokers.quillmoor.example]
+            rules:
+              - matches: [{path: {type: PathPrefix, value: /declarations}}]
+                backendRefs: [{name: declarations-v1, port: 80}]
+              - matches: [{path: {type: PathPrefix, value: /tariffs}}]
+                backendRefs: [{name: tariffs, port: 80}]
+          YAML
+          sleep 10
+    - id: wrong-class
+      description: Points the Gateway at a GatewayClass that does not exist.
+      feedback: Use the installed GatewayClass (kubectl get gatewayclass); otherwise nothing programs the Gateway.
+      expectFail: [gateway, tariffs-routed]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-customs
+          kubectl apply -f - <<'YAML'
+          apiVersion: gateway.networking.k8s.io/v1
+          kind: Gateway
+          metadata: {name: brokers, namespace: brokers-portal}
+          spec:
+            gatewayClassName: nginx
+            listeners: [{name: http, protocol: HTTP, port: 80, hostname: brokers.quillmoor.example}]
+          ---
+          apiVersion: gateway.networking.k8s.io/v1
+          kind: HTTPRoute
+          metadata: {name: brokers, namespace: brokers-portal}
+          spec:
+            parentRefs: [{name: brokers}]
+            hostnames: [brokers.quillmoor.example]
+            rules:
+              - matches: [{path: {type: PathPrefix, value: /declarations}}]
+                backendRefs: [{name: declarations-v1, port: 80, weight: 90}, {name: declarations-v2, port: 80, weight: 10}]
+              - matches: [{path: {type: PathPrefix, value: /tariffs}}]
+                backendRefs: [{name: tariffs, port: 80}]
+          YAML
+          sleep 10
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-customs
+          kubectl apply -f - <<'YAML'
+          apiVersion: gateway.networking.k8s.io/v1
+          kind: Gateway
+          metadata: {name: brokers, namespace: brokers-portal}
+          spec:
+            gatewayClassName: traefik
+            listeners: [{name: http, protocol: HTTP, port: 80, hostname: brokers.quillmoor.example}]
+          ---
+          apiVersion: gateway.networking.k8s.io/v1
+          kind: HTTPRoute
+          metadata: {name: brokers, namespace: brokers-portal}
+          spec:
+            parentRefs: [{name: brokers}]
+            hostnames: [brokers.quillmoor.example]
+            rules:
+              - matches: [{path: {type: PathPrefix, value: /declarations}}]
+                backendRefs: [{name: declarations-v1, port: 80, weight: 90}, {name: declarations-v2, port: 80, weight: 10}]
+              - matches: [{path: {type: PathPrefix, value: /tariffs}}]
+                backendRefs: [{name: tariffs, port: 80}]
+          YAML
+          kubectl -n brokers-portal wait gateway/brokers --for=condition=Programmed --timeout=60s
+          sleep 5

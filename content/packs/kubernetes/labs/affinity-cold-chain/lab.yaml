@@ -1,0 +1,281 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: affinity-cold-chain
+  title: Place cold-chain workloads with node affinity
+  domain: kubernetes
+  frameworks: [cka:workloads-scheduling]
+  difficulty: medium
+  estimatedMinutes: 12
+  tags: [scheduling, node-affinity, labels]
+  version: 1
+spec:
+  description: |
+    Quillmoor's cold-chain monitor reads temperature probes that are wired
+    only to the refrigerated hall's machines. Its Pods currently land
+    anywhere.
+
+    Use context `qm-fleet`:
+
+    ```bash
+    kubectl config use-context qm-fleet
+    ```
+
+    The workers carry these labels:
+
+    - `quillmoor.example/zone`: `refrigerated` or `ambient`
+    - `quillmoor.example/gpu-free` (present on machines without a GPU
+      workload)
+
+    Change Deployment **`cold-chain-monitor`** in namespace `cold-chain`
+    using **node affinity**:
+
+    1. Its Pods **must** run only on nodes whose `quillmoor.example/zone` is
+       `refrigerated`.
+    2. Among those, the scheduler should **prefer** nodes that have the
+       `quillmoor.example/gpu-free` label; this is a preference only, never a
+       requirement.
+
+    Then confirm that all {{replicas}} replicas run in the refrigerated zone.
+    Do not change node labels or taints.
+  objectives:
+    - Write required node affinity with matchExpressions
+    - Add a weighted preferred node affinity term
+    - Verify Pod placement against node labels
+  params:
+    replicas:
+      type: int
+      min: 2
+      max: 3
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-fleet
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-fleet
+          nodes:
+            - {name: fleet-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: fleet-wk-1, role: worker, labels: {quillmoor.example/zone: refrigerated, quillmoor.example/gpu-free: "true"}}
+            - {name: fleet-wk-2, role: worker, labels: {quillmoor.example/zone: refrigerated}}
+            - {name: fleet-wk-3, role: worker, labels: {quillmoor.example/zone: ambient, quillmoor.example/gpu-free: "true"}}
+  setup:
+    - on: qm-fleet
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: cold-chain}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: cold-chain-monitor, namespace: cold-chain}
+        spec:
+          replicas: {{replicas}}
+          selector: {matchLabels: {app: cold-chain-monitor}}
+          template:
+            metadata: {labels: {app: cold-chain-monitor}}
+            spec:
+              containers:
+                - name: monitor
+                  image: busybox:1.37
+                  command: ["sh", "-c", "while true; do echo probe-read; sleep 20; done"]
+    - on: qm-fleet
+      timeoutSec: 180
+      run: kubectl -n cold-chain rollout status deploy/cold-chain-monitor --timeout=150s
+  teardown:
+    - on: qm-fleet
+      run: kubectl delete namespace cold-chain --ignore-not-found --wait=false
+  checks:
+    - id: context
+      description: Terminal is using context qm-fleet
+      type: k8s-context
+      on: workstation
+      skills: [k8s.cli.contexts]
+      weight: 0.5
+      expect: {match: exact, value: qm-fleet}
+    - id: required-zone
+      description: Required node affinity selects exactly zone In [refrigerated]
+      type: shell
+      on: qm-fleet
+      skills: [k8s.scheduling.node-affinity]
+      weight: 2
+      command: |
+        kubectl -n cold-chain get deployment cold-chain-monitor -o json | jq -c '
+          [.spec.template.spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[]?
+           | [.matchExpressions[]? | {key, operator, values: ((.values // []) | sort)}]]'
+      expect: {match: exact, value: '[[{"key":"quillmoor.example/zone","operator":"In","values":["refrigerated"]}]]'}
+    - id: preferred-gpu-free
+      description: A preferred node affinity term favours nodes with the gpu-free label
+      type: shell
+      on: qm-fleet
+      skills: [k8s.scheduling.node-affinity]
+      weight: 2
+      command: |
+        kubectl -n cold-chain get deployment cold-chain-monitor -o json | jq -r '
+          [.spec.template.spec.affinity.nodeAffinity.preferredDuringSchedulingIgnoredDuringExecution[]?
+           | select(.weight > 0) | .preference.matchExpressions[]?
+           | select(.key == "quillmoor.example/gpu-free" and (.operator == "Exists" or (.operator == "In" and (.values | index("true")))))]
+          | if length > 0 then "preferred" else "missing" end'
+      expect: {match: exact, value: preferred}
+    - id: no-node-selector
+      description: Placement uses node affinity, not a nodeSelector
+      type: k8s-query
+      skills: [k8s.scheduling.node-affinity]
+      weight: 0.5
+      query: {cluster: qm-fleet, resource: deployment, name: cold-chain-monitor, namespace: cold-chain, jsonpath: '{.spec.template.spec.nodeSelector}'}
+      expect: {match: exact, value: ""}
+    - id: placed-refrigerated
+      description: All {{replicas}} current replicas are ready on refrigerated nodes
+      type: shell
+      on: qm-fleet
+      skills: [k8s.scheduling.node-affinity]
+      weight: 2
+      command: |
+        kubectl -n cold-chain rollout status deploy/cold-chain-monitor --timeout=5s >/dev/null 2>&1 || { echo "not rolled out"; exit 0; }
+        cold=$(kubectl get nodes -l quillmoor.example/zone=refrigerated -o jsonpath='{.items[*].metadata.name}')
+        kubectl -n cold-chain get pods -l app=cold-chain-monitor -o json | jq -r --arg cold " $cold " '
+          [.items[] | select(.metadata.deletionTimestamp == null)
+           | select(any(.status.conditions[]?; .type == "Ready" and .status == "True"))
+           | .spec.nodeName as $n | ($cold | contains(" " + $n + " "))] | "\(length) \(all)"'
+      expect: {match: exact, value: "{{replicas}} true"}
+    - id: nodes-unchanged
+      description: Node zone and gpu-free labels are unchanged
+      type: shell
+      on: qm-fleet
+      skills: [k8s.cli.scoped-changes]
+      weight: 0.5
+      command: kubectl get nodes -L quillmoor.example/zone,quillmoor.example/gpu-free --no-headers | awk '$1 ~ /wk/ {print $1"="$6"/"$7}' | paste -sd' ' -
+      expect: {match: exact, value: "fleet-wk-1=refrigerated/true fleet-wk-2=refrigerated/ fleet-wk-3=ambient/true"}
+  hints:
+    - title: Switch context
+      body: The fleet cluster is qm-fleet.
+      command: kubectl config use-context qm-fleet
+      cost: 0
+    - title: See the labels
+      command: kubectl get nodes -L quillmoor.example/zone,quillmoor.example/gpu-free
+      body: "-L adds a column per label key."
+      cost: 0
+    - title: Two kinds of affinity
+      body: |
+        `requiredDuringSchedulingIgnoredDuringExecution` holds
+        `nodeSelectorTerms` that must match;
+        `preferredDuringSchedulingIgnoredDuringExecution` holds weighted
+        `preference` terms the scheduler scores.
+      command: kubectl explain deployment.spec.template.spec.affinity.nodeAffinity
+      cost: 1
+    - title: The affinity block
+      body: |
+        ```yaml
+        affinity:
+          nodeAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              nodeSelectorTerms:
+                - matchExpressions:
+                    - {key: quillmoor.example/zone, operator: In, values: [refrigerated]}
+            preferredDuringSchedulingIgnoredDuringExecution:
+              - weight: 50
+                preference:
+                  matchExpressions:
+                    - {key: quillmoor.example/gpu-free, operator: Exists}
+        ```
+      cost: 3
+  misconceptions:
+    - id: zone-only-preferred
+      description: Makes the zone a preference instead of a requirement.
+      feedback: A preference can be ignored when the scheduler finds a better-scoring node, so Pods could still land in the ambient zone. Use required affinity for the zone.
+      expectFail: [required-zone]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 200
+        run: |
+          kubectl config use-context qm-fleet
+          kubectl -n cold-chain patch deployment cold-chain-monitor -p '{"spec":{"template":{"spec":{"affinity":{"nodeAffinity":{
+            "preferredDuringSchedulingIgnoredDuringExecution":[
+              {"weight":100,"preference":{"matchExpressions":[{"key":"quillmoor.example/zone","operator":"In","values":["refrigerated"]}]}},
+              {"weight":50,"preference":{"matchExpressions":[{"key":"quillmoor.example/gpu-free","operator":"Exists"}]}}]}}}}}}'
+          kubectl -n cold-chain rollout status deploy/cold-chain-monitor --timeout=150s
+    - id: gpu-free-required
+      description: Puts the gpu-free label into the required term as well.
+      feedback: Two expressions in one term must both match, so fleet-wk-2 is excluded although gpu-free was only a preference.
+      expectFail: [required-zone, preferred-gpu-free]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 200
+        run: |
+          kubectl config use-context qm-fleet
+          kubectl -n cold-chain patch deployment cold-chain-monitor -p '{"spec":{"template":{"spec":{"affinity":{"nodeAffinity":{
+            "requiredDuringSchedulingIgnoredDuringExecution":{"nodeSelectorTerms":[{"matchExpressions":[
+              {"key":"quillmoor.example/zone","operator":"In","values":["refrigerated"]},
+              {"key":"quillmoor.example/gpu-free","operator":"Exists"}]}]}}}}}}}'
+          kubectl -n cold-chain rollout status deploy/cold-chain-monitor --timeout=150s
+    - id: node-selector
+      description: Uses a nodeSelector for the zone.
+      feedback: A nodeSelector can express the requirement but not the preference; the task asks for node affinity for both.
+      expectFail: [required-zone, preferred-gpu-free, no-node-selector]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 200
+        run: |
+          kubectl config use-context qm-fleet
+          kubectl -n cold-chain patch deployment cold-chain-monitor -p '{"spec":{"template":{"spec":{"nodeSelector":{"quillmoor.example/zone":"refrigerated"}}}}}'
+          kubectl -n cold-chain rollout status deploy/cold-chain-monitor --timeout=150s
+    - id: relabel-ambient
+      description: Relabels the ambient worker so the existing Pods already satisfy the rule.
+      feedback: Node labels describe the hardware; changing them to fit a workload breaks every other placement rule that relies on them.
+      expectFail: [nodes-unchanged]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 200
+        run: |
+          kubectl config use-context qm-fleet
+          kubectl label node fleet-wk-3 quillmoor.example/zone=refrigerated --overwrite
+          kubectl -n cold-chain patch deployment cold-chain-monitor -p '{"spec":{"template":{"spec":{"affinity":{"nodeAffinity":{
+            "requiredDuringSchedulingIgnoredDuringExecution":{"nodeSelectorTerms":[{"matchExpressions":[{"key":"quillmoor.example/zone","operator":"In","values":["refrigerated"]}]}]},
+            "preferredDuringSchedulingIgnoredDuringExecution":[{"weight":50,"preference":{"matchExpressions":[{"key":"quillmoor.example/gpu-free","operator":"Exists"}]}}]}}}}}}'
+          kubectl -n cold-chain rollout status deploy/cold-chain-monitor --timeout=150s
+  solution:
+    explanation: |
+      The required term filters nodes: only those with zone=refrigerated are
+      feasible. The preferred term adds its weight to the score of feasible
+      nodes that carry gpu-free, so fleet-wk-1 is favoured but fleet-wk-2
+      stays usable. Changing the Pod template rolls out new Pods, which are
+      scheduled under the new rules.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 200
+        run: |
+          kubectl config use-context qm-fleet
+          kubectl -n cold-chain patch deployment cold-chain-monitor -p '{"spec":{"template":{"spec":{"affinity":{"nodeAffinity":{
+            "requiredDuringSchedulingIgnoredDuringExecution":{"nodeSelectorTerms":[{"matchExpressions":[{"key":"quillmoor.example/zone","operator":"In","values":["refrigerated"]}]}]},
+            "preferredDuringSchedulingIgnoredDuringExecution":[{"weight":50,"preference":{"matchExpressions":[{"key":"quillmoor.example/gpu-free","operator":"Exists"}]}}]}}}}}}'
+          kubectl -n cold-chain rollout status deploy/cold-chain-monitor --timeout=150s
+          kubectl -n cold-chain get pods -o wide
+    alternatives:
+      - id: in-true-preference
+        description: Preference written as In ["true"] with weight 100, edited with yq.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 200
+            run: |
+              kubectl config use-context qm-fleet
+              kubectl -n cold-chain get deployment cold-chain-monitor -o yaml | yq '
+                .spec.template.spec.affinity.nodeAffinity = {
+                  "requiredDuringSchedulingIgnoredDuringExecution": {"nodeSelectorTerms": [
+                    {"matchExpressions": [{"key": "quillmoor.example/zone", "operator": "In", "values": ["refrigerated"]}]}]},
+                  "preferredDuringSchedulingIgnoredDuringExecution": [
+                    {"weight": 100, "preference": {"matchExpressions": [{"key": "quillmoor.example/gpu-free", "operator": "In", "values": ["true"]}]}}]}' \
+                | kubectl apply -f -
+              kubectl -n cold-chain rollout status deploy/cold-chain-monitor --timeout=150s

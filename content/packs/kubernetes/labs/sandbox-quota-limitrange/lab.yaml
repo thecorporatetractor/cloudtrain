@@ -1,0 +1,308 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: sandbox-quota-limitrange
+  title: Cap the sandbox namespace with quota and defaults
+  domain: kubernetes
+  frameworks: [cka:workloads-scheduling, ckad:environment-config-security]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [resourcequota, limitrange, namespaces, admission]
+  version: 1
+spec:
+  description: |
+    Developers at Quillmoor share the `dev-sandbox` namespace on the depot
+    platform, and last week one test run requested more CPU than the whole
+    platform had. Put a ceiling on the namespace and give Pods sensible
+    defaults.
+
+    Use context `qm-depot`:
+
+    ```bash
+    kubectl config use-context qm-depot
+    ```
+
+    In namespace **`dev-sandbox`**:
+
+    1. Create a ResourceQuota that caps the namespace at **4 CPU** and
+       **8Gi** of memory in total **requests**, and at **20 Pods**.
+    2. Create a LimitRange so that a container which declares no resources
+       gets these values automatically:
+
+       | | CPU | memory |
+       |---|---|---|
+       | request | `100m` | `128Mi` |
+       | limit | `{{defcpu}}` | `512Mi` |
+
+    3. Prove the quota works: try to create a Pod named `big-test` in
+       `dev-sandbox` that requests (and is limited to) **5** CPU, and save the
+       error message
+       `kubectl` prints to `/home/learner/reports/rejected.txt`.
+
+    The `sandbox-web` Deployment that already runs there must keep running.
+  objectives:
+    - Write a ResourceQuota for compute requests and object counts
+    - Set default requests and limits with a LimitRange
+    - Read quota admission errors
+  params:
+    defcpu:
+      type: choice
+      values: [500m, 400m, 300m]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-depot
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: qm-depot
+  setup:
+    - on: qm-depot
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: dev-sandbox}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: sandbox-web, namespace: dev-sandbox}
+        spec:
+          replicas: 2
+          selector: {matchLabels: {app: sandbox-web}}
+          template:
+            metadata: {labels: {app: sandbox-web}}
+            spec:
+              containers:
+                - name: web
+                  image: httpd:2.4-alpine
+                  resources:
+                    requests: {cpu: 100m, memory: 64Mi}
+    - on: qm-depot
+      timeoutSec: 150
+      run: kubectl -n dev-sandbox rollout status deploy/sandbox-web --timeout=120s
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/reports
+  teardown:
+    - on: qm-depot
+      run: kubectl delete namespace dev-sandbox --ignore-not-found --wait=false
+  checks:
+    - id: context
+      description: Terminal is using context qm-depot
+      type: k8s-context
+      on: workstation
+      skills: [k8s.cli.contexts]
+      weight: 0.5
+      expect: {match: exact, value: qm-depot}
+    - id: quota-values
+      description: One ResourceQuota caps requests at 4 CPU / 8Gi memory and the namespace at 20 Pods
+      type: shell
+      on: qm-depot
+      skills: [k8s.workloads.quotas-limitranges, k8s.storage.capacity-units]
+      weight: 2
+      command: |
+        kubectl -n dev-sandbox get resourcequota -o json | jq -r '
+          [.items[] | .spec.hard | "cpu=\(.["requests.cpu"] // .cpu) mem=\(.["requests.memory"] // .memory) pods=\(.pods)"] | join(";")'
+      expect: {match: regex, value: '^cpu=(4|4000m) mem=8Gi pods=20$'}
+    - id: quota-enforced
+      description: A Pod requesting 5 CPU is rejected by the quota (server-side dry run)
+      type: shell
+      on: qm-depot
+      skills: [k8s.workloads.quotas-limitranges]
+      timeoutSec: 20
+      command: |
+        kubectl -n dev-sandbox run quota-probe --image=busybox:1.37 --restart=Never --dry-run=server \
+          --overrides='{"spec":{"containers":[{"name":"quota-probe","image":"busybox:1.37","resources":{"requests":{"cpu":"5"},"limits":{"cpu":"5"}}}]}}' \
+          -o name 2>&1 | grep -o -m1 'exceeded quota' || echo admitted
+      expect: {match: exact, value: exceeded quota}
+    - id: defaults-applied
+      description: A container without resources gets requests 100m/128Mi and limits {{defcpu}}/512Mi (server-side dry run)
+      type: shell
+      on: qm-depot
+      skills: [k8s.workloads.quotas-limitranges, k8s.workloads.resources]
+      weight: 2
+      timeoutSec: 20
+      command: |
+        kubectl -n dev-sandbox run defaults-probe --image=busybox:1.37 --restart=Never --dry-run=server -o json 2>&1 \
+          | jq -r '.spec.containers[0].resources | "\(.requests.cpu)/\(.requests.memory) \(.limits.cpu)/\(.limits.memory)"' 2>/dev/null || echo rejected
+      expect: {match: exact, value: "100m/128Mi {{defcpu}}/512Mi"}
+    - id: rejection-recorded
+      description: The report holds the quota error for Pod big-test
+      type: shell
+      on: workstation
+      skills: [k8s.workloads.quotas-limitranges]
+      command: |
+        f=/home/learner/reports/rejected.txt
+        [ -f "$f" ] && grep -q 'big-test' "$f" && grep -q 'exceeded quota' "$f" && echo ok || echo "no quota error recorded"
+      expect: {match: exact, value: ok}
+    - id: big-test-absent
+      description: Pod big-test does not exist
+      type: shell
+      on: qm-depot
+      skills: [k8s.workloads.quotas-limitranges]
+      weight: 0.5
+      command: kubectl -n dev-sandbox get pod big-test --no-headers --ignore-not-found | wc -l
+      expect: {match: exact, value: "0"}
+    - id: web-running
+      description: sandbox-web still runs 2 ready replicas
+      type: k8s-query
+      skills: [k8s.cli.scoped-changes]
+      weight: 0.5
+      query: {cluster: qm-depot, resource: deployment, name: sandbox-web, namespace: dev-sandbox, jsonpath: '{.spec.replicas}/{.status.readyReplicas}'}
+      expect: {match: exact, value: "2/2"}
+  hints:
+    - title: Switch context
+      body: The sandbox lives in qm-depot.
+      command: kubectl config use-context qm-depot
+      cost: 0
+    - title: Quota from the command line
+      body: "`kubectl create quota --hard` takes a comma-separated list of resource names and amounts."
+      command: kubectl -n dev-sandbox create quota sandbox-quota --hard=requests.cpu=4,requests.memory=8Gi,pods=20
+      cost: 2
+    - title: default vs defaultRequest
+      body: |
+        In a LimitRange item of `type: Container`, `defaultRequest` fills in
+        missing requests and `default` fills in missing limits. `min`/`max`
+        only validate; they do not fill anything in.
+      cost: 2
+    - title: Capture the error
+      body: kubectl prints admission errors on stderr.
+      command: kubectl -n dev-sandbox run big-test --image=busybox:1.37 --overrides='{"spec":{"containers":[{"name":"big-test","image":"busybox:1.37","resources":{"requests":{"cpu":"5"},"limits":{"cpu":"5"}}}]}}' 2> ~/reports/rejected.txt
+      cost: 1
+  misconceptions:
+    - id: no-limitrange
+      description: Creates only the quota.
+      feedback: Once a quota tracks CPU and memory requests, every new Pod must declare them or be rejected. A LimitRange supplies defaults so plain Pods still start.
+      expectFail: [defaults-applied]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n dev-sandbox create quota sandbox-quota --hard=requests.cpu=4,requests.memory=8Gi,pods=20
+          kubectl -n dev-sandbox run big-test --image=busybox:1.37 --overrides='{"spec":{"containers":[{"name":"big-test","image":"busybox:1.37","resources":{"requests":{"cpu":"5"},"limits":{"cpu":"5"}}}]}}' 2> ~/reports/rejected.txt || true
+    - id: max-instead-of-default
+      description: Writes max values into the LimitRange instead of default and defaultRequest.
+      feedback: "`max` rejects containers above it but fills in nothing. Use `default` for limits and `defaultRequest` for requests."
+      expectFail: [defaults-applied]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n dev-sandbox create quota sandbox-quota --hard=requests.cpu=4,requests.memory=8Gi,pods=20
+          kubectl apply -f - <<'YAML'
+          apiVersion: v1
+          kind: LimitRange
+          metadata: {name: sandbox-defaults, namespace: dev-sandbox}
+          spec:
+            limits:
+              - type: Container
+                max: {cpu: "{{defcpu}}", memory: 512Mi}
+                min: {cpu: 100m, memory: 128Mi}
+          YAML
+          kubectl -n dev-sandbox run big-test --image=busybox:1.37 --overrides='{"spec":{"containers":[{"name":"big-test","image":"busybox:1.37","resources":{"requests":{"cpu":"5"},"limits":{"cpu":"5"}}}]}}' 2> ~/reports/rejected.txt || true
+    - id: limits-quota
+      description: Caps limits.cpu and limits.memory instead of requests.
+      feedback: The task caps total requests. A limits-only quota lets Pods request anything as long as their limits fit.
+      expectFail: [quota-values]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n dev-sandbox create quota sandbox-quota --hard=limits.cpu=4,limits.memory=8Gi,pods=20
+          kubectl apply -f - <<'YAML'
+          apiVersion: v1
+          kind: LimitRange
+          metadata: {name: sandbox-defaults, namespace: dev-sandbox}
+          spec:
+            limits:
+              - type: Container
+                default: {cpu: "{{defcpu}}", memory: 512Mi}
+                defaultRequest: {cpu: 100m, memory: 128Mi}
+          YAML
+          kubectl -n dev-sandbox run big-test --image=busybox:1.37 --overrides='{"spec":{"containers":[{"name":"big-test","image":"busybox:1.37","resources":{"requests":{"cpu":"5"},"limits":{"cpu":"5"}}}]}}' 2> ~/reports/rejected.txt || true
+    - id: decimal-gigabytes
+      description: Writes the memory cap as 8G instead of 8Gi.
+      feedback: "`8G` is 8 x 10^9 bytes; `8Gi` is 8 x 2^30 bytes. Use the binary unit asked for."
+      expectFail: [quota-values]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n dev-sandbox create quota sandbox-quota --hard=requests.cpu=4,requests.memory=8G,pods=20
+          kubectl apply -f - <<'YAML'
+          apiVersion: v1
+          kind: LimitRange
+          metadata: {name: sandbox-defaults, namespace: dev-sandbox}
+          spec:
+            limits:
+              - type: Container
+                default: {cpu: "{{defcpu}}", memory: 512Mi}
+                defaultRequest: {cpu: 100m, memory: 128Mi}
+          YAML
+          kubectl -n dev-sandbox run big-test --image=busybox:1.37 --overrides='{"spec":{"containers":[{"name":"big-test","image":"busybox:1.37","resources":{"requests":{"cpu":"5"},"limits":{"cpu":"5"}}}]}}' 2> ~/reports/rejected.txt || true
+  solution:
+    explanation: |
+      The ResourceQuota sums the requests of all Pods in the namespace and
+      rejects any Pod that would push a total over `hard`. The LimitRange's
+      `defaultRequest` and `default` are written into containers that declare
+      nothing, at admission time, so plain Pods still satisfy the quota.
+    steps:
+      - on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n dev-sandbox create quota sandbox-quota --hard=requests.cpu=4,requests.memory=8Gi,pods=20
+          kubectl apply -f - <<'YAML'
+          apiVersion: v1
+          kind: LimitRange
+          metadata: {name: sandbox-defaults, namespace: dev-sandbox}
+          spec:
+            limits:
+              - type: Container
+                default: {cpu: "{{defcpu}}", memory: 512Mi}
+                defaultRequest: {cpu: 100m, memory: 128Mi}
+          YAML
+          kubectl -n dev-sandbox run big-test --image=busybox:1.37 --overrides='{"spec":{"containers":[{"name":"big-test","image":"busybox:1.37","resources":{"requests":{"cpu":"5"},"limits":{"cpu":"5"}}}]}}' 2> ~/reports/rejected.txt || true
+    alternatives:
+      - id: manifests-and-short-keys
+        description: Both objects as manifests, using the short quota keys cpu/memory (aliases of requests.cpu/requests.memory).
+        steps:
+          - on: workstation
+            as: learner
+            run: |
+              kubectl config use-context qm-depot
+              kubectl apply -f - <<'YAML'
+              apiVersion: v1
+              kind: ResourceQuota
+              metadata: {name: sandbox-ceiling, namespace: dev-sandbox}
+              spec:
+                hard: {cpu: "4", memory: 8Gi, pods: "20"}
+              ---
+              apiVersion: v1
+              kind: LimitRange
+              metadata: {name: container-defaults, namespace: dev-sandbox}
+              spec:
+                limits:
+                  - type: Container
+                    default: {cpu: "{{defcpu}}", memory: 512Mi}
+                    defaultRequest: {cpu: 100m, memory: 128Mi}
+              YAML
+              cat > /tmp/big.yaml <<'YAML'
+              apiVersion: v1
+              kind: Pod
+              metadata: {name: big-test, namespace: dev-sandbox}
+              spec:
+                containers:
+                  - name: big
+                    image: busybox:1.37
+                    resources: {requests: {cpu: "5"}, limits: {cpu: "5"}}
+              YAML
+              kubectl apply -f /tmp/big.yaml > ~/reports/rejected.txt 2>&1 || true

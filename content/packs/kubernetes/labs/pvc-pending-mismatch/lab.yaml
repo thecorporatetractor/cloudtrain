@@ -1,0 +1,278 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: pvc-pending-mismatch
+  title: Bind a claim stuck in Pending
+  domain: kubernetes
+  frameworks: [cka:storage, ckad:design-build]
+  difficulty: easy
+  estimatedMinutes: 10
+  tags: [storage, pv, pvc, access-modes, storageclass]
+  version: 1
+spec:
+  description: |
+    The quarterly audit reporter should read last quarter's archive from a
+    pre-created PersistentVolume, but its Pod never starts: the claim stays
+    Pending.
+
+    Use context `qm-archive`:
+
+    ```bash
+    kubectl config use-context qm-archive
+    ```
+
+    In namespace `audit`, the Deployment `audit-reporter` mounts the claim
+    **`audit-archive`**, which should bind to the PersistentVolume
+    **`audit-archive-pv`**. Find out why it does not bind and fix the
+    **claim** (not the volume: the archive team owns it), so that the claim
+    is Bound to `audit-archive-pv` and the reporter Pod runs and reads the
+    archive. Keep the claim's name.
+  objectives:
+    - Read why a PersistentVolumeClaim stays Pending
+    - Match a claim to a volume by storageClassName, access mode and size
+    - Replace a claim whose spec cannot be changed in place
+  params:
+    size:
+      type: choice
+      values: [1Gi, 2Gi, 3Gi]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-archive
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-archive
+          nodes:
+            - {name: archive-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: archive-wk-1, role: worker}
+  setup:
+    - on: qm-archive/archive-wk-1
+      run: |
+        mkdir -p /srv/audit-archive
+        printf 'quarter,shipments,exceptions\n2026-Q3,48211,317\n' > /srv/audit-archive/2026-q3.csv
+    - on: qm-archive
+      apply: |
+        apiVersion: v1
+        kind: PersistentVolume
+        metadata: {name: audit-archive-pv, labels: {quillmoor.example/owner: archive-team}}
+        spec:
+          capacity: {storage: 5Gi}
+          accessModes: [ReadOnlyMany]
+          persistentVolumeReclaimPolicy: Retain
+          storageClassName: archive-manual
+          hostPath: {path: /srv/audit-archive, type: Directory}
+          nodeAffinity:
+            required:
+              nodeSelectorTerms:
+                - matchExpressions:
+                    - {key: kubernetes.io/hostname, operator: In, values: [archive-wk-1]}
+        ---
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: audit}
+        ---
+        apiVersion: v1
+        kind: PersistentVolumeClaim
+        metadata: {name: audit-archive, namespace: audit}
+        spec:
+          accessModes: [ReadWriteOnce]
+          storageClassName: standard
+          resources:
+            requests: {storage: "{{size}}"}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: audit-reporter, namespace: audit}
+        spec:
+          replicas: 1
+          selector: {matchLabels: {app: audit-reporter}}
+          template:
+            metadata: {labels: {app: audit-reporter}}
+            spec:
+              containers:
+                - name: reporter
+                  image: busybox:1.37
+                  command: ["sh", "-c", "while true; do echo \"rows=$(cat /archive/*.csv | wc -l)\"; tail -n1 /archive/2026-q3.csv; sleep 30; done"]
+                  volumeMounts: [{name: archive, mountPath: /archive, readOnly: true}]
+              volumes:
+                - name: archive
+                  persistentVolumeClaim: {claimName: audit-archive, readOnly: true}
+  teardown:
+    - on: qm-archive
+      run: |
+        kubectl delete namespace audit --ignore-not-found --wait=false
+        kubectl delete pv audit-archive-pv --ignore-not-found --wait=false
+  checks:
+    - id: context
+      description: Terminal is using context qm-archive
+      type: k8s-context
+      on: workstation
+      skills: [k8s.cli.contexts]
+      weight: 0.5
+      expect: {match: exact, value: qm-archive}
+    - id: claim-bound
+      description: Claim audit-archive is Bound to audit-archive-pv
+      type: k8s-query
+      skills: [k8s.storage.claims]
+      weight: 2
+      query: {cluster: qm-archive, resource: pvc, name: audit-archive, namespace: audit, jsonpath: '{.status.phase} {.spec.volumeName}'}
+      expect: {match: exact, value: Bound audit-archive-pv}
+    - id: claim-spec
+      description: The claim asks for ReadOnlyMany on StorageClass archive-manual
+      type: k8s-query
+      skills: [k8s.storage.access-modes, k8s.storage.claims]
+      query: {cluster: qm-archive, resource: pvc, name: audit-archive, namespace: audit, jsonpath: '{.spec.accessModes} {.spec.storageClassName}'}
+      expect: {match: exact, value: '["ReadOnlyMany"] archive-manual'}
+    - id: reporter-reads
+      description: The audit-reporter Pod is Running and prints the archive's last row
+      type: shell
+      on: qm-archive
+      skills: [k8s.storage.claims]
+      weight: 2
+      timeoutSec: 20
+      command: |
+        kubectl -n audit rollout status deploy/audit-reporter --timeout=5s >/dev/null 2>&1 || { echo "not running"; exit 0; }
+        kubectl -n audit logs deploy/audit-reporter --tail=20 | grep -m1 '^2026-Q3,' || echo "archive not read"
+      expect: {match: exact, value: "2026-Q3,48211,317"}
+    - id: volume-unchanged
+      description: The volume audit-archive-pv keeps its access mode, class, size and Retain policy
+      type: k8s-query
+      skills: [k8s.cli.scoped-changes]
+      weight: 0.5
+      query: {cluster: qm-archive, resource: pv, name: audit-archive-pv, jsonpath: '{.spec.accessModes} {.spec.storageClassName} {.spec.capacity.storage} {.spec.persistentVolumeReclaimPolicy}'}
+      expect: {match: exact, value: '["ReadOnlyMany"] archive-manual 5Gi Retain'}
+  hints:
+    - title: Switch context
+      body: The archive is in qm-archive.
+      command: kubectl config use-context qm-archive
+      cost: 0
+    - title: Compare claim and volume
+      command: kubectl get pv audit-archive-pv; kubectl -n audit get pvc audit-archive -o wide; kubectl -n audit describe pvc audit-archive
+      body: For a static volume to bind, the claim's storageClassName must equal the volume's, its access modes must be offered by the volume, and its request must fit the capacity.
+      cost: 1
+    - title: Claims are mostly immutable
+      body: Access modes and storageClassName of an existing claim cannot be changed. Delete it and create it again with the same name; a claim in use by a Pod is only removed once that Pod is gone.
+      cost: 2
+    - title: Order of operations
+      command: |
+        kubectl -n audit scale deployment audit-reporter --replicas=0
+        kubectl -n audit get pvc audit-archive -o yaml > pvc.yaml   # edit accessModes and storageClassName, drop status/uid
+        kubectl -n audit delete pvc audit-archive
+        kubectl apply -f pvc.yaml
+        kubectl -n audit scale deployment audit-reporter --replicas=1
+      body: Scale the reporter down, replace the claim, scale it up again.
+      cost: 3
+  misconceptions:
+    - id: change-the-volume
+      description: Edits the PersistentVolume to match the claim instead.
+      feedback: The volume belongs to the archive team and is read-only by design. Fix the claim.
+      expectFail: [volume-unchanged]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 180
+        run: |
+          kubectl config use-context qm-archive
+          kubectl patch pv audit-archive-pv -p '{"spec":{"accessModes":["ReadOnlyMany","ReadWriteOnce"],"storageClassName":"standard"}}'
+          kubectl -n audit wait pvc/audit-archive --for=jsonpath='{.status.phase}'=Bound --timeout=60s || true
+          kubectl -n audit rollout status deploy/audit-reporter --timeout=100s || true
+    - id: class-only
+      description: Fixes the storageClassName but keeps ReadWriteOnce.
+      feedback: The volume offers only ReadOnlyMany. A claim asking for ReadWriteOnce never matches it.
+      expectFail: [claim-bound, claim-spec, reporter-reads]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 180
+        run: |
+          kubectl config use-context qm-archive
+          kubectl -n audit scale deployment audit-reporter --replicas=0
+          kubectl -n audit delete pvc audit-archive --wait=true
+          kubectl apply -f - <<'YAML'
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata: {name: audit-archive, namespace: audit}
+          spec:
+            accessModes: [ReadWriteOnce]
+            storageClassName: archive-manual
+            resources: {requests: {storage: "{{size}}"}}
+          YAML
+          kubectl -n audit scale deployment audit-reporter --replicas=1
+          sleep 30
+    - id: oversized-request
+      description: Recreates the claim correctly but asks for more than the volume holds.
+      feedback: A claim binds only to a volume at least as large as its request. 5Gi is all this volume offers.
+      expectFail: [claim-bound, reporter-reads]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 180
+        run: |
+          kubectl config use-context qm-archive
+          kubectl -n audit scale deployment audit-reporter --replicas=0
+          kubectl -n audit delete pvc audit-archive --wait=true
+          kubectl apply -f - <<'YAML'
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata: {name: audit-archive, namespace: audit}
+          spec:
+            accessModes: [ReadOnlyMany]
+            storageClassName: archive-manual
+            resources: {requests: {storage: 10Gi}}
+          YAML
+          kubectl -n audit scale deployment audit-reporter --replicas=1
+          sleep 30
+  solution:
+    explanation: |
+      `describe pvc` shows no volume matches: the claim asks for
+      ReadWriteOnce on class `standard` (which has no provisioner here), while
+      the volume offers ReadOnlyMany on `archive-manual`. Both fields are
+      immutable, so the claim is replaced: scale the reporter to zero so the
+      claim can be deleted, recreate it with the volume's class and access
+      mode, and scale back up.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 240
+        run: |
+          kubectl config use-context qm-archive
+          kubectl -n audit scale deployment audit-reporter --replicas=0
+          kubectl -n audit delete pvc audit-archive --wait=true
+          kubectl apply -f - <<'YAML'
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata: {name: audit-archive, namespace: audit}
+          spec:
+            accessModes: [ReadOnlyMany]
+            storageClassName: archive-manual
+            resources: {requests: {storage: "{{size}}"}}
+          YAML
+          kubectl -n audit wait pvc/audit-archive --for=jsonpath='{.status.phase}'=Bound --timeout=60s
+          kubectl -n audit scale deployment audit-reporter --replicas=1
+          kubectl -n audit rollout status deploy/audit-reporter --timeout=150s
+          sleep 5
+    alternatives:
+      - id: replace-force-with-volume-name
+        description: Edit the exported claim, pin it to the volume with volumeName, and replace it with --force while the Deployment is scaled down.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 240
+            run: |
+              kubectl config use-context qm-archive
+              kubectl -n audit scale deployment audit-reporter --replicas=0
+              kubectl -n audit get pvc audit-archive -o yaml \
+                | yq '.spec.accessModes = ["ReadOnlyMany"] | .spec.storageClassName = "archive-manual" | .spec.volumeName = "audit-archive-pv"
+                      | del(.status) | del(.metadata.uid) | del(.metadata.resourceVersion) | del(.metadata.creationTimestamp) | del(.metadata.annotations)' > /tmp/pvc.yaml
+              kubectl replace --force -f /tmp/pvc.yaml
+              kubectl -n audit wait pvc/audit-archive --for=jsonpath='{.status.phase}'=Bound --timeout=60s
+              kubectl -n audit scale deployment audit-reporter --replicas=1
+              kubectl -n audit rollout status deploy/audit-reporter --timeout=150s
+              sleep 5

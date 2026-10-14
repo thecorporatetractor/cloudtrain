@@ -1,0 +1,222 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: cni-trace-pod-path
+  title: Trace pod-to-pod traffic and name the CNI
+  domain: kubernetes
+  frameworks: [cka:services-networking, cka:cluster-architecture]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [cni, networking, pod-cidr, nodes]
+  version: 1
+spec:
+  description: |
+    The yard team is writing down how their cluster is wired before a network
+    audit. Collect two facts from the cluster and the nodes themselves, and
+    prove the Pod network spans nodes.
+
+    Use context `qm-yard`. You can also `ssh yard-cp-1`, `ssh yard-wk-1` and
+    `ssh yard-wk-2` from your workstation (with `sudo` on the nodes).
+
+    1. Find which **CNI plugin** the cluster uses (look at the CNI
+       configuration on a node, under `/etc/cni/net.d`) and the cluster-wide
+       **Pod CIDR** (the range all Pod IPs come from, not one node's slice).
+    2. Write them to `/home/learner/reports/cni.txt` in exactly this format:
+
+       ```text
+       plugin=<plugin name in lower case>
+       pod-cidr=<CIDR>
+       ```
+
+    3. In namespace `net-audit`, run two Pods from image `busybox:1.37` that
+       keep running (`sleep 3600`): **`{{a}}`** on node `yard-wk-1` and
+       **`{{b}}`** on node `yard-wk-2`. Show that `{{a}}` can ping `{{b}}`'s
+       Pod IP.
+  objectives:
+    - Locate the CNI configuration on a node
+    - Tell the cluster Pod CIDR from a node's Pod CIDR
+    - Test Pod-to-Pod connectivity across nodes
+  params:
+    a:
+      type: choice
+      values: [probe-east, trace-a, ping-left]
+    b:
+      type: choice
+      values: [probe-west, trace-b, ping-right]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-yard
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-yard
+          nodes:
+            - {name: yard-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: yard-wk-1, role: worker}
+            - {name: yard-wk-2, role: worker}
+  setup:
+    - on: qm-yard
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: net-audit}
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/reports
+  teardown:
+    - on: qm-yard
+      run: kubectl delete namespace net-audit --ignore-not-found --wait=false
+  checks:
+    - id: context
+      description: Terminal is using context qm-yard
+      type: k8s-context
+      on: workstation
+      skills: [k8s.cli.contexts]
+      weight: 0.5
+      expect: {match: exact, value: qm-yard}
+    - id: report-file-plugin
+      description: Line 1 of the report is plugin=calico
+      type: shell
+      on: workstation
+      skills: [k8s.networking.cni]
+      weight: 2
+      command: sed -n 1p /home/learner/reports/cni.txt 2>/dev/null | tr -d '\r '
+      expect: {match: exact, value: plugin=calico}
+    - id: report-file-cidr
+      description: Line 2 of the report is the cluster Pod CIDR
+      type: shell
+      on: workstation
+      skills: [k8s.networking.cni]
+      weight: 2
+      command: sed -n 2p /home/learner/reports/cni.txt 2>/dev/null | tr -d '\r '
+      expect: {match: exact, value: pod-cidr=10.244.0.0/16}
+    - id: pods-placed
+      description: "{{a}} runs on yard-wk-1 and {{b}} on yard-wk-2 (busybox:1.37)"
+      type: shell
+      on: qm-yard
+      skills: [k8s.networking.connectivity-testing]
+      command: |
+        for p in {{a}} {{b}}; do
+          kubectl -n net-audit get pod $p -o jsonpath='{.metadata.name}@{.spec.nodeName}:{.status.phase}:{.spec.containers[0].image}{"\n"}' 2>/dev/null
+        done | paste -sd' ' -
+      expect: {match: exact, value: "{{a}}@yard-wk-1:Running:busybox:1.37 {{b}}@yard-wk-2:Running:busybox:1.37"}
+    - id: cross-node-ping
+      description: "{{a}} reaches {{b}}'s Pod IP across nodes"
+      type: shell
+      on: qm-yard
+      skills: [k8s.networking.connectivity-testing, k8s.networking.cni]
+      timeoutSec: 20
+      command: |
+        ip=$(kubectl -n net-audit get pod {{b}} -o jsonpath='{.status.podIP}')
+        [ -n "$ip" ] || { echo "no peer"; exit 0; }
+        kubectl -n net-audit exec {{a}} -- ping -c 2 -W 2 "$ip" >/dev/null 2>&1 && echo reachable || echo unreachable
+      expect: {match: exact, value: reachable}
+  hints:
+    - title: Switch context
+      body: The container yard is qm-yard.
+      command: kubectl config use-context qm-yard
+      cost: 0
+    - title: CNI configuration lives on the node
+      command: ssh yard-wk-1 'ls /etc/cni/net.d/ && sudo cat /etc/cni/net.d/*.conflist'
+      body: The kubelet's container runtime runs the plugins named in the first config file there; the `type` of the first plugin is the CNI.
+      cost: 1
+    - title: Cluster CIDR vs node CIDR
+      body: Each node's `spec.podCIDR` is one slice. The whole range is the controller manager's `--cluster-cidr` (from kubeadm's `podSubnet`), and the CNI's IP pool uses it too.
+      command: ssh yard-cp-1 'sudo grep cluster-cidr /etc/kubernetes/manifests/kube-controller-manager.yaml'
+      cost: 2
+    - title: Pin a Pod to a node
+      body: "`spec.nodeName` (or a nodeSelector on kubernetes.io/hostname) places a Pod on one node."
+      command: kubectl -n net-audit run {{a}} --image=busybox:1.37 --overrides='{"spec":{"nodeName":"yard-wk-1"}}' -- sleep 3600
+      cost: 2
+  misconceptions:
+    - id: node-slice
+      description: Reports one node's podCIDR instead of the cluster range.
+      feedback: "`spec.podCIDR` of a node is the /24 slice it was given. The cluster Pod CIDR is the range all those slices come from."
+      expectFail: [report-file-cidr]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          kubectl config use-context qm-yard
+          printf 'plugin=calico\npod-cidr=%s\n' "$(kubectl get node yard-wk-1 -o jsonpath='{.spec.podCIDR}')" > ~/reports/cni.txt
+          kubectl -n net-audit run {{a}} --image=busybox:1.37 --overrides='{"spec":{"nodeName":"yard-wk-1"}}' -- sleep 3600
+          kubectl -n net-audit run {{b}} --image=busybox:1.37 --overrides='{"spec":{"nodeName":"yard-wk-2"}}' -- sleep 3600
+          kubectl -n net-audit wait pod/{{a}} pod/{{b}} --for=condition=Ready --timeout=90s
+    - id: same-node
+      description: Runs both Pods on the same node.
+      feedback: Two Pods on one node talk through the node's bridge or routes and never cross the Pod network between nodes.
+      expectFail: [pods-placed]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          kubectl config use-context qm-yard
+          printf 'plugin=calico\npod-cidr=10.244.0.0/16\n' > ~/reports/cni.txt
+          kubectl -n net-audit run {{a}} --image=busybox:1.37 --overrides='{"spec":{"nodeName":"yard-wk-1"}}' -- sleep 3600
+          kubectl -n net-audit run {{b}} --image=busybox:1.37 --overrides='{"spec":{"nodeName":"yard-wk-1"}}' -- sleep 3600
+          kubectl -n net-audit wait pod/{{a}} pod/{{b}} --for=condition=Ready --timeout=90s
+    - id: service-cidr
+      description: Reports the Service CIDR as the Pod CIDR.
+      feedback: Service ClusterIPs (10.96.0.0/12 by default) are virtual and never assigned to Pods. Pod IPs come from the cluster CIDR.
+      expectFail: [report-file-cidr]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          kubectl config use-context qm-yard
+          printf 'plugin=calico\npod-cidr=10.96.0.0/12\n' > ~/reports/cni.txt
+          kubectl -n net-audit run {{a}} --image=busybox:1.37 --overrides='{"spec":{"nodeName":"yard-wk-1"}}' -- sleep 3600
+          kubectl -n net-audit run {{b}} --image=busybox:1.37 --overrides='{"spec":{"nodeName":"yard-wk-2"}}' -- sleep 3600
+          kubectl -n net-audit wait pod/{{a}} pod/{{b}} --for=condition=Ready --timeout=90s
+  solution:
+    explanation: |
+      `/etc/cni/net.d/10-calico.conflist` on every node shows the Calico
+      plugin chain. The controller manager's `--cluster-cidr` (kubeadm's
+      `podSubnet`) is 10.244.0.0/16; each node only gets a /24 of it. Two Pods
+      pinned to different workers get IPs from different slices and reach each
+      other through Calico's routes.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-yard
+          plugin=$(ssh yard-wk-1 'sudo cat /etc/cni/net.d/*.conflist' | jq -r '.plugins[0].type')
+          cidr=$(ssh yard-cp-1 'sudo cat /etc/kubernetes/manifests/kube-controller-manager.yaml' | sed -n 's/.*--cluster-cidr=//p')
+          printf 'plugin=%s\npod-cidr=%s\n' "$plugin" "$cidr" > ~/reports/cni.txt
+          kubectl -n net-audit run {{a}} --image=busybox:1.37 --overrides='{"spec":{"nodeName":"yard-wk-1"}}' -- sleep 3600
+          kubectl -n net-audit run {{b}} --image=busybox:1.37 --overrides='{"spec":{"nodeName":"yard-wk-2"}}' -- sleep 3600
+          kubectl -n net-audit wait pod/{{a}} pod/{{b}} --for=condition=Ready --timeout=90s
+          kubectl -n net-audit exec {{a}} -- ping -c 2 "$(kubectl -n net-audit get pod {{b}} -o jsonpath='{.status.podIP}')"
+    alternatives:
+      - id: kubeadm-config-and-selectors
+        description: Read the Pod subnet from the kubeadm-config ConfigMap and pin Pods with nodeSelector manifests.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 150
+            run: |
+              kubectl config use-context qm-yard
+              cidr=$(kubectl -n kube-system get configmap kubeadm-config -o jsonpath='{.data.ClusterConfiguration}' | yq '.networking.podSubnet')
+              plugin=$(ssh yard-wk-2 'ls /etc/cni/net.d/' | grep -o -m1 calico)
+              printf 'plugin=%s\npod-cidr=%s\n' "$plugin" "$cidr" > ~/reports/cni.txt
+              for p in "{{a}} yard-wk-1" "{{b}} yard-wk-2"; do set -- $p
+                kubectl apply -f - <<YAML
+              apiVersion: v1
+              kind: Pod
+              metadata: {name: $1, namespace: net-audit}
+              spec:
+                nodeSelector: {kubernetes.io/hostname: $2}
+                containers: [{name: box, image: "busybox:1.37", command: ["sleep", "3600"]}]
+              YAML
+              done
+              kubectl -n net-audit wait pod/{{a}} pod/{{b}} --for=condition=Ready --timeout=90s

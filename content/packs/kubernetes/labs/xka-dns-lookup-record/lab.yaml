@@ -1,0 +1,142 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xka-dns-lookup-record
+  title: Record Service and Pod DNS names
+  domain: kubernetes
+  frameworks: [cka:services-networking]
+  difficulty: easy
+  estimatedMinutes: 5
+  tags: [exam, dns]
+  version: 1
+spec:
+  description: |
+    **Context:** `qm-depot` (`kubectl config use-context qm-depot`)
+
+    Namespace **`customs-lookup`** runs the Service **`{{svc}}`** and the Pod
+    **`rate-card`**. Using cluster DNS from inside the cluster (the Pod
+    `dns-tools` in that namespace has `nslookup`), write:
+
+    - to `/home/learner/exam/dns/service.txt`: the fully qualified DNS name of
+      the Service and the address it resolves to, as `<name> <address>`;
+    - to `/home/learner/exam/dns/pod.txt`: the IP-based DNS name of the Pod
+      `rate-card` and the address it resolves to, as `<name> <address>`.
+
+    Fully qualified names end in the cluster domain `cluster.local`.
+  objectives:
+    - Resolve a Service's FQDN through cluster DNS
+    - Resolve a Pod's IP-based DNS record
+  params:
+    svc:
+      type: choice
+      values: [tariff, tariff-lookup, tariff-api]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-depot
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: qm-depot
+  setup:
+    - on: qm-depot
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: customs-lookup}
+        ---
+        apiVersion: v1
+        kind: Pod
+        metadata: {name: rate-card, namespace: customs-lookup, labels: {app: "{{svc}}"}}
+        spec:
+          terminationGracePeriodSeconds: 1
+          containers:
+            - {name: rates, image: "httpd:2.4-alpine"}
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata: {name: "{{svc}}", namespace: customs-lookup}
+        spec:
+          selector: {app: "{{svc}}"}
+          ports: [{port: 80, targetPort: 80}]
+        ---
+        apiVersion: v1
+        kind: Pod
+        metadata: {name: dns-tools, namespace: customs-lookup}
+        spec:
+          terminationGracePeriodSeconds: 1
+          containers:
+            - {name: tools, image: "busybox:1.37", command: ["sleep", "1d"]}
+    - on: qm-depot
+      timeoutSec: 120
+      run: kubectl -n customs-lookup wait pod/rate-card pod/dns-tools --for=condition=Ready --timeout=100s
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/exam /home/learner/exam/dns
+  teardown:
+    - on: qm-depot
+      run: kubectl delete namespace customs-lookup --ignore-not-found --wait=false
+  checks:
+    - id: service-record
+      description: service.txt holds the Service FQDN and its ClusterIP
+      type: shell
+      on: workstation
+      skills: [k8s.networking.dns]
+      weight: 2
+      command: |
+        ip=$(kubectl --kubeconfig /home/learner/.kube/config --context qm-depot -n customs-lookup get svc {{svc}} -o jsonpath='{.spec.clusterIP}')
+        got=$(head -n1 /home/learner/exam/dns/service.txt 2>/dev/null | tr -d '\r' | awk '{sub(/\.$/, "", $1); print $1, $2}')
+        [ -n "$ip" ] && [ "$got" = "{{svc}}.customs-lookup.svc.cluster.local $ip" ] && echo ok || echo "got: $got"
+      expect: {match: exact, value: ok}
+    - id: pod-record
+      description: pod.txt holds the Pod's IP-based DNS name and its IP
+      type: shell
+      on: workstation
+      skills: [k8s.networking.dns]
+      weight: 2
+      command: |
+        ip=$(kubectl --kubeconfig /home/learner/.kube/config --context qm-depot -n customs-lookup get pod rate-card -o jsonpath='{.status.podIP}')
+        got=$(head -n1 /home/learner/exam/dns/pod.txt 2>/dev/null | tr -d '\r' | awk '{sub(/\.$/, "", $1); print $1, $2}')
+        [ -n "$ip" ] && [ "$got" = "$(echo "$ip" | tr . -).customs-lookup.pod.cluster.local $ip" ] && echo ok || echo "got: $got"
+      expect: {match: exact, value: ok}
+  misconceptions:
+    - id: short-name
+      description: Writes the short Service name.
+      feedback: The fully qualified name includes namespace, svc and the cluster domain.
+      expectFail: [service-record]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-depot
+          ip=$(kubectl -n customs-lookup get svc {{svc}} -o jsonpath='{.spec.clusterIP}')
+          pip=$(kubectl -n customs-lookup get pod rate-card -o jsonpath='{.status.podIP}')
+          echo "{{svc}} $ip" > ~/exam/dns/service.txt
+          echo "$(echo $pip | tr . -).customs-lookup.pod.cluster.local $pip" > ~/exam/dns/pod.txt
+    - id: pod-name-record
+      description: Uses the Pod name in the Pod record.
+      feedback: A plain Pod's A record is named after its IP with dashes.
+      expectFail: [pod-record]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-depot
+          ip=$(kubectl -n customs-lookup get svc {{svc}} -o jsonpath='{.spec.clusterIP}')
+          pip=$(kubectl -n customs-lookup get pod rate-card -o jsonpath='{.status.podIP}')
+          echo "{{svc}}.customs-lookup.svc.cluster.local $ip" > ~/exam/dns/service.txt
+          echo "rate-card.customs-lookup.pod.cluster.local $pip" > ~/exam/dns/pod.txt
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n customs-lookup exec dns-tools -- nslookup {{svc}} | awk '/^Name:/ {n=$2} /^Address/ && !/#53/ {a=$2} END {print n, a}' > ~/exam/dns/service.txt
+          pip=$(kubectl -n customs-lookup get pod rate-card -o jsonpath='{.status.podIP}')
+          kubectl -n customs-lookup exec dns-tools -- nslookup "$(echo $pip | tr . -).customs-lookup.pod.cluster.local" \
+            | awk '/^Name:/ {n=$2} /^Address/ && !/#53/ {a=$2} END {print n, a}' > ~/exam/dns/pod.txt

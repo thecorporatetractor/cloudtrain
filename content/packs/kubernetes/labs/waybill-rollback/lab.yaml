@@ -1,0 +1,249 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: waybill-rollback
+  title: Roll back a bad image rollout to a named revision
+  domain: kubernetes
+  frameworks: [cka:workloads-scheduling, ckad:deployment]
+  difficulty: easy
+  estimatedMinutes: 10
+  tags: [deployment, rollout, rollback, revisions]
+  version: 1
+spec:
+  description: |
+    Last night's release of the waybill API went straight to production
+    without approval and its Pods are crash-looping. Change management wants
+    the service back on the **last approved release**: every release's
+    change cause records whether it was approved.
+
+    Use context `qm-dispatch`:
+
+    ```bash
+    kubectl config use-context qm-dispatch
+    ```
+
+    In namespace `{{ns}}`, return the Deployment `waybill-api` to the
+    revision whose change cause marks it as the last **approved** release,
+    and make sure all 3 replicas are running and ready on it. Do not
+    delete or recreate the Deployment.
+  objectives:
+    - Read a Deployment's rollout history and revision details
+    - Roll back to a specific revision
+    - Confirm a rollout completed
+  params:
+    ns:
+      type: choice
+      values: [waybills, waybill-desk, freight-docs]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-dispatch
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: qm-dispatch
+  setup:
+    - on: qm-dispatch
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: "{{ns}}"}
+    - on: qm-dispatch
+      timeoutSec: 420
+      run: |
+        set -e
+        release() {  # release <image> <version> <change cause> <command-json>
+          cat <<YAML | kubectl apply -f -
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: waybill-api
+          namespace: {{ns}}
+          annotations:
+            kubernetes.io/change-cause: "$3"
+        spec:
+          replicas: 3
+          revisionHistoryLimit: 10
+          selector: {matchLabels: {app: waybill-api}}
+          template:
+            metadata: {labels: {app: waybill-api}}
+            spec:
+              containers:
+                - name: api
+                  image: $1
+                  command: $4
+                  env:
+                    - {name: RELEASE, value: "$2"}
+        YAML
+        }
+        web='["httpd-foreground"]'
+        release httpd:2.4-alpine 3.8.0 "waybill-api 3.8.0 (CAB-2207 approved)" "$web"
+        kubectl -n {{ns}} rollout status deploy/waybill-api --timeout=120s
+        release httpd:2.4-alpine 3.9.0 "waybill-api 3.9.0 (CAB-2231 approved)" "$web"
+        kubectl -n {{ns}} rollout status deploy/waybill-api --timeout=120s
+        release caddy:2-alpine 4.0.0-rc1 "waybill-api 4.0.0-rc1 (canary, not approved)" '["caddy","file-server","--root","/usr/share/caddy"]'
+        kubectl -n {{ns}} rollout status deploy/waybill-api --timeout=120s
+        release busybox:1.37 4.0.0 "waybill-api 4.0.0 (approval pending)" '["sh","-c","echo waybill-api 4.0.0 cannot open /etc/waybill/schema.json; exit 1"]'
+        # wait until the broken revision is crash-looping
+        for i in $(seq 1 60); do
+          n=$(kubectl -n {{ns}} get pods -l app=waybill-api -o json | jq '[.items[] | select(.spec.containers[0].image == "busybox:1.37") | .status.containerStatuses[0].restartCount // 0 | select(. >= 1)] | length')
+          [ "$n" -ge 1 ] && exit 0
+          sleep 2
+        done
+        echo "broken revision did not start"; exit 1
+  teardown:
+    - on: qm-dispatch
+      run: kubectl delete namespace {{ns}} --ignore-not-found --wait=false
+  checks:
+    - id: context
+      description: Terminal is using context qm-dispatch
+      type: k8s-context
+      on: workstation
+      skills: [k8s.cli.contexts]
+      weight: 0.5
+      expect: {match: exact, value: qm-dispatch}
+    - id: approved-template
+      description: The Deployment's Pod template is the one of release 3.9.0 (httpd:2.4-alpine, RELEASE=3.9.0)
+      type: k8s-query
+      skills: [k8s.workloads.rollouts]
+      weight: 2
+      query:
+        cluster: qm-dispatch
+        resource: deployment
+        name: waybill-api
+        namespace: "{{ns}}"
+        jsonpath: '{.spec.template.spec.containers[0].image} {.spec.template.spec.containers[0].env[?(@.name=="RELEASE")].value} {.spec.template.spec.containers[0].command}'
+      expect: {match: exact, value: 'httpd:2.4-alpine 3.9.0 ["httpd-foreground"]'}
+    - id: approved-revision
+      description: The ReplicaSet serving all Pods is the one recorded for the approved 3.9.0 release
+      type: shell
+      on: qm-dispatch
+      skills: [k8s.workloads.rollouts]
+      command: |
+        kubectl -n {{ns}} get rs -l app=waybill-api -o json \
+          | jq -r '[.items[] | select(.spec.replicas > 0) | .metadata.annotations["kubernetes.io/change-cause"]] | join(";")'
+      expect: {match: exact, value: "waybill-api 3.9.0 (CAB-2231 approved)"}
+    - id: rollout-complete
+      description: 3 of 3 replicas are updated, ready and available
+      type: k8s-query
+      skills: [k8s.workloads.deployments]
+      query:
+        cluster: qm-dispatch
+        resource: deployment
+        name: waybill-api
+        namespace: "{{ns}}"
+        jsonpath: '{.spec.replicas}/{.status.updatedReplicas}/{.status.readyReplicas}/{.status.availableReplicas}/{.status.replicas}'
+      expect: {match: exact, value: 3/3/3/3/3}
+    - id: history-kept
+      description: The Deployment was not recreated (its revision history is still there)
+      type: shell
+      on: qm-dispatch
+      skills: [k8s.workloads.rollouts]
+      weight: 0.5
+      command: kubectl -n {{ns}} get rs -l app=waybill-api --no-headers | wc -l
+      expect: {match: exact, value: "4"}
+  hints:
+    - title: Switch context
+      body: The waybill API runs in qm-dispatch.
+      command: kubectl config use-context qm-dispatch
+      cost: 0
+    - title: Read the history
+      body: The CHANGE-CAUSE column comes from the `kubernetes.io/change-cause` annotation of each revision.
+      command: kubectl -n {{ns}} rollout history deployment waybill-api
+      cost: 1
+    - title: Inspect one revision
+      command: kubectl -n {{ns}} rollout history deployment waybill-api --revision=2
+      body: "`--revision` shows that revision's Pod template, so you can confirm image and settings before rolling back."
+      cost: 1
+    - title: Undo to a chosen revision
+      body: Without `--to-revision`, undo goes back exactly one revision, which is not necessarily an approved one.
+      command: kubectl -n {{ns}} rollout undo deployment waybill-api --to-revision=2
+      cost: 2
+  misconceptions:
+    - id: plain-undo
+      description: Runs rollout undo without a revision, landing on the unapproved canary.
+      feedback: "`rollout undo` returns to the previous revision. Here that is the unapproved 4.0.0-rc1 canary; read the history and pick the revision with --to-revision."
+      expectFail: [approved-template, approved-revision]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl -n {{ns}} rollout undo deployment waybill-api
+          kubectl -n {{ns}} rollout status deployment waybill-api --timeout=120s
+    - id: oldest-approved
+      description: Rolls back to the first approved revision instead of the last approved one.
+      feedback: Both 3.8.0 and 3.9.0 are approved; the task asks for the most recent approved release.
+      expectFail: [approved-template, approved-revision]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl -n {{ns}} rollout undo deployment waybill-api --to-revision=1
+          kubectl -n {{ns}} rollout status deployment waybill-api --timeout=120s
+    - id: set-image-only
+      description: Sets the image back to httpd but leaves the rest of the broken template (command, RELEASE) in place.
+      feedback: A revision is the whole Pod template, not only the image. Rolling back restores every field of the approved release.
+      expectFail: [approved-template, approved-revision]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 90
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl -n {{ns}} set image deployment/waybill-api api=httpd:2.4-alpine
+          kubectl -n {{ns}} rollout status deployment waybill-api --timeout=60s || true
+    - id: recreate-deployment
+      description: Deletes the Deployment and creates it again from the approved settings.
+      feedback: Recreating throws away the revision history change management relies on, and causes downtime. Roll back in place.
+      expectFail: [history-kept]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl -n {{ns}} get deployment waybill-api -o yaml \
+            | yq '.spec.template.spec.containers[0].image = "httpd:2.4-alpine" | .spec.template.spec.containers[0].command = ["httpd-foreground"]
+                  | .spec.template.spec.containers[0].env = [{"name": "RELEASE", "value": "3.9.0"}]
+                  | .metadata.annotations["kubernetes.io/change-cause"] = "waybill-api 3.9.0 (CAB-2231 approved)"
+                  | del(.metadata.resourceVersion, .metadata.uid, .metadata.creationTimestamp, .status)' > /tmp/waybill.yaml
+          kubectl -n {{ns}} delete deployment waybill-api --wait=true
+          kubectl apply -f /tmp/waybill.yaml
+          kubectl -n {{ns}} rollout status deployment waybill-api --timeout=120s
+  solution:
+    explanation: |
+      `rollout history` lists each revision with its change cause: revision 2
+      is the last approved release (3.9.0). `rollout undo --to-revision=2`
+      scales that revision's ReplicaSet back up and the broken one down.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl -n {{ns}} rollout history deployment waybill-api
+          kubectl -n {{ns}} rollout undo deployment waybill-api --to-revision=2
+          kubectl -n {{ns}} rollout status deployment waybill-api --timeout=120s
+    alternatives:
+      - id: lookup-revision-by-cause
+        description: Find the revision number from the ReplicaSets' annotations, then undo to it.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 150
+            run: |
+              kubectl config use-context qm-dispatch
+              rev=$(kubectl -n {{ns}} get rs -l app=waybill-api -o json \
+                | jq -r '[.items[] | select(.metadata.annotations["kubernetes.io/change-cause"] | test("\\(CAB-[0-9]+ approved\\)$"))
+                         | .metadata.annotations["deployment.kubernetes.io/revision"] | tonumber] | max')
+              kubectl -n {{ns}} rollout undo deployment waybill-api --to-revision=$rev
+              kubectl -n {{ns}} rollout status deployment waybill-api --timeout=120s
