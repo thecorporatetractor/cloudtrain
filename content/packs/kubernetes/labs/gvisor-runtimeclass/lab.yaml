@@ -1,0 +1,192 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: gvisor-runtimeclass
+  title: Run untrusted converters in a sandboxed runtime
+  domain: kubernetes
+  frameworks: [cks:microservice-vulnerabilities]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [runtimeclass, gvisor, sandboxing]
+  version: 1
+spec:
+  description: |
+    Quillmoor Logistics' customs desk converts scanned documents with a
+    third-party converter that parses untrusted files. A parser bug in it
+    would run code directly on the node's kernel. The worker nodes have
+    **gVisor** installed: containerd knows a runtime handler named `runsc`.
+
+    From your workstation, switch to context `qm-customs`
+    (`kubectl config use-context qm-customs`).
+
+    1. Create a RuntimeClass named `{{rc}}` for the handler `runsc`.
+    2. Move the Deployment `doc-converter` in namespace `customs-docs` onto
+       that RuntimeClass. All its Pods must run in the sandbox (gVisor's
+       kernel reports itself in `dmesg` inside the container).
+    3. Other workloads in the namespace keep the default runtime.
+  objectives:
+    - Create a RuntimeClass for an installed handler
+    - Select it from a Pod template
+    - Prove that a Pod runs under the sandbox kernel
+  params:
+    rc:
+      type: choice
+      values: [gvisor, sandboxed, untrusted]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      # Needs gVisor (runsc) and its containerd handler on the nodes (kubeadm:1.37-sec).
+      - name: qm-customs
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-customs
+          nodes:
+            - {name: customs-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: customs-wk-1, role: worker}
+  setup:
+    - on: qm-customs/customs-wk-1
+      run: |
+        command -v runsc >/dev/null || { echo "prerequisite missing: gVisor (runsc) is not installed on the node image (needs kubeadm:1.37-sec)" >&2; exit 1; }
+        grep -q 'runtimes.runsc' /etc/containerd/config.toml || { echo "prerequisite missing: containerd has no runsc handler" >&2; exit 1; }
+    - on: qm-customs
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: customs-docs}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: doc-converter, namespace: customs-docs}
+        spec:
+          replicas: 2
+          selector: {matchLabels: {app: doc-converter}}
+          template:
+            metadata: {labels: {app: doc-converter}}
+            spec:
+              containers:
+                - {name: converter, image: busybox:1.37, command: ["sh", "-c", "while true; do sleep 30; done"]}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: docs-index, namespace: customs-docs}
+        spec:
+          replicas: 1
+          selector: {matchLabels: {app: docs-index}}
+          template:
+            metadata: {labels: {app: docs-index}}
+            spec:
+              containers:
+                - {name: index, image: busybox:1.37, command: ["sh", "-c", "while true; do sleep 30; done"]}
+    - on: qm-customs
+      timeoutSec: 150
+      run: |
+        kubectl -n customs-docs rollout status deploy/doc-converter --timeout=140s
+        kubectl -n customs-docs rollout status deploy/docs-index --timeout=60s
+  teardown:
+    - on: qm-customs
+      run: |
+        kubectl delete namespace customs-docs --ignore-not-found --wait=false
+        kubectl delete runtimeclass {{rc}} --ignore-not-found
+  checks:
+    - id: context
+      description: Terminal is using context qm-customs
+      type: k8s-context
+      on: workstation
+      skills: [k8s.cli.contexts]
+      weight: 0.5
+      expect: {match: exact, value: qm-customs}
+    - id: runtimeclass
+      description: RuntimeClass {{rc}} uses handler runsc
+      type: k8s-query
+      skills: [k8s.security.sandboxing]
+      query: {cluster: qm-customs, resource: runtimeclass, name: "{{rc}}", jsonpath: "{.handler}"}
+      expect: {match: exact, value: runsc}
+    - id: deployment-uses-it
+      description: doc-converter's Pod template selects {{rc}} and its rollout completed
+      type: shell
+      on: qm-customs
+      skills: [k8s.security.sandboxing]
+      timeoutSec: 90
+      command: |
+        kubectl -n customs-docs rollout status deploy/doc-converter --timeout=60s >/dev/null 2>&1 || { echo "rollout incomplete"; exit 0; }
+        kubectl -n customs-docs get deploy doc-converter -o jsonpath='{.spec.template.spec.runtimeClassName}'
+      expect: {match: exact, value: "{{rc}}"}
+    - id: pods-sandboxed
+      description: Every running doc-converter Pod runs under the gVisor kernel
+      type: shell
+      on: qm-customs
+      skills: [k8s.security.sandboxing]
+      weight: 3
+      timeoutSec: 60
+      command: |
+        n=0; g=0
+        for p in $(kubectl -n customs-docs get pods -l app=doc-converter --field-selector=status.phase=Running -o name); do
+          n=$((n+1))
+          kubectl -n customs-docs exec "$p" -- dmesg 2>/dev/null | grep -qi gvisor && g=$((g+1))
+        done
+        [ "$n" -gt 0 ] && [ "$n" = "$g" ] && echo all-sandboxed || echo "pods=$n sandboxed=$g"
+      expect: {match: exact, value: all-sandboxed}
+    - id: others-default
+      description: docs-index still uses the default runtime
+      type: k8s-query
+      skills: [k8s.security.sandboxing]
+      query: {cluster: qm-customs, resource: deployment, name: docs-index, namespace: customs-docs, jsonpath: "{.spec.template.spec.runtimeClassName}"}
+      expect: {match: exact, value: ""}
+  hints:
+    - title: RuntimeClass
+      body: A RuntimeClass maps a name used by Pods to a handler configured in the container runtime.
+      command: |
+        kubectl apply -f - <<'YAML'
+        apiVersion: node.k8s.io/v1
+        kind: RuntimeClass
+        metadata: {name: {{rc}}}
+        handler: runsc
+        YAML
+      cost: 1
+    - title: Select it
+      body: Set spec.template.spec.runtimeClassName on the Deployment.
+      cost: 1
+    - title: Prove it
+      command: kubectl -n customs-docs exec deploy/doc-converter -- dmesg
+      body: Under gVisor, dmesg shows gVisor's own boot messages instead of the host kernel's.
+      cost: 1
+  misconceptions:
+    - id: wrong-handler
+      description: Uses the RuntimeClass name as handler (e.g. handler gvisor).
+      feedback: The handler must match the name containerd knows (runsc); Pods fail to start otherwise.
+      expectFail: [runtimeclass, pods-sandboxed]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-customs
+          kubectl apply -f - <<'YAML'
+          apiVersion: node.k8s.io/v1
+          kind: RuntimeClass
+          metadata: {name: "{{rc}}"}
+          handler: gvisor
+          YAML
+          kubectl -n customs-docs patch deploy doc-converter -p '{"spec":{"template":{"spec":{"runtimeClassName":"{{rc}}"}}}}'
+          sleep 30
+  solution:
+    explanation: Create the RuntimeClass with handler runsc and set runtimeClassName in doc-converter's Pod template; the rolled-out Pods run on gVisor's user-space kernel.
+    steps:
+      - on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-customs
+          kubectl apply -f - <<'YAML'
+          apiVersion: node.k8s.io/v1
+          kind: RuntimeClass
+          metadata: {name: "{{rc}}"}
+          handler: runsc
+          YAML
+          kubectl -n customs-docs patch deploy doc-converter -p '{"spec":{"template":{"spec":{"runtimeClassName":"{{rc}}"}}}}'
+          kubectl -n customs-docs rollout status deploy/doc-converter --timeout=120s

@@ -1,0 +1,304 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: seccomp-apparmor-printer
+  title: Confine a container with seccomp and AppArmor
+  domain: kubernetes
+  frameworks: [cks:system-hardening]
+  difficulty: hard
+  estimatedMinutes: 25
+  tags: [apparmor, seccomp, securitycontext, node-hardening]
+  version: 1
+spec:
+  description: |
+    The barcode service that drives Quillmoor Logistics' label printers is
+    third-party code. Security wrote an AppArmor profile, `{{profile}}`, that
+    lets it work normally but forbids writes under `/etc` and `/proc/sys`.
+
+    From your workstation, switch to context `qm-fleet`
+    (`kubectl config use-context qm-fleet`). The profile file is
+    `/opt/qm-profiles/{{profile}}` on **each** fleet worker (`fleet-wk-1`,
+    `fleet-wk-2`; `ssh <node>`, `sudo` works).
+
+    1. Load the profile in **enforce** mode on both workers.
+    2. Change the Deployment `barcode-service` in namespace `fleet-labels`
+       so its container runs under that AppArmor profile **and** the
+       container runtime's default seccomp profile (`RuntimeDefault`).
+    3. Both replicas (one per worker) must be Running and Ready, and a write
+       to `/etc` from inside them must be denied.
+  objectives:
+    - Load an AppArmor profile with apparmor_parser
+    - Reference a Localhost AppArmor profile from a Pod
+    - Apply the RuntimeDefault seccomp profile
+    - Verify confinement from inside the container
+  params:
+    profile:
+      type: choice
+      values: [qm-barcode, barcode-confined, qm-labelsvc]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-fleet
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        access: [ssh]
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-fleet
+          nodes:
+            - {name: fleet-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: fleet-wk-1, role: worker}
+            - {name: fleet-wk-2, role: worker}
+  setup:
+    - on: qm-fleet/fleet-wk-1
+      run: &profile |
+        set -e
+        mkdir -p /opt/qm-profiles
+        cat > /opt/qm-profiles/{{profile}} <<'EOF'
+        #include <tunables/global>
+
+        # Barcode service: normal container behaviour, but no writes to
+        # system configuration or kernel tunables.
+        profile {{profile}} flags=(attach_disconnected,mediate_deleted) {
+          #include <abstractions/base>
+
+          file,
+          network,
+          capability,
+          signal,
+          ptrace (read, readby),
+          umount,
+
+          deny /etc/** wl,
+          deny /proc/sys/** w,
+          deny /sys/** w,
+        }
+        EOF
+        apparmor_parser -R /opt/qm-profiles/{{profile}} 2>/dev/null || true
+    - on: qm-fleet/fleet-wk-2
+      run: *profile
+    - on: qm-fleet
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: fleet-labels}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: barcode-service, namespace: fleet-labels}
+        spec:
+          replicas: 2
+          # One replica per worker (anti-affinity), so roll by replacing in place.
+          strategy:
+            type: RollingUpdate
+            rollingUpdate: {maxSurge: 0, maxUnavailable: 1}
+          selector: {matchLabels: {app: barcode-service}}
+          template:
+            metadata: {labels: {app: barcode-service}}
+            spec:
+              affinity:
+                podAntiAffinity:
+                  requiredDuringSchedulingIgnoredDuringExecution:
+                    - labelSelector: {matchLabels: {app: barcode-service}}
+                      topologyKey: kubernetes.io/hostname
+              containers:
+                - name: barcode
+                  image: busybox:1.37
+                  command: ["sh", "-c"]
+                  args:
+                    - |
+                      mkdir -p /tmp/barcodes
+                      i=0
+                      while true; do
+                        i=$((i+1)); echo "QM$(printf %08d $i)" > /tmp/barcodes/last && touch /tmp/ok
+                        sleep 3
+                      done
+                  readinessProbe:
+                    exec: {command: ["test", "-f", "/tmp/ok"]}
+                    periodSeconds: 3
+    - on: qm-fleet
+      timeoutSec: 180
+      run: kubectl -n fleet-labels rollout status deploy/barcode-service --timeout=170s
+  teardown:
+    - on: qm-fleet
+      run: kubectl delete namespace fleet-labels --ignore-not-found --wait=false
+  checks:
+    - id: context
+      description: Terminal is using context qm-fleet
+      type: k8s-context
+      on: workstation
+      skills: [k8s.cli.contexts]
+      weight: 0.5
+      expect: {match: exact, value: qm-fleet}
+    - id: profile-loaded-wk1
+      description: "{{profile}} is loaded in enforce mode on fleet-wk-1"
+      type: shell
+      on: qm-fleet/fleet-wk-1
+      skills: [k8s.security.seccomp-apparmor]
+      command: grep -qx '{{profile}} (enforce)' /sys/kernel/security/apparmor/profiles && echo enforce || echo "not loaded in enforce mode"
+      expect: {match: exact, value: enforce}
+    - id: profile-loaded-wk2
+      description: "{{profile}} is loaded in enforce mode on fleet-wk-2"
+      type: shell
+      on: qm-fleet/fleet-wk-2
+      skills: [k8s.security.seccomp-apparmor]
+      command: grep -qx '{{profile}} (enforce)' /sys/kernel/security/apparmor/profiles && echo enforce || echo "not loaded in enforce mode"
+      expect: {match: exact, value: enforce}
+    - id: rolled-out
+      description: Both barcode-service replicas run the updated template and are Ready
+      type: shell
+      on: qm-fleet
+      skills: [k8s.security.seccomp-apparmor]
+      weight: 2
+      timeoutSec: 90
+      command: |
+        kubectl -n fleet-labels rollout status deploy/barcode-service --timeout=60s >/dev/null 2>&1
+        kubectl -n fleet-labels get deploy barcode-service -o jsonpath='{.status.updatedReplicas}/{.status.readyReplicas}/{.status.replicas}'
+      expect: {match: exact, value: 2/2/2}
+    - id: apparmor-confined
+      description: Every running barcode container is confined by {{profile}} in enforce mode
+      type: shell
+      on: qm-fleet
+      skills: [k8s.security.seccomp-apparmor]
+      weight: 2
+      timeoutSec: 60
+      command: |
+        n=0; ok=0
+        for p in $(kubectl -n fleet-labels get pods -l app=barcode-service --field-selector=status.phase=Running -o name); do
+          n=$((n+1))
+          [ "$(kubectl -n fleet-labels exec "$p" -- cat /proc/1/attr/current 2>/dev/null)" = "{{profile}} (enforce)" ] && ok=$((ok+1))
+        done
+        echo "pods=$n confined=$ok"
+      expect: {match: exact, value: pods=2 confined=2}
+    - id: seccomp-filtered
+      description: Every running barcode container runs with a seccomp filter (RuntimeDefault in its spec)
+      type: shell
+      on: qm-fleet
+      skills: [k8s.security.seccomp-apparmor]
+      weight: 2
+      timeoutSec: 60
+      command: |
+        n=0; ok=0
+        for p in $(kubectl -n fleet-labels get pods -l app=barcode-service --field-selector=status.phase=Running -o name); do
+          n=$((n+1))
+          t=$(kubectl -n fleet-labels get "$p" -o jsonpath='{.spec.containers[0].securityContext.seccompProfile.type}{.spec.securityContext.seccompProfile.type}')
+          m=$(kubectl -n fleet-labels exec "$p" -- grep '^Seccomp:' /proc/1/status 2>/dev/null | awk '{print $2}')
+          case "$t" in RuntimeDefault*) [ "$m" = 2 ] && ok=$((ok+1)) ;; esac
+        done
+        echo "pods=$n filtered=$ok"
+      expect: {match: exact, value: pods=2 filtered=2}
+    - id: etc-write-denied
+      description: Writing to /etc inside a barcode container is denied
+      type: shell
+      on: qm-fleet
+      skills: [k8s.security.seccomp-apparmor]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        p=$(kubectl -n fleet-labels get pods -l app=barcode-service --field-selector=status.phase=Running -o name | head -1)
+        [ -n "$p" ] || { echo "no running pod"; exit 0; }
+        out=$(kubectl -n fleet-labels exec "$p" -- sh -c 'echo x > /etc/qm-tamper && echo written' 2>&1)
+        kubectl -n fleet-labels exec "$p" -- rm -f /etc/qm-tamper >/dev/null 2>&1 || true
+        case "$out" in *written*) echo allowed ;; *"Permission denied"*) echo denied ;; *) echo "unexpected: $out" ;; esac
+      expect: {match: exact, value: denied}
+  hints:
+    - title: Load a profile
+      body: apparmor_parser -r (re)loads a profile in enforce mode; aa-status lists what is loaded.
+      command: ssh fleet-wk-1 'sudo apparmor_parser -r /opt/qm-profiles/{{profile}} && sudo aa-status | grep {{profile}}'
+      cost: 1
+    - title: Every node that may run the Pod
+      body: The kubelet refuses to start a container whose Localhost profile is not loaded on its node. The replicas spread over both workers.
+      cost: 1
+    - title: The securityContext fields
+      body: |
+        Since Kubernetes 1.30 both are fields:
+        `appArmorProfile: {type: Localhost, localhostProfile: <name>}` and
+        `seccompProfile: {type: RuntimeDefault}`, at Pod or container level.
+      cost: 2
+    - title: Check from inside
+      command: kubectl -n fleet-labels exec deploy/barcode-service -- cat /proc/1/attr/current
+      body: The process's current AppArmor label shows the profile and its mode.
+      cost: 1
+  misconceptions:
+    - id: one-node-only
+      description: Loads the profile only on fleet-wk-1.
+      feedback: The replica scheduled on fleet-wk-2 cannot start (CreateContainerError). Load the profile on every node that can run the Pod.
+      expectFail: [profile-loaded-wk2, rolled-out]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-fleet
+          ssh fleet-wk-1 'sudo apparmor_parser -r /opt/qm-profiles/{{profile}}'
+          kubectl -n fleet-labels patch deploy barcode-service --type=json -p '[{"op":"add","path":"/spec/template/spec/containers/0/securityContext","value":{"appArmorProfile":{"type":"Localhost","localhostProfile":"{{profile}}"},"seccompProfile":{"type":"RuntimeDefault"}}}]'
+          sleep 20
+    - id: complain-mode
+      description: Loads the profile in complain mode (apparmor_parser -C).
+      feedback: Complain mode only logs violations; the write to /etc still succeeds. Load it in enforce mode.
+      expectFail: [profile-loaded-wk1, profile-loaded-wk2, apparmor-confined, etc-write-denied]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-fleet
+          for n in fleet-wk-1 fleet-wk-2; do ssh $n 'sudo apparmor_parser -C -r /opt/qm-profiles/{{profile}}'; done
+          kubectl -n fleet-labels patch deploy barcode-service --type=json -p '[{"op":"add","path":"/spec/template/spec/containers/0/securityContext","value":{"appArmorProfile":{"type":"Localhost","localhostProfile":"{{profile}}"},"seccompProfile":{"type":"RuntimeDefault"}}}]'
+          kubectl -n fleet-labels rollout status deploy/barcode-service --timeout=150s
+    - id: seccomp-forgotten
+      description: Applies the AppArmor profile but no seccomp profile.
+      feedback: The task asks for RuntimeDefault seccomp as well; without it the container runs Unconfined for syscalls.
+      expectFail: [seccomp-filtered]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-fleet
+          for n in fleet-wk-1 fleet-wk-2; do ssh $n 'sudo apparmor_parser -r /opt/qm-profiles/{{profile}}'; done
+          kubectl -n fleet-labels patch deploy barcode-service --type=json -p '[{"op":"add","path":"/spec/template/spec/containers/0/securityContext","value":{"appArmorProfile":{"type":"Localhost","localhostProfile":"{{profile}}"}}}]'
+          kubectl -n fleet-labels rollout status deploy/barcode-service --timeout=150s
+    - id: runtime-default-apparmor
+      description: Uses appArmorProfile RuntimeDefault instead of the provided profile.
+      feedback: The runtime's default AppArmor profile does not forbid writes to /etc. Reference the Localhost profile by name.
+      expectFail: [apparmor-confined, etc-write-denied]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-fleet
+          for n in fleet-wk-1 fleet-wk-2; do ssh $n 'sudo apparmor_parser -r /opt/qm-profiles/{{profile}}'; done
+          kubectl -n fleet-labels patch deploy barcode-service --type=json -p '[{"op":"add","path":"/spec/template/spec/containers/0/securityContext","value":{"appArmorProfile":{"type":"RuntimeDefault"},"seccompProfile":{"type":"RuntimeDefault"}}}]'
+          kubectl -n fleet-labels rollout status deploy/barcode-service --timeout=150s
+  solution:
+    explanation: |
+      Load the profile on both workers with apparmor_parser (enforce is the
+      default), then set appArmorProfile Localhost/{{profile}} and seccompProfile
+      RuntimeDefault in the container's securityContext. The rollout replaces
+      both replicas, which now start confined.
+    steps:
+      - on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-fleet
+          for n in fleet-wk-1 fleet-wk-2; do
+            ssh $n 'sudo apparmor_parser -r /opt/qm-profiles/{{profile}} && sudo aa-status | grep {{profile}}'
+          done
+          kubectl -n fleet-labels patch deploy barcode-service --type=json -p '[{"op":"add","path":"/spec/template/spec/containers/0/securityContext","value":{"appArmorProfile":{"type":"Localhost","localhostProfile":"{{profile}}"},"seccompProfile":{"type":"RuntimeDefault"}}}]'
+          kubectl -n fleet-labels rollout status deploy/barcode-service --timeout=150s
+    alternatives:
+      - id: pod-level-and-persistent
+        description: Install the profile under /etc/apparmor.d so it survives reboots, and set both profiles at Pod level.
+        steps:
+          - on: workstation
+            as: learner
+            run: |
+              kubectl config use-context qm-fleet
+              for n in fleet-wk-1 fleet-wk-2; do
+                ssh $n 'sudo cp /opt/qm-profiles/{{profile}} /etc/apparmor.d/{{profile}} && sudo apparmor_parser -r /etc/apparmor.d/{{profile}}'
+              done
+              kubectl -n fleet-labels patch deploy barcode-service --type=merge -p '{"spec":{"template":{"spec":{"securityContext":{"appArmorProfile":{"type":"Localhost","localhostProfile":"{{profile}}"},"seccompProfile":{"type":"RuntimeDefault"}}}}}}'
+              kubectl -n fleet-labels rollout status deploy/barcode-service --timeout=150s

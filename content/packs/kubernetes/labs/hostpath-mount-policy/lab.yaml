@@ -1,0 +1,234 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: hostpath-mount-policy
+  title: Block host filesystem mounts with Pod Security
+  domain: kubernetes
+  frameworks: [cks:microservice-vulnerabilities]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [pod-security-admission, baseline, hostpath, emptydir]
+  version: 1
+spec:
+  description: |
+    A security review of Quillmoor Logistics' container yard cluster flagged
+    the diagnostics Pod `{{pod}}` in namespace `yard-tools`: it mounts the
+    **host's root filesystem** at `/host`, so anyone who can exec into it can
+    read node credentials.
+
+    From your workstation, switch to context `qm-yard`
+    (`kubectl config use-context qm-yard`).
+
+    1. Make the API server **reject** Pods in `yard-tools` that violate the
+       **baseline** Pod Security Standard (which forbids hostPath volumes).
+       Use exactly the baseline level.
+    2. Replace `{{pod}}` with a compliant Pod of the same name, image and
+       command whose `/host` directory is an **emptyDir** volume instead of the
+       host filesystem. It must be Running.
+  objectives:
+    - Enforce a Pod Security level on a namespace
+    - Know that enforcement does not evict existing Pods
+    - Replace a hostPath volume with an emptyDir
+  params:
+    pod:
+      type: choice
+      values: [crane-diag, gate-debug, yard-toolbox]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-yard
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-yard
+          nodes:
+            - {name: yard-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: yard-wk-1, role: worker}
+  setup:
+    - on: qm-yard
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: yard-tools}
+        ---
+        apiVersion: v1
+        kind: Pod
+        metadata: {name: "{{pod}}", namespace: yard-tools, labels: {app: yard-diag}}
+        spec:
+          containers:
+            - name: diag
+              image: busybox:1.37
+              command: ["sh", "-c", "while true; do ls /host > /dev/null 2>&1; sleep 30; done"]
+              volumeMounts: [{name: host-root, mountPath: /host}]
+          volumes:
+            - name: host-root
+              hostPath: {path: /, type: Directory}
+    - on: qm-yard
+      timeoutSec: 150
+      run: kubectl -n yard-tools wait pod/{{pod}} --for=condition=Ready --timeout=140s
+  teardown:
+    - on: qm-yard
+      run: kubectl delete namespace yard-tools --ignore-not-found --wait=false
+  checks:
+    - id: context
+      description: Terminal is using context qm-yard
+      type: k8s-context
+      on: workstation
+      skills: [k8s.cli.contexts]
+      weight: 0.5
+      expect: {match: exact, value: qm-yard}
+    - id: enforce-baseline
+      description: yard-tools enforces the baseline level
+      type: k8s-query
+      skills: [k8s.security.pod-security-admission]
+      weight: 2
+      query: {cluster: qm-yard, resource: namespace, name: yard-tools, jsonpath: "{.metadata.labels.pod-security\\.kubernetes\\.io/enforce}"}
+      expect: {match: exact, value: baseline}
+    - id: hostpath-rejected
+      description: A new Pod with a hostPath volume is rejected in yard-tools
+      type: shell
+      on: qm-yard
+      skills: [k8s.security.pod-security-admission]
+      weight: 2
+      command: |
+        pod='{"apiVersion":"v1","kind":"Pod","metadata":{"name":"qm-psa-probe","namespace":"yard-tools"},"spec":{"containers":[{"name":"c","image":"busybox:1.37","command":["true"],"volumeMounts":[{"name":"h","mountPath":"/h"}]}],"volumes":[{"name":"h","hostPath":{"path":"/etc"}}]}}'
+        if out=$(printf "%s" "$pod" | kubectl create --dry-run=server -f - 2>&1); then echo admitted; else
+          case "$out" in *violates*|*forbidden*) echo rejected ;; *) echo "error: $out" | head -c 200 ;; esac; fi
+      expect: {match: exact, value: rejected}
+    - id: root-pod-admitted
+      description: Ordinary root Pods are still admitted (the level is baseline, not restricted)
+      type: shell
+      on: qm-yard
+      skills: [k8s.security.pod-security-admission]
+      command: |
+        kubectl -n yard-tools run qm-psa-plain --image=busybox:1.37 --restart=Never --dry-run=server -- true >/dev/null 2>&1 && echo admitted || echo rejected
+      expect: {match: exact, value: admitted}
+    - id: pod-replaced
+      description: "{{pod}} runs busybox:1.37 with /host from an emptyDir and no hostPath volume"
+      type: shell
+      on: qm-yard
+      skills: [k8s.security.security-context]
+      weight: 2
+      timeoutSec: 60
+      command: |
+        kubectl -n yard-tools wait pod/{{pod}} --for=condition=Ready --timeout=40s >/dev/null 2>&1
+        kubectl -n yard-tools get pod {{pod}} -o json 2>/dev/null | jq -r '
+          .spec as $s
+          | ([$s.volumes[]? | select(.hostPath)] | length) as $hp
+          | ([$s.containers[0].volumeMounts[]? | select(.mountPath == "/host") | .name as $n | $s.volumes[] | select(.name == $n and .emptyDir != null)] | length) as $ed
+          | "phase=\(.status.phase) image=\($s.containers[0].image) hostPath=\($hp) hostIsEmptyDir=\($ed)"'
+      expect: {match: exact, value: "phase=Running image=busybox:1.37 hostPath=0 hostIsEmptyDir=1"}
+    - id: host-files-hidden
+      description: The node's files (e.g. /etc/kubernetes) are not visible under /host in {{pod}}
+      type: shell
+      on: qm-yard
+      skills: [k8s.security.security-context]
+      timeoutSec: 30
+      command: kubectl -n yard-tools exec {{pod}} -- sh -c 'test -e /host/etc/kubernetes/kubelet.conf && echo visible || echo hidden' 2>/dev/null || echo "exec failed"
+      expect: {match: exact, value: hidden}
+  hints:
+    - title: Namespace labels drive Pod Security
+      body: The label `pod-security.kubernetes.io/enforce` takes privileged, baseline or restricted.
+      command: kubectl label ns yard-tools pod-security.kubernetes.io/enforce=baseline
+      cost: 1
+    - title: Existing Pods stay
+      body: Enforcement checks Pods when they are created. The flagged Pod keeps running until you replace it; kubectl only warns.
+      cost: 1
+    - title: Replace, do not patch
+      body: Pod volumes are immutable. Export the Pod, change the volume and recreate it.
+      command: kubectl -n yard-tools get pod {{pod}} -o yaml > /tmp/pod.yaml
+      cost: 2
+  misconceptions:
+    - id: label-only
+      description: Enforces baseline but leaves the flagged Pod running.
+      feedback: Admission only checks new Pods. The old Pod still mounts the host root; replace it.
+      expectFail: [pod-replaced, host-files-hidden]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-yard
+          kubectl label ns yard-tools pod-security.kubernetes.io/enforce=baseline
+    - id: warn-only
+      description: Sets the warn label instead of enforce, then replaces the Pod.
+      feedback: warn only prints a warning; nothing is rejected.
+      expectFail: [enforce-baseline, hostpath-rejected]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-yard
+          kubectl label ns yard-tools pod-security.kubernetes.io/warn=baseline
+          kubectl -n yard-tools delete pod {{pod}} --now
+          kubectl apply -f - <<'YAML'
+          apiVersion: v1
+          kind: Pod
+          metadata: {name: "{{pod}}", namespace: yard-tools, labels: {app: yard-diag}}
+          spec:
+            containers:
+              - name: diag
+                image: busybox:1.37
+                command: ["sh", "-c", "while true; do ls /host > /dev/null 2>&1; sleep 30; done"]
+                volumeMounts: [{name: host-root, mountPath: /host}]
+            volumes:
+              - {name: host-root, emptyDir: {}}
+          YAML
+          kubectl -n yard-tools wait pod/{{pod}} --for=condition=Ready --timeout=120s
+    - id: restricted-instead
+      description: Enforces restricted instead of baseline.
+      feedback: The task asks for baseline. restricted would also reject the yard's ordinary root containers.
+      expectFail: [enforce-baseline, root-pod-admitted]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-yard
+          kubectl label ns yard-tools pod-security.kubernetes.io/enforce=restricted
+  solution:
+    explanation: |
+      Label yard-tools with pod-security.kubernetes.io/enforce=baseline. That
+      blocks new hostPath Pods but does not evict the existing one, so delete it
+      and recreate it with an emptyDir at /host.
+    steps:
+      - on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-yard
+          kubectl label ns yard-tools pod-security.kubernetes.io/enforce=baseline
+          kubectl -n yard-tools get pod {{pod}} -o json \
+            | jq 'del(.status, .metadata.uid, .metadata.resourceVersion, .metadata.creationTimestamp, .metadata.managedFields)
+                  | .spec.volumes |= map(if .name == "host-root" then {"name": "host-root", "emptyDir": {}} else . end)' > /tmp/{{pod}}.json
+          kubectl replace --force -f /tmp/{{pod}}.json
+          kubectl -n yard-tools wait pod/{{pod}} --for=condition=Ready --timeout=120s
+    alternatives:
+      - id: version-pinned-labels
+        description: Pin the enforce version and add warn/audit at baseline too; write the new Pod by hand.
+        steps:
+          - on: workstation
+            as: learner
+            run: |
+              kubectl config use-context qm-yard
+              kubectl label ns yard-tools pod-security.kubernetes.io/enforce=baseline pod-security.kubernetes.io/enforce-version=v1.37 \
+                pod-security.kubernetes.io/warn=baseline pod-security.kubernetes.io/audit=baseline
+              kubectl -n yard-tools delete pod {{pod}} --now
+              kubectl apply -f - <<'YAML'
+              apiVersion: v1
+              kind: Pod
+              metadata: {name: "{{pod}}", namespace: yard-tools}
+              spec:
+                containers:
+                  - name: diag
+                    image: busybox:1.37
+                    command: ["sh", "-c", "while true; do ls /host > /dev/null 2>&1; sleep 30; done"]
+                    volumeMounts: [{name: scratch, mountPath: /host}]
+                volumes:
+                  - name: scratch
+                    emptyDir: {sizeLimit: 100Mi}
+              YAML
+              kubectl -n yard-tools wait pod/{{pod}} --for=condition=Ready --timeout=120s

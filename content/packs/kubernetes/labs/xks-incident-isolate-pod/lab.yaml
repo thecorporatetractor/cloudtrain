@@ -1,0 +1,266 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xks-incident-isolate-pod
+  title: Isolate a flagged Pod for investigation
+  domain: kubernetes
+  frameworks: [cks:monitoring-runtime-security]
+  difficulty: medium
+  estimatedMinutes: 7
+  tags: [exam, incident-response, networkpolicy, forensics]
+  version: 1
+spec:
+  description: |
+    Context: `qm-ledger` (`kubectl config use-context qm-ledger`).
+
+    The incident ticket `~/incident/ticket.txt` on your workstation names a
+    compromised Pod in namespace `customs-intake` by its IP address.
+
+    1. Label that Pod `quarantine=true` (only that Pod).
+    2. Create a NetworkPolicy in `customs-intake` that denies **all ingress
+       and all egress** for Pods labelled `quarantine=true`.
+    3. Keep the Pod running: do not delete or restart it, it is needed for
+       forensics. The other Pods must keep working normally.
+  objectives:
+    - Find a Pod by IP and isolate it without destroying evidence
+  params:
+    index:
+      type: choice
+      values: [0, 1, 2]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      # Canonical sim-k8s-security cluster: every K-tier exam task shares it.
+      - name: qm-ledger
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        access: [ssh]
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-ledger
+          nodes:
+            - {name: ledger-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: ledger-wk-1, role: worker}
+            - {name: ledger-wk-2, role: worker}
+  setup:
+    - on: qm-ledger
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: customs-intake}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: intake-parser, namespace: customs-intake}
+        spec:
+          replicas: 3
+          selector: {matchLabels: {app: intake-parser}}
+          template:
+            metadata: {labels: {app: intake-parser}}
+            spec:
+              containers:
+                - {name: parser, image: busybox:1.37, command: ["sh", "-c", "mkdir -p /w && echo parsed > /w/index.html && exec httpd -f -p 8080 -h /w"]}
+        ---
+        apiVersion: v1
+        kind: Pod
+        metadata: {name: probe, namespace: customs-intake, labels: {app: probe}}
+        spec:
+          containers:
+            - {name: probe, image: busybox:1.37, command: ["sleep", "1d"]}
+    - on: qm-ledger
+      timeoutSec: 150
+      run: |
+        set -e
+        kubectl -n customs-intake rollout status deploy/intake-parser --timeout=140s
+        kubectl -n customs-intake wait pod/probe --for=condition=Ready --timeout=60s
+    # Grader reference, root-only on the control plane.
+    - on: qm-ledger/ledger-cp-1
+      run: |
+        set -e
+        export KUBECONFIG=/etc/kubernetes/admin.conf
+        pod=$(kubectl -n customs-intake get pods -l app=intake-parser -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | sort | sed -n "$(({{index}}+1))p")
+        install -d -m 0700 /var/lib/cloudtrain
+        kubectl -n customs-intake get pod "$pod" -o jsonpath='POD={.metadata.name}{"\n"}IP={.status.podIP}{"\n"}PUID={.metadata.uid}{"\n"}' > /var/lib/cloudtrain/incident.env
+        chmod 0600 /var/lib/cloudtrain/incident.env
+    - on: workstation
+      run: |
+        set -e
+        k="kubectl --kubeconfig /home/learner/.kube/config --context qm-ledger"
+        pod=$($k -n customs-intake get pods -l app=intake-parser -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | sort | sed -n "$(({{index}}+1))p")
+        ip=$($k -n customs-intake get pod "$pod" -o jsonpath='{.status.podIP}')
+        mkdir -p /home/learner/incident
+        cat > /home/learner/incident/ticket.txt <<EOF
+        INCIDENT QM-SEC-4471   severity: high
+        Outbound connections to an unknown host were seen from a customs intake
+        parser Pod. Source address (Pod IP): $ip
+        Action: isolate the Pod for forensics. Do NOT delete it.
+        EOF
+        chown -R learner:learner /home/learner/incident
+  teardown:
+    - on: qm-ledger
+      run: kubectl delete namespace customs-intake --ignore-not-found --wait=false
+  checks:
+    - id: target-labelled
+      description: The compromised Pod (and only it) is labelled quarantine=true
+      type: shell
+      on: qm-ledger/ledger-cp-1
+      skills: [k8s.security.incident-investigation]
+      weight: 2
+      command: |
+        export KUBECONFIG=/etc/kubernetes/admin.conf; . /var/lib/cloudtrain/incident.env
+        want=$POD
+        got=$(kubectl -n customs-intake get pods -l quarantine=true -o jsonpath='{range .items[*]}{.metadata.name}{" "}{end}')
+        [ "$got" = "$want " ] && echo correct || echo "labelled: '$got'"
+      expect: {match: exact, value: correct}
+    - id: target-still-running
+      description: The compromised Pod is the same Pod as before and still Running
+      type: shell
+      on: qm-ledger/ledger-cp-1
+      skills: [k8s.security.incident-investigation]
+      weight: 2
+      command: |
+        export KUBECONFIG=/etc/kubernetes/admin.conf; . /var/lib/cloudtrain/incident.env
+        pod=$POD
+        uid=$PUID
+        got=$(kubectl -n customs-intake get pod "$pod" -o jsonpath='{.metadata.uid}/{.status.phase}/{.status.containerStatuses[0].restartCount}' 2>/dev/null)
+        [ "$got" = "$uid/Running/0" ] && echo same-and-running || echo "now: '$got'"
+      expect: {match: exact, value: same-and-running}
+    - id: ingress-cut
+      description: probe can no longer reach the compromised Pod
+      type: shell
+      on: qm-ledger/ledger-cp-1
+      skills: [k8s.security.incident-investigation]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        export KUBECONFIG=/etc/kubernetes/admin.conf; . /var/lib/cloudtrain/incident.env
+        ip=$IP
+        out=$(kubectl -n customs-intake exec probe -- sh -c "wget -qO- -T 4 http://$ip:8080/ >/dev/null 2>&1; echo rc=\$?" 2>&1)
+        case "$out" in *rc=0*) echo open ;; *rc=*) echo blocked ;; *) echo "error: $out" ;; esac
+      expect: {match: exact, value: blocked}
+    - id: egress-cut
+      description: The compromised Pod can no longer reach the other parser Pods
+      type: shell
+      on: qm-ledger/ledger-cp-1
+      skills: [k8s.security.incident-investigation]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        export KUBECONFIG=/etc/kubernetes/admin.conf; . /var/lib/cloudtrain/incident.env
+        pod=$POD
+        other=$(kubectl -n customs-intake get pods -l app=intake-parser -o jsonpath='{range .items[*]}{.metadata.name} {.status.podIP}{"\n"}{end}' | grep -v "^$pod " | head -1 | awk '{print $2}')
+        out=$(kubectl -n customs-intake exec "$pod" -- sh -c "wget -qO- -T 4 http://$other:8080/ >/dev/null 2>&1; echo rc=\$?" 2>&1)
+        case "$out" in *rc=0*) echo open ;; *rc=*) echo blocked ;; *) echo "error: $out" ;; esac
+      expect: {match: exact, value: blocked}
+    - id: others-unaffected
+      description: probe still reaches the other parser Pods
+      type: shell
+      on: qm-ledger/ledger-cp-1
+      skills: [k8s.security.incident-investigation]
+      timeoutSec: 30
+      command: |
+        export KUBECONFIG=/etc/kubernetes/admin.conf; . /var/lib/cloudtrain/incident.env
+        pod=$POD
+        other=$(kubectl -n customs-intake get pods -l app=intake-parser -o jsonpath='{range .items[*]}{.metadata.name} {.status.podIP}{"\n"}{end}' | grep -v "^$pod " | head -1 | awk '{print $2}')
+        out=$(kubectl -n customs-intake exec probe -- sh -c "wget -qO- -T 4 http://$other:8080/ >/dev/null 2>&1; echo rc=\$?" 2>&1)
+        case "$out" in *rc=0*) echo open ;; *rc=*) echo blocked ;; *) echo "error: $out" ;; esac
+      expect: {match: exact, value: open}
+  misconceptions:
+    - id: deleted-pod
+      description: Deletes the compromised Pod instead of isolating it.
+      feedback: Deleting destroys the evidence and the Deployment just starts a clean replacement. Isolate it in place.
+      expectFail: [target-still-running]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-ledger
+          ip=$(grep -o '[0-9]\+\.[0-9]\+\.[0-9]\+\.[0-9]\+' ~/incident/ticket.txt)
+          pod=$(kubectl -n customs-intake get pods -o wide | awk -v ip="$ip" '$6==ip{print $1}')
+          kubectl -n customs-intake delete pod "$pod"
+    - id: ingress-only-isolation
+      description: Isolates only ingress, so the Pod can still talk out.
+      feedback: A compromised Pod must not reach anything either; include Egress in policyTypes.
+      expectFail: [egress-cut]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-ledger
+          ip=$(grep -o '[0-9]\+\.[0-9]\+\.[0-9]\+\.[0-9]\+' ~/incident/ticket.txt)
+          pod=$(kubectl -n customs-intake get pods -o wide | awk -v ip="$ip" '$6==ip{print $1}')
+          kubectl -n customs-intake label pod "$pod" quarantine=true
+          kubectl apply -f - <<'YAML'
+          apiVersion: networking.k8s.io/v1
+          kind: NetworkPolicy
+          metadata: {name: quarantine, namespace: customs-intake}
+          spec:
+            podSelector: {matchLabels: {quarantine: "true"}}
+            policyTypes: [Ingress]
+          YAML
+    - id: whole-namespace
+      description: Applies the deny-all to every Pod in the namespace.
+      feedback: Select only the quarantined Pod; the other parsers must keep serving.
+      expectFail: [others-unaffected]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-ledger
+          ip=$(grep -o '[0-9]\+\.[0-9]\+\.[0-9]\+\.[0-9]\+' ~/incident/ticket.txt)
+          pod=$(kubectl -n customs-intake get pods -o wide | awk -v ip="$ip" '$6==ip{print $1}')
+          kubectl -n customs-intake label pod "$pod" quarantine=true
+          kubectl apply -f - <<'YAML'
+          apiVersion: networking.k8s.io/v1
+          kind: NetworkPolicy
+          metadata: {name: quarantine, namespace: customs-intake}
+          spec:
+            podSelector: {}
+            policyTypes: [Ingress, Egress]
+          YAML
+  solution:
+    explanation: Map the IP to the Pod, label it, and select that label in a policy with both policy types and no rules.
+    steps:
+      - on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-ledger
+          ip=$(grep -o '[0-9]\+\.[0-9]\+\.[0-9]\+\.[0-9]\+' ~/incident/ticket.txt)
+          pod=$(kubectl -n customs-intake get pods -o wide | awk -v ip="$ip" '$6==ip{print $1}')
+          kubectl -n customs-intake label pod "$pod" quarantine=true
+          kubectl apply -f - <<'YAML'
+          apiVersion: networking.k8s.io/v1
+          kind: NetworkPolicy
+          metadata: {name: quarantine, namespace: customs-intake}
+          spec:
+            podSelector: {matchLabels: {quarantine: "true"}}
+            policyTypes: [Ingress, Egress]
+          YAML
+    alternatives:
+      - id: field-selector
+        description: Find the Pod with a field selector on status.podIP.
+        steps:
+          - on: workstation
+            as: learner
+            run: |
+              kubectl config use-context qm-ledger
+              ip=$(grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' ~/incident/ticket.txt)
+              pod=$(kubectl -n customs-intake get pods --field-selector status.podIP=$ip -o name)
+              kubectl -n customs-intake label $pod quarantine=true
+              kubectl apply -f - <<'YAML'
+              apiVersion: networking.k8s.io/v1
+              kind: NetworkPolicy
+              metadata: {name: isolate-quarantined, namespace: customs-intake}
+              spec:
+                podSelector:
+                  matchExpressions:
+                    - {key: quarantine, operator: In, values: ["true"]}
+                policyTypes: [Ingress, Egress]
+                ingress: []
+                egress: []
+              YAML

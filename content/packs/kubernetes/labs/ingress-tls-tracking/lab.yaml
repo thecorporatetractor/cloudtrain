@@ -1,0 +1,247 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ingress-tls-tracking
+  title: Terminate TLS on the tracking Ingress
+  domain: kubernetes
+  frameworks: [cks:cluster-setup]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [ingress, tls, certificates]
+  version: 1
+spec:
+  description: |
+    Quillmoor Logistics' shipment tracking page `track.quillmoor.example`
+    is served over plain HTTP: customers' tracking numbers and delivery
+    addresses cross the network unencrypted.
+
+    From your workstation, switch to context `qm-tracking`
+    (`kubectl config use-context qm-tracking`). The cluster runs the NGINX
+    Ingress controller (IngressClass `nginx`).
+
+    The certificate and key issued for the site are in `~/certs/`
+    (`track.crt`, `track.key`).
+
+    1. Create a TLS Secret named `{{secret}}` in namespace `parcel-tracking`
+       from those files.
+    2. Change the Ingress `tracking` in that namespace so it serves
+       `track.quillmoor.example` over **HTTPS** with that certificate.
+    3. Plain HTTP requests must be **redirected** to HTTPS.
+  objectives:
+    - Create a kubernetes.io/tls Secret from PEM files
+    - Add a tls section to an Ingress
+    - Verify the served certificate and the HTTP to HTTPS redirect
+  params:
+    secret:
+      type: choice
+      values: [track-tls, tracking-cert, track-quillmoor-tls]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      # Needs an Ingress controller (IngressClass nginx) in the kubeadm image;
+      # see the kubeadm extras work in the foundations stream.
+      - name: qm-tracking
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-tracking
+          nodes:
+            - {name: tracking-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: tracking-wk-1, role: worker}
+  setup:
+    - on: qm-tracking
+      timeoutSec: 200
+      run: |
+        # Prerequisite: an NGINX Ingress controller.
+        for i in $(seq 1 36); do
+          kubectl get ingressclass nginx >/dev/null 2>&1 && \
+            kubectl get svc -A -l app.kubernetes.io/component=controller,app.kubernetes.io/name=ingress-nginx -o name 2>/dev/null | grep -q . && exit 0
+          sleep 5
+        done
+        echo "prerequisite missing: no NGINX Ingress controller (IngressClass nginx) in this cluster image" >&2
+        exit 1
+    - on: workstation
+      run: |
+        set -e
+        mkdir -p /home/learner/certs
+        cd /home/learner/certs
+        openssl req -x509 -newkey rsa:2048 -nodes -days 365 -subj "/O=Quillmoor Logistics/CN=track.quillmoor.example" \
+          -addext "subjectAltName=DNS:track.quillmoor.example" -keyout track.key -out track.crt 2>/dev/null
+        chown -R learner:learner /home/learner/certs
+        chmod 0600 track.key
+    - on: qm-tracking
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: parcel-tracking}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: tracking-web, namespace: parcel-tracking}
+        spec:
+          replicas: 1
+          selector: {matchLabels: {app: tracking-web}}
+          template:
+            metadata: {labels: {app: tracking-web}}
+            spec:
+              containers:
+                - name: web
+                  image: busybox:1.37
+                  command: ["sh", "-c", "mkdir -p /w && echo 'Quillmoor tracking' > /w/index.html && exec httpd -f -p 8080 -h /w"]
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata: {name: tracking-web, namespace: parcel-tracking}
+        spec:
+          selector: {app: tracking-web}
+          ports: [{port: 80, targetPort: 8080}]
+        ---
+        apiVersion: networking.k8s.io/v1
+        kind: Ingress
+        metadata: {name: tracking, namespace: parcel-tracking}
+        spec:
+          ingressClassName: nginx
+          rules:
+            - host: track.quillmoor.example
+              http:
+                paths:
+                  - {path: /, pathType: Prefix, backend: {service: {name: tracking-web, port: {number: 80}}}}
+    - on: qm-tracking
+      timeoutSec: 150
+      run: kubectl -n parcel-tracking rollout status deploy/tracking-web --timeout=140s
+  teardown:
+    - on: qm-tracking
+      run: kubectl delete namespace parcel-tracking --ignore-not-found --wait=false
+  checks:
+    - id: context
+      description: Terminal is using context qm-tracking
+      type: k8s-context
+      on: workstation
+      skills: [k8s.cli.contexts]
+      weight: 0.5
+      expect: {match: exact, value: qm-tracking}
+    - id: tls-secret
+      description: Secret {{secret}} is of type kubernetes.io/tls and holds the provided certificate
+      type: shell
+      on: qm-tracking/tracking-cp-1
+      skills: [k8s.security.ingress-tls]
+      weight: 2
+      command: |
+        export KUBECONFIG=/etc/kubernetes/admin.conf
+        t=$(kubectl -n parcel-tracking get secret {{secret}} -o jsonpath='{.type}' 2>/dev/null)
+        cn=$(kubectl -n parcel-tracking get secret {{secret}} -o jsonpath='{.data.tls\.crt}' 2>/dev/null | base64 -d | openssl x509 -noout -subject -nameopt RFC2253 2>/dev/null)
+        echo "type=$t $cn"
+      expect: {match: regex, value: "^type=kubernetes.io/tls subject=CN=track\\.quillmoor\\.example,O=Quillmoor Logistics$"}
+    - id: ingress-tls
+      description: Ingress tracking lists track.quillmoor.example under tls with secret {{secret}}
+      type: k8s-query
+      skills: [k8s.security.ingress-tls]
+      query: {cluster: qm-tracking, resource: ingress, name: tracking, namespace: parcel-tracking, jsonpath: "{range .spec.tls[*]}{.secretName}:{.hosts[*]}{end}"}
+      expect: {match: exact, value: "{{secret}}:track.quillmoor.example"}
+    - id: https-serves-cert
+      description: HTTPS for track.quillmoor.example returns the page with the provided certificate
+      type: shell
+      on: qm-tracking/tracking-cp-1
+      skills: [k8s.security.ingress-tls]
+      weight: 3
+      timeoutSec: 40
+      command: |
+        export KUBECONFIG=/etc/kubernetes/admin.conf
+        ip=$(kubectl get svc -A -l app.kubernetes.io/component=controller,app.kubernetes.io/name=ingress-nginx -o jsonpath='{.items[0].spec.clusterIP}')
+        sub=$(echo | openssl s_client -connect $ip:443 -servername track.quillmoor.example 2>/dev/null | openssl x509 -noout -subject -nameopt RFC2253 2>/dev/null)
+        body=$(curl -sk -m 5 --resolve track.quillmoor.example:443:$ip https://track.quillmoor.example/)
+        echo "$sub body=$body"
+      expect: {match: exact, value: "subject=CN=track.quillmoor.example,O=Quillmoor Logistics body=Quillmoor tracking"}
+    - id: http-redirects
+      description: Plain HTTP is redirected to HTTPS
+      type: shell
+      on: qm-tracking/tracking-cp-1
+      skills: [k8s.security.ingress-tls]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        export KUBECONFIG=/etc/kubernetes/admin.conf
+        ip=$(kubectl get svc -A -l app.kubernetes.io/component=controller,app.kubernetes.io/name=ingress-nginx -o jsonpath='{.items[0].spec.clusterIP}')
+        curl -s -m 5 -o /dev/null -w '%{http_code} %{redirect_url}' --resolve track.quillmoor.example:80:$ip http://track.quillmoor.example/
+      expect: {match: regex, value: "^30[178] https://track\\.quillmoor\\.example/?$"}
+  hints:
+    - title: The TLS Secret type
+      command: kubectl -n parcel-tracking create secret tls {{secret}} --cert ~/certs/track.crt --key ~/certs/track.key
+      body: "`kubectl create secret tls` builds a kubernetes.io/tls Secret with tls.crt and tls.key."
+      cost: 1
+    - title: The Ingress tls section
+      body: "`spec.tls` takes a list of `{hosts: [...], secretName: ...}`. The host must match the rule's host."
+      cost: 2
+    - title: Redirects
+      body: The NGINX controller redirects HTTP to HTTPS by itself for hosts that have TLS configured.
+      cost: 1
+  misconceptions:
+    - id: generic-secret
+      description: Creates a generic Secret from the files.
+      feedback: The controller only uses kubernetes.io/tls Secrets with tls.crt and tls.key keys; it falls back to its fake certificate.
+      expectFail: [tls-secret, https-serves-cert]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-tracking
+          kubectl -n parcel-tracking create secret generic {{secret}} --from-file=tls.crt=$HOME/certs/track.crt --from-file=tls.key=$HOME/certs/track.key
+          kubectl -n parcel-tracking patch ingress tracking --type=merge -p '{"spec":{"tls":[{"hosts":["track.quillmoor.example"],"secretName":"{{secret}}"}]}}'
+          sleep 10
+    - id: no-hosts
+      description: Adds tls with the secret but without the hosts list.
+      feedback: Without hosts the certificate is not attached to track.quillmoor.example.
+      expectFail: [ingress-tls]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-tracking
+          kubectl -n parcel-tracking create secret tls {{secret}} --cert $HOME/certs/track.crt --key $HOME/certs/track.key
+          kubectl -n parcel-tracking patch ingress tracking --type=merge -p '{"spec":{"tls":[{"secretName":"{{secret}}"}]}}'
+          sleep 10
+  solution:
+    explanation: Create the kubernetes.io/tls Secret and reference it with the host in spec.tls; NGINX then serves the certificate and redirects HTTP with 308.
+    steps:
+      - on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-tracking
+          kubectl -n parcel-tracking create secret tls {{secret}} --cert ~/certs/track.crt --key ~/certs/track.key
+          kubectl -n parcel-tracking patch ingress tracking --type=merge -p '{"spec":{"tls":[{"hosts":["track.quillmoor.example"],"secretName":"{{secret}}"}]}}'
+          sleep 10
+    alternatives:
+      - id: explicit-redirect
+        description: Re-apply the Ingress as YAML with an explicit force-ssl-redirect annotation.
+        steps:
+          - on: workstation
+            as: learner
+            run: |
+              kubectl config use-context qm-tracking
+              kubectl -n parcel-tracking create secret tls {{secret}} --cert ~/certs/track.crt --key ~/certs/track.key
+              kubectl apply -f - <<'YAML'
+              apiVersion: networking.k8s.io/v1
+              kind: Ingress
+              metadata:
+                name: tracking
+                namespace: parcel-tracking
+                annotations:
+                  nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+              spec:
+                ingressClassName: nginx
+                tls:
+                  - hosts: [track.quillmoor.example]
+                    secretName: {{secret}}
+                rules:
+                  - host: track.quillmoor.example
+                    http:
+                      paths:
+                        - {path: /, pathType: Prefix, backend: {service: {name: tracking-web, port: {number: 80}}}}
+              YAML
+              sleep 10

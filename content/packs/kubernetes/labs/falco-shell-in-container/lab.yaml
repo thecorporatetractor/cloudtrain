@@ -1,0 +1,200 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: falco-shell-in-container
+  title: Detect a shell spawned in a container
+  domain: kubernetes
+  frameworks: [cks:monitoring-runtime-security]
+  difficulty: hard
+  estimatedMinutes: 25
+  tags: [falco, runtime-detection, incident-response]
+  version: 1
+spec:
+  description: |
+    Quillmoor Logistics' customs workloads never need an interactive shell,
+    yet the network team saw odd connections from the customs namespace. The
+    cluster runs **Falco** on every node, but no rule watches the customs
+    containers specifically.
+
+    From your workstation, switch to context `qm-customs`
+    (`kubectl config use-context qm-customs`). The worker is reachable with
+    `ssh customs-wk-1` (`sudo` works). Falco runs there as a systemd service;
+    its rules are in `/etc/falco/`.
+
+    1. Add a Falco rule named **`Shell in customs container`** in
+       `/etc/falco/rules.d/qm-customs.yaml` on `customs-wk-1` that fires when a
+       shell (`sh`, `ash` or `bash`) starts in any container of namespace
+       `customs-clearance`. Its output must include the **Pod name** and the
+       **command line**. Make Falco load it.
+    2. Trigger it yourself once (for example with `kubectl exec` into
+       `declaration-api`) and check that the alert appears.
+    3. One Pod in `customs-clearance` spawns shells on its own: that is the
+       attacker. Identify it from the alerts and **delete** it. Leave every
+       other Pod running.
+  objectives:
+    - Write a Falco rule with macros, fields and an output format
+    - Reload Falco and read its alerts
+    - Act on an alert by removing the compromised Pod
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      # Needs Falco on the nodes (kubeadm:1.37-sec).
+      - name: qm-customs
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        access: [ssh]
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-customs
+          nodes:
+            - {name: customs-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: customs-wk-1, role: worker}
+  setup:
+    - on: qm-customs/customs-wk-1
+      run: |
+        command -v falco >/dev/null || { echo "prerequisite missing: Falco is not installed on the node image (needs kubeadm:1.37-sec)" >&2; exit 1; }
+        systemctl list-units --type=service --state=running 'falco*' --no-legend | grep -q . || { echo "prerequisite missing: no running falco service" >&2; exit 1; }
+        mkdir -p /etc/falco/rules.d
+    - on: qm-customs
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: customs-clearance}
+        ---
+        apiVersion: v1
+        kind: Pod
+        metadata: {name: declaration-api, namespace: customs-clearance, labels: {app: declaration-api}}
+        spec:
+          containers:
+            - {name: api, image: busybox:1.37, command: ["sleep", "1d"]}
+        ---
+        apiVersion: v1
+        kind: Pod
+        metadata: {name: tariff-cache, namespace: customs-clearance, labels: {app: tariff-cache}}
+        spec:
+          containers:
+            - {name: cache, image: busybox:1.37, command: ["sleep", "1d"]}
+        ---
+        apiVersion: v1
+        kind: Pod
+        metadata: {name: manifest-relay, namespace: customs-clearance, labels: {app: manifest-relay}}
+        spec:
+          containers:
+            - name: relay
+              image: busybox:1.37
+              command: ["/bin/sleep", "1d"]
+              lifecycle:
+                postStart:
+                  exec:
+                    command: ["/bin/busybox", "nohup", "/bin/sh", "-c", "while true; do /bin/sh -c 'id; cat /etc/hostname' >/dev/null; /bin/sleep 15; done"]
+  teardown:
+    - on: qm-customs
+      run: kubectl delete namespace customs-clearance --ignore-not-found --wait=false
+  checks:
+    - id: context
+      description: Terminal is using context qm-customs
+      type: k8s-context
+      on: workstation
+      skills: [k8s.cli.contexts]
+      weight: 0.5
+      expect: {match: exact, value: qm-customs}
+    - id: rule-loaded
+      description: Falco on customs-wk-1 loads a rule named "Shell in customs container"
+      type: shell
+      on: qm-customs/customs-wk-1
+      skills: [k8s.security.runtime-detection]
+      weight: 2
+      timeoutSec: 60
+      command: |
+        f=/etc/falco/rules.d/qm-customs.yaml
+        [ -s $f ] || { echo "no rule file"; exit 0; }
+        falco -L 2>/dev/null | grep -q "Shell in customs container" && echo loaded || echo "not loaded"
+      expect: {match: exact, value: loaded}
+    - id: rule-fires
+      description: A shell started in a customs container produces an alert with Pod name and command line
+      type: shell
+      on: qm-customs/customs-wk-1
+      skills: [k8s.security.runtime-detection]
+      weight: 3
+      timeoutSec: 60
+      command: |
+        export KUBECONFIG=/etc/kubernetes/kubelet.conf
+        marker="qmprobe$(date +%s)"
+        crictl exec $(crictl ps --name cache -q | head -n1) /bin/sh -c "echo $marker" >/dev/null 2>&1
+        sleep 5
+        journalctl -u 'falco*' --since '-2min' --no-pager -o cat 2>/dev/null | grep 'Shell in customs container' | grep "$marker" | grep -q tariff-cache && echo alerted || echo "no alert"
+      expect: {match: exact, value: alerted}
+    - id: attacker-removed
+      description: The Pod that spawns shells on its own (manifest-relay) is deleted
+      type: shell
+      on: qm-customs
+      skills: [k8s.security.runtime-detection]
+      weight: 2
+      command: kubectl -n customs-clearance get pod manifest-relay >/dev/null 2>&1 && echo present || echo deleted
+      expect: {match: exact, value: deleted}
+    - id: others-running
+      description: declaration-api and tariff-cache are still Running
+      type: shell
+      on: qm-customs
+      skills: [k8s.security.runtime-detection]
+      command: kubectl -n customs-clearance get pod declaration-api tariff-cache -o jsonpath='{range .items[*]}{.status.phase}{" "}{end}' 2>/dev/null
+      expect: {match: exact, value: "Running Running "}
+  hints:
+    - title: Rule skeleton
+      body: |
+        A rule has `rule`, `desc`, `condition`, `output` and `priority`. The
+        stock macros `spawned_process` and `container` exist; fields include
+        `k8s.ns.name`, `k8s.pod.name`, `proc.name` and `proc.cmdline`.
+      cost: 2
+    - title: Reload
+      body: Restart the Falco service after adding a rules file, and check its log for rule errors.
+      command: ssh customs-wk-1 'sudo systemctl restart "falco*"; sudo journalctl -u "falco*" -n 20 --no-pager'
+      cost: 1
+    - title: Read the alerts
+      command: ssh customs-wk-1 'sudo journalctl -u "falco*" --since -5min --no-pager | grep "Shell in customs container"'
+      body: Alerts you triggered with kubectl exec come from the Pod you chose; the attacker's keep coming without you.
+      cost: 1
+  misconceptions:
+    - id: deleted-wrong-pod
+      description: Deletes the Pod used for the test trigger instead of the attacker.
+      feedback: Your own kubectl exec also fires the rule. The attacker's alerts keep arriving every few seconds without you.
+      expectFail: [attacker-removed, others-running]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-customs
+          kubectl -n customs-clearance delete pod declaration-api --now
+  solution:
+    explanation: |
+      The rule combines spawned_process and container with the namespace and
+      shell names; its output includes %k8s.pod.name and %proc.cmdline. After a
+      restart Falco loads it; manifest-relay produces alerts every 15 seconds
+      without any exec from you, so it is the one to delete.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          kubectl config use-context qm-customs
+          ssh customs-wk-1 'sudo bash -s' <<'EOS'
+          cat > /etc/falco/rules.d/qm-customs.yaml <<'EOF'
+          - rule: Shell in customs container
+            desc: A shell started in a container of the customs-clearance namespace
+            condition: spawned_process and container and k8s.ns.name = "customs-clearance" and proc.name in (sh, ash, bash)
+            output: "Shell in customs container (pod=%k8s.pod.name ns=%k8s.ns.name container=%container.name cmdline=%proc.cmdline user=%user.name)"
+            priority: WARNING
+            tags: [customs, shell]
+          EOF
+          systemctl restart $(systemctl list-units --type=service --state=running 'falco*' --no-legend | awk '{print $1}' | head -n1)
+          sleep 20
+          EOS
+          kubectl -n customs-clearance exec declaration-api -- sh -c 'echo test'
+          sleep 20
+          pod=$(ssh customs-wk-1 'sudo journalctl -u "falco*" --since -2min --no-pager -o cat' | grep 'Shell in customs container' | grep -v declaration-api | grep -o 'pod=[^ ]*' | sort | uniq -c | sort -rn | awk 'NR==1{print $2}' | cut -d= -f2)
+          kubectl -n customs-clearance delete pod "$pod"

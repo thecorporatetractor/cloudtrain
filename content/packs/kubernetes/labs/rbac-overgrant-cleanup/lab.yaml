@@ -1,0 +1,322 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: rbac-overgrant-cleanup
+  title: Strip an over-broad grant back to least privilege
+  domain: kubernetes
+  frameworks: [cks:cluster-hardening]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [rbac, least-privilege, serviceaccount, clusterrolebinding]
+  version: 1
+spec:
+  description: |
+    Quillmoor Logistics' harbour dispatch team runs a small status dashboard,
+    `berth-dashboard`, in namespace `{{ns}}`. To "make it work" someone bound
+    its ServiceAccount `{{sa}}` to **cluster-admin**. Any compromise of that
+    Pod would hand an attacker the whole cluster.
+
+    From your workstation, switch to context `qm-dispatch` first:
+
+    ```bash
+    kubectl config use-context qm-dispatch
+    ```
+
+    1. Remove every cluster-wide grant to `{{sa}}`.
+    2. Give `{{sa}}` a **read-only** grant, valid **only in `{{ns}}`**, on
+       exactly the resources the dashboard reads. The dashboard logs every
+       API path it polls (`kubectl -n {{ns}} logs deploy/berth-dashboard`).
+       It needs the verbs `get`, `list` and `watch`, nothing else.
+    3. The dashboard must keep working: its Pod reports Ready only while
+       every poll succeeds.
+  objectives:
+    - Find who holds cluster-admin through a ClusterRoleBinding
+    - Derive the needed resources from what a workload actually calls
+    - Write a namespaced read-only Role and RoleBinding
+    - Prove access and denial with kubectl auth can-i
+  params:
+    ns:
+      type: choice
+      values: [harbour-ops, berth-control, quay-status]
+    sa:
+      type: choice
+      values: [berth-viewer, dashboard-reader, status-board]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-dispatch
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: qm-dispatch
+  setup:
+    - on: qm-dispatch
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: "{{ns}}"}
+        ---
+        apiVersion: v1
+        kind: ServiceAccount
+        metadata: {name: "{{sa}}", namespace: "{{ns}}"}
+        ---
+        apiVersion: rbac.authorization.k8s.io/v1
+        kind: ClusterRoleBinding
+        metadata: {name: berth-dashboard-admin}
+        roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: cluster-admin}
+        subjects:
+          - {kind: ServiceAccount, name: "{{sa}}", namespace: "{{ns}}"}
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata: {name: berth-dashboard, namespace: "{{ns}}"}
+        spec:
+          selector: {app: berth-dashboard}
+          ports: [{port: 80, targetPort: 8080}]
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: berth-dashboard, namespace: "{{ns}}"}
+        spec:
+          replicas: 1
+          selector: {matchLabels: {app: berth-dashboard}}
+          template:
+            metadata: {labels: {app: berth-dashboard}}
+            spec:
+              serviceAccountName: "{{sa}}"
+              containers:
+                - name: dashboard
+                  image: busybox:1.37
+                  command: ["sh", "-c"]
+                  args:
+                    - |
+                      SA=/var/run/secrets/kubernetes.io/serviceaccount
+                      NS=$(cat $SA/namespace)
+                      API=https://kubernetes.default.svc
+                      while true; do
+                        ok=1
+                        for p in /api/v1/namespaces/$NS/pods /api/v1/namespaces/$NS/services /apis/apps/v1/namespaces/$NS/deployments; do
+                          if wget -q -T 5 --no-check-certificate --header "Authorization: Bearer $(cat $SA/token)" -O /dev/null "$API$p" 2>/dev/null; then
+                            echo "$(date -u +%H:%M:%S) GET $p 200"
+                          else
+                            echo "$(date -u +%H:%M:%S) GET $p FAILED"; ok=0
+                          fi
+                        done
+                        if [ $ok = 1 ]; then touch /tmp/healthy; else rm -f /tmp/healthy; fi
+                        sleep 5
+                      done
+                  readinessProbe:
+                    exec: {command: ["test", "-f", "/tmp/healthy"]}
+                    periodSeconds: 3
+                    failureThreshold: 1
+    - on: qm-dispatch
+      timeoutSec: 150
+      run: kubectl -n {{ns}} rollout status deploy/berth-dashboard --timeout=140s
+  teardown:
+    - on: qm-dispatch
+      run: |
+        kubectl delete clusterrolebinding berth-dashboard-admin --ignore-not-found
+        kubectl delete namespace {{ns}} --ignore-not-found --wait=false
+  checks:
+    - id: context
+      description: Terminal is using context qm-dispatch
+      type: k8s-context
+      on: workstation
+      skills: [k8s.cli.contexts]
+      weight: 0.5
+      expect: {match: exact, value: qm-dispatch}
+    - id: no-cluster-binding
+      description: No ClusterRoleBinding grants anything to {{sa}}
+      type: shell
+      on: qm-dispatch
+      skills: [k8s.security.rbac-least-privilege]
+      weight: 2
+      command: |
+        kubectl get clusterrolebindings -o json | jq -r '[.items[] | select(any(.subjects[]?; .kind=="ServiceAccount" and .name=="{{sa}}" and .namespace=="{{ns}}")) | .metadata.name] | length'
+      expect: {match: exact, value: "0"}
+    - id: not-cluster-admin
+      description: "{{sa}} can no longer do everything (cannot delete Nodes)"
+      type: k8s-can-i
+      skills: [k8s.security.rbac-least-privilege]
+      query: {cluster: qm-dispatch, verb: delete, resource: nodes, as: "system:serviceaccount:{{ns}}:{{sa}}"}
+      expect: {match: exact, value: "no"}
+    - id: reads-pods
+      description: "{{sa}} can list Pods in {{ns}}"
+      type: k8s-can-i
+      skills: [k8s.rbac.binding-scope]
+      query: {cluster: qm-dispatch, verb: list, resource: pods, namespace: "{{ns}}", as: "system:serviceaccount:{{ns}}:{{sa}}"}
+      expect: {match: exact, value: "yes"}
+    - id: reads-deployments
+      description: "{{sa}} can watch Deployments in {{ns}}"
+      type: k8s-can-i
+      skills: [k8s.rbac.binding-scope]
+      query: {cluster: qm-dispatch, verb: watch, resource: deployments.apps, namespace: "{{ns}}", as: "system:serviceaccount:{{ns}}:{{sa}}"}
+      expect: {match: exact, value: "yes"}
+    - id: no-secrets
+      description: "{{sa}} cannot read Secrets in {{ns}}"
+      type: k8s-can-i
+      skills: [k8s.security.rbac-least-privilege]
+      weight: 2
+      query: {cluster: qm-dispatch, verb: get, resource: secrets, namespace: "{{ns}}", as: "system:serviceaccount:{{ns}}:{{sa}}"}
+      expect: {match: exact, value: "no"}
+    - id: no-writes
+      description: "{{sa}} cannot delete Pods or patch Deployments in {{ns}}"
+      type: shell
+      on: qm-dispatch
+      skills: [k8s.security.rbac-least-privilege]
+      weight: 2
+      command: |
+        a=$(kubectl auth can-i delete pods -n {{ns}} --as=system:serviceaccount:{{ns}}:{{sa}} 2>/dev/null)
+        b=$(kubectl auth can-i patch deployments.apps -n {{ns}} --as=system:serviceaccount:{{ns}}:{{sa}} 2>/dev/null)
+        echo "delete-pods=$a patch-deployments=$b"
+      expect: {match: exact, value: "delete-pods=no patch-deployments=no"}
+    - id: namespace-scoped
+      description: "{{sa}} cannot list Pods in kube-system"
+      type: k8s-can-i
+      skills: [k8s.rbac.binding-scope]
+      weight: 2
+      query: {cluster: qm-dispatch, verb: list, resource: pods, namespace: kube-system, as: "system:serviceaccount:{{ns}}:{{sa}}"}
+      expect: {match: exact, value: "no"}
+    - id: dashboard-healthy
+      description: berth-dashboard still polls the API successfully (Pod Ready)
+      type: shell
+      on: qm-dispatch
+      skills: [k8s.security.rbac-least-privilege]
+      weight: 2
+      timeoutSec: 45
+      command: |
+        for i in $(seq 1 12); do
+          r=$(kubectl -n {{ns}} get pods -l app=berth-dashboard -o json | jq -r '[.items[] | select(.metadata.deletionTimestamp == null) | (.status.conditions[]? | select(.type=="Ready") | .status)] | join("")')
+          [ "$r" = True ] && { echo ready; exit 0; }
+          sleep 3
+        done
+        echo "not ready: '$r'"
+      expect: {match: exact, value: ready}
+  hints:
+    - title: Switch context
+      body: The dashboard runs on the dispatch cluster.
+      command: kubectl config use-context qm-dispatch
+      cost: 0
+    - title: Find the over-broad grant
+      body: Look for bindings whose subjects include the dashboard's ServiceAccount.
+      command: kubectl get clusterrolebindings -o wide | grep {{sa}}
+      cost: 1
+    - title: What does it read?
+      body: The log names the API paths. `/api/v1/...` is the core group, `/apis/apps/v1/...` the apps group.
+      command: kubectl -n {{ns}} logs deploy/berth-dashboard --tail=6
+      cost: 1
+    - title: Imperative shortcut
+      body: A Role takes several resources and verbs at once; bind it with a RoleBinding in the same namespace.
+      command: kubectl -n {{ns}} create role berth-dashboard-read --verb=get,list,watch --resource=pods,services,deployments.apps
+      cost: 2
+  misconceptions:
+    - id: cluster-view
+      description: Swaps cluster-admin for the built-in view ClusterRole but keeps a ClusterRoleBinding.
+      feedback: A ClusterRoleBinding applies everywhere, so the dashboard can still read every namespace. Bind with a RoleBinding in {{ns}}.
+      expectFail: [no-cluster-binding, namespace-scoped]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl delete clusterrolebinding berth-dashboard-admin
+          kubectl create clusterrolebinding berth-dashboard-view --clusterrole=view --serviceaccount={{ns}}:{{sa}}
+    - id: wildcard-resources
+      description: Grants get/list/watch on every resource in the namespace.
+      feedback: '`resources: ["*"]` includes Secrets. List exactly the resources the dashboard polls.'
+      expectFail: [no-secrets]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl delete clusterrolebinding berth-dashboard-admin
+          kubectl apply -f - <<'YAML'
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: Role
+          metadata: {name: dashboard-read, namespace: "{{ns}}"}
+          rules:
+            - apiGroups: ["", "apps"]
+              resources: ["*"]
+              verbs: [get, list, watch]
+          YAML
+          kubectl -n {{ns}} create rolebinding dashboard-read --role=dashboard-read --serviceaccount={{ns}}:{{sa}}
+    - id: missing-apps-group
+      description: Lists deployments under the core API group, so the Deployment poll is still denied.
+      feedback: 'Deployments live in the `apps` group. A rule with `apiGroups: [""]` never matches them, and the dashboard turns unready.'
+      expectFail: [reads-deployments, dashboard-healthy]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl delete clusterrolebinding berth-dashboard-admin
+          kubectl apply -f - <<'YAML'
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: Role
+          metadata: {name: dashboard-read, namespace: "{{ns}}"}
+          rules:
+            - apiGroups: [""]
+              resources: [pods, services, deployments]
+              verbs: [get, list, watch]
+          YAML
+          kubectl -n {{ns}} create rolebinding dashboard-read --role=dashboard-read --serviceaccount={{ns}}:{{sa}}
+    - id: binding-left-in-place
+      description: Adds the namespaced Role but leaves the cluster-admin binding in place.
+      feedback: RBAC is additive. A narrow Role changes nothing while the cluster-admin binding still exists; delete it.
+      expectFail: [no-cluster-binding, not-cluster-admin, no-secrets]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl -n {{ns}} create role dashboard-read --verb=get,list,watch --resource=pods,services,deployments.apps
+          kubectl -n {{ns}} create rolebinding dashboard-read --role=dashboard-read --serviceaccount={{ns}}:{{sa}}
+  solution:
+    explanation: |
+      Delete the ClusterRoleBinding to cluster-admin, then grant get/list/watch
+      on pods and services (core group) and deployments (apps group) through a
+      Role and RoleBinding in {{ns}}. Nothing outside {{ns}} and no write verb
+      or Secret access remains, and the dashboard's polls keep succeeding.
+    steps:
+      - on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl delete clusterrolebinding berth-dashboard-admin
+          kubectl -n {{ns}} create role berth-dashboard-read --verb=get,list,watch --resource=pods,services,deployments.apps
+          kubectl -n {{ns}} create rolebinding berth-dashboard-read --role=berth-dashboard-read --serviceaccount={{ns}}:{{sa}}
+          kubectl auth can-i list deployments.apps -n {{ns}} --as=system:serviceaccount:{{ns}}:{{sa}}
+    alternatives:
+      - id: clusterrole-rolebinding
+        description: A reusable ClusterRole bound by a RoleBinding in {{ns}}, written as YAML.
+        steps:
+          - on: workstation
+            as: learner
+            run: |
+              kubectl config use-context qm-dispatch
+              kubectl delete clusterrolebinding berth-dashboard-admin
+              kubectl apply -f - <<'YAML'
+              apiVersion: rbac.authorization.k8s.io/v1
+              kind: ClusterRole
+              metadata: {name: berth-dashboard-reader}
+              rules:
+                - apiGroups: [""]
+                  resources: [pods, services]
+                  verbs: [get, list, watch]
+                - apiGroups: [apps]
+                  resources: [deployments]
+                  verbs: [get, list, watch]
+              ---
+              apiVersion: rbac.authorization.k8s.io/v1
+              kind: RoleBinding
+              metadata: {name: berth-dashboard-reader, namespace: "{{ns}}"}
+              roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: berth-dashboard-reader}
+              subjects:
+                - {kind: ServiceAccount, name: "{{sa}}", namespace: "{{ns}}"}
+              YAML

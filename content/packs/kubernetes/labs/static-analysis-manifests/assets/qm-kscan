@@ -1,0 +1,50 @@
+#!/bin/bash
+# qm-kscan: Quillmoor's manifest risk analyser (CloudTrain lab tool).
+# Usage: qm-kscan <file|dir>...
+# Scans Kubernetes YAML (Pods and workload controllers) for risky settings:
+#   HOSTPATH                 a volume of type hostPath
+#   PRIVILEGED               a container with securityContext.privileged: true
+#   RUN_AS_ROOT              runAsUser 0, or runAsNonRoot not enforced (Pod or container level)
+#   HOST_NETWORK / HOST_PID  the Pod shares the node's network / process namespace
+#   PRIV_ESCALATION          allowPrivilegeEscalation: true set explicitly
+# Prints one line per finding and a summary; exit code 1 when findings exist,
+# 2 on a parse error.
+set -uo pipefail
+[ $# -gt 0 ] || { echo "usage: qm-kscan <file|dir>..." >&2; exit 2; }
+files=()
+for a in "$@"; do
+  if [ -d "$a" ]; then while IFS= read -r f; do files+=("$f"); done < <(find "$a" -type f \( -name '*.yaml' -o -name '*.yml' \) | sort)
+  elif [ -f "$a" ]; then files+=("$a")
+  else echo "qm-kscan: $a: no such file or directory" >&2; exit 2; fi
+done
+total=0; rc=0
+for f in "${files[@]}"; do
+  json=$(yq ea -o=json -I=0 '[.]' "$f" 2>&1) || { echo "qm-kscan: $f: YAML parse error: $json" >&2; rc=2; continue; }
+  out=$(jq -r --arg f "$f" '
+    .[] | select(type == "object" and .kind != null) |
+    . as $o |
+    (if .kind == "Pod" then .spec
+     elif .kind == "CronJob" then .spec.jobTemplate.spec.template.spec
+     elif (.kind | IN("Deployment","StatefulSet","DaemonSet","ReplicaSet","Job")) then .spec.template.spec
+     else empty end) as $p |
+    select($p != null) |
+    "\($f): \($o.kind)/\($o.metadata.name)" as $w |
+    ( ($p.volumes // [])[] | select(.hostPath) | "\($w) HOSTPATH volume \(.name) mounts host path \(.hostPath.path)" ),
+    ( if $p.hostNetwork == true then "\($w) HOST_NETWORK Pod uses the node network namespace" else empty end ),
+    ( if $p.hostPID == true then "\($w) HOST_PID Pod uses the node process namespace" else empty end ),
+    ( ($p.initContainers // []) + ($p.containers // []) | .[] |
+      . as $c |
+      ( if $c.securityContext.privileged == true then "\($w) PRIVILEGED container \($c.name) is privileged" else empty end ),
+      ( if $c.securityContext.allowPrivilegeEscalation == true then "\($w) PRIV_ESCALATION container \($c.name) allows privilege escalation" else empty end ),
+      ( ($c.securityContext.runAsUser // $p.securityContext.runAsUser) as $uid |
+        ($c.securityContext.runAsNonRoot // $p.securityContext.runAsNonRoot) as $nr |
+        if $uid == 0 then "\($w) RUN_AS_ROOT container \($c.name) runs as UID 0"
+        elif $nr != true then "\($w) RUN_AS_ROOT container \($c.name) does not enforce runAsNonRoot"
+        else empty end ) )
+  ' <<<"$json" 2>&1) || { echo "qm-kscan: $f: $out" >&2; rc=2; continue; }
+  if [ -n "$out" ]; then echo "$out"; total=$((total + $(printf '%s\n' "$out" | wc -l))); fi
+done
+echo "qm-kscan: ${#files[@]} file(s) scanned, $total finding(s)"
+[ $rc = 2 ] && exit 2
+[ $total -gt 0 ] && exit 1
+exit 0

@@ -1,0 +1,228 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: cis-apiserver-findings
+  title: Fix CIS benchmark findings on a control plane
+  domain: kubernetes
+  frameworks: [cks:cluster-setup]
+  difficulty: hard
+  estimatedMinutes: 30
+  tags: [cis-benchmark, kube-bench, kube-apiserver, kubelet]
+  version: 1
+spec:
+  description: |
+    Quillmoor Logistics' container yard cluster is due for its quarterly CIS
+    review. A change last week introduced three regressions on the control
+    plane node `yard-cp-1`, and the benchmark now reports these checks as
+    **FAIL**:
+
+    - **1.2.7** Ensure that the `--authorization-mode` argument is not set to
+      `AlwaysAllow` (API server)
+    - **4.2.1** Ensure that the `--anonymous-auth` argument is set to false
+      (kubelet)
+    - **4.2.4** Verify that the `--read-only-port` argument is set to 0
+      (kubelet)
+
+    From your workstation, switch to context `qm-yard`
+    (`kubectl config use-context qm-yard`); reach the node with
+    `ssh yard-cp-1` (`sudo` works).
+
+    1. Run the benchmark tool on `yard-cp-1` and confirm the three FAIL
+       results (`sudo kube-bench run --targets master,node --check
+       1.2.7,4.2.1,4.2.4`).
+    2. Apply the remediations the tool prints for those three checks.
+    3. Rescan: all three must PASS, and the cluster must keep working.
+  objectives:
+    - Run kube-bench for selected checks
+    - Remediate API server authorization mode
+    - Remediate kubelet anonymous auth and the read-only port
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      # Needs kube-bench on the node (kubeadm:1.37-sec).
+      - name: qm-yard
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        access: [ssh]
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-yard
+          nodes:
+            - {name: yard-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: yard-wk-1, role: worker}
+  setup:
+    - on: qm-yard/yard-cp-1
+      timeoutSec: 500
+      run: |
+        set -e
+        command -v kube-bench >/dev/null || { echo "prerequisite missing: kube-bench is not installed on the node image (needs kubeadm:1.37-sec)" >&2; exit 1; }
+        python3 - <<'PY'
+        import yaml
+        p = "/var/lib/kubelet/config.yaml"
+        c = yaml.safe_load(open(p))
+        c.setdefault("authentication", {}).setdefault("anonymous", {})["enabled"] = True
+        c["readOnlyPort"] = 10255
+        open(p, "w").write(yaml.safe_dump(c, default_flow_style=False))
+        p = "/etc/kubernetes/manifests/kube-apiserver.yaml"
+        m = yaml.safe_load(open(p))
+        c = m["spec"]["containers"][0]
+        c["command"] = [("--authorization-mode=AlwaysAllow,Node,RBAC" if a.startswith("--authorization-mode=") else a) for a in c["command"]]
+        open(p, "w").write(yaml.safe_dump(m, default_flow_style=False))
+        PY
+        systemctl restart kubelet
+        for i in $(seq 1 90); do
+          ps -C kube-apiserver -o args= | grep -q -- --authorization-mode=AlwaysAllow && curl -sfk https://127.0.0.1:6443/readyz >/dev/null && exit 0
+          sleep 5
+        done
+        exit 1
+    - on: qm-yard
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: yard-ops}
+        ---
+        apiVersion: v1
+        kind: ServiceAccount
+        metadata: {name: crane-monitor, namespace: yard-ops}
+        ---
+        apiVersion: rbac.authorization.k8s.io/v1
+        kind: RoleBinding
+        metadata: {name: crane-monitor-view, namespace: yard-ops}
+        roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: view}
+        subjects:
+          - {kind: ServiceAccount, name: crane-monitor, namespace: yard-ops}
+  teardown:
+    - on: qm-yard
+      run: kubectl delete namespace yard-ops --ignore-not-found --wait=false
+  checks:
+    - id: context
+      description: Terminal is using context qm-yard
+      type: k8s-context
+      on: workstation
+      skills: [k8s.cli.contexts]
+      weight: 0.5
+      expect: {match: exact, value: qm-yard}
+    - id: rescan-passes
+      description: kube-bench reports PASS for 1.2.7, 4.2.1 and 4.2.4 on yard-cp-1
+      type: shell
+      on: qm-yard/yard-cp-1
+      skills: [k8s.security.cis-benchmark]
+      weight: 3
+      timeoutSec: 120
+      command: |
+        kube-bench run --targets master,node --check 1.2.7,4.2.1,4.2.4 --json 2>/dev/null \
+          | jq -r '[.Controls[]?.tests[]?.results[]? | select(.test_number=="1.2.7" or .test_number=="4.2.1" or .test_number=="4.2.4") | "\(.test_number)=\(.status)"] | sort | join(" ")'
+      expect: {match: exact, value: "1.2.7=PASS 4.2.1=PASS 4.2.4=PASS"}
+    - id: rbac-enforced
+      description: A ServiceAccount without RBAC grants can no longer list Secrets (AlwaysAllow is gone)
+      type: shell
+      on: qm-yard/yard-cp-1
+      skills: [k8s.security.cis-benchmark]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        export KUBECONFIG=/etc/kubernetes/admin.conf
+        tok=$(kubectl -n yard-ops create token crane-monitor --duration=10m)
+        echo "code=$(curl -sk -m 5 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $tok" https://127.0.0.1:6443/api/v1/namespaces/kube-system/secrets)"
+      expect: {match: exact, value: code=403}
+    - id: rbac-grants-work
+      description: RBAC still grants what it should (crane-monitor can list Pods in yard-ops)
+      type: shell
+      on: qm-yard/yard-cp-1
+      skills: [k8s.security.cis-benchmark]
+      timeoutSec: 30
+      command: |
+        export KUBECONFIG=/etc/kubernetes/admin.conf
+        tok=$(kubectl -n yard-ops create token crane-monitor --duration=10m)
+        echo "code=$(curl -sk -m 5 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $tok" https://127.0.0.1:6443/api/v1/namespaces/yard-ops/pods)"
+      expect: {match: exact, value: code=200}
+    - id: kubelet-locked
+      description: The yard-cp-1 kubelet rejects anonymous requests and no longer listens on 10255
+      type: shell
+      on: qm-yard/yard-cp-1
+      skills: [k8s.security.cis-benchmark]
+      weight: 2
+      timeoutSec: 30
+      command: echo "anon=$(curl -sk -m 5 -o /dev/null -w '%{http_code}' https://127.0.0.1:10250/pods) ro=$(ss -Htln 'sport = :10255' | wc -l)"
+      expect: {match: exact, value: anon=401 ro=0}
+    - id: cluster-healthy
+      description: Both nodes are Ready and the admin kubeconfig works
+      type: shell
+      on: qm-yard
+      skills: [k8s.security.cis-benchmark]
+      timeoutSec: 60
+      command: kubectl get nodes -o jsonpath='{range .items[*]}{.status.conditions[?(@.type=="Ready")].status}{" "}{end}'
+      expect: {match: exact, value: "True True "}
+  hints:
+    - title: Run only the checks you need
+      command: ssh yard-cp-1 'sudo kube-bench run --targets master,node --check 1.2.7,4.2.1,4.2.4'
+      body: The output ends with remediation text for every FAIL.
+      cost: 0
+    - title: Where each setting lives
+      body: |
+        The API server flags are in /etc/kubernetes/manifests/kube-apiserver.yaml;
+        the kubelet reads /var/lib/kubelet/config.yaml (authentication.anonymous.enabled,
+        readOnlyPort) and must be restarted after a change.
+      cost: 1
+  misconceptions:
+    - id: kubelet-not-restarted
+      description: Edits the kubelet config but does not restart the kubelet.
+      feedback: The running kubelet keeps its old settings until restarted.
+      expectFail: [kubelet-locked]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 600
+        run: |
+          kubectl config use-context qm-yard
+          ssh yard-cp-1 'sudo bash -s' <<'EOS'
+          sed -i 's/--authorization-mode=AlwaysAllow,Node,RBAC/--authorization-mode=Node,RBAC/' /etc/kubernetes/manifests/kube-apiserver.yaml
+          sed -i '/^  anonymous:/{n;s/enabled: true/enabled: false/}' /var/lib/kubelet/config.yaml
+          sed -i 's/^readOnlyPort: 10255$/readOnlyPort: 0/' /var/lib/kubelet/config.yaml
+          for i in $(seq 1 90); do
+            ps -C kube-apiserver -o args= | grep -q -- '--authorization-mode=Node,RBAC' && curl -sfk https://127.0.0.1:6443/readyz >/dev/null && break
+            sleep 5
+          done
+          EOS
+    - id: rbac-dropped
+      description: Removes AlwaysAllow together with RBAC, leaving only Node.
+      feedback: Node alone authorizes only kubelets; users and controllers need RBAC. Remove only AlwaysAllow.
+      expectFail: [rbac-grants-work]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 600
+        run: |
+          kubectl config use-context qm-yard
+          ssh yard-cp-1 'sudo bash -s' <<'EOS'
+          sed -i 's/--authorization-mode=AlwaysAllow,Node,RBAC/--authorization-mode=Node/' /etc/kubernetes/manifests/kube-apiserver.yaml
+          sed -i '/^  anonymous:/{n;s/enabled: true/enabled: false/}' /var/lib/kubelet/config.yaml
+          sed -i 's/^readOnlyPort: 10255$/readOnlyPort: 0/' /var/lib/kubelet/config.yaml
+          systemctl restart kubelet
+          sleep 60
+          EOS
+  solution:
+    explanation: Drop AlwaysAllow from --authorization-mode (keep Node,RBAC), set authentication.anonymous.enabled false and readOnlyPort 0 in the kubelet config, restart the kubelet and rescan.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 600
+        run: |
+          kubectl config use-context qm-yard
+          ssh yard-cp-1 'sudo bash -s' <<'EOS'
+          kube-bench run --targets master,node --check 1.2.7,4.2.1,4.2.4 | grep -E '^\[(FAIL|PASS)\]'
+          sed -i 's/--authorization-mode=AlwaysAllow,Node,RBAC/--authorization-mode=Node,RBAC/' /etc/kubernetes/manifests/kube-apiserver.yaml
+          sed -i '/^  anonymous:/{n;s/enabled: true/enabled: false/}' /var/lib/kubelet/config.yaml
+          sed -i 's/^readOnlyPort: 10255$/readOnlyPort: 0/' /var/lib/kubelet/config.yaml
+          systemctl restart kubelet
+          for i in $(seq 1 90); do
+            ps -C kube-apiserver -o args= | grep -q -- '--authorization-mode=Node,RBAC' && curl -sfk https://127.0.0.1:6443/readyz >/dev/null && break
+            sleep 5
+          done
+          kube-bench run --targets master,node --check 1.2.7,4.2.1,4.2.4 | grep -E '^\[(FAIL|PASS)\]'
+          EOS

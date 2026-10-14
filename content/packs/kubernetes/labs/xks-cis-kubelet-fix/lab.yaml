@@ -1,0 +1,178 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xks-cis-kubelet-fix
+  title: Resolve benchmark findings on a node
+  domain: kubernetes
+  frameworks: [cks:cluster-setup]
+  difficulty: hard
+  estimatedMinutes: 10
+  tags: [exam, cis-benchmark, kubelet, node-hardening]
+  version: 1
+spec:
+  description: |
+    Context: `qm-ledger`. Node `ledger-wk-2` is reachable with `ssh ledger-wk-2`
+    (`sudo` works).
+
+    The benchmark report `/root/cis/ledger-wk-2-node.txt` on `ledger-wk-2` lists
+    two **FAIL** results for the kubelet. Fix both on `ledger-wk-2` as the
+    report's remediation text describes, so that a rescan passes them. The
+    node must stay `Ready`.
+  objectives:
+    - Read a benchmark report and apply the kubelet remediations
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      # Canonical sim-k8s-security cluster: every K-tier exam task shares it.
+      - name: qm-ledger
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        access: [ssh]
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-ledger
+          nodes:
+            - {name: ledger-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: ledger-wk-1, role: worker}
+            - {name: ledger-wk-2, role: worker}
+  setup:
+    - on: qm-ledger/ledger-wk-2
+      timeoutSec: 120
+      run: |
+        set -e
+        python3 - <<'PY'
+        import yaml
+        p = "/var/lib/kubelet/config.yaml"
+        c = yaml.safe_load(open(p))
+        c["readOnlyPort"] = 10255
+        open(p, "w").write(yaml.safe_dump(c, default_flow_style=False))
+        PY
+        chmod 0644 /var/lib/kubelet/config.yaml
+        systemctl restart kubelet
+        for i in $(seq 1 30); do ss -Htln 'sport = :10255' | grep -q . && break; sleep 2; done
+        mkdir -p /root/cis
+        cat > /root/cis/ledger-wk-2-node.txt <<'EOF'
+        [INFO] 4 Worker Node Security Configuration
+        [INFO] 4.1 Worker Node Configuration Files
+        [PASS] 4.1.1 Ensure that the kubelet service file permissions are set to 600 or more restrictive (Automated)
+        [PASS] 4.1.2 Ensure that the kubelet service file ownership is set to root:root (Automated)
+        [PASS] 4.1.5 Ensure that the --kubeconfig kubelet.conf file permissions are set to 600 or more restrictive (Automated)
+        [PASS] 4.1.6 Ensure that the --kubeconfig kubelet.conf file ownership is set to root:root (Automated)
+        [FAIL] 4.1.9 If the kubelet config.yaml configuration file is being used validate permissions set to 600 or more restrictive (Automated)
+        [PASS] 4.1.10 If the kubelet config.yaml configuration file is being used validate file ownership is set to root:root (Automated)
+        [INFO] 4.2 Kubelet
+        [PASS] 4.2.1 Ensure that the --anonymous-auth argument is set to false (Automated)
+        [PASS] 4.2.2 Ensure that the --authorization-mode argument is not set to AlwaysAllow (Automated)
+        [PASS] 4.2.3 Ensure that the --client-ca-file argument is set as appropriate (Automated)
+        [FAIL] 4.2.4 Verify that the --read-only-port argument is set to 0 (Manual)
+
+        == Remediations node ==
+        4.1.9 Run the following command (based on the file location on your system) on each worker node.
+        For example, chmod 600 /var/lib/kubelet/config.yaml
+
+        4.2.4 If using a Kubelet config file, edit the file to set readOnlyPort to 0.
+        If using command line arguments, edit the kubelet service file
+        /usr/lib/systemd/system/kubelet.service.d/10-kubeadm.conf on each Worker Node and
+        set the below parameter in KUBELET_SYSTEM_PODS_ARGS variable.
+        --read-only-port=0
+        Based on your system, restart the kubelet service. For example:
+        systemctl daemon-reload
+        systemctl restart kubelet.service
+
+        == Summary node ==
+        9 checks PASS
+        2 checks FAIL
+        0 checks WARN
+        0 checks INFO
+        EOF
+        chmod 0600 /root/cis/ledger-wk-2-node.txt
+  checks:
+    - id: config-permissions
+      description: /var/lib/kubelet/config.yaml is mode 600 or more restrictive (4.1.9)
+      type: shell
+      on: qm-ledger/ledger-wk-2
+      skills: [k8s.security.cis-benchmark]
+      weight: 2
+      command: |
+        m=$(stat -c %a /var/lib/kubelet/config.yaml)
+        [ $((0$m & 0177)) -eq 0 ] && echo ok || echo "too open: $m"
+      expect: {match: exact, value: ok}
+    - id: read-only-port-off
+      description: The kubelet read-only port is disabled and nothing listens on 10255 (4.2.4)
+      type: shell
+      on: qm-ledger/ledger-wk-2
+      skills: [k8s.security.cis-benchmark]
+      weight: 3
+      timeoutSec: 30
+      command: |
+        cfg=$(python3 -c 'import yaml;print(yaml.safe_load(open("/var/lib/kubelet/config.yaml")).get("readOnlyPort", 0))')
+        flag=$(ps -C kubelet -o args= | tr ' ' '\n' | sed -n 's/^--read-only-port=//p')
+        eff=${flag:-$cfg}
+        l=$(ss -Htln 'sport = :10255' | wc -l)
+        echo "effective=$eff listeners=$l"
+      expect: {match: exact, value: effective=0 listeners=0}
+    - id: node-ready
+      description: ledger-wk-2 is Ready
+      type: shell
+      on: qm-ledger
+      skills: [k8s.security.cis-benchmark]
+      timeoutSec: 60
+      command: kubectl wait node/ledger-wk-2 --for=condition=Ready --timeout=40s >/dev/null 2>&1 && echo Ready || echo NotReady
+      expect: {match: exact, value: Ready}
+  misconceptions:
+    - id: no-restart
+      description: Sets readOnlyPort to 0 but does not restart the kubelet.
+      feedback: The running kubelet keeps listening on 10255 until it is restarted.
+      expectFail: [read-only-port-off]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          ssh ledger-wk-2 'sudo bash -s' <<'EOS'
+          sed -i 's/^readOnlyPort: 10255$/readOnlyPort: 0/' /var/lib/kubelet/config.yaml
+          chmod 600 /var/lib/kubelet/config.yaml
+          EOS
+    - id: one-of-two
+      description: Fixes the read-only port but not the file permissions.
+      feedback: The report lists two FAIL results; 4.1.9 needs chmod 600 on config.yaml.
+      expectFail: [config-permissions]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          ssh ledger-wk-2 'sudo bash -s' <<'EOS'
+          sed -i 's/^readOnlyPort: 10255$/readOnlyPort: 0/' /var/lib/kubelet/config.yaml
+          systemctl restart kubelet
+          EOS
+          sleep 10
+  solution:
+    explanation: chmod 600 the kubelet config, set readOnlyPort to 0 in it and restart the kubelet.
+    steps:
+      - on: workstation
+        as: learner
+        run: |
+          ssh ledger-wk-2 'sudo bash -s' <<'EOS'
+          grep FAIL /root/cis/ledger-wk-2-node.txt
+          chmod 600 /var/lib/kubelet/config.yaml
+          sed -i 's/^readOnlyPort: 10255$/readOnlyPort: 0/' /var/lib/kubelet/config.yaml
+          systemctl restart kubelet
+          EOS
+          sleep 10
+    alternatives:
+      - id: remove-key-and-0400
+        description: Delete the readOnlyPort line (the default is 0) and make the file 0400.
+        steps:
+          - on: workstation
+            as: learner
+            run: |
+              ssh ledger-wk-2 'sudo bash -s' <<'EOS'
+              sed -i '/^readOnlyPort:/d' /var/lib/kubelet/config.yaml
+              chmod 0400 /var/lib/kubelet/config.yaml
+              systemctl restart kubelet
+              EOS
+              sleep 10

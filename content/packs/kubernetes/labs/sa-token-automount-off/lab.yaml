@@ -1,0 +1,311 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: sa-token-automount-off
+  title: Stop handing API tokens to Pods that need none
+  domain: kubernetes
+  frameworks: [cks:cluster-hardening]
+  difficulty: easy
+  estimatedMinutes: 10
+  tags: [serviceaccount, token, automount]
+  version: 1
+spec:
+  description: |
+    Every Pod at Quillmoor Logistics' depots gets a ServiceAccount token
+    mounted, even the barcode scanners that never talk to the Kubernetes API.
+    A stolen token is a foothold, so tokens should go only where they are used.
+
+    From your workstation, switch to context `qm-depot` first:
+
+    ```bash
+    kubectl config use-context qm-depot
+    ```
+
+    The depot namespaces are `depot-north` and `depot-south`.
+
+    1. Turn off token automounting on the `default` ServiceAccount of **both**
+       depot namespaces.
+    2. Turn it off explicitly on the Pods of the Deployments that never call
+       the API: `{{scanner}}` (depot-north) and `label-feed` (depot-south).
+       Their running Pods must no longer have a token mounted.
+    3. `route-sync` in depot-north **does** call the API, with the `default`
+       ServiceAccount. It must keep receiving its projected token and keep
+       working (its Pod is Ready only while its API calls succeed).
+  objectives:
+    - Disable token automounting on a ServiceAccount
+    - Override automounting per Pod template
+    - Know that running Pods keep their volumes until they are recreated
+  params:
+    scanner:
+      type: choice
+      values: [parcel-scanner, crate-scanner, pallet-scanner]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-depot
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: qm-depot
+  setup:
+    - on: qm-depot
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: depot-north}
+        ---
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: depot-south}
+        ---
+        apiVersion: v1
+        kind: ConfigMap
+        metadata: {name: routes, namespace: depot-north}
+        data: {north-loop: "D1,D4,D7"}
+        ---
+        apiVersion: rbac.authorization.k8s.io/v1
+        kind: Role
+        metadata: {name: route-reader, namespace: depot-north}
+        rules:
+          - {apiGroups: [""], resources: [configmaps], verbs: [get]}
+        ---
+        apiVersion: rbac.authorization.k8s.io/v1
+        kind: RoleBinding
+        metadata: {name: route-reader, namespace: depot-north}
+        roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: route-reader}
+        subjects:
+          - {kind: ServiceAccount, name: default, namespace: depot-north}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: "{{scanner}}", namespace: depot-north}
+        spec:
+          replicas: 1
+          selector: {matchLabels: {app: "{{scanner}}"}}
+          template:
+            metadata: {labels: {app: "{{scanner}}"}}
+            spec:
+              containers:
+                - {name: scanner, image: busybox:1.37, command: ["sh", "-c", "while true; do sleep 30; done"]}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: label-feed, namespace: depot-south}
+        spec:
+          replicas: 1
+          selector: {matchLabels: {app: label-feed}}
+          template:
+            metadata: {labels: {app: label-feed}}
+            spec:
+              containers:
+                - {name: feed, image: busybox:1.37, command: ["sh", "-c", "while true; do sleep 30; done"]}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: route-sync, namespace: depot-north}
+        spec:
+          replicas: 1
+          selector: {matchLabels: {app: route-sync}}
+          template:
+            metadata: {labels: {app: route-sync}}
+            spec:
+              containers:
+                - name: sync
+                  image: busybox:1.37
+                  command: ["sh", "-c"]
+                  args:
+                    - |
+                      SA=/var/run/secrets/kubernetes.io/serviceaccount
+                      while true; do
+                        if [ -f $SA/token ] && wget -q -T 5 --no-check-certificate --header "Authorization: Bearer $(cat $SA/token)" -O /dev/null \
+                             https://kubernetes.default.svc/api/v1/namespaces/depot-north/configmaps/routes 2>/dev/null; then
+                          echo "$(date -u +%T) routes synced"; touch /tmp/healthy
+                        else
+                          echo "$(date -u +%T) cannot read routes (token missing or rejected)"; rm -f /tmp/healthy
+                        fi
+                        sleep 5
+                      done
+                  readinessProbe:
+                    exec: {command: ["test", "-f", "/tmp/healthy"]}
+                    periodSeconds: 3
+                    failureThreshold: 1
+    - on: qm-depot
+      timeoutSec: 150
+      run: |
+        kubectl -n depot-north rollout status deploy/route-sync --timeout=140s
+        kubectl -n depot-north rollout status deploy/{{scanner}} --timeout=60s
+        kubectl -n depot-south rollout status deploy/label-feed --timeout=60s
+  teardown:
+    - on: qm-depot
+      run: kubectl delete namespace depot-north depot-south --ignore-not-found --wait=false
+  checks:
+    - id: context
+      description: Terminal is using context qm-depot
+      type: k8s-context
+      on: workstation
+      skills: [k8s.cli.contexts]
+      weight: 0.5
+      expect: {match: exact, value: qm-depot}
+    - id: sa-north-off
+      description: The default ServiceAccount of depot-north does not automount tokens
+      type: k8s-query
+      skills: [k8s.security.sa-token-hygiene]
+      query: {cluster: qm-depot, resource: serviceaccount, name: default, namespace: depot-north, jsonpath: "{.automountServiceAccountToken}"}
+      expect: {match: exact, value: "false"}
+    - id: sa-south-off
+      description: The default ServiceAccount of depot-south does not automount tokens
+      type: k8s-query
+      skills: [k8s.security.sa-token-hygiene]
+      query: {cluster: qm-depot, resource: serviceaccount, name: default, namespace: depot-south, jsonpath: "{.automountServiceAccountToken}"}
+      expect: {match: exact, value: "false"}
+    - id: pod-specs-off
+      description: The {{scanner}} and label-feed Pod templates set automountServiceAccountToken to false
+      type: shell
+      on: qm-depot
+      skills: [k8s.security.sa-token-hygiene]
+      command: |
+        a=$(kubectl -n depot-north get deploy {{scanner}} -o jsonpath='{.spec.template.spec.automountServiceAccountToken}')
+        b=$(kubectl -n depot-south get deploy label-feed -o jsonpath='{.spec.template.spec.automountServiceAccountToken}')
+        echo "{{scanner}}=${a:-unset} label-feed=${b:-unset}"
+      expect: {match: exact, value: "{{scanner}}=false label-feed=false"}
+    - id: running-pods-tokenless
+      description: No running {{scanner}} or label-feed Pod has a ServiceAccount token mounted
+      type: shell
+      on: qm-depot
+      skills: [k8s.security.sa-token-hygiene]
+      weight: 2
+      timeoutSec: 60
+      command: |
+        # Wait for rollouts the learner may have just triggered.
+        kubectl -n depot-north rollout status deploy/{{scanner}} --timeout=40s >/dev/null 2>&1
+        kubectl -n depot-south rollout status deploy/label-feed --timeout=40s >/dev/null 2>&1
+        n=0; with=0
+        for spec in "depot-north app={{scanner}}" "depot-south app=label-feed"; do
+          set -- $spec
+          for m in $(kubectl -n "$1" get pods -l "$2" --field-selector=status.phase=Running -o json | jq -r '.items[] | select(.metadata.deletionTimestamp == null) | "\(.metadata.name)=\([.spec.containers[].volumeMounts[]?.mountPath] | join(","))"'); do
+            n=$((n+1)); case "$m" in *serviceaccount*) with=$((with+1));; esac
+          done
+        done
+        echo "running=$n with-token=$with"
+      expect: {match: regex, value: "^running=[1-9][0-9]* with-token=0$"}
+    - id: route-sync-token
+      description: Every route-sync Pod still gets a projected token
+      type: shell
+      on: qm-depot
+      skills: [k8s.security.sa-token-hygiene]
+      timeoutSec: 30
+      command: |
+        n=0; without=0
+        for m in $(kubectl -n depot-north get pods -l app=route-sync -o json | jq -r '.items[] | select(.metadata.deletionTimestamp == null) | "\(.metadata.name)=\([.spec.containers[].volumeMounts[]?.mountPath] | join(","))"'); do
+          n=$((n+1)); case "$m" in *serviceaccount*) ;; *) without=$((without+1));; esac
+        done
+        echo "pods=$n without-token=$without"
+      expect: {match: regex, value: "^pods=[1-9][0-9]* without-token=0$"}
+    - id: route-sync-working
+      description: route-sync still reads its routes from the API (Pod Ready)
+      type: shell
+      on: qm-depot
+      skills: [k8s.security.sa-token-hygiene]
+      weight: 2
+      timeoutSec: 60
+      command: |
+        kubectl -n depot-north rollout status deploy/route-sync --timeout=40s >/dev/null 2>&1
+        r=$(kubectl -n depot-north get pods -l app=route-sync -o json | jq -r '[.items[] | select(.metadata.deletionTimestamp == null) | (.status.conditions[]? | select(.type=="Ready") | .status)] | join(" ")')
+        case "$r" in *False*|"") echo "not ready: '$r'" ;; *) echo ready ;; esac
+      expect: {match: exact, value: ready}
+  hints:
+    - title: Switch context
+      command: kubectl config use-context qm-depot
+      body: The depots share one virtual cluster.
+      cost: 0
+    - title: Two places to set it
+      body: |
+        `automountServiceAccountToken` exists on the ServiceAccount and on the Pod
+        spec. The Pod setting wins when both are set.
+      cost: 1
+    - title: Existing Pods do not change
+      body: A token volume is added when a Pod is created. Pods only lose it when the Deployment rolls them out again.
+      cost: 1
+    - title: route-sync uses the default ServiceAccount
+      body: If you switch automounting off on that ServiceAccount, route-sync needs an explicit opt-in on its own Pod template.
+      cost: 2
+  misconceptions:
+    - id: sa-only-no-rollout
+      description: Patches only the ServiceAccounts and expects running Pods to lose their tokens.
+      feedback: Running Pods keep their mounted token. Set the field on the Pod templates too, which also rolls the Pods.
+      expectFail: [pod-specs-off, running-pods-tokenless]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-depot
+          for ns in depot-north depot-south; do
+            kubectl -n $ns patch serviceaccount default -p '{"automountServiceAccountToken": false}'
+          done
+          kubectl -n depot-north patch deploy route-sync -p '{"spec":{"template":{"spec":{"automountServiceAccountToken":true}}}}'
+    - id: broke-route-sync
+      description: Disables automounting on the default ServiceAccount without opting route-sync back in.
+      feedback: route-sync runs as the default ServiceAccount. Set automountServiceAccountToken true on its Pod template (and roll it) so it keeps its token.
+      expectFail: [route-sync-token, route-sync-working]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-depot
+          for ns in depot-north depot-south; do
+            kubectl -n $ns patch serviceaccount default -p '{"automountServiceAccountToken": false}'
+          done
+          kubectl -n depot-north patch deploy {{scanner}} -p '{"spec":{"template":{"spec":{"automountServiceAccountToken":false}}}}'
+          kubectl -n depot-south patch deploy label-feed -p '{"spec":{"template":{"spec":{"automountServiceAccountToken":false}}}}'
+          kubectl -n depot-north rollout restart deploy/route-sync
+    - id: pods-only
+      description: Sets the field on the two Pod templates but leaves the ServiceAccounts as they are.
+      feedback: New workloads in the depot namespaces would still get tokens by default. Turn it off on the default ServiceAccounts too.
+      expectFail: [sa-north-off, sa-south-off]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n depot-north patch deploy {{scanner}} -p '{"spec":{"template":{"spec":{"automountServiceAccountToken":false}}}}'
+          kubectl -n depot-south patch deploy label-feed -p '{"spec":{"template":{"spec":{"automountServiceAccountToken":false}}}}'
+  solution:
+    explanation: |
+      Turn automounting off on both default ServiceAccounts, set it false on the
+      two Pod templates (which rolls the Pods without tokens), and set it true on
+      route-sync's Pod template so the Pod-level opt-in keeps its token.
+    steps:
+      - on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-depot
+          for ns in depot-north depot-south; do
+            kubectl -n $ns patch serviceaccount default -p '{"automountServiceAccountToken": false}'
+          done
+          kubectl -n depot-north patch deploy route-sync -p '{"spec":{"template":{"spec":{"automountServiceAccountToken":true}}}}'
+          kubectl -n depot-north patch deploy {{scanner}} -p '{"spec":{"template":{"spec":{"automountServiceAccountToken":false}}}}'
+          kubectl -n depot-south patch deploy label-feed -p '{"spec":{"template":{"spec":{"automountServiceAccountToken":false}}}}'
+          kubectl -n depot-north rollout status deploy/{{scanner}}
+          kubectl -n depot-south rollout status deploy/label-feed
+    alternatives:
+      - id: dedicated-sa
+        description: Give route-sync its own ServiceAccount (with the same Role) instead of an opt-in on the default one.
+        steps:
+          - on: workstation
+            as: learner
+            run: |
+              kubectl config use-context qm-depot
+              kubectl -n depot-north create serviceaccount route-sync
+              kubectl -n depot-north create rolebinding route-sync-reader --role=route-reader --serviceaccount=depot-north:route-sync
+              kubectl -n depot-north set serviceaccount deploy/route-sync route-sync
+              for ns in depot-north depot-south; do
+                kubectl -n $ns patch serviceaccount default -p '{"automountServiceAccountToken": false}'
+              done
+              kubectl -n depot-north patch deploy {{scanner}} -p '{"spec":{"template":{"spec":{"automountServiceAccountToken":false}}}}'
+              kubectl -n depot-south patch deploy label-feed -p '{"spec":{"template":{"spec":{"automountServiceAccountToken":false}}}}'
+              kubectl -n depot-north rollout status deploy/route-sync

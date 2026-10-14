@@ -1,0 +1,165 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xks-ingress-tls-secret
+  title: Serve an Ingress over TLS
+  domain: kubernetes
+  frameworks: [cks:cluster-setup]
+  difficulty: medium
+  estimatedMinutes: 7
+  tags: [exam, ingress, tls]
+  version: 1
+spec:
+  description: |
+    Context: `qm-ledger` (`kubectl config use-context qm-ledger`).
+
+    1. Create a TLS Secret `portal-tls` in namespace `partner-portal` from
+       `~/exam/portal.crt` and `~/exam/portal.key`.
+    2. Make the existing Ingress `portal` serve `portal.quillmoor.example`
+       over HTTPS with that certificate. HTTP requests must not be served
+       (they must be redirected to HTTPS).
+  objectives:
+    - Add TLS to an Ingress
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      # Canonical sim-k8s-security cluster: every K-tier exam task shares it.
+      - name: qm-ledger
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        access: [ssh]
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-ledger
+          nodes:
+            - {name: ledger-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: ledger-wk-1, role: worker}
+            - {name: ledger-wk-2, role: worker}
+  setup:
+    - on: qm-ledger
+      timeoutSec: 200
+      run: |
+        for i in $(seq 1 36); do
+          kubectl get ingressclass nginx >/dev/null 2>&1 && \
+            kubectl get svc -A -l app.kubernetes.io/component=controller,app.kubernetes.io/name=ingress-nginx -o name 2>/dev/null | grep -q . && exit 0
+          sleep 5
+        done
+        echo "prerequisite missing: no NGINX Ingress controller (IngressClass nginx) in this cluster image" >&2
+        exit 1
+    - on: workstation
+      run: |
+        set -e
+        mkdir -p /home/learner/exam && cd /home/learner/exam
+        openssl req -x509 -newkey rsa:2048 -nodes -days 365 -subj "/O=Quillmoor Logistics/CN=portal.quillmoor.example" \
+          -addext "subjectAltName=DNS:portal.quillmoor.example" -keyout portal.key -out portal.crt 2>/dev/null
+        chown -R learner:learner /home/learner/exam
+    - on: qm-ledger
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: partner-portal}
+        ---
+        apiVersion: v1
+        kind: Pod
+        metadata: {name: portal, namespace: partner-portal, labels: {app: portal}}
+        spec:
+          containers:
+            - {name: web, image: busybox:1.37, command: ["sh", "-c", "mkdir -p /w && echo 'partner portal' > /w/index.html && exec httpd -f -p 8080 -h /w"]}
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata: {name: portal, namespace: partner-portal}
+        spec:
+          selector: {app: portal}
+          ports: [{port: 80, targetPort: 8080}]
+        ---
+        apiVersion: networking.k8s.io/v1
+        kind: Ingress
+        metadata: {name: portal, namespace: partner-portal}
+        spec:
+          ingressClassName: nginx
+          rules:
+            - host: portal.quillmoor.example
+              http:
+                paths:
+                  - {path: /, pathType: Prefix, backend: {service: {name: portal, port: {number: 80}}}}
+  teardown:
+    - on: qm-ledger
+      run: kubectl delete namespace partner-portal --ignore-not-found --wait=false
+  checks:
+    - id: secret-tls
+      description: portal-tls is a kubernetes.io/tls Secret
+      type: k8s-query
+      skills: [k8s.security.ingress-tls]
+      query: {cluster: qm-ledger, resource: secret, name: portal-tls, namespace: partner-portal, jsonpath: "{.type}"}
+      expect: {match: exact, value: kubernetes.io/tls}
+    - id: https-cert
+      description: HTTPS for portal.quillmoor.example presents the provided certificate
+      type: shell
+      on: qm-ledger/ledger-cp-1
+      skills: [k8s.security.ingress-tls]
+      weight: 3
+      timeoutSec: 40
+      command: |
+        export KUBECONFIG=/etc/kubernetes/admin.conf
+        ip=$(kubectl get svc -A -l app.kubernetes.io/component=controller,app.kubernetes.io/name=ingress-nginx -o jsonpath='{.items[0].spec.clusterIP}')
+        echo | openssl s_client -connect $ip:443 -servername portal.quillmoor.example 2>/dev/null | openssl x509 -noout -subject -nameopt RFC2253 2>/dev/null
+      expect: {match: exact, value: "subject=CN=portal.quillmoor.example,O=Quillmoor Logistics"}
+    - id: http-redirected
+      description: Plain HTTP gets a redirect to HTTPS
+      type: shell
+      on: qm-ledger/ledger-cp-1
+      skills: [k8s.security.ingress-tls]
+      timeoutSec: 30
+      command: |
+        export KUBECONFIG=/etc/kubernetes/admin.conf
+        ip=$(kubectl get svc -A -l app.kubernetes.io/component=controller,app.kubernetes.io/name=ingress-nginx -o jsonpath='{.items[0].spec.clusterIP}')
+        curl -s -m 5 -o /dev/null -w '%{http_code}' --resolve portal.quillmoor.example:80:$ip http://portal.quillmoor.example/
+      expect: {match: regex, value: "^30[178]$"}
+  misconceptions:
+    - id: secret-other-namespace
+      description: Creates the Secret in the default namespace.
+      feedback: An Ingress can only use TLS Secrets from its own namespace.
+      expectFail: [secret-tls, https-cert]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-ledger
+          kubectl -n default create secret tls portal-tls --cert ~/exam/portal.crt --key ~/exam/portal.key
+          kubectl -n partner-portal patch ingress portal --type=merge -p '{"spec":{"tls":[{"hosts":["portal.quillmoor.example"],"secretName":"portal-tls"}]}}'
+          sleep 10
+  solution:
+    explanation: kubectl create secret tls, then add spec.tls with the host and secretName.
+    steps:
+      - on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-ledger
+          kubectl -n partner-portal create secret tls portal-tls --cert ~/exam/portal.crt --key ~/exam/portal.key
+          kubectl -n partner-portal patch ingress portal --type=merge -p '{"spec":{"tls":[{"hosts":["portal.quillmoor.example"],"secretName":"portal-tls"}]}}'
+          sleep 10
+    alternatives:
+      - id: yaml-secret
+        description: Write the Secret as YAML with base64 data.
+        steps:
+          - on: workstation
+            as: learner
+            run: |
+              kubectl config use-context qm-ledger
+              kubectl apply -f - <<YAML
+              apiVersion: v1
+              kind: Secret
+              metadata: {name: portal-tls, namespace: partner-portal}
+              type: kubernetes.io/tls
+              data:
+                tls.crt: $(base64 -w0 ~/exam/portal.crt)
+                tls.key: $(base64 -w0 ~/exam/portal.key)
+              YAML
+              kubectl -n partner-portal patch ingress portal --type=json -p '[{"op":"add","path":"/spec/tls","value":[{"hosts":["portal.quillmoor.example"],"secretName":"portal-tls"}]}]'
+              sleep 10

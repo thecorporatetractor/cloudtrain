@@ -1,0 +1,409 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: tariff-secret-audit
+  title: Audit who read the tariff secrets
+  domain: kubernetes
+  frameworks: [cks:monitoring-runtime-security, cks:cluster-hardening]
+  difficulty: hard
+  estimatedMinutes: 30
+  tags: [audit, audit-policy, kube-apiserver, secrets, forensics]
+  version: 1
+spec:
+  description: |
+    Quillmoor Logistics' customs tariff rates leaked to a competitor. The
+    rates live in Secret `tariff-rates` in namespace `tariffs` on the
+    billing-ledger cluster, but the API server keeps no audit log, so nobody
+    can tell who reads it.
+
+    From your workstation, switch to context `qm-ledger`
+    (`kubectl config use-context qm-ledger`). The API server is a static Pod
+    on `ledger-cp-1` (`ssh ledger-cp-1`, `sudo` works).
+
+    1. Write an audit policy at `/etc/kubernetes/audit/policy.yaml` that
+       records every request on **Secrets** at the **Metadata** level (never
+       with request or response bodies, which would copy the secret values
+       into the log).
+    2. Enable auditing on the API server with that policy, writing the log to
+       `/var/log/kubernetes/audit/audit.log` on the node.
+    3. Something in the cluster reads `tariff-rates` every few seconds. From
+       the audit log, find the **ServiceAccount** that reads it and write its
+       full username (`system:serviceaccount:<namespace>:<name>`) to
+       `~/tariff-reader.txt` on your workstation.
+  objectives:
+    - Write an audit policy with resource-specific levels
+    - Enable audit logging on a kubeadm API server
+    - Query JSON audit events with jq
+  params:
+    readerns:
+      type: choice
+      values: [rate-sync, broker-feeds, quay-pricing]
+    sa:
+      type: choice
+      values: [tariff-mirror, rates-exporter, price-sync]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-ledger
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        access: [ssh]
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-ledger
+          nodes:
+            - {name: ledger-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: ledger-wk-1, role: worker}
+  setup:
+    - on: qm-ledger
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: tariffs}
+        ---
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: "{{readerns}}"}
+        ---
+        apiVersion: v1
+        kind: Secret
+        metadata: {name: tariff-rates, namespace: tariffs}
+        stringData: {rates.csv: "HS8471,0.0\nHS8703,10.0\n"}
+        ---
+        apiVersion: v1
+        kind: Secret
+        metadata: {name: tariff-archive, namespace: tariffs}
+        stringData: {archive.csv: "HS8471,2.5\n"}
+        ---
+        apiVersion: v1
+        kind: ServiceAccount
+        metadata: {name: "{{sa}}", namespace: "{{readerns}}"}
+        ---
+        apiVersion: v1
+        kind: ServiceAccount
+        metadata: {name: archive-bot, namespace: tariffs}
+        ---
+        apiVersion: rbac.authorization.k8s.io/v1
+        kind: Role
+        metadata: {name: tariff-read, namespace: tariffs}
+        rules:
+          - {apiGroups: [""], resources: [secrets], verbs: [get]}
+        ---
+        apiVersion: rbac.authorization.k8s.io/v1
+        kind: RoleBinding
+        metadata: {name: tariff-read, namespace: tariffs}
+        roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: tariff-read}
+        subjects:
+          - {kind: ServiceAccount, name: "{{sa}}", namespace: "{{readerns}}"}
+          - {kind: ServiceAccount, name: archive-bot, namespace: tariffs}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: feed-worker, namespace: "{{readerns}}"}
+        spec:
+          replicas: 1
+          selector: {matchLabels: {app: feed-worker}}
+          template:
+            metadata: {labels: {app: feed-worker}}
+            spec:
+              serviceAccountName: "{{sa}}"
+              containers:
+                - name: worker
+                  image: busybox:1.37
+                  command: ["sh", "-c"]
+                  args:
+                    - |
+                      SA=/var/run/secrets/kubernetes.io/serviceaccount
+                      while true; do
+                        wget -q -T 5 --no-check-certificate --header "Authorization: Bearer $(cat $SA/token)" -O /dev/null \
+                          https://kubernetes.default.svc/api/v1/namespaces/tariffs/secrets/tariff-rates 2>/dev/null
+                        sleep 5
+                      done
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: archive-bot, namespace: tariffs}
+        spec:
+          replicas: 1
+          selector: {matchLabels: {app: archive-bot}}
+          template:
+            metadata: {labels: {app: archive-bot}}
+            spec:
+              serviceAccountName: archive-bot
+              containers:
+                - name: bot
+                  image: busybox:1.37
+                  command: ["sh", "-c"]
+                  args:
+                    - |
+                      SA=/var/run/secrets/kubernetes.io/serviceaccount
+                      while true; do
+                        wget -q -T 5 --no-check-certificate --header "Authorization: Bearer $(cat $SA/token)" -O /dev/null \
+                          https://kubernetes.default.svc/api/v1/namespaces/tariffs/secrets/tariff-archive 2>/dev/null
+                        sleep 5
+                      done
+    - on: qm-ledger
+      timeoutSec: 150
+      run: |
+        kubectl -n {{readerns}} rollout status deploy/feed-worker --timeout=140s
+        kubectl -n tariffs rollout status deploy/archive-bot --timeout=60s
+  teardown:
+    - on: qm-ledger
+      run: kubectl delete namespace tariffs {{readerns}} --ignore-not-found --wait=false
+  checks:
+    - id: context
+      description: Terminal is using context qm-ledger
+      type: k8s-context
+      on: workstation
+      skills: [k8s.cli.contexts]
+      weight: 0.5
+      expect: {match: exact, value: qm-ledger}
+    - id: audit-flags
+      description: kube-apiserver runs with the policy file and the requested log path
+      type: shell
+      on: qm-ledger/ledger-cp-1
+      skills: [k8s.security.api-server-hardening]
+      command: |
+        a=$(ps -C kube-apiserver -o args= | tr ' ' '\n')
+        p=$(echo "$a" | sed -n 's/^--audit-policy-file=//p'); l=$(echo "$a" | sed -n 's/^--audit-log-path=//p')
+        echo "policy=${p:-unset} log=${l:-unset}"
+      expect: {match: exact, value: "policy=/etc/kubernetes/audit/policy.yaml log=/var/log/kubernetes/audit/audit.log"}
+    - id: secret-metadata-level
+      description: A fresh read of tariff-rates is logged at Metadata level on the node
+      type: shell
+      on: qm-ledger/ledger-cp-1
+      skills: [k8s.security.audit-logging]
+      weight: 3
+      timeoutSec: 45
+      command: |
+        export KUBECONFIG=/etc/kubernetes/admin.conf
+        log=/var/log/kubernetes/audit/audit.log
+        [ -s $log ] || { echo "no audit log at $log"; exit 0; }
+        kubectl -n tariffs get secret tariff-rates -o name >/dev/null 2>&1
+        for i in $(seq 1 15); do
+          lvl=$(tail -n 4000 $log | jq -r 'select(.objectRef.resource == "secrets" and .objectRef.name == "tariff-rates" and (.user.username | startswith("system:serviceaccount:") | not) and .stage != "RequestReceived") | .level' 2>/dev/null | tail -n1)
+          [ -n "$lvl" ] && break
+          sleep 2
+        done
+        echo "level=${lvl:-not-logged}"
+      expect: {match: exact, value: level=Metadata}
+    - id: no-secret-bodies
+      description: No Secret event in the log carries a request or response body
+      type: shell
+      on: qm-ledger/ledger-cp-1
+      skills: [k8s.security.audit-logging]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        log=/var/log/kubernetes/audit/audit.log
+        [ -s $log ] || { echo "no audit log"; exit 0; }
+        n=$(jq -c 'select(.objectRef.resource == "secrets" and (.level == "Request" or .level == "RequestResponse"))' $log 2>/dev/null | wc -l)
+        echo "events-with-bodies=$n"
+      expect: {match: exact, value: events-with-bodies=0}
+    - id: reader-identified
+      description: ~/tariff-reader.txt names the ServiceAccount that reads tariff-rates
+      type: shell
+      on: workstation
+      skills: [k8s.security.audit-logging]
+      weight: 3
+      command: tr -d ' \r\n' < /home/learner/tariff-reader.txt 2>/dev/null || echo missing
+      expect: {match: exact, value: "system:serviceaccount:{{readerns}}:{{sa}}"}
+  hints:
+    - title: A minimal policy
+      body: |
+        `apiVersion: audit.k8s.io/v1`, `kind: Policy`, then `rules:`. Rules are
+        evaluated in order and the first match wins; a rule matches resources
+        by group (`""` for core) and name.
+      cost: 1
+    - title: Flags and mounts
+      body: |
+        The API server needs `--audit-policy-file` and `--audit-log-path`, plus
+        hostPath volumes for the policy file and the log directory, mounted at
+        the same paths inside the container.
+      cost: 2
+    - title: Search the log
+      body: Each line is one JSON event.
+      command: ssh ledger-cp-1 "sudo jq -r 'select(.objectRef.resource==\"secrets\" and .objectRef.name==\"tariff-rates\") | .user.username' /var/log/kubernetes/audit/audit.log | sort | uniq -c"
+      cost: 2
+  misconceptions:
+    - id: request-response-level
+      description: Logs Secrets at RequestResponse to "see everything".
+      feedback: RequestResponse copies every secret value into the audit log, a second leak. Use Metadata for Secrets.
+      expectFail: [secret-metadata-level, no-secret-bodies]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 600
+        run: |
+          kubectl config use-context qm-ledger
+          ssh ledger-cp-1 'sudo LEVEL=RequestResponse bash -s' <<'EOS'
+          set -e
+          mkdir -p /etc/kubernetes/audit /var/log/kubernetes/audit
+          cat > /etc/kubernetes/audit/policy.yaml <<EOF
+          apiVersion: audit.k8s.io/v1
+          kind: Policy
+          omitStages: [RequestReceived]
+          rules:
+            - level: $LEVEL
+              resources:
+                - group: ""
+                  resources: [secrets]
+            - level: None
+          EOF
+          python3 - <<'PY'
+          import yaml
+          p = "/etc/kubernetes/manifests/kube-apiserver.yaml"
+          m = yaml.safe_load(open(p))
+          c = m["spec"]["containers"][0]
+          c["command"] += ["--audit-policy-file=/etc/kubernetes/audit/policy.yaml", "--audit-log-path=/var/log/kubernetes/audit/audit.log"]
+          c.setdefault("volumeMounts", []).extend([
+              {"name": "audit-policy", "mountPath": "/etc/kubernetes/audit/policy.yaml", "readOnly": True},
+              {"name": "audit-log", "mountPath": "/var/log/kubernetes/audit"}])
+          m["spec"].setdefault("volumes", []).extend([
+              {"name": "audit-policy", "hostPath": {"path": "/etc/kubernetes/audit/policy.yaml", "type": "File"}},
+              {"name": "audit-log", "hostPath": {"path": "/var/log/kubernetes/audit", "type": "DirectoryOrCreate"}}])
+          open(p, "w").write(yaml.safe_dump(m, default_flow_style=False))
+          PY
+          for i in $(seq 1 90); do
+            ps -C kube-apiserver -o args= | grep -q -- --audit-policy-file= && curl -sfk https://127.0.0.1:6443/readyz >/dev/null && break
+            sleep 5
+          done
+          sleep 15
+          jq -r 'select(.objectRef.name=="tariff-rates") | .user.username' /var/log/kubernetes/audit/audit.log | sort -u | grep serviceaccount | head -n1
+          EOS
+          ssh ledger-cp-1 "sudo jq -r 'select(.objectRef.name==\"tariff-rates\") | .user.username' /var/log/kubernetes/audit/audit.log" | grep serviceaccount | sort -u | head -n1 > ~/tariff-reader.txt
+    - id: wrong-reader
+      description: Names the ServiceAccount that reads a different Secret (tariff-archive).
+      feedback: Filter on objectRef.name as well as the resource; archive-bot reads tariff-archive, not tariff-rates.
+      expectFail: [reader-identified]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 600
+        run: |
+          kubectl config use-context qm-ledger
+          ssh ledger-cp-1 'sudo LEVEL=Metadata bash -s' <<'EOS'
+          set -e
+          mkdir -p /etc/kubernetes/audit /var/log/kubernetes/audit
+          cat > /etc/kubernetes/audit/policy.yaml <<EOF
+          apiVersion: audit.k8s.io/v1
+          kind: Policy
+          omitStages: [RequestReceived]
+          rules:
+            - level: $LEVEL
+              resources:
+                - group: ""
+                  resources: [secrets]
+            - level: None
+          EOF
+          python3 - <<'PY'
+          import yaml
+          p = "/etc/kubernetes/manifests/kube-apiserver.yaml"
+          m = yaml.safe_load(open(p))
+          c = m["spec"]["containers"][0]
+          c["command"] += ["--audit-policy-file=/etc/kubernetes/audit/policy.yaml", "--audit-log-path=/var/log/kubernetes/audit/audit.log"]
+          c.setdefault("volumeMounts", []).extend([
+              {"name": "audit-policy", "mountPath": "/etc/kubernetes/audit/policy.yaml", "readOnly": True},
+              {"name": "audit-log", "mountPath": "/var/log/kubernetes/audit"}])
+          m["spec"].setdefault("volumes", []).extend([
+              {"name": "audit-policy", "hostPath": {"path": "/etc/kubernetes/audit/policy.yaml", "type": "File"}},
+              {"name": "audit-log", "hostPath": {"path": "/var/log/kubernetes/audit", "type": "DirectoryOrCreate"}}])
+          open(p, "w").write(yaml.safe_dump(m, default_flow_style=False))
+          PY
+          for i in $(seq 1 90); do
+            ps -C kube-apiserver -o args= | grep -q -- --audit-policy-file= && curl -sfk https://127.0.0.1:6443/readyz >/dev/null && break
+            sleep 5
+          done
+          EOS
+          echo system:serviceaccount:tariffs:archive-bot > ~/tariff-reader.txt
+  solution:
+    explanation: |
+      The policy's first rule logs core-group secrets at Metadata (who, what,
+      when, but no bodies); a final `level: None` keeps the log small. The API
+      server gets --audit-policy-file and --audit-log-path plus two hostPath
+      mounts. Once it restarts, the reader's periodic GETs show up with
+      user.username system:serviceaccount:{{readerns}}:{{sa}}.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 600
+        run: |
+          kubectl config use-context qm-ledger
+          ssh ledger-cp-1 'sudo bash -s' <<'EOS'
+          set -e
+          mkdir -p /etc/kubernetes/audit /var/log/kubernetes/audit
+          cat > /etc/kubernetes/audit/policy.yaml <<'EOF'
+          apiVersion: audit.k8s.io/v1
+          kind: Policy
+          omitStages: [RequestReceived]
+          rules:
+            - level: Metadata
+              resources:
+                - group: ""
+                  resources: [secrets]
+            - level: None
+          EOF
+          python3 - <<'PY'
+          import yaml
+          p = "/etc/kubernetes/manifests/kube-apiserver.yaml"
+          m = yaml.safe_load(open(p))
+          c = m["spec"]["containers"][0]
+          c["command"] += ["--audit-policy-file=/etc/kubernetes/audit/policy.yaml", "--audit-log-path=/var/log/kubernetes/audit/audit.log", "--audit-log-maxage=7"]
+          c.setdefault("volumeMounts", []).extend([
+              {"name": "audit-policy", "mountPath": "/etc/kubernetes/audit/policy.yaml", "readOnly": True},
+              {"name": "audit-log", "mountPath": "/var/log/kubernetes/audit"}])
+          m["spec"].setdefault("volumes", []).extend([
+              {"name": "audit-policy", "hostPath": {"path": "/etc/kubernetes/audit/policy.yaml", "type": "File"}},
+              {"name": "audit-log", "hostPath": {"path": "/var/log/kubernetes/audit", "type": "DirectoryOrCreate"}}])
+          open(p, "w").write(yaml.safe_dump(m, default_flow_style=False))
+          PY
+          for i in $(seq 1 90); do
+            ps -C kube-apiserver -o args= | grep -q -- --audit-policy-file= && curl -sfk https://127.0.0.1:6443/readyz >/dev/null && break
+            sleep 5
+          done
+          sleep 15
+          EOS
+          ssh ledger-cp-1 "sudo jq -r 'select(.objectRef.resource==\"secrets\" and .objectRef.namespace==\"tariffs\" and .objectRef.name==\"tariff-rates\") | .user.username' /var/log/kubernetes/audit/audit.log" \
+            | grep '^system:serviceaccount:' | sort | uniq -c | sort -rn | awk 'NR==1{print $2}' > ~/tariff-reader.txt
+          cat ~/tariff-reader.txt
+    alternatives:
+      - id: catch-all-metadata
+        description: Log Secrets and ConfigMaps at Metadata and skip noisy read-only events of everything else.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 600
+            run: |
+              kubectl config use-context qm-ledger
+              ssh ledger-cp-1 'sudo bash -s' <<'EOS'
+              set -e
+              mkdir -p /etc/kubernetes/audit
+              cat > /etc/kubernetes/audit/policy.yaml <<'EOF'
+              apiVersion: audit.k8s.io/v1
+              kind: Policy
+              rules:
+                - level: Metadata
+                  resources:
+                    - group: ""
+                      resources: [secrets, configmaps]
+                - level: None
+                  verbs: [get, list, watch]
+                - level: Metadata
+              EOF
+              m=/etc/kubernetes/manifests/kube-apiserver.yaml
+              sed -i 's#^    - kube-apiserver$#    - kube-apiserver\n    - --audit-policy-file=/etc/kubernetes/audit/policy.yaml\n    - --audit-log-path=/var/log/kubernetes/audit/audit.log#' $m
+              sed -i 's#^    volumeMounts:$#    volumeMounts:\n    - mountPath: /etc/kubernetes/audit/policy.yaml\n      name: audit-policy\n      readOnly: true\n    - mountPath: /var/log/kubernetes/audit\n      name: audit-log#' $m
+              sed -i 's#^  volumes:$#  volumes:\n  - hostPath:\n      path: /etc/kubernetes/audit/policy.yaml\n      type: File\n    name: audit-policy\n  - hostPath:\n      path: /var/log/kubernetes/audit\n      type: DirectoryOrCreate\n    name: audit-log#' $m
+              for i in $(seq 1 90); do
+                ps -C kube-apiserver -o args= | grep -q -- --audit-policy-file= && curl -sfk https://127.0.0.1:6443/readyz >/dev/null && break
+                sleep 5
+              done
+              sleep 15
+              EOS
+              ssh ledger-cp-1 "sudo grep tariff-rates /var/log/kubernetes/audit/audit.log" \
+                | jq -r 'select(.objectRef.name=="tariff-rates") | .user.username' | grep serviceaccount | sort -u | head -n1 > ~/tariff-reader.txt

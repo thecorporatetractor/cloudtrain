@@ -1,0 +1,202 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xks-runtime-alert-scale
+  title: Act on a runtime detection alert
+  domain: kubernetes
+  frameworks: [cks:monitoring-runtime-security]
+  difficulty: medium
+  estimatedMinutes: 8
+  tags: [exam, runtime-detection, incident-response]
+  version: 1
+spec:
+  description: |
+    Context: `qm-ledger` (`kubectl config use-context qm-ledger`). Node
+    `ledger-cp-1` is reachable with `ssh ledger-cp-1` (`sudo` works).
+
+    The cluster's runtime detector forwards its alerts, one JSON object per
+    line, to `/var/log/qm-runtime/alerts.json` on `ledger-cp-1`.
+
+    One alert reports a **package management process** launched inside a
+    running container in namespace `intake-ops`. Find the Pod that triggered
+    it and scale the **Deployment** that owns that Pod to **0** replicas. Do
+    not change the other Deployments and do not delete anything.
+  objectives:
+    - Read runtime alerts and map a Pod to its owning Deployment
+  params:
+    target:
+      type: choice
+      values: [doc-parser, label-sync, tariff-lookup, manifest-check]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      # Canonical sim-k8s-security cluster: every K-tier exam task shares it.
+      - name: qm-ledger
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        access: [ssh]
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-ledger
+          nodes:
+            - {name: ledger-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: ledger-wk-1, role: worker}
+            - {name: ledger-wk-2, role: worker}
+  setup:
+    - on: qm-ledger
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: intake-ops}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: doc-parser, namespace: intake-ops}
+        spec:
+          replicas: 2
+          selector: {matchLabels: {app: doc-parser}}
+          template:
+            metadata: {labels: {app: doc-parser, tier: intake}}
+            spec:
+              containers: [{name: app, image: busybox:1.37, command: ["sleep", "1d"]}]
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: label-sync, namespace: intake-ops}
+        spec:
+          replicas: 2
+          selector: {matchLabels: {app: label-sync}}
+          template:
+            metadata: {labels: {app: label-sync, tier: intake}}
+            spec:
+              containers: [{name: app, image: busybox:1.37, command: ["sleep", "1d"]}]
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: tariff-lookup, namespace: intake-ops}
+        spec:
+          replicas: 2
+          selector: {matchLabels: {app: tariff-lookup}}
+          template:
+            metadata: {labels: {app: tariff-lookup, tier: intake}}
+            spec:
+              containers: [{name: app, image: busybox:1.37, command: ["sleep", "1d"]}]
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: manifest-check, namespace: intake-ops}
+        spec:
+          replicas: 2
+          selector: {matchLabels: {app: manifest-check}}
+          template:
+            metadata: {labels: {app: manifest-check, tier: intake}}
+            spec:
+              containers: [{name: app, image: busybox:1.37, command: ["sleep", "1d"]}]
+    - on: qm-ledger
+      timeoutSec: 180
+      run: |
+        for d in doc-parser label-sync tariff-lookup manifest-check; do kubectl -n intake-ops rollout status deploy/$d --timeout=150s; done
+    - on: qm-ledger/ledger-cp-1
+      run: |
+        set -e
+        export KUBECONFIG=/etc/kubernetes/admin.conf
+        mkdir -p /var/log/qm-runtime
+        TARGET={{target}} python3 - <<'PY'
+        import json, os, subprocess
+        target = os.environ["TARGET"]
+        pods = json.loads(subprocess.check_output(["kubectl", "-n", "intake-ops", "get", "pods", "-o", "json"]))["items"]
+        byapp = {}
+        for p in pods:
+            byapp.setdefault(p["metadata"]["labels"]["app"], []).append(p)
+        others = sorted(a for a in byapp if a != target)
+        def alert(t, rule, prio, pod, cmd, extra=""):
+            f = {"k8s.ns.name": pod["metadata"]["namespace"], "k8s.pod.name": pod["metadata"]["name"],
+                 "container.name": "app", "container.id": pod["status"]["containerStatuses"][0]["containerID"][-12:],
+                 "proc.cmdline": cmd, "user.name": "root"}
+            out = f"{t} {prio}: {rule}{extra} (user=root command={cmd} k8s.ns={f['k8s.ns.name']} k8s.pod={f['k8s.pod.name']} container={f['container.id']})"
+            return {"time": "2026-10-14T" + t + "Z", "rule": rule, "priority": prio, "output": out, "output_fields": f}
+        lines = [
+            alert("06:02:11.201", "Terminal shell in container", "Notice", byapp[others[0]][0], "sh", " (kubectl exec by on-call)"),
+            alert("06:40:57.913", "Read sensitive file untrusted", "Warning", byapp[others[1]][1], "cat /etc/shadow"),
+            alert("07:15:33.448", "Launch Package Management Process in Container", "Error", byapp[target][1], "apk add --no-cache nmap"),
+            alert("07:16:02.004", "Outbound connection to unexpected port", "Notice", byapp[others[2]][0], "wget -q http://10.96.0.1:6443"),
+        ]
+        with open("/var/log/qm-runtime/alerts.json", "w") as fh:
+            for l in lines: fh.write(json.dumps(l) + "\n")
+        PY
+        chmod 0640 /var/log/qm-runtime/alerts.json
+  teardown:
+    - on: qm-ledger
+      run: kubectl delete namespace intake-ops --ignore-not-found --wait=false
+  checks:
+    - id: target-scaled
+      description: The Deployment whose Pod installed packages is scaled to 0 (and still exists)
+      type: k8s-query
+      skills: [k8s.security.runtime-detection]
+      weight: 3
+      query: {cluster: qm-ledger, resource: deployment, name: "{{target}}", namespace: intake-ops, jsonpath: "{.spec.replicas}"}
+      expect: {match: exact, value: "0"}
+    - id: others-untouched
+      description: The other three Deployments still have 2 replicas
+      type: shell
+      on: qm-ledger
+      skills: [k8s.security.runtime-detection]
+      command: |
+        n=0
+        for d in doc-parser label-sync tariff-lookup manifest-check; do
+          [ "$d" = {{target}} ] && continue
+          [ "$(kubectl -n intake-ops get deploy $d -o jsonpath='{.spec.replicas}' 2>/dev/null)" = 2 ] && n=$((n+1))
+        done
+        echo "untouched=$n"
+      expect: {match: exact, value: untouched=3}
+  misconceptions:
+    - id: deleted-pod
+      description: Deletes the Pod instead of scaling its Deployment.
+      feedback: The ReplicaSet recreates a deleted Pod immediately. Scale the owning Deployment to 0.
+      expectFail: [target-scaled]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-ledger
+          pod=$(ssh ledger-cp-1 "sudo jq -r 'select(.rule | test(\"Package Management\")) | .output_fields[\"k8s.pod.name\"]' /var/log/qm-runtime/alerts.json")
+          kubectl -n intake-ops delete pod "$pod"
+    - id: wrong-alert
+      description: Acts on the first alert in the file (a shell in a different Pod).
+      feedback: Pick the alert for a package management process, not the first one.
+      expectFail: [target-scaled, others-untouched]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-ledger
+          pod=$(ssh ledger-cp-1 "sudo head -n1 /var/log/qm-runtime/alerts.json" | jq -r '.output_fields["k8s.pod.name"]')
+          app=$(kubectl -n intake-ops get pod "$pod" -o jsonpath='{.metadata.labels.app}')
+          kubectl -n intake-ops scale deploy "$app" --replicas=0
+  solution:
+    explanation: Filter the alert by rule, take k8s.pod.name, follow the Pod's owner (ReplicaSet, then Deployment) and scale that Deployment to zero.
+    steps:
+      - on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-ledger
+          pod=$(ssh ledger-cp-1 "sudo jq -r 'select(.rule | test(\"Package Management\")) | .output_fields[\"k8s.pod.name\"]' /var/log/qm-runtime/alerts.json")
+          rs=$(kubectl -n intake-ops get pod "$pod" -o jsonpath='{.metadata.ownerReferences[0].name}')
+          deploy=$(kubectl -n intake-ops get rs "$rs" -o jsonpath='{.metadata.ownerReferences[0].name}')
+          kubectl -n intake-ops scale deploy "$deploy" --replicas=0
+    alternatives:
+      - id: grep-output
+        description: Grep the human-readable output field and strip the Pod hash suffixes.
+        steps:
+          - on: workstation
+            as: learner
+            run: |
+              kubectl config use-context qm-ledger
+              pod=$(ssh ledger-cp-1 'sudo grep -i "package management" /var/log/qm-runtime/alerts.json' | grep -o 'k8s.pod=[^ ]*' | cut -d= -f2)
+              deploy=$(echo "$pod" | sed -E 's/-[a-z0-9]+-[a-z0-9]+$//')
+              kubectl -n intake-ops scale deployment/"$deploy" --replicas=0

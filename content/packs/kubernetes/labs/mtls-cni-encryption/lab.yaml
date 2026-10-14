@@ -1,0 +1,281 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: mtls-cni-encryption
+  title: Encrypt pod-to-pod traffic
+  domain: kubernetes
+  frameworks: [cks:microservice-vulnerabilities]
+  difficulty: hard
+  estimatedMinutes: 25
+  tags: [cni, calico, wireguard, encryption, tcpdump]
+  version: 1
+spec:
+  description: |
+    In Quillmoor Logistics' customs cluster the declaration API on
+    `customs-wk-1` sends importer tax numbers to its database on
+    `customs-cp-1` in plain HTTP. Between nodes, the CNI (Calico) wraps that
+    traffic in VXLAN, which is not encryption: anyone on the node network can
+    read it.
+
+    From your workstation, switch to context `qm-customs`
+    (`kubectl config use-context qm-customs`). Nodes are reachable with
+    `ssh <node>` (`sudo` works; `tcpdump` is installed).
+
+    1. Look at the traffic between the nodes with `tcpdump` on
+       `customs-wk-1` and find the tax numbers in it.
+    2. Turn on Calico's **WireGuard** encryption for the cluster.
+    3. Prove it: save a capture of at least 10 seconds of the node-to-node
+       traffic, taken on `customs-wk-1`'s node network interface **after**
+       encryption is active, to `/var/tmp/declaration-traffic.pcap` on
+       `customs-wk-1`. It must contain the encrypted traffic and no plain
+       tax numbers.
+
+    The declaration API must keep working.
+  objectives:
+    - Capture inter-node Pod traffic and recognise plaintext
+    - Enable WireGuard encryption in the CNI
+    - Verify encryption with a packet capture
+  params:
+    taxprefix:
+      type: choice
+      values: [QM-TAXID, IMPORTER-VAT, EORI-QM]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-customs
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        access: [ssh]
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-customs
+          nodes:
+            - {name: customs-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: customs-wk-1, role: worker}
+  setup:
+    - on: qm-customs
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: customs-clearance}
+        ---
+        apiVersion: v1
+        kind: Pod
+        metadata: {name: declaration-db, namespace: customs-clearance, labels: {app: declaration-db}}
+        spec:
+          nodeSelector: {kubernetes.io/hostname: customs-cp-1}
+          tolerations: [{key: node-role.kubernetes.io/control-plane, operator: Exists, effect: NoSchedule}]
+          containers:
+            - name: db
+              image: busybox:1.37
+              command: ["sh", "-c", "mkdir -p /w && echo stored > /w/index.html && exec httpd -f -p 5432 -h /w"]
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata: {name: declaration-db, namespace: customs-clearance}
+        spec:
+          selector: {app: declaration-db}
+          ports: [{port: 5432, targetPort: 5432}]
+        ---
+        apiVersion: v1
+        kind: Pod
+        metadata: {name: declaration-api, namespace: customs-clearance, labels: {app: declaration-api}}
+        spec:
+          nodeSelector: {kubernetes.io/hostname: customs-wk-1}
+          containers:
+            - name: api
+              image: busybox:1.37
+              command: ["sh", "-c"]
+              args:
+                - |
+                  i=0
+                  while true; do
+                    i=$((i+1))
+                    if wget -q -T 3 -O /dev/null "http://declaration-db:5432/?taxno={{taxprefix}}-$((700000+i))"; then touch /tmp/ok; echo "stored $i"; else rm -f /tmp/ok; fi
+                    sleep 1
+                  done
+              readinessProbe:
+                exec: {command: ["test", "-f", "/tmp/ok"]}
+                periodSeconds: 3
+    - on: qm-customs
+      timeoutSec: 150
+      run: |
+        kubectl -n customs-clearance wait pod/declaration-db --for=condition=Ready --timeout=140s
+        kubectl -n customs-clearance wait pod/declaration-api --for=condition=Ready --timeout=90s
+    - on: qm-customs/customs-wk-1
+      timeoutSec: 60
+      run: |
+        # Baseline: the tax numbers are visible on the wire.
+        dev=$(ip -o route get 192.168.100.10 | sed -n 's/.* dev \([^ ]*\).*/\1/p')
+        timeout 8 tcpdump -i "$dev" -nn -A host 192.168.100.10 2>/dev/null | grep -q '{{taxprefix}}-' || { echo "no plaintext seen on $dev" >&2; exit 1; }
+  teardown:
+    - on: qm-customs
+      run: kubectl delete namespace customs-clearance --ignore-not-found --wait=false
+  checks:
+    - id: context
+      description: Terminal is using context qm-customs
+      type: k8s-context
+      on: workstation
+      skills: [k8s.cli.contexts]
+      weight: 0.5
+      expect: {match: exact, value: qm-customs}
+    - id: wireguard-enabled
+      description: Calico's FelixConfiguration enables WireGuard
+      type: shell
+      on: qm-customs
+      skills: [k8s.security.mtls]
+      command: kubectl get felixconfigurations.crd.projectcalico.org default -o jsonpath='{.spec.wireguardEnabled}' 2>/dev/null || echo missing
+      expect: {match: exact, value: "true"}
+    - id: nodes-have-keys
+      description: Both nodes publish a WireGuard public key
+      type: shell
+      on: qm-customs
+      skills: [k8s.security.mtls]
+      command: |
+        n=0
+        for node in customs-cp-1 customs-wk-1; do
+          k=$(kubectl get node $node -o jsonpath='{.metadata.annotations.projectcalico\.org/WireguardPublicKey}')
+          [ -n "$k" ] && n=$((n+1))
+        done
+        echo "keys=$n"
+      expect: {match: exact, value: keys=2}
+    - id: wire-encrypted
+      description: A fresh capture between the nodes shows WireGuard packets and no plain tax numbers
+      type: shell
+      on: qm-customs/customs-wk-1
+      skills: [k8s.security.mtls]
+      weight: 3
+      timeoutSec: 40
+      command: |
+        dev=$(ip -o route get 192.168.100.10 | sed -n 's/.* dev \([^ ]*\).*/\1/p')
+        f=$(mktemp); timeout 10 tcpdump -i "$dev" -nn -w "$f" host 192.168.100.10 2>/dev/null
+        wg=$(tcpdump -nn -r "$f" udp port 51820 2>/dev/null | wc -l)
+        plain=$(tcpdump -nn -A -r "$f" 2>/dev/null | grep -c '{{taxprefix}}-')
+        rm -f "$f"
+        [ "$wg" -gt 0 ] && wg=yes || wg=no
+        echo "wireguard=$wg plaintext=$plain"
+      expect: {match: exact, value: wireguard=yes plaintext=0}
+    - id: proof-capture
+      description: /var/tmp/declaration-traffic.pcap holds WireGuard traffic and no plain tax numbers
+      type: shell
+      on: qm-customs/customs-wk-1
+      skills: [k8s.security.mtls]
+      weight: 2
+      command: |
+        f=/var/tmp/declaration-traffic.pcap
+        [ -s $f ] || { echo "no capture"; exit 0; }
+        wg=$(tcpdump -nn -r $f udp port 51820 2>/dev/null | wc -l)
+        plain=$(tcpdump -nn -A -r $f 2>/dev/null | grep -c '{{taxprefix}}-')
+        [ "$wg" -ge 10 ] && wg=yes || wg="too-few($wg)"
+        echo "wireguard=$wg plaintext=$plain"
+      expect: {match: exact, value: wireguard=yes plaintext=0}
+    - id: api-working
+      description: declaration-api still stores declarations (Ready)
+      type: shell
+      on: qm-customs
+      skills: [k8s.security.mtls]
+      timeoutSec: 60
+      command: kubectl -n customs-clearance wait pod/declaration-api --for=condition=Ready --timeout=40s >/dev/null 2>&1 && echo ready || echo "not ready"
+      expect: {match: exact, value: ready}
+  hints:
+    - title: Watch the wire
+      body: Capture on the interface that carries traffic to the other node and print payloads as text.
+      command: ssh customs-wk-1 'sudo timeout 5 tcpdump -i any -nn -A host 192.168.100.10 | grep -m3 taxno'
+      cost: 1
+    - title: Where Calico keeps its settings
+      body: |
+        Cluster-wide Felix settings live in the FelixConfiguration named
+        `default` (`felixconfigurations.crd.projectcalico.org`). Its
+        `spec.wireguardEnabled` switches encryption for IPv4 traffic.
+      command: kubectl get felixconfigurations.crd.projectcalico.org default -o yaml
+      cost: 2
+    - title: Is it active?
+      body: Each node announces its WireGuard public key in an annotation once its tunnel is up; traffic then uses UDP port 51820.
+      command: kubectl get nodes -o yaml | grep -i wireguard
+      cost: 1
+    - title: Save the proof
+      command: ssh customs-wk-1 'sudo timeout 12 tcpdump -i <interface> -nn -w /var/tmp/declaration-traffic.pcap host 192.168.100.10'
+      body: Replace <interface> with the node's network interface (ip route get 192.168.100.10).
+      cost: 1
+  misconceptions:
+    - id: capture-before-enabling
+      description: Saves the proof capture before WireGuard is active.
+      feedback: Capture after both nodes publish their WireGuard keys; an earlier capture still shows plain VXLAN traffic.
+      expectFail: [proof-capture]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          kubectl config use-context qm-customs
+          ssh customs-wk-1 'sudo bash -s' <<'EOS'
+          dev=$(ip -o route get 192.168.100.10 | sed -n 's/.* dev \([^ ]*\).*/\1/p')
+          timeout 12 tcpdump -i "$dev" -nn -w /var/tmp/declaration-traffic.pcap host 192.168.100.10
+          true
+          EOS
+          kubectl patch felixconfigurations.crd.projectcalico.org default --type=merge -p '{"spec":{"wireguardEnabled":true}}'
+          for i in $(seq 1 60); do
+            n=$(kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.annotations.projectcalico\.org/WireguardPublicKey}{"\n"}{end}' | grep -c .)
+            [ "$n" = 2 ] && break; sleep 5
+          done
+          sleep 20
+    - id: wrong-felixconfig
+      description: Creates a new FelixConfiguration with another name instead of changing default.
+      feedback: Only the FelixConfiguration named default (or node.<name> for one node) is applied cluster-wide.
+      expectFail: [wireguard-enabled, wire-encrypted]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-customs
+          kubectl apply -f - <<'YAML'
+          apiVersion: crd.projectcalico.org/v1
+          kind: FelixConfiguration
+          metadata: {name: wireguard}
+          spec:
+            wireguardEnabled: true
+          YAML
+          sleep 30
+  solution:
+    explanation: |
+      Patch the default FelixConfiguration with wireguardEnabled true. Felix on
+      every node creates the wireguard.cali interface, publishes its public key
+      and routes Pod traffic to other nodes through the tunnel (UDP 51820), so
+      a capture on the node interface only shows encrypted packets.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 400
+        run: |
+          kubectl config use-context qm-customs
+          kubectl patch felixconfigurations.crd.projectcalico.org default --type=merge -p '{"spec":{"wireguardEnabled":true}}'
+          for i in $(seq 1 60); do
+            n=$(kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.annotations.projectcalico\.org/WireguardPublicKey}{"\n"}{end}' | grep -c .)
+            [ "$n" = 2 ] && break; sleep 5
+          done
+          sleep 20
+          ssh customs-wk-1 'sudo bash -s' <<'EOS'
+          dev=$(ip -o route get 192.168.100.10 | sed -n 's/.* dev \([^ ]*\).*/\1/p')
+          timeout 12 tcpdump -i "$dev" -nn -w /var/tmp/declaration-traffic.pcap host 192.168.100.10
+          tcpdump -nn -r /var/tmp/declaration-traffic.pcap | head -5
+          true
+          EOS
+    alternatives:
+      - id: apply-with-merge
+        description: Edit the full FelixConfiguration through kubectl get | jq | apply.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 400
+            run: |
+              kubectl config use-context qm-customs
+              kubectl get felixconfigurations.crd.projectcalico.org default -o json | jq '.spec.wireguardEnabled = true' | kubectl replace -f -
+              until [ "$(kubectl get node customs-wk-1 -o jsonpath='{.metadata.annotations.projectcalico\.org/WireguardPublicKey}')" != "" ] && \
+                    [ "$(kubectl get node customs-cp-1 -o jsonpath='{.metadata.annotations.projectcalico\.org/WireguardPublicKey}')" != "" ]; do sleep 5; done
+              sleep 20
+              ssh customs-wk-1 'sudo timeout 15 tcpdump -i any -nn -w /var/tmp/declaration-traffic.pcap "udp port 51820 or host 192.168.100.10"; true'

@@ -1,0 +1,332 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xks-registry-vap
+  title: Admit only approved registries
+  domain: kubernetes
+  frameworks: [cks:supply-chain-security]
+  difficulty: hard
+  estimatedMinutes: 10
+  tags: [exam, validatingadmissionpolicy, cel, supply-chain]
+  version: 1
+spec:
+  description: |
+    Context: `qm-depot` (`kubectl config use-context qm-depot`).
+
+    Create a ValidatingAdmissionPolicy named `{{policy}}` and a
+    ValidatingAdmissionPolicyBinding (any name) that **reject** every Pod in
+    namespace `intake` that has any container or init container whose image
+    is **not** from the registry `registry.quillmoor.example` (image references
+    of the form `registry.quillmoor.example/<repository>...`).
+
+    Pods in other namespaces must not be affected.
+  objectives:
+    - Write a CEL validation over all containers of a Pod
+    - Bind a policy to one namespace with Deny
+  params:
+    policy:
+      type: choice
+      values: [approved-registry-only, intake-registry-allowlist, quillmoor-images-only]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      # Canonical sim-k8s-security virtual cluster: every V-tier exam task shares it.
+      - name: qm-depot
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: qm-depot
+  setup:
+    - on: qm-depot
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: intake}
+        ---
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: intake-sandbox}
+  teardown:
+    - on: qm-depot
+      run: |
+        for b in $(kubectl get validatingadmissionpolicybindings -o jsonpath='{range .items[?(@.spec.policyName=="{{policy}}")]}{.metadata.name}{" "}{end}'); do
+          kubectl delete validatingadmissionpolicybinding "$b" --ignore-not-found
+        done
+        kubectl delete validatingadmissionpolicy {{policy}} --ignore-not-found
+        kubectl delete namespace intake intake-sandbox --ignore-not-found --wait=false
+  checks:
+    - id: policy-exists
+      description: ValidatingAdmissionPolicy {{policy}} exists and is bound
+      type: shell
+      on: qm-depot
+      skills: [k8s.security.admission-control]
+      command: |
+        p=$(kubectl get validatingadmissionpolicy {{policy}} -o jsonpath='{.metadata.name}' 2>/dev/null)
+        b=$(kubectl get validatingadmissionpolicybindings -o json | jq '[.items[] | select(.spec.policyName=="{{policy}}")] | length')
+        echo "policy=${p:-none} bindings=$b"
+      expect: {match: regex, value: "^policy={{policy}} bindings=[1-9]"}
+    - id: foreign-rejected
+      description: A Pod in intake with image busybox:1.37 is rejected
+      type: shell
+      on: qm-depot
+      skills: [k8s.security.admission-control]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        if out=$(kubectl -n intake run qm-vap-a --image=busybox:1.37 --restart=Never --dry-run=server -- true 2>&1); then echo admitted; else
+          case "$out" in *denied*|*forbidden*|*{{policy}}*) echo rejected ;; *) echo "error: $out" | head -c 200 ;; esac; fi
+      expect: {match: exact, value: rejected}
+    - id: lookalike-rejected
+      description: A look-alike registry host (registry.quillmoor.example.attacker.test) is rejected
+      type: shell
+      on: qm-depot
+      skills: [k8s.security.admission-control]
+      timeoutSec: 30
+      command: |
+        if out=$(kubectl -n intake run qm-vap-b --image=registry.quillmoor.example.attacker.test/intake/scanner:1.0 --restart=Never --dry-run=server -- true 2>&1); then echo admitted; else
+          case "$out" in *denied*|*forbidden*|*{{policy}}*) echo rejected ;; *) echo "error: $out" | head -c 200 ;; esac; fi
+      expect: {match: exact, value: rejected}
+    - id: init-container-rejected
+      description: A Pod whose init container uses busybox:1.37 is rejected
+      type: shell
+      on: qm-depot
+      skills: [k8s.security.admission-control]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        pod='{"apiVersion":"v1","kind":"Pod","metadata":{"name":"qm-vap-c","namespace":"intake"},"spec":{"initContainers":[{"name":"init","image":"busybox:1.37"}],"containers":[{"name":"app","image":"registry.quillmoor.example/intake/parser:2.1"}]}}'
+        if out=$(printf "%s" "$pod" | kubectl create --dry-run=server -f - 2>&1); then echo admitted; else
+          case "$out" in *denied*|*forbidden*|*{{policy}}*) echo rejected ;; *) echo "error: $out" | head -c 200 ;; esac; fi
+      expect: {match: exact, value: rejected}
+    - id: approved-admitted
+      description: A Pod in intake using only registry.quillmoor.example images is admitted
+      type: shell
+      on: qm-depot
+      skills: [k8s.security.admission-control]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        pod='{"apiVersion":"v1","kind":"Pod","metadata":{"name":"qm-vap-d","namespace":"intake"},"spec":{"initContainers":[{"name":"init","image":"registry.quillmoor.example/intake/migrate:1.4"}],"containers":[{"name":"app","image":"registry.quillmoor.example/intake/parser:2.1"}]}}'
+        if out=$(printf "%s" "$pod" | kubectl create --dry-run=server -f - 2>&1); then echo admitted; else echo "rejected: $out" | head -c 200; fi
+      expect: {match: exact, value: admitted}
+    - id: other-namespace-unaffected
+      description: A busybox Pod in intake-sandbox is still admitted
+      type: shell
+      on: qm-depot
+      skills: [k8s.security.admission-control]
+      timeoutSec: 30
+      command: |
+        if out=$(kubectl -n intake-sandbox run qm-vap-e --image=busybox:1.37 --restart=Never --dry-run=server -- true 2>&1); then echo admitted; else echo "rejected: $out" | head -c 200; fi
+      expect: {match: exact, value: admitted}
+  misconceptions:
+    - id: warn-only
+      description: Binds the policy with validationActions Warn instead of Deny.
+      feedback: Warn and Audit never reject a request; use Deny.
+      expectFail: [foreign-rejected, init-container-rejected]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-depot
+          kubectl apply -f - <<'YAML'
+          apiVersion: admissionregistration.k8s.io/v1
+          kind: ValidatingAdmissionPolicy
+          metadata: {name: "{{policy}}"}
+          spec:
+            failurePolicy: Fail
+            matchConstraints:
+              resourceRules:
+                - {apiGroups: [""], apiVersions: [v1], operations: [CREATE, UPDATE], resources: [pods]}
+            validations:
+              - expression: "object.spec.containers.all(c, c.image.startsWith('registry.quillmoor.example/')) && (!has(object.spec.initContainers) || object.spec.initContainers.all(c, c.image.startsWith('registry.quillmoor.example/')))"
+          ---
+          apiVersion: admissionregistration.k8s.io/v1
+          kind: ValidatingAdmissionPolicyBinding
+          metadata: {name: "{{policy}}-intake"}
+          spec:
+            policyName: "{{policy}}"
+            validationActions: [Warn]
+            matchResources:
+              namespaceSelector:
+                matchLabels: {kubernetes.io/metadata.name: intake}
+          YAML
+    - id: no-slash
+      description: Checks startsWith('registry.quillmoor.example') without the trailing slash.
+      feedback: Without the slash, any host that merely begins with the same letters passes. Compare against 'registry.quillmoor.example/'.
+      expectFail: [lookalike-rejected]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-depot
+          kubectl apply -f - <<'YAML'
+          apiVersion: admissionregistration.k8s.io/v1
+          kind: ValidatingAdmissionPolicy
+          metadata: {name: "{{policy}}"}
+          spec:
+            failurePolicy: Fail
+            matchConstraints:
+              resourceRules:
+                - {apiGroups: [""], apiVersions: [v1], operations: [CREATE, UPDATE], resources: [pods]}
+            validations:
+              - expression: "object.spec.containers.all(c, c.image.startsWith('registry.quillmoor.example')) && (!has(object.spec.initContainers) || object.spec.initContainers.all(c, c.image.startsWith('registry.quillmoor.example')))"
+          ---
+          apiVersion: admissionregistration.k8s.io/v1
+          kind: ValidatingAdmissionPolicyBinding
+          metadata: {name: "{{policy}}-intake"}
+          spec:
+            policyName: "{{policy}}"
+            validationActions: [Deny]
+            matchResources:
+              namespaceSelector:
+                matchLabels: {kubernetes.io/metadata.name: intake}
+          YAML
+    - id: containers-only
+      description: Validates spec.containers but ignores initContainers.
+      feedback: Init containers run code too. Validate them as well (guarding with has()).
+      expectFail: [init-container-rejected]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-depot
+          kubectl apply -f - <<'YAML'
+          apiVersion: admissionregistration.k8s.io/v1
+          kind: ValidatingAdmissionPolicy
+          metadata: {name: "{{policy}}"}
+          spec:
+            failurePolicy: Fail
+            matchConstraints:
+              resourceRules:
+                - {apiGroups: [""], apiVersions: [v1], operations: [CREATE, UPDATE], resources: [pods]}
+            validations:
+              - expression: "object.spec.containers.all(c, c.image.startsWith('registry.quillmoor.example/'))"
+          ---
+          apiVersion: admissionregistration.k8s.io/v1
+          kind: ValidatingAdmissionPolicyBinding
+          metadata: {name: "{{policy}}-intake"}
+          spec:
+            policyName: "{{policy}}"
+            validationActions: [Deny]
+            matchResources:
+              namespaceSelector:
+                matchLabels: {kubernetes.io/metadata.name: intake}
+          YAML
+    - id: cluster-wide
+      description: Binds the policy without a namespace selector, so it applies to every namespace.
+      feedback: Only intake is in scope; add matchResources.namespaceSelector to the binding.
+      expectFail: [other-namespace-unaffected]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-depot
+          kubectl apply -f - <<'YAML'
+          apiVersion: admissionregistration.k8s.io/v1
+          kind: ValidatingAdmissionPolicy
+          metadata: {name: "{{policy}}"}
+          spec:
+            failurePolicy: Fail
+            matchConstraints:
+              resourceRules:
+                - {apiGroups: [""], apiVersions: [v1], operations: [CREATE, UPDATE], resources: [pods]}
+              namespaceSelector:
+                matchExpressions:
+                  - {key: kubernetes.io/metadata.name, operator: NotIn, values: [kube-system]}
+            validations:
+              - expression: "object.spec.containers.all(c, c.image.startsWith('registry.quillmoor.example/')) && (!has(object.spec.initContainers) || object.spec.initContainers.all(c, c.image.startsWith('registry.quillmoor.example/')))"
+          ---
+          apiVersion: admissionregistration.k8s.io/v1
+          kind: ValidatingAdmissionPolicyBinding
+          metadata: {name: "{{policy}}-all"}
+          spec:
+            policyName: "{{policy}}"
+            validationActions: [Deny]
+          YAML
+  solution:
+    explanation: |
+      The policy matches Pod CREATE/UPDATE and checks every container and init
+      container image against the registry prefix including the slash. The
+      binding selects namespace intake by its automatic name label and denies.
+    steps:
+      - on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-depot
+          kubectl apply -f - <<'YAML'
+          apiVersion: admissionregistration.k8s.io/v1
+          kind: ValidatingAdmissionPolicy
+          metadata:
+            name: {{policy}}
+          spec:
+            failurePolicy: Fail
+            matchConstraints:
+              resourceRules:
+                - apiGroups: [""]
+                  apiVersions: ["v1"]
+                  operations: ["CREATE", "UPDATE"]
+                  resources: ["pods"]
+            validations:
+              - expression: >-
+                  object.spec.containers.all(c, c.image.startsWith('registry.quillmoor.example/')) &&
+                  (!has(object.spec.initContainers) ||
+                   object.spec.initContainers.all(c, c.image.startsWith('registry.quillmoor.example/')))
+                message: images must come from registry.quillmoor.example
+          ---
+          apiVersion: admissionregistration.k8s.io/v1
+          kind: ValidatingAdmissionPolicyBinding
+          metadata:
+            name: {{policy}}-intake
+          spec:
+            policyName: {{policy}}
+            validationActions: [Deny]
+            matchResources:
+              namespaceSelector:
+                matchLabels:
+                  kubernetes.io/metadata.name: intake
+          YAML
+          sleep 3
+    alternatives:
+      - id: variables-and-ephemeral
+        description: Collect every image (including ephemeral containers) in a variable and test them once.
+        steps:
+          - on: workstation
+            as: learner
+            run: |
+              kubectl config use-context qm-depot
+              kubectl apply -f - <<'YAML'
+              apiVersion: admissionregistration.k8s.io/v1
+              kind: ValidatingAdmissionPolicy
+              metadata: {name: "{{policy}}"}
+              spec:
+                failurePolicy: Fail
+                matchConstraints:
+                  resourceRules:
+                    - {apiGroups: [""], apiVersions: [v1], operations: [CREATE, UPDATE], resources: [pods]}
+                variables:
+                  - name: images
+                    expression: >-
+                      object.spec.containers.map(c, c.image) +
+                      (has(object.spec.initContainers) ? object.spec.initContainers.map(c, c.image) : []) +
+                      (has(object.spec.ephemeralContainers) ? object.spec.ephemeralContainers.map(c, c.image) : [])
+                validations:
+                  - expression: "variables.images.all(i, i.startsWith('registry.quillmoor.example/'))"
+                    messageExpression: "'unapproved registry in: ' + variables.images.join(', ')"
+              ---
+              apiVersion: admissionregistration.k8s.io/v1
+              kind: ValidatingAdmissionPolicyBinding
+              metadata: {name: intake-registry}
+              spec:
+                policyName: "{{policy}}"
+                validationActions: [Deny, Audit]
+                matchResources:
+                  namespaceSelector:
+                    matchExpressions:
+                      - {key: kubernetes.io/metadata.name, operator: In, values: [intake]}
+              YAML
+              sleep 3

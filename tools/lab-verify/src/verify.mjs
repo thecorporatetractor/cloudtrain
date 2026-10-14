@@ -372,9 +372,10 @@ export async function checkLab(labFile, skills, frameworkRefs, findings, ctx = {
     if (p.type === "int" && !(Number.isInteger(p.min) && Number.isInteger(p.max) && p.min <= p.max)) findings.push({ level: "error", file: labFile, path: `/spec/params/${name}`, message: "int param needs min <= max" });
   }
 
-  // Authoring quality bar for the pack. Exam tasks (curriculum type exam) are
-  // graded without help, so they must have no hints instead.
-  if (ctx.examTasks?.has(doc.metadata.id)) {
+  // Authoring quality bar for the pack. Exam tasks (curriculum type exam, or
+  // tag `exam`) are graded without help, so they must have no hints instead.
+  const isExam = ctx.examTasks?.has(doc.metadata.id) || (doc.metadata?.tags ?? []).includes("exam");
+  if (isExam) {
     if (spec.hints?.length) findings.push({ level: "error", file: labFile, path: "/spec/hints", message: "exam task must not have hints" });
   } else if (!spec.hints?.length) findings.push({ level: "warn", file: labFile, message: "no hints" });
   if (!spec.misconceptions?.length) findings.push({ level: "warn", file: labFile, message: "no misconceptions" });
@@ -399,6 +400,7 @@ export async function checkPack(packDir, labIds, findings, examTasks = new Set()
     }
   }
   // Exam tasks are drawn by exam simulations, never taken from a course.
+  for (const l of examTasks) if (labIds.has(l) && inCourses.has(l)) findings.push({ level: "error", file, message: `exam task '${l}' must not be in a course` });
   for (const l of labIds) if (!inCourses.has(l) && !examTasks.has(l)) findings.push({ level: "warn", file, message: `lab '${l}' is not in any course` });
   const courseIds = new Set((doc.courses ?? []).map((c) => c.id));
   for (const p of doc.paths ?? []) {
@@ -449,6 +451,7 @@ export async function verifyContent(contentDir, opts = {}) {
     const packDir = path.join(packsDir, pack);
     const labsDir = path.join(packDir, "labs");
     const labIds = new Set();
+    const examIds = new Set();
     for (const lab of existsSync(labsDir) ? (await readdir(labsDir)).sort() : []) {
       const labFile = path.join(labsDir, lab, "lab.yaml");
       if (!existsSync(labFile)) {
@@ -461,8 +464,9 @@ export async function verifyContent(contentDir, opts = {}) {
       labs.push({ file: labFile, id: doc?.metadata?.id ?? lab, ok, checks: doc?.spec?.checks?.length ?? 0 });
       packLabs.set(doc?.metadata?.id ?? lab, { domain: doc?.metadata?.domain, frameworks: doc?.metadata?.frameworks ?? [] });
       labIds.add(lab);
+      if ((doc?.metadata?.tags ?? []).includes("exam")) examIds.add(lab);
     }
-    await checkPack(packDir, labIds, findings, examTasks);
+    await checkPack(packDir, labIds, findings, new Set([...examTasks, ...examIds]));
   }
   // Info only: skills no lab gives evidence for yet (the lab backlog).
   const skillsFile = path.join(contentDir, "skills.yaml");

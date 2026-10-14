@@ -1,0 +1,270 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: immutable-label-printers
+  title: Make the label printers immutable at runtime
+  domain: kubernetes
+  frameworks: [cks:monitoring-runtime-security]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [securitycontext, readonlyrootfilesystem, emptydir, immutability]
+  version: 1
+spec:
+  description: |
+    The label-printer service at Quillmoor Logistics' depots runs as root on
+    a writable filesystem. If an attacker gets a shell in it, they can drop
+    tools anywhere and keep them. Make the containers immutable at runtime.
+
+    From your workstation, switch to context `qm-depot` first:
+
+    ```bash
+    kubectl config use-context qm-depot
+    ```
+
+    Change the Deployment `label-printer` in namespace `depot-labels` so that
+    its container:
+
+    - has a **read-only root filesystem**;
+    - runs as a **non-root** user (enforced with `runAsNonRoot`; use UID
+      {{uid}}) and **cannot escalate privileges**;
+    - can still write to exactly two places, `/tmp` and `{{spool}}`, each an
+      `emptyDir` volume. No other path may be writable.
+
+    The printer must keep working: its Pods are Ready only while it can write
+    both its temp files and its spool jobs.
+  objectives:
+    - Set readOnlyRootFilesystem, runAsNonRoot and allowPrivilegeEscalation
+    - Provide writable scratch space with emptyDir volumes
+    - Verify immutability from inside the container
+  params:
+    uid:
+      type: choice
+      values: [1000, 2101, 4242]
+    spool:
+      type: choice
+      values: [/var/spool/labels, /var/spool/printq]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-depot
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: qm-depot
+  setup:
+    - on: qm-depot
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: depot-labels}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: label-printer, namespace: depot-labels}
+        spec:
+          replicas: 2
+          selector: {matchLabels: {app: label-printer}}
+          template:
+            metadata: {labels: {app: label-printer}}
+            spec:
+              containers:
+                - name: printer
+                  image: busybox:1.37
+                  command: ["sh", "-c"]
+                  args:
+                    - |
+                      i=0
+                      while true; do
+                        i=$((i+1))
+                        if t=$(mktemp /tmp/render.XXXXXX) && echo "label $i" > "$t" && mkdir -p {{spool}} && mv "$t" {{spool}}/job-$((i % 5)); then
+                          touch /tmp/healthy; echo "printed job $i"
+                        else
+                          rm -f /tmp/healthy 2>/dev/null; echo "cannot write temp or spool files"
+                        fi
+                        sleep 3
+                      done
+                  readinessProbe:
+                    exec: {command: ["test", "-f", "/tmp/healthy"]}
+                    periodSeconds: 3
+                    failureThreshold: 1
+    - on: qm-depot
+      timeoutSec: 150
+      run: kubectl -n depot-labels rollout status deploy/label-printer --timeout=140s
+  teardown:
+    - on: qm-depot
+      run: kubectl delete namespace depot-labels --ignore-not-found --wait=false
+  checks:
+    - id: context
+      description: Terminal is using context qm-depot
+      type: k8s-context
+      on: workstation
+      skills: [k8s.cli.contexts]
+      weight: 0.5
+      expect: {match: exact, value: qm-depot}
+    - id: readonly-root
+      description: The printer container has a read-only root filesystem
+      type: k8s-query
+      skills: [k8s.security.immutability]
+      weight: 2
+      query: {cluster: qm-depot, resource: deployment, name: label-printer, namespace: depot-labels, jsonpath: "{.spec.template.spec.containers[0].securityContext.readOnlyRootFilesystem}"}
+      expect: {match: exact, value: "true"}
+    - id: non-root-enforced
+      description: runAsNonRoot is set (Pod or container level)
+      type: shell
+      on: qm-depot
+      skills: [k8s.security.immutability]
+      command: |
+        p=$(kubectl -n depot-labels get deploy label-printer -o jsonpath='{.spec.template.spec.securityContext.runAsNonRoot}')
+        c=$(kubectl -n depot-labels get deploy label-printer -o jsonpath='{.spec.template.spec.containers[0].securityContext.runAsNonRoot}')
+        if [ "$c" = true ] || { [ "$p" = true ] && [ "$c" != false ]; }; then echo enforced; else echo "not enforced"; fi
+      expect: {match: exact, value: enforced}
+    - id: no-escalation
+      description: allowPrivilegeEscalation is false on the printer container
+      type: k8s-query
+      skills: [k8s.security.immutability]
+      query: {cluster: qm-depot, resource: deployment, name: label-printer, namespace: depot-labels, jsonpath: "{.spec.template.spec.containers[0].securityContext.allowPrivilegeEscalation}"}
+      expect: {match: exact, value: "false"}
+    - id: writable-mounts
+      description: Exactly /tmp and {{spool}} are mounted, both from emptyDir volumes
+      type: shell
+      on: qm-depot
+      skills: [k8s.storage.ephemeral-volumes]
+      weight: 2
+      command: |
+        d=$(kubectl -n depot-labels get deploy label-printer -o json)
+        mounts=$(printf "%s" "$d" | jq -r '.spec.template.spec.containers[0].volumeMounts // [] | map(select(.mountPath | startswith("/var/run/secrets/") | not)) | map(.mountPath) | sort | join(",")')
+        kinds=$(printf "%s" "$d" | jq -r '(.spec.template.spec.containers[0].volumeMounts // []) as $m | [.spec.template.spec.volumes // [] | .[] | select(.name as $n | $m | any(.name == $n)) | if .emptyDir then "emptyDir" else "other" end] | unique | join(",")')
+        echo "mounts=$mounts kinds=$kinds"
+      expect: {match: exact, value: "mounts={{spool}},/tmp kinds=emptyDir"}
+    - id: runs-as-uid
+      description: Running printer Pods run as UID {{uid}}
+      type: shell
+      on: qm-depot
+      skills: [k8s.security.immutability]
+      timeoutSec: 60
+      command: |
+        kubectl -n depot-labels rollout status deploy/label-printer --timeout=40s >/dev/null 2>&1
+        pod=$(kubectl -n depot-labels get pods -l app=label-printer --field-selector=status.phase=Running -o json | jq -r '[.items[] | select(.metadata.deletionTimestamp == null)] | sort_by(.metadata.creationTimestamp) | last | .metadata.name // empty')
+        [ -n "$pod" ] || { echo "no running pod"; exit 0; }
+        echo "uid=$(kubectl -n depot-labels exec "$pod" -- id -u 2>/dev/null)"
+      expect: {match: exact, value: "uid={{uid}}"}
+    - id: root-fs-immutable
+      description: Writing to /etc inside a running printer Pod fails
+      type: shell
+      on: qm-depot
+      skills: [k8s.security.immutability]
+      weight: 2
+      timeoutSec: 60
+      command: |
+        kubectl -n depot-labels rollout status deploy/label-printer --timeout=40s >/dev/null 2>&1
+        pod=$(kubectl -n depot-labels get pods -l app=label-printer --field-selector=status.phase=Running -o json | jq -r '[.items[] | select(.metadata.deletionTimestamp == null)] | sort_by(.metadata.creationTimestamp) | last | .metadata.name // empty')
+        [ -n "$pod" ] || { echo "no running pod"; exit 0; }
+        if kubectl -n depot-labels exec "$pod" -- sh -c 'echo x > /etc/qm-probe' 2>/dev/null; then echo writable; else echo denied; fi
+        kubectl -n depot-labels exec "$pod" -- rm -f /etc/qm-probe >/dev/null 2>&1 || true
+      expect: {match: exact, value: denied}
+    - id: printer-ready
+      description: All label-printer Pods are Ready (temp and spool writes work)
+      type: shell
+      on: qm-depot
+      skills: [k8s.storage.ephemeral-volumes]
+      weight: 2
+      timeoutSec: 60
+      command: |
+        kubectl -n depot-labels rollout status deploy/label-printer --timeout=40s >/dev/null 2>&1
+        r=$(kubectl -n depot-labels get pods -l app=label-printer -o json | jq -r '[.items[] | select(.metadata.deletionTimestamp == null) | (.status.conditions[]? | select(.type=="Ready") | .status)] | join(" ")')
+        case "$r" in *False*|"") echo "not ready: '$r'" ;; *) echo ready ;; esac
+      expect: {match: exact, value: ready}
+  hints:
+    - title: Switch context
+      command: kubectl config use-context qm-depot
+      body: The printers run on the shared depot cluster.
+      cost: 0
+    - title: Where does it write?
+      body: The container's command shows every path it writes to.
+      command: kubectl -n depot-labels get deploy label-printer -o jsonpath='{.spec.template.spec.containers[0].args[0]}'
+      cost: 1
+    - title: Three securityContext fields
+      body: |
+        `readOnlyRootFilesystem: true`, `allowPrivilegeEscalation: false` and
+        `runAsNonRoot: true` with a `runAsUser`. busybox has no named non-root
+        user, so `runAsNonRoot` needs a numeric `runAsUser`.
+      cost: 2
+    - title: Scratch space
+      body: 'Add two `emptyDir: {}` volumes and mount one at /tmp and one at the spool directory.'
+      cost: 2
+  misconceptions:
+    - id: forgot-spool
+      description: Makes the root filesystem read-only but only gives /tmp an emptyDir.
+      feedback: The printer also writes its spool. Without a writable spool volume its writes fail and the Pods go unready.
+      expectFail: [writable-mounts, printer-ready]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n depot-labels patch deploy label-printer --type=json -p '[
+            {"op":"add","path":"/spec/template/spec/volumes","value":[{"name":"tmp","emptyDir":{}}]},
+            {"op":"add","path":"/spec/template/spec/containers/0/volumeMounts","value":[{"name":"tmp","mountPath":"/tmp"}]},
+            {"op":"add","path":"/spec/template/spec/containers/0/securityContext","value":{"readOnlyRootFilesystem":true,"runAsNonRoot":true,"runAsUser":{{uid}},"allowPrivilegeEscalation":false}}]'
+    - id: whole-var-writable
+      description: Mounts an emptyDir over all of /var instead of only the spool directory.
+      feedback: That makes far more than the spool writable. Mount the emptyDir exactly at the spool path.
+      expectFail: [writable-mounts]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n depot-labels patch deploy label-printer --type=json -p '[
+            {"op":"add","path":"/spec/template/spec/volumes","value":[{"name":"tmp","emptyDir":{}},{"name":"var","emptyDir":{}}]},
+            {"op":"add","path":"/spec/template/spec/containers/0/volumeMounts","value":[{"name":"tmp","mountPath":"/tmp"},{"name":"var","mountPath":"/var"}]},
+            {"op":"add","path":"/spec/template/spec/containers/0/securityContext","value":{"readOnlyRootFilesystem":true,"runAsNonRoot":true,"runAsUser":{{uid}},"allowPrivilegeEscalation":false}}]'
+    - id: still-root
+      description: Sets the read-only filesystem and volumes but leaves the container running as root.
+      feedback: A root process can remount or abuse writable mounts. Add runAsNonRoot with a numeric runAsUser and disable privilege escalation.
+      expectFail: [non-root-enforced, no-escalation, runs-as-uid]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n depot-labels patch deploy label-printer --type=json -p '[
+            {"op":"add","path":"/spec/template/spec/volumes","value":[{"name":"tmp","emptyDir":{}},{"name":"spool","emptyDir":{}}]},
+            {"op":"add","path":"/spec/template/spec/containers/0/volumeMounts","value":[{"name":"tmp","mountPath":"/tmp"},{"name":"spool","mountPath":"{{spool}}"}]},
+            {"op":"add","path":"/spec/template/spec/containers/0/securityContext","value":{"readOnlyRootFilesystem":true}}]'
+  solution:
+    explanation: |
+      readOnlyRootFilesystem makes the image layers immutable at runtime;
+      the two emptyDir volumes are the only writable paths. runAsNonRoot with a
+      numeric runAsUser and allowPrivilegeEscalation false stop the process from
+      regaining root.
+    steps:
+      - on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n depot-labels patch deploy label-printer --type=json -p '[
+            {"op":"add","path":"/spec/template/spec/volumes","value":[{"name":"tmp","emptyDir":{}},{"name":"spool","emptyDir":{}}]},
+            {"op":"add","path":"/spec/template/spec/containers/0/volumeMounts","value":[{"name":"tmp","mountPath":"/tmp"},{"name":"spool","mountPath":"{{spool}}"}]},
+            {"op":"add","path":"/spec/template/spec/containers/0/securityContext","value":{"readOnlyRootFilesystem":true,"runAsNonRoot":true,"runAsUser":{{uid}},"allowPrivilegeEscalation":false}}]'
+          kubectl -n depot-labels rollout status deploy/label-printer
+    alternatives:
+      - id: pod-level-user
+        description: Set runAsUser/runAsNonRoot in the Pod securityContext and the rest on the container, applied as a full manifest.
+        steps:
+          - on: workstation
+            as: learner
+            run: |
+              kubectl config use-context qm-depot
+              kubectl -n depot-labels get deploy label-printer -o json \
+                | jq '.spec.template.spec.securityContext = {"runAsNonRoot": true, "runAsUser": {{uid}}, "runAsGroup": {{uid}}}
+                      | .spec.template.spec.volumes = [{"name":"scratch","emptyDir":{}},{"name":"jobs","emptyDir":{"sizeLimit":"64Mi"}}]
+                      | .spec.template.spec.containers[0].securityContext = {"readOnlyRootFilesystem": true, "allowPrivilegeEscalation": false, "capabilities": {"drop": ["ALL"]}}
+                      | .spec.template.spec.containers[0].volumeMounts = [{"name":"scratch","mountPath":"/tmp"},{"name":"jobs","mountPath":"{{spool}}"}]' \
+                | kubectl apply -f -
+              kubectl -n depot-labels rollout status deploy/label-printer

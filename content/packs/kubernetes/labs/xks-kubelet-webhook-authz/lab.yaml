@@ -1,0 +1,187 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xks-kubelet-webhook-authz
+  title: Require authorization on the kubelet API
+  domain: kubernetes
+  frameworks: [cks:system-hardening]
+  difficulty: hard
+  estimatedMinutes: 10
+  tags: [exam, kubelet, authentication, authorization]
+  version: 1
+spec:
+  description: |
+    Context: `qm-ledger`. Node `ledger-wk-1` is reachable with
+    `ssh ledger-wk-1` (`sudo` works).
+
+    Configure the kubelet on `ledger-wk-1` so that:
+
+    - anonymous authentication is **disabled**;
+    - **Webhook** authentication is **enabled** (bearer tokens are checked
+      with the API server);
+    - authorization mode is **Webhook**.
+
+    The node must stay `Ready`.
+  objectives:
+    - Harden the kubelet's authentication and authorization settings
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      # Canonical sim-k8s-security cluster: every K-tier exam task shares it.
+      - name: qm-ledger
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        access: [ssh]
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-ledger
+          nodes:
+            - {name: ledger-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: ledger-wk-1, role: worker}
+            - {name: ledger-wk-2, role: worker}
+  setup:
+    - on: qm-ledger/ledger-wk-1
+      timeoutSec: 120
+      run: |
+        set -e
+        python3 - <<'PY'
+        import yaml
+        p = "/var/lib/kubelet/config.yaml"
+        c = yaml.safe_load(open(p))
+        a = c.setdefault("authentication", {})
+        a.setdefault("anonymous", {})["enabled"] = True
+        a.setdefault("webhook", {})["enabled"] = False
+        c.setdefault("authorization", {})["mode"] = "AlwaysAllow"
+        open(p, "w").write(yaml.safe_dump(c, default_flow_style=False))
+        PY
+        systemctl restart kubelet
+        for i in $(seq 1 30); do
+          [ "$(curl -sk -o /dev/null -w '%{http_code}' https://127.0.0.1:10250/pods || true)" = 200 ] && exit 0
+          sleep 2
+        done
+        exit 1
+    - on: qm-ledger
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: dispatch-exam}
+        ---
+        apiVersion: v1
+        kind: ServiceAccount
+        metadata: {name: no-rights, namespace: dispatch-exam}
+  teardown:
+    - on: qm-ledger
+      run: kubectl delete namespace dispatch-exam --ignore-not-found --wait=false
+  checks:
+    - id: anonymous-401
+      description: Unauthenticated requests to the kubelet get 401
+      type: shell
+      on: qm-ledger/ledger-cp-1
+      skills: [k8s.security.kubelet-hardening]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        ip=$(KUBECONFIG=/etc/kubernetes/admin.conf kubectl get node ledger-wk-1 -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}')
+        echo "code=$(curl -sk -m 5 -o /dev/null -w '%{http_code}' https://$ip:10250/pods)"
+      expect: {match: exact, value: code=401}
+    - id: token-authz-403
+      description: A valid ServiceAccount token without rights is authenticated but refused (403)
+      type: shell
+      on: qm-ledger/ledger-cp-1
+      skills: [k8s.security.kubelet-hardening]
+      weight: 3
+      timeoutSec: 30
+      command: |
+        export KUBECONFIG=/etc/kubernetes/admin.conf
+        ip=$(kubectl get node ledger-wk-1 -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}')
+        tok=$(kubectl -n dispatch-exam create token no-rights --duration=10m)
+        echo "code=$(curl -sk -m 5 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $tok" https://$ip:10250/pods)"
+      expect: {match: exact, value: code=403}
+    - id: node-ready
+      description: ledger-wk-1 is Ready
+      type: shell
+      on: qm-ledger
+      skills: [k8s.security.kubelet-hardening]
+      timeoutSec: 60
+      command: kubectl wait node/ledger-wk-1 --for=condition=Ready --timeout=40s >/dev/null 2>&1 && echo Ready || echo NotReady
+      expect: {match: exact, value: Ready}
+  misconceptions:
+    - id: webhook-authn-left-off
+      description: Disables anonymous access and sets Webhook authorization but leaves webhook authentication off.
+      feedback: Without webhook authentication the kubelet cannot validate bearer tokens, so token clients are rejected as unauthenticated instead of being authorized.
+      expectFail: [token-authz-403]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          ssh ledger-wk-1 'sudo bash -s' <<'EOS'
+          python3 - <<'PY'
+          import yaml
+          p = "/var/lib/kubelet/config.yaml"
+          c = yaml.safe_load(open(p))
+          c["authentication"]["anonymous"]["enabled"] = False
+          c["authorization"]["mode"] = "Webhook"
+          open(p, "w").write(yaml.safe_dump(c, default_flow_style=False))
+          PY
+          systemctl restart kubelet
+          EOS
+          sleep 10
+    - id: anonymous-left-on
+      description: Enables both webhooks but leaves anonymous authentication on.
+      feedback: Anonymous requests then reach authorization as system:anonymous instead of being rejected outright.
+      expectFail: [anonymous-401]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          ssh ledger-wk-1 'sudo bash -s' <<'EOS'
+          python3 - <<'PY'
+          import yaml
+          p = "/var/lib/kubelet/config.yaml"
+          c = yaml.safe_load(open(p))
+          c["authentication"]["webhook"]["enabled"] = True
+          c["authorization"]["mode"] = "Webhook"
+          open(p, "w").write(yaml.safe_dump(c, default_flow_style=False))
+          PY
+          systemctl restart kubelet
+          EOS
+          sleep 10
+  solution:
+    explanation: Set authentication.anonymous.enabled false, authentication.webhook.enabled true and authorization.mode Webhook in /var/lib/kubelet/config.yaml, then restart the kubelet.
+    steps:
+      - on: workstation
+        as: learner
+        run: |
+          ssh ledger-wk-1 'sudo bash -s' <<'EOS'
+          python3 - <<'PY'
+          import yaml
+          p = "/var/lib/kubelet/config.yaml"
+          c = yaml.safe_load(open(p))
+          c["authentication"]["anonymous"]["enabled"] = False
+          c["authentication"]["webhook"]["enabled"] = True
+          c["authorization"]["mode"] = "Webhook"
+          open(p, "w").write(yaml.safe_dump(c, default_flow_style=False))
+          PY
+          systemctl restart kubelet
+          EOS
+          sleep 10
+    alternatives:
+      - id: sed-edit
+        description: Edit the three values with sed.
+        steps:
+          - on: workstation
+            as: learner
+            run: |
+              ssh ledger-wk-1 'sudo bash -s' <<'EOS'
+              f=/var/lib/kubelet/config.yaml
+              sed -i '/^  anonymous:/{n;s/enabled: true/enabled: false/}' $f
+              sed -i '/^  webhook:/,/^  [a-z]/{s/    enabled: false/    enabled: true/}' $f
+              sed -i 's/^  mode: AlwaysAllow/  mode: Webhook/' $f
+              systemctl restart kubelet
+              EOS
+              sleep 10

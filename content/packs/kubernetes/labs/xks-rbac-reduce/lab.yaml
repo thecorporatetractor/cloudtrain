@@ -1,0 +1,167 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xks-rbac-reduce
+  title: Reduce a Role to least privilege
+  domain: kubernetes
+  frameworks: [cks:cluster-hardening]
+  difficulty: medium
+  estimatedMinutes: 6
+  tags: [exam, rbac, least-privilege]
+  version: 1
+spec:
+  description: |
+    Context: `qm-depot` (`kubectl config use-context qm-depot`).
+
+    In namespace `{{ns}}`, the Role `report-builder` grants far more than the
+    report job needs. Change the Role so that it grants **exactly** the verbs
+    `get` and `list` on **Pods** and **ConfigMaps**, and nothing else.
+
+    Keep the Role's name and the existing RoleBinding: the ServiceAccount
+    `report-builder` must keep those permissions.
+  objectives:
+    - Edit a Role down to an exact verb and resource set
+  params:
+    ns:
+      type: choice
+      values: [audit-reports, monthly-reports, ledger-reports]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      # Canonical sim-k8s-security virtual cluster: every V-tier exam task shares it.
+      - name: qm-depot
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: qm-depot
+  setup:
+    - on: qm-depot
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: "{{ns}}"}
+        ---
+        apiVersion: v1
+        kind: ServiceAccount
+        metadata: {name: report-builder, namespace: "{{ns}}"}
+        ---
+        apiVersion: rbac.authorization.k8s.io/v1
+        kind: Role
+        metadata: {name: report-builder, namespace: "{{ns}}"}
+        rules:
+          - apiGroups: [""]
+            resources: [pods, configmaps, secrets]
+            verbs: [get, list, watch, create, update, delete]
+          - apiGroups: [""]
+            resources: [pods/exec, pods/log]
+            verbs: [get, create]
+          - apiGroups: [apps]
+            resources: [deployments]
+            verbs: ["*"]
+        ---
+        apiVersion: rbac.authorization.k8s.io/v1
+        kind: RoleBinding
+        metadata: {name: report-builder, namespace: "{{ns}}"}
+        roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: report-builder}
+        subjects:
+          - {kind: ServiceAccount, name: report-builder, namespace: "{{ns}}"}
+  teardown:
+    - on: qm-depot
+      run: kubectl delete namespace {{ns}} --ignore-not-found --wait=false
+  checks:
+    - id: rule-set
+      description: The Role grants exactly get and list on pods and configmaps in the core group
+      type: shell
+      on: qm-depot
+      skills: [k8s.security.rbac-least-privilege]
+      weight: 3
+      command: |
+        kubectl -n {{ns}} get role report-builder -o json 2>/dev/null \
+          | jq -r '[.rules[] | .apiGroups[] as $g | .resources[] as $r | .verbs[] as $v | "\($g)/\($r):\($v)"] | unique | join(",")'
+      expect: {match: exact, value: "/configmaps:get,/configmaps:list,/pods:get,/pods:list"}
+    - id: sa-can-list-pods
+      description: report-builder can still list Pods in {{ns}}
+      type: k8s-can-i
+      skills: [k8s.security.rbac-least-privilege]
+      query: {cluster: qm-depot, verb: list, resource: pods, namespace: "{{ns}}", as: "system:serviceaccount:{{ns}}:report-builder"}
+      expect: {match: exact, value: "yes"}
+    - id: sa-can-get-configmaps
+      description: report-builder can still get ConfigMaps in {{ns}}
+      type: k8s-can-i
+      skills: [k8s.security.rbac-least-privilege]
+      query: {cluster: qm-depot, verb: get, resource: configmaps, namespace: "{{ns}}", as: "system:serviceaccount:{{ns}}:report-builder"}
+      expect: {match: exact, value: "yes"}
+    - id: sa-no-secrets
+      description: report-builder can no longer read Secrets
+      type: k8s-can-i
+      skills: [k8s.security.rbac-least-privilege]
+      query: {cluster: qm-depot, verb: get, resource: secrets, namespace: "{{ns}}", as: "system:serviceaccount:{{ns}}:report-builder"}
+      expect: {match: exact, value: "no"}
+    - id: sa-no-exec
+      description: report-builder can no longer exec into Pods
+      type: k8s-can-i
+      skills: [k8s.security.rbac-least-privilege]
+      query: {cluster: qm-depot, verb: create, resource: pods/exec, namespace: "{{ns}}", as: "system:serviceaccount:{{ns}}:report-builder"}
+      expect: {match: exact, value: "no"}
+  misconceptions:
+    - id: kept-watch
+      description: Keeps watch next to get and list.
+      feedback: The task says exactly get and list.
+      expectFail: [rule-set]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n {{ns}} apply -f - <<'YAML'
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: Role
+          metadata: {name: report-builder, namespace: "{{ns}}"}
+          rules:
+            - apiGroups: [""]
+              resources: [pods, configmaps]
+              verbs: [get, list, watch]
+          YAML
+    - id: parallel-role
+      description: Creates a second, narrow Role next to the old one instead of changing report-builder.
+      feedback: The RoleBinding still points at report-builder, so the broad grant stays in force.
+      expectFail: [sa-no-secrets, sa-no-exec, rule-set]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n {{ns}} create role report-builder-v2 --verb=get,list --resource=pods,configmaps
+    - id: recreated-under-new-name
+      description: Deletes the Role and recreates it under a different name.
+      feedback: The RoleBinding references the Role by name; renaming it leaves the ServiceAccount with no permissions.
+      expectFail: [sa-can-list-pods, sa-can-get-configmaps]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n {{ns}} delete role report-builder
+          kubectl -n {{ns}} create role report-reader --verb=get,list --resource=pods,configmaps
+  solution:
+    explanation: Replace the Role's rules in place; the RoleBinding keeps pointing at it.
+    steps:
+      - on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n {{ns}} create role report-builder --verb=get,list --resource=pods,configmaps --dry-run=client -o yaml | kubectl replace -f -
+    alternatives:
+      - id: json-patch
+        description: Replace the rules with a JSON patch.
+        steps:
+          - on: workstation
+            as: learner
+            run: |
+              kubectl config use-context qm-depot
+              kubectl -n {{ns}} patch role report-builder --type=json -p '[{"op":"replace","path":"/rules","value":[{"apiGroups":[""],"resources":["pods","configmaps"],"verbs":["get","list"]}]}]'

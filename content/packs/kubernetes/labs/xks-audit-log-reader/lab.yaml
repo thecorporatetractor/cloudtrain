@@ -1,0 +1,145 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xks-audit-log-reader
+  title: Find who read a Secret in the audit log
+  domain: kubernetes
+  frameworks: [cks:monitoring-runtime-security]
+  difficulty: medium
+  estimatedMinutes: 7
+  tags: [exam, audit, forensics, jq]
+  version: 1
+spec:
+  description: |
+    Context: `qm-ledger`. The node `ledger-cp-1` is reachable with
+    `ssh ledger-cp-1` (`sudo` works).
+
+    The audit log archived at
+    `/var/log/kubernetes/audit/archive/audit-20261013.log` on `ledger-cp-1`
+    covers the night the partner API credentials leaked.
+
+    Find the user that **read** (`get`) Secret `partner-token` in namespace
+    `partner-apps` and write that username, exactly as it appears in the log,
+    to `~/exam/partner-token-reader.txt` on your workstation.
+  objectives:
+    - Filter JSON audit events by verb, resource, namespace and name
+  params:
+    reader:
+      type: choice
+      values: ["system:serviceaccount:partner-apps:edi-bridge", "jdoyle@quillmoor.example", "system:serviceaccount:ops-tools:debug-shell"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      # Canonical sim-k8s-security cluster: every K-tier exam task shares it.
+      - name: qm-ledger
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        access: [ssh]
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-ledger
+          nodes:
+            - {name: ledger-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: ledger-wk-1, role: worker}
+            - {name: ledger-wk-2, role: worker}
+  setup:
+    - on: qm-ledger/ledger-cp-1
+      run: |
+        set -e
+        mkdir -p /var/log/kubernetes/audit/archive
+        READER='{{reader}}' python3 - <<'PY'
+        import json, os, random, uuid
+        random.seed(20261013)
+        reader = os.environ["READER"]
+        users = ["system:serviceaccount:partner-apps:edi-bridge", "jdoyle@quillmoor.example",
+                 "system:serviceaccount:ops-tools:debug-shell", "kubernetes-admin",
+                 "system:serviceaccount:kube-system:generic-garbage-collector", "amehta@quillmoor.example"]
+        decoys = [u for u in users if u != reader]
+        def ev(t, user, verb, res, ns=None, name=None, code=200):
+            o = {"resource": res, "apiVersion": "v1"}
+            if ns: o["namespace"] = ns
+            if name: o["name"] = name
+            path = "/api/v1" + (f"/namespaces/{ns}" if ns else "") + f"/{res}" + (f"/{name}" if name else "")
+            return {"kind": "Event", "apiVersion": "audit.k8s.io/v1", "level": "Metadata", "auditID": str(uuid.UUID(int=random.getrandbits(128))),
+                    "stage": "ResponseComplete", "requestURI": path, "verb": verb, "user": {"username": user, "groups": ["system:authenticated"]},
+                    "sourceIPs": [f"10.244.{random.randint(0,3)}.{random.randint(2,250)}"], "userAgent": "kubectl/v1.37.1",
+                    "objectRef": o, "responseStatus": {"metadata": {}, "code": code},
+                    "requestReceivedTimestamp": f"2026-10-13T{t}Z", "stageTimestamp": f"2026-10-13T{t}Z"}
+        out = []
+        for h in range(0, 6):
+            for m in range(0, 60, 7):
+                t = f"0{h}:{m:02d}:{random.randint(10,59)}.{random.randint(100000,999999)}"
+                u = random.choice(decoys)
+                choice = random.random()
+                if choice < 0.35:
+                    out.append(ev(t, u, "get", "configmaps", "partner-apps", random.choice(["edi-routes", "partner-list"])))
+                elif choice < 0.55:
+                    out.append(ev(t, u, "list", "secrets", "partner-apps"))
+                elif choice < 0.75:
+                    out.append(ev(t, u, "get", "secrets", "partner-apps", random.choice(["partner-token-old", "edi-signing"])))
+                elif choice < 0.85:
+                    out.append(ev(t, u, "get", "secrets", "billing", "partner-token"))
+                else:
+                    out.append(ev(t, u, "get", "pods", "partner-apps", "edi-bridge-7d9f"))
+        # Same name in another namespace, a refused read, and the real read.
+        out.append(ev("01:02:33.120934", decoys[1], "get", "secrets", "billing", "partner-token"))
+        out.append(ev("03:14:07.204411", decoys[0], "get", "secrets", "partner-apps", "partner-token", code=403))
+        out.append(ev("03:16:42.882019", reader, "get", "secrets", "partner-apps", "partner-token"))
+        out.sort(key=lambda e: e["requestReceivedTimestamp"])
+        with open("/var/log/kubernetes/audit/archive/audit-20261013.log", "w") as f:
+            for e in out: f.write(json.dumps(e) + "\n")
+        PY
+        chmod 0600 /var/log/kubernetes/audit/archive/audit-20261013.log
+    - on: workstation
+      run: |
+        mkdir -p /home/learner/exam && chown learner:learner /home/learner/exam
+  checks:
+    - id: reader-written
+      description: ~/exam/partner-token-reader.txt holds the username that read partner-token
+      type: shell
+      on: workstation
+      skills: [k8s.security.audit-logging, k8s.security.incident-investigation]
+      weight: 3
+      command: tr -d ' \r\n' < /home/learner/exam/partner-token-reader.txt 2>/dev/null || echo missing
+      expect: {match: exact, value: "{{reader}}"}
+  misconceptions:
+    - id: counted-refused
+      description: Takes the first get of partner-token, which the API server refused (403).
+      feedback: A 403 means the read did not happen. Check responseStatus.code.
+      expectFail: [reader-written]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          ssh ledger-cp-1 "sudo jq -r 'select(.verb==\"get\" and .objectRef.resource==\"secrets\" and .objectRef.namespace==\"partner-apps\" and .objectRef.name==\"partner-token\") | .user.username' /var/log/kubernetes/audit/archive/audit-20261013.log" | head -n1 > ~/exam/partner-token-reader.txt
+    - id: ignored-namespace
+      description: Filters by name only and picks up partner-token from namespace billing.
+      feedback: Secret names are only unique per namespace; filter objectRef.namespace too.
+      expectFail: [reader-written]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          ssh ledger-cp-1 "sudo jq -r 'select(.verb==\"get\" and .objectRef.name==\"partner-token\" and .responseStatus.code==200) | .user.username' /var/log/kubernetes/audit/archive/audit-20261013.log" | head -n1 > ~/exam/partner-token-reader.txt
+  solution:
+    explanation: Filter on verb get, resource secrets, namespace partner-apps, name partner-token and a successful response code.
+    steps:
+      - on: workstation
+        as: learner
+        run: |
+          ssh ledger-cp-1 "sudo jq -r 'select(.verb==\"get\" and .objectRef.resource==\"secrets\" and .objectRef.namespace==\"partner-apps\" and .objectRef.name==\"partner-token\" and .responseStatus.code==200) | .user.username' /var/log/kubernetes/audit/archive/audit-20261013.log" | sort -u > ~/exam/partner-token-reader.txt
+          cat ~/exam/partner-token-reader.txt
+    alternatives:
+      - id: grep-uri
+        description: Grep the exact request URI and read the username of the 200 response.
+        steps:
+          - on: workstation
+            as: learner
+            run: |
+              ssh ledger-cp-1 'sudo grep "\"requestURI\": \"/api/v1/namespaces/partner-apps/secrets/partner-token\"" /var/log/kubernetes/audit/archive/audit-20261013.log' \
+                | grep '"code": 200' | jq -r .user.username | sort -u > ~/exam/partner-token-reader.txt

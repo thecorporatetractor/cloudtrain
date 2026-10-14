@@ -1,0 +1,135 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xks-wireguard-cni
+  title: Turn on pod-to-pod encryption
+  domain: kubernetes
+  frameworks: [cks:microservice-vulnerabilities]
+  difficulty: hard
+  estimatedMinutes: 10
+  tags: [exam, cni, calico, wireguard]
+  version: 1
+spec:
+  description: |
+    Context: `qm-ledger` (`kubectl config use-context qm-ledger`). The CNI
+    is Calico.
+
+    1. Enable Calico's **WireGuard** encryption for pod-to-pod traffic
+       between nodes.
+    2. Once it is active, write the WireGuard **public key** that Calico
+       reports for node `ledger-wk-1` to `~/exam/wireguard-key.txt` on your
+       workstation (the key only, one line).
+  objectives:
+    - Enable WireGuard in Calico and read its status
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      # Canonical sim-k8s-security cluster: every K-tier exam task shares it.
+      - name: qm-ledger
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        access: [ssh]
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-ledger
+          nodes:
+            - {name: ledger-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: ledger-wk-1, role: worker}
+            - {name: ledger-wk-2, role: worker}
+  setup:
+    - on: workstation
+      run: mkdir -p /home/learner/exam && chown learner:learner /home/learner/exam
+  checks:
+    - id: enabled
+      description: The default FelixConfiguration enables WireGuard
+      type: shell
+      on: qm-ledger
+      skills: [k8s.security.mtls]
+      command: kubectl get felixconfigurations.crd.projectcalico.org default -o jsonpath='{.spec.wireguardEnabled}' 2>/dev/null || echo missing
+      expect: {match: exact, value: "true"}
+    - id: active
+      description: All three nodes report a WireGuard public key
+      type: shell
+      on: qm-ledger
+      skills: [k8s.security.mtls]
+      timeoutSec: 60
+      command: |
+        for i in $(seq 1 10); do
+          n=$(kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.annotations.projectcalico\.org/WireguardPublicKey}{"\n"}{end}' | grep -c .)
+          [ "$n" = 3 ] && break; sleep 4
+        done
+        echo "keys=$n"
+      expect: {match: exact, value: keys=3}
+    - id: key-written
+      description: ~/exam/wireguard-key.txt holds ledger-wk-1's WireGuard public key
+      type: shell
+      on: workstation
+      skills: [k8s.security.mtls]
+      weight: 2
+      command: |
+        want=$(kubectl --kubeconfig /home/learner/.kube/config --context qm-ledger get node ledger-wk-1 -o jsonpath='{.metadata.annotations.projectcalico\.org/WireguardPublicKey}' 2>/dev/null)
+        got=$(tr -d ' \r\n' < /home/learner/exam/wireguard-key.txt 2>/dev/null)
+        if [ -z "$want" ]; then echo "no key reported"; elif [ "$got" = "$want" ]; then echo match; else echo mismatch; fi
+      expect: {match: exact, value: match}
+  misconceptions:
+    - id: other-node-key
+      description: Writes the control plane's key instead of ledger-wk-1's.
+      feedback: Each node has its own key pair; read the annotation of ledger-wk-1.
+      expectFail: [key-written]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          kubectl config use-context qm-ledger
+          kubectl patch felixconfigurations.crd.projectcalico.org default --type=merge -p '{"spec":{"wireguardEnabled":true}}'
+          for i in $(seq 1 60); do
+            n=$(kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.annotations.projectcalico\.org/WireguardPublicKey}{"\n"}{end}' | grep -c .)
+            [ "$n" = 3 ] && break; sleep 5
+          done
+          kubectl get node ledger-cp-1 -o jsonpath='{.metadata.annotations.projectcalico\.org/WireguardPublicKey}' > ~/exam/wireguard-key.txt
+    - id: key-before-active
+      description: Writes the file right after the patch, before the key exists.
+      feedback: The key appears only after Felix has set up the tunnel; wait for the annotation.
+      expectFail: [key-written]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-ledger
+          kubectl get node ledger-wk-1 -o jsonpath='{.metadata.annotations.projectcalico\.org/WireguardPublicKey}' > ~/exam/wireguard-key.txt
+          kubectl patch felixconfigurations.crd.projectcalico.org default --type=merge -p '{"spec":{"wireguardEnabled":true}}'
+  solution:
+    explanation: Patch the default FelixConfiguration; when Felix has created the tunnel, each node carries the annotation projectcalico.org/WireguardPublicKey.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          kubectl config use-context qm-ledger
+          kubectl patch felixconfigurations.crd.projectcalico.org default --type=merge -p '{"spec":{"wireguardEnabled":true}}'
+          for i in $(seq 1 60); do
+            k=$(kubectl get node ledger-wk-1 -o jsonpath='{.metadata.annotations.projectcalico\.org/WireguardPublicKey}')
+            [ -n "$k" ] && break; sleep 5
+          done
+          echo "$k" > ~/exam/wireguard-key.txt
+    alternatives:
+      - id: calico-node-resource
+        description: Read the key from the Calico Node resource status instead of the Kubernetes Node annotation.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 300
+            run: |
+              kubectl config use-context qm-ledger
+              kubectl get felixconfigurations.crd.projectcalico.org default -o json | jq '.spec.wireguardEnabled = true' | kubectl replace -f -
+              for i in $(seq 1 60); do
+                k=$(kubectl get nodes.crd.projectcalico.org ledger-wk-1 -o jsonpath='{.status.wireguardPublicKey}' 2>/dev/null)
+                [ -n "$k" ] && break; sleep 5
+              done
+              echo "$k" > ~/exam/wireguard-key.txt
