@@ -1,0 +1,100 @@
+# Test fixture for the exam engine (not curriculum content).
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xt-service-selector-tier
+  title: Point the yard feed Service at one tier
+  domain: kubernetes
+  frameworks: [ckad:services-networking]
+  difficulty: medium
+  estimatedMinutes: 6
+  tags: [exam-fixture]
+spec:
+  description: |
+    Use context `exam-edge`.
+
+    The Service `yard-feed` in namespace `yard-feed` has no endpoints. Fix
+    its selector so that it routes to the `yard-feed` Pods of tier
+    **{{tier}}** only, and to no other Pods. Do not change any Pod or
+    Deployment.
+  params:
+    tier: {type: choice, values: [ingest, relay]}
+  topology:
+    entry: workstation
+    nodes:
+      - {name: workstation, driver: container, image: "jumphost:1", access: [shell]}
+      - name: exam-edge
+        driver: k8s-cluster
+        cluster: {mode: virtual, version: "v1.37", context: exam-edge}
+  setup:
+    - on: exam-edge
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: yard-feed}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: feed-ingest, namespace: yard-feed}
+        spec:
+          replicas: 2
+          selector: {matchLabels: {app: yard-feed, tier: ingest}}
+          template:
+            metadata: {labels: {app: yard-feed, tier: ingest}}
+            spec:
+              containers: [{name: feed, image: "caddy:2-alpine", ports: [{containerPort: 80}]}]
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: feed-relay, namespace: yard-feed}
+        spec:
+          replicas: 1
+          selector: {matchLabels: {app: yard-feed, tier: relay}}
+          template:
+            metadata: {labels: {app: yard-feed, tier: relay}}
+            spec:
+              containers: [{name: feed, image: "caddy:2-alpine", ports: [{containerPort: 80}]}]
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata: {name: yard-feed, namespace: yard-feed}
+        spec:
+          selector: {app: yard-feeder}
+          ports: [{port: 80, targetPort: 80}]
+    - on: exam-edge
+      timeoutSec: 120
+      run: |
+        for d in feed-ingest feed-relay; do kubectl -n yard-feed rollout status deploy/$d --timeout=100s; done
+  checks:
+    - id: selects-tier
+      description: the Service selects the yard-feed Pods of the requested tier
+      type: k8s-query
+      skills: [k8s.networking.services]
+      query: {cluster: exam-edge, resource: service, name: yard-feed, namespace: yard-feed, jsonpath: "{.spec.selector.app}/{.spec.selector.tier}"}
+      expect: {match: exact, value: "yard-feed/{{tier}}"}
+    - id: endpoints-only-tier
+      description: every endpoint is a Pod of that tier
+      type: shell
+      on: exam-edge
+      skills: [k8s.networking.endpoints]
+      command: |
+        want=$(kubectl -n yard-feed get pods -l app=yard-feed,tier={{tier}} -o jsonpath='{range .items[*]}{.status.podIP}{"\n"}{end}' | sort | tr '\n' ' ')
+        got=$(kubectl -n yard-feed get endpointslices -l kubernetes.io/service-name=yard-feed -o jsonpath='{range .items[*].endpoints[*]}{.addresses[0]}{"\n"}{end}' | sort | tr '\n' ' ')
+        [ -n "$got" ] && [ "$got" = "$want" ] && echo match
+      expect: {match: exact, value: "match"}
+    - id: workloads-untouched
+      description: the Deployments keep their replica counts
+      type: shell
+      on: exam-edge
+      skills: [k8s.cli.scoped-changes]
+      weight: 0.5
+      command: kubectl -n yard-feed get deploy feed-ingest feed-relay -o jsonpath='{range .items[*]}{.metadata.name}={.spec.replicas};{end}'
+      expect: {match: exact, value: "feed-ingest=2;feed-relay=1;"}
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 60
+        run: |
+          kubectl --context exam-edge -n yard-feed patch service yard-feed --type=merge -p '{"spec":{"selector":{"app":"yard-feed","tier":"{{tier}}"}}}'
+          sleep 3

@@ -1,0 +1,101 @@
+# Test fixture for the exam engine (not curriculum content).
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xt-configmap-key
+  title: Feed a berth limit from a ConfigMap
+  domain: kubernetes
+  frameworks: [ckad:environment-config-security]
+  difficulty: medium
+  estimatedMinutes: 7
+  tags: [exam-fixture]
+spec:
+  description: |
+    Use context `exam-core`.
+
+    In namespace `berth-config`:
+
+    1. Create a ConfigMap `berth-settings` with the key `MAX_BERTHS` set to
+       `{{berths}}`.
+    2. Create a Pod `berth-reader` (image `busybox:1.37`, command
+       `sleep 3600`) whose environment variable `MAX_BERTHS` comes from that
+       key of the ConfigMap.
+
+    Write everything you apply for this task to
+    `/home/learner/exam/berth-reader.yaml` and apply that file. After the
+    exam the file is applied once more; it must report no changes.
+  params:
+    berths: {type: int, min: 6, max: 14}
+  topology:
+    entry: workstation
+    nodes:
+      - {name: workstation, driver: container, image: "jumphost:1", access: [shell]}
+      - name: exam-core
+        driver: k8s-cluster
+        cluster: {mode: virtual, version: "v1.37", context: exam-core}
+  setup:
+    - on: exam-core
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: berth-config}
+  checks:
+    - id: configmap-value
+      description: berth-settings holds MAX_BERTHS
+      type: k8s-query
+      skills: [k8s.workloads.config]
+      query: {cluster: exam-core, resource: configmap, name: berth-settings, namespace: berth-config, jsonpath: "{.data.MAX_BERTHS}"}
+      expect: {match: exact, value: "{{berths}}"}
+    - id: env-from-key
+      description: berth-reader takes MAX_BERTHS from the ConfigMap key
+      type: k8s-query
+      skills: [k8s.workloads.config]
+      query: {cluster: exam-core, resource: pod, name: berth-reader, namespace: berth-config, jsonpath: "{.spec.containers[0].env[?(@.name=='MAX_BERTHS')].valueFrom.configMapKeyRef.name}/{.spec.containers[0].env[?(@.name=='MAX_BERTHS')].valueFrom.configMapKeyRef.key}"}
+      expect: {match: exact, value: "berth-settings/MAX_BERTHS"}
+    - id: pod-sees-value
+      description: the running Pod sees the value
+      type: shell
+      on: exam-core
+      skills: [k8s.workloads.config, k8s.workloads.pods]
+      timeoutSec: 20
+      command: kubectl -n berth-config exec berth-reader -- printenv MAX_BERTHS
+      expect: {match: exact, value: "{{berths}}"}
+  exam:
+    rerun:
+      - on: workstation
+        as: learner
+        timeoutSec: 60
+        run: |
+          f=/home/learner/exam/berth-reader.yaml
+          test -s "$f" || { echo "missing $f" >&2; exit 1; }
+          out=$(kubectl --context exam-core apply -f "$f") || exit 1
+          echo "$out"
+          # Idempotent: every object reports "unchanged".
+          ! printf '%s\n' "$out" | grep -v ' unchanged$' | grep -q .
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          mkdir -p /home/learner/exam
+          cat > /home/learner/exam/berth-reader.yaml <<'YAML'
+          apiVersion: v1
+          kind: ConfigMap
+          metadata: {name: berth-settings, namespace: berth-config}
+          data: {MAX_BERTHS: "{{berths}}"}
+          ---
+          apiVersion: v1
+          kind: Pod
+          metadata: {name: berth-reader, namespace: berth-config}
+          spec:
+            containers:
+              - name: reader
+                image: busybox:1.37
+                command: [sleep, "3600"]
+                env:
+                  - name: MAX_BERTHS
+                    valueFrom: {configMapKeyRef: {name: berth-settings, key: MAX_BERTHS}}
+          YAML
+          kubectl --context exam-core apply -f /home/learner/exam/berth-reader.yaml
+          kubectl --context exam-core -n berth-config wait pod/berth-reader --for=condition=Ready --timeout=100s

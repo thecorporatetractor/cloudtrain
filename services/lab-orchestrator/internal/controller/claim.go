@@ -230,6 +230,7 @@ func forwardSpec(s, p *labsv1.LabSession, exp metav1.Time) {
 	p.Spec.Hibernate = s.Spec.Hibernate
 	p.Spec.ResetGeneration = s.Spec.ResetGeneration
 	p.Spec.ValidateRequest = s.Spec.ValidateRequest
+	p.Spec.AccessRevoked = p.Spec.AccessRevoked || s.Spec.AccessRevoked
 }
 
 // mirror forwards s's spec to its pooled session p and publishes p's state

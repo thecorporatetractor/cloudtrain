@@ -102,3 +102,7 @@ func normalize(v any) (any, error) {
 		return v, nil
 	}
 }
+
+// YAMLToJSON converts a single YAML document to JSON with YAML 1.2 scalar
+// resolution (so `on`, `N`, `yes` stay strings) and anchors/aliases resolved.
+func YAMLToJSON(data []byte) ([]byte, error) { return yamlToJSON(data) }

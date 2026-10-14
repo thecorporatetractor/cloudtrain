@@ -213,6 +213,9 @@ func convert(src *sourceLab) *labsv1.LabTemplateSpec {
 		Teardown:    convertActions(s.Teardown),
 		Solution:    labsv1.Solution{Explanation: s.Solution.Explanation, Steps: convertActions(s.Solution.Steps)},
 	}
+	if s.Exam != nil {
+		out.Exam = &labsv1.ExamTaskSpec{Rerun: convertActions(s.Exam.Rerun)}
+	}
 	for _, alt := range s.Solution.Alternatives {
 		out.Solution.Alternatives = append(out.Solution.Alternatives, labsv1.SolutionAlternative{
 			ID: alt.ID, Description: alt.Description, Steps: convertActions(alt.Steps),
@@ -368,6 +371,9 @@ func inlineSources(src *sourceLab, baseDir string) []Issue {
 	visit("/spec/setup", s.Setup)
 	visit("/spec/teardown", s.Teardown)
 	visit("/spec/solution/steps", s.Solution.Steps)
+	if s.Exam != nil {
+		visit("/spec/exam/rerun", s.Exam.Rerun)
+	}
 	for i := range s.Solution.Alternatives {
 		visit(fmt.Sprintf("/spec/solution/alternatives/%d/steps", i), s.Solution.Alternatives[i].Steps)
 	}

@@ -54,7 +54,7 @@ export const NAV: NavSection[] = [
       { to: '/skills', label: 'Skills', icon: <Waypoints size={16} />, keys: 'g s', link: (p) => <Link to="/skills" search={{ framework: 'cks' }} {...p} /> },
       { to: '/assignments', label: 'My assignments', icon: <ClipboardList size={16} />, keys: 'g m', link: (p) => <Link to="/assignments" {...p} /> },
       { to: '/history', label: 'History', icon: <History size={16} />, keys: 'g y', link: (p) => <Link to="/history" {...p} /> },
-      { to: '/exams', label: 'Exams', icon: <GraduationCap size={16} />, keys: 'g e', link: (p) => <Link to="/exams" {...p} /> },
+      { to: '/exams', label: 'Exams', icon: <GraduationCap size={16} />, keys: 'g e', link: (p) => <Link to="/exams" search={{}} {...p} /> },
     ],
   },
   {
@@ -82,7 +82,7 @@ function ShellInner() {
   const pathname = useRouterState({ select: (s) => s.location.pathname });
   const { theme, setTheme, cycle } = useTheme();
   const me = useMe();
-  const inWorkspace = /^\/labs\/[^/]+\/work$/.test(pathname) || /\/observe\/[^/]+$/.test(pathname);
+  const inWorkspace = /^\/labs\/[^/]+\/work$/.test(pathname) || /\/observe\/[^/]+$/.test(pathname) || /^\/exams\/attempts\/[^/]+$/.test(pathname);
   const publicPage = isPublicPath(pathname);
 
   // Workspace forces the rail; leaving restores the user's preference.
@@ -101,7 +101,7 @@ function ShellInner() {
     { keys: 'mod+/', description: 'Keyboard shortcuts', group: 'Global', skipTerminal: true, handler: () => shell.setShortcutsOpen(true) },
     { keys: 'mod+shift+l', description: 'Cycle theme', group: 'Global', handler: cycle },
     { keys: '[', description: 'Collapse or expand navigation', group: 'Global', handler: () => !inWorkspace && shell.toggleNavCollapsed() },
-    ...visibleSections.flatMap((s) => s.items.filter((n) => n.keys).map((n): Hotkey => ({ keys: n.keys!, description: `Go to ${n.label.toLowerCase()}`, group: 'Navigate', handler: () => void navigate({ to: n.to as '/', search: n.to === '/catalog' || n.to === '/team' ? {} : n.to === '/skills' ? { framework: 'cks' } : undefined }) }))),
+    ...visibleSections.flatMap((s) => s.items.filter((n) => n.keys).map((n): Hotkey => ({ keys: n.keys!, description: `Go to ${n.label.toLowerCase()}`, group: 'Navigate', handler: () => void navigate({ to: n.to as '/', search: n.to === '/catalog' || n.to === '/team' || n.to === '/exams' ? {} : n.to === '/skills' ? { framework: 'cks' } : undefined }) }))),
   ];
   useHotkeys(hotkeys, !publicPage);
 

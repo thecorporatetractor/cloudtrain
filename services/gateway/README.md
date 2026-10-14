@@ -144,6 +144,38 @@ row the learner sees on the session (`LabSession.notices`) and as a live
 `notice` frame. Shadowing works within one gateway replica (a multi-replica
 deployment needs sticky routing by session or a shared pub/sub).
 
+## Exam simulations
+
+`src/exams/` serves `/api/exams/*` (types: `packages/api-types/exam.d.ts`) on
+top of the orchestrator's `ExamTemplate`/`ExamSession`
+(`services/lab-orchestrator`, "Exam simulations").
+
+| Route | What |
+|---|---|
+| `GET /api/exams` | catalog: every curriculum exam (+ `CT_EXTRA_EXAM_FILES`), availability (each pool covers its draw with built labs), rules, retake policy and the caller's retake status |
+| `GET /api/exams/:examId` | detail: objectives (normalised weights), pre-exam checklist, report contents, the caller's attempts |
+| `POST /api/exams/:examId/attempts` | start (201): retake policy enforced (one running attempt; first + `freeRetakes` immediately, then `cooldownHours`; `maxAttemptsPer30Days`; attempts the platform failed to run never count); `labctl exam compile`, task LabTemplates + ExamTemplate created once, ExamSession `exam-<10 hex>` with `avoidTasks` = earlier tasks when `freshDraw` |
+| `GET /api/exams/attempts/:id` | state: phase, server time, timer start and deadline, tasks (statements with params resolved, weights, contexts, flags), terminal targets while in progress; never checks, hints or solutions |
+| `PUT /api/exams/attempts/:id/tasks/:index/flag` | `{flagged}` (in progress, rules.flagForReview) |
+| `POST /api/exams/attempts/:id/submit` | `spec.submit` (the orchestrator freezes and grades) |
+| `GET /api/exams/attempts/:id/report` | per objective, per task (pass/partial/fail, weight), per check (learner-safe message, failed after reboot / on re-run), skills, recommended labs |
+| `GET /api/exams/attempts/mine?exam=` | the caller's attempts |
+| `GET /api/exams/team-readiness?team=` | manager view: per exam and member, best/last score, readiness, weakest objective |
+| `GET /api/exams/attempts/:id/terminal?target=` | WebSocket, same protocol as lab terminals; refused once the environment is frozen |
+
+Persistence is behind `ExamStore` (`MemoryExamStore` now; Postgres tables in
+`src/exams/schema.sql` for the platform-api migration) and learner-model
+feeding behind `ExamEvidenceSink` (once per graded attempt; the platform-api
+adapter calls `recordRun` per task). The dev team directory
+(`AttemptTeamDirectory`) stands in for teams/team_members.
+
+Settings: `CT_CURRICULUM_FILE` (default `content/curriculum.yaml`),
+`CT_EXTRA_EXAM_FILES` (e.g.
+`services/lab-orchestrator/testdata/exams/exams.yaml`, with
+`CT_EXTRA_LAB_DIRS=services/lab-orchestrator/testdata/exams/tasks`),
+`CT_EXAM_SESSION_LABELS` (`k=v,...`, e.g. a scoped manager's selector),
+`CT_EXAM_DURATION_MINUTES` (demo override).
+
 ## Auth (BFF)
 
 - **Login, identity-first:** `GET /api/auth/login?email=` looks the domain up

@@ -37,6 +37,11 @@ type sourceSpec struct {
 	Hints          []sourceHint           `json:"hints"`
 	Misconceptions []sourceMisconception  `json:"misconceptions"`
 	Solution       sourceSolution         `json:"solution"`
+	Exam           *sourceExam            `json:"exam"`
+}
+
+type sourceExam struct {
+	Rerun []sourceAction `json:"rerun"`
 }
 
 type sourceParam struct {

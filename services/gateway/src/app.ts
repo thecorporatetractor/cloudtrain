@@ -20,12 +20,16 @@ import type { SessionService } from './sessions/service.js';
 import { bridge, clampSize, send } from './terminal/bridge.js';
 import { TerminalHub } from './terminal/hub.js';
 import { planTerminal } from './terminal/target.js';
+import { registerExamRoutes } from './exams/routes.js';
+import type { ExamService } from './exams/service.js';
 
 export interface AppDeps {
   content: Content;
   auth: Authenticator;
   sessions: SessionService;
   cluster: LabCluster;
+  /** Exam simulations (`/api/exams/*`); omitted = not served. */
+  exams?: ExamService;
   logger?: boolean | { level: string };
   /** Postgres-backed platform (identity, persistence, admin). Without it the gateway serves labs/sessions with sample learner data. */
   platform?: PlatformService;
@@ -186,6 +190,10 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   });
 
   if (ps) registerPlatformRoutes(app, ps, sessions, deps.clusterInfo ?? null);
+
+  /* ---------------------------------- exams ---------------------------------- */
+
+  if (deps.exams) registerExamRoutes(app, deps.exams, cluster);
 
   return app;
 }

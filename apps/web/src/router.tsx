@@ -40,6 +40,9 @@ const PlatformLayout = lazyRouteComponent(() => import('./routes/platform/Platfo
 const PlatformOrgs = lazyRouteComponent(() => import('./routes/platform/Orgs'), 'PlatformOrgs');
 const PlatformCapacity = lazyRouteComponent(() => import('./routes/platform/Capacity'), 'PlatformCapacity');
 const PlatformContent = lazyRouteComponent(() => import('./routes/platform/Content'), 'PlatformContent');
+const ExamDetail = lazyRouteComponent(() => import('./routes/exams/ExamDetail'), 'ExamDetail');
+const ExamWorkspace = lazyRouteComponent(() => import('./routes/exams/ExamWorkspace'), 'ExamWorkspace');
+const ExamResults = lazyRouteComponent(() => import('./routes/exams/ExamResults'), 'ExamResults');
 
 function Pending() {
   return (
@@ -150,8 +153,19 @@ export const historyRoute = createRoute({
   component: HistoryScreen,
 });
 
-/** Exam simulations: reserved for the exam engine stream (learner: simulations, attempts, results). */
-export const examsRoute = createRoute({ getParentRoute: () => rootRoute, path: '/exams', component: Exams });
+export interface ExamsSearch {
+  view?: 'attempts';
+}
+/** Exam simulations: catalog and the learner's attempts (lab.run). */
+export const examsRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/exams',
+  validateSearch: (s: Record<string, unknown>): ExamsSearch => (s.view === 'attempts' ? { view: 'attempts' } : {}),
+  component: Exams,
+});
+export const examDetailRoute = createRoute({ getParentRoute: () => rootRoute, path: '/exams/$examId', component: ExamDetail });
+export const examAttemptRoute = createRoute({ getParentRoute: () => rootRoute, path: '/exams/attempts/$attemptId', component: ExamWorkspace });
+export const examResultsRoute = createRoute({ getParentRoute: () => rootRoute, path: '/exams/attempts/$attemptId/results', component: ExamResults });
 
 /* ------------------------------------------------------------------ author */
 
@@ -194,8 +208,16 @@ export const teamAssignmentsRoute = createRoute({
   component: TeamAssignments,
 });
 
-/** Manager view of team exam readiness (exam engine stream). */
-export const teamExamsRoute = createRoute({ getParentRoute: () => rootRoute, path: '/team/exams', validateSearch: teamSearch, component: TeamExams });
+export interface TeamExamsSearch extends TeamSearch {
+  exam?: string;
+}
+/** Manager view of team exam readiness (GET /api/exams/team-readiness, progress.read.team). */
+export const teamExamsRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/team/exams',
+  validateSearch: (s: Record<string, unknown>): TeamExamsSearch => ({ ...teamSearch(s), ...(str(s.exam) ? { exam: str(s.exam) } : {}) }),
+  component: TeamExams,
+});
 
 /* ------------------------------------------------------------------ instructor */
 
@@ -298,6 +320,9 @@ const routeTree = rootRoute.addChildren([
   assignmentsRoute,
   historyRoute,
   examsRoute,
+  examDetailRoute,
+  examAttemptRoute,
+  examResultsRoute,
   studioRoute,
   studioDraftRoute,
   teamRoute,

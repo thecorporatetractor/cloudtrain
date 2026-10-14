@@ -46,6 +46,14 @@ export interface Config {
   devDomainVerifyBypass: boolean;
   /** How often open lab attempts are reconciled with the cluster (ms, 0 = off). */
   sweepIntervalMs: number;
+  /** content/curriculum.yaml (exam simulations). */
+  curriculumFile: string;
+  /** Extra files with an `exams` list served alongside the curriculum (e.g. the orchestrator's test exam). */
+  extraExamFiles: string[];
+  /** Labels put on every ExamSession, e.g. a scoped orchestrator's session selector ("k=v,k2=v2"). */
+  examSessionLabels: Record<string, string>;
+  /** Dev/demo override of every exam's duration. */
+  examDurationMinutes?: number;
 }
 
 /** Relative paths in settings are relative to the repository root (pnpm runs the gateway from its package dir). */
@@ -54,6 +62,15 @@ const fromRoot = (p: string) => path.resolve(repoRoot, p);
 function num(v: string | undefined, d: number): number {
   const n = v === undefined || v === '' ? NaN : Number(v);
   return Number.isFinite(n) ? n : d;
+}
+
+function labels(v: string | undefined): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const kv of (v ?? '').split(',')) {
+    const [k, val] = kv.split('=');
+    if (k?.trim() && val !== undefined) out[k.trim()] = val.trim();
+  }
+  return out;
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
@@ -98,5 +115,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     platformIdps: (env.CT_PLATFORM_IDPS ?? 'azarguard-entra').split(',').map((s) => s.trim()).filter(Boolean),
     devDomainVerifyBypass: !prod && env.CT_DEV_DOMAIN_VERIFY_BYPASS === '1',
     sweepIntervalMs: num(env.CT_SWEEP_INTERVAL_MS, 60_000),
+    curriculumFile: fromRoot(env.CT_CURRICULUM_FILE ?? 'content/curriculum.yaml'),
+    extraExamFiles: list(env.CT_EXTRA_EXAM_FILES).map(fromRoot),
+    examSessionLabels: labels(env.CT_EXAM_SESSION_LABELS),
+    ...(num(env.CT_EXAM_DURATION_MINUTES, 0) > 0 ? { examDurationMinutes: num(env.CT_EXAM_DURATION_MINUTES, 0) } : {}),
   };
 }

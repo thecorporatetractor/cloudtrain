@@ -28,6 +28,19 @@ type LabTemplateSpec struct {
 	// +optional
 	Misconceptions []Misconception `json:"misconceptions,omitempty"`
 	Solution       Solution        `json:"solution"`
+	// Exam holds exam-task grading extras (labs used as exam tasks).
+	// +optional
+	Exam *ExamTaskSpec `json:"exam,omitempty"`
+}
+
+// ExamTaskSpec is the exam-only part of an exam-task lab.
+type ExamTaskSpec struct {
+	// Rerun actions run after the first grading pass when the exam's rules
+	// ask for an idempotency re-run (e.g. re-running the candidate's saved
+	// playbook and asserting it reports no changes). A failing action fails
+	// the task's checks; then the checks are graded again.
+	// +optional
+	Rerun []Action `json:"rerun,omitempty"`
 }
 
 // LabTemplateStatus is the observed state of a LabTemplate.

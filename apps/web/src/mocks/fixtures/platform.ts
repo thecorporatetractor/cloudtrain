@@ -173,7 +173,7 @@ export const userRef = (id: string): UserRef => {
   return p ? { id: p.id, name: p.name, email: p.email, title: p.title } : { id, name: id, email: `${id}@example` };
 };
 const teamsOf = (p: PersonSeed, orgId: string) => p.teams.filter((t) => teamSeeds.find((s) => s.id === t.teamId)?.orgId === orgId);
-const membersOfTeam = (teamId: string) => people.filter((p) => p.status !== 'deactivated' && p.teams.some((t) => t.teamId === teamId));
+export const membersOfTeam = (teamId: string) => people.filter((p) => p.status !== 'deactivated' && p.teams.some((t) => t.teamId === teamId));
 
 /* ================================================================ permissions */
 

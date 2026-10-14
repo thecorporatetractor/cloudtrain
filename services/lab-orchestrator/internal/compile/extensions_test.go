@@ -106,3 +106,26 @@ func TestContentPacksCompile(t *testing.T) {
 		}
 	}
 }
+
+func TestCompileExamRerun(t *testing.T) {
+	lt, err := CompileFile("../../testdata/exams/tasks/xt-configmap-key/lab.yaml", Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lt.Spec.Exam == nil || len(lt.Spec.Exam.Rerun) != 1 || lt.Spec.Exam.Rerun[0].On != "workstation" || lt.Spec.Exam.Rerun[0].As != "learner" {
+		t.Fatalf("exam = %+v", lt.Spec.Exam)
+	}
+	bad := []byte(`apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata: {id: x, title: x, domain: kubernetes, difficulty: easy, estimatedMinutes: 1}
+spec:
+  description: x
+  topology: {nodes: [{name: ws, driver: container}]}
+  checks: [{id: c, description: c, type: shell, skills: [s]}]
+  solution: {steps: [{on: ws, run: "true"}]}
+  exam: {rerun: [{on: nowhere, run: "true"}]}
+`)
+	if _, err := Compile(bad, Options{}); err == nil || !strings.Contains(err.Error(), "/spec/exam/rerun/0") {
+		t.Fatalf("rerun on unknown node: %v", err)
+	}
+}
