@@ -1,0 +1,155 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: loadbalancer-kiosk-ip
+  title: Expose the kiosk API with a LoadBalancer Service
+  domain: kubernetes
+  frameworks: [cka:services-networking]
+  difficulty: easy
+  estimatedMinutes: 10
+  tags: [loadbalancer, services, metallb]
+  version: 1
+spec:
+  description: |
+    The yard's self-service kiosks need a stable address for the kiosk API
+    that does not depend on any one node.
+
+    Use context `qm-yard`:
+
+    ```bash
+    kubectl config use-context qm-yard
+    ```
+
+    1. In namespace **`yard-kiosk`**, expose Deployment **`kiosk-api`** with a
+       Service **`{{svc}}`** of type **LoadBalancer** on port **80**
+       (containers listen on 8080).
+    2. Write the external address the in-lab load balancer assigns to
+       `/home/learner/reports/kiosk-ip.txt` (just the address).
+    3. Check from your workstation that `http://<address>/` answers.
+  objectives:
+    - Create a LoadBalancer Service and read its external address
+  params:
+    svc:
+      type: choice
+      values: [kiosk-public, kiosk-lb, kiosk-gateway]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-yard
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-yard
+          nodes:
+            - {name: yard-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: yard-wk-1, role: worker}
+  setup:
+    - on: qm-yard/yard-cp-1
+      timeoutSec: 400
+      run: /opt/cloudtrain/bin/addons-install lb --wait
+    - on: qm-yard
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: yard-kiosk}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: kiosk-api, namespace: yard-kiosk}
+        spec:
+          replicas: 2
+          selector: {matchLabels: {app: kiosk-api}}
+          template:
+            metadata: {labels: {app: kiosk-api}}
+            spec:
+              containers:
+                - name: api
+                  image: busybox:1.37
+                  command: ["sh", "-c", "mkdir -p /www && echo kiosk-api-online > /www/index.html && exec httpd -f -p 8080 -h /www"]
+    - on: qm-yard
+      timeoutSec: 150
+      run: kubectl -n yard-kiosk rollout status deploy/kiosk-api --timeout=120s
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/reports
+  teardown:
+    - on: qm-yard
+      run: kubectl delete namespace yard-kiosk --ignore-not-found --wait=false
+  checks:
+    - id: context
+      description: Terminal is using context qm-yard
+      type: k8s-context
+      on: workstation
+      skills: [k8s.cli.contexts]
+      weight: 0.5
+      expect: {match: exact, value: qm-yard}
+    - id: service
+      description: "{{svc}} is a LoadBalancer Service, port 80 to 8080, with an external address"
+      type: k8s-query
+      skills: [k8s.networking.loadbalancer]
+      weight: 2
+      query: {cluster: qm-yard, resource: service, name: "{{svc}}", namespace: yard-kiosk, jsonpath: '{.spec.type} {.spec.ports[0].port}->{.spec.ports[0].targetPort} {.status.loadBalancer.ingress[0].ip}'}
+      expect: {match: regex, value: '^LoadBalancer 80->8080 192\.168\.100\.2[0-9][0-9]$'}
+    - id: address-reported
+      description: The report holds the Service's external address and it answers from the workstation
+      type: shell
+      on: workstation
+      skills: [k8s.networking.loadbalancer]
+      weight: 2
+      timeoutSec: 20
+      command: |
+        ip=$(tr -d ' \r\n' < /home/learner/reports/kiosk-ip.txt 2>/dev/null)
+        exp=$(kubectl --kubeconfig /home/learner/.kube/config --context qm-yard -n yard-kiosk get svc {{svc}} -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+        [ -n "$ip" ] && [ "$ip" = "$exp" ] && curl -s -m 5 "http://$ip/" || echo "address $ip"
+      expect: {match: exact, value: kiosk-api-online}
+  hints:
+    - title: Switch context
+      body: The yard cluster is qm-yard.
+      command: kubectl config use-context qm-yard
+      cost: 0
+    - title: Expose
+      command: kubectl -n yard-kiosk expose deploy/kiosk-api --name={{svc}} --type=LoadBalancer --port=80 --target-port=8080
+      body: The load balancer controller fills status.loadBalancer.ingress a few seconds later.
+      cost: 2
+  misconceptions:
+    - id: cluster-ip-reported
+      description: Writes the ClusterIP instead of the external address.
+      feedback: The ClusterIP is internal; the kiosks need the EXTERNAL-IP.
+      expectFail: [address-reported]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-yard
+          kubectl -n yard-kiosk expose deploy/kiosk-api --name={{svc}} --type=LoadBalancer --port=80 --target-port=8080
+          sleep 10
+          kubectl -n yard-kiosk get svc {{svc}} -o jsonpath='{.spec.clusterIP}' > ~/reports/kiosk-ip.txt
+    - id: nodeport
+      description: Creates a NodePort Service.
+      feedback: NodePort ties clients to node addresses; LoadBalancer gives one stable address.
+      expectFail: [service, address-reported]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-yard
+          kubectl -n yard-kiosk expose deploy/kiosk-api --name={{svc}} --type=NodePort --port=80 --target-port=8080
+          getent hosts yard-wk-1 | awk '{print $1}' > ~/reports/kiosk-ip.txt
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          kubectl config use-context qm-yard
+          kubectl -n yard-kiosk expose deploy/kiosk-api --name={{svc}} --type=LoadBalancer --port=80 --target-port=8080
+          for i in $(seq 1 30); do
+            ip=$(kubectl -n yard-kiosk get svc {{svc}} -o jsonpath='{.status.loadBalancer.ingress[0].ip}'); [ -n "$ip" ] && break; sleep 2
+          done
+          echo "$ip" > ~/reports/kiosk-ip.txt
+          curl -s -m 5 "http://$ip/"

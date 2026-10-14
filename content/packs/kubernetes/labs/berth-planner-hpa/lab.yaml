@@ -1,0 +1,202 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: berth-planner-hpa
+  title: Autoscale the berth planner on CPU
+  domain: kubernetes
+  frameworks: [cka:workloads-scheduling]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [hpa, autoscaling, metrics, resources]
+  version: 1
+spec:
+  description: |
+    Ship arrivals bunch up in the evening and the berth planner falls behind.
+    It should scale with its CPU load.
+
+    Use context `qm-fleet`:
+
+    ```bash
+    kubectl config use-context qm-fleet
+    ```
+
+    In namespace **`harbour-planning`**:
+
+    1. Give container `planner` of Deployment **`berth-planner`** a CPU
+       request of **{{cpu}}** (the autoscaler computes utilisation against
+       requests).
+    2. Create a HorizontalPodAutoscaler **`berth-planner`** that keeps the
+       Deployment between **2** and **8** replicas at **60 %** average CPU
+       utilisation.
+    3. Start the provided load generator by scaling Deployment
+       **`berth-load`** to **3** replicas, and wait until the autoscaler has
+       scaled `berth-planner` above 2 replicas.
+  objectives:
+    - Set CPU requests as the basis for utilisation
+    - Create an autoscaling/v2 HPA
+    - Observe scaling decisions under load
+  params:
+    cpu:
+      type: choice
+      values: [50m, 60m, 75m]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-fleet
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-fleet
+          nodes:
+            - {name: fleet-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: fleet-wk-1, role: worker}
+            - {name: fleet-wk-2, role: worker}
+  setup:
+    - on: qm-fleet/fleet-cp-1
+      timeoutSec: 400
+      run: /opt/cloudtrain/bin/addons-install metrics-server --wait
+    - on: qm-fleet
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: harbour-planning}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: berth-planner, namespace: harbour-planning}
+        spec:
+          replicas: 1
+          selector: {matchLabels: {app: berth-planner}}
+          template:
+            metadata: {labels: {app: berth-planner}}
+            spec:
+              terminationGracePeriodSeconds: 1
+              containers:
+                - name: planner
+                  image: busybox:1.37
+                  # every request burns a little CPU, like a planning run
+                  command: ["sh", "-c", "mkdir -p /www/cgi-bin && printf '#!/bin/sh\\necho Content-Type: text/plain\\necho\\ni=0; while [ $i -lt 20000 ]; do i=$((i+1)); done; echo planned\\n' > /www/cgi-bin/plan && chmod +x /www/cgi-bin/plan && exec httpd -f -p 80 -h /www"]
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata: {name: berth-planner, namespace: harbour-planning}
+        spec:
+          selector: {app: berth-planner}
+          ports: [{port: 80}]
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: berth-load, namespace: harbour-planning}
+        spec:
+          replicas: 0
+          selector: {matchLabels: {app: berth-load}}
+          template:
+            metadata: {labels: {app: berth-load}}
+            spec:
+              terminationGracePeriodSeconds: 1
+              containers:
+                - name: load
+                  image: busybox:1.37
+                  command: ["sh", "-c", "while true; do wget -q -O /dev/null http://berth-planner/cgi-bin/plan; done"]
+    - on: qm-fleet
+      timeoutSec: 150
+      run: kubectl -n harbour-planning rollout status deploy/berth-planner --timeout=120s
+  teardown:
+    - on: qm-fleet
+      run: kubectl delete namespace harbour-planning --ignore-not-found --wait=false
+  checks:
+    - id: context
+      description: Terminal is using context qm-fleet
+      type: k8s-context
+      on: workstation
+      skills: [k8s.cli.contexts]
+      weight: 0.5
+      expect: {match: exact, value: qm-fleet}
+    - id: cpu-request
+      description: Container planner requests {{cpu}} CPU
+      type: k8s-query
+      skills: [k8s.workloads.autoscaling]
+      query: {cluster: qm-fleet, resource: deployment, name: berth-planner, namespace: harbour-planning, jsonpath: '{.spec.template.spec.containers[?(@.name=="planner")].resources.requests.cpu}'}
+      expect: {match: exact, value: "{{cpu}}"}
+    - id: hpa-spec
+      description: HPA berth-planner targets the Deployment, 2-8 replicas at 60 % CPU
+      type: shell
+      on: qm-fleet
+      skills: [k8s.workloads.autoscaling]
+      weight: 2
+      command: |
+        kubectl -n harbour-planning get hpa.v2.autoscaling berth-planner -o json | jq -r '"\(.spec.scaleTargetRef.name) \(.spec.minReplicas)-\(.spec.maxReplicas) \([.spec.metrics[] | "\(.resource.name):\(.resource.target.averageUtilization)"] | join(","))"'
+      expect: {match: exact, value: berth-planner 2-8 cpu:60}
+    - id: scaled-up
+      description: Under load the autoscaler reads metrics and has scaled berth-planner above 2 replicas
+      type: shell
+      on: qm-fleet
+      skills: [k8s.workloads.autoscaling]
+      weight: 2
+      command: |
+        kubectl -n harbour-planning get hpa.v2.autoscaling berth-planner -o json | jq -r '
+          "active=\([.status.conditions[]? | select(.type == "ScalingActive") | .status] | join("")) scaled=\(.status.desiredReplicas > 2)"'
+      expect: {match: exact, value: active=True scaled=true}
+  hints:
+    - title: Switch context
+      body: The planner runs in qm-fleet.
+      command: kubectl config use-context qm-fleet
+      cost: 0
+    - title: Requests first
+      command: kubectl -n harbour-planning set resources deploy/berth-planner -c planner --requests=cpu={{cpu}}
+      body: Without a CPU request the HPA cannot compute utilisation and reports ScalingActive=False.
+      cost: 1
+    - title: The autoscaler
+      command: kubectl -n harbour-planning autoscale deploy/berth-planner --min=2 --max=8 --cpu-percent=60
+      body: It creates an autoscaling/v2 HPA.
+      cost: 2
+    - title: Watch it work
+      command: kubectl -n harbour-planning scale deploy/berth-load --replicas=3 && kubectl -n harbour-planning get hpa berth-planner -w
+      body: Metrics arrive every 15 s or so; scaling up follows within a minute or two.
+      cost: 1
+  misconceptions:
+    - id: no-requests
+      description: Creates the HPA without setting CPU requests.
+      feedback: Utilisation is usage divided by request; with no request the HPA cannot act.
+      expectFail: [cpu-request, scaled-up]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 240
+        run: |
+          kubectl config use-context qm-fleet
+          kubectl -n harbour-planning autoscale deploy/berth-planner --min=2 --max=8 --cpu-percent=60
+          kubectl -n harbour-planning scale deploy/berth-load --replicas=3
+          sleep 150
+    - id: no-load
+      description: Creates the HPA but never starts the load generator.
+      feedback: The task asks you to show the scale-up; start berth-load.
+      expectFail: [scaled-up]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 240
+        run: |
+          kubectl config use-context qm-fleet
+          kubectl -n harbour-planning set resources deploy/berth-planner -c planner --requests=cpu={{cpu}}
+          kubectl -n harbour-planning autoscale deploy/berth-planner --min=2 --max=8 --cpu-percent=60
+          sleep 120
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 480
+        run: |
+          kubectl config use-context qm-fleet
+          kubectl -n harbour-planning set resources deploy/berth-planner -c planner --requests=cpu={{cpu}}
+          kubectl -n harbour-planning autoscale deploy/berth-planner --min=2 --max=8 --cpu-percent=60
+          kubectl -n harbour-planning scale deploy/berth-load --replicas=3
+          for i in $(seq 1 80); do
+            [ "$(kubectl -n harbour-planning get hpa berth-planner -o jsonpath='{.status.desiredReplicas}')" -gt 2 ] 2>/dev/null && break; sleep 5
+          done
