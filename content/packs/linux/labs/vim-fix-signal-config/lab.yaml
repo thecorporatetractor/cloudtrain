@@ -1,0 +1,195 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: vim-fix-signal-config
+  title: Edit a signalling config file in vim without breaking it
+  domain: linux
+  frameworks: [lpic1:gnu-commands, rhcsa-aligned:essential-tools]
+  difficulty: easy
+  estimatedMinutes: 10
+  tags: [vim, editors, config-files]
+  version: 1
+spec:
+  description: |
+    Change ticket SIG-2207 for the Tallowmere Rail interlocking controller asks for
+    three new values in `/etc/tr-signal/interlock.conf`:
+
+    | Section | Key | New value |
+    |---|---|---|
+    | `[global]` | `max_route_locks` | `{{locks}}` |
+    | `[global]` | `approach_lock_timeout` | `{{timeout}}` |
+    | `[route-B]` | `overlap_ms` | `{{overlap}}` |
+
+    Edit the file with **vim** (`vim /etc/tr-signal/interlock.conf`). You are in the
+    `trsignal` group, which may write the file but not the directory. Everything
+    else must stay byte for byte as it is: the comments (including the commented-out
+    example lines), the other routes, the file's owner and mode. The grader compares
+    the whole file except these three lines.
+  objectives:
+    - Open, search, change and save a file in vim
+    - Change one occurrence without touching look-alike lines
+    - Keep a file's owner and mode when editing it
+  params:
+    locks:
+      type: int
+      min: 8
+      max: 16
+    timeout:
+      type: choice
+      values: ["45", "60", "75"]
+    overlap:
+      type: int
+      min: 180
+      max: 260
+  topology:
+    entry: tr-signal-01
+    nodes:
+      - name: tr-signal-01
+        driver: container
+        image: linux-pod-el:10
+        access: [shell]
+  setup:
+    - on: tr-signal-01
+      file:
+        path: /var/lib/cloudtrain/interlock.conf.orig
+        source: assets/interlock.conf
+        mode: "0600"
+    - on: tr-signal-01
+      run: |
+        set -eu
+        getent group trsignal >/dev/null || groupadd -g 4200 trsignal
+        usermod -aG trsignal learner
+        mkdir -p /etc/tr-signal && chmod 0755 /etc/tr-signal
+        install -o root -g trsignal -m 0664 /var/lib/cloudtrain/interlock.conf.orig /etc/tr-signal/interlock.conf
+        # Baseline: the file without the three lines that change.
+        grep -vnE '^(max_route_locks|approach_lock_timeout) = ' /var/lib/cloudtrain/interlock.conf.orig \
+          | grep -v '^32:' > /var/lib/cloudtrain/rest.baseline
+        sed -n '32p' /var/lib/cloudtrain/interlock.conf.orig | grep -qx 'overlap_ms = 150'
+  checks:
+    - id: max-route-locks
+      description: "[global] max_route_locks has the new value"
+      type: shell
+      on: tr-signal-01
+      skills: [linux.shell.editors]
+      command: grep -c '^max_route_locks = {{locks}}$' /etc/tr-signal/interlock.conf
+      expect: {match: exact, value: "1"}
+    - id: approach-timeout
+      description: "[global] approach_lock_timeout has the new value"
+      type: shell
+      on: tr-signal-01
+      skills: [linux.shell.editors]
+      command: grep -c '^approach_lock_timeout = {{timeout}}$' /etc/tr-signal/interlock.conf
+      expect: {match: exact, value: "1"}
+    - id: route-b-overlap
+      description: "[route-B] overlap_ms has the new value"
+      type: shell
+      on: tr-signal-01
+      skills: [linux.shell.editors]
+      command: sed -n '32p' /etc/tr-signal/interlock.conf
+      expect: {match: exact, value: "overlap_ms = {{overlap}}"}
+    - id: rest-unchanged
+      description: Every other line (comments, other routes, blank lines) is byte for byte unchanged
+      type: shell
+      on: tr-signal-01
+      skills: [linux.shell.editors]
+      weight: 2
+      command: |
+        grep -vnE '^(max_route_locks|approach_lock_timeout) = ' /etc/tr-signal/interlock.conf | grep -v '^32:' \
+          | cmp -s /var/lib/cloudtrain/rest.baseline - && [ "$(tail -c1 /etc/tr-signal/interlock.conf | od -An -c | tr -d ' ')" = '\n' ] && echo same || echo changed
+      expect: {match: exact, value: same}
+    - id: owner-mode
+      description: The file keeps owner root, group trsignal and mode 0664
+      type: shell
+      on: tr-signal-01
+      skills: [linux.shell.editors]
+      weight: 0.5
+      command: stat -c '%U:%G %a' /etc/tr-signal/interlock.conf
+      expect: {match: exact, value: "root:trsignal 664"}
+  hints:
+    - title: Find the line
+      body: "In normal mode, `/^max_route` jumps to the next line starting with max_route (`n` repeats). `/\\[route-B` finds the section header."
+      cost: 1
+    - title: Change a value
+      body: "On the line, `$` goes to its end and `ciw` changes the word under the cursor (or `cw` from the start of the number). Esc returns to normal mode; `:wq` saves and quits."
+      cost: 1
+    - title: Careful with :s
+      body: "`:%s/old/new/` changes every matching line in the file, including the commented example and the other routes. Limit it to the current line with `:s` or to a range like `:/\\[route-B/,/\\[route-C/s/^overlap_ms = .*/overlap_ms = NEW/`."
+      cost: 2
+  misconceptions:
+    - id: global-substitute
+      description: Uses :%s for the [global] keys and so also changes the commented-out example lines.
+      feedback: "The example lines start with '#   ', but a pattern without ^ matches them too. Anchor the pattern (^max_route_locks) or work on one line."
+      expectFail: [rest-unchanged]
+      mutation:
+        on: tr-signal-01
+        as: learner
+        run: |
+          vim -Es -c '%s/max_route_locks = 6/max_route_locks = {{locks}}/' -c '%s/approach_lock_timeout = 30/approach_lock_timeout = {{timeout}}/' \
+            -c '32s/150/{{overlap}}/' -c 'wq' /etc/tr-signal/interlock.conf
+    - id: every-route
+      description: Changes overlap_ms in every route, not just route-B.
+      feedback: "Only [route-B] is in the ticket. A file-wide substitution changes route-A too."
+      expectFail: [rest-unchanged]
+      mutation:
+        on: tr-signal-01
+        as: learner
+        run: |
+          vim -Es -c '%s/^max_route_locks = .*/max_route_locks = {{locks}}/' -c '%s/^approach_lock_timeout = .*/approach_lock_timeout = {{timeout}}/' \
+            -c '%s/^overlap_ms = 150$/overlap_ms = {{overlap}}/' -c 'wq' /etc/tr-signal/interlock.conf
+    - id: replaced-file
+      description: Writes a new file over the old one with different permissions (e.g. from a copy made elsewhere).
+      feedback: "Replacing the file instead of editing it loses its owner and mode. vim writes in place when the directory is not writable; keep it that way."
+      expectFail: [owner-mode]
+      mutation:
+        on: tr-signal-01
+        as: admin
+        run: |
+          sed -e 's/^max_route_locks = .*/max_route_locks = {{locks}}/' -e 's/^approach_lock_timeout = .*/approach_lock_timeout = {{timeout}}/' \
+            -e '32s/150/{{overlap}}/' /etc/tr-signal/interlock.conf > /tmp/interlock.new
+          install -m 0644 /tmp/interlock.new /etc/tr-signal/interlock.conf
+    - id: wrong-key-edited
+      description: Edits overlap_ms of the first route found (route-A) instead of route-B.
+      feedback: "Search for the section header first (/\\[route-B), then for the key below it."
+      expectFail: [route-b-overlap, rest-unchanged]
+      mutation:
+        on: tr-signal-01
+        as: learner
+        run: |
+          vim -Es -c '/^max_route_locks/s/= .*/= {{locks}}/' -c '/^approach_lock_timeout/s/= .*/= {{timeout}}/' \
+            -c '1' -c '/^overlap_ms/s/= .*/= {{overlap}}/' -c 'wq' /etc/tr-signal/interlock.conf
+  solution:
+    explanation: |
+      Anchored searches land on the real keys, not the commented examples; searching
+      for the section header first makes the third change hit route-B only. Because
+      the learner cannot write /etc/tr-signal, vim overwrites the file in place and
+      keeps its owner and mode. The steps below drive vim in Ex mode, which is what
+      the interactive keystrokes amount to.
+    steps:
+      - on: tr-signal-01
+        as: learner
+        run: |
+          vim -Es \
+            -c '/^max_route_locks = /s/= .*/= {{locks}}/' \
+            -c '/^approach_lock_timeout = /s/= .*/= {{timeout}}/' \
+            -c '/^\[route-B\]/' -c '/^overlap_ms = /s/= .*/= {{overlap}}/' \
+            -c 'wq' /etc/tr-signal/interlock.conf
+    alternatives:
+      - id: range-substitute
+        description: Use anchored line-range substitutions.
+        steps:
+          - on: tr-signal-01
+            as: learner
+            run: |
+              vim -Es -c '/^\[global\]/,/^\[route-A\]/s/^max_route_locks = .*/max_route_locks = {{locks}}/' \
+                -c '%s/^approach_lock_timeout = .*/approach_lock_timeout = {{timeout}}/' \
+                -c '/^\[route-B\]/,/^\[route-C\]/s/^overlap_ms = .*/overlap_ms = {{overlap}}/' \
+                -c 'x' /etc/tr-signal/interlock.conf
+      - id: sed-to-stdout-then-cat
+        description: Without vim, transform with sed to a temp file and write it back in place with cat (keeps owner and mode).
+        steps:
+          - on: tr-signal-01
+            as: learner
+            run: |
+              sed -e 's/^max_route_locks = .*/max_route_locks = {{locks}}/' -e 's/^approach_lock_timeout = .*/approach_lock_timeout = {{timeout}}/' \
+                -e '/^\[route-B\]/,/^\[route-C\]/s/^overlap_ms = .*/overlap_ms = {{overlap}}/' /etc/tr-signal/interlock.conf > /tmp/ixl.new
+              cat /tmp/ixl.new > /etc/tr-signal/interlock.conf

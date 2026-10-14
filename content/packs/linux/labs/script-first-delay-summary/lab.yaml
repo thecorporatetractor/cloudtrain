@@ -1,0 +1,280 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: script-first-delay-summary
+  title: Write a first script that summarises a day of delays
+  domain: linux
+  frameworks: [rhcsa-aligned:scripts, lpic1:shells-scripting, linuxplus:automation-scripting]
+  difficulty: easy
+  estimatedMinutes: 15
+  tags: [bash, scripting, exit-codes, arguments, awk]
+  version: 1
+spec:
+  description: |
+    The Tallowmere Rail control room types the same commands every morning to
+    summarise yesterday's delays. Turn them into a script:
+    `/usr/local/bin/delay-summary` (an empty file you own is already there).
+
+    The delay feed is a CSV file with a header line:
+
+    ```
+    date,train,station,delay_min,reported_on
+    2026-10-03,TR4507,Ashby,4,2026-10-03
+    ```
+
+    Behaviour of `delay-summary DATE` (DATE as `YYYY-MM-DD`):
+
+    - Read the feed from the file named in the environment variable `DELAY_FEED`,
+      or from `/srv/delays/feed.csv` when that variable is not set.
+    - Consider the rows whose **`date` field** equals DATE (not `reported_on`).
+    - Print exactly two lines and exit with status 0:
+      ```
+      total=<sum of delay_min of those rows>
+      worst=<largest delay_min of those rows>
+      ```
+    - If no row has that date, print nothing on standard output and **exit 2**.
+    - If it is not called with exactly one argument, print a usage line on standard
+      error and **exit 1**.
+
+    Make the script executable and test it, e.g. `delay-summary 2026-10-0{{day}}`.
+    The grader runs it as you on several hidden feeds, including edge cases.
+  objectives:
+    - Write a bash script with a shebang and make it executable
+    - Use positional parameters, default values and exit statuses
+    - Aggregate one CSV column with awk
+  params:
+    day:
+      type: choice
+      values: ["3", "5", "6"]
+  topology:
+    entry: tr-control-02
+    nodes:
+      - name: tr-control-02
+        driver: container
+        image: linux-pod-el:10
+        access: [shell]
+  setup:
+    - on: tr-control-02
+      file: {path: /var/lib/cloudtrain/case.sh, source: assets/case.sh, mode: "0700"}
+    - on: tr-control-02
+      file: {path: /var/lib/cloudtrain/make-cases.sh, source: assets/make-cases.sh, mode: "0700"}
+    - on: tr-control-02
+      run: |
+        set -eu
+        chmod 0700 /var/lib/cloudtrain /var/lib/cloudtrain/*.sh
+        mkdir -p /srv/delays
+        bash /var/lib/cloudtrain/make-cases.sh 0{{day}}
+        chmod 0644 /srv/delays/feed.csv
+        rm -f /usr/local/bin/delay-summary
+        install -o learner -g learner -m 0644 /dev/null /usr/local/bin/delay-summary
+  checks:
+    - id: executable
+      description: /usr/local/bin/delay-summary is executable and starts with a shebang
+      type: shell
+      on: tr-control-02
+      skills: [linux.shell.scripting]
+      weight: 0.5
+      command: f=/usr/local/bin/delay-summary; [ -x $f ] && head -c2 $f | grep -q '#!' && echo ok || echo no
+      expect: {match: exact, value: ok}
+    - id: default-feed
+      description: Without DELAY_FEED it summarises the day from /srv/delays/feed.csv
+      type: shell
+      on: tr-control-02
+      skills: [linux.shell.scripting]
+      command: /var/lib/cloudtrain/case.sh 1
+      timeoutSec: 20
+      expect: {match: exact, value: pass}
+    - id: date-field-only
+      description: It sums only rows whose date field matches, ignoring reported_on
+      type: shell
+      on: tr-control-02
+      skills: [linux.shell.scripting]
+      weight: 1.5
+      command: /var/lib/cloudtrain/case.sh 2
+      timeoutSec: 20
+      expect: {match: exact, value: pass}
+    - id: single-row
+      description: A day with a single row
+      type: shell
+      on: tr-control-02
+      skills: [linux.shell.scripting]
+      command: /var/lib/cloudtrain/case.sh 3
+      timeoutSec: 20
+      expect: {match: exact, value: pass}
+    - id: all-on-time
+      description: A day whose trains were all on time still has data (total=0, worst=0, exit 0)
+      type: shell
+      on: tr-control-02
+      skills: [linux.shell.scripting]
+      command: /var/lib/cloudtrain/case.sh 4
+      timeoutSec: 20
+      expect: {match: exact, value: pass}
+    - id: no-data-exit-2
+      description: A day without rows prints nothing and exits 2
+      type: shell
+      on: tr-control-02
+      skills: [linux.shell.scripting]
+      weight: 1.5
+      command: /var/lib/cloudtrain/case.sh 5
+      timeoutSec: 20
+      expect: {match: exact, value: pass}
+    - id: usage-exit-1
+      description: Without an argument it exits 1
+      type: shell
+      on: tr-control-02
+      skills: [linux.shell.scripting]
+      command: /var/lib/cloudtrain/case.sh 6
+      timeoutSec: 20
+      expect: {match: exact, value: pass}
+    - id: numeric-maximum
+      description: The worst delay is the numeric maximum (100 beats 99)
+      type: shell
+      on: tr-control-02
+      skills: [linux.shell.scripting]
+      command: /var/lib/cloudtrain/case.sh 7
+      timeoutSec: 20
+      expect: {match: exact, value: pass}
+  hints:
+    - title: Skeleton
+      body: "Start with `#!/bin/bash`, then `feed=${DELAY_FEED:-/srv/delays/feed.csv}`, then check `$#`. `chmod +x` the file when done."
+      cost: 1
+    - title: Match a field, not the line
+      body: "`grep \"$1\"` also matches rows reported on that day. awk can compare one field: `awk -F, -v d=\"$1\" '$1 == d' \"$feed\"`."
+      cost: 1
+    - title: Sum, maximum and exit status in awk
+      body: "In awk, keep `t += $4`, a row counter and the maximum; in the END block `exit 2` when the counter is 0. awk's exit status becomes the script's if awk is its last command."
+      cost: 2
+  misconceptions:
+    - id: grep-whole-line
+      description: Selects rows with grep on the whole line.
+      feedback: "The date also appears in reported_on, so rows of the previous day sneak in. Compare the first field only."
+      expectFail: [date-field-only]
+      mutation:
+        on: tr-control-02
+        as: learner
+        run: |
+          cat > /usr/local/bin/delay-summary <<'S'
+          #!/bin/bash
+          [ $# -eq 1 ] || { echo "usage: delay-summary DATE" >&2; exit 1; }
+          rows=$(grep "$1" "${DELAY_FEED:-/srv/delays/feed.csv}") || exit 2
+          echo "$rows" | awk -F, '{t += $4; if ($4 > w) w = $4} END {print "total=" t; print "worst=" w + 0}'
+          S
+          chmod +x /usr/local/bin/delay-summary
+    - id: always-exit-0
+      description: Prints zeros and exits 0 when the day has no rows.
+      feedback: "Callers must be able to tell 'no data' from 'no delays'. Count matching rows and exit 2 when there are none."
+      expectFail: [no-data-exit-2]
+      mutation:
+        on: tr-control-02
+        as: learner
+        run: |
+          cat > /usr/local/bin/delay-summary <<'S'
+          #!/bin/bash
+          [ $# -eq 1 ] || { echo "usage: delay-summary DATE" >&2; exit 1; }
+          awk -F, -v d="$1" '$1 == d {t += $4; if ($4 > w) w = $4} END {print "total=" t + 0; print "worst=" w + 0}' "${DELAY_FEED:-/srv/delays/feed.csv}"
+          S
+          chmod +x /usr/local/bin/delay-summary
+    - id: text-sort-max
+      description: Takes the maximum with sort | tail without -n.
+      feedback: "Text sorting puts 100 before 99. Use sort -n or compare numbers in awk."
+      expectFail: [numeric-maximum]
+      mutation:
+        on: tr-control-02
+        as: learner
+        run: |
+          cat > /usr/local/bin/delay-summary <<'S'
+          #!/bin/bash
+          [ $# -eq 1 ] || { echo "usage: delay-summary DATE" >&2; exit 1; }
+          f=${DELAY_FEED:-/srv/delays/feed.csv}
+          d=$(awk -F, -v d="$1" '$1 == d {print $4}' "$f")
+          [ -n "$d" ] || exit 2
+          echo "total=$(echo "$d" | paste -sd+ | bc)"
+          echo "worst=$(echo "$d" | sort | tail -1)"
+          S
+          chmod +x /usr/local/bin/delay-summary
+    - id: hardcoded-feed
+      description: Ignores DELAY_FEED and always reads /srv/delays/feed.csv.
+      feedback: "The control room points DELAY_FEED at other feeds for replays. Use ${DELAY_FEED:-/srv/delays/feed.csv}."
+      expectFail: [date-field-only, single-row]
+      mutation:
+        on: tr-control-02
+        as: learner
+        run: |
+          cat > /usr/local/bin/delay-summary <<'S'
+          #!/bin/bash
+          [ $# -eq 1 ] || { echo "usage: delay-summary DATE" >&2; exit 1; }
+          awk -F, -v d="$1" '$1 == d {t += $4; if (!n++ || $4 > w) w = $4} END {if (!n) exit 2; print "total=" t; print "worst=" w}' /srv/delays/feed.csv
+          S
+          chmod +x /usr/local/bin/delay-summary
+    - id: not-executable
+      description: Writes the script but forgets chmod +x.
+      feedback: "Without the execute bit the shell refuses to run the file as a command. chmod +x it."
+      expectFail: [executable, default-feed]
+      mutation:
+        on: tr-control-02
+        as: learner
+        run: |
+          cat > /usr/local/bin/delay-summary <<'S'
+          #!/bin/bash
+          awk -F, -v d="$1" '$1 == d {t += $4; if (!n++ || $4 > w) w = $4} END {if (!n) exit 2; print "total=" t; print "worst=" w}' "${DELAY_FEED:-/srv/delays/feed.csv}"
+          S
+  solution:
+    explanation: |
+      The default comes from ${DELAY_FEED:-...}, $# guards the argument count, and
+      one awk program compares the date field, sums, tracks the maximum numerically
+      and exits 2 from its END block when no row matched. Because awk is the last
+      command, its exit status is the script's.
+    steps:
+      - on: tr-control-02
+        as: learner
+        run: |
+          cat > /usr/local/bin/delay-summary <<'S'
+          #!/bin/bash
+          # delay-summary DATE: total and worst delay of one day from the delay feed.
+          feed=${DELAY_FEED:-/srv/delays/feed.csv}
+          if [ $# -ne 1 ]; then
+            echo "usage: delay-summary YYYY-MM-DD" >&2
+            exit 1
+          fi
+          awk -F, -v d="$1" '
+            $1 == d { n++; t += $4; if (n == 1 || $4 > w) w = $4 }
+            END { if (n == 0) exit 2; print "total=" t; print "worst=" w }
+          ' "$feed"
+          S
+          chmod +x /usr/local/bin/delay-summary
+          delay-summary 2026-10-0{{day}}
+    alternatives:
+      - id: bash-read-loop
+        description: Pure bash with a while-read loop and arithmetic.
+        steps:
+          - on: tr-control-02
+            as: learner
+            run: |
+              cat > /usr/local/bin/delay-summary <<'S'
+              #!/bin/bash
+              (( $# == 1 )) || { echo "usage: $0 DATE" >&2; exit 1; }
+              total=0 worst=-1 rows=0
+              while IFS=, read -r date train station delay reported; do
+                [[ $date == "$1" ]] || continue
+                (( rows++, total += delay ))
+                (( delay > worst )) && worst=$delay
+              done < "${DELAY_FEED:-/srv/delays/feed.csv}"
+              (( rows )) || exit 2
+              printf 'total=%d\nworst=%d\n' "$total" "$worst"
+              S
+              chmod 755 /usr/local/bin/delay-summary
+      - id: cut-sort-n
+        description: Filter with awk, then sum with paste and bc and take the maximum with sort -n.
+        steps:
+          - on: tr-control-02
+            as: learner
+            run: |
+              cat > /usr/local/bin/delay-summary <<'S'
+              #!/bin/sh
+              [ "$#" -eq 1 ] || { echo "usage: delay-summary DATE" >&2; exit 1; }
+              d=$(awk -F, -v d="$1" '$1 == d {print $4}' "${DELAY_FEED:-/srv/delays/feed.csv}")
+              [ -n "$d" ] || exit 2
+              echo "total=$(echo "$d" | paste -sd+ - | bc)"
+              echo "worst=$(echo "$d" | sort -n | tail -n 1)"
+              S
+              chmod u+x /usr/local/bin/delay-summary

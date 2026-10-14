@@ -1,0 +1,186 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: script-positional-user-tool
+  title: Write a crew onboarding script with positional arguments
+  domain: linux
+  frameworks: [rhcsa-aligned:scripts, linuxplus:automation-scripting]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [bash, scripting, arguments, useradd]
+  version: 1
+spec:
+  description: |
+    Tallowmere Rail's crew office onboards new drivers and guards every week. Write
+    the administration script `/usr/local/sbin/mkcrew` (an empty file you own is
+    already there); the office's automation runs it as root.
+
+    `mkcrew USERNAME GROUP`:
+
+    - With anything other than exactly two arguments, print a line starting with
+      `usage:` on standard error and exit **1**, changing nothing.
+    - If the group does not exist yet, create it.
+    - If the user does not exist, create it with a home directory and GROUP as a
+      supplementary group, and exit 0.
+    - If the user already exists, change nothing and exit 0 (the script may be run
+      again safely).
+
+    Example: `mkcrew crw-dana {{group}}`. Make it executable. You cannot run it for
+    real yourself (it needs root); test the
+    argument handling, and read it carefully. The grader runs it as root on hidden
+    cases.
+  objectives:
+    - Check the number of positional parameters
+    - Test for existing users and groups before acting
+    - Write to standard error and choose exit statuses
+  params:
+    group:
+      type: choice
+      values: [drivers, guards]
+  topology:
+    entry: tr-crew-03
+    nodes:
+      - name: tr-crew-03
+        driver: container
+        image: linux-pod-el:10
+        access: [shell]
+  setup:
+    - on: tr-crew-03
+      file: {path: /var/lib/cloudtrain/case.sh, source: assets/case.sh, mode: "0700"}
+    - on: tr-crew-03
+      run: |
+        set -eu
+        chmod 0700 /var/lib/cloudtrain /var/lib/cloudtrain/case.sh
+        getent group drivers >/dev/null || groupadd drivers
+        getent group guards >/dev/null || groupadd guards
+        rm -f /usr/local/sbin/mkcrew
+        install -o learner -g learner -m 0644 /dev/null /usr/local/sbin/mkcrew
+  checks:
+    - id: executable
+      description: /usr/local/sbin/mkcrew is an executable script
+      type: shell
+      on: tr-crew-03
+      skills: [linux.shell.scripting]
+      weight: 0.5
+      command: f=/usr/local/sbin/mkcrew; [ -x $f ] && head -c2 $f | grep -q '#!' && echo ok || echo no
+      expect: {match: exact, value: ok}
+    - id: creates-user
+      description: A new user is created with a home directory and the group
+      type: shell
+      on: tr-crew-03
+      skills: [linux.shell.scripting, linux.users.accounts]
+      weight: 1.5
+      timeoutSec: 30
+      command: /var/lib/cloudtrain/case.sh 1
+      expect: {match: exact, value: pass}
+    - id: existing-user-untouched
+      description: An existing user is left alone and the script exits 0
+      type: shell
+      on: tr-crew-03
+      skills: [linux.shell.scripting, linux.users.accounts]
+      timeoutSec: 30
+      command: /var/lib/cloudtrain/case.sh 2
+      expect: {match: exact, value: pass}
+    - id: usage-on-bad-arguments
+      description: Wrong argument counts print usage on stderr, exit 1 and change nothing
+      type: shell
+      on: tr-crew-03
+      skills: [linux.shell.scripting]
+      weight: 1.5
+      timeoutSec: 30
+      command: /var/lib/cloudtrain/case.sh 3
+      expect: {match: exact, value: pass}
+    - id: creates-missing-group
+      description: A missing group is created first
+      type: shell
+      on: tr-crew-03
+      skills: [linux.shell.scripting, linux.users.accounts]
+      timeoutSec: 30
+      command: /var/lib/cloudtrain/case.sh 4
+      expect: {match: exact, value: pass}
+  hints:
+    - title: Argument count
+      body: "`$#` holds the number of arguments: `if [ $# -ne 2 ]; then echo \"usage: mkcrew USERNAME GROUP\" >&2; exit 1; fi`."
+      cost: 1
+    - title: Does it exist?
+      body: "`getent group NAME` and `id NAME` (or `getent passwd NAME`) exit 0 when the group or user exists. Redirect their output to /dev/null."
+      cost: 1
+    - title: Creating
+      body: "`groupadd GROUP` and `useradd -m -G GROUP USERNAME`."
+      cost: 2
+  misconceptions:
+    - id: no-argument-check
+      description: Uses $1 and $2 without checking how many arguments were given.
+      feedback: "With one argument, useradd runs with an empty group, and with none it fails in confusing ways. Check $# first."
+      expectFail: [usage-on-bad-arguments]
+      mutation:
+        on: tr-crew-03
+        as: learner
+        run: |
+          printf '%s\n' '#!/bin/bash' 'getent group "$2" >/dev/null || groupadd "$2"' 'id "$1" >/dev/null 2>&1 || useradd -m -G "$2" "$1"' 'exit 0' > /usr/local/sbin/mkcrew
+          chmod +x /usr/local/sbin/mkcrew
+    - id: always-useradd
+      description: Calls useradd without checking whether the user exists.
+      feedback: "useradd fails for an existing user, so a second run reports an error. Test with id first."
+      expectFail: [existing-user-untouched]
+      mutation:
+        on: tr-crew-03
+        as: learner
+        run: |
+          printf '%s\n' '#!/bin/bash' '[ $# -eq 2 ] || { echo "usage: mkcrew USERNAME GROUP" >&2; exit 1; }' 'getent group "$2" >/dev/null || groupadd "$2"' 'useradd -m -G "$2" "$1"' > /usr/local/sbin/mkcrew
+          chmod +x /usr/local/sbin/mkcrew
+    - id: assumes-group
+      description: Never creates the group.
+      feedback: "useradd -G fails when the group does not exist. Create it with groupadd when getent cannot find it."
+      expectFail: [creates-missing-group]
+      mutation:
+        on: tr-crew-03
+        as: learner
+        run: |
+          printf '%s\n' '#!/bin/bash' '[ $# -eq 2 ] || { echo "usage: mkcrew USERNAME GROUP" >&2; exit 1; }' 'id "$1" >/dev/null 2>&1 && exit 0' 'useradd -m -G "$2" "$1"' > /usr/local/sbin/mkcrew
+          chmod +x /usr/local/sbin/mkcrew
+    - id: usage-on-stdout
+      description: Prints the usage line on standard output and exits 0.
+      feedback: "Callers detect misuse by the exit status, and messages belong on standard error: echo ... >&2; exit 1."
+      expectFail: [usage-on-bad-arguments]
+      mutation:
+        on: tr-crew-03
+        as: learner
+        run: |
+          printf '%s\n' '#!/bin/bash' 'if [ $# -ne 2 ]; then echo "usage: mkcrew USERNAME GROUP"; exit 0; fi' 'getent group "$2" >/dev/null || groupadd "$2"' 'id "$1" >/dev/null 2>&1 || useradd -m -G "$2" "$1"' > /usr/local/sbin/mkcrew
+          chmod +x /usr/local/sbin/mkcrew
+  solution:
+    explanation: |
+      Check $# before using any argument, create the group only when getent cannot
+      find it, and create the user only when id cannot find it. Both tests make the
+      script safe to run again.
+    steps:
+      - on: tr-crew-03
+        as: learner
+        run: |
+          printf '%s\n' \
+            '#!/bin/bash' \
+            '# mkcrew USERNAME GROUP: create a crew account (idempotent).' \
+            'if [ $# -ne 2 ]; then' \
+            '  echo "usage: mkcrew USERNAME GROUP" >&2' \
+            '  exit 1' \
+            'fi' \
+            'user=$1 group=$2' \
+            'getent group "$group" >/dev/null || groupadd "$group" || exit 2' \
+            'if id "$user" >/dev/null 2>&1; then' \
+            '  echo "mkcrew: $user exists, nothing to do"' \
+            '  exit 0' \
+            'fi' \
+            'useradd -m -G "$group" "$user"' > /usr/local/sbin/mkcrew
+          chmod +x /usr/local/sbin/mkcrew
+          /usr/local/sbin/mkcrew onlyone; echo "exit $?"
+    alternatives:
+      - id: bash-tests
+        description: Use (( )) for the count and getent for both lookups.
+        steps:
+          - on: tr-crew-03
+            as: learner
+            run: |
+              printf '%s\n' '#!/usr/bin/env bash' '(( $# == 2 )) || { printf "usage: %s USERNAME GROUP\n" "${0##*/}" >&2; exit 1; }' \
+                'getent group "$2" >/dev/null 2>&1 || groupadd -- "$2"' 'getent passwd "$1" >/dev/null 2>&1 && exit 0' 'useradd --create-home --groups "$2" -- "$1"' > /usr/local/sbin/mkcrew
+              chmod 755 /usr/local/sbin/mkcrew

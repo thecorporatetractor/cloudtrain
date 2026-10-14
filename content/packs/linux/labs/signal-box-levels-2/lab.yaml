@@ -1,0 +1,165 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: signal-box-levels-2
+  title: 'Signal box challenge: levels 6 to 10'
+  domain: linux
+  frameworks: [lpic1:gnu-commands]
+  difficulty: medium
+  estimatedMinutes: 30
+  tags: [challenge, ctf, grep, uniq, base64, compression]
+  version: 1
+spec:
+  description: |
+    The signal-box puzzle continues. Level 6 is open: start in
+    `~/signalbox/level6` and read its `README`.
+
+    When you find a level's password, unlock the next level with
+    `sb-unlock NEXT_LEVEL PASSWORD`; it appears as `~/signalbox/levelN`. Level 10
+    leads to the **final token**: write it (just the token) to
+    `~/answers/signal-box-2.txt`.
+
+    Passwords are 24 hexadecimal characters. Text filters (`grep`, `sort`, `uniq`,
+    `tr`), `base64`, `file` and the usual (de)compression tools are all you need.
+    Work in a scratch directory such as `mktemp -d` for level 9.
+  objectives:
+    - Find lines by keyword and by frequency
+    - Decode base64 and translate characters
+    - Peel compression layers by identifying each with file
+  params:
+    key:
+      type: int
+      min: 100000
+      max: 999999
+  topology:
+    entry: tr-signalbox-02
+    nodes:
+      - name: tr-signalbox-02
+        driver: container
+        image: linux-pod-deb:24.04
+        access: [shell]
+  setup:
+    - on: tr-signalbox-02
+      file: {path: /usr/local/bin/sb-unlock, source: assets/sb-unlock, mode: "0755"}
+    - on: tr-signalbox-02
+      file: {path: /var/lib/cloudtrain/build-levels.sh, source: assets/build-levels.sh, mode: "0700"}
+    - on: tr-signalbox-02
+      run: |
+        set -eu
+        chmod 0755 /usr/local/bin/sb-unlock; chmod 0700 /var/lib/cloudtrain /var/lib/cloudtrain/build-levels.sh
+        bash /var/lib/cloudtrain/build-levels.sh {{key}}
+        install -d -o learner -g learner /home/learner/answers
+        rm -f /home/learner/answers/signal-box-2.txt
+  checks:
+    - id: reached-level-8
+      description: Levels 7 and 8 are unlocked
+      type: shell
+      on: tr-signalbox-02
+      skills: [linux.shell.text-processing]
+      weight: 0.5
+      command: test -f /home/learner/signalbox/level8/README && echo yes || echo no
+      expect: {match: exact, value: "yes"}
+    - id: reached-level-10
+      description: Levels 9 and 10 are unlocked
+      type: shell
+      on: tr-signalbox-02
+      skills: [linux.files.links-archives]
+      command: test -f /home/learner/signalbox/level10/README && echo yes || echo no
+      expect: {match: exact, value: "yes"}
+    - id: final-token
+      description: ~/answers/signal-box-2.txt holds the final token
+      type: shell
+      on: tr-signalbox-02
+      skills: [linux.shell.text-processing]
+      weight: 2
+      command: |
+        want=$(printf 'sb-%s-%s' {{key}} 10 | sha256sum | cut -c1-24)
+        [ "$(tr -d '[:space:]' < /home/learner/answers/signal-box-2.txt 2>/dev/null)" = "$want" ] && echo correct || echo wrong
+      expect: {match: exact, value: correct}
+  hints:
+    - title: Level 6
+      body: "`grep -w semaphore data.txt` matches the whole word only, not semaphores."
+      cost: 1
+    - title: Level 7
+      body: "`uniq -u` prints lines that are not repeated, but only adjacent repeats are seen. Sort first."
+      cost: 1
+    - title: Level 8
+      body: "`base64 -d data.txt` decodes."
+      cost: 1
+    - title: Level 9
+      body: "Copy layers.bin to a scratch directory, then repeat: `file X`, rename it to the matching extension, decompress (xz -d, tar -xf, bunzip2, gunzip)."
+      cost: 2
+    - title: Level 10
+      body: "ROT13 is its own inverse: `tr 'A-Za-z' 'N-ZA-Mn-za-m' < data.txt`."
+      cost: 2
+  misconceptions:
+    - id: uniq-without-sort
+      description: Runs uniq -u on the unsorted file at level 7.
+      feedback: "uniq compares neighbouring lines only, so every line of a shuffled file looks unique. Sort first."
+      expectFail: [reached-level-8, final-token]
+      mutation:
+        on: tr-signalbox-02
+        as: learner
+        run: |
+          cd ~/signalbox
+          sb-unlock 7 "$(grep -w semaphore level6/data.txt | cut -f2)"
+          sb-unlock 8 "$(uniq -u level7/data.txt | head -1)" || true
+    - id: no-rot13
+      description: Submits the level-10 text without undoing the rotation.
+      feedback: "Every letter was rotated by 13 places; digits were not. Rotate the letters back with tr."
+      expectFail: [final-token]
+      mutation:
+        on: tr-signalbox-02
+        as: learner
+        run: |
+          bash <<'EOS'
+          set -e
+          cd ~/signalbox
+          sb-unlock 7 "$(grep -w semaphore level6/data.txt | cut -f2)"
+          sb-unlock 8 "$(sort level7/data.txt | uniq -u)"
+          sb-unlock 9 "$(base64 -d level8/data.txt | awk '{print $NF}')"
+          t=$(mktemp -d); xz -dc level9/layers.bin | tar -xOf - stage2 | bunzip2 | gunzip > $t/p
+          sb-unlock 10 "$(awk '{print $NF}' $t/p)"
+          awk '{print $NF}' level10/data.txt > ~/answers/signal-box-2.txt
+          EOS
+  solution:
+    explanation: |
+      Level 6: grep -w for the exact word. Level 7: sort | uniq -u. Level 8: base64 -d.
+      Level 9: file names the outermost format each time: xz, then tar, then bzip2,
+      then gzip. Level 10: tr undoes ROT13.
+    steps:
+      - on: tr-signalbox-02
+        as: learner
+        run: |
+          bash <<'EOS'
+          set -e
+          cd ~/signalbox
+          sb-unlock 7 "$(grep -w semaphore level6/data.txt | cut -f2)"
+          sb-unlock 8 "$(sort level7/data.txt | uniq -u)"
+          sb-unlock 9 "$(base64 -d level8/data.txt | awk '{print $NF}')"
+          t=$(mktemp -d); cp level9/layers.bin $t/; cd $t
+          file layers.bin; mv layers.bin l.xz; xz -d l.xz
+          file l; tar -xf l
+          file stage2; mv stage2 s.bz2; bunzip2 s.bz2
+          file s; mv s p.gz; gunzip p.gz
+          cd ~/signalbox
+          sb-unlock 10 "$(awk '{print $NF}' $t/p)"
+          tr 'A-Za-z' 'N-ZA-Mn-za-m' < level10/data.txt | awk '{print $NF}' > ~/answers/signal-box-2.txt
+          cat ~/answers/signal-box-2.txt
+          EOS
+    alternatives:
+      - id: streams-and-uniq-c
+        description: Count with uniq -c and decompress in one pipeline without temporary files.
+        steps:
+          - on: tr-signalbox-02
+            as: learner
+            run: |
+              bash <<'EOS'
+              set -e
+              cd ~/signalbox
+              sb-unlock 7 "$(awk -F'\t' '$1 == "semaphore" {print $2}' level6/data.txt)"
+              sb-unlock 8 "$(sort level7/data.txt | uniq -c | awk '$1 == 1 {print $2}')"
+              sb-unlock 9 "$(base64 --decode < level8/data.txt | grep -oE '[0-9a-f]{24}')"
+              sb-unlock 10 "$(xz -dc level9/layers.bin | tar -xOf - | bzip2 -dc | gzip -dc | grep -oE '[0-9a-f]{24}')"
+              tr 'N-ZA-Mn-za-m' 'A-Za-z' < level10/data.txt | grep -oE '[0-9a-f]{24}' > ~/answers/signal-box-2.txt
+              EOS

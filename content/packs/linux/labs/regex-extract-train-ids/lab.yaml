@@ -1,0 +1,221 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: regex-extract-train-ids
+  title: Extract malformed train IDs with regular expressions
+  domain: linux
+  frameworks: [lpic1:gnu-commands, rhcsa-aligned:essential-tools, linuxplus:automation-scripting]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [regex, grep, sed, text-processing]
+  version: 1
+spec:
+  description: |
+    Every line of Tallowmere Rail's dispatch log, `/srv/dispatch/dispatch.log`,
+    names a train in its `train=` field. A valid train ID is **exactly two
+    upper-case letters followed by exactly four digits** (`TR4512`). Several
+    hand-typed entries break that rule.
+
+    1. Write every malformed train ID (the value after `train=` exactly as it
+       appears) to `~/answers/malformed-ids.txt`, **each distinct value once,
+       sorted** (`sort -u` order).
+    2. Write a corrected copy of the log to `~/dispatch-fixed.log`. Only these
+       mistakes can be corrected safely and must be fixed:
+       - lower-case letters (`tr4512` -> `TR4512`),
+       - one `-` or `_` between the letters and the digits (`TR-4512`, `tr_4512` -> `TR4512`).
+
+       Any other malformed ID (wrong number of letters or digits) stays exactly as it
+       is, and nothing outside the `train=` field may change: the free-text
+       `note=` field contains look-alike references that are not train IDs.
+
+    Use `grep -E` and `sed -E` (GNU sed's `\U` upper-cases a replacement).
+  objectives:
+    - Write extended regular expressions with classes, quantifiers and anchors
+    - Extract matches with grep -o
+    - Rewrite matches with sed capture groups, limited to one field
+  params:
+    salt:
+      type: int
+      min: 3
+      max: 40
+  topology:
+    entry: tr-dispatch-01
+    nodes:
+      - name: tr-dispatch-01
+        driver: container
+        image: linux-pod-deb:24.04
+        access: [shell]
+  setup:
+    - on: tr-dispatch-01
+      run: |
+        set -eu
+        mkdir -p /srv/dispatch /var/lib/cloudtrain && chmod 0700 /var/lib/cloudtrain
+        L=/srv/dispatch/dispatch.log
+        awk -v salt={{salt}} 'BEGIN {
+          split("ASH BRM COR DUN ELS FAL GAR HOL", st, " ")
+          split("TR4512 TR4518 XC2201 TR4530 RL0907 XC2215 TR4544 RL0911", good, " ")
+          # Malformed values: fixable (case, one separator) and unfixable (shape).
+          split("tr4518 TR-4530 xc_2215 Rl0907 tr-4544 T4512 TR45123 kx10234 XCC2201 TR451", bad, " ")
+          nb = 10
+          for (i = 1; i <= 64; i++) {
+            h = 5 + int(i / 6); m = (i * 7 + salt) % 60; s = (i * 13) % 60
+            if ((i + salt) % 5 == 0 && nb > 0) { id = bad[nb]; nb-- } else id = good[(i + salt) % 8 + 1]
+            note = ""
+            if (i % 9 == 0) note = " note=\"see ref ab-1234 and form tr_5521\""
+            if (i % 11 == 0) note = " note=\"crew swap with ly2020\""
+            printf "2026-10-%02d %02d:%02d:%02d DISPATCH train=%s from=%s to=%s platform=%d%s\n", 3 + i % 4, h, m, s, id, st[i % 8 + 1], st[(i + 3) % 8 + 1], i % 4 + 1, note
+          }
+          # Guarantee every malformed value occurs at least once.
+          for (j = nb; j >= 1; j--) printf "2026-10-07 18:%02d:00 DISPATCH train=%s from=GAR to=HOL platform=3\n", j, bad[j]
+        }' > $L
+        chmod 0644 $L
+        # Expected results (root only), from a reference implementation.
+        grep -oE 'train=[^ ]*' $L | cut -d= -f2 | grep -vxE '[A-Z]{2}[0-9]{4}' | sort -u > /var/lib/cloudtrain/malformed.expected
+        sed -E 's/train=([A-Za-z]{2})[-_]?([0-9]{4})( |$)/train=\U\1\E\2\3/' $L > /var/lib/cloudtrain/fixed.expected
+        grep -c . /var/lib/cloudtrain/malformed.expected | grep -qx 10
+        install -d -o learner -g learner /home/learner/answers
+        rm -f /home/learner/answers/malformed-ids.txt /home/learner/dispatch-fixed.log
+  checks:
+    - id: malformed-list
+      description: ~/answers/malformed-ids.txt lists every malformed train ID once, sorted
+      type: shell
+      on: tr-dispatch-01
+      skills: [linux.shell.regex-sed-awk]
+      weight: 2
+      command: cmp -s /var/lib/cloudtrain/malformed.expected /home/learner/answers/malformed-ids.txt && echo correct || echo wrong
+      expect: {match: exact, value: correct}
+    - id: fixed-line-count
+      description: ~/dispatch-fixed.log has as many lines as the original log
+      type: shell
+      on: tr-dispatch-01
+      skills: [linux.shell.regex-sed-awk]
+      weight: 0.5
+      command: '[ -f /home/learner/dispatch-fixed.log ] && [ "$(wc -l < /home/learner/dispatch-fixed.log)" = "$(wc -l < /srv/dispatch/dispatch.log)" ] && echo same || echo differs'
+      expect: {match: exact, value: same}
+    - id: fixable-corrected
+      description: Every fixable ID is corrected and every train= value in the copy is now valid or one of the unfixable ones
+      type: shell
+      on: tr-dispatch-01
+      skills: [linux.shell.regex-sed-awk]
+      weight: 2
+      command: |
+        grep -oE 'train=[^ ]*' /var/lib/cloudtrain/fixed.expected | sort > /tmp/.exp.ids
+        grep -oE 'train=[^ ]*' /home/learner/dispatch-fixed.log 2>/dev/null | sort > /tmp/.got.ids
+        cmp -s /tmp/.exp.ids /tmp/.got.ids && echo ok || echo wrong; rm -f /tmp/.exp.ids /tmp/.got.ids
+      expect: {match: exact, value: ok}
+    - id: notes-untouched
+      description: Nothing outside the train= field changed (notes, stations, timestamps)
+      type: shell
+      on: tr-dispatch-01
+      skills: [linux.shell.regex-sed-awk]
+      weight: 1.5
+      command: |
+        sed -E 's/train=[^ ]*//' /srv/dispatch/dispatch.log > /tmp/.a
+        sed -E 's/train=[^ ]*//' /home/learner/dispatch-fixed.log > /tmp/.b 2>/dev/null
+        cmp -s /tmp/.a /tmp/.b && echo same || echo changed; rm -f /tmp/.a /tmp/.b
+      expect: {match: exact, value: same}
+    - id: fixed-exact
+      description: The corrected copy matches the expected log exactly
+      type: shell
+      on: tr-dispatch-01
+      skills: [linux.shell.regex-sed-awk]
+      command: cmp -s /var/lib/cloudtrain/fixed.expected /home/learner/dispatch-fixed.log && echo correct || echo wrong
+      expect: {match: exact, value: correct}
+  hints:
+    - title: Pull out the field
+      body: "`grep -oE 'train=[^ ]*'` prints only the matching part of each line: the field and its value."
+      cost: 1
+    - title: Invert a whole-line match
+      body: "After cutting off `train=`, `grep -vxE '[A-Z]{2}[0-9]{4}'` keeps the values that do NOT match the full pattern (`-x` anchors it to the whole line)."
+      cost: 1
+    - title: Capture and rebuild
+      body: "In sed -E, `([A-Za-z]{2})[-_]?([0-9]{4})` captures letters and digits; the replacement `\\U\\1\\E\\2` upper-cases the letters. Start the pattern with `train=` so notes are never touched."
+      cost: 2
+    - title: Do not cut a longer ID short
+      body: "`TR45123` contains `TR4512`. Make sure the four digits are followed by a space or the end of the line: `( |$)`, and put that captured character back."
+      cost: 3
+  misconceptions:
+    - id: unanchored-fix
+      description: Rewrites every letters-digits look-alike in the line, including the references in note=.
+      feedback: "Without train= in the pattern, sed also rewrites ab-1234 and tr_5521 in the notes. Anchor the substitution to the field."
+      expectFail: [notes-untouched, fixed-exact]
+      mutation:
+        on: tr-dispatch-01
+        as: learner
+        run: |
+          grep -oE 'train=[^ ]*' /srv/dispatch/dispatch.log | cut -d= -f2 | grep -vxE '[A-Z]{2}[0-9]{4}' | sort -u > ~/answers/malformed-ids.txt
+          sed -E 's/\b([A-Za-z]{2})[-_]?([0-9]{4})\b/\U\1\E\2/g' /srv/dispatch/dispatch.log > ~/dispatch-fixed.log
+    - id: no-digit-boundary
+      description: Does not check what follows the four digits, so a five-digit ID is "fixed" too.
+      feedback: "kx10234 has five digits; it is not fixable and must stay. End the pattern with ( |$)."
+      expectFail: [fixable-corrected, fixed-exact]
+      mutation:
+        on: tr-dispatch-01
+        as: learner
+        run: |
+          grep -oE 'train=[^ ]*' /srv/dispatch/dispatch.log | cut -d= -f2 | grep -vxE '[A-Z]{2}[0-9]{4}' | sort -u > ~/answers/malformed-ids.txt
+          sed -E 's/train=([A-Za-z]{2})[-_]?([0-9]{4})/train=\U\1\E\2/' /srv/dispatch/dispatch.log > ~/dispatch-fixed.log
+    - id: partial-match-list
+      description: Lists values with grep -v but without -x, so IDs that merely contain a valid ID are missed.
+      feedback: "Without -x (or ^...$), TR45123 and XCC2201 contain a valid-looking part and are filtered out. Match the whole value."
+      expectFail: [malformed-list]
+      mutation:
+        on: tr-dispatch-01
+        as: learner
+        run: |
+          grep -oE 'train=[^ ]*' /srv/dispatch/dispatch.log | cut -d= -f2 | grep -vE '[A-Z]{2}[0-9]{4}' | sort -u > ~/answers/malformed-ids.txt
+          sed -E 's/train=([A-Za-z]{2})[-_]?([0-9]{4})( |$)/train=\U\1\E\2\3/' /srv/dispatch/dispatch.log > ~/dispatch-fixed.log
+    - id: whole-lines-listed
+      description: Writes the offending log lines instead of the ID values.
+      feedback: "The list should hold the train= values only. grep -o prints just the match."
+      expectFail: [malformed-list]
+      mutation:
+        on: tr-dispatch-01
+        as: learner
+        run: |
+          grep -vE 'train=[A-Z]{2}[0-9]{4} ' /srv/dispatch/dispatch.log | sort -u > ~/answers/malformed-ids.txt
+          sed -E 's/train=([A-Za-z]{2})[-_]?([0-9]{4})( |$)/train=\U\1\E\2\3/' /srv/dispatch/dispatch.log > ~/dispatch-fixed.log
+    - id: case-only
+      description: Upper-cases the IDs but leaves the separators in.
+      feedback: "TR-4530 is still invalid. Make the separator optional in the pattern ([-_]?) and leave it out of the replacement."
+      expectFail: [fixable-corrected]
+      mutation:
+        on: tr-dispatch-01
+        as: learner
+        run: |
+          grep -oE 'train=[^ ]*' /srv/dispatch/dispatch.log | cut -d= -f2 | grep -vxE '[A-Z]{2}[0-9]{4}' | sort -u > ~/answers/malformed-ids.txt
+          sed -E 's/train=([A-Za-z]{2})([-_]?[0-9]{4})( |$)/train=\U\1\E\2\3/' /srv/dispatch/dispatch.log > ~/dispatch-fixed.log
+  solution:
+    explanation: |
+      grep -o extracts the train= values; grep -vxE keeps those that do not match the
+      whole valid pattern. sed -E captures two letters and four digits, allows one
+      optional separator between them, requires a space or end of line after the
+      digits and upper-cases the letters with \U...\E. Anchoring on train= keeps the
+      notes intact.
+    steps:
+      - on: tr-dispatch-01
+        as: learner
+        run: |
+          mkdir -p ~/answers
+          grep -oE 'train=[^ ]*' /srv/dispatch/dispatch.log | cut -d= -f2 | grep -vxE '[A-Z]{2}[0-9]{4}' | sort -u > ~/answers/malformed-ids.txt
+          sed -E 's/train=([A-Za-z]{2})[-_]?([0-9]{4})( |$)/train=\U\1\E\2\3/' /srv/dispatch/dispatch.log > ~/dispatch-fixed.log
+    alternatives:
+      - id: awk-field
+        description: Do both with awk, working on the train= field only.
+        steps:
+          - on: tr-dispatch-01
+            as: learner
+            run: |
+              awk '{for (i = 1; i <= NF; i++) if ($i ~ /^train=/) { v = substr($i, 7); if (v !~ /^[A-Z][A-Z][0-9][0-9][0-9][0-9]$/) print v }}' /srv/dispatch/dispatch.log | sort -u > ~/answers/malformed-ids.txt
+              awk '{ if (match($0, /train=[A-Za-z][A-Za-z][-_]?[0-9][0-9][0-9][0-9]( |$)/)) {
+                       v = substr($0, RSTART + 6, RLENGTH - 6); sp = (substr(v, length(v)) == " ") ? " " : ""; gsub(/[-_ ]/, "", v)
+                       $0 = substr($0, 1, RSTART + 5) toupper(substr(v, 1, 2)) substr(v, 3) sp substr($0, RSTART + RLENGTH) }
+                     print }' /srv/dispatch/dispatch.log > ~/dispatch-fixed.log
+      - id: sed-two-passes
+        description: Two sed passes, first removing the separator, then upper-casing.
+        steps:
+          - on: tr-dispatch-01
+            as: learner
+            run: |
+              grep -o 'train=[^ ]*' /srv/dispatch/dispatch.log | sed 's/^train=//' | grep -Ev '^[A-Z]{2}[0-9]{4}$' | sort | uniq > ~/answers/malformed-ids.txt
+              sed -E -e 's/train=([A-Za-z]{2})[-_]([0-9]{4})( |$)/train=\1\2\3/' -e 's/train=([A-Za-z]{2})([0-9]{4})( |$)/train=\U\1\E\2\3/' /srv/dispatch/dispatch.log > ~/dispatch-fixed.log

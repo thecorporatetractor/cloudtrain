@@ -1,0 +1,194 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: find-stale-depot-files
+  title: Find and archive stale depot inspection files
+  domain: linux
+  frameworks: [lpic1:devices-filesystems, lfcs:essential-commands, rhcsa-aligned:essential-tools]
+  difficulty: medium
+  estimatedMinutes: 12
+  tags: [find, cp, archive, files]
+  version: 1
+spec:
+  description: |
+    The depot file server of Tallowmere Rail is filling up with old rolling-stock
+    inspection reports. Before anything is deleted, the records office wants a copy
+    of the stale ones.
+
+    Find every **inspection report** (`*.rpt`) under `/srv/depot` that is
+
+    - **older than 90 days** (last modified),
+    - **larger than 1 MiB**, and
+    - **owned by the user `inspector`**,
+
+    and copy each one into `/srv/archive/stale`, **keeping its path below
+    `/srv/depot`**: `/srv/depot/ashby/2025/q3/unit-1042.rpt` becomes
+    `/srv/archive/stale/ashby/2025/q3/unit-1042.rpt`. Several depots use the same
+    file names.
+
+    Copy only those reports, and leave the originals where they are.
+  objectives:
+    - Combine find tests for name, age, size and owner
+    - Copy matches while keeping their relative paths
+  params:
+    bigMiB:
+      type: int
+      min: 2
+      max: 4
+    fitterDepot:
+      type: choice
+      values: [ashby, corran]
+  topology:
+    entry: depot-files-01
+    nodes:
+      - name: depot-files-01
+        driver: container
+        image: linux-pod-el:10
+        access: [shell]
+  setup:
+    - on: depot-files-01
+      run: |
+        set -eu
+        id inspector >/dev/null 2>&1 || useradd -M -u 4301 -s /sbin/nologin inspector
+        id fitter >/dev/null 2>&1 || useradd -M -u 4302 -s /sbin/nologin fitter
+        rm -rf /srv/depot /srv/archive; mkdir -p /srv/depot /srv/archive/stale
+        chown learner:learner /srv/archive/stale
+        mkdir -p /var/lib/cloudtrain && chmod 0700 /var/lib/cloudtrain
+        : > /var/lib/cloudtrain/expected
+        # mk <path> <size> <age-days> <owner> <expected:yes|no>
+        mk() {
+          f=/srv/depot/$1; mkdir -p "$(dirname "$f")"
+          printf 'Tallowmere Rail inspection report %s\n' "$1" > "$f"
+          truncate -s "$2" "$f"; chown "$4" "$f"; chmod 0644 "$f"; touch -d "$3 days ago" "$f"
+          [ "$5" = yes ] && echo "$1" >> /var/lib/cloudtrain/expected || true
+        }
+        mk ashby/2025/q3/unit-1042.rpt {{bigMiB}}M 140 inspector yes
+        mk corran/2025/q3/unit-1042.rpt 3M 150 inspector yes
+        mk corran/2025/q2/unit-0988.rpt 1536K 210 inspector yes
+        mk dunmere/2024/q4/unit-0711.rpt 5M 330 inspector yes
+        mk ashby/2026/q3/unit-1201.rpt 4M 30 inspector no
+        mk ashby/2025/q4/unit-1107.rpt 900K 120 inspector no
+        mk dunmere/2025/q1/unit-0802.rpt 1M 200 inspector no
+        mk {{fitterDepot}}/2025/q1/unit-0815.rpt 3M 200 fitter no
+        mk corran/2025/q1/bogie-photos.tar 6M 220 inspector no
+        mk dunmere/2026/q2/unit-1150.rpt 2M 60 inspector no
+        chmod -R a+rX /srv/depot
+        sort -o /var/lib/cloudtrain/expected /var/lib/cloudtrain/expected
+        (cd /srv/depot && find . -type f -printf '%P %s %T@ %u\n' | sort) > /var/lib/cloudtrain/originals
+  checks:
+    - id: stale-copied
+      description: Every stale inspector report is in /srv/archive/stale at its path below /srv/depot, with identical content
+      type: shell
+      on: depot-files-01
+      skills: [linux.files.find-locate]
+      weight: 2
+      command: |
+        while read -r p; do cmp -s "/srv/depot/$p" "/srv/archive/stale/$p" || echo "missing $p"; done < /var/lib/cloudtrain/expected | head -1 | grep . || echo ok
+      expect: {match: exact, value: ok}
+    - id: nothing-extra
+      description: The archive holds only those reports (no new, small, foreign-owned or non-report files)
+      type: shell
+      on: depot-files-01
+      skills: [linux.files.find-locate]
+      weight: 2
+      command: (cd /srv/archive/stale && find . -type f -printf '%P\n' | sort | cmp -s /var/lib/cloudtrain/expected - && echo ok || echo extra)
+      expect: {match: exact, value: ok}
+    - id: originals-kept
+      description: The originals are still in /srv/depot, unchanged
+      type: shell
+      on: depot-files-01
+      skills: [linux.files.find-locate, linux.shell.navigation]
+      weight: 0.5
+      command: (cd /srv/depot && find . -type f -printf '%P %s %T@ %u\n' | sort | cmp -s /var/lib/cloudtrain/originals - && echo kept || echo changed)
+      expect: {match: exact, value: kept}
+  hints:
+    - title: One test per condition
+      body: "find combines tests with an implicit AND: `-name '*.rpt' -mtime +90 -size +1M -user inspector`. Run it without any action first to see the list."
+      command: find /srv/depot -type f -name '*.rpt' -mtime +90 -size +1M -user inspector
+      cost: 1
+    - title: Plus, minus, nothing
+      body: "`-mtime +90` means more than 90 days ago, `-mtime -90` less than 90. `-size +1M` means more than one MiB (sizes are rounded up to whole units, so a file of exactly 1 MiB does not match)."
+      cost: 1
+    - title: Keep the paths
+      body: "Run find from inside /srv/depot so it prints relative paths, then copy with `cp --parents`, which recreates the directories below the target."
+      command: cd /srv/depot && find . -name '*.rpt' ... -exec cp --parents {} /srv/archive/stale/ \;
+      cost: 2
+  misconceptions:
+    - id: any-owner
+      description: Leaves out the owner test.
+      feedback: "One stale report belongs to fitter, not inspector. Add -user inspector."
+      expectFail: [nothing-extra]
+      mutation:
+        on: depot-files-01
+        as: learner
+        run: cd /srv/depot && find . -type f -name '*.rpt' -mtime +90 -size +1M -exec cp --parents {} /srv/archive/stale/ \;
+    - id: newer-instead-of-older
+      description: Uses -mtime -90, which finds files changed in the last 90 days.
+      feedback: "The sign matters: -90 means less than 90 days old, +90 more than 90 days."
+      expectFail: [stale-copied, nothing-extra]
+      mutation:
+        on: depot-files-01
+        as: learner
+        run: cd /srv/depot && find . -type f -name '*.rpt' -mtime -90 -size +1M -user inspector -exec cp --parents {} /srv/archive/stale/ \;
+    - id: flat-copy
+      description: Copies the files straight into the archive directory without their paths.
+      feedback: "Two depots both have unit-1042.rpt, so a flat copy overwrites one with the other, and the records office cannot tell where a report came from."
+      expectFail: [stale-copied, nothing-extra]
+      mutation:
+        on: depot-files-01
+        as: learner
+        run: find /srv/depot -type f -name '*.rpt' -mtime +90 -size +1M -user inspector -exec cp {} /srv/archive/stale/ \;
+    - id: size-in-kilobytes
+      description: Writes the size test as +1k or +1024 (512-byte blocks), which matches almost everything.
+      feedback: "Without a suffix, find counts 512-byte blocks; k is KiB. Use +1M for more than one MiB."
+      expectFail: [nothing-extra]
+      mutation:
+        on: depot-files-01
+        as: learner
+        run: cd /srv/depot && find . -type f -name '*.rpt' -mtime +90 -size +1k -user inspector -exec cp --parents {} /srv/archive/stale/ \;
+    - id: moved-not-copied
+      description: Moves the reports instead of copying them.
+      feedback: "The records office asked for a copy; nothing may disappear from /srv/depot yet."
+      expectFail: [originals-kept]
+      mutation:
+        on: depot-files-01
+        as: admin
+        run: |
+          cd /srv/depot && find . -type f -name '*.rpt' -mtime +90 -size +1M -user inspector -exec cp --parents {} /srv/archive/stale/ \;
+          find . -type f -name '*.rpt' -mtime +90 -size +1M -user inspector -delete
+    - id: full-source-path
+      description: Copies with --parents from / so the archive gets srv/depot/... inside it.
+      feedback: "cp --parents keeps the path exactly as given. Run it from /srv/depot with relative paths (./ashby/...)."
+      expectFail: [stale-copied, nothing-extra]
+      mutation:
+        on: depot-files-01
+        as: learner
+        run: find /srv/depot -type f -name '*.rpt' -mtime +90 -size +1M -user inspector -exec cp --parents {} /srv/archive/stale/ \;
+  solution:
+    explanation: |
+      find selects on name, age (-mtime +90), size (-size +1M) and owner (-user
+      inspector) at once. Starting from /srv/depot it prints paths relative to it,
+      and cp --parents recreates those directories below /srv/archive/stale.
+    steps:
+      - on: depot-files-01
+        as: learner
+        run: |
+          cd /srv/depot
+          find . -type f -name '*.rpt' -mtime +90 -size +1M -user inspector -exec cp --parents {} /srv/archive/stale/ \;
+          find /srv/archive/stale -type f
+    alternatives:
+      - id: tar-pipe
+        description: Stream the selected files through tar, which keeps relative paths.
+        steps:
+          - on: depot-files-01
+            as: learner
+            run: cd /srv/depot && find . -type f -name '*.rpt' -mtime +90 -size +1M -user inspector -print0 | tar --null -T - -cf - | tar -xf - -C /srv/archive/stale
+      - id: loop-with-install
+        description: Loop over -printf %P output and use install -D to create the directories.
+        steps:
+          - on: depot-files-01
+            as: learner
+            run: |
+              find /srv/depot -type f -name '*.rpt' -mtime +90 -size +1M -user inspector -printf '%P\n' | while read -r p; do
+                install -D -m 0644 "/srv/depot/$p" "/srv/archive/stale/$p"
+              done

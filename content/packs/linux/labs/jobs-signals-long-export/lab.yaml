@@ -1,0 +1,167 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: jobs-signals-long-export
+  title: Keep a long export running after you log out
+  domain: linux
+  frameworks: [lpic1:gnu-commands]
+  difficulty: easy
+  estimatedMinutes: 8
+  tags: [jobs, signals, nohup, sighup, background]
+  version: 1
+spec:
+  description: |
+    The nightly fares export, `tr-fares-export {{run}}`, takes about three hours.
+    Last night someone started it in their terminal, closed the laptop, and the
+    export died with the session: closing a terminal sends **SIGHUP** to the jobs
+    that were started from it.
+
+    1. Start `tr-fares-export {{run}}` so that it runs in the background and
+       **ignores SIGHUP** (it must survive the end of your session). Exactly one
+       export must be running.
+    2. Then, as you would after logging in again, find the running export and
+       write **its PID** (just the number) to `~/answers/export.pid`.
+
+    Do not wait for it to finish.
+  objectives:
+    - Run a command in the background
+    - Make a process immune to hangups with nohup
+    - Find a running process again from a new shell
+  params:
+    run:
+      type: choice
+      values: [fares-q4, fares-weekend, fares-advance]
+  topology:
+    entry: tr-fares-01
+    nodes:
+      - name: tr-fares-01
+        driver: container
+        image: linux-pod-deb:24.04
+        access: [shell]
+  setup:
+    - on: tr-fares-01
+      file: {path: /usr/local/bin/tr-fares-export, source: assets/tr-fares-export, mode: "0755"}
+    - on: tr-fares-01
+      run: |
+        set -eu
+        chmod 0755 /usr/local/bin/tr-fares-export
+        pkill -f '^/bin/bash /usr/local/bin/tr-fares-export' || true
+        install -d -o learner -g learner /home/learner/answers
+        rm -f /home/learner/answers/export.pid /home/learner/nohup.out
+        rm -rf /home/learner/exports
+  checks:
+    - id: export-running
+      description: Exactly one tr-fares-export {{run}} is running
+      type: shell
+      on: tr-fares-01
+      skills: [linux.processes.management]
+      command: |
+        n=0; for p in $(pgrep -f '^/bin/bash /usr/local/bin/tr-fares-export {{run}}$'); do
+          case "$(ps -o stat= -p "$p")" in ""|Z*) ;; *) n=$((n+1)) ;; esac
+        done; echo "$n"
+      expect: {match: exact, value: "1"}
+    - id: ignores-sighup
+      description: The running export ignores SIGHUP, so it survives the end of the session
+      type: shell
+      on: tr-fares-01
+      skills: [linux.processes.management]
+      weight: 2
+      command: |
+        p=$(pgrep -f '^/bin/bash /usr/local/bin/tr-fares-export {{run}}$' | head -1)
+        [ -n "$p" ] || { echo none; exit 0; }
+        ign=$(awk '/^SigIgn:/ {print $2}' /proc/$p/status)
+        # SIGHUP is signal 1: bit 0 of the SigIgn mask.
+        [ $(( 0x$ign & 1 )) -eq 1 ] && echo ignored || echo not-ignored
+      expect: {match: exact, value: ignored}
+    - id: pid-recorded
+      description: ~/answers/export.pid holds the PID of the running export
+      type: shell
+      on: tr-fares-01
+      skills: [linux.processes.management]
+      weight: 1.5
+      command: |
+        want=$(pgrep -f '^/bin/bash /usr/local/bin/tr-fares-export {{run}}$' | head -1)
+        got=$(tr -d '[:space:]' < /home/learner/answers/export.pid 2>/dev/null)
+        [ -n "$want" ] && [ "$want" = "$got" ] && echo match || echo "no match"
+      expect: {match: exact, value: match}
+  hints:
+    - title: Background and hangup
+      body: "`cmd &` puts a job in the background, but it still dies on SIGHUP when the session ends. `nohup cmd &` starts it with SIGHUP ignored and sends its output to nohup.out."
+      cost: 1
+    - title: Find it again
+      body: "In a new shell `jobs` is empty, because jobs belong to the shell that started them. Use `pgrep -f tr-fares-export` or `ps -u $USER -o pid,args`."
+      command: pgrep -f tr-fares-export
+      cost: 1
+    - title: Check your work
+      body: "`grep SigIgn /proc/PID/status` shows the ignored signals as a hex mask; an odd last digit means SIGHUP is ignored."
+      cost: 1
+  misconceptions:
+    - id: plain-background
+      description: Starts the export with & only.
+      feedback: "A background job still receives SIGHUP when its terminal closes. Start it with nohup (or ignore HUP with trap '' HUP before starting it)."
+      expectFail: [ignores-sighup]
+      mutation:
+        on: tr-fares-01
+        as: learner
+        run: |
+          tr-fares-export {{run}} > ~/export.log 2>&1 &
+          echo $! > ~/answers/export.pid
+    - id: started-twice
+      description: Starts a second export to be sure, so two runs write the same file.
+      feedback: "Two exports race on the same output file. Check with pgrep before starting another one."
+      expectFail: [export-running]
+      mutation:
+        on: tr-fares-01
+        as: learner
+        run: |
+          nohup tr-fares-export {{run}} >/dev/null 2>&1 &
+          nohup tr-fares-export {{run}} >/dev/null 2>&1 &
+          echo $! > ~/answers/export.pid
+    - id: shell-pid
+      description: Records the shell's own PID ($$) instead of the export's.
+      feedback: "$$ is the PID of your shell. $! is the last background job; from a new shell use pgrep."
+      expectFail: [pid-recorded]
+      mutation:
+        on: tr-fares-01
+        as: learner
+        run: |
+          nohup tr-fares-export {{run}} >/dev/null 2>&1 &
+          echo $$ > ~/answers/export.pid
+  solution:
+    explanation: |
+      nohup starts the export with SIGHUP ignored (and redirects its output), & puts
+      it in the background, and pgrep -f finds it again from any later shell.
+    steps:
+      - on: tr-fares-01
+        as: learner
+        run: |
+          nohup tr-fares-export {{run}} > ~/fares-export.log 2>&1 &
+          sleep 1
+      - on: tr-fares-01
+        as: learner
+        run: |
+          pgrep -f 'tr-fares-expor[t] {{run}}' > ~/answers/export.pid
+          cat ~/answers/export.pid
+    alternatives:
+      - id: trap-and-setsid
+        description: Ignore HUP with trap in a subshell and detach with setsid.
+        steps:
+          - on: tr-fares-01
+            as: learner
+            run: |
+              (trap '' HUP; exec setsid tr-fares-export {{run}} > ~/fares-export.log 2>&1 < /dev/null) &
+              sleep 1
+          - on: tr-fares-01
+            as: learner
+            run: pgrep -f 'tr-fares-expor[t] {{run}}' > ~/answers/export.pid
+      - id: nohup-default-output
+        description: nohup writing to nohup.out explicitly (as it does by itself on a terminal), PID found with ps.
+        steps:
+          - on: tr-fares-01
+            as: learner
+            run: |
+              cd ~ && nohup tr-fares-export {{run}} < /dev/null > nohup.out 2>&1 &
+              sleep 1
+          - on: tr-fares-01
+            as: learner
+            run: ps -u learner -o pid=,args= | awk '/tr-fares-expor[t] / {print $1}' > ~/answers/export.pid

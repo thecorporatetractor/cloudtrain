@@ -1,0 +1,243 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: file-ops-roster-cleanup
+  title: Reorganise the crew roster directory with globbing
+  domain: linux
+  frameworks: [lpic1:gnu-commands, rhcsa-aligned:essential-tools]
+  difficulty: easy
+  estimatedMinutes: 10
+  tags: [shell, globbing, brace-expansion, mv, mkdir, rm]
+  version: 1
+spec:
+  description: |
+    Tallowmere Rail's crew office dumps every roster export into one flat directory,
+    `~/rosters`, and it has become unusable. Tidy it up:
+
+    1. Create one directory per month of 2026 inside `~/rosters`, named
+       `2026-01`, `2026-02`, ... `2026-12` (all twelve, even for months without a
+       roster yet).
+    2. Move every 2026 roster (`roster-2026-MM-DD*.csv`) into the directory of its
+       month. Keep the file names and contents as they are.
+    3. Delete the `*.bak` copies the export tool leaves behind, and nothing else.
+
+    Leave the 2025 rosters and every other file where they are. Some file names
+    contain spaces.
+
+    Globs (`*`, `?`, `[...]`) and brace expansion (`{01..12}`) make this a handful
+    of commands.
+  objectives:
+    - Create many directories at once with brace expansion
+    - Select files with glob patterns
+    - Move and delete files safely, including names with spaces
+  params:
+    spaceMonth:
+      type: choice
+      values: ["04", "09"]
+    extraDay:
+      type: int
+      min: 10
+      max: 28
+  topology:
+    entry: tr-crew-01
+    nodes:
+      - name: tr-crew-01
+        driver: container
+        image: linux-pod-deb:24.04
+        access: [shell]
+  setup:
+    - on: tr-crew-01
+      run: |
+        bash <<'EOS'
+        set -eu
+        R=/home/learner/rosters
+        rm -rf "$R"; mkdir -p "$R"; cd "$R"
+        row() { printf 'date,driver,guard,service\n%s,%s,%s,TR%d\n' "$1" "$2" "$3" "$4"; }
+        n=0
+        for d in 2026-01-05 2026-01-19 2026-02-02 2026-03-16 2026-03-30 2026-05-11 \
+                 2026-06-01 2026-06-{{extraDay}} 2026-07-13 2026-08-24 2026-10-05 2026-11-02 2026-12-14; do
+          n=$((n+1)); row "$d" "driver$n" "guard$n" $((4100+n)) > "roster-$d.csv"
+        done
+        row 2026-{{spaceMonth}}-07 night1 nightguard 4199 > "roster-2026-{{spaceMonth}}-07 night shift.csv"
+        for d in 2025-11-03 2025-12-01 2025-12-22; do row "$d" old old 3000 > "roster-$d.csv"; done
+        cp roster-2026-01-19.csv roster-2026-01-19.csv.bak
+        cp roster-2026-06-01.csv roster-2026-06-01.csv.bak
+        cp roster-2025-12-01.csv roster-2025-12-01.csv.bak
+        cp roster-2026-11-02.csv roster-2026-11-02.csv.bak
+        printf 'Rosters are exported nightly. Ask the crew office before deleting.\n' > notes-2026-03.txt
+        printf 'driver,depot\n' > drivers.csv
+        chown -R learner:learner "$R"
+        # Grader baseline: where every file must end up, with its checksum.
+        mkdir -p /var/lib/cloudtrain
+        find . -type f ! -name '*.bak' -print0 | while IFS= read -r -d '' f; do
+          b=${f#./}
+          case $b in roster-2026-*) dest="${b:7:7}/$b" ;; *) dest="$b" ;; esac
+          printf '%s\t%s\n' "$(sha256sum < "$f" | cut -d' ' -f1)" "$dest"
+        done | sort > /var/lib/cloudtrain/rosters.expected
+        EOS
+  checks:
+    - id: month-dirs
+      description: All twelve directories 2026-01 ... 2026-12 exist in ~/rosters
+      type: shell
+      on: tr-crew-01
+      skills: [linux.shell.navigation]
+      command: |
+        cd /home/learner/rosters && n=0
+        for m in 01 02 03 04 05 06 07 08 09 10 11 12; do [ -d "2026-$m" ] && n=$((n+1)); done; echo "$n"
+      expect: {match: exact, value: "12"}
+    - id: rosters-in-month
+      description: Every 2026 roster sits, unchanged, in the directory of its month
+      type: shell
+      on: tr-crew-01
+      skills: [linux.shell.navigation]
+      weight: 2
+      command: |
+        cd /home/learner/rosters || exit 1
+        grep -P '\t2026-' /var/lib/cloudtrain/rosters.expected | while IFS="$(printf '\t')" read -r sum path; do
+          [ -f "$path" ] && [ "$(sha256sum < "$path" | cut -d' ' -f1)" = "$sum" ] || echo "missing: $path"
+        done | head -3 | grep . || echo ok
+      expect: {match: exact, value: ok}
+    - id: bak-deleted
+      description: No *.bak copy is left anywhere under ~/rosters
+      type: shell
+      on: tr-crew-01
+      skills: [linux.shell.navigation]
+      command: find /home/learner/rosters -name '*.bak' | wc -l
+      expect: {match: exact, value: "0"}
+    - id: others-kept
+      description: The 2025 rosters and the other files are still in ~/rosters, unchanged
+      type: shell
+      on: tr-crew-01
+      skills: [linux.shell.navigation]
+      command: |
+        cd /home/learner/rosters || exit 1
+        grep -vP '\t2026-' /var/lib/cloudtrain/rosters.expected | while IFS="$(printf '\t')" read -r sum path; do
+          [ -f "$path" ] && [ "$(sha256sum < "$path" | cut -d' ' -f1)" = "$sum" ] || echo "missing: $path"
+        done | head -3 | grep . || echo ok
+      expect: {match: exact, value: ok}
+    - id: nothing-extra
+      description: No stray files were created (each file is where the plan expects it)
+      type: shell
+      on: tr-crew-01
+      skills: [linux.shell.navigation]
+      weight: 0.5
+      command: |
+        cd /home/learner/rosters || exit 1
+        exp=$(cut -f2 /var/lib/cloudtrain/rosters.expected | sort)
+        got=$(find . -type f -printf '%P\n' | sort)
+        [ "$exp" = "$got" ] && echo ok || echo differs
+      expect: {match: exact, value: ok}
+  hints:
+    - title: Twelve directories, one command
+      body: "Brace expansion generates words before the command runs: `echo 2026-{01..12}` shows what `mkdir` would receive."
+      command: mkdir ~/rosters/2026-{01..12}
+      cost: 1
+    - title: Get rid of the copies first
+      body: "Delete the `*.bak` files before moving anything, so that a pattern like `roster-2026-01-*` can no longer match them. Preview any glob with `ls` or `echo` first."
+      cost: 1
+    - title: One glob per month
+      body: "A loop over the months lets the glob pick the files: `for m in {01..12}; do mv roster-2026-$m-* 2026-$m/; done`. The glob expands to whole file names, spaces included, as long as you never store them in an unquoted variable."
+      cost: 2
+  misconceptions:
+    - id: moves-bak-too
+      description: Moves the month's files before deleting the copies, so the *.bak files end up in the month directories.
+      feedback: "roster-2026-01-* also matches roster-2026-01-19.csv.bak. Delete the copies first or make the pattern end in .csv."
+      expectFail: [bak-deleted]
+      mutation:
+        on: tr-crew-01
+        as: learner
+        run: |
+          bash <<'EOS'
+          cd ~/rosters && mkdir -p 2026-{01..12}
+          for m in {01..12}; do mv roster-2026-$m-* 2026-$m/ 2>/dev/null || true; done
+          EOS
+    - id: only-busy-months
+      description: Creates directories only for months that have rosters.
+      feedback: "The crew office wants all twelve months, so the next export has somewhere to go. Brace expansion makes that free."
+      expectFail: [month-dirs]
+      mutation:
+        on: tr-crew-01
+        as: learner
+        run: |
+          bash <<'EOS'
+          cd ~/rosters && rm -f -- *.bak
+          for f in roster-2026-*.csv; do m=${f:7:7}; mkdir -p "$m"; mv -- "$f" "$m/"; done
+          EOS
+    - id: unquoted-loop
+      description: Loops over `ls` output, so the file name with spaces is split into words and never moved.
+      feedback: "`for f in $(ls ...)` splits names at spaces. Loop over the glob itself (`for f in roster-2026-*.csv`) and quote \"$f\"."
+      expectFail: [rosters-in-month]
+      mutation:
+        on: tr-crew-01
+        as: learner
+        run: |
+          bash <<'EOS'
+          cd ~/rosters && mkdir -p 2026-{01..12} && rm -f -- *.bak
+          for f in $(ls roster-2026-*.csv); do mv $f 2026-${f:12:2}/ 2>/dev/null || true; done
+          EOS
+    - id: all-years
+      description: Uses a pattern that also catches the 2025 rosters.
+      feedback: "roster-*-12-* matches December of every year. Anchor the year in the pattern: roster-2026-12-*."
+      expectFail: [others-kept]
+      mutation:
+        on: tr-crew-01
+        as: learner
+        run: |
+          bash <<'EOS'
+          cd ~/rosters && mkdir -p 2026-{01..12} && rm -f -- *.bak
+          for m in {01..12}; do mv -- roster-*-$m-* 2026-$m/ 2>/dev/null || true; done
+          EOS
+    - id: deletes-everything-old
+      description: Deletes with a broad pattern such as roster-* or *2026*, losing files that should stay.
+      feedback: "rm with a broad glob cannot be undone. Preview with ls first, and remember the task: delete only *.bak."
+      expectFail: [others-kept]
+      mutation:
+        on: tr-crew-01
+        as: learner
+        run: |
+          bash <<'EOS'
+          cd ~/rosters && mkdir -p 2026-{01..12}
+          for m in {01..12}; do cp -- roster-2026-$m-*.csv 2026-$m/ 2>/dev/null || true; done
+          rm -f -- *2026*.* *.bak
+          EOS
+  solution:
+    explanation: |
+      Brace expansion builds the twelve names, the copies go first so no later glob
+      can match them, and one glob per month moves its rosters. Globs expand to
+      complete file names, so the one with spaces is moved like any other.
+    steps:
+      - on: tr-crew-01
+        as: learner
+        run: |
+          bash <<'EOS'
+          cd ~/rosters
+          mkdir 2026-{01..12}
+          rm -- *.bak
+          for m in {01..12}; do
+            for f in roster-2026-$m-*.csv; do [ -e "$f" ] && mv -- "$f" "2026-$m/"; done
+          done
+          ls -R
+          EOS
+    alternatives:
+      - id: substring-loop
+        description: Loop over all 2026 rosters once and cut the month out of the name with parameter expansion.
+        steps:
+          - on: tr-crew-01
+            as: learner
+            run: |
+              bash <<'EOS'
+              cd ~/rosters && mkdir -p 2026-{01..12}
+              find . -maxdepth 1 -name '*.bak' -delete
+              for f in roster-2026-*.csv; do mv -- "$f" "${f:7:7}/"; done
+              EOS
+      - id: find-exec
+        description: Use find with -exec and a small sh -c helper.
+        steps:
+          - on: tr-crew-01
+            as: learner
+            run: |
+              bash <<'EOS'
+              cd ~/rosters && mkdir -p 2026-{01..12}
+              rm -f ./*.bak
+              find . -maxdepth 1 -type f -name 'roster-2026-*.csv' -exec sh -c 'for f; do b=${f#./}; m=$(echo "$b" | cut -c8-14); mv "$f" "$m/"; done' sh {} +
+              EOS

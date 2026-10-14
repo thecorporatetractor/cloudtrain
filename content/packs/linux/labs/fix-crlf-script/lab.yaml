@@ -1,0 +1,167 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: fix-crlf-script
+  title: Repair a script that fails with bad interpreter
+  domain: linux
+  frameworks: [linuxplus:troubleshooting]
+  difficulty: easy
+  estimatedMinutes: 8
+  tags: [troubleshooting, line-endings, permissions, scripts]
+  version: 1
+spec:
+  description: |
+    A colleague at Tallowmere Rail wrote `~/bin/platform-board` on a laptop and
+    copied it to the station server. It should write the departure board of one
+    station to `~/boards/STATION.board`, but running it fails:
+
+    ```
+    $ ~/bin/platform-board {{station}}
+    ```
+
+    Find out why, repair the script **in place** (keep its name, path and logic),
+    and run it once for **{{station}}** so that `~/boards/{{station}}.board`
+    exists. It must work when started directly as `~/bin/platform-board`, not only
+    via `bash ~/bin/platform-board`.
+  objectives:
+    - Read and interpret "bad interpreter" and "Permission denied" errors
+    - Detect and remove CRLF line endings
+    - Set the execute bit on a script
+  params:
+    station:
+      type: choice
+      values: [Ashby, Corran, Dunmere]
+  topology:
+    entry: tr-station-01
+    nodes:
+      - name: tr-station-01
+        driver: container
+        image: linux-pod-el:10
+        access: [shell]
+  setup:
+    - on: tr-station-01
+      file: {path: /var/lib/cloudtrain/platform-board.crlf, source: assets/platform-board, mode: "0600"}
+    - on: tr-station-01
+      run: |
+        set -eu
+        mkdir -p /srv/timetable
+        : > /srv/timetable/today.csv
+        i=0
+        for st in Ashby Bramwell Corran Dunmere Ashby Corran Dunmere Ashby Bramwell Corran Dunmere Ashby; do
+          i=$((i+1)); printf 'TR%d,%s,%02d:%02d,%d\n' $((4400 + i * 3)) $st $((6 + i)) $((i * 7 % 60)) $((i % 3 + 1)) >> /srv/timetable/today.csv
+        done
+        chmod 0644 /srv/timetable/today.csv
+        install -d -o learner -g learner /home/learner/bin
+        install -o learner -g learner -m 0644 /var/lib/cloudtrain/platform-board.crlf /home/learner/bin/platform-board
+        rm -rf /home/learner/boards
+        # Expected board (root only), from the script with LF endings.
+        mkdir -p /var/lib/cloudtrain/x
+        tr -d '\r' < /var/lib/cloudtrain/platform-board.crlf > /var/lib/cloudtrain/pb.lf
+        tr -d '\r' < /var/lib/cloudtrain/platform-board.crlf | sha256sum | cut -d' ' -f1 > /var/lib/cloudtrain/pb.lf.sha
+        HOME=/var/lib/cloudtrain/x bash /var/lib/cloudtrain/pb.lf {{station}} >/dev/null
+        mv /var/lib/cloudtrain/x/boards/{{station}}.board /var/lib/cloudtrain/expected.board
+        rm -rf /var/lib/cloudtrain/x
+  checks:
+    - id: no-crlf
+      description: The script has Unix (LF) line endings
+      type: shell
+      on: tr-station-01
+      skills: [linux.shell.scripting]
+      command: grep -c "$(printf '\r')" /home/learner/bin/platform-board 2>/dev/null || true
+      expect: {match: exact, value: "0"}
+    - id: executable
+      description: The script is executable by its owner
+      type: shell
+      on: tr-station-01
+      skills: [linux.files.permissions]
+      command: test -x /home/learner/bin/platform-board && echo yes || echo no
+      expect: {match: exact, value: "yes"}
+    - id: logic-unchanged
+      description: Apart from line endings, the script is unchanged
+      type: shell
+      on: tr-station-01
+      skills: [linux.shell.scripting]
+      weight: 0.5
+      command: '[ "$(tr -d "\r" < /home/learner/bin/platform-board | sha256sum | cut -d" " -f1)" = "$(cat /var/lib/cloudtrain/pb.lf.sha)" ] && echo same || echo changed'
+      expect: {match: exact, value: same}
+    - id: runs-directly
+      description: Started directly, the script exits 0
+      type: shell
+      on: tr-station-01
+      skills: [linux.shell.scripting]
+      command: (cd /tmp && runuser -u learner -- env -i HOME=/var/tmp/pb-check PATH=/usr/bin:/bin /home/learner/bin/platform-board Bramwell >/dev/null 2>&1; echo $?; rm -rf /var/tmp/pb-check)
+      expect: {match: exact, value: "0"}
+    - id: board-written
+      description: ~/boards/{{station}}.board holds the correct departure board
+      type: shell
+      on: tr-station-01
+      skills: [linux.shell.scripting]
+      weight: 1.5
+      command: cmp -s /var/lib/cloudtrain/expected.board /home/learner/boards/{{station}}.board && echo ok || echo no
+      expect: {match: exact, value: ok}
+  hints:
+    - title: Read the error carefully
+      body: "`bad interpreter: /bin/bash^M` means the kernel looked for a program literally named `/bin/bash` followed by a carriage return. `cat -A` shows line ends as `^M$`; `file` says 'with CRLF line terminators'."
+      cost: 1
+    - title: Strip the carriage returns
+      body: "`sed -i 's/\\r$//' FILE` removes a trailing CR from every line (dos2unix does the same where installed)."
+      cost: 1
+    - title: Permission denied?
+      body: "A script also needs the execute bit to be started by its path: `chmod u+x FILE`. `ls -l` shows it as an x."
+      cost: 1
+  misconceptions:
+    - id: run-with-bash
+      description: Works around the error by always running bash FILE, leaving the file broken.
+      feedback: "bash FILE ignores the shebang and the execute bit, but cron, other scripts and colleagues start it by its path. Fix the file itself."
+      expectFail: [no-crlf, executable, runs-directly]
+      mutation:
+        on: tr-station-01
+        as: learner
+        run: tr -d '\r' < ~/bin/platform-board > /tmp/pb && bash /tmp/pb {{station}}
+    - id: chmod-only
+      description: Sets the execute bit but leaves the CRLF line endings.
+      feedback: "The execute bit is half the fix; the ^M after /bin/bash still breaks the interpreter line."
+      expectFail: [no-crlf, runs-directly]
+      mutation:
+        on: tr-station-01
+        as: learner
+        run: chmod u+x ~/bin/platform-board
+    - id: crlf-only
+      description: Removes the CRs but forgets the execute bit.
+      feedback: "Without x, starting it by path gives 'Permission denied'."
+      expectFail: [executable, runs-directly]
+      mutation:
+        on: tr-station-01
+        as: learner
+        run: sed -i 's/\r$//' ~/bin/platform-board && bash ~/bin/platform-board {{station}}
+  solution:
+    explanation: |
+      The file has CRLF line endings, so the shebang names "/bin/bash\r", and it lacks
+      the execute bit. Strip the carriage returns in place, add u+x and run it.
+    steps:
+      - on: tr-station-01
+        as: learner
+        run: |
+          file ~/bin/platform-board
+          sed -i 's/\r$//' ~/bin/platform-board
+          chmod u+x ~/bin/platform-board
+          ~/bin/platform-board {{station}}
+    alternatives:
+      - id: tr-and-install
+        description: Rewrite the file with tr and set the mode with install.
+        steps:
+          - on: tr-station-01
+            as: learner
+            run: |
+              tr -d '\r' < ~/bin/platform-board > ~/bin/.pb.tmp
+              install -m 0755 ~/bin/.pb.tmp ~/bin/platform-board && rm ~/bin/.pb.tmp
+              ~/bin/platform-board {{station}}
+      - id: vim-fileformat
+        description: Use vim's fileformat setting to save with Unix line endings.
+        steps:
+          - on: tr-station-01
+            as: learner
+            run: |
+              vim -Es -c 'edit ++fileformat=dos' -c 'setlocal fileformat=unix' -c 'wq' ~/bin/platform-board
+              chmod 700 ~/bin/platform-board
+              ~/bin/platform-board {{station}}
