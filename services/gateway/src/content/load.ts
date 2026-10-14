@@ -23,12 +23,30 @@ export interface Content {
   skills: Skill[];
   /** Prerequisite edges from skills.yaml (`requires`). */
   requires: Map<string, string[]>;
+  /** Competencies (skills.yaml domain -> competency), for team heatmaps. */
+  competencies: ContentCompetency[];
   frameworks: Framework[];
+  /** Content packs and their labs (content visibility). */
+  packs: ContentPack[];
   paths: Path[];
   domains: DomainInfo[];
   summaries: LabSummary[];
   /** Labs that failed validation; they are not served. */
   issues: ContentIssue[];
+}
+
+export interface ContentCompetency {
+  id: string;
+  name: string;
+  domain: Domain;
+  skillIds: string[];
+}
+
+export interface ContentPack {
+  id: string;
+  title: string;
+  domain: Domain;
+  labIds: string[];
 }
 
 /* ------------------------------ source shapes ------------------------------ */
@@ -84,20 +102,22 @@ async function subdirs(dir: string): Promise<string[]> {
 
 /* --------------------------------- mapping --------------------------------- */
 
-export function toSkills(doc: SkillGraphDoc): { skills: Skill[]; requires: Map<string, string[]> } {
+export function toSkills(doc: SkillGraphDoc): { skills: Skill[]; requires: Map<string, string[]>; competencies: ContentCompetency[] } {
   const skills: Skill[] = [];
   const requires = new Map<string, string[]>();
+  const competencies: ContentCompetency[] = [];
   for (const d of doc.domains) {
     const domain = DOMAIN_OF[d.id];
     if (!domain) continue;
     for (const c of d.competencies) {
+      competencies.push({ id: c.id, name: c.title, domain, skillIds: c.skills.map((s) => s.id) });
       for (const s of c.skills) {
         skills.push({ id: s.id, name: s.title, domain, competency: c.title });
         if (s.requires?.length) requires.set(s.id, s.requires);
       }
     }
   }
-  return { skills, requires };
+  return { skills, requires, competencies };
 }
 
 /** Objective weights are published percentages; the API uses fractions of 1 that sum to 1. */
@@ -145,7 +165,7 @@ async function loadLab(file: string, pack: string | undefined, labs: Map<string,
 /** Reads content/ (skill graph, frameworks, packs) plus optional extra lab directories. */
 export async function loadContent(contentDir: string, extraLabDirs: string[] = []): Promise<Content> {
   const issues: ContentIssue[] = [];
-  const { skills, requires } = toSkills(await readYaml<SkillGraphDoc>(path.join(contentDir, 'skills.yaml')));
+  const { skills, requires, competencies } = toSkills(await readYaml<SkillGraphDoc>(path.join(contentDir, 'skills.yaml')));
 
   const frameworks: Framework[] = [];
   const fwDir = path.join(contentDir, 'frameworks');
@@ -218,5 +238,12 @@ export async function loadContent(contentDir: string, extraLabDirs: string[] = [
     pathCount: paths.filter((p) => p.domain === id).length,
   }));
 
-  return { labs, skills, requires, frameworks, paths, domains, summaries, issues };
+  const contentPacks: ContentPack[] = packs.map((p) => ({
+    id: p.metadata.id,
+    title: p.metadata.title,
+    domain: p.metadata.domain,
+    labIds: Array.from(labs.values()).filter((l) => l.pack === p.metadata.id).map((l) => l.lab.metadata.id),
+  }));
+
+  return { labs, skills, requires, competencies, frameworks, packs: contentPacks, paths, domains, summaries, issues };
 }

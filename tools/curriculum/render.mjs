@@ -89,6 +89,7 @@ for (const d of domains) {
   push(cell(d.summary), "");
   if (d.organisation) push(`Fictional organisation: **${d.organisation.name}**${d.organisation.summary ? ` (${cell(d.organisation.summary)})` : ""}.`, "");
   if (d.notes) push(cell(d.notes), "");
+  if (d.licensingNote) push(`**Licensing.** ${cell(d.licensingNote)}`, "");
   push(`Competencies: ${d.competencies.map((c) => `${code(c.id)}${c.new ? " (new)" : ""}`).join(", ")}.`, "");
 
   const ps = pathsOf(d.id);

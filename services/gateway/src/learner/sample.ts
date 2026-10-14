@@ -1,11 +1,13 @@
 import { createHash } from 'node:crypto';
 import type { Domain, GoalForecast, HomeData, Learner, Recommendation, SkillState } from '@cloudtrain/api-types';
 import type { Principal } from '../auth.js';
+import { legacyRole } from '../authz.js';
 import type { Content } from '../content/load.js';
 
 /*
- * SAMPLE LEARNER MODEL. There is no learner-model backend yet (assessment /
- * analytics services). These numbers are deterministic placeholders computed
+ * SAMPLE LEARNER MODEL: the fallback when the gateway runs without a database
+ * (unit tests of the lab/session surface). With Postgres configured, Home and
+ * Skills come from the persisted learner model (learner/home.ts). These numbers are deterministic placeholders computed
  * over the REAL skill graph and catalog so Home and Skills render coherently
  * against real lab ids; none of it reflects what the learner actually did.
  * Replace with the learner-model service when it exists.
@@ -18,9 +20,8 @@ function seeded(key: string): number {
 
 const round2 = (v: number) => Math.round(v * 100) / 100;
 
-export function learnerOf(p: Principal): Learner {
-  const role = p.roles.includes('admin') ? 'admin' : p.roles.includes('manager') ? 'manager' : 'learner';
-  return { id: p.sub, name: p.name, email: p.email, role, team: p.team, org: p.orgName, streakDays: 3, minutesThisWeek: 75 };
+export function learnerOf(p: Principal, stats: { streakDays: number; minutesThisWeek: number } = { streakDays: 3, minutesThisWeek: 75 }): Learner {
+  return { id: p.sub, name: p.name, email: p.email, role: legacyRole(p.roles), team: p.team, org: p.orgName, ...stats };
 }
 
 export function sampleSkillStates(content: Content, who: string): SkillState[] {

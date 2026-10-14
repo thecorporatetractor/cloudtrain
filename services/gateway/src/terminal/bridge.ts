@@ -1,5 +1,6 @@
 import { PassThrough, Writable } from 'node:stream';
 import type { WebSocket } from 'ws';
+import type { SessionNotice } from '@cloudtrain/api-types';
 import type { ExecHandle, LabCluster } from '../kube/cluster.js';
 import type { TerminalPlan } from './target.js';
 
@@ -14,7 +15,7 @@ import type { TerminalPlan } from './target.js';
  *                      text   {"t":"error","m":"..."}         could not attach
  */
 export type ClientFrame = { t: 'i'; d: string } | { t: 'r'; c: number; r: number };
-export type ServerFrame = { t: 'ready'; via: string } | { t: 'exit'; code: number } | { t: 'error'; m: string };
+export type ServerFrame = { t: 'ready'; via: string } | { t: 'exit'; code: number } | { t: 'error'; m: string } | { t: 'notice'; notice: SessionNotice } | { t: 'observe'; readOnly: true; m: string };
 
 export const clampSize = (n: unknown, d: number, max: number) => {
   const v = Math.floor(Number(n));
@@ -30,6 +31,8 @@ export class TerminalOutput extends Writable {
     private readonly ws: WebSocket,
     cols: number,
     rows: number,
+    /** Copy of every output chunk (read-only observers of this terminal). */
+    private readonly tap?: (chunk: Buffer) => void,
   ) {
     super();
     this.columns = cols;
@@ -45,19 +48,20 @@ export class TerminalOutput extends Writable {
 
   override _write(chunk: Buffer, _enc: BufferEncoding, cb: (err?: Error | null) => void) {
     if (this.ws.readyState === this.ws.OPEN) this.ws.send(chunk, { binary: true });
+    this.tap?.(chunk);
     cb();
   }
 }
 
-const send = (ws: WebSocket, f: ServerFrame) => {
+export const send = (ws: WebSocket, f: ServerFrame) => {
   if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(f));
 };
 
 /** Attaches a client WebSocket to an exec session in the lab and shuttles bytes both ways until either side ends. */
-export async function bridge(ws: WebSocket, cluster: LabCluster, planned: Promise<TerminalPlan>, size: { cols: number; rows: number }, log: { warn(o: object, m: string): void }) {
+export async function bridge(ws: WebSocket, cluster: LabCluster, planned: Promise<TerminalPlan>, size: { cols: number; rows: number }, log: { warn(o: object, m: string): void }, tap?: (chunk: Buffer) => void) {
   // Listeners go on synchronously so keystrokes sent while the exec is being set up are buffered, not lost.
   const stdin = new PassThrough();
-  const stdout = new TerminalOutput(ws, size.cols, size.rows);
+  const stdout = new TerminalOutput(ws, size.cols, size.rows, tap);
   let handle: ExecHandle | undefined;
   let closed = false;
 

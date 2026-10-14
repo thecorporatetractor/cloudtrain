@@ -1,0 +1,68 @@
+# CloudTrain local platform dependencies: Postgres, Keycloak, Mailpit.
+# `task dev:deps` / `task dev:deps:down` (compose project "cloudtrain-dev-deps").
+#
+# DEV ONLY. Every password in this file and in keycloak/*.json is a fixed,
+# published development credential for fictional users on 127.0.0.1-bound
+# ports. Never reuse them anywhere else.
+#
+# Images are pinned by tag and digest; bump them together with deploy/versions.env.
+name: cloudtrain-dev-deps
+
+services:
+  postgres:
+    image: postgres:17.11-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres-dev-only
+      # Roles/databases created by postgres/init.sql (gateway owner + RLS-bound app role, keycloak)
+    ports: ['127.0.0.1:55432:5432']
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/10-init.sql:ro
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres -d cloudtrain']
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.7.5@sha256:37dbaf6f0722c9ec246335f36e1ef8b2e6cb960f7c27e0d8c615121a3d475a85
+    command: ['start-dev', '--import-realm', '--features=organization']
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin-dev-only
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://postgres:5432/keycloak
+      KC_DB_USERNAME: keycloak
+      KC_DB_PASSWORD: keycloak-dev-only
+      # Browser and gateway both reach Keycloak as http://localhost:8180; the
+      # brokered acme-idp realm is called back-channel on the container port.
+      KC_HOSTNAME: http://localhost:8180
+      KC_HOSTNAME_BACKCHANNEL_DYNAMIC: 'true'
+      KC_HTTP_ENABLED: 'true'
+      KC_HEALTH_ENABLED: 'true'
+      KC_LOG_LEVEL: info
+    ports: ['127.0.0.1:8180:8080']
+    extra_hosts:
+      # back-channel logout to the gateway on the host
+      - host.docker.internal:host-gateway
+    volumes:
+      - ./keycloak/import:/opt/keycloak/data/import:ro
+    depends_on:
+      postgres: { condition: service_healthy }
+    healthcheck:
+      test: ['CMD-SHELL', "exec 3<>/dev/tcp/127.0.0.1/9000 && printf 'GET /health/ready HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n' >&3 && grep -q UP <&3"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+      start_period: 20s
+
+  mailpit:
+    image: axllent/mailpit:v1.31.5@sha256:94f6b70c1436defae6799d9ac7ff0eeff9540465b842026d5cdb018f1c0234ea
+    ports: ['127.0.0.1:8025:8025', '127.0.0.1:1025:1025']
+    environment:
+      MP_SMTP_AUTH_ACCEPT_ANY: '1'
+      MP_SMTP_AUTH_ALLOW_INSECURE: '1'
+
+volumes:
+  pgdata:

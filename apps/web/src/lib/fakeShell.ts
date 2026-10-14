@@ -406,7 +406,7 @@ export class FakeShell {
       this.println('kind: Pod');
       this.println('metadata: { name: probe, namespace: checkout, labels: { app: probe } }');
       this.println('spec:');
-      this.println('  containers: [{ name: probe, image: registry.tessera.internal/netshoot:1, command: [sleep, infinity] }]');
+      this.println('  containers: [{ name: probe, image: registry.quillmoor.internal/netshoot:1, command: [sleep, infinity] }]');
     } else if (f.startsWith('manifests/')) {
       this.println('apiVersion: networking.k8s.io/v1');
       this.println('kind: NetworkPolicy');

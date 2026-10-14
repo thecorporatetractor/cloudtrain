@@ -1,20 +1,37 @@
 import { Command } from 'cmdk';
 import * as DialogPrimitive from '@radix-ui/react-dialog';
 import { useNavigate } from '@tanstack/react-router';
-import { BookOpen, FlaskConical, Home, Keyboard, Moon, Palette, Sun, Sunset, Terminal, Users, Waypoints } from 'lucide-react';
+import { Keyboard, Moon, Palette, Sun, Sunset, Terminal } from 'lucide-react';
 import { useCatalog, useMe } from '@/api/client';
 import { Kbd } from '@/components/ui';
 import { THEMES, useTheme } from '@/lib/theme';
 import { formatMinutes, titleCase } from '@/lib/utils';
 import { canAccess } from './access';
+import { NAV } from './Shell';
 import { useShell } from './shell-context';
+
+/** Deeper destinations inside the areas; gated like the nav items that contain them. */
+const EXTRA: { to: string; label: string; keywords: string[] }[] = [
+  { to: '/team/assign', label: 'Assign a lab or path', keywords: ['assignment', 'due', 'manager'] },
+  { to: '/team/assignments', label: 'Team assignments', keywords: ['overdue', 'status'] },
+  { to: '/team/exams', label: 'Team exam readiness', keywords: ['exam', 'simulation'] },
+  { to: '/admin/users', label: 'Admin: users', keywords: ['invite', 'roles', 'deactivate'] },
+  { to: '/admin/teams', label: 'Admin: teams', keywords: ['managers'] },
+  { to: '/admin/sso', label: 'Admin: single sign-on', keywords: ['sso', 'oidc', 'saml', 'entra', 'okta', 'domain'] },
+  { to: '/admin/content', label: 'Admin: content visibility', keywords: ['packs', 'labs', 'pin'] },
+  { to: '/admin/sessions', label: 'Admin: live sessions', keywords: ['terminate'] },
+  { to: '/admin/usage', label: 'Admin: usage & quotas', keywords: ['quota', 'hours'] },
+  { to: '/admin/audit', label: 'Admin: audit log', keywords: ['audit', 'export'] },
+  { to: '/admin/settings', label: 'Admin: settings', keywords: ['org', 'logo'] },
+  { to: '/platform/capacity', label: 'Platform: capacity', keywords: ['nodes', 'warm pools', 'vms'] },
+];
 
 export function CommandPalette() {
   const { paletteOpen, setPaletteOpen, setShortcutsOpen } = useShell();
   const navigate = useNavigate();
   const { setTheme } = useTheme();
   const catalog = useCatalog();
-  const role = useMe().data?.role;
+  const me = useMe().data;
 
   const run = (fn: () => void) => () => {
     setPaletteOpen(false);
@@ -36,25 +53,18 @@ export function CommandPalette() {
               <Command.Empty className="palette-empty">No results. Try a lab name, a skill or a page.</Command.Empty>
 
               <Command.Group heading="Go to" className="palette-group">
-                <Command.Item className="palette-item" onSelect={run(() => void navigate({ to: '/' }))} keywords={['home', 'dashboard']}>
-                  <Home size={14} /> Home <Kbd keys="g h" />
-                </Command.Item>
-                <Command.Item className="palette-item" onSelect={run(() => void navigate({ to: '/catalog', search: {} }))}>
-                  <BookOpen size={14} /> Catalog <Kbd keys="g c" />
-                </Command.Item>
-                <Command.Item className="palette-item" onSelect={run(() => void navigate({ to: '/skills', search: { framework: 'cks' } }))}>
-                  <Waypoints size={14} /> Skills <Kbd keys="g s" />
-                </Command.Item>
-                {canAccess(role, '/team') && (
-                  <Command.Item className="palette-item" onSelect={run(() => void navigate({ to: '/team' }))}>
-                    <Users size={14} /> Team dashboard <Kbd keys="g t" />
+                {NAV.flatMap((s) => s.items)
+                  .filter((n) => canAccess(me, n.to))
+                  .map((n) => (
+                    <Command.Item key={n.to} className="palette-item" value={`${n.label} ${n.to}`} onSelect={run(() => void navigate({ to: n.to as '/', search: n.to === '/catalog' || n.to === '/team' ? {} : n.to === '/skills' ? { framework: 'cks' } : undefined }))}>
+                      {n.icon} {n.label} {n.keys && <Kbd keys={n.keys} />}
+                    </Command.Item>
+                  ))}
+                {EXTRA.filter((e) => canAccess(me, e.to)).map((e) => (
+                  <Command.Item key={e.to} className="palette-item" value={`${e.label} ${e.to}`} keywords={e.keywords} onSelect={run(() => void navigate({ to: e.to as '/', search: e.to.startsWith('/team') ? {} : undefined }))}>
+                    <span style={{ width: 14 }} /> {e.label}
                   </Command.Item>
-                )}
-                {canAccess(role, '/studio') && (
-                  <Command.Item className="palette-item" onSelect={run(() => void navigate({ to: '/studio' }))}>
-                    <FlaskConical size={14} /> Scenario Studio <Kbd keys="g a" />
-                  </Command.Item>
-                )}
+                ))}
               </Command.Group>
 
               {catalog.data && (

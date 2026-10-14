@@ -8,6 +8,20 @@ import type { Compiler } from '../kube/compile.js';
 import { ANNOTATION_HINTS, LABEL_LAB, LABEL_LEARNER, LABEL_MANAGED_BY, LABEL_ORG, LABS_API_VERSION, MANAGED_BY, type LabSession } from '../kube/types.js';
 import { labIdOf, phaseOf, revealedHints, toWebSession } from './map.js';
 
+/**
+ * Platform side effects around the session lifecycle (quotas, content
+ * visibility, attempt persistence, notices). Optional: without a database the
+ * gateway serves sessions alone (unit tests of the lab surface).
+ */
+export interface SessionHooks {
+  /** Throws to refuse the start (404 hidden lab, 429 quota); may set the TTL. */
+  beforeStart(p: Principal, lab: ContentLab): Promise<{ ttlMinutes?: number }>;
+  started(p: Principal, lab: ContentLab, ls: LabSession): Promise<void>;
+  validated(p: Principal, lab: ContentLab, ls: LabSession, res: ValidateResponse): Promise<void>;
+  ended(p: Principal, sessionName: string, ls?: LabSession): Promise<void>;
+  decorate(p: Principal, s: WebSession): Promise<WebSession>;
+}
+
 export interface SessionServiceOptions {
   validateTimeoutMs: number;
   /** Poll interval while waiting for status.validation. */
@@ -15,6 +29,7 @@ export interface SessionServiceOptions {
   sessionTtlMinutes?: number;
   sleep?: (ms: number) => Promise<void>;
   now?: () => number;
+  hooks?: SessionHooks;
 }
 
 /** Kubernetes label values: [a-z0-9A-Z._-], at most 63 characters, alphanumeric at both ends. */
@@ -38,6 +53,7 @@ export class SessionService {
   private readonly pollMs: number;
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly now: () => number;
+  hooks?: SessionHooks;
 
   constructor(
     private readonly content: Content,
@@ -48,6 +64,40 @@ export class SessionService {
     this.pollMs = opts.pollMs ?? 500;
     this.sleep = opts.sleep ?? defaultSleep;
     this.now = opts.now ?? Date.now;
+    if (opts.hooks) this.hooks = opts.hooks;
+  }
+
+  private async view(principal: Principal, ls: LabSession, lab: ContentLab): Promise<WebSession> {
+    const s = toWebSession(ls, lab.lab);
+    return this.hooks ? this.hooks.decorate(principal, s) : s;
+  }
+
+  /** Any session by name (instructor/admin paths; the caller authorizes). */
+  async find(id: string): Promise<{ ls: LabSession; lab: ContentLab | undefined } | null> {
+    const ls = await this.cluster.getSession(id);
+    if (!ls) return null;
+    return { ls, lab: this.content.labs.get(labIdOf(ls) ?? '') };
+  }
+
+  /** Moves the expiry `minutes` later than the current one (or now). */
+  async extend(id: string, minutes: number): Promise<LabSession> {
+    const ls = await this.cluster.getSession(id);
+    if (!ls) throw notFound('Session');
+    const current = Date.parse(ls.status?.expiresAt ?? ls.spec.expiresAt ?? '') || this.now();
+    const expiresAt = new Date(Math.max(current, this.now()) + minutes * 60_000).toISOString().replace(/\.\d{3}Z$/, 'Z');
+    return this.cluster.patchSession(id, { spec: { expiresAt } });
+  }
+
+  /** Asks the orchestrator to reset every node and rerun setup (spec.resetGeneration + 1). */
+  async reset(id: string): Promise<LabSession> {
+    const ls = await this.cluster.getSession(id);
+    if (!ls) throw notFound('Session');
+    return this.cluster.patchSession(id, { spec: { resetGeneration: (ls.spec.resetGeneration ?? 0) + 1 } });
+  }
+
+  /** Deletes any session (the orchestrator's finalizer tears it down). */
+  async terminate(id: string): Promise<void> {
+    await this.cluster.deleteSession(id);
   }
 
   private lab(labId: string): ContentLab {
@@ -80,6 +130,8 @@ export class SessionService {
 
   async start(principal: Principal, labId: string): Promise<WebSession> {
     const lab = this.lab(labId);
+    const gate = this.hooks ? await this.hooks.beforeStart(principal, lab) : {};
+    const ttl = gate.ttlMinutes ?? this.opts.sessionTtlMinutes;
     const templateName = await this.ensureTemplate(lab);
     const ls: LabSession = {
       apiVersion: LABS_API_VERSION,
@@ -97,16 +149,17 @@ export class SessionService {
         templateRef: { name: templateName },
         learner: { id: principal.sub, org: principal.orgId },
         seed: randomInt(1, 2 ** 31 - 1),
-        ...(this.opts.sessionTtlMinutes ? { ttl: `${this.opts.sessionTtlMinutes}m` } : {}),
+        ...(ttl ? { ttl: `${ttl}m` } : {}),
       },
     };
     const created = await this.cluster.createSession(ls);
+    await this.hooks?.started(principal, lab, created);
     return toWebSession(created, lab.lab);
   }
 
   async get(principal: Principal, id: string): Promise<WebSession> {
     const { ls, lab } = await this.owned(principal, id);
-    return toWebSession(ls, lab.lab);
+    return this.view(principal, ls, lab);
   }
 
   /** The caller's sessions (newest first), optionally for one lab. */
@@ -124,8 +177,9 @@ export class SessionService {
   }
 
   async end(principal: Principal, id: string): Promise<void> {
-    await this.owned(principal, id);
+    const { ls } = await this.owned(principal, id);
     await this.cluster.deleteSession(id);
+    await this.hooks?.ended(principal, id, ls);
   }
 
   async revealHint(principal: Principal, id: string, index: number): Promise<WebSession> {
@@ -183,6 +237,8 @@ export class SessionService {
     if (v.phase === 'Failed') {
       return { session, summary: { ...summary, skillsTouched: [] }, grading: { state: 'failed', message: v.message || 'Grading failed before any check ran.' } };
     }
-    return { session, summary, grading: { state: 'complete' } };
+    const res: ValidateResponse = { session, summary, grading: { state: 'complete' } };
+    await this.hooks?.validated(principal, lab, current, res);
+    return res;
   }
 }
