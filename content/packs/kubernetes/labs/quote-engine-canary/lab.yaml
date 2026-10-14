@@ -115,6 +115,7 @@ spec:
     - id: v2-ready
       description: quote-engine-v2 Pods run RELEASE=v2 and are all ready
       type: shell
+      timeoutSec: 30
       on: qm-dispatch
       skills: [k8s.delivery.deployment-strategies]
       command: |
@@ -125,18 +126,18 @@ spec:
     - id: share
       description: Exactly one in five ready endpoints of the Service is a v2 Pod
       type: shell
+      timeoutSec: 30
       on: qm-dispatch
       skills: [k8s.delivery.deployment-strategies]
       weight: 3
       command: |
-        eps=$(kubectl -n quote-pricing get endpointslices -l kubernetes.io/service-name=quote-engine -o jsonpath='{range .items[*].endpoints[?(@.conditions.ready==true)]}{.targetRef.name}{"\n"}{end}')
-        total=0; v2=0
-        for p in $eps; do
-          total=$((total+1))
-          r=$(kubectl -n quote-pricing get pod "$p" -o jsonpath='{.metadata.labels.release}' 2>/dev/null)
-          [ "$r" = v2 ] && v2=$((v2+1))
-        done
-        if [ "$v2" -gt 0 ] && [ $((v2*5)) -eq "$total" ]; then echo "share ok"; else echo "v2=$v2 of total=$total"; fi
+        kubectl -n quote-pricing get pods -l app=quote-engine -o json > /tmp/qe-pods.json
+        kubectl -n quote-pricing get endpointslices -l kubernetes.io/service-name=quote-engine -o json \
+          | jq -r --slurpfile pods /tmp/qe-pods.json '
+              ($pods[0].items | map({(.metadata.name): (.metadata.labels.release // "")}) | add // {}) as $rel
+              | [.items[].endpoints[]? | select(.conditions.ready == true) | $rel[.targetRef.name]] as $r
+              | ($r | length) as $t | ($r | map(select(. == "v2")) | length) as $v
+              | if $v > 0 and $v * 5 == $t then "share ok" else "v2=\($v) of total=\($t)" end'
       expect: {match: exact, value: share ok}
     - id: service-unchanged
       description: The Service quote-engine still selects app=quote-engine only
