@@ -1,0 +1,125 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xkd-job-completions
+  title: Run a Job to a fixed number of completions
+  domain: kubernetes
+  frameworks: [ckad:design-build]
+  difficulty: easy
+  estimatedMinutes: 5
+  tags: [exam, job]
+  version: 1
+spec:
+  description: |
+    **Context:** `qm-dispatch` (`kubectl config use-context qm-dispatch`)
+
+    In namespace `rate-feeds`, run a Job named **`rate-import`** that:
+
+    - completes successfully **6** times, with **2** Pods running at a time;
+    - has a backoff limit of **3**;
+    - runs container `import` with image `busybox:1.37` and the command
+      `/bin/sh -c "echo importing {{feed}} rates; sleep 2"`.
+
+    Let the Job finish.
+  objectives:
+    - Set completions, parallelism and backoffLimit on a Job
+  params:
+    feed:
+      type: choice
+      values: [road-freight, sea-freight, air-cargo]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-dispatch
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: qm-dispatch
+  setup:
+    - on: qm-dispatch
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: rate-feeds}
+  teardown:
+    - on: qm-dispatch
+      run: kubectl delete namespace rate-feeds --ignore-not-found --wait=false
+  checks:
+    - id: shape
+      description: rate-import has 6 completions, parallelism 2 and backoffLimit 3
+      type: k8s-query
+      skills: [k8s.workloads.jobs]
+      weight: 2
+      query: {cluster: qm-dispatch, resource: job, name: rate-import, namespace: rate-feeds, jsonpath: "{.spec.completions}/{.spec.parallelism}/{.spec.backoffLimit}"}
+      expect: {match: exact, value: "6/2/3"}
+    - id: container
+      description: Container import runs busybox:1.37 and imports {{feed}} rates
+      type: k8s-query
+      skills: [k8s.workloads.jobs]
+      query: {cluster: qm-dispatch, resource: job, name: rate-import, namespace: rate-feeds, jsonpath: '{.spec.template.spec.containers[?(@.name=="import")].image} {.spec.template.spec.containers[?(@.name=="import")].command}'}
+      expect: {match: regex, value: '^busybox:1\.37 .*importing {{feed}} rates'}
+    - id: complete
+      description: The Job completed with 6 successful Pods
+      type: k8s-query
+      skills: [k8s.workloads.jobs]
+      weight: 2
+      query: {cluster: qm-dispatch, resource: job, name: rate-import, namespace: rate-feeds, jsonpath: '{.status.conditions[?(@.type=="Complete")].status} {.status.succeeded}'}
+      expect: {match: exact, value: "True 6"}
+  misconceptions:
+    - id: parallel-six
+      description: Sets parallelism to 6 instead of completions.
+      feedback: "`parallelism` is how many run at once; `completions` is how many must succeed."
+      expectFail: [shape, complete]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl -n rate-feeds create job rate-import --image=busybox:1.37 --dry-run=client -o yaml -- /bin/sh -c "echo importing {{feed}} rates; sleep 2" \
+            | yq '.spec.parallelism = 6 | .spec.backoffLimit = 3 | .spec.template.spec.containers[0].name = "import"' | kubectl apply -f -
+          kubectl -n rate-feeds wait job/rate-import --for=condition=Complete --timeout=90s
+    - id: default-backoff
+      description: Leaves backoffLimit at its default of 6.
+      feedback: The task fixes the backoff limit at 3; the default allows six failures.
+      expectFail: [shape]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl -n rate-feeds create job rate-import --image=busybox:1.37 --dry-run=client -o yaml -- /bin/sh -c "echo importing {{feed}} rates; sleep 2" \
+            | yq '.spec.completions = 6 | .spec.parallelism = 2 | .spec.template.spec.containers[0].name = "import"' | kubectl apply -f -
+          kubectl -n rate-feeds wait job/rate-import --for=condition=Complete --timeout=90s
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl apply -f - <<'YAML'
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: rate-import
+            namespace: rate-feeds
+          spec:
+            completions: 6
+            parallelism: 2
+            backoffLimit: 3
+            template:
+              spec:
+                restartPolicy: Never
+                containers:
+                  - name: import
+                    image: busybox:1.37
+                    command: ["/bin/sh", "-c", "echo importing {{feed}} rates; sleep 2"]
+          YAML
+          kubectl -n rate-feeds wait job/rate-import --for=condition=Complete --timeout=120s

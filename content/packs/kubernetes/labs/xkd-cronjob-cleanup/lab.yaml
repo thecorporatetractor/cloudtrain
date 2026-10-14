@@ -1,0 +1,139 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xkd-cronjob-cleanup
+  title: Schedule a cleanup job
+  domain: kubernetes
+  frameworks: [ckad:design-build]
+  difficulty: easy
+  estimatedMinutes: 6
+  tags: [exam, cronjob]
+  version: 1
+spec:
+  description: |
+    **Context:** `qm-dispatch` (`kubectl config use-context qm-dispatch`)
+
+    In namespace `scratch-sweeper`, create a CronJob named **`{{name}}`**:
+
+    - it runs every **15 minutes** (at :00, :15, :30 and :45);
+    - container `purge` with image `busybox:1.37` runs the command
+      `/bin/sh -c "echo purge-tmp {{area}}"`;
+    - a new run never starts while the previous one is still running;
+    - it keeps **2** successful and **2** failed Jobs.
+  objectives:
+    - Write a CronJob with a step schedule, concurrency and history limits
+  params:
+    name:
+      type: choice
+      values: [purge-tmp, tmp-purge, scratch-purge]
+    area:
+      type: choice
+      values: [depot-north, depot-south, harbour]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-dispatch
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: qm-dispatch
+  setup:
+    - on: qm-dispatch
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: scratch-sweeper}
+  teardown:
+    - on: qm-dispatch
+      run: kubectl delete namespace scratch-sweeper --ignore-not-found --wait=false
+  checks:
+    - id: schedule
+      description: CronJob {{name}} runs every 15 minutes
+      type: k8s-query
+      skills: [k8s.workloads.jobs]
+      weight: 2
+      query: {cluster: qm-dispatch, resource: cronjob, name: "{{name}}", namespace: scratch-sweeper, jsonpath: "{.spec.schedule}"}
+      expect: {match: regex, value: '^\s*(\*/15|0,15,30,45|0-59/15)\s+\*\s+\*\s+\*\s+\*\s*$'}
+    - id: container
+      description: Container purge runs busybox:1.37 with the purge-tmp command
+      type: k8s-query
+      skills: [k8s.workloads.jobs]
+      query: {cluster: qm-dispatch, resource: cronjob, name: "{{name}}", namespace: scratch-sweeper, jsonpath: '{.spec.jobTemplate.spec.template.spec.containers[?(@.name=="purge")].image} {.spec.jobTemplate.spec.template.spec.containers[?(@.name=="purge")].command}'}
+      expect: {match: regex, value: '^busybox:1\.37 .*purge-tmp {{area}}'}
+    - id: forbid
+      description: Concurrent runs are forbidden
+      type: k8s-query
+      skills: [k8s.workloads.jobs]
+      query: {cluster: qm-dispatch, resource: cronjob, name: "{{name}}", namespace: scratch-sweeper, jsonpath: "{.spec.concurrencyPolicy}"}
+      expect: {match: exact, value: Forbid}
+    - id: history
+      description: Keeps 2 successful and 2 failed Jobs
+      type: k8s-query
+      skills: [k8s.workloads.jobs]
+      query: {cluster: qm-dispatch, resource: cronjob, name: "{{name}}", namespace: scratch-sweeper, jsonpath: "{.spec.successfulJobsHistoryLimit}/{.spec.failedJobsHistoryLimit}"}
+      expect: {match: exact, value: "2/2"}
+  misconceptions:
+    - id: minute-15
+      description: Writes "15 * * * *", which runs once an hour at quarter past.
+      feedback: A plain number in the minute field is a fixed minute. Every 15 minutes is `*/15`.
+      expectFail: [schedule]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl -n scratch-sweeper create cronjob {{name}} --image=busybox:1.37 --schedule="15 * * * *" -- /bin/sh -c "echo purge-tmp {{area}}"
+    - id: replace-policy
+      description: Uses concurrencyPolicy Replace, which kills a running purge to start the next one.
+      feedback: Replace cancels the running Job; Forbid skips the new run instead.
+      expectFail: [forbid]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl -n scratch-sweeper create cronjob {{name}} --image=busybox:1.37 --schedule="*/15 * * * *" -- /bin/sh -c "echo purge-tmp {{area}}"
+          kubectl -n scratch-sweeper patch cronjob {{name}} -p '{"spec":{"concurrencyPolicy":"Replace","successfulJobsHistoryLimit":2,"failedJobsHistoryLimit":2}}'
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl apply -f - <<'YAML'
+          apiVersion: batch/v1
+          kind: CronJob
+          metadata:
+            name: {{name}}
+            namespace: scratch-sweeper
+          spec:
+            schedule: "*/15 * * * *"
+            concurrencyPolicy: Forbid
+            successfulJobsHistoryLimit: 2
+            failedJobsHistoryLimit: 2
+            jobTemplate:
+              spec:
+                template:
+                  spec:
+                    restartPolicy: OnFailure
+                    containers:
+                      - name: purge
+                        image: busybox:1.37
+                        command: ["/bin/sh", "-c", "echo purge-tmp {{area}}"]
+          YAML
+    alternatives:
+      - id: create-and-patch
+        description: kubectl create cronjob, then a merge patch for the policies and the container name.
+        steps:
+          - on: workstation
+            as: learner
+            run: |
+              kubectl config use-context qm-dispatch
+              kubectl -n scratch-sweeper create cronjob {{name}} --image=busybox:1.37 --schedule="0,15,30,45 * * * *" --dry-run=client -o yaml -- /bin/sh -c "echo purge-tmp {{area}}" \
+                | yq '.spec.concurrencyPolicy = "Forbid" | .spec.successfulJobsHistoryLimit = 2 | .spec.failedJobsHistoryLimit = 2 | .spec.jobTemplate.spec.template.spec.containers[0].name = "purge"' \
+                | kubectl apply -f -

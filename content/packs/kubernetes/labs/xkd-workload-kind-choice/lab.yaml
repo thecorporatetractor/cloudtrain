@@ -1,0 +1,178 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xkd-workload-kind-choice
+  title: Pick the right workload resource
+  domain: kubernetes
+  frameworks: [ckad:design-build]
+  difficulty: medium
+  estimatedMinutes: 7
+  tags: [exam, daemonset]
+  version: 1
+spec:
+  description: |
+    **Context:** `qm-yard` (`kubectl config use-context qm-yard`)
+
+    In namespace `node-cache`, the Deployment **`{{name}}`** runs a local
+    cache that must exist **exactly once on every worker node**; as a
+    Deployment it can end up with two copies on one worker and none on
+    another.
+
+    Replace it with a **DaemonSet** named **`{{name}}`** that uses the same
+    Pod template (labels, container, image, command), so that exactly one
+    Pod runs on each worker node and none on the control plane. Remove the
+    Deployment.
+  objectives:
+    - Choose a DaemonSet for per-node workloads and convert a Deployment
+  params:
+    name:
+      type: choice
+      values: [node-cache, image-cache, dns-cache]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-yard
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-yard
+          nodes:
+            - {name: yard-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: yard-wk-1, role: worker}
+            - {name: yard-wk-2, role: worker}
+  setup:
+    - on: qm-yard
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: node-cache}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: "{{name}}", namespace: node-cache}
+        spec:
+          replicas: 2
+          selector: {matchLabels: {app: "{{name}}"}}
+          template:
+            metadata: {labels: {app: "{{name}}", tier: node-local}}
+            spec:
+              terminationGracePeriodSeconds: 2
+              containers:
+                - name: cache
+                  image: redis:7.4-alpine
+                  command: ["redis-server", "--save", "", "--maxmemory", "32mb"]
+    - on: qm-yard
+      timeoutSec: 150
+      run: kubectl -n node-cache rollout status deploy/{{name}} --timeout=140s
+  teardown:
+    - on: qm-yard
+      run: kubectl delete namespace node-cache --ignore-not-found --wait=false
+  checks:
+    - id: daemonset
+      description: DaemonSet {{name}} runs one ready Pod per worker (2)
+      type: k8s-query
+      skills: [k8s.workloads.daemonsets]
+      weight: 2
+      query: {cluster: qm-yard, resource: daemonset, name: "{{name}}", namespace: node-cache, jsonpath: "{.status.desiredNumberScheduled}/{.status.numberReady}"}
+      expect: {match: exact, value: "2/2"}
+    - id: placement
+      description: The Pods run on yard-wk-1 and yard-wk-2, one each
+      type: shell
+      on: qm-yard
+      skills: [k8s.workloads.daemonsets]
+      command: |
+        kubectl -n node-cache get pods -l app={{name}} -o json | jq -r '[.items[] | select(.metadata.deletionTimestamp == null) | .spec.nodeName] | sort | join(",")'
+      expect: {match: exact, value: "yard-wk-1,yard-wk-2"}
+    - id: same-template
+      description: The DaemonSet keeps the Pod labels, container, image and command
+      type: k8s-query
+      skills: [k8s.workloads.daemonsets]
+      query: {cluster: qm-yard, resource: daemonset, name: "{{name}}", namespace: node-cache, jsonpath: '{.spec.template.metadata.labels.app}/{.spec.template.metadata.labels.tier} {.spec.template.spec.containers[0].name} {.spec.template.spec.containers[0].image} {.spec.template.spec.containers[0].command}'}
+      expect: {match: exact, value: '{{name}}/node-local cache redis:7.4-alpine ["redis-server","--save","","--maxmemory","32mb"]'}
+    - id: deployment-gone
+      description: The Deployment {{name}} is gone
+      type: shell
+      on: qm-yard
+      skills: [k8s.workloads.daemonsets]
+      weight: 0.5
+      command: kubectl -n node-cache get deployment {{name}} -o name 2>/dev/null || echo gone
+      expect: {match: exact, value: gone}
+  misconceptions:
+    - id: tolerate-control-plane
+      description: Adds a toleration for the control-plane taint, so a cache Pod also lands on yard-cp-1.
+      feedback: DaemonSets respect taints. Without a toleration they stay off the control plane, which is what the task wants.
+      expectFail: [daemonset, placement]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 180
+        run: |
+          kubectl config use-context qm-yard
+          kubectl -n node-cache get deploy {{name}} -o yaml \
+            | yq 'del(.status) | del(.metadata.uid) | del(.metadata.resourceVersion) | del(.metadata.creationTimestamp) | del(.metadata.managedFields) | del(.metadata.annotations) | del(.metadata.generation)
+                  | .kind = "DaemonSet" | del(.spec.replicas) | del(.spec.strategy) | del(.spec.progressDeadlineSeconds)
+                  | .spec.template.spec.tolerations = [{"key": "node-role.kubernetes.io/control-plane", "operator": "Exists", "effect": "NoSchedule"}]' > ds.yaml
+          kubectl -n node-cache delete deploy {{name}}
+          kubectl apply -f ds.yaml
+          kubectl -n node-cache rollout status ds/{{name}} --timeout=150s
+    - id: anti-affinity-deployment
+      description: Keeps the Deployment and adds Pod anti-affinity; a new worker would get no cache and a scaled-up Deployment would leave Pods Pending.
+      feedback: Anti-affinity spreads replicas but does not follow the node list. A DaemonSet does.
+      expectFail: [daemonset, deployment-gone]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 180
+        run: |
+          kubectl config use-context qm-yard
+          kubectl -n node-cache patch deploy {{name}} -p '{"spec":{"template":{"spec":{"affinity":{"podAntiAffinity":{"requiredDuringSchedulingIgnoredDuringExecution":[{"labelSelector":{"matchLabels":{"app":"{{name}}"}},"topologyKey":"kubernetes.io/hostname"}]}}}}}}'
+          kubectl -n node-cache rollout status deploy/{{name}} --timeout=150s
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 200
+        run: |
+          kubectl config use-context qm-yard
+          kubectl -n node-cache delete deployment {{name}}
+          kubectl apply -f - <<'YAML'
+          apiVersion: apps/v1
+          kind: DaemonSet
+          metadata:
+            name: {{name}}
+            namespace: node-cache
+          spec:
+            selector:
+              matchLabels: {app: {{name}}}
+            template:
+              metadata:
+                labels: {app: {{name}}, tier: node-local}
+              spec:
+                terminationGracePeriodSeconds: 2
+                containers:
+                  - name: cache
+                    image: redis:7.4-alpine
+                    command: ["redis-server", "--save", "", "--maxmemory", "32mb"]
+          YAML
+          kubectl -n node-cache rollout status daemonset/{{name}} --timeout=150s
+    alternatives:
+      - id: convert-with-yq
+        description: Convert the live Deployment with yq.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 200
+            run: |
+              kubectl config use-context qm-yard
+              kubectl -n node-cache get deploy {{name}} -o yaml \
+                | yq 'del(.status) | del(.metadata.uid) | del(.metadata.resourceVersion) | del(.metadata.creationTimestamp) | del(.metadata.managedFields) | del(.metadata.annotations) | del(.metadata.generation)
+                      | .kind = "DaemonSet" | del(.spec.replicas) | del(.spec.strategy) | del(.spec.progressDeadlineSeconds)' > ds.yaml
+              kubectl -n node-cache delete deploy {{name}}
+              kubectl apply -f ds.yaml
+              kubectl -n node-cache rollout status ds/{{name}} --timeout=150s

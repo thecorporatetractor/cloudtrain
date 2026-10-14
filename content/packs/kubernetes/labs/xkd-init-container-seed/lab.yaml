@@ -1,0 +1,204 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xkd-init-container-seed
+  title: Seed data with an init container
+  domain: kubernetes
+  frameworks: [ckad:design-build]
+  difficulty: medium
+  estimatedMinutes: 7
+  tags: [exam, init-containers, emptydir]
+  version: 1
+spec:
+  description: |
+    **Context:** `qm-dispatch` (`kubectl config use-context qm-dispatch`)
+
+    In namespace `timetable-web`, the Pod **`timetable`** serves the
+    directory `/www` on port 8080, but the directory is empty.
+
+    Change the Pod so that an **init container** named **`seed`** (image
+    `busybox:1.37`) writes the line `{{line}}` to `/www/index.html` before the
+    container `web` starts. Use an `emptyDir` volume shared by both
+    containers and mounted at `/www`. Keep the Pod's name, namespace and the
+    `web` container's image and command.
+  objectives:
+    - Use an init container to prepare data for the main container
+    - Share an emptyDir volume between containers
+  params:
+    line:
+      type: choice
+      values: ["harbour departures 06:10", "yard shuttle every 20 min", "north depot opens 05:30"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-dispatch
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: qm-dispatch
+  setup:
+    - on: qm-dispatch
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: timetable-web}
+        ---
+        apiVersion: v1
+        kind: Pod
+        metadata: {name: timetable, namespace: timetable-web, labels: {app: timetable}}
+        spec:
+          terminationGracePeriodSeconds: 2
+          containers:
+            - name: web
+              image: busybox:1.37
+              command: ["httpd", "-f", "-p", "8080", "-h", "/www"]
+              ports: [{name: http, containerPort: 8080}]
+    - on: qm-dispatch
+      timeoutSec: 90
+      run: kubectl -n timetable-web wait pod/timetable --for=condition=Ready --timeout=80s
+  teardown:
+    - on: qm-dispatch
+      run: kubectl delete namespace timetable-web --ignore-not-found --wait=false
+  checks:
+    - id: init-seed
+      description: Pod timetable has init container seed
+      type: k8s-query
+      skills: [k8s.workloads.native-sidecars]
+      query: {cluster: qm-dispatch, resource: pod, name: timetable, namespace: timetable-web, jsonpath: "{.spec.initContainers[*].name}"}
+      expect: {match: exact, value: seed}
+    - id: shared-emptydir
+      description: seed and web mount the same emptyDir volume at /www
+      type: shell
+      on: qm-dispatch
+      skills: [k8s.storage.ephemeral-volumes]
+      command: |
+        j=$(kubectl -n timetable-web get pod timetable -o json 2>/dev/null) || { echo missing; exit 0; }
+        echo "$j" | jq -r '
+          (.spec.initContainers // [] | map(select(.name == "seed"))[0].volumeMounts // [] | map(select(.mountPath == "/www"))[0].name) as $a
+          | (.spec.containers | map(select(.name == "web"))[0].volumeMounts // [] | map(select(.mountPath == "/www"))[0].name) as $b
+          | if $a != null and $a == $b and ([.spec.volumes[] | select(.name == $a and .emptyDir != null)] | length) == 1 then "shared" else "not shared" end'
+      expect: {match: exact, value: shared}
+    - id: serves-seed
+      description: web is running and serves the seeded line
+      type: shell
+      on: qm-dispatch
+      skills: [k8s.workloads.native-sidecars]
+      weight: 2
+      timeoutSec: 20
+      command: kubectl -n timetable-web exec timetable -c web -- wget -qO- -T 3 http://127.0.0.1:8080/ 2>/dev/null || echo "no answer"
+      expect: {match: exact, value: "{{line}}"}
+    - id: web-unchanged
+      description: The web container keeps its image and command
+      type: k8s-query
+      skills: [k8s.workloads.native-sidecars]
+      weight: 0.5
+      query: {cluster: qm-dispatch, resource: pod, name: timetable, namespace: timetable-web, jsonpath: '{.spec.containers[?(@.name=="web")].image} {.spec.containers[?(@.name=="web")].command}'}
+      expect: {match: exact, value: 'busybox:1.37 ["httpd","-f","-p","8080","-h","/www"]'}
+  misconceptions:
+    - id: seed-as-app-container
+      description: Adds seed as a second app container, so nothing guarantees it runs before web and the Pod keeps restarting it after it exits.
+      feedback: Only init containers run to completion before the app containers start.
+      expectFail: [init-seed]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl -n timetable-web delete pod timetable --wait=true
+          kubectl apply -f - <<'YAML'
+          apiVersion: v1
+          kind: Pod
+          metadata: {name: timetable, namespace: timetable-web, labels: {app: timetable}}
+          spec:
+            containers:
+              - name: web
+                image: busybox:1.37
+                command: ["httpd", "-f", "-p", "8080", "-h", "/www"]
+                volumeMounts: [{name: www, mountPath: /www}]
+              - name: seed
+                image: busybox:1.37
+                command: ["sh", "-c", "echo '{{line}}' > /www/index.html; sleep 3600"]
+                volumeMounts: [{name: www, mountPath: /www}]
+            volumes:
+              - {name: www, emptyDir: {}}
+          YAML
+          kubectl -n timetable-web wait pod/timetable --for=condition=Ready --timeout=90s
+    - id: no-shared-volume
+      description: Lets the init container write to its own filesystem, which web never sees.
+      feedback: Every container has its own root filesystem. Only a volume mounted in both is shared.
+      expectFail: [shared-emptydir, serves-seed]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl -n timetable-web delete pod timetable --wait=true
+          kubectl apply -f - <<'YAML'
+          apiVersion: v1
+          kind: Pod
+          metadata: {name: timetable, namespace: timetable-web, labels: {app: timetable}}
+          spec:
+            initContainers:
+              - name: seed
+                image: busybox:1.37
+                command: ["sh", "-c", "mkdir -p /www && echo '{{line}}' > /www/index.html"]
+            containers:
+              - name: web
+                image: busybox:1.37
+                command: ["httpd", "-f", "-p", "8080", "-h", "/www"]
+          YAML
+          kubectl -n timetable-web wait pod/timetable --for=condition=Ready --timeout=90s
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl -n timetable-web delete pod timetable --wait=true
+          kubectl apply -f - <<'YAML'
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: timetable
+            namespace: timetable-web
+            labels: {app: timetable}
+          spec:
+            initContainers:
+              - name: seed
+                image: busybox:1.37
+                command: ["sh", "-c", "echo '{{line}}' > /www/index.html"]
+                volumeMounts: [{name: www, mountPath: /www}]
+            containers:
+              - name: web
+                image: busybox:1.37
+                command: ["httpd", "-f", "-p", "8080", "-h", "/www"]
+                ports: [{name: http, containerPort: 8080}]
+                volumeMounts: [{name: www, mountPath: /www}]
+            volumes:
+              - name: www
+                emptyDir: {}
+          YAML
+          kubectl -n timetable-web wait pod/timetable --for=condition=Ready --timeout=120s
+    alternatives:
+      - id: replace-force-with-yq
+        description: Edit the exported Pod with yq and replace it in one step.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 150
+            run: |
+              kubectl config use-context qm-dispatch
+              kubectl -n timetable-web get pod timetable -o yaml \
+                | yq '.spec.volumes += [{"name": "seed-data", "emptyDir": {}}]
+                      | .spec.containers[0].volumeMounts += [{"name": "seed-data", "mountPath": "/www"}]
+                      | .spec.initContainers = [{"name": "seed", "image": "busybox:1.37", "command": ["sh", "-c", "printf \"%s\\n\" \"{{line}}\" > /www/index.html"], "volumeMounts": [{"name": "seed-data", "mountPath": "/www"}]}]' \
+                | kubectl replace --force -f -
+              kubectl -n timetable-web wait pod/timetable --for=condition=Ready --timeout=120s
