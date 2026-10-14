@@ -1,0 +1,517 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: tariff-cache-statefulset
+  title: Run the tariff cache as a StatefulSet with stable storage
+  domain: kubernetes
+  frameworks: [cka:workloads-scheduling, ckad:design-build]
+  difficulty: medium
+  estimatedMinutes: 18
+  tags: [statefulset, headless-service, persistent-volumes]
+  version: 1
+spec:
+  description: |
+    The tariff cache answers rate lookups for every quote Quillmoor sends.
+    It runs as a single-replica Deployment on an `emptyDir`, so each restart
+    empties the cache and the quote engine stalls while it warms up again.
+    The capacity team wants three cache members, each with its own disk and a
+    stable network identity.
+
+    From your workstation, switch to context `qm-capacity` first:
+
+    ```bash
+    kubectl config use-context qm-capacity
+    ```
+
+    In namespace `tariff-cache`:
+
+    1. Create a **headless** Service named **`{{peers}}`** on port 6379 that
+       selects the cache Pods.
+    2. Replace the Deployment `tariff-cache` with a **StatefulSet** named
+       **`tariff-cache`** governed by that Service: **3** replicas, container
+       `redis` with image `redis:7.4-alpine`, and the same Pod labels as today.
+    3. Give every replica its **own** 1Gi `ReadWriteOnce` claim named `data`
+       (so the claims are `data-tariff-cache-0` .. `-2`), mounted at `/data`.
+       The cluster has no dynamic provisioner: the platform team pre-created
+       local volumes in the StorageClass **`{{storageClass}}`**.
+    4. The claims must **outlive** the Pods and the StatefulSet itself (do not
+       let Kubernetes delete them automatically).
+    5. Delete the old Deployment. Keep the existing ClusterIP Service
+       `tariff-cache` that the quote engine uses.
+  objectives:
+    - Explain why a StatefulSet needs a headless governing Service
+    - Use volumeClaimTemplates to give each replica its own claim
+    - Bind claims to pre-provisioned volumes through a StorageClass
+    - Control claim retention for a StatefulSet
+  params:
+    peers:
+      type: choice
+      values: [tariff-cache-peers, tariff-cache-hl, tariff-members]
+    storageClass:
+      type: choice
+      values: [tariff-local, capacity-local-ssd]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-capacity
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-capacity
+          nodes:
+            - {name: capacity-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: capacity-wk-1, role: worker}
+            - {name: capacity-wk-2, role: worker}
+  setup:
+    - on: qm-capacity
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: tariff-cache}
+        ---
+        apiVersion: storage.k8s.io/v1
+        kind: StorageClass
+        metadata: {name: "{{storageClass}}"}
+        provisioner: kubernetes.io/no-provisioner
+        volumeBindingMode: WaitForFirstConsumer
+        reclaimPolicy: Retain
+        ---
+        apiVersion: v1
+        kind: PersistentVolume
+        metadata: {name: tariff-vol-a, labels: {quillmoor.example/pool: tariff}}
+        spec:
+          capacity: {storage: 1Gi}
+          accessModes: [ReadWriteOnce]
+          persistentVolumeReclaimPolicy: Retain
+          storageClassName: "{{storageClass}}"
+          hostPath: {path: /srv/tariff/vol-a, type: DirectoryOrCreate}
+          nodeAffinity:
+            required:
+              nodeSelectorTerms:
+                - matchExpressions: [{key: kubernetes.io/hostname, operator: In, values: [capacity-wk-1]}]
+        ---
+        apiVersion: v1
+        kind: PersistentVolume
+        metadata: {name: tariff-vol-b, labels: {quillmoor.example/pool: tariff}}
+        spec:
+          capacity: {storage: 1Gi}
+          accessModes: [ReadWriteOnce]
+          persistentVolumeReclaimPolicy: Retain
+          storageClassName: "{{storageClass}}"
+          hostPath: {path: /srv/tariff/vol-b, type: DirectoryOrCreate}
+          nodeAffinity:
+            required:
+              nodeSelectorTerms:
+                - matchExpressions: [{key: kubernetes.io/hostname, operator: In, values: [capacity-wk-2]}]
+        ---
+        apiVersion: v1
+        kind: PersistentVolume
+        metadata: {name: tariff-vol-c, labels: {quillmoor.example/pool: tariff}}
+        spec:
+          capacity: {storage: 1Gi}
+          accessModes: [ReadWriteOnce]
+          persistentVolumeReclaimPolicy: Retain
+          storageClassName: "{{storageClass}}"
+          hostPath: {path: /srv/tariff/vol-c, type: DirectoryOrCreate}
+          nodeAffinity:
+            required:
+              nodeSelectorTerms:
+                - matchExpressions: [{key: kubernetes.io/hostname, operator: In, values: [capacity-wk-1, capacity-wk-2]}]
+        ---
+        apiVersion: v1
+        kind: PersistentVolume
+        metadata: {name: tariff-vol-d, labels: {quillmoor.example/pool: tariff}}
+        spec:
+          capacity: {storage: 1Gi}
+          accessModes: [ReadWriteOnce]
+          persistentVolumeReclaimPolicy: Retain
+          storageClassName: "{{storageClass}}"
+          hostPath: {path: /srv/tariff/vol-d, type: DirectoryOrCreate}
+          nodeAffinity:
+            required:
+              nodeSelectorTerms:
+                - matchExpressions: [{key: kubernetes.io/hostname, operator: In, values: [capacity-wk-1, capacity-wk-2]}]
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: tariff-cache, namespace: tariff-cache}
+        spec:
+          replicas: 1
+          selector: {matchLabels: {app: tariff-cache}}
+          template:
+            metadata: {labels: {app: tariff-cache, tier: cache}}
+            spec:
+              containers:
+                - name: redis
+                  image: redis:7.4-alpine
+                  ports: [{name: redis, containerPort: 6379}]
+                  volumeMounts: [{name: data, mountPath: /data}]
+              volumes:
+                - name: data
+                  emptyDir: {}
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata: {name: tariff-cache, namespace: tariff-cache}
+        spec:
+          selector: {app: tariff-cache}
+          ports: [{name: redis, port: 6379, targetPort: 6379}]
+    - on: qm-capacity
+      timeoutSec: 150
+      run: kubectl -n tariff-cache rollout status deploy/tariff-cache --timeout=140s
+  teardown:
+    - on: qm-capacity
+      run: |
+        kubectl delete namespace tariff-cache --ignore-not-found --wait=false
+        kubectl delete pv -l quillmoor.example/pool=tariff --ignore-not-found --wait=false
+        kubectl delete storageclass {{storageClass}} --ignore-not-found
+  checks:
+    - id: context
+      description: Terminal is using context qm-capacity
+      type: k8s-context
+      on: workstation
+      skills: [k8s.cli.contexts]
+      weight: 0.5
+      expect: {match: exact, value: qm-capacity}
+    - id: headless
+      description: Service {{peers}} is headless and exposes 6379
+      type: k8s-query
+      skills: [k8s.workloads.statefulsets]
+      query: {cluster: qm-capacity, resource: service, name: "{{peers}}", namespace: tariff-cache, jsonpath: "{.spec.clusterIP} {.spec.ports[*].port}"}
+      expect: {match: exact, value: "None 6379"}
+    - id: governed
+      description: StatefulSet tariff-cache is governed by {{peers}} with 3 replicas
+      type: k8s-query
+      skills: [k8s.workloads.statefulsets]
+      query: {cluster: qm-capacity, resource: statefulset, name: tariff-cache, namespace: tariff-cache, jsonpath: "{.spec.serviceName} {.spec.replicas}"}
+      expect: {match: exact, value: "{{peers}} 3"}
+    - id: ready
+      description: All 3 members are ready and the peers Service has 3 endpoints
+      type: shell
+      on: qm-capacity
+      skills: [k8s.workloads.statefulsets]
+      weight: 2
+      command: |
+        r=$(kubectl -n tariff-cache get sts tariff-cache -o jsonpath='{.status.readyReplicas}' 2>/dev/null)
+        e=$(kubectl -n tariff-cache get endpointslices -l kubernetes.io/service-name={{peers}} -o jsonpath='{range .items[*].endpoints[*]}{.targetRef.name}{"\n"}{end}' 2>/dev/null | grep -c '^tariff-cache-[0-2]$')
+        echo "ready=${r:-0} endpoints=$e"
+      expect: {match: exact, value: "ready=3 endpoints=3"}
+    - id: claims
+      description: Claims data-tariff-cache-0..2 are Bound, 1Gi, ReadWriteOnce, class {{storageClass}}
+      type: shell
+      on: qm-capacity
+      skills: [k8s.storage.claims]
+      weight: 2
+      command: |
+        for i in 0 1 2; do
+          kubectl -n tariff-cache get pvc data-tariff-cache-$i -o jsonpath='{.status.phase}/{.spec.resources.requests.storage}/{.spec.accessModes[0]}/{.spec.storageClassName};' 2>/dev/null || printf 'missing;'
+        done
+      expect: {match: exact, value: "Bound/1Gi/ReadWriteOnce/{{storageClass}};Bound/1Gi/ReadWriteOnce/{{storageClass}};Bound/1Gi/ReadWriteOnce/{{storageClass}};"}
+    - id: per-pod-claim
+      description: Each member mounts its own claim at /data
+      type: shell
+      on: qm-capacity
+      skills: [k8s.storage.claims, k8s.workloads.statefulsets]
+      command: |
+        for i in 0 1 2; do
+          p=tariff-cache-$i
+          v=$(kubectl -n tariff-cache get pod $p -o jsonpath='{.spec.containers[?(@.name=="redis")].volumeMounts[?(@.mountPath=="/data")].name}' 2>/dev/null)
+          c=$(kubectl -n tariff-cache get pod $p -o jsonpath="{.spec.volumes[?(@.name==\"$v\")].persistentVolumeClaim.claimName}" 2>/dev/null)
+          printf '%s=%s;' "$p" "${c:-none}"
+        done
+      expect: {match: exact, value: "tariff-cache-0=data-tariff-cache-0;tariff-cache-1=data-tariff-cache-1;tariff-cache-2=data-tariff-cache-2;"}
+    - id: claims-retained
+      description: Claims are retained when Pods or the StatefulSet are deleted
+      type: k8s-query
+      skills: [k8s.workloads.statefulsets]
+      weight: 0.5
+      query: {cluster: qm-capacity, resource: statefulset, name: tariff-cache, namespace: tariff-cache, jsonpath: "{.spec.persistentVolumeClaimRetentionPolicy.whenDeleted}/{.spec.persistentVolumeClaimRetentionPolicy.whenScaled}"}
+      expect: {match: exact, value: "Retain/Retain"}
+    - id: deployment-gone
+      description: The old Deployment is gone and the client Service tariff-cache still exists
+      type: shell
+      on: qm-capacity
+      skills: [k8s.cli.scoped-changes]
+      weight: 0.5
+      command: |
+        d=$(kubectl -n tariff-cache get deploy tariff-cache -o name 2>/dev/null)
+        s=$(kubectl -n tariff-cache get svc tariff-cache -o jsonpath='{.spec.clusterIP}' 2>/dev/null)
+        [ -z "$d" ] && [ -n "$s" ] && [ "$s" != None ] && echo ok || echo "deployment='$d' service-ip='$s'"
+      expect: {match: exact, value: ok}
+  hints:
+    - title: Switch context
+      body: The cache runs on the capacity-planning cluster.
+      command: kubectl config use-context qm-capacity
+      cost: 0
+    - title: Headless means no virtual IP
+      body: "A Service with `clusterIP: None` gives each StatefulSet member a DNS name `<pod>.<service>`. The StatefulSet names it in `spec.serviceName`."
+      cost: 1
+    - title: One claim per replica
+      body: |
+        A `volumes:` entry that points at one PVC is shared by every replica.
+        `volumeClaimTemplates` creates `<template>-<statefulset>-<ordinal>` per
+        member instead. Look at the volumes waiting for you.
+      command: kubectl get storageclass,pv
+      cost: 2
+    - title: Start from the Deployment
+      body: Export the Deployment, change the kind, add serviceName and volumeClaimTemplates, and drop the emptyDir volume and the strategy.
+      command: kubectl -n tariff-cache get deploy tariff-cache -o yaml > sts.yaml
+      cost: 1
+  misconceptions:
+    - id: shared-claim
+      description: Creates one PVC and references it from the Pod template, so all members share (and fight over) a single RWO volume.
+      feedback: A Pod-template volume is the same for every replica. Use `volumeClaimTemplates` so each member gets its own claim.
+      expectFail: [claims, per-pod-claim]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          kubectl config use-context qm-capacity
+          kubectl -n tariff-cache delete deploy tariff-cache
+          kubectl apply -f - <<'YAML'
+          apiVersion: v1
+          kind: Service
+          metadata: {name: "{{peers}}", namespace: tariff-cache}
+          spec:
+            clusterIP: None
+            selector: {app: tariff-cache}
+            ports: [{name: redis, port: 6379}]
+          ---
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata: {name: data, namespace: tariff-cache}
+          spec:
+            accessModes: [ReadWriteOnce]
+            storageClassName: "{{storageClass}}"
+            resources: {requests: {storage: 1Gi}}
+          ---
+          apiVersion: apps/v1
+          kind: StatefulSet
+          metadata: {name: tariff-cache, namespace: tariff-cache}
+          spec:
+            serviceName: "{{peers}}"
+            replicas: 3
+            selector: {matchLabels: {app: tariff-cache}}
+            template:
+              metadata: {labels: {app: tariff-cache, tier: cache}}
+              spec:
+                containers:
+                  - name: redis
+                    image: redis:7.4-alpine
+                    ports: [{name: redis, containerPort: 6379}]
+                    volumeMounts: [{name: data, mountPath: /data}]
+                volumes:
+                  - name: data
+                    persistentVolumeClaim: {claimName: data}
+          YAML
+          sleep 30
+    - id: clusterip-governing
+      description: Points serviceName at an ordinary ClusterIP Service, so the members get no per-Pod DNS records.
+      feedback: Per-member DNS names only exist behind a headless Service (`clusterIP None`).
+      expectFail: [headless]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 200
+        run: |
+          kubectl config use-context qm-capacity
+          kubectl -n tariff-cache delete deploy tariff-cache
+          kubectl apply -f - <<'YAML'
+          apiVersion: v1
+          kind: Service
+          metadata: {name: "{{peers}}", namespace: tariff-cache}
+          spec:
+            selector: {app: tariff-cache}
+            ports: [{name: redis, port: 6379}]
+          ---
+          apiVersion: apps/v1
+          kind: StatefulSet
+          metadata: {name: tariff-cache, namespace: tariff-cache}
+          spec:
+            serviceName: "{{peers}}"
+            replicas: 3
+            selector: {matchLabels: {app: tariff-cache}}
+            template:
+              metadata: {labels: {app: tariff-cache, tier: cache}}
+              spec:
+                containers:
+                  - name: redis
+                    image: redis:7.4-alpine
+                    ports: [{name: redis, containerPort: 6379}]
+                    volumeMounts: [{name: data, mountPath: /data}]
+            volumeClaimTemplates:
+              - metadata: {name: data}
+                spec:
+                  accessModes: [ReadWriteOnce]
+                  storageClassName: "{{storageClass}}"
+                  resources: {requests: {storage: 1Gi}}
+          YAML
+          kubectl -n tariff-cache rollout status sts/tariff-cache --timeout=180s
+    - id: delete-claims
+      description: Sets the claim retention policy to Delete, so removing the StatefulSet throws the cached data away.
+      feedback: "`persistentVolumeClaimRetentionPolicy` defaults to Retain for both cases; Delete removes the claims with the Pods' owner."
+      expectFail: [claims-retained]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 200
+        run: |
+          kubectl config use-context qm-capacity
+          kubectl -n tariff-cache delete deploy tariff-cache
+          kubectl apply -f - <<'YAML'
+          apiVersion: v1
+          kind: Service
+          metadata: {name: "{{peers}}", namespace: tariff-cache}
+          spec:
+            clusterIP: None
+            selector: {app: tariff-cache}
+            ports: [{name: redis, port: 6379}]
+          ---
+          apiVersion: apps/v1
+          kind: StatefulSet
+          metadata: {name: tariff-cache, namespace: tariff-cache}
+          spec:
+            serviceName: "{{peers}}"
+            replicas: 3
+            persistentVolumeClaimRetentionPolicy: {whenDeleted: Delete, whenScaled: Retain}
+            selector: {matchLabels: {app: tariff-cache}}
+            template:
+              metadata: {labels: {app: tariff-cache, tier: cache}}
+              spec:
+                containers:
+                  - name: redis
+                    image: redis:7.4-alpine
+                    ports: [{name: redis, containerPort: 6379}]
+                    volumeMounts: [{name: data, mountPath: /data}]
+            volumeClaimTemplates:
+              - metadata: {name: data}
+                spec:
+                  accessModes: [ReadWriteOnce]
+                  storageClassName: "{{storageClass}}"
+                  resources: {requests: {storage: 1Gi}}
+          YAML
+          kubectl -n tariff-cache rollout status sts/tariff-cache --timeout=180s
+    - id: no-storage-class
+      description: Leaves out storageClassName; with no default class and no provisioner the claims stay Pending.
+      feedback: Pre-created volumes are only matched within their StorageClass. Name it in the claim template.
+      expectFail: [claims, ready]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          kubectl config use-context qm-capacity
+          kubectl -n tariff-cache delete deploy tariff-cache
+          kubectl apply -f - <<'YAML'
+          apiVersion: v1
+          kind: Service
+          metadata: {name: "{{peers}}", namespace: tariff-cache}
+          spec:
+            clusterIP: None
+            selector: {app: tariff-cache}
+            ports: [{name: redis, port: 6379}]
+          ---
+          apiVersion: apps/v1
+          kind: StatefulSet
+          metadata: {name: tariff-cache, namespace: tariff-cache}
+          spec:
+            serviceName: "{{peers}}"
+            replicas: 3
+            selector: {matchLabels: {app: tariff-cache}}
+            template:
+              metadata: {labels: {app: tariff-cache, tier: cache}}
+              spec:
+                containers:
+                  - name: redis
+                    image: redis:7.4-alpine
+                    ports: [{name: redis, containerPort: 6379}]
+                    volumeMounts: [{name: data, mountPath: /data}]
+            volumeClaimTemplates:
+              - metadata: {name: data}
+                spec:
+                  accessModes: [ReadWriteOnce]
+                  resources: {requests: {storage: 1Gi}}
+          YAML
+          sleep 30
+  solution:
+    explanation: |
+      The headless Service gives each member a stable DNS name; the StatefulSet
+      names it in `serviceName`. `volumeClaimTemplates` creates
+      `data-tariff-cache-<n>` per member, which bind (on first use) to the
+      pre-created local volumes of the StorageClass and are kept when Pods or
+      the StatefulSet go away (retention policy Retain, the default).
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 240
+        run: |
+          kubectl config use-context qm-capacity
+          kubectl apply -f - <<'YAML'
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: {{peers}}
+            namespace: tariff-cache
+          spec:
+            clusterIP: None
+            selector: {app: tariff-cache}
+            ports:
+              - {name: redis, port: 6379, targetPort: 6379}
+          ---
+          apiVersion: apps/v1
+          kind: StatefulSet
+          metadata:
+            name: tariff-cache
+            namespace: tariff-cache
+          spec:
+            serviceName: {{peers}}
+            replicas: 3
+            selector:
+              matchLabels: {app: tariff-cache}
+            template:
+              metadata:
+                labels: {app: tariff-cache, tier: cache}
+              spec:
+                containers:
+                  - name: redis
+                    image: redis:7.4-alpine
+                    ports: [{name: redis, containerPort: 6379}]
+                    volumeMounts: [{name: data, mountPath: /data}]
+            volumeClaimTemplates:
+              - metadata: {name: data}
+                spec:
+                  accessModes: [ReadWriteOnce]
+                  storageClassName: {{storageClass}}
+                  resources:
+                    requests: {storage: 1Gi}
+          YAML
+          kubectl -n tariff-cache delete deployment tariff-cache
+          kubectl -n tariff-cache rollout status statefulset/tariff-cache --timeout=200s
+    alternatives:
+      - id: explicit-retention
+        description: Convert the exported Deployment with yq and state the Retain policy explicitly.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 240
+            run: |
+              kubectl config use-context qm-capacity
+              kubectl -n tariff-cache create service clusterip {{peers}} --clusterip=None --tcp=6379:6379 --dry-run=client -o yaml \
+                | yq '.spec.selector = {"app": "tariff-cache"}' | kubectl apply -f -
+              kubectl -n tariff-cache get deploy tariff-cache -o yaml \
+                | yq 'del(.status) | del(.metadata.uid) | del(.metadata.resourceVersion) | del(.metadata.generation) | del(.metadata.creationTimestamp) | del(.metadata.annotations) | del(.metadata.managedFields)
+                      | .kind = "StatefulSet" | del(.spec.strategy) | del(.spec.progressDeadlineSeconds) | del(.spec.revisionHistoryLimit)
+                      | .spec.serviceName = "{{peers}}" | .spec.replicas = 3
+                      | .spec.persistentVolumeClaimRetentionPolicy = {"whenDeleted": "Retain", "whenScaled": "Retain"}
+                      | del(.spec.template.spec.volumes)
+                      | .spec.volumeClaimTemplates = [{"metadata": {"name": "data"}, "spec": {"accessModes": ["ReadWriteOnce"], "storageClassName": "{{storageClass}}", "resources": {"requests": {"storage": "1Gi"}}}}]' > sts.yaml
+              kubectl -n tariff-cache delete deployment tariff-cache
+              kubectl apply -f sts.yaml
+              kubectl -n tariff-cache rollout status statefulset/tariff-cache --timeout=200s

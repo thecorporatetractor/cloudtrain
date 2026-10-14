@@ -1,0 +1,264 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ledger-export-cronjob
+  title: Schedule the nightly ledger export
+  domain: kubernetes
+  frameworks: [ckad:design-build]
+  difficulty: easy
+  estimatedMinutes: 10
+  tags: [cronjob, jobs, batch]
+  version: 1
+spec:
+  description: |
+    Finance at Quillmoor Logistics reconciles the billing ledger every morning
+    from an export written overnight. Until now someone ran the export by hand.
+
+    From your workstation, switch to context `qm-archive` first:
+
+    ```bash
+    kubectl config use-context qm-archive
+    ```
+
+    In namespace `ledger-ops`, create a CronJob named **`{{cronjob}}`** that:
+
+    | Requirement | Value |
+    |---|---|
+    | Runs | every night at **02:30** (cluster time) |
+    | Container `exporter` | image `busybox:1.37`, command `/bin/sh -c "echo exporting ledger {{ledger}}; sleep 5; echo export done"` |
+    | Concurrency | a run never starts while the previous one is still running |
+    | History | keep **3** successful and **1** failed Job |
+    | Deadline | a run that is still going after **10 minutes** is stopped and counted as failed |
+    | Pods | never restarted in place; a failed Pod is replaced by the Job |
+
+    Then prove the template works without waiting for 02:30: start one Job
+    from the CronJob, named **`{{cronjob}}-manual`**, and let it complete.
+  objectives:
+    - Write a CronJob schedule in cron syntax
+    - Control concurrency and history of a CronJob
+    - Distinguish the Job deadline from the CronJob starting deadline
+    - Trigger a CronJob by hand
+  params:
+    cronjob:
+      type: choice
+      values: [ledger-export, nightly-ledger-export, ledger-nightly]
+    ledger:
+      type: choice
+      values: [freight, parcels, customs]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-archive
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: qm-archive
+  setup:
+    - on: qm-archive
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: ledger-ops}
+  teardown:
+    - on: qm-archive
+      run: kubectl delete namespace ledger-ops --ignore-not-found --wait=false
+  checks:
+    - id: context
+      description: Terminal is using context qm-archive
+      type: k8s-context
+      on: workstation
+      skills: [k8s.cli.contexts]
+      weight: 0.5
+      expect: {match: exact, value: qm-archive}
+    - id: schedule
+      description: CronJob {{cronjob}} runs at 02:30 every day
+      type: k8s-query
+      skills: [k8s.workloads.jobs]
+      weight: 2
+      query: {cluster: qm-archive, resource: cronjob, name: "{{cronjob}}", namespace: ledger-ops, jsonpath: "{.spec.schedule}"}
+      expect: {match: regex, value: '^\s*30\s+0?2\s+\*\s+\*\s+\*\s*$'}
+    - id: container
+      description: The exporter container uses busybox:1.37 and exports ledger {{ledger}}
+      type: k8s-query
+      skills: [k8s.workloads.jobs]
+      query: {cluster: qm-archive, resource: cronjob, name: "{{cronjob}}", namespace: ledger-ops, jsonpath: '{.spec.jobTemplate.spec.template.spec.containers[?(@.name=="exporter")].image} {.spec.jobTemplate.spec.template.spec.containers[?(@.name=="exporter")].command} {.spec.jobTemplate.spec.template.spec.containers[?(@.name=="exporter")].args}'}
+      expect: {match: regex, value: '^busybox:1\.37 .*exporting ledger {{ledger}}'}
+    - id: no-overlap
+      description: Concurrent runs are forbidden
+      type: k8s-query
+      skills: [k8s.workloads.jobs]
+      query: {cluster: qm-archive, resource: cronjob, name: "{{cronjob}}", namespace: ledger-ops, jsonpath: "{.spec.concurrencyPolicy}"}
+      expect: {match: exact, value: Forbid}
+    - id: history
+      description: Keeps 3 successful and 1 failed Job
+      type: k8s-query
+      skills: [k8s.workloads.jobs]
+      weight: 0.5
+      query: {cluster: qm-archive, resource: cronjob, name: "{{cronjob}}", namespace: ledger-ops, jsonpath: "{.spec.successfulJobsHistoryLimit}/{.spec.failedJobsHistoryLimit}"}
+      expect: {match: exact, value: "3/1"}
+    - id: job-deadline
+      description: Each run is stopped after 600 s (Job activeDeadlineSeconds)
+      type: k8s-query
+      skills: [k8s.workloads.jobs]
+      weight: 2
+      query: {cluster: qm-archive, resource: cronjob, name: "{{cronjob}}", namespace: ledger-ops, jsonpath: "{.spec.jobTemplate.spec.activeDeadlineSeconds}"}
+      expect: {match: exact, value: "600"}
+    - id: restart-never
+      description: Pods use restartPolicy Never
+      type: k8s-query
+      skills: [k8s.workloads.jobs]
+      weight: 0.5
+      query: {cluster: qm-archive, resource: cronjob, name: "{{cronjob}}", namespace: ledger-ops, jsonpath: "{.spec.jobTemplate.spec.template.spec.restartPolicy}"}
+      expect: {match: exact, value: Never}
+    - id: manual-run
+      description: Job {{cronjob}}-manual was created from the CronJob and completed
+      type: shell
+      on: qm-archive
+      skills: [k8s.workloads.jobs]
+      weight: 2
+      command: |
+        kubectl -n ledger-ops get job {{cronjob}}-manual -o jsonpath='{.metadata.annotations.cronjob\.kubernetes\.io/instantiate} {.status.succeeded}' 2>/dev/null || echo missing
+      expect: {match: exact, value: "manual 1"}
+  hints:
+    - title: Switch context
+      body: The ledger tooling runs on the archive cluster.
+      command: kubectl config use-context qm-archive
+      cost: 0
+    - title: Generate a starting point
+      body: kubectl can scaffold a CronJob; the fields for concurrency, history and deadline then go into the YAML.
+      command: kubectl -n ledger-ops create cronjob {{cronjob}} --image=busybox:1.37 --schedule="30 2 * * *" --dry-run=client -o yaml -- /bin/sh -c "echo exporting ledger {{ledger}}; sleep 5; echo export done" > cronjob.yaml
+      cost: 1
+    - title: Two different deadlines
+      body: |
+        `spec.startingDeadlineSeconds` (CronJob) limits how late a *missed start*
+        may still happen. `spec.jobTemplate.spec.activeDeadlineSeconds` (Job) stops a
+        run that has been going too long. Only one of them matches the task.
+      command: kubectl explain cronjob.spec.jobTemplate.spec.activeDeadlineSeconds
+      cost: 2
+    - title: Run it now
+      body: A Job created from a CronJob copies its template and is annotated as a manual instantiation.
+      command: kubectl -n ledger-ops create job {{cronjob}}-manual --from=cronjob/{{cronjob}}
+      cost: 1
+  misconceptions:
+    - id: starting-deadline
+      description: Uses startingDeadlineSeconds for the 10-minute limit; a long run is never stopped.
+      feedback: "`startingDeadlineSeconds` only governs late starts. To stop a run after 10 minutes set `activeDeadlineSeconds` on the Job template."
+      expectFail: [job-deadline]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 90
+        run: |
+          kubectl config use-context qm-archive
+          kubectl apply -f - <<'YAML'
+          apiVersion: batch/v1
+          kind: CronJob
+          metadata: {name: "{{cronjob}}", namespace: ledger-ops}
+          spec:
+            schedule: "30 2 * * *"
+            concurrencyPolicy: Forbid
+            startingDeadlineSeconds: 600
+            successfulJobsHistoryLimit: 3
+            failedJobsHistoryLimit: 1
+            jobTemplate:
+              spec:
+                template:
+                  spec:
+                    restartPolicy: Never
+                    containers:
+                      - name: exporter
+                        image: busybox:1.37
+                        command: ["/bin/sh", "-c", "echo exporting ledger {{ledger}}; sleep 5; echo export done"]
+          YAML
+          kubectl -n ledger-ops create job {{cronjob}}-manual --from=cronjob/{{cronjob}}
+          kubectl -n ledger-ops wait job/{{cronjob}}-manual --for=condition=Complete --timeout=60s
+    - id: afternoon-schedule
+      description: Reads 02:30 on a 12-hour clock and schedules the export for 14:30, in the middle of the working day.
+      feedback: Cron hours run 0-23 and the fields are minute, hour, day of month, month, day of week. 02:30 at night is `30 2 * * *`.
+      expectFail: [schedule]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 90
+        run: |
+          kubectl config use-context qm-archive
+          kubectl -n ledger-ops create cronjob {{cronjob}} --image=busybox:1.37 --schedule="30 14 * * *" -- /bin/sh -c "echo exporting ledger {{ledger}}; sleep 5; echo export done"
+    - id: default-concurrency
+      description: Leaves concurrencyPolicy at its default (Allow), so a slow export can overlap the next one.
+      feedback: "The default lets runs overlap. `concurrencyPolicy: Forbid` skips a run while the previous one is active."
+      expectFail: [no-overlap, job-deadline]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 90
+        run: |
+          kubectl config use-context qm-archive
+          kubectl -n ledger-ops create cronjob {{cronjob}} --image=busybox:1.37 --schedule="30 2 * * *" -- /bin/sh -c "echo exporting ledger {{ledger}}; sleep 5; echo export done"
+          kubectl -n ledger-ops create job {{cronjob}}-manual --from=cronjob/{{cronjob}}
+          kubectl -n ledger-ops wait job/{{cronjob}}-manual --for=condition=Complete --timeout=60s
+    - id: plain-job
+      description: Creates the manual Job from scratch instead of from the CronJob, so it proves nothing about the template.
+      feedback: "`kubectl create job --from=cronjob/<name>` runs the CronJob's own template; a hand-written Job can differ from it."
+      expectFail: [manual-run]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 90
+        run: |
+          kubectl config use-context qm-archive
+          kubectl -n ledger-ops create job {{cronjob}}-manual --image=busybox:1.37 -- /bin/sh -c "echo exporting ledger {{ledger}}; sleep 5; echo export done"
+          kubectl -n ledger-ops wait job/{{cronjob}}-manual --for=condition=Complete --timeout=60s
+  solution:
+    explanation: |
+      The schedule `30 2 * * *` is minute 30 of hour 2. `concurrencyPolicy:
+      Forbid` prevents overlap, the two history limits prune old Jobs, and
+      `activeDeadlineSeconds: 600` on the Job template stops a run after ten
+      minutes. `kubectl create job --from=cronjob/...` runs the template once now.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          kubectl config use-context qm-archive
+          kubectl apply -f - <<'YAML'
+          apiVersion: batch/v1
+          kind: CronJob
+          metadata:
+            name: {{cronjob}}
+            namespace: ledger-ops
+          spec:
+            schedule: "30 2 * * *"
+            concurrencyPolicy: Forbid
+            successfulJobsHistoryLimit: 3
+            failedJobsHistoryLimit: 1
+            jobTemplate:
+              spec:
+                activeDeadlineSeconds: 600
+                template:
+                  spec:
+                    restartPolicy: Never
+                    containers:
+                      - name: exporter
+                        image: busybox:1.37
+                        command: ["/bin/sh", "-c", "echo exporting ledger {{ledger}}; sleep 5; echo export done"]
+          YAML
+          kubectl -n ledger-ops create job {{cronjob}}-manual --from=cronjob/{{cronjob}}
+          kubectl -n ledger-ops wait job/{{cronjob}}-manual --for=condition=Complete --timeout=90s
+    alternatives:
+      - id: scaffold-and-patch
+        description: Scaffold with kubectl create cronjob, then patch in the policy fields.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 120
+            run: |
+              kubectl config use-context qm-archive
+              kubectl -n ledger-ops create cronjob {{cronjob}} --image=busybox:1.37 --schedule="30 2 * * *" --restart=Never -- /bin/sh -c "echo exporting ledger {{ledger}}; sleep 5; echo export done"
+              kubectl -n ledger-ops patch cronjob {{cronjob}} --type=merge -p '{"spec":{"concurrencyPolicy":"Forbid","successfulJobsHistoryLimit":3,"failedJobsHistoryLimit":1,"jobTemplate":{"spec":{"activeDeadlineSeconds":600,"template":{"spec":{"containers":[{"name":"exporter","image":"busybox:1.37","command":["/bin/sh","-c","echo exporting ledger {{ledger}}; sleep 5; echo export done"]}]}}}}}}'
+              kubectl -n ledger-ops create job {{cronjob}}-manual --from=cronjob/{{cronjob}}
+              kubectl -n ledger-ops wait job/{{cronjob}}-manual --for=condition=Complete --timeout=90s
