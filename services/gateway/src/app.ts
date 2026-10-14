@@ -10,12 +10,16 @@ import { learnerOf, sampleHome, sampleSkillStates } from './learner/sample.js';
 import type { SessionService } from './sessions/service.js';
 import { bridge, clampSize } from './terminal/bridge.js';
 import { planTerminal } from './terminal/target.js';
+import { registerExamRoutes } from './exams/routes.js';
+import type { ExamService } from './exams/service.js';
 
 export interface AppDeps {
   content: Content;
   auth: Authenticator;
   sessions: SessionService;
   cluster: LabCluster;
+  /** Exam simulations (`/api/exams/*`); omitted = not served. */
+  exams?: ExamService;
   logger?: boolean | { level: string };
 }
 
@@ -109,6 +113,10 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     planned.catch(() => undefined); // reported to the client by bridge()
     void bridge(socket, cluster, planned, { cols: clampSize(req.query.cols, 120, 1000), rows: clampSize(req.query.rows, 32, 500) }, req.log);
   });
+
+  /* ---------------------------------- exams ---------------------------------- */
+
+  if (deps.exams) registerExamRoutes(app, deps.exams, cluster);
 
   return app;
 }

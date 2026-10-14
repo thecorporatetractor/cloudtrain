@@ -334,3 +334,7 @@ export interface TeamData {
   members: TeamMember[];
   workshops: Workshop[];
 }
+
+// ---- Exam simulations (exam engine stream) ----
+
+export * from './exam.js';
