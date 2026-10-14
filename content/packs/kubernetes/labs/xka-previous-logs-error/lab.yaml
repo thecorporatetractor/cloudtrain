@@ -1,0 +1,126 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xka-previous-logs-error
+  title: Save the crash reason of a restarting container
+  domain: kubernetes
+  frameworks: [cka:troubleshooting]
+  difficulty: easy
+  estimatedMinutes: 5
+  tags: [exam, logs]
+  version: 1
+spec:
+  description: |
+    **Context:** `qm-depot` (`kubectl config use-context qm-depot`)
+
+    In namespace **`manifest-intake`**, the container **`manifest-parser`**
+    of Pod **`intake-worker`** crashed and was restarted. Write every line
+    containing `ERROR` that the **previous** (crashed) instance of that
+    container printed to **`/home/learner/exam/parser-errors.txt`**, in the
+    original order and unchanged.
+  objectives:
+    - Read the logs of a previous container instance in a multi-container Pod
+  params:
+    batch:
+      type: choice
+      values: ["4471", "5208", "6093"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-depot
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: qm-depot
+  setup:
+    - on: qm-depot
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: manifest-intake}
+        ---
+        apiVersion: v1
+        kind: Pod
+        metadata: {name: intake-worker, namespace: manifest-intake}
+        spec:
+          terminationGracePeriodSeconds: 1
+          containers:
+            - name: intake-api
+              image: busybox:1.37
+              command: ["sh", "-c", "while true; do echo 'ERROR intake-api heartbeat late'; sleep 20; done"]
+            - name: manifest-parser
+              image: busybox:1.37
+              command:
+                - sh
+                - -c
+                - |
+                  if [ ! -f /state/crashed ]; then
+                    touch /state/crashed
+                    echo "INFO parsing manifest batch {{batch}}"
+                    echo "ERROR batch {{batch}}: consignee missing on line 17"
+                    echo "WARN retrying batch {{batch}}"
+                    echo "ERROR batch {{batch}}: schema v3 not supported, aborting"
+                    exit 3
+                  fi
+                  echo "INFO parser restarted in safe mode"
+                  while true; do echo "INFO waiting for batches"; sleep 30; done
+              volumeMounts: [{name: state, mountPath: /state}]
+          volumes:
+            - name: state
+              emptyDir: {}
+    - on: qm-depot
+      timeoutSec: 120
+      run: |
+        for i in $(seq 1 50); do
+          r=$(kubectl -n manifest-intake get pod intake-worker -o jsonpath='{.status.containerStatuses[?(@.name=="manifest-parser")].restartCount}')
+          [ "${r:-0}" -ge 1 ] && exit 0
+          sleep 2
+        done
+        exit 1
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/exam
+  teardown:
+    - on: qm-depot
+      run: kubectl delete namespace manifest-intake --ignore-not-found --wait=false
+  checks:
+    - id: error-lines
+      description: The file holds exactly the ERROR lines of the crashed manifest-parser instance
+      type: file
+      on: workstation
+      target: /home/learner/exam/parser-errors.txt
+      skills: [k8s.troubleshooting.logs]
+      weight: 2
+      expect: {match: regex, value: '^ERROR batch {{batch}}: consignee missing on line 17\nERROR batch {{batch}}: schema v3 not supported, aborting\n?$'}
+  misconceptions:
+    - id: current-instance
+      description: Reads the logs of the running instance instead of the previous one.
+      feedback: Without --previous, kubectl logs shows the current instance, which has not failed.
+      expectFail: [error-lines]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n manifest-intake logs intake-worker -c manifest-parser | grep ERROR > ~/exam/parser-errors.txt || true
+    - id: wrong-container
+      description: Omits -c and reads the default container.
+      feedback: In a multi-container Pod, name the container with -c.
+      expectFail: [error-lines]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n manifest-intake logs intake-worker | grep ERROR > ~/exam/parser-errors.txt || true
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n manifest-intake logs intake-worker -c manifest-parser --previous | grep ERROR > ~/exam/parser-errors.txt

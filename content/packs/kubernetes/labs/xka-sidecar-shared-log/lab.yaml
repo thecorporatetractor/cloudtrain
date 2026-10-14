@@ -1,0 +1,144 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xka-sidecar-shared-log
+  title: Add a log sidecar to a Deployment
+  domain: kubernetes
+  frameworks: [cka:workloads-scheduling]
+  difficulty: medium
+  estimatedMinutes: 8
+  tags: [exam, sidecars, emptydir]
+  version: 1
+spec:
+  description: |
+    **Context:** `qm-depot` (`kubectl config use-context qm-depot`)
+
+    The container `gate` of Deployment **`gate-log`** in namespace
+    **`gate-audit`** writes its access log to `/var/log/gate/access.log`.
+    Change the Deployment so that:
+
+    - a volume **`gate-logs`** of type `emptyDir` is mounted at
+      `/var/log/gate` in `gate`;
+    - a **native sidecar** named **`{{sidecar}}`** (image `busybox:1.37`,
+      declared as an init container with `restartPolicy: Always`) mounts the
+      same volume and runs `tail -F /var/log/gate/access.log`, so the access
+      log appears in its output.
+  objectives:
+    - Add a native sidecar container
+    - Share a log file through an emptyDir volume
+  params:
+    sidecar:
+      type: choice
+      values: [log-streamer, access-tail, gate-log-shipper]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-depot
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: qm-depot
+  setup:
+    - on: qm-depot
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: gate-audit}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: gate-log, namespace: gate-audit}
+        spec:
+          replicas: 1
+          selector: {matchLabels: {app: gate-log}}
+          template:
+            metadata: {labels: {app: gate-log}}
+            spec:
+              terminationGracePeriodSeconds: 1
+              containers:
+                - name: gate
+                  image: busybox:1.37
+                  command: ["sh", "-c", "mkdir -p /var/log/gate; n=0; while true; do n=$((n+1)); echo \"gate-7 truck $n admitted\" >> /var/log/gate/access.log; sleep 3; done"]
+    - on: qm-depot
+      timeoutSec: 120
+      run: kubectl -n gate-audit rollout status deploy/gate-log --timeout=100s
+  teardown:
+    - on: qm-depot
+      run: kubectl delete namespace gate-audit --ignore-not-found --wait=false
+  checks:
+    - id: native-sidecar
+      description: "{{sidecar}} is an init container with restartPolicy Always and the app container is unchanged"
+      type: k8s-query
+      skills: [k8s.workloads.native-sidecars]
+      weight: 2
+      query: {cluster: qm-depot, resource: deployment, name: gate-log, namespace: gate-audit, jsonpath: '{range .spec.template.spec.initContainers[*]}{.name}:{.restartPolicy};{end} {range .spec.template.spec.containers[*]}{.name};{end}'}
+      expect: {match: exact, value: "{{sidecar}}:Always; gate;"}
+    - id: shared-volume
+      description: gate-logs is an emptyDir mounted at /var/log/gate in both containers
+      type: shell
+      on: qm-depot
+      skills: [k8s.storage.ephemeral-volumes]
+      command: |
+        kubectl -n gate-audit get deploy gate-log -o json | jq -r '
+          .spec.template.spec as $s
+          | "\([$s.volumes[]? | select(.name == "gate-logs") | has("emptyDir")] | join(",")) "
+            + ([($s.initContainers // [])[], $s.containers[] | .volumeMounts[]? | select(.name == "gate-logs") | .mountPath] | join(","))'
+      expect: {match: exact, value: "true /var/log/gate,/var/log/gate"}
+    - id: log-streamed
+      description: The sidecar's output shows the gate's access log
+      type: shell
+      on: qm-depot
+      skills: [k8s.workloads.native-sidecars]
+      weight: 2
+      timeoutSec: 20
+      command: |
+        kubectl -n gate-audit rollout status deploy/gate-log --timeout=5s >/dev/null 2>&1 || { echo "not rolled out"; exit 0; }
+        n=$(kubectl -n gate-audit logs deploy/gate-log -c {{sidecar}} --tail=20 2>/dev/null | grep -c 'admitted$')
+        [ "${n:-0}" -gt 0 ] && echo streaming || echo silent
+      expect: {match: exact, value: streaming}
+  misconceptions:
+    - id: regular-container
+      description: Adds the sidecar as a second app container.
+      feedback: A native sidecar is declared in initContainers with restartPolicy Always.
+      expectFail: [native-sidecar]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n gate-audit patch deploy gate-log -p '{"spec":{"template":{"spec":{"volumes":[{"name":"gate-logs","emptyDir":{}}],"containers":[
+            {"name":"gate","volumeMounts":[{"name":"gate-logs","mountPath":"/var/log/gate"}]},
+            {"name":"{{sidecar}}","image":"busybox:1.37","command":["tail","-F","/var/log/gate/access.log"],"volumeMounts":[{"name":"gate-logs","mountPath":"/var/log/gate"}]}]}}}}'
+          kubectl -n gate-audit rollout status deploy/gate-log --timeout=120s
+    - id: volume-not-in-app
+      description: Mounts the volume only in the sidecar.
+      feedback: The app writes the file; it has to write into the shared volume for the sidecar to see it.
+      expectFail: [shared-volume, log-streamed]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n gate-audit patch deploy gate-log -p '{"spec":{"template":{"spec":{"volumes":[{"name":"gate-logs","emptyDir":{}}],"initContainers":[
+            {"name":"{{sidecar}}","image":"busybox:1.37","restartPolicy":"Always","command":["tail","-F","/var/log/gate/access.log"],"volumeMounts":[{"name":"gate-logs","mountPath":"/var/log/gate"}]}]}}}}'
+          kubectl -n gate-audit rollout status deploy/gate-log --timeout=120s
+          sleep 8
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n gate-audit patch deploy gate-log -p '{"spec":{"template":{"spec":{"volumes":[{"name":"gate-logs","emptyDir":{}}],
+            "initContainers":[{"name":"{{sidecar}}","image":"busybox:1.37","restartPolicy":"Always","command":["tail","-F","/var/log/gate/access.log"],"volumeMounts":[{"name":"gate-logs","mountPath":"/var/log/gate"}]}],
+            "containers":[{"name":"gate","volumeMounts":[{"name":"gate-logs","mountPath":"/var/log/gate"}]}]}}}}'
+          kubectl -n gate-audit rollout status deploy/gate-log --timeout=120s
+          sleep 8

@@ -1,0 +1,133 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xka-events-failing-pod
+  title: Get a stuck Pod running
+  domain: kubernetes
+  frameworks: [cka:troubleshooting]
+  difficulty: easy
+  estimatedMinutes: 6
+  tags: [exam, events, configmap]
+  version: 1
+spec:
+  description: |
+    **Context:** `qm-depot` (`kubectl config use-context qm-depot`)
+
+    The Pod **`customs-sync`** in namespace **`customs-feed`** has been stuck
+    in `ContainerCreating` since it was deployed. Use its events to find out
+    which object it is waiting for, and create that object so the Pod reaches
+    **Running**. It must contain the key **`SYNC_MODE`** with the value
+    **`{{mode}}`**.
+
+    Do not delete or change the Pod.
+  objectives:
+    - Read a Pod's events to find a missing dependency
+    - Create a ConfigMap with a given key
+  params:
+    cm:
+      type: choice
+      values: [customs-sync-settings, sync-endpoints, customs-feed-config]
+    mode:
+      type: choice
+      values: [nightly, hourly, on-arrival]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-depot
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: qm-depot
+  setup:
+    - on: qm-depot
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: customs-feed}
+        ---
+        apiVersion: v1
+        kind: ConfigMap
+        metadata: {name: customs-sync-defaults, namespace: customs-feed}
+        data: {SYNC_MODE: manual}
+        ---
+        apiVersion: v1
+        kind: Pod
+        metadata: {name: customs-sync, namespace: customs-feed}
+        spec:
+          terminationGracePeriodSeconds: 1
+          containers:
+            - name: sync
+              image: busybox:1.37
+              command: ["sh", "-c", "while true; do cat /etc/sync/SYNC_MODE; echo; sleep 30; done"]
+              volumeMounts: [{name: settings, mountPath: /etc/sync}]
+          volumes:
+            - name: settings
+              configMap: {name: "{{cm}}"}
+  teardown:
+    - on: qm-depot
+      run: kubectl delete namespace customs-feed --ignore-not-found --wait=false
+  checks:
+    - id: pod-running
+      description: customs-sync is Running and reads SYNC_MODE {{mode}}
+      type: shell
+      on: qm-depot
+      skills: [k8s.troubleshooting.events]
+      weight: 2
+      timeoutSec: 20
+      command: |
+        echo "$(kubectl -n customs-feed get pod customs-sync -o jsonpath='{.status.phase}') $(kubectl -n customs-feed exec customs-sync -- cat /etc/sync/SYNC_MODE 2>/dev/null)"
+      expect: {match: exact, value: "Running {{mode}}"}
+    - id: configmap
+      description: ConfigMap {{cm}} holds SYNC_MODE={{mode}}
+      type: k8s-query
+      skills: [k8s.workloads.config]
+      query: {cluster: qm-depot, resource: configmap, name: "{{cm}}", namespace: customs-feed, jsonpath: '{.data.SYNC_MODE}'}
+      expect: {match: exact, value: "{{mode}}"}
+    - id: pod-unchanged
+      description: The original Pod was kept (same volume reference, no restarts by replacement)
+      type: k8s-query
+      skills: [k8s.troubleshooting.events]
+      weight: 0.5
+      query: {cluster: qm-depot, resource: pod, name: customs-sync, namespace: customs-feed, jsonpath: '{.spec.volumes[0].configMap.name}'}
+      expect: {match: exact, value: "{{cm}}"}
+  misconceptions:
+    - id: wrong-configmap
+      description: Edits the existing defaults ConfigMap instead of creating the one the Pod mounts.
+      feedback: The FailedMount event names the ConfigMap the Pod needs.
+      expectFail: [pod-running, configmap]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n customs-feed create configmap customs-sync-defaults --from-literal=SYNC_MODE={{mode}} --dry-run=client -o yaml | kubectl apply -f -
+          sleep 20
+    - id: recreate-pod
+      description: Recreates the Pod without the volume.
+      feedback: The Pod needs its configuration; provide the missing ConfigMap instead of removing the mount.
+      expectFail: [pod-running, configmap, pod-unchanged]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n customs-feed get pod customs-sync -o json | jq 'del(.spec.volumes, .spec.containers[0].volumeMounts, .status, .metadata.uid, .metadata.resourceVersion, .metadata.creationTimestamp)' > /tmp/p.json
+          kubectl -n customs-feed delete pod customs-sync --wait=true
+          kubectl create -f /tmp/p.json
+          kubectl -n customs-feed wait pod/customs-sync --for=condition=Ready --timeout=60s
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 260
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n customs-feed events --for pod/customs-sync
+          kubectl -n customs-feed create configmap {{cm}} --from-literal=SYNC_MODE={{mode}}
+          kubectl -n customs-feed wait pod/customs-sync --for=condition=Ready --timeout=240s

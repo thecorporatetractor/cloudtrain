@@ -1,0 +1,118 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xka-helm-install-values
+  title: Install a chart with a values override
+  domain: kubernetes
+  frameworks: [cka:cluster-architecture]
+  difficulty: easy
+  estimatedMinutes: 6
+  tags: [exam, helm]
+  version: 1
+spec:
+  description: |
+    **Context:** `qm-depot` (`kubectl config use-context qm-depot`)
+
+    The local chart repository in `~/exam/charts` (packaged charts and their
+    `index.yaml`) contains the chart **`gate-metrics`**. Install it as release
+    **`gm`** in the namespace **`monitoring`** (create the namespace as part
+    of the install) so that its Service is of type **NodePort**. Set the type
+    through the chart's values, not by editing objects afterwards.
+  objectives:
+    - Install a chart from a local repository with a value override
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-depot
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: qm-depot
+  setup:
+    - on: workstation
+      file:
+        path: /opt/cloudtrain/xka-build-chart.sh
+        source: assets/build-chart.sh
+        mode: "0755"
+    - on: workstation
+      as: learner
+      timeoutSec: 60
+      run: /opt/cloudtrain/xka-build-chart.sh
+  teardown:
+    - on: qm-depot
+      run: kubectl delete namespace monitoring --ignore-not-found --wait=false
+  checks:
+    - id: release
+      description: Release gm in monitoring is deployed from chart gate-metrics
+      type: shell
+      on: qm-depot
+      skills: [k8s.cluster.packaging]
+      weight: 2
+      command: helm -n monitoring list -a -o json 2>/dev/null | jq -r '.[] | select(.name == "gm") | "\(.status) \(.chart)"'
+      expect: {match: exact, value: deployed gate-metrics-0.4.2}
+    - id: values
+      description: The release's user-supplied values set service.type to NodePort
+      type: shell
+      on: qm-depot
+      skills: [k8s.cluster.packaging]
+      weight: 2
+      command: helm -n monitoring get values gm -o json 2>/dev/null | jq -r '.service.type'
+      expect: {match: exact, value: NodePort}
+    - id: service-type
+      description: The release's Service is a NodePort Service with a ready endpoint
+      type: shell
+      on: qm-depot
+      skills: [k8s.cluster.packaging]
+      command: |
+        echo "$(kubectl -n monitoring get svc gm-gate-metrics -o jsonpath='{.spec.type}' 2>/dev/null) \
+        $(kubectl -n monitoring get endpointslices -l kubernetes.io/service-name=gm-gate-metrics -o json | jq '[.items[].endpoints[]? | select(.conditions.ready)] | length')"
+      expect: {match: exact, value: NodePort 1}
+  misconceptions:
+    - id: patched-after-install
+      description: Installs with defaults and patches the Service to NodePort.
+      feedback: The next helm upgrade renders the chart again and turns the Service back into ClusterIP. Set the value at install time.
+      expectFail: [values]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 180
+        run: |
+          kubectl config use-context qm-depot
+          helm install gm ~/exam/charts/gate-metrics-0.4.2.tgz -n monitoring --create-namespace --wait --timeout 2m
+          kubectl -n monitoring patch svc gm-gate-metrics -p '{"spec":{"type":"NodePort"}}'
+    - id: wrong-namespace
+      description: Installs into the default namespace.
+      feedback: Without -n, helm uses the context's namespace. The release belongs in monitoring.
+      expectFail: [release, values, service-type]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 180
+        run: |
+          kubectl config use-context qm-depot
+          helm install gm ~/exam/charts/gate-metrics-0.4.2.tgz --set service.type=NodePort --wait --timeout 2m
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 180
+        run: |
+          kubectl config use-context qm-depot
+          helm install gm ~/exam/charts/gate-metrics-0.4.2.tgz -n monitoring --create-namespace --set service.type=NodePort --wait --timeout 2m
+    alternatives:
+      - id: repo-index-and-values-file
+        description: Pick the chart from the repository index and pass a values file.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 180
+            run: |
+              kubectl config use-context qm-depot
+              url=$(yq '.entries["gate-metrics"][0].urls[0]' ~/exam/charts/index.yaml)
+              printf 'service:\n  type: NodePort\n' > /tmp/gm-values.yaml
+              helm upgrade --install gm ~/exam/charts/$url -n monitoring --create-namespace -f /tmp/gm-values.yaml --wait --timeout 2m

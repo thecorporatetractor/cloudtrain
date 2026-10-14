@@ -1,0 +1,173 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xka-crd-custom-resource
+  title: Create a custom resource for an installed operator
+  domain: kubernetes
+  frameworks: [cka:cluster-architecture]
+  difficulty: medium
+  estimatedMinutes: 7
+  tags: [exam, crd, custom-resources, operators]
+  version: 1
+spec:
+  description: |
+    **Context:** `qm-depot` (`kubectl config use-context qm-depot`)
+
+    The harbour's berth operator (it runs outside the cluster) watches
+    **BerthAllocation** objects, a custom resource installed in the cluster,
+    and marks valid ones Ready in their status.
+
+    Find out which fields a BerthAllocation takes, then create one named
+    **`berth-7`** in namespace **`harbour-berths`** that allocates **berth
+    7** to the vessel **`{{vessel}}`** in the **`{{slot}}`** slot. The
+    operator must report it as Ready.
+  objectives:
+    - Discover a custom resource's schema with kubectl explain
+    - Create a custom resource that its controller accepts
+  params:
+    vessel:
+      type: choice
+      values: [MV Lorne Starling, MV Quill Meridian, MV Tamsin Ray]
+    slot:
+      type: choice
+      values: [early, late, night]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-depot
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: qm-depot
+  setup:
+    - on: qm-depot
+      apply: |
+        apiVersion: apiextensions.k8s.io/v1
+        kind: CustomResourceDefinition
+        metadata: {name: berthallocations.harbour.quillmoor.example}
+        spec:
+          group: harbour.quillmoor.example
+          scope: Namespaced
+          names: {plural: berthallocations, singular: berthallocation, kind: BerthAllocation, shortNames: [ba]}
+          versions:
+            - name: v1
+              served: true
+              storage: true
+              subresources: {status: {}}
+              additionalPrinterColumns:
+                - {name: Berth, type: integer, jsonPath: .spec.berthNumber}
+                - {name: Vessel, type: string, jsonPath: .spec.vessel}
+                - {name: Phase, type: string, jsonPath: .status.phase}
+              schema:
+                openAPIV3Schema:
+                  type: object
+                  properties:
+                    spec:
+                      type: object
+                      description: A berth allocation for one vessel and one time slot.
+                      required: [berthNumber, vessel, slot]
+                      properties:
+                        berthNumber: {type: integer, minimum: 1, maximum: 24, description: Number of the berth (1-24).}
+                        vessel: {type: string, minLength: 1, description: Name of the vessel.}
+                        slot: {type: string, enum: [early, late, night], description: Time slot of the allocation.}
+                        pilotRequired: {type: boolean, description: Whether a harbour pilot is booked.}
+                    status:
+                      type: object
+                      properties:
+                        phase: {type: string}
+                        message: {type: string}
+        ---
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: harbour-berths}
+    - on: qm-depot
+      timeoutSec: 60
+      run: |
+        kubectl wait crd/berthallocations.harbour.quillmoor.example --for=condition=Established --timeout=50s
+        # The "operator": a small reconcile loop in the platform's admin container.
+        cat > /tmp/berth-operator.sh <<'SH'
+        while true; do
+          kubectl get berthallocations -A -o json 2>/dev/null | jq -r '.items[] | select((.status.phase // "") != "Ready") | "\(.metadata.namespace) \(.metadata.name)"' \
+            | while read -r ns n; do
+                kubectl -n "$ns" patch berthallocation "$n" --subresource=status --type=merge \
+                  -p '{"status":{"phase":"Ready","message":"berth reserved by the harbour operator"}}' >/dev/null 2>&1
+              done
+          sleep 3
+        done
+        SH
+        pgrep -f /tmp/berth-operator.sh >/dev/null || setsid nohup sh /tmp/berth-operator.sh >/dev/null 2>&1 < /dev/null &
+        sleep 1
+  teardown:
+    - on: qm-depot
+      run: |
+        pkill -f /tmp/berth-operator.sh || true
+        kubectl delete namespace harbour-berths --ignore-not-found --wait=false
+        kubectl delete crd berthallocations.harbour.quillmoor.example --ignore-not-found --wait=false
+  checks:
+    - id: resource
+      description: BerthAllocation berth-7 allocates berth 7 to {{vessel}} in the {{slot}} slot
+      type: k8s-query
+      skills: [k8s.cluster.extensions]
+      weight: 2
+      query: {cluster: qm-depot, resource: berthallocations.harbour.quillmoor.example, name: berth-7, namespace: harbour-berths, jsonpath: '{.spec.berthNumber}|{.spec.vessel}|{.spec.slot}'}
+      expect: {match: exact, value: "7|{{vessel}}|{{slot}}"}
+    - id: ready
+      description: The operator reports berth-7 as Ready
+      type: k8s-query
+      skills: [k8s.cluster.extensions]
+      query: {cluster: qm-depot, resource: berthallocations.harbour.quillmoor.example, name: berth-7, namespace: harbour-berths, jsonpath: '{.status.phase}'}
+      expect: {match: exact, value: Ready}
+  misconceptions:
+    - id: guessed-field-names
+      description: Guesses field names instead of reading the schema.
+      feedback: Unknown fields are pruned by a structural schema and required fields are enforced; kubectl explain berthallocation.spec lists the real ones.
+      expectFail: [resource, ready]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-depot
+          kubectl apply -f - <<'YAML' || true
+          apiVersion: harbour.quillmoor.example/v1
+          kind: BerthAllocation
+          metadata: {name: berth-7, namespace: harbour-berths}
+          spec: {berth: 7, vessel: "{{vessel}}", slot: {{slot}}}
+          YAML
+          sleep 8
+    - id: wrong-namespace
+      description: Creates the object in the default namespace.
+      feedback: BerthAllocations are namespaced; create it in harbour-berths.
+      expectFail: [resource, ready]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-depot
+          kubectl apply -f - <<'YAML'
+          apiVersion: harbour.quillmoor.example/v1
+          kind: BerthAllocation
+          metadata: {name: berth-7}
+          spec: {berthNumber: 7, vessel: "{{vessel}}", slot: {{slot}}}
+          YAML
+          sleep 8
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-depot
+          kubectl explain berthallocation.spec
+          kubectl apply -f - <<'YAML'
+          apiVersion: harbour.quillmoor.example/v1
+          kind: BerthAllocation
+          metadata: {name: berth-7, namespace: harbour-berths}
+          spec: {berthNumber: 7, vessel: "{{vessel}}", slot: {{slot}}}
+          YAML
+          for i in $(seq 1 20); do
+            [ "$(kubectl -n harbour-berths get ba berth-7 -o jsonpath='{.status.phase}')" = Ready ] && break; sleep 2
+          done
