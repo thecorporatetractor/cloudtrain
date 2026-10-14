@@ -337,6 +337,33 @@ and keeps boot-to-Ready around 90–117 s.
   `registry` import). A DataVolume is the better fit for persistent per-learner disks;
   containerDisk is the better fit for disposable labs.
 
+## Lab runtime tiers (foundations stream)
+
+Status and measurements: `docs/handoffs/foundations.md`.
+
+- **Tier A, unprivileged pods** (`el-lab:10`, `deb-lab:24.04`, `task image:build:linux-pod`).
+  Catalog `userNamespace: true`: the container driver sets `hostUsers: false` when every
+  schedulable node reports user namespace support for the runtime handler
+  (`--user-namespaces=auto|true|false`), except for pods with a privileged container
+  (topology links). Works on this kind cluster (K8s 1.36.4, containerd 2.3.4, runc 1.4.3,
+  kernel 6.18); idmapped PVC mounts keep uid 1000 on the node. Fallback: host users, with
+  the reason in the pod annotation `labs.cloudtrain.dev/user-namespace`. PID 1 is tini,
+  learner (uid 1000) has no sudo rights, package sources point only at the mirror.
+- **Tier B, Kata**: deferred (download size); tier-B labs run as tier-C VMs locally.
+- **Tier C, VMs** (`el-vm:10`, `ubuntu-vm:24.04`, `task image:build:el-vm|ubuntu-vm`). The
+  mirror snapshot is baked in as the only, local repo (`/opt/cloudtrain/repo/<el10|noble>`),
+  because lab VPCs have no route to cluster services. Extra blank disks: topology
+  `resources.disks: ["2Gi", "2Gi"]` -> `/dev/vdb..`, `/dev/disk/by-id/virtio-ct-dataN`.
+- **Mirrors** (`task mirror:content`, `task mirror:up`): namespace `cloudtrain-mirrors`.
+  Labs reference `http://mirror.cloudtrain-mirrors.svc/el10/`, `/noble/` (key
+  `/keys/cloudtrain-mirror.asc`), `/pypi/simple/`, `/ansible/`; registry
+  `registry.cloudtrain-mirrors.svc:5000` (zot, allowlist = catalog `workloadImages`,
+  anonymous read only); Gitea `http://git.cloudtrain-mirrors.svc:3000` (anonymous read, no
+  sign-up). Ingress only from pods labelled `labs.cloudtrain.dev/session`.
+- **kubeadm extras** (`kubeadm:1.37-full` = `kubeadm:1.37-sec`, `build.sh kubeadm-full`,
+  layered on kubeadm:1.37): `/opt/cloudtrain/bin/addons-install <list> [--wait] [--pool a-b]`
+  after `kubeadm init` + `cni-install`; see the catalog comment for the add-on list.
+
 ## Known gaps and problems hit (with the fix in place)
 
 1. **Only the kind worker runs VMs.** The control-plane node is tainted, so virt-handler

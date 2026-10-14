@@ -71,6 +71,8 @@ for t in "${targets[@]}"; do
                      load_docker_image "$LINUX_POD_EL_IMAGE" $ALL_NODES ;;
     linux-pod-deb)   # shellcheck disable=SC2086
                      load_docker_image "$LINUX_POD_DEB_IMAGE" $ALL_NODES ;;
+    kubeadm-full)    # shellcheck disable=SC2086
+                     load_docker_image "${GOLDEN_IMAGE_REPO}:${KUBEADM_FULL_IMAGE_TAG}" $VM_NODES ;;
     el-vm)           # shellcheck disable=SC2086
                      load_docker_image "$EL_VM_IMAGE" $VM_NODES ;;
     ubuntu-vm)       # shellcheck disable=SC2086
@@ -79,6 +81,6 @@ for t in "${targets[@]}"; do
                      load_docker_image "$MIRROR_CONTENT_IMAGE" $ALL_NODES ;;
     workloads)       # shellcheck disable=SC2086
                      load_workloads $ALL_NODES ;;
-    *) die "unknown image '$t' (kubeadm-node | kubeadm-upgrade | etcd-host | jumphost | workloads | linux-pod-el | linux-pod-deb | el-vm | ubuntu-vm | mirror)" ;;
+    *) die "unknown image '$t' (kubeadm-node | kubeadm-upgrade | kubeadm-full | etcd-host | jumphost | workloads | linux-pod-el | linux-pod-deb | el-vm | ubuntu-vm | mirror)" ;;
   esac
 done

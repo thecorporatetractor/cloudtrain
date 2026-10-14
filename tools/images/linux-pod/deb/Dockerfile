@@ -23,6 +23,7 @@ RUN --mount=type=bind,from=noble,target=/mnt/noble --mount=type=bind,source=comm
       openssh-client openssh-server rsync git tmux tar gzip bzip2 xz-utils zip unzip zstd acl attr \
       diffutils patch bc wamerican jq python3 python3-pip python3-venv gcc make libc6-dev cron at sudo passwd \
       openssl hostname util-linux cpio sqlite3 logrotate locales tzdata ca-certificates; \
+    apt-get -y upgrade; \
     dpkg -l | awk '/^ii/{print $2}' | xargs apt-get install -y --reinstall --no-install-recommends >/dev/null; \
     mandb -q || true; \
     rm -f /etc/apt/sources.list.d/build.sources /tmp/ubuntu.sources; apt-get clean; rm -rf /var/lib/apt/lists/*
