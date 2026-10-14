@@ -187,7 +187,7 @@ spec:
         n=0; with=0
         for spec in "depot-north app={{scanner}}" "depot-south app=label-feed"; do
           set -- $spec
-          for m in $(kubectl -n "$1" get pods -l "$2" --field-selector=status.phase=Running -o jsonpath='{range .items[*]}{.metadata.name}={range .spec.containers[*].volumeMounts[*]}{.mountPath},{end}{" "}{end}'); do
+          for m in $(kubectl -n "$1" get pods -l "$2" --field-selector=status.phase=Running -o json | jq -r '.items[] | select(.metadata.deletionTimestamp == null) | "\(.metadata.name)=\([.spec.containers[].volumeMounts[]?.mountPath] | join(","))"'); do
             n=$((n+1)); case "$m" in *serviceaccount*) with=$((with+1));; esac
           done
         done
@@ -201,7 +201,7 @@ spec:
       timeoutSec: 30
       command: |
         n=0; without=0
-        for m in $(kubectl -n depot-north get pods -l app=route-sync -o jsonpath='{range .items[*]}{.metadata.name}={range .spec.containers[*].volumeMounts[*]}{.mountPath},{end}{" "}{end}'); do
+        for m in $(kubectl -n depot-north get pods -l app=route-sync -o json | jq -r '.items[] | select(.metadata.deletionTimestamp == null) | "\(.metadata.name)=\([.spec.containers[].volumeMounts[]?.mountPath] | join(","))"'); do
           n=$((n+1)); case "$m" in *serviceaccount*) ;; *) without=$((without+1));; esac
         done
         echo "pods=$n without-token=$without"
@@ -215,7 +215,7 @@ spec:
       timeoutSec: 60
       command: |
         kubectl -n depot-north rollout status deploy/route-sync --timeout=40s >/dev/null 2>&1
-        r=$(kubectl -n depot-north get pods -l app=route-sync -o jsonpath='{range .items[*]}{.status.conditions[?(@.type=="Ready")].status}{" "}{end}')
+        r=$(kubectl -n depot-north get pods -l app=route-sync -o json | jq -r '[.items[] | select(.metadata.deletionTimestamp == null) | (.status.conditions[]? | select(.type=="Ready") | .status)] | join(" ")')
         case "$r" in *False*|"") echo "not ready: '$r'" ;; *) echo ready ;; esac
       expect: {match: exact, value: ready}
   hints:
