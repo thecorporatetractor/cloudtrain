@@ -114,3 +114,12 @@ test("podImageRefs finds manifest, flag and JSON refs and skips jsonpath and par
   ].join("\n");
   assert.deepEqual([...podImageRefs(text)].sort(), ["busybox:1.37", "caddy:2-alpine", "httpd:2.4-alpine", "redis:7.4-alpine"]);
 });
+
+test("exam task with hints is an error, and needs no hints or course otherwise", async () => {
+  const f = await findingsAfter("xkd-job-completions", (s) =>
+    s.replace("  misconceptions:\n", "  hints:\n    - {title: Peek, body: Use kubectl create job.}\n  misconceptions:\n"),
+  );
+  assert.ok(f.some((x) => x.level === "error" && x.path === "/spec/hints" && /exam task/.test(x.message)), JSON.stringify(f));
+  const clean = await findingsAfter("xkd-job-completions", (s) => s.replace("estimatedMinutes: 5", "estimatedMinutes: 6"));
+  assert.ok(!clean.some((x) => /no hints/.test(x.message)), JSON.stringify(clean));
+});
