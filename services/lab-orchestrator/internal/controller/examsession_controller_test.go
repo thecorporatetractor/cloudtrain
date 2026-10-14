@@ -517,3 +517,53 @@ func TestRevokeTargetsAndStickiness(t *testing.T) {
 		t.Fatal("revocation not sticky after spec cleared")
 	}
 }
+
+func TestExamWaitsForTaskTemplatesCreatedAlongside(t *testing.T) {
+	h := newExamHarness(t, examTemplate(labsv1.ExamEnvironmentShared, false, false))
+	// The cache has not seen the task templates yet.
+	ctx := context.Background()
+	saved := map[string]*labsv1.LabTemplate{}
+	for _, id := range []string{"ta1", "ta2", "tb1", "tb2"} {
+		lt := &labsv1.LabTemplate{}
+		if err := h.c.Get(ctx, types.NamespacedName{Namespace: examNS, Name: id + "-v1-0123456789"}, lt); err != nil {
+			t.Fatal(err)
+		}
+		saved[id] = lt.DeepCopy()
+		if err := h.c.Delete(ctx, lt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	res, err := h.er.Reconcile(ctx, ctrl.Request{NamespacedName: h.name})
+	if err != nil || res.RequeueAfter != 2*time.Second {
+		t.Fatalf("res %v err %v", res, err)
+	}
+	es := h.es()
+	if es.Status.Phase != labsv1.ExamPending || len(es.Status.Tasks) != 0 {
+		t.Fatalf("status %+v", es.Status)
+	}
+	if c := meta.FindStatusCondition(es.Status.Conditions, labsv1.ExamConditionDrawn); c == nil || c.Reason != "WaitingForTaskTemplates" {
+		t.Errorf("condition %+v", c)
+	}
+	for _, lt := range saved {
+		lt.ResourceVersion = ""
+		if err := h.c.Create(ctx, lt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h.pump(3)
+	if h.es().Status.Phase != labsv1.ExamInProgress {
+		t.Fatalf("phase %s", h.es().Status.Phase)
+	}
+	// Past the wait, a missing template fails the attempt.
+	h2 := newExamHarness(t, examTemplate(labsv1.ExamEnvironmentShared, false, false))
+	for id := range saved {
+		lt := &labsv1.LabTemplate{}
+		_ = h2.c.Get(ctx, types.NamespacedName{Namespace: examNS, Name: id + "-v1-0123456789"}, lt)
+		_ = h2.c.Delete(ctx, lt)
+	}
+	h2.now = t0.Add(taskTemplateWait + time.Minute)
+	h2.pump(1)
+	if h2.es().Status.Phase != labsv1.ExamFailed {
+		t.Errorf("phase %s", h2.es().Status.Phase)
+	}
+}

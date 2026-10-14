@@ -38,7 +38,13 @@ const (
 	DefaultExamStageTimeout = 15 * time.Minute
 
 	requeueExam = 5 * time.Second
+	// taskTemplateWait tolerates task LabTemplates created together with the
+	// attempt that the cache has not seen yet.
+	taskTemplateWait = 2 * time.Minute
 )
+
+// errTaskTemplatePending: a drawn task's LabTemplate does not exist (yet).
+var errTaskTemplatePending = errors.New("task template not found")
 
 // Learner-safe attempt messages.
 const (
@@ -180,6 +186,10 @@ func (r *ExamSessionReconciler) reconcile(ctx context.Context, run *examRun) (ct
 	// 1. Draw once.
 	if len(st.Tasks) == 0 {
 		if err := r.draw(ctx, run); err != nil {
+			if errors.Is(err, errTaskTemplatePending) && r.now().Sub(es.CreationTimestamp.Time) < taskTemplateWait {
+				r.setCondition(es, labsv1.ExamConditionDrawn, metav1.ConditionFalse, "WaitingForTaskTemplates", err.Error())
+				return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+			}
 			r.setCondition(es, labsv1.ExamConditionDrawn, metav1.ConditionFalse, "DrawFailed", err.Error())
 			r.event(es, "Warning", "DrawFailed", err.Error())
 			return r.failAttempt(ctx, run, "DrawFailed", ExamMsgDrawFailed)
@@ -230,6 +240,9 @@ func (r *ExamSessionReconciler) draw(ctx context.Context, run *examRun) error {
 	for _, d := range drawn {
 		lt := &labsv1.LabTemplate{}
 		if err := r.Get(ctx, client.ObjectKey{Namespace: es.Namespace, Name: d.TemplateRef}, lt); err != nil {
+			if apierrors.IsNotFound(err) {
+				return fmt.Errorf("task %s: LabTemplate %s: %w", d.ID, d.TemplateRef, errTaskTemplatePending)
+			}
 			return fmt.Errorf("task %s: LabTemplate %s: %w", d.ID, d.TemplateRef, err)
 		}
 		rt, err := exam.Resolve(d, &lt.Spec)
