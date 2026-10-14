@@ -1,0 +1,110 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xpe-k8s-autoscale-tracking
+  title: Autoscale the tracking API on CPU
+  domain: kubernetes
+  frameworks: [ct-platform:kubernetes-operations]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [exam, hpa, metrics]
+  version: 1
+spec:
+  description: |
+    **Context:** `qm-harbour` (`kubectl config use-context qm-harbour`)
+
+    Add a HorizontalPodAutoscaler **`tracking-burst`** in namespace
+    **`tracking-scale`** for the Deployment **`tracking-burst`** that keeps it
+    between **3** and **8** replicas at **70 %** average CPU utilisation.
+    Make sure the autoscaler actually reads CPU metrics for the Deployment
+    (its `ScalingActive` condition is true and it reports a current
+    utilisation).
+  objectives:
+    - Create a CPU-based HPA that the metrics pipeline can serve
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-harbour
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-harbour
+          nodes:
+            - {name: harbour-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: harbour-wk-1, role: worker}
+            - {name: harbour-wk-2, role: worker}
+  setup:
+    - on: qm-harbour/harbour-cp-1
+      timeoutSec: 400
+      run: /opt/cloudtrain/bin/addons-install metrics-server --wait
+    - on: qm-harbour
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: tracking-scale}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: tracking-burst, namespace: tracking-scale}
+        spec:
+          replicas: 1
+          selector: {matchLabels: {app: tracking-burst}}
+          template:
+            metadata: {labels: {app: tracking-burst}}
+            spec:
+              containers:
+                - {name: api, image: "httpd:2.4-alpine"}
+  teardown:
+    - on: qm-harbour
+      run: kubectl delete namespace tracking-scale --ignore-not-found --wait=false
+  checks:
+    - id: hpa
+      description: HPA tracking-burst scales the Deployment 3-8 at 70 % CPU
+      type: shell
+      on: qm-harbour
+      skills: [k8s.workloads.autoscaling]
+      weight: 2
+      command: |
+        kubectl -n tracking-scale get hpa.v2.autoscaling tracking-burst -o json 2>/dev/null | jq -r '"\(.spec.scaleTargetRef.name) \(.spec.minReplicas)-\(.spec.maxReplicas) \([.spec.metrics[] | "\(.resource.name):\(.resource.target.averageUtilization)"] | join(","))"'
+      expect: {match: exact, value: "tracking-burst 3-8 cpu:70"}
+    - id: metrics-flow
+      description: The HPA reads CPU utilisation (ScalingActive is True)
+      type: shell
+      on: qm-harbour
+      skills: [k8s.workloads.autoscaling]
+      weight: 2
+      command: |
+        kubectl -n tracking-scale get hpa.v2.autoscaling tracking-burst -o json 2>/dev/null | jq -r '"\([.status.conditions[]? | select(.type == "ScalingActive") | .status] | join("")) \([.status.currentMetrics[]? | .resource.current.averageUtilization | select(. != null)] | length > 0)"'
+      expect: {match: exact, value: True true}
+  misconceptions:
+    - id: no-requests
+      description: Creates the HPA without giving the containers CPU requests.
+      feedback: Utilisation is measured against requests; without them the HPA reports ScalingActive=False.
+      expectFail: [metrics-flow]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-harbour
+          kubectl -n tracking-scale autoscale deploy/tracking-burst --min=3 --max=8 --cpu-percent=70
+          sleep 90
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          kubectl config use-context qm-harbour
+          kubectl -n tracking-scale set resources deploy/tracking-burst -c api --requests=cpu=50m
+          kubectl -n tracking-scale rollout status deploy/tracking-burst --timeout=120s
+          kubectl -n tracking-scale autoscale deploy/tracking-burst --min=3 --max=8 --cpu-percent=70
+          for i in $(seq 1 40); do
+            kubectl -n tracking-scale get hpa tracking-burst -o jsonpath='{.status.conditions[?(@.type=="ScalingActive")].status}' | grep -q True && break; sleep 5
+          done

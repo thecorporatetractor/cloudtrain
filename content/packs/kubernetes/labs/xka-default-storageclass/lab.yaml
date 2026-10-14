@@ -1,0 +1,156 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xka-default-storageclass
+  title: Change the default StorageClass
+  domain: kubernetes
+  frameworks: [cka:storage]
+  difficulty: easy
+  estimatedMinutes: 6
+  tags: [exam, storageclass, pvc]
+  version: 1
+spec:
+  description: |
+    **Context:** `qm-yard` (`kubectl config use-context qm-yard`)
+
+    1. Make the StorageClass **`fast-local`** the **only** default
+       StorageClass of `qm-yard`.
+    2. In namespace **`yard-cache`** (it exists), create a PVC
+       **`scan-cache`** of **1Gi** (ReadWriteOnce) **without** a
+       `storageClassName`, and a Pod **`cache-check`** (image `busybox:1.37`,
+       command `sleep 3600`) that mounts it at `/cache`, so that the claim is
+       provisioned and Bound through `fast-local`.
+  objectives:
+    - Switch the default StorageClass
+    - Let a claim pick up the default class
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-yard
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-yard
+          nodes:
+            - {name: yard-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: yard-wk-1, role: worker}
+            - {name: yard-wk-2, role: worker}
+  setup:
+    - on: qm-yard/yard-cp-1
+      timeoutSec: 400
+      run: /opt/cloudtrain/bin/addons-install storage --wait
+    - on: qm-yard
+      apply: |
+        apiVersion: storage.k8s.io/v1
+        kind: StorageClass
+        metadata: {name: fast-local}
+        provisioner: rancher.io/local-path
+        volumeBindingMode: WaitForFirstConsumer
+        reclaimPolicy: Delete
+        ---
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: yard-cache}
+  teardown:
+    - on: qm-yard
+      run: kubectl delete namespace yard-cache --ignore-not-found --wait=false
+  checks:
+    - id: only-default
+      description: fast-local is the only default StorageClass
+      type: shell
+      on: qm-yard
+      skills: [k8s.storage.storage-classes]
+      weight: 2
+      command: kubectl get storageclass -o json | jq -r '[.items[] | select(.metadata.annotations["storageclass.kubernetes.io/is-default-class"] == "true") | .metadata.name] | join(",")'
+      expect: {match: exact, value: fast-local}
+    - id: claim-bound
+      description: scan-cache (1Gi) is Bound through fast-local and mounted by cache-check
+      type: shell
+      on: qm-yard
+      skills: [k8s.storage.storage-classes]
+      weight: 2
+      command: |
+        echo "$(kubectl -n yard-cache get pvc scan-cache -o jsonpath='{.status.phase} {.spec.storageClassName} {.spec.resources.requests.storage}') \
+        $(kubectl -n yard-cache get pod cache-check -o jsonpath='{.status.phase}')"
+      expect: {match: exact, value: Bound fast-local 1Gi Running}
+  misconceptions:
+    - id: two-defaults
+      description: Marks fast-local as default but leaves local-path default too.
+      feedback: With two defaults the newest wins and the setup is ambiguous; remove the annotation from local-path.
+      expectFail: [only-default]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-yard
+          kubectl annotate storageclass fast-local storageclass.kubernetes.io/is-default-class=true --overwrite
+          kubectl apply -f - <<'YAML'
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata: {name: scan-cache, namespace: yard-cache}
+          spec: {accessModes: [ReadWriteOnce], resources: {requests: {storage: 1Gi}}}
+          ---
+          apiVersion: v1
+          kind: Pod
+          metadata: {name: cache-check, namespace: yard-cache}
+          spec:
+            containers: [{name: c, image: "busybox:1.37", command: ["sleep", "3600"], volumeMounts: [{name: v, mountPath: /cache}]}]
+            volumes: [{name: v, persistentVolumeClaim: {claimName: scan-cache}}]
+          YAML
+          kubectl -n yard-cache wait pod/cache-check --for=condition=Ready --timeout=120s
+    - id: claim-before-default
+      description: Creates the claim before switching the default.
+      feedback: The default class is applied when the claim is created; a claim made earlier keeps local-path.
+      expectFail: [claim-bound]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-yard
+          kubectl apply -f - <<'YAML'
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata: {name: scan-cache, namespace: yard-cache}
+          spec: {accessModes: [ReadWriteOnce], resources: {requests: {storage: 1Gi}}}
+          ---
+          apiVersion: v1
+          kind: Pod
+          metadata: {name: cache-check, namespace: yard-cache}
+          spec:
+            containers: [{name: c, image: "busybox:1.37", command: ["sleep", "3600"], volumeMounts: [{name: v, mountPath: /cache}]}]
+            volumes: [{name: v, persistentVolumeClaim: {claimName: scan-cache}}]
+          YAML
+          kubectl annotate storageclass local-path storageclass.kubernetes.io/is-default-class- --overwrite
+          kubectl annotate storageclass fast-local storageclass.kubernetes.io/is-default-class=true --overwrite
+          kubectl -n yard-cache wait pod/cache-check --for=condition=Ready --timeout=120s
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-yard
+          kubectl annotate storageclass local-path storageclass.kubernetes.io/is-default-class- --overwrite
+          kubectl annotate storageclass fast-local storageclass.kubernetes.io/is-default-class=true --overwrite
+          kubectl apply -f - <<'YAML'
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata: {name: scan-cache, namespace: yard-cache}
+          spec: {accessModes: [ReadWriteOnce], resources: {requests: {storage: 1Gi}}}
+          ---
+          apiVersion: v1
+          kind: Pod
+          metadata: {name: cache-check, namespace: yard-cache}
+          spec:
+            containers: [{name: c, image: "busybox:1.37", command: ["sleep", "3600"], volumeMounts: [{name: v, mountPath: /cache}]}]
+            volumes: [{name: v, persistentVolumeClaim: {claimName: scan-cache}}]
+          YAML
+          kubectl -n yard-cache wait pod/cache-check --for=condition=Ready --timeout=120s

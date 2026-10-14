@@ -1,0 +1,122 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xka-top-cpu-pod
+  title: Report the busiest Pod by CPU
+  domain: kubernetes
+  frameworks: [cka:troubleshooting]
+  difficulty: easy
+  estimatedMinutes: 5
+  tags: [exam, metrics, kubectl-top]
+  version: 1
+spec:
+  description: |
+    **Context:** `qm-fleet` (`kubectl config use-context qm-fleet`)
+
+    Among the Pods labelled **`tier=sorting`** in **all namespaces** of
+    `qm-fleet`, find the one currently using the **most CPU** and write
+    its name (only the name) to `/home/learner/exam/top-cpu.txt`.
+  objectives:
+    - Read CPU use across namespaces from the metrics API
+  params:
+    busy:
+      type: choice
+      values: [sorter-gamma, sorter-alpha, sorter-delta]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-fleet
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-fleet
+          nodes:
+            - {name: fleet-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: fleet-wk-1, role: worker}
+            - {name: fleet-wk-2, role: worker}
+  setup:
+    - on: qm-fleet/fleet-cp-1
+      timeoutSec: 400
+      run: /opt/cloudtrain/bin/addons-install metrics-server --wait
+    - on: qm-fleet
+      timeoutSec: 400
+      run: |
+        set -e
+        for ns in sort-east sort-west; do kubectl create namespace $ns --dry-run=client -o yaml | kubectl apply -f -; done
+        i=0
+        for p in sorter-alpha sorter-beta sorter-gamma sorter-delta; do
+          i=$((i+1)); ns=sort-east; [ $((i % 2)) = 0 ] && ns=sort-west
+          lim=40m; [ "$p" = "{{busy}}" ] && lim=250m
+          cat <<YAML | kubectl apply -f -
+        apiVersion: v1
+        kind: Pod
+        metadata: {name: $p, namespace: $ns, labels: {tier: sorting}}
+        spec:
+          terminationGracePeriodSeconds: 1
+          containers:
+            - name: sort
+              image: busybox:1.37
+              command: ["sh", "-c", "while true; do :; done"]
+              resources: {requests: {cpu: 20m}, limits: {cpu: $lim}}
+        YAML
+        done
+        cat <<'YAML' | kubectl apply -f -
+        apiVersion: v1
+        kind: Pod
+        metadata: {name: crane-sim, namespace: sort-east, labels: {tier: simulation}}
+        spec:
+          terminationGracePeriodSeconds: 1
+          containers:
+            - {name: sim, image: "busybox:1.37", command: ["sh", "-c", "while true; do :; done"], resources: {limits: {cpu: 350m}}}
+        YAML
+        kubectl wait -n sort-east pod --all --for=condition=Ready --timeout=150s
+        kubectl wait -n sort-west pod --all --for=condition=Ready --timeout=150s
+        for i in $(seq 1 40); do [ "$(kubectl top pod -A -l tier=sorting --no-headers 2>/dev/null | wc -l)" = 4 ] && break; sleep 5; done
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/exam
+  teardown:
+    - on: qm-fleet
+      run: kubectl delete namespace sort-east sort-west --ignore-not-found --wait=false
+  checks:
+    - id: busiest
+      description: The file names the tier=sorting Pod with the highest CPU use
+      type: file
+      on: workstation
+      target: /home/learner/exam/top-cpu.txt
+      skills: [k8s.troubleshooting.resource-usage]
+      weight: 2
+      expect: {match: regex, value: '^{{busy}}\n?$'}
+  misconceptions:
+    - id: label-ignored
+      description: Ignores the label and picks the busiest Pod overall.
+      feedback: Filter with -l tier=sorting.
+      expectFail: [busiest]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-fleet
+          kubectl top pod -A --sort-by=cpu --no-headers | grep -v kube-system | head -1 | awk '{print $2}' > ~/exam/top-cpu.txt
+    - id: one-namespace
+      description: Looks only in the current namespace.
+      feedback: The sorting Pods are spread over several namespaces; use -A.
+      expectFail: [busiest]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-fleet
+          kubectl top pod -l tier=sorting --sort-by=cpu --no-headers 2>/dev/null | head -1 | awk '{print $1}' > ~/exam/top-cpu.txt
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-fleet
+          kubectl top pod -A -l tier=sorting --sort-by=cpu --no-headers | head -1 | awk '{print $2}' > ~/exam/top-cpu.txt

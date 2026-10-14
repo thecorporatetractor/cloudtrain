@@ -1,0 +1,124 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xka-ingress-host-rule
+  title: Publish an app through an Ingress host rule
+  domain: kubernetes
+  frameworks: [cka:services-networking]
+  difficulty: easy
+  estimatedMinutes: 6
+  tags: [exam, ingress]
+  version: 1
+spec:
+  description: |
+    **Context:** `qm-tracking` (`kubectl config use-context qm-tracking`)
+
+    In namespace **`ferry-info`**, create an Ingress **`ferry-board`** for the
+    cluster's IngressClass (`kubectl get ingressclass`) that routes
+    **`ferry.quillmoor.example/`** (every path) to the Service
+    **`ferry-board`** on port **8080**.
+
+    The Ingress controller listens on port 30080 of every node.
+  objectives:
+    - Write an Ingress host rule for an existing IngressClass
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-tracking
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-tracking
+          nodes:
+            - {name: tracking-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: tracking-wk-1, role: worker}
+            - {name: tracking-wk-2, role: worker}
+  setup:
+    - on: qm-tracking/tracking-cp-1
+      timeoutSec: 400
+      run: /opt/cloudtrain/bin/addons-install ingress --wait
+    - on: qm-tracking
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: ferry-info}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: ferry-board, namespace: ferry-info}
+        spec:
+          replicas: 2
+          selector: {matchLabels: {app: ferry-board}}
+          template:
+            metadata: {labels: {app: ferry-board}}
+            spec:
+              terminationGracePeriodSeconds: 1
+              containers:
+                - name: board
+                  image: busybox:1.37
+                  command: ["sh", "-c", "mkdir -p /www && echo ferry-board-ok > /www/index.html && exec httpd -f -p 8080 -h /www"]
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata: {name: ferry-board, namespace: ferry-info}
+        spec:
+          selector: {app: ferry-board}
+          ports: [{port: 8080}]
+  teardown:
+    - on: qm-tracking
+      run: kubectl delete namespace ferry-info --ignore-not-found --wait=false
+  checks:
+    - id: ingress
+      description: Ingress ferry-board uses the cluster's IngressClass for host ferry.quillmoor.example
+      type: k8s-query
+      skills: [k8s.networking.ingress-gateway]
+      query: {cluster: qm-tracking, resource: ingress, name: ferry-board, namespace: ferry-info, jsonpath: '{.spec.ingressClassName} {.spec.rules[0].host} {.spec.rules[0].http.paths[0].backend.service.name}:{.spec.rules[0].http.paths[0].backend.service.port.number}'}
+      expect: {match: exact, value: "traefik ferry.quillmoor.example ferry-board:8080"}
+    - id: routed
+      description: ferry.quillmoor.example answers through the Ingress controller
+      type: shell
+      on: workstation
+      skills: [k8s.networking.ingress-gateway]
+      weight: 2
+      timeoutSec: 20
+      command: |
+        curl -s -m 5 -H 'Host: ferry.quillmoor.example' http://tracking-wk-2:30080/ || echo unreachable
+      expect: {match: exact, value: ferry-board-ok}
+  misconceptions:
+    - id: wrong-port
+      description: Points the backend at port 80.
+      feedback: The Service listens on 8080.
+      expectFail: [ingress, routed]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-tracking
+          kubectl -n ferry-info create ingress ferry-board --class=traefik --rule="ferry.quillmoor.example/*=ferry-board:80"
+          sleep 5
+    - id: no-host
+      description: Leaves out the host, so the rule catches every host name.
+      feedback: The rule belongs to ferry.quillmoor.example only.
+      expectFail: [ingress]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-tracking
+          kubectl -n ferry-info create ingress ferry-board --class=traefik --rule="/*=ferry-board:8080"
+          sleep 5
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-tracking
+          kubectl get ingressclass
+          kubectl -n ferry-info create ingress ferry-board --class=traefik --rule="ferry.quillmoor.example/*=ferry-board:8080"
+          sleep 5
