@@ -36,6 +36,10 @@ const (
 	// pooled session was claimed, False when the session was provisioned
 	// itself instead (pool missing, exhausted or of another template).
 	ConditionClaimed = "Claimed"
+	// ConditionAccessRevoked is True once spec.accessRevoked took effect:
+	// endpoints withdrawn and every learner process on the entry node and the
+	// VM nodes killed.
+	ConditionAccessRevoked = "AccessRevoked"
 )
 
 // LearnerRef identifies the learner owning a session.
@@ -95,6 +99,14 @@ type LabSessionSpec struct {
 	// in status.validation with the same observedRequest.
 	// +optional
 	ValidateRequest int64 `json:"validateRequest,omitempty"`
+	// AccessRevoked freezes the session for the learner (exam time is up):
+	// endpoints are withdrawn and the learner's processes on the entry node
+	// and the VM nodes are killed, while the nodes keep running so the
+	// session can still be graded (checks and admin actions are unaffected).
+	// It is sticky: once the AccessRevoked condition is True, clearing the
+	// field does not restore access.
+	// +optional
+	AccessRevoked bool `json:"accessRevoked,omitempty"`
 }
 
 // NodePhase is the lifecycle phase of a single topology node.

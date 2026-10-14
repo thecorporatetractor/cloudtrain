@@ -312,6 +312,10 @@ export interface Exam {
     anyOrder?: boolean;
     flagForReview?: boolean;
     rebootBeforeGrade: boolean;
+    /**
+     * Re-run each task's spec.exam.rerun actions after the first grading pass and grade again (e.g. saved playbooks must report no changes). Default false.
+     */
+    idempotencyRerun?: boolean;
     docsAllowed?: string;
     partialCredit?: "per-check" | "per-task" | "none";
     notes?: string;

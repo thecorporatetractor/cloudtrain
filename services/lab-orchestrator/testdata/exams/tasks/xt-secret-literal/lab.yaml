@@ -1,0 +1,66 @@
+# Test fixture for the exam engine (not curriculum content).
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xt-secret-literal
+  title: Store the cargo API token
+  domain: kubernetes
+  frameworks: [ckad:environment-config-security]
+  difficulty: easy
+  estimatedMinutes: 4
+  tags: [exam-fixture]
+spec:
+  description: |
+    Use context `exam-core`.
+
+    The cargo booking service in namespace `cargo-auth` expects its API token
+    in a generic Secret named `cargo-api`, key `token`, value `{{token}}`.
+    Create it. Do not touch the Secret `cargo-legacy`.
+  params:
+    token: {type: name, prefix: qltok}
+  topology:
+    entry: workstation
+    nodes:
+      - {name: workstation, driver: container, image: "jumphost:1", access: [shell]}
+      - name: exam-core
+        driver: k8s-cluster
+        cluster: {mode: virtual, version: "v1.37", context: exam-core}
+  setup:
+    - on: exam-core
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: cargo-auth}
+        ---
+        apiVersion: v1
+        kind: Secret
+        metadata: {name: cargo-legacy, namespace: cargo-auth}
+        stringData: {token: retired-token}
+  checks:
+    - id: token-value
+      description: cargo-api holds the token under key token
+      type: shell
+      on: exam-core
+      skills: [k8s.security.secrets]
+      command: kubectl -n cargo-auth get secret cargo-api -o jsonpath='{.data.token}' | base64 -d
+      expect: {match: exact, value: "{{token}}"}
+    - id: generic-type
+      description: cargo-api is a generic (Opaque) Secret
+      type: k8s-query
+      skills: [k8s.security.secrets]
+      weight: 0.5
+      query: {cluster: exam-core, resource: secret, name: cargo-api, namespace: cargo-auth, jsonpath: "{.type}"}
+      expect: {match: exact, value: "Opaque"}
+    - id: legacy-untouched
+      description: cargo-legacy is unchanged
+      type: shell
+      on: exam-core
+      skills: [k8s.cli.scoped-changes]
+      weight: 0.5
+      command: kubectl -n cargo-auth get secret cargo-legacy -o jsonpath='{.data.token}' | base64 -d
+      expect: {match: exact, value: "retired-token"}
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        run: kubectl --context exam-core -n cargo-auth create secret generic cargo-api --from-literal=token={{token}}

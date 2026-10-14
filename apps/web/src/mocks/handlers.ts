@@ -6,6 +6,7 @@ import { homeData } from './fixtures/home';
 import { myAssignments, personById, skillStatesOf, teamSeedById, userRef } from './fixtures/platform';
 import { drafts as seedDrafts, freshGates, specFromPrompt } from './fixtures/studio';
 import { allPlatformHandlers, currentSession, currentUser, mockNotices } from './platformHandlers';
+import { examHandlers } from './examHandlers';
 
 /* ------------------------------------------------------------------ */
 /* In-memory state (resets on reload)                                  */
@@ -253,4 +254,4 @@ export const sampleOnlyHandlers = [
   }),
 ];
 
-export const handlers = [...allPlatformHandlers, ...coreHandlers, ...sampleOnlyHandlers];
+export const handlers = [...allPlatformHandlers, ...coreHandlers, ...examHandlers, ...sampleOnlyHandlers];

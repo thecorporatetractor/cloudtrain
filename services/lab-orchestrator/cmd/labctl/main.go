@@ -3,6 +3,7 @@
 //	labctl compile [--seed N] [--defaults] [--namespace NS] [--schema FILE] <lab.yaml>
 //	labctl validate [--schema FILE] <dir>...
 //	labctl verify [--context C] [--parallel N] [--only ID] [--keep] <lab dir|lab.yaml>...
+//	labctl exam compile|draw|run [flags] <exam-id>
 package main
 
 import (
@@ -28,6 +29,7 @@ Usage:
   labctl compile [flags] <lab.yaml>   print the compiled LabTemplate as YAML
   labctl validate [flags] <dir>...    validate every lab.yaml under the directories
   labctl verify [flags] <lab>...      run the verifier cycle on a live cluster (see docs/k8s-readiness.md)
+  labctl exam compile|draw|run ...    exam simulations (see 'labctl exam help')
 
 Run 'labctl <command> -h' for command flags.
 `
@@ -48,6 +50,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return cmdValidate(args[1:], stdout, stderr)
 	case "verify":
 		return cmdVerify(args[1:], stdout, stderr)
+	case "exam":
+		return cmdExam(args[1:], stdout, stderr)
 	case "-h", "--help", "help":
 		fmt.Fprint(stdout, usage)
 		return 0

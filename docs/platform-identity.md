@@ -52,6 +52,19 @@ the web only hides UI, it never enforces.
 `platform_admin` holds every permission plus `org.manage`, `capacity.read`,
 `support.access` at platform scope.
 
+Exam simulations use the same permissions (no exam-specific ones):
+
+| Exam action | Permission and scope |
+|---|---|
+| Catalog, start, flag, submit, own reports, exam terminal | `lab.run` (self: only the caller's own attempts) |
+| Team exam readiness (`/team/exams`) | `progress.read.team` on the team (manager: teams they manage; org admin: any team) |
+| Void someone's running attempt (not scored, not counted) | `session.control` on the candidate (instructor: their cohorts; org admin) |
+| Grant one retake past the cooldown / 30-day cap | `assignment.manage` on the candidate (manager: their teams; instructor: their cohorts; org admin) |
+
+The retake policy comes from the exam's `retakePolicy` in
+`content/curriculum.yaml` and is enforced by the gateway; "one running attempt
+per person and exam" is also a unique index, so it holds under concurrent starts.
+
 ## SSO and authentication
 
 - **Keycloak 26** is the identity broker: one realm `cloudtrain`, the
@@ -109,6 +122,13 @@ the web only hides UI, it never enforces.
 | `content_visibility` | org_id, pack_id/lab_id, enabled, pinned_paths |
 | `quotas` | org_id, max_concurrent_sessions, monthly_lab_hours, max_session_minutes |
 | `audit_log` | org_id, at, actor_id, action, target_type, target_id, ip, details jsonb (append-only) |
+| `exam_attempts` | org_id, id (= ExamSession name), user_id, exam_id, number, seed, phase, started_at, timer_started_at, deadline, submitted_at, completed_at, tasks jsonb, flagged int[], score, passed, report jsonb, evidence_recorded, voided_at/by, void_reason; unique running attempt per (org, user, exam) |
+| `exam_task_results` | org_id, attempt_id, task_index, task_id, objective, weight, outcome, score, checks jsonb |
+| `exam_retake_grants` | org_id, id, user_id, exam_id, granted_by, reason, used_at, used_by_attempt |
+
+A graded exam attempt feeds the same learner model: one `lab_attempts` row per
+task (session `<attempt>/t<index>`, hints 0) with its `check_results` and
+`skill_evidence`, then `learner_skill_state`, exactly once per attempt.
 
 Grading results (`status.validation`) are persisted on every validate:
 `lab_attempts` + `check_results` + `skill_evidence`, then `learner_skill_state` is
@@ -160,6 +180,13 @@ All under `/api`, JSON, cookie session, CSRF header on writes. Types in
 - Manager: `GET /teams`, `GET /teams/:id/dashboard`, `GET /teams/:id/members/:userId`,
   `POST /assignments`, `GET /assignments?team=`, `DELETE /assignments/:id`,
   `GET /reports/progress.csv?team=&from=&to=`.
+- Exams: `GET /exams`, `GET /exams/:examId`, `POST /exams/:examId/attempts`,
+  `GET /exams/attempts/mine`, `GET /exams/attempts/:id` (+ `/report`, terminal
+  WebSocket), `PUT /exams/attempts/:id/tasks/:index/flag`,
+  `POST /exams/attempts/:id/submit` (lab.run); `GET /exams/team-readiness?team=`
+  (progress.read.team); `POST /exams/attempts/:id/void` (session.control);
+  `POST /exams/:examId/retake-grants` (assignment.manage). Audited: `exam.start`,
+  `exam.submit`, `exam.void`, `exam.retake_grant`.
 - Instructor: `GET /cohorts`, `POST /cohorts`, `GET /cohorts/:id/board`,
   `POST /sessions/:id/extend|reset|terminate`, terminal WebSocket with `?observe=1`.
 - Admin: `/admin/overview`, `/admin/users` (GET, POST invite, PATCH roles/teams/status),

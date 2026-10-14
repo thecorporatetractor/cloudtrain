@@ -88,6 +88,8 @@ export interface LabSessionSpec {
   hibernate?: boolean;
   resetGeneration?: number;
   validateRequest?: number;
+  /** Exam freeze: endpoints withdrawn, learner processes ended (orchestrator). */
+  accessRevoked?: boolean;
 }
 
 export interface LabSessionStatus {

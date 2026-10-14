@@ -15,7 +15,7 @@ import { createTestDb, type TestDb } from './pg.js';
 
 /** Test auth: the principal is loaded from the database for the user named in `x-test-user`. */
 export class HeaderAuthenticator implements Authenticator {
-  readonly csrf = false;
+  readonly csrf: boolean = false;
   constructor(private readonly t: TestDb) {}
   async authenticate(req: FastifyRequest): Promise<Principal | null> {
     const id = req.headers['x-test-user'];

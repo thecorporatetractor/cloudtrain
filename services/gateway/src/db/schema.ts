@@ -298,6 +298,57 @@ export interface AssignmentTargetsView {
   via_id: string;
 }
 
+export interface ExamAttemptsTable {
+  org_id: string;
+  id: string;
+  user_id: string;
+  exam_id: string;
+  exam_title: string;
+  number: number;
+  seed: number;
+  phase: 'preparing' | 'in-progress' | 'grading' | 'completed' | 'failed';
+  started_at: Timestamp;
+  timer_started_at: Timestamp | null;
+  deadline: Timestamp | null;
+  submitted_at: Timestamp | null;
+  completed_at: Timestamp | null;
+  duration_minutes: number;
+  tasks: Json<unknown[]>;
+  flagged: number[];
+  /** numeric(5,1): read as a string. */
+  score: ColumnType<string | null, number | string | null, number | string | null>;
+  passed: boolean | null;
+  report: Json<unknown> | null;
+  evidence_recorded: Generated<boolean>;
+  voided_at: Timestamp | null;
+  voided_by: string | null;
+  void_reason: string | null;
+}
+
+export interface ExamTaskResultsTable {
+  org_id: string;
+  attempt_id: string;
+  task_index: number;
+  task_id: string;
+  objective: string;
+  weight: ColumnType<string, number | string, number | string>;
+  outcome: 'pass' | 'partial' | 'fail';
+  score: ColumnType<string, number | string, number | string>;
+  checks: Json<unknown[]>;
+}
+
+export interface ExamRetakeGrantsTable {
+  id: Generated<string>;
+  org_id: string;
+  user_id: string;
+  exam_id: string;
+  granted_by: string | null;
+  reason: string | null;
+  created_at: CreatedAt;
+  used_at: Timestamp | null;
+  used_by_attempt: string | null;
+}
+
 export interface DB {
   orgs: OrgsTable;
   users: UsersTable;
@@ -322,6 +373,9 @@ export interface DB {
   auth_sessions: AuthSessionsTable;
   assignment_status: AssignmentStatusView;
   assignment_targets: AssignmentTargetsView;
+  exam_attempts: ExamAttemptsTable;
+  exam_task_results: ExamTaskResultsTable;
+  exam_retake_grants: ExamRetakeGrantsTable;
 }
 
 export type OrgRow = Selectable<OrgsTable>;

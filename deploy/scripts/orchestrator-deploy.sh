@@ -63,7 +63,10 @@ fi
 # VM_DISKS=persistent to exercise hibernate); SESSION_SELECTOR restricts it to matching
 # LabSessions (e.g. labs.cloudtrain.dev/verify=true for labctl verify), so
 # several managers can share the cluster without reconciling each other's
-# sessions. Defaults: cloudtrain-system, all sessions. SKIP_CRDS=1 leaves the
+# sessions. A separate instance also gets its own ClusterRole
+# (lab-orchestrator-<ns>), so deploying one branch's manager never rewrites the
+# permissions of another branch's instance. Defaults: cloudtrain-system, all
+# sessions. SKIP_CRDS=1 leaves the
 # cluster's CRDs alone (when other branches' API additions are installed).
 NS=${ORCH_NAMESPACE:-cloudtrain-system}
 manifests() {
@@ -71,6 +74,8 @@ manifests() {
     | NS="$NS" IMG="$IMG" SEL="${SESSION_SELECTOR:-}" VMD="${VM_DISKS:-ephemeral}" yq '
         (select(.kind == "Namespace") | .metadata.name) = strenv(NS) |
         (select(.metadata.namespace == "cloudtrain-system") | .metadata.namespace) = strenv(NS) |
+        (select(.kind == "ClusterRole" and strenv(NS) != "cloudtrain-system") | .metadata.name) = "lab-orchestrator-" + strenv(NS) |
+        (select(.kind == "ClusterRoleBinding" and strenv(NS) != "cloudtrain-system") | .roleRef.name) = "lab-orchestrator-" + strenv(NS) |
         (select(.kind == "ClusterRoleBinding") | .metadata.name) = "lab-orchestrator-" + strenv(NS) |
         (select(.kind == "ClusterRoleBinding") | .subjects[0].namespace) = strenv(NS) |
         (select(.kind == "Deployment") | .spec.template.spec.containers[0].image) = strenv(IMG) |

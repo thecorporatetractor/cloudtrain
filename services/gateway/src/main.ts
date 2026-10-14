@@ -1,3 +1,4 @@
+import path from 'node:path';
 import { sql } from 'kysely';
 import { buildApp } from './app.js';
 import { loadConfig } from './config.js';
@@ -13,6 +14,11 @@ import { OidcAuthenticator, Sealer, SessionStore } from './oidc/sessions.js';
 import { PlatformService } from './platform/service.js';
 import { SessionService } from './sessions/service.js';
 import { TerminalHub } from './terminal/hub.js';
+import { loadExamCatalog } from './exams/catalog.js';
+import { LabctlExamCompiler } from './exams/compile.js';
+import { KubeExamCluster } from './exams/kube.js';
+import { PgEvidenceSink, PgExamStore, PgTeamDirectory } from './exams/pg.js';
+import { ExamService } from './exams/service.js';
 
 async function main() {
   const config = loadConfig();
@@ -57,6 +63,20 @@ async function main() {
   });
   sessions.hooks = platform;
 
+  // Exam simulations: attempts, results and retake grants in Postgres (RLS),
+  // evidence into the learner model, teams from teams/team_members.
+  const examCatalog = await loadExamCatalog(content, config.contentDir, config.curriculumFile, config.extraExamFiles);
+  const exams = new ExamService(
+    examCatalog,
+    content,
+    new KubeExamCluster(kc, config.namespace),
+    new LabctlExamCompiler(config.labctl, [path.join(config.contentDir, 'packs'), ...config.extraLabDirs]),
+    new PgExamStore(db),
+    new PgEvidenceSink(db, content),
+    new PgTeamDirectory(db),
+    { sessionLabels: config.examSessionLabels, ...(config.examDurationMinutes ? { durationMinutes: config.examDurationMinutes } : {}) },
+  );
+
   const app = await buildApp({
     content,
     auth: new OidcAuthenticator(db, store, oidc),
@@ -66,9 +86,12 @@ async function main() {
     oidc: { client: oidc, store },
     clusterInfo: new KubeClusterInfo(kc),
     hub: new TerminalHub(),
+    exams,
     logger: { level: config.logLevel },
   });
   log = app.log;
+  for (const i of examCatalog.issues) app.log.warn({ file: i.file }, `exams skipped: ${i.message}`);
+  app.log.info({ exams: examCatalog.exams.size, available: [...examCatalog.exams.values()].filter((e) => e.availability === 'available').map((e) => e.def.id) }, 'exam catalog loaded');
 
   for (const i of content.issues) app.log.warn({ file: i.file }, `lab skipped: ${i.message}`);
   app.log.info({ labs: content.labs.size, skills: content.skills.length, frameworks: content.frameworks.length, context: config.kubeContext, namespace: config.namespace }, 'content loaded');

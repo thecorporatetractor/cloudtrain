@@ -176,6 +176,8 @@ function me(): Me | undefined {
   const s = readSession();
   return s ? buildMe(s) : undefined;
 }
+/** The mock principal (permissions, managed teams) for other handler modules (exams). */
+export const currentMe = (): Me | undefined => me();
 
 /* ------------------------------------------------------------------ */
 /* Mutable state                                                        */

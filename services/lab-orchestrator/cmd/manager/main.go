@@ -88,6 +88,8 @@ func main() {
 		cacheOpts.ByObject[&labsv1.LabSession{}] = cache.ByObject{Label: sel}
 		// Pools carry the same labels (pooled sessions inherit them).
 		cacheOpts.ByObject[&labsv1.WarmPool{}] = cache.ByObject{Label: sel}
+		// Exam attempts too (their environment sessions inherit their labels).
+		cacheOpts.ByObject[&labsv1.ExamSession{}] = cache.ByObject{Label: sel}
 	}
 	if watchNamespace != "" {
 		cacheOpts.DefaultNamespaces = map[string]cache.Config{watchNamespace: {}}
@@ -183,6 +185,13 @@ func main() {
 		Metrics: poolMetrics,
 	}).SetupWithManager(mgr); err != nil {
 		log.Error(err, "unable to set up WarmPool controller")
+		os.Exit(1)
+	}
+	if err := (&controller.ExamSessionReconciler{
+		Client: mgr.GetClient(), Scheme: scheme, Drivers: reg,
+		Recorder: mgr.GetEventRecorderFor("lab-orchestrator"),
+	}).SetupWithManager(mgr); err != nil {
+		log.Error(err, "unable to set up ExamSession controller")
 		os.Exit(1)
 	}
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {

@@ -1,0 +1,65 @@
+# Test fixture for the exam engine (not curriculum content).
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xt-scale-manifest-api
+  title: Scale the manifest API
+  domain: kubernetes
+  frameworks: [ckad:deployment]
+  difficulty: easy
+  estimatedMinutes: 4
+  tags: [exam-fixture]
+spec:
+  description: |
+    Use context `exam-core`.
+
+    Quillmoor's manifest API in namespace `manifest-api` cannot keep up with
+    the morning sailings. Scale the Deployment `manifest-api` to
+    **{{replicas}}** replicas and make sure every Pod becomes ready.
+  params:
+    replicas: {type: int, min: 3, max: 5}
+  topology:
+    entry: workstation
+    nodes:
+      - {name: workstation, driver: container, image: "jumphost:1", access: [shell]}
+      - name: exam-core
+        driver: k8s-cluster
+        cluster: {mode: virtual, version: "v1.37", context: exam-core}
+  setup:
+    - on: exam-core
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: manifest-api}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: manifest-api, namespace: manifest-api}
+        spec:
+          replicas: 1
+          selector: {matchLabels: {app: manifest-api}}
+          template:
+            metadata: {labels: {app: manifest-api}}
+            spec:
+              containers: [{name: api, image: "caddy:2-alpine"}]
+  checks:
+    - id: desired-replicas
+      description: manifest-api is set to the requested number of replicas
+      type: k8s-query
+      skills: [k8s.workloads.scaling]
+      query: {cluster: exam-core, resource: deployment, name: manifest-api, namespace: manifest-api, jsonpath: "{.spec.replicas}"}
+      expect: {match: exact, value: "{{replicas}}"}
+    - id: ready-replicas
+      description: every manifest-api Pod is ready
+      type: k8s-query
+      skills: [k8s.workloads.scaling]
+      query: {cluster: exam-core, resource: deployment, name: manifest-api, namespace: manifest-api, jsonpath: "{.status.readyReplicas}"}
+      expect: {match: exact, value: "{{replicas}}"}
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          kubectl --context exam-core -n manifest-api scale deployment manifest-api --replicas={{replicas}}
+          kubectl --context exam-core -n manifest-api rollout status deployment manifest-api --timeout=100s

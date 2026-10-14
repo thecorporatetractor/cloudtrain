@@ -10,6 +10,8 @@ see `packages/lab-schema`) into running, isolated topologies.
 | `LabTemplate` (`lt`) | Compiled, immutable lab definition: source metadata + digest, params, topology (nodes, links, entry), setup/teardown actions, checks, hints, misconceptions, solution. `{{params}}` stay unresolved; the spec is immutable (CEL rule). |
 | `LabSession` (`ls`) | One learner attempt: `templateRef`, `learner`, `seed`, `ttl`/`expiresAt`, `hibernate`, optional `warmPoolRef`. `resetGeneration`. Status: phase (`Pending`, `Provisioning`, `Ready`, `Grading`, `Hibernated`, `Expired`, `Failed`), recorded topology, setup progress, conditions, resolved params, per-node status, access endpoints, entry node, expiry. |
 | `WarmPool` (`wp`) | `templateRef`, `size`, `maxSurge`, `maxIdle`; keeps `size` Ready, unclaimed sessions; status `ready` / `provisioning` / `claimed` + conditions `Ready`, `Degraded` (see "Warm pools"). |
+| `ExamTemplate` (`et`) | Compiled, immutable exam simulation (from `exams` in `content/curriculum.yaml`): blueprint objectives with weights, draw counts and pools (pool tasks are LabTemplates referenced by name), duration, pass mark, rules, retake policy. See "Exam simulations". |
+| `ExamSession` (`es`) | One candidate attempt: `examTemplateRef`, `candidate`, `seed`, `avoidTasks`, `duration` override, `submit`, `retainEnvironment`. Status: phase (`Pending`, `Provisioning`, `InProgress`, `Grading`, `Completed`, `Failed`), drawn tasks (resolved statements, weights, nodes, contexts), environments (mirrored endpoints while in progress), `startedAt`/`deadline`/`submittedAt`/`frozenAt`, grading passes, score report. |
 
 CRDs are generated into `config/crd`, RBAC into `config/rbac`.
 
@@ -320,6 +322,102 @@ so no golden PVC); 2.7 GB allocated per disk (11 GiB sparse raw), i.e.
 `deploy/.results/warmpool-*-proof.txt` for session-level timings. KubeVirt
 pause was rejected: it keeps the virt-launcher pods and their memory and CPU
 requests, so it frees no schedulable capacity.
+
+## Exam simulations
+
+**Why on top of LabSession, not instead of it.** An attempt needs exactly
+what a lab session already does (topology, drivers, setup, endpoints,
+grading, teardown), plus a draw, one timer, a freeze, extra grading passes and
+a weighted report. So `ExamSession` owns ordinary `LabSession`s: the exam
+controller (`internal/controller/examsession_controller.go`, pure logic in
+`internal/exam`) writes one resolved `LabTemplate` per environment and runs it
+as a `LabSession` it controls. Nothing in the drivers knows about exams; the
+only `LabSession` addition is `spec.accessRevoked` (the freeze).
+
+**Compile** (`labctl exam compile`, `internal/exam/compile.go`): the exam entry
+is validated against `curriculum.schema.json#/$defs/exam` (embedded copy,
+YAML 1.2), each pool task's lab compiles to a LabTemplate named like the
+gateway names lab templates (`<id>-v<version>-<digest10>`), and the exam must
+be consistent: every pool covers its draw, `taskCount` = sum of draws, a task
+is in one pool only, no `k8s-context` checks (the candidate switches contexts
+between tasks), and for `environment: shared` every pool task agrees on shared
+nodes (same name = identical node definition, a context belongs to one node,
+one entry node, links never disagree). That makes the union of *any* draw
+well-defined.
+
+**Draw** (`internal/exam/draw.go`): per objective, a seeded shuffle of the
+pool; with `retakePolicy.freshDraw`, tasks in `spec.avoidTasks` (the gateway
+passes the candidate's earlier tasks) are taken only when the pool has too few
+others. Task seed = SHA-256(attempt seed, task id), so a task's params do not
+depend on the rest of the draw. Task weight = objective weight (normalised over
+drawn objectives) / tasks drawn for it.
+
+**Environment** (`internal/exam/env.go`): `shared` = one LabTemplate
+`<attempt>-env` with the union of the drawn tasks' nodes (names and contexts
+exactly as authored; entry first, then sorted), links, setup and teardown in
+task order, checks prefixed `t<index>/`; `per-task` = one `<attempt>-t<i>`
+each. Every task is resolved with its own seed before merging, so the
+environment has no params; it never carries hints, misconceptions, solution
+steps or explanations (its required solution is a no-op). The environment
+LabSession carries the attempt's labels (scoped managers) and
+`labs.cloudtrain.dev/exam-session`.
+
+**Lifecycle**: `Pending` -> draw (`status.tasks`: resolved statement,
+objective, weight, nodes, contexts) -> `Provisioning` (fails, unscored, after
+40m) -> all environments Ready: `startedAt`, `deadline = startedAt +
+duration`, `InProgress`, endpoints mirrored -> `spec.submit` or the deadline
+-> `Grading`: **Freeze** (`accessRevoked` on every environment: endpoints
+withdrawn, every learner process on the entry node, the VMs and kubeadm
+members killed by `RevokeScript`; condition `AccessRevoked`) -> **Initial**
+pass (`validateRequest`, existing grader) -> **Rerun** (`rules.idempotencyRerun`:
+each task's `spec.exam.rerun` actions, e.g. re-apply the saved manifest /
+playbook and assert no changes) -> **RerunGrade** -> **Reboot**
+(`rules.rebootBeforeGrade`: guest reboot of every VM and kubeadm member, boot
+ids recorded) -> **RebootWait** (new boot id, ssh back, kubeadm `/readyz`,
+session Ready; 15m stage timeout) -> **RebootGrade** -> **Done**: score report,
+`Completed`, environments deleted (`EnvironmentReleased`). An environment that
+fails before or during the attempt fails the attempt unscored. Every stage
+persists its progress; a grading round that does not answer within 15 minutes
+records the missing checks as failed ("the check could not run").
+
+**Score report** (`internal/exam/score.go`): a check passes if it passed in
+every pass that ran and its task's re-run succeeded (`failedOnRerun`,
+`failedAfterReboot` flags otherwise); task score per `rules.partialCredit`
+(`per-check`: weighted share; `per-task`/`none`: all or nothing); outcome
+pass/partial/fail; objective score = mean of its tasks; total = objective
+scores weighted by normalised objective weight; `passed = total >= passMark`
+(one decimal). Messages are the grader's learner-safe ones; grader output is
+never stored on the attempt.
+
+**labctl exam** (`cmd/labctl/exam.go`, `exam_run.go`):
+
+```sh
+bin/labctl exam compile --all                     # every curriculum exam (reports missing pool labs)
+bin/labctl exam compile --exams testdata/exams/exams.yaml --labs testdata/exams/tasks sim-test-k8s-dev
+bin/labctl exam draw --seed 7 [--avoid id,..] [--statements] [-o json] <exam>
+bin/labctl exam run --auto-solve|--no-solve [--attempts N] [--expire --duration 3m] \
+  --context kind-cloudtrain-dev --session-label labs.cloudtrain.dev/verify=true <exam>
+```
+
+`run` creates a namespace with the task templates and the ExamTemplate, then
+per attempt an ExamSession (retakes avoid earlier tasks and must be disjoint
+where the pools allow); `--auto-solve` applies each drawn task's reference
+solution (resolved from the task template with the task seed) and expects
+100 %, `--no-solve` expects a fail, `--expire` skips the submit, starts a
+learner background process and proves the freeze at the deadline. It checks
+the draw against the offline preview, the environment's nodes against the
+union, released environments and an empty namespace afterwards; reports go to
+`deploy/.results/exams/<exam>-<mode>.json`.
+
+**Exam-task contract** (for content streams): a lab with `type: exam` in the
+curriculum; statement names the context/host to use; no `k8s-context` checks;
+nodes shared with the other tasks of its exam are defined identically (same
+name, image, cluster spec, context); work in task-specific namespaces/paths so
+tasks never collide in a shared environment; checks grade end state only (they
+run after the freeze, with admin credentials); state that must survive
+`rebootBeforeGrade` must persist; tasks of exams with `idempotencyRerun`
+declare `spec.exam.rerun`; hints are allowed in the file but never shown in an
+exam.
 
 ## Grading
 
