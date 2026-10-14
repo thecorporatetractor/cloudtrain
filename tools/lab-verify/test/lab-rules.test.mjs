@@ -96,7 +96,7 @@ test("framework topic skill must be listed by its objective", async () => {
 test("skills no lab uses are reported as info, never as warnings", async () => {
   const r = await verifyContent(contentDir, { catalogFile });
   const info = r.findings.filter((x) => x.level === "info");
-  assert.ok(info.some((x) => x.path === "k8s.security.sbom"), "sbom has no lab yet");
+  assert.ok(info.some((x) => x.path === "net.wireless.fundamentals"), "wireless fundamentals has no lab yet");
   assert.ok(!info.some((x) => x.path === "k8s.scheduling.cordon-drain"), "cordon-drain is exercised");
   assert.deepEqual(r.findings.filter((x) => x.level === "warn"), []);
 });
@@ -122,4 +122,33 @@ test("exam task with hints is an error, and needs no hints or course otherwise",
   assert.ok(f.some((x) => x.level === "error" && x.path === "/spec/hints" && /exam task/.test(x.message)), JSON.stringify(f));
   const clean = await findingsAfter("xkd-job-completions", (s) => s.replace("estimatedMinutes: 5", "estimatedMinutes: 6"));
   assert.ok(!clean.some((x) => /no hints/.test(x.message)), JSON.stringify(clean));
+});
+
+// Rules merged from build/k8s-admin, build/k8s-dev, build/k8s-sec and build/linux-a.
+
+test("exam task in a course is an error; an exam task needs no course", async () => {
+  const packYaml = path.join("packs/kubernetes/pack.yaml");
+  const clean = await findingsAfterFile(packYaml, (s) => s.replace("    title: Kubernetes administration essentials\n", "    title: Kubernetes administration essentials \n"));
+  assert.ok(!clean.some((x) => /'xkd-job-completions' is not in any course/.test(x.message)), JSON.stringify(clean));
+  const f = await findingsAfterFile(packYaml, (s) => s.replace("      - scale-berth-planner\n", "      - scale-berth-planner\n      - xkd-job-completions\n"));
+  assert.ok(f.some((x) => x.level === "error" && /exam task 'xkd-job-completions' must not be in a course/.test(x.message)), JSON.stringify(f));
+});
+
+test("a lab tagged exam follows exam rules even outside the curriculum's exam list", async () => {
+  const f = await findingsAfter("scale-berth-planner", (s) => s.replace(/\n  tags: \[/, "\n  tags: [exam, "));
+  assert.ok(f.some((x) => x.level === "error" && x.path === "/spec/hints" && /exam task/.test(x.message)), JSON.stringify(f));
+});
+
+test("objectives of curriculum-declared frameworks (ct-platform) are accepted; unknown ones are not", async () => {
+  const ok = await findingsAfter("scale-berth-planner", (s) => s.replace("frameworks: [cka:workloads-scheduling, ckad:deployment]", "frameworks: [cka:workloads-scheduling, ckad:deployment, ct-platform:containers-delivery]"));
+  assert.ok(!ok.some((x) => x.level === "error" && /framework objective/.test(x.message)), JSON.stringify(ok));
+  const bad = await findingsAfter("scale-berth-planner", (s) => s.replace("frameworks: [cka:workloads-scheduling, ckad:deployment]", "frameworks: [cka:workloads-scheduling, ct-platform:no-such-objective]"));
+  assert.ok(bad.some((x) => x.level === "error" && x.path === "/metadata/frameworks" && /ct-platform:no-such-objective/.test(x.message)), JSON.stringify(bad));
+});
+
+test("pack labs may use curriculum newSkills; unknown skills are still errors", async () => {
+  const ok = await findingsAfter("scale-berth-planner", (s) => s.replace("skills: [k8s.workloads.scaling]", "skills: [k8s.workloads.scaling, linux.shell.editors]"));
+  assert.ok(!ok.some((x) => x.level === "error" && /unknown skill/.test(x.message)), JSON.stringify(ok));
+  const bad = await findingsAfter("scale-berth-planner", (s) => s.replace("skills: [k8s.workloads.scaling]", "skills: [k8s.workloads.no-such-skill]"));
+  assert.ok(bad.some((x) => x.level === "error" && /unknown skill 'k8s.workloads.no-such-skill'/.test(x.message)), JSON.stringify(bad));
 });

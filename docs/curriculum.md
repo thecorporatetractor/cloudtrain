@@ -2249,13 +2249,9 @@ _CloudTrain internal assessment. It is not aligned to, affiliated with or endors
 
 | Ref | Kind | Tier | Status | Description |
 | --- | --- | --- | --- | --- |
-| `el-lab:10` | container | A | proposed | Userland pod for Enterprise Linux family labs, based on AlmaLinux 10 (presented as CloudTrain EL lab image), hostUsers false |
-| `deb-lab:24.04` | container | A | proposed | Userland pod for Debian family labs, based on Ubuntu 24.04 LTS |
 | `el-sys:10` | container | B | proposed | Kata pod image with systemd as PID 1, LVM/mdadm/nftables tools, AlmaLinux 10 based |
 | `deb-sys:24.04` | container | B | proposed | Kata pod image with systemd as PID 1, networking and storage tools, Ubuntu 24.04 based |
 | `el-vm:9` | containerDisk | C | proposed | EL 9 cloud image (AlmaLinux 9 GenericCloud) for the RHEL 9 variant |
-| `el-vm:10` | containerDisk | C | proposed | EL 10 cloud image (AlmaLinux 10 GenericCloud) with local dnf/Flatpak mirrors configured by cloud-init |
-| `ubuntu-vm:24.04` | containerDisk | C | proposed | Ubuntu 24.04 LTS cloud image, unmodified, lab state applied by cloud-init |
 | `dockerd:29` | container | B | spike | Kata pod running rootful Docker Engine 29 with a block-backed /var/lib/docker (overlay2 spike pending) |
 | `docker-vm:29` | containerDisk | C | proposed | Ubuntu 24.04 VM with Docker Engine 29 for daemon, firewall and rootless labs |
 | `podman-vm:5` | containerDisk | C | proposed | EL 10 VM with Podman 5, skopeo, buildah and Quadlet |
@@ -2270,7 +2266,6 @@ _CloudTrain internal assessment. It is not aligned to, affiliated with or endors
 | `awx:24` | service | C | spike | AWX controller pool (Apache-2.0; releases paused upstream), per-learner org or per-learner instance |
 | `galaxy-ng:4` | service | A | proposed | Private Galaxy (Pulp galaxy_ng) for collection publish labs |
 | `srlinux:25` | container | N | spike | Nokia SR Linux; hosted-training EULA to be confirmed |
-| `kubeadm:1.37-sec` | containerDisk | K | proposed | kubeadm:1.37 node plus AppArmor profiles, Falco, an offline Trivy DB, gVisor runsc and kube-bench |
 
 ## Appendix: alignment frameworks declared here
 
