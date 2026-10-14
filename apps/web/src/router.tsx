@@ -14,6 +14,11 @@ const Skills = lazyRouteComponent(() => import('./routes/Skills'), 'Skills');
 const Studio = lazyRouteComponent(() => import('./routes/Studio'), 'Studio');
 const StudioDraft = lazyRouteComponent(() => import('./routes/StudioDraft'), 'StudioDraft');
 const Team = lazyRouteComponent(() => import('./routes/Team'), 'Team');
+const Exams = lazyRouteComponent(() => import('./routes/Exams'), 'Exams');
+const TeamExams = lazyRouteComponent(() => import('./routes/Exams'), 'TeamExams');
+const ExamDetail = lazyRouteComponent(() => import('./routes/exams/ExamDetail'), 'ExamDetail');
+const ExamWorkspace = lazyRouteComponent(() => import('./routes/exams/ExamWorkspace'), 'ExamWorkspace');
+const ExamResults = lazyRouteComponent(() => import('./routes/exams/ExamResults'), 'ExamResults');
 
 function Pending() {
   return (
@@ -86,7 +91,51 @@ export const studioRoute = createRoute({ getParentRoute: () => rootRoute, path: 
 export const studioDraftRoute = createRoute({ getParentRoute: () => rootRoute, path: '/studio/$draftId', component: StudioDraft });
 export const teamRoute = createRoute({ getParentRoute: () => rootRoute, path: '/team', component: Team });
 
-const routeTree = rootRoute.addChildren([homeRoute, catalogRoute, labRoute, workspaceRoute, skillsRoute, studioRoute, studioDraftRoute, teamRoute]);
+/* ------------------------------------------------------------------ exams (exam engine stream) */
+
+export interface ExamsSearch {
+  view?: 'attempts';
+}
+/** Exam simulations: catalog and the learner's attempts. */
+export const examsRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/exams',
+  validateSearch: (s: Record<string, unknown>): ExamsSearch => (s.view === 'attempts' ? { view: 'attempts' } : {}),
+  component: Exams,
+});
+export const examDetailRoute = createRoute({ getParentRoute: () => rootRoute, path: '/exams/$examId', component: ExamDetail });
+export const examAttemptRoute = createRoute({ getParentRoute: () => rootRoute, path: '/exams/attempts/$attemptId', component: ExamWorkspace });
+export const examResultsRoute = createRoute({ getParentRoute: () => rootRoute, path: '/exams/attempts/$attemptId/results', component: ExamResults });
+export interface TeamExamsSearch {
+  team?: string;
+  exam?: string;
+}
+/** Manager view of team exam readiness. */
+export const teamExamsRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/team/exams',
+  validateSearch: (s: Record<string, unknown>): TeamExamsSearch => ({
+    ...(typeof s.team === 'string' && s.team ? { team: s.team } : {}),
+    ...(typeof s.exam === 'string' && s.exam ? { exam: s.exam } : {}),
+  }),
+  component: TeamExams,
+});
+
+const routeTree = rootRoute.addChildren([
+  homeRoute,
+  catalogRoute,
+  labRoute,
+  workspaceRoute,
+  skillsRoute,
+  studioRoute,
+  studioDraftRoute,
+  teamRoute,
+  examsRoute,
+  examDetailRoute,
+  examAttemptRoute,
+  examResultsRoute,
+  teamExamsRoute,
+]);
 
 export const router = createRouter({
   routeTree,

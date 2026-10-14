@@ -53,3 +53,19 @@ Role gating (`src/app/access.tsx`) applies to the nav, the command palette, the 
 The mock API runs in the browser through a service worker (`public/mockServiceWorker.js`) in dev, or in a production build when `VITE_MOCK_API=1`. Sessions and studio drafts live in memory and reset on reload.
 
 Screenshots of every screen in all three themes are in `docs/screenshots/`.
+
+## Exams
+
+`/exams` (catalog with alignment disclaimers, duration, pass mark and rules;
+`?view=attempts` = attempt history), `/exams/$examId` (blueprint, rules,
+pre-exam checklist, start), `/exams/attempts/$attemptId` (exam workspace:
+single server-anchored timer, task navigator with flags, statement, terminals,
+submit with confirmation, auto-submit at time-out, preparing/grading states),
+`/exams/attempts/$attemptId/results` (pass/fail, per-objective bars against the
+pass mark, per-task and per-check results, skill evidence, recommendations) and
+`/team/exams` (manager: team exam readiness). API: `src/api/exams.ts`
+(`packages/api-types/exam.d.ts`); mock: `src/mocks/examHandlers.ts` over
+`src/mocks/fixtures/exams.generated.ts` (generated from
+`content/curriculum.yaml`). Screenshots in all three themes:
+`docs/screenshots/exams/` (`node scripts/exam-shots.mjs` against a mock dev
+server; the exam clock is driven with Playwright's clock API).

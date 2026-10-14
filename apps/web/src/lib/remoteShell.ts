@@ -15,7 +15,7 @@ export class RemoteShell {
 
   constructor(
     private readonly term: Terminal,
-    private readonly opts: { sessionId: string; node: string; entry: boolean },
+    private readonly opts: { sessionId: string; node: string; entry: boolean; url?: (query: URLSearchParams) => string },
   ) {}
 
   start() {
@@ -39,11 +39,16 @@ export class RemoteShell {
 
   private connect() {
     if (this.disposed) return;
-    const { sessionId, node, entry } = this.opts;
+    const { sessionId, node, entry, url } = this.opts;
     const q = new URLSearchParams({ cols: String(this.term.cols), rows: String(this.term.rows) });
-    if (!entry) q.set('node', node);
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-    const ws = new WebSocket(`${proto}://${location.host}/api/sessions/${encodeURIComponent(sessionId)}/terminal?${q}`);
+    let path: string;
+    if (url) path = url(q);
+    else {
+      if (!entry) q.set('node', node);
+      path = `/api/sessions/${encodeURIComponent(sessionId)}/terminal?${q}`;
+    }
+    const ws = new WebSocket(`${proto}://${location.host}${path}`);
     ws.binaryType = 'arraybuffer';
     this.ws = ws;
     this.live = true;

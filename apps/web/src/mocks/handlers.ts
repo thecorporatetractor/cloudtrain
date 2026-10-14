@@ -5,6 +5,7 @@ import { frameworks, skillStates, skills } from './fixtures/skills';
 import { homeData } from './fixtures/home';
 import { memberById, memberSkillStates, teamData } from './fixtures/team';
 import { drafts as seedDrafts, freshGates, specFromPrompt } from './fixtures/studio';
+import { examHandlers } from './examHandlers';
 
 /* ------------------------------------------------------------------ */
 /* In-memory state (resets on reload)                                  */
@@ -255,4 +256,4 @@ export const sampleOnlyHandlers = [
   }),
 ];
 
-export const handlers = [...coreHandlers, ...sampleOnlyHandlers];
+export const handlers = [...coreHandlers, ...examHandlers, ...sampleOnlyHandlers];
