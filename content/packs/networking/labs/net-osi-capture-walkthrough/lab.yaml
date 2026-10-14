@@ -1,0 +1,173 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: net-osi-capture-walkthrough
+  title: Follow one web request down the stack in a packet capture
+  domain: networking
+  frameworks: [ccna:network-fundamentals]
+  difficulty: easy
+  estimatedMinutes: 15
+  tags: [tcp, http, tcpdump, osi]
+  version: 1
+spec:
+  description: |
+    Marlow Valley Schools shows the district timetable on a kiosk in the north
+    campus foyer. The kiosk `kiosk-north` fetches the page from the timetable
+    server `timetable-dc` in the data centre, through the campus router
+    `mv-campus-north`.
+
+    On `kiosk-north` (shell):
+
+    1. Start a packet capture on `eth1` and fetch
+       `http://10.{{octet}}.200.10:{{port}}/timetable.html` once while it runs
+       (`wget` is available).
+    2. From your capture, write `/root/report.txt` with exactly these six lines,
+       using tcpdump's flag notation (`S`, `S.`, `.`) for the handshake:
+
+    ```
+    client_port: <kiosk TCP port of that connection>
+    server_port: <server TCP port>
+    syn: <flags of the first segment>
+    syn_ack: <flags of the second segment>
+    ack: <flags of the third segment>
+    http_status: <three-digit status code in the server's response>
+    ```
+
+    The grader keeps its own capture on the kiosk and compares your report with
+    the connection it saw.
+  objectives:
+    - Capture a TCP connection with tcpdump and find its three-way handshake
+    - Tell the ephemeral client port from the well-known or service port
+    - Read the application-layer status line in the same capture
+  params:
+    octet:
+      type: int
+      min: 20
+      max: 90
+    port:
+      type: choice
+      values: [80, 8080, 8000]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: kiosk-north
+        driver: container
+        image: nettools:1
+        resources: { cpu: 0.25, memoryMiB: 128 }
+        access: [shell]
+      - name: mv-campus-north
+        driver: netdev
+        image: frr:10
+        access: [console]
+      - name: timetable-dc
+        driver: container
+        image: netsvc:1
+        resources: { cpu: 0.25, memoryMiB: 128 }
+    links:
+      - { a: "kiosk-north:eth1", b: "mv-campus-north:eth1", subnet: "10.{{octet}}.10.0/24" }
+      - { a: "mv-campus-north:eth2", b: "timetable-dc:eth1", subnet: "10.{{octet}}.200.0/24" }
+  setup:
+    - on: mv-campus-north
+      config: |
+        interface eth1
+         ip address 10.{{octet}}.10.1/24
+        interface eth2
+         ip address 10.{{octet}}.200.1/24
+    - on: timetable-dc
+      run: |
+        ip addr replace 10.{{octet}}.200.10/24 dev eth1
+        ip route replace 10.{{octet}}.0.0/16 via 10.{{octet}}.200.1
+        mkdir -p /srv/www
+        printf '<html><body><h1>Marlow Valley timetable</h1><p>Period 1 08:45</p></body></html>\n' > /srv/www/timetable.html
+        setsid httpd -p {{port}} -h /srv/www </dev/null >/dev/null 2>&1 &
+    - on: kiosk-north
+      run: |
+        ip addr replace 10.{{octet}}.10.20/24 dev eth1
+        ip route replace 10.{{octet}}.0.0/16 via 10.{{octet}}.10.1
+        mkdir -p /var/lib/cloudtrain
+        setsid tcpdump -i eth1 -U -s 0 -w /var/lib/cloudtrain/grader.pcap 'tcp port {{port}}' </dev/null >/dev/null 2>&1 &
+        sleep 1
+  checks:
+    - id: report-ports
+      description: The report names the kiosk's ephemeral port and the server port of a connection the grader captured
+      type: shell
+      on: kiosk-north
+      command: |
+        f=/root/report.txt; [ -f "$f" ] || exit 1
+        c=$(sed -n 's/^client_port: *\([0-9]*\) *$/\1/p' "$f"); s=$(sed -n 's/^server_port: *\([0-9]*\) *$/\1/p' "$f")
+        [ "$s" = "{{port}}" ] && [ -n "$c" ] || exit 1
+        tcpdump -nn -r /var/lib/cloudtrain/grader.pcap 2>/dev/null 'tcp[tcpflags] == tcp-syn' | grep -q "10.{{octet}}.10.20.$c > 10.{{octet}}.200.10.{{port}}:"
+      skills: [net.fundamentals.tcp-udp-ports]
+      weight: 2
+    - id: report-handshake
+      description: The report gives the three handshake segments in tcpdump flag notation
+      type: shell
+      on: kiosk-north
+      command: |
+        f=/root/report.txt; [ -f "$f" ] || exit 1
+        grep -qx 'syn: *S *' "$f" && grep -qx 'syn_ack: *S\. *' "$f" && grep -qx 'ack: *\. *' "$f"
+      skills: [net.fundamentals.models]
+      weight: 2
+    - id: report-status
+      description: The report's HTTP status matches the response the grader captured
+      type: shell
+      on: kiosk-north
+      command: |
+        f=/root/report.txt; [ -f "$f" ] || exit 1
+        h=$(sed -n 's/^http_status: *\([0-9][0-9][0-9]\) *$/\1/p' "$f"); [ -n "$h" ] || exit 1
+        tcpdump -nn -A -r /var/lib/cloudtrain/grader.pcap 2>/dev/null "src port {{port}}" | grep -q "HTTP/1\.[01] $h "
+      skills: [net.troubleshooting.packet-capture]
+  hints:
+    - title: Capture while you fetch
+      body: Run tcpdump in the background (or in a second shell), then fetch the page, then stop the capture. Filter on the server port to keep the output short.
+      command: "tcpdump -i eth1 -nn -w /tmp/web.pcap tcp port <port> &"
+      cost: 1
+    - title: Reading the handshake
+      body: In `tcpdump -nn -r` output the first three lines of a new connection show `Flags [S]`, `Flags [S.]` and `Flags [.]`. The side that sends the first SYN is the client; its port is the high, ephemeral one.
+      cost: 1
+    - title: Where is the status code?
+      body: Read the capture again with `-A` to see payload text; the server's first data segment starts with a status line such as `HTTP/1.0 200 OK`.
+      command: "tcpdump -nn -A -r /tmp/web.pcap src port <port>"
+      cost: 2
+  misconceptions:
+    - id: ports-swapped
+      description: Treats the server's port as the client port and the other way round
+      mutation:
+        on: kiosk-north
+        run: |
+          wget -q -O /dev/null http://10.{{octet}}.200.10:{{port}}/timetable.html
+          c=$(tcpdump -nn -r /var/lib/cloudtrain/grader.pcap 'tcp[tcpflags] == tcp-syn' 2>/dev/null | head -1 | sed 's/.*10\.{{octet}}\.10\.20\.\([0-9]*\) >.*/\1/')
+          printf 'client_port: {{port}}\nserver_port: %s\nsyn: S\nsyn_ack: S.\nack: .\nhttp_status: 200\n' "$c" > /root/report.txt
+      expectFail: [report-ports]
+      feedback: The client opens the connection from an ephemeral port; the server answers from the port the service listens on.
+    - id: synack-written-as-ack
+      description: Writes the second segment as a plain ACK instead of SYN+ACK
+      mutation:
+        on: kiosk-north
+        run: |
+          wget -q -O /dev/null http://10.{{octet}}.200.10:{{port}}/timetable.html
+          c=$(tcpdump -nn -r /var/lib/cloudtrain/grader.pcap 'tcp[tcpflags] == tcp-syn' 2>/dev/null | head -1 | sed 's/.*10\.{{octet}}\.10\.20\.\([0-9]*\) >.*/\1/')
+          printf 'client_port: %s\nserver_port: {{port}}\nsyn: S\nsyn_ack: .\nack: .\nhttp_status: 200\n' "$c" > /root/report.txt
+      expectFail: [report-handshake]
+      feedback: The server's reply to a SYN carries both SYN and ACK (`S.`); only the third segment is a bare ACK.
+  solution:
+    explanation: |
+      Capture on the kiosk while fetching the page once. The first segment (SYN)
+      goes from the kiosk's ephemeral port to the server port, the server answers
+      with SYN+ACK and the kiosk completes the handshake with an ACK. The HTTP
+      status line is in the server's first data segment.
+    steps:
+      - on: kiosk-north
+        run: |
+          tcpdump -i eth1 -nn -U -w /tmp/web.pcap tcp port {{port}} </dev/null >/dev/null 2>&1 &
+          p=$!; sleep 2
+          wget -q -O /dev/null http://10.{{octet}}.200.10:{{port}}/timetable.html
+          sleep 2; kill $p; wait $p 2>/dev/null
+          c=$(tcpdump -nn -r /tmp/web.pcap 'tcp[tcpflags] == tcp-syn' 2>/dev/null | head -1 | sed 's/.*10\.{{octet}}\.10\.20\.\([0-9]*\) >.*/\1/')
+          h=$(tcpdump -nn -A -r /tmp/web.pcap src port {{port}} 2>/dev/null | grep -o 'HTTP/1\.[01] [0-9][0-9][0-9]' | head -1 | cut -d' ' -f2)
+          printf 'client_port: %s\nserver_port: {{port}}\nsyn: S\nsyn_ack: S.\nack: .\nhttp_status: %s\n' "$c" "$h" > /root/report.txt
+          cat /root/report.txt

@@ -1,0 +1,226 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: net-subnet-east-campus
+  title: Carve a campus block into right-sized subnets
+  domain: networking
+  frameworks: [ccna:network-fundamentals]
+  difficulty: easy
+  estimatedMinutes: 20
+  tags: [ipv4, subnetting, vlsm]
+  version: 1
+spec:
+  description: |
+    Marlow Valley Schools has received the block **10.40.{{q}}.0/22** for the new
+    east campus. The campus router `mv-campus-east` (Linux, shell) has four
+    cables:
+
+    | Interface | Segment | Needs |
+    |---|---|---|
+    | `eth1` | student LAN, host `student-east` | 300 hosts |
+    | `eth2` | staff LAN, host `staff-east` | 120 hosts |
+    | `eth3` | printer LAN, host `printer-east` | 40 hosts |
+    | `eth4` | point-to-point uplink to `mv-core-1` (FRR console, its `eth1`) | 2 addresses |
+
+    Split the block into four non-overlapping subnets, each the **smallest**
+    prefix that fits its segment, all inside 10.40.{{q}}.0/22. Then:
+
+    - address the four interfaces of `mv-campus-east` (the router is the first
+      usable address of each LAN is a good convention, but any usable address works);
+    - address `eth1` of `student-east`, `staff-east` and `printer-east` in their
+      LAN with the same prefix length and give each a default route via its router
+      address;
+    - address `eth1` on `mv-core-1` in the uplink subnet.
+
+    Every host and `mv-core-1` must reach its neighbour on `mv-campus-east`.
+  objectives:
+    - Size subnets from host counts (2^n - 2 usable addresses)
+    - Place variable-length subnets in a block without overlap
+    - Address a router and hosts consistently and verify with ping
+  params:
+    q:
+      type: choice
+      values: [0, 4, 8, 12]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: mv-campus-east
+        driver: container
+        image: netsvc:1
+        resources: { cpu: 0.25, memoryMiB: 128 }
+        access: [shell]
+      - name: student-east
+        driver: container
+        image: nettools:1
+        resources: { cpu: 0.25, memoryMiB: 96 }
+        access: [shell]
+      - name: staff-east
+        driver: container
+        image: nettools:1
+        resources: { cpu: 0.25, memoryMiB: 96 }
+        access: [shell]
+      - name: printer-east
+        driver: container
+        image: nettools:1
+        resources: { cpu: 0.25, memoryMiB: 96 }
+        access: [shell]
+      - name: mv-core-1
+        driver: netdev
+        image: frr:10
+        access: [console]
+    links:
+      - { a: "mv-campus-east:eth1", b: "student-east:eth1" }
+      - { a: "mv-campus-east:eth2", b: "staff-east:eth1" }
+      - { a: "mv-campus-east:eth3", b: "printer-east:eth1" }
+      - { a: "mv-campus-east:eth4", b: "mv-core-1:eth1" }
+  checks:
+    - id: router-sizes
+      description: Each router interface has the smallest prefix that fits its segment, inside the campus block
+      type: shell
+      on: mv-campus-east
+      command: |
+        python3 - <<'PY'
+        import ipaddress, subprocess, sys, json
+        block = ipaddress.ip_network("10.40.{{q}}.0/22")
+        want = {"eth1": [23], "eth2": [25], "eth3": [26], "eth4": [30, 31]}
+        for ifc, plens in want.items():
+            out = json.loads(subprocess.run(["ip", "-j", "-4", "addr", "show", "dev", ifc], capture_output=True, text=True).stdout or "[]")
+            addrs = [a for o in out for a in o.get("addr_info", [])]
+            if len(addrs) != 1: sys.exit(1)
+            n = ipaddress.ip_interface(f"{addrs[0]['local']}/{addrs[0]['prefixlen']}").network
+            if n.prefixlen not in plens or not n.subnet_of(block): sys.exit(1)
+        PY
+      skills: [net.addressing.ipv4-subnetting]
+      weight: 2
+    - id: no-overlap
+      description: The four router subnets do not overlap
+      type: shell
+      on: mv-campus-east
+      command: |
+        python3 - <<'PY'
+        import ipaddress, subprocess, sys, json, itertools
+        nets = []
+        for ifc in ["eth1", "eth2", "eth3", "eth4"]:
+            out = json.loads(subprocess.run(["ip", "-j", "-4", "addr", "show", "dev", ifc], capture_output=True, text=True).stdout or "[]")
+            addrs = [a for o in out for a in o.get("addr_info", [])]
+            if not addrs: sys.exit(1)
+            nets += [ipaddress.ip_interface(f"{a['local']}/{a['prefixlen']}").network for a in addrs]
+        if any(a.overlaps(b) for a, b in itertools.combinations(nets, 2)): sys.exit(1)
+        PY
+      skills: [net.addressing.ipv4-subnetting]
+      weight: 2
+    - id: student-host
+      description: student-east has a /23 address in the block and reaches its default gateway
+      type: shell
+      on: student-east
+      command: &hostcheck |
+        a=$(ip -4 -o addr show dev eth1 | awk '{print $4}' | head -1); [ -n "$a" ] || exit 1
+        gw=$(ip -4 route show default | awk '{print $3}' | head -1); [ -n "$gw" ] || exit 1
+        p=${a#*/}; n=$(ipcalc -n "$a" | cut -d= -f2)
+        [ "$(ipcalc -n "$gw/$p" | cut -d= -f2)" = "$n" ] && [ "$gw" != "${a%/*}" ] || exit 1
+        [ "$(ipcalc -n "$a" -p 2>/dev/null | sed -n 's/PREFIX=//p')" = "${EXPECT:-$p}" ] || exit 1
+        ping -c1 -W2 "$gw" >/dev/null
+      skills: [net.addressing.ipv4-subnetting]
+    - id: staff-host
+      description: staff-east has an address in its subnet and reaches its default gateway
+      type: shell
+      on: staff-east
+      command: *hostcheck
+      skills: [net.addressing.ipv4-subnetting]
+    - id: printer-host
+      description: printer-east has an address in its subnet and reaches its default gateway
+      type: shell
+      on: printer-east
+      command: *hostcheck
+      skills: [net.addressing.ipv4-subnetting]
+    - id: uplink
+      description: mv-core-1 is addressed on the point-to-point subnet and reaches mv-campus-east
+      type: shell
+      on: mv-core-1
+      command: |
+        a=$(ip -4 -o addr show dev eth1 | awk '{print $4}' | head -1); [ -n "$a" ] || exit 1
+        p=${a#*/}; ip=${a%/*}
+        [ "$p" = 30 ] || [ "$p" = 31 ] || exit 1
+        n=$(ipcalc -n "$a" | cut -d= -f2); base=${n##*.}; pre=${n%.*}; me=${ip##*.}
+        if [ "$p" = 30 ]; then o=$((base + 1)); [ "$me" = "$o" ] && o=$((base + 2)); else o=$base; [ "$me" = "$o" ] && o=$((base + 1)); fi
+        ping -c1 -W2 "$pre.$o" >/dev/null
+      skills: [net.addressing.ipv4-subnetting]
+  hints:
+    - title: Size each subnet first
+      body: A prefix of length p gives 2^(32-p) - 2 usable hosts. 300 hosts need more than 256 addresses, 120 fit in 128, 40 fit in 64, and a point-to-point link needs a /30 (or /31).
+      cost: 1
+    - title: Place the largest first
+      body: Allocate from the start of the block, largest subnet first, so every subnet starts on a boundary that is a multiple of its own size.
+      cost: 1
+    - title: Linux addressing
+      body: "`ip addr add <address>/<prefix> dev eth1` and `ip route add default via <gateway>` on the hosts; in vtysh on mv-core-1: `configure`, `interface eth1`, `ip address <address>/<prefix>`."
+      cost: 2
+  misconceptions:
+    - id: classful-24
+      description: Gives the 300-host student LAN a /24, which holds only 254 hosts
+      mutation:
+        on: mv-campus-east
+        run: |
+          Q={{q}}
+          ip addr replace 10.40.$Q.1/24 dev eth1
+          ip addr replace 10.40.$((Q+2)).1/25 dev eth2
+          ip addr replace 10.40.$((Q+2)).129/26 dev eth3
+          ip addr replace 10.40.$((Q+2)).193/30 dev eth4
+      expectFail: [router-sizes]
+      feedback: A /24 has 254 usable addresses; 300 hosts need a /23.
+    - id: overlapping
+      description: Starts the staff subnet inside the student /23
+      mutation:
+        on: mv-campus-east
+        run: |
+          ip addr replace 10.40.{{q}}.1/23 dev eth1
+          ip addr replace 10.40.{{q}}.129/25 dev eth2
+          ip addr replace 10.40.{{q}}.193/26 dev eth3
+          ip addr replace 10.40.{{q}}.254/30 dev eth4
+      expectFail: [no-overlap]
+      feedback: A /23 starting at the block's first address covers the first 512 addresses; the next subnet must start after it.
+  solution:
+    explanation: |
+      Largest first: students 10.40.{{q}}.0/23, staff the first /25 after it,
+      printers the next /26 and the uplink the next /30.
+    steps:
+      - on: mv-campus-east
+        run: |
+          set -e
+          B=10.40; Q={{q}}
+          ip addr replace $B.$Q.1/23 dev eth1
+          ip addr replace $B.$((Q+2)).1/25 dev eth2
+          ip addr replace $B.$((Q+2)).129/26 dev eth3
+          ip addr replace $B.$((Q+2)).193/30 dev eth4
+      - on: student-east
+        run: "ip addr replace 10.40.{{q}}.10/23 dev eth1 && ip route replace default via 10.40.{{q}}.1"
+      - on: staff-east
+        run: "Q=$(( {{q}} + 2 )); ip addr replace 10.40.$Q.10/25 dev eth1 && ip route replace default via 10.40.$Q.1"
+      - on: printer-east
+        run: "Q=$(( {{q}} + 2 )); ip addr replace 10.40.$Q.140/26 dev eth1 && ip route replace default via 10.40.$Q.129"
+      - on: mv-core-1
+        run: "Q=$(( {{q}} + 2 )); printf 'interface eth1\n ip address 10.40.%s.194/30\n' $Q > /tmp/c.conf && vtysh -f /tmp/c.conf"
+    alternatives:
+      - id: smallest-first-31
+        description: Uplink first as a /31, then printers, staff and students, each on its own boundary
+        steps:
+          - on: mv-campus-east
+            run: |
+              set -e
+              Q={{q}}
+              ip addr replace 10.40.$Q.0/31 dev eth4
+              ip addr replace 10.40.$Q.65/26 dev eth3
+              ip addr replace 10.40.$Q.129/25 dev eth2
+              ip addr replace 10.40.$((Q+2)).1/23 dev eth1
+          - on: student-east
+            run: "Q=$(( {{q}} + 2 )); ip addr replace 10.40.$Q.200/23 dev eth1 && ip route replace default via 10.40.$Q.1"
+          - on: staff-east
+            run: "ip addr replace 10.40.{{q}}.130/25 dev eth1 && ip route replace default via 10.40.{{q}}.129"
+          - on: printer-east
+            run: "ip addr replace 10.40.{{q}}.70/26 dev eth1 && ip route replace default via 10.40.{{q}}.65"
+          - on: mv-core-1
+            run: "printf 'interface eth1\n ip address 10.40.%s.1/31\n' {{q}} > /tmp/c.conf && vtysh -f /tmp/c.conf"

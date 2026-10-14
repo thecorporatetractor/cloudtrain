@@ -1,0 +1,132 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: net-fix-broadcast-storm
+  title: Stop a broadcast storm caused by a new redundant link
+  domain: networking
+  frameworks: [ccna:network-access]
+  difficulty: hard
+  estimatedMinutes: 20
+  tags: [stp, loop, broadcast-storm, tcpdump]
+  version: 1
+spec:
+  description: |
+    A contractor ran a second cable between the annex switches `mv-sw-annex-1`
+    and `mv-sw-annex-2` (Linux bridges `br0`, shell access): they are now joined
+    on both `eth2` and `eth3`, spanning tree is off, and the annex network has
+    melted down. `annex-host-1` (on `mv-sw-annex-1:eth1`) and `annex-host-2` (on
+    `mv-sw-annex-2:eth1`) can no longer reach each other.
+
+    1. Prove the loop: on `annex-host-1`, capture at least 20 frames of the storm
+       on `eth1` into `/root/loop.pcap` (`tcpdump -w`).
+    2. Turn spanning tree on for `br0` on **both** switches. Keep both cables
+       connected and enslaved to `br0`; spanning tree must block one of them.
+    3. Confirm the two hosts reach each other again.
+
+    The switch ports are rate limited for lab safety; do not remove the `tbf`
+    qdiscs. Spanning tree here uses 802.1D timers: allow about 10 seconds to
+    converge.
+  objectives:
+    - Recognise a layer-2 loop from repeated broadcast frames in a capture
+    - Enable spanning tree on both switches
+    - Keep redundant links connected but blocked
+  params:
+    octet:
+      type: int
+      min: 20
+      max: 90
+  topology:
+    entry: workstation
+    nodes:
+      - { name: workstation, driver: container, image: jumphost:1, access: [shell] }
+      - { name: mv-sw-annex-1, driver: container, image: netsvc:1, resources: { cpu: 0.25, memoryMiB: 96 }, access: [shell] }
+      - { name: mv-sw-annex-2, driver: container, image: netsvc:1, resources: { cpu: 0.25, memoryMiB: 96 }, access: [shell] }
+      - { name: annex-host-1, driver: container, image: nettools:1, resources: { cpu: 0.2, memoryMiB: 64 }, access: [shell] }
+      - { name: annex-host-2, driver: container, image: nettools:1, resources: { cpu: 0.2, memoryMiB: 64 }, access: [shell] }
+    links:
+      - { a: "mv-sw-annex-1:eth1", b: "annex-host-1:eth1" }
+      - { a: "mv-sw-annex-2:eth1", b: "annex-host-2:eth1" }
+      - { a: "mv-sw-annex-1:eth2", b: "mv-sw-annex-2:eth2" }
+      - { a: "mv-sw-annex-1:eth3", b: "mv-sw-annex-2:eth3" }
+  setup:
+    - on: mv-sw-annex-1
+      run: &bridge |
+        ip link add br0 type bridge stp_state 0 forward_delay 400 hello_time 100 max_age 600 2>/dev/null || true
+        for p in eth1 eth2 eth3; do tc qdisc replace dev $p root tbf rate 1mbit burst 16kb latency 50ms; ip link set $p master br0; done
+        ip link set br0 up
+    - { on: mv-sw-annex-2, run: *bridge }
+    - { on: annex-host-1, run: "ip addr replace 10.{{octet}}.0.11/24 dev eth1; ping -c2 -W1 10.{{octet}}.0.12 >/dev/null 2>&1; true" }
+    - { on: annex-host-2, run: "ip addr replace 10.{{octet}}.0.12/24 dev eth1" }
+  checks:
+    - id: loop-captured
+      description: annex-host-1 holds a capture with at least 20 copies of the same broadcast frame
+      type: shell
+      on: annex-host-1
+      command: |
+        [ -f /root/loop.pcap ] || exit 1
+        tcpdump -nn -e -r /root/loop.pcap ether broadcast 2>/dev/null | sed 's/^[^ ]* //' | sort | uniq -c | sort -rn | awk 'NR==1{print ($1>=20) ? "loop" : "no-loop"}'
+      expect: { match: exact, value: loop }
+      skills: [net.troubleshooting.packet-capture]
+      weight: 2
+    - id: stp-both
+      description: Spanning tree is on for br0 on mv-sw-annex-2 and both cables are still enslaved and up
+      type: shell
+      on: mv-sw-annex-2
+      command: &stp |
+        [ "$(cat /sys/class/net/br0/bridge/stp_state)" != 0 ] || exit 1
+        for p in eth2 eth3; do [ -e /sys/class/net/br0/brif/$p ] && ip link show $p | grep -q 'state UP' || exit 1; done
+        tc qdisc show dev eth2 | grep -q tbf
+      skills: [net.switching.stp]
+      weight: 2
+    - id: stp-annex-1
+      description: Spanning tree is on for br0 on mv-sw-annex-1 and both cables are still enslaved and up
+      type: shell
+      on: mv-sw-annex-1
+      command: *stp
+      skills: [net.switching.stp]
+      weight: 2
+    - id: one-blocked
+      description: Exactly one switch port on the redundant cables blocks (checked on the non-root switch)
+      type: shell
+      on: mv-sw-annex-2
+      command: |
+        b=/sys/class/net/br0/bridge
+        if [ "$(cat $b/root_id)" = "$(cat $b/bridge_id)" ]; then echo root; exit 0; fi
+        echo "$(cat /sys/class/net/br0/brif/eth2/state)$(cat /sys/class/net/br0/brif/eth3/state)" | grep -Eq '^(34|43)$' && echo ok
+      expect: { match: regex, value: "^(ok|root)$" }
+      skills: [net.switching.stp]
+    - id: hosts-reachable
+      description: annex-host-1 reaches annex-host-2 again
+      type: reachability
+      on: annex-host-1
+      target: 10.{{octet}}.0.12
+      skills: [net.switching.stp]
+  hints:
+    - title: Seeing a storm
+      body: In a loop every broadcast is copied forever. A short capture on a host shows the same ARP or neighbour solicitation over and over.
+      command: "tcpdump -ni eth1 -c 30 -w /root/loop.pcap"
+      cost: 1
+    - title: Break the loop without unplugging
+      body: Spanning tree blocks one of the redundant ports. Turn it on for the bridge on both switches.
+      command: "ip link set br0 type bridge stp_state 1"
+      cost: 2
+  misconceptions:
+    - id: unplug-cable
+      description: Removes the second cable from the bridge instead of running spanning tree
+      mutation:
+        on: mv-sw-annex-2
+        run: ip link set eth3 nomaster
+      expectFail: [stp-both]
+      feedback: That ends the storm but throws the redundancy away; spanning tree keeps both cables and blocks one.
+  solution:
+    explanation: |
+      Capture shows the same broadcast frames repeating. With spanning tree on
+      both bridges, the non-root switch blocks one of its two ports towards the
+      root, so the redundant cable stays connected but carries no traffic.
+    steps:
+      - on: annex-host-1
+        run: |
+          ping -c1 -W1 10.{{octet}}.0.99 >/dev/null 2>&1
+          timeout 10 tcpdump -ni eth1 -c 40 -w /root/loop.pcap ether broadcast >/dev/null 2>&1; true
+      - { on: mv-sw-annex-1, run: "ip link set br0 type bridge stp_state 1" }
+      - { on: mv-sw-annex-2, run: "ip link set br0 type bridge stp_state 1 && sleep 15" }

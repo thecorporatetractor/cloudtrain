@@ -1,0 +1,145 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: net-fix-native-vlan-mismatch
+  title: Find why management traffic leaks between VLANs
+  domain: networking
+  frameworks: [ccna:network-access]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [vlan, trunk, native-vlan, troubleshooting]
+  version: 1
+spec:
+  description: |
+    Since `mv-sw-south-2` was swapped last week, the management host `mgmt-s1`
+    on `mv-sw-south-1` can ping the student laptop `student-s2` on the other
+    switch, and `mgmt-s2` no longer reaches `mgmt-s1`.
+
+    District standard for the south campus trunk (`eth3` on both Linux bridge
+    switches, shell access): VLAN {{students}} (students) tagged, VLAN 99
+    (management) as the untagged native VLAN, nothing else. Access ports:
+    `eth1` = management (VLAN 99), `eth2` = students (VLAN {{students}}). All hosts
+    use `10.{{octet}}.0.0/24`.
+
+    Find what differs between the two ends of the trunk and fix it so the
+    management hosts reach each other, the student hosts reach each other, and no
+    management host reaches a student host.
+  objectives:
+    - Compare VLAN membership on both ends of a trunk
+    - Explain how a native VLAN mismatch merges two VLANs
+    - Restore the standard and verify separation
+  params:
+    octet:
+      type: int
+      min: 20
+      max: 90
+    students:
+      type: choice
+      values: [30, 31, 32]
+  topology:
+    entry: workstation
+    nodes:
+      - { name: workstation, driver: container, image: jumphost:1, access: [shell] }
+      - { name: mv-sw-south-1, driver: container, image: netsvc:1, resources: { cpu: 0.25, memoryMiB: 96 }, access: [shell] }
+      - { name: mv-sw-south-2, driver: container, image: netsvc:1, resources: { cpu: 0.25, memoryMiB: 96 }, access: [shell] }
+      - { name: mgmt-s1, driver: container, image: nettools:1, resources: { cpu: 0.2, memoryMiB: 64 }, access: [shell] }
+      - { name: student-s1, driver: container, image: nettools:1, resources: { cpu: 0.2, memoryMiB: 64 }, access: [shell] }
+      - { name: mgmt-s2, driver: container, image: nettools:1, resources: { cpu: 0.2, memoryMiB: 64 }, access: [shell] }
+      - { name: student-s2, driver: container, image: nettools:1, resources: { cpu: 0.2, memoryMiB: 64 }, access: [shell] }
+    links:
+      - { a: "mv-sw-south-1:eth1", b: "mgmt-s1:eth1" }
+      - { a: "mv-sw-south-1:eth2", b: "student-s1:eth1" }
+      - { a: "mv-sw-south-2:eth1", b: "mgmt-s2:eth1" }
+      - { a: "mv-sw-south-2:eth2", b: "student-s2:eth1" }
+      - { a: "mv-sw-south-1:eth3", b: "mv-sw-south-2:eth3" }
+  setup:
+    - on: mv-sw-south-1
+      run: |
+        ip link add br0 type bridge vlan_filtering 1 2>/dev/null || true
+        for p in eth1 eth2 eth3; do ip link set $p master br0; done; ip link set br0 up
+        bridge vlan add dev eth1 vid 99 pvid untagged; bridge vlan del dev eth1 vid 1
+        bridge vlan add dev eth2 vid {{students}} pvid untagged; bridge vlan del dev eth2 vid 1
+        bridge vlan add dev eth3 vid {{students}}; bridge vlan add dev eth3 vid 99 pvid untagged; bridge vlan del dev eth3 vid 1
+    - on: mv-sw-south-2
+      run: |
+        ip link add br0 type bridge vlan_filtering 1 2>/dev/null || true
+        for p in eth1 eth2 eth3; do ip link set $p master br0; done; ip link set br0 up
+        bridge vlan add dev eth1 vid 99 pvid untagged; bridge vlan del dev eth1 vid 1
+        bridge vlan add dev eth2 vid {{students}} pvid untagged; bridge vlan del dev eth2 vid 1
+        bridge vlan add dev eth3 vid 99; bridge vlan add dev eth3 vid {{students}} pvid untagged; bridge vlan del dev eth3 vid 1
+    - { on: mgmt-s1, run: "ip addr replace 10.{{octet}}.0.91/24 dev eth1" }
+    - { on: student-s1, run: "ip addr replace 10.{{octet}}.0.31/24 dev eth1" }
+    - { on: mgmt-s2, run: "ip addr replace 10.{{octet}}.0.92/24 dev eth1" }
+    - { on: student-s2, run: "ip addr replace 10.{{octet}}.0.32/24 dev eth1" }
+  checks:
+    - id: mgmt-separated
+      description: mgmt-s1 no longer reaches the student hosts
+      type: shell
+      on: mgmt-s1
+      command: |
+        ip neigh flush dev eth1
+        for t in 31 32; do ping -c1 -W1 10.{{octet}}.0.$t >/dev/null 2>&1 && { echo reachable; exit 0; }; done; echo unreachable
+      expect: { match: exact, value: unreachable }
+      timeoutSec: 10
+      skills: [net.switching.trunking]
+      weight: 2
+    - { id: mgmt-across, description: mgmt-s1 reaches mgmt-s2, type: reachability, on: mgmt-s1, target: "10.{{octet}}.0.92", skills: [net.switching.trunking], weight: 2 }
+    - { id: students-across, description: student-s1 reaches student-s2, type: reachability, on: student-s1, target: "10.{{octet}}.0.32", skills: [net.switching.trunking] }
+    - id: trunk-standard
+      description: eth3 on mv-sw-south-2 matches the standard (students tagged, 99 untagged native, nothing else)
+      type: shell
+      on: mv-sw-south-2
+      command: &trunk |
+        bridge -j vlan show dev eth3 | python3 -c '
+        import json,sys
+        for p in json.load(sys.stdin):
+            print(sorted((x["vlan"],"PVID" in x.get("flags",[]),"Egress Untagged" in x.get("flags",[])) for x in p["vlans"]))'
+      expect: { match: exact, value: "[({{students}}, False, False), (99, True, True)]" }
+      skills: [net.troubleshooting.methodology]
+    - id: sw1-standard
+      description: eth3 on mv-sw-south-1 still matches the standard
+      type: shell
+      on: mv-sw-south-1
+      command: *trunk
+      expect: { match: exact, value: "[({{students}}, False, False), (99, True, True)]" }
+      skills: [net.switching.trunking]
+      weight: 0.5
+  hints:
+    - title: Compare both ends
+      body: Run `bridge vlan show dev eth3` on both switches and compare which VLAN is the PVID / untagged one.
+      cost: 1
+    - title: What a mismatch does
+      body: Untagged frames leaving one switch's native VLAN arrive in the other switch's native VLAN. If those differ, the two VLANs are bridged together across the trunk.
+      cost: 1
+    - title: Fix the swapped switch
+      body: On mv-sw-south-2 make VLAN 99 the untagged PVID of eth3 and carry the student VLAN tagged.
+      command: "bridge vlan add dev eth3 vid 99 pvid untagged"
+      cost: 2
+  misconceptions:
+    - id: fix-wrong-side
+      description: Changes the healthy switch to match the swapped one
+      mutation:
+        on: mv-sw-south-1
+        run: |
+          bridge vlan add dev eth3 vid 99; bridge vlan add dev eth3 vid {{students}} pvid untagged
+      expectFail: [trunk-standard, sw1-standard]
+      feedback: The VLANs are separated again, but the trunk now breaks the district standard (management must be the native VLAN).
+    - id: remove-native
+      description: Removes the student VLAN from the trunk to stop the leak
+      mutation:
+        on: mv-sw-south-2
+        run: |
+          bridge vlan del dev eth3 vid {{students}}; bridge vlan add dev eth3 vid 99 pvid untagged
+      expectFail: [students-across, trunk-standard]
+      feedback: The leak stops, but the student VLAN no longer crosses the trunk.
+  solution:
+    explanation: |
+      mv-sw-south-2 sends the student VLAN untagged on the trunk while
+      mv-sw-south-1 sends management untagged, so untagged frames switch VLANs
+      at the far end. Make VLAN 99 the native VLAN on mv-sw-south-2 and tag the
+      student VLAN.
+    steps:
+      - on: mv-sw-south-2
+        run: |
+          bridge vlan add dev eth3 vid 99 pvid untagged
+          bridge vlan add dev eth3 vid {{students}}

@@ -1,0 +1,166 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: net-arp-neighbour-tables
+  title: Read ARP and IPv6 neighbour tables to map hosts to MACs
+  domain: networking
+  frameworks: [ccna:network-fundamentals]
+  difficulty: easy
+  estimatedMinutes: 10
+  tags: [arp, ndp, ipv6, neighbour]
+  version: 1
+spec:
+  description: |
+    The south campus router `mv-campus-south` is a Linux router. Its library LAN
+    (`eth1`, `10.{{octet}}.30.0/24`) holds the library printer `printer-south`
+    at `10.{{octet}}.30.{{printer}}`. Its uplink (`eth2`, `10.{{octet}}.0.0/30`)
+    goes to its default gateway, the core router `mv-core-1`.
+
+    The help desk needs the MAC addresses for a cabling audit. On
+    `mv-campus-south` (shell):
+
+    1. Make sure the IPv4 ARP table has entries for the printer and the gateway,
+       and the IPv6 neighbour table has an entry for the gateway's link-local
+       address on `eth2`.
+    2. Write `/root/neighbours.txt` with exactly these three lines (MACs in
+       lower case, colon separated):
+
+    ```
+    printer_mac: <MAC of the library printer>
+    gateway_mac: <MAC of the default gateway>
+    gateway_link_local: <IPv6 link-local address of the default gateway>
+    ```
+  objectives:
+    - Populate the ARP and IPv6 neighbour tables by sending traffic
+    - Read `ip neigh` output for IPv4 and IPv6
+    - Tell a neighbour's MAC from the router's own interface MAC
+  params:
+    octet:
+      type: int
+      min: 20
+      max: 90
+    printer:
+      type: int
+      min: 50
+      max: 59
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: mv-campus-south
+        driver: container
+        image: netsvc:1
+        resources: { cpu: 0.25, memoryMiB: 128 }
+        access: [shell]
+      - name: printer-south
+        driver: container
+        image: nettools:1
+        resources: { cpu: 0.25, memoryMiB: 128 }
+      - name: mv-core-1
+        driver: netdev
+        image: frr:10
+        access: [console]
+    links:
+      - { a: "printer-south:eth1", b: "mv-campus-south:eth1" }
+      - { a: "mv-campus-south:eth2", b: "mv-core-1:eth1", subnet: "10.{{octet}}.0.0/30" }
+  setup:
+    - on: mv-core-1
+      config: |
+        interface eth1
+         ip address 10.{{octet}}.0.1/30
+        ip route 10.{{octet}}.30.0/24 10.{{octet}}.0.2
+    - on: mv-campus-south
+      run: |
+        ip addr replace 10.{{octet}}.30.1/24 dev eth1
+        ip addr replace 10.{{octet}}.0.2/30 dev eth2
+        ip route replace default via 10.{{octet}}.0.1
+        ip neigh flush all
+    - on: printer-south
+      run: |
+        ip addr replace 10.{{octet}}.30.{{printer}}/24 dev eth1
+        ip route replace default via 10.{{octet}}.30.1
+  checks:
+    - id: printer-mac
+      description: The report gives the library printer's MAC address
+      type: shell
+      on: mv-campus-south
+      command: |
+        f=/root/neighbours.txt; [ -f "$f" ] || exit 1
+        got=$(sed -n 's/^printer_mac: *\([0-9a-fA-F:]*\) *$/\1/p' "$f" | tr A-F a-f)
+        ping -c1 -W2 10.{{octet}}.30.{{printer}} >/dev/null 2>&1
+        want=$(ip neigh show 10.{{octet}}.30.{{printer}} dev eth1 | awk '{print $3}')
+        [ -n "$want" ] && [ "$got" = "$want" ]
+      skills: [net.fundamentals.arp-nd]
+      weight: 2
+    - id: gateway-mac
+      description: The report gives the default gateway's MAC address
+      type: shell
+      on: mv-campus-south
+      command: |
+        f=/root/neighbours.txt; [ -f "$f" ] || exit 1
+        got=$(sed -n 's/^gateway_mac: *\([0-9a-fA-F:]*\) *$/\1/p' "$f" | tr A-F a-f)
+        ping -c1 -W2 10.{{octet}}.0.1 >/dev/null 2>&1
+        want=$(ip neigh show 10.{{octet}}.0.1 dev eth2 | awk '{print $3}')
+        [ -n "$want" ] && [ "$got" = "$want" ]
+      skills: [net.fundamentals.arp-nd]
+      weight: 2
+    - id: gateway-link-local
+      description: The report gives the gateway's IPv6 link-local address, which is in the IPv6 neighbour table
+      type: shell
+      on: mv-campus-south
+      command: |
+        f=/root/neighbours.txt; [ -f "$f" ] || exit 1
+        got=$(sed -n 's/^gateway_link_local: *\([0-9a-fA-F:]*\) *$/\1/p' "$f" | tr A-F a-f)
+        case "$got" in fe80:*) ;; *) exit 1;; esac
+        ip -6 neigh show dev eth2 | grep -q "^$got lladdr" || exit 1
+        ping -c1 -W2 "$got%eth2" >/dev/null 2>&1
+      skills: [net.fundamentals.arp-nd]
+  hints:
+    - title: Empty tables
+      body: Entries appear only after traffic. Ping each neighbour once; for IPv6, ping the all-nodes group `ff02::1` out of the uplink interface.
+      command: "ping -c2 -I eth2 ff02::1"
+      cost: 1
+    - title: Reading the tables
+      body: "`ip neigh show` lists IPv4 entries as `<address> dev <if> lladdr <mac> <state>`; `ip -6 neigh show dev eth2` does the same for IPv6. `ip link` shows this router's own MACs, which are not what is asked."
+      command: "ip -4 neigh show; ip -6 neigh show dev eth2"
+      cost: 1
+  misconceptions:
+    - id: own-mac
+      description: Reports the router's own interface MACs from `ip link` instead of the neighbours'
+      mutation:
+        on: mv-campus-south
+        run: |
+          ping -c1 -W2 10.{{octet}}.0.1 >/dev/null; ping -c2 -W2 -I eth2 ff02::1 >/dev/null
+          ll=$(ip -6 neigh show dev eth2 | awk '/^fe80/{print $1; exit}')
+          printf 'printer_mac: %s\ngateway_mac: %s\ngateway_link_local: %s\n' "$(cat /sys/class/net/eth1/address)" "$(cat /sys/class/net/eth2/address)" "$ll" > /root/neighbours.txt
+      expectFail: [printer-mac, gateway-mac]
+      feedback: "`ip link` shows the MACs of this router's own interfaces. The ARP table maps a neighbour's IP address to the neighbour's MAC."
+    - id: own-link-local
+      description: Reports the router's own link-local address on eth2 instead of the gateway's
+      mutation:
+        on: mv-campus-south
+        run: |
+          ping -c1 -W2 10.{{octet}}.30.{{printer}} >/dev/null; ping -c1 -W2 10.{{octet}}.0.1 >/dev/null
+          own=$(ip -6 addr show dev eth2 scope link | awk '/inet6/{print $2}' | cut -d/ -f1)
+          printf 'printer_mac: %s\ngateway_mac: %s\ngateway_link_local: %s\n' "$(ip neigh show 10.{{octet}}.30.{{printer}} | awk '{print $5}')" "$(ip neigh show 10.{{octet}}.0.1 | awk '{print $5}')" "$own" > /root/neighbours.txt
+      expectFail: [gateway-link-local]
+      feedback: Every interface has its own link-local address; the gateway's appears in the IPv6 neighbour table, not in `ip addr`.
+  solution:
+    explanation: |
+      Ping the printer and the gateway so ARP resolves them, ping the all-nodes
+      group on the uplink so neighbour discovery learns the gateway's link-local
+      address, then read both tables.
+    steps:
+      - on: mv-campus-south
+        run: |
+          ping -c1 -W2 10.{{octet}}.30.{{printer}} >/dev/null
+          ping -c1 -W2 10.{{octet}}.0.1 >/dev/null
+          ping -c2 -W2 -I eth2 ff02::1 >/dev/null
+          p=$(ip neigh show 10.{{octet}}.30.{{printer}} dev eth1 | awk '{print $3}')
+          g=$(ip neigh show 10.{{octet}}.0.1 dev eth2 | awk '{print $3}')
+          ll=$(ip -6 neigh show dev eth2 | awk '/^fe80/{print $1; exit}')
+          printf 'printer_mac: %s\ngateway_mac: %s\ngateway_link_local: %s\n' "$p" "$g" "$ll" > /root/neighbours.txt
+          cat /root/neighbours.txt

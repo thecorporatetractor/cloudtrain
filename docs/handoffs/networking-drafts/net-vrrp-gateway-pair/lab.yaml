@@ -1,0 +1,203 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: net-vrrp-gateway-pair
+  title: Give a campus a redundant default gateway with VRRP
+  domain: networking
+  frameworks: [ccna:ip-connectivity]
+  difficulty: medium
+  estimatedMinutes: 25
+  tags: [vrrp, fhrp, frr, redundancy]
+  version: 1
+spec:
+  description: |
+    The north campus classroom LAN `10.{{octet}}.10.0/24` hangs off the switch
+    `mv-sw-north-1` together with two routers, `mv-campus-north-a` (.2) and
+    `mv-campus-north-b` (.3), both uplinked to `mv-core-1` (FRR consoles). The
+    classroom host `classroom-north` (.50) uses `10.{{octet}}.10.1` as its
+    default gateway, but nothing answers on that address yet.
+
+    Configure VRRP version 3, virtual router ID **{{vrid}}**, on `eth1` of both
+    campus routers with the virtual address `10.{{octet}}.10.1`:
+
+    - `mv-campus-north-a` is master with priority 200;
+    - `mv-campus-north-b` keeps the default priority 100 and takes over when
+      `-a` fails; preemption stays on so `-a` takes the role back.
+
+    The VRRP daemon and the macvlan interfaces FRR needs for VRID {{vrid}}
+    (`vrrp4-{{vrid}}`, carrying the virtual MAC and address) are already prepared
+    on both routers. The grader shuts `eth1` on `mv-campus-north-a` for 20 seconds
+    and checks that `classroom-north` still reaches `mv-core-1` (`10.{{octet}}.1.1`).
+  objectives:
+    - Configure a VRRP group with a virtual IP, priority and preemption
+    - Verify master and backup roles
+    - Prove the gateway survives the loss of the master
+  params:
+    octet:
+      type: int
+      min: 20
+      max: 90
+    vrid:
+      type: int
+      min: 10
+      max: 99
+  topology:
+    entry: workstation
+    nodes:
+      - { name: workstation, driver: container, image: jumphost:1, access: [shell] }
+      - { name: mv-campus-north-a, driver: netdev, image: frr:10, access: [console] }
+      - { name: mv-campus-north-b, driver: netdev, image: frr:10, access: [console] }
+      - { name: mv-core-1, driver: netdev, image: frr:10, access: [console] }
+      - { name: mv-sw-north-1, driver: container, image: netsvc:1, resources: { cpu: 0.25, memoryMiB: 96 } }
+      - { name: classroom-north, driver: container, image: nettools:1, resources: { cpu: 0.2, memoryMiB: 64 }, access: [shell] }
+    links:
+      - { a: "mv-campus-north-a:eth1", b: "mv-sw-north-1:eth1" }
+      - { a: "mv-campus-north-b:eth1", b: "mv-sw-north-1:eth2" }
+      - { a: "classroom-north:eth1", b: "mv-sw-north-1:eth3" }
+      - { a: "mv-campus-north-a:eth2", b: "mv-core-1:eth1", subnet: "10.{{octet}}.0.0/30" }
+      - { a: "mv-campus-north-b:eth2", b: "mv-core-1:eth2", subnet: "10.{{octet}}.0.4/30" }
+  setup:
+    - on: mv-sw-north-1
+      run: |
+        ip link add br0 type bridge 2>/dev/null || true
+        for p in eth1 eth2 eth3; do ip link set $p master br0; done; ip link set br0 up
+    - on: mv-campus-north-a
+      run: &vrrpprep |
+        pgrep -x vrrpd >/dev/null || setsid /usr/lib/frr/vrrpd -d -F traditional -A 127.0.0.1 --limit-fds 1024 </dev/null >/dev/null 2>&1
+        V=$(printf '%02x' {{vrid}})
+        ip link add vrrp4-{{vrid}} link eth1 type macvlan mode bridge 2>/dev/null || true
+        ip link set dev vrrp4-{{vrid}} address 00:00:5e:00:01:$V
+        ip addr replace 10.{{octet}}.10.1/24 dev vrrp4-{{vrid}}
+        ip link set vrrp4-{{vrid}} protodown on 2>/dev/null || true
+        ip link set vrrp4-{{vrid}} up
+        for i in $(seq 20); do vtysh -c 'show vrrp' >/dev/null 2>&1 && exit 0; sleep 1; done; exit 1
+    - on: mv-campus-north-b
+      run: *vrrpprep
+    - on: mv-campus-north-a
+      config: |
+        interface eth1
+         ip address 10.{{octet}}.10.2/24
+        interface eth2
+         ip address 10.{{octet}}.0.2/30
+        ip route 10.{{octet}}.1.0/24 10.{{octet}}.0.1
+    - on: mv-campus-north-b
+      config: |
+        interface eth1
+         ip address 10.{{octet}}.10.3/24
+        interface eth2
+         ip address 10.{{octet}}.0.6/30
+        ip route 10.{{octet}}.1.0/24 10.{{octet}}.0.5
+    - on: mv-core-1
+      run: ip link add lan1 type dummy 2>/dev/null; ip link set lan1 up
+    - on: mv-core-1
+      config: |
+        interface eth1
+         ip address 10.{{octet}}.0.1/30
+        interface eth2
+         ip address 10.{{octet}}.0.5/30
+        interface lan1
+         ip address 10.{{octet}}.1.1/24
+        ip route 10.{{octet}}.10.0/24 10.{{octet}}.0.2
+        ip route 10.{{octet}}.10.0/24 10.{{octet}}.0.6 50
+    - { on: classroom-north, run: "ip addr replace 10.{{octet}}.10.50/24 dev eth1 && ip route replace default via 10.{{octet}}.10.1" }
+  checks:
+    - id: a-master
+      description: mv-campus-north-a is VRRP master for the group with priority 200
+      type: shell
+      on: mv-campus-north-a
+      command: vtysh -c 'show vrrp summary' | awk '$1=="eth1" && $2=="{{vrid}}"{print $3, $4, $6}'
+      expect: { match: exact, value: "200 1 Master" }
+      skills: [net.routing.vrrp]
+      weight: 2
+    - id: b-backup
+      description: mv-campus-north-b is VRRP backup for the group with priority 100 and the same virtual address
+      type: shell
+      on: mv-campus-north-b
+      command: |
+        vtysh -c 'show vrrp eth1 {{vrid}}' | grep -q '10.{{octet}}.10.1' || exit 1
+        vtysh -c 'show vrrp summary' | awk '$1=="eth1" && $2=="{{vrid}}"{print $3, $4, $6}'
+      expect: { match: exact, value: "100 1 Backup" }
+      skills: [net.routing.vrrp]
+    - id: gateway-works
+      description: classroom-north reaches the core through the virtual gateway
+      type: reachability
+      on: classroom-north
+      target: 10.{{octet}}.1.1
+      skills: [net.routing.vrrp]
+    - id: fail-master
+      description: (failover test) mv-campus-north-a's LAN interface is shut for 20 seconds
+      type: shell
+      on: mv-campus-north-a
+      command: |
+        ip link set eth1 down
+        setsid sh -c 'sleep 20; ip link set eth1 up' </dev/null >/dev/null 2>&1 &
+        echo started
+      expect: { match: exact, value: started }
+      skills: [net.routing.vrrp]
+      weight: 0
+    - id: survives-failover
+      description: While mv-campus-north-a is down, classroom-north still reaches the core
+      type: shell
+      on: classroom-north
+      command: |
+        for i in $(seq 8); do ping -c1 -W1 10.{{octet}}.1.1 >/dev/null 2>&1 && { echo ok; exit 0; }; done; echo lost
+      expect: { match: exact, value: ok }
+      timeoutSec: 15
+      skills: [net.routing.vrrp]
+      weight: 2
+    - id: b-took-over
+      description: mv-campus-north-b became master during the failure
+      type: shell
+      on: mv-campus-north-b
+      command: vtysh -c 'show vrrp summary' | awk '$1=="eth1" && $2=="{{vrid}}"{print $6}'
+      expect: { match: exact, value: Master }
+      skills: [net.routing.vrrp]
+  hints:
+    - title: FRR VRRP commands
+      body: "Under `interface eth1`: `vrrp {{vrid}} version 3`, `vrrp {{vrid}} ip 10.{{octet}}.10.1` and `vrrp {{vrid}} priority 200` on the master."
+      cost: 2
+    - title: Checking roles
+      body: "`show vrrp summary` lists each group's priority, number of addresses and state on this router."
+      command: "show vrrp summary"
+      cost: 1
+  misconceptions:
+    - id: only-master
+      description: Configures VRRP on the master router only
+      mutation:
+        on: mv-campus-north-a
+        config: |
+          interface eth1
+           vrrp {{vrid}} version 3
+           vrrp {{vrid}} priority 200
+           vrrp {{vrid}} ip 10.{{octet}}.10.1
+      expectFail: [b-backup, survives-failover, b-took-over]
+      feedback: The gateway works until the master fails; without a backup in the same group nobody takes over.
+    - id: equal-priorities
+      description: Leaves both routers at the default priority
+      mutation:
+        on: mv-campus-north-b
+        config: |
+          interface eth1
+           vrrp {{vrid}} version 3
+           vrrp {{vrid}} ip 10.{{octet}}.10.1
+      expectFail: [a-master]
+      feedback: With equal priorities the higher interface address wins, so -b becomes master; -a needs priority 200.
+  solution:
+    explanation: |
+      Both routers join VRRP group {{vrid}} with the same virtual address; -a has
+      priority 200 and becomes master, -b stays backup at 100 and takes over when
+      -a stops advertising. Preemption (on by default) returns the role to -a.
+    steps:
+      - on: mv-campus-north-a
+        config: |
+          interface eth1
+           vrrp {{vrid}} version 3
+           vrrp {{vrid}} priority 200
+           vrrp {{vrid}} ip 10.{{octet}}.10.1
+      - on: mv-campus-north-b
+        config: |
+          interface eth1
+           vrrp {{vrid}} version 3
+           vrrp {{vrid}} ip 10.{{octet}}.10.1
+      - on: mv-campus-north-b
+        run: sleep 6

@@ -1,0 +1,180 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: net-vlan-access-ports
+  title: Separate staff and student ports into VLANs
+  domain: networking
+  frameworks: [ccna:network-access]
+  difficulty: easy
+  estimatedMinutes: 15
+  tags: [vlan, access-port, linux-bridge]
+  version: 1
+spec:
+  description: |
+    The north campus switch `mv-sw-north-1` is a Linux bridge (`br0`, shell
+    access). Today all four ports share one broadcast domain, so student laptops
+    can reach staff machines:
+
+    | Port | Host | Should be in |
+    |---|---|---|
+    | `eth1` | `staff-north-1` | VLAN 20 (staff) |
+    | `eth2` | `staff-north-2` | VLAN 20 (staff) |
+    | `eth3` | `student-north-1` | VLAN 30 (students) |
+    | `eth4` | `student-north-2` | VLAN 30 (students) |
+
+    All four hosts use addresses in `10.{{octet}}.{{lan}}.0/24`. Turn on VLAN
+    filtering on `br0` and make each port an untagged access port of its VLAN,
+    with no other VLAN on it, so staff hosts reach each other, student hosts reach
+    each other, and staff and students cannot reach each other.
+  objectives:
+    - Enable VLAN filtering on a Linux bridge
+    - Configure untagged access ports with a port VLAN ID
+    - Verify separation between VLANs at layer 2
+  params:
+    octet:
+      type: int
+      min: 20
+      max: 90
+    lan:
+      type: int
+      min: 10
+      max: 99
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: mv-sw-north-1
+        driver: container
+        image: netsvc:1
+        resources: { cpu: 0.25, memoryMiB: 96 }
+        access: [shell]
+      - name: staff-north-1
+        driver: container
+        image: nettools:1
+        resources: { cpu: 0.25, memoryMiB: 64 }
+        access: [shell]
+      - name: staff-north-2
+        driver: container
+        image: nettools:1
+        resources: { cpu: 0.25, memoryMiB: 64 }
+        access: [shell]
+      - name: student-north-1
+        driver: container
+        image: nettools:1
+        resources: { cpu: 0.25, memoryMiB: 64 }
+        access: [shell]
+      - name: student-north-2
+        driver: container
+        image: nettools:1
+        resources: { cpu: 0.25, memoryMiB: 64 }
+        access: [shell]
+    links:
+      - { a: "mv-sw-north-1:eth1", b: "staff-north-1:eth1" }
+      - { a: "mv-sw-north-1:eth2", b: "staff-north-2:eth1" }
+      - { a: "mv-sw-north-1:eth3", b: "student-north-1:eth1" }
+      - { a: "mv-sw-north-1:eth4", b: "student-north-2:eth1" }
+  setup:
+    - on: mv-sw-north-1
+      run: |
+        ip link add br0 type bridge vlan_filtering 0 2>/dev/null || true
+        for p in eth1 eth2 eth3 eth4; do ip link set $p master br0; done
+        ip link set br0 up
+    - on: staff-north-1
+      run: ip addr replace 10.{{octet}}.{{lan}}.21/24 dev eth1
+    - on: staff-north-2
+      run: ip addr replace 10.{{octet}}.{{lan}}.22/24 dev eth1
+    - on: student-north-1
+      run: ip addr replace 10.{{octet}}.{{lan}}.31/24 dev eth1
+    - on: student-north-2
+      run: ip addr replace 10.{{octet}}.{{lan}}.32/24 dev eth1
+  checks:
+    - id: staff-ports
+      description: eth1 and eth2 are untagged access ports of VLAN 20 only
+      type: shell
+      on: mv-sw-north-1
+      command: &ports |
+        [ "$(cat /sys/class/net/br0/bridge/vlan_filtering)" = 1 ] || exit 1
+        bridge -j vlan show | python3 -c '
+        import json,sys
+        for p in json.load(sys.stdin):
+            v=[(x["vlan"],"PVID" in x.get("flags",[]),"Egress Untagged" in x.get("flags",[])) for x in p["vlans"]]
+            print(p["ifname"], v)'
+      expect: { match: regex, value: "(?m)^eth1 \\[\\(20, True, True\\)\\]\\neth2 \\[\\(20, True, True\\)\\]$" }
+      skills: [net.switching.vlans]
+      weight: 2
+    - id: student-ports
+      description: eth3 and eth4 are untagged access ports of VLAN 30 only
+      type: shell
+      on: mv-sw-north-1
+      command: *ports
+      expect: { match: regex, value: "(?m)^eth3 \\[\\(30, True, True\\)\\]\\neth4 \\[\\(30, True, True\\)\\]$" }
+      skills: [net.switching.vlans]
+      weight: 2
+    - id: staff-together
+      description: staff-north-1 reaches staff-north-2
+      type: reachability
+      on: staff-north-1
+      target: 10.{{octet}}.{{lan}}.22
+      skills: [net.switching.vlans]
+    - id: students-together
+      description: student-north-1 reaches student-north-2
+      type: reachability
+      on: student-north-1
+      target: 10.{{octet}}.{{lan}}.32
+      skills: [net.switching.vlans]
+    - id: staff-student-separated
+      description: staff-north-1 cannot reach student-north-1
+      type: shell
+      on: staff-north-1
+      command: |
+        ip neigh flush dev eth1
+        if ping -c2 -W1 10.{{octet}}.{{lan}}.31 >/dev/null 2>&1; then echo reachable; else echo unreachable; fi
+      expect: { match: exact, value: unreachable }
+      skills: [net.switching.vlans]
+      weight: 2
+      timeoutSec: 10
+  hints:
+    - title: Filtering first
+      body: A Linux bridge ignores VLAN membership until VLAN filtering is on.
+      command: "ip link set br0 type bridge vlan_filtering 1"
+      cost: 1
+    - title: Access ports
+      body: An access port carries one VLAN untagged and tags incoming frames with it (PVID). Add the VLAN with `pvid untagged` and remove the default VLAN 1 from the port.
+      command: "bridge vlan add dev eth1 vid 20 pvid untagged; bridge vlan del dev eth1 vid 1"
+      cost: 2
+    - title: Check your work
+      body: "`bridge vlan show` lists every port's VLANs and flags."
+      cost: 1
+  misconceptions:
+    - id: filtering-off
+      description: Assigns VLANs but never turns on VLAN filtering
+      mutation:
+        on: mv-sw-north-1
+        run: |
+          for p in eth1 eth2; do bridge vlan add dev $p vid 20 pvid untagged; bridge vlan del dev $p vid 1; done
+          for p in eth3 eth4; do bridge vlan add dev $p vid 30 pvid untagged; bridge vlan del dev $p vid 1; done
+      expectFail: [staff-ports, student-ports, staff-student-separated]
+      feedback: Without vlan_filtering the bridge forwards every frame regardless of the VLAN table.
+    - id: tagged-not-access
+      description: Adds the VLANs as tagged memberships and leaves VLAN 1 as the untagged PVID
+      mutation:
+        on: mv-sw-north-1
+        run: |
+          ip link set br0 type bridge vlan_filtering 1
+          for p in eth1 eth2; do bridge vlan add dev $p vid 20; done
+          for p in eth3 eth4; do bridge vlan add dev $p vid 30; done
+      expectFail: [staff-ports, student-ports, staff-student-separated]
+      feedback: The hosts send untagged frames, so they still land in the PVID (VLAN 1) together.
+  solution:
+    explanation: |
+      Enable VLAN filtering, then make each port an untagged member with its
+      VLAN as PVID and remove the default VLAN 1.
+    steps:
+      - on: mv-sw-north-1
+        run: |
+          ip link set br0 type bridge vlan_filtering 1
+          for p in eth1 eth2; do bridge vlan add dev $p vid 20 pvid untagged; bridge vlan del dev $p vid 1; done
+          for p in eth3 eth4; do bridge vlan add dev $p vid 30 pvid untagged; bridge vlan del dev $p vid 1; done

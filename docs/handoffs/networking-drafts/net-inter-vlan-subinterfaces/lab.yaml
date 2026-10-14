@@ -1,0 +1,123 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: net-inter-vlan-subinterfaces
+  title: Route between campus VLANs on one router link
+  domain: networking
+  frameworks: [ccna:network-access, ccna:ip-connectivity]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [inter-vlan, router-on-a-stick, 802.1q, subinterface]
+  version: 1
+spec:
+  description: |
+    The north campus router `mv-campus-north` (Linux router, shell) has a single
+    cable, `eth1`, to the switch `mv-sw-north-1`. The switch port facing the
+    router is already an 802.1Q trunk tagging VLANs 20, 30 and 40; each VLAN has
+    one host:
+
+    | VLAN | Subnet | Gateway | Host |
+    |---|---|---|---|
+    | 20 (staff) | 10.{{octet}}.20.0/24 | 10.{{octet}}.20.1 | `staff-north` (.10) |
+    | 30 (students) | 10.{{octet}}.30.0/24 | 10.{{octet}}.30.1 | `student-north` (.10) |
+    | 40 (printers) | 10.{{octet}}.40.0/24 | 10.{{octet}}.40.1 | `printer-north` (.10) |
+
+    The hosts are addressed and point at their gateway. Configure 802.1Q
+    subinterfaces for the three VLANs on `eth1` of `mv-campus-north` and give each
+    the gateway address (IPv4 forwarding is already on), so every host reaches the
+    other two.
+  objectives:
+    - Create 802.1Q VLAN subinterfaces on a router's trunk link
+    - Assign one gateway per VLAN and enable routing between them
+    - Verify inter-VLAN reachability through the router
+  params:
+    octet:
+      type: int
+      min: 20
+      max: 90
+  topology:
+    entry: workstation
+    nodes:
+      - { name: workstation, driver: container, image: jumphost:1, access: [shell] }
+      - { name: mv-campus-north, driver: container, image: netsvc:1, resources: { cpu: 0.25, memoryMiB: 96 }, access: [shell] }
+      - { name: mv-sw-north-1, driver: container, image: netsvc:1, resources: { cpu: 0.25, memoryMiB: 96 }, access: [shell] }
+      - { name: staff-north, driver: container, image: nettools:1, resources: { cpu: 0.2, memoryMiB: 64 }, access: [shell] }
+      - { name: student-north, driver: container, image: nettools:1, resources: { cpu: 0.2, memoryMiB: 64 }, access: [shell] }
+      - { name: printer-north, driver: container, image: nettools:1, resources: { cpu: 0.2, memoryMiB: 64 }, access: [shell] }
+    links:
+      - { a: "mv-campus-north:eth1", b: "mv-sw-north-1:eth4" }
+      - { a: "mv-sw-north-1:eth1", b: "staff-north:eth1" }
+      - { a: "mv-sw-north-1:eth2", b: "student-north:eth1" }
+      - { a: "mv-sw-north-1:eth3", b: "printer-north:eth1" }
+  setup:
+    - on: mv-sw-north-1
+      run: |
+        ip link add br0 type bridge vlan_filtering 1 2>/dev/null || true
+        for p in eth1 eth2 eth3 eth4; do ip link set $p master br0; done; ip link set br0 up
+        bridge vlan add dev eth1 vid 20 pvid untagged; bridge vlan del dev eth1 vid 1
+        bridge vlan add dev eth2 vid 30 pvid untagged; bridge vlan del dev eth2 vid 1
+        bridge vlan add dev eth3 vid 40 pvid untagged; bridge vlan del dev eth3 vid 1
+        for v in 20 30 40; do bridge vlan add dev eth4 vid $v; done; bridge vlan del dev eth4 vid 1
+    - { on: staff-north, run: "ip addr replace 10.{{octet}}.20.10/24 dev eth1 && ip route replace default via 10.{{octet}}.20.1" }
+    - { on: student-north, run: "ip addr replace 10.{{octet}}.30.10/24 dev eth1 && ip route replace default via 10.{{octet}}.30.1" }
+    - { on: printer-north, run: "ip addr replace 10.{{octet}}.40.10/24 dev eth1 && ip route replace default via 10.{{octet}}.40.1" }
+  checks:
+    - id: subinterfaces
+      description: mv-campus-north has VLAN 20, 30 and 40 subinterfaces on eth1 with the gateway addresses
+      type: shell
+      on: mv-campus-north
+      command: |
+        ip -j -d addr show | python3 -c '
+        import json,sys
+        out=[]
+        for i in json.load(sys.stdin):
+            li=i.get("linkinfo",{})
+            if li.get("info_kind")=="vlan" and i.get("link")=="eth1":
+                for a in i.get("addr_info",[]):
+                    if a["family"]=="inet": out.append("%s %s/%s" % (li["info_data"]["id"], a["local"], a["prefixlen"]))
+        print(" ".join(sorted(out)))'
+      expect: { match: exact, value: "20 10.{{octet}}.20.1/24 30 10.{{octet}}.30.1/24 40 10.{{octet}}.40.1/24" }
+      skills: [net.switching.inter-vlan]
+      weight: 2
+    - { id: staff-gateway, description: staff-north reaches its gateway, type: reachability, on: staff-north, target: "10.{{octet}}.20.1", skills: [net.switching.inter-vlan] }
+    - { id: staff-to-students, description: staff-north reaches student-north, type: reachability, on: staff-north, target: "10.{{octet}}.30.10", skills: [net.switching.inter-vlan], weight: 2 }
+    - { id: students-to-printers, description: student-north reaches printer-north, type: reachability, on: student-north, target: "10.{{octet}}.40.10", skills: [net.switching.inter-vlan], weight: 2 }
+  hints:
+    - title: One subinterface per VLAN
+      body: A VLAN subinterface is a Linux VLAN device on top of the trunk interface; it sends and receives frames tagged with its VLAN ID.
+      command: "ip link add link eth1 name eth1.20 type vlan id 20"
+      cost: 1
+    - title: Gateways
+      body: Put each VLAN's gateway address on its subinterface and bring it up; leave eth1 itself without an address.
+      command: "ip addr add 10.{{octet}}.20.1/24 dev eth1.20; ip link set eth1.20 up"
+      cost: 2
+  misconceptions:
+    - id: untagged-addresses
+      description: Puts all three gateway addresses directly on eth1 instead of on tagged subinterfaces
+      mutation:
+        on: mv-campus-north
+        run: |
+  for v in 20 30 40; do ip addr add 10.{{octet}}.$v.1/24 dev eth1; done
+      expectFail: [subinterfaces, staff-gateway, staff-to-students]
+      feedback: The switch sends these VLANs tagged; untagged addresses on eth1 never see the hosts' frames.
+    - id: wrong-vlan-id
+      description: Numbers the subinterfaces by name but gives one of them the wrong VLAN ID
+      mutation:
+        on: mv-campus-north
+        run: |
+          ip link add link eth1 name eth1.20 type vlan id 20; ip link add link eth1 name eth1.30 type vlan id 40; ip link add link eth1 name eth1.40 type vlan id 30
+          for v in 20 30 40; do ip addr add 10.{{octet}}.$v.1/24 dev eth1.$v; ip link set eth1.$v up; done
+      expectFail: [subinterfaces, staff-to-students, students-to-printers]
+      feedback: The interface name is only a label; the VLAN ID decides which tagged frames the subinterface receives.
+  solution:
+    explanation: |
+      Create eth1.20, eth1.30 and eth1.40 as 802.1Q subinterfaces, give each the
+      VLAN's gateway address and bring them up; the router forwards between them.
+    steps:
+      - on: mv-campus-north
+        run: |
+          for v in 20 30 40; do
+            ip link add link eth1 name eth1.$v type vlan id $v
+            ip addr add 10.{{octet}}.$v.1/24 dev eth1.$v
+            ip link set eth1.$v up
+          done
