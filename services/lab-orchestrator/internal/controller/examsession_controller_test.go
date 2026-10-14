@@ -370,6 +370,8 @@ func TestExamTimerExpiryFreezesAndGrades(t *testing.T) {
 		t.Fatal("frozen before the deadline")
 	}
 	h.now = h.now.Add(2 * time.Minute)
+	// The client's auto-submit lands after the deadline: still a time-out.
+	h.patchES(`{"spec":{"submit":true}}`)
 	h.pump(2)
 	es = h.es()
 	if es.Status.FrozenAt == nil || es.Status.SubmittedAt != nil {

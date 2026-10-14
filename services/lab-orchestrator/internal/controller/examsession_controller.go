@@ -509,12 +509,14 @@ func (r *ExamSessionReconciler) inProgress(ctx context.Context, run *examRun, en
 			return r.failAttempt(ctx, run, "EnvironmentLost", ExamMsgEnvFailed)
 		}
 	}
-	if es.Spec.Submit && st.SubmittedAt == nil {
+	expired := st.Deadline != nil && !now.Before(st.Deadline.Time)
+	// A submit that arrives at or after the deadline (e.g. the client's
+	// auto-submit at time-out) is a time-out, not a candidate submit.
+	if es.Spec.Submit && st.SubmittedAt == nil && !expired {
 		t := metav1.NewTime(now)
 		st.SubmittedAt = &t
 		r.event(es, "Normal", "Submitted", "submitted by the candidate")
 	}
-	expired := st.Deadline != nil && !now.Before(st.Deadline.Time)
 	if st.SubmittedAt == nil && !expired {
 		return ctrl.Result{RequeueAfter: st.Deadline.Sub(now)}, nil
 	}

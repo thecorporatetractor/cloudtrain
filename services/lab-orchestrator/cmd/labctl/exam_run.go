@@ -70,12 +70,14 @@ type ExamAttemptReport struct {
 
 // FreezeProof is what --expire observed at the deadline.
 type FreezeProof struct {
-	LearnerPIDBefore     string `json:"learnerPidBefore"`
-	EndpointsBefore      int    `json:"endpointsBefore"`
-	EndpointsAfter       int    `json:"endpointsAfter"`
-	AccessRevoked        bool   `json:"accessRevokedCondition"`
-	LearnerProcsAfter    string `json:"learnerProcessesAfter"`
-	FrozenAfterDeadlineS int64  `json:"frozenSecondsAfterDeadline"`
+	LearnerPIDBefore  string `json:"learnerPidBefore"`
+	EndpointsBefore   int    `json:"endpointsBefore"`
+	EndpointsAfter    int    `json:"endpointsAfter"`
+	AccessRevoked     bool   `json:"accessRevokedCondition"`
+	LearnerProcsAfter string `json:"learnerProcessesAfter"`
+	// ZombiesAfter are killed learner processes not yet reaped (no live code).
+	ZombiesAfter         []string `json:"killedZombiesAfter,omitempty"`
+	FrozenAfterDeadlineS int64    `json:"frozenSecondsAfterDeadline"`
 }
 
 // ExamRunReport is written to <out>/<exam>-<mode>.json.
@@ -566,10 +568,15 @@ func (x *examRunner) solve(ctx context.Context, es *labsv1.ExamSession, resolved
 	return nil
 }
 
-// learnerProcs lists the learner's processes on a node (as root).
+// learnerProcs lists the learner's live processes on a node (as root).
+// Killed processes whose parent is gone stay as zombies until the
+// container's PID 1 reaps them (the jumphost has no reaping init); they hold
+// no resources and run nothing, so they are reported separately as "Z<pid>".
 const learnerProcs = `uid=$(id -u learner 2>/dev/null) || exit 0
 for d in /proc/[0-9]*; do
-  [ "$(awk '/^Uid:/{print $2}' "$d/status" 2>/dev/null)" = "$uid" ] && printf '%s:%s ' "${d#/proc/}" "$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null)"
+  [ "$(awk '/^Uid:/{print $2}' "$d/status" 2>/dev/null)" = "$uid" ] || continue
+  if [ "$(awk '/^State:/{print $2}' "$d/status" 2>/dev/null)" = Z ]; then printf 'Z%s ' "${d#/proc/}"; continue; fi
+  printf '%s:%s ' "${d#/proc/}" "$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null)"
 done; true`
 
 // proveFreeze starts a learner background process, waits for the deadline
@@ -623,8 +630,14 @@ func (x *examRunner) proveFreeze(ctx context.Context, es *labsv1.ExamSession) (*
 	if err != nil {
 		return p, fmt.Errorf("list learner processes: %w", err)
 	}
-	p.LearnerProcsAfter = strings.TrimSpace(after.Stdout)
-	x.v.logf("%s: frozen %ds after the deadline; endpoints %d -> %d; learner processes after: %q", es.Name, p.FrozenAfterDeadlineS, p.EndpointsBefore, p.EndpointsAfter, p.LearnerProcsAfter)
+	for _, f := range strings.Fields(after.Stdout) {
+		if strings.HasPrefix(f, "Z") {
+			p.ZombiesAfter = append(p.ZombiesAfter, strings.TrimPrefix(f, "Z"))
+		} else {
+			p.LearnerProcsAfter = strings.TrimSpace(p.LearnerProcsAfter + " " + f)
+		}
+	}
+	x.v.logf("%s: frozen %ds after the deadline; endpoints %d -> %d; live learner processes after: %q; killed (zombie) pids: %v", es.Name, p.FrozenAfterDeadlineS, p.EndpointsBefore, p.EndpointsAfter, p.LearnerProcsAfter, p.ZombiesAfter)
 	switch {
 	case p.EndpointsAfter != 0:
 		return p, fmt.Errorf("%d endpoint(s) still published after the freeze", p.EndpointsAfter)
