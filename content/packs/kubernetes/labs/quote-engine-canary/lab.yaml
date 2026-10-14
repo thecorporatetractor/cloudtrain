@@ -1,0 +1,299 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: quote-engine-canary
+  title: Send a share of traffic to a canary release
+  domain: kubernetes
+  frameworks: [ckad:deployment]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [canary, deployments, services, labels]
+  version: 1
+spec:
+  description: |
+    The pricing team has a new quote engine (v2) that rounds freight surcharges
+    differently. Before it replaces v1 they want it to answer a fixed share of
+    real quote requests. There is no service mesh or ingress controller in
+    front of it: only Deployments, labels and the existing Service.
+
+    From your workstation, switch to context `qm-dispatch` first:
+
+    ```bash
+    kubectl config use-context qm-dispatch
+    ```
+
+    In namespace `quote-pricing`, the Deployment `quote-engine-v1` runs
+    **{{v1}}** replicas behind the Service `quote-engine`. Add a Deployment
+    named **`quote-engine-v2`** so that:
+
+    - its Pods run the same image and port as v1, but with the environment
+      variable `RELEASE=v2` (v1 Pods have `RELEASE=v1`) and the label
+      `release: v2` instead of `release: v1`;
+    - the Service `quote-engine` sends them traffic **without changing the
+      Service**;
+    - exactly **one Pod in five** behind the Service is a v2 Pod, so roughly
+      one request in five reaches v2;
+    - `quote-engine-v1` keeps its {{v1}} replicas and its Pods are untouched.
+
+    The Pod `probe` in the namespace has `wget` for testing.
+  objectives:
+    - Explain how a Service selector picks Pods from several Deployments
+    - Size a canary by replica ratio
+    - Keep Deployment selectors from overlapping
+  params:
+    v1:
+      type: choice
+      values: [4, 8]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-dispatch
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: qm-dispatch
+  setup:
+    - on: qm-dispatch
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: quote-pricing}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: quote-engine-v1, namespace: quote-pricing, labels: {app: quote-engine}}
+        spec:
+          replicas: {{v1}}
+          selector: {matchLabels: {app: quote-engine, release: v1}}
+          template:
+            metadata: {labels: {app: quote-engine, release: v1}}
+            spec:
+              containers:
+                - name: engine
+                  image: busybox:1.37
+                  env: [{name: RELEASE, value: v1}]
+                  command: ["sh", "-c", "mkdir -p /www && echo \"quote-engine $RELEASE\" > /www/index.html && exec httpd -f -p 8080 -h /www"]
+                  ports: [{name: http, containerPort: 8080}]
+                  readinessProbe:
+                    httpGet: {path: /, port: http}
+                    periodSeconds: 5
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata: {name: quote-engine, namespace: quote-pricing}
+        spec:
+          selector: {app: quote-engine}
+          ports: [{name: http, port: 80, targetPort: http}]
+        ---
+        apiVersion: v1
+        kind: Pod
+        metadata: {name: probe, namespace: quote-pricing, labels: {role: probe}}
+        spec:
+          containers:
+            - {name: probe, image: "busybox:1.37", command: ["sleep", "1d"]}
+    - on: qm-dispatch
+      timeoutSec: 150
+      run: |
+        kubectl -n quote-pricing rollout status deploy/quote-engine-v1 --timeout=120s
+        kubectl -n quote-pricing wait pod/probe --for=condition=Ready --timeout=60s
+  teardown:
+    - on: qm-dispatch
+      run: kubectl delete namespace quote-pricing --ignore-not-found --wait=false
+  checks:
+    - id: context
+      description: Terminal is using context qm-dispatch
+      type: k8s-context
+      on: workstation
+      skills: [k8s.cli.contexts]
+      weight: 0.5
+      expect: {match: exact, value: qm-dispatch}
+    - id: v2-ready
+      description: quote-engine-v2 Pods run RELEASE=v2 and are all ready
+      type: shell
+      timeoutSec: 30
+      on: qm-dispatch
+      skills: [k8s.delivery.deployment-strategies]
+      command: |
+        out=$(kubectl -n quote-pricing get deploy quote-engine-v2 -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="RELEASE")].value} {.spec.template.metadata.labels.release} {.status.readyReplicas} {.spec.replicas}' 2>/dev/null) || { echo missing; exit 0; }
+        set -- $out
+        [ "$1 $2" = "v2 v2" ] && [ -n "$3" ] && [ "$3" = "$4" ] && [ "$4" -gt 0 ] && echo ready || echo "not ready: $out"
+      expect: {match: exact, value: ready}
+    - id: share
+      description: Exactly one in five ready endpoints of the Service is a v2 Pod
+      type: shell
+      timeoutSec: 30
+      on: qm-dispatch
+      skills: [k8s.delivery.deployment-strategies]
+      weight: 3
+      command: |
+        kubectl -n quote-pricing get pods -l app=quote-engine -o json > /tmp/qe-pods.json
+        kubectl -n quote-pricing get endpointslices -l kubernetes.io/service-name=quote-engine -o json \
+          | jq -r --slurpfile pods /tmp/qe-pods.json '
+              ($pods[0].items | map({(.metadata.name): (.metadata.labels.release // "")}) | add // {}) as $rel
+              | [.items[].endpoints[]? | select(.conditions.ready == true) | $rel[.targetRef.name]] as $r
+              | ($r | length) as $t | ($r | map(select(. == "v2")) | length) as $v
+              | if $v > 0 and $v * 5 == $t then "share ok" else "v2=\($v) of total=\($t)" end'
+      expect: {match: exact, value: share ok}
+    - id: service-unchanged
+      description: The Service quote-engine still selects app=quote-engine only
+      type: k8s-query
+      skills: [k8s.networking.services]
+      query: {cluster: qm-dispatch, resource: service, name: quote-engine, namespace: quote-pricing, jsonpath: "{.spec.selector}"}
+      expect: {match: exact, value: '{"app":"quote-engine"}'}
+    - id: v1-untouched
+      description: quote-engine-v1 still runs {{v1}} ready v1 Pods
+      type: k8s-query
+      skills: [k8s.delivery.deployment-strategies]
+      query: {cluster: qm-dispatch, resource: deployment, name: quote-engine-v1, namespace: quote-pricing, jsonpath: '{.spec.replicas}/{.status.readyReplicas} {.spec.template.spec.containers[0].env[?(@.name=="RELEASE")].value}'}
+      expect: {match: exact, value: "{{v1}}/{{v1}} v1"}
+    - id: both-answer
+      description: Requests through the Service reach both v1 and v2
+      type: shell
+      on: qm-dispatch
+      skills: [k8s.delivery.deployment-strategies]
+      timeoutSec: 60
+      command: |
+        out=$(kubectl -n quote-pricing exec probe -- sh -c 'for i in $(seq 1 60); do wget -qO- -T 2 http://quote-engine/ 2>/dev/null; done' 2>/dev/null)
+        printf '%s\n' "$out" | grep -o 'quote-engine v[12]' | sort -u | tr '\n' ' '
+      expect: {match: exact, value: "quote-engine v1 quote-engine v2 "}
+  hints:
+    - title: Switch context
+      body: The pricing services run on the dispatch cluster.
+      command: kubectl config use-context qm-dispatch
+      cost: 0
+    - title: What the Service selects
+      body: Compare the Service selector with the labels on the v1 Pods. Any Pod carrying the Service's labels becomes an endpoint, whichever Deployment created it.
+      command: kubectl -n quote-pricing get svc quote-engine -o jsonpath='{.spec.selector}{"\n"}' && kubectl -n quote-pricing get pods --show-labels
+      cost: 1
+    - title: The arithmetic
+      body: With N v1 Pods, how many v2 Pods make v2 one fifth of the total?
+      cost: 2
+    - title: Copy, do not edit
+      body: Start from the v1 Deployment, rename it, and change the release label (selector and template) and the RELEASE variable. Editing v1 itself would turn the canary into a rollout.
+      command: kubectl -n quote-pricing get deploy quote-engine-v1 -o yaml > v2.yaml
+      cost: 2
+  misconceptions:
+    - id: switch-selector
+      description: Points the Service at release=v2, which sends all traffic to the canary at once.
+      feedback: Changing the Service selector is a blue/green cut-over, not a canary. Keep the selector and let replica counts set the share.
+      expectFail: [service-unchanged, share]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl -n quote-pricing get deploy quote-engine-v1 -o yaml \
+            | yq 'del(.status) | del(.metadata.uid) | del(.metadata.resourceVersion) | del(.metadata.creationTimestamp) | del(.metadata.managedFields) | del(.metadata.annotations)
+                  | .metadata.name = "quote-engine-v2" | .spec.replicas = {{v1}} / 4
+                  | .spec.selector.matchLabels.release = "v2" | .spec.template.metadata.labels.release = "v2"
+                  | .spec.template.spec.containers[0].env[0].value = "v2"' \
+            | kubectl apply -f -
+          kubectl -n quote-pricing patch svc quote-engine -p '{"spec":{"selector":{"app":"quote-engine","release":"v2"}}}'
+          kubectl -n quote-pricing rollout status deploy/quote-engine-v2 --timeout=120s
+    - id: equal-split
+      description: Runs as many v2 Pods as v1 Pods, which sends half of the traffic to the canary.
+      feedback: kube-proxy spreads connections evenly over ready endpoints, so the share equals the Pod ratio. One in five needs v2 = v1 / 4.
+      expectFail: [share]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl -n quote-pricing get deploy quote-engine-v1 -o yaml \
+            | yq 'del(.status) | del(.metadata.uid) | del(.metadata.resourceVersion) | del(.metadata.creationTimestamp) | del(.metadata.managedFields) | del(.metadata.annotations)
+                  | .metadata.name = "quote-engine-v2"
+                  | .spec.selector.matchLabels.release = "v2" | .spec.template.metadata.labels.release = "v2"
+                  | .spec.template.spec.containers[0].env[0].value = "v2"' \
+            | kubectl apply -f -
+          kubectl -n quote-pricing rollout status deploy/quote-engine-v2 --timeout=120s
+    - id: in-place
+      description: Edits quote-engine-v1 to RELEASE=v2, which rolls every Pod to the new release.
+      feedback: A canary runs next to the stable release. Changing the v1 template replaces all v1 Pods.
+      expectFail: [v1-untouched, v2-ready]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl -n quote-pricing set env deploy/quote-engine-v1 RELEASE=v2
+          kubectl -n quote-pricing rollout status deploy/quote-engine-v1 --timeout=120s
+    - id: missing-app-label
+      description: Gives the v2 Pods only the release label, so the Service never selects them.
+      feedback: The Service selects `app=quote-engine`; Pods without that label get no traffic, whatever their Deployment is called.
+      expectFail: [share, both-answer]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl -n quote-pricing get deploy quote-engine-v1 -o yaml \
+            | yq 'del(.status) | del(.metadata.uid) | del(.metadata.resourceVersion) | del(.metadata.creationTimestamp) | del(.metadata.managedFields) | del(.metadata.annotations)
+                  | .metadata.name = "quote-engine-v2" | .spec.replicas = {{v1}} / 4
+                  | .spec.selector.matchLabels = {"release": "v2"} | .spec.template.metadata.labels = {"release": "v2"}
+                  | .spec.template.spec.containers[0].env[0].value = "v2"' \
+            | kubectl apply -f -
+          kubectl -n quote-pricing rollout status deploy/quote-engine-v2 --timeout=120s
+  solution:
+    explanation: |
+      The Service selects `app=quote-engine`, so any ready Pod with that label is
+      an endpoint. A second Deployment whose Pods carry `app=quote-engine,
+      release=v2` (and a selector on `release=v2`, so it never overlaps v1) adds
+      v2 endpoints. With {{v1}} v1 Pods, {{v1}}/4 v2 Pods make one endpoint in five.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 180
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl apply -f - <<'YAML'
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: quote-engine-v2
+            namespace: quote-pricing
+            labels: {app: quote-engine}
+          spec:
+            replicas: {{v1}}
+            selector:
+              matchLabels: {app: quote-engine, release: v2}
+            template:
+              metadata:
+                labels: {app: quote-engine, release: v2}
+              spec:
+                containers:
+                  - name: engine
+                    image: busybox:1.37
+                    env: [{name: RELEASE, value: v2}]
+                    command: ["sh", "-c", "mkdir -p /www && echo \"quote-engine $RELEASE\" > /www/index.html && exec httpd -f -p 8080 -h /www"]
+                    ports: [{name: http, containerPort: 8080}]
+                    readinessProbe:
+                      httpGet: {path: /, port: http}
+                      periodSeconds: 5
+          YAML
+          kubectl -n quote-pricing scale deploy/quote-engine-v2 --replicas=$(( {{v1}} / 4 ))
+          kubectl -n quote-pricing rollout status deploy/quote-engine-v2 --timeout=150s
+    alternatives:
+      - id: copy-with-yq
+        description: Copy the live v1 Deployment with yq, changing name, labels, variable and replica count.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 180
+            run: |
+              kubectl config use-context qm-dispatch
+              kubectl -n quote-pricing get deploy quote-engine-v1 -o yaml \
+                | yq 'del(.status) | del(.metadata.uid) | del(.metadata.resourceVersion) | del(.metadata.creationTimestamp) | del(.metadata.managedFields) | del(.metadata.annotations) | del(.metadata.generation)
+                      | .metadata.name = "quote-engine-v2" | .spec.replicas = {{v1}} / 4
+                      | .spec.selector.matchLabels.release = "v2" | .spec.template.metadata.labels.release = "v2"
+                      | .spec.template.spec.containers[0].env[0].value = "v2"' \
+                | kubectl apply -f -
+              kubectl -n quote-pricing rollout status deploy/quote-engine-v2 --timeout=150s

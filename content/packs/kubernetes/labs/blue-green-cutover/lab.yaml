@@ -1,0 +1,279 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: blue-green-cutover
+  title: Cut over the customs portal blue/green
+  domain: kubernetes
+  frameworks: [ckad:deployment]
+  difficulty: medium
+  estimatedMinutes: 12
+  tags: [blue-green, deployments, services]
+  version: 1
+spec:
+  description: |
+    Brokers file declarations through the customs portal. Release
+    `{{green}}` changes the declaration form, and the customs authority wants
+    every broker to switch to it at the same moment, with a one-command way
+    back.
+
+    From your workstation, switch to context `qm-customs` first:
+
+    ```bash
+    kubectl config use-context qm-customs
+    ```
+
+    In namespace `customs-portal`, the Deployment `portal-blue` ({{replicas}}
+    replicas, Pods labelled `app: customs-portal, slot: blue`) serves the
+    Service `customs-portal`.
+
+    1. Create a Deployment **`portal-green`** with **{{replicas}}** replicas,
+       the same container as blue except `RELEASE={{green}}`, and Pod labels
+       `app: customs-portal, slot: green`.
+    2. Check that green is fully ready before any broker reaches it.
+    3. Switch the Service **`customs-portal`** so that **all** traffic goes
+       to green at once and none to blue.
+    4. Leave `portal-blue` **running at {{replicas}} replicas** so you can
+       switch back instantly.
+
+    The Pod `probe` in the namespace has `wget` for testing.
+  objectives:
+    - Run two versions side by side with distinct labels
+    - Switch traffic atomically by changing a Service selector
+    - Keep the previous version warm for rollback
+  params:
+    replicas:
+      type: int
+      min: 2
+      max: 3
+    green:
+      type: choice
+      values: ["2026.11", "2026.12", "2027.01"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-customs
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: qm-customs
+  setup:
+    - on: qm-customs
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: customs-portal}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: portal-blue, namespace: customs-portal}
+        spec:
+          replicas: {{replicas}}
+          selector: {matchLabels: {app: customs-portal, slot: blue}}
+          template:
+            metadata: {labels: {app: customs-portal, slot: blue}}
+            spec:
+              containers:
+                - name: portal
+                  image: busybox:1.37
+                  env: [{name: RELEASE, value: "2026.10"}]
+                  command: ["sh", "-c", "mkdir -p /www && echo \"customs portal $RELEASE\" > /www/index.html && exec httpd -f -p 8080 -h /www"]
+                  ports: [{name: http, containerPort: 8080}]
+                  readinessProbe:
+                    httpGet: {path: /, port: http}
+                    periodSeconds: 5
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata: {name: customs-portal, namespace: customs-portal}
+        spec:
+          selector: {app: customs-portal, slot: blue}
+          ports: [{name: http, port: 80, targetPort: http}]
+        ---
+        apiVersion: v1
+        kind: Pod
+        metadata: {name: probe, namespace: customs-portal, labels: {role: probe}}
+        spec:
+          containers:
+            - {name: probe, image: "busybox:1.37", command: ["sleep", "1d"]}
+    - on: qm-customs
+      timeoutSec: 150
+      run: |
+        kubectl -n customs-portal rollout status deploy/portal-blue --timeout=120s
+        kubectl -n customs-portal wait pod/probe --for=condition=Ready --timeout=60s
+  teardown:
+    - on: qm-customs
+      run: kubectl delete namespace customs-portal --ignore-not-found --wait=false
+  checks:
+    - id: context
+      description: Terminal is using context qm-customs
+      type: k8s-context
+      on: workstation
+      skills: [k8s.cli.contexts]
+      weight: 0.5
+      expect: {match: exact, value: qm-customs}
+    - id: green-ready
+      description: portal-green runs {{replicas}} ready Pods with RELEASE={{green}} and slot=green
+      type: k8s-query
+      skills: [k8s.delivery.deployment-strategies]
+      query: {cluster: qm-customs, resource: deployment, name: portal-green, namespace: customs-portal, jsonpath: '{.status.readyReplicas}/{.spec.replicas} {.spec.template.spec.containers[0].env[?(@.name=="RELEASE")].value} {.spec.template.metadata.labels.slot}'}
+      expect: {match: exact, value: "{{replicas}}/{{replicas}} {{green}} green"}
+    - id: selector-green
+      description: The Service selects the green slot of the customs portal
+      type: k8s-query
+      skills: [k8s.networking.services]
+      weight: 2
+      query: {cluster: qm-customs, resource: service, name: customs-portal, namespace: customs-portal, jsonpath: "{.spec.selector.app}/{.spec.selector.slot}"}
+      expect: {match: exact, value: customs-portal/green}
+    - id: endpoints-green-only
+      description: Every endpoint of the Service is a green Pod
+      type: shell
+      timeoutSec: 30
+      on: qm-customs
+      skills: [k8s.delivery.deployment-strategies]
+      weight: 2
+      command: |
+        names=$(kubectl -n customs-portal get endpointslices -l kubernetes.io/service-name=customs-portal -o jsonpath='{range .items[*].endpoints[*]}{.targetRef.name}{"\n"}{end}')
+        g=0; o=0
+        for p in $names; do
+          case "$p" in portal-green-*) g=$((g+1)) ;; *) o=$((o+1)) ;; esac
+        done
+        echo "green=$g other=$o"
+      expect: {match: exact, value: "green={{replicas}} other=0"}
+    - id: serves-green
+      description: Requests through the Service are answered by release {{green}} only
+      type: shell
+      on: qm-customs
+      skills: [k8s.delivery.deployment-strategies]
+      timeoutSec: 40
+      command: |
+        kubectl -n customs-portal exec probe -- sh -c 'for i in $(seq 1 20); do wget -qO- -T 2 http://customs-portal/ 2>/dev/null; done' 2>/dev/null | sort -u | tr '\n' ';'
+      expect: {match: exact, value: "customs portal {{green}};"}
+    - id: blue-warm
+      description: portal-blue is still running {{replicas}} ready Pods for rollback
+      type: k8s-query
+      skills: [k8s.delivery.deployment-strategies]
+      query: {cluster: qm-customs, resource: deployment, name: portal-blue, namespace: customs-portal, jsonpath: '{.status.readyReplicas}/{.spec.replicas} {.spec.template.spec.containers[0].env[?(@.name=="RELEASE")].value}'}
+      expect: {match: exact, value: "{{replicas}}/{{replicas}} 2026.10"}
+  hints:
+    - title: Switch context
+      body: The portal runs on the customs cluster.
+      command: kubectl config use-context qm-customs
+      cost: 0
+    - title: Two Deployments, one Service
+      body: Green needs its own Deployment whose selector and Pod labels say `slot=green`; blue stays as it is.
+      command: kubectl -n customs-portal get deploy portal-blue -o yaml > green.yaml
+      cost: 1
+    - title: Ready first
+      body: Wait for the green rollout before you touch the Service.
+      command: kubectl -n customs-portal rollout status deploy/portal-green
+      cost: 1
+    - title: The switch
+      body: A merge patch changes only the key you name in the selector.
+      command: "kubectl -n customs-portal patch service customs-portal -p '{\"spec\":{\"selector\":{\"slot\":\"green\"}}}'"
+      cost: 2
+  misconceptions:
+    - id: app-only-selector
+      description: Removes slot from the Service selector, so blue and green share the traffic.
+      feedback: Selecting only `app` makes both slots endpoints; that is a mixed rollout, not a cut-over. Select `slot=green`.
+      expectFail: [selector-green, endpoints-green-only, serves-green]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 180
+        run: |
+          kubectl config use-context qm-customs
+          kubectl -n customs-portal get deploy portal-blue -o yaml \
+            | yq 'del(.status) | del(.metadata.uid) | del(.metadata.resourceVersion) | del(.metadata.creationTimestamp) | del(.metadata.managedFields) | del(.metadata.annotations)
+                  | .metadata.name = "portal-green" | .spec.selector.matchLabels.slot = "green" | .spec.template.metadata.labels.slot = "green"
+                  | .spec.template.spec.containers[0].env[0].value = "{{green}}"' \
+            | kubectl apply -f -
+          kubectl -n customs-portal rollout status deploy/portal-green --timeout=120s
+          kubectl -n customs-portal patch service customs-portal --type=json -p '[{"op":"remove","path":"/spec/selector/slot"}]'
+    - id: blue-scaled-down
+      description: Scales blue to zero right after the switch, which removes the instant rollback path.
+      feedback: Blue/green keeps the old slot warm until the new one has proven itself; switching back is then only a selector change.
+      expectFail: [blue-warm]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 180
+        run: |
+          kubectl config use-context qm-customs
+          kubectl -n customs-portal get deploy portal-blue -o yaml \
+            | yq 'del(.status) | del(.metadata.uid) | del(.metadata.resourceVersion) | del(.metadata.creationTimestamp) | del(.metadata.managedFields) | del(.metadata.annotations)
+                  | .metadata.name = "portal-green" | .spec.selector.matchLabels.slot = "green" | .spec.template.metadata.labels.slot = "green"
+                  | .spec.template.spec.containers[0].env[0].value = "{{green}}"' \
+            | kubectl apply -f -
+          kubectl -n customs-portal rollout status deploy/portal-green --timeout=120s
+          kubectl -n customs-portal patch service customs-portal -p '{"spec":{"selector":{"slot":"green"}}}'
+          kubectl -n customs-portal scale deploy portal-blue --replicas=0
+    - id: update-blue-in-place
+      description: Changes RELEASE on portal-blue instead of creating green, which is a rolling update with no way back but another rollout.
+      feedback: Blue/green needs two complete environments. Updating blue in place mixes versions during the rollout and leaves nothing warm to fall back to.
+      expectFail: [green-ready, blue-warm]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 180
+        run: |
+          kubectl config use-context qm-customs
+          kubectl -n customs-portal set env deploy/portal-blue RELEASE={{green}}
+          kubectl -n customs-portal rollout status deploy/portal-blue --timeout=120s
+  solution:
+    explanation: |
+      Green is a second, complete Deployment with its own `slot=green` selector.
+      Once it is ready, one selector change on the Service moves every new
+      connection to green; blue keeps running, so `slot=blue` is the rollback.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 200
+        run: |
+          kubectl config use-context qm-customs
+          kubectl apply -f - <<'YAML'
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: portal-green
+            namespace: customs-portal
+          spec:
+            replicas: {{replicas}}
+            selector:
+              matchLabels: {app: customs-portal, slot: green}
+            template:
+              metadata:
+                labels: {app: customs-portal, slot: green}
+              spec:
+                containers:
+                  - name: portal
+                    image: busybox:1.37
+                    env: [{name: RELEASE, value: "{{green}}"}]
+                    command: ["sh", "-c", "mkdir -p /www && echo \"customs portal $RELEASE\" > /www/index.html && exec httpd -f -p 8080 -h /www"]
+                    ports: [{name: http, containerPort: 8080}]
+                    readinessProbe:
+                      httpGet: {path: /, port: http}
+                      periodSeconds: 5
+          YAML
+          kubectl -n customs-portal rollout status deploy/portal-green --timeout=150s
+          kubectl -n customs-portal patch service customs-portal -p '{"spec":{"selector":{"app":"customs-portal","slot":"green"}}}'
+    alternatives:
+      - id: copy-and-set-selector
+        description: Copy blue with yq and switch with kubectl set selector.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 200
+            run: |
+              kubectl config use-context qm-customs
+              kubectl -n customs-portal get deploy portal-blue -o yaml \
+                | yq 'del(.status) | del(.metadata.uid) | del(.metadata.resourceVersion) | del(.metadata.creationTimestamp) | del(.metadata.managedFields) | del(.metadata.annotations) | del(.metadata.generation)
+                      | .metadata.name = "portal-green" | .spec.selector.matchLabels.slot = "green" | .spec.template.metadata.labels.slot = "green"
+                      | .spec.template.spec.containers[0].env[0].value = "{{green}}"' \
+                | kubectl apply -f -
+              kubectl -n customs-portal rollout status deploy/portal-green --timeout=150s
+              kubectl -n customs-portal set selector service customs-portal 'app=customs-portal,slot=green'

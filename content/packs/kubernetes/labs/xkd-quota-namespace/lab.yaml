@@ -1,0 +1,123 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xkd-quota-namespace
+  title: Limit a namespace with a quota
+  domain: kubernetes
+  frameworks: [ckad:environment-config-security]
+  difficulty: easy
+  estimatedMinutes: 5
+  tags: [exam, resourcequota]
+  version: 1
+spec:
+  description: |
+    **Context:** `qm-depot` (`kubectl config use-context qm-depot`)
+
+    Create a ResourceQuota named **`{{quota}}`** in namespace
+    **`pilot-apps`** that allows at most:
+
+    - **6** Pods;
+    - **2** CPU of **requests** in total;
+    - **4Gi** of memory **limits** in total.
+  objectives:
+    - Write a ResourceQuota for object counts and compute resources
+  params:
+    quota:
+      type: choice
+      values: [pilot-quota, pilot-apps-quota, pilot-budget]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-depot
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: qm-depot
+  setup:
+    - on: qm-depot
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: pilot-apps}
+  teardown:
+    - on: qm-depot
+      run: kubectl delete namespace pilot-apps --ignore-not-found --wait=false
+  checks:
+    - id: pods
+      description: Quota {{quota}} allows 6 Pods
+      type: k8s-query
+      skills: [k8s.workloads.quotas-limitranges]
+      query: {cluster: qm-depot, resource: resourcequota, name: "{{quota}}", namespace: pilot-apps, jsonpath: "{.spec.hard.pods}"}
+      expect: {match: exact, value: "6"}
+    - id: cpu-requests
+      description: Quota {{quota}} caps CPU requests at 2
+      type: k8s-query
+      skills: [k8s.workloads.quotas-limitranges]
+      query: {cluster: qm-depot, resource: resourcequota, name: "{{quota}}", namespace: pilot-apps, jsonpath: '{.spec.hard.requests\.cpu}{.spec.hard.cpu}'}
+      expect: {match: regex, value: '^(2|2000m)$'}
+    - id: memory-limits
+      description: Quota {{quota}} caps memory limits at 4Gi
+      type: k8s-query
+      skills: [k8s.workloads.quotas-limitranges]
+      weight: 2
+      query: {cluster: qm-depot, resource: resourcequota, name: "{{quota}}", namespace: pilot-apps, jsonpath: '{.spec.hard.limits\.memory}'}
+      expect: {match: exact, value: 4Gi}
+  misconceptions:
+    - id: memory-requests
+      description: Uses memory (which means requests.memory) for the 4Gi limit.
+      feedback: In a quota, `memory` and `requests.memory` are the same thing. Limits are counted under `limits.memory`.
+      expectFail: [memory-limits]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n pilot-apps create quota {{quota}} --hard=pods=6,requests.cpu=2,memory=4Gi
+    - id: limitrange
+      description: Writes a LimitRange, which constrains each container, not the namespace total.
+      feedback: A LimitRange sets per-object defaults and bounds; a ResourceQuota caps the namespace total.
+      expectFail: [pods, cpu-requests, memory-limits]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-depot
+          kubectl apply -f - <<'YAML'
+          apiVersion: v1
+          kind: LimitRange
+          metadata: {name: "{{quota}}", namespace: pilot-apps}
+          spec:
+            limits:
+              - type: Container
+                max: {cpu: "2", memory: 4Gi}
+          YAML
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n pilot-apps create quota {{quota}} --hard=pods=6,requests.cpu=2,limits.memory=4Gi
+    alternatives:
+      - id: manifest
+        description: Declarative manifest.
+        steps:
+          - on: workstation
+            as: learner
+            run: |
+              kubectl config use-context qm-depot
+              kubectl apply -f - <<'YAML'
+              apiVersion: v1
+              kind: ResourceQuota
+              metadata: {name: "{{quota}}", namespace: pilot-apps}
+              spec:
+                hard:
+                  pods: "6"
+                  requests.cpu: "2"
+                  limits.memory: 4Gi
+              YAML

@@ -1,0 +1,160 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xkd-build-tag-image
+  title: Build and save an image
+  domain: kubernetes
+  frameworks: [ckad:design-build]
+  difficulty: medium
+  estimatedMinutes: 8
+  tags: [exam, images, buildah, oci]
+  version: 1
+spec:
+  description: |
+    **Host:** `yard-wk-1` (`ssh yard-wk-1`, then `sudo buildah`)
+
+    The directory `/home/learner/quote-api/` on `yard-wk-1` holds a
+    Containerfile for the quote API. The base image `busybox:1.37` is in
+    buildah's local storage; there is no internet access.
+
+    1. Change the Containerfile so the image **exposes port 9090** and the
+       server listens on **9090** instead of 8080.
+    2. Build it with the name and tag **`quote-api:{{tag}}`**.
+    3. Save the image as an **OCI archive** at
+       **`/home/learner/quote-api-{{tag}}.tar`** on `yard-wk-1`.
+  objectives:
+    - Edit a Containerfile, build and tag an image, export it in OCI format
+  params:
+    tag:
+      type: choice
+      values: ["2.1", "2.1.1", "2.1.2"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      # Needs a build tool on the kubeadm node image (buildah).
+      - name: qm-yard
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-yard
+          nodes:
+            - {name: yard-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: yard-wk-1, role: worker}
+            - {name: yard-wk-2, role: worker}
+  setup:
+    - on: qm-yard/yard-wk-1
+      run: install -d -o learner -g learner -m 0755 /home/learner/quote-api
+    - on: qm-yard/yard-wk-1
+      file: {path: /home/learner/quote-api/Containerfile, source: assets/Containerfile, mode: "0644"}
+    - on: qm-yard/yard-wk-1
+      timeoutSec: 120
+      run: |
+        set -e
+        chown -R learner:learner /home/learner/quote-api
+        command -v buildah >/dev/null || { echo "buildah is not installed on this node image" >&2; exit 1; }
+        if ! buildah images -q docker.io/library/busybox:1.37 >/dev/null 2>&1; then
+          ctr -n k8s.io images export /tmp/busybox-base.tar docker.io/library/busybox:1.37
+          buildah pull -q oci-archive:/tmp/busybox-base.tar >/dev/null
+          buildah tag "$(buildah images -q | head -n1)" docker.io/library/busybox:1.37
+          rm -f /tmp/busybox-base.tar
+        fi
+  teardown:
+    - on: qm-yard/yard-wk-1
+      run: |
+        buildah rmi -f localhost/quote-api:{{tag}} >/dev/null 2>&1 || true
+        rm -rf /home/learner/quote-api /home/learner/quote-api-{{tag}}.tar
+  checks:
+    - id: containerfile-port
+      description: The Containerfile exposes 9090 and the server listens on 9090
+      type: shell
+      timeoutSec: 30
+      on: qm-yard/yard-wk-1
+      skills: [k8s.delivery.image-build]
+      command: |
+        f=/home/learner/quote-api/Containerfile
+        e=$(grep -Ei '^[[:space:]]*EXPOSE' "$f" | tr -s ' ' | tr '\n' ';')
+        c=$(grep -E '^[[:space:]]*CMD' "$f" | grep -c '9090')
+        echo "expose=$e cmd9090=$c"
+      expect: {match: regex, value: '^expose=EXPOSE 9090(/tcp)?; cmd9090=1$'}
+    - id: image-built
+      description: buildah has quote-api:{{tag}} exposing 9090
+      type: shell
+      timeoutSec: 30
+      on: qm-yard/yard-wk-1
+      skills: [k8s.delivery.image-build]
+      weight: 2
+      command: |
+        buildah inspect --type image localhost/quote-api:{{tag}} 2>/dev/null | python3 -c 'import json,sys; c=json.load(sys.stdin)["OCIv1"]["config"]; print(" ".join(sorted(c.get("ExposedPorts",{}))))' 2>/dev/null || echo missing
+      expect: {match: exact, value: 9090/tcp}
+    - id: oci-archive
+      description: /home/learner/quote-api-{{tag}}.tar is an OCI archive of that image
+      type: shell
+      timeoutSec: 30
+      on: qm-yard/yard-wk-1
+      skills: [k8s.delivery.image-build]
+      weight: 2
+      command: |
+        f=/home/learner/quote-api-{{tag}}.tar
+        [ -f "$f" ] || { echo missing; exit 0; }
+        python3 - "$f" <<'PY'
+        import json, sys, tarfile
+        t = tarfile.open(sys.argv[1])
+        names = t.getnames()
+        if "oci-layout" not in names:
+            print("not an OCI layout"); sys.exit(0)
+        blob = lambda d: json.load(t.extractfile("blobs/" + d.replace(":", "/")))
+        idx = json.load(t.extractfile("index.json"))
+        man = idx["manifests"][0]
+        m = blob(man["digest"])
+        if "manifests" in m:
+            m = blob(m["manifests"][0]["digest"])
+        cfg = blob(m["config"]["digest"])
+        print(" ".join(sorted(cfg.get("config", {}).get("ExposedPorts", {}))))
+        PY
+      expect: {match: exact, value: 9090/tcp}
+  misconceptions:
+    - id: expose-only
+      description: Changes EXPOSE but leaves the server on 8080; EXPOSE is documentation, the process still listens on 8080.
+      feedback: EXPOSE only records metadata. The command that starts the server decides the port it listens on.
+      expectFail: [containerfile-port]
+      mutation:
+        on: qm-yard/yard-wk-1
+        as: learner
+        timeoutSec: 240
+        run: |
+          set -e
+          cd /home/learner/quote-api
+          sed -i 's/^EXPOSE 8080/EXPOSE 9090/' Containerfile
+          sudo buildah bud -q -t quote-api:{{tag}} . >/dev/null
+          sudo buildah push quote-api:{{tag}} oci-archive:/home/learner/quote-api-{{tag}}.tar:quote-api:{{tag}}
+    - id: docker-archive
+      description: Saves a docker-archive instead of an OCI archive.
+      feedback: The task asks for the OCI image layout (`oci-archive:`).
+      expectFail: [oci-archive]
+      mutation:
+        on: qm-yard/yard-wk-1
+        as: learner
+        timeoutSec: 240
+        run: |
+          set -e
+          cd /home/learner/quote-api
+          sed -i 's/8080/9090/g' Containerfile
+          sudo buildah bud -q -t quote-api:{{tag}} . >/dev/null
+          sudo buildah push quote-api:{{tag}} docker-archive:/home/learner/quote-api-{{tag}}.tar:quote-api:{{tag}}
+  solution:
+    steps:
+      - on: qm-yard/yard-wk-1
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd /home/learner/quote-api
+          sed -i 's/8080/9090/g' Containerfile
+          sudo buildah bud -q -t quote-api:{{tag}} . >/dev/null
+          sudo buildah push quote-api:{{tag}} oci-archive:/home/learner/quote-api-{{tag}}.tar:quote-api:{{tag}}

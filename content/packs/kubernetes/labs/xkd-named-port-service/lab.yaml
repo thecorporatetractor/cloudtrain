@@ -1,0 +1,159 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xkd-named-port-service
+  title: Target a named container port
+  domain: kubernetes
+  frameworks: [ckad:services-networking]
+  difficulty: medium
+  estimatedMinutes: 6
+  tags: [exam, services, named-ports]
+  version: 1
+spec:
+  description: |
+    **Context:** `qm-depot` (`kubectl config use-context qm-depot`)
+
+    In namespace `customs-ui`:
+
+    1. Name container port **8443** of the Deployment **`customs-ui`**
+       **`https`**.
+    2. Make the existing Service **`customs-ui`** target that port **by
+       name** instead of by number.
+
+    The Service must keep port 443 and still reach all Pods.
+  objectives:
+    - Name container ports and reference them from a Service
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-depot
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: qm-depot
+  setup:
+    - on: qm-depot
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: customs-ui}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: customs-ui, namespace: customs-ui}
+        spec:
+          replicas: 2
+          selector: {matchLabels: {app: customs-ui}}
+          template:
+            metadata: {labels: {app: customs-ui}}
+            spec:
+              terminationGracePeriodSeconds: 2
+              containers:
+                - name: ui
+                  image: busybox:1.37
+                  command: ["sh", "-c", "mkdir -p /www && echo customs-ui > /www/index.html && httpd -p 9100 -h /www && exec httpd -f -p 8443 -h /www"]
+                  ports:
+                    - {name: metrics, containerPort: 9100}
+                    - {containerPort: 8443}
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata: {name: customs-ui, namespace: customs-ui}
+        spec:
+          selector: {app: customs-ui}
+          ports: [{name: web, port: 443, targetPort: 8443}]
+        ---
+        apiVersion: v1
+        kind: Pod
+        metadata: {name: probe, namespace: customs-ui}
+        spec:
+          terminationGracePeriodSeconds: 1
+          containers:
+            - {name: probe, image: "busybox:1.37", command: ["sleep", "1d"]}
+    - on: qm-depot
+      timeoutSec: 120
+      run: |
+        kubectl -n customs-ui rollout status deploy/customs-ui --timeout=110s
+        kubectl -n customs-ui wait pod/probe --for=condition=Ready --timeout=60s
+  teardown:
+    - on: qm-depot
+      run: kubectl delete namespace customs-ui --ignore-not-found --wait=false
+  checks:
+    - id: port-named
+      description: Container port 8443 of customs-ui is named https
+      type: k8s-query
+      skills: [k8s.networking.named-ports]
+      query: {cluster: qm-depot, resource: deployment, name: customs-ui, namespace: customs-ui, jsonpath: '{.spec.template.spec.containers[0].ports[?(@.containerPort==8443)].name}'}
+      expect: {match: exact, value: https}
+    - id: target-by-name
+      description: Service customs-ui keeps port 443 and targets the port name https
+      type: k8s-query
+      skills: [k8s.networking.named-ports]
+      weight: 2
+      query: {cluster: qm-depot, resource: service, name: customs-ui, namespace: customs-ui, jsonpath: "{.spec.ports[0].port}->{.spec.ports[0].targetPort}"}
+      expect: {match: exact, value: 443->https}
+    - id: reachable
+      description: The Service reaches all ready Pods on 8443
+      type: shell
+      on: qm-depot
+      skills: [k8s.networking.named-ports]
+      timeoutSec: 30
+      command: |
+        n=$(kubectl -n customs-ui get endpointslices -l kubernetes.io/service-name=customs-ui -o json | jq '[.items[] | select(any(.ports[]?; .port == 8443)) | .endpoints[] | select(.conditions.ready)] | length')
+        b=$(kubectl -n customs-ui exec probe -- wget -qO- -T 5 http://customs-ui:443/ 2>/dev/null)
+        echo "endpoints=$n body=$b"
+      expect: {match: exact, value: endpoints=2 body=customs-ui}
+  misconceptions:
+    - id: named-service-port-only
+      description: Names the Service port https but keeps the numeric targetPort.
+      feedback: The Service port's own name is not the container port name. Set `targetPort` to the container port's name.
+      expectFail: [target-by-name]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n customs-ui patch deploy customs-ui --type=json -p '[{"op":"add","path":"/spec/template/spec/containers/0/ports/1/name","value":"https"}]'
+          kubectl -n customs-ui patch svc customs-ui --type=json -p '[{"op":"replace","path":"/spec/ports/0/name","value":"https"}]'
+          kubectl -n customs-ui rollout status deploy/customs-ui --timeout=100s
+    - id: service-before-pods
+      description: Points the Service at the name https without naming the container port, so the Service loses every endpoint.
+      feedback: A named targetPort is resolved in each Pod; Pods without a port of that name are not endpoints.
+      expectFail: [port-named, reachable]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n customs-ui patch svc customs-ui --type=json -p '[{"op":"replace","path":"/spec/ports/0/targetPort","value":"https"}]'
+          sleep 5
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n customs-ui patch deployment customs-ui --type=json -p '[{"op":"add","path":"/spec/template/spec/containers/0/ports/1/name","value":"https"}]'
+          kubectl -n customs-ui rollout status deployment/customs-ui --timeout=120s
+          kubectl -n customs-ui patch service customs-ui --type=json -p '[{"op":"replace","path":"/spec/ports/0/targetPort","value":"https"}]'
+          sleep 5
+    alternatives:
+      - id: yq-edit
+        description: Edit both objects with yq and apply.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 150
+            run: |
+              kubectl config use-context qm-depot
+              kubectl -n customs-ui get deploy customs-ui -o yaml | yq '(.spec.template.spec.containers[0].ports[] | select(.containerPort == 8443)).name = "https"' | kubectl apply -f -
+              kubectl -n customs-ui rollout status deployment/customs-ui --timeout=120s
+              kubectl -n customs-ui get svc customs-ui -o yaml | yq '.spec.ports[0].targetPort = "https"' | kubectl apply -f -
+              sleep 5

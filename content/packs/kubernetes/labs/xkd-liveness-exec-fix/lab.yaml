@@ -1,0 +1,153 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xkd-liveness-exec-fix
+  title: Fix a liveness probe that kills a healthy app
+  domain: kubernetes
+  frameworks: [ckad:observability-maintenance]
+  difficulty: medium
+  estimatedMinutes: 7
+  tags: [exam, probes, troubleshooting]
+  version: 1
+spec:
+  description: |
+    **Context:** `qm-dispatch` (`kubectl config use-context qm-dispatch`)
+
+    In namespace `ledger-sync`, the Pod **`ledger-sync`** is healthy but keeps
+    being restarted. Find out why from its events and correct its **liveness
+    probe** (keep an `exec` liveness probe that really checks the app's health
+    marker), so that the Pod `ledger-sync` stays Running with **zero**
+    restarts. Keep the Pod's name, image and command.
+  objectives:
+    - Read probe failures from events and fix an exec liveness probe
+  params:
+    marker:
+      type: choice
+      values: [/tmp/ledger.ok, /tmp/sync.healthy, /run/ledger/alive]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-dispatch
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: qm-dispatch
+  setup:
+    - on: qm-dispatch
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: ledger-sync}
+        ---
+        apiVersion: v1
+        kind: Pod
+        metadata: {name: ledger-sync, namespace: ledger-sync, labels: {app: ledger-sync}}
+        spec:
+          terminationGracePeriodSeconds: 2
+          containers:
+            - name: sync
+              image: busybox:1.37
+              command: ["sh", "-c", "mkdir -p $(dirname {{marker}}) && touch {{marker}} && echo 'ledger sync running, health marker {{marker}}' && exec sleep 1d"]
+              livenessProbe:
+                exec:
+                  command: ["cat", "/tmp/healthy"]
+                initialDelaySeconds: 2
+                periodSeconds: 3
+                failureThreshold: 2
+  teardown:
+    - on: qm-dispatch
+      run: kubectl delete namespace ledger-sync --ignore-not-found --wait=false
+  checks:
+    - id: running-no-restarts
+      description: ledger-sync is Running with 0 restarts
+      type: k8s-query
+      skills: [k8s.workloads.probes]
+      weight: 2
+      query: {cluster: qm-dispatch, resource: pod, name: ledger-sync, namespace: ledger-sync, jsonpath: "{.status.phase} restarts={.status.containerStatuses[0].restartCount}"}
+      expect: {match: exact, value: Running restarts=0}
+    - id: exec-probe
+      description: The liveness probe is an exec probe that checks {{marker}}
+      type: k8s-query
+      skills: [k8s.troubleshooting.events]
+      query: {cluster: qm-dispatch, resource: pod, name: ledger-sync, namespace: ledger-sync, jsonpath: "{.spec.containers[0].livenessProbe.exec.command}"}
+      expect: {match: contains, value: "{{marker}}"}
+    - id: same-app
+      description: The Pod keeps its image and command
+      type: k8s-query
+      skills: [k8s.workloads.probes]
+      weight: 0.5
+      query: {cluster: qm-dispatch, resource: pod, name: ledger-sync, namespace: ledger-sync, jsonpath: "{.spec.containers[0].image} {.spec.containers[0].command[2]}"}
+      expect: {match: contains, value: "busybox:1.37 mkdir -p $(dirname {{marker}}) && touch {{marker}}"}
+  misconceptions:
+    - id: probe-removed
+      description: Removes the liveness probe; the restarts stop but nothing watches the app any more.
+      feedback: The task is to fix the probe, not to switch off health checking.
+      expectFail: [exec-probe]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl -n ledger-sync get pod ledger-sync -o yaml | yq 'del(.spec.containers[0].livenessProbe)' | kubectl replace --force -f -
+          kubectl -n ledger-sync wait pod/ledger-sync --for=condition=Ready --timeout=60s
+          sleep 15
+    - id: threshold-raised
+      description: Raises failureThreshold instead of fixing the path; the Pod still restarts, just later.
+      feedback: A probe that checks the wrong file fails forever. Point it at the marker the app writes.
+      expectFail: [exec-probe]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl -n ledger-sync get pod ledger-sync -o yaml | yq '.spec.containers[0].livenessProbe.failureThreshold = 100' | kubectl replace --force -f -
+          kubectl -n ledger-sync wait pod/ledger-sync --for=condition=Ready --timeout=60s
+          sleep 15
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl -n ledger-sync describe pod ledger-sync | grep -i liveness
+          kubectl -n ledger-sync get pod ledger-sync -o yaml \
+            | yq '.spec.containers[0].livenessProbe.exec.command = ["cat", "{{marker}}"]' \
+            | kubectl replace --force -f -
+          kubectl -n ledger-sync wait pod/ledger-sync --for=condition=Ready --timeout=60s
+          sleep 20
+    alternatives:
+      - id: test-f
+        description: Recreate the Pod from a clean manifest with a `test -f` probe.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 150
+            run: |
+              kubectl config use-context qm-dispatch
+              kubectl -n ledger-sync delete pod ledger-sync --wait=true
+              kubectl apply -f - <<'YAML'
+              apiVersion: v1
+              kind: Pod
+              metadata: {name: ledger-sync, namespace: ledger-sync, labels: {app: ledger-sync}}
+              spec:
+                containers:
+                  - name: sync
+                    image: busybox:1.37
+                    command: ["sh", "-c", "mkdir -p $(dirname {{marker}}) && touch {{marker}} && echo 'ledger sync running, health marker {{marker}}' && exec sleep 1d"]
+                    livenessProbe:
+                      exec:
+                        command: ["test", "-f", "{{marker}}"]
+                      initialDelaySeconds: 2
+                      periodSeconds: 3
+                      failureThreshold: 2
+              YAML
+              kubectl -n ledger-sync wait pod/ledger-sync --for=condition=Ready --timeout=60s
+              sleep 20

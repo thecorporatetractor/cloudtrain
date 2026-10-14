@@ -1,0 +1,147 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xkd-scale-and-pause
+  title: Pause a rollout to batch changes
+  domain: kubernetes
+  frameworks: [ckad:deployment]
+  difficulty: medium
+  estimatedMinutes: 7
+  tags: [exam, rollouts, pause]
+  version: 1
+spec:
+  description: |
+    **Context:** `qm-dispatch` (`kubectl config use-context qm-dispatch`)
+
+    In namespace `dock-display`, the Deployment **`dock-board`** needs two
+    changes that must go out as **one** rollout:
+
+    - container `board` image → **`httpd:2.4`**;
+    - container `board` memory limit → **`{{memory}}`**.
+
+    **Pause** the Deployment's rollout, make both changes, then **resume** it,
+    so that exactly **one** new ReplicaSet is created. Let the rollout finish.
+  objectives:
+    - Pause and resume a Deployment rollout to batch template changes
+  params:
+    memory:
+      type: choice
+      values: [128Mi, 160Mi, 192Mi]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-dispatch
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: qm-dispatch
+  setup:
+    - on: qm-dispatch
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: dock-display}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: dock-board, namespace: dock-display}
+        spec:
+          replicas: 2
+          selector: {matchLabels: {app: dock-board}}
+          template:
+            metadata: {labels: {app: dock-board}}
+            spec:
+              terminationGracePeriodSeconds: 2
+              containers:
+                - name: board
+                  image: httpd:2.4-alpine
+                  resources:
+                    requests: {cpu: 10m, memory: 32Mi}
+                    limits: {memory: 64Mi}
+    - on: qm-dispatch
+      timeoutSec: 150
+      run: kubectl -n dock-display rollout status deploy/dock-board --timeout=140s
+  teardown:
+    - on: qm-dispatch
+      run: kubectl delete namespace dock-display --ignore-not-found --wait=false
+  checks:
+    - id: template
+      description: board runs httpd:2.4 with a {{memory}} memory limit
+      type: k8s-query
+      skills: [k8s.workloads.rollouts]
+      query: {cluster: qm-dispatch, resource: deployment, name: dock-board, namespace: dock-display, jsonpath: "{.spec.template.spec.containers[0].image} {.spec.template.spec.containers[0].resources.limits.memory}"}
+      expect: {match: exact, value: "httpd:2.4 {{memory}}"}
+    - id: resumed
+      description: The rollout is resumed and complete
+      type: k8s-query
+      skills: [k8s.workloads.rollouts]
+      query: {cluster: qm-dispatch, resource: deployment, name: dock-board, namespace: dock-display, jsonpath: "paused={.spec.paused} {.status.updatedReplicas}/{.status.readyReplicas}/{.spec.replicas}"}
+      expect: {match: regex, value: '^paused=(false)? 2/2/2$'}
+    - id: one-replicaset
+      description: Exactly one new ReplicaSet was created (two in total, revision 2)
+      type: shell
+      timeoutSec: 30
+      on: qm-dispatch
+      skills: [k8s.workloads.rollouts]
+      weight: 2
+      command: |
+        n=$(kubectl -n dock-display get rs -l app=dock-board --no-headers 2>/dev/null | wc -l)
+        r=$(kubectl -n dock-display get deploy dock-board -o jsonpath='{.metadata.annotations.deployment\.kubernetes\.io/revision}' 2>/dev/null)
+        echo "replicasets=$n revision=$r"
+      expect: {match: exact, value: replicasets=2 revision=2}
+  misconceptions:
+    - id: no-pause
+      description: Makes the two changes back to back without pausing, which starts two rollouts.
+      feedback: Every template change of an active Deployment starts a rollout. Pausing collects the changes into one.
+      expectFail: [one-replicaset]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 180
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl -n dock-display set image deploy/dock-board board=httpd:2.4
+          kubectl -n dock-display set resources deploy/dock-board -c board --limits=memory={{memory}}
+          kubectl -n dock-display rollout status deploy/dock-board --timeout=150s
+    - id: never-resumed
+      description: Pauses and edits but forgets to resume, so nothing is rolled out.
+      feedback: A paused Deployment ignores template changes until `kubectl rollout resume`.
+      expectFail: [resumed, one-replicaset]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl -n dock-display rollout pause deploy/dock-board
+          kubectl -n dock-display set image deploy/dock-board board=httpd:2.4
+          kubectl -n dock-display set resources deploy/dock-board -c board --limits=memory={{memory}}
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 180
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl -n dock-display rollout pause deployment/dock-board
+          kubectl -n dock-display set image deployment/dock-board board=httpd:2.4
+          kubectl -n dock-display set resources deployment/dock-board -c board --limits=memory={{memory}}
+          kubectl -n dock-display rollout resume deployment/dock-board
+          kubectl -n dock-display rollout status deployment/dock-board --timeout=150s
+    alternatives:
+      - id: patch-while-paused
+        description: Pause, one strategic merge patch, resume.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 180
+            run: |
+              kubectl config use-context qm-dispatch
+              kubectl -n dock-display patch deployment dock-board -p '{"spec":{"paused":true}}'
+              kubectl -n dock-display patch deployment dock-board -p '{"spec":{"template":{"spec":{"containers":[{"name":"board","image":"httpd:2.4","resources":{"limits":{"memory":"{{memory}}"}}}]}}}}'
+              kubectl -n dock-display patch deployment dock-board -p '{"spec":{"paused":false}}'
+              kubectl -n dock-display rollout status deployment/dock-board --timeout=150s

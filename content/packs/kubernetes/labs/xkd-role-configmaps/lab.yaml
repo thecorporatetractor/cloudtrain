@@ -1,0 +1,145 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xkd-role-configmaps
+  title: Grant read access to ConfigMaps
+  domain: kubernetes
+  frameworks: [ckad:environment-config-security]
+  difficulty: medium
+  estimatedMinutes: 6
+  tags: [exam, rbac]
+  version: 1
+spec:
+  description: |
+    **Context:** `qm-depot` (`kubectl config use-context qm-depot`)
+
+    In namespace `route-config`, allow the existing ServiceAccount
+    **`route-reader`** to **get, list and watch ConfigMaps** in
+    `route-config` **only** (no other namespaces, resources or verbs). Name
+    the Role and the RoleBinding **`{{name}}`**.
+  objectives:
+    - Grant namespaced read access with a Role and RoleBinding
+  params:
+    name:
+      type: choice
+      values: [configmap-viewer, route-config-read, cm-reader]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-depot
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: qm-depot
+  setup:
+    - on: qm-depot
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: route-config}
+        ---
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: route-config-archive}
+        ---
+        apiVersion: v1
+        kind: ServiceAccount
+        metadata: {name: route-reader, namespace: route-config}
+  teardown:
+    - on: qm-depot
+      run: kubectl delete namespace route-config route-config-archive --ignore-not-found --wait=false
+  checks:
+    - id: read-verbs
+      description: route-reader can get, list and watch ConfigMaps in route-config
+      type: shell
+      timeoutSec: 30
+      on: qm-depot
+      skills: [k8s.rbac.roles]
+      weight: 2
+      command: |
+        for v in get list watch; do printf '%s=%s ' $v "$(kubectl auth can-i $v configmaps -n route-config --as system:serviceaccount:route-config:route-reader 2>/dev/null)"; done
+      expect: {match: exact, value: "get=yes list=yes watch=yes "}
+    - id: no-write-or-secrets
+      description: route-reader cannot change ConfigMaps or read Secrets
+      type: shell
+      timeoutSec: 30
+      on: qm-depot
+      skills: [k8s.rbac.roles]
+      command: |
+        a=system:serviceaccount:route-config:route-reader
+        echo "update=$(kubectl auth can-i update configmaps -n route-config --as $a) delete=$(kubectl auth can-i delete configmaps -n route-config --as $a) secrets=$(kubectl auth can-i get secrets -n route-config --as $a)"
+      expect: {match: exact, value: update=no delete=no secrets=no}
+    - id: own-namespace-only
+      description: route-reader cannot read ConfigMaps in another namespace
+      type: k8s-can-i
+      skills: [k8s.rbac.binding-scope]
+      weight: 2
+      query: {cluster: qm-depot, verb: list, resource: configmaps, namespace: route-config-archive, as: "system:serviceaccount:route-config:route-reader"}
+      expect: {match: exact, value: "no"}
+    - id: names
+      description: RoleBinding {{name}} binds Role {{name}} to route-reader
+      type: k8s-query
+      skills: [k8s.rbac.binding-scope]
+      weight: 0.5
+      query: {cluster: qm-depot, resource: rolebinding, name: "{{name}}", namespace: route-config, jsonpath: "{.roleRef.kind}/{.roleRef.name} {.subjects[0].kind}/{.subjects[0].name}"}
+      expect: {match: exact, value: "Role/{{name}} ServiceAccount/route-reader"}
+  misconceptions:
+    - id: clusterrolebinding
+      description: Uses a ClusterRole and ClusterRoleBinding, which grants the read in every namespace.
+      feedback: A ClusterRoleBinding is cluster-wide. Bind in the namespace with a RoleBinding.
+      expectFail: [own-namespace-only, names]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-depot
+          kubectl create clusterrole {{name}} --verb=get,list,watch --resource=configmaps
+          kubectl create clusterrolebinding {{name}} --clusterrole={{name}} --serviceaccount=route-config:route-reader
+    - id: no-watch
+      description: Grants only get and list.
+      feedback: Controllers and `kubectl get -w` need watch; the task lists three verbs.
+      expectFail: [read-verbs]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n route-config create role {{name}} --verb=get,list --resource=configmaps
+          kubectl -n route-config create rolebinding {{name}} --role={{name}} --serviceaccount=route-config:route-reader
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n route-config create role {{name}} --verb=get,list,watch --resource=configmaps
+          kubectl -n route-config create rolebinding {{name}} --role={{name}} --serviceaccount=route-config:route-reader
+    alternatives:
+      - id: declarative
+        description: Role and RoleBinding as manifests.
+        steps:
+          - on: workstation
+            as: learner
+            run: |
+              kubectl config use-context qm-depot
+              kubectl apply -f - <<'YAML'
+              apiVersion: rbac.authorization.k8s.io/v1
+              kind: Role
+              metadata: {name: "{{name}}", namespace: route-config}
+              rules:
+                - apiGroups: [""]
+                  resources: [configmaps]
+                  verbs: [get, list, watch]
+              ---
+              apiVersion: rbac.authorization.k8s.io/v1
+              kind: RoleBinding
+              metadata: {name: "{{name}}", namespace: route-config}
+              roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: "{{name}}"}
+              subjects:
+                - {kind: ServiceAccount, name: route-reader, namespace: route-config}
+              YAML

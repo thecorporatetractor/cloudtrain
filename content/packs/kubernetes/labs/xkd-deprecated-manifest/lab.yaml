@@ -1,0 +1,147 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xkd-deprecated-manifest
+  title: Update a manifest to a served API version
+  domain: kubernetes
+  frameworks: [ckad:observability-maintenance]
+  difficulty: medium
+  estimatedMinutes: 6
+  tags: [exam, api-deprecation, hpa]
+  version: 1
+spec:
+  description: |
+    **Context:** `qm-dispatch` (`kubectl config use-context qm-dispatch`)
+
+    The manifest **`~/manifests/eta-hpa.yaml`** uses an API version that this
+    cluster no longer serves. Fix the file **in place** so it uses a served
+    API version and keeps the same behaviour (target Deployment, 2-6
+    replicas, 65 % average CPU utilisation), then apply it so the object
+    exists in namespace `eta-forecast`.
+  objectives:
+    - Convert a manifest from a removed API version, including schema changes
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-dispatch
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: qm-dispatch
+  setup:
+    - on: qm-dispatch
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: eta-forecast}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: eta-forecast, namespace: eta-forecast}
+        spec:
+          replicas: 2
+          selector: {matchLabels: {app: eta-forecast}}
+          template:
+            metadata: {labels: {app: eta-forecast}}
+            spec:
+              terminationGracePeriodSeconds: 2
+              containers:
+                - name: forecast
+                  image: busybox:1.37
+                  command: ["sleep", "1d"]
+                  resources: {requests: {cpu: 10m, memory: 16Mi}}
+    - on: workstation
+      run: install -d -o learner -g learner -m 0755 /home/learner/manifests
+    - on: workstation
+      file: {path: /home/learner/manifests/eta-hpa.yaml, source: assets/eta-hpa.yaml, mode: "0644"}
+    - on: workstation
+      run: chown learner:learner /home/learner/manifests/eta-hpa.yaml
+  teardown:
+    - on: qm-dispatch
+      run: kubectl delete namespace eta-forecast --ignore-not-found --wait=false
+  checks:
+    - id: file-version
+      description: eta-hpa.yaml uses autoscaling/v2 and is accepted by the API server
+      type: shell
+      on: workstation
+      skills: [k8s.delivery.api-deprecations]
+      timeoutSec: 30
+      command: |
+        f=/home/learner/manifests/eta-hpa.yaml
+        v=$(yq -r .apiVersion "$f" 2>/dev/null)
+        kubectl --kubeconfig /home/learner/.kube/config --context qm-dispatch apply --dry-run=server -f "$f" >/dev/null 2>&1 && a=accepted || a=rejected
+        echo "$v $a"
+      expect: {match: exact, value: autoscaling/v2 accepted}
+    - id: hpa
+      description: HPA eta-forecast scales eta-forecast 2-6 at 65 % CPU
+      type: k8s-query
+      skills: [k8s.delivery.api-deprecations]
+      weight: 2
+      query: {cluster: qm-dispatch, resource: horizontalpodautoscalers.v2.autoscaling, name: eta-forecast, namespace: eta-forecast, jsonpath: "{.spec.scaleTargetRef.name} {.spec.minReplicas}-{.spec.maxReplicas} {.spec.metrics[0].resource.name} {.spec.metrics[0].resource.target.type}={.spec.metrics[0].resource.target.averageUtilization}"}
+      expect: {match: exact, value: eta-forecast 2-6 cpu Utilization=65}
+  misconceptions:
+    - id: version-only
+      description: Changes only the apiVersion; v2 has no targetAverageUtilization field, so the apply is rejected.
+      feedback: autoscaling/v2 moved the target into `target {type, averageUtilization}`. Check `kubectl explain` for the new version.
+      expectFail: [file-version, hpa]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-dispatch
+          sed -i 's#^apiVersion: autoscaling/v2beta1#apiVersion: autoscaling/v2#' ~/manifests/eta-hpa.yaml
+          kubectl apply -f ~/manifests/eta-hpa.yaml || true
+    - id: imperative-autoscale
+      description: Creates the HPA with kubectl autoscale and leaves the manifest broken.
+      feedback: The manifest is what the team applies next time. Fix the file, not only the cluster.
+      expectFail: [file-version]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl -n eta-forecast autoscale deployment eta-forecast --min=2 --max=6 --cpu=65%
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-dispatch
+          cat > ~/manifests/eta-hpa.yaml <<'YAML'
+          # Autoscaling for the ETA forecaster.
+          apiVersion: autoscaling/v2
+          kind: HorizontalPodAutoscaler
+          metadata:
+            name: eta-forecast
+            namespace: eta-forecast
+          spec:
+            scaleTargetRef:
+              apiVersion: apps/v1
+              kind: Deployment
+              name: eta-forecast
+            minReplicas: 2
+            maxReplicas: 6
+            metrics:
+              - type: Resource
+                resource:
+                  name: cpu
+                  target:
+                    type: Utilization
+                    averageUtilization: 65
+          YAML
+          kubectl apply -f ~/manifests/eta-hpa.yaml
+    alternatives:
+      - id: yq-convert
+        description: Convert the fields with yq.
+        steps:
+          - on: workstation
+            as: learner
+            run: |
+              kubectl config use-context qm-dispatch
+              yq -i '.apiVersion = "autoscaling/v2" | .spec.metrics[0].resource.target = {"type": "Utilization", "averageUtilization": .spec.metrics[0].resource.targetAverageUtilization} | del(.spec.metrics[0].resource.targetAverageUtilization)' ~/manifests/eta-hpa.yaml
+              kubectl apply -f ~/manifests/eta-hpa.yaml

@@ -1,0 +1,332 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: app-serviceaccount-api
+  title: Give an app its own ServiceAccount to read ConfigMaps
+  domain: kubernetes
+  frameworks: [ckad:environment-config-security]
+  difficulty: easy
+  estimatedMinutes: 12
+  tags: [serviceaccount, rbac, role, rolebinding]
+  version: 1
+spec:
+  description: |
+    `route-sync` reloads the delivery route tables from ConfigMaps by calling
+    the Kubernetes API with its Pod's token. It runs under the namespace's
+    `default` ServiceAccount, which may do nothing, so every reload fails
+    with HTTP 403.
+
+    From your workstation, switch to context `qm-dispatch` first:
+
+    ```bash
+    kubectl config use-context qm-dispatch
+    ```
+
+    In namespace `route-planning`:
+
+    1. Create a ServiceAccount named **`{{sa}}`**.
+    2. Allow it to **get** and **list** ConfigMaps in `route-planning` and
+       nothing else: no other verbs, no other resources, no other namespaces.
+       Name the Role and the RoleBinding **`{{role}}`**.
+    3. Run the Pod **`route-sync`** under that ServiceAccount, with the same
+       container as today (the `default` ServiceAccount stays as it is).
+
+    The Pod writes the HTTP status of its last calls to `/tmp/status`
+    (`configmaps=<code> secrets=<code>`); with the right permissions it reads
+    `configmaps=200 secrets=403`.
+  objectives:
+    - Create a ServiceAccount for one workload
+    - Grant namespaced, verb-limited access with a Role and RoleBinding
+    - Run a Pod under a ServiceAccount (and know that it cannot be changed on a running Pod)
+    - Verify permissions with kubectl auth can-i
+  params:
+    sa:
+      type: choice
+      values: [route-sync, route-sync-reader, routes-api]
+    role:
+      type: choice
+      values: [configmap-reader, read-route-tables, routes-config-read]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-dispatch
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: qm-dispatch
+  setup:
+    - on: qm-dispatch
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: route-planning}
+        ---
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: route-archive}
+        ---
+        apiVersion: v1
+        kind: ConfigMap
+        metadata: {name: routes-north, namespace: route-planning}
+        data: {depots: "harbour,yard,north-depot"}
+        ---
+        apiVersion: v1
+        kind: ConfigMap
+        metadata: {name: routes-south, namespace: route-planning}
+        data: {depots: "harbour,south-depot"}
+        ---
+        apiVersion: v1
+        kind: Secret
+        metadata: {name: telematics-key, namespace: route-planning}
+        stringData: {key: not-for-route-sync}
+        ---
+        apiVersion: v1
+        kind: Pod
+        metadata: {name: route-sync, namespace: route-planning, labels: {app: route-sync}}
+        spec:
+          containers:
+            - name: sync
+              image: busybox:1.37
+              command:
+                - sh
+                - -c
+                - |
+                  api=https://kubernetes.default.svc/api/v1/namespaces/route-planning
+                  code() {
+                    wget -S -q -O /dev/null --no-check-certificate \
+                      --header "Authorization: Bearer $(cat /var/run/secrets/kubernetes.io/serviceaccount/token)" "$api/$1" 2>&1 \
+                      | grep -o 'HTTP/1\.[01] [0-9][0-9][0-9]' | tail -n1 | cut -d' ' -f2
+                  }
+                  while true; do
+                    echo "configmaps=$(code configmaps) secrets=$(code secrets)" > /tmp/status.new
+                    mv /tmp/status.new /tmp/status
+                    cat /tmp/status
+                    sleep 5
+                  done
+    - on: qm-dispatch
+      timeoutSec: 90
+      run: kubectl -n route-planning wait pod/route-sync --for=condition=Ready --timeout=80s
+  teardown:
+    - on: qm-dispatch
+      run: kubectl delete namespace route-planning route-archive --ignore-not-found --wait=false
+  checks:
+    - id: context
+      description: Terminal is using context qm-dispatch
+      type: k8s-context
+      on: workstation
+      skills: [k8s.cli.contexts]
+      weight: 0.5
+      expect: {match: exact, value: qm-dispatch}
+    - id: pod-sa
+      description: Pod route-sync runs under ServiceAccount {{sa}}
+      type: k8s-query
+      skills: [k8s.rbac.service-accounts]
+      weight: 2
+      query: {cluster: qm-dispatch, resource: pod, name: route-sync, namespace: route-planning, jsonpath: "{.spec.serviceAccountName} {.status.phase}"}
+      expect: {match: exact, value: "{{sa}} Running"}
+    - id: can-list
+      description: "{{sa}} can list ConfigMaps in route-planning"
+      type: k8s-can-i
+      skills: [k8s.rbac.roles]
+      query: {cluster: qm-dispatch, verb: list, resource: configmaps, namespace: route-planning, as: "system:serviceaccount:route-planning:{{sa}}"}
+      expect: {match: exact, value: "yes"}
+    - id: can-get
+      description: "{{sa}} can get a ConfigMap in route-planning"
+      type: k8s-can-i
+      skills: [k8s.rbac.roles]
+      query: {cluster: qm-dispatch, verb: get, resource: configmaps, name: routes-north, namespace: route-planning, as: "system:serviceaccount:route-planning:{{sa}}"}
+      expect: {match: exact, value: "yes"}
+    - id: no-secrets
+      description: "{{sa}} cannot list Secrets"
+      type: k8s-can-i
+      skills: [k8s.rbac.roles]
+      query: {cluster: qm-dispatch, verb: list, resource: secrets, namespace: route-planning, as: "system:serviceaccount:route-planning:{{sa}}"}
+      expect: {match: exact, value: "no"}
+    - id: no-write
+      description: "{{sa}} cannot update or watch ConfigMaps (get and list only)"
+      type: shell
+      timeoutSec: 30
+      on: qm-dispatch
+      skills: [k8s.rbac.roles]
+      command: |
+        for v in update delete create watch patch; do
+          printf '%s=%s ' $v "$(kubectl auth can-i $v configmaps -n route-planning --as system:serviceaccount:route-planning:{{sa}} 2>/dev/null)"
+        done
+      expect: {match: exact, value: "update=no delete=no create=no watch=no patch=no "}
+    - id: namespace-scoped
+      description: "{{sa}} cannot list ConfigMaps in another namespace"
+      type: k8s-can-i
+      skills: [k8s.rbac.roles]
+      query: {cluster: qm-dispatch, verb: list, resource: configmaps, namespace: route-archive, as: "system:serviceaccount:route-planning:{{sa}}"}
+      expect: {match: exact, value: "no"}
+    - id: names
+      description: Role and RoleBinding {{role}} bind the Role to {{sa}}
+      type: k8s-query
+      skills: [k8s.rbac.roles]
+      weight: 0.5
+      query: {cluster: qm-dispatch, resource: rolebinding, name: "{{role}}", namespace: route-planning, jsonpath: "{.roleRef.kind}/{.roleRef.name} {.subjects[0].kind}/{.subjects[0].name}"}
+      expect: {match: exact, value: "Role/{{role}} ServiceAccount/{{sa}}"}
+    - id: default-sa-unchanged
+      description: The default ServiceAccount still cannot list ConfigMaps
+      type: k8s-can-i
+      skills: [k8s.rbac.service-accounts]
+      weight: 0.5
+      query: {cluster: qm-dispatch, verb: list, resource: configmaps, namespace: route-planning, as: "system:serviceaccount:route-planning:default"}
+      expect: {match: exact, value: "no"}
+    - id: api-call
+      description: The running route-sync Pod reads ConfigMaps and is refused Secrets
+      type: shell
+      on: qm-dispatch
+      skills: [k8s.rbac.service-accounts]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        for i in 1 2 3; do
+          s=$(kubectl -n route-planning exec route-sync -- cat /tmp/status 2>/dev/null)
+          [ "$s" = "configmaps=200 secrets=403" ] && break
+          sleep 5
+        done
+        echo "${s:-no status}"
+      expect: {match: exact, value: "configmaps=200 secrets=403"}
+  hints:
+    - title: Switch context
+      body: Route planning runs on the dispatch cluster.
+      command: kubectl config use-context qm-dispatch
+      cost: 0
+    - title: See the failure
+      body: The Pod logs the status codes of its calls every five seconds.
+      command: kubectl -n route-planning logs route-sync --tail=3
+      cost: 0
+    - title: Imperative RBAC
+      body: kubectl can create a ServiceAccount, a Role with exact verbs and resources, and a RoleBinding to a ServiceAccount (`namespace:name`).
+      command: kubectl -n route-planning create role {{role}} --verb=get,list --resource=configmaps
+      cost: 2
+    - title: A running Pod keeps its ServiceAccount
+      body: "`serviceAccountName` cannot be changed on an existing Pod. Export the Pod, set the field, delete and recreate it."
+      command: kubectl -n route-planning get pod route-sync -o yaml > route-sync.yaml
+      cost: 2
+    - title: Check before you test
+      body: Ask the API server what the ServiceAccount may do.
+      command: kubectl auth can-i --list -n route-planning --as system:serviceaccount:route-planning:{{sa}}
+      cost: 1
+  misconceptions:
+    - id: bind-default-sa
+      description: Grants the Role to the namespace's default ServiceAccount, which every other Pod in the namespace also uses.
+      feedback: Permissions on `default` leak to every Pod that does not name a ServiceAccount. Give the app its own.
+      expectFail: [pod-sa, default-sa-unchanged]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 90
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl -n route-planning create role {{role}} --verb=get,list --resource=configmaps
+          kubectl -n route-planning create rolebinding {{role}} --role={{role}} --serviceaccount=route-planning:default
+    - id: cluster-wide
+      description: Uses a ClusterRole and ClusterRoleBinding, which lets the app read ConfigMaps in every namespace.
+      feedback: A ClusterRoleBinding grants in all namespaces. Bind with a RoleBinding in route-planning (a ClusterRole may be referenced from it).
+      expectFail: [namespace-scoped]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl -n route-planning create serviceaccount {{sa}}
+          kubectl create clusterrole {{role}} --verb=get,list --resource=configmaps
+          kubectl create clusterrolebinding {{role}} --clusterrole={{role}} --serviceaccount=route-planning:{{sa}}
+          kubectl -n route-planning get pod route-sync -o yaml | yq 'del(.status) | del(.metadata.uid) | del(.metadata.resourceVersion) | del(.metadata.creationTimestamp) | del(.metadata.managedFields) | del(.spec.nodeName) | del(.spec.volumes) | del(.spec.containers[].volumeMounts) | .spec.serviceAccountName = "{{sa}}" | del(.spec.serviceAccount)' > /tmp/rs.yaml
+          kubectl -n route-planning delete pod route-sync --wait=true
+          kubectl apply -f /tmp/rs.yaml
+          kubectl -n route-planning wait pod/route-sync --for=condition=Ready --timeout=60s
+    - id: wildcard-verbs
+      description: Grants all verbs on ConfigMaps, so the app could also rewrite or delete the route tables.
+      feedback: Least privilege means the verbs the app needs (get, list), not `*`.
+      expectFail: [no-write]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl -n route-planning create serviceaccount {{sa}}
+          kubectl -n route-planning create role {{role}} --verb='*' --resource=configmaps
+          kubectl -n route-planning create rolebinding {{role}} --role={{role}} --serviceaccount=route-planning:{{sa}}
+          kubectl -n route-planning get pod route-sync -o yaml | yq 'del(.status) | del(.metadata.uid) | del(.metadata.resourceVersion) | del(.metadata.creationTimestamp) | del(.metadata.managedFields) | del(.spec.nodeName) | del(.spec.volumes) | del(.spec.containers[].volumeMounts) | .spec.serviceAccountName = "{{sa}}" | del(.spec.serviceAccount)' > /tmp/rs.yaml
+          kubectl -n route-planning delete pod route-sync --wait=true
+          kubectl apply -f /tmp/rs.yaml
+          kubectl -n route-planning wait pod/route-sync --for=condition=Ready --timeout=60s
+    - id: pod-not-recreated
+      description: Creates the ServiceAccount and RBAC but never restarts the Pod under it, so the app still calls as default.
+      feedback: RBAC follows the identity in the Pod's token. Until the Pod runs as the new ServiceAccount nothing changes for the app.
+      expectFail: [pod-sa, api-call]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 60
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl -n route-planning create serviceaccount {{sa}}
+          kubectl -n route-planning create role {{role}} --verb=get,list --resource=configmaps
+          kubectl -n route-planning create rolebinding {{role}} --role={{role}} --serviceaccount=route-planning:{{sa}}
+  solution:
+    explanation: |
+      A dedicated ServiceAccount, a Role with `get` and `list` on `configmaps`
+      and a RoleBinding in the same namespace give exactly that access. The Pod
+      has to be recreated with `serviceAccountName`, because the field is
+      immutable; the new token then carries the new identity.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl -n route-planning create serviceaccount {{sa}}
+          kubectl -n route-planning create role {{role}} --verb=get,list --resource=configmaps
+          kubectl -n route-planning create rolebinding {{role}} --role={{role}} --serviceaccount=route-planning:{{sa}}
+          kubectl -n route-planning get pod route-sync -o yaml \
+            | yq 'del(.status) | del(.metadata.uid) | del(.metadata.resourceVersion) | del(.metadata.creationTimestamp) | del(.metadata.managedFields) | del(.spec.nodeName)
+                  | del(.spec.volumes) | del(.spec.containers[].volumeMounts) | del(.spec.serviceAccount) | .spec.serviceAccountName = "{{sa}}"' > route-sync.yaml
+          kubectl -n route-planning delete pod route-sync --wait=true
+          kubectl apply -f route-sync.yaml
+          kubectl -n route-planning wait pod/route-sync --for=condition=Ready --timeout=90s
+          sleep 8
+    alternatives:
+      - id: declarative
+        description: Write all objects as one manifest and use kubectl replace --force for the Pod.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 150
+            run: |
+              kubectl config use-context qm-dispatch
+              kubectl apply -f - <<'YAML'
+              apiVersion: v1
+              kind: ServiceAccount
+              metadata: {name: "{{sa}}", namespace: route-planning}
+              ---
+              apiVersion: rbac.authorization.k8s.io/v1
+              kind: Role
+              metadata: {name: "{{role}}", namespace: route-planning}
+              rules:
+                - apiGroups: [""]
+                  resources: [configmaps]
+                  verbs: [get, list]
+              ---
+              apiVersion: rbac.authorization.k8s.io/v1
+              kind: RoleBinding
+              metadata: {name: "{{role}}", namespace: route-planning}
+              roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: "{{role}}"}
+              subjects:
+                - {kind: ServiceAccount, name: "{{sa}}", namespace: route-planning}
+              YAML
+              kubectl -n route-planning get pod route-sync -o yaml \
+                | yq 'del(.spec.volumes) | del(.spec.containers[].volumeMounts) | del(.spec.nodeName) | del(.spec.serviceAccount) | .spec.serviceAccountName = "{{sa}}"' \
+                | kubectl replace --force -f -
+              kubectl -n route-planning wait pod/route-sync --for=condition=Ready --timeout=90s
+              sleep 8

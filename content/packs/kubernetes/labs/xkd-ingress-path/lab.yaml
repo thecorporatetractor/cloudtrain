@@ -1,0 +1,162 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xkd-ingress-path
+  title: Route a path with an Ingress
+  domain: kubernetes
+  frameworks: [ckad:services-networking]
+  difficulty: easy
+  estimatedMinutes: 5
+  tags: [exam, ingress]
+  version: 1
+spec:
+  description: |
+    **Context:** `qm-yard` (`kubectl config use-context qm-yard`)
+
+    In namespace `shop-front`, create an Ingress named **`{{name}}`** that
+    routes requests for host **`shop.quillmoor.example`** with paths
+    starting with **`/quotes`** to the Service **`quote`** on port **80**.
+    Use the cluster's default IngressClass.
+  objectives:
+    - Write a host and prefix-path rule in an Ingress
+  params:
+    name:
+      type: choice
+      values: [shop-quotes, quotes-route, shop-front]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      # Needs an ingress controller with a default IngressClass on the kubeadm cluster.
+      - name: qm-yard
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-yard
+          nodes:
+            - {name: yard-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: yard-wk-1, role: worker}
+            - {name: yard-wk-2, role: worker}
+  setup:
+    - on: qm-yard
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: shop-front}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: quote, namespace: shop-front}
+        spec:
+          replicas: 1
+          selector: {matchLabels: {app: quote}}
+          template:
+            metadata: {labels: {app: quote}}
+            spec:
+              terminationGracePeriodSeconds: 2
+              containers:
+                - name: web
+                  image: busybox:1.37
+                  command: ["sh", "-c", "mkdir -p /www/quotes && echo quotes-ok > /www/quotes/index.html && echo shop-root > /www/index.html && exec httpd -f -p 8080 -h /www"]
+                  ports: [{name: http, containerPort: 8080}]
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata: {name: quote, namespace: shop-front}
+        spec:
+          selector: {app: quote}
+          ports: [{name: http, port: 80, targetPort: http}]
+    - on: qm-yard
+      timeoutSec: 150
+      run: |
+        kubectl -n shop-front rollout status deploy/quote --timeout=120s
+        kubectl get ingressclass -o jsonpath='{range .items[*]}{.metadata.annotations.ingressclass\.kubernetes\.io/is-default-class}{"\n"}{end}' | grep -qx true \
+          || { echo "no default IngressClass on qm-yard" >&2; exit 1; }
+  teardown:
+    - on: qm-yard
+      run: kubectl delete namespace shop-front --ignore-not-found --wait=false
+  checks:
+    - id: rule
+      description: Ingress {{name}} routes shop.quillmoor.example /quotes (Prefix) to quote:80
+      type: k8s-query
+      skills: [k8s.networking.ingress-gateway]
+      weight: 2
+      query: {cluster: qm-yard, resource: ingress, name: "{{name}}", namespace: shop-front, jsonpath: "{.spec.rules[0].host} {.spec.rules[0].http.paths[0].path} {.spec.rules[0].http.paths[0].pathType} {.spec.rules[0].http.paths[0].backend.service.name}:{.spec.rules[0].http.paths[0].backend.service.port.number}{.spec.rules[0].http.paths[0].backend.service.port.name}"}
+      expect: {match: regex, value: '^shop\.quillmoor\.example /quotes/? Prefix quote:(80|http)$'}
+    - id: routed
+      description: A request for shop.quillmoor.example/quotes/ through the ingress controller reaches quote
+      type: shell
+      on: qm-yard/yard-cp-1
+      skills: [k8s.networking.ingress-gateway]
+      weight: 2
+      timeoutSec: 40
+      command: |
+        export KUBECONFIG=/etc/kubernetes/admin.conf
+        addr=$(kubectl -n shop-front get ingress {{name}} -o jsonpath='{.status.loadBalancer.ingress[0].ip}{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null)
+        [ -n "$addr" ] || { echo "ingress has no address"; exit 0; }
+        for i in 1 2 3 4 5; do
+          out=$(curl -s -m 5 -H 'Host: shop.quillmoor.example' "http://$addr/quotes/" 2>/dev/null)
+          [ "$out" = quotes-ok ] && break
+          sleep 3
+        done
+        echo "${out:-no answer}"
+      expect: {match: exact, value: quotes-ok}
+  misconceptions:
+    - id: exact-path
+      description: Uses pathType Exact, so /quotes/ and deeper paths are not routed.
+      feedback: Exact matches only the literal path. "Paths starting with" means Prefix.
+      expectFail: [rule]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-yard
+          kubectl -n shop-front create ingress {{name}} --rule="shop.quillmoor.example/quotes=quote:80"
+    - id: no-host
+      description: Leaves out the host, so the rule applies to every host name.
+      feedback: Set `host` on the rule; without it the Ingress catches requests for any host.
+      expectFail: [rule]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-yard
+          kubectl -n shop-front create ingress {{name}} --rule="/quotes*=quote:80"
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 90
+        run: |
+          kubectl config use-context qm-yard
+          kubectl -n shop-front create ingress {{name}} --rule="shop.quillmoor.example/quotes*=quote:80"
+          sleep 20
+    alternatives:
+      - id: manifest
+        description: Ingress manifest with the named service port.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 90
+            run: |
+              kubectl config use-context qm-yard
+              kubectl apply -f - <<'YAML'
+              apiVersion: networking.k8s.io/v1
+              kind: Ingress
+              metadata: {name: "{{name}}", namespace: shop-front}
+              spec:
+                rules:
+                  - host: shop.quillmoor.example
+                    http:
+                      paths:
+                        - path: /quotes
+                          pathType: Prefix
+                          backend:
+                            service: {name: quote, port: {name: http}}
+              YAML
+              sleep 20

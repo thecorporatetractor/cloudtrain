@@ -1,0 +1,254 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: kiosk-restricted-pss
+  title: Enforce the restricted Pod Security Standard
+  domain: kubernetes
+  frameworks: [cks:microservice-vulnerabilities, ckad:environment-config-security]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [pod-security-admission, security-context, namespaces]
+  version: 1
+spec:
+  description: |
+    The self-service kiosks in Quillmoor's depots run on shared hardware in
+    public halls. Security has decided that kiosk workloads must meet the
+    **restricted** Pod Security Standard, and that the cluster must refuse
+    anything that does not.
+
+    From your workstation, switch to context `qm-depot` first:
+
+    ```bash
+    kubectl config use-context qm-depot
+    ```
+
+    1. Make the namespace **`kiosk-display`** **enforce** the `restricted`
+       Pod Security Standard (latest version), so non-compliant Pods are
+       rejected at admission.
+    2. Fix the Deployment **`kiosk-ui`** in that namespace so its Pods are
+       admitted and run: keep the image, command and port, and run the
+       container as user **{{uid}}**.
+    3. When you are done, all {{replicas}} kiosk-ui Pods must run the fixed
+       template; no Pod from the old template may be left.
+  objectives:
+    - Label a namespace for Pod Security Admission in enforce mode
+    - Know what the restricted profile requires of a Pod
+    - Write a compliant securityContext at Pod and container level
+  params:
+    uid:
+      type: choice
+      values: [1000, 2101, 4321]
+    replicas:
+      type: int
+      min: 2
+      max: 3
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-depot
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: qm-depot
+  setup:
+    - on: qm-depot
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: kiosk-display}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: kiosk-ui, namespace: kiosk-display}
+        spec:
+          replicas: {{replicas}}
+          selector: {matchLabels: {app: kiosk-ui}}
+          template:
+            metadata: {labels: {app: kiosk-ui}}
+            spec:
+              terminationGracePeriodSeconds: 3
+              containers:
+                - name: ui
+                  image: busybox:1.37
+                  command: ["sh", "-c", "mkdir -p /tmp/www && echo 'Welcome to Quillmoor depot' > /tmp/www/index.html && exec httpd -f -p 8080 -h /tmp/www"]
+                  ports: [{name: http, containerPort: 8080}]
+                  readinessProbe:
+                    httpGet: {path: /, port: http}
+                    periodSeconds: 5
+    - on: qm-depot
+      timeoutSec: 120
+      run: kubectl -n kiosk-display rollout status deploy/kiosk-ui --timeout=110s
+  teardown:
+    - on: qm-depot
+      run: kubectl delete namespace kiosk-display --ignore-not-found --wait=false
+  checks:
+    - id: context
+      description: Terminal is using context qm-depot
+      type: k8s-context
+      on: workstation
+      skills: [k8s.cli.contexts]
+      weight: 0.5
+      expect: {match: exact, value: qm-depot}
+    - id: enforce-label
+      description: kiosk-display enforces the restricted profile
+      type: k8s-query
+      skills: [k8s.security.pod-security-admission]
+      weight: 2
+      query: {cluster: qm-depot, resource: namespace, name: kiosk-display, jsonpath: '{.metadata.labels.pod-security\.kubernetes\.io/enforce}/{.metadata.labels.pod-security\.kubernetes\.io/enforce-version}'}
+      expect: {match: regex, value: '^restricted/(latest)?$'}
+    - id: root-pod-rejected
+      description: A Pod that runs as root is rejected in kiosk-display
+      type: shell
+      timeoutSec: 30
+      on: qm-depot
+      skills: [k8s.security.pod-security-admission]
+      weight: 2
+      command: |
+        out=$(kubectl -n kiosk-display run pss-probe --image=busybox:1.37 --restart=Never --dry-run=server -- sleep 1 2>&1)
+        case "$out" in *"violates PodSecurity"*) echo rejected ;; *) echo admitted ;; esac
+      expect: {match: exact, value: rejected}
+    - id: rolled-out
+      description: All {{replicas}} kiosk-ui Pods run the current template and are ready, with no old Pods left
+      type: shell
+      timeoutSec: 30
+      on: qm-depot
+      skills: [k8s.security.security-context]
+      weight: 2
+      command: |
+        d=$(kubectl -n kiosk-display get deploy kiosk-ui -o jsonpath='{.spec.replicas} {.status.updatedReplicas} {.status.readyReplicas}' 2>/dev/null)
+        pods=$(kubectl -n kiosk-display get pods -l app=kiosk-ui -o json 2>/dev/null | jq '[.items[] | select(.metadata.deletionTimestamp == null)] | length')
+        echo "$d pods=$pods"
+      expect: {match: exact, value: "{{replicas}} {{replicas}} {{replicas}} pods={{replicas}}"}
+    - id: pods-compliant
+      description: Every Pod in kiosk-display meets the restricted profile
+      type: shell
+      timeoutSec: 30
+      on: qm-depot
+      skills: [k8s.security.security-context]
+      command: |
+        out=$(kubectl label --dry-run=server --overwrite namespace kiosk-display pod-security.kubernetes.io/enforce=restricted 2>&1)
+        case "$out" in *violate*) echo "violations found" ;; *) echo compliant ;; esac
+      expect: {match: exact, value: compliant}
+    - id: runs-as-uid
+      description: The ui container runs as UID {{uid}} and still serves on 8080
+      type: shell
+      on: qm-depot
+      skills: [k8s.security.security-context]
+      timeoutSec: 30
+      command: |
+        p=$(kubectl -n kiosk-display get pods -l app=kiosk-ui --field-selector=status.phase=Running -o json 2>/dev/null | jq -r '[.items[] | select(.metadata.deletionTimestamp == null)][0].metadata.name // empty')
+        [ -n "$p" ] || { echo "no running pod"; exit 0; }
+        u=$(kubectl -n kiosk-display exec "$p" -c ui -- id -u 2>/dev/null)
+        b=$(kubectl -n kiosk-display exec "$p" -c ui -- wget -qO- -T 3 http://127.0.0.1:8080/ 2>/dev/null)
+        echo "uid=$u body=$b"
+      expect: {match: exact, value: "uid={{uid}} body=Welcome to Quillmoor depot"}
+  hints:
+    - title: Switch context
+      body: The kiosks run on the depot platform.
+      command: kubectl config use-context qm-depot
+      cost: 0
+    - title: Three modes
+      body: "Pod Security Admission reads namespace labels `pod-security.kubernetes.io/<mode>=<level>`; only `enforce` rejects Pods, `warn` and `audit` just report."
+      cost: 1
+    - title: Ask before you enforce
+      body: A server-side dry run of the label lists which running Pods would violate it.
+      command: kubectl label --dry-run=server --overwrite ns kiosk-display pod-security.kubernetes.io/enforce=restricted
+      cost: 1
+    - title: What restricted needs
+      body: |
+        Non-root (`runAsNonRoot: true` and a non-zero UID), no privilege
+        escalation, all capabilities dropped, and a seccomp profile of
+        `RuntimeDefault` (or Localhost).
+      cost: 2
+    - title: Existing Pods are not evicted
+      body: Enforcement applies at admission. Watch the rollout and the ReplicaSet events to see whether new Pods are created.
+      command: kubectl -n kiosk-display describe rs -l app=kiosk-ui | grep -A3 Events
+      cost: 1
+  misconceptions:
+    - id: warn-only
+      description: Sets the warn label instead of enforce; non-compliant Pods are still admitted.
+      feedback: "`warn` only prints a warning to the client. Use `pod-security.kubernetes.io/enforce=restricted` to refuse Pods."
+      expectFail: [enforce-label, root-pod-rejected]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-depot
+          kubectl label ns kiosk-display pod-security.kubernetes.io/warn=restricted
+          kubectl -n kiosk-display patch deploy kiosk-ui --type=strategic -p '{"spec":{"template":{"spec":{"securityContext":{"runAsNonRoot":true,"runAsUser":{{uid}},"seccompProfile":{"type":"RuntimeDefault"}},"containers":[{"name":"ui","securityContext":{"allowPrivilegeEscalation":false,"capabilities":{"drop":["ALL"]}}}]}}}}'
+          kubectl -n kiosk-display rollout status deploy/kiosk-ui --timeout=120s
+    - id: baseline
+      description: Enforces baseline, which still allows containers that run as root.
+      feedback: Baseline blocks known privilege escalations but not root users or missing seccomp. The task requires restricted.
+      expectFail: [enforce-label, root-pod-rejected]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-depot
+          kubectl label ns kiosk-display pod-security.kubernetes.io/enforce=baseline
+          kubectl -n kiosk-display patch deploy kiosk-ui --type=strategic -p '{"spec":{"template":{"spec":{"securityContext":{"runAsNonRoot":true,"runAsUser":{{uid}},"seccompProfile":{"type":"RuntimeDefault"}},"containers":[{"name":"ui","securityContext":{"allowPrivilegeEscalation":false,"capabilities":{"drop":["ALL"]}}}]}}}}'
+          kubectl -n kiosk-display rollout status deploy/kiosk-ui --timeout=120s
+    - id: label-without-fix
+      description: Enforces restricted and restarts the Deployment without fixing it; the new Pods are rejected and the old root Pods keep running.
+      feedback: Enforcement does not evict running Pods, so things look fine until the next rollout. Fix the template, then check that the rollout completes.
+      expectFail: [rolled-out, pods-compliant]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 60
+        run: |
+          kubectl config use-context qm-depot
+          kubectl label ns kiosk-display pod-security.kubernetes.io/enforce=restricted
+          kubectl -n kiosk-display rollout restart deploy/kiosk-ui
+          sleep 20
+    - id: non-root-only
+      description: Sets only runAsNonRoot and a UID; capabilities and seccomp still violate restricted, so new Pods are refused.
+      feedback: Restricted also requires `allowPrivilegeEscalation false`, `capabilities.drop [ALL]` and a seccomp profile. Read the ReplicaSet event; it names every violation.
+      expectFail: [rolled-out, pods-compliant]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 60
+        run: |
+          kubectl config use-context qm-depot
+          kubectl label ns kiosk-display pod-security.kubernetes.io/enforce=restricted
+          kubectl -n kiosk-display patch deploy kiosk-ui --type=strategic -p '{"spec":{"template":{"spec":{"securityContext":{"runAsNonRoot":true,"runAsUser":{{uid}}}}}}}'
+          sleep 20
+  solution:
+    explanation: |
+      The `enforce` label makes the API server reject non-compliant Pods. The
+      restricted profile requires a non-root user, no privilege escalation,
+      all capabilities dropped and a RuntimeDefault seccomp profile. Running
+      Pods are not evicted, so the Deployment rollout has to replace them with
+      Pods from the fixed template.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 180
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n kiosk-display patch deploy kiosk-ui --type=strategic -p '{"spec":{"template":{"spec":{"securityContext":{"runAsNonRoot":true,"runAsUser":{{uid}},"seccompProfile":{"type":"RuntimeDefault"}},"containers":[{"name":"ui","securityContext":{"allowPrivilegeEscalation":false,"capabilities":{"drop":["ALL"]}}}]}}}}'
+          kubectl -n kiosk-display rollout status deploy/kiosk-ui --timeout=150s
+          kubectl label ns kiosk-display pod-security.kubernetes.io/enforce=restricted pod-security.kubernetes.io/enforce-version=latest --overwrite
+    alternatives:
+      - id: label-first-container-level
+        description: Enforce first, then fix the template with everything at container level and wait for the rollout.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 180
+            run: |
+              kubectl config use-context qm-depot
+              kubectl label ns kiosk-display pod-security.kubernetes.io/enforce=restricted
+              kubectl -n kiosk-display get deploy kiosk-ui -o yaml \
+                | yq '.spec.template.spec.containers[0].securityContext = {"runAsNonRoot": true, "runAsUser": {{uid}}, "allowPrivilegeEscalation": false, "capabilities": {"drop": ["ALL"]}, "seccompProfile": {"type": "RuntimeDefault"}}' \
+                | kubectl apply -f -
+              kubectl -n kiosk-display rollout status deploy/kiosk-ui --timeout=150s

@@ -1,0 +1,285 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: build-waybill-image
+  title: Build and tag an image from a Containerfile
+  domain: kubernetes
+  frameworks: [ckad:design-build]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [images, containerfile, buildah, oci]
+  version: 1
+spec:
+  description: |
+    The container yard prints a waybill for every container that leaves the
+    gate. The waybill renderer was handed over by a contractor with a
+    Containerfile that does not build, and the yard cluster has no internet
+    access, so images reach it as archives, never by pulling from the outside.
+
+    The build host is the worker node `yard-wk-1` (`ssh yard-wk-1`, then use
+    `sudo buildah`). The sources are in `/home/learner/waybill/` on that node,
+    and the base image `busybox:1.37` is already in buildah's local storage.
+
+    1. Fix `/home/learner/waybill/Containerfile` so that the image **builds**
+       and its default command **runs** (do not rename `render-waybill.sh`).
+    2. Build it and tag it for the yard registry as
+       **`registry.quillmoor.example/yard/waybill-renderer:{{tag}}`**.
+    3. Export that image as an **OCI archive** to
+       **`/home/learner/waybill-renderer-{{tag}}.tar`** on `yard-wk-1`.
+    4. Make the image available to the node's container runtime (containerd,
+       namespace `k8s.io`) from that archive and run it in cluster `qm-yard`
+       (context `qm-yard`) as Pod **`waybill-renderer`** in namespace
+       **`yard-gate`**, from exactly that tag, with environment variable
+       `SHIPMENT={{shipment}}`. The Pod must never try to pull the image.
+
+    ```bash
+    kubectl config use-context qm-yard
+    ```
+  objectives:
+    - Read a Containerfile and fix build-time and run-time mistakes
+    - Build and tag an image for a private registry name
+    - Export an image as an OCI archive and import it into containerd
+    - Run a Pod from a locally imported image without pulling
+  params:
+    tag:
+      type: choice
+      values: ["1.4.0", "1.4.1", "1.5.0"]
+    shipment:
+      type: choice
+      values: [QM-204411, QM-318840, QM-557102]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      # Needs a build tool on the kubeadm node image (buildah), see the
+      # curriculum note for this lab.
+      - name: qm-yard
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-yard
+          nodes:
+            - {name: yard-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: yard-wk-1, role: worker}
+  setup:
+    - on: qm-yard/yard-wk-1
+      run: install -d -o learner -g learner -m 0755 /home/learner/waybill
+    - on: qm-yard/yard-wk-1
+      file: {path: /home/learner/waybill/Containerfile, source: assets/Containerfile, mode: "0644"}
+    - on: qm-yard/yard-wk-1
+      file: {path: /home/learner/waybill/render-waybill.sh, source: assets/render-waybill.sh, mode: "0644"}
+    - on: qm-yard/yard-wk-1
+      timeoutSec: 120
+      run: |
+        set -e
+        chown -R learner:learner /home/learner/waybill
+        command -v buildah >/dev/null || { echo "buildah is not installed on this node image" >&2; exit 1; }
+        # Seed buildah's storage with the base image from containerd (no internet).
+        ctr -n k8s.io images export /tmp/busybox-base.tar docker.io/library/busybox:1.37
+        buildah pull -q oci-archive:/tmp/busybox-base.tar >/dev/null
+        buildah tag "$(buildah images -q | head -n1)" docker.io/library/busybox:1.37
+        rm -f /tmp/busybox-base.tar
+    - on: qm-yard
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: yard-gate}
+  teardown:
+    - on: qm-yard
+      run: kubectl delete namespace yard-gate --ignore-not-found --wait=false
+  checks:
+    - id: context
+      description: Terminal is using context qm-yard
+      type: k8s-context
+      on: workstation
+      skills: [k8s.cli.contexts]
+      weight: 0.5
+      expect: {match: exact, value: qm-yard}
+    - id: containerfile-builds
+      description: The Containerfile builds and copies the renderer script under its real name
+      type: shell
+      on: qm-yard/yard-wk-1
+      skills: [k8s.delivery.image-build]
+      timeoutSec: 90
+      command: |
+        cd /home/learner/waybill && buildah bud -q --layers=false -f Containerfile -t localhost/cloudtrain-grade:probe . >/dev/null 2>&1 && echo built || echo "build failed"
+        buildah rmi -f localhost/cloudtrain-grade:probe >/dev/null 2>&1 || true
+      expect: {match: exact, value: built}
+    - id: image-tagged
+      description: buildah storage holds registry.quillmoor.example/yard/waybill-renderer:{{tag}}
+      type: shell
+      on: qm-yard/yard-wk-1
+      skills: [k8s.delivery.image-build]
+      timeoutSec: 30
+      command: buildah images --noheading | awk '{print $1 ":" $2}' | grep -x 'registry.quillmoor.example/yard/waybill-renderer:{{tag}}' || echo missing
+      expect: {match: exact, value: "registry.quillmoor.example/yard/waybill-renderer:{{tag}}"}
+    - id: oci-archive
+      description: /home/learner/waybill-renderer-{{tag}}.tar is an OCI archive of that tag
+      type: shell
+      on: qm-yard/yard-wk-1
+      skills: [k8s.delivery.image-build]
+      timeoutSec: 30
+      command: |
+        f=/home/learner/waybill-renderer-{{tag}}.tar
+        [ -f "$f" ] || { echo missing; exit 0; }
+        tar -tf "$f" | grep -qx 'oci-layout' || { echo "not an OCI layout"; exit 0; }
+        tar -xOf "$f" index.json | grep -q '{{tag}}' && echo oci || echo "tag not recorded"
+      expect: {match: exact, value: oci}
+    - id: runtime-has-image
+      description: containerd (k8s.io) on yard-wk-1 has the image under the registry tag
+      type: shell
+      on: qm-yard/yard-wk-1
+      skills: [k8s.delivery.image-build]
+      timeoutSec: 30
+      command: ctr -n k8s.io images ls -q | grep -x 'registry.quillmoor.example/yard/waybill-renderer:{{tag}}' || echo missing
+      expect: {match: exact, value: "registry.quillmoor.example/yard/waybill-renderer:{{tag}}"}
+    - id: pod-image
+      description: Pod waybill-renderer uses that tag and never pulls it
+      type: k8s-query
+      skills: [k8s.delivery.image-build]
+      query: {cluster: qm-yard, resource: pod, name: waybill-renderer, namespace: yard-gate, jsonpath: "{.spec.containers[0].image} {.spec.containers[0].imagePullPolicy}"}
+      expect: {match: exact, value: "registry.quillmoor.example/yard/waybill-renderer:{{tag}} Never"}
+    - id: pod-serves
+      description: The renderer runs and serves the waybill for {{shipment}}
+      type: shell
+      on: qm-yard
+      skills: [k8s.delivery.image-build]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        phase=$(kubectl -n yard-gate get pod waybill-renderer -o jsonpath='{.status.phase}' 2>/dev/null)
+        [ "$phase" = Running ] || { echo "phase=$phase"; exit 0; }
+        kubectl -n yard-gate exec waybill-renderer -- wget -qO- -T 5 http://127.0.0.1:8080/ 2>/dev/null | tr '\n' ' '
+      expect: {match: contains, value: "shipment: {{shipment}} status: WAYBILL OK"}
+  hints:
+    - title: Read the build error
+      body: Run the build as it is and read which instruction fails. Compare the file names in the Containerfile with the files in the directory.
+      command: ssh yard-wk-1 'cd waybill && ls -l && sudo buildah bud -t test .'
+      cost: 1
+    - title: Executable bit
+      body: |
+        The script is copied with the mode it has in the build context (0644), so
+        the container cannot execute it. `COPY --chmod=0755` or a `RUN chmod`
+        fixes it inside the image.
+      cost: 2
+    - title: Export and import
+      body: |
+        `buildah push <image> oci-archive:<file>:<image>` writes an OCI archive
+        that keeps the name. containerd imports it with `ctr -n k8s.io images
+        import`; check the name with `ctr -n k8s.io images ls -q`.
+      cost: 2
+    - title: Never pull
+      body: A registry that does not exist cannot be pulled from; `imagePullPolicy` controls whether the kubelet tries.
+      command: kubectl -n yard-gate run waybill-renderer --image=registry.quillmoor.example/yard/waybill-renderer:{{tag}} --image-pull-policy=Never --env=SHIPMENT={{shipment}}
+      cost: 2
+  misconceptions:
+    - id: chmod-on-host-only
+      description: Fixes the file name but not the mode; the image builds and the container then fails with permission denied.
+      feedback: A successful build does not prove the image runs. The mode of a copied file comes from the build context; set it in the Containerfile.
+      expectFail: [pod-serves]
+      mutation:
+        on: qm-yard/yard-wk-1
+        as: learner
+        timeoutSec: 240
+        run: |
+          set -e
+          cd /home/learner/waybill
+          sed -i 's#COPY render.sh#COPY render-waybill.sh#' Containerfile
+          sudo buildah bud -q -t registry.quillmoor.example/yard/waybill-renderer:{{tag}} . >/dev/null
+          sudo buildah push registry.quillmoor.example/yard/waybill-renderer:{{tag}} oci-archive:/home/learner/waybill-renderer-{{tag}}.tar:registry.quillmoor.example/yard/waybill-renderer:{{tag}}
+          sudo ctr -n k8s.io images import /home/learner/waybill-renderer-{{tag}}.tar
+          kubectl config use-context qm-yard
+          kubectl -n yard-gate run waybill-renderer --image=registry.quillmoor.example/yard/waybill-renderer:{{tag}} --image-pull-policy=Never --env=SHIPMENT={{shipment}}
+    - id: default-pull-policy
+      description: Runs the Pod with the default pull policy; with a tag that is not latest it is IfNotPresent and happens to work, but the task asked that the kubelet never pull.
+      feedback: Set `imagePullPolicy` explicitly when the image only exists locally; IfNotPresent still contacts the registry whenever the image is missing on a node.
+      expectFail: [pod-image]
+      mutation:
+        on: qm-yard/yard-wk-1
+        as: learner
+        timeoutSec: 240
+        run: |
+          set -e
+          cd /home/learner/waybill
+          sed -i 's#COPY render.sh /opt/waybill/render.sh#COPY --chmod=0755 render-waybill.sh /opt/waybill/render.sh#' Containerfile
+          sudo buildah bud -q -t registry.quillmoor.example/yard/waybill-renderer:{{tag}} . >/dev/null
+          sudo buildah push registry.quillmoor.example/yard/waybill-renderer:{{tag}} oci-archive:/home/learner/waybill-renderer-{{tag}}.tar:registry.quillmoor.example/yard/waybill-renderer:{{tag}}
+          sudo ctr -n k8s.io images import /home/learner/waybill-renderer-{{tag}}.tar
+          kubectl config use-context qm-yard
+          kubectl -n yard-gate run waybill-renderer --image=registry.quillmoor.example/yard/waybill-renderer:{{tag}} --env=SHIPMENT={{shipment}}
+    - id: docker-archive
+      description: Exports a docker-archive instead of an OCI archive.
+      feedback: The task asked for the OCI image layout (`oci-archive:`); docker-archive is a different format without `oci-layout`.
+      expectFail: [oci-archive]
+      mutation:
+        on: qm-yard/yard-wk-1
+        as: learner
+        timeoutSec: 240
+        run: |
+          set -e
+          cd /home/learner/waybill
+          sed -i 's#COPY render.sh /opt/waybill/render.sh#COPY --chmod=0755 render-waybill.sh /opt/waybill/render.sh#' Containerfile
+          sudo buildah bud -q -t registry.quillmoor.example/yard/waybill-renderer:{{tag}} . >/dev/null
+          sudo buildah push registry.quillmoor.example/yard/waybill-renderer:{{tag}} docker-archive:/home/learner/waybill-renderer-{{tag}}.tar:registry.quillmoor.example/yard/waybill-renderer:{{tag}}
+          kubectl config use-context qm-yard
+  solution:
+    explanation: |
+      The Containerfile copied a file that does not exist (`render.sh`) and the
+      script lacked the executable bit. After fixing both, buildah builds and
+      tags the image, `buildah push ... oci-archive:` writes the OCI layout,
+      `ctr -n k8s.io images import` hands it to the kubelet's runtime, and
+      `imagePullPolicy: Never` makes the kubelet use only that local copy.
+    steps:
+      - on: qm-yard/yard-wk-1
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd /home/learner/waybill
+          sed -i 's#COPY render.sh /opt/waybill/render.sh#COPY --chmod=0755 render-waybill.sh /opt/waybill/render.sh#' Containerfile
+          sudo buildah bud -q -t registry.quillmoor.example/yard/waybill-renderer:{{tag}} . >/dev/null
+          sudo buildah push registry.quillmoor.example/yard/waybill-renderer:{{tag}} oci-archive:/home/learner/waybill-renderer-{{tag}}.tar:registry.quillmoor.example/yard/waybill-renderer:{{tag}}
+          sudo ctr -n k8s.io images import /home/learner/waybill-renderer-{{tag}}.tar
+      - on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          kubectl config use-context qm-yard
+          kubectl -n yard-gate run waybill-renderer --image=registry.quillmoor.example/yard/waybill-renderer:{{tag}} --image-pull-policy=Never --env=SHIPMENT={{shipment}}
+          kubectl -n yard-gate wait pod/waybill-renderer --for=condition=Ready --timeout=100s
+    alternatives:
+      - id: run-chmod
+        description: Keep the COPY destination and add a RUN chmod layer; write the Pod as a manifest.
+        steps:
+          - on: qm-yard/yard-wk-1
+            as: learner
+            timeoutSec: 300
+            run: |
+              set -e
+              cd /home/learner/waybill
+              sed -i 's#COPY render.sh /opt/waybill/render.sh#COPY render-waybill.sh /opt/waybill/render.sh\nRUN chmod 0755 /opt/waybill/render.sh#' Containerfile
+              sudo buildah build -q -t registry.quillmoor.example/yard/waybill-renderer:{{tag}} -f Containerfile . >/dev/null
+              sudo buildah push registry.quillmoor.example/yard/waybill-renderer:{{tag}} oci-archive:/home/learner/waybill-renderer-{{tag}}.tar:registry.quillmoor.example/yard/waybill-renderer:{{tag}}
+              sudo ctr -n k8s.io images import /home/learner/waybill-renderer-{{tag}}.tar
+          - on: workstation
+            as: learner
+            timeoutSec: 120
+            run: |
+              kubectl config use-context qm-yard
+              kubectl apply -f - <<'YAML'
+              apiVersion: v1
+              kind: Pod
+              metadata: {name: waybill-renderer, namespace: yard-gate}
+              spec:
+                containers:
+                  - name: renderer
+                    image: registry.quillmoor.example/yard/waybill-renderer:{{tag}}
+                    imagePullPolicy: Never
+                    env: [{name: SHIPMENT, value: "{{shipment}}"}]
+              YAML
+              kubectl -n yard-gate wait pod/waybill-renderer --for=condition=Ready --timeout=100s

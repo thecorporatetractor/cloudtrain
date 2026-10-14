@@ -1,0 +1,144 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xkd-clusterip-expose
+  title: Expose a Deployment inside the cluster
+  domain: kubernetes
+  frameworks: [ckad:services-networking]
+  difficulty: easy
+  estimatedMinutes: 4
+  tags: [exam, services]
+  version: 1
+spec:
+  description: |
+    **Context:** `qm-depot` (`kubectl config use-context qm-depot`)
+
+    In namespace `rates-desk`, expose the Deployment **`rates-api`** as a
+    **ClusterIP** Service named **`rates`** on port **80**, forwarding to the
+    containers' port **8080**. The Pod `probe` in the namespace has `wget`
+    for testing.
+  objectives:
+    - Expose a Deployment with a ClusterIP Service and a port mapping
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-depot
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: qm-depot
+  setup:
+    - on: qm-depot
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: rates-desk}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: rates-api, namespace: rates-desk}
+        spec:
+          replicas: 2
+          selector: {matchLabels: {app: rates-api}}
+          template:
+            metadata: {labels: {app: rates-api, tier: backend}}
+            spec:
+              terminationGracePeriodSeconds: 2
+              containers:
+                - name: api
+                  image: busybox:1.37
+                  command: ["sh", "-c", "mkdir -p /www && echo rates-ok > /www/index.html && exec httpd -f -p 8080 -h /www"]
+                  ports: [{containerPort: 8080}]
+        ---
+        apiVersion: v1
+        kind: Pod
+        metadata: {name: probe, namespace: rates-desk}
+        spec:
+          terminationGracePeriodSeconds: 1
+          containers:
+            - {name: probe, image: "busybox:1.37", command: ["sleep", "1d"]}
+    - on: qm-depot
+      timeoutSec: 120
+      run: |
+        kubectl -n rates-desk rollout status deploy/rates-api --timeout=110s
+        kubectl -n rates-desk wait pod/probe --for=condition=Ready --timeout=60s
+  teardown:
+    - on: qm-depot
+      run: kubectl delete namespace rates-desk --ignore-not-found --wait=false
+  checks:
+    - id: service
+      description: Service rates is ClusterIP, port 80 to target port 8080
+      type: k8s-query
+      skills: [k8s.networking.services]
+      query: {cluster: qm-depot, resource: service, name: rates, namespace: rates-desk, jsonpath: "{.spec.type} {.spec.ports[0].port}->{.spec.ports[0].targetPort}"}
+      expect: {match: exact, value: ClusterIP 80->8080}
+    - id: endpoints
+      description: rates has both rates-api Pods as endpoints
+      type: shell
+      timeoutSec: 30
+      on: qm-depot
+      skills: [k8s.networking.services]
+      command: kubectl -n rates-desk get endpointslices -l kubernetes.io/service-name=rates -o jsonpath='{range .items[*].endpoints[*]}{.targetRef.name}{"\n"}{end}' | grep -c '^rates-api-'
+      expect: {match: exact, value: "2"}
+    - id: reachable
+      description: http://rates.rates-desk/ answers from inside the cluster
+      type: shell
+      on: qm-depot
+      skills: [k8s.networking.services]
+      weight: 2
+      timeoutSec: 30
+      command: kubectl -n rates-desk exec probe -- wget -qO- -T 5 http://rates.rates-desk/ 2>/dev/null || echo unreachable
+      expect: {match: exact, value: rates-ok}
+  misconceptions:
+    - id: same-port
+      description: Exposes port 8080 on the Service as well, so clients on port 80 get nothing.
+      feedback: "`--port` is what clients use; `--target-port` is where the container listens."
+      expectFail: [service, reachable]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n rates-desk expose deployment rates-api --name=rates --port=8080
+    - id: nodeport
+      description: Creates a NodePort Service, which also opens the API on every node.
+      feedback: The task asks for in-cluster exposure only (ClusterIP).
+      expectFail: [service]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n rates-desk expose deployment rates-api --name=rates --port=80 --target-port=8080 --type=NodePort
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n rates-desk expose deployment rates-api --name=rates --port=80 --target-port=8080
+          sleep 3
+    alternatives:
+      - id: manifest
+        description: Service manifest selecting the Pod labels.
+        steps:
+          - on: workstation
+            as: learner
+            run: |
+              kubectl config use-context qm-depot
+              kubectl apply -f - <<'YAML'
+              apiVersion: v1
+              kind: Service
+              metadata: {name: rates, namespace: rates-desk}
+              spec:
+                type: ClusterIP
+                selector: {app: rates-api}
+                ports:
+                  - {port: 80, targetPort: 8080, protocol: TCP}
+              YAML
+              sleep 3

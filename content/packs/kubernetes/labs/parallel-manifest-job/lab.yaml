@@ -1,0 +1,261 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: parallel-manifest-job
+  title: Process a manifest backlog with a parallel Job
+  domain: kubernetes
+  frameworks: [ckad:design-build]
+  difficulty: medium
+  estimatedMinutes: 12
+  tags: [jobs, indexed-job, parallelism, batch]
+  version: 1
+spec:
+  description: |
+    A schema change at the customs desk means the last 12 batches of cargo
+    manifests have to be re-validated. Each batch is numbered 0 to 11 and must
+    be processed exactly once by a worker that knows its batch number.
+
+    From your workstation, switch to context `qm-customs` first:
+
+    ```bash
+    kubectl config use-context qm-customs
+    ```
+
+    In namespace `customs-manifests`, create a Job named **`{{job}}`** that:
+
+    - completes **12** times, giving each Pod a distinct batch number 0-11 in
+      the environment variable `JOB_COMPLETION_INDEX` (an **Indexed** Job);
+    - runs at most **4** Pods at the same time;
+    - tolerates **2** failed Pods before giving up (backoff limit);
+    - runs container `revalidate` with image `busybox:1.37` and the command
+      `/bin/sh -c 'echo "batch $JOB_COMPLETION_INDEX of {{manifest}} revalidated"; sleep 2'`.
+
+    Leave the Job **Complete**. The ConfigMap `backlog` in the namespace
+    describes the batches; you do not need to change it.
+  objectives:
+    - Choose between NonIndexed and Indexed completion modes
+    - Set completions, parallelism and backoffLimit
+    - Confirm a Job's completion state and completed indexes
+  params:
+    job:
+      type: choice
+      values: [manifest-revalidate, revalidate-batches, manifest-backlog]
+    manifest:
+      type: choice
+      values: [sea-freight, air-cargo, rail-freight]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-customs
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: qm-customs
+  setup:
+    - on: qm-customs
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: customs-manifests}
+        ---
+        apiVersion: v1
+        kind: ConfigMap
+        metadata: {name: backlog, namespace: customs-manifests}
+        data:
+          batches: "12"
+          manifest: "{{manifest}}"
+          note: "Batches 0-11; each worker reads JOB_COMPLETION_INDEX."
+  teardown:
+    - on: qm-customs
+      run: kubectl delete namespace customs-manifests --ignore-not-found --wait=false
+  checks:
+    - id: context
+      description: Terminal is using context qm-customs
+      type: k8s-context
+      on: workstation
+      skills: [k8s.cli.contexts]
+      weight: 0.5
+      expect: {match: exact, value: qm-customs}
+    - id: indexed
+      description: Job {{job}} uses the Indexed completion mode
+      type: k8s-query
+      skills: [k8s.workloads.jobs]
+      weight: 2
+      query: {cluster: qm-customs, resource: job, name: "{{job}}", namespace: customs-manifests, jsonpath: "{.spec.completionMode}"}
+      expect: {match: exact, value: Indexed}
+    - id: completions-parallelism
+      description: 12 completions, at most 4 Pods in parallel
+      type: k8s-query
+      skills: [k8s.workloads.jobs]
+      query: {cluster: qm-customs, resource: job, name: "{{job}}", namespace: customs-manifests, jsonpath: "{.spec.completions}/{.spec.parallelism}"}
+      expect: {match: exact, value: "12/4"}
+    - id: backoff
+      description: The backoff limit is 2
+      type: k8s-query
+      skills: [k8s.workloads.jobs]
+      weight: 0.5
+      query: {cluster: qm-customs, resource: job, name: "{{job}}", namespace: customs-manifests, jsonpath: "{.spec.backoffLimit}"}
+      expect: {match: exact, value: "2"}
+    - id: container
+      description: Container revalidate runs busybox:1.37 and reports its batch for {{manifest}}
+      type: k8s-query
+      skills: [k8s.workloads.jobs]
+      weight: 0.5
+      query: {cluster: qm-customs, resource: job, name: "{{job}}", namespace: customs-manifests, jsonpath: '{.spec.template.spec.containers[?(@.name=="revalidate")].image} {.spec.template.spec.containers[?(@.name=="revalidate")].command}'}
+      expect: {match: regex, value: '^busybox:1\.37 .*JOB_COMPLETION_INDEX of {{manifest}} revalidated'}
+    - id: complete
+      description: The Job is Complete with every batch 0-11 done exactly once
+      type: k8s-query
+      skills: [k8s.workloads.jobs]
+      weight: 2
+      query: {cluster: qm-customs, resource: job, name: "{{job}}", namespace: customs-manifests, jsonpath: '{.status.conditions[?(@.type=="Complete")].status} {.status.succeeded} {.status.completedIndexes}'}
+      expect: {match: exact, value: "True 12 0-11"}
+  hints:
+    - title: Switch context
+      body: The customs workloads run on the customs cluster.
+      command: kubectl config use-context qm-customs
+      cost: 0
+    - title: Scaffold a Job
+      body: kubectl create job gives you the Pod template; completions, parallelism and the mode go into the YAML.
+      command: kubectl -n customs-manifests create job {{job}} --image=busybox:1.37 --dry-run=client -o yaml -- /bin/sh -c 'echo "batch $JOB_COMPLETION_INDEX of {{manifest}} revalidated"; sleep 2' > job.yaml
+      cost: 1
+    - title: Where does the index come from
+      body: With `completionMode` Indexed the Job controller sets the annotation and the `JOB_COMPLETION_INDEX` variable on each Pod; NonIndexed Pods get no index at all.
+      command: kubectl explain job.spec.completionMode
+      cost: 2
+    - title: Watch it finish
+      body: completedIndexes lists the batches that succeeded.
+      command: kubectl -n customs-manifests get job {{job}} -o jsonpath='{.status.completedIndexes}{"\n"}'
+      cost: 1
+  misconceptions:
+    - id: non-indexed
+      description: Sets completions and parallelism but keeps the default NonIndexed mode; every Pod sees an empty batch number.
+      feedback: Only an Indexed Job hands each Pod its own index. A NonIndexed Job just counts 12 interchangeable successes.
+      expectFail: [indexed, complete]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 180
+        run: |
+          kubectl config use-context qm-customs
+          kubectl apply -f - <<'YAML'
+          apiVersion: batch/v1
+          kind: Job
+          metadata: {name: "{{job}}", namespace: customs-manifests}
+          spec:
+            completions: 12
+            parallelism: 4
+            backoffLimit: 2
+            template:
+              spec:
+                restartPolicy: Never
+                containers:
+                  - name: revalidate
+                    image: busybox:1.37
+                    command: ["/bin/sh", "-c", "echo \"batch $JOB_COMPLETION_INDEX of {{manifest}} revalidated\"; sleep 2"]
+          YAML
+          kubectl -n customs-manifests wait job/{{job}} --for=condition=Complete --timeout=150s
+    - id: all-at-once
+      description: Sets parallelism equal to completions, so all 12 batches hit the customs backend at once.
+      feedback: "`parallelism` caps how many Pods run simultaneously; `completions` is the total. Here they differ: 4 and 12."
+      expectFail: [completions-parallelism]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 180
+        run: |
+          kubectl config use-context qm-customs
+          kubectl apply -f - <<'YAML'
+          apiVersion: batch/v1
+          kind: Job
+          metadata: {name: "{{job}}", namespace: customs-manifests}
+          spec:
+            completionMode: Indexed
+            completions: 12
+            parallelism: 12
+            backoffLimit: 2
+            template:
+              spec:
+                restartPolicy: Never
+                containers:
+                  - name: revalidate
+                    image: busybox:1.37
+                    command: ["/bin/sh", "-c", "echo \"batch $JOB_COMPLETION_INDEX of {{manifest}} revalidated\"; sleep 2"]
+          YAML
+          kubectl -n customs-manifests wait job/{{job}} --for=condition=Complete --timeout=150s
+    - id: default-backoff
+      description: Forgets the backoff limit, so the Job keeps retrying up to the default of 6 failures.
+      feedback: backoffLimit defaults to 6. The task allows 2 failed Pods.
+      expectFail: [backoff]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 180
+        run: |
+          kubectl config use-context qm-customs
+          kubectl apply -f - <<'YAML'
+          apiVersion: batch/v1
+          kind: Job
+          metadata: {name: "{{job}}", namespace: customs-manifests}
+          spec:
+            completionMode: Indexed
+            completions: 12
+            parallelism: 4
+            template:
+              spec:
+                restartPolicy: Never
+                containers:
+                  - name: revalidate
+                    image: busybox:1.37
+                    command: ["/bin/sh", "-c", "echo \"batch $JOB_COMPLETION_INDEX of {{manifest}} revalidated\"; sleep 2"]
+          YAML
+          kubectl -n customs-manifests wait job/{{job}} --for=condition=Complete --timeout=150s
+  solution:
+    explanation: |
+      `completionMode: Indexed` with `completions: 12` gives the Pods the indexes
+      0-11 (one success each), `parallelism: 4` keeps four Pods in flight, and
+      `backoffLimit: 2` fails the Job after the third failed Pod.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 200
+        run: |
+          kubectl config use-context qm-customs
+          kubectl apply -f - <<'YAML'
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: {{job}}
+            namespace: customs-manifests
+          spec:
+            completionMode: Indexed
+            completions: 12
+            parallelism: 4
+            backoffLimit: 2
+            template:
+              spec:
+                restartPolicy: Never
+                containers:
+                  - name: revalidate
+                    image: busybox:1.37
+                    command: ["/bin/sh", "-c", "echo \"batch $JOB_COMPLETION_INDEX of {{manifest}} revalidated\"; sleep 2"]
+          YAML
+          kubectl -n customs-manifests wait job/{{job}} --for=condition=Complete --timeout=180s
+    alternatives:
+      - id: scaffold-and-edit
+        description: Scaffold with kubectl create job --dry-run, add the fields with yq, then apply.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 200
+            run: |
+              kubectl config use-context qm-customs
+              kubectl -n customs-manifests create job {{job}} --image=busybox:1.37 --dry-run=client -o yaml -- /bin/sh -c 'echo "batch $JOB_COMPLETION_INDEX of {{manifest}} revalidated"; sleep 2' \
+                | yq '.spec.completionMode = "Indexed" | .spec.completions = 12 | .spec.parallelism = 4 | .spec.backoffLimit = 2 | .spec.template.spec.containers[0].name = "revalidate"' \
+                | kubectl apply -f -
+              kubectl -n customs-manifests wait job/{{job}} --for=condition=Complete --timeout=180s

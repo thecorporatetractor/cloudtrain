@@ -1,0 +1,418 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: registry-allowlist-vap
+  title: Admit only images from the company registry
+  domain: kubernetes
+  frameworks: [cks:supply-chain-security, ckad:environment-config-security]
+  difficulty: hard
+  estimatedMinutes: 20
+  tags: [admission, validatingadmissionpolicy, cel, images, supply-chain]
+  version: 1
+spec:
+  description: |
+    After an incident in which a public image with a cryptominer was pulled
+    into a harbour workload, Quillmoor decided that production namespaces may
+    only run images that went through the company registry
+    `registry.quillmoor.example`, where they are scanned and signed.
+
+    From your workstation, switch to context `qm-dispatch` first:
+
+    ```bash
+    kubectl config use-context qm-dispatch
+    ```
+
+    Using only built-in admission (no webhook):
+
+    1. Create a **ValidatingAdmissionPolicy** named **`{{policy}}`** that
+       rejects a Pod when **any** of its containers or init containers uses
+       an image that is not under `registry.quillmoor.example/` (for example
+       `registry.quillmoor.example/harbour/crane-api:3.2` is fine,
+       `busybox:1.37` and `registry.quillmoor.example.mirror.io/x:1` are not).
+    2. Bind it with a **ValidatingAdmissionPolicyBinding** named
+       **`{{policy}}`** that **denies** such Pods only in namespaces labelled
+       **`quillmoor.example/registry-policy=enforced`** (`harbour-apps` already
+       is; `harbour-sandbox` is not and must stay open).
+    3. Prove it: try to create a Pod `hub-test` with image `busybox:1.37` in
+       `harbour-apps` and save the full error message that kubectl prints to
+       **`/home/learner/vap-proof.txt`** on the workstation.
+  objectives:
+    - Write a CEL validation over all containers of a Pod
+    - Scope a policy binding with a namespace selector
+    - Choose the validation action that rejects requests
+    - Test admission with server-side dry runs
+  params:
+    policy:
+      type: choice
+      values: [company-registry-only, harbour-image-allowlist, registry-allowlist]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-dispatch
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: qm-dispatch
+  setup:
+    - on: qm-dispatch
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata:
+          name: harbour-apps
+          labels: {quillmoor.example/registry-policy: enforced}
+        ---
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: harbour-sandbox}
+  teardown:
+    - on: qm-dispatch
+      run: |
+        kubectl delete validatingadmissionpolicybinding {{policy}} --ignore-not-found
+        kubectl delete validatingadmissionpolicy {{policy}} --ignore-not-found
+        kubectl delete namespace harbour-apps harbour-sandbox --ignore-not-found --wait=false
+  checks:
+    - id: context
+      description: Terminal is using context qm-dispatch
+      type: k8s-context
+      on: workstation
+      skills: [k8s.cli.contexts]
+      weight: 0.5
+      expect: {match: exact, value: qm-dispatch}
+    - id: binding-denies
+      description: Binding {{policy}} references policy {{policy}} with the Deny action
+      type: k8s-query
+      skills: [k8s.security.admission-control]
+      query: {cluster: qm-dispatch, resource: validatingadmissionpolicybinding, name: "{{policy}}", jsonpath: "{.spec.policyName} {.spec.validationActions}"}
+      expect: {match: regex, value: '^{{policy}} \[.*"Deny".*\]$'}
+    - id: hub-denied
+      description: busybox:1.37 is rejected in harbour-apps
+      type: shell
+      timeoutSec: 30
+      on: qm-dispatch
+      skills: [k8s.security.admission-control]
+      weight: 2
+      command: |
+        out=$(kubectl -n harbour-apps run grade-hub --image=busybox:1.37 --restart=Never --dry-run=server -- sleep 1 2>&1)
+        case "$out" in *ValidatingAdmissionPolicy*denied*) echo denied ;; *) echo "admitted" ;; esac
+      expect: {match: exact, value: denied}
+    - id: company-allowed
+      description: An image from registry.quillmoor.example is admitted in harbour-apps
+      type: shell
+      timeoutSec: 30
+      on: qm-dispatch
+      skills: [k8s.security.admission-control]
+      command: |
+        out=$(kubectl -n harbour-apps run grade-ok --image=registry.quillmoor.example/harbour/crane-api:3.2 --restart=Never --dry-run=server 2>&1)
+        case "$out" in *created*) echo admitted ;; *) echo "denied" ;; esac
+      expect: {match: exact, value: admitted}
+    - id: sandbox-open
+      description: harbour-sandbox (unlabelled) still admits busybox:1.37
+      type: shell
+      timeoutSec: 30
+      on: qm-dispatch
+      skills: [k8s.security.admission-control]
+      command: |
+        out=$(kubectl -n harbour-sandbox run grade-hub --image=busybox:1.37 --restart=Never --dry-run=server -- sleep 1 2>&1)
+        case "$out" in *created*) echo admitted ;; *) echo "denied" ;; esac
+      expect: {match: exact, value: admitted}
+    - id: init-container-denied
+      description: A hub image in an init container is rejected in harbour-apps
+      type: shell
+      timeoutSec: 30
+      on: qm-dispatch
+      skills: [k8s.security.admission-control]
+      command: |
+        out=$(kubectl apply --dry-run=server -f - 2>&1 <<'YAML'
+        apiVersion: v1
+        kind: Pod
+        metadata: {name: grade-init, namespace: harbour-apps}
+        spec:
+          initContainers:
+            - {name: fetch, image: "busybox:1.37", command: ["true"]}
+          containers:
+            - {name: app, image: "registry.quillmoor.example/harbour/crane-api:3.2"}
+        YAML
+        )
+        case "$out" in *ValidatingAdmissionPolicy*denied*) echo denied ;; *) echo "admitted" ;; esac
+      expect: {match: exact, value: denied}
+    - id: lookalike-denied
+      description: A look-alike registry host (registry.quillmoor.example.mirror.io) is rejected
+      type: shell
+      timeoutSec: 30
+      on: qm-dispatch
+      skills: [k8s.security.image-signing]
+      command: |
+        out=$(kubectl -n harbour-apps run grade-lookalike --image=registry.quillmoor.example.mirror.io/harbour/crane-api:3.2 --restart=Never --dry-run=server 2>&1)
+        case "$out" in *ValidatingAdmissionPolicy*denied*) echo denied ;; *) echo "admitted" ;; esac
+      expect: {match: exact, value: denied}
+    - id: proof
+      description: /home/learner/vap-proof.txt holds the rejection of hub-test by {{policy}}
+      type: file
+      on: workstation
+      target: /home/learner/vap-proof.txt
+      skills: [k8s.security.admission-control]
+      weight: 0.5
+      expect: {match: regex, value: "hub-test.*ValidatingAdmissionPolicy '{{policy}}'.*denied"}
+  hints:
+    - title: Switch context
+      body: The harbour workloads run on the dispatch cluster.
+      command: kubectl config use-context qm-dispatch
+      cost: 0
+    - title: Two objects
+      body: The policy holds the rule (matchConstraints + validations); the binding decides where it applies (matchResources) and what happens on failure (validationActions).
+      command: kubectl explain validatingadmissionpolicybinding.spec
+      cost: 1
+    - title: Every container
+      body: "In CEL, `list.all(x, predicate)` is true when the predicate holds for every element. `initContainers` may be absent, so guard it with `has()`."
+      cost: 2
+    - title: The prefix matters
+      body: "`startsWith('registry.quillmoor.example')` also accepts `registry.quillmoor.example.mirror.io`. Include the slash."
+      cost: 2
+    - title: Capture the error
+      body: kubectl prints admission errors on stderr.
+      command: kubectl -n harbour-apps run hub-test --image=busybox:1.37 2> ~/vap-proof.txt; cat ~/vap-proof.txt
+      cost: 1
+  misconceptions:
+    - id: warn-action
+      description: Binds the policy with validationActions Warn, which only prints a warning and admits the Pod.
+      feedback: Warn and Audit report; only Deny rejects the request.
+      expectFail: [binding-denies, hub-denied]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 90
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl apply -f - <<'YAML'
+          apiVersion: admissionregistration.k8s.io/v1
+          kind: ValidatingAdmissionPolicy
+          metadata: {name: "{{policy}}"}
+          spec:
+            failurePolicy: Fail
+            matchConstraints:
+              resourceRules:
+                - apiGroups: [""]
+                  apiVersions: [v1]
+                  operations: [CREATE, UPDATE]
+                  resources: [pods]
+            validations:
+              - expression: >-
+                  object.spec.containers.all(c, c.image.startsWith('registry.quillmoor.example/')) &&
+                  (!has(object.spec.initContainers) || object.spec.initContainers.all(c, c.image.startsWith('registry.quillmoor.example/')))
+                message: images must come from registry.quillmoor.example
+          ---
+          apiVersion: admissionregistration.k8s.io/v1
+          kind: ValidatingAdmissionPolicyBinding
+          metadata: {name: "{{policy}}"}
+          spec:
+            policyName: "{{policy}}"
+            validationActions: [Warn]
+            matchResources:
+              namespaceSelector:
+                matchLabels: {quillmoor.example/registry-policy: enforced}
+          YAML
+    - id: cluster-wide
+      description: Binds without a namespace selector, so the policy also blocks the sandbox (and every system namespace).
+      feedback: Without `matchResources.namespaceSelector` the binding applies everywhere. Scope it with the label.
+      expectFail: [sandbox-open]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 90
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl apply -f - <<'YAML'
+          apiVersion: admissionregistration.k8s.io/v1
+          kind: ValidatingAdmissionPolicy
+          metadata: {name: "{{policy}}"}
+          spec:
+            failurePolicy: Fail
+            matchConstraints:
+              resourceRules:
+                - apiGroups: [""]
+                  apiVersions: [v1]
+                  operations: [CREATE, UPDATE]
+                  resources: [pods]
+            validations:
+              - expression: >-
+                  object.spec.containers.all(c, c.image.startsWith('registry.quillmoor.example/')) &&
+                  (!has(object.spec.initContainers) || object.spec.initContainers.all(c, c.image.startsWith('registry.quillmoor.example/')))
+                message: images must come from registry.quillmoor.example
+          ---
+          apiVersion: admissionregistration.k8s.io/v1
+          kind: ValidatingAdmissionPolicyBinding
+          metadata: {name: "{{policy}}"}
+          spec:
+            policyName: "{{policy}}"
+            validationActions: [Deny]
+          YAML
+    - id: prefix-without-slash
+      description: Checks startsWith('registry.quillmoor.example') without the slash, so a look-alike host passes.
+      feedback: A registry is a host name; any longer host that starts with the same characters is a different registry. Match up to the slash.
+      expectFail: [lookalike-denied]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 90
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl apply -f - <<'YAML'
+          apiVersion: admissionregistration.k8s.io/v1
+          kind: ValidatingAdmissionPolicy
+          metadata: {name: "{{policy}}"}
+          spec:
+            failurePolicy: Fail
+            matchConstraints:
+              resourceRules:
+                - apiGroups: [""]
+                  apiVersions: [v1]
+                  operations: [CREATE, UPDATE]
+                  resources: [pods]
+            validations:
+              - expression: >-
+                  object.spec.containers.all(c, c.image.startsWith('registry.quillmoor.example')) &&
+                  (!has(object.spec.initContainers) || object.spec.initContainers.all(c, c.image.startsWith('registry.quillmoor.example')))
+                message: images must come from registry.quillmoor.example
+          ---
+          apiVersion: admissionregistration.k8s.io/v1
+          kind: ValidatingAdmissionPolicyBinding
+          metadata: {name: "{{policy}}"}
+          spec:
+            policyName: "{{policy}}"
+            validationActions: [Deny]
+            matchResources:
+              namespaceSelector:
+                matchLabels: {quillmoor.example/registry-policy: enforced}
+          YAML
+    - id: containers-only
+      description: Validates spec.containers only, so a hub image slips in as an init container.
+      feedback: Init containers run code too. Validate `initContainers` (guarded with `has()`) as well.
+      expectFail: [init-container-denied]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 90
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl apply -f - <<'YAML'
+          apiVersion: admissionregistration.k8s.io/v1
+          kind: ValidatingAdmissionPolicy
+          metadata: {name: "{{policy}}"}
+          spec:
+            failurePolicy: Fail
+            matchConstraints:
+              resourceRules:
+                - apiGroups: [""]
+                  apiVersions: [v1]
+                  operations: [CREATE, UPDATE]
+                  resources: [pods]
+            validations:
+              - expression: object.spec.containers.all(c, c.image.startsWith('registry.quillmoor.example/'))
+                message: images must come from registry.quillmoor.example
+          ---
+          apiVersion: admissionregistration.k8s.io/v1
+          kind: ValidatingAdmissionPolicyBinding
+          metadata: {name: "{{policy}}"}
+          spec:
+            policyName: "{{policy}}"
+            validationActions: [Deny]
+            matchResources:
+              namespaceSelector:
+                matchLabels: {quillmoor.example/registry-policy: enforced}
+          YAML
+  solution:
+    explanation: |
+      The policy matches Pod CREATE/UPDATE and requires every container and
+      init container image to start with `registry.quillmoor.example/` (the
+      slash pins the host). The binding applies it with `Deny` only where the
+      namespace carries the enforcement label.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 90
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl apply -f - <<'YAML'
+          apiVersion: admissionregistration.k8s.io/v1
+          kind: ValidatingAdmissionPolicy
+          metadata:
+            name: {{policy}}
+          spec:
+            failurePolicy: Fail
+            matchConstraints:
+              resourceRules:
+                - apiGroups: [""]
+                  apiVersions: [v1]
+                  operations: [CREATE, UPDATE]
+                  resources: [pods]
+            validations:
+              - expression: >-
+                  object.spec.containers.all(c, c.image.startsWith('registry.quillmoor.example/')) &&
+                  (!has(object.spec.initContainers) || object.spec.initContainers.all(c, c.image.startsWith('registry.quillmoor.example/')))
+                message: images must come from registry.quillmoor.example
+          ---
+          apiVersion: admissionregistration.k8s.io/v1
+          kind: ValidatingAdmissionPolicyBinding
+          metadata:
+            name: {{policy}}
+          spec:
+            policyName: {{policy}}
+            validationActions: [Deny]
+            matchResources:
+              namespaceSelector:
+                matchLabels:
+                  quillmoor.example/registry-policy: enforced
+          YAML
+          sleep 3
+          kubectl -n harbour-apps run hub-test --image=busybox:1.37 2> ~/vap-proof.txt || true
+          cat ~/vap-proof.txt
+    alternatives:
+      - id: variables-and-ephemeral
+        description: Collect every image (containers, init and ephemeral containers) in a CEL variable and test it once.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 90
+            run: |
+              kubectl config use-context qm-dispatch
+              kubectl apply -f - <<'YAML'
+              apiVersion: admissionregistration.k8s.io/v1
+              kind: ValidatingAdmissionPolicy
+              metadata: {name: "{{policy}}"}
+              spec:
+                failurePolicy: Fail
+                matchConstraints:
+                  resourceRules:
+                    - apiGroups: [""]
+                      apiVersions: [v1]
+                      operations: [CREATE, UPDATE]
+                      resources: [pods, pods/ephemeralcontainers]
+                variables:
+                  - name: images
+                    expression: >-
+                      object.spec.containers.map(c, c.image) +
+                      (has(object.spec.initContainers) ? object.spec.initContainers.map(c, c.image) : []) +
+                      (has(object.spec.ephemeralContainers) ? object.spec.ephemeralContainers.map(c, c.image) : [])
+                validations:
+                  - expression: variables.images.all(i, i.startsWith('registry.quillmoor.example/'))
+                    messageExpression: "'images outside registry.quillmoor.example: ' + variables.images.filter(i, !i.startsWith('registry.quillmoor.example/')).join(', ')"
+              ---
+              apiVersion: admissionregistration.k8s.io/v1
+              kind: ValidatingAdmissionPolicyBinding
+              metadata: {name: "{{policy}}"}
+              spec:
+                policyName: "{{policy}}"
+                validationActions: [Deny, Audit]
+                matchResources:
+                  namespaceSelector:
+                    matchExpressions:
+                      - {key: quillmoor.example/registry-policy, operator: In, values: [enforced]}
+              YAML
+              sleep 3
+              kubectl -n harbour-apps run hub-test --image=busybox:1.37 > ~/vap-proof.txt 2>&1 || true

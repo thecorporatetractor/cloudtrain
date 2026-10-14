@@ -1,0 +1,299 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: migrate-deprecated-apis
+  title: Migrate manifests off removed API versions
+  domain: kubernetes
+  frameworks: [ckad:observability-maintenance]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [api-deprecation, manifests, ingress, cronjob, hpa, pdb]
+  version: 1
+spec:
+  description: |
+    The fleet team is moving its van telemetry service to the depot platform,
+    which runs Kubernetes v1.37. Their manifests were written years ago and
+    `kubectl apply` now fails on most of them.
+
+    From your workstation, switch to context `qm-depot` first:
+
+    ```bash
+    kubectl config use-context qm-depot
+    ```
+
+    The Deployment and Service `telemetry-api` already run in namespace
+    `fleet-telemetry`. The four manifests in **`~/fleet-manifests/`**
+    (`cronjob.yaml`, `pdb.yaml`, `ingress.yaml`, `hpa.yaml`) still use API
+    versions that v1.37 no longer serves.
+
+    1. Edit the files **in place** so that each one uses an API version the
+       cluster serves, keeping what each object does: same names, schedule,
+       budget, host, path (`/api`, prefix match), backend Service and port,
+       replica bounds and CPU target.
+    2. Apply all four to the cluster so the objects exist in
+       `fleet-telemetry`.
+
+    There is no ingress controller on this cluster; the Ingress object only
+    has to be accepted by the API server.
+  objectives:
+    - Find which API versions a cluster serves
+    - Convert manifests from removed to served API versions
+    - Rewrite fields whose schema changed between versions (Ingress backend)
+  params:
+    host:
+      type: choice
+      values: [telemetry.fleet.quillmoor.example, vans.fleet.quillmoor.example, fleet-api.quillmoor.example]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-depot
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: qm-depot
+  setup:
+    - on: qm-depot
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: fleet-telemetry}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: telemetry-api, namespace: fleet-telemetry}
+        spec:
+          replicas: 2
+          selector: {matchLabels: {app: telemetry-api}}
+          template:
+            metadata: {labels: {app: telemetry-api}}
+            spec:
+              containers:
+                - name: api
+                  image: httpd:2.4-alpine
+                  ports: [{name: http, containerPort: 80}]
+                  resources: {requests: {cpu: 50m, memory: 32Mi}}
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata: {name: telemetry-api, namespace: fleet-telemetry}
+        spec:
+          selector: {app: telemetry-api}
+          ports: [{name: http, port: 80, targetPort: http}]
+    - on: workstation
+      run: install -d -o learner -g learner -m 0755 /home/learner/fleet-manifests
+    - on: workstation
+      file: {path: /home/learner/fleet-manifests/cronjob.yaml, source: assets/cronjob.yaml, mode: "0644"}
+    - on: workstation
+      file: {path: /home/learner/fleet-manifests/pdb.yaml, source: assets/pdb.yaml, mode: "0644"}
+    - on: workstation
+      file: {path: /home/learner/fleet-manifests/ingress.yaml, source: assets/ingress.yaml, mode: "0644"}
+    - on: workstation
+      file: {path: /home/learner/fleet-manifests/hpa.yaml, source: assets/hpa.yaml, mode: "0644"}
+    - on: workstation
+      run: |
+        sed -i 's/HOSTNAME/{{host}}/' /home/learner/fleet-manifests/ingress.yaml
+        chown -R learner:learner /home/learner/fleet-manifests
+  teardown:
+    - on: qm-depot
+      run: kubectl delete namespace fleet-telemetry --ignore-not-found --wait=false
+  checks:
+    - id: context
+      description: Terminal is using context qm-depot
+      type: k8s-context
+      on: workstation
+      skills: [k8s.cli.contexts]
+      weight: 0.5
+      expect: {match: exact, value: qm-depot}
+    - id: files-served-versions
+      description: No file in ~/fleet-manifests uses a removed API version any more
+      type: shell
+      timeoutSec: 30
+      on: workstation
+      skills: [k8s.delivery.api-deprecations]
+      command: |
+        cd /home/learner/fleet-manifests 2>/dev/null || { echo "directory missing"; exit 0; }
+        bad=$(grep -lE '^apiVersion:[[:space:]]*(batch/v1beta1|policy/v1beta1|networking\.k8s\.io/v1beta1|extensions/v1beta1|autoscaling/v2beta[12])[[:space:]]*$' cronjob.yaml pdb.yaml ingress.yaml hpa.yaml 2>&1 | tr '\n' ' ')
+        [ -z "$bad" ] && echo clean || echo "still removed: $bad"
+      expect: {match: exact, value: clean}
+    - id: files-apply
+      description: The four files are accepted by the API server as they are on disk
+      type: shell
+      on: workstation
+      skills: [k8s.cli.manifests]
+      timeoutSec: 30
+      command: |
+        cd /home/learner/fleet-manifests 2>/dev/null || { echo "directory missing"; exit 0; }
+        kubectl --kubeconfig /home/learner/.kube/config --context qm-depot apply --dry-run=server -f cronjob.yaml -f pdb.yaml -f ingress.yaml -f hpa.yaml >/dev/null 2>&1 && echo accepted || echo rejected
+      expect: {match: exact, value: accepted}
+    - id: cronjob
+      description: CronJob odometer-sync exists with its schedule and concurrency policy
+      type: k8s-query
+      skills: [k8s.delivery.api-deprecations]
+      query: {cluster: qm-depot, resource: cronjobs.v1.batch, name: odometer-sync, namespace: fleet-telemetry, jsonpath: "{.spec.schedule}/{.spec.concurrencyPolicy}"}
+      expect: {match: exact, value: "15 1 * * */Forbid"}
+    - id: pdb
+      description: PodDisruptionBudget telemetry-api keeps one telemetry-api Pod available
+      type: k8s-query
+      skills: [k8s.delivery.api-deprecations]
+      query: {cluster: qm-depot, resource: poddisruptionbudgets.v1.policy, name: telemetry-api, namespace: fleet-telemetry, jsonpath: "{.spec.minAvailable}/{.spec.selector.matchLabels.app}"}
+      expect: {match: exact, value: 1/telemetry-api}
+    - id: ingress
+      description: Ingress telemetry routes {{host}}/api (prefix) to telemetry-api port 80
+      type: k8s-query
+      skills: [k8s.delivery.api-deprecations]
+      weight: 2
+      query: {cluster: qm-depot, resource: ingresses.v1.networking.k8s.io, name: telemetry, namespace: fleet-telemetry, jsonpath: "{.spec.rules[0].host} {.spec.rules[0].http.paths[0].path} {.spec.rules[0].http.paths[0].pathType} {.spec.rules[0].http.paths[0].backend.service.name}:{.spec.rules[0].http.paths[0].backend.service.port.number}"}
+      expect: {match: exact, value: "{{host}} /api Prefix telemetry-api:80"}
+    - id: hpa
+      description: HorizontalPodAutoscaler telemetry-api scales telemetry-api 2-5 at 70 % CPU
+      type: k8s-query
+      skills: [k8s.delivery.api-deprecations]
+      query: {cluster: qm-depot, resource: horizontalpodautoscalers.v2.autoscaling, name: telemetry-api, namespace: fleet-telemetry, jsonpath: "{.spec.scaleTargetRef.name} {.spec.minReplicas}-{.spec.maxReplicas} {.spec.metrics[0].resource.name}={.spec.metrics[0].resource.target.averageUtilization}"}
+      expect: {match: exact, value: "telemetry-api 2-5 cpu=70"}
+  hints:
+    - title: Switch context
+      body: The depot platform hosts the fleet services.
+      command: kubectl config use-context qm-depot
+      cost: 0
+    - title: What does the cluster serve
+      body: Look up the served versions for each kind instead of guessing.
+      command: kubectl api-resources | grep -Ei 'cronjob|poddisruption|ingresses|horizontal'
+      cost: 1
+    - title: Same schema, new version
+      body: CronJob, PodDisruptionBudget and this HPA only need a new apiVersion line. The Ingress backend changed shape in networking.k8s.io/v1.
+      command: kubectl explain ingress.spec.rules.http.paths --api-version=networking.k8s.io/v1
+      cost: 2
+    - title: Ingress v1 backend
+      body: "`serviceName`/`servicePort` became `service: {name, port: {number}}`, and every path needs a `pathType`."
+      cost: 2
+  misconceptions:
+    - id: apply-from-stdin-only
+      description: Converts the manifests on the fly and applies them, but leaves the files in the repository broken.
+      feedback: The next person to apply the files hits the same errors. Fix the manifests themselves; they are the source of truth.
+      expectFail: [files-served-versions, files-apply]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 90
+        run: |
+          kubectl config use-context qm-depot
+          cd ~/fleet-manifests
+          for f in cronjob pdb hpa; do
+            sed -e 's#^apiVersion: batch/v1beta1#apiVersion: batch/v1#' -e 's#^apiVersion: policy/v1beta1#apiVersion: policy/v1#' -e 's#^apiVersion: autoscaling/v2beta2#apiVersion: autoscaling/v2#' $f.yaml | kubectl apply -f -
+          done
+          kubectl apply -f - <<'YAML'
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata: {name: telemetry, namespace: fleet-telemetry}
+          spec:
+            rules:
+              - host: {{host}}
+                http:
+                  paths:
+                    - path: /api
+                      pathType: Prefix
+                      backend:
+                        service: {name: telemetry-api, port: {number: 80}}
+          YAML
+    - id: version-line-only
+      description: Changes only the apiVersion of the Ingress; the old serviceName/servicePort fields are rejected by networking.k8s.io/v1.
+      feedback: Some kinds changed schema when they went GA. Check `kubectl explain` for the new version, not only the group/version.
+      expectFail: [ingress, files-apply]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 90
+        run: |
+          kubectl config use-context qm-depot
+          cd ~/fleet-manifests
+          sed -i -e 's#^apiVersion: batch/v1beta1#apiVersion: batch/v1#' -e 's#^apiVersion: policy/v1beta1#apiVersion: policy/v1#' -e 's#^apiVersion: autoscaling/v2beta2#apiVersion: autoscaling/v2#' -e 's#^apiVersion: networking.k8s.io/v1beta1#apiVersion: networking.k8s.io/v1#' *.yaml
+          kubectl apply -f . || true
+    - id: exact-path
+      description: Converts the Ingress with pathType Exact, so only /api itself matches and /api/positions does not.
+      feedback: The old Ingress matched by prefix (implementation-specific). Keep the behaviour with `pathType Prefix`.
+      expectFail: [ingress]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 90
+        run: |
+          kubectl config use-context qm-depot
+          cd ~/fleet-manifests
+          sed -i -e 's#^apiVersion: batch/v1beta1#apiVersion: batch/v1#' -e 's#^apiVersion: policy/v1beta1#apiVersion: policy/v1#' -e 's#^apiVersion: autoscaling/v2beta2#apiVersion: autoscaling/v2#' cronjob.yaml pdb.yaml hpa.yaml
+          cat > ingress.yaml <<'YAML'
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: telemetry
+            namespace: fleet-telemetry
+          spec:
+            rules:
+              - host: {{host}}
+                http:
+                  paths:
+                    - path: /api
+                      pathType: Exact
+                      backend:
+                        service:
+                          name: telemetry-api
+                          port: {number: 80}
+          YAML
+          kubectl apply -f .
+  solution:
+    explanation: |
+      CronJob (batch/v1), PodDisruptionBudget (policy/v1) and HPA
+      (autoscaling/v2) kept their schema, so only `apiVersion` changes. The
+      Ingress moved to networking.k8s.io/v1, where the backend is
+      `service.name` + `service.port.number` and `pathType` is required.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 90
+        run: |
+          kubectl config use-context qm-depot
+          cd ~/fleet-manifests
+          sed -i -e 's#^apiVersion: batch/v1beta1#apiVersion: batch/v1#' cronjob.yaml
+          sed -i -e 's#^apiVersion: policy/v1beta1#apiVersion: policy/v1#' pdb.yaml
+          sed -i -e 's#^apiVersion: autoscaling/v2beta2#apiVersion: autoscaling/v2#' hpa.yaml
+          cat > ingress.yaml <<'YAML'
+          # Van tablets post telemetry to /api on the fleet host name.
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: telemetry
+            namespace: fleet-telemetry
+          spec:
+            rules:
+              - host: {{host}}
+                http:
+                  paths:
+                    - path: /api
+                      pathType: Prefix
+                      backend:
+                        service:
+                          name: telemetry-api
+                          port:
+                            number: 80
+          YAML
+          kubectl apply -f cronjob.yaml -f pdb.yaml -f ingress.yaml -f hpa.yaml
+    alternatives:
+      - id: yq-edit
+        description: Edit the files with yq, converting the Ingress backend structurally, and apply the directory.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 90
+            run: |
+              kubectl config use-context qm-depot
+              cd ~/fleet-manifests
+              yq -i '.apiVersion = "batch/v1"' cronjob.yaml
+              yq -i '.apiVersion = "policy/v1"' pdb.yaml
+              yq -i '.apiVersion = "autoscaling/v2"' hpa.yaml
+              yq -i '.apiVersion = "networking.k8s.io/v1"
+                     | .spec.rules[].http.paths[] |= (.pathType = "Prefix" | .backend = {"service": {"name": .backend.serviceName, "port": {"number": .backend.servicePort}}})' ingress.yaml
+              kubectl apply -f .

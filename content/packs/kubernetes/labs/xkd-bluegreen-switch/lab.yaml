@@ -1,0 +1,178 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xkd-bluegreen-switch
+  title: Switch a Service to the green release
+  domain: kubernetes
+  frameworks: [ckad:deployment]
+  difficulty: easy
+  estimatedMinutes: 6
+  tags: [exam, blue-green, services]
+  version: 1
+spec:
+  description: |
+    **Context:** `qm-dispatch` (`kubectl config use-context qm-dispatch`)
+
+    In namespace `booking-desk`, the Service `booking` serves the Pods of the
+    Deployment `booking-blue` (Pod label `version: blue`). The Deployment
+    `booking-green` (Pod label `version: green`) holds the new release.
+
+    Point the Service **`booking`** at the **green** Pods only. Once green is
+    fully ready and serving, scale **`booking-blue` to 0** replicas (keep the
+    Deployment).
+  objectives:
+    - Switch traffic with a Service selector and retire the old release
+  params:
+    replicas:
+      type: int
+      min: 2
+      max: 3
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-dispatch
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: qm-dispatch
+  setup:
+    - on: qm-dispatch
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: booking-desk}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: booking-blue, namespace: booking-desk}
+        spec:
+          replicas: {{replicas}}
+          selector: {matchLabels: {app: booking, version: blue}}
+          template:
+            metadata: {labels: {app: booking, version: blue}}
+            spec:
+              terminationGracePeriodSeconds: 2
+              containers:
+                - name: web
+                  image: busybox:1.37
+                  command: ["sh", "-c", "mkdir -p /www && echo booking-blue > /www/index.html && exec httpd -f -p 8080 -h /www"]
+                  ports: [{name: http, containerPort: 8080}]
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: booking-green, namespace: booking-desk}
+        spec:
+          replicas: {{replicas}}
+          selector: {matchLabels: {app: booking, version: green}}
+          template:
+            metadata: {labels: {app: booking, version: green}}
+            spec:
+              terminationGracePeriodSeconds: 2
+              containers:
+                - name: web
+                  image: busybox:1.37
+                  command: ["sh", "-c", "mkdir -p /www && echo booking-green > /www/index.html && exec httpd -f -p 8080 -h /www"]
+                  ports: [{name: http, containerPort: 8080}]
+                  readinessProbe:
+                    httpGet: {path: /, port: http}
+                    periodSeconds: 3
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata: {name: booking, namespace: booking-desk}
+        spec:
+          selector: {app: booking, version: blue}
+          ports: [{name: http, port: 80, targetPort: http}]
+    - on: qm-dispatch
+      timeoutSec: 150
+      run: |
+        kubectl -n booking-desk rollout status deploy/booking-blue --timeout=140s
+        kubectl -n booking-desk rollout status deploy/booking-green --timeout=140s
+  teardown:
+    - on: qm-dispatch
+      run: kubectl delete namespace booking-desk --ignore-not-found --wait=false
+  checks:
+    - id: selector
+      description: Service booking selects the green Pods of booking
+      type: k8s-query
+      skills: [k8s.delivery.deployment-strategies]
+      weight: 2
+      query: {cluster: qm-dispatch, resource: service, name: booking, namespace: booking-desk, jsonpath: "{.spec.selector.app}/{.spec.selector.version}"}
+      expect: {match: exact, value: booking/green}
+    - id: endpoints
+      description: Every endpoint of booking is a green Pod ({{replicas}})
+      type: shell
+      timeoutSec: 30
+      on: qm-dispatch
+      skills: [k8s.delivery.deployment-strategies]
+      command: |
+        names=$(kubectl -n booking-desk get endpointslices -l kubernetes.io/service-name=booking -o jsonpath='{range .items[*].endpoints[*]}{.targetRef.name}{"\n"}{end}')
+        g=0; o=0; for p in $names; do case "$p" in booking-green-*) g=$((g+1)) ;; *) o=$((o+1)) ;; esac; done
+        echo "green=$g other=$o"
+      expect: {match: exact, value: "green={{replicas}} other=0"}
+    - id: blue-zero
+      description: booking-blue still exists and is scaled to 0
+      type: k8s-query
+      skills: [k8s.delivery.deployment-strategies]
+      query: {cluster: qm-dispatch, resource: deployment, name: booking-blue, namespace: booking-desk, jsonpath: "replicas={.spec.replicas}"}
+      expect: {match: exact, value: replicas=0}
+    - id: green-intact
+      description: booking-green still runs {{replicas}} ready Pods
+      type: k8s-query
+      skills: [k8s.delivery.deployment-strategies]
+      weight: 0.5
+      query: {cluster: qm-dispatch, resource: deployment, name: booking-green, namespace: booking-desk, jsonpath: "{.status.readyReplicas}/{.spec.replicas}"}
+      expect: {match: exact, value: "{{replicas}}/{{replicas}}"}
+  misconceptions:
+    - id: deleted-blue
+      description: Deletes the blue Deployment instead of scaling it to zero.
+      feedback: Scaled to zero, blue can come back with one command; deleted, it has to be rebuilt.
+      expectFail: [blue-zero]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl -n booking-desk patch svc booking -p '{"spec":{"selector":{"version":"green"}}}'
+          kubectl -n booking-desk delete deploy booking-blue
+    - id: app-only
+      description: Removes version from the selector; with blue at zero it looks right now, but the Service no longer tells the releases apart.
+      feedback: Select the release explicitly (`version=green`) so scaling blue back up does not silently mix traffic.
+      expectFail: [selector]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 90
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl -n booking-desk patch svc booking --type=json -p '[{"op":"remove","path":"/spec/selector/version"}]'
+          kubectl -n booking-desk scale deploy booking-blue --replicas=0
+          sleep 10
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 90
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl -n booking-desk rollout status deploy/booking-green --timeout=60s
+          kubectl -n booking-desk patch service booking -p '{"spec":{"selector":{"app":"booking","version":"green"}}}'
+          kubectl -n booking-desk scale deployment booking-blue --replicas=0
+          sleep 5
+    alternatives:
+      - id: set-selector
+        description: kubectl set selector, then scale.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 90
+            run: |
+              kubectl config use-context qm-dispatch
+              kubectl -n booking-desk set selector service booking 'app=booking,version=green'
+              kubectl -n booking-desk scale deployment/booking-blue --replicas 0
+              sleep 5

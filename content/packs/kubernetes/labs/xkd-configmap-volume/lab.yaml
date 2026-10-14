@@ -1,0 +1,163 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xkd-configmap-volume
+  title: Mount configuration from a ConfigMap
+  domain: kubernetes
+  frameworks: [ckad:environment-config-security]
+  difficulty: easy
+  estimatedMinutes: 5
+  tags: [exam, configmap, volumes]
+  version: 1
+spec:
+  description: |
+    **Context:** `qm-depot` (`kubectl config use-context qm-depot`)
+
+    1. In namespace `tariff-rules`, create a ConfigMap named
+       **`tariff-rules`** from the file **`~/exam/tariff-rules.properties`**,
+       so that the ConfigMap has one key `tariff-rules.properties` holding the
+       whole file.
+    2. Mount it at **`/etc/tariff`** in container `api` of the Deployment
+       **`tariff-api`**, so the file is readable at
+       `/etc/tariff/tariff-rules.properties`. All Pods must be ready.
+  objectives:
+    - Create a ConfigMap from a file and mount it as a volume
+  params:
+    surcharge:
+      type: choice
+      values: ["0.035", "0.042", "0.051"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-depot
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: qm-depot
+  setup:
+    - on: workstation
+      run: install -d -o learner -g learner -m 0755 /home/learner/exam
+    - on: workstation
+      file:
+        path: /home/learner/exam/tariff-rules.properties
+        mode: "0644"
+        content: |
+          # Quillmoor tariff rules
+          fuel.surcharge={{surcharge}}
+          customs.flat=12.50
+          weekend.multiplier=1.2
+    - on: workstation
+      run: chown learner:learner /home/learner/exam/tariff-rules.properties
+    - on: qm-depot
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: tariff-rules}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: tariff-api, namespace: tariff-rules}
+        spec:
+          replicas: 2
+          selector: {matchLabels: {app: tariff-api}}
+          template:
+            metadata: {labels: {app: tariff-api}}
+            spec:
+              terminationGracePeriodSeconds: 2
+              containers:
+                - name: api
+                  image: busybox:1.37
+                  command: ["sleep", "1d"]
+    - on: qm-depot
+      timeoutSec: 120
+      run: kubectl -n tariff-rules rollout status deploy/tariff-api --timeout=110s
+  teardown:
+    - on: qm-depot
+      run: kubectl delete namespace tariff-rules --ignore-not-found --wait=false
+  checks:
+    - id: configmap
+      description: ConfigMap tariff-rules has the key tariff-rules.properties with the file's content
+      type: shell
+      timeoutSec: 30
+      on: qm-depot
+      skills: [k8s.workloads.config]
+      weight: 2
+      command: |
+        kubectl -n tariff-rules get configmap tariff-rules -o json 2>/dev/null \
+          | jq -r '(.data | keys | join(",")) + " " + ((.data["tariff-rules.properties"] // "") | split("\n") | map(select(startswith("fuel.surcharge="))) | join(""))' || echo missing
+      expect: {match: exact, value: "tariff-rules.properties fuel.surcharge={{surcharge}}"}
+    - id: mounted
+      description: A running tariff-api Pod reads /etc/tariff/tariff-rules.properties from the ConfigMap
+      type: shell
+      on: qm-depot
+      skills: [k8s.workloads.config]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        p=$(kubectl -n tariff-rules get pods -l app=tariff-api -o json | jq -r '[.items[] | select(.metadata.deletionTimestamp == null and .status.phase == "Running")][0].metadata.name // empty')
+        [ -n "$p" ] || { echo "no pod"; exit 0; }
+        kubectl -n tariff-rules exec "$p" -c api -- grep '^fuel.surcharge=' /etc/tariff/tariff-rules.properties 2>/dev/null || echo "not readable"
+      expect: {match: exact, value: "fuel.surcharge={{surcharge}}"}
+    - id: rolled-out
+      description: All tariff-api Pods run the new template and are ready
+      type: k8s-query
+      skills: [k8s.workloads.config]
+      weight: 0.5
+      query: {cluster: qm-depot, resource: deployment, name: tariff-api, namespace: tariff-rules, jsonpath: "{.status.updatedReplicas}/{.status.readyReplicas}/{.spec.replicas}"}
+      expect: {match: exact, value: 2/2/2}
+  misconceptions:
+    - id: env-file
+      description: Uses --from-env-file, which turns every line into its own key instead of one file.
+      feedback: "`--from-file` stores the file under its name; `--from-env-file` parses it into separate keys."
+      expectFail: [configmap, mounted]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n tariff-rules create configmap tariff-rules --from-env-file=$HOME/exam/tariff-rules.properties
+          kubectl -n tariff-rules patch deploy tariff-api -p '{"spec":{"template":{"spec":{"volumes":[{"name":"rules","configMap":{"name":"tariff-rules"}}],"containers":[{"name":"api","volumeMounts":[{"name":"rules","mountPath":"/etc/tariff"}]}]}}}}'
+          kubectl -n tariff-rules rollout status deploy/tariff-api --timeout=120s
+    - id: wrong-path
+      description: Mounts the volume at /etc/tariff/tariff-rules.properties, which makes that path a directory.
+      feedback: A ConfigMap volume is a directory with one file per key. Mount the directory at /etc/tariff.
+      expectFail: [mounted]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n tariff-rules create configmap tariff-rules --from-file=$HOME/exam/tariff-rules.properties
+          kubectl -n tariff-rules patch deploy tariff-api -p '{"spec":{"template":{"spec":{"volumes":[{"name":"rules","configMap":{"name":"tariff-rules"}}],"containers":[{"name":"api","volumeMounts":[{"name":"rules","mountPath":"/etc/tariff/tariff-rules.properties"}]}]}}}}'
+          kubectl -n tariff-rules rollout status deploy/tariff-api --timeout=120s
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n tariff-rules create configmap tariff-rules --from-file=$HOME/exam/tariff-rules.properties
+          kubectl -n tariff-rules patch deployment tariff-api -p '{"spec":{"template":{"spec":{"volumes":[{"name":"rules","configMap":{"name":"tariff-rules"}}],"containers":[{"name":"api","volumeMounts":[{"name":"rules","mountPath":"/etc/tariff"}]}]}}}}'
+          kubectl -n tariff-rules rollout status deployment/tariff-api --timeout=120s
+    alternatives:
+      - id: set-volume-yq
+        description: Explicit key name and a yq edit of the Deployment.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 150
+            run: |
+              kubectl config use-context qm-depot
+              kubectl -n tariff-rules create configmap tariff-rules --from-file=tariff-rules.properties=$HOME/exam/tariff-rules.properties
+              kubectl -n tariff-rules get deploy tariff-api -o yaml \
+                | yq '.spec.template.spec.volumes = [{"name": "tariff", "configMap": {"name": "tariff-rules"}}] | .spec.template.spec.containers[0].volumeMounts = [{"name": "tariff", "mountPath": "/etc/tariff", "readOnly": true}]' \
+                | kubectl apply -f -
+              kubectl -n tariff-rules rollout status deployment/tariff-api --timeout=120s

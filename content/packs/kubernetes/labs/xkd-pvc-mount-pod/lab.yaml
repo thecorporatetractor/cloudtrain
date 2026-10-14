@@ -1,0 +1,204 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xkd-pvc-mount-pod
+  title: Persist a Pod's data on a claim
+  domain: kubernetes
+  frameworks: [ckad:design-build]
+  difficulty: easy
+  estimatedMinutes: 6
+  tags: [exam, pvc, volumes]
+  version: 1
+spec:
+  description: |
+    **Context:** `qm-yard` (`kubectl config use-context qm-yard`)
+
+    In namespace `notes-api`, the Pod **`notes-api`** appends a line to
+    `/var/lib/notes/boot.log` every time it starts, but the file lives in the
+    container and is lost whenever the Pod is recreated.
+
+    1. Create a PersistentVolumeClaim **`{{pvc}}`** requesting **500Mi**,
+       access mode **ReadWriteOnce**, in StorageClass **`yard-notes`** (its
+       volumes are pre-provisioned; there is no dynamic provisioner).
+    2. Recreate the Pod `notes-api` (same name, image and command) with the
+       claim mounted at **`/var/lib/notes`**.
+  objectives:
+    - Claim pre-provisioned storage and mount it in a Pod
+  params:
+    pvc:
+      type: choice
+      values: [notes-data, notes-store, notes-pvc]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-yard
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-yard
+          nodes:
+            - {name: yard-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: yard-wk-1, role: worker}
+            - {name: yard-wk-2, role: worker}
+  setup:
+    - on: qm-yard
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: notes-api}
+        ---
+        apiVersion: storage.k8s.io/v1
+        kind: StorageClass
+        metadata: {name: yard-notes}
+        provisioner: kubernetes.io/no-provisioner
+        volumeBindingMode: WaitForFirstConsumer
+        ---
+        apiVersion: v1
+        kind: PersistentVolume
+        metadata: {name: yard-notes-pv-1, labels: {quillmoor.example/pool: yard-notes}}
+        spec:
+          capacity: {storage: 1Gi}
+          accessModes: [ReadWriteOnce]
+          persistentVolumeReclaimPolicy: Delete
+          storageClassName: yard-notes
+          hostPath: {path: /srv/yard-notes/pv-1, type: DirectoryOrCreate}
+          nodeAffinity:
+            required:
+              nodeSelectorTerms:
+                - matchExpressions: [{key: kubernetes.io/hostname, operator: In, values: [yard-wk-1]}]
+        ---
+        apiVersion: v1
+        kind: Pod
+        metadata: {name: notes-api, namespace: notes-api, labels: {app: notes-api}}
+        spec:
+          terminationGracePeriodSeconds: 2
+          containers:
+            - name: api
+              image: busybox:1.37
+              command: ["sh", "-c", "mkdir -p /var/lib/notes && date >> /var/lib/notes/boot.log && exec sleep 1d"]
+    - on: qm-yard
+      timeoutSec: 120
+      run: kubectl -n notes-api wait pod/notes-api --for=condition=Ready --timeout=110s
+  teardown:
+    - on: qm-yard
+      run: |
+        kubectl delete namespace notes-api --ignore-not-found --wait=false
+        kubectl delete pv -l quillmoor.example/pool=yard-notes --ignore-not-found --wait=false
+        kubectl delete storageclass yard-notes --ignore-not-found
+  checks:
+    - id: claim
+      description: PVC {{pvc}} is Bound with 500Mi ReadWriteOnce in class yard-notes
+      type: k8s-query
+      skills: [k8s.storage.claims]
+      weight: 2
+      query: {cluster: qm-yard, resource: pvc, name: "{{pvc}}", namespace: notes-api, jsonpath: "{.status.phase} {.spec.resources.requests.storage} {.spec.accessModes[0]} {.spec.storageClassName}"}
+      expect: {match: exact, value: "Bound 500Mi ReadWriteOnce yard-notes"}
+    - id: mounted
+      description: notes-api mounts {{pvc}} at /var/lib/notes
+      type: shell
+      timeoutSec: 30
+      on: qm-yard
+      skills: [k8s.storage.claims]
+      weight: 2
+      command: |
+        j=$(kubectl -n notes-api get pod notes-api -o json 2>/dev/null) || { echo missing; exit 0; }
+        echo "$j" | jq -r '(.spec.containers[0].volumeMounts // [] | map(select(.mountPath == "/var/lib/notes"))[0].name) as $v
+          | [.spec.volumes[] | select(.name == $v) | .persistentVolumeClaim.claimName][0] // "none"'
+      expect: {match: exact, value: "{{pvc}}"}
+    - id: running
+      description: notes-api runs the original image and command and has written boot.log on the claim
+      type: shell
+      timeoutSec: 30
+      on: qm-yard
+      skills: [k8s.storage.claims]
+      command: |
+        kubectl -n notes-api get pod notes-api -o jsonpath='{.status.phase} {.spec.containers[0].image} ' 2>/dev/null
+        kubectl -n notes-api exec notes-api -- sh -c 'grep -q " /var/lib/notes " /proc/mounts && test -s /var/lib/notes/boot.log && echo persisted' 2>/dev/null || echo "not persisted"
+      expect: {match: exact, value: "Running busybox:1.37 persisted"}
+  misconceptions:
+    - id: emptydir
+      description: Mounts an emptyDir at /var/lib/notes, which is deleted together with the Pod.
+      feedback: emptyDir lives exactly as long as the Pod. Only a PersistentVolumeClaim outlives it.
+      expectFail: [mounted]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-yard
+          kubectl apply -f - <<'YAML'
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata: {name: "{{pvc}}", namespace: notes-api}
+          spec:
+            accessModes: [ReadWriteOnce]
+            storageClassName: yard-notes
+            resources: {requests: {storage: 500Mi}}
+          YAML
+          kubectl -n notes-api get pod notes-api -o yaml | yq '.spec.volumes += [{"name": "notes", "emptyDir": {}}] | .spec.containers[0].volumeMounts += [{"name": "notes", "mountPath": "/var/lib/notes"}]' | kubectl replace --force -f -
+          kubectl -n notes-api wait pod/notes-api --for=condition=Ready --timeout=100s
+    - id: no-class
+      description: Omits the StorageClass; with no default class the claim never binds and the Pod stays Pending.
+      feedback: Pre-provisioned volumes are matched within their StorageClass. Name it in the claim.
+      expectFail: [claim, running]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-yard
+          kubectl apply -f - <<'YAML'
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata: {name: "{{pvc}}", namespace: notes-api}
+          spec:
+            accessModes: [ReadWriteOnce]
+            resources: {requests: {storage: 500Mi}}
+          YAML
+          kubectl -n notes-api get pod notes-api -o yaml | yq '.spec.volumes += [{"name": "notes", "persistentVolumeClaim": {"claimName": "{{pvc}}"}}] | .spec.containers[0].volumeMounts += [{"name": "notes", "mountPath": "/var/lib/notes"}]' | kubectl replace --force -f -
+          sleep 20
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 180
+        run: |
+          kubectl config use-context qm-yard
+          kubectl apply -f - <<'YAML'
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: {{pvc}}
+            namespace: notes-api
+          spec:
+            accessModes: [ReadWriteOnce]
+            storageClassName: yard-notes
+            resources:
+              requests: {storage: 500Mi}
+          YAML
+          kubectl -n notes-api delete pod notes-api --wait=true
+          kubectl apply -f - <<'YAML'
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: notes-api
+            namespace: notes-api
+            labels: {app: notes-api}
+          spec:
+            containers:
+              - name: api
+                image: busybox:1.37
+                command: ["sh", "-c", "mkdir -p /var/lib/notes && date >> /var/lib/notes/boot.log && exec sleep 1d"]
+                volumeMounts:
+                  - {name: notes, mountPath: /var/lib/notes}
+            volumes:
+              - name: notes
+                persistentVolumeClaim: {claimName: {{pvc}}}
+          YAML
+          kubectl -n notes-api wait pod/notes-api --for=condition=Ready --timeout=150s

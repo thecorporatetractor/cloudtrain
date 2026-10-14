@@ -1,0 +1,138 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xkd-service-port-fix
+  title: Fix a Service that targets the wrong port
+  domain: kubernetes
+  frameworks: [ckad:services-networking]
+  difficulty: easy
+  estimatedMinutes: 5
+  tags: [exam, services, troubleshooting]
+  version: 1
+spec:
+  description: |
+    **Context:** `qm-depot` (`kubectl config use-context qm-depot`)
+
+    In namespace `booking-api`, requests from the Pod `probe` to
+    `http://booking/` (port 80) are refused, although the `booking` Pods are
+    running. Fix the **Service `booking`** (do not change the Deployment) so
+    that `probe` receives HTTP 200 from `http://booking/` on port 80.
+  objectives:
+    - Trace a Service to its endpoints and fix a target port
+  params:
+    port:
+      type: choice
+      values: [8080, 8181, 9090]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-depot
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: qm-depot
+  setup:
+    - on: qm-depot
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: booking-api}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: booking, namespace: booking-api}
+        spec:
+          replicas: 2
+          selector: {matchLabels: {app: booking}}
+          template:
+            metadata: {labels: {app: booking}}
+            spec:
+              terminationGracePeriodSeconds: 2
+              containers:
+                - name: web
+                  image: busybox:1.37
+                  command: ["sh", "-c", "mkdir -p /www && echo booking-ok > /www/index.html && exec httpd -f -p {{port}} -h /www"]
+                  ports: [{containerPort: {{port}}}]
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata: {name: booking, namespace: booking-api}
+        spec:
+          selector: {app: booking}
+          ports: [{port: 80, targetPort: 8008}]
+        ---
+        apiVersion: v1
+        kind: Pod
+        metadata: {name: probe, namespace: booking-api}
+        spec:
+          terminationGracePeriodSeconds: 1
+          containers:
+            - {name: probe, image: "busybox:1.37", command: ["sleep", "1d"]}
+    - on: qm-depot
+      timeoutSec: 120
+      run: |
+        kubectl -n booking-api rollout status deploy/booking --timeout=110s
+        kubectl -n booking-api wait pod/probe --for=condition=Ready --timeout=60s
+  teardown:
+    - on: qm-depot
+      run: kubectl delete namespace booking-api --ignore-not-found --wait=false
+  checks:
+    - id: http-200
+      description: probe gets HTTP 200 from http://booking/ on port 80
+      type: shell
+      on: qm-depot
+      skills: [k8s.troubleshooting.networking]
+      weight: 2
+      timeoutSec: 30
+      command: kubectl -n booking-api exec probe -- wget -S -qO /dev/null -T 5 http://booking/ 2>&1 | grep -o 'HTTP/1\.[01] [0-9]*' | head -n1 || echo none
+      expect: {match: exact, value: HTTP/1.1 200}
+    - id: service-port
+      description: Service booking still listens on port 80
+      type: k8s-query
+      skills: [k8s.troubleshooting.networking]
+      query: {cluster: qm-depot, resource: service, name: booking, namespace: booking-api, jsonpath: "{.spec.ports[0].port}"}
+      expect: {match: exact, value: "80"}
+    - id: deployment-unchanged
+      description: The booking Deployment is unchanged
+      type: k8s-query
+      skills: [k8s.troubleshooting.networking]
+      weight: 0.5
+      query: {cluster: qm-depot, resource: deployment, name: booking, namespace: booking-api, jsonpath: "{.metadata.generation}"}
+      expect: {match: exact, value: "1"}
+  misconceptions:
+    - id: fixed-container-port
+      description: Changes the containerPort in the Deployment to 8008; the declaration does not move the process, which still listens on {{port}}.
+      feedback: "`containerPort` is informational. The Service's targetPort must match the port the process actually listens on."
+      expectFail: [http-200, deployment-unchanged]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n booking-api patch deploy booking --type=json -p '[{"op":"replace","path":"/spec/template/spec/containers/0/ports/0/containerPort","value":8008}]'
+          kubectl -n booking-api rollout status deploy/booking --timeout=100s
+    - id: changed-port
+      description: Changes the Service port to {{port}}, so clients on port 80 are still refused.
+      feedback: "`port` is what clients connect to; `targetPort` is where the Pods listen. Fix targetPort."
+      expectFail: [http-200, service-port]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n booking-api patch svc booking --type=json -p '[{"op":"replace","path":"/spec/ports/0/port","value":{{port}}}]'
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n booking-api get endpointslices -l kubernetes.io/service-name=booking
+          kubectl -n booking-api patch service booking --type=json -p '[{"op":"replace","path":"/spec/ports/0/targetPort","value":{{port}}}]'
+          sleep 3

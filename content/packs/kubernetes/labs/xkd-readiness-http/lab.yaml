@@ -1,0 +1,123 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xkd-readiness-http
+  title: Add an HTTP readiness probe
+  domain: kubernetes
+  frameworks: [ckad:observability-maintenance]
+  difficulty: easy
+  estimatedMinutes: 5
+  tags: [exam, probes]
+  version: 1
+spec:
+  description: |
+    **Context:** `qm-dispatch` (`kubectl config use-context qm-dispatch`)
+
+    In namespace `carrier-gateway`, add a **readiness** probe to container
+    `api` of the Deployment **`carrier-api`**: an HTTP GET on path
+    **`/healthz`**, port **8080**, every **5** seconds. All Pods must be
+    ready after the rollout.
+  objectives:
+    - Configure an HTTP readiness probe
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-dispatch
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: qm-dispatch
+  setup:
+    - on: qm-dispatch
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: carrier-gateway}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: carrier-api, namespace: carrier-gateway}
+        spec:
+          replicas: 2
+          selector: {matchLabels: {app: carrier-api}}
+          template:
+            metadata: {labels: {app: carrier-api}}
+            spec:
+              terminationGracePeriodSeconds: 2
+              containers:
+                - name: api
+                  image: busybox:1.37
+                  command: ["sh", "-c", "mkdir -p /www && echo carrier-api > /www/index.html && echo ok > /www/healthz && exec httpd -f -p 8080 -h /www"]
+                  ports: [{name: http, containerPort: 8080}]
+    - on: qm-dispatch
+      timeoutSec: 150
+      run: kubectl -n carrier-gateway rollout status deploy/carrier-api --timeout=140s
+  teardown:
+    - on: qm-dispatch
+      run: kubectl delete namespace carrier-gateway --ignore-not-found --wait=false
+  checks:
+    - id: probe
+      description: carrier-api has an HTTP readiness probe on /healthz:8080 every 5 s
+      type: k8s-query
+      skills: [k8s.workloads.probes]
+      weight: 2
+      query: {cluster: qm-dispatch, resource: deployment, name: carrier-api, namespace: carrier-gateway, jsonpath: '{.spec.template.spec.containers[?(@.name=="api")].readinessProbe.httpGet.path} {.spec.template.spec.containers[?(@.name=="api")].readinessProbe.httpGet.port} {.spec.template.spec.containers[?(@.name=="api")].readinessProbe.periodSeconds}'}
+      expect: {match: regex, value: '^/healthz (8080|http) 5$'}
+    - id: ready
+      description: All carrier-api Pods run the new template and are ready
+      type: k8s-query
+      skills: [k8s.workloads.probes]
+      query: {cluster: qm-dispatch, resource: deployment, name: carrier-api, namespace: carrier-gateway, jsonpath: "{.status.updatedReplicas}/{.status.readyReplicas}/{.spec.replicas}"}
+      expect: {match: exact, value: 2/2/2}
+  misconceptions:
+    - id: liveness-instead
+      description: Adds a liveness probe; it restarts unhealthy containers but never takes them out of the Service.
+      feedback: Readiness decides whether a Pod receives traffic; liveness decides whether it is restarted.
+      expectFail: [probe]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl -n carrier-gateway patch deploy carrier-api -p '{"spec":{"template":{"spec":{"containers":[{"name":"api","livenessProbe":{"httpGet":{"path":"/healthz","port":8080},"periodSeconds":5}}]}}}}'
+          kubectl -n carrier-gateway rollout status deploy/carrier-api --timeout=120s
+    - id: wrong-port
+      description: Probes port 80, where nothing listens, so the new Pods never become ready.
+      feedback: The probe must target the port the container serves on (8080, named http).
+      expectFail: [probe, ready]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 60
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl -n carrier-gateway patch deploy carrier-api -p '{"spec":{"template":{"spec":{"containers":[{"name":"api","readinessProbe":{"httpGet":{"path":"/healthz","port":80},"periodSeconds":5}}]}}}}'
+          sleep 20
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl -n carrier-gateway patch deployment carrier-api -p '{"spec":{"template":{"spec":{"containers":[{"name":"api","readinessProbe":{"httpGet":{"path":"/healthz","port":8080},"periodSeconds":5}}]}}}}'
+          kubectl -n carrier-gateway rollout status deployment/carrier-api --timeout=120s
+    alternatives:
+      - id: named-port
+        description: Edit with yq and reference the named port http.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 150
+            run: |
+              kubectl config use-context qm-dispatch
+              kubectl -n carrier-gateway get deploy carrier-api -o yaml \
+                | yq '.spec.template.spec.containers[0].readinessProbe = {"httpGet": {"path": "/healthz", "port": "http"}, "periodSeconds": 5}' \
+                | kubectl apply -f -
+              kubectl -n carrier-gateway rollout status deployment/carrier-api --timeout=120s
