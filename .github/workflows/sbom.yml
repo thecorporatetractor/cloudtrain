@@ -1,0 +1,103 @@
+# SBOMs (syft; SPDX JSON + CycloneDX JSON). Source tree: every push to main
+# and PR (artifact) and, on main, submitted to the GitHub dependency graph
+# (dependency submission API). Releases: source SBOMs plus one per published
+# image (ghcr.io/<repo>/<image>:<version>, pushed by images.yml from the v* tag)
+# are attached to the release. Image SBOMs per build/push are produced and
+# attested in images.yml. Report-only.
+name: sbom
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  source:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: bash .github/scripts/install-tools.sh syft
+      - name: syft (source tree)
+        run: |
+          syft scan dir:. --source-name cloudtrain --exclude './content/**' --exclude './**/node_modules/**' \
+            -o spdx-json=sbom-source.spdx.json -o cyclonedx-json=sbom-source.cdx.json
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sbom-source
+          path: sbom-source.*.json
+          retention-days: 30
+
+  dependency-submission:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write # dependency submission API
+    steps:
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          path: .
+          syft-version: v1.54.1
+          format: spdx-json
+          dependency-snapshot: true
+          upload-artifact: false
+          upload-release-assets: false
+
+  release:
+    if: github.event_name == 'release'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write # upload release assets
+      packages: read # pull the published images
+    steps:
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: bash .github/scripts/install-tools.sh syft
+      - name: SBOMs (source + published images) attached to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SYFT_REGISTRY_AUTH_AUTHORITY: ghcr.io
+          SYFT_REGISTRY_AUTH_USERNAME: ${{ github.actor }}
+          SYFT_REGISTRY_AUTH_PASSWORD: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          version=${TAG#v}
+          syft scan dir:. --source-name cloudtrain --source-version "$version" \
+            --exclude './content/**' --exclude './**/node_modules/**' \
+            -o "spdx-json=cloudtrain-$version-source.spdx.json" -o "cyclonedx-json=cloudtrain-$version-source.cdx.json"
+          for name in lab-orchestrator jumphost frr nettools netsvc linux-pod-deb linux-pod-el; do
+            ref="ghcr.io/${REPO,,}/$name:$version"
+            syft scan "registry:$ref" --source-name "$name" --source-version "$version" \
+              -o "spdx-json=cloudtrain-$version-$name.spdx.json" -o "cyclonedx-json=cloudtrain-$version-$name.cdx.json" \
+              || echo "::warning::no image $ref (images.yml publishes it from the v* tag)"
+          done
+          gh release upload "$TAG" cloudtrain-"$version"-*.json --clobber --repo "$REPO"
