@@ -1,0 +1,77 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xks-sbom-spdx
+  title: Generate an SBOM for an image
+  domain: kubernetes
+  frameworks: [cks:supply-chain-security]
+  difficulty: easy
+  estimatedMinutes: 5
+  tags: [exam, sbom, spdx]
+  version: 1
+spec:
+  description: |
+    Context: node `dispatch-cp-1` (`ssh dispatch-cp-1`, `sudo` works), which
+    has Trivy installed and the image
+    `registry.quillmoor.example/dispatch/api:{{tag}}` pulled.
+
+    Generate an **SPDX JSON** SBOM for that image and save it at
+    `/opt/exam/sbom/dispatch-api.spdx.json` on the node.
+  objectives:
+    - Produce an SPDX SBOM with Trivy
+  params:
+    tag:
+      type: choice
+      values: ["4.1", "4.2", "5.0"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      # Needs Trivy on the node (kubeadm:1.37-sec).
+      - name: qm-dispatch
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        access: [ssh]
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-dispatch
+          nodes:
+            - {name: dispatch-cp-1, role: control-plane, taints: []}
+  setup:
+    - on: qm-dispatch/dispatch-cp-1
+      run: |
+        set -e
+        command -v trivy >/dev/null || { echo "prerequisite missing: Trivy is not installed on the node image (needs kubeadm:1.37-sec)" >&2; exit 1; }
+        ctr -n k8s.io images tag --force docker.io/library/redis:7.4-alpine registry.quillmoor.example/dispatch/api:{{tag}} >/dev/null
+        mkdir -p /opt/exam/sbom
+  checks:
+    - id: spdx-file
+      description: The file is an SPDX JSON SBOM of dispatch/api:{{tag}} with its packages
+      type: shell
+      on: qm-dispatch/dispatch-cp-1
+      skills: [k8s.security.sbom]
+      weight: 2
+      command: |
+        jq -r '"\(.spdxVersion | startswith("SPDX-2"))|\(.name | contains("dispatch/api:{{tag}}"))|\([.packages[]?] | length > 5)"' /opt/exam/sbom/dispatch-api.spdx.json 2>/dev/null || echo invalid
+      expect: {match: exact, value: "true|true|true"}
+  misconceptions:
+    - id: table-output
+      description: Saves the default vulnerability table instead of an SBOM.
+      feedback: Use --format spdx-json; the table is a vulnerability report, not an SBOM.
+      expectFail: [spdx-file]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: ssh dispatch-cp-1 'sudo trivy image --image-src containerd -o /opt/exam/sbom/dispatch-api.spdx.json registry.quillmoor.example/dispatch/api:{{tag}}'
+  solution:
+    explanation: trivy image --format spdx-json -o <file> <image>.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 300
+        run: ssh dispatch-cp-1 'sudo trivy image --image-src containerd --format spdx-json -o /opt/exam/sbom/dispatch-api.spdx.json registry.quillmoor.example/dispatch/api:{{tag}}'

@@ -1,0 +1,118 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: sbom-dispatch-image
+  title: Generate an SBOM and find a vulnerable library
+  domain: kubernetes
+  frameworks: [cks:supply-chain-security]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [sbom, spdx, trivy, supply-chain]
+  version: 1
+spec:
+  description: |
+    An OpenSSL advisory landed at Quillmoor Logistics. The harbour dispatch
+    router image `registry.quillmoor.example/dispatch/router:3.2` is already
+    pulled on node `dispatch-cp-1` (`ssh dispatch-cp-1`, `sudo` works), and
+    **Trivy** with an offline vulnerability database is installed there.
+
+    1. Generate an **SPDX JSON** SBOM for that image and save it as
+       `/root/sbom/dispatch-router.spdx.json` on the node.
+    2. Using the SBOM, find the package that ships OpenSSL's **libcrypto**
+       library and write its package name and version, separated by one
+       space (for example `libfoo 1.2.3-r0`), to `/root/sbom/report.txt`.
+  objectives:
+    - Generate an SPDX SBOM for a container image
+    - Query an SBOM with jq
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      # Needs Trivy with an offline DB on the node (kubeadm:1.37-sec).
+      - name: qm-dispatch
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        access: [ssh]
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-dispatch
+          nodes:
+            - {name: dispatch-cp-1, role: control-plane, taints: []}
+  setup:
+    - on: qm-dispatch/dispatch-cp-1
+      timeoutSec: 180
+      run: |
+        set -e
+        command -v trivy >/dev/null || { echo "prerequisite missing: Trivy is not installed on the node image (needs kubeadm:1.37-sec)" >&2; exit 1; }
+        ctr -n k8s.io images tag --force docker.io/library/httpd:2.4-alpine registry.quillmoor.example/dispatch/router:3.2 >/dev/null
+        mkdir -p /root/sbom /var/lib/cloudtrain && chmod 0700 /var/lib/cloudtrain
+        ctr -n k8s.io run --rm registry.quillmoor.example/dispatch/router:3.2 qm-sbom-ref \
+          sh -c "apk info -W /usr/lib/libcrypto.so.3 2>/dev/null | awk '{print \$NF}'; apk info -v 2>/dev/null | grep '^libcrypto'" > /var/lib/cloudtrain/sbom-ref.txt
+        test -s /var/lib/cloudtrain/sbom-ref.txt
+  checks:
+    - id: sbom-spdx
+      description: /root/sbom/dispatch-router.spdx.json is an SPDX JSON document for the dispatch image
+      type: shell
+      on: qm-dispatch/dispatch-cp-1
+      skills: [k8s.security.sbom]
+      weight: 2
+      command: |
+        f=/root/sbom/dispatch-router.spdx.json
+        jq -r '"\(.spdxVersion | startswith("SPDX-2"))|\(.name | test("dispatch/router"))|\([.packages[]?] | length > 5)"' $f 2>/dev/null || echo invalid
+      expect: {match: exact, value: "true|true|true"}
+    - id: sbom-has-libcrypto
+      description: The SBOM lists the libcrypto package
+      type: shell
+      on: qm-dispatch/dispatch-cp-1
+      skills: [k8s.security.sbom]
+      command: jq -r '[.packages[]?.name | select(startswith("libcrypto"))] | length > 0' /root/sbom/dispatch-router.spdx.json 2>/dev/null || echo false
+      expect: {match: exact, value: "true"}
+    - id: report
+      description: report.txt names the package and version that provide libcrypto
+      type: shell
+      on: qm-dispatch/dispatch-cp-1
+      skills: [k8s.security.sbom]
+      weight: 3
+      command: |
+        want=$(grep '^libcrypto' /var/lib/cloudtrain/sbom-ref.txt | head -n1 | sed -E 's/^(libcrypto[0-9.]*)-(.*)$/\1 \2/')
+        got=$(head -n1 /root/sbom/report.txt 2>/dev/null | tr -s ' \t' ' ' | sed 's/ $//')
+        [ -n "$want" ] && [ "$got" = "$want" ] && echo correct || echo "got '$got'"
+      expect: {match: exact, value: correct}
+  hints:
+    - title: SBOM formats in Trivy
+      command: ssh dispatch-cp-1 'sudo trivy image --help | grep -A3 -- --format'
+      body: Trivy writes SPDX JSON with --format spdx-json and can read images from containerd with --image-src containerd.
+      cost: 1
+    - title: Query the SBOM
+      command: ssh dispatch-cp-1 "sudo jq -r '.packages[] | \"\(.name) \(.versionInfo)\"' /root/sbom/dispatch-router.spdx.json | grep -i crypto"
+      body: Every SPDX package has name and versionInfo.
+      cost: 2
+  misconceptions:
+    - id: cyclonedx
+      description: Writes a CycloneDX SBOM instead of SPDX.
+      feedback: The task asks for SPDX JSON (--format spdx-json).
+      expectFail: [sbom-spdx]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          ssh dispatch-cp-1 'sudo bash -s' <<'EOS'
+          trivy image --image-src containerd --format cyclonedx -o /root/sbom/dispatch-router.spdx.json registry.quillmoor.example/dispatch/router:3.2
+          EOS
+  solution:
+    explanation: trivy image --format spdx-json produces the SBOM; jq over .packages finds libcrypto's package name and versionInfo.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          ssh dispatch-cp-1 'sudo bash -s' <<'EOS'
+          trivy image --image-src containerd --format spdx-json -o /root/sbom/dispatch-router.spdx.json registry.quillmoor.example/dispatch/router:3.2
+          jq -r '.packages[] | select(.name | startswith("libcrypto")) | "\(.name) \(.versionInfo)"' /root/sbom/dispatch-router.spdx.json | head -n1 > /root/sbom/report.txt
+          cat /root/sbom/report.txt
+          EOS

@@ -1,0 +1,151 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xks-scan-pick-image
+  title: Remove workloads using images with critical CVEs
+  domain: kubernetes
+  frameworks: [cks:supply-chain-security]
+  difficulty: medium
+  estimatedMinutes: 8
+  tags: [exam, trivy, image-scanning]
+  version: 1
+spec:
+  description: |
+    Context: `qm-dispatch` (`kubectl config use-context qm-dispatch`). Node
+    `dispatch-cp-1` has Trivy with an offline database (`ssh dispatch-cp-1`,
+    `sudo` works) and all images used in the cluster.
+
+    Scan the images of the four Deployments in namespace `intake`. Scale
+    every Deployment whose image has at least one **CRITICAL**
+    vulnerability to **0** replicas. Leave the others unchanged.
+  objectives:
+    - Scan images and act on the severity of findings
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      # Needs Trivy with an offline DB on the node (kubeadm:1.37-sec).
+      - name: qm-dispatch
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        access: [ssh]
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-dispatch
+          nodes:
+            - {name: dispatch-cp-1, role: control-plane, taints: []}
+  setup:
+    - on: qm-dispatch
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: intake}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: intake-cache, namespace: intake}
+        spec:
+          replicas: 1
+          selector: {matchLabels: {app: intake-cache}}
+          template:
+            metadata: {labels: {app: intake-cache}}
+            spec:
+              containers: [{name: c, image: "redis:7.4-alpine"}]
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: intake-web, namespace: intake}
+        spec:
+          replicas: 1
+          selector: {matchLabels: {app: intake-web}}
+          template:
+            metadata: {labels: {app: intake-web}}
+            spec:
+              containers: [{name: c, image: "httpd:2.4"}]
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: intake-proxy, namespace: intake}
+        spec:
+          replicas: 1
+          selector: {matchLabels: {app: intake-proxy}}
+          template:
+            metadata: {labels: {app: intake-proxy}}
+            spec:
+              containers: [{name: c, image: "caddy:2-alpine"}]
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: intake-tools, namespace: intake}
+        spec:
+          replicas: 1
+          selector: {matchLabels: {app: intake-tools}}
+          template:
+            metadata: {labels: {app: intake-tools}}
+            spec:
+              containers: [{name: c, image: "busybox:1.37", command: ["sleep", "1d"]}]
+    # Ground truth from the same offline database the learner uses (root-only).
+    - on: qm-dispatch/dispatch-cp-1
+      timeoutSec: 600
+      run: |
+        set -e
+        command -v trivy >/dev/null || { echo "prerequisite missing: Trivy is not installed on the node image (needs kubeadm:1.37-sec)" >&2; exit 1; }
+        install -d -m 0700 /var/lib/cloudtrain
+        : > /var/lib/cloudtrain/critical.txt
+        for d in intake-cache:redis:7.4-alpine intake-web:httpd:2.4 intake-proxy:caddy:2-alpine intake-tools:busybox:1.37; do
+          name=${d%%:*}; img=docker.io/library/${d#*:}
+          n=$(trivy image --image-src containerd --offline-scan --skip-db-update --severity CRITICAL --format json "$img" 2>/dev/null | jq '[.Results[]?.Vulnerabilities[]?] | length')
+          [ "$n" -gt 0 ] && echo "$name" >> /var/lib/cloudtrain/critical.txt
+        done
+        c=$(wc -l < /var/lib/cloudtrain/critical.txt)
+        [ "$c" -ge 1 ] && [ "$c" -le 3 ] || { echo "offline DB gives $c of 4 images with CRITICAL findings; the task needs a mix" >&2; exit 1; }
+  teardown:
+    - on: qm-dispatch
+      run: kubectl delete namespace intake --ignore-not-found --wait=false
+  checks:
+    - id: replicas
+      description: Exactly the Deployments with CRITICAL findings are scaled to 0; the rest keep 1 replica
+      type: shell
+      on: qm-dispatch/dispatch-cp-1
+      skills: [k8s.security.supply-chain]
+      weight: 3
+      command: |
+        export KUBECONFIG=/etc/kubernetes/admin.conf
+        bad=0
+        for d in intake-cache intake-web intake-proxy intake-tools; do
+          want=1; grep -qx "$d" /var/lib/cloudtrain/critical.txt && want=0
+          [ "$(kubectl -n intake get deploy $d -o jsonpath='{.spec.replicas}' 2>/dev/null)" = "$want" ] || bad=$((bad+1))
+        done
+        echo "wrong=$bad"
+      expect: {match: exact, value: wrong=0}
+  misconceptions:
+    - id: high-too
+      description: Also scales Deployments with HIGH (not CRITICAL) findings.
+      feedback: The task is limited to CRITICAL; filter with --severity CRITICAL.
+      expectFail: [replicas]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 600
+        run: |
+          kubectl config use-context qm-dispatch
+          for d in intake-cache intake-web intake-proxy intake-tools; do kubectl -n intake scale deploy $d --replicas=0; done
+  solution:
+    explanation: Scan each image with --severity CRITICAL and scale the Deployments whose scan returns findings.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 600
+        run: |
+          kubectl config use-context qm-dispatch
+          for d in $(kubectl -n intake get deploy -o jsonpath='{range .items[*]}{.metadata.name}={.spec.template.spec.containers[0].image}{"\n"}{end}'); do
+            name=${d%%=*}; img=${d#*=}
+            case "$img" in */*) ;; *) img=docker.io/library/$img ;; esac
+            n=$(ssh dispatch-cp-1 "sudo trivy image --image-src containerd --offline-scan --skip-db-update --severity CRITICAL --format json $img 2>/dev/null" | jq '[.Results[]?.Vulnerabilities[]?] | length')
+            echo "$name $img critical=$n"
+            [ "$n" -gt 0 ] && kubectl -n intake scale deploy "$name" --replicas=0
+          done

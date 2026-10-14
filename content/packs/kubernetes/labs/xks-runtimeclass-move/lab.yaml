@@ -1,0 +1,124 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xks-runtimeclass-move
+  title: Move a workload to a sandboxed runtime
+  domain: kubernetes
+  frameworks: [cks:microservice-vulnerabilities]
+  difficulty: medium
+  estimatedMinutes: 7
+  tags: [exam, runtimeclass, gvisor]
+  version: 1
+spec:
+  description: |
+    Context: `qm-customs` (`kubectl config use-context qm-customs`). The
+    nodes have gVisor installed; containerd's handler is called `runsc`.
+
+    1. Create a RuntimeClass named `sandboxed` for the handler `runsc`.
+    2. Make the Deployment `pdf-convert` in namespace `customs-print` run its
+       Pods with that RuntimeClass. All replicas must be Running.
+  objectives:
+    - Create a RuntimeClass and use it from a Deployment
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      # Needs gVisor (runsc) and its containerd handler on the nodes (kubeadm:1.37-sec).
+      - name: qm-customs
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-customs
+          nodes:
+            - {name: customs-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: customs-wk-1, role: worker}
+  setup:
+    - on: qm-customs/customs-wk-1
+      run: |
+        command -v runsc >/dev/null || { echo "prerequisite missing: gVisor (runsc) is not installed on the node image (needs kubeadm:1.37-sec)" >&2; exit 1; }
+    - on: qm-customs
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: customs-print}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: pdf-convert, namespace: customs-print}
+        spec:
+          replicas: 2
+          selector: {matchLabels: {app: pdf-convert}}
+          template:
+            metadata: {labels: {app: pdf-convert}}
+            spec:
+              containers:
+                - {name: convert, image: busybox:1.37, command: ["sh", "-c", "while true; do sleep 30; done"]}
+  teardown:
+    - on: qm-customs
+      run: |
+        kubectl delete namespace customs-print --ignore-not-found --wait=false
+        kubectl delete runtimeclass sandboxed --ignore-not-found
+  checks:
+    - id: runtimeclass
+      description: RuntimeClass sandboxed uses handler runsc
+      type: k8s-query
+      skills: [k8s.security.sandboxing]
+      query: {cluster: qm-customs, resource: runtimeclass, name: sandboxed, jsonpath: "{.handler}"}
+      expect: {match: exact, value: runsc}
+    - id: deployment-sandboxed
+      description: pdf-convert uses sandboxed and all replicas are available
+      type: shell
+      on: qm-customs
+      skills: [k8s.security.sandboxing]
+      weight: 2
+      timeoutSec: 90
+      command: |
+        kubectl -n customs-print rollout status deploy/pdf-convert --timeout=60s >/dev/null 2>&1
+        kubectl -n customs-print get deploy pdf-convert -o jsonpath='{.spec.template.spec.runtimeClassName}/{.status.updatedReplicas}/{.status.availableReplicas}'
+      expect: {match: exact, value: sandboxed/2/2}
+    - id: gvisor-kernel
+      description: A pdf-convert Pod runs under gVisor
+      type: shell
+      on: qm-customs
+      skills: [k8s.security.sandboxing]
+      timeoutSec: 30
+      command: kubectl -n customs-print exec deploy/pdf-convert -- dmesg 2>/dev/null | grep -qi gvisor && echo gvisor || echo "host kernel"
+      expect: {match: exact, value: gvisor}
+  misconceptions:
+    - id: annotation-instead
+      description: Puts the RuntimeClass name in an annotation instead of runtimeClassName.
+      feedback: Only spec.runtimeClassName selects the runtime.
+      expectFail: [deployment-sandboxed, gvisor-kernel]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-customs
+          kubectl apply -f - <<'YAML'
+          apiVersion: node.k8s.io/v1
+          kind: RuntimeClass
+          metadata: {name: sandboxed}
+          handler: runsc
+          YAML
+          kubectl -n customs-print patch deploy pdf-convert -p '{"spec":{"template":{"metadata":{"annotations":{"runtimeclass":"sandboxed"}}}}}'
+          kubectl -n customs-print rollout status deploy/pdf-convert --timeout=120s
+  solution:
+    explanation: Create the RuntimeClass and set spec.template.spec.runtimeClassName.
+    steps:
+      - on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-customs
+          kubectl apply -f - <<'YAML'
+          apiVersion: node.k8s.io/v1
+          kind: RuntimeClass
+          metadata: {name: sandboxed}
+          handler: runsc
+          YAML
+          kubectl -n customs-print patch deploy pdf-convert -p '{"spec":{"template":{"spec":{"runtimeClassName":"sandboxed"}}}}'
+          kubectl -n customs-print rollout status deploy/pdf-convert --timeout=120s

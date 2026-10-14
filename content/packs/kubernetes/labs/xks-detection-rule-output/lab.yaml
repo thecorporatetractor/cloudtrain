@@ -1,0 +1,127 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xks-detection-rule-output
+  title: Adjust a detection rule's output
+  domain: kubernetes
+  frameworks: [cks:monitoring-runtime-security]
+  difficulty: medium
+  estimatedMinutes: 8
+  tags: [exam, falco, runtime-detection]
+  version: 1
+spec:
+  description: |
+    Context: `qm-fleet`. Node `fleet-wk-1` is reachable with `ssh fleet-wk-1`
+    (`sudo` works). Falco runs there as a systemd service.
+
+    The rule **`Fleet secret file read`** in
+    `/etc/falco/rules.d/qm-fleet.yaml` alerts when a container reads
+    `/etc/shadow`, but its output lacks context.
+
+    1. Change the rule's output so that every alert also contains the
+       **container name** and the **user name** (Falco fields
+       `container.name` and `user.name`), and make Falco use the new rule.
+    2. Copy one complete alert line produced by the changed rule to
+       `~/exam/fleet-alert.txt` on your workstation.
+  objectives:
+    - Change a Falco rule's output fields and reload it
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      # Needs Falco on the nodes (kubeadm:1.37-sec).
+      - name: qm-fleet
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        access: [ssh]
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-fleet
+          nodes:
+            - {name: fleet-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: fleet-wk-1, role: worker}
+  setup:
+    - on: qm-fleet/fleet-wk-1
+      timeoutSec: 120
+      run: |
+        command -v falco >/dev/null || { echo "prerequisite missing: Falco is not installed on the node image (needs kubeadm:1.37-sec)" >&2; exit 1; }
+        mkdir -p /etc/falco/rules.d
+        cat > /etc/falco/rules.d/qm-fleet.yaml <<'EOF'
+        - rule: Fleet secret file read
+          desc: A container in the fleet namespaces read /etc/shadow
+          condition: open_read and container and fd.name = /etc/shadow and k8s.ns.name startswith "fleet-"
+          output: "Fleet secret file read (file=%fd.name pod=%k8s.pod.name)"
+          priority: WARNING
+        EOF
+        systemctl restart $(systemctl list-units --type=service 'falco*' --no-legend | awk '{print $1}' | head -n1)
+    - on: qm-fleet
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: fleet-tacho}
+        ---
+        apiVersion: v1
+        kind: Pod
+        metadata: {name: tacho-collector, namespace: fleet-tacho}
+        spec:
+          nodeName: fleet-wk-1
+          containers:
+            - name: collector
+              image: busybox:1.37
+              command: ["sh", "-c", "while true; do cat /etc/shadow >/dev/null; sleep 10; done"]
+    - on: workstation
+      run: mkdir -p /home/learner/exam && chown learner:learner /home/learner/exam
+  teardown:
+    - on: qm-fleet
+      run: kubectl delete namespace fleet-tacho --ignore-not-found --wait=false
+  checks:
+    - id: rule-output-fields
+      description: The loaded rule's output contains %container.name and %user.name
+      type: shell
+      on: qm-fleet/fleet-wk-1
+      skills: [k8s.security.runtime-detection]
+      weight: 2
+      timeoutSec: 60
+      command: |
+        out=$(journalctl -u 'falco*' --since '-1min' --no-pager -o cat 2>/dev/null | grep 'Fleet secret file read' | tail -n1)
+        case "$out" in *collector*root*|*root*collector*) echo enriched ;; "") echo "no recent alert" ;; *) echo "missing fields" ;; esac
+      expect: {match: exact, value: enriched}
+    - id: alert-saved
+      description: ~/exam/fleet-alert.txt holds an alert line with the container and user names
+      type: shell
+      on: workstation
+      skills: [k8s.security.runtime-detection]
+      weight: 2
+      command: |
+        l=$(grep -m1 'Fleet secret file read' /home/learner/exam/fleet-alert.txt 2>/dev/null)
+        case "$l" in *collector*root*|*root*collector*) echo ok ;; "") echo missing ;; *) echo "incomplete" ;; esac
+      expect: {match: exact, value: ok}
+  misconceptions:
+    - id: not-reloaded
+      description: Edits the rule but does not restart Falco; saves an old alert.
+      feedback: Falco reads rules at start; restart it, then copy a new alert.
+      expectFail: [rule-output-fields, alert-saved]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          ssh fleet-wk-1 'sudo sed -i "s/(file=%fd.name pod=%k8s.pod.name)/(file=%fd.name pod=%k8s.pod.name container=%container.name user=%user.name)/" /etc/falco/rules.d/qm-fleet.yaml'
+          ssh fleet-wk-1 'sudo journalctl -u "falco*" --no-pager -o cat | grep "Fleet secret file read" | tail -n1' > ~/exam/fleet-alert.txt
+  solution:
+    explanation: Add container=%container.name and user=%user.name to the output, restart Falco, wait for the next alert and save it.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 180
+        run: |
+          ssh fleet-wk-1 'sudo bash -s' <<'EOS'
+          sed -i "s/(file=%fd.name pod=%k8s.pod.name)/(file=%fd.name pod=%k8s.pod.name container=%container.name user=%user.name)/" /etc/falco/rules.d/qm-fleet.yaml
+          systemctl restart $(systemctl list-units --type=service 'falco*' --no-legend | awk '{print $1}' | head -n1)
+          sleep 30
+          EOS
+          ssh fleet-wk-1 'sudo journalctl -u "falco*" --since -20s --no-pager -o cat | grep "Fleet secret file read" | tail -n1' > ~/exam/fleet-alert.txt
+          cat ~/exam/fleet-alert.txt
