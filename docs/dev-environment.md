@@ -22,7 +22,7 @@ containerd image store, nested virtualization on (`/dev/kvm` present).
 Every version is pinned in **`deploy/versions.env`**, which is the only place versions are
 set. Pinning goes below the tag where that is possible: the kind node image, the Multus
 image, the KVM probe disk and every image baked into the golden image are pinned by
-digest (golden image list: `tools/images/images.lock`); the KubeVirt, CDI and Flannel
+digest (VM image contents: `tools/images/lock/*.lock`); the KubeVirt, CDI and Calico
 manifests are checked against sha256 sums; Multus is vendored (`deploy/multus/`, see
 "Known gaps" 4); the golden image's apt packages are exact versions, Ubuntu packages come
 from a fixed `snapshot.ubuntu.com` point in time, and the Docker and pkgs.k8s.io repo keys
@@ -39,7 +39,7 @@ must match pinned fingerprints:
 | Lab Kubernetes (inside VMs) | v1.37.1 from `pkgs.k8s.io/core:/stable:/v1.37` | current minor |
 | Lab node runtime | containerd.io `2.4.1-2~ubuntu.24.04~noble`, cri-tools `1.37.0-1.1`, kubernetes-cni `1.9.1-1.1` | installed as `pkg=version` and held |
 | Ubuntu cloud image | noble `release-20260926`, sha256 pinned | apt archive snapshot `20261010T000000Z` |
-| Flannel (lab CNI inside VMs) | v0.28.10 | |
+| Calico (lab CNI inside VMs) | v3.33.0 (`calico-vxlan.yaml`, VXLAN Always, pool 10.244.0.0/16) | replaced Flannel, which does not enforce NetworkPolicy |
 | go-task | v3.54.0 | |
 
 ## Commands
@@ -49,7 +49,10 @@ task tools          # install pinned CLIs into ~/.local/bin (idempotent)
 task dev:up         # create or converge kind 'cloudtrain-dev' + Kube-OVN + Multus + KubeVirt + CDI, then prove KVM
 task dev:status     # nodes, KVM devices, add-on versions, unhealthy pods, lab namespaces, node memory
 task dev:verify-kvm # boot a throwaway VMI and check libvirt <domain type='kvm'>
-task image:build    # golden kubeadm node image -> containerDisk cloudtrain/kubeadm-node:v1.37.1
+task image:build:all   # every lab image, one at a time (see "Lab images" below)
+task image:build       # = image:build:kubeadm-node -> containerDisk cloudtrain/kubeadm-node:v1.37.1
+task image:load        # load built images + workload images into kind (IMAGES="..." for a subset)
+task image:test        # boot-test the VM images offline on the dev cluster (IMAGES="..." for a subset)
 task lab:demo       # end-to-end lab proof; the lab is deleted afterwards (KEEP=1 keeps it)
 task lab:clean      # delete leftover demo labs (namespace + VPC + subnets)
 task dev:down       # delete ONLY the cloudtrain-dev kind cluster
@@ -112,7 +115,7 @@ what blocks them.
    with a pinned `caCertHashes`) and a bootstrap token. All of them go into Secrets.
 2. Two `VirtualMachine`s boot from `cloudtrain/kubeadm-node:v1.37.1`. Each gets a fixed IP
    through `ovn.kubernetes.io/ip_address`, so every lab uses the same private IPs.
-   cloud-init runs `kubeadm init` and applies Flannel on `ctl-1`. On `wrk-1` it waits for
+   cloud-init runs `kubeadm init` and applies Calico on `ctl-1`. On `wrk-1` it waits for
    `:6443` and then runs `kubeadm join`. The VMs have no internet: every image comes from
    the golden image.
 3. The learner kubeconfig on the workstation is built from `admin.conf` (fetched over
@@ -147,7 +150,7 @@ The two contexts report different server versions (v1.37.1 and v1.36.0), which s
 that `use-context` switches between two real clusters; the script now fails if they do
 not. The kept lab was also checked by
 hand: CoreDNS Running with 0 restarts, and a pod pinned to `wrk-1` ran with pod IP
-`10.244.1.2`, so the Flannel overlay works across the VMs.
+`10.244.1.2`, so the overlay works across the VMs (that run used Flannel; Calico replaced it).
 
 ## Measured timings and memory
 
@@ -190,7 +193,7 @@ Other measurements:
 | `dev:up` from nothing | 401 s (cold image pulls; KubeVirt 173 s, CDI 49 s) |
 | `dev:up` re-run after node restart with IP drift | 144 s (forced IP change), 135 s (`docker stop` of both nodes) |
 | `dev:up` re-run on a converged cluster | about 20 s, no changes |
-| `image:build` (base image cached) | 304 s (virt-customize 116 s, sparsify, containerDisk build); 3072 s when the builder image is rebuilt, because `snapshot.ubuntu.com` served about 370 KB/s here (builder 40 min, virt-customize 457 s) |
+| `image:build:*` under TCG (default since the WSL crashes) | etcd-host 540–555 s, kubeadm-node 1450 s, kubeadm-upgrade about 2150 s through sparsify (most of it apt from `snapshot.ubuntu.com` and image pulls through the appliance's user-mode network). Earlier KVM numbers: 304 s for the kubeadm node image with a cached builder, 3072 s when the builder image was rebuilt |
 | KVM probe VMI (cirros) to Ready | 13–16 s |
 | `kind load` of the golden image (2.26 GB containerDisk) | about 65 s per node; the demo skips nodes that already have it |
 | Platform idle footprint (both kind nodes) | about 3.1 GB |
@@ -199,34 +202,205 @@ The VMs go from apply to Running in about 13 s, but most of the remaining ~100 s
 Ubuntu boot, cloud-init and `kubeadm init`. The next speed-up is VM snapshots or
 warm pools, not faster scheduling.
 
-## Golden image pipeline (`tools/images/`)
+## Lab images (`tools/images/`)
+
+Every image a lab references is listed in `deploy/images/catalog.yaml` (the contract the
+runtime reads). Versions come from `deploy/versions.env`, digests from
+`tools/images/lock/*.lock`, and every build refuses to run when the catalog entry and the
+pins disagree.
+
+| Catalog ref | Image | Contents | Build |
+|---|---|---|---|
+| `kubeadm:1.37` | `cloudtrain/kubeadm-node:v1.37.1` (containerDisk) | kubeadm/kubelet/kubectl 1.37.1 held, containerd, control-plane + Calico + workload images, curl | `task image:build:kubeadm-node` |
+| `kubeadm:1.36` | `cloudtrain/kubeadm-node:v1.36-upgrade` (containerDisk) | v1.36.5 installed and held; v1.37.1 staged offline (see below) | `task image:build:kubeadm-upgrade` |
+| `etcd-host:3.6` | `cloudtrain/etcd-host:3.6` (containerDisk) | etcd v3.6.15 + etcdctl/etcdutl in `/usr/local/bin`, `etcd.service` with mutual TLS | `task image:build:etcd-host` |
+| `jumphost:1` | `cloudtrain/jumphost:1` (container) | kubectl v1.37.1, helm v4.3.0, etcdctl/etcdutl, yq, jq, ssh, vim/nano, tmux, user `learner` (uid 1000), `k` alias with completion, prompt with the kube context | `task image:build:jumphost` |
+
+**Workload images.** Lab VMs have no internet, so every image a lab's Pods use is in the
+catalog's `workloadImages` (`busybox:1.37`, `httpd:2.4-alpine`, `redis:7.4-alpine`,
+`caddy:2-alpine`, and `httpd:2.4`, which the named-port-nodeport misconception drifts to).
+They are pinned by index digest in `lock/workloads.lock`, pulled by digest into every
+kubeadm node image's containerd (`k8s.io` namespace, CRI-managed, named by tag so
+`imagePullPolicy: IfNotPresent` finds them), and pulled the same way into the kind nodes
+for `mode: virtual` labs (`task image:load:workloads`, idempotent). Adding an image:
+add it to `workloadImages`, run `task image:lock`, rebuild the kubeadm images.
+
+**Upgrade image (`kubeadm:1.36`).** v1.36.5 is installed from the v1.36 pkgs.k8s.io repo
+and kubeadm/kubelet/kubectl are held. The build then mirrors the two minors the lab needs
+as flat apt repos, downloading through the signed pkgs.k8s.io repos (apt checks the
+signatures and every .deb's sha256): `/opt/k8s-apt/v1.36/` (kubeadm/kubelet/kubectl
+1.36.5, cri-tools 1.36.0, kubernetes-cni) and `/opt/k8s-apt/v1.37/` (1.37.1, cri-tools
+1.37.0, kubernetes-cni). Both are signed with a throwaway build key whose public half is
+appended to `/etc/apt/keyrings/kubernetes-apt-keyring.gpg` (next to the pkgs.k8s.io key),
+and `/etc/apt/sources.list.d/kubernetes.list` has the same shape as the online one:
+
+```
+deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] file:/opt/k8s-apt/v1.36/ /
+```
+
+so the learner upgrades exactly as online: change `v1.36` to `v1.37` in that file,
+`apt-get update`, `apt-get install kubeadm=1.37.1-*`. No apt source needs the internet
+(the Ubuntu and Docker sources are renamed `*.disabled`), so `apt-get update` succeeds
+offline. Every image of `kubeadm config images list --kubernetes-version v1.37.1`
+(etcd, CoreDNS and pause included) is preloaded next to the v1.36.5 set, so
+`kubeadm upgrade apply v1.37.1` runs with no network.
+
+**etcd-host.** Ubuntu 24.04 with etcd from the sha256-pinned release tarball, a system
+user `etcd`, and an enabled `etcd.service` (single member, client and peer mutual TLS on
+127.0.0.1:2379/2380). Its PKI is generated per VM on first start
+(`/usr/local/sbin/cloudtrain-etcd-pki`, `ExecStartPre`) under `/etc/qm-etcd/pki`:
+`ca`, `server`, `peer`, and client identities `grader` and `admin` (`.crt`/`.key`, keys
+0600, owned by `etcd`). No `ETCDCTL_*` variables are set, because the etcd lab teaches
+the TLS flags. The etcd-snapshot-restore lab replaces the unit and PKI with its own
+(`provision-etcd.sh` tears them down first); `task image:test` runs that lab's provision
+script and solution on the image.
+
+All VM images share the same conventions: Ubuntu cloud image with cloud-init and sshd,
+**no users or keys baked in** (the runtime injects `learner` with passwordless sudo,
+root's authorized_keys and the ssh host key through cloud-init), apt timers and snapd
+are gone, and `/etc/cloudtrain-release` records versions and the catalog ref.
+
+**CNI contract (kubeadm images).** The runtime calls `/opt/cloudtrain/bin/cni-install
+<podCIDR>` on the control plane after `kubeadm init` (with `10.244.0.0/16`). It checks
+`/opt/cloudtrain/manifests/calico.yaml` against the sha256 recorded at build time
+(`calico.yaml.sha256`), sets Calico's default IPv4 pool to `<podCIDR>` (Calico's own
+default, 192.168.0.0/16, overlaps the lab VPCs 192.168.99.0/24 and 192.168.100.0/24)
+and applies it with `/etc/kubernetes/admin.conf`; `--wait` also waits for the rollout.
+All Calico images are preloaded. `lab:demo` and `image:test` use the same script.
+
+### Build pipeline
 
 Choice: **virt-customize at build time**, not cloud-init at first boot. Packages and all
-control-plane and CNI images are baked in. This is what lets the VMs run in an isolated
-VPC with no internet and keeps boot-to-Ready around 90–117 s.
+images are baked in. This is what lets the VMs run in an isolated VPC with no internet
+and keeps boot-to-Ready around 90–117 s.
 
 - `builder/Dockerfile`: Ubuntu 24.04 (by digest) + libguestfs from the pinned apt snapshot
-  (only the `ca-certificates` bootstrap comes from the live archive), run with
-  `--device /dev/kvm`. The tag is derived from the Dockerfile and snapshot, so changing
-  either triggers a rebuild.
-- `build.sh`: fetches the pinned cloud image and checks its sha256. It resolves the image
-  list with the pinned `kubeadm config images list` plus the Flannel manifest (sha256
-  checked), fails if kubeadm fails or the list lacks kube-apiserver, pause, etcd, coredns
-  or flannel, and requires the list to match `images.lock` (`UPDATE_LOCK=1` refreshes
-  the digests after a version bump). It grows the disk to 10G, runs
-  `scripts/guest-setup.sh` inside the guest (apt from the pinned Ubuntu snapshot, repo
-  keys checked against pinned fingerprints, containerd.io/cri-tools/kubernetes-cni and
-  kubelet/kubeadm/kubectl `1.37.1-1.1` at exact versions and held, SystemdCgroup,
-  sysctls/modules, then `ctr pull --platform linux/amd64` of 9 images by digest into
-  `k8s.io`, tagged by name for kubeadm), generalizes the image
-  (machine-id, ssh host keys, cloud-init clean), runs `virt-sparsify --compress` (about
-  1.06 GiB qcow2), and packages the result as a containerDisk `FROM scratch`, with
-  `/disk/disk.qcow2` owned by 107.
-- `jumphost/Dockerfile` + `build-jumphost.sh`: the learner workstation image (ssh client,
-  pinned kubectl, bash completion, user `learner`).
+  (only the `ca-certificates` bootstrap comes from the live archive). The tag is derived
+  from the Dockerfile and snapshot, so changing either triggers a rebuild.
+- **libguestfs runs under TCG (software emulation), not KVM, by default.** On the
+  reference machine, nested KVM inside the libguestfs appliance (`docker --device
+  /dev/kvm` → WSL2 → Hyper-V) coincided with several WSL crashes and one Windows bugcheck
+  0x7f (double fault), while KubeVirt lab VMs on the same host ran cleanly.
+  `build.sh` now sets `LIBGUESTFS_BACKEND_SETTINGS=force_tcg`, caps the appliance at
+  2 GiB (`LIBGUESTFS_MEMSIZE=2048`) and the builder container at 6 GiB. `GUESTFS_KVM=1`
+  re-enables KVM on hosts where nested virtualization is known to be stable. Build one
+  image at a time (`image:build:all` is sequential). `GUESTFS_VERBOSE=1` streams every
+  traced guest command to the log (otherwise a stalled build looks idle); apt in the
+  guest has timeouts and retries, because the appliance's user-mode network can stall
+  under TCG. `PACKAGE_ONLY=1` re-runs only the containerDisk packaging from an existing
+  `.cache/<variant>/out/disk.qcow2`.
+- `build.sh <variant>` (`kubeadm-node`, `kubeadm-upgrade`, `etcd-host`): fetches the
+  pinned cloud image and checks its sha256. It resolves the image lists (pinned
+  `kubeadm config images list` per Kubernetes version, the Calico manifest checked by
+  sha256 (then pool CIDR and VXLAN mode set, see `build.sh`), the catalog's `workloadImages`) and requires each to match its lock file
+  (`lock/kubernetes-<version>.lock`, `lock/calico.lock`, `lock/workloads.lock`;
+  `task image:lock` refreshes the digests after a version bump). It grows the disk, runs
+  `scripts/guest-<kind>.sh` inside the guest (shared steps in `scripts/guest-common.sh`:
+  apt from the pinned Ubuntu snapshot, repo keys checked against pinned fingerprints,
+  exact package versions held; images pulled by digest with
+  `ctr pull --platform linux/amd64`), generalizes the image (machine-id, ssh host keys,
+  cloud-init clean), runs `virt-sparsify --compress`, and packages the result as a
+  containerDisk `FROM scratch` with `/disk/disk.qcow2` owned by 107. Work files live in
+  `tools/images/.cache/<variant>/`.
+- `build-jumphost.sh`: `jumphost/Dockerfile` with apt from the same snapshot and helm,
+  etcd and yq checked against sha256 sums in `versions.env` (kubectl against dl.k8s.io's
+  `.sha256`).
+- `load.sh`: loads images into kind and skips any node that already has the same digest
+  (containerDisks only to nodes that run VMs).
+- `boot-test.sh`: per VM image, a fresh namespace with an isolated Kube-OVN VPC (no
+  internet, as in a lab), the VM booted with the runtime's cloud-init conventions, and a
+  `jumphost:1` tester pod in the VPC that runs every check over `ssh` as `learner`.
+  kubeadm-node: `crictl images` lists every workload image, a single-node `kubeadm init`,
+  and one Pod per workload image Running with `imagePullPolicy: Never`. kubeadm-upgrade:
+  the same on v1.36.5, then the offline `apt-get update`/`install` of 1.37.1,
+  `kubeadm upgrade apply v1.37.1 --etcd-upgrade=false`, kubelet restart, and the node and
+  kube-apiserver at v1.37.1. etcd-host: `etcdctl endpoint health` over mutual TLS, a client
+  without a certificate is refused, then the etcd lab's provision script and solution.
+  Results: `deploy/.results/image-test/<variant>.txt`. At most one test VM runs at a time.
 - CDI alternative: the same `disk.qcow2` can be served as a `DataVolume` source (`http` or
   `registry` import). A DataVolume is the better fit for persistent per-learner disks;
   containerDisk is the better fit for disposable labs.
+
+## Platform dependencies (Postgres, Keycloak, Mailpit)
+
+The gateway's identity and persistence run against a separate compose project,
+`cloudtrain-dev-deps` (`deploy/dev/compose.yaml`). It never touches other
+containers or compose projects; every port is bound to 127.0.0.1.
+
+```bash
+task dev:deps         # up --wait, migrate, seed when empty, sync Keycloak organizations
+task dev:gateway      # gateway on :8787 (OIDC BFF)
+task dev:seed         # re-seed the fictional data (replaces the two seeded orgs)
+task dev:deps:down    # stop (data kept)    task dev:deps:reset   # stop and delete the data volume
+task dev:realms       # regenerate the realm imports from deploy/dev/people.json
+```
+
+| Service | Image (pinned by tag and digest) | Host port | Notes |
+|---|---|---|---|
+| Postgres | `postgres:17.11-alpine` | 55432 | databases `cloudtrain` (roles `cloudtrain_owner` = schema owner, `cloudtrain_app` = RLS-bound app role) and `keycloak` |
+| Keycloak | `quay.io/keycloak/keycloak:26.7.5` | 8180 | `start-dev --import-realm`, admin console `http://localhost:8180/admin` (`admin` / `admin-dev-only`) |
+| Mailpit | `axllent/mailpit:v1.31.5` | 8025 (UI/API), 1025 (SMTP) | invitation emails and Keycloak's own mails |
+
+Every credential in `deploy/dev/` is a published development value for
+fictional people; none is used outside this stack.
+
+**Realms** (`deploy/dev/keycloak/import/*.json`, generated by `gen-realms.mjs`
+from `deploy/dev/people.json`):
+
+- `cloudtrain`: Organizations enabled; confidential client `cloudtrain-gateway`
+  (code flow, PKCE S256, back-channel logout URL, mappers for `idp_roles`,
+  `idp_groups`, `identity_provider`, `title`); service-account client
+  `cloudtrain-gateway-admin` (realm-management roles for users, IdPs and
+  organizations); OTP and passkeys (WebAuthn passwordless) available as required
+  actions; SMTP to Mailpit; local accounts for Quillmoor Logistics and the
+  platform operator; identity provider `acme-idp` (OIDC) with claim mappers
+  `roles` -> `idp_roles` and `groups` -> `idp_groups`, sync mode FORCE.
+- `acme-idp`: a stand-in external corporate IdP for the fictional Acme Freight:
+  client `cloudtrain-broker` whose `roles` claim carries client roles named
+  exactly like the Entra app roles (`CloudTrain.Learner`, `CloudTrain.Manager`,
+  `CloudTrain.Instructor`, `CloudTrain.Author`, `CloudTrain.OrgAdmin`,
+  `CloudTrain.PlatformAdmin`) plus a `groups` claim.
+
+Organizations, their verified domains and IdP links are not in the import:
+`pnpm --filter @cloudtrain/gateway kc:sync` (part of `dev:deps`) creates them from
+the database through the admin API, the same code the admin UI's SSO page uses.
+
+**Keycloak inside Docker vs the host:** browser and gateway use
+`http://localhost:8180` (`KC_HOSTNAME`); the `acme-idp` broker calls its token,
+userinfo and JWKS endpoints on the container port (`http://localhost:8080`).
+Back-channel logout calls `http://host.docker.internal:8787`, which reaches the
+gateway only if it listens beyond loopback (`CT_HOST=0.0.0.0`); with the default
+`127.0.0.1` Keycloak's call fails harmlessly and logout still works through
+`POST /api/auth/logout` and the refresh check.
+
+### Adding AzarGuard's Entra ID tenant (`azarguard-entra`)
+
+1. Register an app in Entra ID (single tenant), web redirect URI
+   `http://localhost:8180/realms/cloudtrain/broker/azarguard-entra/endpoint`,
+   a client secret, and app roles with the values `CloudTrain.Learner`,
+   `CloudTrain.Manager`, `CloudTrain.Instructor`, `CloudTrain.Author`,
+   `CloudTrain.OrgAdmin`, `CloudTrain.PlatformAdmin` (assigned to users or groups;
+   they arrive in the ID token's `roles` claim). Optionally emit `groups`.
+2. Write `~/.config/cloudtrain/entra-dev.env` (mode 600, never committed):
+
+   ```bash
+   ENTRA_TENANT_ID=<directory (tenant) id>
+   ENTRA_CLIENT_ID=<application (client) id>
+   ENTRA_CLIENT_SECRET=<client secret value>
+   ENTRA_DOMAINS=azarguard.com          # optional: creates/links the AzarGuard org for these verified domains
+   # ENTRA_ORG_NAME=AzarGuard  ENTRA_ORG_SLUG=azarguard   (defaults)
+   ```
+
+   `AZURE_TENANT_ID` / `AZURE_CLIENT_ID` / `AZURE_CLIENT_SECRET` are accepted too.
+3. Run `pnpm --filter @cloudtrain/gateway kc:sync` (or `task dev:deps`). It
+   creates/updates the OIDC identity provider `azarguard-entra` (v2.0 issuer
+   `https://login.microsoftonline.com/<tenant>/v2.0`, PKCE, the same
+   `roles`/`groups` mappers as `acme-idp`), and with `ENTRA_DOMAINS` an org with
+   those domains and an active SSO connection. It prints only whether the file
+   was found, never a value. Without the file it skips with a one-line notice.
+4. `CloudTrain.PlatformAdmin` from Entra grants platform_admin because
+   `azarguard-entra` is in `CT_PLATFORM_IDPS` (default). The mapping code is the
+   one `acme-idp` exercises today.
 
 ## Known gaps and problems hit (with the fix in place)
 

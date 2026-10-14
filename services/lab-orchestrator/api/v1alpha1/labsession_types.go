@@ -32,6 +32,10 @@ const (
 	ConditionHibernated = "Hibernated"
 	// ConditionExpired is True once the session passed its expiry.
 	ConditionExpired = "Expired"
+	// ConditionClaimed is set on sessions with spec.warmPoolRef: True once a
+	// pooled session was claimed, False when the session was provisioned
+	// itself instead (pool missing, exhausted or of another template).
+	ConditionClaimed = "Claimed"
 )
 
 // LearnerRef identifies the learner owning a session.
@@ -74,7 +78,16 @@ type LabSessionSpec struct {
 	// +optional
 	// +kubebuilder:validation:Minimum=0
 	ResetGeneration int64 `json:"resetGeneration,omitempty"`
-	// WarmPoolRef names the WarmPool that pre-provisioned this session, if any.
+	// WarmPoolRef asks for a pre-provisioned session from the named WarmPool
+	// (same namespace and templateRef). On its first reconcile the session
+	// claims a Ready pooled session (optimistic update of its claimed-by
+	// label, so no pooled session is claimed twice) and from then on fronts
+	// it: status mirrors the pooled session (status.pooledSession), and
+	// learner, ttl/expiresAt, hibernate, resetGeneration and validateRequest
+	// are forwarded to it. The pooled session's seed decides the params
+	// (spec.seed is not used). Deleting this session deletes the pooled one.
+	// If the pool has no Ready session, the session is provisioned normally
+	// (condition Claimed=False, reason PoolExhausted).
 	// +optional
 	WarmPoolRef string `json:"warmPoolRef,omitempty"`
 	// ValidateRequest asks the controller to grade the session: every time
@@ -194,6 +207,10 @@ type LabSessionStatus struct {
 	// and the UI.
 	// +optional
 	Links []LinkStatus `json:"links,omitempty"`
+	// PooledSession is the claimed pooled LabSession that actually runs
+	// this session's nodes (spec.warmPoolRef).
+	// +optional
+	PooledSession string `json:"pooledSession,omitempty"`
 }
 
 // LinkStatus describes one provisioned topology link.

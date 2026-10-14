@@ -1,0 +1,28 @@
+#!/bin/bash
+# /opt/cloudtrain/bin/cni-install <podCIDR> [--wait]
+#
+# Runtime contract (kubeadm driver): called on the control plane right after
+# `kubeadm init`. Installs Calico from the manifest baked into this image (its sha256
+# was recorded at build time and is checked here) with the default IPv4 pool set to
+# <podCIDR>. Every Calico image is preloaded in containerd, so no registry is needed.
+# Calico's own default (192.168.0.0/16) would overlap the lab VPCs, so <podCIDR> is
+# required. --wait also waits (up to 5 min) for calico-node and calico-kube-controllers.
+set -euo pipefail
+MANIFEST=/opt/cloudtrain/manifests/calico.yaml
+cidr=${1:-}
+[[ $cidr =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/([0-9]|[12][0-9]|3[0-2])$ ]] \
+  || { echo "usage: cni-install <podCIDR, e.g. 10.244.0.0/16> [--wait]" >&2; exit 2; }
+(cd "$(dirname "$MANIFEST")" && sha256sum --quiet -c "$MANIFEST.sha256") \
+  || { echo "cni-install: $MANIFEST does not match its recorded sha256" >&2; exit 1; }
+export KUBECONFIG=${KUBECONFIG:-/etc/kubernetes/admin.conf}
+tmp=$(mktemp); trap 'rm -f "$tmp"' EXIT
+# The baked manifest has exactly one CALICO_IPV4POOL_CIDR entry; replace its value.
+sed "/- name: CALICO_IPV4POOL_CIDR\$/{n;s|value: \".*\"|value: \"$cidr\"|}" "$MANIFEST" > "$tmp"
+grep -A1 -- '- name: CALICO_IPV4POOL_CIDR$' "$tmp" | grep -q "value: \"$cidr\"" \
+  || { echo "cni-install: could not set the pool CIDR" >&2; exit 1; }
+kubectl apply -f "$tmp" >/dev/null
+echo "cni-install: Calico $(cat /opt/cloudtrain/manifests/calico.version 2>/dev/null) applied, pool $cidr"
+if [[ ${2:-} == --wait ]]; then
+  kubectl -n kube-system rollout status ds/calico-node --timeout=300s
+  kubectl -n kube-system rollout status deploy/calico-kube-controllers --timeout=300s
+fi

@@ -79,13 +79,22 @@ type ContainerDriver struct {
 	// Network, when set, wires nodes with topology links into the session
 	// network (see links.go); without it such nodes fail as unsupported.
 	Network PodNetwork
+	// PersistentHome gives every container node a PersistentVolumeClaim for
+	// /home/learner (see home.go), which is what makes container nodes
+	// hibernatable: hibernate deletes the pod, resume recreates it on the
+	// same home volume. Without it container nodes keep running while the
+	// session is hibernated.
+	PersistentHome bool
+	// HomeStorageClass and HomeSize of the home volume (defaults: cluster
+	// default class, 1Gi).
+	HomeStorageClass string
+	HomeSize         string
 }
 
-// ContainerDriver deliberately does not implement Hibernator: deleting the
-// Pod would discard the learner's work, and container nodes are cheap enough
-// to keep running. State-preserving hibernation belongs to the vm and
-// k8s-cluster drivers (stop the VM, keep its disk).
-var _ NodeDriver = (*ContainerDriver)(nil)
+var (
+	_ NodeDriver = (*ContainerDriver)(nil)
+	_ Hibernator = (*ContainerDriver)(nil)
+)
 
 func (d *ContainerDriver) Name() labsv1.DriverName { return labsv1.DriverContainer }
 
@@ -298,7 +307,19 @@ func (d *ContainerDriver) Provision(ctx context.Context, ref NodeRef) (NodeState
 	if err := d.createIfAbsent(ctx, ref, d.BuildService(ref)); err != nil {
 		return NodeState{Phase: labsv1.NodePending, Message: err.Error()}, fmt.Errorf("service: %w", err)
 	}
+	if d.PersistentHome {
+		ready, err := d.ensureHome(ctx, ref)
+		if err != nil {
+			return NodeState{Phase: labsv1.NodePending, Message: err.Error()}, fmt.Errorf("home volume: %w", err)
+		}
+		if !ready {
+			return NodeState{Phase: labsv1.NodeProvisioning, Message: "previous home volume is being deleted"}, nil
+		}
+	}
 	pod := d.BuildPod(ref)
+	if d.PersistentHome {
+		d.mountHome(ref, pod)
+	}
 	if err := d.decoratePod(ref, pod, false); err != nil {
 		return NodeState{Phase: labsv1.NodeFailed, Message: err.Error()}, err
 	}
@@ -313,6 +334,9 @@ func (d *ContainerDriver) Status(ctx context.Context, ref NodeRef) (NodeState, e
 	pod := &corev1.Pod{}
 	err := d.Client.Get(ctx, client.ObjectKey{Namespace: ref.Namespace(), Name: ref.ResourceName()}, pod)
 	if apierrors.IsNotFound(err) {
+		if ref.Session.Spec.Hibernate {
+			return NodeState{Phase: labsv1.NodeHibernated, Message: "pod stopped; home volume kept"}, nil
+		}
 		return NodeState{Phase: labsv1.NodePending, Message: "pod not created"}, nil
 	}
 	if err != nil {
@@ -446,17 +470,33 @@ func (d *ContainerDriver) ExecIn(ctx context.Context, ref NodeRef, container str
 	return res, err
 }
 
-// Reset deletes the Pod; the next Provision recreates it from the image.
+// Reset deletes the Pod and its home volume; the next Provision recreates
+// both from the image.
 func (d *ContainerDriver) Reset(ctx context.Context, ref NodeRef) error {
-	return d.deletePod(ctx, ref)
+	if err := d.deletePod(ctx, ref); err != nil {
+		return err
+	}
+	_, err := d.deleteHome(ctx, ref)
+	return err
 }
 
-// Destroy deletes the Pod and the Service.
+// Destroy deletes the Pod, the Service and the home volume; ErrInProgress
+// until the home volume is gone (it is released once the pod is).
 func (d *ContainerDriver) Destroy(ctx context.Context, ref NodeRef) error {
 	if err := d.deletePod(ctx, ref); err != nil {
 		return err
 	}
-	return d.deleteOwned(ctx, ref, &corev1.Service{})
+	if err := d.deleteOwned(ctx, ref, &corev1.Service{}); err != nil {
+		return err
+	}
+	gone, err := d.deleteHome(ctx, ref)
+	if err != nil {
+		return err
+	}
+	if !gone {
+		return inProgress("home volume of %s is being deleted", ref.ResourceName())
+	}
+	return nil
 }
 
 func (d *ContainerDriver) deletePod(ctx context.Context, ref NodeRef) error {

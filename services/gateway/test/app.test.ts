@@ -31,7 +31,7 @@ describe('HTTP API', () => {
     const lab = await app.inject('/api/labs/etcd-snapshot-restore');
     expect(lab.statusCode).toBe(200);
     expect(lab.body).not.toMatch(/"solution"|"expect"|"misconceptions"/);
-    expect((await app.inject('/api/labs/nope')).json()).toEqual({ error: 'Lab not found' });
+    expect((await app.inject('/api/labs/nope')).json()).toEqual({ error: 'Lab not found', code: 'not_found' });
     const skills = (await app.inject('/api/skills')).json();
     expect(skills.frameworks).toHaveLength(4);
     expect(skills.states.length).toBe(skills.skills.length);
@@ -41,7 +41,7 @@ describe('HTTP API', () => {
   });
 
   it('answers 401 without a principal (health stays open)', async () => {
-    const { app } = await make({ authenticate: async () => null });
+    const { app } = await make({ csrf: false, authenticate: async () => null });
     expect((await app.inject('/api/catalog')).statusCode).toBe(401);
     expect((await app.inject('/api/health')).statusCode).toBe(200);
   });

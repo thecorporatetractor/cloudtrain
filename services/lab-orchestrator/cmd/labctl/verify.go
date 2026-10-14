@@ -805,6 +805,15 @@ func (v *verifier) leftovers(ctx context.Context, ns, uid string) ([]string, err
 			}
 		}
 	}
+	// vcluster host namespaces of the session ("ct-<release>").
+	nsl := &unstructured.UnstructuredList{}
+	nsl.SetGroupVersionKind(schema.GroupVersionKind{Version: "v1", Kind: "NamespaceList"})
+	if err := v.c.List(ctx, nsl, client.MatchingLabels{drivers.LabelSessionNamespace: ns}); err != nil {
+		return nil, err
+	}
+	for _, it := range nsl.Items {
+		out = append(out, "namespace/"+it.GetName())
+	}
 	if uid != "" {
 		for _, gvk := range []schema.GroupVersionKind{drivers.GVKVpc, drivers.GVKSubnet} {
 			ul := &unstructured.UnstructuredList{}
