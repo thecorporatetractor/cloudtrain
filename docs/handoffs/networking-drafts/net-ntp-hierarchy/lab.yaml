@@ -1,0 +1,181 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: net-ntp-hierarchy
+  title: Build a district time hierarchy with NTP
+  domain: networking
+  frameworks: [ccna:ip-services]
+  difficulty: easy
+  estimatedMinutes: 15
+  tags: [ntp, chrony, time]
+  version: 1
+spec:
+  description: |
+    Every Marlow Valley router runs `chronyd` (Linux routers, shell; config in
+    `/etc/chrony/chrony.conf`, restart with `chrony-restart`). Nothing is
+    synchronised yet. Build this hierarchy:
+
+    | Device | Synchronises from | Serves |
+    |---|---|---|
+    | `ntp-dc` (10.{{octet}}.250.123, stratum {{stratum}}) | its reference clock (done) | the core routers |
+    | `mv-core-1`, `mv-core-2` | `ntp-dc` | the campus routers |
+    | `mv-campus-north`, `mv-campus-south` | both core routers | nobody |
+
+    | Link | Addresses |
+    |---|---|
+    | ntp-dc eth1 - mv-core-1 eth1 | 10.{{octet}}.251.0/30 (.1 core-1, .2 ntp-dc) |
+    | ntp-dc eth2 - mv-core-2 eth1 | 10.{{octet}}.252.0/30 (.1 core-2, .2 ntp-dc) |
+    | mv-core-1 eth2 - mv-campus-north eth1 | 10.{{octet}}.0.0/30 (.1 core, .2 north) |
+    | mv-core-1 eth3 - mv-campus-south eth1 | 10.{{octet}}.0.4/30 (.5 core, .6 south) |
+    | mv-core-2 eth2 - mv-campus-north eth2 | 10.{{octet}}.0.8/30 (.9 core, .10 north) |
+    | mv-core-2 eth3 - mv-campus-south eth2 | 10.{{octet}}.0.12/30 (.13 core, .14 south) |
+
+    The cores already route to the time server's address 10.{{octet}}.250.123.
+    The core routers must allow NTP clients only from their campus links. When
+    you are done, both campus routers must list both core routers as sources,
+    be synchronised at stratum {{stratum}} + 2 and be within one second of the
+    source.
+  objectives:
+    - Configure NTP clients with server statements
+    - Let a router serve time to selected subnets
+    - Verify sources, stratum and offset
+  params:
+    octet:
+      type: int
+      min: 20
+      max: 90
+    stratum:
+      type: choice
+      values: [2, 3, 4]
+  topology:
+    entry: workstation
+    nodes:
+      - { name: workstation, driver: container, image: jumphost:1, access: [shell] }
+      - { name: ntp-dc, driver: container, image: netsvc:1, resources: { cpu: 0.2, memoryMiB: 64 } }
+      - { name: mv-core-1, driver: container, image: netsvc:1, resources: { cpu: 0.2, memoryMiB: 64 }, access: [shell] }
+      - { name: mv-core-2, driver: container, image: netsvc:1, resources: { cpu: 0.2, memoryMiB: 64 }, access: [shell] }
+      - { name: mv-campus-north, driver: container, image: netsvc:1, resources: { cpu: 0.2, memoryMiB: 64 }, access: [shell] }
+      - { name: mv-campus-south, driver: container, image: netsvc:1, resources: { cpu: 0.2, memoryMiB: 64 }, access: [shell] }
+    links:
+      - { a: "ntp-dc:eth1", b: "mv-core-1:eth1" }
+      - { a: "ntp-dc:eth2", b: "mv-core-2:eth1" }
+      - { a: "mv-core-1:eth2", b: "mv-campus-north:eth1" }
+      - { a: "mv-core-1:eth3", b: "mv-campus-south:eth1" }
+      - { a: "mv-core-2:eth2", b: "mv-campus-north:eth2" }
+      - { a: "mv-core-2:eth3", b: "mv-campus-south:eth2" }
+  setup:
+    - on: ntp-dc
+      run: &chrony |
+        cat > /usr/local/bin/chrony-restart <<'EOS'
+        #!/bin/sh
+        pkill -x chronyd; sleep 1; rm -f /run/chrony/chronyd.pid
+        chronyd -x -f /etc/chrony/chrony.conf -l /var/log/chrony.log
+        EOS
+        chmod +x /usr/local/bin/chrony-restart
+        mkdir -p /etc/chrony /run/chrony
+        case $(hostname) in
+          *ntp-dc*) ip addr replace 10.{{octet}}.250.123/32 dev lo; ip addr replace 10.{{octet}}.251.2/30 dev eth1; ip addr replace 10.{{octet}}.252.2/30 dev eth2
+                    ip route replace 10.{{octet}}.0.0/16 via 10.{{octet}}.251.1
+                    printf 'local stratum {{stratum}}\nallow 10.{{octet}}.251.0/30\nallow 10.{{octet}}.252.0/30\n' > /etc/chrony/chrony.conf ;;
+          *core-1*) ip addr replace 10.{{octet}}.251.1/30 dev eth1; ip route replace 10.{{octet}}.250.123/32 via 10.{{octet}}.251.2; ip addr replace 10.{{octet}}.0.1/30 dev eth2; ip addr replace 10.{{octet}}.0.5/30 dev eth3
+                    printf '# mv-core-1\n' > /etc/chrony/chrony.conf ;;
+          *core-2*) ip addr replace 10.{{octet}}.252.1/30 dev eth1; ip route replace 10.{{octet}}.250.123/32 via 10.{{octet}}.252.2; ip addr replace 10.{{octet}}.0.9/30 dev eth2; ip addr replace 10.{{octet}}.0.13/30 dev eth3
+                    printf '# mv-core-2\n' > /etc/chrony/chrony.conf ;;
+          *north*)  ip addr replace 10.{{octet}}.0.2/30 dev eth1; ip addr replace 10.{{octet}}.0.10/30 dev eth2
+                    printf '# mv-campus-north\n' > /etc/chrony/chrony.conf ;;
+          *south*)  ip addr replace 10.{{octet}}.0.6/30 dev eth1; ip addr replace 10.{{octet}}.0.14/30 dev eth2
+                    printf '# mv-campus-south\n' > /etc/chrony/chrony.conf ;;
+        esac
+        chrony-restart
+    - { on: mv-core-1, run: *chrony }
+    - { on: mv-core-2, run: *chrony }
+    - { on: mv-campus-north, run: *chrony }
+    - { on: mv-campus-south, run: *chrony }
+  checks:
+    - id: core1-synced
+      description: mv-core-1 is synchronised to ntp-dc
+      type: shell
+      on: mv-core-1
+      command: &synced |
+        for i in $(seq 25); do chronyc -n sources 2>/dev/null | grep -q '^\^\*' && break; sleep 1; done
+        chronyc -n sources | awk '/^\^\*/{print $2}'
+      expect: { match: exact, value: "10.{{octet}}.250.123" }
+      timeoutSec: 35
+      skills: [net.services.ntp]
+    - id: core2-synced
+      description: mv-core-2 is synchronised to ntp-dc
+      type: shell
+      on: mv-core-2
+      command: *synced
+      expect: { match: exact, value: "10.{{octet}}.250.123" }
+      timeoutSec: 35
+      skills: [net.services.ntp]
+    - id: north-both-cores
+      description: mv-campus-north uses both core routers, is synchronised at stratum {{stratum}}+2 and within one second
+      type: shell
+      on: mv-campus-north
+      command: &campus |
+        for i in $(seq 30); do chronyc -n sources 2>/dev/null | grep -q '^\^\*' && break; sleep 1; done
+        s=$(chronyc -n sources | awk '/^\^[*+-]/{print $2}' | sort | tr '\n' ' ')
+        st=$(chronyc tracking | awk -F': ' '/^Stratum/{print $2}')
+        off=$(chronyc tracking | awk '/^System time/{print ($4 < 1.0) ? "ok" : "off"}')
+        echo "$s| $st $off"
+      expect: { match: regex, value: "^10\\.{{octet}}\\.0\\.(1|9) 10\\.{{octet}}\\.0\\.(1|9) \\| [0-9]+ ok$" }
+      timeoutSec: 45
+      skills: [net.services.ntp]
+      weight: 2
+    - id: south-both-cores
+      description: mv-campus-south uses both core routers and is synchronised
+      type: shell
+      on: mv-campus-south
+      command: *campus
+      expect: { match: regex, value: "^10\\.{{octet}}\\.0\\.(13|5) 10\\.{{octet}}\\.0\\.(13|5) \\| [0-9]+ ok$" }
+      timeoutSec: 45
+      skills: [net.services.ntp]
+      weight: 2
+    - id: campus-stratum
+      description: mv-campus-north runs at stratum {{stratum}} + 2
+      type: shell
+      on: mv-campus-north
+      command: '[ "$(chronyc tracking | awk -F": " "/^Stratum/{print \$2}")" = "$(( {{stratum}} + 2 ))" ]'
+      skills: [net.services.ntp]
+    - id: core-serves-campus-only
+      description: mv-core-1 serves NTP to its campus links and nothing else
+      type: shell
+      on: mv-core-1
+      command: grep -E '^\s*(allow|deny)' /etc/chrony/chrony.conf | sort | tr '\n' ';'
+      expect: { match: regex, value: "^(allow 10\\.{{octet}}\\.0\\.(0/30|4/30|0/29|0/28|0/24|0/16)[ ]*;)+$" }
+      skills: [net.services.ntp]
+      weight: 0.5
+  hints:
+    - title: chrony client and server lines
+      body: "`server <address> iburst` makes chronyd use a source; `allow <subnet>` lets clients from that subnet query this router."
+      cost: 1
+    - title: Apply and verify
+      body: After editing /etc/chrony/chrony.conf run `chrony-restart`, then `chronyc sources` (the `*` marks the selected source) and `chronyc tracking` (stratum and offset).
+      cost: 1
+  misconceptions:
+    - id: campus-to-dc
+      description: Points the campus routers straight at ntp-dc
+      mutation:
+        on: mv-campus-north
+        run: printf 'server 10.{{octet}}.250.123 iburst\n' > /etc/chrony/chrony.conf && chrony-restart
+      expectFail: [north-both-cores, core1-synced]
+      feedback: The campus routers have no route to the data centre, and the design says they use the core routers.
+    - id: core-allow-all
+      description: Opens the core routers to every client
+      mutation:
+        on: mv-core-1
+        run: printf 'server 10.{{octet}}.250.123 iburst\nallow all\n' > /etc/chrony/chrony.conf && chrony-restart
+      expectFail: [core-serves-campus-only]
+      feedback: The core routers should answer only the campus links.
+  solution:
+    explanation: |
+      Cores: `server 10.{{octet}}.250.123 iburst` plus `allow` for their two campus
+      /30s. Campus routers: one `server` line per core link address. Each level
+      adds one to the stratum.
+    steps:
+      - { on: mv-core-1, run: "printf 'server 10.{{octet}}.250.123 iburst\\nallow 10.{{octet}}.0.0/30\\nallow 10.{{octet}}.0.4/30\\n' > /etc/chrony/chrony.conf && chrony-restart" }
+      - { on: mv-core-2, run: "printf 'server 10.{{octet}}.250.123 iburst\\nallow 10.{{octet}}.0.8/30\\nallow 10.{{octet}}.0.12/30\\n' > /etc/chrony/chrony.conf && chrony-restart" }
+      - { on: mv-campus-north, run: "printf 'server 10.{{octet}}.0.1 iburst\\nserver 10.{{octet}}.0.9 iburst\\n' > /etc/chrony/chrony.conf && chrony-restart" }
+      - { on: mv-campus-south, run: "printf 'server 10.{{octet}}.0.5 iburst\\nserver 10.{{octet}}.0.13 iburst\\n' > /etc/chrony/chrony.conf && chrony-restart" }

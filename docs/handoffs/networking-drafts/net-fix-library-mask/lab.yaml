@@ -1,0 +1,154 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: net-fix-library-mask
+  title: Repair a host that uses the wrong prefix length
+  domain: networking
+  frameworks: [ccna:network-fundamentals]
+  difficulty: easy
+  estimatedMinutes: 12
+  tags: [ipv4, subnet-mask, troubleshooting]
+  version: 1
+spec:
+  description: |
+    The south-campus library PC `library-pc-south` reaches its gateway but cannot
+    print: the printers live on the printer LAN `10.{{octet}}.31.0/24` behind the
+    campus router `mv-campus-south`, and the help desk says pinging
+    `printer-south-1` (`10.{{octet}}.31.{{printer}}`) just times out.
+
+    The library LAN is `10.{{octet}}.30.0/24` with the gateway
+    `10.{{octet}}.30.1`. Find out why the PC cannot reach the printer and fix the
+    PC so it reaches both its gateway and the printer. Do **not** change
+    `mv-campus-south`.
+  objectives:
+    - Compare a host's prefix length with the real subnet
+    - Explain why a too-short prefix makes a host ARP for off-subnet addresses
+    - Fix the host's addressing and verify end to end
+  params:
+    octet:
+      type: int
+      min: 20
+      max: 90
+    pc:
+      type: int
+      min: 20
+      max: 40
+    printer:
+      type: int
+      min: 10
+      max: 19
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: library-pc-south
+        driver: container
+        image: nettools:1
+        resources: { cpu: 0.25, memoryMiB: 96 }
+        access: [shell]
+      - name: mv-campus-south
+        driver: netdev
+        image: frr:10
+        access: [console]
+      - name: printer-south-1
+        driver: container
+        image: nettools:1
+        resources: { cpu: 0.25, memoryMiB: 96 }
+    links:
+      - { a: "library-pc-south:eth1", b: "mv-campus-south:eth1", subnet: "10.{{octet}}.30.0/24" }
+      - { a: "mv-campus-south:eth2", b: "printer-south-1:eth1", subnet: "10.{{octet}}.31.0/24" }
+  setup:
+    - on: mv-campus-south
+      config: |
+        interface eth1
+         description library LAN
+         ip address 10.{{octet}}.30.1/24
+        interface eth2
+         description printer LAN
+         ip address 10.{{octet}}.31.1/24
+    - on: printer-south-1
+      run: ip addr replace 10.{{octet}}.31.{{printer}}/24 dev eth1 && ip route replace default via 10.{{octet}}.31.1
+    - on: library-pc-south
+      run: ip addr replace 10.{{octet}}.30.{{pc}}/16 dev eth1 && ip route replace default via 10.{{octet}}.30.1
+  checks:
+    - id: printer-reachable
+      description: The library PC reaches the printer
+      type: reachability
+      on: library-pc-south
+      target: 10.{{octet}}.31.{{printer}}
+      skills: [net.troubleshooting.methodology]
+      weight: 2
+    - id: gateway-reachable
+      description: The library PC still reaches its gateway
+      type: reachability
+      on: library-pc-south
+      target: 10.{{octet}}.30.1
+      skills: [net.addressing.ipv4-subnetting]
+    - id: pc-prefix
+      description: The PC's library address uses the library LAN's prefix length
+      type: shell
+      on: library-pc-south
+      command: ip -4 -o addr show dev eth1 | awk '{print $4}' | sort | tr '\n' ' '
+      expect: { match: exact, value: "10.{{octet}}.30.{{pc}}/24 " }
+      skills: [net.addressing.ipv4-subnetting]
+      weight: 2
+    - id: router-untouched
+      description: mv-campus-south was not changed (no proxy ARP, no new routes or addresses)
+      type: shell
+      on: mv-campus-south
+      command: |
+        [ "$(cat /proc/sys/net/ipv4/conf/eth1/proxy_arp)" = 0 ] && [ -z "$(ip neigh show proxy)" ] || exit 1
+        vtysh -c 'show running-config' | grep -E '^ ?(ip route|ip address|ipv6 route)' | sort | tr '\n' ';'
+      expect: { match: exact, value: " ip address 10.{{octet}}.30.1/24; ip address 10.{{octet}}.31.1/24;" }
+      skills: [net.troubleshooting.methodology]
+  hints:
+    - title: What does the PC think is local?
+      body: With a /16 the PC treats every 10.{{octet}}.x.x address as on its own wire and sends ARP requests for the printer instead of handing the packet to the gateway.
+      command: "ip -4 addr show dev eth1; ip route get 10.{{octet}}.31.{{printer}}"
+      cost: 1
+    - title: Prove it
+      body: Capture on the PC while pinging the printer. ARP requests for the printer's address that nobody answers confirm the wrong prefix.
+      command: "tcpdump -ni eth1 arp"
+      cost: 1
+    - title: The fix
+      body: Replace the address with the same host address and the library LAN's real prefix length, then check the default route is still there.
+      command: "ip addr del 10.{{octet}}.30.{{pc}}/16 dev eth1"
+      cost: 2
+  misconceptions:
+    - id: proxy-arp
+      description: Makes the router answer ARP for the printer (proxy ARP) so the /16 host works
+      mutation:
+        on: mv-campus-south
+        run: ip neigh add proxy 10.{{octet}}.31.{{printer}} dev eth1
+      expectFail: [router-untouched, pc-prefix]
+      feedback: Proxy ARP hides the wrong mask instead of fixing it, and the task says not to change the router.
+    - id: host-route-patch
+      description: Adds a route for the printer LAN on the PC but keeps the /16
+      mutation:
+        on: library-pc-south
+        run: ip route replace 10.{{octet}}.31.0/24 via 10.{{octet}}.30.1
+      expectFail: [pc-prefix]
+      feedback: A more specific route works around the symptom; every other subnet in 10.{{octet}}.0.0/16 would still be unreachable.
+    - id: too-long-prefix
+      description: Shortens the subnet the other way with a /25
+      mutation:
+        on: library-pc-south
+        run: |
+          ip -4 addr flush dev eth1
+          ip addr replace 10.{{octet}}.30.{{pc}}/25 dev eth1 && ip route replace default via 10.{{octet}}.30.1
+      expectFail: [pc-prefix]
+      feedback: A /25 reaches the gateway and the printer but cuts the PC off from library hosts above .127; the LAN is a /24.
+  solution:
+    explanation: |
+      The PC's /16 made the printer address look local, so the PC ARPed for it on
+      the library wire. With the library LAN's real /24 the PC sends printer
+      traffic to the gateway.
+    steps:
+      - on: library-pc-south
+        run: |
+          ip -4 addr flush dev eth1
+          ip addr add 10.{{octet}}.30.{{pc}}/24 dev eth1
+          ip route replace default via 10.{{octet}}.30.1

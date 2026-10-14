@@ -1,0 +1,151 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: net-rstp-root-bridge
+  title: Choose the spanning-tree root for a campus triangle
+  domain: networking
+  frameworks: [ccna:network-access]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [stp, spanning-tree, root-bridge, linux-bridge]
+  version: 1
+spec:
+  description: |
+    The data-centre switch `mv-sw-core-1` and the two access switches
+    `mv-sw-acc-1` and `mv-sw-acc-2` are cabled in a triangle and run spanning tree
+    on their Linux bridges (`br0`, shell access). All three still have the
+    default bridge priority, so the root is whichever switch happens to have the
+    lowest MAC address.
+
+    | Link | Ports |
+    |---|---|
+    | core - acc-1 | `mv-sw-core-1:eth1` - `mv-sw-acc-1:eth1` |
+    | core - acc-2 | `mv-sw-core-1:eth2` - `mv-sw-acc-2:eth1` |
+    | acc-1 - acc-2 | `mv-sw-acc-1:eth2` - `mv-sw-acc-2:eth2` |
+
+    Set bridge priorities so that `mv-sw-core-1` is the root bridge and
+    `mv-sw-acc-1` would take over if the core failed (core lowest, acc-1 next,
+    acc-2 highest). With equal port costs, the link between the two access
+    switches must be the one that blocks. `host-acc-1` and `host-acc-2` must still
+    reach each other. Keep spanning tree on everywhere.
+
+    Note: these Linux bridges run the kernel's spanning tree (802.1D timers, same
+    root election and port roles as RSTP); allow about 10 seconds for a new
+    topology to settle.
+  objectives:
+    - Explain root bridge election from priority and MAC address
+    - Set bridge priorities to place the root and the backup root
+    - Predict and verify which port blocks
+  params:
+    octet:
+      type: int
+      min: 20
+      max: 90
+  topology:
+    entry: workstation
+    nodes:
+      - { name: workstation, driver: container, image: jumphost:1, access: [shell] }
+      - { name: mv-sw-core-1, driver: container, image: netsvc:1, resources: { cpu: 0.25, memoryMiB: 96 }, access: [shell] }
+      - { name: mv-sw-acc-1, driver: container, image: netsvc:1, resources: { cpu: 0.25, memoryMiB: 96 }, access: [shell] }
+      - { name: mv-sw-acc-2, driver: container, image: netsvc:1, resources: { cpu: 0.25, memoryMiB: 96 }, access: [shell] }
+      - { name: host-acc-1, driver: container, image: nettools:1, resources: { cpu: 0.2, memoryMiB: 64 }, access: [shell] }
+      - { name: host-acc-2, driver: container, image: nettools:1, resources: { cpu: 0.2, memoryMiB: 64 }, access: [shell] }
+    links:
+      - { a: "mv-sw-core-1:eth1", b: "mv-sw-acc-1:eth1" }
+      - { a: "mv-sw-core-1:eth2", b: "mv-sw-acc-2:eth1" }
+      - { a: "mv-sw-acc-1:eth2", b: "mv-sw-acc-2:eth2" }
+      - { a: "mv-sw-acc-1:eth3", b: "host-acc-1:eth1" }
+      - { a: "mv-sw-acc-2:eth3", b: "host-acc-2:eth1" }
+  setup:
+    - on: mv-sw-core-1
+      run: &bridge |
+        ip link add br0 type bridge stp_state 1 forward_delay 400 hello_time 100 max_age 600 2>/dev/null || true
+        for p in eth1 eth2 eth3; do [ -e /sys/class/net/$p ] && ip link set $p master br0; done
+        # lab safety: cap every switch port so a learner-made loop cannot flood the platform
+        for p in eth1 eth2 eth3; do [ -e /sys/class/net/$p ] && tc qdisc replace dev $p root tbf rate 2mbit burst 32kb latency 100ms; done
+        ip link set br0 up
+    - { on: mv-sw-acc-1, run: *bridge }
+    - { on: mv-sw-acc-2, run: *bridge }
+    - { on: host-acc-1, run: "ip addr replace 10.{{octet}}.0.11/24 dev eth1" }
+    - { on: host-acc-2, run: "ip addr replace 10.{{octet}}.0.12/24 dev eth1" }
+  checks:
+    - id: core-is-root
+      description: mv-sw-core-1 is the root bridge
+      type: shell
+      on: mv-sw-core-1
+      command: |
+        b=/sys/class/net/br0/bridge; [ "$(cat $b/stp_state)" != 0 ] || exit 1
+        [ "$(cat $b/root_id)" = "$(cat $b/bridge_id)" ]
+      skills: [net.switching.stp]
+      weight: 2
+    - id: core-ports-forward
+      description: Both of the core's links forward (neither blocks)
+      type: shell
+      on: mv-sw-core-1
+      command: "for p in eth1 eth2; do cat /sys/class/net/br0/brif/$p/state; done | tr '\\n' ' '"
+      expect: { match: exact, value: "3 3 " }
+      skills: [net.switching.stp]
+    - id: acc1-backup-root
+      description: mv-sw-acc-1 has a lower priority than mv-sw-acc-2 but higher than the core, and its root port is the core link
+      type: shell
+      on: mv-sw-acc-1
+      command: |
+        b=/sys/class/net/br0/bridge; [ "$(cat $b/stp_state)" != 0 ] || exit 1
+        me=$(cat $b/priority); root=$(( 0x$(cut -c1-4 $b/root_id) ))
+        [ "$root" -lt "$me" ] && [ "$me" -lt 32768 ] && [ "$(cat $b/root_port)" = "$(cat /sys/class/net/br0/brif/eth1/port_no | xargs printf '%d')" ]
+      skills: [net.switching.stp]
+    - id: acc2-blocks-access-link
+      description: mv-sw-acc-2 blocks its port on the access-to-access link and uses the core link as root port
+      type: shell
+      on: mv-sw-acc-2
+      command: |
+        b=/sys/class/net/br0/bridge; [ "$(cat $b/stp_state)" != 0 ] || exit 1
+        echo "$(cat /sys/class/net/br0/brif/eth1/state) $(cat /sys/class/net/br0/brif/eth2/state)"
+      expect: { match: exact, value: "3 4" }
+      skills: [net.switching.stp]
+      weight: 2
+    - id: hosts-connected
+      description: host-acc-1 reaches host-acc-2
+      type: reachability
+      on: host-acc-1
+      target: 10.{{octet}}.0.12
+      skills: [net.switching.stp]
+  hints:
+    - title: How the root is chosen
+      body: The bridge with the lowest bridge ID (priority, then MAC address) becomes root. Lower the core's priority below the default 32768.
+      command: "ip link set br0 type bridge priority 4096"
+      cost: 1
+    - title: Reading the result
+      body: "`bridge link` shows each port's state; /sys/class/net/br0/bridge/root_id and bridge_id tell you whether this bridge is root."
+      command: "bridge link; cat /sys/class/net/br0/bridge/root_id"
+      cost: 1
+    - title: Which end blocks?
+      body: On the access-to-access link, the switch with the better (lower) bridge ID keeps its port designated; the other switch's port blocks. That is why acc-2 gets the highest priority.
+      cost: 2
+  misconceptions:
+    - id: access-as-root
+      description: Lowers the priority of an access switch instead of the core
+      mutation:
+        on: mv-sw-acc-1
+        run: ip link set br0 type bridge priority 4096 && sleep 12
+      expectFail: [core-is-root, acc1-backup-root]
+      feedback: The lowest priority wins the election; the root must be the core switch.
+    - id: stp-off-acc2
+      description: Turns spanning tree off on an access switch to stop the blocking
+      mutation:
+        on: mv-sw-acc-2
+        run: |
+          ip link set br0 type bridge stp_state 0
+          sleep 12
+      expectFail: [acc2-blocks-access-link]
+      feedback: Without spanning tree the triangle is a loop that can only end in a broadcast storm.
+  solution:
+    explanation: |
+      Give the core the lowest priority, acc-1 the next and leave acc-2 highest.
+      The core becomes root, both access switches use their core link as root
+      port, and on the access-to-access link acc-1's port is designated while
+      acc-2's port blocks.
+    steps:
+      - { on: mv-sw-core-1, run: "ip link set br0 type bridge priority 4096" }
+      - { on: mv-sw-acc-1, run: "ip link set br0 type bridge priority 8192" }
+      - { on: mv-sw-acc-2, run: "ip link set br0 type bridge priority 32768 && sleep 15" }

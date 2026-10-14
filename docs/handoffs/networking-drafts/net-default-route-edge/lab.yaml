@@ -1,0 +1,161 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: net-default-route-edge
+  title: Send unknown traffic to the regional network edge
+  domain: networking
+  frameworks: [ccna:ip-connectivity]
+  difficulty: easy
+  estimatedMinutes: 10
+  tags: [default-route, static-routing, traceroute]
+  version: 1
+spec:
+  description: |
+    The two campus routers `mv-campus-north` and `mv-campus-south` connect to the
+    district edge router `mv-edge-1`, which connects to `regional-gw`, the
+    regional education network's router (all FRR consoles; you may change only
+    the three Marlow Valley routers).
+
+    | Link | Subnet |
+    |---|---|
+    | mv-campus-north eth1 - mv-edge-1 eth1 | 10.{{octet}}.0.0/30 (.1 edge, .2 north) |
+    | mv-campus-south eth1 - mv-edge-1 eth2 | 10.{{octet}}.0.4/30 (.5 edge, .6 south) |
+    | mv-edge-1 eth3 - regional-gw eth1 | 192.0.2.{{up}}/30 (first usable address edge, second regional) |
+
+    `mv-edge-1` already routes the campus LANs. Nothing on the district side
+    knows the regional network yet. Configure default routes so every campus
+    router sends unknown destinations to `mv-edge-1`, and `mv-edge-1` sends them to
+    `regional-gw`. A traceroute from `classroom-north` to the regional portal
+    `198.51.100.{{portal}}` must pass the north campus router, the edge and the
+    regional router.
+  objectives:
+    - Configure a static default route towards the edge
+    - Chain default routes from the campus to the provider
+    - Verify the path with traceroute
+  params:
+    octet:
+      type: int
+      min: 20
+      max: 90
+    up:
+      type: choice
+      values: [8, 12, 16, 20]
+    portal:
+      type: int
+      min: 10
+      max: 99
+  topology:
+    entry: workstation
+    nodes:
+      - { name: workstation, driver: container, image: jumphost:1, access: [shell] }
+      - { name: mv-campus-north, driver: netdev, image: frr:10, access: [console] }
+      - { name: mv-campus-south, driver: netdev, image: frr:10, access: [console] }
+      - { name: mv-edge-1, driver: netdev, image: frr:10, access: [console] }
+      - { name: regional-gw, driver: netdev, image: frr:10 }
+      - { name: classroom-north, driver: container, image: nettools:1, resources: { cpu: 0.2, memoryMiB: 64 }, access: [shell] }
+      - { name: classroom-south, driver: container, image: nettools:1, resources: { cpu: 0.2, memoryMiB: 64 }, access: [shell] }
+      - { name: regional-portal, driver: container, image: nettools:1, resources: { cpu: 0.2, memoryMiB: 64 } }
+    links:
+      - { a: "mv-campus-north:eth1", b: "mv-edge-1:eth1", subnet: "10.{{octet}}.0.0/30" }
+      - { a: "mv-campus-south:eth1", b: "mv-edge-1:eth2", subnet: "10.{{octet}}.0.4/30" }
+      - { a: "mv-edge-1:eth3", b: "regional-gw:eth1", subnet: "192.0.2.{{up}}/30" }
+      - { a: "mv-campus-north:eth2", b: "classroom-north:eth1", subnet: "10.{{octet}}.10.0/24" }
+      - { a: "mv-campus-south:eth2", b: "classroom-south:eth1", subnet: "10.{{octet}}.30.0/24" }
+      - { a: "regional-gw:eth2", b: "regional-portal:eth1", subnet: "198.51.100.0/24" }
+  setup:
+    - on: mv-campus-north
+      config: |
+        interface eth1
+         ip address 10.{{octet}}.0.2/30
+        interface eth2
+         ip address 10.{{octet}}.10.1/24
+    - on: mv-campus-south
+      config: |
+        interface eth1
+         ip address 10.{{octet}}.0.6/30
+        interface eth2
+         ip address 10.{{octet}}.30.1/24
+    - on: mv-edge-1
+      run: |
+        U={{up}}; printf 'interface eth1\n ip address 10.{{octet}}.0.1/30\ninterface eth2\n ip address 10.{{octet}}.0.5/30\ninterface eth3\n ip address 192.0.2.%s/30\nip route 10.{{octet}}.10.0/24 10.{{octet}}.0.2\nip route 10.{{octet}}.30.0/24 10.{{octet}}.0.6\n' $((U+1)) > /tmp/setup.conf
+        vtysh -f /tmp/setup.conf
+    - on: regional-gw
+      run: |
+        U={{up}}; printf 'interface eth1\n ip address 192.0.2.%s/30\ninterface eth2\n ip address 198.51.100.1/24\nip route 10.{{octet}}.0.0/16 192.0.2.%s\n' $((U+2)) $((U+1)) > /tmp/setup.conf
+        vtysh -f /tmp/setup.conf
+    - { on: classroom-north, run: "ip addr replace 10.{{octet}}.10.20/24 dev eth1 && ip route replace default via 10.{{octet}}.10.1" }
+    - { on: classroom-south, run: "ip addr replace 10.{{octet}}.30.20/24 dev eth1 && ip route replace default via 10.{{octet}}.30.1" }
+    - { on: regional-portal, run: "ip addr replace 198.51.100.{{portal}}/24 dev eth1 && ip route replace default via 198.51.100.1" }
+  checks:
+    - id: north-default
+      description: mv-campus-north has an installed default route via mv-edge-1
+      type: device-cmd
+      on: mv-campus-north
+      command: show ip route 0.0.0.0/0
+      expect: { match: regex, value: "\\* 10\\.{{octet}}\\.0\\.1, via eth1" }
+      skills: [net.routing.static]
+    - id: south-default
+      description: mv-campus-south has an installed default route via mv-edge-1
+      type: device-cmd
+      on: mv-campus-south
+      command: show ip route 0.0.0.0/0
+      expect: { match: regex, value: "\\* 10\\.{{octet}}\\.0\\.5, via eth1" }
+      skills: [net.routing.static]
+    - id: edge-default
+      description: mv-edge-1 has an installed default route via regional-gw
+      type: shell
+      on: mv-edge-1
+      command: |
+        U={{up}}; vtysh -c 'show ip route 0.0.0.0/0' | grep -q "\* 192\.0\.2\.$((U+2)), via eth3"
+      skills: [net.routing.static]
+    - id: traceroute-path
+      description: A traceroute from classroom-north to the portal passes north, the edge and the regional router
+      type: shell
+      on: classroom-north
+      command: |
+        U={{up}}; traceroute -n -w1 -q1 -m6 198.51.100.{{portal}} 2>/dev/null | awk 'NR>1{printf "%s ", $2}'
+      expect: { match: regex, value: "^10\\.{{octet}}\\.10\\.1 10\\.{{octet}}\\.0\\.1 192\\.0\\.2\\.[0-9]+ 198\\.51\\.100\\.{{portal}} $" }
+      timeoutSec: 20
+      skills: [net.routing.static]
+      weight: 2
+    - id: south-reaches-portal
+      description: classroom-south reaches the regional portal
+      type: reachability
+      on: classroom-south
+      target: 198.51.100.{{portal}}
+      skills: [net.routing.static]
+  hints:
+    - title: A default route is a static route to 0.0.0.0/0
+      body: "In configure mode: `ip route 0.0.0.0/0 <next-hop>`. The next hop is the neighbour on the directly connected link."
+      cost: 1
+    - title: Chain them
+      body: Each campus router's default points at the edge; the edge's default points at the regional router. The edge keeps its specific campus routes, so replies find their way back.
+      cost: 1
+  misconceptions:
+    - id: skip-the-edge
+      description: Points the campus routers' defaults straight at the regional router's address
+      mutation:
+        on: mv-campus-north
+        run: |
+          U={{up}}; printf 'ip route 0.0.0.0/0 192.0.2.%s\n' $((U+2)) > /tmp/m.conf; vtysh -f /tmp/m.conf
+      expectFail: [north-default, traceroute-path]
+      feedback: A next hop must be on a connected subnet; mv-campus-north can only hand traffic to mv-edge-1.
+    - id: edge-without-default
+      description: Configures the campus defaults but forgets the edge's own default route
+      mutation:
+        on: mv-campus-north
+        config: |
+          ip route 0.0.0.0/0 10.{{octet}}.0.1
+      expectFail: [edge-default, traceroute-path]
+      feedback: The edge has no route to unknown destinations either, so it drops what the campuses send it.
+  solution:
+    explanation: |
+      Each campus router gets `ip route 0.0.0.0/0` towards its edge link
+      address; mv-edge-1 gets a default towards regional-gw. The regional router
+      already routes the district block back to the edge.
+    steps:
+      - { on: mv-campus-north, config: "ip route 0.0.0.0/0 10.{{octet}}.0.1\n" }
+      - { on: mv-campus-south, config: "ip route 0.0.0.0/0 10.{{octet}}.0.5\n" }
+      - on: mv-edge-1
+        run: |
+          U={{up}}; printf 'ip route 0.0.0.0/0 192.0.2.%s\n' $((U+2)) > /tmp/s.conf; vtysh -f /tmp/s.conf

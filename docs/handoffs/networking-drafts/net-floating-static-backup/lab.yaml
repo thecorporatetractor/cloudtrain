@@ -1,0 +1,180 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: net-floating-static-backup
+  title: Fail over to a backup link with a floating static route
+  domain: networking
+  frameworks: [ccna:ip-connectivity]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [floating-static, administrative-distance, failover]
+  version: 1
+spec:
+  description: |
+    The vocational annex router `mv-annex-1` (FRR console) reaches the district
+    core `mv-core-1` over two links:
+
+    | Link | annex end | core end |
+    |---|---|---|
+    | fibre: `mv-annex-1:eth1` - `mv-core-1:eth1` | 10.{{octet}}.0.2/30 | 10.{{octet}}.0.1/30 |
+    | radio: `mv-annex-1:eth2` - `mv-core-1:eth2` (slow) | 10.{{octet}}.0.6/30 | 10.{{octet}}.0.5/30 |
+
+    The core already routes the annex LAN `10.{{octet}}.{{annex}}.0/24` over the
+    fibre with a backup over the radio. On `mv-annex-1`, configure the route to
+    the district office LAN `10.{{octet}}.1.0/24` so that:
+
+    - it uses the fibre while the fibre is up;
+    - it uses the radio link only when the fibre is down (a floating static
+      route with an administrative distance of your choice above 1);
+    - it moves back to the fibre when the fibre recovers.
+
+    The grader shuts `mv-annex-1:eth1` and checks that `annex-pc` still reaches
+    `office-pc` (`10.{{octet}}.1.10`), then brings the fibre back.
+  objectives:
+    - Configure a static route and a floating static route with a higher distance
+    - Predict which route is installed while both next hops are reachable
+    - Verify failover and failback
+  params:
+    octet:
+      type: int
+      min: 20
+      max: 90
+    annex:
+      type: int
+      min: 60
+      max: 69
+  topology:
+    entry: workstation
+    nodes:
+      - { name: workstation, driver: container, image: jumphost:1, access: [shell] }
+      - { name: mv-annex-1, driver: netdev, image: frr:10, access: [console] }
+      - { name: mv-core-1, driver: netdev, image: frr:10, access: [console] }
+      - { name: annex-pc, driver: container, image: nettools:1, resources: { cpu: 0.2, memoryMiB: 64 }, access: [shell] }
+      - { name: office-pc, driver: container, image: nettools:1, resources: { cpu: 0.2, memoryMiB: 64 }, access: [shell] }
+    links:
+      - { a: "mv-annex-1:eth1", b: "mv-core-1:eth1", subnet: "10.{{octet}}.0.0/30" }
+      - a: "mv-annex-1:eth2"
+        b: "mv-core-1:eth2"
+        subnet: "10.{{octet}}.0.4/30"
+        impair: { latencyMs: 40 }
+      - { a: "mv-annex-1:eth3", b: "annex-pc:eth1", subnet: "10.{{octet}}.{{annex}}.0/24" }
+      - { a: "mv-core-1:eth3", b: "office-pc:eth1", subnet: "10.{{octet}}.1.0/24" }
+  setup:
+    - on: mv-core-1
+      config: |
+        interface eth1
+         ip address 10.{{octet}}.0.1/30
+        interface eth2
+         ip address 10.{{octet}}.0.5/30
+        interface eth3
+         ip address 10.{{octet}}.1.1/24
+        bfd
+         peer 10.{{octet}}.0.2 interface eth1
+          receive-interval 200
+          transmit-interval 200
+        ip route 10.{{octet}}.{{annex}}.0/24 10.{{octet}}.0.2 bfd
+        ip route 10.{{octet}}.{{annex}}.0/24 10.{{octet}}.0.6 200
+    - on: mv-annex-1
+      config: |
+        interface eth1
+         ip address 10.{{octet}}.0.2/30
+        interface eth2
+         ip address 10.{{octet}}.0.6/30
+        interface eth3
+         ip address 10.{{octet}}.{{annex}}.1/24
+        bfd
+         peer 10.{{octet}}.0.1 interface eth1
+          receive-interval 200
+          transmit-interval 200
+    - { on: annex-pc, run: "ip addr replace 10.{{octet}}.{{annex}}.10/24 dev eth1 && ip route replace default via 10.{{octet}}.{{annex}}.1" }
+    - { on: office-pc, run: "ip addr replace 10.{{octet}}.1.10/24 dev eth1 && ip route replace default via 10.{{octet}}.1.1" }
+  checks:
+    - id: fibre-preferred
+      description: With both links up, mv-annex-1 forwards to the office LAN over the fibre
+      type: shell
+      on: mv-annex-1
+      command: ip route get 10.{{octet}}.1.10 | head -1
+      expect: { match: regex, value: "via 10\\.{{octet}}\\.0\\.1 dev eth1" }
+      skills: [net.routing.route-selection]
+    - id: floating-configured
+      description: A static route to the office LAN over the radio with a distance above 1 exists
+      type: device-cmd
+      on: mv-annex-1
+      command: show running-config
+      expect: { match: regex, value: "ip route 10\\.{{octet}}\\.1\\.0/24 10\\.{{octet}}\\.0\\.5 ([2-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])\\b" }
+      skills: [net.routing.floating-static]
+    - id: failover
+      description: With the fibre down, annex-pc's traffic to the office goes over the radio and gets answers
+      type: shell
+      on: mv-annex-1
+      command: |
+        ip link set eth1 down; sleep 3
+        r=$(ip route get 10.{{octet}}.1.10 | head -1)
+        ping -c2 -W2 -I 10.{{octet}}.{{annex}}.1 10.{{octet}}.1.10 >/dev/null 2>&1 && p=ok || p=lost
+        ip link set eth1 up; sleep 4
+        echo "$r | $p"
+      expect: { match: regex, value: "via 10\\.{{octet}}\\.0\\.5 dev eth2.* \\| ok$" }
+      timeoutSec: 30
+      skills: [net.routing.floating-static]
+      weight: 2
+    - id: failback
+      description: After the fibre recovers, traffic goes back over the fibre and annex-pc reaches office-pc
+      type: shell
+      on: mv-annex-1
+      command: |
+        for i in $(seq 10); do ip route get 10.{{octet}}.1.10 | grep -q 'dev eth1' && break; sleep 1; done
+        ip route get 10.{{octet}}.1.10 | head -1
+      expect: { match: regex, value: "via 10\\.{{octet}}\\.0\\.1 dev eth1" }
+      timeoutSec: 20
+      skills: [net.routing.floating-static]
+    - id: end-to-end
+      description: annex-pc reaches office-pc
+      type: reachability
+      on: annex-pc
+      target: 10.{{octet}}.1.10
+      skills: [net.routing.static]
+  hints:
+    - title: Two routes, one prefix
+      body: Configure the fibre route with the default distance (1) and the radio route with a higher distance, e.g. 200. Only the best one is installed; the other waits.
+      command: "show ip route 10.{{octet}}.1.0/24"
+      cost: 1
+    - title: Syntax
+      body: "The distance is the last argument: `ip route 10.{{octet}}.1.0/24 10.{{octet}}.0.5 200`."
+      cost: 2
+  misconceptions:
+    - id: equal-distance
+      description: Adds both routes with the default distance, so the radio carries traffic too
+      mutation:
+        on: mv-annex-1
+        config: |
+          ip route 10.{{octet}}.1.0/24 10.{{octet}}.0.1
+          ip route 10.{{octet}}.1.0/24 10.{{octet}}.0.5
+      expectFail: [floating-configured, fibre-preferred]
+      feedback: With equal distances both routes are installed (ECMP) and some traffic uses the slow radio link even while the fibre is up.
+    - id: no-backup
+      description: Configures only the fibre route
+      mutation:
+        on: mv-annex-1
+        config: |
+          ip route 10.{{octet}}.1.0/24 10.{{octet}}.0.1
+      expectFail: [floating-configured, failover]
+      feedback: Without a second route there is nothing to fall back to when the fibre fails.
+    - id: backup-preferred
+      description: Gives the radio route the lower distance by mistake
+      mutation:
+        on: mv-annex-1
+        config: |
+          ip route 10.{{octet}}.1.0/24 10.{{octet}}.0.1 200
+          ip route 10.{{octet}}.1.0/24 10.{{octet}}.0.5
+      expectFail: [fibre-preferred, floating-configured]
+      feedback: The lower distance wins; the radio would carry all traffic while the fibre sits idle.
+  solution:
+    explanation: |
+      A static route via the fibre (distance 1) plus the same prefix via the radio
+      with distance 200. While eth1 is up only the fibre route is installed; when
+      it goes down FRR withdraws it and installs the floating route.
+    steps:
+      - on: mv-annex-1
+        config: |
+          ip route 10.{{octet}}.1.0/24 10.{{octet}}.0.1
+          ip route 10.{{octet}}.1.0/24 10.{{octet}}.0.5 200

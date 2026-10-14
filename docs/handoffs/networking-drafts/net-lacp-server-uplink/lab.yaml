@@ -1,0 +1,170 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: net-lacp-server-uplink
+  title: Bundle two links to the data-centre server with LACP
+  domain: networking
+  frameworks: [ccna:network-access]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [lacp, 802.3ad, bonding, etherchannel]
+  version: 1
+spec:
+  description: |
+    The student-records server `records-dc` (Linux, shell) is cabled to the
+    data-centre switch `mv-sw-dc-1` (Linux bridge `br0`, shell) twice:
+    `records-dc:eth1` - `mv-sw-dc-1:eth1` and `records-dc:eth2` - `mv-sw-dc-1:eth2`.
+    Today only `eth1` is used. The admin PC `admin-dc` sits on `mv-sw-dc-1:eth3`.
+
+    Bundle both links with LACP (802.3ad) on both sides:
+
+    - on `records-dc`, create `bond0` in 802.3ad mode with fast LACP rate over
+      `eth1` and `eth2`, and move the server address
+      `10.{{octet}}.8.20/24` onto `bond0`;
+    - on `mv-sw-dc-1`, create `bond0` in 802.3ad mode with fast LACP rate over
+      `eth1` and `eth2` and make `bond0` (not the member links) a port of `br0`.
+
+    Both members must be active in the same aggregator, and `admin-dc`
+    (`10.{{octet}}.8.10`) must keep reaching the server when either link fails;
+    the grader takes each link down in turn.
+  objectives:
+    - Build an 802.3ad (LACP) bond on a server and on a switch
+    - Verify that both members join one aggregator with the partner
+    - Prove the bundle survives the loss of a member link
+  params:
+    octet:
+      type: int
+      min: 20
+      max: 90
+  topology:
+    entry: workstation
+    nodes:
+      - { name: workstation, driver: container, image: jumphost:1, access: [shell] }
+      - { name: mv-sw-dc-1, driver: container, image: netsvc:1, resources: { cpu: 0.25, memoryMiB: 96 }, access: [shell] }
+      - { name: records-dc, driver: container, image: netsvc:1, resources: { cpu: 0.25, memoryMiB: 96 }, access: [shell] }
+      - { name: admin-dc, driver: container, image: nettools:1, resources: { cpu: 0.2, memoryMiB: 64 }, access: [shell] }
+    links:
+      - { a: "mv-sw-dc-1:eth1", b: "records-dc:eth1" }
+      - { a: "mv-sw-dc-1:eth2", b: "records-dc:eth2" }
+      - { a: "mv-sw-dc-1:eth3", b: "admin-dc:eth1" }
+  setup:
+    - on: mv-sw-dc-1
+      run: |
+        ip link add br0 type bridge 2>/dev/null || true
+        ip link set eth1 master br0; ip link set eth3 master br0; ip link set br0 up
+    - { on: records-dc, run: "ip addr replace 10.{{octet}}.8.20/24 dev eth1" }
+    - { on: admin-dc, run: "ip addr replace 10.{{octet}}.8.10/24 dev eth1" }
+  checks:
+    - id: server-bond
+      description: records-dc runs an 802.3ad bond with eth1 and eth2 in the same aggregator and the server address on bond0
+      type: shell
+      on: records-dc
+      command: |
+        f=/proc/net/bonding/bond0; [ -f $f ] || exit 1
+        grep -q 'Bonding Mode: IEEE 802.3ad' $f || exit 1
+        ids=$(awk '/^Slave Interface/{s=$3} /Aggregator ID/ && s{print s, $3; s=""}' $f | sort | tr '\n' ' ')
+        agg=$(awk '/Active Aggregator Info/{f=1} f && /Aggregator ID/{print $3; exit}' $f)
+        echo "$ids" | grep -Eq "^eth1 $agg eth2 $agg $" || exit 1
+        grep -A3 'Active Aggregator Info' $f | grep -q 'Partner Mac Address: 00:00:00:00:00:00' && exit 1
+      skills: [net.switching.etherchannel]
+      weight: 2
+    - id: server-address
+      description: The server address sits on bond0
+      type: shell
+      on: records-dc
+      command: ip -4 -o addr show dev bond0 | awk '{print $4}'
+      expect: { match: exact, value: "10.{{octet}}.8.20/24" }
+      skills: [net.switching.etherchannel]
+    - id: switch-bond
+      description: mv-sw-dc-1 runs an 802.3ad bond with eth1 and eth2 in one aggregator, bridged as a single port
+      type: shell
+      on: mv-sw-dc-1
+      command: |
+        f=/proc/net/bonding/bond0; [ -f $f ] || exit 1
+        grep -q 'Bonding Mode: IEEE 802.3ad' $f || exit 1
+        ids=$(awk '/^Slave Interface/{s=$3} /Aggregator ID/ && s{print s, $3; s=""}' $f | sort | tr '\n' ' ')
+        agg=$(awk '/Active Aggregator Info/{f=1} f && /Aggregator ID/{print $3; exit}' $f)
+        echo "$ids" | grep -Eq "^eth1 $agg eth2 $agg $" || exit 1
+        [ -e /sys/class/net/br0/brif/bond0 ] && [ ! -e /sys/class/net/br0/brif/eth1 ] && [ ! -e /sys/class/net/br0/brif/eth2 ]
+      skills: [net.switching.etherchannel]
+      weight: 2
+    - id: reachable
+      description: admin-dc reaches the server
+      type: reachability
+      on: admin-dc
+      target: 10.{{octet}}.8.20
+      skills: [net.switching.etherchannel]
+    - id: survives-link-loss
+      description: The server stays reachable from its bond while each member link is down in turn
+      type: shell
+      on: records-dc
+      command: |
+        ok() { for i in 1 2 3 4 5 6 7 8 9 10; do ping -c1 -W1 -I bond0 10.{{octet}}.8.10 >/dev/null 2>&1 && return 0; done; return 1; }
+        r=pass
+        for m in eth1 eth2; do
+          ip link set $m down; sleep 1
+          ok || r=fail
+          ip link set $m up; sleep 4
+        done
+        ok || r=fail
+        echo $r
+      expect: { match: exact, value: pass }
+      timeoutSec: 60
+      skills: [net.switching.etherchannel]
+      weight: 2
+  hints:
+    - title: Members must be down to join
+      body: Linux enslaves an interface to a bond only while it is down. Create the bond, set the members down, enslave them, then bring the bond up.
+      command: "ip link add bond0 type bond mode 802.3ad lacp_rate fast miimon 100"
+      cost: 1
+    - title: The switch side
+      body: On the switch the bond replaces the member ports in the bridge; remove eth1 from br0 first, then bridge bond0.
+      command: "ip link set eth1 nomaster"
+      cost: 2
+    - title: Check the aggregator
+      body: "/proc/net/bonding/bond0 shows each member's Aggregator ID and the partner's MAC; both members need the active aggregator's ID."
+      command: "cat /proc/net/bonding/bond0"
+      cost: 1
+  misconceptions:
+    - id: server-only
+      description: Bonds the server but leaves the switch ports as two separate bridge ports
+      mutation:
+        on: records-dc
+        run: |
+          ip addr flush dev eth1
+          ip link add bond0 type bond mode 802.3ad lacp_rate fast miimon 100
+          for m in eth1 eth2; do ip link set $m down; ip link set $m master bond0; done
+          ip link set bond0 up; ip addr add 10.{{octet}}.8.20/24 dev bond0
+      expectFail: [switch-bond, server-bond]
+      feedback: LACP needs a partner; with only one side bonding, the members never form one aggregator with the switch.
+    - id: active-backup
+      description: Uses an active-backup bond instead of LACP
+      mutation:
+        on: records-dc
+        run: |
+          ip addr flush dev eth1
+          ip link add bond0 type bond mode active-backup miimon 100
+          for m in eth1 eth2; do ip link set $m down; ip link set $m master bond0; done
+          ip link set bond0 up; ip addr add 10.{{octet}}.8.20/24 dev bond0
+      expectFail: [server-bond]
+      feedback: Active-backup survives a failure but uses one link at a time and does not negotiate with the switch; the task asks for 802.3ad.
+  solution:
+    explanation: |
+      Create an 802.3ad bond on both ends with the two links as members. On the
+      server the address moves to bond0; on the switch bond0 replaces eth1 as the
+      bridge port. LACP puts both members in one aggregator, and the bond keeps
+      forwarding when a member goes down.
+    steps:
+      - on: mv-sw-dc-1
+        run: |
+          ip link set eth1 nomaster
+          ip link add bond0 type bond mode 802.3ad lacp_rate fast miimon 100
+          for m in eth1 eth2; do ip link set $m down; ip link set $m master bond0; done
+          ip link set bond0 up; ip link set bond0 master br0
+      - on: records-dc
+        run: |
+          ip addr flush dev eth1
+          ip link add bond0 type bond mode 802.3ad lacp_rate fast miimon 100
+          for m in eth1 eth2; do ip link set $m down; ip link set $m master bond0; done
+          ip link set bond0 up; ip addr add 10.{{octet}}.8.20/24 dev bond0
+          for i in $(seq 30); do ping -c1 -W1 10.{{octet}}.8.10 >/dev/null 2>&1 && break; sleep 1; done

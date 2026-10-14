@@ -17,10 +17,10 @@ Legend. **Type**: learn = guided first exposure, do = complete a task, fix = rep
 | Containers with Docker and Podman | 12 | 78 | 28 | 1 | 0 | 0 | 106 | B 59, C 47 | 22 |
 | Infrastructure as code with OpenTofu and Terraform | 5 | 50 | 44 | 2 | 0 | 0 | 94 | A 50, B 1, V 43 | 19 |
 | Configuration management and automation | 7 | 61 | 36 | 1 | 0 | 0 | 97 | A 39, B 7, C 45, N 6 | 26 |
-| Network administration | 4 | 45 | 32 | 1 | 0 | 0 | 77 | N 77 | 15 |
-| **Total** | 44 | 482 | 362 | 12 | 4 | 7 | 833 | A 173, B 136, C 218, K 112, V 122, N 83 | 154 |
+| Network administration | 4 | 45 | 32 | 1 | 2 | 0 | 75 | N 77 | 15 |
+| **Total** | 44 | 482 | 362 | 12 | 6 | 7 | 831 | A 173, B 136, C 218, K 112, V 122, N 83 | 154 |
 
-Cross-domain exams: Platform engineer practical capstone. Exam tasks are counted under the domain of each task. Learning labs by type: learn 44, do 345, fix 80, hack 13. New skills proposed: 302.
+Cross-domain exams: Platform engineer practical capstone. Exam tasks are counted under the domain of each task. Learning labs by type: learn 44, do 345, fix 80, hack 13. New skills proposed: 279.
 
 ## Kubernetes
 
@@ -1014,7 +1014,7 @@ Fictional organisation: **Marlow Valley Schools** (A fictional school district w
 
 Quiz-only (no labs): wireless fundamentals and WLAN security (net.wireless.fundamentals), port security and DHCP snooping (net.security.port-security), controller-based and SDN architecture concepts. CCNA v1.1 is the alignment target; third-party sources say v1.1 runs until early February 2027 and a v2.0 blueprint follows (unverified; re-check before launch).
 
-Competencies: `net.fundamentals`, `net.addressing`, `net.switching`, `net.routing`, `net.services`, `net.security`, `net.automation`, `net.troubleshooting` (new).
+Competencies: `net.fundamentals`, `net.addressing`, `net.switching`, `net.routing`, `net.services`, `net.security`, `net.automation`, `net.troubleshooting`.
 
 ### Paths (4)
 
@@ -1072,8 +1072,8 @@ _CloudTrain is not affiliated with or endorsed by Cisco Systems, Inc. or Red Hat
 
 | Lab | Title | Type | Difficulty | Min | Tier | Status | Frameworks | Scenario |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `net-osi-capture-walkthrough` | Follow one web request down the stack in a packet capture | learn | easy | 15 | N | proposed | ccna:network-fundamentals | Capture a north-campus kiosk fetching the district timetable page and record the TCP handshake flags, source and destination ports and the HTTP status code in a report file the grader compares with its own capture. |
-| `net-arp-neighbour-tables` | Read ARP and IPv6 neighbour tables to map hosts to MACs | learn | easy | 10 | N | proposed | ccna:network-fundamentals | Populate and read the IPv4 ARP and IPv6 neighbour tables on mv-campus-south and write the MAC address of the library printer and of the default gateway to a file. |
+| `net-osi-capture-walkthrough` | Follow one web request down the stack in a packet capture | learn | easy | 15 | N | verified | ccna:network-fundamentals | Capture a north-campus kiosk fetching the district timetable page and record the TCP handshake flags, source and destination ports and the HTTP status code in a report file the grader compares with its own capture. |
+| `net-arp-neighbour-tables` | Read ARP and IPv6 neighbour tables to map hosts to MACs | learn | easy | 10 | N | verified | ccna:network-fundamentals | Populate and read the IPv4 ARP and IPv6 neighbour tables on mv-campus-south and write the MAC address of the library printer and of the default gateway to a file. |
 | `net-subnet-east-campus` | Carve a campus block into right-sized subnets | do | easy | 20 | N | proposed | ccna:network-fundamentals | Split Marlow Valley's new 10.40.0.0/22 east-campus block into subnets for 300 students, 120 staff, 40 printers and a point-to-point uplink, then address the router and one host per subnet so every host reaches its gateway. |
 | `net-fix-library-mask` | Repair a host that uses the wrong prefix length | fix | easy | 12 | N | proposed | ccna:network-fundamentals | The south-campus library PC was given a /16 instead of a /24 and cannot reach the printer subnet; correct its addressing so it reaches both its gateway and the printers without touching the router. |
 | `net-ipv6-dual-stack-office` | Add IPv6 to the district office LAN | do | medium | 20 | N | proposed | ccna:network-fundamentals | Give the district office router a global /64 and link-local gateway, send router advertisements so the staff hosts autoconfigure with SLAAC, and prove IPv6 reachability between two office hosts and the router. |
@@ -1875,7 +1875,7 @@ _CloudTrain internal assessment. It is not aligned to, affiliated with or endors
 
 ## Appendix: proposed new skills
 
-302 skills to merge into `content/skills.yaml` after approval.
+279 skills to merge into `content/skills.yaml` after approval.
 
 <details><summary>New skills</summary>
 
@@ -2160,29 +2160,6 @@ _CloudTrain internal assessment. It is not aligned to, affiliated with or endors
 | `automation.network.config-templates` | Render device configurations from Jinja2 templates and push them | automation.network | automation.network.connections, automation.content.templates |
 | `automation.network.backup-facts` | Gather network facts and back up and restore device configurations | automation.network | automation.network.connections |
 | `automation.network.parsing` | Parse device CLI output into structured data and assert on it | automation.network | automation.network.connections, automation.data.filters |
-| `net.fundamentals.arp-nd` | Resolve link-layer addresses with ARP and IPv6 neighbour discovery and read neighbour tables | net.fundamentals | net.fundamentals.models |
-| `net.addressing.ipv6-slaac` | Provide IPv6 addresses with router advertisements and SLAAC | net.addressing | net.addressing.ipv6 |
-| `net.routing.ipv6-static` | Configure IPv6 static and default routes | net.routing | net.addressing.ipv6, net.routing.static |
-| `net.routing.floating-static` | Configure floating static routes with an administrative distance | net.routing | net.routing.static |
-| `net.routing.route-selection` | Predict route selection from prefix length, administrative distance and metric | net.routing | net.routing.static |
-| `net.routing.ospf-tuning` | Tune OSPF cost, DR priority, passive interfaces and default-route origination | net.routing | net.routing.ospf |
-| `net.routing.vrrp` | Configure a VRRP virtual gateway with priority and preemption | net.routing | net.routing.fhrp |
-| `net.switching.inter-vlan` | Route between VLANs with 802.1Q subinterfaces | net.switching | net.switching.trunking, net.routing.static |
-| `net.services.dhcp-relay` | Relay DHCP requests across subnets to a central server | net.services | net.services.dhcp |
-| `net.services.syslog` | Forward device logs to a central syslog server with severity filters | net.services | net.fundamentals.tcp-udp-ports |
-| `net.services.snmp` | Expose and poll device counters with SNMPv3 | net.services | net.fundamentals.tcp-udp-ports |
-| `net.services.qos` | Classify, mark and prioritise traffic on a congested link | net.services | net.fundamentals.tcp-udp-ports |
-| `net.security.firewall-zones` | Build stateful zone-based filtering between inside, DMZ and outside | net.security | net.security.acls |
-| `net.security.device-hardening` | Restrict device management access to secure protocols and trusted sources | net.security | net.fundamentals.tcp-udp-ports |
-| `net.security.wireguard` | Build a site-to-site WireGuard tunnel and route through it | net.security | net.security.vpn |
-| `net.security.ipsec` | Build a site-to-site IPsec tunnel with IKEv2 | net.security | net.security.vpn |
-| `net.automation.json-rpc` | Read and change device configuration through a JSON-RPC or REST API | net.automation | net.automation.apis |
-| `net.automation.netconf-gnmi` | Retrieve operational state with gNMI and YANG paths | net.automation | net.automation.apis |
-| `net.automation.config-templates` | Render device configurations from YAML data with Jinja2 templates | net.automation | net.automation.apis |
-| `net.automation.ansible-network` | Push and back up network device configuration with Ansible | net.automation | net.automation.config-templates |
-| `net.troubleshooting.methodology` | Isolate a fault layer by layer with ping, traceroute and neighbour and route tables | net.troubleshooting | net.fundamentals.models, net.routing.static |
-| `net.troubleshooting.packet-capture` | Capture and read packets with tcpdump to prove where traffic stops | net.troubleshooting | net.fundamentals.tcp-udp-ports |
-| `net.troubleshooting.mtu` | Diagnose MTU and path-MTU problems and fix them with MTU or MSS settings | net.troubleshooting | net.troubleshooting.packet-capture |
 
 </details>
 
@@ -2211,7 +2188,6 @@ _CloudTrain internal assessment. It is not aligned to, affiliated with or endors
 | `awx:24` | service | C | spike | AWX controller pool (Apache-2.0; releases paused upstream), per-learner org or per-learner instance |
 | `galaxy-ng:4` | service | A | proposed | Private Galaxy (Pulp galaxy_ng) for collection publish labs |
 | `srlinux:25` | container | N | spike | Nokia SR Linux; hosted-training EULA to be confirmed |
-| `netsvc:1` | container | N | proposed | Linux services host for network labs: kea/dnsmasq, chrony, rsyslog, snmpd, unbound |
 | `kubeadm:1.37-sec` | containerDisk | K | proposed | kubeadm:1.37 node plus AppArmor profiles, Falco, an offline Trivy DB, gVisor runsc and kube-bench |
 
 ## Appendix: alignment frameworks declared here

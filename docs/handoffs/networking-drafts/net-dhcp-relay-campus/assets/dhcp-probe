@@ -1,0 +1,17 @@
+#!/bin/sh
+# dhcp-probe <iface> [mac]
+# Runs one DHCP exchange (broadcast replies) and prints "<ip> <router> <dns>"
+# without configuring anything. With a MAC, the request comes from a temporary
+# macvlan interface that carries that MAC.
+if=$1; mac=$2; dev=$if
+if [ -n "$mac" ]; then
+  dev=probe0
+  ip link del probe0 2>/dev/null
+  ip link add probe0 link "$if" address "$mac" type macvlan mode bridge && ip link set probe0 up || exit 2
+fi
+s=$(mktemp)
+printf '#!/bin/sh\n[ "$1" = bound ] && echo "$ip $router $dns"\nexit 0\n' > "$s"; chmod +x "$s"
+udhcpc -i "$dev" -B -n -q -f -t 4 -T 2 -s "$s" 2>/dev/null | tail -1
+rm -f "$s"
+[ -n "$mac" ] && ip link del probe0
+exit 0

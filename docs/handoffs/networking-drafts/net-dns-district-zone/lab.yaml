@@ -1,0 +1,191 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: net-dns-district-zone
+  title: Publish district host names in DNS
+  domain: networking
+  frameworks: [ccna:ip-services]
+  difficulty: easy
+  estimatedMinutes: 15
+  tags: [dns, bind, zone, resolver]
+  version: 1
+spec:
+  description: |
+    The district name server `mv-dns-1` (10.{{octet}}.200.53, Linux, shell) runs
+    BIND and is authoritative for `mvschools.example`, but the zone holds only
+    its SOA and NS records (`/var/bind/pri/mvschools.example.zone`).
+
+    1. Add these records and make BIND serve them:
+
+       | Name | Type | Value |
+       |---|---|---|
+       | timetable | A | 10.{{octet}}.210.10 |
+       | timetable | AAAA | 2001:db8:{{octet}}:210::10 |
+       | grades | A | 10.{{octet}}.220.20 |
+       | grades | AAAA | 2001:db8:{{octet}}:220::20 |
+       | tt | CNAME | timetable |
+
+    2. Point the campus hosts `north-host` and `south-host` (shell) at
+       `mv-dns-1` as their only name server, so that
+       `http://tt.mvschools.example/` and `http://grades.mvschools.example/` load
+       from both campuses.
+  objectives:
+    - Add A, AAAA and CNAME records to an authoritative zone
+    - Reload a zone after changing it (serial number)
+    - Configure clients to use the district name server
+  params:
+    octet:
+      type: int
+      min: 20
+      max: 90
+  topology:
+    entry: workstation
+    nodes:
+      - { name: workstation, driver: container, image: jumphost:1, access: [shell] }
+      - { name: mv-core-1, driver: netdev, image: frr:10, access: [console] }
+      - { name: mv-dns-1, driver: container, image: netsvc:1, resources: { cpu: 0.25, memoryMiB: 128 }, access: [shell] }
+      - { name: timetable-dc, driver: container, image: netsvc:1, resources: { cpu: 0.2, memoryMiB: 64 } }
+      - { name: grades-dc, driver: container, image: netsvc:1, resources: { cpu: 0.2, memoryMiB: 64 } }
+      - { name: north-host, driver: container, image: nettools:1, resources: { cpu: 0.2, memoryMiB: 64 }, access: [shell] }
+      - { name: south-host, driver: container, image: nettools:1, resources: { cpu: 0.2, memoryMiB: 64 }, access: [shell] }
+    links:
+      - { a: "mv-core-1:eth1", b: "north-host:eth1", subnet: "10.{{octet}}.10.0/24" }
+      - { a: "mv-core-1:eth2", b: "south-host:eth1", subnet: "10.{{octet}}.30.0/24" }
+      - { a: "mv-core-1:eth3", b: "mv-dns-1:eth1", subnet: "10.{{octet}}.200.0/24" }
+      - { a: "mv-core-1:eth4", b: "timetable-dc:eth1", subnet: "10.{{octet}}.210.0/24" }
+      - { a: "mv-core-1:eth5", b: "grades-dc:eth1", subnet: "10.{{octet}}.220.0/24" }
+  setup:
+    - on: mv-core-1
+      config: |
+        interface eth1
+         ip address 10.{{octet}}.10.1/24
+        interface eth2
+         ip address 10.{{octet}}.30.1/24
+        interface eth3
+         ip address 10.{{octet}}.200.1/24
+        interface eth4
+         ip address 10.{{octet}}.210.1/24
+        interface eth5
+         ip address 10.{{octet}}.220.1/24
+    - on: mv-dns-1
+      run: |
+        ip addr replace 10.{{octet}}.200.53/24 dev eth1; ip route replace default via 10.{{octet}}.200.1
+        rndc-confgen -a -c /etc/bind/rndc.key >/dev/null 2>&1; chown root:named /etc/bind/rndc.key; chmod 640 /etc/bind/rndc.key
+        cat > /etc/bind/named.conf <<'EOC'
+        include "/etc/bind/rndc.key";
+        controls { inet 127.0.0.1 port 953 allow { 127.0.0.1; } keys { "rndc-key"; }; };
+        options {
+          directory "/var/bind";
+          pid-file "/run/named/named.pid";
+          listen-on { any; };
+          listen-on-v6 { none; };
+          allow-query { any; };
+          recursion no;
+        };
+        zone "mvschools.example" { type primary; file "/var/bind/pri/mvschools.example.zone"; };
+        EOC
+        cat > /var/bind/pri/mvschools.example.zone <<'EOC'
+        $TTL 300
+        @   IN SOA mv-dns-1.mvschools.example. hostmaster.mvschools.example. (
+                2026101401 ; serial
+                3600 600 86400 300 )
+            IN NS  mv-dns-1.mvschools.example.
+        mv-dns-1 IN A 10.{{octet}}.200.53
+        EOC
+        chown -R named:named /var/bind/pri
+        named -u named -c /etc/bind/named.conf
+        sleep 1; dig +short @127.0.0.1 mvschools.example SOA >/dev/null
+    - on: timetable-dc
+      run: |
+        ip addr replace 10.{{octet}}.210.10/24 dev eth1; ip route replace default via 10.{{octet}}.210.1
+        mkdir -p /srv/www; echo 'Marlow Valley timetable' > /srv/www/index.html
+        setsid httpd -p 80 -h /srv/www </dev/null >/dev/null 2>&1 &
+    - on: grades-dc
+      run: |
+        ip addr replace 10.{{octet}}.220.20/24 dev eth1; ip route replace default via 10.{{octet}}.220.1
+        mkdir -p /srv/www; echo 'Marlow Valley grades' > /srv/www/index.html
+        setsid httpd -p 80 -h /srv/www </dev/null >/dev/null 2>&1 &
+    - { on: north-host, run: "ip addr replace 10.{{octet}}.10.10/24 dev eth1 && ip route replace default via 10.{{octet}}.10.1 && printf 'nameserver 192.0.2.53\\n' > /etc/resolv.conf" }
+    - { on: south-host, run: "ip addr replace 10.{{octet}}.30.10/24 dev eth1 && ip route replace default via 10.{{octet}}.30.1 && printf 'nameserver 192.0.2.53\\n' > /etc/resolv.conf" }
+  checks:
+    - id: a-records
+      description: mv-dns-1 serves the A records for timetable and grades
+      type: shell
+      on: mv-dns-1
+      command: echo $(dig +short @127.0.0.1 timetable.mvschools.example A) $(dig +short @127.0.0.1 grades.mvschools.example A)
+      expect: { match: exact, value: "10.{{octet}}.210.10 10.{{octet}}.220.20" }
+      skills: [net.services.dns]
+      weight: 2
+    - id: aaaa-records
+      description: mv-dns-1 serves the AAAA records for timetable and grades
+      type: shell
+      on: mv-dns-1
+      command: echo $(dig +short @127.0.0.1 timetable.mvschools.example AAAA) $(dig +short @127.0.0.1 grades.mvschools.example AAAA)
+      expect: { match: exact, value: "2001:db8:{{octet}}:210::10 2001:db8:{{octet}}:220::20" }
+      skills: [net.services.dns]
+    - id: cname-record
+      description: tt is a CNAME for timetable
+      type: shell
+      on: mv-dns-1
+      command: dig +short @127.0.0.1 tt.mvschools.example CNAME
+      expect: { match: exact, value: "timetable.mvschools.example." }
+      skills: [net.services.dns]
+    - id: north-uses-resolver
+      description: north-host resolves through mv-dns-1 and loads the timetable page by its alias
+      type: shell
+      on: north-host
+      command: grep -E '^nameserver' /etc/resolv.conf | tr '\n' ';'; wget -q -T 3 -O- http://tt.mvschools.example/
+      expect: { match: exact, value: "nameserver 10.{{octet}}.200.53;Marlow Valley timetable" }
+      skills: [net.services.dns]
+      weight: 2
+    - id: south-uses-resolver
+      description: south-host resolves through mv-dns-1 and loads the grades page by name
+      type: shell
+      on: south-host
+      command: grep -E '^nameserver' /etc/resolv.conf | tr '\n' ';'; wget -q -T 3 -O- http://grades.mvschools.example/
+      expect: { match: exact, value: "nameserver 10.{{octet}}.200.53;Marlow Valley grades" }
+      skills: [net.services.dns]
+      weight: 2
+  hints:
+    - title: Zone file lines
+      body: "One record per line: `timetable IN A 10.{{octet}}.210.10`, `timetable IN AAAA ...`, `tt IN CNAME timetable`. Names without a trailing dot are relative to the zone."
+      cost: 1
+    - title: Make BIND notice
+      body: Increase the serial, check the file with `named-checkzone mvschools.example <file>` and reload with `rndc reload`.
+      cost: 2
+    - title: Clients
+      body: The hosts read their name server from /etc/resolv.conf.
+      cost: 1
+  misconceptions:
+    - id: no-reload
+      description: Edits the zone file but never reloads BIND
+      mutation:
+        on: mv-dns-1
+        run: |
+          printf 'timetable IN A 10.{{octet}}.210.10\ngrades IN A 10.{{octet}}.220.20\n' >> /var/bind/pri/mvschools.example.zone
+      expectFail: [a-records, cname-record]
+      feedback: BIND keeps serving the zone it loaded until it is reloaded; also bump the serial so secondaries notice.
+    - id: clients-unchanged
+      description: Publishes the records but leaves the hosts on their old name server
+      mutation:
+        on: mv-dns-1
+        run: |
+          f=/var/bind/pri/mvschools.example.zone
+          sed -i 's/2026101401/2026101402/' $f
+          printf 'timetable IN A 10.{{octet}}.210.10\ntimetable IN AAAA 2001:db8:{{octet}}:210::10\ngrades IN A 10.{{octet}}.220.20\ngrades IN AAAA 2001:db8:{{octet}}:220::20\ntt IN CNAME timetable\n' >> $f
+          rndc reload >/dev/null
+      expectFail: [north-uses-resolver, south-uses-resolver]
+      feedback: The server answers, but clients only ask the name server listed in their resolv.conf.
+  solution:
+    explanation: |
+      Append the five records, bump the SOA serial, reload the zone, then make
+      mv-dns-1 the only nameserver in each host's /etc/resolv.conf.
+    steps:
+      - on: mv-dns-1
+        run: |
+          f=/var/bind/pri/mvschools.example.zone
+          sed -i 's/2026101401/2026101402/' $f
+          printf 'timetable IN A 10.{{octet}}.210.10\ntimetable IN AAAA 2001:db8:{{octet}}:210::10\ngrades IN A 10.{{octet}}.220.20\ngrades IN AAAA 2001:db8:{{octet}}:220::20\ntt IN CNAME timetable\n' >> $f
+          named-checkzone mvschools.example $f && rndc reload
+      - { on: north-host, run: "printf 'nameserver 10.{{octet}}.200.53\\n' > /etc/resolv.conf" }
+      - { on: south-host, run: "printf 'nameserver 10.{{octet}}.200.53\\n' > /etc/resolv.conf" }

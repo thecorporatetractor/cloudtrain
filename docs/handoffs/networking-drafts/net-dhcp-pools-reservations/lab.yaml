@@ -1,0 +1,176 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: net-dhcp-pools-reservations
+  title: Serve campus addresses with DHCP pools and reservations
+  domain: networking
+  frameworks: [ccna:ip-services]
+  difficulty: easy
+  estimatedMinutes: 20
+  tags: [dhcp, dnsmasq, reservation]
+  version: 1
+spec:
+  description: |
+    The district DHCP server `mv-dhcp-1` (Linux, shell, dnsmasq and Kea
+    installed) is connected to three campus segments and holds `.5` on each:
+
+    | Interface | Segment | Pool | Gateway |
+    |---|---|---|---|
+    | `eth1` | staff, 10.{{octet}}.20.0/24 (`staff-pc`) | .100 - .199 | 10.{{octet}}.20.1 |
+    | `eth2` | students, 10.{{octet}}.30.0/24 (`student-pc`) | .100 - .249 | 10.{{octet}}.30.1 |
+    | `eth3` | library printers, 10.{{octet}}.40.0/24 (`printer-lib`) | reservations only | 10.{{octet}}.40.1 |
+
+    Every lease must hand out the segment's gateway and the district DNS server
+    `10.{{octet}}.0.53`. The three library printers must always get fixed
+    addresses; their MACs are in `/root/printers.csv` on `mv-dhcp-1`:
+    printer 1 -> 10.{{octet}}.40.11, printer 2 -> .12, printer 3 -> .13. No other
+    device may get an address on the printer segment.
+
+    Configure and start a DHCP server on `mv-dhcp-1` (dnsmasq or Kea). The grader
+    runs DHCP clients on `staff-pc` and `student-pc`, and on `printer-lib` with
+    each printer's MAC.
+  objectives:
+    - Define DHCP pools with router and DNS options per subnet
+    - Reserve fixed addresses by MAC address
+    - Verify leases from the client side
+  params:
+    octet:
+      type: int
+      min: 20
+      max: 90
+    p:
+      type: int
+      min: 10
+      max: 99
+  topology:
+    entry: workstation
+    nodes:
+      - { name: workstation, driver: container, image: jumphost:1, access: [shell] }
+      - { name: mv-dhcp-1, driver: container, image: netsvc:1, resources: { cpu: 0.25, memoryMiB: 128 }, access: [shell] }
+      - { name: staff-pc, driver: container, image: nettools:1, resources: { cpu: 0.2, memoryMiB: 64 }, access: [shell] }
+      - { name: student-pc, driver: container, image: nettools:1, resources: { cpu: 0.2, memoryMiB: 64 }, access: [shell] }
+      - { name: printer-lib, driver: container, image: nettools:1, resources: { cpu: 0.2, memoryMiB: 64 }, access: [shell] }
+    links:
+      - { a: "mv-dhcp-1:eth1", b: "staff-pc:eth1" }
+      - { a: "mv-dhcp-1:eth2", b: "student-pc:eth1" }
+      - { a: "mv-dhcp-1:eth3", b: "printer-lib:eth1" }
+  setup:
+    - on: mv-dhcp-1
+      run: |
+        ip addr replace 10.{{octet}}.20.5/24 dev eth1
+        ip addr replace 10.{{octet}}.30.5/24 dev eth2
+        ip addr replace 10.{{octet}}.40.5/24 dev eth3
+        printf 'printer,mac\nprinter-lib-1,02:4d:56:{{p}}:40:01\nprinter-lib-2,02:4d:56:{{p}}:40:02\nprinter-lib-3,02:4d:56:{{p}}:40:03\n' > /root/printers.csv
+    - { on: staff-pc, file: { path: /usr/local/bin/dhcp-probe, mode: "0755", source: assets/dhcp-probe } }
+    - { on: student-pc, file: { path: /usr/local/bin/dhcp-probe, mode: "0755", source: assets/dhcp-probe } }
+    - { on: printer-lib, file: { path: /usr/local/bin/dhcp-probe, mode: "0755", source: assets/dhcp-probe } }
+  checks:
+    - id: staff-lease
+      description: A staff client gets a pool address with the staff gateway and the district DNS server
+      type: shell
+      on: staff-pc
+      command: dhcp-probe eth1
+      expect: { match: regex, value: "^10\\.{{octet}}\\.20\\.1[0-9][0-9] 10\\.{{octet}}\\.20\\.1 10\\.{{octet}}\\.0\\.53$" }
+      timeoutSec: 20
+      skills: [net.services.dhcp]
+      weight: 2
+    - id: student-lease
+      description: A student client gets a pool address with the student gateway and the district DNS server
+      type: shell
+      on: student-pc
+      command: dhcp-probe eth1
+      expect: { match: regex, value: "^10\\.{{octet}}\\.30\\.(1[0-9][0-9]|2[0-4][0-9]) 10\\.{{octet}}\\.30\\.1 10\\.{{octet}}\\.0\\.53$" }
+      timeoutSec: 20
+      skills: [net.services.dhcp]
+      weight: 2
+    - id: printer-reservations
+      description: Each of the three printer MACs gets its reserved address and the printer gateway
+      type: shell
+      on: printer-lib
+      command: |
+        for n in 1 2 3; do echo "$(dhcp-probe eth1 02:4d:56:{{p}}:40:0$n)"; done | tr '\n' ';'
+      expect: { match: exact, value: "10.{{octet}}.40.11 10.{{octet}}.40.1 10.{{octet}}.0.53;10.{{octet}}.40.12 10.{{octet}}.40.1 10.{{octet}}.0.53;10.{{octet}}.40.13 10.{{octet}}.40.1 10.{{octet}}.0.53;" }
+      timeoutSec: 60
+      skills: [net.services.dhcp]
+      weight: 3
+    - id: printer-segment-closed
+      description: An unknown device on the printer segment gets no address
+      type: shell
+      on: printer-lib
+      command: dhcp-probe eth1 02:4d:56:{{p}}:40:99
+      expect: { match: exact, value: "" }
+      timeoutSec: 30
+      skills: [net.services.dhcp]
+  hints:
+    - title: dnsmasq in a few lines
+      body: "Use one `dhcp-range=set:<tag>,<first>,<last>,<mask>,<lease>` per pool and `dhcp-option=tag:<tag>,option:router,<gw>` for its gateway; `dhcp-option=option:dns-server,<ip>` applies to all. `port=0` turns dnsmasq's DNS off."
+      cost: 1
+    - title: Reservations only
+      body: "A range in `static` mode (`dhcp-range=set:printers,10.{{octet}}.40.0,static,255.255.255.0`) serves only hosts with a `dhcp-host=<mac>,<ip>` entry."
+      cost: 2
+    - title: Run and test
+      body: Start the server with `dnsmasq -C <file>` (it daemonises) and test from a client with `dhcp-probe eth1`, which prints the offered address, router and DNS server.
+      cost: 1
+  misconceptions:
+    - id: server-as-gateway
+      description: Hands out the DHCP server's own address as the default gateway
+      mutation:
+        on: mv-dhcp-1
+        run: |
+          O={{octet}}; f=/etc/dnsmasq.d/district.conf; mkdir -p /etc/dnsmasq.d
+          cat > $f <<EOC
+          port=0
+          interface=eth1,eth2,eth3
+          dhcp-range=set:staff,10.$O.20.100,10.$O.20.199,255.255.255.0,12h
+          dhcp-range=set:students,10.$O.30.100,10.$O.30.249,255.255.255.0,12h
+          dhcp-range=set:printers,10.$O.40.0,static,255.255.255.0
+          dhcp-option=option:dns-server,10.$O.0.53
+          dhcp-host=02:4d:56:{{p}}:40:01,10.$O.40.11
+          dhcp-host=02:4d:56:{{p}}:40:02,10.$O.40.12
+          dhcp-host=02:4d:56:{{p}}:40:03,10.$O.40.13
+          EOC
+          dnsmasq -C $f
+      expectFail: [staff-lease, student-lease, printer-reservations]
+      feedback: Without a router option per pool dnsmasq offers its own address as gateway; the gateways are the .1 routers.
+    - id: printers-in-a-pool
+      description: Gives the printer segment a dynamic pool and forgets the reservations
+      mutation:
+        on: mv-dhcp-1
+        run: |
+          O={{octet}}; f=/etc/dnsmasq.d/district.conf; mkdir -p /etc/dnsmasq.d
+          cat > $f <<EOC
+          port=0
+          interface=eth1,eth2,eth3
+          dhcp-range=set:staff,10.$O.20.100,10.$O.20.199,255.255.255.0,12h
+          dhcp-option=tag:staff,option:router,10.$O.20.1
+          dhcp-range=set:students,10.$O.30.100,10.$O.30.249,255.255.255.0,12h
+          dhcp-option=tag:students,option:router,10.$O.30.1
+          dhcp-range=set:printers,10.$O.40.100,10.$O.40.200,255.255.255.0,12h
+          dhcp-option=tag:printers,option:router,10.$O.40.1
+          dhcp-option=option:dns-server,10.$O.0.53
+          EOC
+          dnsmasq -C $f
+      expectFail: [printer-reservations, printer-segment-closed]
+      feedback: Printers need the same address every time; reserve them by MAC and serve nothing else on that segment.
+  solution:
+    explanation: |
+      One dnsmasq file: a tagged range and router option per staff and student
+      pool, a static-only range for the printer segment with one dhcp-host line
+      per printer MAC, and the DNS server option for everyone.
+    steps:
+      - on: mv-dhcp-1
+        run: |
+          O={{octet}}; f=/etc/dnsmasq.d/district.conf; mkdir -p /etc/dnsmasq.d
+          cat > $f <<EOC
+          port=0
+          interface=eth1,eth2,eth3
+          dhcp-range=set:staff,10.$O.20.100,10.$O.20.199,255.255.255.0,12h
+          dhcp-option=tag:staff,option:router,10.$O.20.1
+          dhcp-range=set:students,10.$O.30.100,10.$O.30.249,255.255.255.0,12h
+          dhcp-option=tag:students,option:router,10.$O.30.1
+          dhcp-range=set:printers,10.$O.40.0,static,255.255.255.0
+          dhcp-option=tag:printers,option:router,10.$O.40.1
+          dhcp-option=option:dns-server,10.$O.0.53
+          EOC
+          tail -n +2 /root/printers.csv | while IFS=, read -r name mac; do n=${name##*-}; echo "dhcp-host=$mac,10.$O.40.1$n" >> $f; done
+          dnsmasq -C $f
