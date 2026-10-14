@@ -2,6 +2,7 @@ import { Kysely, PostgresDialect, sql, type Transaction } from 'kysely';
 import { Migrator, type Migration, type MigrationProvider } from 'kysely/migration';
 import pg from 'pg';
 import * as m0001 from './migrations/0001_platform.js';
+import * as m0002 from './migrations/0002_invitation_lookup.js';
 import type { DB } from './schema.js';
 
 export type Db = Kysely<DB>;
@@ -42,7 +43,7 @@ export function migrationProvider(appRole: string): MigrationProvider {
     up: (db) => mod.up(db, appRole),
     down: (db) => mod.down(db),
   });
-  return { getMigrations: async () => ({ '0001_platform': bind(m0001) }) };
+  return { getMigrations: async () => ({ '0001_platform': bind(m0001), '0002_invitation_lookup': bind(m0002) }) };
 }
 
 /** Applies pending migrations; run as the schema owner. */

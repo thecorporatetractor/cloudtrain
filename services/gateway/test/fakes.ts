@@ -1,7 +1,7 @@
 import { PassThrough } from 'node:stream';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import type { Principal } from '../src/auth.js';
+import { devPrincipal, type Principal } from '../src/auth.js';
 import { loadContent, type Content } from '../src/content/load.js';
 import { ConflictError, type ExecHandle, type ExecStreams, type ExecTarget, type LabCluster } from '../src/kube/cluster.js';
 import type { Compiler } from '../src/kube/compile.js';
@@ -19,7 +19,7 @@ export function realContent(): Promise<Content> {
   return cached;
 }
 
-export const alice: Principal = { sub: 'alice', name: 'Alice', email: 'alice@quillmoor.example', orgId: 'org-a', orgName: 'Org A', team: 'Ops', roles: ['learner'] };
+export const alice: Principal = devPrincipal({ sub: 'alice', name: 'Alice', email: 'alice@quillmoor.example', orgId: 'org-a', orgName: 'Org A', orgSlug: 'org-a', team: 'Ops', roles: ['learner'] });
 export const bob: Principal = { ...alice, sub: 'bob', name: 'Bob' };
 
 const clone = <T>(v: T): T => structuredClone(v);
