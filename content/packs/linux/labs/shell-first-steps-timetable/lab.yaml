@@ -1,0 +1,219 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: shell-first-steps-timetable
+  title: Find your way around the timetable office workstation
+  domain: linux
+  frameworks: [lpic1:gnu-commands, linuxplus:services-users]
+  difficulty: easy
+  estimatedMinutes: 10
+  tags: [shell, navigation, ls, find, wc]
+  version: 1
+spec:
+  description: |
+    Welcome to the Tallowmere Rail timetable office. Planners keep their work on the
+    shared workstation `tr-timetable-01` under `/srv/timetable`, and nobody remembers
+    where the drafts went.
+
+    There are exactly **three draft timetables** somewhere below `/srv/timetable`;
+    each draft's file name starts with `draft-`. Find them, work out which one was
+    **modified most recently**, and count its lines.
+
+    Write your answer to `~/answers/newest.txt` as one line holding the draft's
+    **absolute path** and its **line count**, for example:
+
+    ```
+    /srv/timetable/some/dir/draft-example.tt 42
+    ```
+
+    (`wc -l` output, `42 /srv/...`, is accepted too.) Only read the drafts: do not
+    edit, move or `touch` them.
+  objectives:
+    - Move around the filesystem with cd, ls and pwd
+    - Sort files by modification time
+    - Count lines and write an answer to a file
+  params:
+    newest:
+      type: choice
+      values: [autumn, engineering]
+    lines:
+      type: int
+      min: 120
+      max: 480
+  topology:
+    entry: tr-timetable-01
+    nodes:
+      - name: tr-timetable-01
+        driver: container
+        image: linux-pod-deb:24.04
+        access: [shell]
+  setup:
+    - on: tr-timetable-01
+      run: |
+        set -eu
+        rm -rf /srv/timetable
+        T=/srv/timetable
+        mkdir -p $T/2026-q3 $T/planning/autumn $T/engineering/possessions $T/archive/2025 $T/templates
+        # Three drafts. Their names are chosen so alphabetical order never gives the answer.
+        lines_for() { case $1 in {{newest}}) echo {{lines}} ;; autumn) echo 311 ;; engineering) echo 207 ;; esac; }
+        mk() { n=$1; f=$2; : > "$f"; i=1; while [ $i -le "$n" ]; do printf 'TR%04d %02d:%02d platform %d\n' $((1000+i)) $((i%24)) $((i*7%60)) $((i%6+1)) >> "$f"; i=$((i+1)); done; }
+        mk 501 $T/2026-q3/draft-weekend.tt
+        mk "$(lines_for autumn)" $T/planning/autumn/draft-autumn.tt
+        mk "$(lines_for engineering)" $T/engineering/possessions/draft-engineering.tt
+        touch -d '2026-09-02 08:15' $T/2026-q3/draft-weekend.tt
+        if [ '{{newest}}' = autumn ]; then
+          touch -d '2026-10-12 16:40' $T/planning/autumn/draft-autumn.tt
+          touch -d '2026-09-30 11:05' $T/engineering/possessions/draft-engineering.tt
+        else
+          touch -d '2026-09-28 09:30' $T/planning/autumn/draft-autumn.tt
+          touch -d '2026-10-11 17:55' $T/engineering/possessions/draft-engineering.tt
+        fi
+        # Decoys: newer than every draft, but not drafts.
+        printf 'Remember: drafts are named draft-*.tt\n' > $T/planning/README
+        mk 900 $T/archive/2025/final-winter.tt
+        mk 15 $T/templates/blank.tt
+        touch -d '2026-10-13 07:00' $T/planning/README $T/archive/2025/final-winter.tt
+        touch -d '2025-01-10 10:00' $T/templates/blank.tt
+        chmod -R a+rX,go-w $T
+        # Baseline of the drafts (content + mtime) for the read-only check.
+        mkdir -p /var/lib/cloudtrain
+        find $T -name 'draft-*' -printf '%p %T@\n' | sort > /var/lib/cloudtrain/drafts.mtime
+        install -d -o learner -g learner -m 0755 /home/learner/answers
+        rm -f /home/learner/answers/newest.txt
+  checks:
+    - id: answer-exists
+      description: ~/answers/newest.txt exists and is not empty
+      type: shell
+      on: tr-timetable-01
+      skills: [linux.shell.navigation]
+      weight: 0.5
+      command: test -s /home/learner/answers/newest.txt && echo ok || echo missing
+      expect: {match: exact, value: ok}
+    - id: names-newest
+      description: The answer names the most recently modified draft by its absolute path
+      type: shell
+      on: tr-timetable-01
+      skills: [linux.shell.navigation]
+      weight: 2
+      command: |
+        case '{{newest}}' in autumn) p=/srv/timetable/planning/autumn/draft-autumn.tt ;; *) p=/srv/timetable/engineering/possessions/draft-engineering.tt ;; esac
+        tr -s ' \t' '\n\n' < /home/learner/answers/newest.txt | grep -qxF "$p" && echo found || echo absent
+      expect: {match: exact, value: found}
+    - id: only-one-draft
+      description: The answer names one draft only
+      type: shell
+      on: tr-timetable-01
+      skills: [linux.shell.navigation]
+      weight: 0.5
+      command: grep -o 'draft-[a-z]*\.tt' /home/learner/answers/newest.txt | sort -u | wc -l
+      expect: {match: exact, value: "1"}
+    - id: line-count
+      description: The answer holds the newest draft's line count
+      type: shell
+      on: tr-timetable-01
+      skills: [linux.shell.navigation]
+      weight: 1.5
+      command: |
+        tr -s ' \t' '\n\n' < /home/learner/answers/newest.txt | grep -qx '{{lines}}' && echo found || echo absent
+      expect: {match: exact, value: found}
+    - id: drafts-untouched
+      description: The drafts were not modified, moved or touched
+      type: shell
+      on: tr-timetable-01
+      skills: [linux.shell.navigation]
+      weight: 0.5
+      command: find /srv/timetable -name 'draft-*' -printf '%p %T@\n' | sort | cmp -s /var/lib/cloudtrain/drafts.mtime - && echo unchanged || echo changed
+      expect: {match: exact, value: unchanged}
+  hints:
+    - title: Search instead of clicking around
+      body: "`find` walks a whole directory tree and can match file names with a glob."
+      command: find /srv/timetable -name 'draft-*'
+      cost: 1
+    - title: Newest first
+      body: "`ls -l` shows modification times and `-t` sorts by them, newest first. You can give `ls` several files at once."
+      command: ls -lt /srv/timetable/*/draft-* /srv/timetable/*/*/draft-*
+      cost: 1
+    - title: Counting lines
+      body: "`wc -l FILE` prints the line count followed by the file name, which is an accepted answer format. Redirect it with `>` into ~/answers/newest.txt."
+      cost: 2
+  misconceptions:
+    - id: newest-file-not-draft
+      description: Takes the newest file in the tree, which is not a draft.
+      feedback: "The README and the 2025 archive were changed after every draft. Limit the search to files named draft-* before sorting by time."
+      expectFail: [names-newest]
+      mutation:
+        on: tr-timetable-01
+        as: learner
+        run: |
+          f=$(find /srv/timetable -type f -printf '%T@ %p\n' | sort -n | tail -1 | cut -d' ' -f2)
+          wc -l "$f" > ~/answers/newest.txt
+    - id: alphabetical-last
+      description: Uses the default ls order (alphabetical) and takes the last draft.
+      feedback: "Plain ls sorts by name. Add -t to sort by modification time."
+      expectFail: [names-newest, line-count]
+      mutation:
+        on: tr-timetable-01
+        as: learner
+        run: |
+          f=$(find /srv/timetable -name 'draft-*' -printf '%f %p\n' | sort | tail -1 | cut -d' ' -f2)
+          wc -l "$f" > ~/answers/newest.txt
+    - id: relative-path
+      description: Writes the path relative to the current directory.
+      feedback: "An absolute path starts with /. Relative paths depend on where the reader is standing."
+      expectFail: [names-newest]
+      mutation:
+        on: tr-timetable-01
+        as: learner
+        run: |
+          cd /srv/timetable
+          f=$(ls -t */draft-* */*/draft-* | head -1)
+          wc -l "$f" > ~/answers/newest.txt
+    - id: byte-count
+      description: Counts bytes or words instead of lines.
+      feedback: "wc -c counts bytes and wc -w words; the planners asked for lines (wc -l)."
+      expectFail: [line-count]
+      mutation:
+        on: tr-timetable-01
+        as: learner
+        run: |
+          f=$(ls -t $(find /srv/timetable -name 'draft-*') | head -1)
+          wc -c "$f" > ~/answers/newest.txt
+    - id: touched-drafts
+      description: Opens the drafts in a way that changes their timestamps (e.g. touch, or saving in an editor).
+      feedback: "Reading never needs to change a file. touch or :w in an editor updates the modification time, which destroys the very evidence you were asked for."
+      expectFail: [drafts-untouched]
+      mutation:
+        on: tr-timetable-01
+        as: admin
+        run: find /srv/timetable -name 'draft-*' -exec touch {} +
+  solution:
+    explanation: |
+      `find` lists the three drafts wherever they are; `ls -t` sorts them newest
+      first; `wc -l` counts the lines of the winner and prints `count path`, which is
+      an accepted answer format.
+    steps:
+      - on: tr-timetable-01
+        as: learner
+        run: |
+          f=$(ls -t $(find /srv/timetable -name 'draft-*' -type f) | head -1)
+          mkdir -p ~/answers
+          wc -l "$f" > ~/answers/newest.txt
+          cat ~/answers/newest.txt
+    alternatives:
+      - id: find-printf-sort
+        description: Let find print epoch mtimes, sort numerically and write `path count`.
+        steps:
+          - on: tr-timetable-01
+            as: learner
+            run: |
+              f=$(find /srv/timetable -type f -name 'draft-*' -printf '%T@ %p\n' | sort -n | tail -1 | cut -d' ' -f2-)
+              printf '%s %s\n' "$f" "$(wc -l < "$f")" > ~/answers/newest.txt
+      - id: stat-by-hand
+        description: Inspect each draft with stat, pick the newest by eye, then count its lines.
+        steps:
+          - on: tr-timetable-01
+            as: learner
+            run: |
+              for f in $(find /srv/timetable -name 'draft-*'); do stat -c '%Y %n' "$f"; done | sort -rn | head -1 | while read -r _ f; do
+                n=$(cat "$f" | wc -l); echo "$f $n" > ~/answers/newest.txt
+              done
