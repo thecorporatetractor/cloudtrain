@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// lab-verify: validates CloudTrain content.
+// lab-verify: validates CloudTrain content (labs, skills, frameworks, packs, content/curriculum.yaml).
 //   lab-verify [contentDir] [--json] [--strict] [--verbose]
 // Exit code 1 on any error or denylist hit (and on warnings with --strict).
 import path from "node:path";
@@ -26,6 +26,10 @@ if (json) {
   console.log(`content: ${rel(contentDir)}`);
   console.log(`skills: ${r.skills}  framework objectives: ${r.frameworks}  labs: ${r.labs.length}\n`);
   for (const l of r.labs) console.log(`  ${l.ok ? "PASS" : "FAIL"}  ${l.id}  (${l.checks} checks)`);
+  if (r.curriculum) {
+    const c = r.curriculum;
+    console.log(`\ncurriculum: ${c.labs} labs (${c.examTasks} exam tasks; ${c.verified} verified, ${c.built} built, ${c.proposed} proposed), ${c.paths} paths, ${c.exams} exams, ${c.newSkills} new skills`);
+  }
   const shown = r.findings.filter((f) => verbose || f.level !== "info");
   if (shown.length) console.log("");
   for (const f of shown) console.log(`${f.level.toUpperCase().padEnd(5)} ${rel(f.file)}${f.path ? ` ${f.path}` : ""}: ${f.message}`);

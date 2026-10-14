@@ -1,13 +1,18 @@
 import { createRequire } from "node:module";
 import { Ajv2020, type ErrorObject } from "ajv/dist/2020.js";
 import type { Lab } from "./types.generated.js";
+import type { Curriculum } from "./curriculum.generated.js";
 
 export type * from "./types.generated.js";
+export type { Curriculum } from "./curriculum.generated.js";
 
 const require = createRequire(import.meta.url);
 
 /** The raw JSON Schema (draft 2020-12) for `cloudtrain.dev/v3` labs. */
 export const labSchema: Record<string, unknown> = require("../schema/lab.schema.json");
+
+/** The raw JSON Schema (draft 2020-12) for the `cloudtrain.dev/v1` Curriculum document. */
+export const curriculumSchema: Record<string, unknown> = require("../schema/curriculum.schema.json");
 
 export const LAB_API_VERSION = "cloudtrain.dev/v3" as const;
 
@@ -24,6 +29,7 @@ export interface ValidationResult {
 
 const ajv = new Ajv2020({ allErrors: true, strict: false, useDefaults: false });
 const compiled = ajv.compile<Lab>(labSchema);
+const compiledCurriculum = ajv.compile<Curriculum>(curriculumSchema);
 
 function toIssue(e: ErrorObject): ValidationIssue {
   let message = e.message ?? "invalid";
@@ -48,6 +54,25 @@ export function validateLab(doc: unknown): ValidationResult {
     return true;
   });
   return { valid, issues: unique };
+}
+
+/**
+ * Validates a parsed content/curriculum.yaml against the curriculum schema (shape only;
+ * cross-references such as lab ids, skills and framework refs are checked by tools/lab-verify).
+ */
+export function validateCurriculum(doc: unknown): ValidationResult {
+  const valid = compiledCurriculum(doc) as boolean;
+  const issues = valid ? [] : (compiledCurriculum.errors ?? []).map(toIssue);
+  const seen = new Set<string>();
+  return {
+    valid,
+    issues: issues.filter((i) => {
+      const k = `${i.path}|${i.message}`;
+      if (seen.has(k)) return false;
+      seen.add(k);
+      return true;
+    }),
+  };
 }
 
 /** Type guard form of {@link validateLab}. */

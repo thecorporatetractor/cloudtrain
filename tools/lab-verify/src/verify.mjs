@@ -4,6 +4,7 @@ import path from "node:path";
 import YAML from "yaml";
 import { validateLab, referencedParams } from "@cloudtrain/lab-schema";
 import { scanText } from "./denylist.mjs";
+import { checkCurriculum } from "./curriculum.mjs";
 
 /** @typedef {{ level: "error" | "warn" | "info", file: string, path?: string, message: string }} Finding */
 
@@ -426,6 +427,8 @@ export async function verifyContent(contentDir, opts = {}) {
   const catalog = await loadCatalog(opts.catalogFile ?? path.resolve(contentDir, "../deploy/images/catalog.yaml"), findings);
   const usedSkills = new Set();
   const labs = [];
+  /** @type {Map<string, { domain?: string, frameworks?: string[] }>} */
+  const packLabs = new Map();
   const packsDir = path.join(contentDir, "packs");
   for (const pack of existsSync(packsDir) ? (await readdir(packsDir)).sort() : []) {
     const packDir = path.join(packsDir, pack);
@@ -441,6 +444,7 @@ export async function verifyContent(contentDir, opts = {}) {
       const doc = await checkLab(labFile, skills, frameworkRefs, findings, { catalog, usedSkills });
       const ok = findings.filter((f) => f.level === "error").length === before;
       labs.push({ file: labFile, id: doc?.metadata?.id ?? lab, ok, checks: doc?.spec?.checks?.length ?? 0 });
+      packLabs.set(doc?.metadata?.id ?? lab, { domain: doc?.metadata?.domain, frameworks: doc?.metadata?.frameworks ?? [] });
       labIds.add(lab);
     }
     await checkPack(packDir, labIds, findings);
@@ -450,6 +454,8 @@ export async function verifyContent(contentDir, opts = {}) {
   for (const id of skills.keys()) {
     if (!usedSkills.has(id)) findings.push({ level: "info", file: skillsFile, path: id, message: "no lab check is tagged with this skill" });
   }
+  // The curriculum (proposal and source of truth for paths and exams), when present.
+  const curriculum = await checkCurriculum(path.join(contentDir, "curriculum.yaml"), { skills, frameworkRefs, catalog, packLabs }, findings);
   const denylistHits = await scanDenylist(contentDir);
-  return { skills: skills.size, frameworks: frameworkRefs.size, labs, findings, denylistHits };
+  return { skills: skills.size, frameworks: frameworkRefs.size, labs, curriculum, findings, denylistHits };
 }

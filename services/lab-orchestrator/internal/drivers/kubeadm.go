@@ -46,11 +46,14 @@ type KubeadmDriver struct {
 	Container     *ContainerDriver
 	Session       *SessionRuntime
 	ImageRegistry string
+	// Disks selects ephemeral (containerDisk) or persistent root disks.
+	Disks VMDiskOptions
 }
 
 var (
 	_ NodeDriver     = (*KubeadmDriver)(nil)
 	_ AccessProvider = (*KubeadmDriver)(nil)
+	_ Hibernator     = (*KubeadmDriver)(nil)
 )
 
 func (d *KubeadmDriver) Name() labsv1.DriverName { return labsv1.DriverK8sCluster }
@@ -162,6 +165,7 @@ func (d *KubeadmDriver) Provision(ctx context.Context, ref NodeRef) (NodeState, 
 		vm := buildVM(ref.Session, net, vmSpec{
 			Name: l.vms[i], Hostname: m.Name, IP: h.IP, Image: imageWithRegistry(d.ImageRegistry, img.Image),
 			Cores: int64(cores), MemMiB: mem, CISecret: ci, Labels: vmLabels(ref, m.Name),
+			Disk: d.Disks, DiskSize: img.DiskSize,
 		})
 		if err := setOwner(ref.Session, vm, d.Client); err != nil {
 			return fail(err)
@@ -170,6 +174,11 @@ func (d *KubeadmDriver) Provision(ctx context.Context, ref NodeRef) (NodeState, 
 			if IsPermanent(err) {
 				return fail(err)
 			}
+			return NodeState{Phase: labsv1.NodeProvisioning, Message: err.Error()}, err
+		}
+	}
+	if d.Disks.Persistent { // resume after hibernate
+		if err := setRunStrategy(ctx, d.Client, d.reader(), ref.Namespace(), l.vms, "Always"); err != nil {
 			return NodeState{Phase: labsv1.NodeProvisioning, Message: err.Error()}, err
 		}
 	}
@@ -459,21 +468,41 @@ func (d *KubeadmDriver) observe(ctx context.Context, ref NodeRef, l kubeadmLayou
 	for _, m := range l.members {
 		details["ip."+m.Name] = l.hosts[m.Name].IP
 	}
-	state := NodeState{Phase: labsv1.NodeReady, InstanceID: st.instance, Details: details}
+	boot, instance := st.instance, st.instance
+	if d.Disks.Persistent {
+		if instance, err = vmIdentity(ctx, d.reader(), ref.Namespace(), l.vms); err != nil {
+			return NodeState{}, err
+		}
+	}
+	state := NodeState{Phase: labsv1.NodeReady, InstanceID: instance, Details: details}
 	cpVM := memberVM(ref, l.cp.Name)
 	done, err := vmAnnotation(ctx, d.reader(), ref.Namespace(), cpVM, AnnotationBootstrapped)
 	if err != nil {
 		return NodeState{}, err
 	}
-	if done == st.instance {
-		return state, nil
+	script, waitMsg := convergeScript(ref, l), "kubeadm cluster bootstrapping"
+	if done == instance {
+		if boot == instance {
+			return state, nil
+		}
+		// Bootstrapped disks, new boot (resume): the cluster keeps whatever
+		// the learner did to it, so only wait for the API and every member's
+		// ssh instead of converging to the template again.
+		booted, err := vmAnnotation(ctx, d.reader(), ref.Namespace(), cpVM, AnnotationBooted)
+		if err != nil {
+			return NodeState{}, err
+		}
+		if booted == boot {
+			return state, nil
+		}
+		script, waitMsg = resumeScript(ref, l), "kubeadm cluster resuming"
 	}
-	waiting := NodeState{Phase: labsv1.NodeProvisioning, Message: "kubeadm cluster bootstrapping", InstanceID: st.instance}
+	waiting := NodeState{Phase: labsv1.NodeProvisioning, Message: waitMsg, InstanceID: instance}
 	if !converge {
 		return waiting, nil
 	}
 	res, err := execOnCluster(ctx, d.Container, ref, ExecRequest{
-		Command: []string{"/bin/sh", "-c", convergeScript(ref, l)}, Timeout: 60 * time.Second,
+		Command: []string{"/bin/sh", "-c", script}, Timeout: 60 * time.Second,
 	})
 	if err != nil {
 		waiting.Message = "waiting for the entry node to reach the cluster"
@@ -484,13 +513,43 @@ func (d *KubeadmDriver) observe(ctx context.Context, ref NodeRef, l kubeadmLayou
 		if out == "" {
 			out = strings.TrimSpace(res.Stderr)
 		}
-		waiting.Message = "kubeadm cluster bootstrapping: " + strings.TrimPrefix(lastLine(out), "WAIT ")
+		waiting.Message = waitMsg + ": " + strings.TrimPrefix(lastLine(out), "WAIT ")
 		return waiting, nil
 	}
-	if err := annotateVM(ctx, d.Client, ref.Namespace(), cpVM, st.instance); err != nil {
+	if err := annotateVMWith(ctx, d.Client, ref.Namespace(), cpVM,
+		map[string]string{AnnotationBootstrapped: instance, AnnotationBooted: boot}); err != nil {
 		return NodeState{}, err
 	}
 	return state, nil
+}
+
+// resumeScript checks a resumed cluster from the admin sidecar: API server
+// ready and every member reachable over ssh. Prints READY or "WAIT <reason>".
+func resumeScript(ref NodeRef, l kubeadmLayout) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "export KUBECONFIG=%s\n", AdminKubeconfigPath(ref.Node.Name))
+	b.WriteString(`kubectl get --raw=/readyz >/dev/null 2>&1 || { echo "WAIT API server not reachable yet"; exit 0; }
+`)
+	for _, m := range l.members {
+		q := shellQuote([]string{m.Name})
+		fmt.Fprintf(&b, "ssh -T %s true >/dev/null 2>&1 || { echo \"WAIT node %s not reachable\"; exit 0; }\n", q, m.Name)
+	}
+	b.WriteString("echo READY\n")
+	return b.String()
+}
+
+// Hibernate stops every member VM (runStrategy Halted) when the disks are
+// persistent; the next Provision starts them again. On ephemeral
+// containerDisks the cluster keeps running.
+func (d *KubeadmDriver) Hibernate(ctx context.Context, ref NodeRef) error {
+	if !d.Disks.Persistent {
+		return fmt.Errorf("kubeadm cluster %s boots from ephemeral disks: %w", ref.Node.Name, ErrUnsupported)
+	}
+	l, err := d.layout(ref)
+	if err != nil {
+		return err
+	}
+	return client.IgnoreNotFound(setRunStrategy(ctx, d.Client, d.reader(), ref.Namespace(), l.vms, "Halted"))
 }
 
 func lastLine(s string) string {
@@ -505,6 +564,9 @@ func (d *KubeadmDriver) Status(ctx context.Context, ref NodeRef) (NodeState, err
 	l, err := d.layout(ref)
 	if err != nil {
 		return NodeState{Phase: labsv1.NodeFailed, Message: err.Error()}, err
+	}
+	if ref.Session.Spec.Hibernate && d.Disks.Persistent {
+		return stoppedState(ctx, d.reader(), ref.Namespace(), l.vms)
 	}
 	return d.observe(ctx, ref, l, false)
 }
@@ -567,15 +629,22 @@ func (d *KubeadmDriver) Connect(_ context.Context, ref NodeRef, access labsv1.Ac
 	return hostEndpoint(ref, l.cpHost.IP)
 }
 
-// Reset deletes the member VMs; Provision recreates them (fresh disks, a new
-// cluster with the same PKI).
+// Reset deletes the member VMs (and their disks); Provision recreates them
+// (fresh disks, a new cluster with the same PKI). ErrInProgress until the
+// old VMs and disks are gone.
 func (d *KubeadmDriver) Reset(ctx context.Context, ref NodeRef) error {
 	l, err := d.layout(ref)
 	if err != nil {
 		return err
 	}
-	_, err = deleteVMs(ctx, d.Client, d.reader(), ref.Session, l.vms)
-	return err
+	gone, err := deleteVMs(ctx, d.Client, d.reader(), ref.Session, l.vms)
+	if err != nil {
+		return err
+	}
+	if !gone {
+		return inProgress("kubeadm cluster %s VMs are being deleted for reset", ref.Node.Name)
+	}
+	return nil
 }
 
 // Destroy deletes the VMs and Secrets; ErrInProgress until the VMs are gone.

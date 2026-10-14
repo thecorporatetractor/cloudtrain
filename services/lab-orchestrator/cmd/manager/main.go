@@ -30,7 +30,8 @@ func main() {
 		metricsAddr, probeAddr, registry, runtimeClass, watchNamespace      string
 		catalogPaths, adminImageRef, helmBin, vclusterChart, vclusterValues string
 		sessionSelector, leaderElectionID, netToolsImage                    string
-		leaderElect, metricsSecure                                          bool
+		storageClass, vmDisks                                               string
+		leaderElect, metricsSecure, persistentHome, vclusterPersistence     bool
 		concurrency                                                         int
 		provisionTimeout                                                    time.Duration
 	)
@@ -51,6 +52,10 @@ func main() {
 	flag.StringVar(&vclusterValues, "vcluster-values", "/opt/cloudtrain/charts/vcluster-values.yaml", "base values for virtual clusters (deploy/vcluster/values.yaml); empty = none")
 	flag.StringVar(&sessionSelector, "session-selector", "", "only reconcile LabSessions matching this label selector (e.g. labs.cloudtrain.dev/verify=true); empty = all")
 	flag.StringVar(&leaderElectionID, "leader-election-id", "lab-orchestrator.labs.cloudtrain.dev", "leader election lease name")
+	flag.BoolVar(&persistentHome, "persistent-home", true, "give container nodes a PVC for /home/learner (survives hibernate/resume)")
+	flag.BoolVar(&vclusterPersistence, "vcluster-persistence", true, "keep vcluster databases on a PVC (vclusters can hibernate)")
+	flag.StringVar(&vmDisks, "vm-disks", "persistent", "VM root disks: persistent (CDI DataVolume per VM, VMs can hibernate) or ephemeral (containerDisk)")
+	flag.StringVar(&storageClass, "storage-class", "", "StorageClass of learner homes, vcluster databases and VM disks; empty = cluster default")
 	opts := zap.Options{}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
@@ -79,6 +84,8 @@ func main() {
 			os.Exit(1)
 		}
 		cacheOpts.ByObject[&labsv1.LabSession{}] = cache.ByObject{Label: sel}
+		// Pools carry the same labels (pooled sessions inherit them).
+		cacheOpts.ByObject[&labsv1.WarmPool{}] = cache.ByObject{Label: sel}
 	}
 	if watchNamespace != "" {
 		cacheOpts.DefaultNamespaces = map[string]cache.Config{watchNamespace: {}}
@@ -112,10 +119,16 @@ func main() {
 		log.Error(err, "unable to load image catalog")
 		os.Exit(1)
 	}
+	if vmDisks != "persistent" && vmDisks != "ephemeral" {
+		log.Error(nil, "--vm-disks must be persistent or ephemeral", "value", vmDisks)
+		os.Exit(1)
+	}
 	rt, err := drivers.NewRuntime(drivers.RuntimeOptions{
 		Client: mgr.GetClient(), Reader: mgr.GetAPIReader(), Scheme: scheme, Executor: executor,
 		Catalog: catalog, ImageRegistry: registry, RuntimeClassName: runtimeClass, AdminImageRef: adminImageRef,
 		Helm: drivers.ExecHelm{Binary: helmBin}, VClusterChart: vclusterChart, VClusterValues: vclusterValues,
+		PersistentHome: persistentHome, VClusterPersistence: vclusterPersistence, StorageClass: storageClass,
+		VMDisks: drivers.VMDiskOptions{Persistent: vmDisks == "persistent"},
 	})
 	if err != nil {
 		log.Error(err, "unable to build drivers")
@@ -133,13 +146,22 @@ func main() {
 	}
 	reg.Replace(drivers.NewNetdev(rt.Container))
 
+	poolMetrics := controller.NewPoolMetrics()
+	poolMetrics.Register()
 	if err := (&controller.LabSessionReconciler{
 		Client: mgr.GetClient(), Scheme: scheme, Drivers: reg,
 		Recorder:         mgr.GetEventRecorderFor("lab-orchestrator"),
 		ProvisionTimeout: provisionTimeout, MaxConcurrentReconciles: concurrency,
-		Session: rt.Session,
+		Session: rt.Session, Reader: mgr.GetAPIReader(), Metrics: poolMetrics,
 	}).SetupWithManager(mgr); err != nil {
 		log.Error(err, "unable to set up LabSession controller")
+		os.Exit(1)
+	}
+	if err := (&controller.WarmPoolReconciler{
+		Client: mgr.GetClient(), Scheme: scheme, Recorder: mgr.GetEventRecorderFor("lab-orchestrator"),
+		Metrics: poolMetrics,
+	}).SetupWithManager(mgr); err != nil {
+		log.Error(err, "unable to set up WarmPool controller")
 		os.Exit(1)
 	}
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {

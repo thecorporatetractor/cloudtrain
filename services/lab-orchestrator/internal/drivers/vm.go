@@ -32,11 +32,14 @@ type VMDriver struct {
 	Session   *SessionRuntime
 	// ImageRegistry prefixes containerDisk images (see ContainerDriver.ImageFor).
 	ImageRegistry string
+	// Disks selects ephemeral (containerDisk) or persistent root disks.
+	Disks VMDiskOptions
 }
 
 var (
 	_ NodeDriver     = (*VMDriver)(nil)
 	_ AccessProvider = (*VMDriver)(nil)
+	_ Hibernator     = (*VMDriver)(nil)
 )
 
 func (d *VMDriver) Name() labsv1.DriverName { return labsv1.DriverVM }
@@ -91,6 +94,7 @@ func (d *VMDriver) Provision(ctx context.Context, ref NodeRef) (NodeState, error
 	vm := buildVM(ref.Session, NewLabNet(ref.Session), vmSpec{
 		Name: ref.ResourceName(), Hostname: h.Name, IP: h.IP, Image: imageWithRegistry(d.ImageRegistry, img.Image),
 		Cores: cores, MemMiB: mem, CISecret: sec, Labels: vmLabels(ref, ""),
+		Disk: d.Disks, DiskSize: img.DiskSize,
 	})
 	if err := setOwner(ref.Session, vm, d.Client); err != nil {
 		return fail(err)
@@ -100,6 +104,11 @@ func (d *VMDriver) Provision(ctx context.Context, ref NodeRef) (NodeState, error
 			return fail(err)
 		}
 		return NodeState{Phase: labsv1.NodeProvisioning, Message: err.Error()}, err
+	}
+	if d.Disks.Persistent { // resume after hibernate
+		if err := setRunStrategy(ctx, d.Client, d.reader(), ref.Namespace(), []string{vm.GetName()}, "Always"); err != nil {
+			return NodeState{Phase: labsv1.NodeProvisioning, Message: err.Error()}, err
+		}
 	}
 	return d.observe(ctx, ref, h, true)
 }
@@ -137,16 +146,31 @@ func (d *VMDriver) observe(ctx context.Context, ref NodeRef, h PlannedHost, conv
 	if st.running < st.total {
 		return NodeState{Phase: labsv1.NodeProvisioning, Message: "VM booting: " + strings.Join(st.waiting, ", ")}, nil
 	}
-	state := NodeState{Phase: labsv1.NodeReady, InstanceID: st.instance, Details: map[string]string{"ip": h.IP}}
+	boot, instance := st.instance, st.instance
+	if d.Disks.Persistent {
+		if instance, err = vmIdentity(ctx, d.reader(), ref.Namespace(), []string{name}); err != nil {
+			return NodeState{}, err
+		}
+	}
+	state := NodeState{Phase: labsv1.NodeReady, InstanceID: instance, Details: map[string]string{"ip": h.IP}}
 	done, err := vmAnnotation(ctx, d.reader(), ref.Namespace(), name, AnnotationBootstrapped)
 	if err != nil {
 		return NodeState{}, err
 	}
-	if done == st.instance {
+	if done == instance && boot != instance {
+		// Bootstrapped disk, new boot (resume): wait until ssh answers again.
+		booted, err := vmAnnotation(ctx, d.reader(), ref.Namespace(), name, AnnotationBooted)
+		if err != nil {
+			return NodeState{}, err
+		}
+		if booted == boot {
+			return state, nil
+		}
+	} else if done == instance {
 		return state, nil
 	}
 	if !converge {
-		return NodeState{Phase: labsv1.NodeProvisioning, Message: "waiting for cloud-init", InstanceID: st.instance}, nil
+		return NodeState{Phase: labsv1.NodeProvisioning, Message: "waiting for cloud-init", InstanceID: instance}, nil
 	}
 	res, err := execOnHost(ctx, d.Container, ref, h.Name, ExecRequest{
 		Command: []string{"/bin/sh", "-c", "timeout 20 cloud-init status --wait >/dev/null 2>&1; cloud-init status 2>/dev/null | grep -q 'status: done' && echo READY || echo WAIT"},
@@ -154,16 +178,30 @@ func (d *VMDriver) observe(ctx context.Context, ref NodeRef, h PlannedHost, conv
 	})
 	if err != nil || res.ExitCode != 0 || !strings.Contains(res.Stdout, "READY") {
 		msg := "waiting for ssh and cloud-init on " + h.Name
-		return NodeState{Phase: labsv1.NodeProvisioning, Message: msg, InstanceID: st.instance}, nil
+		return NodeState{Phase: labsv1.NodeProvisioning, Message: msg, InstanceID: instance}, nil
 	}
-	if err := annotateVM(ctx, d.Client, ref.Namespace(), name, st.instance); err != nil {
+	if err := annotateVMWith(ctx, d.Client, ref.Namespace(), name,
+		map[string]string{AnnotationBootstrapped: instance, AnnotationBooted: boot}); err != nil {
 		return NodeState{}, err
 	}
 	return state, nil
 }
 
+// Hibernate stops a VM with a persistent disk (runStrategy Halted); the
+// next Provision starts it again. A VM on an ephemeral containerDisk keeps
+// running (stopping it would discard the learner's changes).
+func (d *VMDriver) Hibernate(ctx context.Context, ref NodeRef) error {
+	if !d.Disks.Persistent {
+		return fmt.Errorf("vm %s boots from an ephemeral disk: %w", ref.Node.Name, ErrUnsupported)
+	}
+	return client.IgnoreNotFound(setRunStrategy(ctx, d.Client, d.reader(), ref.Namespace(), []string{ref.ResourceName()}, "Halted"))
+}
+
 // Status observes the VM without changing anything.
 func (d *VMDriver) Status(ctx context.Context, ref NodeRef) (NodeState, error) {
+	if ref.Session.Spec.Hibernate && d.Disks.Persistent {
+		return stoppedState(ctx, d.reader(), ref.Namespace(), []string{ref.ResourceName()})
+	}
 	h, err := d.host(ref)
 	if err != nil {
 		return NodeState{Phase: labsv1.NodeFailed, Message: err.Error()}, err
@@ -209,10 +247,18 @@ func (d *VMDriver) Connect(_ context.Context, ref NodeRef, access labsv1.AccessT
 	return labsv1.Endpoint{}, fmt.Errorf("vm driver: %s access: %w", access, ErrUnsupported)
 }
 
-// Reset deletes the VM; the next Provision recreates it from the image.
+// Reset deletes the VM (and its persistent disk); the next Provision
+// recreates it from the image. ErrInProgress until the old VM and disk are
+// gone, so the new VM never adopts the old disk.
 func (d *VMDriver) Reset(ctx context.Context, ref NodeRef) error {
-	_, err := deleteVMs(ctx, d.Client, d.reader(), ref.Session, []string{ref.ResourceName()})
-	return err
+	gone, err := deleteVMs(ctx, d.Client, d.reader(), ref.Session, []string{ref.ResourceName()})
+	if err != nil {
+		return err
+	}
+	if !gone {
+		return inProgress("VM %s is being deleted for reset", ref.ResourceName())
+	}
+	return nil
 }
 
 // Destroy deletes the VM and its Secret; ErrInProgress until the VM is gone.

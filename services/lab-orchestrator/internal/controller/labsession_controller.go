@@ -19,6 +19,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	labsv1 "github.com/cloudtrain/cloudtrain/services/lab-orchestrator/api/v1alpha1"
@@ -93,6 +94,11 @@ type LabSessionReconciler struct {
 	// network, entry isolation) before any node and wires the entry node
 	// once the other nodes' access material exists.
 	Session drivers.SessionProvisioner
+	// Reader, when set, is an uncached reader (mgr.GetAPIReader()) used to
+	// find a claimant's pooled session without cache lag.
+	Reader client.Reader
+	// Metrics, when set, counts warm pool claims.
+	Metrics *PoolMetrics
 }
 
 // +kubebuilder:rbac:groups=labs.cloudtrain.dev,resources=labsessions,verbs=get;list;watch;update;patch
@@ -111,8 +117,10 @@ type LabSessionReconciler struct {
 // +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=discovery.k8s.io,resources=endpointslices,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=kubevirt.io,resources=virtualmachines;virtualmachineinstances,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=cdi.kubevirt.io,resources=datavolumes,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=kubeovn.io,resources=vpcs;subnets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=k8s.cni.cncf.io,resources=network-attachment-definitions,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch;create;delete
 // +kubebuilder:rbac:groups="",resources=pods/exec,verbs=create
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
@@ -185,7 +193,15 @@ func (r *LabSessionReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	}
 
 	tpl, tplErr := r.template(ctx, s)
-	res, err := r.reconcileSession(ctx, s, tpl, tplErr, save)
+	var res ctrl.Result
+	var err error
+	handled := false
+	if isClaimant(s) {
+		res, handled, err = r.reconcileClaim(ctx, s, tpl)
+	}
+	if !handled {
+		res, err = r.reconcileSession(ctx, s, tpl, tplErr, save)
+	}
 	if uerr := save(ctx); uerr != nil {
 		return ctrl.Result{}, errors.Join(err, uerr)
 	}
@@ -232,12 +248,19 @@ func (r *LabSessionReconciler) reconcileSession(ctx context.Context, s *labsv1.L
 	}
 
 	now := r.now()
-	exp := expiry(s, tpl)
-	st.ExpiresAt = &exp
-	if !now.Before(exp.Time) {
-		return r.expire(ctx, s)
+	if unclaimedPooled(s) {
+		// A pooled session waits for its claimant indefinitely; the claim
+		// sets spec.expiresAt (see WarmPool.spec.maxIdle for recycling).
+		st.ExpiresAt = nil
+		r.setCondition(s, labsv1.ConditionExpired, metav1.ConditionFalse, ReasonActive, "unclaimed pooled session; expires once claimed")
+	} else {
+		exp := expiry(s, tpl)
+		st.ExpiresAt = &exp
+		if !now.Before(exp.Time) {
+			return r.expire(ctx, s)
+		}
+		r.setCondition(s, labsv1.ConditionExpired, metav1.ConditionFalse, ReasonActive, "session has not expired")
 	}
-	r.setCondition(s, labsv1.ConditionExpired, metav1.ConditionFalse, ReasonActive, "session has not expired")
 
 	if tplErr != nil {
 		var re *resolveError
@@ -281,8 +304,19 @@ func (r *LabSessionReconciler) reconcileSession(ctx context.Context, s *labsv1.L
 		if st.Phase == labsv1.SessionHibernated {
 			st.Phase = labsv1.SessionProvisioning
 		}
+		// Resuming is not a reset: hibernated nodes come back with their
+		// state (persistent disks, the learner's home volume), so a new
+		// backing instance must not re-run setup over the learner's work.
+		// Forgetting the instance ids makes the next observation the
+		// baseline again. This covers every node, also those still stopping
+		// when the resume arrived; nodes that kept running report the same
+		// instance anyway.
+		for i := range st.Nodes {
+			st.Nodes[i].InstanceID = ""
+		}
 		r.setCondition(s, labsv1.ConditionHibernated, metav1.ConditionFalse, ReasonAwake, "session resumed")
 		r.setCondition(s, labsv1.ConditionReady, metav1.ConditionFalse, ReasonProvisioning, "resuming nodes")
+		r.event(s, "Normal", ReasonAwake, "resuming hibernated nodes")
 	}
 
 	// Spec-driven reset: reset every node and run setup again.
@@ -291,6 +325,10 @@ func (r *LabSessionReconciler) reconcileSession(ctx context.Context, s *labsv1.L
 			if drivers.IsPermanent(err) {
 				st.ObservedResetGeneration = s.Spec.ResetGeneration
 				return r.fail(s, ReasonResetFailed, err.Error()), nil
+			}
+			r.rearmSetup(s, ReasonResetRequested, "lab reset in progress: "+err.Error())
+			if errors.Is(err, drivers.ErrInProgress) {
+				return ctrl.Result{RequeueAfter: requeueTeardown}, nil
 			}
 			return ctrl.Result{}, err
 		}
@@ -584,12 +622,20 @@ func (r *LabSessionReconciler) hibernate(ctx context.Context, s *labsv1.LabSessi
 		}
 		h, ok := d.(drivers.Hibernator)
 		if !ok {
-			continue // e.g. container nodes keep running (see ContainerDriver)
+			continue // the node keeps running
 		}
 		ref := r.ref(s, tpl, n)
 		if err := h.Hibernate(ctx, ref); err != nil {
+			if errors.Is(err, drivers.ErrUnsupported) {
+				continue // this node keeps running (e.g. netdev, ephemeral VM disks)
+			}
 			if drivers.IsPermanent(err) {
 				nodes[i].Message = fmt.Sprintf("hibernate: %v", err)
+				continue
+			}
+			if errors.Is(err, drivers.ErrInProgress) {
+				settled = false
+				nodes[i].Message = err.Error()
 				continue
 			}
 			return ctrl.Result{}, err
@@ -625,6 +671,9 @@ func (r *LabSessionReconciler) hibernate(ctx context.Context, s *labsv1.LabSessi
 // the live template only if nothing was recorded), then session-scoped
 // topology resources. Errors keep the caller from releasing the session.
 func (r *LabSessionReconciler) teardown(ctx context.Context, s *labsv1.LabSession) error {
+	if err := r.deletePooled(ctx, s); err != nil {
+		return err
+	}
 	spec := &labsv1.LabTemplateSpec{}
 	switch {
 	case s.Status.Topology != nil:
@@ -874,6 +923,7 @@ func (r *LabSessionReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		WithOptions(controller.Options{MaxConcurrentReconciles: n}).
 		For(&labsv1.LabSession{}).
+		Watches(&labsv1.LabSession{}, handler.EnqueueRequestsFromMapFunc(claimantOf)).
 		Owns(&corev1.Pod{}).
 		Owns(&corev1.Service{}).
 		Named("labsession").
