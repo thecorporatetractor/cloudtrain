@@ -172,8 +172,11 @@ func TestEntryPolicy(t *testing.T) {
 	if len(np.Spec.Ingress) != 0 || len(np.Spec.PolicyTypes) != 2 {
 		t.Error("entry must have no ingress")
 	}
-	if len(np.Spec.Egress) != 3 || np.Spec.Egress[1].To[0].PodSelector.MatchExpressions[0].Values[0] != VClusterRelease(s, "qm-virt") {
+	if len(np.Spec.Egress) != 4 || np.Spec.Egress[1].To[0].PodSelector.MatchExpressions[0].Values[0] != VClusterRelease(s, "qm-virt") {
 		t.Errorf("egress = %+v", np.Spec.Egress)
+	}
+	if m := np.Spec.Egress[3]; m.To[0].NamespaceSelector.MatchLabels["kubernetes.io/metadata.name"] != MirrorNamespace || len(m.Ports) != 3 {
+		t.Errorf("mirror egress = %+v", m)
 	}
 }
 

@@ -20,6 +20,10 @@
 #                 apply <staged> --etcd-upgrade=false`, kubelet/kubectl install (reports
 #                 whether the package restarts kubelet), restart, node and kube-apiserver
 #                 report the staged version
+#   el-vm         two blank data disks by serial, LVM over both + XFS mount, mdadm,
+#                 SELinux Enforcing, firewalld active, `dnf install httpd` offline (local repo)
+#   ubuntu-vm     the same disks/LVM checks, AppArmor enabled, `apt-get update/install nginx`
+#                 offline (local signed repo), nftables/ufw present
 #   etcd-host     etcd.service active, `etcdctl endpoint health` over mutual TLS passes,
 #                 a client without a certificate is refused, then the
 #                 etcd-snapshot-restore lab's own provision script + solution run
@@ -48,6 +52,8 @@ image_of() {
     kubeadm-node)    echo "${GOLDEN_IMAGE_REPO}:${LAB_K8S_VERSION}" ;;
     kubeadm-upgrade) echo "${GOLDEN_IMAGE_REPO}:${UPGRADE_IMAGE_TAG}" ;;
     etcd-host)       echo "$ETCD_HOST_IMAGE" ;;
+    el-vm)           echo "$EL_VM_IMAGE" ;;
+    ubuntu-vm)       echo "$UBUNTU_VM_IMAGE" ;;
     *) die "unknown image '$1'" ;;
   esac
 }
@@ -55,7 +61,14 @@ image_of() {
 run_test() {
   local variant=$1 img mem ns work
   img=$(image_of "$variant")
-  case $variant in etcd-host) mem=1Gi ;; *) mem=2560Mi ;; esac
+  case $variant in etcd-host|el-vm|ubuntu-vm) mem=1536Mi ;; *) mem=2560Mi ;; esac
+  # Linux VM images: two blank data disks, as the vm driver attaches topology
+  # resources.disks (emptyDisk for ephemeral VMs, serial ct-dataN).
+  local xdisks="" xvols=""
+  if [[ $variant == el-vm || $variant == ubuntu-vm ]]; then
+    xdisks=$'\n            - { name: data1, serial: ct-data1, disk: { bus: virtio } }\n            - { name: data2, serial: ct-data2, disk: { bus: virtio } }'
+    xvols=$'\n        - { name: data1, emptyDisk: { capacity: 1Gi } }\n        - { name: data2, emptyDisk: { capacity: 1Gi } }'
+  fi
   ns="ctimg-$variant-$(date +%H%M%S)"
   work=$(mktemp -d)
   NS=$ns; WORK=$work
@@ -118,13 +131,13 @@ spec:
         devices:
           disks:
             - { name: root, disk: { bus: virtio } }
-            - { name: cloudinit, disk: { bus: virtio } }
+            - { name: cloudinit, disk: { bus: virtio } }$xdisks
           interfaces: [{ name: default, bridge: {} }]
           rng: {}
       networks: [{ name: default, pod: {} }]
       volumes:
         - { name: root, containerDisk: { image: $img, imagePullPolicy: IfNotPresent } }
-        - { name: cloudinit, cloudInitNoCloud: { secretRef: { name: vm-cloudinit } } }
+        - { name: cloudinit, cloudInitNoCloud: { secretRef: { name: vm-cloudinit } } }$xvols
 ---
 apiVersion: v1
 kind: Pod
@@ -351,8 +364,55 @@ EOS
   [[ ${PIPESTATUS[0]} == 0 ]]
 }
 
-targets=("$@"); ((${#targets[@]})) || targets=(kubeadm-node kubeadm-upgrade etcd-host)
+# linux_vm_checks <family>: the Linux VM image contract (tier C).
+linux_vm_checks() {
+  cat <<'EOS'
+set -e
+echo "== learner from cloud-init"; id learner; sudo -n -u learner sudo -n true && echo "ok: learner has passwordless sudo"
+echo "== extra blank disks by serial"
+lsblk -o NAME,SIZE,TYPE,SERIAL,MOUNTPOINTS
+for s in ct-data1 ct-data2; do test -b /dev/disk/by-id/virtio-$s && echo "ok: /dev/disk/by-id/virtio-$s -> $(readlink -f /dev/disk/by-id/virtio-$s)"; done
+d1=$(readlink -f /dev/disk/by-id/virtio-ct-data1); d2=$(readlink -f /dev/disk/by-id/virtio-ct-data2)
+echo "== LVM on the data disks"
+pvcreate -q "$d1" "$d2"; vgcreate -q labvg "$d1" "$d2"; lvcreate -q -y -n data -L 1500M labvg
+mkfs.xfs -q /dev/labvg/data; mkdir -p /mnt/data; mount /dev/labvg/data /mnt/data; df -h /mnt/data | tail -1
+echo hello > /mnt/data/f && grep -q hello /mnt/data/f && echo "ok: LVM striped over two disks, XFS mounted"
+umount /mnt/data; lvremove -q -y labvg/data; vgremove -q -y labvg; pvremove -q "$d1" "$d2"
+echo "== mdadm available"; mdadm --version
+EOS
+}
+
+test_el-vm() {
+  linux_vm_checks | vmrun || return 1
+  vmrun <<'EOS'
+set -e
+echo "== SELinux"; getenforce; [ "$(getenforce)" = Enforcing ] && echo "ok: SELinux Enforcing"
+sestatus | head -5
+echo "== firewalld"; systemctl is-active firewalld; firewall-cmd --get-default-zone; firewall-cmd --list-services
+echo "== repos (offline)"; dnf -q repolist
+dnf -y -q install httpd mod_ssl && rpm -q httpd && echo "ok: dnf install httpd from the local repo, offline"
+systemctl start httpd && curl -fsS -o /dev/null http://127.0.0.1/ -w 'httpd %{http_code}\n' || curl -s -o /dev/null -w 'httpd %{http_code}\n' http://127.0.0.1/
+ls -Z /var/www/html -d
+echo "== man pages"; man -w ls
+EOS
+}
+
+test_ubuntu-vm() {
+  linux_vm_checks | vmrun || return 1
+  vmrun <<'EOS'
+set -e
+echo "== AppArmor"; aa-enabled && echo "ok: AppArmor enabled"
+echo "== apt (offline, local signed repo)"; grep -rh '^URIs' /etc/apt/sources.list.d/
+apt-get -qq update && echo "ok: apt-get update offline"
+DEBIAN_FRONTEND=noninteractive apt-get -qq install -y nginx >/dev/null && dpkg -s nginx | grep -q 'install ok' && echo "ok: apt-get install nginx from the local repo, offline"
+curl -s -o /dev/null -w 'nginx %{http_code}\n' http://127.0.0.1/
+echo "== nftables / ufw"; nft --version; ufw status
+echo "== man pages"; man -w ls
+EOS
+}
+
+targets=("$@"); ((${#targets[@]})) || targets=(kubeadm-node kubeadm-upgrade etcd-host el-vm ubuntu-vm)
 for t in "${targets[@]}"; do
-  case $t in kubeadm-node|kubeadm-upgrade|etcd-host) ;; *) die "unknown image '$t' (kubeadm-node | kubeadm-upgrade | etcd-host)" ;; esac
+  case $t in kubeadm-node|kubeadm-upgrade|etcd-host|el-vm|ubuntu-vm) ;; *) die "unknown image '$t' (kubeadm-node | kubeadm-upgrade | etcd-host | el-vm | ubuntu-vm)" ;; esac
 done
 for t in "${targets[@]}"; do run_test "$t"; done

@@ -1,0 +1,199 @@
+# Shared, read-only offline mirrors for labs (namespace ${MIRROR_NAMESPACE}).
+# Rendered by deploy/scripts/mirrors-up.sh (variables from deploy/versions.env).
+#   mirror.<ns>.svc:80      dnf (/el10/), apt (/noble/), PyPI (/pypi/simple/), Ansible
+#                           collections (/ansible/), keys (/keys/)        nginx, read-only
+#   registry.<ns>.svc:5000  zot pull-through mirror of docker.io, allowlisted repos only;
+#                           anonymous read, push needs the admin htpasswd
+#   git.<ns>.svc:3000       Gitea (public seed repos readable anonymously, no sign-up)
+# Ingress: only from lab pods (label labs.cloudtrain.dev/session) in any namespace.
+# Egress: none, except the registry (DNS + HTTPS to upstream registries, to fill the cache).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ${MIRROR_NAMESPACE}
+  labels:
+    app.kubernetes.io/part-of: cloudtrain-mirrors
+    pod-security.kubernetes.io/enforce: restricted
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: mirror, namespace: ${MIRROR_NAMESPACE}, labels: { app: mirror } }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: mirror } }
+  template:
+    metadata: { labels: { app: mirror } }
+    spec:
+      automountServiceAccountToken: false
+      securityContext: { runAsNonRoot: true, runAsUser: 101, seccompProfile: { type: RuntimeDefault } }
+      containers:
+        - name: nginx
+          image: ${MIRROR_CONTENT_IMAGE}
+          imagePullPolicy: IfNotPresent
+          ports: [{ name: http, containerPort: 8080 }]
+          readinessProbe: { httpGet: { path: /healthz, port: 8080 } }
+          resources: { requests: { cpu: 10m, memory: 32Mi }, limits: { memory: 128Mi } }
+          securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } }
+          volumeMounts: [{ name: tmp, mountPath: /tmp }]
+      volumes: [{ name: tmp, emptyDir: {} }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: mirror, namespace: ${MIRROR_NAMESPACE} }
+spec:
+  selector: { app: mirror }
+  ports: [{ name: http, port: 80, targetPort: 8080 }]
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: registry-config, namespace: ${MIRROR_NAMESPACE} }
+data:
+  config.json: |
+    {
+      "distSpecVersion": "1.1.1",
+      "storage": { "rootDirectory": "/var/lib/registry", "dedupe": true, "gc": true },
+      "http": {
+        "address": "0.0.0.0", "port": "5000",
+        "auth": { "htpasswd": { "path": "/etc/zot/htpasswd" } },
+        "accessControl": {
+          "repositories": { "**": { "anonymousPolicy": ["read"], "policies": [ { "users": ["admin"], "actions": ["read", "create", "update", "delete"] } ] } }
+        }
+      },
+      "log": { "level": "info" },
+      "extensions": {
+        "sync": {
+          "enable": true,
+          "registries": [
+            { "urls": ["https://registry-1.docker.io"], "onDemand": true, "tlsVerify": true,
+              "pollInterval": "24h", "maxRetries": 3, "retryDelay": "30s",
+              "content": ${ZOT_ALLOWLIST} }
+          ]
+        }
+      }
+    }
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: registry, namespace: ${MIRROR_NAMESPACE} }
+spec: { accessModes: [ReadWriteOnce], resources: { requests: { storage: 4Gi } } }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: registry, namespace: ${MIRROR_NAMESPACE}, labels: { app: registry } }
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector: { matchLabels: { app: registry } }
+  template:
+    metadata:
+      labels: { app: registry }
+      annotations: { cloudtrain.dev/config-hash: "${ZOT_CONFIG_HASH}" }
+    spec:
+      automountServiceAccountToken: false
+      securityContext: { runAsNonRoot: true, runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000, seccompProfile: { type: RuntimeDefault } }
+      containers:
+        - name: zot
+          image: ${ZOT_IMAGE}
+          imagePullPolicy: IfNotPresent
+          args: [serve, /etc/zot/config.json]
+          ports: [{ name: http, containerPort: 5000 }]
+          readinessProbe: { httpGet: { path: /v2/, port: 5000 }, initialDelaySeconds: 3 }
+          resources: { requests: { cpu: 20m, memory: 64Mi }, limits: { memory: 512Mi } }
+          securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } }
+          volumeMounts:
+            - { name: config, mountPath: /etc/zot/config.json, subPath: config.json }
+            - { name: htpasswd, mountPath: /etc/zot/htpasswd, subPath: htpasswd }
+            - { name: data, mountPath: /var/lib/registry }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - { name: config, configMap: { name: registry-config } }
+        - { name: htpasswd, secret: { secretName: registry-htpasswd } }
+        - { name: data, persistentVolumeClaim: { claimName: registry } }
+        - { name: tmp, emptyDir: {} }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: registry, namespace: ${MIRROR_NAMESPACE} }
+spec:
+  selector: { app: registry }
+  ports: [{ name: http, port: 5000, targetPort: 5000 }]
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: gitea, namespace: ${MIRROR_NAMESPACE} }
+spec: { accessModes: [ReadWriteOnce], resources: { requests: { storage: 1Gi } } }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: git, namespace: ${MIRROR_NAMESPACE}, labels: { app: git } }
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector: { matchLabels: { app: git } }
+  template:
+    metadata: { labels: { app: git } }
+    spec:
+      automountServiceAccountToken: false
+      securityContext: { runAsNonRoot: true, runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000, seccompProfile: { type: RuntimeDefault } }
+      containers:
+        - name: gitea
+          image: ${GITEA_IMAGE}
+          imagePullPolicy: IfNotPresent
+          ports: [{ name: http, containerPort: 3000 }]
+          env:
+            - { name: GITEA__database__DB_TYPE, value: sqlite3 }
+            - { name: GITEA__security__INSTALL_LOCK, value: "true" }
+            - { name: GITEA__server__ROOT_URL, value: "http://git.${MIRROR_NAMESPACE}.svc:3000/" }
+            - { name: GITEA__server__DOMAIN, value: "git.${MIRROR_NAMESPACE}.svc" }
+            - { name: GITEA__server__DISABLE_SSH, value: "true" }
+            - { name: GITEA__server__OFFLINE_MODE, value: "true" }
+            - { name: GITEA__service__DISABLE_REGISTRATION, value: "true" }
+            - { name: GITEA__service__REQUIRE_SIGNIN_VIEW, value: "false" }
+            - { name: GITEA__repository__DISABLE_HTTP_GIT, value: "false" }
+            - { name: GITEA__openid__ENABLE_OPENID_SIGNIN, value: "false" }
+            - { name: GITEA__mailer__ENABLED, value: "false" }
+            - { name: GITEA__cron__ENABLED, value: "false" }
+            - { name: GITEA__log__LEVEL, value: Warn }
+          readinessProbe: { httpGet: { path: /api/healthz, port: 3000 }, initialDelaySeconds: 5 }
+          resources: { requests: { cpu: 20m, memory: 128Mi }, limits: { memory: 512Mi } }
+          securityContext: { allowPrivilegeEscalation: false, capabilities: { drop: [ALL] } }
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/gitea }
+            - { name: data, mountPath: /etc/gitea, subPath: conf }
+      volumes: [{ name: data, persistentVolumeClaim: { claimName: gitea } }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: git, namespace: ${MIRROR_NAMESPACE} }
+spec:
+  selector: { app: git }
+  ports: [{ name: http, port: 3000, targetPort: 3000 }]
+---
+# Ingress only from lab pods; nothing else in the cluster (and nothing outside) gets in.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: labs-only, namespace: ${MIRROR_NAMESPACE} }
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - namespaceSelector: {}
+          podSelector: { matchExpressions: [{ key: labs.cloudtrain.dev/session, operator: Exists }] }
+        - namespaceSelector: {}
+          podSelector: { matchLabels: { cloudtrain.dev/mirror-client: "true" } }
+      ports: [{ port: 8080 }, { port: 5000 }, { port: 3000 }]
+  egress:
+    - to: [{ namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: kube-system } }, podSelector: { matchLabels: { k8s-app: kube-dns } } }]
+      ports: [{ port: 53, protocol: UDP }, { port: 53, protocol: TCP }]
+---
+# The registry fills its cache from upstream: HTTPS out (allowlisted repos only, by zot config).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: registry-upstream, namespace: ${MIRROR_NAMESPACE} }
+spec:
+  podSelector: { matchLabels: { app: registry } }
+  policyTypes: [Egress]
+  egress:
+    - to: [{ ipBlock: { cidr: 0.0.0.0/0, except: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16] } }]
+      ports: [{ port: 443, protocol: TCP }]

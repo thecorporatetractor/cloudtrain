@@ -57,6 +57,64 @@ images:
   nettools:1:
     kind: container
     image: cloudtrain/nettools:1   # iproute2, ping, traceroute, tcpdump, iperf3; also the link sidecar
+  # kubeadm:1.37 plus add-ons for the K8s curriculum, layered on that image (build.sh
+  # kubeadm-full). Post-init hook: `/opt/cloudtrain/bin/addons-install <list> [--wait]
+  # [--pool a-b]` with metrics-server, gateway-api, traefik (IngressClass + GatewayClass
+  # "traefik", :80/:443, NodePorts 30080/30443), metallb (L2, pool default
+  # 192.168.100.200-220), local-path (default StorageClass), falco; aliases ingress,
+  # gateway, lb, storage, all. Images preloaded (lock/addons.lock). CKS material always
+  # present: gVisor runsc registered with containerd as handler `runsc` (labs create the
+  # RuntimeClass), kube-bench + cfg, AppArmor sample profiles and audit policies in
+  # /opt/cloudtrain/security. No Trivy DB (size; see docs/dev-environment.md).
+  kubeadm:1.37-full:
+    kind: containerDisk
+    image: cloudtrain/kubeadm-node:v1.37.1-full
+    kubernetesVersion: v1.37.1
+    tier: K
+    addons: [metrics-server, gateway-api, traefik, metallb, local-path, falco]
+  kubeadm:1.37-sec:                    # same image, the curriculum's CKS ref
+    kind: containerDisk
+    image: cloudtrain/kubeadm-node:v1.37.1-full
+    kubernetesVersion: v1.37.1
+    tier: K
+    addons: [metrics-server, gateway-api, traefik, metallb, local-path, falco]
+  # linux (foundations stream) ------------------------------------------------
+  # Tier A: unprivileged learner pods (tools/images/build-linux-pod.sh, task image:build:linux-pod).
+  # userNamespace: the container driver runs them with pod hostUsers: false when every
+  # node's runtime handler reports user namespace support (else host users, see
+  # docs/dev-environment.md "Lab runtime tiers"). PID 1 is tini -> cloudtrain-init (hooks in
+  # /etc/cloudtrain/init.d/, then sleep); no systemd. User `learner` (uid 1000) has NO sudo
+  # rights (sudo is installed for sudo labs). Man pages, editors (vim, nano), admin tools,
+  # git, python3/pip, gcc/make, cron/at, openssh client+server, sample data in /srv/samples.
+  # Package sources point ONLY at the in-cluster mirror (dnf/apt/pip, see deploy/mirrors).
+  el-lab:10:
+    kind: container
+    image: cloudtrain/el-lab:10        # AlmaLinux 10.2 userland
+    tier: A
+    userNamespace: true
+    mirrors: [dnf, pypi]
+  deb-lab:24.04:
+    kind: container
+    image: cloudtrain/deb-lab:24.04    # Ubuntu 24.04 userland, unminimized
+    tier: A
+    userNamespace: true
+    mirrors: [apt, pypi]
+  # Tier C: KubeVirt VMs for Linux labs (tools/images/build.sh el-vm|ubuntu-vm). Each carries
+  # the mirror snapshot as a LOCAL repo (/opt/cloudtrain/repo/<el10|noble>), the only enabled
+  # package source, so dnf/apt work offline in an isolated lab VPC. Extra blank disks come
+  # from topology resources.disks (sizes, e.g. ["2Gi", "2Gi"]): /dev/vdb.. with serials
+  # ct-data1.. (/dev/disk/by-id/virtio-ct-dataN). No users or keys baked in (cloud-init
+  # injects learner with passwordless sudo, root key, host key), like etcd-host.
+  el-vm:10:
+    kind: containerDisk
+    image: cloudtrain/el-vm:10         # AlmaLinux 10.2 GenericCloud; SELinux enforcing, firewalld, auditd
+    tier: C
+    mirrors: [dnf-local]
+  ubuntu-vm:24.04:
+    kind: containerDisk
+    image: cloudtrain/ubuntu-vm:24.04  # Ubuntu 24.04 cloud image; AppArmor, nftables/ufw, auditd
+    tier: C
+    mirrors: [apt-local]
 workloadImages:
   - busybox:1.37
   - httpd:2.4-alpine

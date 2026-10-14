@@ -133,7 +133,10 @@ type NodeResources struct {
 	CPU *resource.Quantity `json:"cpu,omitempty"`
 	// +optional
 	MemoryMiB *int64 `json:"memoryMiB,omitempty"`
+	// Disks (vm nodes): sizes of extra blank data disks, e.g. ["2Gi", "2Gi"],
+	// attached as /dev/vdb, /dev/vdc, ... (serials ct-data1, ct-data2, ...).
 	// +optional
+	// +kubebuilder:validation:MaxItems=6
 	Disks []string `json:"disks,omitempty"`
 }
 

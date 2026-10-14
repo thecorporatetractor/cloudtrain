@@ -8,6 +8,16 @@
 #                    (UPGRADE_K8S_VERSION installed + held; LAB_K8S_VERSION debs in a local
 #                    signed apt repo and its control-plane images in containerd)
 #   etcd-host        ${ETCD_HOST_IMAGE}                             catalog etcd-host:3.6
+#   el-vm            ${EL_VM_IMAGE}                                 catalog el-vm:10
+#                    (AlmaLinux ${ALMA_RELEASE} GenericCloud + local dnf repo from the mirror
+#                    snapshot, SELinux enforcing, firewalld)
+#   ubuntu-vm        ${UBUNTU_VM_IMAGE}                             catalog ubuntu-vm:24.04
+#                    (Ubuntu cloud image + local signed apt repo from the mirror snapshot)
+#   kubeadm-full     ${GOLDEN_IMAGE_REPO}:${KUBEADM_FULL_IMAGE_TAG}  catalog kubeadm:1.37-full (+ -sec)
+#                    LAYERED on the kubeadm-node containerDisk (must exist): add-ons for
+#                    /opt/cloudtrain/bin/addons-install + images, gVisor, kube-bench, AppArmor
+#                    profiles, audit policies (tools/images/kubeadm-addons)
+#   el-vm/ubuntu-vm need the mirror content: tools/mirrors/build-content.sh (task mirror:content)
 #
 # Steps:
 #   1. fetch + verify the pinned Ubuntu cloud image
@@ -42,24 +52,48 @@ case $VARIANT in
     STAGED_MINOR=$LAB_K8S_MINOR; STAGED_VERSION=$LAB_K8S_VERSION ;;
   etcd-host)
     TAG="$ETCD_HOST_IMAGE"; REF=etcd-host:3.6; GUEST=etcd-host; DISK_SIZE=4G ;;
-  *) die "unknown variant '$VARIANT' (kubeadm-node | kubeadm-upgrade | etcd-host)" ;;
+  kubeadm-full)
+    TAG="${GOLDEN_IMAGE_REPO}:${KUBEADM_FULL_IMAGE_TAG}"; REF=kubeadm:1.37-full; GUEST=kubeadm-addons; DISK_SIZE=12G
+    K8S_VERSION=$LAB_K8S_VERSION; STAGED_VERSION="" ;;
+  el-vm)
+    TAG="$EL_VM_IMAGE"; REF=el-vm:10; GUEST=el-vm; DISK_SIZE=10G ;;
+  ubuntu-vm)
+    TAG="$UBUNTU_VM_IMAGE"; REF=ubuntu-vm:24.04; GUEST=ubuntu-vm; DISK_SIZE=10G ;;
+  *) die "unknown variant '$VARIANT' (kubeadm-node | kubeadm-upgrade | etcd-host | el-vm | ubuntu-vm)" ;;
 esac
 
 # --- 0. catalog contract: the catalog must name exactly what this build produces ---
 cat_get() { yq -r ".images[\"$REF\"].$1 // \"\"" "$CATALOG"; }
 [[ $(cat_get image) == "$TAG" ]] || die "catalog $REF.image is '$(cat_get image)', this build produces '$TAG'"
-if [[ $GUEST == kubeadm ]]; then
+if [[ $GUEST == kubeadm || $GUEST == kubeadm-addons ]]; then
   [[ $(cat_get kubernetesVersion) == "$K8S_VERSION" ]] \
     || die "catalog $REF.kubernetesVersion is '$(cat_get kubernetesVersion)', expected $K8S_VERSION"
   [[ -z $STAGED_VERSION ]] || yq -e ".images[\"$REF\"].stagedUpgrades[] | select(. == \"$STAGED_VERSION\")" "$CATALOG" >/dev/null \
     || die "catalog $REF.stagedUpgrades does not list $STAGED_VERSION"
-else
+elif [[ $GUEST == etcd-host ]]; then
   [[ $(cat_get etcdVersion) == "$ETCD_VERSION" ]] || die "catalog $REF.etcdVersion is '$(cat_get etcdVersion)', expected $ETCD_VERSION"
 fi
 
 # --- 1. base image -------------------------------------------------------------
 BASE="$CACHE/ubuntu-${UBUNTU_RELEASE}-${UBUNTU_SERIAL}-amd64.img"
-if ! echo "${UBUNTU_IMAGE_SHA256}  $BASE" | sha256sum -c --status 2>/dev/null; then
+BASE_LABEL="ubuntu-${UBUNTU_RELEASE}-${UBUNTU_SERIAL}"
+if [[ $GUEST == kubeadm-addons ]]; then
+  # Layered build: start from the kubeadm:1.37 disk inside its containerDisk image.
+  KBASE="${GOLDEN_IMAGE_REPO}:${LAB_K8S_VERSION}"
+  docker image inspect "$KBASE" >/dev/null 2>&1 || die "$KBASE not built (run: task image:build:kubeadm-node)"
+  BASE="$WORK/base.qcow2"; BASE_LABEL="${KBASE##*/}"
+  if [[ ${PACKAGE_ONLY:-0} != 1 && ${LOCK_ONLY:-0} != 1 ]]; then
+    cid=$(docker create "$KBASE" sh); docker cp "$cid:/disk/disk.qcow2" "$BASE"; docker rm "$cid" >/dev/null
+  fi
+elif [[ $GUEST == el-vm ]]; then
+  BASE="$CACHE/$ALMA_CLOUD_IMAGE"; BASE_LABEL="${ALMA_CLOUD_IMAGE%.x86_64.qcow2}"
+  if ! echo "${ALMA_CLOUD_IMAGE_SHA256}  $BASE" | sha256sum -c --status 2>/dev/null; then
+    log "downloading $ALMA_CLOUD_IMAGE"
+    curl -fSL --retry 3 -o "$BASE" "https://repo.almalinux.org/almalinux/10/cloud/x86_64/images/$ALMA_CLOUD_IMAGE" \
+      || curl -fSL --retry 3 -o "$BASE" "https://vault.almalinux.org/${ALMA_RELEASE}/cloud/x86_64/images/$ALMA_CLOUD_IMAGE"
+    echo "${ALMA_CLOUD_IMAGE_SHA256}  $BASE" | sha256sum -c - || die "checksum mismatch for $BASE"
+  fi
+elif ! echo "${UBUNTU_IMAGE_SHA256}  $BASE" | sha256sum -c --status 2>/dev/null; then
   log "downloading Ubuntu ${UBUNTU_RELEASE} cloud image ${UBUNTU_SERIAL}"
   curl -fSL --retry 3 -o "$BASE" \
     "https://cloud-images.ubuntu.com/releases/${UBUNTU_RELEASE}/release-${UBUNTU_SERIAL}/ubuntu-24.04-server-cloudimg-amd64.img"
@@ -144,12 +178,56 @@ if [[ $GUEST == kubeadm ]]; then
     kubeadm_images "$STAGED_VERSION"
     lock_check "$LOCKDIR/kubernetes-$STAGED_VERSION.lock" "${KIMAGES[@]}"
   fi
-else
+elif [[ $GUEST == etcd-host ]]; then
   ETCD_TGZ="$CACHE/etcd-${ETCD_VERSION}-linux-amd64.tar.gz"
   fetch_pinned "https://github.com/etcd-io/etcd/releases/download/${ETCD_VERSION}/etcd-${ETCD_VERSION}-linux-amd64.tar.gz" \
     "$ETCD_TARBALL_SHA256" "$ETCD_TGZ"
   cp "$ETCD_TGZ" "$WORK/in/etcd.tar.gz"
   cp -r "$HERE/etcd-host/." "$WORK/in/"
+fi
+if [[ $GUEST == kubeadm-addons ]]; then
+  A="$HERE/kubeadm-addons"; IN="$WORK/in"; rm -rf "$IN/addons"; mkdir -p "$IN/addons"/{metrics-server,gateway-api,traefik,metallb,local-path,falco}
+  fetch_pinned "https://github.com/kubernetes-sigs/metrics-server/releases/download/${METRICS_SERVER_VERSION}/components.yaml" \
+    "$METRICS_SERVER_MANIFEST_SHA256" "$CACHE/metrics-server-${METRICS_SERVER_VERSION}.yaml"
+  # lab kubelets serve self-signed certificates
+  sed 's|        - --metric-resolution=15s|        - --metric-resolution=15s\n        - --kubelet-insecure-tls|' \
+    "$CACHE/metrics-server-${METRICS_SERVER_VERSION}.yaml" > "$IN/addons/metrics-server/components.yaml"
+  grep -q -- '--kubelet-insecure-tls' "$IN/addons/metrics-server/components.yaml" || die "could not patch metrics-server args"
+  fetch_pinned "https://github.com/kubernetes-sigs/gateway-api/releases/download/${GATEWAY_API_VERSION}/standard-install.yaml" \
+    "$GATEWAY_API_MANIFEST_SHA256" "$IN/addons/gateway-api/standard-install.yaml"
+  fetch_pinned "https://raw.githubusercontent.com/metallb/metallb/${METALLB_VERSION}/config/manifests/metallb-native.yaml" \
+    "$METALLB_MANIFEST_SHA256" "$IN/addons/metallb/metallb-native.yaml"
+  fetch_pinned "https://raw.githubusercontent.com/rancher/local-path-provisioner/${LOCAL_PATH_VERSION}/deploy/local-path-storage.yaml" \
+    "$LOCAL_PATH_MANIFEST_SHA256" "$CACHE/local-path-${LOCAL_PATH_VERSION}.yaml"
+  # default StorageClass; helper pod uses the preloaded busybox:1.37
+  sed -e 's|image: docker.io/library/busybox$|image: docker.io/library/busybox:1.37|' \
+      -e 's|^  name: local-path$|  name: local-path\n  annotations: { storageclass.kubernetes.io/is-default-class: "true" }|' \
+    "$CACHE/local-path-${LOCAL_PATH_VERSION}.yaml" > "$IN/addons/local-path/local-path-storage.yaml"
+  grep -q 'busybox:1.37' "$IN/addons/local-path/local-path-storage.yaml" || die "could not pin the local-path helper image"
+  cp "$A/manifests/traefik.yaml" "$A/manifests/traefik-crds.yaml" "$IN/addons/traefik/"
+  cp "$A/falco.yaml" "$IN/addons/falco/falco.yaml"
+  cp "$A/addons-install" "$IN/"; rm -rf "$IN/security"; cp -r "$A/security" "$IN/security"
+  fetch_pinned "https://github.com/google/gvisor/releases/download/${GVISOR_RELEASE}/gvisor-x86_64.tar.bz2" \
+    "$GVISOR_TARBALL_SHA256" "$CACHE/gvisor-${GVISOR_RELEASE}.tar.bz2"
+  # the guest has no bzip2: unpack the two binaries here
+  rm -rf "$IN/gvisor"; mkdir -p "$IN/gvisor"
+  tar -xjf "$CACHE/gvisor-${GVISOR_RELEASE}.tar.bz2" -C "$IN/gvisor" runsc containerd-shim-runsc-v1
+  fetch_pinned "https://github.com/aquasecurity/kube-bench/releases/download/${KUBE_BENCH_VERSION}/kube-bench_${KUBE_BENCH_VERSION#v}_linux_amd64.tar.gz" \
+    "$KUBE_BENCH_TARBALL_SHA256" "$IN/kube-bench.tar.gz"
+  # every image the add-on manifests reference must be in lock/addons.lock (exactly)
+  mapfile -t AIMG < <(grep -rhoE 'image: *"?[a-z0-9.-]+(/[a-zA-Z0-9._-]+)+:[a-zA-Z0-9._-]+' "$IN/addons" | awk '{print $2}' | tr -d '"' \
+    | grep -v 'busybox:1.37' | while read -r i; do normalize "$i"; done | sort -u)
+  lock_check "$LOCKDIR/addons.lock" "${AIMG[@]}"
+  grep -v '^#' "$LOCKDIR/addons.lock" | grep . > "$IN/addon-images.txt"
+fi
+if [[ $GUEST == el-vm || $GUEST == ubuntu-vm ]]; then
+  MIRROR="$CACHE/mirror/$MIRROR_SNAPSHOT"
+  repo=$([[ $GUEST == el-vm ]] && echo el10 || echo noble)
+  [[ -f $MIRROR/$repo/${repo}.lock ]] || die "no mirror content $MIRROR/$repo (run: task mirror:content)"
+  rm -rf "$WORK/in/repo"; mkdir -p "$WORK/in/repo"
+  cp -al "$MIRROR/$repo" "$WORK/in/repo/$repo" 2>/dev/null || cp -a "$MIRROR/$repo" "$WORK/in/repo/$repo"
+  rm -f "$WORK/in/repo/$repo/.wanted" "$WORK/in/repo/$repo/.missing"
+  cp "$REPO_ROOT/tools/mirrors/keys/cloudtrain-mirror.asc" "$WORK/in/"
 fi
 [[ ${LOCK_ONLY:-0} == 1 ]] && { log "lock files ok"; exit 0; }
 
@@ -188,7 +266,11 @@ PAUSE_IMAGE=${PAUSE_IMAGE:-}
 CALICO_VERSION=${CALICO_VERSION}
 LAB_POD_CIDR=${LAB_POD_CIDR}
 STAGED_CRI_TOOLS_VERSION=${CRI_TOOLS_VERSION}
+ALMA_RELEASE=${ALMA_RELEASE}
+MIRROR_SNAPSHOT=${MIRROR_SNAPSHOT}
 ETCD_VERSION=${ETCD_VERSION}
+GVISOR_RELEASE=${GVISOR_RELEASE}
+KUBE_BENCH_VERSION=${KUBE_BENCH_VERSION}
 CONTAINERD_VERSION=${CONTAINERD_VERSION}
 KUBERNETES_CNI_VERSION=${KUBERNETES_CNI_VERSION}
 UBUNTU_APT_SNAPSHOT=${UBUNTU_APT_SNAPSHOT}
@@ -208,7 +290,7 @@ else GUESTFS_ARGS+=(-e LIBGUESTFS_BACKEND_SETTINGS=force_tcg -e GUESTFS_SMP="${G
 log "customizing $VARIANT (virt-customize, $([[ ${GUESTFS_KVM:-0} == 1 ]] && echo KVM || echo 'TCG; GUESTFS_KVM=1 for KVM'))"
 docker run --rm --memory 6g "${GUESTFS_ARGS[@]}" \
   -v "$HERE:/src:ro" -v "$CACHE:/work" -e TMPDIR="/work/$VARIANT/tmp" \
-  -e BASE="/work/$(basename "$BASE")" -e VARIANT_DIR="/work/$VARIANT" \
+  -e BASE="/work/${BASE#"$CACHE"/}" -e VARIANT_DIR="/work/$VARIANT" \
   -e GUEST_SCRIPT="guest-$GUEST.sh" -e DISK_SIZE="$DISK_SIZE" \
   "$BUILDER" bash /src/scripts/customize.sh
 fi
@@ -218,8 +300,12 @@ log "packaging containerDisk $TAG"
 docker build -q -t "$TAG" -f "$HERE/containerdisk/Dockerfile" \
   --label "org.opencontainers.image.version=${TAG##*:}" \
   --label "dev.cloudtrain.catalog-ref=${REF}" \
-  --label "dev.cloudtrain.base=ubuntu-${UBUNTU_RELEASE}-${UBUNTU_SERIAL}" "$WORK/out" >/dev/null
+  --label "dev.cloudtrain.base=${BASE_LABEL}" "$WORK/out" >/dev/null
 docker images "$TAG" --format '{{.Repository}}:{{.Tag}}  {{.ID}}  {{.Size}}'
+# Disk hygiene (the host disk is small): drop the build inputs; CLEAN_DISK=1 also drops the
+# customized disk (then PACKAGE_ONLY=1 is no longer possible). Both are root-owned.
+docker run --rm -u 0 -v "$WORK:/w" --entrypoint sh "$UBUNTU_BASE_IMAGE" -c \
+  "rm -rf /w/in /w/tmp /w/base.qcow2 $([[ ${CLEAN_DISK:-1} == 1 ]] && echo /w/out/disk.qcow2)" 2>/dev/null || true
 log "image:build:$VARIANT done in $((SECONDS - T0))s"
 
 # --- 5. load into kind -----------------------------------------------------------

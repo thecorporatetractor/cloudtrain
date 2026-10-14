@@ -1,0 +1,37 @@
+# Falco (modern eBPF probe, no kernel module) as a DaemonSet; default rules from the image.
+# Alerts: kubectl -n falco logs ds/falco | grep -i '"priority"'
+apiVersion: v1
+kind: Namespace
+metadata: { name: falco }
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata: { name: falco, namespace: falco, labels: { app: falco } }
+spec:
+  selector: { matchLabels: { app: falco } }
+  template:
+    metadata: { labels: { app: falco } }
+    spec:
+      hostPID: true
+      tolerations: [{ operator: Exists }]
+      containers:
+        - name: falco
+          image: docker.io/falcosecurity/falco:0.45.0
+          imagePullPolicy: IfNotPresent
+          args: [/usr/bin/falco, -o, engine.kind=modern_ebpf, -o, json_output=true, -o, "rules_files[0]=/etc/falco/falco_rules.yaml", -o, "rules_files[1]=/etc/falco/falco_rules.local.yaml", -o, "rules_files[2]=/etc/falco/rules.d"]
+          securityContext: { privileged: true }
+          resources: { requests: { cpu: 50m, memory: 128Mi }, limits: { memory: 512Mi } }
+          volumeMounts:
+            - { name: proc, mountPath: /host/proc, readOnly: true }
+            - { name: etc, mountPath: /host/etc, readOnly: true }
+            - { name: dev, mountPath: /host/dev, readOnly: true }
+            - { name: sys, mountPath: /sys/kernel/tracing }
+            - { name: containerd, mountPath: /host/run/containerd/containerd.sock }
+            - { name: rules, mountPath: /etc/falco/rules.d }
+      volumes:
+        - { name: proc, hostPath: { path: /proc } }
+        - { name: etc, hostPath: { path: /etc } }
+        - { name: dev, hostPath: { path: /dev } }
+        - { name: sys, hostPath: { path: /sys/kernel/tracing } }
+        - { name: containerd, hostPath: { path: /run/containerd/containerd.sock, type: Socket } }
+        - { name: rules, hostPath: { path: /etc/falco/rules.d, type: DirectoryOrCreate } }
