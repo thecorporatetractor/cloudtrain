@@ -1,0 +1,208 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xks-metadata-egress-block
+  title: Block egress to the node metadata address
+  domain: kubernetes
+  frameworks: [cks:cluster-setup]
+  difficulty: medium
+  estimatedMinutes: 7
+  tags: [exam, networkpolicy, egress, metadata]
+  version: 1
+spec:
+  description: |
+    Context: `qm-customs` (`kubectl config use-context qm-customs`).
+
+    Create a NetworkPolicy named `{{policy}}` in namespace `partner-apps`
+    that prevents **all Pods** in that namespace from reaching the node
+    metadata address `169.254.169.254`, while **all other egress** (other
+    Pods, Services, DNS) keeps working.
+
+    On these lab nodes the metadata address answers on port 80.
+  objectives:
+    - Block a single address with an ipBlock except
+  params:
+    policy:
+      type: choice
+      values: [deny-metadata, block-node-metadata, no-instance-metadata]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-customs
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-customs
+          nodes:
+            - {name: customs-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: customs-wk-1, role: worker}
+  setup:
+    - on: qm-customs/customs-wk-1
+      run: |
+        set -e
+        mkdir -p /opt/qm-metadata/latest/meta-data
+        echo "i-0partner" > /opt/qm-metadata/latest/meta-data/instance-id
+        ip addr add 169.254.169.254/32 dev lo 2>/dev/null || true
+        systemctl stop qm-metadata 2>/dev/null || true
+        systemctl reset-failed qm-metadata 2>/dev/null || true
+        systemd-run --unit qm-metadata --property=Restart=always \
+          python3 -m http.server 80 --bind 169.254.169.254 --directory /opt/qm-metadata
+        for i in $(seq 1 20); do
+          python3 -c 'import urllib.request;urllib.request.urlopen("http://169.254.169.254/latest/meta-data/instance-id",timeout=2)' && exit 0
+          sleep 1
+        done
+        exit 1
+    - on: qm-customs
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: partner-apps}
+        ---
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: partner-portal}
+        ---
+        apiVersion: v1
+        kind: Pod
+        metadata: {name: sync, namespace: partner-apps, labels: {app: sync}}
+        spec:
+          containers:
+            - {name: sync, image: busybox:1.37, command: ["sleep", "1d"]}
+        ---
+        apiVersion: v1
+        kind: Pod
+        metadata: {name: web, namespace: partner-portal, labels: {app: web}}
+        spec:
+          containers:
+            - {name: web, image: busybox:1.37, command: ["sh", "-c", "mkdir -p /w && echo ok > /w/index.html && exec httpd -f -p 8080 -h /w"]}
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata: {name: web, namespace: partner-portal}
+        spec:
+          selector: {app: web}
+          ports: [{port: 80, targetPort: 8080}]
+    - on: qm-customs
+      timeoutSec: 150
+      run: |
+        kubectl -n partner-apps wait pod/sync --for=condition=Ready --timeout=140s
+        kubectl -n partner-portal wait pod/web --for=condition=Ready --timeout=60s
+        kubectl -n partner-apps exec sync -- wget -qO- -T 5 http://169.254.169.254/latest/meta-data/instance-id >/dev/null
+  teardown:
+    - on: qm-customs
+      run: kubectl delete namespace partner-apps partner-portal --ignore-not-found --wait=false
+  checks:
+    - id: policy-exists
+      description: NetworkPolicy {{policy}} exists in partner-apps and selects all Pods
+      type: k8s-query
+      skills: [k8s.security.node-metadata]
+      query: {cluster: qm-customs, resource: networkpolicy, name: "{{policy}}", namespace: partner-apps, jsonpath: "{.metadata.name}:{.spec.podSelector}"}
+      expect: {match: exact, value: "{{policy}}:{}"}
+    - id: metadata-blocked
+      description: partner-apps/sync cannot reach 169.254.169.254
+      type: shell
+      on: qm-customs
+      skills: [k8s.security.node-metadata]
+      weight: 3
+      timeoutSec: 30
+      command: |
+        out=$(kubectl -n partner-apps exec sync -- sh -c 'wget -qO- -T 4 http://169.254.169.254/latest/meta-data/instance-id >/dev/null 2>&1; echo rc=$?' 2>&1)
+        case "$out" in *rc=0*) echo open ;; *rc=*) echo blocked ;; *) echo "error: $out" ;; esac
+      expect: {match: exact, value: blocked}
+    - id: service-egress-works
+      description: partner-apps/sync still reaches the web Service in partner-portal by name
+      type: shell
+      on: qm-customs
+      skills: [k8s.security.node-metadata]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        out=$(kubectl -n partner-apps exec sync -- sh -c 'wget -qO- -T 4 http://web.partner-portal.svc.cluster.local/ 2>&1; echo rc=$?' 2>&1)
+        case "$out" in *rc=0*) echo open ;; *) echo "blocked: $out" | tr '\n' ' ' ;; esac
+      expect: {match: exact, value: open}
+  misconceptions:
+    - id: deny-all-egress
+      description: Denies all egress, which also breaks DNS and Service traffic.
+      feedback: Allow 0.0.0.0/0 and except only 169.254.169.254/32.
+      expectFail: [service-egress-works]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-customs
+          kubectl apply -f - <<'YAML'
+          apiVersion: networking.k8s.io/v1
+          kind: NetworkPolicy
+          metadata: {name: "{{policy}}", namespace: partner-apps}
+          spec:
+            podSelector: {}
+            policyTypes: [Egress]
+          YAML
+    - id: ingress-type
+      description: Puts the ipBlock into an ingress rule.
+      feedback: Traffic to the metadata address is egress from the Pod; use policyTypes Egress with an egress rule.
+      expectFail: [metadata-blocked]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-customs
+          kubectl apply -f - <<'YAML'
+          apiVersion: networking.k8s.io/v1
+          kind: NetworkPolicy
+          metadata: {name: "{{policy}}", namespace: partner-apps}
+          spec:
+            podSelector: {}
+            policyTypes: [Ingress]
+            ingress:
+              - from:
+                  - ipBlock: {cidr: 0.0.0.0/0, except: [169.254.169.254/32]}
+          YAML
+  solution:
+    explanation: An egress rule allowing 0.0.0.0/0 except 169.254.169.254/32 keeps every other destination open.
+    steps:
+      - on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-customs
+          kubectl apply -f - <<'YAML'
+          apiVersion: networking.k8s.io/v1
+          kind: NetworkPolicy
+          metadata: {name: "{{policy}}", namespace: partner-apps}
+          spec:
+            podSelector: {}
+            policyTypes: [Egress]
+            egress:
+              - to:
+                  - ipBlock:
+                      cidr: 0.0.0.0/0
+                      except: [169.254.169.254/32]
+          YAML
+    alternatives:
+      - id: cidr-per-range
+        description: Allow cluster ranges and the rest separately, still excepting the metadata address.
+        steps:
+          - on: workstation
+            as: learner
+            run: |
+              kubectl config use-context qm-customs
+              kubectl apply -f - <<'YAML'
+              apiVersion: networking.k8s.io/v1
+              kind: NetworkPolicy
+              metadata: {name: "{{policy}}", namespace: partner-apps}
+              spec:
+                podSelector: {}
+                policyTypes: [Egress]
+                egress:
+                  - to:
+                      - namespaceSelector: {}
+                  - to:
+                      - ipBlock: {cidr: 0.0.0.0/1}
+                      - ipBlock: {cidr: 128.0.0.0/1, except: [169.254.169.254/32]}
+              YAML

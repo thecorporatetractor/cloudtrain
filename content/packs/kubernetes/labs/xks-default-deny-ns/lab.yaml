@@ -1,0 +1,230 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xks-default-deny-ns
+  title: Apply a default-deny baseline
+  domain: kubernetes
+  frameworks: [cks:cluster-setup]
+  difficulty: medium
+  estimatedMinutes: 7
+  tags: [exam, networkpolicy, default-deny, dns]
+  version: 1
+spec:
+  description: |
+    Context: `qm-ledger` (`kubectl config use-context qm-ledger`).
+
+    Add NetworkPolicies to namespace `billing` (any names) so that:
+
+    - no Pod in `billing` accepts any incoming traffic;
+    - no Pod in `billing` can open any outgoing connection, **except** DNS
+      lookups (UDP and TCP port 53).
+  objectives:
+    - Deny all ingress and egress in a namespace while allowing DNS
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-ledger
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-ledger
+          nodes:
+            - {name: ledger-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: ledger-wk-1, role: worker}
+  setup:
+    - on: qm-ledger
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: billing}
+        ---
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: ledger-ops}
+        ---
+        apiVersion: v1
+        kind: Pod
+        metadata: {name: invoice-api, namespace: billing, labels: {app: invoice-api}}
+        spec:
+          containers:
+            - {name: api, image: busybox:1.37, command: ["sh", "-c", "mkdir -p /w && echo ok > /w/index.html && exec httpd -f -p 8080 -h /w"]}
+        ---
+        apiVersion: v1
+        kind: Pod
+        metadata: {name: probe, namespace: billing, labels: {app: probe}}
+        spec:
+          containers:
+            - {name: probe, image: busybox:1.37, command: ["sleep", "1d"]}
+        ---
+        apiVersion: v1
+        kind: Pod
+        metadata: {name: web, namespace: ledger-ops, labels: {app: web}}
+        spec:
+          containers:
+            - {name: web, image: busybox:1.37, command: ["sh", "-c", "mkdir -p /w && echo ok > /w/index.html && exec httpd -f -p 8080 -h /w"]}
+        ---
+        apiVersion: v1
+        kind: Pod
+        metadata: {name: probe, namespace: ledger-ops, labels: {app: probe}}
+        spec:
+          containers:
+            - {name: probe, image: busybox:1.37, command: ["sleep", "1d"]}
+    - on: qm-ledger
+      timeoutSec: 150
+      run: |
+        kubectl -n billing wait pod --all --for=condition=Ready --timeout=140s
+        kubectl -n ledger-ops wait pod --all --for=condition=Ready --timeout=60s
+  teardown:
+    - on: qm-ledger
+      run: kubectl delete namespace billing ledger-ops --ignore-not-found --wait=false
+  checks:
+    - id: ingress-denied
+      description: ledger-ops/probe cannot reach billing/invoice-api
+      type: shell
+      on: qm-ledger
+      skills: [k8s.security.netpol-default-deny]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        ip=$(kubectl -n billing get pod invoice-api -o jsonpath='{.status.podIP}')
+        kubectl -n ledger-ops exec probe -- wget -qO- -T 4 http://$ip:8080/ >/dev/null 2>&1 && echo open || echo blocked
+      expect: {match: exact, value: blocked}
+    - id: egress-denied
+      description: billing/probe cannot reach ledger-ops/web
+      type: shell
+      on: qm-ledger
+      skills: [k8s.security.netpol-default-deny]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        ip=$(kubectl -n ledger-ops get pod web -o jsonpath='{.status.podIP}')
+        kubectl -n billing exec probe -- wget -qO- -T 4 http://$ip:8080/ >/dev/null 2>&1 && echo open || echo blocked
+      expect: {match: exact, value: blocked}
+    - id: dns-allowed
+      description: billing/probe can still resolve names
+      type: shell
+      on: qm-ledger
+      skills: [k8s.security.netpol-default-deny]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        kubectl -n billing exec probe -- nslookup -timeout=3 kubernetes.default.svc.cluster.local 2>&1 | grep -q '^Address.*10\.96\.0\.1' && echo resolved || echo failed
+      expect: {match: exact, value: resolved}
+    - id: same-namespace-denied
+      description: billing/probe cannot reach billing/invoice-api either
+      type: shell
+      on: qm-ledger
+      skills: [k8s.security.netpol-default-deny]
+      timeoutSec: 30
+      command: |
+        ip=$(kubectl -n billing get pod invoice-api -o jsonpath='{.status.podIP}')
+        kubectl -n billing exec probe -- wget -qO- -T 4 http://$ip:8080/ >/dev/null 2>&1 && echo open || echo blocked
+      expect: {match: exact, value: blocked}
+  misconceptions:
+    - id: ingress-only
+      description: Writes only an ingress default deny.
+      feedback: Without Egress in policyTypes outgoing traffic stays open.
+      expectFail: [egress-denied]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-ledger
+          kubectl apply -f - <<'YAML'
+          apiVersion: networking.k8s.io/v1
+          kind: NetworkPolicy
+          metadata: {name: default-deny, namespace: billing}
+          spec:
+            podSelector: {}
+            policyTypes: [Ingress]
+          YAML
+    - id: no-dns
+      description: Denies all egress without a DNS exception.
+      feedback: Allow UDP and TCP 53 in an egress rule, or name resolution fails.
+      expectFail: [dns-allowed]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-ledger
+          kubectl apply -f - <<'YAML'
+          apiVersion: networking.k8s.io/v1
+          kind: NetworkPolicy
+          metadata: {name: default-deny, namespace: billing}
+          spec:
+            podSelector: {}
+            policyTypes: [Ingress, Egress]
+          YAML
+    - id: allow-all-egress
+      description: Adds an egress rule with no ports, which opens all egress.
+      feedback: An egress rule without ports or peers allows everything. Restrict it to port 53.
+      expectFail: [egress-denied]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-ledger
+          kubectl apply -f - <<'YAML'
+          apiVersion: networking.k8s.io/v1
+          kind: NetworkPolicy
+          metadata: {name: default-deny, namespace: billing}
+          spec:
+            podSelector: {}
+            policyTypes: [Ingress, Egress]
+            egress:
+              - {}
+          YAML
+  solution:
+    explanation: One policy selects all Pods for both directions; its only egress rule allows port 53 over UDP and TCP.
+    steps:
+      - on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-ledger
+          kubectl apply -f - <<'YAML'
+          apiVersion: networking.k8s.io/v1
+          kind: NetworkPolicy
+          metadata: {name: default-deny-allow-dns, namespace: billing}
+          spec:
+            podSelector: {}
+            policyTypes: [Ingress, Egress]
+            egress:
+              - ports:
+                  - {protocol: UDP, port: 53}
+                  - {protocol: TCP, port: 53}
+          YAML
+    alternatives:
+      - id: two-policies
+        description: Separate default-deny and DNS policies, DNS limited to kube-system.
+        steps:
+          - on: workstation
+            as: learner
+            run: |
+              kubectl config use-context qm-ledger
+              kubectl apply -f - <<'YAML'
+              apiVersion: networking.k8s.io/v1
+              kind: NetworkPolicy
+              metadata: {name: deny-all, namespace: billing}
+              spec:
+                podSelector: {}
+                policyTypes: [Ingress, Egress]
+              ---
+              apiVersion: networking.k8s.io/v1
+              kind: NetworkPolicy
+              metadata: {name: allow-dns, namespace: billing}
+              spec:
+                podSelector: {}
+                policyTypes: [Egress]
+                egress:
+                  - to:
+                      - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: kube-system}}
+                    ports:
+                      - {protocol: UDP, port: 53}
+                      - {protocol: TCP, port: 53}
+              YAML

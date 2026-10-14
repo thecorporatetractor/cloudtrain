@@ -1,0 +1,363 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: secrets-encryption-at-rest
+  title: Encrypt Secrets at rest in etcd
+  domain: kubernetes
+  frameworks: [cks:microservice-vulnerabilities]
+  difficulty: hard
+  estimatedMinutes: 30
+  tags: [secrets, encryption-at-rest, etcd, kube-apiserver]
+  version: 1
+spec:
+  description: |
+    Quillmoor Logistics' billing-ledger cluster stores Secrets in etcd as
+    plain text: anyone holding an etcd backup can read the payment gateway
+    credentials. Encrypt them at rest.
+
+    From your workstation, switch to context `qm-ledger`
+    (`kubectl config use-context qm-ledger`). The control plane runs on
+    `ledger-cp-1` (`ssh ledger-cp-1`, `sudo` works); the API server is a
+    static Pod defined in `/etc/kubernetes/manifests/kube-apiserver.yaml`.
+
+    1. Configure the API server with an encryption configuration that
+       encrypts **Secrets** with the **aescbc** provider (a 32-byte random
+       key), keeping the `identity` provider only as a fallback for reading
+       data that is not encrypted yet. Store the configuration under
+       `/etc/kubernetes/enc/` on the node.
+    2. Re-write **every existing Secret** in the cluster so it is stored
+       encrypted.
+    3. Check in etcd that Secret `{{secret}}` in namespace `billing` is no
+       longer stored in plain text. The etcd client certificates are in
+       `/etc/kubernetes/pki/etcd/`, and the etcd static Pod
+       (`etcd-ledger-cp-1` in `kube-system`) contains `etcdctl`.
+
+    Applications must still read their Secrets as before.
+  objectives:
+    - Write an EncryptionConfiguration with aescbc and identity
+    - Wire a config file into the kube-apiserver static Pod
+    - Re-encrypt existing Secrets
+    - Read raw values from etcd to prove encryption
+  params:
+    secret:
+      type: choice
+      values: [payment-gateway, card-processor, settlement-bank]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-ledger
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        access: [ssh]
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-ledger
+          nodes:
+            - {name: ledger-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: ledger-wk-1, role: worker}
+  setup:
+    - on: qm-ledger
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: billing}
+        ---
+        apiVersion: v1
+        kind: Secret
+        metadata: {name: "{{secret}}", namespace: billing}
+        stringData:
+          username: qm-ledger-svc
+          password: QmLedger-{{secret}}-s3cret
+        ---
+        apiVersion: v1
+        kind: Secret
+        metadata: {name: invoice-signing, namespace: billing}
+        stringData: {key: qm-invoice-signing-material}
+        ---
+        apiVersion: v1
+        kind: Pod
+        metadata: {name: ledger-api, namespace: billing}
+        spec:
+          containers:
+            - name: api
+              image: busybox:1.37
+              command: ["sh", "-c", "while true; do sleep 30; done"]
+              env:
+                - name: DB_PASSWORD
+                  valueFrom: {secretKeyRef: {name: "{{secret}}", key: password}}
+    - on: qm-ledger
+      timeoutSec: 150
+      run: kubectl -n billing wait pod/ledger-api --for=condition=Ready --timeout=140s
+  teardown:
+    - on: qm-ledger
+      run: kubectl delete namespace billing --ignore-not-found --wait=false
+  checks:
+    - id: context
+      description: Terminal is using context qm-ledger
+      type: k8s-context
+      on: workstation
+      skills: [k8s.cli.contexts]
+      weight: 0.5
+      expect: {match: exact, value: qm-ledger}
+    - id: apiserver-flag
+      description: kube-apiserver runs with --encryption-provider-config pointing under /etc/kubernetes/enc/
+      type: shell
+      on: qm-ledger/ledger-cp-1
+      skills: [k8s.security.api-server-hardening]
+      command: |
+        f=$(ps -C kube-apiserver -o args= | tr ' ' '\n' | sed -n 's/^--encryption-provider-config=//p')
+        case "$f" in /etc/kubernetes/enc/*) [ -s "$f" ] && echo "configured" || echo "file missing: $f" ;; "") echo "flag missing" ;; *) echo "outside /etc/kubernetes/enc: $f" ;; esac
+      expect: {match: exact, value: configured}
+    - id: aescbc-first
+      description: The configuration encrypts secrets with aescbc first and keeps identity as a later fallback
+      type: shell
+      on: qm-ledger/ledger-cp-1
+      skills: [k8s.security.secrets]
+      weight: 2
+      command: |
+        f=$(ps -C kube-apiserver -o args= | tr ' ' '\n' | sed -n 's/^--encryption-provider-config=//p')
+        python3 - "$f" <<'PY'
+        import sys, yaml, base64
+        try:
+            c = yaml.safe_load(open(sys.argv[1]))
+        except Exception as e:
+            print("unreadable"); sys.exit()
+        for r in c.get("resources", []):
+            if "secrets" in r.get("resources", []):
+                p = r.get("providers", [])
+                names = [list(x.keys())[0] for x in p]
+                ok_key = False
+                if names and names[0] == "aescbc":
+                    keys = p[0]["aescbc"].get("keys", [])
+                    ok_key = bool(keys) and len(base64.b64decode(keys[0]["secret"])) == 32
+                print("providers=%s key32=%s" % (",".join(names), ok_key)); break
+        else:
+            print("no rule for secrets")
+        PY
+      expect: {match: regex, value: "^providers=aescbc(,.*)?,identity(,.*)? key32=True$"}
+    - id: billing-secret-encrypted
+      description: Secret {{secret}} is stored in etcd with the aescbc prefix
+      type: shell
+      on: qm-ledger/ledger-cp-1
+      skills: [k8s.security.secrets]
+      weight: 3
+      timeoutSec: 30
+      command: |
+        export KUBECONFIG=/etc/kubernetes/admin.conf
+        kubectl -n kube-system exec etcd-ledger-cp-1 -- etcdctl --cacert /etc/kubernetes/pki/etcd/ca.crt \
+          --cert /etc/kubernetes/pki/etcd/healthcheck-client.crt --key /etc/kubernetes/pki/etcd/healthcheck-client.key \
+          get /registry/secrets/billing/{{secret}} --print-value-only 2>/dev/null | head -c 18 | tr -c '[:print:]' '.'
+      expect: {match: exact, value: "k8s:enc:aescbc:v1:"}
+    - id: all-secrets-encrypted
+      description: Every Secret in etcd is stored encrypted
+      type: shell
+      on: qm-ledger/ledger-cp-1
+      skills: [k8s.security.secrets]
+      weight: 2
+      timeoutSec: 60
+      command: |
+        export KUBECONFIG=/etc/kubernetes/admin.conf
+        e="kubectl -n kube-system exec etcd-ledger-cp-1 -- etcdctl --cacert /etc/kubernetes/pki/etcd/ca.crt --cert /etc/kubernetes/pki/etcd/healthcheck-client.crt --key /etc/kubernetes/pki/etcd/healthcheck-client.key"
+        total=0; plain=0
+        for k in $($e get /registry/secrets/ --prefix --keys-only 2>/dev/null); do
+          total=$((total+1))
+          [ "$($e get "$k" --print-value-only 2>/dev/null | head -c 8)" = "k8s:enc:" ] || plain=$((plain+1))
+        done
+        echo "secrets=$total plaintext=$plain"
+      expect: {match: regex, value: "^secrets=[1-9][0-9]* plaintext=0$"}
+    - id: secret-readable
+      description: The API still returns the original value of {{secret}}
+      type: shell
+      on: qm-ledger
+      skills: [k8s.security.secrets]
+      timeoutSec: 30
+      command: kubectl -n billing get secret {{secret}} -o jsonpath='{.data.password}' | base64 -d
+      expect: {match: exact, value: "QmLedger-{{secret}}-s3cret"}
+  hints:
+    - title: The configuration file
+      body: |
+        `kind: EncryptionConfiguration` (`apiVersion: apiserver.config.k8s.io/v1`)
+        lists, per resource, providers in order: the **first** encrypts new
+        writes, all of them are tried for reads.
+      command: head -c 32 /dev/urandom | base64
+      cost: 1
+    - title: The API server must see the file
+      body: |
+        It runs in a container. Besides the `--encryption-provider-config` flag
+        it needs a hostPath volume and volumeMount for /etc/kubernetes/enc.
+        The kubelet restarts the static Pod when you save the manifest.
+      cost: 2
+    - title: Re-write everything
+      body: Encryption applies on write. Read every Secret and write it back unchanged.
+      command: kubectl get secrets -A -o json | kubectl replace -f -
+      cost: 2
+    - title: Look into etcd
+      command: |
+        kubectl -n kube-system exec etcd-ledger-cp-1 -- etcdctl --cacert /etc/kubernetes/pki/etcd/ca.crt \
+          --cert /etc/kubernetes/pki/etcd/healthcheck-client.crt --key /etc/kubernetes/pki/etcd/healthcheck-client.key \
+          get /registry/secrets/billing/{{secret}} | hexdump -C | head
+      body: An encrypted value starts with k8s:enc:aescbc:v1:<key name>.
+      cost: 1
+  misconceptions:
+    - id: identity-first
+      description: Lists identity before aescbc, so new writes stay plain text.
+      feedback: The first provider is used for writes. Put aescbc first and identity last.
+      expectFail: [aescbc-first, billing-secret-encrypted, all-secrets-encrypted]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 600
+        run: |
+          kubectl config use-context qm-ledger
+          ssh ledger-cp-1 'sudo bash -s' <<'EOS'
+          set -e
+          mkdir -p /etc/kubernetes/enc
+          cat > /etc/kubernetes/enc/enc.yaml <<EOF
+          apiVersion: apiserver.config.k8s.io/v1
+          kind: EncryptionConfiguration
+          resources:
+            - resources: [secrets]
+              providers:
+                - identity: {}
+                - aescbc:
+                    keys:
+                      - name: key1
+                        secret: $(head -c 32 /dev/urandom | base64)
+          EOF
+          python3 - <<'PY'
+          import yaml
+          p = "/etc/kubernetes/manifests/kube-apiserver.yaml"
+          m = yaml.safe_load(open(p))
+          c = m["spec"]["containers"][0]
+          c["command"] = [a for a in c["command"] if not a.startswith("--encryption-provider-config")] + ["--encryption-provider-config=/etc/kubernetes/enc/enc.yaml"]
+          c.setdefault("volumeMounts", []).append({"name": "enc", "mountPath": "/etc/kubernetes/enc", "readOnly": True})
+          m["spec"].setdefault("volumes", []).append({"name": "enc", "hostPath": {"path": "/etc/kubernetes/enc", "type": "DirectoryOrCreate"}})
+          open(p, "w").write(yaml.safe_dump(m, default_flow_style=False))
+          PY
+          for i in $(seq 1 90); do
+            ps -C kube-apiserver -o args= | grep -q -- --encryption-provider-config= && curl -sfk https://127.0.0.1:6443/readyz >/dev/null && break
+            sleep 5
+          done
+          EOS
+          for i in $(seq 1 60); do kubectl get --raw /readyz >/dev/null 2>&1 && break; sleep 5; done
+          kubectl get secrets -A -o json | kubectl replace -f -
+    - id: no-rewrite
+      description: Configures aescbc correctly but never re-writes the existing Secrets.
+      feedback: Encryption happens on write. Secrets written before the change stay plain text until rewritten.
+      expectFail: [billing-secret-encrypted, all-secrets-encrypted]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 600
+        run: |
+          kubectl config use-context qm-ledger
+          ssh ledger-cp-1 'sudo bash -s' <<'EOS'
+          set -e
+          mkdir -p /etc/kubernetes/enc
+          cat > /etc/kubernetes/enc/enc.yaml <<EOF
+          apiVersion: apiserver.config.k8s.io/v1
+          kind: EncryptionConfiguration
+          resources:
+            - resources: [secrets]
+              providers:
+                - aescbc:
+                    keys:
+                      - name: key1
+                        secret: $(head -c 32 /dev/urandom | base64)
+                - identity: {}
+          EOF
+          python3 - <<'PY'
+          import yaml
+          p = "/etc/kubernetes/manifests/kube-apiserver.yaml"
+          m = yaml.safe_load(open(p))
+          c = m["spec"]["containers"][0]
+          c["command"].append("--encryption-provider-config=/etc/kubernetes/enc/enc.yaml")
+          c.setdefault("volumeMounts", []).append({"name": "enc", "mountPath": "/etc/kubernetes/enc", "readOnly": True})
+          m["spec"].setdefault("volumes", []).append({"name": "enc", "hostPath": {"path": "/etc/kubernetes/enc", "type": "DirectoryOrCreate"}})
+          open(p, "w").write(yaml.safe_dump(m, default_flow_style=False))
+          PY
+          for i in $(seq 1 90); do
+            ps -C kube-apiserver -o args= | grep -q -- --encryption-provider-config= && curl -sfk https://127.0.0.1:6443/readyz >/dev/null && break
+            sleep 5
+          done
+          EOS
+          for i in $(seq 1 60); do kubectl get --raw /readyz >/dev/null 2>&1 && break; sleep 5; done
+  solution:
+    explanation: |
+      Write an EncryptionConfiguration whose secrets rule lists aescbc (with a
+      base64-encoded 32-byte key) before identity, mount /etc/kubernetes/enc into
+      the API server static Pod and pass --encryption-provider-config. When the
+      API server is back, replace every Secret so it is re-written through the
+      aescbc provider; etcd then holds k8s:enc:aescbc:v1:key1:... values.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 600
+        run: |
+          kubectl config use-context qm-ledger
+          ssh ledger-cp-1 'sudo bash -s' <<'EOS'
+          set -e
+          mkdir -p /etc/kubernetes/enc
+          chmod 0700 /etc/kubernetes/enc
+          cat > /etc/kubernetes/enc/enc.yaml <<EOF
+          apiVersion: apiserver.config.k8s.io/v1
+          kind: EncryptionConfiguration
+          resources:
+            - resources: [secrets]
+              providers:
+                - aescbc:
+                    keys:
+                      - name: key1
+                        secret: $(head -c 32 /dev/urandom | base64)
+                - identity: {}
+          EOF
+          chmod 0600 /etc/kubernetes/enc/enc.yaml
+          python3 - <<'PY'
+          import yaml
+          p = "/etc/kubernetes/manifests/kube-apiserver.yaml"
+          m = yaml.safe_load(open(p))
+          c = m["spec"]["containers"][0]
+          c["command"].append("--encryption-provider-config=/etc/kubernetes/enc/enc.yaml")
+          c.setdefault("volumeMounts", []).append({"name": "enc", "mountPath": "/etc/kubernetes/enc", "readOnly": True})
+          m["spec"].setdefault("volumes", []).append({"name": "enc", "hostPath": {"path": "/etc/kubernetes/enc", "type": "DirectoryOrCreate"}})
+          open(p, "w").write(yaml.safe_dump(m, default_flow_style=False))
+          PY
+          for i in $(seq 1 90); do
+            ps -C kube-apiserver -o args= | grep -q -- --encryption-provider-config= && curl -sfk https://127.0.0.1:6443/readyz >/dev/null && break
+            sleep 5
+          done
+          EOS
+          for i in $(seq 1 60); do kubectl get --raw /readyz >/dev/null 2>&1 && break; sleep 5; done
+          kubectl get secrets -A -o json | kubectl replace -f -
+    alternatives:
+      - id: sed-edit-and-rewrite-loop
+        description: Edit the manifest with sed and rewrite Secrets namespace by namespace.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 600
+            run: |
+              kubectl config use-context qm-ledger
+              ssh ledger-cp-1 'sudo bash -s' <<'EOS'
+              set -e
+              install -d -m 0700 /etc/kubernetes/enc
+              KEY=$(head -c 32 /dev/urandom | base64)
+              printf 'apiVersion: apiserver.config.k8s.io/v1\nkind: EncryptionConfiguration\nresources:\n- resources:\n  - secrets\n  providers:\n  - aescbc:\n      keys:\n      - name: ledger-2026\n        secret: %s\n  - identity: {}\n' "$KEY" > /etc/kubernetes/enc/config.yaml
+              m=/etc/kubernetes/manifests/kube-apiserver.yaml
+              sed -i 's#^    - kube-apiserver$#    - kube-apiserver\n    - --encryption-provider-config=/etc/kubernetes/enc/config.yaml#' $m
+              sed -i 's#^    volumeMounts:$#    volumeMounts:\n    - mountPath: /etc/kubernetes/enc\n      name: enc\n      readOnly: true#' $m
+              sed -i 's#^  volumes:$#  volumes:\n  - hostPath:\n      path: /etc/kubernetes/enc\n      type: DirectoryOrCreate\n    name: enc#' $m
+              for i in $(seq 1 90); do
+                ps -C kube-apiserver -o args= | grep -q -- --encryption-provider-config= && curl -sfk https://127.0.0.1:6443/readyz >/dev/null && break
+                sleep 5
+              done
+              EOS
+              for i in $(seq 1 60); do kubectl get --raw /readyz >/dev/null 2>&1 && break; sleep 5; done
+              for ns in $(kubectl get ns -o jsonpath='{.items[*].metadata.name}'); do
+                kubectl -n "$ns" get secrets -o json | kubectl replace -f -
+              done
