@@ -1,0 +1,140 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xkd-helm-upgrade-rollback
+  title: Upgrade and roll back a Helm release
+  domain: kubernetes
+  frameworks: [ckad:deployment]
+  difficulty: medium
+  estimatedMinutes: 7
+  tags: [exam, helm]
+  version: 1
+spec:
+  description: |
+    **Context:** `qm-dispatch` (`kubectl config use-context qm-dispatch`)
+
+    The Helm release **`track-ui`** in namespace `track-ui` runs chart
+    version 1.2.0. The packaged charts are in `~/charts/`
+    (`track-ui-1.2.0.tgz`, `track-ui-1.3.0.tgz`); there is no chart
+    repository.
+
+    1. Upgrade the release `track-ui` to chart version **1.3.0**.
+    2. The new version breaks the tracking page: roll the release back to
+       **revision 1**.
+    3. Write the release's **current revision number** after the rollback
+       (just the number) to **`/home/learner/answers/track-ui-revision.txt`**.
+  objectives:
+    - Upgrade, inspect and roll back a Helm release
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-dispatch
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: qm-dispatch
+  setup:
+    - on: qm-dispatch
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: track-ui}
+    - on: workstation
+      run: install -d -o learner -g learner -m 0755 /home/learner/answers /home/learner/charts /home/learner/charts/src /home/learner/charts/src/track-ui /home/learner/charts/src/track-ui/templates
+    - on: workstation
+      file: {path: /home/learner/charts/src/track-ui/Chart.yaml, source: assets/track-ui/Chart.yaml, mode: "0644"}
+    - on: workstation
+      file: {path: /home/learner/charts/src/track-ui/values.yaml, source: assets/track-ui/values.yaml, mode: "0644"}
+    - on: workstation
+      file: {path: /home/learner/charts/src/track-ui/templates/deployment.yaml, source: assets/track-ui/templates/deployment.yaml, mode: "0644"}
+    - on: workstation
+      run: chown -R learner:learner /home/learner/charts
+    - on: workstation
+      as: learner
+      timeoutSec: 150
+      run: |
+        set -e
+        cd ~/charts
+        sed -i -e 's/\[\[/{''{/g' -e 's/\]\]/}''}/g' -e '/^# Delimiters/d' src/track-ui/templates/deployment.yaml
+        helm package src/track-ui --version 1.2.0 --app-version 1.2.0 >/dev/null
+        sed -i 's/^banner:.*/banner: "Track your parcel (new layout)"/; s/^replicas:.*/replicas: 3/' src/track-ui/values.yaml
+        helm package src/track-ui --version 1.3.0 --app-version 1.3.0 >/dev/null
+        rm -rf src
+        helm --kube-context qm-dispatch -n track-ui install track-ui ./track-ui-1.2.0.tgz --wait --timeout 120s >/dev/null
+  teardown:
+    - on: qm-dispatch
+      run: kubectl delete namespace track-ui --ignore-not-found --wait=false
+  checks:
+    - id: upgraded
+      description: The release history contains an upgrade to chart track-ui-1.3.0
+      type: shell
+      on: qm-dispatch
+      skills: [k8s.cluster.packaging]
+      command: helm -n track-ui history track-ui -o json 2>/dev/null | jq -r '[.[] | select(.chart == "track-ui-1.3.0")] | length > 0' || echo false
+      expect: {match: exact, value: "true"}
+    - id: rolled-back
+      description: The deployed revision is a rollback to revision 1 running chart 1.2.0
+      type: shell
+      on: qm-dispatch
+      skills: [k8s.cluster.packaging]
+      weight: 2
+      command: helm -n track-ui history track-ui -o json 2>/dev/null | jq -r '.[-1] | "\(.status) \(.chart) \(.description)"' || echo none
+      expect: {match: exact, value: deployed track-ui-1.2.0 Rollback to 1}
+    - id: answer
+      description: track-ui-revision.txt holds the current revision number
+      type: shell
+      on: qm-dispatch
+      skills: [k8s.cluster.packaging]
+      command: helm -n track-ui history track-ui -o json 2>/dev/null | jq -r '.[-1].revision' || echo none
+      expect: {match: exact, value: "3"}
+    - id: answer-file
+      description: The answer file matches the release's current revision
+      type: file
+      on: workstation
+      target: /home/learner/answers/track-ui-revision.txt
+      skills: [k8s.cluster.packaging]
+      expect: {match: regex, value: '^\s*3\s*$'}
+  misconceptions:
+    - id: revision-one
+      description: Believes a rollback returns the release to revision number 1 and writes 1.
+      feedback: A rollback creates a new revision that copies the old one; the counter keeps going up.
+      expectFail: [answer-file]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 200
+        run: |
+          kubectl config use-context qm-dispatch
+          helm -n track-ui upgrade track-ui ~/charts/track-ui-1.3.0.tgz --wait --timeout 90s
+          helm -n track-ui rollback track-ui 1 --wait --timeout 90s
+          echo 1 > ~/answers/track-ui-revision.txt
+    - id: reinstall
+      description: Uninstalls and reinstalls chart 1.2.0 instead of rolling back, which throws away the release history.
+      feedback: "`helm rollback <release> <revision>` keeps the history and is what an auditor expects to see."
+      expectFail: [upgraded, rolled-back]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 200
+        run: |
+          kubectl config use-context qm-dispatch
+          helm -n track-ui upgrade track-ui ~/charts/track-ui-1.3.0.tgz --wait --timeout 90s
+          helm -n track-ui uninstall track-ui --wait
+          helm -n track-ui install track-ui ~/charts/track-ui-1.2.0.tgz --wait --timeout 90s
+          helm -n track-ui history track-ui -o json | jq -r '.[-1].revision' > ~/answers/track-ui-revision.txt
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 240
+        run: |
+          kubectl config use-context qm-dispatch
+          helm -n track-ui upgrade track-ui ~/charts/track-ui-1.3.0.tgz --wait --timeout 100s
+          helm -n track-ui rollback track-ui 1 --wait --timeout 100s
+          helm -n track-ui history track-ui
+          helm -n track-ui status track-ui -o json | jq -r .version > ~/answers/track-ui-revision.txt

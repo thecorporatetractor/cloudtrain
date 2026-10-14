@@ -1,0 +1,132 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xkd-kustomize-image-tag
+  title: Set an image tag through Kustomize
+  domain: kubernetes
+  frameworks: [ckad:deployment]
+  difficulty: easy
+  estimatedMinutes: 5
+  tags: [exam, kustomize]
+  version: 1
+spec:
+  description: |
+    **Context:** `qm-dispatch` (`kubectl config use-context qm-dispatch`)
+
+    The directory `~/parcel-api/` holds a Kustomize base (`base/`) and a
+    staging overlay (`overlays/staging/`) for the parcel API.
+
+    1. Using the **`images`** field of the **staging overlay** (do not edit
+       the base), set the tag of `registry.quillmoor.example/parcel-api` to
+       **`{{tag}}`**.
+    2. Apply the staging overlay to the cluster.
+
+    Only the Deployment object is graded; the image does not need to be
+    pullable.
+  objectives:
+    - Override an image tag in a Kustomize overlay and apply it
+  params:
+    tag:
+      type: choice
+      values: ["2.7", "2.7.1", "2.8"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-dispatch
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: qm-dispatch
+  setup:
+    - on: qm-dispatch
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: parcel-staging}
+    - on: workstation
+      run: install -d -o learner -g learner -m 0755 /home/learner/parcel-api /home/learner/parcel-api/base /home/learner/parcel-api/overlays /home/learner/parcel-api/overlays/staging
+    - on: workstation
+      file: {path: /home/learner/parcel-api/base/deployment.yaml, source: assets/base/deployment.yaml, mode: "0644"}
+    - on: workstation
+      file: {path: /home/learner/parcel-api/base/kustomization.yaml, source: assets/base/kustomization.yaml, mode: "0644"}
+    - on: workstation
+      file: {path: /home/learner/parcel-api/overlays/staging/kustomization.yaml, source: assets/staging/kustomization.yaml, mode: "0644"}
+    - on: workstation
+      run: chown -R learner:learner /home/learner/parcel-api
+  teardown:
+    - on: qm-dispatch
+      run: kubectl delete namespace parcel-staging --ignore-not-found --wait=false
+  checks:
+    - id: overlay-images
+      description: The staging overlay sets the parcel-api tag to {{tag}} with its images field
+      type: shell
+      on: workstation
+      skills: [k8s.cluster.kustomize]
+      weight: 2
+      command: yq -r '.images[] | select(.name == "registry.quillmoor.example/parcel-api") | .newTag' /home/learner/parcel-api/overlays/staging/kustomization.yaml 2>/dev/null || echo none
+      expect: {match: exact, value: "{{tag}}"}
+    - id: base-untouched
+      description: The base still renders parcel-api:2.6
+      type: shell
+      on: workstation
+      skills: [k8s.cluster.kustomize]
+      command: |
+        kubectl kustomize /home/learner/parcel-api/base 2>/dev/null | grep -o 'image: .*' || echo "render failed"
+      expect: {match: exact, value: "image: registry.quillmoor.example/parcel-api:2.6"}
+    - id: applied
+      description: Deployment parcel-api in parcel-staging uses tag {{tag}} and carries the overlay label
+      type: k8s-query
+      skills: [k8s.cluster.kustomize]
+      weight: 2
+      query: {cluster: qm-dispatch, resource: deployment, name: parcel-api, namespace: parcel-staging, jsonpath: "{.spec.template.spec.containers[0].image} {.metadata.labels.env}"}
+      expect: {match: exact, value: "registry.quillmoor.example/parcel-api:{{tag}} staging"}
+  misconceptions:
+    - id: edit-base
+      description: Changes the tag in the base deployment, which also changes every other overlay built on it.
+      feedback: Overlays exist so environments differ without touching the shared base. Put the override in the overlay.
+      expectFail: [overlay-images, base-untouched]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-dispatch
+          sed -i 's#parcel-api:2.6#parcel-api:{{tag}}#' ~/parcel-api/base/deployment.yaml
+          kubectl apply -k ~/parcel-api/overlays/staging
+    - id: set-image-live
+      description: Applies the overlay and then runs kubectl set image on the live Deployment; the next apply of the overlay reverts it.
+      feedback: The overlay is the source of truth. A live edit is overwritten the next time anyone applies it.
+      expectFail: [overlay-images]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl apply -k ~/parcel-api/overlays/staging
+          kubectl -n parcel-staging set image deploy/parcel-api api=registry.quillmoor.example/parcel-api:{{tag}}
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-dispatch
+          cat >> ~/parcel-api/overlays/staging/kustomization.yaml <<'YAML'
+          images:
+            - name: registry.quillmoor.example/parcel-api
+              newTag: "{{tag}}"
+          YAML
+          kubectl apply -k ~/parcel-api/overlays/staging
+    alternatives:
+      - id: yq-edit
+        description: Add the images entry with yq and apply with kubectl kustomize piped to apply.
+        steps:
+          - on: workstation
+            as: learner
+            run: |
+              kubectl config use-context qm-dispatch
+              yq -i '.images = [{"name": "registry.quillmoor.example/parcel-api", "newTag": "{{tag}}"}]' ~/parcel-api/overlays/staging/kustomization.yaml
+              kubectl kustomize ~/parcel-api/overlays/staging | kubectl apply -f -

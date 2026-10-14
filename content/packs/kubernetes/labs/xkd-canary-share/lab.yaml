@@ -1,0 +1,185 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xkd-canary-share
+  title: Add a canary behind an existing Service
+  domain: kubernetes
+  frameworks: [ckad:deployment]
+  difficulty: medium
+  estimatedMinutes: 8
+  tags: [exam, canary, deployments]
+  version: 1
+spec:
+  description: |
+    **Context:** `qm-dispatch` (`kubectl config use-context qm-dispatch`)
+
+    In namespace `quote-service`, the Service `quote` sends traffic to the
+    10 Pods of the Deployment `quote-engine` (image `busybox:1.37`).
+
+    Add a Deployment named **`quote-engine-canary`** whose Pods run the new
+    image **`httpd:2.4-alpine`** (it listens on port 80) so that the Service
+    `quote` still has **10** Pods behind it in total and **2** of them (20 %)
+    are canary Pods. Label the canary Pods `track: canary`. Do not modify the
+    Service.
+  objectives:
+    - Size a canary next to a stable Deployment behind one Service
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-dispatch
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: qm-dispatch
+  setup:
+    - on: qm-dispatch
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: quote-service}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: quote-engine, namespace: quote-service}
+        spec:
+          replicas: 10
+          selector: {matchLabels: {app: quote, track: stable}}
+          template:
+            metadata: {labels: {app: quote, track: stable}}
+            spec:
+              terminationGracePeriodSeconds: 2
+              containers:
+                - name: engine
+                  image: busybox:1.37
+                  command: ["sh", "-c", "mkdir -p /www && echo stable > /www/index.html && exec httpd -f -p 8080 -h /www"]
+                  ports: [{name: http, containerPort: 8080}]
+                  resources: {requests: {cpu: 5m, memory: 8Mi}}
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata: {name: quote, namespace: quote-service}
+        spec:
+          selector: {app: quote}
+          ports: [{name: http, port: 80, targetPort: http}]
+    - on: qm-dispatch
+      timeoutSec: 180
+      run: kubectl -n quote-service rollout status deploy/quote-engine --timeout=170s
+  teardown:
+    - on: qm-dispatch
+      run: kubectl delete namespace quote-service --ignore-not-found --wait=false
+  checks:
+    - id: canary-image
+      description: quote-engine-canary runs httpd:2.4-alpine with track=canary Pods
+      type: k8s-query
+      skills: [k8s.delivery.deployment-strategies]
+      query: {cluster: qm-dispatch, resource: deployment, name: quote-engine-canary, namespace: quote-service, jsonpath: "{.spec.template.spec.containers[0].image} {.spec.template.metadata.labels.app}/{.spec.template.metadata.labels.track}"}
+      expect: {match: exact, value: httpd:2.4-alpine quote/canary}
+    - id: share
+      description: The Service has 10 ready endpoints, 2 of them canary Pods
+      type: shell
+      on: qm-dispatch
+      skills: [k8s.delivery.deployment-strategies]
+      weight: 3
+      command: |
+        eps=$(kubectl -n quote-service get endpointslices -l kubernetes.io/service-name=quote -o jsonpath='{range .items[*].endpoints[?(@.conditions.ready==true)]}{.targetRef.name}{"\n"}{end}')
+        t=0; c=0
+        for p in $eps; do t=$((t+1)); case "$p" in quote-engine-canary-*) c=$((c+1)) ;; esac; done
+        echo "total=$t canary=$c"
+      expect: {match: exact, value: "total=10 canary=2"}
+    - id: service-unchanged
+      description: Service quote is unchanged
+      type: k8s-query
+      skills: [k8s.delivery.deployment-strategies]
+      weight: 0.5
+      query: {cluster: qm-dispatch, resource: service, name: quote, namespace: quote-service, jsonpath: "{.spec.selector} {.spec.ports[0].port}->{.spec.ports[0].targetPort}"}
+      expect: {match: exact, value: '{"app":"quote"} 80->http'}
+  misconceptions:
+    - id: forgot-stable
+      description: Adds 2 canary Pods without scaling the stable Deployment down, so 12 Pods serve and the canary gets about 17 %.
+      feedback: The share is canary / total. Keep the total at 10 by scaling stable to 8.
+      expectFail: [share]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl apply -f - <<'YAML'
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata: {name: quote-engine-canary, namespace: quote-service}
+          spec:
+            replicas: 2
+            selector: {matchLabels: {app: quote, track: canary}}
+            template:
+              metadata: {labels: {app: quote, track: canary}}
+              spec:
+                containers:
+                  - name: engine
+                    image: httpd:2.4-alpine
+                    ports: [{name: http, containerPort: 80}]
+          YAML
+          kubectl -n quote-service rollout status deploy/quote-engine-canary --timeout=120s
+    - id: unnamed-port
+      description: Leaves the canary's port unnamed; the Service targets the port name http, so the canary Pods never become endpoints.
+      feedback: A Service with `targetPort` set to a name looks that name up in each Pod. Name the canary's port http.
+      expectFail: [share]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl -n quote-service scale deploy quote-engine --replicas=8
+          kubectl apply -f - <<'YAML'
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata: {name: quote-engine-canary, namespace: quote-service}
+          spec:
+            replicas: 2
+            selector: {matchLabels: {app: quote, track: canary}}
+            template:
+              metadata: {labels: {app: quote, track: canary}}
+              spec:
+                containers:
+                  - name: engine
+                    image: httpd:2.4-alpine
+                    ports: [{containerPort: 80}]
+          YAML
+          kubectl -n quote-service rollout status deploy/quote-engine-canary --timeout=120s
+          kubectl -n quote-service rollout status deploy/quote-engine --timeout=120s
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 200
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl -n quote-service scale deployment quote-engine --replicas=8
+          kubectl apply -f - <<'YAML'
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: quote-engine-canary
+            namespace: quote-service
+          spec:
+            replicas: 2
+            selector:
+              matchLabels: {app: quote, track: canary}
+            template:
+              metadata:
+                labels: {app: quote, track: canary}
+              spec:
+                containers:
+                  - name: engine
+                    image: httpd:2.4-alpine
+                    ports:
+                      - {name: http, containerPort: 80}
+          YAML
+          kubectl -n quote-service rollout status deploy/quote-engine-canary --timeout=150s
+          kubectl -n quote-service rollout status deploy/quote-engine --timeout=150s
