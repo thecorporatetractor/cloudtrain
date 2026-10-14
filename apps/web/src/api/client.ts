@@ -158,8 +158,12 @@ export function useEndSession(sessionId: string | undefined) {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: async () => {
-      const res = await fetch(`/api/sessions/${sessionId}`, { method: 'DELETE' });
-      if (!res.ok && res.status !== 404) throw new ApiError(res.status, res.statusText || 'Could not end the session');
+      // Through request() so the CSRF header is sent; 404 means it is already gone.
+      try {
+        await del(`/api/sessions/${sessionId}`);
+      } catch (err) {
+        if (!(err instanceof ApiError && err.status === 404)) throw err;
+      }
     },
     onSuccess: () => qc.removeQueries({ queryKey: ['session', sessionId] }),
   });
