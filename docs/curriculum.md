@@ -2,7 +2,7 @@
 
 <!-- GENERATED from content/curriculum.yaml by tools/curriculum/render.mjs. Do not edit by hand. -->
 
-Status: **proposal**, version 1, updated 2026-10-14. Source of truth: `content/curriculum.yaml` (schema `packages/lab-schema/schema/curriculum.schema.json`, cross-checked by `tools/lab-verify`).
+Status: **proposal**, version 2, updated 2026-10-14. Source of truth: `content/curriculum.yaml` (schema `packages/lab-schema/schema/curriculum.schema.json`, cross-checked by `tools/lab-verify`).
 
 Proposed CloudTrain curriculum across six domains. Everything not yet built is status proposed and awaits approval. Alignment to external exams lives only in `frameworks` refs, path/exam disclaimers and descriptive text; titles never name an exam, exam code or certifying body.
 
@@ -14,13 +14,13 @@ Legend. **Type**: learn = guided first exposure, do = complete a task, fix = rep
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | Kubernetes | 5 | 89 | 103 | 3 | 4 | 7 | 181 | C 1, K 112, V 79 | 25 |
 | Linux administration | 11 | 159 | 119 | 3 | 0 | 0 | 278 | A 84, B 69, C 125 | 48 |
-| Containers with Docker and Podman | 12 | 78 | 28 | 1 | 0 | 0 | 106 | B 59, C 47 | 22 |
+| Containers with Docker | 11 | 91 | 44 | 2 | 0 | 0 | 135 | B 71, C 64 | 28 |
 | Infrastructure as code with OpenTofu and Terraform | 5 | 50 | 44 | 2 | 0 | 0 | 94 | A 50, B 1, V 43 | 19 |
 | Configuration management and automation | 7 | 61 | 36 | 1 | 0 | 0 | 97 | A 39, B 7, C 45, N 6 | 26 |
 | Network administration | 4 | 45 | 32 | 1 | 0 | 0 | 77 | N 77 | 15 |
-| **Total** | 44 | 482 | 362 | 12 | 4 | 7 | 833 | A 173, B 136, C 218, K 112, V 122, N 83 | 154 |
+| **Total** | 43 | 495 | 378 | 13 | 4 | 7 | 862 | A 173, B 148, C 235, K 112, V 122, N 83 | 160 |
 
-Cross-domain exams: Platform engineer practical capstone. Exam tasks are counted under the domain of each task. Learning labs by type: learn 44, do 345, fix 80, hack 13. New skills proposed: 302.
+Cross-domain exams: Platform engineer practical capstone. Exam tasks are counted under the domain of each task. Learning labs by type: learn 45, do 354, fix 83, hack 13. New skills proposed: 309.
 
 ## Kubernetes
 
@@ -518,30 +518,31 @@ _CloudTrain is not affiliated with or endorsed by Red Hat, Inc. or CompTIA, Inc.
 | `hardware-inventory-report` | Inventory a depot host's hardware without vendor tools | learn | easy | 12 | C | proposed | lpic1:system-architecture, linuxplus:system-management | Report CPU model and cores, memory, block devices with sizes and PCI network controllers of depot-ctl-2 in the CSV format the asset team needs. |
 | `libvirt-golden-template` | Turn a configured VM into a reusable template | do | hard | 25 | C | proposed | lpic1:install-packages | Clean the configured depot VM (machine-id, SSH host keys, logs, cloud-init state) so clones from it boot with unique identities, proven by cloning two copies. |
 
-## Containers with Docker and Podman
+## Containers with Docker
 
-Build, ship, run, secure and debug OCI containers with Docker Engine 29 and Podman 5, graded on end state (inspect output, registry contents, attestations, reachability) rather than on command history. Digests, OCI referrers and attestations are first-class from the image-building path onward.
+Build, ship, run, secure and debug OCI containers with Docker Engine 29, BuildKit, buildx, Bake and Compose, graded on end state (inspect output, registry contents, attestations, reachability) rather than on command history. Digests, OCI referrers and attestations are first-class from the image-building path onward. Podman 5 is a short optional track for Enterprise Linux hosts.
 
 Fictional organisation: **Copperleaf Media** (A fictional streaming and publishing company running a video transcoder farm, a catalogue API, a subtitle service, an ad-insertion service and a playout encoder, with a private registry at registry.copperleaf.example.).
 
+Docker-first since revision 2 (2026-10-14). Paths, exams and the image budget centre on Docker Engine 29 (containerd image store), BuildKit/buildx/Bake, Compose, networking, storage, registries, runtime security, supply chain (Scout, cosign, Notation, SBOM and provenance, Docker Hardened Images), troubleshooting and production CI. Podman keeps five labs (differences from Docker, rootless, SELinux mounts, pods with Kubernetes YAML, Quadlet) and a smaller optional simulation; Swarm stays optional and unexamined.
+
 Competencies: `containers.foundations` (new), `containers.build` (new), `containers.buildkit` (new), `containers.compose` (new), `containers.network` (new), `containers.storage` (new), `containers.runtime-security` (new), `containers.supply-chain` (new), `containers.registry` (new), `containers.operations` (new), `containers.internals` (new), `containers.podman` (new), `containers.swarm` (new).
 
-### Paths (12)
+### Paths (11)
 
 | Path | Title | Level | Hours | Labs | Prerequisites | Aligns to | Audience |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `ctr-foundations` | Container foundations | beginner | 3 | 8 | - | - | Developers and administrators new to containers; requires the Linux foundations shell, permissions and processes modules |
-| `ctr-building-images` | Building great container images | intermediate | 6 | 13 | `ctr-foundations` | ckad | Developers and platform engineers who ship images |
-| `ctr-compose` | Multi-container applications with Compose | intermediate | 3 | 7 | `ctr-foundations` | - | Developers running local stacks and small services |
-| `ctr-networking` | Container networking | advanced | 4 | 7 | `ctr-foundations` | - | Platform and operations engineers; requires Linux host networking basics |
-| `ctr-storage` | Container storage and data | intermediate | 2 | 5 | `ctr-foundations` | - | Anyone running stateful containers |
+| `ctr-building-images` | Building great container images | intermediate | 7 | 15 | `ctr-foundations` | ckad | Developers and platform engineers who ship images |
+| `ctr-compose` | Multi-container applications with Compose | intermediate | 4 | 9 | `ctr-foundations` | - | Developers running local stacks and small services |
+| `ctr-networking` | Container networking | advanced | 6 | 10 | `ctr-foundations` | - | Platform and operations engineers; requires Linux host networking basics |
+| `ctr-storage` | Container storage and data | intermediate | 3 | 6 | `ctr-foundations` | - | Anyone running stateful containers |
 | `ctr-registries` | Registries and image distribution | intermediate | 3 | 6 | `ctr-building-images` | - | Platform engineers running registries and offline mirrors |
-| `ctr-security-supply-chain` | Container security and supply chain | advanced | 7 | 12 | `ctr-building-images`, `ctr-registries` | cks | Security and platform engineers |
-| `ctr-troubleshooting-production` | Container troubleshooting and production operations | advanced | 5 | 10 | `ctr-building-images`, `ctr-compose`, `ctr-networking`, `ctr-storage` | - | Operations engineers running container hosts and CI |
+| `ctr-security-supply-chain` | Container security and supply chain | advanced | 10 | 16 | `ctr-building-images`, `ctr-registries` | cks | Security and platform engineers |
+| `ctr-troubleshooting-production` | Container troubleshooting and production operations | advanced | 7 | 13 | `ctr-building-images`, `ctr-compose`, `ctr-networking`, `ctr-storage` | - | Operations engineers running container hosts and CI |
 | `ctr-internals` | Container internals | advanced | 4 | 7 | `ctr-building-images`, `ctr-storage` | - | Platform engineers, SREs and security engineers |
-| `ctr-podman-track` | Podman containers on Enterprise Linux | intermediate | 6 | 16 | `ctr-foundations` | ex188-aligned | Administrators and developers on Enterprise Linux; graded on end state that survives a reboot |
+| `ctr-podman-track` | Podman for Docker users (optional) | intermediate | 2 | 5 | `ctr-foundations` | ex188-aligned | Docker users who also run containers on Enterprise Linux hosts; graded on end state that survives a reboot |
 | `ctr-swarm` | Swarm essentials (optional) | intermediate | 2 | 3 | `ctr-compose`, `ctr-networking` | - | Teams still operating Swarm clusters |
-| `ctr-dca-legacy-overlay` | Legacy Docker associate objectives overlay | intermediate | 8 | 22 | `ctr-foundations` | dca-legacy | Learners preparing for the legacy Docker associate exam; UCP/DTR (MKE/MSR), Interlock, devicemapper and content-trust objectives are not taught |
 
 <details><summary><b>Container foundations</b>: modules</summary>
 
@@ -553,8 +554,8 @@ Competencies: `containers.foundations` (new), `containers.build` (new), `contain
 <details><summary><b>Building great container images</b>: modules</summary>
 
 - **Dockerfile fundamentals**: `ctr-dockerfile-catalogue-api`, `ctr-build-args-labels`, `ctr-exec-form-signals`, `ctr-healthcheck`
-- **Small, cache-friendly, non-root images**: `ctr-cache-order`, `ctr-shrink-transcoder`, `ctr-non-root-uid`, `ctr-digest-pin`
-- **BuildKit and build-as-code**: `ctr-buildkit-cache-mount`, `ctr-build-secret-token`, `ctr-build-checks`, `ctr-multi-platform`, `ctr-bake-matrix`
+- **Small, cache-friendly, non-root, reproducible images**: `ctr-cache-order`, `ctr-shrink-transcoder`, `ctr-non-root-uid`, `ctr-digest-pin`, `ctr-reproducible-build`
+- **BuildKit, buildx and Bake**: `ctr-buildkit-cache-mount`, `ctr-build-secret-token`, `ctr-build-checks`, `ctr-multi-platform`, `ctr-bake-matrix`, `ctr-buildx-cache-export`
 
 _CloudTrain is not affiliated with or endorsed by the Cloud Native Computing Foundation or The Linux Foundation. CKAD is a trademark of The Linux Foundation. This path covers objectives aligned to that exam; completing it confers no certification._
 
@@ -564,19 +565,22 @@ _CloudTrain is not affiliated with or endorsed by the Cloud Native Computing Fou
 
 - **The application model**: `ctr-compose-first-stack`, `ctr-compose-env-interp`, `ctr-compose-override-profiles`
 - **Startup, secrets and the inner loop**: `ctr-compose-healthy-start`, `ctr-compose-secrets`, `ctr-compose-watch`, `ctr-compose-proxy-repair`
+- **Composition and distribution**: `ctr-compose-include-split`, `ctr-compose-oci-publish`
 
 </details>
 
 <details><summary><b>Container networking</b>: modules</summary>
 
 - **Bridges, names and published ports**: `ctr-user-bridge-dns`, `ctr-publish-scoped`, `ctr-reach-without-publish`
-- **Host integration and drivers**: `ctr-cidr-clash`, `ctr-docker-user-chain`, `ctr-macvlan-encoder`, `ctr-net-mtu-hang`
+- **Host integration, firewall backends and drivers**: `ctr-cidr-clash`, `ctr-docker-user-chain`, `ctr-nftables-backend`, `ctr-macvlan-encoder`, `ctr-ipv6-dual-stack`
+- **Packet-level diagnosis**: `ctr-net-tcpdump-veth`, `ctr-net-mtu-hang`
 
 </details>
 
 <details><summary><b>Container storage and data</b>: modules</summary>
 
-- **Mounts and data operations**: `ctr-volume-vs-bind`, `ctr-volume-backup-restore`, `ctr-bind-permission-denied`, `ctr-selinux-relabel`, `ctr-storage-backend-tour`
+- **Mounts and data operations**: `ctr-volume-vs-bind`, `ctr-volume-backup-restore`, `ctr-bind-permission-denied`, `ctr-image-mount-models`
+- **The image store**: `ctr-storage-backend-tour`, `ctr-containerd-store-migration`
 
 </details>
 
@@ -589,8 +593,9 @@ _CloudTrain is not affiliated with or endorsed by the Cloud Native Computing Fou
 
 <details><summary><b>Container security and supply chain</b>: modules</summary>
 
-- **Runtime least privilege**: `ctr-cap-drop-readonly`, `ctr-socket-escape`, `ctr-rootless-engine`, `ctr-seccomp-profile`, `ctr-cis-bench`
-- **Scanning, attestations and signatures**: `ctr-scan-triage-vex`, `ctr-sbom-provenance`, `ctr-content-trust-retired`, `ctr-cosign-sign-verify`, `ctr-signed-only-gate`, `ctr-leaked-secret-history`, `ctr-hardened-base-migration`
+- **Runtime and engine least privilege**: `ctr-cap-drop-readonly`, `ctr-socket-escape`, `ctr-remote-engine-ssh`, `ctr-rootless-engine`, `ctr-seccomp-profile`, `ctr-cis-bench`
+- **Scanning, policy and hardened bases**: `ctr-scan-triage-vex`, `ctr-scout-policy`, `ctr-leaked-secret-history`, `ctr-hardened-base-migration`, `ctr-dhi-vex-reconcile`
+- **Attestations and signatures**: `ctr-sbom-provenance`, `ctr-content-trust-retired`, `ctr-cosign-sign-verify`, `ctr-notation-sign-verify`, `ctr-signed-only-gate`
 
 _CloudTrain is not affiliated with or endorsed by the Cloud Native Computing Foundation or The Linux Foundation. CKS is a trademark of The Linux Foundation. This path covers objectives aligned to that exam; completing it confers no certification._
 
@@ -598,8 +603,9 @@ _CloudTrain is not affiliated with or endorsed by the Cloud Native Computing Fou
 
 <details><summary><b>Container troubleshooting and production operations</b>: modules</summary>
 
-- **Exits, limits and changed defaults**: `ctr-oom-exit-137`, `ctr-nofile-after-upgrade`, `ctr-link-env-removed`, `ctr-seccomp-legacy-binary`, `ctr-debug-distroless`
-- **Logs, restarts, daemon and upgrades**: `ctr-log-rotation`, `ctr-restart-policy`, `ctr-daemon-json-conflict`, `ctr-engine-upgrade`, `ctr-ci-rootless-buildkit`
+- **Exits, limits and changed defaults**: `ctr-oom-exit-137`, `ctr-nofile-after-upgrade`, `ctr-link-env-removed`, `ctr-seccomp-legacy-binary`, `ctr-api-version-floor`, `ctr-events-flapping`, `ctr-debug-distroless`
+- **Logs, restarts, daemon and upgrades**: `ctr-log-rotation`, `ctr-restart-policy`, `ctr-daemon-json-conflict`, `ctr-engine-upgrade`
+- **Production delivery and CI**: `ctr-ci-rootless-buildkit`, `ctr-release-pipeline-capstone`
 
 </details>
 
@@ -610,15 +616,14 @@ _CloudTrain is not affiliated with or endorsed by the Cloud Native Computing Fou
 
 </details>
 
-<details><summary><b>Podman containers on Enterprise Linux</b>: modules</summary>
+<details><summary><b>Podman for Docker users (optional)</b>: modules</summary>
 
-- **Building images (Containerfile patterns transfer from Docker)**: `ctr-dockerfile-catalogue-api`, `ctr-build-args-labels`, `ctr-non-root-uid`, `ctr-shrink-transcoder`
-- **Registries and image management**: `ctr-podman-registries-conf`, `ctr-local-registry-tls`, `ctr-skopeo-copy-airgap`, `ctr-podman-state-commit`
-- **Rootless containers and services**: `ctr-podman-rootless-basics`, `ctr-selinux-relabel`, `ctr-quadlet-reboot`
-- **Pods, secrets and Kubernetes YAML**: `ctr-podman-pod`, `ctr-podman-secret`, `ctr-podman-kube-play`
-- **Troubleshooting**: `ctr-oom-exit-137`, `ctr-debug-distroless`
+- **Differences from Docker and rootless operation**: `ctr-podman-docker-differences`, `ctr-podman-rootless-basics`, `ctr-selinux-relabel`
+- **Pods and systemd services**: `ctr-podman-pod-kube-play`, `ctr-quadlet-reboot`
 
 _CloudTrain is not affiliated with or endorsed by Red Hat, Inc. Red Hat Certified Specialist in Containers is a trademark of Red Hat, Inc. This path covers objectives aligned to that exam; completing it confers no certification._
+
+Optional short track. Image building, registries and troubleshooting transfer from the Docker paths (ctr-building-images, ctr-registries, ctr-troubleshooting-production); learners aiming at the Podman simulation take those first.
 
 </details>
 
@@ -628,98 +633,98 @@ _CloudTrain is not affiliated with or endorsed by Red Hat, Inc. Red Hat Certifie
 
 </details>
 
-<details><summary><b>Legacy Docker associate objectives overlay</b>: modules</summary>
-
-- **Orchestration**: `ctr-swarm-init-quorum`, `ctr-swarm-services`, `ctr-swarm-stack`
-- **Image creation, management and registry**: `ctr-dockerfile-catalogue-api`, `ctr-shrink-transcoder`, `ctr-tag-vs-digest`, `ctr-local-registry-tls`
-- **Installation and configuration**: `ctr-daemon-json-conflict`, `ctr-log-rotation`, `ctr-engine-upgrade`, `ctr-inspect-report`
-- **Networking**: `ctr-user-bridge-dns`, `ctr-publish-scoped`, `ctr-cidr-clash`, `ctr-docker-user-chain`
-- **Security**: `ctr-cap-drop-readonly`, `ctr-rootless-engine`, `ctr-content-trust-retired`, `ctr-cis-bench`
-- **Storage and volumes**: `ctr-volume-vs-bind`, `ctr-volume-backup-restore`, `ctr-storage-backend-tour`
-
-_CloudTrain is not affiliated with or endorsed by Mirantis, Inc. Docker Certified Associate is a trademark of Mirantis, Inc. This path covers objectives aligned to that exam; completing it confers no certification._
-
-</details>
-
-### Labs (78)
+### Labs (91)
 
 | Lab | Title | Type | Difficulty | Min | Tier | Status | Frameworks | Scenario |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `ctr-first-transcoder-run` | Start, inspect and retire your first transcoder container | learn | easy | 12 | B | proposed | ex188-aligned:run-containers | Run the transcode-probe image detached as probe-1 with PROFILE=1080p, read its startup banner from the logs into ~/probe-banner.txt, and remove the stale probe-old container so only probe-1 remains. |
-| `ctr-override-defaults` | Run a one-off catalogue migration by overriding image defaults | do | easy | 10 | B | proposed | ex188-aligned:run-containers | Copperleaf's catalogue-api image normally starts the server; run it once with an overridden entrypoint and arguments to apply migration 0042, then record the migration container's exit code in ~/migrate-exit.txt. |
-| `ctr-exec-into-subtitle` | Read live configuration from inside the subtitle service | do | easy | 8 | B | proposed | ex188-aligned:troubleshoot | The running subtitle-svc container was started with a config nobody committed; exec into it, find the active caption-font value it loaded, and write it to ~/subtitle-font.txt without restarting the container. |
-| `ctr-inspect-report` | Report which containers mount the catalogue share | do | easy | 12 | B | proposed | dca-legacy:install-config | Of the twelve containers on Copperleaf's batch host, list the names and IP addresses of exactly those that mount /srv/catalogue, one per line in ~/catalogue-mounts.txt, using inspect templates and filters. |
-| `ctr-disk-reclaim` | Free engine disk space without losing release images | fix | easy | 12 | B | proposed |  | The transcoder host's engine storage is 95% full; reclaim at least 3 GiB with targeted prune commands while every image tagged prod and every named volume survives. |
-| `ctr-tag-vs-digest` | Deploy the catalogue API by digest after a tag moved | learn | easy | 10 | B | proposed | dca-legacy:images-registry, ex188-aligned:manage-images | catalogue-api:2.3 was re-pushed with a different build overnight; find the digest the release note names in the local registry, run the service by that digest, and write the digest to ~/pinned-digest.txt. |
-| `ctr-dockerfile-catalogue-api` | Write a Dockerfile with a lean build context for the catalogue API | learn | easy | 15 | B | proposed | ex188-aligned:build-images, ckad:design-build, dca-legacy:images-registry | Containerise Copperleaf's Python catalogue API so the image answers on port 8080 and the 2 GiB of sample media in the repository never reaches the build context or the image. |
-| `ctr-exec-form-signals` | Make the ad-insertion service stop cleanly | fix | medium | 15 | B | proposed | ex188-aligned:build-images | The ad-insertion container ignores SIGTERM because a shell-form ENTRYPOINT wraps it, so every stop waits 10 s and loses in-flight bookings; fix the image so docker stop finishes within 2 s and the service logs a clean shutdown. |
-| `ctr-cache-order` | Reorder the subtitle build so code edits reuse cached dependencies | do | medium | 15 | B | proposed | ckad:design-build | A one-line code change to the subtitle service triggers a six-minute dependency reinstall; restructure the Dockerfile so a rebuild after editing src/ reuses the dependency layer and the apt layer leaves no package lists behind. |
-| `ctr-shrink-transcoder` | Shrink the transcoder image with a multi-stage build | do | medium | 20 | B | proposed | ckad:design-build, cks:supply-chain-security, ex188-aligned:build-images | The transcoder image weighs about 900 MB because it ships its compiler toolchain; rebuild it with multiple stages so it is under 120 MB and still passes the bundled probe-media self-test. |
-| `ctr-non-root-uid` | Run the thumbnailer as UID 10001 with one writable cache path | do | medium | 15 | B | proposed | ex188-aligned:build-images, cks:supply-chain-security | Security wants the thumbnailer image to run as UID/GID 10001 with only /var/cache/thumbs writable by that user; rebuild it so it starts without root and still writes thumbnails. |
-| `ctr-healthcheck` | Report catalogue API health only after its cache is warm | do | easy | 12 | B | proposed | ex188-aligned:build-images | Add a HEALTHCHECK to the catalogue API image so the container reports healthy only once /ready returns 200 after the cache warm-up, and unhealthy within 30 s if that endpoint starts failing. |
-| `ctr-build-args-labels` | Stamp release metadata into the subtitle image with ARG and labels | do | easy | 10 | B | proposed | ex188-aligned:build-images | Make the subtitle image accept a RELEASE build argument that ends up both as an org.opencontainers.image.version label and as the APP_RELEASE environment variable, then build release 4.2.0. |
-| `ctr-digest-pin` | Pin every base image of the catalogue build by digest | do | medium | 12 | B | proposed | cks:supply-chain-security | Replace each floating FROM tag in the catalogue API's Dockerfile with the digest currently served by the Copperleaf mirror so a rebuild next month produces the same base layers. |
-| `ctr-buildkit-cache-mount` | Stop re-downloading Python wheels on every rebuild | do | medium | 15 | B | proposed |  | Use a BuildKit cache mount for the pip cache in the subtitle build so a rebuild after a requirements bump fetches only the changed package from the offline index (the grader reads the index access log). |
-| `ctr-build-secret-token` | Move a private package token out of build arguments | do | medium | 15 | B | proposed | cks:supply-chain-security | The ad-insertion build passes a package-feed token via ARG, so it shows up in image history; switch to a BuildKit secret mount so the image still builds and neither history nor any layer contains the token. |
-| `ctr-build-checks` | Clear every build-check warning in the subtitle Dockerfile | fix | easy | 10 | B | proposed |  | Run the build checks against the subtitle service's Dockerfile and fix every reported issue (shell-form commands, casing, undefined variables) so the check run exits clean and the image still builds. |
-| `ctr-multi-platform` | Publish the thumbnailer for amd64 and arm64 in one index | do | hard | 25 | B | proposed |  | Copperleaf's new ARM edge boxes need the thumbnailer; build it for linux/amd64 and linux/arm64 with buildx and push a single index to the private registry whose manifest list carries both platforms. |
-| `ctr-bake-matrix` | Build three media services from one Bake file | do | hard | 20 | B | proposed |  | Write a Bake file whose default group builds the transcoder, subtitle and thumbnailer images with a shared RELEASE variable so one bake command produces all three tagged images. |
-| `ctr-compose-first-stack` | Describe the catalogue API and its cache as a Compose project | learn | easy | 15 | B | proposed | ex188-aligned:multi-container | Write a Compose file that runs the catalogue API with a Redis cache on a named network and a named volume, so compose up -d leaves the API on port 8080 serving cached titles. |
-| `ctr-compose-env-interp` | Drive staging and production ports from .env files | do | easy | 12 | B | proposed |  | Parameterise the catalogue Compose project so .env.staging publishes 18080 and .env.prod publishes 8080, and compose config with each file renders exactly those ports. |
-| `ctr-compose-healthy-start` | Stop the rights service racing its database at startup | fix | medium | 15 | B | proposed | ex188-aligned:multi-container | The rights-ledger API crash-loops on every compose up because it starts before PostgreSQL accepts connections; add a database healthcheck and a depends_on condition so a cold start brings the API up healthy on the first try. |
-| `ctr-compose-override-profiles` | Add a debug toolbox that only starts on request | do | medium | 15 | B | proposed |  | Split the catalogue project into a base file and a local override, and add a toolbox service that starts only with the debug profile, so a plain up runs two services and a debug up runs three. |
-| `ctr-compose-secrets` | Deliver the ad partner key as a Compose secret | do | medium | 15 | B | proposed | ex188-aligned:multi-container | Give the ad-insertion service its partner API key as a Compose secret mounted under /run/secrets instead of an environment variable, so the key is readable in the container but absent from docker inspect output. |
-| `ctr-compose-watch` | Live-sync subtitle templates while developing | do | medium | 15 | B | proposed |  | Configure develop.watch so edits under templates/ appear in the running subtitle container without a rebuild and a change to requirements.txt triggers a rebuild, as proven by the grader's file edits. |
-| `ctr-compose-proxy-repair` | Repair the caption-render proxy that answers 502 | fix | medium | 20 | B | proposed | ex188-aligned:troubleshoot | Copperleaf's Caddy proxy in front of two caption renderers returns 502 because the renderers sit on another network and the upstream port is wrong; fix the Compose project so requests alternate between both renderers. |
-| `ctr-user-bridge-dns` | Let the catalogue API find its database by name | learn | easy | 12 | B | proposed | dca-legacy:networking, ex188-aligned:multi-container | catalogue-api cannot resolve catalogue-db because both run on the default bridge; move them to a user-defined network so the API reaches the database by name and stays unpublished to the host. |
-| `ctr-publish-scoped` | Publish the transcoder API on the private address only | do | easy | 10 | B | proposed | dca-legacy:networking, ex188-aligned:run-containers | Publish the transcoder's job API on the host's private address and its metrics port on 127.0.0.1 only, so the grader's second host reaches the API but never the metrics. |
-| `ctr-reach-without-publish` | Query a distroless service's debug port without publishing it | do | medium | 12 | B | proposed |  | The distroless subtitle service exposes /debug/vars only on localhost inside its container; start a toolbox container in its network namespace and save that endpoint's output to ~/subtitle-vars.json without publishing any port. |
-| `ctr-cidr-clash` | Move container networks off the office VPN range | fix | medium | 20 | C | proposed | dca-legacy:networking | New Compose networks on the editing host grab 172.20.0.0/16, which collides with Copperleaf's VPN; configure default address pools so new networks land in 10.210.0.0/16 and the VPN route to the archive works again. |
-| `ctr-docker-user-chain` | Restrict the ad-insertion port to partner networks | hack | hard | 25 | C | proposed | dca-legacy:networking, dca-legacy:security | The published ad-insertion port is reachable from every network, and the host firewall rules the admin added are bypassed; add persistent DOCKER-USER rules so only 198.51.100.0/24 reaches it, surviving an engine restart. |
-| `ctr-macvlan-encoder` | Give the playout encoder its own studio LAN address | do | hard | 25 | C | proposed | dca-legacy:networking | The playout encoder must appear on the studio LAN as 192.0.2.40; attach it with a macvlan network on the VM's second NIC so the studio host reaches it directly. |
-| `ctr-net-mtu-hang` | Fix uploads from containers that hang at the CDN ingest | fix | hard | 25 | B | proposed |  | Large uploads from the packager container to the CDN ingest stall while small ones work; capture the traffic, find the MTU mismatch on the custom network and set the network MTU so a 50 MB upload completes. |
-| `ctr-volume-vs-bind` | Pick the right mount type for index, config and scratch | learn | easy | 12 | B | proposed | dca-legacy:storage, ex188-aligned:run-containers | Run the media indexer with its index in a named volume, its config as a read-only bind mount and its scratch space in a 256 MiB tmpfs, as verified by the container's mount table. |
-| `ctr-volume-backup-restore` | Back up the rights database volume and restore it elsewhere | do | medium | 15 | B | proposed | dca-legacy:storage | Archive the rights-db named volume to ~/backups/rights-db.tar.gz with a throwaway container and restore it into a new volume rights-db-restore so a second database container reports the same title count. |
-| `ctr-bind-permission-denied` | Let the non-root thumbnailer write to its bind mount | fix | medium | 15 | B | proposed | ex188-aligned:troubleshoot | The thumbnailer runs as UID 10001 and fails with permission denied on the host directory mounted at /var/cache/thumbs; fix ownership on the host side so it writes thumbnails without running as root. |
+| `ctr-first-transcoder-run` | Start, inspect and retire your first transcoder container | learn | easy | 12 | B | proposed | ex188-aligned:run-containers, docker-practitioner:operations | Run the transcode-probe image detached as probe-1 with PROFILE=1080p, read its startup banner from the logs into ~/probe-banner.txt, and remove the stale probe-old container so only probe-1 remains. |
+| `ctr-override-defaults` | Run a one-off catalogue migration by overriding image defaults | do | easy | 10 | B | proposed | ex188-aligned:run-containers, docker-practitioner:operations, docker-practitioner:build | Copperleaf's catalogue-api image normally starts the server; run it once with an overridden entrypoint and arguments to apply migration 0042, then record the migration container's exit code in ~/migrate-exit.txt. |
+| `ctr-exec-into-subtitle` | Read live configuration from inside the subtitle service | do | easy | 8 | B | proposed | ex188-aligned:troubleshoot, docker-practitioner:operations | The running subtitle-svc container was started with a config nobody committed; exec into it, find the active caption-font value it loaded, and write it to ~/subtitle-font.txt without restarting the container. |
+| `ctr-inspect-report` | Report which containers mount the catalogue share | do | easy | 12 | B | proposed | dca-legacy:install-config, docker-practitioner:operations | Of the twelve containers on Copperleaf's batch host, list the names and IP addresses of exactly those that mount /srv/catalogue, one per line in ~/catalogue-mounts.txt, using inspect templates and filters. |
+| `ctr-disk-reclaim` | Free engine disk space without losing release images | fix | easy | 12 | B | proposed | docker-practitioner:operations | The transcoder host's engine storage is 95% full; reclaim at least 3 GiB with targeted prune commands while every image tagged prod and every named volume survives. |
+| `ctr-tag-vs-digest` | Deploy the catalogue API by digest after a tag moved | learn | easy | 10 | B | proposed | dca-legacy:images-registry, ex188-aligned:manage-images, docker-practitioner:registry | catalogue-api:2.3 was re-pushed with a different build overnight; find the digest the release note names in the local registry, run the service by that digest, and write the digest to ~/pinned-digest.txt. |
+| `ctr-dockerfile-catalogue-api` | Write a Dockerfile with a lean build context for the catalogue API | learn | easy | 15 | B | proposed | ex188-aligned:build-images, ckad:design-build, dca-legacy:images-registry, docker-practitioner:build | Containerise Copperleaf's Python catalogue API so the image answers on port 8080 and the 2 GiB of sample media in the repository never reaches the build context or the image. |
+| `ctr-exec-form-signals` | Make the ad-insertion service stop cleanly | fix | medium | 15 | B | proposed | ex188-aligned:build-images, docker-practitioner:build | The ad-insertion container ignores SIGTERM because a shell-form ENTRYPOINT wraps it, so every stop waits 10 s and loses in-flight bookings; fix the image so docker stop finishes within 2 s and the service logs a clean shutdown. |
+| `ctr-cache-order` | Reorder the subtitle build so code edits reuse cached dependencies | do | medium | 15 | B | proposed | ckad:design-build, docker-practitioner:build | A one-line code change to the subtitle service triggers a six-minute dependency reinstall; restructure the Dockerfile so a rebuild after editing src/ reuses the dependency layer and the apt layer leaves no package lists behind. |
+| `ctr-shrink-transcoder` | Shrink the transcoder image with a multi-stage build | do | medium | 20 | B | proposed | ckad:design-build, cks:supply-chain-security, ex188-aligned:build-images, docker-practitioner:build | The transcoder image weighs about 900 MB because it ships its compiler toolchain; rebuild it with multiple stages so it is under 120 MB and still passes the bundled probe-media self-test. |
+| `ctr-non-root-uid` | Run the thumbnailer as UID 10001 with one writable cache path | do | medium | 15 | B | proposed | ex188-aligned:build-images, cks:supply-chain-security, docker-practitioner:build | Security wants the thumbnailer image to run as UID/GID 10001 with only /var/cache/thumbs writable by that user; rebuild it so it starts without root and still writes thumbnails. |
+| `ctr-healthcheck` | Report catalogue API health only after its cache is warm | do | easy | 12 | B | proposed | ex188-aligned:build-images, docker-practitioner:build | Add a HEALTHCHECK to the catalogue API image so the container reports healthy only once /ready returns 200 after the cache warm-up, and unhealthy within 30 s if that endpoint starts failing. |
+| `ctr-build-args-labels` | Stamp release metadata into the subtitle image with ARG and labels | do | easy | 10 | B | proposed | ex188-aligned:build-images, docker-practitioner:build | Make the subtitle image accept a RELEASE build argument that ends up both as an org.opencontainers.image.version label and as the APP_RELEASE environment variable, then build release 4.2.0. |
+| `ctr-digest-pin` | Pin every base image of the catalogue build by digest | do | medium | 12 | B | proposed | cks:supply-chain-security, docker-practitioner:build | Replace each floating FROM tag in the catalogue API's Dockerfile with the digest currently served by the Copperleaf mirror so a rebuild next month produces the same base layers. |
+| `ctr-reproducible-build` | Rebuild the subtitle image bit for bit from the same commit | do | hard | 25 | B | proposed | docker-practitioner:build | Auditors want to rebuild subtitle:4.3.0 and get the same digest; pin every input, derive SOURCE_DATE_EPOCH from the commit time and rewrite file timestamps so two clean builds on fresh builders produce an identical image digest. |
+| `ctr-buildkit-cache-mount` | Stop re-downloading Python wheels on every rebuild | do | medium | 15 | B | proposed | docker-practitioner:build | Use a BuildKit cache mount for the pip cache in the subtitle build so a rebuild after a requirements bump fetches only the changed package from the offline index (the grader reads the index access log). |
+| `ctr-build-secret-token` | Move a private package token out of build arguments | do | medium | 15 | B | proposed | cks:supply-chain-security, docker-practitioner:build, docker-practitioner:supply-chain | The ad-insertion build passes a package-feed token via ARG, so it shows up in image history; switch to a BuildKit secret mount so the image still builds and neither history nor any layer contains the token. |
+| `ctr-build-checks` | Clear every build-check warning in the subtitle Dockerfile | fix | easy | 10 | B | proposed | docker-practitioner:build | Run the build checks against the subtitle service's Dockerfile and fix every reported issue (shell-form commands, casing, undefined variables) so the check run exits clean and the image still builds. |
+| `ctr-multi-platform` | Publish the thumbnailer for amd64 and arm64 in one index | do | hard | 25 | B | proposed | docker-practitioner:build, docker-practitioner:registry | Copperleaf's new ARM edge boxes need the thumbnailer; build it for linux/amd64 and linux/arm64 with buildx and push a single index to the private registry whose manifest list carries both platforms. |
+| `ctr-bake-matrix` | Build three media services from one Bake file | do | hard | 20 | B | proposed | docker-practitioner:build | Write a Bake file whose default group builds the transcoder, subtitle and thumbnailer images with a shared RELEASE variable so one bake command produces all three tagged images. |
+| `ctr-buildx-cache-export` | Share build cache between throwaway CI builders through the registry | do | hard | 25 | B | proposed | docker-practitioner:build | Every CI run rebuilds the transcoder from scratch; create a docker-container buildx builder, export its cache to the private registry with mode=max, prove a brand-new builder reuses it, and export the compiled binaries to ./dist with the local exporter. |
+| `ctr-compose-first-stack` | Describe the catalogue API and its cache as a Compose project | learn | easy | 15 | B | proposed | ex188-aligned:multi-container, docker-practitioner:compose | Write a Compose file that runs the catalogue API with a Redis cache on a named network and a named volume, so compose up -d leaves the API on port 8080 serving cached titles. |
+| `ctr-compose-env-interp` | Drive staging and production ports from .env files | do | easy | 12 | B | proposed | docker-practitioner:compose | Parameterise the catalogue Compose project so .env.staging publishes 18080 and .env.prod publishes 8080, and compose config with each file renders exactly those ports. |
+| `ctr-compose-healthy-start` | Stop the rights service racing its database at startup | fix | medium | 15 | B | proposed | ex188-aligned:multi-container, docker-practitioner:compose | The rights-ledger API crash-loops on every compose up because it starts before PostgreSQL accepts connections; add a database healthcheck and a depends_on condition so a cold start brings the API up healthy on the first try. |
+| `ctr-compose-override-profiles` | Add a debug toolbox that only starts on request | do | medium | 15 | B | proposed | docker-practitioner:compose | Split the catalogue project into a base file and a local override, and add a toolbox service that starts only with the debug profile, so a plain up runs two services and a debug up runs three. |
+| `ctr-compose-secrets` | Deliver the ad partner key as a Compose secret | do | medium | 15 | B | proposed | ex188-aligned:multi-container, docker-practitioner:compose | Give the ad-insertion service its partner API key as a Compose secret mounted under /run/secrets instead of an environment variable, so the key is readable in the container but absent from docker inspect output. |
+| `ctr-compose-watch` | Live-sync subtitle templates while developing | do | medium | 15 | B | proposed | docker-practitioner:compose | Configure develop.watch so edits under templates/ appear in the running subtitle container without a rebuild and a change to requirements.txt triggers a rebuild, as proven by the grader's file edits. |
+| `ctr-compose-include-split` | Split the media platform Compose file per team | do | medium | 20 | B | proposed | docker-practitioner:compose | The 600-line platform compose.yaml is edited by three teams; split it into catalogue, subtitle and ads files assembled with include, share one logging block through extends, and keep the rendered compose config identical to the original. |
+| `ctr-compose-oci-publish` | Ship the caption review stack to QA as an OCI artifact | do | hard | 20 | B | proposed | docker-practitioner:compose | Publish the caption-review Compose application to the private registry as an OCI artifact with every image pinned by digest, then start it on the QA engine straight from the registry reference with no project files copied across. |
+| `ctr-compose-proxy-repair` | Repair the caption-render proxy that answers 502 | fix | medium | 20 | B | proposed | ex188-aligned:troubleshoot, docker-practitioner:compose, docker-practitioner:networking | Copperleaf's Caddy proxy in front of two caption renderers returns 502 because the renderers sit on another network and the upstream port is wrong; fix the Compose project so requests alternate between both renderers. |
+| `ctr-user-bridge-dns` | Let the catalogue API find its database by name | learn | easy | 12 | B | proposed | dca-legacy:networking, ex188-aligned:multi-container, docker-practitioner:networking | catalogue-api cannot resolve catalogue-db because both run on the default bridge; move them to a user-defined network so the API reaches the database by name and stays unpublished to the host. |
+| `ctr-publish-scoped` | Publish the transcoder API on the private address only | do | easy | 10 | B | proposed | dca-legacy:networking, ex188-aligned:run-containers, docker-practitioner:networking | Publish the transcoder's job API on the host's private address and its metrics port on 127.0.0.1 only, so the grader's second host reaches the API but never the metrics. |
+| `ctr-reach-without-publish` | Query a distroless service's debug port without publishing it | do | medium | 12 | B | proposed | docker-practitioner:networking, docker-practitioner:operations | The distroless subtitle service exposes /debug/vars only on localhost inside its container; start a toolbox container in its network namespace and save that endpoint's output to ~/subtitle-vars.json without publishing any port. |
+| `ctr-cidr-clash` | Move container networks off the office VPN range | fix | medium | 20 | C | proposed | dca-legacy:networking, docker-practitioner:networking, docker-practitioner:operations | New Compose networks on the editing host grab 172.20.0.0/16, which collides with Copperleaf's VPN; configure default address pools so new networks land in 10.210.0.0/16 and the VPN route to the archive works again. |
+| `ctr-docker-user-chain` | Restrict the ad-insertion port to partner networks | hack | hard | 25 | C | proposed | dca-legacy:networking, dca-legacy:security, docker-practitioner:networking | The published ad-insertion port is reachable from every network, and the host firewall rules the admin added are bypassed; add persistent DOCKER-USER rules so only 198.51.100.0/24 reaches it, surviving an engine restart. |
+| `ctr-macvlan-encoder` | Give the playout encoder its own studio LAN address | do | hard | 25 | C | proposed | dca-legacy:networking, docker-practitioner:networking | The playout encoder must appear on the studio LAN as 192.0.2.40; attach it with a macvlan network on the VM's second NIC so the studio host reaches it directly. |
+| `ctr-net-mtu-hang` | Fix uploads from containers that hang at the CDN ingest | fix | hard | 25 | B | proposed | docker-practitioner:networking | Large uploads from the packager container to the CDN ingest stall while small ones work; capture the traffic, find the MTU mismatch on the custom network and set the network MTU so a 50 MB upload completes. |
+| `ctr-ipv6-dual-stack` | Serve the catalogue API to IPv6-only set-top boxes | do | medium | 20 | C | proposed | docker-practitioner:networking, dca-legacy:networking | Copperleaf's new set-top boxes are IPv6-only; create a dual-stack user-defined network from the assigned ULA prefix, attach the catalogue API and publish it so it answers on both the host's IPv4 and IPv6 addresses. |
+| `ctr-nftables-backend` | Move the edge host's engine to the nftables firewall backend | do | hard | 25 | C | proposed | docker-practitioner:networking | Switch the edge host's engine to the nftables firewall backend, keep the transcoder API reachable only from the partner range with an equivalent of the old DOCKER-USER rule, and prove the engine no longer writes iptables rules. |
+| `ctr-net-tcpdump-veth` | Prove which container is flooding the ad-decision service | fix | medium | 20 | B | proposed | docker-practitioner:networking | Something on the ads network floods the ad-decision service with requests; capture on the right veth and inside the service's namespace with nsenter and tcpdump, name the offending container in ~/flooder.txt and disconnect it from the network. |
+| `ctr-volume-vs-bind` | Pick the right mount type for index, config and scratch | learn | easy | 12 | B | proposed | dca-legacy:storage, ex188-aligned:run-containers, docker-practitioner:storage | Run the media indexer with its index in a named volume, its config as a read-only bind mount and its scratch space in a 256 MiB tmpfs, as verified by the container's mount table. |
+| `ctr-volume-backup-restore` | Back up the rights database volume and restore it elsewhere | do | medium | 15 | B | proposed | dca-legacy:storage, docker-practitioner:storage | Archive the rights-db named volume to ~/backups/rights-db.tar.gz with a throwaway container and restore it into a new volume rights-db-restore so a second database container reports the same title count. |
+| `ctr-bind-permission-denied` | Let the non-root thumbnailer write to its bind mount | fix | medium | 15 | B | proposed | ex188-aligned:troubleshoot, docker-practitioner:storage | The thumbnailer runs as UID 10001 and fails with permission denied on the host directory mounted at /var/cache/thumbs; fix ownership on the host side so it writes thumbnails without running as root. |
+| `ctr-image-mount-models` | Mount the caption OCR model pack from an image | do | medium | 15 | B | proposed | docker-practitioner:storage | Ship the caption OCR model pack as its own image and mount it read-only into the OCR worker with an image mount, so a model update is a new image tag and the worker image no longer carries the 2 GB pack. |
 | `ctr-selinux-relabel` | Clear an SELinux denial on a Podman bind mount | fix | medium | 15 | C | proposed | ex188-aligned:troubleshoot, ex188-aligned:build-images | On the SELinux-enforcing podman host, the subtitle container cannot read /srv/captions; relabel the mount correctly (not by disabling SELinux) so the container reads the files and enforcing mode stays on. |
-| `ctr-storage-backend-tour` | Find where the engine really keeps image layers | learn | medium | 15 | C | proposed | dca-legacy:storage | On a freshly installed Engine 29 host, determine whether images live in the containerd image store or overlay2, and write the storage driver and the path holding the transcoder's top layer to ~/storage-report.txt. |
-| `ctr-local-registry-tls` | Run Copperleaf's private registry with TLS and passwords | do | medium | 20 | B | proposed | dca-legacy:images-registry, ex188-aligned:manage-images | Run a registry on port 5443 with the provided certificate and an htpasswd user ci-push, push catalogue-api:2.3 to it, and make sure anonymous pulls are refused. |
-| `ctr-offline-mirror` | Fix CI pulls by routing them through the platform mirror | fix | medium | 20 | C | proposed |  | Builds on the CI host fail because Hub and ghcr pulls cannot leave the network; configure the engine's Hub mirror and rewrite the ghcr references in the build files to the Copperleaf mirror host so the pipeline build succeeds. |
-| `ctr-skopeo-copy-airgap` | Ship the playout image set to the air-gapped studio registry | do | medium | 15 | B | proposed | ex188-aligned:manage-images | Copy the four playout images from the build registry to the isolated studio registry (reachable only through an archive on the transfer share) so every image arrives with its original digest. |
-| `ctr-oci-artifacts-referrers` | Attach a caption bundle to an image as an OCI referrer | do | hard | 20 | B | proposed |  | Push the caption style bundle as an OCI artifact that refers to catalogue-api's digest, then list that digest's referrers through the registry API and save the response to ~/referrers.json. |
-| `ctr-registry-gc` | Reclaim registry storage without losing production digests | do | medium | 15 | B | proposed |  | The private registry's disk is nearly full of nightly builds; delete every nightly-* manifest and run garbage collection so usage drops by at least half while all digests listed in prod-digests.txt still pull. |
-| `ctr-cap-drop-readonly` | Run ad insertion with minimal privileges | do | medium | 15 | B | proposed | dca-legacy:security, cks:microservice-vulnerabilities | Restart the ad-insertion container with all capabilities dropped except binding port 80, no privilege escalation, a read-only root filesystem and a tmpfs /tmp, while it still serves bookings. |
-| `ctr-socket-escape` | Escape through a mounted engine socket, then close the hole | hack | hard | 25 | B | proposed | dca-legacy:security | A monitoring dashboard container mounts the engine socket; use it to read /root/flag.txt on the host, then redeploy the dashboard behind a socket proxy that only allows listing containers so the escape no longer works. |
-| `ctr-rootless-engine` | Run the encoder team's engine rootless | do | hard | 25 | C | proposed | dca-legacy:security | Set up a rootless engine for the encoder user so that user runs the preview service on port 8080 while no root-owned daemon serves their containers. |
-| `ctr-seccomp-profile` | Confine the caption OCR worker with a custom seccomp profile | do | hard | 20 | C | proposed | cks:system-hardening | Apply a custom seccomp profile to the OCR worker that blocks mount, ptrace and keyctl, and prove the worker still processes a test page while a ptrace attempt inside it fails. |
-| `ctr-cis-bench` | Fix the failing CIS benchmark checks on the transcoder host | do | hard | 30 | C | proposed | dca-legacy:security | Run the CIS Docker benchmark tool on the transcoder host and fix the five failures listed in the audit ticket (daemon and container settings) so a rerun reports them as passed. |
-| `ctr-scan-triage-vex` | Triage scanner findings for the catalogue API | do | medium | 20 | B | proposed | cks:supply-chain-security | Scan catalogue-api with the offline vulnerability database, remove every fixable critical finding by bumping the base, and record the one non-exploitable finding as not_affected in a VEX document the rescan honours. |
-| `ctr-sbom-provenance` | Publish the subtitle image with SBOM and provenance attestations | do | medium | 15 | B | proposed | cks:supply-chain-security | Build and push subtitle:4.2.0 with an SBOM and maximum-detail provenance attached, so the registry holds both attestations for that image digest. |
-| `ctr-cosign-sign-verify` | Sign the catalogue release by digest | do | hard | 20 | B | proposed | cks:supply-chain-security | Sign catalogue-api's release digest with Copperleaf's release key using cosign so verification with the public key succeeds and the signature is discoverable as a referrer of that digest. |
-| `ctr-signed-only-gate` | Build, attest, sign and prove unsigned images are refused | do | hard | 30 | B | proposed | cks:supply-chain-security | Take the ad-insertion service through build with SBOM, push, sign with Notation and deploy through the release gate, then show that an unsigned rebuild of the same tag is rejected by the gate. |
-| `ctr-leaked-secret-history` | Purge a leaked storage key from published image history | hack | medium | 20 | B | proposed | cks:supply-chain-security | An object-storage key was baked into an early layer of transcoder:7.1; find it, mark it revoked in the mock key service, publish a rebuilt image without it and delete the leaked manifest from the registry. |
-| `ctr-hardened-base-migration` | Move the subtitle service onto a hardened distroless base | do | medium | 20 | B | proposed | cks:supply-chain-security | Rebase the subtitle service onto the mirrored hardened Python runtime image using its dev variant for the build stage, verify the base's signed SBOM, and keep the service passing its smoke test. |
-| `ctr-content-trust-retired` | Replace a retired content-trust pull with signature verification | learn | easy | 10 | B | proposed | dca-legacy:security | A legacy deploy script sets DOCKER_CONTENT_TRUST=1 and now fails every pull; remove it and add a cosign verification step against Copperleaf's public key so the script deploys only verified digests. |
-| `ctr-oom-exit-137` | Explain and stop the transcoder's exit 137 | fix | medium | 15 | B | proposed | ex188-aligned:troubleshoot | The transcoder container keeps dying with exit code 137; prove from inspect state whether it was OOM-killed, then set a 1 GiB memory limit and WORKERS=2 so a test job completes. |
-| `ctr-nofile-after-upgrade` | Fix edge-cache 'too many open files' after an engine upgrade | fix | medium | 15 | B | proposed |  | Since the engine upgrade lowered the default open-files limit, the edge-cache container fails under load; give it a nofile limit of 65536 so the grader's 5,000-connection test passes. |
-| `ctr-link-env-removed` | Repair a legacy stack that relied on link environment variables | fix | medium | 15 | B | proposed |  | The old rights-report job reads DB_PORT_5432_TCP_ADDR, which the engine no longer injects for links; rewire it to resolve the database by name on a user-defined network so the nightly report runs. |
-| `ctr-seccomp-legacy-binary` | Restore a legacy 32-bit caption encoder without going unconfined | fix | hard | 20 | B | proposed |  | A tightened default seccomp profile now kills the 32-bit caption encoder; ship a profile derived from the default that allows only the syscalls it needs, so it runs while seccomp stays enabled. |
-| `ctr-log-rotation` | Cap container logs that filled the batch host | do | easy | 12 | C | proposed | dca-legacy:install-config | The chatty ingest container's JSON logs filled the disk; recreate it with logs rotated at 20 MB keeping 5 files, and set the same default for new containers on the host. |
-| `ctr-restart-policy` | Keep the subtitle worker running but respect manual stops | do | easy | 10 | B | proposed | ex188-aligned:run-containers | Configure the subtitle worker to restart automatically after crashes and engine restarts but stay down after an operator stops it, as verified by the grader crashing, restarting and stopping it. |
-| `ctr-daemon-json-conflict` | Bring a dead engine back after a daemon.json change | fix | medium | 20 | C | proposed | dca-legacy:install-config | The engine on the packaging host no longer starts after someone added a hosts entry to daemon.json that conflicts with the service's -H flag; resolve it with a systemd drop-in so the engine starts and listens on the socket and on tcp://127.0.0.1:2375. |
-| `ctr-debug-distroless` | Debug a shell-less catalogue API returning 500 | fix | medium | 15 | B | proposed | ex188-aligned:troubleshoot | The distroless catalogue API returns 500 for every request; attach a debug container sharing its process and network namespaces, find the missing config file it expects, and fix the deployment so /titles returns 200. |
-| `ctr-ci-rootless-buildkit` | Replace the privileged CI builder with rootless BuildKit | do | hard | 25 | B | proposed | cks:supply-chain-security | Copperleaf's CI job builds with a privileged dind sidecar; switch it to a rootless BuildKit builder that builds, scans, signs and pushes the thumbnailer, with the privileged sidecar removed. |
-| `ctr-engine-upgrade` | Upgrade the transcoder host engine with running jobs | do | hard | 30 | C | proposed | dca-legacy:install-config | Upgrade the transcoder host from Engine 28 to 29 from the local package mirror with live-restore enabled, so the long-running transcode container keeps running through the upgrade and the engine reports version 29. |
+| `ctr-storage-backend-tour` | Find where the engine really keeps image layers | learn | medium | 15 | C | proposed | dca-legacy:storage, docker-practitioner:storage | On a freshly installed Engine 29 host, determine whether images live in the containerd image store or overlay2, and write the storage driver and the path holding the transcoder's top layer to ~/storage-report.txt. |
+| `ctr-containerd-store-migration` | Move an upgraded host onto the containerd image store | do | hard | 25 | C | proposed | docker-practitioner:storage | The batch host was upgraded from Engine 27 and still stores images in overlay2; switch it to the containerd image store, re-pull the release images by digest and show that multi-platform indexes and attestations now survive a pull. |
+| `ctr-local-registry-tls` | Run Copperleaf's private registry with TLS and passwords | do | medium | 20 | B | proposed | dca-legacy:images-registry, ex188-aligned:manage-images, docker-practitioner:registry | Run a registry on port 5443 with the provided certificate and an htpasswd user ci-push, push catalogue-api:2.3 to it, and make sure anonymous pulls are refused. |
+| `ctr-offline-mirror` | Fix CI pulls by routing them through the platform mirror | fix | medium | 20 | C | proposed | docker-practitioner:registry, docker-practitioner:operations | Builds on the CI host fail because Hub and ghcr pulls cannot leave the network; configure the engine's Hub mirror and rewrite the ghcr references in the build files to the Copperleaf mirror host so the pipeline build succeeds. |
+| `ctr-skopeo-copy-airgap` | Ship the playout image set to the air-gapped studio registry | do | medium | 15 | B | proposed | ex188-aligned:manage-images, docker-practitioner:registry | Copy the four playout images from the build registry to the isolated studio registry (reachable only through an archive on the transfer share) so every image arrives with its original digest. |
+| `ctr-oci-artifacts-referrers` | Attach a caption bundle to an image as an OCI referrer | do | hard | 20 | B | proposed | docker-practitioner:registry | Push the caption style bundle as an OCI artifact that refers to catalogue-api's digest, then list that digest's referrers through the registry API and save the response to ~/referrers.json. |
+| `ctr-registry-gc` | Reclaim registry storage without losing production digests | do | medium | 15 | B | proposed | docker-practitioner:registry | The private registry's disk is nearly full of nightly builds; delete every nightly-* manifest and run garbage collection so usage drops by at least half while all digests listed in prod-digests.txt still pull. |
+| `ctr-cap-drop-readonly` | Run ad insertion with minimal privileges | do | medium | 15 | B | proposed | dca-legacy:security, cks:microservice-vulnerabilities, docker-practitioner:security | Restart the ad-insertion container with all capabilities dropped except binding port 80, no privilege escalation, a read-only root filesystem and a tmpfs /tmp, while it still serves bookings. |
+| `ctr-socket-escape` | Escape through a mounted engine socket, then close the hole | hack | hard | 25 | B | proposed | dca-legacy:security, docker-practitioner:security | A monitoring dashboard container mounts the engine socket; use it to read /root/flag.txt on the host, then redeploy the dashboard behind a socket proxy that only allows listing containers so the escape no longer works. |
+| `ctr-remote-engine-ssh` | Retire the batch host's unauthenticated engine port | do | medium | 20 | C | proposed | docker-practitioner:security, dca-legacy:security | The batch host's engine listens on TCP 2375 without TLS so operators can manage it remotely; close the port and give the operators a docker context that reaches the engine over SSH as the restricted user ops. |
+| `ctr-rootless-engine` | Run the encoder team's engine rootless | do | hard | 25 | C | proposed | dca-legacy:security, docker-practitioner:security | Set up a rootless engine for the encoder user so that user runs the preview service on port 8080 while no root-owned daemon serves their containers. |
+| `ctr-seccomp-profile` | Confine the caption OCR worker with a custom seccomp profile | do | hard | 20 | C | proposed | cks:system-hardening, docker-practitioner:security | Apply a custom seccomp profile to the OCR worker that blocks mount, ptrace and keyctl, and prove the worker still processes a test page while a ptrace attempt inside it fails. |
+| `ctr-cis-bench` | Fix the failing CIS benchmark checks on the transcoder host | do | hard | 30 | C | proposed | dca-legacy:security, docker-practitioner:security | Run the CIS Docker benchmark tool on the transcoder host and fix the five failures listed in the audit ticket (daemon and container settings) so a rerun reports them as passed. |
+| `ctr-scan-triage-vex` | Triage scanner findings for the catalogue API | do | medium | 20 | B | proposed | cks:supply-chain-security, docker-practitioner:supply-chain | Scan catalogue-api with the offline vulnerability database, remove every fixable critical finding by bumping the base, and record the one non-exploitable finding as not_affected in a VEX document the rescan honours. |
+| `ctr-scout-policy` | Bring the catalogue image back within supply-chain policy | do | medium | 20 | B | proposed | docker-practitioner:supply-chain | The catalogue image fails Copperleaf's policies for fixable high CVEs, missing provenance and a root default user; evaluate it with Docker Scout against the mirrored advisory data, fix all three and show the rebuilt image passes every policy. |
+| `ctr-sbom-provenance` | Publish the subtitle image with SBOM and provenance attestations | do | medium | 15 | B | proposed | cks:supply-chain-security, docker-practitioner:supply-chain | Build and push subtitle:4.2.0 with an SBOM and maximum-detail provenance attached, so the registry holds both attestations for that image digest. |
+| `ctr-cosign-sign-verify` | Sign the catalogue release by digest | do | hard | 20 | B | proposed | cks:supply-chain-security, docker-practitioner:supply-chain | Sign catalogue-api's release digest with Copperleaf's release key using cosign so verification with the public key succeeds and the signature is discoverable as a referrer of that digest. |
+| `ctr-notation-sign-verify` | Sign the subtitle release with Notation and a trust policy | do | hard | 20 | B | proposed | docker-practitioner:supply-chain | Sign the subtitle release digest with Notation using the Copperleaf test CA, write a trust policy that trusts only that CA for the media repositories, and show verification passes for the release and fails for an image signed by another key. |
+| `ctr-signed-only-gate` | Build, attest, sign and prove unsigned images are refused | do | hard | 30 | B | proposed | cks:supply-chain-security, docker-practitioner:supply-chain | Take the ad-insertion service through build with SBOM, push, sign with Notation and deploy through the release gate, then show that an unsigned rebuild of the same tag is rejected by the gate. |
+| `ctr-leaked-secret-history` | Purge a leaked storage key from published image history | hack | medium | 20 | B | proposed | cks:supply-chain-security, docker-practitioner:supply-chain, docker-practitioner:registry | An object-storage key was baked into an early layer of transcoder:7.1; find it, mark it revoked in the mock key service, publish a rebuilt image without it and delete the leaked manifest from the registry. |
+| `ctr-hardened-base-migration` | Move the subtitle service onto a hardened distroless base | do | medium | 20 | B | proposed | cks:supply-chain-security, docker-practitioner:supply-chain, docker-practitioner:build | Rebase the subtitle service onto the mirrored hardened Python runtime image using its dev variant for the build stage, verify the base's signed SBOM, and keep the service passing its smoke test. |
+| `ctr-dhi-vex-reconcile` | Explain the findings a hardened base still reports | do | medium | 20 | B | proposed | docker-practitioner:supply-chain | The thumbnailer now runs on a mirrored hardened runtime image yet the scanner still lists CVEs; reconcile each finding with the base image's VEX attestation and make the release gate fail only on findings the VEX does not cover. |
+| `ctr-content-trust-retired` | Replace a retired content-trust pull with signature verification | learn | easy | 10 | B | proposed | dca-legacy:security, docker-practitioner:supply-chain | A legacy deploy script sets DOCKER_CONTENT_TRUST=1 and now fails every pull; remove it and add a cosign verification step against Copperleaf's public key so the script deploys only verified digests. |
+| `ctr-oom-exit-137` | Explain and stop the transcoder's exit 137 | fix | medium | 15 | B | proposed | ex188-aligned:troubleshoot, docker-practitioner:operations, docker-practitioner:security | The transcoder container keeps dying with exit code 137; prove from inspect state whether it was OOM-killed, then set a 1 GiB memory limit and WORKERS=2 so a test job completes. |
+| `ctr-nofile-after-upgrade` | Fix edge-cache 'too many open files' after an engine upgrade | fix | medium | 15 | B | proposed | docker-practitioner:operations | Since the engine upgrade lowered the default open-files limit, the edge-cache container fails under load; give it a nofile limit of 65536 so the grader's 5,000-connection test passes. |
+| `ctr-link-env-removed` | Repair a legacy stack that relied on link environment variables | fix | medium | 15 | B | proposed | docker-practitioner:networking, docker-practitioner:operations | The old rights-report job reads DB_PORT_5432_TCP_ADDR, which the engine no longer injects for links; rewire it to resolve the database by name on a user-defined network so the nightly report runs. |
+| `ctr-seccomp-legacy-binary` | Restore a legacy 32-bit caption encoder without going unconfined | fix | hard | 20 | B | proposed | docker-practitioner:security, docker-practitioner:operations | A tightened default seccomp profile now kills the 32-bit caption encoder; ship a profile derived from the default that allows only the syscalls it needs, so it runs while seccomp stays enabled. |
+| `ctr-api-version-floor` | Fix the CI deploy client the upgraded engine refuses | fix | medium | 15 | B | proposed | docker-practitioner:operations | After the build host moved to Engine 29 the pinned CI deploy tool fails with a client API version too old error; find which API versions the engine accepts and move the client to a supported one so the deploy job passes without lowering the engine's minimum. |
+| `ctr-events-flapping` | Find the flapping container from the engine's event stream | fix | medium | 15 | B | proposed | docker-practitioner:operations | One of forty containers on the batch host restarts every few minutes and the dashboards miss it; use the engine event stream and stats to record the flapping container, its exit reason and its peak memory in ~/flapping.json. |
+| `ctr-log-rotation` | Cap container logs that filled the batch host | do | easy | 12 | C | proposed | dca-legacy:install-config, docker-practitioner:operations | The chatty ingest container's JSON logs filled the disk; recreate it with logs rotated at 20 MB keeping 5 files, and set the same default for new containers on the host. |
+| `ctr-restart-policy` | Keep the subtitle worker running but respect manual stops | do | easy | 10 | B | proposed | ex188-aligned:run-containers, docker-practitioner:operations | Configure the subtitle worker to restart automatically after crashes and engine restarts but stay down after an operator stops it, as verified by the grader crashing, restarting and stopping it. |
+| `ctr-daemon-json-conflict` | Bring a dead engine back after a daemon.json change | fix | medium | 20 | C | proposed | dca-legacy:install-config, docker-practitioner:operations | The engine on the packaging host no longer starts after someone added a hosts entry to daemon.json that conflicts with the service's -H flag; resolve it with a systemd drop-in so the engine starts and listens on the socket and on tcp://127.0.0.1:2375. |
+| `ctr-debug-distroless` | Debug a shell-less catalogue API returning 500 | fix | medium | 15 | B | proposed | ex188-aligned:troubleshoot, docker-practitioner:operations | The distroless catalogue API returns 500 for every request; attach a debug container sharing its process and network namespaces, find the missing config file it expects, and fix the deployment so /titles returns 200. |
+| `ctr-ci-rootless-buildkit` | Replace the privileged CI builder with rootless BuildKit | do | hard | 25 | B | proposed | cks:supply-chain-security, docker-practitioner:operations | Copperleaf's CI job builds with a privileged dind sidecar; switch it to a rootless BuildKit builder that builds, scans, signs and pushes the thumbnailer, with the privileged sidecar removed. |
+| `ctr-release-pipeline-capstone` | Ship a catalogue release from commit to running service | do | hard | 45 | B | proposed | docker-practitioner:supply-chain, docker-practitioner:build | Take catalogue-api 5.0.0 from commit to staging: multi-platform build with registry cache, SBOM and provenance, a signature, a push by digest, a Compose deployment pinned to that digest, and a gate that refuses the unsigned previous build. |
+| `ctr-engine-upgrade` | Upgrade the transcoder host engine with running jobs | do | hard | 30 | C | proposed | dca-legacy:install-config, docker-practitioner:operations | Upgrade the transcoder host from Engine 28 to 29 from the local package mirror with live-restore enabled, so the long-running transcode container keeps running through the upgrade and the engine reports version 29. |
 | `ctr-runtime-stack-trace` | Trace the transcoder container down to its runc process | learn | medium | 15 | C | proposed |  | Map the running transcoder container from its engine ID to its containerd task in the moby namespace, its shim and its host PID, and write the four identifiers to ~/runtime-chain.txt. |
 | `ctr-runc-bundle` | Run the subtitle service from a hand-made OCI bundle | do | hard | 25 | B | proposed |  | Export the subtitle image's filesystem into an OCI bundle, generate and edit config.json for a read-only root and hostname caption-box, and run it with runc so the grader sees it in runc list. |
 | `ctr-image-layout-on-disk` | Find the layer that deleted Copperleaf's signing keys | do | hard | 20 | B | proposed |  | Unpack transcoder:7.1 as an OCI image layout, walk index, manifest and config, and record the digest of the layer whose whiteout removes /etc/copperleaf/keys in ~/whiteout-layer.txt. |
+| `ctr-podman-docker-differences` | Move a Docker routine to Podman and note what changes | learn | easy | 20 | C | proposed | ex188-aligned:manage-images | Move the catalogue API's run, build and push routine from the Docker host to the Podman host: make short names resolve through Copperleaf's registry, serve Docker-compatible clients through the Podman socket, and record in ~/differences.yaml the three behaviours that changed. |
 | `ctr-podman-rootless-basics` | Run the catalogue API rootless with Podman | learn | easy | 15 | C | proposed | ex188-aligned:run-containers | As the unprivileged user media, run the catalogue API with rootless Podman on port 8080 and record which host UID container root maps to in ~/uid-map.txt. |
-| `ctr-podman-registries-conf` | Resolve short image names through Copperleaf's registry | do | medium | 15 | C | proposed | ex188-aligned:manage-images | Configure registries.conf so the short name subtitle resolves to registry.copperleaf.example/media/subtitle, the internal registry's CA is trusted, and no prompt or public registry is consulted. |
-| `ctr-podman-pod` | Run the catalogue API and cache in one Podman pod | do | medium | 15 | C | proposed | ex188-aligned:multi-container | Create a pod named catalogue that publishes port 8080 and runs the API and Redis talking over localhost, so the API serves cached titles from outside the pod. |
-| `ctr-podman-secret` | Hand the database password to the rights API as a Podman secret | do | medium | 12 | C | proposed | ex188-aligned:multi-container | Store the rights database password as a Podman secret and give it to both the database and API containers so they connect without the password appearing in any inspect output or env listing. |
-| `ctr-podman-kube-play` | Round-trip the catalogue pod through Kubernetes YAML | do | medium | 15 | C | proposed | ex188-aligned:multi-container | Generate Kubernetes YAML from the running catalogue pod, tear the pod down, and recreate it with podman kube play from ~/catalogue.yaml so it serves on 8080 again. |
+| `ctr-podman-pod-kube-play` | Run the catalogue pod and replay it from Kubernetes YAML | do | medium | 25 | C | proposed | ex188-aligned:multi-container | Create pod catalogue on port 8080 with the API and Redis sharing localhost and the database password supplied as a Podman secret, then generate Kubernetes YAML from it, tear it down and recreate it with podman kube play so it serves again. |
 | `ctr-quadlet-reboot` | Keep the subtitle service running across reboots with Quadlet | do | hard | 25 | C | proposed | ex188-aligned:run-containers | Define the subtitle service as a rootless Quadlet unit for user media with lingering enabled, so after the grader reboots the VM it is running and answering on port 8090. |
-| `ctr-podman-state-commit` | Preserve a hand-tuned encoder container as an image and archive | do | medium | 15 | C | proposed | ex188-aligned:manage-images | A colleague tuned the encoder container interactively; capture its current filesystem as image encoder:tuned and also save that image to /srv/archive/encoder-tuned.tar so it can be reloaded elsewhere. |
 | `ctr-swarm-init-quorum` | Build a three-manager swarm and drain one manager | do | medium | 25 | C | proposed | dca-legacy:orchestration | Initialise a swarm across the three playout VMs with all three as managers, then drain playout-2 for maintenance so the swarm keeps quorum and runs no tasks on it. |
 | `ctr-swarm-services` | Place catalogue replicas and a global log agent on the swarm | do | medium | 20 | C | proposed | dca-legacy:orchestration | Run catalogue-api as four replicas only on nodes labelled tier=edge and the log shipper as a global service, then roll catalogue-api to 2.4 one task at a time without dropping below three running replicas. |
 | `ctr-swarm-stack` | Deploy the ad-insertion stack with an overlay network and secrets | do | hard | 25 | C | proposed | dca-legacy:orchestration | Deploy the ad-insertion stack from its Compose file onto the swarm with an encrypted overlay network, its partner key as a swarm secret and its rules file as a config, reachable through the routing mesh on port 8088. |
@@ -1128,7 +1133,8 @@ _CloudTrain is not affiliated with or endorsed by Cisco Systems, Inc. or Red Hat
 | `sim-linux-sysadmin` | Linux system administrator practical exam simulation | lfcs | practical | 120 min | 67% | 18 | 36 | shared | no | C |
 | `sim-el-sysadmin` | Enterprise Linux administrator practical exam simulation | rhcsa-aligned | practical | 180 min | 70% | 20 | 40 | shared | yes | C |
 | `sim-linux-pro` | Linux professional scenario exam simulation | linuxplus | practical-simulation | 90 min | 72% | 20 | 40 | per-task | no | B |
-| `sim-containers-podman` | Container developer practical exam simulation | ex188-aligned | practical | 150 min | 70% | 12 | 24 | shared | yes | C |
+| `sim-containers-docker` | Container practitioner practical exam simulation | docker-practitioner | practical | 150 min | 70% | 12 | 24 | shared | yes | C |
+| `sim-containers-podman` | Rootless container practical exam simulation (optional) | ex188-aligned | practical | 90 min | 70% | 8 | 16 | shared | yes | C |
 | `sim-iac-associate` | Infrastructure as code associate exam simulation | tf-associate | practical-simulation | 60 min | 70% | 12 | 24 | shared | no | A |
 | `sim-iac-advanced` | Infrastructure as code advanced lab exam simulation | tf-advanced | practical | 240 min | 70% | 9 | 18 | shared | no | V |
 | `sim-el-automation` | Enterprise Linux automation practical exam simulation | ex294-aligned | practical | 240 min | 70% | 15 | 34 | shared | yes | C |
@@ -1529,19 +1535,79 @@ _CloudTrain is not affiliated with or endorsed by CompTIA. Linux+ is a trademark
 
 </details>
 
-### Container developer practical exam simulation
+### Container practitioner practical exam simulation
 
-Aligns to: Red Hat cloud-native containers exam (EX188) objective themes.
+Aligns to: Docker practitioner practical blueprint (CloudTrain-defined).
 
-**Duration** 150 min. **Pass mark** 70% (The real exam reports a scaled score with a published passing threshold; 70% is a CloudTrain setting for this simulation.). **Tasks** 12, environment shared, tier C.
+The main containers exam. No live hands-on Docker exam exists (the legacy associate exam is multiple choice on a 2020 blueprint), so CloudTrain defines one: twelve end-state-graded tasks on one Engine 29 host, weighted by the docker-practitioner blueprint (the legacy domains modernised plus supply chain and operations).
+
+**Duration** 150 min. **Pass mark** 70% (CloudTrain setting; no vendor pass mark applies.). **Tasks** 12, environment shared, tier C.
 
 | Objective | Weight | Tasks | Pool |
 | --- | --- | --- | --- |
-| ex188-aligned:build-images | 25% | 3 | 6 |
+| docker-practitioner:build | 18% | 2 | 4 |
+| docker-practitioner:registry | 8% | 1 | 2 |
+| docker-practitioner:compose | 15% | 2 | 4 |
+| docker-practitioner:networking | 15% | 2 | 4 |
+| docker-practitioner:storage | 8% | 1 | 2 |
+| docker-practitioner:security | 10% | 1 | 2 |
+| docker-practitioner:supply-chain | 10% | 1 | 2 |
+| docker-practitioner:operations | 16% | 2 | 4 |
+
+**Rules.** Hints: none. Timer: one timer across all tasks. Tasks in any order. Flag for review. Reboot before grading: yes. Docs: offline Docker documentation and man pages only; no internet. Partial credit: per-task. One docker-vm:29 host (Engine 29, containerd image store) with a local TLS registry; the grader restarts the engine and reboots the VM, then checks end state. Tasks that feed later tasks (for example reports:1.0) are seeded when the producing task is not drawn.
+
+**Retakes.** 1 free retake(s); 24 h cooldown; at most 3 attempts per 30 days; every attempt draws fresh tasks and parameters. a retake draws different tasks and new parameters
+
+**Score report.** Breakdown by objective, task, skill; expected values are never shown. per-objective percent against the pass mark; per-task pass/fail with learner-safe messages; which checks failed only after the restart or reboot; time used per task; skill deltas fed to the learner model; recommended Docker path labs for weak objectives.
+
+_CloudTrain is not affiliated with or endorsed by Docker, Inc. or Mirantis, Inc. Docker is a trademark of Docker, Inc. This simulation follows a CloudTrain-defined blueprint; it is aligned to no vendor exam and passing it confers no certification._
+
+<details><summary>Task pool (24 tasks)</summary>
+
+| Task | Objective | Title | Difficulty | Min | Tier | Scenario |
+| --- | --- | --- | --- | --- | --- | --- |
+| `xcd-build-multistage-nonroot` | docker-practitioner:build | Build the report service as a small non-root image | medium | 12 | C | Write a Dockerfile for the supplied Go report service that compiles in one stage and ships on a minimal base running as UID 10001, tagged reports:1.0 and under 30 MB. |
+| `xcd-build-cache-secret` | docker-practitioner:build | Build with a cached dependency step and a secret token | medium | 12 | C | Build pricing:2.0 so the dependency download uses a BuildKit cache mount and reads the package token from a build secret, leaving no trace of the token in any layer or in the image history. |
+| `xcd-build-bake-targets` | docker-practitioner:build | Build two images from one Bake definition | medium | 10 | C | Write a Bake file whose default group builds the api and worker images with a shared VERSION variable and OCI source labels, so a single bake call produces both tags. |
+| `xcd-build-entrypoint-signals` | docker-practitioner:build | Make the worker take arguments and stop cleanly | medium | 10 | C | Fix the worker image so arguments after the image name reach the program, a stop ends it within two seconds instead of the full timeout, and its health status turns healthy. |
+| `xcd-registry-tls-push` | docker-practitioner:registry | Push a release by digest to the authenticated registry | medium | 10 | C | Log in to the exam registry over TLS with the supplied CA, push reports:1.0 and record its digest in ~/digest.txt so a pull by that digest succeeds on a clean engine. |
+| `xcd-registry-multiarch-index` | docker-practitioner:registry | Publish a two-platform image index | hard | 12 | C | Publish tools:1.4 for linux/amd64 and linux/arm64 as one index in the exam registry so inspecting the index lists both platforms with their own digests. |
+| `xcd-compose-health-order` | docker-practitioner:compose | Start an API only after its database is healthy | medium | 12 | C | Complete compose.yaml so the api service starts only after db reports healthy, restarts on failure and answers on 127.0.0.1:8081. |
+| `xcd-compose-env-profiles` | docker-practitioner:compose | Drive a stack from an env file with an optional profile | medium | 10 | C | Make the stack take its image tag and port from .env.staging and start the adminer service only when the debug profile is enabled. |
+| `xcd-compose-secret-file` | docker-practitioner:compose | Give two services a password as a Compose secret | medium | 10 | C | Deliver the database password to the db and api services as a file-based Compose secret so neither container's environment nor its inspect output shows it. |
+| `xcd-compose-fix-broken-stack` | docker-practitioner:compose | Repair a Compose stack that fails to start | medium | 12 | C | The supplied three-service stack fails on up; fix its network, volume and port mistakes so every service is running and the web front answers on port 8088. |
+| `xcd-net-user-bridge` | docker-practitioner:networking | Connect two services by name on an isolated network | medium | 10 | C | Create network backend with subnet 172.30.8.0/24 and run cache and api on it so api reaches cache by name and neither is attached to the default bridge. |
+| `xcd-net-publish-loopback` | docker-practitioner:networking | Publish a metrics port on loopback only | easy | 6 | C | Run the metrics service so port 9100 is published on 127.0.0.1 only and on no other host address. |
+| `xcd-net-docker-user-rule` | docker-practitioner:networking | Allow a published port from one subnet only | hard | 15 | C | Restrict published port 8443 so only clients from 10.20.0.0/24 reach it, through the engine's user chain, in a way that survives an engine restart and a reboot. |
+| `xcd-net-address-pool` | docker-practitioner:networking | Keep new networks off a reserved range | medium | 12 | C | Change the engine's default address pools so new networks come from 10.210.0.0/16 in /24 blocks, then recreate the app network so it no longer overlaps the office range. |
+| `xcd-storage-volume-restore` | docker-practitioner:storage | Restore a volume from a backup archive | medium | 10 | C | Restore /backup/ledger.tar into a new volume ledger-data and run the ledger service on it so the restored rows are served. |
+| `xcd-storage-mount-mix` | docker-practitioner:storage | Mount configuration, data and scratch correctly | easy | 8 | C | Run the indexer with its configuration bind-mounted read-only from /srv/indexer/conf, its index on the named volume index-data and /tmp as a 64 MB tmpfs. |
+| `xcd-sec-least-privilege` | docker-practitioner:security | Run a gateway with minimal privileges | medium | 10 | C | Run the gateway with every capability dropped except NET_BIND_SERVICE, no-new-privileges, a read-only root filesystem and a pids limit of 100, still answering on port 80. |
+| `xcd-sec-socket-proxy` | docker-practitioner:security | Take the engine socket away from a monitoring container | hard | 15 | C | The monitoring container mounts the engine socket read-write; redeploy it behind a socket proxy that only allows listing containers so its dashboard still works and it can no longer start containers. |
+| `xcd-supply-sbom-sign` | docker-practitioner:supply-chain | Attach an SBOM and a signature to a release | hard | 15 | C | Build and push reports:1.1 with an SBOM attestation, sign its digest with the supplied cosign key and show that verification with the public key succeeds. |
+| `xcd-supply-leaked-secret` | docker-practitioner:supply-chain | Remove a credential baked into an image | medium | 12 | C | The api:3.2 image carries a storage key in a layer and in an ENV; rebuild it so no layer, history entry or config field holds the key and push the clean image under the same tag. |
+| `xcd-ops-log-rotation` | docker-practitioner:operations | Cap container logs engine-wide | easy | 8 | C | Configure the engine so new containers use the local log driver with 10 MB files and at most three per container, and recreate the chatty service so it uses them. |
+| `xcd-ops-oom-diagnose` | docker-practitioner:operations | Diagnose and fix an exit 137 | medium | 10 | C | The import job exits with code 137; record the reason in ~/reason.txt and rerun it with a memory limit that lets it finish while staying under 512 MB. |
+| `xcd-ops-restart-survive` | docker-practitioner:operations | Keep a service running across engine restarts | easy | 6 | C | Make the beacon service come back after an engine restart and a host reboot but stay stopped after a manual stop. |
+| `xcd-ops-debug-shell-less` | docker-practitioner:operations | Diagnose a shell-less service returning errors | medium | 12 | C | The distroless pricing service returns 500; attach a debug container that shares its namespaces, find the missing configuration key and fix the run so it answers 200. |
+
+</details>
+
+### Rootless container practical exam simulation (optional)
+
+Aligns to: Red Hat cloud-native containers exam (EX188) objective themes.
+
+Optional and smaller since revision 2: the Podman track is five labs, so the simulation keeps the reboot-graded, SELinux-enforcing format of the only performance-based container exam but draws eight tasks in 90 minutes. Learners who want a Docker credential-style check take the container practitioner simulation instead.
+
+**Duration** 90 min. **Pass mark** 70% (The real exam reports a scaled score with a published passing threshold; 70% is a CloudTrain setting for this simulation.). **Tasks** 8, environment shared, tier C.
+
+| Objective | Weight | Tasks | Pool |
+| --- | --- | --- | --- |
+| ex188-aligned:build-images | 25% | 2 | 4 |
 | ex188-aligned:manage-images | 20% | 2 | 4 |
-| ex188-aligned:run-containers | 20% | 3 | 6 |
-| ex188-aligned:multi-container | 20% | 2 | 4 |
-| ex188-aligned:troubleshoot | 15% | 2 | 4 |
+| ex188-aligned:run-containers | 20% | 2 | 4 |
+| ex188-aligned:multi-container | 20% | 1 | 2 |
+| ex188-aligned:troubleshoot | 15% | 1 | 2 |
 
 **Rules.** Hints: none. Timer: one timer across all tasks. Tasks in any order. Flag for review. Reboot before grading: yes. Docs: local man pages and offline Podman documentation only; no internet. Partial credit: per-task. One podman-vm:5 host (SELinux enforcing) with a local TLS registry; the grader reboots the VM, then checks end state. Tasks drawn so build tasks feeding later tasks (e.g. media-api image) are seeded if the build task is not drawn.
 
@@ -1551,16 +1617,14 @@ Aligns to: Red Hat cloud-native containers exam (EX188) objective themes.
 
 _CloudTrain is not affiliated with or endorsed by Red Hat, Inc. Red Hat Certified Specialist in Containers is a trademark of Red Hat, Inc. This simulation covers objectives aligned to that exam; passing it confers no certification._
 
-<details><summary>Task pool (24 tasks)</summary>
+<details><summary>Task pool (16 tasks)</summary>
 
 | Task | Objective | Title | Difficulty | Min | Tier | Scenario |
 | --- | --- | --- | --- | --- | --- | --- |
 | `xct-build-media-containerfile` | ex188-aligned:build-images | Build the media API image from a Containerfile | medium | 15 | C | Write a Containerfile for the supplied media API that runs as UID 1001 from /opt/media, exposes 8080 and builds as localhost/media-api:1.0. |
-| `xct-build-args-env` | ex188-aligned:build-images | Parameterise the build with a release argument | easy | 8 | C | Build localhost/caption-api:2.1 so a RELEASE build argument sets both an image label and the CAPTION_RELEASE environment variable seen by the running container. |
 | `xct-build-entrypoint-cmd` | ex188-aligned:build-images | Make the report tool accept arguments after the image name | medium | 10 | C | Rebuild localhost/report-tool so its program is the fixed entrypoint and --daily is only the default argument, so passing --weekly at run time replaces just the argument. |
 | `xct-build-volume-selinux` | ex188-aligned:build-images | Serve host content through an image-declared volume | medium | 12 | C | Build localhost/static-web with /srv/www declared as a volume and run it as static-web with the host directory /exam/www mounted there with the correct SELinux label so pages are served on port 8081. |
 | `xct-build-arbitrary-uid` | ex188-aligned:build-images | Build an image that works under any assigned UID | hard | 12 | C | Adjust the queue-worker image so its data directory is group-0 owned and group-writable, letting the container start and write data when run with an arbitrary UID such as 1000650000. |
-| `xct-build-multistage-small` | ex188-aligned:build-images | Ship the compiled helper in a small runtime image | medium | 12 | C | Build localhost/probe-helper:1.0 with a separate build stage so the final image contains the compiled helper but no compiler and is under 60 MB. |
 | `xct-manage-registry-push` | ex188-aligned:manage-images | Push to the authenticated exam registry over TLS | medium | 10 | C | Trust the exam registry's CA, log in as exam-push and push localhost/media-api:1.0 as registry.exam.example:5443/media/api:1.0 so it can be pulled back by digest. |
 | `xct-manage-short-names` | ex188-aligned:manage-images | Make a short image name resolve unambiguously | medium | 8 | C | Configure the user's registries settings so podman pull ledger fetches registry.exam.example:5443/finance/ledger without prompting and without querying any other registry. |
 | `xct-manage-image-archive` | ex188-aligned:manage-images | Back up an image to an archive file | easy | 6 | C | Save localhost/caption-api:2.1 with its tag to /exam/backup/caption-api.tar so loading the archive on a clean system recreates the tagged image. |
@@ -1568,17 +1632,11 @@ _CloudTrain is not affiliated with or endorsed by Red Hat, Inc. Red Hat Certifie
 | `xct-run-ports-env` | ex188-aligned:run-containers | Run a service with published port and environment | easy | 6 | C | Run localhost/media-api:1.0 as container media-api with MEDIA_REGION=north, publishing container port 8080 on host port 18080. |
 | `xct-run-persistent-db` | ex188-aligned:run-containers | Run a database whose data outlives the container | medium | 10 | C | Run the supplied PostgreSQL image as ledger-db with its data on the named volume ledger-data, so removing and recreating the container keeps the seeded table. |
 | `xct-run-quadlet-service` | ex188-aligned:run-containers | Run a container as a service that survives reboot | hard | 15 | C | Make the container media-api start automatically for user examuser at boot as a systemd service so it is running and answering on port 18080 after the grader reboots the system. |
-| `xct-run-resource-limits` | ex188-aligned:run-containers | Run a batch container under memory and pid limits | easy | 6 | C | Run localhost/batch-runner as batch-1 limited to 256 MiB of memory and 64 processes, restarting on failure up to three times. |
 | `xct-run-rootless-user` | ex188-aligned:run-containers | Run a rootless container as a specific unprivileged user | medium | 8 | C | As examuser, run localhost/static-web rootless as container docs-web on host port 8082 with the process inside running as UID 1001. |
-| `xct-run-inspect-report` | ex188-aligned:run-containers | Report runtime facts about running containers | easy | 6 | C | Write the IP address, image digest and restart count of the running container ingest-7 to /exam/ingest-facts.txt in the requested order. |
 | `xct-multi-pod-api-db` | ex188-aligned:multi-container | Assemble an API and database in one pod | medium | 15 | C | Create pod ledger-pod publishing 8085 with the ledger API and its database inside it, the API reaching the database on localhost and returning the ledger summary from outside. |
-| `xct-multi-secret-password` | ex188-aligned:multi-container | Share a database password through a secret | medium | 10 | C | Create secret ledger-db-pass and use it for both the database and the API containers so they connect while the password appears in no container's environment listing. |
 | `xct-multi-kube-play` | ex188-aligned:multi-container | Start a multi-container application from Kubernetes YAML | medium | 12 | C | Start the application described in /exam/catalog.yaml with podman kube play, fixing the one wrong image reference in it, so its web container answers on host port 8086. |
-| `xct-multi-network-dependency` | ex188-aligned:multi-container | Connect a web tier to its cache by name | easy | 10 | C | Create network shop-net and run cache and web on it so web reaches the cache by the hostname cache and serves cached pages on host port 8087. |
 | `xct-trouble-crashloop` | ex188-aligned:troubleshoot | Get a crash-looping container running | medium | 10 | C | Container metrics-agent exits immediately after start; read its logs, correct the misnamed configuration variable and leave it running. |
-| `xct-trouble-port-conflict` | ex188-aligned:troubleshoot | Resolve a container that cannot bind its host port | easy | 8 | C | Container status-page fails to start because its host port is taken by a stray container; stop the stray one and start status-page so it serves on host port 8090. |
 | `xct-trouble-selinux-mount` | ex188-aligned:troubleshoot | Fix a container that cannot read its mounted data | medium | 10 | C | Container report-web returns 403 because it cannot read /exam/reports; fix the mount so it serves the reports while SELinux stays enforcing. |
-| `xct-trouble-exec-diagnose` | ex188-aligned:troubleshoot | Find why a running service returns errors | medium | 10 | C | Container price-api answers every request with 500; inspect it from inside, find the unreadable file it depends on, fix it and confirm /health returns 200. |
 
 </details>
 
@@ -1875,7 +1933,7 @@ _CloudTrain internal assessment. It is not aligned to, affiliated with or endors
 
 ## Appendix: proposed new skills
 
-302 skills to merge into `content/skills.yaml` after approval.
+309 skills to merge into `content/skills.yaml` after approval.
 
 <details><summary>New skills</summary>
 
@@ -1985,23 +2043,28 @@ _CloudTrain internal assessment. It is not aligned to, affiliated with or endors
 | `containers.build.minimal-base` | Choose slim, distroless, scratch or hardened base images | containers.build | containers.build.multi-stage |
 | `containers.build.digest-pinning` | Pin base images by digest and update pins deliberately | containers.build | containers.registry.references |
 | `containers.build.args-labels` | Parameterise builds with ARG, ENV and OCI labels | containers.build | containers.build.dockerfile |
+| `containers.build.reproducible` | Make builds reproducible with pinned inputs and SOURCE_DATE_EPOCH | containers.build | containers.build.digest-pinning |
 | `containers.buildkit.mounts` | Speed up builds with RUN --mount cache and bind mounts | containers.buildkit | containers.build.cache-order |
 | `containers.buildkit.secrets` | Pass build secrets and SSH agents without leaking them into layers | containers.buildkit | containers.buildkit.mounts |
 | `containers.buildkit.multi-platform` | Build multi-platform images and indexes with buildx | containers.buildkit | containers.buildkit.mounts, containers.registry.references |
 | `containers.buildkit.bake` | Define builds as code with Bake targets, groups and shared variables | containers.buildkit | containers.buildkit.mounts |
 | `containers.buildkit.checks` | Run build checks and fix their findings | containers.buildkit | containers.build.dockerfile |
+| `containers.buildkit.cache-export` | Choose buildx builders, cache backends and exporters and share build cache through a registry | containers.buildkit | containers.buildkit.mounts, containers.registry.references |
 | `containers.compose.model` | Describe services, networks and volumes in a Compose file and run the project | containers.compose | containers.foundations.lifecycle, containers.network.bridge-dns |
 | `containers.compose.interpolation` | Use .env files and variable interpolation and verify with compose config | containers.compose | containers.compose.model |
 | `containers.compose.startup-order` | Order startup with depends_on conditions and healthchecks | containers.compose | containers.compose.model, containers.build.healthcheck |
 | `containers.compose.overrides` | Merge Compose files and gate services with profiles | containers.compose | containers.compose.model |
 | `containers.compose.secrets-configs` | Provide secrets and configs to Compose services as files | containers.compose | containers.compose.model |
 | `containers.compose.watch` | Configure develop.watch to sync files and rebuild services | containers.compose | containers.compose.model |
+| `containers.compose.include` | Assemble an application from several Compose files with include and extends | containers.compose | containers.compose.overrides |
+| `containers.compose.distribution` | Publish Compose applications as OCI artifacts and run them from a registry reference | containers.compose | containers.compose.model, containers.registry.oci-artifacts |
 | `containers.network.bridge-dns` | Connect containers on user-defined bridges and resolve them by name | containers.network | containers.foundations.lifecycle |
 | `containers.network.publishing` | Publish ports on chosen host addresses and verify reachability | containers.network | containers.network.bridge-dns |
 | `containers.network.drivers` | Choose host, none, macvlan, ipvlan and container network modes | containers.network | containers.network.bridge-dns |
 | `containers.network.host-firewall` | Inspect and extend the engine's iptables/nftables rules via DOCKER-USER | containers.network | containers.network.publishing, linux.net.firewall |
 | `containers.network.address-pools` | Configure default address pools and network MTU to fit the host network | containers.network | containers.network.bridge-dns, linux.net.ip-config |
 | `containers.network.diagnosis` | Diagnose container traffic with nsenter, tcpdump and network inspect | containers.network | containers.network.bridge-dns, linux.net.troubleshooting |
+| `containers.network.ipv6` | Enable IPv6 and dual-stack container networks and publish on both address families | containers.network | containers.network.publishing, linux.net.ip-config |
 | `containers.storage.mount-types` | Choose volumes, bind mounts and tmpfs, read-only where possible | containers.storage | containers.foundations.lifecycle |
 | `containers.storage.backup-restore` | Back up and restore named volumes with throwaway containers | containers.storage | containers.storage.mount-types, linux.files.links-archives |
 | `containers.storage.permissions` | Fix UID/GID and SELinux label mismatches on mounted data | containers.storage | containers.storage.mount-types, linux.files.permissions |
@@ -2018,6 +2081,7 @@ _CloudTrain internal assessment. It is not aligned to, affiliated with or endors
 | `containers.supply-chain.verify-gate` | Gate deployment on signature and attestation verification | containers.supply-chain | containers.supply-chain.signing |
 | `containers.supply-chain.hardened-bases` | Migrate to hardened bases and verify their attestations | containers.supply-chain | containers.build.minimal-base, containers.supply-chain.sbom-provenance |
 | `containers.supply-chain.secret-hygiene` | Find secrets leaked into image layers and history and remove them | containers.supply-chain | containers.foundations.inspect |
+| `containers.supply-chain.policy` | Evaluate images against supply-chain policies with Docker Scout and fix the failures | containers.supply-chain | containers.supply-chain.scanning, containers.supply-chain.sbom-provenance |
 | `containers.registry.references` | Distinguish tags, digests and multi-platform indexes | containers.registry | containers.foundations.inspect |
 | `containers.registry.run-registry` | Run a private registry with TLS and authentication | containers.registry | containers.registry.references, linux.security.tls-certificates |
 | `containers.registry.mirror` | Configure pull-through mirrors and rewrite references for offline pulls | containers.registry | containers.registry.references |
@@ -2035,6 +2099,7 @@ _CloudTrain internal assessment. It is not aligned to, affiliated with or endors
 | `containers.internals.oci-bundle` | Run a container from an OCI runtime bundle with runc | containers.internals | containers.internals.runtime-stack |
 | `containers.internals.image-layout` | Read an OCI image layout (index, manifest, config, layers, whiteouts) | containers.internals | containers.registry.references |
 | `containers.internals.escape-awareness` | Recognise container escape paths such as mounted sockets and privileged mode and close them | containers.internals | containers.runtime-security.least-privilege |
+| `containers.podman.docker-parity` | Carry Docker workflows to Podman: daemonless model, rootless defaults, short names and the Docker-compatible socket | containers.podman | containers.foundations.lifecycle |
 | `containers.podman.rootless` | Run rootless Podman with subuid/subgid mappings | containers.podman | containers.foundations.lifecycle, linux.users.accounts |
 | `containers.podman.registries-conf` | Configure registries.conf search order, short-name aliases, mirrors and CAs | containers.podman | containers.registry.references |
 | `containers.podman.pods` | Group containers into Podman pods sharing network and ports | containers.podman | containers.podman.rootless |
@@ -2234,5 +2299,6 @@ Frameworks with a file in `content/frameworks/` (cka, ckad, cks, lfcs, ccna) are
 | `ex457-aligned` | Red Hat Ansible network automation exam (EX457) objective themes | Red Hat, Inc. | none | dev-workflow, variables-facts, control-flow, controller, network-roles-templates, netcommon-modules, config-backup |
 | `ex188-aligned` | Red Hat cloud-native containers exam (EX188) objective themes | Red Hat, Inc. | cloudtrain | build-images (25), manage-images (20), run-containers (20), multi-container (20), troubleshoot (15) |
 | `dca-legacy` | Docker Certified Associate (blueprint v1.4, 2020) domains, legacy | Mirantis, Inc. | published | orchestration (25), images-registry (20), install-config (15), networking (15), security (15), storage (10) |
+| `docker-practitioner` | Docker practitioner practical blueprint (CloudTrain-defined) | CloudTrain | cloudtrain | build (18), registry (8), compose (15), networking (15), storage (8), security (10), supply-chain (10), operations (16) |
 | `ct-platform` | CloudTrain platform engineer capstone | CloudTrain | cloudtrain | linux-foundation (10), containers-delivery (15), iac-provisioning (15), config-automation (15), kubernetes-operations (20), networking-connectivity (10), security-hardening (10), incident-response (5) |
 
