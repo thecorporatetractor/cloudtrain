@@ -154,7 +154,19 @@ export interface Node {
   resources?: {
     cpu?: number;
     memoryMiB?: number;
-    disks?: string[];
+    /**
+     * vm nodes: sizes of extra blank data disks (e.g. ["2Gi", "2Gi"]), attached as /dev/vdb, /dev/vdc, ... with serials ct-data1, ct-data2, ... (/dev/disk/by-id/virtio-ct-dataN)
+     *
+     * @maxItems 6
+     */
+    disks?:
+      | []
+      | [string]
+      | [string, string]
+      | [string, string, string]
+      | [string, string, string, string]
+      | [string, string, string, string, string]
+      | [string, string, string, string, string, string];
   };
   access?: ("shell" | "ssh" | "console" | "web" | "rdp")[];
   /**
