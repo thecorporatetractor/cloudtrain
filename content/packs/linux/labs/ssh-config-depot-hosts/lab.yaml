@@ -1,0 +1,276 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ssh-config-depot-hosts
+  title: Reach four depot hosts with keys and an ssh config file
+  domain: linux
+  frameworks: [rhcsa-aligned:essential-tools, lpic1:security, linuxplus:security]
+  difficulty: easy
+  estimatedMinutes: 12
+  tags: [ssh, keys, ssh-config, proxyjump]
+  version: 1
+spec:
+  description: |
+    Tallowmere Rail's rolling-stock team works on four depot hosts. Typing users,
+    ports and passwords every time is error-prone, so set up proper access from
+    your workstation:
+
+    | Host | Login user | Port | Reached through |
+    |---|---|---|---|
+    | `depot-1` | `rsops` | 22 | directly |
+    | `depot-2` | `rsdepot` | {{depot2Port}} | `depot-1` (jump host) |
+    | `depot-3` | `yard` | 2223 | `depot-1` (jump host) |
+    | `depot-4` | `yard` | 22 | directly |
+
+    1. Generate a new **ed25519** key pair for depot work at `~/.ssh/depot_ed25519`
+       (a separate key, not the workstation's default one).
+    2. Install its public key for `rsops` on `depot-1` and for `rsdepot` on
+       `depot-2`. Both accounts still accept the initial password `{{password}}`.
+    3. Write a `Host` entry for each of the four hosts in `~/.ssh/config`, with the
+       user, port, jump host (where listed) and your depot key, so that plain
+       `ssh depot-1` and `ssh depot-2` log in **without a password**.
+
+    depot-3 and depot-4 get the key next week; their entries only need to be right.
+    Keep the existing contents of `~/.ssh/config`.
+  objectives:
+    - Generate an SSH key pair and install the public key on a server
+    - Write per-host client settings in ~/.ssh/config
+    - Reach an internal host through a jump host
+  params:
+    depot2Port:
+      type: choice
+      values: ["2222", "2202"]
+    password:
+      type: choice
+      values: [Bogie-Lathe-17, Wheel-Set-42]
+  topology:
+    entry: tr-rs-ws-01
+    nodes:
+      - name: tr-rs-ws-01
+        driver: container
+        image: linux-pod-deb:24.04
+        access: [shell]
+  setup:
+    - on: tr-rs-ws-01
+      run: |
+        set -eu
+        # Four "depot hosts": sshd instances on their own loopback addresses.
+        # /etc/hosts is a bind mount: rewrite it in place, never rename over it.
+        h=$(sed '/ depot-[1-4]$/d' /etc/hosts); printf '%s\n' "$h" > /etc/hosts
+        printf '127.0.1.11 depot-1\n127.0.1.12 depot-2\n127.0.1.13 depot-3\n127.0.1.14 depot-4\n' >> /etc/hosts
+        for u in rsops rsdepot yard; do id $u >/dev/null 2>&1 || useradd -m -s /bin/bash $u; done
+        echo 'rsops:{{password}}' | chpasswd; echo 'rsdepot:{{password}}' | chpasswd; echo 'yard:{{password}}' | chpasswd
+        for u in rsops rsdepot yard; do rm -rf /home/$u/.ssh; install -d -m 0700 -o $u -g $u /home/$u/.ssh; done
+        for n in 1 2 3 4; do [ -f /run/sshd-depot-$n.pid ] && kill "$(cat /run/sshd-depot-$n.pid)" 2>/dev/null || true; done
+        sleep 1
+        mkdir -p /run/sshd /var/log/depot-ssh
+        inst() { n=$1 addr=$2 port=$3 users=$4
+          d=/etc/ssh/depot-$n; mkdir -p $d
+          [ -f $d/ssh_host_ed25519_key ] || ssh-keygen -q -t ed25519 -N '' -f $d/ssh_host_ed25519_key
+          cat > /etc/ssh/depot-$n.conf <<CONF
+        ListenAddress $addr:$port
+        HostKey $d/ssh_host_ed25519_key
+        PidFile /run/sshd-depot-$n.pid
+        UsePAM no
+        PasswordAuthentication yes
+        KbdInteractiveAuthentication no
+        PubkeyAuthentication yes
+        PermitRootLogin no
+        AllowUsers $users
+        AllowTcpForwarding yes
+        LogLevel VERBOSE
+        Subsystem sftp internal-sftp
+        CONF
+          /usr/sbin/sshd -f /etc/ssh/depot-$n.conf -E /var/log/depot-ssh/depot-$n.log
+        }
+        inst 1 127.0.1.11 22 rsops
+        inst 2 127.0.1.12 {{depot2Port}} rsdepot
+        inst 3 127.0.1.13 2223 yard
+        inst 4 127.0.1.14 22 yard
+        rm -f /home/learner/.ssh/depot_ed25519 /home/learner/.ssh/depot_ed25519.pub
+        touch /home/learner/.ssh/config
+        grep -q '^Host tr-backup-01$' /home/learner/.ssh/config || printf '\n# Nightly backup host (managed by the depot team)\nHost tr-backup-01\n  User backup\n  Port 2299\n' >> /home/learner/.ssh/config
+        chown learner:learner /home/learner/.ssh/config
+        mkdir -p /var/lib/cloudtrain && chmod 0700 /var/lib/cloudtrain
+        cp /home/learner/.ssh/config /var/lib/cloudtrain/ssh_config.orig
+  checks:
+    - id: depot-key
+      description: ~/.ssh/depot_ed25519 is an ed25519 key pair separate from the default key
+      type: shell
+      on: tr-rs-ws-01
+      skills: [linux.remote.ssh]
+      command: |
+        k=/home/learner/.ssh/depot_ed25519
+        [ -f $k ] && [ -f $k.pub ] && ssh-keygen -l -f $k.pub 2>/dev/null | grep -q '(ED25519)$' \
+          && ! cmp -s $k.pub /home/learner/.ssh/id_ed25519.pub && echo ok || echo no
+      expect: {match: exact, value: ok}
+    - id: key-on-depot-1
+      description: The depot public key is authorized for rsops on depot-1
+      type: shell
+      on: tr-rs-ws-01
+      skills: [linux.remote.ssh]
+      command: k=$(cut -d' ' -f2 /home/learner/.ssh/depot_ed25519.pub 2>/dev/null); [ -n "$k" ] && grep -qF "$k" /home/rsops/.ssh/authorized_keys 2>/dev/null && echo yes || echo no
+      expect: {match: exact, value: "yes"}
+    - id: key-on-depot-2
+      description: The depot public key is authorized for rsdepot on depot-2
+      type: shell
+      on: tr-rs-ws-01
+      skills: [linux.remote.ssh]
+      command: k=$(cut -d' ' -f2 /home/learner/.ssh/depot_ed25519.pub 2>/dev/null); [ -n "$k" ] && grep -qF "$k" /home/rsdepot/.ssh/authorized_keys 2>/dev/null && echo yes || echo no
+      expect: {match: exact, value: "yes"}
+    - id: config-entries
+      description: ~/.ssh/config gives each depot host its user, port, jump host and the depot key
+      type: shell
+      on: tr-rs-ws-01
+      skills: [linux.remote.ssh]
+      weight: 2
+      command: |
+        cd /home/learner
+        cfg() { runuser -u learner -- ssh -G "$1" 2>/dev/null | awk -v k="$2" '$1 == k {print $2; exit}'; }
+        bad=""
+        for spec in "depot-1 rsops 22 none" "depot-2 rsdepot {{depot2Port}} depot-1" "depot-3 yard 2223 depot-1" "depot-4 yard 22 none"; do
+          set -- $spec
+          [ "$(cfg $1 user)" = "$2" ] || bad="$bad $1:user"
+          [ "$(cfg $1 port)" = "$3" ] || bad="$bad $1:port"
+          pj=$(cfg $1 proxyjump); [ "${pj:-none}" = "$4" ] || bad="$bad $1:proxyjump"
+          runuser -u learner -- ssh -G "$1" 2>/dev/null | grep -qx 'identityfile ~/.ssh/depot_ed25519\|identityfile /home/learner/.ssh/depot_ed25519' || bad="$bad $1:identityfile"
+        done
+        echo "${bad:-ok}"
+      expect: {match: exact, value: ok}
+    - id: login-depot-1
+      description: ssh depot-1 logs in as rsops with the key, without a password
+      type: shell
+      on: tr-rs-ws-01
+      skills: [linux.remote.ssh]
+      timeoutSec: 20
+      command: runuser -u learner -- sh -c 'cd && ssh -o BatchMode=yes -o ConnectTimeout=5 depot-1 id -un' 2>/dev/null
+      expect: {match: exact, value: rsops}
+    - id: login-depot-2
+      description: ssh depot-2 logs in as rsdepot through the jump host, without a password
+      type: shell
+      on: tr-rs-ws-01
+      skills: [linux.remote.ssh]
+      weight: 2
+      timeoutSec: 20
+      command: runuser -u learner -- sh -c 'cd && ssh -o BatchMode=yes -o ConnectTimeout=5 depot-2 id -un' 2>/dev/null
+      expect: {match: exact, value: rsdepot}
+    - id: config-kept
+      description: The previous contents of ~/.ssh/config are still there
+      type: shell
+      on: tr-rs-ws-01
+      skills: [linux.remote.ssh]
+      weight: 0.5
+      command: |
+        grep -vxF -f /home/learner/.ssh/config /var/lib/cloudtrain/ssh_config.orig | grep -v '^\s*$' | head -1 | grep -q . && echo lost || echo kept
+      expect: {match: exact, value: kept}
+  hints:
+    - title: A dedicated key
+      body: "`ssh-keygen -t ed25519 -f ~/.ssh/depot_ed25519` writes the private key and the .pub next to it. An empty passphrase is fine for this lab."
+      cost: 1
+    - title: Installing the key
+      body: "`ssh-copy-id -i ~/.ssh/depot_ed25519.pub -p PORT user@host` logs in once with the password and appends the key to the account's ~/.ssh/authorized_keys. For depot-2, add `-o ProxyJump=rsops@depot-1` or write the config first."
+      cost: 1
+    - title: Host blocks
+      body: "Each block starts with `Host NAME` and sets `User`, `Port`, `IdentityFile ~/.ssh/depot_ed25519` and, behind the jump host, `ProxyJump depot-1`. `ssh -G depot-2` prints the settings ssh would use."
+      cost: 2
+  misconceptions:
+    - id: default-key
+      description: Uses the existing default key instead of generating the depot key.
+      feedback: "The task asks for a separate key at ~/.ssh/depot_ed25519, so it can be revoked on its own."
+      expectFail: [depot-key, config-entries]
+      mutation:
+        on: tr-rs-ws-01
+        as: admin
+        run: |
+          cat /home/learner/.ssh/id_ed25519.pub >> /home/rsops/.ssh/authorized_keys
+          cat /home/learner/.ssh/id_ed25519.pub >> /home/rsdepot/.ssh/authorized_keys
+          cp /home/learner/.ssh/id_ed25519 /home/learner/.ssh/depot_ed25519; cp /home/learner/.ssh/id_ed25519.pub /home/learner/.ssh/depot_ed25519.pub
+          chown learner:learner /home/learner/.ssh/depot_ed25519*
+          printf 'Host depot-1\n  User rsops\nHost depot-2\n  User rsdepot\n  Port {{depot2Port}}\n  ProxyJump depot-1\nHost depot-3\n  User yard\n  Port 2223\n  ProxyJump depot-1\nHost depot-4\n  User yard\n' >> /home/learner/.ssh/config
+    - id: no-jump
+      description: Leaves out ProxyJump for the hosts behind depot-1.
+      feedback: "depot-2 and depot-3 are only reachable through depot-1. Add ProxyJump depot-1 to their blocks."
+      expectFail: [config-entries]
+      mutation:
+        on: tr-rs-ws-01
+        as: learner
+        run: |
+          ssh-keygen -q -t ed25519 -N '' -f ~/.ssh/depot_ed25519
+          printf 'Host depot-*\n  IdentityFile ~/.ssh/depot_ed25519\nHost depot-1\n  User rsops\nHost depot-2\n  User rsdepot\n  Port {{depot2Port}}\nHost depot-3\n  User yard\n  Port 2223\nHost depot-4\n  User yard\n' >> ~/.ssh/config
+    - id: key-on-one-host
+      description: Installs the key on depot-1 only, assuming depot-2 shares it.
+      feedback: "Every account keeps its own authorized_keys. Install the key for rsdepot on depot-2 too."
+      expectFail: [key-on-depot-2, login-depot-2]
+      mutation:
+        on: tr-rs-ws-01
+        as: learner
+        run: |
+          ssh-keygen -q -t ed25519 -N '' -f ~/.ssh/depot_ed25519
+          printf 'Host depot-*\n  IdentityFile ~/.ssh/depot_ed25519\n  StrictHostKeyChecking accept-new\nHost depot-1\n  User rsops\nHost depot-2\n  User rsdepot\n  Port {{depot2Port}}\n  ProxyJump depot-1\nHost depot-3\n  User yard\n  Port 2223\n  ProxyJump depot-1\nHost depot-4\n  User yard\n' >> ~/.ssh/config
+          printf '#!/bin/sh\necho {{password}}\n' > ~/.askpass; chmod 700 ~/.askpass
+          SSH_ASKPASS=~/.askpass SSH_ASKPASS_REQUIRE=force DISPLAY=none setsid -w ssh-copy-id -i ~/.ssh/depot_ed25519.pub depot-1 </dev/null
+    - id: overwrote-config
+      description: Replaces ~/.ssh/config with only the depot entries.
+      feedback: "> truncates the file; >> appends. Existing entries in ~/.ssh/config belong to other work."
+      expectFail: [config-kept]
+      mutation:
+        on: tr-rs-ws-01
+        as: learner
+        run: printf 'Host depot-1\n  User rsops\n' > ~/.ssh/config
+  solution:
+    explanation: |
+      A dedicated ed25519 key is installed with ssh-copy-id (one password login per
+      account); the Host blocks record user, port and key, and ProxyJump depot-1 makes
+      ssh tunnel through depot-1 to the inner hosts. A wildcard block can hold the
+      settings all four share. The steps feed the password through SSH_ASKPASS
+      because they run without a terminal; interactively you just type it.
+    steps:
+      - on: tr-rs-ws-01
+        as: learner
+        run: |
+          ssh-keygen -q -t ed25519 -N '' -f ~/.ssh/depot_ed25519
+          cat >> ~/.ssh/config <<'CFG'
+
+          Host depot-1
+            User rsops
+          Host depot-2
+            User rsdepot
+            Port {{depot2Port}}
+            ProxyJump depot-1
+          Host depot-3
+            User yard
+            Port 2223
+            ProxyJump depot-1
+          Host depot-4
+            User yard
+            Port 22
+          Host depot-*
+            IdentityFile ~/.ssh/depot_ed25519
+            StrictHostKeyChecking accept-new
+          CFG
+          printf '#!/bin/sh\necho {{password}}\n' > ~/.askpass; chmod 700 ~/.askpass
+          export SSH_ASKPASS=~/.askpass SSH_ASKPASS_REQUIRE=force DISPLAY=none
+          setsid -w ssh-copy-id -i ~/.ssh/depot_ed25519.pub depot-1 </dev/null
+          setsid -w ssh-copy-id -i ~/.ssh/depot_ed25519.pub depot-2 </dev/null
+          rm -f ~/.askpass
+          ssh -o BatchMode=yes depot-2 id -un
+    alternatives:
+      - id: manual-authorized-keys
+        description: Append the public key to authorized_keys over an ssh session instead of ssh-copy-id, with Hostname-free blocks per host.
+        steps:
+          - on: tr-rs-ws-01
+            as: learner
+            run: |
+              ssh-keygen -q -t ed25519 -C depot -N '' -f ~/.ssh/depot_ed25519
+              for h in 1 2 3 4; do ssh-keyscan -p $(case $h in 2) echo {{depot2Port}};; 3) echo 2223;; *) echo 22;; esac) depot-$h 2>/dev/null; done > /tmp/kh
+              cat /tmp/kh >> ~/.ssh/known_hosts
+              { printf '\nHost depot-1\n    User rsops\n    IdentityFile ~/.ssh/depot_ed25519\n'
+                printf 'Host depot-2\n    User rsdepot\n    Port {{depot2Port}}\n    ProxyJump depot-1\n    IdentityFile ~/.ssh/depot_ed25519\n'
+                printf 'Host depot-3\n    User yard\n    Port 2223\n    ProxyJump depot-1\n    IdentityFile ~/.ssh/depot_ed25519\n'
+                printf 'Host depot-4\n    User yard\n    IdentityFile ~/.ssh/depot_ed25519\n'; } >> ~/.ssh/config
+              printf '#!/bin/sh\necho {{password}}\n' > ~/.askpass; chmod 700 ~/.askpass
+              export SSH_ASKPASS=~/.askpass SSH_ASKPASS_REQUIRE=force DISPLAY=none
+              for h in depot-1 depot-2; do
+                setsid -w ssh -o PubkeyAuthentication=no $h 'umask 077; mkdir -p ~/.ssh; cat >> ~/.ssh/authorized_keys' < ~/.ssh/depot_ed25519.pub
+              done
+              rm -f ~/.askpass

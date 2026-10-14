@@ -1,0 +1,302 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: robust-script-rotation-tool
+  title: Harden a roster rotation script
+  domain: linux
+  frameworks: [linuxplus:automation-scripting]
+  difficulty: hard
+  estimatedMinutes: 30
+  tags: [bash, getopts, set-e, trap, idempotency]
+  version: 1
+spec:
+  description: |
+    Every Monday the Tallowmere Rail crew office runs `~/bin/rotate-roster.sh` to
+    archive the week's roster and rotate the crews with `tr-crewshift`. Last week it
+    crashed half-way and left a roster with half the duties missing, and running it
+    twice archived the rotated roster over the original. Rewrite it so it is safe.
+
+    **Interface:** `rotate-roster.sh -d DIR -w WEEK [-n SHIFT]`
+
+    - `-d DIR` (required): the roster directory with `current.csv` and an
+      `archive/` subdirectory (create `archive/` if it is missing). Paths may
+      contain spaces.
+    - `-w WEEK` (required): the week label, e.g. `2026-W42`.
+    - `-n SHIFT` (optional, default 1): passed to `tr-crewshift`.
+    - `-h`: print a usage line on standard output and exit 0. An unknown option or a
+      missing required option prints the usage line on standard error and exits **2**.
+
+    **Behaviour:**
+
+    1. If `archive/roster-WEEK.csv` already exists, the week is done: change
+       nothing and exit 0.
+    2. Otherwise `archive/roster-WEEK.csv` becomes a copy of the current
+       `current.csv`, and `current.csv` becomes the output of
+       `tr-crewshift SHIFT < current.csv`; exit 0.
+    3. If anything fails (for example `tr-crewshift` exits non-zero after printing
+       part of its output), exit non-zero and leave **no trace**: `current.csv`
+       unchanged, no new archive file, no temporary files left in DIR or its
+       archive.
+
+    Use strict mode (`set -euo pipefail`), `getopts`, temporary files in the same
+    directory moved into place only when complete, and a `trap` that removes them.
+    The grader runs your script as you on fresh copies of several roster
+    directories and compares the results with a reference.
+  objectives:
+    - Parse options with getopts and validate required arguments
+    - Make a script fail fast with set -euo pipefail
+    - Write files atomically and clean up with trap
+    - Make a script idempotent
+  params:
+    week:
+      type: choice
+      values: [2026-W42, 2026-W43]
+  topology:
+    entry: tr-crew-02
+    nodes:
+      - name: tr-crew-02
+        driver: container
+        image: linux-pod-deb:24.04
+        access: [shell]
+  setup:
+    - on: tr-crew-02
+      file: {path: /usr/local/bin/tr-crewshift, source: assets/tr-crewshift, mode: "0755"}
+    - on: tr-crew-02
+      file: {path: /var/lib/cloudtrain/reference.sh, source: assets/reference.sh, mode: "0700"}
+    - on: tr-crew-02
+      file: {path: /var/lib/cloudtrain/case.sh, source: assets/case.sh, mode: "0700"}
+    - on: tr-crew-02
+      file: {path: /var/lib/cloudtrain/rotate-roster.orig, source: assets/rotate-roster.sh, mode: "0644"}
+    - on: tr-crew-02
+      run: |
+        set -eu
+        chmod 0755 /usr/local/bin/tr-crewshift
+        chmod 0700 /var/lib/cloudtrain /var/lib/cloudtrain/reference.sh /var/lib/cloudtrain/case.sh
+        install -d -o learner -g learner /home/learner/bin
+        install -o learner -g learner -m 0755 /var/lib/cloudtrain/rotate-roster.orig /home/learner/bin/rotate-roster.sh
+        rm -rf /home/learner/rosters; mkdir -p /home/learner/rosters/archive
+        printf 'duty,crew\nEarly-1,Ada\nEarly-2,Bram\nLate-1,Cleo\nLate-2,Dev\nNight-1,Eli\nNight-2,Fen\n' > /home/learner/rosters/current.csv
+        chown -R learner:learner /home/learner/rosters
+  checks:
+    - id: normal-run
+      description: A normal run archives the roster and rotates the crews
+      type: shell
+      on: tr-crew-02
+      skills: [linux.shell.robust-scripting]
+      timeoutSec: 60
+      command: /var/lib/cloudtrain/case.sh 1
+      expect: {match: exact, value: pass}
+    - id: idempotent
+      description: A second run for the same week changes nothing and exits 0
+      type: shell
+      on: tr-crew-02
+      skills: [linux.shell.robust-scripting]
+      weight: 1.5
+      timeoutSec: 60
+      command: /var/lib/cloudtrain/case.sh 2 && /var/lib/cloudtrain/case.sh 8
+      expect: {match: exact, value: "pass\npass"}
+    - id: shift-option
+      description: -n SHIFT is passed on
+      type: shell
+      on: tr-crew-02
+      skills: [linux.shell.robust-scripting]
+      timeoutSec: 60
+      command: /var/lib/cloudtrain/case.sh 3
+      expect: {match: exact, value: pass}
+    - id: option-errors
+      description: Unknown or missing options exit 2 and change nothing; -h prints usage and exits 0
+      type: shell
+      on: tr-crew-02
+      skills: [linux.shell.robust-scripting]
+      timeoutSec: 90
+      command: /var/lib/cloudtrain/case.sh 4 && /var/lib/cloudtrain/case.sh 5 && /var/lib/cloudtrain/case.sh 9
+      expect: {match: exact, value: "pass\npass\npass"}
+    - id: failure-leaves-no-trace
+      description: When tr-crewshift fails half-way, current.csv is unchanged and no archive or temporary file is left
+      type: shell
+      on: tr-crew-02
+      skills: [linux.shell.robust-scripting]
+      weight: 2
+      timeoutSec: 60
+      command: /var/lib/cloudtrain/case.sh 6
+      expect: {match: exact, value: pass}
+    - id: creates-archive-dir
+      description: A missing archive/ directory is created
+      type: shell
+      on: tr-crew-02
+      skills: [linux.shell.robust-scripting]
+      weight: 0.5
+      timeoutSec: 60
+      command: /var/lib/cloudtrain/case.sh 7
+      expect: {match: exact, value: pass}
+  hints:
+    - title: getopts skeleton
+      body: "`while getopts ':d:w:n:h' opt; do case $opt in d) dir=$OPTARG ;; ... ;; *) usage >&2; exit 2 ;; esac; done`. The leading colon lets you handle errors yourself. Check afterwards that dir and week are set."
+      cost: 1
+    - title: Never write the real file directly
+      body: "`tmp=$(mktemp \"$dir/.current.XXXXXX\")`, write into $tmp, and `mv \"$tmp\" \"$dir/current.csv\"` only after everything succeeded. mv within one filesystem is atomic."
+      cost: 2
+    - title: Clean up on every exit
+      body: "`trap 'rm -f \"$tmp\"' EXIT` runs however the script ends, including when set -e aborts it. After a successful mv the file is gone, so rm -f is harmless."
+      cost: 2
+    - title: Order matters
+      body: "Create the new roster in a temporary file first, then the archive copy, then move the new roster into place. If the archive is written first and the shift fails, the week looks done."
+      cost: 3
+  misconceptions:
+    - id: original-script
+      description: Keeps the original script (positional arguments, writes current.csv directly).
+      feedback: "The original truncates current.csv before tr-crewshift has succeeded, and archives over the original when run twice."
+      expectFail: [normal-run, failure-leaves-no-trace, option-errors]
+      mutation:
+        on: tr-crew-02
+        as: learner
+        run: "true"
+    - id: no-temp-file
+      description: Adds getopts and set -e but still redirects tr-crewshift straight into current.csv.
+      feedback: "set -e stops the script, but the shell truncated current.csv before tr-crewshift even started. Write to a temporary file and move it into place."
+      expectFail: [failure-leaves-no-trace]
+      mutation:
+        on: tr-crew-02
+        as: learner
+        run: |
+          cat > ~/bin/rotate-roster.sh <<'S'
+          #!/bin/bash
+          set -euo pipefail
+          usage() { echo "usage: rotate-roster.sh -d DIR -w WEEK [-n SHIFT]"; }
+          dir= week= n=1
+          while getopts ':d:w:n:h' o; do case $o in d) dir=$OPTARG ;; w) week=$OPTARG ;; n) n=$OPTARG ;; h) usage; exit 0 ;; *) usage >&2; exit 2 ;; esac; done
+          [ -n "$dir" ] && [ -n "$week" ] || { usage >&2; exit 2; }
+          [ -e "$dir/archive/roster-$week.csv" ] && exit 0
+          mkdir -p "$dir/archive"
+          cp "$dir/current.csv" "$dir/archive/roster-$week.csv"
+          tr-crewshift "$n" < "$dir/archive/roster-$week.csv" > "$dir/current.csv"
+          S
+    - id: not-idempotent
+      description: Rotates again on a second run for the same week.
+      feedback: "Check for archive/roster-WEEK.csv first; if it exists the week was rotated already."
+      expectFail: [idempotent]
+      mutation:
+        on: tr-crew-02
+        as: learner
+        run: |
+          cat > ~/bin/rotate-roster.sh <<'S'
+          #!/bin/bash
+          set -euo pipefail
+          usage() { echo "usage: rotate-roster.sh -d DIR -w WEEK [-n SHIFT]"; }
+          dir= week= n=1
+          while getopts ':d:w:n:h' o; do case $o in d) dir=$OPTARG ;; w) week=$OPTARG ;; n) n=$OPTARG ;; h) usage; exit 0 ;; *) usage >&2; exit 2 ;; esac; done
+          [ -n "$dir" ] && [ -n "$week" ] || { usage >&2; exit 2; }
+          tmp=$(mktemp "$dir/.c.XXXXXX"); trap 'rm -f "$tmp"' EXIT
+          tr-crewshift "$n" < "$dir/current.csv" > "$tmp"
+          mkdir -p "$dir/archive"; cp "$dir/current.csv" "$dir/archive/roster-$week.csv"
+          mv "$tmp" "$dir/current.csv"
+          S
+    - id: unquoted-paths
+      description: Leaves variables unquoted, so a directory with a space breaks.
+      feedback: "Unquoted $dir splits 'depot rosters' into two words. Quote every expansion."
+      expectFail: [normal-run]
+      mutation:
+        on: tr-crew-02
+        as: learner
+        run: |
+          cat > ~/bin/rotate-roster.sh <<'S'
+          #!/bin/bash
+          set -euo pipefail
+          dir= week= n=1
+          while getopts ':d:w:n:h' o; do case $o in d) dir=$OPTARG ;; w) week=$OPTARG ;; n) n=$OPTARG ;; h) echo usage; exit 0 ;; *) echo usage >&2; exit 2 ;; esac; done
+          [ -n "$dir" ] && [ -n "$week" ] || { echo usage >&2; exit 2; }
+          [ -e $dir/archive/roster-$week.csv ] && exit 0
+          tmp=$(mktemp $dir/.c.XXXXXX); trap 'rm -f $tmp' EXIT
+          tr-crewshift $n < $dir/current.csv > $tmp
+          mkdir -p $dir/archive; cp $dir/current.csv $dir/archive/roster-$week.csv; mv $tmp $dir/current.csv
+          S
+  solution:
+    explanation: |
+      getopts parses the flags and the required ones are checked before anything is
+      touched. An existing archive file makes the run a no-op. The new roster is built
+      in a temporary file in the same directory (so mv is atomic), the archive copy is
+      written the same way, and only then is the new roster moved into place. With
+      set -euo pipefail any failure stops the script, and the EXIT trap removes
+      whatever temporary file is left.
+    steps:
+      - on: tr-crew-02
+        as: learner
+        run: |
+          cat > ~/bin/rotate-roster.sh <<'S'
+          #!/bin/bash
+          # rotate-roster.sh -d DIR -w WEEK [-n SHIFT]: archive the roster, rotate the crews.
+          set -euo pipefail
+
+          usage() { echo "usage: rotate-roster.sh -d DIR -w WEEK [-n SHIFT]"; }
+
+          dir="" week="" shift_n=1
+          while getopts ':d:w:n:h' opt; do
+            case $opt in
+              d) dir=$OPTARG ;;
+              w) week=$OPTARG ;;
+              n) shift_n=$OPTARG ;;
+              h) usage; exit 0 ;;
+              *) usage >&2; exit 2 ;;
+            esac
+          done
+          if [[ -z $dir || -z $week ]]; then usage >&2; exit 2; fi
+
+          archive="$dir/archive/roster-$week.csv"
+          if [[ -e $archive ]]; then
+            echo "roster for $week already rotated"
+            exit 0
+          fi
+
+          new="" arch_tmp=""
+          cleanup() {
+            [[ -n $new ]] && rm -f -- "$new"
+            [[ -n $arch_tmp ]] && rm -f -- "$arch_tmp"
+            return 0
+          }
+          trap cleanup EXIT
+
+          new=$(mktemp "$dir/.current.csv.XXXXXX")
+          tr-crewshift "$shift_n" < "$dir/current.csv" > "$new"
+
+          mkdir -p "$dir/archive"
+          arch_tmp=$(mktemp "$dir/archive/.roster.XXXXXX")
+          cp -- "$dir/current.csv" "$arch_tmp"
+          chmod 0644 "$arch_tmp" "$new"
+          mv -- "$arch_tmp" "$archive"
+          mv -- "$new" "$dir/current.csv"
+          echo "rotated $dir for $week"
+          S
+          chmod +x ~/bin/rotate-roster.sh
+          ~/bin/rotate-roster.sh -d ~/rosters -w {{week}}
+          ~/bin/rotate-roster.sh -d ~/rosters -w {{week}}
+    alternatives:
+      - id: err-trap-and-functions
+        description: Separate validate/rotate functions, an ERR trap that reports the failing line, and install for the atomic copy.
+        steps:
+          - on: tr-crew-02
+            as: learner
+            run: |
+              cat > ~/bin/rotate-roster.sh <<'S'
+              #!/usr/bin/env bash
+              set -Eeuo pipefail
+              trap 'echo "rotate-roster: failed at line $LINENO" >&2' ERR
+              TMPS=()
+              trap 'rm -f -- "${TMPS[@]}"' EXIT
+              die_usage() { echo "Usage: rotate-roster.sh -d DIR -w WEEK [-n SHIFT]" >&2; exit 2; }
+              DIR= WEEK= N=1
+              while getopts ':hd:w:n:' o; do
+                case "$o" in
+                  h) echo "Usage: rotate-roster.sh -d DIR -w WEEK [-n SHIFT]"; exit 0 ;;
+                  d) DIR="$OPTARG" ;; w) WEEK="$OPTARG" ;; n) N="$OPTARG" ;;
+                  :|\?) die_usage ;;
+                esac
+              done
+              [[ -n "$DIR" && -n "$WEEK" ]] || die_usage
+              [[ -f "$DIR/archive/roster-$WEEK.csv" ]] && exit 0
+              t1=$(mktemp -p "$DIR" .rot.XXXX); TMPS+=("$t1")
+              tr-crewshift "$N" < "$DIR/current.csv" > "$t1"
+              install -d "$DIR/archive"
+              t2=$(mktemp -p "$DIR/archive" .arc.XXXX); TMPS+=("$t2")
+              install -m 0644 "$DIR/current.csv" "$t2" && mv "$t2" "$DIR/archive/roster-$WEEK.csv"
+              chmod 0644 "$t1" && mv "$t1" "$DIR/current.csv"
+              S

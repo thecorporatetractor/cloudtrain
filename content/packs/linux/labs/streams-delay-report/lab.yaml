@@ -1,0 +1,171 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: streams-delay-report
+  title: Split delay-feed output and errors into separate files
+  domain: linux
+  frameworks: [lpic1:gnu-commands, rhcsa-aligned:essential-tools, linuxplus:system-management]
+  difficulty: easy
+  estimatedMinutes: 8
+  tags: [redirection, stdout, stderr, tee, pipes]
+  version: 1
+spec:
+  description: |
+    The Tallowmere Rail control room runs the delay-feed collector,
+    `tr-delay-feed`, by hand every morning. It prints one line per delayed train
+    on **standard output** and a warning per broken station sensor on **standard
+    error**.
+
+    Run it once, as yourself, so that in a single command:
+
+    - its standard output is saved to `/var/tmp/delays.log`,
+    - its standard error is saved to `/var/tmp/delays.err`,
+    - and you still see the delay lines on your screen while it runs (use `tee`).
+
+    Each file must hold only its own stream, nothing mixed. Do not edit the files
+    afterwards; the collector also records where its output went.
+  objectives:
+    - Redirect standard output and standard error separately
+    - Copy a stream to a file and the screen with tee
+  params:
+    trains:
+      type: int
+      min: 6
+      max: 14
+    sensors:
+      type: int
+      min: 2
+      max: 5
+  topology:
+    entry: tr-control-01
+    nodes:
+      - name: tr-control-01
+        driver: container
+        image: linux-pod-deb:24.04
+        access: [shell]
+  setup:
+    - on: tr-control-01
+      file:
+        path: /usr/local/bin/tr-delay-feed
+        source: assets/tr-delay-feed
+        mode: "0755"
+    - on: tr-control-01
+      run: |
+        set -eu
+        chmod 0755 /usr/local/bin/tr-delay-feed
+        mkdir -p /usr/share/tr-delay
+        stations="Ashby Bramwell Corran Dunmere Elsford Fallow Garth Hollin"
+        : > /usr/share/tr-delay/feed.dat
+        i=0; t={{trains}}; s={{sensors}}
+        while [ $i -lt $t ]; do
+          i=$((i+1)); st=$(echo $stations | cut -d' ' -f$(( (i % 8) + 1 )))
+          echo "D|TR$((3100 + i * 7))|$(( (i * 13) % 40 + 3 ))|$st" >> /usr/share/tr-delay/feed.dat
+          if [ $i -le $s ]; then echo "W|S$((40 + i))|$st|timeout" >> /usr/share/tr-delay/feed.dat; fi
+        done
+        chmod 0644 /usr/share/tr-delay/feed.dat
+        rm -f /var/tmp/delays.log /var/tmp/delays.err
+        rm -rf /home/learner/.local/state/tr-delay
+        # Expected streams for the grader (root only).
+        mkdir -p /var/lib/cloudtrain && chmod 0700 /var/lib/cloudtrain
+        HOME=/var/lib/cloudtrain/run tr-delay-feed > /var/lib/cloudtrain/expected.out 2> /var/lib/cloudtrain/expected.err
+        rm -rf /var/lib/cloudtrain/run
+  checks:
+    - id: log-is-stdout
+      description: /var/tmp/delays.log holds exactly the collector's standard output
+      type: shell
+      on: tr-control-01
+      skills: [linux.shell.redirection]
+      weight: 2
+      command: cmp -s /var/lib/cloudtrain/expected.out /var/tmp/delays.log && echo match || echo differs
+      expect: {match: exact, value: match}
+    - id: err-is-stderr
+      description: /var/tmp/delays.err holds exactly the collector's standard error
+      type: shell
+      on: tr-control-01
+      skills: [linux.shell.redirection]
+      weight: 2
+      command: cmp -s /var/lib/cloudtrain/expected.err /var/tmp/delays.err && echo match || echo differs
+      expect: {match: exact, value: match}
+    - id: stdout-through-tee
+      description: The collector's standard output went into a pipe (to tee), not straight into the file
+      type: shell
+      on: tr-control-01
+      skills: [linux.shell.redirection]
+      command: grep -q '^stdout=pipe:' /home/learner/.local/state/tr-delay/last-run 2>/dev/null && echo pipe || echo no
+      expect: {match: exact, value: pipe}
+    - id: stderr-to-file
+      description: The collector's standard error went straight into /var/tmp/delays.err
+      type: shell
+      on: tr-control-01
+      skills: [linux.shell.redirection]
+      command: grep -qx 'stderr=/var/tmp/delays.err' /home/learner/.local/state/tr-delay/last-run 2>/dev/null && echo file || echo no
+      expect: {match: exact, value: file}
+  hints:
+    - title: Two streams, two numbers
+      body: "Standard output is file descriptor 1, standard error is 2. `>` redirects 1, `2>` redirects 2."
+      cost: 1
+    - title: A T-junction for a stream
+      body: "`tee FILE` copies its standard input to FILE and to its own standard output, i.e. your screen. Only standard output travels through a pipe `|`."
+      cost: 1
+    - title: Where does 2> belong?
+      body: "A redirection applies to the command it is written next to. `cmd | tee f 2> e` redirects tee's errors, not cmd's. Put `2>` on the collector."
+      cost: 2
+  misconceptions:
+    - id: merged-streams
+      description: Merges both streams with 2>&1 before tee.
+      feedback: "2>&1 sends errors into the same pipe, so delays.log ends up with the warnings in it. Give standard error its own redirection."
+      expectFail: [log-is-stdout, err-is-stderr]
+      mutation:
+        on: tr-control-01
+        as: learner
+        run: tr-delay-feed 2>&1 | tee /var/tmp/delays.log; touch /var/tmp/delays.err
+    - id: stderr-on-tee
+      description: Puts 2> after tee, so it captures tee's errors instead of the collector's.
+      feedback: "Each command in a pipeline has its own descriptors. 2> after tee redirects tee's standard error, which is empty; the warnings still go to your screen."
+      expectFail: [err-is-stderr, stderr-to-file]
+      mutation:
+        on: tr-control-01
+        as: learner
+        run: tr-delay-feed | tee /var/tmp/delays.log 2> /var/tmp/delays.err
+    - id: no-tee
+      description: Redirects both streams to files and skips tee.
+      feedback: "The files are right, but the control room also wants the lines on screen while the feed runs. Pipe standard output through tee."
+      expectFail: [stdout-through-tee]
+      mutation:
+        on: tr-control-01
+        as: learner
+        run: tr-delay-feed > /var/tmp/delays.log 2> /var/tmp/delays.err
+    - id: run-twice
+      description: Runs the collector twice with tee -a or >>, appending a second copy.
+      feedback: "Appending (>> or tee -a) keeps the earlier run's lines. The files should hold one run each."
+      expectFail: [log-is-stdout, err-is-stderr]
+      mutation:
+        on: tr-control-01
+        as: learner
+        run: |
+          tr-delay-feed 2>> /var/tmp/delays.err | tee -a /var/tmp/delays.log
+          tr-delay-feed 2>> /var/tmp/delays.err | tee -a /var/tmp/delays.log
+  solution:
+    explanation: |
+      `2>` sits next to the collector, so only its standard error goes to delays.err;
+      its standard output goes through the pipe to tee, which writes delays.log and
+      repeats every line on the terminal.
+    steps:
+      - on: tr-control-01
+        as: learner
+        run: tr-delay-feed 2> /var/tmp/delays.err | tee /var/tmp/delays.log
+    alternatives:
+      - id: process-substitution
+        description: Use bash process substitution for tee.
+        steps:
+          - on: tr-control-01
+            as: learner
+            run: |
+              bash -c 'tr-delay-feed > >(tee /var/tmp/delays.log) 2> /var/tmp/delays.err; wait'
+              sleep 1
+      - id: group-redirect
+        description: Redirect standard error of a whole group, then pipe.
+        steps:
+          - on: tr-control-01
+            as: learner
+            run: "{ tr-delay-feed | tee /var/tmp/delays.log; } 2> /var/tmp/delays.err"

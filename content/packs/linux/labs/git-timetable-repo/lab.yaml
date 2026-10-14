@@ -1,0 +1,258 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: git-timetable-repo
+  title: Fix a bug on a branch and merge it with Git
+  domain: linux
+  frameworks: [lfcs:essential-commands, linuxplus:automation-scripting]
+  difficulty: easy
+  estimatedMinutes: 15
+  tags: [git, branches, merge, push]
+  version: 1
+spec:
+  description: |
+    The timetable office keeps its helper scripts in the repository
+    `timetable-tools` on Tallowmere Rail's Git server:
+
+    ```
+    git@git.tallowmere.example:timetable-tools.git
+    ```
+
+    (your SSH key is already registered there). Its `tests/run.sh` fails: `ttfmt`
+    prints `1:05` instead of `01:05` and does not wrap departures after midnight
+    (1505 minutes must print `01:05`).
+
+    1. Clone the repository and set your Git identity (name and e-mail) for it.
+    2. Create a **feature branch**, fix `bin/ttfmt` there so that `tests/run.sh`
+       passes, and commit with a meaningful message (a subject of at least three
+       words).
+    3. Merge the branch into `main` **with a merge commit** (the team wants one merge
+       commit per fix, so no fast-forward) and **push** `main`.
+
+    Do not rewrite the existing history on the server.
+  objectives:
+    - Clone over SSH and configure a Git identity
+    - Work on a feature branch and merge it with a merge commit
+    - Push to a shared remote without rewriting history
+  params:
+    branch:
+      type: choice
+      values: [fix-ttfmt-padding, fix/ttfmt-midnight]
+  topology:
+    entry: tr-timetable-04
+    nodes:
+      - name: tr-timetable-04
+        driver: container
+        image: linux-pod-deb:24.04
+        access: [shell]
+  setup:
+    - on: tr-timetable-04
+      file: {path: /var/lib/cloudtrain/seed-repo.sh, source: assets/seed-repo.sh, mode: "0700"}
+    - on: tr-timetable-04
+      file: {path: /usr/local/sbin/git-keys, source: assets/git-keys, mode: "0755"}
+    - on: tr-timetable-04
+      run: |
+        set -eu
+        chmod 0700 /var/lib/cloudtrain /var/lib/cloudtrain/seed-repo.sh; chmod 0755 /usr/local/sbin/git-keys
+        # /etc/hosts is a bind mount: rewrite it in place, never rename over it.
+        h=$(sed '/ git.tallowmere.example$/d' /etc/hosts); printf '%s\n' "$h" > /etc/hosts
+        echo '127.0.3.1 git.tallowmere.example' >> /etc/hosts
+        id git >/dev/null 2>&1 || useradd -m -d /srv/git -s /usr/bin/git-shell git
+        usermod -p '*' git
+        mkdir -p /srv/git && chown git:git /srv/git
+        bash /var/lib/cloudtrain/seed-repo.sh
+        # The Git server: sshd for the git account only, keys from the learner's ~/.ssh.
+        mkdir -p /etc/ssh/git-server /run/sshd
+        [ -f /etc/ssh/git-server/ssh_host_ed25519_key ] || ssh-keygen -q -t ed25519 -N '' -f /etc/ssh/git-server/ssh_host_ed25519_key
+        cat > /etc/ssh/git-server.conf <<'CONF'
+        ListenAddress 127.0.3.1:22
+        HostKey /etc/ssh/git-server/ssh_host_ed25519_key
+        PidFile /run/sshd-git.pid
+        UsePAM no
+        PasswordAuthentication no
+        KbdInteractiveAuthentication no
+        AllowUsers git
+        AuthorizedKeysFile none
+        AuthorizedKeysCommand /usr/local/sbin/git-keys %u
+        AuthorizedKeysCommandUser root
+        CONF
+        [ -f /run/sshd-git.pid ] && kill "$(cat /run/sshd-git.pid)" 2>/dev/null && sleep 1 || true
+        /usr/sbin/sshd -f /etc/ssh/git-server.conf
+        # Pre-trust the server's host key for the learner, as a managed workstation would.
+        install -d -m 0700 -o learner -g learner /home/learner/.ssh
+        touch /home/learner/.ssh/known_hosts
+        sed -i '/^git.tallowmere.example /d' /home/learner/.ssh/known_hosts
+        printf 'git.tallowmere.example %s\n' "$(cut -d' ' -f1,2 /etc/ssh/git-server/ssh_host_ed25519_key.pub)" >> /home/learner/.ssh/known_hosts
+        chown learner:learner /home/learner/.ssh/known_hosts
+        rm -rf /home/learner/timetable-tools
+  checks:
+    - id: history-kept
+      description: The server's original history is still part of main
+      type: shell
+      on: tr-timetable-04
+      skills: [linux.git.basics]
+      weight: 0.5
+      command: git -c safe.directory='*' -C /srv/git/timetable-tools.git merge-base --is-ancestor "$(cat /var/lib/cloudtrain/baseline)" main && echo kept || echo rewritten
+      expect: {match: exact, value: kept}
+    - id: tests-pass-on-main
+      description: tests/run.sh passes on the pushed main
+      type: shell
+      on: tr-timetable-04
+      skills: [linux.git.basics, linux.shell.scripting]
+      weight: 2
+      command: |
+        # upload-pack ignores -c, so trust the repository through a throwaway HOME.
+        w=$(mktemp -d); HOME=$w git config --global safe.directory '*'
+        HOME=$w git clone -q /srv/git/timetable-tools.git "$w/r" 2>/dev/null
+        (cd "$w/r" && bash tests/run.sh >/dev/null 2>&1) && echo pass || echo fail; rm -rf "$w"
+      expect: {match: exact, value: pass}
+    - id: merge-commit
+      description: main has a merge commit that brings in the fix from a feature branch
+      type: shell
+      on: tr-timetable-04
+      skills: [linux.git.basics]
+      weight: 1.5
+      command: |
+        cd /srv/git/timetable-tools.git || exit 0
+        b=$(cat /var/lib/cloudtrain/baseline)
+        n=0
+        for m in $(git -c safe.directory='*' rev-list --merges "$b"..main); do
+          git -c safe.directory='*' diff --quiet "$m^1" "$m" -- bin/ttfmt || n=$((n+1))
+        done
+        [ $n -ge 1 ] && echo merged || echo no-merge
+      expect: {match: exact, value: merged}
+    - id: identity-and-message
+      description: The fix commit has a configured author and a subject of at least three words
+      type: shell
+      on: tr-timetable-04
+      skills: [linux.git.basics]
+      command: |
+        cd /srv/git/timetable-tools.git || exit 0
+        b=$(cat /var/lib/cloudtrain/baseline)
+        c=$(git -c safe.directory='*' rev-list --no-merges "$b"..main -- bin/ttfmt | head -1)
+        [ -n "$c" ] || { echo none; exit 0; }
+        e=$(git -c safe.directory='*' log -1 --format=%ae "$c"); s=$(git -c safe.directory='*' log -1 --format=%s "$c")
+        case $e in *@*.*) ;; *) echo "no identity"; exit 0 ;; esac
+        case $e in learner@tr-timetable-04*|*@localhost*|*.\(none\)) echo "no identity"; exit 0 ;; esac
+        [ "$(echo "$s" | wc -w)" -ge 3 ] && echo ok || echo "short message"
+      expect: {match: exact, value: ok}
+  hints:
+    - title: Clone and identify
+      body: "`git clone git@git.tallowmere.example:timetable-tools.git`, then inside it `git config user.name \"...\"` and `git config user.email \"...\"`."
+      cost: 1
+    - title: The bug
+      body: "`%d` prints the hour without padding, and the hour is never reduced modulo 24. `printf '%02d:%02d\\n' $(( m / 60 % 24 )) $(( m % 60 ))` does both. Run tests/run.sh."
+      cost: 2
+    - title: Branch, merge, push
+      body: "`git switch -c BRANCH`, commit, `git switch main`, `git merge --no-ff BRANCH`, `git push origin main`. Without --no-ff Git fast-forwards and no merge commit is made."
+      cost: 1
+  misconceptions:
+    - id: commit-on-main
+      description: Commits the fix directly on main.
+      feedback: "The team reviews fixes as branches and keeps a merge commit per fix. Branch first, then merge with --no-ff."
+      expectFail: [merge-commit]
+      mutation:
+        on: tr-timetable-04
+        as: learner
+        run: |
+          git clone -q git@git.tallowmere.example:timetable-tools.git ~/timetable-tools && cd ~/timetable-tools
+          git config user.name "Ada Signal"; git config user.email "ada@tallowmere.example"
+          sed -i 's|h=$(( m / 60 ))|h=$(( m / 60 % 24 ))|; s|%d:%02d|%02d:%02d|' bin/ttfmt
+          bash tests/run.sh && git commit -qam "Pad hours and wrap after midnight in ttfmt" && git push -q origin main
+    - id: fast-forward
+      description: Merges the branch with a fast-forward, so no merge commit exists.
+      feedback: "When main has not moved, git merge just moves the pointer. Use git merge --no-ff."
+      expectFail: [merge-commit]
+      mutation:
+        on: tr-timetable-04
+        as: learner
+        run: |
+          git clone -q git@git.tallowmere.example:timetable-tools.git ~/timetable-tools && cd ~/timetable-tools
+          git config user.name "Ada Signal"; git config user.email "ada@tallowmere.example"
+          git switch -q -c {{branch}}
+          sed -i 's|h=$(( m / 60 ))|h=$(( m / 60 % 24 ))|; s|%d:%02d|%02d:%02d|' bin/ttfmt
+          git commit -qam "Pad hours and wrap after midnight in ttfmt"
+          git switch -q main && git merge -q {{branch}} && git push -q origin main
+    - id: not-pushed
+      description: Merges locally but never pushes.
+      feedback: "Your merge only exists in your clone until you git push origin main."
+      expectFail: [tests-pass-on-main, merge-commit]
+      mutation:
+        on: tr-timetable-04
+        as: learner
+        run: |
+          git clone -q git@git.tallowmere.example:timetable-tools.git ~/timetable-tools && cd ~/timetable-tools
+          git config user.name "Ada Signal"; git config user.email "ada@tallowmere.example"
+          git switch -q -c {{branch}}
+          sed -i 's|h=$(( m / 60 ))|h=$(( m / 60 % 24 ))|; s|%d:%02d|%02d:%02d|' bin/ttfmt
+          git commit -qam "Pad hours and wrap after midnight in ttfmt"
+          git switch -q main && git merge -q --no-ff -m "Merge {{branch}}" {{branch}}
+    - id: lazy-message
+      description: Commits with a one-word message such as "fix".
+      feedback: "In a year nobody will know what 'fix' fixed. Write a subject that says what changed."
+      expectFail: [identity-and-message]
+      mutation:
+        on: tr-timetable-04
+        as: learner
+        run: |
+          git clone -q git@git.tallowmere.example:timetable-tools.git ~/timetable-tools && cd ~/timetable-tools
+          git config user.name "Ada Signal"; git config user.email "ada@tallowmere.example"
+          git switch -q -c {{branch}}
+          sed -i 's|h=$(( m / 60 ))|h=$(( m / 60 % 24 ))|; s|%d:%02d|%02d:%02d|' bin/ttfmt
+          git commit -qam "fix"
+          git switch -q main && git merge -q --no-ff -m "Merge {{branch}}" {{branch}} && git push -q origin main
+    - id: force-push-rewrite
+      description: Rebuilds main from scratch and force-pushes it.
+      feedback: "Force-pushing over a shared branch throws away colleagues' commits. Merge on top of the existing history and push normally."
+      expectFail: [history-kept]
+      mutation:
+        on: tr-timetable-04
+        as: learner
+        run: |
+          git clone -q git@git.tallowmere.example:timetable-tools.git ~/timetable-tools && cd ~/timetable-tools
+          git config user.name "Ada Signal"; git config user.email "ada@tallowmere.example"
+          git checkout -q --orphan fresh && git commit -qm "Import timetable tools again"
+          git branch -M fresh main && git push -q -f origin main
+  solution:
+    explanation: |
+      Clone over SSH, set the identity in the clone, fix the format string (zero-padded
+      hour modulo 24) on a feature branch, commit with a descriptive subject, merge with
+      --no-ff so main records a merge commit, and push main normally.
+    steps:
+      - on: tr-timetable-04
+        as: learner
+        run: |
+          git clone git@git.tallowmere.example:timetable-tools.git ~/timetable-tools
+          cd ~/timetable-tools
+          git config user.name "Ada Signal"
+          git config user.email "ada.signal@tallowmere.example"
+          git switch -c {{branch}}
+          sed -i 's|h=$(( m / 60 ))|h=$(( m / 60 % 24 ))|; s|%d:%02d|%02d:%02d|' bin/ttfmt
+          cat bin/ttfmt
+          bash tests/run.sh
+          git commit -am "Zero-pad hours and wrap times past midnight in ttfmt"
+          git switch main
+          git merge --no-ff -m "Merge branch '{{branch}}'" {{branch}}
+          git push origin main
+          git log --oneline --graph -5
+    alternatives:
+      - id: branch-push-then-merge
+        description: Push the feature branch too, write the fix with a heredoc, merge with git merge --no-ff --no-edit.
+        steps:
+          - on: tr-timetable-04
+            as: learner
+            run: |
+              git clone -q git@git.tallowmere.example:timetable-tools.git ~/timetable-tools && cd ~/timetable-tools
+              git config user.name "Bram Points" && git config user.email bram@tallowmere.example
+              git checkout -q -b {{branch}}
+              cat > bin/ttfmt <<'S'
+              #!/bin/bash
+              # ttfmt MINUTES: format minutes after midnight as HH:MM (24-hour clock).
+              m=${1:?usage: ttfmt MINUTES}
+              h=$(( (m / 60) % 24 ))
+              printf '%02d:%02d\n' "$h" $(( m % 60 ))
+              S
+              tests/run.sh
+              git add bin/ttfmt && git commit -q -m "ttfmt: pad the hour and wrap at 24h"
+              git push -q -u origin {{branch}}
+              git checkout -q main && git pull -q && git merge --no-ff --no-edit {{branch}} && git push -q origin main

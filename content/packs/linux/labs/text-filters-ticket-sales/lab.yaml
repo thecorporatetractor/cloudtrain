@@ -1,0 +1,174 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: text-filters-ticket-sales
+  title: Rank stations by ticket sales from a CSV export
+  domain: linux
+  frameworks: [lpic1:gnu-commands, linuxplus:automation-scripting]
+  difficulty: easy
+  estimatedMinutes: 12
+  tags: [text-processing, sort, uniq, cut, head, csv]
+  version: 1
+spec:
+  description: |
+    The Tallowmere Rail revenue team wants to know where weekend travel pays off.
+    The ticketing system exported last week's figures to
+    `/srv/ticketing/exports/sales.csv`, one row per station:
+
+    ```
+    station,region,weekday_revenue,weekend_revenue,tickets
+    ```
+
+    Write the **five stations with the highest weekend revenue**, highest first, to
+    `~/answers/top5.txt`: **station names only**, one per line, nothing else.
+
+    The export tool is known to repeat some rows. Use the classic filters (`tail` or
+    `grep`, `sort`, `uniq`, `head`, `cut`); no spreadsheet is available.
+  objectives:
+    - Skip a CSV header line
+    - Sort numerically on one field with a custom separator
+    - Remove duplicate lines and cut out one column
+  params:
+    salt:
+      type: int
+      min: 1
+      max: 97
+  topology:
+    entry: tkt-report-01
+    nodes:
+      - name: tkt-report-01
+        driver: container
+        image: linux-pod-deb:24.04
+        access: [shell]
+  setup:
+    - on: tkt-report-01
+      run: |
+        set -eu
+        mkdir -p /srv/ticketing/exports /var/lib/cloudtrain
+        chmod 0700 /var/lib/cloudtrain
+        f=/srv/ticketing/exports/sales.csv
+        awk -v salt={{salt}} 'BEGIN {
+          n = split("Ashby Junction,Bramwell,Corran Quay,Dunmere,Elsford Parkway,Fallow Cross,Garth,Hollin Cross,Ivel Bridge,Jessop Road,Kelmscot,Larkhill,Marrow Lane,Netherby,Orchard Halt,Pellow,Quarry Bank,Rushden Vale,Saltmarsh,Tallowmere Central,Upton Moss,Vane Street,Wexley,Yarrow Green", s, ",")
+          regions = "north,south,east,west"; split(regions, r, ",")
+          print "station,region,weekday_revenue,weekend_revenue,tickets"
+          for (i = 1; i <= n; i++) {
+            if (s[i] == "Hollin Cross") we = 9990
+            else if (i % 4 == 1) we = 10000 + (i * 3797 + salt * 131) % 4000
+            else we = 2000 + (i * 3797 + salt * 131) % 7900
+            wd = 40000 - we * 2 + (i * 17) % 300
+            line = s[i] "," r[i % 4 + 1] "," wd "," we "," int(we / 7) + i
+            print line
+            if (i % 4 == 1 && i < 10) print line
+          }
+        }' > $f
+        chmod 0644 $f
+        # Expected answer (root only).
+        tail -n +2 $f | sort -u | sort -t, -k4,4nr | head -5 | cut -d, -f1 > /var/lib/cloudtrain/top5.expected
+        test "$(wc -l < /var/lib/cloudtrain/top5.expected)" = 5
+        install -d -o learner -g learner /home/learner/answers
+        rm -f /home/learner/answers/top5.txt
+  checks:
+    - id: five-lines
+      description: ~/answers/top5.txt has exactly five non-empty lines
+      type: shell
+      on: tkt-report-01
+      skills: [linux.shell.text-processing]
+      weight: 0.5
+      command: grep -c . /home/learner/answers/top5.txt 2>/dev/null || true
+      expect: {match: exact, value: "5"}
+    - id: names-only
+      description: The lines hold station names only (no numbers, commas or header)
+      type: shell
+      on: tkt-report-01
+      skills: [linux.shell.text-processing]
+      weight: 0.5
+      command: test -s /home/learner/answers/top5.txt && ! grep -qE '[0-9,]|station' /home/learner/answers/top5.txt && echo clean || echo no
+      expect: {match: exact, value: clean}
+    - id: top5-correct
+      description: The five stations with the highest weekend revenue, highest first, without repeats
+      type: shell
+      on: tkt-report-01
+      skills: [linux.shell.text-processing]
+      weight: 3
+      command: cmp -s /var/lib/cloudtrain/top5.expected /home/learner/answers/top5.txt && echo correct || echo wrong
+      expect: {match: exact, value: correct}
+  hints:
+    - title: Look before you filter
+      command: head -5 /srv/ticketing/exports/sales.csv
+      body: Note the separator, the header line and which field number is weekend_revenue.
+      cost: 0
+    - title: Sort on one field as a number
+      body: "`sort -t, -k4,4nr` sorts on field 4 only, numerically (`n`), highest first (`r`). Without `n`, 9990 sorts above 12000."
+      cost: 1
+    - title: Repeated rows
+      body: "Identical lines must be removed before taking the top five, otherwise one station can take two places. `uniq` only removes adjacent repeats, so sort first (or use `sort -u`)."
+      cost: 2
+    - title: Only the names
+      body: "`cut -d, -f1` keeps the first field. Skip the header with `tail -n +2`."
+      cost: 2
+  misconceptions:
+    - id: lexical-sort
+      description: Sorts the revenue as text instead of as a number.
+      feedback: "Text order compares character by character, so 9990 comes before 12000. Add n to the sort key."
+      expectFail: [top5-correct]
+      mutation:
+        on: tkt-report-01
+        as: learner
+        run: tail -n +2 /srv/ticketing/exports/sales.csv | sort -u | sort -t, -k4,4r | head -5 | cut -d, -f1 > ~/answers/top5.txt
+    - id: keeps-duplicates
+      description: Ranks without removing the repeated rows.
+      feedback: "The export repeats some rows, so a station appears twice in your top five. Remove duplicates with sort -u or sort | uniq before head."
+      expectFail: [top5-correct]
+      mutation:
+        on: tkt-report-01
+        as: learner
+        run: tail -n +2 /srv/ticketing/exports/sales.csv | sort -t, -k4,4nr | head -5 | cut -d, -f1 > ~/answers/top5.txt
+    - id: wrong-column
+      description: Sorts on the weekday revenue (field 3).
+      feedback: "Count the fields in the header: weekend_revenue is the fourth."
+      expectFail: [top5-correct]
+      mutation:
+        on: tkt-report-01
+        as: learner
+        run: tail -n +2 /srv/ticketing/exports/sales.csv | sort -u | sort -t, -k3,3nr | head -5 | cut -d, -f1 > ~/answers/top5.txt
+    - id: whole-rows
+      description: Writes the whole CSV rows instead of the names.
+      feedback: "The revenue team asked for names only; cut -d, -f1 keeps the first field."
+      expectFail: [names-only, top5-correct]
+      mutation:
+        on: tkt-report-01
+        as: learner
+        run: tail -n +2 /srv/ticketing/exports/sales.csv | sort -u | sort -t, -k4,4nr | head -5 > ~/answers/top5.txt
+    - id: uniq-unsorted
+      description: Uses uniq directly on the file, which only drops adjacent duplicates, then counts the header too.
+      feedback: "The header sorts like any other line unless you remove it; with -n it counts as 0 but still takes part. Skip it explicitly."
+      expectFail: [top5-correct]
+      mutation:
+        on: tkt-report-01
+        as: learner
+        run: sort -t, -k4,4nr /srv/ticketing/exports/sales.csv | head -5 | cut -d, -f1 > ~/answers/top5.txt
+  solution:
+    explanation: |
+      Drop the header, remove repeated rows, sort numerically on the fourth
+      comma-separated field from highest to lowest, keep five rows and cut out the
+      station name.
+    steps:
+      - on: tkt-report-01
+        as: learner
+        run: |
+          mkdir -p ~/answers
+          tail -n +2 /srv/ticketing/exports/sales.csv | sort | uniq | sort -t, -k4,4nr | head -5 | cut -d, -f1 > ~/answers/top5.txt
+          cat ~/answers/top5.txt
+    alternatives:
+      - id: awk-dedupe
+        description: Deduplicate and pick the columns with awk, then sort.
+        steps:
+          - on: tkt-report-01
+            as: learner
+            run: awk -F, 'NR > 1 && !seen[$0]++ {print $4 "," $1}' /srv/ticketing/exports/sales.csv | sort -t, -k1,1nr | head -5 | cut -d, -f2 > ~/answers/top5.txt
+      - id: grep-header
+        description: Remove the header with grep -v and use sort -u.
+        steps:
+          - on: tkt-report-01
+            as: learner
+            run: grep -v '^station,' /srv/ticketing/exports/sales.csv | sort -u -t, -k1,5 | sort -t, -k4nr | cut -d, -f1 | head -n 5 > ~/answers/top5.txt

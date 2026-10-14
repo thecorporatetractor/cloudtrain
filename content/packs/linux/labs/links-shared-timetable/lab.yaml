@@ -1,0 +1,203 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: links-shared-timetable
+  title: Publish the current timetable with links
+  domain: linux
+  frameworks: [lpic1:devices-filesystems, rhcsa-aligned:essential-tools]
+  difficulty: easy
+  estimatedMinutes: 8
+  tags: [links, symlink, hardlink, inode]
+  version: 1
+spec:
+  description: |
+    The Tallowmere Rail timetable office has approved one of the drafts in
+    `/srv/timetable/drafts/` (the file `APPROVED` there names it). Publish it
+    without copying it:
+
+    1. Create a **hard link** to the approved draft in `/srv/timetable/archive/`,
+       keeping the draft's file name.
+    2. Make `/srv/timetable/current` a **symbolic link** that opens the approved
+       timetable.
+
+    Every season the planners rename the drafts directory (for example
+    `drafts` -> `drafts-2026-winter`). Both `current` and the archive copy must
+    keep showing the approved timetable after such a rename, so think about what
+    your symbolic link points at. Do not rename or modify the drafts yourself.
+  objectives:
+    - Tell hard links and symbolic links apart by inode and target
+    - Create links that survive a rename of the original directory
+  params:
+    approved:
+      type: choice
+      values: [winter-2026-v2.tt, winter-2026-v3.tt]
+  topology:
+    entry: tr-timetable-02
+    nodes:
+      - name: tr-timetable-02
+        driver: container
+        image: linux-pod-el:10
+        access: [shell]
+  setup:
+    - on: tr-timetable-02
+      run: |
+        set -eu
+        rm -rf /srv/timetable
+        D=/srv/timetable/drafts
+        mkdir -p $D /srv/timetable/archive
+        for v in 1 2 3; do
+          i=0; : > $D/winter-2026-v$v.tt
+          while [ $i -lt $((40 + v * 7)) ]; do i=$((i+1)); printf 'v%d TR%04d dep %02d:%02d\n' $v $((2000+i)) $((5+i%18)) $((i*11%60)) >> $D/winter-2026-v$v.tt; done
+        done
+        echo '{{approved}}' > $D/APPROVED
+        printf 'Archive of published timetables. Hard links only, never copies.\n' > /srv/timetable/archive/README
+        chown -R learner:learner /srv/timetable
+        mkdir -p /var/lib/cloudtrain
+        stat -c '%i' $D/{{approved}} > /var/lib/cloudtrain/approved.inode
+        (cd $D && sha256sum winter-2026-v*.tt APPROVED) > /var/lib/cloudtrain/drafts.sha256
+  checks:
+    - id: archive-hardlink
+      description: archive/ holds a hard link (same inode) to the approved draft, under the draft's name
+      type: shell
+      on: tr-timetable-02
+      skills: [linux.files.links-archives]
+      weight: 2
+      command: |
+        f=/srv/timetable/archive/{{approved}}
+        [ -f "$f" ] && [ ! -L "$f" ] && [ "$(stat -c %i "$f")" = "$(cat /var/lib/cloudtrain/approved.inode)" ] && echo linked || echo no
+      expect: {match: exact, value: linked}
+    - id: current-symlink
+      description: /srv/timetable/current is a symbolic link
+      type: shell
+      on: tr-timetable-02
+      skills: [linux.files.links-archives]
+      command: test -L /srv/timetable/current && echo symlink || echo no
+      expect: {match: exact, value: symlink}
+    - id: current-opens-approved
+      description: current resolves to the approved timetable
+      type: shell
+      on: tr-timetable-02
+      skills: [linux.files.links-archives]
+      command: |
+        [ -e /srv/timetable/current ] && [ "$(stat -L -c %i /srv/timetable/current)" = "$(cat /var/lib/cloudtrain/approved.inode)" ] && echo approved || echo no
+      expect: {match: exact, value: approved}
+    - id: survives-rename
+      description: current still opens the approved timetable after the drafts directory is renamed
+      type: shell
+      on: tr-timetable-02
+      skills: [linux.files.links-archives]
+      weight: 2
+      command: |
+        # Simulate the seasonal rename on a copy of the link chain: resolve every hop of
+        # current and fail if any hop goes through the drafts directory.
+        p=/srv/timetable/current; n=0
+        while [ -L "$p" ] && [ $n -lt 10 ]; do
+          t=$(readlink "$p"); case $t in /*) ;; *) t=$(dirname "$p")/$t ;; esac
+          p=$(realpath -m -s "$t"); n=$((n+1))
+          case $p in /srv/timetable/drafts|/srv/timetable/drafts/*) echo "via drafts"; exit 0 ;; esac
+        done
+        [ -e "$p" ] && [ "$(stat -L -c %i "$p")" = "$(cat /var/lib/cloudtrain/approved.inode)" ] && echo survives || echo no
+      expect: {match: exact, value: survives}
+    - id: drafts-untouched
+      description: The drafts and the APPROVED note are unchanged and still in drafts/
+      type: shell
+      on: tr-timetable-02
+      skills: [linux.files.links-archives]
+      weight: 0.5
+      command: cd /srv/timetable/drafts 2>/dev/null && sha256sum -c --quiet /var/lib/cloudtrain/drafts.sha256 >/dev/null 2>&1 && echo unchanged || echo changed
+      expect: {match: exact, value: unchanged}
+  hints:
+    - title: Which draft?
+      command: cat /srv/timetable/drafts/APPROVED
+      body: The note names the approved file.
+      cost: 0
+    - title: Two kinds of links
+      body: "`ln TARGET LINK` makes a hard link: a second name for the same inode. `ln -s TARGET LINK` makes a symbolic link: a small file holding a path. `ls -li` shows inode numbers."
+      cost: 1
+    - title: What breaks on a rename
+      body: "A symbolic link stores a path. If that path goes through `drafts/`, renaming `drafts` leaves it dangling. The hard link in `archive/` is not affected by the rename, so point `current` at it."
+      cost: 2
+  misconceptions:
+    - id: copy-not-link
+      description: Copies the draft into the archive with cp.
+      feedback: "cp makes a new file with its own inode; edits to one are not seen in the other and the space is used twice. Use ln (no -s) for a hard link."
+      expectFail: [archive-hardlink]
+      mutation:
+        on: tr-timetable-02
+        as: learner
+        run: |
+          cd /srv/timetable && a=$(cat drafts/APPROVED)
+          cp drafts/$a archive/$a && ln -s archive/$a current
+    - id: symlink-into-drafts
+      description: Points current straight at the draft inside drafts/.
+      feedback: "That works until the planners rename drafts/. Then current dangles. Point it at the hard link in archive/, which does not move."
+      expectFail: [survives-rename]
+      mutation:
+        on: tr-timetable-02
+        as: learner
+        run: |
+          cd /srv/timetable && a=$(cat drafts/APPROVED)
+          ln drafts/$a archive/$a && ln -s /srv/timetable/drafts/$a current
+    - id: current-hardlink
+      description: Makes current a hard link instead of a symbolic link.
+      feedback: "The office wants current to show where it points (ls -l current). Use ln -s for that."
+      expectFail: [current-symlink]
+      mutation:
+        on: tr-timetable-02
+        as: learner
+        run: |
+          cd /srv/timetable && a=$(cat drafts/APPROVED)
+          ln drafts/$a archive/$a && ln archive/$a current
+    - id: archive-symlink
+      description: Makes the archive entry a symbolic link too.
+      feedback: "A symbolic link into drafts/ breaks with the rename, so the archive needs a hard link: a real second name for the inode."
+      expectFail: [archive-hardlink]
+      mutation:
+        on: tr-timetable-02
+        as: learner
+        run: |
+          cd /srv/timetable && a=$(cat drafts/APPROVED)
+          ln -s ../drafts/$a archive/$a && ln -s drafts/$a current
+    - id: wrong-draft
+      description: Links the newest draft instead of the approved one.
+      feedback: "The newest draft is not necessarily the approved one; drafts/APPROVED says which."
+      expectFail: [current-opens-approved, archive-hardlink]
+      mutation:
+        on: tr-timetable-02
+        as: learner
+        run: |
+          cd /srv/timetable && a=$(ls drafts/*.tt | grep -v "$(cat drafts/APPROVED)" | tail -1 | xargs basename)
+          ln drafts/$a archive/$a && ln -s archive/$a current
+  solution:
+    explanation: |
+      The hard link in archive/ is a second name for the approved draft's inode, so it
+      is unaffected by anything that happens to the name in drafts/. The symbolic link
+      current then points at that stable name instead of into drafts/.
+    steps:
+      - on: tr-timetable-02
+        as: learner
+        run: |
+          cd /srv/timetable
+          a=$(cat drafts/APPROVED)
+          ln drafts/$a archive/$a
+          ln -s archive/$a current
+          ls -li drafts/$a archive/$a current
+    alternatives:
+      - id: absolute-symlink
+        description: Use an absolute path for the symbolic link.
+        steps:
+          - on: tr-timetable-02
+            as: learner
+            run: |
+              a=$(cat /srv/timetable/drafts/APPROVED)
+              ln /srv/timetable/drafts/$a /srv/timetable/archive/
+              ln -s /srv/timetable/archive/$a /srv/timetable/current
+      - id: chain-via-archive-dir
+        description: Link with ln -sr (relative path computed by ln) after creating the hard link with cp -l.
+        steps:
+          - on: tr-timetable-02
+            as: learner
+            run: |
+              a=$(cat /srv/timetable/drafts/APPROVED)
+              cp -l /srv/timetable/drafts/$a /srv/timetable/archive/$a
+              ln -sr /srv/timetable/archive/$a /srv/timetable/current

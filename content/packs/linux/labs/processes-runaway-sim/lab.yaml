@@ -1,0 +1,198 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: processes-runaway-sim
+  title: Find and stop the runaway timetable simulation
+  domain: linux
+  frameworks: [rhcsa-aligned:running-systems, lpic1:gnu-commands, linuxplus:services-users]
+  difficulty: easy
+  estimatedMinutes: 10
+  tags: [processes, ps, pstree, kill, renice]
+  version: 1
+spec:
+  description: |
+    The planning box `tr-plan-01` is crawling. Tonight's timetable simulation for
+    `{{timetable}}` was started twice: once properly by the supervisor `tr-planner`,
+    and once more by hand from a shell that has since closed, which left an
+    **orphaned duplicate** (its parent is gone). Both copies of `tt-sim` look alike
+    in `top`.
+
+    1. Find out which `tt-sim` is the **legitimate run** (started by `tr-planner`)
+       and which is the orphan.
+    2. Lower the legitimate run's priority: give it a **nice value of 10**. Leave
+       the supervisor's own priority alone.
+    3. **Terminate only the orphan.** The supervisor and the legitimate run must
+       keep running.
+  objectives:
+    - Read a process tree with ps or pstree
+    - Change the priority of a running process with renice
+    - Send a signal to exactly one process
+  params:
+    timetable:
+      type: choice
+      values: [winter-2026, spring-2027]
+    run:
+      type: int
+      min: 3
+      max: 9
+  topology:
+    entry: tr-plan-01
+    nodes:
+      - name: tr-plan-01
+        driver: container
+        image: linux-pod-el:10
+        access: [shell]
+        resources: {cpu: 1, memoryMiB: 512}
+  setup:
+    - on: tr-plan-01
+      file: {path: /usr/local/bin/tt-sim, source: assets/tt-sim, mode: "0755"}
+    - on: tr-plan-01
+      file: {path: /usr/local/bin/tr-planner, source: assets/tr-planner, mode: "0755"}
+    - on: tr-plan-01
+      run: |
+        set -eu
+        chmod 0755 /usr/local/bin/tt-sim /usr/local/bin/tr-planner
+        pkill -f '^/bin/bash /usr/local/bin/(tt-sim|tr-planner)' || true
+        sleep 1
+        mkdir -p /var/lib/cloudtrain && chmod 0700 /var/lib/cloudtrain
+        # The supervisor and its run, as learner, detached from this exec session.
+        setsid -f runuser -u learner -- /usr/local/bin/tr-planner {{timetable}} {{run}} </dev/null >/dev/null 2>&1
+        # The hand-started duplicate: its launching shell exits at once, so it is orphaned.
+        setsid -f runuser -u learner -- /bin/bash -c '/usr/local/bin/tt-sim --timetable {{timetable}} --run {{run}} </dev/null >/dev/null 2>&1 & exit 0'
+        for i in $(seq 1 20); do
+          [ "$(pgrep -fc '^/bin/bash /usr/local/bin/tt-sim --timetable {{timetable}}')" = 2 ] && break; sleep 0.5
+        done
+        planner=$(pgrep -f '^/bin/bash /usr/local/bin/tr-planner {{timetable}}')
+        legit=$(pgrep -P "$planner" tt-sim)
+        orphan=$(pgrep -f '^/bin/bash /usr/local/bin/tt-sim --timetable {{timetable}}' | grep -vx "$legit")
+        test -n "$planner" && test -n "$legit" && test -n "$orphan"
+        printf 'planner=%s\nlegit=%s\norphan=%s\n' "$planner" "$legit" "$orphan" > /var/lib/cloudtrain/pids
+  checks:
+    - id: orphan-gone
+      description: The orphaned duplicate is no longer running
+      type: shell
+      on: tr-plan-01
+      skills: [linux.processes.management]
+      weight: 2
+      command: |
+        # A killed orphan may linger as a zombie (PID 1 of the pod does not reap); that counts as gone.
+        . /var/lib/cloudtrain/pids; case "$(ps -o stat= -p "$orphan")" in ""|Z*) echo gone ;; *) echo running ;; esac
+      expect: {match: exact, value: gone}
+    - id: legit-running
+      description: The legitimate run is still running
+      type: shell
+      on: tr-plan-01
+      skills: [linux.processes.management]
+      weight: 1.5
+      command: . /var/lib/cloudtrain/pids; case "$(ps -o stat= -p "$legit")" in ""|Z*) echo gone ;; *) echo running ;; esac
+      expect: {match: exact, value: running}
+    - id: planner-running
+      description: The supervisor tr-planner is still running
+      type: shell
+      on: tr-plan-01
+      skills: [linux.processes.management]
+      command: . /var/lib/cloudtrain/pids; case "$(ps -o stat= -p "$planner")" in ""|Z*) echo gone ;; *) echo running ;; esac
+      expect: {match: exact, value: running}
+    - id: legit-niced
+      description: The legitimate run has nice value 10
+      type: shell
+      on: tr-plan-01
+      skills: [linux.processes.management]
+      weight: 1.5
+      command: . /var/lib/cloudtrain/pids; ps -o ni= -p "$legit" | tr -d ' '
+      expect: {match: exact, value: "10"}
+    - id: planner-priority-kept
+      description: The supervisor keeps its default nice value 0
+      type: shell
+      on: tr-plan-01
+      skills: [linux.processes.management]
+      weight: 0.5
+      command: . /var/lib/cloudtrain/pids; ps -o ni= -p "$planner" | tr -d ' '
+      expect: {match: exact, value: "0"}
+  hints:
+    - title: Show the family tree
+      body: "`ps -ef --forest` (or `pstree -p`) draws parents and children. The orphan's parent is PID 1, because orphans are adopted by the first process."
+      command: ps -o pid,ppid,ni,pcpu,args -u learner --forest
+      cost: 1
+    - title: Priority of a running process
+      body: "`nice` only starts new commands. For a running one use `renice -n 10 -p PID`. As a normal user you may only make your own processes nicer (higher numbers)."
+      cost: 1
+    - title: One process, one signal
+      body: "`pkill tt-sim` matches both copies. Use `kill PID` with the orphan's PID."
+      cost: 2
+  misconceptions:
+    - id: pkill-both
+      description: Kills every tt-sim by name.
+      feedback: "Both copies have the same name and arguments. Pick the orphan by its parent (PPID 1) and kill that PID only."
+      expectFail: [legit-running]
+      mutation:
+        on: tr-plan-01
+        as: learner
+        run: pkill tt-sim; sleep 1
+    - id: kill-supervisor
+      description: Kills the supervisor, thinking that stops the duplicate.
+      feedback: "tr-planner is the legitimate parent. Killing it orphans the good run and leaves the duplicate alive."
+      expectFail: [planner-running, orphan-gone]
+      mutation:
+        on: tr-plan-01
+        as: learner
+        run: pkill tr-planner; sleep 1
+    - id: wrong-copy
+      description: Renices and kills the wrong copy (the one under tr-planner).
+      feedback: "The run under tr-planner is the legitimate one; the orphan is the one whose parent is PID 1."
+      expectFail: [legit-running, orphan-gone]
+      mutation:
+        on: tr-plan-01
+        as: learner
+        run: |
+          p=$(pgrep -f '^/bin/bash /usr/local/bin/tr-planner')
+          l=$(pgrep -P "$p" tt-sim); o=$(pgrep tt-sim | grep -vx "$l")
+          renice -n 10 -p "$o"; kill "$l"; sleep 1
+    - id: nice-command
+      description: Runs nice -n 10 on a new command instead of renicing the running process.
+      feedback: "nice launches a new process with the given niceness; it does not touch processes that already run. Use renice."
+      expectFail: [legit-niced]
+      mutation:
+        on: tr-plan-01
+        as: learner
+        run: |
+          o=$(ps -o pid=,ppid=,args= -u learner | awk '$2 == 1 && /tt-sim/ {print $1}')
+          kill "$o"; nice -n 10 true
+    - id: renice-supervisor
+      description: Renices the supervisor (or the whole user) instead of the run.
+      feedback: "A child's niceness is copied at fork time; changing the parent later does not change the running child. Renice the tt-sim PID."
+      expectFail: [legit-niced, planner-priority-kept]
+      mutation:
+        on: tr-plan-01
+        as: learner
+        run: |
+          o=$(ps -o pid=,ppid=,args= -u learner | awk '$2 == 1 && /tt-sim/ {print $1}')
+          kill "$o"; renice -n 10 -p "$(pgrep -f '^/bin/bash /usr/local/bin/tr-planner')"
+  solution:
+    explanation: |
+      In the process tree, the legitimate tt-sim is a child of tr-planner; the
+      duplicate's parent is PID 1 because the shell that started it exited. renice
+      changes the priority of the running child only, and kill sends SIGTERM to the
+      orphan's PID only.
+    steps:
+      - on: tr-plan-01
+        as: learner
+        run: |
+          ps -o pid,ppid,ni,args -u learner --forest
+          legit=$(pgrep -P "$(pgrep -f '^/bin/bash /usr/local/bin/tr-planner')" tt-sim)
+          orphan=$(ps -o pid=,ppid=,args= -u learner | awk '$2 == 1 && /tt-sim/ {print $1}')
+          renice -n 10 -p "$legit"
+          kill "$orphan"
+          sleep 1
+    alternatives:
+      - id: pstree-and-kill-9
+        description: Read the PIDs from pstree and use SIGKILL for the orphan.
+        steps:
+          - on: tr-plan-01
+            as: learner
+            run: |
+              legit=$(pstree -p learner | grep -o 'tr-planner([0-9]*)---tt-sim([0-9]*)' | grep -o 'tt-sim([0-9]*)' | tr -dc 0-9)
+              orphan=$(pgrep tt-sim | grep -vx "$legit")
+              renice 10 "$legit"
+              kill -9 "$orphan"
+              sleep 1

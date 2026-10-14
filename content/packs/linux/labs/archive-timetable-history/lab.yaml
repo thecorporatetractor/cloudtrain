@@ -1,0 +1,224 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: archive-timetable-history
+  title: Package timetable history into compressed archives
+  domain: linux
+  frameworks: [rhcsa-aligned:essential-tools, lpic1:gnu-commands, linuxplus:system-management]
+  difficulty: easy
+  estimatedMinutes: 10
+  tags: [tar, xz, archives, restore]
+  version: 1
+spec:
+  description: |
+    The timetable office at Tallowmere Rail closes its 2025 books. The auditor
+    wants the year's timetables archived and one month restored for spot checks.
+
+    1. Create the **xz-compressed** tar archive `/srv/backup/timetable-2025.tar.xz`
+       of the directory `/srv/timetable/2025`. Member names must start with
+       `2025/` (not with `/srv/...` or `srv/...`), and the archive must record each
+       file's **original owner** (several planners own files).
+    2. Write the archive's member list (`tar -t` output: names only, one per line)
+       to `/srv/backup/timetable-2025.list`.
+    3. Restore **only month {{month}}** from the archive into `/tmp/restore`, so
+       its files end up in `/tmp/restore/2025/{{month}}/`. Restore nothing else.
+
+    Leave `/srv/timetable` itself unchanged.
+  objectives:
+    - Create a compressed tar archive with relative member names
+    - List an archive's contents
+    - Extract part of an archive into another directory
+  params:
+    month:
+      type: choice
+      values: ["03", "06", "11"]
+  topology:
+    entry: tr-timetable-03
+    nodes:
+      - name: tr-timetable-03
+        driver: container
+        image: linux-pod-el:10
+        access: [shell]
+  setup:
+    - on: tr-timetable-03
+      run: |
+        set -eu
+        for u in 4311:planner-ana 4312:planner-joss 4313:planner-mei; do
+          id "${u#*:}" >/dev/null 2>&1 || useradd -M -u "${u%%:*}" -s /sbin/nologin "${u#*:}"
+        done
+        rm -rf /srv/timetable /srv/backup /tmp/restore
+        mkdir -p /srv/backup && chown learner:learner /srv/backup
+        owners="planner-ana planner-joss planner-mei"
+        for m in 01 02 03 04 05 06 07 08 09 10 11 12; do
+          d=/srv/timetable/2025/$m; mkdir -p "$d"
+          i=0
+          for kind in weekday saturday sunday; do
+            i=$((i+1)); f=$d/$kind.tt
+            seq 1 $((20 + i * 3 + ${m#0})) | sed "s/^/2025-$m $kind service TR/" > "$f"
+            chown "$(echo $owners | cut -d' ' -f$(( (i + ${m#0}) % 3 + 1 )))" "$f"
+          done
+        done
+        printf 'Closed 2025-12-31 by the timetable office.\n' > /srv/timetable/2025/CLOSED
+        chmod -R a+rX,go-w /srv/timetable
+        mkdir -p /var/lib/cloudtrain && chmod 0700 /var/lib/cloudtrain
+        (cd /srv/timetable && find 2025 -type f -printf '%p %U %s\n' | sort) > /var/lib/cloudtrain/files
+        (cd /srv/timetable && find 2025 -printf '%p %U %s %T@\n' | sort) > /var/lib/cloudtrain/tree
+  checks:
+    - id: archive-is-xz-tar
+      description: /srv/backup/timetable-2025.tar.xz is an xz-compressed tar archive
+      type: shell
+      on: tr-timetable-03
+      skills: [linux.files.links-archives]
+      command: f=/srv/backup/timetable-2025.tar.xz; xz -t "$f" 2>/dev/null && tar -tJf "$f" >/dev/null 2>&1 && echo xz-tar || echo no
+      expect: {match: exact, value: xz-tar}
+    - id: members-relative
+      description: Every member name starts with 2025/ and every 2025 file is in the archive
+      type: shell
+      on: tr-timetable-03
+      skills: [linux.files.links-archives]
+      weight: 1.5
+      command: |
+        f=/srv/backup/timetable-2025.tar.xz
+        tar -tJf "$f" 2>/dev/null | grep -v '^2025\(/\|$\)' | head -1 | grep -q . && { echo foreign; exit 0; }
+        tar -tJf "$f" 2>/dev/null | sed 's#/$##' | sort > /tmp/.members
+        cut -d' ' -f1 /var/lib/cloudtrain/files | while read -r p; do grep -qxF "$p" /tmp/.members || echo "missing $p"; done | head -1 | grep . || echo complete
+        rm -f /tmp/.members
+      expect: {match: exact, value: complete}
+    - id: owners-recorded
+      description: The archive records each file's original owner
+      type: shell
+      on: tr-timetable-03
+      skills: [linux.files.links-archives]
+      command: |
+        tar --numeric-owner -tvJf /srv/backup/timetable-2025.tar.xz 2>/dev/null | awk '$1 !~ /^d/ {split($2, o, "/"); print $6, o[1]}' | sort > /tmp/.owners
+        awk '{print $1, $2}' /var/lib/cloudtrain/files | cmp -s - /tmp/.owners && echo recorded || echo different; rm -f /tmp/.owners
+      expect: {match: exact, value: recorded}
+    - id: list-written
+      description: /srv/backup/timetable-2025.list holds the archive's member names, one per line
+      type: shell
+      on: tr-timetable-03
+      skills: [linux.files.links-archives]
+      command: |
+        [ -s /srv/backup/timetable-2025.list ] || { echo missing; exit 0; }
+        tar -tJf /srv/backup/timetable-2025.tar.xz 2>/dev/null | sort > /tmp/.a; sort /srv/backup/timetable-2025.list > /tmp/.b
+        cmp -s /tmp/.a /tmp/.b && echo match || echo differs; rm -f /tmp/.a /tmp/.b
+      expect: {match: exact, value: match}
+    - id: month-restored
+      description: Month {{month}} is restored into /tmp/restore/2025/{{month}}/ with identical files
+      type: shell
+      on: tr-timetable-03
+      skills: [linux.files.links-archives]
+      weight: 1.5
+      command: |
+        for f in /srv/timetable/2025/{{month}}/*; do cmp -s "$f" "/tmp/restore/2025/{{month}}/$(basename "$f")" || echo "missing $f"; done | head -1 | grep . || echo restored
+      expect: {match: exact, value: restored}
+    - id: only-that-month
+      description: Nothing but month {{month}} was restored
+      type: shell
+      on: tr-timetable-03
+      skills: [linux.files.links-archives]
+      command: (cd /tmp/restore 2>/dev/null && find . -type f -printf '%P\n' | grep -v '^2025/{{month}}/' | wc -l) || echo missing
+      expect: {match: exact, value: "0"}
+    - id: source-unchanged
+      description: /srv/timetable is unchanged
+      type: shell
+      on: tr-timetable-03
+      skills: [linux.files.links-archives]
+      weight: 0.5
+      command: (cd /srv/timetable && find 2025 -printf '%p %U %s %T@\n' | sort | cmp -s /var/lib/cloudtrain/tree - && echo unchanged || echo changed)
+      expect: {match: exact, value: unchanged}
+  hints:
+    - title: Change directory inside tar
+      body: "`tar -C /srv/timetable -cJf ARCHIVE 2025` changes to /srv/timetable first, so members are named 2025/... . J selects xz."
+      cost: 1
+    - title: Owners are recorded by default
+      body: "tar stores owner and group of every member without any option. `tar -tvf` shows them. Do not override them with --owner."
+      cost: 1
+    - title: Extract one directory
+      body: "Name the member to extract after the archive: `tar -xJf ARCHIVE -C /tmp/restore 2025/MM`. The target directory must exist."
+      cost: 2
+  misconceptions:
+    - id: absolute-members
+      description: Archives /srv/timetable/2025 by its full path.
+      feedback: "tar strips the leading / and stores srv/timetable/2025/..., so a restore lands in the wrong place. Use -C /srv/timetable and archive 2025."
+      expectFail: [members-relative]
+      mutation:
+        on: tr-timetable-03
+        as: learner
+        run: |
+          tar -cJf /srv/backup/timetable-2025.tar.xz /srv/timetable/2025
+          tar -tJf /srv/backup/timetable-2025.tar.xz > /srv/backup/timetable-2025.list
+    - id: gzip-not-xz
+      description: Uses -z (gzip) and only names the file .tar.xz.
+      feedback: "The extension does not compress anything. -z is gzip, -j bzip2, -J xz."
+      expectFail: [archive-is-xz-tar]
+      mutation:
+        on: tr-timetable-03
+        as: learner
+        run: |
+          tar -C /srv/timetable -czf /srv/backup/timetable-2025.tar.xz 2025
+          tar -tzf /srv/backup/timetable-2025.tar.xz > /srv/backup/timetable-2025.list
+    - id: owner-overridden
+      description: Overrides the recorded owner with --owner.
+      feedback: "--owner replaces every member's owner, so the auditor can no longer see who maintained which timetable."
+      expectFail: [owners-recorded]
+      mutation:
+        on: tr-timetable-03
+        as: learner
+        run: |
+          tar -C /srv/timetable --owner=learner --group=learner -cJf /srv/backup/timetable-2025.tar.xz 2025
+          tar -tJf /srv/backup/timetable-2025.tar.xz > /srv/backup/timetable-2025.list
+    - id: verbose-list
+      description: Writes the long listing (tar -tv) instead of the names.
+      feedback: "The auditor's tools expect one member name per line; -v adds permissions, owners, sizes and dates."
+      expectFail: [list-written]
+      mutation:
+        on: tr-timetable-03
+        as: learner
+        run: |
+          tar -C /srv/timetable -cJf /srv/backup/timetable-2025.tar.xz 2025
+          tar -tvJf /srv/backup/timetable-2025.tar.xz > /srv/backup/timetable-2025.list
+    - id: restore-everything
+      description: Extracts the whole archive into /tmp/restore.
+      feedback: "Only one month was requested. Name the member directory after the archive to extract just that."
+      expectFail: [only-that-month]
+      mutation:
+        on: tr-timetable-03
+        as: learner
+        run: |
+          tar -C /srv/timetable -cJf /srv/backup/timetable-2025.tar.xz 2025
+          mkdir -p /tmp/restore && tar -xJf /srv/backup/timetable-2025.tar.xz -C /tmp/restore
+  solution:
+    explanation: |
+      -C makes the member names relative (2025/...), -J compresses with xz, and owners
+      are recorded by default. tar -t lists names only; naming 2025/MM after the
+      archive extracts just that month, and -C /tmp/restore puts it there.
+    steps:
+      - on: tr-timetable-03
+        as: learner
+        run: |
+          tar -C /srv/timetable -cJf /srv/backup/timetable-2025.tar.xz 2025
+          tar -tf /srv/backup/timetable-2025.tar.xz > /srv/backup/timetable-2025.list
+          mkdir -p /tmp/restore
+          tar -xf /srv/backup/timetable-2025.tar.xz -C /tmp/restore 2025/{{month}}
+          ls -l /tmp/restore/2025/{{month}}
+    alternatives:
+      - id: pipe-through-xz
+        description: Create an uncompressed tar on stdout and compress it with xz; restore with a wildcard.
+        steps:
+          - on: tr-timetable-03
+            as: learner
+            run: |
+              cd /srv/timetable && tar -cf - 2025 | xz -6 > /srv/backup/timetable-2025.tar.xz
+              xz -dc /srv/backup/timetable-2025.tar.xz | tar -t > /srv/backup/timetable-2025.list
+              mkdir -p /tmp/restore && cd /tmp/restore && tar -xJf /srv/backup/timetable-2025.tar.xz --wildcards '2025/{{month}}/*'
+      - id: long-options
+        description: The same with long options.
+        steps:
+          - on: tr-timetable-03
+            as: learner
+            run: |
+              tar --create --xz --file=/srv/backup/timetable-2025.tar.xz --directory=/srv/timetable 2025
+              tar --list --file=/srv/backup/timetable-2025.tar.xz > /srv/backup/timetable-2025.list
+              mkdir -p /tmp/restore
+              tar --extract --file=/srv/backup/timetable-2025.tar.xz --directory=/tmp/restore 2025/{{month}}/

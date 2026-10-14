@@ -1,0 +1,182 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: net-inspect-ticket-gate
+  title: Report which ports a ticket gate host listens on
+  domain: linux
+  frameworks: [lpic1:networking, linuxplus:system-management]
+  difficulty: easy
+  estimatedMinutes: 10
+  tags: [networking, ip, ss, routes, ports]
+  version: 1
+spec:
+  description: |
+    The network team is documenting the ticket-gate controllers at Tallowmere
+    Central. Log in to `tkt-gate-01` and fill in `~/answers/gate.txt` with:
+
+    ```
+    ip=<the IPv4 address of eth0, without the /prefix>
+    gateway=<the IPv4 address of the default gateway>
+    listen=<port>/<process name>
+    listen=<port>/<process name>
+    ...
+    ```
+
+    with one `listen=` line for **every listening TCP port** on the host
+    (whatever address it is bound to) and the name of the process that owns it.
+    UDP sockets do not count. The order of the `listen=` lines does not matter.
+  objectives:
+    - Read interface addresses with ip addr
+    - Find the default route with ip route
+    - List listening TCP sockets and their processes with ss
+  params:
+    apiPort:
+      type: int
+      min: 8400
+      max: 8499
+    ledgerPort:
+      type: choice
+      values: ["5432", "6432"]
+  topology:
+    entry: tkt-gate-01
+    nodes:
+      - name: tkt-gate-01
+        driver: container
+        image: linux-pod-deb:24.04
+        access: [shell]
+  setup:
+    - on: tkt-gate-01
+      file: {path: /usr/local/lib/tkt/tkt-listener, source: assets/tkt-listener, mode: "0755"}
+    - on: tkt-gate-01
+      run: |
+        set -eu
+        L=/usr/local/lib/tkt
+        chmod 0755 $L/tkt-listener
+        for n in tkt-gate-api tkt-validator tkt-ledger-sync tkt-beacon; do ln -sf tkt-listener $L/$n; done
+        pkill -f '^/usr/bin/python3 /usr/local/lib/tkt/' || true
+        sleep 1
+        start() { setsid -f runuser -u learner -- "$L/$1" "$2" "$3" "$4" </dev/null >/dev/null 2>&1; }
+        start tkt-gate-api tcp 0.0.0.0 {{apiPort}}
+        start tkt-validator tcp 127.0.0.1 7070
+        start tkt-ledger-sync tcp 0.0.0.0 {{ledgerPort}}
+        start tkt-beacon udp 0.0.0.0 6100
+        for i in $(seq 1 20); do [ "$(ss -Htln | wc -l)" -ge 3 ] && break; sleep 0.5; done
+        install -d -o learner -g learner /home/learner/answers
+        rm -f /home/learner/answers/gate.txt
+  checks:
+    - id: ip-address
+      description: ip= holds eth0's IPv4 address without prefix
+      type: shell
+      on: tkt-gate-01
+      skills: [linux.net.troubleshooting]
+      command: |
+        want=$(ip -4 -o addr show dev eth0 | awk '{print $4}' | cut -d/ -f1 | head -1)
+        grep -qx "ip=$want" /home/learner/answers/gate.txt 2>/dev/null && echo match || echo "no match"
+      expect: {match: exact, value: match}
+    - id: gateway
+      description: gateway= holds the default gateway
+      type: shell
+      on: tkt-gate-01
+      skills: [linux.net.troubleshooting]
+      command: |
+        want=$(ip -4 route show default | awk '{print $3; exit}')
+        grep -qx "gateway=$want" /home/learner/answers/gate.txt 2>/dev/null && echo match || echo "no match"
+      expect: {match: exact, value: match}
+    - id: listening-tcp
+      description: The listen= lines are exactly the listening TCP ports with their process names
+      type: shell
+      on: tkt-gate-01
+      skills: [linux.net.troubleshooting]
+      weight: 2
+      command: |
+        # As the services' owner: root in the pod lacks CAP_SYS_PTRACE, so ss -p shows no
+        # processes of other users to it.
+        runuser -u learner -- ss -Htlnp | awk '{n = split($4, a, ":"); p = a[n]; match($0, /users:\(\("[^"]+"/); proc = substr($0, RSTART + 9, RLENGTH - 10); print "listen=" p "/" proc}' | sort -u > /tmp/.want
+        grep '^listen=' /home/learner/answers/gate.txt 2>/dev/null | sort -u > /tmp/.got
+        [ -s /tmp/.want ] && cmp -s /tmp/.want /tmp/.got && echo match || echo "no match"; rm -f /tmp/.want /tmp/.got
+      expect: {match: exact, value: match}
+  hints:
+    - title: Addresses
+      body: "`ip -4 addr show eth0` (short: `ip -4 a s eth0`) prints the address as ADDRESS/PREFIX. Write only the part before the slash."
+      cost: 1
+    - title: Default route
+      body: "`ip route` lists the routing table; the line starting with `default via` names the gateway."
+      command: ip route show default
+      cost: 1
+    - title: Listening sockets
+      body: "`ss -tlnp`: t = TCP only, l = listening, n = numeric ports, p = processes. 127.0.0.1:7070 is listening too, just not reachable from outside. You see the process names of your own processes."
+      command: ss -tlnp
+      cost: 2
+  misconceptions:
+    - id: includes-udp
+      description: Lists UDP sockets too (ss -lnp without -t, or -u).
+      feedback: "The network team asked for TCP listeners. -t restricts ss to TCP."
+      expectFail: [listening-tcp]
+      mutation:
+        on: tkt-gate-01
+        as: learner
+        run: |
+          { echo "ip=$(ip -4 -o addr show dev eth0 | awk '{print $4}' | cut -d/ -f1)"
+            echo "gateway=$(ip route show default | awk '{print $3}')"
+            ss -Hlnp | awk '{n = split($5, a, ":"); match($0, /users:\(\("[^"]+"/); print "listen=" a[n] "/" substr($0, RSTART + 9, RLENGTH - 10)}'
+          } > ~/answers/gate.txt
+    - id: public-only
+      description: Leaves out the listener bound to 127.0.0.1.
+      feedback: "A socket bound to the loopback address is still a listening TCP port on this host; it is only unreachable from other hosts."
+      expectFail: [listening-tcp]
+      mutation:
+        on: tkt-gate-01
+        as: learner
+        run: |
+          { echo "ip=$(ip -4 -o addr show dev eth0 | awk '{print $4}' | cut -d/ -f1)"
+            echo "gateway=$(ip route show default | awk '{print $3}')"
+            ss -Htlnp | grep -v '127.0.0.1' | awk '{n = split($4, a, ":"); match($0, /users:\(\("[^"]+"/); print "listen=" a[n] "/" substr($0, RSTART + 9, RLENGTH - 10)}'
+          } > ~/answers/gate.txt
+    - id: with-prefix
+      description: Writes the address with its prefix length (CIDR notation).
+      feedback: "ip addr shows ADDRESS/PREFIX; the form asks for the address alone."
+      expectFail: [ip-address]
+      mutation:
+        on: tkt-gate-01
+        as: learner
+        run: |
+          { echo "ip=$(ip -4 -o addr show dev eth0 | awk '{print $4}')"
+            echo "gateway=$(ip route show default | awk '{print $3}')"
+          } > ~/answers/gate.txt
+    - id: loopback-address
+      description: Writes 127.0.0.1 (or the hostname) as the host's address.
+      feedback: "127.0.0.1 exists on every host. The form wants the address of eth0."
+      expectFail: [ip-address]
+      mutation:
+        on: tkt-gate-01
+        as: learner
+        run: echo "ip=127.0.0.1" > ~/answers/gate.txt
+  solution:
+    explanation: |
+      ip addr gives eth0's address (strip the /prefix), the default route names the
+      gateway, and ss -tlnp lists every listening TCP socket with the process owning
+      it; the port is the part after the last colon of the local address.
+    steps:
+      - on: tkt-gate-01
+        as: learner
+        run: |
+          ip -4 addr show eth0; ip route; ss -tlnp
+          {
+            echo "ip=$(ip -4 -o addr show dev eth0 | awk '{print $4}' | cut -d/ -f1)"
+            echo "gateway=$(ip route show default | awk '{print $3}')"
+            ss -Htlnp | sed -E 's/.*:([0-9]+) .*users:\(\("([^"]+)".*/listen=\1\/\2/'
+          } > ~/answers/gate.txt
+          cat ~/answers/gate.txt
+    alternatives:
+      - id: by-hand
+        description: Read the values from the command output and type them in, e.g. with printf.
+        steps:
+          - on: tkt-gate-01
+            as: learner
+            run: |
+              a=$(hostname -I | awk '{print $1}')
+              g=$(ip r | awk '/^default/ {print $3}')
+              printf 'ip=%s\ngateway=%s\n' "$a" "$g" > ~/answers/gate.txt
+              ss -tlnp | tail -n +2 | while read -r st rq sq local peer procs; do
+                echo "listen=${local##*:}/$(echo "$procs" | cut -d'"' -f2)"
+              done >> ~/answers/gate.txt

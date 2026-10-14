@@ -1,0 +1,159 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: signal-box-levels-1
+  title: 'Signal box challenge: levels 1 to 5'
+  domain: linux
+  frameworks: [lpic1:gnu-commands]
+  difficulty: easy
+  estimatedMinutes: 25
+  tags: [challenge, ctf, find, file, ls]
+  version: 1
+spec:
+  description: |
+    The Tallowmere Rail signal box has been locked by a retiring signaller who
+    loved puzzles. Each level hides the password of the next one in a different
+    way. Work through all five:
+
+    1. Start in `~/signalbox/level1` and read its `README`.
+    2. When you find a level's password, unlock the next level with
+       `sb-unlock NEXT_LEVEL PASSWORD`; it appears as `~/signalbox/levelN`.
+    3. Level 5 leads to the **final token**. Write it (just the token) to
+       `~/answers/signal-box-1.txt`.
+
+    Passwords are 24 hexadecimal characters. Only `ls`, `cat`, `cd`, `file`,
+    `find` and friends are needed.
+  objectives:
+    - Show hidden files and read awkwardly named files
+    - Identify file types with file
+    - Search by size, permissions and ownership with find
+  params:
+    key:
+      type: int
+      min: 100000
+      max: 999999
+  topology:
+    entry: tr-signalbox-01
+    nodes:
+      - name: tr-signalbox-01
+        driver: container
+        image: linux-pod-deb:24.04
+        access: [shell]
+  setup:
+    - on: tr-signalbox-01
+      file: {path: /usr/local/bin/sb-unlock, source: assets/sb-unlock, mode: "0755"}
+    - on: tr-signalbox-01
+      file: {path: /var/lib/cloudtrain/build-levels.sh, source: assets/build-levels.sh, mode: "0700"}
+    - on: tr-signalbox-01
+      run: |
+        set -eu
+        chmod 0755 /usr/local/bin/sb-unlock; chmod 0700 /var/lib/cloudtrain /var/lib/cloudtrain/build-levels.sh
+        bash /var/lib/cloudtrain/build-levels.sh {{key}}
+        install -d -o learner -g learner /home/learner/answers
+        rm -f /home/learner/answers/signal-box-1.txt
+  checks:
+    - id: reached-level-3
+      description: Levels 2 and 3 are unlocked
+      type: shell
+      on: tr-signalbox-01
+      skills: [linux.shell.navigation]
+      weight: 0.5
+      command: test -f /home/learner/signalbox/level3/README && echo yes || echo no
+      expect: {match: exact, value: "yes"}
+    - id: reached-level-5
+      description: Levels 4 and 5 are unlocked
+      type: shell
+      on: tr-signalbox-01
+      skills: [linux.files.find-locate]
+      command: test -f /home/learner/signalbox/level5/README && echo yes || echo no
+      expect: {match: exact, value: "yes"}
+    - id: final-token
+      description: ~/answers/signal-box-1.txt holds the final token
+      type: shell
+      on: tr-signalbox-01
+      skills: [linux.files.find-locate]
+      weight: 2
+      command: |
+        want=$(printf 'sb-%s-%s' {{key}} 5 | sha256sum | cut -c1-24)
+        [ "$(tr -d '[:space:]' < /home/learner/answers/signal-box-1.txt 2>/dev/null)" = "$want" ] && echo correct || echo wrong
+      expect: {match: exact, value: correct}
+  hints:
+    - title: Level 1
+      body: "Files whose names start with a dot are hidden from plain ls. `ls -a` shows them."
+      cost: 1
+    - title: Level 2
+      body: "Many programs read standard input when given `-`. Give the file a path instead: `cat ./-`."
+      cost: 1
+    - title: Level 3
+      body: "`file` reports what a file contains. File names starting with - need `./` too: `file ./inhere/*`."
+      cost: 1
+    - title: Level 4
+      body: "`find yard -type f -size 1033c ! -executable` combines size in bytes (c) and a negated test."
+      cost: 2
+    - title: Level 5
+      body: "`find /srv/signalbox -user signal5 -group signalbox -size 25c` - and remember hidden files count too."
+      cost: 2
+  misconceptions:
+    - id: wrong-owner-match
+      description: Matches only the user (not the group) at level 5 and takes the first file found.
+      feedback: "Several files belong to signal5; only one also belongs to group signalbox and has the right size. Combine all three tests."
+      expectFail: [final-token]
+      mutation:
+        on: tr-signalbox-01
+        as: learner
+        run: |
+          bash <<'EOS'
+          set -e
+          sb-unlock 2 "$(cat ~/signalbox/level1/.lever-frame)"
+          sb-unlock 3 "$(cat ~/signalbox/level2/-)"
+          for f in ~/signalbox/level3/inhere/*; do file "$f" | grep -q text && p=$(cat "$f"); done; sb-unlock 4 "$p"
+          sb-unlock 5 "$(head -1 "$(find ~/signalbox/level4/yard -type f -size 1033c ! -executable)")"
+          cat "$(find /srv/signalbox -type f -user signal5 -size 25c | sort | head -1)" > ~/answers/signal-box-1.txt
+          EOS
+    - id: guessed-token
+      description: Submits a level password instead of the final token.
+      feedback: "The answer is the token found through level 5, not the password of an earlier level."
+      expectFail: [final-token, reached-level-5]
+      mutation:
+        on: tr-signalbox-01
+        as: learner
+        run: cat ~/signalbox/level1/.lever-frame > ~/answers/signal-box-1.txt
+  solution:
+    explanation: |
+      Level 1 hides the password in a dotfile (ls -a), level 2 in a file named -
+      (cat ./-), level 3 in the only text file among data files (file), level 4 in the
+      one non-executable 1033-byte file (find -size 1033c ! -executable), and level 5
+      in the one file under /srv/signalbox owned by signal5:signalbox with 25 bytes.
+    steps:
+      - on: tr-signalbox-01
+        as: learner
+        run: |
+          bash <<'EOS'
+          set -e
+          cd ~/signalbox
+          sb-unlock 2 "$(cat level1/.lever-frame)"
+          sb-unlock 3 "$(cat level2/-)"
+          sb-unlock 4 "$(cat "$(file level3/inhere/* | grep ASCII | cut -d: -f1)")"
+          sb-unlock 5 "$(head -1 "$(find level4/yard -type f -size 1033c ! -executable)")"
+          find /srv/signalbox -type f -user signal5 -group signalbox -size 25c -exec cat {} \; > ~/answers/signal-box-1.txt
+          cat ~/answers/signal-box-1.txt
+          EOS
+    alternatives:
+      - id: ls-and-stat
+        description: Use ls -la, stat and grep instead of find for the last two levels.
+        steps:
+          - on: tr-signalbox-01
+            as: learner
+            run: |
+              bash <<'EOS'
+              set -e
+              cd ~/signalbox
+              sb-unlock 2 "$(ls -a level1 | grep '^\.l' | sed 's#^#level1/#' | xargs cat)"
+              sb-unlock 3 "$(cat -- level2/-)"
+              sb-unlock 4 "$(for f in level3/inhere/*; do [ "$(file -b --mime-encoding -- "$f")" = us-ascii ] && cat -- "$f"; done | head -1)"
+              p=$(for f in level4/yard/*/.*; do [ -f "$f" ] && [ ! -x "$f" ] && [ "$(stat -c %s "$f")" = 1033 ] && head -1 "$f"; done; true)
+              sb-unlock 5 "$p"
+              for f in /srv/signalbox/*/.* /srv/signalbox/*/*; do
+                if [ -f "$f" ] && [ "$(stat -c '%U:%G:%s' "$f")" = signal5:signalbox:25 ]; then cat "$f"; fi
+              done > ~/answers/signal-box-1.txt
+              EOS
