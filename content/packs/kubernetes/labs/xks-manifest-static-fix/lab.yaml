@@ -1,0 +1,137 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xks-manifest-static-fix
+  title: Fix risky settings found by static analysis
+  domain: kubernetes
+  frameworks: [cks:supply-chain-security]
+  difficulty: medium
+  estimatedMinutes: 7
+  tags: [exam, static-analysis, securitycontext]
+  version: 1
+spec:
+  description: |
+    Context: `qm-archive` (`kubectl config use-context qm-archive`).
+
+    The manifest `~/exam/parcel-router.yaml` on your workstation fails the
+    analyser `qm-kscan` with two findings.
+
+    1. Fix both findings **in the file** so that
+       `qm-kscan ~/exam/parcel-router.yaml` reports 0 findings. Change only
+       what is needed: keep the image, command, replicas and user settings.
+    2. Apply the fixed manifest. Its Deployment must become available in
+       namespace `parcel-routing`.
+  objectives:
+    - Interpret analyser findings and fix them in a manifest
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-archive
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: qm-archive
+  setup:
+    - on: workstation
+      file: {path: /usr/local/bin/qm-kscan, source: assets/qm-kscan, mode: "0755"}
+    - on: workstation
+      file: {path: /home/learner/exam/parcel-router.yaml, source: assets/parcel-router.yaml, mode: "0644"}
+    - on: workstation
+      run: chown -R learner:learner /home/learner/exam
+    - on: qm-archive
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: parcel-routing}
+  teardown:
+    - on: qm-archive
+      run: kubectl delete namespace parcel-routing --ignore-not-found --wait=false
+  checks:
+    - id: scan-clean
+      description: qm-kscan reports 0 findings for the manifest
+      type: shell
+      on: workstation
+      skills: [k8s.security.static-analysis]
+      weight: 2
+      command: runuser -u learner -- qm-kscan /home/learner/exam/parcel-router.yaml 2>&1 | tail -n1
+      expect: {match: exact, value: "qm-kscan: 1 file(s) scanned, 0 finding(s)"}
+    - id: rest-unchanged
+      description: Image, command, replicas and user settings are unchanged in the file
+      type: shell
+      on: workstation
+      skills: [k8s.security.static-analysis]
+      command: |
+        yq -o=json '.' /home/learner/exam/parcel-router.yaml 2>/dev/null | jq -r '.spec as $s | $s.template.spec as $p |
+          "\($s.replicas)|\($p.containers[0].image)|\($p.containers[0].command | join(" "))|\($p.securityContext.runAsNonRoot // $p.containers[0].securityContext.runAsNonRoot)|\($p.securityContext.runAsUser // $p.containers[0].securityContext.runAsUser)"'
+      expect: {match: exact, value: "2|busybox:1.37|sh -c while true; do echo routing; sleep 30; done|true|1000"}
+    - id: applied
+      description: The live Deployment has neither hostNetwork nor privilege escalation and is available
+      type: shell
+      on: qm-archive
+      skills: [k8s.security.static-analysis]
+      weight: 2
+      timeoutSec: 60
+      command: |
+        kubectl -n parcel-routing rollout status deploy/parcel-router --timeout=40s >/dev/null 2>&1 || { echo "not available"; exit 0; }
+        kubectl -n parcel-routing get deploy parcel-router -o json | jq -r '.spec.template.spec | "hostNetwork=\(.hostNetwork // false) escalation=\(.containers[0].securityContext.allowPrivilegeEscalation // "unset")"'
+      expect: {match: regex, value: "^hostNetwork=false escalation=(false|unset)$"}
+  misconceptions:
+    - id: one-of-two
+      description: Fixes only the privilege escalation finding.
+      feedback: The analyser reported two findings; hostNetwork must go as well.
+      expectFail: [scan-clean, applied]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          yq -i '.spec.template.spec.containers[0].securityContext.allowPrivilegeEscalation = false' ~/exam/parcel-router.yaml
+          kubectl config use-context qm-archive
+          kubectl apply -f ~/exam/parcel-router.yaml
+    - id: fixed-but-not-applied
+      description: Fixes the file but never applies it.
+      feedback: The task ends with the fixed Deployment running.
+      expectFail: [applied]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          yq -i 'del(.spec.template.spec.hostNetwork) | .spec.template.spec.containers[0].securityContext.allowPrivilegeEscalation = false' ~/exam/parcel-router.yaml
+    - id: dropped-user-settings
+      description: Replaces the whole securityContext, losing runAsNonRoot and the user.
+      feedback: Change only the two flagged settings; the user settings were already correct.
+      expectFail: [rest-unchanged]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          yq -i 'del(.spec.template.spec.hostNetwork) | del(.spec.template.spec.securityContext) | .spec.template.spec.containers[0].securityContext = {"allowPrivilegeEscalation": false}' ~/exam/parcel-router.yaml
+          kubectl config use-context qm-archive
+          kubectl apply -f ~/exam/parcel-router.yaml || true
+  solution:
+    explanation: Remove hostNetwork (or set it false) and set allowPrivilegeEscalation to false, rescan, then apply.
+    steps:
+      - on: workstation
+        as: learner
+        run: |
+          yq -i 'del(.spec.template.spec.hostNetwork) | .spec.template.spec.containers[0].securityContext.allowPrivilegeEscalation = false' ~/exam/parcel-router.yaml
+          qm-kscan ~/exam/parcel-router.yaml
+          kubectl config use-context qm-archive
+          kubectl apply -f ~/exam/parcel-router.yaml
+          kubectl -n parcel-routing rollout status deploy/parcel-router --timeout=120s
+    alternatives:
+      - id: explicit-false
+        description: Set hostNetwork false explicitly and remove the escalation field.
+        steps:
+          - on: workstation
+            as: learner
+            run: |
+              yq -i '.spec.template.spec.hostNetwork = false | del(.spec.template.spec.containers[0].securityContext.allowPrivilegeEscalation)' ~/exam/parcel-router.yaml
+              qm-kscan ~/exam/parcel-router.yaml
+              kubectl config use-context qm-archive
+              kubectl apply -f ~/exam/parcel-router.yaml
+              kubectl -n parcel-routing rollout status deploy/parcel-router --timeout=120s

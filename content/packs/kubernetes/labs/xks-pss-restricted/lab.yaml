@@ -1,0 +1,174 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xks-pss-restricted
+  title: Enforce restricted Pod Security on a namespace
+  domain: kubernetes
+  frameworks: [cks:microservice-vulnerabilities]
+  difficulty: medium
+  estimatedMinutes: 8
+  tags: [exam, pod-security-admission, restricted, securitycontext]
+  version: 1
+spec:
+  description: |
+    Context: `qm-archive` (`kubectl config use-context qm-archive`).
+
+    1. Enforce the **restricted** Pod Security Standard on namespace
+       `partner-apps`.
+    2. Fix the Deployment `partner-sync` in that namespace so that its Pods
+       are admitted under that level and all {{replicas}} replicas run the
+       updated template. Keep the image and command; use UID {{uid}} where a
+       user ID is needed.
+  objectives:
+    - Enforce a Pod Security level with namespace labels
+    - Make a Pod template compliant with the restricted profile
+  params:
+    uid:
+      type: choice
+      values: [1000, 3100, 65532]
+    replicas:
+      type: choice
+      values: [2, 3]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-archive
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: qm-archive
+  setup:
+    - on: qm-archive
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: partner-apps}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: partner-sync, namespace: partner-apps}
+        spec:
+          replicas: {{replicas}}
+          selector: {matchLabels: {app: partner-sync}}
+          template:
+            metadata: {labels: {app: partner-sync}}
+            spec:
+              containers:
+                - name: sync
+                  image: busybox:1.37
+                  command: ["sh", "-c", "while true; do echo syncing partner feeds; sleep 20; done"]
+    - on: qm-archive
+      timeoutSec: 150
+      run: kubectl -n partner-apps rollout status deploy/partner-sync --timeout=140s
+  teardown:
+    - on: qm-archive
+      run: kubectl delete namespace partner-apps --ignore-not-found --wait=false
+  checks:
+    - id: enforce-label
+      description: Namespace partner-apps enforces the restricted level
+      type: k8s-query
+      skills: [k8s.security.pod-security-admission]
+      weight: 2
+      query: {cluster: qm-archive, resource: namespace, name: partner-apps, jsonpath: "{.metadata.labels.pod-security\\.kubernetes\\.io/enforce}"}
+      expect: {match: exact, value: restricted}
+    - id: noncompliant-rejected
+      description: A plain root Pod is rejected in partner-apps
+      type: shell
+      on: qm-archive
+      skills: [k8s.security.pod-security-admission]
+      command: |
+        if out=$(kubectl -n partner-apps run qm-psa-probe --image=busybox:1.37 --restart=Never --dry-run=server -- sleep 1 2>&1); then echo admitted; else
+          case "$out" in *violates*|*forbidden*) echo rejected ;; *) echo "error: $out" ;; esac; fi
+      expect: {match: exact, value: rejected}
+    - id: template-compliant
+      description: The partner-sync Pod template is admitted under the restricted level
+      type: shell
+      on: qm-archive
+      skills: [k8s.security.security-context]
+      weight: 2
+      command: |
+        pod=$(kubectl -n partner-apps get deploy partner-sync -o json \
+          | jq '{apiVersion:"v1",kind:"Pod",metadata:{name:"qm-template-probe",namespace:"partner-apps"},spec:.spec.template.spec}')
+        if out=$(echo "$pod" | kubectl --dry-run=server -n partner-apps create -f - 2>&1); then echo admitted; else echo "rejected: $out" | head -c 300; fi
+      expect: {match: exact, value: admitted}
+    - id: rolled-out
+      description: All {{replicas}} partner-sync replicas run the updated template
+      type: shell
+      on: qm-archive
+      skills: [k8s.security.security-context]
+      weight: 2
+      timeoutSec: 60
+      command: |
+        kubectl -n partner-apps rollout status deploy/partner-sync --timeout=40s >/dev/null 2>&1
+        kubectl -n partner-apps get deploy partner-sync -o jsonpath='{.spec.replicas}/{.status.updatedReplicas}/{.status.availableReplicas}/{.status.unavailableReplicas}'
+      expect: {match: exact, value: "{{replicas}}/{{replicas}}/{{replicas}}/"}
+    - id: image-kept
+      description: partner-sync still runs busybox:1.37
+      type: k8s-query
+      skills: [k8s.security.security-context]
+      weight: 0.5
+      query: {cluster: qm-archive, resource: deployment, name: partner-sync, namespace: partner-apps, jsonpath: "{.spec.template.spec.containers[0].image}"}
+      expect: {match: exact, value: "busybox:1.37"}
+  misconceptions:
+    - id: warn-not-enforce
+      description: Sets the warn label instead of enforce.
+      feedback: warn and audit only report violations; enforce rejects Pods.
+      expectFail: [enforce-label, noncompliant-rejected]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-archive
+          kubectl label ns partner-apps pod-security.kubernetes.io/warn=restricted
+    - id: missing-seccomp
+      description: Fixes user and privilege escalation but forgets the seccomp profile and capability drop.
+      feedback: restricted also requires seccompProfile RuntimeDefault (or Localhost) and capabilities drop ALL.
+      expectFail: [template-compliant, rolled-out]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-archive
+          kubectl label ns partner-apps pod-security.kubernetes.io/enforce=restricted
+          kubectl -n partner-apps patch deploy partner-sync --type=json -p '[{"op":"add","path":"/spec/template/spec/containers/0/securityContext","value":{"runAsNonRoot":true,"runAsUser":{{uid}},"allowPrivilegeEscalation":false}}]'
+    - id: label-only
+      description: Enforces restricted but leaves the Deployment unchanged; the old Pods keep running.
+      feedback: Existing Pods are not evicted, but any new Pod of this template would be rejected. Fix the template.
+      expectFail: [template-compliant]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-archive
+          kubectl label ns partner-apps pod-security.kubernetes.io/enforce=restricted
+  solution:
+    explanation: |
+      Label the namespace with pod-security.kubernetes.io/enforce=restricted, then
+      give the container runAsNonRoot with a numeric UID, allowPrivilegeEscalation
+      false, capabilities drop ALL and the RuntimeDefault seccomp profile.
+    steps:
+      - on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-archive
+          kubectl label ns partner-apps pod-security.kubernetes.io/enforce=restricted --overwrite
+          kubectl -n partner-apps patch deploy partner-sync --type=json -p '[{"op":"add","path":"/spec/template/spec/containers/0/securityContext","value":{"runAsNonRoot":true,"runAsUser":{{uid}},"allowPrivilegeEscalation":false,"capabilities":{"drop":["ALL"]},"seccompProfile":{"type":"RuntimeDefault"}}}]'
+          kubectl -n partner-apps rollout status deploy/partner-sync
+    alternatives:
+      - id: pod-level-context
+        description: Put user and seccomp in the Pod securityContext, and pin the enforce version label.
+        steps:
+          - on: workstation
+            as: learner
+            run: |
+              kubectl config use-context qm-archive
+              kubectl label ns partner-apps pod-security.kubernetes.io/enforce=restricted pod-security.kubernetes.io/enforce-version=latest --overwrite
+              kubectl -n partner-apps patch deploy partner-sync --type=json -p '[
+                {"op":"add","path":"/spec/template/spec/securityContext","value":{"runAsNonRoot":true,"runAsUser":{{uid}},"seccompProfile":{"type":"RuntimeDefault"}}},
+                {"op":"add","path":"/spec/template/spec/containers/0/securityContext","value":{"allowPrivilegeEscalation":false,"capabilities":{"drop":["ALL"]}}}]'
+              kubectl -n partner-apps rollout status deploy/partner-sync

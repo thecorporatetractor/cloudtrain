@@ -1,0 +1,220 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xks-immutable-secret
+  title: Make a Secret immutable and mount it read-only
+  domain: kubernetes
+  frameworks: [cks:microservice-vulnerabilities]
+  difficulty: easy
+  estimatedMinutes: 5
+  tags: [exam, secrets, immutable]
+  version: 1
+spec:
+  description: |
+    Context: `qm-dispatch` (`kubectl config use-context qm-dispatch`).
+
+    In namespace `waybill-signing`:
+
+    1. Make Secret `signing-key` **immutable**. Its data must stay exactly as
+       it is.
+    2. Run the Pod `signer` (keep its name and image) with Secret
+       `signing-key` mounted **read-only** at `/run/signing`. Recreate the Pod
+       if you need to.
+  objectives:
+    - Mark a Secret immutable without changing its data
+    - Mount a Secret as a read-only volume
+  params:
+    keyid:
+      type: choice
+      values: [qm-wb-7f31, qm-wb-a204, qm-wb-c9e8]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-dispatch
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: qm-dispatch
+  setup:
+    - on: qm-dispatch
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: waybill-signing}
+        ---
+        apiVersion: v1
+        kind: Secret
+        metadata: {name: signing-key, namespace: waybill-signing}
+        stringData:
+          key-id: "{{keyid}}"
+          key.pem: |
+            -----BEGIN QUILLMOOR TEST KEY-----
+            {{keyid}}-not-a-real-key
+            -----END QUILLMOOR TEST KEY-----
+        ---
+        apiVersion: v1
+        kind: Pod
+        metadata: {name: signer, namespace: waybill-signing, labels: {app: signer}}
+        spec:
+          containers:
+            - {name: signer, image: busybox:1.37, command: ["sh", "-c", "while true; do sleep 30; done"]}
+    - on: qm-dispatch
+      timeoutSec: 120
+      run: |
+        kubectl -n waybill-signing wait pod/signer --for=condition=Ready --timeout=100s
+  teardown:
+    - on: qm-dispatch
+      run: kubectl delete namespace waybill-signing --ignore-not-found --wait=false
+  checks:
+    - id: secret-immutable
+      description: Secret signing-key is immutable
+      type: k8s-query
+      skills: [k8s.security.secrets]
+      query: {cluster: qm-dispatch, resource: secret, name: signing-key, namespace: waybill-signing, jsonpath: "{.immutable}"}
+      expect: {match: exact, value: "true"}
+    - id: secret-data-unchanged
+      description: The Secret still holds key-id {{keyid}} and the same key.pem
+      type: shell
+      on: qm-dispatch
+      skills: [k8s.security.secrets]
+      command: |
+        id=$(kubectl -n waybill-signing get secret signing-key -o jsonpath='{.data.key-id}' | base64 -d)
+        pem=$(kubectl -n waybill-signing get secret signing-key -o jsonpath='{.data.key\.pem}' | base64 -d | sed -n 2p)
+        keys=$(kubectl -n waybill-signing get secret signing-key -o json | jq -r '.data | keys | join(",")')
+        echo "$id|$pem|$keys"
+      expect: {match: exact, value: "{{keyid}}|{{keyid}}-not-a-real-key|key-id,key.pem"}
+    - id: pod-running
+      description: Pod signer is Running with image busybox:1.37
+      type: shell
+      on: qm-dispatch
+      skills: [k8s.security.secrets]
+      timeoutSec: 60
+      command: |
+        kubectl -n waybill-signing wait pod/signer --for=condition=Ready --timeout=40s >/dev/null 2>&1
+        kubectl -n waybill-signing get pod signer -o jsonpath='{.status.phase} {.spec.containers[0].image}'
+      expect: {match: exact, value: "Running busybox:1.37"}
+    - id: mount-readonly
+      description: signing-key is mounted read-only at /run/signing
+      type: shell
+      on: qm-dispatch
+      skills: [k8s.security.secrets]
+      weight: 2
+      command: |
+        kubectl -n waybill-signing get pod signer -o json | jq -r '
+          (.spec.volumes // []) as $v
+          | [.spec.containers[0].volumeMounts[]? | select(.mountPath == "/run/signing" or .mountPath == "/run/signing/")
+             | . as $m | ($v[] | select(.name == $m.name) | .secret.secretName) as $s
+             | "\($s):\($m.readOnly // false)"] | join(",")'
+      expect: {match: exact, value: "signing-key:true"}
+    - id: key-visible
+      description: The key file is readable inside the Pod at /run/signing/key-id
+      type: shell
+      on: qm-dispatch
+      skills: [k8s.security.secrets]
+      timeoutSec: 30
+      command: kubectl -n waybill-signing exec signer -- cat /run/signing/key-id 2>/dev/null || echo missing
+      expect: {match: exact, value: "{{keyid}}"}
+  misconceptions:
+    - id: mount-not-readonly
+      description: Mounts the Secret without readOnly set on the volumeMount.
+      feedback: 'Set `readOnly: true` on the volumeMount as the task asks.'
+      expectFail: [mount-readonly]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl -n waybill-signing patch secret signing-key -p '{"immutable":true}'
+          kubectl -n waybill-signing delete pod signer --now
+          kubectl -n waybill-signing apply -f - <<'YAML'
+          apiVersion: v1
+          kind: Pod
+          metadata: {name: signer, namespace: waybill-signing}
+          spec:
+            volumes: [{name: key, secret: {secretName: signing-key}}]
+            containers:
+              - name: signer
+                image: busybox:1.37
+                command: ["sh", "-c", "while true; do sleep 30; done"]
+                volumeMounts: [{name: key, mountPath: /run/signing}]
+          YAML
+    - id: recreated-wrong-data
+      description: Recreates the Secret from a literal and loses the original key data.
+      feedback: Recreating is fine, but the data must stay identical. Patching `immutable` onto the existing Secret is simpler.
+      expectFail: [secret-data-unchanged]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl -n waybill-signing delete secret signing-key
+          kubectl -n waybill-signing create secret generic signing-key --from-literal=key-id={{keyid}}
+          kubectl -n waybill-signing patch secret signing-key -p '{"immutable":true}'
+    - id: secret-left-mutable
+      description: Mounts the Secret but never makes it immutable.
+      feedback: '`immutable: true` is a field of the Secret itself.'
+      expectFail: [secret-immutable]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl -n waybill-signing delete pod signer --now
+          kubectl -n waybill-signing apply -f - <<'YAML'
+          apiVersion: v1
+          kind: Pod
+          metadata: {name: signer, namespace: waybill-signing}
+          spec:
+            volumes: [{name: key, secret: {secretName: signing-key}}]
+            containers:
+              - name: signer
+                image: busybox:1.37
+                command: ["sh", "-c", "while true; do sleep 30; done"]
+                volumeMounts: [{name: key, mountPath: /run/signing, readOnly: true}]
+          YAML
+  solution:
+    explanation: A mutable Secret may be switched to immutable in place. Pod volumes cannot be added to a running Pod, so the Pod is recreated with a read-only Secret volume.
+    steps:
+      - on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl -n waybill-signing patch secret signing-key -p '{"immutable":true}'
+          kubectl -n waybill-signing get pod signer -o json \
+            | jq 'del(.status, .metadata.uid, .metadata.resourceVersion, .metadata.creationTimestamp)
+                  | .spec.volumes += [{"name":"signing","secret":{"secretName":"signing-key"}}]
+                  | .spec.containers[0].volumeMounts += [{"name":"signing","mountPath":"/run/signing","readOnly":true}]' > /tmp/signer.json
+          kubectl replace --force -f /tmp/signer.json
+          kubectl -n waybill-signing wait pod/signer --for=condition=Ready --timeout=90s
+    alternatives:
+      - id: recreate-secret
+        description: Export the Secret, recreate it with immutable true, and write the Pod from scratch.
+        steps:
+          - on: workstation
+            as: learner
+            run: |
+              kubectl config use-context qm-dispatch
+              kubectl -n waybill-signing get secret signing-key -o json \
+                | jq 'del(.metadata.uid, .metadata.resourceVersion, .metadata.creationTimestamp, .metadata.managedFields) | .immutable = true' > /tmp/key.json
+              kubectl replace --force -f /tmp/key.json
+              kubectl -n waybill-signing delete pod signer --now
+              kubectl apply -f - <<'YAML'
+              apiVersion: v1
+              kind: Pod
+              metadata: {name: signer, namespace: waybill-signing}
+              spec:
+                volumes:
+                  - name: key
+                    secret: {secretName: signing-key, defaultMode: 0400}
+                containers:
+                  - name: signer
+                    image: busybox:1.37
+                    command: ["sh", "-c", "while true; do sleep 30; done"]
+                    volumeMounts: [{name: key, mountPath: /run/signing, readOnly: true}]
+              YAML
+              kubectl -n waybill-signing wait pod/signer --for=condition=Ready --timeout=90s

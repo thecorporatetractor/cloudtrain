@@ -1,0 +1,180 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xks-drop-privileged
+  title: Remove privileged settings from a Deployment
+  domain: kubernetes
+  frameworks: [cks:microservice-vulnerabilities]
+  difficulty: medium
+  estimatedMinutes: 7
+  tags: [exam, securitycontext, privileged, hostpath]
+  version: 1
+spec:
+  description: |
+    Context: `qm-archive` (`kubectl config use-context qm-archive`).
+
+    The Deployment `log-collector` in namespace `fleet-logging` runs a
+    privileged container and mounts a directory of the node.
+
+    Change it so that **no container is privileged** and the Pods use **no
+    hostPath volume**. The collector must keep reading the application log
+    from its `emptyDir` volume `app-logs`: the Pods are Ready only while it
+    can.
+  objectives:
+    - Remove privileged mode and hostPath volumes from a workload
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-archive
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: qm-archive
+  setup:
+    - on: qm-archive
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: fleet-logging}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: log-collector, namespace: fleet-logging}
+        spec:
+          replicas: 1
+          selector: {matchLabels: {app: log-collector}}
+          template:
+            metadata: {labels: {app: log-collector}}
+            spec:
+              volumes:
+                - name: app-logs
+                  emptyDir: {}
+                - name: node-scratch
+                  hostPath: {path: /var/tmp/qm-log-collector, type: DirectoryOrCreate}
+              containers:
+                - name: app
+                  image: busybox:1.37
+                  command: ["sh", "-c", "while true; do echo \"$(date -u +%T) truck check-in\" >> /logs/app.log; sleep 2; done"]
+                  volumeMounts: [{name: app-logs, mountPath: /logs}]
+                - name: collector
+                  image: busybox:1.37
+                  command: ["sh", "-c", "while true; do if tail -n1 /logs/app.log >/dev/null 2>&1; then touch /tmp/ok; else rm -f /tmp/ok; fi; sleep 2; done"]
+                  securityContext: {privileged: true}
+                  readinessProbe:
+                    exec: {command: ["test", "-f", "/tmp/ok"]}
+                    periodSeconds: 3
+                  volumeMounts:
+                    - {name: app-logs, mountPath: /logs}
+                    - {name: node-scratch, mountPath: /node}
+    - on: qm-archive
+      timeoutSec: 150
+      run: kubectl -n fleet-logging rollout status deploy/log-collector --timeout=140s
+  teardown:
+    - on: qm-archive
+      run: kubectl delete namespace fleet-logging --ignore-not-found --wait=false
+  checks:
+    - id: not-privileged
+      description: No container in the log-collector Pod template is privileged
+      type: shell
+      on: qm-archive
+      skills: [k8s.security.security-context]
+      weight: 2
+      command: |
+        kubectl -n fleet-logging get deploy log-collector -o json | jq -r '[.spec.template.spec.containers[], (.spec.template.spec.initContainers // [])[] | select(.securityContext.privileged == true) | .name] | length'
+      expect: {match: exact, value: "0"}
+    - id: no-hostpath
+      description: The Pod template has no hostPath volume
+      type: shell
+      on: qm-archive
+      skills: [k8s.security.security-context]
+      weight: 2
+      command: |
+        kubectl -n fleet-logging get deploy log-collector -o json | jq -r '[.spec.template.spec.volumes // [] | .[] | select(.hostPath)] | length'
+      expect: {match: exact, value: "0"}
+    - id: emptydir-kept
+      description: The collector still mounts the app-logs emptyDir
+      type: shell
+      on: qm-archive
+      skills: [k8s.security.security-context]
+      command: |
+        kubectl -n fleet-logging get deploy log-collector -o json | jq -r '
+          (.spec.template.spec.volumes // [] | map(select(.name=="app-logs" and .emptyDir != null)) | length) as $v
+          | (.spec.template.spec.containers[] | select(.name=="collector") | .volumeMounts // [] | map(select(.name=="app-logs")) | length) as $m
+          | "volume=\($v) mount=\($m)"'
+      expect: {match: exact, value: "volume=1 mount=1"}
+    - id: collector-ready
+      description: The rolled-out log-collector Pods are Ready
+      type: shell
+      on: qm-archive
+      skills: [k8s.security.security-context]
+      timeoutSec: 60
+      command: |
+        kubectl -n fleet-logging rollout status deploy/log-collector --timeout=40s >/dev/null 2>&1 && echo ready || echo "not rolled out"
+      expect: {match: exact, value: ready}
+  misconceptions:
+    - id: kept-hostpath
+      description: Turns privileged off but leaves the hostPath volume.
+      feedback: The task forbids hostPath volumes as well; remove the volume and its mount.
+      expectFail: [no-hostpath]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-archive
+          kubectl -n fleet-logging patch deploy log-collector --type=json -p '[{"op":"replace","path":"/spec/template/spec/containers/1/securityContext/privileged","value":false}]'
+    - id: removed-all-volumes
+      description: Deletes every volume, including the emptyDir the collector reads.
+      feedback: Only the hostPath has to go. Without app-logs the collector has nothing to read and never becomes Ready.
+      expectFail: [emptydir-kept, collector-ready]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-archive
+          kubectl -n fleet-logging patch deploy log-collector --type=json -p '[
+            {"op":"remove","path":"/spec/template/spec/volumes"},
+            {"op":"remove","path":"/spec/template/spec/containers/0/volumeMounts"},
+            {"op":"remove","path":"/spec/template/spec/containers/1/volumeMounts"},
+            {"op":"remove","path":"/spec/template/spec/containers/1/securityContext"}]'
+    - id: privileged-left
+      description: Removes the hostPath but leaves the container privileged.
+      feedback: privileged gives the container every capability and all host devices. Remove it or set it to false.
+      expectFail: [not-privileged]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-archive
+          kubectl -n fleet-logging patch deploy log-collector --type=json -p '[
+            {"op":"remove","path":"/spec/template/spec/volumes/1"},
+            {"op":"remove","path":"/spec/template/spec/containers/1/volumeMounts/1"}]'
+  solution:
+    explanation: Remove the hostPath volume and its mount, and drop privileged from the collector's securityContext; the emptyDir stays.
+    steps:
+      - on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-archive
+          kubectl -n fleet-logging patch deploy log-collector --type=json -p '[
+            {"op":"remove","path":"/spec/template/spec/volumes/1"},
+            {"op":"remove","path":"/spec/template/spec/containers/1/volumeMounts/1"},
+            {"op":"remove","path":"/spec/template/spec/containers/1/securityContext"}]'
+          kubectl -n fleet-logging rollout status deploy/log-collector
+    alternatives:
+      - id: jq-rewrite
+        description: Rewrite the Deployment with jq, setting privileged false and allowPrivilegeEscalation false.
+        steps:
+          - on: workstation
+            as: learner
+            run: |
+              kubectl config use-context qm-archive
+              kubectl -n fleet-logging get deploy log-collector -o json \
+                | jq '.spec.template.spec.volumes |= map(select(.hostPath == null))
+                      | .spec.template.spec.containers |= map(.volumeMounts |= map(select(.name != "node-scratch")) | .securityContext = {"privileged": false, "allowPrivilegeEscalation": false})' \
+                | kubectl apply -f -
+              kubectl -n fleet-logging rollout status deploy/log-collector

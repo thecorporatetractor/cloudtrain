@@ -1,0 +1,329 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: node-footprint-reduce
+  title: Shrink a node's attack surface
+  domain: kubernetes
+  frameworks: [cks:system-hardening]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [node-hardening, packages, systemd, nftables, attack-surface]
+  version: 1
+spec:
+  description: |
+    Worker `fleet-wk-2` in Quillmoor Logistics' fleet cluster was once a
+    general-purpose depot server, and it shows: a scan from the bastion found
+    more open ports than a Kubernetes node should have.
+
+    Reach the node with `ssh fleet-wk-2` (`sudo` works without a password).
+
+    1. The node still runs a legacy FTP drop for handheld scanners. Nothing
+       uses it any more: stop it, make sure it cannot start again, and
+       **remove the package** that installed it.
+    2. The depot metrics exporter on port **{{port}}** is still needed by an
+       agent **on the node itself**, but it must not be reachable from any
+       other host. Keep it running and close the port to everything except
+       localhost with **nftables**.
+    3. From the bastion (your workstation), only SSH (22) and the kubelet
+       (10250) may remain reachable among these ports. Do not break the node:
+       it must stay Ready.
+
+    Useful tools on the node: `ss -tlnp`, `systemctl`, `dpkg -S`, `apt`,
+    `nft`.
+  objectives:
+    - Map a listening port to its process, unit and package
+    - Disable a service and remove its package
+    - Restrict a port to localhost with an nftables rule
+    - Keep kubelet and SSH reachable
+  params:
+    port:
+      type: choice
+      values: [9876, 9911, 8790]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-fleet
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        access: [ssh]
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-fleet
+          nodes:
+            - {name: fleet-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: fleet-wk-2, role: worker}
+  setup:
+    - on: qm-fleet/fleet-wk-2
+      timeoutSec: 120
+      run: |
+        set -e
+        # Legacy FTP drop, packaged locally (the lab has no internet).
+        b=$(mktemp -d)
+        mkdir -p $b/DEBIAN $b/usr/sbin $b/lib/systemd/system $b/etc/qm-ftp-relay
+        cat > $b/DEBIAN/control <<'EOF'
+        Package: qm-ftp-relay
+        Version: 2.3.1
+        Architecture: all
+        Maintainer: Quillmoor Depot IT <depot-it@quillmoor.example>
+        Depends: python3
+        Description: Legacy FTP drop for depot handheld scanners
+         Accepts scanner uploads over plain FTP on port 21.
+        EOF
+        cat > $b/DEBIAN/postinst <<'EOF'
+        #!/bin/sh
+        systemctl daemon-reload || true
+        systemctl enable --now qm-ftpd.service || true
+        EOF
+        cat > $b/DEBIAN/prerm <<'EOF'
+        #!/bin/sh
+        systemctl disable --now qm-ftpd.service || true
+        EOF
+        chmod 0755 $b/DEBIAN/postinst $b/DEBIAN/prerm
+        cat > $b/usr/sbin/qm-ftpd <<'EOF'
+        #!/usr/bin/python3
+        # Answers like an FTP server: banner, then refuses everything.
+        import socket
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("0.0.0.0", 21)); s.listen(8)
+        while True:
+            c, _ = s.accept()
+            try:
+                c.sendall(b"220 qm-ftp-relay 2.3.1 ready (anonymous uploads enabled)\r\n")
+            finally:
+                c.close()
+        EOF
+        chmod 0755 $b/usr/sbin/qm-ftpd
+        echo "anonymous_upload=yes" > $b/etc/qm-ftp-relay/relay.conf
+        cat > $b/lib/systemd/system/qm-ftpd.service <<'EOF'
+        [Unit]
+        Description=Quillmoor legacy FTP drop for handheld scanners
+        After=network-online.target
+        [Service]
+        ExecStart=/usr/sbin/qm-ftpd
+        Restart=always
+        [Install]
+        WantedBy=multi-user.target
+        EOF
+        dpkg-deb --root-owner-group --build $b /var/cache/qm-ftp-relay_2.3.1_all.deb >/dev/null
+        dpkg -i /var/cache/qm-ftp-relay_2.3.1_all.deb >/dev/null
+        rm -rf $b /var/cache/qm-ftp-relay_2.3.1_all.deb
+        # Depot metrics exporter: needed locally, exposed by accident on 0.0.0.0.
+        mkdir -p /opt/qm-depot-metrics
+        echo 'qm_depot_trucks_in_yard 17' > /opt/qm-depot-metrics/metrics
+        cat > /etc/systemd/system/qm-depot-metrics.service <<EOF
+        [Unit]
+        Description=Quillmoor depot metrics exporter
+        [Service]
+        ExecStart=/usr/bin/python3 -m http.server {{port}} --bind 0.0.0.0 --directory /opt/qm-depot-metrics
+        Restart=always
+        [Install]
+        WantedBy=multi-user.target
+        EOF
+        systemctl daemon-reload
+        systemctl enable --now qm-depot-metrics.service
+        for i in $(seq 1 20); do
+          ss -tln | grep -q ':21 ' && ss -tln | grep -q ':{{port}} ' && exit 0
+          sleep 1
+        done
+        echo "services did not start" >&2; exit 1
+    - on: workstation
+      timeoutSec: 60
+      run: |
+        # Baseline from the bastion: both stray ports are open.
+        for p in 21 {{port}}; do nc -z -w 3 fleet-wk-2 $p || { echo "port $p not reachable from the bastion" >&2; exit 1; }; done
+  checks:
+    - id: package-removed
+      description: The package that provides the FTP drop is no longer installed
+      type: shell
+      on: qm-fleet/fleet-wk-2
+      skills: [linux.security.attack-surface]
+      weight: 2
+      command: dpkg-query -W -f='${db:Status-Status}' qm-ftp-relay 2>/dev/null | grep -qx installed && echo installed || echo removed
+      expect: {match: exact, value: removed}
+    - id: ftp-not-listening
+      description: Nothing listens on port 21 and the unit is not enabled
+      type: shell
+      on: qm-fleet/fleet-wk-2
+      skills: [linux.security.attack-surface]
+      command: |
+        l=$(ss -Htln 'sport = :21' | wc -l)
+        e=$(systemctl is-enabled qm-ftpd.service 2>/dev/null || true)
+        case "$e" in enabled|enabled-runtime|static|indirect|alias) en=yes ;; *) en=no ;; esac
+        echo "listeners=$l enabled=$en"
+      expect: {match: exact, value: "listeners=0 enabled=no"}
+    - id: metrics-local
+      description: The metrics exporter still answers on 127.0.0.1:{{port}}
+      type: shell
+      on: qm-fleet/fleet-wk-2
+      skills: [linux.net.firewall]
+      weight: 2
+      timeoutSec: 20
+      command: curl -s -m 5 http://127.0.0.1:{{port}}/metrics || echo unreachable
+      expect: {match: exact, value: "qm_depot_trucks_in_yard 17"}
+    - id: metrics-closed-remote
+      description: Port {{port}} on fleet-wk-2 is not reachable from the bastion
+      type: shell
+      on: workstation
+      skills: [linux.net.firewall]
+      weight: 2
+      timeoutSec: 20
+      command: nc -z -w 4 fleet-wk-2 {{port}} && echo open || echo closed
+      expect: {match: exact, value: closed}
+    - id: nftables-rule
+      description: An nftables rule (not a stopped exporter) closes port {{port}}
+      type: shell
+      on: qm-fleet/fleet-wk-2
+      skills: [linux.net.firewall]
+      command: nft list ruleset 2>/dev/null | grep -Eq 'dport (\{[^}]*)?{{port}}\b' && echo present || echo missing
+      expect: {match: exact, value: present}
+    - id: ftp-closed-remote
+      description: Port 21 on fleet-wk-2 is not reachable from the bastion
+      type: shell
+      on: workstation
+      skills: [linux.security.attack-surface]
+      timeoutSec: 20
+      command: nc -z -w 4 fleet-wk-2 21 && echo open || echo closed
+      expect: {match: exact, value: closed}
+    - id: ssh-and-kubelet-open
+      description: SSH and the kubelet on fleet-wk-2 are still reachable from the bastion
+      type: shell
+      on: workstation
+      skills: [linux.net.firewall]
+      weight: 2
+      timeoutSec: 20
+      command: |
+        s=closed; k=closed
+        nc -z -w 4 fleet-wk-2 22 && s=open
+        nc -z -w 4 fleet-wk-2 10250 && k=open
+        echo "ssh=$s kubelet=$k"
+      expect: {match: exact, value: "ssh=open kubelet=open"}
+    - id: node-ready
+      description: fleet-wk-2 is still Ready
+      type: shell
+      on: qm-fleet
+      skills: [linux.security.attack-surface]
+      timeoutSec: 60
+      command: kubectl wait node/fleet-wk-2 --for=condition=Ready --timeout=40s >/dev/null 2>&1 && echo Ready || echo NotReady
+      expect: {match: exact, value: Ready}
+  hints:
+    - title: What is listening?
+      body: ss shows the process behind each listening socket.
+      command: ssh fleet-wk-2 'sudo ss -tlnp'
+      cost: 0
+    - title: From file to package
+      body: |
+        `systemctl status <unit>` shows the unit file and its binary; `dpkg -S
+        <path>` names the package that owns a file.
+      command: ssh fleet-wk-2 'systemctl status qm-ftpd --no-pager; dpkg -S /usr/sbin/qm-ftpd'
+      cost: 1
+    - title: Your own nftables table
+      body: |
+        Calico and kube-proxy keep their own tables; do not flush the ruleset.
+        Add a separate `inet` table with an input chain that drops the port
+        unless the packet arrives on `lo`.
+      command: |
+        ssh fleet-wk-2 'sudo nft add table inet qm_hardening && sudo nft add chain inet qm_hardening input "{ type filter hook input priority 0; policy accept; }"'
+      cost: 2
+  misconceptions:
+    - id: stopped-not-removed
+      description: Stops and disables the FTP unit but leaves the package installed.
+      feedback: An installed package can be re-enabled or upgraded back into service. Remove it.
+      expectFail: [package-removed]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          ssh fleet-wk-2 'sudo bash -s' <<'EOS'
+          systemctl disable --now qm-ftpd.service
+          nft add table inet qm_hardening
+          nft add chain inet qm_hardening input '{ type filter hook input priority 0; policy accept; }'
+          nft add rule inet qm_hardening input iifname != "lo" tcp dport {{port}} drop
+          EOS
+    - id: stopped-exporter
+      description: Stops the metrics exporter instead of firewalling it.
+      feedback: The local agent still needs the exporter. Keep it running and filter the port with nftables.
+      expectFail: [metrics-local, nftables-rule]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          ssh fleet-wk-2 'sudo bash -s' <<'EOS'
+          apt-get remove -y qm-ftp-relay
+          systemctl disable --now qm-depot-metrics.service
+          EOS
+    - id: blocked-localhost-too
+      description: Drops the port for every source, including localhost.
+      feedback: Exclude the loopback interface (iifname "lo") or accept 127.0.0.1 before the drop.
+      expectFail: [metrics-local]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          ssh fleet-wk-2 'sudo bash -s' <<'EOS'
+          apt-get remove -y qm-ftp-relay
+          nft add table inet qm_hardening
+          nft add chain inet qm_hardening input '{ type filter hook input priority 0; policy accept; }'
+          nft add rule inet qm_hardening input tcp dport {{port}} drop
+          EOS
+    - id: default-drop-bastion
+      description: Drops everything from the bastion except SSH, cutting off the kubelet port too.
+      feedback: The kubelet API must stay reachable. Close only the ports you were asked to close.
+      expectFail: [ssh-and-kubelet-open]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          ssh fleet-wk-2 'sudo bash -s' <<'EOS'
+          apt-get remove -y qm-ftp-relay
+          nft add table inet qm_hardening
+          nft add chain inet qm_hardening input '{ type filter hook input priority 0; policy accept; }'
+          nft add rule inet qm_hardening input ip saddr 192.168.99.0/24 tcp dport != 22 drop
+          EOS
+  solution:
+    explanation: |
+      `ss -tlnp` maps port 21 to qm-ftpd; `dpkg -S /usr/sbin/qm-ftpd` names the
+      package qm-ftp-relay, whose removal also disables the unit. The exporter
+      keeps listening, and a separate nftables table drops TCP to its port
+      unless the packet arrives on the loopback interface. (To survive a
+      reboot, put the table in a file loaded at boot; do not let
+      /etc/nftables.conf flush the ruleset, it would wipe Calico's rules.)
+    steps:
+      - on: workstation
+        as: learner
+        run: |
+          ssh fleet-wk-2 'sudo bash -s' <<'EOS'
+          ss -tlnp
+          dpkg -S /usr/sbin/qm-ftpd
+          systemctl disable --now qm-ftpd.service
+          apt-get purge -y qm-ftp-relay
+          nft add table inet qm_hardening
+          nft add chain inet qm_hardening input '{ type filter hook input priority 0; policy accept; }'
+          nft add rule inet qm_hardening input iifname != "lo" tcp dport {{port}} drop
+          nft list table inet qm_hardening
+          EOS
+    alternatives:
+      - id: dpkg-and-nft-file
+        description: Remove with dpkg and load the filter from an nft file, accepting loopback explicitly.
+        steps:
+          - on: workstation
+            as: learner
+            run: |
+              ssh fleet-wk-2 'sudo bash -s' <<'EOS'
+              dpkg --remove qm-ftp-relay
+              cat > /etc/qm-hardening.nft <<'NFT'
+              table inet qm_hardening {
+                chain input {
+                  type filter hook input priority filter; policy accept;
+                  iif "lo" accept
+                  tcp dport {{port}} drop
+                }
+              }
+              NFT
+              nft -f /etc/qm-hardening.nft
+              EOS

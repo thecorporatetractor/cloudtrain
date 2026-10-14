@@ -1,0 +1,514 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: customs-default-deny
+  title: Build a default-deny baseline with DNS egress
+  domain: kubernetes
+  frameworks: [cks:cluster-setup]
+  difficulty: medium
+  estimatedMinutes: 18
+  tags: [networkpolicy, default-deny, egress, dns, metadata]
+  version: 1
+spec:
+  description: |
+    Quillmoor Logistics' customs gateway handles declarations that carry
+    importer tax numbers. A penetration test found that every Pod in namespace
+    `customs-clearance` can talk to anything, including the node metadata
+    address `169.254.169.254`, which on cloud nodes hands out instance
+    credentials.
+
+    From your workstation, switch to context `qm-customs` first:
+
+    ```bash
+    kubectl config use-context qm-customs
+    ```
+
+    Build a NetworkPolicy baseline in `customs-clearance` (any policy names):
+
+    1. **Default deny**: no Pod in the namespace accepts any ingress traffic
+       and no Pod may send any egress traffic, unless a rule below allows it.
+    2. **DNS**: every Pod in the namespace may send DNS queries (UDP and TCP
+       port 53), but **only to Pods in namespace `kube-system`**.
+    3. **Uplink**: Pods labelled `role={{uplink}}` may additionally connect to
+       **any** address, **except** the node metadata address
+       `169.254.169.254`.
+
+    Test clients: `customs-clearance/probe` (no special role) and
+    `customs-clearance/{{uplink}}` (labelled `role={{uplink}}`) both have
+    `wget` and `nslookup`. Pod `public-kiosk/kiosk-web` serves HTTP on
+    port 8080 and also listens on TCP port 53. On these lab nodes the metadata
+    address answers on port 80, as it would on a cloud node.
+  objectives:
+    - Isolate every Pod of a namespace for ingress and egress
+    - Allow DNS only to the cluster DNS namespace
+    - Allow broad egress with an ipBlock exception
+    - Block the node metadata endpoint
+  params:
+    uplink:
+      type: choice
+      values: [broker-uplink, tariff-sync, manifest-relay]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      # Graded on live connectivity: real nodes with Calico, which enforces
+      # NetworkPolicy, including egress to node-local addresses.
+      - name: qm-customs
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-customs
+          nodes:
+            - {name: customs-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: customs-wk-1, role: worker}
+  setup:
+    # Simulated cloud metadata endpoint on the worker: 169.254.169.254:80 on lo.
+    - on: qm-customs/customs-wk-1
+      run: |
+        set -e
+        mkdir -p /opt/qm-metadata/latest/meta-data
+        echo "i-0customs" > /opt/qm-metadata/latest/meta-data/instance-id
+        ip addr add 169.254.169.254/32 dev lo 2>/dev/null || true
+        systemctl stop qm-metadata 2>/dev/null || true
+        systemctl reset-failed qm-metadata 2>/dev/null || true
+        systemd-run --unit qm-metadata --property=Restart=always \
+          python3 -m http.server 80 --bind 169.254.169.254 --directory /opt/qm-metadata
+        for i in $(seq 1 20); do
+          python3 -c 'import urllib.request;urllib.request.urlopen("http://169.254.169.254/latest/meta-data/instance-id",timeout=2)' && exit 0
+          sleep 1
+        done
+        echo "metadata simulator did not start" >&2; exit 1
+    - on: qm-customs
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: customs-clearance}
+        ---
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: public-kiosk}
+        ---
+        apiVersion: v1
+        kind: Pod
+        metadata: {name: declaration-api, namespace: customs-clearance, labels: {app: declaration-api}}
+        spec:
+          containers:
+            - name: api
+              image: busybox:1.37
+              command: ["sh", "-c", "mkdir -p /www && echo declarations > /www/index.html && exec httpd -f -p 8080 -h /www"]
+              ports: [{containerPort: 8080}]
+        ---
+        apiVersion: v1
+        kind: Pod
+        metadata: {name: probe, namespace: customs-clearance, labels: {role: probe}}
+        spec:
+          containers:
+            - {name: probe, image: "busybox:1.37", command: ["sleep", "1d"]}
+        ---
+        apiVersion: v1
+        kind: Pod
+        metadata: {name: "{{uplink}}", namespace: customs-clearance, labels: {role: "{{uplink}}"}}
+        spec:
+          containers:
+            - {name: uplink, image: "busybox:1.37", command: ["sleep", "1d"]}
+        ---
+        apiVersion: v1
+        kind: Pod
+        metadata: {name: kiosk-web, namespace: public-kiosk, labels: {app: kiosk-web}}
+        spec:
+          containers:
+            - name: web
+              image: busybox:1.37
+              command: ["sh", "-c", "mkdir -p /www && echo kiosk > /www/index.html && httpd -p 53 -h /www && exec httpd -f -p 8080 -h /www"]
+        ---
+        apiVersion: v1
+        kind: Pod
+        metadata: {name: probe, namespace: public-kiosk, labels: {role: probe}}
+        spec:
+          containers:
+            - {name: probe, image: "busybox:1.37", command: ["sleep", "1d"]}
+    - on: qm-customs
+      timeoutSec: 150
+      run: |
+        set -e
+        kubectl -n customs-clearance wait pod --all --for=condition=Ready --timeout=120s
+        kubectl -n public-kiosk wait pod --all --for=condition=Ready --timeout=120s
+        # Baseline: everything open, metadata reachable from a Pod.
+        kubectl -n customs-clearance exec {{uplink}} -- wget -qO- -T 5 http://169.254.169.254/latest/meta-data/instance-id >/dev/null
+  teardown:
+    - on: qm-customs
+      run: kubectl delete namespace customs-clearance public-kiosk --ignore-not-found --wait=false
+  checks:
+    - id: context
+      description: Terminal is using context qm-customs
+      type: k8s-context
+      on: workstation
+      skills: [k8s.cli.contexts]
+      weight: 0.5
+      expect: {match: exact, value: qm-customs}
+    - id: ingress-denied
+      description: public-kiosk/probe can no longer reach declaration-api
+      type: shell
+      on: qm-customs
+      skills: [k8s.security.netpol-default-deny]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        # reach <ns> <pod> <url>: open | blocked | error
+        reach() {
+          phase=$(kubectl -n "$1" get pod "$2" -o jsonpath='{.status.phase}' 2>/dev/null)
+          [ "$phase" = Running ] || { echo "error: $1/$2 phase '$phase'"; return; }
+          res=$(kubectl -n "$1" exec "$2" -- sh -c 'wget -qO- -T 4 "$1" 2>&1 >/dev/null; echo "rc=$?"' sh "$3" 2>/dev/null)
+          case "$res" in
+            *"timed out"*|*"No route to host"*|*"Connection refused"*) echo blocked ;;
+            *rc=0) echo open ;;
+            *"bad address"*) echo blocked ;;
+            *rc=1) echo blocked ;;
+            *) echo "error: ${res:-kubectl exec failed}" | tr '\n' ' ' ;;
+          esac
+        }
+        ip=$(kubectl -n customs-clearance get pod declaration-api -o jsonpath='{.status.podIP}')
+        reach public-kiosk probe "http://$ip:8080/"
+      expect: {match: exact, value: blocked}
+    - id: egress-denied
+      description: customs-clearance/probe (no role) cannot reach kiosk-web on 8080
+      type: shell
+      on: qm-customs
+      skills: [k8s.security.netpol-default-deny]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        reach() {
+          phase=$(kubectl -n "$1" get pod "$2" -o jsonpath='{.status.phase}' 2>/dev/null)
+          [ "$phase" = Running ] || { echo "error: $1/$2 phase '$phase'"; return; }
+          res=$(kubectl -n "$1" exec "$2" -- sh -c 'wget -qO- -T 4 "$1" 2>&1 >/dev/null; echo "rc=$?"' sh "$3" 2>/dev/null)
+          case "$res" in
+            *"timed out"*|*"No route to host"*|*"Connection refused"*) echo blocked ;;
+            *rc=0) echo open ;;
+            *rc=1) echo blocked ;;
+            *) echo "error: ${res:-kubectl exec failed}" | tr '\n' ' ' ;;
+          esac
+        }
+        ip=$(kubectl -n public-kiosk get pod kiosk-web -o jsonpath='{.status.podIP}')
+        reach customs-clearance probe "http://$ip:8080/"
+      expect: {match: exact, value: blocked}
+    - id: dns-works
+      description: customs-clearance/probe can resolve cluster names through cluster DNS
+      type: shell
+      on: qm-customs
+      skills: [k8s.security.netpol-default-deny]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        out=$(kubectl -n customs-clearance exec probe -- nslookup -timeout=3 kubernetes.default.svc.cluster.local 2>&1)
+        if echo "$out" | grep -q '^Address.*10\.96\.0\.1'; then echo resolved; else echo "failed"; fi
+      expect: {match: exact, value: resolved}
+    - id: dns-only-kube-system
+      description: Port 53 is open only towards kube-system (kiosk-web:53 stays blocked)
+      type: shell
+      on: qm-customs
+      skills: [k8s.security.netpol-default-deny]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        reach() {
+          phase=$(kubectl -n "$1" get pod "$2" -o jsonpath='{.status.phase}' 2>/dev/null)
+          [ "$phase" = Running ] || { echo "error: $1/$2 phase '$phase'"; return; }
+          res=$(kubectl -n "$1" exec "$2" -- sh -c 'wget -qO- -T 4 "$1" 2>&1 >/dev/null; echo "rc=$?"' sh "$3" 2>/dev/null)
+          case "$res" in
+            *"timed out"*|*"No route to host"*|*"Connection refused"*) echo blocked ;;
+            *rc=0) echo open ;;
+            *rc=1) echo blocked ;;
+            *) echo "error: ${res:-kubectl exec failed}" | tr '\n' ' ' ;;
+          esac
+        }
+        ip=$(kubectl -n public-kiosk get pod kiosk-web -o jsonpath='{.status.podIP}')
+        reach customs-clearance probe "http://$ip:53/"
+      expect: {match: exact, value: blocked}
+    - id: uplink-egress-open
+      description: The {{uplink}} Pod reaches kiosk-web on 8080
+      type: shell
+      on: qm-customs
+      skills: [k8s.security.node-metadata]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        reach() {
+          phase=$(kubectl -n "$1" get pod "$2" -o jsonpath='{.status.phase}' 2>/dev/null)
+          [ "$phase" = Running ] || { echo "error: $1/$2 phase '$phase'"; return; }
+          res=$(kubectl -n "$1" exec "$2" -- sh -c 'wget -qO- -T 4 "$1" 2>&1 >/dev/null; echo "rc=$?"' sh "$3" 2>/dev/null)
+          case "$res" in
+            *"timed out"*|*"No route to host"*|*"Connection refused"*) echo blocked ;;
+            *rc=0) echo open ;;
+            *rc=1) echo blocked ;;
+            *) echo "error: ${res:-kubectl exec failed}" | tr '\n' ' ' ;;
+          esac
+        }
+        ip=$(kubectl -n public-kiosk get pod kiosk-web -o jsonpath='{.status.podIP}')
+        reach customs-clearance {{uplink}} "http://$ip:8080/"
+      expect: {match: exact, value: open}
+    - id: uplink-dns-works
+      description: The {{uplink}} Pod can resolve cluster names
+      type: shell
+      on: qm-customs
+      skills: [k8s.security.netpol-default-deny]
+      timeoutSec: 30
+      command: |
+        out=$(kubectl -n customs-clearance exec {{uplink}} -- nslookup -timeout=3 kubernetes.default.svc.cluster.local 2>&1)
+        if echo "$out" | grep -q '^Address.*10\.96\.0\.1'; then echo resolved; else echo "failed"; fi
+      expect: {match: exact, value: resolved}
+    - id: metadata-blocked
+      description: The {{uplink}} Pod cannot reach 169.254.169.254
+      type: shell
+      on: qm-customs
+      skills: [k8s.security.node-metadata]
+      weight: 3
+      timeoutSec: 30
+      command: |
+        phase=$(kubectl -n customs-clearance get pod {{uplink}} -o jsonpath='{.status.phase}' 2>/dev/null)
+        [ "$phase" = Running ] || { echo "error: phase '$phase'"; exit 0; }
+        res=$(kubectl -n customs-clearance exec {{uplink}} -- sh -c 'wget -qO- -T 4 http://169.254.169.254/latest/meta-data/instance-id 2>&1 >/dev/null; echo "rc=$?"' 2>/dev/null)
+        case "$res" in *rc=0) echo open ;; *rc=1) echo blocked ;; *) echo "error: $res" | tr '\n' ' ' ;; esac
+      expect: {match: exact, value: blocked}
+  hints:
+    - title: Switch context
+      body: The customs gateway lives in its own cluster.
+      command: kubectl config use-context qm-customs
+      cost: 0
+    - title: The default-deny shape
+      body: |
+        A policy that selects every Pod (`podSelector: {}`), lists both policy
+        types and has no rules denies everything in both directions. Rules in
+        other policies add exceptions on top.
+      cost: 1
+    - title: DNS goes to a namespace
+      body: |
+        CoreDNS runs in `kube-system`. Select it with a `namespaceSelector` on the
+        automatic label `kubernetes.io/metadata.name`, in the same rule as the
+        port 53 entries for UDP and TCP.
+      command: kubectl get ns kube-system --show-labels
+      cost: 2
+    - title: Any address except one
+      body: |
+        An `ipBlock` with `cidr: 0.0.0.0/0` and an `except` list matches every
+        IPv4 address but the excepted ranges. Put it in a policy that selects only
+        the uplink Pods.
+      cost: 2
+    - title: Test it yourself
+      command: |
+        kubectl -n customs-clearance exec {{uplink}} -- wget -qO- -T 3 http://169.254.169.254/latest/meta-data/instance-id
+        kubectl -n customs-clearance exec probe -- nslookup kubernetes.default
+      body: Both commands should behave the way the task asks.
+      cost: 1
+  misconceptions:
+    - id: dns-to-anywhere
+      description: Allows port 53 to every destination instead of only kube-system.
+      feedback: A rule with only `ports` and no `to` admits that port to every address. Add a `namespaceSelector` for kube-system to the same rule.
+      expectFail: [dns-only-kube-system]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-customs
+          kubectl apply -f - <<'YAML'
+          apiVersion: networking.k8s.io/v1
+          kind: NetworkPolicy
+          metadata: {name: default-deny, namespace: customs-clearance}
+          spec:
+            podSelector: {}
+            policyTypes: [Ingress, Egress]
+          ---
+          apiVersion: networking.k8s.io/v1
+          kind: NetworkPolicy
+          metadata: {name: allow-dns, namespace: customs-clearance}
+          spec:
+            podSelector: {}
+            policyTypes: [Egress]
+            egress:
+              - ports:
+                  - {protocol: UDP, port: 53}
+                  - {protocol: TCP, port: 53}
+          ---
+          apiVersion: networking.k8s.io/v1
+          kind: NetworkPolicy
+          metadata: {name: uplink-egress, namespace: customs-clearance}
+          spec:
+            podSelector: {matchLabels: {role: "{{uplink}}"}}
+            policyTypes: [Egress]
+            egress:
+              - to:
+                  - ipBlock: {cidr: 0.0.0.0/0, except: [169.254.169.254/32]}
+          YAML
+    - id: no-metadata-except
+      description: Gives the uplink Pods 0.0.0.0/0 without excepting the metadata address.
+      feedback: 0.0.0.0/0 includes 169.254.169.254. List it under `except` in the same ipBlock.
+      expectFail: [metadata-blocked]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-customs
+          kubectl apply -f - <<'YAML'
+          apiVersion: networking.k8s.io/v1
+          kind: NetworkPolicy
+          metadata: {name: default-deny, namespace: customs-clearance}
+          spec:
+            podSelector: {}
+            policyTypes: [Ingress, Egress]
+          ---
+          apiVersion: networking.k8s.io/v1
+          kind: NetworkPolicy
+          metadata: {name: allow-dns, namespace: customs-clearance}
+          spec:
+            podSelector: {}
+            policyTypes: [Egress]
+            egress:
+              - to:
+                  - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: kube-system}}
+                ports:
+                  - {protocol: UDP, port: 53}
+                  - {protocol: TCP, port: 53}
+          ---
+          apiVersion: networking.k8s.io/v1
+          kind: NetworkPolicy
+          metadata: {name: uplink-egress, namespace: customs-clearance}
+          spec:
+            podSelector: {matchLabels: {role: "{{uplink}}"}}
+            policyTypes: [Egress]
+            egress:
+              - to:
+                  - ipBlock: {cidr: 0.0.0.0/0}
+          YAML
+    - id: ingress-only
+      description: Writes the default deny for Ingress only, so egress stays open.
+      feedback: "`policyTypes: [Ingress]` never restricts egress. List `Egress` too, or egress stays unrestricted for every Pod."
+      expectFail: [egress-denied, dns-only-kube-system, metadata-blocked]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-customs
+          kubectl apply -f - <<'YAML'
+          apiVersion: networking.k8s.io/v1
+          kind: NetworkPolicy
+          metadata: {name: default-deny, namespace: customs-clearance}
+          spec:
+            podSelector: {}
+            policyTypes: [Ingress]
+          YAML
+    - id: forgot-dns
+      description: Denies all egress but forgets the DNS exception, so name lookups break.
+      feedback: Once egress is denied, Pods cannot reach CoreDNS either. Allow port 53 to kube-system.
+      expectFail: [dns-works, uplink-dns-works]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-customs
+          kubectl apply -f - <<'YAML'
+          apiVersion: networking.k8s.io/v1
+          kind: NetworkPolicy
+          metadata: {name: default-deny, namespace: customs-clearance}
+          spec:
+            podSelector: {}
+            policyTypes: [Ingress, Egress]
+          ---
+          apiVersion: networking.k8s.io/v1
+          kind: NetworkPolicy
+          metadata: {name: uplink-egress, namespace: customs-clearance}
+          spec:
+            podSelector: {matchLabels: {role: "{{uplink}}"}}
+            policyTypes: [Egress]
+            egress:
+              - to:
+                  - ipBlock: {cidr: 0.0.0.0/0, except: [169.254.169.254/32, 10.96.0.0/12, 10.244.0.0/16]}
+          YAML
+  solution:
+    explanation: |
+      Policies are additive allow-lists. One policy selects every Pod for both
+      directions with no rules (default deny); a second allows port 53 only to
+      Pods in kube-system; a third, selecting only the uplink Pods, allows every
+      address except the metadata endpoint. The uplink Pods match both the DNS
+      and the uplink policy, so they get the union.
+    steps:
+      - on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-customs
+          kubectl apply -f - <<'YAML'
+          apiVersion: networking.k8s.io/v1
+          kind: NetworkPolicy
+          metadata: {name: default-deny, namespace: customs-clearance}
+          spec:
+            podSelector: {}
+            policyTypes: [Ingress, Egress]
+          ---
+          apiVersion: networking.k8s.io/v1
+          kind: NetworkPolicy
+          metadata: {name: allow-dns, namespace: customs-clearance}
+          spec:
+            podSelector: {}
+            policyTypes: [Egress]
+            egress:
+              - to:
+                  - namespaceSelector:
+                      matchLabels: {kubernetes.io/metadata.name: kube-system}
+                ports:
+                  - {protocol: UDP, port: 53}
+                  - {protocol: TCP, port: 53}
+          ---
+          apiVersion: networking.k8s.io/v1
+          kind: NetworkPolicy
+          metadata: {name: uplink-egress, namespace: customs-clearance}
+          spec:
+            podSelector:
+              matchLabels: {role: "{{uplink}}"}
+            policyTypes: [Egress]
+            egress:
+              - to:
+                  - ipBlock:
+                      cidr: 0.0.0.0/0
+                      except: [169.254.169.254/32]
+          YAML
+    alternatives:
+      - id: kube-dns-pods
+        description: Narrow DNS further to the CoreDNS Pods (k8s-app=kube-dns) in kube-system, in one combined default-deny policy.
+        steps:
+          - on: workstation
+            as: learner
+            run: |
+              kubectl config use-context qm-customs
+              kubectl apply -f - <<'YAML'
+              apiVersion: networking.k8s.io/v1
+              kind: NetworkPolicy
+              metadata: {name: baseline, namespace: customs-clearance}
+              spec:
+                podSelector: {}
+                policyTypes: [Ingress, Egress]
+                egress:
+                  - to:
+                      - namespaceSelector:
+                          matchLabels: {kubernetes.io/metadata.name: kube-system}
+                        podSelector:
+                          matchLabels: {k8s-app: kube-dns}
+                    ports:
+                      - {protocol: UDP, port: 53}
+                      - {protocol: TCP, port: 53}
+              ---
+              apiVersion: networking.k8s.io/v1
+              kind: NetworkPolicy
+              metadata: {name: uplink-any-but-metadata, namespace: customs-clearance}
+              spec:
+                podSelector:
+                  matchExpressions:
+                    - {key: role, operator: In, values: ["{{uplink}}"]}
+                policyTypes: [Egress]
+                egress:
+                  - to:
+                      - ipBlock: {cidr: 0.0.0.0/0, except: [169.254.169.254/32]}
+              YAML

@@ -1,0 +1,237 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: static-analysis-manifests
+  title: Statically analyse manifests for risky settings
+  domain: kubernetes
+  frameworks: [cks:supply-chain-security]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [static-analysis, securitycontext, hostpath, privileged, supply-chain]
+  version: 1
+spec:
+  description: |
+    Quillmoor Logistics' fleet team is about to ship its telemetry stack. The
+    platform team requires every manifest to pass the in-house analyser
+    `qm-kscan` before it reaches a cluster.
+
+    The manifests are in `~/fleet-manifests/` on your workstation.
+
+    1. Scan them: `qm-kscan ~/fleet-manifests` (`qm-kscan` with no arguments
+       prints its rules).
+    2. Fix **every** finding (hostPath volumes, privileged containers,
+       containers that may run as root) in the files themselves, until the
+       scan reports **0 findings**. Where a workload needs scratch space, give
+       it an `emptyDir`; where it needs a user, use UID {{uid}}. Do not delete
+       workloads or files, and do not change images or commands.
+    3. Deploy the fixed manifests to namespace `fleet-telemetry` on context
+       `qm-depot` (`kubectl config use-context qm-depot`). Every workload must
+       become Ready.
+  objectives:
+    - Run a static analyser over Kubernetes manifests
+    - Replace hostPath scratch space with emptyDir
+    - Remove privileged mode and enforce non-root users
+    - Deploy only manifests that scan clean
+  params:
+    uid:
+      type: choice
+      values: [1000, 2500, 7001]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-depot
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: qm-depot
+  setup:
+    - on: workstation
+      file: {path: /usr/local/bin/qm-kscan, source: assets/qm-kscan, mode: "0755"}
+    - on: workstation
+      file: {path: /home/learner/fleet-manifests/telemetry-agent.yaml, source: assets/fleet-manifests/telemetry-agent.yaml, mode: "0644"}
+    - on: workstation
+      file: {path: /home/learner/fleet-manifests/route-planner.yaml, source: assets/fleet-manifests/route-planner.yaml, mode: "0644"}
+    - on: workstation
+      file: {path: /home/learner/fleet-manifests/tyre-monitor.yaml, source: assets/fleet-manifests/tyre-monitor.yaml, mode: "0644"}
+    - on: workstation
+      file: {path: /home/learner/fleet-manifests/depot-map.yaml, source: assets/fleet-manifests/depot-map.yaml, mode: "0644"}
+    - on: workstation
+      run: chown -R learner:learner /home/learner/fleet-manifests
+    - on: qm-depot
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: fleet-telemetry}
+  teardown:
+    - on: qm-depot
+      run: kubectl delete namespace fleet-telemetry --ignore-not-found --wait=false
+  checks:
+    - id: scan-clean
+      description: qm-kscan reports 0 findings for ~/fleet-manifests
+      type: shell
+      on: workstation
+      skills: [k8s.security.static-analysis]
+      weight: 3
+      command: runuser -u learner -- qm-kscan /home/learner/fleet-manifests 2>&1 | tail -n1
+      expect: {match: regex, value: "^qm-kscan: [1-9][0-9]* file\\(s\\) scanned, 0 finding\\(s\\)$"}
+    - id: workloads-kept
+      description: The files still define all four workloads with their original images
+      type: shell
+      on: workstation
+      skills: [k8s.security.static-analysis]
+      command: |
+        cd /home/learner/fleet-manifests 2>/dev/null || { echo "directory missing"; exit 0; }
+        yq ea -o=json -I=0 '[.]' *.yaml 2>/dev/null | jq -r '[.[] | select(.kind != null) | "\(.kind)/\(.metadata.name)=\([.spec.template.spec.containers[].image] | join("+"))"] | sort | join(",")'
+      expect: {match: exact, value: "DaemonSet/telemetry-agent=busybox:1.37,Deployment/depot-map=busybox:1.37,Deployment/route-planner=busybox:1.37,Deployment/tyre-monitor=busybox:1.37"}
+    - id: deployed-ready
+      description: All four workloads run Ready in fleet-telemetry
+      type: shell
+      on: qm-depot
+      skills: [k8s.security.static-analysis]
+      weight: 2
+      timeoutSec: 90
+      command: |
+        ok=0
+        for w in daemonset/telemetry-agent deployment/route-planner deployment/tyre-monitor deployment/depot-map; do
+          kubectl -n fleet-telemetry rollout status "$w" --timeout=20s >/dev/null 2>&1 && ok=$((ok+1))
+        done
+        echo "ready=$ok/4"
+      expect: {match: exact, value: ready=4/4}
+    - id: live-no-hostpath-privileged
+      description: No deployed workload uses hostPath or a privileged container
+      type: shell
+      on: qm-depot
+      skills: [k8s.security.security-context]
+      weight: 2
+      command: |
+        kubectl -n fleet-telemetry get ds,deploy -o json | jq -r '
+          [.items[] | .spec.template.spec as $p |
+            (($p.volumes // [])[] | select(.hostPath) | "hostPath"),
+            ($p.containers[] | select(.securityContext.privileged == true) | "privileged")] as $bad
+          | "objects=\(.items | length) risky=\($bad | length)"'
+      expect: {match: exact, value: "objects=4 risky=0"}
+    - id: live-non-root
+      description: Every deployed container enforces runAsNonRoot and none runs as UID 0
+      type: shell
+      on: qm-depot
+      skills: [k8s.security.security-context]
+      weight: 2
+      command: |
+        kubectl -n fleet-telemetry get ds,deploy -o json | jq -r '
+          [.items[] | .spec.template.spec as $p | $p.containers[] |
+            ((.securityContext.runAsNonRoot // $p.securityContext.runAsNonRoot) == true and
+             ((.securityContext.runAsUser // $p.securityContext.runAsUser) // 1) != 0)] as $r
+          | "containers=\($r | length) rootable=\($r | map(select(. == false)) | length)"'
+      expect: {match: regex, value: "^containers=[1-9][0-9]* rootable=0$"}
+  hints:
+    - title: Read the rules
+      body: Each finding names the file, the workload, the rule and the container or volume.
+      command: qm-kscan ~/fleet-manifests
+      cost: 0
+    - title: Scratch space without the host
+      body: Swap `hostPath` for `emptyDir` on the volume; the mount can stay as it is.
+      cost: 1
+    - title: Non-root has two parts
+      body: |
+        `runAsNonRoot: true` makes the kubelet refuse to start a root process, and
+        busybox has no named user, so add a numeric `runAsUser` (not 0).
+      cost: 1
+    - title: Edit in place with yq
+      body: yq can change a manifest without retyping it.
+      command: yq -i '.spec.template.spec.volumes[0] = {"name":"buffer","emptyDir":{}}' ~/fleet-manifests/telemetry-agent.yaml
+      cost: 2
+  misconceptions:
+    - id: privileged-false-only
+      description: Sets privileged false but keeps the hostPath volume.
+      feedback: The analyser flags hostPath volumes separately; replace it with an emptyDir.
+      expectFail: [scan-clean, live-no-hostpath-privileged]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          cd ~/fleet-manifests
+          for f in telemetry-agent.yaml tyre-monitor.yaml; do yq -i '.spec.template.spec.containers[0].securityContext.privileged = false' $f; done
+          yq -i '.spec.template.spec.securityContext = {"runAsNonRoot": true, "runAsUser": {{uid}}}' telemetry-agent.yaml
+          yq -i '.spec.template.spec.securityContext = {"runAsNonRoot": true, "runAsUser": {{uid}}}' route-planner.yaml
+          kubectl config use-context qm-depot
+          kubectl apply -f ~/fleet-manifests
+    - id: uid-without-nonroot
+      description: Sets a non-zero runAsUser but never enforces runAsNonRoot.
+      feedback: runAsUser alone can be overridden by a later change; runAsNonRoot makes the kubelet enforce it, and the analyser checks for it.
+      expectFail: [scan-clean, live-non-root]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          cd ~/fleet-manifests
+          yq -i '.spec.template.spec.volumes[0] = {"name":"buffer","emptyDir":{}}' telemetry-agent.yaml
+          for f in telemetry-agent.yaml tyre-monitor.yaml; do yq -i 'del(.spec.template.spec.containers[0].securityContext.privileged)' $f; done
+          yq -i '.spec.template.spec.securityContext = {"runAsUser": {{uid}}}' telemetry-agent.yaml
+          yq -i '.spec.template.spec.securityContext = {"runAsUser": {{uid}}}' route-planner.yaml
+          kubectl config use-context qm-depot
+          kubectl apply -f ~/fleet-manifests
+    - id: deleted-the-problem
+      description: Deletes the failing manifests so the scan comes back clean.
+      feedback: A clean scan of fewer files is not a fix. Keep every workload and change its settings.
+      expectFail: [workloads-kept, deployed-ready]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          rm ~/fleet-manifests/telemetry-agent.yaml ~/fleet-manifests/route-planner.yaml ~/fleet-manifests/tyre-monitor.yaml
+          kubectl config use-context qm-depot
+          kubectl apply -f ~/fleet-manifests
+    - id: fixed-but-not-deployed
+      description: Fixes the files but never deploys them.
+      feedback: The task ends with the fixed manifests running in fleet-telemetry.
+      expectFail: [deployed-ready, live-no-hostpath-privileged]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          cd ~/fleet-manifests
+          yq -i '.spec.template.spec.volumes[0] = {"name":"buffer","emptyDir":{}}' telemetry-agent.yaml
+          for f in telemetry-agent.yaml tyre-monitor.yaml; do yq -i 'del(.spec.template.spec.containers[0].securityContext.privileged)' $f; done
+          yq -i '.spec.template.spec.securityContext = {"runAsNonRoot": true, "runAsUser": {{uid}}}' telemetry-agent.yaml
+          yq -i '.spec.template.spec.securityContext = {"runAsNonRoot": true, "runAsUser": {{uid}}}' route-planner.yaml
+  solution:
+    explanation: |
+      Replace the hostPath buffer with an emptyDir, drop privileged from both
+      containers, and give the two workloads without a user a Pod
+      securityContext with runAsNonRoot and a numeric UID (route-planner's
+      runAsUser 0 is replaced). Scan again, then apply the directory.
+    steps:
+      - on: workstation
+        as: learner
+        run: |
+          cd ~/fleet-manifests
+          qm-kscan . || true
+          yq -i '.spec.template.spec.volumes[0] = {"name":"buffer","emptyDir":{}}' telemetry-agent.yaml
+          for f in telemetry-agent.yaml tyre-monitor.yaml; do yq -i 'del(.spec.template.spec.containers[0].securityContext.privileged)' $f; done
+          yq -i '.spec.template.spec.securityContext = {"runAsNonRoot": true, "runAsUser": {{uid}}}' telemetry-agent.yaml
+          yq -i '.spec.template.spec.securityContext = {"runAsNonRoot": true, "runAsUser": {{uid}}}' route-planner.yaml
+          qm-kscan .
+          kubectl config use-context qm-depot
+          kubectl apply -f ~/fleet-manifests
+          kubectl -n fleet-telemetry rollout status ds/telemetry-agent --timeout=120s
+    alternatives:
+      - id: container-level
+        description: Set the user per container and use privileged false plus allowPrivilegeEscalation false.
+        steps:
+          - on: workstation
+            as: learner
+            run: |
+              cd ~/fleet-manifests
+              yq -i '.spec.template.spec.volumes[0] = {"name":"buffer","emptyDir":{"sizeLimit":"64Mi"}}' telemetry-agent.yaml
+              yq -i '.spec.template.spec.containers[0].securityContext = {"privileged": false, "allowPrivilegeEscalation": false, "runAsNonRoot": true, "runAsUser": {{uid}}}' telemetry-agent.yaml
+              yq -i '.spec.template.spec.containers[0].securityContext = {"privileged": false, "allowPrivilegeEscalation": false, "runAsNonRoot": true, "runAsUser": 1000}' tyre-monitor.yaml
+              yq -i 'del(.spec.template.spec.securityContext) | .spec.template.spec.containers[0].securityContext = {"runAsNonRoot": true, "runAsUser": {{uid}}, "allowPrivilegeEscalation": false}' route-planner.yaml
+              qm-kscan .
+              kubectl config use-context qm-depot
+              kubectl apply -f ~/fleet-manifests
+              kubectl -n fleet-telemetry rollout status ds/telemetry-agent --timeout=120s

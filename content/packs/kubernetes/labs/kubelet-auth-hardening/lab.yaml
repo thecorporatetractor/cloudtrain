@@ -1,0 +1,286 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: kubelet-auth-hardening
+  title: Lock down kubelet authentication and authorization
+  domain: kubernetes
+  frameworks: [cks:system-hardening, cks:cluster-setup]
+  difficulty: hard
+  estimatedMinutes: 25
+  tags: [kubelet, authentication, authorization, webhook, node-hardening]
+  version: 1
+spec:
+  description: |
+    A security audit of Quillmoor Logistics' fleet cluster found that the
+    kubelet on worker `fleet-wk-1` answers **anyone** on its API port
+    (10250): an unauthenticated request can list Pods and even run commands
+    in containers.
+
+    From your workstation, switch to context `qm-fleet`
+    (`kubectl config use-context qm-fleet`). Reach the node with
+    `ssh fleet-wk-1`; `sudo` works without a password.
+
+    Fix the kubelet on `fleet-wk-1` so that:
+
+    1. **anonymous** requests are rejected as unauthenticated (HTTP 401);
+    2. **authorization** is delegated to the API server (`Webhook` mode), so
+       an authenticated client without RBAC permission on the node is refused
+       (HTTP 403);
+    3. the node stays **Ready**, and `kubectl logs` / `kubectl exec` for Pods
+       on it keep working.
+
+    The kubelet reads its settings from `/var/lib/kubelet/config.yaml`.
+  objectives:
+    - Read and edit a KubeletConfiguration file
+    - Disable anonymous kubelet authentication
+    - Switch kubelet authorization to Webhook
+    - Prove the change with direct requests to port 10250
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-fleet
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        access: [ssh]
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-fleet
+          nodes:
+            - {name: fleet-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: fleet-wk-1, role: worker}
+  setup:
+    - on: qm-fleet/fleet-wk-1
+      timeoutSec: 120
+      run: |
+        set -e
+        python3 - <<'PY'
+        import yaml
+        p = "/var/lib/kubelet/config.yaml"
+        c = yaml.safe_load(open(p))
+        c.setdefault("authentication", {}).setdefault("anonymous", {})["enabled"] = True
+        c.setdefault("authorization", {})["mode"] = "AlwaysAllow"
+        open(p, "w").write(yaml.safe_dump(c, default_flow_style=False))
+        PY
+        systemctl restart kubelet
+        for i in $(seq 1 30); do
+          code=$(curl -sk -o /dev/null -w '%{http_code}' https://127.0.0.1:10250/pods || true)
+          [ "$code" = 200 ] && exit 0
+          sleep 2
+        done
+        echo "kubelet did not come back open (last code $code)" >&2; exit 1
+    - on: qm-fleet
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: fleet-monitor}
+        ---
+        apiVersion: v1
+        kind: ServiceAccount
+        metadata: {name: fleet-probe, namespace: fleet-monitor}
+        ---
+        apiVersion: v1
+        kind: Pod
+        metadata: {name: tacho-reader, namespace: fleet-monitor}
+        spec:
+          nodeName: fleet-wk-1
+          containers:
+            - {name: reader, image: busybox:1.37, command: ["sh", "-c", "while true; do echo tacho reading ok; sleep 5; done"]}
+    - on: qm-fleet
+      timeoutSec: 150
+      run: kubectl -n fleet-monitor wait pod/tacho-reader --for=condition=Ready --timeout=140s
+  teardown:
+    - on: qm-fleet
+      run: kubectl delete namespace fleet-monitor --ignore-not-found --wait=false
+  checks:
+    - id: context
+      description: Terminal is using context qm-fleet
+      type: k8s-context
+      on: workstation
+      skills: [k8s.cli.contexts]
+      weight: 0.5
+      expect: {match: exact, value: qm-fleet}
+    - id: anonymous-401
+      description: An anonymous request to fleet-wk-1:10250/pods is rejected with 401
+      type: shell
+      on: qm-fleet/fleet-cp-1
+      skills: [k8s.security.kubelet-hardening]
+      weight: 3
+      timeoutSec: 30
+      command: |
+        ip=$(KUBECONFIG=/etc/kubernetes/admin.conf kubectl get node fleet-wk-1 -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}')
+        echo "code=$(curl -sk -m 5 -o /dev/null -w '%{http_code}' https://$ip:10250/pods)"
+      expect: {match: exact, value: code=401}
+    - id: unprivileged-403
+      description: A valid token without node permissions gets 403 from the kubelet
+      type: shell
+      on: qm-fleet/fleet-cp-1
+      skills: [k8s.security.kubelet-hardening]
+      weight: 3
+      timeoutSec: 30
+      command: |
+        export KUBECONFIG=/etc/kubernetes/admin.conf
+        ip=$(kubectl get node fleet-wk-1 -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}')
+        tok=$(kubectl -n fleet-monitor create token fleet-probe --duration=10m)
+        echo "code=$(curl -sk -m 5 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $tok" https://$ip:10250/pods)"
+      expect: {match: exact, value: code=403}
+    - id: config-file
+      description: config.yaml has anonymous authentication off and authorization mode Webhook
+      type: shell
+      on: qm-fleet/fleet-wk-1
+      skills: [k8s.security.kubelet-hardening, k8s.security.cis-benchmark]
+      command: |
+        python3 -c '
+        import yaml
+        c = yaml.safe_load(open("/var/lib/kubelet/config.yaml"))
+        a = c.get("authentication", {})
+        print("anonymous=%s webhook-authn=%s authz=%s" % (a.get("anonymous", {}).get("enabled"), a.get("webhook", {}).get("enabled"), c.get("authorization", {}).get("mode")))'
+      expect: {match: exact, value: "anonymous=False webhook-authn=True authz=Webhook"}
+    - id: node-ready
+      description: fleet-wk-1 is Ready
+      type: shell
+      on: qm-fleet
+      skills: [k8s.security.kubelet-hardening]
+      timeoutSec: 60
+      command: |
+        kubectl wait node/fleet-wk-1 --for=condition=Ready --timeout=40s >/dev/null 2>&1 && echo Ready || echo NotReady
+      expect: {match: exact, value: Ready}
+    - id: logs-and-exec-work
+      description: kubectl logs and exec still work for tacho-reader on fleet-wk-1
+      type: shell
+      on: qm-fleet
+      skills: [k8s.security.kubelet-hardening]
+      timeoutSec: 30
+      command: |
+        l=$(kubectl -n fleet-monitor logs tacho-reader --tail=1 2>&1)
+        e=$(kubectl -n fleet-monitor exec tacho-reader -- echo exec-ok 2>&1)
+        echo "logs=$(echo "$l" | grep -c 'tacho reading ok') exec=$e"
+      expect: {match: exact, value: "logs=1 exec=exec-ok"}
+  hints:
+    - title: Try it the way an attacker would
+      body: From the workstation (or any node), call the kubelet without credentials.
+      command: ssh fleet-cp-1 'curl -sk https://fleet-wk-1:10250/pods | head -c 300'
+      cost: 0
+    - title: Two sections of the config
+      body: |
+        `authentication.anonymous.enabled` decides whether requests without
+        credentials get through at all; `authorization.mode` decides what an
+        authenticated caller may do. `AlwaysAllow` allows everything.
+      command: ssh fleet-wk-1 'sudo grep -A12 "^authentication" /var/lib/kubelet/config.yaml'
+      cost: 1
+    - title: Changes need a restart
+      body: The kubelet reads config.yaml only at start-up.
+      command: ssh fleet-wk-1 'sudo systemctl restart kubelet'
+      cost: 1
+    - title: Test with a real but powerless identity
+      body: A ServiceAccount token authenticates through the webhook; with Webhook authorization it should get 403.
+      command: |
+        TOKEN=$(kubectl -n fleet-monitor create token fleet-probe)
+        ssh fleet-cp-1 "curl -sk -o /dev/null -w '%{http_code}\n' -H 'Authorization: Bearer $TOKEN' https://fleet-wk-1:10250/pods"
+      cost: 2
+  misconceptions:
+    - id: anonymous-only
+      description: Turns anonymous authentication off but leaves authorization at AlwaysAllow.
+      feedback: Any authenticated caller, including any ServiceAccount token, can still run commands through the kubelet. Set authorization.mode to Webhook.
+      expectFail: [unprivileged-403, config-file]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-fleet
+          ssh fleet-wk-1 'sudo bash -s' <<'EOS'
+          python3 - <<'PY'
+          import yaml
+          p = "/var/lib/kubelet/config.yaml"
+          c = yaml.safe_load(open(p))
+          c["authentication"]["anonymous"]["enabled"] = False
+          open(p, "w").write(yaml.safe_dump(c, default_flow_style=False))
+          PY
+          systemctl restart kubelet
+          EOS
+          sleep 10
+    - id: webhook-only
+      description: Switches authorization to Webhook but keeps anonymous authentication on.
+      feedback: Anonymous callers are then authorized as system:anonymous; they get 403 instead of 401, and any RBAC grant to system:anonymous would open the kubelet again. Turn anonymous off.
+      expectFail: [anonymous-401, config-file]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-fleet
+          ssh fleet-wk-1 'sudo bash -s' <<'EOS'
+          python3 - <<'PY'
+          import yaml
+          p = "/var/lib/kubelet/config.yaml"
+          c = yaml.safe_load(open(p))
+          c["authorization"]["mode"] = "Webhook"
+          open(p, "w").write(yaml.safe_dump(c, default_flow_style=False))
+          PY
+          systemctl restart kubelet
+          EOS
+          sleep 10
+    - id: no-restart
+      description: Edits config.yaml correctly but never restarts the kubelet.
+      feedback: The running kubelet still uses the old settings. Restart it and test again.
+      expectFail: [anonymous-401, unprivileged-403]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-fleet
+          ssh fleet-wk-1 'sudo bash -s' <<'EOS'
+          python3 - <<'PY'
+          import yaml
+          p = "/var/lib/kubelet/config.yaml"
+          c = yaml.safe_load(open(p))
+          c["authentication"]["anonymous"]["enabled"] = False
+          c["authorization"]["mode"] = "Webhook"
+          open(p, "w").write(yaml.safe_dump(c, default_flow_style=False))
+          PY
+          EOS
+  solution:
+    explanation: |
+      Set authentication.anonymous.enabled to false and authorization.mode to
+      Webhook in /var/lib/kubelet/config.yaml and restart the kubelet. The API
+      server keeps working with the kubelet because it authenticates with its
+      client certificate (kube-apiserver-kubelet-client), which RBAC allows on
+      the nodes/* subresources.
+    steps:
+      - on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-fleet
+          ssh fleet-wk-1 'sudo bash -s' <<'EOS'
+          sed -i '/^  anonymous:/{n;s/enabled: true/enabled: false/}' /var/lib/kubelet/config.yaml
+          sed -i 's/^  mode: AlwaysAllow/  mode: Webhook/' /var/lib/kubelet/config.yaml
+          grep -A2 -E '^  (anonymous|webhook):' /var/lib/kubelet/config.yaml; grep -A1 '^authorization' /var/lib/kubelet/config.yaml
+          systemctl restart kubelet
+          EOS
+          kubectl config use-context qm-fleet
+          sleep 10
+          kubectl wait node/fleet-wk-1 --for=condition=Ready --timeout=90s
+    alternatives:
+      - id: rewrite-sections
+        description: Rewrite both sections with explicit webhook cache settings (Python and PyYAML on the node), then restart.
+        steps:
+          - on: workstation
+            as: learner
+            run: |
+              kubectl config use-context qm-fleet
+              ssh fleet-wk-1 'sudo bash -s' <<'EOS'
+              python3 - <<'PY'
+              import yaml
+              p = "/var/lib/kubelet/config.yaml"
+              c = yaml.safe_load(open(p))
+              c["authentication"] = {"anonymous": {"enabled": False}, "webhook": {"enabled": True, "cacheTTL": "2m0s"}, "x509": {"clientCAFile": "/etc/kubernetes/pki/ca.crt"}}
+              c["authorization"] = {"mode": "Webhook", "webhook": {"cacheAuthorizedTTL": "5m0s", "cacheUnauthorizedTTL": "30s"}}
+              open(p, "w").write(yaml.safe_dump(c, default_flow_style=False))
+              PY
+              systemctl restart kubelet
+              EOS
+              sleep 10
+              kubectl wait node/fleet-wk-1 --for=condition=Ready --timeout=90s

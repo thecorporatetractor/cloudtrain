@@ -1,0 +1,142 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xks-readonly-rootfs
+  title: Make a container's filesystem read-only
+  domain: kubernetes
+  frameworks: [cks:monitoring-runtime-security]
+  difficulty: easy
+  estimatedMinutes: 6
+  tags: [exam, readonlyrootfilesystem, emptydir]
+  version: 1
+spec:
+  description: |
+    Context: `qm-depot` (`kubectl config use-context qm-depot`).
+
+    Give the container of Deployment `ticket-printer` in namespace
+    `{{ns}}` a **read-only root filesystem**. It writes temporary files to
+    `/tmp`: give `/tmp` an `emptyDir` volume so the Pods stay Running and
+    Ready.
+  objectives:
+    - Set readOnlyRootFilesystem with an emptyDir for scratch space
+  params:
+    ns:
+      type: choice
+      values: [ticket-office, ferry-tickets, depot-tickets]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-depot
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: qm-depot
+  setup:
+    - on: qm-depot
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: "{{ns}}"}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: ticket-printer, namespace: "{{ns}}"}
+        spec:
+          replicas: 2
+          selector: {matchLabels: {app: ticket-printer}}
+          template:
+            metadata: {labels: {app: ticket-printer}}
+            spec:
+              containers:
+                - name: printer
+                  image: busybox:1.37
+                  command: ["sh", "-c", "while true; do if date > /tmp/last-ticket; then touch /tmp/ok; else exit 1; fi; sleep 3; done"]
+                  readinessProbe:
+                    exec: {command: ["test", "-f", "/tmp/ok"]}
+                    periodSeconds: 3
+    - on: qm-depot
+      timeoutSec: 150
+      run: kubectl -n {{ns}} rollout status deploy/ticket-printer --timeout=140s
+  teardown:
+    - on: qm-depot
+      run: kubectl delete namespace {{ns}} --ignore-not-found --wait=false
+  checks:
+    - id: readonly-root
+      description: The ticket-printer container has a read-only root filesystem
+      type: k8s-query
+      skills: [k8s.security.immutability]
+      weight: 2
+      query: {cluster: qm-depot, resource: deployment, name: ticket-printer, namespace: "{{ns}}", jsonpath: "{.spec.template.spec.containers[0].securityContext.readOnlyRootFilesystem}"}
+      expect: {match: exact, value: "true"}
+    - id: tmp-emptydir
+      description: /tmp is mounted from an emptyDir volume
+      type: shell
+      on: qm-depot
+      skills: [k8s.security.immutability]
+      command: |
+        kubectl -n {{ns}} get deploy ticket-printer -o json | jq -r '
+          (.spec.template.spec.volumes // []) as $v
+          | [.spec.template.spec.containers[0].volumeMounts[]? | select(.mountPath == "/tmp") | .name as $n | $v[] | select(.name == $n) | if .emptyDir then "emptyDir" else "other" end] | join(",")'
+      expect: {match: exact, value: emptyDir}
+    - id: pods-ready
+      description: The updated ticket-printer Pods are Running and Ready
+      type: shell
+      on: qm-depot
+      skills: [k8s.security.immutability]
+      weight: 2
+      timeoutSec: 60
+      command: kubectl -n {{ns}} rollout status deploy/ticket-printer --timeout=40s >/dev/null 2>&1 && echo ready || echo "not rolled out"
+      expect: {match: exact, value: ready}
+  misconceptions:
+    - id: no-tmp-volume
+      description: Sets the read-only root filesystem without a writable /tmp.
+      feedback: The printer writes to /tmp; without an emptyDir there it crashes.
+      expectFail: [tmp-emptydir, pods-ready]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n {{ns}} patch deploy ticket-printer --type=json -p '[{"op":"add","path":"/spec/template/spec/containers/0/securityContext","value":{"readOnlyRootFilesystem":true}}]'
+    - id: pod-level-field
+      description: Puts readOnlyRootFilesystem into the Pod securityContext, where it does not exist.
+      feedback: readOnlyRootFilesystem is a container-level field; the API drops it from the Pod securityContext.
+      expectFail: [readonly-root]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n {{ns}} patch deploy ticket-printer --type=json -p '[
+            {"op":"add","path":"/spec/template/spec/volumes","value":[{"name":"tmp","emptyDir":{}}]},
+            {"op":"add","path":"/spec/template/spec/containers/0/volumeMounts","value":[{"name":"tmp","mountPath":"/tmp"}]}]'
+          kubectl -n {{ns}} get deploy ticket-printer -o json | jq '.spec.template.spec.securityContext.readOnlyRootFilesystem = true' | kubectl apply -f - || true
+  solution:
+    explanation: Set readOnlyRootFilesystem on the container and mount an emptyDir at /tmp.
+    steps:
+      - on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-depot
+          kubectl -n {{ns}} patch deploy ticket-printer --type=json -p '[
+            {"op":"add","path":"/spec/template/spec/volumes","value":[{"name":"tmp","emptyDir":{}}]},
+            {"op":"add","path":"/spec/template/spec/containers/0/volumeMounts","value":[{"name":"tmp","mountPath":"/tmp"}]},
+            {"op":"add","path":"/spec/template/spec/containers/0/securityContext","value":{"readOnlyRootFilesystem":true}}]'
+          kubectl -n {{ns}} rollout status deploy/ticket-printer
+    alternatives:
+      - id: memory-emptydir
+        description: Use a memory-backed emptyDir with a size limit.
+        steps:
+          - on: workstation
+            as: learner
+            run: |
+              kubectl config use-context qm-depot
+              kubectl -n {{ns}} patch deploy ticket-printer --type=strategic -p '{"spec":{"template":{"spec":{
+                "volumes":[{"name":"scratch","emptyDir":{"medium":"Memory","sizeLimit":"16Mi"}}],
+                "containers":[{"name":"printer","securityContext":{"readOnlyRootFilesystem":true},"volumeMounts":[{"name":"scratch","mountPath":"/tmp"}]}]}}}}'
+              kubectl -n {{ns}} rollout status deploy/ticket-printer

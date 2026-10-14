@@ -1,0 +1,192 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: verify-kubectl-checksum
+  title: Verify platform binaries before use
+  domain: kubernetes
+  frameworks: [cks:cluster-setup]
+  difficulty: easy
+  estimatedMinutes: 8
+  tags: [checksum, sha512, binaries, supply-chain]
+  version: 1
+spec:
+  description: |
+    Quillmoor Logistics stages Kubernetes binaries from three internal mirrors
+    before a node rollout. A mirror was compromised last week, so nothing is
+    installed until its checksum is verified.
+
+    On node `fleet-wk-1` (`ssh fleet-wk-1`, `sudo` works without a password)
+    three copies of the **kubelet v1.37.1** binary were downloaded to:
+
+    - `/opt/qm-staging/north/kubelet`
+    - `/opt/qm-staging/south/kubelet`
+    - `/opt/qm-staging/east/kubelet`
+
+    The SHA-512 published with the v1.37.1 release is in
+    `/opt/qm-staging/kubelet-v1.37.1.sha512` (the hash only, as the release
+    page publishes it).
+
+    1. Verify each copy against the published SHA-512.
+    2. Delete the copy that does **not** match. Do not modify the others.
+    3. Record the mirrors whose copy is genuine in
+       `/opt/qm-staging/genuine.txt`, one mirror name per line (for example
+       `north`).
+
+    Note: every copy reports the same version when you run it; only the
+    checksum tells you which one to trust.
+  objectives:
+    - Compute and compare SHA-512 checksums
+    - Use sha512sum --check with a published hash
+    - Remove a tampered binary
+  params:
+    tampered:
+      type: choice
+      values: [north, south, east]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-fleet
+        driver: k8s-cluster
+        image: kubeadm:1.37
+        access: [ssh]
+        cluster:
+          mode: kubeadm
+          version: "v1.37.1"
+          context: qm-fleet
+          nodes:
+            - {name: fleet-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
+            - {name: fleet-wk-1, role: worker}
+  setup:
+    - on: qm-fleet/fleet-wk-1
+      run: |
+        set -e
+        rm -rf /opt/qm-staging
+        for m in north south east; do install -d -m 0755 /opt/qm-staging/$m; cp /usr/bin/kubelet /opt/qm-staging/$m/kubelet; done
+        sha512sum /usr/bin/kubelet | awk '{print $1}' > /opt/qm-staging/kubelet-v1.37.1.sha512
+        # The compromised mirror's copy: same size class, still runs, extra payload appended.
+        head -c 4096 /dev/urandom >> /opt/qm-staging/{{tampered}}/kubelet
+        chmod 0755 /opt/qm-staging/*/kubelet
+        touch -r /usr/bin/kubelet /opt/qm-staging/*/kubelet
+  checks:
+    - id: tampered-deleted
+      description: The tampered copy is gone
+      type: shell
+      on: qm-fleet/fleet-wk-1
+      skills: [k8s.security.binary-verification]
+      weight: 2
+      command: test -e /opt/qm-staging/{{tampered}}/kubelet && echo present || echo deleted
+      expect: {match: exact, value: deleted}
+    - id: genuine-intact
+      description: Both genuine copies are still there and unchanged
+      type: shell
+      on: qm-fleet/fleet-wk-1
+      skills: [k8s.security.binary-verification]
+      weight: 2
+      command: |
+        want=$(cat /opt/qm-staging/kubelet-v1.37.1.sha512 2>/dev/null || sha512sum /usr/bin/kubelet | awk '{print $1}')
+        n=0
+        for m in north south east; do
+          [ "$m" = {{tampered}} ] && continue
+          [ "$(sha512sum /opt/qm-staging/$m/kubelet 2>/dev/null | awk '{print $1}')" = "$want" ] && n=$((n+1))
+        done
+        echo "intact=$n"
+      expect: {match: exact, value: intact=2}
+    - id: genuine-recorded
+      description: /opt/qm-staging/genuine.txt lists exactly the two genuine mirrors
+      type: shell
+      on: qm-fleet/fleet-wk-1
+      skills: [k8s.security.binary-verification]
+      weight: 2
+      command: |
+        want=$(for m in north south east; do [ "$m" != {{tampered}} ] && echo $m; done | sort | paste -sd, -)
+        got=$(tr -d ' \r' < /opt/qm-staging/genuine.txt 2>/dev/null | grep -v '^$' | sed 's#.*/qm-staging/##; s#/kubelet$##' | sort -u | paste -sd, -)
+        [ "$got" = "$want" ] && echo correct || echo "recorded: '${got}'"
+      expect: {match: exact, value: correct}
+  hints:
+    - title: Compute the checksums
+      body: sha512sum prints the hash followed by the file name.
+      command: ssh fleet-wk-1 'sha512sum /opt/qm-staging/*/kubelet; cat /opt/qm-staging/kubelet-v1.37.1.sha512'
+      cost: 1
+    - title: Let sha512sum compare for you
+      body: |
+        `sha512sum --check` reads lines of the form `<hash>  <file>` and reports
+        OK or FAILED for each file.
+      command: ssh fleet-wk-1 'cd /opt/qm-staging && for m in north south east; do echo "$(cat kubelet-v1.37.1.sha512)  $m/kubelet"; done | sha512sum --check'
+      cost: 2
+    - title: The files are root-owned
+      body: Deleting and writing under /opt/qm-staging needs sudo.
+      cost: 1
+  misconceptions:
+    - id: trusted-version-output
+      description: Trusts `kubelet --version`, keeps everything and records all three mirrors.
+      feedback: A tampered binary can print any version. Only the checksum proves the bytes are the released ones.
+      expectFail: [tampered-deleted, genuine-recorded]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          ssh fleet-wk-1 'sudo sh -c "printf \"north\nsouth\neast\n\" > /opt/qm-staging/genuine.txt"'
+    - id: deleted-wrong-copy
+      description: Deletes a genuine copy instead of the tampered one.
+      feedback: Compare each file's hash with the published hash before deleting anything.
+      expectFail: [tampered-deleted, genuine-intact, genuine-recorded]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          ssh fleet-wk-1 'sudo bash -s' <<'EOS'
+          cd /opt/qm-staging
+          for m in north south east; do [ "$m" != {{tampered}} ] && { rm -f $m/kubelet; echo $m > genuine.txt; break; }; done
+          EOS
+    - id: deleted-everything
+      description: Deletes all three copies to be safe.
+      feedback: Two copies are genuine and are needed for the rollout. Delete only the one that fails verification.
+      expectFail: [genuine-intact]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          ssh fleet-wk-1 'sudo bash -s' <<'EOS'
+          rm -f /opt/qm-staging/*/kubelet
+          for m in north south east; do [ "$m" != {{tampered}} ] && echo $m; done > /opt/qm-staging/genuine.txt
+          EOS
+  solution:
+    explanation: |
+      Build `<hash>  <file>` lines from the published hash and let
+      `sha512sum --check` report each copy. The one marked FAILED is tampered:
+      delete it and record the mirrors marked OK.
+    steps:
+      - on: workstation
+        as: learner
+        run: |
+          ssh fleet-wk-1 'sudo bash -s' <<'EOS'
+          cd /opt/qm-staging
+          sum=$(cat kubelet-v1.37.1.sha512)
+          : > genuine.txt
+          for m in north south east; do
+            if echo "$sum  $m/kubelet" | sha512sum --check --quiet 2>/dev/null; then
+              echo "$m" >> genuine.txt
+            else
+              echo "$m/kubelet FAILED"; rm -f "$m/kubelet"
+            fi
+          done
+          cat genuine.txt
+          EOS
+    alternatives:
+      - id: compare-by-hand
+        description: Compare the hashes with a plain string comparison and record full paths.
+        steps:
+          - on: workstation
+            as: learner
+            run: |
+              ssh fleet-wk-1 'sudo bash -s' <<'EOS'
+              want=$(cat /opt/qm-staging/kubelet-v1.37.1.sha512)
+              for f in /opt/qm-staging/*/kubelet; do
+                got=$(sha512sum "$f" | cut -d' ' -f1)
+                if [ "$got" = "$want" ]; then echo "$f" >> /opt/qm-staging/genuine.txt; else rm -v "$f"; fi
+              done
+              EOS
