@@ -16,6 +16,7 @@
 #               hibernate/resume, reset, delete leaves nothing behind.
 #
 # Usage: PART=virtual hack/warmpool-proof.sh | tee ../../deploy/.results/warmpool-virtual-proof.txt
+# shellcheck disable=SC2088 # "~/..." in ok/bad messages is text, not a path
 set -euo pipefail
 cd "$(dirname "$0")/.."
 PART=${PART:-virtual}
@@ -66,11 +67,11 @@ session_pods() {
     '.items[] | select(.metadata.labels["labs.cloudtrain.dev/session"]==$s or .metadata.labels.release==$r or (.metadata.labels["vcluster.loft.sh/managed-by"] // "")==$r) | .metadata.name'
 }
 leftovers() {
-  local out=() r
+  local objs=() r
   for r in $(K api-resources --verbs=list --namespaced -o name | grep -v '^events'); do
-    while read -r o; do [[ -n $o ]] && out+=("$o"); done < <(K -n "$NS" get "$r" -o name --ignore-not-found 2>/dev/null)
+    while read -r o; do [[ -n $o ]] && objs+=("$o"); done < <(K -n "$NS" get "$r" -o name --ignore-not-found 2>/dev/null)
   done
-  printf '%s\n' "${out[@]}" | grep -v -E '^(configmap/kube-root-ca.crt|serviceaccount/default|labtemplate\.labs\.cloudtrain\.dev/)' || true
+  printf '%s\n' "${objs[@]}" | grep -v -E '^(configmap/kube-root-ca.crt|serviceaccount/default|labtemplate\.labs\.cloudtrain\.dev/)' || true
   K get clusterrole,clusterrolebinding -o name | grep -- "-v-$NS\$" || true
   K get vpc,subnet -l "labs.cloudtrain.dev/managed-by" -o name 2>/dev/null | grep -- "$NS" || true
 }

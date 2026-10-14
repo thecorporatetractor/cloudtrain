@@ -32,6 +32,7 @@ fetch_pinned() {
     mv "$dest.tmp" "$dest"
   fi
 }
+# shellcheck disable=SC2034 # used by the scripts that source lib.sh
 MANIFEST_CACHE="$REPO_ROOT/deploy/.cache"
 
 # wait_for <description> <timeout-seconds> <command...>

@@ -7,6 +7,7 @@ ARG HELM_VERSION=v3.19.0
 ARG HELM_SHA256=a7f81ce08007091b86d8bd696eb4d86b8d0f2e1b9f6c714be62f82f96a594496
 ARG VCLUSTER_VERSION=0.37.2
 ARG VCLUSTER_CHART_SHA256=0e3e1df3802a1199653930cfadcf52ba309ea7d5282a1a8541452bea8a9cf707
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 WORKDIR /src
 COPY services/lab-orchestrator/go.mod services/lab-orchestrator/go.sum ./
 RUN GOWORK=off go mod download

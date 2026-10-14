@@ -12,6 +12,7 @@ ARG ETCD_TARBALL_SHA256
 ARG YQ_VERSION
 ARG YQ_BINARY_SHA256
 ENV DEBIAN_FRONTEND=noninteractive
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 # The base image has no CA bundle, so ca-certificates is bootstrapped from the live
 # archive first (https to snapshot.ubuntu.com needs it); everything else comes from
 # the pinned snapshot.
@@ -38,8 +39,8 @@ RUN set -eu; cd /tmp \
  && rm -f helm.tgz etcd.tgz \
  && chmod 0755 /usr/local/bin/* \
  && C=/usr/share/bash-completion/completions \
- && kubectl completion bash > $C/kubectl && helm completion bash > $C/helm \
- && etcdctl completion bash > $C/etcdctl && yq shell-completion bash > $C/yq \
+ && kubectl completion bash > "$C/kubectl" && helm completion bash > "$C/helm" \
+ && etcdctl completion bash > "$C/etcdctl" && yq shell-completion bash > "$C/yq" \
  && kubectl version --client && helm version --short && etcdctl version && yq --version
 
 COPY bashrc /etc/cloudtrain/bashrc
