@@ -290,6 +290,14 @@ export interface AssignmentStatusView {
   progress: number;
 }
 
+export interface AssignmentTargetsView {
+  assignment_id: string;
+  org_id: string;
+  user_id: string;
+  via_kind: 'team' | 'user' | 'cohort';
+  via_id: string;
+}
+
 export interface DB {
   orgs: OrgsTable;
   users: UsersTable;
@@ -313,6 +321,7 @@ export interface DB {
   auth_login_states: AuthLoginStatesTable;
   auth_sessions: AuthSessionsTable;
   assignment_status: AssignmentStatusView;
+  assignment_targets: AssignmentTargetsView;
 }
 
 export type OrgRow = Selectable<OrgsTable>;
