@@ -1,11 +1,14 @@
 import { Link, useNavigate } from '@tanstack/react-router';
 import { ArrowRight, ChevronLeft, GraduationCap, History, Hourglass, Play, Users } from 'lucide-react';
-import { useMemo } from 'react';
-import { useExams, useMyAttempts, useTeamExamReadiness } from '@/api/exams';
+import { useMemo, useState } from 'react';
+import { useExams, useGrantExamRetake, useMyAttempts, useTeamExamReadiness, useVoidExamAttempt } from '@/api/exams';
 import type { ExamAttemptSummary, ExamSummary, TeamExamMember } from '@/api/types';
-import { RequireAccess } from '@/app/access';
+import { can, RequireAccess } from '@/app/access';
+import { useShell } from '@/app/shell-context';
 import { alignLabel, Disclaimer, ExamDomainIcon, examDomainLabel, fmtPct, PhaseBadge, ResultBadge, RuleChips, ScoreBar } from '@/components/exams/ui';
-import { Badge, Card, EmptyState, ErrorState, PageSkeleton, Segmented, Stat } from '@/components/ui';
+import { Badge, Button, Card, EmptyState, ErrorState, PageSkeleton, Segmented, Stat } from '@/components/ui';
+import { ConfirmDialog, Field, Input, Select } from '@/components/ui/forms';
+import { useSelectedTeam } from './Team';
 import { examsRoute, teamExamsRoute } from '@/router';
 import { formatDate, formatMinutes, relativeTime } from '@/lib/utils';
 
@@ -198,10 +201,62 @@ export function Exams() {
 const readinessLabel: Record<TeamExamMember['readiness'], string> = { ready: 'Ready', close: 'Close', 'not-ready': 'Not ready', 'not-attempted': 'Not attempted' };
 const readinessTone: Record<TeamExamMember['readiness'], 'ok' | 'warn' | 'err' | 'neutral'> = { ready: 'ok', close: 'warn', 'not-ready': 'err', 'not-attempted': 'neutral' };
 
+/** Manager/admin interventions on one member: grant a retake (assignment.manage), void a running attempt (session.control). */
+function MemberActions({ examId, examTitle, member }: { examId: string; examTitle: string; member: TeamExamMember }) {
+  const { me } = useSelectedTeam(undefined);
+  const { toast } = useShell();
+  const grant = useGrantExamRetake(examId);
+  const voider = useVoidExamAttempt();
+  const [confirm, setConfirm] = useState<'grant' | 'void' | null>(null);
+  const [reason, setReason] = useState('');
+  const mayGrant = can(me, 'assignment.manage');
+  const mayVoid = can(me, 'session.control') && !!member.activeAttemptId;
+  if (!mayGrant && !mayVoid) return null;
+  const close = () => (setConfirm(null), setReason(''));
+  return (
+    <div className="row" style={{ gap: 6, justifyContent: 'flex-end' }}>
+      {mayVoid && (
+        <Button size="sm" variant="ghost" onClick={() => setConfirm('void')}>
+          Void attempt
+        </Button>
+      )}
+      {mayGrant && member.attempts > 0 && (
+        <Button size="sm" variant="ghost" onClick={() => setConfirm('grant')}>
+          Grant retake
+        </Button>
+      )}
+      <ConfirmDialog
+        open={confirm !== null}
+        onOpenChange={(o) => !o && close()}
+        title={confirm === 'void' ? `Void ${member.name}'s running attempt?` : `Grant ${member.name} one more attempt?`}
+        description={
+          confirm === 'void'
+            ? `The exam environment closes now. The attempt is not scored and does not count against ${member.name}'s retakes. This is recorded in the audit log.`
+            : `${member.name} can start ${examTitle} once more, even inside the cooldown or past the 30-day limit. This is recorded in the audit log.`
+        }
+        confirmLabel={confirm === 'void' ? 'Void attempt' : 'Grant retake'}
+        danger={confirm === 'void'}
+        loading={grant.isPending || voider.isPending}
+        onConfirm={() => {
+          const done = (title: string) => () => (toast({ title, tone: 'ok' }), close());
+          const failed = (e: Error) => toast({ title: 'Not done', description: e.message, tone: 'err' });
+          if (confirm === 'void' && member.activeAttemptId) voider.mutate({ attemptId: member.activeAttemptId, reason: reason || undefined }, { onSuccess: done('Attempt voided'), onError: failed });
+          if (confirm === 'grant') grant.mutate({ userId: member.userId, ...(reason ? { reason } : {}) }, { onSuccess: done('Retake granted'), onError: failed });
+        }}
+      >
+        <Field label="Reason (audit log)">
+          {({ id }) => <Input id={id} value={reason} maxLength={500} onChange={(e) => setReason(e.target.value)} placeholder={confirm === 'void' ? 'e.g. proctoring incident' : 'e.g. environment outage during the last attempt'} />}
+        </Field>
+      </ConfirmDialog>
+    </div>
+  );
+}
+
 export function TeamExams() {
   const search = teamExamsRoute.useSearch();
   const navigate = useNavigate({ from: '/team/exams' });
-  const data = useTeamExamReadiness(search.team);
+  const { teams, selected } = useSelectedTeam(search.team);
+  const data = useTeamExamReadiness(selected);
   const exam = data.data?.exams.find((e) => e.examId === search.exam) ?? data.data?.exams[0];
 
   return (
@@ -212,8 +267,17 @@ export function TeamExams() {
         </Link>
         <header className="page-header">
           <div>
-            <div className="page-eyebrow">Manager{data.data ? ` · ${data.data.team.name}` : ''}</div>
+            <div className="page-eyebrow">Manager{data.data && teams.length <= 1 ? ` · ${data.data.team.name}` : ''}</div>
             <h1>Exam readiness</h1>
+            {teams.length > 1 && selected && (
+              <Select aria-label="Team" value={selected} onChange={(e) => void navigate({ search: { ...search, team: e.target.value } })} style={{ marginTop: 6 }}>
+                {teams.map((t) => (
+                  <option key={t.id} value={t.id}>
+                    {t.name}
+                  </option>
+                ))}
+              </Select>
+            )}
             <p className="muted">Who has taken a simulation, how they scored against the pass mark, and where each person is weakest.</p>
           </div>
         </header>
@@ -257,6 +321,7 @@ export function TeamExams() {
                     <th style={{ textAlign: 'right' }}>Last</th>
                     <th style={{ textAlign: 'right' }}>Attempts</th>
                     <th>Weakest objective</th>
+                    <th />
                   </tr>
                 </thead>
                 <tbody>
@@ -299,6 +364,9 @@ export function TeamExams() {
                             <Hourglass size={11} /> no data
                           </span>
                         )}
+                      </td>
+                      <td>
+                        <MemberActions examId={exam.examId} examTitle={exam.examTitle} member={m} />
                       </td>
                     </tr>
                   ))}

@@ -44,10 +44,13 @@ interface MockAttempt {
   tasks: MockTask[];
   flagged: Set<number>;
   report?: ExamReport;
+  voided?: { at: number; reason?: string };
 }
 
 const exams = new Map(fixtureExams.map((e) => [e.id, e]));
 const attempts = new Map<string, MockAttempt>();
+/** Open retake grants per `${userId}:${examId}`. */
+const grants = new Map<string, number>();
 const latency = () => delay(120 + Math.random() * 180);
 
 function seedHistory() {
@@ -116,6 +119,7 @@ function summary(a: MockAttempt): ExamAttemptSummary {
     ...(a.report ? { score: a.report.score, passed: a.report.passed } : {}),
     number: a.number,
     counted: a.phase !== 'failed',
+    ...(a.voided ? { voided: { at: iso(a.voided.at)!, ...(a.voided.reason ? { reason: a.voided.reason } : {}) } } : {}),
   };
 }
 
@@ -136,15 +140,18 @@ function retake(exam: FixtureExam): RetakeStatus {
   const counted = list.filter((a) => a.phase !== 'failed');
   const recent = counted.filter((a) => Date.now() - a.startedAt < 30 * DAY);
   const freeRetakesLeft = Math.max(0, exam.retakePolicy.freeRetakes - Math.max(0, counted.length - 1));
-  const base = { attemptsLast30Days: recent.length, attemptsTotal: counted.length, freeRetakesLeft };
+  const open = grants.get(`${me()?.id}:${exam.id}`) ?? 0;
+  const base = { attemptsLast30Days: recent.length, attemptsTotal: counted.length, freeRetakesLeft, ...(open ? { retakeGrants: open } : {}) };
   const active = list.find((a) => a.phase === 'preparing' || a.phase === 'in-progress' || a.phase === 'grading');
   if (active) return { ...base, allowed: false, reason: 'You have an attempt in progress. Resume it instead of starting another.', activeAttemptId: active.id };
   if (recent.length >= exam.retakePolicy.maxAttemptsPer30Days) {
+    if (open) return { ...base, allowed: true, viaGrant: true };
     return { ...base, allowed: false, reason: `You have used all ${exam.retakePolicy.maxAttemptsPer30Days} attempts allowed in 30 days.`, nextAllowedAt: iso(recent[recent.length - 1]!.startedAt + 30 * DAY)! };
   }
   const last = counted[0];
   if (last && freeRetakesLeft === 0 && exam.retakePolicy.cooldownHours > 0) {
     const next = (last.completedAt ?? last.startedAt) + exam.retakePolicy.cooldownHours * HOUR;
+    if (Date.now() < next && open) return { ...base, allowed: true, viaGrant: true };
     if (Date.now() < next) return { ...base, allowed: false, reason: `Retakes after the free ones wait ${exam.retakePolicy.cooldownHours} hours after your previous attempt.`, nextAllowedAt: iso(next)! };
   }
   return { ...base, allowed: true };
@@ -245,6 +252,7 @@ function memberRow(exam: FixtureExam, m: { id: string; name: string }, i: number
       passed: graded.some((a) => a.report!.passed),
       ...(weakest ? { weakestObjective: { id: weakest.id, ...(weakest.name ? { name: weakest.name } : {}), score: weakest.score } } : {}),
       readiness: best === undefined ? 'not-attempted' : best >= exam.passMark + 5 ? 'ready' : best >= exam.passMark - 10 ? 'close' : 'not-ready',
+      ...(real.find((a) => a.phase === 'preparing' || a.phase === 'in-progress' || a.phase === 'grading') ? { activeAttemptId: real.find((a) => a.phase === 'preparing' || a.phase === 'in-progress' || a.phase === 'grading')!.id } : {}),
     };
   }
   const r = hash(`${exam.id}:${m.id}`);
@@ -362,12 +370,39 @@ export const examHandlers = [
     if (!exam) return notFound('Exam');
     if (!MOCK_AVAILABLE.has(exam.id)) return HttpResponse.json({ error: 'Exam tasks are still being authored for this simulation.' }, { status: 409 });
     const r = retake(exam);
-    if (!r.allowed) return HttpResponse.json({ error: r.reason }, { status: 409 });
+    if (!r.allowed) return HttpResponse.json({ error: r.reason, code: 'conflict' }, { status: 409 });
+    if (r.viaGrant) grants.set(`${me()!.id}:${exam.id}`, (r.retakeGrants ?? 1) - 1);
     const id = `exam-${Math.random().toString(16).slice(2, 12).padEnd(10, '0')}`;
     const prior = mine(exam.id);
     const avoid = exam.retakePolicy.freshDraw ? new Set(prior.filter((a) => a.phase !== 'failed').flatMap((a) => a.tasks.map((t) => t.taskId))) : new Set<string>();
     const a: MockAttempt = { id, userId: me()!.id, examId: exam.id, number: prior.length + 1, phase: 'preparing', startedAt: Date.now(), tasks: drawTasks(exam, id, avoid), flagged: new Set() };
     attempts.set(id, a);
     return HttpResponse.json({ attempt: state(a) }, { status: 201 });
+  }),
+  http.post('/api/exams/attempts/:id/void', async ({ params, request }) => {
+    await latency();
+    const m = me();
+    if (!m?.permissions.includes('session.control')) return HttpResponse.json({ error: 'You do not have permission to do this (session.control).', code: 'forbidden', permission: 'session.control' }, { status: 403 });
+    const a = attempts.get(String(params.id));
+    if (!a) return notFound('Attempt');
+    tick(a);
+    if (a.phase !== 'preparing' && a.phase !== 'in-progress' && a.phase !== 'grading') return HttpResponse.json({ error: 'Only a running attempt can be voided.', code: 'conflict' }, { status: 409 });
+    const { reason } = ((await request.json().catch(() => ({}))) ?? {}) as { reason?: string };
+    a.phase = 'failed';
+    a.completedAt = Date.now();
+    a.voided = { at: a.completedAt, ...(reason ? { reason } : {}) };
+    return HttpResponse.json(summary(a));
+  }),
+  http.post('/api/exams/:examId/retake-grants', async ({ params, request }) => {
+    await latency();
+    const m = me();
+    if (!m?.permissions.includes('assignment.manage')) return HttpResponse.json({ error: 'You do not have permission to do this (assignment.manage).', code: 'forbidden', permission: 'assignment.manage' }, { status: 403 });
+    const exam = exams.get(String(params.examId));
+    if (!exam) return notFound('Exam');
+    const { userId, reason } = (await request.json()) as { userId?: string; reason?: string };
+    if (!userId) return HttpResponse.json({ error: 'userId is required', code: 'invalid' }, { status: 422 });
+    const k = `${userId}:${exam.id}`;
+    grants.set(k, (grants.get(k) ?? 0) + 1);
+    return HttpResponse.json({ id: `grant-${Date.now()}`, examId: exam.id, userId, grantedBy: m.id, ...(reason ? { reason } : {}), createdAt: new Date().toISOString() }, { status: 201 });
   }),
 ];

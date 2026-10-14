@@ -20,6 +20,8 @@ const themes = arg('themes', 'dark,light,cream').split(',');
 const out = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../docs/screenshots/exams');
 await mkdir(out, { recursive: true });
 
+const PERSONAS = { learner: { userId: 'u-lena', orgId: 'org-quillmoor' }, manager: { userId: 'u-ingrid', orgId: 'org-quillmoor' } };
+
 const browser = await chromium.launch({ executablePath: arg('chromium', '/usr/bin/chromium'), args: ['--no-sandbox'] });
 let failed = false;
 
@@ -31,7 +33,15 @@ async function shot(page, name, theme) {
 
 async function run(theme) {
   const ctx = await browser.newContext({ viewport: { width: 1440, height: 900 }, deviceScaleFactor: 1 });
-  await ctx.addInitScript((t) => localStorage.setItem('ct.theme', t), theme);
+  // Mock personas (platform fixtures): the learner takes the exam, the manager of
+  // her team (Platform Reliability) looks at team readiness.
+  await ctx.addInitScript(
+    ({ t, learner }) => {
+      localStorage.setItem('ct.theme', t);
+      localStorage.setItem('ct.mock.session', sessionStorage.getItem('ct.shots.session') ?? learner);
+    },
+    { t: theme, learner: JSON.stringify(PERSONAS.learner) },
+  );
   const page = await ctx.newPage();
   await page.clock.install();
   page.on('pageerror', (e) => {
@@ -107,8 +117,11 @@ async function run(theme) {
   await go('/exams?view=attempts', 'Attempt history');
   await shot(page, '11-attempts', theme);
 
-  // 12. Manager view of team exam readiness.
+  // 12. Manager view of team exam readiness (switch to the manager persona; the
+  // learner's attempt above shows up in her row).
+  await page.evaluate((m) => sessionStorage.setItem('ct.shots.session', m), JSON.stringify(PERSONAS.manager));
   await go('/team/exams', 'Exam readiness');
+  await page.getByText('Lena Varga').first().waitFor({ timeout: 15000 });
   await page.locator('.table').first().waitFor();
   await shot(page, '12-team-readiness', theme);
 
