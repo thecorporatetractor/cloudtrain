@@ -120,6 +120,39 @@ export function toSkills(doc: SkillGraphDoc): { skills: Skill[]; requires: Map<s
   return { skills, requires, competencies };
 }
 
+interface CurriculumSkillsDoc {
+  domains?: { id: string; skillDomain?: string; competencies?: { id: string; title: string }[] }[];
+  newSkills?: { id: string; name: string; domain: string; competency: string; requires?: string[] }[];
+}
+
+/**
+ * Adds the approved curriculum's `newSkills` (content/curriculum.yaml) that skills.yaml
+ * does not have yet and that a loaded lab uses (`used`). Pack labs may tag checks with
+ * them until they are promoted into skills.yaml (lab-verify accepts the same set).
+ */
+export function addCurriculumSkills(
+  doc: CurriculumSkillsDoc,
+  graph: { skills: Skill[]; requires: Map<string, string[]>; competencies: ContentCompetency[] },
+  used: ReadonlySet<string>,
+): void {
+  const known = new Set(graph.skills.map((s) => s.id));
+  const titles = new Map<string, string>();
+  for (const d of doc.domains ?? []) for (const c of d.competencies ?? []) titles.set(c.id, c.title);
+  for (const n of doc.newSkills ?? []) {
+    const domain = DOMAIN_OF[n.domain];
+    if (!domain || known.has(n.id) || !used.has(n.id)) continue;
+    known.add(n.id);
+    let comp = graph.competencies.find((c) => c.id === n.competency);
+    if (!comp) {
+      comp = { id: n.competency, name: titles.get(n.competency) ?? n.competency, domain, skillIds: [] };
+      graph.competencies.push(comp);
+    }
+    comp.skillIds.push(n.id);
+    graph.skills.push({ id: n.id, name: n.name, domain, competency: comp.name });
+    if (n.requires?.length) graph.requires.set(n.id, n.requires);
+  }
+}
+
 /** Objective weights are published percentages; the API uses fractions of 1 that sum to 1. */
 export function toFramework(doc: FrameworkDoc): Framework | null {
   const id = doc.id as FrameworkId;
@@ -165,7 +198,8 @@ async function loadLab(file: string, pack: string | undefined, labs: Map<string,
 /** Reads content/ (skill graph, frameworks, packs) plus optional extra lab directories. */
 export async function loadContent(contentDir: string, extraLabDirs: string[] = []): Promise<Content> {
   const issues: ContentIssue[] = [];
-  const { skills, requires, competencies } = toSkills(await readYaml<SkillGraphDoc>(path.join(contentDir, 'skills.yaml')));
+  const graph = toSkills(await readYaml<SkillGraphDoc>(path.join(contentDir, 'skills.yaml')));
+  const { skills, requires, competencies } = graph;
 
   const frameworks: Framework[] = [];
   const fwDir = path.join(contentDir, 'frameworks');
@@ -192,6 +226,12 @@ export async function loadContent(contentDir: string, extraLabDirs: string[] = [
       const file = path.join(labDir, 'lab.yaml');
       if (await exists(file)) await loadLab(file, undefined, labs, issues);
     }
+  }
+
+  const curriculumFile = path.join(contentDir, 'curriculum.yaml');
+  if (await exists(curriculumFile)) {
+    const used = new Set(Array.from(labs.values()).flatMap(({ lab }) => labSkills(lab)));
+    addCurriculumSkills(await readYaml<CurriculumSkillsDoc>(curriculumFile), graph, used);
   }
 
   // Paths: every course is a path; a pack path concatenates its courses.

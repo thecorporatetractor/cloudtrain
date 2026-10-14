@@ -44,13 +44,16 @@ async function make() {
 }
 
 describe('exam catalog', () => {
-  it('serves the test exam as available and curriculum exams as coming soon', async () => {
+  it('serves the test exam and fully authored curriculum exams as available, the rest as coming soon', async () => {
     const cat = await catalog();
     expect(cat.exams.get(EXAM)?.availability).toBe('available');
     const cka = cat.exams.get('sim-k8s-admin');
-    expect(cka?.availability).toBe('coming-soon');
+    expect(cka?.availability).toBe('available'); // every pool has authored exam tasks
     expect(cka?.def.envTier).toBe('K');
-    expect(cat.exams.get('sim-net-associate')?.def.envTier).toBe('N'); // YAML 1.2
+    const net = cat.exams.get('sim-net-associate');
+    expect(net?.availability).toBe('coming-soon');
+    expect(net?.availabilityNote).toMatch(/still being authored/);
+    expect(net?.def.envTier).toBe('N'); // YAML 1.2
     expect(cat.objectiveNames.get('ckad:deployment')).toBeTruthy();
     expect(cat.issues).toEqual([]);
   });
@@ -114,7 +117,7 @@ describe('exam service', () => {
     // A second start while one runs is refused.
     await expect(svc.start(alice, EXAM)).rejects.toThrow(/in progress/);
     // Coming-soon exams cannot start.
-    await expect(svc.start(alice, 'sim-k8s-admin')).rejects.toThrow(/still being authored/);
+    await expect(svc.start(alice, 'sim-net-associate')).rejects.toThrow(/still being authored/);
   });
 
   it('serves the running attempt without checks, hints or solutions; flags; submit', async () => {

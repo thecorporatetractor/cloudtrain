@@ -1,4 +1,5 @@
 import { existsSync } from 'node:fs';
+import { readdir } from 'node:fs/promises';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { learnerLab, fillParams, revealedHint } from '../src/content/view.js';
@@ -9,10 +10,11 @@ describe('content loader (real content/)', () => {
   it('serves every Kubernetes pack lab, valid against the v3 schema', async () => {
     const c = await realContent();
     expect(c.issues).toEqual([]);
+    const onDisk = (await readdir(path.join(repo, 'content/packs/kubernetes/labs'), { withFileTypes: true })).filter((e) => e.isDirectory()).length;
     const k8s = c.summaries.filter((l) => l.domain === 'kubernetes').map((l) => l.id).sort();
-    expect(k8s).toHaveLength(11);
+    expect(k8s).toHaveLength(onDisk);
     expect(k8s).toContain('drain-yard-worker');
-    expect(c.domains.find((d) => d.id === 'kubernetes')?.labCount).toBe(11);
+    expect(c.domains.find((d) => d.id === 'kubernetes')?.labCount).toBe(onDisk);
   });
 
   it('maps the skill graph and every check skill exists', async () => {
@@ -21,6 +23,12 @@ describe('content loader (real content/)', () => {
     expect(c.skills.length).toBeGreaterThan(100);
     expect(c.skills.find((s) => s.id === 'k8s.cli.contexts')).toMatchObject({ domain: 'kubernetes' });
     for (const l of c.summaries) for (const s of l.skillIds) expect(ids.has(s), `${l.id}: ${s}`).toBe(true);
+    // Curriculum newSkills a pack lab uses join the graph (until promoted into skills.yaml).
+    const git = c.skills.find((s) => s.id === 'linux.git.basics');
+    expect(git).toMatchObject({ domain: 'linux' });
+    expect(c.competencies.find((k) => k.id === 'linux.git')?.skillIds).toContain('linux.git.basics');
+    // ...but unused newSkills do not.
+    expect(ids.has('linux.shell.help-docs')).toBe(false);
   });
 
   it('maps frameworks: ids prefixed per objective, weights summing to 1', async () => {
@@ -38,7 +46,9 @@ describe('content loader (real content/)', () => {
 
   it('turns pack courses and paths into catalog paths', async () => {
     const c = await realContent();
-    expect(c.paths.map((p) => p.id)).toEqual(['k8s-admin-essentials', 'k8s-access-and-networking', 'k8s-cluster-maintenance', 'cka-track']);
+    const ids = c.paths.map((p) => p.id);
+    expect(ids).toEqual(expect.arrayContaining(['k8s-admin-essentials', 'k8s-access-and-networking', 'k8s-cluster-maintenance', 'cka-track']));
+    expect(new Set(ids).size).toBe(ids.length);
     expect(c.paths.find((p) => p.id === 'cka-track')).toMatchObject({ framework: 'cka', domain: 'kubernetes' });
     expect(c.paths.find((p) => p.id === 'cka-track')!.labIds).toHaveLength(11);
     expect(c.summaries.find((l) => l.id === 'two-container-pod')?.pathId).toBe('k8s-admin-essentials');

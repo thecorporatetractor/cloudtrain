@@ -24,10 +24,11 @@ async function make(auth: Authenticator = new DevAuthenticator(alice)) {
 
 describe('HTTP API', () => {
   it('serves the real catalog, labs and skills', async () => {
-    const { app } = await make();
+    const { app, content } = await make();
     const cat = (await app.inject('/api/catalog')).json();
-    expect(cat.labs.filter((l: { domain: string }) => l.domain === 'kubernetes')).toHaveLength(11);
-    expect(cat.paths.length).toBe(4);
+    expect(cat.labs.filter((l: { domain: string }) => l.domain === 'kubernetes')).toHaveLength(content.summaries.filter((l) => l.domain === 'kubernetes').length);
+    expect(cat.labs.length).toBe(content.summaries.length);
+    expect(cat.paths.length).toBe(content.paths.length);
     const lab = await app.inject('/api/labs/etcd-snapshot-restore');
     expect(lab.statusCode).toBe(200);
     expect(lab.body).not.toMatch(/"solution"|"expect"|"misconceptions"/);
