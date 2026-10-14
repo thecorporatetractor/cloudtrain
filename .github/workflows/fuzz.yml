@@ -1,0 +1,59 @@
+# Nightly Go native fuzzing of the lab compiler (lab.yaml parsing, schema
+# validation, asset inlining, parameter resolution). The seed corpora already run
+# as unit tests in ci.yml. A crash fails the run and uploads the failing input
+# (testdata/fuzz/<Target>/...): commit it as a regression seed with the fix.
+# Report-only (scheduled; not a PR check).
+name: fuzz
+
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+    inputs:
+      fuzztime:
+        description: Time budget per target (go test -fuzztime)
+        default: 10m
+        required: false
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  fuzz:
+    name: fuzz (${{ matrix.target }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [FuzzYAMLToJSON, FuzzCompile, FuzzResolveIntParam]
+    defaults:
+      run:
+        working-directory: services/lab-orchestrator
+    steps:
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: services/lab-orchestrator/go.mod
+          cache-dependency-path: services/lab-orchestrator/go.sum
+      - name: go test -fuzz
+        env:
+          TARGET: ${{ matrix.target }}
+          FUZZTIME: ${{ inputs.fuzztime || '10m' }}
+        run: go test ./internal/compile -run '^$' -fuzz "^${TARGET}\$" -fuzztime "$FUZZTIME"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: failure()
+        with:
+          name: fuzz-crashers-${{ matrix.target }}
+          path: services/lab-orchestrator/internal/compile/testdata/fuzz/
+          retention-days: 30
