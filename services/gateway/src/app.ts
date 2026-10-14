@@ -35,6 +35,12 @@ export interface AppDeps {
   hub?: TerminalHub;
 }
 
+/** onRoute hook: an /api route without `config.permission` or `config.public` is a startup error. */
+export function requireDeclaredPermission(r: { url: string; method: string | string[]; config?: unknown }): void {
+  const cfg = (r.config ?? {}) as { permission?: string; public?: boolean };
+  if (r.url.startsWith('/api/') && !cfg.permission && !cfg.public) throw new Error(`route ${String(r.method)} ${r.url} declares no permission`);
+}
+
 const UNSAFE = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 
 /**
@@ -47,6 +53,8 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   const { content, auth, sessions, cluster, platform: ps } = deps;
   const hub = deps.hub ?? new TerminalHub();
   const app = Fastify({ logger: deps.logger ?? false, trustProxy: '127.0.0.1' });
+  // Fail at startup, not at request time: every /api route must declare a permission or be public.
+  app.addHook('onRoute', requireDeclaredPermission);
   await app.register(cookie);
   await app.register(websocket, { options: { maxPayload: 1 << 20 } });
   app.addContentTypeParser('application/x-www-form-urlencoded', { parseAs: 'string' }, (_req, body, done) => done(null, Object.fromEntries(new URLSearchParams(body as string))));
