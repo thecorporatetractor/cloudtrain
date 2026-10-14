@@ -1,0 +1,146 @@
+// Screenshots of the role-based platform views (mock mode), one persona per area.
+//
+//   pnpm --filter web dev -- --port 5199 &
+//   node apps/web/scripts/platform-shots.mjs [--base http://localhost:5199] [--chromium /usr/bin/chromium] [--only sign-in,admin-users]
+//
+// Output: apps/web/docs/screenshots/platform/<view>-<theme>.png. Dark for every
+// view, light and cream for a few. Exits non-zero on a page error.
+import { mkdir } from 'node:fs/promises';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { chromium } from 'playwright-core';
+
+const arg = (name, d) => {
+  const i = process.argv.indexOf(`--${name}`);
+  return i > 0 ? process.argv[i + 1] : d;
+};
+const base = arg('base', 'http://localhost:5199');
+const only = arg('only', '')?.split(',').filter(Boolean);
+const out = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../docs/screenshots/platform');
+await mkdir(out, { recursive: true });
+
+const browser = await chromium.launch({ executablePath: arg('chromium', '/usr/bin/chromium'), args: ['--no-sandbox'] });
+let failed = false;
+
+const PERSONAS = { learner: { userId: 'u-lena', orgId: 'org-quillmoor' }, manager: { userId: 'u-ingrid', orgId: 'org-quillmoor' }, instructor: { userId: 'u-samir', orgId: 'org-quillmoor' }, author: { userId: 'u-aino', orgId: 'org-quillmoor' }, org_admin: { userId: 'u-priya', orgId: 'org-quillmoor' }, platform_admin: { userId: 'u-elin', orgId: 'org-acme' } };
+
+async function session(theme, persona, width = 1440) {
+  const ctx = await browser.newContext({ viewport: { width, height: 900 }, deviceScaleFactor: 1 });
+  await ctx.addInitScript(
+    ({ t, s }) => {
+      localStorage.setItem('ct.theme', t);
+      localStorage.setItem('ct.mock.session', s);
+      localStorage.setItem('ct.nav.collapsed', '0');
+    },
+    { t: theme, s: persona === 'none' ? 'none' : JSON.stringify(PERSONAS[persona]) },
+  );
+  const page = await ctx.newPage();
+  page.on('pageerror', (e) => {
+    if (/ServiceWorker/.test(e.message)) return;
+    console.log('PAGE ERROR', e.message);
+    failed = true;
+  });
+  page.on('console', (m) => {
+    if (m.type() === 'error' && !/ServiceWorker|favicon|net::ERR/.test(m.text())) console.log('CONSOLE', m.text().slice(0, 200));
+  });
+  return { ctx, page };
+}
+
+async function open(page, url, waitFor) {
+  await page.goto(base + url, { waitUntil: 'networkidle' });
+  if (waitFor) await page.getByText(waitFor, { exact: false }).first().waitFor({ timeout: 15000 });
+  await page.waitForTimeout(600);
+}
+
+async function shot(page, name) {
+  await page.screenshot({ path: path.join(out, `${name}.png`) });
+  console.log('saved', `${name}.png`);
+}
+
+/** [name, persona, url, waitFor, extra steps] */
+const VIEWS = [
+  ['sign-in', 'none', '/sign-in', 'Sign in'],
+  ['sign-in-sso', 'none', '/sign-in', 'Sign in', async (p) => (await p.getByLabel('Work email').fill('lena.varga@quillmoor.example'), await p.getByRole('button', { name: 'Continue' }).click(), await p.getByText('Continue with').waitFor())],
+  ['sign-in-password', 'none', '/sign-in', 'Sign in', async (p) => (await p.getByLabel('Work email').fill('june.park@acmefreight.example'), await p.getByRole('button', { name: 'Continue' }).click(), await p.getByLabel('Password').waitFor())],
+  ['sign-in-expired', 'none', '/sign-in?reason=expired&returnTo=%2Fteam', 'session expired'],
+  ['forbidden', 'learner', '/admin', 'not available to you'],
+  ['home-learner', 'learner', '/', 'Assignments due'],
+  ['assignments', 'learner', '/assignments', 'My assignments'],
+  ['history', 'learner', '/history', 'History'],
+  ['history-attempt', 'learner', '/history', 'History', async (p) => (await p.locator('tr.row-link').first().click(), await p.getByText('Checks').first().waitFor())],
+  ['exams', 'learner', '/exams', 'Exam simulations'],
+  ['user-menu', 'manager', '/', 'Next best lab', async (p) => (await p.getByRole('button', { name: 'Account menu' }).click(), await p.getByText('Organisation').waitFor())],
+  ['persona-switcher', 'manager', '/', 'Next best lab', async (p) => (await p.getByRole('button', { name: 'Demo persona' }).click(), await p.getByText('Demo persona · mock mode').waitFor())],
+  ['team-dashboard', 'manager', '/team', 'Members × competencies'],
+  ['team-member', 'manager', '/team/members/u-lena?team=t-platrel', 'Lena Varga'],
+  ['team-assign', 'manager', '/team/assign?team=t-platrel', 'Assign work', async (p) => (await p.getByRole('radio', { name: /Isolate the payments/ }).click(), await p.waitForTimeout(200))],
+  ['team-assignments', 'manager', '/team/assignments?team=t-platrel', 'Assignments'],
+  ['team-assignment-detail', 'manager', '/team/assignments?team=t-platrel', 'Assignments', async (p) => (await p.locator('tr.row-link').first().click(), await p.getByText('People').waitFor())],
+  ['team-exams', 'manager', '/team/exams?team=t-platrel', 'Exam readiness'],
+  ['cohorts', 'instructor', '/cohorts', 'Cohorts'],
+  ['cohort-board', 'instructor', '/cohorts/c-cks-q4', 'Live board'],
+  ['cohort-terminate', 'instructor', '/cohorts/c-cks-q4', 'Live board', async (p) => (await p.getByRole('button', { name: /Session actions for Lena/ }).click(), await p.getByText('Terminate').click(), await p.getByText('Terminate Lena').waitFor())],
+  ['observe', 'instructor', '/cohorts/c-cks-q4/observe/ls-lena-netpol', 'Observing', async (p) => p.waitForTimeout(6000)],
+  ['workspace-observed', 'learner', '/labs/orchard-netpol-isolation/work', 'CHECKS', async (p) => (await p.getByText('An instructor is observing').waitFor({ timeout: 30000 }), await p.waitForTimeout(500))],
+  ['studio-author', 'author', '/studio', 'Scenario Studio'],
+  ['admin-overview', 'org_admin', '/admin', 'Recent activity'],
+  ['admin-users', 'org_admin', '/admin/users', 'Pending invitations'],
+  ['admin-user-edit', 'org_admin', '/admin/users?user=u-samir', 'Samir Haddad', async (p) => p.getByText('Roles').first().waitFor()],
+  ['admin-invite', 'org_admin', '/admin/users?invite=true', 'Invite someone'],
+  ['admin-deactivate', 'org_admin', '/admin/users?user=u-kofi', 'Kofi Mensah', async (p) => (await p.getByRole('button', { name: 'Deactivate' }).click(), await p.getByText('running labs will be terminated').waitFor())],
+  ['admin-teams', 'org_admin', '/admin/teams?team=t-platrel', 'Members'],
+  ['admin-sso', 'org_admin', '/admin/sso', 'Identity providers'],
+  ['admin-sso-connection', 'org_admin', '/admin/sso?connection=sso-1', 'Group → roles'],
+  ['admin-sso-wizard', 'org_admin', '/admin/sso?add=true', 'Add an identity provider'],
+  ['admin-content', 'org_admin', '/admin/content', 'Pinned paths'],
+  ['admin-sessions', 'org_admin', '/admin/sessions', 'Running'],
+  ['admin-usage', 'org_admin', '/admin/usage', 'Quotas'],
+  ['admin-audit', 'org_admin', '/admin/audit', 'Export CSV'],
+  ['admin-audit-detail', 'org_admin', '/admin/audit', 'Export CSV', async (p) => (await p.locator('tr.row-link').first().click(), await p.getByText('Details').waitFor())],
+  ['admin-settings', 'org_admin', '/admin/settings', 'Organisation'],
+  ['platform-orgs', 'platform_admin', '/platform', 'Organisations'],
+  ['platform-org', 'platform_admin', '/platform?org=org-quillmoor', 'Quotas'],
+  ['platform-capacity', 'platform_admin', '/platform/capacity', 'Cluster nodes'],
+  ['platform-content', 'platform_admin', '/platform/content', 'Global packs'],
+];
+
+try {
+  for (const [name, persona, url, waitFor, extra] of VIEWS) {
+    if (only?.length && !only.includes(name)) continue;
+    const { ctx, page } = await session('dark', persona);
+    try {
+      await open(page, url, waitFor);
+      if (extra) await extra(page);
+      await page.waitForTimeout(300);
+      await shot(page, `${name}-dark`);
+    } catch (e) {
+      console.log('FAILED', name, e.message.split('\n')[0]);
+      failed = true;
+      await shot(page, `${name}-dark-FAILED`).catch(() => {});
+    }
+    await ctx.close();
+  }
+  if (!only?.length) {
+    for (const theme of ['light', 'cream']) {
+      for (const [name, persona, url, waitFor] of [VIEWS[0], VIEWS.find((v) => v[0] === 'team-dashboard'), VIEWS.find((v) => v[0] === 'cohort-board'), VIEWS.find((v) => v[0] === 'admin-users'), VIEWS.find((v) => v[0] === 'admin-sso')]) {
+        const { ctx, page } = await session(theme, persona);
+        await open(page, url, waitFor);
+        await shot(page, `${name}-${theme}`);
+        await ctx.close();
+      }
+    }
+    // Tables at 1280px.
+    for (const [name, persona, url, waitFor] of [VIEWS.find((v) => v[0] === 'team-dashboard'), VIEWS.find((v) => v[0] === 'cohort-board'), VIEWS.find((v) => v[0] === 'admin-audit')]) {
+      const { ctx, page } = await session('dark', persona, 1280);
+      await open(page, url, waitFor);
+      await shot(page, `${name}-dark-1280`);
+      await ctx.close();
+    }
+  }
+} catch (e) {
+  console.log('FAILED', e.message);
+  failed = true;
+} finally {
+  await browser.close();
+}
+process.exit(failed ? 1 : 0);

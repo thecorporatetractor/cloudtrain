@@ -89,6 +89,34 @@ tasks:
     desc: Delete all demo lab namespaces
     cmds: [bash deploy/scripts/lab-demo.sh --clean]
 
+  # ------------------------------------------------------- platform dependencies
+  # Postgres 17 (127.0.0.1:55432), Keycloak 26 (http://localhost:8180, admin/admin-dev-only),
+  # Mailpit (http://localhost:8025, SMTP 1025). Compose project cloudtrain-dev-deps only.
+
+  dev:deps:
+    desc: 'Start Postgres, Keycloak and Mailpit (deploy/dev/compose.yaml), migrate, seed when empty, sync Keycloak organizations'
+    cmds:
+      - docker compose -f deploy/dev/compose.yaml up -d --wait
+      - pnpm --filter @cloudtrain/gateway db:migrate
+      - pnpm --filter @cloudtrain/gateway db:seed --if-empty
+      - pnpm --filter @cloudtrain/gateway kc:sync
+
+  dev:deps:down:
+    desc: Stop the platform dependencies (data volume kept; dev:deps:reset also deletes it)
+    cmds: [docker compose -f deploy/dev/compose.yaml down]
+
+  dev:deps:reset:
+    desc: Delete the platform dependencies and their data (fresh realm import and seed on next dev:deps)
+    cmds: [docker compose -f deploy/dev/compose.yaml down -v]
+
+  dev:seed:
+    desc: 'Re-seed the fictional dev data (replaces the seeded orgs; DEV ONLY)'
+    cmds: [pnpm --filter @cloudtrain/gateway db:seed, pnpm --filter @cloudtrain/gateway kc:sync]
+
+  dev:realms:
+    desc: Regenerate the Keycloak realm imports from deploy/dev/people.json (then dev:deps:reset + dev:deps)
+    cmds: [node deploy/dev/keycloak/gen-realms.mjs]
+
   # ---------------------------------------------------------------- web + gateway
   # Real-mode development: `task dev:orchestrator`, `task dev:gateway` and
   # `task dev:web` in three terminals. Every kubectl/manager call is pinned to
@@ -101,20 +129,12 @@ tasks:
     cmds: [go build -o services/lab-orchestrator/bin/labctl ./services/lab-orchestrator/cmd/labctl]
 
   dev:orchestrator:
-    desc: Run the lab-orchestrator manager locally, scoped to CT_NAMESPACE (default cloudtrain-sessions) on CT_KUBE_CONTEXT
-    vars:
-      CTX: '{{.CT_KUBE_CONTEXT | default "kind-cloudtrain-dev"}}'
-      NS: '{{.CT_NAMESPACE | default "cloudtrain-sessions"}}'
-      KCFG: '{{.ROOT_DIR}}/.cache/kubeconfig-{{.CTX}}'
+    desc: Deploy the lab-orchestrator into the cluster for the web/gateway sessions (scoped to sessions the gateway creates; ephemeral VM disks)
     cmds:
-      - mkdir -p .cache
-      # A one-context kubeconfig: controller-runtime uses the current context, and this keeps the user's file untouched.
-      - kubectl config view --minify --flatten --context {{.CTX}} > {{.KCFG}}
-      # Install the CRDs only when absent: other streams' managers may share them.
-      - for f in services/lab-orchestrator/config/crd/*.yaml; do kubectl --context {{.CTX}} get -f "$f" >/dev/null 2>&1 || kubectl --context {{.CTX}} apply -f "$f"; done
-      - kubectl --context {{.CTX}} get namespace {{.NS}} >/dev/null 2>&1 || kubectl --context {{.CTX}} create namespace {{.NS}}
-      # Always namespace-scoped: an unscoped manager would reconcile (and fail) other sessions in the cluster.
-      - KUBECONFIG={{.KCFG}} go run ./services/lab-orchestrator/cmd/manager --watch-namespace={{.NS}} --health-probe-bind-address=127.0.0.1:8081
+      # In-cluster, not `go run`: the image bundles helm and the vcluster chart the drivers need.
+      # Scoped by label so it never reconciles other managers' verify sessions.
+      - for f in services/lab-orchestrator/config/crd/labs.cloudtrain.dev_*.yaml; do kubectl --context kind-{{.CLUSTER_NAME}} get -f "$f" >/dev/null 2>&1 || kubectl --context kind-{{.CLUSTER_NAME}} apply -f "$f"; done
+      - ORCH_NAMESPACE=cloudtrain-system SESSION_SELECTOR=app.kubernetes.io/managed-by=cloudtrain-gateway SKIP_CRDS=1 VM_DISKS=${VM_DISKS:-ephemeral} LOAD_LAB_IMAGES=${LOAD_LAB_IMAGES:-0} bash deploy/scripts/orchestrator-deploy.sh
 
   dev:gateway:
     desc: Run services/gateway (BFF for apps/web) against CT_KUBE_CONTEXT, sessions in CT_NAMESPACE (default cloudtrain-sessions)
@@ -125,6 +145,10 @@ tasks:
     env:
       CT_KUBE_CONTEXT: '{{.CTX}}'
       CT_NAMESPACE: '{{.NS}}'
+      # Dev only: the acme-idp realm stands in for AzarGuard's Entra tenant (may grant platform_admin),
+      # and domain verification accepts without the DNS TXT record.
+      CT_PLATFORM_IDPS: '{{.CT_PLATFORM_IDPS | default "azarguard-entra,acme-idp"}}'
+      CT_DEV_DOMAIN_VERIFY_BYPASS: '{{.CT_DEV_DOMAIN_VERIFY_BYPASS | default "1"}}'
     cmds:
       - pnpm --filter @cloudtrain/lab-schema build
       - kubectl --context {{.CTX}} get namespace {{.NS}} >/dev/null 2>&1 || kubectl --context {{.CTX}} create namespace {{.NS}}

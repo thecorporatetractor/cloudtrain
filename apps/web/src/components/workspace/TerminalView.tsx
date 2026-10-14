@@ -21,7 +21,7 @@ interface Props {
 }
 
 /** The whole xterm palette comes from the --term-* tokens, so every theme (including the light ones) applies to the terminal. */
-function readTheme(): ITheme {
+export function readTerminalTheme(): ITheme {
   const cs = getComputedStyle(document.documentElement);
   const v = (name: string) => cs.getPropertyValue(name).trim();
   const blue = v('--term-blue');
@@ -75,7 +75,7 @@ export function TerminalView({ lab, source, active, onOpenNode, ownsKey, session
       cursorStyle: 'bar',
       scrollback: 4000,
       allowProposedApi: true,
-      theme: readTheme(),
+      theme: readTerminalTheme(),
       // A real PTY already sends CRLF; the fake shell writes bare LF.
       convertEol: !(sessionId && source.kind === 'console'),
     });
@@ -130,7 +130,7 @@ export function TerminalView({ lab, source, active, onOpenNode, ownsKey, session
     if (!term) return;
     // Wait a frame so the new CSS variables have applied.
     const id = requestAnimationFrame(() => {
-      term.options.theme = readTheme();
+      term.options.theme = readTerminalTheme();
     });
     return () => cancelAnimationFrame(id);
   }, [theme]);

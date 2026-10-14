@@ -1,10 +1,10 @@
 import { Link, useNavigate } from '@tanstack/react-router';
 import { Panel, PanelGroup, PanelResizeHandle, type ImperativePanelHandle } from 'react-resizable-panels';
-import { AlertTriangle, CheckCircle2, ChevronLeft, Keyboard, Loader2, Maximize2, Minimize2, Network, PanelLeft, PanelLeftClose, PanelRight, Play, Power, X } from 'lucide-react';
+import { AlertTriangle, CheckCircle2, ChevronLeft, Eye, Keyboard, Lightbulb, Loader2, Maximize2, Megaphone, Minimize2, Network, PanelLeft, PanelLeftClose, PanelRight, Play, Power, X } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ApiError, useEndSession, useLab, useRevealHint, useSession, useStartSession, useValidate } from '@/api/client';
 import { isRealApi } from '@/api/mode';
-import type { LabSession, TopologyLink, ValidateResponse } from '@/api/types';
+import type { LabSession, SessionNotice, TopologyLink, ValidateResponse } from '@/api/types';
 import { useScreenShortcuts, useShell } from '@/app/shell-context';
 import { DifficultyBadge, SkillTags, StatusDot } from '@/components/domain';
 import { Badge, Button, ErrorState, Kbd, Skeleton, Tooltip } from '@/components/ui';
@@ -82,6 +82,7 @@ export function Workspace() {
   const reveal = useRevealHint(search.s);
   const end = useEndSession(search.s);
   const [lastResult, setLastResult] = useState<ValidateResponse | null>(null);
+  const [dismissedNotices, setDismissedNotices] = useState<Set<string>>(() => new Set());
 
   // Start (or restart) a session when none is attached or it is gone.
   const startingRef = useRef(false);
@@ -267,6 +268,8 @@ export function Workspace() {
   const gradingNote = lastResult?.grading && lastResult.grading.state !== 'complete' ? lastResult.grading : undefined;
   const passedCount = s?.results.filter((r) => r.status === 'pass').length ?? 0;
   const done = s?.status === 'passed';
+  const observers = (s?.notices ?? []).filter((n) => n.kind === 'observed' && n.active !== false);
+  const messages = (s?.notices ?? []).filter((n) => n.kind !== 'observed' && !dismissedNotices.has(n.id));
 
   const taskPanel = (
     <Panel id="task" ref={taskRef} collapsible collapsedSize={0} minSize={18} defaultSize={28} maxSize={45} order={layout.taskSide === 'left' ? 0 : 2} onCollapse={() => setLayout((x) => ({ ...x, taskCollapsed: true }))} onExpand={() => setLayout((x) => ({ ...x, taskCollapsed: false }))} className="ws-task-panel">
@@ -368,6 +371,20 @@ export function Workspace() {
         </div>
       </header>
 
+      {observers.length > 0 && (
+        <div className="ws-notice ws-notice-observed" role="status" aria-live="polite">
+          <span className="row small" style={{ gap: 8 }}>
+            <Eye size={13} />
+            <strong>An instructor is observing this session</strong>
+            <span className="muted">
+              · {observers.map((n) => n.from?.name ?? 'Instructor').join(', ')} can see your terminal (read-only) · this is recorded in the audit log
+            </span>
+          </span>
+        </div>
+      )}
+      {messages.map((n) => (
+        <NoticeBar key={n.id} notice={n} onDismiss={() => setDismissedNotices((d) => new Set(d).add(n.id))} />
+      ))}
       {lastResult && gradingNote && (
         <div className="ws-result ws-result-partial" role="status">
           <span className="row small" style={{ gap: 8 }}>
@@ -435,6 +452,21 @@ export function Workspace() {
         </PanelGroup>
       </div>
 
+    </div>
+  );
+}
+
+function NoticeBar({ notice, onDismiss }: { notice: SessionNotice; onDismiss: () => void }) {
+  const hint = notice.kind === 'hint';
+  const control = notice.kind === 'extended' || notice.kind === 'reset' || notice.kind === 'terminated';
+  return (
+    <div className={cn('ws-notice', hint && 'ws-notice-hint', control && 'ws-notice-control')} role="status">
+      <span className="row small" style={{ gap: 8, minWidth: 0 }}>
+        {hint ? <Lightbulb size={13} /> : <Megaphone size={13} />}
+        <strong>{notice.from?.name ?? 'Instructor'}</strong>
+        <span className="muted truncate">{notice.message}</span>
+      </span>
+      <Button variant="ghost" size="sm" iconOnly aria-label="Dismiss" icon={<X size={12} />} onClick={onDismiss} />
     </div>
   );
 }

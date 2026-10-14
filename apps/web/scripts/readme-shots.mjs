@@ -20,9 +20,18 @@ await mkdir(out, { recursive: true });
 const browser = await chromium.launch({ executablePath: arg('chromium', '/usr/bin/chromium'), args: ['--no-sandbox'] });
 let failed = false;
 
-async function session(theme) {
+// Mock-mode accounts (see src/mocks/fixtures/platform.ts): one per role.
+const PERSONAS = { learner: { userId: 'u-lena', orgId: 'org-quillmoor' }, manager: { userId: 'u-ingrid', orgId: 'org-quillmoor' }, instructor: { userId: 'u-samir', orgId: 'org-quillmoor' }, author: { userId: 'u-aino', orgId: 'org-quillmoor' }, org_admin: { userId: 'u-priya', orgId: 'org-quillmoor' } };
+
+async function session(theme, persona = 'manager') {
   const ctx = await browser.newContext({ viewport: { width: 1440, height: 900 }, deviceScaleFactor: 1 });
-  await ctx.addInitScript((t) => localStorage.setItem('ct.theme', t), theme);
+  await ctx.addInitScript(
+    ({ t, s }) => {
+      localStorage.setItem('ct.theme', t);
+      localStorage.setItem('ct.mock.session', s);
+    },
+    { t: theme, s: persona === 'none' ? 'none' : JSON.stringify(PERSONAS[persona]) },
+  );
   const page = await ctx.newPage();
   page.on('pageerror', (e) => {
     if (/ServiceWorker/.test(e.message)) return; // dev-server MSW update check, harmless
@@ -75,11 +84,13 @@ try {
   await open(page, '/skills', 'Skills');
   await shot(page, 'skills');
 
-  await open(page, '/studio/draft-netpol-v4', 'Verification');
-  await shot(page, 'studio');
-
-  await open(page, '/team', 'Team');
+  await open(page, '/team', 'Members × competencies');
   await shot(page, 'team');
+
+  await open(page, '/team/assign?team=t-platrel', 'Assign work');
+  await page.getByRole('radio', { name: /Isolate the payments/ }).click();
+  await page.waitForTimeout(300);
+  await shot(page, 'assign');
 
   await open(page, '/', 'Next best lab');
   await page.keyboard.press('Control+k');
@@ -88,6 +99,22 @@ try {
   await page.waitForTimeout(600);
   await shot(page, 'command-palette');
   await ctx.close();
+
+  // Role-specific areas, each with the account that owns them.
+  const views = [
+    ['author', '/studio/draft-netpol-v4', 'Verification', 'studio'],
+    ['instructor', '/cohorts/c-cks-q4', 'Live board', 'instructor-board'],
+    ['org_admin', '/admin/users', 'Pending invitations', 'admin-users'],
+    ['org_admin', '/admin/sso', 'Identity providers', 'admin-sso'],
+    ['org_admin', '/admin/audit', 'Export CSV', 'audit-log'],
+    ['none', '/sign-in', 'Sign in', 'sign-in'],
+  ];
+  for (const [persona, url, waitFor, name] of views) {
+    const s = await session('dark', persona);
+    await open(s.page, url, waitFor);
+    await shot(s.page, name);
+    await s.ctx.close();
+  }
 
   for (const theme of ['light', 'cream']) {
     const s = await session(theme);

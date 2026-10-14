@@ -58,7 +58,9 @@ if [[ ${LOAD_LAB_IMAGES:-1} == 1 ]]; then
 fi
 
 # ORCH_NAMESPACE deploys a separate instance (its own namespace, ClusterRoleBinding
-# and leader-election lease); SESSION_SELECTOR restricts it to matching
+# and leader-election lease); VM_DISKS (default ephemeral: a persistent kubeadm
+# session costs ~16 GB of disk, so local verification uses containerDisks; set
+# VM_DISKS=persistent to exercise hibernate); SESSION_SELECTOR restricts it to matching
 # LabSessions (e.g. labs.cloudtrain.dev/verify=true for labctl verify), so
 # several managers can share the cluster without reconciling each other's
 # sessions. Defaults: cloudtrain-system, all sessions. SKIP_CRDS=1 leaves the
@@ -66,14 +68,15 @@ fi
 NS=${ORCH_NAMESPACE:-cloudtrain-system}
 manifests() {
   kubectl kustomize "$SVC/config/default" \
-    | NS="$NS" IMG="$IMG" SEL="${SESSION_SELECTOR:-}" yq '
+    | NS="$NS" IMG="$IMG" SEL="${SESSION_SELECTOR:-}" VMD="${VM_DISKS:-ephemeral}" yq '
         (select(.kind == "Namespace") | .metadata.name) = strenv(NS) |
         (select(.metadata.namespace == "cloudtrain-system") | .metadata.namespace) = strenv(NS) |
         (select(.kind == "ClusterRoleBinding") | .metadata.name) = "lab-orchestrator-" + strenv(NS) |
         (select(.kind == "ClusterRoleBinding") | .subjects[0].namespace) = strenv(NS) |
         (select(.kind == "Deployment") | .spec.template.spec.containers[0].image) = strenv(IMG) |
         (select(.kind == "Deployment") | .spec.template.spec.containers[0].args) += ["--leader-election-id=lab-orchestrator-" + strenv(NS)] |
-        (select(.kind == "Deployment" and strenv(SEL) != "") | .spec.template.spec.containers[0].args) += ["--session-selector=" + strenv(SEL)]' \
+        (select(.kind == "Deployment" and strenv(SEL) != "") | .spec.template.spec.containers[0].args) += ["--session-selector=" + strenv(SEL)] |
+        (select(.kind == "Deployment") | .spec.template.spec.containers[0].args) += ["--vm-disks=" + strenv(VMD)]' \
     | if [[ ${SKIP_CRDS:-0} == 1 ]]; then yq 'select(.kind != "CustomResourceDefinition")'; else cat; fi
 }
 log "applying CRDs, RBAC and manager ($IMG) in $NS${SESSION_SELECTOR:+, sessions $SESSION_SELECTOR}"
