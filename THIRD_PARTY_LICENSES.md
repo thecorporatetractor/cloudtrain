@@ -10,6 +10,7 @@ distributed as separate images and not linked into CloudTrain.
 | Package | Version | License |
 |---|---|---|
 | @fastify/ajv-compiler | 4.0.7 | MIT |
+| @fastify/cookie | 11.1.3 | MIT |
 | @fastify/deepmerge | 3.2.2 | MIT |
 | @fastify/error | 4.2.1 | MIT |
 | @fastify/fast-json-stringify-compiler | 5.1.1 | MIT |
@@ -159,6 +160,7 @@ distributed as separate images and not linked into CloudTrain.
 | json-schema-ref-resolver | 3.0.1 | MIT |
 | json-schema-traverse | 1.0.0 | MIT |
 | jsonpath-plus | 10.4.0 | MIT |
+| kysely | 0.29.6 | MIT |
 | light-my-request | 6.8.0 | BSD-3-Clause |
 | loose-envify | 1.4.0 | MIT |
 | lucide-react | 0.460.0 | ISC |
@@ -167,13 +169,26 @@ distributed as separate images and not linked into CloudTrain.
 | mime-types | 2.1.35 | MIT |
 | ms | 2.1.3 | MIT |
 | node-fetch | 2.7.0 | MIT |
+| nodemailer | 10.1.0 | MIT-0 |
 | oauth4webapi | 3.8.8 | MIT |
 | on-exit-leak-free | 2.1.2 | MIT |
 | once | 1.4.0 | ISC |
 | openid-client | 6.8.8 | MIT |
+| pg | 8.23.1 | MIT |
+| pg-cloudflare | 1.4.1 | MIT |
+| pg-connection-string | 2.14.1 | MIT |
+| pg-int8 | 1.0.1 | ISC |
+| pg-pool | 3.14.0 | MIT |
+| pg-protocol | 1.16.1 | MIT |
+| pg-types | 2.2.0 | MIT |
+| pgpass | 1.0.5 | MIT |
 | pino | 10.4.0 | MIT |
 | pino-abstract-transport | 3.0.0 | MIT |
 | pino-std-serializers | 7.1.0 | MIT |
+| postgres-array | 2.0.0 | MIT |
+| postgres-bytea | 1.0.1 | MIT |
+| postgres-date | 1.0.7 | MIT |
+| postgres-interval | 1.2.0 | MIT |
 | process-warning | 5.1.1 | MIT |
 | pump | 3.0.4 | MIT |
 | quick-format-unescaped | 4.0.4 | MIT |
@@ -225,6 +240,7 @@ distributed as separate images and not linked into CloudTrain.
 | whatwg-url | 5.0.0 | MIT |
 | wrappy | 1.0.2 | ISC |
 | ws | 8.22.0 | MIT |
+| xtend | 4.0.2 | MIT |
 | yaml | 2.9.1 | ISC |
 | zustand | 4.5.7 | MIT |
 
@@ -236,7 +252,7 @@ distributed as separate images and not linked into CloudTrain.
 | github.com/antlr4-go/antlr/v4 | BSD-3-Clause |
 | github.com/beorn7/perks/quantile | MIT |
 | github.com/blang/semver/v4 | MIT |
-| github.com/cenkalti/backoff/v4 | MIT |
+| github.com/cenkalti/backoff/v5 | MIT |
 | github.com/cespare/xxhash/v2 | MIT |
 | github.com/davecgh/go-spew/spew | ISC |
 | github.com/emicklei/go-restful/v3 | MIT |
@@ -263,6 +279,7 @@ distributed as separate images and not linked into CloudTrain.
 | github.com/json-iterator/go | MIT |
 | github.com/mailru/easyjson | MIT |
 | github.com/moby/spdystream | Apache-2.0 |
+| github.com/moby/spdystream/spdy | BSD-3-Clause |
 | github.com/modern-go/concurrent | Apache-2.0 |
 | github.com/modern-go/reflect2 | Apache-2.0 |
 | github.com/munnerz/goautoneg | BSD-3-Clause |
@@ -281,11 +298,17 @@ distributed as separate images and not linked into CloudTrain.
 | go.opentelemetry.io/auto/sdk | Apache-2.0 |
 | go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp | Apache-2.0 |
 | go.opentelemetry.io/otel | Apache-2.0 |
+| go.opentelemetry.io/otel | BSD-3-Clause |
 | go.opentelemetry.io/otel/exporters/otlp/otlptrace | Apache-2.0 |
+| go.opentelemetry.io/otel/exporters/otlp/otlptrace | BSD-3-Clause |
 | go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc | Apache-2.0 |
+| go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc | BSD-3-Clause |
 | go.opentelemetry.io/otel/metric | Apache-2.0 |
+| go.opentelemetry.io/otel/metric | BSD-3-Clause |
 | go.opentelemetry.io/otel/sdk | Apache-2.0 |
+| go.opentelemetry.io/otel/sdk | BSD-3-Clause |
 | go.opentelemetry.io/otel/trace | Apache-2.0 |
+| go.opentelemetry.io/otel/trace | BSD-3-Clause |
 | go.opentelemetry.io/proto/otlp | Apache-2.0 |
 | go.uber.org/multierr | MIT |
 | go.uber.org/zap | MIT |
