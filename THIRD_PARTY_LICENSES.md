@@ -293,7 +293,6 @@ distributed as separate images and not linked into CloudTrain.
 | github.com/santhosh-tekuri/jsonschema/v6 | Apache-2.0 |
 | github.com/spf13/cobra | Apache-2.0 |
 | github.com/spf13/pflag | BSD-3-Clause |
-| github.com/stoewer/go-strcase | MIT |
 | github.com/x448/float16 | MIT |
 | go.opentelemetry.io/auto/sdk | Apache-2.0 |
 | go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp | Apache-2.0 |
@@ -312,6 +311,7 @@ distributed as separate images and not linked into CloudTrain.
 | go.opentelemetry.io/proto/otlp | Apache-2.0 |
 | go.uber.org/multierr | MIT |
 | go.uber.org/zap | MIT |
+| go.yaml.in/yaml/v3 | MIT |
 | golang.org/x/crypto | BSD-3-Clause |
 | golang.org/x/exp | BSD-3-Clause |
 | golang.org/x/net | BSD-3-Clause |
