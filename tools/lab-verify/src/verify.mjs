@@ -213,7 +213,9 @@ export async function checkLab(labFile, skills, frameworkRefs, findings, ctx = {
   if (doc.metadata.id !== dirName) findings.push({ level: "error", file: labFile, path: "/metadata/id", message: `id '${doc.metadata.id}' must match directory '${dirName}'` });
 
   for (const f of doc.metadata.frameworks ?? []) {
-    if (!frameworkRefs.has(f)) findings.push({ level: "error", file: labFile, path: "/metadata/frameworks", message: `unknown framework objective '${f}'` });
+    // Objectives may also come from frameworks declared only in content/curriculum.yaml
+    // (CloudTrain's own capstone frameworks, e.g. ct-platform); those carry no skill map.
+    if (!frameworkRefs.has(f) && !ctx.curriculumRefs?.has(f)) findings.push({ level: "error", file: labFile, path: "/metadata/frameworks", message: `unknown framework objective '${f}'` });
   }
 
   const spec = doc.spec;
@@ -433,10 +435,12 @@ export async function verifyContent(contentDir, opts = {}) {
   const labs = [];
   // Exam tasks (curriculum labs of type exam) follow exam rules: no hints, no course.
   const examTasks = new Set();
+  const curriculumRefs = new Set();
   const curriculumFile = path.join(contentDir, "curriculum.yaml");
   if (existsSync(curriculumFile)) {
     const cur = await loadYaml(curriculumFile, []);
     for (const l of cur?.labs ?? []) if (l?.type === "exam") examTasks.add(l.id);
+    for (const f of cur?.frameworks ?? []) for (const o of f?.objectives ?? []) curriculumRefs.add(`${f.id}:${o.id}`);
   }
   /** @type {Map<string, { domain?: string, frameworks?: string[] }>} */
   const packLabs = new Map();
@@ -452,7 +456,7 @@ export async function verifyContent(contentDir, opts = {}) {
         continue;
       }
       const before = findings.filter((f) => f.level === "error").length;
-      const doc = await checkLab(labFile, skills, frameworkRefs, findings, { catalog, usedSkills, examTasks });
+      const doc = await checkLab(labFile, skills, frameworkRefs, findings, { catalog, usedSkills, examTasks, curriculumRefs });
       const ok = findings.filter((f) => f.level === "error").length === before;
       labs.push({ file: labFile, id: doc?.metadata?.id ?? lab, ok, checks: doc?.spec?.checks?.length ?? 0 });
       packLabs.set(doc?.metadata?.id ?? lab, { domain: doc?.metadata?.domain, frameworks: doc?.metadata?.frameworks ?? [] });
