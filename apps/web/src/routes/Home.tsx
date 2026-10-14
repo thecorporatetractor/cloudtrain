@@ -1,10 +1,11 @@
 import { Link } from '@tanstack/react-router';
-import { ArrowRight, CheckCircle2, Flame, Lightbulb, Play, Route, Sparkles, Trophy } from 'lucide-react';
+import { ArrowRight, CheckCircle2, ClipboardList, Flame, Lightbulb, Play, Route, Sparkles, Trophy } from 'lucide-react';
 import type { ReactNode } from 'react';
 import { useCatalog, useHome, useSkills } from '@/api/client';
 import type { Activity, LabSummary, Recommendation } from '@/api/types';
 import { Bar, Delta, Ring } from '@/components/charts';
 import { DifficultyBadge, DomainIcon, ReasonList, domainLabel } from '@/components/domain';
+import { AssignmentStateBadge, DueDate, ItemLink } from '@/components/platform';
 import { Badge, Card, ErrorState, PageSkeleton, Stat } from '@/components/ui';
 import { frameworkDomainLabel } from '@/lib/readiness';
 import { daysUntil, formatDate, formatMinutes, pct, relativeTime } from '@/lib/utils';
@@ -29,7 +30,7 @@ export function Home() {
     );
   }
 
-  const { learner, recommendations, goal, activity, masteryByDomain } = home.data;
+  const { learner, recommendations, goal, activity, masteryByDomain, assignmentsDue } = home.data;
   const labOf = (id: string) => catalog.data.labs.find((l) => l.id === id);
   const framework = skills.data?.frameworks.find((f) => f.id === goal.frameworkId);
   const [top, ...others] = recommendations;
@@ -90,6 +91,29 @@ export function Home() {
         </div>
 
         <div className="stack" style={{ gap: 20 }}>
+          {assignmentsDue && assignmentsDue.length > 0 && (
+            <Card className="card-flush">
+              <div className="card-head">
+                <h2 className="row" style={{ gap: 8 }}>
+                  <ClipboardList size={15} className="subtle" /> Assignments due
+                </h2>
+                <Link to="/assignments" className="link-quiet small">
+                  All <ArrowRight size={12} />
+                </Link>
+              </div>
+              <ul className="due-list">
+                {assignmentsDue.map((a) => (
+                  <li key={a.id} className="due-row">
+                    <span className="stack grow" style={{ gap: 2, minWidth: 0 }}>
+                      <ItemLink item={a.item} className="small truncate link-strong" />
+                      <DueDate dueAt={a.dueAt} />
+                    </span>
+                    <AssignmentStateBadge state={a.status} />
+                  </li>
+                ))}
+              </ul>
+            </Card>
+          )}
           <Card className="card-flush">
             <div className="card-head">
               <h2>Goal: {framework?.name ?? goal.frameworkId.toUpperCase()}</h2>

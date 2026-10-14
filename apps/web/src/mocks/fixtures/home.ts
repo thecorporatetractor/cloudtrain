@@ -6,10 +6,10 @@ import { frameworks, skillStates, skills } from './skills';
 export const learner: Learner = {
   id: 'u-ingrid',
   name: 'Ingrid Solvang',
-  email: 'ingrid.solvang@tessera-freight.example',
+  email: 'ingrid.solvang@quillmoor.example',
   role: 'admin',
   team: 'Platform Reliability',
-  org: 'Tessera Freight',
+  org: 'Quillmoor Logistics',
   streakDays: 6,
   minutesThisWeek: 142,
 };
