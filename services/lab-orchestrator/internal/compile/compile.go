@@ -35,6 +35,9 @@ import (
 const (
 	DefaultActionTimeoutSec = 60
 	DefaultCheckTimeoutSec  = 5
+	// DefaultShellCheckTimeoutSec: shell checks usually make several calls
+	// (kubectl against a vcluster, ssh hops) and timed out at 5s under load.
+	DefaultShellCheckTimeoutSec = 30
 	DefaultCheckWeight      = "1"
 	DefaultHintCost         = 1
 	DefaultLabVersion       = 1
@@ -426,6 +429,9 @@ func convertCheck(c sourceCheck) labsv1.Check {
 	}
 	if c.Weight != nil {
 		out.Weight = formatFloat(*c.Weight)
+	}
+	if out.Type == "shell" {
+		out.TimeoutSec = DefaultShellCheckTimeoutSec
 	}
 	if c.TimeoutSec != nil {
 		out.TimeoutSec = *c.TimeoutSec

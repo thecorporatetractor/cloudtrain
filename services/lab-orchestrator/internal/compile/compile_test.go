@@ -274,3 +274,20 @@ func TestLearnerSudoOptIn(t *testing.T) {
 		t.Fatal("learnerSudo not compiled")
 	}
 }
+
+func TestShellCheckDefaultTimeout(t *testing.T) {
+	lt, err := Compile([]byte(minimalLab), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := lt.Spec.Checks[0].TimeoutSec; got != DefaultShellCheckTimeoutSec {
+		t.Errorf("shell check default timeout = %d, want %d", got, DefaultShellCheckTimeoutSec)
+	}
+	lt, err = Compile(mutate(minimalLab, `command: "test -f /tmp/{{file}}"`, `command: "test -f /tmp/{{file}}", timeoutSec: 8`), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := lt.Spec.Checks[0].TimeoutSec; got != 8 {
+		t.Errorf("explicit timeout = %d", got)
+	}
+}

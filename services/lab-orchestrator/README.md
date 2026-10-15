@@ -454,7 +454,8 @@ to `Ready`). A request on a Failed or Expired session is answered with phase
 - **Output comparison**: the raw stdout with at most one trailing newline
   (`\n` or `\r\n`) stripped; nothing else is trimmed. The expected value is
   used verbatim. `regex` is Go RE2 and matches anywhere unless anchored.
-- Timeouts: `timeoutSec` (default 5s, max 5m) via coreutils `timeout` in the
+- Timeouts: `timeoutSec` (default 30s for `shell` checks, which usually make
+  several calls, 5s for the other types; max 5m) via coreutils `timeout` in the
   target, plus transport slack; exit 124/137 = "the check timed out".
 - `message` is learner-safe (`passed`, `not satisfied yet`, `the check timed
   out`, `the check could not run`); it never contains expected values.
