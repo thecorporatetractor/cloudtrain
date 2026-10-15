@@ -75,14 +75,13 @@ distributed as separate images and not linked into CloudTrain.
 | @types/d3-transition | 3.0.9 | MIT |
 | @types/d3-zoom | 3.0.9 | MIT |
 | @types/js-yaml | 4.0.9 | MIT |
-| @types/node | 24.19.2, 26.6.5 | MIT |
+| @types/node | 22.20.5, 24.19.2 | MIT |
 | @types/node-fetch | 2.6.13 | MIT |
-| @types/prop-types | 15.7.15 | MIT |
-| @types/react | 18.3.31 | MIT |
-| @types/react-dom | 18.3.7 | MIT |
+| @types/react | 19.3.0 | MIT |
+| @types/react-dom | 19.3.0 | MIT |
 | @types/stream-buffers | 3.0.8 | MIT |
-| @xterm/addon-fit | 0.10.0 | MIT |
-| @xterm/xterm | 5.5.0 | MIT |
+| @xterm/addon-fit | 0.11.0 | MIT |
+| @xterm/xterm | 6.0.0 | MIT |
 | @xyflow/react | 12.12.0 | MIT |
 | @xyflow/system | 0.0.83 | MIT |
 | abstract-logging | 2.0.1 | MIT |
@@ -154,7 +153,6 @@ distributed as separate images and not linked into CloudTrain.
 | isbot | 5.2.2 | Unlicense |
 | isomorphic-ws | 5.0.0 | MIT |
 | jose | 6.2.12 | MIT |
-| js-tokens | 4.0.0 | MIT |
 | js-yaml | 4.3.2 | MIT |
 | jsep | 1.6.0 | MIT |
 | json-schema-ref-resolver | 3.0.1 | MIT |
@@ -162,7 +160,6 @@ distributed as separate images and not linked into CloudTrain.
 | jsonpath-plus | 10.4.0 | MIT |
 | kysely | 0.29.6 | MIT |
 | light-my-request | 6.8.0 | BSD-3-Clause |
-| loose-envify | 1.4.0 | MIT |
 | lucide-react | 0.460.0 | ISC |
 | math-intrinsics | 1.1.0 | MIT |
 | mime-db | 1.52.0 | MIT |
@@ -192,11 +189,11 @@ distributed as separate images and not linked into CloudTrain.
 | process-warning | 5.1.1 | MIT |
 | pump | 3.0.4 | MIT |
 | quick-format-unescaped | 4.0.4 | MIT |
-| react | 18.3.1 | MIT |
-| react-dom | 18.3.1 | MIT |
+| react | 19.3.0 | MIT |
+| react-dom | 19.3.0 | MIT |
 | react-remove-scroll | 2.7.2 | MIT |
 | react-remove-scroll-bar | 2.3.8 | MIT |
-| react-resizable-panels | 2.1.9 | MIT |
+| react-resizable-panels | 4.14.2 | MIT |
 | react-style-singleton | 2.2.3 | MIT |
 | readable-stream | 3.6.2 | MIT |
 | real-require | 1.0.0 | MIT |
@@ -208,7 +205,7 @@ distributed as separate images and not linked into CloudTrain.
 | safe-buffer | 5.2.1 | MIT |
 | safe-regex2 | 5.1.2 | MIT |
 | safe-stable-stringify | 2.5.0 | MIT |
-| scheduler | 0.23.2 | MIT |
+| scheduler | 0.28.0 | MIT |
 | secure-json-parse | 4.1.1 | BSD-3-Clause |
 | semver | 7.8.5 | ISC |
 | seroval | 1.6.9 | MIT |
@@ -231,7 +228,7 @@ distributed as separate images and not linked into CloudTrain.
 | toad-cache | 3.7.4 | MIT |
 | tr46 | 0.0.3 | MIT |
 | tslib | 2.8.1 | 0BSD |
-| undici-types | 7.24.6, 8.9.0 | MIT |
+| undici-types | 6.21.0, 7.24.6 | MIT |
 | use-callback-ref | 1.3.3 | MIT |
 | use-sidecar | 1.1.3 | MIT |
 | use-sync-external-store | 1.7.0 | MIT |
