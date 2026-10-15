@@ -12,6 +12,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -24,6 +25,7 @@ import (
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/yaml"
@@ -78,6 +80,55 @@ type VClusterDriver struct {
 	// StorageClass and VolumeSize of that PVC (defaults: cluster default, 1Gi).
 	StorageClass string
 	VolumeSize   string
+	// PodSecurity is the Pod Security Standard enforced on every vcluster
+	// host namespace (PodSecurityBaseline when empty). See
+	// HostNamespacePodSecurity.
+	PodSecurity string
+}
+
+// Pod Security Standard levels for vcluster host namespaces.
+const (
+	PodSecurityBaseline   = "baseline"
+	PodSecurityRestricted = "restricted"
+)
+
+// Pod Security admission namespace labels.
+const (
+	LabelPodSecurityEnforce        = "pod-security.kubernetes.io/enforce"
+	LabelPodSecurityEnforceVersion = "pod-security.kubernetes.io/enforce-version"
+	LabelPodSecurityAudit          = "pod-security.kubernetes.io/audit"
+	LabelPodSecurityAuditVersion   = "pod-security.kubernetes.io/audit-version"
+)
+
+// ValidPodSecurity reports whether level may be enforced on vcluster host
+// namespaces. "privileged" is deliberately not accepted: it would let a
+// learner's virtual-cluster pod mount the node's filesystem.
+func ValidPodSecurity(level string) bool {
+	return level == "" || level == PodSecurityBaseline || level == PodSecurityRestricted
+}
+
+// HostNamespacePodSecurity is the Pod Security admission labels of a vcluster
+// host namespace. Pods a learner creates inside a vcluster are synced into
+// that namespace and run on the host's nodes, so the host namespace is the
+// security boundary: enforcing (at least) baseline makes the host API server
+// reject synced pods that are privileged, use hostPath volumes, host
+// namespaces (network, PID, IPC), host ports or extra capabilities; the
+// virtual pod then stays Pending with a sync error event. Baseline is the
+// default because restricted rejects the vcluster control plane itself
+// (its syncer runs as root without a seccomp profile) and most lab
+// workloads (busybox as root). Restricted violations are still recorded
+// in the audit log.
+func (d *VClusterDriver) HostNamespacePodSecurity() map[string]string {
+	level := d.PodSecurity
+	if level == "" {
+		level = PodSecurityBaseline
+	}
+	return map[string]string{
+		LabelPodSecurityEnforce:        level,
+		LabelPodSecurityEnforceVersion: "latest",
+		LabelPodSecurityAudit:          PodSecurityRestricted,
+		LabelPodSecurityAuditVersion:   "latest",
+	}
 }
 
 var (
@@ -128,19 +179,47 @@ func (d *VClusterDriver) ensureHostNamespace(ctx context.Context, ref NodeRef) (
 	switch {
 	case err == nil && !ownedBySession(ref.Session, ns):
 		return false, fmt.Errorf("namespace %s exists but does not belong to session %s: %w", ns.Name, ref.Session.Name, ErrConflict)
+	case err == nil && ns.DeletionTimestamp != nil:
+		return false, nil
 	case err == nil:
-		return ns.DeletionTimestamp == nil, nil
+		// Namespaces created before Pod Security was enforced (or with
+		// another level) are brought in line before the vcluster syncs
+		// anything into them.
+		return true, d.enforcePodSecurity(ctx, ns)
 	case !apierrors.IsNotFound(err):
 		return false, err
 	}
 	labels := SessionLabels(ref.Session)
 	labels[LabelSessionNamespace] = LabelValue(ref.Namespace())
 	labels[LabelNode] = LabelValue(ref.Node.Name)
+	for k, v := range d.HostNamespacePodSecurity() {
+		labels[k] = v
+	}
 	ns = &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: d.hostNS(ref), Labels: labels}}
 	if err := d.Client.Create(ctx, ns); err != nil && !apierrors.IsAlreadyExists(err) {
 		return false, err
 	}
 	return true, nil
+}
+
+// enforcePodSecurity patches the Pod Security labels of an existing host
+// namespace when they differ.
+func (d *VClusterDriver) enforcePodSecurity(ctx context.Context, ns *corev1.Namespace) error {
+	want := d.HostNamespacePodSecurity()
+	missing := map[string]string{}
+	for k, v := range want {
+		if ns.Labels[k] != v {
+			missing[k] = v
+		}
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	patch, err := json.Marshal(map[string]any{"metadata": map[string]any{"labels": missing}})
+	if err != nil {
+		return err
+	}
+	return d.Client.Patch(ctx, ns, client.RawPatch(types.MergePatchType, patch))
 }
 
 // VClusterReleases lists the releases of the topology's virtual clusters.

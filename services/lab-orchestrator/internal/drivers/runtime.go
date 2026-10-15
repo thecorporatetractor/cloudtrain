@@ -28,6 +28,9 @@ type RuntimeOptions struct {
 	Helm           HelmRunner
 	VClusterChart  string
 	VClusterValues string
+	// VClusterPodSecurity is the Pod Security Standard enforced on vcluster
+	// host namespaces (default baseline).
+	VClusterPodSecurity string
 	// Lab state persistence (what hibernate/resume preserves):
 	// PersistentHome gives container nodes a /home/learner PVC,
 	// VClusterPersistence keeps vcluster databases on a PVC, VMDisks makes
@@ -82,7 +85,8 @@ func NewRuntime(o RuntimeOptions) (*Runtime, error) {
 		ImageRegistry: o.ImageRegistry, Disks: disks}
 	cluster := &ClusterDriver{
 		Virtual: &VClusterDriver{Client: o.Client, Reader: o.Reader, Container: container, Helm: o.Helm,
-			Chart: o.VClusterChart, ValuesFile: o.VClusterValues, Persistent: o.VClusterPersistence, StorageClass: o.StorageClass},
+			Chart: o.VClusterChart, ValuesFile: o.VClusterValues, Persistent: o.VClusterPersistence, StorageClass: o.StorageClass,
+			PodSecurity: o.VClusterPodSecurity},
 		Kubeadm: &KubeadmDriver{Client: o.Client, Reader: o.Reader, Catalog: o.Catalog, Container: container,
 			Session: session, ImageRegistry: o.ImageRegistry, Disks: disks},
 	}

@@ -44,7 +44,7 @@ an object it did not create (`ErrConflict`).
 |---|---|---|
 | `container` | Pod + ClusterIP Service (RuntimeClass, e.g. `kata`) | Image from the catalog. The **entry node** gets an admin sidecar, host aliases for every VM host and, with VMs, a second NIC on the lab network. |
 | `vm` | KubeVirt `VirtualMachine` | Catalog image on the lab network, root disk a CDI DataVolume imported from the containerDisk (`--vm-disks=persistent`, default) or the containerDisk itself; cloud-init: `learner` (key, passwordless sudo), root with the admin key only, pinned host key, static `/etc/hosts`. Ready once cloud-init finished. |
-| `k8s-cluster` `virtual` | vcluster (Helm, vendored chart + `deploy/vcluster/values.yaml`) | One vcluster per node, each in its own namespace `ct-<release>` (vcluster >= 0.25 allows one per namespace; session labels + `labs.cloudtrain.dev/session-namespace`, deleted on destroy), embedded DB on a StatefulSet PVC (`--vcluster-persistence`; emptyDir without it), kubeconfig rewritten to `https://<release>.ct-<release>.svc` and published as `<node>-kubeconfig`; synced workloads isolated by a NetworkPolicy. |
+| `k8s-cluster` `virtual` | vcluster (Helm, vendored chart + `deploy/vcluster/values.yaml`) | One vcluster per node, each in its own namespace `ct-<release>` (vcluster >= 0.25 allows one per namespace; session labels + `labs.cloudtrain.dev/session-namespace`, deleted on destroy), embedded DB on a StatefulSet PVC (`--vcluster-persistence`; emptyDir without it), kubeconfig rewritten to `https://<release>.ct-<release>.svc` and published as `<node>-kubeconfig`; synced workloads isolated by a NetworkPolicy and by Pod Security admission on the host namespace (`--vcluster-pod-security`, default `baseline`: privileged, hostPath, host namespaces/ports and extra capabilities are rejected, the virtual pod stays Pending with a sync error; `restricted` violations are audited). |
 | `k8s-cluster` `kubeadm` | one KubeVirt VM per `cluster.nodes[]` | The orchestrator owns the PKI (CA, bootstrap token, admin/learner client certs, host keys), so kubeconfigs exist before boot. Control plane: `kubeadm init` with the pre-seeded CA, version = the image's kubeadm, CNI via the image's `/opt/cloudtrain/bin/cni-install <podCIDR>` (fallback: bundled Flannel manifest), pod CIDR 10.244.0.0/16. Workers join with a pinned CA hash. Declared taints are exact (`[]` = untainted), labels applied after join, `state: notready` = joined, Ready once, then kubelet stopped and disabled. Ready once every member matches its declared state and CoreDNS is available. |
 | `netdev` | Pod per device (FRR); vrnetlab VMs / Clabernetes later | implemented for FRR (see "Lab network and netdev") |
 
@@ -230,7 +230,8 @@ Manager flags: `--metrics-bind-address` (default `0`, off; HTTPS with
 Kubernetes authn/authz when set), `--watch-namespace`, `--leader-elect`,
 `--max-concurrent-reconciles`, `--provision-timeout`, `--image-registry`,
 `--runtime-class`, `--image-catalog`, `--admin-image-ref`, `--helm`,
-`--vcluster-chart`, `--vcluster-values`, `--session-selector`,
+`--vcluster-chart`, `--vcluster-values`, `--vcluster-pod-security`
+(`baseline`|`restricted`; `privileged` is refused), `--session-selector`,
 `--leader-election-id`, `--net-tools-image` (default `nettools:1`),
 `--persistent-home`, `--vcluster-persistence`, `--vm-disks`
 (`persistent`|`ephemeral`), `--storage-class`. The cache only holds Pods/Services labelled

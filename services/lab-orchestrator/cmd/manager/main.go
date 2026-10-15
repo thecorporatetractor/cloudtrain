@@ -31,7 +31,7 @@ func main() {
 		metricsAddr, probeAddr, registry, runtimeClass, watchNamespace      string
 		catalogPaths, adminImageRef, helmBin, vclusterChart, vclusterValues string
 		sessionSelector, leaderElectionID, netToolsImage                    string
-		storageClass, vmDisks, userNamespaces                               string
+		storageClass, vmDisks, userNamespaces, vclusterPodSecurity          string
 		leaderElect, metricsSecure, persistentHome, vclusterPersistence     bool
 		concurrency                                                         int
 		provisionTimeout                                                    time.Duration
@@ -57,6 +57,7 @@ func main() {
 	flag.BoolVar(&persistentHome, "persistent-home", true, "give container nodes a PVC for /home/learner (survives hibernate/resume)")
 	flag.BoolVar(&vclusterPersistence, "vcluster-persistence", true, "keep vcluster databases on a PVC (vclusters can hibernate)")
 	flag.StringVar(&vmDisks, "vm-disks", "persistent", "VM root disks: persistent (CDI DataVolume per VM, VMs can hibernate) or ephemeral (containerDisk)")
+	flag.StringVar(&vclusterPodSecurity, "vcluster-pod-security", drivers.PodSecurityBaseline, "Pod Security Standard enforced on vcluster host namespaces, where learners' virtual-cluster pods run: baseline or restricted (restricted also rejects the vcluster control plane unless the values make it non-root)")
 	flag.StringVar(&storageClass, "storage-class", "", "StorageClass of learner homes, vcluster databases and VM disks; empty = cluster default")
 	opts := zap.Options{}
 	opts.BindFlags(flag.CommandLine)
@@ -123,6 +124,10 @@ func main() {
 		log.Error(err, "unable to load image catalog")
 		os.Exit(1)
 	}
+	if !drivers.ValidPodSecurity(vclusterPodSecurity) {
+		log.Error(nil, "--vcluster-pod-security must be baseline or restricted", "value", vclusterPodSecurity)
+		os.Exit(1)
+	}
 	if vmDisks != "persistent" && vmDisks != "ephemeral" {
 		log.Error(nil, "--vm-disks must be persistent or ephemeral", "value", vmDisks)
 		os.Exit(1)
@@ -149,7 +154,8 @@ func main() {
 		Client: mgr.GetClient(), Reader: mgr.GetAPIReader(), Scheme: scheme, Executor: executor,
 		Catalog: catalog, ImageRegistry: registry, RuntimeClassName: runtimeClass, AdminImageRef: adminImageRef,
 		Helm: drivers.ExecHelm{Binary: helmBin}, VClusterChart: vclusterChart, VClusterValues: vclusterValues,
-		PersistentHome: persistentHome, VClusterPersistence: vclusterPersistence, StorageClass: storageClass,
+		VClusterPodSecurity: vclusterPodSecurity,
+		PersistentHome:      persistentHome, VClusterPersistence: vclusterPersistence, StorageClass: storageClass,
 		VMDisks:        drivers.VMDiskOptions{Persistent: vmDisks == "persistent"},
 		UserNamespaces: useUserNS,
 	})
