@@ -12,7 +12,6 @@ import './styles/pages.css';
 import './styles/workspace.css';
 import './styles/platform.css';
 import { router } from './router';
-import { API_MODE } from './api/mode';
 import { ThemeProvider } from './lib/theme';
 import { TooltipProvider } from './components/ui';
 
@@ -23,7 +22,9 @@ const queryClient = new QueryClient({
 });
 
 async function boot() {
-  if (API_MODE === 'real') {
+  // The env check is inlined (not API_MODE) so the bundler drops the MSW chunk from builds that
+  // never start it; Rolldown does not constant-fold the imported const.
+  if (import.meta.env.VITE_API_MODE === 'real') {
     // The gateway serves everything except Scenario Studio, which stays sample data.
     const { startMocks } = await import('./mocks/browser');
     await startMocks({ sampleOnly: true });

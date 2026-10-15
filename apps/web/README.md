@@ -1,6 +1,6 @@
 # CloudTrain web
 
-Learner, manager, instructor, author, org-admin and platform-admin UI. Vite + React 18 + TypeScript (strict), TanStack Router/Query, Radix primitives, xterm.js, React Flow.
+Learner, manager, instructor, author, org-admin and platform-admin UI. Vite + React 19 + TypeScript (strict), TanStack Router/Query, Radix primitives, xterm.js, React Flow.
 
 ```sh
 pnpm install

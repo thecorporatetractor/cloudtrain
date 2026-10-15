@@ -28,6 +28,14 @@ export type Action = {
   apply?: string;
   file?: {
     [k: string]: unknown;
+  } & {
+    path: string;
+    content?: string;
+    mode?: string;
+    /**
+     * Asset path relative to the lab directory (beside lab.yaml), copied verbatim to `path`. Use instead of `content` for scripts and fixtures too large to inline. Must stay inside the lab directory: no leading '/', no '.' or '..' segments.
+     */
+    source?: string;
   };
   /**
    * network device configuration block

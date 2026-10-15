@@ -1,4 +1,4 @@
-import { Panel, PanelGroup, PanelResizeHandle } from 'react-resizable-panels';
+import { Group, Panel, Separator } from 'react-resizable-panels';
 import { Activity, Columns2, Plus, X } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import type { AccessKind, Lab, TopologyLink } from '@/api/types';
@@ -187,7 +187,7 @@ export function TerminalArea({ lab, model, onFocus, onClose, onOpenConsole, onCa
 
   return (
     <div className="termarea">
-      <PanelGroup direction="horizontal" autoSaveId={undefined}>
+      <Group orientation="horizontal">
         {model.panes.map((pane, i) => (
           <PaneSlot key={pane.id} id={pane.id} index={i}>
             <div className={cn('pane', model.activePane === pane.id && 'is-active')} onMouseDown={() => onFocus(pane.id)} onFocusCapture={() => model.activePane !== pane.id && onFocus(pane.id)}>
@@ -285,7 +285,7 @@ export function TerminalArea({ lab, model, onFocus, onClose, onOpenConsole, onCa
             </div>
           </PaneSlot>
         ))}
-      </PanelGroup>
+      </Group>
     </div>
   );
 }
@@ -293,8 +293,8 @@ export function TerminalArea({ lab, model, onFocus, onClose, onOpenConsole, onCa
 function PaneSlot({ id, index, children }: { id: string; index: number; children: React.ReactNode }) {
   return (
     <>
-      {index > 0 && <PanelResizeHandle className="splitter splitter-v" />}
-      <Panel id={id} minSize={20} order={index}>
+      {index > 0 && <Separator className="splitter splitter-v" />}
+      <Panel id={id} minSize="20%">
         {children}
       </Panel>
     </>

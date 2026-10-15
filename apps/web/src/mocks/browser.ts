@@ -5,7 +5,7 @@ import { handlers, sampleOnlyHandlers } from './handlers';
 export async function startMocks({ sampleOnly = false }: { sampleOnly?: boolean } = {}) {
   const worker = setupWorker(...(sampleOnly ? sampleOnlyHandlers : handlers));
   await worker.start({
-    onUnhandledRequest: 'bypass',
+    onUnhandledFrame: 'bypass',
     quiet: true,
     serviceWorker: { url: `${import.meta.env.BASE_URL}mockServiceWorker.js` },
   });
