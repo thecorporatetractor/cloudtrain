@@ -119,7 +119,7 @@ Each entry carries its reason in the file itself:
   - the ZAP image by digest in `dast.yml`;
   - the Postgres service image by digest.
 - **Go:** setup-go reads the `toolchain` directive in `services/lab-orchestrator/go.mod`
-  (go1.26.9).
+  (go1.27.2).
 
 ## Running the checks locally
 
