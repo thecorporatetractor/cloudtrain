@@ -156,6 +156,15 @@ func TestDecoratePod(t *testing.T) {
 	if pod.Annotations[AnnotationLogicalSwitch] != p.Mgmt.Subnet {
 		t.Errorf("primary switch = %q", pod.Annotations[AnnotationLogicalSwitch])
 	}
+	// Every link attachment forwards unknown MACs (bridges, bonds, VRRP).
+	for _, l := range p.Links[:2] {
+		if got := pod.Annotations[l.Segment.Provider+".kubernetes.io/layer2_forward"]; got != "true" {
+			t.Errorf("link %s: layer2_forward = %q", l.ID, got)
+		}
+	}
+	if _, ok := pod.Annotations["ovn.kubernetes.io/layer2_forward"]; ok {
+		t.Error("management interface must not forward unknown MACs")
+	}
 	var nets []map[string]string
 	if err := json.Unmarshal([]byte(pod.Annotations[AnnotationNetworks]), &nets); err != nil {
 		t.Fatal(err)
@@ -349,5 +358,51 @@ func TestManagerConflict(t *testing.T) {
 	m := &Manager{Client: newFake(foreign)}
 	if _, err := m.Ensure(context.Background(), p); !errors.Is(err, ErrConflict) {
 		t.Errorf("err = %v, want ErrConflict", err)
+	}
+}
+
+func TestEnsureVLANPassthru(t *testing.T) {
+	ctx := context.Background()
+	c := newFake()
+	m := &Manager{Client: c}
+	p, _ := Build(sess, ospfTopology())
+	if _, err := m.Ensure(ctx, p); err != nil {
+		t.Fatal(err)
+	}
+	var calls [][]string
+	set := func(_ context.Context, ls []string) error { calls = append(calls, ls); return nil }
+	if err := m.EnsureVLANPassthru(ctx, p, set); err != nil {
+		t.Fatal(err)
+	}
+	if len(calls) != 1 || len(calls[0]) != len(p.Links) || calls[0][0] != p.Links[0].Segment.Subnet {
+		t.Fatalf("calls = %v", calls)
+	}
+	for _, sw := range calls[0] {
+		if sw == p.Mgmt.Subnet {
+			t.Error("management switch must not pass VLAN tags")
+		}
+	}
+	// Marked subnets are not set again.
+	if err := m.EnsureVLANPassthru(ctx, p, set); err != nil || len(calls) != 1 {
+		t.Errorf("second pass: calls=%v err=%v", calls, err)
+	}
+	sub := &unstructured.Unstructured{}
+	sub.SetGroupVersionKind(SubnetGVK)
+	if err := c.Get(ctx, client.ObjectKey{Name: p.Links[0].Segment.Subnet}, sub); err != nil {
+		t.Fatal(err)
+	}
+	if sub.GetAnnotations()[AnnotationVLANPassthru] != "true" {
+		t.Errorf("annotations = %v", sub.GetAnnotations())
+	}
+	// A failure leaves the subnets unmarked (retried next pass).
+	p2, _ := Build(Session{Namespace: "labs", Name: "ospf-3", UID: "uid-3"}, ospfTopology())
+	if _, err := m.Ensure(ctx, p2); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.EnsureVLANPassthru(ctx, p2, func(context.Context, []string) error { return errors.New("boom") }); err == nil {
+		t.Fatal("error swallowed")
+	}
+	if err := c.Get(ctx, client.ObjectKey{Name: p2.Links[0].Segment.Subnet}, sub); err != nil || sub.GetAnnotations()[AnnotationVLANPassthru] != "" {
+		t.Errorf("marked after failure: %v %v", sub.GetAnnotations(), err)
 	}
 }

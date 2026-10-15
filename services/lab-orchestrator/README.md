@@ -144,6 +144,18 @@ is impaired once: RTT grows by 2 x latencyMs), `mtu` via `ip link set mtu` on
 both ends (576-9000). `network.ImpairCommand` re-applies or clears it at
 runtime in the sidecar.
 
+**Layer 2 on links**: link segments behave like a dumb switch/cable, so
+bridges, bonds (LACP), VLAN trunks, STP and VRRP work across them. Every link
+attachment is annotated `<provider>.kubernetes.io/layer2_forward: "true"`
+(Kube-OVN adds `unknown` to the port's addresses, so frames for MACs other
+than the port's own are delivered), and once the link subnets are Ready the
+manager sets `other_config:vlan-passthru=true` on each link logical switch with
+`ovn-nbctl` in the ovn-central pod (`--ovn-central`, default
+`kube-system/app=ovn-central`; empty disables it and tagged frames are
+dropped). Done subnets carry `labs.cloudtrain.dev/vlan-passthru: "true"`. The
+management segment keeps strict addressing. There is no rate limit on link
+segments yet: a bridging loop floods OVN.
+
 **Isolation** is structural: wired pods live only in the session VPC, which
 has no route to the platform pod network, kube-apiserver, nodes or the
 internet, even when a learner adds a default route via the VPC gateway; the
@@ -232,7 +244,7 @@ Kubernetes authn/authz when set), `--watch-namespace`, `--leader-elect`,
 `--runtime-class`, `--image-catalog`, `--admin-image-ref`, `--helm`,
 `--vcluster-chart`, `--vcluster-values`, `--vcluster-pod-security`
 (`baseline`|`restricted`; `privileged` is refused), `--session-selector`,
-`--leader-election-id`, `--net-tools-image` (default `nettools:1`),
+`--leader-election-id`, `--net-tools-image` (default `nettools:1`), `--ovn-central`,
 `--persistent-home`, `--vcluster-persistence`, `--vm-disks`
 (`persistent`|`ephemeral`), `--storage-class`. The cache only holds Pods/Services labelled
 `app.kubernetes.io/managed-by=cloudtrain-lab-orchestrator`.
