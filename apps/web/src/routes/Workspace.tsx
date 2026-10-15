@@ -1,5 +1,5 @@
 import { Link, useNavigate } from '@tanstack/react-router';
-import { Panel, Separator, usePanelRef, type PanelSize } from 'react-resizable-panels';
+import { Panel, Separator, usePanelRef, type Layout, type PanelSize } from 'react-resizable-panels';
 import { AlertTriangle, CheckCircle2, ChevronLeft, Eye, Keyboard, Lightbulb, Loader2, Maximize2, Megaphone, Minimize2, Network, PanelLeft, PanelLeftClose, PanelRight, Play, Power, X } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ApiError, useEndSession, useLab, useRevealHint, useSession, useStartSession, useValidate } from '@/api/client';
@@ -118,8 +118,11 @@ export function Workspace() {
     const collapsed = size.asPercentage === 0;
     setLayout((x) => (x.taskCollapsed === collapsed ? x : { ...x, taskCollapsed: collapsed }));
   }, []);
-  const onTopoResize = useCallback((size: PanelSize) => {
-    const collapsed = size.asPercentage === 0;
+  // The topology flag follows the group layout instead: onLayoutChange runs with the layout update
+  // itself, while onResize comes a frame later from a ResizeObserver, after React Flow has already
+  // measured (and warned about) a zero-height canvas.
+  const onVerticalLayout = useCallback((l: Layout) => {
+    const collapsed = l.topo === 0;
     setLayout((x) => (x.topoCollapsed === collapsed ? x : { ...x, topoCollapsed: collapsed }));
   }, []);
   const chromeless = shell.chromeless;
@@ -431,8 +434,8 @@ export function Workspace() {
           {layout.taskSide === 'left' && taskPanel}
           {layout.taskSide === 'left' && <Separator className="splitter splitter-v" />}
           <Panel id="main" minSize="40%">
-            <PersistedGroup orientation="vertical" storageId="ct.ws.v">
-              <Panel id="topo" panelRef={topoRef} collapsible collapsedSize="0%" minSize="15%" defaultSize="30%" maxSize="60%" onResize={onTopoResize} className="ws-topo-panel">
+            <PersistedGroup orientation="vertical" storageId="ct.ws.v" onLayoutChange={onVerticalLayout}>
+              <Panel id="topo" panelRef={topoRef} collapsible collapsedSize="0%" minSize="15%" defaultSize="30%" maxSize="60%" className="ws-topo-panel">
                 <div className="ws-topo">
                   <div className="ws-topo-head">
                     <span className="xs subtle">Topology · click a node to open its console · right-click a link (or Tab to it and press Enter) to capture</span>
