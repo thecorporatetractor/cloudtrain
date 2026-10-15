@@ -321,6 +321,22 @@ func yamlDocs(docs ...any) (string, error) {
 
 const criSocket = "unix:///run/containerd/containerd.sock"
 
+// Bounded retries of the cluster bootstrap in the node userdata.
+const (
+	KubeadmInitAttempts = 3
+	KubeadmJoinAttempts = 8
+)
+
+// kubeadmTimeouts (kubeadm.k8s.io/v1beta4 Timeouts) for init and join.
+var kubeadmTimeouts = map[string]any{
+	"controlPlaneComponentHealthCheck": "10m0s",
+	"kubeletHealthCheck":               "8m0s",
+	"kubernetesAPICall":                "3m0s",
+	"etcdAPICall":                      "5m0s",
+	"tlsBootstrap":                     "10m0s",
+	"discovery":                        "10m0s",
+}
+
 // PodCIDR of kubeadm lab clusters. It must not overlap the lab network
 // (192.168.99.0/24, 192.168.100.0/24), so a CNI default such as Calico's
 // 192.168.0.0/16 is never used: the image's cni-install gets this CIDR.
@@ -344,6 +360,9 @@ func (d *KubeadmDriver) userdata(ref NodeRef, l kubeadmLayout, m labsv1.ClusterN
 				"bootstrapTokens":  []any{map[string]any{"token": p.token, "ttl": "24h"}},
 				"localAPIEndpoint": map[string]any{"advertiseAddress": h.IP, "bindPort": 6443},
 				"nodeRegistration": nodeReg,
+				// Generous timeouts: on a loaded host the static pods start
+				// slowly and early API calls (RBAC bootstrap) time out.
+				"timeouts": kubeadmTimeouts,
 			},
 			map[string]any{
 				"apiVersion": "kubeadm.k8s.io/v1beta4", "kind": "ClusterConfiguration",
@@ -367,16 +386,33 @@ func (d *KubeadmDriver) userdata(ref NodeRef, l kubeadmLayout, m labsv1.ClusterN
 			{Path: "/etc/kubernetes/pki/ca.key", Content: string(p.ca.Key), Permissions: "0600"},
 			{Path: "/root/kubeadm.yaml", Content: cfg, Permissions: "0600"},
 		}
-		ci.RunCmd = []string{strings.ReplaceAll(`set -e
+		ci.RunCmd = []string{strings.NewReplacer("__POD_CIDR__", PodCIDR, "__INIT_ATTEMPTS__", fmt.Sprint(KubeadmInitAttempts), "__CRI__", criSocket).Replace(`set -e
 sed -i "s/__KUBE_VERSION__/$(kubeadm version -o short)/" /root/kubeadm.yaml
-kubeadm init --config /root/kubeadm.yaml --skip-token-print > /var/log/kubeadm.log 2>&1
+: > /var/log/kubeadm.log
+# kubeadm init fails under host load (wait-control-plane or an API call
+# times out). Retry a bounded number of times; kubeadm reset wipes
+# /etc/kubernetes/pki, so the pre-seeded CA is restored before each retry.
+install -d -m 0700 /root/ca-seed
+cp -p /etc/kubernetes/pki/ca.crt /etc/kubernetes/pki/ca.key /root/ca-seed/
+ok=0
+for i in $(seq 1 __INIT_ATTEMPTS__); do
+  echo "cloudtrain: kubeadm init attempt $i/__INIT_ATTEMPTS__" >> /var/log/kubeadm.log
+  if kubeadm init --config /root/kubeadm.yaml --skip-token-print >> /var/log/kubeadm.log 2>&1; then ok=1; break; fi
+  echo "cloudtrain: kubeadm init attempt $i failed; resetting" >> /var/log/kubeadm.log
+  kubeadm reset -f --cri-socket __CRI__ >> /var/log/kubeadm.log 2>&1 || true
+  install -d -m 0755 /etc/kubernetes/pki
+  install -m 0644 /root/ca-seed/ca.crt /etc/kubernetes/pki/ca.crt
+  install -m 0600 /root/ca-seed/ca.key /etc/kubernetes/pki/ca.key
+  sleep 20
+done
+[ "$ok" = 1 ] || { echo "cloudtrain: kubeadm init failed after __INIT_ATTEMPTS__ attempts" >> /var/log/kubeadm.log; exit 1; }
 export KUBECONFIG=/etc/kubernetes/admin.conf
 # CNI: the image's installer if it ships one (called with the pod CIDR),
 # else the legacy Flannel manifest of the golden image.
 if [ -x /opt/cloudtrain/bin/cni-install ]; then /opt/cloudtrain/bin/cni-install "__POD_CIDR__" >> /var/log/kubeadm.log 2>&1
 else kubectl apply -f /opt/cloudtrain/manifests/kube-flannel.yml >> /var/log/kubeadm.log 2>&1; fi
 install -d -o learner -g learner /home/learner/.kube
-install -o learner -g learner -m 600 /etc/kubernetes/admin.conf /home/learner/.kube/config`, "__POD_CIDR__", PodCIDR)}
+install -o learner -g learner -m 600 /etc/kubernetes/admin.conf /home/learner/.kube/config`)}
 		return ci.Render()
 	}
 	join, err := yamlDocs(map[string]any{
@@ -385,13 +421,19 @@ install -o learner -g learner -m 600 /etc/kubernetes/admin.conf /home/learner/.k
 			"apiServerEndpoint": cpIP + ":6443", "token": p.token, "caCertHashes": []any{p.caHash},
 		}},
 		"nodeRegistration": nodeReg,
+		"timeouts":         kubeadmTimeouts,
 	})
 	if err != nil {
 		return nil, err
 	}
 	ci.Files = []cloudInitFile{{Path: "/root/join.yaml", Content: join, Permissions: "0600"}}
-	run := fmt.Sprintf(`for i in $(seq 1 180); do timeout 2 bash -c '</dev/tcp/%[1]s/6443' 2>/dev/null && break; sleep 5; done
-for i in 1 2 3 4 5; do kubeadm join --config /root/join.yaml >> /var/log/kubeadm.log 2>&1 && break; kubeadm reset -f >> /var/log/kubeadm.log 2>&1; sleep 10; done`, cpIP)
+	// Workers wait for the API before every attempt: the control plane may
+	// itself be retrying kubeadm init (reset takes the API down in between).
+	run := fmt.Sprintf(`for i in $(seq 1 %[2]d); do
+  for w in $(seq 1 120); do timeout 2 bash -c '</dev/tcp/%[1]s/6443' 2>/dev/null && break; sleep 5; done
+  kubeadm join --config /root/join.yaml >> /var/log/kubeadm.log 2>&1 && break
+  kubeadm reset -f --cri-socket %[3]s >> /var/log/kubeadm.log 2>&1; sleep 15
+done`, cpIP, KubeadmJoinAttempts, criSocket)
 	if m.State == "notready" {
 		// Declared NotReady: join, wait until registered and Ready once, then
 		// stop the kubelet for good (the learner may troubleshoot it).

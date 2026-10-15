@@ -215,12 +215,22 @@ func TestKubeadmUserdata(t *testing.T) {
 					t.Errorf("cp userdata lacks %q", w)
 				}
 			}
-			if strings.Contains(s, "__POD_CIDR__") {
-				t.Error("pod CIDR placeholder not replaced")
+			if strings.Contains(s, "__POD_CIDR__") || strings.Contains(s, "__INIT_ATTEMPTS__") || strings.Contains(s, "__CRI__") {
+				t.Error("placeholder not replaced")
+			}
+			// Bounded init retry with reset, restoring the pre-seeded CA.
+			for _, w := range []string{"seq 1 3", "kubeadm reset -f --cri-socket " + criSocket, "/root/ca-seed/ca.key /etc/kubernetes/pki/ca.key",
+				"failed after 3 attempts", "kubernetesAPICall: 3m0s", "controlPlaneComponentHealthCheck: 10m0s"} {
+				if !strings.Contains(s, w) {
+					t.Errorf("cp userdata lacks %q", w)
+				}
 			}
 		case "yard-wk-1":
 			if !strings.Contains(s, "taints: []") || strings.Contains(s, "disable --now kubelet") {
 				t.Errorf("worker: explicit empty taints, kubelet kept\n%s", s)
+			}
+			if !strings.Contains(s, "seq 1 8") || !strings.Contains(s, "kubeadm reset -f") || !strings.Contains(s, "tlsBootstrap: 10m0s") {
+				t.Errorf("worker: bounded join retry with reset and timeouts\n%s", s)
 			}
 		case "yard-wk-2":
 			if !strings.Contains(s, "systemctl disable --now kubelet") || !strings.Contains(s, "effect: NoSchedule") {
