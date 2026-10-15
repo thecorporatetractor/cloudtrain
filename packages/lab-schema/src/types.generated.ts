@@ -33,7 +33,7 @@ export type Action = {
     content?: string;
     mode?: string;
     /**
-     * Asset path relative to the lab directory (beside lab.yaml), copied verbatim to `path`. Use instead of `content` for scripts and fixtures too large to inline. Must stay inside the lab directory: no leading '/', no '.' or '..' segments.
+     * Asset path relative to the lab directory (beside lab.yaml), written to `path`. The compiler inlines the asset as `content`, so it is templated like the rest of the lab: every {{param}} placeholder is replaced with the session's value, and an undefined placeholder fails validation. Assets that must contain literal double braces (Helm or Go templates, Jinja) write them with other delimiters and convert at setup time (e.g. `<% %>` then sed). Use instead of `content` for scripts and fixtures too large to inline. Must stay inside the lab directory: no leading '/', no '.' or '..' segments.
      */
     source?: string;
   };
