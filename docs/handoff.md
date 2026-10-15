@@ -46,7 +46,7 @@ items of the old list; what is left of them:
 | Web: learner, manager, instructor, admin, platform views | merged | `apps/web/README.md`, screenshots in `apps/web/docs/screenshots/platform/` |
 | Lab runtime: container, vcluster, kubeadm, VM, netdev drivers; grader; `labctl verify` | merged, verified on several labs | `services/lab-orchestrator/README.md` |
 | Warm pools, hibernate/resume, reset | merged; proven on vcluster; kubeadm proof pending | `deploy/.results/warmpool-virtual-proof.txt` |
-| Exam simulations (engine + gateway + web) | merged; engine proven live; Postgres flow proven in tests; 3 of 13 exams compile (the K8s ones), the rest wait for pool labs; live end-to-end with real auth and `task dev:orchestrator` reconciling ExamSessions pending | `docs/handoffs/exam-integrate.md` |
+| Exam simulations (engine + gateway + web) | merged; proven live end to end on 2026-10-15 (Keycloak login + CSRF, gateway :8787, `task dev:orchestrator` manager reconciling the ExamSession, partial solve scored 51, environments released; `deploy/.results/exam-integration-proof.txt`); 3 of 13 exams compile (the K8s ones), the rest wait for pool labs | `docs/handoffs/exam-integrate.md` |
 | Images | kubeadm 1.37 (Calico), 1.36 upgrade, etcd-host, jumphost, frr, nettools, netsvc, el-lab:10, el-vm:10 built; kubeadm:1.37-full/-sec built not boot-tested; deb-lab, ubuntu-vm not built; mirrors partial | `docs/handoffs/foundations.md` |
 | Security CI | merged: pre-public scans done, real issues fixed (Go 1.26.9, gRPC, token tag check), no secrets in history (gitleaks 186 commits); workflows NOT written yet | `docs/handoffs/security-ci.md` |
 | Curriculum | approved (Docker-first containers, Terraform-first IaC): 878 labs, 43 paths, 13 exams | `content/curriculum.yaml`, `docs/curriculum.md`, review page https://claude.ai/artifact/1qkEpeMhv1M7Qa5DsfcZpY |
@@ -77,9 +77,12 @@ Not started at all (wave 2): Linux tier B/C labs, containers (Docker), IaC
    assets are templated and the schema now says so; shell checks default to a 30 s
    timeout; the gateway smoke lab creates the learner's `~/handover`). Left: Kata,
    kubeadm proof under real load, networking P3/P4 and link rate limiting.
-3. **Exam integration:** deploy script so `task dev:orchestrator` reconciles
-   gateway ExamSessions; port `exam-smoke.mjs` to real auth + CSRF and run the live
-   proof.
+3. **Exam integration: done** (2026-10-15). `task dev:orchestrator` reconciles the
+   gateway's ExamSessions (selector `app.kubernetes.io/managed-by=cloudtrain-gateway`;
+   the deploy warns when another manager would overlap); `exam-smoke.mjs` logs in
+   through Keycloak with CSRF and passed live (attempt `exam-2dc04c2d63`, score 51,
+   ready in 49 s, graded 6 s after submit). Left: screenshots of the exam screens
+   (optional) and per-exam runs once pool labs exist (item 5).
 4. **Foundations:** boot-test `kubeadm:1.37-full`, build `deb-lab` and `ubuntu-vm`,
    deploy the mirrors (`task mirror:up`), Kata spike when disk allows.
 5. **Resume content streams** from their handoffs, verify queues one VM job at a
@@ -95,7 +98,12 @@ Not started at all (wave 2): Linux tier B/C labs, containers (Docker), IaC
   Kube-OVN, Multus. Scoped in-cluster orchestrator `cloudtrain-system` for
   gateway sessions (`task dev:orchestrator`).
 - Compose deps `cloudtrain-dev-deps`: Postgres :55432, Keycloak :8180, Mailpit
-  :8025. Gateway :8787 and web :5173 (real mode) were running in the user's
+  :8025. **The Postgres volume is still a v17 data directory** while
+  `deploy/dev/compose.yaml` now pins Postgres 18, so `task dev:deps` stops at
+  `check-volume.sh`. For the exam proof the old v17 containers were started with
+  `docker start cloudtrain-dev-deps-{postgres,keycloak,mailpit}-1` (no reset; migration
+  `0003_exams` applied). User step: dump/reset per `docs/dev-environment.md`
+  ("Postgres major upgrades"), then `task dev:deps`. Gateway :8787 and web :5173 (real mode) were running in the user's
   session; restart with `task dev:gateway` / `task dev:web`.
 - Crash logger: systemd user service `cloudtrain-crashlog`
   (`~/cloudtrain-crashlog/monitor.log`).
