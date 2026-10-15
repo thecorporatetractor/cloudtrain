@@ -65,9 +65,11 @@ fi
 # and leader-election lease); VM_DISKS (default ephemeral: a persistent kubeadm
 # session costs ~16 GB of disk, so local verification uses containerDisks; set
 # VM_DISKS=persistent to exercise hibernate); SESSION_SELECTOR restricts it to matching
-# LabSessions (e.g. labs.cloudtrain.dev/verify=true for labctl verify), so
-# several managers can share the cluster without reconciling each other's
-# sessions. A separate instance also gets its own ClusterRole
+# LabSessions, WarmPools and ExamSessions (e.g. labs.cloudtrain.dev/verify=true for
+# labctl verify; app.kubernetes.io/managed-by=cloudtrain-gateway for the gateway's lab
+# sessions and exam attempts, `task dev:orchestrator`), so several managers can
+# share the cluster without reconciling each other's sessions. An ExamSession's
+# environment LabSessions inherit its labels, so the same manager runs them. A separate instance also gets its own ClusterRole
 # (lab-orchestrator-<ns>), so deploying one branch's manager never rewrites the
 # permissions of another branch's instance. Defaults: cloudtrain-system, all
 # sessions. SKIP_CRDS=1 leaves the
@@ -101,3 +103,15 @@ k -n "$NS" create configmap lab-image-catalog "${CM_ARGS[@]}" --dry-run=client -
 k -n "$NS" rollout restart deploy/lab-orchestrator >/dev/null
 k -n "$NS" rollout status deploy/lab-orchestrator --timeout=180s
 log "lab-orchestrator deployed in $NS ($IMG)"
+
+# Exactly one manager must reconcile a session: warn about other instances that
+# would also pick up this one's sessions (no selector, or the same selector).
+while IFS=$'\t' read -r ns sel; do
+  [[ $ns == "$NS" ]] && continue
+  if [[ -z $sel ]]; then
+    warn "lab-orchestrator in $ns has no --session-selector: it also reconciles every session of this instance"
+  elif [[ -n ${SESSION_SELECTOR:-} && $sel == "$SESSION_SELECTOR" ]]; then
+    warn "lab-orchestrator in $ns uses the same --session-selector ($sel): two managers would reconcile these sessions"
+  fi
+done < <(k get deploy -A -l app.kubernetes.io/name=lab-orchestrator -o json 2>/dev/null \
+  | jq -r '.items[] | [.metadata.namespace, ((.spec.template.spec.containers[0].args // []) | map(select(startswith("--session-selector="))) | .[0] // "" | sub("^--session-selector="; ""))] | @tsv')

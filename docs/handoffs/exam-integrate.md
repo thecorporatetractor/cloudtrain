@@ -1,7 +1,8 @@
-# Handoff: exam-integrate (paused 2026-10-14)
+# Handoff: exam-integrate (done 2026-10-15)
 
-Branch `build/exam-integrate`, worktree `.worktrees/b-exam-integrate`, based on
-main + `build/exam-engine`. Paused at the user's request after step 3.
+Branch `build/exam-integrate` (merged into main with wave 1), then
+`feat/exam-integration-live` for the deploy step and the live proof (sections
+"Deploy" and "Live proof" below).
 
 ## Merge / conflicts: done (commit 70ce24f)
 
@@ -48,39 +49,65 @@ Not yet run: `pnpm -r build/test` (whole repo), go vet/test + `make generate`
 drift, `lab-verify --strict`, `curriculum render --check`. The merge did not
 change Go code beyond build/exam-engine itself.
 
-## Live proof: not started
+## Deploy: `task dev:orchestrator` runs the gateway's exams
 
-`deploy/.results/exam-integration-proof.txt` does not exist. Nothing was
-deployed: no gateway, DB, namespace or scoped manager of mine is running
-(the mock vite on :5291 was stopped).
+- The manager's `--session-selector` filters LabSessions, WarmPools and
+  ExamSessions (cmd/manager/main.go cache options); the ExamSession controller
+  copies the attempt's labels onto its environment LabTemplates/LabSessions
+  (`childLabels`), so one manager owns the whole attempt.
+- The gateway labels ExamSessions `app.kubernetes.io/managed-by=cloudtrain-gateway`
+  by default, which is the `task dev:orchestrator` selector: leave
+  `CT_EXAM_SESSION_LABELS` unset for it (set it only to hand exams to another scoped
+  manager, e.g. `labs.cloudtrain.dev/exam-proof=true` for `ct-exam-system`).
+- `orchestrator-deploy.sh` keeps the per-instance ClusterRole for non-default
+  namespaces (cloudtrain-system uses `lab-orchestrator`, which has the exam verbs)
+  and now warns after a deploy when another lab-orchestrator has no selector or
+  the same selector.
+- Proven: the manager in `cloudtrain-system` logged the attempt, `ct-exam-system`
+  did not.
 
-## Left, in order
+## Live proof: passed (2026-10-15)
 
-1. Step 4 (deploy): verify `deploy/scripts/orchestrator-deploy.sh` keeps the
-   per-instance ClusterRole and `CT_EXAM_SESSION_LABELS`; make
-   `task dev:orchestrator` (scoped to `app.kubernetes.io/managed-by=cloudtrain-gateway`)
-   reconcile gateway ExamSessions: the gateway puts `managed-by=cloudtrain-gateway`
-   on ExamSessions by default; check the manager's selector filters
-   ExamSessions too and that env LabSessions inherit the label, so exactly one
-   manager reconciles them.
-2. Step 5 gates above.
-3. Step 6 live proof via `tools/slots/run.sh pod`: own gateway on a free port
-   (not 8787) with a separate database in the compose Postgres
-   (`CREATE DATABASE`, `pnpm db:migrate`/`db:seed` with CT_DATABASE_URL/OWNER_URL),
-   `CT_EXTRA_EXAM_FILES`/`CT_EXTRA_LAB_DIRS` for sim-test-k8s-dev,
-   `CT_EXAM_SESSION_LABELS` = own scoped manager selector. Port
-   `services/gateway/scripts/exam-smoke.mjs` to the OIDC/CSRF gateway (it was
-   written for DevAuthenticator): start, 409, flag, submit, report persisted,
-   manager readiness 200 / other 403, cross-org. Save the log.
-4. Optional: regenerate `apps/web/docs/screenshots/exams` in all three themes
+`deploy/.results/exam-integration-proof.txt` (log) and
+`deploy/.results/exams/gateway-live-smoke.json`. Setup: gateway on :8787 from main
+(`CT_EXTRA_LAB_DIRS=services/lab-orchestrator/testdata/exams/tasks`,
+`CT_EXTRA_EXAM_FILES=services/lab-orchestrator/testdata/exams/exams.yaml`, no
+`CT_EXAM_SESSION_LABELS`), Keycloak :8180 local accounts, `task dev:orchestrator`
+manager, kind `cloudtrain-dev`; run through `tools/slots/run.sh pod`.
+
+`node services/gateway/scripts/exam-smoke.mjs` (now OIDC + CSRF via
+`deploy/scripts/platform-login.mjs`; `--no-solve` keeps the untouched run), 32
+checks passed:
+
+| Step | Result |
+|---|---|
+| Auth | 401 without a session; Amara (learner, Quillmoor, local Keycloak) logged in; start without `x-csrf-token` refused 403 `csrf` |
+| Start | attempt `exam-2dc04c2d63` 201 preparing; second start 409; in-progress after **49 s** (vcluster exam-core + exam-edge + workstation) |
+| Terminal | WebSocket with the session cookie runs kubectl as the learner (both contexts); without a cookie HTTP 401 |
+| Solve | task 2 "Feed a berth limit from a ConfigMap" solved in the exam terminal (8 s), task 2 flagged |
+| Grade | submit 200; completed with report **6.4 s** later; score **51** (pass mark 66, not passed): deployment 40, config 100, networking 0; passes initial + rerun |
+| After | terminal refused, history and catalog count the attempt; manager Tomasz sees it in Yard Platform readiness (51, not-ready); manager Ines (other team) 403; another learner 404; Acme Freight user 404 |
+| Clean-up | ExamSession labelled managed-by=cloudtrain-gateway; environments released (no LabSessions left) 47 s after submit. The completed ExamSession, its ExamTemplate and the task LabTemplate were then deleted by hand; the attempt and report stay readable from Postgres |
+
+Whole run 108 s. Not covered live: the secret task's solver branch (the config
+task was drawn), retake grants and void (covered by test/exams-pg.test.ts).
+
+## Left
+
+1. Optional: regenerate `apps/web/docs/screenshots/exams` in all three themes
    (`node apps/web/scripts/exam-shots.mjs --base http://localhost:<port>`; it
-   now runs as the learner persona and switches to the manager for shot 12; a
-   dark-theme run passed, screenshots not committed).
+   runs as the learner persona and switches to the manager for shot 12).
+2. Per-exam runs (`labctl exam run --auto-solve` / `--no-solve`, then the gateway
+   smoke with `--exam <id>`) as pool labs land; the smoke's solver only knows the
+   sim-test-k8s-dev config/secret tasks, other exams run with `--no-solve`.
+3. The dev Postgres volume is still v17 (see docs/handoff.md, Running state).
 
 ## Resume
 
 ```sh
-cd /home/hackrvl/cloudtrain/.worktrees/b-exam-integrate
-pnpm install --frozen-lockfile && pnpm --filter @cloudtrain/lab-schema build
-pnpm --filter @cloudtrain/gateway test   # needs the compose Postgres on :55432
+task dev:deps            # needs the v17 -> 18 volume step first
+task dev:orchestrator
+CT_EXTRA_LAB_DIRS=services/lab-orchestrator/testdata/exams/tasks \
+CT_EXTRA_EXAM_FILES=services/lab-orchestrator/testdata/exams/exams.yaml task dev:gateway
+tools/slots/run.sh pod -- node services/gateway/scripts/exam-smoke.mjs --out /tmp/exam-smoke.json
 ```
