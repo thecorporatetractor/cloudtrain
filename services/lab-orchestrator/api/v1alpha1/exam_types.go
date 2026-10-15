@@ -498,5 +498,5 @@ const (
 )
 
 func init() {
-	SchemeBuilder.Register(&ExamTemplate{}, &ExamTemplateList{}, &ExamSession{}, &ExamSessionList{})
+	register(&ExamTemplate{}, &ExamTemplateList{}, &ExamSession{}, &ExamSessionList{})
 }

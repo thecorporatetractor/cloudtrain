@@ -13,13 +13,13 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/util/httpstream"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/remotecommand"
 	utilexec "k8s.io/client-go/util/exec"
+	"k8s.io/streaming/pkg/httpstream"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -562,11 +562,18 @@ func (e *RESTPodExecutor) Exec(ctx context.Context, namespace, pod, container st
 	if err != nil {
 		return err
 	}
-	ex, err := remotecommand.NewFallbackExecutor(wsExec, spdyExec, func(err error) bool {
-		return httpstream.IsUpgradeFailure(err) || httpstream.IsHTTPSProxyError(err)
-	})
+	ex, err := remotecommand.NewFallbackExecutor(wsExec, spdyExec, shouldFallbackToSPDY)
 	if err != nil {
 		return err
 	}
 	return ex.StreamWithContext(ctx, remotecommand.StreamOptions{Stdin: stdin, Stdout: stdout, Stderr: stderr})
+}
+
+// shouldFallbackToSPDY reports whether a failed WebSocket exec should be
+// retried over SPDY. It must use k8s.io/streaming's httpstream: since
+// client-go 0.37 the WebSocket transport returns that package's
+// UpgradeFailureError, which the deprecated k8s.io/apimachinery copy does not
+// recognise (the fallback would silently never trigger).
+func shouldFallbackToSPDY(err error) bool {
+	return httpstream.IsUpgradeFailure(err) || httpstream.IsHTTPSProxyError(err)
 }

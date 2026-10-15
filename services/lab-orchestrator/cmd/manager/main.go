@@ -173,7 +173,7 @@ func main() {
 	poolMetrics.Register()
 	if err := (&controller.LabSessionReconciler{
 		Client: mgr.GetClient(), Scheme: scheme, Drivers: reg,
-		Recorder:         mgr.GetEventRecorderFor("lab-orchestrator"),
+		Recorder:         mgr.GetEventRecorder("lab-orchestrator"),
 		ProvisionTimeout: provisionTimeout, MaxConcurrentReconciles: concurrency,
 		Session: rt.Session, Reader: mgr.GetAPIReader(), Metrics: poolMetrics,
 	}).SetupWithManager(mgr); err != nil {
@@ -181,7 +181,7 @@ func main() {
 		os.Exit(1)
 	}
 	if err := (&controller.WarmPoolReconciler{
-		Client: mgr.GetClient(), Scheme: scheme, Recorder: mgr.GetEventRecorderFor("lab-orchestrator"),
+		Client: mgr.GetClient(), Scheme: scheme, Recorder: mgr.GetEventRecorder("lab-orchestrator"),
 		Metrics: poolMetrics,
 	}).SetupWithManager(mgr); err != nil {
 		log.Error(err, "unable to set up WarmPool controller")
@@ -189,7 +189,7 @@ func main() {
 	}
 	if err := (&controller.ExamSessionReconciler{
 		Client: mgr.GetClient(), Scheme: scheme, Drivers: reg,
-		Recorder: mgr.GetEventRecorderFor("lab-orchestrator"),
+		Recorder: mgr.GetEventRecorder("lab-orchestrator"),
 	}).SetupWithManager(mgr); err != nil {
 		log.Error(err, "unable to set up ExamSession controller")
 		os.Exit(1)

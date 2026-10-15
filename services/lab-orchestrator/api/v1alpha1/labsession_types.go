@@ -328,5 +328,5 @@ type LabSessionList struct {
 }
 
 func init() {
-	SchemeBuilder.Register(&LabSession{}, &LabSessionList{})
+	register(&LabSession{}, &LabSessionList{})
 }

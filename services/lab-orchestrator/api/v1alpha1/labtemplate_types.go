@@ -76,5 +76,5 @@ type LabTemplateList struct {
 }
 
 func init() {
-	SchemeBuilder.Register(&LabTemplate{}, &LabTemplateList{})
+	register(&LabTemplate{}, &LabTemplateList{})
 }
