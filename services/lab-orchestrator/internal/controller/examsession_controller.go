@@ -13,7 +13,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -62,7 +62,7 @@ type ExamSessionReconciler struct {
 	client.Client
 	Scheme   *runtime.Scheme
 	Drivers  *drivers.Registry
-	Recorder record.EventRecorder
+	Recorder events.EventRecorder
 	// Now is injectable for tests.
 	Now             func() time.Time
 	ProvisionBudget time.Duration
@@ -107,7 +107,7 @@ func (r *ExamSessionReconciler) stageTimeout() time.Duration {
 
 func (r *ExamSessionReconciler) event(obj runtime.Object, typ, reason, msg string) {
 	if r.Recorder != nil {
-		r.Recorder.Event(obj, typ, reason, msg)
+		r.Recorder.Eventf(obj, nil, typ, reason, reason, "%s", msg)
 	}
 }
 

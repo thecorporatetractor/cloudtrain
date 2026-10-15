@@ -502,7 +502,7 @@ vcluster's Roles via `escalate`/`bind`).
 
 | Target | What |
 |---|---|
-| `make generate` | sync schema, deepcopy, CRDs, RBAC (controller-gen v0.18) |
+| `make generate` | sync schema, deepcopy, CRDs, RBAC (controller-gen v0.22, installed as `~/.local/bin/controller-gen-v0.22.0`) |
 | `make test` | `go vet` + `go test ./...` (fake client and fake executors; no cluster or network) |
 | `make build` | `bin/labctl`, `bin/manager` |
 | `make samples` | validate and compile `testdata/labs` |

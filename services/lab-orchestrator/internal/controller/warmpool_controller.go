@@ -13,7 +13,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -48,7 +48,7 @@ const (
 type WarmPoolReconciler struct {
 	client.Client
 	Scheme   *runtime.Scheme
-	Recorder record.EventRecorder
+	Recorder events.EventRecorder
 	// Now is injectable for tests; defaults to time.Now.
 	Now func() time.Time
 	// Seed returns the seed of a new pooled session; defaults to random.
@@ -281,7 +281,7 @@ func (r *WarmPoolReconciler) deleteSession(ctx context.Context, s *labsv1.LabSes
 
 func (r *WarmPoolReconciler) event(obj runtime.Object, typ, reason, msg string) {
 	if r.Recorder != nil {
-		r.Recorder.Event(obj, typ, reason, msg)
+		r.Recorder.Eventf(obj, nil, typ, reason, reason, "%s", msg)
 	}
 }
 

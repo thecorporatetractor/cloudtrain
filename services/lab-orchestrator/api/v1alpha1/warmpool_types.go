@@ -97,5 +97,5 @@ type WarmPoolList struct {
 }
 
 func init() {
-	SchemeBuilder.Register(&WarmPool{}, &WarmPoolList{})
+	register(&WarmPool{}, &WarmPoolList{})
 }

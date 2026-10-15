@@ -2,9 +2,10 @@
 SHELL := /usr/bin/env bash
 .SHELLFLAGS := -eu -o pipefail -c
 
-CONTROLLER_GEN_VERSION ?= v0.18.0
+CONTROLLER_GEN_VERSION ?= v0.22.0
 LOCALBIN       ?= $(HOME)/.local/bin
-CONTROLLER_GEN ?= $(shell command -v controller-gen 2>/dev/null || echo $(LOCALBIN)/controller-gen)
+# Versioned binary name so a different controller-gen on PATH never produces drift.
+CONTROLLER_GEN ?= $(LOCALBIN)/controller-gen-$(CONTROLLER_GEN_VERSION)
 SCHEMA_SRC     := ../../packages/lab-schema/schema/lab.schema.json
 SCHEMA_DST     := internal/labschema/lab.schema.json
 CURRICULUM_SRC := ../../packages/lab-schema/schema/curriculum.schema.json
@@ -30,7 +31,10 @@ manifests: controller-gen
 	$(CONTROLLER_GEN) rbac:roleName=lab-orchestrator paths=./internal/controller/... output:rbac:artifacts:config=config/rbac
 
 controller-gen:
-	@test -x "$(CONTROLLER_GEN)" || GOBIN=$(LOCALBIN) go install sigs.k8s.io/controller-tools/cmd/controller-gen@$(CONTROLLER_GEN_VERSION)
+	@test -x "$(CONTROLLER_GEN)" || { \
+		tmp=$$(mktemp -d); \
+		GOBIN=$$tmp go install sigs.k8s.io/controller-tools/cmd/controller-gen@$(CONTROLLER_GEN_VERSION); \
+		mkdir -p "$$(dirname "$(CONTROLLER_GEN)")"; mv "$$tmp/controller-gen" "$(CONTROLLER_GEN)"; rmdir "$$tmp"; }
 
 fmt:
 	gofmt -l -w .
