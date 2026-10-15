@@ -66,8 +66,23 @@ export async function createTestDb(): Promise<TestDb> {
       await owner.destroy();
       const c = new pg.Client({ connectionString: OWNER_URL });
       await c.connect();
-      await c.query(`DROP DATABASE IF EXISTS ${name} WITH (FORCE)`);
-      await c.end();
+      try {
+        // pool.end() returns before the server backends have exited; FORCE
+        // would then try to terminate the app role's lingering backend, which
+        // the (non-superuser) owner may not do (42501). Retry until they're gone.
+        for (let attempt = 0; ; attempt++) {
+          try {
+            await c.query(`DROP DATABASE IF EXISTS ${name} WITH (FORCE)`);
+            break;
+          } catch (e) {
+            const code = (e as { code?: string }).code;
+            if (attempt >= 50 || (code !== '42501' && code !== '55006')) throw e;
+            await new Promise((r) => setTimeout(r, 100));
+          }
+        }
+      } finally {
+        await c.end();
+      }
     },
   };
 }

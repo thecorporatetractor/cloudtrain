@@ -26,7 +26,7 @@ distributed as separate images and not linked into CloudTrain.
 | @fontsource-variable/jetbrains-mono | 5.3.0 | OFL-1.1 |
 | @jsep-plugin/assignment | 1.4.0 | MIT |
 | @jsep-plugin/regex | 1.1.0 | MIT |
-| @kubernetes/client-node | 1.4.0 | Apache-2.0 |
+| @kubernetes/client-node | 2.0.0 | Apache-2.0 |
 | @pinojs/redact | 0.4.0 | MIT |
 | @radix-ui/primitive | 1.2.0 | MIT |
 | @radix-ui/react-arrow | 1.1.17 | MIT |
@@ -75,8 +75,7 @@ distributed as separate images and not linked into CloudTrain.
 | @types/d3-transition | 3.0.9 | MIT |
 | @types/d3-zoom | 3.0.9 | MIT |
 | @types/js-yaml | 4.0.9 | MIT |
-| @types/node | 22.20.5, 24.19.2 | MIT |
-| @types/node-fetch | 2.6.13 | MIT |
+| @types/node | 22.20.5, 26.6.5 | MIT |
 | @types/react | 19.3.0 | MIT |
 | @types/react-dom | 19.3.0 | MIT |
 | @types/stream-buffers | 3.0.8 | MIT |
@@ -85,7 +84,7 @@ distributed as separate images and not linked into CloudTrain.
 | @xyflow/react | 12.12.0 | MIT |
 | @xyflow/system | 0.0.83 | MIT |
 | abstract-logging | 2.0.1 | MIT |
-| agent-base | 7.1.4 | MIT |
+| agent-base | 9.0.0 | MIT |
 | ajv | 8.20.0 | MIT |
 | ajv-formats | 3.0.1 | MIT |
 | argparse | 2.0.1 | Python-2.0 |
@@ -153,19 +152,18 @@ distributed as separate images and not linked into CloudTrain.
 | isbot | 5.2.2 | Unlicense |
 | isomorphic-ws | 5.0.0 | MIT |
 | jose | 6.2.12 | MIT |
-| js-yaml | 4.3.2 | MIT |
+| js-yaml | 5.4.3 | MIT |
 | jsep | 1.6.0 | MIT |
 | json-schema-ref-resolver | 3.0.1 | MIT |
 | json-schema-traverse | 1.0.0 | MIT |
 | jsonpath-plus | 10.4.0 | MIT |
 | kysely | 0.29.6 | MIT |
 | light-my-request | 6.8.0 | BSD-3-Clause |
-| lucide-react | 0.460.0 | ISC |
+| lucide-react | 1.57.0 | ISC |
 | math-intrinsics | 1.1.0 | MIT |
 | mime-db | 1.52.0 | MIT |
 | mime-types | 2.1.35 | MIT |
 | ms | 2.1.3 | MIT |
-| node-fetch | 2.7.0 | MIT |
 | nodemailer | 10.1.0 | MIT-0 |
 | oauth4webapi | 3.8.8 | MIT |
 | on-exit-leak-free | 2.1.2 | MIT |
@@ -193,7 +191,7 @@ distributed as separate images and not linked into CloudTrain.
 | react-dom | 19.3.0 | MIT |
 | react-remove-scroll | 2.7.2 | MIT |
 | react-remove-scroll-bar | 2.3.8 | MIT |
-| react-resizable-panels | 4.14.2 | MIT |
+| react-resizable-panels | 4.14.3 | MIT |
 | react-style-singleton | 2.2.3 | MIT |
 | readable-stream | 3.6.2 | MIT |
 | real-require | 1.0.0 | MIT |
@@ -213,7 +211,7 @@ distributed as separate images and not linked into CloudTrain.
 | set-cookie-parser | 3.1.3 | MIT |
 | smart-buffer | 4.2.0 | MIT |
 | socks | 2.8.10 | MIT |
-| socks-proxy-agent | 8.0.5 | MIT |
+| socks-proxy-agent | 10.1.0 | MIT |
 | sonic-boom | 4.2.1 | MIT |
 | split2 | 4.2.0 | ISC |
 | stream-buffers | 3.0.3 | Unlicense |
@@ -226,15 +224,13 @@ distributed as separate images and not linked into CloudTrain.
 | text-decoder | 1.2.7 | Apache-2.0 |
 | thread-stream | 4.2.0 | MIT |
 | toad-cache | 3.7.4 | MIT |
-| tr46 | 0.0.3 | MIT |
 | tslib | 2.8.1 | 0BSD |
-| undici-types | 6.21.0, 7.24.6 | MIT |
+| undici | 8.12.1 | MIT |
+| undici-types | 6.21.0, 8.9.0 | MIT |
 | use-callback-ref | 1.3.3 | MIT |
 | use-sidecar | 1.1.3 | MIT |
 | use-sync-external-store | 1.7.0 | MIT |
 | util-deprecate | 1.0.2 | MIT |
-| webidl-conversions | 3.0.1 | BSD-2-Clause |
-| whatwg-url | 5.0.0 | MIT |
 | wrappy | 1.0.2 | ISC |
 | ws | 8.22.0 | MIT |
 | xtend | 4.0.2 | MIT |
