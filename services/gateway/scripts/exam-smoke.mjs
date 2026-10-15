@@ -331,7 +331,8 @@ try {
   check(false, 'smoke run', String(e?.stack ?? e));
 }
 summary.timings = timings;
-log('summary', JSON.stringify(summary));
+// Without the base URL: "http://host...learner@domain" on one line reads as a credential URI to secret scanners.
+log('summary', JSON.stringify({ ...summary, base: undefined }));
 if (out)
   await writeFile(
     out,
