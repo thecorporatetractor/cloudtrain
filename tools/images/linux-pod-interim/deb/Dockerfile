@@ -4,7 +4,7 @@
 # Contract: user `learner` (uid/gid 1000, bash, no sudo rule: labs that are about
 # privileges add one in setup), man pages and /usr/share/doc present (the image is
 # "unminimized"), sshd installed but not started, PID 1 `sleep infinity`.
-FROM ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55
+FROM ubuntu:24.10@sha256:cdf755952ed117f6126ff4e65810bf93767d4c38f5c7185b50ec1f1078b464cc
 ENV DEBIAN_FRONTEND=noninteractive
 # Interim build: packages come from the live Ubuntu archive (snapshot.ubuntu.com was
 # returning 5xx errors on 2026-10-14). The foundations image pins a snapshot.

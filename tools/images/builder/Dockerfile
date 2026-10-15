@@ -1,6 +1,6 @@
 # Image-builder toolbox: libguestfs (virt-customize) + qemu-img.
 # Runs with /dev/kvm passed through so the libguestfs appliance is accelerated.
-FROM ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55
+FROM ubuntu:24.10@sha256:cdf755952ed117f6126ff4e65810bf93767d4c38f5c7185b50ec1f1078b464cc
 ENV DEBIAN_FRONTEND=noninteractive
 # snapshot.ubuntu.com point in time (UBUNTU_APT_SNAPSHOT in deploy/versions.env).
 ARG UBUNTU_APT_SNAPSHOT
