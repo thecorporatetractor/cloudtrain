@@ -245,7 +245,8 @@ Kubernetes authn/authz when set), `--watch-namespace`, `--leader-elect`,
 `--vcluster-chart`, `--vcluster-values`, `--vcluster-pod-security`
 (`baseline`|`restricted`; `privileged` is refused), `--session-selector`,
 `--leader-election-id`, `--net-tools-image` (default `nettools:1`), `--ovn-central`,
-`--persistent-home`, `--vcluster-persistence`, `--vm-disks`
+`--persistent-home`, `--vcluster-persistence`, `--allow-learner-sudo` (default true;
+false fails labs whose entry node sets `learnerSudo`, see docs/dev-environment.md), `--vm-disks`
 (`persistent`|`ephemeral`), `--storage-class`. The cache only holds Pods/Services labelled
 `app.kubernetes.io/managed-by=cloudtrain-lab-orchestrator`.
 

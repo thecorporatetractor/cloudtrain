@@ -146,6 +146,23 @@ func TestEntryPod(t *testing.T) {
 	if *node.SecurityContext.RunAsUser != 0 || *node.SecurityContext.AllowPrivilegeEscalation {
 		t.Error("node container must be root without privilege escalation")
 	}
+	if _, ok := pod.Annotations[AnnotationLearnerSudo]; ok {
+		t.Error("learner-sudo annotation without opt-in")
+	}
+	// Opt-in (security trade-off): setuid programs may escalate in the node
+	// container only; the admin sidecar stays locked down.
+	sudo := ref
+	sudo.Node.LearnerSudo = true
+	sp := d.BuildPod(sudo)
+	if !*sp.Spec.Containers[0].SecurityContext.AllowPrivilegeEscalation || sp.Annotations[AnnotationLearnerSudo] != "true" {
+		t.Error("learnerSudo must allow privilege escalation and be annotated")
+	}
+	if *sp.Spec.Containers[1].SecurityContext.AllowPrivilegeEscalation {
+		t.Error("admin sidecar must never allow privilege escalation")
+	}
+	if p := sp.Spec.Containers[0].SecurityContext.Privileged; p != nil && *p {
+		t.Error("learnerSudo must not make the container privileged")
+	}
 	if len(admin.SecurityContext.Capabilities.Drop) != 1 || len(admin.VolumeMounts) != 0 || len(node.VolumeMounts) != 0 {
 		t.Error("admin sidecar must drop caps and share no volume with the node container")
 	}

@@ -93,6 +93,9 @@ type ContainerDriver struct {
 	// (DetectUserNamespaces). Catalog images marked userNamespace then run in
 	// a user namespace (see userns.go).
 	UserNamespaces bool
+	// DenyLearnerSudo refuses entry nodes with learnerSudo (manager flag
+	// --allow-learner-sudo=false).
+	DenyLearnerSudo bool
 }
 
 var (
@@ -307,6 +310,10 @@ func (d *ContainerDriver) Provision(ctx context.Context, ref NodeRef) (NodeState
 		if _, err := d.Catalog.Resolve(ref.Node.Image, ImageKindContainer); err != nil {
 			return NodeState{Phase: labsv1.NodeFailed, Message: err.Error()}, err
 		}
+	}
+	if ref.Node.LearnerSudo && d.DenyLearnerSudo {
+		err := fmt.Errorf("node %q requests learnerSudo, which this platform does not allow (--allow-learner-sudo=false): %w", ref.Node.Name, ErrUnsupported)
+		return NodeState{Phase: labsv1.NodeFailed, Message: err.Error()}, err
 	}
 	if err := d.createIfAbsent(ctx, ref, d.BuildService(ref)); err != nil {
 		return NodeState{Phase: labsv1.NodePending, Message: err.Error()}, fmt.Errorf("service: %w", err)

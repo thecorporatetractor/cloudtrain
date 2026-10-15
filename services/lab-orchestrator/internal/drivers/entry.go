@@ -53,6 +53,9 @@ const (
 	// ("<instance>/<digest>").
 	AnnotationWired = "labs.cloudtrain.dev/wired"
 	learnerUID      = 1000
+	// AnnotationLearnerSudo marks entry pods whose learner may escalate
+	// privileges (lab topology learnerSudo: true).
+	AnnotationLearnerSudo = "labs.cloudtrain.dev/learner-sudo"
 )
 
 // isEntry reports whether ref is the topology's entry node.
@@ -68,8 +71,17 @@ func (d *ContainerDriver) decorateEntryPod(ref NodeRef, pod *corev1.Pod) {
 	node := &pod.Spec.Containers[0]
 	node.SecurityContext = &corev1.SecurityContext{
 		RunAsUser: root, RunAsGroup: root,
-		// Setuid binaries cannot raise the learner's privileges.
-		AllowPrivilegeEscalation: ptr.To(false),
+		// Setuid binaries cannot raise the learner's privileges, unless the
+		// lab opts in with learnerSudo (security trade-off: the learner can
+		// become root in this unprivileged container; Provision refuses it
+		// when the operator disallows learner sudo).
+		AllowPrivilegeEscalation: ptr.To(ref.Node.LearnerSudo),
+	}
+	if ref.Node.LearnerSudo {
+		if pod.Annotations == nil {
+			pod.Annotations = map[string]string{}
+		}
+		pod.Annotations[AnnotationLearnerSudo] = "true"
 	}
 	adminImage := d.AdminImage
 	if adminImage == "" {

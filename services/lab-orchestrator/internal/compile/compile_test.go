@@ -176,6 +176,7 @@ func TestCompileInvalid(t *testing.T) {
 		{"duplicate nodes", mutate(minimalLab, "access: [shell]}", "access: [shell]}\n      - {name: box, driver: container, image: x}"), []string{"duplicate node name"}},
 		{"apply on container", mutate(minimalLab, `run: "touch /tmp/{{file}}"`, `apply: "kind: List"`), []string{"apply requires a k8s-cluster node"}},
 		{"shell check without command", mutate(minimalLab, `, command: "test -f /tmp/{{file}}"`, ""), []string{"shell check requires command"}},
+		{"learnerSudo on a non-entry node", mutate(minimalLab, "access: [shell]}", "access: [shell]}\n      - {name: side, driver: container, image: x, learnerSudo: true}"), []string{"/spec/topology/nodes/1/learnerSudo", "only allowed on the entry node"}},
 		{"cluster on non-cluster node", mutate(minimalLab, "access: [shell]}", "access: [shell], cluster: {mode: kubeadm}}"), []string{"cluster is only allowed"}},
 		{"int param without bounds", mutate(minimalLab, "{type: name, prefix: notes}", "{type: int}"), []string{"int param needs min and max"}},
 		{"int default out of range", mutate(minimalLab, "{type: name, prefix: notes}", "{type: int, min: 1, max: 5, default: 9}"), []string{"/spec/params/file/default", "outside [min, max]"}},
@@ -254,5 +255,22 @@ func TestParamDecoding(t *testing.T) {
 	}
 	if d := lt.Spec.Params["file"].Default; d == nil || *d != "9007199254740993" {
 		t.Errorf("default = %v", d)
+	}
+}
+
+func TestLearnerSudoOptIn(t *testing.T) {
+	lt, err := Compile([]byte(minimalLab), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lt.Spec.Topology.Nodes[0].LearnerSudo {
+		t.Fatal("learnerSudo must default to false")
+	}
+	lt, err = Compile(mutate(minimalLab, "access: [shell]}", "access: [shell], learnerSudo: true}"), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !lt.Spec.Topology.Nodes[0].LearnerSudo {
+		t.Fatal("learnerSudo not compiled")
 	}
 }

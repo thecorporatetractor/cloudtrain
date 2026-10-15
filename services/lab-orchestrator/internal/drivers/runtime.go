@@ -43,6 +43,8 @@ type RuntimeOptions struct {
 	// UserNamespaces: run catalog images marked userNamespace with pod
 	// hostUsers: false (resolve with DetectUserNamespaces).
 	UserNamespaces bool
+	// DenyLearnerSudo refuses labs whose entry node sets learnerSudo.
+	DenyLearnerSudo bool
 }
 
 // Runtime is the assembled driver set.
@@ -64,7 +66,7 @@ func NewRuntime(o RuntimeOptions) (*Runtime, error) {
 		Client: o.Client, Reader: o.Reader, Scheme: o.Scheme, ImageRegistry: o.ImageRegistry,
 		RuntimeClassName: o.RuntimeClassName, Executor: o.Executor, Catalog: o.Catalog,
 		PersistentHome: o.PersistentHome, HomeStorageClass: o.StorageClass,
-		UserNamespaces: o.UserNamespaces,
+		UserNamespaces: o.UserNamespaces, DenyLearnerSudo: o.DenyLearnerSudo,
 	}
 	disks := o.VMDisks
 	if disks.StorageClass == "" {

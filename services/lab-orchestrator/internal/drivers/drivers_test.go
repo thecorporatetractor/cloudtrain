@@ -426,3 +426,14 @@ func TestStubsReturnNotImplemented(t *testing.T) {
 		})
 	}
 }
+
+func TestContainerDenyLearnerSudo(t *testing.T) {
+	d, _ := newContainerDriver(t)
+	d.DenyLearnerSudo = true
+	ref := jumphostRef()
+	ref.Node.LearnerSudo = true
+	st, err := d.Provision(context.Background(), ref)
+	if !IsPermanent(err) || st.Phase != labsv1.NodeFailed || !strings.Contains(st.Message, "learnerSudo") {
+		t.Fatalf("state %+v err %v", st, err)
+	}
+}

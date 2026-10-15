@@ -277,7 +277,7 @@ func stringify(v any) string {
 func convertTopology(t sourceTopology) labsv1.Topology {
 	out := labsv1.Topology{Entry: t.Entry}
 	for _, n := range t.Nodes {
-		node := labsv1.Node{Name: n.Name, Driver: labsv1.DriverName(n.Driver), Image: n.Image}
+		node := labsv1.Node{Name: n.Name, Driver: labsv1.DriverName(n.Driver), Image: n.Image, LearnerSudo: n.LearnerSudo}
 		for _, a := range n.Access {
 			node.Access = append(node.Access, labsv1.AccessType(a))
 		}

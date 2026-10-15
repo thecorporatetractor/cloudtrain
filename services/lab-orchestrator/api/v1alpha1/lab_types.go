@@ -122,6 +122,12 @@ type Node struct {
 	Resources *NodeResources `json:"resources,omitempty"`
 	// +optional
 	Access []AccessType `json:"access,omitempty"`
+	// LearnerSudo (entry container node only, opt-in security trade-off)
+	// allows privilege escalation in the node container so setuid/setgid
+	// programs (sudo, crontab, passwd) work for the learner. Default false:
+	// allowPrivilegeEscalation is false and the learner cannot become root.
+	// +optional
+	LearnerSudo bool `json:"learnerSudo,omitempty"`
 	// Cluster is only set for driver=k8s-cluster.
 	// +optional
 	Cluster *ClusterSpec `json:"cluster,omitempty"`

@@ -80,7 +80,9 @@ type sourceNode struct {
 	Image     string           `json:"image"`
 	Resources *sourceResources `json:"resources"`
 	Access    []string         `json:"access"`
-	Cluster   *sourceCluster   `json:"cluster"`
+	// LearnerSudo: see lab.schema.json (security trade-off, opt-in).
+	LearnerSudo bool           `json:"learnerSudo"`
+	Cluster     *sourceCluster `json:"cluster"`
 }
 
 type sourceResources struct {

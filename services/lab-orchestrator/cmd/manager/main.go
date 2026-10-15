@@ -34,6 +34,7 @@ func main() {
 		storageClass, vmDisks, userNamespaces, vclusterPodSecurity          string
 		ovnCentral                                                          string
 		leaderElect, metricsSecure, persistentHome, vclusterPersistence     bool
+		allowLearnerSudo                                                    bool
 		concurrency                                                         int
 		provisionTimeout                                                    time.Duration
 	)
@@ -60,6 +61,7 @@ func main() {
 	flag.StringVar(&vmDisks, "vm-disks", "persistent", "VM root disks: persistent (CDI DataVolume per VM, VMs can hibernate) or ephemeral (containerDisk)")
 	flag.StringVar(&vclusterPodSecurity, "vcluster-pod-security", drivers.PodSecurityBaseline, "Pod Security Standard enforced on vcluster host namespaces, where learners' virtual-cluster pods run: baseline or restricted (restricted also rejects the vcluster control plane unless the values make it non-root)")
 	flag.StringVar(&ovnCentral, "ovn-central", "kube-system/app=ovn-central", "Kube-OVN central pods (<namespace>/<label>=<value>) to set vlan-passthru on lab link switches with ovn-nbctl; empty = links drop 802.1Q-tagged frames")
+	flag.BoolVar(&allowLearnerSudo, "allow-learner-sudo", true, "allow labs whose entry node sets learnerSudo (the learner may escalate to root in that unprivileged container); false fails such sessions")
 	flag.StringVar(&storageClass, "storage-class", "", "StorageClass of learner homes, vcluster databases and VM disks; empty = cluster default")
 	opts := zap.Options{}
 	opts.BindFlags(flag.CommandLine)
@@ -159,7 +161,7 @@ func main() {
 		VClusterPodSecurity: vclusterPodSecurity,
 		PersistentHome:      persistentHome, VClusterPersistence: vclusterPersistence, StorageClass: storageClass,
 		VMDisks:        drivers.VMDiskOptions{Persistent: vmDisks == "persistent"},
-		UserNamespaces: useUserNS,
+		UserNamespaces: useUserNS, DenyLearnerSudo: !allowLearnerSudo,
 	})
 	if err != nil {
 		log.Error(err, "unable to build drivers")
