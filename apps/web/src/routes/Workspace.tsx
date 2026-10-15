@@ -1,5 +1,5 @@
 import { Link, useNavigate } from '@tanstack/react-router';
-import { Panel, PanelGroup, PanelResizeHandle, type ImperativePanelHandle } from 'react-resizable-panels';
+import { Panel, Separator, usePanelRef, type PanelSize } from 'react-resizable-panels';
 import { AlertTriangle, CheckCircle2, ChevronLeft, Eye, Keyboard, Lightbulb, Loader2, Maximize2, Megaphone, Minimize2, Network, PanelLeft, PanelLeftClose, PanelRight, Play, Power, X } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ApiError, useEndSession, useLab, useRevealHint, useSession, useStartSession, useValidate } from '@/api/client';
@@ -8,6 +8,7 @@ import type { LabSession, SessionNotice, TopologyLink, ValidateResponse } from '
 import { useScreenShortcuts, useShell } from '@/app/shell-context';
 import { DifficultyBadge, SkillTags, StatusDot } from '@/components/domain';
 import { Badge, Button, ErrorState, Kbd, Skeleton, Tooltip } from '@/components/ui';
+import { PersistedGroup } from '@/components/ui/panels';
 import { TaskPanel } from '@/components/workspace/TaskPanel';
 import { TerminalArea, focusActiveTerminal, useTerminalModel } from '@/components/workspace/TerminalArea';
 import { Timer } from '@/components/workspace/Timer';
@@ -110,8 +111,17 @@ export function Workspace() {
       /* ignore */
     }
   }, [layout]);
-  const taskRef = useRef<ImperativePanelHandle>(null);
-  const topoRef = useRef<ImperativePanelHandle>(null);
+  const taskRef = usePanelRef();
+  const topoRef = usePanelRef();
+  // v4 has no onCollapse/onExpand: derive the collapsed flags from the panel size (collapsedSize is 0).
+  const onTaskResize = useCallback((size: PanelSize) => {
+    const collapsed = size.asPercentage === 0;
+    setLayout((x) => (x.taskCollapsed === collapsed ? x : { ...x, taskCollapsed: collapsed }));
+  }, []);
+  const onTopoResize = useCallback((size: PanelSize) => {
+    const collapsed = size.asPercentage === 0;
+    setLayout((x) => (x.topoCollapsed === collapsed ? x : { ...x, topoCollapsed: collapsed }));
+  }, []);
   const chromeless = shell.chromeless;
 
   // Leave full-screen when the workspace unmounts (the setter is stable; `shell` is not).
@@ -272,7 +282,7 @@ export function Workspace() {
   const messages = (s?.notices ?? []).filter((n) => n.kind !== 'observed' && !dismissedNotices.has(n.id));
 
   const taskPanel = (
-    <Panel id="task" ref={taskRef} collapsible collapsedSize={0} minSize={18} defaultSize={28} maxSize={45} order={layout.taskSide === 'left' ? 0 : 2} onCollapse={() => setLayout((x) => ({ ...x, taskCollapsed: true }))} onExpand={() => setLayout((x) => ({ ...x, taskCollapsed: false }))} className="ws-task-panel">
+    <Panel id="task" panelRef={taskRef} collapsible collapsedSize="0%" minSize="18%" defaultSize="28%" maxSize="45%" onResize={onTaskResize} className="ws-task-panel">
       <TaskPanel lab={l} session={s} validating={validate.isPending} onRevealHint={(i) => reveal.mutate(i)} revealing={reveal.isPending} />
     </Panel>
   );
@@ -417,12 +427,12 @@ export function Workspace() {
       )}
 
       <div className="ws-body">
-        <PanelGroup key={layout.taskSide} direction="horizontal" autoSaveId={`ct.ws.h.${layout.taskSide}`}>
+        <PersistedGroup key={layout.taskSide} orientation="horizontal" storageId={`ct.ws.h.${layout.taskSide}`}>
           {layout.taskSide === 'left' && taskPanel}
-          {layout.taskSide === 'left' && <PanelResizeHandle className="splitter splitter-v" />}
-          <Panel id="main" minSize={40} order={1}>
-            <PanelGroup direction="vertical" autoSaveId="ct.ws.v">
-              <Panel id="topo" ref={topoRef} collapsible collapsedSize={0} minSize={15} defaultSize={30} maxSize={60} order={0} onCollapse={() => setLayout((x) => ({ ...x, topoCollapsed: true }))} onExpand={() => setLayout((x) => ({ ...x, topoCollapsed: false }))} className="ws-topo-panel">
+          {layout.taskSide === 'left' && <Separator className="splitter splitter-v" />}
+          <Panel id="main" minSize="40%">
+            <PersistedGroup orientation="vertical" storageId="ct.ws.v">
+              <Panel id="topo" panelRef={topoRef} collapsible collapsedSize="0%" minSize="15%" defaultSize="30%" maxSize="60%" onResize={onTopoResize} className="ws-topo-panel">
                 <div className="ws-topo">
                   <div className="ws-topo-head">
                     <span className="xs subtle">Topology · click a node to open its console · right-click a link (or Tab to it and press Enter) to capture</span>
@@ -437,19 +447,19 @@ export function Workspace() {
                   {!layout.topoCollapsed && <TopologyCanvas topology={l.spec.topology} nodeStates={s?.nodes} onOpenNode={(name, access) => terminals.openConsole(name, access)} onCapture={onCapture} onImpair={onImpair} />}
                 </div>
               </Panel>
-              <PanelResizeHandle className="splitter splitter-h" />
-              <Panel id="terminals" minSize={30} order={1}>
+              <Separator className="splitter splitter-h" />
+              <Panel id="terminals" minSize="30%">
                 {isRealApi && !envReady ? (
                   <EnvironmentState session={s} onRestart={() => void navigate({ search: {}, replace: true })} />
                 ) : (
                   <TerminalArea lab={l} model={terminals.model} onFocus={terminals.focus} onClose={terminals.closeTab} onOpenConsole={terminals.openConsole} onCapture={onCapture} onSplit={terminals.split} ownsKey={ownsKey} sessionId={isRealApi ? s?.id : undefined} />
                 )}
               </Panel>
-            </PanelGroup>
+            </PersistedGroup>
           </Panel>
-          {layout.taskSide === 'right' && <PanelResizeHandle className="splitter splitter-v" />}
+          {layout.taskSide === 'right' && <Separator className="splitter splitter-v" />}
           {layout.taskSide === 'right' && taskPanel}
-        </PanelGroup>
+        </PersistedGroup>
       </div>
 
     </div>

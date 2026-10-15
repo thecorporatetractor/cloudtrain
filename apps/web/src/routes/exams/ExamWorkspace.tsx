@@ -1,7 +1,8 @@
 import { Link, useNavigate } from '@tanstack/react-router';
 import { AlertTriangle, ArrowLeft, ArrowRight, CheckCircle2, ChevronLeft, Flag, Loader2, Lock, Plus, Send, TerminalSquare } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { Panel, PanelGroup, PanelResizeHandle } from 'react-resizable-panels';
+import { Panel, Separator } from 'react-resizable-panels';
+import { PersistedGroup } from '@/components/ui/panels';
 import { useAttempt, useFlagTask, useSubmitExam } from '@/api/exams';
 import type { ExamAttemptState, ExamTaskView, ExamTerminalTarget } from '@/api/types';
 import { ExamTerminal } from '@/components/exams/ExamTerminal';
@@ -314,8 +315,8 @@ function ExamWorkspaceScreen() {
       {header}
       <Navigator tasks={a.tasks} current={task?.index ?? 1} visited={visited} onSelect={setCurrent} />
       <div className="exam-ws-body">
-        <PanelGroup direction="horizontal" autoSaveId="ct.exam.h">
-          <Panel id="task" minSize={22} defaultSize={34} maxSize={55} order={0}>
+        <PersistedGroup orientation="horizontal" storageId="ct.exam.h">
+          <Panel id="task" minSize="22%" defaultSize="34%" maxSize="55%">
             {task && (
               <TaskPane
                 task={task}
@@ -327,8 +328,8 @@ function ExamWorkspaceScreen() {
               />
             )}
           </Panel>
-          <PanelResizeHandle className="splitter splitter-v" />
-          <Panel id="terminals" minSize={35} order={1} style={{ position: 'relative' }}>
+          <Separator className="splitter splitter-v" />
+          <Panel id="terminals" minSize="35%" style={{ position: 'relative' }}>
             <Terminals attempt={a} closed={closed} />
             {timeUp && (
               <div className="exam-overlay" role="alertdialog" aria-label="Time is up">
@@ -343,7 +344,7 @@ function ExamWorkspaceScreen() {
               </div>
             )}
           </Panel>
-        </PanelGroup>
+        </PersistedGroup>
       </div>
 
       <Dialog open={confirm} onOpenChange={setConfirm} title="Submit your exam?" description="Submitting ends the exam for good: the environment closes and your work is graded. You cannot come back to it.">
