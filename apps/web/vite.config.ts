@@ -24,19 +24,21 @@ export default defineConfig(({ mode }) => {
       target: 'es2022',
       sourcemap: false,
       chunkSizeWarningLimit: 900,
-      rollupOptions: {
+      rolldownOptions: {
         output: {
-          // Assign by module id only. The object form would also drag the libraries' shared
-          // dependencies (React itself) into these chunks, which made every page preload them.
-          // The heavy chunks are then imported only by the lazily loaded routes (see router.tsx).
-          manualChunks(id) {
-            // React runtime gets its own chunk; otherwise Rollup may file react-dom under the
-            // first library chunk that needs it, and the entry would preload that chunk for it.
-            if (/node_modules\/(react|react-dom|scheduler)\//.test(id)) return 'react';
-            if (/node_modules\/(@xyflow\/|d3-|classcat\/|zustand\/)/.test(id)) return 'flow';
-            if (id.includes('node_modules/@xterm/')) return 'xterm';
-            if (id.includes('node_modules/@tanstack/')) return 'router';
-            return undefined;
+          // Vite 8 bundles with Rolldown: manualChunks is deprecated in favour of codeSplitting groups.
+          // A group also captures its modules' dependencies (includeDependenciesRecursively), which
+          // would drag shared dependencies such as React into the library chunks and make every page
+          // preload them. The React runtime therefore has the highest priority: a module captured by
+          // one group is removed from the others. The heavy chunks are then imported only by the
+          // lazily loaded routes (see router.tsx).
+          codeSplitting: {
+            groups: [
+              { name: 'react', test: /node_modules[\\/](react|react-dom|scheduler)[\\/]/, priority: 40 },
+              { name: 'router', test: /node_modules[\\/]@tanstack[\\/]/, priority: 30 },
+              { name: 'flow', test: /node_modules[\\/](@xyflow[\\/]|d3-|classcat[\\/]|zustand[\\/])/, priority: 20 },
+              { name: 'xterm', test: /node_modules[\\/]@xterm[\\/]/, priority: 10 },
+            ],
           },
         },
       },
