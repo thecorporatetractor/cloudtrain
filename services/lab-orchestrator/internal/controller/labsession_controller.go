@@ -120,7 +120,7 @@ type LabSessionReconciler struct {
 // +kubebuilder:rbac:groups=cdi.kubevirt.io,resources=datavolumes,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=kubeovn.io,resources=vpcs;subnets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=k8s.cni.cncf.io,resources=network-attachment-definitions,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch;create;delete
+// +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch;create;delete;patch
 // +kubebuilder:rbac:groups="",resources=pods/exec,verbs=create
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list
 // +kubebuilder:rbac:groups=node.k8s.io,resources=runtimeclasses,verbs=get

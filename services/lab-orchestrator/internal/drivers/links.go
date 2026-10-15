@@ -1,6 +1,7 @@
 package drivers
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	labsv1 "github.com/cloudtrain/cloudtrain/services/lab-orchestrator/api/v1alpha1"
 	"github.com/cloudtrain/cloudtrain/services/lab-orchestrator/internal/network"
@@ -39,6 +41,71 @@ type LinkNetwork struct {
 	// DestroyWait bounds how long DestroyTopology waits for the network to
 	// be gone before returning a retryable error (default 45s).
 	DestroyWait time.Duration
+	// OVN, when set, makes link segments pass 802.1Q-tagged frames
+	// (vlan-passthru on their logical switches). Nil: tagged frames are
+	// dropped on links.
+	OVN *OVNCentral
+}
+
+// OVNCentral runs ovn-nbctl in Kube-OVN's ovn-central pod, for logical
+// switch options Kube-OVN has no API for. It needs list on pods and
+// create on pods/exec in Namespace.
+type OVNCentral struct {
+	Reader   client.Reader
+	Executor PodExecutor
+	// Namespace and Selector find the ovn-central pods (kube-system,
+	// app=ovn-central); Container is the container to exec in (ovn-central).
+	Namespace string
+	Selector  map[string]string
+	Container string
+}
+
+// ParseOVNCentral parses "<namespace>/<label>=<value>" (container ovn-central).
+func ParseOVNCentral(spec string) (*OVNCentral, error) {
+	ns, sel, ok := strings.Cut(spec, "/")
+	k, v, ok2 := strings.Cut(sel, "=")
+	if !ok || !ok2 || ns == "" || k == "" || v == "" {
+		return nil, fmt.Errorf("ovn-central %q: want <namespace>/<label>=<value>", spec)
+	}
+	return &OVNCentral{Namespace: ns, Selector: map[string]string{k: v}, Container: "ovn-central"}, nil
+}
+
+// VLANPassthruCommand is the ovn-nbctl argv that sets vlan-passthru on
+// switches (one transaction). --no-leader-only: any member of a clustered
+// NB database forwards the write to the leader.
+func VLANPassthruCommand(switches []string) []string {
+	cmd := []string{"ovn-nbctl", "--no-leader-only"}
+	for i, ls := range switches {
+		if i > 0 {
+			cmd = append(cmd, "--")
+		}
+		cmd = append(cmd, "set", "Logical_Switch", ls, "other_config:vlan-passthru=true")
+	}
+	return cmd
+}
+
+// SetVLANPassthru implements network.SetVLANPassthru.
+func (o *OVNCentral) SetVLANPassthru(ctx context.Context, switches []string) error {
+	pods := &corev1.PodList{}
+	if err := o.Reader.List(ctx, pods, client.InNamespace(o.Namespace), client.MatchingLabels(o.Selector)); err != nil {
+		return err
+	}
+	var errs []error
+	for _, p := range pods.Items {
+		if p.Status.Phase != corev1.PodRunning || p.DeletionTimestamp != nil {
+			continue
+		}
+		var out bytes.Buffer
+		err := o.Executor.Exec(ctx, p.Namespace, p.Name, o.Container, VLANPassthruCommand(switches), nil, &out, &out)
+		if err == nil {
+			return nil
+		}
+		errs = append(errs, fmt.Errorf("%s: %w: %s", p.Name, err, strings.TrimSpace(out.String())))
+	}
+	if len(errs) == 0 {
+		return fmt.Errorf("no running ovn-central pod in %s matching %v", o.Namespace, o.Selector)
+	}
+	return errors.Join(errs...)
 }
 
 var _ PodNetwork = (*LinkNetwork)(nil)
@@ -69,6 +136,10 @@ func (n *LinkNetwork) ProvisionTopology(ctx context.Context, ref SessionRef) (bo
 		return false, err
 	}
 	ready, err := n.Manager.Ensure(ctx, p)
+	if ready && err == nil && n.OVN != nil {
+		err = n.Manager.EnsureVLANPassthru(ctx, p, n.OVN.SetVLANPassthru)
+		ready = err == nil
+	}
 	if errors.Is(err, network.ErrConflict) {
 		return false, fmt.Errorf("%w: %w", ErrConflict, err)
 	}

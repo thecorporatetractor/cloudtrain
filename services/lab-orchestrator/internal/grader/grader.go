@@ -22,6 +22,10 @@ import (
 const (
 	// DefaultTimeout applies when a check has no timeoutSec.
 	DefaultTimeout = 5 * time.Second
+	// DefaultShellTimeout applies to shell checks without timeoutSec: they
+	// usually make several calls (kubectl, ssh) and 5s was too short under
+	// load. Matches the compiler's default for shell checks.
+	DefaultShellTimeout = 30 * time.Second
 	// MaxTimeout caps a single check.
 	MaxTimeout = 5 * time.Minute
 	// transportSlack is added to the exec deadline on top of the in-target
@@ -110,6 +114,9 @@ type outcome struct {
 
 func timeoutOf(c labsv1.Check) time.Duration {
 	t := DefaultTimeout
+	if c.Type == "shell" {
+		t = DefaultShellTimeout
+	}
 	if c.TimeoutSec > 0 {
 		t = time.Duration(c.TimeoutSec) * time.Second
 	}

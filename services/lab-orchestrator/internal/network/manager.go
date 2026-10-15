@@ -12,6 +12,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	labsv1 "github.com/cloudtrain/cloudtrain/services/lab-orchestrator/api/v1alpha1"
@@ -153,6 +154,54 @@ func (m *Manager) Ensure(ctx context.Context, p *Plan) (bool, error) {
 		}
 	}
 	return ready, nil
+}
+
+// AnnotationVLANPassthru marks a link Subnet whose logical switch was set to
+// pass 802.1Q-tagged frames (OVN other_config:vlan-passthru=true).
+const AnnotationVLANPassthru = "labs.cloudtrain.dev/vlan-passthru"
+
+// SetVLANPassthru sets other_config:vlan-passthru=true on OVN logical
+// switches (Kube-OVN has no Subnet field for it).
+type SetVLANPassthru func(ctx context.Context, switches []string) error
+
+// EnsureVLANPassthru makes every link segment of the plan pass 802.1Q-tagged
+// frames, so trunks, router-on-a-stick and VLAN sub-interfaces work across
+// lab links. Link logical switches drop tagged frames by default. Subnets
+// already done carry AnnotationVLANPassthru; call it once the segments are
+// Ready (their logical switches exist). Kube-OVN only mutates individual
+// other_config keys, so the setting survives its reconciles.
+func (m *Manager) EnsureVLANPassthru(ctx context.Context, p *Plan, set SetVLANPassthru) error {
+	var todo []*unstructured.Unstructured
+	for i := range p.Links {
+		sub := &unstructured.Unstructured{}
+		sub.SetGroupVersionKind(SubnetGVK)
+		if err := m.Client.Get(ctx, client.ObjectKey{Name: p.Links[i].Segment.Subnet}, sub); err != nil {
+			return err
+		}
+		if !m.owns(p.Session, sub) {
+			return fmt.Errorf("subnet %s does not belong to session %s/%s: %w", sub.GetName(), p.Session.Namespace, p.Session.Name, ErrConflict)
+		}
+		if sub.GetAnnotations()[AnnotationVLANPassthru] != "true" {
+			todo = append(todo, sub)
+		}
+	}
+	if len(todo) == 0 {
+		return nil
+	}
+	names := make([]string, len(todo))
+	for i, sub := range todo {
+		names[i] = sub.GetName()
+	}
+	if err := set(ctx, names); err != nil {
+		return fmt.Errorf("vlan-passthru on %v: %w", names, err)
+	}
+	patch := []byte(fmt.Sprintf(`{"metadata":{"annotations":{%q:"true"}}}`, AnnotationVLANPassthru))
+	for _, sub := range todo {
+		if err := m.Client.Patch(ctx, sub, client.RawPatch(types.MergePatchType, patch)); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func subnetReady(o *unstructured.Unstructured) bool {

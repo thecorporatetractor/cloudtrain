@@ -19,6 +19,12 @@ const (
 	AnnotationNetworks = "k8s.v1.cni.cncf.io/networks"
 	// AnnotationLogicalSwitch puts the primary interface on a Kube-OVN subnet.
 	AnnotationLogicalSwitch = "ovn.kubernetes.io/logical_switch"
+	// Layer2ForwardSuffix, prefixed with an attachment's provider, makes
+	// Kube-OVN add "unknown" to the port's addresses (Kube-OVN >= 1.16
+	// Layer2ForwardAnnotationTemplate), so the port also receives unicast
+	// for MACs that are not its own: Linux bridges, bonds, macvlans and
+	// VRRP virtual MACs behind a link end.
+	Layer2ForwardSuffix = ".kubernetes.io/layer2_forward"
 
 	// InitContainerName applies addresses, MTU and impairment before the node starts.
 	InitContainerName = "net-init"
@@ -59,6 +65,7 @@ func (p *Plan) DecoratePod(node string, pod *corev1.Pod, containerName string, o
 		for _, ne := range ends {
 			nets = append(nets, ne.Link.Segment.Attachment(p.Session.Namespace, ne.End.Interface))
 			pod.Annotations[ne.Link.Segment.Provider+".kubernetes.io/logical_switch"] = ne.Link.Segment.Subnet
+			pod.Annotations[ne.Link.Segment.Provider+Layer2ForwardSuffix] = "true"
 		}
 		raw, err := json.Marshal(nets)
 		if err != nil {

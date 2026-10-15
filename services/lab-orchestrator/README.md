@@ -44,7 +44,7 @@ an object it did not create (`ErrConflict`).
 |---|---|---|
 | `container` | Pod + ClusterIP Service (RuntimeClass, e.g. `kata`) | Image from the catalog. The **entry node** gets an admin sidecar, host aliases for every VM host and, with VMs, a second NIC on the lab network. |
 | `vm` | KubeVirt `VirtualMachine` | Catalog image on the lab network, root disk a CDI DataVolume imported from the containerDisk (`--vm-disks=persistent`, default) or the containerDisk itself; cloud-init: `learner` (key, passwordless sudo), root with the admin key only, pinned host key, static `/etc/hosts`. Ready once cloud-init finished. |
-| `k8s-cluster` `virtual` | vcluster (Helm, vendored chart + `deploy/vcluster/values.yaml`) | One vcluster per node, each in its own namespace `ct-<release>` (vcluster >= 0.25 allows one per namespace; session labels + `labs.cloudtrain.dev/session-namespace`, deleted on destroy), embedded DB on a StatefulSet PVC (`--vcluster-persistence`; emptyDir without it), kubeconfig rewritten to `https://<release>.ct-<release>.svc` and published as `<node>-kubeconfig`; synced workloads isolated by a NetworkPolicy. |
+| `k8s-cluster` `virtual` | vcluster (Helm, vendored chart + `deploy/vcluster/values.yaml`) | One vcluster per node, each in its own namespace `ct-<release>` (vcluster >= 0.25 allows one per namespace; session labels + `labs.cloudtrain.dev/session-namespace`, deleted on destroy), embedded DB on a StatefulSet PVC (`--vcluster-persistence`; emptyDir without it), kubeconfig rewritten to `https://<release>.ct-<release>.svc` and published as `<node>-kubeconfig`; synced workloads isolated by a NetworkPolicy and by Pod Security admission on the host namespace (`--vcluster-pod-security`, default `baseline`: privileged, hostPath, host namespaces/ports and extra capabilities are rejected, the virtual pod stays Pending with a sync error; `restricted` violations are audited). |
 | `k8s-cluster` `kubeadm` | one KubeVirt VM per `cluster.nodes[]` | The orchestrator owns the PKI (CA, bootstrap token, admin/learner client certs, host keys), so kubeconfigs exist before boot. Control plane: `kubeadm init` with the pre-seeded CA, version = the image's kubeadm, CNI via the image's `/opt/cloudtrain/bin/cni-install <podCIDR>` (fallback: bundled Flannel manifest), pod CIDR 10.244.0.0/16. Workers join with a pinned CA hash. Declared taints are exact (`[]` = untainted), labels applied after join, `state: notready` = joined, Ready once, then kubelet stopped and disabled. Ready once every member matches its declared state and CoreDNS is available. |
 | `netdev` | Pod per device (FRR); vrnetlab VMs / Clabernetes later | implemented for FRR (see "Lab network and netdev") |
 
@@ -144,6 +144,18 @@ is impaired once: RTT grows by 2 x latencyMs), `mtu` via `ip link set mtu` on
 both ends (576-9000). `network.ImpairCommand` re-applies or clears it at
 runtime in the sidecar.
 
+**Layer 2 on links**: link segments behave like a dumb switch/cable, so
+bridges, bonds (LACP), VLAN trunks, STP and VRRP work across them. Every link
+attachment is annotated `<provider>.kubernetes.io/layer2_forward: "true"`
+(Kube-OVN adds `unknown` to the port's addresses, so frames for MACs other
+than the port's own are delivered), and once the link subnets are Ready the
+manager sets `other_config:vlan-passthru=true` on each link logical switch with
+`ovn-nbctl` in the ovn-central pod (`--ovn-central`, default
+`kube-system/app=ovn-central`; empty disables it and tagged frames are
+dropped). Done subnets carry `labs.cloudtrain.dev/vlan-passthru: "true"`. The
+management segment keeps strict addressing. There is no rate limit on link
+segments yet: a bridging loop floods OVN.
+
 **Isolation** is structural: wired pods live only in the session VPC, which
 has no route to the platform pod network, kube-apiserver, nodes or the
 internet, even when a learner adds a default route via the VPC gateway; the
@@ -230,9 +242,11 @@ Manager flags: `--metrics-bind-address` (default `0`, off; HTTPS with
 Kubernetes authn/authz when set), `--watch-namespace`, `--leader-elect`,
 `--max-concurrent-reconciles`, `--provision-timeout`, `--image-registry`,
 `--runtime-class`, `--image-catalog`, `--admin-image-ref`, `--helm`,
-`--vcluster-chart`, `--vcluster-values`, `--session-selector`,
-`--leader-election-id`, `--net-tools-image` (default `nettools:1`),
-`--persistent-home`, `--vcluster-persistence`, `--vm-disks`
+`--vcluster-chart`, `--vcluster-values`, `--vcluster-pod-security`
+(`baseline`|`restricted`; `privileged` is refused), `--session-selector`,
+`--leader-election-id`, `--net-tools-image` (default `nettools:1`), `--ovn-central`,
+`--persistent-home`, `--vcluster-persistence`, `--allow-learner-sudo` (default true;
+false fails labs whose entry node sets `learnerSudo`, see docs/dev-environment.md), `--vm-disks`
 (`persistent`|`ephemeral`), `--storage-class`. The cache only holds Pods/Services labelled
 `app.kubernetes.io/managed-by=cloudtrain-lab-orchestrator`.
 
@@ -440,7 +454,8 @@ to `Ready`). A request on a Failed or Expired session is answered with phase
 - **Output comparison**: the raw stdout with at most one trailing newline
   (`\n` or `\r\n`) stripped; nothing else is trimmed. The expected value is
   used verbatim. `regex` is Go RE2 and matches anywhere unless anchored.
-- Timeouts: `timeoutSec` (default 5s, max 5m) via coreutils `timeout` in the
+- Timeouts: `timeoutSec` (default 30s for `shell` checks, which usually make
+  several calls, 5s for the other types; max 5m) via coreutils `timeout` in the
   target, plus transport slack; exit 124/137 = "the check timed out".
 - `message` is learner-safe (`passed`, `not satisfied yet`, `the check timed
   out`, `the check could not run`); it never contains expected values.

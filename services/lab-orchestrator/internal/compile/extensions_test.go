@@ -129,3 +129,33 @@ spec:
 		t.Fatalf("rerun on unknown node: %v", err)
 	}
 }
+
+// file.source assets are inlined at compile time and then templated like
+// every other string of the lab: {{param}} is substituted per seed and an
+// unknown placeholder is a validation error (lab.schema.json documents it).
+func TestFileSourceIsTemplated(t *testing.T) {
+	lab := strings.Replace(assetLab, "  description: Run the script\n",
+		"  description: Run the script\n  params:\n    who: {type: choice, values: [ada]}\n", 1)
+	path := writeLab(t, lab)
+	asset := filepath.Join(filepath.Dir(path), "assets", "run.sh")
+	if err := os.WriteFile(asset, []byte("#!/bin/sh\necho {{ who }} > /tmp/ran\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	lt, err := CompileFile(path, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec, _, err := Resolve(&lt.Spec, 1, ResolveOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := spec.Setup[0].File.Content; got != "#!/bin/sh\necho ada > /tmp/ran\n" {
+		t.Errorf("asset not templated: %q", got)
+	}
+	if err := os.WriteFile(asset, []byte("echo {{nope}}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := CompileFile(path, Options{}); err == nil || !strings.Contains(err.Error(), "undefined param {{nope}}") {
+		t.Errorf("unknown placeholder in an asset: %v", err)
+	}
+}

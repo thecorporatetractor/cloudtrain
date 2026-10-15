@@ -12,6 +12,10 @@
 source "$(dirname "$0")/lib.sh"
 for t in kubectl docker kind jq yq; do need "$t"; done
 cluster_exists || die "kind cluster $CLUSTER_NAME not found (run: task dev:up)"
+if [[ -n ${PROVISION_TIMEOUT:-} && ! $PROVISION_TIMEOUT =~ ^([0-9]+(\.[0-9]+)?(h|m|s|ms))+$ ]]; then
+  die "PROVISION_TIMEOUT must be a Go duration such as 40m or 1h30m (got '$PROVISION_TIMEOUT')"
+fi
+case ${VCLUSTER_POD_SECURITY:-baseline} in baseline|restricted) ;; *) die "VCLUSTER_POD_SECURITY must be baseline or restricted";; esac
 
 SVC="$REPO_ROOT/services/lab-orchestrator"
 log "building manager image"
@@ -68,10 +72,14 @@ fi
 # permissions of another branch's instance. Defaults: cloudtrain-system, all
 # sessions. SKIP_CRDS=1 leaves the
 # cluster's CRDs alone (when other branches' API additions are installed).
+# PROVISION_TIMEOUT (a Go duration, e.g. 40m) sets the manager's
+# --provision-timeout: sessions whose nodes are not ready by then fail. Empty
+# keeps the manager default (15m); kubeadm sessions on a loaded machine need more.
+# VCLUSTER_POD_SECURITY (baseline|restricted) sets --vcluster-pod-security.
 NS=${ORCH_NAMESPACE:-cloudtrain-system}
 manifests() {
   kubectl kustomize "$SVC/config/default" \
-    | NS="$NS" IMG="$IMG" SEL="${SESSION_SELECTOR:-}" VMD="${VM_DISKS:-ephemeral}" yq '
+    | NS="$NS" IMG="$IMG" SEL="${SESSION_SELECTOR:-}" VMD="${VM_DISKS:-ephemeral}" PT="${PROVISION_TIMEOUT:-}" PSS="${VCLUSTER_POD_SECURITY:-}" yq '
         (select(.kind == "Namespace") | .metadata.name) = strenv(NS) |
         (select(.metadata.namespace == "cloudtrain-system") | .metadata.namespace) = strenv(NS) |
         (select(.kind == "ClusterRole" and strenv(NS) != "cloudtrain-system") | .metadata.name) = "lab-orchestrator-" + strenv(NS) |
@@ -81,10 +89,12 @@ manifests() {
         (select(.kind == "Deployment") | .spec.template.spec.containers[0].image) = strenv(IMG) |
         (select(.kind == "Deployment") | .spec.template.spec.containers[0].args) += ["--leader-election-id=lab-orchestrator-" + strenv(NS)] |
         (select(.kind == "Deployment" and strenv(SEL) != "") | .spec.template.spec.containers[0].args) += ["--session-selector=" + strenv(SEL)] |
-        (select(.kind == "Deployment") | .spec.template.spec.containers[0].args) += ["--vm-disks=" + strenv(VMD)]' \
+        (select(.kind == "Deployment") | .spec.template.spec.containers[0].args) += ["--vm-disks=" + strenv(VMD)] |
+        (select(.kind == "Deployment" and strenv(PT) != "") | .spec.template.spec.containers[0].args) += ["--provision-timeout=" + strenv(PT)] |
+        (select(.kind == "Deployment" and strenv(PSS) != "") | .spec.template.spec.containers[0].args) += ["--vcluster-pod-security=" + strenv(PSS)]' \
     | if [[ ${SKIP_CRDS:-0} == 1 ]]; then yq 'select(.kind != "CustomResourceDefinition")'; else cat; fi
 }
-log "applying CRDs, RBAC and manager ($IMG) in $NS${SESSION_SELECTOR:+, sessions $SESSION_SELECTOR}"
+log "applying CRDs, RBAC and manager ($IMG) in $NS${SESSION_SELECTOR:+, sessions $SESSION_SELECTOR}${PROVISION_TIMEOUT:+, provision timeout $PROVISION_TIMEOUT}"
 k apply -f <(manifests) >/dev/null
 k -n "$NS" create configmap lab-image-catalog "${CM_ARGS[@]}" --dry-run=client -o yaml | k apply -f - >/dev/null
 # A catalog change alone does not change the pod template: restart to reload it.

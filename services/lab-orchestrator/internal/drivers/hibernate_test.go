@@ -442,3 +442,59 @@ func TestVClusterOwnHostNamespace(t *testing.T) {
 		t.Error("host namespaces collide")
 	}
 }
+
+// Learner pods inside a vcluster are synced into its host namespace: the
+// namespace must enforce Pod Security so privileged / hostPath pods are
+// rejected by the host API server.
+func TestVClusterHostNamespaceEnforcesPodSecurity(t *testing.T) {
+	ctx := context.Background()
+	tpl := kubeadmTopology()
+	ref := NodeRef{Session: testSession(), Template: tpl, Node: tpl.Topology.Nodes[3]}
+	c := fake.NewClientBuilder().WithScheme(testScheme(t)).Build()
+	d := &VClusterDriver{Client: c}
+	if ready, err := d.ensureHostNamespace(ctx, ref); err != nil || !ready {
+		t.Fatalf("ensure = %v %v", ready, err)
+	}
+	ns := &corev1.Namespace{}
+	if err := c.Get(ctx, client.ObjectKey{Name: VClusterNamespace(ref.Session, ref.Node.Name)}, ns); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{
+		LabelPodSecurityEnforce: "baseline", LabelPodSecurityEnforceVersion: "latest",
+		LabelPodSecurityAudit: "restricted", LabelPodSecurityAuditVersion: "latest",
+	}
+	for k, v := range want {
+		if ns.Labels[k] != v {
+			t.Errorf("label %s = %q, want %q (labels %v)", k, ns.Labels[k], v, ns.Labels)
+		}
+	}
+
+	// A host namespace created before enforcement (or with a weaker level)
+	// is patched on the next Provision pass, keeping its session labels.
+	ns.Labels[LabelPodSecurityEnforce] = "privileged"
+	delete(ns.Labels, LabelPodSecurityAudit)
+	if err := c.Update(ctx, ns); err != nil {
+		t.Fatal(err)
+	}
+	d.PodSecurity = PodSecurityRestricted
+	if ready, err := d.ensureHostNamespace(ctx, ref); err != nil || !ready {
+		t.Fatalf("ensure (existing) = %v %v", ready, err)
+	}
+	if err := c.Get(ctx, client.ObjectKeyFromObject(ns), ns); err != nil {
+		t.Fatal(err)
+	}
+	if ns.Labels[LabelPodSecurityEnforce] != "restricted" || ns.Labels[LabelPodSecurityAudit] != "restricted" {
+		t.Errorf("existing namespace not patched: %v", ns.Labels)
+	}
+	if ns.Labels[LabelSessionUID] != "uid-1" {
+		t.Errorf("session labels lost: %v", ns.Labels)
+	}
+}
+
+func TestValidPodSecurity(t *testing.T) {
+	for level, ok := range map[string]bool{"": true, "baseline": true, "restricted": true, "privileged": false, "none": false} {
+		if ValidPodSecurity(level) != ok {
+			t.Errorf("ValidPodSecurity(%q) = %v", level, !ok)
+		}
+	}
+}

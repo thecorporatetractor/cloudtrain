@@ -35,6 +35,9 @@ import (
 const (
 	DefaultActionTimeoutSec = 60
 	DefaultCheckTimeoutSec  = 5
+	// DefaultShellCheckTimeoutSec: shell checks usually make several calls
+	// (kubectl against a vcluster, ssh hops) and timed out at 5s under load.
+	DefaultShellCheckTimeoutSec = 30
 	DefaultCheckWeight      = "1"
 	DefaultHintCost         = 1
 	DefaultLabVersion       = 1
@@ -277,7 +280,7 @@ func stringify(v any) string {
 func convertTopology(t sourceTopology) labsv1.Topology {
 	out := labsv1.Topology{Entry: t.Entry}
 	for _, n := range t.Nodes {
-		node := labsv1.Node{Name: n.Name, Driver: labsv1.DriverName(n.Driver), Image: n.Image}
+		node := labsv1.Node{Name: n.Name, Driver: labsv1.DriverName(n.Driver), Image: n.Image, LearnerSudo: n.LearnerSudo}
 		for _, a := range n.Access {
 			node.Access = append(node.Access, labsv1.AccessType(a))
 		}
@@ -426,6 +429,9 @@ func convertCheck(c sourceCheck) labsv1.Check {
 	}
 	if c.Weight != nil {
 		out.Weight = formatFloat(*c.Weight)
+	}
+	if out.Type == "shell" {
+		out.TimeoutSec = DefaultShellCheckTimeoutSec
 	}
 	if c.TimeoutSec != nil {
 		out.TimeoutSec = *c.TimeoutSec

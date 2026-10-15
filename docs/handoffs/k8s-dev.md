@@ -92,7 +92,7 @@ How the exam tasks are designed, following the exam-engine contract:
 
 ## Platform bugs and inconsistencies found
 
-1. **The grader's default check timeout is 5 s.** Shell checks that make several kubectl calls against a vcluster time out under load ("check timed out"; quote-engine-canary seed 1). Every multi-call shell check now sets `timeoutSec: 30`. A longer default for shell checks would be safer.
+1. **Fixed (platform round 3): shell checks now default to 30 s.** Was: **the grader's default check timeout is 5 s.** Shell checks that make several kubectl calls against a vcluster time out under load ("check timed out"; quote-engine-canary seed 1). Every multi-call shell check now sets `timeoutSec: 30`. A longer default for shell checks would be safer.
 2. **`file.source` assets are template-expanded by labctl.** The schema says they are copied verbatim, but `labctl validate` reports Helm's `{{ .Values.x }}` in an asset as an undefined param. Workaround in xkd-helm-upgrade-rollback: write `[[ ]]` delimiters and sed them to braces in setup.
 3. **orchestrator-deploy.sh dies on a failing `kind load`** (busybox:1.37 whose local Docker ID differs from the one on the node: "content digest not found"), even though the image is already on the nodes by tag. Workaround: `LOAD_LAB_IMAGES=0`.
 4. **The schema has no `type: exam`**; exam-ness lives only in curriculum.yaml. lab-verify now reads it (commit e2aff0c and earlier): exam tasks must not have hints and need no course.

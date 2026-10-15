@@ -454,6 +454,18 @@ Status and measurements: `docs/handoffs/foundations.md`.
   kernel 6.18); idmapped PVC mounts keep uid 1000 on the node. Fallback: host users, with
   the reason in the pod annotation `labs.cloudtrain.dev/user-namespace`. PID 1 is tini,
   learner (uid 1000) has no sudo rights, package sources point only at the mirror.
+- **Learner sudo (opt-in, security trade-off).** Entry nodes run with
+  `allowPrivilegeEscalation: false`, so `no_new_privs` blocks every setuid/setgid program
+  (`sudo`, `crontab`, `passwd`, `su`). A lab that teaches root administration sets
+  `learnerSudo: true` on its entry node (validation refuses it anywhere else) and grants the
+  rule itself, e.g. setup `run: echo 'learner ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/learner
+  && chmod 0440 /etc/sudoers.d/learner` (or a narrower rule when sudoers is the topic). The
+  trade-off: the learner can become root in the node container. It stays unprivileged
+  (default capabilities, no host mounts, the admin sidecar keeps `no_new_privs`), runs in a
+  user namespace with tier-A images where supported (root there is an unprivileged uid on
+  the host), and the pod is annotated `labs.cloudtrain.dev/learner-sudo: "true"`. Prefer
+  tier-A (`userNamespace`) images for such labs; operators can refuse them entirely with
+  the manager flag `--allow-learner-sudo=false` (sessions fail with a clear message).
 - **Tier B, Kata**: deferred (download size); tier-B labs run as tier-C VMs locally.
 - **Tier C, VMs** (`el-vm:10`, `ubuntu-vm:24.04`, `task image:build:el-vm|ubuntu-vm`). The
   mirror snapshot is baked in as the only, local repo (`/opt/cloudtrain/repo/<el10|noble>`),

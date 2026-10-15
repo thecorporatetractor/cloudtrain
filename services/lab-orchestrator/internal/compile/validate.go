@@ -78,6 +78,9 @@ func validateSemantics(s *labsv1.LabTemplateSpec) []Issue {
 		if n.Cluster != nil && n.Driver != labsv1.DriverK8sCluster {
 			add(path, "cluster is only allowed for driver k8s-cluster")
 		}
+		if n.LearnerSudo && (n.Driver != labsv1.DriverContainer || n.Name != s.Topology.Entry) {
+			add(path+"/learnerSudo", "learnerSudo is only allowed on the entry node (driver container)")
+		}
 		if n.Driver == labsv1.DriverK8sCluster {
 			if n.Cluster == nil {
 				add(path, "driver k8s-cluster requires cluster")

@@ -114,8 +114,9 @@ twice; both times the kubeadm sessions never got Ready.
    control plane does not retry `init` (`internal/drivers/kubeadm.go`, userdata). Every
    K-tier verify in this session failed this way.
 2. The manager's default `--provision-timeout=15m` is too short for kubeadm sessions on
-   a loaded machine; I patched my scoped manager to 40m by hand (deploy script has no
-   variable for it).
+   a loaded machine. Fixed: `PROVISION_TIMEOUT=40m bash deploy/scripts/orchestrator-deploy.sh`
+   (also works with `task dev:orchestrator`); bug 1 is fixed too (bounded `kubeadm init`
+   retry with reset, longer kubeadm timeouts).
 3. lab-verify could not accept `ct-platform:*` objectives (declared only in
    content/curriculum.yaml, which forbids redeclaring them under content/frameworks).
    Fixed in this branch (`tools/lab-verify/src/verify.mjs`, commit f7ef682).
@@ -156,9 +157,7 @@ pnpm install --filter @cloudtrain/lab-verify... --offline && (cd packages/lab-sc
 (cd services/lab-orchestrator && make build)
 # scoped manager (CRDs unchanged: diff first, then SKIP_CRDS=1)
 ORCH_NAMESPACE=ct-k8sadmin-system SESSION_SELECTOR=labs.cloudtrain.dev/verify=k8s-admin \
-  SKIP_CRDS=1 LOAD_LAB_IMAGES=0 bash deploy/scripts/orchestrator-deploy.sh
-kubectl --context kind-cloudtrain-dev -n ct-k8sadmin-system patch deploy lab-orchestrator --type=json \
-  -p '[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--provision-timeout=40m"}]'
+  SKIP_CRDS=1 LOAD_LAB_IMAGES=0 PROVISION_TIMEOUT=40m bash deploy/scripts/orchestrator-deploy.sh
 # one lab (vm slot for kubeadm, pod slot for vcluster)
 cd services/lab-orchestrator
 ../../tools/slots/run.sh pod -- bin/labctl verify --context kind-cloudtrain-dev --repo-root ../.. \

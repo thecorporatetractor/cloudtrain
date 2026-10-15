@@ -5,24 +5,36 @@ its own detailed handoff in `docs/handoffs/`.
 
 ## Read first
 
-1. **Security hole in virtual-cluster labs (fix before anyone outside the team
-   uses them).** Pods a learner creates inside a vcluster run on the host with
-   no Pod Security enforcement, so a learner can start a privileged pod that
-   mounts the kind node's filesystem. Fix: enforce Pod Security (baseline or
-   restricted) on each vcluster's host namespace in the vcluster driver, and use
-   Kata isolation in production. Source: `docs/handoffs/k8s-sec.md`.
-2. **kubeadm labs don't come up under load.** `kubeadm init` runs once with no
-   retry, and the session provisioning timeout (15 min) isn't configurable from
-   the deploy script. Every kubeadm verify in the k8s-admin stream failed this
-   way. Fix: retry `kubeadm init`, add a provisioning-timeout option to
-   `deploy/scripts/orchestrator-deploy.sh`, and run fewer VM jobs in parallel.
-3. **Lab links don't switch.** Kube-OVN link segments drop frames for foreign
-   MACs and 802.1Q tags, so bridges, VLANs, STP, LACP and VRRP labs fail.
-   Proposed fix (tested by hand): `layer2_forward` on link attachments and
-   `vlan-passthru=true` on link switches. Source: `docs/handoffs/networking.md`.
-4. **Learners can't use sudo/crontab in pod labs** (`allowPrivilegeEscalation:
-   false` on entry pods). Blocks ~20 Linux labs. Source: `docs/handoffs/linux-a.md`.
-5. **Windows C: drive is nearly full** (~23 GB free). Docker's disk file is
+Platform fixes round 3 (branch `fix/platform-round-3`) closed the first four
+items of the old list; what is left of them:
+
+1. **vcluster Pod Security: fixed.** Every vcluster host namespace now enforces
+   Pod Security `baseline` (audit `restricted`; manager flag
+   `--vcluster-pod-security`, deploy variable `VCLUSTER_POD_SECURITY`). Proven live: a
+   learner's privileged + hostPID + hostPath `/` pod stays Pending with
+   `SyncError ... violates PodSecurity "baseline:latest"`, a plain pod runs.
+   `restricted` is not usable as the enforced level (it rejects the vcluster
+   syncer itself and most lab workloads). Still open: Kata isolation in production.
+   `xks-drop-privileged` now starts from refused Pods (statement says so).
+2. **kubeadm under load: fixed in code, not yet proven under load.** `kubeadm init`
+   is retried up to 3 times with `kubeadm reset` in between (pre-seeded CA
+   restored), workers retry join up to 8 times, kubeadm timeouts are longer, and
+   `PROVISION_TIMEOUT=40m bash deploy/scripts/orchestrator-deploy.sh` (or with
+   `task dev:orchestrator`) sets `--provision-timeout`. Still advised: one VM
+   verify at a time on this machine.
+3. **Lab links switch: fixed.** Link attachments carry `layer2_forward`, link
+   logical switches get `vlan-passthru=true` (manager execs `ovn-nbctl` in
+   ovn-central, flag `--ovn-central`). Proven with the `net-trunk-two-switches`
+   draft (VLAN 20/30 tagged + native 99 across two Linux bridges). The L2 drafts in
+   `docs/handoffs/networking-drafts/` no longer need `l2shim.sh`. Still open:
+   P3 (entry NetworkPolicy on a wired entry), P4 (read-only sysctls), no rate limit
+   on link segments (do not run `net-fix-broadcast-storm`).
+4. **Learner sudo: available as an opt-in.** Entry node `learnerSudo: true`
+   (security trade-off, see `docs/dev-environment.md`); the lab's setup grants the
+   sudoers rule. Default stays `allowPrivilegeEscalation: false`; operators can
+   refuse such labs with `--allow-learner-sudo=false`. The linux-a root labs can
+   now be written.
+5. **Windows C: drive is nearly full** (~16 GB free on 2026-10-15). Docker's disk file is
    ~237 GB though Docker now holds ~80 GB; compact it (see "Machine" below).
 
 ## Where things are
@@ -61,11 +73,10 @@ Not started at all (wave 2): Linux tier B/C labs, containers (Docker), IaC
 
 1. **Machine:** compact the Docker disk file (below), start Docker Desktop, then
    `task dev:up` (it now heals expired KubeVirt certs itself) and `task dev:deps`.
-2. **Platform fixes (one agent):** vcluster Pod Security hole; kubeadm init retry
-   and configurable provisioning timeout; Kube-OVN link switching (layer2_forward,
-   vlan-passthru); a sudo-capable learner option for pod labs; asset templating in
-   `file.source` (copied verbatim per the schema, but labctl substitutes `{{ }}`);
-   grader default timeout for multi-call checks.
+2. **Platform fixes:** done in round 3 (read-first 1-4 above, plus: `file.source`
+   assets are templated and the schema now says so; shell checks default to a 30 s
+   timeout; the gateway smoke lab creates the learner's `~/handover`). Left: Kata,
+   kubeadm proof under real load, networking P3/P4 and link rate limiting.
 3. **Exam integration:** deploy script so `task dev:orchestrator` reconciles
    gateway ExamSessions; port `exam-smoke.mjs` to real auth + CSRF and run the live
    proof.
