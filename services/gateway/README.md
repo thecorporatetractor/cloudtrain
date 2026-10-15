@@ -11,7 +11,7 @@ runtime:
 | Sessions | `LabTemplate` + `LabSession` objects (`labs.cloudtrain.dev/v1alpha1`) in the cluster, reconciled by `services/lab-orchestrator` |
 | Grading | the LabSession validation contract (`spec.validateRequest` / `status.validation`, see `docs/k8s-readiness.md`) |
 | Terminal | WebSocket -> Kubernetes exec into the node's `k8s-exec` endpoint, with TTY and resize |
-| Identity, orgs, roles, teams, cohorts, assignments, audit | Postgres 17 with row-level security per org (`src/db`), Keycloak 26 as the identity broker (`src/oidc`, `src/keycloak`) |
+| Identity, orgs, roles, teams, cohorts, assignments, audit | Postgres 18 with row-level security per org (`src/db`), Keycloak 26 as the identity broker (`src/oidc`, `src/keycloak`) |
 | Learner model (Home, mastery, skill states, dashboards) | persisted on every validate (`lab_attempts`, `check_results`, `skill_evidence`, `learner_skill_state`); `src/learner/model.ts`. Without a database (unit tests of the lab surface) the old sample model in `src/learner/sample.ts` is the fallback |
 | Scenario Studio | **not served**; the web app keeps it in MSW |
 

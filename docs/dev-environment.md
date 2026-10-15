@@ -353,8 +353,8 @@ task dev:realms       # regenerate the realm imports from deploy/dev/people.json
 
 | Service | Image (pinned by tag and digest) | Host port | Notes |
 |---|---|---|---|
-| Postgres | `postgres:17.11-alpine` | 55432 | databases `cloudtrain` (roles `cloudtrain_owner` = schema owner, `cloudtrain_app` = RLS-bound app role) and `keycloak` |
-| Keycloak | `quay.io/keycloak/keycloak:26.7.5` | 8180 | `start-dev --import-realm`, admin console `http://localhost:8180/admin` (`admin` / `admin-dev-only`) |
+| Postgres | `postgres:18.6-alpine` | 55432 | databases `cloudtrain` (roles `cloudtrain_owner` = schema owner, `cloudtrain_app` = RLS-bound app role) and `keycloak` |
+| Keycloak | `quay.io/keycloak/keycloak:26.8.1` | 8180 | `start-dev --import-realm`, admin console `http://localhost:8180/admin` (`admin` / `admin-dev-only`) |
 | Mailpit | `axllent/mailpit:v1.31.5` | 8025 (UI/API), 1025 (SMTP) | invitation emails and Keycloak's own mails |
 
 Every credential in `deploy/dev/` is a published development value for
@@ -388,6 +388,30 @@ Back-channel logout calls `http://host.docker.internal:8787`, which reaches the
 gateway only if it listens beyond loopback (`CT_HOST=0.0.0.0`); with the default
 `127.0.0.1` Keycloak's call fails harmlessly and logout still works through
 `POST /api/auth/logout` and the refresh check.
+
+### Postgres major upgrades
+
+A Postgres major release cannot read the previous major's data directory. Since
+Postgres 18 the official image also keeps its data under
+`/var/lib/postgresql/18/docker`, with the volume mounted at `/var/lib/postgresql`
+(it was `/var/lib/postgresql/data` up to 17). `task dev:deps` first runs
+`deploy/dev/postgres/check-volume.sh`, which stops with a message when the
+`cloudtrain-dev-deps_pgdata` volume holds another major. The dev data is the
+fictional seed, so the normal fix is to recreate it:
+
+```bash
+task dev:deps:reset && task dev:deps   # new volume, realm import, migrate, seed, kc:sync
+```
+
+To keep rows you added by hand, dump the old cluster with the old image before
+the reset, then re-apply what you need with `psql` once `task dev:deps` has run:
+
+```bash
+docker run -d --name ct-pg17-dump -e POSTGRES_PASSWORD=unused \
+  -v cloudtrain-dev-deps_pgdata:/var/lib/postgresql/data postgres:17.11-alpine
+sleep 5; docker exec ct-pg17-dump pg_dump -U postgres -d cloudtrain > cloudtrain-dev-pg17.sql
+docker rm -f ct-pg17-dump
+```
 
 ### Adding AzarGuard's Entra ID tenant (`azarguard-entra`)
 

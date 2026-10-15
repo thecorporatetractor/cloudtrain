@@ -99,7 +99,7 @@ per person and exam" is also a unique index, so it holds under concurrent starts
 - **Service accounts / API tokens:** org-scoped personal access tokens for the
   reporting API (phase 2).
 
-## Data model (Postgres 17, RLS on every tenant table)
+## Data model (Postgres 18, RLS on every tenant table)
 
 | Table | Key columns |
 |---|---|
@@ -199,7 +199,7 @@ Every mutating admin, instructor or manager action writes an `audit_log` row.
 
 ## Local development
 
-`deploy/dev/compose.yaml`: Postgres 17, Keycloak 26 (realm import with the
+`deploy/dev/compose.yaml`: Postgres 18, Keycloak 26 (realm import with the
 `cloudtrain` realm, organizations enabled, a second realm `acme-idp` acting as an
 external corporate IdP to exercise federation), Mailpit for invitation emails.
 Seed data: two orgs with fictional people covering every role, teams, a cohort,
