@@ -126,6 +126,9 @@ keeps that order, or rework them.
 
 ## Platform blockers and bugs (with evidence)
 
+- **P1 and P2 are fixed in the platform (round 3)**: link attachments carry
+  `layer2_forward`, link switches get `vlan-passthru=true`; `net-trunk-two-switches`
+  passes without `l2shim.sh`. Original findings:
 - **P1 - link segments drop unicast to MACs that are not the port's own.**
   Kube-OVN creates link logical switch ports with `addresses: ["<mac> <ip>"]`, no
   `unknown`, so a Linux bridge, bond member, macvlan or VRRP virtual MAC cannot

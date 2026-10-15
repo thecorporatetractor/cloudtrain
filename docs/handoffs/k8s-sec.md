@@ -95,16 +95,17 @@ else was running. Re-run it first in step 1.
 ## Platform blockers and bugs found
 
 - Security node image (`kubeadm:1.37-sec`) and an Ingress controller are missing (table above).
-- Controller `DefaultProvisionTimeout` is a fixed 15 min (labsession_controller.go) with no
-  manager flag; under machine load (loadavg 70-110) kubeadm clusters did not bootstrap in
+- Fixed (platform round 3): `PROVISION_TIMEOUT=40m` for orchestrator-deploy.sh, and
+  `kubeadm init` is retried. Was: controller `DefaultProvisionTimeout` is a fixed 15 min with no
+  deploy option; under machine load (loadavg 70-110) kubeadm clusters did not bootstrap in
   time and verify sessions failed as `nodes not ready after 15m0s`.
 - `orchestrator-deploy.sh` with `LOAD_LAB_IMAGES=1` aborted on `kind load busybox:1.37`
   ("content digest ... not found") although the image was already on the nodes under a
   different image ID (multi-platform image); work-around `LOAD_LAB_IMAGES=0`.
-- Platform risk: vclusters run with no Pod Security restrictions on the host; a learner Pod
-  in a `mode: virtual` cluster can be privileged with hostPath mounts on the kind node.
-  (xks-drop-privileged starts from such a Deployment by design, with a harmless
-  `/var/tmp/qm-log-collector` path.)
+- Fixed (platform round 3): vcluster host namespaces enforce Pod Security `baseline`, so a
+  learner Pod in a `mode: virtual` cluster can no longer be privileged or mount hostPath
+  (it stays Pending with a SyncError). xks-drop-privileged therefore starts from refused
+  Pods; its setup no longer waits for the rollout.
 - lab-verify had no notion of exam tasks: it warned "no hints" and "not in any course" for
   them, which fails `--strict`. Changed (tools/lab-verify/src/verify.mjs): labs tagged
   `exam` must have no hints and must not be in a course.

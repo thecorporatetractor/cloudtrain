@@ -77,7 +77,9 @@ no other failure had been printed.
 
 ## Platform blockers and bugs
 
-1. **No sudo for the learner on tier-A entry pods.** `drivers/entry.go` sets
+1. **Fixed as an opt-in (platform round 3): entry node `learnerSudo: true`** (security
+   trade-off, see docs/dev-environment.md; setup must add the sudoers rule). Original finding:
+   **No sudo for the learner on tier-A entry pods.** `drivers/entry.go` sets
    `allowPrivilegeEscalation: false` on the node container, so no_new_privs blocks
    every setuid/setgid program: `sudo`, `crontab` (setgid crontab; "mkstemp:
    Permission denied"), `passwd`. Still true with foundations' user-namespace
