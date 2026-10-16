@@ -1,0 +1,189 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-disk-reclaim
+  title: Free engine disk space without losing release images
+  domain: containers
+  frameworks: [docker-practitioner:operations]
+  difficulty: easy
+  estimatedMinutes: 12
+  tags: [docker, prune, disk, system-df]
+  version: 1
+spec:
+  description: |
+    The transcoder host `cl-transcode-02` (`ssh cl-transcode-02`; you are in the
+    `docker` group) is running out of disk space: weeks of test builds, finished batch
+    containers and their leftovers have piled up in the engine's storage.
+
+    **Reclaim at least {{need}} MiB** of engine storage (images, containers, volumes
+    and build cache together, as `docker system df` and the disk see it), with these
+    rules from the media-platform team:
+
+    - every image tagged **`prod`** stays, even the ones no container uses right now;
+    - every **named volume** stays, with its data (the anonymous volumes of finished
+      batch jobs can go);
+    - the running container **`transcoder-live`** keeps running.
+  objectives:
+    - Read engine disk usage with docker system df
+    - Choose targeted prune commands and filters
+    - Avoid deleting unused but needed images and named volumes
+  params:
+    need:
+      type: choice
+      values: [350, 400, 450]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-transcode-02
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-transcode-02
+      timeoutSec: 600
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        d=$(mktemp -d)
+        build() {  # build <tag> <MiB> <seed>: an image with a MiB-sized incompressible layer
+          printf '%s\n' 'FROM busybox:1.37' "RUN head -c $(( $2 * 1048576 )) /dev/urandom > /opt/blob && echo $3 > /opt/seed" \
+            'CMD ["sleep", "infinity"]' > "$d/Dockerfile"
+          docker build -q -t "$1" "$d" >/dev/null
+        }
+        # release images (prod): one in use, two unused
+        build copperleaf/transcoder:prod 40 live
+        build copperleaf/thumbnailer:prod 40 thumb
+        build copperleaf/packager:prod 40 pack
+        docker run -d --name transcoder-live -v transcode-state:/state copperleaf/transcoder:prod >/dev/null
+        # named volumes with data, unused by any container
+        for v in catalogue-db media-index ad-ledger; do
+          docker volume create "$v" >/dev/null
+          docker run --rm -v "$v:/v" busybox:1.37 sh -c "echo $v-{{need}} > /v/SENTINEL"
+        done
+        # junk: test builds re-tagged until the old ones are dangling
+        for i in 1 2 3; do build copperleaf/transcoder:test 90 "t$i"; done
+        build copperleaf/transcoder:nightly 60 n1
+        # finished batch jobs: stopped containers with big writable layers and anonymous volumes
+        for i in 1 2 3; do
+          docker run --name "batch-$i" -v /work busybox:1.37 sh -c 'head -c 41943040 /dev/urandom > /blob && head -c 20971520 /dev/urandom > /work/chunk' >/dev/null
+        done
+        rm -rf "$d"
+        mkdir -p /var/lib/cloudtrain
+        du -smx /var/lib/containerd /var/lib/docker | awk '{s+=$1} END {print s}' > /var/lib/cloudtrain/used.before
+        docker images --format json | jq -r 'select(.Tag == "prod") | .Repository + ":" + .Tag + " " + .ID' | sort > /var/lib/cloudtrain/prod.images
+        docker inspect transcoder-live | jq -r '.[0].Id' > /var/lib/cloudtrain/live.id
+  checks:
+    - id: space-reclaimed
+      description: At least the required amount of engine storage was freed
+      type: shell
+      on: cl-transcode-02
+      skills: [containers.foundations.cleanup]
+      weight: 3
+      timeoutSec: 60
+      command: |
+        now=$(du -smx /var/lib/containerd /var/lib/docker | awk '{s+=$1} END {print s}')
+        [ $(( $(cat /var/lib/cloudtrain/used.before) - now )) -ge {{need}} ] && echo enough || echo "not-enough"
+      expect: {match: exact, value: enough}
+    - id: prod-images-kept
+      description: Every image tagged prod is still present, unchanged
+      type: shell
+      on: cl-transcode-02
+      skills: [containers.foundations.cleanup]
+      weight: 2
+      command: |
+        docker images --format json | jq -r 'select(.Tag == "prod") | .Repository + ":" + .Tag + " " + .ID' | sort | cmp -s - /var/lib/cloudtrain/prod.images && echo kept || echo changed
+      expect: {match: exact, value: kept}
+    - id: named-volumes-kept
+      description: Every named volume still exists with its data
+      type: shell
+      on: cl-transcode-02
+      skills: [containers.foundations.cleanup]
+      weight: 2
+      command: |
+        for v in catalogue-db media-index ad-ledger; do
+          docker run --rm -v "$v:/v:ro" busybox:1.37 cat /v/SENTINEL 2>/dev/null | grep -qx "$v-{{need}}" || { echo "lost"; exit 0; }
+        done
+        docker volume inspect transcode-state >/dev/null 2>&1 && echo kept || echo lost
+      expect: {match: exact, value: kept}
+    - id: live-untouched
+      description: transcoder-live is the same container and still running
+      type: shell
+      on: cl-transcode-02
+      skills: [containers.foundations.cleanup]
+      weight: 1
+      command: |
+        [ "$(docker inspect transcoder-live 2>/dev/null | jq -r '.[0].Id + " " + (.[0].State.Running|tostring)')" = "$(cat /var/lib/cloudtrain/live.id) true" ] && echo running || echo changed
+      expect: {match: exact, value: running}
+  hints:
+    - title: Where does the space go?
+      body: "`docker system df` sums images, containers, local volumes and build cache, and `-v` lists each item with its size."
+      command: docker system df -v
+      cost: 1
+    - title: Prune one kind at a time
+      body: "`docker container prune`, `docker image prune` (dangling images only, unless you add -a), `docker volume prune` (anonymous volumes only, unless you add -a) and `docker builder prune` each clean one kind."
+      cost: 1
+    - title: The trap in -a
+      body: "`docker image prune -a` and `docker system prune -a` delete every image no container uses, including unused prod images. Remove the test images by name, or use a filter."
+      cost: 2
+  misconceptions:
+    - id: system-prune-all
+      description: Runs docker system prune -a, which also deletes the unused prod images.
+      feedback: "-a removes every image without a container, and two prod images had none. Prune dangling images and remove the test and nightly tags explicitly instead."
+      expectFail: [prod-images-kept]
+      mutation:
+        on: cl-transcode-02
+        as: learner
+        run: docker system prune -a -f
+    - id: volume-prune-all
+      description: Prunes every unused volume, named ones included.
+      feedback: "docker volume prune -a also deletes named volumes that no container mounts right now, with their data. Without -a it only removes anonymous volumes."
+      expectFail: [named-volumes-kept]
+      mutation:
+        on: cl-transcode-02
+        as: learner
+        run: |
+          docker container prune -f
+          docker image prune -f
+          docker builder prune -a -f
+          docker volume prune -a -f
+    - id: containers-only
+      description: Removes only the stopped containers.
+      feedback: "Stopped containers are only part of the waste. docker system df shows dangling images and build cache taking more."
+      expectFail: [space-reclaimed]
+      mutation:
+        on: cl-transcode-02
+        as: learner
+        run: docker container prune -f
+  solution:
+    explanation: |
+      Remove what is provably waste: stopped containers and their anonymous volumes,
+      dangling images, the test/nightly tags and the build cache. Plain `prune` (no
+      -a) never touches tagged images or named volumes.
+    steps:
+      - on: cl-transcode-02
+        as: learner
+        run: |
+          docker system df
+          docker container prune -f
+          docker volume prune -f
+          docker rmi copperleaf/transcoder:test copperleaf/transcoder:nightly
+          docker image prune -f
+          docker builder prune -a -f
+          docker system df
+    alternatives:
+      - id: rm-with-volumes
+        description: Remove the batch containers with their volumes by name, then filter-prune images.
+        steps:
+          - on: cl-transcode-02
+            as: learner
+            run: |
+              docker rm -v batch-1 batch-2 batch-3
+              docker image rm $(docker images --format json | jq -r 'select(.Tag == "test" or .Tag == "nightly") | .Repository + ":" + .Tag')
+              docker image prune -f --filter dangling=true
+              docker buildx prune -a -f

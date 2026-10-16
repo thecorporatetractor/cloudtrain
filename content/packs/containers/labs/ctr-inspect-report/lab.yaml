@@ -1,0 +1,188 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-inspect-report
+  title: Report which containers mount the catalogue share
+  domain: containers
+  frameworks: [dca-legacy:install-config, docker-practitioner:operations]
+  difficulty: easy
+  estimatedMinutes: 12
+  tags: [docker, inspect, filters, format, mounts]
+  version: 1
+spec:
+  description: |
+    The storage team will move the host directory **`/srv/catalogue`** on Copperleaf's
+    batch host `cl-batch-01` (`ssh cl-batch-01`; you are in the `docker` group) to a new
+    disk tonight. They need to know which containers use it.
+
+    Twelve containers run on the host. Write a report to `~/catalogue-mounts.txt` on
+    `cl-batch-01` with **one line per container that bind-mounts the host directory
+    `/srv/catalogue`** (wherever it appears inside the container), in the form
+
+    ```
+    <container name> <IP address>
+    ```
+
+    for example `batch-ingest-3 172.18.0.5`. Use the container's IP address on the
+    network it is attached to. List **exactly** those containers, in any order.
+
+    Careful: some containers mount other directories, or volumes, at paths that look
+    similar.
+  objectives:
+    - Read mounts and network settings from docker inspect
+    - Select containers with filters and output templates
+    - Tell a bind mount's source from its destination
+  params:
+    layout:
+      type: choice
+      values: [a, b]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-batch-01
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-batch-01
+      timeoutSec: 300
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        mkdir -p /srv/catalogue /srv/catalogue-archive /srv/catalogue/thumbs /srv/media
+        echo "catalogue export $(date +%F)" > /srv/catalogue/README
+        docker rm -f $(docker ps -aq) >/dev/null 2>&1 || true
+        docker network rm cl-batch >/dev/null 2>&1 || true
+        docker network create --subnet 172.30.40.0/24 cl-batch >/dev/null
+        docker volume create catalogue >/dev/null
+        run() { n=$1; shift; docker run -d --name "$n" "$@" busybox:1.37 sleep infinity >/dev/null; }
+        # layout a / b decide which jobs use the share and which use look-alikes
+        if [ '{{layout}}' = a ]; then
+          run batch-ingest-1 --network cl-batch -v /srv/catalogue:/mnt/catalogue:ro
+          run batch-ingest-2 --network cl-batch -v /srv/media:/mnt/media
+          run thumbnailer    -v /srv/catalogue:/work
+          run sitemap-gen    --network cl-batch -v /srv/catalogue-archive:/srv/catalogue
+          run feed-export    --network cl-batch --mount type=bind,src=/srv/catalogue,dst=/export,readonly
+          run search-indexer -v catalogue:/srv/catalogue
+          run metadata-sync  -v /srv/catalogue/thumbs:/thumbs
+          run price-rules    --network cl-batch
+        else
+          run batch-ingest-1 --network cl-batch -v /srv/media:/mnt/media
+          run batch-ingest-2 --network cl-batch -v /srv/catalogue:/mnt/catalogue:ro
+          run thumbnailer    -v /srv/catalogue/thumbs:/thumbs
+          run sitemap-gen    --network cl-batch -v catalogue:/srv/catalogue
+          run feed-export    -v /srv/catalogue-archive:/srv/catalogue
+          run search-indexer --network cl-batch --mount type=bind,src=/srv/catalogue,dst=/index
+          run metadata-sync  -v /srv/catalogue:/data/catalogue
+          run price-rules    --network cl-batch
+        fi
+        run ad-scheduler   --network cl-batch -v /srv/media:/media:ro
+        run log-forwarder  -v /var/log:/host-logs:ro
+        run report-mailer  --network cl-batch --tmpfs /srv/catalogue
+        run cache-warmer   -v /srv/catalogue:/srv/catalogue
+        [ "$(docker ps -q | wc -l)" = 12 ]
+        rm -f /home/learner/catalogue-mounts.txt
+  checks:
+    - id: report-exists
+      description: ~/catalogue-mounts.txt exists and is not empty
+      type: shell
+      on: cl-batch-01
+      skills: [containers.foundations.inspect]
+      weight: 0.5
+      command: test -s /home/learner/catalogue-mounts.txt && echo ok || echo missing
+      expect: {match: exact, value: ok}
+    - id: right-containers
+      description: The report names exactly the containers that bind-mount /srv/catalogue
+      type: shell
+      on: cl-batch-01
+      skills: [containers.foundations.inspect]
+      weight: 3
+      command: |
+        want=$(docker ps -q | xargs docker inspect | jq -r '.[] | select(any(.Mounts[]; .Type == "bind" and .Source == "/srv/catalogue")) | .Name | ltrimstr("/")' | sort)
+        have=$(awk 'NF {sub(/^\//, "", $1); print $1}' /home/learner/catalogue-mounts.txt 2>/dev/null | sort)
+        [ -n "$want" ] && [ "$want" = "$have" ] && echo exact || echo different
+      expect: {match: exact, value: exact}
+    - id: right-addresses
+      description: Every line pairs the container with its IP address
+      type: shell
+      on: cl-batch-01
+      skills: [containers.foundations.inspect]
+      weight: 2
+      command: |
+        want=$(docker ps -q | xargs docker inspect | jq -r '.[] | select(any(.Mounts[]; .Type == "bind" and .Source == "/srv/catalogue")) | (.Name | ltrimstr("/")) + " " + ([.NetworkSettings.Networks[].IPAddress] | first)' | sort)
+        have=$(awk 'NF {sub(/^\//, "", $1); print $1, $2}' /home/learner/catalogue-mounts.txt 2>/dev/null | sort)
+        [ -n "$want" ] && [ "$want" = "$have" ] && echo exact || echo different
+      expect: {match: exact, value: exact}
+  hints:
+    - title: Where mounts live
+      body: "`docker inspect <container>` prints JSON; `.Mounts` lists each mount with its `Type`, `Source` (on the host) and `Destination` (in the container)."
+      command: docker inspect cache-warmer | jq '.[0].Mounts'
+      cost: 1
+    - title: Filter first
+      body: "`docker ps --filter volume=/srv/catalogue` matches containers by mount, but check whether it matches the source or the destination before you trust it."
+      cost: 2
+    - title: The IP address
+      body: "Each network a container is attached to has its own entry under `.NetworkSettings.Networks`, with an `IPAddress`."
+      command: docker inspect thumbnailer | jq -r '.[0].NetworkSettings.Networks[].IPAddress'
+      cost: 1
+  misconceptions:
+    - id: destination-match
+      description: Matches the mount destination /srv/catalogue instead of the host source.
+      feedback: "A container that mounts something else AT /srv/catalogue does not use the host directory. Compare each bind mount's Source, the path on the host."
+      expectFail: [right-containers, right-addresses]
+      mutation:
+        on: cl-batch-01
+        as: learner
+        run: |
+          docker ps -q | xargs docker inspect | jq -r '.[] | select(any(.Mounts[]; .Destination == "/srv/catalogue")) | (.Name | ltrimstr("/")) + " " + ([.NetworkSettings.Networks[].IPAddress] | first)' > ~/catalogue-mounts.txt
+    - id: prefix-match
+      description: Treats any source that starts with /srv/catalogue (the thumbs subdirectory, the archive) as the share.
+      feedback: "/srv/catalogue-archive and /srv/catalogue/thumbs are different directories. The storage team asked about /srv/catalogue itself."
+      expectFail: [right-containers, right-addresses]
+      mutation:
+        on: cl-batch-01
+        as: learner
+        run: |
+          docker ps -q | xargs docker inspect | jq -r '.[] | select(any(.Mounts[]; (.Source // "") | startswith("/srv/catalogue"))) | (.Name | ltrimstr("/")) + " " + ([.NetworkSettings.Networks[].IPAddress] | first)' > ~/catalogue-mounts.txt
+    - id: names-only
+      description: Lists the right containers but without their IP addresses.
+      feedback: "The report needs the IP address on each line too: .NetworkSettings.Networks.<network>.IPAddress."
+      expectFail: [right-addresses]
+      mutation:
+        on: cl-batch-01
+        as: learner
+        run: |
+          docker ps -q | xargs docker inspect | jq -r '.[] | select(any(.Mounts[]; .Type == "bind" and .Source == "/srv/catalogue")) | .Name | ltrimstr("/")' > ~/catalogue-mounts.txt
+  solution:
+    explanation: |
+      Bind mounts record the host path in `Source`. Select the containers with a bind
+      mount whose Source is exactly `/srv/catalogue` and print the name and the IP of
+      the network they are attached to.
+    steps:
+      - on: cl-batch-01
+        as: learner
+        run: |
+          docker ps -q | xargs docker inspect | jq -r '.[]
+            | select(any(.Mounts[]; .Type == "bind" and .Source == "/srv/catalogue"))
+            | (.Name | ltrimstr("/")) + " " + ([.NetworkSettings.Networks[].IPAddress] | first)' > ~/catalogue-mounts.txt
+          cat ~/catalogue-mounts.txt
+    alternatives:
+      - id: loop-and-grep
+        description: Loop over the containers in the shell and test each mount source.
+        steps:
+          - on: cl-batch-01
+            as: learner
+            run: |
+              : > ~/catalogue-mounts.txt
+              for c in $(docker ps --format json | jq -r .Names); do
+                if docker inspect "$c" | jq -e '.[0].Mounts[] | select(.Type == "bind" and .Source == "/srv/catalogue")' >/dev/null; then
+                  ip=$(docker inspect "$c" | jq -r '.[0].NetworkSettings.Networks | to_entries[0].value.IPAddress')
+                  echo "/$c $ip" >> ~/catalogue-mounts.txt
+                fi
+              done

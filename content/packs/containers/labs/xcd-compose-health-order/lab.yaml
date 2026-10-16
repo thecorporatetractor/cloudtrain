@@ -1,0 +1,187 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xcd-compose-health-order
+  title: Start the ordering API only once its database is healthy
+  domain: containers
+  frameworks: [docker-practitioner:compose]
+  difficulty: medium
+  estimatedMinutes: 10
+  tags: [exam, docker, compose, healthcheck, depends_on]
+  version: 1
+spec:
+  description: |
+    **Host:** `cl-docker-01` (`ssh cl-docker-01`)
+
+    `~/exam/ordering/compose.yaml` describes the ordering stack (project name
+    `ordering`): a Redis database `db` and the API `api`, which refuses to start when the
+    database does not answer yet. Complete the file so that:
+
+    - `db` has a **health check** (`redis-cli ping` works inside it);
+    - `api` **starts only after `db` reports healthy**;
+    - `api` is **restarted automatically** when it fails, and both services come back
+      after a host reboot;
+    - `api` (port 8000 in the container) answers on **`127.0.0.1:8081`** on the host,
+      and on no other host address.
+
+    Then bring the stack up from that file.
+  objectives:
+    - Add a health check and a health-conditioned dependency in Compose
+    - Publish a service on loopback with a restart policy
+  params:
+    token:
+      type: int
+      min: 10000
+      max: 99999
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-docker-01
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-docker-01
+      timeoutSec: 240
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        d=$(mktemp -d)
+        cat > "$d/api.py" <<'PY'
+        import http.server, os, socket, sys
+        host = os.environ.get("DB_HOST", "db")
+        try:
+            s = socket.create_connection((host, 6379), timeout=2); s.sendall(b"PING\r\n")
+            assert s.recv(16).startswith(b"+PONG")
+        except Exception as e:
+            print(f"database {host} not ready: {e}", flush=True); sys.exit(1)
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200); self.end_headers(); self.wfile.write(f"ordering api ok {os.environ.get('TOKEN', '-')}\n".encode())
+        print("ordering api listening on :8000", flush=True)
+        http.server.ThreadingHTTPServer(("", 8000), H).serve_forever()
+        PY
+        printf '%s\n' 'FROM python:3.13-alpine' 'COPY api.py /app/api.py' 'CMD ["python3", "/app/api.py"]' > "$d/Dockerfile"
+        docker build -q -t copperleaf/ordering-api:1 "$d" >/dev/null
+        rm -rf "$d"
+        o=/home/learner/exam/ordering
+        install -d -o learner -g learner /home/learner/exam "$o"
+        cat > "$o/compose.yaml" <<'YML'
+        name: ordering
+        services:
+          db:
+            image: redis:7.4-alpine
+          api:
+            image: copperleaf/ordering-api:1
+            environment:
+              DB_HOST: db
+              TOKEN: "{{token}}"
+        YML
+        chown -R learner:learner "$o"
+  checks:
+    - id: health-condition
+      description: api depends on db with condition service_healthy, and db has a health check
+      type: shell
+      on: cl-docker-01
+      skills: [containers.compose.startup-order]
+      weight: 2
+      command: |
+        cd /home/learner/exam/ordering && docker compose config --format json 2>/dev/null | jq -r '[.services.api.depends_on.db.condition // "none", (.services.db.healthcheck.test != null and (.services.db.healthcheck.disable // false | not) | tostring)] | join(" ")'
+      expect: {match: exact, value: "service_healthy true"}
+    - id: db-healthy
+      description: The db container of project ordering is healthy
+      type: shell
+      on: cl-docker-01
+      skills: [containers.compose.startup-order]
+      weight: 1
+      timeoutSec: 60
+      command: |
+        for i in $(seq 15); do c=$(docker ps -q --filter label=com.docker.compose.project=ordering --filter label=com.docker.compose.service=db | head -1)
+          s=$(docker inspect "$c" 2>/dev/null | jq -r '.[0].State.Health.Status // "none"'); [ "$s" = healthy ] && break; sleep 2; done; echo "$s"
+      expect: {match: exact, value: healthy}
+    - id: api-serves
+      description: api answers on 127.0.0.1:8081 and is published nowhere else
+      type: shell
+      on: cl-docker-01
+      skills: [containers.compose.model, containers.network.publishing]
+      weight: 2
+      timeoutSec: 60
+      command: |
+        c=$(docker ps -q --filter label=com.docker.compose.project=ordering --filter label=com.docker.compose.service=api | head -1)
+        b=$(docker inspect "$c" 2>/dev/null | jq -r '[.[0].HostConfig.PortBindings["8000/tcp"][]? | (.HostIp // "") + ":" + .HostPort] | join(",")')
+        r=$(curl -fsS --max-time 3 http://127.0.0.1:8081/ 2>/dev/null)
+        echo "$b $r"
+      expect: {match: exact, value: "127.0.0.1:8081 ordering api ok {{token}}"}
+    - id: restart-policy
+      description: Both services restart automatically
+      type: shell
+      on: cl-docker-01
+      skills: [containers.operations.restart-health]
+      weight: 1
+      command: |
+        docker ps -aq --filter label=com.docker.compose.project=ordering | xargs -r docker inspect | jq -r '[.[] | select(.HostConfig.RestartPolicy.Name | IN("always", "unless-stopped", "on-failure"))] | length'
+      expect: {match: exact, value: "2"}
+  misconceptions:
+    - id: plain-depends-on
+      description: Uses a plain depends_on list, which waits only for db to start.
+      feedback: "depends_on: [db] waits until the db container is started, not until Redis answers. Use the long form with condition: service_healthy and give db a healthcheck."
+      expectFail: [health-condition]
+      mutation:
+        on: cl-docker-01
+        as: learner
+        run: |
+          cd ~/exam/ordering
+          cat > compose.yaml <<'YML'
+          name: ordering
+          services:
+            db:
+              image: redis:7.4-alpine
+              restart: unless-stopped
+            api:
+              image: copperleaf/ordering-api:1
+              depends_on: [db]
+              restart: unless-stopped
+              ports: ["127.0.0.1:8081:8000"]
+              environment:
+                DB_HOST: db
+                TOKEN: "{{token}}"
+          YML
+          docker compose up -d
+          sleep 8
+  solution:
+    explanation: A healthcheck on db, the long depends_on form with service_healthy, a restart policy and a loopback port.
+    steps:
+      - on: cl-docker-01
+        as: learner
+        run: |
+          cd ~/exam/ordering
+          cat > compose.yaml <<'YML'
+          name: ordering
+          services:
+            db:
+              image: redis:7.4-alpine
+              restart: unless-stopped
+              healthcheck:
+                test: ["CMD", "redis-cli", "ping"]
+                interval: 2s
+                timeout: 2s
+                retries: 10
+            api:
+              image: copperleaf/ordering-api:1
+              restart: unless-stopped
+              depends_on:
+                db:
+                  condition: service_healthy
+              ports:
+                - "127.0.0.1:8081:8000"
+              environment:
+                DB_HOST: db
+                TOKEN: "{{token}}"
+          YML
+          docker compose up -d --wait

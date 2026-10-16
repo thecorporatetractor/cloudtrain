@@ -1,0 +1,112 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xcd-storage-mount-mix
+  title: Run the indexer with three kinds of mounts
+  domain: containers
+  frameworks: [docker-practitioner:storage]
+  difficulty: easy
+  estimatedMinutes: 6
+  tags: [exam, docker, volumes, bind-mounts, tmpfs]
+  version: 1
+spec:
+  description: |
+    **Host:** `cl-docker-01` (`ssh cl-docker-01`)
+
+    Run `copperleaf/indexer:2` as a container named **`indexer`** with:
+
+    - its configuration from the host directory **`/srv/indexer/conf`**, bind-mounted
+      **read-only** at **`/etc/indexer`**;
+    - its index on the named volume **`index-data`** at **`/var/lib/indexer`**;
+    - **`/tmp`** as a **tmpfs of 64 MiB**.
+
+    `indexer` must run again on its own after a host reboot.
+  objectives:
+    - Combine bind, volume and tmpfs mounts on one container
+  params:
+    shard:
+      type: int
+      min: 100
+      max: 999
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-docker-01
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-docker-01
+      timeoutSec: 240
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        d=$(mktemp -d)
+        printf '%s\n' '#!/bin/sh' '[ -r /etc/indexer/indexer.conf ] || { echo "FATAL: no config"; exit 1; }' \
+          'echo "indexer up $(cat /etc/indexer/indexer.conf)"' 'trap "exit 0" TERM' 'while :; do sleep 10 & wait $!; done' > "$d/indexer"
+        chmod 0755 "$d/indexer"
+        printf '%s\n' 'FROM busybox:1.37' 'COPY indexer /usr/local/bin/indexer' 'ENTRYPOINT ["/usr/local/bin/indexer"]' > "$d/Dockerfile"
+        docker build -q -t copperleaf/indexer:2 "$d" >/dev/null
+        rm -rf "$d"
+        mkdir -p /srv/indexer/conf && echo "shard={{shard}}" > /srv/indexer/conf/indexer.conf && chmod -R a+rX /srv/indexer
+  checks:
+    - id: running
+      description: indexer is running with its configuration
+      type: shell
+      on: cl-docker-01
+      skills: [containers.storage.mount-types]
+      weight: 1
+      command: |
+        [ "$(docker inspect indexer 2>/dev/null | jq -r '.[0].State.Running')" = true ] && docker logs indexer 2>&1 | grep -c '^indexer up shard={{shard}}$' || echo 0
+      expect: {match: exact, value: "1"}
+    - id: mounts
+      description: The configuration is a read-only bind and the index the named volume index-data
+      type: shell
+      on: cl-docker-01
+      skills: [containers.storage.mount-types]
+      weight: 2
+      command: |
+        docker inspect indexer 2>/dev/null | jq -r '[.[0].Mounts[] | select(.Destination == "/etc/indexer" or .Destination == "/var/lib/indexer") | .Destination + "=" + .Type + ":" + (if .Type == "bind" then .Source else .Name end) + ":" + (.RW | tostring)] | sort | join(" ")'
+      expect: {match: exact, value: "/etc/indexer=bind:/srv/indexer/conf:false /var/lib/indexer=volume:index-data:true"}
+    - id: tmpfs
+      description: /tmp is a 64 MiB tmpfs
+      type: shell
+      on: cl-docker-01
+      skills: [containers.storage.mount-types]
+      weight: 1.5
+      command: |
+        docker exec indexer awk '$2 == "/tmp" {print $3, ($4 ~ /(^|,)size=65536k(,|$)/ ? "64MiB" : "other-size")}' /proc/mounts 2>/dev/null || echo none
+      expect: {match: exact, value: "tmpfs 64MiB"}
+    - id: restarts
+      description: indexer comes back after a reboot
+      type: shell
+      on: cl-docker-01
+      skills: [containers.operations.restart-health]
+      weight: 0.5
+      command: docker inspect indexer 2>/dev/null | jq -r 'if (.[0].HostConfig.RestartPolicy.Name | IN("always", "unless-stopped")) then "restarts" else "stays-down" end'
+      expect: {match: exact, value: restarts}
+  misconceptions:
+    - id: config-rw
+      description: Bind-mounts the configuration read-write.
+      feedback: "Add :ro (or readonly with --mount) to the bind mount."
+      expectFail: [mounts]
+      mutation:
+        on: cl-docker-01
+        as: learner
+        run: docker run -d --name indexer --restart unless-stopped -v /srv/indexer/conf:/etc/indexer -v index-data:/var/lib/indexer --tmpfs /tmp:size=64m copperleaf/indexer:2
+  solution:
+    explanation: One run command with a read-only bind, a named volume and a sized tmpfs.
+    steps:
+      - on: cl-docker-01
+        as: learner
+        run: |
+          docker run -d --name indexer --restart unless-stopped \
+            --mount type=bind,src=/srv/indexer/conf,dst=/etc/indexer,readonly \
+            --mount type=volume,src=index-data,dst=/var/lib/indexer \
+            --tmpfs /tmp:size=64m copperleaf/indexer:2

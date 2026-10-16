@@ -1,0 +1,173 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xcd-build-entrypoint-signals
+  title: Fix the worker image's entrypoint, stop and health
+  domain: containers
+  frameworks: [docker-practitioner:build]
+  difficulty: medium
+  estimatedMinutes: 12
+  tags: [exam, docker, dockerfile, entrypoint, signals, healthcheck]
+  version: 1
+spec:
+  description: |
+    **Host:** `cl-docker-01` (`ssh cl-docker-01`)
+
+    The queue worker's build context is `~/exam/worker/` (a `Dockerfile` and
+    `worker.py`). Images built from it have three problems:
+
+    - arguments given after the image name (`--queue <name>`) never reach the worker;
+    - `docker stop` always waits the full 10 s timeout;
+    - the container never becomes **healthy**. The worker answers health probes on
+      `http://127.0.0.1:8085/healthz` inside the container.
+
+    Fix the Dockerfile (do not change `worker.py`), build it as
+    **`copperleaf/worker:2`**, and run it as a container named **`worker`** that
+    consumes the queue **`{{queue}}`**. `worker` must be **healthy** and must run again
+    on its own after a host reboot.
+  objectives:
+    - Use exec-form ENTRYPOINT so arguments and signals reach the process
+    - Write a working HEALTHCHECK with tools the image has
+  params:
+    queue:
+      type: choice
+      values: [transcode-hd, subtitle-render, ad-stitch]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-docker-01
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-docker-01
+      timeoutSec: 240
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        w=/home/learner/exam/worker
+        install -d -o learner -g learner /home/learner/exam "$w"
+        cat > "$w/worker.py" <<'PY'
+        import argparse, http.server, signal, sys, threading
+
+        p = argparse.ArgumentParser()
+        p.add_argument("--queue", default="default")
+        a = p.parse_args()
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                ok = self.path == "/healthz"
+                self.send_response(200 if ok else 404)
+                self.end_headers()
+                self.wfile.write(b"ok\n" if ok else b"")
+            def log_message(self, *args):
+                pass
+
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 8085), H)
+        def stop(signum, frame):
+            print(f"worker stopped cleanly (signal {signum})", flush=True)
+            sys.exit(0)
+        signal.signal(signal.SIGTERM, stop)
+        print(f"worker consuming queue {a.queue}", flush=True)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        signal.pause()
+        PY
+        cat > "$w/Dockerfile" <<'DF'
+        FROM python:3.13-alpine
+        WORKDIR /app
+        COPY worker.py /app/worker.py
+        HEALTHCHECK --interval=5s --timeout=3s --retries=3 CMD curl -f http://127.0.0.1:8080/healthz || exit 1
+        ENTRYPOINT python3 /app/worker.py
+        CMD ["--queue", "default"]
+        DF
+        chown -R learner:learner "$w"
+        sha256sum "$w/worker.py" > /var/tmp/worker.py.sha256
+  checks:
+    - id: exec-form
+      description: copperleaf/worker:2 starts python3 directly (exec form), not through a shell
+      type: shell
+      on: cl-docker-01
+      skills: [containers.build.entrypoint]
+      weight: 1
+      command: docker image inspect copperleaf/worker:2 2>/dev/null | jq -r '(.[0].Config.Entrypoint // [])[0] // "none"'
+      expect: {match: regex, value: "^(python3|/usr/local/bin/python3|python)$"}
+    - id: queue-arg
+      description: worker consumes the requested queue
+      type: shell
+      on: cl-docker-01
+      skills: [containers.build.entrypoint]
+      weight: 1.5
+      command: docker logs worker 2>&1 | grep -c '^worker consuming queue {{queue}}$' || true
+      expect: {match: exact, value: "1"}
+    - id: healthy
+      description: worker reports healthy
+      type: shell
+      on: cl-docker-01
+      skills: [containers.build.healthcheck]
+      weight: 2
+      timeoutSec: 60
+      command: |
+        for i in $(seq 20); do s=$(docker inspect worker 2>/dev/null | jq -r '.[0].State.Health.Status // "none"'); [ "$s" = healthy ] && break; sleep 2; done; echo "$s"
+      expect: {match: exact, value: healthy}
+    - id: fast-stop
+      description: A container from copperleaf/worker:2 stops within 3 s and shuts down cleanly
+      type: shell
+      on: cl-docker-01
+      skills: [containers.build.signals]
+      weight: 2
+      timeoutSec: 60
+      command: |
+        docker rm -f xcd-stop-probe >/dev/null 2>&1
+        docker run -d --name xcd-stop-probe copperleaf/worker:2 --queue probe >/dev/null 2>&1 || { echo no-image; exit 0; }
+        sleep 2; t0=$(date +%s); docker stop xcd-stop-probe >/dev/null; t=$(( $(date +%s) - t0 ))
+        c=$(docker logs xcd-stop-probe 2>&1 | grep -c 'stopped cleanly'); docker rm -f xcd-stop-probe >/dev/null
+        [ "$t" -le 3 ] && [ "$c" -ge 1 ] && echo fast || echo "slow-${t}s"
+      expect: {match: exact, value: fast}
+    - id: worker-unchanged-restarts
+      description: worker.py is unchanged and worker comes back after a reboot
+      type: shell
+      on: cl-docker-01
+      skills: [containers.operations.restart-health]
+      weight: 0.5
+      command: |
+        sha256sum -c --status /var/tmp/worker.py.sha256 && docker inspect worker 2>/dev/null | jq -r 'if (.[0].HostConfig.RestartPolicy.Name | IN("always", "unless-stopped")) then "ok" else "stays-down" end' || echo changed
+      expect: {match: exact, value: ok}
+  misconceptions:
+    - id: shell-form-kept
+      description: Fixes the health check but keeps the shell-form ENTRYPOINT.
+      feedback: "In shell form, /bin/sh -c is PID 1: it ignores the arguments after the image name and does not pass SIGTERM on. Write ENTRYPOINT as a JSON array."
+      expectFail: [exec-form, queue-arg]
+      mutation:
+        on: cl-docker-01
+        as: learner
+        run: |
+          cd ~/exam/worker
+          sed -i 's#CMD curl -f http://127.0.0.1:8080/healthz || exit 1#CMD wget -q -O /dev/null http://127.0.0.1:8085/healthz || exit 1#' Dockerfile
+          docker build -q -t copperleaf/worker:2 .
+          docker run -d --name worker --restart unless-stopped copperleaf/worker:2 --queue {{queue}}
+  solution:
+    explanation: |
+      Exec-form ENTRYPOINT makes python3 PID 1, so it receives SIGTERM and the run
+      arguments replace CMD. The image has no curl; busybox wget (or python) can probe
+      the right port.
+    steps:
+      - on: cl-docker-01
+        as: learner
+        run: |
+          cd ~/exam/worker
+          cat > Dockerfile <<'DF'
+          FROM python:3.13-alpine
+          WORKDIR /app
+          COPY worker.py /app/worker.py
+          HEALTHCHECK --interval=5s --timeout=3s --retries=3 CMD wget -q -O /dev/null http://127.0.0.1:8085/healthz || exit 1
+          ENTRYPOINT ["python3", "/app/worker.py"]
+          CMD ["--queue", "default"]
+          DF
+          docker build -q -t copperleaf/worker:2 .
+          docker run -d --name worker --restart unless-stopped copperleaf/worker:2 --queue {{queue}}

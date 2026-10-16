@@ -1,0 +1,203 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-first-transcoder-run
+  title: Start, inspect and retire your first transcoder container
+  domain: containers
+  frameworks: [ex188-aligned:run-containers, docker-practitioner:operations]
+  difficulty: easy
+  estimatedMinutes: 12
+  tags: [docker, run, logs, rm, env]
+  version: 1
+spec:
+  description: |
+    Welcome to Copperleaf Media's transcoder farm. Before a new encoding profile
+    goes live, the farm team runs a **probe container** that checks the profile and
+    prints a one-line startup banner.
+
+    The probe runs on the Docker host `cl-transcode-01`. From your workstation,
+    connect with `ssh cl-transcode-01` (you are in the `docker` group there, and
+    `sudo` works without a password). The image `copperleaf/transcode-probe:2.4` is
+    already on the host.
+
+    1. Start the probe **in the background** as a container named **`probe-1`**,
+       with the environment variable **`PROFILE=1080p`**. Leave it running.
+    2. Copy the probe's **startup banner** (the first line it logs, the one ending in
+       `ready`) into `~/probe-banner.txt` on `cl-transcode-01`.
+    3. Last week's probe, **`probe-old`**, has stopped but is still lying around.
+       **Remove** it, so that `probe-1` is the only transcode-probe container on the
+       host.
+  objectives:
+    - Run a detached, named container with an environment variable
+    - Read a container's logs
+    - Tell stopped containers from removed ones and clean up
+  params:
+    build:
+      type: int
+      min: 1000
+      max: 9999
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-transcode-01
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-transcode-01
+      timeoutSec: 240
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        d=$(mktemp -d)
+        cat > "$d/probe.sh" <<'SH'
+        #!/bin/sh
+        echo "transcode-probe 2.4.1 build {{build}} profile=${PROFILE:-unset} ready"
+        trap 'exit 0' TERM INT
+        while :; do sleep 5 & wait $!; echo "heartbeat profile=${PROFILE:-unset}"; done
+        SH
+        chmod 0755 "$d/probe.sh"
+        printf '%s\n' 'FROM busybox:1.37' 'COPY probe.sh /usr/local/bin/transcode-probe' \
+          'LABEL org.opencontainers.image.vendor="Copperleaf Media"' \
+          'ENTRYPOINT ["/usr/local/bin/transcode-probe"]' > "$d/Dockerfile"
+        docker build -q -t copperleaf/transcode-probe:2.4 "$d" >/dev/null
+        rm -rf "$d"
+        docker rm -f probe-1 probe-old >/dev/null 2>&1 || true
+        docker run -d --name probe-old -e PROFILE=720p copperleaf/transcode-probe:2.4 >/dev/null
+        sleep 1
+        docker stop -t 2 probe-old >/dev/null
+        rm -f /home/learner/probe-banner.txt
+  checks:
+    - id: probe-running
+      description: A container named probe-1 is running
+      type: shell
+      on: cl-transcode-01
+      skills: [containers.foundations.lifecycle]
+      weight: 2
+      command: docker inspect probe-1 2>/dev/null | jq -r '.[0].State.Running // false'
+      expect: {match: exact, value: "true"}
+    - id: probe-image
+      description: probe-1 runs the copperleaf/transcode-probe:2.4 image
+      type: shell
+      on: cl-transcode-01
+      skills: [containers.foundations.lifecycle]
+      weight: 1
+      command: |
+        want=$(docker image inspect copperleaf/transcode-probe:2.4 | jq -r '.[0].Id')
+        have=$(docker inspect probe-1 2>/dev/null | jq -r '.[0].Image')
+        [ -n "$want" ] && [ "$want" = "$have" ] && echo same || echo different
+      expect: {match: exact, value: same}
+    - id: probe-profile
+      description: probe-1 has PROFILE=1080p in its environment
+      type: shell
+      on: cl-transcode-01
+      skills: [containers.foundations.lifecycle]
+      weight: 1.5
+      command: docker inspect probe-1 2>/dev/null | jq -r '.[0].Config.Env[]?' | grep -cx 'PROFILE=1080p'
+      expect: {match: exact, value: "1"}
+    - id: banner-saved
+      description: ~/probe-banner.txt holds probe-1's startup banner
+      type: shell
+      on: cl-transcode-01
+      skills: [containers.foundations.exec-logs]
+      weight: 2
+      command: |
+        f=/home/learner/probe-banner.txt
+        [ -s "$f" ] || { echo missing; exit 0; }
+        grep -qxF 'transcode-probe 2.4.1 build {{build}} profile=1080p ready' "$f" && echo banner || echo wrong
+      expect: {match: exact, value: banner}
+    - id: probe-old-removed
+      description: The stopped container probe-old no longer exists
+      type: shell
+      on: cl-transcode-01
+      skills: [containers.foundations.lifecycle]
+      weight: 1.5
+      command: docker container inspect probe-old >/dev/null 2>&1 && echo present || echo removed
+      expect: {match: exact, value: removed}
+    - id: single-probe
+      description: probe-1 is the only container created from the transcode-probe image
+      type: shell
+      on: cl-transcode-01
+      skills: [containers.foundations.lifecycle]
+      weight: 1
+      command: docker ps -a --filter ancestor=copperleaf/transcode-probe:2.4 -q | wc -l
+      expect: {match: exact, value: "1"}
+  hints:
+    - title: Background and name
+      body: "`docker run` takes `-d` (detach), `--name` and `-e KEY=value` before the image name."
+      command: docker run --help | grep -E -- '--detach|--name|--env '
+      cost: 1
+    - title: The banner
+      body: "`docker logs probe-1` prints everything the container wrote. The banner is the first line; `head -n 1` keeps just that one."
+      cost: 1
+    - title: Stopped is not gone
+      body: "`docker ps` only lists running containers; `docker ps -a` shows stopped ones too. `docker rm` deletes a stopped container."
+      command: docker ps -a
+      cost: 1
+  misconceptions:
+    - id: forgot-env
+      description: Starts probe-1 without the PROFILE variable.
+      feedback: "The probe reads its profile from the PROFILE environment variable; without -e PROFILE=1080p it reports profile=unset. Recreate the container with the variable."
+      expectFail: [probe-profile, banner-saved]
+      mutation:
+        on: cl-transcode-01
+        as: learner
+        run: |
+          docker run -d --name probe-1 copperleaf/transcode-probe:2.4
+          sleep 2
+          docker logs probe-1 | head -n 1 > ~/probe-banner.txt
+          docker rm probe-old
+    - id: banner-from-old-probe
+      description: Copies the banner from probe-old's logs instead of probe-1's.
+      feedback: "Stopped containers keep their logs, so probe-old still has a banner, but it is last week's 720p one. Read the logs of probe-1."
+      expectFail: [banner-saved]
+      mutation:
+        on: cl-transcode-01
+        as: learner
+        run: |
+          docker run -d --name probe-1 -e PROFILE=1080p copperleaf/transcode-probe:2.4
+          docker logs probe-old | head -n 1 > ~/probe-banner.txt
+          docker rm probe-old
+    - id: stop-not-remove
+      description: Stops probe-old again (or leaves it) instead of removing it.
+      feedback: "A stopped container still exists, with its filesystem and logs, until docker rm deletes it. docker ps -a shows it."
+      expectFail: [probe-old-removed, single-probe]
+      mutation:
+        on: cl-transcode-01
+        as: learner
+        run: |
+          docker run -d --name probe-1 -e PROFILE=1080p copperleaf/transcode-probe:2.4
+          sleep 2
+          docker logs probe-1 | head -n 1 > ~/probe-banner.txt
+          docker stop probe-old
+  solution:
+    explanation: |
+      `docker run -d --name probe-1 -e PROFILE=1080p <image>` starts the probe in the
+      background. `docker logs` shows what it printed; the first line is the banner.
+      `docker rm probe-old` deletes the stopped container (`docker stop` would not).
+    steps:
+      - on: cl-transcode-01
+        as: learner
+        run: |
+          docker run -d --name probe-1 -e PROFILE=1080p copperleaf/transcode-probe:2.4
+          sleep 2
+          docker logs probe-1 | head -n 1 > ~/probe-banner.txt
+          cat ~/probe-banner.txt
+          docker rm probe-old
+    alternatives:
+      - id: grep-and-force
+        description: Long option names, grep the ready line, and force-remove by filter.
+        steps:
+          - on: cl-transcode-01
+            as: learner
+            run: |
+              docker container run --detach --name probe-1 --env PROFILE=1080p copperleaf/transcode-probe:2.4
+              sleep 3
+              docker container logs probe-1 2>&1 | grep 'ready$' > ~/probe-banner.txt
+              docker container rm --force $(docker ps -aq --filter name=^probe-old$)

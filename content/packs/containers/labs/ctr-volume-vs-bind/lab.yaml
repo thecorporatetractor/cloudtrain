@@ -1,0 +1,175 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-volume-vs-bind
+  title: Give the media indexer the right kind of storage for each job
+  domain: containers
+  frameworks: [dca-legacy:storage, ex188-aligned:run-containers, docker-practitioner:storage]
+  difficulty: easy
+  estimatedMinutes: 12
+  tags: [docker, volumes, bind-mounts, tmpfs]
+  version: 1
+spec:
+  description: |
+    Copperleaf's media indexer scans new uploads and keeps a search index. On
+    `cl-media-01` (`ssh cl-media-01`; you are in the `docker` group) start it from
+    the image `copperleaf/media-indexer:1.0` as a detached container named
+    **`media-indexer`**, with three kinds of storage:
+
+    | Path in the container | What it holds | Storage |
+    |---|---|---|
+    | `/var/lib/indexer` | the index, must outlive the container | the **named volume `media-index`** |
+    | `/etc/indexer` | configuration maintained on the host in `/etc/copperleaf/indexer` | a **bind mount**, **read-only** |
+    | `/scratch` | temporary transcode chunks, never kept | a **tmpfs** of **256 MiB** |
+
+    The indexer refuses to start if its configuration is missing, and checks that it
+    cannot write to it. When everything is right it logs `indexer ready`.
+  objectives:
+    - Choose between named volumes, bind mounts and tmpfs mounts
+    - Mount read-only and size a tmpfs
+    - Verify mounts from inside the container
+  params:
+    shard:
+      type: int
+      min: 10
+      max: 99
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-media-01
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-media-01
+      timeoutSec: 240
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        d=$(mktemp -d)
+        cat > "$d/media-indexer" <<'SH'
+        #!/bin/sh
+        # Copperleaf media indexer (lab stand-in).
+        c=/etc/indexer/indexer.conf
+        [ -r "$c" ] || { echo "FATAL: no configuration at $c"; exit 1; }
+        if touch /etc/indexer/.probe 2>/dev/null; then rm -f /etc/indexer/.probe; echo "FATAL: /etc/indexer is writable; mount it read-only"; exit 1; fi
+        mkdir -p /var/lib/indexer && echo "shard=$(sed -n 's/^shard=//p' "$c") started=$(date +%s)" >> /var/lib/indexer/index.log
+        echo "indexer ready (shard $(sed -n 's/^shard=//p' "$c"))"
+        trap 'exit 0' TERM INT
+        while :; do sleep 10 & wait $!; dd if=/dev/zero of=/scratch/chunk bs=1k count=64 2>/dev/null; done
+        SH
+        chmod 0755 "$d/media-indexer"
+        printf '%s\n' 'FROM busybox:1.37' 'COPY media-indexer /usr/local/bin/media-indexer' \
+          'VOLUME /var/lib/indexer' 'ENTRYPOINT ["/usr/local/bin/media-indexer"]' > "$d/Dockerfile"
+        docker build -q -t copperleaf/media-indexer:1.0 "$d" >/dev/null
+        rm -rf "$d"
+        docker rm -f media-indexer >/dev/null 2>&1 || true
+        mkdir -p /etc/copperleaf/indexer
+        printf '%s\n' "shard={{shard}}" 'sources=/srv/uploads' 'formats=mp4,mkv,mov' > /etc/copperleaf/indexer/indexer.conf
+        chmod -R a+rX /etc/copperleaf/indexer
+  checks:
+    - id: indexer-running
+      description: media-indexer is running and logged that it is ready
+      type: shell
+      on: cl-media-01
+      skills: [containers.storage.mount-types]
+      weight: 1
+      command: |
+        [ "$(docker inspect media-indexer 2>/dev/null | jq -r '.[0].State.Running')" = true ] || { echo stopped; exit 0; }
+        docker logs media-indexer 2>&1 | grep -q '^indexer ready (shard {{shard}})' && echo ready || echo not-ready
+      expect: {match: exact, value: ready}
+    - id: index-named-volume
+      description: /var/lib/indexer is the named volume media-index
+      type: shell
+      on: cl-media-01
+      skills: [containers.storage.mount-types]
+      weight: 2
+      command: docker inspect media-indexer 2>/dev/null | jq -r '[.[0].Mounts[] | select(.Destination == "/var/lib/indexer") | .Type + ":" + (.Name // "")] | join(",")'
+      expect: {match: exact, value: "volume:media-index"}
+    - id: config-bind-ro
+      description: /etc/indexer is a read-only bind mount of /etc/copperleaf/indexer
+      type: shell
+      on: cl-media-01
+      skills: [containers.storage.mount-types]
+      weight: 2
+      command: |
+        docker inspect media-indexer 2>/dev/null | jq -r '[.[0].Mounts[] | select(.Destination == "/etc/indexer") | .Type + ":" + .Source + ":" + (.RW | tostring)] | join(",")'
+      expect: {match: exact, value: "bind:/etc/copperleaf/indexer:false"}
+    - id: scratch-tmpfs-256m
+      description: The container's mount table shows /scratch as a 256 MiB tmpfs
+      type: shell
+      on: cl-media-01
+      skills: [containers.storage.mount-types]
+      weight: 2
+      command: |
+        docker exec media-indexer awk '$2 == "/scratch" {print $3, ($4 ~ /(^|,)size=262144k(,|$)/ ? "256MiB" : "other-size")}' /proc/mounts 2>/dev/null || echo none
+      expect: {match: exact, value: "tmpfs 256MiB"}
+  hints:
+    - title: Three flags, three types
+      body: "`-v media-index:/var/lib/indexer` names a volume; `-v /host/path:/path:ro` is a read-only bind mount; `--tmpfs /path:size=256m` (or `--mount type=tmpfs,...,tmpfs-size=...`) is a tmpfs."
+      cost: 2
+    - title: Why it stopped
+      body: "If the container exits, `docker logs media-indexer` says why (missing config, writable config)."
+      cost: 1
+    - title: Check from inside
+      body: "`docker exec media-indexer cat /proc/mounts` is the container's own mount table: type, options (ro, size=...) and all."
+      cost: 1
+  misconceptions:
+    - id: config-writable
+      description: Bind-mounts the configuration read-write.
+      feedback: "Configuration the host owns should be mounted read-only (:ro or readonly), so the container cannot change it. The indexer refuses a writable config."
+      expectFail: [indexer-running, config-bind-ro]
+      mutation:
+        on: cl-media-01
+        as: learner
+        run: docker run -d --name media-indexer -v media-index:/var/lib/indexer -v /etc/copperleaf/indexer:/etc/indexer --tmpfs /scratch:size=256m copperleaf/media-indexer:1.0
+    - id: anonymous-volume
+      description: Relies on the image's VOLUME, which creates an anonymous volume instead of media-index.
+      feedback: "The image declares VOLUME /var/lib/indexer, so Docker creates a volume with a random name; it is easy to lose. Mount the named volume media-index explicitly."
+      expectFail: [index-named-volume]
+      mutation:
+        on: cl-media-01
+        as: learner
+        run: docker run -d --name media-indexer -v /etc/copperleaf/indexer:/etc/indexer:ro --tmpfs /scratch:size=256m copperleaf/media-indexer:1.0
+    - id: tmpfs-unsized
+      description: Mounts a tmpfs without a size.
+      feedback: "An unsized tmpfs may grow to half of the host's memory. Give it size=256m."
+      expectFail: [scratch-tmpfs-256m]
+      mutation:
+        on: cl-media-01
+        as: learner
+        run: docker run -d --name media-indexer -v media-index:/var/lib/indexer -v /etc/copperleaf/indexer:/etc/indexer:ro --tmpfs /scratch copperleaf/media-indexer:1.0
+  solution:
+    explanation: |
+      Named volume for data that must persist, read-only bind mount for host-owned
+      configuration, sized tmpfs for throw-away scratch space.
+    steps:
+      - on: cl-media-01
+        as: learner
+        run: |
+          docker run -d --name media-indexer \
+            -v media-index:/var/lib/indexer \
+            -v /etc/copperleaf/indexer:/etc/indexer:ro \
+            --tmpfs /scratch:size=256m \
+            copperleaf/media-indexer:1.0
+          sleep 2
+          docker logs media-indexer
+    alternatives:
+      - id: mount-syntax
+        description: The same with --mount, creating the volume first.
+        steps:
+          - on: cl-media-01
+            as: learner
+            run: |
+              docker volume create media-index
+              docker run -d --name media-indexer \
+                --mount type=volume,src=media-index,dst=/var/lib/indexer \
+                --mount type=bind,src=/etc/copperleaf/indexer,dst=/etc/indexer,readonly \
+                --mount type=tmpfs,dst=/scratch,tmpfs-size=268435456 \
+                copperleaf/media-indexer:1.0

@@ -1,0 +1,95 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xcd-net-publish-loopback
+  title: Publish the metrics endpoint on loopback only
+  domain: containers
+  frameworks: [docker-practitioner:networking]
+  difficulty: easy
+  estimatedMinutes: 5
+  tags: [exam, docker, ports, publish]
+  version: 1
+spec:
+  description: |
+    **Host:** `cl-docker-01` (`ssh cl-docker-01`)
+
+    Run the metrics exporter `copperleaf/node-metrics:1` as a container named
+    **`metrics`**. It listens on port 9100 inside the container. Publish it on the host
+    as port **9100** on **`127.0.0.1` only**: no other host address, IPv4 or IPv6, may
+    accept connections on 9100. It must run again on its own after a host reboot.
+  objectives:
+    - Bind a published port to one host address
+  params:
+    node:
+      type: int
+      min: 10
+      max: 99
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-docker-01
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-docker-01
+      timeoutSec: 240
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        d=$(mktemp -d); mkdir -p "$d/www"
+        printf '%s\n' '# copperleaf node metrics' 'cl_node_id {{node}}' 'cl_up 1' > "$d/www/metrics"
+        printf '%s\n' 'FROM busybox:1.37' 'COPY www /www' 'EXPOSE 9100' 'CMD ["httpd", "-f", "-p", "9100", "-h", "/www"]' > "$d/Dockerfile"
+        docker build -q -t copperleaf/node-metrics:1 "$d" >/dev/null
+        rm -rf "$d"
+  checks:
+    - id: loopback-serves
+      description: http://127.0.0.1:9100/metrics on the host is served by metrics
+      type: shell
+      on: cl-docker-01
+      skills: [containers.network.publishing]
+      weight: 2
+      command: curl -fsS --max-time 3 http://127.0.0.1:9100/metrics 2>/dev/null | grep -c '^cl_node_id {{node}}$' || true
+      expect: {match: exact, value: "1"}
+    - id: loopback-only
+      description: Port 9100 is published on 127.0.0.1 and no other address
+      type: shell
+      on: cl-docker-01
+      skills: [containers.network.publishing]
+      weight: 3
+      command: |
+        b=$(docker inspect metrics 2>/dev/null | jq -r '[.[0].HostConfig.PortBindings["9100/tcp"][]? | (.HostIp // "") + ":" + .HostPort] | join(",")')
+        ext=no
+        for ip in $(hostname -I) ; do curl -s -o /dev/null --max-time 2 "http://$ip:9100/metrics" && ext=yes; done
+        curl -g -s -o /dev/null --max-time 2 'http://[::1]:9100/metrics' && ext=yes
+        echo "$b external=$ext"
+      expect: {match: exact, value: "127.0.0.1:9100 external=no"}
+    - id: restarts
+      description: metrics comes back after a reboot
+      type: shell
+      on: cl-docker-01
+      skills: [containers.operations.restart-health]
+      weight: 1
+      command: docker inspect metrics 2>/dev/null | jq -r 'if (.[0].HostConfig.RestartPolicy.Name | IN("always", "unless-stopped")) then "restarts" else "stays-down" end'
+      expect: {match: exact, value: restarts}
+  misconceptions:
+    - id: all-addresses
+      description: Publishes 9100 on every host address.
+      feedback: "-p 9100:9100 binds 0.0.0.0 (and ::), so every interface accepts connections. Put the address in front: -p 127.0.0.1:9100:9100."
+      expectFail: [loopback-only]
+      mutation:
+        on: cl-docker-01
+        as: learner
+        run: docker run -d --name metrics --restart unless-stopped -p 9100:9100 copperleaf/node-metrics:1
+  solution:
+    explanation: "`-p 127.0.0.1:9100:9100` binds only the IPv4 loopback address."
+    steps:
+      - on: cl-docker-01
+        as: learner
+        run: docker run -d --name metrics --restart unless-stopped -p 127.0.0.1:9100:9100 copperleaf/node-metrics:1

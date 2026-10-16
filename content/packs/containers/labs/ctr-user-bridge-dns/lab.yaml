@@ -1,0 +1,191 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-user-bridge-dns
+  title: Let the catalogue API find its database by name
+  domain: containers
+  frameworks: [dca-legacy:networking, ex188-aligned:multi-container, docker-practitioner:networking]
+  difficulty: easy
+  estimatedMinutes: 12
+  tags: [docker, networks, dns, bridge]
+  version: 1
+spec:
+  description: |
+    On `cl-catalogue-03` (`ssh cl-catalogue-03`; you are in the `docker` group) the
+    container **`catalogue-api`** should talk to its cache database, the container
+    **`catalogue-db`**, by the host name `catalogue-db`. It logs
+    `db catalogue-db unreachable` every few seconds instead: both containers were
+    started on Docker's default bridge network.
+
+    Fix the networking so that:
+
+    - `catalogue-api` reaches `catalogue-db` **by name** (its logs then say
+      `db catalogue-db ok`), through a **user-defined bridge network** that both
+      containers are attached to;
+    - neither container publishes any port on the host;
+    - the database keeps its data (do not delete the `catalogue-db` container's data
+      volume `catalogue-cache`).
+
+    You may recreate `catalogue-api`, or attach the existing containers to a network;
+    both are fine.
+  objectives:
+    - Explain why the default bridge has no name resolution
+    - Create a user-defined bridge network and attach containers to it
+    - Keep internal services unpublished
+  params:
+    netname:
+      type: choice
+      values: [catalogue-net, catalogue-backend, cl-catalogue]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-catalogue-03
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-catalogue-03
+      timeoutSec: 240
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        d=$(mktemp -d)
+        cat > "$d/catalogue-api" <<'SH'
+        #!/bin/sh
+        # Copperleaf catalogue API (lab stand-in): checks its cache database by name.
+        trap 'exit 0' TERM INT
+        while :; do
+          if redis-cli -h "${DB_HOST:-catalogue-db}" -t 2 ping 2>/dev/null | grep -q PONG; then echo "db ${DB_HOST:-catalogue-db} ok"
+          else echo "db ${DB_HOST:-catalogue-db} unreachable"; fi
+          sleep 3 & wait $!
+        done
+        SH
+        chmod 0755 "$d/catalogue-api"
+        printf '%s\n' 'FROM redis:7.4-alpine' 'COPY catalogue-api /usr/local/bin/catalogue-api' \
+          'ENV DB_HOST=catalogue-db' 'ENTRYPOINT ["/usr/local/bin/catalogue-api"]' > "$d/Dockerfile"
+        docker build -q -t copperleaf/catalogue-api:3.2 "$d" >/dev/null
+        rm -rf "$d"
+        docker rm -f catalogue-api catalogue-db >/dev/null 2>&1 || true
+        docker volume create catalogue-cache >/dev/null
+        docker run -d --name catalogue-db -v catalogue-cache:/data redis:7.4-alpine redis-server --appendonly yes >/dev/null
+        docker exec catalogue-db sh -c 'for i in $(seq 20); do redis-cli ping >/dev/null 2>&1 && break; sleep 1; done; redis-cli set catalogue:titles 4211 >/dev/null; redis-cli save >/dev/null'
+        docker run -d --name catalogue-api copperleaf/catalogue-api:3.2 >/dev/null
+  checks:
+    - id: shared-user-network
+      description: catalogue-api and catalogue-db share a user-defined bridge network
+      type: shell
+      on: cl-catalogue-03
+      skills: [containers.network.bridge-dns]
+      weight: 2
+      command: |
+        nets() { docker inspect "$1" 2>/dev/null | jq -r '.[0].NetworkSettings.Networks | keys[]'; }
+        for n in $(nets catalogue-api); do
+          nets catalogue-db | grep -qx "$n" || continue
+          [ "$(docker network inspect "$n" | jq -r '.[0].Driver')" = bridge ] || continue
+          [ "$n" != bridge ] && { echo shared; exit 0; }
+        done
+        echo none
+      expect: {match: exact, value: shared}
+    - id: resolves-by-name
+      description: catalogue-api reaches catalogue-db by its name
+      type: shell
+      on: cl-catalogue-03
+      skills: [containers.network.bridge-dns]
+      weight: 3
+      command: docker exec catalogue-api redis-cli -h catalogue-db -t 3 ping 2>/dev/null || echo unreachable
+      expect: {match: exact, value: PONG}
+    - id: nothing-published
+      description: Neither container publishes a port on the host
+      type: shell
+      on: cl-catalogue-03
+      skills: [containers.network.bridge-dns]
+      weight: 1
+      command: |
+        docker inspect catalogue-api catalogue-db 2>/dev/null | jq -r '[.[] | (.HostConfig.PortBindings // {} | length) + ([.NetworkSettings.Ports // {} | .[] | select(. != null)] | length) + (if .HostConfig.NetworkMode == "host" then 1 else 0 end)] | add // 1'
+      expect: {match: exact, value: "0"}
+    - id: data-kept
+      description: catalogue-db still serves its data from the catalogue-cache volume
+      type: shell
+      on: cl-catalogue-03
+      skills: [containers.network.bridge-dns]
+      weight: 1
+      command: |
+        docker inspect catalogue-db 2>/dev/null | jq -e '.[0].Mounts[] | select(.Name == "catalogue-cache")' >/dev/null || { echo no-volume; exit 0; }
+        docker exec catalogue-db redis-cli get catalogue:titles 2>/dev/null || echo none
+      expect: {match: exact, value: "4211"}
+  hints:
+    - title: Why the default bridge fails
+      body: "Docker's embedded DNS answers container names only on user-defined networks. On the default `bridge` network containers see each other only by IP."
+      cost: 1
+    - title: Create and attach
+      body: "`docker network create <name>` makes a user-defined bridge; `docker network connect <name> <container>` attaches a running container to it."
+      command: docker network create {{netname}}
+      cost: 2
+    - title: Check from inside
+      body: "`docker exec catalogue-api redis-cli -h catalogue-db ping` answers PONG once the name resolves; `docker logs catalogue-api` shows the change too."
+      cost: 1
+  misconceptions:
+    - id: legacy-link
+      description: Recreates catalogue-api with --link on the default bridge.
+      feedback: "--link is a legacy feature that writes an /etc/hosts entry; it works only on the default bridge and is deprecated. Use a user-defined network, where Docker's DNS resolves names."
+      expectFail: [shared-user-network]
+      mutation:
+        on: cl-catalogue-03
+        as: learner
+        run: |
+          docker rm -f catalogue-api
+          docker run -d --name catalogue-api --link catalogue-db copperleaf/catalogue-api:3.2
+    - id: publish-and-host-ip
+      description: Publishes the database port on the host and points the API at the host instead.
+      feedback: "Publishing the database exposes it outside Docker, and the API still does not find it by name. Put both containers on a user-defined network and leave the ports unpublished."
+      expectFail: [shared-user-network, resolves-by-name, nothing-published]
+      mutation:
+        on: cl-catalogue-03
+        as: learner
+        run: |
+          docker rm -f catalogue-db
+          docker run -d --name catalogue-db -p 6379:6379 -v catalogue-cache:/data redis:7.4-alpine redis-server --appendonly yes
+          docker rm -f catalogue-api
+          docker run -d --name catalogue-api -e DB_HOST=172.17.0.1 copperleaf/catalogue-api:3.2
+    - id: only-api-attached
+      description: Creates the network but attaches only catalogue-api to it.
+      feedback: "A network only connects the containers attached to it. catalogue-db must be on the same user-defined network."
+      expectFail: [shared-user-network, resolves-by-name]
+      mutation:
+        on: cl-catalogue-03
+        as: learner
+        run: |
+          docker network create {{netname}}
+          docker network connect {{netname}} catalogue-api
+  solution:
+    explanation: |
+      Docker's embedded DNS (127.0.0.11) resolves container names on user-defined
+      networks only. Create one and attach both running containers; no ports need to be
+      published for container-to-container traffic.
+    steps:
+      - on: cl-catalogue-03
+        as: learner
+        run: |
+          docker network create {{netname}}
+          docker network connect {{netname}} catalogue-db
+          docker network connect {{netname}} catalogue-api
+          sleep 4
+          docker logs --tail 2 catalogue-api
+    alternatives:
+      - id: recreate-on-network
+        description: Recreate catalogue-api on the new network and move catalogue-db there with network connect.
+        steps:
+          - on: cl-catalogue-03
+            as: learner
+            run: |
+              docker network create --driver bridge {{netname}}
+              docker network connect {{netname}} catalogue-db
+              docker network disconnect bridge catalogue-db
+              docker rm -f catalogue-api
+              docker run -d --name catalogue-api --network {{netname}} copperleaf/catalogue-api:3.2
