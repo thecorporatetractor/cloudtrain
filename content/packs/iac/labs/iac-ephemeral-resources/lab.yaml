@@ -1,0 +1,263 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: iac-ephemeral-resources
+  title: Hand the forecast stack its cluster token without storing it
+  domain: iac
+  frameworks: [tf-associate:secrets, tf-professional:credentials-secrets]
+  difficulty: medium
+  estimatedMinutes: 25
+  tags: [terraform, ephemeral-resources, credentials, providers, kubernetes-provider]
+  version: 1
+spec:
+  description: |
+    The forecast stack in `~/stacks/forecast-deploy` (applied on `sm-grid`)
+    deploys through the least-privileged ServiceAccount `forecast-deployer`
+    (namespace `forecast`). To configure its `deployer` provider it reads the
+    account's **long-lived token** from a Secret with a data source, so that
+    token sits in plain text in the state and in every saved plan.
+
+    Change the stack so the deployer authenticates with a **short-lived token
+    that Terraform never stores**:
+
+    1. Put an **ephemeral** `kubernetes_token_request_v1` for
+       `forecast-deployer` into a small module, `./modules/deployer-token`, that
+       returns the token through an **ephemeral output**.
+    2. Configure the `deployer` provider with that module output and remove the
+       data source.
+    3. Apply. The ConfigMap must still be managed through the `deployer` provider,
+       neither the state nor a saved plan may contain a ServiceAccount token, and a
+       plan afterwards reports no changes.
+  objectives:
+    - Read short-lived credentials with an ephemeral resource
+    - Pass ephemeral values through module outputs into a provider
+    - Prove that state and saved plans hold no credential
+  params:
+    horizon:
+      type: choice
+      values: ["36", "48", "72"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+      - name: sm-grid
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: sm-grid
+  setup:
+    - on: sm-grid
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: forecast}
+        ---
+        apiVersion: v1
+        kind: ServiceAccount
+        metadata: {name: forecast-deployer, namespace: forecast}
+        ---
+        apiVersion: v1
+        kind: Secret
+        type: kubernetes.io/service-account-token
+        metadata:
+          name: forecast-deployer-token
+          namespace: forecast
+          annotations: {kubernetes.io/service-account.name: forecast-deployer}
+        ---
+        apiVersion: rbac.authorization.k8s.io/v1
+        kind: Role
+        metadata: {name: forecast-deployer, namespace: forecast}
+        rules:
+          - apiGroups: [""]
+            resources: [configmaps]
+            verbs: [get, list, watch, create, update, patch, delete]
+        ---
+        apiVersion: rbac.authorization.k8s.io/v1
+        kind: RoleBinding
+        metadata: {name: forecast-deployer, namespace: forecast}
+        roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: forecast-deployer}
+        subjects:
+          - {kind: ServiceAccount, name: forecast-deployer, namespace: forecast}
+    - on: sm-grid
+      timeoutSec: 60
+      run: |
+        for i in $(seq 1 30); do
+          [ -n "$(kubectl -n forecast get secret forecast-deployer-token -o jsonpath='{.data.token}')" ] && exit 0; sleep 2
+        done
+        echo "token secret not populated" >&2; exit 1
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/main.tf, source: assets/main.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/seed.sh, source: assets/seed.sh, mode: "0755"}
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/stacks
+    - on: workstation
+      as: learner
+      timeoutSec: 240
+      run: /var/tmp/ct-seed/seed.sh
+  teardown:
+    - on: sm-grid
+      run: kubectl delete namespace forecast --ignore-not-found --wait=false
+  checks:
+    - id: deployed-by-deployer
+      description: ConfigMap forecast-settings is managed in state through the deployer provider
+      type: shell
+      on: workstation
+      skills: [iac.quality.ephemeral, iac.language.provider-config]
+      weight: 1.5
+      command: |
+        jq -r '[.resources[]? | select(.mode == "managed" and (.type | test("^kubernetes_config_map")) and (.instances[0].attributes.metadata[0].name == "forecast-settings")) | .provider] | .[0] // "none"' /home/learner/stacks/forecast-deploy/terraform.tfstate 2>/dev/null | sed -E 's/.*\]\.?//'
+      expect: {match: exact, value: deployer}
+    - id: configmap-live
+      description: The ConfigMap is in the cluster with its horizon
+      type: k8s-query
+      skills: [iac.targets.kubernetes-helm]
+      weight: 0.5
+      query: {cluster: sm-grid, resource: configmap, name: forecast-settings, namespace: forecast, jsonpath: "{.data.horizon_hours}"}
+      expect: {match: exact, value: "{{horizon}}"}
+    - id: state-has-no-token
+      description: The state holds no ServiceAccount token and no token data source
+      type: shell
+      on: workstation
+      skills: [iac.quality.ephemeral, iac.quality.secrets]
+      weight: 2
+      timeoutSec: 60
+      command: |
+        f=/home/learner/stacks/forecast-deploy/terraform.tfstate
+        [ -f $f ] || { echo "no state"; exit 0; }
+        jwt=$(grep -c 'eyJhbGci' $f)
+        ds=$(jq '[.resources[]? | select(.mode == "data" and (.type | test("^kubernetes_secret")))] | length' $f)
+        echo "tokens=$jwt token-data-sources=$ds"
+      expect: {match: exact, value: tokens=0 token-data-sources=0}
+    - id: plan-has-no-token
+      description: A saved plan holds no ServiceAccount token
+      type: shell
+      on: workstation
+      skills: [iac.quality.ephemeral]
+      weight: 2
+      timeoutSec: 120
+      command: |
+        j=$(ct-iac planjson /home/learner/stacks/forecast-deploy)
+        [ -n "$j" ] || { echo "plan failed"; exit 0; }
+        echo "$j" | grep -q 'eyJhbGci' && echo "token in plan" || echo clean
+      expect: {match: exact, value: clean}
+    - id: token-module
+      description: Module deployer-token holds an ephemeral token request
+      type: shell
+      on: workstation
+      skills: [iac.quality.ephemeral]
+      command: cat /home/learner/stacks/forecast-deploy/modules/deployer-token/*.tf 2>/dev/null | grep -cE '^[[:space:]]*ephemeral[[:space:]]+"kubernetes_token_request(_v1)?"' || true
+      expect: {match: exact, value: "1"}
+    - id: converged
+      description: A new plan of ~/stacks/forecast-deploy reports no changes
+      type: shell
+      on: workstation
+      skills: [iac.foundations.workflow]
+      timeoutSec: 120
+      command: ct-iac plan /home/learner/stacks/forecast-deploy
+      expect: {match: exact, value: no-changes}
+  hints:
+    - title: Seeing the leak
+      body: Data sources are recorded in state with everything they read.
+      command: cd ~/stacks/forecast-deploy && terraform show -json | jq '.values.root_module.resources[] | select(.mode == "data") | .values.data | keys'
+      cost: 1
+    - title: The ephemeral resource
+      body: |
+        ```hcl
+        ephemeral "kubernetes_token_request_v1" "deployer" {
+          metadata {
+            name      = "forecast-deployer"
+            namespace = "forecast"
+          }
+          spec {
+            expiration_seconds = 600
+          }
+        }
+
+        output "token" {
+          value     = ephemeral.kubernetes_token_request_v1.deployer.token
+          ephemeral = true
+        }
+        ```
+      cost: 2
+    - title: Wiring it in
+      body: "Call the module (it uses the default kubernetes provider) and set `token = module.deployer_token.token` in the deployer provider. Provider configurations may use ephemeral values."
+      cost: 1
+  misconceptions:
+    - id: sensitive-output
+      description: Moves the data source into a module and marks its output sensitive.
+      feedback: Sensitive only hides the value on screen; the data source still records the token in state. An ephemeral resource is never written to state or plan.
+      expectFail: [state-has-no-token, plan-has-no-token, token-module]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          cd ~/stacks/forecast-deploy
+          mkdir -p modules/deployer-token
+          cat > modules/deployer-token/main.tf <<'HCL'
+          data "kubernetes_secret_v1" "deployer_token" {
+            metadata {
+              name      = "forecast-deployer-token"
+              namespace = "forecast"
+            }
+          }
+          output "token" {
+            value     = data.kubernetes_secret_v1.deployer_token.data["token"]
+            sensitive = true
+          }
+          HCL
+          python3 - <<'PY'
+          import re
+          p = "main.tf"; s = open(p).read()
+          s = re.sub(r'# The forecast deployer.s long-lived token.*?\n\}\n', 'module "deployer_token" {\n  source = "./modules/deployer-token"\n}\n', s, flags=re.S)
+          s = s.replace('data.kubernetes_secret_v1.deployer_token.data["token"]', 'module.deployer_token.token')
+          open(p, "w").write(s)
+          PY
+          iac init -input=false -no-color && iac apply -auto-approve -input=false -no-color
+  solution:
+    explanation: |
+      The ephemeral token request asks the API server for a short-lived token on every
+      run; ephemeral values exist only in memory for that run and are never written
+      to state or plan files. An `ephemeral = true` output carries it out of the
+      module, and provider configuration is one of the places allowed to use it.
+      With the data source gone, nothing in state or a saved plan holds a token.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/stacks/forecast-deploy
+          mkdir -p modules/deployer-token
+          cat > modules/deployer-token/main.tf <<'HCL'
+          ephemeral "kubernetes_token_request_v1" "deployer" {
+            metadata {
+              name      = "forecast-deployer"
+              namespace = "forecast"
+            }
+            spec {
+              expiration_seconds = 600
+            }
+          }
+
+          output "token" {
+            description = "Short-lived token of forecast-deployer"
+            value       = ephemeral.kubernetes_token_request_v1.deployer.token
+            ephemeral   = true
+          }
+          HCL
+          python3 - <<'PY'
+          import re
+          p = "main.tf"; s = open(p).read()
+          s = re.sub(r'# The forecast deployer.s long-lived token.*?\n\}\n', 'module "deployer_token" {\n  source = "./modules/deployer-token"\n}\n', s, flags=re.S)
+          s = s.replace('data.kubernetes_secret_v1.deployer_token.data["token"]', 'module.deployer_token.token')
+          open(p, "w").write(s)
+          PY
+          iac init -input=false -no-color
+          iac apply -auto-approve -input=false -no-color
+          iac plan -input=false -no-color -detailed-exitcode
