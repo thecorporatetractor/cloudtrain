@@ -1,0 +1,143 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-build-args-labels
+  title: Stamp release metadata into the subtitle image with ARG and labels
+  domain: containers
+  frameworks: [ex188-aligned:build-images, docker-practitioner:build]
+  difficulty: easy
+  estimatedMinutes: 10
+  tags: [docker, dockerfile, arg, label, env]
+  version: 1
+spec:
+  description: |
+    The subtitle service's build context is `~/subtitle-svc/` on `cl-build-01`
+    (`ssh cl-build-01`; you are in the `docker` group). Release managers want every
+    image to say which release it is, without editing the Dockerfile for each release.
+
+    1. Change the Dockerfile so it takes a **build argument `RELEASE`** and puts its value
+       - into the label **`org.opencontainers.image.version`**, and
+       - into the environment variable **`APP_RELEASE`** of containers started from the
+         image (the service prints it at start).
+    2. Build release **`{{release}}`** as **`copperleaf/subtitle-svc:{{release}}`**,
+       passing the release on the command line.
+
+    The same Dockerfile must work for the next release by changing only the build
+    argument.
+  objectives:
+    - Declare and use a build argument
+    - Turn a build argument into a label and a runtime environment variable
+  params:
+    release:
+      type: choice
+      values: [4.2.0, 4.2.1, 4.3.0]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-build-01
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-build-01
+      timeoutSec: 240
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        s=/home/learner/subtitle-svc
+        install -d -o learner -g learner "$s"
+        printf '%s\n' '#!/bin/sh' 'echo "subtitle-svc release ${APP_RELEASE:-unknown} starting"' > "$s/start.sh"
+        chmod 0755 "$s/start.sh"
+        printf '%s\n' 'FROM busybox:1.37' 'LABEL org.opencontainers.image.vendor="Copperleaf Media"' \
+          'COPY start.sh /usr/local/bin/start.sh' 'CMD ["/usr/local/bin/start.sh"]' > "$s/Dockerfile"
+        chown -R learner:learner "$s"
+  checks:
+    - id: image-label
+      description: The image's org.opencontainers.image.version label is the release
+      type: shell
+      on: cl-build-01
+      skills: [containers.build.args-labels]
+      weight: 2
+      command: docker image inspect copperleaf/subtitle-svc:{{release}} 2>/dev/null | jq -r '.[0].Config.Labels["org.opencontainers.image.version"] // "none"'
+      expect: {match: exact, value: "{{release}}"}
+    - id: runtime-env
+      description: Containers from the image print the release at start
+      type: shell
+      on: cl-build-01
+      skills: [containers.build.args-labels]
+      weight: 2
+      command: docker run --rm copperleaf/subtitle-svc:{{release}} 2>/dev/null || echo none
+      expect: {match: exact, value: "subtitle-svc release {{release}} starting"}
+    - id: reusable-dockerfile
+      description: The Dockerfile declares ARG RELEASE and builds another release from the argument alone
+      type: shell
+      on: cl-build-01
+      skills: [containers.build.args-labels]
+      weight: 2
+      timeoutSec: 120
+      command: |
+        grep -qE '^\s*ARG\s+RELEASE(\s|=|$)' /home/learner/subtitle-svc/Dockerfile || { echo no-arg; exit 0; }
+        docker build -q --build-arg RELEASE=9.9.9-probe -t ct-probe/subtitle-svc:probe /home/learner/subtitle-svc >/dev/null 2>&1 || { echo build-failed; exit 0; }
+        l=$(docker image inspect ct-probe/subtitle-svc:probe | jq -r '.[0].Config.Labels["org.opencontainers.image.version"]')
+        e=$(docker run --rm ct-probe/subtitle-svc:probe)
+        docker rmi -f ct-probe/subtitle-svc:probe >/dev/null 2>&1
+        [ "$l" = 9.9.9-probe ] && [ "$e" = "subtitle-svc release 9.9.9-probe starting" ] && echo reusable || echo "hardcoded"
+      expect: {match: exact, value: reusable}
+  hints:
+    - title: ARG then use it
+      body: "`ARG RELEASE` declares the argument; after that line, `${RELEASE}` can be used in `LABEL` and `ENV` instructions."
+      cost: 1
+    - title: Build-time versus run-time
+      body: "An ARG exists only while the image builds. To see it in a running container, copy it into an ENV: `ENV APP_RELEASE=${RELEASE}`."
+      cost: 2
+    - title: Passing it
+      body: "`docker build --build-arg RELEASE={{release}} -t copperleaf/subtitle-svc:{{release}} .`"
+      cost: 2
+  misconceptions:
+    - id: arg-not-env
+      description: Uses the ARG in the label only, expecting it to exist at run time.
+      feedback: "Build arguments are gone once the build finishes; the container never sees RELEASE. Set ENV APP_RELEASE=${RELEASE}."
+      expectFail: [runtime-env, reusable-dockerfile]
+      mutation:
+        on: cl-build-01
+        as: learner
+        run: |
+          cd ~/subtitle-svc
+          sed -i '1a ARG RELEASE\nLABEL org.opencontainers.image.version=${RELEASE}' Dockerfile
+          docker build -q --build-arg RELEASE={{release}} -t copperleaf/subtitle-svc:{{release}} .
+    - id: hardcoded
+      description: Writes the release number into the Dockerfile instead of an argument.
+      feedback: "A literal version must be edited for every release. Declare ARG RELEASE and pass the value with --build-arg."
+      expectFail: [reusable-dockerfile]
+      mutation:
+        on: cl-build-01
+        as: learner
+        run: |
+          cd ~/subtitle-svc
+          sed -i '1a LABEL org.opencontainers.image.version={{release}}\nENV APP_RELEASE={{release}}' Dockerfile
+          docker build -q -t copperleaf/subtitle-svc:{{release}} .
+  solution:
+    explanation: |
+      `ARG RELEASE` after FROM makes the value available to the following instructions;
+      `LABEL` records it in the image config and `ENV` carries it into containers.
+    steps:
+      - on: cl-build-01
+        as: learner
+        run: |
+          cd ~/subtitle-svc
+          cat > Dockerfile <<'DF'
+          FROM busybox:1.37
+          ARG RELEASE
+          LABEL org.opencontainers.image.vendor="Copperleaf Media" \
+                org.opencontainers.image.version="${RELEASE}"
+          ENV APP_RELEASE=${RELEASE}
+          COPY start.sh /usr/local/bin/start.sh
+          CMD ["/usr/local/bin/start.sh"]
+          DF
+          docker build --build-arg RELEASE={{release}} -t copperleaf/subtitle-svc:{{release}} .

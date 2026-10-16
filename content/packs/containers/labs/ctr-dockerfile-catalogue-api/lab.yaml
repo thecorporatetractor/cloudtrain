@@ -1,0 +1,194 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-dockerfile-catalogue-api
+  title: Write a Dockerfile with a lean build context for the catalogue API
+  domain: containers
+  frameworks: [ex188-aligned:build-images, ckad:design-build, dca-legacy:images-registry, docker-practitioner:build]
+  difficulty: easy
+  estimatedMinutes: 15
+  tags: [docker, dockerfile, dockerignore, build-context]
+  version: 1
+spec:
+  description: |
+    Copperleaf's catalogue API has never run in a container. Its repository is
+    `~/catalogue-api/` on `cl-build-02` (`ssh cl-build-02`; you are in the `docker`
+    group):
+
+    ```
+    catalogue-api/
+    ├── app/server.py        the API (Python 3, standard library only)
+    ├── app/catalogue.json   the data it serves
+    ├── sample-media/        large test videos for the QA team (about 200 MiB)
+    └── README.md
+    ```
+
+    1. Write `~/catalogue-api/Dockerfile` based on **`python:3.13-alpine`** that runs
+       `app/server.py` so the API answers on **port 8080** of the container. Read the
+       README for how the server is started.
+    2. Make sure **`sample-media/` never reaches the build context** (and so never the
+       image), with a `.dockerignore` file.
+    3. Build **`copperleaf/catalogue-api:dev`** and run it as the detached container
+       **`catalogue-dev`**, published on the host as **`127.0.0.1:8080`**.
+  objectives:
+    - Write a first Dockerfile (FROM, WORKDIR, COPY, EXPOSE, CMD)
+    - Keep the build context small with .dockerignore
+    - Make a server listen on all interfaces inside a container
+  params:
+    titles:
+      type: int
+      min: 200
+      max: 900
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-build-02
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-build-02
+      timeoutSec: 300
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        r=/home/learner/catalogue-api
+        rm -rf "$r"; mkdir -p "$r/app" "$r/sample-media/qa"
+        cat > "$r/app/server.py" <<'PY'
+        """Copperleaf catalogue API."""
+        import argparse, http.server, json, pathlib
+        p = argparse.ArgumentParser()
+        p.add_argument("--bind", default="127.0.0.1", help="address to listen on (default 127.0.0.1)")
+        p.add_argument("--port", type=int, default=8080)
+        a = p.parse_args()
+        data = json.loads((pathlib.Path(__file__).parent / "catalogue.json").read_text())
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = json.dumps({"service": "catalogue-api", "titles": data["titles"]}).encode()
+                self.send_response(200); self.send_header("Content-Type", "application/json"); self.end_headers(); self.wfile.write(body)
+        print(f"catalogue-api on {a.bind}:{a.port}", flush=True)
+        http.server.ThreadingHTTPServer((a.bind, a.port), H).serve_forever()
+        PY
+        echo '{"titles": {{titles}}}' > "$r/app/catalogue.json"
+        printf '%s\n' '# catalogue-api' '' 'Run: `python3 app/server.py --bind <address> --port <port>`.' \
+          'The server listens on 127.0.0.1 unless --bind says otherwise.' > "$r/README.md"
+        for i in 1 2 3 4; do head -c 52428800 /dev/urandom > "$r/sample-media/qa/clip-$i.mp4"; done
+        chown -R learner:learner "$r"
+  checks:
+    - id: api-answers
+      description: catalogue-dev answers on 127.0.0.1:8080 with the catalogue
+      type: shell
+      on: cl-build-02
+      skills: [containers.build.dockerfile, k8s.delivery.image-build]
+      weight: 2
+      command: |
+        img=$(docker inspect catalogue-dev 2>/dev/null | jq -r '.[0].Config.Image')
+        r=$(curl -fsS --max-time 3 http://127.0.0.1:8080/ 2>/dev/null | jq -r '.titles' 2>/dev/null)
+        echo "$img ${r:-down}"
+      expect: {match: exact, value: "copperleaf/catalogue-api:dev {{titles}}"}
+    - id: no-media-in-image
+      description: The image contains no sample media
+      type: shell
+      on: cl-build-02
+      skills: [containers.build.dockerfile]
+      weight: 2
+      timeoutSec: 60
+      command: |
+        docker image inspect copperleaf/catalogue-api:dev >/dev/null 2>&1 || { echo no-image; exit 0; }
+        n=$(docker run --rm --entrypoint sh copperleaf/catalogue-api:dev -c 'find / -xdev \( -name "clip-*.mp4" -o -name sample-media \) 2>/dev/null | wc -l')
+        [ "$n" = 0 ] && echo clean || echo "media-found"
+      expect: {match: exact, value: clean}
+    - id: lean-context
+      description: The repository's .dockerignore keeps sample-media out of the build context
+      type: shell
+      on: cl-build-02
+      skills: [containers.build.dockerfile]
+      weight: 2
+      timeoutSec: 120
+      command: |
+        cd /home/learner/catalogue-api || exit 0
+        printf '%s\n' 'FROM busybox:1.37' 'COPY . /ctx' > /tmp/ctx-probe.Dockerfile
+        cp /tmp/ctx-probe.Dockerfile ./ctx-probe.Dockerfile
+        docker build -q -f ctx-probe.Dockerfile -t ct-probe/ctx:probe . >/dev/null 2>&1 || { rm -f ctx-probe.Dockerfile; echo build-failed; exit 0; }
+        rm -f ctx-probe.Dockerfile
+        r=$(docker run --rm ct-probe/ctx:probe sh -c 'test -e /ctx/sample-media && echo media-in-context || (test -e /ctx/app/server.py && echo lean || echo app-missing)')
+        docker rmi -f ct-probe/ctx:probe >/dev/null 2>&1; echo "$r"
+      expect: {match: exact, value: lean}
+  hints:
+    - title: A first Dockerfile
+      body: "`FROM python:3.13-alpine`, `WORKDIR /app`, `COPY app/ /app/`, `EXPOSE 8080`, and a `CMD` in exec form."
+      cost: 1
+    - title: Listening inside a container
+      body: "127.0.0.1 inside the container is the container's own loopback; published ports arrive on its network interface. Start the server with `--bind 0.0.0.0`."
+      cost: 2
+    - title: .dockerignore
+      body: "A `.dockerignore` next to the Dockerfile lists paths the client never sends to the builder, one pattern per line, e.g. `sample-media/`."
+      cost: 1
+  misconceptions:
+    - id: loopback-bind
+      description: Starts the server with its default 127.0.0.1 bind address.
+      feedback: "The server listens on the container's loopback only, so traffic from the published port never reaches it. Pass --bind 0.0.0.0."
+      expectFail: [api-answers]
+      mutation:
+        on: cl-build-02
+        as: learner
+        run: |
+          cd ~/catalogue-api
+          printf '%s\n' 'sample-media/' > .dockerignore
+          printf '%s\n' 'FROM python:3.13-alpine' 'WORKDIR /app' 'COPY app/ /app/' 'EXPOSE 8080' 'CMD ["python3", "server.py"]' > Dockerfile
+          docker build -q -t copperleaf/catalogue-api:dev .
+          docker run -d --name catalogue-dev -p 127.0.0.1:8080:8080 copperleaf/catalogue-api:dev
+          sleep 2
+    - id: copy-everything
+      description: Copies the whole repository without a .dockerignore.
+      feedback: "COPY . sends and stores everything, including 200 MiB of test videos. Ignore sample-media/ in .dockerignore and copy only what the API needs."
+      expectFail: [no-media-in-image, lean-context]
+      mutation:
+        on: cl-build-02
+        as: learner
+        run: |
+          cd ~/catalogue-api
+          printf '%s\n' 'FROM python:3.13-alpine' 'WORKDIR /srv' 'COPY . /srv/' 'EXPOSE 8080' 'CMD ["python3", "app/server.py", "--bind", "0.0.0.0"]' > Dockerfile
+          docker build -q -t copperleaf/catalogue-api:dev .
+          docker run -d --name catalogue-dev -p 127.0.0.1:8080:8080 copperleaf/catalogue-api:dev
+          sleep 2
+  solution:
+    explanation: |
+      Copy only the app, start it on all interfaces, and keep the test videos out of the
+      context with .dockerignore.
+    steps:
+      - on: cl-build-02
+        as: learner
+        run: |
+          cd ~/catalogue-api
+          printf '%s\n' 'sample-media/' '.git' > .dockerignore
+          cat > Dockerfile <<'DF'
+          FROM python:3.13-alpine
+          WORKDIR /app
+          COPY app/ /app/
+          EXPOSE 8080
+          CMD ["python3", "/app/server.py", "--bind", "0.0.0.0", "--port", "8080"]
+          DF
+          docker build -t copperleaf/catalogue-api:dev .
+          docker run -d --name catalogue-dev -p 127.0.0.1:8080:8080 copperleaf/catalogue-api:dev
+          sleep 2
+    alternatives:
+      - id: copy-dot-with-ignore
+        description: COPY . with a .dockerignore that excludes the media and the docs.
+        steps:
+          - on: cl-build-02
+            as: learner
+            run: |
+              cd ~/catalogue-api
+              printf '%s\n' 'sample-media' 'README.md' 'Dockerfile' '.dockerignore' > .dockerignore
+              printf '%s\n' 'FROM python:3.13-alpine' 'WORKDIR /srv/catalogue' 'COPY . .' 'EXPOSE 8080' \
+                'ENTRYPOINT ["python3", "app/server.py"]' 'CMD ["--bind", "0.0.0.0"]' > Dockerfile
+              docker build -t copperleaf/catalogue-api:dev .
+              docker run -d --name catalogue-dev -p 127.0.0.1:8080:8080 copperleaf/catalogue-api:dev
+              sleep 2
