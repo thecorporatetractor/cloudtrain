@@ -1,0 +1,259 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: iac-workspaces-vs-dirs
+  title: Run staging and production from workspaces, then directories
+  domain: iac
+  frameworks: [tf-associate:state]
+  difficulty: medium
+  estimatedMinutes: 25
+  tags: [terraform, workspaces, s3-backend, state-migration]
+  version: 1
+spec:
+  description: |
+    The forecast service stack in `~/stacks/forecast` keeps its state in the S3
+    bucket `saltmarsh-state` on the workstation's local S3 store (see
+    `backend.tf`; key `forecast/terraform.tfstate`). It is initialised, nothing is
+    applied yet.
+
+    1. Make the configuration environment-aware with **`terraform.workspace`**: it
+       writes `/home/learner/forecast/<workspace>.conf` with the lines
+       `env=<workspace>`, `replicas=<n>` and `instance=<random_id hex>`, where
+       `replicas` is **{{staging}}** for `staging` and **{{prod}}** for `prod`.
+    2. Create the workspaces **`staging`** and **`prod`** and apply the stack in
+       each of them.
+    3. Production now gets its own root module: create `~/stacks/forecast-prod`
+       with its own backend key **`forecast-prod/terraform.tfstate`** (same
+       bucket, no workspaces) that manages the prod file. Move prod's existing
+       state there, so prod's `instance` id does not change, then **delete** the
+       `prod` workspace from `~/stacks/forecast` without destroying anything.
+
+    In the end, the `staging` workspace of `~/stacks/forecast` and
+    `~/stacks/forecast-prod` both plan with no changes.
+  objectives:
+    - Use workspaces and terraform.workspace for per-environment values
+    - Find where an S3 backend stores each workspace's state
+    - Move a workspace's state to a separate root module and backend key
+  params:
+    staging:
+      type: int
+      min: 2
+      max: 3
+    prod:
+      type: int
+      min: 5
+      max: 8
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+  setup:
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/backend.tf, source: assets/backend.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/main.tf, source: assets/main.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/seed.sh, source: assets/seed.sh, mode: "0755"}
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/stacks
+    - on: workstation
+      as: learner
+      timeoutSec: 240
+      run: /var/tmp/ct-seed/seed.sh
+  checks:
+    - id: staging-file
+      description: staging.conf has env=staging, its replica count and the instance id in the staging state
+      type: shell
+      on: workstation
+      skills: [iac.state.environments]
+      weight: 1.5
+      timeoutSec: 60
+      command: |
+        ct-s3 ensure >/dev/null 2>&1
+        id=$(ct-s3 api GET '/saltmarsh-state/env:/staging/forecast/terraform.tfstate' | jq -r '[.resources[]? | select(.type == "random_id") | .instances[0].attributes.hex][0] // "none"' 2>/dev/null)
+        f=$(cat /home/learner/forecast/staging.conf 2>/dev/null | tr '\n' ' ')
+        [ "$f" = "env=staging replicas={{staging}} instance=$id " ] && echo ok || echo "file: $f state: $id"
+      expect: {match: exact, value: ok}
+    - id: prod-moved
+      description: forecast-prod/terraform.tfstate holds prod with the instance id first created in the prod workspace
+      type: shell
+      on: workstation
+      skills: [iac.state.environments, iac.state.backends]
+      weight: 2.5
+      timeoutSec: 60
+      command: |
+        ct-s3 ensure >/dev/null 2>&1
+        hex() { jq -r '[.resources[]? | select(.type == "random_id") | .instances[0].attributes.hex][0] // "none"' 2>/dev/null; }
+        now=$(ct-s3 api GET '/saltmarsh-state/forecast-prod/terraform.tfstate' | hex)
+        # Oldest first: the first prod-workspace state version that holds a random_id.
+        first=none
+        for v in $(ct-s3 api GET '/saltmarsh-state?versions&prefix=env:/prod/forecast/terraform.tfstate' | grep -o '<Version><Key>[^<]*</Key><VersionId>[^<]*</VersionId>' | sed 's/.*<VersionId>//; s/<.*//' | tac); do
+          h=$(ct-s3 api GET "/saltmarsh-state/env:/prod/forecast/terraform.tfstate?versionId=$v" | hex)
+          [ "$h" != none ] && [ -n "$h" ] && { first=$h; break; }
+        done
+        file=$(sed -n 's/^instance=//p' /home/learner/forecast/prod.conf 2>/dev/null)
+        [ "$now" != none ] && [ "$now" = "$first" ] && [ "$now" = "$file" ] && echo moved || echo "now=$now first=$first file=$file"
+      expect: {match: exact, value: moved}
+    - id: prod-file
+      description: prod.conf has env=prod and the prod replica count
+      type: shell
+      on: workstation
+      skills: [iac.state.environments]
+      command: head -2 /home/learner/forecast/prod.conf 2>/dev/null | tr '\n' ' ' || echo missing
+      expect: {match: exact, value: "env=prod replicas={{prod}} "}
+    - id: prod-workspace-gone
+      description: The prod workspace no longer exists in ~/stacks/forecast
+      type: shell
+      on: workstation
+      skills: [iac.state.environments]
+      timeoutSec: 60
+      command: |
+        ct-iac run /home/learner/stacks/forecast iac workspace list -no-color 2>/dev/null | tr -d ' *' | grep . | sort | paste -sd, -
+      expect: {match: exact, value: "default,staging"}
+    - id: staging-converged
+      description: The staging workspace of ~/stacks/forecast plans with no changes
+      type: shell
+      on: workstation
+      skills: [iac.foundations.workflow]
+      timeoutSec: 120
+      command: |
+        # Selecting a workspace that does not exist would create it in the S3 backend: look first.
+        ct-iac run /home/learner/stacks/forecast iac workspace list -no-color 2>/dev/null | tr -d ' *' | grep -qx staging || { echo "no staging workspace"; exit 0; }
+        ct-iac run /home/learner/stacks/forecast sh -c 'TF_WORKSPACE=staging iac plan -input=false -lock=false -no-color -detailed-exitcode >/dev/null 2>&1; echo $?'
+      expect: {match: exact, value: "0"}
+    - id: prod-converged
+      description: ~/stacks/forecast-prod plans with no changes
+      type: shell
+      on: workstation
+      skills: [iac.foundations.workflow, iac.state.backends]
+      timeoutSec: 120
+      command: ct-iac plan /home/learner/stacks/forecast-prod
+      expect: {match: exact, value: no-changes}
+  hints:
+    - title: Values per workspace
+      body: "`lookup({ staging = {{staging}}, prod = {{prod}} }, terraform.workspace, 1)` picks a value by workspace name; use `terraform.workspace` in the file name too."
+      cost: 1
+    - title: Where workspace state lives
+      body: With an S3 backend, the default workspace uses the key itself; other workspaces use `env:/<workspace>/<key>`.
+      command: ct-s3 api GET '/saltmarsh-state?list-type=2' | grep -o '<Key>[^<]*</Key>'
+      cost: 1
+    - title: Moving one workspace's state
+      body: In the old directory, `terraform workspace select prod` and `terraform state pull > prod.tfstate`. In the new directory, `terraform init`, then `terraform state push prod.tfstate`. Back in the old one, `terraform workspace select default` and `terraform workspace delete -force prod` (forgets, does not destroy).
+      cost: 2
+  misconceptions:
+    - id: recreate-prod
+      description: Applies the new prod directory from scratch instead of moving the prod state.
+      feedback: A fresh apply creates new resources (a new instance id), and the old workspace's objects are orphaned. Pull the prod state and push it into the new backend key first.
+      expectFail: [prod-moved]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 400
+        run: |
+          set -e
+          cd ~/stacks/forecast
+          cat > main.tf <<'HCL'
+          locals {
+            replicas = lookup({ staging = {{staging}}, prod = {{prod}} }, terraform.workspace, 1)
+          }
+          resource "random_id" "instance" {
+            byte_length = 4
+          }
+          resource "local_file" "forecast" {
+            filename = "/home/learner/forecast/${terraform.workspace}.conf"
+            content  = "env=${terraform.workspace}\nreplicas=${local.replicas}\ninstance=${random_id.instance.hex}\n"
+          }
+          HCL
+          for w in staging prod; do iac workspace new $w >/dev/null; iac apply -auto-approve -input=false -no-color; done
+          mkdir -p ../forecast-prod && cp backend.tf ../forecast-prod/
+          sed -i 's|key                         = "forecast/terraform.tfstate"|key                         = "forecast-prod/terraform.tfstate"|' ../forecast-prod/backend.tf
+          sed 's/terraform.workspace/"prod"/g; s/lookup({ staging = {{staging}}, prod = {{prod}} }, "prod", 1)/{{prod}}/' main.tf > ../forecast-prod/main.tf
+          iac workspace select default && iac workspace delete -force prod
+          cd ../forecast-prod && iac init -input=false -no-color && iac apply -auto-approve -input=false -no-color
+    - id: delete-workspace-destroys
+      description: Destroys prod in the workspace before deleting it, then recreates it in the new directory.
+      feedback: Deleting a workspace does not need a destroy; -force only forgets its resources. Destroying first wipes production and gives it a new identity.
+      expectFail: [prod-moved]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 400
+        run: |
+          set -e
+          cd ~/stacks/forecast
+          cat > main.tf <<'HCL'
+          locals {
+            replicas = lookup({ staging = {{staging}}, prod = {{prod}} }, terraform.workspace, 1)
+          }
+          resource "random_id" "instance" {
+            byte_length = 4
+          }
+          resource "local_file" "forecast" {
+            filename = "/home/learner/forecast/${terraform.workspace}.conf"
+            content  = "env=${terraform.workspace}\nreplicas=${local.replicas}\ninstance=${random_id.instance.hex}\n"
+          }
+          HCL
+          for w in staging prod; do iac workspace new $w >/dev/null; iac apply -auto-approve -input=false -no-color; done
+          iac destroy -auto-approve -input=false -no-color
+          iac workspace select default && iac workspace delete prod
+          mkdir -p ../forecast-prod && cp backend.tf ../forecast-prod/
+          sed -i 's|key                         = "forecast/terraform.tfstate"|key                         = "forecast-prod/terraform.tfstate"|' ../forecast-prod/backend.tf
+          sed 's/terraform.workspace/"prod"/g; s/lookup({ staging = {{staging}}, prod = {{prod}} }, "prod", 1)/{{prod}}/' main.tf > ../forecast-prod/main.tf
+          cd ../forecast-prod && iac init -input=false -no-color && iac apply -auto-approve -input=false -no-color
+  solution:
+    explanation: |
+      `terraform.workspace` names the file and picks the replica count. With an S3
+      backend each non-default workspace's state lives under
+      `env:/<workspace>/forecast/terraform.tfstate`. Pulling prod's state and
+      pushing it into the new directory's backend key moves the resources without
+      touching them; `workspace delete -force` then only forgets them in the old
+      backend.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 480
+        run: |
+          set -e
+          cd ~/stacks/forecast
+          cat > main.tf <<'HCL'
+          locals {
+            replicas = lookup({ staging = {{staging}}, prod = {{prod}} }, terraform.workspace, 1)
+          }
+
+          resource "random_id" "instance" {
+            byte_length = 4
+          }
+
+          resource "local_file" "forecast" {
+            filename = "/home/learner/forecast/${terraform.workspace}.conf"
+            content  = "env=${terraform.workspace}\nreplicas=${local.replicas}\ninstance=${random_id.instance.hex}\n"
+          }
+          HCL
+          for w in staging prod; do
+            iac workspace new $w
+            iac apply -auto-approve -input=false -no-color
+          done
+          iac workspace select prod
+          iac state pull > /tmp/prod.tfstate
+          mkdir -p ../forecast-prod
+          sed 's|key                         = "forecast/terraform.tfstate"|key                         = "forecast-prod/terraform.tfstate"|' backend.tf > ../forecast-prod/backend.tf
+          cat > ../forecast-prod/main.tf <<'HCL'
+          resource "random_id" "instance" {
+            byte_length = 4
+          }
+
+          resource "local_file" "forecast" {
+            filename = "/home/learner/forecast/prod.conf"
+            content  = "env=prod\nreplicas={{prod}}\ninstance=${random_id.instance.hex}\n"
+          }
+          HCL
+          cd ../forecast-prod
+          iac init -input=false -no-color
+          iac state push /tmp/prod.tfstate
+          iac plan -input=false -no-color -detailed-exitcode
+          cd ../forecast
+          iac workspace select staging
+          iac workspace delete -force prod

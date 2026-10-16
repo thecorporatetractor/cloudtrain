@@ -1,0 +1,260 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: iac-hosted-platform-concepts
+  title: Design a hosted-platform workspace layout
+  domain: iac
+  frameworks: [tf-associate:hcp]
+  difficulty: easy
+  estimatedMinutes: 15
+  tags: [terraform, hosted-platform, workspaces, projects, variable-sets, concepts]
+  version: 1
+spec:
+  description: |
+    Saltmarsh Energy is moving its stacks to a hosted Terraform platform. Nothing
+    is provisioned in this lab: you design the layout in
+    `~/design/layout.yaml`, which the platform team will feed into their
+    provisioning code. The platform project is already filled in as an example.
+
+    Teams: **`platform`**, **`grid-telemetry`** and **`energy-trading`**.
+    Environments: **`staging`** and **`prod`**. The rules:
+
+    1. One organisation, `saltmarsh`, with **one project per team**, named after
+       the team.
+    2. Each project holds the team's two workspaces, named
+       `<team>-staging` and `<team>-prod`, with their `environment` set.
+    3. Every workspace uses `execution_mode: remote`. Staging applies
+       automatically (`auto_apply: true`); production never does.
+    4. **Isolation:** each team has `write` on its own project and nothing on the
+       others; `platform` has `admin` on every project.
+    5. **Variable sets:** `cloud-credentials-staging` applies to every staging
+       workspace and nothing else, `cloud-credentials-prod` to every prod workspace
+       and nothing else, and a third set, **`{{varset}}`**, holds the trading
+       desk's market-data keys and applies only to the two energy-trading
+       workspaces.
+  objectives:
+    - Relate organisations, projects, workspaces and variable sets
+    - Express least-privilege team access on a hosted platform
+    - Scope shared variables to the workspaces that need them
+  params:
+    varset:
+      type: choice
+      values: [trading-market-data, trading-api-keys, market-feed-credentials]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+  setup:
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/design
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/layout.yaml, source: assets/layout.yaml, mode: "0644"}
+    - on: workstation
+      run: |
+        [ -e /home/learner/design/layout.yaml ] || install -m 0644 -o learner -g learner /var/tmp/ct-seed/layout.yaml /home/learner/design/layout.yaml
+  checks:
+    - id: projects-workspaces
+      description: One project per team, each with its two workspaces and environments
+      type: shell
+      on: workstation
+      skills: [iac.collaboration.hcp-concepts]
+      weight: 2
+      command: |
+        yq -o json /home/learner/design/layout.yaml 2>/dev/null | jq -r '
+          [.projects[]? | .name as $p | .workspaces[]? | "\($p)/\(.name)/\(.environment)"] | sort | join(" ")' 2>/dev/null || echo invalid
+      expect: {match: exact, value: energy-trading/energy-trading-prod/prod energy-trading/energy-trading-staging/staging grid-telemetry/grid-telemetry-prod/prod grid-telemetry/grid-telemetry-staging/staging platform/platform-prod/prod platform/platform-staging/staging}
+    - id: settings
+      description: Every workspace runs remotely; only staging applies automatically
+      type: shell
+      on: workstation
+      skills: [iac.collaboration.hcp-concepts]
+      command: |
+        yq -o json /home/learner/design/layout.yaml 2>/dev/null | jq -r '
+          [.projects[]?.workspaces[]?] as $w
+          | if ($w | length) == 6
+               and all($w[]; .execution_mode == "remote")
+               and all($w[]; (.environment == "staging" and .auto_apply == true) or (.environment == "prod" and .auto_apply == false))
+            then "ok" else "wrong" end' 2>/dev/null || echo invalid
+      expect: {match: exact, value: ok}
+    - id: team-access
+      description: Each team writes only to its own project; platform administers all
+      type: shell
+      on: workstation
+      skills: [iac.collaboration.hcp-concepts]
+      weight: 2
+      command: |
+        yq -o json /home/learner/design/layout.yaml 2>/dev/null | jq -r '
+          [.projects[]? | "\(.name):" + ((.team_access // {}) | to_entries | sort_by(.key) | map("\(.key)=\(.value)") | join(","))] | sort | join(" ")' 2>/dev/null || echo invalid
+      expect: {match: exact, value: "energy-trading:energy-trading=write,platform=admin grid-telemetry:grid-telemetry=write,platform=admin platform:platform=admin"}
+    - id: variable-sets
+      description: The credential sets cover exactly one environment each and {{varset}} only the trading workspaces
+      type: shell
+      on: workstation
+      skills: [iac.collaboration.hcp-concepts]
+      weight: 2
+      command: |
+        yq -o json /home/learner/design/layout.yaml 2>/dev/null | jq -r '
+          [.variable_sets[]? | "\(.name)=" + ((.workspaces // []) | sort | join(","))] | sort | join(" ")' 2>/dev/null || echo invalid
+      expect: {match: exact, value: "cloud-credentials-prod=energy-trading-prod,grid-telemetry-prod,platform-prod cloud-credentials-staging=energy-trading-staging,grid-telemetry-staging,platform-staging {{varset}}=energy-trading-prod,energy-trading-staging"}
+  hints:
+    - title: The hierarchy
+      body: An organisation contains projects; a project groups workspaces and is the natural unit for team access; a workspace holds one state and its runs. Variable sets are defined once and attached to the workspaces (or projects) that need them.
+      cost: 1
+    - title: Least privilege
+      body: Grant access per project. A team that is not listed on a project has no access to it, which is what isolation needs.
+      cost: 1
+    - title: Check your YAML
+      body: "`yq . ~/design/layout.yaml` fails on indentation mistakes; keep the example's shape."
+      command: yq -o json ~/design/layout.yaml | jq '.projects[].name'
+      cost: 1
+  misconceptions:
+    - id: org-wide-credentials
+      description: Attaches both credential sets to every workspace.
+      feedback: Staging runs would get production credentials. Scope each credential set to the workspaces of its environment.
+      expectFail: [variable-sets]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          cat > ~/design/layout.yaml <<'YAML'
+          organisation: saltmarsh
+          projects:
+            - name: platform
+              team_access: {platform: admin}
+              workspaces:
+                - {name: platform-staging, environment: staging, execution_mode: remote, auto_apply: true}
+                - {name: platform-prod, environment: prod, execution_mode: remote, auto_apply: false}
+            - name: grid-telemetry
+              team_access: {grid-telemetry: write, platform: admin}
+              workspaces:
+                - {name: grid-telemetry-staging, environment: staging, execution_mode: remote, auto_apply: true}
+                - {name: grid-telemetry-prod, environment: prod, execution_mode: remote, auto_apply: false}
+            - name: energy-trading
+              team_access: {energy-trading: write, platform: admin}
+              workspaces:
+                - {name: energy-trading-staging, environment: staging, execution_mode: remote, auto_apply: true}
+                - {name: energy-trading-prod, environment: prod, execution_mode: remote, auto_apply: false}
+          variable_sets:
+            - name: cloud-credentials-staging
+              workspaces: [platform-staging, platform-prod, grid-telemetry-staging, grid-telemetry-prod, energy-trading-staging, energy-trading-prod]
+            - name: cloud-credentials-prod
+              workspaces: [platform-staging, platform-prod, grid-telemetry-staging, grid-telemetry-prod, energy-trading-staging, energy-trading-prod]
+            - name: {{varset}}
+              workspaces: [energy-trading-staging, energy-trading-prod]
+          YAML
+    - id: shared-write
+      description: Gives every team write access to every project to keep things simple.
+      feedback: That lets the grid team change trading's production. Grant write only on the team's own project.
+      expectFail: [team-access]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          cat > ~/design/layout.yaml <<'YAML'
+          organisation: saltmarsh
+          projects:
+            - name: platform
+              team_access: {platform: admin, grid-telemetry: write, energy-trading: write}
+              workspaces:
+                - {name: platform-staging, environment: staging, execution_mode: remote, auto_apply: true}
+                - {name: platform-prod, environment: prod, execution_mode: remote, auto_apply: false}
+            - name: grid-telemetry
+              team_access: {grid-telemetry: write, energy-trading: write, platform: admin}
+              workspaces:
+                - {name: grid-telemetry-staging, environment: staging, execution_mode: remote, auto_apply: true}
+                - {name: grid-telemetry-prod, environment: prod, execution_mode: remote, auto_apply: false}
+            - name: energy-trading
+              team_access: {energy-trading: write, grid-telemetry: write, platform: admin}
+              workspaces:
+                - {name: energy-trading-staging, environment: staging, execution_mode: remote, auto_apply: true}
+                - {name: energy-trading-prod, environment: prod, execution_mode: remote, auto_apply: false}
+          variable_sets:
+            - name: cloud-credentials-staging
+              workspaces: [platform-staging, grid-telemetry-staging, energy-trading-staging]
+            - name: cloud-credentials-prod
+              workspaces: [platform-prod, grid-telemetry-prod, energy-trading-prod]
+            - name: {{varset}}
+              workspaces: [energy-trading-staging, energy-trading-prod]
+          YAML
+    - id: auto-apply-prod
+      description: Turns on auto-apply for production as well.
+      feedback: Production changes must wait for a human to approve the plan. Keep auto_apply false on prod workspaces.
+      expectFail: [settings]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          cat > ~/design/layout.yaml <<'YAML'
+          organisation: saltmarsh
+          projects:
+            - name: platform
+              team_access: {platform: admin}
+              workspaces:
+                - {name: platform-staging, environment: staging, execution_mode: remote, auto_apply: true}
+                - {name: platform-prod, environment: prod, execution_mode: remote, auto_apply: true}
+            - name: grid-telemetry
+              team_access: {grid-telemetry: write, platform: admin}
+              workspaces:
+                - {name: grid-telemetry-staging, environment: staging, execution_mode: remote, auto_apply: true}
+                - {name: grid-telemetry-prod, environment: prod, execution_mode: remote, auto_apply: true}
+            - name: energy-trading
+              team_access: {energy-trading: write, platform: admin}
+              workspaces:
+                - {name: energy-trading-staging, environment: staging, execution_mode: remote, auto_apply: true}
+                - {name: energy-trading-prod, environment: prod, execution_mode: remote, auto_apply: true}
+          variable_sets:
+            - name: cloud-credentials-staging
+              workspaces: [platform-staging, grid-telemetry-staging, energy-trading-staging]
+            - name: cloud-credentials-prod
+              workspaces: [platform-prod, grid-telemetry-prod, energy-trading-prod]
+            - name: {{varset}}
+              workspaces: [energy-trading-staging, energy-trading-prod]
+          YAML
+  solution:
+    explanation: |
+      One project per team is the unit of access: each team gets write on its own
+      project and the platform team admin on all, so no team can touch another's
+      workspaces. Each project holds a staging and a prod workspace; only staging
+      auto-applies. Credential sets are attached per environment and the trading
+      keys only to the trading workspaces, so no run sees secrets it does not need.
+    steps:
+      - on: workstation
+        as: learner
+        run: |
+          cat > ~/design/layout.yaml <<'YAML'
+          organisation: saltmarsh
+
+          projects:
+            - name: platform
+              team_access:
+                platform: admin
+              workspaces:
+                - {name: platform-staging, environment: staging, execution_mode: remote, auto_apply: true}
+                - {name: platform-prod, environment: prod, execution_mode: remote, auto_apply: false}
+            - name: grid-telemetry
+              team_access:
+                grid-telemetry: write
+                platform: admin
+              workspaces:
+                - {name: grid-telemetry-staging, environment: staging, execution_mode: remote, auto_apply: true}
+                - {name: grid-telemetry-prod, environment: prod, execution_mode: remote, auto_apply: false}
+            - name: energy-trading
+              team_access:
+                energy-trading: write
+                platform: admin
+              workspaces:
+                - {name: energy-trading-staging, environment: staging, execution_mode: remote, auto_apply: true}
+                - {name: energy-trading-prod, environment: prod, execution_mode: remote, auto_apply: false}
+
+          variable_sets:
+            - name: cloud-credentials-staging
+              workspaces: [platform-staging, grid-telemetry-staging, energy-trading-staging]
+            - name: cloud-credentials-prod
+              workspaces: [platform-prod, grid-telemetry-prod, energy-trading-prod]
+            - name: {{varset}}
+              workspaces: [energy-trading-staging, energy-trading-prod]
+          YAML
+          yq -o json ~/design/layout.yaml >/dev/null

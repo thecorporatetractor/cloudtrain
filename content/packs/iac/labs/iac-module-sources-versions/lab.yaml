@@ -1,0 +1,153 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: iac-module-sources-versions
+  title: Consume and upgrade a versioned git module
+  domain: iac
+  frameworks: [tf-associate:modules]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [terraform, modules, module-sources, git, versioning]
+  version: 1
+spec:
+  description: |
+    The inland stack in `~/stacks/inland` (applied) calls the `farm-base` module
+    from a **copy** in `vendor/farm-base` that someone took from release 1.2.0.
+    The module's home is the internal Git repository
+    **`/home/learner/git/farm-base.git`** (address it as
+    `git::file:///home/learner/git/farm-base.git`). Its tags are releases; its
+    `main` branch carries unreleased work.
+
+    1. Point the `farm` module call at the Git repository, **pinned to tag
+       `v1.2.0`**, and delete the `vendor` copy. Because it is the same code, the
+       plan must show no changes.
+    2. Upgrade the call to **`v1.3.0`**. Read the release's `CHANGELOG.md` (for
+       example with `git -C ... show v1.3.0:CHANGELOG.md`), adapt the call, review
+       the plan (only the farm's file content may change) and apply.
+
+    Afterwards a plan reports no changes.
+  objectives:
+    - Source a module from a Git repository pinned to a tag
+    - Upgrade a module version and adapt to a breaking input change
+    - Read a plan to confirm only the intended change happens
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+  setup:
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/make-repo.sh, source: assets/make-repo.sh, mode: "0755"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/seed.sh, source: assets/seed.sh, mode: "0755"}
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/stacks
+    - on: workstation
+      as: learner
+      timeoutSec: 240
+      run: /var/tmp/ct-seed/seed.sh
+  checks:
+    - id: pinned-source
+      description: The module is installed from the Git repository at tag v1.3.0
+      type: shell
+      on: workstation
+      skills: [iac.modules.sources]
+      weight: 2
+      command: jq -r '[.Modules[]? | select(.Key == "farm") | .Source][0] // "none"' /home/learner/stacks/inland/.terraform/modules/modules.json 2>/dev/null || echo none
+      expect: {match: regex, value: '^git::file:///home/learner/git/farm-base\.git\?ref=v1\.3\.0$'}
+    - id: no-vendor-copy
+      description: The vendored copy is gone
+      type: shell
+      on: workstation
+      skills: [iac.modules.sources]
+      weight: 0.5
+      command: test -e /home/learner/stacks/inland/vendor/farm-base && echo present || echo gone
+      expect: {match: exact, value: gone}
+    - id: upgraded-file
+      description: larkholt.conf has the 1.3.0 content
+      type: shell
+      on: workstation
+      skills: [iac.modules.sources]
+      weight: 1.5
+      command: tr '\n' ' ' < /home/learner/inland/larkholt.conf 2>/dev/null || echo missing
+      expect: {match: exact, value: "farm=larkholt quota=standard schema=2 "}
+    - id: same-address
+      description: The file is still managed at module.farm.local_file.conf, with no other farm files
+      type: shell
+      on: workstation
+      skills: [iac.modules.sources]
+      timeoutSec: 60
+      command: |
+        a=$(ct-iac state /home/learner/stacks/inland | jq -r '[.values.root_module.child_modules[]?.resources[]?.address] | join(",")' 2>/dev/null)
+        n=$(ls /home/learner/inland/*.conf 2>/dev/null | wc -l)
+        echo "$a files=$n"
+      expect: {match: exact, value: module.farm.local_file.conf files=1}
+    - id: converged
+      description: A new plan of ~/stacks/inland reports no changes
+      type: shell
+      on: workstation
+      skills: [iac.foundations.workflow]
+      timeoutSec: 120
+      command: ct-iac plan /home/learner/stacks/inland
+      expect: {match: exact, value: no-changes}
+  hints:
+    - title: Git sources
+      body: '`source = "git::file:///home/learner/git/farm-base.git?ref=v1.2.0"` pins a tag. After changing a source, run `terraform init` (or `init -upgrade`) to fetch it.'
+      cost: 1
+    - title: What changed in 1.3.0
+      body: The changelog names a renamed input. Module inputs are the arguments of the module block, so rename the argument in your call.
+      command: git -C ~/git/farm-base.git show v1.3.0:CHANGELOG.md
+      cost: 1
+    - title: Never track a branch
+      body: Without `?ref=` you get whatever the default branch holds today, including unreleased changes.
+      cost: 2
+  misconceptions:
+    - id: unpinned
+      description: Uses the repository without a ref, so the call follows main.
+      feedback: main holds unreleased work (it now requires grid_region). Pin the release tag with ?ref=v1.3.0 so every init gets the same code.
+      expectFail: [pinned-source, upgraded-file, converged]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 240
+        run: |
+          cd ~/stacks/inland
+          rm -rf vendor
+          printf 'module "farm" {\n  source = "git::file:///home/learner/git/farm-base.git"\n  farm   = "larkholt"\n}\n' > main.tf
+          iac init -upgrade -input=false -no-color
+          iac apply -auto-approve -input=false -no-color || true
+    - id: edit-the-module
+      description: Keeps the vendored copy and edits it to look like 1.3.0.
+      feedback: A local copy drifts from the release and nobody can tell which version runs. Use the Git source with the release tag.
+      expectFail: [pinned-source, no-vendor-copy]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 240
+        run: |
+          cd ~/stacks/inland
+          sed -i 's/quota=standard\\n"/quota=standard\\nschema=2\\n"/' vendor/farm-base/main.tf
+          iac apply -auto-approve -input=false -no-color
+  solution:
+    explanation: |
+      A `git::` source with `?ref=v1.2.0` fetches exactly that release, which is the
+      code the vendor copy held, so the plan is empty. Release 1.3.0 renames the
+      input `farm_name` to `farm`; after renaming the argument and `init -upgrade`,
+      the plan updates only the farm file's content (schema=2).
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/stacks/inland
+          rm -rf vendor
+          printf 'module "farm" {\n  source    = "git::file:///home/learner/git/farm-base.git?ref=v1.2.0"\n  farm_name = "larkholt"\n}\n' > main.tf
+          iac init -input=false -no-color
+          iac plan -input=false -no-color -detailed-exitcode
+          git -C ~/git/farm-base.git show v1.3.0:CHANGELOG.md
+          printf 'module "farm" {\n  source = "git::file:///home/learner/git/farm-base.git?ref=v1.3.0"\n  farm   = "larkholt"\n}\n' > main.tf
+          iac init -upgrade -input=false -no-color
+          iac apply -auto-approve -input=false -no-color
