@@ -1,0 +1,245 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: iac-first-plan-apply
+  title: Plan, apply and destroy a first configuration
+  domain: iac
+  frameworks: [tf-associate:iac-concepts, tf-associate:core-workflow]
+  difficulty: easy
+  estimatedMinutes: 15
+  tags: [terraform, workflow, local-provider, plan, apply, destroy]
+  version: 1
+spec:
+  description: |
+    Saltmarsh Energy's survey team keeps one inventory file per wind farm. Until now
+    someone typed them by hand; from today they are written by infrastructure as
+    code, so a rerun always produces the same file.
+
+    Your workstation has Terraform installed (`terraform version`). Providers come
+    from an offline mirror, so `terraform init` works without internet access.
+
+    **1. Write the configuration.** In the empty directory `~/stacks/survey`, write a
+    configuration (for example `main.tf`) that uses the `hashicorp/local` provider's
+    `local_file` resource to create **`/home/learner/survey/gullhaven.txt`** with
+    exactly this content (three lines, each ending in a newline):
+
+    ```
+    farm: gullhaven
+    turbines: {{turbines}}
+    surveyed-by: saltmarsh-survey
+    ```
+
+    **2. Run the core workflow** in `~/stacks/survey`: `terraform init`, then
+    `terraform plan` (read what it will create), then `terraform apply`.
+
+    **3. Prove it is idempotent.** Run `terraform plan` again: it must report
+    *No changes*. Leave the file in place, managed by Terraform.
+
+    **4. Clean up.** `~/stacks/survey-scratch` holds last week's dry run, already
+    applied; it created `/home/learner/survey/dry-run-{{scratch}}.txt`. Remove
+    everything that stack manages **with Terraform**, so its state ends up empty.
+  objectives:
+    - Write a resource block with a provider requirement
+    - Run init, plan and apply, and read the plan
+    - Recognise a converged configuration (plan with no changes)
+    - Destroy everything a configuration manages
+  params:
+    turbines:
+      type: int
+      min: 12
+      max: 48
+    scratch:
+      type: int
+      min: 100
+      max: 999
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+  setup:
+    - on: workstation
+      run: |
+        set -eu
+        install -d -o learner -g learner /home/learner/stacks /home/learner/stacks/survey /home/learner/stacks/survey-scratch /home/learner/survey
+    - on: workstation
+      file: {path: /home/learner/stacks/survey-scratch/main.tf, source: assets/scratch.tf, mode: "0644"}
+    - on: workstation
+      run: chown learner:learner /home/learner/stacks/survey-scratch/main.tf
+    - on: workstation
+      as: learner
+      timeoutSec: 120
+      run: |
+        set -eu
+        cd ~/stacks/survey-scratch
+        iac init -input=false -no-color >/dev/null
+        iac apply -auto-approve -input=false -no-color >/dev/null
+        test -f ~/survey/dry-run-{{scratch}}.txt
+  checks:
+    - id: inventory-content
+      description: /home/learner/survey/gullhaven.txt holds the three inventory lines
+      type: shell
+      on: workstation
+      skills: [iac.foundations.workflow]
+      weight: 1.5
+      command: |
+        f=/home/learner/survey/gullhaven.txt
+        [ -f "$f" ] || { echo missing; exit 0; }
+        [ "$(cat "$f")" = "$(printf 'farm: gullhaven\nturbines: {{turbines}}\nsurveyed-by: saltmarsh-survey')" ] && echo ok || echo different
+      expect: {match: exact, value: ok}
+    - id: managed-by-state
+      description: The inventory file is a local_file resource in the state of ~/stacks/survey
+      type: shell
+      on: workstation
+      skills: [iac.foundations.concepts, iac.foundations.workflow]
+      weight: 2
+      timeoutSec: 60
+      command: |
+        ct-iac state /home/learner/stacks/survey \
+          | jq -r '[.values.root_module.resources[]? | select(.type == "local_file" and .values.filename == "/home/learner/survey/gullhaven.txt")] | length' 2>/dev/null || echo 0
+      expect: {match: exact, value: "1"}
+    - id: converged
+      description: A new plan of ~/stacks/survey reports no changes
+      type: shell
+      on: workstation
+      skills: [iac.foundations.workflow]
+      weight: 1.5
+      timeoutSec: 90
+      command: ct-iac plan /home/learner/stacks/survey
+      expect: {match: exact, value: no-changes}
+    - id: scratch-destroyed
+      description: The survey-scratch state is empty and its dry-run file is gone
+      type: shell
+      on: workstation
+      skills: [iac.foundations.workflow]
+      weight: 2
+      timeoutSec: 60
+      command: |
+        n=$(ct-iac state /home/learner/stacks/survey-scratch | jq -r '[.values.root_module.resources[]?] | length' 2>/dev/null)
+        [ -n "$n" ] || n=unreadable
+        [ -e /home/learner/survey/dry-run-{{scratch}}.txt ] && f=present || f=gone
+        echo "resources=$n file=$f"
+      expect: {match: exact, value: "resources=0 file=gone"}
+  hints:
+    - title: The shape of a resource block
+      body: |
+        A `terraform` block names the provider, a `resource` block describes the
+        object: `resource "local_file" "gullhaven" { filename = "..." content = "..." }`.
+        A heredoc (`<<-EOT ... EOT`) keeps multi-line content readable and ends with
+        a newline.
+      cost: 1
+    - title: Read the plan before applying
+      body: "`+` means create, `~` update in place, `-/+` replace, `-` destroy. A converged configuration plans `No changes`."
+      command: cd ~/stacks/survey && terraform init && terraform plan
+      cost: 1
+    - title: Removing what a stack manages
+      body: Deleting the file by hand leaves it in the stack's state, and the next apply recreates it. Let Terraform remove it.
+      command: cd ~/stacks/survey-scratch && terraform destroy
+      cost: 2
+  misconceptions:
+    - id: hand-written-file
+      description: Writes the inventory file with the shell instead of Terraform, so nothing manages it.
+      feedback: The file looks right, but no state tracks it, so nothing keeps it that way. Create it with a local_file resource and apply.
+      expectFail: [managed-by-state, converged]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          printf 'farm: gullhaven\nturbines: {{turbines}}\nsurveyed-by: saltmarsh-survey\n' > ~/survey/gullhaven.txt
+          cd ~/stacks/survey-scratch && iac destroy -auto-approve -input=false -no-color
+    - id: rm-instead-of-destroy
+      description: Deletes the dry-run file with rm, which leaves it in the scratch stack's state.
+      feedback: The scratch state still lists the file, so the next apply would bring it back. terraform destroy removes the object and its state entry.
+      expectFail: [scratch-destroyed]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          mkdir -p ~/stacks/survey && cd ~/stacks/survey
+          cat > main.tf <<'HCL'
+          resource "local_file" "gullhaven" {
+            filename = "/home/learner/survey/gullhaven.txt"
+            content  = "farm: gullhaven\nturbines: {{turbines}}\nsurveyed-by: saltmarsh-survey\n"
+          }
+          HCL
+          iac init -input=false -no-color && iac apply -auto-approve -input=false -no-color
+          rm -f ~/survey/dry-run-{{scratch}}.txt
+    - id: plan-only
+      description: Writes the configuration and runs plan but never applies it.
+      feedback: plan only shows what would happen. apply makes it happen and records the result in state.
+      expectFail: [inventory-content, managed-by-state, converged]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          mkdir -p ~/stacks/survey && cd ~/stacks/survey
+          cat > main.tf <<'HCL'
+          resource "local_file" "gullhaven" {
+            filename = "/home/learner/survey/gullhaven.txt"
+            content  = "farm: gullhaven\nturbines: {{turbines}}\nsurveyed-by: saltmarsh-survey\n"
+          }
+          HCL
+          iac init -input=false -no-color && iac plan -input=false -no-color
+          cd ~/stacks/survey-scratch && iac destroy -auto-approve -input=false -no-color
+  solution:
+    explanation: |
+      `terraform init` installs the local provider from the mirror, `plan` shows one
+      resource to add and `apply` creates the file and records it in
+      `terraform.tfstate`. A second plan compares configuration, state and the real
+      file and finds nothing to do. `terraform destroy` in the scratch stack deletes
+      its file and leaves an empty state.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 180
+        run: |
+          set -e
+          cd ~/stacks/survey
+          cat > main.tf <<'HCL'
+          terraform {
+            required_providers {
+              local = {
+                source = "hashicorp/local"
+              }
+            }
+          }
+
+          resource "local_file" "gullhaven" {
+            filename = "/home/learner/survey/gullhaven.txt"
+            content  = <<-EOT
+              farm: gullhaven
+              turbines: {{turbines}}
+              surveyed-by: saltmarsh-survey
+            EOT
+          }
+          HCL
+          iac init -input=false -no-color
+          iac plan -input=false -no-color
+          iac apply -auto-approve -input=false -no-color
+          iac plan -input=false -no-color -detailed-exitcode
+          cd ~/stacks/survey-scratch
+          iac destroy -auto-approve -input=false -no-color
+    alternatives:
+      - id: escaped-string
+        description: A single quoted string with \n escapes, and destroy through apply -destroy.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 180
+            run: |
+              set -e
+              cd ~/stacks/survey
+              cat > survey.tf <<'HCL'
+              resource "local_file" "inventory" {
+                filename = "/home/learner/survey/gullhaven.txt"
+                content  = "farm: gullhaven\nturbines: {{turbines}}\nsurveyed-by: saltmarsh-survey\n"
+              }
+              HCL
+              iac init -input=false -no-color
+              iac apply -auto-approve -input=false -no-color
+              cd ~/stacks/survey-scratch
+              iac apply -destroy -auto-approve -input=false -no-color

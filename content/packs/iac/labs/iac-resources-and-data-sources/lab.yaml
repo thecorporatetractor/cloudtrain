@@ -1,0 +1,277 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: iac-resources-and-data-sources
+  title: Read existing objects with data sources
+  domain: iac
+  frameworks: [tf-associate:configuration]
+  difficulty: easy
+  estimatedMinutes: 15
+  tags: [terraform, data-sources, kubernetes-provider, references]
+  version: 1
+spec:
+  description: |
+    The platform team created namespace `grid-telemetry` on the grid cluster
+    (context `sm-grid`) and labelled it for cost reporting. Those labels belong to
+    the platform team: your stack may **read** the namespace but must not manage it.
+
+    In `~/stacks/cost-labels` (the provider is already configured in
+    `providers.tf`, pinned to context `sm-grid`):
+
+    1. Look the namespace up with a **data source**
+       (`kubernetes_namespace_v1`).
+    2. Create a ConfigMap **`cost-labels`** in that namespace whose data has two
+       keys, taken from the namespace's labels at plan time:
+
+       | ConfigMap key | Namespace label |
+       |---|---|
+       | `cost-centre` | `saltmarsh.example/cost-centre` |
+       | `team` | `saltmarsh.example/team` |
+
+       Take the namespace name for the ConfigMap from the data source as well, so
+       the plan shows the ConfigMap depends on it.
+    3. Apply, and check that a second plan reports *No changes*.
+
+    If the platform team relabels the namespace, the next plan of your stack must
+    want to update the ConfigMap, so do not copy the label values into your code.
+  objectives:
+    - Declare a data source and read its attributes
+    - Reference data source attributes from a resource
+    - Tell a data source from a managed resource in state
+  params:
+    cost_centre:
+      type: choice
+      values: [cc-4410, cc-4427, cc-4583, cc-4619]
+    team:
+      type: choice
+      values: [grid-platform, telemetry-ops, scada-core]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+      - name: sm-grid
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: sm-grid
+  setup:
+    - on: sm-grid
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata:
+          name: grid-telemetry
+          labels:
+            saltmarsh.example/cost-centre: "{{cost_centre}}"
+            saltmarsh.example/team: "{{team}}"
+            saltmarsh.example/owner: platform
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/stacks /home/learner/stacks/cost-labels
+    - on: workstation
+      file:
+        path: /home/learner/stacks/cost-labels/providers.tf
+        mode: "0644"
+        content: |
+          terraform {
+            required_providers {
+              kubernetes = {
+                source  = "hashicorp/kubernetes"
+                version = "~> 3.3.0"
+              }
+            }
+          }
+
+          provider "kubernetes" {
+            config_path    = "~/.kube/config"
+            config_context = "sm-grid"
+          }
+    - on: workstation
+      run: chown -R learner:learner /home/learner/stacks/cost-labels
+  teardown:
+    - on: sm-grid
+      run: kubectl delete namespace grid-telemetry --ignore-not-found --wait=false
+  checks:
+    - id: configmap-data
+      description: ConfigMap cost-labels in grid-telemetry holds the cost-centre and team labels
+      type: k8s-query
+      skills: [iac.language.resources-data, iac.targets.kubernetes-helm]
+      weight: 2
+      query: {cluster: sm-grid, resource: configmap, name: cost-labels, namespace: grid-telemetry, jsonpath: "{.data.cost-centre}/{.data.team}"}
+      expect: {match: exact, value: "{{cost_centre}}/{{team}}"}
+    - id: data-source-in-state
+      description: The state reads namespace grid-telemetry through a data source and manages the ConfigMap
+      type: shell
+      on: workstation
+      skills: [iac.language.resources-data]
+      weight: 1.5
+      timeoutSec: 60
+      command: |
+        ct-iac state /home/learner/stacks/cost-labels | jq -r '
+          [.values.root_module.resources[]?] as $r
+          | ([$r[] | select(.mode == "data" and (.type | test("^kubernetes_namespace")) and .values.metadata[0].name == "grid-telemetry")] | length) as $d
+          | ([$r[] | select(.mode == "managed" and (.type | test("^kubernetes_namespace")))] | length) as $n
+          | ([$r[] | select(.mode == "managed" and (.type | test("^kubernetes_config_map")) and .values.metadata[0].name == "cost-labels")] | length) as $c
+          | "data=\($d) managed-namespaces=\($n) configmaps=\($c)"' 2>/dev/null
+      expect: {match: exact, value: "data=1 managed-namespaces=0 configmaps=1"}
+    - id: reads-labels
+      description: The ConfigMap's data and namespace come from the data source (directly or through a local), not literals
+      type: shell
+      on: workstation
+      skills: [iac.language.resources-data, iac.language.dependencies]
+      weight: 2
+      timeoutSec: 90
+      command: |
+        ct-iac planjson /home/learner/stacks/cost-labels | jq -r '
+          [.configuration.root_module.resources[]? | select(.mode == "managed" and (.type | test("^kubernetes_config_map")))][0] as $cm
+          | ([$cm.expressions.data.references[]? | select(startswith("data.kubernetes_namespace") or startswith("local."))] | length > 0) as $data
+          | ([$cm.expressions.metadata[0].namespace.references[]? | select(startswith("data.kubernetes_namespace"))] | length > 0) as $ns
+          | "data=\($data) namespace=\($ns)"' 2>/dev/null
+      expect: {match: exact, value: "data=true namespace=true"}
+    - id: converged
+      description: A new plan of ~/stacks/cost-labels reports no changes
+      type: shell
+      on: workstation
+      skills: [iac.foundations.workflow]
+      timeoutSec: 90
+      command: ct-iac plan /home/learner/stacks/cost-labels
+      expect: {match: exact, value: no-changes}
+  hints:
+    - title: Data source syntax
+      body: |
+        `data "kubernetes_namespace_v1" "grid" { metadata { name = "grid-telemetry" } }`
+        reads the namespace. Its labels are then
+        `data.kubernetes_namespace_v1.grid.metadata[0].labels`.
+      cost: 1
+    - title: Label keys with slashes and dots
+      body: 'Index the labels map with the full key in brackets: `labels["saltmarsh.example/team"]`.'
+      cost: 1
+    - title: Reading versus managing
+      body: A `resource "kubernetes_namespace_v1"` would try to create the namespace and fail because it exists. A data source only reads it; `terraform state list` shows it with a `data.` prefix.
+      command: cd ~/stacks/cost-labels && terraform state list
+      cost: 1
+  misconceptions:
+    - id: hard-coded-values
+      description: Copies today's label values into the ConfigMap as literals.
+      feedback: The ConfigMap looks right today, but it no longer follows the namespace when the platform team relabels it. Reference the data source's labels.
+      expectFail: [reads-labels, data-source-in-state]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 180
+        run: |
+          cd ~/stacks/cost-labels
+          cat > main.tf <<'HCL'
+          resource "kubernetes_config_map_v1" "cost_labels" {
+            metadata {
+              name      = "cost-labels"
+              namespace = "grid-telemetry"
+            }
+            data = {
+              "cost-centre" = "{{cost_centre}}"
+              team          = "{{team}}"
+            }
+          }
+          HCL
+          iac init -input=false -no-color && iac apply -auto-approve -input=false -no-color
+    - id: manage-the-namespace
+      description: Declares the namespace as a resource, which tries to create an object that already exists.
+      feedback: The namespace belongs to the platform team and already exists, so creating it fails. Read it with a data source.
+      expectFail: [configmap-data, data-source-in-state, converged]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 180
+        run: |
+          cd ~/stacks/cost-labels
+          cat > main.tf <<'HCL'
+          resource "kubernetes_namespace_v1" "grid" {
+            metadata {
+              name = "grid-telemetry"
+            }
+          }
+          resource "kubernetes_config_map_v1" "cost_labels" {
+            metadata {
+              name      = "cost-labels"
+              namespace = kubernetes_namespace_v1.grid.metadata[0].name
+            }
+            data = {
+              "cost-centre" = "{{cost_centre}}"
+              team          = "{{team}}"
+            }
+          }
+          HCL
+          iac init -input=false -no-color
+          iac apply -auto-approve -input=false -no-color || true
+  solution:
+    explanation: |
+      The data source reads the existing namespace at plan time; the ConfigMap takes
+      its namespace and both values from it, so Terraform orders the read before the
+      create and a relabel shows up as an in-place update on the next plan. State
+      lists the namespace as `data.kubernetes_namespace_v1.grid`, which Terraform
+      never creates or destroys.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 180
+        run: |
+          set -e
+          cd ~/stacks/cost-labels
+          cat > main.tf <<'HCL'
+          data "kubernetes_namespace_v1" "grid" {
+            metadata {
+              name = "grid-telemetry"
+            }
+          }
+
+          resource "kubernetes_config_map_v1" "cost_labels" {
+            metadata {
+              name      = "cost-labels"
+              namespace = data.kubernetes_namespace_v1.grid.metadata[0].name
+            }
+            data = {
+              "cost-centre" = data.kubernetes_namespace_v1.grid.metadata[0].labels["saltmarsh.example/cost-centre"]
+              team          = data.kubernetes_namespace_v1.grid.metadata[0].labels["saltmarsh.example/team"]
+            }
+          }
+          HCL
+          iac init -input=false -no-color
+          iac apply -auto-approve -input=false -no-color
+          iac plan -input=false -no-color -detailed-exitcode
+    alternatives:
+      - id: locals
+        description: Read the labels once into a local and build the data map from it.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 180
+            run: |
+              set -e
+              cd ~/stacks/cost-labels
+              cat > main.tf <<'HCL'
+              data "kubernetes_namespace_v1" "grid" {
+                metadata {
+                  name = "grid-telemetry"
+                }
+              }
+
+              locals {
+                labels = data.kubernetes_namespace_v1.grid.metadata[0].labels
+              }
+
+              resource "kubernetes_config_map_v1" "cost_labels" {
+                metadata {
+                  name      = "cost-labels"
+                  namespace = data.kubernetes_namespace_v1.grid.metadata[0].name
+                }
+                data = {
+                  "cost-centre" = local.labels["saltmarsh.example/cost-centre"]
+                  "team"        = local.labels["saltmarsh.example/team"]
+                }
+              }
+              HCL
+              iac init -input=false -no-color
+              iac apply -auto-approve -input=false -no-color
