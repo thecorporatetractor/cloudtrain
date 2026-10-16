@@ -24,6 +24,12 @@
 #                 SELinux Enforcing, firewalld active, `dnf install httpd` offline (local repo)
 #   ubuntu-vm     the same disks/LVM checks, AppArmor enabled, `apt-get update/install nginx`
 #                 offline (local signed repo), nftables/ufw present
+#   docker-vm     Docker Engine 29 with the containerd image store, every preloaded image
+#                 listed by `docker images`, offline `docker run`, BuildKit build and
+#                 compose stack, published port reachable, --memory OOM kill (exit 137),
+#                 then the escape-containment probe: a privileged container with the VM's
+#                 / and PID namespace sees only the VM (no kubelet, no kube API, no
+#                 platform node reachable)
 #   etcd-host     etcd.service active, `etcdctl endpoint health` over mutual TLS passes,
 #                 a client without a certificate is refused, then the
 #                 etcd-snapshot-restore lab's own provision script + solution run
@@ -54,6 +60,7 @@ image_of() {
     etcd-host)       echo "$ETCD_HOST_IMAGE" ;;
     el-vm)           echo "$EL_VM_IMAGE" ;;
     ubuntu-vm)       echo "$UBUNTU_VM_IMAGE" ;;
+    docker-vm)       echo "$DOCKER_VM_IMAGE" ;;
     *) die "unknown image '$1'" ;;
   esac
 }
@@ -61,7 +68,7 @@ image_of() {
 run_test() {
   local variant=$1 img mem ns work
   img=$(image_of "$variant")
-  case $variant in etcd-host|el-vm|ubuntu-vm) mem=1536Mi ;; *) mem=2560Mi ;; esac
+  case $variant in etcd-host|el-vm|ubuntu-vm) mem=1536Mi ;; docker-vm) mem=2048Mi ;; *) mem=2560Mi ;; esac
   # Linux VM images: two blank data disks, as the vm driver attaches topology
   # resources.disks (emptyDisk for ephemeral VMs, serial ct-dataN).
   local xdisks="" xvols=""
@@ -411,8 +418,47 @@ echo "== man pages"; man -w ls
 EOS
 }
 
+test_docker-vm() {
+  vmrun <<'EOS' || return 1
+set -e
+echo "== engine"; docker version --format 'server {{.Server.Version}} client {{.Client.Version}}'
+docker info --format '{{.Driver}} {{json .DriverStatus}}' | tee /tmp/info; grep -q 'io.containerd.snapshotter' /tmp/info && echo "ok: containerd image store"
+echo "== preloaded images"; docker images --format '{{.Repository}}:{{.Tag}}' | sort | tee /tmp/imgs
+for i in $(sed 's/@.*//; s#^docker.io/library/##' /opt/cloudtrain/images/images.txt); do grep -qx "$i" /tmp/imgs || { echo "FAIL: $i not in docker images"; exit 1; }; done
+echo "ok: every preloaded image is visible to the engine"
+echo "== offline run"; docker run --rm busybox:1.37 echo ok: busybox runs
+echo "== offline BuildKit build"; d=$(mktemp -d); printf 'FROM alpine:3.22\nRUN echo built > /built\nCMD ["cat","/built"]\n' > $d/Dockerfile
+docker build -q -t bt/offline:1 $d >/dev/null && docker run --rm bt/offline:1 | grep -qx built && echo "ok: docker build offline"
+echo "== compose + published port"; mkdir -p /tmp/cs && printf 'services:\n  web:\n    image: nginx:1.29-alpine\n    ports: ["127.0.0.1:8088:80"]\n' > /tmp/cs/compose.yaml
+docker compose -f /tmp/cs/compose.yaml up -d --wait >/dev/null && curl -fsS -o /dev/null -w 'ok: compose nginx %{http_code}\n' http://127.0.0.1:8088/
+docker compose -f /tmp/cs/compose.yaml down >/dev/null
+echo "== cgroup memory limit"; set +e; docker run --name oomt --memory 16m busybox:1.37 sh -c 'x=a; while :; do x=$x$x; done' >/dev/null 2>&1
+r=$(docker inspect -f '{{.State.ExitCode}} oom={{.State.OOMKilled}}' oomt); docker rm -f oomt >/dev/null; set -e
+[ "$r" = "137 oom=true" ] && echo "ok: --memory 16m OOM-killed ($r)" || { echo "FAIL: OOM test gave $r"; exit 1; }
+echo "== rootless prerequisites"; command -v newuidmap dockerd-rootless-setuptool.sh slirp4netns
+echo "== man pages"; man -w docker-run 2>/dev/null || man -w docker || true
+EOS
+  echo "== escape containment (as learner in the docker group)" | tee -a "$OUT"
+  vmrun <<'EOS' || return 1
+usermod -aG docker learner
+EOS
+  k -n "$NS" exec -i tester -- ssh vm 'bash -s' <<'EOS' 2>&1 | tee -a "$OUT"; [[ ${PIPESTATUS[0]} == 0 ]] || return 1
+set -e
+docker run --rm --privileged --pid=host --net=host -v /:/host busybox:1.37 sh -c '
+  echo "container uid: $(id -u)"; echo "host rootfs: $(grep CLOUDTRAIN_IMAGE= /host/etc/cloudtrain-release)"
+  echo "host pid 1: $(cat /proc/1/comm)"
+  if ls /host/var/lib/kubelet >/dev/null 2>&1; then echo "FAIL: kubelet state visible"; exit 1; fi; echo "ok: no kubelet state on the VM"
+  if ps -o comm | grep -qE "virt-launcher|kubelet|containerd-shim-runc-v2 -namespace k8s.io"; then echo "FAIL: platform processes visible"; exit 1; fi
+  echo "ok: only the VM processes are visible ($(ps -o comm | wc -l) processes)"
+  for t in 10.96.0.1:443 172.31.0.2:10250 172.31.0.3:6443 1.1.1.1:443; do
+    if timeout 3 nc -z ${t%:*} ${t#*:} 2>/dev/null; then echo "FAIL: $t reachable"; exit 1; fi; echo "ok: $t unreachable"
+  done'
+grep -m1 -i -E 'hypervisor|KVM' /sys/class/dmi/id/sys_vendor /proc/cpuinfo 2>/dev/null | head -1 | sed 's/^/vm evidence: /' || true
+EOS
+}
+
 targets=("$@"); ((${#targets[@]})) || targets=(kubeadm-node kubeadm-upgrade etcd-host el-vm ubuntu-vm)
 for t in "${targets[@]}"; do
-  case $t in kubeadm-node|kubeadm-upgrade|etcd-host|el-vm|ubuntu-vm) ;; *) die "unknown image '$t' (kubeadm-node | kubeadm-upgrade | etcd-host | el-vm | ubuntu-vm)" ;; esac
+  case $t in kubeadm-node|kubeadm-upgrade|etcd-host|el-vm|ubuntu-vm|docker-vm) ;; *) die "unknown image '$t' (kubeadm-node | kubeadm-upgrade | etcd-host | el-vm | ubuntu-vm | docker-vm)" ;; esac
 done
 for t in "${targets[@]}"; do run_test "$t"; done

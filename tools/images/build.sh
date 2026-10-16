@@ -17,6 +17,9 @@
 #                    LAYERED on the kubeadm-node containerDisk (must exist): add-ons for
 #                    /opt/cloudtrain/bin/addons-install + images, gVisor, kube-bench, AppArmor
 #                    profiles, audit policies (tools/images/kubeadm-addons)
+#   docker-vm        ${DOCKER_VM_IMAGE}                             catalog docker-vm:29
+#                    (Ubuntu cloud image + Docker Engine 29, buildx, compose, rootless extras;
+#                    tools/images/docker-vm/preload-images.txt preloaded, lock/docker-vm.lock)
 #   el-vm/ubuntu-vm need the mirror content: tools/mirrors/build-content.sh (task mirror:content)
 #
 # Steps:
@@ -59,7 +62,9 @@ case $VARIANT in
     TAG="$EL_VM_IMAGE"; REF=el-vm:10; GUEST=el-vm; DISK_SIZE=10G ;;
   ubuntu-vm)
     TAG="$UBUNTU_VM_IMAGE"; REF=ubuntu-vm:24.04; GUEST=ubuntu-vm; DISK_SIZE=10G ;;
-  *) die "unknown variant '$VARIANT' (kubeadm-node | kubeadm-upgrade | etcd-host | el-vm | ubuntu-vm)" ;;
+  docker-vm)
+    TAG="$DOCKER_VM_IMAGE"; REF=docker-vm:29; GUEST=docker-vm; DISK_SIZE=12G ;;
+  *) die "unknown variant '$VARIANT' (kubeadm-node | kubeadm-upgrade | etcd-host | el-vm | ubuntu-vm | docker-vm)" ;;
 esac
 
 # --- 0. catalog contract: the catalog must name exactly what this build produces ---
@@ -220,6 +225,14 @@ if [[ $GUEST == kubeadm-addons ]]; then
   lock_check "$LOCKDIR/addons.lock" "${AIMG[@]}"
   grep -v '^#' "$LOCKDIR/addons.lock" | grep . > "$IN/addon-images.txt"
 fi
+if [[ $GUEST == docker-vm ]]; then
+  # Images preloaded into the engine: tools/images/docker-vm/preload-images.txt, by digest.
+  mapfile -t DIMAGES < <(grep -v '^#' "$HERE/docker-vm/preload-images.txt" | grep . | while read -r i; do normalize "$i"; done)
+  ((${#DIMAGES[@]})) || die "docker-vm/preload-images.txt lists no image"
+  n0=${#LOCKED[@]}
+  lock_check "$LOCKDIR/docker-vm.lock" "${DIMAGES[@]}"
+  printf '%s\n' "${LOCKED[@]:$n0}" > "$WORK/in/docker-images.txt"
+fi
 if [[ $GUEST == el-vm || $GUEST == ubuntu-vm ]]; then
   MIRROR="$CACHE/mirror/$MIRROR_SNAPSHOT"
   repo=$([[ $GUEST == el-vm ]] && echo el10 || echo noble)
@@ -275,6 +288,9 @@ CONTAINERD_VERSION=${CONTAINERD_VERSION}
 KUBERNETES_CNI_VERSION=${KUBERNETES_CNI_VERSION}
 UBUNTU_APT_SNAPSHOT=${UBUNTU_APT_SNAPSHOT}
 DOCKER_APT_KEY_FPR=${DOCKER_APT_KEY_FPR}
+DOCKER_CE_VERSION=${DOCKER_CE_VERSION}
+DOCKER_BUILDX_VERSION=${DOCKER_BUILDX_VERSION}
+DOCKER_COMPOSE_VERSION=${DOCKER_COMPOSE_VERSION}
 K8S_APT_KEY_FPR=${K8S_APT_KEY_FPR}
 BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 GIT_REV=$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)
