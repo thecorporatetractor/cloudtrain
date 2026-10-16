@@ -13,7 +13,10 @@ ENV DEBIAN_FRONTEND=noninteractive
 # versions are exactly the mirror's. The base image excludes /usr/share/man and docs
 # (dpkg path-exclude); drop the excludes and reinstall, so every package has its man pages.
 RUN --mount=type=bind,from=noble,target=/mnt/noble --mount=type=bind,source=common/cloudtrain-mirror.asc,target=/mnt/key.asc \
-    set -eux; rm -f /etc/dpkg/dpkg.cfg.d/excludes /usr/bin/man; \
+    set -eux; rm -f /etc/dpkg/dpkg.cfg.d/excludes; \
+    # the minimized image diverts /usr/bin/man to man.REAL behind a stub; undo it like
+    # `unminimize` does, else man-db's postinst fails (chown /usr/bin/man) and apt exits 100
+    if dpkg-divert --list /usr/bin/man | grep -q .; then rm -f /usr/bin/man; dpkg-divert --quiet --local --rename --remove /usr/bin/man; fi; \
     mv /etc/apt/sources.list.d/ubuntu.sources /tmp/ubuntu.sources; \
     printf 'Types: deb\nURIs: file:/mnt/noble/\nSuites: ./\nSigned-By: /mnt/key.asc\n' > /etc/apt/sources.list.d/build.sources; \
     apt-get -o APT::Update::Error-Mode=any update; \

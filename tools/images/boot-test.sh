@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Boot-test CloudTrain VM images on the dev cluster, OFFLINE, one VM at a time.
 #
-# Usage: boot-test.sh [kubeadm-node|kubeadm-upgrade|etcd-host ...]   (default: all)
+# Usage: boot-test.sh [kubeadm-node|kubeadm-upgrade|kubeadm-full|etcd-host|el-vm|ubuntu-vm ...]   (default: all)
 #
 # Per image, in a fresh namespace: an isolated Kube-OVN VPC (no route to the platform
 # network or the internet, the same model as lab:demo), the VM booted from the
@@ -24,6 +24,12 @@
 #                 SELinux Enforcing, firewalld active, `dnf install httpd` offline (local repo)
 #   ubuntu-vm     the same disks/LVM checks, AppArmor enabled, `apt-get update/install nginx`
 #                 offline (local signed repo), nftables/ufw present
+#   kubeadm-full  kubeadm:1.37-full / -sec: single-node init, `addons-install all,falco
+#                 --wait` offline, `kubectl top node` (metrics-server), an Ingress and an
+#                 HTTPRoute through traefik (NodePort 30080), a MetalLB LoadBalancer IP
+#                 reached from the tester in the VPC, a PVC bound by local-path, a Pod
+#                 under RuntimeClass runsc (gVisor kernel), a Falco alert on `kubectl exec`,
+#                 kube-bench runs
 #   etcd-host     etcd.service active, `etcdctl endpoint health` over mutual TLS passes,
 #                 a client without a certificate is refused, then the
 #                 etcd-snapshot-restore lab's own provision script + solution run
@@ -51,6 +57,7 @@ image_of() {
   case $1 in
     kubeadm-node)    echo "${GOLDEN_IMAGE_REPO}:${LAB_K8S_VERSION}" ;;
     kubeadm-upgrade) echo "${GOLDEN_IMAGE_REPO}:${UPGRADE_IMAGE_TAG}" ;;
+    kubeadm-full)    echo "${GOLDEN_IMAGE_REPO}:${KUBEADM_FULL_IMAGE_TAG}" ;;
     etcd-host)       echo "$ETCD_HOST_IMAGE" ;;
     el-vm)           echo "$EL_VM_IMAGE" ;;
     ubuntu-vm)       echo "$UBUNTU_VM_IMAGE" ;;
@@ -61,7 +68,7 @@ image_of() {
 run_test() {
   local variant=$1 img mem ns work
   img=$(image_of "$variant")
-  case $variant in etcd-host|el-vm|ubuntu-vm) mem=1536Mi ;; *) mem=2560Mi ;; esac
+  case $variant in etcd-host|el-vm|ubuntu-vm) mem=1536Mi ;; kubeadm-full) mem=4Gi ;; *) mem=2560Mi ;; esac
   # Linux VM images: two blank data disks, as the vm driver attaches topology
   # resources.disks (emptyDisk for ephemeral VMs, serial ct-dataN).
   local xdisks="" xvols=""
@@ -262,6 +269,101 @@ test_kubeadm-node() {
   netpol_enforced | vmrun
 }
 
+test_kubeadm-full() {
+  kubeadm_single_node "$LAB_K8S_VERSION" | vmrun || return 1
+  vmrun <<'EOS' || return 1
+set -e; export KUBECONFIG=/etc/kubernetes/admin.conf
+grep -E '^(ADDONS|GVISOR|KUBE_BENCH)' /etc/cloudtrain-release
+t=$SECONDS; /opt/cloudtrain/bin/addons-install all,falco --wait; echo "ok: addons-install all,falco --wait in $((SECONDS - t))s (offline)"
+for i in $(seq 40); do kubectl top node vm >/dev/null 2>&1 && break; sleep 5; done
+kubectl top node vm && echo "ok: metrics-server (kubectl top node)"
+kubectl get ingressclass,gatewayclass,storageclass
+cat <<'EOF' | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata: { name: web, labels: { app: web } }
+spec: { containers: [{ name: c, image: httpd:2.4-alpine, imagePullPolicy: Never }] }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: web }
+spec: { selector: { app: web }, ports: [{ port: 80 }] }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: web-lb }
+spec: { type: LoadBalancer, selector: { app: web }, ports: [{ port: 80 }] }
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: { name: web }
+spec:
+  ingressClassName: traefik
+  rules: [{ host: web.lab, http: { paths: [{ path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }] } }]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: { name: gw }
+spec: { gatewayClassName: traefik, listeners: [{ name: http, protocol: HTTP, port: 8000, allowedRoutes: { namespaces: { from: Same } } }] }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: web }
+spec:
+  parentRefs: [{ name: gw }]
+  hostnames: [route.lab]
+  rules: [{ backendRefs: [{ name: web, port: 80 }] }]
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: data }
+spec: { accessModes: [ReadWriteOnce], resources: { requests: { storage: 64Mi } } }
+---
+apiVersion: v1
+kind: Pod
+metadata: { name: pvc-user }
+spec:
+  containers: [{ name: c, image: busybox:1.37, imagePullPolicy: Never, command: [sh, -c, "echo ok > /d/f && sleep 3600"], volumeMounts: [{ name: d, mountPath: /d }] }]
+  volumes: [{ name: d, persistentVolumeClaim: { claimName: data } }]
+---
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata: { name: gvisor }
+handler: runsc
+---
+apiVersion: v1
+kind: Pod
+metadata: { name: sandboxed }
+spec: { runtimeClassName: gvisor, containers: [{ name: c, image: busybox:1.37, imagePullPolicy: Never, command: [sleep, "3600"] }] }
+EOF
+kubectl wait pod web pvc-user sandboxed --for=condition=Ready --timeout=240s
+kubectl get pvc data -o jsonpath='{.status.phase} {.spec.storageClassName}{"\n"}' | grep -q '^Bound local-path' && echo "ok: PVC bound by local-path (default class)"
+kubectl exec sandboxed -- dmesg 2>/dev/null | grep -qi gvisor && echo "ok: RuntimeClass runsc pod runs under gVisor ($(kubectl exec sandboxed -- uname -r))"
+code() { curl -s -o /dev/null -w '%{http_code}' -H "Host: $1" "$2"; }
+for i in $(seq 30); do [ "$(code web.lab http://127.0.0.1:30080/)" = 200 ] && break; sleep 3; done
+[ "$(code web.lab http://127.0.0.1:30080/)" = 200 ] && echo "ok: Ingress via traefik (NodePort 30080) -> 200"
+kubectl wait gateway gw --for=condition=Programmed --timeout=120s
+for i in $(seq 30); do [ "$(code route.lab http://127.0.0.1:30080/)" = 200 ] && break; sleep 3; done
+[ "$(code route.lab http://127.0.0.1:30080/)" = 200 ] && echo "ok: HTTPRoute via traefik GatewayClass -> 200"
+for i in $(seq 30); do ip=$(kubectl get svc web-lb -o jsonpath='{.status.loadBalancer.ingress[0].ip}'); [ -n "$ip" ] && break; sleep 2; done
+echo "web-lb external IP: $ip"; echo "$ip" > /tmp/lb-ip
+[ -n "$ip" ] && echo "ok: MetalLB assigned $ip"
+kubectl exec web -- sh -c 'echo probe' >/dev/null
+for i in $(seq 30); do kubectl -n falco logs ds/falco --since=5m 2>/dev/null | grep -qi 'shell\|terminal' && break; sleep 3; done
+kubectl -n falco logs ds/falco --since=5m | grep -i '"priority"' | grep -i 'shell\|terminal' | tail -1 | cut -c1-300
+kubectl -n falco logs ds/falco --since=5m | grep -qi 'shell\|terminal' && echo "ok: Falco alert on kubectl exec"
+kube-bench run --targets master --noremediations 2>/dev/null | grep -E '^== Summary|checks (PASS|FAIL|WARN)' | head -4
+kube-bench version
+EOS
+  local ip
+  ip=$(k -n "$NS" exec tester -- ssh vm cat /tmp/lb-ip)
+  if k -n "$NS" exec tester -- curl -s -m 5 -o /dev/null -w '%{http_code}' "http://$ip/" | tee -a "$OUT" | grep -q 200; then
+    echo "ok: MetalLB IP $ip reachable from the tester in the VPC" | tee -a "$OUT"
+  else
+    echo "REPORT: MetalLB IP $ip NOT reachable from the tester in the VPC (L2 ARP for a non-port IP in Kube-OVN)" | tee -a "$OUT"
+  fi
+}
+
 test_kubeadm-upgrade() {
   local to=$LAB_K8S_VERSION
   crictl_has_workloads | vmrun || return 1
@@ -411,8 +513,8 @@ echo "== man pages"; man -w ls
 EOS
 }
 
-targets=("$@"); ((${#targets[@]})) || targets=(kubeadm-node kubeadm-upgrade etcd-host el-vm ubuntu-vm)
+targets=("$@"); ((${#targets[@]})) || targets=(kubeadm-node kubeadm-upgrade kubeadm-full etcd-host el-vm ubuntu-vm)
 for t in "${targets[@]}"; do
-  case $t in kubeadm-node|kubeadm-upgrade|etcd-host|el-vm|ubuntu-vm) ;; *) die "unknown image '$t' (kubeadm-node | kubeadm-upgrade | etcd-host | el-vm | ubuntu-vm)" ;; esac
+  case $t in kubeadm-node|kubeadm-upgrade|kubeadm-full|etcd-host|el-vm|ubuntu-vm) ;; *) die "unknown image '$t' (kubeadm-node | kubeadm-upgrade | kubeadm-full | etcd-host | el-vm | ubuntu-vm)" ;; esac
 done
 for t in "${targets[@]}"; do run_test "$t"; done

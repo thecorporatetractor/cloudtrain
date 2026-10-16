@@ -10,7 +10,7 @@
 #      get through (NetworkPolicy)
 # Usage: mirrors-up.sh [--no-test]
 source "$(dirname "$0")/lib.sh"
-need docker; need kubectl; need yq; need jq
+need docker; need kubectl; need yq; need jq; need perl
 NS=$MIRROR_NAMESPACE
 CONTENT="$REPO_ROOT/tools/images/.cache/mirror/$MIRROR_SNAPSHOT"
 T0=$SECONDS
@@ -52,7 +52,9 @@ if ! k -n "$NS" get secret mirror-admin >/dev/null 2>&1; then
   k -n "$NS" create secret generic mirror-admin --from-literal=username=admin --from-literal=password="$pw" >/dev/null
   k -n "$NS" create secret generic registry-htpasswd --from-literal=htpasswd="$bc" >/dev/null
 fi
-envsubst '${MIRROR_NAMESPACE} ${MIRROR_CONTENT_IMAGE} ${ZOT_IMAGE} ${GITEA_IMAGE} ${ZOT_ALLOWLIST} ${ZOT_CONFIG_HASH}' \
+# Only these variables are substituted (like `envsubst '${A} ${B}'`; perl, since gettext's
+# envsubst is not installed everywhere).
+perl -pe 's/\$\{(MIRROR_NAMESPACE|MIRROR_CONTENT_IMAGE|ZOT_IMAGE|GITEA_IMAGE|ZOT_ALLOWLIST|ZOT_CONFIG_HASH)\}/$ENV{$1}/g' \
   < "$REPO_ROOT/deploy/mirrors/mirrors.yaml" | k apply -f - >/dev/null
 for d in mirror registry git; do
   wait_for "$NS/$d rollout" 300 k -n "$NS" rollout status deploy/$d --timeout=5s
