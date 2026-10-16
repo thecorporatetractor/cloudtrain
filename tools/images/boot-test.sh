@@ -430,7 +430,9 @@ echo "== offline run"; docker run --rm busybox:1.37 echo ok: busybox runs
 echo "== offline BuildKit build"; d=$(mktemp -d); printf 'FROM alpine:3.22\nRUN echo built > /built\nCMD ["cat","/built"]\n' > $d/Dockerfile
 docker build -q -t bt/offline:1 $d >/dev/null && docker run --rm bt/offline:1 | grep -qx built && echo "ok: docker build offline"
 echo "== compose + published port"; mkdir -p /tmp/cs && printf 'services:\n  web:\n    image: nginx:1.29-alpine\n    ports: ["127.0.0.1:8088:80"]\n' > /tmp/cs/compose.yaml
-docker compose -f /tmp/cs/compose.yaml up -d --wait >/dev/null && curl -fsS -o /dev/null -w 'ok: compose nginx %{http_code}\n' http://127.0.0.1:8088/
+docker compose -f /tmp/cs/compose.yaml up -d --wait >/dev/null 2>&1
+for i in $(seq 15); do curl -fsS -o /dev/null http://127.0.0.1:8088/ 2>/dev/null && break; sleep 1; done
+curl -fsS -o /dev/null -w 'ok: compose nginx %{http_code}\n' http://127.0.0.1:8088/
 docker compose -f /tmp/cs/compose.yaml down >/dev/null
 echo "== cgroup memory limit"; set +e; docker run --name oomt --memory 16m busybox:1.37 sh -c 'x=a; while :; do x=$x$x; done' >/dev/null 2>&1
 r=$(docker inspect -f '{{.State.ExitCode}} oom={{.State.OOMKilled}}' oomt); docker rm -f oomt >/dev/null; set -e
@@ -453,7 +455,7 @@ docker run --rm --privileged --pid=host --net=host -v /:/host busybox:1.37 sh -c
   for t in 10.96.0.1:443 172.31.0.2:10250 172.31.0.3:6443 1.1.1.1:443; do
     if timeout 3 nc -z ${t%:*} ${t#*:} 2>/dev/null; then echo "FAIL: $t reachable"; exit 1; fi; echo "ok: $t unreachable"
   done'
-grep -m1 -i -E 'hypervisor|KVM' /sys/class/dmi/id/sys_vendor /proc/cpuinfo 2>/dev/null | head -1 | sed 's/^/vm evidence: /' || true
+echo "virtualization: $(systemd-detect-virt 2>/dev/null || echo unknown)"
 EOS
 }
 
