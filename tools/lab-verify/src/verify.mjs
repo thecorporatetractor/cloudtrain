@@ -332,7 +332,10 @@ export async function checkLab(labFile, skills, frameworkRefs, findings, ctx = {
       });
     }
     (spec.hints ?? []).forEach((h, i) => h.command && texts.push([`/spec/hints/${i}/command`, h.command]));
-    for (const [at, t] of texts) {
+    // Pods only exist in labs with a Kubernetes cluster. Docker host labs (e.g. Compose
+    // files with `image:` lines) build or preload their images on the VM itself.
+    const hasCluster = spec.topology.nodes.some((n) => n.driver === "k8s-cluster");
+    for (const [at, t] of hasCluster ? texts : []) {
       for (const ref of podImageRefs(t)) {
         if (!catalog.workload.has(ref)) {
           findings.push({ level: "error", file: labFile, path: at, message: `Pod image '${ref}' is not in workloadImages of ${path.basename(catalog.file)}` });
