@@ -1,0 +1,240 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: iac-moved-removed-refactor
+  title: Rename resources and release one from management
+  domain: iac
+  frameworks: [tf-associate:state, tf-advanced:modules]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [terraform, moved, removed, refactoring, state]
+  version: 1
+spec:
+  description: |
+    The stack in `~/stacks/telemetry-core` (applied, on `sm-grid`) predates
+    Saltmarsh's naming standard: a resource's local name must be the object's
+    name in snake_case. Two changes are due, and neither may destroy anything:
+
+    1. **Rename** `kubernetes_namespace_v1.ns1` to
+       `kubernetes_namespace_v1.telemetry_core` and
+       `kubernetes_config_map_v1.cm` to
+       `kubernetes_config_map_v1.collector_settings`, recording the renames in
+       **`moved` blocks** so the plan shows moves, not replacements.
+    2. The archive team takes over namespace `legacy-archive`. Stop managing it
+       with a **`removed` block** that keeps the namespace (it must still exist,
+       untouched, after your apply), and delete its resource block.
+
+    Apply the changes. The plan before your apply should show only moves and the
+    removal from state; afterwards a plan reports no changes.
+  objectives:
+    - Rename resource addresses with moved blocks
+    - Stop managing an object with a removed block without destroying it
+    - Review a refactoring plan for destroys before applying
+  params:
+    flush:
+      type: int
+      min: 15
+      max: 90
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+      - name: sm-grid
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: sm-grid
+  setup:
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/main.tf, source: assets/main.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/seed.sh, source: assets/seed.sh, mode: "0755"}
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/stacks
+    - on: workstation
+      as: learner
+      timeoutSec: 240
+      run: /var/tmp/ct-seed/seed.sh
+    - on: sm-grid
+      run: |
+        set -eu
+        kubectl -n kube-system get configmap ct-baseline-uids >/dev/null 2>&1 && exit 0
+        kubectl -n kube-system create configmap ct-baseline-uids \
+          --from-literal=telemetry-core=$(kubectl get namespace telemetry-core -o jsonpath='{.metadata.uid}') \
+          --from-literal=legacy-archive=$(kubectl get namespace legacy-archive -o jsonpath='{.metadata.uid}') \
+          --from-literal=collector-settings=$(kubectl -n telemetry-core get configmap collector-settings -o jsonpath='{.metadata.uid}')
+  teardown:
+    - on: sm-grid
+      run: kubectl delete namespace telemetry-core legacy-archive --ignore-not-found --wait=false
+  checks:
+    - id: objects-kept
+      description: Namespace telemetry-core and ConfigMap collector-settings keep their original UIDs
+      type: shell
+      on: sm-grid
+      skills: [iac.state.refactor]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        b() { kubectl -n kube-system get configmap ct-baseline-uids -o jsonpath="{.data.$1}"; }
+        ns=$(kubectl get namespace telemetry-core -o jsonpath='{.metadata.uid}' 2>/dev/null)
+        cm=$(kubectl -n telemetry-core get configmap collector-settings -o jsonpath='{.metadata.uid}' 2>/dev/null)
+        [ "$ns" = "$(b telemetry-core)" ] && a=same || a=new
+        [ "$cm" = "$(b collector-settings)" ] && c=same || c=new
+        echo "namespace=$a configmap=$c"
+      expect: {match: exact, value: namespace=same configmap=same}
+    - id: archive-kept
+      description: Namespace legacy-archive still exists with its original UID
+      type: shell
+      on: sm-grid
+      skills: [iac.state.refactor]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        now=$(kubectl get namespace legacy-archive -o jsonpath='{.metadata.uid}' 2>/dev/null)
+        was=$(kubectl -n kube-system get configmap ct-baseline-uids -o jsonpath='{.data.legacy-archive}')
+        [ -n "$now" ] && [ "$now" = "$was" ] && echo kept || echo "gone or recreated"
+      expect: {match: exact, value: kept}
+    - id: new-addresses
+      description: The state holds exactly the two renamed addresses
+      type: shell
+      on: workstation
+      skills: [iac.state.refactor]
+      weight: 2
+      timeoutSec: 60
+      command: |
+        ct-iac state /home/learner/stacks/telemetry-core | jq -r '[.values.root_module.resources[]? | select(.mode == "managed") | .address] | sort | join(" ")' 2>/dev/null
+      expect: {match: exact, value: kubernetes_config_map_v1.collector_settings kubernetes_namespace_v1.telemetry_core}
+    - id: blocks-in-code
+      description: The configuration records the change with moved and removed blocks
+      type: shell
+      on: workstation
+      skills: [iac.state.refactor]
+      weight: 1
+      command: |
+        c=$(cat /home/learner/stacks/telemetry-core/*.tf 2>/dev/null)
+        m=$(printf '%s\n' "$c" | grep -cE '^[[:space:]]*moved[[:space:]]*\{')
+        r=$(printf '%s\n' "$c" | grep -cE '^[[:space:]]*removed[[:space:]]*\{')
+        echo "moved=$m removed=$r"
+      expect: {match: regex, value: '^moved=[2-9] removed=[1-9]$'}
+    - id: settings-intact
+      description: collector-settings still holds its flush interval
+      type: k8s-query
+      skills: [iac.state.refactor]
+      weight: 0.5
+      query: {cluster: sm-grid, resource: configmap, name: collector-settings, namespace: telemetry-core, jsonpath: "{.data.flush_seconds}"}
+      expect: {match: exact, value: "{{flush}}"}
+    - id: converged
+      description: A new plan of ~/stacks/telemetry-core reports no changes
+      type: shell
+      on: workstation
+      skills: [iac.foundations.workflow]
+      timeoutSec: 90
+      command: ct-iac plan /home/learner/stacks/telemetry-core
+      expect: {match: exact, value: no-changes}
+  hints:
+    - title: moved
+      body: |
+        Rename the block, then add
+        `moved { from = kubernetes_namespace_v1.ns1  to = kubernetes_namespace_v1.telemetry_core }`
+        (on separate lines). Remember to update references to the old name too.
+      cost: 1
+    - title: removed
+      body: |
+        Delete the resource block and add
+        ```hcl
+        removed {
+          from = kubernetes_namespace_v1.old_archive
+          lifecycle {
+            destroy = false
+          }
+        }
+        ```
+      cost: 2
+    - title: Read the plan
+      body: The plan should say "has moved to" for two resources and "will no longer be managed by Terraform" for the archive, with 0 to destroy.
+      command: cd ~/stacks/telemetry-core && terraform plan
+      cost: 1
+  misconceptions:
+    - id: delete-the-block
+      description: Deletes the archive's resource block without a removed block.
+      feedback: Without a removed block, a resource missing from the configuration is planned for destroy, so the archive team's namespace would be deleted.
+      expectFail: [archive-kept, blocks-in-code]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          cd ~/stacks/telemetry-core
+          python3 - <<'PY'
+          import re
+          p = "main.tf"; s = open(p).read()
+          s = re.sub(r'resource "kubernetes_namespace_v1" "old_archive" \{.*?\n\}\n', '', s, flags=re.S)
+          s = s.replace('"ns1"', '"telemetry_core"').replace('kubernetes_namespace_v1.ns1', 'kubernetes_namespace_v1.telemetry_core').replace('"cm"', '"collector_settings"')
+          s += '\nmoved {\n  from = kubernetes_namespace_v1.ns1\n  to   = kubernetes_namespace_v1.telemetry_core\n}\n\nmoved {\n  from = kubernetes_config_map_v1.cm\n  to   = kubernetes_config_map_v1.collector_settings\n}\n'
+          open(p, "w").write(s)
+          PY
+          iac apply -auto-approve -input=false -no-color
+    - id: rename-without-moved
+      description: Renames the blocks without moved blocks.
+      feedback: To Terraform a new name is a new resource. Without moved, it destroys the old objects and creates new ones.
+      expectFail: [objects-kept, blocks-in-code]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          cd ~/stacks/telemetry-core
+          python3 - <<'PY'
+          import re
+          p = "main.tf"; s = open(p).read()
+          s = re.sub(r'resource "kubernetes_namespace_v1" "old_archive" \{.*?\n\}\n', '', s, flags=re.S)
+          s = s.replace('"ns1"', '"telemetry_core"').replace('kubernetes_namespace_v1.ns1', 'kubernetes_namespace_v1.telemetry_core').replace('"cm"', '"collector_settings"')
+          s += '\nremoved {\n  from = kubernetes_namespace_v1.old_archive\n  lifecycle {\n    destroy = false\n  }\n}\n'
+          open(p, "w").write(s)
+          PY
+          iac apply -auto-approve -input=false -no-color
+  solution:
+    explanation: |
+      moved blocks tell Terraform that the object at the old address now lives at the
+      new one, so the plan moves state entries instead of replacing objects. A
+      removed block with `destroy = false` drops the archive namespace from state and
+      leaves the object alone; without it, deleting the resource block would destroy
+      the namespace.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/stacks/telemetry-core
+          python3 - <<'PY'
+          import re
+          p = "main.tf"; s = open(p).read()
+          s = re.sub(r'resource "kubernetes_namespace_v1" "old_archive" \{.*?\n\}\n', '', s, flags=re.S)
+          s = s.replace('"ns1"', '"telemetry_core"').replace('kubernetes_namespace_v1.ns1', 'kubernetes_namespace_v1.telemetry_core').replace('"cm"', '"collector_settings"')
+          open(p, "w").write(s)
+          PY
+          cat > refactor.tf <<'HCL'
+          moved {
+            from = kubernetes_namespace_v1.ns1
+            to   = kubernetes_namespace_v1.telemetry_core
+          }
+
+          moved {
+            from = kubernetes_config_map_v1.cm
+            to   = kubernetes_config_map_v1.collector_settings
+          }
+
+          removed {
+            from = kubernetes_namespace_v1.old_archive
+            lifecycle {
+              destroy = false
+            }
+          }
+          HCL
+          iac plan -input=false -no-color
+          iac apply -auto-approve -input=false -no-color

@@ -1,0 +1,263 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: iac-import-blocks-generate
+  title: Adopt hand-made namespaces with import blocks
+  domain: iac
+  frameworks: [tf-associate:maintain, tf-advanced:lifecycle-import-drift]
+  difficulty: medium
+  estimatedMinutes: 25
+  tags: [terraform, import, generate-config, kubernetes-provider]
+  version: 1
+spec:
+  description: |
+    During last night's storm outage the on-call engineer created three
+    namespaces on `sm-grid` by hand: `farm-gullhaven`, `farm-redmoor` and
+    `farm-skerrow`. Workloads already run in them, so they must not be recreated.
+
+    Bring all three under management in `~/stacks/farms` (providers are
+    configured in `providers.tf`):
+
+    1. Declare one **`import` block** per namespace.
+    2. Let Terraform write the matching resource configuration for you with
+       `terraform plan -generate-config-out=generated.tf`, review it, and keep
+       it (tidy it up if you like).
+    3. Apply, so the import is recorded in state. A following plan must report
+       **no changes**, and every namespace must keep its labels and identity.
+  objectives:
+    - Declare import blocks for existing objects
+    - Generate configuration for imported resources and review it
+    - Confirm an adoption with an empty plan
+  params:
+    oncall:
+      type: choice
+      values: [ines, bram, odile, tomasz]
+    region:
+      type: choice
+      values: [north-sea, irish-sea]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+      - name: sm-grid
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: sm-grid
+  setup:
+    - on: sm-grid
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata:
+          name: farm-gullhaven
+          labels: {saltmarsh.example/farm: gullhaven, saltmarsh.example/region: "{{region}}", saltmarsh.example/created-by: "{{oncall}}"}
+        ---
+        apiVersion: v1
+        kind: Namespace
+        metadata:
+          name: farm-redmoor
+          labels: {saltmarsh.example/farm: redmoor, saltmarsh.example/region: "{{region}}", saltmarsh.example/created-by: "{{oncall}}"}
+        ---
+        apiVersion: v1
+        kind: Namespace
+        metadata:
+          name: farm-skerrow
+          labels: {saltmarsh.example/farm: skerrow, saltmarsh.example/region: "{{region}}", saltmarsh.example/created-by: "{{oncall}}"}
+    - on: sm-grid
+      run: |
+        set -eu
+        kubectl -n kube-system get configmap ct-baseline-uids >/dev/null 2>&1 && exit 0
+        kubectl -n kube-system create configmap ct-baseline-uids \
+          --from-literal=gullhaven=$(kubectl get namespace farm-gullhaven -o jsonpath='{.metadata.uid}') \
+          --from-literal=redmoor=$(kubectl get namespace farm-redmoor -o jsonpath='{.metadata.uid}') \
+          --from-literal=skerrow=$(kubectl get namespace farm-skerrow -o jsonpath='{.metadata.uid}')
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/stacks /home/learner/stacks/farms
+    - on: workstation
+      file:
+        path: /home/learner/stacks/farms/providers.tf
+        mode: "0644"
+        content: |
+          terraform {
+            required_providers {
+              kubernetes = {
+                source  = "hashicorp/kubernetes"
+                version = "~> 3.3.0"
+              }
+            }
+          }
+
+          provider "kubernetes" {
+            config_path    = "~/.kube/config"
+            config_context = "sm-grid"
+          }
+    - on: workstation
+      run: chown -R learner:learner /home/learner/stacks/farms
+  teardown:
+    - on: sm-grid
+      run: kubectl delete namespace farm-gullhaven farm-redmoor farm-skerrow --ignore-not-found --wait=false
+  checks:
+    - id: all-in-state
+      description: All three farm namespaces are managed in the state of ~/stacks/farms
+      type: shell
+      on: workstation
+      skills: [iac.state.import]
+      weight: 2
+      timeoutSec: 60
+      command: |
+        ct-iac state /home/learner/stacks/farms | jq -r '[.values.root_module.resources[]? | select(.mode == "managed" and (.type | test("^kubernetes_namespace"))) | .values.metadata[0].name] | sort | join(" ")' 2>/dev/null
+      expect: {match: exact, value: farm-gullhaven farm-redmoor farm-skerrow}
+    - id: identities-kept
+      description: The namespaces are the original objects (UIDs unchanged)
+      type: shell
+      on: sm-grid
+      skills: [iac.state.import]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        r=""
+        for f in gullhaven redmoor skerrow; do
+          now=$(kubectl get namespace farm-$f -o jsonpath='{.metadata.uid}' 2>/dev/null)
+          was=$(kubectl -n kube-system get configmap ct-baseline-uids -o jsonpath="{.data.$f}")
+          [ -n "$now" ] && [ "$now" = "$was" ] && r="$r same" || r="$r new"
+        done
+        echo $r
+      expect: {match: exact, value: same same same}
+    - id: labels-kept
+      description: The namespaces still carry their region and created-by labels
+      type: shell
+      on: sm-grid
+      skills: [iac.state.import]
+      timeoutSec: 30
+      command: |
+        for f in gullhaven redmoor skerrow; do
+          kubectl get namespace farm-$f -o jsonpath='{.metadata.labels.saltmarsh\.example/region}/{.metadata.labels.saltmarsh\.example/created-by} ' 2>/dev/null
+        done
+      expect: {match: exact, value: "{{region}}/{{oncall}} {{region}}/{{oncall}} {{region}}/{{oncall}} "}
+    - id: import-blocks
+      description: The adoption is recorded in import blocks in the configuration
+      type: shell
+      on: workstation
+      skills: [iac.state.import]
+      weight: 0.5
+      command: cat /home/learner/stacks/farms/*.tf 2>/dev/null | grep -cE '^[[:space:]]*import[[:space:]]*\{' || true
+      expect: {match: regex, value: '^[1-9][0-9]*$'}
+    - id: converged
+      description: A new plan of ~/stacks/farms reports no changes
+      type: shell
+      on: workstation
+      skills: [iac.foundations.workflow, iac.state.import]
+      weight: 1.5
+      timeoutSec: 90
+      command: ct-iac plan /home/learner/stacks/farms
+      expect: {match: exact, value: no-changes}
+  hints:
+    - title: An import block
+      body: |
+        ```hcl
+        import {
+          to = kubernetes_namespace_v1.farm_gullhaven
+          id = "farm-gullhaven"
+        }
+        ```
+        For a namespace the import id is its name.
+      cost: 1
+    - title: Generate, then review
+      body: With import blocks but no resource blocks, plan can write the resource blocks for you. Read generated.tf before applying; it lists every attribute it found.
+      command: cd ~/stacks/farms && terraform plan -generate-config-out=generated.tf
+      cost: 1
+    - title: Plan says import, not create
+      body: Before applying, the plan must read "3 to import, 0 to add". Anything to add or destroy means a resource block does not match its object.
+      cost: 2
+  misconceptions:
+    - id: resources-without-import
+      description: Writes resource blocks for the namespaces but never imports them.
+      feedback: Terraform tries to create namespaces that already exist and the apply fails. Import blocks tell it to adopt the existing objects instead.
+      expectFail: [all-in-state, converged, import-blocks]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 240
+        run: |
+          cd ~/stacks/farms
+          for f in gullhaven redmoor skerrow; do
+            printf 'resource "kubernetes_namespace_v1" "farm_%s" {\n  metadata {\n    name = "farm-%s"\n  }\n}\n\n' "$f" "$f" >> main.tf
+          done
+          iac init -input=false -no-color
+          iac apply -auto-approve -input=false -no-color || true
+    - id: labels-dropped
+      description: Imports the namespaces with hand-written blocks that leave the labels out.
+      feedback: The import succeeds, but the next apply removes every label the configuration does not list. Generate the configuration, or copy the labels into it.
+      expectFail: [labels-kept]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 240
+        run: |
+          cd ~/stacks/farms
+          for f in gullhaven redmoor skerrow; do
+            printf 'import {\n  to = kubernetes_namespace_v1.farm_%s\n  id = "farm-%s"\n}\n\nresource "kubernetes_namespace_v1" "farm_%s" {\n  metadata {\n    name = "farm-%s"\n  }\n}\n\n' "$f" "$f" "$f" "$f" >> main.tf
+          done
+          iac init -input=false -no-color
+          iac apply -auto-approve -input=false -no-color
+  solution:
+    explanation: |
+      Each import block names the target address and the provider's import id (the
+      namespace name). With no resource block present, `plan
+      -generate-config-out` reads the live objects and writes matching blocks, so
+      the plan shows three imports and nothing else. After apply the objects are in
+      state with their labels in configuration, and the next plan is empty.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/stacks/farms
+          for f in gullhaven redmoor skerrow; do
+            printf 'import {\n  to = kubernetes_namespace_v1.farm_%s\n  id = "farm-%s"\n}\n\n' "$f" "$f" >> imports.tf
+          done
+          iac init -input=false -no-color
+          iac plan -input=false -no-color -generate-config-out=generated.tf
+          iac apply -auto-approve -input=false -no-color
+          iac plan -input=false -no-color -detailed-exitcode
+    alternatives:
+      - id: for-each-import
+        description: One for_each resource and one for_each import block, written by hand.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 300
+            run: |
+              set -e
+              cd ~/stacks/farms
+              cat > main.tf <<'HCL'
+              locals {
+                farms = toset(["gullhaven", "redmoor", "skerrow"])
+              }
+
+              import {
+                for_each = local.farms
+                to       = kubernetes_namespace_v1.farm[each.key]
+                id       = "farm-${each.key}"
+              }
+
+              resource "kubernetes_namespace_v1" "farm" {
+                for_each = local.farms
+                metadata {
+                  name = "farm-${each.key}"
+                  labels = {
+                    "saltmarsh.example/farm"       = each.key
+                    "saltmarsh.example/region"     = "{{region}}"
+                    "saltmarsh.example/created-by" = "{{oncall}}"
+                  }
+                }
+              }
+              HCL
+              iac init -input=false -no-color
+              iac apply -auto-approve -input=false -no-color

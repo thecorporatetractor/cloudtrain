@@ -27,6 +27,7 @@ for f in "${flavours[@]}"; do
     --build-arg YQ_VERSION="$YQ_VERSION" --build-arg YQ_BINARY_SHA256="$YQ_BINARY_SHA256" \
     --build-arg TERRAFORM_VERSION="$TERRAFORM_VERSION" --build-arg TERRAFORM_ZIP_SHA256="$TERRAFORM_ZIP_SHA256" \
     --build-arg TOFU_VERSION="$TOFU_VERSION" --build-arg TOFU_ZIP_SHA256="$TOFU_ZIP_SHA256" \
+    --build-arg SEAWEEDFS_VERSION="$SEAWEEDFS_VERSION" --build-arg SEAWEEDFS_TARBALL_SHA256="$SEAWEEDFS_TARBALL_SHA256" \
     "$HERE/iac" >/dev/null
   docker images "$tag" --format '{{.Repository}}:{{.Tag}}  {{.ID}}  {{.Size}}'
   log "built $tag"

@@ -13,6 +13,7 @@
 #
 # Offline: providers install only from the filesystem mirror /opt/cloudtrain/providers
 # (~/.terraformrc), reachable under both registry.terraform.io and registry.opentofu.org.
+# State backends: `ct-s3` runs a local S3-compatible store (SeaweedFS) inside the pod.
 FROM ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55
 ARG UBUNTU_APT_SNAPSHOT
 ARG KUBECTL_VERSION
@@ -24,6 +25,8 @@ ARG TERRAFORM_VERSION
 ARG TERRAFORM_ZIP_SHA256
 ARG TOFU_VERSION
 ARG TOFU_ZIP_SHA256
+ARG SEAWEEDFS_VERSION
+ARG SEAWEEDFS_TARBALL_SHA256
 ARG IAC_CLI=terraform
 ARG TERRAFORM_SHIM=1
 ENV DEBIAN_FRONTEND=noninteractive
@@ -66,7 +69,13 @@ RUN set -eu; cd /tmp \
  && rm -rf tofu.zip tofu.d terraform.zip terraform.d \
  && printf 'IAC_CLI=%s\nTERRAFORM_VERSION=%s\nTOFU_VERSION=%s\n' "$IAC_CLI" \
       "$([ "$IAC_CLI" = terraform ] && echo "$TERRAFORM_VERSION")" "$TOFU_VERSION" > /tmp/iac.env
-COPY --chmod=0755 iac ct-iac /usr/local/bin/
+# Local S3-compatible store for state-backend labs (SeaweedFS, Apache-2.0): see ct-s3.
+RUN set -eu; cd /tmp \
+ && curl -fsSLo weed.tgz "https://github.com/seaweedfs/seaweedfs/releases/download/${SEAWEEDFS_VERSION}/linux_amd64.tar.gz" \
+ && echo "${SEAWEEDFS_TARBALL_SHA256}  weed.tgz" | sha256sum -c - \
+ && tar -xzf weed.tgz -C /usr/local/bin weed && rm -f weed.tgz && chmod 0755 /usr/local/bin/weed \
+ && weed version | head -1
+COPY --chmod=0755 iac ct-iac ct-s3 /usr/local/bin/
 COPY --chmod=0755 terraform-shim /usr/local/lib/cloudtrain/terraform-shim
 RUN install -d /etc/cloudtrain && mv /tmp/iac.env /etc/cloudtrain/iac.env \
  && if [ "$IAC_CLI" = tofu ] && [ "$TERRAFORM_SHIM" = 1 ]; then ln -s /usr/local/lib/cloudtrain/terraform-shim /usr/local/bin/terraform; fi \
@@ -91,7 +100,8 @@ RUN set -eu; m=/opt/cloudtrain/providers/registry.terraform.io; cd /tmp \
  && cp -al /opt/cloudtrain/providers/registry.terraform.io /opt/cloudtrain/providers/registry.opentofu.org \
  && chmod -R a+rX /opt/cloudtrain
 
-COPY terraformrc /etc/cloudtrain/terraformrc
+COPY terraformrc s3.json /etc/cloudtrain/
+COPY aws-credentials aws-config /etc/cloudtrain/aws/
 COPY bashrc /etc/cloudtrain/bashrc
 COPY vimrc /etc/vim/vimrc.local
 # Non-root learner (uid/gid 1000, what the runtime's securityContext uses); the ubuntu
@@ -102,6 +112,9 @@ RUN userdel -r ubuntu 2>/dev/null; useradd -m -u 1000 -U -s /bin/bash learner \
  && install -m 0644 -o learner -g learner /etc/cloudtrain/terraformrc /home/learner/.terraformrc \
  && install -m 0644 /etc/cloudtrain/terraformrc /etc/skel/.terraformrc \
  && install -m 0644 /etc/cloudtrain/terraformrc /root/.terraformrc \
+ && install -d -m 0700 -o learner -g learner /home/learner/.aws \
+ && install -m 0600 -o learner -g learner /etc/cloudtrain/aws/aws-credentials /home/learner/.aws/credentials \
+ && install -m 0644 -o learner -g learner /etc/cloudtrain/aws/aws-config /home/learner/.aws/config \
  && . /etc/cloudtrain/iac.env \
  && printf 'CLOUDTRAIN_IMAGE=iac-ws\nIAC_CLI=%s\nTERRAFORM_VERSION=%s\nTOFU_VERSION=%s\nKUBECTL_VERSION=%s\nHELM_VERSION=%s\nYQ_VERSION=%s\n' \
       "$IAC_CLI" "$TERRAFORM_VERSION" "$TOFU_VERSION" "$KUBECTL_VERSION" "$HELM_VERSION" "$YQ_VERSION" > /etc/cloudtrain-release

@@ -1,0 +1,197 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: iac-depends-on-ordering
+  title: Fix an apply that races a Helm release against its prerequisites
+  domain: iac
+  frameworks: [tf-associate:configuration]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [terraform, dependencies, depends_on, helm, kubernetes-provider]
+  version: 1
+spec:
+  description: |
+    The telemetry collector stack in `~/stacks/collector` (initialised, never
+    applied) creates namespace `grid-telemetry`, the Secret
+    `collector-credentials` (ingest token `{{token}}`) and installs the local Helm chart
+    `charts/collector` as release `collector`. The chart refuses to install
+    when its credentials Secret does not exist yet.
+
+    On a fresh environment, `terraform apply` fails: Terraform starts the three
+    objects in parallel because nothing in the configuration says that the
+    release needs the Secret, or that both need the namespace. A second apply
+    "fixes" it, which is why nobody noticed until the disaster-recovery drill.
+
+    Fix the configuration so that **a clean apply from empty state always
+    succeeds**: the Secret is created after the namespace and the release after
+    the Secret. Prefer references between resources; use `depends_on` only where
+    there is no value to reference. Then apply the stack so the release is
+    deployed and the collector Pod runs on `sm-grid`.
+  objectives:
+    - Explain how Terraform derives ordering from references
+    - Add implicit dependencies by referencing attributes
+    - Use depends_on for dependencies that carry no value
+  params:
+    token:
+      type: choice
+      values: [tk-7f3a91c2, tk-2b8e44d0, tk-c41d7a95]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+      - name: sm-grid
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: sm-grid
+  setup:
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/main.tf, source: assets/main.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/Chart.yaml, source: assets/chart/Chart.yaml, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/values.yaml, source: assets/chart/values.yaml, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/deployment.yaml, source: assets/chart/templates/deployment.yaml, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/seed.sh, source: assets/seed.sh, mode: "0755"}
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/stacks
+    - on: workstation
+      as: learner
+      timeoutSec: 120
+      run: /var/tmp/ct-seed/seed.sh
+  teardown:
+    - on: sm-grid
+      run: kubectl delete namespace grid-telemetry --ignore-not-found --wait=false
+  checks:
+    - id: release-deployed
+      description: Helm release collector in grid-telemetry is deployed
+      type: shell
+      on: sm-grid
+      skills: [iac.targets.kubernetes-helm]
+      weight: 1.5
+      command: helm -n grid-telemetry status collector -o json 2>/dev/null | jq -r '.info.status // "missing"' || echo missing
+      expect: {match: exact, value: deployed}
+    - id: collector-running
+      description: The collector Deployment has its Pod ready with the ingest token mounted
+      type: k8s-query
+      skills: [iac.targets.kubernetes-helm]
+      query: {cluster: sm-grid, resource: deployment, name: collector, namespace: grid-telemetry, jsonpath: "{.status.readyReplicas}"}
+      expect: {match: exact, value: "1"}
+    - id: secret-after-namespace
+      description: The Secret's configuration depends on the namespace resource
+      type: shell
+      on: workstation
+      skills: [iac.language.dependencies]
+      weight: 2
+      timeoutSec: 90
+      command: |
+        ct-iac planjson /home/learner/stacks/collector | jq -r '
+          [.configuration.root_module.resources[]? | select(.type == "kubernetes_secret_v1" or .type == "kubernetes_secret")][0] as $s
+          | ([$s.expressions | .. | objects | .references? // empty | .[]] + ($s.depends_on // []))
+          | map(select(test("^kubernetes_namespace"))) | length > 0' 2>/dev/null
+      expect: {match: exact, value: "true"}
+    - id: release-after-secret
+      description: The release's configuration depends on the Secret resource
+      type: shell
+      on: workstation
+      skills: [iac.language.dependencies]
+      weight: 2
+      timeoutSec: 90
+      command: |
+        ct-iac planjson /home/learner/stacks/collector | jq -r '
+          [.configuration.root_module.resources[]? | select(.type == "helm_release")][0] as $r
+          | ([$r.expressions | .. | objects | .references? // empty | .[]] + ($r.depends_on // []))
+          | map(select(test("^kubernetes_secret"))) | length > 0' 2>/dev/null
+      expect: {match: exact, value: "true"}
+    - id: converged
+      description: A new plan of ~/stacks/collector reports no changes
+      type: shell
+      on: workstation
+      skills: [iac.foundations.workflow]
+      timeoutSec: 120
+      command: ct-iac plan /home/learner/stacks/collector
+      expect: {match: exact, value: no-changes}
+  hints:
+    - title: See what Terraform thinks
+      body: "`terraform graph` prints the dependency graph. Today the three resources only hang off their providers: nothing connects them."
+      command: cd ~/stacks/collector && terraform graph | grep -E 'kubernetes_|helm_'
+      cost: 1
+    - title: References create order
+      body: When one resource reads another's attribute, Terraform creates the other one first. `namespace = kubernetes_namespace_v1.telemetry.metadata[0].name` both names the namespace and orders after it.
+      cost: 1
+    - title: What can the release reference?
+      body: The chart value `credentialsSecret` is the Secret's name; take it from `kubernetes_secret_v1.credentials.metadata[0].name`. Where no attribute is used, `depends_on = [kubernetes_secret_v1.credentials]` states the order explicitly.
+      cost: 2
+  misconceptions:
+    - id: apply-twice
+      description: Runs apply until it succeeds instead of fixing the ordering.
+      feedback: The second apply works only because the first one left the Secret behind. On a fresh environment the race is still there. Make the release depend on the Secret.
+      expectFail: [secret-after-namespace, release-after-secret]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 400
+        run: |
+          cd ~/stacks/collector
+          iac apply -auto-approve -input=false -no-color || iac apply -auto-approve -input=false -no-color || iac apply -auto-approve -input=false -no-color
+    - id: namespace-only
+      description: Orders everything after the namespace, but the release still races the Secret.
+      feedback: Both now wait for the namespace, yet the release and the Secret still start together. The release needs the Secret too.
+      expectFail: [release-after-secret]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 400
+        run: |
+          cd ~/stacks/collector
+          sed -i 's/    namespace = "grid-telemetry"/    namespace = kubernetes_namespace_v1.telemetry.metadata[0].name/; s/  namespace = "grid-telemetry"/  namespace = kubernetes_namespace_v1.telemetry.metadata[0].name/' main.tf
+          iac apply -auto-approve -input=false -no-color || iac apply -auto-approve -input=false -no-color
+  solution:
+    explanation: |
+      The Secret now takes its namespace from the namespace resource, and the release
+      takes both its namespace and the `credentialsSecret` value from the Secret.
+      Each reference is an edge in the dependency graph, so Terraform creates the
+      namespace, then the Secret, then the release, and the chart's lookup finds the
+      Secret on the first apply.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 400
+        run: |
+          set -e
+          cd ~/stacks/collector
+          python3 - <<'PY'
+          p = "main.tf"; s = open(p).read()
+          s = s.replace('    name      = "collector-credentials"\n    namespace = "grid-telemetry"',
+                        '    name      = "collector-credentials"\n    namespace = kubernetes_namespace_v1.telemetry.metadata[0].name')
+          s = s.replace('  namespace = "grid-telemetry"\n  wait',
+                        '  namespace = kubernetes_secret_v1.credentials.metadata[0].namespace\n  wait')
+          s = s.replace('      value = "collector-credentials"', '      value = kubernetes_secret_v1.credentials.metadata[0].name')
+          open(p, "w").write(s)
+          PY
+          iac fmt
+          iac apply -auto-approve -input=false -no-color
+    alternatives:
+      - id: explicit-depends-on
+        description: Keep the literals and state the order with depends_on.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 400
+            run: |
+              set -e
+              cd ~/stacks/collector
+              python3 - <<'PY'
+              p = "main.tf"; s = open(p).read()
+              s = s.replace('  data = {\n', '  depends_on = [kubernetes_namespace_v1.telemetry]\n\n  data = {\n', 1)
+              s = s.replace('  wait      = true\n', '  wait      = true\n\n  depends_on = [kubernetes_namespace_v1.telemetry, kubernetes_secret_v1.credentials]\n', 1)
+              open(p, "w").write(s)
+              PY
+              iac fmt
+              iac apply -auto-approve -input=false -no-color

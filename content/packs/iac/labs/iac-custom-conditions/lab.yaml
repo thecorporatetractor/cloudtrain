@@ -1,0 +1,249 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: iac-custom-conditions
+  title: Guard a stack with validations, conditions and checks
+  domain: iac
+  frameworks: [tf-associate:custom-conditions]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [terraform, validation, precondition, postcondition, check-blocks]
+  version: 1
+spec:
+  description: |
+    The turbine dashboard stack in `~/stacks/dashboard` (applied on `sm-grid`)
+    keeps causing incidents: someone typed 150 instead of 15.0 MW, someone pointed
+    it at a namespace that is not billed to anyone, and a NodePort crept in. Add
+    guard rails, then apply:
+
+    1. **Validation:** `turbine_mw` must reject any value below 0.5 or above 15
+       (both limits allowed).
+    2. **Precondition:** planning must fail when the target namespace
+       (`var.namespace`) has no label `saltmarsh.example/cost-centre`. The error
+       message must contain the word `cost-centre`.
+    3. **Postcondition:** the `dashboard` Service must be of type `ClusterIP`; any
+       other type must stop the run with an error.
+    4. **Check block:** add `check "telemetry_endpoint"` that reads
+       `var.telemetry_url` with the `http` provider's data source (scoped to the
+       check block) and asserts that it answers with status 200. In this lab the
+       gateway is down, so plans and applies must show a **warning**, not fail.
+
+    Do not change the variables' defaults. Apply when done: the stack's objects
+    stay as they are and a following plan reports no changes.
+  objectives:
+    - Validate input variables
+    - Guard resources with preconditions and postconditions
+    - Report ongoing health with a check block that warns instead of failing
+  params:
+    gh:
+      type: choice
+      values: ["9.5", "12", "13.6"]
+    cc:
+      type: choice
+      values: [cc-7101, cc-7230, cc-7344]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+      - name: sm-grid
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: sm-grid
+  setup:
+    - on: sm-grid
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata:
+          name: grid-dashboards
+          labels: {saltmarsh.example/cost-centre: "{{cc}}"}
+        ---
+        apiVersion: v1
+        kind: Namespace
+        metadata:
+          name: sandbox-dashboards
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/main.tf, source: assets/main.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/seed.sh, source: assets/seed.sh, mode: "0755"}
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/stacks
+    - on: workstation
+      as: learner
+      timeoutSec: 300
+      run: /var/tmp/ct-seed/seed.sh
+  teardown:
+    - on: sm-grid
+      run: kubectl delete namespace grid-dashboards sandbox-dashboards --ignore-not-found --wait=false
+  checks:
+    - id: capacity-validation
+      description: turbine_mw rejects 16 and 0.4 with a validation error and accepts 0.5 and 15
+      type: shell
+      on: workstation
+      skills: [iac.quality.conditions, iac.language.variables]
+      weight: 1.5
+      timeoutSec: 200
+      command: |
+        d=/home/learner/stacks/dashboard; r=""
+        for v in 16 0.4 0.5 15; do
+          out=$(ct-iac run $d iac plan -input=false -lock=false -no-color -var "turbine_mw={\"X-01\"=$v}" 2>&1); rc=$?
+          if [ $rc -eq 0 ]; then r="$r $v=ok"; elif echo "$out" | grep -q 'Invalid value for variable'; then r="$r $v=invalid"; else r="$r $v=error"; fi
+        done
+        echo $r
+      expect: {match: exact, value: 16=invalid 0.4=invalid 0.5=ok 15=ok}
+    - id: namespace-precondition
+      description: Planning against a namespace without the cost-centre label fails with a condition naming cost-centre
+      type: shell
+      on: workstation
+      skills: [iac.quality.conditions]
+      weight: 2
+      timeoutSec: 120
+      command: |
+        out=$(ct-iac run /home/learner/stacks/dashboard iac plan -input=false -lock=false -no-color -var namespace=sandbox-dashboards 2>&1) && { echo planned; exit 0; }
+        echo "$out" | grep -qi 'condition failed' || { echo "other error"; exit 0; }
+        echo "$out" | grep -q 'cost-centre' && echo refused || echo "refused without cost-centre in the message"
+      expect: {match: exact, value: refused}
+    - id: service-postcondition
+      description: A dashboard Service of type NodePort stops the run with a condition error
+      type: shell
+      on: workstation
+      skills: [iac.quality.conditions]
+      weight: 1.5
+      timeoutSec: 120
+      command: |
+        out=$(ct-iac run /home/learner/stacks/dashboard iac plan -input=false -lock=false -no-color -var service_type=NodePort 2>&1) && { echo planned; exit 0; }
+        echo "$out" | grep -qi 'condition failed' && echo refused || echo "other error"
+      expect: {match: exact, value: refused}
+    - id: check-warns
+      description: The telemetry_endpoint check block reports the down gateway as a warning and the plan still succeeds
+      type: shell
+      on: workstation
+      skills: [iac.quality.conditions]
+      weight: 1.5
+      timeoutSec: 120
+      command: |
+        out=$(ct-iac run /home/learner/stacks/dashboard iac plan -input=false -lock=false -no-color 2>&1); rc=$?
+        [ $rc -eq 0 ] || { echo "plan failed"; exit 0; }
+        echo "$out" | grep -q 'Warning:' && echo "$out" | grep -q 'check "telemetry_endpoint"' && echo warned || echo "no warning"
+      expect: {match: exact, value: warned}
+    - id: objects-applied
+      description: The capacities ConfigMap and the ClusterIP dashboard Service are in grid-dashboards
+      type: shell
+      on: sm-grid
+      skills: [iac.foundations.workflow]
+      timeoutSec: 30
+      command: |
+        c=$(kubectl -n grid-dashboards get configmap turbine-capacities -o jsonpath='{.data.GH-01}' 2>/dev/null)
+        s=$(kubectl -n grid-dashboards get service dashboard -o jsonpath='{.spec.type}' 2>/dev/null)
+        echo "GH-01=$c service=$s"
+      expect: {match: exact, value: "GH-01={{gh}} service=ClusterIP"}
+    - id: converged
+      description: A new plan of ~/stacks/dashboard reports no changes
+      type: shell
+      on: workstation
+      skills: [iac.foundations.workflow]
+      timeoutSec: 120
+      command: ct-iac plan /home/learner/stacks/dashboard
+      expect: {match: exact, value: no-changes}
+  hints:
+    - title: Validating every map value
+      body: "`alltrue([for mw in values(var.turbine_mw) : mw >= 0.5 && mw <= 15])` is true only when every value is in range."
+      cost: 1
+    - title: Where conditions go
+      body: |
+        `precondition` and `postcondition` blocks live in a resource's (or data
+        source's) `lifecycle` block; `self` refers to the object in a
+        postcondition. A data source's postcondition can test what it read, for
+        example `contains(keys(self.metadata[0].labels), "saltmarsh.example/cost-centre")`.
+      cost: 2
+    - title: Check blocks
+      body: |
+        ```hcl
+        check "telemetry_endpoint" {
+          data "http" "health" {
+            url = var.telemetry_url
+          }
+          assert {
+            condition     = data.http.health.status_code == 200
+            error_message = "Telemetry gateway is not healthy."
+          }
+        }
+        ```
+        Failures inside a check block are warnings.
+      cost: 2
+  misconceptions:
+    - id: http-outside-check
+      description: Reads the health endpoint with a top-level http data source and checks it in a precondition.
+      feedback: A failing top-level data source or precondition stops every plan while the gateway is down. A data source scoped inside a check block only warns.
+      expectFail: [check-warns, converged]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 240
+        run: |
+          cd ~/stacks/dashboard
+          cat >> main.tf <<'HCL'
+
+          data "http" "health" {
+            url = var.telemetry_url
+            lifecycle {
+              postcondition {
+                condition     = self.status_code == 200
+                error_message = "Telemetry gateway is not healthy."
+              }
+            }
+          }
+          HCL
+          iac init -input=false -no-color
+          iac apply -auto-approve -input=false -no-color || true
+    - id: upper-bound-only
+      description: Validates only that capacities are at most 15.
+      feedback: A capacity of 0.4 MW is a typo too. Test both bounds for every value.
+      expectFail: [capacity-validation]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 240
+        run: |
+          cd ~/stacks/dashboard
+          python3 - <<'PY'
+          p = "main.tf"; s = open(p).read()
+          s = s.replace('  type        = map(number)\n', '  type        = map(number)\n  validation {\n    condition     = alltrue([for mw in values(var.turbine_mw) : mw <= 15])\n    error_message = "Turbine capacities must be at most 15 MW."\n  }\n', 1)
+          s = s.replace('data "kubernetes_namespace_v1" "target" {\n  metadata {\n    name = var.namespace\n  }\n}', 'data "kubernetes_namespace_v1" "target" {\n  metadata {\n    name = var.namespace\n  }\n  lifecycle {\n    postcondition {\n      condition     = contains(keys(self.metadata[0].labels), "saltmarsh.example/cost-centre")\n      error_message = "Namespace has no cost-centre label."\n    }\n  }\n}')
+          s = s.replace('      target_port = 8080\n    }\n  }\n}', '      target_port = 8080\n    }\n  }\n  lifecycle {\n    postcondition {\n      condition     = self.spec[0].type == "ClusterIP"\n      error_message = "The dashboard Service must be ClusterIP."\n    }\n  }\n}')
+          s += '\ncheck "telemetry_endpoint" {\n  data "http" "health" {\n    url = var.telemetry_url\n  }\n  assert {\n    condition     = data.http.health.status_code == 200\n    error_message = "Telemetry gateway is not healthy."\n  }\n}\n'
+          open(p, "w").write(s)
+          PY
+          iac init -input=false -no-color
+          iac apply -auto-approve -input=false -no-color
+  solution:
+    explanation: |
+      Variable validation rejects bad capacities before anything is planned. The data
+      source's postcondition tests the label it just read, so planning against an
+      unlabelled namespace stops with the message. The Service's postcondition checks
+      the planned type. The check block's scoped http data source fails to connect
+      while the gateway is down, which Terraform reports as a warning: the run goes
+      on and nothing changes.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/stacks/dashboard
+          python3 - <<'PY'
+          p = "main.tf"; s = open(p).read()
+          s = s.replace('  type        = map(number)\n', '  type        = map(number)\n  validation {\n    condition     = alltrue([for mw in values(var.turbine_mw) : mw >= 0.5 && mw <= 15])\n    error_message = "Turbine capacities must be between 0.5 and 15 MW."\n  }\n', 1)
+          s = s.replace('data "kubernetes_namespace_v1" "target" {\n  metadata {\n    name = var.namespace\n  }\n}', 'data "kubernetes_namespace_v1" "target" {\n  metadata {\n    name = var.namespace\n  }\n  lifecycle {\n    postcondition {\n      condition     = contains(keys(self.metadata[0].labels), "saltmarsh.example/cost-centre")\n      error_message = "Namespace ${var.namespace} has no saltmarsh.example/cost-centre label."\n    }\n  }\n}')
+          s = s.replace('      target_port = 8080\n    }\n  }\n}', '      target_port = 8080\n    }\n  }\n  lifecycle {\n    postcondition {\n      condition     = self.spec[0].type == "ClusterIP"\n      error_message = "The dashboard Service must be ClusterIP."\n    }\n  }\n}')
+          s += '\ncheck "telemetry_endpoint" {\n  data "http" "health" {\n    url = var.telemetry_url\n  }\n\n  assert {\n    condition     = data.http.health.status_code == 200\n    error_message = "Telemetry gateway ${var.telemetry_url} is not healthy."\n  }\n}\n'
+          open(p, "w").write(s)
+          PY
+          iac init -input=false -no-color
+          iac apply -auto-approve -input=false -no-color
+          iac plan -input=false -no-color -detailed-exitcode
