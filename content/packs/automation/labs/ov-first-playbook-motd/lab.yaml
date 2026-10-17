@@ -1,0 +1,288 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ov-first-playbook-motd
+  title: Write a first playbook that sets a compliance banner
+  domain: automation
+  frameworks: [ex294-aligned:core-components]
+  difficulty: easy
+  estimatedMinutes: 15
+  tags: [ansible, playbook, copy, become, idempotency, motd]
+  version: 1
+spec:
+  description: |
+    Compliance wants a login banner on every **claims** node (the `claims_web` and
+    `claims_db` groups), and nowhere else. Write the playbook
+    **`/home/learner/claims-automation/motd.yml`** on `ov-ctl` that makes `/etc/motd` on
+    each claims node contain exactly these three lines, owned by root with mode `0644`:
+
+    ```
+    Orrin & Vale Insurance: authorised use only
+    Host: <the host's inventory name> (<claims_web or claims_db>)
+    Support: claims-ops, extension {{ext}}
+    ```
+
+    For example, on `ov-db-1` the second line is `Host: ov-db-1 (claims_db)`. Leave
+    `ov-quote-api1` alone.
+
+    Run it with `ansible-playbook motd.yml` from the project directory (its `ansible.cfg`
+    sets the inventory and the `ovauto` user, but not privilege escalation: `/etc/motd`
+    belongs to root). A second run must report **no changes**: the grader runs your
+    playbook again and expects `changed=0`.
+
+    Look up any module with `ansible-doc`, for example `ansible-doc ansible.builtin.copy`.
+  objectives:
+    - Write a playbook with plays, hosts and tasks
+    - Escalate privileges in a play
+    - Use a file module so a re-run changes nothing
+    - Read module documentation offline with ansible-doc
+  params:
+    bootpw:
+      type: int
+      min: 100000
+      max: 999999
+    ext:
+      type: int
+      min: 2100
+      max: 2999
+  topology:
+    entry: ov-ctl
+    nodes:
+      - { name: ov-ctl, driver: container, image: ansible-ctl:2.21, access: [shell] }
+      - { name: ov-claims-web1, driver: container, image: el-lab:10, resources: { cpu: 0.2, memoryMiB: 256 } }
+      - { name: ov-claims-web2, driver: container, image: el-lab:10, resources: { cpu: 0.2, memoryMiB: 256 } }
+      - { name: ov-db-1, driver: container, image: el-lab:10, resources: { cpu: 0.2, memoryMiB: 256 } }
+      - { name: ov-quote-api1, driver: container, image: deb-lab:24.04, resources: { cpu: 0.2, memoryMiB: 256 } }
+    links:
+      - { a: "ov-ctl:eth1", b: "ov-claims-web1:eth1" }
+      - { a: "ov-ctl:eth2", b: "ov-claims-web2:eth1" }
+      - { a: "ov-ctl:eth3", b: "ov-db-1:eth1" }
+      - { a: "ov-ctl:eth4", b: "ov-quote-api1:eth1" }
+  setup:
+    - on: ov-claims-web1
+      run: &ov-node |
+        set -eu
+        case $(hostname) in
+          ov-claims-web1) a=11 ;; ov-claims-web2) a=12 ;; ov-db-1) a=21 ;; ov-quote-api1) a=31 ;;
+          *) echo "unknown host $(hostname)" >&2; exit 1 ;;
+        esac
+        ip link set eth1 up
+        ip addr replace 10.70.0.$a/24 dev eth1
+        id ovauto >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Orrin and Vale automation" ovauto
+        echo 'ovauto:Ov-boot-{{bootpw}}' | chpasswd
+        printf 'ovauto ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/ovauto
+        chmod 0440 /etc/sudoers.d/ovauto
+        ssh-keygen -A >/dev/null 2>&1
+        mkdir -p /run/sshd
+        pgrep -x sshd >/dev/null || /usr/sbin/sshd
+        { sha256sum /etc/motd 2>/dev/null || echo absent; } | cut -d' ' -f1 > /var/tmp/.ct-motd.sum
+    - { on: ov-claims-web2, run: *ov-node }
+    - { on: ov-db-1, run: *ov-node }
+    - { on: ov-quote-api1, run: *ov-node }
+    - on: ov-ctl
+      timeoutSec: 240
+      run: |
+        set -eu
+        ct-fleet-net 10.70.0.10/24 ov-claims-web1=10.70.0.11 ov-claims-web2=10.70.0.12 ov-db-1=10.70.0.21 ov-quote-api1=10.70.0.31
+        ct-ansible pushkey --seal ovauto Ov-boot-{{bootpw}} ov-claims-web1 ov-claims-web2 ov-db-1 ov-quote-api1
+        p=/home/learner/claims-automation
+        install -d -o learner -g learner $p
+        cat > $p/inventory.yml <<'EOF'
+        claims:
+          children:
+            claims_web:
+              hosts:
+                ov-claims-web1:
+                ov-claims-web2:
+            claims_db:
+              hosts:
+                ov-db-1:
+        quoting:
+          hosts:
+            ov-quote-api1:
+        EOF
+        printf '[defaults]\ninventory = inventory.yml\nremote_user = ovauto\n' > $p/ansible.cfg
+        chown learner:learner $p/inventory.yml $p/ansible.cfg
+  checks:
+    - id: motd-web1
+      description: /etc/motd on ov-claims-web1 is the banner for claims_web, root-owned, 0644
+      type: shell
+      on: ov-claims-web1
+      skills: [automation.modules.files]
+      command: &motd |
+        case $(hostname) in ov-db-1) g=claims_db ;; *) g=claims_web ;; esac
+        f=/etc/motd
+        [ -f $f ] || { echo missing; exit 0; }
+        printf 'Orrin & Vale Insurance: authorised use only\nHost: %s (%s)\nSupport: claims-ops, extension {{ext}}\n' "$(hostname)" "$g" | cmp -s - $f && c=content-ok || c=content-differs
+        echo "$c $(stat -c '%U %a' $f)"
+      expect: { match: exact, value: "content-ok root 644" }
+    - { id: motd-web2, description: "/etc/motd on ov-claims-web2 is the banner for claims_web, root-owned, 0644", type: shell, on: ov-claims-web2, skills: [automation.modules.files], command: *motd, expect: { match: exact, value: "content-ok root 644" } }
+    - { id: motd-db1, description: "/etc/motd on ov-db-1 is the banner for claims_db, root-owned, 0644", type: shell, on: ov-db-1, skills: [automation.modules.files], command: *motd, expect: { match: exact, value: "content-ok root 644" } }
+    - id: quote-untouched
+      description: /etc/motd on ov-quote-api1 is unchanged
+      type: shell
+      on: ov-quote-api1
+      skills: [automation.modules.files]
+      command: |
+        s=$({ sha256sum /etc/motd 2>/dev/null || echo absent; } | cut -d' ' -f1)
+        [ "$s" = "$(cat /var/tmp/.ct-motd.sum)" ] && echo unchanged || echo changed
+      expect: { match: exact, value: unchanged }
+    - id: rerun-no-changes
+      description: Running motd.yml again succeeds and reports no changes
+      type: shell
+      on: ov-ctl
+      skills: [automation.modules.files, automation.foundations.docs]
+      weight: 2
+      timeoutSec: 180
+      command: ct-ansible recap /home/learner/claims-automation motd.yml
+      expect: { match: exact, value: "changed=0 failed=0 unreachable=0" }
+  hints:
+    - title: The skeleton of a playbook
+      body: |
+        A playbook is a YAML list of plays. Each play names its `hosts:` (a group, or
+        several joined with `:`), can set `become: true` to run as root, and lists
+        `tasks:`, each calling one module with its arguments.
+      cost: 1
+    - title: Writing a whole file
+      body: |
+        `ansible.builtin.copy` with `content:` writes a file from text you give it, and
+        reports `changed` only when the file differs. A block scalar (`content: |`) keeps
+        the three lines readable. `ansible-doc -s ansible.builtin.copy` shows every option.
+      command: ansible-doc -s ansible.builtin.copy
+      cost: 1
+    - title: Which group am I in?
+      body: |
+        Two plays, one per group, can each write their own group name. Or one play for
+        `claims` can use the magic variable `group_names` (every group the host is in,
+        parents included) to pick the one that starts with `claims_`.
+      cost: 2
+  misconceptions:
+    - id: shell-echo
+      description: Writes the banner with a shell task, which reports changed on every run.
+      feedback: A shell or command task cannot know the file is already right, so every run reports a change. Use a file module such as copy or template.
+      expectFail: [rerun-no-changes]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 180
+        run: |
+          set -e
+          cd ~/claims-automation
+          cat > motd.yml <<'EOF'
+          - hosts: claims
+            become: true
+            tasks:
+              - ansible.builtin.shell: >-
+                  printf 'Orrin & Vale Insurance: authorised use only\nHost: %s (%s)\nSupport: claims-ops, extension {{ext}}\n'
+                  {{ inventory_hostname }} {{ group_names | select('match', 'claims_') | first }} > /etc/motd
+          EOF
+          ansible-playbook motd.yml
+    - id: every-host
+      description: Targets all hosts, so the quoting API gets a claims banner too.
+      feedback: The banner is for the claims groups only. Target claims (or the two child groups), not all.
+      expectFail: [quote-untouched]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 180
+        run: |
+          set -e
+          cd ~/claims-automation
+          cat > motd.yml <<'EOF'
+          - hosts: all
+            become: true
+            tasks:
+              - ansible.builtin.copy:
+                  dest: /etc/motd
+                  owner: root
+                  mode: "0644"
+                  content: |
+                    Orrin & Vale Insurance: authorised use only
+                    Host: {{ inventory_hostname }} ({{ group_names | select('match', 'claims_') | first | default('none') }})
+                    Support: claims-ops, extension {{ext}}
+          EOF
+          ansible-playbook motd.yml
+    - id: parent-group-name
+      description: Writes the parent group claims on every node instead of claims_web or claims_db.
+      feedback: group_names also contains the parent group claims. Each node's banner must name its own child group.
+      expectFail: [motd-web1, motd-web2, motd-db1]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 180
+        run: |
+          set -e
+          cd ~/claims-automation
+          cat > motd.yml <<'EOF'
+          - hosts: claims
+            become: true
+            tasks:
+              - ansible.builtin.copy:
+                  dest: /etc/motd
+                  owner: root
+                  mode: "0644"
+                  content: |
+                    Orrin & Vale Insurance: authorised use only
+                    Host: {{ inventory_hostname }} ({{ group_names | first }})
+                    Support: claims-ops, extension {{ext}}
+          EOF
+          ansible-playbook motd.yml
+  solution:
+    explanation: |
+      One play for the `claims` group with `become: true` and a single `copy` task. The
+      content is a block scalar; `inventory_hostname` gives the host's name and
+      `group_names | select('match', 'claims_') | first` its child group (group_names
+      also lists the parent `claims`). `copy` compares checksums, so the second run
+      reports `ok` and `changed=0`.
+    steps:
+      - on: ov-ctl
+        as: learner
+        timeoutSec: 180
+        run: |
+          set -e
+          cd ~/claims-automation
+          cat > motd.yml <<'EOF'
+          - name: Compliance banner on the claims nodes
+            hosts: claims
+            become: true
+            tasks:
+              - name: Login banner
+                ansible.builtin.copy:
+                  dest: /etc/motd
+                  owner: root
+                  group: root
+                  mode: "0644"
+                  content: |
+                    Orrin & Vale Insurance: authorised use only
+                    Host: {{ inventory_hostname }} ({{ group_names | select('match', 'claims_') | first }})
+                    Support: claims-ops, extension {{ext}}
+          EOF
+          ansible-playbook motd.yml
+          ansible-playbook motd.yml
+    alternatives:
+      - id: one-play-per-group
+        description: Two plays, one per child group, each with the group name written literally.
+        steps:
+          - on: ov-ctl
+            as: learner
+            timeoutSec: 180
+            run: |
+              set -e
+              cd ~/claims-automation
+              cat > motd.yml <<'EOF'
+              - hosts: claims_web
+                become: true
+                tasks:
+                  - ansible.builtin.copy:
+                      dest: /etc/motd
+                      mode: "0644"
+                      content: "Orrin & Vale Insurance: authorised use only\nHost: {{ inventory_hostname }} (claims_web)\nSupport: claims-ops, extension {{ext}}\n"
+              - hosts: claims_db
+                become: true
+                tasks:
+                  - ansible.builtin.copy:
+                      dest: /etc/motd
+                      mode: "0644"
+                      content: "Orrin & Vale Insurance: authorised use only\nHost: {{ inventory_hostname }} (claims_db)\nSupport: claims-ops, extension {{ext}}\n"
+              EOF
+              ansible-playbook motd.yml

@@ -1,0 +1,173 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xan-run-navigator-artifact
+  title: Run a playbook through navigator and keep its artifact
+  domain: automation
+  frameworks: [ex294-aligned:run-content]
+  difficulty: easy
+  estimatedMinutes: 8
+  tags: [exam, ansible, navigator, artifacts]
+  version: 1
+spec:
+  description: |
+    **Exam environment.** You work as `learner` on the control node `control`. The
+    managed nodes are `node1` (group `dev`), `node2` (`test`), `node3` (`prod`, also in
+    `webservers`) and `node4` (`balancers`), all Enterprise Linux 10; the account
+    `devops` on every node accepts your SSH key and may use sudo without a password.
+    Packages come from each node's local repository. Every playbook you write is run
+    again by the grader (it must report no changes), then every node is rebooted before
+    the final checks.
+
+    In **`/home/learner/exam/navigator`** (inventory, `ansible.cfg` and the playbook
+    `site.yml` are there) create the settings file **`ansible-navigator.yml`** so that
+    `ansible-navigator run site.yml`, started in that directory:
+
+    - runs **without an execution environment** (there is no container engine here);
+    - prints to **standard output** (no interactive text interface);
+    - saves its **playbook artifact** as a JSON file under
+      **`/home/learner/exam/navigator/artifacts/`**.
+
+    Then run `site.yml` through navigator so that an artifact file exists.
+  objectives:
+    - Configure ansible-navigator with a settings file
+    - Keep playbook artifacts for later review
+  topology:
+    entry: control
+    nodes:
+      - { name: control, driver: container, image: ansible-ctl:2.21, access: [shell] }
+      - { name: node1, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node2, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node3, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node4, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+  setup:
+    - on: node1
+      timeoutSec: 120
+      run: &exam-node |
+        set -eu
+        id devops >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Exam automation" devops
+        install -d -m 0700 -o devops -g devops /home/devops/.ssh
+        install -m 0600 -o devops -g devops /home/learner/.ssh/authorized_keys /home/devops/.ssh/authorized_keys
+        printf 'devops ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/devops
+        chmod 0440 /etc/sudoers.d/devops
+    - { on: node2, timeoutSec: 120, run: *exam-node }
+    - { on: node3, timeoutSec: 120, run: *exam-node }
+    - { on: node4, timeoutSec: 120, run: *exam-node }
+    - on: control
+      run: |
+        set -eu
+        p=/home/learner/exam/navigator
+        install -d -o learner -g learner /home/learner/exam $p
+        cat > $p/inventory.yml <<'EOF'
+        dev:
+          hosts:
+            node1:
+        test:
+          hosts:
+            node2:
+        prod:
+          hosts:
+            node3:
+        balancers:
+          hosts:
+            node4:
+        webservers:
+          children:
+            prod:
+        EOF
+        printf '[defaults]\ninventory = inventory.yml\nremote_user = devops\n' > $p/ansible.cfg
+        cat > $p/site.yml <<'EOF'
+        - name: Exam site check
+          hosts: all
+          gather_facts: false
+          tasks:
+            - name: Reach every node
+              ansible.builtin.ping:
+        EOF
+        chown -R learner:learner $p
+  checks:
+    - id: settings
+      description: ansible-navigator.yml disables execution environments, uses stdout mode and saves artifacts under artifacts/
+      type: shell
+      on: control
+      skills: [automation.devworkflow.navigator]
+      weight: 2
+      command: |
+        f=/home/learner/exam/navigator/ansible-navigator.yml
+        [ -f $f ] || { echo missing; exit 0; }
+        python3 - "$f" <<'PY'
+        import sys, yaml
+        n = (yaml.safe_load(open(sys.argv[1])) or {}).get("ansible-navigator", {})
+        ee = (n.get("execution-environment") or {}).get("enabled")
+        art = n.get("playbook-artifact") or {}
+        save = str(art.get("save-as", ""))
+        print(" ".join([
+            "ee-off" if ee is False else "ee-on",
+            "stdout" if n.get("mode") == "stdout" else "no-stdout",
+            "artifacts" if art.get("enable", True) is not False and save.startswith("/home/learner/exam/navigator/artifacts/") else "no-artifacts"]))
+        PY
+      expect: { match: exact, value: "ee-off stdout artifacts" }
+    - id: artifact
+      description: A playbook artifact of site.yml exists under artifacts/
+      type: shell
+      on: control
+      skills: [automation.devworkflow.navigator]
+      weight: 2
+      command: |
+        n=0
+        for f in /home/learner/exam/navigator/artifacts/*.json; do
+          [ -f "$f" ] && jq -e '.plays | length > 0' "$f" >/dev/null 2>&1 && n=$((n+1))
+        done
+        [ "$n" -gt 0 ] && echo present || echo none
+      expect: { match: exact, value: present }
+    - id: navigator-runs
+      description: ansible-navigator run site.yml succeeds non-interactively from the project
+      type: shell
+      on: control
+      skills: [automation.devworkflow.navigator]
+      timeoutSec: 180
+      command: |
+        ct-ansible run /home/learner/exam/navigator ansible-navigator run site.yml </dev/null >/dev/null 2>&1 && echo ok || echo failed
+      expect: { match: exact, value: ok }
+  exam:
+    rerun:
+      - on: control
+        timeoutSec: 600
+        run: |
+          r=$(ct-ansible recap /home/learner/exam/navigator site.yml)
+          echo "$r"
+          [ "$r" = "changed=0 failed=0 unreachable=0" ]
+  misconceptions:
+    - id: default-ee
+      description: Leaves execution environments on.
+      feedback: Without a container engine navigator cannot start an execution environment; disable it in the settings.
+      expectFail: [settings, navigator-runs]
+      mutation:
+        on: control
+        as: learner
+        timeoutSec: 180
+        run: |
+          cd ~/exam/navigator
+          printf 'ansible-navigator:\n  mode: stdout\n  playbook-artifact:\n    enable: true\n    save-as: /home/learner/exam/navigator/artifacts/{playbook_name}-artifact-{time_stamp}.json\n' > ansible-navigator.yml
+          ansible-navigator run site.yml </dev/null || true
+  solution:
+    explanation: The settings file sets execution-environment.enabled false, mode stdout and playbook-artifact.save-as under artifacts/; one navigator run then writes the artifact.
+    steps:
+      - on: control
+        as: learner
+        timeoutSec: 180
+        run: |
+          set -e
+          cd ~/exam/navigator
+          cat > ansible-navigator.yml <<'EOF'
+          ---
+          ansible-navigator:
+            execution-environment:
+              enabled: false
+            mode: stdout
+            playbook-artifact:
+              enable: true
+              save-as: /home/learner/exam/navigator/artifacts/{playbook_name}-artifact-{time_stamp}.json
+          EOF
+          mkdir -p artifacts
+          ansible-navigator run site.yml </dev/null

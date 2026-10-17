@@ -1,0 +1,175 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xan-errors-failed-when-check
+  title: Fail a play on an unacceptable command result
+  domain: automation
+  frameworks: [ex294-aligned:plays-errors]
+  difficulty: medium
+  estimatedMinutes: 10
+  tags: [exam, ansible, failed_when, register]
+  version: 1
+spec:
+  description: |
+    **Exam environment.** You work as `learner` on the control node `control`. The
+    managed nodes are `node1` (group `dev`), `node2` (`test`), `node3` (`prod`, also in
+    `webservers`) and `node4` (`balancers`), all Enterprise Linux 10; the account
+    `devops` on every node accepts your SSH key and may use sudo without a password.
+    Packages come from each node's local repository. Every playbook you write is run
+    again by the grader (it must report no changes), then every node is rebooted before
+    the final checks.
+
+    Every node has the health command **`/usr/local/bin/exam-health`**. Write
+    **`/home/learner/exam/health/health.yml`** that runs it on every node, registers its
+    output, and **fails the host** with the message **`health check failed`** when the
+    output contains **`DEGRADED`**. The play must go on for the other hosts: on every
+    healthy host a second task creates the empty file **`/var/tmp/exam-healthy`**.
+
+    The command itself only reads state: it must never be reported as a change. Run the
+    playbook (it ends with a failure on the degraded host; that is expected).
+  objectives:
+    - Register a command result and decide failure with failed_when or fail
+  params:
+    bad:
+      type: choice
+      values: [node1, node2, node3, node4]
+  topology:
+    entry: control
+    nodes:
+      - { name: control, driver: container, image: ansible-ctl:2.21, access: [shell] }
+      - { name: node1, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node2, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node3, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node4, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+  setup:
+    - on: node1
+      timeoutSec: 120
+      run: &exam-node |
+        set -eu
+        id devops >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Exam automation" devops
+        install -d -m 0700 -o devops -g devops /home/devops/.ssh
+        install -m 0600 -o devops -g devops /home/learner/.ssh/authorized_keys /home/devops/.ssh/authorized_keys
+        printf 'devops ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/devops
+        chmod 0440 /etc/sudoers.d/devops
+    - { on: node2, timeoutSec: 120, run: *exam-node }
+    - { on: node3, timeoutSec: 120, run: *exam-node }
+    - { on: node4, timeoutSec: 120, run: *exam-node }
+    - on: node1
+      run: &health |
+        set -eu
+        if [ "$(hostname -s)" = "{{bad}}" ]; then s=DEGRADED; else s=OK; fi
+        printf '#!/bin/sh\necho "exam-health 2.1"\necho "status: %s"\n' "$s" > /usr/local/bin/exam-health
+        chmod 0755 /usr/local/bin/exam-health
+    - { on: node2, run: *health }
+    - { on: node3, run: *health }
+    - { on: node4, run: *health }
+    - on: control
+      run: |
+        set -eu
+        p=/home/learner/exam/health
+        install -d -o learner -g learner /home/learner/exam $p
+        cat > $p/inventory.yml <<'EOF'
+        dev:
+          hosts:
+            node1:
+        test:
+          hosts:
+            node2:
+        prod:
+          hosts:
+            node3:
+        balancers:
+          hosts:
+            node4:
+        webservers:
+          children:
+            prod:
+        EOF
+        printf '[defaults]\ninventory = inventory.yml\nremote_user = devops\n' > $p/ansible.cfg
+        chown -R learner:learner $p
+  checks:
+    - id: marker-node1
+      description: The marker exists on node1 exactly when node1 is healthy
+      type: shell
+      on: node1
+      skills: [automation.control-flow.error-handling]
+      command: &marker |
+        if [ "$(hostname -s)" = "{{bad}}" ]; then want=absent; else want=present; fi
+        [ -e /var/tmp/exam-healthy ] && got=present || got=absent
+        [ "$want" = "$got" ] && echo correct || echo "marker-$got"
+      expect: { match: exact, value: correct }
+    - { id: marker-node2, description: The marker exists on node2 exactly when node2 is healthy, type: shell, on: node2, skills: [automation.control-flow.error-handling], command: *marker, expect: { match: exact, value: correct } }
+    - { id: marker-node3, description: The marker exists on node3 exactly when node3 is healthy, type: shell, on: node3, skills: [automation.control-flow.error-handling], command: *marker, expect: { match: exact, value: correct } }
+    - { id: marker-node4, description: The marker exists on node4 exactly when node4 is healthy, type: shell, on: node4, skills: [automation.control-flow.error-handling], command: *marker, expect: { match: exact, value: correct } }
+    - id: fails-with-message
+      description: Running health.yml fails only the degraded host, with the required message
+      type: shell
+      on: control
+      skills: [automation.control-flow.error-handling]
+      weight: 2
+      timeoutSec: 300
+      command: |
+        out=$(ct-ansible run /home/learner/exam/health env ANSIBLE_NOCOLOR=1 ansible-playbook health.yml 2>&1)
+        f=$(echo "$out" | grep -oE '^fatal: \[node[0-9]\]' | grep -oE 'node[0-9]' | sort -u | tr '\n' ' ' | sed 's/ $//')
+        echo "$out" | grep -q 'health check failed' && m=message || m=no-message
+        echo "failed=$f $m"
+      expect: { match: exact, value: "failed={{bad}} message" }
+  exam:
+    rerun:
+      - on: control
+        timeoutSec: 600
+        run: |
+          r=$(ct-ansible recap /home/learner/exam/health health.yml)
+          echo "$r"
+          [ "$r" = "changed=0 failed=1 unreachable=0" ]
+  misconceptions:
+    - id: stops-everything
+      description: Uses any_errors_fatal, so one degraded host stops the play everywhere.
+      feedback: Only the degraded host may fail; the others must still get their marker.
+      expectFail: [marker-node1, marker-node2, marker-node3, marker-node4]
+      mutation:
+        on: control
+        as: learner
+        timeoutSec: 300
+        run: |
+          cd ~/exam/health
+          cat > health.yml <<'EOF'
+          - hosts: all
+            become: true
+            any_errors_fatal: true
+            tasks:
+              - ansible.builtin.command: /usr/local/bin/exam-health
+                register: h
+                changed_when: false
+                failed_when: "'DEGRADED' in h.stdout"
+              - ansible.builtin.copy: { dest: /var/tmp/exam-healthy, content: "" }
+          EOF
+          ansible-playbook health.yml || true
+  solution:
+    explanation: failed_when tests the registered stdout; changed_when false keeps the read-only command from reporting a change; a fail task with when gives the required message.
+    steps:
+      - on: control
+        as: learner
+        timeoutSec: 300
+        run: |
+          cd ~/exam/health
+          cat > health.yml <<'EOF'
+          - name: Node health
+            hosts: all
+            become: true
+            tasks:
+              - name: Health command
+                ansible.builtin.command: /usr/local/bin/exam-health
+                register: health
+                changed_when: false
+              - name: Degraded nodes fail
+                ansible.builtin.fail:
+                  msg: health check failed
+                when: "'DEGRADED' in health.stdout"
+              - name: Healthy marker
+                ansible.builtin.copy:
+                  dest: /var/tmp/exam-healthy
+                  content: ""
+                  mode: "0644"
+          EOF
+          ansible-playbook health.yml || true

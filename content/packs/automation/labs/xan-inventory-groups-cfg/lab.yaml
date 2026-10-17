@@ -1,0 +1,157 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xan-inventory-groups-cfg
+  title: Build the exam inventory and project configuration
+  domain: automation
+  frameworks: [ex294-aligned:config-inventory]
+  difficulty: easy
+  estimatedMinutes: 10
+  tags: [exam, ansible, inventory, ansible-cfg]
+  version: 1
+spec:
+  description: |
+    **Exam environment.** You work as `learner` on the control node `control`. The
+    managed nodes are `node1` (group `dev`), `node2` (`test`), `node3` (`prod`, also in
+    `webservers`) and `node4` (`balancers`), all Enterprise Linux 10; the account
+    `devops` on every node accepts your SSH key and may use sudo without a password.
+    Packages come from each node's local repository. Every playbook you write is run
+    again by the grader (it must report no changes), then every node is rebooted before
+    the final checks.
+
+    In **`/home/learner/exam/inventory`** (it exists and is empty) create:
+
+    1. an inventory file **`inventory`** (INI or YAML) with the groups `dev` (`node1`),
+       `test` (`node2`), `prod` (`node3`) and `balancers` (`node4`), and a group
+       **`webservers`** whose only member is the group `prod`;
+    2. an **`ansible.cfg`** in the same directory that sets that inventory, the roles path
+       `/home/learner/exam/inventory/roles`, the collections path
+       `/home/learner/exam/inventory/collections` and the remote user `devops`.
+
+    From that directory `ansible all -m ansible.builtin.ping` must then succeed for all
+    four nodes without further options.
+  objectives:
+    - Write an inventory with groups and a group of groups
+    - Configure a project with ansible.cfg
+  topology:
+    entry: control
+    nodes:
+      - { name: control, driver: container, image: ansible-ctl:2.21, access: [shell] }
+      - { name: node1, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node2, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node3, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node4, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+  setup:
+    - on: node1
+      timeoutSec: 120
+      run: &exam-node |
+        set -eu
+        id devops >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Exam automation" devops
+        install -d -m 0700 -o devops -g devops /home/devops/.ssh
+        install -m 0600 -o devops -g devops /home/learner/.ssh/authorized_keys /home/devops/.ssh/authorized_keys
+        printf 'devops ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/devops
+        chmod 0440 /etc/sudoers.d/devops
+    - { on: node2, timeoutSec: 120, run: *exam-node }
+    - { on: node3, timeoutSec: 120, run: *exam-node }
+    - { on: node4, timeoutSec: 120, run: *exam-node }
+    - on: control
+      run: install -d -o learner -g learner /home/learner/exam /home/learner/exam/inventory
+  checks:
+    - id: groups
+      description: The inventory defines dev, test, prod, balancers and webservers with the right members
+      type: shell
+      on: control
+      skills: [automation.inventory.static]
+      weight: 2
+      timeoutSec: 60
+      command: |
+        cd /home/learner/exam/inventory 2>/dev/null && [ -f inventory ] || { echo missing; exit 0; }
+        ct-ansible run . ansible-inventory -i inventory --list 2>/dev/null | jq -r '
+          def h(g): ((.[g].hosts // []) | sort | join(","));
+          "dev=" + h("dev") + " test=" + h("test") + " prod=" + h("prod") + " balancers=" + h("balancers")
+          + " webservers=[" + h("webservers") + "|" + ((.webservers.children // []) | sort | join(",")) + "]"' 2>/dev/null || echo unreadable
+      expect: { match: exact, value: "dev=node1 test=node2 prod=node3 balancers=node4 webservers=[|prod]" }
+    - id: config
+      description: ansible.cfg sets the inventory, roles path, collections path and remote user
+      type: shell
+      on: control
+      skills: [automation.foundations.config]
+      weight: 2
+      timeoutSec: 60
+      command: |
+        p=/home/learner/exam/inventory
+        ct-ansible run $p ansible-config dump --only-changed --format json 2>/dev/null | jq -r --arg p "$p" '
+          def v(n): (map(select(.name? == n)) | .[0].value);
+          def has(n; x): ((v(n) // []) | if type == "array" then index(x) != null else . == x end);
+          [ (if v("CONFIG_FILE") == ($p + "/ansible.cfg") then "file" else "nofile" end),
+            (if has("DEFAULT_HOST_LIST"; $p + "/inventory") then "inventory" else "noinventory" end),
+            (if has("DEFAULT_ROLES_PATH"; $p + "/roles") then "roles" else "noroles" end),
+            (if has("COLLECTIONS_PATHS"; $p + "/collections") then "collections" else "nocollections" end),
+            (if v("DEFAULT_REMOTE_USER") == "devops" then "devops" else "nouser" end) ] | join(" ")' 2>/dev/null || echo unreadable
+      expect: { match: exact, value: "file inventory roles collections devops" }
+    - id: ping
+      description: A bare ping from the project directory reaches all four nodes
+      type: shell
+      on: control
+      skills: [automation.foundations.adhoc]
+      timeoutSec: 120
+      command: |
+        n=$(ct-ansible run /home/learner/exam/inventory ansible all -m ansible.builtin.ping -o 2>/dev/null | grep -c ' | SUCCESS ')
+        echo "pong=$n"
+      expect: { match: exact, value: "pong=4" }
+  misconceptions:
+    - id: webservers-host
+      description: Puts node3 into webservers directly instead of making prod its child group.
+      feedback: webservers must contain the group prod, not the host.
+      expectFail: [groups]
+      mutation:
+        on: control
+        as: learner
+        run: |
+          cd ~/exam/inventory
+          printf '[dev]\nnode1\n[test]\nnode2\n[prod]\nnode3\n[balancers]\nnode4\n[webservers]\nnode3\n' > inventory
+          printf '[defaults]\ninventory = inventory\nroles_path = /home/learner/exam/inventory/roles\ncollections_path = /home/learner/exam/inventory/collections\nremote_user = devops\n' > ansible.cfg
+    - id: no-remote-user
+      description: Leaves the remote user out of ansible.cfg.
+      feedback: Without remote_user the connection uses your own account name.
+      expectFail: [config]
+      mutation:
+        on: control
+        as: learner
+        run: |
+          cd ~/exam/inventory
+          printf '[dev]\nnode1\n[test]\nnode2\n[prod]\nnode3\n[balancers]\nnode4\n[webservers:children]\nprod\n' > inventory
+          printf '[defaults]\ninventory = inventory\nroles_path = /home/learner/exam/inventory/roles\ncollections_path = /home/learner/exam/inventory/collections\n' > ansible.cfg
+  solution:
+    explanation: An INI inventory with a [webservers:children] section, and [defaults] keys inventory, roles_path, collections_path and remote_user.
+    steps:
+      - on: control
+        as: learner
+        timeoutSec: 120
+        run: |
+          set -e
+          cd ~/exam/inventory
+          printf '[dev]\nnode1\n\n[test]\nnode2\n\n[prod]\nnode3\n\n[balancers]\nnode4\n\n[webservers:children]\nprod\n' > inventory
+          printf '[defaults]\ninventory = /home/learner/exam/inventory/inventory\nroles_path = /home/learner/exam/inventory/roles\ncollections_path = /home/learner/exam/inventory/collections\nremote_user = devops\n' > ansible.cfg
+          ansible all -m ansible.builtin.ping
+    alternatives:
+      - id: yaml
+        description: The same inventory in YAML format, relative paths in ansible.cfg.
+        steps:
+          - on: control
+            as: learner
+            timeoutSec: 120
+            run: |
+              set -e
+              cd ~/exam/inventory
+              cat > inventory <<'EOF'
+              all:
+                children:
+                  dev: { hosts: { node1: } }
+                  test: { hosts: { node2: } }
+                  prod: { hosts: { node3: } }
+                  balancers: { hosts: { node4: } }
+                  webservers: { children: { prod: } }
+              EOF
+              printf '[defaults]\ninventory = ./inventory\nroles_path = ./roles\ncollections_path = ./collections\nremote_user = devops\n' > ansible.cfg
+              ansible all -m ansible.builtin.ping

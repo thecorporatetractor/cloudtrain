@@ -1,0 +1,205 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xan-sys-boot-target-sysctl
+  title: Set the default target and a persistent kernel parameter
+  domain: automation
+  frameworks: [ex294-aligned:automate-system-tasks]
+  difficulty: easy
+  estimatedMinutes: 10
+  tags: [exam, ansible, systemd, sysctl, persistence]
+  version: 1
+spec:
+  description: |
+    **Exam environment.** You work as `learner` on the control node `control`. The
+    managed nodes are `node1` (group `dev`), `node2` (`test`), `node3` (`prod`, also in
+    `webservers`) and `node4` (`balancers`), all Enterprise Linux 10; the account
+    `devops` on every node accepts your SSH key and may use sudo without a password.
+    Packages come from each node's local repository. Every playbook you write is run
+    again by the grader (it must report no changes), then every node is rebooted before
+    the final checks.
+
+    Write the playbook **`/home/learner/exam/boot/boot.yml`** (the directory has an
+    inventory and an `ansible.cfg` with the remote user `devops`) that:
+
+    - makes **`multi-user.target`** the default boot target on **all** nodes;
+    - sets the kernel parameter **`vm.swappiness`** to **`{{swap}}`** on the **prod** hosts,
+      persistently, and leaves it alone everywhere else.
+
+    Run it. Both settings must still be in effect after the nodes reboot.
+  objectives:
+    - Manage systemd boot targets idempotently
+    - Set kernel parameters persistently with the sysctl module
+  params:
+    swap:
+      type: int
+      min: 5
+      max: 25
+  topology:
+    entry: control
+    nodes:
+      - { name: control, driver: container, image: ansible-ctl:2.21, access: [shell] }
+      - { name: node1, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node2, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node3, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node4, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+  setup:
+    - on: node1
+      timeoutSec: 120
+      run: &exam-node |
+        set -eu
+        id devops >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Exam automation" devops
+        install -d -m 0700 -o devops -g devops /home/devops/.ssh
+        install -m 0600 -o devops -g devops /home/learner/.ssh/authorized_keys /home/devops/.ssh/authorized_keys
+        printf 'devops ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/devops
+        chmod 0440 /etc/sudoers.d/devops
+    - { on: node2, timeoutSec: 120, run: *exam-node }
+    - { on: node3, timeoutSec: 120, run: *exam-node }
+    - { on: node4, timeoutSec: 120, run: *exam-node }
+    - on: node1
+      run: &graphical |
+        set -eu
+        [ -f /var/tmp/.ct-boot-seeded ] || { systemctl set-default graphical.target >/dev/null 2>&1; sysctl -n vm.swappiness > /var/tmp/.ct-swappiness; touch /var/tmp/.ct-boot-seeded; }
+    - { on: node2, run: *graphical }
+    - { on: node3, run: *graphical }
+    - { on: node4, run: *graphical }
+    - on: control
+      run: |
+        set -eu
+        p=/home/learner/exam/boot
+        install -d -o learner -g learner /home/learner/exam $p
+        cat > $p/inventory.yml <<'EOF'
+        dev:
+          hosts:
+            node1:
+        test:
+          hosts:
+            node2:
+        prod:
+          hosts:
+            node3:
+        balancers:
+          hosts:
+            node4:
+        webservers:
+          children:
+            prod:
+        EOF
+        printf '[defaults]\ninventory = inventory.yml\nremote_user = devops\n' > $p/ansible.cfg
+        chown -R learner:learner $p
+  checks:
+    - id: target-node1
+      description: multi-user.target is the default on node1
+      type: shell
+      on: node1
+      skills: [automation.modules.packages-services]
+      command: &target systemctl get-default
+      expect: { match: exact, value: multi-user.target }
+    - { id: target-node2, description: multi-user.target is the default on node2, type: shell, on: node2, skills: [automation.modules.packages-services], command: *target, expect: { match: exact, value: multi-user.target } }
+    - { id: target-node3, description: multi-user.target is the default on node3, type: shell, on: node3, skills: [automation.modules.packages-services], command: *target, expect: { match: exact, value: multi-user.target } }
+    - { id: target-node4, description: multi-user.target is the default on node4, type: shell, on: node4, skills: [automation.modules.packages-services], command: *target, expect: { match: exact, value: multi-user.target } }
+    - id: swappiness-prod
+      description: vm.swappiness is the required value on node3, at runtime and in a sysctl file
+      type: shell
+      on: node3
+      skills: [automation.modules.packages-services]
+      weight: 2
+      command: |
+        r=$(sysctl -n vm.swappiness)
+        grep -rqsE '^[[:space:]]*vm\.swappiness[[:space:]]*=[[:space:]]*{{swap}}[[:space:]]*$' /etc/sysctl.conf /etc/sysctl.d/ && f=persistent || f=runtime-only
+        echo "$r $f"
+      expect: { match: exact, value: "{{swap}} persistent" }
+    - id: swappiness-others
+      description: vm.swappiness is unchanged on node1
+      type: shell
+      on: node1
+      skills: [automation.modules.packages-services]
+      command: '[ "$(sysctl -n vm.swappiness)" = "$(cat /var/tmp/.ct-swappiness)" ] && echo unchanged || echo changed'
+      expect: { match: exact, value: unchanged }
+  exam:
+    rerun:
+      - on: control
+        timeoutSec: 600
+        run: |
+          r=$(ct-ansible recap /home/learner/exam/boot boot.yml)
+          echo "$r"
+          [ "$r" = "changed=0 failed=0 unreachable=0" ]
+  misconceptions:
+    - id: runtime-only
+      description: Sets swappiness with sysctl -w only, so the reboot resets it.
+      feedback: A runtime change does not survive a reboot; the value must be written to a sysctl configuration file too.
+      expectFail: [swappiness-prod]
+      mutation:
+        on: control
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/exam/boot
+          cat > boot.yml <<'EOF'
+          - hosts: all
+            become: true
+            tasks:
+              - ansible.builtin.command: systemctl set-default multi-user.target
+                changed_when: false
+          - hosts: prod
+            become: true
+            tasks:
+              - ansible.builtin.command: sysctl -w vm.swappiness={{swap}}
+                changed_when: false
+          EOF
+          ansible-playbook boot.yml
+    - id: all-hosts-swappiness
+      description: Sets swappiness on every node.
+      feedback: Only the prod hosts get the new value.
+      expectFail: [swappiness-others]
+      mutation:
+        on: control
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/exam/boot
+          cat > boot.yml <<'EOF'
+          - hosts: all
+            become: true
+            tasks:
+              - ansible.posix.sysctl: { name: vm.swappiness, value: "{{swap}}", sysctl_file: /etc/sysctl.d/90-exam.conf }
+          EOF
+          ansible-playbook boot.yml
+  solution:
+    explanation: |
+      systemctl get-default is compared before set-default runs, so the task only changes
+      a node that is not on multi-user yet; ansible.posix.sysctl writes the value to a
+      sysctl file and applies it at once.
+    steps:
+      - on: control
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/exam/boot
+          cat > boot.yml <<'EOF'
+          - name: Default boot target
+            hosts: all
+            become: true
+            tasks:
+              - name: Current default
+                ansible.builtin.command: systemctl get-default
+                register: target
+                changed_when: false
+              - name: multi-user as default
+                ansible.builtin.command: systemctl set-default multi-user.target
+                when: target.stdout != 'multi-user.target'
+          - name: Swappiness on prod
+            hosts: prod
+            become: true
+            tasks:
+              - name: vm.swappiness
+                ansible.posix.sysctl:
+                  name: vm.swappiness
+                  value: "{{swap}}"
+                  sysctl_file: /etc/sysctl.d/90-exam.conf
+                  state: present
+          EOF
+          ansible-playbook boot.yml

@@ -1,0 +1,200 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xan-errors-block-rescue-file
+  title: Fall back when a configuration file is missing
+  domain: automation
+  frameworks: [ex294-aligned:plays-errors]
+  difficulty: medium
+  estimatedMinutes: 12
+  tags: [exam, ansible, block, rescue, always, lineinfile]
+  version: 1
+spec:
+  description: |
+    **Exam environment.** You work as `learner` on the control node `control`. The
+    managed nodes are `node1` (group `dev`), `node2` (`test`), `node3` (`prod`, also in
+    `webservers`) and `node4` (`balancers`), all Enterprise Linux 10; the account
+    `devops` on every node accepts your SSH key and may use sudo without a password.
+    Packages come from each node's local repository. Every playbook you write is run
+    again by the grader (it must report no changes), then every node is rebooted before
+    the final checks.
+
+    Write **`/home/learner/exam/rescue/rescue.yml`** for all nodes that:
+
+    1. adds the line **`exam_run={{mode}}`** to **`/etc/exam/app.conf`**, once;
+    2. where `/etc/exam/app.conf` does not exist, the attempt must fail and be
+       **rescued**: create the file from the template
+       `/home/learner/exam/rescue/templates/app.conf.j2` (it is there), then add the line;
+    3. **always**, whatever happened, appends a line `<timestamp> <inventory host name>
+       exam run` to **`/var/log/exam-run.log`**, with the timestamp in ISO 8601 form such
+       as `2026-10-17T21:15:03Z`.
+
+    Do not create the file in advance with another task: use `block`, `rescue` and
+    `always`. Run the playbook. (The always line is appended on every run; that is the
+    only change a re-run may report.)
+  objectives:
+    - Handle task failures with block, rescue and always
+  params:
+    mode:
+      type: choice
+      values: [audited, strict, verbose]
+  topology:
+    entry: control
+    nodes:
+      - { name: control, driver: container, image: ansible-ctl:2.21, access: [shell] }
+      - { name: node1, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node2, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node3, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node4, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+  setup:
+    - on: node1
+      timeoutSec: 120
+      run: &exam-node |
+        set -eu
+        id devops >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Exam automation" devops
+        install -d -m 0700 -o devops -g devops /home/devops/.ssh
+        install -m 0600 -o devops -g devops /home/learner/.ssh/authorized_keys /home/devops/.ssh/authorized_keys
+        printf 'devops ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/devops
+        chmod 0440 /etc/sudoers.d/devops
+    - { on: node2, timeoutSec: 120, run: *exam-node }
+    - { on: node3, timeoutSec: 120, run: *exam-node }
+    - { on: node4, timeoutSec: 120, run: *exam-node }
+    - on: node1
+      run: &appconf |
+        set -eu
+        [ -f /var/tmp/.ct-rescue-seeded ] && exit 0
+        install -d -m 0755 /etc/exam
+        case $(hostname) in node1*|node2*) printf '# app config\nmode=standard\n' > /etc/exam/app.conf ;; *) rm -f /etc/exam/app.conf ;; esac
+        touch /var/tmp/.ct-rescue-seeded
+    - { on: node2, run: *appconf }
+    - { on: node3, run: *appconf }
+    - { on: node4, run: *appconf }
+    - on: control
+      run: |
+        set -eu
+        p=/home/learner/exam/rescue
+        install -d -o learner -g learner /home/learner/exam $p
+        cat > $p/inventory.yml <<'EOF'
+        dev:
+          hosts:
+            node1:
+        test:
+          hosts:
+            node2:
+        prod:
+          hosts:
+            node3:
+        balancers:
+          hosts:
+            node4:
+        webservers:
+          children:
+            prod:
+        EOF
+        printf '[defaults]\ninventory = inventory.yml\nremote_user = devops\n' > $p/ansible.cfg
+        install -d $p/templates
+        printf '# generated for {{ inventory_hostname }}\nmode=standard\n' > $p/templates/app.conf.j2
+        chown -R learner:learner $p
+  checks:
+    - id: kept-node1
+      description: node1 keeps its file and has the line exactly once
+      type: shell
+      on: node1
+      skills: [automation.control-flow.error-handling]
+      command: &kept |
+        f=/etc/exam/app.conf
+        [ -f $f ] || { echo missing; exit 0; }
+        echo "head=$(head -1 $f | cut -c1-12) lines=$(grep -cx 'exam_run={{mode}}' $f)"
+      expect: { match: exact, value: "head=# app config lines=1" }
+    - id: rescued-node3
+      description: node3 got the file from the template and has the line exactly once
+      type: shell
+      on: node3
+      skills: [automation.control-flow.error-handling]
+      weight: 2
+      command: &rescued |
+        f=/etc/exam/app.conf
+        [ -f $f ] || { echo missing; exit 0; }
+        echo "head=$(head -1 $f) lines=$(grep -cx 'exam_run={{mode}}' $f)"
+      expect: { match: exact, value: "head=# generated for node3 lines=1" }
+    - { id: rescued-node4, description: node4 got the file from the template and has the line exactly once, type: shell, on: node4, skills: [automation.control-flow.error-handling], weight: 2, command: *rescued, expect: { match: exact, value: "head=# generated for node4 lines=1" } }
+    - id: always-log
+      description: Every run left a timestamped line in /var/log/exam-run.log on node2 and node4
+      type: shell
+      on: node2
+      skills: [automation.control-flow.error-handling]
+      command: &log |
+        h=$(hostname -s)
+        n=$(grep -cE "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?(Z|[+-][0-9]{2}:?[0-9]{2})? $h exam run$" /var/log/exam-run.log 2>/dev/null)
+        [ "${n:-0}" -ge 1 ] && echo logged || echo not-logged
+      expect: { match: exact, value: logged }
+    - { id: always-log-node4, description: The rescued node4 also logged its run, type: shell, on: node4, skills: [automation.control-flow.error-handling], command: *log, expect: { match: exact, value: logged } }
+  exam:
+    rerun:
+      - on: control
+        timeoutSec: 600
+        run: |
+          r=$(ct-ansible recap /home/learner/exam/rescue rescue.yml)
+          echo "$r"
+          case $r in *" failed=0 unreachable=0") true ;; *) false ;; esac
+  misconceptions:
+    - id: no-rescue
+      description: Adds the line without a rescue, so the play fails where the file is missing.
+      feedback: Hosts without the file must be rescued from the template.
+      expectFail: [rescued-node3, rescued-node4]
+      mutation:
+        on: control
+        as: learner
+        timeoutSec: 300
+        run: |
+          cd ~/exam/rescue
+          cat > rescue.yml <<'EOF'
+          - hosts: all
+            become: true
+            tasks:
+              - ansible.builtin.lineinfile: { path: /etc/exam/app.conf, line: "exam_run={{mode}}" }
+              - ansible.builtin.shell: echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) {{ inventory_hostname }} exam run" >> /var/log/exam-run.log
+          EOF
+          ansible-playbook rescue.yml || true
+  solution:
+    explanation: |
+      lineinfile without create fails on a missing file; the rescue templates the file
+      and repeats the line; always appends the log line with the date filter or
+      ansible_date_time.
+    steps:
+      - on: control
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/exam/rescue
+          cat > rescue.yml <<'EOF'
+          - name: App configuration with a fallback
+            hosts: all
+            become: true
+            tasks:
+              - name: Configure the app
+                block:
+                  - name: Run mode
+                    ansible.builtin.lineinfile:
+                      path: /etc/exam/app.conf
+                      line: exam_run={{mode}}
+                rescue:
+                  - name: File from the template
+                    ansible.builtin.template:
+                      src: templates/app.conf.j2
+                      dest: /etc/exam/app.conf
+                      mode: "0644"
+                  - name: Run mode
+                    ansible.builtin.lineinfile:
+                      path: /etc/exam/app.conf
+                      line: exam_run={{mode}}
+                always:
+                  - name: Run log
+                    ansible.builtin.lineinfile:
+                      path: /var/log/exam-run.log
+                      line: "{{ now(utc=true).strftime('%Y-%m-%dT%H:%M:%SZ') }} {{ inventory_hostname }} exam run"
+                      create: true
+                      mode: "0644"
+          EOF
+          ansible-playbook rescue.yml
