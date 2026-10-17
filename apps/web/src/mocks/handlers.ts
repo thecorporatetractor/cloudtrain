@@ -2,7 +2,7 @@ import { http, HttpResponse, delay } from 'msw';
 import type { CheckResult, LabSession, StudioDraft, ValidateResponse, VerificationGate } from '@/api/types';
 import { domains, labById, labSummaries, paths } from './fixtures/labs';
 import { frameworks, skillStates, skills } from './fixtures/skills';
-import { homeData } from './fixtures/home';
+import { COLD_START_USER, coldHomeData, homeData } from './fixtures/home';
 import { myAssignments, personById, skillStatesOf, teamSeedById, userRef } from './fixtures/platform';
 import { drafts as seedDrafts, freshGates, specFromPrompt } from './fixtures/studio';
 import { allPlatformHandlers, currentSession, currentUser, mockNotices } from './platformHandlers';
@@ -136,12 +136,18 @@ const coreHandlers = [
     if (!s) return HttpResponse.json({ error: 'Not signed in', code: 'unauthenticated' }, { status: 401 });
     // The recommendations and goal are the sample learner model; the greeting and assignments follow the persona.
     const p = personById.get(s.userId);
+    if (s.userId === COLD_START_USER) return HttpResponse.json(coldHomeData);
     const learner = p ? { ...homeData.learner, id: p.id, name: p.name, email: p.email, team: p.teams[0] ? (teamSeedById(p.teams[0].teamId)?.name ?? '') : '' } : homeData.learner;
     return HttpResponse.json({ ...homeData, learner, assignmentsDue: myAssignments(s.userId).filter((a) => a.status !== 'completed').slice(0, 5), source: 'live' });
   }),
 
   http.get('/api/catalog', async () => {
     await latency();
+    // The new learner has finished nothing; only the lab they opened shows as started.
+    if (currentSession()?.userId === COLD_START_USER) {
+      const started = coldHomeData.resume?.labId;
+      return HttpResponse.json({ domains, paths: paths.map((p) => ({ ...p, progress: 0 })), labs: labSummaries.map(({ bestScore: _b, ...l }) => ({ ...l, completion: l.id === started ? 'in-progress' : 'new' })) });
+    }
     return HttpResponse.json({ domains, paths, labs: labSummaries });
   }),
   http.get('/api/labs/:id', async ({ params }) => {

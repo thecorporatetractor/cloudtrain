@@ -19,7 +19,7 @@ import { authorize, can, type AuthzTarget } from '../authz.js';
 import type { Tx } from '../db/index.js';
 import type { AssignmentRow } from '../db/schema.js';
 import { badRequest, notFound } from '../errors.js';
-import { competencyMastery, minutesSince, readinessOf, skillStates } from '../learner/home.js';
+import { competencyMastery, environmentMinutesSince, readinessOf, skillStates } from '../learner/home.js';
 import { actorOf, audit } from './audit.js';
 import { decodeCursor, encodeCursor, pageLimit, userRef, type PlatformService } from './service.js';
 
@@ -137,7 +137,7 @@ export async function dashboard(ps: PlatformService, p: Principal, teamId: strin
         role: m.role,
         mastery: competencyMastery(ps.content, mu),
         readiness: Object.fromEntries(frameworks.map((f) => [f.id, readinessOf(ps.content, f.id, mu)])) as Partial<Record<FrameworkId, number>>,
-        minutesThisMonth: minutesSince(mine, monthStart),
+        minutesThisMonth: environmentMinutesSince(mine, monthStart),
         attemptsThisMonth: mine.filter((a) => a.started_at >= monthStart).length,
         ...(last ? { lastActiveAt: last.toISOString() } : {}),
         assignments: counts,
@@ -203,7 +203,7 @@ export async function memberDetail(ps: PlatformService, p: Principal, teamId: st
       readiness: Object.fromEntries(ps.content.frameworks.map((f) => [f.id, readinessOf(ps.content, f.id, mu)])) as Partial<Record<FrameworkId, number>>,
       attempts: attempts.items,
       assignments: await ps.myAssignmentsTx(tx, userId),
-      minutesThisMonth: minutesSince(lite, new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1))),
+      minutesThisMonth: environmentMinutesSince(lite, new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1))),
     };
   });
 }

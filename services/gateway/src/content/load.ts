@@ -84,7 +84,7 @@ const DOMAIN_OF: Record<string, Domain> = {
 };
 /** Always listed; the wave-2 domains appear once they have labs. */
 const CORE_DOMAINS: readonly Domain[] = ['kubernetes', 'linux', 'networking'];
-const FRAMEWORK_IDS: readonly FrameworkId[] = ['cka', 'cks', 'lfcs', 'ccna'];
+const FRAMEWORK_IDS: readonly FrameworkId[] = ['cka', 'ckad', 'cks', 'lfcs', 'ccna'];
 
 const DOMAIN_INFO: Record<Domain, { name: string; tagline: string }> = {
   kubernetes: { name: 'Kubernetes', tagline: 'Real kubeadm and virtual clusters, from etcd to admission.' },

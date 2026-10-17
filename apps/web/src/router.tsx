@@ -121,7 +121,7 @@ export interface SkillsSearch {
   /** Another team member's skills (managers and admins). */
   member?: string;
 }
-const FRAMEWORKS: FrameworkId[] = ['cka', 'cks', 'lfcs', 'ccna'];
+const FRAMEWORKS: FrameworkId[] = ['cka', 'ckad', 'cks', 'lfcs', 'ccna'];
 export const skillsRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: '/skills',
