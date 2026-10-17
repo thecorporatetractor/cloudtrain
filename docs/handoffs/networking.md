@@ -19,11 +19,14 @@ and the README table). Verify reports: `deploy/.results/verify/<lab>.json`.
 | net-vrrp-gateway-pair | return path is fast OSPF (hello 1 / dead 3): static return routes cannot fail over; `show vrrp interface eth1 N` (not `show vrrp eth1 N`); solution waits out the failover probe of the earlier grading round |
 | net-lacp-server-uplink | after platform round 4 the node runs in a user namespace and `/proc/net/bonding` hides the LACP partner/aggregator details; the checks read `ip -d -j link` (`ad_info`) instead |
 
-`net-fix-broadcast-storm` stays **built**: on the round-4 manager (10 Mbit/s link
-cap) seed 2 and the mutation pass and `hosts-reachable` now retries for 45 s, but
-seed 1 failed `loop-captured` twice (the solution's capture saw fewer than 20
-copies of one broadcast). Next step: count total broadcast frames in the capture
-instead of copies of one frame, or lower the threshold, then re-verify.
+`net-fix-broadcast-storm` is **verified** (platform round 5, 2026-10-18: both seeds
+and the mutation). Root cause of the seed-1 `loop-captured` failures: the loop is
+already full of the ports' link-up IPv6 multicast (one neighbour advertisement was
+copied about 15,700 times in 20 s and every switch tbf queue held ~260 packets with
+>130k drops), so the solution's fresh ARP broadcasts were mostly dropped at the full
+queues and the `ether broadcast` capture saw fewer than 20 copies of any one frame.
+The check now counts copies of the most repeated broadcast **or multicast** frame
+(`ether multicast`), and the solution captures `ether multicast` (300 frames, 15 s).
 
 **sim-net-associate exam tasks** (`xnt-*`, type exam, no hints):
 xnt-subnet-admin-block, xnt-fix-host-gateway, xnt-summary-route (fundamentals);
