@@ -1,0 +1,104 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xlf-persist-sysctl-pair
+  title: Persist two kernel parameters on the depot gateway
+  domain: linux
+  frameworks: [lfcs:operations-deployment]
+  difficulty: easy
+  estimatedMinutes: 6
+  tags: [exam, sysctl, kernel]
+  version: 1
+spec:
+  description: |
+    **Host:** `tr-ops-01` (`ssh tr-ops-01`, then `sudo -i`)
+
+    The depot gateway needs two kernel settings, **now and after every boot**:
+
+    - `vm.swappiness` = **{{sw}}**
+    - `net.core.somaxconn` = **{{conn}}**
+
+    The existing file `/etc/sysctl.d/60-depot-base.conf` holds other depot settings:
+    leave it and the settings in it exactly as they are.
+  objectives:
+    - Change kernel parameters at runtime and persistently
+  params:
+    sw:
+      type: choice
+      values: ["5", "15", "25", "35"]
+    conn:
+      type: choice
+      values: ["1024", "2048", "8192"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-ops-01
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["2Gi", "1Gi", "2Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-ops-01
+      run: |
+        set -eu
+        install -d -m 0700 /var/lib/cloudtrain
+        printf '%s\n' '# Tallowmere depot baseline' 'kernel.panic = 30' 'vm.dirty_ratio = 15' > /etc/sysctl.d/60-depot-base.conf
+        sha256sum /etc/sysctl.d/60-depot-base.conf > /var/lib/cloudtrain/xlf-sysctl.sha
+        sysctl -q -p /etc/sysctl.d/60-depot-base.conf
+        sysctl -q -w vm.swappiness=60 net.core.somaxconn=4096
+  checks:
+    - id: runtime
+      description: Both parameters have the requested values now
+      type: shell
+      on: tr-ops-01
+      skills: [linux.kernel.sysctl]
+      weight: 1
+      command: echo "$(sysctl -n vm.swappiness) $(sysctl -n net.core.somaxconn)"
+      expect: {match: exact, value: "{{sw}} {{conn}}"}
+    - id: persistent
+      description: The boot-time sysctl configuration sets both values
+      type: shell
+      on: tr-ops-01
+      skills: [linux.kernel.sysctl]
+      weight: 2
+      command: |
+        systemd-analyze cat-config sysctl.d 2>/dev/null | tr -d ' \t' | awk -F= '$1 == "vm.swappiness" {s = $2} $1 == "net.core.somaxconn" {c = $2} END {print s " " c}'
+      expect: {match: exact, value: "{{sw}} {{conn}}"}
+    - id: base-kept
+      description: The depot baseline file and its settings are unchanged
+      type: shell
+      on: tr-ops-01
+      skills: [linux.kernel.sysctl]
+      weight: 0.5
+      command: sha256sum -c --quiet /var/lib/cloudtrain/xlf-sysctl.sha >/dev/null 2>&1 && [ "$(sysctl -n kernel.panic) $(sysctl -n vm.dirty_ratio)" = "30 15" ] && echo kept || echo changed
+      expect: {match: exact, value: kept}
+  misconceptions:
+    - id: runtime-only
+      description: Sets the values with sysctl -w only.
+      feedback: "sysctl -w lasts until the next boot; put the settings in a file under /etc/sysctl.d."
+      expectFail: [persistent]
+      mutation:
+        on: tr-ops-01
+        as: learner
+        run: sudo sysctl -q -w vm.swappiness={{sw}} net.core.somaxconn={{conn}}
+  solution:
+    explanation: A new drop-in in /etc/sysctl.d holds the two settings for every boot; sysctl -p applies that file now.
+    steps:
+      - on: tr-ops-01
+        as: learner
+        run: |
+          printf 'vm.swappiness = {{sw}}\nnet.core.somaxconn = {{conn}}\n' | sudo tee /etc/sysctl.d/70-depot-gateway.conf >/dev/null
+          sudo sysctl -q -p /etc/sysctl.d/70-depot-gateway.conf
+    alternatives:
+      - id: sysctl-conf
+        description: Append to /etc/sysctl.conf and reload everything.
+        steps:
+          - on: tr-ops-01
+            as: learner
+            run: |
+              printf 'vm.swappiness={{sw}}\nnet.core.somaxconn={{conn}}\n' | sudo tee -a /etc/sysctl.conf >/dev/null
+              sudo sysctl -q --system

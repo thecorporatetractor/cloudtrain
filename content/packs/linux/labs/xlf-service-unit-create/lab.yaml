@@ -1,0 +1,100 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xlf-service-unit-create
+  title: Create a service for a provided binary
+  domain: linux
+  frameworks: [lfcs:essential-commands]
+  difficulty: medium
+  estimatedMinutes: 8
+  tags: [exam, systemd, units]
+  version: 1
+spec:
+  description: |
+    **Host:** `tr-ops-01` (`ssh tr-ops-01`, then `sudo -i`)
+
+    The departures board daemon is installed at **`/opt/tr/bin/tr-departures`**.
+    Create a systemd service **`tr-departures.service`** that:
+
+    - runs the daemon as the existing user **`{{user}}`**;
+    - **restarts it automatically when it fails** or is killed;
+    - is **started now** and **at every boot**.
+  objectives:
+    - Write a service unit with a user and a restart policy
+  params:
+    user:
+      type: choice
+      values: [tr-boards, boardsvc, departures]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-ops-01
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["2Gi", "1Gi", "2Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-ops-01
+      run: |
+        set -eu
+        id {{user}} >/dev/null 2>&1 || useradd -r -M -s /usr/sbin/nologin {{user}}
+        mkdir -p /opt/tr/bin
+        printf '%s\n' '#!/bin/sh' 'while :; do date +%s > /tmp/tr-departures.$(id -un).beat; sleep 5; done' > /opt/tr/bin/tr-departures
+        chmod 0755 /opt/tr/bin/tr-departures
+        rm -f /etc/systemd/system/tr-departures.service; systemctl daemon-reload
+  checks:
+    - id: running-as-user
+      description: The service is active and runs as {{user}}
+      type: shell
+      on: tr-ops-01
+      skills: [linux.systemd.unit-authoring]
+      weight: 1.5
+      command: |
+        p=$(systemctl show -P MainPID tr-departures.service 2>/dev/null)
+        [ "$(systemctl is-active tr-departures.service)" = active ] && [ "${p:-0}" != 0 ] && echo "$(ps -o user= -p $p)" || echo inactive
+      expect: {match: exact, value: "{{user}}"}
+    - id: restarts
+      description: Killing the daemon makes systemd start it again
+      type: shell
+      on: tr-ops-01
+      skills: [linux.systemd.unit-authoring]
+      weight: 1.5
+      timeoutSec: 60
+      command: |
+        p=$(systemctl show -P MainPID tr-departures.service); [ "${p:-0}" != 0 ] || { echo not-running; exit 0; }
+        kill -9 $p
+        for i in $(seq 25); do sleep 1; n=$(systemctl show -P MainPID tr-departures.service); [ "${n:-0}" != 0 ] && [ "$n" != "$p" ] && { echo restarted; exit 0; }; done
+        echo stayed-down
+      expect: {match: exact, value: restarted}
+    - id: enabled
+      description: The service starts at boot
+      type: shell
+      on: tr-ops-01
+      skills: [linux.systemd.unit-authoring]
+      weight: 1
+      command: systemctl is-enabled tr-departures.service 2>/dev/null || echo disabled
+      expect: {match: exact, value: enabled}
+  misconceptions:
+    - id: no-restart
+      description: Leaves out the restart policy.
+      feedback: "Restart=on-failure (or always) in [Service] tells systemd to start the daemon again."
+      expectFail: [restarts]
+      mutation:
+        on: tr-ops-01
+        as: learner
+        run: |
+          printf '[Unit]\nDescription=Departures board\n\n[Service]\nUser={{user}}\nExecStart=/opt/tr/bin/tr-departures\n\n[Install]\nWantedBy=multi-user.target\n' | sudo tee /etc/systemd/system/tr-departures.service >/dev/null
+          sudo systemctl daemon-reload; sudo systemctl enable --now tr-departures.service
+  solution:
+    explanation: '[Service] with User=, ExecStart= and Restart=on-failure; [Install] WantedBy=multi-user.target for enable.'
+    steps:
+      - on: tr-ops-01
+        as: learner
+        run: |
+          printf '[Unit]\nDescription=Departures board\nAfter=network.target\n\n[Service]\nUser={{user}}\nExecStart=/opt/tr/bin/tr-departures\nRestart=on-failure\nRestartSec=2\n\n[Install]\nWantedBy=multi-user.target\n' | sudo tee /etc/systemd/system/tr-departures.service >/dev/null
+          sudo systemctl daemon-reload
+          sudo systemctl enable --now tr-departures.service

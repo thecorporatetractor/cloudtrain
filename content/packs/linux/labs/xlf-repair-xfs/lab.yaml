@@ -1,0 +1,93 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xlf-repair-xfs
+  title: Repair and remount a damaged filesystem
+  domain: linux
+  frameworks: [lfcs:storage]
+  difficulty: medium
+  estimatedMinutes: 8
+  tags: [exam, xfs, repair]
+  version: 1
+spec:
+  description: |
+    **Host:** `tr-ops-01` (`ssh tr-ops-01`, then `sudo -i`)
+
+    After a storage controller fault, the depot archive on **`/dev/vgops/lvdepot`**
+    no longer mounts at its usual place **`/srv/depot-archive`** (see `/etc/fstab`).
+    **Repair the filesystem** and **mount it again** at that place. Do not reformat
+    it: the archive data must survive.
+  objectives:
+    - Check and repair an XFS filesystem
+  params:
+    seed:
+      type: int
+      min: 1
+      max: 999
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-ops-01
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["2Gi", "1Gi", "2Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-ops-01
+      timeoutSec: 180
+      run: |
+        set -eu
+        pvs /dev/vde >/dev/null 2>&1 || pvcreate -q /dev/vde
+        vgs vgops >/dev/null 2>&1 || vgcreate -q vgops /dev/vde
+        if ! lvs vgops/lvdepot >/dev/null 2>&1; then
+          lvcreate -q -y -n lvdepot -L 320M vgops; mkfs.xfs -q /dev/vgops/lvdepot
+          mkdir -p /srv/depot-archive
+          echo '/dev/mapper/vgops-lvdepot /srv/depot-archive xfs defaults,nofail 0 0' >> /etc/fstab
+          systemctl daemon-reload; mount /srv/depot-archive
+          for i in $(seq 1 40); do seq 1 500 | awk -v i=$i -v s={{seed}} '{print "depot", i, $1 * s}' > /srv/depot-archive/ledger-$i.txt; done
+          install -d -m 0700 /var/lib/cloudtrain
+          (cd /srv/depot-archive && sha256sum ledger-*.txt) > /var/lib/cloudtrain/xlf-depot.sha
+          umount /srv/depot-archive
+          xfs_db -x -c 'sb 0' -c 'write -d magicnum 0x58465300' /dev/vgops/lvdepot >/dev/null 2>&1 || xfs_db -x -c 'sb 0' -c 'write magicnum 0x58465300' /dev/vgops/lvdepot >/dev/null
+          ! mount /srv/depot-archive 2>/dev/null
+        fi
+  checks:
+    - id: mounted
+      description: The archive is mounted at /srv/depot-archive from lvdepot
+      type: shell
+      on: tr-ops-01
+      skills: [linux.storage.repair]
+      weight: 1
+      command: s=$(findmnt -n -o SOURCE /srv/depot-archive 2>/dev/null); [ -n "$s" ] && [ "$(readlink -f "$s")" = "$(readlink -f /dev/vgops/lvdepot)" ] && echo mounted || echo not-mounted
+      expect: {match: exact, value: mounted}
+    - id: data
+      description: The archive data survived
+      type: shell
+      on: tr-ops-01
+      skills: [linux.storage.repair]
+      weight: 2
+      command: cd /srv/depot-archive 2>/dev/null && sha256sum -c --quiet /var/lib/cloudtrain/xlf-depot.sha >/dev/null 2>&1 && echo intact || echo lost
+      expect: {match: exact, value: intact}
+  misconceptions:
+    - id: reformat
+      description: Makes a new filesystem instead of repairing the old one.
+      feedback: "mkfs destroys the archive; xfs_repair on the unmounted device finds the backup superblocks and fixes the primary one."
+      expectFail: [data]
+      mutation:
+        on: tr-ops-01
+        as: learner
+        run: sudo sh -c 'mkfs.xfs -q -f /dev/vgops/lvdepot && mount /srv/depot-archive'
+  solution:
+    explanation: xfs_repair on the unmounted device rebuilds the primary superblock from a secondary copy; mount then uses the fstab entry.
+    steps:
+      - on: tr-ops-01
+        as: learner
+        timeoutSec: 180
+        run: |
+          set -e
+          sudo xfs_repair /dev/vgops/lvdepot >/dev/null 2>&1
+          sudo mount /srv/depot-archive

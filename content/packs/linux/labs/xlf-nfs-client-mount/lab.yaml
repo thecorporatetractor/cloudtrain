@@ -1,0 +1,111 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xlf-nfs-client-mount
+  title: Mount an NFS export persistently
+  domain: linux
+  frameworks: [lfcs:storage]
+  difficulty: easy
+  estimatedMinutes: 6
+  tags: [exam, nfs, fstab]
+  version: 1
+spec:
+  description: |
+    **Hosts:** `tr-ops-01` (configure here); `tr-sec-01` is the file server
+
+    The file server exports the published timetables as
+    **`tr-sec-01:/exports/timetables`**. On `tr-ops-01`, mount it at
+    **`/mnt/timetables`** **read-only** and with the option **`{{opt}}`**, now and at
+    every boot. The boot must not hang if the file server is unreachable at that
+    moment, so mark it as a network filesystem.
+  objectives:
+    - Mount an NFS export persistently with options
+  params:
+    opt:
+      type: choice
+      values: [noexec, nosuid, nodev]
+    edition:
+      type: int
+      min: 100
+      max: 999
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-ops-01
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["2Gi", "1Gi", "2Gi"]}
+        access: [ssh, console]
+      - name: tr-sec-01
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536}
+        access: [ssh, console]
+  setup:
+    - on: tr-sec-01
+      timeoutSec: 120
+      run: |
+        set -eu
+        mkdir -p /exports/timetables; echo "edition {{edition}}" > /exports/timetables/EDITION
+        echo '/exports/timetables *(ro,sync,no_subtree_check)' > /etc/exports.d/timetables.exports
+        systemctl enable --now nfs-server; exportfs -ra
+        for s in nfs mountd rpc-bind; do firewall-cmd -q --permanent --add-service=$s; done; firewall-cmd -q --reload
+    - on: tr-ops-01
+      timeoutSec: 180
+      run: |
+        set -eu
+        # ubuntu-vm: cloud-init re-creates the online ubuntu.sources at first boot; keep apt offline (local repo only)
+        if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then mv /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list.d/ubuntu.sources.cloud-init; rm -rf /var/lib/apt/lists/*; fi
+        ls /var/lib/apt/lists/*_Packages >/dev/null 2>&1 || apt-get update -q >/dev/null
+        dpkg -s nfs-common >/dev/null 2>&1 || apt-get install -y -q nfs-common >/dev/null
+  checks:
+    - id: mounted
+      description: The export is mounted read-only with the option
+      type: shell
+      on: tr-ops-01
+      skills: [linux.storage.network-mounts]
+      weight: 1.5
+      timeoutSec: 40
+      command: |
+        s=$(findmnt -n -t nfs,nfs4 -o SOURCE /mnt/timetables 2>/dev/null); o=$(findmnt -n -o OPTIONS /mnt/timetables 2>/dev/null)
+        c=$(timeout 10 cat /mnt/timetables/EDITION 2>/dev/null)
+        case "$s" in *:/exports/timetables) ;; *) echo "source=$s"; exit 0 ;; esac
+        echo ",$o," | grep -q ',ro,' && echo ",$o," | grep -q ',{{opt}},' && [ "$c" = "edition {{edition}}" ] && echo mounted || echo "opts=$o"
+      expect: {match: exact, value: mounted}
+    - id: fstab
+      description: /etc/fstab mounts it at boot as a network filesystem with the options
+      type: shell
+      on: tr-ops-01
+      skills: [linux.storage.network-mounts]
+      weight: 2
+      command: |
+        awk '$2 == "/mnt/timetables" && $1 ~ /:\/exports\/timetables\/?$/ && $3 ~ /^nfs4?$/ {o = "," $4 ","; if (o ~ /,ro,/ && o ~ /,{{opt}},/ && o ~ /,_netdev,/) f = 1} END {print f ? "fstab" : "missing"}' /etc/fstab
+      expect: {match: exact, value: fstab}
+  misconceptions:
+    - id: no-netdev
+      description: Writes the fstab line without _netdev.
+      feedback: "_netdev tells systemd to wait for the network and not to block the local boot on this mount."
+      expectFail: [fstab]
+      mutation:
+        on: tr-ops-01
+        as: learner
+        run: |
+          sudo mkdir -p /mnt/timetables
+          echo 'tr-sec-01:/exports/timetables /mnt/timetables nfs ro,{{opt}} 0 0' | sudo tee -a /etc/fstab >/dev/null
+          sudo systemctl daemon-reload; sudo mount /mnt/timetables
+  solution:
+    explanation: An nfs line in /etc/fstab with ro, the option and _netdev; mount applies it now.
+    steps:
+      - on: tr-ops-01
+        as: learner
+        timeoutSec: 90
+        run: |
+          set -e
+          sudo mkdir -p /mnt/timetables
+          echo 'tr-sec-01:/exports/timetables /mnt/timetables nfs ro,{{opt}},_netdev 0 0' | sudo tee -a /etc/fstab >/dev/null
+          sudo systemctl daemon-reload
+          sudo mount /mnt/timetables

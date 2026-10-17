@@ -1,0 +1,83 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xlf-user-limits
+  title: Limit a user's processes
+  domain: linux
+  frameworks: [lfcs:users-groups]
+  difficulty: easy
+  estimatedMinutes: 5
+  tags: [exam, limits, pam]
+  version: 1
+spec:
+  description: |
+    **Host:** `tr-ops-01` (`ssh tr-ops-01`, then `sudo -i`)
+
+    The batch account **`{{user}}`** once fork-bombed the host. Limit the number of
+    processes it may run: a **soft limit of {{soft}}** and a **hard limit of
+    {{hard}}**, applied to **every new login session** of that user. Other users keep
+    their limits.
+  objectives:
+    - Set per-user resource limits with pam_limits
+  params:
+    user:
+      type: choice
+      values: [batchrun, nightjob, faresync]
+    soft:
+      type: choice
+      values: ["64", "100", "128"]
+    hard:
+      type: choice
+      values: ["200", "256", "300"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-ops-01
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["2Gi", "1Gi", "2Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-ops-01
+      run: |
+        set -eu
+        id {{user}} >/dev/null 2>&1 || useradd -m -s /bin/bash {{user}}
+        id tr-peer2 >/dev/null 2>&1 || useradd -m -s /bin/bash tr-peer2
+        # grading uses su -; sshd logins already apply pam_limits
+        grep -q '^session.*pam_limits.so' /etc/pam.d/su || echo 'session required pam_limits.so' >> /etc/pam.d/su
+  checks:
+    - id: limits
+      description: A new login session of {{user}} gets the soft and hard process limits
+      type: shell
+      on: tr-ops-01
+      skills: [linux.users.resource-limits]
+      weight: 2
+      command: su - {{user}} -c 'echo "$(ulimit -Su) $(ulimit -Hu)"' 2>/dev/null
+      expect: {match: exact, value: "{{soft}} {{hard}}"}
+    - id: others
+      description: Other users keep their limits
+      type: shell
+      on: tr-ops-01
+      skills: [linux.users.resource-limits]
+      weight: 0.5
+      command: '[ "$(su - tr-peer2 -c "ulimit -Hu" 2>/dev/null)" = "$(su - root -c "ulimit -Hu" 2>/dev/null)" ] && echo unchanged || echo changed'
+      expect: {match: exact, value: unchanged}
+  misconceptions:
+    - id: profile-ulimit
+      description: Sets the limits with ulimit in the user's .bashrc.
+      feedback: "A ulimit in a shell startup file only covers that shell, and a user can raise it; pam_limits with /etc/security/limits.d applies the limits to every session."
+      expectFail: [limits]
+      mutation:
+        on: tr-ops-01
+        as: learner
+        run: echo 'ulimit -Su {{soft}}' | sudo tee -a /home/{{user}}/.bashrc >/dev/null
+  solution:
+    explanation: A limits.d file with soft and hard nproc entries for the user; pam_limits applies them at login.
+    steps:
+      - on: tr-ops-01
+        as: learner
+        run: printf '{{user}} soft nproc {{soft}}\n{{user}} hard nproc {{hard}}\n' | sudo tee /etc/security/limits.d/60-{{user}}.conf >/dev/null

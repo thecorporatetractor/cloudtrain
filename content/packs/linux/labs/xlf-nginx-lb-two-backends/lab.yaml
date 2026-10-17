@@ -1,0 +1,103 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xlf-nginx-lb-two-backends
+  title: Load-balance two local backends behind nginx
+  domain: linux
+  frameworks: [lfcs:networking]
+  difficulty: medium
+  estimatedMinutes: 10
+  tags: [exam, nginx, reverse-proxy, load-balancing]
+  version: 1
+spec:
+  description: |
+    **Host:** `tr-ops-01` (`ssh tr-ops-01`, then `sudo -i`)
+
+    Two instances of the journey planner already run on `tr-ops-01`, on
+    **`127.0.0.1:{{p1}}`** and **`127.0.0.1:{{p2}}`**. Install **nginx** from the
+    configured repository and make it serve the site
+    **`planner.tallowmere.example`** on **port 80**, spreading requests **across both
+    instances**. nginx must start at boot.
+  objectives:
+    - Configure an nginx upstream with two backends for a named virtual host
+  params:
+    p1:
+      type: int
+      min: 9201
+      max: 9249
+    p2:
+      type: int
+      min: 9251
+      max: 9299
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-ops-01
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["2Gi", "1Gi", "2Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-ops-01
+      timeoutSec: 90
+      run: |
+        set -eu
+        # ubuntu-vm: cloud-init re-creates the online ubuntu.sources at first boot; keep apt offline (local repo only)
+        if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then mv /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list.d/ubuntu.sources.cloud-init; rm -rf /var/lib/apt/lists/*; fi
+        ls /var/lib/apt/lists/*_Packages >/dev/null 2>&1 || apt-get update -q >/dev/null
+        for i in a:{{p1}} b:{{p2}}; do
+          n=${i%%:*}; p=${i##*:}; mkdir -p /srv/planner-$n; echo "planner-$n" > /srv/planner-$n/index.html
+          printf '[Unit]\nDescription=Journey planner %s\n[Service]\nExecStart=/usr/bin/python3 -m http.server %s --bind 127.0.0.1 --directory /srv/planner-%s\nRestart=always\n[Install]\nWantedBy=multi-user.target\n' $n $p $n > /etc/systemd/system/tr-planner-$n.service
+        done
+        systemctl daemon-reload; systemctl enable --now tr-planner-a.service tr-planner-b.service
+  checks:
+    - id: balanced
+      description: Requests for planner.tallowmere.example on port 80 reach both instances
+      type: shell
+      on: tr-ops-01
+      skills: [linux.services.web-proxy]
+      weight: 2.5
+      timeoutSec: 40
+      command: |
+        for i in 1 2 3 4 5 6 7 8; do curl -4 -s -m 4 -H 'Host: planner.tallowmere.example' http://127.0.0.1/; done | sort -u | paste -sd,
+      expect: {match: exact, value: "planner-a,planner-b"}
+    - id: enabled
+      description: nginx is enabled at boot and running
+      type: shell
+      on: tr-ops-01
+      skills: [linux.services.web-proxy]
+      weight: 0.5
+      command: echo "$(systemctl is-enabled nginx 2>/dev/null) $(systemctl is-active nginx 2>/dev/null)"
+      expect: {match: exact, value: "enabled active"}
+  misconceptions:
+    - id: one-backend
+      description: Proxies to one instance only.
+      feedback: "An upstream block with both servers and proxy_pass http://<upstream> spreads the load."
+      expectFail: [balanced]
+      mutation:
+        on: tr-ops-01
+        as: learner
+        timeoutSec: 180
+        run: |
+          sudo apt-get update -q >/dev/null; sudo apt-get install -y -q nginx >/dev/null
+          printf 'server {\n  listen 80;\n  server_name planner.tallowmere.example;\n  location / { proxy_pass http://127.0.0.1:{{p1}}; }\n}\n' | sudo tee /etc/nginx/sites-available/planner >/dev/null
+          sudo ln -sf /etc/nginx/sites-available/planner /etc/nginx/sites-enabled/planner
+          sudo systemctl reload nginx
+  solution:
+    explanation: An upstream with both instances and a server block for the name with proxy_pass to it; nginx distributes round robin.
+    steps:
+      - on: tr-ops-01
+        as: learner
+        timeoutSec: 180
+        run: |
+          set -e
+          sudo apt-get update -q >/dev/null; sudo apt-get install -y -q nginx >/dev/null
+          printf 'upstream planner {\n  server 127.0.0.1:{{p1}};\n  server 127.0.0.1:{{p2}};\n}\nserver {\n  listen 80;\n  server_name planner.tallowmere.example;\n  location / { proxy_pass http://planner; }\n}\n' | sudo tee /etc/nginx/sites-available/planner >/dev/null
+          sudo ln -sf /etc/nginx/sites-available/planner /etc/nginx/sites-enabled/planner
+          sudo nginx -t
+          sudo systemctl enable nginx
+          sudo systemctl reload nginx

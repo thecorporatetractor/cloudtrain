@@ -1,0 +1,124 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xlf-find-and-copy
+  title: Find files by criteria and copy them preserving paths
+  domain: linux
+  frameworks: [lfcs:essential-commands]
+  difficulty: medium
+  estimatedMinutes: 8
+  tags: [exam, find, cp]
+  version: 1
+spec:
+  description: |
+    **Host:** `tr-ops-01` (`ssh tr-ops-01`, then `sudo -i`)
+
+    Audit request: below **`/srv/depot-data`**, find every **regular file** that
+
+    - is owned by the user **`{{user}}`**,
+    - is **larger than {{kb}} KiB**, and
+    - was **last modified more than {{days}} days ago**.
+
+    Copy all of them into **`/srv/audit`**, keeping their **paths relative to
+    `/srv/depot-data`** (so `/srv/depot-data/a/b/f.log` becomes `/srv/audit/a/b/f.log`).
+    Copy nothing else and leave the originals in place.
+  objectives:
+    - Combine find tests for owner, size and age
+    - Copy files while preserving their relative paths
+  params:
+    user:
+      type: choice
+      values: [rheon, sabrina, teilo]
+    kb:
+      type: choice
+      values: ["50", "100", "200"]
+    days:
+      type: choice
+      values: ["30", "60", "90"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-ops-01
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["2Gi", "1Gi", "2Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-ops-01
+      run: |
+        set -eu
+        id {{user}} >/dev/null 2>&1 || useradd -M -s /usr/sbin/nologin {{user}}
+        id tr-yardclerk >/dev/null 2>&1 || useradd -M -s /usr/sbin/nologin tr-yardclerk
+        rm -rf /srv/depot-data /srv/audit; mkdir -p /srv/audit
+        k={{kb}}; d={{days}}; n=0
+        for dir in yard/north yard/south "office/night shift" archive/2025; do
+          mkdir -p "/srv/depot-data/$dir"
+          for kind in match small fresh other; do
+            n=$((n + 1)); f="/srv/depot-data/$dir/$kind-$n.log"
+            case $kind in small) sz=$((k - 20)) ;; *) sz=$((k + 30 + n)) ;; esac
+            head -c $((sz * 1024)) /dev/urandom > "$f"
+            case $kind in other) chown tr-yardclerk "$f" ;; *) chown {{user}} "$f" ;; esac
+            case $kind in fresh) touch -d "$((d - 10)) days ago" "$f" ;; *) touch -d "$((d + 15)) days ago" "$f" ;; esac
+          done
+        done
+        install -d -m 0700 /var/lib/cloudtrain
+        (cd /srv/depot-data && find . -type f -name 'match-*' | sed 's#^\./##' | sort) > /var/lib/cloudtrain/xlf-find.expected
+  checks:
+    - id: copied
+      description: Every matching file is in /srv/audit at its relative path with the same content
+      type: shell
+      on: tr-ops-01
+      skills: [linux.files.find-locate]
+      weight: 2
+      command: |
+        bad=0
+        while IFS= read -r f; do cmp -s "/srv/depot-data/$f" "/srv/audit/$f" || bad=$((bad + 1)); done < /var/lib/cloudtrain/xlf-find.expected
+        echo "missing=$bad"
+      expect: {match: exact, value: "missing=0"}
+    - id: nothing-else
+      description: No other file was copied
+      type: shell
+      on: tr-ops-01
+      skills: [linux.files.find-locate]
+      weight: 1.5
+      command: |
+        (cd /srv/audit && find . -type f | sed 's#^\./##' | sort) | diff -q - /var/lib/cloudtrain/xlf-find.expected >/dev/null && echo exact || echo extra-or-missing
+      expect: {match: exact, value: exact}
+    - id: originals
+      description: The originals are still in place
+      type: shell
+      on: tr-ops-01
+      skills: [linux.files.find-locate]
+      weight: 0.5
+      command: echo "$(find /srv/depot-data -type f | wc -l)"
+      expect: {match: exact, value: "16"}
+  misconceptions:
+    - id: no-age
+      description: Leaves out the age test, so recently changed files are copied too.
+      feedback: "-mtime +N selects files modified more than N days ago."
+      expectFail: [nothing-else]
+      mutation:
+        on: tr-ops-01
+        as: learner
+        run: cd /srv/depot-data && sudo find . -type f -user {{user}} -size +{{kb}}k -exec cp --parents {} /srv/audit/ \;
+  solution:
+    explanation: find combines -user, -size +Nk and -mtime +N; cp --parents run from /srv/depot-data recreates the relative directories.
+    steps:
+      - on: tr-ops-01
+        as: learner
+        run: cd /srv/depot-data && sudo find . -type f -user {{user}} -size +{{kb}}k -mtime +{{days}} -exec cp --parents -p {} /srv/audit/ \;
+    alternatives:
+      - id: rsync-files-from
+        description: Build the list with find and copy it with rsync --files-from.
+        steps:
+          - on: tr-ops-01
+            as: learner
+            run: |
+              cd /srv/depot-data
+              sudo find . -type f -user {{user}} -size +{{kb}}k -mtime +{{days}} -printf '%P\n' > /tmp/xlf-list
+              sudo rsync -a --files-from=/tmp/xlf-list /srv/depot-data/ /srv/audit/
+              rm -f /tmp/xlf-list

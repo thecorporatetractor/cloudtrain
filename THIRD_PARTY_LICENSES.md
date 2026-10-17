@@ -193,7 +193,7 @@ iac licensingNote in content/curriculum.yaml) unless built with IAC_CLI=tofu.
 | react-dom | 19.3.0 | MIT |
 | react-remove-scroll | 2.7.2 | MIT |
 | react-remove-scroll-bar | 2.3.8 | MIT |
-| react-resizable-panels | 4.14.3 | MIT |
+| react-resizable-panels | 4.14.4 | MIT |
 | react-style-singleton | 2.2.3 | MIT |
 | readable-stream | 3.6.2 | MIT |
 | real-require | 1.0.0 | MIT |

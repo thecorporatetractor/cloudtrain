@@ -1,0 +1,124 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xlf-timer-housekeeping
+  title: Schedule a housekeeping script with a timer
+  domain: linux
+  frameworks: [lfcs:operations-deployment]
+  difficulty: medium
+  estimatedMinutes: 8
+  tags: [exam, systemd, timers]
+  version: 1
+spec:
+  description: |
+    **Host:** `tr-ops-01` (`ssh tr-ops-01`, then `sudo -i`)
+
+    The ticket cache grows without bound. Run **`/usr/local/sbin/tr-cache-purge`**
+    **every 20 minutes, on the hour and at :20 and :40**, through systemd:
+
+    - a service unit **`tr-cache-purge.service`** that runs the script;
+    - a timer unit **`tr-cache-purge.timer`** that also **runs a missed run after the
+      host was down** at the scheduled time, **enabled** for every boot and **active**
+      now.
+
+    Do not use cron.
+  objectives:
+    - Write a calendar timer that catches up missed runs
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-ops-01
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["2Gi", "1Gi", "2Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-ops-01
+      run: |
+        set -eu
+        printf '%s\n' '#!/bin/sh' 'find /var/cache/tr-tickets -type f -mmin +60 -delete 2>/dev/null' 'echo "$(date -Is) purge" >> /var/log/tr-cache-purge.log' > /usr/local/sbin/tr-cache-purge
+        chmod 0755 /usr/local/sbin/tr-cache-purge; mkdir -p /var/cache/tr-tickets
+        rm -f /etc/systemd/system/tr-cache-purge.*; systemctl daemon-reload
+  checks:
+    - id: service
+      description: tr-cache-purge.service runs the script
+      type: shell
+      on: tr-ops-01
+      skills: [linux.systemd.timers]
+      weight: 1
+      command: systemctl show -P ExecStart tr-cache-purge.service 2>/dev/null | grep -q 'path=/usr/local/sbin/tr-cache-purge ' && echo runs-script || echo no
+      expect: {match: exact, value: runs-script}
+    - id: schedule
+      description: The timer fires at :00, :20 and :40 of every hour
+      type: shell
+      on: tr-ops-01
+      skills: [linux.systemd.timers]
+      weight: 2
+      command: |
+        c=$(systemctl show -P TimersCalendar tr-cache-purge.timer 2>/dev/null)
+        case "$c" in *'OnCalendar=*-*-* *:00/20:00 '*|*'OnCalendar=*-*-* *:00,20,40:00 '*) echo every-20 ;; *) echo "calendar=$c" ;; esac
+      expect: {match: exact, value: every-20}
+    - id: catch-up
+      description: Missed runs are caught up after downtime
+      type: shell
+      on: tr-ops-01
+      skills: [linux.systemd.timers]
+      weight: 1
+      command: systemctl show -P Persistent tr-cache-purge.timer 2>/dev/null
+      expect: {match: exact, value: "yes"}
+    - id: enabled
+      description: The timer is enabled and active
+      type: shell
+      on: tr-ops-01
+      skills: [linux.systemd.timers]
+      weight: 1
+      command: echo "$(systemctl is-enabled tr-cache-purge.timer 2>/dev/null) $(systemctl is-active tr-cache-purge.timer 2>/dev/null)"
+      expect: {match: exact, value: "enabled active"}
+  misconceptions:
+    - id: monotonic
+      description: Uses a monotonic OnUnitActiveSec=20min timer, which drifts and cannot catch up.
+      feedback: "Fixed clock times need OnCalendar=*:0/20; Persistent=true only works with OnCalendar."
+      expectFail: [schedule]
+      mutation:
+        on: tr-ops-01
+        as: learner
+        run: |
+          printf '[Service]\nType=oneshot\nExecStart=/usr/local/sbin/tr-cache-purge\n' | sudo tee /etc/systemd/system/tr-cache-purge.service >/dev/null
+          printf '[Timer]\nOnBootSec=5min\nOnUnitActiveSec=20min\nPersistent=true\n[Install]\nWantedBy=timers.target\n' | sudo tee /etc/systemd/system/tr-cache-purge.timer >/dev/null
+          sudo systemctl daemon-reload; sudo systemctl enable --now tr-cache-purge.timer
+    - id: no-persistent
+      description: Schedules the calendar time but does not catch up missed runs.
+      feedback: "Persistent=true in [Timer] makes systemd run a missed elapse at the next boot."
+      expectFail: [catch-up]
+      mutation:
+        on: tr-ops-01
+        as: learner
+        run: |
+          printf '[Service]\nType=oneshot\nExecStart=/usr/local/sbin/tr-cache-purge\n' | sudo tee /etc/systemd/system/tr-cache-purge.service >/dev/null
+          printf '[Timer]\nOnCalendar=*:0/20\n[Install]\nWantedBy=timers.target\n' | sudo tee /etc/systemd/system/tr-cache-purge.timer >/dev/null
+          sudo systemctl daemon-reload; sudo systemctl enable --now tr-cache-purge.timer
+  solution:
+    explanation: A oneshot service plus a timer with OnCalendar=*:0/20 and Persistent=true, enabled into timers.target.
+    steps:
+      - on: tr-ops-01
+        as: learner
+        run: |
+          printf '[Unit]\nDescription=Purge the ticket cache\n\n[Service]\nType=oneshot\nExecStart=/usr/local/sbin/tr-cache-purge\n' | sudo tee /etc/systemd/system/tr-cache-purge.service >/dev/null
+          printf '[Unit]\nDescription=Purge the ticket cache every 20 minutes\n\n[Timer]\nOnCalendar=*:0/20\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n' | sudo tee /etc/systemd/system/tr-cache-purge.timer >/dev/null
+          sudo systemctl daemon-reload
+          sudo systemctl enable --now tr-cache-purge.timer
+    alternatives:
+      - id: listed-minutes
+        description: List the minutes explicitly.
+        steps:
+          - on: tr-ops-01
+            as: learner
+            run: |
+              printf '[Service]\nType=oneshot\nExecStart=/usr/local/sbin/tr-cache-purge\n' | sudo tee /etc/systemd/system/tr-cache-purge.service >/dev/null
+              printf '[Timer]\nOnCalendar=*-*-* *:00,20,40:00\nPersistent=yes\n\n[Install]\nWantedBy=timers.target\n' | sudo tee /etc/systemd/system/tr-cache-purge.timer >/dev/null
+              sudo systemctl daemon-reload
+              sudo systemctl enable --now tr-cache-purge.timer

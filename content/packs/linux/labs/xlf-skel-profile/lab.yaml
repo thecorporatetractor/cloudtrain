@@ -1,0 +1,97 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xlf-skel-profile
+  title: Give new users a default environment
+  domain: linux
+  frameworks: [lfcs:users-groups]
+  difficulty: easy
+  estimatedMinutes: 5
+  tags: [exam, skel, environment]
+  version: 1
+spec:
+  description: |
+    **Host:** `tr-ops-01` (`ssh tr-ops-01`, then `sudo -i`)
+
+    Every user account **created from now on** on `tr-ops-01` must start with:
+
+    - the environment variable **`TR_DEPOT={{depot}}`** set in its login shells;
+    - a file **`~/DEPOT-RULES.txt`** in its home directory containing the line
+      **`Report faults to the {{depot}} signal box.`**
+
+    Existing accounts must not be changed.
+  objectives:
+    - Use /etc/skel to give new accounts default files and environment
+  params:
+    depot:
+      type: choice
+      values: [Ashby, Corran, Larkhill, Wexley]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-ops-01
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["2Gi", "1Gi", "2Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-ops-01
+      run: |
+        set -eu
+        install -d -m 0700 /var/lib/cloudtrain
+        id tr-oldhand >/dev/null 2>&1 || useradd -m -s /bin/bash tr-oldhand
+        sha256sum /home/tr-oldhand/.profile /home/tr-oldhand/.bashrc > /var/lib/cloudtrain/xlf-skel.sha
+  checks:
+    - id: env
+      description: A newly created user gets TR_DEPOT in a login shell
+      type: shell
+      on: tr-ops-01
+      skills: [linux.shell.env-profiles]
+      weight: 1.5
+      command: |
+        u=trnew$$; useradd -m -s /bin/bash $u >/dev/null 2>&1
+        v=$(su - $u -c 'printf %s "$TR_DEPOT"' 2>/dev/null); userdel -r $u >/dev/null 2>&1; echo "${v:-unset}"
+      expect: {match: exact, value: "{{depot}}"}
+    - id: file
+      description: A newly created user gets DEPOT-RULES.txt in the home directory
+      type: shell
+      on: tr-ops-01
+      skills: [linux.shell.env-profiles]
+      weight: 1.5
+      command: |
+        u=trnew2$$; useradd -m -s /bin/bash $u >/dev/null 2>&1
+        f=/home/$u/DEPOT-RULES.txt; r=missing
+        [ -f $f ] && grep -qx 'Report faults to the {{depot}} signal box.' $f && [ "$(stat -c %U $f)" = $u ] && r=present
+        userdel -r $u >/dev/null 2>&1; echo $r
+      expect: {match: exact, value: present}
+    - id: existing
+      description: Existing accounts are unchanged
+      type: shell
+      on: tr-ops-01
+      skills: [linux.shell.env-profiles]
+      weight: 0.5
+      command: sha256sum -c --quiet /var/lib/cloudtrain/xlf-skel.sha >/dev/null 2>&1 && [ ! -e /home/tr-oldhand/DEPOT-RULES.txt ] && echo unchanged || echo changed
+      expect: {match: exact, value: unchanged}
+  misconceptions:
+    - id: existing-home
+      description: Puts the file and variable into an existing user's home instead of /etc/skel.
+      feedback: "useradd -m copies /etc/skel into each new home; put both there."
+      expectFail: [env, file, existing]
+      mutation:
+        on: tr-ops-01
+        as: learner
+        run: |
+          echo 'export TR_DEPOT={{depot}}' | sudo tee -a /home/tr-oldhand/.profile >/dev/null
+          echo 'Report faults to the {{depot}} signal box.' | sudo tee /home/tr-oldhand/DEPOT-RULES.txt >/dev/null
+  solution:
+    explanation: Files in /etc/skel are copied into every new home; the export in /etc/skel/.profile runs in each new user's login shells.
+    steps:
+      - on: tr-ops-01
+        as: learner
+        run: |
+          echo 'export TR_DEPOT={{depot}}' | sudo tee -a /etc/skel/.profile >/dev/null
+          echo 'Report faults to the {{depot}} signal box.' | sudo tee /etc/skel/DEPOT-RULES.txt >/dev/null

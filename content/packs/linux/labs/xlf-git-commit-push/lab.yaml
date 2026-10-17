@@ -1,0 +1,132 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xlf-git-commit-push
+  title: Commit a fix to a branch and push it
+  domain: linux
+  frameworks: [lfcs:essential-commands]
+  difficulty: easy
+  estimatedMinutes: 6
+  tags: [exam, git]
+  version: 1
+spec:
+  description: |
+    **Host:** `tr-ops-01` (`ssh tr-ops-01`; work as `learner`, no root needed)
+
+    The station list is kept in the Git repository
+    **`git://tr-ops-01/stations.git`**. Station **Dunmere** was renamed to
+    **{{newname}}**.
+
+    1. Clone the repository and create the branch **`fix/TT-{{ticket}}`** from `main`.
+    2. In `stations.txt`, replace the line `Dunmere` with `{{newname}}` (nothing else
+       changes).
+    3. Commit with a message that contains **`TT-{{ticket}}`** and **push the branch**
+       to the server. `main` on the server must stay unchanged.
+  objectives:
+    - Branch, commit and push with Git
+  params:
+    ticket:
+      type: int
+      min: 100
+      max: 999
+    newname:
+      type: choice
+      values: [Dunmere Parkway, Dunmere Central, Dunmere Halt]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-ops-01
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["2Gi", "1Gi", "2Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-ops-01
+      timeoutSec: 180
+      run: |
+        set -eu
+        # ubuntu-vm: cloud-init re-creates the online ubuntu.sources at first boot; keep apt offline (local repo only)
+        if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then mv /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list.d/ubuntu.sources.cloud-init; rm -rf /var/lib/apt/lists/*; fi
+        ls /var/lib/apt/lists/*_Packages >/dev/null 2>&1 || apt-get update -q >/dev/null
+        command -v git >/dev/null || apt-get install -y -q git >/dev/null
+        R=/srv/git/stations.git; rm -rf /srv/git; mkdir -p /srv/git
+        git init -q --bare -b main $R
+        w=$(mktemp -d); git -C $w init -q -b main
+        printf '%s\n' 'Ashby Junction' Bramwell 'Corran Quay' Dunmere 'Elsford Parkway' > $w/stations.txt
+        git -C $w add stations.txt
+        git -C $w -c user.name='Timetable Office' -c user.email=timetable@tallowmere.example commit -q -m 'Station list'
+        git -C $w push -q $R main
+        rm -rf $w
+        git --git-dir=$R config daemon.receivepack true
+        install -d -m 0700 /var/lib/cloudtrain
+        git --git-dir=$R rev-parse main > /var/lib/cloudtrain/xlf-git.main
+        chown -R nobody:nogroup /srv/git
+        printf '[Unit]\nDescription=Tallowmere git daemon\n[Service]\nUser=nobody\nExecStart=/usr/bin/git daemon --reuseaddr --base-path=/srv/git --export-all --enable=receive-pack /srv/git\nRestart=always\n[Install]\nWantedBy=multi-user.target\n' > /etc/systemd/system/tr-git-daemon.service
+        systemctl daemon-reload; systemctl enable --now tr-git-daemon.service
+        sleep 2
+  checks:
+    - id: branch
+      description: The branch fix/TT-{{ticket}} exists on the server
+      type: shell
+      on: tr-ops-01
+      skills: [linux.git.basics]
+      weight: 1
+      command: git -c safe.directory='*' --git-dir=/srv/git/stations.git rev-parse -q --verify refs/heads/fix/TT-{{ticket}} >/dev/null && echo pushed || echo missing
+      expect: {match: exact, value: pushed}
+    - id: change
+      description: On the branch, only Dunmere was renamed
+      type: shell
+      on: tr-ops-01
+      skills: [linux.git.basics]
+      weight: 1.5
+      command: |
+        g="git -c safe.directory=* --git-dir=/srv/git/stations.git"
+        want=$(printf '%s\n' 'Ashby Junction' Bramwell 'Corran Quay' '{{newname}}' 'Elsford Parkway')
+        [ "$($g show fix/TT-{{ticket}}:stations.txt 2>/dev/null)" = "$want" ] && [ "$($g diff --name-only main fix/TT-{{ticket}} 2>/dev/null)" = stations.txt ] && echo renamed || echo wrong
+      expect: {match: exact, value: renamed}
+    - id: message
+      description: The commit message references TT-{{ticket}}
+      type: shell
+      on: tr-ops-01
+      skills: [linux.git.basics]
+      weight: 1
+      command: git -c safe.directory='*' --git-dir=/srv/git/stations.git log --format=%B main..fix/TT-{{ticket}} 2>/dev/null | grep -q 'TT-{{ticket}}' && echo referenced || echo missing
+      expect: {match: exact, value: referenced}
+    - id: main-kept
+      description: main on the server is unchanged
+      type: shell
+      on: tr-ops-01
+      skills: [linux.git.basics]
+      weight: 0.5
+      command: '[ "$(git -c safe.directory=* --git-dir=/srv/git/stations.git rev-parse main)" = "$(cat /var/lib/cloudtrain/xlf-git.main)" ] && echo kept || echo changed'
+      expect: {match: exact, value: kept}
+  misconceptions:
+    - id: pushed-main
+      description: Commits on main and pushes main.
+      feedback: "Create the branch first (git switch -c fix/TT-{{ticket}}) and push that branch: git push -u origin fix/TT-{{ticket}}."
+      expectFail: [branch, main-kept]
+      mutation:
+        on: tr-ops-01
+        as: learner
+        run: |
+          set -e
+          rm -rf ~/stations; git clone -q git://tr-ops-01/stations.git ~/stations; cd ~/stations
+          sed -i 's/^Dunmere$/{{newname}}/' stations.txt
+          git -c user.name=Learner -c user.email=learner@tallowmere.example commit -qam 'TT-{{ticket}} rename Dunmere'
+          git push -q origin main
+  solution:
+    explanation: Clone, switch to a new branch, edit, commit with the ticket in the message and push the branch to origin.
+    steps:
+      - on: tr-ops-01
+        as: learner
+        run: |
+          set -e
+          rm -rf ~/stations; git clone -q git://tr-ops-01/stations.git ~/stations; cd ~/stations
+          git switch -q -c fix/TT-{{ticket}}
+          sed -i 's/^Dunmere$/{{newname}}/' stations.txt
+          git -c user.name=Learner -c user.email=learner@tallowmere.example commit -qam 'TT-{{ticket}}: rename Dunmere to {{newname}}'
+          git push -q -u origin fix/TT-{{ticket}}

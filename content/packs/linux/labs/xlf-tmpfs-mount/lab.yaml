@@ -1,0 +1,84 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xlf-tmpfs-mount
+  title: Mount a size-limited tmpfs
+  domain: linux
+  frameworks: [lfcs:storage]
+  difficulty: easy
+  estimatedMinutes: 5
+  tags: [exam, tmpfs, fstab]
+  version: 1
+spec:
+  description: |
+    **Host:** `tr-ops-01` (`ssh tr-ops-01`, then `sudo -i`)
+
+    The fare engine needs a fast scratch area in memory. Mount a **tmpfs** at
+    **`/srv/fare-scratch`** that is limited to **{{size}} MiB** and whose root
+    directory has mode **`{{mode}}`**, now and at every boot.
+  objectives:
+    - Mount a tmpfs with size and mode options persistently
+  params:
+    size:
+      type: choice
+      values: ["32", "64", "96"]
+    mode:
+      type: choice
+      values: ["1777", "0750", "0700"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-ops-01
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["2Gi", "1Gi", "2Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-ops-01
+      run: mkdir -p /srv/fare-scratch
+  checks:
+    - id: mounted
+      description: A tmpfs of {{size}} MiB with mode {{mode}} is mounted
+      type: shell
+      on: tr-ops-01
+      skills: [linux.storage.mounts]
+      weight: 1.5
+      command: |
+        t=$(findmnt -n -o FSTYPE /srv/fare-scratch 2>/dev/null); s=$(df -BM --output=size /srv/fare-scratch 2>/dev/null | tail -1 | tr -dc 0-9)
+        m=$(stat -c %a /srv/fare-scratch); m=$(printf '%04d' $m)
+        echo "$t ${s}M $m"
+      expect: {match: exact, value: "tmpfs {{size}}M {{mode}}"}
+    - id: fstab
+      description: /etc/fstab mounts it at boot with the size and mode
+      type: shell
+      on: tr-ops-01
+      skills: [linux.storage.mounts]
+      weight: 1.5
+      command: |
+        o=$(findmnt --fstab -n -o FSTYPE,OPTIONS /srv/fare-scratch 2>/dev/null)
+        case "$o" in tmpfs*) echo "$o" | grep -qE "size=({{size}}[mM]|$(({{size}} * 1024))[kK])" && echo "$o" | grep -qE "mode=0?$(echo {{mode}} | sed 's/^0//')" && echo fstab || echo "opts=$o" ;; *) echo missing ;; esac
+      expect: {match: exact, value: fstab}
+  misconceptions:
+    - id: no-size
+      description: Mounts the tmpfs without a size limit.
+      feedback: "Without size= a tmpfs may grow to half of RAM; add size={{size}}m."
+      expectFail: [mounted, fstab]
+      mutation:
+        on: tr-ops-01
+        as: learner
+        run: |
+          echo 'tmpfs /srv/fare-scratch tmpfs mode={{mode}} 0 0' | sudo tee -a /etc/fstab >/dev/null
+          sudo systemctl daemon-reload; sudo mount /srv/fare-scratch
+  solution:
+    explanation: A tmpfs line in /etc/fstab with size= and mode=; mount applies it now.
+    steps:
+      - on: tr-ops-01
+        as: learner
+        run: |
+          echo 'tmpfs /srv/fare-scratch tmpfs size={{size}}m,mode={{mode}} 0 0' | sudo tee -a /etc/fstab >/dev/null
+          sudo systemctl daemon-reload
+          sudo mount /srv/fare-scratch

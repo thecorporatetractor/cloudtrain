@@ -1,0 +1,98 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xlf-archive-compare
+  title: Archive a tree and report the differences from a backup
+  domain: linux
+  frameworks: [lfcs:essential-commands]
+  difficulty: easy
+  estimatedMinutes: 6
+  tags: [exam, tar, diff]
+  version: 1
+spec:
+  description: |
+    **Host:** `tr-ops-01` (`ssh tr-ops-01`, then `sudo -i`)
+
+    1. Create a **gzip-compressed tar archive** of the live timetable tree
+       **`/srv/timetable/live`** at **`/root/archives/live-{{tag}}.tar.gz`**.
+    2. Compare the live tree with last week's backup **`/srv/timetable/backup`** and
+       write to **`/root/archives/changed-{{tag}}.txt`** the **paths relative to
+       `live`** of every file that **is new in `live` or whose content differs** from
+       the backup, one per line, **sorted**.
+  objectives:
+    - Create a gzip tar archive
+    - Compare two directory trees and report the differing files
+  params:
+    tag:
+      type: int
+      min: 1000
+      max: 9999
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-ops-01
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["2Gi", "1Gi", "2Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-ops-01
+      run: |
+        set -eu
+        rm -rf /srv/timetable; mkdir -p /srv/timetable/live/lines /srv/timetable/live/stations /root/archives
+        for l in north south east west coast valley; do seq 1 30 | sed "s/^/$l stop /" > /srv/timetable/live/lines/$l.txt; done
+        for s in ashby bramwell corran dunmere; do echo "station $s" > /srv/timetable/live/stations/$s.txt; done
+        cp -a /srv/timetable/live /srv/timetable/backup
+        t={{tag}}
+        echo "change $t" >> /srv/timetable/live/lines/$( [ $((t % 2)) = 0 ] && echo north || echo coast ).txt
+        echo "change $t" >> /srv/timetable/live/stations/corran.txt
+        echo "new line" > /srv/timetable/live/lines/harbour-$t.txt
+        echo "closed" > /srv/timetable/backup/stations/old-depot.txt
+        touch -d '2026-01-01' /srv/timetable/live/lines/east.txt
+        install -d -m 0700 /var/lib/cloudtrain
+        (cd /srv/timetable/live && find . -type f | sed 's#^\./##' | while read -r f; do cmp -s "$f" "../backup/$f" || echo "$f"; done | sort) > /var/lib/cloudtrain/xlf-changed.expected
+  checks:
+    - id: archive
+      description: The archive is gzip-compressed and holds every live file
+      type: shell
+      on: tr-ops-01
+      skills: [linux.files.links-archives]
+      weight: 1.5
+      command: |
+        a=/root/archives/live-{{tag}}.tar.gz
+        gzip -t $a 2>/dev/null || { echo not-gzip; exit 0; }
+        got=$(tar -tzf $a | grep -v '/$' | sed -n 's#^\(.*/\)\{0,1\}live/##p' | sort | paste -sd,)
+        want=$(cd /srv/timetable/live && find . -type f | sed 's#^\./##' | sort | paste -sd,)
+        [ "$got" = "$want" ] && echo complete || echo incomplete
+      expect: {match: exact, value: complete}
+    - id: report
+      description: The report lists exactly the new and changed files
+      type: shell
+      on: tr-ops-01
+      skills: [linux.shell.text-processing]
+      weight: 2
+      command: cmp -s /var/lib/cloudtrain/xlf-changed.expected /root/archives/changed-{{tag}}.txt && echo exact || echo different
+      expect: {match: exact, value: exact}
+  misconceptions:
+    - id: timestamps
+      description: Reports by modification time, catching a file whose content did not change.
+      feedback: "Compare content (diff -rq, cmp, rsync -c), not timestamps; east.txt was only touched."
+      expectFail: [report]
+      mutation:
+        on: tr-ops-01
+        as: learner
+        run: |
+          sudo tar -czf /root/archives/live-{{tag}}.tar.gz -C /srv/timetable live
+          cd /srv/timetable/live && sudo rsync -rin --out-format='%n' ./ ../backup/ | grep -v '/$' | sort | sudo tee /root/archives/changed-{{tag}}.txt >/dev/null
+  solution:
+    explanation: tar -czf archives the tree; diff -rq names files that differ or exist only in live, and sed turns those lines into relative paths.
+    steps:
+      - on: tr-ops-01
+        as: learner
+        run: |
+          sudo tar -czf /root/archives/live-{{tag}}.tar.gz -C /srv/timetable live
+          diff -rq /srv/timetable/live /srv/timetable/backup | sed -n -e 's#^Files /srv/timetable/live/\(.*\) and .* differ$#\1#p' -e 's#^Only in /srv/timetable/live/\{0,1\}\([^:]*\): \(.*\)$#\1/\2#p' | sed 's#^/##' | sort | sudo tee /root/archives/changed-{{tag}}.txt >/dev/null
