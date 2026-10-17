@@ -1,0 +1,143 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xcd-registry-tls-push
+  title: Push the reports image to the TLS registry
+  domain: containers
+  frameworks: [docker-practitioner:registry]
+  difficulty: medium
+  estimatedMinutes: 10
+  tags: [exam, docker, registry, tls, login, push]
+  version: 1
+spec:
+  description: |
+    **Host:** `cl-docker-01` (`ssh cl-docker-01`)
+
+    The exam registry runs at **`registry.copperleaf.example:5443`** over TLS with a
+    private CA. The CA certificate is `/srv/exam/registry-ca.crt`; the login is in
+    `/srv/exam/registry-credentials.txt`.
+
+    1. Make the engine **trust the registry through its CA** (do not mark the registry
+       insecure).
+    2. Log in and push the local image `reports:1.0` as
+       **`registry.copperleaf.example:5443/reports:1.0`**.
+    3. Write the pushed image's **digest** (`sha256:...`) to `~/exam/reports-digest.txt`.
+  objectives:
+    - Trust a private registry CA per registry
+    - Authenticate, tag and push to a private registry
+    - Record the digest of a pushed image
+  params:
+    pin:
+      type: int
+      min: 1000
+      max: 9999
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-docker-01
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-docker-01
+      timeoutSec: 300
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        grep -q ' registry.copperleaf.example' /etc/hosts || echo '127.0.0.1 registry.copperleaf.example' >> /etc/hosts
+        r=/srv/exam/registry; rm -rf "$r"; mkdir -p "$r/certs" "$r/auth"; cd "$r/certs"
+        openssl req -x509 -newkey rsa:2048 -nodes -keyout ca.key -out ca.crt -days 30 -subj "/CN=Copperleaf exam CA" 2>/dev/null
+        openssl req -newkey rsa:2048 -nodes -keyout server.key -out server.csr -subj "/CN=registry.copperleaf.example" 2>/dev/null
+        printf 'subjectAltName=DNS:registry.copperleaf.example\nextendedKeyUsage=serverAuth\n' > ext.cnf
+        openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out server.crt -days 30 -extfile ext.cnf 2>/dev/null
+        chmod 0644 server.key
+        htpasswd -Bbn exam "Copperleaf-{{pin}}" > "$r/auth/htpasswd"
+        docker rm -f xcd-tls-registry >/dev/null 2>&1 || true
+        docker run -d --name xcd-tls-registry --restart always -p 5443:5443 \
+          -v "$r/certs:/certs:ro" -v "$r/auth:/auth:ro" -e REGISTRY_HTTP_ADDR=0.0.0.0:5443 \
+          -e REGISTRY_HTTP_TLS_CERTIFICATE=/certs/server.crt -e REGISTRY_HTTP_TLS_KEY=/certs/server.key \
+          -e REGISTRY_AUTH=htpasswd -e REGISTRY_AUTH_HTPASSWD_REALM=copperleaf -e REGISTRY_AUTH_HTPASSWD_PATH=/auth/htpasswd \
+          registry:3 >/dev/null
+        cp "$r/certs/ca.crt" /srv/exam/registry-ca.crt
+        printf '%s\n' 'username: exam' "password: Copperleaf-{{pin}}" > /srv/exam/registry-credentials.txt
+        chmod 0644 /srv/exam/registry-ca.crt /srv/exam/registry-credentials.txt
+        d=$(mktemp -d)
+        printf '%s\n' 'FROM busybox:1.37' 'RUN echo "reports 1.0 build {{pin}}" > /reports-version' 'CMD ["cat", "/reports-version"]' > "$d/Dockerfile"
+        docker build -q -t reports:1.0 "$d" >/dev/null
+        rm -rf "$d"
+        for i in $(seq 30); do curl -s --cacert /srv/exam/registry-ca.crt -o /dev/null https://registry.copperleaf.example:5443/v2/ && break; sleep 1; done
+        install -d -o learner -g learner /home/learner/exam
+        rm -f /home/learner/exam/reports-digest.txt
+  checks:
+    - id: pushed
+      description: reports:1.0 is in the registry and is the local reports:1.0 image
+      type: shell
+      timeoutSec: 60
+      on: cl-docker-01
+      skills: [containers.registry.run-registry]
+      weight: 2
+      command: |
+        A='Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json'
+        curl -s --cacert /srv/exam/registry-ca.crt -u "exam:Copperleaf-{{pin}}" -H "$A" -o /dev/null -w '%{http_code}' \
+          https://registry.copperleaf.example:5443/v2/reports/manifests/1.0
+      expect: {match: exact, value: "200"}
+    - id: digest-recorded
+      description: ~/exam/reports-digest.txt holds the digest the registry serves for reports:1.0
+      type: shell
+      timeoutSec: 60
+      on: cl-docker-01
+      skills: [containers.registry.references]
+      weight: 2
+      command: |
+        A='Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json'
+        d=$(curl -sI --cacert /srv/exam/registry-ca.crt -u "exam:Copperleaf-{{pin}}" -H "$A" https://registry.copperleaf.example:5443/v2/reports/manifests/1.0 \
+          | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}')
+        [ -n "$d" ] && grep -qF "$d" /home/learner/exam/reports-digest.txt 2>/dev/null && echo recorded || echo wrong
+      expect: {match: exact, value: recorded}
+    - id: trusted-by-ca
+      description: The engine trusts the registry through its CA, not as an insecure registry
+      type: shell
+      timeoutSec: 60
+      on: cl-docker-01
+      skills: [containers.registry.run-registry]
+      weight: 1.5
+      command: |
+        c=/etc/docker/certs.d/registry.copperleaf.example:5443/ca.crt
+        insecure=$(jq -r '(."insecure-registries" // []) | map(select(test("copperleaf"))) | length' /etc/docker/daemon.json 2>/dev/null || echo 0)
+        if [ -f "$c" ] && cmp -s "$c" /srv/exam/registry-ca.crt && [ "${insecure:-0}" = 0 ]; then echo trusted; else echo "not-trusted"; fi
+      expect: {match: exact, value: trusted}
+  misconceptions:
+    - id: insecure-registry
+      description: Marks the registry insecure in daemon.json instead of trusting its CA.
+      feedback: "insecure-registries switches off certificate verification. Put the CA in /etc/docker/certs.d/<host>:<port>/ca.crt instead; no engine restart is needed."
+      expectFail: [trusted-by-ca]
+      mutation:
+        on: cl-docker-01
+        as: admin
+        run: |
+          echo '{ "insecure-registries": ["registry.copperleaf.example:5443"] }' > /etc/docker/daemon.json
+          systemctl restart docker
+          for i in $(seq 30); do docker info >/dev/null 2>&1 && break; sleep 1; done
+          echo "Copperleaf-{{pin}}" | runuser -u learner -- docker login -u exam --password-stdin registry.copperleaf.example:5443
+          runuser -u learner -- docker tag reports:1.0 registry.copperleaf.example:5443/reports:1.0
+          runuser -u learner -- docker push -q registry.copperleaf.example:5443/reports:1.0
+          runuser -u learner -- sh -c "docker image inspect registry.copperleaf.example:5443/reports:1.0 | jq -r '.[0].RepoDigests[]' | sed 's/.*@//' > /home/learner/exam/reports-digest.txt"
+  solution:
+    explanation: |
+      The engine reads per-registry CAs from /etc/docker/certs.d/<host>:<port>/ca.crt.
+      After login and push, the image's RepoDigests (or the push output) show the digest.
+    steps:
+      - on: cl-docker-01
+        as: learner
+        run: |
+          sudo install -D -m 0644 /srv/exam/registry-ca.crt /etc/docker/certs.d/registry.copperleaf.example:5443/ca.crt
+          sed -n 's/^password: //p' /srv/exam/registry-credentials.txt | docker login -u exam --password-stdin registry.copperleaf.example:5443
+          docker tag reports:1.0 registry.copperleaf.example:5443/reports:1.0
+          docker push registry.copperleaf.example:5443/reports:1.0
+          docker image inspect registry.copperleaf.example:5443/reports:1.0 | jq -r '.[0].RepoDigests[]' | grep '^registry.copperleaf.example:5443/' | sed 's/.*@//' > ~/exam/reports-digest.txt

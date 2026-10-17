@@ -1,0 +1,202 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-override-defaults
+  title: Run a one-off catalogue migration by overriding image defaults
+  domain: containers
+  frameworks: [ex188-aligned:run-containers, docker-practitioner:operations, docker-practitioner:build]
+  difficulty: easy
+  estimatedMinutes: 10
+  tags: [docker, entrypoint, cmd, volumes, exit-code]
+  version: 1
+spec:
+  description: |
+    Copperleaf's catalogue API runs on `cl-catalogue-01` (`ssh cl-catalogue-01`; you
+    are in the `docker` group, `sudo` works without a password) as the container
+    `catalogue-api`, from the image `copperleaf/catalogue-api:3.1`. Its database lives
+    in the named volume **`catalogue-db`**, mounted at **`/data`**.
+
+    The same image also ships the migration tool **`/app/migrate.py`**. It is a
+    Python script that takes `--apply <migration id>` and works on the database in
+    `/data`. The image, however, always starts the API server.
+
+    1. Run migration **`0042`** **once**, in a **new container** from
+       `copperleaf/catalogue-api:3.1`, against the `catalogue-db` volume. Override the
+       image's defaults so the container runs the migration tool instead of the
+       server. Keep the finished container (no `--rm`): the DBA wants its logs.
+    2. Write the migration container's **exit code** (just the number) to
+       `~/migrate-exit.txt` on `cl-catalogue-01`. The tool exits with the number of
+       legacy rows it had to skip, so a non-zero code is expected.
+
+    Leave the running `catalogue-api` container alone.
+  objectives:
+    - Tell an image's ENTRYPOINT from its CMD
+    - Override the entrypoint and arguments for a one-off run
+    - Mount an existing named volume and read a container's exit code
+  params:
+    skipped:
+      type: int
+      min: 3
+      max: 9
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-catalogue-01
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-catalogue-01
+      file: {path: /opt/copperleaf/catalogue-api/server.py, source: assets/server.py, mode: "0644"}
+    - on: cl-catalogue-01
+      file: {path: /opt/copperleaf/catalogue-api/migrate.py, source: assets/migrate.py, mode: "0755"}
+    - on: cl-catalogue-01
+      timeoutSec: 240
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        d=/opt/copperleaf/catalogue-api
+        printf '%s\n' 'FROM python:3.13-alpine' 'WORKDIR /app' 'COPY server.py migrate.py /app/' \
+          'VOLUME /data' 'EXPOSE 8080' 'ENTRYPOINT ["python3", "/app/server.py"]' 'CMD ["--port", "8080"]' > "$d/Dockerfile"
+        docker build -q -t copperleaf/catalogue-api:3.1 "$d" >/dev/null
+        rm -rf "$d"
+        docker rm -f catalogue-api >/dev/null 2>&1 || true
+        docker volume rm catalogue-db >/dev/null 2>&1 || true
+        docker volume create catalogue-db >/dev/null
+        # seed: schema 0041 and the legacy rows migration 0042 will skip
+        docker run --rm -v catalogue-db:/data busybox:1.37 sh -c '
+          echo 0041 > /data/schema_version
+          : > /data/migrations.log
+          i=0; while [ $i -lt {{skipped}} ]; do echo "legacy-$i;;" >> /data/titles.csv; i=$((i+1)); done
+          i=0; while [ $i -lt 40 ]; do echo "title-$i;Copperleaf;2026" >> /data/titles.csv; i=$((i+1)); done'
+        docker run -d --name catalogue-api -v catalogue-db:/data -p 127.0.0.1:8080:8080 copperleaf/catalogue-api:3.1 >/dev/null
+        mkdir -p /var/lib/cloudtrain
+        docker inspect catalogue-api | jq -r '.[0].Id + " " + .[0].State.StartedAt' > /var/lib/cloudtrain/catalogue-api.state
+        rm -f /home/learner/migrate-exit.txt
+  checks:
+    - id: migration-applied
+      description: The catalogue-db volume is at schema version 0042
+      type: shell
+      timeoutSec: 60
+      on: cl-catalogue-01
+      skills: [containers.build.entrypoint]
+      weight: 2
+      command: docker run --rm -v catalogue-db:/data busybox:1.37 cat /data/schema_version 2>/dev/null || echo none
+      expect: {match: exact, value: "0042"}
+    - id: applied-once
+      description: Migration 0042 was applied exactly once
+      type: shell
+      timeoutSec: 60
+      on: cl-catalogue-01
+      skills: [containers.build.entrypoint]
+      weight: 1
+      command: docker run --rm -v catalogue-db:/data busybox:1.37 grep -c '^0042 applied' /data/migrations.log || true
+      expect: {match: exact, value: "1"}
+    - id: one-off-container
+      description: A separate, finished container from copperleaf/catalogue-api:3.1 ran the migration tool
+      type: shell
+      timeoutSec: 60
+      on: cl-catalogue-01
+      skills: [containers.foundations.lifecycle, containers.build.entrypoint]
+      weight: 1.5
+      command: |
+        img=$(docker image inspect copperleaf/catalogue-api:3.1 | jq -r '.[0].Id')
+        docker ps -aq --no-trunc | xargs -r docker inspect | jq -r --arg img "$img" '
+          [ .[] | select(.Image == $img and .Name != "/catalogue-api" and .State.Running == false)
+                | select((.Path | test("migrate\\.py")) or ((.Path | test("python")) and ((.Args[0] // "") | test("migrate\\.py"))))
+                | select(.Args | join(" ") | test("0042")) ]
+          | if length > 0 then "found" else "none" end'
+      expect: {match: exact, value: found}
+    - id: exit-code-recorded
+      description: ~/migrate-exit.txt holds the migration container's exit code
+      type: shell
+      timeoutSec: 60
+      on: cl-catalogue-01
+      skills: [containers.foundations.inspect]
+      weight: 2
+      command: tr -d ' \t\r\n' < /home/learner/migrate-exit.txt 2>/dev/null || echo missing
+      expect: {match: exact, value: "{{skipped}}"}
+    - id: server-untouched
+      description: The catalogue-api container is the original one and still running
+      type: shell
+      timeoutSec: 60
+      on: cl-catalogue-01
+      skills: [containers.foundations.lifecycle]
+      weight: 1
+      command: |
+        now=$(docker inspect catalogue-api 2>/dev/null | jq -r '.[0].Id + " " + .[0].State.StartedAt + " " + (.[0].State.Running|tostring)')
+        [ "$now" = "$(cat /var/lib/cloudtrain/catalogue-api.state) true" ] && echo untouched || echo changed
+      expect: {match: exact, value: untouched}
+  hints:
+    - title: What does the image run?
+      body: "`docker image inspect` shows the image's `Entrypoint` and `Cmd`. Arguments after the image name in `docker run` replace only `Cmd`; the entrypoint stays."
+      command: docker image inspect copperleaf/catalogue-api:3.1 | jq '.[0].Config | {Entrypoint, Cmd}'
+      cost: 1
+    - title: Replacing the entrypoint
+      body: "`--entrypoint` takes a single executable (no arguments). Everything after the image name becomes its arguments. Mount the volume with `-v catalogue-db:/data`."
+      cost: 2
+    - title: The exit code
+      body: "`docker run` (without `-d`) exits with the container's exit code, so `echo $?` right after it works. Later, `docker inspect` has it under `.State.ExitCode`."
+      cost: 1
+  misconceptions:
+    - id: args-only
+      description: Puts the migration command after the image name without replacing the entrypoint.
+      feedback: "Arguments after the image name replace CMD only; the ENTRYPOINT (python3 /app/server.py) still runs and gets your words as its arguments. Use --entrypoint to replace the executable."
+      expectFail: [migration-applied, applied-once, one-off-container, exit-code-recorded]
+      mutation:
+        on: cl-catalogue-01
+        as: learner
+        run: |
+          docker run --name migrate-0042 -v catalogue-db:/data copperleaf/catalogue-api:3.1 /app/migrate.py --apply 0042
+          echo $? > ~/migrate-exit.txt
+    - id: no-volume
+      description: Runs the migration without mounting the catalogue-db volume.
+      feedback: "The image declares VOLUME /data, so without -v Docker gives the container a new, empty anonymous volume and the migration runs against nothing. Mount catalogue-db at /data."
+      expectFail: [migration-applied, applied-once, exit-code-recorded]
+      mutation:
+        on: cl-catalogue-01
+        as: learner
+        run: |
+          docker run --name migrate-0042 --entrypoint python3 copperleaf/catalogue-api:3.1 /app/migrate.py --apply 0042
+          echo $? > ~/migrate-exit.txt
+    - id: exec-into-server
+      description: Runs the migration inside the running catalogue-api container with docker exec.
+      feedback: "docker exec runs inside the live API container: there is no separate container with its own logs and exit status for the DBA. Start a one-off container from the image instead."
+      expectFail: [one-off-container]
+      mutation:
+        on: cl-catalogue-01
+        as: learner
+        run: |
+          docker exec catalogue-api python3 /app/migrate.py --apply 0042
+          echo $? > ~/migrate-exit.txt
+  solution:
+    explanation: |
+      The image's ENTRYPOINT is `python3 /app/server.py`. `--entrypoint python3`
+      replaces it, and the words after the image name become the new arguments.
+      The volume is mounted where the server mounts it. `docker run` in the foreground
+      returns the container's exit code.
+    steps:
+      - on: cl-catalogue-01
+        as: learner
+        run: |
+          docker run --name migrate-0042 -v catalogue-db:/data --entrypoint python3 \
+            copperleaf/catalogue-api:3.1 /app/migrate.py --apply 0042
+          echo $? > ~/migrate-exit.txt
+          cat ~/migrate-exit.txt
+    alternatives:
+      - id: script-entrypoint-inspect
+        description: Use the script itself as the entrypoint, run detached, then read the exit code with docker inspect.
+        steps:
+          - on: cl-catalogue-01
+            as: learner
+            run: |
+              docker run -d --name catalogue-migrate --mount type=volume,src=catalogue-db,dst=/data \
+                --entrypoint /app/migrate.py copperleaf/catalogue-api:3.1 --apply 0042
+              docker wait catalogue-migrate > /dev/null
+              docker inspect catalogue-migrate | jq -r '.[0].State.ExitCode' > ~/migrate-exit.txt

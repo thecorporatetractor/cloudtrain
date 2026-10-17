@@ -1,0 +1,134 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xcd-supply-leaked-secret
+  title: Remove a leaked storage key from the API image
+  domain: containers
+  frameworks: [docker-practitioner:supply-chain]
+  difficulty: medium
+  estimatedMinutes: 10
+  tags: [exam, docker, secrets, layers, history]
+  version: 1
+spec:
+  description: |
+    **Host:** `cl-docker-01` (`ssh cl-docker-01`)
+
+    The image **`localhost:5000/api:3.2`** in the host's registry carries the storage key
+    `CLSK-{{a}}-{{b}}`, baked in at build time. Its build context is `~/exam/api-src/`.
+
+    Rebuild the image so that **no layer, no history entry and no config field** contains
+    the key, and push the clean image under the **same tag**, `localhost:5000/api:3.2`.
+    The application itself does not need the key at build time: at run time it reads it
+    from `/run/secrets/storage_key` when that file exists. The clean image must still
+    start and print `api 3.2 ready`.
+  objectives:
+    - Find secrets in layers, history and image config
+    - Rebuild without baking secrets into any layer
+  params:
+    a:
+      type: int
+      min: 1000
+      max: 9999
+    b:
+      type: int
+      min: 1000
+      max: 9999
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-docker-01
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-docker-01
+      timeoutSec: 300
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        docker rm -f xcd-plain-registry >/dev/null 2>&1 || true
+        docker run -d --name xcd-plain-registry --restart always -p 127.0.0.1:5000:5000 registry:3 >/dev/null
+        for i in $(seq 30); do curl -fs http://127.0.0.1:5000/v2/ >/dev/null && break; sleep 1; done
+        s=/home/learner/exam/api-src
+        install -d -o learner -g learner /home/learner/exam "$s"
+        cat > "$s/app.sh" <<'SH'
+        #!/bin/sh
+        if [ -r /run/secrets/storage_key ]; then echo "storage key loaded"; fi
+        echo "api 3.2 ready"
+        SH
+        chmod 0755 "$s/app.sh"
+        cat > "$s/Dockerfile" <<'DF'
+        FROM busybox:1.37
+        ENV STORAGE_KEY=CLSK-{{a}}-{{b}}
+        RUN mkdir -p /etc/api && echo "$STORAGE_KEY" > /etc/api/storage.key
+        COPY app.sh /app.sh
+        RUN rm -f /etc/api/storage.key
+        CMD ["/app.sh"]
+        DF
+        chown -R learner:learner "$s"
+        docker build -q -t localhost:5000/api:3.2 "$s" >/dev/null
+        docker push -q localhost:5000/api:3.2 >/dev/null
+  checks:
+    - id: no-key-anywhere
+      description: No blob of localhost:5000/api:3.2 (layers, config, history, attestations) contains the key
+      type: shell
+      on: cl-docker-01
+      skills: [containers.supply-chain.secret-hygiene]
+      weight: 3
+      timeoutSec: 90
+      command: |
+        t=$(mktemp -d)
+        skopeo copy -q --all --src-tls-verify=false docker://localhost:5000/api:3.2 "oci:$t:x" >/dev/null 2>&1 || { echo pull-failed; rm -rf "$t"; exit 0; }
+        n=0; for f in "$t"/blobs/sha256/*; do zcat -f "$f" 2>/dev/null | grep -aq 'CLSK-{{a}}-{{b}}' && n=$((n + 1)); done
+        rm -rf "$t"; [ "$n" = 0 ] && echo clean || echo "leaks-in-$n-blobs"
+      expect: {match: exact, value: clean}
+    - id: still-works
+      description: The pushed image starts and prints api 3.2 ready
+      type: shell
+      on: cl-docker-01
+      skills: [containers.supply-chain.secret-hygiene]
+      weight: 1.5
+      timeoutSec: 90
+      command: docker run --rm --pull always localhost:5000/api:3.2 2>/dev/null | tail -n 1 || echo broken
+      expect: {match: exact, value: "api 3.2 ready"}
+  misconceptions:
+    - id: env-only
+      description: Removes the ENV line but still writes the key in a RUN layer that a later layer deletes.
+      feedback: "Deleting a file in a later layer hides it, but the earlier layer still contains it, and the RUN command line is in the history. Never put the key into a build step."
+      expectFail: [no-key-anywhere]
+      mutation:
+        on: cl-docker-01
+        as: learner
+        run: |
+          cd ~/exam/api-src
+          sed -i -e '/^ENV STORAGE_KEY/d' -e 's/\$STORAGE_KEY/CLSK-{{a}}-{{b}}/' Dockerfile
+          docker build -q -t localhost:5000/api:3.2 .
+          docker push -q localhost:5000/api:3.2
+    - id: build-arg
+      description: Passes the key as a build argument instead.
+      feedback: "Build arguments used by RUN end up in the image history (and in provenance). Use a build secret if a step really needs it, or keep the key out of the build."
+      expectFail: [no-key-anywhere]
+      mutation:
+        on: cl-docker-01
+        as: learner
+        run: |
+          cd ~/exam/api-src
+          sed -i 's/^ENV STORAGE_KEY=.*/ARG STORAGE_KEY/' Dockerfile
+          docker build -q --build-arg STORAGE_KEY=CLSK-{{a}}-{{b}} -t localhost:5000/api:3.2 .
+          docker push -q localhost:5000/api:3.2
+  solution:
+    explanation: The application reads the key at run time, so the build needs no key at all; rebuild from a Dockerfile without it and push over the tag.
+    steps:
+      - on: cl-docker-01
+        as: learner
+        run: |
+          cd ~/exam/api-src
+          printf '%s\n' 'FROM busybox:1.37' 'COPY app.sh /app.sh' 'CMD ["/app.sh"]' > Dockerfile
+          docker build -q -t localhost:5000/api:3.2 .
+          docker push localhost:5000/api:3.2

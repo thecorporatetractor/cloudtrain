@@ -1,0 +1,133 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xcd-net-user-bridge
+  title: Put the cache and the API on their own network
+  domain: containers
+  frameworks: [docker-practitioner:networking]
+  difficulty: easy
+  estimatedMinutes: 8
+  tags: [exam, docker, networks, dns]
+  version: 1
+spec:
+  description: |
+    **Host:** `cl-docker-01` (`ssh cl-docker-01`)
+
+    1. Create a bridge network named **`backend`** with the subnet **`172.30.8.0/24`**.
+    2. Run two containers attached to `backend` **and to no other network**:
+       - **`cache`** from `redis:7.4-alpine`;
+       - **`api`** from `copperleaf/rates-api:1`, which looks up its cache under the
+         host name `cache`.
+    3. Both must run again on their own after a host reboot.
+  objectives:
+    - Create a user-defined bridge with a fixed subnet
+    - Attach containers to a single network and resolve them by name
+  params:
+    region:
+      type: choice
+      values: [emea, apac, amer]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-docker-01
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-docker-01
+      timeoutSec: 240
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        d=$(mktemp -d)
+        cat > "$d/rates-api" <<'SH'
+        #!/bin/sh
+        trap 'exit 0' TERM INT
+        while :; do
+          if redis-cli -h cache -t 2 ping 2>/dev/null | grep -q PONG; then echo "rates-api $REGION: cache ok"; else echo "rates-api $REGION: cache unreachable"; fi
+          sleep 5 & wait $!
+        done
+        SH
+        chmod 0755 "$d/rates-api"
+        printf '%s\n' 'FROM redis:7.4-alpine' 'COPY rates-api /usr/local/bin/rates-api' 'ENV REGION={{region}}' \
+          'ENTRYPOINT ["/usr/local/bin/rates-api"]' > "$d/Dockerfile"
+        docker build -q -t copperleaf/rates-api:1 "$d" >/dev/null
+        rm -rf "$d"
+  checks:
+    - id: network
+      description: Network backend is a bridge with subnet 172.30.8.0/24
+      type: shell
+      timeoutSec: 60
+      on: cl-docker-01
+      skills: [containers.network.bridge-dns, containers.network.address-pools]
+      weight: 1.5
+      command: docker network inspect backend 2>/dev/null | jq -r '.[0].Driver + " " + ([.[0].IPAM.Config[]?.Subnet] | join(","))'
+      expect: {match: exact, value: "bridge 172.30.8.0/24"}
+    - id: only-backend
+      description: cache and api are attached to backend and nothing else
+      type: shell
+      timeoutSec: 60
+      on: cl-docker-01
+      skills: [containers.network.bridge-dns]
+      weight: 1.5
+      command: docker inspect cache api 2>/dev/null | jq -r '[.[] | (.NetworkSettings.Networks | keys | join(","))] | join(" ")'
+      expect: {match: exact, value: "backend backend"}
+    - id: by-name
+      description: api reaches cache by name
+      type: shell
+      timeoutSec: 60
+      on: cl-docker-01
+      skills: [containers.network.bridge-dns]
+      weight: 2
+      command: docker exec api redis-cli -h cache -t 3 ping 2>/dev/null || echo unreachable
+      expect: {match: exact, value: PONG}
+    - id: images-and-restart
+      description: Both run the requested images and come back after a reboot
+      type: shell
+      timeoutSec: 60
+      on: cl-docker-01
+      skills: [containers.operations.restart-health]
+      weight: 1
+      command: |
+        docker inspect cache api 2>/dev/null | jq -r '[.[] | .Config.Image + ":" + (if (.HostConfig.RestartPolicy.Name | IN("always", "unless-stopped")) then "restarts" else "stays-down" end)] | join(" ")'
+      expect: {match: exact, value: "redis:7.4-alpine:restarts copperleaf/rates-api:1:restarts"}
+  misconceptions:
+    - id: no-subnet
+      description: Creates backend without the requested subnet.
+      feedback: "Without --subnet the engine picks a range from its default pools."
+      expectFail: [network]
+      mutation:
+        on: cl-docker-01
+        as: learner
+        run: |
+          docker network create backend
+          docker run -d --name cache --network backend --restart unless-stopped redis:7.4-alpine
+          docker run -d --name api --network backend --restart unless-stopped copperleaf/rates-api:1
+    - id: also-default
+      description: Starts the containers on the default bridge, then connects them to backend as well.
+      feedback: "docker network connect adds a network; the default bridge stays attached. Start them with --network backend instead."
+      expectFail: [only-backend]
+      mutation:
+        on: cl-docker-01
+        as: learner
+        run: |
+          docker network create --subnet 172.30.8.0/24 backend
+          docker run -d --name cache --restart unless-stopped redis:7.4-alpine
+          docker run -d --name api --restart unless-stopped copperleaf/rates-api:1
+          docker network connect backend cache
+          docker network connect backend api
+  solution:
+    explanation: Create the network with its subnet and start both containers directly on it with a restart policy.
+    steps:
+      - on: cl-docker-01
+        as: learner
+        run: |
+          docker network create --driver bridge --subnet 172.30.8.0/24 backend
+          docker run -d --name cache --network backend --restart unless-stopped redis:7.4-alpine
+          docker run -d --name api --network backend --restart unless-stopped copperleaf/rates-api:1

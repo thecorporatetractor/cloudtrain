@@ -1,0 +1,189 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-exec-form-signals
+  title: Make the ad-insertion service stop cleanly
+  domain: containers
+  frameworks: [ex188-aligned:build-images, docker-practitioner:build]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [docker, dockerfile, entrypoint, signals, pid1]
+  version: 1
+spec:
+  description: |
+    Copperleaf's ad-insertion service keeps bookings in memory and writes them out when
+    it receives `SIGTERM`. On `cl-ads-01` (`ssh cl-ads-01`; you are in the `docker`
+    group) every `docker stop ad-insertion` takes the full 10 seconds, ends with a
+    `SIGKILL`, and the in-flight bookings are lost: the service never logs its
+    `clean shutdown` line.
+
+    The build context is `~/ad-insertion/` (`Dockerfile`, `docker-entrypoint.sh`,
+    `ad.py`). Do not change `ad.py`.
+
+    1. Fix the image so that `docker stop` delivers `SIGTERM` to the service: a stop must
+       finish within **2 seconds** and the service must log `clean shutdown`.
+    2. Build it as **`copperleaf/ad-insertion:1.1`** and replace the running container
+       **`ad-insertion`** with one from the new image (same name, still running).
+  objectives:
+    - Explain why a shell-form ENTRYPOINT or a wrapper script swallows signals
+    - Use exec form and exec in entrypoint scripts
+  params:
+    region:
+      type: choice
+      values: [north, south, west]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-ads-01
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-ads-01
+      timeoutSec: 240
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        a=/home/learner/ad-insertion
+        install -d -o learner -g learner "$a"
+        cat > "$a/ad.py" <<'PY'
+        import os, signal, sys, time
+        bookings = 0
+        def term(signum, frame):
+            print(f"clean shutdown: {bookings} bookings written", flush=True)
+            sys.exit(0)
+        signal.signal(signal.SIGTERM, term)
+        print(f"ad-insertion serving region {os.environ.get('AD_REGION', '?')}", flush=True)
+        while True:
+            bookings += 1
+            time.sleep(0.5)
+        PY
+        printf '%s\n' '#!/bin/sh' '# prepare the booking spool, then start the service' \
+          'mkdir -p /var/spool/ads' 'echo "spool ready for region ${AD_REGION:-?}"' 'python3 /app/ad.py' > "$a/docker-entrypoint.sh"
+        chmod 0755 "$a/docker-entrypoint.sh"
+        printf '%s\n' 'FROM python:3.13-alpine' 'COPY ad.py /app/ad.py' 'COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh' \
+          'ENV AD_REGION={{region}}' 'ENTRYPOINT /usr/local/bin/docker-entrypoint.sh' > "$a/Dockerfile"
+        chown -R learner:learner "$a"
+        sha256sum "$a/ad.py" > /var/tmp/ad.py.sha256
+        docker build -q -t copperleaf/ad-insertion:1.0 "$a" >/dev/null
+        docker rm -f ad-insertion >/dev/null 2>&1 || true
+        docker run -d --name ad-insertion copperleaf/ad-insertion:1.0 >/dev/null
+  checks:
+    - id: new-image-running
+      description: ad-insertion runs copperleaf/ad-insertion:1.1
+      type: shell
+      timeoutSec: 60
+      on: cl-ads-01
+      skills: [containers.build.entrypoint]
+      weight: 1
+      command: docker inspect ad-insertion 2>/dev/null | jq -r '.[0].Config.Image + " " + (.[0].State.Running | tostring)'
+      expect: {match: exact, value: "copperleaf/ad-insertion:1.1 true"}
+    - id: clean-fast-stop
+      description: A container from copperleaf/ad-insertion:1.1 stops within 2 s and logs clean shutdown
+      type: shell
+      on: cl-ads-01
+      skills: [containers.build.signals]
+      weight: 3
+      timeoutSec: 60
+      command: |
+        docker rm -f ct-stop-probe >/dev/null 2>&1
+        docker run -d --name ct-stop-probe copperleaf/ad-insertion:1.1 >/dev/null 2>&1 || { echo no-image; exit 0; }
+        for i in $(seq 30); do docker logs ct-stop-probe 2>&1 | grep -q '^ad-insertion serving' && break; sleep 1; done
+        t0=$(date +%s%N); docker stop ct-stop-probe >/dev/null; ms=$(( ($(date +%s%N) - t0) / 1000000 ))
+        c=$(docker logs ct-stop-probe 2>&1 | grep -c '^clean shutdown'); docker rm -f ct-stop-probe >/dev/null
+        [ "$ms" -le 2000 ] && [ "$c" -ge 1 ] && echo clean || echo "not-clean-${ms}ms"
+      expect: {match: exact, value: clean}
+    - id: exec-form
+      description: The image's ENTRYPOINT is in exec form (no /bin/sh -c wrapper)
+      type: shell
+      timeoutSec: 60
+      on: cl-ads-01
+      skills: [containers.build.entrypoint]
+      weight: 1
+      command: docker image inspect copperleaf/ad-insertion:1.1 2>/dev/null | jq -r '((.[0].Config.Entrypoint // [])[0:2] | join(" ")) | if . == "/bin/sh -c" or . == "" then "shell-form" else "exec-form" end'
+      expect: {match: exact, value: exec-form}
+    - id: service-unchanged
+      description: ad.py is unchanged and the service still prepares its spool and region
+      type: shell
+      timeoutSec: 60
+      on: cl-ads-01
+      skills: [containers.build.entrypoint]
+      weight: 1
+      command: |
+        sha256sum -c --status /var/tmp/ad.py.sha256 || { echo changed; exit 0; }
+        docker logs ad-insertion 2>&1 | grep -c -e '^spool ready for region {{region}}$' -e '^ad-insertion serving region {{region}}$'
+      expect: {match: exact, value: "2"}
+  hints:
+    - title: Who is PID 1?
+      body: "`docker exec ad-insertion ps -o pid,args` shows the process tree. docker stop sends SIGTERM to PID 1 only."
+      command: docker exec ad-insertion ps -o pid,args
+      cost: 1
+    - title: Two wrappers
+      body: "A shell-form ENTRYPOINT runs under /bin/sh -c, and the entrypoint script starts python as a child. A shell does not pass SIGTERM on to its children."
+      cost: 2
+    - title: exec
+      body: "Write ENTRYPOINT as a JSON array, and end the script with `exec python3 /app/ad.py` so python replaces the shell as PID 1."
+      cost: 2
+  misconceptions:
+    - id: exec-form-only
+      description: Switches ENTRYPOINT to exec form but keeps the script starting python as a child.
+      feedback: "Now the script is PID 1, but it still starts python as a child and ignores SIGTERM. End the script with exec python3 /app/ad.py."
+      expectFail: [clean-fast-stop]
+      mutation:
+        on: cl-ads-01
+        as: learner
+        run: |
+          cd ~/ad-insertion
+          sed -i 's#^ENTRYPOINT .*#ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]#' Dockerfile
+          docker build -q -t copperleaf/ad-insertion:1.1 .
+          docker rm -f ad-insertion && docker run -d --name ad-insertion copperleaf/ad-insertion:1.1
+    - id: shorter-timeout
+      description: Shortens the stop timeout instead of fixing signal delivery.
+      feedback: "docker stop -t 1 just kills sooner; the service still never sees SIGTERM and still loses its bookings."
+      expectFail: [clean-fast-stop, exec-form]
+      mutation:
+        on: cl-ads-01
+        as: learner
+        run: |
+          cd ~/ad-insertion
+          docker build -q -t copperleaf/ad-insertion:1.1 .
+          docker rm -f ad-insertion && docker run -d --name ad-insertion --stop-timeout 1 copperleaf/ad-insertion:1.1
+  solution:
+    explanation: |
+      Exec-form ENTRYPOINT removes the /bin/sh -c wrapper, and `exec` in the script
+      replaces the shell with python, so python is PID 1 and receives SIGTERM.
+    steps:
+      - on: cl-ads-01
+        as: learner
+        run: |
+          cd ~/ad-insertion
+          sed -i 's#^python3 /app/ad.py$#exec python3 /app/ad.py#' docker-entrypoint.sh
+          sed -i 's#^ENTRYPOINT .*#ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]#' Dockerfile
+          docker build -t copperleaf/ad-insertion:1.1 .
+          docker rm -f ad-insertion
+          docker run -d --name ad-insertion copperleaf/ad-insertion:1.1
+    alternatives:
+      - id: python-entrypoint
+        description: Move the spool preparation into the image and start python directly.
+        steps:
+          - on: cl-ads-01
+            as: learner
+            run: |
+              cd ~/ad-insertion
+              cat > Dockerfile <<'DF'
+              FROM python:3.13-alpine
+              COPY ad.py /app/ad.py
+              COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+              ENV AD_REGION={{region}}
+              RUN sed -i 's#^python3 /app/ad.py$#exec python3 /app/ad.py#' /usr/local/bin/docker-entrypoint.sh
+              ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+              DF
+              docker build -t copperleaf/ad-insertion:1.1 .
+              docker rm -f ad-insertion
+              docker run -d --name ad-insertion copperleaf/ad-insertion:1.1

@@ -1,0 +1,154 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xcd-compose-fix-broken-stack
+  title: Repair the storefront Compose stack
+  domain: containers
+  frameworks: [docker-practitioner:compose]
+  difficulty: medium
+  estimatedMinutes: 12
+  tags: [exam, docker, compose, networks, volumes, troubleshooting]
+  version: 1
+spec:
+  description: |
+    **Host:** `cl-docker-01` (`ssh cl-docker-01`)
+
+    `~/exam/storefront/` holds the storefront stack (project `storefront`): `web` (nginx,
+    proxying to `app` on port 5000), `app` and `cache`. `docker compose up -d` fails, and
+    even partly fixed versions do not serve pages.
+
+    Fix `compose.yaml` (and only what is wrong in it) so that all three services are
+    running and **`http://127.0.0.1:8088/`** on the host returns the storefront page
+    through `web`. Keep `app`'s data on a named volume mounted at `/data`.
+  objectives:
+    - Read Compose errors and fix volume, network and port definitions
+  params:
+    token:
+      type: int
+      min: 10000
+      max: 99999
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-docker-01
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-docker-01
+      timeoutSec: 240
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        d=$(mktemp -d)
+        cat > "$d/app.py" <<'PY'
+        import http.server, os, pathlib
+        data = pathlib.Path("/data"); data.mkdir(exist_ok=True)
+        f = data / "visits"
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                n = int(f.read_text()) + 1 if f.exists() else 1
+                f.write_text(str(n))
+                self.send_response(200); self.end_headers()
+                self.wfile.write(f"storefront ok {os.environ.get('TOKEN', '-')}\n".encode())
+        http.server.ThreadingHTTPServer(("", 5000), H).serve_forever()
+        PY
+        printf '%s\n' 'FROM python:3.13-alpine' 'COPY app.py /app/app.py' 'CMD ["python3", "/app/app.py"]' > "$d/Dockerfile"
+        docker build -q -t copperleaf/storefront-app:1 "$d" >/dev/null
+        rm -rf "$d"
+        s=/home/learner/exam/storefront
+        install -d -o learner -g learner /home/learner/exam "$s"
+        printf '%s\n' 'server {' '  listen 80;' '  location / { proxy_pass http://app:5000; }' '}' > "$s/nginx.conf"
+        cat > "$s/compose.yaml" <<'YML'
+        name: storefront
+        services:
+          web:
+            image: nginx:1.29-alpine
+            ports: ["8088:8080"]
+            volumes: ["./nginx.conf:/etc/nginx/conf.d/default.conf:ro"]
+            networks: [front]
+            depends_on: [app]
+            restart: unless-stopped
+          app:
+            image: copperleaf/storefront-app:1
+            environment:
+              TOKEN: "{{token}}"
+            volumes: ["catalogue:/data"]
+            networks: [back]
+            restart: unless-stopped
+          cache:
+            image: redis:7.4-alpine
+            networks: [back]
+            restart: unless-stopped
+        networks:
+          front: {}
+          back: {}
+        YML
+        chown -R learner:learner "$s"
+  checks:
+    - id: all-running
+      description: web, app and cache of project storefront are running
+      type: shell
+      on: cl-docker-01
+      skills: [containers.compose.model]
+      weight: 1.5
+      timeoutSec: 60
+      command: |
+        docker ps --filter status=running --filter label=com.docker.compose.project=storefront --format json | jq -rs '[.[] | .Labels | capture("com.docker.compose.service=(?<s>[^,]+)").s] | sort | join(",")'
+      expect: {match: exact, value: "app,cache,web"}
+    - id: page-served
+      description: http://127.0.0.1:8088/ returns the storefront page through web
+      type: shell
+      on: cl-docker-01
+      skills: [containers.compose.model, containers.network.bridge-dns]
+      weight: 3
+      timeoutSec: 60
+      command: |
+        for i in $(seq 10); do r=$(curl -fsS --max-time 3 http://127.0.0.1:8088/ 2>/dev/null) && break; sleep 2; done; echo "${r:-down}"
+      expect: {match: exact, value: "storefront ok {{token}}"}
+    - id: data-volume
+      description: app keeps its data on a named volume at /data
+      type: shell
+      timeoutSec: 60
+      on: cl-docker-01
+      skills: [containers.compose.model, containers.storage.mount-types]
+      weight: 1
+      command: |
+        c=$(docker ps -q --filter label=com.docker.compose.project=storefront --filter label=com.docker.compose.service=app | head -1)
+        docker inspect "$c" 2>/dev/null | jq -r '[.[0].Mounts[] | select(.Destination == "/data") | .Type] | join(",")'
+      expect: {match: exact, value: volume}
+  misconceptions:
+    - id: port-and-volume-only
+      description: Declares the volume and fixes the port, but leaves web and app on different networks.
+      feedback: "web can only resolve app if both share a network; web is only on front and app only on back. Put web on back too (or app on front)."
+      expectFail: [page-served]
+      mutation:
+        on: cl-docker-01
+        as: learner
+        run: |
+          cd ~/exam/storefront
+          sed -i 's/"8088:8080"/"8088:80"/' compose.yaml
+          printf '%s\n' 'volumes:' '  catalogue: {}' >> compose.yaml
+          docker compose up -d || true
+          sleep 5
+  solution:
+    explanation: |
+      Three mistakes: the named volume catalogue is not declared at the top level (up
+      fails), web publishes container port 8080 while nginx listens on 80, and web and
+      app share no network, so nginx cannot resolve app.
+    steps:
+      - on: cl-docker-01
+        as: learner
+        run: |
+          cd ~/exam/storefront
+          sed -i -e 's/"8088:8080"/"8088:80"/' -e 's/    networks: \[front\]/    networks: [front, back]/' compose.yaml
+          printf '%s\n' 'volumes:' '  catalogue: {}' >> compose.yaml
+          docker compose up -d
+          sleep 3
+          curl -s http://127.0.0.1:8088/
