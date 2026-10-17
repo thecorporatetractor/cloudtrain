@@ -60,13 +60,15 @@ spec:
       type: shell
       on: records-dc
       command: |
-        f=/proc/net/bonding/bond0; [ -f $f ] || exit 1
-        grep -q 'Bonding Mode: IEEE 802.3ad' $f || exit 1
-        ids=$(awk '/^Slave Interface/{s=$3} /Aggregator ID/ && s{print s, $3; s=""}' $f | sort | tr '\n' ' ')
-        agg=$(awk '/Active Aggregator Info/{f=1} f && /Aggregator ID/{print $3; exit}' $f)
-        echo "$ids" | grep -Eq "^eth1 $agg eth2 $agg $" || exit 1
-        grep -A5 'Active Aggregator Info' $f | grep -q 'Partner Mac Address: 00:00:00:00:00:00' && exit 1
-        echo bundled
+        ip -d -j link show | python3 -c '
+        import json,sys
+        L={l["ifname"]:l for l in json.load(sys.stdin)}
+        b=L.get("bond0",{}).get("linkinfo",{}).get("info_data",{})
+        ok=b.get("mode")=="802.3ad" and b.get("ad_num_ports")==2 and b.get("ad_partner_mac","00:00:00:00:00:00")!="00:00:00:00:00:00"
+        for m in ("eth1","eth2"):
+            l=L.get(m,{}); sd=l.get("linkinfo",{}).get("info_slave_data",{})
+            ok=ok and l.get("master")=="bond0" and sd.get("ad_aggregator_id")==b.get("ad_aggregator")
+        print("bundled" if ok else "not-bundled")'
       expect: { match: exact, value: bundled }
       skills: [net.switching.etherchannel]
       weight: 2
@@ -82,12 +84,17 @@ spec:
       type: shell
       on: mv-sw-dc-1
       command: |
-        f=/proc/net/bonding/bond0; [ -f $f ] || exit 1
-        grep -q 'Bonding Mode: IEEE 802.3ad' $f || exit 1
-        ids=$(awk '/^Slave Interface/{s=$3} /Aggregator ID/ && s{print s, $3; s=""}' $f | sort | tr '\n' ' ')
-        agg=$(awk '/Active Aggregator Info/{f=1} f && /Aggregator ID/{print $3; exit}' $f)
-        echo "$ids" | grep -Eq "^eth1 $agg eth2 $agg $" || exit 1
-        [ -e /sys/class/net/br0/brif/bond0 ] && [ ! -e /sys/class/net/br0/brif/eth1 ] && [ ! -e /sys/class/net/br0/brif/eth2 ]
+        ip -d -j link show | python3 -c '
+        import json,sys
+        L={l["ifname"]:l for l in json.load(sys.stdin)}
+        b=L.get("bond0",{}).get("linkinfo",{}).get("info_data",{})
+        ok=b.get("mode")=="802.3ad" and b.get("ad_num_ports")==2 and b.get("ad_partner_mac","00:00:00:00:00:00")!="00:00:00:00:00:00"
+        for m in ("eth1","eth2"):
+            l=L.get(m,{}); sd=l.get("linkinfo",{}).get("info_slave_data",{})
+            ok=ok and l.get("master")=="bond0" and sd.get("ad_aggregator_id")==b.get("ad_aggregator")
+        print("bundled" if ok else "not-bundled")'
+        [ -e /sys/class/net/br0/brif/bond0 ] && [ ! -e /sys/class/net/br0/brif/eth1 ] && [ ! -e /sys/class/net/br0/brif/eth2 ] || echo not-bridged
+      expect: { match: exact, value: bundled }
       skills: [net.switching.etherchannel]
       weight: 2
     - id: reachable
@@ -127,8 +134,8 @@ spec:
       command: "ip link set eth1 nomaster"
       cost: 2
     - title: Check the aggregator
-      body: "/proc/net/bonding/bond0 shows each member's Aggregator ID and the partner's MAC; both members need the active aggregator's ID."
-      command: "cat /proc/net/bonding/bond0"
+      body: "`ip -d link show bond0` shows the active aggregator, the number of ports in it and the partner's MAC; `ip -d link show eth1` shows the member's aggregator ID."
+      command: "ip -d link show bond0"
       cost: 1
   misconceptions:
     - id: server-only
