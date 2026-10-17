@@ -195,6 +195,8 @@ apiVersion: kubeadm.k8s.io/v1beta4
 kind: InitConfiguration
 localAPIEndpoint: { advertiseAddress: $VM_IP, bindPort: 6443 }
 nodeRegistration: { name: vm, criSocket: unix:///run/containerd/containerd.sock, taints: [] }
+# same timeouts as the kubeadm lab driver (internal/drivers/kubeadm.go kubeadmTimeouts)
+timeouts: { controlPlaneComponentHealthCheck: 10m0s, kubeletHealthCheck: 8m0s, kubernetesAPICall: 3m0s, etcdAPICall: 5m0s }
 ---
 apiVersion: kubeadm.k8s.io/v1beta4
 kind: ClusterConfiguration
@@ -206,11 +208,20 @@ kind: KubeletConfiguration
 cgroupDriver: systemd
 resolvConf: /etc/cloudtrain/resolv.conf
 EOF
-kubeadm init --config /root/kubeadm.yaml > /var/log/kubeadm.log 2>&1 || { tail -30 /var/log/kubeadm.log; exit 1; }
+: > /var/log/kubeadm.log; ok=0
+# bounded retry with reset, as the kubeadm lab driver does (init times out under host load)
+for i in 1 2 3; do
+  echo "cloudtrain: kubeadm init attempt \$i/3" | tee -a /var/log/kubeadm.log
+  t=\$SECONDS
+  if kubeadm init --config /root/kubeadm.yaml >> /var/log/kubeadm.log 2>&1; then ok=1; echo "kubeadm init attempt \$i succeeded in \$((SECONDS - t))s"; break; fi
+  echo "cloudtrain: kubeadm init attempt \$i failed after \$((SECONDS - t))s; resetting"; grep -E '^error' /var/log/kubeadm.log | tail -1
+  kubeadm reset -f >> /var/log/kubeadm.log 2>&1 || true; sleep 20
+done
+[ \$ok = 1 ] || { tail -30 /var/log/kubeadm.log; exit 1; }
 export KUBECONFIG=/etc/kubernetes/admin.conf
 /opt/cloudtrain/bin/cni-install 10.244.0.0/16
 for i in \$(seq 120); do kubectl get node vm --no-headers 2>/dev/null | grep -qw Ready && break; sleep 2; done
-kubectl -n kube-system rollout status ds/calico-node --timeout=240s
+kubectl -n kube-system rollout status ds/calico-node --timeout=600s
 kubectl get nodes -o wide
 EOS
 }
