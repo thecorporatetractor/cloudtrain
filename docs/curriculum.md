@@ -17,8 +17,8 @@ Legend. **Type**: learn = guided first exposure, do = complete a task, fix = rep
 | Containers with Docker | 11 | 91 | 44 | 2 | 24 | 0 | 111 | B 71, C 64 | 28 |
 | Infrastructure as code with Terraform | 5 | 54 | 45 | 2 | 48 | 0 | 51 | A 53, B 1, V 45 | 21 |
 | Configuration management and automation | 7 | 61 | 36 | 1 | 0 | 0 | 97 | A 39, B 7, C 45, N 6 | 26 |
-| Network administration | 4 | 45 | 32 | 1 | 22 | 3 | 52 | N 77 | 15 |
-| **Total** | 43 | 499 | 379 | 13 | 151 | 158 | 569 | A 176, B 148, C 235, K 112, V 124, N 83 | 161 |
+| Network administration | 4 | 45 | 32 | 1 | 23 | 2 | 52 | N 77 | 15 |
+| **Total** | 43 | 499 | 379 | 13 | 152 | 157 | 569 | A 176, B 148, C 235, K 112, V 124, N 83 | 161 |
 
 Cross-domain exams: Platform engineer practical capstone. Exam tasks are counted under the domain of each task. Learning labs by type: learn 47, do 356, fix 83, hack 13. New skills proposed: 291.
 
@@ -1099,7 +1099,7 @@ _CloudTrain is not affiliated with or endorsed by Cisco Systems, Inc. or Red Hat
 | `net-inter-vlan-subinterfaces` | Route between campus VLANs on one router link | do | medium | 20 | N | verified | ccna:network-access | Configure 802.1Q subinterfaces for VLANs 20, 30 and 40 on mv-campus-north's single trunk to the switch so hosts in each VLAN reach the others through their own gateway address. |
 | `net-rstp-root-bridge` | Choose the spanning-tree root for a campus triangle | do | medium | 20 | N | verified | ccna:network-access | Run RSTP on three switches cabled in a triangle and set bridge priorities so mv-sw-core-1 is root and the link between the two access switches is the one that blocks. |
 | `net-fix-broadcast-storm` | Stop a broadcast storm caused by a new redundant link | fix | hard | 20 | N | built | ccna:network-access | A contractor added a second cable between two annex switches and the annex network melted down; prove the loop with a capture, enable rapid spanning tree and keep both cables connected. |
-| `net-lacp-server-uplink` | Bundle two links to the data-centre server with LACP | do | medium | 20 | N | built | ccna:network-access | Bond two links between mv-sw-dc-1 and the student-records server with 802.3ad so both carry traffic and the server stays reachable when the grader cuts either link. |
+| `net-lacp-server-uplink` | Bundle two links to the data-centre server with LACP | do | medium | 20 | N | verified | ccna:network-access | Bond two links between mv-sw-dc-1 and the student-records server with 802.3ad so both carry traffic and the server stays reachable when the grader cuts either link. |
 | `net-srlinux-vlan-trunk` | Build access and trunk ports on a network OS switch | do | medium | 20 | N | proposed | ccna:network-access | On the SR Linux switch mv-sw-annex-1 create a bridged network instance with an untagged access port in VLAN 30 and a tagged uplink carrying VLANs 20 and 30, then prove hosts on both sides reach each other. |
 | `net-read-routing-table` | Predict next hops from a routing table | learn | easy | 15 | N | proposed | ccna:ip-connectivity | Read mv-core-1's routing table with connected, static and OSPF routes and write the next hop and source protocol for five district destinations to a file the grader checks against the forwarding plane. |
 | `net-static-routes-campuses` | Connect the district office and two campuses with static routes | do | easy | 15 | N | proposed | ccna:ip-connectivity | Add static routes on mv-core-1, mv-campus-north and mv-campus-south so every campus LAN reaches the other two and the district office, with no route pointing at an unreachable next hop. |
