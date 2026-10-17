@@ -78,10 +78,10 @@ How the exam tasks are designed, following the exam-engine contract:
 
 ## In flight
 
-Nothing. Scoped manager of round 3: namespace `ct-k8sdevsec-system`, selector
-`labs.cloudtrain.dev/verify=k8s-devsec` (shared with k8s-sec); remove it with
-`kubectl --context kind-cloudtrain-dev delete ns ct-k8sdevsec-system` plus its
-ClusterRole/Binding `lab-orchestrator-ct-k8sdevsec-system` when no longer needed.
+Nothing. The round-3 scoped manager (namespace `ct-k8sdevsec-system`, selector
+`labs.cloudtrain.dev/verify=k8s-devsec`, shared with k8s-sec) has been deleted,
+with its ClusterRole/Binding. Deploy a new one before the next verify ("How to
+resume").
 
 ## Round 3 lab fixes (all re-verified)
 
@@ -107,7 +107,7 @@ ClusterRole/Binding `lab-orchestrator-ct-k8sdevsec-system` when no longer needed
 
 ## Next steps, in order
 
-1. Redeploy the scoped manager (see "Resume").
+1. Deploy a scoped manager (see "How to resume"; the round-3 one is gone).
 2. Done in round 3: all V learning labs and the 25 V exam tasks.
 3. Run the exam through the gateway smoke (`exam-smoke.mjs --exam sim-k8s-developer --no-solve`).
 4. Check that C: has at least 15 GB free, then verify the K labs with the vm slot: tariff-cache-statefulset, xkd-pvc-mount-pod, xkd-workload-kind-choice, xkd-netpol-allow-frontend, xkd-nodeport-expose.
@@ -129,8 +129,8 @@ ClusterRole/Binding `lab-orchestrator-ct-k8sdevsec-system` when no longer needed
 3. **orchestrator-deploy.sh dies on a failing `kind load`** (busybox:1.37 whose local Docker ID differs from the one on the node: "content digest not found"), even though the image is already on the nodes by tag. Workaround: `LOAD_LAB_IMAGES=0`.
 4. **The schema has no `type: exam`**; exam-ness lives only in curriculum.yaml. lab-verify now reads it (commit e2aff0c and earlier): exam tasks must not have hints and need no course.
 5. **The scratchpad directory is shared between agents** (same session path). Another stream overwrote my `v.sh`, `setstatus.py` and `queue.log`, which made a queue of verifies fail instantly. My scripts now live in `scratchpad/k8sdev/`.
-6. **Round 3: k8s-query checks still default to 5 s.** Under load single queries time out (xkd-bluegreen-switch, xkd-init-container-seed). Lab-side: `timeoutSec: 20`. Platform: raise `grader.DefaultTimeout` too.
-7. **Round 3: baseline PSA vs `kubectl debug`.** The vcluster accepts ephemeral containers that the host namespace's baseline refuses (the default `general` profile adds SYS_PTRACE); the Pod is then stuck because no later ephemeral container syncs either. Learners get no error. Platform options: install a VAP like xkd-debug-distroless's in every vcluster, or let the syncer surface the SyncError as a Pod event. Labs or exams that use `kubectl debug` in other streams (k8s-admin's distroless-invoice-debug when written) hit the same trap.
+6. **Fixed (platform round 4): k8s-query, k8s-can-i and k8s-context checks default to 20 s.** Was: **Round 3: k8s-query checks still default to 5 s.** Under load single queries time out (xkd-bluegreen-switch, xkd-init-container-seed). Lab-side: `timeoutSec: 20`. Platform: raise `grader.DefaultTimeout` too.
+7. **Fixed (platform round 4): every vcluster gets the ValidatingAdmissionPolicy `cloudtrain-ephemeral-pod-security`**, so `kubectl debug` with the default profile is refused at once with `... must not add capabilities ... use --profile=baseline` and the Pod stays debuggable; xkd-debug-distroless's own namespace-scoped policy is now redundant (harmless). Was: **Round 3: baseline PSA vs `kubectl debug`.** The vcluster accepts ephemeral containers that the host namespace's baseline refuses (the default `general` profile adds SYS_PTRACE); the Pod is then stuck because no later ephemeral container syncs either. Learners get no error. Platform options: install a VAP like xkd-debug-distroless's in every vcluster, or let the syncer surface the SyncError as a Pod event. Labs or exams that use `kubectl debug` in other streams (k8s-admin's distroless-invoice-debug when written) hit the same trap.
 8. **Round 3: editing a running bash script breaks it.** (Agent-side.) Two verifies died with `command not found` after the queue's v.sh was edited mid-run; write a new file instead.
 9. **Round 3: a WSL restart (2026-10-17 02:30) killed in-flight verifies** with websocket 1006 / connection refused; nothing lab-related, re-run.
 

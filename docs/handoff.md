@@ -6,7 +6,19 @@ its own detailed handoff in `docs/handoffs/`.
 ## Read first
 
 Platform fixes round 3 (branch `fix/platform-round-3`) closed the first four
-items of the old list; what is left of them:
+items of the old list; round 4 (branch `fix/platform-round-4`, proof in
+`deploy/.results/platform-round-4-proof.txt`) closed what was left of them except
+Kata and the kubeadm proof under load:
+
+0. **Round 4.** Kubernetes checks (k8s-query, k8s-can-i, k8s-context) default to a
+   20 s timeout (was 5 s). Every vcluster gets the ValidatingAdmissionPolicy
+   `cloudtrain-ephemeral-pod-security`: `kubectl debug` with the default profile is
+   refused at once with a message naming `--profile=baseline`, instead of a debug
+   container that never starts and blocks the Pod's later ones. Lab link attachments
+   are rate-limited on the host side (`--link-rate-mbps`, default 10 Mbit/s each way).
+   A wired entry node's NetworkPolicy no longer filters its link attachments (P3),
+   and wired pods run in a user namespace with writable network sysctls (P4,
+   `--link-sysctls`). The round-3 manager `ct-k8sdevsec-system` has been deleted.
 
 1. **vcluster Pod Security: fixed.** Every vcluster host namespace now enforces
    Pod Security `baseline` (audit `restricted`; manager flag
@@ -26,9 +38,8 @@ items of the old list; what is left of them:
    logical switches get `vlan-passthru=true` (manager execs `ovn-nbctl` in
    ovn-central, flag `--ovn-central`). Proven with the `net-trunk-two-switches`
    draft (VLAN 20/30 tagged + native 99 across two Linux bridges). The L2 drafts in
-   `docs/handoffs/networking-drafts/` no longer need `l2shim.sh`. Still open:
-   P3 (entry NetworkPolicy on a wired entry), P4 (read-only sysctls), no rate limit
-   on link segments (do not run `net-fix-broadcast-storm`).
+   `docs/handoffs/networking-drafts/` no longer need `l2shim.sh`. P3, P4 and the
+   link rate limit: fixed in round 4 (item 0); `net-fix-broadcast-storm` may run.
 4. **Learner sudo: available as an opt-in.** Entry node `learnerSudo: true`
    (security trade-off, see `docs/dev-environment.md`); the lab's setup grants the
    sudoers rule. Default stays `allowPrivilegeEscalation: false`; operators can
@@ -77,8 +88,8 @@ automation (Ansible), and the exam task pools of those domains.
    `task dev:up` (it now heals expired KubeVirt certs itself) and `task dev:deps`.
 2. **Platform fixes:** done in round 3 (read-first 1-4 above, plus: `file.source`
    assets are templated and the schema now says so; shell checks default to a 30 s
-   timeout; the gateway smoke lab creates the learner's `~/handover`). Left: Kata,
-   kubeadm proof under real load, networking P3/P4 and link rate limiting.
+   timeout; the gateway smoke lab creates the learner's `~/handover`) and round 4
+   (item 0). Left: Kata and the kubeadm proof under real load.
 3. **Exam integration: done** (2026-10-15). `task dev:orchestrator` reconciles the
    gateway's ExamSessions (selector `app.kubernetes.io/managed-by=cloudtrain-gateway`;
    the deploy warns when another manager would overlap); `exam-smoke.mjs` logs in

@@ -117,7 +117,8 @@ func ValidPodSecurity(level string) bool {
 // default because restricted rejects the vcluster control plane itself
 // (its syncer runs as root without a seccomp profile) and most lab
 // workloads (busybox as root). Restricted violations are still recorded
-// in the audit log.
+// in the audit log. Ephemeral containers get an earlier, clearer refusal
+// inside the virtual cluster (EphemeralPolicyManifests).
 func (d *VClusterDriver) HostNamespacePodSecurity() map[string]string {
 	level := d.PodSecurity
 	if level == "" {
@@ -284,7 +285,13 @@ func (d *VClusterDriver) values(ref NodeRef, release string) ([]byte, error) {
 			vc["storageClass"] = d.StorageClass
 		}
 	}
+	// Applied by the syncer inside the virtual cluster on every start.
+	manifests, err := EphemeralPolicyManifests(d.PodSecurity)
+	if err != nil {
+		return nil, err
+	}
 	return yaml.Marshal(map[string]any{
+		"experimental": map[string]any{"deploy": map[string]any{"vcluster": map[string]any{"manifests": manifests}}},
 		"controlPlane": map[string]any{
 			"proxy": map[string]any{"extraSANs": []string{release + "." + d.hostNS(ref) + ".svc"}},
 			"statefulSet": map[string]any{

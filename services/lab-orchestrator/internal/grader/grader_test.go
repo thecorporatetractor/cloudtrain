@@ -125,8 +125,8 @@ func TestGradeChecks(t *testing.T) {
 	// Routing: shell defaults to the entry node, k8s-query to the cluster,
 	// k8s-context runs as the learner.
 	joined := strings.Join(f.calls, "\n")
-	for _, w := range []string{"ws|admin|timeout -k 2 30 /bin/sh -c echo hi", "c1|admin|timeout -k 2 5 kubectl get node n1 -o jsonpath={.spec.unschedulable}",
-		"ws|learner|timeout -k 2 5 kubectl config current-context", "c1|admin|timeout -k 2 5 kubectl auth can-i delete pods -n ns --as system:serviceaccount:ns:sa"} {
+	for _, w := range []string{"ws|admin|timeout -k 2 30 /bin/sh -c echo hi", "c1|admin|timeout -k 2 20 kubectl get node n1 -o jsonpath={.spec.unschedulable}",
+		"ws|learner|timeout -k 2 20 kubectl config current-context", "c1|admin|timeout -k 2 20 kubectl auth can-i delete pods -n ns --as system:serviceaccount:ns:sa"} {
 		if !strings.Contains(joined, w) {
 			t.Errorf("missing call %q in\n%s", w, joined)
 		}
@@ -151,7 +151,11 @@ func TestDefaultTimeouts(t *testing.T) {
 	}{
 		{labsv1.Check{Type: "shell"}, DefaultShellTimeout},
 		{labsv1.Check{Type: "file"}, DefaultTimeout},
-		{labsv1.Check{Type: "k8s-query"}, DefaultTimeout},
+		{labsv1.Check{Type: "k8s-query"}, DefaultK8sTimeout},
+		{labsv1.Check{Type: "k8s-can-i"}, DefaultK8sTimeout},
+		{labsv1.Check{Type: "k8s-context"}, DefaultK8sTimeout},
+		{labsv1.Check{Type: "http"}, DefaultTimeout},
+		{labsv1.Check{Type: "k8s-query", TimeoutSec: 3}, 3 * time.Second},
 		{labsv1.Check{Type: "shell", TimeoutSec: 7}, 7 * time.Second},
 		{labsv1.Check{Type: "shell", TimeoutSec: 9999}, MaxTimeout},
 	} {

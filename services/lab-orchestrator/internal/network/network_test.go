@@ -162,6 +162,9 @@ func TestDecoratePod(t *testing.T) {
 			t.Errorf("link %s: layer2_forward = %q", l.ID, got)
 		}
 	}
+	if _, ok := pod.Annotations[p.Links[0].Segment.Provider+IngressRateSuffix]; ok {
+		t.Error("rate limit set without LinkRateMbps")
+	}
 	if _, ok := pod.Annotations["ovn.kubernetes.io/layer2_forward"]; ok {
 		t.Error("management interface must not forward unknown MACs")
 	}
@@ -179,6 +182,7 @@ func TestDecoratePod(t *testing.T) {
 	script := pod.Spec.InitContainers[0].Command[2]
 	for _, want := range []string{
 		"net.ipv4.ip_forward=1",
+		"net.ipv4.ping_group_range='0 65535'",
 		"ip -4 route del default via 198.19.255.1 dev eth0",
 		"ip -4 addr flush dev eth1",
 		"ip -4 addr flush dev eth2",
@@ -195,6 +199,38 @@ func TestDecoratePod(t *testing.T) {
 	caps := pod.Spec.Containers[0].SecurityContext.Capabilities.Add
 	if len(caps) != 2 {
 		t.Errorf("node caps = %v", caps)
+	}
+
+	if init := pod.Spec.InitContainers[0].SecurityContext; init.Privileged == nil || !*init.Privileged || pod.Spec.HostUsers != nil {
+		t.Errorf("without user namespaces net-init must be privileged: %+v hostUsers=%v", init, pod.Spec.HostUsers)
+	}
+
+	// With user namespaces: no privileged container, unmasked /proc in
+	// net-init and the node (writable network sysctls), sidecar unchanged.
+	un := &corev1.Pod{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "node"}}}}
+	if err := p.DecoratePod("edge-1", un, "node", PodOptions{ToolsImage: "t", Router: true, UserNamespace: true, LinkRateMbps: 10}); err != nil {
+		t.Fatal(err)
+	}
+	for _, l := range p.Links[:2] {
+		if un.Annotations[l.Segment.Provider+IngressRateSuffix] != "10" || un.Annotations[l.Segment.Provider+EgressRateSuffix] != "10" {
+			t.Errorf("link %s: rate annotations %v", l.ID, un.Annotations)
+		}
+	}
+	if _, ok := un.Annotations["ovn.kubernetes.io/ingress_rate"]; ok {
+		t.Error("management interface must not be rate limited")
+	}
+	if un.Spec.HostUsers == nil || *un.Spec.HostUsers {
+		t.Error("hostUsers not false")
+	}
+	isc := un.Spec.InitContainers[0].SecurityContext
+	if isc.Privileged != nil || isc.ProcMount == nil || *isc.ProcMount != corev1.UnmaskedProcMount || len(isc.Capabilities.Add) != 2 {
+		t.Errorf("net-init security context %+v", isc)
+	}
+	if pm := un.Spec.Containers[0].SecurityContext.ProcMount; pm == nil || *pm != corev1.UnmaskedProcMount {
+		t.Error("node container /proc not unmasked")
+	}
+	if un.Spec.Containers[1].SecurityContext.ProcMount != nil {
+		t.Error("sidecar /proc unmasked")
 	}
 
 	// A host on a host-only link gets its platform address, no forwarding.

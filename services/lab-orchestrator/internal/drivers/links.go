@@ -41,6 +41,13 @@ type LinkNetwork struct {
 	// DestroyWait bounds how long DestroyTopology waits for the network to
 	// be gone before returning a retryable error (default 45s).
 	DestroyWait time.Duration
+	// UserNamespaces runs wired pods in a user namespace with writable
+	// network sysctls (network.PodOptions.UserNamespace). Set it only when
+	// the cluster supports user namespaces (DetectUserNamespaces).
+	UserNamespaces bool
+	// LinkRateMbps rate-limits every link attachment in both directions
+	// (network.PodOptions.LinkRateMbps); 0 = no limit.
+	LinkRateMbps int
 	// OVN, when set, makes link segments pass 802.1Q-tagged frames
 	// (vlan-passthru on their logical switches). Nil: tagged frames are
 	// dropped on links.
@@ -199,7 +206,7 @@ func (n *LinkNetwork) DecoratePod(ref NodeRef, pod *corev1.Pod, container string
 	if err != nil {
 		return err
 	}
-	return p.DecoratePod(ref.Node.Name, pod, container, network.PodOptions{ToolsImage: n.ToolsImage, Router: router})
+	return p.DecoratePod(ref.Node.Name, pod, container, network.PodOptions{ToolsImage: n.ToolsImage, Router: router, UserNamespace: n.UserNamespaces, LinkRateMbps: n.LinkRateMbps})
 }
 
 // CaptureTarget is where a capture on a link end runs: the link sidecar of

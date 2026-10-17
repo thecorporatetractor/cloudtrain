@@ -46,7 +46,7 @@ time; some edited afterwards).
 | net-fix-native-vlan-mismatch | **yes (P1+P2)** | |
 | net-inter-vlan-subinterfaces | **yes (P1+P2)** | Linux router (netsvc) instead of FRR: FRR console cannot create VLAN devices |
 | net-rstp-root-bridge | **yes** (BPDUs pass without the fix; host ping needs P1) | kernel bridge STP is 802.1D, mstpd/RSTP impossible in a pod netns (user STP needs init netns) |
-| net-fix-broadcast-storm | **yes**, and do not run until the platform rate-limits link segments | a loop on OVN segments with FDB learning may flood the OVN southbound DB; mark `built` with that note |
+| net-fix-broadcast-storm | **yes** | platform round 4 rate-limits every link attachment (10 Mbit/s each way, host side); the draft ran live under it: seed 2 passed 5/5 and the mutation behaved, seed 1 failed `hosts-reachable` right after the solution (reachable again about a minute later: STP and OVN MAC learning still settling); lengthen the solution's wait or retry the reachability check before marking it verified |
 | net-lacp-server-uplink | **yes** | LACP negotiation itself works across OVN (spike) |
 | net-default-route-edge | no | |
 | net-floating-static-backup | no | core uses a BFD-tracked static so the return path fails over (`ip route ... bfd`, untested) |
@@ -142,6 +142,14 @@ keeps that order, or rework them.
 - **P2 - link segments drop 802.1Q-tagged frames.** Tagged frames left the trunk
   port but never arrived; `ovn-nbctl set Logical_Switch <ls> other_config:vlan-passthru=true`
   fixed it. Needed for trunks and router-on-a-stick.
+- **P3 and P4 are fixed in the platform (round 4)**: the entry NetworkPolicy of a
+  wired entry carries `ovn.kubernetes.io/network_policy_for: ovn` (plus the access
+  NAD when the lab has VMs), so it no longer filters link attachments; wired pods
+  run in a user namespace with an unmasked `/proc` in the node container, so
+  network sysctls (`ip_forward`, `rp_filter`, `accept_ra`, `proxy_arp`, ...) are
+  writable by root in the node (host-wide ones stay read-only), and
+  `ping_group_range` lets the learner ping without NET_RAW. The unwired-workstation
+  workaround and the dhcpcd SLAAC workaround are no longer required. Original findings:
 - **P3 - a wired entry node gets the entry NetworkPolicy**, and Kube-OVN applies
   it to its link attachments too, so unicast IP to that node over lab links is
   dropped (seen when the entry defaulted to a bridge node:
