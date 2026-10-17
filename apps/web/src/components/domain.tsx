@@ -1,5 +1,5 @@
 import { Link } from '@tanstack/react-router';
-import { Box, Boxes, CheckCircle2, Clock, Network, RotateCcw, Router, Server, Shuffle, Target, TerminalSquare, TrendingUp, type LucideProps } from 'lucide-react';
+import { Box, Boxes, CheckCircle2, Clock, FileCode, Network, RotateCcw, Router, Server, Shuffle, Target, TerminalSquare, TrendingUp, Workflow, type LucideProps } from 'lucide-react';
 import type { ReactNode } from 'react';
 import { useSkills } from '@/api/client';
 import type { Difficulty, Domain, LabSummary, NodeDriver, NodeStatus, Recommendation } from '@/api/types';
@@ -11,10 +11,20 @@ import { cn, formatMinutes, titleCase } from '@/lib/utils';
 export function DomainIcon({ domain, ...rest }: { domain: Domain } & LucideProps) {
   if (domain === 'kubernetes') return <Boxes {...rest} />;
   if (domain === 'linux') return <TerminalSquare {...rest} />;
+  if (domain === 'containers') return <Box {...rest} />;
+  if (domain === 'iac') return <FileCode {...rest} />;
+  if (domain === 'automation') return <Workflow {...rest} />;
   return <Network {...rest} />;
 }
 
-export const domainLabel: Record<Domain, string> = { kubernetes: 'Kubernetes', linux: 'Linux', networking: 'Networking' };
+export const domainLabel: Record<Domain, string> = {
+  kubernetes: 'Kubernetes',
+  linux: 'Linux',
+  containers: 'Containers',
+  iac: 'Infrastructure as code',
+  automation: 'Automation',
+  networking: 'Networking',
+};
 
 /* -------------------------------- Difficulty -------------------------------- */
 

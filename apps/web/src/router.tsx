@@ -85,7 +85,7 @@ export interface CatalogSearch {
   difficulty?: Difficulty;
   maxMinutes?: number;
 }
-const DOMAINS: Domain[] = ['kubernetes', 'linux', 'networking'];
+const DOMAINS: Domain[] = ['kubernetes', 'linux', 'containers', 'iac', 'automation', 'networking'];
 const DIFFS: Difficulty[] = ['easy', 'medium', 'hard'];
 
 export const catalogRoute = createRoute({

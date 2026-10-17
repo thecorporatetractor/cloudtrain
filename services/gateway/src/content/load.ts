@@ -72,12 +72,26 @@ interface PackDoc {
 }
 
 /** skills.yaml domain ids are short; the API uses the long form. */
-const DOMAIN_OF: Record<string, Domain> = { k8s: 'kubernetes', kubernetes: 'kubernetes', linux: 'linux', net: 'networking', networking: 'networking' };
+const DOMAIN_OF: Record<string, Domain> = {
+  k8s: 'kubernetes',
+  kubernetes: 'kubernetes',
+  linux: 'linux',
+  containers: 'containers',
+  iac: 'iac',
+  automation: 'automation',
+  net: 'networking',
+  networking: 'networking',
+};
+/** Always listed; the wave-2 domains appear once they have labs. */
+const CORE_DOMAINS: readonly Domain[] = ['kubernetes', 'linux', 'networking'];
 const FRAMEWORK_IDS: readonly FrameworkId[] = ['cka', 'cks', 'lfcs', 'ccna'];
 
 const DOMAIN_INFO: Record<Domain, { name: string; tagline: string }> = {
   kubernetes: { name: 'Kubernetes', tagline: 'Real kubeadm and virtual clusters, from etcd to admission.' },
   linux: { name: 'Linux', tagline: 'Full VMs for storage, services and access control.' },
+  containers: { name: 'Containers', tagline: 'Build, ship and run images with a real container engine.' },
+  iac: { name: 'Infrastructure as code', tagline: 'Terraform against real clusters and stores, fully offline.' },
+  automation: { name: 'Automation', tagline: 'Idempotent configuration management across a fleet.' },
   networking: { name: 'Networking', tagline: 'Routers, switches and firewalls on real L2 wires.' },
 };
 
@@ -271,12 +285,14 @@ export async function loadContent(contentDir: string, extraLabDirs: string[] = [
     };
   });
 
-  const domains: DomainInfo[] = (Object.keys(DOMAIN_INFO) as Domain[]).map((id) => ({
-    id,
-    ...DOMAIN_INFO[id],
-    labCount: summaries.filter((l) => l.domain === id).length,
-    pathCount: paths.filter((p) => p.domain === id).length,
-  }));
+  const domains: DomainInfo[] = (Object.keys(DOMAIN_INFO) as Domain[])
+    .map((id) => ({
+      id,
+      ...DOMAIN_INFO[id],
+      labCount: summaries.filter((l) => l.domain === id).length,
+      pathCount: paths.filter((p) => p.domain === id).length,
+    }))
+    .filter((d) => CORE_DOMAINS.includes(d.id) || d.labCount > 0);
 
   const contentPacks: ContentPack[] = packs.map((p) => ({
     id: p.metadata.id,

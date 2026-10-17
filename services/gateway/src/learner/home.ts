@@ -184,7 +184,9 @@ export function buildHome(input: HomeInput): HomeData {
   }
   activity.sort((a, b) => b.at.localeCompare(a.at));
 
-  const domains: Domain[] = ['kubernetes', 'linux', 'networking'];
+  const domains: Domain[] = (['kubernetes', 'linux', 'containers', 'iac', 'automation', 'networking'] as const).filter(
+    (d) => d === 'kubernetes' || d === 'linux' || d === 'networking' || content.skills.some((s) => s.domain === d),
+  );
   const masteryByDomain = domains.map((d) => {
     const ids = content.skills.filter((s) => s.domain === d).map((s) => s.id);
     const practised = ids.filter((id) => mu.has(id));
