@@ -33,7 +33,7 @@ describe('content loader (real content/)', () => {
 
   it('maps frameworks: ids prefixed per objective, weights summing to 1', async () => {
     const c = await realContent();
-    expect(c.frameworks.map((f) => f.id).sort()).toEqual(['ccna', 'cka', 'cks', 'lfcs']);
+    expect(c.frameworks.map((f) => f.id).sort()).toEqual(['ccna', 'cka', 'ckad', 'cks', 'lfcs']);
     const cka = c.frameworks.find((f) => f.id === 'cka')!;
     expect(cka.name).toBe('CKA');
     expect(cka.fullName).toBe('Certified Kubernetes Administrator');
@@ -42,6 +42,18 @@ describe('content loader (real content/)', () => {
     // lab metadata.frameworks reference these ids
     const drain = c.summaries.find((l) => l.id === 'drain-yard-worker')!;
     for (const f of drain.frameworks ?? []) expect(cka.domains.some((d) => d.id === f)).toBe(true);
+  });
+
+  it('loads every framework file, so tags of a known framework resolve to its domains', async () => {
+    // CKAD was dropped by the loader: its tags rendered as raw ids ("CKAD · services networking")
+    // next to the real name of the sibling CKA domain ("CKA · Services and networking").
+    const c = await realContent();
+    const files = (await readdir(path.join(repo, 'content/frameworks'))).filter((f) => /\.ya?ml$/.test(f));
+    expect(c.frameworks).toHaveLength(files.length);
+    const loaded = new Set(c.frameworks.map((f) => f.id as string));
+    const domains = new Set(c.frameworks.flatMap((f) => f.domains.map((d) => d.id)));
+    const unknown = c.summaries.flatMap((l) => (l.frameworks ?? []).filter((f) => loaded.has(f.split(':')[0]!) && !domains.has(f)).map((f) => `${l.id}: ${f}`));
+    expect(unknown).toEqual([]);
   });
 
   it('turns pack courses and paths into catalog paths', async () => {

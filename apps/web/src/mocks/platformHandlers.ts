@@ -148,8 +148,9 @@ function buildMe(s: MockSession): Me | undefined {
     role: legacyRole(roles),
     team: teams[0]?.name ?? '',
     org: org?.name ?? '',
-    streakDays: p.id === 'u-ingrid' ? 6 : Math.round(attemptsFor(p.id).length / 3),
-    minutesThisWeek: Math.round(attemptsFor(p.id).filter((a) => Date.now() - new Date(a.startedAt).getTime() < 7 * 86_400_000).reduce((x, a) => x + a.durationS / 60, 0)),
+    // Like the gateway: only graded practice (a Validate run) counts toward streak and time.
+    streakDays: p.id === 'u-ingrid' ? 6 : Math.round(attemptsFor(p.id).filter((a) => a.validations > 0).length / 3),
+    minutesThisWeek: Math.round(attemptsFor(p.id).filter((a) => a.validations > 0 && Date.now() - new Date(a.startedAt).getTime() < 7 * 86_400_000).reduce((x, a) => x + a.durationS / 60, 0)),
     user: { ...userRef(p.id), lastLoginAt: p.lastLoginDaysAgo === undefined ? undefined : new Date(Date.now() - p.lastLoginDaysAgo * 86_400_000).toISOString() },
     activeOrg: org ? { id: org.id, slug: org.slug, name: org.name } : null,
     memberships: Object.entries(p.orgs).map(([orgId, r]) => ({ org: { id: orgs[orgId]!.id, slug: orgs[orgId]!.slug, name: orgs[orgId]!.name }, roles: r, status: p.status ?? 'active' })),

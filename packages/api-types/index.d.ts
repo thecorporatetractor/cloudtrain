@@ -17,7 +17,7 @@ export type Domain = 'kubernetes' | 'linux' | 'containers' | 'iac' | 'automation
 export type Difficulty = 'easy' | 'medium' | 'hard';
 export type NodeDriver = 'container' | 'vm' | 'k8s-cluster' | 'netdev';
 export type AccessKind = 'shell' | 'ssh' | 'console' | 'web' | 'rdp';
-export type FrameworkId = 'cka' | 'cks' | 'lfcs' | 'ccna';
+export type FrameworkId = 'cka' | 'ckad' | 'cks' | 'lfcs' | 'ccna';
 
 export interface LabMetadata {
   id: string;
@@ -170,21 +170,90 @@ export interface Framework {
   domains: FrameworkDomain[];
 }
 
+/**
+ * How much evidence stands behind a model number. `prior`: none of the inputs
+ * have evidence yet, so the value is the model's default for someone it does
+ * not know (label it "no data yet", never as a prediction). `estimate`: based
+ * on graded practice.
+ */
+export type EstimateConfidence = 'prior' | 'estimate';
+
 export interface Recommendation {
   labId: string;
+  /** Internal ranking score (0..1). Not meant for learners. */
   score: number;
   predictedSuccess: number; // 0..1
-  expectedGain: number; // skill points
+  expectedGain: number; // skill points (internal unit)
+  /** Whether predictedSuccess rests on evidence about the lab's skills. */
+  confidence?: EstimateConfidence;
+  /** Lab skills with graded evidence (of skillIds.length). */
+  evidenceSkills?: number;
+  /** Goal readiness change (0..1, absolute) if the learner passes the lab. */
+  readinessGain?: number;
+  /** Goal framework domains (FrameworkDomain ids) the lab counts toward. */
+  goalDomainIds?: string[];
+  /** A lab practised in the last two weeks that shares skills with this one. */
+  buildsOn?: { labId: string; title: string };
   reasons: { kind: 'gain' | 'review' | 'goal' | 'prereq' | 'time' | 'variety'; text: string }[];
+}
+
+export interface GoalDomain {
+  domainId: string;
+  readiness: number;
+  delta7d: number;
+  /** Exam weight 0..1. */
+  weight?: number;
+  /** Skills of the domain with graded evidence / all skills of the domain. */
+  practisedSkills?: number;
+  skills?: number;
+  /** A lab to practise this domain next (best recommendation that covers it). */
+  labId?: string;
 }
 
 export interface GoalForecast {
   frameworkId: FrameworkId;
   targetDate: string;
+  /** `assignment`: due date of an assigned framework goal; `default`: placeholder (no date chosen yet). */
+  targetDateSource?: 'assignment' | 'default';
   readiness: number; // 0..1
+  /** Readiness at which the plan counts the learner as exam-ready (0..1). */
+  readyAt?: number;
+  /** Only meaningful when confidence is `estimate`. */
   forecastReadyDate: string;
+  confidence?: EstimateConfidence;
+  /** Graded practice sessions in the last four weeks behind the forecast. */
+  sessions?: number;
+  /** Average practice minutes per week over the last four weeks (actual, not a target). */
   weeklyMinutes: number;
-  perDomain: { domainId: string; readiness: number; delta7d: number }[];
+  /** Planning estimate of practice minutes still needed to reach readyAt. */
+  minutesToReady?: number;
+  /** Minutes per day from today needed to be ready by targetDate. */
+  dailyMinutesNeeded?: number;
+  /** Ordered by exam weight x gap (most valuable first). */
+  perDomain: GoalDomain[];
+}
+
+/** An unfinished attempt worth picking up again (most recent first). */
+export interface ResumeItem {
+  labId: string;
+  startedAt: string;
+  /** Times the lab was opened without passing in the last 14 days. */
+  attempts: number;
+  checksPassed: number;
+  checksTotal: number;
+  /** Graded runs (Validate) in the latest attempt. */
+  validations: number;
+  /** Live session to reattach to; absent when the environment has expired. */
+  sessionId?: string;
+}
+
+/** What a learner without graded practice sees instead of model numbers. */
+export interface ColdStart {
+  /** Short labs across the heaviest exam domains: a baseline that seeds the model. */
+  baselineLabIds: string[];
+  baselineMinutes: number;
+  /** First-week plan: one entry per practice day. */
+  plan: { day: number; title: string; labId?: string; minutes: number }[];
 }
 
 export interface Activity {
@@ -202,7 +271,9 @@ export interface Learner {
   role: 'learner' | 'manager' | 'admin';
   team: string;
   org: string;
+  /** Consecutive days with graded practice (a Validate run). */
   streakDays: number;
+  /** Practice minutes in the last 7 days: time in labs where a Validate ran, up to the last run. */
   minutesThisWeek: number;
 }
 
@@ -214,6 +285,10 @@ export interface HomeData {
   masteryByDomain: { domain: Domain; mastery: number; skills: number; practicedSkills: number }[];
   /** Open assignments, soonest due first (platform API). */
   assignmentsDue?: MyAssignment[];
+  /** The most recent unfinished lab, offered above the next best lab. */
+  resume?: ResumeItem;
+  /** Present while the learner has no graded practice. */
+  coldStart?: ColdStart;
   /** `live`: computed from the learner's history; `empty`: no history yet, cold-start defaults. */
   source?: 'live' | 'empty';
 }

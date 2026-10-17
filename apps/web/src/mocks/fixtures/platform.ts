@@ -156,6 +156,8 @@ export const people: PersonSeed[] = [
   { id: 'u-olu', name: 'Oluwaseun Bello', email: 'oluwaseun.bello@quillmoor.example', title: 'Data engineer', orgs: { [Q]: ['learner'] }, teams: [{ teamId: 't-data', role: 'member' }], lastLoginDaysAgo: 12, joinedDaysAgo: 40, skills: [0.3, 0.28, 0.22, 0.15, 0.3, 0.42, 0.55, 0.4, 0.05, 0.05, 0.08] },
   { id: 'u-chloe', name: 'Chloé Dubois', email: 'chloe.dubois@quillmoor.example', title: 'Depot systems lead', orgs: { [Q]: ['learner', 'manager'] }, teams: [{ teamId: 't-depot', role: 'manager' }], lastLoginDaysAgo: 6, joinedDaysAgo: 90, skills: [0.2, 0.2, 0.15, 0.1, 0.25, 0.7, 0.66, 0.72, 0.3, 0.28, 0.35] },
   { id: 'u-greta', name: 'Greta Lindqvist', email: 'greta.lindqvist@quillmoor.example', title: 'Depot systems administrator', orgs: { [Q]: ['learner'] }, teams: [{ teamId: 't-depot', role: 'member' }], lastLoginDaysAgo: 2, joinedDaysAgo: 45, skills: [0.1, 0.1, 0.1, 0.05, 0.15, 0.62, 0.58, 0.64, 0.22, 0.2, 0.3] },
+  // Signed up this week: no graded practice yet (Home cold start, see fixtures/home.ts).
+  { id: 'u-noor', name: 'Noor Aziz', email: 'noor.aziz@quillmoor.example', title: 'Platform engineer (new starter)', orgs: { [Q]: ['learner'] }, teams: [], lastLoginDaysAgo: 0, joinedDaysAgo: 3 },
   { id: 'u-hugo', name: 'Hugo Marchetti', email: 'hugo.marchetti@quillmoor.example', title: 'Depot systems administrator', orgs: { [Q]: ['learner'] }, teams: [{ teamId: 't-depot', role: 'member' }], status: 'invited', joinedDaysAgo: 2, source: 'invite' },
   { id: 'u-sven', name: 'Sven Aalto', email: 'sven.aalto@quillmoor.example', title: 'SRE (left)', orgs: { [Q]: ['learner'] }, teams: [], status: 'deactivated', lastLoginDaysAgo: 34, joinedDaysAgo: 118 },
   // Acme Freight
@@ -220,6 +222,7 @@ export interface Persona {
 }
 export const personas: Persona[] = [
   { id: 'learner', userId: 'u-lena', orgId: Q, label: 'Learner', hint: 'Lena Varga · Junior SRE' },
+  { id: 'new_learner', userId: 'u-noor', orgId: Q, label: 'New learner', hint: 'Noor Aziz · no history yet' },
   { id: 'manager', userId: 'u-ingrid', orgId: Q, label: 'Manager', hint: 'Ingrid Solvang · two teams' },
   { id: 'instructor', userId: 'u-samir', orgId: Q, label: 'Instructor', hint: 'Samir Haddad · CKS bootcamp' },
   { id: 'author', userId: 'u-aino', orgId: Q, label: 'Author', hint: 'Aino Lehto · Scenario Studio' },
@@ -254,6 +257,14 @@ const labTitle = (id: string) => labSummaries.find((l) => l.id === id)?.title ??
 export function attemptsFor(userId: string): Attempt[] {
   const p = personById.get(userId);
   if (!p || p.status === 'invited') return [];
+  if (userId === 'u-noor') {
+    // Opened the same lab twice, never validated; both environments expired after an hour.
+    const lab = labSummaries.find((l) => l.id === 'orchard-netpol-isolation')!;
+    return [50, 50.1].map((hoursAgo, i) => {
+      const startedAt = ago(Math.round(hoursAgo * HOUR));
+      return { id: `att-noor-${i}`, labId: lab.id, labTitle: lab.title, labVersion: lab.version ?? 1, sessionName: `ls-orchard-netp-noor${i}`, startedAt, endedAt: new Date(new Date(startedAt).getTime() + 3600_000).toISOString(), outcome: 'abandoned' as const, score: 0, hintsUsed: 0, validations: 0, durationS: 3600, checksPassed: 0, checksTotal: 5 };
+    });
+  }
   const n = userId === 'u-ingrid' ? 14 : 4 + Math.round(seeded(`${userId}:n`) * 9);
   const out: Attempt[] = [];
   for (let i = 0; i < n; i++) {

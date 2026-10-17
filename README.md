@@ -69,7 +69,7 @@ When a learner is ready, they take a timed exam simulation built the same way.
 
 | | |
 |---|---|
-| ![Home](docs/images/home.png) **Home**: the next best lab and why, goal forecast, mastery | ![Catalog](docs/images/catalog.png) **Catalog**: domains, paths and labs |
+| ![Home](docs/images/home.png) **Home**: resume, the next best lab and why, a study plan toward the exam goal, mastery | ![Catalog](docs/images/catalog.png) **Catalog**: domains, paths and labs |
 | ![Exam workspace](docs/images/exam-workspace.png) **Exam simulation**: one timer, task navigator with flags, terminals into the exam environment | ![Exam results](docs/images/exam-results.png) **Exam results**: per-task and per-objective breakdown against the pass mark |
 | ![Real terminal](docs/images/real-terminal.png) **Real lab**: a terminal into a live lab on the cluster | ![Skills](docs/images/skills.png) **Skills**: mastery and uncertainty per framework |
 | ![Team dashboard](docs/images/team.png) **Manager**: team competency heatmap, deadlines, at-risk learners | ![Assign](docs/images/assign.png) **Assign**: labs, paths or frameworks to people or teams, with due dates |

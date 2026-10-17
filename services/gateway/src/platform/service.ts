@@ -372,12 +372,13 @@ export class PlatformService implements SessionHooks {
 
   async attemptsLite(tx: Tx, userId: string, days: number): Promise<AttemptLite[]> {
     return tx
-      .selectFrom('lab_attempts')
-      .select(['id', 'lab_id', 'started_at', 'ended_at', 'outcome', 'score', 'hints_used', 'duration_s'])
-      .where('user_id', '=', userId)
-      .where('started_at', '>', new Date(this.now().getTime() - days * DAY))
-      .orderBy('started_at', 'desc')
-      .execute();
+      .selectFrom('lab_attempts as a')
+      .select(['a.id', 'a.lab_id', 'a.started_at', 'a.ended_at', 'a.outcome', 'a.score', 'a.hints_used', 'a.duration_s', 'a.session_name', 'a.validations', 'a.checks_passed', 'a.checks_total'])
+      .select((eb) => eb.selectFrom('check_results as c').select((e) => e.fn.max('c.graded_at').as('m')).whereRef('c.attempt_id', '=', 'a.id').as('last_run_at'))
+      .where('a.user_id', '=', userId)
+      .where('a.started_at', '>', new Date(this.now().getTime() - days * DAY))
+      .orderBy('a.started_at', 'desc')
+      .execute() as Promise<AttemptLite[]>;
   }
 
   async states(tx: Tx, userId: string) {
