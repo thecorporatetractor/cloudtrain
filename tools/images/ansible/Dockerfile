@@ -34,8 +34,11 @@ RUN python3 -m venv /opt/ansible \
       -r /opt/ansible/requirements.lock \
  && /opt/ansible/bin/pip check \
  && for b in ansible ansible-config ansible-console ansible-doc ansible-galaxy ansible-inventory \
-             ansible-playbook ansible-pull ansible-vault ansible-test ansible-navigator ansible-lint \
-             ansible-builder ansible-runner molecule yamllint; do ln -s "/opt/ansible/bin/$b" "/usr/local/bin/$b"; done \
+             ansible-playbook ansible-pull ansible-vault ansible-test ansible-navigator \
+             ansible-builder ansible-runner yamllint; do ln -s "/opt/ansible/bin/$b" "/usr/local/bin/$b"; done \
+ && for b in ansible-lint molecule; do rm -f "/usr/local/bin/$b"; \
+      printf '#!/bin/sh\n# venv tool: run it with the venv first on PATH (it warns otherwise)\nPATH=/opt/ansible/bin:$PATH exec /opt/ansible/bin/%s "$@"\n' "$b" > "/usr/local/bin/$b"; \
+      chmod 0755 "/usr/local/bin/$b"; done \
  && test "$(ansible --version | head -1)" = "ansible [core ${ANSIBLE_CORE_VERSION}]" \
  && install -d /usr/share/doc/ansible-core \
  && cp /opt/ansible/lib/python3*/site-packages/ansible_core-*.dist-info/licenses/COPYING /usr/share/doc/ansible-core/COPYING
