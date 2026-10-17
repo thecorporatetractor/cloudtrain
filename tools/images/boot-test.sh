@@ -166,6 +166,8 @@ spec:
   volumes: [{ name: ssh, secret: { secretName: tester-ssh, defaultMode: 0440 } }]
 EOF
   local t0=$SECONDS
+  # `kubectl wait` fails at once (NotFound) if KubeVirt has not created the VMI yet
+  wait_for "[$variant] VMI created" 180 k -n "$ns" get vmi/vm
   k -n "$ns" wait vmi/vm --for=jsonpath='{.status.phase}'=Running --timeout=300s >/dev/null || die "[$variant] VMI not Running"
   log "[$variant] VMI Running after $((SECONDS - t0))s"
   k -n "$ns" wait pod/tester --for=condition=Ready --timeout=120s >/dev/null || die "[$variant] tester pod not Ready"
