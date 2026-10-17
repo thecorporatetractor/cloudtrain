@@ -1,0 +1,90 @@
+Platform round 4 proof (branch fix/platform-round-4), kind cluster cloudtrain-dev,
+2026-10-17. Scoped manager ct-platform4-system, selector
+labs.cloudtrain.dev/verify=platform4, image built from this branch. Proof labs
+(p4-proof-*) lived in the agent's scratch folder and are not content.
+
+== 1. Grader: Kubernetes checks default to 20 s
+labctl compile of p4-proof-debug (k8s-query checks without timeoutSec):
+  refused file 5
+  only-baseline-added k8s-query 20
+  baseline-running k8s-query 20
+Both k8s-query checks graded live at the default (verify below, 3/3 after).
+
+== 2. kubectl debug under vcluster with host Pod Security baseline
+labctl verify --quick p4-proof-debug: before 0/3, after 3/3, ok.
+Then as the learner on the workstation (vcluster qm-proof):
+Targeting container "api". If you don't see processes from this container it may be because the container runtime doesn't support this feature.
+Defaulting debug container name to debugger-d7kmh.
+Error from server (Forbidden): pods "api" is forbidden: ValidatingAdmissionPolicy 'cloudtrain-ephemeral-pod-security' with binding 'cloudtrain-ephemeral-pod-security' denied request: Pod Security "baseline" (enforced where this cluster runs its Pods) refuses debug container debugger-d7kmh: must not add capabilities such as SYS_PTRACE, NET_ADMIN or SYS_ADMIN. An ephemeral container that cannot start can never be removed, so it was not added. With kubectl debug use --profile=baseline (or --profile=restricted).
+---
+NAME                                                                                       VALIDATIONS   PARAMKIND   AGE
+validatingadmissionpolicy.admissionregistration.k8s.io/cloudtrain-ephemeral-pod-security   7             <unset>     10m
+
+NAME                                                                                              POLICYNAME                          PARAMREF   AGE
+validatingadmissionpolicybinding.admissionregistration.k8s.io/cloudtrain-ephemeral-pod-security   cloudtrain-ephemeral-pod-security   <unset>    10m
+---
+Error from server (Forbidden): pods "api" is forbidden: ValidatingAdmissionPolicy 'cloudtrain-ephemeral-pod-security' with binding 'cloudtrain-ephemeral-pod-security' denied request: Pod Security "baseline" (enforced where this cluster runs its Pods) refuses debug container sys: privileged must not be true. An ephemeral container that cannot start can never be removed, so it was not added. With kubectl debug use --profile=baseline (or --profile=restricted).
+exit=1
+exit=0
+dbg running=
+dbg2 running=2026-10-17T14:21:04Z
+(dbg, the solution's baseline container, had already finished its sleep 600.)
+
+== 3. Lab link rate limit
+p4-proof-net (verify --quick, after 6/6): iperf3 h2 -> r1 across a link:
+  [  5]   0.00-8.12   sec  9.12 MBytes  9.43 Mbits/sec   receiver   (limit 10 Mbit/s per attachment)
+OVS on the worker: every link attachment interface of a session has ingress_policing_rate=10000 (kbit/s), the primary interfaces 0:
+
+== 20:10:23 synthetic storm: STP off on both switches (loop over eth2+eth3, no tc in the pods), annex-host-1 sends ~5000 broadcast frames/s (ping -b -i 0.0002 -s 1400, about 56 Mbit/s offered) for 30 s
+verify-mv-sw-annex-1 eth2 rx 8949 pps 5001 kbit/s
+verify-annex-host-1 eth1 tx 0 pps 0 kbit/s
+verify-mv-sw-annex-2 eth2 rx 0 pps 0 kbit/s
+verify-mv-sw-annex-2 eth3 rx 8956 pps 5094 kbit/s
+verify-annex-host-2 eth1 rx 9010 pps 5044 kbit/s
+load: 24.50 29.71 22.77
+cloudtrain-dev-control-plane cpu=210.27%
+cloudtrain-dev-worker cpu=505.98%
+da8b0cc9_eth2_h 10000 d2846b863a5d_h 0 3e4c21ffebc3_h 0 d31ecb5a_eth1_h 10000 da8b0cc9_eth3_h 10000 d31ecb5a_eth2_h 10000 d31ecb5a3ac1_h 0 da8b0cc9_eth1_h 10000 de23cc9bc5d2_h 0 3e4c21ff_eth1_h 10000 d31ecb5a_eth3_h 10000 de23cc9b_eth1_h 10000 da8b0cc94898_h 0
+
+== 20:10:58 flood over, STP back on
+After the flood (STP on again): control-plane cpu=170.86%, worker cpu=446.83%, loadavg 26.62 (the storm added ~60% of one node's CPU; the box stayed responsive).
+
+net-fix-broadcast-storm draft, full labctl verify under the limit:
+LAB                      RUN                    SEED  READY  BEFORE    AFTER      TEARDOWN  RESULT
+net-fix-broadcast-storm  base:seed-2            2     76s    13 (1/5)  100 (5/5)  clean     ok
+net-fix-broadcast-storm  mutation:unplug-cable  1     116s   13 (1/5)  25 (2/5)   clean     ok
+seed 1 hosts-reachable failed right after the solution; in the synthetic copy the same check passed again about a minute later (STP/OVN MAC learning settling). Content timing, not platform.
+p4-proof-storm (draft without its in-pod tbf): before 1/5, after 4/5 (same hosts-reachable timing); an earlier run passed 5/5.
+
+== 4. P3 (wired entry) and P4 (sysctls)
+p4-proof-net: workstation (entry) wired to r1 (netsvc); r1 - h2 (nettools). verify --quick: before 0/6, after 6/6, ok
+(p3-entry-from-router, p3-entry-routed, p3-entry-outbound as learner via ping_group_range, p4-net-sysctls, p4-host-sysctl-refused, rate-capped).
+r1 /root/p4.txt (root in the node container, user namespace + unmasked /proc):
+  net.ipv4.conf.eth1.proxy_arp = 1
+  net.ipv6.conf.eth2.accept_ra = 2
+  net.ipv4.conf.eth1.rp_filter = 0
+  net.ipv4.ip_forward = 0
+  net.ipv4.ip_forward = 1
+  sysctl: error setting key 'kernel.panic': Permission denied
+P3 control on the same session, toggling the entry policy's annotation, ping r1 -> workstation over the link:
+== with network_policy_for=ovn (fix)
+3 packets transmitted, 3 received, 0% packet loss, time 2002ms
+rtt min/avg/max/mdev = 0.093/1.044/1.737/0.695 ms
+networkpolicy.networking.k8s.io/ct-31178f5555-entry annotated
+== annotation removed (old behaviour)
+command terminated with exit code 1
+3 packets transmitted, 0 received, 100% packet loss, time 2026ms
+
+networkpolicy.networking.k8s.io/ct-31178f5555-entry annotated
+== annotation restored
+3 packets transmitted, 3 received, 0% packet loss, time 2013ms
+rtt min/avg/max/mdev = 0.119/10.664/28.394/12.611 ms
+== network_policy_for=ovn,ctv-p4-proof-net-bdcd19b/verify-link-0-38abe906 (list: link NAD included, must block)
+networkpolicy.networking.k8s.io/ct-31178f5555-entry annotated
+command terminated with exit code 1
+3 packets transmitted, 0 received, 100% packet loss, time 2033ms
+
+networkpolicy.networking.k8s.io/ct-31178f5555-entry annotated
+== restored ovn
+3 packets transmitted, 3 received, 0% packet loss, time 2002ms
+rtt min/avg/max/mdev = 0.092/1.057/1.822/0.720 ms

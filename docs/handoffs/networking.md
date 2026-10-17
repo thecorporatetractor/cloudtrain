@@ -46,7 +46,7 @@ time; some edited afterwards).
 | net-fix-native-vlan-mismatch | **yes (P1+P2)** | |
 | net-inter-vlan-subinterfaces | **yes (P1+P2)** | Linux router (netsvc) instead of FRR: FRR console cannot create VLAN devices |
 | net-rstp-root-bridge | **yes** (BPDUs pass without the fix; host ping needs P1) | kernel bridge STP is 802.1D, mstpd/RSTP impossible in a pod netns (user STP needs init netns) |
-| net-fix-broadcast-storm | **yes** | platform round 4 rate-limits every link attachment (10 Mbit/s each way, host side); the draft ran live under it (see "Platform blockers") |
+| net-fix-broadcast-storm | **yes** | platform round 4 rate-limits every link attachment (10 Mbit/s each way, host side); the draft ran live under it: seed 2 passed 5/5 and the mutation behaved, seed 1 failed `hosts-reachable` right after the solution (reachable again about a minute later: STP and OVN MAC learning still settling); lengthen the solution's wait or retry the reachability check before marking it verified |
 | net-lacp-server-uplink | **yes** | LACP negotiation itself works across OVN (spike) |
 | net-default-route-edge | no | |
 | net-floating-static-backup | no | core uses a BFD-tracked static so the return path fails over (`ip route ... bfd`, untested) |

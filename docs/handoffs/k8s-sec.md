@@ -80,8 +80,11 @@ path belong to other streams.)
 ## In flight
 
 Nothing. Round 3 used the scoped manager `ct-k8sdevsec-system` (selector
-`labs.cloudtrain.dev/verify=k8s-devsec`, shared with k8s-dev). All V-tier k8s-query
-checks now set `timeoutSec: 20` (grader default 5 s timed out under load).
+`labs.cloudtrain.dev/verify=k8s-devsec`, shared with k8s-dev); it has since been
+deleted (namespace and ClusterRole/Binding), so deploy a new one before the next
+verify (see k8s-dev.md "How to resume"). All V-tier k8s-query checks set
+`timeoutSec: 20`; since platform round 4 that is also the grader default for
+k8s-query, k8s-can-i and k8s-context checks.
 
 ## Next steps, in order
 
