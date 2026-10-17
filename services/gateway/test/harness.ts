@@ -52,7 +52,7 @@ export const Q = {
   rhea: 'a1000000-0000-4000-8000-0000000000aa',
 };
 
-export async function harness(opts: { oidc?: FakeOidcProvider; auth?: (t: TestDb) => Authenticator } = {}): Promise<Harness> {
+export async function harness(opts: { oidc?: FakeOidcProvider; auth?: (t: TestDb) => Authenticator; devImpersonate?: boolean } = {}): Promise<Harness> {
   const t = await createTestDb();
   const content = await realContent();
   await seed(t.owner, content, await readPeople(defaultPeopleFile(repo)));
@@ -77,7 +77,7 @@ export async function harness(opts: { oidc?: FakeOidcProvider; auth?: (t: TestDb
     auth = new OidcAuthenticator(t.db, store, client);
     oidc = { client, store };
   }
-  const app = await buildApp({ content, auth, sessions, cluster, platform: ps, hub, clusterInfo: null, ...(oidc ? { oidc } : {}) });
+  const app = await buildApp({ content, auth, sessions, cluster, platform: ps, hub, clusterInfo: null, ...(oidc ? { oidc } : {}), ...(opts.devImpersonate ? { devImpersonate: true } : {}) });
   return {
     t,
     app,

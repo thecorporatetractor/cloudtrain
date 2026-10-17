@@ -1,6 +1,6 @@
 import { Link, Outlet, useNavigate, useRouterState } from '@tanstack/react-router';
 import { useEffect, type ReactNode } from 'react';
-import { BookOpen, Building2, Check, ChevronLeft, ChevronRight, ClipboardList, FlaskConical, GraduationCap, HelpCircle, History, Home as HomeIcon, Keyboard, LogOut, Moon, Palette, Presentation, Search, Server, Settings, Shield, Sun, Sunset, Users, UserCog, Waypoints, X } from 'lucide-react';
+import { BookOpen, Building2, Check, ChevronLeft, ChevronRight, ClipboardList, FlaskConical, GraduationCap, HelpCircle, History, Home as HomeIcon, Keyboard, LogOut, Moon, Palette, Presentation, Search, Server, Settings, Shield, Sun, Sunset, UserCheck, Users, UserCog, Waypoints, X } from 'lucide-react';
 import { useMe } from '@/api/client';
 import { useLogout, useSwitchOrg } from '@/api/platform';
 import { isRealApi } from '@/api/mode';
@@ -233,6 +233,7 @@ function ShellInner() {
         <Outlet />
       </main>
 
+      {principal?.auth.impersonated && <DevImpersonationBanner me={principal} />}
       <CommandPalette />
       <ShortcutsDialog />
       <Toasts />
@@ -333,6 +334,19 @@ function UserMenu({ me, navMode }: { me: Me | undefined; navMode: 'full' | 'rail
         </Dropdown.Item>
       </Dropdown.Content>
     </Dropdown.Root>
+  );
+}
+
+/** Dev sign-in-as session (`POST /api/dev/sign-in-as`, local development only): always visible, never in production. */
+function DevImpersonationBanner({ me }: { me: Me }) {
+  return (
+    <div className="dev-impersonation-banner" role="status" aria-live="polite">
+      <UserCheck size={13} aria-hidden />
+      <span>
+        Dev sign-in as <strong>{me.name}</strong>
+      </span>
+      <span className="subtle">· {me.email}</span>
+    </div>
   );
 }
 

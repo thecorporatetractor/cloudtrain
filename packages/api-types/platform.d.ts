@@ -201,8 +201,12 @@ export interface Me extends Learner {
   platformAdmin: boolean;
   /** Send as `x-csrf-token` on every state-changing request. */
   csrfToken: string;
-  /** How this session was established. */
-  auth: { method: 'oidc' | 'dev'; idp?: string; sessionExpiresAt?: string };
+  /**
+   * How this session was established. `dev-impersonation` + `impersonated: true`:
+   * a local-dev "sign in as" session (`POST /api/dev/sign-in-as`, CT_DEV_IMPERSONATE=1),
+   * no IdP login behind it; the web app shows a banner.
+   */
+  auth: { method: 'oidc' | 'dev' | 'dev-impersonation'; idp?: string; sessionExpiresAt?: string; impersonated?: boolean };
   /** True while a platform admin acts inside an org through support access. */
   supportAccess?: { orgId: string; expiresAt: string };
 }
@@ -883,6 +887,7 @@ export type AuditAction =
   | 'auth.login'
   | 'auth.logout'
   | 'auth.login_denied'
+  | 'auth.dev_impersonate'
   | 'org.switch'
   | 'user.invite'
   | 'user.update'

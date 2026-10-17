@@ -4,6 +4,13 @@
 //   node apps/web/scripts/readme-shots.mjs [--base http://localhost:5199] [--chromium /usr/bin/chromium]
 //
 // Output: docs/images/*.png at the repository root.
+//
+// Real mode (a VITE_API_MODE=real dev server in front of a gateway): pass a
+// Playwright storageState from deploy/scripts/dev-signin-as.mjs and an output
+// directory. The read-only pages are taken as that signed-in user (no lab is
+// started, personas are ignored, the mock-fixture waitFor texts are best effort):
+//
+//   node apps/web/scripts/readme-shots.mjs --base http://localhost:5197 --storage /tmp/me.json --out /tmp/shots
 import { mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -14,7 +21,9 @@ const arg = (name, d) => {
   return i > 0 ? process.argv[i + 1] : d;
 };
 const base = arg('base', 'http://localhost:5199');
-const out = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../../docs/images');
+const storage = arg('storage', '');
+if (storage && !arg('out', '')) throw new Error('--storage (real mode) needs --out <dir>: the committed README images are mock mode');
+const out = arg('out', '') ? path.resolve(arg('out')) : path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../../docs/images');
 await mkdir(out, { recursive: true });
 
 const browser = await chromium.launch({ executablePath: arg('chromium', '/usr/bin/chromium'), args: ['--no-sandbox'] });
@@ -24,13 +33,13 @@ let failed = false;
 const PERSONAS = { learner: { userId: 'u-lena', orgId: 'org-quillmoor' }, manager: { userId: 'u-ingrid', orgId: 'org-quillmoor' }, instructor: { userId: 'u-samir', orgId: 'org-quillmoor' }, author: { userId: 'u-aino', orgId: 'org-quillmoor' }, org_admin: { userId: 'u-priya', orgId: 'org-quillmoor' } };
 
 async function session(theme, persona = 'manager') {
-  const ctx = await browser.newContext({ viewport: { width: 1440, height: 900 }, deviceScaleFactor: 1 });
+  const ctx = await browser.newContext({ viewport: { width: 1440, height: 900 }, deviceScaleFactor: 1, ...(storage ? { storageState: storage } : {}) });
   await ctx.addInitScript(
     ({ t, s }) => {
       localStorage.setItem('ct.theme', t);
-      localStorage.setItem('ct.mock.session', s);
+      if (s !== null) localStorage.setItem('ct.mock.session', s);
     },
-    { t: theme, s: persona === 'none' ? 'none' : JSON.stringify(PERSONAS[persona]) },
+    { t: theme, s: storage ? null : persona === 'none' ? 'none' : JSON.stringify(PERSONAS[persona]) },
   );
   const page = await ctx.newPage();
   page.on('pageerror', (e) => {
@@ -43,8 +52,31 @@ async function session(theme, persona = 'manager') {
 
 async function open(page, url, waitFor) {
   await page.goto(base + url, { waitUntil: 'networkidle' });
-  if (waitFor) await page.getByText(waitFor, { exact: false }).first().waitFor({ timeout: 15000 });
+  if (waitFor) {
+    const seen = page.getByText(waitFor, { exact: false }).first().waitFor({ timeout: 15000 });
+    // Real mode: the texts match the mock fixtures, not the signed-in user's data.
+    if (storage) await seen.catch(() => console.log(`note: "${waitFor}" not on ${url} (real data)`));
+    else await seen;
+  }
   await page.waitForTimeout(700);
+}
+
+/** Real mode: read-only pages as the storageState user; nothing that starts a lab or changes state. */
+async function realMode() {
+  const { ctx, page } = await session('dark');
+  for (const [url, waitFor, name] of [
+    ['/', 'Next best lab', 'home'],
+    ['/catalog', 'Kubernetes', 'catalog'],
+    ['/labs/orchard-netpol-isolation', 'Isolate', 'lab-overview'],
+    ['/skills', 'Skills', 'skills'],
+    ['/assignments', 'My assignments', 'assignments'],
+    ['/history', 'History', 'history'],
+    ['/exams', 'Exam', 'exams'],
+  ]) {
+    await open(page, url, waitFor);
+    await shot(page, name);
+  }
+  await ctx.close();
 }
 
 async function settled(page) {
@@ -58,6 +90,11 @@ async function shot(page, name) {
 }
 
 try {
+  if (storage) {
+    await realMode();
+    await browser.close();
+    process.exit(failed ? 1 : 0);
+  }
   const { ctx, page } = await session('dark');
 
   await open(page, '/', 'Next best lab');

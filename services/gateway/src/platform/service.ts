@@ -364,7 +364,12 @@ export class PlatformService implements SessionHooks {
       cohorts: p.cohortIds.map((id) => ({ id, name: cohortName.get(id) ?? id })),
       platformAdmin: p.platformAdmin,
       csrfToken: p.session?.csrf ?? '',
-      auth: { method: p.session?.method ?? 'dev', ...(p.session?.idp ? { idp: p.session.idp } : {}), ...(p.session?.expiresAt ? { sessionExpiresAt: p.session.expiresAt } : {}) },
+      auth: {
+        method: p.session?.method ?? 'dev',
+        ...(p.session?.idp ? { idp: p.session.idp } : {}),
+        ...(p.session?.expiresAt ? { sessionExpiresAt: p.session.expiresAt } : {}),
+        ...(p.session?.impersonated ? { impersonated: true } : {}),
+      },
     };
   }
 

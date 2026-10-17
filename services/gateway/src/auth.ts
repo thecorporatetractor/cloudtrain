@@ -28,7 +28,7 @@ export interface Principal {
   cohortIds: string[];
   platformAdmin: boolean;
   /** Server-side session behind the request (absent for the dev stub). */
-  session?: { idHash: string; csrf: string; idp?: string; expiresAt: string; method: 'oidc' | 'dev' };
+  session?: { idHash: string; csrf: string; idp?: string; expiresAt: string; method: 'oidc' | 'dev' | 'dev-impersonation'; impersonated?: boolean };
 }
 
 /**
