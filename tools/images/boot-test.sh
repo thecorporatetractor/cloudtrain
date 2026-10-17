@@ -317,7 +317,7 @@ spec:
 apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway
 metadata: { name: gw }
-spec: { gatewayClassName: traefik, listeners: [{ name: http, protocol: HTTP, port: 8000, allowedRoutes: { namespaces: { from: Same } } }] }
+spec: { gatewayClassName: traefik, listeners: [{ name: http, protocol: HTTP, port: 80, allowedRoutes: { namespaces: { from: Same } } }] }
 ---
 apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute
