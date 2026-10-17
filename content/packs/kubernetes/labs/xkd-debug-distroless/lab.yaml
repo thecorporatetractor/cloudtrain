@@ -22,6 +22,9 @@ spec:
     that file, and write the value of its `region` setting (only the value)
     to **`/home/learner/answers/rates-region.txt`**. Do not restart, replace
     or copy the Pod.
+
+    The cluster enforces the Pod Security **baseline** level: a debug
+    container must not add Linux capabilities.
   objectives:
     - Debug a running Pod with an ephemeral container that shares its process namespace
   params:
@@ -72,6 +75,36 @@ spec:
               readinessProbe:
                 tcpSocket: {port: 8080}
                 periodSeconds: 2
+    # The vcluster API would accept a debug container that adds capabilities
+    # (kubectl debug's default "general" profile adds SYS_PTRACE), but the host
+    # namespace enforces Pod Security baseline, so it would never start and,
+    # since ephemeral containers cannot be removed, block every later one.
+    # This policy refuses such a request up front with a clear message.
+    - on: qm-dispatch
+      apply: |
+        apiVersion: admissionregistration.k8s.io/v1
+        kind: ValidatingAdmissionPolicy
+        metadata: {name: xkd-debug-distroless-baseline}
+        spec:
+          failurePolicy: Fail
+          matchConstraints:
+            namespaceSelector:
+              matchLabels: {kubernetes.io/metadata.name: rates-engine}
+            resourceRules:
+              - apiGroups: [""]
+                apiVersions: [v1]
+                operations: [UPDATE]
+                resources: [pods/ephemeralcontainers]
+          validations:
+            - expression: "!has(object.spec.ephemeralContainers) || object.spec.ephemeralContainers.all(c, !has(c.securityContext) || !has(c.securityContext.capabilities) || !has(c.securityContext.capabilities.add) || size(c.securityContext.capabilities.add) == 0)"
+              message: "Pod Security baseline: debug containers must not add capabilities (kubectl debug --profile=baseline)"
+        ---
+        apiVersion: admissionregistration.k8s.io/v1
+        kind: ValidatingAdmissionPolicyBinding
+        metadata: {name: xkd-debug-distroless-baseline}
+        spec:
+          policyName: xkd-debug-distroless-baseline
+          validationActions: [Deny]
     - on: qm-dispatch
       timeoutSec: 120
       run: |
@@ -83,7 +116,9 @@ spec:
         if kubectl -n rates-engine exec rates-engine -c engine -- sh -c true 2>/dev/null; then echo "shell still present" >&2; exit 1; fi
   teardown:
     - on: qm-dispatch
-      run: kubectl delete namespace rates-engine --ignore-not-found --wait=false
+      run: |
+        kubectl delete namespace rates-engine --ignore-not-found --wait=false
+        kubectl delete validatingadmissionpolicybinding,validatingadmissionpolicy xkd-debug-distroless-baseline --ignore-not-found
   checks:
     - id: answer
       description: rates-region.txt holds the region from the loaded config
@@ -96,12 +131,14 @@ spec:
     - id: ephemeral-used
       description: An ephemeral container was attached to rates-engine
       type: k8s-query
+      timeoutSec: 20
       skills: [k8s.troubleshooting.debug-containers]
       query: {cluster: qm-dispatch, resource: pod, name: rates-engine, namespace: rates-engine, jsonpath: "{.spec.ephemeralContainers[*].name}"}
       expect: {match: regex, value: '\S'}
     - id: pod-untouched
       description: The original Pod is still running without restarts
       type: k8s-query
+      timeoutSec: 20
       skills: [k8s.troubleshooting.debug-containers]
       weight: 0.5
       query: {cluster: qm-dispatch, resource: pod, name: rates-engine, namespace: rates-engine, jsonpath: '{.status.phase} {.status.containerStatuses[?(@.name=="engine")].restartCount}'}
@@ -117,7 +154,7 @@ spec:
         timeoutSec: 120
         run: |
           kubectl config use-context qm-dispatch
-          kubectl -n rates-engine debug rates-engine --copy-to=rates-engine-debug --image=busybox:1.37 --share-processes --container=dbg -- sleep 300
+          kubectl -n rates-engine debug rates-engine --copy-to=rates-engine-debug --image=busybox:1.37 --profile=baseline --share-processes --container=dbg -- sleep 300
           sleep 10
           kubectl -n rates-engine exec rates-engine-debug -c dbg -- sh -c 'cat /proc/*/root/etc/rates/engine.conf 2>/dev/null | sed -n "s/^region=//p"' > ~/answers/rates-region.txt || true
     - id: no-target
@@ -130,9 +167,20 @@ spec:
         timeoutSec: 120
         run: |
           kubectl config use-context qm-dispatch
-          kubectl -n rates-engine debug rates-engine --image=busybox:1.37 --container=peek -- sleep 300
+          kubectl -n rates-engine debug rates-engine --image=busybox:1.37 --profile=baseline --container=peek -- sleep 300
           sleep 10
           kubectl -n rates-engine exec rates-engine -c peek -- sh -c 'cat /etc/rates/engine.conf /proc/1/root/etc/rates/engine.conf 2>/dev/null | sed -n "s/^region=//p"' > ~/answers/rates-region.txt || true
+    - id: default-profile
+      description: Keeps kubectl debug's default profile, which adds SYS_PTRACE; Pod Security baseline refuses the debug container.
+      feedback: Under the baseline level a container may not add capabilities. `--profile=baseline` attaches a debug container without extra capabilities, and it can still read /proc/1/root of the target.
+      expectFail: [answer, ephemeral-used]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 60
+        run: |
+          kubectl config use-context qm-dispatch
+          kubectl -n rates-engine debug rates-engine --image=busybox:1.37 --target=engine --container=inspect -- sleep 600 || true
   solution:
     steps:
       - on: workstation
@@ -140,7 +188,7 @@ spec:
         timeoutSec: 120
         run: |
           kubectl config use-context qm-dispatch
-          kubectl -n rates-engine debug rates-engine --image=busybox:1.37 --target=engine --container=inspect -- sleep 600
+          kubectl -n rates-engine debug rates-engine --image=busybox:1.37 --target=engine --profile=baseline --container=inspect -- sleep 600
           for i in $(seq 1 30); do
             kubectl -n rates-engine exec rates-engine -c inspect -- true 2>/dev/null && break
             sleep 2
@@ -155,7 +203,7 @@ spec:
             timeoutSec: 120
             run: |
               kubectl config use-context qm-dispatch
-              kubectl -n rates-engine debug rates-engine --image=busybox:1.37 --target=engine --container=reader -- sh -c 'grep "^region=" /proc/1/root/etc/rates/engine.conf; sleep 120'
+              kubectl -n rates-engine debug rates-engine --image=busybox:1.37 --target=engine --profile=baseline --container=reader -- sh -c 'grep "^region=" /proc/1/root/etc/rates/engine.conf; sleep 120'
               for i in $(seq 1 30); do
                 out=$(kubectl -n rates-engine logs rates-engine -c reader 2>/dev/null)
                 [ -n "$out" ] && break

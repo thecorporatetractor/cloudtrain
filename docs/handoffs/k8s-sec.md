@@ -1,6 +1,12 @@
 # Handoff: k8s-sec stream (cluster-security path + sim-k8s-security pool)
 
-Branch `build/k8s-sec`, worktree `/home/hackrvl/cloudtrain/.worktrees/b-k8s-sec`.
+Round 3 (2026-10-16/17, branch `content/k8s-dev-sec-round-3`, merged into main):
+every V-tier lab of the stream is now live-verified (12 of 51). Everything left is
+kubeadm (K tier, vm slot): 27 built and 12 blocked on security tooling. The
+sim-k8s-security exam (envTier K) cannot run yet: verified pools cover cluster-hardening
+(2/4) and microservice-vulnerabilities (3/6) only; cluster-setup and system-hardening
+have no verified task.
+
 All 51 owned labs are authored in `content/packs/kubernetes/labs/<id>/`, pass
 `lab-verify --strict` and `labctl validate`, and are listed in
 `content/curriculum.yaml` (status `built`, or `verified` after a passing live run).
@@ -16,13 +22,21 @@ Course `k8s-cluster-security` in `content/packs/kubernetes/pack.yaml` lists the
 |---|---|---|
 | rbac-overgrant-cleanup | V | 679 s |
 | static-analysis-manifests | V | 580 s |
+| sa-token-automount-off | V | 707 s (round 3) |
+| immutable-label-printers | V | 874 s (round 3; writable-mounts expected `{{spool}},/tmp`, jq sorts `/tmp` first) |
+| xks-rbac-reduce | V | 367 s (round 3) |
+| xks-sa-automount | V | 434 s |
+| xks-immutable-secret | V | 572 s |
+| xks-drop-privileged | V | 692 s (starts from Pods refused by the host baseline PSA) |
+| xks-pss-restricted | V | 556 s |
+| xks-readonly-rootfs | V | 500 s |
+| xks-registry-vap | V | 580 s |
+| xks-manifest-static-fix | V | 555 s |
 
 ### Built, live verify ran and failed; lab fixed since, needs a re-run
 
 | Lab | Failure | Fix (committed) |
 |---|---|---|
-| sa-token-automount-off | `running-pods-tokenless` counted old Pods still terminating after the rollout | checks skip Pods with a deletionTimestamp (e8f92b1) |
-| immutable-label-printers | `writable-mounts` got empty output: `echo "$json"` in the grader's `sh` (dash) expands `\n` and breaks jq | printf instead of echo (feaa8ff) |
 | customs-default-deny | `--quick` base run passed (setup, before 3/8, after 8/8); the full run failed because both sessions hit the 15 min provision timeout under machine load (loadavg 70-110) | nothing to fix in the lab; re-run when the machine is quieter |
 
 ### Built, ready for live verify (runs on existing images: kubeadm:1.37 or vcluster)
@@ -30,10 +44,6 @@ Course `k8s-cluster-security` in `content/packs/kubernetes/pack.yaml` lists the
 Learning labs: verify-kubectl-checksum, api-access-restrict, node-footprint-reduce,
 kubelet-auth-hardening, seccomp-apparmor-printer, hostpath-mount-policy,
 secrets-encryption-at-rest, mtls-cni-encryption, tariff-secret-audit, intrusion-timeline.
-
-Exam tasks (V, qm-depot): xks-rbac-reduce (verify interrupted at pause),
-xks-sa-automount, xks-immutable-secret, xks-drop-privileged, xks-pss-restricted,
-xks-readonly-rootfs, xks-registry-vap, xks-manifest-static-fix.
 
 Exam tasks (K, qm-ledger): xks-default-deny-ns, xks-metadata-egress-block,
 xks-incident-isolate-pod, xks-apiserver-anonymous, xks-node-restriction,
@@ -67,18 +77,15 @@ setup assumes (paths, service names, CLI flags) against what was actually instal
 None. (`kiosk-restricted-pss`, `registry-allowlist-vap`, `netpol-namespace-port` in the
 path belong to other streams.)
 
-## In flight at pause
+## In flight
 
-The `xks-rbac-reduce` verify (pod slot) was interrupted when the queue was stopped for
-the pause (all runs `FAIL interrupted` / `context canceled`, not a lab failure). Nothing
-else was running. Re-run it first in step 1.
+Nothing. Round 3 used the scoped manager `ct-k8sdevsec-system` (selector
+`labs.cloudtrain.dev/verify=k8s-devsec`, shared with k8s-dev). All V-tier k8s-query
+checks now set `timeoutSec: 20` (grader default 5 s timed out under load).
 
 ## Next steps, in order
 
-1. Redeploy the scoped manager (below) and re-run the V-tier queue:
-   sa-token-automount-off, immutable-label-printers, xks-rbac-reduce,
-   xks-sa-automount, xks-immutable-secret, xks-drop-privileged, xks-pss-restricted,
-   xks-readonly-rootfs, xks-registry-vap, xks-manifest-static-fix (pod slot, `--parallel 2`).
+1. Done in round 3: the whole V-tier queue is verified.
 2. K-tier labs, one at a time in the vm slot, starting with customs-default-deny; check
    C: free space first (stop under 15 GB). Watch for the 15 min provision timeout under load.
 3. Highest-risk K labs to watch on first run: api-access-restrict (baseline uses a
