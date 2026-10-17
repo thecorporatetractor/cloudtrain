@@ -77,10 +77,10 @@ catalog (drop them from the curriculum's `images` list).
 
 - New images: kubeadm-node v1.37.1-full 5.0 GB (rebuilt; also in the kind worker), ubuntu-vm
   1.82 GB (also in the worker), deb-lab 896 MB and mirror-content 1.78 GB (both kind nodes).
-- `tools/images/.cache` in `.worktrees/foundations-r3` was removed with the worktree; the
-  mirror content and base images are still in `.worktrees/b-foundations/tools/images/.cache`
-  (round 1 copy, without the qemu-guest-agent deb) and can be rebuilt with
-  `bash tools/mirrors/build-content.sh` (~15 min) when needed.
+- Mirror content 2026.10.14 (with qemu-guest-agent) and its private signing key are in
+  `.worktrees/b-foundations/tools/images/.cache/mirror/` (moved there when the round 3
+  worktree was removed; gitignored). Copy that `.cache/mirror` into a new worktree before
+  `task mirror:up` or an el-vm/ubuntu-vm build.
 - Build cache pruned at the end (`docker builder prune -f`).
 
 ## Gotchas
