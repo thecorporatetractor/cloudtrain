@@ -99,6 +99,8 @@ const SESSION_KEY = 'ct.mock.session';
 interface MockSession {
   userId: string;
   orgId: string;
+  /** Mimics a gateway dev sign-in-as session (banner screenshots). */
+  impersonated?: boolean;
 }
 
 function readSession(): MockSession | null {
@@ -167,7 +169,9 @@ function buildMe(s: MockSession): Me | undefined {
     cohorts: cohortSeeds.filter((c) => c.memberIds.includes(p.id) && c.orgId === s.orgId).map((c) => ({ id: c.id, name: c.name })),
     platformAdmin: !!p.platformAdmin,
     csrfToken: 'mock-csrf-token',
-    auth: { method: 'dev', idp: s.orgId === ORG_QUILLMOOR.id && !p.platformAdmin ? 'quillmoor-entra' : undefined, sessionExpiresAt: new Date(Date.now() + 8 * 3_600_000).toISOString() },
+    auth: s.impersonated
+      ? { method: 'dev-impersonation', impersonated: true, sessionExpiresAt: new Date(Date.now() + 8 * 3_600_000).toISOString() }
+      : { method: 'dev', idp: s.orgId === ORG_QUILLMOOR.id && !p.platformAdmin ? 'quillmoor-entra' : undefined, sessionExpiresAt: new Date(Date.now() + 8 * 3_600_000).toISOString() },
     supportAccess,
   };
 }
@@ -292,8 +296,8 @@ export const authHandlers = [
     const { orgId } = (await request.json()) as { orgId: string };
     const p = personById.get(s.userId);
     if (!p?.orgs[orgId]) return forbidden('org.manage');
-    writeSession({ userId: s.userId, orgId });
-    return json(buildMe({ userId: s.userId, orgId }));
+    writeSession({ ...s, orgId });
+    return json(buildMe({ ...s, orgId }));
   }),
 ];
 

@@ -204,4 +204,6 @@ Every mutating admin, instructor or manager action writes an `audit_log` row.
 external corporate IdP to exercise federation), Mailpit for invitation emails.
 Seed data: two orgs with fictional people covering every role, teams, a cohort,
 assignments and attempt history. `task dev:deps` starts it; `task dev:gateway`
-uses it. All names fictional.
+uses it. All names fictional. Agents that need to act as a real (for example
+Entra-brokered) user use the dev-only sign-in-as endpoint, never available in
+production: docs/dev-environment.md, "Signing in as a real user (agents)".

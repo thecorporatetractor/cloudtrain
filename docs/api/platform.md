@@ -34,6 +34,7 @@ Types: [`packages/api-types/platform.d.ts`](../../packages/api-types/platform.d.
 | `POST /auth/logout` | | `LogoutResponse` (Keycloak end-session URL) | signed in | `auth.logout` |
 | `POST /auth/backchannel-logout` | form `logout_token` (Keycloak) | 200 | signed JWT from Keycloak | |
 | `GET /auth/invite/:token` | | 302 to login with the invited email | public | |
+| `POST /dev/sign-in-as` | `{ email }` or `{ userId }`, optional `orgId` | `Me` (sets `ct_session`); 404 unknown user, 403 non-loopback caller or no membership. **Only with `CT_DEV_IMPERSONATE=1` on localhost** (docs/dev-environment.md) | public, loopback only | `auth.dev_impersonate` |
 | `GET /me` | | `Me` | signed in | |
 | `POST /me/org` | `SwitchOrgRequest` | `Me` | membership in that org (or platform_admin) | `org.switch` |
 

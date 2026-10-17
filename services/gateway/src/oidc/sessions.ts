@@ -14,6 +14,12 @@ import { OidcError, randomToken, type OidcClient, type TokenSet } from './client
  */
 
 export const SESSION_COOKIE = 'ct_session';
+/**
+ * `auth_sessions.idp` of a dev sign-in-as session (CT_DEV_IMPERSONATE=1). The
+ * colon keeps it apart from every real value: 'local' and Keycloak IdP aliases
+ * (lowercase letters, digits and dashes).
+ */
+export const IMPERSONATION_IDP = 'dev:impersonation';
 export const CSRF_HEADER = 'x-csrf-token';
 
 export const hashToken = (t: string) => createHash('sha256').update(t).digest('hex');
@@ -61,6 +67,8 @@ export interface NewSession {
   idp?: string;
   ip?: string;
   userAgent?: string;
+  /** Dev sign-in-as: no IdP behind the session, so no access-token expiry to refresh. */
+  impersonated?: boolean;
 }
 
 export class SessionStore {
@@ -85,10 +93,10 @@ export class SessionStore {
         org_id: s.orgId,
         csrf,
         kc_sid: s.kcSid ?? null,
-        idp: s.idp ?? null,
+        idp: s.impersonated ? IMPERSONATION_IDP : (s.idp ?? null),
         id_token: s.tokens.id_token ?? null,
         refresh_token: s.tokens.refresh_token ? this.sealer.seal(s.tokens.refresh_token) : null,
-        access_expires_at: new Date(now + (s.tokens.expires_in ?? 300) * 1000),
+        access_expires_at: s.impersonated ? null : new Date(now + (s.tokens.expires_in ?? 300) * 1000),
         expires_at: new Date(now + this.opts.maxAgeSeconds * 1000),
         ip: s.ip ?? null,
         user_agent: s.userAgent?.slice(0, 300) ?? null,
@@ -213,6 +221,17 @@ export class OidcAuthenticator implements Authenticator {
       return null;
     }
     void this.store.touch(row.id_hash).catch(() => undefined);
-    return { ...p, session: { idHash: row.id_hash, csrf: row.csrf, ...(row.idp ? { idp: row.idp } : {}), expiresAt: row.expires_at.toISOString(), method: 'oidc' } };
+    const impersonated = row.idp === IMPERSONATION_IDP;
+    return {
+      ...p,
+      session: {
+        idHash: row.id_hash,
+        csrf: row.csrf,
+        ...(row.idp && !impersonated ? { idp: row.idp } : {}),
+        expiresAt: row.expires_at.toISOString(),
+        method: impersonated ? 'dev-impersonation' : 'oidc',
+        ...(impersonated ? { impersonated: true } : {}),
+      },
+    };
   }
 }

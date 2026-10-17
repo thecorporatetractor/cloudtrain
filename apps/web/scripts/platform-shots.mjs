@@ -5,6 +5,14 @@
 //
 // Output: apps/web/docs/screenshots/platform/<view>-<theme>.png. Dark for every
 // view, light and cream for a few. Exits non-zero on a page error.
+//
+// Real mode (a VITE_API_MODE=real dev server in front of a gateway): pass a
+// Playwright storageState from deploy/scripts/dev-signin-as.mjs and an output
+// directory. Every view is then taken as that signed-in user (personas are
+// ignored), only the read-only views run unless --only names others, and the
+// waitFor texts (written for the mock fixtures) are best effort.
+//
+//   node apps/web/scripts/platform-shots.mjs --base http://localhost:5197 --storage /tmp/me.json --out /tmp/shots [--only home-learner]
 import { mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -16,23 +24,25 @@ const arg = (name, d) => {
 };
 const base = arg('base', 'http://localhost:5199');
 const only = arg('only', '')?.split(',').filter(Boolean);
-const out = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../docs/screenshots/platform');
+const storage = arg('storage', '');
+if (storage && !arg('out', '')) throw new Error('--storage (real mode) needs --out <dir>: the committed screenshots are mock mode');
+const out = arg('out', '') ? path.resolve(arg('out')) : path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../docs/screenshots/platform');
 await mkdir(out, { recursive: true });
 
 const browser = await chromium.launch({ executablePath: arg('chromium', '/usr/bin/chromium'), args: ['--no-sandbox'] });
 let failed = false;
 
-const PERSONAS = { learner: { userId: 'u-lena', orgId: 'org-quillmoor' }, manager: { userId: 'u-ingrid', orgId: 'org-quillmoor' }, instructor: { userId: 'u-samir', orgId: 'org-quillmoor' }, author: { userId: 'u-aino', orgId: 'org-quillmoor' }, org_admin: { userId: 'u-priya', orgId: 'org-quillmoor' }, platform_admin: { userId: 'u-elin', orgId: 'org-acme' } };
+const PERSONAS = { learner: { userId: 'u-lena', orgId: 'org-quillmoor' }, learner_impersonated: { userId: 'u-lena', orgId: 'org-quillmoor', impersonated: true }, manager: { userId: 'u-ingrid', orgId: 'org-quillmoor' }, instructor: { userId: 'u-samir', orgId: 'org-quillmoor' }, author: { userId: 'u-aino', orgId: 'org-quillmoor' }, org_admin: { userId: 'u-priya', orgId: 'org-quillmoor' }, platform_admin: { userId: 'u-elin', orgId: 'org-acme' } };
 
 async function session(theme, persona, width = 1440) {
-  const ctx = await browser.newContext({ viewport: { width, height: 900 }, deviceScaleFactor: 1 });
+  const ctx = await browser.newContext({ viewport: { width, height: 900 }, deviceScaleFactor: 1, ...(storage ? { storageState: storage } : {}) });
   await ctx.addInitScript(
     ({ t, s }) => {
       localStorage.setItem('ct.theme', t);
-      localStorage.setItem('ct.mock.session', s);
+      if (s !== null) localStorage.setItem('ct.mock.session', s);
       localStorage.setItem('ct.nav.collapsed', '0');
     },
-    { t: theme, s: persona === 'none' ? 'none' : JSON.stringify(PERSONAS[persona]) },
+    { t: theme, s: storage ? null : persona === 'none' ? 'none' : JSON.stringify(PERSONAS[persona]) },
   );
   const page = await ctx.newPage();
   page.on('pageerror', (e) => {
@@ -48,7 +58,12 @@ async function session(theme, persona, width = 1440) {
 
 async function open(page, url, waitFor) {
   await page.goto(base + url, { waitUntil: 'networkidle' });
-  if (waitFor) await page.getByText(waitFor, { exact: false }).first().waitFor({ timeout: 15000 });
+  if (waitFor) {
+    const seen = page.getByText(waitFor, { exact: false }).first().waitFor({ timeout: 15000 });
+    // Real mode: the texts match the mock fixtures, not the signed-in user's data.
+    if (storage) await seen.catch(() => console.log(`note: "${waitFor}" not on ${url} (real data)`));
+    else await seen;
+  }
   await page.waitForTimeout(600);
 }
 
@@ -69,6 +84,7 @@ const VIEWS = [
   ['history', 'learner', '/history', 'History'],
   ['history-attempt', 'learner', '/history', 'History', async (p) => (await p.locator('tr.row-link').first().click(), await p.getByText('Checks').first().waitFor())],
   ['exams', 'learner', '/exams', 'Exam simulations'],
+  ['dev-signin-banner', 'learner_impersonated', '/', 'Assignments due', async (p) => p.getByText('Dev sign-in as').waitFor()],
   ['user-menu', 'manager', '/', 'Next best lab', async (p) => (await p.getByRole('button', { name: 'Account menu' }).click(), await p.getByText('Organisation').waitFor())],
   ['persona-switcher', 'manager', '/', 'Next best lab', async (p) => (await p.getByRole('button', { name: 'Demo persona' }).click(), await p.getByText('Demo persona · mock mode').waitFor())],
   ['team-dashboard', 'manager', '/team', 'Members × competencies'],
@@ -107,6 +123,8 @@ const VIEWS = [
 try {
   for (const [name, persona, url, waitFor, extra] of VIEWS) {
     if (only?.length && !only.includes(name)) continue;
+    // Real mode: no clicks that change state, no labs started, no sign-in pages (already signed in).
+    if (storage && !only?.length && (extra || persona === 'none' || /\/work$|\/observe\//.test(url))) continue;
     const { ctx, page } = await session('dark', persona);
     try {
       await open(page, url, waitFor);
@@ -120,7 +138,7 @@ try {
     }
     await ctx.close();
   }
-  if (!only?.length) {
+  if (!only?.length && !storage) {
     for (const theme of ['light', 'cream']) {
       for (const [name, persona, url, waitFor] of [VIEWS[0], VIEWS.find((v) => v[0] === 'team-dashboard'), VIEWS.find((v) => v[0] === 'cohort-board'), VIEWS.find((v) => v[0] === 'admin-users'), VIEWS.find((v) => v[0] === 'admin-sso')]) {
         const { ctx, page } = await session(theme, persona);

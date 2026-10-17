@@ -442,6 +442,62 @@ docker rm -f ct-pg17-dump
    `azarguard-entra` is in `CT_PLATFORM_IDPS` (default). The mapping code is the
    one `acme-idp` exercises today.
 
+### Signing in as a real user (agents)
+
+Scripts can sign in as local Keycloak users with `deploy/scripts/platform-login.mjs`,
+but not as Entra-brokered users (MFA, the real tenant). For agents that need to
+see the app as one of those people, the gateway has a **dev-only** sign-in-as
+endpoint, `POST /api/dev/sign-in-as` with `{ "email" }` or `{ "userId" }` and
+optionally `{ "orgId" }`. It creates an ordinary gateway session (the same
+`ct_session` cookie and CSRF token as a real login) for a user that already
+exists in Postgres, with that user's real memberships, roles, teams and
+platform-admin flag. It never creates users or grants anything, and it does no
+Keycloak or Entra token exchange.
+
+```bash
+task dev:gateway                                   # turns it on (CT_DEV_IMPERSONATE=1)
+CT_DEV_IMPERSONATE=0 task dev:gateway              # ... or not
+
+node deploy/scripts/dev-signin-as.mjs someone@azarguard.com            # prints who, org, roles, expiry
+node deploy/scripts/dev-signin-as.mjs someone@azarguard.com --base http://localhost:8787 \
+  --playwright-storage /tmp/someone.json --web http://localhost:5173   # Playwright storageState
+node apps/web/scripts/platform-shots.mjs --base http://localhost:5173 \
+  --storage /tmp/someone.json --out /tmp/shots --only home-learner     # real-mode screenshots
+node apps/web/scripts/readme-shots.mjs --base http://localhost:5173 --storage /tmp/someone.json --out /tmp/shots
+```
+
+As a module, `signInAs(base, email, { orgId })` returns the same session object
+as `platform-login.mjs`'s `login()`: `s.me`, `s.cookie`, `s.csrf` and
+`s.api(method, path, body)` with cookie and CSRF handled.
+
+Safeguards:
+
+- Registered only with `CT_DEV_IMPERSONATE=1`. `task dev:gateway` sets it; no
+  manifest, deploy script, Dockerfile or CI workflow may (a gateway test greps
+  `deploy/`, `.github/` and the service manifests for it). Any value other than
+  `1`, `0` or empty stops the gateway.
+- With the flag set, the gateway **refuses to start** when `NODE_ENV=production`
+  or when `CT_PUBLIC_URL` / `CT_WEB_URL` is not on `localhost` or `127.0.0.1`.
+- Loopback callers only, judged on the TCP peer address (`X-Forwarded-For` is
+  ignored). Browser requests from another site are refused (`Origin`,
+  `Sec-Fetch-Site`, a non-localhost `Host` for DNS rebinding), and the body must be
+  JSON, so a web page cannot sign a browser in behind your back.
+- Org: one where the user has an active membership (default: the first);
+  platform admins may name any org, as with `POST /api/me/org`. Platform-admin
+  powers only when `users.platform_roles` already holds them.
+- Each sign-in writes an `auth.dev_impersonate` audit row in that org (actor
+  `dev-impersonation`, target the user) and a warning in the gateway log. A
+  platform admin without an org membership gets the log line only (audit rows
+  belong to an org).
+- The session is marked as impersonated (`auth_sessions.idp = 'dev:impersonation'`,
+  which no real IdP alias can be; `/api/me` answers
+  `auth: { method: 'dev-impersonation', impersonated: true }`) and the
+  web app shows a "Dev sign-in as <name>" banner on every page. It lives no
+  longer than a normal session (`CT_SESSION_MAX_AGE_SECONDS`, idle timeout), is
+  never refreshed against an IdP, and sign-out ends it.
+- Per-user exam date and target live in the browser's localStorage, not in the
+  database, so an impersonated Home shows the defaults unless the agent sets them.
+
 ## Lab runtime tiers (foundations stream)
 
 Status and measurements: `docs/handoffs/foundations.md`.

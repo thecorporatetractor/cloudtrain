@@ -143,6 +143,8 @@ export function registerAuthRoutes(app: FastifyInstance, d: AuthRouteDeps): void
       if (row?.org_id) await withTenant(ps.db, { orgId: row.org_id, userId: req.principal.sub }, (tx) => audit(tx, { orgId: row.org_id!, actorId: req.principal.sub, actorName: req.principal.name, ip: req.ip }, 'auth.logout', 'user', req.principal.sub)).catch(() => undefined);
     }
     store.clearCookie(reply);
+    // A dev sign-in-as session has no Keycloak session to end.
+    if (sess?.impersonated) return { redirectUrl: `${web}/` };
     return { redirectUrl: await oidc.endSessionUrl(idToken, `${web}/`) };
   });
 

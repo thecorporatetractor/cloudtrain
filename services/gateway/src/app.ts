@@ -15,6 +15,7 @@ import { CSRF_HEADER, csrfMatches, type SessionStore } from './oidc/sessions.js'
 import { endObserve, startObserve } from './platform/cohorts.js';
 import type { PlatformService } from './platform/service.js';
 import { registerAuthRoutes } from './routes/auth.js';
+import { registerDevImpersonation } from './routes/dev.js';
 import { registerPlatformRoutes } from './routes/platform.js';
 import type { SessionService } from './sessions/service.js';
 import { bridge, clampSize, send } from './terminal/bridge.js';
@@ -37,6 +38,8 @@ export interface AppDeps {
   oidc?: { client: OidcClient; store: SessionStore };
   clusterInfo?: ClusterInfo | null;
   hub?: TerminalHub;
+  /** DEV ONLY: `POST /api/dev/sign-in-as` (CT_DEV_IMPERSONATE=1; needs `platform` and `oidc`). Absent = not registered. */
+  devImpersonate?: boolean;
 }
 
 /** onRoute hook: an /api route without `config.permission` or `config.public` is a startup error. */
@@ -119,6 +122,10 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   if (deps.oidc && ps) registerAuthRoutes(app, { ps, oidc: deps.oidc.client, store: deps.oidc.store });
   else if (ps) app.get('/api/me', { config: { permission: 'progress.read.self', anyOrg: true } }, async (req) => ps.me(req.principal));
   else app.get('/api/me', self, async (req) => learnerOf(req.principal));
+  if (deps.devImpersonate) {
+    if (!deps.oidc || !ps) throw new Error('dev sign-in-as needs the platform database and gateway sessions');
+    registerDevImpersonation(app, { ps, store: deps.oidc.store });
+  }
   app.get('/api/home', self, async (req) => (ps ? ps.home(req.principal) : sampleHome(content, req.principal)));
 
   /* --------------------------------- catalog --------------------------------- */
