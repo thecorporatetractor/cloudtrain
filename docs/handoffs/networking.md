@@ -46,7 +46,7 @@ time; some edited afterwards).
 | net-fix-native-vlan-mismatch | **yes (P1+P2)** | |
 | net-inter-vlan-subinterfaces | **yes (P1+P2)** | Linux router (netsvc) instead of FRR: FRR console cannot create VLAN devices |
 | net-rstp-root-bridge | **yes** (BPDUs pass without the fix; host ping needs P1) | kernel bridge STP is 802.1D, mstpd/RSTP impossible in a pod netns (user STP needs init netns) |
-| net-fix-broadcast-storm | **yes**, and do not run until the platform rate-limits link segments | a loop on OVN segments with FDB learning may flood the OVN southbound DB; mark `built` with that note |
+| net-fix-broadcast-storm | **yes** | platform round 4 rate-limits every link attachment (10 Mbit/s each way, host side); the draft ran live under it (see "Platform blockers") |
 | net-lacp-server-uplink | **yes** | LACP negotiation itself works across OVN (spike) |
 | net-default-route-edge | no | |
 | net-floating-static-backup | no | core uses a BFD-tracked static so the return path fails over (`ip route ... bfd`, untested) |

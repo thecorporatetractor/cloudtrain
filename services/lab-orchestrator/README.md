@@ -153,8 +153,15 @@ manager sets `other_config:vlan-passthru=true` on each link logical switch with
 `ovn-nbctl` in the ovn-central pod (`--ovn-central`, default
 `kube-system/app=ovn-central`; empty disables it and tagged frames are
 dropped). Done subnets carry `labs.cloudtrain.dev/vlan-passthru: "true"`. The
-management segment keeps strict addressing. There is no rate limit on link
-segments yet: a bridging loop floods OVN.
+management segment keeps strict addressing.
+
+**Rate limit on links**: every link attachment is annotated
+`<provider>.kubernetes.io/ingress_rate` and `egress_rate` (`--link-rate-mbps`,
+default 10 Mbit/s; 0 disables). Kube-OVN applies them on the host side of the
+pod's veth (OVS ingress policing and an HTB queue), out of the learner's
+reach, so a bridging loop or flood on lab links cannot saturate the host: each
+port injects at most the rate, and a frame dropped at the cap leaves the loop.
+Labs that shape traffic themselves (`tbf`, netem) stay below it.
 
 **Isolation** is structural: wired pods live only in the session VPC, which
 has no route to the platform pod network, kube-apiserver, nodes or the
@@ -245,6 +252,7 @@ Kubernetes authn/authz when set), `--watch-namespace`, `--leader-elect`,
 `--vcluster-chart`, `--vcluster-values`, `--vcluster-pod-security`
 (`baseline`|`restricted`; `privileged` is refused), `--session-selector`,
 `--leader-election-id`, `--net-tools-image` (default `nettools:1`), `--ovn-central`,
+`--link-rate-mbps` (default 10, per link attachment and direction; 0 = none),
 `--persistent-home`, `--vcluster-persistence`, `--allow-learner-sudo` (default true;
 false fails labs whose entry node sets `learnerSudo`, see docs/dev-environment.md), `--vm-disks`
 (`persistent`|`ephemeral`), `--storage-class`. The cache only holds Pods/Services labelled

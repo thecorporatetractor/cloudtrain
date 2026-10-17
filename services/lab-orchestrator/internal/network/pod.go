@@ -25,6 +25,12 @@ const (
 	// for MACs that are not its own: Linux bridges, bonds, macvlans and
 	// VRRP virtual MACs behind a link end.
 	Layer2ForwardSuffix = ".kubernetes.io/layer2_forward"
+	// IngressRateSuffix and EgressRateSuffix, prefixed with an attachment's
+	// provider, rate-limit that port in Mbit/s (Kube-OVN QoS: an HTB queue
+	// towards the pod and OVS ingress policing from it, both on the host
+	// side of the veth, so the learner cannot lift them).
+	IngressRateSuffix = ".kubernetes.io/ingress_rate"
+	EgressRateSuffix  = ".kubernetes.io/egress_rate"
 
 	// InitContainerName applies addresses, MTU and impairment before the node starts.
 	InitContainerName = "net-init"
@@ -40,6 +46,12 @@ type PodOptions struct {
 	ToolsImage string
 	// Router enables IP forwarding in the pod's network namespace (netdev nodes).
 	Router bool
+	// LinkRateMbps caps every link attachment at this rate in each
+	// direction (0 = no limit). A bridging loop on lab links (broadcast
+	// storm labs) otherwise floods OVS and OVN as fast as the CPU allows;
+	// capped, each port re-injects at most this much, and a frame dropped
+	// at the cap leaves the loop for good.
+	LinkRateMbps int
 }
 
 // DecoratePod wires node's pod into the session network: the primary
@@ -66,6 +78,11 @@ func (p *Plan) DecoratePod(node string, pod *corev1.Pod, containerName string, o
 			nets = append(nets, ne.Link.Segment.Attachment(p.Session.Namespace, ne.End.Interface))
 			pod.Annotations[ne.Link.Segment.Provider+".kubernetes.io/logical_switch"] = ne.Link.Segment.Subnet
 			pod.Annotations[ne.Link.Segment.Provider+Layer2ForwardSuffix] = "true"
+			if o.LinkRateMbps > 0 {
+				rate := strconv.Itoa(o.LinkRateMbps)
+				pod.Annotations[ne.Link.Segment.Provider+IngressRateSuffix] = rate
+				pod.Annotations[ne.Link.Segment.Provider+EgressRateSuffix] = rate
+			}
 		}
 		raw, err := json.Marshal(nets)
 		if err != nil {

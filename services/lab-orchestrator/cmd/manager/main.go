@@ -33,6 +33,7 @@ func main() {
 		sessionSelector, leaderElectionID, netToolsImage                    string
 		storageClass, vmDisks, userNamespaces, vclusterPodSecurity          string
 		ovnCentral                                                          string
+		linkRateMbps                                                        int
 		leaderElect, metricsSecure, persistentHome, vclusterPersistence     bool
 		allowLearnerSudo                                                    bool
 		concurrency                                                         int
@@ -61,6 +62,7 @@ func main() {
 	flag.StringVar(&vmDisks, "vm-disks", "persistent", "VM root disks: persistent (CDI DataVolume per VM, VMs can hibernate) or ephemeral (containerDisk)")
 	flag.StringVar(&vclusterPodSecurity, "vcluster-pod-security", drivers.PodSecurityBaseline, "Pod Security Standard enforced on vcluster host namespaces, where learners' virtual-cluster pods run: baseline or restricted (restricted also rejects the vcluster control plane unless the values make it non-root)")
 	flag.StringVar(&ovnCentral, "ovn-central", "kube-system/app=ovn-central", "Kube-OVN central pods (<namespace>/<label>=<value>) to set vlan-passthru on lab link switches with ovn-nbctl; empty = links drop 802.1Q-tagged frames")
+	flag.IntVar(&linkRateMbps, "link-rate-mbps", 10, "rate limit of every lab link attachment in Mbit/s, each direction (Kube-OVN ingress_rate/egress_rate: OVS policing and an HTB queue on the host side of the port, out of the learner's reach), so a bridging loop cannot saturate the host; 0 = none")
 	flag.BoolVar(&allowLearnerSudo, "allow-learner-sudo", true, "allow labs whose entry node sets learnerSudo (the learner may escalate to root in that unprivileged container); false fails such sessions")
 	flag.StringVar(&storageClass, "storage-class", "", "StorageClass of learner homes, vcluster databases and VM disks; empty = cluster default")
 	opts := zap.Options{}
@@ -174,9 +176,15 @@ func main() {
 		toolsImage = img.Image
 	}
 	linkNet := &drivers.LinkNetwork{
-		Manager:    &network.Manager{Client: mgr.GetClient()},
-		ToolsImage: rt.Container.ImageFor(toolsImage),
+		Manager:      &network.Manager{Client: mgr.GetClient()},
+		ToolsImage:   rt.Container.ImageFor(toolsImage),
+		LinkRateMbps: linkRateMbps,
 	}
+	if linkRateMbps < 0 {
+		log.Error(nil, "--link-rate-mbps must be >= 0", "value", linkRateMbps)
+		os.Exit(1)
+	}
+	log.Info("wired lab pods", "linkRateMbps", linkRateMbps)
 	if ovnCentral != "" {
 		ovn, err := drivers.ParseOVNCentral(ovnCentral)
 		if err != nil {

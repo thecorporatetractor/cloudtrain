@@ -162,6 +162,9 @@ func TestDecoratePod(t *testing.T) {
 			t.Errorf("link %s: layer2_forward = %q", l.ID, got)
 		}
 	}
+	if _, ok := pod.Annotations[p.Links[0].Segment.Provider+IngressRateSuffix]; ok {
+		t.Error("rate limit set without LinkRateMbps")
+	}
 	if _, ok := pod.Annotations["ovn.kubernetes.io/layer2_forward"]; ok {
 		t.Error("management interface must not forward unknown MACs")
 	}
@@ -195,6 +198,20 @@ func TestDecoratePod(t *testing.T) {
 	caps := pod.Spec.Containers[0].SecurityContext.Capabilities.Add
 	if len(caps) != 2 {
 		t.Errorf("node caps = %v", caps)
+	}
+
+	// Every link attachment is rate limited when asked.
+	rl := &corev1.Pod{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "node"}}}}
+	if err := p.DecoratePod("edge-1", rl, "node", PodOptions{ToolsImage: "t", Router: true, LinkRateMbps: 10}); err != nil {
+		t.Fatal(err)
+	}
+	for _, l := range p.Links[:2] {
+		if rl.Annotations[l.Segment.Provider+IngressRateSuffix] != "10" || rl.Annotations[l.Segment.Provider+EgressRateSuffix] != "10" {
+			t.Errorf("link %s: rate annotations %v", l.ID, rl.Annotations)
+		}
+	}
+	if _, ok := rl.Annotations["ovn.kubernetes.io/ingress_rate"]; ok {
+		t.Error("management interface must not be rate limited")
 	}
 
 	// A host on a host-only link gets its platform address, no forwarding.
