@@ -445,7 +445,8 @@ docker rm -f ct-pg17-dump
 ### Signing in as a real user (agents)
 
 Scripts can sign in as local Keycloak users with `deploy/scripts/platform-login.mjs`,
-but not as Entra-brokered users (MFA, the real tenant). For agents that need to
+but not as Entra-brokered users (MFA, the real tenant); the one exception is the MFA-free
+test account, see "Headless Entra sign-in" below. For agents that need to
 see the app as one of those people, the gateway has a **dev-only** sign-in-as
 endpoint, `POST /api/dev/sign-in-as` with `{ "email" }` or `{ "userId" }` and
 optionally `{ "orgId" }`. It creates an ordinary gateway session (the same
@@ -497,6 +498,52 @@ Safeguards:
   never refreshed against an IdP, and sign-out ends it.
 - Per-user exam date and weekly target live in the database (`learner_goals`,
   `GET/PUT /api/me/goals`), so an impersonated Home shows the user's own goals.
+
+### Headless Entra sign-in (local end-to-end tests)
+
+**Local only.** `deploy/scripts/entra-login.mjs` signs in for real through Entra ID as
+the test account `ct-e2e@azarguard.com`: a headless Playwright Chromium goes gateway
+`/api/auth/login` (identity-first) -> Keycloak -> identity provider `azarguard-entra` ->
+the Microsoft sign-in page (email, password, "Stay signed in?" -> No) -> Keycloak ->
+gateway callback, then exports the session like `dev-signin-as.mjs` does. Unlike
+sign-in-as it is a real OIDC session (`/api/me` `auth.method = oidc`,
+`auth.idp = azarguard-entra`, not impersonated), so it also tests the broker, the role
+mapping and just-in-time provisioning.
+
+```bash
+node deploy/scripts/entra-login.mjs                                    # prints who, org, roles, the hop path
+node deploy/scripts/entra-login.mjs --playwright-storage /tmp/ct-e2e.json \
+  --screenshot /tmp/ct-e2e-home.png                                    # storageState + Home screenshot
+node apps/web/scripts/platform-shots.mjs --base http://localhost:5173 --storage /tmp/ct-e2e.json --out /tmp/shots
+```
+
+Options: `--base` (gateway, default `http://localhost:8787`), `--web` (default
+`http://localhost:5173`), `--env <file>`, `--chromium` (default `/usr/bin/chromium`),
+`--headed`, `--print-cookie`; `ENTRA_LOGIN_DEBUG_DIR=<dir>` saves the page it got stuck on (`stuck.html`). As a module, `entraLogin({ gateway, web })` returns the same
+session object as `signInAs()` (`s.me`, `s.cookie`, `s.csrf`, `s.api()`), plus
+`s.storageState` (the `ct_session` cookie only).
+
+- Credentials come from `ENTRA_E2E_USER` / `ENTRA_E2E_PASSWORD`, else from
+  `~/.config/cloudtrain/entra-e2e.env` (never commit, print or log them; the script
+  never does). The storageState holds only the gateway session cookie: treat it as a
+  credential for the session's lifetime and delete it after use.
+- The account has no MFA and is fenced by Conditional Access to **this machine's public
+  IP and the CloudTrain app only**. Anywhere else (CI, another network) Entra answers
+  `AADSTS53003` (blocked by Conditional Access): the script exits 3 and prints the
+  request and correlation ids. Do not loosen the policy from here; the tenant is managed
+  by the Terraform configuration in `~/terraform`.
+- Expected roles: **Learner and Manager only** (app roles `CloudTrain.Learner` and
+  `CloudTrain.Manager`), no org or platform admin. Proven 2026-10-17: `/api/me` roles
+  `[learner, manager]`, `platformAdmin: false`; `/api/admin/*` and `/api/platform/*` 403.
+- Entra sends no `email` claim for this account (it has no mail attribute), so on the
+  first sign-in Keycloak's first-broker-login "review profile" page asks for an email;
+  the script fills in the sign-in name, as a person would. Adding the mail attribute (or
+  the `email` optional claim) in the tenant removes that page.
+- `task dev:gateway` does not set `CT_WEB_URL`, so after the callback the browser lands on
+  `http://localhost:8787/` (a 404 JSON page); the script treats that as done and opens
+  `--web` for the screenshot (the cookie is host-scoped, so it works on both ports).
+- Signing in writes the usual `auth.login` audit row and updates the user's
+  `last_login_at`; it changes nothing else.
 
 ## Lab runtime tiers (foundations stream)
 
