@@ -23,6 +23,9 @@ cp -r "$B/security/." /opt/cloudtrain/security/
 # gVisor: runsc + shim, registered with containerd as runtime handler "runsc" (labs only
 # create the RuntimeClass: handler: runsc)
 install -m 0755 "$B/gvisor/runsc" "$B/gvisor/containerd-shim-runsc-v1" /usr/local/bin/
+install -d /usr/local/bin/gvisor-bin
+install -m 0755 "$B"/gvisor/gvisor-bin/* /usr/local/bin/gvisor-bin/
+test -x /usr/local/bin/gvisor-bin/gvisor_sentry
 runsc --version | head -1
 CFG=/etc/containerd/config.toml
 if ! grep -q 'runtimes.runsc' "$CFG"; then

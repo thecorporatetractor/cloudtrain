@@ -209,9 +209,11 @@ if [[ $GUEST == kubeadm-addons ]]; then
   cp "$A/addons-install" "$IN/"; rm -rf "$IN/security"; cp -r "$A/security" "$IN/security"
   fetch_pinned "https://github.com/google/gvisor/releases/download/${GVISOR_RELEASE}/gvisor-x86_64.tar.bz2" \
     "$GVISOR_TARBALL_SHA256" "$CACHE/gvisor-${GVISOR_RELEASE}.tar.bz2"
-  # the guest has no bzip2: unpack the two binaries here
+  # the guest has no bzip2: unpack here. runsc (since the 2026 releases) also needs its
+  # sidecars in gvisor-bin/ next to it (gvisor_sentry, ...; sidecar policy STRICT), else
+  # every sandbox fails with 'sidecar "gvisor_sentry" not usable'.
   rm -rf "$IN/gvisor"; mkdir -p "$IN/gvisor"
-  tar -xjf "$CACHE/gvisor-${GVISOR_RELEASE}.tar.bz2" -C "$IN/gvisor" runsc containerd-shim-runsc-v1
+  tar -xjf "$CACHE/gvisor-${GVISOR_RELEASE}.tar.bz2" -C "$IN/gvisor" runsc containerd-shim-runsc-v1 gvisor-bin
   fetch_pinned "https://github.com/aquasecurity/kube-bench/releases/download/${KUBE_BENCH_VERSION}/kube-bench_${KUBE_BENCH_VERSION#v}_linux_amd64.tar.gz" \
     "$KUBE_BENCH_TARBALL_SHA256" "$IN/kube-bench.tar.gz"
   # every image the add-on manifests reference must be in lock/addons.lock (exactly)
