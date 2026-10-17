@@ -270,7 +270,7 @@ export interface Check {
     value: string;
   };
   /**
-   * Seconds before the check counts as timed out (max 300). Default 30 for shell checks (they often make several calls), 5 for every other type.
+   * Seconds before the check counts as timed out (max 300). Default 30 for shell checks (they often make several calls), 20 for k8s-query, k8s-can-i and k8s-context (one kubectl call, slow under load), 5 for every other type.
    */
   timeoutSec?: number;
 }

@@ -455,7 +455,9 @@ to `Ready`). A request on a Failed or Expired session is answered with phase
   (`\n` or `\r\n`) stripped; nothing else is trimmed. The expected value is
   used verbatim. `regex` is Go RE2 and matches anywhere unless anchored.
 - Timeouts: `timeoutSec` (default 30s for `shell` checks, which usually make
-  several calls, 5s for the other types; max 5m) via coreutils `timeout` in the
+  several calls; 20s for `k8s-query`, `k8s-can-i` and `k8s-context`, whose single
+  kubectl call against a vcluster took over 5s at load average 70-120; 5s for
+  the other types; max 5m; a check's own `timeoutSec` always wins) via coreutils `timeout` in the
   target, plus transport slack; exit 124/137 = "the check timed out".
 - `message` is learner-safe (`passed`, `not satisfied yet`, `the check timed
   out`, `the check could not run`); it never contains expected values.

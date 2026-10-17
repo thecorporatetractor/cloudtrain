@@ -20,8 +20,14 @@ import (
 )
 
 const (
-	// DefaultTimeout applies when a check has no timeoutSec.
+	// DefaultTimeout applies when a check has no timeoutSec and no
+	// type-specific default.
 	DefaultTimeout = 5 * time.Second
+	// DefaultK8sTimeout applies to k8s-query, k8s-can-i and k8s-context
+	// checks without timeoutSec. A single kubectl call against a vcluster
+	// timed out at 5s with the host's load average at 70-120; labs that set
+	// 20s passed. Matches the compiler's default for these types.
+	DefaultK8sTimeout = 20 * time.Second
 	// DefaultShellTimeout applies to shell checks without timeoutSec: they
 	// usually make several calls (kubectl, ssh) and 5s was too short under
 	// load. Matches the compiler's default for shell checks.
@@ -114,8 +120,11 @@ type outcome struct {
 
 func timeoutOf(c labsv1.Check) time.Duration {
 	t := DefaultTimeout
-	if c.Type == "shell" {
+	switch {
+	case c.Type == "shell":
 		t = DefaultShellTimeout
+	case IsK8sCheck(c.Type):
+		t = DefaultK8sTimeout
 	}
 	if c.TimeoutSec > 0 {
 		t = time.Duration(c.TimeoutSec) * time.Second
@@ -124,6 +133,15 @@ func timeoutOf(c labsv1.Check) time.Duration {
 		t = MaxTimeout
 	}
 	return t
+}
+
+// IsK8sCheck reports whether a check type queries a Kubernetes API with kubectl.
+func IsK8sCheck(t labsv1.CheckType) bool {
+	switch t {
+	case "k8s-query", "k8s-can-i", "k8s-context":
+		return true
+	}
+	return false
 }
 
 // wrap runs argv under coreutils timeout in the target.
