@@ -5,7 +5,9 @@ container images (tools/images) contain further third-party software under its o
 licenses, e.g. Ubuntu, Kubernetes, containerd, Calico, etcd and FRRouting (GPL-2.0-or-later),
 distributed as separate images and not linked into CloudTrain. The IaC workstation image
 (tools/images/iac) ships Terraform under BUSL-1.1 (source-available, not open source; see the
-iac licensingNote in content/curriculum.yaml) unless built with IAC_CLI=tofu.
+iac licensingNote in content/curriculum.yaml) unless built with IAC_CLI=tofu. The Ansible control
+node image (tools/images/ansible) ships ansible-core and its tools under GPL-3.0-or-later as
+separate programs with their licence texts; CloudTrain code does not import or link them.
 
 ## JavaScript / TypeScript (pnpm workspace)
 
