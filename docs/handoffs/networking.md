@@ -142,6 +142,14 @@ keeps that order, or rework them.
 - **P2 - link segments drop 802.1Q-tagged frames.** Tagged frames left the trunk
   port but never arrived; `ovn-nbctl set Logical_Switch <ls> other_config:vlan-passthru=true`
   fixed it. Needed for trunks and router-on-a-stick.
+- **P3 and P4 are fixed in the platform (round 4)**: the entry NetworkPolicy of a
+  wired entry carries `ovn.kubernetes.io/network_policy_for: ovn` (plus the access
+  NAD when the lab has VMs), so it no longer filters link attachments; wired pods
+  run in a user namespace with an unmasked `/proc` in the node container, so
+  network sysctls (`ip_forward`, `rp_filter`, `accept_ra`, `proxy_arp`, ...) are
+  writable by root in the node (host-wide ones stay read-only), and
+  `ping_group_range` lets the learner ping without NET_RAW. The unwired-workstation
+  workaround and the dhcpcd SLAAC workaround are no longer required. Original findings:
 - **P3 - a wired entry node gets the entry NetworkPolicy**, and Kube-OVN applies
   it to its link attachments too, so unicast IP to that node over lab links is
   dropped (seen when the entry defaulted to a bridge node:

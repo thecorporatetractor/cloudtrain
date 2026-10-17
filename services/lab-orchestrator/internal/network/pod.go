@@ -46,6 +46,14 @@ type PodOptions struct {
 	ToolsImage string
 	// Router enables IP forwarding in the pod's network namespace (netdev nodes).
 	Router bool
+	// UserNamespace runs the wired pod in a user namespace (hostUsers:
+	// false) with an unmasked /proc in net-init and the node container, so
+	// the pod's network sysctls (ip_forward, rp_filter, accept_ra,
+	// proxy_arp, ...) are writable by root in the node (networking handoff
+	// P4), and net-init needs no privileged mode. Host-wide sysctls stay
+	// read-only: the user namespace does not own them. Without it net-init
+	// runs privileged and /proc/sys is read-only in the node.
+	UserNamespace bool
 	// LinkRateMbps caps every link attachment at this rate in each
 	// direction (0 = no limit). A bridging loop on lab links (broadcast
 	// storm labs) otherwise floods OVS and OVN as fast as the CPU allows;
@@ -109,13 +117,26 @@ func (p *Plan) DecoratePod(node string, pod *corev1.Pod, containerName string, o
 		Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("5m"), corev1.ResourceMemory: resource.MustParse("8Mi")},
 		Limits:   corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("64Mi")},
 	}
+	// Privileged only to write the netns-scoped sysctls (/proc/sys is
+	// read-only otherwise); it exits before the node starts.
+	initSC := &corev1.SecurityContext{Privileged: ptr.To(true)}
+	if o.UserNamespace {
+		pod.Spec.HostUsers = ptr.To(false)
+		initSC = &corev1.SecurityContext{
+			Capabilities: &corev1.Capabilities{Add: []corev1.Capability{"NET_ADMIN", "NET_RAW"}},
+			ProcMount:    ptr.To(corev1.UnmaskedProcMount),
+		}
+		for i := range pod.Spec.Containers {
+			if c := &pod.Spec.Containers[i]; c.Name == containerName {
+				c.SecurityContext.ProcMount = ptr.To(corev1.UnmaskedProcMount)
+			}
+		}
+	}
 	pod.Spec.InitContainers = append(pod.Spec.InitContainers, corev1.Container{
-		Name:    InitContainerName,
-		Image:   o.ToolsImage,
-		Command: []string{"/bin/sh", "-ec", p.InitScript(node, o.Router)},
-		// Privileged only to write the netns-scoped sysctls (/proc/sys is
-		// read-only otherwise); it exits before the node starts.
-		SecurityContext: &corev1.SecurityContext{Privileged: ptr.To(true)},
+		Name:            InitContainerName,
+		Image:           o.ToolsImage,
+		Command:         []string{"/bin/sh", "-ec", p.InitScript(node, o.Router)},
+		SecurityContext: initSC,
 		Resources:       small,
 	})
 	pod.Spec.Containers = append(pod.Spec.Containers, corev1.Container{
@@ -146,6 +167,7 @@ func appendCaps(have []corev1.Capability, add ...corev1.Capability) []corev1.Cap
 
 // InitScript is the net-init shell script for node. It runs once per pod
 // sandbox (a fresh network namespace), so it may flush freely:
+//   - unprivileged ICMP echo (ping_group_range) is allowed,
 //   - the default route via the management gateway is removed (the VPC has no
 //     way out anyway; this keeps lab routing tables clean),
 //   - every link interface loses its Kube-OVN carrier address and gets its
@@ -156,6 +178,10 @@ func (p *Plan) InitScript(node string, router bool) string {
 		b.WriteString("sysctl -qw net.ipv4.ip_forward=1 net.ipv6.conf.all.forwarding=1\n")
 		b.WriteString("sysctl -qw net.ipv4.conf.all.rp_filter=0 net.ipv4.conf.default.rp_filter=0\n")
 	}
+	// Unprivileged ICMP sockets, so the learner (no NET_RAW: no_new_privs
+	// ignores ping's file capabilities) can ping across lab links. 0-65535
+	// is the gid range a pod user namespace maps.
+	b.WriteString("sysctl -qw net.ipv4.ping_group_range='0 65535' || true\n")
 	fmt.Fprintf(&b, "ip -4 route del default via %s dev eth0 2>/dev/null || true\n", p.Mgmt.Gateway)
 	for _, ne := range p.EndsOf(node) {
 		for _, line := range EndCommands(ne) {

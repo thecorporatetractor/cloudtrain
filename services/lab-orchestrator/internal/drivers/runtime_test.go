@@ -197,6 +197,26 @@ func TestEntryPolicy(t *testing.T) {
 	}
 }
 
+func TestEntryPolicyNetworks(t *testing.T) {
+	s := testSession()
+	topo := &kubeadmTopology().Topology
+	if got := EntryPolicyNetworks(s, topo, "workstation"); got != "" {
+		t.Errorf("unwired entry: %q", got)
+	}
+	topo.Links = append(topo.Links, labsv1.Link{A: "workstation:eth1", B: "r1:eth1"})
+	if got, want := EntryPolicyNetworks(s, topo, "workstation"), "ovn,"+s.Namespace+"/"+NewLabNet(s).NAD(); got != want {
+		t.Errorf("wired entry with VM hosts: %q, want %q", got, want)
+	}
+	plain := &labsv1.Topology{Entry: "sw1", Nodes: []labsv1.Node{{Name: "sw1", Driver: labsv1.DriverContainer}, {Name: "h1", Driver: labsv1.DriverContainer}},
+		Links: []labsv1.Link{{A: "h1:eth1", B: "sw1:eth1"}}}
+	if got := EntryPolicyNetworks(s, plain, "sw1"); got != "ovn" {
+		t.Errorf("wired entry, no VMs: %q", got)
+	}
+	if got := EntryPolicyNetworks(s, plain, "s"); got != "" {
+		t.Errorf("prefix match: %q", got)
+	}
+}
+
 func TestKubeadmUserdata(t *testing.T) {
 	tpl := kubeadmTopology()
 	ref := NodeRef{Session: testSession(), Template: tpl, Node: tpl.Topology.Nodes[1]}

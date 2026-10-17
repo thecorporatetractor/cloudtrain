@@ -115,8 +115,16 @@ hashed over namespace, session, UID and suffix):
 A node is *wired* if it is a netdev node or has a link end. Wired pods get:
 the mgmt subnet as primary network, one Multus attachment per link end with
 the interface name from `node:iface`, NET_ADMIN/NET_RAW on the node
-container, a `net-init` init container (nettools image; privileged only for
-netns sysctls) and a `net` sidecar (nettools; `sleep infinity`). Unwired nodes
+container, a `net-init` init container (nettools image) and a `net` sidecar
+(nettools; `sleep infinity`). Where user namespaces are available
+(`--user-namespaces`, `--link-sysctls`, both default on) the pod runs with
+`hostUsers: false`, `net-init` has NET_ADMIN/NET_RAW and `procMount: Unmasked`
+instead of privileged mode, and the node container also gets `procMount:
+Unmasked`: root in the node can change the pod's network sysctls (`ip_forward`,
+`rp_filter`, `accept_ra`, `proxy_arp`), while host-wide sysctls stay read-only
+because the user namespace does not own them. Without user namespaces
+`net-init` is privileged and `/proc/sys` is read-only in the node.
+`net-init` also sets `ping_group_range` so the learner can ping without NET_RAW. Unwired nodes
 (e.g. a jumphost without links) are untouched.
 
 **Links are pure L2.** Kube-OVN needs a CIDR, gateway and IP per port, so each
@@ -168,6 +176,10 @@ has no route to the platform pod network, kube-apiserver, nodes or the
 internet, even when a learner adds a default route via the VPC gateway; the
 platform network has no route into the VPC. No NetworkPolicy is put on wired
 pods (it would also filter link traffic: OSPF multicast, router loopbacks).
+When the entry node is wired, its entry policy carries
+`ovn.kubernetes.io/network_policy_for: ovn` (plus `<ns>/<access NAD>` when the lab
+has VM hosts), so Kube-OVN applies it to the primary and access interfaces only,
+not to the link attachments.
 Platform-network pods such as the jumphost keep the `lab-demo.sh` policies.
 
 **Status**: `status.links[]` = `id`, `segment` (logical switch), `network`
@@ -252,7 +264,8 @@ Kubernetes authn/authz when set), `--watch-namespace`, `--leader-elect`,
 `--vcluster-chart`, `--vcluster-values`, `--vcluster-pod-security`
 (`baseline`|`restricted`; `privileged` is refused), `--session-selector`,
 `--leader-election-id`, `--net-tools-image` (default `nettools:1`), `--ovn-central`,
-`--link-rate-mbps` (default 10, per link attachment and direction; 0 = none),
+`--link-rate-mbps` (default 10, per link attachment and direction; 0 = none), `--link-sysctls`
+(default true: wired pods in a user namespace with writable network sysctls),
 `--persistent-home`, `--vcluster-persistence`, `--allow-learner-sudo` (default true;
 false fails labs whose entry node sets `learnerSudo`, see docs/dev-environment.md), `--vm-disks`
 (`persistent`|`ephemeral`), `--storage-class`. The cache only holds Pods/Services labelled
