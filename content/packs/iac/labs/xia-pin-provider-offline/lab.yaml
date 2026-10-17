@@ -1,0 +1,138 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xia-pin-provider-offline
+  title: Pin a provider and lock it for two platforms offline
+  domain: iac
+  frameworks: [tf-associate:fundamentals]
+  difficulty: easy
+  estimatedMinutes: 5
+  tags: [exam, terraform, providers, lock-file]
+  version: 1
+spec:
+  description: |
+    **Directory:** `~/exam/pin` (workstation)
+
+    The stack in `~/exam/pin` requires `hashicorp/random` with no version
+    constraint. Only the **{{minor}}** release line is approved.
+
+    1. Constrain `random` so it can only resolve to a {{minor}}.x release.
+    2. Produce `~/exam/pin/.terraform.lock.hcl` recording that version with
+       checksums for both `linux_amd64` and `linux_arm64`. The workstation is
+       offline; providers are mirrored in `/opt/cloudtrain/providers`.
+  objectives:
+    - Constrain a provider version and lock it for several platforms
+  params:
+    minor:
+      type: choice
+      values: ["3.7", "3.8"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+  setup:
+    - on: workstation
+      run: |
+        set -eu
+        d=/home/learner/exam/pin
+        install -d -o learner -g learner /home/learner/exam "$d"
+        [ -e "$d/.ct-seeded" ] && exit 0
+        cat > "$d/main.tf" <<'HCL'
+        terraform {
+          required_providers {
+            random = {
+              source = "hashicorp/random"
+            }
+          }
+        }
+
+        resource "random_id" "survey" {
+          byte_length = 4
+        }
+        HCL
+        chown learner:learner "$d/main.tf"; touch "$d/.ct-seeded"
+  checks:
+    - id: constraint
+      description: A fresh init with -upgrade selects a {{minor}}.x release, never a newer minor
+      type: shell
+      on: workstation
+      skills: [iac.foundations.provider-install]
+      weight: 2
+      timeoutSec: 120
+      command: |
+        t=$(mktemp -d /tmp/pincheck.XXXXXX); cp /home/learner/exam/pin/*.tf "$t"/ 2>/dev/null; chown -R learner:learner "$t"
+        ct-iac run "$t" iac init -upgrade -backend=false -input=false -no-color >/dev/null 2>&1
+        v=$(awk '/provider ".*\/hashicorp\/random"/{p=1} p && /version *=/{gsub(/[" ]/,""); split($0,a,"="); print a[2]; exit}' "$t/.terraform.lock.hcl" 2>/dev/null)
+        rm -rf "$t"; echo "${v:-none}"
+      expect: {match: regex, value: '^{{minor}}\.[0-9]+$'}
+    - id: locked-version
+      description: The lock file records a {{minor}}.x release of random
+      type: shell
+      on: workstation
+      skills: [iac.foundations.provider-install]
+      command: |
+        awk '/provider ".*\/hashicorp\/random"/{p=1} p && /version *=/{gsub(/[" ]/,""); split($0,a,"="); print a[2]; exit}' /home/learner/exam/pin/.terraform.lock.hcl 2>/dev/null || echo none
+      expect: {match: regex, value: '^{{minor}}\.[0-9]+$'}
+    - id: two-platforms
+      description: The lock file carries checksums for two platforms
+      type: shell
+      on: workstation
+      skills: [iac.foundations.provider-install]
+      weight: 2
+      command: |
+        f=/home/learner/exam/pin/.terraform.lock.hcl
+        [ -f "$f" ] || { echo missing; exit 0; }
+        n=$(grep -c '"h1:' "$f"); [ "$n" -ge 2 ] && echo ok || echo "h1=$n"
+      expect: {match: exact, value: ok}
+  misconceptions:
+    - id: major-only
+      description: Uses a constraint that still allows newer minor releases.
+      feedback: "`~> 3.0` or `>= X` lets init -upgrade move to a newer minor. Use `~> X.Y.0`."
+      expectFail: [constraint, locked-version]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          cd ~/exam/pin
+          sed -i 's|source = "hashicorp/random"|source  = "hashicorp/random"\n      version = ">= 3.0.0"|' main.tf
+          iac providers lock -fs-mirror=/opt/cloudtrain/providers -platform=linux_amd64 -platform=linux_arm64 -no-color
+    - id: init-only
+      description: Runs init only, which records just the workstation's platform.
+      feedback: init hashes only what it installed. Add the other platform with providers lock from the mirror.
+      expectFail: [two-platforms]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          cd ~/exam/pin
+          sed -i 's|source = "hashicorp/random"|source  = "hashicorp/random"\n      version = "~> {{minor}}.0"|' main.tf
+          iac init -input=false -no-color
+  solution:
+    explanation: "`~> {{minor}}.0` allows only patch releases of that line; providers lock with -fs-mirror and two -platform flags writes both checksums offline."
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          set -e
+          cd ~/exam/pin
+          sed -i 's|source = "hashicorp/random"|source  = "hashicorp/random"\n      version = "~> {{minor}}.0"|' main.tf
+          iac providers lock -fs-mirror=/opt/cloudtrain/providers -platform=linux_amd64 -platform=linux_arm64 -no-color
+    alternatives:
+      - id: init-then-lock
+        description: Init first, then add the arm64 checksums.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 120
+            run: |
+              set -e
+              cd ~/exam/pin
+              sed -i 's|source = "hashicorp/random"|source  = "hashicorp/random"\n      version = ">= {{minor}}.0, < {{minor}}.99"|' main.tf
+              iac init -input=false -no-color
+              iac providers lock -fs-mirror=/opt/cloudtrain/providers -platform=linux_amd64 -platform=linux_arm64 -no-color

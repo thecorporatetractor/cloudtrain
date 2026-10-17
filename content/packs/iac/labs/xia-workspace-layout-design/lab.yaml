@@ -1,0 +1,284 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xia-workspace-layout-design
+  title: Lay out projects, workspaces and variable sets
+  domain: iac
+  frameworks: [tf-associate:hcp]
+  difficulty: easy
+  estimatedMinutes: 5
+  tags: [exam, terraform, hosted-platform, workspaces, variable-sets]
+  version: 1
+spec:
+  description: |
+    **File:** `~/exam/layout/layout.yaml` (workstation)
+
+    Saltmarsh is moving its runs to a hosted Terraform platform. Complete the
+    skeleton in `~/exam/layout/layout.yaml` (keep its structure and names) so
+    that these rules hold:
+
+    1. One project per team: `trading` and `telemetry`. Each team gets `write`
+       on its own project only (team name = project name).
+    2. Each project holds two workspaces named `<team>-{{env}}` and
+       `<team>-prod`; every workspace belongs to exactly one project.
+    3. `common-tags` applies to every workspace in the organisation.
+    4. `trading-prod-creds` must reach **only** the trading production
+       workspace.
+    5. `telemetry-creds` applies to every workspace of the telemetry project,
+       including ones added later.
+  objectives:
+    - Map teams and environments onto projects, workspaces and variable sets
+  params:
+    env:
+      type: choice
+      values: [staging, preprod]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+  setup:
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xia-workspace-layout-design/layout.yaml, source: assets/layout.yaml, mode: "0644"}
+    - on: workstation
+      run: |
+        set -eu
+        d=/home/learner/exam/layout
+        install -d -o learner -g learner /home/learner/exam "$d"
+        [ -e "$d/.ct-seeded" ] && exit 0
+        install -m 0644 -o learner -g learner /var/tmp/ct-seed/xia-workspace-layout-design/layout.yaml "$d/layout.yaml"
+        touch "$d/.ct-seeded"
+  checks:
+    - id: projects
+      description: One write-access project per team
+      type: shell
+      on: workstation
+      skills: [iac.collaboration.hcp-concepts]
+      weight: 1
+      command: |
+        yq -o json /home/learner/exam/layout/layout.yaml 2>/dev/null | python3 -c "$(cat <<'PY'
+        # Rule checks for layout.yaml (read as JSON on stdin). Prints one word per rule asked for.
+        import json, sys
+        rule, env = sys.argv[1], sys.argv[2]
+        try:
+            d = json.load(sys.stdin)
+            projects = {p["name"]: p for p in d.get("projects") or []}
+            vs = {v["name"]: v for v in d.get("variable_sets") or []}
+            def ws(p): return sorted(projects.get(p, {}).get("workspaces") or [])
+            def s(x): return sorted(x or [])
+            if rule == "projects":
+                ok = set(projects) == {"trading", "telemetry"} and all(
+                    p["team_access"]["team"] == n and p["team_access"]["permission"] == "write" for n, p in projects.items())
+            elif rule == "workspaces":
+                ok = ws("trading") == sorted(["trading-" + env, "trading-prod"]) and ws("telemetry") == sorted(["telemetry-" + env, "telemetry-prod"])
+            elif rule == "common":
+                v = vs["common-tags"]; ok = v["global"] is True
+            elif rule == "trading-creds":
+                v = vs["trading-prod-creds"]; ok = v["global"] is False and s(v["projects"]) == [] and s(v["workspaces"]) == ["trading-prod"]
+            elif rule == "telemetry-creds":
+                v = vs["telemetry-creds"]; ok = v["global"] is False and s(v["projects"]) == ["telemetry"] and s(v["workspaces"]) == []
+            print("ok" if ok else "violated")
+        except Exception as e:
+            print("unreadable")
+        PY
+        )" projects {{env}}
+      expect: {match: exact, value: ok}
+    - id: workspaces
+      description: Each project holds its team's two workspaces
+      type: shell
+      on: workstation
+      skills: [iac.collaboration.hcp-concepts]
+      weight: 1
+      command: |
+        yq -o json /home/learner/exam/layout/layout.yaml 2>/dev/null | python3 -c "$(cat <<'PY'
+        # Rule checks for layout.yaml (read as JSON on stdin). Prints one word per rule asked for.
+        import json, sys
+        rule, env = sys.argv[1], sys.argv[2]
+        try:
+            d = json.load(sys.stdin)
+            projects = {p["name"]: p for p in d.get("projects") or []}
+            vs = {v["name"]: v for v in d.get("variable_sets") or []}
+            def ws(p): return sorted(projects.get(p, {}).get("workspaces") or [])
+            def s(x): return sorted(x or [])
+            if rule == "projects":
+                ok = set(projects) == {"trading", "telemetry"} and all(
+                    p["team_access"]["team"] == n and p["team_access"]["permission"] == "write" for n, p in projects.items())
+            elif rule == "workspaces":
+                ok = ws("trading") == sorted(["trading-" + env, "trading-prod"]) and ws("telemetry") == sorted(["telemetry-" + env, "telemetry-prod"])
+            elif rule == "common":
+                v = vs["common-tags"]; ok = v["global"] is True
+            elif rule == "trading-creds":
+                v = vs["trading-prod-creds"]; ok = v["global"] is False and s(v["projects"]) == [] and s(v["workspaces"]) == ["trading-prod"]
+            elif rule == "telemetry-creds":
+                v = vs["telemetry-creds"]; ok = v["global"] is False and s(v["projects"]) == ["telemetry"] and s(v["workspaces"]) == []
+            print("ok" if ok else "violated")
+        except Exception as e:
+            print("unreadable")
+        PY
+        )" workspaces {{env}}
+      expect: {match: exact, value: ok}
+    - id: common-tags
+      description: common-tags is global
+      type: shell
+      on: workstation
+      skills: [iac.collaboration.hcp-concepts]
+      weight: 0.5
+      command: |
+        yq -o json /home/learner/exam/layout/layout.yaml 2>/dev/null | python3 -c "$(cat <<'PY'
+        # Rule checks for layout.yaml (read as JSON on stdin). Prints one word per rule asked for.
+        import json, sys
+        rule, env = sys.argv[1], sys.argv[2]
+        try:
+            d = json.load(sys.stdin)
+            projects = {p["name"]: p for p in d.get("projects") or []}
+            vs = {v["name"]: v for v in d.get("variable_sets") or []}
+            def ws(p): return sorted(projects.get(p, {}).get("workspaces") or [])
+            def s(x): return sorted(x or [])
+            if rule == "projects":
+                ok = set(projects) == {"trading", "telemetry"} and all(
+                    p["team_access"]["team"] == n and p["team_access"]["permission"] == "write" for n, p in projects.items())
+            elif rule == "workspaces":
+                ok = ws("trading") == sorted(["trading-" + env, "trading-prod"]) and ws("telemetry") == sorted(["telemetry-" + env, "telemetry-prod"])
+            elif rule == "common":
+                v = vs["common-tags"]; ok = v["global"] is True
+            elif rule == "trading-creds":
+                v = vs["trading-prod-creds"]; ok = v["global"] is False and s(v["projects"]) == [] and s(v["workspaces"]) == ["trading-prod"]
+            elif rule == "telemetry-creds":
+                v = vs["telemetry-creds"]; ok = v["global"] is False and s(v["projects"]) == ["telemetry"] and s(v["workspaces"]) == []
+            print("ok" if ok else "violated")
+        except Exception as e:
+            print("unreadable")
+        PY
+        )" common {{env}}
+      expect: {match: exact, value: ok}
+    - id: trading-creds
+      description: trading-prod-creds reaches only trading-prod
+      type: shell
+      on: workstation
+      skills: [iac.collaboration.hcp-concepts]
+      weight: 1.5
+      command: |
+        yq -o json /home/learner/exam/layout/layout.yaml 2>/dev/null | python3 -c "$(cat <<'PY'
+        # Rule checks for layout.yaml (read as JSON on stdin). Prints one word per rule asked for.
+        import json, sys
+        rule, env = sys.argv[1], sys.argv[2]
+        try:
+            d = json.load(sys.stdin)
+            projects = {p["name"]: p for p in d.get("projects") or []}
+            vs = {v["name"]: v for v in d.get("variable_sets") or []}
+            def ws(p): return sorted(projects.get(p, {}).get("workspaces") or [])
+            def s(x): return sorted(x or [])
+            if rule == "projects":
+                ok = set(projects) == {"trading", "telemetry"} and all(
+                    p["team_access"]["team"] == n and p["team_access"]["permission"] == "write" for n, p in projects.items())
+            elif rule == "workspaces":
+                ok = ws("trading") == sorted(["trading-" + env, "trading-prod"]) and ws("telemetry") == sorted(["telemetry-" + env, "telemetry-prod"])
+            elif rule == "common":
+                v = vs["common-tags"]; ok = v["global"] is True
+            elif rule == "trading-creds":
+                v = vs["trading-prod-creds"]; ok = v["global"] is False and s(v["projects"]) == [] and s(v["workspaces"]) == ["trading-prod"]
+            elif rule == "telemetry-creds":
+                v = vs["telemetry-creds"]; ok = v["global"] is False and s(v["projects"]) == ["telemetry"] and s(v["workspaces"]) == []
+            print("ok" if ok else "violated")
+        except Exception as e:
+            print("unreadable")
+        PY
+        )" trading-creds {{env}}
+      expect: {match: exact, value: ok}
+    - id: telemetry-creds
+      description: telemetry-creds is attached to the telemetry project
+      type: shell
+      on: workstation
+      skills: [iac.collaboration.hcp-concepts]
+      weight: 1.5
+      command: |
+        yq -o json /home/learner/exam/layout/layout.yaml 2>/dev/null | python3 -c "$(cat <<'PY'
+        # Rule checks for layout.yaml (read as JSON on stdin). Prints one word per rule asked for.
+        import json, sys
+        rule, env = sys.argv[1], sys.argv[2]
+        try:
+            d = json.load(sys.stdin)
+            projects = {p["name"]: p for p in d.get("projects") or []}
+            vs = {v["name"]: v for v in d.get("variable_sets") or []}
+            def ws(p): return sorted(projects.get(p, {}).get("workspaces") or [])
+            def s(x): return sorted(x or [])
+            if rule == "projects":
+                ok = set(projects) == {"trading", "telemetry"} and all(
+                    p["team_access"]["team"] == n and p["team_access"]["permission"] == "write" for n, p in projects.items())
+            elif rule == "workspaces":
+                ok = ws("trading") == sorted(["trading-" + env, "trading-prod"]) and ws("telemetry") == sorted(["telemetry-" + env, "telemetry-prod"])
+            elif rule == "common":
+                v = vs["common-tags"]; ok = v["global"] is True
+            elif rule == "trading-creds":
+                v = vs["trading-prod-creds"]; ok = v["global"] is False and s(v["projects"]) == [] and s(v["workspaces"]) == ["trading-prod"]
+            elif rule == "telemetry-creds":
+                v = vs["telemetry-creds"]; ok = v["global"] is False and s(v["projects"]) == ["telemetry"] and s(v["workspaces"]) == []
+            print("ok" if ok else "violated")
+        except Exception as e:
+            print("unreadable")
+        PY
+        )" telemetry-creds {{env}}
+      expect: {match: exact, value: ok}
+  misconceptions:
+    - id: creds-on-project
+      description: Attaches trading-prod-creds to the whole trading project.
+      feedback: A project-level variable set also reaches trading's non-production workspace. Attach production credentials to the production workspace only.
+      expectFail: [trading-creds]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          cd ~/exam/layout
+          yq -i '.projects = [{"name": "trading", "team_access": {"team": "trading", "permission": "write"}, "workspaces": ["trading-{{env}}", "trading-prod"]}, {"name": "telemetry", "team_access": {"team": "telemetry", "permission": "write"}, "workspaces": ["telemetry-{{env}}", "telemetry-prod"]}]' layout.yaml
+          yq -i '(.variable_sets[] | select(.name == "common-tags") | .global) = true' layout.yaml
+          yq -i '(.variable_sets[] | select(.name == "trading-prod-creds") | .projects) = ["trading"]' layout.yaml
+          yq -i '(.variable_sets[] | select(.name == "telemetry-creds") | .projects) = ["telemetry"]' layout.yaml
+    - id: workspace-list-for-project
+      description: Lists the telemetry workspaces on telemetry-creds instead of attaching the project.
+      feedback: A workspace list does not cover workspaces added later; attach the variable set to the project.
+      expectFail: [telemetry-creds]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          cd ~/exam/layout
+          yq -i '.projects = [{"name": "trading", "team_access": {"team": "trading", "permission": "write"}, "workspaces": ["trading-{{env}}", "trading-prod"]}, {"name": "telemetry", "team_access": {"team": "telemetry", "permission": "write"}, "workspaces": ["telemetry-{{env}}", "telemetry-prod"]}]' layout.yaml
+          yq -i '(.variable_sets[] | select(.name == "common-tags") | .global) = true' layout.yaml
+          yq -i '(.variable_sets[] | select(.name == "trading-prod-creds") | .workspaces) = ["trading-prod"]' layout.yaml
+          yq -i '(.variable_sets[] | select(.name == "telemetry-creds") | .workspaces) = ["telemetry-{{env}}", "telemetry-prod"]' layout.yaml
+  solution:
+    explanation: Projects group each team's workspaces and carry its access; a global variable set reaches every workspace, a project-scoped one every current and future workspace of that project, and a workspace-scoped one only the named workspaces.
+    steps:
+      - on: workstation
+        as: learner
+        run: |
+          set -e
+          cat > ~/exam/layout/layout.yaml <<'YAML'
+          organisation: saltmarsh-energy
+          projects:
+            - name: trading
+              team_access:
+                team: trading
+                permission: write
+              workspaces: [trading-{{env}}, trading-prod]
+            - name: telemetry
+              team_access:
+                team: telemetry
+                permission: write
+              workspaces: [telemetry-{{env}}, telemetry-prod]
+          variable_sets:
+            - name: common-tags
+              global: true
+              projects: []
+              workspaces: []
+            - name: trading-prod-creds
+              global: false
+              projects: []
+              workspaces: [trading-prod]
+            - name: telemetry-creds
+              global: false
+              projects: [telemetry]
+              workspaces: []
+          YAML

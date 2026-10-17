@@ -1,0 +1,192 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xia-call-local-module
+  title: Call a local module for two farms
+  domain: iac
+  frameworks: [tf-associate:modules]
+  difficulty: easy
+  estimatedMinutes: 6
+  tags: [exam, terraform, modules]
+  version: 1
+spec:
+  description: |
+    **Directory:** `~/exam/farm-modules` · **Cluster:** `sm-grid`
+
+    Module `./modules/farm-base` creates a farm namespace with a pod quota.
+    In the root module of the stack:
+
+    1. Call `farm-base` for **gullhaven** with a pod quota of **{{gq}}** and
+       for **redmoor** with a pod quota of **25**.
+    2. Expose both namespace names as root outputs **`gullhaven_namespace`**
+       and **`redmoor_namespace`**, taken from the module's `namespace`
+       output.
+
+    Do not change the module. Apply; a following plan must report no changes.
+  objectives:
+    - Call a local module with input values and read its outputs
+  params:
+    gq:
+      type: int
+      min: 10
+      max: 18
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+      - name: sm-grid
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: sm-grid
+  setup:
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xia-call-local-module/stack/providers.tf, source: assets/stack/providers.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xia-call-local-module/stack/modules/farm-base/main.tf, source: assets/stack/modules/farm-base/main.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xia-call-local-module/seed.sh, source: assets/seed.sh, mode: "0755"}
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/exam
+    - on: workstation
+      as: learner
+      timeoutSec: 120
+      run: /var/tmp/ct-seed/xia-call-local-module/seed.sh xia-call-local-module farm-modules init
+  teardown:
+    - on: sm-grid
+      run: kubectl delete namespace wf-gullhaven wf-redmoor --ignore-not-found --wait=false
+  checks:
+    - id: quotas
+      description: wf-gullhaven and wf-redmoor exist with pod quotas {{gq}} and 25
+      type: shell
+      on: sm-grid
+      skills: [iac.modules.authoring]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        for f in gullhaven redmoor; do printf '%s=%s ' $f "$(kubectl -n wf-$f get resourcequota farm-quota -o jsonpath='{.spec.hard.pods}' 2>/dev/null)"; done
+      expect: {match: exact, value: "gullhaven={{gq}} redmoor=25 "}
+    - id: through-module
+      description: Both farms are managed by calls of ./modules/farm-base, nothing in the root module
+      type: shell
+      on: workstation
+      skills: [iac.modules.authoring]
+      weight: 2
+      timeoutSec: 120
+      command: |
+        d=/home/learner/exam/farm-modules
+        src=$(ct-iac planjson $d | jq -r '[.configuration.root_module.module_calls[]?.source] | unique | join(",")' 2>/dev/null)
+        cnt=$(ct-iac state $d | jq -r '"root=\([.values.root_module.resources[]? | select(.mode == "managed")] | length) module=\([.values.root_module.child_modules[]?.resources[]? | select(.mode == "managed")] | length)"' 2>/dev/null)
+        echo "source=$src $cnt"
+      expect: {match: exact, value: source=./modules/farm-base root=0 module=4}
+    - id: outputs
+      description: Root outputs gullhaven_namespace and redmoor_namespace hold the namespace names
+      type: shell
+      on: workstation
+      skills: [iac.modules.authoring]
+      weight: 1.5
+      timeoutSec: 60
+      command: |
+        ct-iac state /home/learner/exam/farm-modules | jq -r '"\(.values.outputs.gullhaven_namespace.value // "none") \(.values.outputs.redmoor_namespace.value // "none")"' 2>/dev/null
+      expect: {match: exact, value: wf-gullhaven wf-redmoor}
+    - id: converged
+      description: A new plan of ~/exam/farm-modules reports no changes
+      type: shell
+      on: workstation
+      skills: [iac.modules.authoring]
+      timeoutSec: 120
+      command: ct-iac plan /home/learner/exam/farm-modules
+      expect: {match: exact, value: no-changes}
+  misconceptions:
+    - id: literal-outputs
+      description: Writes the namespace names into the outputs as literals.
+      feedback: Literal outputs drift from what the module created. Use module.<name>.namespace.
+      expectFail: [outputs]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          cd ~/exam/farm-modules
+          cat > main.tf <<'HCL'
+          module "gullhaven" {
+            source    = "./modules/farm-base"
+            farm      = "gullhaven"
+            pod_quota = {{gq}}
+          }
+          module "redmoor" {
+            source    = "./modules/farm-base"
+            farm      = "redmoor"
+            pod_quota = 25
+          }
+          output "gullhaven_namespace" {
+            value = "gullhaven"
+          }
+          output "redmoor_namespace" {
+            value = "redmoor"
+          }
+          HCL
+          iac init -input=false -no-color && iac apply -auto-approve -input=false -no-color
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/exam/farm-modules
+          cat > main.tf <<'HCL'
+          module "gullhaven" {
+            source    = "./modules/farm-base"
+            farm      = "gullhaven"
+            pod_quota = {{gq}}
+          }
+
+          module "redmoor" {
+            source    = "./modules/farm-base"
+            farm      = "redmoor"
+            pod_quota = 25
+          }
+
+          output "gullhaven_namespace" {
+            value = module.gullhaven.namespace
+          }
+
+          output "redmoor_namespace" {
+            value = module.redmoor.namespace
+          }
+          HCL
+          iac init -input=false -no-color
+          iac apply -auto-approve -input=false -no-color
+    alternatives:
+      - id: for-each-call
+        description: One module block with for_each over a map of quotas.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 300
+            run: |
+              set -e
+              cd ~/exam/farm-modules
+              cat > main.tf <<'HCL'
+              module "farm" {
+                for_each  = { gullhaven = {{gq}}, redmoor = 25 }
+                source    = "./modules/farm-base"
+                farm      = each.key
+                pod_quota = each.value
+              }
+
+              output "gullhaven_namespace" {
+                value = module.farm["gullhaven"].namespace
+              }
+
+              output "redmoor_namespace" {
+                value = module.farm["redmoor"].namespace
+              }
+              HCL
+              iac init -input=false -no-color
+              iac apply -auto-approve -input=false -no-color

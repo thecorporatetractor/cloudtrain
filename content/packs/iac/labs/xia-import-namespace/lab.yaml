@@ -1,0 +1,156 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xia-import-namespace
+  title: Adopt a hand-made namespace with an import block
+  domain: iac
+  frameworks: [tf-associate:maintain]
+  difficulty: medium
+  estimatedMinutes: 6
+  tags: [exam, terraform, import]
+  version: 1
+spec:
+  description: |
+    **Directory:** `~/exam/storm-import` · **Cluster:** `sm-grid`
+
+    Namespace **`storm-response`** was created by hand during the storm. Bring
+    it under management in the stack with an **`import` block** and a matching
+    resource block (write it or generate it), keeping its labels. Apply, so the
+    namespace is in state without being recreated; the following plan must be
+    empty.
+  objectives:
+    - Adopt an existing object with an import block
+  params:
+    lead:
+      type: choice
+      values: [ines, bram, odile, tomasz]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+      - name: sm-grid
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: sm-grid
+  setup:
+    - on: sm-grid
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata:
+          name: storm-response
+          labels: {saltmarsh.example/incident: storm-2026-10, saltmarsh.example/lead: "{{lead}}"}
+    - on: sm-grid
+      run: |
+        kubectl -n kube-system get configmap ct-xia-import >/dev/null 2>&1 && exit 0
+        kubectl -n kube-system create configmap ct-xia-import --from-literal=uid=$(kubectl get namespace storm-response -o jsonpath='{.metadata.uid}')
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xia-import-namespace/stack/providers.tf, source: assets/stack/providers.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xia-import-namespace/seed.sh, source: assets/seed.sh, mode: "0755"}
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/exam
+    - on: workstation
+      as: learner
+      timeoutSec: 120
+      run: /var/tmp/ct-seed/xia-import-namespace/seed.sh xia-import-namespace storm-import init
+  teardown:
+    - on: sm-grid
+      run: kubectl delete namespace storm-response --ignore-not-found --wait=false
+  checks:
+    - id: in-state
+      description: storm-response is managed in the state of ~/exam/storm-import
+      type: shell
+      on: workstation
+      skills: [iac.state.import]
+      weight: 2
+      timeoutSec: 60
+      command: |
+        ct-iac state /home/learner/exam/storm-import | jq -r '[.values.root_module.resources[]? | select(.mode == "managed" and (.type | test("^kubernetes_namespace"))) | .values.metadata[0].name] | join(" ")' 2>/dev/null
+      expect: {match: exact, value: storm-response}
+    - id: original-kept
+      description: The namespace is the original object and keeps its labels
+      type: shell
+      on: sm-grid
+      skills: [iac.state.import]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        u=$(kubectl get namespace storm-response -o jsonpath='{.metadata.uid}' 2>/dev/null)
+        l=$(kubectl get namespace storm-response -o jsonpath='{.metadata.labels.saltmarsh\.example/lead}' 2>/dev/null)
+        [ -n "$u" ] && [ "$u" = "$(kubectl -n kube-system get configmap ct-xia-import -o jsonpath='{.data.uid}')" ] && o=same || o=new
+        echo "object=$o lead=$l"
+      expect: {match: exact, value: "object=same lead={{lead}}"}
+    - id: import-block
+      description: The adoption is declared with an import block
+      type: shell
+      on: workstation
+      skills: [iac.state.import]
+      weight: 0.5
+      command: cat /home/learner/exam/storm-import/*.tf 2>/dev/null | grep -cE '^[[:space:]]*import[[:space:]]*\{' || true
+      expect: {match: regex, value: '^[1-9][0-9]*$'}
+    - id: converged
+      description: A new plan of ~/exam/storm-import reports no changes
+      type: shell
+      on: workstation
+      skills: [iac.state.import]
+      weight: 1.5
+      timeoutSec: 120
+      command: ct-iac plan /home/learner/exam/storm-import
+      expect: {match: exact, value: no-changes}
+  misconceptions:
+    - id: labels-left-out
+      description: Imports with a resource block that has no labels, so the apply strips them.
+      feedback: After import, the configuration is the truth; labels it does not list are removed. Copy them in, or generate the configuration.
+      expectFail: [original-kept]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          cd ~/exam/storm-import
+          printf 'import {\n  to = kubernetes_namespace_v1.storm\n  id = "storm-response"\n}\n\nresource "kubernetes_namespace_v1" "storm" {\n  metadata {\n    name = "storm-response"\n  }\n}\n' > main.tf
+          iac apply -auto-approve -input=false -no-color
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/exam/storm-import
+          printf 'import {\n  to = kubernetes_namespace_v1.storm\n  id = "storm-response"\n}\n' > imports.tf
+          iac plan -input=false -no-color -generate-config-out=generated.tf
+          iac apply -auto-approve -input=false -no-color
+    alternatives:
+      - id: hand-written
+        description: Write the resource block with the labels by hand.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 300
+            run: |
+              set -e
+              cd ~/exam/storm-import
+              cat > main.tf <<'HCL'
+              import {
+                to = kubernetes_namespace_v1.storm
+                id = "storm-response"
+              }
+
+              resource "kubernetes_namespace_v1" "storm" {
+                metadata {
+                  name = "storm-response"
+                  labels = {
+                    "saltmarsh.example/incident" = "storm-2026-10"
+                    "saltmarsh.example/lead"     = "{{lead}}"
+                  }
+                }
+              }
+              HCL
+              iac apply -auto-approve -input=false -no-color

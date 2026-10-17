@@ -1,0 +1,134 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xia-ignore-operator-annotations
+  title: Converge despite an operator's annotations
+  domain: iac
+  frameworks: [tf-associate:configuration]
+  difficulty: medium
+  estimatedMinutes: 6
+  tags: [exam, terraform, lifecycle, ignore_changes, kubernetes-provider]
+  version: 1
+spec:
+  description: |
+    **Directory:** `~/exam/forecast-annotations` · **Cluster:** `sm-grid`
+
+    The stack (applied) manages Deployment `forecast` in namespace
+    `forecast-ops`. The on-call rota operator writes the annotation
+    `saltmarsh.example/on-call` onto that Deployment, so every plan now wants to
+    remove it.
+
+    Change the configuration so that plans **converge without removing the
+    operator's annotations**, while the annotation the stack sets
+    (`saltmarsh.example/owner`) stays managed in the configuration. Apply if
+    your change needs it; a following plan must report no changes.
+  objectives:
+    - Ignore attributes another system owns with lifecycle ignore_changes
+  params:
+    oncall:
+      type: choice
+      values: [ines, bram, odile, tomasz]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+      - name: sm-grid
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: sm-grid
+  setup:
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xia-ignore-operator-annotations/stack/providers.tf, source: assets/stack/providers.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xia-ignore-operator-annotations/stack/main.tf, source: assets/stack/main.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xia-ignore-operator-annotations/seed.sh, source: assets/seed.sh, mode: "0755"}
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/exam
+    - on: workstation
+      as: learner
+      timeoutSec: 300
+      run: /var/tmp/ct-seed/xia-ignore-operator-annotations/seed.sh xia-ignore-operator-annotations forecast-annotations apply
+    - on: sm-grid
+      timeoutSec: 60
+      run: |
+        set -eu
+        kubectl -n kube-system get configmap ct-xia-annotations >/dev/null 2>&1 && exit 0
+        kubectl -n forecast-ops annotate deployment forecast saltmarsh.example/on-call={{oncall}} --overwrite
+        kubectl -n kube-system create configmap ct-xia-annotations --from-literal=uid=$(kubectl -n forecast-ops get deployment forecast -o jsonpath='{.metadata.uid}')
+  teardown:
+    - on: sm-grid
+      run: kubectl delete namespace forecast-ops --ignore-not-found --wait=false
+  checks:
+    - id: annotation-kept
+      description: The operator's on-call annotation is still on the Deployment
+      type: k8s-query
+      skills: [iac.language.lifecycle]
+      weight: 2
+      query: {cluster: sm-grid, resource: deployment, name: forecast, namespace: forecast-ops, jsonpath: '{.metadata.annotations.saltmarsh\.example/on-call}'}
+      expect: {match: exact, value: "{{oncall}}"}
+    - id: same-deployment
+      description: The Deployment is the original object with its owner annotation
+      type: shell
+      on: sm-grid
+      skills: [iac.language.lifecycle]
+      timeoutSec: 30
+      command: |
+        u=$(kubectl -n forecast-ops get deployment forecast -o jsonpath='{.metadata.uid}' 2>/dev/null)
+        o=$(kubectl -n forecast-ops get deployment forecast -o jsonpath='{.metadata.annotations.saltmarsh\.example/owner}' 2>/dev/null)
+        [ -n "$u" ] && [ "$u" = "$(kubectl -n kube-system get configmap ct-xia-annotations -o jsonpath='{.data.uid}')" ] && s=same || s=new
+        echo "object=$s owner=$o"
+      expect: {match: exact, value: object=same owner=forecast-team}
+    - id: converged
+      description: A new plan of ~/exam/forecast-annotations reports no changes
+      type: shell
+      on: workstation
+      skills: [iac.language.lifecycle]
+      weight: 2
+      timeoutSec: 120
+      command: ct-iac plan /home/learner/exam/forecast-annotations
+      expect: {match: exact, value: no-changes}
+  misconceptions:
+    - id: apply-the-diff
+      description: Applies the plan, which removes the operator's annotation.
+      feedback: The plan converges only because the annotation is gone; the operator writes it again and the next plan drifts. Ignore the annotations instead.
+      expectFail: [annotation-kept]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          cd ~/exam/forecast-annotations
+          iac apply -auto-approve -input=false -no-color
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/exam/forecast-annotations
+          python3 - <<'PY'
+          p = "main.tf"; s = open(p).read()
+          s = s.replace('resource "kubernetes_deployment_v1" "forecast" {\n', 'resource "kubernetes_deployment_v1" "forecast" {\n  lifecycle {\n    ignore_changes = [metadata[0].annotations["saltmarsh.example/on-call"]]\n  }\n\n', 1)
+          open(p, "w").write(s)
+          PY
+          iac plan -input=false -no-color -detailed-exitcode
+    alternatives:
+      - id: provider-ignore
+        description: Tell the kubernetes provider to ignore that annotation everywhere.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 300
+            run: |
+              set -e
+              cd ~/exam/forecast-annotations
+              sed -i 's|  config_context = "sm-grid"|  config_context = "sm-grid"\n  ignore_annotations = ["saltmarsh\\\\.example/on-call"]|' providers.tf
+              cat providers.tf
+              iac plan -input=false -no-color -detailed-exitcode

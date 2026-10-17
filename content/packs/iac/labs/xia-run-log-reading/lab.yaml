@@ -1,0 +1,102 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xia-run-log-reading
+  title: Read a failed remote run's log and settings
+  domain: iac
+  frameworks: [tf-associate:hcp]
+  difficulty: easy
+  estimatedMinutes: 5
+  tags: [exam, terraform, hosted-platform, variable-sets, execution-mode]
+  version: 1
+spec:
+  description: |
+    **Directory:** `~/exam/runlog` (workstation)
+
+    A plan on the hosted platform failed. Its exported run log is
+    `~/exam/runlog/run.log` and the workspace settings are in
+    `~/exam/runlog/workspace.json`. Write `~/exam/runlog/answer.json`:
+
+    ```json
+    {"run_id": "...", "execution_mode": "...", "variable_set": "..."}
+    ```
+
+    - `run_id`: the failed run's id;
+    - `execution_mode`: the workspace's execution mode;
+    - `variable_set`: the name of the variable set whose value of
+      `api_endpoint` the failed run actually used.
+  objectives:
+    - Read run logs and workspace settings of a hosted platform
+  params:
+    mode:
+      type: choice
+      values: [agent, remote]
+    runid:
+      type: choice
+      values: [8fQe2kLm, 3hZt9WvA, 6nRb1PxC]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+  setup:
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xia-run-log-reading/run.log, source: assets/run.log, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xia-run-log-reading/workspace.json, source: assets/workspace.json, mode: "0644"}
+    - on: workstation
+      run: |
+        set -eu
+        d=/home/learner/exam/runlog
+        install -d -o learner -g learner /home/learner/exam "$d"
+        [ -e "$d/.ct-seeded" ] && exit 0
+        install -m 0644 -o learner -g learner /var/tmp/ct-seed/xia-run-log-reading/run.log /var/tmp/ct-seed/xia-run-log-reading/workspace.json "$d"/
+        touch "$d/.ct-seeded"
+  checks:
+    - id: run-id
+      description: run_id is the failed run's id
+      type: shell
+      on: workstation
+      skills: [iac.collaboration.hcp-concepts]
+      weight: 0.5
+      command: jq -r '.run_id' /home/learner/exam/runlog/answer.json 2>/dev/null || echo missing
+      expect: {match: exact, value: "run-{{runid}}"}
+    - id: execution-mode
+      description: execution_mode is the workspace's execution mode
+      type: shell
+      on: workstation
+      skills: [iac.collaboration.hcp-concepts]
+      command: jq -r '.execution_mode' /home/learner/exam/runlog/answer.json 2>/dev/null || echo missing
+      expect: {match: exact, value: "{{mode}}"}
+    - id: variable-set
+      description: variable_set names the set whose api_endpoint won
+      type: shell
+      on: workstation
+      skills: [iac.collaboration.hcp-concepts]
+      weight: 2
+      command: jq -r '.variable_set' /home/learner/exam/runlog/answer.json 2>/dev/null || echo missing
+      expect: {match: exact, value: trading-prod-overrides}
+  misconceptions:
+    - id: first-match
+      description: Picks the first variable set that defines api_endpoint.
+      feedback: Both sets define api_endpoint; the priority set wins, and the log marks the other one as overwritten.
+      expectFail: [variable-set]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          printf '{"run_id": "run-{{runid}}", "execution_mode": "{{mode}}", "variable_set": "trading-defaults"}\n' > ~/exam/runlog/answer.json
+  solution:
+    explanation: The log header names the run and mode (workspace.json confirms the mode); api_endpoint comes from two variable sets, and the priority set trading-prod-overrides is applied while trading-defaults is overwritten.
+    steps:
+      - on: workstation
+        as: learner
+        run: |
+          cd ~/exam/runlog
+          id=$(awk '/^Run ID:/{print $3}' run.log)
+          mode=$(jq -r '.data.attributes["execution-mode"]' workspace.json)
+          set=$(awk '/^  api_endpoint/ && /\[applied\]/{match($0, /"[^"]+"/); print substr($0, RSTART+1, RLENGTH-2)}' run.log)
+          jq -n --arg r "$id" --arg m "$mode" --arg v "$set" '{run_id: $r, execution_mode: $m, variable_set: $v}' > answer.json
+          cat answer.json

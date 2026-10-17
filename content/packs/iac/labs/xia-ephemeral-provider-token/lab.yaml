@@ -1,0 +1,169 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xia-ephemeral-provider-token
+  title: Keep the provider's token out of saved plans and state
+  domain: iac
+  frameworks: [tf-associate:secrets]
+  difficulty: medium
+  estimatedMinutes: 6
+  tags: [exam, terraform, ephemeral, variables, secrets]
+  version: 1
+spec:
+  description: |
+    **Directory:** `~/exam/forecast-token` · **Cluster:** `sm-grid` (reached
+    with a ServiceAccount token, not the kubeconfig)
+
+    The release stack authenticates with the forecast deployer's token, which
+    arrives through variable `deploy_token`; supply it with
+    `TF_VAR_deploy_token=$(cat deployer.token)`. Today that value is written
+    into every saved plan file.
+
+    1. Change the stack so the token arrives through an **ephemeral input
+       variable**: it must reach the provider but never appear in a saved plan
+       or in state.
+    2. Set the ConfigMap's `version` to **`{{version}}`**, save the plan as
+       **`release.tfplan`** in the stack directory (`plan -out`) and apply
+       exactly that saved plan.
+  objectives:
+    - Declare ephemeral input variables
+    - Keep credentials out of saved plans and state
+  params:
+    version:
+      type: choice
+      values: ["2026.10", "2026.11", "2026.12"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+      - name: sm-grid
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: sm-grid
+  setup:
+    - on: sm-grid
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: forecast-token}
+        ---
+        apiVersion: v1
+        kind: ServiceAccount
+        metadata: {name: deployer, namespace: forecast-token}
+        ---
+        apiVersion: v1
+        kind: Secret
+        metadata:
+          name: deployer-token
+          namespace: forecast-token
+          annotations: {kubernetes.io/service-account.name: deployer}
+        type: kubernetes.io/service-account-token
+        ---
+        apiVersion: rbac.authorization.k8s.io/v1
+        kind: Role
+        metadata: {name: release-editor, namespace: forecast-token}
+        rules:
+          - apiGroups: [""]
+            resources: [configmaps]
+            verbs: [get, list, watch, create, update, patch, delete]
+        ---
+        apiVersion: rbac.authorization.k8s.io/v1
+        kind: RoleBinding
+        metadata: {name: deployer-release-editor, namespace: forecast-token}
+        roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: release-editor}
+        subjects:
+          - {kind: ServiceAccount, name: deployer, namespace: forecast-token}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xia-ephemeral-provider-token/stack/main.tf, source: assets/stack/main.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xia-ephemeral-provider-token/prepare.sh, source: assets/prepare.sh, mode: "0755"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xia-ephemeral-provider-token/seed.sh, source: assets/seed.sh, mode: "0755"}
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/exam
+    - on: workstation
+      as: learner
+      timeoutSec: 120
+      run: /var/tmp/ct-seed/xia-ephemeral-provider-token/prepare.sh
+    - on: workstation
+      as: learner
+      timeoutSec: 300
+      run: /var/tmp/ct-seed/xia-ephemeral-provider-token/seed.sh xia-ephemeral-provider-token forecast-token apply
+  teardown:
+    - on: sm-grid
+      run: kubectl delete namespace forecast-token --ignore-not-found --wait=false
+  checks:
+    - id: released
+      description: ConfigMap forecast-release carries version {{version}}
+      type: k8s-query
+      skills: [iac.quality.ephemeral]
+      query: {cluster: sm-grid, resource: configmap, name: forecast-release, namespace: forecast-token, jsonpath: "{.data.version}"}
+      expect: {match: exact, value: "{{version}}"}
+    - id: saved-plan-clean
+      description: release.tfplan is the saved plan of that change and does not contain the token
+      type: shell
+      on: workstation
+      skills: [iac.quality.ephemeral]
+      weight: 3
+      timeoutSec: 120
+      command: |
+        d=/home/learner/exam/forecast-token; f=$d/release.tfplan
+        [ -f "$f" ] || { echo "no saved plan"; exit 0; }
+        tok=$(cat $d/deployer.token)
+        unzip -p "$f" 2>/dev/null | grep -qaF "$tok" && { echo "token in plan"; exit 0; }
+        ct-iac run $d iac show -json release.tfplan 2>/dev/null | jq -r '[.resource_changes[]? | select(.type | test("^kubernetes_config_map")) | .change.after.data.version] | join(",")'
+      expect: {match: exact, value: "{{version}}"}
+    - id: state-clean
+      description: The state does not contain the token
+      type: shell
+      on: workstation
+      skills: [iac.quality.ephemeral, iac.quality.secrets]
+      weight: 1.5
+      timeoutSec: 60
+      command: |
+        d=/home/learner/exam/forecast-token
+        tok=$(cat $d/deployer.token); st=$(cat $d/terraform.tfstate 2>/dev/null)
+        [ -n "$st" ] || { echo "no state"; exit 0; }
+        echo "$st" | grep -qF "$tok" && echo "token in state" || echo clean
+      expect: {match: exact, value: clean}
+    - id: converged
+      description: With the token supplied, a new plan reports no changes
+      type: shell
+      on: workstation
+      skills: [iac.quality.ephemeral]
+      timeoutSec: 120
+      command: ct-iac plan /home/learner/exam/forecast-token -var "deploy_token=$(cat /home/learner/exam/forecast-token/deployer.token)"
+      expect: {match: exact, value: no-changes}
+  misconceptions:
+    - id: sensitive-is-enough
+      description: Keeps the variable merely sensitive.
+      feedback: sensitive hides the value in output, but a saved plan stores every non-ephemeral variable value. Declare the variable ephemeral.
+      expectFail: [saved-plan-clean]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          cd ~/exam/forecast-token
+          sed -i 's/    version = "2026.09"/    version = "{{version}}"/' main.tf
+          export TF_VAR_deploy_token=$(cat deployer.token)
+          iac plan -input=false -no-color -out=release.tfplan
+          iac apply -input=false -no-color release.tfplan
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/exam/forecast-token
+          sed -i 's/  sensitive   = true/  sensitive   = true\n  ephemeral   = true/' main.tf
+          sed -i 's/    version = "2026.09"/    version = "{{version}}"/' main.tf
+          export TF_VAR_deploy_token=$(cat deployer.token)
+          iac plan -input=false -no-color -out=release.tfplan
+          iac apply -input=false -no-color release.tfplan
