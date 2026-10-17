@@ -9,6 +9,7 @@ import { roleLabel } from '@/app/Shell';
 import { useShell } from '@/app/shell-context';
 import { UserCell, When } from '@/components/platform';
 import { Badge, Button, Card, Checkbox, ChipSelect, ConfirmDialog, Dialog, Drawer, EmptyState, ErrorState, Field, Input, Pager, Select, Skeleton, TableSkeleton, TableWrap, Toolbar } from '@/components/ui';
+import { usePageCursor } from '@/lib/paging';
 import { adminUsersRoute } from '@/router';
 
 const PAGE = 12;
@@ -28,14 +29,16 @@ function Screen() {
   const search = adminUsersRoute.useSearch();
   const navigate = useNavigate({ from: adminUsersRoute.fullPath });
   const set = (patch: Partial<typeof search>) => void navigate({ search: (prev) => ({ ...prev, ...patch }), replace: true });
-  const page = search.page ?? 1;
+  const pages = usePageCursor(JSON.stringify([search.q, search.role, search.team, search.status]), search.page ?? 1);
+  const page = pages.page;
   const [q, setQ] = useState(search.q ?? '');
   useEffect(() => {
     const t = window.setTimeout(() => q !== (search.q ?? '') && set({ q: q || undefined, page: undefined }), 250);
     return () => window.clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [q]);
-  const users = useAdminUsers({ q: search.q, role: search.role as OrgRole | undefined, team: search.team, status: search.status as MembershipStatus | undefined, cursor: String((page - 1) * PAGE), limit: PAGE });
+  const users = useAdminUsers({ q: search.q, role: search.role as OrgRole | undefined, team: search.team, status: search.status as MembershipStatus | undefined, cursor: pages.cursor, limit: PAGE });
+  pages.useRemember(users.data?.nextCursor);
   const teams = useAdminTeams();
   const invitations = useInvitations();
   const pendingInvites = (invitations.data ?? []).filter((i) => i.status === 'pending');
@@ -141,7 +144,7 @@ function Screen() {
             </table>
           </TableWrap>
           <div className="card-foot">
-            <Pager offset={(page - 1) * PAGE} pageSize={PAGE} total={users.data.total} loading={users.isFetching} onChange={(o) => set({ page: o / PAGE + 1 || undefined })} />
+            <Pager offset={(page - 1) * PAGE} pageSize={PAGE} total={users.data.total} hasNext={!!users.data.nextCursor} loading={users.isFetching} onChange={(o) => set({ page: o / PAGE + 1 || undefined })} />
           </div>
         </Card>
       )}

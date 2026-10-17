@@ -7,6 +7,7 @@ import { RequireAccess } from '@/app/access';
 import { useShell } from '@/app/shell-context';
 import { When } from '@/components/platform';
 import { Badge, Button, Card, Drawer, EmptyState, ErrorState, Input, Pager, Select, TableSkeleton, TableWrap, Toolbar } from '@/components/ui';
+import { usePageCursor } from '@/lib/paging';
 import { adminAuditRoute } from '@/router';
 
 const PAGE = 20;
@@ -35,14 +36,16 @@ function Screen() {
   const search = adminAuditRoute.useSearch();
   const navigate = useNavigate({ from: adminAuditRoute.fullPath });
   const set = (patch: Partial<typeof search>) => void navigate({ search: (prev) => ({ ...prev, ...patch }), replace: true });
-  const page = search.page ?? 1;
+  const pages = usePageCursor(JSON.stringify([search.action, search.actor, search.targetType, search.from, search.to]), search.page ?? 1);
+  const page = pages.page;
   const [actor, setActor] = useState(search.actor ?? '');
   useEffect(() => {
     const t = window.setTimeout(() => actor !== (search.actor ?? '') && set({ actor: actor || undefined, page: undefined }), 250);
     return () => window.clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [actor]);
-  const q = useAudit({ action: search.action, actor: search.actor, targetType: search.targetType, from: search.from, to: search.to, cursor: String((page - 1) * PAGE), limit: PAGE });
+  const q = useAudit({ action: search.action, actor: search.actor, targetType: search.targetType, from: search.from, to: search.to, cursor: pages.cursor, limit: PAGE });
+  pages.useRemember(q.data?.nextCursor);
   const { toast } = useShell();
   const [exporting, setExporting] = useState(false);
   const hasFilter = !!(search.action || search.actor || search.targetType || search.from || search.to);
@@ -151,7 +154,7 @@ function Screen() {
             </table>
           </TableWrap>
           <div className="card-foot">
-            <Pager offset={(page - 1) * PAGE} pageSize={PAGE} total={q.data.total} loading={q.isFetching} onChange={(o) => set({ page: o / PAGE + 1 || undefined })} />
+            <Pager offset={(page - 1) * PAGE} pageSize={PAGE} total={q.data.total} hasNext={!!q.data.nextCursor} loading={q.isFetching} onChange={(o) => set({ page: o / PAGE + 1 || undefined })} />
           </div>
         </Card>
       )}
