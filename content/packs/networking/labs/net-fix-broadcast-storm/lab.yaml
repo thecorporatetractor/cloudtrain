@@ -97,9 +97,13 @@ spec:
       skills: [net.switching.stp]
     - id: hosts-reachable
       description: annex-host-1 reaches annex-host-2 again
-      type: reachability
+      type: shell
       on: annex-host-1
-      target: 10.{{octet}}.0.12
+      command: |
+        # STP and MAC learning need up to a minute to settle after the loop is broken
+        for i in $(seq 45); do ping -c1 -W1 10.{{octet}}.0.12 >/dev/null 2>&1 && { echo ok; exit 0; }; sleep 1; done; echo lost
+      expect: { match: exact, value: ok }
+      timeoutSec: 120
       skills: [net.switching.stp]
   hints:
     - title: Seeing a storm
@@ -126,7 +130,11 @@ spec:
     steps:
       - on: annex-host-1
         run: |
-          ping -c1 -W1 10.{{octet}}.0.99 >/dev/null 2>&1
-          timeout 10 tcpdump -ni eth1 -c 40 -w /root/loop.pcap ether broadcast >/dev/null 2>&1; true
+          # capture first, then send fresh ARP broadcasts so the loop has frames to copy
+          setsid timeout 12 tcpdump -ni eth1 -c 60 -w /root/loop.pcap ether broadcast </dev/null >/dev/null 2>&1 &
+          sleep 1
+          ip neigh flush dev eth1
+          ping -c3 -W1 10.{{octet}}.0.99 >/dev/null 2>&1
+          sleep 9; true
       - { on: mv-sw-annex-1, run: "ip link set br0 type bridge stp_state 1" }
       - { on: mv-sw-annex-2, run: "ip link set br0 type bridge stp_state 1 && sleep 15" }

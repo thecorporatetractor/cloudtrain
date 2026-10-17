@@ -1,0 +1,134 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xnt-static-campus-reachability
+  title: Static routes between two campuses
+  domain: networking
+  frameworks: [ccna:ip-connectivity]
+  difficulty: medium
+  estimatedMinutes: 8
+  tags: [exam, static-route, frr]
+  version: 1
+spec:
+  description: |
+    **Devices:** `mv-core-6`, `mv-campus-south-6`, `mv-campus-east-6` (FRR consoles)
+
+    | Router | Link to the core | LAN |
+    |---|---|---|
+    | `mv-campus-south-6` | `eth1` `10.{{octet}}.1.2/30` (core `.1`) | `10.{{octet}}.{{south}}.0/24` on `lan1` |
+    | `mv-campus-east-6` | `eth1` `10.{{octet}}.1.6/30` (core `.5`) | `10.{{octet}}.{{east}}.0/24` on `lan1` |
+
+    Interfaces are addressed. Add **static routes only** (no dynamic routing) so
+    the south LAN and the east LAN reach each other in both directions through
+    `mv-core-6`. Use the most specific routes on the core; the campus routers
+    may use a default route.
+  objectives:
+    - Configure static routes for two-way reachability through a transit router
+  params:
+    octet: { type: int, min: 20, max: 90 }
+    south: { type: int, min: 20, max: 59 }
+    east: { type: int, min: 60, max: 99 }
+  topology:
+    entry: workstation
+    nodes:
+      - { name: workstation, driver: container, image: jumphost:1, access: [shell] }
+      - { name: mv-core-6, driver: netdev, image: frr:10, access: [console] }
+      - { name: mv-campus-south-6, driver: netdev, image: frr:10, access: [console] }
+      - { name: mv-campus-east-6, driver: netdev, image: frr:10, access: [console] }
+    links:
+      - { a: "mv-core-6:eth1", b: "mv-campus-south-6:eth1", subnet: "10.{{octet}}.1.0/30" }
+      - { a: "mv-core-6:eth2", b: "mv-campus-east-6:eth1", subnet: "10.{{octet}}.1.4/30" }
+  setup:
+    - { on: mv-campus-south-6, run: "ip link add lan1 type dummy 2>/dev/null; ip link set lan1 up" }
+    - { on: mv-campus-east-6, run: "ip link add lan1 type dummy 2>/dev/null; ip link set lan1 up" }
+    - on: mv-core-6
+      config: |
+        interface eth1
+         ip address 10.{{octet}}.1.1/30
+        interface eth2
+         ip address 10.{{octet}}.1.5/30
+    - on: mv-campus-south-6
+      config: |
+        interface eth1
+         ip address 10.{{octet}}.1.2/30
+        interface lan1
+         ip address 10.{{octet}}.{{south}}.1/24
+        ip route 0.0.0.0/0 10.{{octet}}.1.1
+    - on: mv-campus-east-6
+      config: |
+        interface eth1
+         ip address 10.{{octet}}.1.6/30
+        interface lan1
+         ip address 10.{{octet}}.{{east}}.1/24
+  checks:
+    - id: core-routes
+      description: mv-core-6 has static routes for both campus LANs via the right campus router
+      type: shell
+      on: mv-core-6
+      command: |
+        vtysh -c 'show ip route static json' | python3 -c '
+        import json,sys
+        d=json.load(sys.stdin); out=[]
+        for p in ("10.{{octet}}.{{south}}.0/24","10.{{octet}}.{{east}}.0/24"):
+            out.append(",".join(sorted(n.get("ip","") for r in d.get(p,[]) if r.get("selected") for n in r.get("nexthops",[]))))
+        print(" ".join(out))'
+      expect: { match: exact, value: "10.{{octet}}.1.2 10.{{octet}}.1.6" }
+      skills: [net.routing.static]
+      weight: 2
+    - id: south-to-east
+      description: The south LAN reaches the east LAN
+      type: shell
+      on: mv-campus-south-6
+      command: ping -c2 -W2 -I 10.{{octet}}.{{south}}.1 10.{{octet}}.{{east}}.1 >/dev/null 2>&1 && echo ok || echo fail
+      expect: { match: exact, value: ok }
+      skills: [net.routing.static]
+      weight: 2
+    - id: east-to-south
+      description: The east LAN reaches the south LAN
+      type: shell
+      on: mv-campus-east-6
+      command: ping -c2 -W2 -I 10.{{octet}}.{{east}}.1 10.{{octet}}.{{south}}.1 >/dev/null 2>&1 && echo ok || echo fail
+      expect: { match: exact, value: ok }
+      skills: [net.routing.static]
+      weight: 2
+    - id: static-only
+      description: No dynamic routing protocol is used
+      type: shell
+      on: mv-core-6
+      command: vtysh -c 'show running-config' | grep -Ec '^router (ospf|rip|bgp|isis|eigrp)'
+      expect: { match: exact, value: "0" }
+      skills: [net.routing.static]
+      weight: 0.5
+  misconceptions:
+    - id: core-only
+      description: Adds the core routes but forgets the east router's way back
+      mutation:
+        on: mv-core-6
+        config: |
+          ip route 10.{{octet}}.{{south}}.0/24 10.{{octet}}.1.2
+          ip route 10.{{octet}}.{{east}}.0/24 10.{{octet}}.1.6
+      expectFail: [south-to-east, east-to-south]
+  solution:
+    explanation: |
+      The core needs a route to each campus LAN via that campus router. The south
+      router already has a default route to the core; the east router needs one too
+      (or a route to the south LAN), otherwise replies never come back.
+    steps:
+      - on: mv-core-6
+        config: |
+          ip route 10.{{octet}}.{{south}}.0/24 10.{{octet}}.1.2
+          ip route 10.{{octet}}.{{east}}.0/24 10.{{octet}}.1.6
+      - on: mv-campus-east-6
+        config: |
+          ip route 0.0.0.0/0 10.{{octet}}.1.5
+    alternatives:
+      - id: specific-on-east
+        description: A specific route to the south LAN on the east router instead of a default
+        steps:
+          - on: mv-core-6
+            config: |
+              ip route 10.{{octet}}.{{south}}.0/24 10.{{octet}}.1.2
+              ip route 10.{{octet}}.{{east}}.0/24 10.{{octet}}.1.6
+          - on: mv-campus-east-6
+            config: |
+              ip route 10.{{octet}}.{{south}}.0/24 10.{{octet}}.1.5

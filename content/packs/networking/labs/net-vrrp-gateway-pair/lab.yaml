@@ -13,7 +13,7 @@ spec:
   description: |
     The north campus classroom LAN `10.{{octet}}.10.0/24` hangs off the switch
     `mv-sw-north-1` together with two routers, `mv-campus-north-a` (.2) and
-    `mv-campus-north-b` (.3), both uplinked to `mv-core-1` (FRR consoles). The
+    `mv-campus-north-b` (.3), both uplinked to `mv-core-1` and running OSPF with it (FRR consoles). The
     classroom host `classroom-north` (.50) uses `10.{{octet}}.10.1` as its
     default gateway, but nothing answers on that address yet.
 
@@ -26,7 +26,7 @@ spec:
 
     The VRRP daemon and the macvlan interfaces FRR needs for VRID {{vrid}}
     (`vrrp4-{{vrid}}`, carrying the virtual MAC and address) are already prepared
-    on both routers. The grader shuts `eth1` on `mv-campus-north-a` for 20 seconds
+    on both routers. The grader shuts `eth1` on `mv-campus-north-a` for 30 seconds
     and checks that `classroom-north` still reaches `mv-core-1` (`10.{{octet}}.1.1`).
   objectives:
     - Configure a VRRP group with a virtual IP, priority and preemption
@@ -77,28 +77,54 @@ spec:
       config: |
         interface eth1
          ip address 10.{{octet}}.10.2/24
+         ip ospf area 0
+         ip ospf hello-interval 1
+         ip ospf dead-interval 3
         interface eth2
          ip address 10.{{octet}}.0.2/30
-        ip route 10.{{octet}}.1.0/24 10.{{octet}}.0.1
+         ip ospf area 0
+         ip ospf network point-to-point
+         ip ospf hello-interval 1
+         ip ospf dead-interval 3
+        router ospf
+         ospf router-id 10.255.{{octet}}.2
     - on: mv-campus-north-b
       config: |
         interface eth1
          ip address 10.{{octet}}.10.3/24
+         ip ospf area 0
+         ip ospf hello-interval 1
+         ip ospf dead-interval 3
         interface eth2
          ip address 10.{{octet}}.0.6/30
-        ip route 10.{{octet}}.1.0/24 10.{{octet}}.0.5
+         ip ospf area 0
+         ip ospf network point-to-point
+         ip ospf hello-interval 1
+         ip ospf dead-interval 3
+        router ospf
+         ospf router-id 10.255.{{octet}}.3
     - on: mv-core-1
       run: ip link add lan1 type dummy 2>/dev/null; ip link set lan1 up
     - on: mv-core-1
       config: |
         interface eth1
          ip address 10.{{octet}}.0.1/30
+         ip ospf area 0
+         ip ospf network point-to-point
+         ip ospf hello-interval 1
+         ip ospf dead-interval 3
         interface eth2
          ip address 10.{{octet}}.0.5/30
+         ip ospf area 0
+         ip ospf network point-to-point
+         ip ospf hello-interval 1
+         ip ospf dead-interval 3
         interface lan1
          ip address 10.{{octet}}.1.1/24
-        ip route 10.{{octet}}.10.0/24 10.{{octet}}.0.2
-        ip route 10.{{octet}}.10.0/24 10.{{octet}}.0.6 50
+         ip ospf area 0
+         ip ospf passive
+        router ospf
+         ospf router-id 10.255.{{octet}}.1
     - { on: classroom-north, run: "ip addr replace 10.{{octet}}.10.50/24 dev eth1 && ip route replace default via 10.{{octet}}.10.1" }
   checks:
     - id: a-master
@@ -114,27 +140,39 @@ spec:
       type: shell
       on: mv-campus-north-b
       command: |
-        vtysh -c 'show vrrp eth1 {{vrid}}' | grep -q '10.{{octet}}.10.1' || exit 1
+        vtysh -c 'show vrrp interface eth1 {{vrid}}' | grep -q '10.{{octet}}.10.1' || exit 1
         vtysh -c 'show vrrp summary' | awk '$1=="eth1" && $2=="{{vrid}}"{print $3, $4, $6}'
       expect: { match: exact, value: "100 1 Backup" }
       skills: [net.routing.vrrp]
     - id: gateway-works
       description: classroom-north reaches the core through the virtual gateway
-      type: reachability
+      type: shell
       on: classroom-north
-      target: 10.{{octet}}.1.1
+      command: |
+        for i in $(seq 15); do ping -c1 -W1 10.{{octet}}.1.1 >/dev/null 2>&1 && { echo ok; exit 0; }; sleep 1; done; echo lost
+      expect: { match: exact, value: ok }
+      timeoutSec: 40
       skills: [net.routing.vrrp]
     - id: fail-master
-      description: (failover test) mv-campus-north-a's LAN interface is shut for 20 seconds
+      description: (failover test) mv-campus-north-a's LAN interface is shut for 30 seconds
       type: shell
       on: mv-campus-north-a
       command: |
         ip link set eth1 down
-        setsid sh -c 'sleep 20; ip link set eth1 up' </dev/null >/dev/null 2>&1 &
+        setsid sh -c 'sleep 30; ip link set eth1 up' </dev/null >/dev/null 2>&1 &
         echo started
       expect: { match: exact, value: started }
       skills: [net.routing.vrrp]
       weight: 0
+    - id: b-took-over
+      description: mv-campus-north-b became master during the failure
+      type: shell
+      on: mv-campus-north-b
+      command: |
+        for i in $(seq 10); do st=$(vtysh -c 'show vrrp summary' | awk '$1=="eth1" && $2=="{{vrid}}"{print $6}'); [ "$st" = Master ] && break; sleep 1; done; echo "$st"
+      timeoutSec: 20
+      expect: { match: exact, value: Master }
+      skills: [net.routing.vrrp]
     - id: survives-failover
       description: While mv-campus-north-a is down, classroom-north still reaches the core
       type: shell
@@ -145,13 +183,6 @@ spec:
       timeoutSec: 15
       skills: [net.routing.vrrp]
       weight: 2
-    - id: b-took-over
-      description: mv-campus-north-b became master during the failure
-      type: shell
-      on: mv-campus-north-b
-      command: vtysh -c 'show vrrp summary' | awk '$1=="eth1" && $2=="{{vrid}}"{print $6}'
-      expect: { match: exact, value: Master }
-      skills: [net.routing.vrrp]
   hints:
     - title: FRR VRRP commands
       body: "Under `interface eth1`: `vrrp {{vrid}} version 3`, `vrrp {{vrid}} ip 10.{{octet}}.10.1` and `vrrp {{vrid}} priority 200` on the master."
@@ -173,15 +204,15 @@ spec:
       expectFail: [b-backup, survives-failover, b-took-over]
       feedback: The gateway works until the master fails; without a backup in the same group nobody takes over.
     - id: equal-priorities
-      description: Leaves both routers at the default priority
+      description: Leaves mv-campus-north-a at the default priority
       mutation:
-        on: mv-campus-north-b
+        on: mv-campus-north-a
         config: |
           interface eth1
            vrrp {{vrid}} version 3
            vrrp {{vrid}} ip 10.{{octet}}.10.1
       expectFail: [a-master]
-      feedback: With equal priorities the higher interface address wins, so -b becomes master; -a needs priority 200.
+      feedback: At the default priority 100 the master role is not pinned to -a (with equal priorities the higher interface address, -b, wins); -a needs priority 200.
   solution:
     explanation: |
       Both routers join VRRP group {{vrid}} with the same virtual address; -a has
@@ -199,5 +230,9 @@ spec:
           interface eth1
            vrrp {{vrid}} version 3
            vrrp {{vrid}} ip 10.{{octet}}.10.1
-      - on: mv-campus-north-b
-        run: sleep 6
+      - on: mv-campus-north-a
+        timeoutSec: 90
+        run: |
+          # an earlier grading round may have shut eth1 for 30 s; wait until -a is master again
+          for i in $(seq 60); do vtysh -c 'show vrrp summary' | awk '$1=="eth1" && $2=="{{vrid}}"{print $6}' | grep -qx Master && break; sleep 1; done
+          sleep 3

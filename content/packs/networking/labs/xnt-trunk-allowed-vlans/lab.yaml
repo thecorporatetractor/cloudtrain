@@ -1,0 +1,100 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xnt-trunk-allowed-vlans
+  title: Change the VLANs allowed on a trunk
+  domain: networking
+  frameworks: [ccna:network-access]
+  difficulty: medium
+  estimatedMinutes: 8
+  tags: [exam, vlan, trunk, 802.1q, native-vlan]
+  version: 1
+spec:
+  description: |
+    **Devices:** `mv-sw-north-3` and `mv-sw-north-4` (shell; Linux bridge `br0`,
+    VLAN filtering on)
+
+    The two north switches are joined on `eth9` (both sides). Today that trunk
+    carries VLANs 20, 30 and 40 tagged with VLAN 1 as native. Change it on both
+    switches so it carries **only** VLANs 20, 30 and **{{newvid}}** tagged and
+    VLAN **99** untagged as the native VLAN.
+
+    Access ports are already in place: `eth1` is in VLAN {{newvid}} (hosts
+    `guest-north-3` / `guest-north-4`) and `eth2` is in VLAN 99 (hosts `mgmt-north-3`
+    / `mgmt-north-4`). Those pairs must reach each other across the trunk
+    (all hosts are in `10.{{octet}}.0.0/24`).
+  objectives:
+    - Set the allowed and native VLANs of an 802.1Q trunk
+  params:
+    octet: { type: int, min: 20, max: 90 }
+    newvid: { type: choice, values: ["50", "51", "52", "53"] }
+  topology:
+    entry: workstation
+    nodes:
+      - { name: workstation, driver: container, image: jumphost:1, access: [shell] }
+      - { name: mv-sw-north-3, driver: container, image: netsvc:1, resources: { cpu: 0.2, memoryMiB: 96 }, access: [shell] }
+      - { name: mv-sw-north-4, driver: container, image: netsvc:1, resources: { cpu: 0.2, memoryMiB: 96 }, access: [shell] }
+      - { name: guest-north-3, driver: container, image: nettools:1, resources: { cpu: 0.1, memoryMiB: 48 } }
+      - { name: guest-north-4, driver: container, image: nettools:1, resources: { cpu: 0.1, memoryMiB: 48 } }
+      - { name: mgmt-north-3, driver: container, image: nettools:1, resources: { cpu: 0.1, memoryMiB: 48 } }
+      - { name: mgmt-north-4, driver: container, image: nettools:1, resources: { cpu: 0.1, memoryMiB: 48 } }
+    links:
+      - { a: "mv-sw-north-3:eth1", b: "guest-north-3:eth1" }
+      - { a: "mv-sw-north-3:eth2", b: "mgmt-north-3:eth1" }
+      - { a: "mv-sw-north-4:eth1", b: "guest-north-4:eth1" }
+      - { a: "mv-sw-north-4:eth2", b: "mgmt-north-4:eth1" }
+      - { a: "mv-sw-north-3:eth9", b: "mv-sw-north-4:eth9" }
+  setup:
+    - on: mv-sw-north-3
+      run: &sw |
+        ip link add br0 type bridge vlan_filtering 1 2>/dev/null || true
+        for p in eth1 eth2 eth9; do ip link set $p master br0; done
+        ip link set br0 up
+        bridge vlan add dev eth1 vid {{newvid}} pvid untagged; bridge vlan del dev eth1 vid 1
+        bridge vlan add dev eth2 vid 99 pvid untagged; bridge vlan del dev eth2 vid 1
+        for v in 20 30 40; do bridge vlan add dev eth9 vid $v; done
+    - { on: mv-sw-north-4, run: *sw }
+    - { on: guest-north-3, run: "ip addr replace 10.{{octet}}.0.53/24 dev eth1" }
+    - { on: guest-north-4, run: "ip addr replace 10.{{octet}}.0.54/24 dev eth1" }
+    - { on: mgmt-north-3, run: "ip addr replace 10.{{octet}}.0.93/24 dev eth1" }
+    - { on: mgmt-north-4, run: "ip addr replace 10.{{octet}}.0.94/24 dev eth1" }
+  checks:
+    - id: trunk-north-3
+      description: eth9 on mv-sw-north-3 carries exactly the required VLANs with 99 native
+      type: shell
+      on: mv-sw-north-3
+      command: &trunk |
+        bridge -j vlan show dev eth9 | python3 -c '
+        import json,sys
+        for p in json.load(sys.stdin):
+            print(sorted((x["vlan"],"PVID" in x.get("flags",[]),"Egress Untagged" in x.get("flags",[])) for x in p["vlans"]))'
+      expect: { match: exact, value: "[(20, False, False), (30, False, False), ({{newvid}}, False, False), (99, True, True)]" }
+      skills: [net.switching.trunking]
+      weight: 2
+    - id: trunk-north-4
+      description: eth9 on mv-sw-north-4 carries exactly the required VLANs with 99 native
+      type: shell
+      on: mv-sw-north-4
+      command: *trunk
+      expect: { match: exact, value: "[(20, False, False), (30, False, False), ({{newvid}}, False, False), (99, True, True)]" }
+      skills: [net.switching.trunking]
+      weight: 2
+    - { id: guest-across, description: guest-north-3 reaches guest-north-4, type: reachability, on: guest-north-3, target: "10.{{octet}}.0.54", skills: [net.switching.trunking] }
+    - { id: mgmt-across, description: mgmt-north-3 reaches mgmt-north-4 over the native VLAN, type: reachability, on: mgmt-north-3, target: "10.{{octet}}.0.94", skills: [net.switching.trunking] }
+  misconceptions:
+    - id: vlan40-left
+      description: Adds the new VLANs on both switches but leaves VLAN 40 and VLAN 1 on the trunk
+      mutation:
+        on: mv-sw-north-3
+        run: bridge vlan add dev eth9 vid {{newvid}}; bridge vlan add dev eth9 vid 99
+      expectFail: [trunk-north-3, trunk-north-4, mgmt-across]
+  solution:
+    explanation: On both switches add VLAN {{newvid}} tagged and 99 as untagged PVID to eth9, and remove VLANs 40 and 1.
+    steps:
+      - on: mv-sw-north-3
+        run: &fix |
+          bridge vlan add dev eth9 vid {{newvid}}
+          bridge vlan add dev eth9 vid 99 pvid untagged
+          bridge vlan del dev eth9 vid 40
+          bridge vlan del dev eth9 vid 1
+      - { on: mv-sw-north-4, run: *fix }

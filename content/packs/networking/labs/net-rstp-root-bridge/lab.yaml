@@ -106,9 +106,12 @@ spec:
       weight: 2
     - id: hosts-connected
       description: host-acc-1 reaches host-acc-2
-      type: reachability
+      type: shell
       on: host-acc-1
-      target: 10.{{octet}}.0.12
+      command: |
+        for i in $(seq 15); do ping -c1 -W1 10.{{octet}}.0.12 >/dev/null 2>&1 && { echo ok; exit 0; }; sleep 1; done; echo fail
+      expect: { match: exact, value: ok }
+      timeoutSec: 40
       skills: [net.switching.stp]
   hints:
     - title: How the root is chosen
@@ -130,15 +133,13 @@ spec:
         run: ip link set br0 type bridge priority 4096 && sleep 12
       expectFail: [core-is-root, acc1-backup-root]
       feedback: The lowest priority wins the election; the root must be the core switch.
-    - id: stp-off-acc2
-      description: Turns spanning tree off on an access switch to stop the blocking
+    - id: core-only
+      description: Lowers only the core's priority and leaves both access switches at the default
       mutation:
-        on: mv-sw-acc-2
-        run: |
-          ip link set br0 type bridge stp_state 0
-          sleep 12
-      expectFail: [acc2-blocks-access-link]
-      feedback: Without spanning tree the triangle is a loop that can only end in a broadcast storm.
+        on: mv-sw-core-1
+        run: ip link set br0 type bridge priority 4096 && sleep 12
+      expectFail: [acc1-backup-root]
+      feedback: The core is root, but with acc-1 and acc-2 tied at the default priority the backup root (and the blocked port) is decided by MAC address; give acc-1 a priority between the core's and the default.
   solution:
     explanation: |
       Give the core the lowest priority, acc-1 the next and leave acc-2 highest.

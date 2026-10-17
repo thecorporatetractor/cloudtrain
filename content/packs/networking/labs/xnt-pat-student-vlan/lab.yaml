@@ -1,0 +1,104 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xnt-pat-student-vlan
+  title: Port address translation for one VLAN
+  domain: networking
+  frameworks: [ccna:ip-services]
+  difficulty: medium
+  estimatedMinutes: 8
+  tags: [exam, nat, pat, nftables]
+  version: 1
+spec:
+  description: |
+    **Device:** `mv-edge-3` (Linux router, shell; nftables)
+
+    | Interface | Network |
+    |---|---|
+    | `eth1` | guest VLAN `10.{{octet}}.50.0/24` (`guest-pc-3` is `.10`) |
+    | `eth2` | staff VLAN `10.{{octet}}.20.0/24` (`staff-pc-3` is `.10`) |
+    | `eth3` | outside, `198.51.100.{{out}}/24`; the regional network's test server is `198.51.100.1` |
+
+    The regional network routes the staff VLAN back to `mv-edge-3`, but it has no
+    route to the guest VLAN. Configure port address translation on `mv-edge-3`
+    so traffic from the **guest VLAN** to the outside leaves with the edge's
+    outside address `198.51.100.{{out}}`. Staff traffic must keep its own source
+    address. The test server's TCP port 7777 answers with the source address it
+    sees.
+  objectives:
+    - Configure source NAT with port translation for one inside subnet
+  params:
+    octet: { type: int, min: 20, max: 90 }
+    out: { type: int, min: 20, max: 250 }
+  topology:
+    entry: workstation
+    nodes:
+      - { name: workstation, driver: container, image: jumphost:1, access: [shell] }
+      - { name: mv-edge-3, driver: container, image: netsvc:1, resources: { cpu: 0.2, memoryMiB: 96 }, access: [shell] }
+      - { name: guest-pc-3, driver: container, image: netsvc:1, resources: { cpu: 0.1, memoryMiB: 64 }, access: [shell] }
+      - { name: staff-pc-3, driver: container, image: netsvc:1, resources: { cpu: 0.1, memoryMiB: 64 }, access: [shell] }
+      - { name: regional-test-3, driver: container, image: netsvc:1, resources: { cpu: 0.1, memoryMiB: 64 } }
+    links:
+      - { a: "mv-edge-3:eth1", b: "guest-pc-3:eth1" }
+      - { a: "mv-edge-3:eth2", b: "staff-pc-3:eth1" }
+      - { a: "mv-edge-3:eth3", b: "regional-test-3:eth1" }
+  setup:
+    - on: mv-edge-3
+      run: |
+        ip addr replace 10.{{octet}}.50.1/24 dev eth1
+        ip addr replace 10.{{octet}}.20.1/24 dev eth2
+        ip addr replace 198.51.100.{{out}}/24 dev eth3
+        ip route replace default via 198.51.100.1
+    - { on: guest-pc-3, run: "ip addr replace 10.{{octet}}.50.10/24 dev eth1 && ip route replace default via 10.{{octet}}.50.1" }
+    - { on: staff-pc-3, run: "ip addr replace 10.{{octet}}.20.10/24 dev eth1 && ip route replace default via 10.{{octet}}.20.1" }
+    - on: regional-test-3
+      run: |
+        ip addr replace 198.51.100.1/24 dev eth1
+        ip route replace 10.{{octet}}.20.0/24 via 198.51.100.{{out}}
+        setsid ncat -l -k -p 7777 --sh-exec 'echo $NCAT_REMOTE_ADDR' </dev/null >/dev/null 2>&1 &
+        sleep 1
+  checks:
+    - id: guest-translated
+      description: Guest VLAN traffic reaches the outside with the edge's outside address
+      type: shell
+      on: guest-pc-3
+      command: ncat -w3 --recv-only 198.51.100.1 7777 </dev/null 2>/dev/null
+      expect: { match: exact, value: "198.51.100.{{out}}" }
+      timeoutSec: 10
+      skills: [net.services.nat]
+      weight: 3
+    - id: staff-untranslated
+      description: Staff traffic keeps its own source address
+      type: shell
+      on: staff-pc-3
+      command: ncat -w3 --recv-only 198.51.100.1 7777 </dev/null 2>/dev/null
+      expect: { match: exact, value: "10.{{octet}}.20.10" }
+      timeoutSec: 10
+      skills: [net.services.nat]
+      weight: 2
+  misconceptions:
+    - id: masquerade-all
+      description: Masquerades everything that leaves eth3
+      mutation:
+        on: mv-edge-3
+        run: |
+          nft add table ip nat
+          nft add chain ip nat post '{ type nat hook postrouting priority 100; }'
+          nft add rule ip nat post oif eth3 masquerade
+      expectFail: [staff-untranslated]
+  solution:
+    explanation: |
+      A postrouting NAT rule that matches only the guest source subnet leaving
+      the outside interface and masquerades it (PAT to the interface address).
+    steps:
+      - on: mv-edge-3
+        run: |
+          nft add table ip nat
+          nft add chain ip nat post '{ type nat hook postrouting priority 100; }'
+          nft add rule ip nat post ip saddr 10.{{octet}}.50.0/24 oif eth3 masquerade
+    alternatives:
+      - id: snat-explicit
+        description: Explicit SNAT to the outside address with iptables
+        steps:
+          - on: mv-edge-3
+            run: iptables -t nat -A POSTROUTING -s 10.{{octet}}.50.0/24 -o eth3 -j SNAT --to-source 198.51.100.{{out}}

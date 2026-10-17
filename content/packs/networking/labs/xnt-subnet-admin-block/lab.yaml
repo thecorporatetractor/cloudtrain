@@ -1,0 +1,115 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xnt-subnet-admin-block
+  title: Address a new admin VLAN from a given block
+  domain: networking
+  frameworks: [ccna:network-fundamentals]
+  difficulty: medium
+  estimatedMinutes: 8
+  tags: [exam, subnetting, ipv4]
+  version: 1
+spec:
+  description: |
+    **Devices:** `mv-admin-gw` (Linux router, shell), `admin-pc-1` and
+    `admin-pc-2` (shell)
+
+    The new administration LAN gets its addresses from the block
+    `10.{{octet}}.8.0/21`. It needs **{{hosts}}** usable addresses (gateway
+    included). Use the **first** subnet of the block with the **smallest**
+    prefix that fits, and address it like this:
+
+    - `mv-admin-gw` `eth1`: the first usable address of the subnet;
+    - `admin-pc-1` `eth1`: the second usable address, `admin-pc-2` `eth1`: the third;
+    - both PCs use the gateway as their default route.
+
+    Both PCs must then reach the gateway's service address `10.{{octet}}.250.1`,
+    which lives on the gateway itself.
+  objectives:
+    - Pick the smallest subnet for a host count and apply it to a gateway and hosts
+  params:
+    octet: { type: int, min: 20, max: 90 }
+    hosts: { type: choice, values: ["50", "100", "200", "400"] }
+  topology:
+    entry: workstation
+    nodes:
+      - { name: workstation, driver: container, image: jumphost:1, access: [shell] }
+      - { name: mv-admin-gw, driver: container, image: netsvc:1, resources: { cpu: 0.2, memoryMiB: 96 }, access: [shell] }
+      - { name: mv-sw-admin, driver: container, image: netsvc:1, resources: { cpu: 0.1, memoryMiB: 64 } }
+      - { name: admin-pc-1, driver: container, image: nettools:1, resources: { cpu: 0.1, memoryMiB: 48 }, access: [shell] }
+      - { name: admin-pc-2, driver: container, image: nettools:1, resources: { cpu: 0.1, memoryMiB: 48 }, access: [shell] }
+    links:
+      - { a: "mv-admin-gw:eth1", b: "mv-sw-admin:eth1" }
+      - { a: "mv-sw-admin:eth2", b: "admin-pc-1:eth1" }
+      - { a: "mv-sw-admin:eth3", b: "admin-pc-2:eth1" }
+  setup:
+    - on: mv-sw-admin
+      run: |
+        ip link add br0 type bridge 2>/dev/null || true
+        for p in eth1 eth2 eth3; do ip link set $p master br0; done
+        ip link set br0 up
+    - on: mv-admin-gw
+      run: |
+        ip link add svc0 type dummy 2>/dev/null || true
+        ip link set svc0 up
+        ip addr replace 10.{{octet}}.250.1/32 dev svc0
+  checks:
+    - id: gateway-address
+      description: mv-admin-gw has the first usable address with the right prefix on eth1
+      type: shell
+      on: mv-admin-gw
+      command: &calc |
+        h={{hosts}}; p=32; while [ $(( (1 << (32 - p)) - 2 )) -lt $h ]; do p=$((p - 1)); done
+        got=$(ip -4 -o addr show dev eth1 | awk '{print $4}' | tr '\n' ' ')
+        [ "$got" = "10.{{octet}}.8.1/$p " ] && echo ok || echo "wrong"
+      expect: { match: exact, value: ok }
+      skills: [net.addressing.ipv4-subnetting]
+      weight: 2
+    - id: pc1-address
+      description: admin-pc-1 has the second usable address with the right prefix
+      type: shell
+      on: admin-pc-1
+      command: |
+        h={{hosts}}; p=32; while [ $(( (1 << (32 - p)) - 2 )) -lt $h ]; do p=$((p - 1)); done
+        got=$(ip -4 -o addr show dev eth1 | awk '{print $4}' | tr '\n' ' ')
+        [ "$got" = "10.{{octet}}.8.2/$p " ] && echo ok || echo wrong
+      expect: { match: exact, value: ok }
+      skills: [net.addressing.ipv4-subnetting]
+    - id: pc2-address
+      description: admin-pc-2 has the third usable address with the right prefix
+      type: shell
+      on: admin-pc-2
+      command: |
+        h={{hosts}}; p=32; while [ $(( (1 << (32 - p)) - 2 )) -lt $h ]; do p=$((p - 1)); done
+        got=$(ip -4 -o addr show dev eth1 | awk '{print $4}' | tr '\n' ' ')
+        [ "$got" = "10.{{octet}}.8.3/$p " ] && echo ok || echo wrong
+      expect: { match: exact, value: ok }
+      skills: [net.addressing.ipv4-subnetting]
+    - { id: pc1-service, description: admin-pc-1 reaches the gateway's service address, type: reachability, on: admin-pc-1, target: "10.{{octet}}.250.1", skills: [net.addressing.ipv4-subnetting] }
+    - { id: pc2-service, description: admin-pc-2 reaches the gateway's service address, type: reachability, on: admin-pc-2, target: "10.{{octet}}.250.1", skills: [net.addressing.ipv4-subnetting] }
+  misconceptions:
+    - id: whole-block
+      description: Uses the whole /21 block as the subnet
+      mutation:
+        on: mv-admin-gw
+        run: ip addr replace 10.{{octet}}.8.1/21 dev eth1
+      expectFail: [gateway-address]
+  solution:
+    explanation: |
+      The smallest prefix whose usable addresses (2^(32-p) - 2) cover the host
+      count: 50 -> /26, 100 -> /25, 200 -> /24, 400 -> /23. The first subnet of
+      the block starts at 10.{{octet}}.8.0, so the gateway is .8.1, the PCs .8.2
+      and .8.3.
+    steps:
+      - on: mv-admin-gw
+        run: |
+          case {{hosts}} in 50) p=26;; 100) p=25;; 200) p=24;; 400) p=23;; esac
+          ip addr replace 10.{{octet}}.8.1/$p dev eth1
+      - on: admin-pc-1
+        run: |
+          case {{hosts}} in 50) p=26;; 100) p=25;; 200) p=24;; 400) p=23;; esac
+          ip addr replace 10.{{octet}}.8.2/$p dev eth1; ip route replace default via 10.{{octet}}.8.1
+      - on: admin-pc-2
+        run: |
+          case {{hosts}} in 50) p=26;; 100) p=25;; 200) p=24;; 400) p=23;; esac
+          ip addr replace 10.{{octet}}.8.3/$p dev eth1; ip route replace default via 10.{{octet}}.8.1

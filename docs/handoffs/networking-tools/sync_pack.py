@@ -17,12 +17,7 @@ for p in cur["paths"]:
             cids.append(m["id"])
     if cids:
         paths.append({"id": p["id"], "title": p["title"], "framework": p["frameworks"][0], "courses": cids})
-for x in cur["exams"]:
-    if x["domain"] != "networking":
-        continue
-    pool = [l for b in x["blueprint"] for l in b["pool"] if l in have]
-    if pool:
-        courses.append({"id": f"{x['id']}-tasks", "title": "Practical exam simulation tasks", "description": "Task pool of the associate network engineer exam simulation (no hints, graded on end state).", "level": "intermediate", "labs": pool})
+# Exam tasks (type: exam) never go into courses (lab-verify rejects it).
 f = f"{root}/content/packs/networking/pack.yaml"
 text = open(f).read()
 head = text[: text.index("courses:")]

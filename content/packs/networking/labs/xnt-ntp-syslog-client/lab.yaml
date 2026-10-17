@@ -1,0 +1,151 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xnt-ntp-syslog-client
+  title: NTP and remote syslog on a campus router
+  domain: networking
+  frameworks: [ccna:ip-services]
+  difficulty: medium
+  estimatedMinutes: 8
+  tags: [exam, ntp, chrony, syslog, rsyslog]
+  version: 1
+spec:
+  description: |
+    **Device:** `mv-campus-east-4` (Linux router, shell; chrony and rsyslog)
+
+    - Make `mv-campus-east-4` synchronise its clock from the core time server
+      `10.{{octet}}.4.1` (reached over `eth1`) and from no other source. chronyd
+      runs with `/etc/chrony/chrony.conf`. To restart it after editing:
+      `pkill -x chronyd`, remove `/run/chrony/chronyd.pid` (the node has no init
+      to reap the old process), then `chronyd -x` (the container cannot set the
+      system clock).
+    - Send log messages of severity **warning and above** (any facility) to the
+      central syslog server `10.{{octet}}.5.10`, UDP port 514, and nothing
+      below warning. rsyslogd reads `/etc/rsyslog.conf` and
+      `/etc/rsyslog.d/*.conf`; restart it after editing.
+
+    Both settings must survive a restart of the daemons (put them in the
+    configuration files).
+  objectives:
+    - Configure an NTP client and remote syslog with a severity threshold
+  params:
+    octet: { type: int, min: 20, max: 90 }
+    token: { type: name, prefix: probe }
+  topology:
+    entry: workstation
+    nodes:
+      - { name: workstation, driver: container, image: jumphost:1, access: [shell] }
+      - { name: mv-campus-east-4, driver: container, image: netsvc:1, resources: { cpu: 0.2, memoryMiB: 96 }, access: [shell] }
+      - { name: mv-core-ntp-4, driver: container, image: netsvc:1, resources: { cpu: 0.1, memoryMiB: 64 } }
+      - { name: syslog-dc-4, driver: container, image: netsvc:1, resources: { cpu: 0.1, memoryMiB: 64 } }
+    links:
+      - { a: "mv-campus-east-4:eth1", b: "mv-core-ntp-4:eth1" }
+      - { a: "mv-campus-east-4:eth2", b: "syslog-dc-4:eth1" }
+  setup:
+    - on: mv-core-ntp-4
+      run: |
+        ip addr replace 10.{{octet}}.4.1/30 dev eth1
+        printf 'local stratum 8\nallow 10.{{octet}}.0.0/16\ndriftfile /var/lib/chrony/chrony.drift\n' > /etc/chrony/server.conf
+        mkdir -p /run/chrony /var/lib/chrony
+        setsid chronyd -x -f /etc/chrony/server.conf </dev/null >/dev/null 2>&1
+    - on: syslog-dc-4
+      run: |
+        ip addr replace 10.{{octet}}.5.10/24 dev eth1
+        cat > /etc/rsyslog-server.conf <<'CONF'
+        module(load="imudp")
+        input(type="imudp" port="514")
+        if $fromhost-ip != "127.0.0.1" then {
+          action(type="omfile" file="/var/lib/cloudtrain/remote.log" template="RSYSLOG_FileFormat")
+          stop
+        }
+        CONF
+        mkdir -p /var/lib/cloudtrain
+        setsid rsyslogd -f /etc/rsyslog-server.conf -i /run/rsyslog-server.pid </dev/null >/dev/null 2>&1
+    - on: mv-campus-east-4
+      run: |
+        ip addr replace 10.{{octet}}.4.2/30 dev eth1
+        ip addr replace 10.{{octet}}.5.1/24 dev eth2
+        printf 'driftfile /var/lib/chrony/chrony.drift\nrtcsync\n' > /etc/chrony/chrony.conf
+        mkdir -p /run/chrony /var/lib/chrony /etc/rsyslog.d
+        setsid chronyd -x </dev/null >/dev/null 2>&1
+        setsid rsyslogd </dev/null >/dev/null 2>&1
+  checks:
+    - id: ntp-config
+      description: chrony on mv-campus-east-4 is configured with the core as its only source
+      type: shell
+      on: mv-campus-east-4
+      command: grep -hE '^[[:space:]]*(server|pool|peer)[[:space:]]' /etc/chrony/chrony.conf /etc/chrony/conf.d/*.conf 2>/dev/null | awk '{print $1, $2}' | tr '\n' ';'
+      expect: { match: exact, value: "server 10.{{octet}}.4.1;" }
+      skills: [net.services.ntp]
+    - id: ntp-synced
+      description: chronyd has selected the core as its synchronisation source
+      type: shell
+      on: mv-campus-east-4
+      command: |
+        for i in $(seq 20); do chronyc -n sources 2>/dev/null | grep -q '^\^\* 10\.{{octet}}\.4\.1 ' && { echo synced; exit 0; }; sleep 2; done; echo not-synced
+      expect: { match: exact, value: synced }
+      timeoutSec: 50
+      skills: [net.services.ntp]
+      weight: 2
+    - id: probe-logs
+      description: (probe) mv-campus-east-4 logs a warning, an error and a notice message
+      type: shell
+      on: mv-campus-east-4
+      command: |
+        logger -p user.warning "{{token}}-warn"; logger -p local3.err "{{token}}-err"; logger -p user.notice "{{token}}-notice"; sleep 2; echo sent
+      expect: { match: exact, value: sent }
+      skills: [net.services.syslog]
+      weight: 0
+    - id: remote-warning
+      description: The syslog server received the warning and error messages
+      type: shell
+      on: syslog-dc-4
+      command: |
+        for i in 1 2 3 4 5; do n=$(grep -o -e '{{token}}-warn' -e '{{token}}-err' /var/lib/cloudtrain/remote.log 2>/dev/null | sort -u | wc -l); [ "$n" = 2 ] && break; sleep 1; done; echo "${n:-0}"
+      expect: { match: exact, value: "2" }
+      timeoutSec: 15
+      skills: [net.services.syslog]
+      weight: 2
+    - id: remote-threshold
+      description: The syslog server received nothing below warning
+      type: shell
+      on: syslog-dc-4
+      command: |
+        [ -f /var/lib/cloudtrain/remote.log ] || { echo missing; exit 0; }
+        grep -q '{{token}}-notice' /var/lib/cloudtrain/remote.log && echo leaked || echo ok
+      expect: { match: exact, value: ok }
+      skills: [net.services.syslog]
+  misconceptions:
+    - id: everything-forwarded
+      description: Forwards every message instead of warning and above
+      mutation:
+        on: mv-campus-east-4
+        run: |
+          printf 'server 10.{{octet}}.4.1 iburst\ndriftfile /var/lib/chrony/chrony.drift\nrtcsync\n' > /etc/chrony/chrony.conf
+          pkill -x chronyd; sleep 1; rm -f /run/chrony/chronyd.pid; setsid chronyd -x </dev/null >/dev/null 2>&1
+          echo '*.* @10.{{octet}}.5.10:514' > /etc/rsyslog.d/remote.conf
+          pkill -x rsyslogd; sleep 1; setsid rsyslogd </dev/null >/dev/null 2>&1
+      expectFail: [remote-threshold]
+  solution:
+    explanation: |
+      `server 10.{{octet}}.4.1 iburst` as the only source in chrony.conf, and an
+      rsyslog rule `*.warning @10.{{octet}}.5.10:514` (one `@` = UDP); the
+      `warning` selector matches that severity and everything more severe.
+      Restart both daemons.
+    steps:
+      - on: mv-campus-east-4
+        run: |
+          printf 'server 10.{{octet}}.4.1 iburst\ndriftfile /var/lib/chrony/chrony.drift\nrtcsync\n' > /etc/chrony/chrony.conf
+          pkill -x chronyd; sleep 1; rm -f /run/chrony/chronyd.pid; setsid chronyd -x </dev/null >/dev/null 2>&1
+          echo '*.warning @10.{{octet}}.5.10:514' > /etc/rsyslog.d/remote.conf
+          pkill -x rsyslogd; sleep 1; setsid rsyslogd </dev/null >/dev/null 2>&1
+    alternatives:
+      - id: rainerscript
+        description: RainerScript forwarding action with a severity filter
+        steps:
+          - on: mv-campus-east-4
+            run: |
+              printf 'server 10.{{octet}}.4.1 iburst\ndriftfile /var/lib/chrony/chrony.drift\nrtcsync\n' > /etc/chrony/chrony.conf
+              pkill -x chronyd; sleep 1; rm -f /run/chrony/chronyd.pid; setsid chronyd -x </dev/null >/dev/null 2>&1
+              echo 'if $syslogseverity <= 4 then action(type="omfwd" target="10.{{octet}}.5.10" port="514" protocol="udp")' > /etc/rsyslog.d/remote.conf
+              pkill -x rsyslogd; sleep 1; setsid rsyslogd </dev/null >/dev/null 2>&1

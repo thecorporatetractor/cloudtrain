@@ -1,0 +1,132 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xnt-acl-printer-subnet
+  title: Filter traffic into the printer subnet
+  domain: networking
+  frameworks: [ccna:security-fundamentals]
+  difficulty: medium
+  estimatedMinutes: 8
+  tags: [exam, acl, nftables, filtering]
+  version: 1
+spec:
+  description: |
+    **Device:** `mv-campus-south-5` (Linux router, shell; nftables)
+
+    | Interface | Subnet | Host |
+    |---|---|---|
+    | `eth1` | staff `10.{{octet}}.20.0/24` | `staff-pc-5` (`.10`) |
+    | `eth2` | students `10.{{octet}}.30.0/24` | `student-pc-5` (`.10`) |
+    | `eth3` | printers `10.{{octet}}.40.0/24` | `printer-5` (`.10`; listens on TCP 22, 631 and 9100) |
+
+    Filter the traffic that `mv-campus-south-5` routes **into the printer
+    subnet**: only hosts of the staff subnet may reach printers, and only on TCP
+    ports 631 and 9100. Drop every other packet routed into the printer subnet
+    (including ICMP and other ports). Traffic between the staff and student
+    subnets must not be affected.
+  objectives:
+    - Write a stateful forwarding filter that permits only specific sources and ports
+  params:
+    octet: { type: int, min: 20, max: 90 }
+  topology:
+    entry: workstation
+    nodes:
+      - { name: workstation, driver: container, image: jumphost:1, access: [shell] }
+      - { name: mv-campus-south-5, driver: container, image: netsvc:1, resources: { cpu: 0.2, memoryMiB: 96 }, access: [shell] }
+      - { name: staff-pc-5, driver: container, image: netsvc:1, resources: { cpu: 0.1, memoryMiB: 64 }, access: [shell] }
+      - { name: student-pc-5, driver: container, image: netsvc:1, resources: { cpu: 0.1, memoryMiB: 64 }, access: [shell] }
+      - { name: printer-5, driver: container, image: netsvc:1, resources: { cpu: 0.1, memoryMiB: 64 } }
+    links:
+      - { a: "mv-campus-south-5:eth1", b: "staff-pc-5:eth1" }
+      - { a: "mv-campus-south-5:eth2", b: "student-pc-5:eth1" }
+      - { a: "mv-campus-south-5:eth3", b: "printer-5:eth1" }
+  setup:
+    - on: mv-campus-south-5
+      run: |
+        ip addr replace 10.{{octet}}.20.1/24 dev eth1
+        ip addr replace 10.{{octet}}.30.1/24 dev eth2
+        ip addr replace 10.{{octet}}.40.1/24 dev eth3
+    - { on: staff-pc-5, run: "ip addr replace 10.{{octet}}.20.10/24 dev eth1 && ip route replace default via 10.{{octet}}.20.1" }
+    - { on: student-pc-5, run: "ip addr replace 10.{{octet}}.30.10/24 dev eth1 && ip route replace default via 10.{{octet}}.30.1" }
+    - on: printer-5
+      run: |
+        ip addr replace 10.{{octet}}.40.10/24 dev eth1 && ip route replace default via 10.{{octet}}.40.1
+        for p in 22 631 9100; do setsid ncat -l -k -p $p --sh-exec 'echo printer' </dev/null >/dev/null 2>&1 & done
+        sleep 1
+  checks:
+    - id: staff-print
+      description: staff-pc-5 reaches the printer on TCP 631 and 9100
+      type: shell
+      on: staff-pc-5
+      command: |
+        r=""; for p in 631 9100; do ncat -z -w2 10.{{octet}}.40.10 $p && r="$r $p:open" || r="$r $p:closed"; done; echo $r
+      expect: { match: exact, value: "631:open 9100:open" }
+      timeoutSec: 15
+      skills: [net.security.acls]
+      weight: 2
+    - id: staff-other-dropped
+      description: staff-pc-5 cannot reach the printer on TCP 22 or with ping
+      type: shell
+      on: staff-pc-5
+      command: |
+        r=""; ncat -z -w2 10.{{octet}}.40.10 22 && r="ssh-open" || r="ssh-closed"
+        ping -c1 -W2 10.{{octet}}.40.10 >/dev/null 2>&1 && r="$r ping-ok" || r="$r ping-dropped"; echo $r
+      expect: { match: exact, value: "ssh-closed ping-dropped" }
+      timeoutSec: 15
+      skills: [net.security.acls]
+      weight: 2
+    - id: student-dropped
+      description: student-pc-5 cannot reach the printer on TCP 631 or 9100
+      type: shell
+      on: student-pc-5
+      command: |
+        r=""; for p in 631 9100; do ncat -z -w2 10.{{octet}}.40.10 $p && r="$r $p:open" || r="$r $p:closed"; done; echo $r
+      expect: { match: exact, value: "631:closed 9100:closed" }
+      timeoutSec: 15
+      skills: [net.security.acls]
+      weight: 2
+    - { id: staff-students-ok, description: Staff and student subnets still reach each other, type: reachability, on: student-pc-5, target: "10.{{octet}}.20.10", skills: [net.security.acls] }
+  misconceptions:
+    - id: staff-any
+      description: Permits the staff subnet to everything in the printer subnet
+      mutation:
+        on: mv-campus-south-5
+        run: |
+          nft add table inet acl
+          nft add chain inet acl printers_in '{ type filter hook forward priority 0; policy accept; }'
+          nft add rule inet acl printers_in ip daddr 10.{{octet}}.40.0/24 ip saddr 10.{{octet}}.20.0/24 accept
+          nft add rule inet acl printers_in ip daddr 10.{{octet}}.40.0/24 drop
+      expectFail: [staff-other-dropped]
+    - id: drop-everything
+      description: Drops all forwarded traffic except the printer ports
+      mutation:
+        on: mv-campus-south-5
+        run: |
+          nft add table inet acl
+          nft add chain inet acl printers_in '{ type filter hook forward priority 0; policy drop; }'
+          nft add rule inet acl printers_in ct state established,related accept
+          nft add rule inet acl printers_in ip saddr 10.{{octet}}.20.0/24 ip daddr 10.{{octet}}.40.0/24 tcp dport '{ 631, 9100 }' accept
+      expectFail: [staff-students-ok]
+  solution:
+    explanation: |
+      In the forward hook, accept return traffic of established flows, accept
+      staff to the printer subnet on TCP 631 and 9100, and drop anything else
+      whose destination is the printer subnet. Other forwarded traffic keeps the
+      accept policy.
+    steps:
+      - on: mv-campus-south-5
+        run: |
+          nft add table inet acl
+          nft add chain inet acl printers_in '{ type filter hook forward priority 0; policy accept; }'
+          nft add rule inet acl printers_in ct state established,related accept
+          nft add rule inet acl printers_in ip saddr 10.{{octet}}.20.0/24 ip daddr 10.{{octet}}.40.0/24 tcp dport '{ 631, 9100 }' accept
+          nft add rule inet acl printers_in ip daddr 10.{{octet}}.40.0/24 drop
+    alternatives:
+      - id: iptables
+        description: The same filter with iptables on the egress interface
+        steps:
+          - on: mv-campus-south-5
+            run: |
+              iptables -A FORWARD -o eth3 -s 10.{{octet}}.20.0/24 -p tcp -m multiport --dports 631,9100 -j ACCEPT
+              iptables -A FORWARD -o eth3 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+              iptables -A FORWARD -o eth3 -j DROP

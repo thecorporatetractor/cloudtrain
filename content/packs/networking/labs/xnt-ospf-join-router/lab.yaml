@@ -1,0 +1,156 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xnt-ospf-join-router
+  title: Join a new router to OSPF area 0
+  domain: networking
+  frameworks: [ccna:ip-connectivity]
+  difficulty: medium
+  estimatedMinutes: 8
+  tags: [exam, ospf, frr]
+  version: 1
+spec:
+  description: |
+    **Device:** `mv-annex-7` (FRR console)
+
+    The new vocational annex router `mv-annex-7` is cabled to `mv-core-7` on
+    `eth1` (`10.{{octet}}.2.0/30`, already addressed) and has two LANs,
+    `10.{{octet}}.{{lan}}.0/24` on `lan1` and `10.{{octet}}.{{lan2}}.0/24` on
+    `lan2`. `mv-core-7` already runs OSPFv2 in area 0 on its side of the link.
+
+    Enable OSPFv2 on `mv-annex-7` with router ID **10.255.{{octet}}.{{rid}}**, form a
+    full adjacency with `mv-core-7` in area 0, and advertise both annex LANs.
+    Do not send OSPF hellos into the LANs. Do not change `mv-core-7`.
+  objectives:
+    - Configure OSPFv2 with an explicit router ID, area 0 interfaces and passive LANs
+  params:
+    octet: { type: int, min: 20, max: 90 }
+    rid: { type: int, min: 10, max: 99 }
+    lan: { type: int, min: 100, max: 149 }
+    lan2: { type: int, min: 150, max: 199 }
+  topology:
+    entry: workstation
+    nodes:
+      - { name: workstation, driver: container, image: jumphost:1, access: [shell] }
+      - { name: mv-annex-7, driver: netdev, image: frr:10, access: [console] }
+      - { name: mv-core-7, driver: netdev, image: frr:10 }
+    links:
+      - { a: "mv-core-7:eth1", b: "mv-annex-7:eth1", subnet: "10.{{octet}}.2.0/30" }
+  setup:
+    - { on: mv-annex-7, run: "for i in lan1 lan2; do ip link add $i type dummy 2>/dev/null; ip link set $i up; done" }
+    - { on: mv-core-7, run: "ip link add lan1 type dummy 2>/dev/null; ip link set lan1 up" }
+    - on: mv-core-7
+      config: |
+        interface eth1
+         ip address 10.{{octet}}.2.1/30
+         ip ospf area 0
+        interface lan1
+         ip address 10.{{octet}}.250.1/24
+         ip ospf area 0
+         ip ospf passive
+        router ospf
+         ospf router-id 10.255.{{octet}}.1
+    - on: mv-annex-7
+      config: |
+        interface eth1
+         ip address 10.{{octet}}.2.2/30
+        interface lan1
+         ip address 10.{{octet}}.{{lan}}.1/24
+        interface lan2
+         ip address 10.{{octet}}.{{lan2}}.1/24
+  checks:
+    - id: router-id
+      description: mv-annex-7 runs OSPF with the given router ID
+      type: shell
+      on: mv-annex-7
+      command: vtysh -c 'show ip ospf json' | python3 -c 'import json,sys; print(json.load(sys.stdin).get("routerId",""))'
+      expect: { match: exact, value: "10.255.{{octet}}.{{rid}}" }
+      skills: [net.routing.ospf]
+    - id: adjacency
+      description: mv-core-7 has a Full adjacency with the annex router
+      type: shell
+      on: mv-core-7
+      command: |
+        for i in $(seq 25); do
+          s=$(vtysh -c 'show ip ospf neighbor json' | python3 -c '
+        import json,sys
+        d=json.load(sys.stdin).get("neighbors",{})
+        print(" ".join(sorted(n.get("nbrState","").split("/")[0] for k,v in d.items() if k=="10.255.{{octet}}.{{rid}}" for n in v)))')
+          [ "$s" = Full ] && break; sleep 2
+        done; echo "$s"
+      expect: { match: exact, value: Full }
+      timeoutSec: 60
+      skills: [net.routing.ospf]
+      weight: 2
+    - id: lans-learned
+      description: mv-core-7 learns both annex LANs through OSPF
+      type: shell
+      on: mv-core-7
+      command: |
+        for i in $(seq 15); do
+          r=$(vtysh -c 'show ip route ospf json' | python3 -c '
+        import json,sys
+        d=json.load(sys.stdin)
+        print(" ".join(p for p in ("10.{{octet}}.{{lan}}.0/24","10.{{octet}}.{{lan2}}.0/24") if any(r.get("selected") for r in d.get(p,[]))))')
+          [ "$r" = "10.{{octet}}.{{lan}}.0/24 10.{{octet}}.{{lan2}}.0/24" ] && break; sleep 2
+        done; echo "$r"
+      expect: { match: exact, value: "10.{{octet}}.{{lan}}.0/24 10.{{octet}}.{{lan2}}.0/24" }
+      timeoutSec: 45
+      skills: [net.routing.ospf]
+      weight: 2
+    - id: lans-passive
+      description: The annex LAN interfaces are passive
+      type: shell
+      on: mv-annex-7
+      command: |
+        vtysh -c 'show ip ospf interface json' | python3 -c '
+        import json,sys
+        d=json.load(sys.stdin).get("interfaces",{})
+        print(" ".join("%s:%s" % (i, "passive" if d.get(i,{}).get("timerPassiveIface") else "active" if i in d else "absent") for i in ("lan1","lan2")))'
+      expect: { match: exact, value: "lan1:passive lan2:passive" }
+      skills: [net.routing.ospf]
+  misconceptions:
+    - id: no-router-id
+      description: Enables OSPF on the interfaces but leaves the router ID to be chosen automatically
+      mutation:
+        on: mv-annex-7
+        config: |
+          interface eth1
+           ip ospf area 0
+          interface lan1
+           ip ospf area 0
+           ip ospf passive
+          interface lan2
+           ip ospf area 0
+           ip ospf passive
+      expectFail: [router-id, adjacency]
+  solution:
+    explanation: |
+      Set the router ID under `router ospf`, put eth1 and both LANs in area 0
+      (interface `ip ospf area 0` or `network` statements), and make the LANs passive.
+    steps:
+      - on: mv-annex-7
+        config: |
+          router ospf
+           ospf router-id 10.255.{{octet}}.{{rid}}
+          interface eth1
+           ip ospf area 0
+          interface lan1
+           ip ospf area 0
+           ip ospf passive
+          interface lan2
+           ip ospf area 0
+           ip ospf passive
+    alternatives:
+      - id: network-statements
+        description: network statements and passive-interface under router ospf
+        steps:
+          - on: mv-annex-7
+            config: |
+              router ospf
+               ospf router-id 10.255.{{octet}}.{{rid}}
+               network 10.{{octet}}.2.0/30 area 0
+               network 10.{{octet}}.{{lan}}.0/24 area 0
+               network 10.{{octet}}.{{lan2}}.0/24 area 0
+               passive-interface lan1
+               passive-interface lan2

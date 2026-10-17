@@ -1,0 +1,123 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xnt-mgmt-ssh-only
+  title: Restrict router management to SSH from the admin subnet
+  domain: networking
+  frameworks: [ccna:security-fundamentals]
+  difficulty: medium
+  estimatedMinutes: 8
+  tags: [exam, management-plane, ssh, nftables, hardening]
+  version: 1
+spec:
+  description: |
+    **Device:** `mv-campus-south-10` (Linux router, shell; nftables)
+
+    The router is managed today over SSH (TCP 22) and over a legacy plain-text
+    console service on TCP 23, from anywhere:
+
+    | Interface | Subnet | Host |
+    |---|---|---|
+    | `eth1` | network admins `10.{{octet}}.{{admin}}.0/24` (router `.1`) | `netadmin-pc-10` (`.10`) |
+    | `eth2` | staff `10.{{octet}}.20.0/24` (router `.1`) | `staff-pc-10` (`.10`) |
+
+    Filter the traffic **addressed to the router itself** so that it can be
+    managed only over SSH and only from the network-admin subnet: SSH from any
+    other source and TCP 23 from every source must be refused or dropped, on
+    every router address. Do not stop the daemons, and do not affect traffic the
+    router forwards between the two subnets.
+  objectives:
+    - Restrict management-plane access to one protocol and one source subnet
+  params:
+    octet: { type: int, min: 20, max: 90 }
+    admin: { type: int, min: 100, max: 199 }
+  topology:
+    entry: workstation
+    nodes:
+      - { name: workstation, driver: container, image: jumphost:1, access: [shell] }
+      - { name: mv-campus-south-10, driver: container, image: netsvc:1, resources: { cpu: 0.2, memoryMiB: 96 }, access: [shell] }
+      - { name: netadmin-pc-10, driver: container, image: netsvc:1, resources: { cpu: 0.1, memoryMiB: 64 }, access: [shell] }
+      - { name: staff-pc-10, driver: container, image: netsvc:1, resources: { cpu: 0.1, memoryMiB: 64 }, access: [shell] }
+    links:
+      - { a: "mv-campus-south-10:eth1", b: "netadmin-pc-10:eth1" }
+      - { a: "mv-campus-south-10:eth2", b: "staff-pc-10:eth1" }
+  setup:
+    - on: mv-campus-south-10
+      run: |
+        ip addr replace 10.{{octet}}.{{admin}}.1/24 dev eth1
+        ip addr replace 10.{{octet}}.20.1/24 dev eth2
+        ssh-keygen -A >/dev/null 2>&1
+        setsid /usr/sbin/sshd </dev/null >/dev/null 2>&1
+        setsid ncat -l -k -p 23 --sh-exec 'echo mv-campus-south-10 legacy console' </dev/null >/dev/null 2>&1 &
+        sleep 1
+    - { on: netadmin-pc-10, run: "ip addr replace 10.{{octet}}.{{admin}}.10/24 dev eth1 && ip route replace default via 10.{{octet}}.{{admin}}.1" }
+    - { on: staff-pc-10, run: "ip addr replace 10.{{octet}}.20.10/24 dev eth1 && ip route replace default via 10.{{octet}}.20.1" }
+  checks:
+    - id: admin-ssh
+      description: netadmin-pc-10 reaches SSH on the router
+      type: shell
+      on: netadmin-pc-10
+      command: ncat -z -w2 10.{{octet}}.{{admin}}.1 22 && echo open || echo closed
+      expect: { match: exact, value: open }
+      timeoutSec: 10
+      skills: [net.security.device-hardening]
+    - id: legacy-refused
+      description: TCP 23 on the router is refused or dropped from both subnets
+      type: shell
+      on: netadmin-pc-10
+      command: |
+        r=""; for a in 10.{{octet}}.{{admin}}.1 10.{{octet}}.20.1; do ncat -z -w2 $a 23 && r="$r open" || r="$r closed"; done; echo $r
+      expect: { match: exact, value: "closed closed" }
+      timeoutSec: 15
+      skills: [net.security.device-hardening]
+      weight: 2
+    - id: staff-ssh-refused
+      description: staff-pc-10 cannot reach SSH or TCP 23 on any router address
+      type: shell
+      on: staff-pc-10
+      command: |
+        r=""; for a in 10.{{octet}}.20.1 10.{{octet}}.{{admin}}.1; do for p in 22 23; do ncat -z -w2 $a $p && r="$r open" || r="$r closed"; done; done; echo $r
+      expect: { match: exact, value: "closed closed closed closed" }
+      timeoutSec: 20
+      skills: [net.security.device-hardening]
+      weight: 2
+    - id: daemons-running
+      description: sshd still runs on the router
+      type: shell
+      on: mv-campus-south-10
+      command: pgrep -x sshd >/dev/null && echo running || echo stopped
+      expect: { match: exact, value: running }
+      skills: [net.security.device-hardening]
+      weight: 0.5
+    - { id: forwarding-ok, description: staff-pc-10 still reaches netadmin-pc-10 through the router, type: reachability, on: staff-pc-10, target: "10.{{octet}}.{{admin}}.10", skills: [net.security.device-hardening] }
+  misconceptions:
+    - id: one-address
+      description: Filters only the router's staff-side address
+      mutation:
+        on: mv-campus-south-10
+        run: |
+          nft add table inet mgmt
+          nft add chain inet mgmt in '{ type filter hook input priority 0; policy accept; }'
+          nft add rule inet mgmt in ip daddr 10.{{octet}}.20.1 tcp dport '{ 22, 23 }' drop
+          nft add rule inet mgmt in tcp dport 23 drop
+      expectFail: [staff-ssh-refused]
+  solution:
+    explanation: |
+      In the input hook (traffic to the router itself), accept TCP 22 from the
+      admin subnet and drop TCP 22 and 23 from everything else. The forward hook
+      is untouched, so routed traffic is not affected.
+    steps:
+      - on: mv-campus-south-10
+        run: |
+          nft add table inet mgmt
+          nft add chain inet mgmt in '{ type filter hook input priority 0; policy accept; }'
+          nft add rule inet mgmt in ip saddr 10.{{octet}}.{{admin}}.0/24 tcp dport 22 accept
+          nft add rule inet mgmt in tcp dport '{ 22, 23 }' drop
+    alternatives:
+      - id: iptables-reject
+        description: iptables INPUT rules that reject instead of drop
+        steps:
+          - on: mv-campus-south-10
+            run: |
+              iptables -A INPUT -p tcp --dport 22 -s 10.{{octet}}.{{admin}}.0/24 -j ACCEPT
+              iptables -A INPUT -p tcp -m multiport --dports 22,23 -j REJECT --reject-with tcp-reset
