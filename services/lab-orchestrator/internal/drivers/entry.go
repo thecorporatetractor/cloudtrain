@@ -384,8 +384,9 @@ func (r *SessionRuntime) reader() client.Reader {
 // SSHSecretName is the session's SSH key Secret.
 func SSHSecretName(s *labsv1.LabSession) string { return "ct-" + SessionHash(s) + "-ssh" }
 
-// ProvisionTopology creates the session keys, the entry policy and (if the
-// topology has VM-backed hosts) the lab network.
+// ProvisionTopology creates the session keys, the entry policy, the lab peer
+// Service and policy (labpeers.go) and (if the topology has VM-backed hosts)
+// the lab network.
 func (r *SessionRuntime) ProvisionTopology(ctx context.Context, ref SessionRef) (bool, error) {
 	if _, err := r.keys(ctx, ref.Session, true); err != nil {
 		return false, err
@@ -401,6 +402,17 @@ func (r *SessionRuntime) ProvisionTopology(ctx context.Context, ref SessionRef) 
 		}
 		if err := ensure(ctx, r.Client, r.reader(), ref.Session, np); err != nil {
 			return false, err
+		}
+	}
+	if len(LabPeers(topo)) > 0 {
+		svc, np := PeerService(ref.Session), PeerNetworkPolicy(ref.Session)
+		for _, obj := range []client.Object{svc, np} {
+			if err := setOwner(ref.Session, obj, r.Client); err != nil {
+				return false, err
+			}
+			if err := ensure(ctx, r.Client, r.reader(), ref.Session, obj); err != nil {
+				return false, err
+			}
 		}
 	}
 	if NeedsLabNetwork(topo) && r.Network != nil {
@@ -424,6 +436,8 @@ func (r *SessionRuntime) DestroyTopology(ctx context.Context, ref SessionRef) er
 	for _, obj := range []client.Object{
 		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: s.Namespace, Name: SSHSecretName(s)}},
 		EntryNetworkPolicy(s, "", nil),
+		PeerService(s),
+		PeerNetworkPolicy(s),
 	} {
 		if _, err := deleteIfOwned(ctx, r.Client, r.reader(), s, obj); err != nil {
 			return err

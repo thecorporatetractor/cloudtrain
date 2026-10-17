@@ -63,6 +63,21 @@ ingress and egress only to cluster DNS, its own vclusters (:8443) and the lab
 CIDRs. Ported from `deploy/scripts/lab-demo.sh`; self-contained so it can move
 onto a shared network package.
 
+### Lab peers: container nodes by name (`labpeers.go`)
+
+Container nodes without topology links (the entry node included) are *lab peers*
+on the platform pod network. Per session, `ProvisionTopology` creates the headless
+Service `ct-<hash>-nodes` (no ports, `publishNotReadyAddresses`, selector
+`labs.cloudtrain.dev/lab-peer=true` + session UID) and the NetworkPolicy
+`ct-<hash>-peers` (primary interface only, `ovn.kubernetes.io/network_policy_for: ovn`).
+Each peer pod gets `hostname: <node>`, `subdomain: ct-<hash>-nodes` and the DNS search
+domain `ct-<hash>-nodes.<ns>.svc.<cluster domain>`, so `<node>` resolves to the pod IP
+inside the session (and only there: the same node name in another session resolves to
+that session's pod). The policy allows ingress from the session's peers only and egress
+to the peers, cluster DNS and the mirrors; the entry policy adds its own egress on top
+(policies add up). Before this, only the entry pod had a policy and non-entry container
+nodes were open in both directions. Live proof: `deploy/.results/lab-peers/` (lab, script, output).
+
 ### Entry node and credentials
 
 ```
