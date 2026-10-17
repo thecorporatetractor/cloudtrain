@@ -56,8 +56,8 @@ items of the old list; what is left of them:
 | Stream | Owned | Verified live | Written, not yet verified | Blocked / not started | Handoff |
 |---|---|---|---|---|---|
 | k8s-admin | 88 | 5 | 63 | 18 blocked on add-ons, 2 not written | `docs/handoffs/k8s-admin.md` |
-| k8s-dev | 42 | 6 | 32 | 4 blocked (buildah, metrics-server, ingress) | `docs/handoffs/k8s-dev.md` |
-| k8s-sec | 51 | 2 | 37 | 12 blocked on security tooling | `docs/handoffs/k8s-sec.md` |
+| k8s-dev | 42 | 33 (every V-tier lab; round 3, 2026-10-17); sim-k8s-developer exam run live: auto-solve 100 %, no-solve 14.5 % | 5 K-tier (vm slot) | 4 blocked (buildah, metrics-server, ingress) | `docs/handoffs/k8s-dev.md` |
+| k8s-sec | 51 | 12 (every V-tier lab; round 3) | 27 K-tier (vm slot) | 12 blocked on security tooling | `docs/handoffs/k8s-sec.md` |
 | networking | 77 | 2 | 31 drafts (parked in `docs/handoffs/networking-drafts/`) | 44 not started (exam tasks, SR Linux, Ansible) | `docs/handoffs/networking.md` |
 | linux-a | 62 | 1 | 21 | ~40 not started (sudo, mirror, mis-tiered) | `docs/handoffs/linux-a.md` |
 | original 11 K8s labs | 11 | 4+ | — | — | `content/packs/kubernetes` |
