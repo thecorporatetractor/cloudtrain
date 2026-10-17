@@ -15,10 +15,10 @@ Legend. **Type**: learn = guided first exposure, do = complete a task, fix = rep
 | Kubernetes | 5 | 89 | 103 | 3 | 54 | 136 | 2 | C 1, K 112, V 79 | 25 |
 | Linux administration | 11 | 159 | 119 | 3 | 1 | 21 | 256 | A 84, B 69, C 125 | 48 |
 | Containers with Docker | 11 | 91 | 44 | 2 | 0 | 0 | 135 | B 71, C 64 | 28 |
-| Infrastructure as code with Terraform | 5 | 54 | 45 | 2 | 23 | 0 | 76 | A 53, B 1, V 45 | 21 |
+| Infrastructure as code with Terraform | 5 | 54 | 45 | 2 | 48 | 0 | 51 | A 53, B 1, V 45 | 21 |
 | Configuration management and automation | 7 | 61 | 36 | 1 | 0 | 0 | 97 | A 39, B 7, C 45, N 6 | 26 |
 | Network administration | 4 | 45 | 32 | 1 | 2 | 0 | 75 | N 77 | 15 |
-| **Total** | 43 | 499 | 379 | 13 | 80 | 157 | 641 | A 176, B 148, C 235, K 112, V 124, N 83 | 161 |
+| **Total** | 43 | 499 | 379 | 13 | 105 | 157 | 616 | A 176, B 148, C 235, K 112, V 124, N 83 | 161 |
 
 Cross-domain exams: Platform engineer practical capstone. Exam tasks are counted under the domain of each task. Learning labs by type: learn 47, do 356, fix 83, hack 13. New skills proposed: 291.
 

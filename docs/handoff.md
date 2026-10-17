@@ -61,13 +61,15 @@ items of the old list; what is left of them:
 | networking | 77 | 2 | 31 drafts (parked in `docs/handoffs/networking-drafts/`) | 44 not started (exam tasks, SR Linux, Ansible) | `docs/handoffs/networking.md` |
 | linux-a | 62 | 1 | 21 | ~40 not started (sudo, mirror, mis-tiered) | `docs/handoffs/linux-a.md` |
 | original 11 K8s labs | 11 | 4+ | — | — | `content/packs/kubernetes` |
+| iac (wave 2) | 99 | 48 (23 foundations labs + 25 sim-iac-associate tasks; exam runs 100 % / 11.7 %) | 0 | 31 learning labs, 18 sim-iac-advanced tasks, 2 capstone tasks not started | `docs/handoffs/iac.md` |
 
 Most "blocked on add-ons" labs should unblock with `kubeadm:1.37-full` (metrics-server,
 Traefik ingress + Gateway API, MetalLB, local-path, Falco, gVisor, kube-bench) once it
 is boot-tested and the labs switch to it.
 
-Not started at all (wave 2): Linux tier B/C labs, containers (Docker), IaC
-(Terraform), automation (Ansible), and the exam task pools of those domains.
+Wave 2: IaC has started (see the iac row; image `terraform-ws:1.15`, Terraform/OpenTofu
+swappable per tenant). Not started at all: Linux tier B/C labs, containers (Docker),
+automation (Ansible), and the exam task pools of those domains.
 
 ## Resume order
 

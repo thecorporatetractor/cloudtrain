@@ -1,0 +1,146 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xia-debug-log-file
+  title: Capture a trace log of a failing plan
+  domain: iac
+  frameworks: [tf-associate:maintain]
+  difficulty: easy
+  estimatedMinutes: 5
+  tags: [exam, terraform, troubleshooting, TF_LOG]
+  version: 1
+spec:
+  description: |
+    **Directory:** `~/exam/debug` (workstation)
+
+    `terraform plan` of the stack in `~/exam/debug` fails. Support needs a
+    trace-level log of that failing plan:
+
+    1. Reproduce the failing plan with **trace** logging written to the file
+       **`~/exam/debug/plan-trace.log`** (set by environment variables, not by
+       redirecting the console).
+    2. Write the URL **path** of the request that failed (for example
+       `/a/b/c`, without scheme, host or port) as the only line of
+       `~/exam/debug/answer.txt`.
+
+    Do not fix the stack.
+  objectives:
+    - Use TF_LOG and TF_LOG_PATH to capture a trace log
+  params:
+    port:
+      type: int
+      min: 18000
+      max: 18999
+    api:
+      type: choice
+      values: [v2/turbines/status, v3/feeders/health, v1/substations/ping]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+  setup:
+    - on: workstation
+      run: |
+        set -eu
+        d=/home/learner/exam/debug
+        install -d -o learner -g learner /home/learner/exam "$d"
+        [ -e "$d/.ct-seeded" ] && exit 0
+        cat > "$d/main.tf" <<'HCL'
+        terraform {
+          required_providers {
+            http = { source = "hashicorp/http", version = "~> 3.6.0" }
+          }
+        }
+
+        data "http" "gateway" {
+          url = "http://127.0.0.1:{{port}}/telemetry/{{api}}"
+        }
+
+        output "gateway_status" {
+          value = data.http.gateway.status_code
+        }
+        HCL
+        chown learner:learner "$d/main.tf"
+        runuser -u learner -- sh -c 'cd /home/learner/exam/debug && iac init -input=false -no-color >/dev/null'
+        touch "$d/.ct-seeded"
+  checks:
+    - id: trace-log
+      description: plan-trace.log is a trace-level log of the failing plan
+      type: shell
+      on: workstation
+      skills: [iac.operations.troubleshooting]
+      weight: 2
+      command: |
+        f=/home/learner/exam/debug/plan-trace.log
+        [ -s "$f" ] || { echo missing; exit 0; }
+        grep -q '\[TRACE\]' "$f" && grep -q '/telemetry/{{api}}' "$f" && echo ok || echo "not a trace of the plan"
+      expect: {match: exact, value: ok}
+    - id: log-not-console
+      description: The log was written by Terraform itself (TF_LOG_PATH), not a console redirect
+      type: shell
+      on: workstation
+      skills: [iac.operations.troubleshooting]
+      command: |
+        f=/home/learner/exam/debug/plan-trace.log
+        [ -s "$f" ] || { echo missing; exit 0; }
+        grep -q '^Error: \|^│ Error: ' "$f" && echo console || echo log
+      expect: {match: exact, value: log}
+    - id: answer
+      description: answer.txt holds the failing request path
+      type: shell
+      on: workstation
+      skills: [iac.operations.troubleshooting]
+      weight: 2
+      command: head -n1 /home/learner/exam/debug/answer.txt 2>/dev/null | tr -d ' \r' || echo missing
+      expect: {match: exact, value: "/telemetry/{{api}}"}
+  misconceptions:
+    - id: debug-level
+      description: Logs at DEBUG instead of TRACE.
+      feedback: Support asked for trace level; TF_LOG=TRACE.
+      expectFail: [trace-log]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          cd ~/exam/debug
+          TF_LOG=DEBUG TF_LOG_PATH=$HOME/exam/debug/plan-trace.log iac plan -input=false -no-color || true
+          echo /telemetry/{{api}} > answer.txt
+    - id: redirect-console
+      description: Redirects the console output into the file instead of using TF_LOG_PATH.
+      feedback: Redirecting mixes the user-facing error into the file; TF_LOG_PATH writes only the log.
+      expectFail: [log-not-console]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          cd ~/exam/debug
+          TF_LOG=TRACE iac plan -input=false -no-color > plan-trace.log 2>&1 || true
+          echo /telemetry/{{api}} > answer.txt
+    - id: full-url
+      description: Records the whole URL instead of its path.
+      feedback: The answer is the path only, without scheme, host and port.
+      expectFail: [answer]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          cd ~/exam/debug
+          TF_LOG=TRACE TF_LOG_PATH=$HOME/exam/debug/plan-trace.log iac plan -input=false -no-color || true
+          echo http://127.0.0.1:{{port}}/telemetry/{{api}} > answer.txt
+  solution:
+    explanation: TF_LOG=TRACE sets the level and TF_LOG_PATH sends the log to a file; the failed GET of the http data source shows the path.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          cd ~/exam/debug
+          TF_LOG=TRACE TF_LOG_PATH=$HOME/exam/debug/plan-trace.log iac plan -input=false -no-color || true
+          grep -o 'http://127.0.0.1:[0-9]*/[^" ]*' plan-trace.log | head -1 | sed 's|http://[^/]*||' > answer.txt
+          cat answer.txt

@@ -1,0 +1,128 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xia-sensitive-redaction
+  title: Keep a password out of plan and output text
+  domain: iac
+  frameworks: [tf-associate:secrets]
+  difficulty: easy
+  estimatedMinutes: 5
+  tags: [exam, terraform, sensitive, secrets]
+  version: 1
+spec:
+  description: |
+    **Directory:** `~/exam/broker` (workstation)
+
+    The broker stack prints the telemetry broker password in plan output and in
+    `terraform output`. Mark the input **`broker_password`** and the output
+    **`broker_dsn`** derived from it as sensitive, so that neither the plan text
+    nor `terraform output` shows the password, and apply. The output must still
+    hold the full connection string.
+  objectives:
+    - Mark variables and outputs sensitive
+  params:
+    password:
+      type: choice
+      values: [Fj8-tide-41, Qm2-gale-77, Rk5-surf-09]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+  setup:
+    - on: workstation
+      run: |
+        set -eu
+        d=/home/learner/exam/broker
+        install -d -o learner -g learner /home/learner/exam "$d"
+        [ -e "$d/.ct-seeded" ] && exit 0
+        cat > "$d/main.tf" <<'HCL'
+        variable "broker_password" {
+          type = string
+        }
+
+        resource "local_file" "client_conf" {
+          filename = "/home/learner/exam/broker/out/client.conf"
+          content  = "user=telemetry\npassword=${var.broker_password}\n"
+        }
+
+        output "broker_dsn" {
+          value = "amqp://telemetry:${var.broker_password}@broker.saltmarsh.example:5672/grid"
+        }
+        HCL
+        printf 'broker_password = "{{password}}"\n' > "$d/terraform.tfvars"
+        chown -R learner:learner "$d"; touch "$d/.ct-seeded"
+  checks:
+    - id: plan-redacted
+      description: A plan with a new password succeeds and does not print it
+      type: shell
+      on: workstation
+      skills: [iac.quality.secrets]
+      weight: 2
+      timeoutSec: 90
+      command: |
+        out=$(ct-iac run /home/learner/exam/broker iac plan -input=false -lock=false -no-color -var broker_password=probe-Zx91 2>&1) || { echo "plan failed"; exit 0; }
+        echo "$out" | grep -q 'probe-Zx91' && echo leaked || echo redacted
+      expect: {match: exact, value: redacted}
+    - id: output-redacted
+      description: terraform output does not show the password
+      type: shell
+      on: workstation
+      skills: [iac.quality.secrets]
+      timeoutSec: 60
+      command: |
+        out=$(ct-iac run /home/learner/exam/broker iac output -no-color 2>&1)
+        echo "$out" | grep -q 'broker_dsn' || { echo "no output"; exit 0; }
+        echo "$out" | grep -q '{{password}}' && echo leaked || echo redacted
+      expect: {match: exact, value: redacted}
+    - id: dsn-intact
+      description: broker_dsn is sensitive in state and still holds the full connection string
+      type: shell
+      on: workstation
+      skills: [iac.quality.secrets]
+      weight: 1.5
+      timeoutSec: 60
+      command: |
+        ct-iac state /home/learner/exam/broker | jq -r '.values.outputs.broker_dsn | "\(.sensitive) \(.value)"' 2>/dev/null
+      expect: {match: exact, value: "true amqp://telemetry:{{password}}@broker.saltmarsh.example:5672/grid"}
+  misconceptions:
+    - id: output-only
+      description: Marks only the output sensitive, so the plan still prints the password in the file content.
+      feedback: Values derived from a non-sensitive variable appear in plans. Mark the variable sensitive too.
+      expectFail: [plan-redacted]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          cd ~/exam/broker
+          sed -i 's|/grid"|/grid"\n  sensitive = true|' main.tf
+          iac init -input=false -no-color && iac apply -auto-approve -input=false -no-color
+    - id: nonsensitive-output
+      description: Wraps the output in nonsensitive() to silence the error after marking the variable.
+      feedback: nonsensitive() prints the password again. Mark the output sensitive instead.
+      expectFail: [output-redacted, dsn-intact]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          cd ~/exam/broker
+          sed -i 's|  type = string|  type      = string\n  sensitive = true|' main.tf
+          sed -i 's|  value = "amqp://telemetry:${var.broker_password}@broker.saltmarsh.example:5672/grid"|  value = nonsensitive("amqp://telemetry:${var.broker_password}@broker.saltmarsh.example:5672/grid")|' main.tf
+          iac init -input=false -no-color && iac apply -auto-approve -input=false -no-color
+  solution:
+    explanation: "`sensitive = true` on the variable redacts every value derived from it in plan text; the output must then be marked sensitive too, and terraform output shows <sensitive>."
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          set -e
+          cd ~/exam/broker
+          sed -i 's|  type = string|  type      = string\n  sensitive = true|' main.tf
+          sed -i 's|/grid"|/grid"\n  sensitive = true|' main.tf
+          iac init -input=false -no-color
+          iac apply -auto-approve -input=false -no-color

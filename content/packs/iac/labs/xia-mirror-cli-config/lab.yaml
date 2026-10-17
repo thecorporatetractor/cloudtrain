@@ -1,0 +1,171 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xia-mirror-cli-config
+  title: Configure provider installation from a filesystem mirror only
+  domain: iac
+  frameworks: [tf-associate:fundamentals]
+  difficulty: medium
+  estimatedMinutes: 6
+  tags: [exam, terraform, cli-config, provider-installation, offline]
+  version: 1
+spec:
+  description: |
+    **Directory:** `~/exam/mirror` (workstation)
+
+    Build agents must never download providers from a registry. Write a CLI
+    configuration file **`~/exam/mirror/cli.tfrc`** that makes Terraform install
+    providers **only** from the filesystem mirror `/opt/cloudtrain/providers`,
+    with direct installation from registries disabled for every provider.
+
+    Then initialise the telemetry stack in `~/exam/mirror/telemetry` with that
+    file (`TF_CLI_CONFIG_FILE`). Do not change `~/.terraformrc`.
+  objectives:
+    - Configure provider_installation with a filesystem mirror and no direct installation
+  params:
+    probe:
+      type: choice
+      values: [grid, fleet, scada]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+  setup:
+    - on: workstation
+      run: |
+        set -eu
+        d=/home/learner/exam/mirror
+        install -d -o learner -g learner /home/learner/exam "$d" "$d/telemetry"
+        [ -e "$d/.ct-seeded" ] && exit 0
+        cat > "$d/telemetry/main.tf" <<'HCL'
+        terraform {
+          required_providers {
+            random = { source = "hashicorp/random", version = "~> 3.9.0" }
+            local  = { source = "hashicorp/local", version = "~> 2.9.0" }
+          }
+        }
+
+        resource "random_pet" "collector" {
+          prefix = "{{probe}}"
+        }
+
+        resource "local_file" "collector" {
+          filename = "/home/learner/exam/mirror/telemetry/collector.txt"
+          content  = random_pet.collector.id
+        }
+        HCL
+        chown -R learner:learner "$d"; touch "$d/.ct-seeded"
+  checks:
+    - id: mirror-installs
+      description: With cli.tfrc alone, init of the telemetry stack succeeds from the mirror
+      type: shell
+      on: workstation
+      skills: [iac.foundations.cli-config]
+      weight: 2
+      timeoutSec: 150
+      command: |
+        c=/home/learner/exam/mirror/cli.tfrc
+        [ -f "$c" ] || { echo missing; exit 0; }
+        t=$(mktemp -d /tmp/mirrorcheck.XXXXXX); cp /home/learner/exam/mirror/telemetry/*.tf "$t"/; chown -R learner:learner "$t"
+        ct-iac run "$t" env TF_CLI_CONFIG_FILE=$c iac init -backend=false -input=false -no-color >/dev/null 2>&1 && r=ok || r=failed
+        rm -rf "$t"; echo $r
+      expect: {match: exact, value: ok}
+    - id: direct-disabled
+      description: cli.tfrc names the mirror path and allows no direct installation
+      type: shell
+      on: workstation
+      skills: [iac.foundations.cli-config]
+      weight: 2
+      command: |
+        c=/home/learner/exam/mirror/cli.tfrc
+        [ -f "$c" ] || { echo missing; exit 0; }
+        s=$(sed 's/#.*//; s|//.*||' "$c")
+        echo "$s" | grep -q 'filesystem_mirror' && echo "$s" | grep -q '"/opt/cloudtrain/providers/\{0,1\}"' || { echo "no mirror"; exit 0; }
+        # a direct block is only acceptable when it excludes every provider
+        d=$(echo "$s" | awk '/direct[[:space:]]*\{/{f=1} f{print} f && /\}/{exit}')
+        if [ -z "$d" ]; then echo disabled
+        elif echo "$d" | grep -q 'exclude[[:space:]]*=[[:space:]]*\[[[:space:]]*"\*/\*/\*"\|exclude[[:space:]]*=[[:space:]]*\[[[:space:]]*"\*/\*"'; then echo disabled
+        else echo "direct allowed"; fi
+      expect: {match: exact, value: disabled}
+    - id: initialised
+      description: The telemetry stack is initialised with random and local in its lock file
+      type: shell
+      on: workstation
+      skills: [iac.foundations.cli-config]
+      command: |
+        f=/home/learner/exam/mirror/telemetry/.terraform.lock.hcl
+        grep -q 'hashicorp/random"' "$f" 2>/dev/null && grep -q 'hashicorp/local"' "$f" && echo ok || echo "not initialised"
+      expect: {match: exact, value: ok}
+    - id: default-config-untouched
+      description: ~/.terraformrc is unchanged
+      type: shell
+      on: workstation
+      skills: [iac.foundations.cli-config]
+      weight: 0.5
+      command: cmp -s /home/learner/.terraformrc /etc/cloudtrain/terraformrc && echo same || echo changed
+      expect: {match: exact, value: same}
+  misconceptions:
+    - id: direct-fallback
+      description: Adds the mirror but keeps a direct block, so missing providers still come from the registry.
+      feedback: An empty `direct {}` block allows registry downloads for anything the mirror lacks. Leave it out or exclude every provider.
+      expectFail: [direct-disabled]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          printf 'provider_installation {\n  filesystem_mirror {\n    path = "/opt/cloudtrain/providers"\n  }\n  direct {}\n}\n' > ~/exam/mirror/cli.tfrc
+          cd ~/exam/mirror/telemetry && iac init -input=false -no-color
+    - id: wrong-mirror-path
+      description: Points the mirror at a directory that does not exist.
+      feedback: The mirror is /opt/cloudtrain/providers; with direct disabled nothing else can supply the providers, so init fails.
+      expectFail: [mirror-installs, direct-disabled]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          printf 'provider_installation {\n  filesystem_mirror {\n    path = "/opt/provider-mirror"\n  }\n}\n' > ~/exam/mirror/cli.tfrc
+          cd ~/exam/mirror/telemetry && iac init -input=false -no-color
+  solution:
+    explanation: A provider_installation block with only a filesystem_mirror (no direct block) restricts installation to the mirror; TF_CLI_CONFIG_FILE selects the file for one command.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          set -e
+          cat > ~/exam/mirror/cli.tfrc <<'HCL'
+          provider_installation {
+            filesystem_mirror {
+              path    = "/opt/cloudtrain/providers"
+              include = ["*/*/*"]
+            }
+          }
+          HCL
+          cd ~/exam/mirror/telemetry
+          TF_CLI_CONFIG_FILE=$HOME/exam/mirror/cli.tfrc iac init -input=false -no-color
+    alternatives:
+      - id: direct-exclude
+        description: Keep a direct block that excludes every provider.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 120
+            run: |
+              set -e
+              cat > ~/exam/mirror/cli.tfrc <<'HCL'
+              provider_installation {
+                filesystem_mirror {
+                  path = "/opt/cloudtrain/providers"
+                }
+                direct {
+                  exclude = ["*/*/*"]
+                }
+              }
+              HCL
+              cd ~/exam/mirror/telemetry
+              TF_CLI_CONFIG_FILE=$HOME/exam/mirror/cli.tfrc iac init -input=false -no-color

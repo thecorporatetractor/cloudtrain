@@ -1,0 +1,168 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xia-module-input-contract
+  title: Give a module a typed, validated input contract
+  domain: iac
+  frameworks: [tf-associate:modules]
+  difficulty: medium
+  estimatedMinutes: 6
+  tags: [exam, terraform, modules, variables, validation]
+  version: 1
+spec:
+  description: |
+    **Directory:** `~/exam/alerts-module` (workstation)
+
+    Module `./modules/turbine-alerts` declares its inputs as bare
+    `variable "x" {}` blocks, so a wrong value only fails deep inside it. Give
+    the module a contract, without changing the root module:
+
+    | Input | Type | Rule |
+    |---|---|---|
+    | `farm` | string | none |
+    | `threshold` | number | from 5 to {{max}} (both allowed), validation error otherwise |
+
+    Each input needs a `description`. A non-numeric `threshold` (for example
+    `terraform plan -var threshold=high`) must fail at plan.
+  objectives:
+    - Type and validate module inputs
+  params:
+    max:
+      type: choice
+      values: ["35", "40", "45"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+  setup:
+    - on: workstation
+      run: |
+        set -eu
+        d=/home/learner/exam/alerts-module
+        install -d -o learner -g learner /home/learner/exam "$d" "$d/modules/turbine-alerts"
+        [ -e "$d/.ct-seeded" ] && exit 0
+        cat > "$d/main.tf" <<'HCL'
+        variable "threshold" {
+          default = 25
+        }
+
+        module "redmoor_alerts" {
+          source    = "./modules/turbine-alerts"
+          farm      = "redmoor"
+          threshold = var.threshold
+        }
+        HCL
+        cat > "$d/modules/turbine-alerts/main.tf" <<'HCL'
+        variable "farm" {}
+        variable "threshold" {}
+
+        resource "local_file" "rule" {
+          filename = "/home/learner/exam/alerts-module/out/${var.farm}.rule"
+          content  = "alert when gust_ms > ${var.threshold}\n"
+        }
+        HCL
+        chown -R learner:learner "$d"; touch "$d/.ct-seeded"
+  checks:
+    - id: type-enforced
+      description: threshold=high fails at plan; threshold=25 plans
+      type: shell
+      on: workstation
+      skills: [iac.modules.authoring]
+      weight: 2
+      timeoutSec: 150
+      command: |
+        # private copy: checks may run at the same time, and init rewrites .terraform
+        d=$(mktemp -d /tmp/contract.XXXXXX); cp -r /home/learner/exam/alerts-module/*.tf /home/learner/exam/alerts-module/modules "$d"/ 2>/dev/null; chown -R learner:learner "$d"
+        ct-iac run $d iac init -input=false -no-color >/dev/null 2>&1
+        ct-iac run $d iac plan -input=false -lock=false -no-color -var threshold=high >/dev/null 2>&1 && a=accepted || a=rejected
+        ct-iac run $d iac plan -input=false -lock=false -no-color -var threshold=25 >/dev/null 2>&1 && b=ok || b=error
+        rm -rf "$d"; echo "high=$a 25=$b"
+      expect: {match: exact, value: high=rejected 25=ok}
+    - id: range-validated
+      description: 4 and {{max}}.5 fail with a validation error, 5 and {{max}} plan
+      type: shell
+      on: workstation
+      skills: [iac.quality.conditions, iac.modules.authoring]
+      weight: 2
+      timeoutSec: 240
+      command: |
+        d=$(mktemp -d /tmp/contract.XXXXXX); cp -r /home/learner/exam/alerts-module/*.tf /home/learner/exam/alerts-module/modules "$d"/ 2>/dev/null; chown -R learner:learner "$d"; r=""
+        ct-iac run $d iac init -input=false -no-color >/dev/null 2>&1
+        for v in 4 5 {{max}} {{max}}.5; do
+          out=$(ct-iac run $d iac plan -input=false -lock=false -no-color -var threshold=$v 2>&1); rc=$?
+          if [ $rc -eq 0 ]; then r="$r $v=ok"; elif echo "$out" | grep -q 'Invalid value for variable'; then r="$r $v=invalid"; else r="$r $v=error"; fi
+        done
+        rm -rf "$d"; echo $r
+      expect: {match: exact, value: "4=invalid 5=ok {{max}}=ok {{max}}.5=invalid"}
+    - id: described-and-typed
+      description: Both module inputs have a type and a description
+      type: shell
+      on: workstation
+      skills: [iac.modules.authoring]
+      command: |
+        cat /home/learner/exam/alerts-module/modules/turbine-alerts/*.tf 2>/dev/null | awk '
+          /^[[:space:]]*variable[[:space:]]+"/ {v=$2; gsub(/"/,"",v); inv=1; depth=0}
+          inv { o=gsub(/\{/,"{"); c=gsub(/\}/,"}"); depth+=o-c
+                if ($0 ~ /^[[:space:]]*type[[:space:]]*=/) t[v]=1
+                if ($0 ~ /^[[:space:]]*description[[:space:]]*=/) dsc[v]=1
+                if (depth<=0) inv=0 }
+          END { print ((t["farm"] && dsc["farm"] && t["threshold"] && dsc["threshold"]) ? "ok" : "missing") }'
+      expect: {match: exact, value: ok}
+    - id: root-unchanged
+      description: The root module still passes var.threshold to the module unchanged
+      type: shell
+      on: workstation
+      skills: [iac.modules.authoring]
+      weight: 0.5
+      command: grep -c 'threshold = var.threshold' /home/learner/exam/alerts-module/main.tf 2>/dev/null || true
+      expect: {match: exact, value: "1"}
+  misconceptions:
+    - id: types-without-validation
+      description: Adds types and descriptions but no range rule.
+      feedback: A number type accepts 4 or 400. Add a validation block with both bounds.
+      expectFail: [range-validated]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          cd ~/exam/alerts-module/modules/turbine-alerts
+          python3 - <<'PY'
+          s = open("main.tf").read()
+          s = s.replace('variable "farm" {}', 'variable "farm" {\n  description = "Farm name"\n  type        = string\n}')
+          s = s.replace('variable "threshold" {}', 'variable "threshold" {\n  description = "Gust threshold in m/s"\n  type        = number\n}')
+          open("main.tf", "w").write(s)
+          PY
+    - id: validation-without-type
+      description: Validates the range but leaves threshold untyped.
+      feedback: Without `type = number` the contract is incomplete and the input is not described as a number.
+      expectFail: [described-and-typed]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          cd ~/exam/alerts-module/modules/turbine-alerts
+          python3 - <<'PY'
+          s = open("main.tf").read()
+          s = s.replace('variable "farm" {}', 'variable "farm" {\n  description = "Farm name"\n  type        = string\n}')
+          s = s.replace('variable "threshold" {}', 'variable "threshold" {\n  description = "Gust threshold in m/s"\n  validation {\n    condition     = var.threshold >= 5 && var.threshold <= {{max}}\n    error_message = "threshold must be from 5 to {{max}}."\n  }\n}')
+          open("main.tf", "w").write(s)
+          PY
+  solution:
+    explanation: "`type = number` converts or rejects input at the module boundary, and a validation block enforces the range with a clear message."
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          set -e
+          cd ~/exam/alerts-module/modules/turbine-alerts
+          python3 - <<'PY'
+          s = open("main.tf").read()
+          s = s.replace('variable "farm" {}', 'variable "farm" {\n  description = "Wind farm the rule is for"\n  type        = string\n}')
+          s = s.replace('variable "threshold" {}', 'variable "threshold" {\n  description = "Gust threshold in m/s"\n  type        = number\n  validation {\n    condition     = var.threshold >= 5 && var.threshold <= {{max}}\n    error_message = "threshold must be from 5 to {{max}} m/s."\n  }\n}')
+          open("main.tf", "w").write(s)
+          PY
+          cd ~/exam/alerts-module && iac init -input=false -no-color && iac validate -no-color

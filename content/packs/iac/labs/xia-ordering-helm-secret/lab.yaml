@@ -1,0 +1,157 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xia-ordering-helm-secret
+  title: Order a Helm release after the Secret it mounts
+  domain: iac
+  frameworks: [tf-associate:configuration]
+  difficulty: medium
+  estimatedMinutes: 6
+  tags: [exam, terraform, dependencies, helm]
+  version: 1
+spec:
+  description: |
+    **Directory:** `~/exam/collector-order` · **Cluster:** `sm-grid`
+
+    The collector stack (initialised, never applied) creates namespace
+    `telemetry-collector`, Secret `collector-credentials` and installs the
+    local chart `charts/collector` as release `collector`. The chart refuses
+    to install while its Secret is missing, and a clean apply fails because
+    nothing orders the three objects (token `xia-{{token}}`).
+
+    Make a **clean apply from empty state succeed every time**: the Secret after
+    the namespace, the release after the Secret. Then apply, so the release is
+    deployed.
+  objectives:
+    - Order resources with references or depends_on
+  params:
+    token:
+      type: choice
+      values: [7f3a91, 2b8e44, c41d7a]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+      - name: sm-grid
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: sm-grid
+  setup:
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xia-ordering-helm-secret/stack/main.tf, source: assets/stack/main.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xia-ordering-helm-secret/stack/charts/collector/Chart.yaml, source: assets/stack/charts/collector/Chart.yaml, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xia-ordering-helm-secret/stack/charts/collector/values.yaml, source: assets/stack/charts/collector/values.yaml, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xia-ordering-helm-secret/stack/charts/collector/templates/deployment.yaml, source: assets/stack/charts/collector/templates/deployment.yaml, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xia-ordering-helm-secret/seed.sh, source: assets/seed.sh, mode: "0755"}
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/exam
+    - on: workstation
+      as: learner
+      timeoutSec: 120
+      run: /var/tmp/ct-seed/xia-ordering-helm-secret/seed.sh xia-ordering-helm-secret collector-order init
+  teardown:
+    - on: sm-grid
+      run: kubectl delete namespace telemetry-collector --ignore-not-found --wait=false
+  checks:
+    - id: release-deployed
+      description: Release collector in telemetry-collector is deployed and its Pod is ready
+      type: shell
+      on: sm-grid
+      skills: [iac.language.dependencies]
+      weight: 1.5
+      timeoutSec: 30
+      command: |
+        s=$(helm -n telemetry-collector status collector -o json 2>/dev/null | jq -r '.info.status // "missing"')
+        r=$(kubectl -n telemetry-collector get deployment collector -o jsonpath='{.status.readyReplicas}' 2>/dev/null)
+        echo "release=${s:-missing} ready=${r:-0}"
+      expect: {match: exact, value: release=deployed ready=1}
+    - id: secret-after-namespace
+      description: The Secret depends on the namespace resource in the configuration
+      type: shell
+      on: workstation
+      skills: [iac.language.dependencies]
+      weight: 2
+      timeoutSec: 120
+      command: |
+        ct-iac planjson /home/learner/exam/collector-order | jq -r '
+          [.configuration.root_module.resources[]? | select(.type | test("^kubernetes_secret"))][0] as $s
+          | ([$s.expressions | .. | objects | .references? // empty | .[]] + ($s.depends_on // []))
+          | map(select(test("^kubernetes_namespace"))) | length > 0' 2>/dev/null
+      expect: {match: exact, value: "true"}
+    - id: release-after-secret
+      description: The release depends on the Secret resource in the configuration
+      type: shell
+      on: workstation
+      skills: [iac.language.dependencies]
+      weight: 2
+      timeoutSec: 120
+      command: |
+        ct-iac planjson /home/learner/exam/collector-order | jq -r '
+          [.configuration.root_module.resources[]? | select(.type == "helm_release")][0] as $r
+          | ([$r.expressions | .. | objects | .references? // empty | .[]] + ($r.depends_on // []))
+          | map(select(test("^kubernetes_secret"))) | length > 0' 2>/dev/null
+      expect: {match: exact, value: "true"}
+    - id: converged
+      description: A new plan of ~/exam/collector-order reports no changes
+      type: shell
+      on: workstation
+      skills: [iac.language.dependencies]
+      timeoutSec: 120
+      command: ct-iac plan /home/learner/exam/collector-order
+      expect: {match: exact, value: no-changes}
+  misconceptions:
+    - id: apply-until-it-works
+      description: Repeats apply until the race happens to succeed.
+      feedback: The second apply finds the Secret left by the first; a fresh environment still races. Make the release depend on the Secret.
+      expectFail: [secret-after-namespace, release-after-secret]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 450
+        run: |
+          cd ~/exam/collector-order
+          iac apply -auto-approve -input=false -no-color || iac apply -auto-approve -input=false -no-color || iac apply -auto-approve -input=false -no-color
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 450
+        run: |
+          set -e
+          cd ~/exam/collector-order
+          python3 - <<'PY'
+          p = "main.tf"; s = open(p).read()
+          s = s.replace('    name      = "collector-credentials"\n    namespace = "telemetry-collector"',
+                        '    name      = "collector-credentials"\n    namespace = kubernetes_namespace_v1.telemetry.metadata[0].name')
+          s = s.replace('  namespace = "telemetry-collector"\n  wait',
+                        '  namespace = kubernetes_secret_v1.credentials.metadata[0].namespace\n  wait')
+          s = s.replace('      value = "collector-credentials"', '      value = kubernetes_secret_v1.credentials.metadata[0].name')
+          open(p, "w").write(s)
+          PY
+          iac apply -auto-approve -input=false -no-color
+    alternatives:
+      - id: depends-on
+        description: Keep the literals and add depends_on to the Secret and the release.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 450
+            run: |
+              set -e
+              cd ~/exam/collector-order
+              python3 - <<'PY'
+              p = "main.tf"; s = open(p).read()
+              s = s.replace('  data = {\n', '  depends_on = [kubernetes_namespace_v1.telemetry]\n\n  data = {\n', 1)
+              s = s.replace('  wait      = true\n', '  wait      = true\n\n  depends_on = [kubernetes_secret_v1.credentials]\n', 1)
+              open(p, "w").write(s)
+              PY
+              iac apply -auto-approve -input=false -no-color

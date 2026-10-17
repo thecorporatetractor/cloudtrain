@@ -1,0 +1,144 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xia-variable-validation
+  title: Add a validated region variable
+  domain: iac
+  frameworks: [tf-associate:configuration]
+  difficulty: easy
+  estimatedMinutes: 6
+  tags: [exam, terraform, variables, validation]
+  version: 1
+spec:
+  description: |
+    **Directory:** `~/exam/region` (workstation)
+
+    The stack in `~/exam/region` writes two farm label files with the region
+    `{{default}}` typed into each of them. Add a variable **`farm_region`**:
+
+    - type string, default `"{{default}}"`;
+    - only `north-sea`, `irish-sea` and `celtic-sea` are allowed; any other
+      value must fail at plan with a validation error;
+    - every resource takes its region from `var.farm_region` (no region literal
+      left in a resource).
+
+    Apply the stack with the default; a following plan reports no changes.
+  objectives:
+    - Declare a variable with a default and a validation rule
+  params:
+    default:
+      type: choice
+      values: [north-sea, irish-sea]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+  setup:
+    - on: workstation
+      run: |
+        set -eu
+        d=/home/learner/exam/region
+        install -d -o learner -g learner /home/learner/exam "$d"
+        [ -e "$d/.ct-seeded" ] && exit 0
+        cat > "$d/main.tf" <<'HCL'
+        resource "local_file" "gullhaven" {
+          filename = "/home/learner/exam/region/out/gullhaven.labels"
+          content  = "farm=gullhaven\nregion={{default}}\n"
+        }
+
+        resource "local_file" "skerrow" {
+          filename = "/home/learner/exam/region/out/skerrow.labels"
+          content  = "farm=skerrow\nregion={{default}}\n"
+        }
+        HCL
+        chown learner:learner "$d/main.tf"; touch "$d/.ct-seeded"
+  checks:
+    - id: validation
+      description: An unknown region fails with a validation error; the three allowed regions plan
+      type: shell
+      on: workstation
+      skills: [iac.language.variables]
+      weight: 2
+      timeoutSec: 200
+      command: |
+        d=/home/learner/exam/region; r=""
+        for v in baltic north-sea irish-sea celtic-sea; do
+          out=$(ct-iac run $d iac plan -input=false -lock=false -no-color -var farm_region=$v 2>&1); rc=$?
+          if [ $rc -eq 0 ]; then r="$r $v=ok"; elif echo "$out" | grep -q 'Invalid value for variable'; then r="$r $v=invalid"; else r="$r $v=error"; fi
+        done
+        echo $r
+      expect: {match: exact, value: baltic=invalid north-sea=ok irish-sea=ok celtic-sea=ok}
+    - id: used-everywhere
+      description: With farm_region=celtic-sea, both files would carry celtic-sea
+      type: shell
+      on: workstation
+      skills: [iac.language.variables]
+      weight: 2
+      timeoutSec: 90
+      command: |
+        ct-iac planjson /home/learner/exam/region -var farm_region=celtic-sea \
+          | jq -r '[.planned_values.root_module.resources[]? | select(.type == "local_file") | .values.content | test("region=celtic-sea")] | (length == 2 and all)' 2>/dev/null
+      expect: {match: exact, value: "true"}
+    - id: applied-default
+      description: The files carry the default region and a plan reports no changes
+      type: shell
+      on: workstation
+      skills: [iac.language.variables]
+      timeoutSec: 90
+      command: |
+        g=$(grep -h '^region=' /home/learner/exam/region/out/gullhaven.labels /home/learner/exam/region/out/skerrow.labels 2>/dev/null | sort -u | tr '\n' ' ')
+        echo "$g$(ct-iac plan /home/learner/exam/region)"
+      expect: {match: exact, value: "region={{default}} no-changes"}
+  misconceptions:
+    - id: no-validation
+      description: Declares the variable with a default but no validation.
+      feedback: Without a validation block any string is accepted. Add a contains() rule.
+      expectFail: [validation]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          cd ~/exam/region
+          printf 'variable "farm_region" {\n  type    = string\n  default = "{{default}}"\n}\n' > variables.tf
+          sed -i 's/region={{default}}/region=${var.farm_region}/' main.tf
+          iac init -input=false -no-color && iac apply -auto-approve -input=false -no-color
+    - id: one-resource-only
+      description: Uses the variable in one resource and leaves the literal in the other.
+      feedback: Every resource must take the region from the variable.
+      expectFail: [used-everywhere]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          cd ~/exam/region
+          printf 'variable "farm_region" {\n  type    = string\n  default = "{{default}}"\n  validation {\n    condition     = contains(["north-sea", "irish-sea", "celtic-sea"], var.farm_region)\n    error_message = "farm_region must be north-sea, irish-sea or celtic-sea."\n  }\n}\n' > variables.tf
+          sed -i '0,/region={{default}}/s//region=${var.farm_region}/' main.tf
+          iac init -input=false -no-color && iac apply -auto-approve -input=false -no-color
+  solution:
+    explanation: A validation block with contains() rejects other regions at plan; both resources interpolate var.farm_region.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          set -e
+          cd ~/exam/region
+          cat > variables.tf <<'HCL'
+          variable "farm_region" {
+            description = "Sea region of the farms"
+            type        = string
+            default     = "{{default}}"
+            validation {
+              condition     = contains(["north-sea", "irish-sea", "celtic-sea"], var.farm_region)
+              error_message = "farm_region must be north-sea, irish-sea or celtic-sea."
+            }
+          }
+          HCL
+          sed -i 's/region={{default}}/region=${var.farm_region}/' main.tf
+          iac init -input=false -no-color
+          iac apply -auto-approve -input=false -no-color

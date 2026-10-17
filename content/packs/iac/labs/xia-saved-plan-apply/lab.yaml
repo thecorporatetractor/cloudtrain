@@ -1,0 +1,134 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xia-saved-plan-apply
+  title: Apply exactly a saved plan
+  domain: iac
+  frameworks: [tf-associate:core-workflow]
+  difficulty: easy
+  estimatedMinutes: 6
+  tags: [exam, terraform, saved-plan, destroy]
+  version: 1
+spec:
+  description: |
+    **Directories:** `~/exam/survey` and `~/exam/survey-scratch` (workstation)
+
+    1. Save a plan of the survey stack in `~/exam/survey` to the file
+       **`~/exam/survey/survey.tfplan`**, then apply **exactly that saved plan**.
+       Keep the plan file.
+    2. Destroy everything the scratch stack in `~/exam/survey-scratch` manages.
+       The survey stack must stay intact.
+  objectives:
+    - Save a plan and apply exactly that plan
+    - Destroy one stack without touching another
+  params:
+    batch:
+      type: int
+      min: 40
+      max: 99
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+  setup:
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/exam
+    - on: workstation
+      as: learner
+      timeoutSec: 180
+      run: |
+        set -eu
+        d=$HOME/exam/survey; s=$HOME/exam/survey-scratch
+        [ -e "$d/.ct-seeded" ] && exit 0
+        mkdir -p "$d" "$s" "$HOME/exam/survey-out"
+        cat > "$d/main.tf" <<'HCL'
+        resource "local_file" "survey" {
+          filename = "/home/learner/exam/survey-out/batch-{{batch}}.txt"
+          content  = "survey batch {{batch}} planned at ${plantimestamp()}\n"
+        }
+        HCL
+        cat > "$s/main.tf" <<'HCL'
+        resource "local_file" "scratch" {
+          filename = "/home/learner/exam/survey-out/scratch-{{batch}}.txt"
+          content  = "scratch\n"
+        }
+        HCL
+        (cd "$d" && iac init -input=false -no-color >/dev/null)
+        (cd "$s" && iac init -input=false -no-color >/dev/null && iac apply -auto-approve -input=false -no-color >/dev/null)
+        touch "$d/.ct-seeded"
+  checks:
+    - id: plan-saved
+      description: survey.tfplan exists and plans the survey file
+      type: shell
+      on: workstation
+      skills: [iac.foundations.workflow]
+      timeoutSec: 60
+      command: |
+        ct-iac run /home/learner/exam/survey iac show -json survey.tfplan 2>/dev/null \
+          | jq -r '[.resource_changes[]? | select(.type == "local_file")] | length' 2>/dev/null | grep -qx 1 && echo ok || echo missing
+      expect: {match: exact, value: ok}
+    - id: saved-plan-applied
+      description: The survey file was written by applying that saved plan
+      type: shell
+      on: workstation
+      skills: [iac.foundations.workflow]
+      weight: 2
+      timeoutSec: 60
+      command: |
+        p=$(ct-iac run /home/learner/exam/survey iac show -json survey.tfplan 2>/dev/null | jq -r '[.resource_changes[]? | select(.type == "local_file") | .change.after.content][0] // empty' 2>/dev/null)
+        f=$(cat /home/learner/exam/survey-out/batch-{{batch}}.txt 2>/dev/null)
+        [ -n "$p" ] && [ "$(printf '%s' "$p")" = "$f" ] && echo same || echo different
+      expect: {match: exact, value: same}
+    - id: scratch-destroyed
+      description: The scratch stack's state is empty and its file is gone; the survey file remains
+      type: shell
+      on: workstation
+      skills: [iac.foundations.workflow]
+      weight: 1.5
+      timeoutSec: 60
+      command: |
+        n=$(ct-iac state /home/learner/exam/survey-scratch | jq -r '[.values.root_module.resources[]?] | length' 2>/dev/null)
+        [ -e /home/learner/exam/survey-out/scratch-{{batch}}.txt ] && s=present || s=gone
+        [ -e /home/learner/exam/survey-out/batch-{{batch}}.txt ] && v=present || v=gone
+        echo "scratch-resources=${n:-?} scratch=$s survey=$v"
+      expect: {match: exact, value: scratch-resources=0 scratch=gone survey=present}
+  misconceptions:
+    - id: fresh-apply
+      description: Saves the plan but then runs a plain apply, which computes a new plan.
+      feedback: "`terraform apply` without a plan file plans again; only `terraform apply survey.tfplan` applies what was reviewed."
+      expectFail: [saved-plan-applied]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          cd ~/exam/survey && iac plan -input=false -no-color -out=survey.tfplan && sleep 2
+          iac apply -auto-approve -input=false -no-color
+          cd ~/exam/survey-scratch && iac destroy -auto-approve -input=false -no-color
+    - id: destroyed-wrong-stack
+      description: Destroys the survey stack instead of the scratch stack.
+      feedback: destroy acts on the stack of the current directory; run it in ~/exam/survey-scratch.
+      expectFail: [scratch-destroyed]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          cd ~/exam/survey && iac plan -input=false -no-color -out=survey.tfplan && iac apply -input=false -no-color survey.tfplan
+          iac destroy -auto-approve -input=false -no-color
+  solution:
+    explanation: plan -out writes the reviewed plan; apply with the file applies exactly it (plantimestamp shows which plan it was); destroy in the scratch directory only touches that state.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          set -e
+          cd ~/exam/survey
+          iac plan -input=false -no-color -out=survey.tfplan
+          iac apply -input=false -no-color survey.tfplan
+          cd ~/exam/survey-scratch
+          iac destroy -auto-approve -input=false -no-color
