@@ -9,6 +9,7 @@ import { SkillTags } from '@/components/domain';
 import { OutcomeBadge, When, minutesLabel, outcomeMeta } from '@/components/platform';
 import { Card, Drawer, EmptyState, ErrorState, Pager, Select, Skeleton, Stat, TableSkeleton, TableWrap } from '@/components/ui';
 import { formatDuration } from '@/lib/utils';
+import { usePageCursor } from '@/lib/paging';
 import { historyRoute } from '@/router';
 
 const PAGE = 15;
@@ -25,8 +26,10 @@ export function History() {
 function HistoryScreen() {
   const search = historyRoute.useSearch();
   const navigate = useNavigate({ from: historyRoute.fullPath });
-  const page = search.page ?? 1;
-  const q = useMyAttempts({ lab: search.lab, outcome: search.outcome, cursor: String((page - 1) * PAGE), limit: PAGE });
+  const pages = usePageCursor(JSON.stringify([search.lab, search.outcome]), search.page ?? 1);
+  const page = pages.page;
+  const q = useMyAttempts({ lab: search.lab, outcome: search.outcome, cursor: pages.cursor, limit: PAGE });
+  pages.useRemember(q.data?.nextCursor);
   const all = useMyAttempts({ limit: 200 });
   const catalog = useCatalog();
   const set = (patch: Partial<typeof search>) => void navigate({ search: (prev) => ({ ...prev, ...patch }), replace: true });
@@ -77,7 +80,7 @@ function HistoryScreen() {
             ))}
           </Select>
         </div>
-        {q.data && <Pager offset={(page - 1) * PAGE} pageSize={PAGE} total={q.data.total} loading={q.isFetching} onChange={(o) => set({ page: o / PAGE + 1 || undefined })} />}
+        {q.data && <Pager offset={(page - 1) * PAGE} pageSize={PAGE} total={q.data.total} hasNext={!!q.data.nextCursor} loading={q.isFetching} onChange={(o) => set({ page: o / PAGE + 1 || undefined })} />}
       </div>
 
       {q.isPending ? (
