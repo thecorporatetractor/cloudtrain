@@ -1,0 +1,165 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: partition-new-data-disk
+  title: Partition and format a new data disk
+  domain: linux
+  frameworks: [rhcsa-aligned:local-storage, lfcs:storage, lpic1:devices-filesystems]
+  difficulty: easy
+  estimatedMinutes: 12
+  tags: [storage, partitions, gpt, xfs, ext4]
+  version: 1
+spec:
+  description: |
+    The timetable office's log host **`tr-tt-01`** (`ssh tr-tt-01`; you have `sudo`)
+    got a new, empty **4 GiB disk, `/dev/vdc`**. Prepare it:
+
+    1. Give it a **GPT** partition table.
+    2. Partition 1: **1 GiB**, formatted **XFS** with the filesystem label
+       **`TT-LOGS`**.
+    3. Partition 2: **2 GiB**, formatted **ext4** with the filesystem label
+       **`TT-ARCHIVE`**.
+
+    Leave the remaining space free for later. Do not mount anything yet (a later lab
+    mounts the archive), and do not touch the system disk `/dev/vda` or the small cloud-init disk `/dev/vdb`.
+  objectives:
+    - Create a GPT label and partitions of given sizes
+    - Create XFS and ext4 filesystems with labels
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-tt-01
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["4Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-tt-01
+      run: |
+        set -eu
+        [ "$(readlink -f /dev/disk/by-id/virtio-ct-data1)" = /dev/vdc ]
+        test -b /dev/vdc
+        test "$(lsblk -bdno SIZE /dev/vdc)" -ge $((4 * 1024 * 1024 * 1024 - 1048576))
+        wipefs -a /dev/vdc >/dev/null
+  checks:
+    - id: gpt
+      description: /dev/vdc has a GPT partition table
+      type: shell
+      on: tr-tt-01
+      skills: [linux.storage.partitions]
+      weight: 1
+      command: blkid -p -s PTTYPE -o value /dev/vdc 2>/dev/null || echo none
+      expect: {match: exact, value: gpt}
+    - id: sizes
+      description: Partition 1 is about 1 GiB and partition 2 about 2 GiB, with free space left
+      type: shell
+      on: tr-tt-01
+      skills: [linux.storage.partitions]
+      weight: 1.5
+      command: |
+        m() { [ -b "$1" ] && echo $(( $(blockdev --getsize64 "$1") / 1048576 )) || echo 0; }
+        a=$(m /dev/vdc1); b=$(m /dev/vdc2); n=$(lsblk -nro TYPE /dev/vdc | grep -c part)
+        [ $a -ge 1000 ] && [ $a -le 1048 ] && [ $b -ge 2020 ] && [ $b -le 2100 ] && [ $n = 2 ] && echo sized || echo "p1=${a}MiB p2=${b}MiB parts=$n"
+      expect: {match: exact, value: sized}
+    - id: logs-fs
+      description: Partition 1 holds XFS labelled TT-LOGS
+      type: shell
+      on: tr-tt-01
+      skills: [linux.storage.filesystems]
+      weight: 1
+      command: echo "$(blkid -s TYPE -o value /dev/vdc1 2>/dev/null) $(blkid -s LABEL -o value /dev/vdc1 2>/dev/null)"
+      expect: {match: exact, value: "xfs TT-LOGS"}
+    - id: archive-fs
+      description: Partition 2 holds ext4 labelled TT-ARCHIVE
+      type: shell
+      on: tr-tt-01
+      skills: [linux.storage.filesystems]
+      weight: 1
+      command: echo "$(blkid -s TYPE -o value /dev/vdc2 2>/dev/null) $(blkid -s LABEL -o value /dev/vdc2 2>/dev/null)"
+      expect: {match: exact, value: "ext4 TT-ARCHIVE"}
+    - id: not-mounted
+      description: Nothing on /dev/vdc is mounted
+      type: shell
+      on: tr-tt-01
+      skills: [linux.storage.filesystems]
+      weight: 0.5
+      command: lsblk -nro MOUNTPOINTS /dev/vdc | grep -q . && echo mounted || echo unmounted
+      expect: {match: exact, value: unmounted}
+  hints:
+    - title: Look before you cut
+      command: lsblk -o NAME,SIZE,TYPE,FSTYPE,LABEL,MOUNTPOINTS
+      body: "vda is the system disk and the 1 MiB vdb is the cloud-init seed; vdc (4 GiB) is the new one."
+      cost: 0
+    - title: Scriptable partitioning
+      body: "parted -s /dev/vdc mklabel gpt mkpart logs 1MiB 1025MiB mkpart archive 1025MiB 3073MiB does it in one line; fdisk and gdisk work interactively (g creates a GPT label in fdisk)."
+      cost: 2
+    - title: Labels belong to the filesystem
+      body: "mkfs.xfs -L and mkfs.ext4 -L set the filesystem label that blkid and LABEL= in fstab use (not the GPT partition name)."
+      cost: 1
+  misconceptions:
+    - id: mbr-label
+      description: Creates an MBR (msdos) partition table.
+      feedback: "The depot standard is GPT: parted mklabel gpt (or g in fdisk)."
+      expectFail: [gpt]
+      mutation:
+        on: tr-tt-01
+        as: learner
+        run: |
+          set -e
+          sudo parted -s /dev/vdc mklabel msdos mkpart primary 1MiB 1025MiB mkpart primary 1025MiB 3073MiB
+          sudo udevadm settle
+          sudo mkfs.xfs -q -L TT-LOGS /dev/vdc1; sudo mkfs.ext4 -q -L TT-ARCHIVE /dev/vdc2
+    - id: swapped-fs
+      description: Puts the filesystem types on the wrong partitions.
+      feedback: "Partition 1 (1 GiB) is the XFS log area, partition 2 (2 GiB) the ext4 archive."
+      expectFail: [logs-fs, archive-fs]
+      mutation:
+        on: tr-tt-01
+        as: learner
+        run: |
+          set -e
+          sudo parted -s /dev/vdc mklabel gpt mkpart logs 1MiB 1025MiB mkpart archive 1025MiB 3073MiB
+          sudo udevadm settle
+          sudo mkfs.ext4 -q -L TT-LOGS /dev/vdc1; sudo mkfs.xfs -q -L TT-ARCHIVE /dev/vdc2
+    - id: whole-disk
+      description: Uses all the space for the second partition.
+      feedback: "The archive partition is 2 GiB; leave the rest of the disk free."
+      expectFail: [sizes]
+      mutation:
+        on: tr-tt-01
+        as: learner
+        run: |
+          set -e
+          sudo parted -s /dev/vdc mklabel gpt mkpart logs 1MiB 1025MiB mkpart archive 1025MiB 100%
+          sudo udevadm settle
+          sudo mkfs.xfs -q -L TT-LOGS /dev/vdc1; sudo mkfs.ext4 -q -L TT-ARCHIVE /dev/vdc2
+  solution:
+    explanation: |
+      parted writes the GPT label and both partitions (MiB boundaries keep them aligned),
+      then mkfs.xfs -L and mkfs.ext4 -L create the labelled filesystems.
+    steps:
+      - on: tr-tt-01
+        as: learner
+        run: |
+          set -e
+          sudo parted -s /dev/vdc mklabel gpt mkpart logs xfs 1MiB 1025MiB mkpart archive ext4 1025MiB 3073MiB
+          sudo udevadm settle
+          sudo mkfs.xfs -q -L TT-LOGS /dev/vdc1
+          sudo mkfs.ext4 -q -L TT-ARCHIVE /dev/vdc2
+          lsblk -f /dev/vdc
+    alternatives:
+      - id: sfdisk-script
+        description: Partition with an sfdisk script that gives sizes instead of boundaries.
+        steps:
+          - on: tr-tt-01
+            as: learner
+            run: |
+              set -e
+              printf 'label: gpt\n,1GiB,L\n,2GiB,L\n' | sudo sfdisk -q /dev/vdc
+              sudo udevadm settle
+              sudo mkfs.xfs -q -L TT-LOGS /dev/vdc1
+              sudo mkfs.ext4 -q -L TT-ARCHIVE /dev/vdc2

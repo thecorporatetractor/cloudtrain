@@ -1,0 +1,166 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: fix-failing-service-unit
+  title: Bring a service back that fails at start
+  domain: linux
+  frameworks: [lfcs:essential-commands, linuxplus:troubleshooting]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [systemd, troubleshooting, journalctl]
+  version: 1
+spec:
+  description: |
+    After last night's maintenance the departure-board web service on
+    **`tr-board-01`** (`ssh tr-board-01`; you have `sudo`) no longer starts:
+    `systemctl start departure-board` fails and the station screens show nothing.
+
+    Find out why from systemd and the journal, and fix the unit so that
+    **`departure-board.service`**:
+
+    - runs **now** and **starts at boot**;
+    - still runs as the unprivileged service account **`board`** (never as root);
+    - serves the board on **`http://localhost:{{port}}/`** as before.
+
+    The content in `/srv/board` and the account are fine; something in the unit
+    configuration is not.
+  objectives:
+    - Read why a unit failed from systemctl status and journalctl
+    - Fix unit settings and reload systemd
+  params:
+    port:
+      type: int
+      min: 8081
+      max: 8099
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-board-01
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536}
+        access: [ssh, console]
+  setup:
+    - on: tr-board-01
+      run: |
+        set -eu
+        id board >/dev/null 2>&1 || useradd -r -M -d /srv/board -s /usr/sbin/nologin board
+        mkdir -p /srv/board
+        echo "<h1>Tallowmere Central departures</h1><p>platform board {{port}}</p>" > /srv/board/index.html
+        chown -R board:board /srv/board
+        cat > /etc/systemd/system/departure-board.service <<'UNIT'
+        [Unit]
+        Description=Tallowmere departure board
+        After=network.target
+
+        [Service]
+        User=boards
+        ExecStart=/usr/bin/python -m http.server {{port}} --bind 127.0.0.1 --directory /srv/board
+        Restart=on-failure
+        RestartSec=3
+
+        [Install]
+        WantedBy=multi-user.target
+        UNIT
+        systemctl daemon-reload
+        systemctl enable departure-board.service
+        systemctl start departure-board.service || true
+  checks:
+    - id: active
+      description: departure-board.service is running
+      type: shell
+      on: tr-board-01
+      skills: [linux.systemd.unit-editing]
+      weight: 1
+      command: systemctl is-active departure-board.service || true
+      expect: {match: exact, value: active}
+    - id: serves
+      description: The board is served on port {{port}}
+      type: shell
+      on: tr-board-01
+      skills: [linux.systemd.journal]
+      weight: 1.5
+      timeoutSec: 30
+      command: curl -s -m 5 http://localhost:{{port}}/ | grep -o 'platform board {{port}}' || echo unreachable
+      expect: {match: exact, value: "platform board {{port}}"}
+    - id: as-board
+      description: It runs as the service account board
+      type: shell
+      on: tr-board-01
+      skills: [linux.systemd.unit-editing]
+      weight: 1.5
+      command: |
+        p=$(systemctl show -P MainPID departure-board.service)
+        [ "${p:-0}" != 0 ] && ps -o user= -p $p || echo "not running"
+      expect: {match: exact, value: board}
+    - id: enabled
+      description: It starts at boot
+      type: shell
+      on: tr-board-01
+      skills: [linux.systemd.units]
+      weight: 0.5
+      command: systemctl is-enabled departure-board.service 2>/dev/null || true
+      expect: {match: exact, value: enabled}
+  hints:
+    - title: Ask systemd first
+      command: systemctl status departure-board.service
+      body: "The status shows the result (exit-code, a missing user...) and the last log lines. Read the full log with journalctl -u departure-board -b."
+      cost: 0
+    - title: There may be more than one fault
+      body: "Fix one problem, daemon-reload, restart and read the journal again: the next error only shows once the first is gone."
+      cost: 1
+    - title: Check the names
+      command: getent passwd board; ls -l /usr/bin/python*
+      body: "Ubuntu 24.04 ships python3 but no python command; and the account in the unit must exist."
+      cost: 2
+  misconceptions:
+    - id: run-as-root
+      description: Removes User= so the service runs as root.
+      feedback: "Running the web server as root hides the bad account name instead of fixing it. Set User=board."
+      expectFail: [as-board]
+      mutation:
+        on: tr-board-01
+        as: learner
+        run: |
+          sudo sed -i '/^User=/d; s#/usr/bin/python #/usr/bin/python3 #' /etc/systemd/system/departure-board.service
+          sudo systemctl daemon-reload; sudo systemctl restart departure-board.service
+    - id: no-reload
+      description: Fixes the file but restarts without systemctl daemon-reload.
+      feedback: "systemd keeps the old unit in memory (status warns 'changed on disk'); run systemctl daemon-reload, then restart."
+      expectFail: [active, serves]
+      mutation:
+        on: tr-board-01
+        as: learner
+        run: |
+          sudo sed -i 's/^User=boards/User=board/; s#/usr/bin/python #/usr/bin/python3 #' /etc/systemd/system/departure-board.service
+          sudo systemctl restart departure-board.service || true
+  solution:
+    explanation: |
+      The journal shows two faults: the unit names a user boards that does not exist,
+      and ExecStart calls /usr/bin/python, which Ubuntu 24.04 does not have. Correct
+      both, reload systemd and restart.
+    steps:
+      - on: tr-board-01
+        as: learner
+        run: |
+          sudo sed -i 's/^User=boards/User=board/; s#/usr/bin/python #/usr/bin/python3 #' /etc/systemd/system/departure-board.service
+          sudo systemctl daemon-reload
+          sudo systemctl restart departure-board.service
+          sleep 2
+          systemctl status --no-pager departure-board.service
+    alternatives:
+      - id: dropin-fix
+        description: Leave the unit file and correct the two settings in a drop-in.
+        steps:
+          - on: tr-board-01
+            as: learner
+            run: |
+              sudo mkdir -p /etc/systemd/system/departure-board.service.d
+              printf '[Service]\nUser=board\nExecStart=\nExecStart=/usr/bin/python3 -m http.server {{port}} --bind 127.0.0.1 --directory /srv/board\n' | sudo tee /etc/systemd/system/departure-board.service.d/fix.conf >/dev/null
+              sudo systemctl daemon-reload
+              sudo systemctl restart departure-board.service
+              sleep 2

@@ -1,0 +1,167 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: dropin-override-memory
+  title: Override a vendor unit with a drop-in
+  domain: linux
+  frameworks: [lfcs:essential-commands]
+  difficulty: easy
+  estimatedMinutes: 10
+  tags: [systemd, drop-in, limits]
+  version: 1
+spec:
+  description: |
+    The ticket API on **`tr-tkt-01`** (`ssh tr-tkt-01`; you have `sudo`) comes from the
+    vendor package with its unit file **`/usr/lib/systemd/system/ticket-api.service`**.
+    During the morning peak it runs out of file descriptors, and it should report
+    which region it serves.
+
+    Change the service so that:
+
+    - its open-file limit (**`LimitNOFILE`**) is **{{nofile}}**;
+    - it runs with the environment variable **`TICKET_REGION={{region}}`**;
+    - the **vendor unit file stays untouched** (the next package update would
+      overwrite your edits there): put your changes in a **drop-in** under
+      `/etc/systemd/system`;
+    - the **running** service uses the new settings.
+  objectives:
+    - Extend a vendor unit with a drop-in file
+    - Reload systemd and restart a service to apply unit changes
+  params:
+    nofile:
+      type: choice
+      values: ["16384", "32768", "65536"]
+    region:
+      type: choice
+      values: [north, coast, valley, harbour]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-tkt-01
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536}
+        access: [ssh, console]
+  setup:
+    - on: tr-tkt-01
+      run: |
+        set -eu
+        printf '%s\n' '#!/bin/sh' 'echo "ticket-api up region=${TICKET_REGION:-unset}"' 'while :; do sleep 10; done' > /usr/local/bin/ticket-api
+        chmod 0755 /usr/local/bin/ticket-api
+        printf '%s\n' '# Vendor unit: do not edit, use a drop-in.' '[Unit]' 'Description=Tallowmere ticket API' 'After=network.target' '' '[Service]' 'ExecStart=/usr/local/bin/ticket-api' 'LimitNOFILE=1024' 'Restart=on-failure' '' '[Install]' 'WantedBy=multi-user.target' > /usr/lib/systemd/system/ticket-api.service
+        install -d -m 0700 /var/lib/cloudtrain
+        sha256sum /usr/lib/systemd/system/ticket-api.service > /var/lib/cloudtrain/ticket-api.sha
+        rm -rf /etc/systemd/system/ticket-api.service /etc/systemd/system/ticket-api.service.d
+        systemctl daemon-reload
+        systemctl enable --now ticket-api.service
+  checks:
+    - id: vendor-untouched
+      description: The vendor unit file is unchanged and no full copy shadows it
+      type: shell
+      on: tr-tkt-01
+      skills: [linux.systemd.unit-editing]
+      weight: 1
+      command: sha256sum -c --quiet /var/lib/cloudtrain/ticket-api.sha >/dev/null 2>&1 && [ ! -e /etc/systemd/system/ticket-api.service ] && echo untouched || echo changed
+      expect: {match: exact, value: untouched}
+    - id: dropin
+      description: A drop-in under /etc/systemd/system/ticket-api.service.d sets both values
+      type: shell
+      on: tr-tkt-01
+      skills: [linux.systemd.unit-editing]
+      weight: 1.5
+      command: |
+        d=$(systemctl show -P DropInPaths ticket-api.service)
+        echo "$d" | grep -q '/etc/systemd/system/ticket-api.service.d/' && cat /etc/systemd/system/ticket-api.service.d/*.conf | grep -q 'LimitNOFILE={{nofile}}' && cat /etc/systemd/system/ticket-api.service.d/*.conf | grep -q 'TICKET_REGION={{region}}' && echo dropin || echo "dropins=$d"
+      expect: {match: exact, value: dropin}
+    - id: running-limit
+      description: The running process has the new open-file limit
+      type: shell
+      on: tr-tkt-01
+      skills: [linux.systemd.unit-editing]
+      weight: 1.5
+      command: |
+        p=$(systemctl show -P MainPID ticket-api.service)
+        [ "${p:-0}" != 0 ] && awk '/^Max open files/ {print $4}' /proc/$p/limits || echo "not running"
+      expect: {match: exact, value: "{{nofile}}"}
+    - id: running-env
+      description: The running process has TICKET_REGION={{region}}
+      type: shell
+      on: tr-tkt-01
+      skills: [linux.systemd.unit-editing]
+      weight: 1
+      command: |
+        p=$(systemctl show -P MainPID ticket-api.service)
+        [ "${p:-0}" != 0 ] && tr '\0' '\n' < /proc/$p/environ | grep '^TICKET_REGION=' || echo "not set"
+      expect: {match: exact, value: "TICKET_REGION={{region}}"}
+  hints:
+    - title: Where drop-ins live
+      body: "Any file /etc/systemd/system/ticket-api.service.d/<name>.conf is merged over the vendor unit. It needs the section header too, e.g. [Service]."
+      cost: 0
+    - title: The editor way
+      command: sudo systemctl edit ticket-api.service
+      body: "systemctl edit opens a drop-in (override.conf) in an editor and reloads systemd when you save. Do not use --full: that copies the whole unit to /etc."
+      cost: 1
+    - title: Saved is not applied
+      body: "systemd reads unit files on daemon-reload, and a process gets limits and environment when it starts. Restart the service afterwards, then check /proc/<pid>/limits."
+      cost: 2
+  misconceptions:
+    - id: edited-vendor
+      description: Edits the vendor unit file directly.
+      feedback: "Package updates replace files in /usr/lib/systemd/system. Undo the edit and put the change in a drop-in under /etc/systemd/system/ticket-api.service.d/."
+      expectFail: [vendor-untouched, dropin]
+      mutation:
+        on: tr-tkt-01
+        as: learner
+        run: |
+          sudo sed -i 's/^LimitNOFILE=.*/LimitNOFILE={{nofile}}\nEnvironment=TICKET_REGION={{region}}/' /usr/lib/systemd/system/ticket-api.service
+          sudo systemctl daemon-reload; sudo systemctl restart ticket-api.service
+    - id: not-restarted
+      description: Writes the drop-in but never reloads and restarts the service.
+      feedback: "The running process keeps its old limits until systemd reloads the unit and the service restarts: systemctl daemon-reload && systemctl restart ticket-api."
+      expectFail: [running-limit, running-env]
+      mutation:
+        on: tr-tkt-01
+        as: learner
+        run: |
+          sudo mkdir -p /etc/systemd/system/ticket-api.service.d
+          printf '[Service]\nLimitNOFILE={{nofile}}\nEnvironment=TICKET_REGION={{region}}\n' | sudo tee /etc/systemd/system/ticket-api.service.d/peak.conf >/dev/null
+    - id: full-copy
+      description: Copies the whole unit to /etc/systemd/system and edits the copy.
+      feedback: "A full copy in /etc hides every future vendor change. A drop-in only overrides the two settings you need."
+      expectFail: [vendor-untouched, dropin]
+      mutation:
+        on: tr-tkt-01
+        as: learner
+        run: |
+          sed 's/^LimitNOFILE=.*/LimitNOFILE={{nofile}}\nEnvironment=TICKET_REGION={{region}}/' /usr/lib/systemd/system/ticket-api.service | sudo tee /etc/systemd/system/ticket-api.service >/dev/null
+          sudo systemctl daemon-reload; sudo systemctl restart ticket-api.service
+  solution:
+    explanation: |
+      A drop-in with a [Service] section overrides just LimitNOFILE and adds the
+      Environment= line; daemon-reload makes systemd read it and the restart gives the
+      new process the limit and the variable.
+    steps:
+      - on: tr-tkt-01
+        as: learner
+        run: |
+          sudo mkdir -p /etc/systemd/system/ticket-api.service.d
+          printf '[Service]\nLimitNOFILE={{nofile}}\nEnvironment=TICKET_REGION={{region}}\n' | sudo tee /etc/systemd/system/ticket-api.service.d/peak.conf >/dev/null
+          sudo systemctl daemon-reload
+          sudo systemctl restart ticket-api.service
+          systemctl cat ticket-api.service
+    alternatives:
+      - id: two-dropins
+        description: One drop-in per setting; systemd merges every .conf in the directory.
+        steps:
+          - on: tr-tkt-01
+            as: learner
+            run: |
+              sudo mkdir -p /etc/systemd/system/ticket-api.service.d
+              printf '[Service]\nLimitNOFILE={{nofile}}:{{nofile}}\n' | sudo tee /etc/systemd/system/ticket-api.service.d/10-limits.conf >/dev/null
+              printf '[Service]\nEnvironment="TICKET_REGION={{region}}"\n' | sudo tee /etc/systemd/system/ticket-api.service.d/20-region.conf >/dev/null
+              sudo systemctl daemon-reload
+              sudo systemctl restart ticket-api.service

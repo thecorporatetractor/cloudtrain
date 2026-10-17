@@ -1,0 +1,160 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: selinux-port-boolean
+  title: Run the ticket API on a non-standard port under SELinux
+  domain: linux
+  frameworks: [rhcsa-aligned:security]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [selinux, httpd, ports, booleans]
+  version: 1
+spec:
+  description: |
+    The ticket API front end on **`tr-tkt-02`** (`ssh tr-tkt-02`; you have `sudo`) is
+    an Apache virtual host that must listen on **TCP port 82** and forwards requests
+    to the fares database host over the network. The configuration in
+    `/etc/httpd/conf.d/ticket-api.conf` is ready, but `httpd` refuses to start.
+
+    With SELinux **enforcing**, make it work **persistently** (the settings must
+    survive a reboot):
+
+    - `httpd` runs, starts at boot and answers on **`http://localhost:82/`**;
+    - SELinux lets `httpd` **connect to the database over the network** (the
+      database driver uses the PostgreSQL port), using the boolean meant for that.
+
+    Do not change the port and do not disable SELinux.
+  objectives:
+    - Label a port for a confined service with semanage port
+    - Find and set an SELinux boolean persistently
+  params:
+    token:
+      type: int
+      min: 1000
+      max: 9999
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-tkt-02
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536}
+        access: [ssh, console]
+  setup:
+    - on: tr-tkt-02
+      timeoutSec: 240
+      run: |
+        set -eu
+        rpm -q httpd >/dev/null 2>&1 || dnf -y -q install httpd
+        mkdir -p /var/www/ticket-api
+        echo "<p>ticket api {{token}}</p>" > /var/www/ticket-api/index.html
+        restorecon -R /var/www/ticket-api
+        printf 'Listen 82\n<VirtualHost *:82>\n    DocumentRoot /var/www/ticket-api\n</VirtualHost>\n' > /etc/httpd/conf.d/ticket-api.conf
+        setsebool -P httpd_can_network_connect_db off
+        setsebool -P httpd_can_network_connect off
+        semanage port -d -t http_port_t -p tcp 82 2>/dev/null || true
+        setenforce 1
+        systemctl disable httpd >/dev/null 2>&1 || true
+        systemctl restart httpd >/dev/null 2>&1 || true
+  checks:
+    - id: enforcing
+      description: SELinux is enforcing
+      type: shell
+      on: tr-tkt-02
+      skills: [linux.security.selinux-contexts]
+      weight: 0.5
+      command: echo "$(getenforce) $(sed -n 's/^SELINUX=//p' /etc/selinux/config)"
+      expect: {match: exact, value: "Enforcing enforcing"}
+    - id: port-label
+      description: TCP 82 is an http_port_t port in the persistent policy
+      type: shell
+      on: tr-tkt-02
+      skills: [linux.security.selinux-contexts]
+      weight: 1.5
+      command: semanage port -l -C 2>/dev/null | awk '$1 == "http_port_t" && $2 == "tcp"' | grep -qw 82 && echo labelled || echo missing
+      expect: {match: exact, value: labelled}
+    - id: serving
+      description: httpd runs, starts at boot and answers on port 82
+      type: shell
+      on: tr-tkt-02
+      skills: [linux.security.selinux-contexts]
+      weight: 1.5
+      timeoutSec: 30
+      command: echo "$(systemctl is-enabled httpd 2>/dev/null) $(curl -s -m 5 http://localhost:82/ | grep -o 'ticket api {{token}}' || echo down)"
+      expect: {match: exact, value: "enabled ticket api {{token}}"}
+    - id: db-boolean
+      description: httpd may connect to databases over the network, persistently
+      type: shell
+      on: tr-tkt-02
+      skills: [linux.security.selinux-contexts]
+      weight: 1.5
+      command: |
+        now=$(getsebool httpd_can_network_connect_db | awk '{print $3}')
+        perm=$(semanage boolean -l 2>/dev/null | awk '$1 == "httpd_can_network_connect_db" {gsub(/[(),]/, " "); print $3}')
+        echo "now=$now persistent=$perm"
+      expect: {match: exact, value: "now=on persistent=on"}
+    - id: least-privilege
+      description: The broad network boolean stays off
+      type: shell
+      on: tr-tkt-02
+      skills: [linux.security.selinux-contexts]
+      weight: 0.5
+      command: getsebool httpd_can_network_connect | awk '{print $3}'
+      expect: {match: exact, value: "off"}
+  hints:
+    - title: Why does httpd not start?
+      command: sudo journalctl -u httpd -n 20; sudo ausearch -m avc -ts recent
+      body: "'Permission denied: could not bind to address [::]:82' plus an AVC for name_bind means SELinux does not allow httpd on that port."
+      cost: 0
+    - title: Ports have types too
+      command: sudo semanage port -l | grep http_port_t
+      body: "semanage port -a -t http_port_t -p tcp 82 adds the port to the type httpd may bind."
+      cost: 1
+    - title: Finding the boolean
+      command: sudo semanage boolean -l | grep httpd_can_network
+      body: "There is one boolean for all outgoing connections and a narrower one for database ports. Pick the narrow one and set it with setsebool -P."
+      cost: 2
+  misconceptions:
+    - id: boolean-not-persistent
+      description: Sets the boolean without -P.
+      feedback: "setsebool without -P lasts until the next boot; use setsebool -P."
+      expectFail: [db-boolean]
+      mutation:
+        on: tr-tkt-02
+        as: learner
+        timeoutSec: 120
+        run: |
+          sudo semanage port -a -t http_port_t -p tcp 82
+          sudo setsebool httpd_can_network_connect_db on
+          sudo systemctl enable --now httpd
+    - id: broad-boolean
+      description: Turns on httpd_can_network_connect, which allows every outgoing connection.
+      feedback: "httpd_can_network_connect opens all ports; httpd_can_network_connect_db allows just the database ports the task needs."
+      expectFail: [db-boolean, least-privilege]
+      mutation:
+        on: tr-tkt-02
+        as: learner
+        timeoutSec: 120
+        run: |
+          sudo semanage port -a -t http_port_t -p tcp 82
+          sudo setsebool -P httpd_can_network_connect on
+          sudo systemctl enable --now httpd
+  solution:
+    explanation: |
+      semanage port adds TCP 82 to http_port_t so httpd may bind it; setsebool -P
+      httpd_can_network_connect_db on lets it reach database ports and writes the value
+      into the policy; enable --now starts httpd now and at boot.
+    steps:
+      - on: tr-tkt-02
+        as: learner
+        timeoutSec: 180
+        run: |
+          set -e
+          sudo semanage port -a -t http_port_t -p tcp 82
+          sudo setsebool -P httpd_can_network_connect_db on
+          sudo systemctl enable --now httpd
+          curl -s http://localhost:82/
