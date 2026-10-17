@@ -1,0 +1,103 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xlf-static-route-persist
+  title: Add a persistent route to the depot network
+  domain: linux
+  frameworks: [lfcs:networking]
+  difficulty: easy
+  estimatedMinutes: 6
+  tags: [exam, routing, netplan]
+  version: 1
+spec:
+  description: |
+    **Host:** `tr-ops-01` (`ssh tr-ops-01`, then `sudo -i`)
+
+    The depot network **`10.{{a}}.{{b}}.0/24`** is reached through the depot router,
+    which is this host's **current default gateway** (see `ip route`). Add a route for
+    that prefix through that next hop on the interface with the default route,
+    **active now and after every reboot**. Do not change the default route or the
+    host's address.
+  objectives:
+    - Add a static route at runtime and in the persistent network configuration
+  params:
+    a:
+      type: int
+      min: 100
+      max: 199
+    b:
+      type: int
+      min: 1
+      max: 250
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-ops-01
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["2Gi", "1Gi", "2Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-ops-01
+      run: |
+        set -eu
+        install -d -m 0700 /var/lib/cloudtrain
+        ip -4 route show default | awk '{print $3; exit}' > /var/lib/cloudtrain/xlf-route.gw
+        ip -4 route show default | awk '{print $5; exit}' > /var/lib/cloudtrain/xlf-route.dev
+        test -s /var/lib/cloudtrain/xlf-route.gw
+  checks:
+    - id: runtime
+      description: The kernel routes the depot prefix through the gateway
+      type: shell
+      on: tr-ops-01
+      skills: [linux.net.persistent-config]
+      weight: 1
+      command: ip -4 route show 10.{{a}}.{{b}}.0/24 | grep -q "via $(cat /var/lib/cloudtrain/xlf-route.gw) " && echo routed || echo missing
+      expect: {match: exact, value: routed}
+    - id: persistent
+      description: The persistent network configuration has the route
+      type: shell
+      on: tr-ops-01
+      skills: [linux.net.persistent-config]
+      weight: 2
+      command: |
+        gw=$(cat /var/lib/cloudtrain/xlf-route.gw)
+        netplan get 2>/dev/null | tr -d '"' | grep -A2 -E 'to: *10\.{{a}}\.{{b}}\.0/24' | grep -q "via: *$gw" && echo netplan && exit 0
+        grep -rsA3 'Destination=10.{{a}}.{{b}}.0/24' /etc/systemd/network | grep -q "Gateway=$gw" && echo netplan && exit 0
+        echo missing
+      expect: {match: exact, value: netplan}
+    - id: default-kept
+      description: The default route is unchanged
+      type: shell
+      on: tr-ops-01
+      skills: [linux.net.persistent-config]
+      weight: 0.5
+      command: ip -4 route show default | grep -q "via $(cat /var/lib/cloudtrain/xlf-route.gw) dev $(cat /var/lib/cloudtrain/xlf-route.dev)" && echo kept || echo changed
+      expect: {match: exact, value: kept}
+  misconceptions:
+    - id: runtime-only
+      description: Adds the route with ip route only.
+      feedback: "ip route add is lost at the next boot; add the route to a netplan file (routes: - to: ... via: ...) and netplan apply."
+      expectFail: [persistent]
+      mutation:
+        on: tr-ops-01
+        as: learner
+        run: sudo ip route add 10.{{a}}.{{b}}.0/24 via $(ip -4 route show default | awk '{print $3; exit}')
+  solution:
+    explanation: A netplan drop-in for the same interface adds the route (netplan merges it with the cloud-init file); netplan apply makes it live.
+    steps:
+      - on: tr-ops-01
+        as: learner
+        timeoutSec: 90
+        run: |
+          set -e
+          dev=$(ip -4 route show default | awk '{print $5; exit}'); gw=$(ip -4 route show default | awk '{print $3; exit}')
+          key=$(sudo netplan get ethernets | awk -F: '/^[^ ]/ {print $1}' | head -1)
+          printf 'network:\n  version: 2\n  ethernets:\n    %s:\n      routes:\n        - to: 10.{{a}}.{{b}}.0/24\n          via: %s\n' "$key" "$gw" | sudo tee /etc/netplan/60-depot-route.yaml >/dev/null
+          sudo chmod 600 /etc/netplan/60-depot-route.yaml
+          sudo netplan apply
+          ip route show 10.{{a}}.{{b}}.0/24 | grep -q via

@@ -1,0 +1,105 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xlf-sshd-restrict-group
+  title: Restrict SSH logins to one group with keys only
+  domain: linux
+  frameworks: [lfcs:networking]
+  difficulty: medium
+  estimatedMinutes: 8
+  tags: [exam, sshd, hardening]
+  version: 1
+spec:
+  description: |
+    **Host:** `tr-ops-01` (`ssh tr-ops-01`, then `sudo -i`)
+
+    Harden the SSH server of `tr-ops-01`:
+
+    - only members of the group **`{{grp}}`** may log in over SSH (`learner` and
+      `root` already are members; `tr-visitor` is not);
+    - logins work **with keys only**: no password or keyboard-interactive
+      authentication;
+    - the running SSH server uses the new settings, and **your current session must
+      keep working** (keep a second session open while you test).
+  objectives:
+    - Restrict sshd to a group and to public-key authentication
+  params:
+    grp:
+      type: choice
+      values: [sshops, depotssh, remoteops]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-ops-01
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["2Gi", "1Gi", "2Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-ops-01
+      run: |
+        set -eu
+        getent group {{grp}} >/dev/null || groupadd {{grp}}
+        usermod -aG {{grp}} learner; usermod -aG {{grp}} root
+        id tr-visitor >/dev/null 2>&1 || useradd -m -s /bin/bash tr-visitor
+        echo 'tr-visitor:Visitor-Pass-2026' | chpasswd
+        printf 'PasswordAuthentication yes\nKbdInteractiveAuthentication yes\n' > /etc/ssh/sshd_config.d/40-tr-legacy.conf
+        systemctl try-reload-or-restart ssh
+  checks:
+    - id: allow-groups
+      description: sshd only admits members of {{grp}}
+      type: shell
+      on: tr-ops-01
+      skills: [linux.services.sshd]
+      weight: 1.5
+      command: |
+        a=$(sshd -T 2>/dev/null | awk '$1 == "allowgroups" {$1 = ""; print}' | tr -s ' ' | sed 's/^ //')
+        u=$(sshd -T 2>/dev/null | awk '$1 == "allowusers"' | grep -c .)
+        [ "$a" = {{grp}} ] && [ "$u" = 0 ] && echo group-only || echo "allowgroups=$a allowusers=$u"
+      expect: {match: exact, value: group-only}
+    - id: keys-only
+      description: Password and keyboard-interactive authentication are off
+      type: shell
+      on: tr-ops-01
+      skills: [linux.services.sshd]
+      weight: 1.5
+      command: sshd -T 2>/dev/null | awk '$1 == "passwordauthentication" || $1 == "kbdinteractiveauthentication" || $1 == "pubkeyauthentication" {print $1 "=" $2}' | sort | paste -sd,
+      expect: {match: exact, value: "kbdinteractiveauthentication=no,passwordauthentication=no,pubkeyauthentication=yes"}
+    - id: live
+      description: The running server refuses the visitor's password and the configuration is valid
+      type: shell
+      on: tr-ops-01
+      skills: [linux.services.sshd]
+      weight: 1
+      timeoutSec: 30
+      command: |
+        sshd -t 2>/dev/null || { echo invalid; exit 0; }
+        m=$(timeout 10 ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o PreferredAuthentications=none tr-visitor@localhost true 2>&1 | grep -o 'Permission denied ([a-z,-]*)')
+        [ "$m" = 'Permission denied (publickey)' ] && [ "$(systemctl is-active ssh)" = active ] && echo enforced || echo "running=$m"
+      expect: {match: exact, value: enforced}
+  misconceptions:
+    - id: shadowed
+      description: Appends the settings at the end of sshd_config, where an earlier drop-in already set them.
+      feedback: "sshd uses the first value it reads; the drop-ins in sshd_config.d are included at the top. Change or remove 40-tr-legacy.conf, or add an earlier-sorting drop-in."
+      expectFail: [keys-only]
+      mutation:
+        on: tr-ops-01
+        as: learner
+        run: |
+          printf 'AllowGroups {{grp}}\nPasswordAuthentication no\nKbdInteractiveAuthentication no\n' | sudo tee -a /etc/ssh/sshd_config >/dev/null
+          sudo systemctl try-reload-or-restart ssh
+  solution:
+    explanation: A drop-in that sorts before the legacy one sets AllowGroups and turns password and keyboard-interactive authentication off; sshd -t validates and a reload applies it without dropping sessions.
+    steps:
+      - on: tr-ops-01
+        as: learner
+        run: |
+          set -e
+          sudo rm -f /etc/ssh/sshd_config.d/40-tr-legacy.conf
+          printf 'AllowGroups {{grp}}\nPasswordAuthentication no\nKbdInteractiveAuthentication no\nPubkeyAuthentication yes\n' | sudo tee /etc/ssh/sshd_config.d/10-tr-hardening.conf >/dev/null
+          sudo sshd -t
+          sudo systemctl try-reload-or-restart ssh

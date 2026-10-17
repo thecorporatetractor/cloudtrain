@@ -1,0 +1,98 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xlf-free-disk-space
+  title: Free space on a full filesystem without data loss
+  domain: linux
+  frameworks: [lfcs:essential-commands]
+  difficulty: medium
+  estimatedMinutes: 8
+  tags: [exam, disk-space, du]
+  version: 1
+spec:
+  description: |
+    **Host:** `tr-ops-01` (`ssh tr-ops-01`, then `sudo -i`)
+
+    The ticket spool **`/srv/spool`** is almost full and ticket sales are failing.
+    Bring its usage **below {{pct}} %** (as `df` reports it). Everything below
+    **`/srv/spool/sales`** is the protected sales ledger and must stay exactly as it
+    is; the filesystem must stay mounted at `/srv/spool` with its current size.
+  objectives:
+    - Find what fills a filesystem and free space safely
+  params:
+    pct:
+      type: choice
+      values: ["50", "60", "70"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-ops-01
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["2Gi", "1Gi", "2Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-ops-01
+      timeoutSec: 180
+      run: |
+        set -eu
+        pvs /dev/vde >/dev/null 2>&1 || pvcreate -q /dev/vde
+        vgs vgops >/dev/null 2>&1 || vgcreate -q vgops /dev/vde
+        if ! lvs vgops/lvspool >/dev/null 2>&1; then
+          lvcreate -q -y -n lvspool -L 128M vgops; mkfs.ext4 -q -m 0 /dev/vgops/lvspool
+          mkdir -p /srv/spool
+          echo '/dev/mapper/vgops-lvspool /srv/spool ext4 defaults,nofail 0 2' >> /etc/fstab
+          systemctl daemon-reload; mount /srv/spool
+          mkdir -p /srv/spool/sales /srv/spool/gate-logs /srv/spool/tmp/render
+          for i in $(seq 1 6); do head -c 4M /dev/urandom > /srv/spool/sales/ledger-$i.dat; done
+          for i in $(seq 1 7); do head -c 10M /dev/urandom > /srv/spool/gate-logs/gate.log.$i; done
+          echo "current" > /srv/spool/gate-logs/gate.log
+          for i in $(seq 1 3); do head -c 7M /dev/urandom > /srv/spool/tmp/render/job-$i.tmp; done
+          install -d -m 0700 /var/lib/cloudtrain
+          (cd /srv/spool/sales && sha256sum *) > /var/lib/cloudtrain/xlf-spool.sha
+          lvs --noheadings --units m --nosuffix -o lv_size vgops/lvspool | tr -d ' ' > /var/lib/cloudtrain/xlf-spool.size
+        fi
+  checks:
+    - id: below
+      description: /srv/spool is below {{pct}} % used
+      type: shell
+      on: tr-ops-01
+      skills: [linux.storage.space-analysis]
+      weight: 2
+      command: u=$(df --output=pcent /srv/spool 2>/dev/null | tail -1 | tr -dc 0-9); [ -n "$u" ] && [ "$u" -lt {{pct}} ] && echo below || echo "used=$u"
+      expect: {match: exact, value: below}
+    - id: ledger
+      description: The sales ledger is untouched
+      type: shell
+      on: tr-ops-01
+      skills: [linux.storage.space-analysis]
+      weight: 1.5
+      command: cd /srv/spool/sales 2>/dev/null && sha256sum -c --quiet /var/lib/cloudtrain/xlf-spool.sha >/dev/null 2>&1 && [ $(ls | wc -l) = 6 ] && echo intact || echo damaged
+      expect: {match: exact, value: intact}
+    - id: same-fs
+      description: The same filesystem is still mounted with its size
+      type: shell
+      on: tr-ops-01
+      skills: [linux.storage.space-analysis]
+      weight: 0.5
+      command: s=$(findmnt -n -o SOURCE /srv/spool 2>/dev/null); [ "$(readlink -f "$s")" = "$(readlink -f /dev/vgops/lvspool)" ] && [ "$(lvs --noheadings --units m --nosuffix -o lv_size vgops/lvspool | tr -d ' ')" = "$(cat /var/lib/cloudtrain/xlf-spool.size)" ] && echo same || echo changed
+      expect: {match: exact, value: same}
+  misconceptions:
+    - id: only-tmp
+      description: Removes only the render temp files, which is not enough.
+      feedback: "du -sh /srv/spool/* shows the rotated gate logs take most of the space; old rotations (gate.log.N) can go."
+      expectFail: [below]
+      mutation:
+        on: tr-ops-01
+        as: learner
+        run: sudo rm -f /srv/spool/tmp/render/*.tmp
+  solution:
+    explanation: du shows the rotated gate logs and temp render files fill the spool; deleting them frees the space without touching the ledger.
+    steps:
+      - on: tr-ops-01
+        as: learner
+        run: sudo sh -c 'rm -f /srv/spool/gate-logs/gate.log.* /srv/spool/tmp/render/*.tmp'

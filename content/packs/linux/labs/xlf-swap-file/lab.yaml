@@ -1,0 +1,87 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xlf-swap-file
+  title: Add a persistent swap file
+  domain: linux
+  frameworks: [lfcs:storage]
+  difficulty: easy
+  estimatedMinutes: 6
+  tags: [exam, swap]
+  version: 1
+spec:
+  description: |
+    **Host:** `tr-ops-01` (`ssh tr-ops-01`, then `sudo -i`)
+
+    Add a swap file **`/var/swap/depot.swap`** of **{{size}} MiB** to `tr-ops-01`. It
+    must be **active now and after every boot**, and only root may read it.
+  objectives:
+    - Create, secure and activate a swap file persistently
+  params:
+    size:
+      type: choice
+      values: ["128", "192", "256"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-ops-01
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["2Gi", "1Gi", "2Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-ops-01
+      run: swapoff /var/swap/depot.swap 2>/dev/null; rm -f /var/swap/depot.swap; mkdir -p /var/swap
+  checks:
+    - id: active
+      description: The swap file is active with the requested size
+      type: shell
+      on: tr-ops-01
+      skills: [linux.storage.swap]
+      weight: 1.5
+      command: |
+        swapon --show=NAME,SIZE --bytes --noheadings | awk -v w={{size}} '$1 == "/var/swap/depot.swap" { m = $2 / 1048576; if (m >= w - 2 && m <= w) ok = 1 } END { print ok ? "active" : "inactive" }'
+      expect: {match: exact, value: active}
+    - id: fstab
+      description: /etc/fstab activates it at boot
+      type: shell
+      on: tr-ops-01
+      skills: [linux.storage.swap]
+      weight: 1.5
+      command: |
+        awk '$1 == "/var/swap/depot.swap" && $3 == "swap" {f = 1} END {print f ? "fstab" : "missing"}' /etc/fstab
+      expect: {match: exact, value: fstab}
+    - id: mode
+      description: Only root can read the swap file
+      type: shell
+      on: tr-ops-01
+      skills: [linux.storage.swap]
+      weight: 0.5
+      command: stat -c '%U %a' /var/swap/depot.swap 2>/dev/null || echo none
+      expect: {match: exact, value: "root 600"}
+  misconceptions:
+    - id: swapon-only
+      description: Activates the file without an fstab entry.
+      feedback: "swapon lasts until reboot; add /var/swap/depot.swap none swap defaults 0 0 to /etc/fstab."
+      expectFail: [fstab]
+      mutation:
+        on: tr-ops-01
+        as: learner
+        run: sudo sh -c 'dd if=/dev/zero of=/var/swap/depot.swap bs=1M count={{size}} status=none && chmod 600 /var/swap/depot.swap && mkswap -q /var/swap/depot.swap && swapon /var/swap/depot.swap'
+  solution:
+    explanation: dd allocates the file, chmod 600 protects it, mkswap formats it, the fstab line activates it at boot and swapon -a now.
+    steps:
+      - on: tr-ops-01
+        as: learner
+        timeoutSec: 120
+        run: |
+          set -e
+          sudo dd if=/dev/zero of=/var/swap/depot.swap bs=1M count={{size}} status=none
+          sudo chmod 600 /var/swap/depot.swap
+          sudo mkswap -q /var/swap/depot.swap
+          echo '/var/swap/depot.swap none swap defaults 0 0' | sudo tee -a /etc/fstab >/dev/null
+          sudo swapon -a

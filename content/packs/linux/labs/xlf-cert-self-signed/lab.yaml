@@ -1,0 +1,107 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xlf-cert-self-signed
+  title: Create a key and certificate with given subject fields
+  domain: linux
+  frameworks: [lfcs:essential-commands]
+  difficulty: medium
+  estimatedMinutes: 8
+  tags: [exam, openssl, tls]
+  version: 1
+spec:
+  description: |
+    **Host:** `tr-ops-01` (`ssh tr-ops-01`, then `sudo -i`)
+
+    The test ticket portal needs a self-signed certificate. Create:
+
+    - a private key **`/etc/tr-tls/private/{{cn}}.key`** (RSA, at least 2048 bits),
+      readable **only by root**;
+    - a self-signed certificate **`/etc/tr-tls/certs/{{cn}}.crt`** for that key with
+      the subject **`CN={{cn}}.tallowmere.example`, `O=Tallowmere Rail`, `C=GB`**,
+      the subject alternative names **`DNS:{{cn}}.tallowmere.example`** and
+      **`DNS:{{cn}}`**, valid for **{{days}} days** from now.
+  objectives:
+    - Generate a key and a self-signed certificate with subject and SAN fields
+  params:
+    cn:
+      type: choice
+      values: [tickets-test, portal-qa, fares-staging]
+    days:
+      type: choice
+      values: ["30", "90", "365"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-ops-01
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["2Gi", "1Gi", "2Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-ops-01
+      run: rm -rf /etc/tr-tls; mkdir -p /etc/tr-tls/private /etc/tr-tls/certs; chmod 0700 /etc/tr-tls/private
+  checks:
+    - id: subject
+      description: The certificate has the requested subject
+      type: shell
+      on: tr-ops-01
+      skills: [linux.security.tls-certificates]
+      weight: 1
+      command: openssl x509 -in /etc/tr-tls/certs/{{cn}}.crt -noout -subject -nameopt RFC2253 2>/dev/null | sed 's/^subject=//' | tr ',' '\n' | sort | paste -sd,
+      expect: {match: exact, value: "C=GB,CN={{cn}}.tallowmere.example,O=Tallowmere Rail"}
+    - id: san
+      description: The certificate has both alternative names
+      type: shell
+      on: tr-ops-01
+      skills: [linux.security.tls-certificates]
+      weight: 1
+      command: openssl x509 -in /etc/tr-tls/certs/{{cn}}.crt -noout -ext subjectAltName 2>/dev/null | tail -n +2 | tr -d ' ' | tr ',' '\n' | sort | paste -sd,
+      expect: {match: exact, value: "DNS:{{cn}},DNS:{{cn}}.tallowmere.example"}
+    - id: validity
+      description: It is valid now and for {{days}} days
+      type: shell
+      on: tr-ops-01
+      skills: [linux.security.tls-certificates]
+      weight: 1
+      command: |
+        c=/etc/tr-tls/certs/{{cn}}.crt
+        b=$(date -d "$(openssl x509 -in $c -noout -startdate 2>/dev/null | cut -d= -f2)" +%s 2>/dev/null); e=$(date -d "$(openssl x509 -in $c -noout -enddate 2>/dev/null | cut -d= -f2)" +%s 2>/dev/null)
+        [ -n "$b" ] && [ -n "$e" ] && d=$(( (e - b + 43200) / 86400 )) && [ $d = {{days}} ] && [ $b -le $(date +%s) ] && echo valid || echo "days=$d"
+      expect: {match: exact, value: valid}
+    - id: key
+      description: The key matches the certificate, is RSA of at least 2048 bits and only root can read it
+      type: shell
+      on: tr-ops-01
+      skills: [linux.security.tls-certificates]
+      weight: 1.5
+      command: |
+        k=/etc/tr-tls/private/{{cn}}.key; c=/etc/tr-tls/certs/{{cn}}.crt
+        a=$(openssl pkey -in $k -pubout 2>/dev/null | sha256sum); b=$(openssl x509 -in $c -noout -pubkey 2>/dev/null | sha256sum)
+        bits=$(openssl pkey -in $k -noout -text 2>/dev/null | sed -n 's/.*Private-Key: (\([0-9]*\) bit.*/\1/p')
+        t=$(openssl pkey -in $k -noout -text 2>/dev/null | grep -c '^modulus:')
+        m=$(stat -c '%U %a' $k 2>/dev/null)
+        [ "$a" = "$b" ] && [ "$t" = 1 ] && [ "${bits:-0}" -ge 2048 ] && case "$m" in "root 600"|"root 400") true ;; *) false ;; esac && echo ok || echo "mode=$m bits=$bits"
+      expect: {match: exact, value: ok}
+  misconceptions:
+    - id: no-san
+      description: Creates the certificate without subject alternative names.
+      feedback: "Clients check the SAN, not the CN; add -addext subjectAltName=DNS:...,DNS:...."
+      expectFail: [san]
+      mutation:
+        on: tr-ops-01
+        as: learner
+        run: sudo openssl req -x509 -newkey rsa:2048 -nodes -days {{days}} -subj '/C=GB/O=Tallowmere Rail/CN={{cn}}.tallowmere.example' -keyout /etc/tr-tls/private/{{cn}}.key -out /etc/tr-tls/certs/{{cn}}.crt 2>/dev/null
+  solution:
+    explanation: openssl req -x509 -newkey creates the key and the self-signed certificate in one step; -subj and -addext set the subject and SANs, -days the validity.
+    steps:
+      - on: tr-ops-01
+        as: learner
+        run: |
+          set -e
+          sudo openssl req -x509 -newkey rsa:3072 -nodes -days {{days}} -subj '/C=GB/O=Tallowmere Rail/CN={{cn}}.tallowmere.example' -addext 'subjectAltName=DNS:{{cn}}.tallowmere.example,DNS:{{cn}}' -keyout /etc/tr-tls/private/{{cn}}.key -out /etc/tr-tls/certs/{{cn}}.crt 2>/dev/null
+          sudo chmod 600 /etc/tr-tls/private/{{cn}}.key

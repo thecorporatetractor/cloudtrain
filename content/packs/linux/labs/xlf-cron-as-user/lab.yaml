@@ -1,0 +1,113 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xlf-cron-as-user
+  title: Schedule a report job for a service account
+  domain: linux
+  frameworks: [lfcs:operations-deployment]
+  difficulty: easy
+  estimatedMinutes: 6
+  tags: [exam, cron]
+  version: 1
+spec:
+  description: |
+    **Host:** `tr-ops-01` (`ssh tr-ops-01`, then `sudo -i`)
+
+    The fare report must run as the service account **`tr-report`** (it has no login
+    shell) at **minute {{min}} past {{h1}}:00 and {{h2}}:00, Monday to Friday**. Each
+    run appends both its standard output and its error output to
+    **`/var/log/tr-report/fares.log`**. The command is
+    **`/usr/local/bin/tr-fare-report`**. Use cron.
+  objectives:
+    - Schedule a job in another user's crontab with output redirection
+  params:
+    min:
+      type: choice
+      values: ["5", "15", "40"]
+    h1:
+      type: choice
+      values: ["6", "7"]
+    h2:
+      type: choice
+      values: ["18", "19", "20"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-ops-01
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["2Gi", "1Gi", "2Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-ops-01
+      run: |
+        set -eu
+        id tr-report >/dev/null 2>&1 || useradd -r -M -s /usr/sbin/nologin tr-report
+        install -d -o tr-report -g tr-report /var/log/tr-report
+        printf '%s\n' '#!/bin/sh' 'echo "$(date -Is) fares ok"' 'echo "warning: 2 gates offline" >&2' > /usr/local/bin/tr-fare-report
+        chmod 0755 /usr/local/bin/tr-fare-report
+        crontab -r -u tr-report 2>/dev/null || true
+        systemctl enable --now cron
+  checks:
+    - id: schedule
+      description: A cron job of tr-report runs the report at the requested times
+      type: shell
+      on: tr-ops-01
+      skills: [linux.processes.scheduled-jobs]
+      weight: 2
+      command: |
+        { crontab -l -u tr-report 2>/dev/null; cat /etc/cron.d/* 2>/dev/null | awk '$6 == "tr-report" {$6 = ""; print}'; } | grep -v '^[[:space:]]*#' | grep 'tr-fare-report' |
+          awk '{d = tolower($5); print $1, $2, $3, $4, d}' | sed 's/ mon-fri$/ 1-5/' | grep -qxE '0?{{min}} ({{h1}},{{h2}}|{{h2}},{{h1}}) \* \* 1-5' && echo scheduled || echo missing
+      expect: {match: exact, value: scheduled}
+    - id: output
+      description: The job appends stdout and stderr to the log
+      type: shell
+      on: tr-ops-01
+      skills: [linux.processes.scheduled-jobs]
+      weight: 1.5
+      command: |
+        l=$({ crontab -l -u tr-report 2>/dev/null; cat /etc/cron.d/* 2>/dev/null; } | grep -v '^[[:space:]]*#' | grep 'tr-fare-report' | head -1)
+        echo "$l" | grep -qE '>> */var/log/tr-report/fares\.log' && echo "$l" | grep -qE '2>&1|&>>' && echo appends || echo "line=$l"
+      expect: {match: exact, value: appends}
+    - id: runs-as-user
+      description: The job works as tr-report
+      type: shell
+      on: tr-ops-01
+      skills: [linux.processes.scheduled-jobs]
+      weight: 0.5
+      command: su -s /bin/sh tr-report -c '/usr/local/bin/tr-fare-report >> /var/log/tr-report/fares.log 2>&1' && echo ok || echo fails
+      expect: {match: exact, value: ok}
+  misconceptions:
+    - id: root-crontab
+      description: Puts the job in root's crontab.
+      feedback: "Edit the service account's crontab with crontab -u tr-report -e (or an /etc/cron.d line with the user field)."
+      expectFail: [schedule]
+      mutation:
+        on: tr-ops-01
+        as: learner
+        run: echo '{{min}} {{h1}},{{h2}} * * 1-5 /usr/local/bin/tr-fare-report >> /var/log/tr-report/fares.log 2>&1' | sudo crontab -
+    - id: stdout-only
+      description: Appends standard output only.
+      feedback: ">> captures stdout; add 2>&1 after it so errors land in the log too."
+      expectFail: [output]
+      mutation:
+        on: tr-ops-01
+        as: learner
+        run: echo '{{min}} {{h1}},{{h2}} * * 1-5 /usr/local/bin/tr-fare-report >> /var/log/tr-report/fares.log' | sudo crontab -u tr-report -
+  solution:
+    explanation: crontab -u installs the line in tr-report's crontab; >> appends and 2>&1 sends errors to the same file.
+    steps:
+      - on: tr-ops-01
+        as: learner
+        run: echo '{{min}} {{h1}},{{h2}} * * 1-5 /usr/local/bin/tr-fare-report >> /var/log/tr-report/fares.log 2>&1' | sudo crontab -u tr-report -
+    alternatives:
+      - id: cron-d
+        description: An /etc/cron.d file with the user field.
+        steps:
+          - on: tr-ops-01
+            as: learner
+            run: echo '{{min}} {{h1}},{{h2}} * * mon-fri tr-report /usr/local/bin/tr-fare-report >> /var/log/tr-report/fares.log 2>&1' | sudo tee /etc/cron.d/tr-fare-report >/dev/null

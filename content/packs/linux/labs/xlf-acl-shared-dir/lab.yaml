@@ -1,0 +1,98 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xlf-acl-shared-dir
+  title: Grant a second group access with default ACLs
+  domain: linux
+  frameworks: [lfcs:users-groups]
+  difficulty: medium
+  estimatedMinutes: 6
+  tags: [exam, acl, permissions]
+  version: 1
+spec:
+  description: |
+    **Host:** `tr-ops-01` (`ssh tr-ops-01`, then `sudo -i`)
+
+    The directory **`/srv/fares`** belongs to the group `farecalc`. The group
+    **`{{grp}}`** must also get **read and write access** to it, to the files already
+    in it, and to **every file and directory created in it later**, without changing
+    the owner, the group or the mode bits for others.
+  objectives:
+    - Grant access with access and default ACL entries
+  params:
+    grp:
+      type: choice
+      values: [revenue, audit, faredesk2]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-ops-01
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["2Gi", "1Gi", "2Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-ops-01
+      timeoutSec: 120
+      run: |
+        set -eu
+        # ubuntu-vm: cloud-init re-creates the online ubuntu.sources at first boot; keep apt offline (local repo only)
+        if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then mv /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list.d/ubuntu.sources.cloud-init; rm -rf /var/lib/apt/lists/*; fi
+        ls /var/lib/apt/lists/*_Packages >/dev/null 2>&1 || apt-get update -q >/dev/null
+        command -v setfacl >/dev/null || apt-get install -y -q acl >/dev/null
+        for g in farecalc {{grp}}; do getent group $g >/dev/null || groupadd $g; done
+        id fc-ann >/dev/null 2>&1 || useradd -m -G farecalc fc-ann
+        id {{grp}}-bob >/dev/null 2>&1 || useradd -m -G {{grp}} {{grp}}-bob
+        rm -rf /srv/fares; mkdir -p /srv/fares/2026
+        echo "fares" > /srv/fares/tariff.csv; echo "q3" > /srv/fares/2026/q3.csv
+        chown -R root:farecalc /srv/fares; chmod 2770 /srv/fares /srv/fares/2026; chmod 0660 /srv/fares/tariff.csv /srv/fares/2026/q3.csv
+  checks:
+    - id: existing
+      description: Members of {{grp}} can read and change the existing files
+      type: shell
+      on: tr-ops-01
+      skills: [linux.files.acls]
+      weight: 1.5
+      command: su -s /bin/sh {{grp}}-bob -c 'cat /srv/fares/tariff.csv >/dev/null && echo x >> /srv/fares/2026/q3.csv && touch /srv/fares/.probe-b' 2>/dev/null && echo rw || echo denied; rm -f /srv/fares/.probe-b
+      expect: {match: exact, value: rw}
+    - id: future
+      description: Files created later in the directory are writable by {{grp}} too
+      type: shell
+      on: tr-ops-01
+      skills: [linux.files.acls]
+      weight: 2
+      command: |
+        d=/srv/fares/new-$$
+        su -s /bin/sh fc-ann -c "umask 007; mkdir -p $d && echo n > $d/f.csv" 2>/dev/null
+        su -s /bin/sh {{grp}}-bob -c "echo y >> $d/f.csv" 2>/dev/null && echo inherited || echo denied
+        rm -rf $d
+      expect: {match: exact, value: inherited}
+    - id: unchanged
+      description: Owner, group and mode bits for others are unchanged
+      type: shell
+      on: tr-ops-01
+      skills: [linux.files.acls]
+      weight: 0.5
+      command: echo "$(stat -c '%U:%G' /srv/fares) $(stat -c '%A' /srv/fares | cut -c8-10)"
+      expect: {match: exact, value: "root:farecalc ---"}
+  misconceptions:
+    - id: no-default
+      description: Sets access ACLs only, without default entries.
+      feedback: "Access ACLs cover existing files; setfacl -d (default ACL) on the directories makes new files inherit the entry."
+      expectFail: [future]
+      mutation:
+        on: tr-ops-01
+        as: learner
+        run: sudo setfacl -R -m g:{{grp}}:rwX /srv/fares
+  solution:
+    explanation: setfacl -R -m adds the group to everything that exists; -d -m adds a default entry on the directories that new files inherit.
+    steps:
+      - on: tr-ops-01
+        as: learner
+        run: |
+          sudo setfacl -R -m g:{{grp}}:rwX /srv/fares
+          sudo find /srv/fares -type d -exec setfacl -d -m g:{{grp}}:rwX {} +

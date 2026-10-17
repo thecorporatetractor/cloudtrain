@@ -1,0 +1,118 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xlf-raid1-create
+  title: Build a mirrored array from two disks
+  domain: linux
+  frameworks: [lfcs:storage]
+  difficulty: hard
+  estimatedMinutes: 10
+  tags: [exam, mdadm, raid]
+  version: 1
+spec:
+  description: |
+    **Host:** `tr-ops-01` (`ssh tr-ops-01`, then `sudo -i`)
+
+    The spare device pair **`/dev/vdc1`** and **`/dev/vdc2`** (two equal partitions,
+    one per future disk slot) must hold the signalling event log on a mirror:
+
+    1. Create a **RAID 1** array **`/dev/md{{n}}`** from both partitions.
+    2. Record the array in the **mdadm configuration** so it assembles under the same
+       name at boot.
+    3. Put an **ext4** filesystem on it and mount it at **`/srv/sig-events`**, now and
+       at every boot.
+  objectives:
+    - Create a RAID 1 array with mdadm and persist its definition
+    - Mount a filesystem on the array persistently
+  params:
+    n:
+      type: int
+      min: 1
+      max: 9
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-ops-01
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["2Gi", "1Gi", "2Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-ops-01
+      timeoutSec: 120
+      run: |
+        set -eu
+        if ! [ -b /dev/vdc2 ]; then
+          parted -s /dev/vdc mklabel gpt mkpart raid-a 1MiB 401MiB mkpart raid-b 401MiB 801MiB set 1 raid on set 2 raid on
+          udevadm settle
+        fi
+        test -b /dev/vdc1 && test -b /dev/vdc2
+  checks:
+    - id: raid1
+      description: /dev/md{{n}} is an active RAID 1 of both partitions
+      type: shell
+      on: tr-ops-01
+      skills: [linux.storage.raid]
+      weight: 2
+      command: |
+        l=$(mdadm --detail /dev/md{{n}} 2>/dev/null | awk '/Raid Level/ {print $4}')
+        m=$(mdadm --detail /dev/md{{n}} 2>/dev/null | awk '/active sync/ {print $NF}' | sort | paste -sd,)
+        echo "level=$l members=$m"
+      expect: {match: exact, value: "level=raid1 members=/dev/vdc1,/dev/vdc2"}
+    - id: mdadm-conf
+      description: /etc/mdadm/mdadm.conf defines the array by its UUID
+      type: shell
+      on: tr-ops-01
+      skills: [linux.storage.raid]
+      weight: 1
+      command: |
+        u=$(mdadm --detail /dev/md{{n}} 2>/dev/null | awk '/UUID :/ {print $3}')
+        [ -n "$u" ] && grep -E '^ARRAY ' /etc/mdadm/mdadm.conf 2>/dev/null | grep -q "UUID=$u" && echo recorded || echo missing
+      expect: {match: exact, value: recorded}
+    - id: mounted
+      description: The ext4 filesystem on the array is mounted at /srv/sig-events and in /etc/fstab
+      type: shell
+      on: tr-ops-01
+      skills: [linux.storage.raid]
+      weight: 1
+      command: |
+        t=$(findmnt -n -o FSTYPE /srv/sig-events 2>/dev/null); s=$(findmnt -n -o SOURCE /srv/sig-events 2>/dev/null)
+        f=$(findmnt --fstab -n -o TARGET /srv/sig-events 2>/dev/null)
+        [ "$t" = ext4 ] && [ "$(readlink -f "$s")" = "$(readlink -f /dev/md{{n}})" ] && [ "$f" = /srv/sig-events ] && echo persistent || echo "fs=$t src=$s fstab=$f"
+      expect: {match: exact, value: persistent}
+  misconceptions:
+    - id: no-conf
+      description: Creates and mounts the array but never records it in mdadm.conf.
+      feedback: "Without an ARRAY line the array may come back as /dev/md127; append mdadm --detail --scan to /etc/mdadm/mdadm.conf and update the initramfs."
+      expectFail: [mdadm-conf]
+      mutation:
+        on: tr-ops-01
+        as: learner
+        timeoutSec: 120
+        run: |
+          set -e
+          sudo mdadm --create /dev/md{{n}} --run --level=1 --raid-devices=2 --metadata=1.2 /dev/vdc1 /dev/vdc2
+          sudo mkfs.ext4 -q /dev/md{{n}}
+          sudo mkdir -p /srv/sig-events
+          echo "UUID=$(sudo blkid -s UUID -o value /dev/md{{n}}) /srv/sig-events ext4 defaults,nofail 0 0" | sudo tee -a /etc/fstab >/dev/null
+          sudo systemctl daemon-reload; sudo mount /srv/sig-events
+  solution:
+    explanation: mdadm --create builds the mirror; mdadm --detail --scan appends its ARRAY line to mdadm.conf (update-initramfs copies it into the early boot image); the filesystem is mounted by UUID.
+    steps:
+      - on: tr-ops-01
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          sudo mdadm --create /dev/md{{n}} --run --level=1 --raid-devices=2 --metadata=1.2 /dev/vdc1 /dev/vdc2
+          sudo mdadm --detail --scan /dev/md{{n}} | sudo tee -a /etc/mdadm/mdadm.conf >/dev/null
+          sudo update-initramfs -u >/dev/null 2>&1 || true
+          sudo mkfs.ext4 -q /dev/md{{n}}
+          sudo mkdir -p /srv/sig-events
+          echo "UUID=$(sudo blkid -s UUID -o value /dev/md{{n}}) /srv/sig-events ext4 defaults,nofail 0 0" | sudo tee -a /etc/fstab >/dev/null
+          sudo systemctl daemon-reload
+          sudo mount /srv/sig-events

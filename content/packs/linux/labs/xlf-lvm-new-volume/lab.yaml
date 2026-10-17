@@ -1,0 +1,99 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xlf-lvm-new-volume
+  title: Create a mounted logical volume of a given size
+  domain: linux
+  frameworks: [lfcs:storage]
+  difficulty: medium
+  estimatedMinutes: 10
+  tags: [exam, lvm, fstab]
+  version: 1
+spec:
+  description: |
+    **Host:** `tr-ops-01` (`ssh tr-ops-01`, then `sudo -i`)
+
+    The spare disk **`/dev/vdd`** is empty. Use the **whole disk** for a new volume
+    group **`{{vg}}`**, and in it create the logical volume **`{{lv}}`** of
+    **{{size}} MiB**. Put an **ext4** filesystem on it and mount it at
+    **`/srv/{{lv}}`**, now and at every boot.
+  objectives:
+    - Create a physical volume, volume group and logical volume
+    - Format and mount a logical volume persistently
+  params:
+    vg:
+      type: choice
+      values: [vgrecords, vgtimetable, vgfreight]
+    lv:
+      type: choice
+      values: [records, crewlogs, manifests]
+    size:
+      type: choice
+      values: ["300", "400", "500"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-ops-01
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["2Gi", "1Gi", "2Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-ops-01
+      run: wipefs -q -a /dev/vdd 2>/dev/null || true
+  checks:
+    - id: vg
+      description: The volume group uses /dev/vdd
+      type: shell
+      on: tr-ops-01
+      skills: [linux.storage.lvm]
+      weight: 1
+      command: pvs --noheadings -o pv_name -S vg_name={{vg}} 2>/dev/null | tr -d ' ' | paste -sd,
+      expect: {match: exact, value: /dev/vdd}
+    - id: lv-size
+      description: The logical volume has the requested size
+      type: shell
+      on: tr-ops-01
+      skills: [linux.storage.lvm]
+      weight: 1
+      command: lvs --noheadings --units m --nosuffix -o lv_size {{vg}}/{{lv}} 2>/dev/null | tr -d ' ' | cut -d. -f1
+      expect: {match: exact, value: "{{size}}"}
+    - id: mounted
+      description: The ext4 filesystem is mounted at /srv/{{lv}} and in /etc/fstab
+      type: shell
+      on: tr-ops-01
+      skills: [linux.storage.mounts]
+      weight: 1.5
+      command: |
+        t=$(findmnt -n -o FSTYPE /srv/{{lv}} 2>/dev/null); s=$(findmnt -n -o SOURCE /srv/{{lv}} 2>/dev/null)
+        f=$(findmnt --fstab -n -o TARGET /srv/{{lv}} 2>/dev/null)
+        [ "$t" = ext4 ] && [ "$(readlink -f "$s")" = "$(readlink -f /dev/{{vg}}/{{lv}})" ] && [ "$f" = /srv/{{lv}} ] && echo persistent || echo "fs=$t fstab=$f"
+      expect: {match: exact, value: persistent}
+  misconceptions:
+    - id: not-in-fstab
+      description: Mounts the volume without an fstab entry.
+      feedback: "mount lasts until the next boot; add the volume to /etc/fstab."
+      expectFail: [mounted]
+      mutation:
+        on: tr-ops-01
+        as: learner
+        run: sudo sh -c 'pvcreate -q /dev/vdd && vgcreate -q {{vg}} /dev/vdd && lvcreate -q -y -n {{lv}} -L {{size}}M {{vg}} && mkfs.ext4 -q /dev/{{vg}}/{{lv}} && mkdir -p /srv/{{lv}} && mount /dev/{{vg}}/{{lv}} /srv/{{lv}}'
+  solution:
+    explanation: pvcreate, vgcreate and lvcreate -L build the volume; mkfs.ext4 formats it and an fstab line mounts it at boot.
+    steps:
+      - on: tr-ops-01
+        as: learner
+        run: |
+          set -e
+          sudo pvcreate -q /dev/vdd
+          sudo vgcreate -q {{vg}} /dev/vdd
+          sudo lvcreate -q -y -n {{lv}} -L {{size}}M {{vg}}
+          sudo mkfs.ext4 -q /dev/{{vg}}/{{lv}}
+          sudo mkdir -p /srv/{{lv}}
+          echo "/dev/{{vg}}/{{lv}} /srv/{{lv}} ext4 defaults 0 2" | sudo tee -a /etc/fstab >/dev/null
+          sudo systemctl daemon-reload
+          sudo mount /srv/{{lv}}

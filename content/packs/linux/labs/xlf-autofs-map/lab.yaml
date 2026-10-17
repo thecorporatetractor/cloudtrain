@@ -1,0 +1,112 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xlf-autofs-map
+  title: Automount per-user shares on demand
+  domain: linux
+  frameworks: [lfcs:storage]
+  difficulty: hard
+  estimatedMinutes: 10
+  tags: [exam, autofs, nfs]
+  version: 1
+spec:
+  description: |
+    **Hosts:** `tr-ops-01` (configure here); `tr-sec-01` is the file server
+
+    The file server exports one share per depot clerk below
+    **`tr-sec-01:/exports/clerks`** (for example `/exports/clerks/{{u1}}` and
+    `/exports/clerks/{{u2}}`, and more clerks will follow). On `tr-ops-01`, configure
+    **autofs** so that **`/clerks/<name>`** mounts `tr-sec-01:/exports/clerks/<name>`
+    read-write **on access**, for **every** clerk without listing them one by one.
+    autofs must start at boot. Install it from the configured repository.
+  objectives:
+    - Write an autofs indirect map with a wildcard key
+  params:
+    u1:
+      type: choice
+      values: [sian, tomos]
+    u2:
+      type: choice
+      values: [wyn, ynyr]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-ops-01
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["2Gi", "1Gi", "2Gi"]}
+        access: [ssh, console]
+      - name: tr-sec-01
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536}
+        access: [ssh, console]
+  setup:
+    - on: tr-sec-01
+      timeoutSec: 120
+      run: |
+        set -eu
+        for u in {{u1}} {{u2}} zelda; do mkdir -p /exports/clerks/$u; echo "share of $u" > /exports/clerks/$u/OWNER; done
+        echo '/exports/clerks *(rw,sync,no_subtree_check)' > /etc/exports.d/clerks.exports
+        systemctl enable --now nfs-server; exportfs -ra
+        for s in nfs mountd rpc-bind; do firewall-cmd -q --permanent --add-service=$s; done; firewall-cmd -q --reload
+    - on: tr-ops-01
+      timeoutSec: 180
+      run: |
+        set -eu
+        # ubuntu-vm: cloud-init re-creates the online ubuntu.sources at first boot; keep apt offline (local repo only)
+        if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then mv /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list.d/ubuntu.sources.cloud-init; rm -rf /var/lib/apt/lists/*; fi
+        ls /var/lib/apt/lists/*_Packages >/dev/null 2>&1 || apt-get update -q >/dev/null
+        dpkg -s nfs-common >/dev/null 2>&1 || apt-get install -y -q nfs-common >/dev/null
+  checks:
+    - id: on-demand
+      description: Accessing /clerks/<name> mounts that clerk's share, also for a clerk not named in the task
+      type: shell
+      on: tr-ops-01
+      skills: [linux.storage.network-mounts]
+      weight: 2
+      timeoutSec: 60
+      command: |
+        ok=0
+        for u in {{u1}} {{u2}} zelda; do [ "$(timeout 15 cat /clerks/$u/OWNER 2>/dev/null)" = "share of $u" ] && ok=$((ok + 1)); done
+        echo "shares=$ok"
+      expect: {match: exact, value: "shares=3"}
+    - id: autofs
+      description: /clerks is an autofs mount point and autofs is enabled
+      type: shell
+      on: tr-ops-01
+      skills: [linux.storage.network-mounts]
+      weight: 1.5
+      command: echo "$(findmnt -n -t autofs -o TARGET /clerks >/dev/null 2>&1 && echo autofs || echo plain) $(systemctl is-enabled autofs 2>/dev/null)"
+      expect: {match: exact, value: "autofs enabled"}
+  misconceptions:
+    - id: listed-keys
+      description: Lists only the two named clerks in the map.
+      feedback: "A wildcard key (*) with & in the location serves every clerk, including future ones."
+      expectFail: [on-demand]
+      mutation:
+        on: tr-ops-01
+        as: learner
+        timeoutSec: 180
+        run: |
+          sudo apt-get update -q >/dev/null; sudo apt-get install -y -q autofs >/dev/null
+          echo '/clerks /etc/auto.clerks' | sudo tee /etc/auto.master.d/clerks.autofs >/dev/null
+          printf '{{u1}} -rw tr-sec-01:/exports/clerks/{{u1}}\n{{u2}} -rw tr-sec-01:/exports/clerks/{{u2}}\n' | sudo tee /etc/auto.clerks >/dev/null
+          sudo systemctl enable autofs; sudo systemctl restart autofs
+  solution:
+    explanation: A master entry for /clerks and an indirect map whose wildcard key * and & substitute the clerk's name.
+    steps:
+      - on: tr-ops-01
+        as: learner
+        timeoutSec: 180
+        run: |
+          set -e
+          sudo apt-get update -q >/dev/null; sudo apt-get install -y -q autofs >/dev/null
+          echo '/clerks /etc/auto.clerks' | sudo tee /etc/auto.master.d/clerks.autofs >/dev/null
+          echo '* -rw tr-sec-01:/exports/clerks/&' | sudo tee /etc/auto.clerks >/dev/null
+          sudo systemctl enable autofs
+          sudo systemctl restart autofs

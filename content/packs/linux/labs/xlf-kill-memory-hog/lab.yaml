@@ -1,0 +1,118 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xlf-kill-memory-hog
+  title: Stop the process exhausting memory and prevent its restart
+  domain: linux
+  frameworks: [lfcs:operations-deployment]
+  difficulty: easy
+  estimatedMinutes: 6
+  tags: [exam, processes, systemd, memory]
+  version: 1
+spec:
+  description: |
+    **Host:** `tr-ops-01` (`ssh tr-ops-01`, then `sudo -i`)
+
+    `tr-ops-01` is running out of memory. Find the **process that uses the most
+    memory**, **stop it**, and make sure it is **not started again**, neither by
+    whatever keeps respawning it nor at the next boot. Every other service on the
+    host must keep running.
+  objectives:
+    - Find a process by memory use and trace it to its systemd unit
+    - Stop and disable a unit
+  params:
+    unit:
+      type: choice
+      values: [tr-cachewarm, tr-ledger-index, tr-route-preload]
+    mb:
+      type: int
+      min: 220
+      max: 300
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-ops-01
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["2Gi", "1Gi", "2Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-ops-01
+      timeoutSec: 120
+      run: |
+        set -eu
+        mkdir -p /opt/tr/lib
+        printf '%s\n' 'import time' 'blob = bytearray({{mb}} * 1024 * 1024)' 'for i in range(0, len(blob), 4096): blob[i] = 1' 'while True: time.sleep(30)' > /opt/tr/lib/{{unit}}.py
+        printf '%s\n' 'import time' 'blob = bytearray(24 * 1024 * 1024)' 'for i in range(0, len(blob), 4096): blob[i] = 1' 'while True: time.sleep(30)' > /opt/tr/lib/tr-ticketd.py
+        for u in {{unit}} tr-ticketd; do
+          printf '[Unit]\nDescription=Tallowmere %s\n[Service]\nExecStart=/usr/bin/python3 /opt/tr/lib/%s.py\nRestart=always\nRestartSec=2\n[Install]\nWantedBy=multi-user.target\n' $u $u > /etc/systemd/system/$u.service
+        done
+        systemctl daemon-reload
+        systemctl enable --now {{unit}}.service tr-ticketd.service
+        sleep 3
+  checks:
+    - id: stopped
+      description: The memory hog is no longer running
+      type: shell
+      on: tr-ops-01
+      skills: [linux.processes.management]
+      weight: 1
+      timeoutSec: 30
+      command: sleep 5; pgrep -f '^/usr/bin/python3 /opt/tr/lib/{{unit}}.py' >/dev/null && echo running || echo stopped
+      expect: {match: exact, value: stopped}
+    - id: not-at-boot
+      description: Its unit will not start at boot
+      type: shell
+      on: tr-ops-01
+      skills: [linux.systemd.units]
+      weight: 1.5
+      command: s=$(systemctl is-enabled {{unit}}.service 2>/dev/null); case "$s" in disabled|masked) echo off ;; *) echo "$s" ;; esac
+      expect: {match: exact, value: "off"}
+    - id: others-running
+      description: The other Tallowmere service still runs
+      type: shell
+      on: tr-ops-01
+      skills: [linux.systemd.units]
+      weight: 0.5
+      command: systemctl is-active tr-ticketd.service
+      expect: {match: exact, value: active}
+  misconceptions:
+    - id: kill-only
+      description: Kills the process, which the unit restarts.
+      feedback: "Restart=always brings it back; stop and disable the unit that owns the process (systemctl status <pid> names it)."
+      expectFail: [stopped, not-at-boot]
+      mutation:
+        on: tr-ops-01
+        as: learner
+        run: sudo kill -9 $(ps -eo pid,rss --sort=-rss --no-headers | awk 'NR == 1 {print $1}')
+    - id: stop-only
+      description: Stops the unit but leaves it enabled.
+      feedback: "systemctl stop lasts until the next boot; systemctl disable (or mask) as well."
+      expectFail: [not-at-boot]
+      mutation:
+        on: tr-ops-01
+        as: learner
+        run: sudo systemctl stop {{unit}}.service
+  solution:
+    explanation: ps sorted by RSS shows the top consumer; systemctl status on its PID names the unit, which systemctl disable --now stops and keeps off.
+    steps:
+      - on: tr-ops-01
+        as: learner
+        run: |
+          pid=$(ps -eo pid,rss --sort=-rss --no-headers | awk 'NR == 1 {print $1}')
+          unit=$(systemctl status $pid --no-pager 2>/dev/null | awk 'NR == 1 {print $2}')
+          sudo systemctl disable --now "$unit"
+    alternatives:
+      - id: mask
+        description: Mask the unit after stopping it.
+        steps:
+          - on: tr-ops-01
+            as: learner
+            run: |
+              pid=$(ps -eo pid,rss --sort=-rss --no-headers | awk 'NR == 1 {print $1}')
+              unit=$(ps -o unit= -p $pid)
+              sudo systemctl stop "$unit" && sudo systemctl mask "$unit"

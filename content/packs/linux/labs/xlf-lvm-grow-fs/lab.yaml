@@ -1,0 +1,100 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xlf-lvm-grow-fs
+  title: Extend a volume and its filesystem online
+  domain: linux
+  frameworks: [lfcs:storage]
+  difficulty: easy
+  estimatedMinutes: 6
+  tags: [exam, lvm, ext4]
+  version: 1
+spec:
+  description: |
+    **Host:** `tr-ops-01` (`ssh tr-ops-01`, then `sudo -i`)
+
+    The train-movement history on **`vgops/lvtrains`** (ext4, mounted at
+    **`/srv/trains`**) is nearly full. Grow the logical volume to **{{size}} MiB** and
+    its filesystem with it, **without unmounting** it. The data must stay intact.
+  objectives:
+    - Extend a logical volume and its filesystem online
+  params:
+    size:
+      type: choice
+      values: ["448", "480", "512"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-ops-01
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["2Gi", "1Gi", "2Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-ops-01
+      timeoutSec: 120
+      run: |
+        set -eu
+        pvs /dev/vde >/dev/null 2>&1 || pvcreate -q /dev/vde
+        vgs vgops >/dev/null 2>&1 || vgcreate -q vgops /dev/vde
+        if ! lvs vgops/lvtrains >/dev/null 2>&1; then
+          lvcreate -q -y -n lvtrains -L 256M vgops; mkfs.ext4 -q /dev/vgops/lvtrains
+          mkdir -p /srv/trains
+          echo '/dev/mapper/vgops-lvtrains /srv/trains ext4 defaults 0 2' >> /etc/fstab
+          systemctl daemon-reload; mount /srv/trains
+          seq 1 30000 | awk '{printf "train %05d platform %d\n", $1, $1 % 12}' > /srv/trains/movements.txt
+          install -d -m 0700 /var/lib/cloudtrain
+          sha256sum /srv/trains/movements.txt > /var/lib/cloudtrain/xlf-trains.sha
+          findmnt -n -o TARGET /srv/trains > /dev/null
+        fi
+  checks:
+    - id: lv-size
+      description: The logical volume is {{size}} MiB
+      type: shell
+      on: tr-ops-01
+      skills: [linux.storage.lvm]
+      weight: 1
+      command: lvs --noheadings --units m --nosuffix -o lv_size vgops/lvtrains 2>/dev/null | tr -d ' ' | cut -d. -f1
+      expect: {match: exact, value: "{{size}}"}
+    - id: fs-grown
+      description: The filesystem was grown to match
+      type: shell
+      on: tr-ops-01
+      skills: [linux.storage.lvm]
+      weight: 1.5
+      command: s=$(df -BM --output=size /srv/trains 2>/dev/null | tail -1 | tr -dc 0-9); [ -n "$s" ] && [ $s -ge $(({{size}} - 40)) ] && echo grown || echo "fs=$s"
+      expect: {match: exact, value: grown}
+    - id: intact
+      description: The data is intact and the filesystem stayed mounted
+      type: shell
+      on: tr-ops-01
+      skills: [linux.storage.lvm]
+      weight: 1
+      command: findmnt -n /srv/trains >/dev/null && sha256sum -c --quiet /var/lib/cloudtrain/xlf-trains.sha >/dev/null 2>&1 && echo intact || echo damaged
+      expect: {match: exact, value: intact}
+  misconceptions:
+    - id: lv-only
+      description: Grows the logical volume but not the filesystem.
+      feedback: "lvextend alone leaves ext4 at its old size; use lvextend -r or resize2fs afterwards."
+      expectFail: [fs-grown]
+      mutation:
+        on: tr-ops-01
+        as: learner
+        run: sudo lvextend -q -L {{size}}M vgops/lvtrains
+  solution:
+    explanation: lvextend -r grows the volume and then runs resize2fs on the mounted ext4 filesystem.
+    steps:
+      - on: tr-ops-01
+        as: learner
+        run: sudo lvextend -q -r -L {{size}}M vgops/lvtrains
+    alternatives:
+      - id: resize2fs
+        description: lvextend, then resize2fs.
+        steps:
+          - on: tr-ops-01
+            as: learner
+            run: sudo sh -c 'lvextend -q -L {{size}}M vgops/lvtrains && resize2fs /dev/vgops/lvtrains'

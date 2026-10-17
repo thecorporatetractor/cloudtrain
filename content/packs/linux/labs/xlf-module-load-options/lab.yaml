@@ -1,0 +1,89 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xlf-module-load-options
+  title: Load a kernel module with options at boot
+  domain: linux
+  frameworks: [lfcs:operations-deployment]
+  difficulty: medium
+  estimatedMinutes: 6
+  tags: [exam, kernel, modules]
+  version: 1
+spec:
+  description: |
+    **Host:** `tr-ops-01` (`ssh tr-ops-01`, then `sudo -i`)
+
+    The signalling simulator needs RAM disks. Make the kernel module **`brd`** load
+    **at every boot** with the option **`rd_nr={{n}}`**, and load it that way **now**
+    as well.
+  objectives:
+    - Load a kernel module with an option, now and at boot
+  params:
+    n:
+      type: int
+      min: 2
+      max: 6
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-ops-01
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["2Gi", "1Gi", "2Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-ops-01
+      run: |
+        set -eu
+        modprobe -r brd 2>/dev/null || true
+        modinfo brd >/dev/null
+  checks:
+    - id: loaded
+      description: brd is loaded with rd_nr={{n}}
+      type: shell
+      on: tr-ops-01
+      skills: [linux.kernel.modules]
+      weight: 1.5
+      command: cat /sys/module/brd/parameters/rd_nr 2>/dev/null || echo not-loaded
+      expect: {match: exact, value: "{{n}}"}
+    - id: at-boot
+      description: brd is listed for loading at boot
+      type: shell
+      on: tr-ops-01
+      skills: [linux.kernel.modules]
+      weight: 1
+      command: cat /etc/modules-load.d/*.conf /etc/modules 2>/dev/null | sed 's/#.*//' | awk '{print $1}' | grep -qx brd && echo listed || echo missing
+      expect: {match: exact, value: listed}
+    - id: option
+      description: The module configuration sets rd_nr={{n}}
+      type: shell
+      on: tr-ops-01
+      skills: [linux.kernel.modules]
+      weight: 1.5
+      command: |
+        v=$(modprobe -c 2>/dev/null | awk '$1 == "options" && $2 == "brd" {for (i = 3; i <= NF; i++) if ($i ~ /^rd_nr=/) {split($i, a, "="); v = a[2]}} END {print v}')
+        echo "${v:-unset}"
+      expect: {match: exact, value: "{{n}}"}
+  misconceptions:
+    - id: modprobe-only
+      description: Loads the module with the option by hand only.
+      feedback: "modprobe lasts until reboot; list the module in /etc/modules-load.d and put the option in /etc/modprobe.d."
+      expectFail: [at-boot, option]
+      mutation:
+        on: tr-ops-01
+        as: learner
+        run: sudo modprobe brd rd_nr={{n}}
+  solution:
+    explanation: /etc/modules-load.d makes systemd load the module at boot; an options line in /etc/modprobe.d supplies rd_nr every time it loads.
+    steps:
+      - on: tr-ops-01
+        as: learner
+        run: |
+          echo brd | sudo tee /etc/modules-load.d/brd.conf >/dev/null
+          echo 'options brd rd_nr={{n}}' | sudo tee /etc/modprobe.d/brd.conf >/dev/null
+          sudo modprobe -r brd 2>/dev/null || true
+          sudo modprobe brd

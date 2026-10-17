@@ -1,0 +1,121 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xlf-selinux-enforce-fix
+  title: Switch the EL node to enforcing without breaking its web service
+  domain: linux
+  frameworks: [lfcs:operations-deployment]
+  difficulty: hard
+  estimatedMinutes: 10
+  tags: [exam, selinux, httpd]
+  version: 1
+spec:
+  description: |
+    **Host:** the Enterprise Linux node `tr-sec-01` (`ssh tr-sec-01`, then `sudo -i`)
+
+    `tr-sec-01` was left with SELinux in **permissive** mode. Its web server publishes
+    the gate report at **`http://tr-sec-01/gates-{{n}}.html`**.
+
+    Switch SELinux to **enforcing**, now and **after every reboot**, and make sure the
+    gate report is **still served** under enforcing mode. Fix the cause rather than
+    adding exceptions: no permissive domains, no custom policy modules.
+  objectives:
+    - Set the SELinux mode persistently
+    - Restore the default file context of web content
+  params:
+    n:
+      type: int
+      min: 10
+      max: 99
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-sec-01
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536}
+        access: [ssh, console]
+  setup:
+    - on: tr-sec-01
+      timeoutSec: 240
+      run: |
+        set -eu
+        rpm -q httpd >/dev/null 2>&1 || dnf -y -q install httpd
+        echo "<h1>Gate report {{n}}</h1>" > /root/gates-{{n}}.html
+        mv -f /root/gates-{{n}}.html /var/www/html/gates-{{n}}.html
+        chmod 0644 /var/www/html/gates-{{n}}.html
+        systemctl enable --now httpd
+        firewall-cmd -q --permanent --add-service=http; firewall-cmd -q --reload
+        sed -i 's/^SELINUX=.*/SELINUX=permissive/' /etc/selinux/config
+        setenforce 0
+  checks:
+    - id: enforcing-now
+      description: SELinux is enforcing now
+      type: shell
+      on: tr-sec-01
+      skills: [linux.security.selinux-contexts]
+      weight: 1
+      command: getenforce
+      expect: {match: exact, value: Enforcing}
+    - id: enforcing-boot
+      description: SELinux is configured to be enforcing at boot
+      type: shell
+      on: tr-sec-01
+      skills: [linux.security.selinux-contexts]
+      weight: 1
+      command: |
+        c=$(sed -n 's/^SELINUX=//p' /etc/selinux/config)
+        grep -qE '(^|[[:space:]])(selinux=0|enforcing=0)([[:space:]]|$)' /proc/cmdline && c=kernel-override
+        grubby --info=ALL 2>/dev/null | grep '^args=' | grep -qE '[" ](selinux|enforcing)=0[" ]' && c=kernel-args
+        echo "$c"
+      expect: {match: exact, value: enforcing}
+    - id: served
+      description: The gate report is served under enforcing mode
+      type: shell
+      on: tr-sec-01
+      skills: [linux.security.selinux-contexts]
+      weight: 2
+      timeoutSec: 30
+      command: '[ "$(getenforce)" = Enforcing ] && curl -4 -s -m 8 http://localhost/gates-{{n}}.html | grep -o "Gate report {{n}}" || echo not-served'
+      expect: {match: exact, value: "Gate report {{n}}"}
+    - id: no-exceptions
+      description: No permissive domain or custom module was added
+      type: shell
+      on: tr-sec-01
+      skills: [linux.security.selinux-contexts]
+      weight: 0.5
+      command: |
+        p=$(semanage permissive -l -n 2>/dev/null | grep -c .)
+        m=$(semodule --list-modules=full 2>/dev/null | awk '$1 == 400' | grep -c .)
+        echo "permissive=$p modules=$m"
+      expect: {match: exact, value: "permissive=0 modules=0"}
+  misconceptions:
+    - id: mode-only
+      description: Switches to enforcing without fixing the file label.
+      feedback: "The page was moved from /root and kept its admin_home_t label; restorecon gives it httpd_sys_content_t."
+      expectFail: [served]
+      mutation:
+        on: tr-sec-01
+        as: learner
+        run: sudo sh -c 'sed -i "s/^SELINUX=.*/SELINUX=enforcing/" /etc/selinux/config && setenforce 1'
+    - id: runtime-only
+      description: Uses setenforce 1 and restorecon but leaves the configuration permissive.
+      feedback: "setenforce lasts until the next boot; SELINUX=enforcing in /etc/selinux/config makes it permanent."
+      expectFail: [enforcing-boot]
+      mutation:
+        on: tr-sec-01
+        as: learner
+        run: sudo sh -c 'restorecon -v /var/www/html/gates-{{n}}.html && setenforce 1'
+  solution:
+    explanation: restorecon resets the moved file to the default web content label; setenforce 1 switches now and SELINUX=enforcing keeps it at boot.
+    steps:
+      - on: tr-sec-01
+        as: learner
+        run: |
+          sudo restorecon -Rv /var/www/html
+          sudo sed -i 's/^SELINUX=.*/SELINUX=enforcing/' /etc/selinux/config
+          sudo setenforce 1

@@ -1,0 +1,153 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xlf-repo-install-hold
+  title: Install a held package version from the vendor mirror
+  domain: linux
+  frameworks: [lfcs:operations-deployment]
+  difficulty: medium
+  estimatedMinutes: 8
+  tags: [exam, apt, repositories, pinning]
+  version: 1
+spec:
+  description: |
+    **Host:** `tr-ops-01` (`ssh tr-ops-01`, then `sudo -i`)
+
+    The signalling vendor publishes its packages in an apt repository at
+    **`http://tr-ops-01:8801/`** (a flat repository: suite `./`). Its signing key is
+    **`http://tr-ops-01:8801/tallowmere-vendor.asc`**.
+
+    1. Add the repository as an apt source that **verifies the vendor's signature**
+       with that key (no `trusted=yes`, no disabled checks).
+    2. Install **`tr-signal-agent` version {{ver}}** exactly, not the newest one.
+    3. **Hold** the package so upgrades leave it at that version.
+  objectives:
+    - Add a signed apt repository with its key
+    - Install and hold a specific package version
+  params:
+    ver:
+      type: choice
+      values: ["1.4.2", "1.5.0"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-ops-01
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["2Gi", "1Gi", "2Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-ops-01
+      timeoutSec: 240
+      run: |
+        set -eu
+        # ubuntu-vm: cloud-init re-creates the online ubuntu.sources at first boot; keep apt offline (local repo only)
+        if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then mv /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list.d/ubuntu.sources.cloud-init; rm -rf /var/lib/apt/lists/*; fi
+        ls /var/lib/apt/lists/*_Packages >/dev/null 2>&1 || apt-get update -q >/dev/null
+        R=/srv/vendor/apt; rm -rf /srv/vendor; mkdir -p $R
+        b=$(mktemp -d)
+        for v in 1.4.2 1.5.0 1.6.1; do
+          d=$b/tr-signal-agent_$v; mkdir -p $d/DEBIAN $d/usr/bin
+          printf '#!/bin/sh\necho "tr-signal-agent %s"\n' $v > $d/usr/bin/tr-signal-agent; chmod 0755 $d/usr/bin/tr-signal-agent
+          printf 'Package: tr-signal-agent\nVersion: %s\nArchitecture: all\nMaintainer: Tallowmere Signalling <vendor@tallowmere.example>\nDescription: Tallowmere signal box agent\n' $v > $d/DEBIAN/control
+          dpkg-deb -b --root-owner-group $d $R/tr-signal-agent_${v}_all.deb >/dev/null
+        done
+        command -v apt-ftparchive >/dev/null || apt-get install -y -q apt-utils >/dev/null
+        cd $R && apt-ftparchive packages . > Packages && gzip -kf Packages
+        apt-ftparchive -o APT::FTPArchive::Release::Origin=Tallowmere -o APT::FTPArchive::Release::Label=Vendor release . > Release
+        G=$b/gpg; mkdir -m 0700 $G
+        gpg --batch --homedir $G --pinentry-mode loopback --passphrase '' --quick-gen-key 'Tallowmere Vendor <vendor@tallowmere.example>' ed25519 sign never 2>/dev/null
+        gpg --batch --homedir $G --armor --export > $R/tallowmere-vendor.asc
+        gpg --batch --homedir $G --clearsign -o InRelease Release
+        gpg --batch --homedir $G -abs -o Release.gpg Release
+        gpgconf --homedir $G --kill all 2>/dev/null || true
+        rm -rf $b
+        printf '[Unit]\nDescription=Tallowmere vendor apt mirror\n[Service]\nExecStart=/usr/bin/python3 -m http.server 8801 --directory /srv/vendor/apt\nRestart=always\n[Install]\nWantedBy=multi-user.target\n' > /etc/systemd/system/tr-vendor-mirror.service
+        systemctl daemon-reload; systemctl enable --now tr-vendor-mirror.service
+        for i in $(seq 20); do curl -sf -o /dev/null http://tr-ops-01:8801/InRelease && exit 0; sleep 1; done; exit 1
+  checks:
+    - id: version
+      description: tr-signal-agent {{ver}} is installed
+      type: shell
+      on: tr-ops-01
+      skills: [linux.packages.version-pinning]
+      weight: 2
+      command: dpkg-query -W -f '${db:Status-Status} ${Version}' tr-signal-agent 2>/dev/null || echo missing
+      expect: {match: exact, value: "installed {{ver}}"}
+    - id: held
+      description: The package is on hold
+      type: shell
+      on: tr-ops-01
+      skills: [linux.packages.version-pinning]
+      weight: 1
+      command: apt-mark showhold 2>/dev/null | grep -qx tr-signal-agent && echo held || echo not-held
+      expect: {match: exact, value: held}
+    - id: signed-source
+      description: The vendor source is configured with signature checking
+      type: shell
+      on: tr-ops-01
+      skills: [linux.packages.repositories]
+      weight: 1.5
+      timeoutSec: 90
+      command: |
+        if grep -rsiqE 'trusted(=|: *)yes|allow-insecure|AllowInsecureRepositories|AllowUnauthenticated' /etc/apt/sources.list /etc/apt/sources.list.d /etc/apt/apt.conf.d; then echo insecure; exit 0; fi
+        timeout 60 apt-get update 2>&1 | grep -qiE 'NO_PUBKEY|not signed|insecure' && { echo unverified; exit 0; }
+        apt-cache policy tr-signal-agent 2>/dev/null | grep -q 'http://tr-ops-01:8801' && echo signed || echo no-source
+      expect: {match: exact, value: signed}
+  misconceptions:
+    - id: newest
+      description: Installs the newest version instead of the requested one.
+      feedback: "apt-get install name=version installs an exact version; apt-cache policy lists what the repository offers."
+      expectFail: [version]
+      mutation:
+        on: tr-ops-01
+        as: learner
+        timeoutSec: 180
+        run: |
+          sudo curl -sfo /etc/apt/keyrings/tallowmere-vendor.asc http://tr-ops-01:8801/tallowmere-vendor.asc
+          echo 'deb [signed-by=/etc/apt/keyrings/tallowmere-vendor.asc] http://tr-ops-01:8801/ ./' | sudo tee /etc/apt/sources.list.d/tallowmere-vendor.list >/dev/null
+          sudo apt-get update -q >/dev/null && sudo apt-get install -y -q tr-signal-agent >/dev/null && sudo apt-mark hold tr-signal-agent
+    - id: trusted-yes
+      description: Skips signature checking with trusted=yes.
+      feedback: "trusted=yes accepts unsigned or forged metadata; download the key and reference it with signed-by."
+      expectFail: [signed-source]
+      mutation:
+        on: tr-ops-01
+        as: learner
+        timeoutSec: 180
+        run: |
+          echo 'deb [trusted=yes] http://tr-ops-01:8801/ ./' | sudo tee /etc/apt/sources.list.d/tallowmere-vendor.list >/dev/null
+          sudo apt-get update -q >/dev/null && sudo apt-get install -y -q tr-signal-agent={{ver}} >/dev/null && sudo apt-mark hold tr-signal-agent
+  solution:
+    explanation: The key goes to /etc/apt/keyrings and the source references it with signed-by; name=version installs the exact version and apt-mark hold keeps it.
+    steps:
+      - on: tr-ops-01
+        as: learner
+        timeoutSec: 180
+        run: |
+          set -e
+          sudo install -d -m 0755 /etc/apt/keyrings
+          sudo curl -sfo /etc/apt/keyrings/tallowmere-vendor.asc http://tr-ops-01:8801/tallowmere-vendor.asc
+          echo 'deb [signed-by=/etc/apt/keyrings/tallowmere-vendor.asc] http://tr-ops-01:8801/ ./' | sudo tee /etc/apt/sources.list.d/tallowmere-vendor.list >/dev/null
+          sudo apt-get update -q >/dev/null
+          sudo apt-get install -y -q tr-signal-agent={{ver}} >/dev/null
+          sudo apt-mark hold tr-signal-agent
+    alternatives:
+      - id: deb822
+        description: A deb822 .sources file and an apt preferences pin.
+        steps:
+          - on: tr-ops-01
+            as: learner
+            timeoutSec: 180
+            run: |
+              set -e
+              sudo install -d -m 0755 /etc/apt/keyrings
+              curl -sf http://tr-ops-01:8801/tallowmere-vendor.asc | sudo tee /etc/apt/keyrings/tallowmere-vendor.asc >/dev/null
+              printf 'Types: deb\nURIs: http://tr-ops-01:8801/\nSuites: ./\nSigned-By: /etc/apt/keyrings/tallowmere-vendor.asc\n' | sudo tee /etc/apt/sources.list.d/tallowmere-vendor.sources >/dev/null
+              sudo apt-get update -q >/dev/null
+              sudo apt-get install -y -q --allow-downgrades tr-signal-agent={{ver}} >/dev/null
+              sudo apt-mark hold tr-signal-agent
