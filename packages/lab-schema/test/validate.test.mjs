@@ -69,3 +69,9 @@ test("a mutation needs expectFail and vice versa", () => {
   delete lab.spec.misconceptions[0].mutation;
   assert.equal(validateLab(lab).valid, false);
 });
+
+test("spaced undeclared placeholders are literal Jinja, not param references", () => {
+  const lab = structuredClone(minimal);
+  lab.spec.solution.steps[0].run = "echo '{{ inventory_hostname }} {{ word }} {{typo}}' > /tmp/x";
+  assert.deepEqual([...referencedParams(lab)].sort(), ["typo", "word"]);
+});

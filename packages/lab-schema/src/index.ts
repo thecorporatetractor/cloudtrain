@@ -82,11 +82,22 @@ export function isLab(doc: unknown): doc is Lab {
 
 const PARAM_REF = /\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}/g;
 
-/** Returns every `{{param}}` name referenced anywhere in the lab's spec. */
+/**
+ * True when a `{{ name }}` match is literal text, not a param reference: written with
+ * inner whitespace (the Jinja/Ansible style) and not naming a declared param. `{{name}}`
+ * without whitespace always references a param. Mirrors the compiler (literalPlaceholder).
+ */
+export function isLiteralPlaceholder(match: string, name: string, declared: (name: string) => boolean): boolean {
+  return match !== `{{${name}}}` && !declared(name);
+}
+
+/** Returns every `{{param}}` name referenced anywhere in the lab's spec (literal Jinja excluded). */
 export function referencedParams(lab: Lab): Set<string> {
   const names = new Set<string>();
+  const params = (lab.spec as { params?: Record<string, unknown> }).params ?? {};
+  const declared = (n: string) => Object.prototype.hasOwnProperty.call(params, n);
   const walk = (v: unknown): void => {
-    if (typeof v === "string") for (const m of v.matchAll(PARAM_REF)) names.add(m[1]!);
+    if (typeof v === "string") for (const m of v.matchAll(PARAM_REF)) { if (!isLiteralPlaceholder(m[0], m[1]!, declared)) names.add(m[1]!); }
     else if (Array.isArray(v)) v.forEach(walk);
     else if (v && typeof v === "object") Object.values(v).forEach(walk);
   };

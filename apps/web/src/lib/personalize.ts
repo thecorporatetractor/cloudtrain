@@ -2,9 +2,13 @@ import type { Lab, LabSession, TopologyNode } from '@/api/types';
 
 const PARAM = /\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}/g;
 
-/** Fills `{{param}}` with the session's values; unresolved ones read as ‹name›. */
+/**
+ * Fills `{{param}}` with the session's values; unresolved ones read as ‹name›, except
+ * `{{ name }}` written with inner whitespace, which is literal Jinja (Ansible labs) unless
+ * it names a param of this attempt.
+ */
 export function fillParams(text: string, params: Record<string, string> | undefined): string {
-  return text.replace(PARAM, (_, name: string) => params?.[name] ?? `‹${name}›`);
+  return text.replace(PARAM, (m: string, name: string) => params?.[name] ?? (m === `{{${name}}}` ? `‹${name}›` : m));
 }
 
 /**

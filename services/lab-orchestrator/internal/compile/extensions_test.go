@@ -159,3 +159,35 @@ func TestFileSourceIsTemplated(t *testing.T) {
 		t.Errorf("unknown placeholder in an asset: %v", err)
 	}
 }
+
+// "{{ name }}" with inner whitespace and an undeclared name is literal text (Jinja in
+// Ansible playbooks and templates); a declared name is substituted in either spelling,
+// and "{{name}}" without whitespace must still name a declared param.
+func TestSpacedUndeclaredPlaceholderIsLiteral(t *testing.T) {
+	lab := strings.Replace(assetLab, "  description: Run the script\n",
+		"  description: Run the script\n  params:\n    who: {type: choice, values: [ada]}\n", 1)
+	path := writeLab(t, lab)
+	asset := filepath.Join(filepath.Dir(path), "assets", "run.sh")
+	body := "- debug: msg=\"{{ inventory_hostname }} {{ item.name }} {{ who }} {{who}} {{ x | upper }}\"\n"
+	if err := os.WriteFile(asset, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	lt, err := CompileFile(path, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec, _, err := Resolve(&lt.Spec, 1, ResolveOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "- debug: msg=\"{{ inventory_hostname }} {{ item.name }} ada ada {{ x | upper }}\"\n"
+	if got := spec.Setup[0].File.Content; got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+	if err := os.WriteFile(asset, []byte("echo {{inventory_hostname}}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := CompileFile(path, Options{}); err == nil || !strings.Contains(err.Error(), "undefined param {{inventory_hostname}}") {
+		t.Errorf("unspaced unknown placeholder: %v", err)
+	}
+}
