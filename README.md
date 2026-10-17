@@ -138,6 +138,9 @@ CloudTrain is in early development. Here is exactly where it stands.
   links, `kubectl debug` refused up front with a clear message when it would
   break Pod Security in a virtual cluster, and a 20 s default timeout for
   Kubernetes checks.
+  Round 5: container nodes of one lab reach each other by name (an S3 store, a
+  Git server or Moto next to the workstation), still isolated from other labs and
+  from the platform.
 - Exam engine: drawing tasks, the shared environment, timer freeze, auto-solved
   runs scoring 100%, unsolved runs failing, and retakes drawing different tasks.
 - Exam simulations through the gateway with real sign-in (Keycloak and CSRF),

@@ -10,6 +10,17 @@ items of the old list; round 4 (branch `fix/platform-round-4`, proof in
 `deploy/.results/platform-round-4-proof.txt`) closed what was left of them except
 Kata and the kubeadm proof under load:
 
+0. **Round 5** (branch `fix/platform-round-5`). Container nodes of one lab reach each
+   other by name: every container node without links (entry included) is a *lab peer*
+   with DNS name `<node>` inside its session (headless Service `ct-<hash>-nodes` as the
+   pods' subdomain + search domain) and the NetworkPolicy `ct-<hash>-peers` allows any
+   port between the session's peers, nothing from other labs or the platform, and
+   egress only to peers, DNS and the mirrors (non-entry container nodes used to be open
+   both ways). Proof `deploy/.results/lab-peers/` (20/20: S3 + Git + a Terraform s3
+   backend by name; another lab, the API server, the host, the internet and a platform
+   pod all refused). Authoring rules in `docs/k8s-readiness.md` ("Access"). Unblocks
+   separate Moto/S3/Git nodes (IaC) and Ansible managed nodes.
+
 0. **Round 4.** Kubernetes checks (k8s-query, k8s-can-i, k8s-context) default to a
    20 s timeout (was 5 s). Every vcluster gets the ValidatingAdmissionPolicy
    `cloudtrain-ephemeral-pod-security`: `kubectl debug` with the default profile is

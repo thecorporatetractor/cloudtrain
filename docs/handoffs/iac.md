@@ -126,11 +126,14 @@ only). Re-check dates 2027-01-31.
 
 ## Platform findings
 
-1. **Container nodes are not reachable from the entry pod**: no host alias, and the
-   entry NetworkPolicy allows only DNS, its vclusters and lab CIDRs. Separate
-   `s3-store`, `gitea` or `moto` nodes therefore do not work. The S3 store runs inside
-   the workstation (`ct-s3`), Git module sources use bare repos on the workstation.
-   `moto:5` (AWS-shaped labs) will need the same in-pod approach or a platform change.
+1. **Fixed in platform round 5: container nodes reach each other by name.** Every
+   container node without links is a lab peer: `s3store`, `git` or `moto` resolve
+   inside the session and the peer NetworkPolicy allows any port between the session's
+   peers (isolated from other labs and the platform). Proven with a workstation using
+   an S3 backend and a Git remote on a second `terraform-ws:1.15` node
+   (`deploy/.results/lab-peers/`). The labs written so far keep `ct-s3` and bare repos
+   on the workstation; new labs may use separate `s3-store`, `gitea` or `moto` nodes
+   (see "Container nodes reach each other by name" in `docs/k8s-readiness.md`).
 2. Catalog parsing is strict (`UnmarshalStrict`): no custom catalog fields.
 3. `lab.schema.json` only allowed the wave-1 domains; it now accepts the six
    curriculum domains (containers, iac, automation too).
@@ -159,9 +162,8 @@ only). Re-check dates 2027-01-31.
 2. Image additions those need: Terraform 1.9 and 1.5.7 staged (upgrade/migration labs),
    kubernetes provider 2.38 in the mirror (major-upgrade lab), conftest, the aws provider
    (large: ~600 MB unpacked) for AWS-shaped labs. Pin each like the rest.
-3. AWS-shaped targets (moto:5, sim-iac-advanced pool, iac-moto-vpc-subnets): run Moto
-   inside the workstation like ct-s3, or get the platform to make container nodes
-   reachable from the entry pod (finding 1).
+3. AWS-shaped targets (moto:5, sim-iac-advanced pool, iac-moto-vpc-subnets): a separate
+   `moto` container node now works (finding 1); the image still has to be built.
 4. `tofu-*` labs (state encryption, early evaluation, OCI distribution, migration) need
    the Terraform flavour with tofu alongside, which the image already has.
 5. Promote the `iac.*` newSkills into `content/skills.yaml` once the wave settles.

@@ -335,6 +335,7 @@ func (d *ContainerDriver) Provision(ctx context.Context, ref NodeRef) (NodeState
 		return NodeState{Phase: labsv1.NodeFailed, Message: err.Error()}, err
 	}
 	d.applyUserNamespace(ref, pod)
+	d.applyLabPeer(ref, pod)
 	if err := d.createIfAbsent(ctx, ref, pod); err != nil {
 		return NodeState{Phase: labsv1.NodePending, Message: err.Error()}, fmt.Errorf("pod: %w", err)
 	}

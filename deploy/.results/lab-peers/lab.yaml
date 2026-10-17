@@ -1,0 +1,68 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: platform-lab-peers-proof
+  title: Lab peers reach each other by name
+  domain: iac
+  frameworks: [tf-associate:state]
+  difficulty: easy
+  estimatedMinutes: 10
+  tags: [platform-proof]
+  version: 1
+spec:
+  description: |
+    Platform proof: a workstation and an S3 + Git service node in one lab.
+  objectives:
+    - Reach a service node by name
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+      - name: s3store
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+  setup:
+    - on: s3store
+      timeoutSec: 120
+      run: |
+        mkdir -p /tmp/srv/s3 /tmp/srv/git
+        setsid nohup weed server -dir=/tmp/srv/s3 -ip=0.0.0.0 -ip.bind=0.0.0.0 -filer -s3 -s3.port=8333 >/tmp/srv/weed.log 2>&1 </dev/null &
+        git init -q --bare /tmp/srv/git/modules.git
+        tmp=$(mktemp -d) && cd "$tmp" && git init -q -b main && printf 'variable "x" {}\n' > main.tf \
+          && git -c user.email=ct@lab -c user.name=ct add . && git -c user.email=ct@lab -c user.name=ct commit -qm init \
+          && git push -q /tmp/srv/git/modules.git main
+        touch /tmp/srv/git/modules.git/git-daemon-export-ok
+        setsid nohup git daemon --reuseaddr --base-path=/tmp/srv/git --export-all --listen=0.0.0.0 /tmp/srv/git >/tmp/srv/git-daemon.log 2>&1 </dev/null &
+        for i in $(seq 60); do curl -s -o /dev/null http://127.0.0.1:8333/ && break; sleep 2; done
+        curl -sf -X PUT http://127.0.0.1:8333/proof-state
+  checks:
+    - id: name-resolves
+      description: s3store resolves from the workstation
+      type: shell
+      on: workstation
+      skills: [iac.state.backends]
+      command: runuser -u learner -- getent hosts s3store >/dev/null && echo ok
+      expect: {match: exact, value: ok}
+    - id: s3-by-name
+      description: The S3 bucket list on s3store answers by name
+      type: shell
+      on: workstation
+      skills: [iac.state.backends]
+      command: curl -s --max-time 10 http://s3store:8333/ | grep -q proof-state && echo ok
+      expect: {match: exact, value: ok}
+    - id: git-by-name
+      description: The Git repository on s3store answers by name
+      type: shell
+      on: workstation
+      skills: [iac.state.backends]
+      command: git ls-remote git://s3store/modules.git main | grep -q refs/heads/main && echo ok
+      expect: {match: exact, value: ok}
+  solution:
+    explanation: Nothing to do; the platform provides the names.
+    steps:
+      - on: workstation
+        run: "true"
