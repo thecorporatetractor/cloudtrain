@@ -434,3 +434,23 @@ func TestCloudInitRender(t *testing.T) {
 		t.Error("hosts / sudo missing")
 	}
 }
+
+// labctl verify and exam runs build their runtime with NewRuntime and exec steps on
+// FRR nodes through the netdev driver, so it must be the real one, not the stub.
+func TestNewRuntimeRegistersRealNetdevDriver(t *testing.T) {
+	rt, err := NewRuntime(RuntimeOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, err := rt.Registry.Get(labsv1.DriverNetdev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nd, ok := d.(*NetdevDriver)
+	if !ok {
+		t.Fatalf("netdev driver is %T, want *NetdevDriver", d)
+	}
+	if nd.ContainerDriver != rt.Container {
+		t.Fatal("netdev driver must share the runtime's container driver (and its lab network)")
+	}
+}

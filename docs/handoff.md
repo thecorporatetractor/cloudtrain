@@ -44,10 +44,9 @@ Kata and the kubeadm proof under load:
    `docs/handoffs/networking-drafts/` no longer need `l2shim.sh`. P3, P4 and the
    link rate limit: fixed in round 4 (item 0); `net-fix-broadcast-storm` may run.
    Networking round 3 verified every L2 lab on it except the broadcast storm.
-   **Open platform bug:** `labctl verify` (and the exam auto-solve) builds its exec
-   runtime with the stub netdev driver, so solution/mutation steps on FRR nodes
-   fail (`driver netdev (clabernetes): exec not implemented`); the one-line fix is
-   in `docs/handoffs/networking.md`.
+   The `labctl verify` / exam auto-solve netdev bug (steps on FRR nodes failed with
+   `exec not implemented`) is fixed in `drivers.NewRuntime`, so the 12 round-3 labs
+   verified with a locally patched labctl match what main runs now.
 4. **Learner sudo: available as an opt-in.** Entry node `learnerSudo: true`
    (security trade-off, see `docs/dev-environment.md`); the lab's setup grants the
    sudoers rule. Default stays `allowPrivilegeEscalation: false`; operators can

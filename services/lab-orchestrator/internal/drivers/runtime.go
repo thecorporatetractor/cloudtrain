@@ -55,7 +55,7 @@ type Runtime struct {
 }
 
 // NewRuntime builds the container, vm, k8s-cluster (virtual + kubeadm) and
-// netdev (stub) drivers plus the session runtime that owns keys, the lab
+// netdev (FRR) drivers plus the session runtime that owns keys, the lab
 // network and entry wiring.
 func NewRuntime(o RuntimeOptions) (*Runtime, error) {
 	adminRef := o.AdminImageRef
@@ -92,7 +92,9 @@ func NewRuntime(o RuntimeOptions) (*Runtime, error) {
 		Kubeadm: &KubeadmDriver{Client: o.Client, Reader: o.Reader, Catalog: o.Catalog, Container: container,
 			Session: session, ImageRegistry: o.ImageRegistry, Disks: disks},
 	}
-	reg, err := NewRegistry(container, vm, cluster, NewNetdevDriver())
+	// The real netdev driver, not the stub: labctl verify and exam runs exec
+	// solution/mistake steps on FRR nodes through it, like the manager.
+	reg, err := NewRegistry(container, vm, cluster, NewNetdev(container))
 	if err != nil {
 		return nil, err
 	}
