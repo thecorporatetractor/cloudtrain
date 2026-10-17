@@ -13,7 +13,7 @@ spec:
   description: |
     The north campus classroom LAN `10.{{octet}}.10.0/24` hangs off the switch
     `mv-sw-north-1` together with two routers, `mv-campus-north-a` (.2) and
-    `mv-campus-north-b` (.3), both uplinked to `mv-core-1` (FRR consoles). The
+    `mv-campus-north-b` (.3), both uplinked to `mv-core-1` and running OSPF with it (FRR consoles). The
     classroom host `classroom-north` (.50) uses `10.{{octet}}.10.1` as its
     default gateway, but nothing answers on that address yet.
 
@@ -77,28 +77,54 @@ spec:
       config: |
         interface eth1
          ip address 10.{{octet}}.10.2/24
+         ip ospf area 0
+         ip ospf hello-interval 1
+         ip ospf dead-interval 3
         interface eth2
          ip address 10.{{octet}}.0.2/30
-        ip route 10.{{octet}}.1.0/24 10.{{octet}}.0.1
+         ip ospf area 0
+         ip ospf network point-to-point
+         ip ospf hello-interval 1
+         ip ospf dead-interval 3
+        router ospf
+         ospf router-id 10.255.{{octet}}.2
     - on: mv-campus-north-b
       config: |
         interface eth1
          ip address 10.{{octet}}.10.3/24
+         ip ospf area 0
+         ip ospf hello-interval 1
+         ip ospf dead-interval 3
         interface eth2
          ip address 10.{{octet}}.0.6/30
-        ip route 10.{{octet}}.1.0/24 10.{{octet}}.0.5
+         ip ospf area 0
+         ip ospf network point-to-point
+         ip ospf hello-interval 1
+         ip ospf dead-interval 3
+        router ospf
+         ospf router-id 10.255.{{octet}}.3
     - on: mv-core-1
       run: ip link add lan1 type dummy 2>/dev/null; ip link set lan1 up
     - on: mv-core-1
       config: |
         interface eth1
          ip address 10.{{octet}}.0.1/30
+         ip ospf area 0
+         ip ospf network point-to-point
+         ip ospf hello-interval 1
+         ip ospf dead-interval 3
         interface eth2
          ip address 10.{{octet}}.0.5/30
+         ip ospf area 0
+         ip ospf network point-to-point
+         ip ospf hello-interval 1
+         ip ospf dead-interval 3
         interface lan1
          ip address 10.{{octet}}.1.1/24
-        ip route 10.{{octet}}.10.0/24 10.{{octet}}.0.2
-        ip route 10.{{octet}}.10.0/24 10.{{octet}}.0.6 50
+         ip ospf area 0
+         ip ospf passive
+        router ospf
+         ospf router-id 10.255.{{octet}}.1
     - { on: classroom-north, run: "ip addr replace 10.{{octet}}.10.50/24 dev eth1 && ip route replace default via 10.{{octet}}.10.1" }
   checks:
     - id: a-master
@@ -173,15 +199,15 @@ spec:
       expectFail: [b-backup, survives-failover, b-took-over]
       feedback: The gateway works until the master fails; without a backup in the same group nobody takes over.
     - id: equal-priorities
-      description: Leaves both routers at the default priority
+      description: Leaves mv-campus-north-a at the default priority
       mutation:
-        on: mv-campus-north-b
+        on: mv-campus-north-a
         config: |
           interface eth1
            vrrp {{vrid}} version 3
            vrrp {{vrid}} ip 10.{{octet}}.10.1
       expectFail: [a-master]
-      feedback: With equal priorities the higher interface address wins, so -b becomes master; -a needs priority 200.
+      feedback: At the default priority 100 the master role is not pinned to -a (with equal priorities the higher interface address, -b, wins); -a needs priority 200.
   solution:
     explanation: |
       Both routers join VRRP group {{vrid}} with the same virtual address; -a has

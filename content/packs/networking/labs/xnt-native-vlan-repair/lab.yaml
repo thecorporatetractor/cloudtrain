@@ -1,0 +1,111 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xnt-native-vlan-repair
+  title: Repair a native VLAN mismatch
+  domain: networking
+  frameworks: [ccna:network-access]
+  difficulty: medium
+  estimatedMinutes: 8
+  tags: [exam, trunk, native-vlan, troubleshooting]
+  version: 1
+spec:
+  description: |
+    **Devices:** `mv-sw-annex-1` and `mv-sw-annex-2` (shell; Linux bridge `br0`,
+    VLAN filtering on)
+
+    The annex switches are joined by a trunk on `eth9`. Each switch has a
+    management host on `eth1` (VLAN 99) and a student host on `eth2` (VLAN
+    {{student}}). Management hosts can currently reach student hosts on the
+    other switch, which must never happen.
+
+    The trunk is meant to carry VLAN {{student}} tagged and VLAN 99 as the
+    untagged native VLAN on both ends. Find the mismatch and fix it so each
+    VLAN crosses the trunk and management and student hosts are separated. All
+    hosts use `10.{{octet}}.0.0/24`.
+  objectives:
+    - Diagnose and repair a native VLAN mismatch on a trunk
+  params:
+    octet: { type: int, min: 20, max: 90 }
+    student: { type: choice, values: ["30", "31", "32", "33"] }
+  topology:
+    entry: workstation
+    nodes:
+      - { name: workstation, driver: container, image: jumphost:1, access: [shell] }
+      - { name: mv-sw-annex-1, driver: container, image: netsvc:1, resources: { cpu: 0.2, memoryMiB: 96 }, access: [shell] }
+      - { name: mv-sw-annex-2, driver: container, image: netsvc:1, resources: { cpu: 0.2, memoryMiB: 96 }, access: [shell] }
+      - { name: mgmt-annex-1, driver: container, image: nettools:1, resources: { cpu: 0.1, memoryMiB: 48 } }
+      - { name: student-annex-1, driver: container, image: nettools:1, resources: { cpu: 0.1, memoryMiB: 48 } }
+      - { name: mgmt-annex-2, driver: container, image: nettools:1, resources: { cpu: 0.1, memoryMiB: 48 } }
+      - { name: student-annex-2, driver: container, image: nettools:1, resources: { cpu: 0.1, memoryMiB: 48 } }
+    links:
+      - { a: "mv-sw-annex-1:eth1", b: "mgmt-annex-1:eth1" }
+      - { a: "mv-sw-annex-1:eth2", b: "student-annex-1:eth1" }
+      - { a: "mv-sw-annex-2:eth1", b: "mgmt-annex-2:eth1" }
+      - { a: "mv-sw-annex-2:eth2", b: "student-annex-2:eth1" }
+      - { a: "mv-sw-annex-1:eth9", b: "mv-sw-annex-2:eth9" }
+  setup:
+    - on: mv-sw-annex-1
+      run: &sw |
+        ip link add br0 type bridge vlan_filtering 1 2>/dev/null || true
+        for p in eth1 eth2 eth9; do ip link set $p master br0; done
+        ip link set br0 up
+        bridge vlan add dev eth1 vid 99 pvid untagged; bridge vlan del dev eth1 vid 1
+        bridge vlan add dev eth2 vid {{student}} pvid untagged; bridge vlan del dev eth2 vid 1
+        bridge vlan add dev eth9 vid {{student}}; bridge vlan add dev eth9 vid 99 pvid untagged; bridge vlan del dev eth9 vid 1
+    - on: mv-sw-annex-2
+      run: |
+        ip link add br0 type bridge vlan_filtering 1 2>/dev/null || true
+        for p in eth1 eth2 eth9; do ip link set $p master br0; done
+        ip link set br0 up
+        bridge vlan add dev eth1 vid 99 pvid untagged; bridge vlan del dev eth1 vid 1
+        bridge vlan add dev eth2 vid {{student}} pvid untagged; bridge vlan del dev eth2 vid 1
+        bridge vlan add dev eth9 vid 99; bridge vlan add dev eth9 vid {{student}} pvid untagged; bridge vlan del dev eth9 vid 1
+    - { on: mgmt-annex-1, run: "ip addr replace 10.{{octet}}.0.91/24 dev eth1" }
+    - { on: student-annex-1, run: "ip addr replace 10.{{octet}}.0.31/24 dev eth1" }
+    - { on: mgmt-annex-2, run: "ip addr replace 10.{{octet}}.0.92/24 dev eth1" }
+    - { on: student-annex-2, run: "ip addr replace 10.{{octet}}.0.32/24 dev eth1" }
+  checks:
+    - id: trunk-annex-1
+      description: eth9 on mv-sw-annex-1 carries the student VLAN tagged and 99 native
+      type: shell
+      on: mv-sw-annex-1
+      command: &trunk |
+        bridge -j vlan show dev eth9 | python3 -c '
+        import json,sys
+        for p in json.load(sys.stdin):
+            print(sorted((x["vlan"],"PVID" in x.get("flags",[]),"Egress Untagged" in x.get("flags",[])) for x in p["vlans"]))'
+      expect: { match: exact, value: "[({{student}}, False, False), (99, True, True)]" }
+      skills: [net.switching.trunking]
+    - id: trunk-annex-2
+      description: eth9 on mv-sw-annex-2 carries the student VLAN tagged and 99 native
+      type: shell
+      on: mv-sw-annex-2
+      command: *trunk
+      expect: { match: exact, value: "[({{student}}, False, False), (99, True, True)]" }
+      skills: [net.switching.trunking]
+      weight: 2
+    - { id: mgmt-across, description: mgmt-annex-1 reaches mgmt-annex-2, type: reachability, on: mgmt-annex-1, target: "10.{{octet}}.0.92", skills: [net.switching.trunking] }
+    - { id: students-across, description: student-annex-1 reaches student-annex-2, type: reachability, on: student-annex-1, target: "10.{{octet}}.0.32", skills: [net.switching.trunking] }
+    - id: separated
+      description: mgmt-annex-1 cannot reach student-annex-2
+      type: shell
+      on: mgmt-annex-1
+      command: |
+        ip neigh flush dev eth1
+        ping -c2 -W1 10.{{octet}}.0.32 >/dev/null 2>&1 && echo reachable || echo separated
+      expect: { match: exact, value: separated }
+      timeoutSec: 10
+      skills: [net.switching.vlans]
+  misconceptions:
+    - id: wrong-end
+      description: Changes the correct switch to match the broken one (student VLAN native on both ends)
+      mutation:
+        on: mv-sw-annex-1
+        run: bridge vlan add dev eth9 vid 99; bridge vlan add dev eth9 vid {{student}} pvid untagged
+      expectFail: [trunk-annex-1, trunk-annex-2]
+  solution:
+    explanation: mv-sw-annex-2 sends the student VLAN untagged and tags 99; swap them so 99 is the native VLAN and the student VLAN is tagged, as on mv-sw-annex-1.
+    steps:
+      - on: mv-sw-annex-2
+        run: bridge vlan add dev eth9 vid {{student}}; bridge vlan add dev eth9 vid 99 pvid untagged

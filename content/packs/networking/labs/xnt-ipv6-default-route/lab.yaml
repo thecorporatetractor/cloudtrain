@@ -1,0 +1,99 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xnt-ipv6-default-route
+  title: IPv6 default route via a link-local next hop
+  domain: networking
+  frameworks: [ccna:ip-connectivity]
+  difficulty: medium
+  estimatedMinutes: 6
+  tags: [exam, ipv6, static-route, link-local, frr]
+  version: 1
+spec:
+  description: |
+    **Device:** `mv-campus-north-9` (FRR console)
+
+    `mv-campus-north-9` connects to `mv-core-9` on `eth1`
+    (`2001:db8:{{site}}:1::/64`, north `::2`, core `::1`). The north IPv6 LAN is
+    `2001:db8:{{site}}:10::/64` on `lan1`; the district office LAN behind the
+    core is `2001:db8:{{site}}:200::/64`. The core already routes back to the north LAN.
+
+    Configure an IPv6 **default route** on `mv-campus-north-9` whose next hop is
+    the **link-local** address of `mv-core-9` on that link (find it yourself), so
+    the north LAN reaches the district office LAN.
+  objectives:
+    - Configure an IPv6 static default route with a link-local next hop
+  params:
+    site: { type: int, min: 10, max: 99 }
+    ll: { type: choice, values: ["1", "a", "c0de", "fe"] }
+  topology:
+    entry: workstation
+    nodes:
+      - { name: workstation, driver: container, image: jumphost:1, access: [shell] }
+      - { name: mv-campus-north-9, driver: netdev, image: frr:10, access: [console] }
+      - { name: mv-core-9, driver: netdev, image: frr:10, access: [console] }
+    links:
+      - { a: "mv-core-9:eth1", b: "mv-campus-north-9:eth1" }
+  setup:
+    - on: mv-core-9
+      run: |
+        ip link add lan1 type dummy 2>/dev/null; ip link set lan1 up
+        # one link-local only, so the answer is unambiguous
+        ip link set eth1 addrgenmode none 2>/dev/null || true
+        ip -6 addr flush dev eth1 scope link
+        ip -6 addr add fe80::{{ll}}/64 dev eth1
+    - on: mv-campus-north-9
+      run: |
+        ip link add lan1 type dummy 2>/dev/null; ip link set lan1 up
+        ip -6 addr add fe80::2/64 dev eth1 2>/dev/null || true
+    - on: mv-core-9
+      config: |
+        interface eth1
+         ipv6 address 2001:db8:{{site}}:1::1/64
+        interface lan1
+         ipv6 address 2001:db8:{{site}}:200::1/64
+        ipv6 route 2001:db8:{{site}}:10::/64 fe80::2 eth1
+    - on: mv-campus-north-9
+      config: |
+        interface eth1
+         ipv6 address 2001:db8:{{site}}:1::2/64
+        interface lan1
+         ipv6 address 2001:db8:{{site}}:10::1/64
+  checks:
+    - id: default-route
+      description: mv-campus-north-9 has an active IPv6 default route via the core's link-local address on eth1
+      type: shell
+      on: mv-campus-north-9
+      command: |
+        vtysh -c 'show ipv6 route ::/0 json' | python3 -c '
+        import json,sys
+        d=json.load(sys.stdin)
+        print(" ".join(sorted("%s %s %s" % (r["protocol"], n.get("ip",""), n.get("interfaceName","")) for r in d.get("::/0",[]) if r.get("selected") for n in r.get("nexthops",[]) if n.get("active"))))'
+      expect: { match: exact, value: "static fe80::{{ll}} eth1" }
+      skills: [net.routing.ipv6-static]
+      weight: 2
+    - id: reach-office
+      description: The north LAN reaches the district office LAN over IPv6
+      type: shell
+      on: mv-campus-north-9
+      command: ping -6 -c2 -W2 -I 2001:db8:{{site}}:10::1 2001:db8:{{site}}:200::1 >/dev/null 2>&1 && echo ok || echo fail
+      expect: { match: exact, value: ok }
+      skills: [net.routing.ipv6-static]
+      weight: 2
+  misconceptions:
+    - id: global-next-hop
+      description: Uses the core's global address as next hop
+      mutation:
+        on: mv-campus-north-9
+        config: |
+          ipv6 route ::/0 2001:db8:{{site}}:1::1
+      expectFail: [default-route]
+  solution:
+    explanation: |
+      `show ipv6 neighbors` (after a ping to `2001:db8:{{site}}:1::1`) or the
+      core's `show interface eth1` gives its link-local address. A link-local
+      next hop is only unique per link, so the route must name the interface.
+    steps:
+      - on: mv-campus-north-9
+        config: |
+          ipv6 route ::/0 fe80::{{ll}} eth1

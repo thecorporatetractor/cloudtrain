@@ -1,0 +1,104 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xnt-summary-route
+  title: Replace four static routes with one summary
+  domain: networking
+  frameworks: [ccna:network-fundamentals]
+  difficulty: medium
+  estimatedMinutes: 8
+  tags: [exam, summarisation, static-route, frr]
+  version: 1
+spec:
+  description: |
+    **Device:** `mv-core-5` (FRR console)
+
+    `mv-core-5` reaches the four north campus LANs through `mv-campus-north-5`
+    (`10.{{octet}}.0.2`) with one static route per LAN: four consecutive /24s
+    starting at `10.{{octet}}.{{base}}.0/24`.
+
+    Replace those four static routes on `mv-core-5` with the **single smallest
+    summary route** that covers all four LANs and nothing more, via the same next
+    hop. No other static route may remain for those LANs. The district server
+    `server-core-5` must still reach every north LAN.
+  objectives:
+    - Calculate and configure a summary static route
+  params:
+    octet: { type: int, min: 20, max: 90 }
+    base: { type: choice, values: ["16", "20", "32", "44", "64", "100"] }
+  topology:
+    entry: workstation
+    nodes:
+      - { name: workstation, driver: container, image: jumphost:1, access: [shell] }
+      - { name: mv-core-5, driver: netdev, image: frr:10, access: [console] }
+      - { name: mv-campus-north-5, driver: netdev, image: frr:10 }
+      - { name: server-core-5, driver: container, image: nettools:1, resources: { cpu: 0.1, memoryMiB: 48 } }
+    links:
+      - { a: "mv-core-5:eth1", b: "mv-campus-north-5:eth1", subnet: "10.{{octet}}.0.0/30" }
+      - { a: "mv-core-5:eth2", b: "server-core-5:eth1" }
+  setup:
+    - on: mv-campus-north-5
+      run: |
+        for i in 0 1 2 3; do ip link add lan$i type dummy 2>/dev/null || true; ip link set lan$i up; done
+    - on: mv-campus-north-5
+      run: |
+        b={{base}}
+        { echo "interface eth1"; echo " ip address 10.{{octet}}.0.2/30"
+          for i in 0 1 2 3; do echo "interface lan$i"; echo " ip address 10.{{octet}}.$((b + i)).1/24"; done
+          echo "ip route 0.0.0.0/0 10.{{octet}}.0.1"; } > /tmp/cfg && vtysh -f /tmp/cfg && rm -f /tmp/cfg
+    - on: mv-core-5
+      run: |
+        b={{base}}
+        { echo "interface eth1"; echo " ip address 10.{{octet}}.0.1/30"
+          echo "interface eth2"; echo " ip address 10.{{octet}}.250.1/24"
+          for i in 0 1 2 3; do echo "ip route 10.{{octet}}.$((b + i)).0/24 10.{{octet}}.0.2"; done; } > /tmp/cfg && vtysh -f /tmp/cfg && rm -f /tmp/cfg
+    - { on: server-core-5, run: "ip addr replace 10.{{octet}}.250.10/24 dev eth1 && ip route replace default via 10.{{octet}}.250.1" }
+  checks:
+    - id: one-summary
+      description: mv-core-5's only static route towards the north LANs is the /22 summary
+      type: shell
+      on: mv-core-5
+      command: vtysh -c 'show running-config' | grep '^ip route ' | sort | tr '\n' ';'
+      expect: { match: exact, value: "ip route 10.{{octet}}.{{base}}.0/22 10.{{octet}}.0.2;" }
+      skills: [net.addressing.ipv4-subnetting, net.routing.static]
+      weight: 3
+    - id: reach-all
+      description: server-core-5 reaches all four north LANs
+      type: shell
+      on: server-core-5
+      command: |
+        b={{base}}; r=ok
+        for i in 0 1 2 3; do ping -c1 -W2 10.{{octet}}.$((b + i)).1 >/dev/null 2>&1 || r=fail; done; echo $r
+      expect: { match: exact, value: ok }
+      timeoutSec: 20
+      skills: [net.routing.static]
+  misconceptions:
+    - id: too-wide
+      description: Summarises with a /21, which also covers four LANs that are not in the north campus
+      mutation:
+        on: mv-core-5
+        run: |
+          b={{base}}
+          for i in 0 1 2 3; do vtysh -c 'conf t' -c "no ip route 10.{{octet}}.$((b + i)).0/24 10.{{octet}}.0.2"; done
+          vtysh -c 'conf t' -c "ip route 10.{{octet}}.$((b / 8 * 8)).0/21 10.{{octet}}.0.2"
+      expectFail: [one-summary]
+  solution:
+    explanation: |
+      Four consecutive /24s starting on a multiple of four share their first 22
+      bits, so 10.{{octet}}.{{base}}.0/22 covers exactly them. Remove the four /24
+      routes and add the /22.
+    steps:
+      - on: mv-core-5
+        run: |
+          b={{base}}
+          for i in 0 1 2 3; do vtysh -c 'conf t' -c "no ip route 10.{{octet}}.$((b + i)).0/24 10.{{octet}}.0.2"; done
+          vtysh -c 'conf t' -c "ip route 10.{{octet}}.{{base}}.0/22 10.{{octet}}.0.2"
+    alternatives:
+      - id: config-file
+        description: Apply the change as a configuration block
+        steps:
+          - on: mv-core-5
+            run: |
+              b={{base}}
+              { echo "ip route 10.{{octet}}.{{base}}.0/22 10.{{octet}}.0.2"
+                for i in 0 1 2 3; do echo "no ip route 10.{{octet}}.$((b + i)).0/24 10.{{octet}}.0.2"; done; } > /tmp/fix && vtysh -f /tmp/fix; rm -f /tmp/fix

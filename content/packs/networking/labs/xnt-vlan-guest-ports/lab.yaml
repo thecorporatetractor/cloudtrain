@@ -1,0 +1,98 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xnt-vlan-guest-ports
+  title: Move two switch ports into a guest VLAN
+  domain: networking
+  frameworks: [ccna:network-access]
+  difficulty: easy
+  estimatedMinutes: 6
+  tags: [exam, vlan, access-port, linux-bridge]
+  version: 1
+spec:
+  description: |
+    **Device:** `mv-sw-south-2` (shell; Linux bridge `br0`, VLAN filtering on)
+
+    All three ports of the south library switch are untagged members of the
+    staff VLAN 20:
+
+    | Port | Host |
+    |---|---|
+    | `eth1` | `staff-south-9` |
+    | `eth2` | `library-south-1` |
+    | `eth3` | `library-south-2` |
+
+    Create the guest VLAN **{{vid}}** and make `eth2` and `eth3` untagged access
+    ports of that VLAN only. The two library hosts must reach each other and
+    must not reach `staff-south-9`; `eth1` stays an access port of VLAN 20.
+    Host addresses are already set (all in `10.{{octet}}.20.0/24`).
+  objectives:
+    - Configure access ports in a new VLAN on a Linux bridge
+  params:
+    octet: { type: int, min: 20, max: 90 }
+    vid: { type: choice, values: ["50", "55", "60", "70"] }
+  topology:
+    entry: workstation
+    nodes:
+      - { name: workstation, driver: container, image: jumphost:1, access: [shell] }
+      - { name: mv-sw-south-2, driver: container, image: netsvc:1, resources: { cpu: 0.2, memoryMiB: 96 }, access: [shell] }
+      - { name: staff-south-9, driver: container, image: nettools:1, resources: { cpu: 0.1, memoryMiB: 48 } }
+      - { name: library-south-1, driver: container, image: nettools:1, resources: { cpu: 0.1, memoryMiB: 48 }, access: [shell] }
+      - { name: library-south-2, driver: container, image: nettools:1, resources: { cpu: 0.1, memoryMiB: 48 }, access: [shell] }
+    links:
+      - { a: "mv-sw-south-2:eth1", b: "staff-south-9:eth1" }
+      - { a: "mv-sw-south-2:eth2", b: "library-south-1:eth1" }
+      - { a: "mv-sw-south-2:eth3", b: "library-south-2:eth1" }
+  setup:
+    - on: mv-sw-south-2
+      run: |
+        ip link add br0 type bridge vlan_filtering 1 2>/dev/null || true
+        for p in eth1 eth2 eth3; do ip link set $p master br0; bridge vlan add dev $p vid 20 pvid untagged; bridge vlan del dev $p vid 1; done
+        ip link set br0 up
+    - { on: staff-south-9, run: "ip addr replace 10.{{octet}}.20.9/24 dev eth1" }
+    - { on: library-south-1, run: "ip addr replace 10.{{octet}}.20.51/24 dev eth1" }
+    - { on: library-south-2, run: "ip addr replace 10.{{octet}}.20.52/24 dev eth1" }
+  checks:
+    - id: guest-ports
+      description: eth2 and eth3 are untagged access ports of the guest VLAN only
+      type: shell
+      on: mv-sw-south-2
+      command: &vl |
+        bridge -j vlan show | python3 -c '
+        import json,sys
+        d={p["ifname"]:sorted((x["vlan"],"PVID" in x.get("flags",[]),"Egress Untagged" in x.get("flags",[])) for x in p["vlans"]) for p in json.load(sys.stdin)}
+        print(d.get("eth1"), d.get("eth2"), d.get("eth3"))'
+      expect: { match: exact, value: "[(20, True, True)] [({{vid}}, True, True)] [({{vid}}, True, True)]" }
+      skills: [net.switching.vlans]
+      weight: 2
+    - { id: library-pair, description: library-south-1 reaches library-south-2, type: reachability, on: library-south-1, target: "10.{{octet}}.20.52", skills: [net.switching.vlans] }
+    - id: staff-separated
+      description: library-south-1 cannot reach staff-south-9
+      type: shell
+      on: library-south-1
+      command: |
+        ip neigh flush dev eth1
+        ping -c2 -W1 10.{{octet}}.20.9 >/dev/null 2>&1 && echo reachable || echo separated
+      expect: { match: exact, value: separated }
+      timeoutSec: 10
+      skills: [net.switching.vlans]
+  misconceptions:
+    - id: vlan20-kept
+      description: Adds the guest VLAN to eth2 and eth3 but leaves them in VLAN 20 as well
+      mutation:
+        on: mv-sw-south-2
+        run: for p in eth2 eth3; do bridge vlan add dev $p vid {{vid}}; done
+      expectFail: [guest-ports]
+  solution:
+    explanation: Add the guest VLAN as untagged PVID on eth2 and eth3 and remove VLAN 20 from them.
+    steps:
+      - on: mv-sw-south-2
+        run: for p in eth2 eth3; do bridge vlan add dev $p vid {{vid}} pvid untagged; bridge vlan del dev $p vid 20; done
+    alternatives:
+      - id: replace-order
+        description: Remove VLAN 20 first, then add the guest VLAN
+        steps:
+          - on: mv-sw-south-2
+            run: |
+              bridge vlan del dev eth2 vid 20; bridge vlan del dev eth3 vid 20
+              bridge vlan add dev eth2 vid {{vid}} pvid untagged; bridge vlan add dev eth3 vid {{vid}} pvid untagged

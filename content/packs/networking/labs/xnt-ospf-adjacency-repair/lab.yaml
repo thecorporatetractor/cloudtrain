@@ -1,0 +1,130 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xnt-ospf-adjacency-repair
+  title: Repair an OSPF adjacency
+  domain: networking
+  frameworks: [ccna:ip-connectivity]
+  difficulty: medium
+  estimatedMinutes: 8
+  tags: [exam, ospf, troubleshooting, frr]
+  version: 1
+spec:
+  description: |
+    **Device:** `mv-campus-east-8` (FRR console)
+
+    `mv-campus-east-8` should be a full OSPF neighbour of `mv-core-8` on the link
+    `eth1` (`10.{{octet}}.3.0/30`, area 0, point-to-point), but the adjacency
+    never reaches Full and the core does not learn the east LAN
+    `10.{{octet}}.{{lan}}.0/24`.
+
+    One OSPF parameter on `mv-campus-east-8` does not match the core. Find it and
+    fix it **on `mv-campus-east-8`** so the adjacency is Full and the core learns
+    the east LAN through OSPF. Do not change `mv-core-8`.
+  objectives:
+    - Find and fix an OSPF neighbour parameter mismatch
+  params:
+    octet: { type: int, min: 20, max: 90 }
+    lan: { type: int, min: 100, max: 199 }
+    fault: { type: choice, values: [hello, dead, area] }
+  topology:
+    entry: workstation
+    nodes:
+      - { name: workstation, driver: container, image: jumphost:1, access: [shell] }
+      - { name: mv-campus-east-8, driver: netdev, image: frr:10, access: [console] }
+      - { name: mv-core-8, driver: netdev, image: frr:10, access: [console] }
+    links:
+      - { a: "mv-core-8:eth1", b: "mv-campus-east-8:eth1", subnet: "10.{{octet}}.3.0/30" }
+  setup:
+    - { on: mv-campus-east-8, run: "ip link add lan1 type dummy 2>/dev/null; ip link set lan1 up" }
+    - on: mv-core-8
+      config: |
+        interface eth1
+         ip address 10.{{octet}}.3.1/30
+         ip ospf area 0
+         ip ospf network point-to-point
+        router ospf
+         ospf router-id 10.255.{{octet}}.1
+    - on: mv-campus-east-8
+      config: |
+        interface eth1
+         ip address 10.{{octet}}.3.2/30
+         ip ospf area 0
+         ip ospf network point-to-point
+        interface lan1
+         ip address 10.{{octet}}.{{lan}}.1/24
+         ip ospf area 0
+         ip ospf passive
+        router ospf
+         ospf router-id 10.255.{{octet}}.8
+    - on: mv-campus-east-8
+      run: |
+        case {{fault}} in
+          hello) vtysh -c 'conf t' -c 'interface eth1' -c 'ip ospf hello-interval 4' ;;
+          dead) vtysh -c 'conf t' -c 'interface eth1' -c 'ip ospf dead-interval 15' ;;
+          area) vtysh -c 'conf t' -c 'interface eth1' -c 'no ip ospf area' -c 'ip ospf area 0.0.0.1' ;;
+        esac
+  checks:
+    - id: adjacency
+      description: mv-core-8 has a Full adjacency with mv-campus-east-8
+      type: shell
+      on: mv-core-8
+      command: |
+        for i in $(seq 20); do
+          s=$(vtysh -c 'show ip ospf neighbor json' | python3 -c '
+        import json,sys
+        d=json.load(sys.stdin).get("neighbors",{})
+        print(" ".join(sorted(n.get("nbrState","").split("/")[0] for k,v in d.items() if k=="10.255.{{octet}}.8" for n in v)))')
+          [ "$s" = Full ] && break; sleep 2
+        done; echo "$s"
+      expect: { match: exact, value: Full }
+      timeoutSec: 50
+      skills: [net.routing.ospf]
+      weight: 2
+    - id: lan-learned
+      description: mv-core-8 learns the east LAN through OSPF
+      type: shell
+      on: mv-core-8
+      command: |
+        for i in $(seq 10); do
+          r=$(vtysh -c 'show ip route ospf json' | python3 -c '
+        import json,sys
+        print("yes" if any(r.get("selected") for r in json.load(sys.stdin).get("10.{{octet}}.{{lan}}.0/24",[])) else "no")')
+          [ "$r" = yes ] && break; sleep 2
+        done; echo $r
+      expect: { match: exact, value: "yes" }
+      timeoutSec: 30
+      skills: [net.routing.ospf]
+      weight: 2
+    - id: core-untouched
+      description: mv-core-8 still uses the default timers in area 0
+      type: shell
+      on: mv-core-8
+      command: |
+        vtysh -c 'show ip ospf interface eth1 json' | python3 -c '
+        import json,sys
+        i=json.load(sys.stdin)["interfaces"]["eth1"]; print(i["area"], i["timerMsecs"], i["timerDeadSecs"])'
+      expect: { match: exact, value: "0.0.0.0 10000 40" }
+      skills: [net.routing.ospf]
+  misconceptions:
+    - id: clear-only
+      description: Restarts the OSPF process instead of fixing the mismatch
+      mutation:
+        on: mv-campus-east-8
+        run: vtysh -c 'clear ip ospf process' && sleep 5
+      expectFail: [adjacency, lan-learned]
+  solution:
+    explanation: |
+      `show ip ospf interface eth1` on both routers shows the hello and dead
+      intervals and the area; the east router differs in one of them. Put it back
+      to the core's values (hello 10 s, dead 40 s, area 0).
+    steps:
+      - on: mv-campus-east-8
+        config: |
+          interface eth1
+           no ip ospf hello-interval
+           no ip ospf dead-interval
+      - on: mv-campus-east-8
+        run: |
+          a=$(vtysh -c 'show running-config' | sed -n '/^interface eth1/,/^exit/s/^ ip ospf area //p')
+          [ "$a" = 0 ] || vtysh -c 'conf t' -c 'interface eth1' -c 'no ip ospf area' -c 'ip ospf area 0'
