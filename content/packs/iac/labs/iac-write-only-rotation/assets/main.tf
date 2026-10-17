@@ -33,10 +33,9 @@ resource "kubernetes_secret_v1" "db" {
     name      = "telemetry-db-credentials"
     namespace = kubernetes_namespace_v1.db.metadata[0].name
   }
-  data = {
-    username = "{{user}}"
-  }
+  # data_wo cannot be combined with data, so the username travels write-only too.
   data_wo = {
+    username = "{{user}}"
     password = ephemeral.random_password.db.result
   }
   data_wo_revision = 1

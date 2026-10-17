@@ -144,6 +144,9 @@ spec:
     - title: Old copies
       body: terraform.tfvars still holds the old token, and terraform.tfstate.backup keeps the previous state. Both have to go.
       cost: 1
+    - title: Still in state after the switch?
+      body: An existing Secret switched from `data` to `data_wo` in place keeps its previous `data` in state, because the provider goes on reading back the keys it managed. Create a fresh object with `-replace=kubernetes_secret_v1.feed`.
+      cost: 2
   misconceptions:
     - id: sensitive-is-enough
       description: Rotates by writing the new token into terraform.tfvars and keeping data.
@@ -175,7 +178,7 @@ spec:
           open(p, "w").write(s)
           PY
           rm -f terraform.tfvars
-          iac apply -auto-approve -input=false -no-color -var "grid_operator_token=$(cat ~/incident/new-token.txt)"
+          iac apply -auto-approve -input=false -no-color -replace=kubernetes_secret_v1.feed -var "grid_operator_token=$(cat ~/incident/new-token.txt)"
           rm -f terraform.tfstate.backup
   solution:
     explanation: |
@@ -183,8 +186,9 @@ spec:
       An ephemeral variable is never written to plan or state files and may only feed
       ephemeral contexts such as write-only arguments. `data_wo` sends the token to
       the cluster without recording it; `data_wo_revision` is what Terraform tracks,
-      so the next rotation is a revision bump. Deleting terraform.tfvars and the
-      state backup removes the last copies.
+      so the next rotation is a revision bump. The Secret is replaced once, because an
+      in-place switch would keep the previously managed `data` in state. Deleting
+      terraform.tfvars and the state backup removes the last copies.
     steps:
       - on: workstation
         as: learner
@@ -200,6 +204,8 @@ spec:
           open(p, "w").write(s)
           PY
           rm -f terraform.tfvars
-          TF_VAR_grid_operator_token=$(cat ~/incident/new-token.txt) iac apply -auto-approve -input=false -no-color
+          # Switching an existing Secret from data to data_wo in place leaves the old data
+          # in state (the provider keeps reading back the keys it managed): replace it.
+          TF_VAR_grid_operator_token=$(cat ~/incident/new-token.txt) iac apply -auto-approve -input=false -no-color -replace=kubernetes_secret_v1.feed
           rm -f terraform.tfstate.backup
           grep -c gop- terraform.tfstate || true
