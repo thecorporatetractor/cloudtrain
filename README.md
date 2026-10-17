@@ -110,8 +110,8 @@ objectives and never copy exam content.
 | Containers with Docker | 11 | 135 | 2 | — | 24 |
 | Infrastructure as code with Terraform | 5 | 99 | 2 | — | 48 |
 | Configuration management and automation | 7 | 97 | 1 | — | — |
-| Network administration | 4 | 77 | 1 | — | 2 |
-| **Total** | **43** | **878** (499 learning, 379 exam tasks) | **13** | **155** | **131** |
+| Network administration | 4 | 77 | 1 | 17 | 3 |
+| **Total** | **43** | **878** (499 learning, 379 exam tasks) | **13** | **172** | **132** |
 <!-- curriculum-table:end -->
 
 "Built" means written and passing schema, skill and compile validation;
@@ -133,11 +133,6 @@ CloudTrain is in early development. Here is exactly where it stands.
   host namespace (a learner's privileged pod is refused), `kubeadm init` retried
   with a configurable provisioning timeout, lab links that carry bridged and
   VLAN-tagged traffic, and an opt-in sudo-capable learner for pod labs.
-  Round 4: rate-limited lab links (broadcast-storm labs can run), writable
-  network sysctls in lab network nodes, a wired entry node reachable over its
-  links, `kubectl debug` refused up front with a clear message when it would
-  break Pod Security in a virtual cluster, and a 20 s default timeout for
-  Kubernetes checks.
 - Exam engine: drawing tasks, the shared environment, timer freeze, auto-solved
   runs scoring 100%, unsolved runs failing, and retakes drawing different tasks.
 - Exam simulations through the gateway with real sign-in (Keycloak and CSRF),
@@ -162,6 +157,7 @@ CloudTrain is in early development. Here is exactly where it stands.
 
 **Known gaps**
 - Kata Containers isolation for production.
+- Lab links have no rate limit yet, so broadcast-storm labs are held back.
 
 **Not started**
 - Lab content for Ansible, and for Linux labs that need VMs or Kata.
