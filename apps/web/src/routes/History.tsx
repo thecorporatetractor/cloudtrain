@@ -127,9 +127,7 @@ function HistoryScreen() {
                       <OutcomeBadge outcome={a.outcome} />
                     </td>
                     <td className="tnum small">{a.outcome === 'abandoned' || a.validations === 0 ? '—' : a.score}</td>
-                    <td className="small tnum">
-                      {a.checksPassed}/{a.checksTotal}
-                    </td>
+                    <td className="small tnum">{a.validations === 0 ? '—' : `${a.checksPassed}/${a.checksTotal}`}</td>
                     <td className="small tnum" title={`Environment open ${formatDuration(a.durationS)}`}>
                       {a.practiceS ? formatDuration(a.practiceS) : <span className="subtle">not validated</span>}
                     </td>
