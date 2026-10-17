@@ -33,7 +33,7 @@ export type Action = {
     content?: string;
     mode?: string;
     /**
-     * Asset path relative to the lab directory (beside lab.yaml), written to `path`. The compiler inlines the asset as `content`, so it is templated like the rest of the lab: every {{param}} placeholder is replaced with the session's value, and an undefined placeholder fails validation. Assets that must contain literal double braces (Helm or Go templates, Jinja) write them with other delimiters and convert at setup time (e.g. `<% %>` then sed). Use instead of `content` for scripts and fixtures too large to inline. Must stay inside the lab directory: no leading '/', no '.' or '..' segments.
+     * Asset path relative to the lab directory (beside lab.yaml), written to `path`. The compiler inlines the asset as `content`, so it is templated like the rest of the lab: every {{param}} placeholder is replaced with the session's value, and an undefined placeholder fails validation. Literal double braces: `{{ name }}` with inner whitespace and an undeclared name stays as written (Jinja/Ansible style); other literal braces (Helm or Go templates, unspaced Jinja) are written with other delimiters and converted at setup time (e.g. `<% %>` then sed). Use instead of `content` for scripts and fixtures too large to inline. Must stay inside the lab directory: no leading '/', no '.' or '..' segments.
      */
     source?: string;
   };
@@ -73,7 +73,7 @@ export interface Lab {
     description: string;
     objectives?: string[];
     /**
-     * Values randomised per learner attempt. Referenced as {{name}} anywhere in description, setup, checks and solution.
+     * Values randomised per learner attempt. Referenced as {{name}} anywhere in description, setup, checks and solution. `{{ name }}` written with inner whitespace references a param only when `name` is declared here; otherwise it stays literal text (Jinja in Ansible playbooks and templates), so avoid param names that clash with Jinja variables the lab uses.
      */
     params?: {
       [k: string]: {

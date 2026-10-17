@@ -73,12 +73,17 @@ func Resolve(spec *labsv1.LabTemplateSpec, seed int64, opts ResolveOptions) (*la
 }
 
 // Substitute replaces {{name}} placeholders using values. Unknown names are
-// an error.
+// an error, except "{{ name }}" written with inner whitespace, which stays
+// literal (Jinja in Ansible content, see literalPlaceholder).
 func Substitute(spec *labsv1.LabTemplateSpec, values map[string]string) (*labsv1.LabTemplateSpec, error) {
 	var missing []string
+	known := func(n string) bool { _, ok := values[n]; return ok }
 	out, err := walkStrings(spec, func(path, v string) string {
 		return placeholderRe.ReplaceAllStringFunc(v, func(m string) string {
 			name := placeholderRe.FindStringSubmatch(m)[1]
+			if literalPlaceholder(m, name, known) {
+				return m
+			}
 			val, ok := values[name]
 			if !ok {
 				missing = append(missing, path+": {{"+name+"}}")
