@@ -42,8 +42,15 @@ Exam pool: 15 of 30 tasks exist, exactly the draw of every objective (3/3/4/2/2/
 `labctl exam compile --allow-missing sim-net-associate` passes (shared-node
 consistency included); without `--allow-missing` it fails on the 15 missing
 tasks. Every task uses its own device names; only `workstation` (jumphost:1,
-entry) is shared. **Not run yet:** `labctl exam run --auto-solve/--no-solve`
-(blocked by the labctl netdev bug below, and the pool has no retake headroom).
+entry) is shared. **Exam run live** (platform round 5, 2026-10-18, 55 nodes, one pod
+slot, scoped manager with the lab-peer policy): `labctl exam run --allow-missing
+--auto-solve` scored **100 %** (every task pass, ready in 277 s, teardown clean, 523 s
+in all) and `--no-solve` **14.3 %** (fail; partial credit only where a check holds on
+the untouched seed, e.g. ACL/SSH/PAT tasks 38-43 %; teardown clean), reports in
+`deploy/.results/exams/sim-net-associate-{auto-solve,no-solve}.json`. A first
+auto-solve run also scored 100 % but its teardown hit the Kube-OVN CNI hang under host
+load ~190 (`-cni-hang.json`; `docs/dev-environment.md`, known gap 9). No exam content
+had to change. Retakes still draw the same 15 tasks (no headroom in the pool).
 
 Still drafts in `docs/handoffs/networking-drafts/` (not touched this round, static
 checks were clean in round 1): the fundamentals, static/OSPF, services and NAT
@@ -105,6 +112,5 @@ trailers), `sync_pack.py` (pack courses from the curriculum; exam tasks stay out
 courses), `setstatus.py`, `x.sh`, `l2shim.sh` (obsolete). Until the labctl netdev
 bug is fixed, point `v.sh` at a labctl built with the one-line patch.
 
-Next: fix the labctl netdev bug (platform), run the sim-net-associate exam
-(`--auto-solve`, `--no-solve`), verify the 22 drafts in path order, then write the
-missing 15 pool tasks so retakes get a fresh draw.
+Next: verify the 22 drafts in path order, then write the missing 15 pool tasks so
+retakes get a fresh draw (the exam itself now runs end to end: 100 % / 14.3 %).
