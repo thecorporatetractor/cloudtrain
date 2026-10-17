@@ -20,6 +20,10 @@ Kata and the kubeadm proof under load:
    backend by name; another lab, the API server, the host, the internet and a platform
    pod all refused). Authoring rules in `docs/k8s-readiness.md` ("Access"). Unblocks
    separate Moto/S3/Git nodes (IaC) and Ansible managed nodes.
+   Also in round 5: headless Entra sign-in for local end-to-end tests
+   (`deploy/scripts/entra-login.mjs`, #42), `net-fix-broadcast-storm` verified (#44),
+   the `sim-net-associate` exam run live (100 % / 14.3 %), and a Kube-OVN CNI hang under
+   heavy load with its recovery (`docs/dev-environment.md`, known gap 9).
 
 0. **Round 4.** Kubernetes checks (k8s-query, k8s-can-i, k8s-context) default to a
    20 s timeout (was 5 s). Every vcluster gets the ValidatingAdmissionPolicy
@@ -88,7 +92,7 @@ Kata and the kubeadm proof under load:
 | k8s-admin | 88 | 5 | 63 | 18 blocked on add-ons, 2 not written | `docs/handoffs/k8s-admin.md` |
 | k8s-dev | 42 | 33 (every V-tier lab; round 3, 2026-10-17); sim-k8s-developer exam run live: auto-solve 100 %, no-solve 14.5 % | 5 K-tier (vm slot) | 4 blocked (buildah, metrics-server, ingress) | `docs/handoffs/k8s-dev.md` |
 | k8s-sec | 51 | 12 (every V-tier lab; round 3) | 27 K-tier (vm slot) | 12 blocked on security tooling | `docs/handoffs/k8s-sec.md` |
-| networking | 77 | 25 (net-fix-broadcast-storm in platform round 5; round 3, 2026-10-17: 9 learning labs incl. every VLAN/trunk/STP/LACP/VRRP lab, 15 sim-net-associate tasks = every objective's draw; exam compiles with `--allow-missing`, exam run not yet done) | 22 drafts in `docs/handoffs/networking-drafts/` | 15 pool tasks, SR Linux/Ansible labs, security/VPN learning labs; `labctl verify` cannot exec steps on FRR nodes (see handoff) | `docs/handoffs/networking.md` |
+| networking | 77 | 25 (net-fix-broadcast-storm in platform round 5; round 3, 2026-10-17: 9 learning labs incl. every VLAN/trunk/STP/LACP/VRRP lab, 15 sim-net-associate tasks = every objective's draw; exam compiles with `--allow-missing`; exam run live in platform round 5: auto-solve 100 %, no-solve 14.3 %, clean teardowns) | 22 drafts in `docs/handoffs/networking-drafts/` | 15 pool tasks, SR Linux/Ansible labs, security/VPN learning labs; `labctl verify` cannot exec steps on FRR nodes (see handoff) | `docs/handoffs/networking.md` |
 | linux-a | 62 | 1 | 21 | ~40 not started (sudo, mirror, mis-tiered) | `docs/handoffs/linux-a.md` |
 | original 11 K8s labs | 11 | 4+ | — | — | `content/packs/kubernetes` |
 | iac (wave 2) | 99 | 48 (23 foundations labs + 25 sim-iac-associate tasks; exam runs 100 % / 11.7 %) | 0 | 31 learning labs, 18 sim-iac-advanced tasks, 2 capstone tasks not started | `docs/handoffs/iac.md` |

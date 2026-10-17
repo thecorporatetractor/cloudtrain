@@ -143,6 +143,8 @@ CloudTrain is in early development. Here is exactly where it stands.
   from the platform.
 - Exam engine: drawing tasks, the shared environment, timer freeze, auto-solved
   runs scoring 100%, unsolved runs failing, and retakes drawing different tasks.
+  The networking exam simulation runs end to end on 55 lab nodes (auto-solved
+  100%, unsolved 14.3%).
 - Exam simulations through the gateway with real sign-in (Keycloak and CSRF),
   run by the same in-cluster orchestrator as the web app's labs.
 - Platform: SSO with real Microsoft Entra ID and brokered IdPs, roles, Postgres

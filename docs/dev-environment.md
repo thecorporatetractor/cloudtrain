@@ -637,6 +637,20 @@ Status and measurements: `docs/handoffs/foundations.md`.
 9. Not covered yet: Clabernetes and netdev nodes, `tc netem` impairment, link capture,
    the Kata runtime for containers (runc locally), and warm pools / VM snapshots.
 
+9. **Kube-OVN CNI DEL calls can hang under heavy load** (platform round 5, 2026-10-18).
+   Tearing down the 55-node `sim-net-associate` environment at host load ~90-190 left 33
+   pods `Terminating` for 40 minutes: kubelet reported `KillPodSandbox ... DeadlineExceeded`,
+   the worker's `kube-ovn-cni` daemon logged no `del port request` after the burst, and 43
+   `/opt/cni/bin/kube-ovn` DEL processes (several labs' pods, not only the exam's) sat in
+   futex waits burning ~15 % CPU each, which by itself pushed the load from ~60 to ~200.
+   Recovery, without restarting the cluster: delete the worker's `kube-ovn-cni` pod (the
+   DaemonSet recreates it; running pods keep their network), then `kill -9` the
+   `/opt/cni/bin/kube-ovn` processes older than 15 minutes on the worker
+   (`docker exec cloudtrain-dev-worker ...`); kubelet retries the DELs against the new
+   daemon and the pods are gone within a minute. Two later teardowns of the same
+   environment at load ~60 were clean. Check for it with
+   `docker exec cloudtrain-dev-worker sh -c 'ps -eo etimes,args | grep "[/]opt/cni/bin/kube-ovn"'`.
+
 ## What changes for the vCenter target (nested ESXi / vSphere VMs)
 
 | Local (kind on WSL2) | vCenter production |
