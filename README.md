@@ -107,11 +107,11 @@ objectives and never copy exam content.
 | --- | --- | --- | --- | --- | --- |
 | Kubernetes | 5 | 192 | 3 | 136 | 54 |
 | Linux administration | 11 | 278 | 3 | 21 | 1 |
-| Containers with Docker | 11 | 135 | 2 | 18 | 6 |
+| Containers with Docker | 11 | 135 | 2 | — | 24 |
 | Infrastructure as code with Terraform | 5 | 99 | 2 | — | 48 |
 | Configuration management and automation | 7 | 97 | 1 | — | — |
 | Network administration | 4 | 77 | 1 | — | 2 |
-| **Total** | **43** | **878** (499 learning, 379 exam tasks) | **13** | **175** | **111** |
+| **Total** | **43** | **878** (499 learning, 379 exam tasks) | **13** | **157** | **129** |
 <!-- curriculum-table:end -->
 
 "Built" means written and passing schema, skill and compile validation;

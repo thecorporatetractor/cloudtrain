@@ -120,7 +120,7 @@ linux and networking, so containers labs are not shown in the UI yet.
 
 ## Status
 
-12 learning labs and 12 exam tasks authored; 6 verified live. Source of truth: `status`/`notes` in `content/curriculum.yaml`.
+12 learning labs and 12 exam tasks authored; 24 verified live. Source of truth: `status`/`notes` in `content/curriculum.yaml`.
 
 ### Learning labs (path order: ctr-foundations, then ctr-building-images module 1)
 
@@ -130,31 +130,31 @@ linux and networking, so containers labs are not shown in the UI yet.
 | `ctr-override-defaults` | verified | verified live 2026-10-17 on docker-vm:29 (6 runs, 764s); tier-B Kata dockerd:29 not built yet |
 | `ctr-exec-into-subtitle` | verified | verified live 2026-10-17 on docker-vm:29 (6 runs, 684s); tier-B Kata dockerd:29 not built yet |
 | `ctr-inspect-report` | verified | verified live 2026-10-17 on docker-vm:29 (6 runs, 995s); tier-B Kata dockerd:29 not built yet |
-| `ctr-tag-vs-digest` | built | runs on docker-vm:29 (tier C VM) with registry:3 as a container on the host; live verify pending |
+| `ctr-tag-vs-digest` | verified | verified live 2026-10-17 on docker-vm:29 (6 runs, 1601s); tier-B Kata dockerd:29 not built yet |
 | `ctr-user-bridge-dns` | verified | verified live 2026-10-17 on docker-vm:29 (6 runs, 980s); tier-B Kata dockerd:29 not built yet |
 | `ctr-volume-vs-bind` | verified | verified live 2026-10-17 on docker-vm:29 (6 runs, 794s); tier-B Kata dockerd:29 not built yet |
-| `ctr-disk-reclaim` | built | runs on docker-vm:29 (tier C VM) until the tier-B Kata dockerd:29 image exists; live verify pending |
-| `ctr-dockerfile-catalogue-api` | built | runs on docker-vm:29 (tier C VM) until the tier-B Kata dockerd:29 image exists; live verify pending |
-| `ctr-build-args-labels` | built | runs on docker-vm:29 (tier C VM) until the tier-B Kata dockerd:29 image exists; live verify pending |
-| `ctr-exec-form-signals` | built | runs on docker-vm:29 (tier C VM) until the tier-B Kata dockerd:29 image exists; live verify pending |
-| `ctr-healthcheck` | built | runs on docker-vm:29 (tier C VM) until the tier-B Kata dockerd:29 image exists; live verify pending |
+| `ctr-disk-reclaim` | verified | verified live 2026-10-17 on docker-vm:29 (6 runs, 1367s); tier-B Kata dockerd:29 not built yet |
+| `ctr-dockerfile-catalogue-api` | verified | verified live 2026-10-17 on docker-vm:29 (5 runs, 675s); tier-B Kata dockerd:29 not built yet |
+| `ctr-build-args-labels` | verified | verified live 2026-10-17 on docker-vm:29 (4 runs, 358s); tier-B Kata dockerd:29 not built yet |
+| `ctr-exec-form-signals` | verified | verified live 2026-10-17 on docker-vm:29 (5 runs, 558s); tier-B Kata dockerd:29 not built yet |
+| `ctr-healthcheck` | verified | verified live 2026-10-17 on docker-vm:29 (5 runs, 1065s); tier-B Kata dockerd:29 not built yet |
 
 ### Exam tasks (`sim-containers-docker` pools)
 
 | Task | Pool | Status | Notes |
 |---|---|---|---|
-| `xcd-build-entrypoint-signals` | build | built | live verify pending |
-| `xcd-compose-fix-broken-stack` | compose | built | live verify pending |
-| `xcd-compose-health-order` | compose | built | live verify pending |
-| `xcd-net-publish-loopback` | networking | built | live verify pending |
-| `xcd-net-user-bridge` | networking | built | live verify pending |
-| `xcd-ops-oom-diagnose` | operations | built | live verify pending |
-| `xcd-ops-restart-survive` | operations | built | live verify pending |
-| `xcd-registry-tls-push` | registry | built | live verify pending |
-| `xcd-sec-least-privilege` | security | built | live verify pending |
-| `xcd-storage-mount-mix` | storage | built | live verify pending |
-| `xcd-storage-volume-restore` | storage | built | live verify pending |
-| `xcd-supply-leaked-secret` | supply-chain | built | live verify pending |
+| `xcd-build-entrypoint-signals` | build | verified | verified live 2026-10-17 on docker-vm:29 (3 runs); reboot pass not exercised by labctl verify |
+| `xcd-compose-fix-broken-stack` | compose | verified | verified live 2026-10-17 on docker-vm:29 (3 runs, 297s); reboot pass not exercised by labctl verify |
+| `xcd-compose-health-order` | compose | verified | verified live 2026-10-17 on docker-vm:29 (3 runs, 325s); reboot pass not exercised by labctl verify |
+| `xcd-net-publish-loopback` | networking | verified | verified live 2026-10-17 on docker-vm:29 (3 runs, 237s); reboot pass not exercised by labctl verify |
+| `xcd-net-user-bridge` | networking | verified | verified live 2026-10-17 on docker-vm:29 (4 runs, 266s); reboot pass not exercised by labctl verify |
+| `xcd-ops-oom-diagnose` | operations | verified | verified live 2026-10-17 on docker-vm:29 (4 runs, 265s); reboot pass not exercised by labctl verify |
+| `xcd-ops-restart-survive` | operations | verified | verified live 2026-10-17 on docker-vm:29 (5 runs, 363s); reboot pass not exercised by labctl verify |
+| `xcd-registry-tls-push` | registry | verified | verified live 2026-10-17 on docker-vm:29 (3 runs, 246s); reboot pass not exercised by labctl verify |
+| `xcd-sec-least-privilege` | security | verified | verified live 2026-10-17 on docker-vm:29 (4 runs, 258s); reboot pass not exercised by labctl verify |
+| `xcd-storage-mount-mix` | storage | verified | verified live 2026-10-17 on docker-vm:29 (3 runs, 245s); reboot pass not exercised by labctl verify |
+| `xcd-storage-volume-restore` | storage | verified | verified live 2026-10-17 on docker-vm:29 (3 runs, 257s); reboot pass not exercised by labctl verify |
+| `xcd-supply-leaked-secret` | supply-chain | verified | verified live 2026-10-17 on docker-vm:29 (4 runs, 290s); reboot pass not exercised by labctl verify |
 
 Not written yet (12). Writable with the current image: `xcd-build-bake-targets`, `xcd-build-cache-secret`, `xcd-compose-env-profiles`, `xcd-compose-secret-file`, `xcd-net-address-pool`, `xcd-net-docker-user-rule`, `xcd-ops-log-rotation`. Blocked on image content docker-vm:29 does not have yet: `xcd-build-multistage-nonroot` (Go toolchain image), `xcd-ops-debug-shell-less` (a distroless/static base), `xcd-registry-multiarch-index` (arm64 base content + binfmt), `xcd-sec-socket-proxy` (a socket-proxy image), `xcd-supply-sbom-sign` (cosign binary). Add those to `tools/images/docker-vm/preload-images.txt` or the guest script and rebuild. The other 79 learning labs of the domain (paths ctr-building-images module 2 onward, compose, networking, storage, registries, security, troubleshooting, internals, podman, swarm) are not started.
 
