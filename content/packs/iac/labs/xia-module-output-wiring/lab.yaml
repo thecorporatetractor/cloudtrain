@@ -1,0 +1,138 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xia-module-output-wiring
+  title: Wire one module's output into another
+  domain: iac
+  frameworks: [tf-associate:modules]
+  difficulty: medium
+  estimatedMinutes: 7
+  tags: [exam, terraform, modules, outputs]
+  version: 1
+spec:
+  description: |
+    **Directory:** `~/exam/forecast-wiring` · **Cluster:** `sm-grid`
+
+    The stack (applied) calls two local modules: `storage` creates the claim
+    `<prefix>-data` and `workload` creates Deployment `forecast`, which still
+    mounts a hard-coded, non-existent claim `forecast-scratch`.
+
+    Make the Deployment mount the claim that `storage` creates, with **no
+    hard-coded claim name anywhere**: `storage` exposes the claim name as an
+    output named **`claim_name`**, `workload` takes it as an input variable
+    named **`claim_name`**, and the root module passes one to the other.
+    Apply; a following plan must report no changes. (Only the Deployment's spec
+    is graded; its Pod may stay Pending.)
+  objectives:
+    - Expose module outputs and pass them into other modules
+  params:
+    prefix:
+      type: choice
+      values: [forecast-gbm, forecast-lstm, forecast-arima]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+      - name: sm-grid
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: sm-grid
+  setup:
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xia-module-output-wiring/stack/providers.tf, source: assets/stack/providers.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xia-module-output-wiring/stack/main.tf, source: assets/stack/main.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xia-module-output-wiring/stack/modules/storage/main.tf, source: assets/stack/modules/storage/main.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xia-module-output-wiring/stack/modules/workload/main.tf, source: assets/stack/modules/workload/main.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xia-module-output-wiring/seed.sh, source: assets/seed.sh, mode: "0755"}
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/exam
+    - on: workstation
+      as: learner
+      timeoutSec: 300
+      run: /var/tmp/ct-seed/xia-module-output-wiring/seed.sh xia-module-output-wiring forecast-wiring apply
+  teardown:
+    - on: sm-grid
+      run: kubectl delete namespace forecast-wiring --ignore-not-found --wait=false
+  checks:
+    - id: mounts-claim
+      description: Deployment forecast mounts claim {{prefix}}-data, which exists
+      type: shell
+      on: sm-grid
+      skills: [iac.modules.authoring]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        c=$(kubectl -n forecast-wiring get deployment forecast -o jsonpath='{.spec.template.spec.volumes[?(@.name=="data")].persistentVolumeClaim.claimName}' 2>/dev/null)
+        kubectl -n forecast-wiring get pvc "$c" -o name >/dev/null 2>&1 && e=exists || e=missing
+        echo "claim=$c $e"
+      expect: {match: exact, value: "claim={{prefix}}-data exists"}
+    - id: wired
+      description: With another prefix the planned Deployment follows the storage module's claim
+      type: shell
+      on: workstation
+      skills: [iac.modules.authoring, iac.language.outputs-locals]
+      weight: 2
+      timeoutSec: 120
+      command: |
+        ct-iac planjson /home/learner/exam/forecast-wiring -var prefix=probe | jq -r '
+          [.planned_values | .. | objects | select(.type? == "kubernetes_deployment_v1" or .type? == "kubernetes_deployment") | .values.spec[0].template[0].spec[0].volume[]?.persistent_volume_claim[0].claim_name] | join(",")' 2>/dev/null
+      expect: {match: exact, value: probe-data}
+    - id: module-contract
+      description: storage has an output claim_name and workload an input claim_name
+      type: shell
+      on: workstation
+      skills: [iac.modules.authoring, iac.language.outputs-locals]
+      timeoutSec: 120
+      command: |
+        ct-iac planjson /home/learner/exam/forecast-wiring | jq -r '.configuration.root_module.module_calls as $m
+          | "output=\($m.storage.module.outputs.claim_name != null) input=\($m.workload.module.variables.claim_name != null)"' 2>/dev/null
+      expect: {match: exact, value: output=true input=true}
+    - id: converged
+      description: A new plan of ~/exam/forecast-wiring reports no changes
+      type: shell
+      on: workstation
+      skills: [iac.modules.authoring]
+      timeoutSec: 120
+      command: ct-iac plan /home/learner/exam/forecast-wiring
+      expect: {match: exact, value: no-changes}
+  misconceptions:
+    - id: hard-code-new-name
+      description: Replaces the hard-coded claim name with today's claim name.
+      feedback: The Deployment works today, but renaming the storage breaks it again. Pass the storage module's output in.
+      expectFail: [wired, module-contract]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          cd ~/exam/forecast-wiring
+          sed -i 's/            claim_name = "forecast-scratch"/            claim_name = "{{prefix}}-data"/' modules/workload/main.tf
+          iac apply -auto-approve -input=false -no-color
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/exam/forecast-wiring
+          cat >> modules/storage/main.tf <<'HCL'
+
+          output "claim_name" {
+            value = kubernetes_persistent_volume_claim_v1.data.metadata[0].name
+          }
+          HCL
+          sed -i 's/            claim_name = "forecast-scratch"/            claim_name = var.claim_name/' modules/workload/main.tf
+          printf '\nvariable "claim_name" {\n  type = string\n}\n' >> modules/workload/main.tf
+          sed -i 's|^module "workload" {|module "workload" {\n  claim_name = module.storage.claim_name|' main.tf
+          iac fmt -recursive
+          iac apply -auto-approve -input=false -no-color

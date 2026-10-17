@@ -1,0 +1,149 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xia-check-block-endpoint
+  title: Warn about an unhealthy endpoint with a check block
+  domain: iac
+  frameworks: [tf-associate:custom-conditions]
+  difficulty: medium
+  estimatedMinutes: 6
+  tags: [exam, terraform, check-blocks, http-provider]
+  version: 1
+spec:
+  description: |
+    **Directory:** `~/exam/gateway-check` · **Cluster:** `sm-grid`
+
+    Add a check block named **`telemetry_health`** to the gateway stack. It
+    reads `var.health_url` with a `http` data source **scoped to the check
+    block** and asserts that the endpoint answers with **status code 200**.
+
+    The gateway is down today: plans and applies must show a **warning** for the
+    check and still succeed. Apply the stack (it is not applied yet); a following
+    plan must report no changes.
+  objectives:
+    - Report continuous health with a check block and a scoped data source
+  params:
+    upstream:
+      type: choice
+      values: [grid-a.saltmarsh.example, grid-b.saltmarsh.example]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+      - name: sm-grid
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: sm-grid
+  setup:
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xia-check-block-endpoint/stack/providers.tf, source: assets/stack/providers.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xia-check-block-endpoint/stack/main.tf, source: assets/stack/main.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xia-check-block-endpoint/seed.sh, source: assets/seed.sh, mode: "0755"}
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/exam
+    - on: workstation
+      as: learner
+      timeoutSec: 120
+      run: /var/tmp/ct-seed/xia-check-block-endpoint/seed.sh xia-check-block-endpoint gateway-check init
+  teardown:
+    - on: sm-grid
+      run: kubectl delete namespace telemetry-gateway --ignore-not-found --wait=false
+  checks:
+    - id: warns-when-down
+      description: With the gateway down the plan succeeds and warns about check telemetry_health
+      type: shell
+      on: workstation
+      skills: [iac.quality.conditions]
+      weight: 2
+      timeoutSec: 120
+      command: |
+        out=$(ct-iac run /home/learner/exam/gateway-check iac plan -input=false -lock=false -no-color 2>&1) || { echo "plan failed"; exit 0; }
+        echo "$out" | grep -q 'Warning:' && echo "$out" | grep -q 'check "telemetry_health"' && echo warned || echo "no warning"
+      expect: {match: exact, value: warned}
+    - id: quiet-when-healthy
+      description: Against an endpoint answering 200 the plan shows no warning for the check
+      type: shell
+      on: workstation
+      skills: [iac.quality.conditions]
+      weight: 2
+      timeoutSec: 120
+      command: |
+        t=$(mktemp -d /tmp/health.XXXXXX); echo ok > "$t/health"; chmod -R a+rX "$t"
+        runuser -u learner -- python3 -m http.server 18181 --bind 127.0.0.1 --directory "$t" >/dev/null 2>&1 &
+        p=$!; sleep 2
+        out=$(ct-iac run /home/learner/exam/gateway-check iac plan -input=false -lock=false -no-color -var health_url=http://127.0.0.1:18181/health 2>&1); rc=$?
+        kill $p 2>/dev/null; rm -rf "$t"
+        [ $rc -eq 0 ] || { echo "plan failed"; exit 0; }
+        echo "$out" | grep -q 'check "telemetry_health"' && echo warned || echo quiet
+      expect: {match: exact, value: quiet}
+    - id: applied
+      description: gateway-settings was applied
+      type: k8s-query
+      skills: [iac.quality.conditions]
+      weight: 0.5
+      query: {cluster: sm-grid, resource: configmap, name: gateway-settings, namespace: telemetry-gateway, jsonpath: "{.data.upstream}"}
+      expect: {match: exact, value: "{{upstream}}"}
+    - id: converged
+      description: A new plan of ~/exam/gateway-check changes no managed resource (the check's read is deferred while the gateway is down)
+      type: shell
+      on: workstation
+      skills: [iac.quality.conditions]
+      timeoutSec: 120
+      command: |
+        ct-iac planjson /home/learner/exam/gateway-check | jq -r '[.resource_changes[]? | select(.mode == "managed" and .change.actions != ["no-op"])] | length' 2>/dev/null | grep . || echo error
+      expect: {match: exact, value: "0"}
+  misconceptions:
+    - id: top-level-data
+      description: Reads the endpoint with a top-level data source and a postcondition, which fails every run while the gateway is down.
+      feedback: Errors from a top-level data source or condition stop the run. A data source scoped inside the check block only produces a warning.
+      expectFail: [warns-when-down, applied, converged]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 200
+        run: |
+          cd ~/exam/gateway-check
+          cat >> main.tf <<'HCL'
+
+          data "http" "health" {
+            url = var.health_url
+            lifecycle {
+              postcondition {
+                condition     = self.status_code == 200
+                error_message = "Telemetry gateway is unhealthy."
+              }
+            }
+          }
+          HCL
+          iac init -input=false -no-color
+          iac apply -auto-approve -input=false -no-color || true
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 200
+        run: |
+          set -e
+          cd ~/exam/gateway-check
+          cat >> main.tf <<'HCL'
+
+          check "telemetry_health" {
+            data "http" "gateway" {
+              url = var.health_url
+            }
+
+            assert {
+              condition     = data.http.gateway.status_code == 200
+              error_message = "Telemetry gateway ${var.health_url} is not healthy."
+            }
+          }
+          HCL
+          iac init -input=false -no-color
+          iac apply -auto-approve -input=false -no-color

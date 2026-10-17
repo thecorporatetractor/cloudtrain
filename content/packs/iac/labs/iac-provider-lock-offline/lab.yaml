@@ -1,0 +1,272 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: iac-provider-lock-offline
+  title: Pin provider versions and commit a lock file offline
+  domain: iac
+  frameworks: [tf-associate:fundamentals]
+  difficulty: easy
+  estimatedMinutes: 15
+  tags: [terraform, providers, version-constraints, lock-file, offline]
+  version: 1
+spec:
+  description: |
+    The grid-telemetry repository in `~/stacks/grid-telemetry` (a Git repository)
+    names its providers but accepts **any** version of them, so two engineers can
+    get different providers on the same day. Platform engineering approved these
+    releases:
+
+    | Provider | Approved |
+    |---|---|
+    | `hashicorp/kubernetes` | the **3.3** minor release line |
+    | `hashicorp/random` | the **{{random_minor}}** minor release line |
+
+    The workstation is offline: providers install from the filesystem mirror in
+    `/opt/cloudtrain/providers` (already configured in `~/.terraformrc`), which
+    holds more than one release of `random`.
+
+    1. Add version constraints to `versions.tf` so that each provider can only
+       ever resolve to a release of its approved minor line (patch releases
+       allowed).
+    2. Initialise the stack, so that `.terraform.lock.hcl` records the
+       selected versions.
+    3. Build machines and some laptops are `linux_arm64`: make the lock file
+       carry checksums for **both** `linux_amd64` and `linux_arm64` for every
+       provider, using only the offline mirror.
+    4. Commit `versions.tf` and `.terraform.lock.hcl` to the repository's current
+       branch. Nothing needs to be applied.
+  objectives:
+    - Write provider version constraints with the pessimistic operator
+    - Explain what the dependency lock file records
+    - Lock providers for several platforms from a filesystem mirror
+  params:
+    random_minor:
+      type: choice
+      values: ["3.7", "3.8"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+  setup:
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/stacks /home/learner/stacks/grid-telemetry
+    - on: workstation
+      file: {path: /home/learner/stacks/grid-telemetry/versions.tf, source: assets/versions.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /home/learner/stacks/grid-telemetry/main.tf, source: assets/main.tf, mode: "0644"}
+    - on: workstation
+      run: chown -R learner:learner /home/learner/stacks/grid-telemetry
+    - on: workstation
+      as: learner
+      run: |
+        set -eu
+        cd ~/stacks/grid-telemetry
+        [ -d .git ] && exit 0
+        git init -q -b main
+        git config user.name "Grid Platform"
+        git config user.email platform@saltmarsh.example
+        printf '.terraform/\n*.tfstate\n*.tfstate.*\n' > .gitignore
+        git add . && git commit -q -m "grid-telemetry: initial stack"
+  checks:
+    - id: random-pinned
+      description: A fresh init with -upgrade selects the newest approved random release, never a newer minor
+      type: shell
+      on: workstation
+      skills: [iac.foundations.provider-install]
+      weight: 2
+      timeoutSec: 120
+      command: |
+        t=$(mktemp -d /tmp/lockcheck.XXXXXX); cp /home/learner/stacks/grid-telemetry/*.tf "$t"/ 2>/dev/null; chown -R learner:learner "$t"
+        ct-iac run "$t" iac init -upgrade -backend=false -input=false -no-color >/dev/null 2>&1
+        v=$(awk '/provider ".*\/hashicorp\/random"/{p=1} p && /version *=/{gsub(/[" ]/,""); split($0,a,"="); print a[2]; exit}' "$t/.terraform.lock.hcl" 2>/dev/null)
+        rm -rf "$t"; echo "${v:-none}"
+      expect: {match: regex, value: '^{{random_minor}}\.[0-9]+$'}
+    - id: kubernetes-constrained
+      description: versions.tf constrains hashicorp/kubernetes to the 3.3 line
+      type: shell
+      on: workstation
+      skills: [iac.foundations.provider-install]
+      timeoutSec: 60
+      command: |
+        ct-iac run /home/learner/stacks/grid-telemetry iac providers -no-color 2>/dev/null \
+          | grep -E 'hashicorp/kubernetes\]' | head -1 | sed -E 's/.*hashicorp\/kubernetes\] *//'
+      expect: {match: regex, value: '^(~> *3\.3(\.[0-9]+)?|>= *3\.3\.[0-9]+, *< *3\.4(\.0)?|3\.3\.[0-9]+)$'}
+    - id: lock-versions
+      description: The lock file records kubernetes 3.3.x and random {{random_minor}}.x
+      type: shell
+      on: workstation
+      skills: [iac.foundations.provider-install, iac.foundations.workflow]
+      command: |
+        f=/home/learner/stacks/grid-telemetry/.terraform.lock.hcl
+        [ -f "$f" ] || { echo "no lock file"; exit 0; }
+        for p in kubernetes random; do
+          awk -v p="$p" '$0 ~ "provider \".*/hashicorp/" p "\"" {f=1} f && /version *=/{gsub(/[" ]/,""); split($0,a,"="); printf "%s=%s ", p, a[2]; exit}' "$f"
+        done
+      expect: {match: regex, value: '^kubernetes=3\.3\.[0-9]+ random={{random_minor}}\.[0-9]+ $'}
+    - id: two-platforms
+      description: Every provider in the lock file carries checksums for linux_amd64 and linux_arm64
+      type: shell
+      on: workstation
+      skills: [iac.foundations.provider-install, iac.foundations.cli-config]
+      weight: 2
+      command: |
+        f=/home/learner/stacks/grid-telemetry/.terraform.lock.hcl
+        [ -f "$f" ] || { echo "no lock file"; exit 0; }
+        awk '/^provider /{p=$2} /"h1:/{n[p]++} END{bad=0; c=0; for (k in n) {c++; if (n[k] < 2) bad++} print (c >= 2 && bad == 0) ? "ok" : "missing"}' "$f"
+      expect: {match: exact, value: ok}
+    - id: committed
+      description: versions.tf and .terraform.lock.hcl are committed with no uncommitted changes
+      type: shell
+      on: workstation
+      skills: [iac.foundations.provider-install]
+      command: |
+        cd /home/learner/stacks/grid-telemetry 2>/dev/null || { echo missing; exit 0; }
+        runuser -u learner -- git ls-files --error-unmatch .terraform.lock.hcl versions.tf >/dev/null 2>&1 || { echo untracked; exit 0; }
+        [ -z "$(runuser -u learner -- git status --porcelain -- .terraform.lock.hcl versions.tf)" ] && echo clean || echo dirty
+      expect: {match: exact, value: clean}
+  hints:
+    - title: The pessimistic operator
+      body: "`~> 3.3.0` allows 3.3.x but not 3.4.0. `~> 3.3` would allow every 3.x from 3.3 on, including newer minors."
+      cost: 1
+    - title: init records only this machine's platform
+      body: "`terraform init` writes the checksums of the packages it installed, so only linux_amd64. `terraform providers lock` can add other platforms; by default it asks the public registry, so point it at the mirror."
+      command: terraform providers lock -fs-mirror=/opt/cloudtrain/providers -platform=linux_amd64 -platform=linux_arm64
+      cost: 2
+    - title: The lock file belongs in Git
+      body: Commit `.terraform.lock.hcl` next to the configuration so every run selects exactly the same provider builds. `.terraform/` stays out of Git.
+      cost: 1
+  misconceptions:
+    - id: major-only
+      description: Uses `~> 3.0` style constraints, which still float across minor releases.
+      feedback: "`~> 3.0` means any 3.x. To stay on one minor line, give three parts: `~> X.Y.0`."
+      expectFail: [random-pinned, kubernetes-constrained]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 180
+        run: |
+          set -e
+          cd ~/stacks/grid-telemetry
+          cat > versions.tf <<'HCL'
+          terraform {
+            required_providers {
+              kubernetes = {
+                source  = "hashicorp/kubernetes"
+                version = "~> 3.0"
+              }
+              random = {
+                source  = "hashicorp/random"
+                version = ">= 3.0"
+              }
+            }
+          }
+          HCL
+          rm -f .terraform.lock.hcl
+          iac init -input=false -no-color
+          iac providers lock -fs-mirror=/opt/cloudtrain/providers -platform=linux_amd64 -platform=linux_arm64 -no-color
+          git add versions.tf .terraform.lock.hcl && git commit -q -m "pin providers"
+    - id: init-only
+      description: Runs init and commits the lock file it wrote, which only has the workstation's own platform.
+      feedback: init hashes only the packages it installed (linux_amd64). Add the arm64 checksums with `terraform providers lock -platform=...` from the mirror.
+      expectFail: [two-platforms]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 180
+        run: |
+          set -e
+          cd ~/stacks/grid-telemetry
+          cat > versions.tf <<'HCL'
+          terraform {
+            required_providers {
+              kubernetes = {
+                source  = "hashicorp/kubernetes"
+                version = "~> 3.3.0"
+              }
+              random = {
+                source  = "hashicorp/random"
+                version = "~> {{random_minor}}.0"
+              }
+            }
+          }
+          HCL
+          iac init -input=false -no-color
+          git add versions.tf .terraform.lock.hcl && git commit -q -m "pin providers"
+    - id: not-committed
+      description: Pins and locks correctly but leaves the files uncommitted.
+      feedback: The lock only helps others once it is in the repository. Commit versions.tf and .terraform.lock.hcl.
+      expectFail: [committed]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 180
+        run: |
+          set -e
+          cd ~/stacks/grid-telemetry
+          sed -i 's|source = "hashicorp/kubernetes"|source  = "hashicorp/kubernetes"\n      version = "~> 3.3.0"|; s|source = "hashicorp/random"|source  = "hashicorp/random"\n      version = "~> {{random_minor}}.0"|' versions.tf
+          iac init -input=false -no-color
+          iac providers lock -fs-mirror=/opt/cloudtrain/providers -platform=linux_amd64 -platform=linux_arm64 -no-color
+  solution:
+    explanation: |
+      `~> 3.3.0` and `~> {{random_minor}}.0` allow patch releases of one minor line
+      only, so even `init -upgrade` cannot move to a newer minor. `init` writes the
+      lock file with the selected versions and the linux_amd64 checksum;
+      `providers lock -fs-mirror=... -platform=...` adds the linux_arm64 checksums
+      from the mirror without network access. Both files are committed so every
+      machine installs exactly these builds.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 180
+        run: |
+          set -e
+          cd ~/stacks/grid-telemetry
+          cat > versions.tf <<'HCL'
+          terraform {
+            required_providers {
+              kubernetes = {
+                source  = "hashicorp/kubernetes"
+                version = "~> 3.3.0"
+              }
+              random = {
+                source  = "hashicorp/random"
+                version = "~> {{random_minor}}.0"
+              }
+            }
+          }
+          HCL
+          iac init -input=false -no-color
+          iac providers lock -fs-mirror=/opt/cloudtrain/providers -platform=linux_amd64 -platform=linux_arm64 -no-color
+          git add versions.tf .terraform.lock.hcl
+          git commit -q -m "Pin kubernetes 3.3 and random {{random_minor}}; lock linux_amd64 and linux_arm64"
+    alternatives:
+      - id: range-constraints
+        description: Explicit lower and upper bounds instead of ~>.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 180
+            run: |
+              set -e
+              cd ~/stacks/grid-telemetry
+              upper=$(echo {{random_minor}} | awk -F. '{print $1 "." $2+1 ".0"}')
+              cat > versions.tf <<HCL
+              terraform {
+                required_providers {
+                  kubernetes = {
+                    source  = "hashicorp/kubernetes"
+                    version = ">= 3.3.0, < 3.4.0"
+                  }
+                  random = {
+                    source  = "hashicorp/random"
+                    version = ">= {{random_minor}}.0, < $upper"
+                  }
+                }
+              }
+              HCL
+              iac providers lock -fs-mirror=/opt/cloudtrain/providers -platform=linux_amd64 -platform=linux_arm64 -no-color
+              iac init -input=false -no-color
+              git add -A && git commit -q -m "Pin providers to the approved minor lines"

@@ -1,0 +1,157 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xia-write-only-password
+  title: Keep a generated password out of state
+  domain: iac
+  frameworks: [tf-associate:secrets]
+  difficulty: hard
+  estimatedMinutes: 8
+  tags: [exam, terraform, ephemeral, write-only, secrets]
+  version: 1
+spec:
+  description: |
+    **Directory:** `~/exam/forecast-db` · **Cluster:** `sm-grid`
+
+    The stack (applied) generates the forecast database password with
+    `random_password` and stores it in Secret `forecast-db-credentials`, so the
+    password sits in the state file twice.
+
+    Change the stack so that:
+
+    - the password is generated as an **ephemeral** value ({{len}} characters,
+      no special characters),
+    - it reaches the Secret's `password` key through a **write-only argument**
+      (the Secret must still hold `username = forecast`; `data` and `data_wo` cannot be combined),
+    - after your apply the **state contains no password** at all, and a following
+      plan reports no changes.
+  objectives:
+    - Generate secrets with ephemeral resources
+    - Pass secrets through write-only arguments so they never reach state
+  params:
+    len:
+      type: choice
+      values: ["24", "28", "32"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+      - name: sm-grid
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: sm-grid
+  setup:
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xia-write-only-password/stack/providers.tf, source: assets/stack/providers.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xia-write-only-password/stack/main.tf, source: assets/stack/main.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xia-write-only-password/seed.sh, source: assets/seed.sh, mode: "0755"}
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/exam
+    - on: workstation
+      as: learner
+      timeoutSec: 300
+      run: /var/tmp/ct-seed/xia-write-only-password/seed.sh xia-write-only-password forecast-db apply
+  teardown:
+    - on: sm-grid
+      run: kubectl delete namespace forecast-db --ignore-not-found --wait=false
+  checks:
+    - id: secret-has-password
+      description: The Secret holds username forecast and a password of {{len}} letters and digits
+      type: shell
+      on: sm-grid
+      skills: [iac.quality.secrets]
+      weight: 1.5
+      timeoutSec: 30
+      command: |
+        u=$(kubectl -n forecast-db get secret forecast-db-credentials -o jsonpath='{.data.username}' 2>/dev/null | base64 -d 2>/dev/null)
+        p=$(kubectl -n forecast-db get secret forecast-db-credentials -o jsonpath='{.data.password}' 2>/dev/null | base64 -d 2>/dev/null)
+        echo "$p" | grep -qE '^[A-Za-z0-9]{{{len}}}$' && f=ok || f=bad
+        echo "username=$u password=$f"
+      expect: {match: exact, value: username=forecast password=ok}
+    - id: no-password-in-state
+      description: Neither the live password nor any random_password result is stored in state
+      type: shell
+      on: workstation
+      skills: [iac.quality.secrets]
+      weight: 3
+      timeoutSec: 60
+      command: |
+        d=/home/learner/exam/forecast-db
+        p=$(ct-iac run $d kubectl --context sm-grid -n forecast-db get secret forecast-db-credentials -o jsonpath='{.data.password}' 2>/dev/null | base64 -d 2>/dev/null)
+        st=$(ct-iac run $d iac state pull 2>/dev/null)
+        [ -n "$p" ] && [ -n "$st" ] || { echo unreadable; exit 0; }
+        echo "$st" | grep -qF "$p" && { echo "password in state"; exit 0; }
+        echo "$st" | jq -e '[.resources[]? | select(.mode == "managed" and .type == "random_password")] | length == 0' >/dev/null && echo clean || echo "random_password in state"
+      expect: {match: exact, value: clean}
+    - id: write-only-used
+      description: The Secret's password goes through data_wo with a revision, sourced from an ephemeral resource
+      type: shell
+      on: workstation
+      skills: [iac.quality.secrets]
+      weight: 1.5
+      timeoutSec: 120
+      command: |
+        ct-iac planjson /home/learner/exam/forecast-db | jq -r '
+          [.configuration.root_module.resources[]? | select(.type | test("^kubernetes_secret"))][0].expressions as $e
+          | "wo=\($e.data_wo != null) revision=\($e.data_wo_revision != null) ephemeral=\([$e.data_wo.references[]? | select(startswith("ephemeral."))] | length > 0)"' 2>/dev/null
+      expect: {match: exact, value: wo=true revision=true ephemeral=true}
+    - id: converged
+      description: A new plan of ~/exam/forecast-db reports no changes
+      type: shell
+      on: workstation
+      skills: [iac.quality.secrets]
+      timeoutSec: 120
+      command: ct-iac plan /home/learner/exam/forecast-db
+      expect: {match: exact, value: no-changes}
+  misconceptions:
+    - id: sensitive-only
+      description: Marks the password sensitive and keeps the random_password resource.
+      feedback: sensitive only hides values in output; state still stores them. Generate the password ephemerally and pass it through data_wo.
+      expectFail: [no-password-in-state, write-only-used]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          cd ~/exam/forecast-db
+          sed -i 's/    password = random_password.db.result/    password = sensitive(random_password.db.result)/' main.tf
+          iac apply -auto-approve -input=false -no-color
+    - id: write-only-from-resource
+      description: Uses data_wo, but feeds it from the managed random_password resource.
+      feedback: The write-only argument stays out of state, but random_password stores its result there. Use the ephemeral random_password instead.
+      expectFail: [no-password-in-state, write-only-used]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          cd ~/exam/forecast-db
+          python3 - <<'PY'
+          p = "main.tf"; s = open(p).read()
+          s = s.replace('  data = {\n    username = "forecast"\n    password = random_password.db.result\n  }', '  data_wo = {\n    username = "forecast"\n    password = random_password.db.result\n  }\n  data_wo_revision = 1')
+          open(p, "w").write(s)
+          PY
+          iac apply -auto-approve -input=false -no-color
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/exam/forecast-db
+          python3 - <<'PY'
+          p = "main.tf"; s = open(p).read()
+          s = s.replace('resource "random_password" "db" {', 'ephemeral "random_password" "db" {')
+          s = s.replace('  data = {\n    username = "forecast"\n    password = random_password.db.result\n  }', '  data_wo = {\n    username = "forecast"\n    password = ephemeral.random_password.db.result\n  }\n  data_wo_revision = 1')
+          open(p, "w").write(s)
+          PY
+          iac apply -auto-approve -input=false -no-color
+          iac plan -input=false -no-color -detailed-exitcode

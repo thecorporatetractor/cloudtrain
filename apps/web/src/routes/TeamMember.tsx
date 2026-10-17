@@ -76,7 +76,8 @@ function MemberScreen() {
       </header>
 
       <div className="stat-row" style={{ marginBottom: 20 }}>
-        <Stat label="This month" value={formatMinutes(d.minutesThisMonth)} hint="hands-on" />
+        <Stat label="This week" value={formatMinutes(d.minutesThisWeek)} hint="practice, last 7 days" />
+        <Stat label="This month" value={formatMinutes(d.minutesThisMonth)} hint="practice" />
         <Stat label="Attempts" value={d.attempts.length} hint={`${passed} passed`} />
         <Stat label="Assignments" value={d.assignments.filter((a) => a.status !== 'completed').length} hint={`${d.assignments.filter((a) => a.status === 'overdue').length} overdue`} tone={d.assignments.some((a) => a.status === 'overdue') ? 'warn' : undefined} />
         {frameworks.slice(0, 2).map((f) => (
@@ -89,7 +90,7 @@ function MemberScreen() {
           <Card className="card-flush">
             <div className="card-head">
               <h2>Competencies</h2>
-              <span className="subtle xs">mean μ of practised skills</span>
+              <span className="subtle xs">average of practised skills</span>
             </div>
             <div className="heat-cells" style={{ padding: 14 }}>
               {Object.entries(d.mastery).map(([cid, v]) => {
@@ -171,7 +172,9 @@ function MemberScreen() {
                       <th scope="col">When</th>
                       <th scope="col">Outcome</th>
                       <th scope="col">Score</th>
-                      <th scope="col">Time</th>
+                      <th scope="col" title="Practice time: from opening the lab to the last Validate">
+                        Practice
+                      </th>
                     </tr>
                   </thead>
                   <tbody>
@@ -188,8 +191,10 @@ function MemberScreen() {
                         <td>
                           <OutcomeBadge outcome={a.outcome} />
                         </td>
-                        <td className="small tnum">{a.outcome === 'abandoned' ? '—' : a.score}</td>
-                        <td className="small tnum">{formatDuration(a.durationS)}</td>
+                        <td className="small tnum">{a.outcome === 'abandoned' || a.validations === 0 ? '—' : a.score}</td>
+                        <td className="small tnum" title={`Environment open ${formatDuration(a.durationS)}`}>
+                          {a.practiceS ? formatDuration(a.practiceS) : <span className="subtle">not validated</span>}
+                        </td>
                       </tr>
                     ))}
                   </tbody>

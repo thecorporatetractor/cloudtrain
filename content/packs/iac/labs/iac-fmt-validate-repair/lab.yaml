@@ -1,0 +1,203 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: iac-fmt-validate-repair
+  title: Repair a configuration that fails format and validation gates
+  domain: iac
+  frameworks: [tf-associate:core-workflow]
+  difficulty: easy
+  estimatedMinutes: 10
+  tags: [terraform, fmt, validate, ci, troubleshooting]
+  version: 1
+spec:
+  description: |
+    The wind-farm repository in `~/stacks/wind-farm` writes one alert threshold
+    file per farm. Its merge gate, `./ci.sh`, rejects every merge request since
+    last week's hurried edits: it runs `terraform fmt -check -recursive`, then
+    `terraform init -backend=false` and `terraform validate`.
+
+    Repair the configuration so that **`./ci.sh` passes**, without changing what
+    the stack does: the plan must still create one `local_file.alert` per farm,
+    `/home/learner/alerts/<farm>.conf` with the content
+    `farm=<farm> max_wind_ms=<speed>`, from the speeds already in `variables.tf`,
+    and the `alert_files` output must stay.
+
+    Do not edit `ci.sh`. You do not need to apply the stack.
+  objectives:
+    - Use terraform fmt to find and fix formatting
+    - Read validate and parser errors and fix their causes
+    - Keep the planned resources unchanged while repairing code
+  params:
+    skerrow:
+      type: int
+      min: 20
+      max: 30
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+  setup:
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/stacks /home/learner/stacks/wind-farm /home/learner/alerts
+    - on: workstation
+      file: {path: /home/learner/stacks/wind-farm/versions.tf, source: assets/versions.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /home/learner/stacks/wind-farm/variables.tf, source: assets/variables.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /home/learner/stacks/wind-farm/main.tf, source: assets/main.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /home/learner/stacks/wind-farm/outputs.tf, source: assets/outputs.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /home/learner/stacks/wind-farm/ci.sh, source: assets/ci.sh, mode: "0755"}
+    - on: workstation
+      run: chown -R learner:learner /home/learner/stacks/wind-farm
+  checks:
+    - id: fmt-clean
+      description: terraform fmt -check -recursive passes
+      type: shell
+      on: workstation
+      skills: [iac.foundations.style]
+      timeoutSec: 60
+      command: ct-iac run /home/learner/stacks/wind-farm iac fmt -check -recursive -no-color >/dev/null 2>&1 && echo ok || echo unformatted
+      expect: {match: exact, value: ok}
+    - id: gate-passes
+      description: The merge gate (fmt, init -backend=false, validate) passes on a clean copy
+      type: shell
+      on: workstation
+      skills: [iac.foundations.workflow, iac.foundations.style]
+      weight: 2
+      timeoutSec: 120
+      command: |
+        # The gate's own commands (as in ci.sh) on a clean copy, independent of the learner's ci.sh.
+        t=$(mktemp -d /tmp/gate.XXXXXX); cp /home/learner/stacks/wind-farm/*.tf "$t"/ 2>/dev/null; chown -R learner:learner "$t"
+        ct-iac run "$t" sh -c 'iac fmt -check -recursive && iac init -backend=false -input=false && iac validate' >/dev/null 2>&1 && r=pass || r=fail
+        rm -rf "$t"; echo "$r"
+      expect: {match: exact, value: pass}
+    - id: same-resources
+      description: The plan still creates exactly the three alert files with the original thresholds
+      type: shell
+      on: workstation
+      skills: [iac.foundations.workflow]
+      weight: 2
+      timeoutSec: 120
+      command: |
+        t=$(mktemp -d /tmp/plan.XXXXXX); cp /home/learner/stacks/wind-farm/*.tf "$t"/ 2>/dev/null; chown -R learner:learner "$t"
+        ct-iac run "$t" iac init -backend=false -input=false -no-color >/dev/null 2>&1
+        ct-iac planjson "$t" | jq -r '[.resource_changes[]? | select(.change.actions == ["create"]) | "\(.address) \(.change.after.filename) \(.change.after.content)"] | sort | join(";")' 2>/dev/null
+        rm -rf "$t"
+      expect: {match: exact, value: 'local_file.alert["gullhaven"] /home/learner/alerts/gullhaven.conf farm=gullhaven max_wind_ms=25;local_file.alert["redmoor"] /home/learner/alerts/redmoor.conf farm=redmoor max_wind_ms=23;local_file.alert["skerrow"] /home/learner/alerts/skerrow.conf farm=skerrow max_wind_ms={{skerrow}}'}
+    - id: output-kept
+      description: The alert_files output is still planned and lists the three files
+      type: shell
+      on: workstation
+      skills: [iac.foundations.workflow]
+      timeoutSec: 120
+      command: |
+        t=$(mktemp -d /tmp/out.XXXXXX); cp /home/learner/stacks/wind-farm/*.tf "$t"/ 2>/dev/null; chown -R learner:learner "$t"
+        ct-iac run "$t" iac init -backend=false -input=false -no-color >/dev/null 2>&1
+        ct-iac planjson "$t" | jq -r '.planned_values.outputs.alert_files.value // [] | sort | join(",")' 2>/dev/null
+        rm -rf "$t"
+      expect: {match: exact, value: "/home/learner/alerts/gullhaven.conf,/home/learner/alerts/redmoor.conf,/home/learner/alerts/skerrow.conf"}
+  hints:
+    - title: Start with the parser
+      body: fmt and validate both stop at the first file that does not parse. Read the file and line in the error; a bracket that opens with `[` must close with `]`.
+      command: cd ~/stacks/wind-farm && terraform fmt -check -recursive -diff
+      cost: 1
+    - title: Let fmt do the layout
+      body: "`terraform fmt` rewrites indentation and aligns the `=` signs for you; `-check` only reports."
+      cost: 1
+    - title: Ask the provider what it expects
+      body: validate names the unsupported argument. `terraform providers schema -json` or the provider documentation lists the real argument names of local_file.
+      command: terraform init -backend=false && terraform validate
+      cost: 2
+  misconceptions:
+    - id: validate-only
+      description: Fixes the errors but never runs fmt, so the format gate still fails.
+      feedback: validate does not check layout. Run terraform fmt (or fmt -recursive) before committing.
+      expectFail: [fmt-clean, gate-passes]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          cd ~/stacks/wind-farm
+          sed -i 's/var\.farm$/var.farms/; s/file_name = /filename = /' main.tf
+          sed -i 's/f\.filename }/f.filename ]/' outputs.tf
+    - id: drop-the-output
+      description: Deletes the broken output block instead of repairing it.
+      feedback: The gate passes, but consumers of alert_files lose it. Fix the closing bracket instead of removing the output.
+      expectFail: [output-kept]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          cd ~/stacks/wind-farm
+          sed -i 's/var\.farm$/var.farms/; s/file_name = /filename = /' main.tf
+          rm -f outputs.tf
+          iac fmt -recursive
+    - id: rename-resource
+      description: Rewrites main.tf with a new resource name, which changes every planned address.
+      feedback: Renaming local_file.alert changes the addresses the rest of the team (and any state) expects. Repair the existing block.
+      expectFail: [same-resources]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          cd ~/stacks/wind-farm
+          cat > main.tf <<'HCL'
+          resource "local_file" "alerts" {
+            for_each = var.farms
+            filename = "${var.alert_dir}/${each.key}.conf"
+            content  = "farm=${each.key} max_wind_ms=${each.value}"
+          }
+          HCL
+          echo 'output "alert_files" {' > outputs.tf
+          echo '  value = [for f in local_file.alerts : f.filename]' >> outputs.tf
+          echo '}' >> outputs.tf
+          iac fmt -recursive
+  solution:
+    explanation: |
+      Three faults: outputs.tf closes a `[` list with `}` (a parse error, so even fmt
+      fails), main.tf refers to the undeclared `var.farm` and uses `file_name`,
+      which local_file does not accept (`filename` is the argument). Fixing those and
+      running `terraform fmt -recursive` (which realigns variables.tf and main.tf)
+      makes the gate pass, and the plan creates the same three files.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 180
+        run: |
+          set -e
+          cd ~/stacks/wind-farm
+          sed -i 's/var\.farm$/var.farms/; s/file_name = /filename = /' main.tf
+          sed -i 's/f\.filename }/f.filename]/' outputs.tf
+          iac fmt -recursive
+          ./ci.sh
+    alternatives:
+      - id: rewrite-files
+        description: Rewrite main.tf and outputs.tf by hand in canonical style.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 180
+            run: |
+              set -e
+              cd ~/stacks/wind-farm
+              cat > main.tf <<'HCL'
+              # One alert threshold file per wind farm, read by the turbine controllers.
+              resource "local_file" "alert" {
+                for_each = var.farms
+                filename = "${var.alert_dir}/${each.key}.conf"
+                content  = "farm=${each.key} max_wind_ms=${each.value}"
+              }
+              HCL
+              cat > outputs.tf <<'HCL'
+              output "alert_files" {
+                description = "Paths of the generated alert files"
+                value       = [for f in local_file.alert : f.filename]
+              }
+              HCL
+              iac fmt variables.tf
+              iac init -backend=false -input=false -no-color && iac validate -no-color

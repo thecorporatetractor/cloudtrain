@@ -393,6 +393,9 @@ func (r *SessionRuntime) ProvisionTopology(ctx context.Context, ref SessionRef) 
 	topo := &ref.Template.Topology
 	if entry, err := EntryRef(NodeRef{Session: ref.Session, Template: ref.Template}); err == nil {
 		np := EntryNetworkPolicy(ref.Session, entry.Node.Name, VClusterReleases(ref.Session, topo))
+		if nets := EntryPolicyNetworks(ref.Session, topo, entry.Node.Name); nets != "" {
+			np.Annotations = map[string]string{AnnotationNetworkPolicyFor: nets}
+		}
 		if err := setOwner(ref.Session, np, r.Client); err != nil {
 			return false, err
 		}

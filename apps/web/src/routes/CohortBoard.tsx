@@ -106,8 +106,8 @@ function BoardScreen() {
                   <th scope="col" style={{ width: 150 }}>
                     Checks
                   </th>
-                  <th scope="col" style={{ whiteSpace: 'nowrap' }}>
-                    On task
+                  <th scope="col" style={{ whiteSpace: 'nowrap' }} title="Time since this live session started (environment time). Practice minutes in reports count up to the last Validate.">
+                    Open for
                   </th>
                   <th scope="col">Hints</th>
                   <th scope="col">Signal</th>

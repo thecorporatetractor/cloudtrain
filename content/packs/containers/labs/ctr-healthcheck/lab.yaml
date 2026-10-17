@@ -1,0 +1,173 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-healthcheck
+  title: Report catalogue API health only after its cache is warm
+  domain: containers
+  frameworks: [ex188-aligned:build-images, docker-practitioner:build]
+  difficulty: easy
+  estimatedMinutes: 12
+  tags: [docker, dockerfile, healthcheck]
+  version: 1
+spec:
+  description: |
+    The catalogue API warms its cache for a few seconds after it starts. Until then it
+    answers `503` on **`/ready`**; once warm, `/ready` answers `200`. The front-door load
+    balancer only sends traffic to containers that Docker reports as **healthy**.
+
+    The build context is `~/catalogue-api/` on `cl-catalogue-04` (`ssh cl-catalogue-04`;
+    you are in the `docker` group). The API listens on port 8080 inside the container.
+    The image has `wget` (BusyBox) and Python, but no `curl`.
+
+    1. Add a **HEALTHCHECK** to the Dockerfile so that a container is
+       - **not** reported healthy before `/ready` returns 200, and
+       - reported **unhealthy within 30 seconds** after `/ready` starts failing.
+    2. Build **`copperleaf/catalogue-api:3.3`** and run it as the detached container
+       **`catalogue-api`**.
+  objectives:
+    - Write a HEALTHCHECK against a readiness endpoint
+    - Choose interval, timeout and retries for a detection deadline
+  params:
+    warm:
+      type: int
+      min: 8
+      max: 14
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-catalogue-04
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-catalogue-04
+      timeoutSec: 240
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        c=/home/learner/catalogue-api
+        install -d -o learner -g learner "$c"
+        cat > "$c/api.py" <<'PY'
+        import http.server, os, pathlib, time
+        start = time.time()
+        warm = float(os.environ.get("WARMUP_SECONDS", "10"))
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path == "/ready":
+                    ok = time.time() - start >= warm and not pathlib.Path("/tmp/break-ready").exists()
+                    self.send_response(200 if ok else 503)
+                else:
+                    self.send_response(200)
+                self.end_headers()
+            def log_message(self, *a):
+                pass
+        print(f"catalogue-api warming cache for {warm:.0f}s", flush=True)
+        http.server.ThreadingHTTPServer(("", 8080), H).serve_forever()
+        PY
+        printf '%s\n' 'FROM python:3.13-alpine' 'COPY api.py /app/api.py' 'ENV WARMUP_SECONDS={{warm}}' \
+          'EXPOSE 8080' 'CMD ["python3", "/app/api.py"]' > "$c/Dockerfile"
+        chown -R learner:learner "$c"
+  checks:
+    - id: running
+      description: catalogue-api runs copperleaf/catalogue-api:3.3 and is healthy
+      type: shell
+      on: cl-catalogue-04
+      skills: [containers.build.healthcheck]
+      weight: 1
+      timeoutSec: 60
+      command: |
+        for i in $(seq 20); do s=$(docker inspect catalogue-api 2>/dev/null | jq -r '.[0].Config.Image + " " + (.[0].State.Health.Status // "no-healthcheck")'); [ "${s#* }" = healthy ] && break; sleep 2; done; echo "$s"
+      expect: {match: exact, value: "copperleaf/catalogue-api:3.3 healthy"}
+    - id: not-healthy-early
+      description: A fresh container is not healthy before its cache is warm, and healthy afterwards
+      type: shell
+      on: cl-catalogue-04
+      skills: [containers.build.healthcheck]
+      weight: 2
+      timeoutSec: 120
+      command: |
+        docker rm -f ct-hc-probe >/dev/null 2>&1
+        docker run -d --name ct-hc-probe -e WARMUP_SECONDS=20 copperleaf/catalogue-api:3.3 >/dev/null 2>&1 || { echo no-image; exit 0; }
+        early=ok; i=0; while [ $i -lt 16 ]; do [ "$(docker inspect ct-hc-probe | jq -r '.[0].State.Health.Status // "none"')" = healthy ] && early=too-early; sleep 1; i=$((i + 1)); done
+        late=never; i=0; while [ $i -lt 40 ]; do [ "$(docker inspect ct-hc-probe | jq -r '.[0].State.Health.Status // "none"')" = healthy ] && { late=ok; break; }; sleep 1; i=$((i + 1)); done
+        docker rm -f ct-hc-probe >/dev/null; echo "$early $late"
+      expect: {match: exact, value: "ok ok"}
+    - id: unhealthy-fast
+      description: A container turns unhealthy within 30 s of /ready failing
+      type: shell
+      on: cl-catalogue-04
+      skills: [containers.build.healthcheck]
+      weight: 2
+      timeoutSec: 150
+      command: |
+        docker rm -f ct-hc-probe2 >/dev/null 2>&1
+        docker run -d --name ct-hc-probe2 -e WARMUP_SECONDS=1 copperleaf/catalogue-api:3.3 >/dev/null 2>&1 || { echo no-image; exit 0; }
+        i=0; while [ $i -lt 60 ] && [ "$(docker inspect ct-hc-probe2 | jq -r '.[0].State.Health.Status // "none"')" != healthy ]; do sleep 1; i=$((i + 1)); done
+        docker exec ct-hc-probe2 touch /tmp/break-ready
+        r=slow; i=0; while [ $i -lt 32 ]; do [ "$(docker inspect ct-hc-probe2 | jq -r '.[0].State.Health.Status // "none"')" = unhealthy ] && { r=fast; break; }; sleep 1; i=$((i + 1)); done
+        docker rm -f ct-hc-probe2 >/dev/null; echo "$r"
+      expect: {match: exact, value: fast}
+  hints:
+    - title: Probe the right endpoint
+      body: "`HEALTHCHECK CMD wget -q -O /dev/null http://127.0.0.1:8080/ready || exit 1`: wget exits non-zero on a 503."
+      cost: 2
+    - title: Timing
+      body: "A container turns unhealthy after `--retries` failed probes in a row, one every `--interval`. Pick values whose product stays under 30 s."
+      cost: 1
+    - title: Watch it
+      body: "`docker inspect catalogue-api | jq '.[0].State.Health'` shows the status and the last probe results."
+      cost: 1
+  misconceptions:
+    - id: probe-root
+      description: Probes / (always 200) instead of /ready.
+      feedback: "/ answers 200 even while the cache is cold, so the container looks healthy too early. Probe /ready."
+      expectFail: [not-healthy-early]
+      mutation:
+        on: cl-catalogue-04
+        as: learner
+        run: |
+          cd ~/catalogue-api
+          sed -i '/^CMD/i HEALTHCHECK --interval=5s --timeout=2s --retries=3 CMD wget -q -O /dev/null http://127.0.0.1:8080/ || exit 1' Dockerfile
+          docker build -q -t copperleaf/catalogue-api:3.3 .
+          docker run -d --name catalogue-api copperleaf/catalogue-api:3.3
+    - id: slow-detection
+      description: Keeps the default 30 s interval with 3 retries.
+      feedback: "With a 30 s interval and 3 retries a failure takes about 90 s to show. Shorten the interval (and/or retries)."
+      expectFail: [unhealthy-fast]
+      mutation:
+        on: cl-catalogue-04
+        as: learner
+        run: |
+          cd ~/catalogue-api
+          sed -i '/^CMD/i HEALTHCHECK --start-period=5s --start-interval=2s CMD wget -q -O /dev/null http://127.0.0.1:8080/ready || exit 1' Dockerfile
+          docker build -q -t copperleaf/catalogue-api:3.3 .
+          docker run -d --name catalogue-api copperleaf/catalogue-api:3.3
+  solution:
+    explanation: |
+      Probe /ready with wget every 5 s; three failures in a row (15 s) mark the
+      container unhealthy, and it only turns healthy once /ready answers 200.
+    steps:
+      - on: cl-catalogue-04
+        as: learner
+        run: |
+          cd ~/catalogue-api
+          sed -i '/^CMD/i HEALTHCHECK --interval=5s --timeout=2s --retries=3 CMD wget -q -O /dev/null http://127.0.0.1:8080/ready || exit 1' Dockerfile
+          docker build -t copperleaf/catalogue-api:3.3 .
+          docker run -d --name catalogue-api copperleaf/catalogue-api:3.3
+    alternatives:
+      - id: python-probe
+        description: Probe with Python instead of wget.
+        steps:
+          - on: cl-catalogue-04
+            as: learner
+            run: |
+              cd ~/catalogue-api
+              sed -i '/^CMD/i HEALTHCHECK --interval=4s --timeout=3s --retries=4 CMD ["python3", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen(\\"http://127.0.0.1:8080/ready\\", timeout=2).status == 200 else 1)"]' Dockerfile
+              docker build -t copperleaf/catalogue-api:3.3 .
+              docker run -d --name catalogue-api copperleaf/catalogue-api:3.3

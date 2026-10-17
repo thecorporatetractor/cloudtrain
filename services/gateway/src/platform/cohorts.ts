@@ -245,7 +245,14 @@ export async function board(ps: PlatformService, p: Principal, id: string): Prom
     const rows: CohortBoardRow[] = [];
     for (const m of members) {
       const ls = live.find((s) => s.spec.learner.id === m.id);
-      const last = await tx.selectFrom('lab_attempts').selectAll().where('user_id', '=', m.id).orderBy('started_at', 'desc').limit(1).executeTakeFirst();
+      const last = await tx
+        .selectFrom('lab_attempts')
+        .selectAll('lab_attempts')
+        .select((eb) => eb.selectFrom('check_results as c').select((e) => e.fn.max('c.graded_at').as('m')).whereRef('c.attempt_id', '=', 'lab_attempts.id').as('last_run_at'))
+        .where('user_id', '=', m.id)
+        .orderBy('started_at', 'desc')
+        .limit(1)
+        .executeTakeFirst();
       const passed = r.lab_ids.length
         ? (await tx.selectFrom('lab_attempts').select('lab_id').distinct().where('user_id', '=', m.id).where('outcome', '=', 'passed').where('lab_id', 'in', r.lab_ids).execute()).length
         : 0;

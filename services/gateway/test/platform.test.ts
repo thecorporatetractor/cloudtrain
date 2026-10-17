@@ -153,7 +153,7 @@ describe.skipIf(!available)('platform API', () => {
     expect((await ines.get(`/api/teams/${yard.id}/dashboard`)).statusCode).toBe(403);
     const csv = await tomasz.get(`/api/reports/progress.csv?team=${yard.id}`);
     expect(csv.headers['content-type']).toMatch(/text\/csv/);
-    expect(csv.body.split('\r\n')[0]).toBe('user_id,name,email,team,assignment_id,item_kind,item_id,due_at,status,progress,best_score,attempts,minutes');
+    expect(csv.body.split('\r\n')[0]).toBe('user_id,name,email,team,assignment_id,item_kind,item_id,due_at,status,progress,best_score,attempts,minutes,environment_minutes');
     // New learner with no history: empty-state home still renders.
     const mei = (await as(h, Q.mei).get('/api/home')).json();
     expect(mei.recommendations.length).toBeGreaterThan(0);

@@ -24,7 +24,7 @@ function Screen() {
   const fail = (e: Error) => toast({ title: 'Could not save', description: e.message, tone: 'err' });
 
   return (
-    <div className="grid-2" style={{ gridTemplateColumns: 'minmax(0, 7fr) minmax(0, 5fr)', gap: 20, alignItems: 'start' }}>
+    <div className="split split-7-5" style={{ alignItems: 'start' }}>
       <div className="stack" style={{ gap: 16 }}>
         <p className="muted small">Disabled packs and labs disappear from the catalog and Home for this organisation and cannot be started. Assignments that point at them stay but cannot be completed, so check the team assignments first.</p>
         {d.packs.map((p) => (

@@ -18,7 +18,7 @@ interface Persona {
  * Mock mode only: switch between one account per role so every view can be
  * demoed. Not rendered in real mode (the gateway owns the session there).
  */
-export function PersonaSwitcher({ compact }: { compact?: boolean }) {
+export function PersonaSwitcher({ compact, side = 'right' }: { compact?: boolean; side?: 'right' | 'top' }) {
   const personas = useQuery({ queryKey: ['dev', 'personas'], queryFn: () => request<Persona[]>('/api/dev/personas'), staleTime: Infinity });
   const me = useMe();
   const set = useSetPersona();
@@ -59,15 +59,15 @@ export function PersonaSwitcher({ compact }: { compact?: boolean }) {
       ) : (
         trigger
       )}
-      <Dropdown.Content side="right" align="end" sideOffset={10}>
+      <Dropdown.Content side={side} align="end" sideOffset={10} className="persona-menu">
         <Dropdown.Label>Demo persona · mock mode</Dropdown.Label>
         {(personas.data ?? []).map((p) => (
-          <Dropdown.Item key={p.id} onSelect={() => choose(p)} disabled={set.isPending}>
-            <span className="grow stack" style={{ gap: 0 }}>
-              <span>{p.label}</span>
-              <span className="xs subtle">{p.hint}</span>
+          <Dropdown.Item key={p.id} onSelect={() => choose(p)} disabled={set.isPending} className="menu-item-2line">
+            <span className="grow stack" style={{ gap: 1, minWidth: 0 }}>
+              <span className="truncate">{p.label}</span>
+              <span className="xs subtle truncate">{p.hint}</span>
             </span>
-            {current?.id === p.id && <Check size={13} className="text-accent" />}
+            {current?.id === p.id && <Check size={13} className="text-accent" aria-label="current" />}
           </Dropdown.Item>
         ))}
       </Dropdown.Content>

@@ -1,0 +1,154 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xia-declarative-rewrite
+  title: Rewrite an imperative script as a declarative configuration
+  domain: iac
+  frameworks: [tf-associate:iac-concepts]
+  difficulty: easy
+  estimatedMinutes: 6
+  tags: [exam, terraform, declarative, local-provider]
+  version: 1
+spec:
+  description: |
+    **Directory:** `~/exam/declarative` (workstation)
+
+    `~/exam/declarative/make-configs.sh` writes three farm configuration files
+    into `/home/learner/farm-configs/`. Replace it with a Terraform configuration
+    in `~/exam/declarative` that produces **byte-identical files** at the same
+    paths with the `hashicorp/local` provider, and apply it. A second plan must
+    report no changes. Do not run the script.
+  objectives:
+    - Express imperative steps as declarative resources
+  params:
+    gh:
+      type: int
+      min: 300
+      max: 420
+    rm:
+      type: int
+      min: 150
+      max: 260
+    sk:
+      type: int
+      min: 500
+      max: 640
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+  setup:
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xia-declarative-rewrite/make-configs.sh, source: assets/make-configs.sh, mode: "0755"}
+    - on: workstation
+      run: |
+        set -eu
+        d=/home/learner/exam/declarative
+        install -d -o learner -g learner /home/learner/exam "$d"
+        [ -e "$d/.ct-seeded" ] && exit 0
+        install -m 0755 -o learner -g learner /var/tmp/ct-seed/xia-declarative-rewrite/make-configs.sh "$d/make-configs.sh"
+        touch "$d/.ct-seeded"
+  checks:
+    - id: files-identical
+      description: The three farm files exist with exactly the script's content
+      type: shell
+      on: workstation
+      skills: [iac.foundations.concepts]
+      weight: 2
+      command: |
+        r=""
+        for f in gullhaven:{{gh}} redmoor:{{rm}} skerrow:{{sk}}; do
+          n=${f%%:*}; c=${f#*:}
+          printf 'farm=%s\ncapacity_mw=%s\n' "$n" "$c" | cmp -s - /home/learner/farm-configs/$n.cfg && r="$r ok" || r="$r bad"
+        done
+        echo $r
+      expect: {match: exact, value: ok ok ok}
+    - id: managed
+      description: All three files are local_file resources in the state of ~/exam/declarative
+      type: shell
+      on: workstation
+      skills: [iac.foundations.concepts]
+      weight: 2
+      timeoutSec: 60
+      command: |
+        ct-iac state /home/learner/exam/declarative | jq -r '[.values.root_module.resources[]? | select(.type == "local_file") | .values.filename | sub(".*/"; "")] | sort | join(",")' 2>/dev/null
+      expect: {match: exact, value: "gullhaven.cfg,redmoor.cfg,skerrow.cfg"}
+    - id: converged
+      description: A new plan of ~/exam/declarative reports no changes
+      type: shell
+      on: workstation
+      skills: [iac.foundations.concepts]
+      timeoutSec: 90
+      command: ct-iac plan /home/learner/exam/declarative
+      expect: {match: exact, value: no-changes}
+  misconceptions:
+    - id: ran-the-script
+      description: Runs the script, so the files exist but nothing declares or tracks them.
+      feedback: The files are right but no configuration describes them; a rerun of Terraform would not keep them that way.
+      expectFail: [managed, converged]
+      mutation:
+        on: workstation
+        as: learner
+        run: sh ~/exam/declarative/make-configs.sh
+    - id: missing-newline
+      description: Writes the content without the final newline, so the files differ from the script's.
+      feedback: printf in the script ends every line with a newline; the files must match byte for byte.
+      expectFail: [files-identical]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          cd ~/exam/declarative
+          cat > main.tf <<'HCL'
+          locals {
+            farms = { gullhaven = {{gh}}, redmoor = {{rm}}, skerrow = {{sk}} }
+          }
+          resource "local_file" "cfg" {
+            for_each = local.farms
+            filename = "/home/learner/farm-configs/${each.key}.cfg"
+            content  = "farm=${each.key}\ncapacity_mw=${each.value}"
+          }
+          HCL
+          iac init -input=false -no-color && iac apply -auto-approve -input=false -no-color
+  solution:
+    explanation: One local_file per farm, driven by a map, declares the end state; apply creates the files and a second plan finds nothing to do.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          set -e
+          cd ~/exam/declarative
+          cat > main.tf <<'HCL'
+          locals {
+            farms = { gullhaven = {{gh}}, redmoor = {{rm}}, skerrow = {{sk}} }
+          }
+
+          resource "local_file" "cfg" {
+            for_each = local.farms
+            filename = "/home/learner/farm-configs/${each.key}.cfg"
+            content  = "farm=${each.key}\ncapacity_mw=${each.value}\n"
+          }
+          HCL
+          iac init -input=false -no-color
+          iac apply -auto-approve -input=false -no-color
+    alternatives:
+      - id: three-blocks
+        description: Three separate local_file blocks.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 120
+            run: |
+              set -e
+              cd ~/exam/declarative
+              for f in gullhaven:{{gh}} redmoor:{{rm}} skerrow:{{sk}}; do
+                n=${f%%:*}; c=${f#*:}
+                printf 'resource "local_file" "%s" {\n  filename = "/home/learner/farm-configs/%s.cfg"\n  content  = "farm=%s\\ncapacity_mw=%s\\n"\n}\n\n' "$n" "$n" "$n" "$c" >> main.tf
+              done
+              iac init -input=false -no-color
+              iac apply -auto-approve -input=false -no-color

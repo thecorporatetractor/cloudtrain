@@ -1,0 +1,126 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xcd-sec-least-privilege
+  title: Run the edge gateway with least privilege
+  domain: containers
+  frameworks: [docker-practitioner:security]
+  difficulty: medium
+  estimatedMinutes: 8
+  tags: [exam, docker, capabilities, read-only, security]
+  version: 1
+spec:
+  description: |
+    **Host:** `cl-docker-01` (`ssh cl-docker-01`)
+
+    Run the edge gateway `copperleaf/gateway:1` as a container named **`gateway`**. It
+    listens on port **80** inside the container; publish it on the host as
+    **`127.0.0.1:8090`**. Harden it:
+
+    - **every** Linux capability dropped **except `NET_BIND_SERVICE`**;
+    - **no-new-privileges** set;
+    - a **read-only root filesystem**;
+    - at most **100** processes (pids limit).
+
+    It must still answer on `http://127.0.0.1:8090/` and run again on its own after a
+    host reboot.
+  objectives:
+    - Drop capabilities and add back only what the service needs
+    - Combine read-only rootfs, no-new-privileges and a pids limit
+  params:
+    edge:
+      type: choice
+      values: [edge-ams, edge-fra, edge-lhr]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-docker-01
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-docker-01
+      timeoutSec: 240
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        d=$(mktemp -d); mkdir -p "$d/www"
+        echo "copperleaf gateway {{edge}}" > "$d/www/index.html"
+        printf '%s\n' 'FROM busybox:1.37' 'COPY www /www' 'EXPOSE 80' 'CMD ["httpd", "-f", "-p", "80", "-h", "/www"]' > "$d/Dockerfile"
+        docker build -q -t copperleaf/gateway:1 "$d" >/dev/null
+        rm -rf "$d"
+  checks:
+    - id: serves
+      description: http://127.0.0.1:8090/ answers from gateway
+      type: shell
+      timeoutSec: 60
+      on: cl-docker-01
+      skills: [containers.runtime-security.least-privilege]
+      weight: 1
+      command: curl -fsS --max-time 3 http://127.0.0.1:8090/ 2>/dev/null || echo down
+      expect: {match: exact, value: "copperleaf gateway {{edge}}"}
+    - id: capabilities
+      description: The gateway process has NET_BIND_SERVICE and no other capability
+      type: shell
+      timeoutSec: 60
+      on: cl-docker-01
+      skills: [containers.runtime-security.least-privilege]
+      weight: 2
+      command: docker exec gateway sh -c 'grep -E "^Cap(Eff|Bnd):" /proc/1/status' 2>/dev/null | awk '{print $2}' | sort -u | tr '\n' ' '
+      expect: {match: exact, value: "0000000000000400 "}
+    - id: hardening
+      description: no-new-privileges, read-only root filesystem and a pids limit of 100
+      type: shell
+      timeoutSec: 60
+      on: cl-docker-01
+      skills: [containers.runtime-security.least-privilege, containers.runtime-security.limits]
+      weight: 2
+      command: |
+        docker inspect gateway 2>/dev/null | jq -r '.[0].HostConfig | [((.SecurityOpt // []) | map(select(test("^no-new-privileges(:true|=true)?$"))) | length > 0), .ReadonlyRootfs, (.PidsLimit == 100)] | map(tostring) | join(" ")'
+      expect: {match: exact, value: "true true true"}
+    - id: published-restarts
+      description: Published on 127.0.0.1:8090 only and restarted after a reboot
+      type: shell
+      timeoutSec: 60
+      on: cl-docker-01
+      skills: [containers.network.publishing]
+      weight: 1
+      command: |
+        docker inspect gateway 2>/dev/null | jq -r '.[0].HostConfig | ([.PortBindings["80/tcp"][]? | (.HostIp // "") + ":" + .HostPort] | join(",")) + " " + (if (.RestartPolicy.Name | IN("always", "unless-stopped")) then "restarts" else "stays-down" end)'
+      expect: {match: exact, value: "127.0.0.1:8090 restarts"}
+  misconceptions:
+    - id: add-without-drop
+      description: Adds NET_BIND_SERVICE but never drops the default capabilities.
+      feedback: "--cap-add only adds; the default set (CHOWN, SETUID, NET_RAW, ...) stays. Use --cap-drop ALL and then --cap-add NET_BIND_SERVICE."
+      expectFail: [capabilities]
+      mutation:
+        on: cl-docker-01
+        as: learner
+        run: |
+          docker run -d --name gateway --restart unless-stopped -p 127.0.0.1:8090:80 --cap-add NET_BIND_SERVICE \
+            --security-opt no-new-privileges --read-only --pids-limit 100 copperleaf/gateway:1
+    - id: missing-limits
+      description: Drops the capabilities but forgets the read-only root and the pids limit.
+      feedback: "Capabilities are one layer. The task also asks for --read-only and --pids-limit 100."
+      expectFail: [hardening]
+      mutation:
+        on: cl-docker-01
+        as: learner
+        run: |
+          docker run -d --name gateway --restart unless-stopped -p 127.0.0.1:8090:80 --cap-drop ALL --cap-add NET_BIND_SERVICE \
+            --security-opt no-new-privileges copperleaf/gateway:1
+  solution:
+    explanation: Drop everything, add back the one capability a port-80 listener needs, and add the other hardening flags.
+    steps:
+      - on: cl-docker-01
+        as: learner
+        run: |
+          docker run -d --name gateway --restart unless-stopped -p 127.0.0.1:8090:80 \
+            --cap-drop ALL --cap-add NET_BIND_SERVICE --security-opt no-new-privileges:true \
+            --read-only --pids-limit 100 copperleaf/gateway:1

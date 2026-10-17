@@ -165,10 +165,10 @@ export function Drawer({ open, onOpenChange, title, description, children, width
 
 /* ---------------------------------- Pager ---------------------------------- */
 
-export function Pager({ offset, pageSize, total, onChange, loading }: { offset: number; pageSize: number; total: number | undefined; onChange: (offset: number) => void; loading?: boolean }) {
+export function Pager({ offset, pageSize, total, onChange, loading, hasNext: more }: { offset: number; pageSize: number; total: number | undefined; onChange: (offset: number) => void; loading?: boolean; hasNext?: boolean }) {
   const from = total === 0 ? 0 : offset + 1;
   const to = total === undefined ? offset + pageSize : Math.min(total, offset + pageSize);
-  const hasNext = total === undefined ? true : to < total;
+  const hasNext = more ?? (total === undefined ? true : to < total);
   return (
     <div className="pager" aria-live="polite">
       <span className="xs subtle tnum">{total === undefined ? `${from}–${to}` : `${from}–${to} of ${total}`}</span>

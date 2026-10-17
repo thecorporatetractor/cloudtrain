@@ -1,0 +1,109 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xia-git-module-pin
+  title: Pin a module to a tag in a Git repository
+  domain: iac
+  frameworks: [tf-associate:modules]
+  difficulty: easy
+  estimatedMinutes: 5
+  tags: [exam, terraform, modules, module-sources, git]
+  version: 1
+spec:
+  description: |
+    **Directory:** `~/exam/inland-git` (workstation only)
+
+    The inland stack uses a hand-copied `vendor/farm-base`. Switch module
+    `farm` to the internal Git repository
+    **`/home/learner/git/farm-base.git`**, pinned to tag **`v1.3.0`** (use a
+    `git::` source with the `file://` protocol), and initialise the stack so
+    the module is installed. You do not need to apply.
+  objectives:
+    - Source a module from Git pinned to a tag
+  params:
+    farm:
+      type: choice
+      values: [fenwick, larkholt]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+  setup:
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xia-git-module-pin/stack/versions.tf, source: assets/stack/versions.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xia-git-module-pin/stack/main.tf, source: assets/stack/main.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xia-git-module-pin/stack/vendor/farm-base/main.tf, source: assets/stack/vendor/farm-base/main.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xia-git-module-pin/make-repo.sh, source: assets/make-repo.sh, mode: "0755"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xia-git-module-pin/seed.sh, source: assets/seed.sh, mode: "0755"}
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/exam
+    - on: workstation
+      as: learner
+      run: /var/tmp/ct-seed/xia-git-module-pin/make-repo.sh
+    - on: workstation
+      as: learner
+      timeoutSec: 120
+      run: /var/tmp/ct-seed/xia-git-module-pin/seed.sh xia-git-module-pin inland-git init
+  checks:
+    - id: pinned-source
+      description: Module farm is installed from the farm-base Git repository at ref v1.3.0
+      type: shell
+      on: workstation
+      skills: [iac.modules.sources]
+      weight: 2
+      command: |
+        jq -r '[.Modules[]? | select(.Key == "farm") | .Source][0] // "none"' /home/learner/exam/inland-git/.terraform/modules/modules.json 2>/dev/null \
+          | grep -qE '^git::file:///home/learner/git/farm-base\.git(//[^?]*)?\?(.*&)?ref=v1\.3\.0(&.*)?$' && echo pinned || echo "not pinned"
+      expect: {match: exact, value: pinned}
+    - id: version-installed
+      description: The installed module is release 1.3.0 and the stack plans with it
+      type: shell
+      on: workstation
+      skills: [iac.modules.sources]
+      weight: 2
+      timeoutSec: 120
+      command: |
+        ct-iac planjson /home/learner/exam/inland-git | jq -r '[.resource_changes[]? | select(.type == "local_file") | .change.after.content][0] // "no plan"' 2>/dev/null | head -1
+      expect: {match: exact, value: "farm-base 1.3.0 farm={{farm}}"}
+  misconceptions:
+    - id: branch-tip
+      description: Points at the repository without a ref, which follows the default branch.
+      feedback: Without ?ref= Terraform takes the default branch, here an unreleased 1.4.0-dev. Pin the tag.
+      expectFail: [pinned-source, version-installed]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          cd ~/exam/inland-git
+          sed -i 's|  source = "./vendor/farm-base"|  source = "git::file:///home/learner/git/farm-base.git"|' main.tf
+          iac init -input=false -no-color
+    - id: old-tag
+      description: Pins the previous release v1.2.0.
+      feedback: The change calls for v1.3.0.
+      expectFail: [pinned-source, version-installed]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          cd ~/exam/inland-git
+          sed -i 's|  source = "./vendor/farm-base"|  source = "git::file:///home/learner/git/farm-base.git?ref=v1.2.0"|' main.tf
+          iac init -input=false -no-color
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          set -e
+          cd ~/exam/inland-git
+          sed -i 's|  source = "./vendor/farm-base"|  source = "git::file:///home/learner/git/farm-base.git?ref=v1.3.0"|' main.tf
+          iac init -input=false -no-color

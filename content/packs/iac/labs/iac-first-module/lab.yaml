@@ -1,0 +1,358 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: iac-first-module
+  title: Extract a reusable farm module
+  domain: iac
+  frameworks: [tf-associate:modules]
+  difficulty: easy
+  estimatedMinutes: 20
+  tags: [terraform, modules, moved, refactoring, kubernetes-provider]
+  version: 1
+spec:
+  description: |
+    Every wind farm gets the same three objects on `sm-grid`: a namespace
+    `farm-<farm>`, a ResourceQuota `farm-quota` limiting its pods and a ConfigMap
+    `farm-info`. The stack in `~/stacks/farm-platform` (applied) declares them
+    as three flat `for_each` resources. Two more farms are coming, so turn the
+    pattern into a module:
+
+    1. Create module **`./modules/farm-base`** that creates those three objects
+       for one farm. Inputs: **`farm`** (string) and **`max_pods`** (number),
+       each with a `type` and a `description`. Output: **`namespace`**, the
+       namespace name.
+    2. In the root module, call `farm-base` for gullhaven, redmoor and skerrow
+       with their current `max_pods`, and output **`farm_namespaces`**: a map
+       from farm to the module's `namespace` output.
+    3. Move the existing objects into the module **without recreating any of
+       them** (use `moved` blocks), then apply. A following plan must report no
+       changes.
+  objectives:
+    - Write a module with typed input variables and outputs
+    - Call a module several times and use its outputs
+    - Move existing resources into a module without recreating them
+  params:
+    gh:
+      type: int
+      min: 10
+      max: 16
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+      - name: sm-grid
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: sm-grid
+  setup:
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/main.tf, source: assets/main.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/seed.sh, source: assets/seed.sh, mode: "0755"}
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/stacks
+    - on: workstation
+      as: learner
+      timeoutSec: 300
+      run: /var/tmp/ct-seed/seed.sh
+    - on: sm-grid
+      run: |
+        set -eu
+        kubectl -n kube-system get configmap ct-baseline-uids >/dev/null 2>&1 && exit 0
+        args=""
+        for f in gullhaven redmoor skerrow; do
+          args="$args --from-literal=ns-$f=$(kubectl get namespace farm-$f -o jsonpath='{.metadata.uid}')"
+          args="$args --from-literal=cm-$f=$(kubectl -n farm-$f get configmap farm-info -o jsonpath='{.metadata.uid}')"
+          args="$args --from-literal=rq-$f=$(kubectl -n farm-$f get resourcequota farm-quota -o jsonpath='{.metadata.uid}')"
+        done
+        kubectl -n kube-system create configmap ct-baseline-uids $args
+  teardown:
+    - on: sm-grid
+      run: kubectl delete namespace farm-gullhaven farm-redmoor farm-skerrow --ignore-not-found --wait=false
+  checks:
+    - id: objects-kept
+      description: All nine farm objects are the original ones (UIDs unchanged)
+      type: shell
+      on: sm-grid
+      skills: [iac.modules.refactor]
+      weight: 3
+      timeoutSec: 60
+      command: |
+        b() { kubectl -n kube-system get configmap ct-baseline-uids -o jsonpath="{.data.$1}"; }
+        n=0
+        for f in gullhaven redmoor skerrow; do
+          [ "$(kubectl get namespace farm-$f -o jsonpath='{.metadata.uid}' 2>/dev/null)" = "$(b ns-$f)" ] && n=$((n+1))
+          [ "$(kubectl -n farm-$f get configmap farm-info -o jsonpath='{.metadata.uid}' 2>/dev/null)" = "$(b cm-$f)" ] && n=$((n+1))
+          [ "$(kubectl -n farm-$f get resourcequota farm-quota -o jsonpath='{.metadata.uid}' 2>/dev/null)" = "$(b rq-$f)" ] && n=$((n+1))
+        done
+        echo "kept=$n"
+      expect: {match: exact, value: kept=9}
+    - id: in-module
+      description: Every farm object is managed inside the farm-base module, none in the root module
+      type: shell
+      on: workstation
+      skills: [iac.modules.authoring]
+      weight: 2
+      timeoutSec: 60
+      command: |
+        ct-iac state /home/learner/stacks/farm-platform | jq -r '
+          ([.values.root_module.resources[]? | select(.mode == "managed")] | length) as $root
+          | ([.values.root_module.child_modules[]? | .resources[]? | select(.mode == "managed")] | length) as $child
+          | "root=\($root) module=\($child)"' 2>/dev/null
+      expect: {match: exact, value: root=0 module=9}
+    - id: module-source
+      description: The calls use ./modules/farm-base, whose inputs farm and max_pods are typed and described
+      type: shell
+      on: workstation
+      skills: [iac.modules.authoring]
+      weight: 1.5
+      timeoutSec: 90
+      command: |
+        d=/home/learner/stacks/farm-platform
+        src=$(ct-iac planjson $d | jq -r '[.configuration.root_module.module_calls[]?.source] | unique | join(",")' 2>/dev/null)
+        typed=$(cat $d/modules/farm-base/*.tf 2>/dev/null | awk '
+          /^[[:space:]]*variable[[:space:]]+"/ {v=$2; gsub(/"/,"",v); t[v]=0; dsc[v]=0; inv=1; depth=0}
+          inv { o=gsub(/\{/,"{"); c=gsub(/\}/,"}"); depth+=o-c
+                if ($0 ~ /^[[:space:]]*type[[:space:]]*=/) t[v]=1
+                if ($0 ~ /^[[:space:]]*description[[:space:]]*=/) dsc[v]=1
+                if (depth<=0) inv=0 }
+          END { print ((t["farm"] && dsc["farm"] && t["max_pods"] && dsc["max_pods"]) ? "typed" : "untyped") }')
+        echo "source=$src $typed"
+      expect: {match: exact, value: source=./modules/farm-base typed}
+    - id: outputs
+      description: Output farm_namespaces maps each farm to its namespace from the module output
+      type: shell
+      on: workstation
+      skills: [iac.modules.authoring, iac.language.outputs-locals]
+      timeoutSec: 60
+      command: |
+        jq -r '.outputs.farm_namespaces.value // {} | to_entries | sort_by(.key) | map("\(.key)=\(.value)") | join(",")' /home/learner/stacks/farm-platform/terraform.tfstate 2>/dev/null
+      expect: {match: exact, value: "gullhaven=farm-gullhaven,redmoor=farm-redmoor,skerrow=farm-skerrow"}
+    - id: quota-values
+      description: The quotas still allow {{gh}}, 20 and 30 pods
+      type: shell
+      on: sm-grid
+      skills: [iac.modules.authoring]
+      weight: 0.5
+      timeoutSec: 30
+      command: |
+        for f in gullhaven redmoor skerrow; do kubectl -n farm-$f get resourcequota farm-quota -o jsonpath='{.spec.hard.pods} ' 2>/dev/null; done
+      expect: {match: exact, value: "{{gh}} 20 30 "}
+    - id: converged
+      description: A new plan of ~/stacks/farm-platform reports no changes
+      type: shell
+      on: workstation
+      skills: [iac.foundations.workflow]
+      timeoutSec: 120
+      command: ct-iac plan /home/learner/stacks/farm-platform
+      expect: {match: exact, value: no-changes}
+  hints:
+    - title: A module is a directory
+      body: Create `modules/farm-base/` with `variables.tf`, `main.tf` and `outputs.tf`. Inside it, resources use `var.farm` and `var.max_pods` instead of each.key and each.value.
+      cost: 1
+    - title: Calling it for several farms
+      body: "`module \"farm\" { for_each = local.farms  source = \"./modules/farm-base\"  farm = each.key  max_pods = each.value.max_pods }` (on separate lines). Run `terraform init` after adding a module."
+      cost: 1
+    - title: Moving into a module
+      body: |
+        One moved block per object, for example
+        `moved { from = kubernetes_namespace_v1.farm["gullhaven"]  to = module.farm["gullhaven"].kubernetes_namespace_v1.this }`.
+        The plan must show 9 moves and 0 to add or destroy.
+      cost: 2
+  misconceptions:
+    - id: module-without-moved
+      description: Introduces the module but adds no moved blocks.
+      feedback: Without moved blocks the objects inside the module are new addresses, so Terraform destroys the old namespaces (and everything in them) and creates new ones.
+      expectFail: [objects-kept]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 400
+        run: |
+          set -e
+          cd ~/stacks/farm-platform
+          mkdir -p modules/farm-base
+          cat > modules/farm-base/main.tf <<'HCL'
+          variable "farm" {
+            type        = string
+            description = "Wind farm name"
+          }
+          variable "max_pods" {
+            type        = number
+            description = "Pod limit of the farm namespace"
+          }
+          resource "kubernetes_namespace_v1" "this" {
+            metadata {
+              name = "farm-${var.farm}"
+            }
+          }
+          resource "kubernetes_resource_quota_v1" "this" {
+            metadata {
+              name      = "farm-quota"
+              namespace = kubernetes_namespace_v1.this.metadata[0].name
+            }
+            spec {
+              hard = {
+                pods = var.max_pods
+              }
+            }
+          }
+          resource "kubernetes_config_map_v1" "this" {
+            metadata {
+              name      = "farm-info"
+              namespace = kubernetes_namespace_v1.this.metadata[0].name
+            }
+            data = {
+              farm = var.farm
+            }
+          }
+          output "namespace" {
+            value = kubernetes_namespace_v1.this.metadata[0].name
+          }
+          HCL
+          python3 - <<'PY'
+          import re
+          p = "main.tf"; s = open(p).read()
+          s = s[:s.index('resource "kubernetes_namespace_v1" "farm"')]
+          s += 'module "farm" {\n  for_each = local.farms\n  source   = "./modules/farm-base"\n  farm     = each.key\n  max_pods = each.value.max_pods\n}\n\noutput "farm_namespaces" {\n  value = { for k, m in module.farm : k => m.namespace }\n}\n'
+          open(p, "w").write(s)
+          PY
+          iac init -input=false -no-color
+          # New objects with the old names race the destroys: the first apply fails half-way, the rerun finishes.
+          iac apply -auto-approve -input=false -no-color || iac apply -auto-approve -input=false -no-color || true
+    - id: untyped-inputs
+      description: Declares the module inputs as bare `variable "farm" {}` blocks.
+      feedback: Without types any value is accepted and mistakes surface late, inside the module. Give every input a type and a description; they are the module's contract.
+      expectFail: [module-source]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 400
+        run: |
+          set -e
+          cd ~/stacks/farm-platform
+          mkdir -p modules/farm-base
+          cat > modules/farm-base/main.tf <<'HCL'
+          variable "farm" {}
+          variable "max_pods" {}
+          resource "kubernetes_namespace_v1" "this" {
+            metadata {
+              name = "farm-${var.farm}"
+            }
+          }
+          resource "kubernetes_resource_quota_v1" "this" {
+            metadata {
+              name      = "farm-quota"
+              namespace = kubernetes_namespace_v1.this.metadata[0].name
+            }
+            spec {
+              hard = {
+                pods = var.max_pods
+              }
+            }
+          }
+          resource "kubernetes_config_map_v1" "this" {
+            metadata {
+              name      = "farm-info"
+              namespace = kubernetes_namespace_v1.this.metadata[0].name
+            }
+            data = {
+              farm = var.farm
+            }
+          }
+          output "namespace" {
+            value = kubernetes_namespace_v1.this.metadata[0].name
+          }
+          HCL
+          python3 - <<'PY'
+          p = "main.tf"; s = open(p).read()
+          s = s[:s.index('resource "kubernetes_namespace_v1" "farm"')]
+          s += 'module "farm" {\n  for_each = local.farms\n  source   = "./modules/farm-base"\n  farm     = each.key\n  max_pods = each.value.max_pods\n}\n\noutput "farm_namespaces" {\n  value = { for k, m in module.farm : k => m.namespace }\n}\n'
+          for f in ["gullhaven", "redmoor", "skerrow"]:
+              for t, r in [("kubernetes_namespace_v1", "farm"), ("kubernetes_resource_quota_v1", "farm"), ("kubernetes_config_map_v1", "farm")]:
+                  s += f'\nmoved {{\n  from = {t}.{r}["{f}"]\n  to   = module.farm["{f}"].{t}.this\n}}\n'
+          open(p, "w").write(s)
+          PY
+          iac init -input=false -no-color
+          iac apply -auto-approve -input=false -no-color
+  solution:
+    explanation: |
+      The module holds the three resources once, parameterised by typed inputs, and
+      returns the namespace name as an output. The root calls it with for_each over
+      the same farm map, so each farm's objects live at
+      `module.farm["<farm>"].<type>.this`. Nine moved blocks map the old flat
+      addresses to those, so the plan only moves state entries and nothing is
+      recreated.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 400
+        run: |
+          set -e
+          cd ~/stacks/farm-platform
+          mkdir -p modules/farm-base
+          cat > modules/farm-base/variables.tf <<'HCL'
+          variable "farm" {
+            description = "Wind farm name, used in the namespace name"
+            type        = string
+          }
+
+          variable "max_pods" {
+            description = "Maximum number of pods in the farm namespace"
+            type        = number
+          }
+          HCL
+          cat > modules/farm-base/main.tf <<'HCL'
+          resource "kubernetes_namespace_v1" "this" {
+            metadata {
+              name = "farm-${var.farm}"
+            }
+          }
+
+          resource "kubernetes_resource_quota_v1" "this" {
+            metadata {
+              name      = "farm-quota"
+              namespace = kubernetes_namespace_v1.this.metadata[0].name
+            }
+            spec {
+              hard = {
+                pods = var.max_pods
+              }
+            }
+          }
+
+          resource "kubernetes_config_map_v1" "this" {
+            metadata {
+              name      = "farm-info"
+              namespace = kubernetes_namespace_v1.this.metadata[0].name
+            }
+            data = {
+              farm = var.farm
+            }
+          }
+          HCL
+          cat > modules/farm-base/outputs.tf <<'HCL'
+          output "namespace" {
+            description = "Name of the farm namespace"
+            value       = kubernetes_namespace_v1.this.metadata[0].name
+          }
+          HCL
+          python3 - <<'PY'
+          p = "main.tf"; s = open(p).read()
+          s = s[:s.index('resource "kubernetes_namespace_v1" "farm"')]
+          s += 'module "farm" {\n  for_each = local.farms\n  source   = "./modules/farm-base"\n  farm     = each.key\n  max_pods = each.value.max_pods\n}\n\noutput "farm_namespaces" {\n  value = { for k, m in module.farm : k => m.namespace }\n}\n'
+          open(p, "w").write(s)
+          m = ""
+          for f in ["gullhaven", "redmoor", "skerrow"]:
+              for t in ["kubernetes_namespace_v1", "kubernetes_resource_quota_v1", "kubernetes_config_map_v1"]:
+                  m += f'moved {{\n  from = {t}.farm["{f}"]\n  to   = module.farm["{f}"].{t}.this\n}}\n\n'
+          open("moved.tf", "w").write(m)
+          PY
+          iac init -input=false -no-color
+          iac plan -input=false -no-color
+          iac apply -auto-approve -input=false -no-color

@@ -1,0 +1,189 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: iac-drift-refresh-only
+  title: Reconcile hand edits found by a refresh-only plan
+  domain: iac
+  frameworks: [tf-associate:maintain, tf-advanced:lifecycle-import-drift]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [terraform, drift, refresh-only, replace, kubernetes-provider]
+  version: 1
+spec:
+  description: |
+    The forecast stack in `~/stacks/forecast` manages a Deployment, a Service and
+    the Secret `forecast-model` on `sm-grid`. Over the weekend someone changed
+    things by hand, and the forecast team also reports that the Secret's content
+    got corrupted by a bad script.
+
+    1. Find out what changed outside Terraform **without changing anything**:
+       `terraform plan -refresh-only` shows the drift.
+    2. The Deployment was scaled because of the winter peak. That change is
+       approved: **accept it into the configuration**, so Terraform keeps the new
+       replica count.
+    3. The Service's label change is not approved: **revert it** to what the
+       configuration says.
+    4. Do not trust the Secret: **force Terraform to replace it** (destroy and
+       create a fresh object) in the same change, with the `-replace` option.
+
+    Finish with an apply, after which a plan reports no changes. The Deployment
+    itself must not be recreated.
+  objectives:
+    - Detect drift with a refresh-only plan
+    - Decide per change whether to accept drift into code or revert it
+    - Force the replacement of one resource with -replace
+  params:
+    replicas:
+      type: int
+      min: 3
+      max: 5
+    model:
+      type: choice
+      values: [gbm-2026.09, gbm-2026.10, lstm-2026.10]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+      - name: sm-grid
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: sm-grid
+  setup:
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/main.tf, source: assets/main.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/seed.sh, source: assets/seed.sh, mode: "0755"}
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/stacks
+    - on: workstation
+      as: learner
+      timeoutSec: 300
+      run: /var/tmp/ct-seed/seed.sh
+    - on: sm-grid
+      timeoutSec: 60
+      run: |
+        set -eu
+        kubectl -n kube-system get configmap ct-baseline-uids >/dev/null 2>&1 && exit 0
+        kubectl -n forecast scale deployment forecast --replicas={{replicas}}
+        kubectl -n forecast label service forecast tier=debug --overwrite
+        kubectl -n forecast patch secret forecast-model --type merge -p '{"stringData":{"model-version":"###corrupt###"}}'
+        kubectl -n kube-system create configmap ct-baseline-uids \
+          --from-literal=deployment=$(kubectl -n forecast get deployment forecast -o jsonpath='{.metadata.uid}') \
+          --from-literal=secret=$(kubectl -n forecast get secret forecast-model -o jsonpath='{.metadata.uid}')
+  teardown:
+    - on: sm-grid
+      run: kubectl delete namespace forecast --ignore-not-found --wait=false
+  checks:
+    - id: replicas-accepted
+      description: The Deployment keeps the scaled replica count and is the same object
+      type: shell
+      on: sm-grid
+      skills: [iac.state.drift]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        r=$(kubectl -n forecast get deployment forecast -o jsonpath='{.spec.replicas}' 2>/dev/null)
+        u=$(kubectl -n forecast get deployment forecast -o jsonpath='{.metadata.uid}' 2>/dev/null)
+        [ "$u" = "$(kubectl -n kube-system get configmap ct-baseline-uids -o jsonpath='{.data.deployment}')" ] && s=same || s=new
+        echo "replicas=$r object=$s"
+      expect: {match: exact, value: "replicas={{replicas}} object=same"}
+    - id: label-reverted
+      description: The Service is labelled tier=api again
+      type: k8s-query
+      skills: [iac.state.drift]
+      weight: 1.5
+      query: {cluster: sm-grid, resource: service, name: forecast, namespace: forecast, jsonpath: "{.metadata.labels.tier}"}
+      expect: {match: exact, value: api}
+    - id: secret-replaced
+      description: Secret forecast-model is a new object with the configured model version
+      type: shell
+      on: sm-grid
+      skills: [iac.state.drift]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        u=$(kubectl -n forecast get secret forecast-model -o jsonpath='{.metadata.uid}' 2>/dev/null)
+        v=$(kubectl -n forecast get secret forecast-model -o jsonpath='{.data.model-version}' 2>/dev/null | base64 -d 2>/dev/null)
+        [ -n "$u" ] && [ "$u" != "$(kubectl -n kube-system get configmap ct-baseline-uids -o jsonpath='{.data.secret}')" ] && o=new || o=old
+        echo "object=$o model=$v"
+      expect: {match: exact, value: "object=new model={{model}}"}
+    - id: converged
+      description: A new plan of ~/stacks/forecast reports no changes
+      type: shell
+      on: workstation
+      skills: [iac.foundations.workflow, iac.state.drift]
+      weight: 1.5
+      timeoutSec: 120
+      command: ct-iac plan /home/learner/stacks/forecast
+      expect: {match: exact, value: no-changes}
+  hints:
+    - title: Look before you touch
+      body: A refresh-only plan compares state with the real objects and lists what changed outside Terraform, without proposing to change anything.
+      command: cd ~/stacks/forecast && terraform plan -refresh-only
+      cost: 1
+    - title: Accept versus revert
+      body: To accept a change, write the new value into the configuration. To revert one, leave the configuration as it is; the next apply puts the object back.
+      cost: 1
+    - title: Replace one resource
+      body: "`-replace=ADDRESS` plans a destroy-and-create for that resource even when nothing else would change it."
+      command: terraform apply -replace=kubernetes_secret_v1.model
+      cost: 2
+  misconceptions:
+    - id: apply-reverts-everything
+      description: Runs a plain apply, which also reverts the approved replica change.
+      feedback: Apply makes the objects match the configuration, so the scale-out is undone. Put the approved replica count into the configuration first.
+      expectFail: [replicas-accepted, secret-replaced]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          cd ~/stacks/forecast
+          iac apply -auto-approve -input=false -no-color
+    - id: refresh-only-apply
+      description: Applies the refresh-only plan, which writes every hand edit into state, including the unapproved ones.
+      feedback: apply -refresh-only accepts all drift into state; the code still says tier=api, so the next plan wants to change it, and the corrupted Secret stays. Decide per change.
+      expectFail: [label-reverted, secret-replaced, converged]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          cd ~/stacks/forecast
+          sed -i 's/    replicas = 2/    replicas = {{replicas}}/' main.tf
+          iac apply -refresh-only -auto-approve -input=false -no-color
+    - id: no-replace
+      description: Lets the in-place update rewrite the Secret instead of replacing it.
+      feedback: The value is right again, but it is still the object the bad script touched. -replace destroys it and creates a fresh one.
+      expectFail: [secret-replaced]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          cd ~/stacks/forecast
+          sed -i 's/    replicas = 2/    replicas = {{replicas}}/' main.tf
+          iac apply -auto-approve -input=false -no-color
+  solution:
+    explanation: |
+      The refresh-only plan shows three outside changes. Writing `replicas =
+      {{replicas}}` into the configuration accepts the scale-out; the label is left
+      as configured, so the apply reverts it; `-replace` makes Terraform destroy and
+      recreate the Secret with the configured content. The Deployment is only
+      updated in place, if at all, so it keeps its identity.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/stacks/forecast
+          iac plan -refresh-only -input=false -no-color
+          sed -i 's/    replicas = 2/    replicas = {{replicas}}/' main.tf
+          iac apply -auto-approve -input=false -no-color -replace=kubernetes_secret_v1.model
+          iac plan -input=false -no-color -detailed-exitcode

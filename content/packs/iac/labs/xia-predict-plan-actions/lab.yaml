@@ -1,0 +1,134 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xia-predict-plan-actions
+  title: Predict what a plan will create, update and replace
+  domain: iac
+  frameworks: [tf-associate:iac-concepts]
+  difficulty: easy
+  estimatedMinutes: 6
+  tags: [exam, terraform, plan, lifecycle]
+  version: 1
+spec:
+  description: |
+    **Directory:** `~/exam/predict` (workstation)
+
+    The stack in `~/exam/predict` is applied. Its `main.tf` already contains a
+    change that has **not** been applied. Without applying it, write
+    `~/exam/predict/answer.json` listing the resource instance addresses the
+    next plan will act on, by action:
+
+    ```json
+    {"create": ["..."], "update": ["..."], "replace": ["..."]}
+    ```
+
+    Use full instance addresses (for example `aws_x.y["k"]`), each list sorted,
+    and leave out instances that will not change. You may confirm with
+    `terraform plan`. Do not apply.
+  objectives:
+    - Read plan actions (create, update in place, replace)
+  params:
+    upd:
+      type: choice
+      values: [gh, rm]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+  setup:
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xia-predict-plan-actions/v1.tf, source: assets/v1.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xia-predict-plan-actions/seed.sh, source: assets/seed.sh, mode: "0755"}
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/exam
+    - on: workstation
+      as: learner
+      timeoutSec: 180
+      run: /var/tmp/ct-seed/xia-predict-plan-actions/seed.sh {{upd}}
+  checks:
+    - id: create-list
+      description: answer.json lists the instances to create
+      type: shell
+      on: workstation
+      skills: [iac.foundations.concepts]
+      timeoutSec: 90
+      command: |
+        exp=$(ct-iac planjson /home/learner/exam/predict | jq -c '[.resource_changes[] | select(.change.actions == ["create"]) | .address] | sort')
+        got=$(jq -c '.create | sort' /home/learner/exam/predict/answer.json 2>/dev/null)
+        [ -n "$exp" ] && [ "$exp" = "$got" ] && echo ok || echo different
+      expect: {match: exact, value: ok}
+    - id: update-list
+      description: answer.json lists the instances to update in place
+      type: shell
+      on: workstation
+      skills: [iac.foundations.concepts, iac.state.inspection]
+      weight: 1.5
+      timeoutSec: 90
+      command: |
+        exp=$(ct-iac planjson /home/learner/exam/predict | jq -c '[.resource_changes[] | select(.change.actions == ["update"]) | .address] | sort')
+        got=$(jq -c '.update | sort' /home/learner/exam/predict/answer.json 2>/dev/null)
+        [ -n "$exp" ] && [ "$exp" = "$got" ] && echo ok || echo different
+      expect: {match: exact, value: ok}
+    - id: replace-list
+      description: answer.json lists the instances to replace
+      type: shell
+      on: workstation
+      skills: [iac.foundations.concepts, iac.state.inspection]
+      weight: 1.5
+      timeoutSec: 90
+      command: |
+        exp=$(ct-iac planjson /home/learner/exam/predict | jq -c '[.resource_changes[] | select((.change.actions | sort) == ["create", "delete"]) | .address] | sort')
+        got=$(jq -c '.replace | sort' /home/learner/exam/predict/answer.json 2>/dev/null)
+        [ -n "$exp" ] && [ "$exp" = "$got" ] && echo ok || echo different
+      expect: {match: exact, value: ok}
+    - id: not-applied
+      description: The pending change is still unapplied
+      type: shell
+      on: workstation
+      skills: [iac.foundations.concepts]
+      timeoutSec: 90
+      command: ct-iac plan /home/learner/exam/predict
+      expect: {match: exact, value: changes}
+  misconceptions:
+    - id: input-replaces
+      description: Assumes any argument change replaces the instance.
+      feedback: Only arguments that force replacement (here triggers_replace, and any change to a local_file) replace; terraform_data's input is updated in place.
+      expectFail: [update-list, replace-list]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 90
+        run: |
+          cd ~/exam/predict
+          printf '{"create": ["terraform_data.alarm"], "update": [], "replace": ["local_file.manifest", "terraform_data.turbine[\\"gh\\"]", "terraform_data.turbine[\\"rm\\"]"]}\n' > answer.json
+    - id: applied-it
+      description: Applies the change to see what happens.
+      feedback: The task was to predict and confirm with plan; apply changed the environment.
+      expectFail: [not-applied]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          cd ~/exam/predict
+          iac apply -auto-approve -input=false -no-color
+  solution:
+    explanation: The new terraform_data.alarm is created; the turbine whose input changes is updated in place; the turbine whose triggers_replace changes and local_file.manifest (any content change) are replaced. random_pet.batch keeps its keepers, so it is untouched.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          set -e
+          cd ~/exam/predict
+          iac plan -input=false -no-color -out=p.tfplan >/dev/null
+          iac show -json p.tfplan | jq '{
+            create: [.resource_changes[] | select(.change.actions == ["create"]) | .address] | sort,
+            update: [.resource_changes[] | select(.change.actions == ["update"]) | .address] | sort,
+            replace: [.resource_changes[] | select((.change.actions | sort) == ["create", "delete"]) | .address] | sort}' > answer.json
+          rm -f p.tfplan
+          cat answer.json

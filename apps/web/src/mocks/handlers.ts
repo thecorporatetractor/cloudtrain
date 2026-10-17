@@ -1,8 +1,8 @@
 import { http, HttpResponse, delay } from 'msw';
-import type { CheckResult, LabSession, StudioDraft, ValidateResponse, VerificationGate } from '@/api/types';
+import type { CheckResult, LabSession, LearnerGoals, StudioDraft, UpdateLearnerGoalsRequest, ValidateResponse, VerificationGate } from '@/api/types';
 import { domains, labById, labSummaries, paths } from './fixtures/labs';
 import { frameworks, skillStates, skills } from './fixtures/skills';
-import { homeData } from './fixtures/home';
+import { COLD_START_USER, coldHomeData, homeData, withGoals } from './fixtures/home';
 import { myAssignments, personById, skillStatesOf, teamSeedById, userRef } from './fixtures/platform';
 import { drafts as seedDrafts, freshGates, specFromPrompt } from './fixtures/studio';
 import { allPlatformHandlers, currentSession, currentUser, mockNotices } from './platformHandlers';
@@ -15,6 +15,25 @@ import { examHandlers } from './examHandlers';
 const sessions = new Map<string, LabSession>();
 const drafts: StudioDraft[] = structuredClone(seedDrafts);
 const verifyStarted = new Map<string, number>();
+/** Learner goals per user (PUT /api/me/goals); kept in localStorage like the persona, so a reload keeps them. */
+const GOALS_KEY = 'ct.mock.goals';
+const goalsByUser = new Map<string, LearnerGoals>(
+  (() => {
+    try {
+      return Object.entries(JSON.parse(localStorage.getItem(GOALS_KEY) ?? '{}') as Record<string, LearnerGoals>);
+    } catch {
+      return [];
+    }
+  })(),
+);
+function saveGoals() {
+  try {
+    localStorage.setItem(GOALS_KEY, JSON.stringify(Object.fromEntries(goalsByUser)));
+  } catch {
+    /* blocked storage: keep them for this visit */
+  }
+}
+const NO_GOALS: LearnerGoals = { targetDate: null, weeklyTargetMinutes: null, updatedAt: null };
 
 const latency = () => delay(180 + Math.random() * 260);
 
@@ -136,12 +155,40 @@ const coreHandlers = [
     if (!s) return HttpResponse.json({ error: 'Not signed in', code: 'unauthenticated' }, { status: 401 });
     // The recommendations and goal are the sample learner model; the greeting and assignments follow the persona.
     const p = personById.get(s.userId);
+    const goals = goalsByUser.get(s.userId);
+    if (s.userId === COLD_START_USER) return HttpResponse.json({ ...coldHomeData, goal: withGoals(coldHomeData.goal, goals) });
     const learner = p ? { ...homeData.learner, id: p.id, name: p.name, email: p.email, team: p.teams[0] ? (teamSeedById(p.teams[0].teamId)?.name ?? '') : '' } : homeData.learner;
-    return HttpResponse.json({ ...homeData, learner, assignmentsDue: myAssignments(s.userId).filter((a) => a.status !== 'completed').slice(0, 5), source: 'live' });
+    return HttpResponse.json({ ...homeData, learner, goal: withGoals(homeData.goal, goals), assignmentsDue: myAssignments(s.userId).filter((a) => a.status !== 'completed').slice(0, 5), source: 'live' });
+  }),
+  http.get('/api/me/goals', async () => {
+    await delay(120);
+    const s = currentSession();
+    if (!s) return HttpResponse.json({ error: 'Not signed in', code: 'unauthenticated' }, { status: 401 });
+    return HttpResponse.json(goalsByUser.get(s.userId) ?? NO_GOALS);
+  }),
+  http.put('/api/me/goals', async ({ request }) => {
+    await delay(200);
+    const s = currentSession();
+    if (!s) return HttpResponse.json({ error: 'Not signed in', code: 'unauthenticated' }, { status: 401 });
+    const body = (await request.json()) as UpdateLearnerGoalsRequest;
+    const cur = goalsByUser.get(s.userId) ?? NO_GOALS;
+    const importing = body.source === 'browser';
+    const today = new Date().toISOString().slice(0, 10);
+    const date = body.targetDate === undefined || (importing && (cur.targetDate !== null || (body.targetDate !== null && body.targetDate < today))) ? cur.targetDate : body.targetDate;
+    const weekly = body.weeklyTargetMinutes === undefined || (importing && cur.weeklyTargetMinutes !== null) ? cur.weeklyTargetMinutes : body.weeklyTargetMinutes;
+    const next: LearnerGoals = { targetDate: date, weeklyTargetMinutes: weekly, updatedAt: new Date().toISOString() };
+    goalsByUser.set(s.userId, next);
+    saveGoals();
+    return HttpResponse.json(next);
   }),
 
   http.get('/api/catalog', async () => {
     await latency();
+    // The new learner has finished nothing; only the lab they opened shows as started.
+    if (currentSession()?.userId === COLD_START_USER) {
+      const started = coldHomeData.resume?.labId;
+      return HttpResponse.json({ domains, paths: paths.map((p) => ({ ...p, progress: 0 })), labs: labSummaries.map(({ bestScore: _b, ...l }) => ({ ...l, completion: l.id === started ? 'in-progress' : 'new' })) });
+    }
     return HttpResponse.json({ domains, paths, labs: labSummaries });
   }),
   http.get('/api/labs/:id', async ({ params }) => {

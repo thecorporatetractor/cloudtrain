@@ -156,6 +156,8 @@ export const people: PersonSeed[] = [
   { id: 'u-olu', name: 'Oluwaseun Bello', email: 'oluwaseun.bello@quillmoor.example', title: 'Data engineer', orgs: { [Q]: ['learner'] }, teams: [{ teamId: 't-data', role: 'member' }], lastLoginDaysAgo: 12, joinedDaysAgo: 40, skills: [0.3, 0.28, 0.22, 0.15, 0.3, 0.42, 0.55, 0.4, 0.05, 0.05, 0.08] },
   { id: 'u-chloe', name: 'Chloé Dubois', email: 'chloe.dubois@quillmoor.example', title: 'Depot systems lead', orgs: { [Q]: ['learner', 'manager'] }, teams: [{ teamId: 't-depot', role: 'manager' }], lastLoginDaysAgo: 6, joinedDaysAgo: 90, skills: [0.2, 0.2, 0.15, 0.1, 0.25, 0.7, 0.66, 0.72, 0.3, 0.28, 0.35] },
   { id: 'u-greta', name: 'Greta Lindqvist', email: 'greta.lindqvist@quillmoor.example', title: 'Depot systems administrator', orgs: { [Q]: ['learner'] }, teams: [{ teamId: 't-depot', role: 'member' }], lastLoginDaysAgo: 2, joinedDaysAgo: 45, skills: [0.1, 0.1, 0.1, 0.05, 0.15, 0.62, 0.58, 0.64, 0.22, 0.2, 0.3] },
+  // Signed up this week: no graded practice yet (Home cold start, see fixtures/home.ts).
+  { id: 'u-noor', name: 'Noor Aziz', email: 'noor.aziz@quillmoor.example', title: 'Platform engineer (new starter)', orgs: { [Q]: ['learner'] }, teams: [], lastLoginDaysAgo: 0, joinedDaysAgo: 3 },
   { id: 'u-hugo', name: 'Hugo Marchetti', email: 'hugo.marchetti@quillmoor.example', title: 'Depot systems administrator', orgs: { [Q]: ['learner'] }, teams: [{ teamId: 't-depot', role: 'member' }], status: 'invited', joinedDaysAgo: 2, source: 'invite' },
   { id: 'u-sven', name: 'Sven Aalto', email: 'sven.aalto@quillmoor.example', title: 'SRE (left)', orgs: { [Q]: ['learner'] }, teams: [], status: 'deactivated', lastLoginDaysAgo: 34, joinedDaysAgo: 118 },
   // Acme Freight
@@ -220,6 +222,7 @@ export interface Persona {
 }
 export const personas: Persona[] = [
   { id: 'learner', userId: 'u-lena', orgId: Q, label: 'Learner', hint: 'Lena Varga · Junior SRE' },
+  { id: 'new_learner', userId: 'u-noor', orgId: Q, label: 'New learner', hint: 'Noor Aziz · no history yet' },
   { id: 'manager', userId: 'u-ingrid', orgId: Q, label: 'Manager', hint: 'Ingrid Solvang · two teams' },
   { id: 'instructor', userId: 'u-samir', orgId: Q, label: 'Instructor', hint: 'Samir Haddad · CKS bootcamp' },
   { id: 'author', userId: 'u-aino', orgId: Q, label: 'Author', hint: 'Aino Lehto · Scenario Studio' },
@@ -254,6 +257,14 @@ const labTitle = (id: string) => labSummaries.find((l) => l.id === id)?.title ??
 export function attemptsFor(userId: string): Attempt[] {
   const p = personById.get(userId);
   if (!p || p.status === 'invited') return [];
+  if (userId === 'u-noor') {
+    // Opened the same lab twice, never validated; both environments expired after an hour.
+    const lab = labSummaries.find((l) => l.id === 'orchard-netpol-isolation')!;
+    return [50, 50.1].map((hoursAgo, i) => {
+      const startedAt = ago(Math.round(hoursAgo * HOUR));
+      return { id: `att-noor-${i}`, labId: lab.id, labTitle: lab.title, labVersion: lab.version ?? 1, sessionName: `ls-orchard-netp-noor${i}`, startedAt, endedAt: new Date(new Date(startedAt).getTime() + 3600_000).toISOString(), outcome: 'abandoned' as const, score: 0, hintsUsed: 0, validations: 0, durationS: 3600, practiceS: 0, checksPassed: 0, checksTotal: 5 };
+    });
+  }
   const n = userId === 'u-ingrid' ? 14 : 4 + Math.round(seeded(`${userId}:n`) * 9);
   const out: Attempt[] = [];
   for (let i = 0; i < n; i++) {
@@ -268,6 +279,7 @@ export function attemptsFor(userId: string): Attempt[] {
     const score = outcome === 'abandoned' ? 0 : Math.max(0, Math.round((passed / checks) * 100) - hints * 4);
     const durationS = Math.round((lab.estimatedMinutes * (0.6 + seeded(`${userId}:d:${i}`) * 1.1)) * 60);
     const startedAt = ago(daysAgo * DAY + Math.round(seeded(`${userId}:t:${i}`) * 10) * HOUR);
+    const validations = 1 + Math.floor(seeded(`${userId}:v:${i}`) * 4);
     out.push({
       id: `att-${userId.slice(2)}-${i}`,
       labId: lab.id,
@@ -279,8 +291,10 @@ export function attemptsFor(userId: string): Attempt[] {
       outcome,
       score,
       hintsUsed: hints,
-      validations: 1 + Math.floor(seeded(`${userId}:v:${i}`) * 4),
+      validations,
       durationS,
+      // Graded time ends at the last Validate; the environment usually runs a while longer.
+      practiceS: outcome === 'abandoned' && validations < 2 ? 0 : Math.round(durationS * (0.55 + seeded(`${userId}:p:${i}`) * 0.4)),
       checksPassed: passed,
       checksTotal: checks,
     });
@@ -288,7 +302,11 @@ export function attemptsFor(userId: string): Attempt[] {
   return out.sort((a, b) => b.startedAt.localeCompare(a.startedAt));
 }
 
-const minutesThisMonth = (userId: string) => Math.round(attemptsFor(userId).filter((a) => NOW - new Date(a.startedAt).getTime() < 30 * DAY).reduce((s, a) => s + a.durationS / 60, 0));
+/** Practice minutes (graded time) in attempts started in the last `days` days: the gateway's single measure of learner time. */
+export const practiceMinutes = (userId: string, days: number) => Math.round(attemptsFor(userId).filter((a) => NOW - new Date(a.startedAt).getTime() < days * DAY).reduce((s, a) => s + a.practiceS / 60, 0));
+const minutesThisMonth = (userId: string) => practiceMinutes(userId, 30);
+/** Environment minutes (session lifetime): quota accounting only. */
+const environmentMinutesThisMonth = (userId: string) => Math.round(attemptsFor(userId).filter((a) => NOW - new Date(a.startedAt).getTime() < 30 * DAY).reduce((s, a) => s + a.durationS / 60, 0));
 
 /* ================================================================ assignments */
 
@@ -476,6 +494,7 @@ function dashboardMember(userId: string, teamId: string): DashboardMember {
     mastery: masteryOf(userId),
     readiness: readinessOf(userId),
     minutesThisMonth: minutesThisMonth(userId),
+    minutesThisWeek: practiceMinutes(userId, 7),
     attemptsThisMonth: attempts.filter((a) => NOW - new Date(a.startedAt).getTime() < 30 * DAY).length,
     lastActiveAt: attempts[0]?.startedAt,
     assignments: { total: mine.length, completed: mine.filter((a) => a.status === 'completed').length, overdue, inProgress: mine.filter((a) => a.status === 'in_progress').length },
@@ -507,7 +526,7 @@ export function teamDashboard(teamId: string, viewerId: string, orgId: string): 
   const minutesByWeek = Array.from({ length: 8 }, (_, i) => {
     const weekStart = new Date(NOW - (7 - i) * 7 * DAY);
     weekStart.setUTCHours(0, 0, 0, 0);
-    const minutes = memberIds.reduce((s, u) => s + attemptsFor(u).filter((a) => Math.floor((NOW - new Date(a.startedAt).getTime()) / (7 * DAY)) === 7 - i).reduce((x, a) => x + a.durationS / 60, 0), 0);
+    const minutes = memberIds.reduce((s, u) => s + attemptsFor(u).filter((a) => Math.floor((NOW - new Date(a.startedAt).getTime()) / (7 * DAY)) === 7 - i).reduce((x, a) => x + a.practiceS / 60, 0), 0);
     return { weekStart: weekStart.toISOString().slice(0, 10), minutes: Math.round(minutes) };
   });
   return {
@@ -519,7 +538,7 @@ export function teamDashboard(teamId: string, viewerId: string, orgId: string): 
     minutesByWeek,
     totals: {
       members: members.length,
-      activeThisWeek: members.filter((m) => m.lastActiveAt && NOW - new Date(m.lastActiveAt).getTime() < 7 * DAY).length,
+      activeThisWeek: members.filter((m) => m.minutesThisWeek > 0).length,
       minutesThisMonth: members.reduce((s, m) => s + m.minutesThisMonth, 0),
       assignmentsOverdue: members.reduce((s, m) => s + m.assignments.overdue, 0),
       completionRate: allAssignments ? round2(completed / allAssignments) : 0,
@@ -544,6 +563,7 @@ export function memberDetail(teamId: string, userId: string): MemberDetail | und
     attempts: attemptsFor(userId),
     assignments: myAssignments(userId),
     minutesThisMonth: minutesThisMonth(userId),
+    minutesThisWeek: practiceMinutes(userId, 7),
   };
 }
 
@@ -711,7 +731,7 @@ export function usageOf(orgId: string, from?: string, to?: string): Usage {
       .slice(0, 8),
     byTeam: teamsOfOrg(orgId)
       .filter((t) => t.memberCount > 0)
-      .map((t) => ({ teamId: t.id, name: t.name, labHours: round2(membersOfTeam(t.id).reduce((s, m) => s + minutesThisMonth(m.id) / 60, 0)) })),
+      .map((t) => ({ teamId: t.id, name: t.name, labHours: round2(membersOfTeam(t.id).reduce((s, m) => s + environmentMinutesThisMonth(m.id) / 60, 0)) })),
   };
 }
 

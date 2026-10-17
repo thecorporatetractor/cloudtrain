@@ -44,7 +44,7 @@ an object it did not create (`ErrConflict`).
 |---|---|---|
 | `container` | Pod + ClusterIP Service (RuntimeClass, e.g. `kata`) | Image from the catalog. The **entry node** gets an admin sidecar, host aliases for every VM host and, with VMs, a second NIC on the lab network. |
 | `vm` | KubeVirt `VirtualMachine` | Catalog image on the lab network, root disk a CDI DataVolume imported from the containerDisk (`--vm-disks=persistent`, default) or the containerDisk itself; cloud-init: `learner` (key, passwordless sudo), root with the admin key only, pinned host key, static `/etc/hosts`. Ready once cloud-init finished. |
-| `k8s-cluster` `virtual` | vcluster (Helm, vendored chart + `deploy/vcluster/values.yaml`) | One vcluster per node, each in its own namespace `ct-<release>` (vcluster >= 0.25 allows one per namespace; session labels + `labs.cloudtrain.dev/session-namespace`, deleted on destroy), embedded DB on a StatefulSet PVC (`--vcluster-persistence`; emptyDir without it), kubeconfig rewritten to `https://<release>.ct-<release>.svc` and published as `<node>-kubeconfig`; synced workloads isolated by a NetworkPolicy and by Pod Security admission on the host namespace (`--vcluster-pod-security`, default `baseline`: privileged, hostPath, host namespaces/ports and extra capabilities are rejected, the virtual pod stays Pending with a sync error; `restricted` violations are audited). |
+| `k8s-cluster` `virtual` | vcluster (Helm, vendored chart + `deploy/vcluster/values.yaml`) | One vcluster per node, each in its own namespace `ct-<release>` (vcluster >= 0.25 allows one per namespace; session labels + `labs.cloudtrain.dev/session-namespace`, deleted on destroy), embedded DB on a StatefulSet PVC (`--vcluster-persistence`; emptyDir without it), kubeconfig rewritten to `https://<release>.ct-<release>.svc` and published as `<node>-kubeconfig`; synced workloads isolated by a NetworkPolicy and by Pod Security admission on the host namespace (`--vcluster-pod-security`, default `baseline`: privileged, hostPath, host namespaces/ports and extra capabilities are rejected, the virtual pod stays Pending with a sync error; `restricted` violations are audited). Ephemeral containers are refused earlier, inside the virtual cluster: the chart's `experimental.deploy` installs the ValidatingAdmissionPolicy `cloudtrain-ephemeral-pod-security` (same level), because the virtual API server would accept one that the host then refuses, and an ephemeral container can never be removed, so every later one of that Pod would fail to sync too. `kubectl debug` (default profile `general` adds SYS_PTRACE) gets `Forbidden ... use --profile=baseline`. |
 | `k8s-cluster` `kubeadm` | one KubeVirt VM per `cluster.nodes[]` | The orchestrator owns the PKI (CA, bootstrap token, admin/learner client certs, host keys), so kubeconfigs exist before boot. Control plane: `kubeadm init` with the pre-seeded CA, version = the image's kubeadm, CNI via the image's `/opt/cloudtrain/bin/cni-install <podCIDR>` (fallback: bundled Flannel manifest), pod CIDR 10.244.0.0/16. Workers join with a pinned CA hash. Declared taints are exact (`[]` = untainted), labels applied after join, `state: notready` = joined, Ready once, then kubelet stopped and disabled. Ready once every member matches its declared state and CoreDNS is available. |
 | `netdev` | Pod per device (FRR); vrnetlab VMs / Clabernetes later | implemented for FRR (see "Lab network and netdev") |
 
@@ -115,8 +115,16 @@ hashed over namespace, session, UID and suffix):
 A node is *wired* if it is a netdev node or has a link end. Wired pods get:
 the mgmt subnet as primary network, one Multus attachment per link end with
 the interface name from `node:iface`, NET_ADMIN/NET_RAW on the node
-container, a `net-init` init container (nettools image; privileged only for
-netns sysctls) and a `net` sidecar (nettools; `sleep infinity`). Unwired nodes
+container, a `net-init` init container (nettools image) and a `net` sidecar
+(nettools; `sleep infinity`). Where user namespaces are available
+(`--user-namespaces`, `--link-sysctls`, both default on) the pod runs with
+`hostUsers: false`, `net-init` has NET_ADMIN/NET_RAW and `procMount: Unmasked`
+instead of privileged mode, and the node container also gets `procMount:
+Unmasked`: root in the node can change the pod's network sysctls (`ip_forward`,
+`rp_filter`, `accept_ra`, `proxy_arp`), while host-wide sysctls stay read-only
+because the user namespace does not own them. Without user namespaces
+`net-init` is privileged and `/proc/sys` is read-only in the node.
+`net-init` also sets `ping_group_range` so the learner can ping without NET_RAW. Unwired nodes
 (e.g. a jumphost without links) are untouched.
 
 **Links are pure L2.** Kube-OVN needs a CIDR, gateway and IP per port, so each
@@ -153,14 +161,25 @@ manager sets `other_config:vlan-passthru=true` on each link logical switch with
 `ovn-nbctl` in the ovn-central pod (`--ovn-central`, default
 `kube-system/app=ovn-central`; empty disables it and tagged frames are
 dropped). Done subnets carry `labs.cloudtrain.dev/vlan-passthru: "true"`. The
-management segment keeps strict addressing. There is no rate limit on link
-segments yet: a bridging loop floods OVN.
+management segment keeps strict addressing.
+
+**Rate limit on links**: every link attachment is annotated
+`<provider>.kubernetes.io/ingress_rate` and `egress_rate` (`--link-rate-mbps`,
+default 10 Mbit/s; 0 disables). Kube-OVN applies them on the host side of the
+pod's veth (OVS ingress policing and an HTB queue), out of the learner's
+reach, so a bridging loop or flood on lab links cannot saturate the host: each
+port injects at most the rate, and a frame dropped at the cap leaves the loop.
+Labs that shape traffic themselves (`tbf`, netem) stay below it.
 
 **Isolation** is structural: wired pods live only in the session VPC, which
 has no route to the platform pod network, kube-apiserver, nodes or the
 internet, even when a learner adds a default route via the VPC gateway; the
 platform network has no route into the VPC. No NetworkPolicy is put on wired
 pods (it would also filter link traffic: OSPF multicast, router loopbacks).
+When the entry node is wired, its entry policy carries
+`ovn.kubernetes.io/network_policy_for: ovn` (plus `<ns>/<access NAD>` when the lab
+has VM hosts), so Kube-OVN applies it to the primary and access interfaces only,
+not to the link attachments.
 Platform-network pods such as the jumphost keep the `lab-demo.sh` policies.
 
 **Status**: `status.links[]` = `id`, `segment` (logical switch), `network`
@@ -245,6 +264,8 @@ Kubernetes authn/authz when set), `--watch-namespace`, `--leader-elect`,
 `--vcluster-chart`, `--vcluster-values`, `--vcluster-pod-security`
 (`baseline`|`restricted`; `privileged` is refused), `--session-selector`,
 `--leader-election-id`, `--net-tools-image` (default `nettools:1`), `--ovn-central`,
+`--link-rate-mbps` (default 10, per link attachment and direction; 0 = none), `--link-sysctls`
+(default true: wired pods in a user namespace with writable network sysctls),
 `--persistent-home`, `--vcluster-persistence`, `--allow-learner-sudo` (default true;
 false fails labs whose entry node sets `learnerSudo`, see docs/dev-environment.md), `--vm-disks`
 (`persistent`|`ephemeral`), `--storage-class`. The cache only holds Pods/Services labelled
@@ -455,7 +476,9 @@ to `Ready`). A request on a Failed or Expired session is answered with phase
   (`\n` or `\r\n`) stripped; nothing else is trimmed. The expected value is
   used verbatim. `regex` is Go RE2 and matches anywhere unless anchored.
 - Timeouts: `timeoutSec` (default 30s for `shell` checks, which usually make
-  several calls, 5s for the other types; max 5m) via coreutils `timeout` in the
+  several calls; 20s for `k8s-query`, `k8s-can-i` and `k8s-context`, whose single
+  kubectl call against a vcluster took over 5s at load average 70-120; 5s for
+  the other types; max 5m; a check's own `timeoutSec` always wins) via coreutils `timeout` in the
   target, plus transport slack; exit 124/137 = "the check timed out".
 - `message` is learner-safe (`passed`, `not satisfied yet`, `the check timed
   out`, `the check could not run`); it never contains expected values.

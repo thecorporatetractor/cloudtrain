@@ -57,7 +57,7 @@ function Screen() {
         <Stat label="Memory requested" value={pct(mem.alloc ? mem.req / mem.alloc : 0)} hint={`${gib(mem.req)} of ${gib(mem.alloc)}`} />
       </div>
 
-      <div className="grid-2" style={{ gridTemplateColumns: 'minmax(0, 7fr) minmax(0, 5fr)', gap: 20, alignItems: 'start' }}>
+      <div className="split split-7-5" style={{ alignItems: 'start' }}>
         <Card className="card-flush">
           <div className="card-head">
             <h2 className="row" style={{ gap: 8 }}>

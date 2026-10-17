@@ -54,6 +54,43 @@ export interface Config {
   examSessionLabels: Record<string, string>;
   /** Dev/demo override of every exam's duration. */
   examDurationMinutes?: number;
+  /**
+   * DEV ONLY: `POST /api/dev/sign-in-as` (CT_DEV_IMPERSONATE=1). loadConfig refuses
+   * to return a config with it on in production or on a non-loopback URL.
+   */
+  devImpersonate: boolean;
+}
+
+const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]']);
+
+/** True for http(s)://localhost, 127.0.0.1 or [::1] (any port). */
+export function isLoopbackUrl(u: string): boolean {
+  try {
+    const url = new URL(u);
+    return (url.protocol === 'http:' || url.protocol === 'https:') && LOOPBACK_HOSTS.has(url.hostname);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * CT_DEV_IMPERSONATE: '1' turns dev sign-in-as on, unset/''/'0' leaves it off,
+ * anything else is an error (never silently ignored). With it on, the gateway
+ * refuses to start when NODE_ENV=production or when CT_PUBLIC_URL / CT_WEB_URL
+ * is not a localhost / 127.0.0.1 URL.
+ */
+export function devImpersonationEnabled(env: NodeJS.ProcessEnv, publicUrl: string, webUrl: string): boolean {
+  const v = env.CT_DEV_IMPERSONATE;
+  if (v === undefined || v === '' || v === '0') return false;
+  if (v !== '1') throw new Error(`CT_DEV_IMPERSONATE must be 1 or 0 (got ${JSON.stringify(v)}); refusing to start`);
+  if (env.NODE_ENV === 'production') throw new Error('CT_DEV_IMPERSONATE=1 is set with NODE_ENV=production: dev sign-in-as is for local development only; refusing to start');
+  for (const [k, u] of [
+    ['CT_PUBLIC_URL', publicUrl],
+    ['CT_WEB_URL', webUrl],
+  ] as const) {
+    if (!isLoopbackUrl(u)) throw new Error(`CT_DEV_IMPERSONATE=1 needs ${k} on localhost or 127.0.0.1 (got ${u}); refusing to start`);
+  }
+  return true;
 }
 
 /** Relative paths in settings are relative to the repository root (pnpm runs the gateway from its package dir). */
@@ -80,6 +117,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const publicUrl = (env.CT_PUBLIC_URL ?? `http://localhost:${num(env.CT_PORT, 8787)}`).replace(/\/$/, '');
   const kcBase = (env.CT_KEYCLOAK_URL ?? 'http://localhost:8180').replace(/\/$/, '');
   const realm = env.CT_KEYCLOAK_REALM ?? 'cloudtrain';
+  const webUrl = (env.CT_WEB_URL ?? publicUrl).replace(/\/$/, '');
+  const devImpersonate = devImpersonationEnabled(env, publicUrl, webUrl);
   return {
     host: env.CT_HOST ?? '127.0.0.1',
     port: num(env.CT_PORT, 8787),
@@ -95,7 +134,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     ...(env.CT_DATABASE_OWNER_URL || env.NODE_ENV !== 'production' ? { databaseOwnerUrl: env.CT_DATABASE_OWNER_URL ?? 'postgres://cloudtrain_owner:owner-dev-only@127.0.0.1:55432/cloudtrain' } : {}),
     databaseAppRole: env.CT_DATABASE_APP_ROLE ?? 'cloudtrain_app',
     publicUrl,
-    webUrl: (env.CT_WEB_URL ?? publicUrl).replace(/\/$/, ''),
+    webUrl,
     oidc: {
       issuer: env.CT_OIDC_ISSUER ?? `${kcBase}/realms/${realm}`,
       clientId: env.CT_OIDC_CLIENT_ID ?? 'cloudtrain-gateway',
@@ -119,5 +158,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     extraExamFiles: list(env.CT_EXTRA_EXAM_FILES).map(fromRoot),
     examSessionLabels: labels(env.CT_EXAM_SESSION_LABELS),
     ...(num(env.CT_EXAM_DURATION_MINUTES, 0) > 0 ? { examDurationMinutes: num(env.CT_EXAM_DURATION_MINUTES, 0) } : {}),
+    devImpersonate,
   };
 }

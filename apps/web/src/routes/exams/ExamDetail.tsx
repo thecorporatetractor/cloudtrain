@@ -69,7 +69,7 @@ function ExamDetailScreen() {
         </div>
       </header>
 
-      <div className="grid-home" style={{ gridTemplateColumns: 'minmax(0, 7fr) minmax(0, 5fr)' }}>
+      <div className="split split-7-5">
         <div className="stack" style={{ gap: 20 }}>
           <Card>
             <div className="grid-3" style={{ gap: 16 }}>

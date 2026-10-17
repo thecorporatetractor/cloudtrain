@@ -17,6 +17,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
@@ -373,6 +374,41 @@ func EntryNetworkPolicy(s *labsv1.LabSession, entry string, vclusterReleases []s
 			Egress:      egress,
 		},
 	}
+}
+
+// AnnotationNetworkPolicyFor limits a NetworkPolicy to some of a pod's
+// networks in Kube-OVN (>= 1.15): a comma-separated list of "ovn" (the
+// primary interface) and "<namespace>/<net-attach-def>". Without it a
+// policy applies to every Kube-OVN interface of the selected pods.
+const AnnotationNetworkPolicyFor = "ovn.kubernetes.io/network_policy_for"
+
+// EntryPolicyNetworks is the AnnotationNetworkPolicyFor value of the entry
+// policy when the entry node is wired into topology links ("" otherwise:
+// the policy then covers the primary interface and the access attachment,
+// which are all the entry pod has). Kube-OVN would otherwise apply the
+// policy to the link attachments too and drop unicast to the entry node
+// over lab links (networking handoff P3). Link segments live in the
+// session VPC, which has no route out, so they need no policy; the primary
+// interface and the access attachment (when the topology has VM hosts)
+// keep it.
+func EntryPolicyNetworks(s *labsv1.LabSession, topo *labsv1.Topology, entry string) string {
+	if topo == nil || entry == "" {
+		return ""
+	}
+	wired := false
+	for _, l := range topo.Links {
+		if strings.HasPrefix(l.A, entry+":") || strings.HasPrefix(l.B, entry+":") {
+			wired = true
+		}
+	}
+	if !wired {
+		return ""
+	}
+	nets := []string{"ovn"}
+	if NeedsLabNetwork(topo) {
+		nets = append(nets, s.Namespace+"/"+NewLabNet(s).NAD())
+	}
+	return strings.Join(nets, ",")
 }
 
 func vclusterNamespaces(releases []string) []string {

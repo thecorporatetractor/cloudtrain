@@ -1,0 +1,128 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xcd-storage-volume-restore
+  title: Restore the ledger into a new volume
+  domain: containers
+  frameworks: [docker-practitioner:storage]
+  difficulty: medium
+  estimatedMinutes: 10
+  tags: [exam, docker, volumes, backup, restore]
+  version: 1
+spec:
+  description: |
+    **Host:** `cl-docker-01` (`ssh cl-docker-01`)
+
+    The ad-insertion ledger was backed up to **`/backup/ledger.tar`** (a tar archive of
+    the old data directory).
+
+    1. Create the named volume **`ledger-data`** and restore the backup into it so that
+       the ledger's files (`rows.csv` and `meta.txt`) sit at the **top level** of the
+       volume.
+    2. Run the ledger service from `copperleaf/ledger:2` as a container named
+       **`ledger`** with `ledger-data` mounted at **`/var/lib/ledger`**. It serves the
+       number of rows it loaded on port 8070 inside the container (`/rows`).
+    3. `ledger` must run again on its own after a host reboot.
+  objectives:
+    - Restore a tar backup into a named volume with a helper container
+    - Mount the volume where the service expects it
+  params:
+    rows:
+      type: int
+      min: 120
+      max: 480
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-docker-01
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-docker-01
+      timeoutSec: 240
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        d=$(mktemp -d)
+        cat > "$d/ledger" <<'SH'
+        #!/bin/sh
+        f=/var/lib/ledger/rows.csv
+        [ -s "$f" ] || { echo "FATAL: $f missing"; exit 1; }
+        mkdir -p /www && wc -l < "$f" | tr -d ' ' > /www/rows
+        echo "ledger serving $(cat /www/rows) rows"
+        exec httpd -f -p 8070 -h /www
+        SH
+        chmod 0755 "$d/ledger"
+        printf '%s\n' 'FROM busybox:1.37' 'COPY ledger /usr/local/bin/ledger' 'ENTRYPOINT ["/usr/local/bin/ledger"]' > "$d/Dockerfile"
+        docker build -q -t copperleaf/ledger:2 "$d" >/dev/null
+        rm -rf "$d"
+        b=$(mktemp -d); mkdir -p "$b/ledger"
+        i=0; while [ $i -lt {{rows}} ]; do echo "ad-$i;slot-$((i % 12));$((1000 + i))" >> "$b/ledger/rows.csv"; i=$((i + 1)); done
+        echo "ledger backup rows={{rows}}" > "$b/ledger/meta.txt"
+        mkdir -p /backup && tar -C "$b" -cf /backup/ledger.tar ledger && chmod 0644 /backup/ledger.tar
+        rm -rf "$b"
+  checks:
+    - id: volume-restored
+      description: ledger-data holds rows.csv and meta.txt at its top level
+      type: shell
+      timeoutSec: 60
+      on: cl-docker-01
+      skills: [containers.storage.backup-restore]
+      weight: 2
+      command: docker run --rm -v ledger-data:/v:ro busybox:1.37 sh -c 'test -s /v/rows.csv && cat /v/meta.txt' 2>/dev/null || echo missing
+      expect: {match: exact, value: "ledger backup rows={{rows}}"}
+    - id: ledger-mount
+      description: ledger mounts ledger-data at /var/lib/ledger
+      type: shell
+      timeoutSec: 60
+      on: cl-docker-01
+      skills: [containers.storage.mount-types]
+      weight: 1
+      command: docker inspect ledger 2>/dev/null | jq -r '[.[0].Mounts[] | select(.Destination == "/var/lib/ledger") | .Type + ":" + (.Name // "")] | join(",")'
+      expect: {match: exact, value: "volume:ledger-data"}
+    - id: ledger-serves
+      description: ledger serves the restored row count
+      type: shell
+      timeoutSec: 60
+      on: cl-docker-01
+      skills: [containers.storage.backup-restore]
+      weight: 2
+      command: docker exec ledger wget -qO- http://127.0.0.1:8070/rows 2>/dev/null || echo down
+      expect: {match: exact, value: "{{rows}}"}
+    - id: restarts
+      description: ledger comes back after a reboot
+      type: shell
+      timeoutSec: 60
+      on: cl-docker-01
+      skills: [containers.operations.restart-health]
+      weight: 0.5
+      command: docker inspect ledger 2>/dev/null | jq -r 'if (.[0].HostConfig.RestartPolicy.Name | IN("always", "unless-stopped")) then "restarts" else "stays-down" end'
+      expect: {match: exact, value: restarts}
+  misconceptions:
+    - id: nested-directory
+      description: Extracts the archive as is, so the files land in a ledger/ subdirectory.
+      feedback: "The archive holds a top-level directory ledger/. Strip it while extracting (tar --strip-components=1) or extract into the right place."
+      expectFail: [volume-restored, ledger-serves]
+      mutation:
+        on: cl-docker-01
+        as: learner
+        run: |
+          docker volume create ledger-data
+          docker run --rm -v ledger-data:/v -v /backup:/backup:ro busybox:1.37 tar -xf /backup/ledger.tar -C /v
+          docker run -d --name ledger --restart unless-stopped -v ledger-data:/var/lib/ledger copperleaf/ledger:2
+  solution:
+    explanation: A throw-away container mounts the new volume and the backup directory and unpacks the archive one level down.
+    steps:
+      - on: cl-docker-01
+        as: learner
+        run: |
+          docker volume create ledger-data
+          docker run --rm -v ledger-data:/v -v /backup:/backup:ro busybox:1.37 tar -xf /backup/ledger.tar -C /v --strip-components=1
+          docker run -d --name ledger --restart unless-stopped -v ledger-data:/var/lib/ledger copperleaf/ledger:2

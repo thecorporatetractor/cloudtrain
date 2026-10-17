@@ -7,6 +7,7 @@ import { RequireAccess } from '@/app/access';
 import { useShell } from '@/app/shell-context';
 import { When } from '@/components/platform';
 import { Badge, Button, Card, Drawer, EmptyState, ErrorState, Input, Pager, Select, TableSkeleton, TableWrap, Toolbar } from '@/components/ui';
+import { usePageCursor } from '@/lib/paging';
 import { adminAuditRoute } from '@/router';
 
 const PAGE = 20;
@@ -16,7 +17,7 @@ const TARGETS = ['user', 'team', 'assignment', 'cohort', 'session', 'sso', 'doma
 /** "session.observe" -> "Observed a session". Good enough for the overview and the table; details keep the raw action. */
 export function auditActionLabel(action: string): string {
   const [area, verb = ''] = action.split('.');
-  const verbs: Record<string, string> = { login: 'Signed in', logout: 'Signed out', login_denied: 'Sign-in denied', switch: 'Switched organisation', invite: 'Invited', update: 'Updated', deactivate: 'Deactivated', reactivate: 'Reactivated', revoke: 'Revoked', create: 'Created', delete: 'Deleted', member_add: 'Added a member to', member_remove: 'Removed a member from', export: 'Exported', broadcast: 'Broadcast to', observe: 'Observed', extend: 'Extended', reset: 'Reset', terminate: 'Terminated', test: 'Tested', add: 'Added', verify: 'Verified', remove: 'Removed', visibility: 'Changed visibility of', org_create: 'Created org', org_update: 'Updated org', org_suspend: 'Suspended org', org_reactivate: 'Reactivated org', org_delete: 'Deleted org' };
+  const verbs: Record<string, string> = { login: 'Signed in', logout: 'Signed out', login_denied: 'Sign-in denied', dev_impersonate: 'Dev sign-in as', switch: 'Switched organisation', invite: 'Invited', update: 'Updated', deactivate: 'Deactivated', reactivate: 'Reactivated', revoke: 'Revoked', create: 'Created', delete: 'Deleted', member_add: 'Added a member to', member_remove: 'Removed a member from', export: 'Exported', broadcast: 'Broadcast to', observe: 'Observed', extend: 'Extended', reset: 'Reset', terminate: 'Terminated', test: 'Tested', add: 'Added', verify: 'Verified', remove: 'Removed', visibility: 'Changed visibility of', org_create: 'Created org', org_update: 'Updated org', org_suspend: 'Suspended org', org_reactivate: 'Reactivated org', org_delete: 'Deleted org' };
   const v = verbs[verb] ?? verb.replace(/_/g, ' ');
   const nouns: Record<string, string> = { auth: '', user: 'user', team: 'team', assignment: 'assignment', cohort: 'cohort', session: 'session', sso: 'SSO connection', domain: 'domain', content: 'content', quota: 'quotas', settings: 'settings', report: 'report', audit: 'audit log', platform: '' };
   const n = nouns[area ?? ''] ?? area;
@@ -35,14 +36,16 @@ function Screen() {
   const search = adminAuditRoute.useSearch();
   const navigate = useNavigate({ from: adminAuditRoute.fullPath });
   const set = (patch: Partial<typeof search>) => void navigate({ search: (prev) => ({ ...prev, ...patch }), replace: true });
-  const page = search.page ?? 1;
+  const pages = usePageCursor(JSON.stringify([search.action, search.actor, search.targetType, search.from, search.to]), search.page ?? 1);
+  const page = pages.page;
   const [actor, setActor] = useState(search.actor ?? '');
   useEffect(() => {
     const t = window.setTimeout(() => actor !== (search.actor ?? '') && set({ actor: actor || undefined, page: undefined }), 250);
     return () => window.clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [actor]);
-  const q = useAudit({ action: search.action, actor: search.actor, targetType: search.targetType, from: search.from, to: search.to, cursor: String((page - 1) * PAGE), limit: PAGE });
+  const q = useAudit({ action: search.action, actor: search.actor, targetType: search.targetType, from: search.from, to: search.to, cursor: pages.cursor, limit: PAGE });
+  pages.useRemember(q.data?.nextCursor);
   const { toast } = useShell();
   const [exporting, setExporting] = useState(false);
   const hasFilter = !!(search.action || search.actor || search.targetType || search.from || search.to);
@@ -151,7 +154,7 @@ function Screen() {
             </table>
           </TableWrap>
           <div className="card-foot">
-            <Pager offset={(page - 1) * PAGE} pageSize={PAGE} total={q.data.total} loading={q.isFetching} onChange={(o) => set({ page: o / PAGE + 1 || undefined })} />
+            <Pager offset={(page - 1) * PAGE} pageSize={PAGE} total={q.data.total} hasNext={!!q.data.nextCursor} loading={q.isFetching} onChange={(o) => set({ page: o / PAGE + 1 || undefined })} />
           </div>
         </Card>
       )}

@@ -1,0 +1,136 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xcd-ops-oom-diagnose
+  title: Find out why the import job dies and let it finish
+  domain: containers
+  frameworks: [docker-practitioner:operations]
+  difficulty: medium
+  estimatedMinutes: 8
+  tags: [exam, docker, oom, limits, exit-codes]
+  version: 1
+spec:
+  description: |
+    **Host:** `cl-docker-01` (`ssh cl-docker-01`)
+
+    The catalogue import runs as the container **`import-job`** (image
+    `copperleaf/import-job:1`) and exits with code **137** before it finishes.
+
+    1. Write the reason the container was stopped to `~/exam/import-reason.txt` (a short
+       phrase is enough).
+    2. Run the import again as a container named **`import-job`** (replace the old one)
+       so that it **finishes successfully**, with a **memory limit of at most 512 MiB**.
+       Leave the finished container in place.
+  objectives:
+    - Read exit codes and the OOM flag from docker inspect
+    - Size a container memory limit
+  params:
+    mb:
+      type: int
+      min: 220
+      max: 320
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-docker-01
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-docker-01
+      timeoutSec: 300
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        d=$(mktemp -d)
+        cat > "$d/import.py" <<'PY'
+        import sys, time
+        mb = int(sys.argv[1]) if len(sys.argv) > 1 else 256
+        print(f"import starting: {mb} MiB of catalogue rows to stage", flush=True)
+        chunks = []
+        for i in range(mb // 16):
+            chunks.append(bytearray(16 * 1024 * 1024))
+            time.sleep(0.05)
+        print(f"import done rows={mb * 1000}", flush=True)
+        PY
+        printf '%s\n' 'FROM python:3.13-alpine' 'COPY import.py /app/import.py' \
+          'ENTRYPOINT ["python3", "/app/import.py"]' 'CMD ["{{mb}}"]' > "$d/Dockerfile"
+        docker build -q -t copperleaf/import-job:1 "$d" >/dev/null
+        rm -rf "$d"
+        docker rm -f import-job >/dev/null 2>&1 || true
+        docker run --name import-job --memory 128m --memory-swap 128m copperleaf/import-job:1 >/dev/null 2>&1 || true
+        install -d -o learner -g learner /home/learner/exam
+        rm -f /home/learner/exam/import-reason.txt
+  checks:
+    - id: reason
+      description: The reason names the memory limit (out of memory)
+      type: shell
+      timeoutSec: 60
+      on: cl-docker-01
+      skills: [containers.operations.exit-codes]
+      weight: 1.5
+      command: grep -qiE 'oom|out[ -]of[ -]memory|memory' /home/learner/exam/import-reason.txt 2>/dev/null && echo named || echo missing
+      expect: {match: exact, value: named}
+    - id: finished
+      description: import-job exited 0 after the import finished
+      type: shell
+      timeoutSec: 60
+      on: cl-docker-01
+      skills: [containers.operations.exit-codes, containers.runtime-security.limits]
+      weight: 2
+      command: |
+        s=$(docker inspect import-job 2>/dev/null | jq -r '.[0].State | "\(.Status) \(.ExitCode) \(.OOMKilled)"')
+        if [ "$s" = "exited 0 false" ] && docker logs import-job 2>&1 | grep -q '^import done rows={{mb}}000$'; then echo finished; else echo "not-finished"; fi
+      expect: {match: exact, value: finished}
+    - id: limited
+      description: import-job has a memory limit of at most 512 MiB
+      type: shell
+      timeoutSec: 60
+      on: cl-docker-01
+      skills: [containers.runtime-security.limits]
+      weight: 1.5
+      command: |
+        m=$(docker inspect import-job 2>/dev/null | jq -r '.[0].HostConfig.Memory // 0')
+        [ "$m" -gt 0 ] && [ "$m" -le 536870912 ] && echo limited || echo "unlimited-or-too-high"
+      expect: {match: exact, value: limited}
+  misconceptions:
+    - id: no-limit
+      description: Removes the limit altogether.
+      feedback: "The task asks for a limit of at most 512 MiB; with no limit the job may take the whole host."
+      expectFail: [limited]
+      mutation:
+        on: cl-docker-01
+        as: learner
+        run: |
+          echo "killed by the kernel OOM killer (memory limit)" > ~/exam/import-reason.txt
+          docker rm -f import-job
+          docker run --name import-job copperleaf/import-job:1
+    - id: wrong-reason
+      description: Reports a crash or a bug instead of the memory limit.
+      feedback: "Exit code 137 is 128 + 9 (SIGKILL); docker inspect shows OOMKilled true, so the kernel killed it at the memory limit."
+      expectFail: [reason]
+      mutation:
+        on: cl-docker-01
+        as: learner
+        run: |
+          echo "application crash" > ~/exam/import-reason.txt
+          docker rm -f import-job
+          docker run --name import-job --memory 512m copperleaf/import-job:1
+  solution:
+    explanation: |
+      `docker inspect import-job` shows `OOMKilled: true`: the 128 MiB limit is too
+      small. Rerun with a limit above the job's working set and at most 512 MiB.
+    steps:
+      - on: cl-docker-01
+        as: learner
+        run: |
+          docker inspect import-job | jq '.[0].State | {ExitCode, OOMKilled}'
+          echo "OOMKilled: memory limit (128m) exceeded, exit 137 = SIGKILL" > ~/exam/import-reason.txt
+          docker rm import-job
+          docker run --name import-job --memory 512m copperleaf/import-job:1

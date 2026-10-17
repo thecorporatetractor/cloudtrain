@@ -9,6 +9,7 @@ import { SkillTags } from '@/components/domain';
 import { OutcomeBadge, When, minutesLabel, outcomeMeta } from '@/components/platform';
 import { Card, Drawer, EmptyState, ErrorState, Pager, Select, Skeleton, Stat, TableSkeleton, TableWrap } from '@/components/ui';
 import { formatDuration } from '@/lib/utils';
+import { usePageCursor } from '@/lib/paging';
 import { historyRoute } from '@/router';
 
 const PAGE = 15;
@@ -25,8 +26,10 @@ export function History() {
 function HistoryScreen() {
   const search = historyRoute.useSearch();
   const navigate = useNavigate({ from: historyRoute.fullPath });
-  const page = search.page ?? 1;
-  const q = useMyAttempts({ lab: search.lab, outcome: search.outcome, cursor: String((page - 1) * PAGE), limit: PAGE });
+  const pages = usePageCursor(JSON.stringify([search.lab, search.outcome]), search.page ?? 1);
+  const page = pages.page;
+  const q = useMyAttempts({ lab: search.lab, outcome: search.outcome, cursor: pages.cursor, limit: PAGE });
+  pages.useRemember(q.data?.nextCursor);
   const all = useMyAttempts({ limit: 200 });
   const catalog = useCatalog();
   const set = (patch: Partial<typeof search>) => void navigate({ search: (prev) => ({ ...prev, ...patch }), replace: true });
@@ -34,10 +37,11 @@ function HistoryScreen() {
   const totals = useMemo(() => {
     const items = all.data?.items ?? [];
     const passed = items.filter((a) => a.outcome === 'passed').length;
-    const seconds = items.reduce((s, a) => s + a.durationS, 0);
-    const scored = items.filter((a) => a.outcome !== 'abandoned');
-    const avg = scored.length ? Math.round(scored.reduce((s, a) => s + a.score, 0) / scored.length) : 0;
-    return { attempts: items.length, passed, seconds, avg };
+    // Practice time (opening a lab to its last Validate), as on Home and in the team views.
+    const seconds = items.reduce((s, a) => s + a.practiceS, 0);
+    const scored = items.filter((a) => a.outcome !== 'abandoned' && a.validations > 0);
+    const avg = scored.length ? Math.round(scored.reduce((s, a) => s + a.score, 0) / scored.length) : undefined;
+    return { attempts: items.length, graded: scored.length, passed, seconds, avg };
   }, [all.data]);
 
   const labsSeen = useMemo(() => Array.from(new Map((all.data?.items ?? []).map((a) => [a.labId, a.labTitle])).entries()), [all.data]);
@@ -52,9 +56,9 @@ function HistoryScreen() {
         </div>
         <div className="row" style={{ gap: 28 }}>
           <Stat label="Attempts" value={totals.attempts} />
-          <Stat label="Passed" value={totals.passed} hint={totals.attempts ? `${Math.round((totals.passed / totals.attempts) * 100)}%` : undefined} />
-          <Stat label="Hands-on" value={minutesLabel(totals.seconds)} />
-          <Stat label="Avg score" value={totals.avg} />
+          <Stat label="Passed" value={totals.graded ? totals.passed : '—'} hint={totals.graded ? `of ${totals.graded} graded` : 'no graded attempts yet'} />
+          <Stat label="Practice" value={totals.graded ? minutesLabel(totals.seconds) : '—'} hint={totals.graded ? 'until your last Validate' : 'counts once you validate'} />
+          <Stat label="Avg score" value={totals.avg ?? '—'} hint={totals.avg === undefined ? 'no data yet' : 'graded attempts'} />
         </div>
       </header>
 
@@ -77,7 +81,7 @@ function HistoryScreen() {
             ))}
           </Select>
         </div>
-        {q.data && <Pager offset={(page - 1) * PAGE} pageSize={PAGE} total={q.data.total} loading={q.isFetching} onChange={(o) => set({ page: o / PAGE + 1 || undefined })} />}
+        {q.data && <Pager offset={(page - 1) * PAGE} pageSize={PAGE} total={q.data.total} hasNext={!!q.data.nextCursor} loading={q.isFetching} onChange={(o) => set({ page: o / PAGE + 1 || undefined })} />}
       </div>
 
       {q.isPending ? (
@@ -99,7 +103,9 @@ function HistoryScreen() {
                     Score
                   </th>
                   <th scope="col">Checks</th>
-                  <th scope="col">Time</th>
+                  <th scope="col" title="Practice time: from opening the lab to the last Validate">
+                    Practice
+                  </th>
                   <th scope="col">Hints</th>
                 </tr>
               </thead>
@@ -120,11 +126,11 @@ function HistoryScreen() {
                     <td>
                       <OutcomeBadge outcome={a.outcome} />
                     </td>
-                    <td className="tnum small">{a.outcome === 'abandoned' ? '—' : a.score}</td>
-                    <td className="small tnum">
-                      {a.checksPassed}/{a.checksTotal}
+                    <td className="tnum small">{a.outcome === 'abandoned' || a.validations === 0 ? '—' : a.score}</td>
+                    <td className="small tnum">{a.validations === 0 ? '—' : `${a.checksPassed}/${a.checksTotal}`}</td>
+                    <td className="small tnum" title={`Environment open ${formatDuration(a.durationS)}`}>
+                      {a.practiceS ? formatDuration(a.practiceS) : <span className="subtle">not validated</span>}
                     </td>
-                    <td className="small tnum">{formatDuration(a.durationS)}</td>
                     <td className="small tnum">{a.hintsUsed || '—'}</td>
                   </tr>
                 ))}
@@ -149,9 +155,9 @@ function AttemptDrawer({ id, onClose, fallback }: { id: string | undefined; onCl
       ) : (
         <div className="stack" style={{ gap: 18 }}>
           <div className="grid-3">
-            <Stat label="Score" value={a.outcome === 'abandoned' ? '—' : a.score} hint="of 100" />
-            <Stat label="Checks" value={`${a.checksPassed}/${a.checksTotal}`} />
-            <Stat label="Time on task" value={formatDuration(a.durationS)} hint={`${a.validations} validate${a.validations === 1 ? '' : 's'} · ${a.hintsUsed} hint${a.hintsUsed === 1 ? '' : 's'}`} />
+            <Stat label="Score" value={a.outcome === 'abandoned' || a.validations === 0 ? '—' : a.score} hint={a.validations === 0 ? 'not validated' : 'of 100'} />
+            <Stat label="Checks" value={a.validations === 0 ? '—' : `${a.checksPassed}/${a.checksTotal}`} hint={a.validations === 0 ? `${a.checksTotal} to check` : undefined} />
+            <Stat label="Practice" value={a.practiceS ? formatDuration(a.practiceS) : '—'} hint={`${a.validations} validate${a.validations === 1 ? '' : 's'} · ${a.hintsUsed} hint${a.hintsUsed === 1 ? '' : 's'} · environment open ${formatDuration(a.durationS)}`} />
           </div>
           <div>
             <div className="task-h">Checks</div>

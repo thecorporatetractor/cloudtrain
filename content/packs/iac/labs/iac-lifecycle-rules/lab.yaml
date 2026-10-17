@@ -1,0 +1,228 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: iac-lifecycle-rules
+  title: Protect and roll trading-desk resources with lifecycle rules
+  domain: iac
+  frameworks: [tf-associate:configuration]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [terraform, lifecycle, prevent_destroy, ignore_changes, create_before_destroy, replace_triggered_by]
+  version: 1
+spec:
+  description: |
+    The energy-trading stack in `~/stacks/trading-desk` (applied on `sm-grid`)
+    runs the pricing engine. Each pricing change produces a ConfigMap with a new
+    name (the name carries a hash of the content). Four rules from the trading
+    platform's runbook must go into the code as **`lifecycle`** settings:
+
+    1. Namespace `trading-desk` must never be destroyed by Terraform.
+    2. The on-call rota tool writes the annotation
+       `saltmarsh.example/on-call` onto the namespace every shift. Terraform must
+       leave the namespace's annotations alone, so plans stop proposing to remove
+       it.
+    3. When the pricing ConfigMap is replaced, the new one must exist **before**
+       the old one is deleted.
+    4. The pricing engine reads its settings only at start, so the
+       `pricing-engine` Deployment must be **replaced** (not updated in place)
+       whenever the pricing ConfigMap is replaced.
+
+    Then roll out the new spread: change `spread` in the `pricing` variable's
+    default to **`{{spread}}`** and apply. Afterwards a plan reports no changes.
+  objectives:
+    - Protect a resource with prevent_destroy
+    - Ignore attributes another system manages with ignore_changes
+    - Order replacements with create_before_destroy
+    - Tie replacements together with replace_triggered_by
+  params:
+    spread:
+      type: choice
+      values: ["0.012", "0.018", "0.021"]
+    oncall:
+      type: choice
+      values: [ines, bram, odile]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+      - name: sm-grid
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: sm-grid
+  setup:
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/main.tf, source: assets/main.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/seed.sh, source: assets/seed.sh, mode: "0755"}
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/stacks
+    - on: workstation
+      as: learner
+      timeoutSec: 300
+      run: /var/tmp/ct-seed/seed.sh
+    - on: sm-grid
+      run: |
+        set -eu
+        kubectl -n kube-system get configmap ct-baseline-uids >/dev/null 2>&1 && exit 0
+        kubectl annotate namespace trading-desk saltmarsh.example/on-call={{oncall}} --overwrite
+        kubectl -n kube-system create configmap ct-baseline-uids \
+          --from-literal=deployment=$(kubectl -n trading-desk get deployment pricing-engine -o jsonpath='{.metadata.uid}')
+  teardown:
+    - on: sm-grid
+      run: kubectl delete namespace trading-desk --ignore-not-found --wait=false
+  checks:
+    - id: prevent-destroy
+      description: A destroy plan of the stack is refused because the namespace is protected
+      type: shell
+      on: workstation
+      skills: [iac.language.lifecycle]
+      weight: 1.5
+      timeoutSec: 120
+      command: |
+        out=$(ct-iac run /home/learner/stacks/trading-desk iac plan -destroy -input=false -lock=false -no-color 2>&1) && { echo "destroy planned"; exit 0; }
+        echo "$out" | grep -q 'cannot be destroyed' && echo protected || echo "other error"
+      expect: {match: exact, value: protected}
+    - id: annotation-kept
+      description: The on-call annotation is still on the namespace
+      type: k8s-query
+      skills: [iac.language.lifecycle]
+      weight: 1.5
+      query: {cluster: sm-grid, resource: namespace, name: trading-desk, jsonpath: "{.metadata.annotations.saltmarsh\\.example/on-call}"}
+      expect: {match: exact, value: "{{oncall}}"}
+    - id: new-pricing
+      description: Exactly one pricing ConfigMap is left and it carries spread {{spread}}
+      type: shell
+      on: sm-grid
+      skills: [iac.language.lifecycle]
+      timeoutSec: 30
+      command: |
+        kubectl -n trading-desk get configmaps -o json | jq -r '[.items[] | select(.metadata.name | startswith("pricing-")) | .data.spread] | "count=\(length) spread=\(join(","))"'
+      expect: {match: exact, value: "count=1 spread={{spread}}"}
+    - id: create-before-destroy
+      description: The pricing ConfigMap is recorded in state as create_before_destroy
+      type: shell
+      on: workstation
+      skills: [iac.language.lifecycle]
+      timeoutSec: 30
+      command: |
+        jq -r '[.resources[]? | select(.mode == "managed" and (.type | test("^kubernetes_config_map"))) | .instances[]? | .create_before_destroy // false] | if length == 0 then "missing" else (all | tostring) end' /home/learner/stacks/trading-desk/terraform.tfstate 2>/dev/null || echo missing
+      expect: {match: exact, value: "true"}
+    - id: engine-replaced
+      description: The pricing-engine Deployment was replaced and uses the new ConfigMap
+      type: shell
+      on: sm-grid
+      skills: [iac.language.lifecycle]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        u=$(kubectl -n trading-desk get deployment pricing-engine -o jsonpath='{.metadata.uid}' 2>/dev/null)
+        cm=$(kubectl -n trading-desk get deployment pricing-engine -o jsonpath='{.spec.template.spec.containers[0].envFrom[0].configMapRef.name}' 2>/dev/null)
+        s=$(kubectl -n trading-desk get configmap "$cm" -o jsonpath='{.data.spread}' 2>/dev/null)
+        [ -n "$u" ] && [ "$u" != "$(kubectl -n kube-system get configmap ct-baseline-uids -o jsonpath='{.data.deployment}')" ] && o=replaced || o=same
+        echo "deployment=$o spread=$s"
+      expect: {match: exact, value: "deployment=replaced spread={{spread}}"}
+    - id: converged
+      description: A new plan of ~/stacks/trading-desk reports no changes
+      type: shell
+      on: workstation
+      skills: [iac.foundations.workflow]
+      timeoutSec: 120
+      command: ct-iac plan /home/learner/stacks/trading-desk
+      expect: {match: exact, value: no-changes}
+  hints:
+    - title: Where the rules live
+      body: Every one of them is an argument of the resource's `lifecycle` block, e.g. `lifecycle { prevent_destroy = true }`.
+      cost: 1
+    - title: Ignoring part of a nested block
+      body: "`ignore_changes = [metadata[0].annotations]` ignores the whole annotations map of the namespace."
+      cost: 1
+    - title: Replacing one thing because another was replaced
+      body: "`replace_triggered_by = [kubernetes_config_map_v1.pricing]` on the Deployment plans a replacement whenever the ConfigMap is replaced. Check the plan for `must be replaced` before applying."
+      cost: 2
+  misconceptions:
+    - id: no-ignore-changes
+      description: Leaves the namespace's annotations managed, so the apply strips the on-call annotation.
+      feedback: Terraform owns every annotation it has in configuration and removes the others on apply. ignore_changes on metadata[0].annotations leaves them to the rota tool.
+      expectFail: [annotation-kept]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 400
+        run: |
+          cd ~/stacks/trading-desk
+          python3 - <<'PY'
+          p = "main.tf"; s = open(p).read()
+          s = s.replace('      "saltmarsh.example/owner" = "energy-trading"\n    }\n  }\n}', '      "saltmarsh.example/owner" = "energy-trading"\n    }\n  }\n  lifecycle {\n    prevent_destroy = true\n  }\n}')
+          s = s.replace('  data = var.pricing\n}', '  data = var.pricing\n  lifecycle {\n    create_before_destroy = true\n  }\n}')
+          s = s.replace('resource "kubernetes_deployment_v1" "pricing_engine" {\n', 'resource "kubernetes_deployment_v1" "pricing_engine" {\n  lifecycle {\n    replace_triggered_by = [kubernetes_config_map_v1.pricing]\n  }\n')
+          s = s.replace('spread   = "0.015"', 'spread   = "{{spread}}"')
+          open(p, "w").write(s)
+          PY
+          iac apply -auto-approve -input=false -no-color
+    - id: in-place-rollout
+      description: Changes the spread without replace_triggered_by, so the engine is only updated in place.
+      feedback: The Deployment just gets a new ConfigMap reference. The runbook says the engine must be replaced; replace_triggered_by ties it to the ConfigMap's replacement.
+      expectFail: [engine-replaced]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 400
+        run: |
+          cd ~/stacks/trading-desk
+          python3 - <<'PY'
+          p = "main.tf"; s = open(p).read()
+          s = s.replace('      "saltmarsh.example/owner" = "energy-trading"\n    }\n  }\n}', '      "saltmarsh.example/owner" = "energy-trading"\n    }\n  }\n  lifecycle {\n    prevent_destroy = true\n    ignore_changes  = [metadata[0].annotations]\n  }\n}')
+          s = s.replace('  data = var.pricing\n}', '  data = var.pricing\n  lifecycle {\n    create_before_destroy = true\n  }\n}')
+          s = s.replace('spread   = "0.015"', 'spread   = "{{spread}}"')
+          open(p, "w").write(s)
+          PY
+          iac apply -auto-approve -input=false -no-color
+    - id: unprotected
+      description: Forgets prevent_destroy on the namespace.
+      feedback: Without prevent_destroy, a destroy (or a replacement) of the namespace would delete everything in it. Add lifecycle { prevent_destroy = true }.
+      expectFail: [prevent-destroy]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 400
+        run: |
+          cd ~/stacks/trading-desk
+          python3 - <<'PY'
+          p = "main.tf"; s = open(p).read()
+          s = s.replace('      "saltmarsh.example/owner" = "energy-trading"\n    }\n  }\n}', '      "saltmarsh.example/owner" = "energy-trading"\n    }\n  }\n  lifecycle {\n    ignore_changes = [metadata[0].annotations]\n  }\n}')
+          s = s.replace('  data = var.pricing\n}', '  data = var.pricing\n  lifecycle {\n    create_before_destroy = true\n  }\n}')
+          s = s.replace('resource "kubernetes_deployment_v1" "pricing_engine" {\n', 'resource "kubernetes_deployment_v1" "pricing_engine" {\n  lifecycle {\n    replace_triggered_by = [kubernetes_config_map_v1.pricing]\n  }\n')
+          s = s.replace('spread   = "0.015"', 'spread   = "{{spread}}"')
+          open(p, "w").write(s)
+          PY
+          iac apply -auto-approve -input=false -no-color
+  solution:
+    explanation: |
+      prevent_destroy makes any plan that would destroy the namespace fail.
+      ignore_changes on the annotations map stops Terraform from reverting the rota
+      tool's annotation. create_before_destroy creates the new pricing ConfigMap
+      before deleting the old one, and replace_triggered_by on the Deployment turns
+      the ConfigMap's replacement into a replacement of the engine, which then
+      starts with the new spread.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 400
+        run: |
+          set -e
+          cd ~/stacks/trading-desk
+          python3 - <<'PY'
+          p = "main.tf"; s = open(p).read()
+          s = s.replace('      "saltmarsh.example/owner" = "energy-trading"\n    }\n  }\n}', '      "saltmarsh.example/owner" = "energy-trading"\n    }\n  }\n\n  lifecycle {\n    prevent_destroy = true\n    ignore_changes  = [metadata[0].annotations]\n  }\n}')
+          s = s.replace('  data = var.pricing\n}', '  data = var.pricing\n\n  lifecycle {\n    create_before_destroy = true\n  }\n}')
+          s = s.replace('resource "kubernetes_deployment_v1" "pricing_engine" {\n', 'resource "kubernetes_deployment_v1" "pricing_engine" {\n  lifecycle {\n    replace_triggered_by = [kubernetes_config_map_v1.pricing]\n  }\n\n')
+          s = s.replace('spread   = "0.015"', 'spread   = "{{spread}}"')
+          open(p, "w").write(s)
+          PY
+          iac plan -input=false -no-color
+          iac apply -auto-approve -input=false -no-color

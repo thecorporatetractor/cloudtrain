@@ -3,9 +3,10 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { withTenant } from '../src/db/index.js';
 import { TENANT_TABLES as PLATFORM_TABLES } from '../src/db/migrations/0001_platform.js';
 import { EXAM_TENANT_TABLES } from '../src/db/migrations/0003_exams.js';
+import { GOAL_TENANT_TABLES } from '../src/db/migrations/0004_learner_goals.js';
 
 /** Every tenant table of every migration. */
-const TENANT_TABLES = [...PLATFORM_TABLES, ...EXAM_TENANT_TABLES];
+const TENANT_TABLES = [...PLATFORM_TABLES, ...EXAM_TENANT_TABLES, ...GOAL_TENANT_TABLES];
 import { defaultPeopleFile, readPeople, seed } from '../src/db/seed.js';
 import { createTestDb, pgAvailable, type TestDb } from './pg.js';
 import { realContent, repo } from './fakes.js';

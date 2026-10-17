@@ -10,7 +10,7 @@ import (
 // quantities or decimal strings, and free-form param values become strings.
 
 // Domain of a lab.
-// +kubebuilder:validation:Enum=kubernetes;linux;networking
+// +kubebuilder:validation:Enum=kubernetes;linux;containers;iac;automation;networking
 type Domain string
 
 // Difficulty of a lab.

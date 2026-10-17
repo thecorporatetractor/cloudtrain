@@ -50,6 +50,7 @@ import {
   assignedUsers,
   assignmentSeeds,
   attemptsFor,
+  practiceMinutes,
   auditOf,
   capacity,
   cohortBoard,
@@ -99,6 +100,8 @@ const SESSION_KEY = 'ct.mock.session';
 interface MockSession {
   userId: string;
   orgId: string;
+  /** Mimics a gateway dev sign-in-as session (banner screenshots). */
+  impersonated?: boolean;
 }
 
 function readSession(): MockSession | null {
@@ -148,8 +151,9 @@ function buildMe(s: MockSession): Me | undefined {
     role: legacyRole(roles),
     team: teams[0]?.name ?? '',
     org: org?.name ?? '',
-    streakDays: p.id === 'u-ingrid' ? 6 : Math.round(attemptsFor(p.id).length / 3),
-    minutesThisWeek: Math.round(attemptsFor(p.id).filter((a) => Date.now() - new Date(a.startedAt).getTime() < 7 * 86_400_000).reduce((x, a) => x + a.durationS / 60, 0)),
+    // Like the gateway: only graded practice (a Validate run) counts toward streak and time.
+    streakDays: p.id === 'u-ingrid' ? 6 : Math.round(attemptsFor(p.id).filter((a) => a.validations > 0).length / 3),
+    minutesThisWeek: practiceMinutes(p.id, 7),
     user: { ...userRef(p.id), lastLoginAt: p.lastLoginDaysAgo === undefined ? undefined : new Date(Date.now() - p.lastLoginDaysAgo * 86_400_000).toISOString() },
     activeOrg: org ? { id: org.id, slug: org.slug, name: org.name } : null,
     memberships: Object.entries(p.orgs).map(([orgId, r]) => ({ org: { id: orgs[orgId]!.id, slug: orgs[orgId]!.slug, name: orgs[orgId]!.name }, roles: r, status: p.status ?? 'active' })),
@@ -166,7 +170,9 @@ function buildMe(s: MockSession): Me | undefined {
     cohorts: cohortSeeds.filter((c) => c.memberIds.includes(p.id) && c.orgId === s.orgId).map((c) => ({ id: c.id, name: c.name })),
     platformAdmin: !!p.platformAdmin,
     csrfToken: 'mock-csrf-token',
-    auth: { method: 'dev', idp: s.orgId === ORG_QUILLMOOR.id && !p.platformAdmin ? 'quillmoor-entra' : undefined, sessionExpiresAt: new Date(Date.now() + 8 * 3_600_000).toISOString() },
+    auth: s.impersonated
+      ? { method: 'dev-impersonation', impersonated: true, sessionExpiresAt: new Date(Date.now() + 8 * 3_600_000).toISOString() }
+      : { method: 'dev', idp: s.orgId === ORG_QUILLMOOR.id && !p.platformAdmin ? 'quillmoor-entra' : undefined, sessionExpiresAt: new Date(Date.now() + 8 * 3_600_000).toISOString() },
     supportAccess,
   };
 }
@@ -291,8 +297,8 @@ export const authHandlers = [
     const { orgId } = (await request.json()) as { orgId: string };
     const p = personById.get(s.userId);
     if (!p?.orgs[orgId]) return forbidden('org.manage');
-    writeSession({ userId: s.userId, orgId });
-    return json(buildMe({ userId: s.userId, orgId }));
+    writeSession({ ...s, orgId });
+    return json(buildMe({ ...s, orgId }));
   }),
 ];
 
@@ -435,13 +441,15 @@ export const managerHandlers = [
     const t = teamDetail(team);
     if (!t) return notFound('Team');
     audit(m.activeOrg!.id, m, 'report.export', 'team', team, t.name, { format: 'csv' });
-    const rows: (string | number | null)[][] = [['user_id', 'name', 'email', 'team', 'assignment_id', 'item_kind', 'item_id', 'due_at', 'status', 'progress', 'best_score', 'attempts', 'minutes']];
+    const rows: (string | number | null)[][] = [['user_id', 'name', 'email', 'team', 'assignment_id', 'item_kind', 'item_id', 'due_at', 'status', 'progress', 'best_score', 'attempts', 'minutes', 'environment_minutes']];
     for (const mem of t.members) {
       const attempts = attemptsFor(mem.user.id);
-      const minutes = Math.round(attempts.reduce((s, a) => s + a.durationS / 60, 0));
+      // Like the gateway: minutes = practice (graded) time, environment_minutes = session lifetime.
+      const minutes = Math.round(attempts.reduce((s, a) => s + a.practiceS / 60, 0));
+      const env = Math.round(attempts.reduce((s, a) => s + a.durationS / 60, 0));
       const mine = myAssignments(mem.user.id);
-      if (!mine.length) rows.push([mem.user.id, mem.user.name, mem.user.email, t.name, '', '', '', '', '', '', '', attempts.length, minutes]);
-      for (const a of mine) rows.push([mem.user.id, mem.user.name, mem.user.email, t.name, a.id, a.item.kind, a.item.id, a.dueAt, a.status, a.progress, a.bestScore ?? null, attempts.filter((x) => a.item.labIds?.includes(x.labId)).length, minutes]);
+      if (!mine.length) rows.push([mem.user.id, mem.user.name, mem.user.email, t.name, '', '', '', '', '', '', '', attempts.length, minutes, env]);
+      for (const a of mine) rows.push([mem.user.id, mem.user.name, mem.user.email, t.name, a.id, a.item.kind, a.item.id, a.dueAt, a.status, a.progress, a.bestScore ?? null, attempts.filter((x) => a.item.labIds?.includes(x.labId)).length, minutes, env]);
     }
     return csv(rows);
   }),

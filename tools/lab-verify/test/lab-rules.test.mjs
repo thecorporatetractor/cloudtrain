@@ -71,6 +71,11 @@ test("Pod image in a manifest that is not a workload image is an error", async (
   assert.ok(f.some((x) => x.level === "error" && /'redis:8' is not in workloadImages/.test(x.message)), JSON.stringify(f));
 });
 
+test("image: lines on a Docker host lab (no cluster) are not Pod images", async () => {
+  const f = await findingsAfterFile("packs/containers/labs/xcd-compose-health-order/lab.yaml", (s) => s.replace("image: redis:7.4-alpine", "image: redis:8"));
+  assert.ok(!f.some((x) => /is not in workloadImages/.test(x.message)), JSON.stringify(f));
+});
+
 test("--image in a hint command is checked too", async () => {
   const f = await findingsAfter("nodeselector-nvme-pod", (s) => s.replace("run {{pod}} --image=httpd:2.4-alpine --dry-run", "run {{pod}} --image=httpd:latest --dry-run"));
   assert.ok(f.some((x) => x.level === "error" && /^\/spec\/hints\//.test(x.path) && /httpd:latest/.test(x.message)), JSON.stringify(f));

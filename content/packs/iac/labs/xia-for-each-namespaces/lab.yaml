@@ -1,0 +1,170 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xia-for-each-namespaces
+  title: One namespace per substation with for_each
+  domain: iac
+  frameworks: [tf-associate:configuration]
+  difficulty: medium
+  estimatedMinutes: 7
+  tags: [exam, terraform, for_each, kubernetes-provider]
+  version: 1
+spec:
+  description: |
+    **Directory:** `~/exam/substations` · **Cluster:** `sm-grid` (the
+    kubernetes provider in `providers.tf` is pinned to it)
+
+    The variable `substations` (in `variables.tf`) maps each grid substation to
+    its voltage in kV. Create **one namespace per entry**:
+
+    - resource instances keyed by the substation name (`for_each`),
+    - namespace name `sub-<substation>`,
+    - label `saltmarsh.example/voltage-kv` set to the substation's voltage.
+
+    Do not change the variable. Apply the configuration; a following plan must
+    report no changes.
+  objectives:
+    - Create one resource instance per map entry with for_each
+  params:
+    third:
+      type: choice
+      values: [skerrow-west, marsh-gate, holt-cross]
+    kv:
+      type: choice
+      values: ["66", "275", "400"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+      - name: sm-grid
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: sm-grid
+  setup:
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xia-for-each-namespaces/stack/providers.tf, source: assets/stack/providers.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xia-for-each-namespaces/stack/variables.tf, source: assets/stack/variables.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xia-for-each-namespaces/seed.sh, source: assets/seed.sh, mode: "0755"}
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/exam
+    - on: workstation
+      as: learner
+      timeoutSec: 120
+      run: /var/tmp/ct-seed/xia-for-each-namespaces/seed.sh xia-for-each-namespaces substations init
+  teardown:
+    - on: sm-grid
+      run: kubectl delete namespace sub-fen-north sub-lark-east sub-{{third}} --ignore-not-found --wait=false
+  checks:
+    - id: namespaces-labelled
+      description: The three substation namespaces exist with their voltage label
+      type: shell
+      on: sm-grid
+      skills: [iac.targets.kubernetes-helm, iac.language.repetition]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        for s in fen-north lark-east {{third}}; do
+          printf '%s=%s ' "$s" "$(kubectl get namespace sub-$s -o jsonpath='{.metadata.labels.saltmarsh\.example/voltage-kv}' 2>/dev/null)"
+        done
+      expect: {match: exact, value: "fen-north=132 lark-east=33 {{third}}={{kv}} "}
+    - id: keyed-by-name
+      description: The namespaces are for_each instances keyed by substation name
+      type: shell
+      on: workstation
+      skills: [iac.language.repetition]
+      weight: 2
+      timeoutSec: 60
+      command: |
+        exp=$(printf '%s\n' fen-north lark-east {{third}} | sort | paste -sd, -)
+        got=$(ct-iac state /home/learner/exam/substations | jq -r '[.values.root_module.resources[]? | select(.mode == "managed" and (.type | test("^kubernetes_namespace"))) | .index | tostring] | sort | join(",")' 2>/dev/null)
+        [ "$exp" = "$got" ] && echo ok || echo "keys: $got"
+      expect: {match: exact, value: ok}
+    - id: follows-variable
+      description: A different substations map plans exactly its own namespaces
+      type: shell
+      on: workstation
+      skills: [iac.language.repetition]
+      weight: 1.5
+      timeoutSec: 120
+      command: |
+        ct-iac planjson /home/learner/exam/substations -var 'substations={"probe-x"=11}' | jq -r '
+          [.resource_changes[]? | select(.type | test("^kubernetes_namespace")) | select(.change.actions | index("create")) | "\(.index) \(.change.after.metadata[0].name) \(.change.after.metadata[0].labels["saltmarsh.example/voltage-kv"])"] | join(";")' 2>/dev/null
+      expect: {match: exact, value: probe-x sub-probe-x 11}
+    - id: converged
+      description: A new plan of ~/exam/substations reports no changes
+      type: shell
+      on: workstation
+      skills: [iac.language.repetition]
+      timeoutSec: 120
+      command: ct-iac plan /home/learner/exam/substations
+      expect: {match: exact, value: no-changes}
+  misconceptions:
+    - id: count-over-keys
+      description: Uses count over the map's keys, so instances are addressed by position.
+      feedback: With count, adding or removing a substation shifts later instances to new indexes. for_each over the map keys each instance by name.
+      expectFail: [keyed-by-name]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          cd ~/exam/substations
+          cat > main.tf <<'HCL'
+          resource "kubernetes_namespace_v1" "substation" {
+            count = length(var.substations)
+            metadata {
+              name = "sub-${keys(var.substations)[count.index]}"
+              labels = {
+                "saltmarsh.example/voltage-kv" = values(var.substations)[count.index]
+              }
+            }
+          }
+          HCL
+          iac apply -auto-approve -input=false -no-color
+    - id: no-label
+      description: Creates the namespaces but leaves the voltage label out.
+      feedback: Each namespace needs the label saltmarsh.example/voltage-kv with each.value.
+      expectFail: [namespaces-labelled, follows-variable]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          cd ~/exam/substations
+          cat > main.tf <<'HCL'
+          resource "kubernetes_namespace_v1" "substation" {
+            for_each = var.substations
+            metadata {
+              name = "sub-${each.key}"
+            }
+          }
+          HCL
+          iac apply -auto-approve -input=false -no-color
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/exam/substations
+          cat > main.tf <<'HCL'
+          resource "kubernetes_namespace_v1" "substation" {
+            for_each = var.substations
+
+            metadata {
+              name = "sub-${each.key}"
+              labels = {
+                "saltmarsh.example/voltage-kv" = tostring(each.value)
+              }
+            }
+          }
+          HCL
+          iac apply -auto-approve -input=false -no-color

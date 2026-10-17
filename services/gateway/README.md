@@ -78,6 +78,7 @@ CT_EXTRA_LAB_DIRS=services/gateway/test/fixtures/labs task dev:gateway
 | `CT_SMTP_HOST`, `CT_SMTP_PORT`, `CT_SMTP_FROM` | `127.0.0.1`, `1025` (Mailpit) | invitation email |
 | `CT_PLATFORM_IDPS` | `azarguard-entra` (`task dev:gateway`: `azarguard-entra,acme-idp`) | IdP aliases whose `CloudTrain.PlatformAdmin` app role grants platform_admin |
 | `CT_DEV_DOMAIN_VERIFY_BYPASS` | off (`task dev:gateway`: `1`) | accept domain verification without the DNS TXT record; ignored with `NODE_ENV=production` |
+| `CT_DEV_IMPERSONATE` | off (`task dev:gateway`: `1`) | DEV ONLY: `POST /api/dev/sign-in-as` for agents; refused at startup with `NODE_ENV=production` or a non-localhost `CT_PUBLIC_URL`/`CT_WEB_URL` (docs/dev-environment.md, "Signing in as a real user") |
 | `CT_SWEEP_INTERVAL_MS` | `60000` | closes attempts whose LabSession expired or vanished |
 
 Relative paths are relative to the repository root.
@@ -253,7 +254,9 @@ visible. `app.platform = on` is set only on platform-admin code paths. Lookups
 that precede org selection (domain/IdP routing, memberships, invitation links,
 background sweeps) are narrow `SECURITY DEFINER` functions. `audit_log` is
 append-only for the app role (SELECT + INSERT). `assignment_status` is a
-`security_invoker` view.
+`security_invoker` view. `learner_goals` (migration `0004_learner_goals`,
+additive and idempotent) holds each learner's exam date and weekly target per
+org (`GET/PUT /api/me/goals`).
 
 ## Learner model
 

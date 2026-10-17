@@ -1,0 +1,196 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-tag-vs-digest
+  title: Deploy the catalogue API by digest after a tag moved
+  domain: containers
+  frameworks: [dca-legacy:images-registry, ex188-aligned:manage-images, docker-practitioner:registry]
+  difficulty: easy
+  estimatedMinutes: 10
+  tags: [docker, registry, digest, tags, pull]
+  version: 1
+spec:
+  description: |
+    Copperleaf's release board approved **catalogue-api 2.3, build {{good}}**
+    (`/srv/releases/catalogue-api-2.3.txt` on `cl-catalogue-02`). Overnight, a CI job
+    re-pushed the tag `2.3` with a different, unapproved build. Every image the CI job
+    pushes also gets an immutable build tag of the form `2.3-build.<build number>`.
+
+    The registry is `registry.copperleaf.example:5000` (repository `catalogue-api`), on
+    the host `cl-catalogue-02` (`ssh cl-catalogue-02`; you are in the `docker` group).
+
+    1. Find the **digest** of the approved build in the registry.
+    2. Run the service as a container named **`catalogue-api`** (detached) **by that
+       digest**, i.e. the image reference you give `docker run` ends in
+       `@sha256:...`, so that a moving tag can never change what runs.
+    3. Write the digest (`sha256:` followed by 64 hex characters) to
+       `~/pinned-digest.txt` on `cl-catalogue-02`.
+  objectives:
+    - Tell a mutable tag from an immutable digest
+    - Look up a manifest digest in a registry
+    - Run a container pinned by digest
+  params:
+    good:
+      type: int
+      min: 4100
+      max: 4899
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-catalogue-02
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-catalogue-02
+      timeoutSec: 300
+      run: |
+        set -eu
+        usermod -aG docker learner
+        grep -q registry.copperleaf.example /etc/hosts || echo '127.0.0.1 registry.copperleaf.example' >> /etc/hosts
+        echo '{ "insecure-registries": ["registry.copperleaf.example:5000"] }' > /etc/docker/daemon.json
+        systemctl restart docker
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        docker rm -f registry catalogue-api >/dev/null 2>&1 || true
+        docker run -d --name registry --restart always -p 127.0.0.1:5000:5000 registry:3 >/dev/null
+        for i in $(seq 30); do curl -fs http://127.0.0.1:5000/v2/ >/dev/null && break; sleep 1; done
+        R=registry.copperleaf.example:5000/catalogue-api
+        bad=$(( {{good}} + 37 ))
+        mk() {  # mk <build>: build, tag 2.3 + 2.3-build.<build>, push
+          d=$(mktemp -d); mkdir -p "$d/www"
+          echo "catalogue-api 2.3 build $1" > "$d/www/version"
+          printf '%s\n' 'FROM busybox:1.37' 'COPY www /www' 'EXPOSE 8080' \
+            "LABEL org.opencontainers.image.version=2.3 com.copperleaf.build=$1" \
+            'CMD ["httpd", "-f", "-p", "8080", "-h", "/www"]' > "$d/Dockerfile"
+          docker build -q -t "$R:2.3" -t "$R:2.3-build.$1" "$d" >/dev/null
+          docker push -q "$R:2.3-build.$1" >/dev/null
+          docker push -q "$R:2.3" >/dev/null
+          rm -rf "$d"
+        }
+        mk $(( {{good}} - 112 ))
+        mk {{good}}
+        mk "$bad"
+        A='Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json'
+        mkdir -p /var/lib/cloudtrain
+        curl -fsSI -H "$A" "http://127.0.0.1:5000/v2/catalogue-api/manifests/2.3-build.{{good}}" \
+          | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}' > /var/lib/cloudtrain/good.digest
+        grep -qE '^sha256:[0-9a-f]{64}$' /var/lib/cloudtrain/good.digest
+        # nothing local: the learner works against the registry
+        docker images --format json | jq -r 'select(.Repository | endswith("/catalogue-api")) | .Repository + ":" + .Tag' | xargs -r docker rmi >/dev/null
+        mkdir -p /srv/releases
+        printf '%s\n' 'Release board, catalogue-api 2.3' "Approved: build {{good}} (signed off by media-platform)" \
+          'Rejected: every other 2.3 build' > /srv/releases/catalogue-api-2.3.txt
+        rm -f /home/learner/pinned-digest.txt
+  checks:
+    - id: api-running
+      description: A container named catalogue-api is running
+      type: shell
+      timeoutSec: 60
+      on: cl-catalogue-02
+      skills: [containers.registry.references]
+      weight: 1
+      command: docker inspect catalogue-api 2>/dev/null | jq -r '.[0].State.Running // false'
+      expect: {match: exact, value: "true"}
+    - id: approved-build
+      description: catalogue-api serves the approved build
+      type: shell
+      timeoutSec: 60
+      on: cl-catalogue-02
+      skills: [containers.registry.references]
+      weight: 2
+      command: docker exec catalogue-api cat /www/version 2>/dev/null || echo none
+      expect: {match: exact, value: "catalogue-api 2.3 build {{good}}"}
+    - id: pinned-by-digest
+      description: catalogue-api was started from an image reference pinned to the approved digest
+      type: shell
+      timeoutSec: 60
+      on: cl-catalogue-02
+      skills: [containers.registry.references]
+      weight: 2
+      command: |
+        ref=$(docker inspect catalogue-api 2>/dev/null | jq -r '.[0].Config.Image')
+        case "$ref" in *@"$(cat /var/lib/cloudtrain/good.digest)") echo pinned ;; *@sha256:*) echo other-digest ;; *) echo tag ;; esac
+      expect: {match: exact, value: pinned}
+    - id: digest-recorded
+      description: ~/pinned-digest.txt holds the approved build's digest
+      type: shell
+      timeoutSec: 60
+      on: cl-catalogue-02
+      skills: [containers.registry.references]
+      weight: 1.5
+      command: grep -qF "$(cat /var/lib/cloudtrain/good.digest)" /home/learner/pinned-digest.txt 2>/dev/null && echo recorded || echo wrong
+      expect: {match: exact, value: recorded}
+  hints:
+    - title: Which tag?
+      body: "The release note names a build number, and every push also got the tag `2.3-build.<number>`. That tag still points at the approved image."
+      cost: 1
+    - title: Getting a digest
+      body: "After `docker pull`, `docker image inspect` shows the registry digest under `RepoDigests`. Without pulling, `skopeo inspect` (add `--tls-verify=false` for this plain-HTTP registry) or the registry API's `Docker-Content-Digest` header give it too."
+      command: docker pull registry.copperleaf.example:5000/catalogue-api:2.3
+      cost: 2
+    - title: Running by digest
+      body: "Any image reference can end in `@sha256:<digest>` instead of `:<tag>`: `docker run -d --name catalogue-api <registry>/<repo>@sha256:...`."
+      cost: 1
+  misconceptions:
+    - id: moved-tag
+      description: Runs the moving tag 2.3, which now points at the unapproved build.
+      feedback: "Tags are mutable pointers: 2.3 was re-pushed overnight and now names another build. Find the approved build's digest and run that."
+      expectFail: [approved-build, pinned-by-digest, digest-recorded]
+      mutation:
+        on: cl-catalogue-02
+        as: learner
+        run: |
+          docker run -d --name catalogue-api registry.copperleaf.example:5000/catalogue-api:2.3
+          docker image inspect registry.copperleaf.example:5000/catalogue-api:2.3 | jq -r '.[0].RepoDigests[0]' | sed 's/.*@//' > ~/pinned-digest.txt
+    - id: build-tag-not-digest
+      description: Runs the right build, but by its build tag instead of its digest.
+      feedback: "The build tag happens to point at the approved image today, but a tag can be re-pushed. Pin the container to the digest: the reference must end in @sha256:..."
+      expectFail: [pinned-by-digest]
+      mutation:
+        on: cl-catalogue-02
+        as: learner
+        run: |
+          docker run -d --name catalogue-api registry.copperleaf.example:5000/catalogue-api:2.3-build.{{good}}
+          docker pull -q registry.copperleaf.example:5000/catalogue-api:2.3-build.{{good}} >/dev/null
+          docker image inspect registry.copperleaf.example:5000/catalogue-api:2.3-build.{{good}} | jq -r '.[0].RepoDigests[0]' | sed 's/.*@//' > ~/pinned-digest.txt
+  solution:
+    explanation: |
+      The build tag `2.3-build.{{good}}` still names the approved image; pull it and
+      read its registry digest and run the container with `repo@sha256:...`. A digest
+      identifies exactly one manifest, so re-pushing a tag cannot change it.
+    steps:
+      - on: cl-catalogue-02
+        as: learner
+        run: |
+          R=registry.copperleaf.example:5000/catalogue-api
+          docker pull -q "$R:2.3-build.{{good}}"
+          ref=$(docker image inspect "$R:2.3-build.{{good}}" | jq -r '.[0].RepoDigests[0]')
+          echo "${ref#*@}" > ~/pinned-digest.txt
+          docker run -d --name catalogue-api "$ref"
+    alternatives:
+      - id: skopeo-inspect
+        description: Read the digest with skopeo without pulling, then run by digest.
+        steps:
+          - on: cl-catalogue-02
+            as: learner
+            run: |
+              R=registry.copperleaf.example:5000/catalogue-api
+              # --raw: the top-level manifest (an index here); its sha256 is the digest the tag points at
+              d=sha256:$(skopeo inspect --raw --tls-verify=false "docker://$R:2.3-build.{{good}}" | sha256sum | cut -d' ' -f1)
+              echo "$d" > ~/pinned-digest.txt
+              docker run -d --name catalogue-api "$R@$d"
+      - id: registry-api
+        description: Ask the registry HTTP API for the Docker-Content-Digest header.
+        steps:
+          - on: cl-catalogue-02
+            as: learner
+            run: |
+              d=$(curl -sI -H 'Accept: application/vnd.oci.image.index.v1+json' -H 'Accept: application/vnd.oci.image.manifest.v1+json' \
+                http://registry.copperleaf.example:5000/v2/catalogue-api/manifests/2.3-build.{{good}} | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}')
+              echo "$d" > ~/pinned-digest.txt
+              docker run -d --name catalogue-api "registry.copperleaf.example:5000/catalogue-api@$d"

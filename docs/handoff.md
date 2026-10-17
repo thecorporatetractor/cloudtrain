@@ -6,7 +6,19 @@ its own detailed handoff in `docs/handoffs/`.
 ## Read first
 
 Platform fixes round 3 (branch `fix/platform-round-3`) closed the first four
-items of the old list; what is left of them:
+items of the old list; round 4 (branch `fix/platform-round-4`, proof in
+`deploy/.results/platform-round-4-proof.txt`) closed what was left of them except
+Kata and the kubeadm proof under load:
+
+0. **Round 4.** Kubernetes checks (k8s-query, k8s-can-i, k8s-context) default to a
+   20 s timeout (was 5 s). Every vcluster gets the ValidatingAdmissionPolicy
+   `cloudtrain-ephemeral-pod-security`: `kubectl debug` with the default profile is
+   refused at once with a message naming `--profile=baseline`, instead of a debug
+   container that never starts and blocks the Pod's later ones. Lab link attachments
+   are rate-limited on the host side (`--link-rate-mbps`, default 10 Mbit/s each way).
+   A wired entry node's NetworkPolicy no longer filters its link attachments (P3),
+   and wired pods run in a user namespace with writable network sysctls (P4,
+   `--link-sysctls`). The round-3 manager `ct-k8sdevsec-system` has been deleted.
 
 1. **vcluster Pod Security: fixed.** Every vcluster host namespace now enforces
    Pod Security `baseline` (audit `restricted`; manager flag
@@ -26,9 +38,8 @@ items of the old list; what is left of them:
    logical switches get `vlan-passthru=true` (manager execs `ovn-nbctl` in
    ovn-central, flag `--ovn-central`). Proven with the `net-trunk-two-switches`
    draft (VLAN 20/30 tagged + native 99 across two Linux bridges). The L2 drafts in
-   `docs/handoffs/networking-drafts/` no longer need `l2shim.sh`. Still open:
-   P3 (entry NetworkPolicy on a wired entry), P4 (read-only sysctls), no rate limit
-   on link segments (do not run `net-fix-broadcast-storm`).
+   `docs/handoffs/networking-drafts/` no longer need `l2shim.sh`. P3, P4 and the
+   link rate limit: fixed in round 4 (item 0); `net-fix-broadcast-storm` may run.
 4. **Learner sudo: available as an opt-in.** Entry node `learnerSudo: true`
    (security trade-off, see `docs/dev-environment.md`); the lab's setup grants the
    sudoers rule. Default stays `allowPrivilegeEscalation: false`; operators can
@@ -56,18 +67,23 @@ items of the old list; what is left of them:
 | Stream | Owned | Verified live | Written, not yet verified | Blocked / not started | Handoff |
 |---|---|---|---|---|---|
 | k8s-admin | 88 | 5 | 63 | 18 blocked on add-ons, 2 not written | `docs/handoffs/k8s-admin.md` |
-| k8s-dev | 42 | 6 | 32 | 4 blocked (buildah, metrics-server, ingress) | `docs/handoffs/k8s-dev.md` |
-| k8s-sec | 51 | 2 | 37 | 12 blocked on security tooling | `docs/handoffs/k8s-sec.md` |
+| k8s-dev | 42 | 33 (every V-tier lab; round 3, 2026-10-17); sim-k8s-developer exam run live: auto-solve 100 %, no-solve 14.5 % | 5 K-tier (vm slot) | 4 blocked (buildah, metrics-server, ingress) | `docs/handoffs/k8s-dev.md` |
+| k8s-sec | 51 | 12 (every V-tier lab; round 3) | 27 K-tier (vm slot) | 12 blocked on security tooling | `docs/handoffs/k8s-sec.md` |
 | networking | 77 | 2 | 31 drafts (parked in `docs/handoffs/networking-drafts/`) | 44 not started (exam tasks, SR Linux, Ansible) | `docs/handoffs/networking.md` |
 | linux-a | 62 | 1 | 21 | ~40 not started (sudo, mirror, mis-tiered) | `docs/handoffs/linux-a.md` |
 | original 11 K8s labs | 11 | 4+ | — | — | `content/packs/kubernetes` |
+| iac (wave 2) | 99 | 48 (23 foundations labs + 25 sim-iac-associate tasks; exam runs 100 % / 11.7 %) | 0 | 31 learning labs, 18 sim-iac-advanced tasks, 2 capstone tasks not started | `docs/handoffs/iac.md` |
+| containers (wave 2, Docker on `docker-vm:29`) | 135 | 24 (12 learning, 12 exam tasks) | 0 | 12 exam tasks (5 need more image content) + 79 learning labs not started | `docs/handoffs/containers.md` |
 
 Most "blocked on add-ons" labs should unblock with `kubeadm:1.37-full` (metrics-server,
 Traefik ingress + Gateway API, MetalLB, local-path, Falco, gVisor, kube-bench) once it
 is boot-tested and the labs switch to it.
 
-Not started at all (wave 2): Linux tier B/C labs, containers (Docker), IaC
-(Terraform), automation (Ansible), and the exam task pools of those domains.
+Wave 2: IaC has started (see the iac row; image `terraform-ws:1.15`, Terraform/OpenTofu
+swappable per tenant), and so has containers (see the containers row; every lab runs on
+a `docker-vm:29` KubeVirt VM, design and escape test in `docs/handoffs/containers.md`).
+Not started at all: Linux tier B/C labs, automation (Ansible), and the exam task pools of
+those domains.
 
 ## Resume order
 
@@ -75,8 +91,8 @@ Not started at all (wave 2): Linux tier B/C labs, containers (Docker), IaC
    `task dev:up` (it now heals expired KubeVirt certs itself) and `task dev:deps`.
 2. **Platform fixes:** done in round 3 (read-first 1-4 above, plus: `file.source`
    assets are templated and the schema now says so; shell checks default to a 30 s
-   timeout; the gateway smoke lab creates the learner's `~/handover`). Left: Kata,
-   kubeadm proof under real load, networking P3/P4 and link rate limiting.
+   timeout; the gateway smoke lab creates the learner's `~/handover`) and round 4
+   (item 0). Left: Kata and the kubeadm proof under real load.
 3. **Exam integration: done** (2026-10-15). `task dev:orchestrator` reconciles the
    gateway's ExamSessions (selector `app.kubernetes.io/managed-by=cloudtrain-gateway`;
    the deploy warns when another manager would overlap); `exam-smoke.mjs` logs in

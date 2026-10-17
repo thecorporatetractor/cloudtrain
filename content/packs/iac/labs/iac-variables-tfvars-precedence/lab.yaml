@@ -1,0 +1,341 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: iac-variables-tfvars-precedence
+  title: Type, validate and layer input variables
+  domain: iac
+  frameworks: [tf-associate:configuration, tf-professional:variables-precedence]
+  difficulty: easy
+  estimatedMinutes: 20
+  tags: [terraform, variables, validation, tfvars, precedence]
+  version: 1
+spec:
+  description: |
+    The telemetry collector stack in `~/stacks/telemetry` is deployed once per wind
+    farm. `main.tf` already uses three input variables that nobody declared, and two
+    variable files sit next to it: `terraform.tfvars` and `farm.auto.tfvars`.
+
+    1. In `variables.tf`, declare the inputs with **types** and **validation**:
+
+       | Variable | Type | Default | Rule |
+       |---|---|---|---|
+       | `farm_name` | string | none | one of `gullhaven`, `redmoor`, `skerrow` |
+       | `turbine_count` | number | none | a whole number from 1 to 60 |
+       | `sample_seconds` | number | `30` | none |
+
+       Give each validation an error message that says what is allowed. Do not
+       edit `main.tf` or the two `.tfvars` files.
+
+    2. Apply the stack once for the collector, with the operator's override
+       **`sample_seconds = 10` given on the command line** (`-var`).
+
+    3. Before the next change window the operators want to know which
+       `turbine_count` Terraform will use in three situations. Write
+       `~/reports/turbine-count.txt` with exactly three lines, each the value
+       Terraform would use:
+
+       ```
+       plain=<value for: terraform plan>
+       cli-var=<value for: terraform plan -var turbine_count={{cli}}>
+       env-var=<value for: TF_VAR_turbine_count={{env}} terraform plan>
+       ```
+  objectives:
+    - Declare typed input variables with defaults
+    - Add validation rules with clear error messages
+    - Apply the precedence of defaults, variable files, environment and -var
+  params:
+    tfvars:
+      type: int
+      min: 10
+      max: 19
+    auto:
+      type: int
+      min: 20
+      max: 29
+    cli:
+      type: int
+      min: 40
+      max: 49
+    env:
+      type: int
+      min: 50
+      max: 59
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+  setup:
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/stacks /home/learner/stacks/telemetry /home/learner/telemetry /home/learner/reports
+    - on: workstation
+      file: {path: /home/learner/stacks/telemetry/main.tf, source: assets/main.tf, mode: "0644"}
+    - on: workstation
+      file:
+        path: /home/learner/stacks/telemetry/terraform.tfvars
+        mode: "0644"
+        content: |
+          farm_name     = "redmoor"
+          turbine_count = {{tfvars}}
+    - on: workstation
+      file:
+        path: /home/learner/stacks/telemetry/farm.auto.tfvars
+        mode: "0644"
+        content: |
+          # Redmoor commissioned new turbines in the spring.
+          turbine_count = {{auto}}
+    - on: workstation
+      run: chown -R learner:learner /home/learner/stacks/telemetry
+  checks:
+    - id: collector-applied
+      description: collector.conf was applied with the layered values and the -var override
+      type: shell
+      on: workstation
+      skills: [iac.language.variables]
+      weight: 2
+      command: tr '\n' ' ' < /home/learner/telemetry/collector.conf 2>/dev/null || echo missing
+      expect: {match: exact, value: "farm=redmoor turbines={{auto}} sample_seconds=10 "}
+    - id: converged
+      description: Planning again with -var sample_seconds=10 reports no changes
+      type: shell
+      on: workstation
+      skills: [iac.foundations.workflow]
+      timeoutSec: 90
+      command: ct-iac plan /home/learner/stacks/telemetry -var sample_seconds=10
+      expect: {match: exact, value: no-changes}
+    - id: number-type
+      description: turbine_count is a number (a non-numeric value is rejected) and sample_seconds defaults to 30
+      type: shell
+      on: workstation
+      skills: [iac.language.variables]
+      weight: 1.5
+      timeoutSec: 120
+      command: |
+        d=/home/learner/stacks/telemetry
+        ct-iac run $d iac validate -no-color >/dev/null 2>&1 || { echo invalid-config; exit 0; }
+        ct-iac run $d iac plan -input=false -lock=false -no-color -var turbine_count=many >/dev/null 2>&1 && t=accepted || t=rejected
+        s=$(ct-iac planjson $d | jq -r '.variables.sample_seconds.value // "none"' 2>/dev/null)
+        echo "text=$t sample=$s"
+      expect: {match: exact, value: "text=rejected sample=30"}
+    - id: farm-validation
+      description: farm_name rejects an unknown farm with a validation error and accepts the three farms
+      type: shell
+      on: workstation
+      skills: [iac.language.variables, iac.quality.conditions]
+      weight: 1.5
+      timeoutSec: 150
+      command: |
+        d=/home/learner/stacks/telemetry; r=""
+        for f in skerrow atlantis; do
+          out=$(ct-iac run $d iac plan -input=false -lock=false -no-color -var farm_name=$f 2>&1); rc=$?
+          if [ $rc -eq 0 ]; then r="$r $f=ok"; elif echo "$out" | grep -q 'Invalid value for variable'; then r="$r $f=invalid"; else r="$r $f=error"; fi
+        done
+        echo $r
+      expect: {match: exact, value: "skerrow=ok atlantis=invalid"}
+    - id: count-validation
+      description: turbine_count rejects 0, 61 and 2.5 with a validation error and accepts 1 and 60
+      type: shell
+      on: workstation
+      skills: [iac.language.variables, iac.quality.conditions]
+      weight: 1.5
+      timeoutSec: 240
+      command: |
+        d=/home/learner/stacks/telemetry; r=""
+        for n in 0 1 60 61 2.5; do
+          out=$(ct-iac run $d iac plan -input=false -lock=false -no-color -var turbine_count=$n 2>&1); rc=$?
+          if [ $rc -eq 0 ]; then r="$r $n=ok"; elif echo "$out" | grep -q 'Invalid value for variable'; then r="$r $n=invalid"; else r="$r $n=error"; fi
+        done
+        echo $r
+      expect: {match: exact, value: "0=invalid 1=ok 60=ok 61=invalid 2.5=invalid"}
+    - id: precedence-report
+      description: ~/reports/turbine-count.txt states the value Terraform uses in each situation
+      type: shell
+      on: workstation
+      skills: [iac.language.variables]
+      weight: 2
+      command: tr '\n' ' ' < /home/learner/reports/turbine-count.txt 2>/dev/null | tr -s ' ' || echo missing
+      expect: {match: regex, value: '^plain={{auto}} cli-var={{cli}} env-var={{auto}} ?$'}
+  hints:
+    - title: Variable with validation
+      body: |
+        ```hcl
+        variable "farm_name" {
+          type = string
+          validation {
+            condition     = contains(["gullhaven", "redmoor", "skerrow"], var.farm_name)
+            error_message = "farm_name must be gullhaven, redmoor or skerrow."
+          }
+        }
+        ```
+      cost: 1
+    - title: Whole numbers
+      body: "`type = number` accepts 2.5. `floor(var.turbine_count) == var.turbine_count` tests for a whole number; combine conditions with `&&`."
+      cost: 1
+    - title: Precedence, lowest to highest
+      body: Default, then environment variables `TF_VAR_name`, then `terraform.tfvars`, then `*.auto.tfvars` (alphabetical), then `-var` and `-var-file` on the command line in the order given.
+      cost: 2
+  misconceptions:
+    - id: env-beats-files
+      description: Believes TF_VAR_ environment variables override the variable files.
+      feedback: Environment variables are only one step above the default. terraform.tfvars and *.auto.tfvars both override them; only -var and -var-file come later.
+      expectFail: [precedence-report]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 180
+        run: |
+          cd ~/stacks/telemetry
+          cat > variables.tf <<'HCL'
+          variable "farm_name" {
+            type = string
+            validation {
+              condition     = contains(["gullhaven", "redmoor", "skerrow"], var.farm_name)
+              error_message = "farm_name must be gullhaven, redmoor or skerrow."
+            }
+          }
+          variable "turbine_count" {
+            type = number
+            validation {
+              condition     = var.turbine_count >= 1 && var.turbine_count <= 60 && floor(var.turbine_count) == var.turbine_count
+              error_message = "turbine_count must be a whole number from 1 to 60."
+            }
+          }
+          variable "sample_seconds" {
+            type    = number
+            default = 30
+          }
+          HCL
+          iac init -input=false -no-color && iac apply -auto-approve -input=false -no-color -var sample_seconds=10
+          printf 'plain={{auto}}\ncli-var={{cli}}\nenv-var={{env}}\n' > ~/reports/turbine-count.txt
+    - id: untyped-variables
+      description: Declares the variables without types or validation, so any string is accepted.
+      feedback: Without `type = number` a value like "many" is accepted and only fails later, or never. Types and validation stop bad input at plan time.
+      expectFail: [number-type, farm-validation, count-validation]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 180
+        run: |
+          cd ~/stacks/telemetry
+          printf 'variable "farm_name" {}\nvariable "turbine_count" {}\nvariable "sample_seconds" {\n  default = 30\n}\n' > variables.tf
+          iac init -input=false -no-color && iac apply -auto-approve -input=false -no-color -var sample_seconds=10
+          printf 'plain={{auto}}\ncli-var={{cli}}\nenv-var={{auto}}\n' > ~/reports/turbine-count.txt
+    - id: range-only
+      description: Validates the range 1-60 but not whole numbers.
+      feedback: A number variable accepts fractions. Add `floor(var.turbine_count) == var.turbine_count` to the condition.
+      expectFail: [count-validation]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 180
+        run: |
+          cd ~/stacks/telemetry
+          cat > variables.tf <<'HCL'
+          variable "farm_name" {
+            type = string
+            validation {
+              condition     = contains(["gullhaven", "redmoor", "skerrow"], var.farm_name)
+              error_message = "farm_name must be gullhaven, redmoor or skerrow."
+            }
+          }
+          variable "turbine_count" {
+            type = number
+            validation {
+              condition     = var.turbine_count >= 1 && var.turbine_count <= 60
+              error_message = "turbine_count must be from 1 to 60."
+            }
+          }
+          variable "sample_seconds" {
+            type    = number
+            default = 30
+          }
+          HCL
+          iac init -input=false -no-color && iac apply -auto-approve -input=false -no-color -var sample_seconds=10
+          printf 'plain={{auto}}\ncli-var={{cli}}\nenv-var={{auto}}\n' > ~/reports/turbine-count.txt
+  solution:
+    explanation: |
+      Types make Terraform convert and reject input before planning, and each
+      `validation` block rejects values outside the rule with its own message. For
+      `turbine_count`, `terraform.tfvars` ({{tfvars}}) is overridden by
+      `farm.auto.tfvars` ({{auto}}), and only `-var` on the command line ({{cli}})
+      beats that. `TF_VAR_turbine_count` sits just above the default, so it loses to
+      both files: the value stays {{auto}}.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 240
+        run: |
+          set -e
+          cd ~/stacks/telemetry
+          cat > variables.tf <<'HCL'
+          variable "farm_name" {
+            description = "Wind farm this collector runs for"
+            type        = string
+            validation {
+              condition     = contains(["gullhaven", "redmoor", "skerrow"], var.farm_name)
+              error_message = "farm_name must be one of gullhaven, redmoor or skerrow."
+            }
+          }
+
+          variable "turbine_count" {
+            description = "Turbines reporting to this collector"
+            type        = number
+            validation {
+              condition     = var.turbine_count >= 1 && var.turbine_count <= 60 && floor(var.turbine_count) == var.turbine_count
+              error_message = "turbine_count must be a whole number from 1 to 60."
+            }
+          }
+
+          variable "sample_seconds" {
+            description = "Sampling interval in seconds"
+            type        = number
+            default     = 30
+          }
+          HCL
+          iac init -input=false -no-color
+          iac apply -auto-approve -input=false -no-color -var sample_seconds=10
+          printf 'plain={{auto}}\ncli-var={{cli}}\nenv-var={{auto}}\n' > ~/reports/turbine-count.txt
+    alternatives:
+      - id: two-validations
+        description: One validation block per rule, and the report built by asking terraform console.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 240
+            run: |
+              set -e
+              cd ~/stacks/telemetry
+              cat > variables.tf <<'HCL'
+              variable "farm_name" {
+                type = string
+                validation {
+                  condition     = var.farm_name == "gullhaven" || var.farm_name == "redmoor" || var.farm_name == "skerrow"
+                  error_message = "Unknown farm: use gullhaven, redmoor or skerrow."
+                }
+              }
+
+              variable "turbine_count" {
+                type = number
+                validation {
+                  condition     = var.turbine_count >= 1 && var.turbine_count <= 60
+                  error_message = "turbine_count must be between 1 and 60."
+                }
+                validation {
+                  condition     = var.turbine_count == floor(var.turbine_count)
+                  error_message = "turbine_count must be a whole number."
+                }
+              }
+
+              variable "sample_seconds" {
+                type    = number
+                default = 30
+              }
+              HCL
+              iac init -input=false -no-color
+              iac apply -auto-approve -input=false -no-color -var sample_seconds=10
+              p=$(echo 'var.turbine_count' | iac console)
+              c=$(echo 'var.turbine_count' | iac console -var turbine_count={{cli}})
+              e=$(echo 'var.turbine_count' | TF_VAR_turbine_count={{env}} iac console)
+              printf 'plain=%s\ncli-var=%s\nenv-var=%s\n' "$p" "$c" "$e" > ~/reports/turbine-count.txt

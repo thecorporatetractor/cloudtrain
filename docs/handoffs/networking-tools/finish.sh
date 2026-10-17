@@ -10,8 +10,5 @@ git add content/packs/networking content/curriculum.yaml
 [ -f deploy/.results/verify/$lab.json ] && git add -f deploy/.results/verify/$lab.json
 git commit -q -m "feat(networking): $lab lab ($st)
 
-$msg
-
-Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01YUBnufQySxggWwyP4n5RG1"
+$msg"
 git log --oneline -1

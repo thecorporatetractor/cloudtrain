@@ -68,6 +68,7 @@ spec:
     - id: init-seed
       description: Pod timetable has init container seed
       type: k8s-query
+      timeoutSec: 20
       skills: [k8s.workloads.native-sidecars]
       query: {cluster: qm-dispatch, resource: pod, name: timetable, namespace: timetable-web, jsonpath: "{.spec.initContainers[*].name}"}
       expect: {match: exact, value: seed}
@@ -78,8 +79,9 @@ spec:
       on: qm-dispatch
       skills: [k8s.storage.ephemeral-volumes]
       command: |
+        # printf, not echo: dash's echo expands the \n inside the JSON strings.
         j=$(kubectl -n timetable-web get pod timetable -o json 2>/dev/null) || { echo missing; exit 0; }
-        echo "$j" | jq -r '
+        printf '%s' "$j" | jq -r '
           (.spec.initContainers // [] | map(select(.name == "seed"))[0].volumeMounts // [] | map(select(.mountPath == "/www"))[0].name) as $a
           | (.spec.containers | map(select(.name == "web"))[0].volumeMounts // [] | map(select(.mountPath == "/www"))[0].name) as $b
           | if $a != null and $a == $b and ([.spec.volumes[] | select(.name == $a and .emptyDir != null)] | length) == 1 then "shared" else "not shared" end'
@@ -96,6 +98,7 @@ spec:
     - id: web-unchanged
       description: The web container keeps its image and command
       type: k8s-query
+      timeoutSec: 20
       skills: [k8s.workloads.native-sidecars]
       weight: 0.5
       query: {cluster: qm-dispatch, resource: pod, name: timetable, namespace: timetable-web, jsonpath: '{.spec.containers[?(@.name=="web")].image} {.spec.containers[?(@.name=="web")].command}'}

@@ -1,0 +1,164 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-exec-into-subtitle
+  title: Read live configuration from inside the subtitle service
+  domain: containers
+  frameworks: [ex188-aligned:troubleshoot, docker-practitioner:operations]
+  difficulty: easy
+  estimatedMinutes: 8
+  tags: [docker, exec, logs, troubleshooting]
+  version: 1
+spec:
+  description: |
+    The subtitle service renders captions for every Copperleaf stream. It runs on
+    `cl-subtitle-01` (`ssh cl-subtitle-01`; you are in the `docker` group) as the
+    container **`subtitle-svc`**.
+
+    During last night's incident someone changed its configuration by hand inside the
+    running container, and nobody wrote down what they set. Captions now use a
+    different font, and the design team needs to know which one.
+
+    Find the **`caption-font`** value the running service actually **loaded** and write
+    just that value (for example `Inter`) to `~/subtitle-font.txt` on `cl-subtitle-01`.
+
+    Do **not** restart, recreate or stop `subtitle-svc`: restarting it would lose the
+    evidence.
+  objectives:
+    - Read a container's logs to learn where it loads configuration from
+    - Run commands inside a running container with docker exec
+    - Investigate without restarting the workload
+  params:
+    font:
+      type: choice
+      values: [Lexend, Atkinson-Hyperlegible, SourceSans3, NotoSans, PlexSans]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-subtitle-01
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-subtitle-01
+      timeoutSec: 240
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        d=$(mktemp -d)
+        cat > "$d/subtitle-svc" <<'SH'
+        #!/bin/sh
+        # Copperleaf subtitle service (lab stand-in): defaults, then the live override file.
+        mkdir -p /run/subtitle
+        echo "subtitle-svc 5.2 starting; defaults from /etc/copperleaf/subtitle/defaults.conf"
+        echo "waiting for the live override in /run/subtitle/active.conf"
+        while [ ! -s /run/subtitle/active.conf ]; do sleep 1; done
+        echo "loaded /run/subtitle/active.conf ($(grep -c = /run/subtitle/active.conf) keys); rendering captions"
+        trap 'exit 0' TERM INT
+        while :; do sleep 30 & wait $!; echo "rendered $(date +%s) captions batch"; done
+        SH
+        chmod 0755 "$d/subtitle-svc"
+        printf '%s\n' 'caption-font=Inter' 'caption-size=42' 'outline=2' > "$d/defaults.conf"
+        printf '%s\n' 'FROM busybox:1.37' 'ENV CAPTION_FONT_FALLBACK=Roboto' \
+          'COPY defaults.conf /etc/copperleaf/subtitle/defaults.conf' \
+          'COPY subtitle-svc /usr/local/bin/subtitle-svc' 'ENTRYPOINT ["/usr/local/bin/subtitle-svc"]' > "$d/Dockerfile"
+        docker build -q -t copperleaf/subtitle-svc:5.2 "$d" >/dev/null
+        rm -rf "$d"
+        docker rm -f subtitle-svc >/dev/null 2>&1 || true
+        docker run -d --name subtitle-svc --restart unless-stopped copperleaf/subtitle-svc:5.2 >/dev/null
+        # the undocumented hand change: written inside the running container, not in the image or its config
+        docker exec subtitle-svc sh -c 'printf "%s\n" "caption-font={{font}}" "caption-size=48" "outline=3" > /run/subtitle/active.conf'
+        for i in $(seq 20); do docker logs subtitle-svc 2>&1 | grep -q '^loaded' && break; sleep 1; done
+        mkdir -p /var/lib/cloudtrain
+        docker inspect subtitle-svc | jq -r '.[0].Id + " " + .[0].State.StartedAt' > /var/lib/cloudtrain/subtitle.state
+        rm -f /home/learner/subtitle-font.txt
+  checks:
+    - id: font-recorded
+      description: ~/subtitle-font.txt holds the caption font the service loaded
+      type: shell
+      timeoutSec: 60
+      on: cl-subtitle-01
+      skills: [containers.foundations.exec-logs]
+      weight: 3
+      command: |
+        f=/home/learner/subtitle-font.txt
+        [ -s "$f" ] || { echo missing; exit 0; }
+        v=$(tr -d ' \t\r' < "$f" | sed -n '/./{p;q}' | sed 's/^caption-font=//')
+        [ "$v" = "{{font}}" ] && echo match || echo wrong
+      expect: {match: exact, value: match}
+    - id: not-restarted
+      description: subtitle-svc is still the same running container, never restarted
+      type: shell
+      timeoutSec: 60
+      on: cl-subtitle-01
+      skills: [containers.foundations.exec-logs]
+      weight: 2
+      command: |
+        now=$(docker inspect subtitle-svc 2>/dev/null | jq -r '.[0].Id + " " + .[0].State.StartedAt + " " + (.[0].State.Running|tostring) + " " + (.[0].RestartCount|tostring)')
+        [ "$now" = "$(cat /var/lib/cloudtrain/subtitle.state) true 0" ] && echo untouched || echo restarted
+      expect: {match: exact, value: untouched}
+  hints:
+    - title: Ask the service
+      body: "`docker logs subtitle-svc` shows what the service printed at start, including which file it loaded."
+      cost: 1
+    - title: Look inside
+      body: "`docker exec` runs a command in the running container, for example `cat` on a file, or `sh` for a shell (add `-it` for an interactive one)."
+      command: docker exec subtitle-svc ls /run/subtitle
+      cost: 1
+    - title: Image defaults are not live state
+      body: "The image's defaults file and environment describe how the container started. A change made inside the running container only shows up in the container's own files."
+      cost: 2
+  misconceptions:
+    - id: image-defaults
+      description: Reports the font from the image's defaults file.
+      feedback: "defaults.conf comes from the image and holds the defaults the service starts with. The logs say the service then loaded /run/subtitle/active.conf; read that file inside the running container."
+      expectFail: [font-recorded]
+      mutation:
+        on: cl-subtitle-01
+        as: learner
+        run: docker exec subtitle-svc sed -n 's/^caption-font=//p' /etc/copperleaf/subtitle/defaults.conf > ~/subtitle-font.txt
+    - id: env-fallback
+      description: Takes the fallback font from the container's environment in docker inspect.
+      feedback: "CAPTION_FONT_FALLBACK is baked into the image as a fallback; it is not what the service loaded. The live value is in the file the logs name."
+      expectFail: [font-recorded]
+      mutation:
+        on: cl-subtitle-01
+        as: learner
+        run: docker inspect subtitle-svc | jq -r '.[0].Config.Env[]' | sed -n 's/^CAPTION_FONT_FALLBACK=//p' > ~/subtitle-font.txt
+    - id: restarted
+      description: Restarts the container to make it print its configuration again.
+      feedback: "A restart is exactly what the team asked you to avoid: it replaces the live process. docker exec reads the state without touching it."
+      expectFail: [not-restarted]
+      mutation:
+        on: cl-subtitle-01
+        as: learner
+        run: |
+          docker exec subtitle-svc sed -n 's/^caption-font=//p' /run/subtitle/active.conf > ~/subtitle-font.txt
+          docker restart -t 1 subtitle-svc
+  solution:
+    explanation: |
+      The logs show that after the defaults the service loaded `/run/subtitle/active.conf`.
+      That file exists only inside the running container, so `docker exec` reads it
+      without restarting anything.
+    steps:
+      - on: cl-subtitle-01
+        as: learner
+        run: |
+          docker logs subtitle-svc | head -n 5
+          docker exec subtitle-svc cat /run/subtitle/active.conf
+          docker exec subtitle-svc sed -n 's/^caption-font=//p' /run/subtitle/active.conf > ~/subtitle-font.txt
+    alternatives:
+      - id: docker-cp
+        description: Copy the live file out of the container with docker cp and read it on the host.
+        steps:
+          - on: cl-subtitle-01
+            as: learner
+            run: |
+              docker cp subtitle-svc:/run/subtitle/active.conf /tmp/active.conf
+              grep '^caption-font=' /tmp/active.conf > ~/subtitle-font.txt

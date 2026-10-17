@@ -35,7 +35,7 @@ function Screen() {
         <Stat label="SSO" value={d.ssoConnections ? `${d.ssoConnections} connection${d.ssoConnections === 1 ? '' : 's'}` : 'Off'} hint={d.org.settings.allowLocalLogin ? 'local passwords allowed' : 'enforced'} />
       </div>
 
-      <div className="grid-2" style={{ gridTemplateColumns: 'minmax(0, 5fr) minmax(0, 7fr)', gap: 20, alignItems: 'start' }}>
+      <div className="split split-5-7" style={{ alignItems: 'start' }}>
         <div className="stack" style={{ gap: 20 }}>
           <Card className="card-flush">
             <div className="card-head">

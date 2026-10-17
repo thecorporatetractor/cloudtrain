@@ -1,0 +1,108 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xcd-ops-restart-survive
+  title: Keep the beacon service up across restarts
+  domain: containers
+  frameworks: [docker-practitioner:operations]
+  difficulty: easy
+  estimatedMinutes: 5
+  tags: [exam, docker, restart-policy]
+  version: 1
+spec:
+  description: |
+    **Host:** `cl-docker-01` (`ssh cl-docker-01`)
+
+    The container **`beacon`** (image `copperleaf/beacon:1`) announces the playout
+    encoder to the monitoring system. Change it so that:
+
+    - it comes back on its own after an **engine restart** and after a **host reboot**;
+    - it **stays stopped** after someone stops it by hand with `docker stop`, until it is
+      started again by hand.
+
+    Keep the container name `beacon` and its image. Leave `beacon` running when you
+    are done.
+  objectives:
+    - Choose the restart policy that matches the required behaviour
+  params:
+    site:
+      type: choice
+      values: [playout-a, playout-b, playout-c]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-docker-01
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-docker-01
+      timeoutSec: 240
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        d=$(mktemp -d)
+        printf '%s\n' 'FROM busybox:1.37' \
+          'CMD ["sh", "-c", "trap \"exit 0\" TERM; while :; do echo beacon $SITE alive; sleep 5 & wait $!; done"]' > "$d/Dockerfile"
+        docker build -q -t copperleaf/beacon:1 "$d" >/dev/null
+        rm -rf "$d"
+        docker rm -f beacon >/dev/null 2>&1 || true
+        docker run -d --name beacon -e SITE={{site}} copperleaf/beacon:1 >/dev/null
+  checks:
+    - id: policy
+      description: beacon restarts after engine restarts and reboots but not after a manual stop
+      type: shell
+      timeoutSec: 60
+      on: cl-docker-01
+      skills: [containers.operations.restart-health]
+      weight: 3
+      command: docker inspect beacon 2>/dev/null | jq -r '.[0].HostConfig.RestartPolicy.Name'
+      expect: {match: exact, value: unless-stopped}
+    - id: same-service
+      description: beacon still runs copperleaf/beacon:1 with its site setting
+      type: shell
+      timeoutSec: 60
+      on: cl-docker-01
+      skills: [containers.operations.restart-health]
+      weight: 1
+      command: |
+        docker inspect beacon 2>/dev/null | jq -r '[.[0].Config.Image, (.[0].Config.Env | index("SITE={{site}}") != null | tostring), (.[0].State.Running | tostring)] | join(" ")'
+      expect: {match: exact, value: "copperleaf/beacon:1 true true"}
+  misconceptions:
+    - id: always
+      description: Uses restart policy always.
+      feedback: "With always, a container you stopped by hand starts again at the next engine restart or reboot. unless-stopped remembers the manual stop."
+      expectFail: [policy]
+      mutation:
+        on: cl-docker-01
+        as: learner
+        run: docker update --restart always beacon
+    - id: on-failure
+      description: Uses restart policy on-failure.
+      feedback: "on-failure reacts to a non-zero exit; an engine restart or reboot is not a failure of the container."
+      expectFail: [policy]
+      mutation:
+        on: cl-docker-01
+        as: learner
+        run: docker update --restart on-failure beacon
+  solution:
+    explanation: "`docker update --restart unless-stopped beacon` changes the policy in place."
+    steps:
+      - on: cl-docker-01
+        as: learner
+        run: docker update --restart unless-stopped beacon
+    alternatives:
+      - id: recreate
+        description: Recreate the container with the policy.
+        steps:
+          - on: cl-docker-01
+            as: learner
+            run: |
+              docker rm -f beacon
+              docker run -d --name beacon --restart unless-stopped -e SITE={{site}} copperleaf/beacon:1

@@ -201,10 +201,39 @@ export interface Me extends Learner {
   platformAdmin: boolean;
   /** Send as `x-csrf-token` on every state-changing request. */
   csrfToken: string;
-  /** How this session was established. */
-  auth: { method: 'oidc' | 'dev'; idp?: string; sessionExpiresAt?: string };
+  /**
+   * How this session was established. `dev-impersonation` + `impersonated: true`:
+   * a local-dev "sign in as" session (`POST /api/dev/sign-in-as`, CT_DEV_IMPERSONATE=1),
+   * no IdP login behind it; the web app shows a banner.
+   */
+  auth: { method: 'oidc' | 'dev' | 'dev-impersonation'; idp?: string; sessionExpiresAt?: string; impersonated?: boolean };
   /** True while a platform admin acts inside an org through support access. */
   supportAccess?: { orgId: string; expiresAt: string };
+}
+
+/**
+ * `GET /me/goals` / `PUT /me/goals`: the learner's own study goals in the
+ * active org. Null = not set (Home falls back to an assigned due date or a
+ * placeholder). The Home goal card reads these through `GoalForecast`.
+ */
+export interface LearnerGoals {
+  /** Exam date, YYYY-MM-DD. */
+  targetDate: string | null;
+  /** Weekly practice target in minutes. */
+  weeklyTargetMinutes: number | null;
+  updatedAt: string | null;
+}
+
+/** `PUT /me/goals`: fields left out stay as they are, null clears. */
+export interface UpdateLearnerGoalsRequest {
+  targetDate?: string | null;
+  weeklyTargetMinutes?: number | null;
+  /**
+   * `browser`: a one-time import of goals the web app kept in localStorage
+   * before goals were stored on the server. Applied only to fields that are
+   * not set yet, so it never overwrites a goal set elsewhere.
+   */
+  source?: 'browser';
 }
 
 /** `POST /me/org`. Answers the new `Me`. */
@@ -479,7 +508,14 @@ export interface Attempt {
   score: number;
   hintsUsed: number;
   validations: number;
+  /** Environment time (session open to close): what quotas bill. */
   durationS: number;
+  /**
+   * Practice time: start of the attempt to its last Validate, 0 when no
+   * Validate ran. The learner's own pages, manager views and reports count
+   * this, so both sides see the same minutes.
+   */
+  practiceS: number;
   checksPassed: number;
   checksTotal: number;
 }
@@ -517,7 +553,10 @@ export interface DashboardMember {
   mastery: Record<string, MasteryCell>;
   /** Framework id -> readiness 0..1. */
   readiness: Partial<Record<FrameworkId, number>>;
+  /** Practice minutes (graded time, see `Attempt.practiceS`) in attempts started this calendar month (UTC). */
   minutesThisMonth: number;
+  /** Practice minutes in the last 7 days: the number on the learner's own Home. */
+  minutesThisWeek: number;
   attemptsThisMonth: number;
   lastActiveAt?: string;
   assignments: { total: number; completed: number; overdue: number; inProgress: number };
@@ -543,8 +582,9 @@ export interface TeamDashboard {
   members: DashboardMember[];
   /** Team-average readiness per framework. */
   frameworks: { frameworkId: FrameworkId; name: string; readiness: number; ready: number; members: number }[];
-  /** Lab minutes per ISO week, oldest first (last 8 weeks). */
+  /** Practice minutes per ISO week (graded time), oldest first (last 8 weeks). */
   minutesByWeek: { weekStart: string; minutes: number }[];
+  /** `activeThisWeek`: members with graded practice in the last 7 days. */
   totals: { members: number; activeThisWeek: number; minutesThisMonth: number; assignmentsOverdue: number; completionRate: number };
   atRisk: AtRiskItem[];
   /** `empty` when nobody in the team has any history yet (the UI shows an empty state). */
@@ -562,7 +602,10 @@ export interface MemberDetail {
   readiness: Partial<Record<FrameworkId, number>>;
   attempts: Attempt[];
   assignments: MyAssignment[];
+  /** Practice minutes this calendar month (UTC), as on the team dashboard. */
   minutesThisMonth: number;
+  /** Practice minutes in the last 7 days, as on the learner's own Home. */
+  minutesThisWeek: number;
 }
 
 /** `GET /reports/progress.csv?team=&from=&to=`: text/csv with these columns. */
@@ -579,7 +622,10 @@ export type ProgressCsvColumn =
   | 'progress'
   | 'best_score'
   | 'attempts'
-  | 'minutes';
+  /** Practice minutes (graded time) in the range; what the learner sees. */
+  | 'minutes'
+  /** Environment minutes (session lifetime) in the range; what quotas bill. */
+  | 'environment_minutes';
 
 /* ================================================================ cohorts + instructor */
 
@@ -627,6 +673,7 @@ export interface BoardSession {
   score: number;
   hintsUsed: number;
   validations: number;
+  /** Minutes since the live session started (environment time, for the live board; not practice minutes). */
   minutesOnTask: number;
   /** No new passing check for a while, repeated failing validates, or many hints. */
   stuck: boolean;
@@ -883,6 +930,7 @@ export type AuditAction =
   | 'auth.login'
   | 'auth.logout'
   | 'auth.login_denied'
+  | 'auth.dev_impersonate'
   | 'org.switch'
   | 'user.invite'
   | 'user.update'

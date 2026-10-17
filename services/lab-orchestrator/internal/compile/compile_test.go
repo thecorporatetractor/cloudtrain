@@ -108,7 +108,7 @@ func TestCompileValid(t *testing.T) {
 				if s.Setup[1].On != "orchard/orchard-w2" || s.Setup[1].TimeoutSec != 120 {
 					t.Errorf("setup[1] = %+v", s.Setup[1])
 				}
-				if s.Hints[0].Cost != 2 || s.Checks[0].TimeoutSec != DefaultCheckTimeoutSec {
+				if s.Hints[0].Cost != 2 || s.Checks[0].TimeoutSec != DefaultK8sCheckTimeoutSec {
 					t.Errorf("hint cost %d, check timeout %d", s.Hints[0].Cost, s.Checks[0].TimeoutSec)
 				}
 				if lt.Labels["labs.cloudtrain.dev/domain"] != "kubernetes" {
@@ -289,5 +289,21 @@ func TestShellCheckDefaultTimeout(t *testing.T) {
 	}
 	if got := lt.Spec.Checks[0].TimeoutSec; got != 8 {
 		t.Errorf("explicit timeout = %d", got)
+	}
+}
+
+func TestK8sCheckDefaultTimeout(t *testing.T) {
+	for _, typ := range []string{"k8s-query", "k8s-can-i", "k8s-context"} {
+		c := convertCheck(sourceCheck{ID: "q", Type: typ})
+		if c.TimeoutSec != DefaultK8sCheckTimeoutSec {
+			t.Errorf("%s default timeout = %d, want %d", typ, c.TimeoutSec, DefaultK8sCheckTimeoutSec)
+		}
+		eight := int32(8)
+		if c := convertCheck(sourceCheck{ID: "q", Type: typ, TimeoutSec: &eight}); c.TimeoutSec != 8 {
+			t.Errorf("%s explicit timeout = %d", typ, c.TimeoutSec)
+		}
+	}
+	if c := convertCheck(sourceCheck{ID: "f", Type: "file"}); c.TimeoutSec != DefaultCheckTimeoutSec {
+		t.Errorf("file default timeout = %d", c.TimeoutSec)
 	}
 }
