@@ -90,6 +90,7 @@ spec:
     - id: api-running
       description: A container named catalogue-api is running
       type: shell
+      timeoutSec: 60
       on: cl-catalogue-02
       skills: [containers.registry.references]
       weight: 1
@@ -98,6 +99,7 @@ spec:
     - id: approved-build
       description: catalogue-api serves the approved build
       type: shell
+      timeoutSec: 60
       on: cl-catalogue-02
       skills: [containers.registry.references]
       weight: 2
@@ -106,6 +108,7 @@ spec:
     - id: pinned-by-digest
       description: catalogue-api was started from an image reference pinned to the approved digest
       type: shell
+      timeoutSec: 60
       on: cl-catalogue-02
       skills: [containers.registry.references]
       weight: 2
@@ -116,6 +119,7 @@ spec:
     - id: digest-recorded
       description: ~/pinned-digest.txt holds the approved build's digest
       type: shell
+      timeoutSec: 60
       on: cl-catalogue-02
       skills: [containers.registry.references]
       weight: 1.5
@@ -126,8 +130,8 @@ spec:
       body: "The release note names a build number, and every push also got the tag `2.3-build.<number>`. That tag still points at the approved image."
       cost: 1
     - title: Getting a digest
-      body: "`docker buildx imagetools inspect <image>` prints the digest the registry stores for a tag without pulling. After a pull, `docker image inspect` shows it under `RepoDigests`."
-      command: docker buildx imagetools inspect registry.copperleaf.example:5000/catalogue-api:2.3
+      body: "After `docker pull`, `docker image inspect` shows the registry digest under `RepoDigests`. Without pulling, `skopeo inspect` (add `--tls-verify=false` for this plain-HTTP registry) or the registry API's `Docker-Content-Digest` header give it too."
+      command: docker pull registry.copperleaf.example:5000/catalogue-api:2.3
       cost: 2
     - title: Running by digest
       body: "Any image reference can end in `@sha256:<digest>` instead of `:<tag>`: `docker run -d --name catalogue-api <registry>/<repo>@sha256:...`."
@@ -152,32 +156,34 @@ spec:
         as: learner
         run: |
           docker run -d --name catalogue-api registry.copperleaf.example:5000/catalogue-api:2.3-build.{{good}}
-          docker buildx imagetools inspect registry.copperleaf.example:5000/catalogue-api:2.3-build.{{good}} --format '{{json .Manifest}}' | jq -r .digest > ~/pinned-digest.txt
+          docker pull -q registry.copperleaf.example:5000/catalogue-api:2.3-build.{{good}} >/dev/null
+          docker image inspect registry.copperleaf.example:5000/catalogue-api:2.3-build.{{good}} | jq -r '.[0].RepoDigests[0]' | sed 's/.*@//' > ~/pinned-digest.txt
   solution:
     explanation: |
-      The build tag `2.3-build.{{good}}` still names the approved image; ask the
-      registry for its digest and run the container with `repo@sha256:...`. A digest
+      The build tag `2.3-build.{{good}}` still names the approved image; pull it and
+      read its registry digest and run the container with `repo@sha256:...`. A digest
       identifies exactly one manifest, so re-pushing a tag cannot change it.
     steps:
       - on: cl-catalogue-02
         as: learner
         run: |
           R=registry.copperleaf.example:5000/catalogue-api
-          d=$(docker buildx imagetools inspect "$R:2.3-build.{{good}}" --format '{{json .Manifest}}' | jq -r .digest)
-          echo "$d" > ~/pinned-digest.txt
-          docker run -d --name catalogue-api "$R@$d"
+          docker pull -q "$R:2.3-build.{{good}}"
+          ref=$(docker image inspect "$R:2.3-build.{{good}}" | jq -r '.[0].RepoDigests[0]')
+          echo "${ref#*@}" > ~/pinned-digest.txt
+          docker run -d --name catalogue-api "$ref"
     alternatives:
-      - id: pull-then-repodigests
-        description: Pull the build tag, read RepoDigests, then run by digest.
+      - id: skopeo-inspect
+        description: Read the digest with skopeo without pulling, then run by digest.
         steps:
           - on: cl-catalogue-02
             as: learner
             run: |
               R=registry.copperleaf.example:5000/catalogue-api
-              docker pull -q "$R:2.3-build.{{good}}"
-              ref=$(docker image inspect "$R:2.3-build.{{good}}" | jq -r '.[0].RepoDigests[0]')
-              echo "${ref#*@}" > ~/pinned-digest.txt
-              docker run -d --name catalogue-api "$ref"
+              # --raw: the top-level manifest (an index here); its sha256 is the digest the tag points at
+              d=sha256:$(skopeo inspect --raw --tls-verify=false "docker://$R:2.3-build.{{good}}" | sha256sum | cut -d' ' -f1)
+              echo "$d" > ~/pinned-digest.txt
+              docker run -d --name catalogue-api "$R@$d"
       - id: registry-api
         description: Ask the registry HTTP API for the Docker-Content-Digest header.
         steps:
