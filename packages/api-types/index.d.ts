@@ -213,8 +213,13 @@ export interface GoalDomain {
 export interface GoalForecast {
   frameworkId: FrameworkId;
   targetDate: string;
-  /** `assignment`: due date of an assigned framework goal; `default`: placeholder (no date chosen yet). */
-  targetDateSource?: 'assignment' | 'default';
+  /**
+   * `learner`: the learner's own exam date (`PUT /me/goals`); `assignment`:
+   * due date of an assigned framework goal; `default`: placeholder (no date chosen yet).
+   */
+  targetDateSource?: 'learner' | 'assignment' | 'default';
+  /** The learner's own weekly practice target in minutes (`PUT /me/goals`), when set. */
+  weeklyTargetMinutes?: number;
   readiness: number; // 0..1
   /** Readiness at which the plan counts the learner as exam-ready (0..1). */
   readyAt?: number;

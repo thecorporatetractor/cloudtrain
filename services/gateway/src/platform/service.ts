@@ -8,6 +8,7 @@ import type {
   AssignmentTarget,
   HomeData,
   LabSession as WebSession,
+  LearnerGoals,
   LabSummary,
   Me,
   MyAssignment,
@@ -15,6 +16,7 @@ import type {
   Quotas,
   SessionNotice,
   SkillState,
+  UpdateLearnerGoalsRequest,
   UserRef,
   ValidateResponse,
 } from '@cloudtrain/api-types';
@@ -27,7 +29,8 @@ import { HttpError, notFound } from '../errors.js';
 import type { LabCluster } from '../kube/cluster.js';
 import { LABEL_MANAGED_BY, LABEL_ORG, MANAGED_BY, type LabSession } from '../kube/types.js';
 import type { KeycloakAdmin } from '../keycloak/admin.js';
-import { buildHome, minutesSince, skillStates, streakDays, type AttemptLite } from '../learner/home.js';
+import { readGoals, writeGoals } from '../learner/goals.js';
+import { buildHome, minutesSince, practiceSeconds, skillStates, streakDays, type AttemptLite } from '../learner/home.js';
 import { endAttempt, recordRun, startAttempt } from '../learner/learning.js';
 import type { Mailer } from '../mail.js';
 import type { SessionStore } from '../oidc/sessions.js';
@@ -376,14 +379,35 @@ export class PlatformService implements SessionHooks {
   /* ------------------------------------------------------------ learner */
 
   async attemptsLite(tx: Tx, userId: string, days: number): Promise<AttemptLite[]> {
-    return tx
+    return (await this.attemptsLiteOf(tx, [userId], new Date(this.now().getTime() - days * DAY))).map(({ user_id: _u, ...a }) => a);
+  }
+
+  /**
+   * Attempts of `userIds` started in [since, until], newest first, with the time
+   * of their last graded run: what practiceSeconds() needs. Every view that
+   * shows practice minutes (Home, team dashboard, member page, progress CSV)
+   * reads attempts through here.
+   */
+  async attemptsLiteOf(tx: Tx, userIds: string[], since: Date, until?: Date): Promise<(AttemptLite & { user_id: string })[]> {
+    if (!userIds.length) return [];
+    let q = tx
       .selectFrom('lab_attempts as a')
-      .select(['a.id', 'a.lab_id', 'a.started_at', 'a.ended_at', 'a.outcome', 'a.score', 'a.hints_used', 'a.duration_s', 'a.session_name', 'a.validations', 'a.checks_passed', 'a.checks_total'])
+      .select(['a.id', 'a.user_id', 'a.lab_id', 'a.started_at', 'a.ended_at', 'a.outcome', 'a.score', 'a.hints_used', 'a.duration_s', 'a.session_name', 'a.validations', 'a.checks_passed', 'a.checks_total'])
       .select((eb) => eb.selectFrom('check_results as c').select((e) => e.fn.max('c.graded_at').as('m')).whereRef('c.attempt_id', '=', 'a.id').as('last_run_at'))
-      .where('a.user_id', '=', userId)
-      .where('a.started_at', '>', new Date(this.now().getTime() - days * DAY))
-      .orderBy('a.started_at', 'desc')
-      .execute() as Promise<AttemptLite[]>;
+      .where('a.user_id', 'in', userIds)
+      .where('a.started_at', '>=', since);
+    if (until) q = q.where('a.started_at', '<=', until);
+    return q.orderBy('a.started_at', 'desc').execute() as Promise<(AttemptLite & { user_id: string })[]>;
+  }
+
+  /* ------------------------------------------------------------- goals */
+
+  goals(p: Principal): Promise<LearnerGoals> {
+    return this.tx(p, (tx) => readGoals(tx, p.sub));
+  }
+
+  setGoals(p: Principal, req: UpdateLearnerGoalsRequest): Promise<LearnerGoals> {
+    return this.tx(p, (tx) => writeGoals(tx, p.orgId, p.sub, req ?? {}, this.now()));
   }
 
   async states(tx: Tx, userId: string) {
@@ -395,9 +419,9 @@ export class PlatformService implements SessionHooks {
     return this.tx(p, async (tx) => {
       const v = await this.visibility(tx);
       const labs = this.content.summaries.filter((l) => this.labVisible(v, l.id));
-      const [states, attempts, assignments] = await Promise.all([this.states(tx, p.sub), this.attemptsLite(tx, p.sub, 120), this.myAssignmentsTx(tx, p.sub)]);
+      const [states, attempts, assignments, goals] = await Promise.all([this.states(tx, p.sub), this.attemptsLite(tx, p.sub, 120), this.myAssignmentsTx(tx, p.sub), readGoals(tx, p.sub)]);
       const { user: _u, activeOrg: _o, memberships: _m, roles: _r, permissions: _p, grants: _g, teams: _t, managedTeams: _mt, instructedCohorts: _ic, cohorts: _c, platformAdmin: _pa, csrfToken: _cs, auth: _a, ...learner } = me;
-      return buildHome({ learner, content: this.content, labs, states, attempts, assignments, pinnedPathIds: v.pinnedPaths, now: this.now() });
+      return buildHome({ learner, content: this.content, labs, states, attempts, assignments, pinnedPathIds: v.pinnedPaths, goals, now: this.now() });
     });
   }
 
@@ -504,7 +528,8 @@ export class PlatformService implements SessionHooks {
     return this.tx(p, (tx) => this.myAssignmentsTx(tx, p.sub));
   }
 
-  toAttempt(r: AttemptRow): Attempt {
+  /** `last_run_at`: time of the attempt's last graded run (max check_results.graded_at), for practiceS. */
+  toAttempt(r: AttemptRow & { last_run_at: Date | null }): Attempt {
     return {
       id: r.id,
       labId: r.lab_id,
@@ -518,6 +543,7 @@ export class PlatformService implements SessionHooks {
       hintsUsed: r.hints_used,
       validations: r.validations,
       durationS: r.ended_at ? r.duration_s : Math.max(r.duration_s, Math.round((this.now().getTime() - r.started_at.getTime()) / 1000)),
+      practiceS: practiceSeconds(r),
       checksPassed: r.checks_passed,
       checksTotal: r.checks_total,
     };
@@ -526,7 +552,11 @@ export class PlatformService implements SessionHooks {
   async attemptsPage(tx: Tx, userId: string, q: AttemptQuery): Promise<Page<Attempt>> {
     const limit = pageLimit(q.limit);
     const cur = decodeCursor<[string, string]>(q.cursor);
-    let query = tx.selectFrom('lab_attempts').selectAll().where('user_id', '=', userId);
+    let query = tx
+      .selectFrom('lab_attempts')
+      .selectAll('lab_attempts')
+      .select((eb) => eb.selectFrom('check_results as c').select((e) => e.fn.max('c.graded_at').as('m')).whereRef('c.attempt_id', '=', 'lab_attempts.id').as('last_run_at'))
+      .where('user_id', '=', userId);
     if (q.lab) query = query.where('lab_id', '=', q.lab);
     if (q.outcome) query = query.where('outcome', '=', q.outcome);
     if (q.from) query = query.where('started_at', '>=', new Date(q.from));
@@ -552,7 +582,8 @@ export class PlatformService implements SessionHooks {
       const rec = history.map((c) => ({ checkId: c.check_id, passed: c.passed, weight: c.weight, skills: c.skills, run: c.run, gradedAt: c.graded_at.toISOString(), ...(c.message ? { message: c.message } : {}) }));
       const latest = new Map<string, (typeof rec)[number]>();
       for (const c of rec) latest.set(c.checkId, c);
-      return { ...this.toAttempt(r), user: u ? userRef(u) : UNKNOWN_USER, checks: [...latest.values()], history: rec };
+      const lastRun = history.reduce<Date | null>((a, c) => (!a || c.graded_at > a ? c.graded_at : a), null);
+      return { ...this.toAttempt({ ...r, last_run_at: lastRun }), user: u ? userRef(u) : UNKNOWN_USER, checks: [...latest.values()], history: rec };
     });
   }
 

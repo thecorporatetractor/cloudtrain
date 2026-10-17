@@ -16,6 +16,7 @@ import type {
   InviteUserRequest,
   Permission,
   UpdateCohortRequest,
+  UpdateLearnerGoalsRequest,
   UpdateContentVisibilityRequest,
   UpdateOrgSettingsRequest,
   UpdatePlatformOrgRequest,
@@ -51,6 +52,8 @@ const csv = (reply: FastifyReply, name: string, body: string) => reply.header('c
 
 export function registerPlatformRoutes(app: FastifyInstance, ps: PlatformService, sessions: SessionService, clusterInfo: ClusterInfo | null): void {
   /* --------------------------------------------------------------- learner */
+  app.get('/api/me/goals', perm('progress.read.self'), async (req) => ps.goals(req.principal));
+  app.put<{ Body: UpdateLearnerGoalsRequest }>('/api/me/goals', perm('progress.read.self'), async (req) => ps.setGoals(req.principal, req.body));
   app.get('/api/assignments/mine', perm('progress.read.self'), async (req) => ps.myAssignments(req.principal));
   app.get<{ Querystring: AttemptQuery }>('/api/attempts/mine', perm('progress.read.self'), async (req) => ps.myAttempts(req.principal, req.query));
   app.get<{ Params: { id: string } }>('/api/attempts/:id', perm('progress.read.self'), async (req) => ps.attemptDetail(req.principal, req.params.id));
