@@ -10,6 +10,7 @@ import { Disclaimer, ExamTimer, PhaseBadge, useServerClock } from '@/components/
 import { Prose } from '@/components/prose';
 import { Badge, Button, Dialog, ErrorState, Meter, Skeleton, Tooltip } from '@/components/ui';
 import { examAttemptRoute } from '@/router';
+import { useMediaQuery } from '@/lib/media';
 import { cn } from '@/lib/utils';
 import { RequireAccess } from '@/app/access';
 
@@ -171,6 +172,8 @@ function ExamWorkspaceScreen() {
   const [current, setCurrent] = useState(1);
   const [confirm, setConfirm] = useState(false);
   const autoSubmitted = useRef(false);
+  // Phones: the task sits above the terminal instead of beside it.
+  const stacked = useMediaQuery('(max-width: 640px)');
 
   const a = attempt.data;
   const timeUp = !!a?.deadline && a.phase === 'in-progress' && now >= Date.parse(a.deadline);
@@ -315,7 +318,7 @@ function ExamWorkspaceScreen() {
       {header}
       <Navigator tasks={a.tasks} current={task?.index ?? 1} visited={visited} onSelect={setCurrent} />
       <div className="exam-ws-body">
-        <PersistedGroup orientation="horizontal" storageId="ct.exam.h">
+        <PersistedGroup key={String(stacked)} orientation={stacked ? 'vertical' : 'horizontal'} storageId={stacked ? 'ct.exam.stacked' : 'ct.exam.h'}>
           <Panel id="task" minSize="22%" defaultSize="34%" maxSize="55%">
             {task && (
               <TaskPane
@@ -328,7 +331,7 @@ function ExamWorkspaceScreen() {
               />
             )}
           </Panel>
-          <Separator className="splitter splitter-v" />
+          <Separator className={cn('splitter', stacked ? 'splitter-h' : 'splitter-v')} />
           <Panel id="terminals" minSize="35%" style={{ position: 'relative' }}>
             <Terminals attempt={a} closed={closed} />
             {timeUp && (

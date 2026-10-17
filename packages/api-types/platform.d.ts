@@ -673,6 +673,7 @@ export interface BoardSession {
   score: number;
   hintsUsed: number;
   validations: number;
+  /** Minutes since the live session started (environment time, for the live board; not practice minutes). */
   minutesOnTask: number;
   /** No new passing check for a while, repeated failing validates, or many hints. */
   stuck: boolean;

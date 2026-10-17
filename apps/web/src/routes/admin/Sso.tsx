@@ -38,7 +38,7 @@ function Screen() {
 
   return (
     <div className="stack" style={{ gap: 20 }}>
-      <div className="grid-2" style={{ gridTemplateColumns: 'minmax(0, 7fr) minmax(0, 5fr)', gap: 20, alignItems: 'start' }}>
+      <div className="split split-7-5" style={{ alignItems: 'start' }}>
         <Card className="card-flush">
           <div className="card-head">
             <h2 className="row" style={{ gap: 8 }}>

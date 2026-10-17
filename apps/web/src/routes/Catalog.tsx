@@ -124,9 +124,9 @@ export function Catalog() {
                     <span>
                       {p.labIds.length} labs · {formatMinutes(p.estimatedMinutes)}
                     </span>
-                    <span className="tnum">{Math.round(p.progress * 100)}%</span>
+                    <span className="tnum">{progressLabel(p.progress)}</span>
                   </div>
-                  <Bar value={p.progress} thin tone={p.progress === 1 ? 'ok' : 'accent'} />
+                  <Bar value={p.progress} thin tone={p.progress === 1 ? 'ok' : p.progress === 0 ? 'neutral' : 'accent'} />
                 </div>
               </button>
             ))}
@@ -176,11 +176,11 @@ export function Catalog() {
               <div className="row xs subtle" style={{ gap: 12 }}>
                 <span>{activePath.labIds.length} labs</span>
                 <span>{formatMinutes(activePath.estimatedMinutes)}</span>
-                <span>{Math.round(activePath.progress * 100)}% complete</span>
+                <span>{progressLabel(activePath.progress, true)}</span>
               </div>
             </div>
-            <div style={{ width: 160 }}>
-              <Bar value={activePath.progress} />
+            <div className="path-banner-bar">
+              <Bar value={activePath.progress} tone={activePath.progress === 0 ? 'neutral' : 'accent'} />
             </div>
           </Card>
         )}
@@ -222,4 +222,11 @@ export function Catalog() {
 
 function clean<T extends object>(o: T): T {
   return Object.fromEntries(Object.entries(o).filter(([, v]) => v !== undefined && v !== '')) as T;
+}
+
+/** A path nobody has started is "not started", not "0%". */
+function progressLabel(progress: number, long = false): string {
+  if (progress <= 0) return 'not started';
+  if (progress >= 1) return 'done';
+  return `${Math.round(progress * 100)}%${long ? ' complete' : ''}`;
 }

@@ -79,7 +79,7 @@ export function LabOverview() {
         </div>
       </header>
 
-      <div className="grid-home" style={{ gridTemplateColumns: 'minmax(0, 8fr) minmax(0, 4fr)' }}>
+      <div className="split split-8-4">
         <div className="stack" style={{ gap: 20 }}>
           <Card>
             <h2 style={{ marginBottom: 12 }}>Scenario</h2>

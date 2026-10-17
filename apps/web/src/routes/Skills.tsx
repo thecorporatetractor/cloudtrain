@@ -40,6 +40,9 @@ export function Skills() {
   }
 
   const member = data.member;
+  const assessed = !!summary && summary.practised > 0;
+  // The practised skill with the least evidence (widest estimate); never a skill without results.
+  const thinnest = summary?.perDomain.flatMap((d) => d.states).filter((st) => st.evidence > 0).sort((a, b) => b.sigma - a.sigma)[0];
   const selected = search.skill ? skillOf.get(search.skill) : undefined;
   const selectedState = search.skill ? stateOf.get(search.skill) : undefined;
   const select = (id?: string) => void navigate({ search: (prev) => ({ ...prev, skill: id === prev.skill ? undefined : id }), replace: true });
@@ -56,7 +59,7 @@ export function Skills() {
           <div className="page-eyebrow">{member ? `Skills · ${member.name}` : 'Skills'}</div>
           <h1>{framework?.fullName}</h1>
           <p className="muted">
-            {member ? `${member.name} (${member.title}): per-skill` : 'Per-skill'} mastery estimate (μ) with uncertainty (σ). Darker is stronger; a dashed ring means the estimate is still uncertain.
+            {member ? `${member.name} (${member.title}): how well they know` : 'How well you know'} each skill, estimated from graded lab results. Darker is stronger; a dashed outline means there is little evidence yet.
           </p>
         </div>
         <Segmented<FrameworkId> label="Framework" value={search.framework} onChange={(v) => void navigate({ search: (prev) => ({ framework: v, ...(prev.member ? { member: prev.member } : {}) }) })} options={data.frameworks.map((f) => ({ value: f.id, label: f.name, title: f.fullName }))} />
@@ -65,29 +68,29 @@ export function Skills() {
       {framework && summary && (
         <div className="skills-layout">
           <div className="stack" style={{ gap: 20, minWidth: 0 }}>
-            <Card className="row" style={{ gap: 40, padding: '18px 24px' }}>
+            <Card className="skills-summary">
               <div className="row" style={{ gap: 14 }}>
-                <Ring value={summary.readiness} size={52} stroke={5} label="Weighted readiness">
+                <Ring value={assessed ? summary.readiness : 0} size={52} stroke={5} label="Readiness" tone={assessed ? 'accent' : 'neutral'}>
                   <span className="ring-value" style={{ fontSize: 11 }}>
-                    {pct(summary.readiness)}
+                    {assessed ? pct(summary.readiness) : '–'}
                   </span>
                 </Ring>
-                <Stat label="Weighted readiness" value={pct(summary.readiness)} hint="exam-weight × mean μ" />
+                <Stat label="Readiness" value={assessed ? pct(summary.readiness) : 'Not assessed'} hint={assessed ? 'weighted by exam domain' : 'starts with the first validated lab'} />
               </div>
-              <Stat label="Skills practised" value={`${summary.practised} / ${summary.total}`} hint={`${summary.total - summary.practised} with no evidence`} />
-              <Stat label="Most uncertain" value={<span className="stat-value-sm">{summary.maxSigma ? (skillOf.get(summary.maxSigma.skillId)?.name ?? '—') : '—'}</span>} hint={summary.maxSigma ? `σ ${summary.maxSigma.sigma.toFixed(2)} · one lab would sharpen it` : undefined} />
+              <Stat label="Skills practised" value={`${summary.practised} / ${summary.total}`} hint={summary.practised ? `${summary.total - summary.practised} with no results yet` : 'no results yet'} />
+              {assessed && thinnest && <Stat label="Least evidence" value={<span className="stat-value-sm">{skillOf.get(thinnest.skillId)?.name ?? '—'}</span>} hint="one lab would firm it up" />}
               <div className="grow" />
               <div className="heat-legend" aria-hidden>
-                <span className="xs subtle">0</span>
+                <span className="xs subtle">weaker</span>
                 {[0.1, 0.3, 0.5, 0.7, 0.9].map((v) => (
                   <HeatCell key={v} value={v} className="heat-legend-cell" />
                 ))}
-                <span className="xs subtle">1</span>
+                <span className="xs subtle">stronger</span>
                 <span className="xs subtle" style={{ marginLeft: 10 }}>
                   <span className="heat heat-legend-cell" style={{ display: 'inline-grid', verticalAlign: 'middle' }}>
                     <span className="heat-uncertain" />
                   </span>{' '}
-                  uncertain
+                  little evidence
                 </span>
               </div>
             </Card>
@@ -96,7 +99,8 @@ export function Skills() {
               {/* Rows of buttons grouped by exam domain; not an ARIA grid, since there is no 2-D keyboard navigation. */}
               <div className="heatmap" aria-label={`${framework.name} skill heatmap`}>
                 {framework.domains.map((d) => {
-                  const { mean } = domainReadiness(d, stateOf);
+                  const { mean, states } = domainReadiness(d, stateOf);
+                  const seen = states.some((st) => st.evidence > 0);
                   const headId = `heat-${d.id.replace(/[^a-z0-9]/gi, '-')}`;
                   return (
                     <div key={d.id} className="heat-row" role="group" aria-labelledby={headId}>
@@ -106,7 +110,7 @@ export function Skills() {
                         </div>
                         <div className="xs subtle row" style={{ gap: 8 }}>
                           <span>{Math.round(d.weight * 100)}% of exam</span>
-                          <span className="tnum">μ {mean.toFixed(2)}</span>
+                          <span className="tnum">{seen ? pct(mean) : 'no data yet'}</span>
                         </div>
                       </div>
                       <div className="heat-cells">
@@ -115,9 +119,9 @@ export function Skills() {
                           const st = stateOf.get(id);
                           if (!sk || !st) return null;
                           return (
-                            <HeatCell key={id} value={st.mu} sigma={st.sigma} onClick={() => select(id)} selected={search.skill === id} aria-label={`${sk.name}: mastery ${pct(st.mu)}, uncertainty ${st.sigma.toFixed(2)}`} title={`${sk.name} · μ ${st.mu.toFixed(2)} σ ${st.sigma.toFixed(2)}`}>
+                            <HeatCell key={id} value={st.evidence ? st.mu : 0} sigma={st.sigma} onClick={() => select(id)} selected={search.skill === id} aria-label={`${sk.name}: ${skillLabel(st)}`} title={`${sk.name} · ${skillLabel(st)}`}>
                               <span className="heat-name">{sk.name}</span>
-                              <span className="heat-mu tnum">{st.evidence ? st.mu.toFixed(2) : '·'}</span>
+                              <span className="heat-mu tnum">{st.evidence ? pct(st.mu) : '–'}</span>
                             </HeatCell>
                           );
                         })}
@@ -142,8 +146,8 @@ export function Skills() {
                 <h3>How estimates work</h3>
               </div>
               <div className="card-body stack small muted" style={{ gap: 8 }}>
-                <p>Each graded check is evidence for its tagged skills. Mastery μ moves like a rating; σ shrinks with evidence and grows with time since practice.</p>
-                <p>Recommendations prefer labs where you are 60–80% likely to succeed and where σ is high, because those attempts teach the model (and you) the most.</p>
+                <p>Each graded check (Validate) is evidence for the skills it tests. Passes on harder labs count more, hints a little less, and an estimate becomes less certain without practice.</p>
+                <p>A skill with no results yet shows no number: it is not a 0. Recommendations prefer labs you are likely, but not certain, to pass, and skills with little evidence, because those attempts tell you the most.</p>
               </div>
             </Card>
           </aside>
@@ -162,24 +166,22 @@ function SkillDetail({ skill, state, labs }: { skill: Skill; state: SkillState; 
         <div className="stack" style={{ gap: 2 }}>
           <div className="xs subtle">{skill.competency}</div>
           <h3>{skill.name}</h3>
-          <div className="xs subtle mono">{skill.id}</div>
         </div>
-        <Badge tone={state.trend === 'down' ? 'warn' : state.trend === 'up' ? 'ok' : 'neutral'}>
-          {trendIcon} {trendLabel}
-        </Badge>
+        {state.evidence > 0 && (
+          <Badge tone={state.trend === 'down' ? 'warn' : state.trend === 'up' ? 'ok' : 'neutral'}>
+            {trendIcon} {trendLabel}
+          </Badge>
+        )}
       </div>
       <div className="card-body stack" style={{ gap: 18 }}>
         <div className="row" style={{ gap: 16 }}>
-          <Ring value={state.mu} size={68} stroke={6} label="Mastery">
-            <span className="ring-value">{state.mu.toFixed(2)}</span>
+          <Ring value={state.evidence ? state.mu : 0} size={68} stroke={6} label="Mastery" tone={state.evidence ? 'accent' : 'neutral'}>
+            <span className="ring-value">{state.evidence ? pct(state.mu) : '–'}</span>
           </Ring>
           <div className="stack grow" style={{ gap: 10 }}>
             <div className="row-between small">
-              <span className="muted">Uncertainty σ</span>
-              <span className="tnum">{state.sigma.toFixed(2)}</span>
-            </div>
-            <div className="meter meter-thin">
-              <div className="meter-fill meter-neutral" style={{ width: `${Math.min(1, state.sigma / 0.5) * 100}%` }} />
+              <span className="muted">Confidence</span>
+              <span>{confidenceOf(state)}</span>
             </div>
             <div className="row-between small">
               <span className="muted">Evidence</span>
@@ -192,8 +194,9 @@ function SkillDetail({ skill, state, labs }: { skill: Skill; state: SkillState; 
           </div>
         </div>
         <div className="small muted">
-          Credible range {Math.max(0, state.mu - state.sigma).toFixed(2)} – {Math.min(1, state.mu + state.sigma).toFixed(2)}.{' '}
-          {state.sigma > 0.3 ? 'Too uncertain to count toward readiness; one attempt would move this a lot.' : state.sigma > 0.18 ? 'Moderately certain; a review attempt would tighten it.' : 'Well established.'}
+          {state.evidence === 0
+            ? 'No results for this skill yet, so there is no estimate. A lab below shows where you stand.'
+            : `Likely between ${pct(Math.max(0, state.mu - state.sigma))} and ${pct(Math.min(1, state.mu + state.sigma))}. ${state.sigma > 0.3 ? 'Still uncertain; one more attempt would move this a lot.' : state.sigma > 0.18 ? 'Fairly certain; a review attempt would firm it up.' : 'Well established.'}`}
         </div>
         <div>
           <div className="xs subtle" style={{ marginBottom: 8, textTransform: 'uppercase', letterSpacing: '0.06em' }}>
@@ -219,4 +222,14 @@ function SkillDetail({ skill, state, labs }: { skill: Skill; state: SkillState; 
       </div>
     </Card>
   );
+}
+
+/** Words, not the model's numbers. */
+function confidenceOf(st: SkillState): string {
+  if (!st.evidence) return 'no data yet';
+  return st.sigma > 0.3 ? 'low' : st.sigma > 0.18 ? 'medium' : 'high';
+}
+
+function skillLabel(st: SkillState): string {
+  return st.evidence ? `${pct(st.mu)} mastery, ${confidenceOf(st)} confidence` : 'no data yet';
 }

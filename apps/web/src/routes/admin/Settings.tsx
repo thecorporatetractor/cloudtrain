@@ -41,8 +41,8 @@ function Screen() {
 
   return (
     <form
-      className="grid-2"
-      style={{ gridTemplateColumns: 'minmax(0, 7fr) minmax(0, 5fr)', gap: 20, alignItems: 'start' }}
+      className="split split-7-5"
+      style={{ alignItems: 'start' }}
       onSubmit={(e) => {
         e.preventDefault();
         update.mutate({ name: name.trim(), settings: { defaultSessionMinutes: minutes, timezone: tz, allowLocalLogin: local, logoUrl: logo || undefined } }, { onSuccess: () => toast({ title: 'Settings saved', tone: 'ok' }), onError: (err) => toast({ title: 'Could not save', description: err.message, tone: 'err' }) });

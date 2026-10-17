@@ -14,6 +14,7 @@ import { TerminalArea, focusActiveTerminal, useTerminalModel } from '@/component
 import { Timer } from '@/components/workspace/Timer';
 import { TopologyCanvas } from '@/components/workspace/Topology';
 import { useHotkeys } from '@/lib/hotkeys';
+import { useMediaQuery } from '@/lib/media';
 import { personalize } from '@/lib/personalize';
 import { cn } from '@/lib/utils';
 import { workspaceRoute } from '@/router';
@@ -237,6 +238,7 @@ export function Workspace() {
     { keys: 'escape', description: 'Exit full-screen', group: 'Lab', handler: () => chromeless && setChromeless(false) },
   ]);
   useScreenShortcuts(WORKSPACE_SHORTCUTS);
+  const stacked = useMediaQuery('(max-width: 640px)');
 
   if (lab.isPending) {
     return (
@@ -430,9 +432,10 @@ export function Workspace() {
       )}
 
       <div className="ws-body">
-        <PersistedGroup key={layout.taskSide} orientation="horizontal" storageId={`ct.ws.h.${layout.taskSide}`}>
+        {/* Phones: the task sits above the topology and terminals instead of beside them. */}
+        <PersistedGroup key={`${layout.taskSide}-${stacked}`} orientation={stacked ? 'vertical' : 'horizontal'} storageId={stacked ? 'ct.ws.stacked' : `ct.ws.h.${layout.taskSide}`}>
           {layout.taskSide === 'left' && taskPanel}
-          {layout.taskSide === 'left' && <Separator className="splitter splitter-v" />}
+          {layout.taskSide === 'left' && <Separator className={cn('splitter', stacked ? 'splitter-h' : 'splitter-v')} />}
           <Panel id="main" minSize="40%">
             <PersistedGroup orientation="vertical" storageId="ct.ws.v" onLayoutChange={onVerticalLayout}>
               <Panel id="topo" panelRef={topoRef} collapsible collapsedSize="0%" minSize="15%" defaultSize="30%" maxSize="60%" className="ws-topo-panel">
@@ -460,7 +463,7 @@ export function Workspace() {
               </Panel>
             </PersistedGroup>
           </Panel>
-          {layout.taskSide === 'right' && <Separator className="splitter splitter-v" />}
+          {layout.taskSide === 'right' && <Separator className={cn('splitter', stacked ? 'splitter-h' : 'splitter-v')} />}
           {layout.taskSide === 'right' && taskPanel}
         </PersistedGroup>
       </div>
