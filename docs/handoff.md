@@ -142,9 +142,20 @@ those domains.
 
 ## Open decisions (user)
 
-- Curriculum rework questions: drop the legacy Docker-cert overlay path? "Docker" in
-  the Docker exam title? Add a professional-level Terraform simulation? External
-  customers get OpenTofu until IBM confirms Terraform hosting in writing — correct?
+- Decided 2026-10-17 (user: "as you advise"):
+  - The legacy Docker-cert (`dca-legacy`) overlay path stays dropped; its domains remain lab tags only.
+  - The containers exam keeps its neutral title ("Container practitioner practical exam
+    simulation"), with Docker named in the description.
+  - The scaled-down sizes in `ctr-disk-reclaim` (350-450 MiB) and
+    `ctr-dockerfile-catalogue-api` (200 MiB of media) are accepted.
+  - External customers get the OpenTofu workstation (`deploy/images/overlays/iac-opentofu.yaml`)
+    until IBM confirms Terraform hosting in writing.
+  - Public CI publishes only `iac-ws-tofu` to GHCR. The Terraform flavour is local only.
+  - OpenTofu images keep the `terraform` -> `tofu` shim, so lab instructions don't fork.
+  - The move to Terraform 1.16 / OpenTofu 1.13 is deferred to a later round (rebuild plus
+    re-verify of 48 labs).
+- Still open: add a professional-level Terraform simulation?
+- Cisco FMC/FTD lab: waiting for Cisco's written answer on evaluation licensing before any work.
 - Product names in lab titles (Kubernetes, Podman, OpenTofu, Ansible): keep or drop?
 - Cisco IOS labs: CML Enterprise as a backend, or open NOS only.
 - AI data policy for terminal traces (tutor, Studio).
