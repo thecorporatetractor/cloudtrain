@@ -254,7 +254,9 @@ visible. `app.platform = on` is set only on platform-admin code paths. Lookups
 that precede org selection (domain/IdP routing, memberships, invitation links,
 background sweeps) are narrow `SECURITY DEFINER` functions. `audit_log` is
 append-only for the app role (SELECT + INSERT). `assignment_status` is a
-`security_invoker` view.
+`security_invoker` view. `learner_goals` (migration `0004_learner_goals`,
+additive and idempotent) holds each learner's exam date and weekly target per
+org (`GET/PUT /api/me/goals`).
 
 ## Learner model
 

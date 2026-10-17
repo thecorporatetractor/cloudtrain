@@ -42,7 +42,9 @@ Types: [`packages/api-types/platform.d.ts`](../../packages/api-types/platform.d.
 
 | Method + path | Request | Response | Permission |
 |---|---|---|---|
-| `GET /home` | | `HomeData` (+ `assignmentsDue`, `source`) | `progress.read.self` |
+| `GET /home` | | `HomeData` (+ `assignmentsDue`, `source`; `goal` uses the learner's own date and weekly target when set) | `progress.read.self` |
+| `GET /me/goals` | | `LearnerGoals` (nulls when not set) | `progress.read.self` |
+| `PUT /me/goals` | `UpdateLearnerGoalsRequest` (left out = unchanged, null = clear; `source: 'browser'` = one-time import of the old localStorage goals, fills unset fields only) | `LearnerGoals`; `422` on an invalid or past date or a weekly target outside 5-3000 min | `progress.read.self` |
 | `GET /catalog` | | `{ domains, paths, labs }`, filtered by content visibility | `lab.run` |
 | `GET /labs/:id` | | `Lab` (404 when hidden for the org) | `lab.run` |
 | `GET /skills[?member=]` | | `{ skills, states, frameworks, member? }` (`member` needs `progress.read.team` for that user) | `progress.read.self` |
@@ -64,7 +66,14 @@ Types: [`packages/api-types/platform.d.ts`](../../packages/api-types/platform.d.
 | `GET /assignments/:id` | | `AssignmentDetail` | `assignment.manage` @ target | |
 | `POST /assignments` | `CreateAssignmentRequest` | `201 CreateAssignmentResponse` | `assignment.manage` @ every target (user target: a team the caller manages contains the user) | `assignment.create` |
 | `DELETE /assignments/:id` | | 204 | `assignment.manage` @ target | `assignment.delete` |
-| `GET /reports/progress.csv?team=&from=&to=` | | `text/csv` (`ProgressCsvColumn`) | `report.export` @ team | `report.export` |
+| `GET /reports/progress.csv?team=&from=&to=` | | `text/csv` (`ProgressCsvColumn`: `minutes` = practice time, `environment_minutes` = session lifetime) | `report.export` @ team | `report.export` |
+
+Minutes: every view a person reads (Home, `Attempt.practiceS`, the team
+dashboard, the member page, the progress CSV `minutes`) counts practice time:
+attempts with a graded run, from the start of the attempt to its last
+Validate. Environment time (`Attempt.durationS`, `environment_minutes`, admin
+usage and quotas, platform lab hours) is how long sessions ran and is what
+quotas bill.
 
 ## Instructor
 
