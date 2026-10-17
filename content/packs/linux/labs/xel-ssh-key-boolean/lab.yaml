@@ -1,0 +1,109 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xel-ssh-key-boolean
+  title: Set up key login and a persistent SELinux boolean
+  domain: linux
+  frameworks: [rhcsa-aligned:security]
+  difficulty: medium
+  estimatedMinutes: 8
+  tags: [exam, ssh, selinux]
+  version: 1
+spec:
+  description: |
+    **Hosts:** node 1 `tr-el-01`, node 2 `tr-el-02`
+
+    1. The user **`{{user}}`** exists on both nodes. Make it possible for `{{user}}` on
+       node 1 to log in to node 2 as `{{user}}` **with an SSH key, without a password**.
+    2. On node 1, turn the SELinux boolean **`{{bool}}`** **on**, now and
+       **persistently** across reboots.
+  objectives:
+    - Set up key-based SSH login between two hosts
+    - Change an SELinux boolean persistently
+  params:
+    user:
+      type: choice
+      values: [sigrota, yardmaster, crewdesk]
+    bool:
+      type: choice
+      values: [httpd_can_network_connect, httpd_enable_homedirs, ftpd_full_access, httpd_can_sendmail]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-el-01
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["2Gi", "1Gi", "2Gi"]}
+        access: [ssh, console]
+      - name: tr-el-02
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536}
+        access: [ssh, console]
+  setup:
+    - on: tr-el-01
+      run: |
+        set -eu
+        id {{user}} >/dev/null 2>&1 || useradd -m {{user}}
+        echo '{{user}}:Rota-Pass-91' | chpasswd
+        setsebool -P {{bool}} off
+    - on: tr-el-02
+      run: |
+        set -eu
+        id {{user}} >/dev/null 2>&1 || useradd -m {{user}}
+        echo '{{user}}:Rota-Pass-91' | chpasswd
+  checks:
+    - id: key-login
+      description: The user logs in from node 1 to node 2 with a key, without a password
+      type: shell
+      on: tr-el-01
+      skills: [linux.remote.ssh]
+      weight: 2
+      timeoutSec: 40
+      command: runuser -u {{user}} -- ssh -n -o BatchMode=yes -o PasswordAuthentication=no -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 tr-el-02 'id -un' 2>/dev/null || echo refused
+      expect: {match: exact, value: "{{user}}"}
+    - id: boolean-now
+      description: The boolean is on now
+      type: shell
+      on: tr-el-01
+      skills: [linux.security.selinux-contexts]
+      weight: 0.5
+      command: getsebool {{bool}} | awk '{print $3}'
+      expect: {match: exact, value: "on"}
+    - id: boolean-persistent
+      description: The boolean is on in the persistent policy
+      type: shell
+      on: tr-el-01
+      skills: [linux.security.selinux-contexts]
+      weight: 1.5
+      command: semanage boolean -l 2>/dev/null | awk -v b={{bool}} '$1 == b {gsub(/[(),]/, " "); print $3}'
+      expect: {match: exact, value: "on"}
+  misconceptions:
+    - id: runtime-boolean
+      description: Sets the boolean without -P.
+      feedback: "setsebool without -P lasts until the next boot; setsebool -P writes it to the policy."
+      expectFail: [boolean-persistent]
+      mutation:
+        on: tr-el-01
+        as: learner
+        run: sudo setsebool {{bool}} on
+  solution:
+    explanation: The user creates a key pair on node 1 and its public key goes into ~/.ssh/authorized_keys of the same user on node 2 (ssh-copy-id with the password, or placed by root); setsebool -P makes the boolean persistent.
+    steps:
+      - on: tr-el-01
+        as: learner
+        run: |
+          set -e
+          sudo -u {{user}} sh -c 'test -f ~/.ssh/id_ed25519 || ssh-keygen -q -t ed25519 -N "" -f ~/.ssh/id_ed25519'
+          sudo cat /home/{{user}}/.ssh/id_ed25519.pub > /tmp/{{user}}.pub
+          sudo setsebool -P {{bool}} on
+      - on: workstation
+        as: learner
+        run: |
+          set -e
+          ssh tr-el-01 cat /tmp/{{user}}.pub | ssh tr-el-02 "sudo -u {{user}} sh -c 'umask 077; mkdir -p ~/.ssh; cat >> ~/.ssh/authorized_keys'"
+          ssh tr-el-01 rm -f /tmp/{{user}}.pub

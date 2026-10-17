@@ -1,0 +1,137 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xel-nmcli-static
+  title: Configure a static address, gateway and DNS
+  domain: linux
+  frameworks: [rhcsa-aligned:networking]
+  difficulty: medium
+  estimatedMinutes: 8
+  tags: [exam, networkmanager, nmcli]
+  version: 1
+spec:
+  description: |
+    **Host:** node 2, `tr-el-02` (`ssh tr-el-02`, then `sudo -i`)
+
+    Node 2 gets its address from DHCP; the depot network team wants it static.
+    Change node 2's **existing network connection** (the one on the interface with
+    the default route) so that, persistently:
+
+    - it keeps its **current IPv4 address, prefix and default gateway**, but they
+      are configured **statically** (no DHCP for IPv4);
+    - the DNS server is **`{{dns}}`** and the search domain `tallowmere.example`;
+    - it also carries the IPv6 address **`fd00:{{net}}::{{host}}/64`**;
+    - the host name of node 2 is **`depot-{{name}}.tallowmere.example`**.
+
+    The changes must be active now. If you lose the connection, use node 2's console.
+  objectives:
+    - Configure static IPv4, IPv6, DNS and the host name with NetworkManager
+  params:
+    dns:
+      type: choice
+      values: ["10.53.0.53", "10.53.1.10", "10.53.2.2"]
+    net:
+      type: int
+      min: 100
+      max: 999
+    host:
+      type: int
+      min: 10
+      max: 99
+    name:
+      type: choice
+      values: [north, harbour, valley]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-el-01
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["2Gi", "1Gi", "2Gi"]}
+        access: [ssh, console]
+      - name: tr-el-02
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536}
+        access: [ssh, console]
+  setup:
+    - on: tr-el-02
+      run: |
+        set -eu
+        install -d -m 0700 /var/lib/cloudtrain
+        dev=$(ip -4 route show default | awk '{print $5; exit}')
+        ip -4 -o addr show dev $dev scope global | awk '{print $4; exit}' > /var/lib/cloudtrain/xel-nm.addr
+        ip -4 route show default | awk '{print $3; exit}' > /var/lib/cloudtrain/xel-nm.gw
+        test -s /var/lib/cloudtrain/xel-nm.addr && test -s /var/lib/cloudtrain/xel-nm.gw
+  checks:
+    - id: static-ipv4
+      description: The connection has the current address and gateway configured statically
+      type: shell
+      on: tr-el-02
+      skills: [linux.net.persistent-config]
+      weight: 2
+      command: |
+        dev=$(ip -4 route show default | awk '{print $5; exit}'); con=$(nmcli -g GENERAL.CONNECTION device show "$dev" 2>/dev/null)
+        m=$(nmcli -g ipv4.method con show "$con" 2>/dev/null); a=$(nmcli -g ipv4.addresses con show "$con" 2>/dev/null); g=$(nmcli -g ipv4.gateway con show "$con" 2>/dev/null)
+        [ "$m" = manual ] && echo ",$a," | sed 's/ //g' | grep -qF ",$(cat /var/lib/cloudtrain/xel-nm.addr)," && [ "$g" = "$(cat /var/lib/cloudtrain/xel-nm.gw)" ] && echo static || echo "method=$m addr=$a gw=$g"
+      expect: {match: exact, value: static}
+    - id: dns
+      description: The DNS server and search domain are configured
+      type: shell
+      on: tr-el-02
+      skills: [linux.net.persistent-config]
+      weight: 1
+      command: |
+        dev=$(ip -4 route show default | awk '{print $5; exit}'); con=$(nmcli -g GENERAL.CONNECTION device show "$dev" 2>/dev/null)
+        d=$(nmcli -g ipv4.dns con show "$con" 2>/dev/null); s=$(nmcli -g ipv4.dns-search con show "$con" 2>/dev/null)
+        echo ",$d," | grep -qF ',{{dns}},' && echo ",$s," | grep -qF ',tallowmere.example,' && grep -q '^nameserver {{dns}}' /etc/resolv.conf && echo dns || echo "dns=$d search=$s"
+      expect: {match: exact, value: dns}
+    - id: ipv6
+      description: The IPv6 address is configured and active
+      type: shell
+      on: tr-el-02
+      skills: [linux.net.persistent-config]
+      weight: 1
+      command: |
+        dev=$(ip -4 route show default | awk '{print $5; exit}'); con=$(nmcli -g GENERAL.CONNECTION device show "$dev" 2>/dev/null)
+        nmcli -g ipv6.addresses con show "$con" 2>/dev/null | tr -d '\\' | grep -qi 'fd00:{{net}}::{{host}}/64' && ip -6 addr show dev $dev | grep -qi 'fd00:{{net}}::{{host}}/64' && echo ipv6 || echo missing
+      expect: {match: exact, value: ipv6}
+    - id: hostname
+      description: The static host name is set
+      type: shell
+      on: tr-el-02
+      skills: [linux.net.persistent-config]
+      weight: 1
+      command: echo "$(hostnamectl --static 2>/dev/null) $(cat /etc/hostname 2>/dev/null)"
+      expect: {match: exact, value: "depot-{{name}}.tallowmere.example depot-{{name}}.tallowmere.example"}
+  misconceptions:
+    - id: dhcp-kept
+      description: Adds the address but leaves the IPv4 method on DHCP.
+      feedback: "ipv4.method must be manual for a static configuration; otherwise DHCP still runs."
+      expectFail: [static-ipv4]
+      mutation:
+        on: tr-el-02
+        as: learner
+        timeoutSec: 90
+        run: |
+          dev=$(ip -4 route show default | awk '{print $5; exit}'); con=$(nmcli -g GENERAL.CONNECTION device show "$dev")
+          sudo nmcli con mod "$con" ipv4.dns {{dns}} ipv4.dns-search tallowmere.example ipv4.ignore-auto-dns yes ipv6.method manual ipv6.addresses fd00:{{net}}::{{host}}/64
+          sudo nmcli device reapply "$dev"
+          sudo hostnamectl set-hostname depot-{{name}}.tallowmere.example
+  solution:
+    explanation: nmcli con mod sets the method, address, gateway, DNS and IPv6 address on the existing profile; device reapply (or con up) activates it; hostnamectl sets the static host name.
+    steps:
+      - on: tr-el-02
+        as: learner
+        timeoutSec: 90
+        run: |
+          set -e
+          dev=$(ip -4 route show default | awk '{print $5; exit}'); con=$(nmcli -g GENERAL.CONNECTION device show "$dev")
+          addr=$(ip -4 -o addr show dev $dev scope global | awk '{print $4; exit}'); gw=$(ip -4 route show default | awk '{print $3; exit}')
+          sudo nmcli con mod "$con" ipv4.method manual ipv4.addresses $addr ipv4.gateway $gw ipv4.dns {{dns}} ipv4.dns-search tallowmere.example ipv4.ignore-auto-dns yes ipv6.method manual ipv6.addresses fd00:{{net}}::{{host}}/64
+          sudo nmcli device reapply "$dev"
+          sudo hostnamectl set-hostname depot-{{name}}.tallowmere.example

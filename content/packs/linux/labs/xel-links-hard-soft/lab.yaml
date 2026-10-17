@@ -1,0 +1,91 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xel-links-hard-soft
+  title: Create hard and symbolic links as specified
+  domain: linux
+  frameworks: [rhcsa-aligned:essential-tools]
+  difficulty: easy
+  estimatedMinutes: 4
+  tags: [exam, links]
+  version: 1
+spec:
+  description: |
+    **Host:** node 1, `tr-el-01` (`ssh tr-el-01`, then `sudo -i`)
+
+    The signalling plan lives in **`/srv/signal/master/plan-{{n}}.conf`**. Create:
+
+    - a **hard link** to it at **`/srv/signal/hard/plan.conf`**;
+    - a **symbolic link** at **`/srv/signal/current.conf`** that points to it by its
+      **absolute path**.
+
+    Do not copy, move or edit the original file.
+  objectives:
+    - Tell hard links from symbolic links and create both
+  params:
+    n:
+      type: int
+      min: 10
+      max: 99
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-el-01
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["2Gi", "1Gi", "2Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-el-01
+      run: |
+        set -eu
+        rm -rf /srv/signal
+        mkdir -p /srv/signal/master /srv/signal/hard
+        printf 'plan={{n}}\nboxes=tr-sig-01,tr-sig-02\n' > /srv/signal/master/plan-{{n}}.conf
+        stat -c %i /srv/signal/master/plan-{{n}}.conf > /srv/signal/master/.inode
+  checks:
+    - id: hard-link
+      description: The hard link shares the original file's inode
+      type: shell
+      on: tr-el-01
+      skills: [linux.files.links-archives]
+      weight: 1
+      command: |
+        o=/srv/signal/master/plan-{{n}}.conf; h=/srv/signal/hard/plan.conf
+        [ ! -L $h ] && [ "$(stat -c %i $o 2>/dev/null)" = "$(stat -c %i $h 2>/dev/null)" ] && [ "$(stat -c %i $o)" = "$(cat /srv/signal/master/.inode)" ] && echo linked || echo no
+      expect: {match: exact, value: linked}
+    - id: symlink
+      description: The symbolic link points to the original by its absolute path
+      type: shell
+      on: tr-el-01
+      skills: [linux.files.links-archives]
+      weight: 1
+      command: '[ -L /srv/signal/current.conf ] && [ "$(readlink /srv/signal/current.conf)" = /srv/signal/master/plan-{{n}}.conf ] && echo absolute || echo no'
+      expect: {match: exact, value: absolute}
+  misconceptions:
+    - id: copied
+      description: Copies the file instead of hard-linking it.
+      feedback: "A copy is a new inode with the same content; ln without -s adds a second name to the same inode."
+      expectFail: [hard-link]
+      mutation:
+        on: tr-el-01
+        as: learner
+        run: sudo sh -c 'cp /srv/signal/master/plan-{{n}}.conf /srv/signal/hard/plan.conf && ln -s /srv/signal/master/plan-{{n}}.conf /srv/signal/current.conf'
+    - id: relative-symlink
+      description: Creates the symbolic link with a relative target.
+      feedback: "The task asks for the absolute path as the link target."
+      expectFail: [symlink]
+      mutation:
+        on: tr-el-01
+        as: learner
+        run: sudo sh -c 'ln /srv/signal/master/plan-{{n}}.conf /srv/signal/hard/plan.conf && cd /srv/signal && ln -s master/plan-{{n}}.conf current.conf'
+  solution:
+    explanation: ln creates a hard link (same inode), ln -s a symbolic link that stores the target path.
+    steps:
+      - on: tr-el-01
+        as: learner
+        run: sudo sh -c 'ln /srv/signal/master/plan-{{n}}.conf /srv/signal/hard/plan.conf && ln -s /srv/signal/master/plan-{{n}}.conf /srv/signal/current.conf'

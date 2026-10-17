@@ -1,0 +1,103 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xel-resize-lv-fs
+  title: Resize a logical volume to a size range
+  domain: linux
+  frameworks: [rhcsa-aligned:filesystems]
+  difficulty: medium
+  estimatedMinutes: 6
+  tags: [exam, lvm, xfs]
+  version: 1
+spec:
+  description: |
+    **Host:** node 1, `tr-el-01` (`ssh tr-el-01`, then `sudo -i`)
+
+    The fare ledger on **`vgexam/lvledger`** (XFS, mounted at **`/srv/ledger`**) is
+    filling up. Resize the logical volume **and its filesystem** so that both are
+    **between {{min}} MiB and {{max}} MiB**. The ledger data must stay intact and
+    the filesystem mounted.
+  objectives:
+    - Grow a logical volume and its filesystem online
+  params:
+    min:
+      type: choice
+      values: ["380", "400", "420"]
+    max:
+      type: choice
+      values: ["472", "492", "512"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-el-01
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["2Gi", "1Gi", "2Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-el-01
+      timeoutSec: 120
+      run: |
+        set -eu
+        pvs /dev/vde >/dev/null 2>&1 || pvcreate -y /dev/vde
+        vgs vgexam >/dev/null 2>&1 || vgcreate vgexam /dev/vde
+        if ! lvs vgexam/lvledger >/dev/null 2>&1; then
+          lvcreate -y -n lvledger -L 304M vgexam; mkfs.xfs -q /dev/vgexam/lvledger
+          mkdir -p /srv/ledger
+          echo '/dev/mapper/vgexam-lvledger /srv/ledger xfs defaults 0 0' >> /etc/fstab
+          systemctl daemon-reload; mount /srv/ledger
+          seq 1 20000 | awk '{printf "fare %06d %d.%02d\n", $1, $1 % 90, $1 % 100}' > /srv/ledger/fares.txt
+          install -d -m 0700 /var/lib/cloudtrain
+          sha256sum /srv/ledger/fares.txt > /var/lib/cloudtrain/xel-ledger.sha
+        fi
+  checks:
+    - id: lv-size
+      description: The logical volume is within the requested range
+      type: shell
+      on: tr-el-01
+      skills: [linux.storage.lvm]
+      weight: 1
+      command: s=$(lvs --noheadings --units m --nosuffix -o lv_size vgexam/lvledger 2>/dev/null | tr -d ' ' | cut -d. -f1); [ -n "$s" ] && [ $s -ge {{min}} ] && [ $s -le {{max}} ] && echo in-range || echo "size=$s"
+      expect: {match: exact, value: in-range}
+    - id: fs-size
+      description: The filesystem was grown with it
+      type: shell
+      on: tr-el-01
+      skills: [linux.storage.lvm]
+      weight: 1.5
+      command: s=$(df -BM --output=size /srv/ledger 2>/dev/null | tail -1 | tr -dc 0-9); [ -n "$s" ] && [ $s -ge $(({{min}} - 25)) ] && [ $s -le {{max}} ] && echo grown || echo "fs=$s"
+      expect: {match: exact, value: grown}
+    - id: data-intact
+      description: The ledger data is intact and mounted
+      type: shell
+      on: tr-el-01
+      skills: [linux.storage.lvm]
+      weight: 1
+      command: findmnt -n /srv/ledger >/dev/null && sha256sum -c --quiet /var/lib/cloudtrain/xel-ledger.sha >/dev/null 2>&1 && echo intact || echo damaged
+      expect: {match: exact, value: intact}
+  misconceptions:
+    - id: lv-only
+      description: Extends the logical volume without growing the filesystem.
+      feedback: "lvextend alone leaves the filesystem at its old size; add -r (--resizefs) or run xfs_growfs afterwards."
+      expectFail: [fs-size]
+      mutation:
+        on: tr-el-01
+        as: learner
+        run: sudo lvextend -L {{max}}M vgexam/lvledger
+  solution:
+    explanation: lvextend -r grows the volume and then the mounted XFS filesystem in one step.
+    steps:
+      - on: tr-el-01
+        as: learner
+        run: sudo lvextend -r -L {{max}}M vgexam/lvledger
+    alternatives:
+      - id: growfs
+        description: lvextend, then xfs_growfs on the mount point.
+        steps:
+          - on: tr-el-01
+            as: learner
+            run: sudo sh -c 'lvextend -L {{min}}M vgexam/lvledger && xfs_growfs /srv/ledger'

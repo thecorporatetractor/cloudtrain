@@ -1,0 +1,102 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xel-vfat-mount
+  title: Create and mount a vfat filesystem
+  domain: linux
+  frameworks: [rhcsa-aligned:filesystems]
+  difficulty: easy
+  estimatedMinutes: 5
+  tags: [exam, vfat, fstab]
+  version: 1
+spec:
+  description: |
+    **Host:** node 1, `tr-el-01` (`ssh tr-el-01`, then `sudo -i`)
+
+    The ticket machines read their updates from a FAT filesystem. Create a **vfat**
+    filesystem on the logical volume **`vgexam/lvexport`** and mount it at
+    **`/srv/export`**, now and at every boot, so that **every file in it belongs to
+    the user `{{user}}`**.
+  objectives:
+    - Create a vfat filesystem and mount it persistently with an owner option
+  params:
+    user:
+      type: choice
+      values: [tvm-sync, ticketbot, kioskd]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-el-01
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["2Gi", "1Gi", "2Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-el-01
+      timeoutSec: 120
+      run: |
+        set -eu
+        pvs /dev/vde >/dev/null 2>&1 || pvcreate -y /dev/vde
+        vgs vgexam >/dev/null 2>&1 || vgcreate vgexam /dev/vde
+        lvs vgexam/lvexport >/dev/null 2>&1 || lvcreate -y -n lvexport -L 64M vgexam
+        id {{user}} >/dev/null 2>&1 || useradd -r -M -s /sbin/nologin {{user}}
+  checks:
+    - id: vfat
+      description: lvexport holds a vfat filesystem mounted at /srv/export
+      type: shell
+      on: tr-el-01
+      skills: [linux.storage.filesystems]
+      weight: 1
+      command: |
+        s=$(findmnt -n -o SOURCE /srv/export 2>/dev/null)
+        [ "$(blkid -s TYPE -o value /dev/vgexam/lvexport)" = vfat ] && [ -n "$s" ] && [ "$(readlink -f "$s")" = "$(readlink -f /dev/vgexam/lvexport)" ] && echo vfat || echo no
+      expect: {match: exact, value: vfat}
+    - id: owner
+      description: Files on it belong to {{user}}
+      type: shell
+      on: tr-el-01
+      skills: [linux.storage.filesystems]
+      weight: 1.5
+      command: |
+        f=/srv/export/.owner-probe-$$; touch $f 2>/dev/null; u=$(stat -c %U $f 2>/dev/null); rm -f $f; echo "${u:-none}"
+      expect: {match: exact, value: "{{user}}"}
+    - id: persistent
+      description: /etc/fstab mounts it at boot with the owner option
+      type: shell
+      on: tr-el-01
+      skills: [linux.storage.filesystems]
+      weight: 1.5
+      command: |
+        u=$(id -u {{user}}); f=$(findmnt --fstab -n -o FSTYPE,OPTIONS /srv/export 2>/dev/null)
+        case "$f" in vfat*) echo "$f" | grep -qE "(^|[ ,])uid=({{user}}|$u)(,|$)" && echo fstab || echo no-uid ;; *) echo "no fstab=$f" ;; esac
+      expect: {match: exact, value: fstab}
+  misconceptions:
+    - id: chown-mountpoint
+      description: Tries chown on the mounted vfat instead of a uid= mount option.
+      feedback: "FAT has no owners; the uid= (and gid=) mount options decide who owns every file."
+      expectFail: [owner, persistent]
+      mutation:
+        on: tr-el-01
+        as: learner
+        run: |
+          sudo mkfs.vfat /dev/vgexam/lvexport >/dev/null
+          sudo mkdir -p /srv/export
+          echo "/dev/vgexam/lvexport /srv/export vfat defaults 0 0" | sudo tee -a /etc/fstab >/dev/null
+          sudo systemctl daemon-reload; sudo mount /srv/export
+          sudo chown {{user}} /srv/export || true
+  solution:
+    explanation: mkfs.vfat creates the filesystem; the uid= mount option makes the user own every file, and the fstab line keeps it at boot.
+    steps:
+      - on: tr-el-01
+        as: learner
+        run: |
+          set -e
+          sudo mkfs.vfat /dev/vgexam/lvexport >/dev/null
+          sudo mkdir -p /srv/export
+          echo "/dev/mapper/vgexam-lvexport /srv/export vfat defaults,uid=$(id -u {{user}}) 0 0" | sudo tee -a /etc/fstab >/dev/null
+          sudo systemctl daemon-reload
+          sudo mount /srv/export

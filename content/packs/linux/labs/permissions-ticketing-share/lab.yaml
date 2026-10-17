@@ -1,0 +1,226 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: permissions-ticketing-share
+  title: Lock down the ticketing reports directory with modes and umask
+  domain: linux
+  frameworks: [rhcsa-aligned:essential-tools, lpic1:devices-filesystems, linuxplus:security]
+  difficulty: easy
+  estimatedMinutes: 10
+  tags: [permissions, chmod, chown, umask, sudo]
+  version: 1
+spec:
+  description: |
+    The nightly fares job on `tkt-report-01` runs as **`fares-bot`** and drops its
+    reports into `/srv/ticketing/reports`. An audit found the directory and its files
+    readable by every account on the host. Fix it with `sudo` (you have full sudo
+    rights on this host):
+
+    1. `/srv/ticketing/reports` and every report in it belong to user **`fares-bot`**
+       and group **`fares`**.
+    2. The owner can read and write the reports (and manage the directory); members of
+       `fares` can **list and read** them but **not change** anything; **all other
+       accounts get no access at all**.
+    3. Reports that `fares-bot` creates from now on must come out as **`0640`**
+       (`rw-r-----`) without anyone running chmod: give `fares-bot` a persistent umask
+       that applies to its **login sessions**. Do not change the default umask of the
+       other accounts.
+
+    `{{reader}}` (a fares analyst) and `otto` (a ticket-office clerk, not in `fares`)
+    are there for you to test with, e.g. `sudo -u otto ls /srv/ticketing/reports`.
+  objectives:
+    - Set owner, group and mode bits on a directory and its files
+    - Tell apart what r, w and x mean on a directory
+    - Make a user's umask persistent for login sessions
+  params:
+    reader:
+      type: choice
+      values: [ines, bram, maud]
+    reports:
+      type: int
+      min: 3
+      max: 6
+  topology:
+    entry: tkt-report-01
+    nodes:
+      - name: tkt-report-01
+        driver: container
+        image: deb-lab:24.04
+        access: [shell]
+        learnerSudo: true
+  setup:
+    - on: tkt-report-01
+      run: |
+        set -eu
+        echo 'learner ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/learner && chmod 0440 /etc/sudoers.d/learner
+        getent group fares >/dev/null || groupadd fares
+        id fares-bot >/dev/null 2>&1 || useradd -m -s /bin/bash fares-bot
+        id {{reader}} >/dev/null 2>&1 || useradd -m -s /bin/bash -G fares {{reader}}
+        id otto >/dev/null 2>&1 || useradd -m -s /bin/bash otto
+        d=/srv/ticketing/reports
+        rm -rf $d; mkdir -p $d
+        for i in $(seq 1 {{reports}}); do
+          printf 'date,station,fares_eur\n2026-10-%02d,Tallowmere Central,%d\n' $i $((1000 + i * 37)) > $d/fares-2026-10-$(printf %02d $i).csv
+        done
+        chown root:root $d; chmod 0777 $d
+        chown fares-bot:fares-bot $d/*; chmod 0666 $d/*
+        chmod 0644 $d/fares-2026-10-01.csv
+        # fares-bot's profile starts from the distribution defaults (umask 022).
+        cp /etc/skel/.profile /etc/skel/.bashrc /home/fares-bot/ && chown fares-bot:fares-bot /home/fares-bot/.profile /home/fares-bot/.bashrc
+        mkdir -p /var/lib/cloudtrain && chmod 0700 /var/lib/cloudtrain
+        su - otto -s /bin/bash -c umask </dev/null > /var/lib/cloudtrain/otto.umask
+  checks:
+    - id: dir-owner
+      description: The reports directory belongs to fares-bot and group fares
+      type: shell
+      on: tkt-report-01
+      skills: [linux.files.permissions]
+      command: stat -c '%U:%G' /srv/ticketing/reports
+      expect: {match: exact, value: "fares-bot:fares"}
+    - id: dir-mode
+      description: "The directory gives the owner full access, the group list/enter only and others nothing"
+      type: shell
+      on: tkt-report-01
+      skills: [linux.files.permissions]
+      command: stat -c '%A' /srv/ticketing/reports | cut -c2-10 | sed 's/s$/x/; s/S$/-/; s/^\(.....\)s/\1x/; s/^\(.....\)S/\1-/'
+      expect: {match: exact, value: "rwxr-x---"}
+    - id: files-locked
+      description: Every report belongs to fares-bot:fares with mode 0640
+      type: shell
+      on: tkt-report-01
+      skills: [linux.files.permissions]
+      weight: 2
+      command: |
+        bad=$(find /srv/ticketing/reports -mindepth 1 -maxdepth 1 -type f ! \( -user fares-bot -group fares -perm 0640 \) -printf '%f ' ; find /srv/ticketing/reports -mindepth 1 -maxdepth 1 -type f -perm /0137 -printf '%f ')
+        n=$(find /srv/ticketing/reports -mindepth 1 -maxdepth 1 -type f | wc -l)
+        [ "$n" -ge {{reports}} ] && [ -z "$bad" ] && echo ok || echo "bad:$bad"
+      expect: {match: exact, value: ok}
+    - id: group-reads
+      description: A member of fares can list and read the reports but not write them
+      type: shell
+      on: tkt-report-01
+      skills: [linux.files.permissions]
+      command: |
+        cd /tmp
+        r=""
+        runuser -u {{reader}} -- ls /srv/ticketing/reports >/dev/null 2>&1 && r="${r}list "
+        runuser -u {{reader}} -- cat /srv/ticketing/reports/fares-2026-10-01.csv >/dev/null 2>&1 && r="${r}read "
+        runuser -u {{reader}} -- sh -c ': >> /srv/ticketing/reports/fares-2026-10-01.csv' 2>/dev/null && r="${r}WRITE "
+        runuser -u {{reader}} -- touch /srv/ticketing/reports/probe-reader 2>/dev/null && { r="${r}CREATE "; rm -f /srv/ticketing/reports/probe-reader; }
+        echo "$r"
+      expect: {match: exact, value: "list read "}
+    - id: others-closed
+      description: Accounts outside fares can neither list nor read the reports
+      type: shell
+      on: tkt-report-01
+      skills: [linux.files.permissions]
+      command: |
+        cd /tmp
+        r=""
+        runuser -u otto -- ls /srv/ticketing/reports >/dev/null 2>&1 && r="${r}LIST "
+        runuser -u otto -- cat /srv/ticketing/reports/fares-2026-10-01.csv >/dev/null 2>&1 && r="${r}READ "
+        echo "${r:-closed}"
+      expect: {match: exact, value: closed}
+    - id: bot-umask
+      description: A new report written in a fares-bot login session is created 0640
+      type: shell
+      on: tkt-report-01
+      skills: [linux.files.permissions]
+      weight: 2
+      command: |
+        cd /tmp
+        f=/srv/ticketing/reports/.umask-probe-$$
+        rm -f $f
+        su - fares-bot -s /bin/bash -c "echo probe > $f" </dev/null >/dev/null 2>&1
+        m=$(stat -c %a $f 2>/dev/null || echo none); rm -f $f; echo $m
+      expect: {match: exact, value: "640"}
+    - id: others-default-umask
+      description: Other accounts keep the default umask
+      type: shell
+      on: tkt-report-01
+      skills: [linux.files.permissions]
+      weight: 0.5
+      command: '[ "$(su - otto -s /bin/bash -c umask </dev/null 2>/dev/null)" = "$(cat /var/lib/cloudtrain/otto.umask)" ] && echo kept || echo changed'
+      expect: {match: exact, value: kept}
+  hints:
+    - title: Look first
+      command: ls -la /srv/ticketing/reports
+      body: The first column shows the mode bits, then owner and group. `stat -c '%a %U:%G' FILE` prints them in octal.
+      cost: 0
+    - title: Directories need x
+      body: "On a directory, r lists the names, x lets you enter it and open files in it, w lets you create and delete entries. Readers need r-x on the directory and r-- on the files, so the directory is 750 and the files 640."
+      cost: 1
+    - title: One recursive mode does not fit both
+      body: "`chmod -R 640` also removes x from the directory. Set the directory and the files separately, or use symbolic modes with `X` (`chmod -R u=rwX,g=rX,o= DIR`). Careful with `sudo chmod 640 DIR/*`: your own shell expands the `*` before sudo runs, and once you have closed the directory you can no longer list it. `sudo find DIR -type f -exec chmod 640 {} +` or `sudo sh -c '...'` avoid that."
+      cost: 1
+    - title: A persistent umask for one account
+      body: "A login shell reads `~/.profile` (bash also `~/.bash_profile`). `umask 027` there makes new files 640 and new directories 750. pam_umask can also read `umask=027` from the account's GECOS field (`usermod -c`)."
+      cost: 2
+  misconceptions:
+    - id: world-readable
+      description: Leaves read access for other accounts (755/644 habits).
+      feedback: "Mode 755 or 644 still lets every account read. Others must get 0 in the last octal digit."
+      expectFail: [dir-mode, files-locked, others-closed]
+      mutation:
+        on: tkt-report-01
+        as: learner
+        run: |
+          sudo chown -R fares-bot:fares /srv/ticketing/reports
+          sudo sh -c 'chmod 755 /srv/ticketing/reports && chmod 644 /srv/ticketing/reports/*'
+          echo 'umask 027' | sudo tee -a /home/fares-bot/.profile >/dev/null
+    - id: recursive-640
+      description: Runs chmod -R 640 on the directory, which removes the x bit from the directory itself.
+      feedback: "Without x on the directory, group members cannot open any file in it. Give the directory 750 and the files 640."
+      expectFail: [dir-mode, group-reads]
+      mutation:
+        on: tkt-report-01
+        as: learner
+        run: |
+          sudo chown -R fares-bot:fares /srv/ticketing/reports
+          sudo chmod -R 640 /srv/ticketing/reports
+          echo 'umask 027' | sudo tee -a /home/fares-bot/.profile >/dev/null
+    - id: umask-in-shell-only
+      description: Runs umask in the current shell instead of making it persistent for fares-bot.
+      feedback: "umask only lasts for the shell that ran it. Put it in fares-bot's login profile so every new session gets it."
+      expectFail: [bot-umask]
+      mutation:
+        on: tkt-report-01
+        as: learner
+        run: |
+          umask 027
+          sudo chown -R fares-bot:fares /srv/ticketing/reports
+          sudo sh -c 'chmod 750 /srv/ticketing/reports && chmod 640 /srv/ticketing/reports/*'
+    - id: global-umask
+      description: Changes the system-wide default umask for every account.
+      feedback: "The task asks for fares-bot only; changing UMASK in /etc/login.defs affects every account on the host."
+      expectFail: [others-default-umask]
+      mutation:
+        on: tkt-report-01
+        as: learner
+        run: |
+          sudo chown -R fares-bot:fares /srv/ticketing/reports
+          sudo sh -c 'chmod 750 /srv/ticketing/reports && chmod 640 /srv/ticketing/reports/*'
+          sudo sed -i 's/^UMASK.*/UMASK\t\t027/' /etc/login.defs
+  solution:
+    explanation: |
+      The directory and files get separate modes (750 and 640): x on a directory is what
+      lets the group open files in it. umask 027 in fares-bot's ~/.profile removes w for
+      the group and everything for others from every file the bot creates afterwards.
+    steps:
+      - on: tkt-report-01
+        as: learner
+        run: |
+          sudo chown -R fares-bot:fares /srv/ticketing/reports
+          sudo find /srv/ticketing/reports -type f -exec chmod 640 {} +
+          sudo chmod 750 /srv/ticketing/reports
+          echo 'umask 027' | sudo tee -a /home/fares-bot/.profile >/dev/null
+    alternatives:
+      - id: symbolic-and-gecos
+        description: Symbolic modes with X in one pass and pam_umask via the GECOS field.
+        steps:
+          - on: tkt-report-01
+            as: learner
+            run: |
+              sudo chown -R fares-bot:fares /srv/ticketing/reports
+              sudo chmod -R u=rwX,g=rX,o= /srv/ticketing/reports
+              sudo usermod -c 'Fares export bot,,,,umask=027' fares-bot

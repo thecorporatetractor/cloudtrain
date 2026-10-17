@@ -1,0 +1,101 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xel-script-args-loop
+  title: Write a script that processes its arguments
+  domain: linux
+  frameworks: [rhcsa-aligned:scripts]
+  difficulty: medium
+  estimatedMinutes: 8
+  tags: [exam, bash, scripting]
+  version: 1
+spec:
+  description: |
+    **Host:** node 1, `tr-el-01` (`ssh tr-el-01`, then `sudo -i`)
+
+    Write the executable script **`/usr/local/bin/{{name}}`** for the depot
+    supervisors:
+
+    - For **each argument**, in the order given, it prints one line
+      `depot <argument> checked` to standard output. Arguments may contain spaces.
+    - Run **without arguments**, it prints `usage: {{name}} DEPOT...` to
+      **standard error**, prints nothing to standard output and exits with status
+      **{{rc}}**.
+    - Otherwise it exits with status 0.
+
+    It is tested with other depot names than the ones you try.
+  objectives:
+    - Loop over positional parameters with correct quoting
+    - Check the argument count and set an exit status
+  params:
+    name:
+      type: choice
+      values: [depot-check, depot-audit, yard-check]
+    rc:
+      type: int
+      min: 2
+      max: 9
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-el-01
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["2Gi", "1Gi", "2Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-el-01
+      run: rm -f /usr/local/bin/{{name}}
+  checks:
+    - id: executable
+      description: The script exists and is executable
+      type: shell
+      on: tr-el-01
+      skills: [linux.shell.scripting]
+      weight: 0.5
+      command: test -x /usr/local/bin/{{name}} && echo yes || echo no
+      expect: {match: exact, value: "yes"}
+    - id: loop
+      description: One line per argument, in order, arguments with spaces kept whole
+      type: shell
+      on: tr-el-01
+      skills: [linux.shell.scripting]
+      weight: 2
+      command: |
+        out=$(cd /tmp && timeout 10 /usr/local/bin/{{name}} "Marrow Lane" north-yard "east  sidings" 2>/dev/null); rc=$?
+        [ "$out" = "$(printf 'depot Marrow Lane checked\ndepot north-yard checked\ndepot east  sidings checked')" ] && [ $rc = 0 ] && echo ok || echo wrong
+      expect: {match: exact, value: ok}
+    - id: no-args
+      description: Without arguments it prints the usage to stderr and exits with the requested status
+      type: shell
+      on: tr-el-01
+      skills: [linux.shell.scripting]
+      weight: 1.5
+      command: |
+        out=$(cd /tmp && timeout 10 /usr/local/bin/{{name}} 2>/tmp/.xel-args.err); rc=$?
+        err=$(cat /tmp/.xel-args.err); rm -f /tmp/.xel-args.err
+        [ -z "$out" ] && [ "$err" = "usage: {{name}} DEPOT..." ] && [ $rc = {{rc}} ] && echo ok || echo "wrong rc=$rc"
+      expect: {match: exact, value: ok}
+  misconceptions:
+    - id: unquoted
+      description: Loops over $* (or unquoted $@), splitting arguments that contain spaces.
+      feedback: 'Use "$@" in double quotes so each argument stays one word.'
+      expectFail: [loop]
+      mutation:
+        on: tr-el-01
+        as: learner
+        run: |
+          printf '%s\n' '#!/bin/bash' 'if [ $# -eq 0 ]; then echo "usage: {{name}} DEPOT..." >&2; exit {{rc}}; fi' 'for d in $*; do echo "depot $d checked"; done' | sudo tee /usr/local/bin/{{name}} >/dev/null
+          sudo chmod 755 /usr/local/bin/{{name}}
+  solution:
+    explanation: '$# counts the arguments; "$@" expands to each argument as one word.'
+    steps:
+      - on: tr-el-01
+        as: learner
+        run: |
+          printf '%s\n' '#!/bin/bash' 'if [ $# -eq 0 ]; then' '  echo "usage: {{name}} DEPOT..." >&2' '  exit {{rc}}' 'fi' 'for d in "$@"; do' '  echo "depot $d checked"' 'done' | sudo tee /usr/local/bin/{{name}} >/dev/null
+          sudo chmod 755 /usr/local/bin/{{name}}

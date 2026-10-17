@@ -1,0 +1,81 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xel-tuned-profile
+  title: Apply the recommended tuning profile
+  domain: linux
+  frameworks: [rhcsa-aligned:running-systems]
+  difficulty: easy
+  estimatedMinutes: 4
+  tags: [exam, tuned]
+  version: 1
+spec:
+  description: |
+    **Host:** node 1, `tr-el-01` (`ssh tr-el-01`, then `sudo -i`)
+
+    Someone switched node 1 to a tuning profile meant for laptops. Make node 1 use
+    the **tuning profile that the tuning daemon recommends for it**, and make sure
+    the daemon is **running now and at boot** so the profile stays applied.
+  objectives:
+    - Query and apply the recommended tuned profile
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-el-01
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["2Gi", "1Gi", "2Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-el-01
+      timeoutSec: 120
+      run: |
+        set -eu
+        systemctl enable --now tuned
+        tuned-adm profile powersave
+        systemctl disable tuned
+  checks:
+    - id: recommended
+      description: The active profile is the recommended one
+      type: shell
+      on: tr-el-01
+      skills: [linux.boot.tuned]
+      weight: 2
+      timeoutSec: 60
+      command: '[ "$(tuned-adm active 2>/dev/null | sed -n "s/^Current active profile: //p")" = "$(tuned-adm recommend 2>/dev/null)" ] && echo recommended || echo other'
+      expect: {match: exact, value: recommended}
+    - id: enabled
+      description: tuned is enabled at boot and running
+      type: shell
+      on: tr-el-01
+      skills: [linux.boot.tuned]
+      weight: 1
+      command: echo "$(systemctl is-enabled tuned 2>/dev/null) $(systemctl is-active tuned 2>/dev/null)"
+      expect: {match: exact, value: "enabled active"}
+  misconceptions:
+    - id: balanced
+      description: Picks a general-purpose profile instead of the recommended one.
+      feedback: "tuned-adm recommend names the profile for this machine (a virtual guest here); apply that one."
+      expectFail: [recommended]
+      mutation:
+        on: tr-el-01
+        as: learner
+        run: sudo sh -c 'systemctl enable --now tuned && tuned-adm profile balanced'
+    - id: not-enabled
+      description: Applies the profile but leaves the daemon disabled at boot.
+      feedback: "Without tuned enabled the profile is not applied after a reboot: systemctl enable tuned."
+      expectFail: [enabled]
+      mutation:
+        on: tr-el-01
+        as: learner
+        run: sudo sh -c 'systemctl start tuned && tuned-adm profile $(tuned-adm recommend)'
+  solution:
+    explanation: tuned-adm recommend prints the profile for this hardware; tuned-adm profile applies it, systemctl enable --now keeps the daemon running.
+    steps:
+      - on: tr-el-01
+        as: learner
+        run: sudo sh -c 'systemctl enable --now tuned && tuned-adm profile "$(tuned-adm recommend)"'

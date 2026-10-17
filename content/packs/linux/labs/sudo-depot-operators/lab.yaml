@@ -1,0 +1,209 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: sudo-depot-operators
+  title: Delegate service restarts to depot operators with sudo
+  domain: linux
+  frameworks: [rhcsa-aligned:users-groups, lfcs:users-groups, linuxplus:security]
+  difficulty: medium
+  estimatedMinutes: 12
+  tags: [sudo, sudoers, visudo, least-privilege]
+  version: 1
+spec:
+  description: |
+    On the depot host `depot-1`, the night operators in group **`depot-ops`** keep
+    phoning the on-call admin just to restart the depot telemetry agent. Let them do it
+    themselves, and nothing more. You have full sudo rights on this host.
+
+    The operators will run exactly:
+
+    ```
+    sudo service tr-depot-agent restart
+    ```
+
+    - Add the rule as a **drop-in under `/etc/sudoers.d/`** for the **group**
+      `depot-ops` (members come and go), written or checked with **`visudo`**.
+    - Operators type their **own password** when sudo asks for it.
+    - They must not be able to do anything else as root: no other service, no other
+      action on the agent (stop, start), no shell, no other command.
+    - Accounts outside `depot-ops` get nothing new.
+
+    Current members of `depot-ops`: `{{op1}}` and `{{op2}}`. Both use the password
+    `{{password}}`; `kofi` (same password) is a ticketing clerk and not an operator.
+    Test as them with `su - {{op1}}`.
+  objectives:
+    - Write a sudoers drop-in for a group that allows one exact command line
+    - Validate sudoers syntax with visudo before it can lock anyone out
+    - Know which file names sudo reads from /etc/sudoers.d
+  params:
+    op1:
+      type: choice
+      values: [ravi, noor]
+    op2:
+      type: choice
+      values: [hana, piet]
+    password:
+      type: choice
+      values: [Bogie-Shed-41, Night-Turn-27, Coupler-Pin-63]
+  topology:
+    entry: depot-1
+    nodes:
+      - name: depot-1
+        driver: container
+        image: deb-lab:24.04
+        access: [shell]
+        learnerSudo: true
+  setup:
+    - on: depot-1
+      run: |
+        set -eu
+        echo 'learner ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/learner && chmod 0440 /etc/sudoers.d/learner
+        getent group depot-ops >/dev/null || groupadd depot-ops
+        for u in {{op1}} {{op2}} kofi; do id $u >/dev/null 2>&1 || useradd -m -s /bin/bash $u; echo "$u:{{password}}" | chpasswd; done
+        usermod -aG depot-ops {{op1}}; usermod -aG depot-ops {{op2}}
+        # Two small daemons with SysV init scripts (no systemd in this host: `service` runs them).
+        for svc in tr-depot-agent tr-signal-relay; do
+          printf '%s\n' '#!/bin/sh' "while :; do date +%s > /run/$svc.beat; sleep 5; done" > /usr/local/bin/$svc
+          chmod 0755 /usr/local/bin/$svc
+          cat > /etc/init.d/$svc <<INIT
+        #!/bin/sh
+        ### BEGIN INIT INFO
+        # Provides:          $svc
+        # Short-Description: Tallowmere Rail $svc
+        ### END INIT INFO
+        P=/run/$svc.pid
+        case "\$1" in
+          start) start-stop-daemon --start --background --make-pidfile --pidfile \$P --exec /usr/local/bin/$svc -- </dev/null >/dev/null 2>&1; echo "$svc started" ;;
+          stop) start-stop-daemon --stop --quiet --oknodo --pidfile \$P --retry 5; rm -f \$P; echo "$svc stopped" ;;
+          restart) "\$0" stop; "\$0" start ;;
+          status) [ -f \$P ] && kill -0 "\$(cat \$P)" 2>/dev/null && echo "$svc is running (pid \$(cat \$P))" || { echo "$svc is not running"; exit 3; } ;;
+          *) echo "usage: \$0 start|stop|restart|status"; exit 2 ;;
+        esac
+        INIT
+          chmod 0755 /etc/init.d/$svc
+          /etc/init.d/$svc stop >/dev/null 2>&1 || true
+          /etc/init.d/$svc start >/dev/null
+        done
+        find /etc/sudoers.d -type f ! -name learner ! -name README -delete
+  checks:
+    - id: dropin-valid
+      description: The rule is a drop-in in /etc/sudoers.d owned by root, and the whole sudoers configuration (syntax and file modes) passes visudo -c
+      type: shell
+      on: depot-1
+      skills: [linux.users.sudo]
+      command: |
+        f=$(grep -l 'depot-ops' /etc/sudoers.d/* 2>/dev/null | head -1)
+        [ -n "$f" ] || { echo missing; exit 0; }
+        [ "$(stat -c %U "$f")" = root ] && [ -z "$(find "$f" -perm /022)" ] || { echo "mode $(stat -c '%U %a' "$f")"; exit 0; }
+        visudo -c >/dev/null 2>&1 && echo ok || echo invalid
+      expect: {match: exact, value: ok}
+    - id: ops-can-restart
+      description: Both depot-ops members can restart tr-depot-agent with their own password
+      type: shell
+      on: depot-1
+      skills: [linux.users.sudo]
+      weight: 2
+      timeoutSec: 60
+      command: |
+        cd /tmp; r=""
+        for u in {{op1}} {{op2}}; do
+          sudo -K -u $u 2>/dev/null || true
+          before=$(cat /run/tr-depot-agent.pid 2>/dev/null)
+          su - $u -c "echo '{{password}}' | sudo -S -p '' service tr-depot-agent restart" </dev/null >/dev/null 2>&1
+          after=$(cat /run/tr-depot-agent.pid 2>/dev/null)
+          [ -n "$after" ] && [ "$before" != "$after" ] && kill -0 "$after" 2>/dev/null && r="$r$u:ok " || r="$r$u:no "
+        done
+        echo "$r"
+      expect: {match: exact, value: "{{op1}}:ok {{op2}}:ok "}
+    - id: ops-nothing-else
+      description: depot-ops members cannot stop the agent, touch other services, get a shell or run other commands as root
+      type: shell
+      on: depot-1
+      skills: [linux.users.sudo]
+      weight: 2
+      timeoutSec: 90
+      command: |
+        cd /tmp; got=""
+        try() { su - {{op1}} -c "echo '{{password}}' | sudo -S -p '' $1" </dev/null >/dev/null 2>&1 && got="$got[$1]"; }
+        try 'service tr-signal-relay restart'
+        try 'service tr-depot-agent stop'
+        try 'service tr-depot-agent start'
+        try '/bin/sh -c true'
+        try '-i true'
+        try 'cat /etc/shadow'
+        /etc/init.d/tr-depot-agent status >/dev/null 2>&1 || /etc/init.d/tr-depot-agent start >/dev/null 2>&1
+        /etc/init.d/tr-signal-relay status >/dev/null 2>&1 || /etc/init.d/tr-signal-relay start >/dev/null 2>&1
+        echo "${got:-none}"
+      expect: {match: exact, value: none}
+    - id: others-nothing
+      description: Accounts outside depot-ops still cannot restart the agent
+      type: shell
+      on: depot-1
+      skills: [linux.users.sudo]
+      timeoutSec: 30
+      command: |
+        cd /tmp
+        su - kofi -c "echo '{{password}}' | sudo -S -p '' service tr-depot-agent restart" </dev/null >/dev/null 2>&1 && echo allowed || echo refused
+      expect: {match: exact, value: refused}
+  hints:
+    - title: Edit safely
+      body: "`sudo visudo -f /etc/sudoers.d/depot-ops` opens a drop-in in an editor and refuses to save a file with a syntax error. `sudo visudo -c` checks every file, including that drop-ins are mode 0440 (a new file from `visudo -f` may need `chmod 0440`)."
+      cost: 1
+    - title: File names sudo ignores
+      body: "sudo skips files in /etc/sudoers.d whose name contains a dot or ends in ~ (see `man sudoers`, @includedir). `depot-ops.conf` is silently ignored; `depot-ops` is read."
+      cost: 1
+    - title: Rule format
+      body: "`%group HOST=(RUNAS) COMMAND ARGS`. A command with arguments allows exactly those arguments; a command without arguments allows any. `which service` gives the full path sudo wants."
+      cost: 2
+  misconceptions:
+    - id: any-arguments
+      description: Allows the service command without fixing its arguments.
+      feedback: "A command listed without arguments may be run with any arguments, so the operators could stop or restart every service. Spell out `tr-depot-agent restart`."
+      expectFail: [ops-nothing-else]
+      mutation:
+        on: depot-1
+        as: learner
+        run: |
+          echo '%depot-ops ALL=(root) /usr/sbin/service' > /tmp/d && sudo visudo -cf /tmp/d && sudo install -m 0440 -o root -g root /tmp/d /etc/sudoers.d/depot-ops
+    - id: dotted-filename
+      description: Names the drop-in with a .conf suffix, which sudo ignores.
+      feedback: "sudo does not read files in /etc/sudoers.d whose name contains a dot. Rename it without the suffix."
+      expectFail: [ops-can-restart]
+      mutation:
+        on: depot-1
+        as: learner
+        run: |
+          echo '%depot-ops ALL=(root) /usr/sbin/service tr-depot-agent restart' > /tmp/d && sudo visudo -cf /tmp/d && sudo install -m 0440 -o root -g root /tmp/d /etc/sudoers.d/depot-ops.conf
+    - id: user-not-group
+      description: Writes the rule for one operator by user name instead of for the group.
+      feedback: "The rule must follow group membership: prefix the group with % (%depot-ops)."
+      expectFail: [ops-can-restart]
+      mutation:
+        on: depot-1
+        as: learner
+        run: |
+          echo '{{op1}} ALL=(root) /usr/sbin/service tr-depot-agent restart' > /tmp/d && sudo visudo -cf /tmp/d && sudo install -m 0440 -o root -g root /tmp/d /etc/sudoers.d/depot-ops
+  solution:
+    explanation: |
+      One line for the group, with the full path and the exact arguments. Writing it to a
+      temporary file and checking it with visudo -cf before installing it with mode 0440
+      means a typo can never lock anyone out of sudo.
+    steps:
+      - on: depot-1
+        as: learner
+        run: |
+          echo '%depot-ops ALL=(root) /usr/sbin/service tr-depot-agent restart' > /tmp/depot-ops
+          sudo visudo -cf /tmp/depot-ops
+          sudo install -m 0440 -o root -g root /tmp/depot-ops /etc/sudoers.d/depot-ops
+          sudo visudo -c
+    alternatives:
+      - id: cmnd-alias
+        description: A Cmnd_Alias in a drop-in written with visudo's EDITOR.
+        steps:
+          - on: depot-1
+            as: learner
+            run: |
+              printf '%s\n' '#!/bin/sh' 'for f; do :; done' 'printf "Cmnd_Alias DEPOT_AGENT = /usr/sbin/service tr-depot-agent restart\n%%depot-ops ALL = (root) DEPOT_AGENT\n" > "$f"' > /tmp/ed
+              chmod +x /tmp/ed
+              sudo EDITOR=/tmp/ed visudo -f /etc/sudoers.d/90-depot-ops
+              sudo chmod 0440 /etc/sudoers.d/90-depot-ops

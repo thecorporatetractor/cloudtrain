@@ -1,0 +1,105 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xel-add-pv-extend-vg
+  title: Extend a volume group with a new partition
+  domain: linux
+  frameworks: [rhcsa-aligned:local-storage]
+  difficulty: medium
+  estimatedMinutes: 6
+  tags: [exam, lvm, partitions]
+  version: 1
+spec:
+  description: |
+    **Host:** node 1, `tr-el-01` (`ssh tr-el-01`, then `sudo -i`)
+
+    The volume group **`vgyard`** lives on the first partition of **`/dev/vdd`** and
+    is almost full. Create a **new partition in the remaining free space of
+    `/dev/vdd`** (at least **{{size}} MiB**) and **add it to `vgyard`**. The yard
+    data mounted at `/srv/yard` must stay intact and mounted.
+  objectives:
+    - Add a physical volume to an existing volume group without data loss
+  params:
+    size:
+      type: choice
+      values: ["400", "450", "500"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-el-01
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["2Gi", "1Gi", "2Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-el-01
+      timeoutSec: 180
+      run: |
+        set -eu
+        if ! vgs vgyard >/dev/null 2>&1; then
+          parted -s /dev/vdd mklabel gpt mkpart yard1 1MiB 401MiB
+          udevadm settle
+          pvcreate -y /dev/vdd1; vgcreate vgyard /dev/vdd1
+          lvcreate -y -n lvyard -l 100%FREE vgyard
+          mkfs.xfs -q /dev/vgyard/lvyard
+          mkdir -p /srv/yard
+          echo '/dev/mapper/vgyard-lvyard /srv/yard xfs defaults 0 0' >> /etc/fstab
+          systemctl daemon-reload; mount /srv/yard
+          seq 1 5000 | sed 's/^/wagon /' > /srv/yard/wagons.txt
+          install -d -m 0700 /var/lib/cloudtrain
+          sha256sum /srv/yard/wagons.txt > /var/lib/cloudtrain/xel-yard.sha
+        fi
+  checks:
+    - id: two-pvs
+      description: vgyard has a second physical volume on a new /dev/vdd partition
+      type: shell
+      on: tr-el-01
+      skills: [linux.storage.lvm]
+      weight: 2
+      command: |
+        pvs --noheadings -o pv_name -S vg_name=vgyard 2>/dev/null | tr -d ' ' | sort | paste -sd, | sed 's#/dev/vdd1,/dev/vdd[2-9]#vdd1+new#'
+      expect: {match: exact, value: "vdd1+new"}
+    - id: grown
+      description: vgyard grew by at least the requested size
+      type: shell
+      on: tr-el-01
+      skills: [linux.storage.lvm]
+      weight: 1
+      command: s=$(vgs --noheadings --units m --nosuffix -o vg_size vgyard 2>/dev/null | tr -d ' ' | cut -d. -f1); [ "${s:-0}" -ge $((396 + {{size}})) ] && echo grown || echo "size=$s"
+      expect: {match: exact, value: grown}
+    - id: data-intact
+      description: The yard data is intact and still mounted
+      type: shell
+      on: tr-el-01
+      skills: [linux.storage.lvm]
+      weight: 1
+      command: findmnt -n /srv/yard >/dev/null && sha256sum -c --quiet /var/lib/cloudtrain/xel-yard.sha >/dev/null 2>&1 && echo intact || echo damaged
+      expect: {match: exact, value: intact}
+  misconceptions:
+    - id: no-vgextend
+      description: Creates the physical volume but never adds it to the group.
+      feedback: "pvcreate only prepares the partition; vgextend vgyard <partition> adds it."
+      expectFail: [two-pvs, grown]
+      mutation:
+        on: tr-el-01
+        as: learner
+        run: |
+          set -e
+          sudo parted -s /dev/vdd mkpart yard2 401MiB 100%
+          sudo udevadm settle
+          sudo pvcreate -y /dev/vdd2
+  solution:
+    explanation: parted adds a partition after the first one, pvcreate initialises it and vgextend adds it to the volume group; the mounted volume is not touched.
+    steps:
+      - on: tr-el-01
+        as: learner
+        run: |
+          set -e
+          sudo parted -s /dev/vdd mkpart yard2 401MiB 100%
+          sudo udevadm settle
+          sudo pvcreate -y /dev/vdd2
+          sudo vgextend vgyard /dev/vdd2

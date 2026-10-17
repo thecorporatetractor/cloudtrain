@@ -1,0 +1,111 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xel-swap-partition
+  title: Add a swap partition without touching existing ones
+  domain: linux
+  frameworks: [rhcsa-aligned:local-storage]
+  difficulty: medium
+  estimatedMinutes: 6
+  tags: [exam, swap, partitions]
+  version: 1
+spec:
+  description: |
+    **Host:** node 1, `tr-el-01` (`ssh tr-el-01`, then `sudo -i`)
+
+    Node 1 runs short of memory during the nightly fare export. Add a **swap
+    partition of {{size}} MiB** on the spare disk **`/dev/vdc`** (GPT, with free
+    space; other tasks may use that disk too, so only add to it). The new swap must
+    be **active now and after every boot**. The swap space the host already uses
+    must stay **active and configured** as it is.
+  objectives:
+    - Create a swap partition and activate it persistently
+  params:
+    size:
+      type: choice
+      values: ["256", "320", "384", "448"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-el-01
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["2Gi", "1Gi", "2Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-el-01
+      timeoutSec: 120
+      run: |
+        set -eu
+        parted -s /dev/vdc print 2>/dev/null | grep -q '^Partition Table: gpt' || parted -s /dev/vdc mklabel gpt
+        if ! swapon --show=NAME --noheadings | grep -qx /var/swap/base.swap; then
+          mkdir -p /var/swap
+          dd if=/dev/zero of=/var/swap/base.swap bs=1M count=64 status=none
+          chmod 0600 /var/swap/base.swap
+          mkswap -q /var/swap/base.swap
+          swapon /var/swap/base.swap
+          grep -q base.swap /etc/fstab || echo '/var/swap/base.swap none swap defaults 0 0' >> /etc/fstab
+        fi
+  checks:
+    - id: new-swap
+      description: A swap partition of about the requested size on /dev/vdc is active
+      type: shell
+      on: tr-el-01
+      skills: [linux.storage.swap]
+      weight: 1.5
+      command: |
+        swapon --show=NAME,SIZE --bytes --noheadings | awk -v want={{size}} '$1 ~ /^\/dev\/vdc[0-9]+$/ { m = $2 / 1048576; if (m >= want - 8 && m <= want + 8) ok = 1 } END { print ok ? "active" : "missing" }'
+      expect: {match: exact, value: active}
+    - id: persistent
+      description: /etc/fstab activates the new swap partition at boot
+      type: shell
+      on: tr-el-01
+      skills: [linux.storage.swap]
+      weight: 1.5
+      command: |
+        p=$(swapon --show=NAME --noheadings | grep '^/dev/vdc' | head -1)
+        [ -n "$p" ] || { echo none; exit 0; }
+        u=$(blkid -s UUID -o value $p)
+        awk -v p=$p -v u="UUID=$u" -v pu="PARTUUID=$(blkid -s PARTUUID -o value $p)" '$3 == "swap" && ($1 == p || $1 == u || $1 == pu) {f=1} END {print f ? "fstab" : "none"}' /etc/fstab
+      expect: {match: exact, value: fstab}
+    - id: existing-kept
+      description: The existing swap file is still active and in /etc/fstab
+      type: shell
+      on: tr-el-01
+      skills: [linux.storage.swap]
+      weight: 1
+      command: swapon --show=NAME --noheadings | grep -qx /var/swap/base.swap && grep -q '^/var/swap/base.swap' /etc/fstab && echo kept || echo lost
+      expect: {match: exact, value: kept}
+  misconceptions:
+    - id: not-persistent
+      description: Activates the swap with swapon only.
+      feedback: "swapon lasts until the next boot; add the partition (by UUID) to /etc/fstab."
+      expectFail: [persistent]
+      mutation:
+        on: tr-el-01
+        as: learner
+        run: |
+          set -e
+          sudo parted -s /dev/vdc mkpart trswap linux-swap 1MiB $((1 + {{size}}))MiB
+          sudo udevadm settle
+          p=$(lsblk -nrpo NAME,PARTLABEL /dev/vdc | awk '$2 == "trswap" {print $1}')
+          sudo mkswap -q $p && sudo swapon $p
+  solution:
+    explanation: parted adds a partition in free space, mkswap formats it, the fstab entry by UUID activates it at boot and swapon -a activates it now.
+    steps:
+      - on: tr-el-01
+        as: learner
+        run: |
+          set -e
+          start=$(sudo parted -s -m /dev/vdc unit MiB print free | awk -F: '$5 == "free;" {s=$2} END {sub("MiB","",s); print int(s) + 1}')
+          sudo parted -s /dev/vdc mkpart trswap linux-swap ${start}MiB $((start + {{size}}))MiB
+          sudo udevadm settle
+          p=$(lsblk -nrpo NAME,PARTLABEL /dev/vdc | awk '$2 == "trswap" {print $1}')
+          sudo mkswap -q $p
+          echo "UUID=$(sudo blkid -s UUID -o value $p) none swap defaults 0 0" | sudo tee -a /etc/fstab >/dev/null
+          sudo systemctl daemon-reload
+          sudo swapon -a

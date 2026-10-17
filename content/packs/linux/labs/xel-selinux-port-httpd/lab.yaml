@@ -1,0 +1,145 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xel-selinux-port-httpd
+  title: Serve web content on a non-standard port under SELinux
+  domain: linux
+  frameworks: [rhcsa-aligned:security]
+  difficulty: hard
+  estimatedMinutes: 10
+  tags: [exam, selinux, httpd, firewalld]
+  version: 1
+spec:
+  description: |
+    **Host:** node 1, `tr-el-01` (`ssh tr-el-01`, then `sudo -i`); test from node 2
+    `tr-el-02`
+
+    The departure-board web server on node 1 is configured to serve
+    **`/srv/departures`** on **TCP port {{port}}** (`/etc/httpd/conf.d/departures.conf`),
+    but it does not start. Make it work:
+
+    - `httpd` serves the existing page **`http://tr-el-01:{{port}}/`** to clients on
+      node 2, now and **after a reboot**;
+    - **SELinux stays enforcing**; fix the policy settings persistently instead of
+      relaxing it. Do not move the content or change the port.
+  objectives:
+    - Label a non-standard port and a content directory for httpd in SELinux
+    - Open the port in firewalld
+  params:
+    port:
+      type: choice
+      values: ["82", "8909", "8989", "9443"]
+    token:
+      type: int
+      min: 1000
+      max: 9999
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-el-01
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["2Gi", "1Gi", "2Gi"]}
+        access: [ssh, console]
+      - name: tr-el-02
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536}
+        access: [ssh, console]
+  setup:
+    - on: tr-el-01
+      timeoutSec: 240
+      run: |
+        set -eu
+        rpm -q httpd >/dev/null 2>&1 || dnf -y -q install httpd
+        mkdir -p /srv/departures
+        echo "<h1>Tallowmere departures</h1><p>board {{token}}</p>" > /srv/departures/index.html
+        chcon -R -t default_t /srv/departures 2>/dev/null || true
+        cat > /etc/httpd/conf.d/departures.conf <<'CONF'
+        Listen {{port}}
+        <VirtualHost *:{{port}}>
+            DocumentRoot /srv/departures
+            <Directory /srv/departures>
+                Require all granted
+            </Directory>
+        </VirtualHost>
+        CONF
+        systemctl disable --now httpd >/dev/null 2>&1 || true
+        setenforce 1
+  checks:
+    - id: enforcing
+      description: SELinux is enforcing now and in the configuration
+      type: shell
+      on: tr-el-01
+      skills: [linux.security.selinux-contexts]
+      weight: 0.5
+      command: echo "$(getenforce) $(sed -n 's/^SELINUX=//p' /etc/selinux/config)"
+      expect: {match: exact, value: "Enforcing enforcing"}
+    - id: served
+      description: Node 2 gets the departure board from port {{port}}
+      type: shell
+      on: tr-el-02
+      skills: [linux.security.selinux-contexts, linux.net.firewalld]
+      weight: 2
+      timeoutSec: 30
+      command: curl -s -m 8 http://tr-el-01:{{port}}/ | grep -o 'board {{token}}' || echo unreachable
+      expect: {match: exact, value: "board {{token}}"}
+    - id: port-label
+      description: The port is labelled http_port_t in the persistent policy
+      type: shell
+      on: tr-el-01
+      skills: [linux.security.selinux-contexts]
+      weight: 1
+      command: semanage port -l -C 2>/dev/null | awk '$1 == "http_port_t" && $2 == "tcp"' | grep -qw {{port}} && echo labelled || { semanage port -l | awk '$1 == "http_port_t" && $2 == "tcp"' | grep -qw {{port}} && echo labelled || echo missing; }
+      expect: {match: exact, value: labelled}
+    - id: fcontext
+      description: The content has a web content type that survives a relabel
+      type: shell
+      on: tr-el-01
+      skills: [linux.security.selinux-contexts]
+      weight: 1
+      command: |
+        t=$(matchpathcon -n /srv/departures/index.html 2>/dev/null | cut -d: -f3); a=$(stat -c %C /srv/departures/index.html | cut -d: -f3)
+        case "$t" in httpd_sys_content_t|httpd_sys_rw_content_t|public_content_t) [ "$a" = "$t" ] && echo persistent || echo "actual=$a" ;; *) echo "policy=$t" ;; esac
+      expect: {match: exact, value: persistent}
+    - id: enabled
+      description: httpd starts at boot
+      type: shell
+      on: tr-el-01
+      skills: [linux.security.selinux-contexts]
+      weight: 0.5
+      command: systemctl is-enabled httpd 2>/dev/null || echo disabled
+      expect: {match: exact, value: enabled}
+  misconceptions:
+    - id: chcon-only
+      description: Fixes the file label with chcon, which a relabel undoes.
+      feedback: "chcon changes the label until the next restorecon or relabel; record the rule with semanage fcontext -a, then restorecon."
+      expectFail: [fcontext]
+      mutation:
+        on: tr-el-01
+        as: learner
+        timeoutSec: 120
+        run: |
+          set -e
+          [ {{port}} = 82 ] || sudo semanage port -a -t http_port_t -p tcp {{port}} 2>/dev/null || sudo semanage port -m -t http_port_t -p tcp {{port}}
+          sudo chcon -R -t httpd_sys_content_t /srv/departures
+          sudo firewall-cmd -q --permanent --add-port={{port}}/tcp; sudo firewall-cmd -q --reload
+          sudo systemctl enable --now httpd
+  solution:
+    explanation: semanage port adds the port to http_port_t, semanage fcontext plus restorecon label the content persistently, firewalld opens the port and systemctl enables httpd.
+    steps:
+      - on: tr-el-01
+        as: learner
+        timeoutSec: 180
+        run: |
+          set -e
+          sudo semanage port -a -t http_port_t -p tcp {{port}} 2>/dev/null || sudo semanage port -m -t http_port_t -p tcp {{port}}
+          sudo semanage fcontext -a -t httpd_sys_content_t '/srv/departures(/.*)?'
+          sudo restorecon -R /srv/departures
+          sudo firewall-cmd -q --permanent --add-port={{port}}/tcp
+          sudo firewall-cmd -q --reload
+          sudo systemctl enable --now httpd

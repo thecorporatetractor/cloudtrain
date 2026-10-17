@@ -1,0 +1,130 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xel-scp-remote-copy
+  title: Copy files securely between the two nodes
+  domain: linux
+  frameworks: [rhcsa-aligned:essential-tools]
+  difficulty: easy
+  estimatedMinutes: 5
+  tags: [exam, scp, ssh]
+  version: 1
+spec:
+  description: |
+    **Hosts:** node 1 `tr-el-01`, node 2 `tr-el-02` (both reachable as `learner` with
+    `ssh` from the workstation)
+
+    The depot manifests of batch **{{batch}}** were prepared on node 2 in
+    **`/srv/outbound/manifests-{{batch}}`** (owned by `learner`). Copy that directory
+    **over SSH** to node 1 so that it ends up as
+    **`/srv/inbound/manifests-{{batch}}`**, with every file's **mode and
+    modification time preserved**.
+  objectives:
+    - Copy a directory tree between hosts over SSH keeping modes and times
+  params:
+    batch:
+      type: int
+      min: 100
+      max: 999
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-el-01
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["2Gi", "1Gi", "2Gi"]}
+        access: [ssh, console]
+      - name: tr-el-02
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536}
+        access: [ssh, console]
+  setup:
+    - on: tr-el-02
+      run: |
+        set -eu
+        d=/srv/outbound/manifests-{{batch}}
+        rm -rf /srv/outbound; mkdir -p $d/wagons
+        i=0
+        for f in loco.txt crew.txt hazmat.txt wagons/a.csv wagons/b.csv run.sh; do
+          i=$((i + 1)); echo "batch {{batch}} part $i $f" > $d/$f
+          touch -d "2026-0$i-0$i 1$i:0$i:00" $d/$f
+        done
+        chmod 0600 $d/hazmat.txt; chmod 0640 $d/crew.txt; chmod 0750 $d/run.sh; chmod 0644 $d/loco.txt $d/wagons/*.csv
+        chown -R learner:learner /srv/outbound
+    - on: tr-el-01
+      run: |
+        set -eu
+        rm -rf /srv/inbound; install -d -o learner -g learner /srv/inbound
+        install -d -m 0700 /var/lib/cloudtrain
+        i=0
+        for f in loco.txt crew.txt hazmat.txt wagons/a.csv wagons/b.csv run.sh; do
+          i=$((i + 1)); echo "$f $(date -d "2026-0$i-0$i 1$i:0$i:00" +%s)"
+        done > /var/lib/cloudtrain/xel-scp.times
+        printf '%s\n' "loco.txt 644" "crew.txt 640" "hazmat.txt 600" "wagons/a.csv 644" "wagons/b.csv 644" "run.sh 750" > /var/lib/cloudtrain/xel-scp.modes
+  checks:
+    - id: copied
+      description: Every file arrived on node 1 with its content
+      type: shell
+      on: tr-el-01
+      skills: [linux.remote.ssh]
+      weight: 1.5
+      command: |
+        d=/srv/inbound/manifests-{{batch}}; ok=0; i=0
+        for f in loco.txt crew.txt hazmat.txt wagons/a.csv wagons/b.csv run.sh; do
+          i=$((i + 1)); [ "$(cat $d/$f 2>/dev/null)" = "batch {{batch}} part $i $f" ] && ok=$((ok + 1))
+        done; echo "files=$ok"
+      expect: {match: exact, value: "files=6"}
+    - id: modes
+      description: The file modes were preserved
+      type: shell
+      on: tr-el-01
+      skills: [linux.remote.ssh]
+      weight: 1
+      command: |
+        d=/srv/inbound/manifests-{{batch}}; bad=0
+        while read -r f m; do [ "$(stat -c %a $d/$f 2>/dev/null)" = "$m" ] || bad=$((bad + 1)); done < /var/lib/cloudtrain/xel-scp.modes
+        echo "bad=$bad"
+      expect: {match: exact, value: "bad=0"}
+    - id: times
+      description: The modification times were preserved
+      type: shell
+      on: tr-el-01
+      skills: [linux.remote.ssh]
+      weight: 1
+      command: |
+        d=/srv/inbound/manifests-{{batch}}; bad=0
+        while read -r f t; do [ "$(stat -c %Y $d/$f 2>/dev/null)" = "$t" ] || bad=$((bad + 1)); done < /var/lib/cloudtrain/xel-scp.times
+        echo "bad=$bad"
+      expect: {match: exact, value: "bad=0"}
+  misconceptions:
+    - id: no-preserve
+      description: Copies recursively without -p.
+      feedback: "scp -r alone stamps the copies with the current time; -p keeps modification times and modes."
+      expectFail: [times]
+      mutation:
+        on: workstation
+        as: learner
+        run: scp -3 -r tr-el-02:/srv/outbound/manifests-{{batch}} tr-el-01:/srv/inbound/
+  solution:
+    explanation: scp -r copies the tree, -p keeps modes and times, -3 relays through the workstation that holds the keys for both nodes.
+    steps:
+      - on: workstation
+        as: learner
+        run: scp -3 -rp tr-el-02:/srv/outbound/manifests-{{batch}} tr-el-01:/srv/inbound/
+    alternatives:
+      - id: rsync-over-ssh
+        description: rsync -a over ssh from the workstation in two hops.
+        steps:
+          - on: workstation
+            as: learner
+            run: |
+              set -e
+              t=$(mktemp -d)
+              rsync -a tr-el-02:/srv/outbound/manifests-{{batch}} $t/
+              rsync -a $t/manifests-{{batch}} tr-el-01:/srv/inbound/
+              rm -rf $t

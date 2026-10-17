@@ -1,0 +1,215 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: hunt-escalation-paths
+  title: Find and close local privilege-escalation paths
+  domain: linux
+  frameworks: [linuxplus:security]
+  difficulty: hard
+  estimatedMinutes: 35
+  tags: [security, sudo, setuid, cron, privilege-escalation, audit]
+  version: 1
+spec:
+  description: |
+    A penetration test of the ticket web host `tkt-web-02` reported "three ways from
+    any local account to root" but the report was lost. Find them again and close
+    them. You have `sudo` for the fixes; start the hunt the way an attacker would,
+    as an ordinary user (`find`, `ls -l`, `sudo -l`, `cat` of what is readable).
+
+    The three paths are one of each:
+
+    - a **sudo rule** that lets the operations account `tkt-ops` run, as root, a
+      command that can start a shell;
+    - an unexpected **setuid-root** file;
+    - a **job run by root** whose script **any user can modify**.
+
+    Write the findings to **`~/audit/escalation.txt`**, exactly three lines:
+
+    ```
+    sudo-rule <full path of the command the rule wrongly allows>
+    setuid <full path of the setuid file>
+    writable <full path of the script>
+    ```
+
+    Then close each path **without breaking the service**: `tkt-ops` keeps its
+    legitimate sudo rule for `/usr/local/sbin/tkt-restart`, the root job keeps
+    running from cron, and the system's own setuid programs (`sudo`, `passwd`, `su`
+    and so on) keep working.
+  objectives:
+    - Enumerate setuid files, sudo rules and root cron jobs
+    - Recognise commands that allow shell escapes under sudo
+    - Close escalation paths without breaking legitimate use
+  params:
+    shellbin:
+      type: choice
+      values: [/usr/bin/find, /usr/bin/vim, /usr/bin/less, /usr/bin/awk]
+    suidpath:
+      type: choice
+      values: [/usr/local/bin/tkt-diag, /opt/tkt/bin/report-helper, /usr/local/sbin/logview]
+    job:
+      type: choice
+      values: [cleanup, rotate-sessions, purge-cache]
+  topology:
+    entry: tkt-web-02
+    nodes:
+      - name: tkt-web-02
+        driver: container
+        image: el-lab:10
+        learnerSudo: true
+        access: [shell]
+  setup:
+    - on: tkt-web-02
+      run: |
+        set -eu
+        echo 'learner ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/learner
+        chmod 0440 /etc/sudoers.d/learner
+        id tkt-ops >/dev/null 2>&1 || useradd -m tkt-ops
+        mkdir -p /opt/tkt/bin /opt/tkt/jobs /srv/tkt/upload /usr/local/sbin /usr/local/bin
+        chmod 1777 /srv/tkt/upload
+        printf '%s\n' '#!/bin/sh' 'echo "tkt-web restarted (training stub)"' > /usr/local/sbin/tkt-restart
+        chmod 0755 /usr/local/sbin/tkt-restart
+        printf '%s\n' '# Ticketing operations (CHG-4410)' 'tkt-ops ALL=(root) NOPASSWD: /usr/local/sbin/tkt-restart' 'tkt-ops ALL=(root) NOPASSWD: {{shellbin}}' > /etc/sudoers.d/20-tkt-ops
+        chmod 0440 /etc/sudoers.d/20-tkt-ops
+        visudo -cq
+        cp "$(readlink -f /usr/bin/python3)" {{suidpath}}
+        chown root:root {{suidpath}}; chmod 4755 {{suidpath}}
+        printf '%s\n' '#!/bin/sh' '# remove expired ticket sessions' 'find /srv/tkt/upload -type f -mmin +120 -delete' > /opt/tkt/jobs/{{job}}.sh
+        chown root:root /opt/tkt/jobs/{{job}}.sh; chmod 0777 /opt/tkt/jobs/{{job}}.sh
+        for j in cleanup rotate-sessions purge-cache; do [ $j = {{job}} ] || { printf '%s\n' '#!/bin/sh' 'exit 0' > /opt/tkt/jobs/$j.sh; chmod 0755 /opt/tkt/jobs/$j.sh; }; done
+        echo '*/10 * * * * root /opt/tkt/jobs/{{job}}.sh' > /etc/cron.d/tkt-{{job}}
+        chmod 0644 /etc/cron.d/tkt-{{job}}
+        install -d -o learner -g learner /home/learner/audit
+        rm -f /home/learner/audit/escalation.txt
+  checks:
+    - id: report-findings
+      description: The report names the sudo command, the setuid file and the writable script
+      type: shell
+      on: tkt-web-02
+      skills: [linux.security.privilege-audit]
+      weight: 2
+      command: |
+        f=/home/learner/audit/escalation.txt; n=0
+        for l in "sudo-rule {{shellbin}}" "setuid {{suidpath}}" "writable /opt/tkt/jobs/{{job}}.sh"; do
+          sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//' $f 2>/dev/null | grep -qxF "$l" && n=$((n+1))
+        done
+        echo $n
+      expect: {match: exact, value: "3"}
+    - id: report-precise
+      description: The report has exactly three lines (no lists of everything)
+      type: shell
+      on: tkt-web-02
+      skills: [linux.security.privilege-audit]
+      weight: 1
+      command: grep -c . /home/learner/audit/escalation.txt 2>/dev/null || echo 0
+      expect: {match: exact, value: "3"}
+    - id: sudo-closed
+      description: tkt-ops can no longer run the shell-capable command as root, and sudoers is valid
+      type: shell
+      on: tkt-web-02
+      skills: [linux.security.privilege-audit, linux.users.sudo]
+      weight: 1.5
+      command: |
+        visudo -cq >/dev/null 2>&1 || { echo invalid; exit 0; }
+        sudo -n -l -U tkt-ops 2>/dev/null | grep -qE '(^|[ ,:])({{shellbin}}|ALL)([ ,]|$)' && echo open || echo closed
+      expect: {match: exact, value: closed}
+    - id: legit-rule-kept
+      description: tkt-ops keeps its tkt-restart rule
+      type: shell
+      on: tkt-web-02
+      skills: [linux.users.sudo]
+      weight: 0.5
+      command: sudo -n -l -U tkt-ops 2>/dev/null | grep -q '/usr/local/sbin/tkt-restart' && echo kept || echo lost
+      expect: {match: exact, value: kept}
+    - id: setuid-closed
+      description: The unexpected file is no longer setuid root
+      type: shell
+      on: tkt-web-02
+      skills: [linux.security.privilege-audit, linux.files.special-bits]
+      weight: 1.5
+      command: '[ -e {{suidpath}} ] && [ -u {{suidpath}} ] && echo open || echo closed'
+      expect: {match: exact, value: closed}
+    - id: job-safe
+      description: The root job still runs from cron and its script is writable by root only
+      type: shell
+      on: tkt-web-02
+      skills: [linux.security.privilege-audit, linux.files.permissions]
+      weight: 1.5
+      command: |
+        s=/opt/tkt/jobs/{{job}}.sh
+        grep -qs "root $s" /etc/cron.d/* || { echo job-removed; exit 0; }
+        [ -f $s ] && [ -x $s ] || { echo script-missing; exit 0; }
+        [ "$(stat -c %U $s)" = root ] && [ $(( 0$(stat -c %a $s) & 022 )) -eq 0 ] && [ $(( 0$(stat -c %a $(dirname $s)) & 002 )) -eq 0 ] && echo safe || echo writable
+      expect: {match: exact, value: safe}
+    - id: system-intact
+      description: The system's own setuid programs still work
+      type: shell
+      on: tkt-web-02
+      skills: [linux.files.special-bits]
+      weight: 1
+      command: '[ -u /usr/bin/sudo ] && [ -u /usr/bin/passwd ] && [ -u /usr/bin/su ] && echo intact || echo broken'
+      expect: {match: exact, value: intact}
+  hints:
+    - title: Setuid files
+      body: "`find / -xdev -perm -4000 -type f 2>/dev/null` lists them. Compare with what the distribution ships: `rpm -qf FILE` says which package owns a file, and an unowned setuid binary stands out."
+      cost: 1
+    - title: Sudo rules
+      body: "`sudo -l -U tkt-ops` (as root) lists what tkt-ops may run. Any editor, pager, find, awk, tar or interpreter run as root can start a shell (GTFOBins has the list)."
+      cost: 1
+    - title: Root's scheduled jobs
+      body: "Look at /etc/crontab, /etc/cron.d and `sudo crontab -l`, then at the permissions of every script they run (and of its directory)."
+      cost: 1
+    - title: Closing without breaking
+      body: "Remove only the bad line from the sudoers.d file (edit with `sudo visudo -f FILE`), `chmod u-s` or delete the setuid copy, and `chmod 755` the script. Do not delete the job or strip setuid from everything."
+      cost: 2
+  misconceptions:
+    - id: deletes-sudo-file
+      description: Deletes tkt-ops' whole sudoers file.
+      feedback: "tkt-ops legitimately needs tkt-restart. Remove only the line that grants the shell-capable command."
+      expectFail: [legit-rule-kept]
+      mutation:
+        on: tkt-web-02
+        as: learner
+        run: |
+          printf '%s\n' 'sudo-rule {{shellbin}}' 'setuid {{suidpath}}' 'writable /opt/tkt/jobs/{{job}}.sh' > ~/audit/escalation.txt
+          sudo rm -f /etc/sudoers.d/20-tkt-ops
+          sudo chmod u-s {{suidpath}}
+          sudo chmod 0755 /opt/tkt/jobs/{{job}}.sh
+    - id: deletes-job
+      description: Removes the cron job instead of fixing the script's permissions.
+      feedback: "The cleanup job is needed; the problem is who can write its script. chmod 755 (owner root) closes the path and keeps the job."
+      expectFail: [job-safe]
+      mutation:
+        on: tkt-web-02
+        as: learner
+        run: |
+          printf '%s\n' 'sudo-rule {{shellbin}}' 'setuid {{suidpath}}' 'writable /opt/tkt/jobs/{{job}}.sh' > ~/audit/escalation.txt
+          sudo sh -c "grep -v '{{shellbin}}' /etc/sudoers.d/20-tkt-ops > /tmp/s && cat /tmp/s > /etc/sudoers.d/20-tkt-ops"
+          sudo chmod u-s {{suidpath}}
+          sudo rm -f /etc/cron.d/tkt-{{job}}
+    - id: strips-all-setuid
+      description: Strips the setuid bit from every file and reports every file found.
+      feedback: "sudo, passwd and su need setuid to work; only the unexpected file was the problem. The report should name the three findings, not every candidate."
+      expectFail: [system-intact, report-precise]
+      mutation:
+        on: tkt-web-02
+        as: learner
+        run: |
+          find / -xdev -perm -4000 -type f 2>/dev/null | sed 's/^/setuid /' > ~/audit/escalation.txt
+          printf '%s\n' 'sudo-rule {{shellbin}}' 'writable /opt/tkt/jobs/{{job}}.sh' >> ~/audit/escalation.txt
+          sudo sh -c "grep -v '{{shellbin}}' /etc/sudoers.d/20-tkt-ops > /tmp/s && cat /tmp/s > /etc/sudoers.d/20-tkt-ops; chmod 0755 /opt/tkt/jobs/{{job}}.sh; find / -xdev -perm -4000 -type f -exec chmod u-s {} +"
+  solution:
+    explanation: find -perm -4000 reveals the unowned setuid copy, sudo -l -U tkt-ops the shell-capable rule, /etc/cron.d the world-writable script; fix each narrowly.
+    steps:
+      - on: tkt-web-02
+        as: learner
+        timeoutSec: 120
+        run: |
+          set -e
+          suid=$(find / -xdev -perm -4000 -type f 2>/dev/null | while read -r f; do rpm -qf "$f" >/dev/null 2>&1 || echo "$f"; done | head -n 1)
+          cmd=$(sudo cat /etc/sudoers.d/20-tkt-ops | awk '/^tkt-ops/ && !/tkt-restart/ {print $NF}')
+          job=$(sudo awk '$6 == "root" {print $7}' /etc/cron.d/* | while read -r s; do [ "$(( 0$(stat -c %a "$s") & 002 ))" -ne 0 ] && echo "$s"; done | head -n 1)
+          printf 'sudo-rule %s\nsetuid %s\nwritable %s\n' "$cmd" "$suid" "$job" > ~/audit/escalation.txt
+          cat ~/audit/escalation.txt
+          sudo sh -c "grep -vF '$cmd' /etc/sudoers.d/20-tkt-ops > /tmp/s && visudo -cqf /tmp/s && cat /tmp/s > /etc/sudoers.d/20-tkt-ops && rm -f /tmp/s"
+          sudo chmod u-s "$suid"
+          sudo chmod 0755 "$job"

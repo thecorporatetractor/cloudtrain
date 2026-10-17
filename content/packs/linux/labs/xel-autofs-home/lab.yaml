@@ -1,0 +1,124 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xel-autofs-home
+  title: Automount a remote user's home directory
+  domain: linux
+  frameworks: [rhcsa-aligned:filesystems]
+  difficulty: hard
+  estimatedMinutes: 10
+  tags: [exam, autofs, nfs]
+  version: 1
+spec:
+  description: |
+    **Hosts:** node 1 `tr-el-01` (configure here), node 2 `tr-el-02` (NFS server)
+
+    The crew member **`{{user}}`** (uid {{uid}}) already exists on node 1 with the home
+    directory **`/crew/{{user}}`**, which is empty. Node 2 exports the crew homes as
+    **`tr-el-02:/exports/crew`** over NFS.
+
+    Configure **autofs** on node 1 so that **`/crew/{{user}}`** is mounted **on demand**
+    from **`tr-el-02:/exports/crew/{{user}}`** (read-write) whenever it is accessed,
+    now and after a reboot. Do not mount it through `/etc/fstab`.
+  objectives:
+    - Configure an autofs indirect map for an NFS home directory
+  params:
+    user:
+      type: choice
+      values: [nerys, osian, peris, rhodri]
+    uid:
+      type: int
+      min: 3100
+      max: 3900
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-el-01
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["2Gi", "1Gi", "2Gi"]}
+        access: [ssh, console]
+      - name: tr-el-02
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536}
+        access: [ssh, console]
+  setup:
+    - on: tr-el-02
+      timeoutSec: 240
+      run: |
+        set -eu
+        mkdir -p /exports/crew/{{user}}
+        echo "home of {{user}} on tr-el-02" > /exports/crew/{{user}}/.crew-profile
+        chown -R {{uid}}:{{uid}} /exports/crew/{{user}}
+        echo '/exports/crew *(rw,sync,no_subtree_check)' > /etc/exports.d/crew.exports
+        systemctl enable --now nfs-server
+        exportfs -ra
+        for s in nfs mountd rpc-bind; do firewall-cmd -q --permanent --add-service=$s; done
+        firewall-cmd -q --reload
+    - on: tr-el-01
+      timeoutSec: 120
+      run: |
+        set -eu
+        mkdir -p /crew
+        id {{user}} >/dev/null 2>&1 || useradd -u {{uid}} -M -d /crew/{{user}} {{user}}
+        rpm -q autofs >/dev/null 2>&1 && systemctl disable --now autofs >/dev/null 2>&1 || true
+  checks:
+    - id: automounted
+      description: Accessing /crew/{{user}} mounts the NFS home from node 2
+      type: shell
+      on: tr-el-01
+      skills: [linux.storage.network-mounts]
+      weight: 2
+      timeoutSec: 60
+      command: |
+        c=$(timeout 30 cat /crew/{{user}}/.crew-profile 2>/dev/null)
+        s=$(findmnt -n -t nfs,nfs4 -o SOURCE /crew/{{user}} 2>/dev/null)
+        [ "$c" = "home of {{user}} on tr-el-02" ] && case "$s" in tr-el-02:/exports/crew/{{user}}|*:/exports/crew/{{user}}) true ;; *) false ;; esac && echo nfs-home || echo "no src=$s"
+      expect: {match: exact, value: nfs-home}
+    - id: autofs-managed
+      description: The mount point is managed by autofs, which is enabled at boot
+      type: shell
+      on: tr-el-01
+      skills: [linux.storage.network-mounts]
+      weight: 1.5
+      command: |
+        a=$(findmnt -n -t autofs -o TARGET 2>/dev/null | grep -cxE '/crew|/crew/{{user}}')
+        echo "$(systemctl is-enabled autofs 2>/dev/null) autofs-mounts=$a"
+      expect: {match: exact, value: "enabled autofs-mounts=1"}
+    - id: no-fstab
+      description: The home is not mounted through /etc/fstab
+      type: shell
+      on: tr-el-01
+      skills: [linux.storage.network-mounts]
+      weight: 0.5
+      command: grep -v '^[[:space:]]*#' /etc/fstab | grep -q '/crew' && echo fstab || echo clean
+      expect: {match: exact, value: clean}
+  misconceptions:
+    - id: static-fstab
+      description: Mounts the NFS home statically from /etc/fstab.
+      feedback: "The task asks for an on-demand mount: an autofs master entry for /crew and a map with {{user}} (or *) pointing at tr-el-02:/exports/crew/..."
+      expectFail: [autofs-managed, no-fstab]
+      mutation:
+        on: tr-el-01
+        as: learner
+        run: |
+          echo "tr-el-02:/exports/crew/{{user}} /crew/{{user}} nfs rw,_netdev 0 0" | sudo tee -a /etc/fstab >/dev/null
+          sudo mkdir -p /crew/{{user}}; sudo systemctl daemon-reload; sudo mount /crew/{{user}}
+  solution:
+    explanation: An indirect autofs map mounts keys below /crew on demand; the wildcard key and & substitute the user name.
+    steps:
+      - on: tr-el-01
+        as: learner
+        timeoutSec: 180
+        run: |
+          set -e
+          sudo dnf -y -q install autofs
+          echo '/crew /etc/auto.crew' | sudo tee /etc/auto.master.d/crew.autofs >/dev/null
+          echo '* -rw,sync tr-el-02:/exports/crew/&' | sudo tee /etc/auto.crew >/dev/null
+          sudo systemctl enable --now autofs
+          sudo systemctl restart autofs

@@ -1,0 +1,132 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xel-repo-config
+  title: Configure the two local repositories
+  domain: linux
+  frameworks: [rhcsa-aligned:software]
+  difficulty: easy
+  estimatedMinutes: 6
+  tags: [exam, dnf, repositories]
+  version: 1
+spec:
+  description: |
+    **Host:** node 2, `tr-el-02` (`ssh tr-el-02`, then `sudo -i`)
+
+    Node 2 has no package repository configured. Configure it to install software
+    from the depot's classroom server:
+
+    - **BaseOS**: `http://tr-el-01:8800/el10/BaseOS`
+    - **AppStream**: `http://tr-el-01:8800/el10/AppStream`
+
+    Both repositories must be **enabled** and must **check package signatures**
+    (GPG checking on). The signing key is
+    `/etc/pki/rpm-gpg/RPM-GPG-KEY-AlmaLinux-10`. Do not use any other repository.
+  objectives:
+    - Configure dnf repositories with GPG checking
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-el-01
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["2Gi", "1Gi", "2Gi"]}
+        access: [ssh, console]
+      - name: tr-el-02
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536}
+        access: [ssh, console]
+  setup:
+    - on: tr-el-01
+      timeoutSec: 120
+      run: |
+        set -eu
+        mkdir -p /srv/classroom/el10
+        ln -sfn /opt/cloudtrain/repo/el10 /srv/classroom/el10/BaseOS
+        ln -sfn /opt/cloudtrain/repo/el10 /srv/classroom/el10/AppStream
+        cat > /etc/systemd/system/tr-classroom-repo.service <<'UNIT'
+        [Unit]
+        Description=Tallowmere classroom package server
+        After=network-online.target
+        [Service]
+        ExecStart=/usr/bin/python3 -m http.server 8800 --directory /srv/classroom
+        Restart=always
+        [Install]
+        WantedBy=multi-user.target
+        UNIT
+        systemctl daemon-reload; systemctl enable --now tr-classroom-repo
+        firewall-cmd -q --permanent --add-port=8800/tcp; firewall-cmd -q --reload
+    - on: tr-el-02
+      timeoutSec: 120
+      run: |
+        set -eu
+        mkdir -p /root/repos.disabled
+        for f in /etc/yum.repos.d/*.repo; do [ -e "$f" ] && mv "$f" /root/repos.disabled/; done
+        dnf clean all >/dev/null 2>&1 || true
+        for i in $(seq 30); do curl -sf -o /dev/null http://tr-el-01:8800/el10/BaseOS/repodata/repomd.xml && exit 0; sleep 2; done
+        echo "classroom repo not reachable" >&2; exit 1
+  checks:
+    - id: configured
+      description: BaseOS and AppStream are configured, enabled and GPG-checked
+      type: shell
+      on: tr-el-02
+      skills: [linux.packages.repositories]
+      weight: 2
+      command: |
+        python3 - <<'PY'
+        import configparser, glob
+        def truthy(v): return str(v).strip().lower() in ("1", "yes", "true", "on")
+        main = configparser.ConfigParser(interpolation=None, strict=False)
+        main.read("/etc/dnf/dnf.conf")
+        dflt = main.get("main", "gpgcheck", fallback="0")
+        want = {"http://tr-el-01:8800/el10/BaseOS", "http://tr-el-01:8800/el10/AppStream"}
+        found = set()
+        for f in glob.glob("/etc/yum.repos.d/*.repo"):
+            c = configparser.ConfigParser(interpolation=None, strict=False)
+            try:
+                c.read(f)
+            except Exception:
+                continue
+            for s in c.sections():
+                if not truthy(c.get(s, "enabled", fallback="1")):
+                    continue
+                gpg = truthy(c.get(s, "gpgcheck", fallback=dflt))
+                for u in c.get(s, "baseurl", fallback="").split():
+                    u = u.rstrip("/")
+                    if u in want and gpg:
+                        found.add(u)
+        print("both" if found == want else "found=" + ",".join(sorted(found)))
+        PY
+      expect: {match: exact, value: both}
+    - id: works
+      description: dnf can install packages from the repositories
+      type: shell
+      on: tr-el-02
+      skills: [linux.packages.repositories]
+      weight: 1
+      timeoutSec: 120
+      command: timeout 100 dnf -q --refresh repoquery tree 2>/dev/null | grep -q '^tree-' && echo works || echo broken
+      expect: {match: exact, value: works}
+  misconceptions:
+    - id: gpg-off
+      description: Configures the repositories with gpgcheck=0.
+      feedback: "The task requires signature checking: gpgcheck=1 and the key file as gpgkey."
+      expectFail: [configured]
+      mutation:
+        on: tr-el-02
+        as: learner
+        run: |
+          printf '[BaseOS]\nname=BaseOS\nbaseurl=http://tr-el-01:8800/el10/BaseOS\nenabled=1\ngpgcheck=0\n\n[AppStream]\nname=AppStream\nbaseurl=http://tr-el-01:8800/el10/AppStream\nenabled=1\ngpgcheck=0\n' | sudo tee /etc/yum.repos.d/classroom.repo >/dev/null
+  solution:
+    explanation: One .repo file in /etc/yum.repos.d with a section per repository, each with baseurl, enabled=1, gpgcheck=1 and the gpgkey.
+    steps:
+      - on: tr-el-02
+        as: learner
+        run: |
+          printf '[BaseOS]\nname=Classroom BaseOS\nbaseurl=http://tr-el-01:8800/el10/BaseOS\nenabled=1\ngpgcheck=1\ngpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-AlmaLinux-10\n\n[AppStream]\nname=Classroom AppStream\nbaseurl=http://tr-el-01:8800/el10/AppStream\nenabled=1\ngpgcheck=1\ngpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-AlmaLinux-10\n' | sudo tee /etc/yum.repos.d/classroom.repo >/dev/null
+          sudo dnf -q makecache

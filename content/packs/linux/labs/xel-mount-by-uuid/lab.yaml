@@ -1,0 +1,89 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xel-mount-by-uuid
+  title: Mount a logical volume by UUID
+  domain: linux
+  frameworks: [rhcsa-aligned:local-storage]
+  difficulty: easy
+  estimatedMinutes: 5
+  tags: [exam, lvm, fstab]
+  version: 1
+spec:
+  description: |
+    **Host:** node 1, `tr-el-01` (`ssh tr-el-01`, then `sudo -i`)
+
+    The logical volume **`vgexam/lvmanifest`** already holds an ext4 filesystem with
+    the freight manifests. Mount it at **`/srv/manifests`** with the mount option
+    **`{{opt}}`**, now and at every boot, referring to the filesystem **by its UUID**
+    in `/etc/fstab`.
+  objectives:
+    - Mount a filesystem persistently by UUID with mount options
+  params:
+    opt:
+      type: choice
+      values: [noexec, nosuid, nodev, noatime]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-el-01
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["2Gi", "1Gi", "2Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-el-01
+      timeoutSec: 120
+      run: |
+        set -eu
+        pvs /dev/vde >/dev/null 2>&1 || pvcreate -y /dev/vde
+        vgs vgexam >/dev/null 2>&1 || vgcreate vgexam /dev/vde
+        lvs vgexam/lvmanifest >/dev/null 2>&1 || { lvcreate -y -n lvmanifest -L 96M vgexam; mkfs.ext4 -q /dev/vgexam/lvmanifest; }
+  checks:
+    - id: mounted-opt
+      description: The volume is mounted at /srv/manifests with the requested option
+      type: shell
+      on: tr-el-01
+      skills: [linux.storage.mounts]
+      weight: 1
+      command: |
+        s=$(findmnt -n -o SOURCE /srv/manifests 2>/dev/null); o=$(findmnt -n -o OPTIONS /srv/manifests 2>/dev/null)
+        [ -n "$s" ] && [ "$(readlink -f "$s")" = "$(readlink -f /dev/vgexam/lvmanifest)" ] && echo ",$o," | grep -q ',{{opt}},' && echo ok || echo "no src=$s opts=$o"
+      expect: {match: exact, value: ok}
+    - id: fstab-uuid
+      description: /etc/fstab mounts it by UUID with the option
+      type: shell
+      on: tr-el-01
+      skills: [linux.storage.mounts]
+      weight: 2
+      command: |
+        u=$(blkid -s UUID -o value /dev/vgexam/lvmanifest)
+        awk -v u="UUID=$u" '$2 == "/srv/manifests" { gsub("\"", "", $1); if ($1 == u && ("," $4 ",") ~ /,{{opt}},/) ok = 1 } END { print ok ? "uuid" : "no" }' /etc/fstab
+      expect: {match: exact, value: uuid}
+  misconceptions:
+    - id: by-lv-path
+      description: Mounts by the LV path instead of the UUID.
+      feedback: "The task asks for UUID=... in the first fstab field (blkid shows it)."
+      expectFail: [fstab-uuid]
+      mutation:
+        on: tr-el-01
+        as: learner
+        run: |
+          sudo mkdir -p /srv/manifests
+          echo "/dev/vgexam/lvmanifest /srv/manifests ext4 defaults,{{opt}} 0 0" | sudo tee -a /etc/fstab >/dev/null
+          sudo systemctl daemon-reload; sudo mount /srv/manifests
+  solution:
+    explanation: blkid prints the filesystem UUID; an fstab line with UUID=..., the mount point and the option mounts it at boot, mount applies it now.
+    steps:
+      - on: tr-el-01
+        as: learner
+        run: |
+          set -e
+          sudo mkdir -p /srv/manifests
+          echo "UUID=$(sudo blkid -s UUID -o value /dev/vgexam/lvmanifest) /srv/manifests ext4 defaults,{{opt}} 0 0" | sudo tee -a /etc/fstab >/dev/null
+          sudo systemctl daemon-reload
+          sudo mount /srv/manifests

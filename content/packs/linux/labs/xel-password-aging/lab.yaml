@@ -1,0 +1,102 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xel-password-aging
+  title: Apply password aging to a user and defaults
+  domain: linux
+  frameworks: [rhcsa-aligned:users-groups]
+  difficulty: easy
+  estimatedMinutes: 5
+  tags: [exam, users, password-aging]
+  version: 1
+spec:
+  description: |
+    **Host:** node 1, `tr-el-01` (`ssh tr-el-01`, then `sudo -i`)
+
+    Security policy for the ticket office:
+
+    1. The existing user **`{{user}}`** must change their password at least every
+       **{{days}} days**.
+    2. Every account **created from now on** must get a maximum password age of
+       **{{newdays}} days** by default.
+
+    Existing accounts other than `{{user}}` keep their current settings.
+  objectives:
+    - Set a user's maximum password age
+    - Change the default password aging for new accounts
+  params:
+    user:
+      type: choice
+      values: [gwilym, hafren, ianto]
+    days:
+      type: choice
+      values: ["30", "45", "60"]
+    newdays:
+      type: choice
+      values: ["70", "80", "90"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-el-01
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["2Gi", "1Gi", "2Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-el-01
+      run: |
+        set -eu
+        id {{user}} >/dev/null 2>&1 || useradd {{user}}
+        id tr-peer >/dev/null 2>&1 || useradd tr-peer
+        chage -M 99999 {{user}}; chage -M 99999 tr-peer
+        sed -i 's/^PASS_MAX_DAYS.*/PASS_MAX_DAYS\t99999/' /etc/login.defs
+  checks:
+    - id: user-max
+      description: The user's maximum password age is {{days}} days
+      type: shell
+      on: tr-el-01
+      skills: [linux.users.password-aging]
+      weight: 1.5
+      command: getent shadow {{user}} | cut -d":" -f5
+      expect: {match: exact, value: "{{days}}"}
+    - id: defaults
+      description: New accounts get a maximum password age of {{newdays}} days
+      type: shell
+      on: tr-el-01
+      skills: [linux.users.password-aging]
+      weight: 1.5
+      command: |
+        u=trprobe$$; useradd -M $u >/dev/null 2>&1; v=$(getent shadow $u | cut -d: -f5); userdel $u >/dev/null 2>&1; echo "${v:-none}"
+      expect: {match: exact, value: "{{newdays}}"}
+    - id: others-kept
+      description: Other existing accounts are unchanged
+      type: shell
+      on: tr-el-01
+      skills: [linux.users.password-aging]
+      weight: 0.5
+      command: getent shadow tr-peer | cut -d":" -f5
+      expect: {match: exact, value: "99999"}
+  misconceptions:
+    - id: defaults-for-all
+      description: Applies the new default to every existing account with chage.
+      feedback: "PASS_MAX_DAYS in /etc/login.defs is the default for new accounts. Existing accounts other than {{user}} must not change."
+      expectFail: [others-kept]
+      mutation:
+        on: tr-el-01
+        as: learner
+        run: |
+          sudo sed -i 's/^PASS_MAX_DAYS.*/PASS_MAX_DAYS\t{{newdays}}/' /etc/login.defs
+          sudo chage -M {{newdays}} tr-peer
+          sudo chage -M {{days}} {{user}}
+  solution:
+    explanation: chage -M sets one account's maximum age; PASS_MAX_DAYS in /etc/login.defs is copied into accounts created later.
+    steps:
+      - on: tr-el-01
+        as: learner
+        run: |
+          sudo chage -M {{days}} {{user}}
+          sudo sed -i 's/^PASS_MAX_DAYS.*/PASS_MAX_DAYS\t{{newdays}}/' /etc/login.defs

@@ -1,0 +1,103 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xel-mount-by-label
+  title: Mount a new filesystem by label
+  domain: linux
+  frameworks: [rhcsa-aligned:local-storage]
+  difficulty: easy
+  estimatedMinutes: 6
+  tags: [exam, filesystems, fstab]
+  version: 1
+spec:
+  description: |
+    **Host:** node 1, `tr-el-01` (`ssh tr-el-01`, then `sudo -i`)
+
+    On **`/dev/vdc`** (GPT, with free space; other tasks may use that disk too, so only
+    add to it) create a new partition of **at least 320 MiB** (XFS needs 300 MiB). Put an **XFS**
+    filesystem on it with the **label `{{label}}`** and mount it at
+    **`/mnt/{{label}}`**, now and at every boot, **by its label** in `/etc/fstab`.
+  objectives:
+    - Label a filesystem and mount it persistently by label
+  params:
+    label:
+      type: choice
+      values: [ttarchive, rosterdata, signallogs, faredata]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-el-01
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["2Gi", "1Gi", "2Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-el-01
+      run: |
+        set -eu
+        parted -s /dev/vdc print 2>/dev/null | grep -q '^Partition Table: gpt' || parted -s /dev/vdc mklabel gpt
+  checks:
+    - id: labelled-xfs
+      description: An XFS filesystem with the label exists on a /dev/vdc partition of at least 320 MiB
+      type: shell
+      on: tr-el-01
+      skills: [linux.storage.mounts]
+      weight: 1
+      command: |
+        d=$(blkid -L {{label}} 2>/dev/null)
+        case "$d" in /dev/vdc[0-9]*) ;; *) echo "device=$d"; exit 0 ;; esac
+        [ "$(blkid -s TYPE -o value $d)" = xfs ] && [ $(blockdev --getsize64 $d) -ge $((319 * 1048576)) ] && echo ok || echo wrong
+      expect: {match: exact, value: ok}
+    - id: mounted
+      description: It is mounted at /mnt/{{label}}
+      type: shell
+      on: tr-el-01
+      skills: [linux.storage.mounts]
+      weight: 1
+      command: 'd=$(blkid -L {{label}} 2>/dev/null); [ -n "$d" ] && [ "$(findmnt -n -o SOURCE /mnt/{{label}} 2>/dev/null)" = "$d" ] && echo mounted || echo no'
+      expect: {match: exact, value: mounted}
+    - id: fstab-label
+      description: /etc/fstab mounts it by LABEL=
+      type: shell
+      on: tr-el-01
+      skills: [linux.storage.mounts]
+      weight: 1.5
+      command: awk '$2 == "/mnt/{{label}}" {print $1}' /etc/fstab | sed 's/"//g' | tail -1
+      expect: {match: exact, value: "LABEL={{label}}"}
+  misconceptions:
+    - id: by-device
+      description: Mounts by device name in /etc/fstab.
+      feedback: "Device names can change; the task asks for LABEL={{label}} in the first fstab field."
+      expectFail: [fstab-label]
+      mutation:
+        on: tr-el-01
+        as: learner
+        run: |
+          set -e
+          sudo parted -s /dev/vdc mkpart {{label}} 1MiB 331MiB
+          sudo udevadm settle
+          p=$(lsblk -nrpo NAME,PARTLABEL /dev/vdc | awk '$2 == "{{label}}" {print $1}')
+          sudo mkfs.xfs -q -L {{label}} $p
+          sudo mkdir -p /mnt/{{label}}
+          echo "$p /mnt/{{label}} xfs defaults 0 0" | sudo tee -a /etc/fstab >/dev/null
+          sudo systemctl daemon-reload; sudo mount /mnt/{{label}}
+  solution:
+    explanation: mkfs.xfs -L sets the label; LABEL= in fstab finds the filesystem whatever its device name.
+    steps:
+      - on: tr-el-01
+        as: learner
+        run: |
+          set -e
+          start=$(sudo parted -s -m /dev/vdc unit MiB print free | awk -F: '$5 == "free;" {s=$2} END {sub("MiB","",s); print int(s) + 1}')
+          sudo parted -s /dev/vdc mkpart {{label}} xfs ${start}MiB $((start + 330))MiB
+          sudo udevadm settle
+          p=$(lsblk -nrpo NAME,PARTLABEL /dev/vdc | awk '$2 == "{{label}}" {print $1}')
+          sudo mkfs.xfs -q -L {{label}} $p
+          sudo mkdir -p /mnt/{{label}}
+          echo "LABEL={{label}} /mnt/{{label}} xfs defaults 0 0" | sudo tee -a /etc/fstab >/dev/null
+          sudo systemctl daemon-reload
+          sudo mount /mnt/{{label}}

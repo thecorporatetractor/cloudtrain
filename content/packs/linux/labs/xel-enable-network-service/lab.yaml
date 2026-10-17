@@ -1,0 +1,89 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xel-enable-network-service
+  title: Run a network service at boot
+  domain: linux
+  frameworks: [rhcsa-aligned:networking]
+  difficulty: easy
+  estimatedMinutes: 5
+  tags: [exam, systemd, ftp]
+  version: 1
+spec:
+  description: |
+    **Host:** node 1, `tr-el-01` (`ssh tr-el-01`, then `sudo -i`)
+
+    The ticket machines fetch their price tables over FTP. Install the **`vsftpd`**
+    FTP server from the configured repository and make it **run now and start at
+    every boot**, listening on **TCP port 21**. Clients on node 2 must be able to
+    reach it through node 1's firewall.
+  objectives:
+    - Install a network service, enable it at boot and open the firewall
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-el-01
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["2Gi", "1Gi", "2Gi"]}
+        access: [ssh, console]
+      - name: tr-el-02
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536}
+        access: [ssh, console]
+  setup:
+    - on: tr-el-01
+      timeoutSec: 120
+      run: |
+        set -eu
+        dnf -y -q remove vsftpd >/dev/null 2>&1 || true
+        firewall-cmd -q --permanent --remove-service=ftp 2>/dev/null || true
+        firewall-cmd -q --reload
+  checks:
+    - id: enabled
+      description: vsftpd is enabled at boot and running
+      type: shell
+      on: tr-el-01
+      skills: [linux.systemd.units]
+      weight: 1.5
+      command: echo "$(systemctl is-enabled vsftpd 2>/dev/null) $(systemctl is-active vsftpd 2>/dev/null)"
+      expect: {match: exact, value: "enabled active"}
+    - id: listening
+      description: Something listens on TCP port 21 on node 1
+      type: shell
+      on: tr-el-01
+      skills: [linux.systemd.units]
+      weight: 0.5
+      command: ss -Hltn 'sport = :21' | grep -q . && echo listening || echo closed
+      expect: {match: exact, value: listening}
+    - id: reachable
+      description: Node 2 gets the FTP greeting from node 1
+      type: shell
+      on: tr-el-02
+      skills: [linux.net.firewalld]
+      weight: 1
+      timeoutSec: 30
+      command: timeout 8 bash -c 'exec 3<>/dev/tcp/tr-el-01/21; head -c 3 <&3' 2>/dev/null || echo unreachable
+      expect: {match: exact, value: "220"}
+  misconceptions:
+    - id: firewall-closed
+      description: Starts the service but leaves the firewall closed.
+      feedback: "firewalld drops FTP until the ftp service is allowed: firewall-cmd --permanent --add-service=ftp && firewall-cmd --reload."
+      expectFail: [reachable]
+      mutation:
+        on: tr-el-01
+        as: learner
+        timeoutSec: 180
+        run: sudo sh -c 'dnf -y -q install vsftpd && systemctl enable --now vsftpd'
+  solution:
+    explanation: dnf installs the package from the local repository, systemctl enable --now starts it at once and at boot, and the ftp service opens port 21 in the default zone.
+    steps:
+      - on: tr-el-01
+        as: learner
+        timeoutSec: 180
+        run: sudo sh -c 'dnf -y -q install vsftpd && systemctl enable --now vsftpd && firewall-cmd -q --permanent --add-service=ftp && firewall-cmd -q --reload'

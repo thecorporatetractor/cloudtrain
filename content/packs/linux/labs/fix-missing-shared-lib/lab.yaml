@@ -1,0 +1,172 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: fix-missing-shared-lib
+  title: Fix a binary that cannot find its shared library
+  domain: linux
+  frameworks: [linuxplus:troubleshooting, lpic1:install-packages]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [ldconfig, ldd, shared-libraries, ld.so.conf, troubleshooting, sudo]
+  version: 1
+spec:
+  description: |
+    A vendor delivered its fare calculator to `tr-fares-02` as a tarball, unpacked
+    under `/opt/vendor/farecalc`. Every user who runs it gets:
+
+    ```
+    farecalc: error while loading shared libraries: libfarecalc.so.2: cannot open shared object file: No such file or directory
+    ```
+
+    Make **`/opt/vendor/farecalc/bin/farecalc`** run for **every user**, in any shell
+    and from cron, without wrappers or environment variables. Fix it the way the
+    dynamic linker is meant to be configured for a library directory outside the
+    system paths: **leave the library where the vendor put it** (it is updated in
+    place by the vendor's tooling) and do not change the binary. You have `sudo`.
+
+    Check it with `/opt/vendor/farecalc/bin/farecalc 12 3`, which prints a fare.
+  objectives:
+    - Diagnose a missing library with ldd
+    - Register a library directory with /etc/ld.so.conf.d and ldconfig
+    - Understand soname links created by ldconfig
+  params:
+    base:
+      type: int
+      min: 120
+      max: 480
+  topology:
+    entry: tr-fares-02
+    nodes:
+      - name: tr-fares-02
+        driver: container
+        image: el-lab:10
+        learnerSudo: true
+        access: [shell]
+  setup:
+    - on: tr-fares-02
+      timeoutSec: 180
+      run: |
+        set -eu
+        echo 'learner ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/learner
+        chmod 0440 /etc/sudoers.d/learner
+        id clerk >/dev/null 2>&1 || useradd -m clerk
+        mkdir -p /var/lib/cloudtrain && chmod 0700 /var/lib/cloudtrain
+        b=$(mktemp -d)
+        cat > $b/fare.c <<'EOT'
+        int fare_pence(int km, int zones) { return {{base}} + km * 23 + zones * 75; }
+        EOT
+        cat > $b/main.c <<'EOT'
+        #include <stdio.h>
+        #include <stdlib.h>
+        int fare_pence(int km, int zones);
+        int main(int argc, char **argv) {
+          if (argc != 3) { fprintf(stderr, "usage: farecalc KM ZONES\n"); return 2; }
+          int p = fare_pence(atoi(argv[1]), atoi(argv[2]));
+          printf("fare: %d.%02d GBP\n", p / 100, p % 100);
+          return 0;
+        }
+        EOT
+        rm -rf /opt/vendor/farecalc
+        mkdir -p /opt/vendor/farecalc/bin /opt/vendor/farecalc/lib /opt/vendor/farecalc/doc
+        gcc -shared -fPIC -Wl,-soname,libfarecalc.so.2 -o /opt/vendor/farecalc/lib/libfarecalc.so.2.4.1 $b/fare.c
+        gcc -o /opt/vendor/farecalc/bin/farecalc $b/main.c /opt/vendor/farecalc/lib/libfarecalc.so.2.4.1
+        rm -rf $b
+        chmod 0755 /opt/vendor/farecalc/bin/farecalc /opt/vendor/farecalc/lib/libfarecalc.so.2.4.1
+        echo "farecalc 2.4.1 - see the vendor portal for support" > /opt/vendor/farecalc/doc/README
+        rm -f /etc/ld.so.conf.d/*farecalc* /usr/lib64/libfarecalc* /usr/local/lib/libfarecalc* /usr/local/lib64/libfarecalc*
+        ldconfig
+        sha256sum /opt/vendor/farecalc/bin/farecalc /opt/vendor/farecalc/lib/libfarecalc.so.2.4.1 > /var/lib/cloudtrain/farecalc.sum
+        p=$(( {{base}} + 12 * 23 + 3 * 75 )); printf 'fare: %d.%02d GBP\n' $((p / 100)) $((p % 100)) > /var/lib/cloudtrain/fare.expected
+  checks:
+    - id: runs-for-users
+      description: farecalc runs for learner and clerk in a clean environment
+      type: shell
+      on: tr-fares-02
+      skills: [linux.packages.source-builds]
+      weight: 2
+      timeoutSec: 20
+      command: |
+        n=0
+        for u in learner clerk; do
+          out=$(su -s /bin/sh $u -c 'env -i PATH=/usr/bin:/bin /opt/vendor/farecalc/bin/farecalc 12 3' 2>&1)
+          [ "$out" = "$(cat /var/lib/cloudtrain/fare.expected)" ] && n=$((n+1))
+        done
+        echo $n
+      expect: {match: exact, value: "2"}
+    - id: linker-config
+      description: The library directory is registered in the dynamic linker configuration
+      type: shell
+      on: tr-fares-02
+      skills: [linux.packages.source-builds]
+      weight: 1.5
+      command: |
+        cat /etc/ld.so.conf /etc/ld.so.conf.d/*.conf 2>/dev/null | sed 's/#.*//; s/[[:space:]]*$//; s#/*$##' | grep -qx '[[:space:]]*/opt/vendor/farecalc/lib' && echo registered || echo missing
+      expect: {match: exact, value: registered}
+    - id: cache-points-at-vendor
+      description: The linker cache resolves libfarecalc.so.2 to the vendor directory
+      type: shell
+      on: tr-fares-02
+      skills: [linux.packages.source-builds]
+      weight: 1
+      command: ldconfig -p | awk '$1 == "libfarecalc.so.2" {print $NF}' | sort -u | tr '\n' ' ' | sed 's/ $//'
+      expect: {match: exact, value: /opt/vendor/farecalc/lib/libfarecalc.so.2}
+    - id: no-copies
+      description: No copies of the library in the system directories, binary and library unchanged
+      type: shell
+      on: tr-fares-02
+      skills: [linux.packages.source-builds]
+      weight: 1
+      command: |
+        for f in /lib64/libfarecalc* /usr/lib64/libfarecalc* /usr/lib/libfarecalc* /usr/local/lib/libfarecalc* /usr/local/lib64/libfarecalc*; do
+          [ -e "$f" ] || [ -L "$f" ] && { echo copied; exit 0; }
+        done
+        sha256sum -c --quiet /var/lib/cloudtrain/farecalc.sum >/dev/null 2>&1 && echo clean || echo modified
+      expect: {match: exact, value: clean}
+  hints:
+    - title: What is missing?
+      command: ldd /opt/vendor/farecalc/bin/farecalc
+      body: ldd shows each library the binary needs and where the linker found it, or "not found".
+      cost: 0
+    - title: Where is it?
+      body: "`find /opt/vendor -name 'libfarecalc*'`. Note the file name differs from the soname the binary asks for (`readelf -d` on the library shows its SONAME)."
+      cost: 1
+    - title: Tell the linker
+      body: "Add the directory to a file in /etc/ld.so.conf.d (e.g. `farecalc.conf`), then run `sudo ldconfig`. ldconfig also creates the libfarecalc.so.2 soname link. `ldconfig -p | grep farecalc` shows the cache."
+      cost: 2
+  misconceptions:
+    - id: copies-into-system
+      description: Copies the library into /usr/lib64.
+      feedback: "A copy in /usr/lib64 goes stale when the vendor updates the library in place, and no package owns it. Register the vendor directory in /etc/ld.so.conf.d instead."
+      expectFail: [linker-config, cache-points-at-vendor, no-copies]
+      mutation:
+        on: tr-fares-02
+        as: learner
+        run: |
+          sudo cp /opt/vendor/farecalc/lib/libfarecalc.so.2.4.1 /usr/lib64/libfarecalc.so.2
+          sudo ldconfig
+    - id: ld-library-path
+      description: Sets LD_LIBRARY_PATH in a profile script.
+      feedback: "LD_LIBRARY_PATH only reaches shells that read the profile; cron jobs, services and sudo drop it. Configure the linker with /etc/ld.so.conf.d and ldconfig."
+      expectFail: [runs-for-users, linker-config]
+      mutation:
+        on: tr-fares-02
+        as: learner
+        run: echo 'export LD_LIBRARY_PATH=/opt/vendor/farecalc/lib' | sudo tee /etc/profile.d/farecalc.sh >/dev/null
+    - id: conf-without-ldconfig
+      description: Writes the configuration file but never runs ldconfig.
+      feedback: "The linker reads its cache (/etc/ld.so.cache), not the .conf files; run sudo ldconfig after changing them. That also creates the soname link."
+      expectFail: [runs-for-users, cache-points-at-vendor]
+      mutation:
+        on: tr-fares-02
+        as: learner
+        run: echo /opt/vendor/farecalc/lib | sudo tee /etc/ld.so.conf.d/farecalc.conf >/dev/null
+  solution:
+    explanation: Register /opt/vendor/farecalc/lib in /etc/ld.so.conf.d and rebuild the cache with ldconfig, which also creates the soname link.
+    steps:
+      - on: tr-fares-02
+        as: learner
+        run: |
+          set -e
+          echo /opt/vendor/farecalc/lib | sudo tee /etc/ld.so.conf.d/farecalc.conf >/dev/null
+          sudo ldconfig
+          /opt/vendor/farecalc/bin/farecalc 12 3

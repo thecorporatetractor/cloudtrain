@@ -1,0 +1,84 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xel-user-uid-expire
+  title: Create a user with fixed UID and expiry
+  domain: linux
+  frameworks: [rhcsa-aligned:users-groups]
+  difficulty: easy
+  estimatedMinutes: 4
+  tags: [exam, users]
+  version: 1
+spec:
+  description: |
+    **Host:** node 1, `tr-el-01` (`ssh tr-el-01`, then `sudo -i`)
+
+    A rolling-stock contractor joins for one project. Create the user **`{{user}}`**
+    with the **UID {{uid}}** whose account **expires on {{date}}** (the account is no
+    longer usable from that day on).
+  objectives:
+    - Create an account with a chosen UID and an expiry date
+  params:
+    user:
+      type: choice
+      values: [contractor-jago, contractor-kit, contractor-lir]
+    uid:
+      type: int
+      min: 4100
+      max: 4900
+    date:
+      type: choice
+      values: ["2027-03-31", "2027-06-30", "2027-09-30", "2027-12-31"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-el-01
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["2Gi", "1Gi", "2Gi"]}
+        access: [ssh, console]
+  checks:
+    - id: uid
+      description: The user exists with the requested UID
+      type: shell
+      on: tr-el-01
+      skills: [linux.users.accounts]
+      weight: 1
+      command: id -u {{user}} 2>/dev/null || echo none
+      expect: {match: exact, value: "{{uid}}"}
+    - id: expiry
+      description: The account expires on {{date}}
+      type: shell
+      on: tr-el-01
+      skills: [linux.users.accounts]
+      weight: 1.5
+      command: |
+        e=$(getent shadow {{user}} | cut -d: -f8); want=$(( $(date -u -d {{date}} +%s) / 86400 ))
+        [ -n "$e" ] && [ "$e" = "$want" ] && echo expires || echo "field=$e want=$want"
+      expect: {match: exact, value: expires}
+  misconceptions:
+    - id: password-expiry
+      description: Sets a password expiry instead of an account expiry.
+      feedback: "chage -M ages the password; the account expiry is useradd -e / chage -E."
+      expectFail: [expiry]
+      mutation:
+        on: tr-el-01
+        as: learner
+        run: sudo sh -c 'useradd -u {{uid}} {{user}} && chage -M 30 {{user}}'
+  solution:
+    explanation: useradd -u sets the UID and -e the account expiry date (YYYY-MM-DD).
+    steps:
+      - on: tr-el-01
+        as: learner
+        run: sudo useradd -u {{uid}} -e {{date}} {{user}}
+    alternatives:
+      - id: chage
+        description: Create the user, then set the expiry with chage -E.
+        steps:
+          - on: tr-el-01
+            as: learner
+            run: sudo sh -c 'useradd -u {{uid}} {{user}} && chage -E {{date}} {{user}}'

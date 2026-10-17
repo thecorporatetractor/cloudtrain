@@ -1,0 +1,86 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xel-sudo-group-nopasswd
+  title: Grant a group passwordless sudo
+  domain: linux
+  frameworks: [rhcsa-aligned:users-groups]
+  difficulty: easy
+  estimatedMinutes: 5
+  tags: [exam, sudo]
+  version: 1
+spec:
+  description: |
+    **Host:** node 1, `tr-el-01` (`ssh tr-el-01`, then `sudo -i`)
+
+    Members of the group **`{{grp}}`** (for example `{{grp}}-ops`) must be able to run
+    **any command as any user through sudo without entering a password**. Users who
+    are not in the group get no new rights. Keep the sudo configuration valid.
+  objectives:
+    - Write a sudoers rule for a group
+  params:
+    grp:
+      type: choice
+      values: [depotadm, sigadmin, fareops]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-el-01
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["2Gi", "1Gi", "2Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-el-01
+      run: |
+        set -eu
+        getent group {{grp}} >/dev/null || groupadd {{grp}}
+        id {{grp}}-ops >/dev/null 2>&1 || useradd -m -G {{grp}} {{grp}}-ops
+        id {{grp}}-guest >/dev/null 2>&1 || useradd -m {{grp}}-guest
+  checks:
+    - id: member-nopasswd
+      description: A group member runs a command as root with sudo and no password
+      type: shell
+      on: tr-el-01
+      skills: [linux.users.sudo]
+      weight: 2
+      command: su - {{grp}}-ops -c 'sudo -n id -un' 2>/dev/null || echo denied
+      expect: {match: exact, value: root}
+    - id: others-denied
+      description: A non-member cannot use sudo
+      type: shell
+      on: tr-el-01
+      skills: [linux.users.sudo]
+      weight: 1
+      command: su - {{grp}}-guest -c 'sudo -n true' >/dev/null 2>&1 && echo allowed || echo denied
+      expect: {match: exact, value: denied}
+    - id: valid
+      description: The sudoers configuration parses
+      type: shell
+      on: tr-el-01
+      skills: [linux.users.sudo]
+      weight: 0.5
+      command: visudo -cq >/dev/null 2>&1 && echo valid || echo broken
+      expect: {match: exact, value: valid}
+  misconceptions:
+    - id: password-required
+      description: Grants ALL but without NOPASSWD.
+      feedback: "Without NOPASSWD: sudo asks for the user's password; the task wants none."
+      expectFail: [member-nopasswd]
+      mutation:
+        on: tr-el-01
+        as: learner
+        run: echo '%{{grp}} ALL=(ALL) ALL' | sudo tee /etc/sudoers.d/{{grp}} >/dev/null
+  solution:
+    explanation: A drop-in in /etc/sudoers.d with %group ALL=(ALL) NOPASSWD:ALL; visudo -c checks the syntax.
+    steps:
+      - on: tr-el-01
+        as: learner
+        run: |
+          echo '%{{grp}} ALL=(ALL) NOPASSWD: ALL' | sudo tee /etc/sudoers.d/{{grp}} >/dev/null
+          sudo chmod 0440 /etc/sudoers.d/{{grp}}
+          sudo visudo -cq

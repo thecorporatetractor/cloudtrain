@@ -1,0 +1,177 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ulimits-batch-user
+  title: Cap processes and open files for the batch account
+  domain: linux
+  frameworks: [lfcs:users-groups, lpic1:security]
+  difficulty: medium
+  estimatedMinutes: 10
+  tags: [ulimit, limits.conf, pam_limits, sudo]
+  version: 1
+spec:
+  description: |
+    Last night a runaway fares batch on `tkt-batch-01` forked until the host stopped
+    answering. The account it runs under, **`batchrun`**, needs hard caps. You have full
+    sudo rights on this host.
+
+    1. Through a file in **`/etc/security/limits.d/`**, give `batchrun` a **hard** limit
+       of **{{nproc}} processes** and **{{nofile}} open files**. Other accounts keep
+       their limits.
+    2. Prove the limits apply: in a **fresh login session** of `batchrun` (for example
+       `sudo su - batchrun`), run `ulimit -Hu -Hn` and save its output to
+       **`~/answers/batchrun-limits.txt`** in your own home directory.
+
+    Do not put `ulimit` calls into batchrun's shell start-up files: the batch scheduler
+    does not read them.
+  objectives:
+    - Set per-user hard resource limits with pam_limits
+    - Know that limits are applied when a session starts, not to running processes
+  params:
+    nproc:
+      type: choice
+      values: ["200", "150", "250"]
+    nofile:
+      type: choice
+      values: ["4096", "2048", "8192"]
+  topology:
+    entry: tkt-batch-01
+    nodes:
+      - name: tkt-batch-01
+        driver: container
+        image: deb-lab:24.04
+        access: [shell]
+        learnerSudo: true
+  setup:
+    - on: tkt-batch-01
+      run: |
+        set -eu
+        echo 'learner ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/learner && chmod 0440 /etc/sudoers.d/learner
+        id batchrun >/dev/null 2>&1 || useradd -m -s /bin/bash -c 'Fares batch runner' batchrun
+        id ines >/dev/null 2>&1 || useradd -m -s /bin/bash ines
+        rm -f /etc/security/limits.d/*batch*
+        # An old, commented-out attempt in the main file.
+        grep -q 'batchrun' /etc/security/limits.conf || printf '\n# 2025-03 ticket TR-4411: cap the batch account?\n#batchrun        soft    nproc           100\n' >> /etc/security/limits.conf
+        install -d -o learner -g learner /home/learner/answers
+        mkdir -p /var/lib/cloudtrain && chmod 0700 /var/lib/cloudtrain
+        (cd /tmp && su - ines -c 'ulimit -Hu; ulimit -Hn' </dev/null) > /var/lib/cloudtrain/ines.limits
+        rm -f /home/learner/answers/batchrun-limits.txt
+  checks:
+    - id: in-limits-d
+      description: A file in /etc/security/limits.d sets the batchrun limits (and pam_limits reads it)
+      type: shell
+      on: tkt-batch-01
+      skills: [linux.users.resource-limits]
+      command: |
+        for f in /etc/security/limits.d/*.conf; do
+          [ -f "$f" ] && awk '$1 == "batchrun" && ($2 == "hard" || $2 == "-") && ($3 == "nproc" || $3 == "nofile")' "$f" | grep -q . && { echo found; exit 0; }
+        done
+        echo missing
+      expect: {match: exact, value: found}
+    - id: login-nproc
+      description: A fresh batchrun login session has a hard process limit of {{nproc}}
+      type: shell
+      on: tkt-batch-01
+      skills: [linux.users.resource-limits]
+      weight: 2
+      command: cd /tmp && su - batchrun -c 'ulimit -Hu' </dev/null 2>/dev/null
+      expect: {match: exact, value: "{{nproc}}"}
+    - id: login-nofile
+      description: A fresh batchrun login session has a hard open-files limit of {{nofile}}
+      type: shell
+      on: tkt-batch-01
+      skills: [linux.users.resource-limits]
+      weight: 2
+      command: cd /tmp && runuser -l batchrun -c 'ulimit -Hn' </dev/null 2>/dev/null
+      expect: {match: exact, value: "{{nofile}}"}
+    - id: not-in-dotfiles
+      description: The limits do not come from batchrun's shell start-up files
+      type: shell
+      on: tkt-batch-01
+      skills: [linux.users.resource-limits]
+      weight: 0.5
+      command: grep -qs 'ulimit' /home/batchrun/.profile /home/batchrun/.bashrc /home/batchrun/.bash_profile /home/batchrun/.bash_login && echo dotfiles || echo clean
+      expect: {match: exact, value: clean}
+    - id: others-unchanged
+      description: Other accounts keep their limits
+      type: shell
+      on: tkt-batch-01
+      skills: [linux.users.resource-limits]
+      weight: 0.5
+      command: cd /tmp && [ "$(su - ines -c 'ulimit -Hu; ulimit -Hn' </dev/null 2>/dev/null)" = "$(cat /var/lib/cloudtrain/ines.limits)" ] && echo unchanged || echo changed
+      expect: {match: exact, value: unchanged}
+    - id: proof
+      description: ~/answers/batchrun-limits.txt holds the hard limits a fresh batchrun session reports
+      type: shell
+      on: tkt-batch-01
+      skills: [linux.users.resource-limits]
+      command: |
+        f=/home/learner/answers/batchrun-limits.txt
+        grep -Eq '^max user processes .*\(-u\) +{{nproc}}$' $f 2>/dev/null && grep -Eq '^open files .*\(-n\) +{{nofile}}$' $f && echo ok || echo no
+      expect: {match: exact, value: ok}
+  hints:
+    - title: Where the limits come from
+      body: "pam_limits applies `/etc/security/limits.conf` and then every `*.conf` in `/etc/security/limits.d/` when a session opens (login, su -, ssh, cron). Each line is `<domain> <type> <item> <value>`, e.g. `batchrun hard nproc 200`."
+      cost: 1
+    - title: Hard and soft
+      body: "A soft limit can be raised by the user up to the hard limit; the hard limit can only be lowered (except by root). `-` sets both at once."
+      cost: 1
+    - title: Your current shell does not change
+      body: "Limits are set when a session starts. Check them in a new session: `sudo su - batchrun`, then `ulimit -Hu -Hn`, and copy the output (or `sudo su - batchrun -c 'ulimit -Hu -Hn' > ~/answers/batchrun-limits.txt`)."
+      cost: 2
+  misconceptions:
+    - id: wrong-suffix
+      description: Names the drop-in without the .conf suffix, so pam_limits never reads it.
+      feedback: "pam_limits only reads files ending in .conf in /etc/security/limits.d."
+      expectFail: [in-limits-d, login-nproc, login-nofile]
+      mutation:
+        on: tkt-batch-01
+        as: learner
+        run: printf 'batchrun hard nproc {{nproc}}\nbatchrun hard nofile {{nofile}}\n' | sudo tee /etc/security/limits.d/batchrun >/dev/null
+    - id: ulimit-in-bashrc
+      description: Puts ulimit commands into batchrun's .bashrc instead of limits.d.
+      feedback: "Shell start-up files only affect shells that read them; the scheduler does not. Use pam_limits in /etc/security/limits.d."
+      expectFail: [in-limits-d, not-in-dotfiles]
+      mutation:
+        on: tkt-batch-01
+        as: learner
+        run: printf 'ulimit -Hu {{nproc}}\nulimit -Hn {{nofile}}\n' | sudo tee -a /home/batchrun/.bashrc >/dev/null
+    - id: wildcard-domain
+      description: Uses the * domain, which caps every account.
+      feedback: "The first field selects who the line applies to; * means everyone. Name the account (batchrun) or a group (@group)."
+      expectFail: [others-unchanged]
+      mutation:
+        on: tkt-batch-01
+        as: learner
+        run: |
+          printf '*  hard  nproc  {{nproc}}\n*  hard  nofile  {{nofile}}\nbatchrun hard nproc {{nproc}}\n' | sudo tee /etc/security/limits.d/90-batchrun.conf >/dev/null
+          sudo su - batchrun -c 'ulimit -Hu -Hn' > ~/answers/batchrun-limits.txt
+    - id: proof-from-own-shell
+      description: Saves the limits of the learner's own shell as the proof.
+      feedback: "Your own session has your limits. Open a fresh session of batchrun to see its limits."
+      expectFail: [proof]
+      mutation:
+        on: tkt-batch-01
+        as: learner
+        run: |
+          printf 'batchrun hard nproc {{nproc}}\nbatchrun hard nofile {{nofile}}\n' | sudo tee /etc/security/limits.d/90-batchrun.conf >/dev/null
+          bash -c 'ulimit -Hu -Hn' > ~/answers/batchrun-limits.txt
+  solution:
+    explanation: |
+      Two hard limits in a limits.d drop-in; pam_limits applies them to every new
+      session of batchrun, which `su -` shows.
+    steps:
+      - on: tkt-batch-01
+        as: learner
+        run: |
+          printf 'batchrun hard nproc {{nproc}}\nbatchrun hard nofile {{nofile}}\n' | sudo tee /etc/security/limits.d/90-batchrun.conf >/dev/null
+          sudo su - batchrun -c 'ulimit -Hu -Hn' > ~/answers/batchrun-limits.txt
+    alternatives:
+      - id: both-limits-dash
+        description: Sets soft and hard together with "-" and checks with runuser -l.
+        steps:
+          - on: tkt-batch-01
+            as: learner
+            run: |
+              printf '%s\n' '# TR-4411 cap the fares batch account' 'batchrun  -  nproc   {{nproc}}' 'batchrun  -  nofile  {{nofile}}' | sudo tee /etc/security/limits.d/batchrun.conf >/dev/null
+              sudo runuser -l batchrun -c 'ulimit -H -u -n' > ~/answers/batchrun-limits.txt
