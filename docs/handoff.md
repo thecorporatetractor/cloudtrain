@@ -73,14 +73,17 @@ Kata and the kubeadm proof under load:
 | linux-a | 62 | 1 | 21 | ~40 not started (sudo, mirror, mis-tiered) | `docs/handoffs/linux-a.md` |
 | original 11 K8s labs | 11 | 4+ | — | — | `content/packs/kubernetes` |
 | iac (wave 2) | 99 | 48 (23 foundations labs + 25 sim-iac-associate tasks; exam runs 100 % / 11.7 %) | 0 | 31 learning labs, 18 sim-iac-advanced tasks, 2 capstone tasks not started | `docs/handoffs/iac.md` |
+| containers (wave 2, Docker on `docker-vm:29`) | 135 | 6 | 18 (6 learning, 12 exam tasks) | 12 exam tasks + 79 learning labs not started | `docs/handoffs/containers.md` |
 
 Most "blocked on add-ons" labs should unblock with `kubeadm:1.37-full` (metrics-server,
 Traefik ingress + Gateway API, MetalLB, local-path, Falco, gVisor, kube-bench) once it
 is boot-tested and the labs switch to it.
 
 Wave 2: IaC has started (see the iac row; image `terraform-ws:1.15`, Terraform/OpenTofu
-swappable per tenant). Not started at all: Linux tier B/C labs, containers (Docker),
-automation (Ansible), and the exam task pools of those domains.
+swappable per tenant), and so has containers (see the containers row; every lab runs on
+a `docker-vm:29` KubeVirt VM, design and escape test in `docs/handoffs/containers.md`).
+Not started at all: Linux tier B/C labs, automation (Ansible), and the exam task pools of
+those domains.
 
 ## Resume order
 
