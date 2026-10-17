@@ -114,7 +114,7 @@ function TeamScreen() {
       ) : (
         <>
           <div className="stat-row" style={{ marginBottom: 20 }}>
-            <Stat label="Hands-on this month" value={formatMinutes(d.totals.minutesThisMonth)} hint={`${d.minutesByWeek.at(-1)?.minutes ?? 0} min this week`} />
+            <Stat label="Practice this month" value={formatMinutes(d.totals.minutesThisMonth)} hint={`${formatMinutes(d.members.reduce((a, m) => a + m.minutesThisWeek, 0))} in the last 7 days`} />
             <Stat label="Completion" value={pct(d.totals.completionRate)} hint="of assigned work" />
             <Stat label="Overdue" value={d.totals.assignmentsOverdue} tone={d.totals.assignmentsOverdue ? 'warn' : undefined} hint="assignments" />
             <Stat label="At risk" value={d.atRisk.length} tone={d.atRisk.length ? 'warn' : undefined} hint="people × items" />
@@ -123,7 +123,7 @@ function TeamScreen() {
 
           <Heatmap d={d} />
 
-          <div className="grid-2" style={{ gridTemplateColumns: 'minmax(0, 5fr) minmax(0, 7fr)', gap: 20, marginTop: 20 }}>
+          <div className="split split-5-7" style={{ marginTop: 20 }}>
             <div className="stack" style={{ gap: 20 }}>
               <Card className="card-flush">
                 <div className="card-head">
@@ -150,8 +150,10 @@ function TeamScreen() {
               </Card>
               <Card className="card-flush">
                 <div className="card-head">
-                  <h2>Lab minutes</h2>
-                  <span className="subtle xs">per week, last 8 weeks</span>
+                  <h2>Practice minutes</h2>
+                  <span className="subtle xs" title="Graded time: from opening a lab to its last Validate, as learners see it on Home">
+                    per week, last 8 weeks
+                  </span>
                 </div>
                 <div style={{ padding: '14px 20px 16px' }}>
                   <Columns values={d.minutesByWeek.map((w) => ({ label: w.weekStart.slice(5), value: w.minutes }))} height={120} format={(v) => formatMinutes(v)} />
@@ -287,7 +289,7 @@ function Heatmap({ d }: { d: TeamDashboard }) {
 
 function MemberCell({ m, teamId }: { m: DashboardMember; teamId: string }) {
   return (
-    <Link to="/team/members/$userId" params={{ userId: m.user.id }} search={{ team: teamId }} className="member-cell" title={`${m.user.name} · ${m.user.title ?? ''} · ${formatMinutes(m.minutesThisMonth)} this month`}>
+    <Link to="/team/members/$userId" params={{ userId: m.user.id }} search={{ team: teamId }} className="member-cell" title={`${m.user.name} · ${m.user.title ?? ''} · ${formatMinutes(m.minutesThisMonth)} practice this month`}>
       <span className="avatar" aria-hidden>
         {initials(m.user.name)}
       </span>
@@ -301,7 +303,7 @@ function MemberCell({ m, teamId }: { m: DashboardMember; teamId: string }) {
           )}
         </span>
         <span className="xs subtle truncate">
-          {m.user.title} · {Math.round(m.minutesThisMonth / 60)}h this month
+          {m.user.title} · {formatMinutes(m.minutesThisMonth)} this month
         </span>
       </span>
       <ArrowRight size={12} className="subtle member-cell-arrow" />

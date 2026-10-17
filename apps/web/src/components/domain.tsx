@@ -95,9 +95,9 @@ export function LabRow({ lab, trailing }: { lab: LabSummary; trailing?: ReactNod
       </span>
       <span className="stack grow" style={{ gap: 3, minWidth: 0 }}>
         <span className="lab-row-title truncate">{lab.title}</span>
-        <span className="row xs subtle" style={{ gap: 10 }}>
+        <span className="row xs subtle lab-row-meta" style={{ gap: 10 }}>
           <DifficultyBadge difficulty={lab.difficulty} />
-          <span className="row" style={{ gap: 4 }}>
+          <span className="row" style={{ gap: 4, whiteSpace: 'nowrap' }}>
             <Clock size={11} /> {formatMinutes(lab.estimatedMinutes)}
           </span>
           <SkillTags ids={lab.skillIds} max={3} size="xs" />

@@ -7,14 +7,14 @@ import { Bar, Delta, Ring } from '@/components/charts';
 import { DifficultyBadge, DomainIcon, ReasonList, domainLabel } from '@/components/domain';
 import { AssignmentStateBadge, DueDate, ItemLink } from '@/components/platform';
 import { Badge, Card, ErrorState, PageSkeleton, Stat } from '@/components/ui';
-import { dateFor, planOf, usePlanPrefs, type Plan, type PlanPrefs } from '@/lib/plan';
+import { dateFor, planOf, usePlanPrefs, type Plan, type PlanPrefsState } from '@/lib/plan';
 import { formatDate, formatMinutes, pct, relativeTime } from '@/lib/utils';
 
 export function Home() {
   const home = useHome();
   const catalog = useCatalog();
   const skills = useSkills();
-  const [prefs, setPrefs] = usePlanPrefs();
+  const goals = usePlanPrefs();
 
   if (home.isPending || catalog.isPending) {
     return (
@@ -36,7 +36,7 @@ export function Home() {
   const frameworks = skills.data?.frameworks;
   const framework = frameworks?.find((f) => f.id === goal.frameworkId);
   const fwName = framework?.name ?? goal.frameworkId.toUpperCase();
-  const plan = planOf(goal, prefs);
+  const plan = planOf(goal, goals.prefs);
   const [top, ...others] = recommendations;
   const hour = new Date().getHours();
   const greeting = hour < 12 ? 'Good morning' : hour < 18 ? 'Good afternoon' : 'Good evening';
@@ -149,7 +149,7 @@ export function Home() {
             </Card>
           )}
 
-          <GoalCard goal={goal} plan={plan} prefs={prefs} setPrefs={setPrefs} framework={framework} fwName={fwName} cold={!!coldStart} labOf={labOf} />
+          <GoalCard goal={goal} plan={plan} goals={goals} framework={framework} fwName={fwName} cold={!!coldStart} labOf={labOf} />
 
           {coldStart ? (
             <ReadinessNote goal={goal} open />
@@ -363,8 +363,10 @@ function ReadinessNote({ goal, open }: { goal: GoalForecast; open?: boolean }) {
 
 /* --------------------------------------------------------------- goal card */
 
-function GoalCard({ goal, plan, prefs, setPrefs, framework, fwName, cold, labOf }: { goal: GoalForecast; plan: Plan; prefs: PlanPrefs; setPrefs: (p: PlanPrefs) => void; framework: Framework | undefined; fwName: string; cold: boolean; labOf: (id: string) => LabSummary | undefined }) {
+function GoalCard({ goal, plan, goals, framework, fwName, cold, labOf }: { goal: GoalForecast; plan: Plan; goals: PlanPrefsState; framework: Framework | undefined; fwName: string; cold: boolean; labOf: (id: string) => LabSummary | undefined }) {
   const [editing, setEditing] = useState(false);
+  const { prefs, save: setPrefs, saving, error } = goals;
+  const ownDate = !!prefs.targetDate;
   const prior = goal.confidence !== 'estimate';
   const assessed = goal.perDomain.some((d) => (d.practisedSkills ?? (d.readiness > 0 ? 1 : 0)) > 0);
   const onPace = !prior && goal.weeklyMinutes >= plan.weeklyNeeded;
@@ -423,9 +425,21 @@ function GoalCard({ goal, plan, prefs, setPrefs, framework, fwName, cold, labOf 
                 Exam date
                 <input className="input" style={{ width: 150 }} type="date" name="date" defaultValue={plan.targetDate} min={new Date().toISOString().slice(0, 10)} required />
               </label>
-              <button type="submit" className="btn btn-sm btn-secondary">
+              <button type="submit" className="btn btn-sm btn-secondary" disabled={saving}>
                 Save
               </button>
+              {ownDate && (
+                <button
+                  type="button"
+                  className="btn btn-sm btn-ghost"
+                  onClick={() => {
+                    setPrefs({ ...prefs, targetDate: undefined });
+                    setEditing(false);
+                  }}
+                >
+                  Remove date
+                </button>
+              )}
               <button type="button" className="btn btn-sm btn-ghost" onClick={() => setEditing(false)}>
                 Cancel
               </button>
@@ -449,7 +463,19 @@ function GoalCard({ goal, plan, prefs, setPrefs, framework, fwName, cold, labOf 
               </div>
             )
           )}
-          {targetIsPlan && <p className="xs subtle">Weekly target set to {formatMinutes(plan.weeklyNeeded)}; it shows at the top of the page.</p>}
+          {plan.weeklyTarget !== undefined && (
+            <p className="xs subtle row" style={{ gap: 6, flexWrap: 'wrap' }}>
+              <span>{targetIsPlan ? `Weekly target set to ${formatMinutes(plan.weeklyTarget)}; it shows at the top of the page.` : `Your weekly target: ${formatMinutes(plan.weeklyTarget)}.`}</span>
+              <button type="button" className="link-quiet xs" onClick={() => setPrefs({ ...prefs, weeklyTarget: undefined })} disabled={saving}>
+                Remove
+              </button>
+            </p>
+          )}
+          {error && (
+            <p className="xs text-err" role="alert">
+              Could not save your goal: {error}
+            </p>
+          )}
         </div>
 
         <div className="stack" style={{ gap: 8 }}>

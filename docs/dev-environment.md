@@ -495,8 +495,8 @@ Safeguards:
   web app shows a "Dev sign-in as <name>" banner on every page. It lives no
   longer than a normal session (`CT_SESSION_MAX_AGE_SECONDS`, idle timeout), is
   never refreshed against an IdP, and sign-out ends it.
-- Per-user exam date and target live in the browser's localStorage, not in the
-  database, so an impersonated Home shows the defaults unless the agent sets them.
+- Per-user exam date and weekly target live in the database (`learner_goals`,
+  `GET/PUT /api/me/goals`), so an impersonated Home shows the user's own goals.
 
 ## Lab runtime tiers (foundations stream)
 

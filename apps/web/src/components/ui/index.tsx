@@ -205,9 +205,9 @@ export function Dialog({ open, onOpenChange, title, description, children, width
 export const Dropdown = {
   Root: DropdownPrimitive.Root,
   Trigger: DropdownPrimitive.Trigger,
-  Content: ({ children, align = 'end', ...rest }: DropdownPrimitive.DropdownMenuContentProps) => (
+  Content: ({ children, align = 'end', className, ...rest }: DropdownPrimitive.DropdownMenuContentProps) => (
     <DropdownPrimitive.Portal>
-      <DropdownPrimitive.Content className="menu" align={align} sideOffset={6} {...rest}>
+      <DropdownPrimitive.Content className={cn('menu', className)} align={align} sideOffset={6} collisionPadding={8} {...rest}>
         {children}
       </DropdownPrimitive.Content>
     </DropdownPrimitive.Portal>

@@ -19,7 +19,7 @@ import { authorize, can, type AuthzTarget } from '../authz.js';
 import type { Tx } from '../db/index.js';
 import type { AssignmentRow } from '../db/schema.js';
 import { badRequest, notFound } from '../errors.js';
-import { competencyMastery, environmentMinutesSince, readinessOf, skillStates } from '../learner/home.js';
+import { competencyMastery, minutesSince, practiceSeconds, practised, readinessOf, skillStates } from '../learner/home.js';
 import { actorOf, audit } from './audit.js';
 import { decodeCursor, encodeCursor, pageLimit, userRef, type PlatformService } from './service.js';
 
@@ -99,19 +99,14 @@ export async function dashboard(ps: PlatformService, p: Principal, teamId: strin
     const members = await teamMembers(tx, teamId);
     const ids = members.map((m) => m.id);
     const states = ids.length ? await tx.selectFrom('learner_skill_state').select(['user_id', 'skill_id', 'mu']).where('user_id', 'in', ids).execute() : [];
-    const attempts = ids.length
-      ? await tx
-          .selectFrom('lab_attempts')
-          .select(['id', 'user_id', 'lab_id', 'started_at', 'ended_at', 'outcome', 'score', 'hints_used', 'duration_s'])
-          .where('user_id', 'in', ids)
-          .where('started_at', '>', new Date(now.getTime() - 70 * DAY))
-          .execute()
-      : [];
+    // Practice minutes, counted exactly as on the learner's own Home (graded time only).
+    const attempts = await ps.attemptsLiteOf(tx, ids, new Date(now.getTime() - 70 * DAY));
     const statuses = ids.length
       ? await tx.selectFrom('assignment_status as s').innerJoin('assignments as a', 'a.id', 's.assignment_id').select(['s.user_id', 's.assignment_id', 's.status', 's.progress', 's.due_at', 's.required', 'a.item_kind', 'a.item_id', 'a.lab_ids']).where('s.user_id', 'in', ids).execute()
       : [];
 
     const monthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
+    const weekAgo = new Date(now.getTime() - 7 * DAY);
     const frameworks = ps.content.frameworks;
     const atRisk: AtRiskItem[] = [];
     const dm: DashboardMember[] = members.map((m) => {
@@ -137,7 +132,8 @@ export async function dashboard(ps: PlatformService, p: Principal, teamId: strin
         role: m.role,
         mastery: competencyMastery(ps.content, mu),
         readiness: Object.fromEntries(frameworks.map((f) => [f.id, readinessOf(ps.content, f.id, mu)])) as Partial<Record<FrameworkId, number>>,
-        minutesThisMonth: environmentMinutesSince(mine, monthStart),
+        minutesThisMonth: minutesSince(mine, monthStart),
+        minutesThisWeek: minutesSince(mine, weekAgo),
         attemptsThisMonth: mine.filter((a) => a.started_at >= monthStart).length,
         ...(last ? { lastActiveAt: last.toISOString() } : {}),
         assignments: counts,
@@ -151,13 +147,12 @@ export async function dashboard(ps: PlatformService, p: Principal, teamId: strin
     const minutesByWeek = Array.from({ length: 8 }, (_, i) => {
       const start = new Date(monday.getTime() - (7 - i) * 7 * DAY);
       const end = new Date(start.getTime() + 7 * DAY);
-      return { weekStart: start.toISOString().slice(0, 10), minutes: Math.round(attempts.filter((a) => a.started_at >= start && a.started_at < end).reduce((x, a) => x + a.duration_s, 0) / 60) };
+      return { weekStart: start.toISOString().slice(0, 10), minutes: minutesSince(attempts, start, end) };
     });
 
     const allAssignments = [...new Map(statuses.map((s) => [`${s.user_id}:${s.assignment_id}`, s])).values()];
     const visible = await teamsWithStats(tx, await visibleTeamIds(tx, p));
     const teams: TeamRef[] = visible.map((t) => ({ id: t.id, name: t.name }));
-    const weekAgo = new Date(now.getTime() - 7 * DAY);
     return {
       team,
       teams,
@@ -170,7 +165,7 @@ export async function dashboard(ps: PlatformService, p: Principal, teamId: strin
       minutesByWeek,
       totals: {
         members: members.length,
-        activeThisWeek: new Set(attempts.filter((a) => a.started_at >= weekAgo).map((a) => a.user_id)).size,
+        activeThisWeek: new Set(attempts.filter((a) => a.started_at >= weekAgo && practised(a)).map((a) => a.user_id)).size,
         minutesThisMonth: dm.reduce((a, m) => a + m.minutesThisMonth, 0),
         assignmentsOverdue: allAssignments.filter((s) => s.status === 'overdue').length,
         completionRate: allAssignments.length ? Math.round((allAssignments.filter((s) => s.status === 'completed').length / allAssignments.length) * 100) / 100 : 0,
@@ -192,8 +187,8 @@ export async function memberDetail(ps: PlatformService, p: Principal, teamId: st
     const rows = await ps.states(tx, userId);
     const mu = new Map(rows.map((r) => [r.skill_id, r.mu]));
     const attempts = await ps.attemptsPage(tx, userId, { limit: 50 });
-    const lite = await ps.attemptsLite(tx, userId, 40);
     const now = ps.now();
+    const lite = await ps.attemptsLite(tx, userId, 40);
     return {
       user: { ...userRef(m), ...(m.last_login_at ? { lastLoginAt: m.last_login_at.toISOString() } : {}) },
       team: { id: team.id, name: team.name },
@@ -203,7 +198,8 @@ export async function memberDetail(ps: PlatformService, p: Principal, teamId: st
       readiness: Object.fromEntries(ps.content.frameworks.map((f) => [f.id, readinessOf(ps.content, f.id, mu)])) as Partial<Record<FrameworkId, number>>,
       attempts: attempts.items,
       assignments: await ps.myAssignmentsTx(tx, userId),
-      minutesThisMonth: environmentMinutesSince(lite, new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1))),
+      minutesThisMonth: minutesSince(lite, new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1))),
+      minutesThisWeek: minutesSince(lite, new Date(now.getTime() - 7 * DAY)),
     };
   });
 }
@@ -357,16 +353,19 @@ export async function progressCsv(ps: PlatformService, p: Principal, teamId: str
     const team = await tx.selectFrom('teams').select(['id', 'name']).where('id', '=', teamId).executeTakeFirst();
     if (!team) throw notFound('Team');
     const members = await teamMembers(tx, teamId);
-    const header = ['user_id', 'name', 'email', 'team', 'assignment_id', 'item_kind', 'item_id', 'due_at', 'status', 'progress', 'best_score', 'attempts', 'minutes'];
+    // minutes: practice (graded) time, the learner's own measure; environment_minutes: session lifetime, what quotas bill.
+    const header = ['user_id', 'name', 'email', 'team', 'assignment_id', 'item_kind', 'item_id', 'due_at', 'status', 'progress', 'best_score', 'attempts', 'minutes', 'environment_minutes'];
     let out = csvLine(header);
+    const all = await ps.attemptsLiteOf(tx, members.map((m) => m.id), fromD, toD);
     for (const m of members) {
-      const attempts = await tx.selectFrom('lab_attempts').select(['lab_id', 'duration_s']).where('user_id', '=', m.id).where('started_at', '>=', fromD).where('started_at', '<=', toD).execute();
-      const minutes = Math.round(attempts.reduce((a, x) => a + x.duration_s, 0) / 60);
+      const attempts = all.filter((a) => a.user_id === m.id);
+      const minutes = Math.round(attempts.reduce((a, x) => a + practiceSeconds(x), 0) / 60);
+      const envMinutes = Math.round(attempts.reduce((a, x) => a + x.duration_s, 0) / 60);
       const mine = await ps.myAssignmentsTx(tx, m.id);
-      if (!mine.length) out += csvLine([m.id, m.name, m.email, team.name, '', '', '', '', '', '', '', attempts.length, minutes]);
+      if (!mine.length) out += csvLine([m.id, m.name, m.email, team.name, '', '', '', '', '', '', '', attempts.length, minutes, envMinutes]);
       for (const a of mine) {
         const n = attempts.filter((x) => (a.item.labIds ?? []).includes(x.lab_id)).length;
-        out += csvLine([m.id, m.name, m.email, team.name, a.id, a.item.kind, a.item.id, a.dueAt ?? '', a.status, a.progress, a.bestScore ?? '', n, minutes]);
+        out += csvLine([m.id, m.name, m.email, team.name, a.id, a.item.kind, a.item.id, a.dueAt ?? '', a.status, a.progress, a.bestScore ?? '', n, minutes, envMinutes]);
       }
     }
     await audit(tx, actorOf(p, ip), 'report.export', 'team', teamId, { report: 'progress.csv', from: fromD.toISOString(), to: toD.toISOString(), rows: members.length }, team.name);

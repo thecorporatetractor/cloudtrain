@@ -104,7 +104,7 @@ function StudioDraftScreen() {
         })}
       </ol>
 
-      <div className="grid-home" style={{ gridTemplateColumns: 'minmax(0, 7fr) minmax(0, 5fr)' }}>
+      <div className="split split-7-5">
         <div className="stack" style={{ gap: 20 }}>
           <Card className="card-flush">
             <div className="card-head">

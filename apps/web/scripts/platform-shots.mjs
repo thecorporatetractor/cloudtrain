@@ -34,8 +34,8 @@ let failed = false;
 
 const PERSONAS = { learner: { userId: 'u-lena', orgId: 'org-quillmoor' }, learner_impersonated: { userId: 'u-lena', orgId: 'org-quillmoor', impersonated: true }, manager: { userId: 'u-ingrid', orgId: 'org-quillmoor' }, instructor: { userId: 'u-samir', orgId: 'org-quillmoor' }, author: { userId: 'u-aino', orgId: 'org-quillmoor' }, org_admin: { userId: 'u-priya', orgId: 'org-quillmoor' }, platform_admin: { userId: 'u-elin', orgId: 'org-acme' } };
 
-async function session(theme, persona, width = 1440) {
-  const ctx = await browser.newContext({ viewport: { width, height: 900 }, deviceScaleFactor: 1, ...(storage ? { storageState: storage } : {}) });
+async function session(theme, persona, width = 1440, height = 900) {
+  const ctx = await browser.newContext({ viewport: { width, height }, deviceScaleFactor: 1, ...(storage ? { storageState: storage } : {}) });
   await ctx.addInitScript(
     ({ t, s }) => {
       localStorage.setItem('ct.theme', t);
@@ -72,7 +72,9 @@ async function shot(page, name) {
   console.log('saved', `${name}.png`);
 }
 
-/** [name, persona, url, waitFor, extra steps] */
+/** [name, persona, url, waitFor, extra steps, viewport (default 1440 x 900)] */
+const PHONE = { width: 390, height: 844 };
+const TABLET = { width: 768, height: 1024 };
 const VIEWS = [
   ['sign-in', 'none', '/sign-in', 'Sign in'],
   ['sign-in-sso', 'none', '/sign-in', 'Sign in', async (p) => (await p.getByLabel('Work email').fill('lena.varga@quillmoor.example'), await p.getByRole('button', { name: 'Continue' }).click(), await p.getByText('Continue with').waitFor())],
@@ -118,14 +120,19 @@ const VIEWS = [
   ['platform-org', 'platform_admin', '/platform?org=org-quillmoor', 'Quotas'],
   ['platform-capacity', 'platform_admin', '/platform/capacity', 'Cluster nodes'],
   ['platform-content', 'platform_admin', '/platform/content', 'Global packs'],
+  // Below 1024px the sidebar is a drawer behind the menu button.
+  ['home-phone', 'learner', '/', 'Assignments due', undefined, PHONE],
+  ['nav-drawer-phone', 'manager', '/', 'Next best lab', async (p) => (await p.getByRole('button', { name: 'Open navigation' }).click(), await p.getByRole('dialog', { name: 'Navigation' }).waitFor()), PHONE],
+  ['team-dashboard-phone', 'manager', '/team', 'Members × competencies', undefined, PHONE],
+  ['home-tablet', 'learner', '/', 'Assignments due', undefined, TABLET],
 ];
 
 try {
-  for (const [name, persona, url, waitFor, extra] of VIEWS) {
+  for (const [name, persona, url, waitFor, extra, viewport] of VIEWS) {
     if (only?.length && !only.includes(name)) continue;
     // Real mode: no clicks that change state, no labs started, no sign-in pages (already signed in).
     if (storage && !only?.length && (extra || persona === 'none' || /\/work$|\/observe\//.test(url))) continue;
-    const { ctx, page } = await session('dark', persona);
+    const { ctx, page } = await session('dark', persona, viewport?.width, viewport?.height);
     try {
       await open(page, url, waitFor);
       if (extra) await extra(page);

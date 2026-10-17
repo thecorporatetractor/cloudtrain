@@ -349,6 +349,15 @@ export interface ExamRetakeGrantsTable {
   used_by_attempt: string | null;
 }
 
+export interface LearnerGoalsTable {
+  org_id: string;
+  user_id: string;
+  /** Postgres `date`; select it as `target_date::text` (YYYY-MM-DD, no time zone shift). */
+  target_date: string | null;
+  weekly_target_minutes: number | null;
+  updated_at: Generated<Date>;
+}
+
 export interface DB {
   orgs: OrgsTable;
   users: UsersTable;
@@ -376,6 +385,7 @@ export interface DB {
   exam_attempts: ExamAttemptsTable;
   exam_task_results: ExamTaskResultsTable;
   exam_retake_grants: ExamRetakeGrantsTable;
+  learner_goals: LearnerGoalsTable;
 }
 
 export type OrgRow = Selectable<OrgsTable>;

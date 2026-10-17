@@ -1,4 +1,4 @@
-import type { Activity, ColdStart, Domain, Framework, FrameworkId, GoalDomain, GoalForecast, HomeData, Learner, LabSummary, MyAssignment, Recommendation, ResumeItem, SkillState } from '@cloudtrain/api-types';
+import type { Activity, ColdStart, LearnerGoals, Domain, Framework, FrameworkId, GoalDomain, GoalForecast, HomeData, Learner, LabSummary, MyAssignment, Recommendation, ResumeItem, SkillState } from '@cloudtrain/api-types';
 import type { Content } from '../content/load.js';
 import { DIFFICULTY, MU0, R, SIGMA_MAX, decayedSigma, expectedGain, expectedSuccess, prior, trendOf, type SkillBelief } from './model.js';
 
@@ -80,14 +80,19 @@ export function competencyMastery(content: Content, mu: Map<string, number>): Re
  * practice, so learner-facing time counts only attempts with a graded run,
  * from the start of the attempt to its last Validate.
  */
-export function practiceSeconds(a: AttemptLite): number {
+export function practiceSeconds(a: Pick<AttemptLite, 'started_at' | 'validations' | 'last_run_at'>): number {
   if (!a.validations || !a.last_run_at) return 0;
   return Math.max(0, Math.round((a.last_run_at.getTime() - a.started_at.getTime()) / 1000));
 }
 
-const practised = (a: AttemptLite) => a.validations > 0 && a.last_run_at !== null;
+/** The attempt had at least one graded run (Validate). */
+export const practised = (a: Pick<AttemptLite, 'validations' | 'last_run_at'>) => a.validations > 0 && a.last_run_at !== null;
 
-/** Environment minutes (session lifetime) in attempts started since `since`: the manager views' measure. */
+/**
+ * Environment minutes (session lifetime) in attempts started since `since`.
+ * Quota and usage accounting only (admin usage, platform org list); people
+ * see practice minutes everywhere.
+ */
 export function environmentMinutesSince(attempts: Pick<AttemptLite, 'started_at' | 'duration_s'>[], since: Date): number {
   return Math.round(attempts.filter((a) => a.started_at >= since).reduce((a, x) => a + x.duration_s, 0) / 60);
 }
@@ -105,9 +110,15 @@ export function streakDays(attempts: AttemptLite[], now: Date): number {
   return n;
 }
 
-/** Practice minutes in attempts started since `since` (see practiceSeconds). */
-export function minutesSince(attempts: AttemptLite[], since: Date): number {
-  return Math.round(attempts.filter((a) => a.started_at >= since).reduce((a, x) => a + practiceSeconds(x), 0) / 60);
+type PracticeFields = Pick<AttemptLite, 'started_at' | 'validations' | 'last_run_at'>;
+
+/**
+ * Practice minutes in attempts started in [since, until) (see
+ * practiceSeconds). The one measure of learner time: Home, the team
+ * dashboard, the member page and the progress CSV all count with it.
+ */
+export function minutesSince(attempts: PracticeFields[], since: Date, until?: Date): number {
+  return Math.round(attempts.filter((a) => a.started_at >= since && (!until || a.started_at < until)).reduce((a, x) => a + practiceSeconds(x), 0) / 60);
 }
 
 export interface HomeInput {
@@ -119,6 +130,8 @@ export interface HomeInput {
   attempts: AttemptLite[];
   assignments: MyAssignment[];
   pinnedPathIds: string[];
+  /** The learner's own goals (PUT /me/goals); omitted = none set. */
+  goals?: LearnerGoals;
   now: Date;
 }
 
@@ -414,13 +427,17 @@ export function buildHome(input: HomeInput): HomeData {
   const weeklyMinutes = Math.round(minutesSince(input.attempts, since28) / 4);
   const sessions = graded.filter((a) => a.started_at >= since28).length;
   const toReady = minutesToReady(readiness);
-  const targetDate = (fwAssignment?.dueAt ?? new Date(now.getTime() + DEFAULT_TARGET_DAYS * DAY).toISOString()).slice(0, 10);
+  // The learner's own date wins over an assignment's due date; neither = a placeholder.
+  const own = input.goals?.targetDate ?? null;
+  const targetDate = own ?? (fwAssignment?.dueAt ?? new Date(now.getTime() + DEFAULT_TARGET_DAYS * DAY).toISOString()).slice(0, 10);
+  const targetDateSource: GoalForecast['targetDateSource'] = own ? 'learner' : fwAssignment?.dueAt ? 'assignment' : 'default';
   // At the learner's own pace (four-week average); with no practice yet there is no pace to project.
   const daysToReady = weeklyMinutes > 0 ? Math.ceil((toReady / weeklyMinutes) * 7) : Math.ceil((toReady / 150) * 7);
   const goal: GoalForecast = {
     frameworkId,
     targetDate,
-    targetDateSource: fwAssignment?.dueAt ? 'assignment' : 'default',
+    targetDateSource,
+    ...(input.goals?.weeklyTargetMinutes ? { weeklyTargetMinutes: input.goals.weeklyTargetMinutes } : {}),
     readiness,
     readyAt: READY_AT,
     forecastReadyDate: new Date(now.getTime() + daysToReady * DAY).toISOString().slice(0, 10),

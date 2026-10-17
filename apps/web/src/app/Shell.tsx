@@ -1,12 +1,14 @@
 import { Link, Outlet, useNavigate, useRouterState } from '@tanstack/react-router';
-import { useEffect, type ReactNode } from 'react';
-import { BookOpen, Building2, Check, ChevronLeft, ChevronRight, ClipboardList, FlaskConical, GraduationCap, HelpCircle, History, Home as HomeIcon, Keyboard, LogOut, Moon, Palette, Presentation, Search, Server, Settings, Shield, Sun, Sunset, UserCheck, Users, UserCog, Waypoints, X } from 'lucide-react';
+import * as DialogPrimitive from '@radix-ui/react-dialog';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
+import { BookOpen, Building2, Check, ChevronLeft, ChevronRight, ClipboardList, FlaskConical, GraduationCap, HelpCircle, History, Home as HomeIcon, Keyboard, LogOut, Menu, Moon, Palette, Presentation, Search, Server, Settings, Shield, Sun, Sunset, UserCheck, Users, UserCog, Waypoints, X } from 'lucide-react';
 import { useMe } from '@/api/client';
 import { useLogout, useSwitchOrg } from '@/api/platform';
 import { isRealApi } from '@/api/mode';
 import type { Me } from '@/api/types';
 import { Badge, Button, Dot, Dropdown, Kbd, Tooltip } from '@/components/ui';
 import { useHotkeys, type Hotkey } from '@/lib/hotkeys';
+import { COMPACT_NAV_QUERY, useMediaQuery } from '@/lib/media';
 import { THEMES, useTheme, type Theme } from '@/lib/theme';
 import { cn } from '@/lib/utils';
 import { canAccess } from './access';
@@ -84,6 +86,11 @@ function ShellInner() {
   const me = useMe();
   const inWorkspace = /^\/labs\/[^/]+\/work$/.test(pathname) || /\/observe\/[^/]+$/.test(pathname) || /^\/exams\/attempts\/[^/]+$/.test(pathname);
   const publicPage = isPublicPath(pathname);
+  // Phones and tablets: the sidebar becomes a drawer behind a menu button in a top bar.
+  const compact = useMediaQuery(COMPACT_NAV_QUERY);
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  const menuButton = useRef<HTMLButtonElement>(null);
+  useEffect(() => setDrawerOpen(false), [pathname, compact]);
 
   // Workspace forces the rail; leaving restores the user's preference.
   useEffect(() => {
@@ -100,7 +107,7 @@ function ShellInner() {
     { keys: '?', description: 'Keyboard shortcuts', group: 'Global', handler: () => shell.setShortcutsOpen(true) },
     { keys: 'mod+/', description: 'Keyboard shortcuts', group: 'Global', skipTerminal: true, handler: () => shell.setShortcutsOpen(true) },
     { keys: 'mod+shift+l', description: 'Cycle theme', group: 'Global', handler: cycle },
-    { keys: '[', description: 'Collapse or expand navigation', group: 'Global', handler: () => !inWorkspace && shell.toggleNavCollapsed() },
+    { keys: '[', description: 'Collapse or expand navigation', group: 'Global', handler: () => (compact ? setDrawerOpen((o) => !o) : !inWorkspace && shell.toggleNavCollapsed()) },
     ...visibleSections.flatMap((s) => s.items.filter((n) => n.keys).map((n): Hotkey => ({ keys: n.keys!, description: `Go to ${n.label.toLowerCase()}`, group: 'Navigate', handler: () => void navigate({ to: n.to as '/', search: n.to === '/catalog' || n.to === '/team' || n.to === '/exams' ? {} : n.to === '/skills' ? { framework: 'cks' } : undefined }) }))),
   ];
   useHotkeys(hotkeys, !publicPage);
@@ -117,117 +124,58 @@ function ShellInner() {
   }
 
   const navMode = shell.navMode;
+  const panel = (mode: 'full' | 'rail', inDrawer = false) => (
+    <NavPanel mode={mode} inDrawer={inDrawer} inWorkspace={inWorkspace} pathname={pathname} sections={visibleSections} principal={principal} theme={theme} setTheme={setTheme} onClose={() => setDrawerOpen(false)} />
+  );
+
+  if (compact) {
+    return (
+      <div className={cn('shell shell-compact', inWorkspace && 'shell-workspace')} data-nav="drawer">
+        <a href="#main" className="skip-link">
+          Skip to content
+        </a>
+        {!(inWorkspace && shell.chromeless) && (
+          <header className="topbar">
+            <button ref={menuButton} type="button" className="topbar-btn" onClick={() => setDrawerOpen(true)} aria-label="Open navigation" aria-expanded={drawerOpen} aria-controls="nav-drawer" aria-haspopup="dialog">
+              <Menu size={18} />
+            </button>
+            <Link to="/" className="brand" aria-label="CloudTrain home">
+              <BrandMark />
+              <span className="brand-name">CloudTrain</span>
+            </Link>
+            <button type="button" className="topbar-btn" style={{ marginLeft: 'auto' }} onClick={() => shell.setPaletteOpen(true)} aria-label="Search and commands">
+              <Search size={17} />
+            </button>
+          </header>
+        )}
+        <DialogPrimitive.Root open={drawerOpen} onOpenChange={setDrawerOpen}>
+          <DialogPrimitive.Portal>
+            <DialogPrimitive.Overlay className="dialog-overlay" />
+            <DialogPrimitive.Content id="nav-drawer" className="nav-drawer" aria-describedby={undefined} onCloseAutoFocus={(e) => (e.preventDefault(), menuButton.current?.focus())}>
+              <DialogPrimitive.Title className="sr-only">Navigation</DialogPrimitive.Title>
+              {panel('full', true)}
+            </DialogPrimitive.Content>
+          </DialogPrimitive.Portal>
+        </DialogPrimitive.Root>
+
+        <main id="main" className="main" tabIndex={-1}>
+          <Outlet />
+        </main>
+
+        {principal?.auth.impersonated && <DevImpersonationBanner me={principal} />}
+        <CommandPalette />
+        <ShortcutsDialog />
+        <Toasts />
+      </div>
+    );
+  }
 
   return (
     <div className={cn('shell', `shell-nav-${navMode}`, inWorkspace && 'shell-workspace')} data-nav={navMode}>
       <a href="#main" className="skip-link">
         Skip to content
       </a>
-      {navMode !== 'hidden' && (
-        <nav className="nav" aria-label="Primary">
-          <div className="nav-brand">
-            <Link to="/" className="brand" aria-label="CloudTrain home">
-              <span className="brand-mark" aria-hidden>
-                <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
-                  <path d="M3 12.5h9.2a3.3 3.3 0 0 0 .4-6.57A4.6 4.6 0 0 0 4 7.6 2.5 2.5 0 0 0 3 12.5Z" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round" />
-                  <path d="M6.5 15.5h5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
-                </svg>
-              </span>
-              {navMode === 'full' && <span className="brand-name">CloudTrain</span>}
-            </Link>
-            {navMode === 'full' && !inWorkspace && (
-              <Tooltip content="Collapse navigation" shortcut="[" side="right">
-                <button className="nav-collapse" onClick={shell.toggleNavCollapsed} aria-label="Collapse navigation">
-                  <ChevronLeft size={14} />
-                </button>
-              </Tooltip>
-            )}
-          </div>
-
-          <button className={cn('nav-search', navMode === 'rail' && 'nav-search-rail')} onClick={() => shell.setPaletteOpen(true)} aria-label="Search and commands">
-            <Search size={14} />
-            {navMode === 'full' && (
-              <>
-                <span className="grow" style={{ textAlign: 'left' }}>
-                  Search
-                </span>
-                <Kbd keys="mod+k" />
-              </>
-            )}
-          </button>
-
-          <div className="nav-scroll">
-            {visibleSections.map((section, si) => (
-              <div key={section.title ?? si} className="nav-section">
-                {section.title && navMode === 'full' && <div className="nav-section-title">{section.title}</div>}
-                {section.title && navMode === 'rail' && <div className="nav-section-rule" aria-hidden />}
-                <ul className="nav-list" aria-label={section.title}>
-                  {section.items.map((n) => {
-                    const active = n.to === '/' ? pathname === '/' : pathname === n.to || pathname.startsWith(`${n.to}/`) || (n.also ?? []).some((a) => pathname.startsWith(a));
-                    const item = n.link({
-                      className: cn('nav-item', active && 'is-active'),
-                      'aria-current': active ? 'page' : undefined,
-                      children: (
-                        <>
-                          <span className="nav-icon">{n.icon}</span>
-                          {navMode === 'full' && <span className="grow truncate">{n.label}</span>}
-                        </>
-                      ),
-                    });
-                    return (
-                      <li key={n.to}>
-                        {navMode === 'rail' ? (
-                          <Tooltip content={n.label} shortcut={n.keys} side="right">
-                            {item}
-                          </Tooltip>
-                        ) : (
-                          item
-                        )}
-                      </li>
-                    );
-                  })}
-                </ul>
-              </div>
-            ))}
-          </div>
-
-          <div className="nav-footer">
-            {!isRealApi && <PersonaSwitcher compact={navMode === 'rail'} />}
-            {navMode === 'rail' && !inWorkspace && (
-              <Tooltip content="Expand navigation" shortcut="[" side="right">
-                <button className="nav-item nav-item-icon" onClick={shell.toggleNavCollapsed} aria-label="Expand navigation">
-                  <ChevronRight size={16} />
-                </button>
-              </Tooltip>
-            )}
-            <Dropdown.Root>
-              <Tooltip content="Theme" shortcut="mod+shift+l" side="right">
-                <Dropdown.Trigger asChild>
-                  <button className="nav-item nav-item-icon" aria-label={`Theme: ${theme}`}>
-                    <span className="nav-icon">{themeIcon[theme]}</span>
-                    {navMode === 'full' && <span className="grow truncate">Theme</span>}
-                    {navMode === 'full' && <span className="subtle small">{THEMES.find((t) => t.id === theme)?.label}</span>}
-                  </button>
-                </Dropdown.Trigger>
-              </Tooltip>
-              <Dropdown.Content side="right" align="end" sideOffset={10}>
-                <Dropdown.Label>Appearance</Dropdown.Label>
-                <Dropdown.RadioGroup value={theme} onValueChange={(v) => setTheme(v as Theme)}>
-                  {THEMES.map((t) => (
-                    <Dropdown.RadioItem key={t.id} value={t.id}>
-                      {themeIcon[t.id]}
-                      <span className="grow">{t.label}</span>
-                      <span className="subtle xs">{t.hint}</span>
-                    </Dropdown.RadioItem>
-                  ))}
-                </Dropdown.RadioGroup>
-              </Dropdown.Content>
-            </Dropdown.Root>
-
-            <UserMenu me={principal} navMode={navMode} />
-          </div>
-        </nav>
-      )}
+      {navMode !== 'hidden' && panel(navMode)}
 
       <main id="main" className="main" tabIndex={-1}>
         <Outlet />
@@ -241,7 +189,145 @@ function ShellInner() {
   );
 }
 
-function UserMenu({ me, navMode }: { me: Me | undefined; navMode: 'full' | 'rail' | 'hidden' }) {
+function BrandMark() {
+  return (
+    <span className="brand-mark" aria-hidden>
+      <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
+        <path d="M3 12.5h9.2a3.3 3.3 0 0 0 .4-6.57A4.6 4.6 0 0 0 4 7.6 2.5 2.5 0 0 0 3 12.5Z" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round" />
+        <path d="M6.5 15.5h5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+      </svg>
+    </span>
+  );
+}
+
+/** The sidebar: a column beside the page on wide screens, the content of the drawer on phones and tablets. */
+function NavPanel({ mode, inDrawer, inWorkspace, pathname, sections, principal, theme, setTheme, onClose }: { mode: 'full' | 'rail'; inDrawer: boolean; inWorkspace: boolean; pathname: string; sections: NavSection[]; principal: Me | undefined; theme: Theme; setTheme: (t: Theme) => void; onClose: () => void }) {
+  const shell = useShell();
+  // In the drawer, menus open upward: there is no room to the right on a phone.
+  const menuSide = inDrawer ? 'top' : 'right';
+  return (
+    <nav className="nav" aria-label="Primary">
+      <div className="nav-brand">
+        <Link to="/" className="brand" aria-label="CloudTrain home">
+          <BrandMark />
+          {mode === 'full' && <span className="brand-name">CloudTrain</span>}
+        </Link>
+        {inDrawer ? (
+          <DialogPrimitive.Close asChild>
+            <button className="nav-collapse nav-close" aria-label="Close navigation">
+              <X size={16} />
+            </button>
+          </DialogPrimitive.Close>
+        ) : (
+          mode === 'full' &&
+          !inWorkspace && (
+            <Tooltip content="Collapse navigation" shortcut="[" side="right">
+              <button className="nav-collapse" onClick={shell.toggleNavCollapsed} aria-label="Collapse navigation">
+                <ChevronLeft size={14} />
+              </button>
+            </Tooltip>
+          )
+        )}
+      </div>
+
+      <button
+        className={cn('nav-search', mode === 'rail' && 'nav-search-rail')}
+        onClick={() => {
+          onClose();
+          shell.setPaletteOpen(true);
+        }}
+        aria-label="Search and commands"
+      >
+        <Search size={14} />
+        {mode === 'full' && (
+          <>
+            <span className="grow" style={{ textAlign: 'left' }}>
+              Search
+            </span>
+            {!inDrawer && <Kbd keys="mod+k" />}
+          </>
+        )}
+      </button>
+
+      <div className="nav-scroll">
+        {sections.map((section, si) => (
+          <div key={section.title ?? si} className="nav-section">
+            {section.title && mode === 'full' && (
+              <div className="nav-section-title" id={`nav-section-${si}`}>
+                {section.title}
+              </div>
+            )}
+            {section.title && mode === 'rail' && <div className="nav-section-rule" aria-hidden />}
+            <ul className="nav-list" aria-label={section.title}>
+              {section.items.map((n) => {
+                const active = n.to === '/' ? pathname === '/' : pathname === n.to || pathname.startsWith(`${n.to}/`) || (n.also ?? []).some((a) => pathname.startsWith(a));
+                const item = n.link({
+                  className: cn('nav-item', active && 'is-active'),
+                  'aria-current': active ? 'page' : undefined,
+                  children: (
+                    <>
+                      <span className="nav-icon">{n.icon}</span>
+                      {mode === 'full' && <span className="grow truncate">{n.label}</span>}
+                    </>
+                  ),
+                });
+                return (
+                  <li key={n.to}>
+                    {mode === 'rail' ? (
+                      <Tooltip content={n.label} shortcut={n.keys} side="right">
+                        {item}
+                      </Tooltip>
+                    ) : (
+                      item
+                    )}
+                  </li>
+                );
+              })}
+            </ul>
+          </div>
+        ))}
+      </div>
+
+      <div className="nav-footer">
+        {!isRealApi && <PersonaSwitcher compact={mode === 'rail'} side={menuSide} />}
+        {mode === 'rail' && !inWorkspace && (
+          <Tooltip content="Expand navigation" shortcut="[" side="right">
+            <button className="nav-item nav-item-icon" onClick={shell.toggleNavCollapsed} aria-label="Expand navigation">
+              <ChevronRight size={16} />
+            </button>
+          </Tooltip>
+        )}
+        <Dropdown.Root>
+          <Tooltip content="Theme" shortcut="mod+shift+l" side="right">
+            <Dropdown.Trigger asChild>
+              <button className="nav-item nav-item-icon" aria-label={`Theme: ${theme}`}>
+                <span className="nav-icon">{themeIcon[theme]}</span>
+                {mode === 'full' && <span className="grow truncate">Theme</span>}
+                {mode === 'full' && <span className="subtle small">{THEMES.find((t) => t.id === theme)?.label}</span>}
+              </button>
+            </Dropdown.Trigger>
+          </Tooltip>
+          <Dropdown.Content side={menuSide} align="end" sideOffset={10}>
+            <Dropdown.Label>Appearance</Dropdown.Label>
+            <Dropdown.RadioGroup value={theme} onValueChange={(v) => setTheme(v as Theme)}>
+              {THEMES.map((t) => (
+                <Dropdown.RadioItem key={t.id} value={t.id}>
+                  {themeIcon[t.id]}
+                  <span className="grow">{t.label}</span>
+                  <span className="subtle xs">{t.hint}</span>
+                </Dropdown.RadioItem>
+              ))}
+            </Dropdown.RadioGroup>
+          </Dropdown.Content>
+        </Dropdown.Root>
+
+        <UserMenu me={principal} navMode={mode} side={menuSide} onBeforeAction={onClose} />
+      </div>
+    </nav>
+  );
+}
+
+function UserMenu({ me, navMode, side = 'right', onBeforeAction }: { me: Me | undefined; navMode: 'full' | 'rail' | 'hidden'; side?: 'right' | 'top'; onBeforeAction?: () => void }) {
   const shell = useShell();
   const navigate = useNavigate();
   const { cycle } = useTheme();
@@ -286,7 +372,7 @@ function UserMenu({ me, navMode }: { me: Me | undefined; navMode: 'full' | 'rail
           )}
         </button>
       </Dropdown.Trigger>
-      <Dropdown.Content side="right" align="end" sideOffset={10}>
+      <Dropdown.Content side={side} align="end" sideOffset={10}>
         <div className="menu-user">
           <div className="small" style={{ fontWeight: 500 }}>
             {me?.name}
@@ -316,7 +402,12 @@ function UserMenu({ me, navMode }: { me: Me | undefined; navMode: 'full' | 'rail
           </>
         )}
         <Dropdown.Separator />
-        <Dropdown.Item onSelect={() => shell.setShortcutsOpen(true)}>
+        <Dropdown.Item
+          onSelect={() => {
+            onBeforeAction?.();
+            shell.setShortcutsOpen(true);
+          }}
+        >
           <Keyboard size={14} /> Keyboard shortcuts <Kbd keys="?" />
         </Dropdown.Item>
         <Dropdown.Item onSelect={cycle}>

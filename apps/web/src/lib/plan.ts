@@ -1,11 +1,18 @@
-import { useCallback, useState } from 'react';
-import type { GoalForecast } from '@/api/types';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { ApiError, put, request } from '@/api/client';
+import type { GoalForecast, LearnerGoals, UpdateLearnerGoalsRequest } from '@/api/types';
 
 /**
  * Study plan on the Home goal card. The gateway sends how many practice
  * minutes are still needed (`minutesToReady`); the learner may pick their own
- * exam date and weekly target. Both are per-browser preferences until the
- * platform stores learner goals.
+ * exam date and weekly target, stored on the server (`/api/me/goals`, per org).
+ *
+ * Before goals were stored on the server the app kept them in localStorage
+ * (KEY). On the first load with the server available they are imported once
+ * (`source: 'browser'`: only fields not set yet) and the key is removed.
+ * Without the goals API (a gateway running without a database) the app keeps
+ * using localStorage.
  */
 
 const DAY = 86_400_000;
@@ -18,26 +25,88 @@ export interface PlanPrefs {
   weeklyTarget?: number;
 }
 
-function read(): PlanPrefs {
+function readLocal(): PlanPrefs | null {
   try {
-    const v = JSON.parse(localStorage.getItem(KEY) ?? '{}') as PlanPrefs;
-    return v && typeof v === 'object' ? v : {};
+    const raw = localStorage.getItem(KEY);
+    if (!raw) return null;
+    const v = JSON.parse(raw) as PlanPrefs;
+    return v && typeof v === 'object' ? v : null;
   } catch {
-    return {};
+    return null;
+  }
+}
+function writeLocal(p: PlanPrefs) {
+  try {
+    localStorage.setItem(KEY, JSON.stringify(p));
+  } catch {
+    /* private window: keep it for this visit */
+  }
+}
+function dropLocal() {
+  try {
+    localStorage.removeItem(KEY);
+  } catch {
+    /* ignore */
   }
 }
 
-export function usePlanPrefs(): [PlanPrefs, (p: PlanPrefs) => void] {
-  const [prefs, setPrefs] = useState<PlanPrefs>(read);
-  const save = useCallback((p: PlanPrefs) => {
-    setPrefs(p);
-    try {
-      localStorage.setItem(KEY, JSON.stringify(p));
-    } catch {
-      /* private window: keep it for this visit */
-    }
-  }, []);
-  return [prefs, save];
+const toPrefs = (g: LearnerGoals): PlanPrefs => ({ ...(g.targetDate ? { targetDate: g.targetDate } : {}), ...(g.weeklyTargetMinutes ? { weeklyTarget: g.weeklyTargetMinutes } : {}) });
+const GOALS_KEY = ['me', 'goals'] as const;
+
+/** The goals API is missing (gateway without a database): fall back to localStorage. */
+const unsupported = (e: unknown) => e instanceof ApiError && (e.status === 404 || e.status === 405 || e.status === 501);
+
+export interface PlanPrefsState {
+  prefs: PlanPrefs;
+  save: (p: PlanPrefs) => void;
+  saving: boolean;
+  /** Last save failed; the card shows it and keeps the previous goals. */
+  error?: string;
+}
+
+export function usePlanPrefs(): PlanPrefsState {
+  const qc = useQueryClient();
+  const goals = useQuery({ queryKey: GOALS_KEY, queryFn: () => request<LearnerGoals>('/api/me/goals'), staleTime: 5 * 60_000, retry: (n, e) => !unsupported(e) && n < 1 });
+  const local = goals.isError && unsupported(goals.error);
+  const [localPrefs, setLocalPrefs] = useState<PlanPrefs>(() => readLocal() ?? {});
+
+  const mutation = useMutation({
+    mutationFn: (body: UpdateLearnerGoalsRequest) => put<LearnerGoals>('/api/me/goals', body),
+    onSuccess: (g) => {
+      qc.setQueryData(GOALS_KEY, g);
+      // The goal card's numbers (daily minutes, source of the date) come from /api/home.
+      void qc.invalidateQueries({ queryKey: ['home'] });
+    },
+  });
+
+  // One-time import of the old per-browser goals.
+  const imported = useRef(false);
+  useEffect(() => {
+    if (imported.current || !goals.isSuccess) return;
+    imported.current = true;
+    const old = readLocal();
+    if (!old) return;
+    if (!old.targetDate && !old.weeklyTarget) return dropLocal();
+    mutation.mutate({ source: 'browser', ...(old.targetDate ? { targetDate: old.targetDate } : {}), ...(old.weeklyTarget ? { weeklyTargetMinutes: Math.round(old.weeklyTarget) } : {}) }, { onSuccess: dropLocal });
+  }, [goals.isSuccess, mutation]);
+
+  const save = useCallback(
+    (p: PlanPrefs) => {
+      if (local) {
+        setLocalPrefs(p);
+        writeLocal(p);
+        return;
+      }
+      mutation.mutate({ targetDate: p.targetDate ?? null, weeklyTargetMinutes: p.weeklyTarget ?? null });
+    },
+    [local, mutation],
+  );
+
+  if (local) return { prefs: localPrefs, save, saving: false };
+  // While a save is in flight show what was asked for.
+  const pending = mutation.isPending && mutation.variables && mutation.variables.source !== 'browser' ? mutation.variables : undefined;
+  const prefs = pending ? toPrefs({ targetDate: pending.targetDate ?? null, weeklyTargetMinutes: pending.weeklyTargetMinutes ?? null, updatedAt: null }) : goals.data ? toPrefs(goals.data) : {};
+  return { prefs, save, saving: mutation.isPending, ...(mutation.isError ? { error: mutation.error.message } : {}) };
 }
 
 /** Days from today until the end of `date` (at least 1). */
@@ -65,15 +134,16 @@ export const SUSTAINABLE_DAILY = 60;
 
 export function planOf(goal: GoalForecast, prefs: PlanPrefs, now = Date.now()): Plan {
   const targetDate = prefs.targetDate ?? goal.targetDate;
+  const weeklyTarget = prefs.weeklyTarget ?? goal.weeklyTargetMinutes;
   const minutesToReady = goal.minutesToReady ?? 0;
   const dailyNeeded = minutesToReady ? round5(minutesToReady / daysLeft(targetDate, now)) : 0;
   return {
     targetDate,
-    dateChosen: !!prefs.targetDate || goal.targetDateSource === 'assignment',
+    dateChosen: !!prefs.targetDate || goal.targetDateSource === 'assignment' || goal.targetDateSource === 'learner',
     minutesToReady,
     dailyNeeded,
     weeklyNeeded: dailyNeeded * 7,
-    ...(prefs.weeklyTarget ? { weeklyTarget: prefs.weeklyTarget } : {}),
+    ...(weeklyTarget ? { weeklyTarget } : {}),
     tooTight: dailyNeeded > SUSTAINABLE_DAILY,
   };
 }

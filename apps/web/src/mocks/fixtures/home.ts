@@ -1,4 +1,4 @@
-import type { Activity, GoalDomain, GoalForecast, HomeData, Learner, Recommendation } from '@/api/types';
+import type { Activity, GoalDomain, GoalForecast, HomeData, Learner, LearnerGoals, Recommendation } from '@/api/types';
 import { frameworkReadiness } from '@/lib/readiness';
 import { pct } from '@/lib/utils';
 import { frameworks, skillStates, skills } from './skills';
@@ -230,3 +230,17 @@ export const coldHomeData: HomeData = {
   assignmentsDue: [],
   source: 'live',
 };
+
+/** The goal with the learner's own exam date and weekly target applied, as the gateway's buildHome does. */
+export function withGoals(g: GoalForecast, goals: LearnerGoals | undefined): GoalForecast {
+  if (!goals) return g;
+  const own = goals.targetDate;
+  const targetDate = own ?? g.targetDate;
+  return {
+    ...g,
+    targetDate,
+    targetDateSource: own ? 'learner' : g.targetDateSource,
+    dailyMinutesNeeded: dailyNeeded(g.minutesToReady ?? 0, targetDate),
+    ...(goals.weeklyTargetMinutes ? { weeklyTargetMinutes: goals.weeklyTargetMinutes } : {}),
+  };
+}

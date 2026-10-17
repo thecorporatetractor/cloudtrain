@@ -79,9 +79,9 @@ Permission gating (`src/app/access.tsx`) applies to the nav, the command palette
 
 ## Mocks
 
-The mock API runs in the browser through a service worker (`public/mockServiceWorker.js`) in dev, or in a production build when `VITE_MOCK_API=1`. Sessions, studio drafts and every admin mutation live in memory and reset on reload; the signed-in persona is kept in `localStorage` (`ct.mock.session`). Every endpoint in `docs/api/platform.md` has a handler, including the CSV exports and 401/403/409/422 answers.
+The mock API runs in the browser through a service worker (`public/mockServiceWorker.js`) in dev, or in a production build when `VITE_MOCK_API=1`. Sessions, studio drafts and every admin mutation live in memory and reset on reload; the signed-in persona and learner goals are kept in `localStorage` (`ct.mock.session`, `ct.mock.goals`). Every endpoint in `docs/api/platform.md` has a handler, including the CSV exports and 401/403/409/422 answers.
 
-Screenshots of every screen in all three themes are in `docs/screenshots/`; the role-based views are under `docs/screenshots/platform/` (`node apps/web/scripts/platform-shots.mjs` against a dev server on port 5199).
+Screenshots of every screen in all three themes are in `docs/screenshots/`; the role-based views are under `docs/screenshots/platform/` (`node apps/web/scripts/platform-shots.mjs` against a dev server on port 5199), including phone and tablet widths (`*-phone-dark.png`, `*-tablet-dark.png`). Below 1024px the sidebar is a drawer behind a menu button in a top bar (`src/lib/media.ts`, `styles/shell.css`).
 ## Exams
 
 `/exams` (catalog with alignment disclaimers, duration, pass mark and rules;

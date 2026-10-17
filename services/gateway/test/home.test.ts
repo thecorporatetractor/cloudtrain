@@ -87,6 +87,26 @@ describe('practice time', () => {
   });
 });
 
+describe('practice time windows', () => {
+  it('buckets by start time in [since, until), the same measure for every view', () => {
+    const a = [attempt('pv', 10, { run: 30 }), attempt('svc', 3, { run: 15 }), attempt('dns', 3)];
+    expect(minutesSince(a, ago(14), ago(7))).toBe(30);
+    expect(minutesSince(a, ago(7), now)).toBe(15);
+    expect(minutesSince(a, ago(14))).toBe(minutesSince(a, ago(14), ago(7)) + minutesSince(a, ago(7), now));
+  });
+});
+
+describe('learner goals', () => {
+  it('uses the learner’s own exam date over a placeholder and sends the weekly target', () => {
+    const own = buildHome(input({ goals: { targetDate: '2027-01-15', weeklyTargetMinutes: 240, updatedAt: now.toISOString() } })).goal;
+    expect(own).toMatchObject({ targetDate: '2027-01-15', targetDateSource: 'learner', weeklyTargetMinutes: 240 });
+    expect(own.dailyMinutesNeeded).toBe(dailyMinutesNeeded(own.minutesToReady!, '2027-01-15', now));
+    const none = buildHome(input({ goals: { targetDate: null, weeklyTargetMinutes: null, updatedAt: null } })).goal;
+    expect(none.targetDateSource).toBe('default');
+    expect(none.weeklyTargetMinutes).toBeUndefined();
+  });
+});
+
 describe('resume and activity', () => {
   it('offers the latest unfinished lab, and a session id only while it is live', () => {
     const expired = [attempt('pv', 3), attempt('pv', 3)];

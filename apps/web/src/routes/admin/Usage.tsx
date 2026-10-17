@@ -42,7 +42,7 @@ function Screen() {
         <Segmented<'14' | '30' | '90'> label="Range" size="sm" value={days} onChange={setDays} options={[{ value: '14', label: '14 d' }, { value: '30', label: '30 d' }, { value: '90', label: '90 d' }]} />
       </div>
 
-      <div className="grid-2" style={{ gridTemplateColumns: 'minmax(0, 7fr) minmax(0, 5fr)', gap: 20, alignItems: 'start' }}>
+      <div className="split split-7-5" style={{ alignItems: 'start' }}>
         <div className="stack" style={{ gap: 20 }}>
           <Card className="card-flush">
             <div className="card-head">
