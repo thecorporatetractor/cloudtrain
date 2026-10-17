@@ -17,8 +17,8 @@ Legend. **Type**: learn = guided first exposure, do = complete a task, fix = rep
 | Containers with Docker | 11 | 91 | 44 | 2 | 24 | 0 | 111 | B 71, C 64 | 28 |
 | Infrastructure as code with Terraform | 5 | 54 | 45 | 2 | 48 | 0 | 51 | A 53, B 1, V 45 | 21 |
 | Configuration management and automation | 7 | 61 | 36 | 1 | 0 | 0 | 97 | A 39, B 7, C 45, N 6 | 26 |
-| Network administration | 4 | 45 | 32 | 1 | 6 | 14 | 57 | N 77 | 15 |
-| **Total** | 43 | 499 | 379 | 13 | 135 | 169 | 574 | A 176, B 148, C 235, K 112, V 124, N 83 | 161 |
+| Network administration | 4 | 45 | 32 | 1 | 7 | 17 | 53 | N 77 | 15 |
+| **Total** | 43 | 499 | 379 | 13 | 136 | 172 | 570 | A 176, B 148, C 235, K 112, V 124, N 83 | 161 |
 
 Cross-domain exams: Platform engineer practical capstone. Exam tasks are counted under the domain of each task. Learning labs by type: learn 47, do 356, fix 83, hack 13. New skills proposed: 291.
 
