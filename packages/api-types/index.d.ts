@@ -13,7 +13,7 @@ import type { MyAssignment, SessionNotice } from './platform.js';
 
 export * from './platform.js';
 
-export type Domain = 'kubernetes' | 'linux' | 'networking';
+export type Domain = 'kubernetes' | 'linux' | 'containers' | 'iac' | 'automation' | 'networking';
 export type Difficulty = 'easy' | 'medium' | 'hard';
 export type NodeDriver = 'container' | 'vm' | 'k8s-cluster' | 'netdev';
 export type AccessKind = 'shell' | 'ssh' | 'console' | 'web' | 'rdp';

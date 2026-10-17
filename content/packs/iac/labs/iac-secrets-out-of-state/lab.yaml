@@ -1,0 +1,211 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: iac-secrets-out-of-state
+  title: Find a leaked token in state and keep it out
+  domain: iac
+  frameworks: [tf-associate:secrets, tf-professional:credentials-secrets]
+  difficulty: medium
+  estimatedMinutes: 25
+  tags: [terraform, secrets, state, sensitive, ephemeral, write-only]
+  version: 1
+spec:
+  description: |
+    Security review of the trading feed stack in `~/stacks/trading-feed`
+    (applied on `sm-grid`): the grid operator's API token is declared
+    `sensitive`, so it never shows in plans, and the team assumed that made it
+    safe. It does not.
+
+    1. **Prove the leak:** find the token in the stack's state with your own
+       eyes and write it (just the value) to `~/incident/found-in-state.txt`.
+    2. **Rotate:** the operator issued a new token, in
+       `~/incident/new-token.txt`. Deliver it to the Secret `grid-operator`
+       (key `token`) so that **no copy of the old or the new token stays in the
+       stack directory**: not in `.tf` or `.tfvars` files, not in
+       `terraform.tfstate` or its backup.
+       - pass the token in through an **ephemeral** input variable (on the
+         command line or as `TF_VAR_grid_operator_token`, never in a file), and
+       - write it with the Secret's **write-only** argument (`data_wo`, with
+         `data_wo_revision` to tell Terraform when to send it again).
+
+    A plan run with the new token passed in must report no changes.
+  objectives:
+    - Explain why sensitive values still end up in state and plan files
+    - Keep secrets out of state with ephemeral variables and write-only arguments
+    - Rotate a secret managed through a write-only argument
+  params:
+    old:
+      type: int
+      min: 100000
+      max: 999999
+    new:
+      type: int
+      min: 100000
+      max: 999999
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+      - name: sm-grid
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: sm-grid
+  setup:
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/main.tf, source: assets/main.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/seed.sh, source: assets/seed.sh, mode: "0755"}
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/stacks
+    - on: workstation
+      as: learner
+      timeoutSec: 240
+      run: /var/tmp/ct-seed/seed.sh gop-{{old}}-live gop-{{new}}-rotated
+  teardown:
+    - on: sm-grid
+      run: kubectl delete namespace trading-feed --ignore-not-found --wait=false
+  checks:
+    - id: leak-proven
+      description: ~/incident/found-in-state.txt holds the token that was in state
+      type: shell
+      on: workstation
+      skills: [iac.quality.secrets, iac.state.inspection]
+      command: head -1 /home/learner/incident/found-in-state.txt 2>/dev/null | tr -d ' \r' || echo missing
+      expect: {match: exact, value: "gop-{{old}}-live"}
+    - id: secret-rotated
+      description: Secret grid-operator holds the new token
+      type: shell
+      on: sm-grid
+      skills: [iac.quality.write-only]
+      weight: 1.5
+      timeoutSec: 30
+      command: kubectl -n trading-feed get secret grid-operator -o jsonpath='{.data.token}' 2>/dev/null | base64 -d 2>/dev/null || echo missing
+      expect: {match: exact, value: "gop-{{new}}-rotated"}
+    - id: state-clean
+      description: The Secret is managed through data_wo and no state file in the stack holds either token
+      type: shell
+      on: workstation
+      skills: [iac.quality.write-only, iac.quality.secrets]
+      weight: 2
+      timeoutSec: 60
+      command: |
+        d=/home/learner/stacks/trading-feed
+        n=$(cat $d/terraform.tfstate* 2>/dev/null | grep -c -e 'gop-{{old}}-live' -e 'gop-{{new}}-rotated')
+        r=$(ct-iac state $d | jq -r '[.values.root_module.resources[]? | select(.type | test("^kubernetes_secret")) | .values.data_wo_revision][0] // "none"' 2>/dev/null)
+        echo "copies=$n revision=$r"
+      expect: {match: regex, value: '^copies=0 revision=[1-9][0-9]*$'}
+    - id: no-secret-files
+      description: No .tf or .tfvars file in the stack holds either token
+      type: shell
+      on: workstation
+      skills: [iac.quality.secrets]
+      command: |
+        cd /home/learner/stacks/trading-feed 2>/dev/null || { echo missing; exit 0; }
+        cat *.tf *.tfvars *.tfvars.json 2>/dev/null | grep -c -e 'gop-{{old}}-live' -e 'gop-{{new}}-rotated' || true
+      expect: {match: exact, value: "0"}
+    - id: ephemeral-input
+      description: A token passed on the command line appears neither in the saved plan nor as a plain variable
+      type: shell
+      on: workstation
+      skills: [iac.quality.ephemeral]
+      weight: 2
+      timeoutSec: 120
+      command: |
+        j=$(ct-iac planjson /home/learner/stacks/trading-feed -var grid_operator_token=probe-7f2c19)
+        [ -n "$j" ] || { echo "plan failed"; exit 0; }
+        echo "$j" | grep -q 'probe-7f2c19' && echo "stored in plan" || echo "not stored"
+      expect: {match: exact, value: not stored}
+    - id: converged
+      description: A plan with the new token passed in reports no changes
+      type: shell
+      on: workstation
+      skills: [iac.foundations.workflow]
+      timeoutSec: 120
+      command: ct-iac plan /home/learner/stacks/trading-feed -var grid_operator_token=gop-{{new}}-rotated
+      expect: {match: exact, value: no-changes}
+  hints:
+    - title: Sensitive is a display setting
+      body: "`sensitive = true` hides a value in plan and apply output only. The state stores every attribute, in plain text; read it with `terraform show -json` or open terraform.tfstate."
+      command: cd ~/stacks/trading-feed && terraform show -json | jq '.values.root_module.resources[] | select(.type == "kubernetes_secret_v1") | .values.data'
+      cost: 1
+    - title: Ephemeral and write-only
+      body: |
+        `ephemeral = true` on the variable keeps its value out of plan and state
+        files; only ephemeral contexts and write-only arguments may use it. Replace
+        `data = {...}` with `data_wo = { token = var.grid_operator_token }` and
+        `data_wo_revision = 1`; bump the revision whenever the value must be sent
+        again.
+      cost: 2
+    - title: Old copies
+      body: terraform.tfvars still holds the old token, and terraform.tfstate.backup keeps the previous state. Both have to go.
+      cost: 1
+    - title: Still in state after the switch?
+      body: An existing Secret switched from `data` to `data_wo` in place keeps its previous `data` in state, because the provider goes on reading back the keys it managed. Create a fresh object with `-replace=kubernetes_secret_v1.feed`.
+      cost: 2
+  misconceptions:
+    - id: sensitive-is-enough
+      description: Rotates by writing the new token into terraform.tfvars and keeping data.
+      feedback: The value is masked on screen but stored in plain text in the state and in the tfvars file. Use an ephemeral variable and the write-only argument.
+      expectFail: [state-clean, no-secret-files, ephemeral-input]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 240
+        run: |
+          cd ~/stacks/trading-feed
+          iac show -json | jq -r '.values.root_module.resources[] | select(.type == "kubernetes_secret_v1") | .values.data.token' > ~/incident/found-in-state.txt
+          printf 'grid_operator_token = "%s"\n' "$(cat ~/incident/new-token.txt)" > terraform.tfvars
+          iac apply -auto-approve -input=false -no-color
+    - id: write-only-not-ephemeral
+      description: Uses data_wo but leaves the variable non-ephemeral.
+      feedback: The Secret no longer stores the token in state, but every saved plan still carries the variable's value. Mark the variable ephemeral.
+      expectFail: [ephemeral-input]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 240
+        run: |
+          cd ~/stacks/trading-feed
+          iac show -json | jq -r '.values.root_module.resources[] | select(.type == "kubernetes_secret_v1") | .values.data.token' > ~/incident/found-in-state.txt
+          python3 - <<'PY'
+          p = "main.tf"; s = open(p).read()
+          s = s.replace("  data = {\n    token = var.grid_operator_token\n  }\n", "  data_wo = {\n    token = var.grid_operator_token\n  }\n  data_wo_revision = 1\n")
+          open(p, "w").write(s)
+          PY
+          rm -f terraform.tfvars
+          iac apply -auto-approve -input=false -no-color -replace=kubernetes_secret_v1.feed -var "grid_operator_token=$(cat ~/incident/new-token.txt)"
+          rm -f terraform.tfstate.backup
+  solution:
+    explanation: |
+      The state file stores the Secret's `data` in plain text, sensitive or not.
+      An ephemeral variable is never written to plan or state files and may only feed
+      ephemeral contexts such as write-only arguments. `data_wo` sends the token to
+      the cluster without recording it; `data_wo_revision` is what Terraform tracks,
+      so the next rotation is a revision bump. The Secret is replaced once, because an
+      in-place switch would keep the previously managed `data` in state. Deleting
+      terraform.tfvars and the state backup removes the last copies.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 240
+        run: |
+          set -e
+          cd ~/stacks/trading-feed
+          iac show -json | jq -r '.values.root_module.resources[] | select(.type == "kubernetes_secret_v1") | .values.data.token' > ~/incident/found-in-state.txt
+          python3 - <<'PY'
+          p = "main.tf"; s = open(p).read()
+          s = s.replace("  sensitive   = true\n}", "  sensitive   = true\n  ephemeral   = true\n}")
+          s = s.replace("  data = {\n    token = var.grid_operator_token\n  }\n", "  data_wo = {\n    token = var.grid_operator_token\n  }\n  data_wo_revision = 1\n")
+          open(p, "w").write(s)
+          PY
+          rm -f terraform.tfvars
+          # Switching an existing Secret from data to data_wo in place leaves the old data
+          # in state (the provider keeps reading back the keys it managed): replace it.
+          TF_VAR_grid_operator_token=$(cat ~/incident/new-token.txt) iac apply -auto-approve -input=false -no-color -replace=kubernetes_secret_v1.feed
+          rm -f terraform.tfstate.backup
+          grep -c gop- terraform.tfstate || true

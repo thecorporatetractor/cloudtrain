@@ -1,0 +1,36 @@
+#!/bin/bash
+# ct-iac: grading helper for IaC labs, CLI-agnostic (runs `iac`). Checks run as root;
+# every command here runs as the learner with the learner's login environment (HOME,
+# kubeconfig, ~/.terraformrc), the same way the platform runs learner actions.
+#
+#   ct-iac plan DIR [ARGS...]      no-changes | changes | error  (plan -detailed-exitcode, no lock)
+#   ct-iac planjson DIR [ARGS...]  the plan as JSON (plan -out + show -json); empty on error
+#   ct-iac state DIR               the current state as JSON (show -json); empty on error
+#   ct-iac run DIR CMD...          any command in DIR as the learner (exit code passed through)
+set -uo pipefail
+learner() {
+  if [[ $(id -u) == 0 ]]; then
+    runuser -u learner -- env -i HOME=/home/learner USER=learner LOGNAME=learner SHELL=/bin/bash \
+      PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin TERM=dumb "$@"
+  else
+    "$@"
+  fi
+}
+cmd=${1:-}; dir=${2:-}
+[[ -n $cmd && -n $dir ]] || { echo "usage: ct-iac plan|planjson|state|run DIR [ARGS...]" >&2; exit 2; }
+shift 2
+[[ -d $dir ]] || { echo "error"; exit 0; }
+ct-s3 ensure >/dev/null 2>&1   # stacks with an S3 backend need the local store up
+case $cmd in
+  plan)
+    learner bash -c 'cd "$1" && shift && iac plan -input=false -lock=false -no-color -detailed-exitcode "$@" >/dev/null 2>&1' ct-iac "$dir" "$@"
+    case $? in 0) echo no-changes ;; 2) echo changes ;; *) echo error ;; esac ;;
+  planjson)
+    learner bash -c 'cd "$1" && shift && f=$(mktemp /tmp/ct-iac.XXXXXX) && trap "rm -f \$f" EXIT &&
+      iac plan -input=false -lock=false -no-color -out="$f" "$@" >/dev/null 2>&1 && iac show -json "$f"' ct-iac "$dir" "$@" ;;
+  state)
+    learner bash -c 'cd "$1" && iac show -json -no-color 2>/dev/null' ct-iac "$dir" ;;
+  run)
+    learner bash -c 'cd "$1" && shift && "$@"' ct-iac "$dir" "$@" ;;
+  *) echo "ct-iac: unknown command $cmd" >&2; exit 2 ;;
+esac

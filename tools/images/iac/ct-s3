@@ -1,0 +1,52 @@
+#!/bin/bash
+# ct-s3: the workstation's own S3-compatible object store (SeaweedFS, Apache-2.0) for
+# state-backend labs. It runs inside the learner's pod as the learner, listens on
+# 127.0.0.1:8333 only (path-style), keeps its data in ~/.local/share/ct-s3 (survives
+# hibernation) and accepts the lab credentials in ~/.aws/credentials. Not a security
+# boundary: anyone in the pod may use it.
+#
+#   ct-s3 start                         start it now and on every later `ensure`
+#   ct-s3 ensure                        start it if it was started before and is down
+#                                       (login shells and ct-iac call this)
+#   ct-s3 bucket NAME [--versioning]    create a bucket (idempotent)
+#   ct-s3 api METHOD PATH [CURL ARGS]   signed request, e.g. ct-s3 api GET '/bucket?versions'
+#   ct-s3 status                        up | down
+set -uo pipefail
+PORT=8333
+H=/home/learner
+DATA=$H/.local/share/ct-s3
+FLAG=$H/.config/ct-s3/enabled
+if [[ $(id -u) == 0 ]]; then
+  exec runuser -u learner -- env -i HOME=$H USER=learner LOGNAME=learner \
+    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin "$0" "$@"
+fi
+up() { curl -s -o /dev/null --max-time 2 "http://127.0.0.1:$PORT/"; }
+sig() { curl -s --aws-sigv4 "aws:amz:us-east-1:s3" -u saltmarsh-lab:saltmarsh-lab-secret "$@"; }
+start() {
+  up && return 0
+  mkdir -p "$DATA" "$(dirname "$FLAG")"
+  setsid nohup weed server -dir="$DATA" -ip=127.0.0.1 -ip.bind=127.0.0.1 -filer \
+    -s3 -s3.port=$PORT -s3.config=/etc/cloudtrain/s3.json \
+    -master.volumeSizeLimitMB=64 -volume.max=16 -metricsPort=0 \
+    >"$DATA/weed.log" 2>&1 </dev/null &
+  for _ in $(seq 1 90); do up && return 0; sleep 1; done
+  echo "ct-s3: store did not come up, see $DATA/weed.log" >&2; return 1
+}
+case ${1:-} in
+  start) start && touch "$FLAG" ;;
+  ensure) [[ -e $FLAG ]] || exit 0; start ;;
+  bucket)
+    b=${2:?bucket name}
+    start || exit 1
+    code=$(sig -o /dev/null -w '%{http_code}' -X PUT "http://127.0.0.1:$PORT/$b")
+    [[ $code == 200 || $code == 409 ]] || { echo "ct-s3: create $b: HTTP $code" >&2; exit 1; }
+    if [[ ${3:-} == --versioning ]]; then
+      sig -o /dev/null -X PUT -H 'Content-Type: application/xml' \
+        --data '<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Status>Enabled</Status></VersioningConfiguration>' \
+        "http://127.0.0.1:$PORT/$b?versioning"
+    fi ;;
+  api) # ':' (e.g. workspace keys env:/...) must be percent-encoded for the signature to match.
+    m=${2:?method}; p=${3:?path}; shift 3; sig -X "$m" "http://127.0.0.1:$PORT${p//:/%3A}" "$@" ;;
+  status) up && echo up || echo down ;;
+  *) echo "usage: ct-s3 start|ensure|bucket NAME [--versioning]|api METHOD PATH|status" >&2; exit 2 ;;
+esac

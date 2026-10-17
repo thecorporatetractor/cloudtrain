@@ -1,0 +1,218 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: iac-state-inspection-report
+  title: Answer audit questions from state and plan JSON
+  domain: iac
+  frameworks: [tf-associate:state]
+  difficulty: easy
+  estimatedMinutes: 15
+  tags: [terraform, state, show-json, jq, audit]
+  version: 1
+spec:
+  description: |
+    Internal audit is reviewing the inland operations stack in `~/stacks/inland`
+    (applied, local state). They want answers taken from Terraform's own records,
+    not from the cluster, and the stack must not change while they look: **do not
+    run apply, refresh, import or any `terraform state` command that writes**.
+
+    Use `terraform state list`, `terraform state show` and `terraform show -json`
+    (with `jq`) to write `~/audit/audit.json`, one JSON object with these keys:
+
+    | Key | Value |
+    |---|---|
+    | `managed_instances` | number of resource instances the state manages |
+    | `configmaps` | names of the ConfigMaps the stack manages, sorted, as an array |
+    | `secret_name` | the name of the Secret the stack manages |
+    | `secret_keys` | the keys of that Secret's data, sorted, as an array |
+    | `namespace_uid` | the namespace's UID as recorded in state |
+  objectives:
+    - List and inspect resources in state
+    - Read state as JSON and query it with jq
+    - Inspect state without modifying it
+  params:
+    key:
+      type: choice
+      values: [historian-password, modbus-psk, relay-cert]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+      - name: sm-grid
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: sm-grid
+  setup:
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/main.tf, source: assets/main.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/seed.sh, source: assets/seed.sh, mode: "0755"}
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/stacks
+    - on: workstation
+      as: learner
+      timeoutSec: 240
+      run: /var/tmp/ct-seed/seed.sh
+  teardown:
+    - on: sm-grid
+      run: kubectl delete namespace inland-ops --ignore-not-found --wait=false
+  checks:
+    - id: instances
+      description: managed_instances matches the state
+      type: shell
+      on: workstation
+      skills: [iac.state.inspection]
+      timeoutSec: 60
+      command: |
+        exp=$(ct-iac state /home/learner/stacks/inland | jq '[.values.root_module.resources[]? | select(.mode == "managed")] | length')
+        got=$(jq '.managed_instances' /home/learner/audit/audit.json 2>/dev/null)
+        [ -n "$exp" ] && [ "$exp" = "$got" ] && echo ok || echo "different"
+      expect: {match: exact, value: ok}
+    - id: configmaps
+      description: configmaps lists the managed ConfigMap names, sorted
+      type: shell
+      on: workstation
+      skills: [iac.state.inspection]
+      timeoutSec: 60
+      command: |
+        exp=$(ct-iac state /home/learner/stacks/inland | jq -c '[.values.root_module.resources[]? | select(.type | test("^kubernetes_config_map")) | .values.metadata[0].name] | sort')
+        got=$(jq -c '.configmaps' /home/learner/audit/audit.json 2>/dev/null)
+        [ "$exp" = "$got" ] && echo ok || echo "different"
+      expect: {match: exact, value: ok}
+    - id: secret-name
+      description: secret_name is the managed Secret's name
+      type: shell
+      on: workstation
+      skills: [iac.state.inspection]
+      timeoutSec: 60
+      command: |
+        exp=$(ct-iac state /home/learner/stacks/inland | jq -r '[.values.root_module.resources[]? | select(.type | test("^kubernetes_secret")) | .values.metadata[0].name][0]')
+        got=$(jq -r '.secret_name' /home/learner/audit/audit.json 2>/dev/null)
+        [ -n "$exp" ] && [ "$exp" = "$got" ] && echo ok || echo "different"
+      expect: {match: exact, value: ok}
+    - id: secret-keys
+      description: secret_keys lists the Secret's data keys, sorted
+      type: shell
+      on: workstation
+      skills: [iac.state.inspection]
+      weight: 1.5
+      timeoutSec: 60
+      command: jq -c '.secret_keys' /home/learner/audit/audit.json 2>/dev/null || echo missing
+      expect: {match: exact, value: '["api-token","{{key}}"]'}
+    - id: namespace-uid
+      description: namespace_uid is the namespace UID recorded in state
+      type: shell
+      on: workstation
+      skills: [iac.state.inspection]
+      weight: 1.5
+      timeoutSec: 60
+      command: |
+        exp=$(ct-iac state /home/learner/stacks/inland | jq -r '[.values.root_module.resources[]? | select(.type | test("^kubernetes_namespace")) | .values.metadata[0].uid][0]')
+        got=$(jq -r '.namespace_uid' /home/learner/audit/audit.json 2>/dev/null)
+        [ -n "$exp" ] && [ "$exp" != null ] && [ "$exp" = "$got" ] && echo ok || echo "different"
+      expect: {match: exact, value: ok}
+    - id: state-untouched
+      description: The state file is byte-for-byte the one written at setup
+      type: shell
+      on: workstation
+      skills: [iac.state.inspection]
+      weight: 2
+      command: |
+        cd /home/learner/stacks/inland 2>/dev/null || { echo missing; exit 0; }
+        [ "$(sha256sum terraform.tfstate 2>/dev/null | cut -d' ' -f1)" = "$(cat .ct-seeded 2>/dev/null)" ] && [ ! -e terraform.tfstate.backup ] && echo untouched || echo changed
+      expect: {match: exact, value: untouched}
+  hints:
+    - title: Addresses first
+      body: "`terraform state list` prints one address per instance; `terraform state show <address>` prints one instance's attributes."
+      command: cd ~/stacks/inland && terraform state list
+      cost: 1
+    - title: The JSON view
+      body: "`terraform show -json` prints the whole state. Resources live under `.values.root_module.resources`, each with `address`, `mode`, `type` and `values`."
+      command: terraform show -json | jq '.values.root_module.resources[] | {address, type}'
+      cost: 1
+    - title: Sensitive values
+      body: The human-readable output hides sensitive values, but the keys of a map are not secret. In JSON, `.values.data | keys` lists them.
+      cost: 2
+  misconceptions:
+    - id: refresh-to-check
+      description: Runs terraform apply -refresh-only to "make sure the state is current", which rewrites the state.
+      feedback: A refresh-only apply writes a new state serial and a backup file. Reading needs only state list, state show and show.
+      expectFail: [state-untouched]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 240
+        run: |
+          cd ~/stacks/inland
+          iac apply -refresh-only -auto-approve -input=false -no-color
+          iac show -json | jq '{managed_instances: ([.values.root_module.resources[] | select(.mode == "managed")] | length),
+            configmaps: ([.values.root_module.resources[] | select(.type == "kubernetes_config_map_v1") | .values.metadata[0].name] | sort),
+            secret_name: ([.values.root_module.resources[] | select(.type == "kubernetes_secret_v1") | .values.metadata[0].name][0]),
+            secret_keys: ([.values.root_module.resources[] | select(.type == "kubernetes_secret_v1") | .values.data | keys[]] | sort),
+            namespace_uid: ([.values.root_module.resources[] | select(.type == "kubernetes_namespace_v1") | .values.metadata[0].uid][0])}' > ~/audit/audit.json
+    - id: count-addresses-blocks
+      description: Counts resource blocks in the configuration instead of instances in state.
+      feedback: A for_each block is one block but several instances. Count what the state manages, e.g. with state list or show -json.
+      expectFail: [instances]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          cd ~/stacks/inland
+          n=$(grep -c '^resource ' main.tf)
+          iac show -json | jq --argjson n "$n" '{managed_instances: $n,
+            configmaps: ([.values.root_module.resources[] | select(.type == "kubernetes_config_map_v1") | .values.metadata[0].name] | sort),
+            secret_name: ([.values.root_module.resources[] | select(.type == "kubernetes_secret_v1") | .values.metadata[0].name][0]),
+            secret_keys: ([.values.root_module.resources[] | select(.type == "kubernetes_secret_v1") | .values.data | keys[]] | sort),
+            namespace_uid: ([.values.root_module.resources[] | select(.type == "kubernetes_namespace_v1") | .values.metadata[0].uid][0])}' > ~/audit/audit.json
+  solution:
+    explanation: |
+      `terraform show -json` prints the current state without changing it. Managed
+      resources have `mode == "managed"`; each for_each instance is its own entry,
+      so the stack manages five instances. The Secret's data keys are readable even
+      though the values are sensitive, and the namespace UID is a computed attribute
+      stored in state.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 120
+        run: |
+          set -e
+          cd ~/stacks/inland
+          iac state list
+          iac show -json | jq '
+            [.values.root_module.resources[]] as $r
+            | {managed_instances: ([$r[] | select(.mode == "managed")] | length),
+               configmaps: ([$r[] | select(.type == "kubernetes_config_map_v1") | .values.metadata[0].name] | sort),
+               secret_name: ([$r[] | select(.type == "kubernetes_secret_v1") | .values.metadata[0].name][0]),
+               secret_keys: ([$r[] | select(.type == "kubernetes_secret_v1") | .values.data | keys[]] | sort),
+               namespace_uid: ([$r[] | select(.type == "kubernetes_namespace_v1") | .values.metadata[0].uid][0])}' > ~/audit/audit.json
+          cat ~/audit/audit.json
+    alternatives:
+      - id: state-show-by-hand
+        description: Read each value with state list and state show, then write the JSON by hand.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 120
+            run: |
+              set -e
+              cd ~/stacks/inland
+              n=$(iac state list | grep -vc '^data\.')
+              ns_uid=$(iac state show -no-color kubernetes_namespace_v1.inland | awk -F'"' '/ uid +=/{print $2; exit}')
+              secret=$(iac state show -no-color kubernetes_secret_v1.scada | awk -F'"' '/ name +=/{print $2; exit}')
+              cat > ~/audit/audit.json <<JSON
+              {
+                "managed_instances": $n,
+                "configmaps": ["farm-fenwick", "farm-larkholt"],
+                "secret_name": "$secret",
+                "secret_keys": ["api-token", "{{key}}"],
+                "namespace_uid": "$ns_uid"
+              }
+              JSON

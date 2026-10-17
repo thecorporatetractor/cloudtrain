@@ -1,0 +1,213 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: iac-s3-backend-lockfile
+  title: Move local state to an S3 backend with lockfile locking
+  domain: iac
+  frameworks: [tf-associate:state]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [terraform, backends, s3, locking, state-migration]
+  version: 1
+spec:
+  description: |
+    The telemetry collector stack in `~/stacks/telemetry` is applied with **local**
+    state, so only this workstation can run it and nothing stops two runs at once.
+    The platform team set up the bucket `saltmarsh-state` on the workstation's
+    S3-compatible store (`ct-s3 status`; credentials are in `~/.aws/credentials`).
+
+    1. Configure an `s3` backend: bucket `saltmarsh-state`, key
+       **`telemetry/terraform.tfstate`**, with **`use_lockfile = true`**. The store
+       needs these settings too:
+
+       ```hcl
+       region                      = "us-east-1"
+       endpoints                   = { s3 = "http://127.0.0.1:8333" }
+       use_path_style              = true
+       skip_credentials_validation = true
+       skip_region_validation      = true
+       skip_requesting_account_id  = true
+       skip_metadata_api_check     = true
+       ```
+
+    2. **Migrate** the existing state into the bucket (nothing may be recreated:
+       the collector's pet name stays), then delete the local state files.
+    3. Prove the lock works. In one terminal start
+       `terraform apply -replace=random_pet.collector` and leave it waiting at its
+       approval prompt (an apply holds the lock while it waits). From a second
+       terminal run `terraform plan` and save its complete output to
+       **`~/reports/lock-proof.txt`**. Then answer `no` in the first terminal, so
+       nothing is replaced and the lock is released.
+
+    Finish with a plan that reports no changes.
+  objectives:
+    - Configure an S3 backend with native lockfile locking
+    - Migrate existing state into a new backend with init -migrate-state
+    - Recognise a state lock held by another run
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+  setup:
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/main.tf, source: assets/main.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/seed.sh, source: assets/seed.sh, mode: "0755"}
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/stacks
+    - on: workstation
+      as: learner
+      timeoutSec: 240
+      run: /var/tmp/ct-seed/seed.sh
+  checks:
+    - id: state-in-bucket
+      description: telemetry/terraform.tfstate in saltmarsh-state holds the original collector (same pet name)
+      type: shell
+      on: workstation
+      skills: [iac.state.backends]
+      weight: 2.5
+      timeoutSec: 60
+      command: |
+        ct-s3 ensure >/dev/null 2>&1
+        pet=$(ct-s3 api GET '/saltmarsh-state/telemetry/terraform.tfstate' | jq -r '[.resources[]? | select(.type == "random_pet") | .instances[0].attributes.id][0] // "none"' 2>/dev/null)
+        [ -n "$pet" ] && [ "$pet" = "$(cat /home/learner/stacks/telemetry/.ct-seeded 2>/dev/null)" ] && echo same || echo "bucket pet: ${pet:-none}"
+      expect: {match: exact, value: same}
+    - id: lockfile-enabled
+      description: The stack is initialised with the s3 backend and use_lockfile enabled
+      type: shell
+      on: workstation
+      skills: [iac.state.locking, iac.state.backends]
+      weight: 1.5
+      command: jq -r '"\(.backend.type) lockfile=\(.backend.config.use_lockfile) key=\(.backend.config.key)"' /home/learner/stacks/telemetry/.terraform/terraform.tfstate 2>/dev/null || echo "not initialised"
+      expect: {match: exact, value: s3 lockfile=true key=telemetry/terraform.tfstate}
+    - id: local-state-gone
+      description: No local state files are left in ~/stacks/telemetry
+      type: shell
+      on: workstation
+      skills: [iac.state.backends]
+      command: ls /home/learner/stacks/telemetry/terraform.tfstate* >/dev/null 2>&1 && echo present || echo gone
+      expect: {match: exact, value: gone}
+    - id: lock-proof
+      description: ~/reports/lock-proof.txt shows a plan refused because of the .tflock lock
+      type: shell
+      on: workstation
+      skills: [iac.state.locking]
+      weight: 1.5
+      command: |
+        f=/home/learner/reports/lock-proof.txt
+        grep -q 'Error acquiring the state lock' $f 2>/dev/null && grep -q 'telemetry/terraform.tfstate' $f && echo proven || echo missing
+      expect: {match: exact, value: proven}
+    - id: lock-released
+      description: No lock object is left behind
+      type: shell
+      on: workstation
+      skills: [iac.state.locking]
+      timeoutSec: 30
+      command: |
+        ct-s3 ensure >/dev/null 2>&1
+        ct-s3 api GET '/saltmarsh-state?list-type=2&prefix=telemetry/' | grep -q 'terraform.tfstate.tflock' && echo locked || echo free
+      expect: {match: exact, value: free}
+    - id: converged
+      description: A new plan of ~/stacks/telemetry reports no changes
+      type: shell
+      on: workstation
+      skills: [iac.foundations.workflow]
+      timeoutSec: 120
+      command: ct-iac plan /home/learner/stacks/telemetry
+      expect: {match: exact, value: no-changes}
+  hints:
+    - title: Where the backend goes
+      body: 'The `backend "s3" { ... }` block goes inside the existing `terraform { }` block, next to required_providers.'
+      cost: 1
+    - title: Migrating
+      body: "`terraform init -migrate-state` notices the new backend and offers to copy the existing state into it. Answer yes, then check with `terraform state list`."
+      command: cd ~/stacks/telemetry && terraform init -migrate-state
+      cost: 1
+    - title: Holding a lock on purpose
+      body: An apply with something to change keeps the lock while it waits for `yes` (with no changes it never prompts). In the second terminal, `terraform plan 2>&1 | tee ~/reports/lock-proof.txt` shows who holds it.
+      cost: 2
+  misconceptions:
+    - id: no-lockfile
+      description: Migrates to S3 without use_lockfile, so concurrent runs are not locked.
+      feedback: Without use_lockfile (or a DynamoDB table, which is deprecated) the S3 backend does not lock at all, and two applies can overwrite each other's state.
+      expectFail: [lockfile-enabled, lock-proof]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 240
+        run: |
+          cd ~/stacks/telemetry
+          python3 - <<'PY'
+          p = "main.tf"; s = open(p).read()
+          s = s.replace('terraform {\n', 'terraform {\n  backend "s3" {\n    bucket = "saltmarsh-state"\n    key = "telemetry/terraform.tfstate"\n    region = "us-east-1"\n    endpoints = { s3 = "http://127.0.0.1:8333" }\n    use_path_style = true\n    skip_credentials_validation = true\n    skip_region_validation = true\n    skip_requesting_account_id = true\n    skip_metadata_api_check = true\n  }\n', 1)
+          open(p, "w").write(s)
+          PY
+          iac init -migrate-state -force-copy -input=false -no-color
+          rm -f terraform.tfstate terraform.tfstate.backup
+    - id: fresh-backend
+      description: Switches the backend with -reconfigure, which starts from an empty state instead of migrating.
+      feedback: -reconfigure ignores the old state, so the next apply creates a new collector with a new name. Use -migrate-state to copy the existing state.
+      expectFail: [state-in-bucket]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 240
+        run: |
+          cd ~/stacks/telemetry
+          python3 - <<'PY'
+          p = "main.tf"; s = open(p).read()
+          s = s.replace('terraform {\n', 'terraform {\n  backend "s3" {\n    bucket = "saltmarsh-state"\n    key = "telemetry/terraform.tfstate"\n    region = "us-east-1"\n    endpoints = { s3 = "http://127.0.0.1:8333" }\n    use_path_style = true\n    use_lockfile = true\n    skip_credentials_validation = true\n    skip_region_validation = true\n    skip_requesting_account_id = true\n    skip_metadata_api_check = true\n  }\n', 1)
+          open(p, "w").write(s)
+          PY
+          rm -f terraform.tfstate terraform.tfstate.backup
+          iac init -reconfigure -input=false -no-color
+          iac apply -auto-approve -input=false -no-color
+  solution:
+    explanation: |
+      The backend block points Terraform at the bucket; `init -migrate-state` copies
+      the local state there unchanged, so nothing is recreated and the local files can
+      go. With `use_lockfile = true` every run first writes
+      `telemetry/terraform.tfstate.tflock` with a conditional write; a second run
+      finds it and stops with "Error acquiring the state lock" until the first one
+      finishes.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/stacks/telemetry
+          python3 - <<'PY'
+          p = "main.tf"; s = open(p).read()
+          s = s.replace('terraform {\n', '''terraform {
+            backend "s3" {
+              bucket                      = "saltmarsh-state"
+              key                         = "telemetry/terraform.tfstate"
+              use_lockfile                = true
+              region                      = "us-east-1"
+              endpoints                   = { s3 = "http://127.0.0.1:8333" }
+              use_path_style              = true
+              skip_credentials_validation = true
+              skip_region_validation      = true
+              skip_requesting_account_id  = true
+              skip_metadata_api_check     = true
+            }
+
+          ''', 1)
+          open(p, "w").write(s)
+          PY
+          iac fmt
+          iac init -migrate-state -force-copy -input=false -no-color
+          rm -f terraform.tfstate terraform.tfstate.backup
+          iac state list
+          # Hold the lock: an apply with a pending change waits for an answer that never
+          # comes (stdin closes after 25 s, which cancels it).
+          ( sleep 25 | iac apply -no-color -replace=random_pet.collector >/tmp/holder.log 2>&1 ) &
+          sleep 8
+          iac plan -no-color -lock-timeout=0s > ~/reports/lock-proof.txt 2>&1 || true
+          wait
+          cat ~/reports/lock-proof.txt
+          iac plan -input=false -no-color -detailed-exitcode

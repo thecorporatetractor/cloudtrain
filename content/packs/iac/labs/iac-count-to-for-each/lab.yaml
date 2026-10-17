@@ -1,0 +1,223 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: iac-count-to-for-each
+  title: Move substations from count to for_each without recreating them
+  domain: iac
+  frameworks: [tf-associate:configuration, tf-associate:state]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [terraform, count, for_each, moved, refactoring, kubernetes-provider]
+  version: 1
+spec:
+  description: |
+    The stack in `~/stacks/substations` gives every grid substation a namespace on
+    the grid cluster (`sm-grid`). It is applied and in use. Substation
+    **`{{retire}}`** is being decommissioned, but removing it from the
+    `substations` list would shift every later `count` index, and Terraform would
+    destroy and recreate the namespaces of the substations after it, with
+    everything inside them.
+
+    1. Rewrite the resource to use **`for_each`, keyed by substation name**
+       (keep the variable a list of names, keep the namespace names and labels).
+    2. Add **`moved` blocks** so that Terraform moves each existing instance from
+       its index to its name instead of recreating it. Check with
+       `terraform plan`: it must show only moves, no destroy and no create.
+    3. Then remove `{{retire}}` from the list and apply. Only its namespace may
+       be destroyed; every other namespace must keep its identity (UID).
+  objectives:
+    - Explain why removing an element from a count list recreates instances
+    - Convert count to for_each with stable keys
+    - Refactor addresses with moved blocks instead of recreating objects
+  params:
+    retire:
+      type: choice
+      values: [saltings, marsh-end]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+      - name: sm-grid
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: sm-grid
+  setup:
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/main.tf, source: assets/main.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/seed.sh, source: assets/seed.sh, mode: "0755"}
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/stacks
+    - on: workstation
+      as: learner
+      timeoutSec: 240
+      run: /var/tmp/ct-seed/seed.sh
+    - on: sm-grid
+      run: |
+        set -eu
+        kubectl -n kube-system get configmap ct-baseline-substations >/dev/null 2>&1 && exit 0
+        args=""
+        for s in north-quay saltings marsh-end harbour-gate; do
+          args="$args --from-literal=$s=$(kubectl get namespace substation-$s -o jsonpath='{.metadata.uid}')"
+        done
+        kubectl -n kube-system create configmap ct-baseline-substations $args
+  teardown:
+    - on: sm-grid
+      run: kubectl delete namespace substation-north-quay substation-saltings substation-marsh-end substation-harbour-gate --ignore-not-found --wait=false
+  checks:
+    - id: retired
+      description: The namespace of substation {{retire}} is gone
+      type: shell
+      on: sm-grid
+      skills: [iac.language.repetition]
+      timeoutSec: 30
+      command: kubectl get namespace substation-{{retire}} -o name 2>/dev/null | grep -q . && echo present || echo gone
+      expect: {match: exact, value: gone}
+    - id: identities-kept
+      description: Every other substation namespace still has its original UID
+      type: shell
+      on: sm-grid
+      skills: [iac.state.refactor, iac.language.repetition]
+      weight: 3
+      timeoutSec: 30
+      command: |
+        r=""
+        for s in north-quay saltings marsh-end harbour-gate; do
+          [ "$s" = "{{retire}}" ] && continue
+          was=$(kubectl -n kube-system get configmap ct-baseline-substations -o jsonpath="{.data.$s}")
+          now=$(kubectl get namespace substation-$s -o jsonpath='{.metadata.uid}' 2>/dev/null)
+          [ -n "$was" ] && [ "$was" = "$now" ] && r="$r $s=same" || r="$r $s=new"
+        done
+        echo $r
+      expect: {match: regex, value: '^[a-z-]+=same [a-z-]+=same [a-z-]+=same$'}
+    - id: keyed-by-name
+      description: The state holds the namespaces as for_each instances keyed by substation name
+      type: shell
+      on: workstation
+      skills: [iac.language.repetition]
+      weight: 2
+      timeoutSec: 60
+      command: |
+        exp=$(printf '%s\n' north-quay saltings marsh-end harbour-gate | grep -vx '{{retire}}' | sort | paste -sd, -)
+        got=$(ct-iac state /home/learner/stacks/substations | jq -r '[.values.root_module.resources[]? | select(.type | test("^kubernetes_namespace")) | .index | tostring] | sort | join(",")' 2>/dev/null)
+        [ "$exp" = "$got" ] && echo ok || echo "keys: $got"
+      expect: {match: exact, value: ok}
+    - id: moved-in-code
+      description: The refactor is recorded in moved blocks in the configuration
+      type: shell
+      on: workstation
+      skills: [iac.state.refactor]
+      weight: 0.5
+      command: cat /home/learner/stacks/substations/*.tf 2>/dev/null | grep -cE '^[[:space:]]*moved[[:space:]]*\{' || true
+      expect: {match: regex, value: '^[1-9][0-9]*$'}
+    - id: converged
+      description: A new plan of ~/stacks/substations reports no changes
+      type: shell
+      on: workstation
+      skills: [iac.foundations.workflow]
+      timeoutSec: 90
+      command: ct-iac plan /home/learner/stacks/substations
+      expect: {match: exact, value: no-changes}
+  hints:
+    - title: Why count hurts here
+      body: With count, instance addresses are positions. Removing the second element moves every later name one position up, so Terraform sees changed names at existing addresses and replaces them.
+      command: cd ~/stacks/substations && terraform state list
+      cost: 1
+    - title: for_each over a list
+      body: for_each needs a map or a set of strings. `for_each = toset(var.substations)` keys each instance by the name itself; use `each.key` in the body.
+      cost: 1
+    - title: One moved block per instance
+      body: |
+        ```hcl
+        moved {
+          from = kubernetes_namespace_v1.substation[0]
+          to   = kubernetes_namespace_v1.substation["north-quay"]
+        }
+        ```
+        Plan after adding them: it should report only moves.
+      cost: 2
+  misconceptions:
+    - id: remove-from-count
+      description: Removes the substation from the list but keeps count.
+      feedback: Every substation after the removed one shifts to a new index and gets a new name, so Terraform destroys and recreates its namespace. Key the instances by name first.
+      expectFail: [identities-kept, keyed-by-name]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          cd ~/stacks/substations
+          sed -i 's/"{{retire}}", //' main.tf
+          iac apply -auto-approve -input=false -no-color
+    - id: for-each-without-moved
+      description: Switches to for_each but adds no moved blocks.
+      feedback: Without moved blocks Terraform sees four old instances to destroy and four new ones to create. moved tells it they are the same objects.
+      expectFail: [identities-kept, moved-in-code]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          cd ~/stacks/substations
+          sed -i 's/"{{retire}}", //; s/count = length(var.substations)/for_each = toset(var.substations)/; s/var.substations\[count.index\]/each.key/g' main.tf
+          # Creates race the destroys of the same names: the first apply fails half-way, the rerun finishes.
+          iac apply -auto-approve -input=false -no-color || iac apply -auto-approve -input=false -no-color || true
+  solution:
+    explanation: |
+      `for_each = toset(var.substations)` keys every instance by its name, so a
+      removed name only ever affects its own instance. The moved blocks map each old
+      index address to the new name address; the plan then shows four moves and
+      nothing else. Removing `{{retire}}` afterwards destroys only that namespace.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 360
+        run: |
+          set -e
+          cd ~/stacks/substations
+          sed -i 's/count = length(var.substations)/for_each = toset(var.substations)/; s/var.substations\[count.index\]/each.key/g' main.tf
+          i=0
+          for s in north-quay saltings marsh-end harbour-gate; do
+            printf 'moved {\n  from = kubernetes_namespace_v1.substation[%d]\n  to   = kubernetes_namespace_v1.substation["%s"]\n}\n\n' "$i" "$s" >> moved.tf
+            i=$((i + 1))
+          done
+          iac plan -input=false -no-color
+          iac apply -auto-approve -input=false -no-color
+          sed -i 's/"{{retire}}", //' main.tf
+          iac apply -auto-approve -input=false -no-color
+    alternatives:
+      - id: one-apply
+        description: Rewrite, add the moved blocks and remove the substation in one change, then apply once.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 360
+            run: |
+              set -e
+              cd ~/stacks/substations
+              sed -i 's/count = length(var.substations)/for_each = toset(var.substations)/; s/var.substations\[count.index\]/each.key/g; s/"{{retire}}", //' main.tf
+              cat >> main.tf <<'HCL'
+
+              moved {
+                from = kubernetes_namespace_v1.substation[0]
+                to   = kubernetes_namespace_v1.substation["north-quay"]
+              }
+              moved {
+                from = kubernetes_namespace_v1.substation[1]
+                to   = kubernetes_namespace_v1.substation["saltings"]
+              }
+              moved {
+                from = kubernetes_namespace_v1.substation[2]
+                to   = kubernetes_namespace_v1.substation["marsh-end"]
+              }
+              moved {
+                from = kubernetes_namespace_v1.substation[3]
+                to   = kubernetes_namespace_v1.substation["harbour-gate"]
+              }
+              HCL
+              iac apply -auto-approve -input=false -no-color

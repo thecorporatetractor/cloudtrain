@@ -1,0 +1,207 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: iac-dynamic-blocks-netpol
+  title: Generate NetworkPolicy rules with dynamic blocks
+  domain: iac
+  frameworks: [tf-associate:configuration, tf-advanced:dynamic-config]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [terraform, dynamic-blocks, networkpolicy, kubernetes-provider]
+  version: 1
+spec:
+  description: |
+    The grid-telemetry collectors on `sm-grid` may only receive traffic on the
+    ports the security team approved. The stack in `~/stacks/telemetry-netpol` is
+    applied, but its NetworkPolicy `collector-ingress` lists two ports by hand,
+    while the approved list lives in the variable `ingest_ports` and already has a
+    third entry (port {{modbus}}/TCP for the substation gateways).
+
+    Change the stack so that the policy's port entries are **generated from
+    `ingest_ports` with a `dynamic` block**: every entry of the variable becomes
+    one port entry with its port and protocol, and adding or removing an entry in
+    the variable is the only change ever needed. Do not change the variable's
+    default. Apply the stack, so the live policy allows exactly the three approved
+    ports.
+  objectives:
+    - Generate nested blocks with a dynamic block
+    - Use the iterator object (key and value) inside content
+    - Keep data in variables and structure in code
+  params:
+    modbus:
+      type: choice
+      values: ["502", "5020", "1502"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+      - name: sm-grid
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: sm-grid
+  setup:
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/main.tf, source: assets/main.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/seed.sh, source: assets/seed.sh, mode: "0755"}
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/stacks
+    - on: workstation
+      as: learner
+      timeoutSec: 240
+      run: /var/tmp/ct-seed/seed.sh
+  teardown:
+    - on: sm-grid
+      run: kubectl delete namespace grid-telemetry --ignore-not-found --wait=false
+  checks:
+    - id: live-ports
+      description: NetworkPolicy collector-ingress allows exactly the three approved ports with their protocols
+      type: k8s-query
+      skills: [iac.language.dynamic-blocks, iac.targets.kubernetes-helm]
+      weight: 2
+      query: {cluster: sm-grid, resource: networkpolicy, name: collector-ingress, namespace: grid-telemetry, jsonpath: "{range .spec.ingress[*].ports[*]}{.protocol}/{.port} {end}"}
+      expect: {match: exact, value: "TCP/4317 UDP/514 TCP/{{modbus}} "}
+    - id: generated-from-variable
+      description: With a different ingest_ports list, the plan's policy follows the list exactly
+      type: shell
+      on: workstation
+      skills: [iac.language.dynamic-blocks]
+      weight: 3
+      timeoutSec: 120
+      command: |
+        ct-iac planjson /home/learner/stacks/telemetry-netpol -var 'ingest_ports=[{port=8443,protocol="TCP"},{port=162,protocol="UDP"}]' \
+          | jq -r '[.resource_changes[]? | select(.type | test("^kubernetes_network_policy")) | .change.after.spec[0].ingress[]?.ports[]? | "\(.protocol)/\(.port)"] | join(" ")' 2>/dev/null
+      expect: {match: exact, value: TCP/8443 UDP/162}
+    - id: no-literal-ports
+      description: The policy resource has no hand-written port entries left
+      type: shell
+      on: workstation
+      skills: [iac.language.dynamic-blocks]
+      weight: 0.5
+      timeoutSec: 90
+      command: |
+        ct-iac planjson /home/learner/stacks/telemetry-netpol | jq -r '
+          [.configuration.root_module.resources[]? | select(.type | test("^kubernetes_network_policy")) | .. | objects | select(has("port") and (.port | type == "object") and (.port | has("constant_value")))] | length' 2>/dev/null
+      expect: {match: exact, value: "0"}
+    - id: converged
+      description: A new plan of ~/stacks/telemetry-netpol reports no changes
+      type: shell
+      on: workstation
+      skills: [iac.foundations.workflow]
+      timeoutSec: 90
+      command: ct-iac plan /home/learner/stacks/telemetry-netpol
+      expect: {match: exact, value: no-changes}
+  hints:
+    - title: The shape of a dynamic block
+      body: |
+        ```hcl
+        dynamic "ports" {
+          for_each = var.ingest_ports
+          content {
+            port     = ports.value.port
+            protocol = ports.value.protocol
+          }
+        }
+        ```
+        The block's label (`ports`) is also the name of the iterator.
+      cost: 2
+    - title: Where it goes
+      body: The dynamic block replaces the hand-written `ports` blocks inside the existing `ingress` block; everything else stays.
+      cost: 1
+  misconceptions:
+    - id: third-literal-block
+      description: Adds a third hand-written ports block instead of generating them.
+      feedback: The live policy is right today, but the next change to ingest_ports does nothing. Generate the entries with a dynamic block over the variable.
+      expectFail: [generated-from-variable, no-literal-ports]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 240
+        run: |
+          cd ~/stacks/telemetry-netpol
+          python3 - <<'PY'
+          p = "main.tf"; s = open(p).read()
+          s = s.replace('        protocol = "UDP"\n      }\n', '        protocol = "UDP"\n      }\n      ports {\n        port     = "{{modbus}}"\n        protocol = "TCP"\n      }\n', 1)
+          open(p, "w").write(s)
+          PY
+          iac apply -auto-approve -input=false -no-color
+    - id: protocol-dropped
+      description: Generates only the port numbers and leaves protocol out, so every entry defaults to TCP.
+      feedback: Without protocol the syslog port becomes TCP/514 and UDP traffic is dropped. Set protocol from the iterator too.
+      expectFail: [live-ports, generated-from-variable]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 240
+        run: |
+          cd ~/stacks/telemetry-netpol
+          python3 - <<'PY'
+          import re
+          p = "main.tf"; s = open(p).read()
+          s = re.sub(r'    ingress \{.*?\n    \}\n', '    ingress {\n      dynamic "ports" {\n        for_each = var.ingest_ports\n        content {\n          port = ports.value.port\n        }\n      }\n    }\n', s, count=1, flags=re.S)
+          open(p, "w").write(s)
+          PY
+          iac apply -auto-approve -input=false -no-color
+  solution:
+    explanation: |
+      A `dynamic "ports"` block inside `ingress` emits one `ports` block per element
+      of `var.ingest_ports`; inside `content`, the iterator `ports` exposes the
+      element as `ports.value`. The policy now follows the variable: the plan adds
+      port {{modbus}} and later list changes need no code change.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 240
+        run: |
+          set -e
+          cd ~/stacks/telemetry-netpol
+          python3 - <<'PY'
+          import re
+          p = "main.tf"; s = open(p).read()
+          s = re.sub(r'    ingress \{.*?\n    \}\n', '''    ingress {
+                dynamic "ports" {
+                  for_each = var.ingest_ports
+                  content {
+                    port     = ports.value.port
+                    protocol = ports.value.protocol
+                  }
+                }
+              }
+          ''', s, count=1, flags=re.S)
+          open(p, "w").write(s)
+          PY
+          iac fmt
+          iac apply -auto-approve -input=false -no-color
+    alternatives:
+      - id: custom-iterator
+        description: A dynamic block with a named iterator and a rule per port.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 240
+            run: |
+              set -e
+              cd ~/stacks/telemetry-netpol
+              python3 - <<'PY'
+              import re
+              p = "main.tf"; s = open(p).read()
+              s = re.sub(r'    ingress \{.*?\n    \}\n', '''    dynamic "ingress" {
+                    for_each = var.ingest_ports
+                    iterator = rule
+                    content {
+                      ports {
+                        port     = rule.value.port
+                        protocol = rule.value.protocol
+                      }
+                    }
+                  }
+              ''', s, count=1, flags=re.S)
+              open(p, "w").write(s)
+              PY
+              iac fmt
+              iac apply -auto-approve -input=false -no-color

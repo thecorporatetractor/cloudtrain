@@ -56,7 +56,7 @@ export interface Lab {
   metadata: {
     id: string;
     title: string;
-    domain: "kubernetes" | "linux" | "networking";
+    domain: "kubernetes" | "linux" | "containers" | "iac" | "automation" | "networking";
     /**
      * Framework objective references, e.g. 'cka:cluster-architecture'.
      */

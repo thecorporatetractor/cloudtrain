@@ -1,0 +1,327 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: iac-for-expressions-functions
+  title: Turn a turbine CSV into a keyed map with for expressions
+  domain: iac
+  frameworks: [tf-associate:configuration, tf-professional:tracing-expressions]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [terraform, for-expressions, functions, csvdecode, for_each]
+  version: 1
+spec:
+  description: |
+    The asset register arrives every quarter as `turbines.csv` in
+    `~/stacks/asset-register` (columns `id,farm,site,model,nameplate_mw`).
+    Saltmarsh wants the register turned into infrastructure data instead of
+    being retyped. In that stack (the `local` provider is already required in
+    `versions.tf`):
+
+    1. Read the CSV with `file()` and `csvdecode()`, using a path relative to the
+       module (`path.module`), and build a **map keyed by turbine id** with a
+       `for` expression.
+    2. Output **`models`**: a map from every turbine id to its model.
+    3. Output **`mw_by_farm`**: a map from each farm to the total nameplate
+       megawatts of its turbines, as numbers.
+    4. Create one `local_file` per **offshore** turbine, keyed by turbine id
+       (`for_each`): `/home/learner/turbines/<id>.txt` with the content
+       `model=<model> mw=<nameplate_mw>`.
+
+    Apply the stack. Next quarter's register must work by replacing the CSV
+    alone: no ids, farms or numbers in your `.tf` files.
+  objectives:
+    - Decode structured data with file and csvdecode
+    - Build maps and filtered collections with for expressions
+    - Aggregate values with functions such as sum, distinct and tonumber
+    - Drive for_each from a derived map
+  params:
+    gh:
+      type: int
+      min: 13
+      max: 15
+    fw:
+      type: int
+      min: 4
+      max: 5
+    sk:
+      type: int
+      min: 18
+      max: 22
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+  setup:
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/stacks /home/learner/stacks/asset-register /home/learner/turbines
+    - on: workstation
+      file: {path: /home/learner/stacks/asset-register/turbines.csv, source: assets/turbines.csv, mode: "0644"}
+    - on: workstation
+      file: {path: /home/learner/stacks/asset-register/versions.tf, source: assets/versions.tf, mode: "0644"}
+    - on: workstation
+      run: chown -R learner:learner /home/learner/stacks/asset-register
+  checks:
+    - id: offshore-files
+      description: One file per offshore turbine with its model and megawatts, and no others
+      type: shell
+      on: workstation
+      skills: [iac.language.expressions, iac.language.repetition]
+      weight: 2
+      command: |
+        exp=$(awk -F, 'NR > 1 && $3 == "offshore" {print $1 ":model=" $4 " mw=" $5}' <<'CSV' | sort | tr '\n' ';'
+        id,farm,site,model,nameplate_mw
+        GH-01,gullhaven,offshore,SW-150,{{gh}}
+        GH-02,gullhaven,offshore,SW-150,{{gh}}
+        GH-03,gullhaven,offshore,SW-120,12
+        RM-01,redmoor,offshore,SW-150,15
+        RM-02,redmoor,offshore,SW-150,15
+        FW-01,fenwick,inland,LX-40,{{fw}}
+        FW-02,fenwick,inland,LX-40,{{fw}}
+        FW-03,fenwick,inland,LX-33,3
+        LH-01,larkholt,inland,LX-40,4
+        SK-01,skerrow,offshore,SW-200,{{sk}}
+        CSV
+        )
+        got=$(for f in /home/learner/turbines/*.txt; do [ -f "$f" ] && echo "$(basename "$f" .txt):$(cat "$f")"; done | sort | tr '\n' ';')
+        [ -n "$got" ] && [ "$exp" = "$got" ] && echo ok || echo different
+      expect: {match: exact, value: ok}
+    - id: keyed-by-id
+      description: The offshore files are local_file instances keyed by turbine id
+      type: shell
+      on: workstation
+      skills: [iac.language.repetition]
+      timeoutSec: 60
+      command: |
+        ct-iac state /home/learner/stacks/asset-register | jq -r '[.values.root_module.resources[]? | select(.type == "local_file") | .index] | map(tostring) | sort | join(",")' 2>/dev/null
+      expect: {match: exact, value: "GH-01,GH-02,GH-03,RM-01,RM-02,SK-01"}
+    - id: models-output
+      description: Output models maps every turbine id to its model
+      type: shell
+      on: workstation
+      skills: [iac.language.expressions, iac.language.outputs-locals]
+      timeoutSec: 60
+      command: |
+        ct-iac state /home/learner/stacks/asset-register | jq -r '.values.outputs.models.value // {} | to_entries | sort_by(.key) | map("\(.key)=\(.value)") | join(",")' 2>/dev/null
+      expect: {match: exact, value: "FW-01=LX-40,FW-02=LX-40,FW-03=LX-33,GH-01=SW-150,GH-02=SW-150,GH-03=SW-120,LH-01=LX-40,RM-01=SW-150,RM-02=SW-150,SK-01=SW-200"}
+    - id: mw-output
+      description: Output mw_by_farm holds each farm's total nameplate megawatts as numbers
+      type: shell
+      on: workstation
+      skills: [iac.language.functions, iac.language.outputs-locals]
+      weight: 1.5
+      timeoutSec: 60
+      command: |
+        exp=$(awk -F, 'NR > 1 {s[$2] += $5} END {for (f in s) print f "=" s[f]}' <<'CSV' | sort | paste -sd, -
+        id,farm,site,model,nameplate_mw
+        GH-01,gullhaven,offshore,SW-150,{{gh}}
+        GH-02,gullhaven,offshore,SW-150,{{gh}}
+        GH-03,gullhaven,offshore,SW-120,12
+        RM-01,redmoor,offshore,SW-150,15
+        RM-02,redmoor,offshore,SW-150,15
+        FW-01,fenwick,inland,LX-40,{{fw}}
+        FW-02,fenwick,inland,LX-40,{{fw}}
+        FW-03,fenwick,inland,LX-33,3
+        LH-01,larkholt,inland,LX-40,4
+        SK-01,skerrow,offshore,SW-200,{{sk}}
+        CSV
+        )
+        got=$(ct-iac state /home/learner/stacks/asset-register | jq -r '.values.outputs.mw_by_farm.value // {} | to_entries | sort_by(.key) | map(select(.value | type == "number") | "\(.key)=\(.value)") | join(",")' 2>/dev/null)
+        [ "$exp" = "$got" ] && echo ok || echo "different"
+      expect: {match: exact, value: ok}
+    - id: data-driven
+      description: A new offshore row in the CSV alone adds its file and its megawatts to the plan
+      type: shell
+      on: workstation
+      skills: [iac.language.expressions, iac.language.functions]
+      weight: 2
+      timeoutSec: 120
+      command: |
+        d=/home/learner/stacks/asset-register
+        cur=$(ct-iac state $d | jq -r '.values.outputs.mw_by_farm.value.skerrow // 0' 2>/dev/null)
+        t=$(mktemp -d /tmp/register.XXXXXX); cp -a $d/. "$t"/ 2>/dev/null
+        echo 'SK-99,skerrow,offshore,SW-200,7' >> "$t/turbines.csv"; chown -R learner:learner "$t"
+        res=$(ct-iac planjson "$t" | jq -r '
+          ([.resource_changes[]? | select(.type == "local_file" and .index == "SK-99" and .change.actions == ["create"])] | length) as $f
+          | "\($f) \(.planned_values.outputs.mw_by_farm.value.skerrow // 0)"' 2>/dev/null)
+        rm -rf "$t"
+        set -- $res
+        echo "file=${1:-0} delta=$(( ${2:-0} - ${cur:-0} ))"
+      expect: {match: exact, value: "file=1 delta=7"}
+    - id: converged
+      description: A new plan of ~/stacks/asset-register reports no changes
+      type: shell
+      on: workstation
+      skills: [iac.foundations.workflow]
+      timeoutSec: 90
+      command: ct-iac plan /home/learner/stacks/asset-register
+      expect: {match: exact, value: no-changes}
+  hints:
+    - title: From CSV to a keyed map
+      body: "`csvdecode(file(\"${path.module}/turbines.csv\"))` gives a list of objects with string values. `{ for t in <list> : t.id => t }` turns it into a map keyed by id."
+      cost: 1
+    - title: Filter and aggregate
+      body: |
+        A trailing `if` filters: `{ for id, t in local.turbines : id => t if t.site == "offshore" }`.
+        For totals, list the farms with `distinct(...)`, then
+        `sum([for t in local.turbines : tonumber(t.nameplate_mw) if t.farm == farm])` per farm.
+      cost: 2
+    - title: Try expressions interactively
+      body: "`terraform console` evaluates expressions against your configuration, e.g. `local.turbines[\"GH-01\"]`."
+      command: cd ~/stacks/asset-register && terraform console
+      cost: 1
+  misconceptions:
+    - id: literal-map
+      description: Types the turbine map into a locals block instead of decoding the CSV.
+      feedback: The result matches this quarter, but next quarter's CSV changes nothing. Decode the file with csvdecode and build the map with a for expression.
+      expectFail: [data-driven]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 180
+        run: |
+          cd ~/stacks/asset-register
+          awk -F, 'NR > 1 {printf "    \"%s\" = { farm = \"%s\", site = \"%s\", model = \"%s\", mw = %s }\n", $1, $2, $3, $4, $5}' turbines.csv > /tmp/rows
+          { echo 'locals {'; echo '  turbines = {'; cat /tmp/rows; echo '  }'; echo '}'; } > main.tf
+          cat >> main.tf <<'HCL'
+          output "models" {
+            value = { for id, t in local.turbines : id => t.model }
+          }
+          output "mw_by_farm" {
+            value = { for f in distinct([for t in local.turbines : t.farm]) : f => sum([for t in local.turbines : t.mw if t.farm == f]) }
+          }
+          resource "local_file" "offshore" {
+            for_each = { for id, t in local.turbines : id => t if t.site == "offshore" }
+            filename = "/home/learner/turbines/${each.key}.txt"
+            content  = "model=${each.value.model} mw=${each.value.mw}"
+          }
+          HCL
+          iac init -input=false -no-color && iac apply -auto-approve -input=false -no-color
+    - id: no-site-filter
+      description: Creates a file for every turbine, inland ones included.
+      feedback: Only offshore turbines get a file. Add `if t.site == "offshore"` to the for expression that feeds for_each.
+      expectFail: [offshore-files, keyed-by-id]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 180
+        run: |
+          cd ~/stacks/asset-register
+          cat > main.tf <<'HCL'
+          locals {
+            turbines = { for t in csvdecode(file("${path.module}/turbines.csv")) : t.id => t }
+          }
+          output "models" {
+            value = { for id, t in local.turbines : id => t.model }
+          }
+          output "mw_by_farm" {
+            value = { for f in distinct([for t in local.turbines : t.farm]) : f => sum([for t in local.turbines : tonumber(t.nameplate_mw) if t.farm == f]) }
+          }
+          resource "local_file" "turbine" {
+            for_each = local.turbines
+            filename = "/home/learner/turbines/${each.key}.txt"
+            content  = "model=${each.value.model} mw=${each.value.nameplate_mw}"
+          }
+          HCL
+          iac init -input=false -no-color && iac apply -auto-approve -input=false -no-color
+    - id: count-over-list
+      description: Uses count over the decoded list, so files are addressed by position instead of turbine id.
+      feedback: With count, removing one row shifts every later index and Terraform recreates those files. Key the instances by id with for_each.
+      expectFail: [keyed-by-id]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 180
+        run: |
+          cd ~/stacks/asset-register
+          cat > main.tf <<'HCL'
+          locals {
+            rows     = csvdecode(file("${path.module}/turbines.csv"))
+            offshore = [for t in local.rows : t if t.site == "offshore"]
+          }
+          output "models" {
+            value = { for t in local.rows : t.id => t.model }
+          }
+          output "mw_by_farm" {
+            value = { for f in distinct(local.rows[*].farm) : f => sum([for t in local.rows : tonumber(t.nameplate_mw) if t.farm == f]) }
+          }
+          resource "local_file" "offshore" {
+            count    = length(local.offshore)
+            filename = "/home/learner/turbines/${local.offshore[count.index].id}.txt"
+            content  = "model=${local.offshore[count.index].model} mw=${local.offshore[count.index].nameplate_mw}"
+          }
+          HCL
+          iac init -input=false -no-color && iac apply -auto-approve -input=false -no-color
+  solution:
+    explanation: |
+      csvdecode turns the file into a list of objects whose values are strings. A for
+      expression keyed by `t.id` makes the map that drives for_each, and a trailing
+      `if` keeps only offshore turbines. `distinct` lists the farms once; for each,
+      `sum` adds the `tonumber`-converted megawatts of that farm's turbines.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 180
+        run: |
+          set -e
+          cd ~/stacks/asset-register
+          cat > main.tf <<'HCL'
+          locals {
+            turbines = { for t in csvdecode(file("${path.module}/turbines.csv")) : t.id => t }
+            offshore = { for id, t in local.turbines : id => t if t.site == "offshore" }
+            farms    = distinct([for t in values(local.turbines) : t.farm])
+          }
+
+          resource "local_file" "offshore" {
+            for_each = local.offshore
+            filename = "/home/learner/turbines/${each.key}.txt"
+            content  = "model=${each.value.model} mw=${each.value.nameplate_mw}"
+          }
+
+          output "models" {
+            value = { for id, t in local.turbines : id => t.model }
+          }
+
+          output "mw_by_farm" {
+            value = {
+              for f in local.farms : f => sum([for t in values(local.turbines) : tonumber(t.nameplate_mw) if t.farm == f])
+            }
+          }
+          HCL
+          iac init -input=false -no-color
+          iac apply -auto-approve -input=false -no-color
+    alternatives:
+      - id: group-by
+        description: Group megawatts with the ... grouping operator and sum each group.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 180
+            run: |
+              set -e
+              cd ~/stacks/asset-register
+              cat > main.tf <<'HCL'
+              locals {
+                rows     = csvdecode(file("${path.module}/turbines.csv"))
+                turbines = { for t in local.rows : t.id => t }
+                mw_lists = { for t in local.rows : t.farm => tonumber(t.nameplate_mw)... }
+              }
+
+              resource "local_file" "offshore" {
+                for_each = { for id, t in local.turbines : id => t if t.site == "offshore" }
+                filename = "/home/learner/turbines/${each.key}.txt"
+                content  = "model=${each.value.model} mw=${each.value.nameplate_mw}\n"
+              }
+
+              output "models" {
+                value = { for id, t in local.turbines : id => t.model }
+              }
+
+              output "mw_by_farm" {
+                value = { for farm, mws in local.mw_lists : farm => sum(mws) }
+              }
+              HCL
+              iac init -input=false -no-color
+              iac apply -auto-approve -input=false -no-color
