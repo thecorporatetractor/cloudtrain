@@ -137,7 +137,7 @@ those domains.
 
 ## Machine
 
-- Heavy work only through `tools/slots/run.sh` (vm 2, build 1, pod 4 slots). Even
+- Heavy work only through `tools/slots/run.sh` (vm and build share 1 heavy slot, pod 4 slots). Even
   so, two kubeadm jobs plus image builds pushed load to 70-110; verify times were
   10-25 min per lab. Consider `vm` = 1 on this machine.
 - VM image builds use TCG (no nested KVM in libguestfs) after three WSL crashes
