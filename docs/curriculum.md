@@ -17,8 +17,8 @@ Legend. **Type**: learn = guided first exposure, do = complete a task, fix = rep
 | Containers with Docker | 11 | 91 | 44 | 2 | 24 | 0 | 111 | B 71, C 64 | 28 |
 | Infrastructure as code with Terraform | 5 | 54 | 45 | 2 | 48 | 0 | 51 | A 53, B 1, V 45 | 21 |
 | Configuration management and automation | 7 | 61 | 36 | 1 | 0 | 0 | 97 | A 39, B 7, C 45, N 6 | 26 |
-| Network administration | 4 | 45 | 32 | 1 | 19 | 6 | 52 | N 77 | 15 |
-| **Total** | 43 | 499 | 379 | 13 | 148 | 161 | 569 | A 176, B 148, C 235, K 112, V 124, N 83 | 161 |
+| Network administration | 4 | 45 | 32 | 1 | 20 | 5 | 52 | N 77 | 15 |
+| **Total** | 43 | 499 | 379 | 13 | 149 | 160 | 569 | A 176, B 148, C 235, K 112, V 124, N 83 | 161 |
 
 Cross-domain exams: Platform engineer practical capstone. Exam tasks are counted under the domain of each task. Learning labs by type: learn 47, do 356, fix 83, hack 13. New skills proposed: 291.
 
@@ -1109,7 +1109,7 @@ _CloudTrain is not affiliated with or endorsed by Cisco Systems, Inc. or Red Hat
 | `net-ospf-single-area` | Replace static routes with single-area OSPF | do | medium | 25 | N | proposed | ccna:ip-connectivity | Run OSPFv2 in area 0 on four district routers with loopback router IDs so every LAN and loopback is learned dynamically and the old static routes can be removed without losing reachability. |
 | `net-ospf-cost-dr-passive` | Steer OSPF with cost, DR priority and passive interfaces | do | medium | 20 | N | proposed | ccna:ip-connectivity | Make the fibre path preferred over the copper path with interface costs, force mv-core-1 to be DR on the data-centre segment, stop hellos toward classroom LANs and originate a default route from the edge. |
 | `net-fix-ospf-adjacency` | Bring two stuck OSPF neighbours to Full | fix | medium | 20 | N | proposed | ccna:ip-connectivity | mv-campus-east never reaches Full with mv-core-1; find the mismatched hello interval and the MTU mismatch, fix both and confirm the east-campus LAN appears in the core routing table. |
-| `net-vrrp-gateway-pair` | Give a campus a redundant default gateway with VRRP | do | medium | 25 | N | built | ccna:ip-connectivity | Configure VRRP between mv-campus-north-a and mv-campus-north-b so classroom hosts keep a single gateway address, the a-router is master by priority, and hosts keep reaching the core when the grader shuts it down. |
+| `net-vrrp-gateway-pair` | Give a campus a redundant default gateway with VRRP | do | medium | 25 | N | verified | ccna:ip-connectivity | Configure VRRP between mv-campus-north-a and mv-campus-north-b so classroom hosts keep a single gateway address, the a-router is master by priority, and hosts keep reaching the core when the grader shuts it down. |
 | `net-dhcp-pools-reservations` | Serve campus addresses with DHCP pools and reservations | do | easy | 20 | N | proposed | ccna:ip-services | Configure the district DHCP server with pools for the staff and student VLANs, the correct gateway and DNS options, and fixed reservations for the three library printers by MAC address. |
 | `net-dhcp-relay-campus` | Relay DHCP from a campus to the central server | do | medium | 20 | N | proposed | ccna:ip-services | Student hosts on the south campus get no address because the DHCP server sits in the data centre; configure a relay on the campus router so they lease from the right pool. |
 | `net-dns-district-zone` | Publish district host names in DNS | do | easy | 15 | N | proposed | ccna:ip-services | Add A, AAAA and CNAME records for the timetable and grades servers to the district resolver and point campus hosts at it so the names resolve and connect from every campus. |
