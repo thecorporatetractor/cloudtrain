@@ -125,7 +125,7 @@ build_noble() {
       -o APT::FTPArchive::Release::Suite=noble -o APT::FTPArchive::Release::Codename=noble release . > Release
     export GNUPGHOME=$(mktemp -d); gpg --batch -q --import /k/secret.asc
     gpg --batch -q --yes --clearsign -o InRelease Release; gpg --batch -q --yes -abs -o Release.gpg Release
-    for f in pool/*.deb; do dpkg-deb -f "$f" Package Version Architecture | paste -sd" "; done | awk "{print \$1\"=\"\$2\" \"\$3}" | sort > noble.lock
+    for f in pool/*.deb; do dpkg-deb -W --showformat "\${Package}=\${Version} \${Architecture}\n" "$f"; done | sort > noble.lock
     chown -R '"$(id -u):$(id -g)"' /out'
   [[ -s $OUT/noble/.missing ]] && warn "noble: unresolvable at $UBUNTU_APT_SNAPSHOT: $(tr '\n' ' ' < "$OUT/noble/.missing")"
   log "noble: $(wc -l < "$OUT/noble/noble.lock") debs, $(du -sh "$OUT/noble" | cut -f1)"

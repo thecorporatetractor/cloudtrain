@@ -28,12 +28,15 @@ Kata and the kubeadm proof under load:
    `restricted` is not usable as the enforced level (it rejects the vcluster
    syncer itself and most lab workloads). Still open: Kata isolation in production.
    `xks-drop-privileged` now starts from refused Pods (statement says so).
-2. **kubeadm under load: fixed in code, not yet proven under load.** `kubeadm init`
-   is retried up to 3 times with `kubeadm reset` in between (pre-seeded CA
-   restored), workers retry join up to 8 times, kubeadm timeouts are longer, and
-   `PROVISION_TIMEOUT=40m bash deploy/scripts/orchestrator-deploy.sh` (or with
-   `task dev:orchestrator`) sets `--provision-timeout`. Still advised: one VM
-   verify at a time on this machine.
+2. **kubeadm under load: init retry proven, post-init still load-bound.** `kubeadm init`
+   is retried up to 3 times with `kubeadm reset` in between (pre-seeded CA restored),
+   workers retry join up to 8 times, longer kubeadm timeouts, and `PROVISION_TIMEOUT=40m
+   task dev:orchestrator` sets `--provision-timeout`. Round 3 (2026-10-17): at host load
+   3-50 every two-node `kubeadm:1.37-sec` session came up (Ready in 5-31 min, init first
+   try); at load 80-166 the retry fired naturally once (attempt 1 failed in
+   wait-control-plane, reset, attempt 2 started) but no session became Ready in 40 min:
+   with 64-85 % CPU steal kube-apiserver, the controllers and calico-node (2 s startup
+   timeout) crashloop after init. Run one VM job and no TCG build at a time.
 3. **Lab links switch: fixed.** Link attachments carry `layer2_forward`, link
    logical switches get `vlan-passthru=true` (manager execs `ovn-nbctl` in
    ovn-central, flag `--ovn-central`). Proven with the `net-trunk-two-switches`
@@ -58,7 +61,7 @@ Kata and the kubeadm proof under load:
 | Lab runtime: container, vcluster, kubeadm, VM, netdev drivers; grader; `labctl verify` | merged, verified on several labs | `services/lab-orchestrator/README.md` |
 | Warm pools, hibernate/resume, reset | merged; proven on vcluster; kubeadm proof pending | `deploy/.results/warmpool-virtual-proof.txt` |
 | Exam simulations (engine + gateway + web) | merged; proven live end to end on 2026-10-15 (Keycloak login + CSRF, gateway :8787, `task dev:orchestrator` manager reconciling the ExamSession, partial solve scored 51, environments released; `deploy/.results/exam-integration-proof.txt`); 3 of 13 exams compile (the K8s ones), the rest wait for pool labs | `docs/handoffs/exam-integrate.md` |
-| Images | kubeadm 1.37 (Calico), 1.36 upgrade, etcd-host, jumphost, frr, nettools, netsvc, el-lab:10, el-vm:10 built; kubeadm:1.37-full/-sec built not boot-tested; deb-lab, ubuntu-vm not built; mirrors partial | `docs/handoffs/foundations.md` |
+| Images | kubeadm 1.37 (Calico), 1.36 upgrade, etcd-host, jumphost, frr, nettools, netsvc, el-lab:10, el-vm:10, **deb-lab:24.04, ubuntu-vm:24.04, kubeadm:1.37-full/-sec** all built and verified (round 3: gVisor sidecar fix, add-on boot test); mirrors deployed (`cloudtrain-mirrors`: content, zot, Gitea; smoke test passes); Kata not started | `docs/handoffs/foundations.md` |
 | Security CI | merged: pre-public scans done, real issues fixed (Go 1.26.9, gRPC, token tag check), no secrets in history (gitleaks 186 commits); workflows NOT written yet | `docs/handoffs/security-ci.md` |
 | Curriculum | approved (Docker-first containers, Terraform-first IaC): 878 labs, 43 paths, 13 exams | `content/curriculum.yaml`, `docs/curriculum.md`, review page https://claude.ai/artifact/1qkEpeMhv1M7Qa5DsfcZpY |
 
@@ -76,8 +79,8 @@ Kata and the kubeadm proof under load:
 | containers (wave 2, Docker on `docker-vm:29`) | 135 | 24 (12 learning, 12 exam tasks) | 0 | 12 exam tasks (5 need more image content) + 79 learning labs not started | `docs/handoffs/containers.md` |
 
 Most "blocked on add-ons" labs should unblock with `kubeadm:1.37-full` (metrics-server,
-Traefik ingress + Gateway API, MetalLB, local-path, Falco, gVisor, kube-bench) once it
-is boot-tested and the labs switch to it.
+Traefik ingress + Gateway API, MetalLB, local-path, Falco, gVisor, kube-bench), now
+boot-tested; labs must call `addons-install <list> --wait` in their setup.
 
 Wave 2: IaC has started (see the iac row; image `terraform-ws:1.15`, Terraform/OpenTofu
 swappable per tenant), and so has containers (see the containers row; every lab runs on
@@ -99,8 +102,11 @@ those domains.
    through Keycloak with CSRF and passed live (attempt `exam-2dc04c2d63`, score 51,
    ready in 49 s, graded 6 s after submit). Left: screenshots of the exam screens
    (optional) and per-exam runs once pool labs exist (item 5).
-4. **Foundations:** boot-test `kubeadm:1.37-full`, build `deb-lab` and `ubuntu-vm`,
-   deploy the mirrors (`task mirror:up`), Kata spike when disk allows.
+4. **Foundations: done except Kata** (round 3, 2026-10-17). kubeadm:1.37-full/-sec,
+   deb-lab, ubuntu-vm built and verified; mirrors deployed and smoke-tested;
+   `gvisor-runtimeclass` and `text-filters-ticket-sales` switched to the new images.
+   Left: Kata spike, MetalLB IP reachability inside a Kube-OVN VPC, switching the other
+   add-on and Linux labs (see `docs/handoffs/foundations.md`).
 5. **Resume content streams** from their handoffs, verify queues one VM job at a
    time (`tools/slots/run.sh`), then exam runs (`labctl exam run --auto-solve`
    and `--no-solve`) per exam.
@@ -166,8 +172,9 @@ those domains.
 ## Integration notes (wave-1 merge)
 
 - Linux labs still use the interim `linux-pod-deb:24.04` / `linux-pod-el:10` images
-  (`tools/images/linux-pod-interim/`); switch them to `deb-lab:24.04` / `el-lab:10`
-  once `deb-lab` is built, then drop the interim catalog entries.
+  (`tools/images/linux-pod-interim/`); `deb-lab` is built and verified (first lab
+  switched: text-filters-ticket-sales), so switch the rest to `deb-lab:24.04` /
+  `el-lab:10`, then drop the interim catalog entries.
 - The gateway serves curriculum `newSkills` that loaded labs use (a bridge);
   promote the Linux skills into `content/skills.yaml` like networking did.
 - `secrets.yml` must scan history or tracked files only (gitignored `apps/web/dist`
