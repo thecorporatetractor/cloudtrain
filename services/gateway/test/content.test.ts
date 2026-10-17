@@ -23,12 +23,14 @@ describe('content loader (real content/)', () => {
     expect(c.skills.length).toBeGreaterThan(100);
     expect(c.skills.find((s) => s.id === 'k8s.cli.contexts')).toMatchObject({ domain: 'kubernetes' });
     for (const l of c.summaries) for (const s of l.skillIds) expect(ids.has(s), `${l.id}: ${s}`).toBe(true);
-    // Curriculum newSkills a pack lab uses join the graph (until promoted into skills.yaml).
+    // Promoted skills (content/skills.yaml) and curriculum newSkills that a pack lab uses join the graph.
     const git = c.skills.find((s) => s.id === 'linux.git.basics');
     expect(git).toMatchObject({ domain: 'linux' });
     expect(c.competencies.find((k) => k.id === 'linux.git')?.skillIds).toContain('linux.git.basics');
-    // ...but unused newSkills do not.
-    expect(ids.has('linux.shell.help-docs')).toBe(false);
+    // ...but newSkills no lab uses do not (the Linux newSkills were promoted in round 4).
+    expect(ids.has('linux.shell.help-docs')).toBe(true);
+    const unused = c.skills.filter((s) => s.id === 'containers.build.multi-stage');
+    expect(unused).toEqual([]);
   });
 
   it('maps frameworks: ids prefixed per objective, weights summing to 1', async () => {
