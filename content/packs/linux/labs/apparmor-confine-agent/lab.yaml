@@ -1,0 +1,193 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: apparmor-confine-agent
+  title: Confine the depot agent with AppArmor
+  domain: linux
+  frameworks: [cks:system-hardening, linuxplus:security]
+  difficulty: hard
+  estimatedMinutes: 25
+  tags: [apparmor, mac, hardening]
+  version: 1
+spec:
+  description: |
+    The depot telemetry agent **`/usr/local/bin/depot-agent`** on **`tr-depot-01`**
+    (`ssh tr-depot-01`; you have `sudo`) runs as root from `depot-agent.service`. It
+    reads its configuration in **`/etc/depot-agent/`** and writes reports to
+    **`/var/spool/depot-agent/`**. A vendor audit found that it *also* tries to read
+    the depot's signing keys in `/srv/depot/keys/`, which it has no business with.
+
+    Confine it with **AppArmor**:
+
+    1. Write a profile for `/usr/local/bin/depot-agent` (start in **complain** mode
+       with `aa-genprof`/`aa-logprof` or write it by hand, as you prefer).
+    2. Tighten it so the agent may **read only its configuration** and **write only
+       its spool directory** (plus what a shell script needs to run).
+    3. Load it in **enforce** mode, persistently, and restart the service.
+
+    When you are done the agent must keep writing reports, and its log line
+    `keys=` must say `denied`.
+  objectives:
+    - Build an AppArmor profile from complain-mode events
+    - Restrict file access to what a service needs and enforce the profile
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-depot-01
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536}
+        access: [ssh, console]
+  setup:
+    - on: tr-depot-01
+      timeoutSec: 120
+      run: |
+        set -eu
+        mkdir -p /etc/depot-agent /var/spool/depot-agent /srv/depot/keys
+        echo "depot=marrow-lane interval=3" > /etc/depot-agent/agent.conf
+        echo "-----BEGIN SIGNING KEY----- tallowmere depot -----END SIGNING KEY-----" > /srv/depot/keys/signing.key
+        chmod 0600 /srv/depot/keys/signing.key
+        cat > /usr/local/bin/depot-agent <<'SH'
+        #!/bin/bash
+        # Tallowmere depot telemetry agent
+        while :; do
+          conf=$(cat /etc/depot-agent/agent.conf >/dev/null 2>&1 && echo read || echo denied)
+          keys=$(cat /srv/depot/keys/signing.key >/dev/null 2>&1 && echo read || echo denied)
+          echo "$(date +%s) conf=$conf keys=$keys" >> /var/spool/depot-agent/report.log 2>/dev/null || true
+          sleep 3
+        done
+        SH
+        chmod 0755 /usr/local/bin/depot-agent
+        printf '[Unit]\nDescription=Tallowmere depot telemetry agent\n[Service]\nExecStart=/usr/local/bin/depot-agent\n[Install]\nWantedBy=multi-user.target\n' > /etc/systemd/system/depot-agent.service
+        rm -f /etc/apparmor.d/usr.local.bin.depot-agent /etc/apparmor.d/depot-agent
+        systemctl daemon-reload; systemctl enable --now depot-agent.service
+  checks:
+    - id: enforced
+      description: The running agent is confined by a profile in enforce mode
+      type: shell
+      on: tr-depot-01
+      skills: [linux.security.mac]
+      weight: 2
+      command: |
+        p=$(systemctl show -P MainPID depot-agent.service)
+        [ "${p:-0}" != 0 ] && cat /proc/$p/attr/current 2>/dev/null | sed 's/ *$//' | grep -E '\(enforce\)$' >/dev/null && echo enforce || echo "label=$(cat /proc/$p/attr/current 2>/dev/null)"
+      expect: {match: exact, value: enforce}
+    - id: keys-denied
+      description: The agent can no longer read the signing keys
+      type: shell
+      on: tr-depot-01
+      skills: [linux.security.mac]
+      weight: 2
+      timeoutSec: 30
+      command: sleep 4; tail -1 /var/spool/depot-agent/report.log 2>/dev/null | grep -o 'keys=[a-z]*' || echo none
+      expect: {match: exact, value: keys=denied}
+    - id: still-working
+      description: The agent still reads its configuration and writes new reports
+      type: shell
+      on: tr-depot-01
+      skills: [linux.security.mac]
+      weight: 1.5
+      timeoutSec: 30
+      command: |
+        a=$(wc -l < /var/spool/depot-agent/report.log 2>/dev/null || echo 0); sleep 7; b=$(wc -l < /var/spool/depot-agent/report.log 2>/dev/null || echo 0)
+        [ "$b" -gt "$a" ] && tail -1 /var/spool/depot-agent/report.log | grep -q 'conf=read' && echo working || echo "stalled a=$a b=$b"
+      expect: {match: exact, value: working}
+    - id: persistent
+      description: The profile is stored in /etc/apparmor.d in enforce mode, so it loads at boot
+      type: shell
+      on: tr-depot-01
+      skills: [linux.security.mac]
+      weight: 1
+      command: |
+        f=$(grep -lE '^[[:space:]]*(profile[[:space:]]+[^[:space:]]+[[:space:]]+)?/usr/local/bin/depot-agent([[:space:]]|\{)' /etc/apparmor.d/* 2>/dev/null | head -1)
+        [ -n "$f" ] || { echo "no profile file"; exit 0; }
+        grep -qE 'flags=\([^)]*complain' "$f" && echo complain-in-file || { [ -e "/etc/apparmor.d/disable/$(basename $f)" ] && echo disabled || echo stored; }
+      expect: {match: exact, value: stored}
+  hints:
+    - title: Learn what it needs
+      command: sudo aa-genprof /usr/local/bin/depot-agent
+      body: "aa-genprof puts a new profile in complain mode, then turns logged events into rules while the service runs (restart it in another shell). aa-logprof does the same for an existing profile."
+      cost: 1
+    - title: A shell script needs its interpreter
+      body: "The profile attaches to the script path; the script runs bash, cat and date, so allow them with ix (inherit the profile), plus include <abstractions/base> and <abstractions/bash>."
+      cost: 2
+    - title: Only the right paths
+      body: "/etc/depot-agent/** r, and /var/spool/depot-agent/** rw, — and no rule for /srv/depot/keys: anything not allowed is denied in enforce mode."
+      cost: 2
+    - title: Load and apply
+      command: sudo apparmor_parser -r /etc/apparmor.d/usr.local.bin.depot-agent && sudo aa-enforce depot-agent
+      body: "A running process keeps its old confinement; restart the service to start it under the profile. aa-status lists loaded profiles and confined processes."
+      cost: 1
+  misconceptions:
+    - id: left-in-complain
+      description: Leaves the profile in complain mode.
+      feedback: "Complain mode only logs; the agent still reads the keys. Switch it with aa-enforce and restart the service."
+      expectFail: [enforced, keys-denied, persistent]
+      mutation:
+        on: tr-depot-01
+        as: learner
+        run: |
+          printf 'abi <abi/4.0>,\ninclude <tunables/global>\nprofile depot-agent /usr/local/bin/depot-agent flags=(complain) {\n  include <abstractions/base>\n  include <abstractions/bash>\n  /usr/local/bin/depot-agent r,\n  /usr/bin/bash ix,\n  /usr/bin/cat ix,\n  /usr/bin/date ix,\n  /usr/bin/sleep ix,\n  /etc/depot-agent/** r,\n  /var/spool/depot-agent/** rw,\n}\n' | sudo tee /etc/apparmor.d/usr.local.bin.depot-agent >/dev/null
+          sudo apparmor_parser -r /etc/apparmor.d/usr.local.bin.depot-agent
+          sudo systemctl restart depot-agent.service
+    - id: too-tight
+      description: Enforces a profile that forgets the spool directory.
+      feedback: "In enforce mode everything not allowed is denied, including the agent's own reports. Add /var/spool/depot-agent/** rw."
+      expectFail: [still-working]
+      mutation:
+        on: tr-depot-01
+        as: learner
+        run: |
+          printf 'abi <abi/4.0>,\ninclude <tunables/global>\nprofile depot-agent /usr/local/bin/depot-agent {\n  include <abstractions/base>\n  include <abstractions/bash>\n  /usr/local/bin/depot-agent r,\n  /usr/bin/bash ix,\n  /usr/bin/cat ix,\n  /usr/bin/date ix,\n  /usr/bin/sleep ix,\n  /etc/depot-agent/** r,\n}\n' | sudo tee /etc/apparmor.d/usr.local.bin.depot-agent >/dev/null
+          sudo apparmor_parser -r /etc/apparmor.d/usr.local.bin.depot-agent
+          sudo systemctl restart depot-agent.service
+    - id: not-restarted
+      description: Loads the profile but does not restart the running agent.
+      feedback: "A process that was already running keeps its old (unconfined) state; restart depot-agent.service."
+      expectFail: [enforced, keys-denied]
+      mutation:
+        on: tr-depot-01
+        as: learner
+        run: |
+          printf 'abi <abi/4.0>,\ninclude <tunables/global>\nprofile depot-agent /usr/local/bin/depot-agent {\n  include <abstractions/base>\n  include <abstractions/bash>\n  /usr/local/bin/depot-agent r,\n  /usr/bin/bash ix,\n  /usr/bin/cat ix,\n  /usr/bin/date ix,\n  /usr/bin/sleep ix,\n  /etc/depot-agent/** r,\n  /var/spool/depot-agent/** rw,\n}\n' | sudo tee /etc/apparmor.d/usr.local.bin.depot-agent >/dev/null
+          sudo apparmor_parser -r /etc/apparmor.d/usr.local.bin.depot-agent
+  solution:
+    explanation: |
+      The profile attaches to /usr/local/bin/depot-agent, lets bash and the helpers it
+      calls run inside the same profile (ix), grants read on the configuration and
+      read-write on the spool, and nothing for /srv/depot/keys. apparmor_parser -r loads
+      it in enforce mode; the file in /etc/apparmor.d is loaded again at boot; the
+      restart puts the agent under it.
+    steps:
+      - on: tr-depot-01
+        as: learner
+        run: |
+          set -e
+          sudo tee /etc/apparmor.d/usr.local.bin.depot-agent >/dev/null <<'PROFILE'
+          abi <abi/4.0>,
+          include <tunables/global>
+
+          profile depot-agent /usr/local/bin/depot-agent {
+            include <abstractions/base>
+            include <abstractions/bash>
+
+            /usr/local/bin/depot-agent r,
+            /usr/bin/bash ix,
+            /usr/bin/cat ix,
+            /usr/bin/date ix,
+            /usr/bin/sleep ix,
+
+            /etc/depot-agent/ r,
+            /etc/depot-agent/** r,
+            /var/spool/depot-agent/ r,
+            /var/spool/depot-agent/** rw,
+          }
+          PROFILE
+          sudo apparmor_parser -r /etc/apparmor.d/usr.local.bin.depot-agent
+          sudo systemctl restart depot-agent.service
+          sleep 4
+          tail -2 /var/spool/depot-agent/report.log

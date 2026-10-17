@@ -1,0 +1,99 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xel-fix-dir-permissions
+  title: Fix a permission problem on a shared directory
+  domain: linux
+  frameworks: [rhcsa-aligned:filesystems]
+  difficulty: medium
+  estimatedMinutes: 5
+  tags: [exam, permissions, setgid]
+  version: 1
+spec:
+  description: |
+    **Host:** node 1, `tr-el-01` (`ssh tr-el-01`, then `sudo -i`)
+
+    Members of the group **`{{group}}`** (for example `{{group}}-a` and `{{group}}-b`)
+    cannot create files in their shared directory **`/srv/shared/{{group}}`**. Fix
+    ownership and permissions so that:
+
+    - every member of `{{group}}` can **create and edit files** there;
+    - files created there **automatically belong to the group `{{group}}`**;
+    - users who are **not** members have **no access at all**.
+
+    Do not change any user's group membership.
+  objectives:
+    - Use group ownership, mode bits and setgid on a shared directory
+  params:
+    group:
+      type: choice
+      values: [planning, depotops, faredesk]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-el-01
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["2Gi", "1Gi", "2Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-el-01
+      run: |
+        set -eu
+        getent group {{group}} >/dev/null || groupadd {{group}}
+        for u in {{group}}-a {{group}}-b; do id $u >/dev/null 2>&1 || useradd -m -G {{group}} $u; done
+        id outsider >/dev/null 2>&1 || useradd -m outsider
+        mkdir -p /srv/shared/{{group}}; chown root:root /srv/shared/{{group}}; chmod 0755 /srv/shared/{{group}}
+        echo "rota" > /srv/shared/{{group}}/rota.txt
+  checks:
+    - id: members-write
+      description: A member can create files in the directory
+      type: shell
+      on: tr-el-01
+      skills: [linux.files.permissions]
+      weight: 1.5
+      command: f=/srv/shared/{{group}}/.probe-$$; su -s /bin/sh {{group}}-b -c "touch $f" 2>/dev/null && echo writable || echo denied; rm -f $f
+      expect: {match: exact, value: writable}
+    - id: group-inherited
+      description: New files belong to the group automatically
+      type: shell
+      on: tr-el-01
+      skills: [linux.files.special-bits]
+      weight: 1.5
+      command: f=/srv/shared/{{group}}/.probe-g-$$; su -s /bin/sh {{group}}-a -c "touch $f" 2>/dev/null; stat -c %G $f 2>/dev/null || echo none; rm -f $f
+      expect: {match: exact, value: "{{group}}"}
+    - id: others-locked
+      description: Non-members cannot list the directory
+      type: shell
+      on: tr-el-01
+      skills: [linux.files.permissions]
+      weight: 1
+      command: su -s /bin/sh outsider -c "ls /srv/shared/{{group}}" >/dev/null 2>&1 && echo open || echo locked
+      expect: {match: exact, value: locked}
+  misconceptions:
+    - id: no-setgid
+      description: Gives the group write access but forgets the setgid bit.
+      feedback: "Without g+s on the directory, new files get the creator's primary group."
+      expectFail: [group-inherited]
+      mutation:
+        on: tr-el-01
+        as: learner
+        run: sudo sh -c 'chgrp {{group}} /srv/shared/{{group}} && chmod 0770 /srv/shared/{{group}}'
+    - id: world-writable
+      description: Opens the directory to everybody.
+      feedback: "chmod 777 lets non-members in; use the group and mode 2770."
+      expectFail: [others-locked]
+      mutation:
+        on: tr-el-01
+        as: learner
+        run: sudo chmod 2777 /srv/shared/{{group}}
+  solution:
+    explanation: Group ownership plus mode 2770 gives members rwx, the setgid bit makes new files inherit the group, others get nothing.
+    steps:
+      - on: tr-el-01
+        as: learner
+        run: sudo sh -c 'chgrp {{group}} /srv/shared/{{group}} && chmod 2770 /srv/shared/{{group}}'

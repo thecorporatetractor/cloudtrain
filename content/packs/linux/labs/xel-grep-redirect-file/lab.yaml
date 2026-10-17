@@ -1,0 +1,90 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xel-grep-redirect-file
+  title: Save matching lines from a file in original order
+  domain: linux
+  frameworks: [rhcsa-aligned:essential-tools]
+  difficulty: easy
+  estimatedMinutes: 5
+  tags: [exam, grep, redirection]
+  version: 1
+spec:
+  description: |
+    **Host:** node 1, `tr-el-01` (`ssh tr-el-01`, then `sudo -i`)
+
+    The interlocking log `/srv/exam/grep/interlocking.log` is too long to read.
+    Write **every line** of it that contains the string **`{{word}}`** (exact case)
+    to **`/root/answers/{{word}}.lines`**, in the order they appear in the log.
+    The file must contain nothing else.
+  objectives:
+    - Filter lines with grep and redirect them into a file
+  params:
+    word:
+      type: choice
+      values: [signal, points, relay, junction]
+    seed:
+      type: int
+      min: 1
+      max: 997
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-el-01
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["2Gi", "1Gi", "2Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-el-01
+      run: |
+        set -eu
+        install -d -m 0700 /var/lib/cloudtrain /root/answers
+        install -d -m 0755 /srv/exam/grep
+        awk -v seed={{seed}} 'BEGIN {
+          split("signal points relay junction lamp track Signal POINTS Relay Junction", w, " ")
+          split("ok warn fault cleared", st, " ")
+          for (i = 1; i <= 300; i++) {
+            a = w[(i * 7 + seed) % 10 + 1]; b = w[(i * 13 + seed * 3) % 10 + 1]
+            printf "2026-10-%02d %02d:%02d tr-sig-%02d %s %s-%d %s\n", (i % 28) + 1, (i * 5) % 24, (i * 11) % 60, (i + seed) % 40, st[i % 4 + 1], a, i, b
+          }
+        }' > /srv/exam/grep/interlocking.log
+        chmod 0644 /srv/exam/grep/interlocking.log
+        grep -- '{{word}}' /srv/exam/grep/interlocking.log > /var/lib/cloudtrain/xel-grep.expected
+        rm -f /root/answers/{{word}}.lines
+  checks:
+    - id: exists
+      description: The answer file exists
+      type: shell
+      on: tr-el-01
+      skills: [linux.shell.redirection]
+      weight: 0.5
+      command: test -s /root/answers/{{word}}.lines && echo yes || echo no
+      expect: {match: exact, value: "yes"}
+    - id: exact-lines
+      description: It holds exactly the matching lines, in order
+      type: shell
+      on: tr-el-01
+      skills: [linux.shell.text-processing]
+      weight: 2
+      command: cmp -s /var/lib/cloudtrain/xel-grep.expected /root/answers/{{word}}.lines && echo same || echo different
+      expect: {match: exact, value: same}
+  misconceptions:
+    - id: ignore-case
+      description: Matches without regard to case.
+      feedback: "The task asks for the exact case; grep -i also keeps lines with other capitalisations."
+      expectFail: [exact-lines]
+      mutation:
+        on: tr-el-01
+        as: learner
+        run: sudo sh -c 'grep -i {{word}} /srv/exam/grep/interlocking.log > /root/answers/{{word}}.lines'
+  solution:
+    explanation: grep keeps matching lines in their original order; the shell redirection writes them to the file.
+    steps:
+      - on: tr-el-01
+        as: learner
+        run: sudo sh -c 'grep {{word}} /srv/exam/grep/interlocking.log > /root/answers/{{word}}.lines'

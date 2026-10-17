@@ -1,0 +1,205 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: dns-client-resolution
+  title: Fix name resolution order on the ticket office host
+  domain: linux
+  frameworks: [rhcsa-aligned:networking, lpic1:networking, lfcs:networking]
+  difficulty: easy
+  estimatedMinutes: 10
+  tags: [dns, resolv.conf, nsswitch, hosts, getent, sudo]
+  version: 1
+spec:
+  description: |
+    The ticket office host `tkt-office-01` is in a mess after a migration: the ticket
+    database moved and the DNS record for it is stale, and short names like `tkt-web`
+    do not resolve at all. You have full sudo rights on this host.
+
+    Make name resolution work like this:
+
+    - **`tkt-db`** (and `tkt-db.tallowmere.test`) resolves from **`/etc/hosts`**, which
+      already has the right address. The local file must win over DNS.
+    - **Every other name** is looked up at the in-lab resolver **`{{resolver}}`**.
+    - Short names are completed with the search domain **`tallowmere.test`**, so
+      `tkt-web` finds `tkt-web.tallowmere.test`.
+
+    Check with `getent hosts NAME`, which uses the same lookup path as every program on
+    the host (`dig` and `host` talk to DNS directly and skip `/etc/hosts`).
+
+    Note: `/etc/resolv.conf` and `/etc/hosts` are mounted into this host from outside.
+    Edit them in place (an editor, or `sudo tee`); tools that replace the file
+    (`sed -i`) fail with "Device or resource busy".
+  objectives:
+    - Choose the order of name sources in /etc/nsswitch.conf
+    - Set the resolver and the search domain in /etc/resolv.conf
+    - Test lookups the way applications do with getent
+  params:
+    resolver:
+      type: choice
+      values: [127.0.10.53, 127.0.20.53]
+    webOctet:
+      type: int
+      min: 20
+      max: 90
+    dbOctet:
+      type: int
+      min: 100
+      max: 180
+  topology:
+    entry: tkt-office-01
+    nodes:
+      - name: tkt-office-01
+        driver: container
+        image: deb-lab:24.04
+        access: [shell]
+        learnerSudo: true
+  setup:
+    - on: tkt-office-01
+      run: |
+        set -eu
+        echo 'learner ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/learner && chmod 0440 /etc/sudoers.d/learner
+        mkdir -p /var/lib/cloudtrain /usr/local/lib/tallowmere && chmod 0700 /var/lib/cloudtrain
+        # The in-lab resolver: a tiny authoritative-only DNS server for tallowmere.test.
+        cat > /usr/local/lib/tallowmere/tr-dns.py <<'PY'
+        import socket, struct, sys
+        ZONE = {
+            "tkt-db.tallowmere.test": "10.40.9.{{dbOctet}}",     # stale record (the database moved)
+            "tkt-web.tallowmere.test": "10.40.7.{{webOctet}}",
+            "fares-api.tallowmere.test": "10.40.7.{{dbOctet}}",
+            "ns1.tallowmere.test": "{{resolver}}",
+        }
+        def name_at(b, i):
+            parts = []
+            while b[i]:
+                n = b[i]; parts.append(b[i + 1:i + 1 + n].decode().lower()); i += n + 1
+            return ".".join(parts), i + 1
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.bind((sys.argv[1], 53))
+        while True:
+            q, addr = s.recvfrom(512)
+            try:
+                tid, flags = struct.unpack("!HH", q[:4])
+                name, end = name_at(q, 12)
+                qtype, = struct.unpack("!H", q[end:end + 2])
+                question = q[12:end + 4]
+                ip = ZONE.get(name)
+                rcode = 0 if ip or name == "tallowmere.test" else 3
+                ans = b""
+                if ip and qtype == 1:
+                    ans = b"\xc0\x0c" + struct.pack("!HHIH", 1, 1, 300, 4) + socket.inet_aton(ip)
+                hdr = struct.pack("!HHHHHH", tid, 0x8400 | (flags & 0x0100) | rcode, 1, 1 if ans else 0, 0, 0)
+                s.sendto(hdr + question + ans, addr)
+            except Exception as e:
+                print("bad query", e, flush=True)
+        PY
+        pkill -f '^python3 /usr/local/lib/tallowmere/tr-dns.py' || true
+        setsid python3 /usr/local/lib/tallowmere/tr-dns.py {{resolver}} </dev/null >/var/log/tr-dns.log 2>&1 &
+        # /etc/hosts: the database's new address (rewrite in place: bind mount).
+        h=$(sed '/tkt-db/d' /etc/hosts); printf '%s\n10.40.7.{{dbOctet}}\ttkt-db.tallowmere.test tkt-db\n' "$h" > /etc/hosts
+        # The broken state after the migration.
+        sed -i 's/^hosts:.*/hosts:          dns files/' /etc/nsswitch.conf
+        cp /etc/resolv.conf /var/lib/cloudtrain/resolv.conf.orig
+        printf '# migrated from tkt-office-old\nnameserver 127.0.30.53\noptions timeout:1 attempts:1\n' > /etc/resolv.conf
+        for i in $(seq 20); do python3 -c "
+        import socket; s=socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(0.5)
+        s.sendto(bytes.fromhex('1234010000010000000000000774616c6c6f776d6572650474657374000001000 1'.replace(' ','')), ('{{resolver}}', 53)); s.recv(512)" 2>/dev/null && break; sleep 0.5; done
+  checks:
+    - id: db-from-hosts
+      description: tkt-db resolves to the address in /etc/hosts, not the stale DNS record
+      type: shell
+      on: tkt-office-01
+      skills: [linux.net.name-resolution]
+      weight: 2
+      timeoutSec: 20
+      command: getent hosts tkt-db | awk '{print $1; exit}'
+      expect: {match: exact, value: "10.40.7.{{dbOctet}}"}
+    - id: short-name
+      description: The short name tkt-web resolves through the search domain and the in-lab resolver
+      type: shell
+      on: tkt-office-01
+      skills: [linux.net.name-resolution]
+      weight: 2
+      timeoutSec: 20
+      command: getent hosts tkt-web | awk '{print $1; exit}'
+      expect: {match: exact, value: "10.40.7.{{webOctet}}"}
+    - id: fqdn
+      description: Fully qualified names resolve at the in-lab resolver
+      type: shell
+      on: tkt-office-01
+      skills: [linux.net.name-resolution]
+      timeoutSec: 20
+      command: getent hosts fares-api.tallowmere.test | awk '{print $1; exit}'
+      expect: {match: exact, value: "10.40.7.{{dbOctet}}"}
+    - id: resolver-first
+      description: /etc/resolv.conf asks {{resolver}} first and searches tallowmere.test
+      type: shell
+      on: tkt-office-01
+      skills: [linux.net.name-resolution]
+      command: |
+        ns=$(awk '$1 == "nameserver" {print $2; exit}' /etc/resolv.conf)
+        awk '$1 == "search" || $1 == "domain" {for (i = 2; i <= NF; i++) if ($i == "tallowmere.test") f = 1} END {exit !f}' /etc/resolv.conf && s=yes || s=no
+        echo "$ns search=$s"
+      expect: {match: exact, value: "{{resolver}} search=yes"}
+  hints:
+    - title: Who decides the order
+      command: grep ^hosts /etc/nsswitch.conf
+      body: "The hosts line lists the sources in the order glibc asks them. `files` is /etc/hosts, `dns` is the resolver from /etc/resolv.conf."
+      cost: 1
+    - title: Resolver settings
+      body: "/etc/resolv.conf takes `nameserver ADDRESS` lines (tried in order) and one `search DOMAIN...` line used to complete short names."
+      cost: 1
+    - title: Editing a mounted file
+      body: "`printf 'nameserver X\\nsearch tallowmere.test\\n' | sudo tee /etc/resolv.conf` overwrites the file in place. `sudo sed -i` would try to rename a new file over the mount point."
+      cost: 2
+  misconceptions:
+    - id: dns-before-files
+      description: Fixes the resolver but leaves DNS ahead of /etc/hosts.
+      feedback: "With `hosts: dns files` the stale DNS record wins. Put files first."
+      expectFail: [db-from-hosts]
+      mutation:
+        on: tkt-office-01
+        as: learner
+        run: printf 'nameserver {{resolver}}\nsearch tallowmere.test\n' | sudo tee /etc/resolv.conf >/dev/null
+    - id: no-search
+      description: Sets the resolver but no search domain.
+      feedback: "Without a search domain the resolver is asked for the bare name tkt-web, which does not exist. Add `search tallowmere.test`."
+      expectFail: [short-name, resolver-first]
+      mutation:
+        on: tkt-office-01
+        as: learner
+        run: |
+          sudo sed -i 's/^hosts:.*/hosts:          files dns/' /etc/nsswitch.conf
+          printf 'nameserver {{resolver}}\n' | sudo tee /etc/resolv.conf >/dev/null
+    - id: keeps-dead-resolver
+      description: Adds the new resolver after the old, dead one.
+      feedback: "Nameservers are tried in order, and the dead one costs a timeout on every lookup. Replace it with the in-lab resolver."
+      expectFail: [resolver-first]
+      mutation:
+        on: tkt-office-01
+        as: learner
+        run: |
+          sudo sed -i 's/^hosts:.*/hosts:          files dns/' /etc/nsswitch.conf
+          printf 'search tallowmere.test\nnameserver {{resolver}}\n' | sudo tee -a /etc/resolv.conf >/dev/null
+  solution:
+    explanation: |
+      nsswitch.conf decides the order of sources (files before dns), resolv.conf names
+      the resolver and the search domain. getent goes through both, like every program.
+    steps:
+      - on: tkt-office-01
+        as: learner
+        run: |
+          sudo sed -i 's/^hosts:.*/hosts:          files dns/' /etc/nsswitch.conf
+          printf 'nameserver {{resolver}}\nsearch tallowmere.test\n' | sudo tee /etc/resolv.conf >/dev/null
+          getent hosts tkt-db tkt-web
+    alternatives:
+      - id: domain-line-and-python-edit
+        description: Uses a domain line instead of search and edits both files in place with Python.
+        steps:
+          - on: tkt-office-01
+            as: learner
+            run: |
+              sudo python3 -c "
+              import re
+              p = '/etc/nsswitch.conf'; s = open(p).read(); open(p, 'w').write(re.sub(r'(?m)^hosts:.*$', 'hosts: files myhostname dns', s))
+              open('/etc/resolv.conf', 'w').write('domain tallowmere.test\nnameserver {{resolver}}\noptions timeout:2\n')
+              "

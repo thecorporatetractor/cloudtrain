@@ -1,0 +1,112 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xel-script-find-report
+  title: Write a script that reports files by condition
+  domain: linux
+  frameworks: [rhcsa-aligned:scripts]
+  difficulty: medium
+  estimatedMinutes: 8
+  tags: [exam, bash, scripting, find]
+  version: 1
+spec:
+  description: |
+    **Host:** node 1, `tr-el-01` (`ssh tr-el-01`, then `sudo -i`)
+
+    Write the executable script **`/usr/local/bin/{{name}}`**. It takes **one
+    argument**, a directory:
+
+    - If the argument is **not an existing directory**, it prints
+      `not a directory: <argument>` to standard error and exits with status **1**.
+    - Otherwise it writes the **full paths** of all **regular files** below that
+      directory (at any depth) that are **larger than {{size}} KiB** to the file
+      **`/root/reports/{{name}}.txt`**, one per line, **sorted**, replacing any
+      previous report, and exits with status 0.
+
+    It is tested on directories you have not seen.
+  objectives:
+    - Use a test on the script's argument and exit with a status
+    - Find files by type and size from a script
+  params:
+    name:
+      type: choice
+      values: [big-files, large-archive-files, heavy-logs]
+    size:
+      type: choice
+      values: ["100", "200", "500"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-el-01
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["2Gi", "1Gi", "2Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-el-01
+      run: rm -f /usr/local/bin/{{name}} /root/reports/{{name}}.txt
+  checks:
+    - id: executable
+      description: The script exists and is executable
+      type: shell
+      on: tr-el-01
+      skills: [linux.shell.scripting]
+      weight: 0.5
+      command: test -x /usr/local/bin/{{name}} && echo yes || echo no
+      expect: {match: exact, value: "yes"}
+    - id: report
+      description: The report lists exactly the large regular files, sorted, with full paths
+      type: shell
+      on: tr-el-01
+      skills: [linux.files.find-locate, linux.shell.scripting]
+      weight: 2
+      command: |
+        t=/var/tmp/xel-report-test; rm -rf $t; mkdir -p "$t/a/b c" $t/d
+        s={{size}}
+        head -c $(( (s + 40) * 1024 )) /dev/zero > $t/a/big1.log
+        head -c $(( (s + 300) * 1024 )) /dev/zero > "$t/a/b c/big 2.dat"
+        head -c $(( (s - 40) * 1024 )) /dev/zero > $t/a/small.log
+        head -c 2048 /dev/zero > $t/d/tiny
+        head -c $(( (s + 90) * 1024 )) /dev/zero > $t/d/zbig3
+        ln -s $t/a/big1.log $t/d/link-to-big
+        mkfifo $t/d/pipe
+        echo stale > /root/reports/{{name}}.txt 2>/dev/null
+        timeout 20 /usr/local/bin/{{name}} $t >/dev/null 2>&1; rc=$?
+        want=$(printf '%s\n' "$t/a/b c/big 2.dat" $t/a/big1.log $t/d/zbig3 | sort)
+        [ $rc = 0 ] && [ "$(cat /root/reports/{{name}}.txt 2>/dev/null)" = "$want" ] && echo ok || echo "wrong rc=$rc"
+        rm -rf $t
+      expect: {match: exact, value: ok}
+    - id: not-a-dir
+      description: A non-directory argument is refused with status 1 and a message on stderr
+      type: shell
+      on: tr-el-01
+      skills: [linux.shell.scripting]
+      weight: 1
+      command: |
+        out=$(timeout 10 /usr/local/bin/{{name}} /etc/hostname 2>/tmp/.xel-find.err); rc=$?
+        err=$(cat /tmp/.xel-find.err); rm -f /tmp/.xel-find.err
+        [ $rc = 1 ] && [ -z "$out" ] && [ "$err" = "not a directory: /etc/hostname" ] && echo ok || echo "wrong rc=$rc"
+      expect: {match: exact, value: ok}
+  misconceptions:
+    - id: no-type-filter
+      description: Lists every large entry without restricting to regular files, unsorted.
+      feedback: "find -type f keeps regular files only; pipe the list through sort."
+      expectFail: [report]
+      mutation:
+        on: tr-el-01
+        as: learner
+        run: |
+          printf '%s\n' '#!/bin/bash' '[ -d "$1" ] || { echo "not a directory: $1" >&2; exit 1; }' 'mkdir -p /root/reports' 'find "$1" -size +{{size}}k -o -type l > /root/reports/{{name}}.txt' | sudo tee /usr/local/bin/{{name}} >/dev/null
+          sudo chmod 755 /usr/local/bin/{{name}}
+  solution:
+    explanation: '[ -d "$1" ] tests the argument; find -type f -size +Nk selects regular files larger than N KiB; sort orders the paths.'
+    steps:
+      - on: tr-el-01
+        as: learner
+        run: |
+          printf '%s\n' '#!/bin/bash' 'if [ ! -d "$1" ]; then' '  echo "not a directory: $1" >&2' '  exit 1' 'fi' 'mkdir -p /root/reports' 'find "$1" -type f -size +{{size}}k | sort > /root/reports/{{name}}.txt' | sudo tee /usr/local/bin/{{name}} >/dev/null
+          sudo chmod 755 /usr/local/bin/{{name}}

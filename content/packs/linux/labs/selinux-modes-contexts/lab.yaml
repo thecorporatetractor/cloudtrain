@@ -1,0 +1,148 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: selinux-modes-contexts
+  title: Serve web content from a non-default directory under SELinux
+  domain: linux
+  frameworks: [rhcsa-aligned:security, lfcs:operations-deployment, linuxplus:security]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [selinux, httpd, file-contexts]
+  version: 1
+spec:
+  description: |
+    The passenger-information web pages moved to **`/srv/pis-www`** on **`tr-pis-02`**
+    (`ssh tr-pis-02`; you have `sudo`). Apache is configured for it and running, file
+    permissions are fine, yet `curl http://localhost/` returns **403 Forbidden**.
+
+    A colleague suggests `setenforce 0`. Do not. Instead:
+
+    - make `httpd` serve `/srv/pis-www` **with SELinux in enforcing mode**;
+    - fix it with a **persistent file-context rule**, so the pages keep working after
+      a filesystem relabel or a `restorecon` run by someone else;
+    - SELinux stays **enforcing** in the running system and in its configuration.
+  objectives:
+    - Read SELinux modes and denials
+    - Add a persistent file-context rule and relabel
+  params:
+    token:
+      type: int
+      min: 1000
+      max: 9999
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-pis-02
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536}
+        access: [ssh, console]
+  setup:
+    - on: tr-pis-02
+      timeoutSec: 240
+      run: |
+        set -eu
+        rpm -q httpd >/dev/null 2>&1 || dnf -y -q install httpd
+        mkdir -p /srv/pis-www
+        echo "<h1>Tallowmere passenger information</h1><p>screen set {{token}}</p>" > /srv/pis-www/index.html
+        chmod -R a+rX /srv/pis-www
+        restorecon -R /srv/pis-www
+        sed -i 's#^DocumentRoot .*#DocumentRoot "/srv/pis-www"#' /etc/httpd/conf/httpd.conf
+        printf '<Directory "/srv/pis-www">\n    Require all granted\n</Directory>\n' > /etc/httpd/conf.d/pis.conf
+        rm -f /etc/httpd/conf.d/welcome.conf
+        setenforce 1
+        systemctl enable httpd; systemctl restart httpd
+  checks:
+    - id: enforcing
+      description: SELinux is enforcing now and in /etc/selinux/config
+      type: shell
+      on: tr-pis-02
+      skills: [linux.security.selinux-contexts]
+      weight: 1
+      command: echo "$(getenforce) $(sed -n 's/^SELINUX=//p' /etc/selinux/config)"
+      expect: {match: exact, value: "Enforcing enforcing"}
+    - id: served
+      description: httpd serves the passenger-information page
+      type: shell
+      on: tr-pis-02
+      skills: [linux.security.selinux-contexts]
+      weight: 2
+      timeoutSec: 30
+      command: curl -s -m 5 http://localhost/ | grep -o 'screen set {{token}}' || echo forbidden
+      expect: {match: exact, value: "screen set {{token}}"}
+    - id: persistent-rule
+      description: The policy labels /srv/pis-www as web content, and the files carry that label
+      type: shell
+      on: tr-pis-02
+      skills: [linux.security.selinux-contexts]
+      weight: 2
+      command: |
+        t=$(matchpathcon -n /srv/pis-www/index.html 2>/dev/null | cut -d: -f3); a=$(stat -c %C /srv/pis-www/index.html | cut -d: -f3)
+        case "$t" in httpd_sys_content_t|httpd_sys_ro_content_t|public_content_t) [ "$a" = "$t" ] && echo persistent || echo "label=$a" ;; *) echo "policy=$t label=$a" ;; esac
+      expect: {match: exact, value: persistent}
+  hints:
+    - title: Is it SELinux?
+      command: sudo ausearch -m avc -ts recent
+      body: "An AVC denial for httpd_t reading a file shows the file's type (tcontext). getenforce shows the mode."
+      cost: 0
+    - title: Compare with a working directory
+      command: ls -Zd /var/www/html /srv/pis-www
+      body: "Apache may read httpd_sys_content_t; files under /srv get another type by default."
+      cost: 1
+    - title: Persistent, not temporary
+      body: "chcon changes a label until the next relabel. semanage fcontext -a -t httpd_sys_content_t '/srv/pis-www(/.*)?' records the rule; restorecon -Rv /srv/pis-www applies it."
+      cost: 2
+  misconceptions:
+    - id: permissive
+      description: Switches SELinux to permissive.
+      feedback: "setenforce 0 turns protection off for everything on the host. Put it back to enforcing and fix the label instead."
+      expectFail: [enforcing]
+      mutation:
+        on: tr-pis-02
+        as: learner
+        run: sudo setenforce 0
+    - id: chcon-only
+      description: Relabels the files with chcon only.
+      feedback: "chcon is undone by restorecon or a relabel; add the rule with semanage fcontext and run restorecon."
+      expectFail: [persistent-rule]
+      mutation:
+        on: tr-pis-02
+        as: learner
+        run: sudo chcon -R -t httpd_sys_content_t /srv/pis-www
+    - id: rule-not-applied
+      description: Adds the file-context rule but never runs restorecon.
+      feedback: "semanage fcontext changes the policy, not the files that exist: run restorecon -R /srv/pis-www."
+      expectFail: [served, persistent-rule]
+      mutation:
+        on: tr-pis-02
+        as: learner
+        run: sudo semanage fcontext -a -t httpd_sys_content_t '/srv/pis-www(/.*)?'
+  solution:
+    explanation: |
+      The files carry the default type for /srv, which httpd_t may not read. A
+      semanage fcontext rule for /srv/pis-www(/.*)? with httpd_sys_content_t plus
+      restorecon labels them persistently; SELinux stays enforcing.
+    steps:
+      - on: tr-pis-02
+        as: learner
+        timeoutSec: 120
+        run: |
+          set -e
+          sudo semanage fcontext -a -t httpd_sys_content_t '/srv/pis-www(/.*)?'
+          sudo restorecon -Rv /srv/pis-www
+          curl -s http://localhost/ | head -3
+    alternatives:
+      - id: equivalence
+        description: Make /srv/pis-www label like /var/www with a path equivalence rule.
+        steps:
+          - on: tr-pis-02
+            as: learner
+            timeoutSec: 120
+            run: |
+              set -e
+              sudo semanage fcontext -a -e /var/www /srv/pis-www
+              sudo restorecon -R /srv/pis-www

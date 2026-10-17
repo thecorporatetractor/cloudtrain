@@ -1,0 +1,112 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xel-users-supplementary
+  title: Create users with supplementary groups and a nologin account
+  domain: linux
+  frameworks: [rhcsa-aligned:users-groups]
+  difficulty: easy
+  estimatedMinutes: 6
+  tags: [exam, users, groups]
+  version: 1
+spec:
+  description: |
+    **Host:** node 1, `tr-el-01` (`ssh tr-el-01`, then `sudo -i`)
+
+    Set up the new signalling shift:
+
+    - a group **`{{grp}}`**;
+    - users **`{{u1}}`** and **`{{u2}}`**, both with `{{grp}}` as a **supplementary**
+      (secondary) group;
+    - a user **`{{u3}}`** who has **no interactive shell** and is **not** a member of
+      `{{grp}}`;
+    - the password of all three users is **`{{pw}}`**.
+  objectives:
+    - Create groups and users with supplementary groups, shells and passwords
+  params:
+    grp:
+      type: choice
+      values: [sigshift, nightsig, boxcrew]
+    u1:
+      type: choice
+      values: [anwen, bethan]
+    u2:
+      type: choice
+      values: [cadoc, dilys]
+    u3:
+      type: choice
+      values: [emrys, ffion]
+    pw:
+      type: choice
+      values: [Tallow-2026, Signal-Box-7, Junction-44]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-el-01
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["2Gi", "1Gi", "2Gi"]}
+        access: [ssh, console]
+  checks:
+    - id: members
+      description: Both shift users have the group as a supplementary group
+      type: shell
+      on: tr-el-01
+      skills: [linux.users.accounts]
+      weight: 1.5
+      command: |
+        g=$(getent group {{grp}} | cut -d: -f4 | tr ',' '\n' | sort | paste -sd,)
+        p1=$(id -gn {{u1}} 2>/dev/null); p2=$(id -gn {{u2}} 2>/dev/null)
+        [ "$g" = "$(printf '%s\n' {{u1}} {{u2}} | sort | paste -sd,)" ] && [ "$p1" != {{grp}} ] && [ "$p2" != {{grp}} ] && echo supplementary || echo "members=$g primary=$p1,$p2"
+      expect: {match: exact, value: supplementary}
+    - id: nologin
+      description: The third user has a non-interactive shell and is not in the group
+      type: shell
+      on: tr-el-01
+      skills: [linux.users.accounts]
+      weight: 1
+      command: |
+        s=$(getent passwd {{u3}} | cut -d: -f7)
+        case "$s" in */nologin|/bin/false|/usr/bin/false) id -nG {{u3}} | grep -qw {{grp}} && echo in-group || echo nologin ;; *) echo "shell=$s" ;; esac
+      expect: {match: exact, value: nologin}
+    - id: passwords
+      description: All three users have the requested password
+      type: shell
+      on: tr-el-01
+      skills: [linux.users.accounts]
+      weight: 1.5
+      command: |
+        ok=0
+        for u in {{u1}} {{u2}} {{u3}}; do
+          h=$(getent shadow $u | cut -d: -f2)
+          [ -n "$h" ] && [ "$(python3 -W ignore -c 'import crypt,sys; print(crypt.crypt(sys.argv[1], sys.argv[2]))' '{{pw}}' "$h" 2>/dev/null)" = "$h" ] && ok=$((ok + 1))
+        done; echo "ok=$ok"
+      expect: {match: exact, value: "ok=3"}
+  misconceptions:
+    - id: primary-group
+      description: Makes the group the users' primary group with -g.
+      feedback: "useradd -g sets the primary group; supplementary groups are -G (or usermod -aG)."
+      expectFail: [members]
+      mutation:
+        on: tr-el-01
+        as: learner
+        run: |
+          sudo groupadd {{grp}}
+          sudo useradd -g {{grp}} {{u1}}; sudo useradd -g {{grp}} {{u2}}; sudo useradd -s /sbin/nologin {{u3}}
+          for u in {{u1}} {{u2}} {{u3}}; do echo "$u:{{pw}}" | sudo chpasswd; done
+  solution:
+    explanation: groupadd creates the group, useradd -G adds it as a supplementary group, -s /sbin/nologin removes the interactive shell, chpasswd sets the passwords.
+    steps:
+      - on: tr-el-01
+        as: learner
+        run: |
+          set -e
+          sudo groupadd {{grp}}
+          sudo useradd -G {{grp}} {{u1}}
+          sudo useradd -G {{grp}} {{u2}}
+          sudo useradd -s /sbin/nologin {{u3}}
+          for u in {{u1}} {{u2}} {{u3}}; do echo "$u:{{pw}}" | sudo chpasswd; done

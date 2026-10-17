@@ -1,0 +1,116 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xel-find-owner-copy
+  title: Copy all files owned by a user to a directory
+  domain: linux
+  frameworks: [rhcsa-aligned:essential-tools]
+  difficulty: easy
+  estimatedMinutes: 5
+  tags: [exam, find, cp]
+  version: 1
+spec:
+  description: |
+    **Host:** node 1, `tr-el-01` (`ssh tr-el-01`, then `sudo -i`)
+
+    The contractor account **`{{user}}`** is leaving. Find **every regular file** on the
+    system owned by `{{user}}` and copy them all into the directory
+    **`/root/found-{{user}}`** (flat, no subdirectories), keeping each file's
+    **mode, ownership and modification time**. Leave the originals in place.
+  objectives:
+    - Find files by owner and copy them with their attributes
+  params:
+    user:
+      type: choice
+      values: [corran, delyth, ewan, fenna]
+    seed:
+      type: int
+      min: 1
+      max: 97
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-el-01
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["2Gi", "1Gi", "2Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-el-01
+      run: |
+        set -eu
+        install -d -m 0700 /var/lib/cloudtrain
+        id {{user}} >/dev/null 2>&1 || useradd -M -s /sbin/nologin {{user}}
+        rm -f /var/spool/mail/{{user}}
+        id tr-other >/dev/null 2>&1 || useradd -M -s /sbin/nologin tr-other
+        n=0
+        for d in /srv/depot/rosters /var/tmp/handover /opt/tr-signal/archive /etc/tr-depot; do
+          mkdir -p $d
+          for k in 1 2; do
+            n=$((n + 1))
+            f=$d/{{user}}-sheet-$n.txt
+            echo "sheet $n seed {{seed}}" > $f
+            chown {{user}}:{{user}} $f
+            chmod $(( (n % 2) ? 640 : 600 )) $f
+            touch -d "2025-0$(( (n % 9) + 1 ))-1$k 0$k:2$n:00" $f
+            o=$d/shared-$n.txt
+            echo "not theirs $n" > $o
+            chown tr-other $o
+          done
+        done
+        rm -rf /root/found-{{user}}
+        find / \( -path /proc -o -path /sys -o -path /run \) -prune -o -type f -user {{user}} -print | sort > /var/lib/cloudtrain/xel-find.expected
+        test "$(wc -l < /var/lib/cloudtrain/xel-find.expected)" -ge 8
+  checks:
+    - id: all-copied
+      description: Every file owned by the user is in the target directory
+      type: shell
+      on: tr-el-01
+      skills: [linux.files.find-locate]
+      weight: 1.5
+      command: |
+        miss=0
+        while read -r f; do [ -f "/root/found-{{user}}/$(basename "$f")" ] || miss=$((miss + 1)); done < /var/lib/cloudtrain/xel-find.expected
+        echo "missing=$miss"
+      expect: {match: exact, value: "missing=0"}
+    - id: attributes
+      description: The copies keep mode, owner and modification time
+      type: shell
+      on: tr-el-01
+      skills: [linux.files.find-locate]
+      weight: 1.5
+      command: |
+        bad=0
+        while read -r f; do
+          c="/root/found-{{user}}/$(basename "$f")"
+          [ "$(stat -c '%a %U %Y' "$f")" = "$(stat -c '%a %U %Y' "$c" 2>/dev/null)" ] || bad=$((bad + 1))
+        done < /var/lib/cloudtrain/xel-find.expected
+        echo "differ=$bad"
+      expect: {match: exact, value: "differ=0"}
+    - id: only-theirs
+      description: No file of another owner was copied
+      type: shell
+      on: tr-el-01
+      skills: [linux.files.find-locate]
+      weight: 0.5
+      command: ls /root/found-{{user}}/shared-* >/dev/null 2>&1 && echo extra || echo clean
+      expect: {match: exact, value: clean}
+  misconceptions:
+    - id: plain-cp
+      description: Copies without preserving attributes.
+      feedback: "A plain cp makes root the owner and stamps the current time; cp -a (or -p) keeps mode, owner and timestamps."
+      expectFail: [attributes]
+      mutation:
+        on: tr-el-01
+        as: learner
+        run: sudo sh -c 'mkdir -p /root/found-{{user}} && find / \( -path /proc -o -path /sys -o -path /run -o -path /root/found-{{user}} \) -prune -o -type f -user {{user}} -exec cp -t /root/found-{{user}} {} +'
+  solution:
+    explanation: find selects the files by owner (skipping the virtual filesystems and the target) and cp -a copies them with their attributes.
+    steps:
+      - on: tr-el-01
+        as: learner
+        run: sudo sh -c 'mkdir -p /root/found-{{user}} && find / \( -path /proc -o -path /sys -o -path /run -o -path /root/found-{{user}} \) -prune -o -type f -user {{user}} -exec cp -a -t /root/found-{{user}} {} +'

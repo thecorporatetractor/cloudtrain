@@ -1,0 +1,90 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xel-nice-process
+  title: Start a job at a given priority
+  domain: linux
+  frameworks: [rhcsa-aligned:running-systems]
+  difficulty: easy
+  estimatedMinutes: 4
+  tags: [exam, processes, nice]
+  version: 1
+spec:
+  description: |
+    **Host:** node 1, `tr-el-01` (`ssh tr-el-01`, then `sudo -i`)
+
+    The timetable re-index job **`/usr/local/bin/tr-reindex`** must not slow down
+    the booking system. Start it **as user `{{user}}`** with a **niceness of
+    {{nice}}**, in the background, so that it **keeps running after you log out**.
+    Exactly one instance must run.
+  objectives:
+    - Start a process with a chosen niceness as another user
+  params:
+    user:
+      type: choice
+      values: [kerra, lowri, madoc]
+    nice:
+      type: choice
+      values: ["5", "7", "12", "15", "18"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-el-01
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["2Gi", "1Gi", "2Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-el-01
+      run: |
+        set -eu
+        id {{user}} >/dev/null 2>&1 || useradd -m {{user}}
+        printf '%s\n' '#!/bin/bash' '# rebuild the timetable search index' 'while :; do sleep 5; done' > /usr/local/bin/tr-reindex
+        chmod 0755 /usr/local/bin/tr-reindex
+        pkill -x tr-reindex || true
+  checks:
+    - id: running
+      description: Exactly one tr-reindex runs as the user
+      type: shell
+      on: tr-el-01
+      skills: [linux.processes.management]
+      weight: 1
+      command: echo "$(ps -C tr-reindex -o user= | sort | uniq -c | awk '{print $1, $2}' | paste -sd,)"
+      expect: {match: exact, value: "1 {{user}}"}
+    - id: niceness
+      description: It runs with the requested niceness
+      type: shell
+      on: tr-el-01
+      skills: [linux.processes.management]
+      weight: 2
+      command: ps -C tr-reindex -o ni= | tr -d ' ' | paste -sd,
+      expect: {match: exact, value: "{{nice}}"}
+  misconceptions:
+    - id: default-nice
+      description: Uses nice without -n, which applies the default increment of 10.
+      feedback: "nice alone adds 10; give the value with nice -n N (or renice afterwards)."
+      expectFail: [niceness]
+      mutation:
+        on: tr-el-01
+        as: learner
+        run: sudo -u {{user}} sh -c 'nohup nice /usr/local/bin/tr-reindex >/dev/null 2>&1 &'
+  solution:
+    explanation: nice -n sets the niceness at start, nohup and & keep it running in the background after logout.
+    steps:
+      - on: tr-el-01
+        as: learner
+        run: sudo -u {{user}} sh -c 'nohup nice -n {{nice}} /usr/local/bin/tr-reindex >/dev/null 2>&1 &'
+    alternatives:
+      - id: renice
+        description: Start it normally, then renice the running process.
+        steps:
+          - on: tr-el-01
+            as: learner
+            run: |
+              sudo -u {{user}} sh -c 'nohup /usr/local/bin/tr-reindex >/dev/null 2>&1 &'
+              sleep 1
+              sudo renice -n {{nice}} -p $(pgrep -x tr-reindex)

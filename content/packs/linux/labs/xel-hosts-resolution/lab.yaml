@@ -1,0 +1,88 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xel-hosts-resolution
+  title: Make a short name resolve locally
+  domain: linux
+  frameworks: [rhcsa-aligned:networking]
+  difficulty: easy
+  estimatedMinutes: 4
+  tags: [exam, name-resolution, hosts]
+  version: 1
+spec:
+  description: |
+    **Hosts:** node 1 `tr-el-01` and node 2 `tr-el-02`
+
+    The new ticket gateway has no DNS record yet. On **both nodes**, make the full
+    name **`{{short}}.tallowmere.example`** and the short name **`{{short}}`**
+    resolve to **`10.{{a}}.{{b}}.{{c}}`**, persistently, without a DNS server.
+  objectives:
+    - Add static host entries used by the resolver
+  params:
+    short:
+      type: choice
+      values: [tkt-gw, gate-api, fare-gw]
+    a:
+      type: int
+      min: 20
+      max: 90
+    b:
+      type: int
+      min: 1
+      max: 250
+    c:
+      type: int
+      min: 2
+      max: 250
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-el-01
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["2Gi", "1Gi", "2Gi"]}
+        access: [ssh, console]
+      - name: tr-el-02
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536}
+        access: [ssh, console]
+  checks:
+    - id: node1
+      description: Both names resolve to the address on node 1
+      type: shell
+      on: tr-el-01
+      skills: [linux.net.name-resolution]
+      weight: 1
+      command: echo "$(getent ahostsv4 {{short}} | awk '{print $1; exit}') $(getent ahostsv4 {{short}}.tallowmere.example | awk '{print $1; exit}')"
+      expect: {match: exact, value: "10.{{a}}.{{b}}.{{c}} 10.{{a}}.{{b}}.{{c}}"}
+    - id: node2
+      description: Both names resolve to the address on node 2
+      type: shell
+      on: tr-el-02
+      skills: [linux.net.name-resolution]
+      weight: 1
+      command: echo "$(getent ahostsv4 {{short}} | awk '{print $1; exit}') $(getent ahostsv4 {{short}}.tallowmere.example | awk '{print $1; exit}')"
+      expect: {match: exact, value: "10.{{a}}.{{b}}.{{c}} 10.{{a}}.{{b}}.{{c}}"}
+  misconceptions:
+    - id: one-node
+      description: Adds the entry on node 1 only.
+      feedback: "/etc/hosts is per host: add the line on node 2 as well."
+      expectFail: [node2]
+      mutation:
+        on: tr-el-01
+        as: learner
+        run: echo "10.{{a}}.{{b}}.{{c}} {{short}}.tallowmere.example {{short}}" | sudo tee -a /etc/hosts >/dev/null
+  solution:
+    explanation: One /etc/hosts line per node with the address, the full name and the alias; nsswitch consults files before DNS.
+    steps:
+      - on: tr-el-01
+        as: learner
+        run: echo "10.{{a}}.{{b}}.{{c}} {{short}}.tallowmere.example {{short}}" | sudo tee -a /etc/hosts >/dev/null
+      - on: tr-el-02
+        as: learner
+        run: echo "10.{{a}}.{{b}}.{{c}} {{short}}.tallowmere.example {{short}}" | sudo tee -a /etc/hosts >/dev/null

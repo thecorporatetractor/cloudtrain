@@ -1,0 +1,177 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: lvm-create-ledger-volume
+  title: Build an LVM volume for the fares ledger
+  domain: linux
+  frameworks: [rhcsa-aligned:local-storage, lfcs:storage, linuxplus:system-management]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [storage, lvm, xfs, fstab]
+  version: 1
+spec:
+  description: |
+    The fares ledger on **`tr-fares-02`** (`ssh tr-fares-02`; you have `sudo`) needs
+    room that can grow later. Two empty disks are attached: **`/dev/vdc`** and
+    **`/dev/vdd`** (1 GiB each).
+
+    1. Create the volume group **`vg-fares`** from **both disks**, with a
+       **physical extent size of 8 MiB**.
+    2. Create the logical volume **`lv-ledger`** of **500 MiB** in it.
+    3. Format `lv-ledger` with **XFS** and mount it at **`/srv/ledger`**, now and at
+       every boot.
+  objectives:
+    - Create physical volumes and a volume group with a chosen extent size
+    - Create, format and persistently mount a logical volume
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-fares-02
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["1Gi", "1Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-fares-02
+      run: |
+        set -eu
+        [ "$(readlink -f /dev/disk/by-id/virtio-ct-data1)" = /dev/vdc ]
+        test -b /dev/vdc && test -b /dev/vdd
+        wipefs -a /dev/vdc /dev/vdd >/dev/null
+        mkdir -p /srv/ledger
+  checks:
+    - id: vg-two-disks
+      description: vg-fares spans both disks
+      type: shell
+      on: tr-fares-02
+      skills: [linux.storage.lvm]
+      weight: 1.5
+      command: |
+        pvs --noheadings -o pv_name -S vg_name=vg-fares 2>/dev/null | tr -d ' ' | sed 's#^/dev/\(vd[cd]\)[0-9]*$#\1#' | sort -u | paste -sd,
+      expect: {match: exact, value: "vdc,vdd"}
+    - id: extent-size
+      description: vg-fares uses 8 MiB extents
+      type: shell
+      on: tr-fares-02
+      skills: [linux.storage.lvm]
+      weight: 1
+      command: vgs --noheadings --units m --nosuffix -o vg_extent_size vg-fares 2>/dev/null | tr -d ' ' || echo none
+      expect: {match: exact, value: "8.00"}
+    - id: lv-size
+      description: lv-ledger is 500 MiB (rounded to whole extents)
+      type: shell
+      on: tr-fares-02
+      skills: [linux.storage.lvm]
+      weight: 1
+      command: s=$(lvs --noheadings --units m --nosuffix -o lv_size vg-fares/lv-ledger 2>/dev/null | tr -d ' ' | cut -d. -f1); [ -n "$s" ] && [ $s -ge 496 ] && [ $s -le 504 ] && echo sized || echo "size=$s"
+      expect: {match: exact, value: sized}
+    - id: mounted
+      description: lv-ledger holds XFS and is mounted at /srv/ledger
+      type: shell
+      on: tr-fares-02
+      skills: [linux.storage.mounts]
+      weight: 1
+      command: |
+        s=$(findmnt -n -o SOURCE /srv/ledger 2>/dev/null); t=$(findmnt -n -o FSTYPE /srv/ledger 2>/dev/null)
+        [ -n "$s" ] && [ "$(readlink -f "$s")" = "$(readlink -f /dev/vg-fares/lv-ledger)" ] && [ "$t" = xfs ] && echo mounted || echo "src=$s fs=$t"
+      expect: {match: exact, value: mounted}
+    - id: fstab
+      description: /etc/fstab mounts it at boot and the entry is valid
+      type: shell
+      on: tr-fares-02
+      skills: [linux.storage.mounts]
+      weight: 1.5
+      command: |
+        f=$(findmnt --fstab -n -o SOURCE /srv/ledger 2>/dev/null)
+        [ -n "$f" ] || { echo missing; exit 0; }
+        d=$(findmnt --fstab -n -o SOURCE --evaluate /srv/ledger 2>/dev/null)
+        [ "$(readlink -f "$d")" = "$(readlink -f /dev/vg-fares/lv-ledger)" ] && findmnt --verify --tab-file /etc/fstab >/dev/null 2>&1 && echo persistent || echo "fstab=$f"
+      expect: {match: exact, value: persistent}
+  hints:
+    - title: Three layers
+      body: "pvcreate marks the disks, vgcreate pools them into a group, lvcreate carves a volume. pvs, vgs and lvs show each layer."
+      cost: 0
+    - title: Extent size
+      body: "The extent size is fixed when the group is created: vgcreate -s 8M vg-fares /dev/vdc /dev/vdd."
+      cost: 1
+    - title: Persistent mounts
+      body: "Add a line to /etc/fstab (device /dev/vg-fares/lv-ledger, which device-mapper also calls /dev/mapper/vg--fares-lv--ledger, or UUID=..., mount point, xfs, defaults, 0 0), run systemctl daemon-reload, then mount /srv/ledger; mount -a tests every line."
+      cost: 2
+  misconceptions:
+    - id: one-disk
+      description: Builds the volume group on one disk only.
+      feedback: "The ledger group must span both disks: add /dev/vdd with vgextend vg-fares /dev/vdd."
+      expectFail: [vg-two-disks]
+      mutation:
+        on: tr-fares-02
+        as: learner
+        run: |
+          set -e
+          sudo pvcreate -q /dev/vdc; sudo vgcreate -q -s 8M vg-fares /dev/vdc
+          sudo lvcreate -q -y -n lv-ledger -L 500M vg-fares; sudo mkfs.xfs -q /dev/vg-fares/lv-ledger
+          echo '/dev/vg-fares/lv-ledger /srv/ledger xfs defaults 0 0' | sudo tee -a /etc/fstab >/dev/null
+          sudo systemctl daemon-reload; sudo mount /srv/ledger
+    - id: default-extents
+      description: Creates the group with the default 4 MiB extents.
+      feedback: "vgcreate uses 4 MiB extents unless you pass -s 8M."
+      expectFail: [extent-size]
+      mutation:
+        on: tr-fares-02
+        as: learner
+        run: |
+          set -e
+          sudo pvcreate -q /dev/vdc /dev/vdd; sudo vgcreate -q vg-fares /dev/vdc /dev/vdd
+          sudo lvcreate -q -y -n lv-ledger -L 500M vg-fares; sudo mkfs.xfs -q /dev/vg-fares/lv-ledger
+          echo '/dev/vg-fares/lv-ledger /srv/ledger xfs defaults 0 0' | sudo tee -a /etc/fstab >/dev/null
+          sudo systemctl daemon-reload; sudo mount /srv/ledger
+    - id: mount-only
+      description: Mounts the volume by hand without an fstab entry.
+      feedback: "A manual mount is gone after the next reboot; add the volume to /etc/fstab."
+      expectFail: [fstab]
+      mutation:
+        on: tr-fares-02
+        as: learner
+        run: |
+          set -e
+          sudo pvcreate -q /dev/vdc /dev/vdd; sudo vgcreate -q -s 8M vg-fares /dev/vdc /dev/vdd
+          sudo lvcreate -q -y -n lv-ledger -L 500M vg-fares; sudo mkfs.xfs -q /dev/vg-fares/lv-ledger
+          sudo mount /dev/vg-fares/lv-ledger /srv/ledger
+  solution:
+    explanation: |
+      pvcreate both disks, vgcreate -s 8M pools them with 8 MiB extents, lvcreate -L 500M
+      rounds up to 63 extents (504 MiB), mkfs.xfs formats it and the fstab line mounts it
+      at boot.
+    steps:
+      - on: tr-fares-02
+        as: learner
+        run: |
+          set -e
+          sudo pvcreate /dev/vdc /dev/vdd
+          sudo vgcreate -s 8M vg-fares /dev/vdc /dev/vdd
+          sudo lvcreate -y -n lv-ledger -L 500M vg-fares
+          sudo mkfs.xfs -q /dev/vg-fares/lv-ledger
+          echo '/dev/vg-fares/lv-ledger /srv/ledger xfs defaults 0 0' | sudo tee -a /etc/fstab >/dev/null
+          sudo systemctl daemon-reload
+          sudo mount /srv/ledger
+          df -h /srv/ledger
+    alternatives:
+      - id: partitions-and-uuid
+        description: Use one partition per disk as physical volumes and mount by UUID.
+        steps:
+          - on: tr-fares-02
+            as: learner
+            run: |
+              set -e
+              for d in vdc vdd; do sudo parted -s /dev/$d mklabel gpt mkpart lvm 1MiB 100% set 1 lvm on; done
+              sudo udevadm settle
+              sudo pvcreate /dev/vdc1 /dev/vdd1
+              sudo vgcreate -s 8M vg-fares /dev/vdc1 /dev/vdd1
+              sudo lvcreate -y -n lv-ledger -l 63 vg-fares
+              sudo mkfs.xfs -q /dev/vg-fares/lv-ledger
+              echo "UUID=$(sudo blkid -s UUID -o value /dev/vg-fares/lv-ledger) /srv/ledger xfs defaults 0 0" | sudo tee -a /etc/fstab >/dev/null
+              sudo systemctl daemon-reload
+              sudo mount -a

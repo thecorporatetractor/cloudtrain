@@ -1,0 +1,191 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: cron-nightly-fares-export
+  title: Schedule the nightly fares export with cron
+  domain: linux
+  frameworks: [rhcsa-aligned:deploy-maintain, lpic1:admin-tasks, linuxplus:services-users]
+  difficulty: easy
+  estimatedMinutes: 10
+  tags: [cron, crontab, cron.deny, scheduling, sudo]
+  version: 1
+spec:
+  description: |
+    The fares team on `tr-fares-01` runs its export by hand every night. Automate it
+    (you have `sudo`):
+
+    1. Run **`/opt/fares/export.sh`** at **{{hour}}:{{minute}} every weekday**
+       (Monday to Friday) **as the user `fares`**, from that user's cron table.
+    2. Its output (standard output and standard error) must be **appended** to
+       **`/var/log/fares-export.log`**. The file already holds the history of the
+       manual runs; keep it. The job runs as `fares`, so that user must be able to
+       write the log.
+    3. The shared **`guest`** account must **not be allowed to use cron** any more,
+       while `fares` keeps using it.
+
+    The cron daemon is already running.
+  objectives:
+    - Write a crontab entry with a weekday schedule for another user
+    - Append command output to a log file from cron
+    - Restrict cron with /etc/cron.deny or /etc/cron.allow
+  params:
+    hour:
+      type: choice
+      values: ["01", "02", "03", "04"]
+    minute:
+      type: choice
+      values: ["05", "15", "25", "40", "50"]
+  topology:
+    entry: tr-fares-01
+    nodes:
+      - name: tr-fares-01
+        driver: container
+        image: el-lab:10
+        learnerSudo: true
+        access: [shell]
+  setup:
+    - on: tr-fares-01
+      run: |
+        set -eu
+        echo 'learner ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/learner
+        chmod 0440 /etc/sudoers.d/learner
+        for u in fares guest; do id $u >/dev/null 2>&1 || useradd -m $u; done
+        mkdir -p /opt/fares /srv/fares/out
+        chown fares: /srv/fares/out
+        cat > /opt/fares/export.sh <<'EOT'
+        #!/bin/sh
+        # Nightly fares export (Tallowmere Rail). Writes the day's fare table.
+        out=/srv/fares/out/fares-$(date +%F).csv
+        printf 'route,fare\nTMC-ASH,4.20\nTMC-BRM,6.10\n' > "$out" || { echo "export: cannot write $out" >&2; exit 1; }
+        echo "$(date '+%F %T') export ok rows=2 file=$out"
+        EOT
+        chmod 0755 /opt/fares/export.sh
+        printf '%s\n' '2026-10-01 23:58:11 export ok rows=2 (manual run, bram)' '2026-10-02 23:59:40 export ok rows=2 (manual run, bram)' > /var/log/fares-export.log
+        chown root:root /var/log/fares-export.log; chmod 0644 /var/log/fares-export.log
+        crontab -u fares -r 2>/dev/null || true
+        echo '*/30 * * * * /usr/bin/true' | crontab -u guest -
+        rm -f /etc/cron.allow; : > /etc/cron.deny
+        pgrep -x crond >/dev/null || /usr/sbin/crond >/dev/null 2>&1 || true
+  checks:
+    - id: schedule
+      description: fares' cron table runs /opt/fares/export.sh at the given time on weekdays
+      type: shell
+      on: tr-fares-01
+      skills: [linux.processes.scheduled-jobs]
+      weight: 2
+      command: |
+        crontab -u fares -l 2>/dev/null | grep -v '^[[:space:]]*#' | awk '$0 ~ /\/opt\/fares\/export\.sh/ {
+          d = tolower($5); gsub(/mon-fri/, "1-5", d); if (d == "1,2,3,4,5") d = "1-5"
+          printf "%02d %02d %s %s %s\n", $1, $2, $3, $4, d }' | sort -u
+      expect: {match: exact, value: "{{minute}} {{hour}} * * 1-5"}
+    - id: appends-log
+      description: Running the job's command as fares appends its output and keeps the history
+      type: shell
+      on: tr-fares-01
+      skills: [linux.processes.scheduled-jobs]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        line=$(crontab -u fares -l 2>/dev/null | grep -v '^[[:space:]]*#' | grep -m1 '/opt/fares/export\.sh') || { echo no-job; exit 0; }
+        cmd=$(echo "$line" | awk '{ $1 = $2 = $3 = $4 = $5 = ""; sub(/^ +/, ""); print }')
+        before=$(wc -l < /var/log/fares-export.log)
+        su -s /bin/sh fares -c "cd ~fares; $cmd" >/dev/null 2>&1
+        after=$(wc -l < /var/log/fares-export.log)
+        grep -q '2026-10-01 23:58:11 export ok' /var/log/fares-export.log || { echo history-lost; exit 0; }
+        [ "$after" -gt "$before" ] && tail -n 1 /var/log/fares-export.log | grep -q 'export ok rows=2' && echo appended || echo not-appended
+      expect: {match: exact, value: appended}
+    - id: guest-denied
+      description: guest may not use cron
+      type: shell
+      on: tr-fares-01
+      skills: [linux.processes.scheduled-jobs]
+      weight: 1
+      command: su -s /bin/sh guest -c 'crontab -l' 2>&1 | grep -q 'not allowed' && echo denied || echo allowed
+      expect: {match: exact, value: denied}
+    - id: fares-allowed
+      description: fares may still use cron
+      type: shell
+      on: tr-fares-01
+      skills: [linux.processes.scheduled-jobs]
+      weight: 0.5
+      command: su -s /bin/sh fares -c 'crontab -l' 2>&1 | grep -q 'not allowed' && echo denied || echo allowed
+      expect: {match: exact, value: allowed}
+  hints:
+    - title: Another user's cron table
+      body: "`sudo crontab -u fares -e` edits it, `sudo crontab -u fares -l` lists it. The five time fields are minute, hour, day of month, month, day of week."
+      cost: 1
+    - title: Weekdays and appending
+      body: "Day of week `1-5` is Monday to Friday. `>> /var/log/fares-export.log 2>&1` appends both output streams; a single `>` would wipe the history every night."
+      cost: 1
+    - title: Can fares write the log?
+      body: "Try it: `sudo -u fares sh -c 'echo test >> /var/log/fares-export.log'`. If not, change the file's owner (`sudo chown fares /var/log/fares-export.log`)."
+      cost: 1
+    - title: Who may use cron
+      body: "If /etc/cron.allow exists, only the users listed there may use crontab; otherwise everyone except those in /etc/cron.deny. See `man crontab`."
+      cost: 1
+  misconceptions:
+    - id: overwrites-log
+      description: Redirects the output with > instead of >>.
+      feedback: "A single > truncates the log on every run, so the history of earlier runs is lost. Use >> ... 2>&1."
+      expectFail: [appends-log]
+      mutation:
+        on: tr-fares-01
+        as: learner
+        run: |
+          sudo chown fares /var/log/fares-export.log
+          echo '{{minute}} {{hour}} * * 1-5 /opt/fares/export.sh > /var/log/fares-export.log 2>&1' | sudo crontab -u fares -
+          echo guest | sudo tee -a /etc/cron.deny >/dev/null
+    - id: own-crontab
+      description: Puts the job in the learner's own cron table.
+      feedback: "The job must run as fares; crontab -e without -u edits your own table. Use sudo crontab -u fares -e."
+      expectFail: [schedule, appends-log]
+      mutation:
+        on: tr-fares-01
+        as: learner
+        run: |
+          sudo chown fares /var/log/fares-export.log
+          echo '{{minute}} {{hour}} * * 1-5 /opt/fares/export.sh >> /var/log/fares-export.log 2>&1' | crontab -
+          echo guest | sudo tee -a /etc/cron.deny >/dev/null
+    - id: log-not-writable
+      description: Schedules the job correctly but leaves the log writable by root only.
+      feedback: "The job runs as fares, who cannot write a root-owned 0644 file, so every run fails silently. Give fares write access to the log."
+      expectFail: [appends-log]
+      mutation:
+        on: tr-fares-01
+        as: learner
+        run: |
+          echo '{{minute}} {{hour}} * * 1-5 /opt/fares/export.sh >> /var/log/fares-export.log 2>&1' | sudo crontab -u fares -
+          echo guest | sudo tee -a /etc/cron.deny >/dev/null
+    - id: daily
+      description: Runs the job every day instead of on weekdays.
+      feedback: "The last field is the day of week; * means every day. Use 1-5 for Monday to Friday."
+      expectFail: [schedule]
+      mutation:
+        on: tr-fares-01
+        as: learner
+        run: |
+          sudo chown fares /var/log/fares-export.log
+          echo '{{minute}} {{hour}} * * * /opt/fares/export.sh >> /var/log/fares-export.log 2>&1' | sudo crontab -u fares -
+          echo guest | sudo tee -a /etc/cron.deny >/dev/null
+  solution:
+    explanation: Give fares the log, install the entry in fares' crontab with crontab -u, and list guest in /etc/cron.deny.
+    steps:
+      - on: tr-fares-01
+        as: learner
+        run: |
+          set -e
+          sudo chown fares /var/log/fares-export.log
+          echo '{{minute}} {{hour}} * * 1-5 /opt/fares/export.sh >> /var/log/fares-export.log 2>&1' | sudo crontab -u fares -
+          echo guest | sudo tee -a /etc/cron.deny >/dev/null
+    alternatives:
+      - id: cron-allow
+        description: An allow list with fares only, names of days, and group write on the log
+        steps:
+          - on: tr-fares-01
+            as: learner
+            run: |
+              set -e
+              sudo chgrp fares /var/log/fares-export.log
+              sudo chmod 0664 /var/log/fares-export.log
+              printf '%s\n' '# nightly export' '{{minute}} {{hour}} * * mon-fri /opt/fares/export.sh >>/var/log/fares-export.log 2>&1' | sudo crontab -u fares -
+              printf '%s\n' root fares | sudo tee /etc/cron.allow >/dev/null

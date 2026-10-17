@@ -5,7 +5,7 @@ usage: localverify.py LABDIR [--seed N] [--only base|mut:<id>|alt:<id>] [--keep]
 import subprocess, sys, yaml, json, re, uuid, os
 
 LABCTL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../services/lab-orchestrator/bin/labctl")
-IMAGES = {"linux-pod-deb:24.04": "cloudtrain/linux-pod-deb:24.04", "linux-pod-el:10": "cloudtrain/linux-pod-el:10"}
+IMAGES = {"deb-lab:24.04": "cloudtrain/deb-lab:24.04", "el-lab:10": "cloudtrain/el-lab:10"}
 LEARNER_ENV = ["env", "-i", "HOME=/home/learner", "USER=learner", "LOGNAME=learner", "SHELL=/bin/bash",
                "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "TERM=dumb",
                "/bin/sh", "-c", 'cd "$HOME" && exec "$@"', "sh"]
@@ -26,8 +26,10 @@ class Box:
     def __init__(self, tpl):
         node = tpl["spec"]["topology"]["nodes"][0]
         self.name = "lv-" + uuid.uuid4().hex[:8]
-        r = sh(["docker", "run", "-d", "--name", self.name, "--hostname", node["name"],
-                "--security-opt", "no-new-privileges", IMAGES[node["image"]], "sleep", "infinity"])
+        # learnerSudo nodes allow privilege escalation (setuid sudo); others get no_new_privs
+        nnp = [] if node.get("learnerSudo") else ["--security-opt", "no-new-privileges"]
+        r = sh(["docker", "run", "-d", "--name", self.name, "--hostname", node["name"]] + nnp +
+               [IMAGES[node["image"]], "sleep", "infinity"])
         if r.returncode:
             sys.exit(r.stderr)
         # mimic the platform's learner wiring

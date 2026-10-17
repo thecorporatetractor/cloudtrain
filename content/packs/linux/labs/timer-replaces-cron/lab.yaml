@@ -1,0 +1,180 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: timer-replaces-cron
+  title: Replace a cron entry with a persistent systemd timer
+  domain: linux
+  frameworks: [rhcsa-aligned:deploy-maintain, lpic1:admin-tasks, linuxplus:services-users]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [systemd, timers, cron]
+  version: 1
+spec:
+  description: |
+    On the rolling-stock host **`tr-stock-01`** (`ssh tr-stock-01`; you have `sudo`)
+    root's crontab runs **`/usr/local/bin/mileage-sync`** every 15 minutes. When the
+    host was down for maintenance, the runs that fell into the downtime were simply
+    lost, and the depot's mileage figures went stale.
+
+    Move the job to systemd:
+
+    1. A service **`mileage-sync.service`** that runs `/usr/local/bin/mileage-sync`
+       once per activation.
+    2. A timer **`mileage-sync.timer`** that triggers it **every 15 minutes, on the
+       quarter hour** (:00, :15, :30, :45), and that **catches up a missed run** after
+       the host was off.
+    3. The timer is **enabled** (survives reboots) and **active** now.
+    4. The **old crontab entry is gone**, so the job does not run twice.
+
+    Check the next elapse time with `systemctl list-timers`.
+  objectives:
+    - Write a service and a calendar timer with Persistent=
+    - Retire a cron job
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-stock-01
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536}
+        access: [ssh, console]
+  setup:
+    - on: tr-stock-01
+      run: |
+        set -eu
+        printf '%s\n' '#!/bin/bash' 'echo "$(date -Is) synced $(( RANDOM % 900 + 100 )) vehicles" >> /var/log/mileage-sync.log' > /usr/local/bin/mileage-sync
+        chmod 0755 /usr/local/bin/mileage-sync
+        systemctl enable --now crond
+        printf '%s\n' 'MAILTO=""' '# rolling-stock mileage, every 15 minutes' '*/15 * * * * /usr/local/bin/mileage-sync' '30 2 * * * /usr/bin/find /var/tmp -name "*.stock" -mtime +7 -delete' > /root/.tr-crontab
+        crontab /root/.tr-crontab && rm -f /root/.tr-crontab
+        crontab -l | grep -q mileage-sync
+        rm -f /etc/systemd/system/mileage-sync.*; systemctl daemon-reload
+  checks:
+    - id: service
+      description: mileage-sync.service runs the sync command
+      type: shell
+      on: tr-stock-01
+      skills: [linux.systemd.timers]
+      weight: 1
+      command: systemctl show -P ExecStart mileage-sync.service 2>/dev/null | grep -q 'path=/usr/local/bin/mileage-sync ' && echo runs-sync || echo no
+      expect: {match: exact, value: runs-sync}
+    - id: quarter-hours
+      description: The timer fires every 15 minutes on the quarter hour
+      type: shell
+      on: tr-stock-01
+      skills: [linux.systemd.timers]
+      weight: 2
+      command: |
+        c=$(systemctl show -P TimersCalendar mileage-sync.timer 2>/dev/null | sed -n 's/.*OnCalendar=\([^;]*\) ;.*/\1/p')
+        [ "$(echo "$c" | grep -c .)" = 1 ] || { echo "calendars=$(echo "$c" | grep -c .)"; exit 0; }
+        m=$(systemd-analyze calendar --iterations=8 "$c" 2>/dev/null | grep -E 'Next elapse|Iter' | grep -oE '[0-9]{2}:[0-9]{2}:[0-9]{2}' | cut -d: -f2,3 | sort -u | paste -sd,)
+        [ "$m" = "00:00,15:00,30:00,45:00" ] && echo quarter-hourly || echo "minutes=$m calendar=$c"
+      expect: {match: exact, value: quarter-hourly}
+    - id: persistent
+      description: The timer catches up missed runs (Persistent=true)
+      type: shell
+      on: tr-stock-01
+      skills: [linux.systemd.timers]
+      weight: 1.5
+      command: systemctl show -P Persistent mileage-sync.timer 2>/dev/null || echo none
+      expect: {match: exact, value: "yes"}
+    - id: enabled
+      description: The timer is enabled and active with a next elapse time
+      type: shell
+      on: tr-stock-01
+      skills: [linux.systemd.timers]
+      weight: 1
+      command: echo "$(systemctl is-enabled mileage-sync.timer 2>/dev/null) $(systemctl is-active mileage-sync.timer 2>/dev/null) $(systemctl list-timers --all --no-legend mileage-sync.timer | grep -c mileage-sync)"
+      expect: {match: exact, value: "enabled active 1"}
+    - id: cron-retired
+      description: No cron entry runs mileage-sync any more, the other root job stays
+      type: shell
+      on: tr-stock-01
+      skills: [linux.processes.scheduled-jobs]
+      weight: 1
+      command: |
+        { crontab -l -u root 2>/dev/null | grep -v '^[[:space:]]*#' | grep -q mileage-sync || grep -rqs mileage-sync /etc/cron.d /etc/crontab /var/spool/cron; } && echo still-in-cron || { crontab -l -u root | grep -q '/var/tmp -name' && echo retired || echo other-jobs-lost; }
+      expect: {match: exact, value: retired}
+  hints:
+    - title: Translate the schedule
+      command: systemd-analyze calendar '*:0/15'
+      body: "systemd-analyze calendar shows when an OnCalendar expression fires next. *:0/15 means every hour, minutes 0, 15, 30 and 45."
+      cost: 1
+    - title: Catching up
+      body: "Persistent=true in [Timer] stores the last run time; if a run was missed while the host was off, it fires once right after boot."
+      cost: 1
+    - title: Enabling a timer
+      body: "Give the timer an [Install] section with WantedBy=timers.target and enable the timer (not the service)."
+      cost: 1
+    - title: Editing root's crontab
+      command: sudo crontab -l
+      body: "sudo crontab -e edits root's crontab; delete only the mileage-sync line, the cleanup job stays."
+      cost: 0
+  misconceptions:
+    - id: not-persistent
+      description: Writes the timer without Persistent=true.
+      feedback: "Without Persistent=true a run that falls into downtime is skipped, exactly the cron problem you are fixing."
+      expectFail: [persistent]
+      mutation:
+        on: tr-stock-01
+        as: learner
+        run: |
+          printf '[Unit]\nDescription=Mileage sync\n[Service]\nType=oneshot\nExecStart=/usr/local/bin/mileage-sync\n' | sudo tee /etc/systemd/system/mileage-sync.service >/dev/null
+          printf '[Unit]\nDescription=Mileage sync every 15 min\n[Timer]\nOnCalendar=*:0/15\n[Install]\nWantedBy=timers.target\n' | sudo tee /etc/systemd/system/mileage-sync.timer >/dev/null
+          sudo systemctl daemon-reload; sudo systemctl enable --now mileage-sync.timer
+          sudo crontab -l > /tmp/root.cron && grep -v mileage-sync /tmp/root.cron | sudo crontab - && rm -f /tmp/root.cron
+    - id: cron-left
+      description: Adds the timer but leaves the cron entry, so the job runs twice.
+      feedback: "Remove the mileage-sync line from root's crontab (sudo crontab -e)."
+      expectFail: [cron-retired]
+      mutation:
+        on: tr-stock-01
+        as: learner
+        run: |
+          printf '[Unit]\nDescription=Mileage sync\n[Service]\nType=oneshot\nExecStart=/usr/local/bin/mileage-sync\n' | sudo tee /etc/systemd/system/mileage-sync.service >/dev/null
+          printf '[Unit]\nDescription=Mileage sync every 15 min\n[Timer]\nOnCalendar=*:0/15\nPersistent=true\n[Install]\nWantedBy=timers.target\n' | sudo tee /etc/systemd/system/mileage-sync.timer >/dev/null
+          sudo systemctl daemon-reload; sudo systemctl enable --now mileage-sync.timer
+    - id: monotonic
+      description: Uses OnUnitActiveSec=15min, which drifts off the quarter hour.
+      feedback: "A monotonic timer counts from the last run, so it does not stay on :00/:15/:30/:45 and Persistent= does not apply to it. Use OnCalendar=*:0/15."
+      expectFail: [quarter-hours]
+      mutation:
+        on: tr-stock-01
+        as: learner
+        run: |
+          printf '[Unit]\nDescription=Mileage sync\n[Service]\nType=oneshot\nExecStart=/usr/local/bin/mileage-sync\n' | sudo tee /etc/systemd/system/mileage-sync.service >/dev/null
+          printf '[Unit]\nDescription=Mileage sync every 15 min\n[Timer]\nOnBootSec=1min\nOnUnitActiveSec=15min\nPersistent=true\n[Install]\nWantedBy=timers.target\n' | sudo tee /etc/systemd/system/mileage-sync.timer >/dev/null
+          sudo systemctl daemon-reload; sudo systemctl enable --now mileage-sync.timer
+          sudo crontab -l > /tmp/root.cron && grep -v mileage-sync /tmp/root.cron | sudo crontab - && rm -f /tmp/root.cron
+  solution:
+    explanation: |
+      A oneshot service runs the command; the timer's OnCalendar=*:0/15 fires on the
+      quarter hours and Persistent=true catches up after downtime. Enable the timer,
+      then delete the crontab line.
+    steps:
+      - on: tr-stock-01
+        as: learner
+        run: |
+          printf '[Unit]\nDescription=Rolling-stock mileage sync\n\n[Service]\nType=oneshot\nExecStart=/usr/local/bin/mileage-sync\n' | sudo tee /etc/systemd/system/mileage-sync.service >/dev/null
+          printf '[Unit]\nDescription=Mileage sync every 15 minutes\n\n[Timer]\nOnCalendar=*:0/15\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n' | sudo tee /etc/systemd/system/mileage-sync.timer >/dev/null
+          sudo systemctl daemon-reload
+          sudo systemctl enable --now mileage-sync.timer
+          sudo crontab -l > /tmp/root.cron && grep -v mileage-sync /tmp/root.cron | sudo crontab - && rm -f /tmp/root.cron
+          systemctl list-timers mileage-sync.timer
+    alternatives:
+      - id: explicit-minutes
+        description: List the four minutes explicitly.
+        steps:
+          - on: tr-stock-01
+            as: learner
+            run: |
+              printf '[Service]\nType=oneshot\nExecStart=/usr/local/bin/mileage-sync\n' | sudo tee /etc/systemd/system/mileage-sync.service >/dev/null
+              printf '[Timer]\nOnCalendar=*-*-* *:00,15,30,45:00\nPersistent=yes\n[Install]\nWantedBy=timers.target\n' | sudo tee /etc/systemd/system/mileage-sync.timer >/dev/null
+              sudo systemctl daemon-reload
+              sudo systemctl enable mileage-sync.timer
+              sudo systemctl start mileage-sync.timer
+              sudo sed -i '/mileage-sync/d' /var/spool/cron/root

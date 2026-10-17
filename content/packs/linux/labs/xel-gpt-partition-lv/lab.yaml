@@ -1,0 +1,127 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xel-gpt-partition-lv
+  title: Create a volume group with a given extent size
+  domain: linux
+  frameworks: [rhcsa-aligned:local-storage]
+  difficulty: medium
+  estimatedMinutes: 8
+  tags: [exam, lvm, partitions]
+  version: 1
+spec:
+  description: |
+    **Host:** node 1, `tr-el-01` (`ssh tr-el-01`, then `sudo -i`)
+
+    The disk **`/dev/vdc`** has a GPT partition table and free space; other tasks may
+    use that disk too, so only add to it.
+
+    1. Create a new partition of **700 MiB** on `/dev/vdc` and use it as the only
+       physical volume of a new volume group **`{{vg}}`** with a **physical extent size
+       of {{pe}} MiB**.
+    2. In `{{vg}}`, create the logical volume **`{{lv}}`** of exactly **{{n}}
+       extents**.
+    3. Format `{{lv}}` with **ext4** and mount it **persistently** at **`/srv/{{lv}}`**.
+  objectives:
+    - Create a GPT partition and a volume group with a chosen extent size
+    - Size a logical volume in extents and mount it persistently
+  params:
+    vg:
+      type: choice
+      values: [vgsignal, vgticket, vgcrew]
+    lv:
+      type: choice
+      values: [lvarchive, lvjournal, lvrota]
+    pe:
+      type: choice
+      values: ["8", "16", "32"]
+    n:
+      type: int
+      min: 10
+      max: 18
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-el-01
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["2Gi", "1Gi", "2Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-el-01
+      run: |
+        set -eu
+        parted -s /dev/vdc print 2>/dev/null | grep -q '^Partition Table: gpt' || parted -s /dev/vdc mklabel gpt
+  checks:
+    - id: vg-extent
+      description: The volume group exists on a partition of /dev/vdc with the requested extent size
+      type: shell
+      on: tr-el-01
+      skills: [linux.storage.lvm, linux.storage.partitions]
+      weight: 1.5
+      command: |
+        pv=$(pvs --noheadings -o pv_name -S vg_name={{vg}} 2>/dev/null | tr -d ' ')
+        pe=$(vgs --noheadings --units m --nosuffix -o vg_extent_size {{vg}} 2>/dev/null | tr -d ' ')
+        case "$pv" in /dev/vdc[0-9]*) echo "pv=vdc-partition pe=$pe" ;; *) echo "pv=$pv pe=$pe" ;; esac
+      expect: {match: exact, value: "pv=vdc-partition pe={{pe}}.00"}
+    - id: lv-extents
+      description: The logical volume has exactly the requested number of extents
+      type: shell
+      on: tr-el-01
+      skills: [linux.storage.lvm]
+      weight: 1.5
+      command: lvdisplay {{vg}}/{{lv}} 2>/dev/null | awk '/Current LE/ {print $3}'
+      expect: {match: exact, value: "{{n}}"}
+    - id: mounted
+      description: The ext4 filesystem is mounted at /srv/{{lv}} and listed in /etc/fstab
+      type: shell
+      on: tr-el-01
+      skills: [linux.storage.lvm]
+      weight: 1
+      command: |
+        t=$(findmnt -n -o FSTYPE /srv/{{lv}} 2>/dev/null); s=$(findmnt -n -o SOURCE /srv/{{lv}} 2>/dev/null)
+        f=$(findmnt --fstab -n -o TARGET /srv/{{lv}} 2>/dev/null)
+        [ "$t" = ext4 ] && [ "$(readlink -f "$s")" = "$(readlink -f /dev/{{vg}}/{{lv}})" ] && [ "$f" = /srv/{{lv}} ] && echo persistent || echo "no fs=$t fstab=$f"
+      expect: {match: exact, value: persistent}
+  misconceptions:
+    - id: default-extent
+      description: Creates the volume group with the default 4 MiB extents and sizes the volume in MiB.
+      feedback: "vgcreate -s sets the extent size; lvcreate -l counts extents."
+      expectFail: [vg-extent]
+      mutation:
+        on: tr-el-01
+        as: learner
+        run: |
+          set -e
+          sudo parted -s /dev/vdc mkpart {{vg}} 1MiB 701MiB
+          sudo udevadm settle
+          p=$(lsblk -nrpo NAME,PARTLABEL /dev/vdc | awk '$2 == "{{vg}}" {print $1}')
+          sudo pvcreate -y $p && sudo vgcreate {{vg}} $p
+          sudo lvcreate -y -n {{lv}} -L $(( {{n}} * {{pe}} ))M {{vg}}
+          sudo mkfs.ext4 -q /dev/{{vg}}/{{lv}}
+          sudo mkdir -p /srv/{{lv}}
+          echo "/dev/{{vg}}/{{lv}} /srv/{{lv}} ext4 defaults 0 0" | sudo tee -a /etc/fstab >/dev/null
+          sudo systemctl daemon-reload; sudo mount /srv/{{lv}}
+  solution:
+    explanation: parted adds the partition in free space, vgcreate -s {{pe}}M sets the extent size, lvcreate -l {{n}} sizes the volume in extents, and the fstab entry mounts it at boot.
+    steps:
+      - on: tr-el-01
+        as: learner
+        run: |
+          set -e
+          start=$(sudo parted -s -m /dev/vdc unit MiB print free | awk -F: '$5 == "free;" {s=$2} END {sub("MiB","",s); print int(s) + 1}')
+          sudo parted -s /dev/vdc mkpart {{vg}} ${start}MiB $((start + 700))MiB
+          sudo udevadm settle
+          p=$(lsblk -nrpo NAME,PARTLABEL /dev/vdc | awk '$2 == "{{vg}}" {print $1}')
+          sudo pvcreate -y $p
+          sudo vgcreate -s {{pe}}M {{vg}} $p
+          sudo lvcreate -y -n {{lv}} -l {{n}} {{vg}}
+          sudo mkfs.ext4 -q /dev/{{vg}}/{{lv}}
+          sudo mkdir -p /srv/{{lv}}
+          echo "/dev/mapper/{{vg}}-{{lv}} /srv/{{lv}} ext4 defaults 0 0" | sudo tee -a /etc/fstab >/dev/null
+          sudo systemctl daemon-reload
+          sudo mount /srv/{{lv}}

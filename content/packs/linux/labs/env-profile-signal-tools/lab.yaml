@@ -1,0 +1,192 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: env-profile-signal-tools
+  title: Give every signaller the same shell environment
+  domain: linux
+  frameworks: [lfcs:users-groups, lpic1:shells-scripting, linuxplus:system-management]
+  difficulty: medium
+  estimatedMinutes: 12
+  tags: [bash, profile, skel, PATH, alias, sudo]
+  version: 1
+spec:
+  description: |
+    The signalling team installed its status tool under `/opt/tr-signal` on
+    `tr-signal-02`. Every signaller, existing and future, should get the same
+    environment. With `sudo`:
+
+    1. In every **login shell**, `/opt/tr-signal/bin` must be **added** to `PATH`
+       (the system directories stay in it).
+    2. In every **interactive** shell, the alias **`{{alias}}`** must run
+       **`sigstat --{{mode}}`**.
+    3. Every account **created from now on** must start with its own copy of
+       `/opt/tr-signal/share/sigstatrc.example` saved as **`~/.sigstatrc`**.
+
+    Use the system-wide places for this (`/etc/profile.d`, `/etc/skel`). **Do not
+    edit the existing users' own dotfiles**: some of them have personal settings
+    that must stay exactly as they are.
+  objectives:
+    - Set environment for all login shells with /etc/profile.d
+    - Define aliases for interactive shells system-wide
+    - Prepare files for new accounts with /etc/skel
+  params:
+    alias:
+      type: choice
+      values: [sst, sigs, sstat]
+    mode:
+      type: choice
+      values: [brief, summary, alarms]
+  topology:
+    entry: tr-signal-02
+    nodes:
+      - name: tr-signal-02
+        driver: container
+        image: el-lab:10
+        learnerSudo: true
+        access: [shell]
+  setup:
+    - on: tr-signal-02
+      run: |
+        set -eu
+        echo 'learner ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/learner
+        chmod 0440 /etc/sudoers.d/learner
+        mkdir -p /opt/tr-signal/bin /opt/tr-signal/share /var/lib/cloudtrain
+        chmod 0700 /var/lib/cloudtrain
+        cat > /opt/tr-signal/bin/sigstat <<'EOT'
+        #!/bin/sh
+        # sigstat: Tallowmere Rail signalling status (training stub)
+        case "${1:-}" in
+          --brief) echo "SIG OK: 42 signals, 0 faults" ;;
+          --summary) echo "SIG SUMMARY: north 14 / south 16 / depot 12, faults 0" ;;
+          --alarms) echo "SIG ALARMS: none" ;;
+          *) echo "usage: sigstat --brief|--summary|--alarms" >&2; exit 2 ;;
+        esac
+        EOT
+        chmod 0755 /opt/tr-signal/bin/sigstat
+        printf '%s\n' '# sigstat personal settings' 'region=all' 'refresh=30' > /opt/tr-signal/share/sigstatrc.example
+        chmod 0644 /opt/tr-signal/share/sigstatrc.example
+        rm -f /etc/profile.d/tr-signal*.sh /etc/skel/.sigstatrc
+        for u in fen gil; do id $u >/dev/null 2>&1 || useradd -m $u; done
+        echo 'export EDITOR=nano' >> /home/fen/.bash_profile
+        echo "alias ll='ls -la --color=auto'" >> /home/gil/.bashrc
+        sha256sum /home/fen/.bash_profile /home/fen/.bashrc /home/gil/.bash_profile /home/gil/.bashrc /home/learner/.bash_profile /home/learner/.bashrc > /var/lib/cloudtrain/dotfiles.sum
+  checks:
+    - id: login-path
+      description: Existing users get /opt/tr-signal/bin in PATH in a login shell
+      type: shell
+      on: tr-signal-02
+      skills: [linux.shell.env-profiles]
+      weight: 1.5
+      timeoutSec: 20
+      command: |
+        n=0
+        for u in fen gil learner; do su - $u -c 'echo ":$PATH:"' 2>/dev/null | grep -q ':/opt/tr-signal/bin:' && n=$((n+1)); done
+        echo $n
+      expect: {match: exact, value: "3"}
+    - id: path-kept
+      description: The system directories are still in PATH
+      type: shell
+      on: tr-signal-02
+      skills: [linux.shell.env-profiles]
+      weight: 0.5
+      timeoutSec: 20
+      command: su - fen -c 'echo ":$PATH:"' 2>/dev/null | grep -q ':/usr/bin:' && echo kept || echo lost
+      expect: {match: exact, value: kept}
+    - id: alias
+      description: Interactive shells have the alias for sigstat
+      type: shell
+      on: tr-signal-02
+      skills: [linux.shell.env-profiles]
+      weight: 1.5
+      timeoutSec: 20
+      command: su - gil -c "bash -lic 'alias {{alias}}'" 2>/dev/null </dev/null | tail -n 1
+      expect: {match: regex, value: "^alias {{alias}}='(/opt/tr-signal/bin/)?sigstat --{{mode}}'$"}
+    - id: new-user-rc
+      description: A newly created account gets ~/.sigstatrc
+      type: shell
+      on: tr-signal-02
+      skills: [linux.shell.env-profiles]
+      weight: 1
+      timeoutSec: 30
+      command: |
+        u=ctprobe$$
+        useradd -m $u >/dev/null 2>&1 || { echo useradd-failed; exit 0; }
+        cmp -s /home/$u/.sigstatrc /opt/tr-signal/share/sigstatrc.example && [ "$(stat -c %U /home/$u/.sigstatrc)" = $u ] && r=ok || r=missing
+        userdel -r $u >/dev/null 2>&1; echo $r
+      expect: {match: exact, value: ok}
+    - id: new-user-path
+      description: A newly created account also gets the PATH and alias
+      type: shell
+      on: tr-signal-02
+      skills: [linux.shell.env-profiles]
+      weight: 1
+      timeoutSec: 30
+      command: |
+        u=ctprobe$$
+        useradd -m $u >/dev/null 2>&1 || { echo useradd-failed; exit 0; }
+        p=$(su - $u -c 'echo ":$PATH:"' 2>/dev/null); a=$(su - $u -c "bash -lic 'alias {{alias}}'" 2>/dev/null </dev/null | tail -n 1)
+        userdel -r $u >/dev/null 2>&1
+        case "$p" in *:/opt/tr-signal/bin:*) ;; *) echo no-path; exit 0 ;; esac
+        echo "$a" | grep -Eq "^alias {{alias}}='(/opt/tr-signal/bin/)?sigstat --{{mode}}'$" && echo ok || echo no-alias
+      expect: {match: exact, value: ok}
+    - id: dotfiles-untouched
+      description: The existing users' own dotfiles are unchanged
+      type: shell
+      on: tr-signal-02
+      skills: [linux.shell.env-profiles]
+      weight: 1
+      command: sha256sum -c --quiet /var/lib/cloudtrain/dotfiles.sum >/dev/null 2>&1 && echo unchanged || echo edited
+      expect: {match: exact, value: unchanged}
+  hints:
+    - title: Which files run when?
+      body: "Login shells read /etc/profile, which sources every /etc/profile.d/*.sh. On Enterprise Linux, interactive non-login shells read /etc/bashrc, which sources them too. Personal files (~/.bash_profile, ~/.bashrc) come after."
+      cost: 0
+    - title: Adding to PATH
+      body: "In a file such as /etc/profile.d/tr-signal.sh: `PATH=$PATH:/opt/tr-signal/bin` and `export PATH`. Do not replace PATH, append to it."
+      cost: 1
+    - title: The alias
+      body: "In the same file: `alias {{alias}}='sigstat --{{mode}}'`. Test with `bash -lic 'alias {{alias}}'` or log in again with `su - fen`."
+      cost: 1
+    - title: New accounts
+      body: "useradd -m copies /etc/skel into the new home. `sudo cp /opt/tr-signal/share/sigstatrc.example /etc/skel/.sigstatrc`."
+      cost: 1
+  misconceptions:
+    - id: edits-dotfiles
+      description: Appends the settings to every user's ~/.bashrc and to /etc/skel/.bashrc.
+      feedback: "Users' own dotfiles belong to them and are not where site policy goes; use a file in /etc/profile.d. New accounts still lack ~/.sigstatrc."
+      expectFail: [dotfiles-untouched, new-user-rc]
+      mutation:
+        on: tr-signal-02
+        as: learner
+        run: |
+          for f in /home/fen/.bashrc /home/gil/.bashrc /home/learner/.bashrc /etc/skel/.bashrc; do
+            printf '%s\n' 'PATH=$PATH:/opt/tr-signal/bin' "alias {{alias}}='sigstat --{{mode}}'" | sudo tee -a $f >/dev/null
+          done
+    - id: no-skel
+      description: Configures /etc/profile.d but forgets the file for new accounts.
+      feedback: "New accounts are populated from /etc/skel; put sigstatrc.example there as .sigstatrc."
+      expectFail: [new-user-rc]
+      mutation:
+        on: tr-signal-02
+        as: learner
+        run: printf '%s\n' 'export PATH=$PATH:/opt/tr-signal/bin' "alias {{alias}}='sigstat --{{mode}}'" | sudo tee /etc/profile.d/tr-signal.sh >/dev/null
+    - id: replaces-path
+      description: Sets PATH to the tool directory only.
+      feedback: "PATH=/opt/tr-signal/bin removes /usr/bin and every other directory; append with PATH=$PATH:/opt/tr-signal/bin."
+      expectFail: [path-kept]
+      mutation:
+        on: tr-signal-02
+        as: learner
+        run: |
+          printf '%s\n' 'export PATH=/opt/tr-signal/bin' "alias {{alias}}='sigstat --{{mode}}'" | sudo tee /etc/profile.d/tr-signal.sh >/dev/null
+          sudo cp /opt/tr-signal/share/sigstatrc.example /etc/skel/.sigstatrc
+  solution:
+    explanation: One /etc/profile.d script appends to PATH and defines the alias; /etc/skel/.sigstatrc covers new accounts.
+    steps:
+      - on: tr-signal-02
+        as: learner
+        run: |
+          set -e
+          printf '%s\n' 'PATH=$PATH:/opt/tr-signal/bin' 'export PATH' "alias {{alias}}='sigstat --{{mode}}'" | sudo tee /etc/profile.d/tr-signal.sh >/dev/null
+          sudo chmod 0644 /etc/profile.d/tr-signal.sh
+          sudo cp /opt/tr-signal/share/sigstatrc.example /etc/skel/.sigstatrc

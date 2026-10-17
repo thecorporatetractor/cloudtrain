@@ -1,0 +1,119 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xel-permissions-umask
+  title: Set ownership, modes and a user's umask
+  domain: linux
+  frameworks: [rhcsa-aligned:essential-tools]
+  difficulty: medium
+  estimatedMinutes: 6
+  tags: [exam, permissions, umask]
+  version: 1
+spec:
+  description: |
+    **Host:** node 1, `tr-el-01` (`ssh tr-el-01`, then `sudo -i`)
+
+    The rostering clerk **`{{user}}`** takes over the weekly rosters.
+
+    1. Every file in **`/srv/rosters`** must be owned by user **`{{user}}`** and group
+       **`{{group}}`**, with mode **`{{mode}}`**. The directory itself stays as it is.
+    2. Files `{{user}}` creates from now on must get no permissions at all for others
+       and no write permission for the group: give `{{user}}` a **umask of `0027`** that
+       applies to every **login shell** of that user.
+  objectives:
+    - Change owner, group and mode of files
+    - Make a per-user umask persistent
+  params:
+    user:
+      type: choice
+      values: [garan, hesketh, iolo, jory]
+    group:
+      type: choice
+      values: [rostering, timetable, crewplan]
+    mode:
+      type: choice
+      values: ["640", "660", "750", "600"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-el-01
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["2Gi", "1Gi", "2Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-el-01
+      run: |
+        set -eu
+        getent group {{group}} >/dev/null || groupadd {{group}}
+        id {{user}} >/dev/null 2>&1 || useradd -m -s /bin/bash {{user}}
+        rm -rf /srv/rosters; mkdir -p /srv/rosters
+        for w in 01 02 03 04 05; do echo "week $w" > /srv/rosters/week-$w.csv; done
+        chmod 0644 /srv/rosters/*; chmod 0755 /srv/rosters
+  checks:
+    - id: owners
+      description: Every roster file has the requested owner and group
+      type: shell
+      on: tr-el-01
+      skills: [linux.files.permissions]
+      weight: 1
+      command: stat -c '%U:%G' /srv/rosters/week-0*.csv | sort -u | paste -sd,
+      expect: {match: exact, value: "{{user}}:{{group}}"}
+    - id: modes
+      description: Every roster file has the requested mode
+      type: shell
+      on: tr-el-01
+      skills: [linux.files.permissions]
+      weight: 1
+      command: stat -c '%a' /srv/rosters/week-0*.csv | sort -u | paste -sd,
+      expect: {match: exact, value: "{{mode}}"}
+    - id: dir-unchanged
+      description: The directory keeps root ownership and mode 755
+      type: shell
+      on: tr-el-01
+      skills: [linux.files.permissions]
+      weight: 0.5
+      command: stat -c '%U %a' /srv/rosters
+      expect: {match: exact, value: "root 755"}
+    - id: umask
+      description: Login shells of the user start with umask 0027
+      type: shell
+      on: tr-el-01
+      skills: [linux.files.permissions]
+      weight: 1.5
+      command: su - {{user}} -c umask 2>/dev/null
+      expect: {match: exact, value: "0027"}
+  misconceptions:
+    - id: umask-for-root
+      description: Sets the umask in the current (root) shell or root's profile only.
+      feedback: "A umask applies to the shell that sets it. Put it in the user's own startup file (~/.bashrc or ~/.bash_profile of that user)."
+      expectFail: [umask]
+      mutation:
+        on: tr-el-01
+        as: learner
+        run: sudo sh -c 'chown {{user}}:{{group}} /srv/rosters/* && chmod {{mode}} /srv/rosters/* && echo "umask 0027" >> /root/.bashrc'
+    - id: recursive-dir
+      description: Changes the directory too with a recursive chown/chmod.
+      feedback: "The task changes the files only; chmod -R also changed the directory."
+      expectFail: [dir-unchanged]
+      mutation:
+        on: tr-el-01
+        as: learner
+        run: sudo sh -c 'chown -R {{user}}:{{group}} /srv/rosters && chmod -R {{mode}} /srv/rosters && echo "umask 0027" >> /home/{{user}}/.bashrc'
+  solution:
+    explanation: chown user:group and chmod on the files; the umask line in the user's ~/.bashrc runs for every login shell (through ~/.bash_profile).
+    steps:
+      - on: tr-el-01
+        as: learner
+        run: sudo sh -c 'chown {{user}}:{{group}} /srv/rosters/* && chmod {{mode}} /srv/rosters/* && echo "umask 0027" >> /home/{{user}}/.bashrc'
+    alternatives:
+      - id: bash-profile
+        description: Put the umask into ~/.bash_profile.
+        steps:
+          - on: tr-el-01
+            as: learner
+            run: sudo sh -c 'chown {{user}}:{{group}} /srv/rosters/*.csv && chmod {{mode}} /srv/rosters/*.csv && echo "umask 027" >> /home/{{user}}/.bash_profile'

@@ -1,0 +1,163 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: fstab-mount-by-uuid
+  title: Mount the archive filesystem persistently by UUID
+  domain: linux
+  frameworks: [rhcsa-aligned:local-storage, lfcs:storage, lpic1:devices-filesystems]
+  difficulty: medium
+  estimatedMinutes: 12
+  tags: [storage, fstab, mount-options, uuid]
+  version: 1
+spec:
+  description: |
+    The ext4 filesystem labelled **`TT-ARCHIVE`** on **`tr-tt-01`** (`ssh tr-tt-01`;
+    you have `sudo`) holds the timetable archive. Device names of the data disks have
+    changed before when disks were added, and last month a host hung in emergency
+    mode because a removed disk was still in `/etc/fstab`.
+
+    Mount `TT-ARCHIVE` at **`/srv/archive`**:
+
+    - in `/etc/fstab`, referring to it **by its filesystem UUID**;
+    - with the options **`noexec`** and **`nodev`**, plus **`nofail`** so the host
+      still boots if the disk is ever missing;
+    - mounted **now** with those options.
+
+    Do not reformat the filesystem: it already holds data.
+  objectives:
+    - Find a filesystem's UUID and mount it persistently by UUID
+    - Choose mount options, including nofail for non-critical disks
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-tt-01
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["4Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-tt-01
+      timeoutSec: 120
+      run: |
+        set -eu
+        [ "$(readlink -f /dev/disk/by-id/virtio-ct-data1)" = /dev/vdc ]
+        if ! blkid -L TT-ARCHIVE >/dev/null 2>&1; then
+          wipefs -a /dev/vdc >/dev/null
+          parted -s /dev/vdc mklabel gpt mkpart logs xfs 1MiB 1025MiB mkpart archive ext4 1025MiB 3073MiB
+          udevadm settle
+          mkfs.xfs -q -L TT-LOGS /dev/vdc1; mkfs.ext4 -q -L TT-ARCHIVE /dev/vdc2
+        fi
+        t=$(mktemp -d); mount LABEL=TT-ARCHIVE $t
+        mkdir -p $t/2025; for m in 01 02 03 04 05 06; do echo "timetable 2025-$m" > $t/2025/tt-$m.txt; done
+        printf '#!/bin/sh\necho archive tool\n' > $t/reindex.sh; chmod 0755 $t/reindex.sh
+        umount $t; rmdir $t
+        mkdir -p /srv/archive
+  checks:
+    - id: mounted
+      description: TT-ARCHIVE is mounted at /srv/archive and its data is there
+      type: shell
+      on: tr-tt-01
+      skills: [linux.storage.mounts]
+      weight: 1
+      command: '[ "$(findmnt -n -o SOURCE /srv/archive 2>/dev/null)" = "$(blkid -L TT-ARCHIVE)" ] && [ -f /srv/archive/2025/tt-06.txt ] && echo mounted || echo no'
+      expect: {match: exact, value: mounted}
+    - id: by-uuid
+      description: /etc/fstab refers to it by UUID
+      type: shell
+      on: tr-tt-01
+      skills: [linux.storage.mounts]
+      weight: 1.5
+      command: |
+        u=$(blkid -s UUID -o value "$(blkid -L TT-ARCHIVE)")
+        awk -v u="UUID=$u" '!/^[[:space:]]*#/ && $2 == "/srv/archive" {gsub("\"", "", $1); print ($1 == u ? "uuid" : "other:" $1)}' /etc/fstab | tail -1
+      expect: {match: exact, value: uuid}
+    - id: options
+      description: The fstab entry has noexec, nodev and nofail
+      type: shell
+      on: tr-tt-01
+      skills: [linux.storage.mounts]
+      weight: 1.5
+      command: |
+        o=$(findmnt --fstab -n -o OPTIONS /srv/archive 2>/dev/null)
+        n=0; for w in noexec nodev nofail; do echo ",$o," | grep -q ",$w," && n=$((n + 1)); done; echo "options=$n/3"
+      expect: {match: exact, value: "options=3/3"}
+    - id: active-options
+      description: The current mount uses noexec and nodev
+      type: shell
+      on: tr-tt-01
+      skills: [linux.storage.mounts]
+      weight: 1
+      command: |
+        o=$(findmnt -n -o OPTIONS /srv/archive 2>/dev/null)
+        echo ",$o," | grep -q ',noexec,' && echo ",$o," | grep -q ',nodev,' && { /srv/archive/reindex.sh >/dev/null 2>&1 && echo exec-allowed || echo enforced; } || echo "opts=$o"
+      expect: {match: exact, value: enforced}
+    - id: fstab-valid
+      description: /etc/fstab parses cleanly
+      type: shell
+      on: tr-tt-01
+      skills: [linux.storage.mounts]
+      weight: 0.5
+      command: findmnt --verify --tab-file /etc/fstab >/dev/null 2>&1 && echo valid || echo errors
+      expect: {match: exact, value: valid}
+  hints:
+    - title: Find the UUID
+      command: sudo blkid -L TT-ARCHIVE; sudo blkid /dev/vdc2
+      body: "blkid -L finds the device by label; blkid prints UUID=... for it. lsblk -f shows the same."
+      cost: 0
+    - title: The fstab fields
+      body: "UUID=<uuid>  /srv/archive  ext4  noexec,nodev,nofail  0  2 — device, mount point, type, options, dump, fsck order."
+      cost: 2
+    - title: Already mounted?
+      body: "If you mounted it by hand first, mount -o remount /srv/archive (or umount and mount) applies the fstab options. findmnt --verify checks the file without rebooting."
+      cost: 1
+  misconceptions:
+    - id: by-device
+      description: Puts /dev/vdc2 into /etc/fstab.
+      feedback: "Device names follow probe order and can change when disks are added; use UUID=..."
+      expectFail: [by-uuid]
+      mutation:
+        on: tr-tt-01
+        as: learner
+        run: |
+          echo '/dev/vdc2 /srv/archive ext4 noexec,nodev,nofail 0 2' | sudo tee -a /etc/fstab >/dev/null
+          sudo systemctl daemon-reload; sudo mount /srv/archive
+    - id: no-nofail
+      description: Leaves out nofail.
+      feedback: "Without nofail a missing archive disk stops the boot in emergency mode."
+      expectFail: [options]
+      mutation:
+        on: tr-tt-01
+        as: learner
+        run: |
+          echo "UUID=$(sudo blkid -s UUID -o value /dev/vdc2) /srv/archive ext4 noexec,nodev 0 2" | sudo tee -a /etc/fstab >/dev/null
+          sudo systemctl daemon-reload; sudo mount /srv/archive
+    - id: not-remounted
+      description: Adds the fstab line while it is still mounted by hand with default options.
+      feedback: "fstab options apply at the next mount; remount /srv/archive so noexec and nodev take effect now."
+      expectFail: [active-options]
+      mutation:
+        on: tr-tt-01
+        as: learner
+        run: |
+          sudo mount LABEL=TT-ARCHIVE /srv/archive
+          echo "UUID=$(sudo blkid -s UUID -o value /dev/vdc2) /srv/archive ext4 noexec,nodev,nofail 0 2" | sudo tee -a /etc/fstab >/dev/null
+          sudo systemctl daemon-reload
+  solution:
+    explanation: |
+      blkid gives the UUID; the fstab line mounts it by UUID with noexec,nodev,nofail.
+      daemon-reload refreshes systemd's mount units and mount /srv/archive applies the
+      entry now.
+    steps:
+      - on: tr-tt-01
+        as: learner
+        run: |
+          set -e
+          u=$(sudo blkid -s UUID -o value "$(sudo blkid -L TT-ARCHIVE)")
+          echo "UUID=$u /srv/archive ext4 noexec,nodev,nofail 0 2" | sudo tee -a /etc/fstab >/dev/null
+          sudo systemctl daemon-reload
+          sudo mount /srv/archive
+          findmnt /srv/archive

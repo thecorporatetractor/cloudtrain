@@ -1,0 +1,99 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xel-kernel-arg
+  title: Add a kernel argument for every kernel
+  domain: linux
+  frameworks: [rhcsa-aligned:deploy-maintain]
+  difficulty: medium
+  estimatedMinutes: 6
+  tags: [exam, grub, kernel]
+  version: 1
+spec:
+  description: |
+    **Host:** node 1, `tr-el-01` (`ssh tr-el-01`, then `sudo -i`)
+
+    The vendor of the signalling interface asks for the kernel argument
+    **`{{arg}}`**. Add it to the command line of **every installed kernel** boot
+    entry, and make sure kernels installed **later** get it too. Do not remove any
+    existing argument and do not reboot.
+  objectives:
+    - Change kernel arguments persistently for all boot entries
+  params:
+    arg:
+      type: choice
+      values: ["audit_backlog_limit=8192", "nmi_watchdog=0", "tsc=reliable", "panic=30"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-el-01
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["2Gi", "1Gi", "2Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-el-01
+      run: |
+        set -eu
+        install -d -m 0700 /var/lib/cloudtrain
+        grubby --info=ALL | sed -n 's/^args="\(.*\)"$/\1/p' | head -1 | tr ' ' '\n' | grep -v '^$' | sort > /var/lib/cloudtrain/xel-kargs.before
+  checks:
+    - id: all-entries
+      description: Every boot entry has the argument
+      type: shell
+      on: tr-el-01
+      skills: [linux.boot.grub]
+      weight: 2
+      command: |
+        n=$(grubby --info=ALL 2>/dev/null | grep -c '^args=')
+        m=$(grubby --info=ALL 2>/dev/null | grep '^args=' | grep -cE '[" ]{{arg}}[" ]')
+        [ "$n" -gt 0 ] && [ "$n" = "$m" ] && echo all || echo "$m of $n"
+      expect: {match: exact, value: all}
+    - id: future-kernels
+      description: The default command line for new kernels has the argument
+      type: shell
+      on: tr-el-01
+      skills: [linux.boot.grub]
+      weight: 1
+      command: |
+        { grep -sE '(^|[ "]){{arg}}([ "]|$)' /etc/kernel/cmdline >/dev/null || grep -sE '^GRUB_CMDLINE_LINUX=.*[" ]{{arg}}[" ]' /etc/default/grub >/dev/null; } && echo persistent || echo missing
+      expect: {match: exact, value: persistent}
+    - id: kept
+      description: The existing arguments are still there
+      type: shell
+      on: tr-el-01
+      skills: [linux.boot.grub]
+      weight: 1
+      command: |
+        now=$(grubby --info=DEFAULT | sed -n 's/^args="\(.*\)"$/\1/p' | tr ' ' '\n' | grep -v '^$' | sort)
+        comm -23 /var/lib/cloudtrain/xel-kargs.before - <<EOF2 | grep -q . && echo removed || echo kept
+        $now
+        EOF2
+      expect: {match: exact, value: kept}
+  misconceptions:
+    - id: default-only
+      description: Changes only the default boot entry.
+      feedback: "grubby --update-kernel=DEFAULT touches one entry; --update-kernel=ALL changes every entry and the default for new kernels."
+      expectFail: [all-entries]
+      mutation:
+        on: tr-el-01
+        as: learner
+        run: |
+          set -e
+          sudo cp /boot/loader/entries/$(ls /boot/loader/entries | head -1) /boot/loader/entries/zz-tr-rescue-copy.conf
+          sudo sed -i 's/^title .*/title Tallowmere rescue copy/; s/^version .*/version 0-rescue-copy/' /boot/loader/entries/zz-tr-rescue-copy.conf
+          sudo grubby --update-kernel=DEFAULT --args="{{arg}}"
+  solution:
+    explanation: grubby --update-kernel=ALL --args adds the argument to every BLS entry and to the default command line used for new kernels.
+    steps:
+      - on: tr-el-01
+        as: learner
+        run: |
+          set -e
+          sudo grubby --update-kernel=ALL --args="{{arg}}"
+          grep -qs '{{arg}}' /etc/kernel/cmdline || { [ -f /etc/kernel/cmdline ] && sudo sed -i 's/$/ {{arg}}/' /etc/kernel/cmdline || true; }
+          grep -q '{{arg}}' /etc/default/grub || sudo sed -i 's/^\(GRUB_CMDLINE_LINUX="[^"]*\)"/\1 {{arg}}"/' /etc/default/grub

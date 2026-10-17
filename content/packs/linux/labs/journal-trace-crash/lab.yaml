@@ -1,0 +1,150 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: journal-trace-crash
+  title: Find why the fares service crashed from the journal
+  domain: linux
+  frameworks: [rhcsa-aligned:running-systems, lpic1:essential-services]
+  difficulty: easy
+  estimatedMinutes: 10
+  tags: [systemd, journalctl, logging]
+  version: 1
+spec:
+  description: |
+    The fares API on **`tr-fares-01`** (`ssh tr-fares-01`; you have `sudo`) went down
+    during the night run and the on-call engineer only restarted the host's other
+    services. The journal still has the story, buried among chatty messages from
+    several services.
+
+    Find the **error** that made **`fares-api.service`** stop. It names one
+    configuration key that has a bad value. Write **only that key** (for example
+    `fare_example_key`) to **`~/answers/cause.txt`** on `tr-fares-01`.
+
+    Do not restart or change any service: just read the journal.
+  objectives:
+    - Filter the journal by unit, priority and time
+    - Tell a fatal error from warnings and from other units' errors
+  params:
+    key:
+      type: choice
+      values: [fare_zone_matrix, peak_window_start, railcard_discount_table, season_ticket_cap]
+    decoy:
+      type: choice
+      values: [fare_cache_ttl, legacy_zone_names, export_batch_size]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-fares-01
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536}
+        access: [ssh, console]
+  setup:
+    - on: tr-fares-01
+      timeoutSec: 120
+      run: |
+        set -eu
+        cat > /usr/local/bin/fares-api <<'SH'
+        #!/bin/bash
+        echo "<6>fares-api 4.2 starting, loading /etc/tr-fares/fares.conf"
+        for i in $(seq 1 25); do echo "<6>priced journey batch $i (412 journeys)"; done
+        echo "<4>warning: config key {{decoy}} is deprecated, using default"
+        for i in $(seq 26 40); do echo "<6>priced journey batch $i (398 journeys)"; done
+        echo "<3>fatal: config key {{key}} has an invalid value: expected a number, got 'tbd'"
+        echo "<6>fares-api shutting down"
+        exit 78
+        SH
+        cat > /usr/local/bin/ticket-gw <<'SH'
+        #!/bin/bash
+        echo "<3>error: config key gate_reader_timeout has an invalid value: 0"
+        echo "<6>ticket-gw falling back to 30 s"
+        sleep 1
+        SH
+        chmod 0755 /usr/local/bin/fares-api /usr/local/bin/ticket-gw
+        printf '[Unit]\nDescription=Tallowmere fares API\n[Service]\nExecStart=/usr/local/bin/fares-api\n' > /etc/systemd/system/fares-api.service
+        printf '[Unit]\nDescription=Tallowmere ticket gateway\n[Service]\nType=oneshot\nExecStart=/usr/local/bin/ticket-gw\n' > /etc/systemd/system/ticket-gw.service
+        systemctl daemon-reload
+        for i in 1 2 3; do logger -t tr-depot "depot heartbeat $i ok"; done
+        systemctl start ticket-gw.service
+        systemctl start fares-api.service || true
+        sleep 2
+        systemctl start ticket-gw.service
+        for i in 1 2 3 4 5 6; do logger -p user.err -t tr-signal "signal box $i: config key lamp_test_interval missing"; done
+        journalctl --sync
+        install -d -o learner -g learner /home/learner/answers
+        rm -f /home/learner/answers/cause.txt
+  checks:
+    - id: answered
+      description: ~/answers/cause.txt holds one key
+      type: shell
+      on: tr-fares-01
+      skills: [linux.systemd.journal]
+      weight: 0.5
+      command: '[ "$(grep -c . /home/learner/answers/cause.txt 2>/dev/null)" = 1 ] && echo one-line || echo missing'
+      expect: {match: exact, value: one-line}
+    - id: cause
+      description: The key is the one in fares-api's fatal error
+      type: shell
+      on: tr-fares-01
+      skills: [linux.systemd.journal]
+      weight: 3
+      command: tr -d ' \t\r' < /home/learner/answers/cause.txt 2>/dev/null | head -1
+      expect: {match: exact, value: "{{key}}"}
+    - id: untouched
+      description: fares-api was not restarted
+      type: shell
+      on: tr-fares-01
+      skills: [linux.systemd.journal]
+      weight: 0.5
+      command: journalctl -u fares-api.service -o cat 2>/dev/null | grep -c 'fares-api 4.2 starting'
+      expect: {match: exact, value: "1"}
+  hints:
+    - title: One unit at a time
+      command: sudo journalctl -u fares-api.service
+      body: "-u limits the journal to one unit; without it you also see the ticket gateway and the signal boxes."
+      cost: 0
+    - title: Only the serious ones
+      body: "-p err shows messages of priority error and worse; -p warning would add the deprecation notice. Combine it with -u."
+      cost: 1
+    - title: A time window
+      body: "--since and --until take times like '1 hour ago' or '2026-10-17 02:00'. -b limits to the current boot."
+      cost: 1
+  misconceptions:
+    - id: took-warning
+      description: Reports the key from the deprecation warning.
+      feedback: "A warning did not stop the service; filter with -p err to see the fatal message."
+      expectFail: [cause]
+      mutation:
+        on: tr-fares-01
+        as: learner
+        run: echo {{decoy}} > ~/answers/cause.txt
+    - id: wrong-unit
+      description: Reports an error from another service.
+      feedback: "That error came from the ticket gateway (or a signal box). Filter by unit with -u fares-api.service."
+      expectFail: [cause]
+      mutation:
+        on: tr-fares-01
+        as: learner
+        run: echo gate_reader_timeout > ~/answers/cause.txt
+  solution:
+    explanation: |
+      journalctl -u fares-api.service -p err shows only fares-api's errors: the fatal
+      message names the key. Warnings and other units' errors are noise.
+    steps:
+      - on: tr-fares-01
+        as: learner
+        run: |
+          mkdir -p ~/answers
+          sudo journalctl -u fares-api.service -p err -o cat | sed -n 's/.*config key \([a-z_]*\) has an invalid value.*/\1/p' | tail -1 > ~/answers/cause.txt
+          cat ~/answers/cause.txt
+    alternatives:
+      - id: grep-fatal
+        description: Grep the unit's journal for the fatal line.
+        steps:
+          - on: tr-fares-01
+            as: learner
+            run: sudo journalctl -u fares-api --since '1 hour ago' --no-pager | grep fatal | awk '{for (i = 1; i <= NF; i++) if ($i == "key") print $(i + 1)}' > ~/answers/cause.txt

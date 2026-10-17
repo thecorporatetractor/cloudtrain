@@ -1,0 +1,199 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: users-new-signallers
+  title: Onboard three new signallers with groups and home directories
+  domain: linux
+  frameworks: [rhcsa-aligned:users-groups, lfcs:users-groups, lpic1:admin-tasks, linuxplus:services-users]
+  difficulty: easy
+  estimatedMinutes: 10
+  tags: [users, groups, useradd, groupadd, chage, sudo]
+  version: 1
+spec:
+  description: |
+    Three trainee signallers start at the Tallowmere Rail signalling centre on Monday.
+    The onboarding ticket `/srv/tickets/{{ticket}}.txt` on `tr-signal-01` has the
+    details. Using `sudo` (you have full sudo rights on this host), make it so that:
+
+    - the group **`signalling`** exists with **GID 4100**;
+    - the users **`ada`**, **`bram`** and **`cleo`** exist, each with their own home
+      directory under `/home`, and each is a member of `signalling`;
+    - **`bram`** is a contractor: his account **expires on the date in the ticket**.
+      `ada` and `cleo` are permanent staff and must not expire.
+
+    Leave the existing groups and users of the host as they are.
+  objectives:
+    - Create a group with a fixed GID
+    - Create users with home directories and supplementary groups
+    - Set an account expiry date
+  params:
+    ticket:
+      type: choice
+      values: [ONB-2207, ONB-2231, ONB-2246, ONB-2260]
+    expiry:
+      type: choice
+      values: ["2027-03-31", "2027-04-30", "2027-06-30", "2027-09-30"]
+  topology:
+    entry: tr-signal-01
+    nodes:
+      - name: tr-signal-01
+        driver: container
+        image: el-lab:10
+        learnerSudo: true
+        access: [shell]
+  setup:
+    - on: tr-signal-01
+      run: |
+        set -eu
+        echo 'learner ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/learner
+        chmod 0440 /etc/sudoers.d/learner
+        for u in ada bram cleo; do userdel -r "$u" 2>/dev/null || true; done
+        groupdel signalling 2>/dev/null || true
+        getent group signal-ops >/dev/null || groupadd -g 4000 signal-ops
+        id duty-bot >/dev/null 2>&1 || useradd -r -M -s /sbin/nologin -G signal-ops duty-bot
+        mkdir -p /srv/tickets
+        cat > /srv/tickets/{{ticket}}.txt <<'EOT'
+        Ticket {{ticket}}: onboarding, signalling centre trainees
+        Requested by: Signalling Centre Manager
+
+        New starters (all three join group "signalling", GID 4100):
+          ada   - Ada Hollis,   permanent
+          bram  - Bram Okafor,  contractor (agency), account ends {{expiry}}
+          cleo  - Cleo Marsh,   permanent
+
+        Each needs a personal home directory.
+        EOT
+        sed -i 's/^        //' /srv/tickets/{{ticket}}.txt
+        chmod 0644 /srv/tickets/{{ticket}}.txt
+  checks:
+    - id: group-gid
+      description: The group signalling exists with GID 4100
+      type: shell
+      on: tr-signal-01
+      skills: [linux.users.accounts]
+      weight: 1
+      command: 'getent group signalling | cut -d: -f3'
+      expect: {match: exact, value: "4100"}
+    - id: users-homes
+      description: ada, bram and cleo exist, each with an own home directory under /home
+      type: shell
+      on: tr-signal-01
+      skills: [linux.users.accounts]
+      weight: 1.5
+      command: |
+        n=0
+        for u in ada bram cleo; do
+          h=$(getent passwd $u | cut -d: -f6)
+          [ "$h" = /home/$u ] && [ -d "$h" ] && [ "$(stat -c %U "$h")" = $u ] && n=$((n+1))
+        done
+        echo $n
+      expect: {match: exact, value: "3"}
+    - id: members
+      description: All three users are members of signalling
+      type: shell
+      on: tr-signal-01
+      skills: [linux.users.accounts]
+      weight: 1.5
+      command: |
+        n=0
+        for u in ada bram cleo; do id -nG $u 2>/dev/null | tr ' ' '\n' | grep -qx signalling && n=$((n+1)); done
+        echo $n
+      expect: {match: exact, value: "3"}
+    - id: bram-expires
+      description: bram's account expires on the date in the ticket
+      type: shell
+      on: tr-signal-01
+      skills: [linux.users.accounts]
+      weight: 1.5
+      command: |
+        want=$(( $(date -u -d {{expiry}} +%s) / 86400 ))
+        [ "$(getent shadow bram | cut -d: -f8)" = "$want" ] && echo ok || echo wrong
+      expect: {match: exact, value: ok}
+    - id: staff-no-expiry
+      description: ada and cleo have no expiry date
+      type: shell
+      on: tr-signal-01
+      skills: [linux.users.accounts]
+      weight: 1
+      command: |
+        for u in ada cleo; do getent shadow $u >/dev/null || { echo missing; exit 0; }; done
+        [ -z "$(getent shadow ada | cut -d: -f8)$(getent shadow cleo | cut -d: -f8)" ] && echo ok || echo expiring
+      expect: {match: exact, value: ok}
+    - id: existing-untouched
+      description: signal-ops keeps GID 4000 and duty-bot stays in it
+      type: shell
+      on: tr-signal-01
+      skills: [linux.users.accounts]
+      weight: 0.5
+      command: '[ "$(getent group signal-ops | cut -d: -f3)" = 4000 ] && id -nG duty-bot | grep -qw signal-ops && echo ok || echo changed'
+      expect: {match: exact, value: ok}
+  hints:
+    - title: Read the ticket
+      command: cat /srv/tickets/*.txt
+      body: Everything you need (names, GID, the contractor's end date) is in the ticket.
+      cost: 0
+    - title: Group with a fixed GID
+      body: "`sudo groupadd -g 4100 signalling`. Check with `getent group signalling`."
+      cost: 1
+    - title: Users in a supplementary group
+      body: "`sudo useradd -m -G signalling ada` creates the user, a home directory and adds the group. For an existing user, `sudo usermod -aG signalling ada` (without -a, -G replaces every supplementary group)."
+      cost: 1
+    - title: Account expiry
+      body: "`sudo chage -E YYYY-MM-DD bram` (or `useradd -e`); `sudo chage -l bram` shows the result."
+      cost: 2
+  misconceptions:
+    - id: default-gid
+      description: Creates the group without choosing its GID.
+      feedback: "groupadd picks the next free GID. Other hosts and the NFS shares expect 4100: use groupadd -g 4100 (or groupmod -g 4100 to fix it)."
+      expectFail: [group-gid]
+      mutation:
+        on: tr-signal-01
+        as: learner
+        run: |
+          sudo groupadd signalling
+          for u in ada bram cleo; do sudo useradd -m -G signalling $u; done
+          sudo chage -E {{expiry}} bram
+    - id: expiry-for-everyone
+      description: Sets the expiry date on all three accounts.
+      feedback: "Only bram is a contractor. ada and cleo would be locked out on that date; clear it with chage -E -1."
+      expectFail: [staff-no-expiry]
+      mutation:
+        on: tr-signal-01
+        as: learner
+        run: |
+          sudo groupadd -g 4100 signalling
+          for u in ada bram cleo; do sudo useradd -m -G signalling -e {{expiry}} $u; done
+    - id: password-max-age-instead
+      description: Uses the password maximum age (chage -M) instead of the account expiry.
+      feedback: "chage -M limits how long a password stays valid; the account itself still never expires. The account end date is chage -E."
+      expectFail: [bram-expires]
+      mutation:
+        on: tr-signal-01
+        as: learner
+        run: |
+          sudo groupadd -g 4100 signalling
+          for u in ada bram cleo; do sudo useradd -m -G signalling $u; done
+          sudo chage -M 90 bram
+  solution:
+    explanation: Create the group with its GID first, then the users with -m and -G, then set bram's expiry with chage -E.
+    steps:
+      - on: tr-signal-01
+        as: learner
+        run: |
+          set -e
+          sudo groupadd -g 4100 signalling
+          for u in ada bram cleo; do sudo useradd -m -G signalling "$u"; done
+          sudo chage -E {{expiry}} bram
+    alternatives:
+      - id: usermod-gpasswd
+        description: Users first, then the group renumbered and its member list set with gpasswd -M
+        steps:
+          - on: tr-signal-01
+            as: learner
+            run: |
+              set -e
+              for u in ada cleo; do sudo useradd -m "$u"; done
+              sudo useradd -m -e {{expiry}} bram
+              sudo groupadd signalling
+              sudo groupmod -g 4100 signalling
+              sudo gpasswd -M ada,bram,cleo signalling

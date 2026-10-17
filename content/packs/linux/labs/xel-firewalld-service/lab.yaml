@@ -1,0 +1,92 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xel-firewalld-service
+  title: Allow a service through firewalld
+  domain: linux
+  frameworks: [rhcsa-aligned:networking]
+  difficulty: easy
+  estimatedMinutes: 5
+  tags: [exam, firewalld]
+  version: 1
+spec:
+  description: |
+    **Host:** node 1, `tr-el-01` (`ssh tr-el-01`, then `sudo -i`)
+
+    In node 1's **default firewall zone**, permit the predefined service
+    **`{{svc}}`** and the port **`{{port}}/tcp`** (the ticket gateway's health probe).
+    Both must be allowed **now and after a reboot**. Keep everything that is allowed
+    already.
+  objectives:
+    - Open a service and a port in firewalld at runtime and permanently
+  params:
+    svc:
+      type: choice
+      values: [https, imaps, ldaps, mysql]
+    port:
+      type: int
+      min: 7400
+      max: 7499
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-el-01
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["2Gi", "1Gi", "2Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-el-01
+      run: |
+        set -eu
+        systemctl enable --now firewalld
+        firewall-cmd -q --permanent --remove-service={{svc}} 2>/dev/null || true
+        firewall-cmd -q --reload
+  checks:
+    - id: runtime
+      description: The service and the port are allowed in the running firewall
+      type: shell
+      on: tr-el-01
+      skills: [linux.net.firewalld]
+      weight: 1
+      command: |
+        z=$(firewall-cmd --get-default-zone)
+        echo "$(firewall-cmd --zone=$z --query-service={{svc}}) $(firewall-cmd --zone=$z --query-port={{port}}/tcp)"
+      expect: {match: exact, value: "yes yes"}
+    - id: permanent
+      description: The service and the port are in the permanent configuration
+      type: shell
+      on: tr-el-01
+      skills: [linux.net.firewalld]
+      weight: 1.5
+      command: |
+        z=$(firewall-cmd --get-default-zone)
+        echo "$(firewall-cmd --permanent --zone=$z --query-service={{svc}}) $(firewall-cmd --permanent --zone=$z --query-port={{port}}/tcp)"
+      expect: {match: exact, value: "yes yes"}
+    - id: ssh-kept
+      description: ssh is still allowed
+      type: shell
+      on: tr-el-01
+      skills: [linux.net.firewalld]
+      weight: 0.5
+      command: firewall-cmd --permanent --query-service=ssh
+      expect: {match: exact, value: "yes"}
+  misconceptions:
+    - id: runtime-only
+      description: Adds the rules without --permanent.
+      feedback: "Runtime changes are lost on reload or reboot; add them with --permanent too (or --runtime-to-permanent)."
+      expectFail: [permanent]
+      mutation:
+        on: tr-el-01
+        as: learner
+        run: sudo sh -c 'firewall-cmd --add-service={{svc}} && firewall-cmd --add-port={{port}}/tcp'
+  solution:
+    explanation: Add both permanently, then reload so the running firewall has them too.
+    steps:
+      - on: tr-el-01
+        as: learner
+        run: sudo sh -c 'firewall-cmd --permanent --add-service={{svc}} && firewall-cmd --permanent --add-port={{port}}/tcp && firewall-cmd --reload'

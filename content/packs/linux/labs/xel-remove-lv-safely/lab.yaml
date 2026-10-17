@@ -1,0 +1,92 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xel-remove-lv-safely
+  title: Retire a logical volume cleanly
+  domain: linux
+  frameworks: [rhcsa-aligned:local-storage]
+  difficulty: easy
+  estimatedMinutes: 5
+  tags: [exam, lvm, fstab]
+  version: 1
+spec:
+  description: |
+    **Host:** node 1, `tr-el-01` (`ssh tr-el-01`, then `sudo -i`)
+
+    The legacy ticket archive on **`vgexam/lvlegacy`** (mounted at
+    **`/srv/legacy`**) has been migrated. Retire it: **unmount** it, **remove its
+    entry from `/etc/fstab`** so the host still boots cleanly, and **remove the
+    logical volume**. The volume group `vgexam` and its other volumes must stay.
+  objectives:
+    - Remove a logical volume and its mount configuration safely
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-el-01
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["2Gi", "1Gi", "2Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-el-01
+      timeoutSec: 120
+      run: |
+        set -eu
+        pvs /dev/vde >/dev/null 2>&1 || pvcreate -y /dev/vde
+        vgs vgexam >/dev/null 2>&1 || vgcreate vgexam /dev/vde
+        lvs vgexam/lvlegacy >/dev/null 2>&1 || { lvcreate -y -n lvlegacy -L 96M vgexam; mkfs.ext4 -q /dev/vgexam/lvlegacy; }
+        lvs vgexam/lvkeep >/dev/null 2>&1 || lvcreate -y -n lvkeep -L 32M vgexam
+        mkdir -p /srv/legacy
+        grep -q '/srv/legacy' /etc/fstab || echo '/dev/mapper/vgexam-lvlegacy /srv/legacy ext4 defaults 0 0' >> /etc/fstab
+        systemctl daemon-reload
+        findmnt -n /srv/legacy >/dev/null || mount /srv/legacy
+        echo "archive" > /srv/legacy/README
+  checks:
+    - id: lv-gone
+      description: lvlegacy no longer exists and nothing is mounted at /srv/legacy
+      type: shell
+      on: tr-el-01
+      skills: [linux.storage.lvm]
+      weight: 1
+      command: '{ lvs vgexam/lvlegacy >/dev/null 2>&1 && echo present; } || { findmnt -n /srv/legacy >/dev/null && echo mounted; } || echo removed'
+      expect: {match: exact, value: removed}
+    - id: fstab-clean
+      description: /etc/fstab has no entry for the retired volume
+      type: shell
+      on: tr-el-01
+      skills: [linux.storage.mounts]
+      weight: 1.5
+      command: grep -v '^[[:space:]]*#' /etc/fstab | grep -qE 'lvlegacy|[[:space:]]/srv/legacy[[:space:]]' && echo stale-entry || echo clean
+      expect: {match: exact, value: clean}
+    - id: vg-kept
+      description: vgexam and its other volumes are still there
+      type: shell
+      on: tr-el-01
+      skills: [linux.storage.lvm]
+      weight: 0.5
+      command: lvs vgexam/lvkeep >/dev/null 2>&1 && echo kept || echo lost
+      expect: {match: exact, value: kept}
+  misconceptions:
+    - id: fstab-left
+      description: Removes the volume but leaves its fstab line, so the next boot drops to emergency mode.
+      feedback: "A missing device in /etc/fstab blocks the boot; delete (or comment out) the line too."
+      expectFail: [fstab-clean]
+      mutation:
+        on: tr-el-01
+        as: learner
+        run: sudo sh -c 'umount /srv/legacy && lvremove -y vgexam/lvlegacy'
+  solution:
+    explanation: Unmount first, delete the fstab line, reload systemd's mount units, then lvremove.
+    steps:
+      - on: tr-el-01
+        as: learner
+        run: |
+          set -e
+          sudo umount /srv/legacy
+          sudo sed -i '\#/srv/legacy#d' /etc/fstab
+          sudo systemctl daemon-reload
+          sudo lvremove -y vgexam/lvlegacy

@@ -48,7 +48,7 @@ spec:
     nodes:
       - name: tr-rs-ws-01
         driver: container
-        image: linux-pod-deb:24.04
+        image: deb-lab:24.04
         access: [shell]
   setup:
     - on: tr-rs-ws-01
@@ -89,6 +89,15 @@ spec:
         inst 4 127.0.1.14 22 yard
         rm -f /home/learner/.ssh/depot_ed25519 /home/learner/.ssh/depot_ed25519.pub
         touch /home/learner/.ssh/config
+        # The platform writes its defaults as a leading `Host *` block (StrictHostKeyChecking
+        # yes, User learner); ssh uses the first value it finds, so that block would override
+        # every entry the learner appends. Move it to the system-wide config, which ssh reads
+        # after the user's file, as on a normal workstation.
+        c=/home/learner/.ssh/config
+        if grep -qx 'Host \*' $c; then
+          awk '/^Host \*$/ {f = 1} f' $c > /etc/ssh/ssh_config.d/10-cloudtrain-defaults.conf
+          awk '/^Host \*$/ {f = 1} !f' $c > $c.tmp && cat $c.tmp > $c && rm -f $c.tmp
+        fi
         grep -q '^Host tr-backup-01$' /home/learner/.ssh/config || printf '\n# Nightly backup host (managed by the depot team)\nHost tr-backup-01\n  User backup\n  Port 2299\n' >> /home/learner/.ssh/config
         chown learner:learner /home/learner/.ssh/config
         mkdir -p /var/lib/cloudtrain && chmod 0700 /var/lib/cloudtrain

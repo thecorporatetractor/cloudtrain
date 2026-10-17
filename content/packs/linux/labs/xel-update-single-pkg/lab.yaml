@@ -1,0 +1,95 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xel-update-single-pkg
+  title: Update one package from a staged repository
+  domain: linux
+  frameworks: [rhcsa-aligned:software]
+  difficulty: medium
+  estimatedMinutes: 6
+  tags: [exam, dnf, rpm]
+  version: 1
+spec:
+  description: |
+    **Host:** node 1, `tr-el-01` (`ssh tr-el-01`, then `sudo -i`)
+
+    The release team staged new builds of the depot tools in the repository
+    **`tr-staged`** (already configured on node 1). Update **only the package
+    `{{pkg}}`** to the version in that repository. The other staged update,
+    `{{other}}`, is not approved yet: it must stay at its installed version.
+  objectives:
+    - Update a single package with dnf
+  params:
+    pkg:
+      type: choice
+      values: [tr-sigtools, tr-farecalc]
+    other:
+      type: choice
+      values: [tr-depotdocs, tr-crewview]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-el-01
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["2Gi", "1Gi", "2Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-el-01
+      timeoutSec: 420
+      run: |
+        set -eu
+        if ! rpm -q {{pkg}} {{other}} >/dev/null 2>&1; then
+          rpm -q rpm-build createrepo_c >/dev/null 2>&1 || dnf -y -q install rpm-build createrepo_c
+          t=$(mktemp -d)
+          printf '%s\n' 'Name: %{n}' 'Version: %{v}' 'Release: 1' 'Summary: Tallowmere depot tool %{n}' 'License: Proprietary' 'BuildArch: noarch' \
+            '%description' 'Internal Tallowmere Rail depot tool.' '%install' 'mkdir -p %{buildroot}/usr/share/%{n}' 'echo %{v} > %{buildroot}/usr/share/%{n}/VERSION' \
+            '%files' '/usr/share/%{n}/VERSION' > $t/tool.spec
+          for n in {{pkg}} {{other}}; do for v in 1.0 1.1; do
+            rpmbuild -bb --quiet --define "_topdir $t/build" --define "n $n" --define "v $v" $t/tool.spec >/dev/null
+          done; done
+          rpm -i $t/build/RPMS/noarch/*-1.0-1.noarch.rpm
+          mkdir -p /srv/tr-staged
+          cp $t/build/RPMS/noarch/*-1.1-1.noarch.rpm /srv/tr-staged/
+          createrepo_c -q /srv/tr-staged
+          rm -rf $t
+          printf '[tr-staged]\nname=Tallowmere staged depot tools (internal, unsigned)\nbaseurl=file:///srv/tr-staged\nenabled=1\ngpgcheck=0\n' > /etc/yum.repos.d/tr-staged.repo
+        fi
+  checks:
+    - id: updated
+      description: "{{pkg}} is at the staged version"
+      type: shell
+      on: tr-el-01
+      skills: [linux.packages.dnf]
+      weight: 2
+      command: rpm -q --qf '%{VERSION}\n' {{pkg}} 2>/dev/null || echo missing
+      expect: {match: exact, value: "1.1"}
+    - id: other-held
+      description: "{{other}} stays at its installed version"
+      type: shell
+      on: tr-el-01
+      skills: [linux.packages.dnf]
+      weight: 1.5
+      command: rpm -q --qf '%{VERSION}\n' {{other}} 2>/dev/null || echo missing
+      expect: {match: exact, value: "1.0"}
+  misconceptions:
+    - id: update-all
+      description: Runs a full update, which also takes the unapproved package.
+      feedback: "dnf update without a package name updates everything that has a newer version; name the package: dnf update {{pkg}}."
+      expectFail: [other-held]
+      mutation:
+        on: tr-el-01
+        as: learner
+        timeoutSec: 180
+        run: sudo dnf -y -q update
+  solution:
+    explanation: dnf update with a package name updates only that package (and what it needs) from the enabled repositories.
+    steps:
+      - on: tr-el-01
+        as: learner
+        timeoutSec: 180
+        run: sudo dnf -y -q update {{pkg}}

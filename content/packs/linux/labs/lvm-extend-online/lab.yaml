@@ -1,0 +1,148 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: lvm-extend-online
+  title: Grow a full logical volume and its filesystem online
+  domain: linux
+  frameworks: [rhcsa-aligned:filesystems, lfcs:storage]
+  difficulty: easy
+  estimatedMinutes: 10
+  tags: [storage, lvm, xfs, online-resize]
+  version: 1
+spec:
+  description: |
+    Alarm on **`tr-fares-02`** (`ssh tr-fares-02`; you have `sudo`): the fares ledger
+    **`/srv/ledger`** (logical volume **`vg-fares/lv-ledger`**, XFS) is **98 % full**,
+    and the ledger writer service `ledger-writer.service` appends to it every second.
+    The volume group still has free extents.
+
+    **Extend `lv-ledger` by 300 MiB** and **grow its filesystem**, **without
+    unmounting it** and without stopping the writer. Nothing may be lost.
+  objectives:
+    - Extend a logical volume from free extents
+    - Grow a mounted XFS filesystem
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-fares-02
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["1Gi", "1Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-fares-02
+      timeoutSec: 180
+      run: |
+        set -eu
+        [ "$(readlink -f /dev/disk/by-id/virtio-ct-data1)" = /dev/vdc ]
+        if ! vgs vg-fares >/dev/null 2>&1; then
+          wipefs -a /dev/vdc /dev/vdd >/dev/null
+          pvcreate -q /dev/vdc /dev/vdd; vgcreate -q -s 8M vg-fares /dev/vdc /dev/vdd
+          lvcreate -q -y -n lv-ledger -L 504M vg-fares; mkfs.xfs -q /dev/vg-fares/lv-ledger
+          mkdir -p /srv/ledger
+          echo '/dev/vg-fares/lv-ledger /srv/ledger xfs defaults 0 0' >> /etc/fstab
+          systemctl daemon-reload; mount /srv/ledger
+        fi
+        avail=$(df -B1M --output=avail /srv/ledger | tail -1 | tr -d ' ')
+        fallocate -l $(( (avail - 12) ))M /srv/ledger/archive-2025.bin
+        printf '%s\n' '#!/bin/bash' 'while :; do echo "$(date +%s) fare entry" >> /srv/ledger/entries.log; sleep 1; done' > /usr/local/bin/ledger-writer
+        chmod 0755 /usr/local/bin/ledger-writer
+        printf '[Unit]\nDescription=Tallowmere fares ledger writer\nRequiresMountsFor=/srv/ledger\n[Service]\nExecStart=/usr/local/bin/ledger-writer\n[Install]\nWantedBy=multi-user.target\n' > /etc/systemd/system/ledger-writer.service
+        systemctl daemon-reload; systemctl enable --now ledger-writer.service
+        install -d -m 0700 /var/lib/cloudtrain
+        awk '$5 == "/srv/ledger" {print $1}' /proc/self/mountinfo > /var/lib/cloudtrain/ledger.mountid
+        stat -c %s /srv/ledger/archive-2025.bin > /var/lib/cloudtrain/ledger.archive-size
+        df -B1M --output=use /srv/ledger | tail -1
+  checks:
+    - id: lv-grown
+      description: lv-ledger grew by 300 MiB (to about 800 MiB)
+      type: shell
+      on: tr-fares-02
+      skills: [linux.storage.lvm]
+      weight: 1.5
+      command: s=$(lvs --noheadings --units m --nosuffix -o lv_size vg-fares/lv-ledger 2>/dev/null | tr -d ' ' | cut -d. -f1); [ -n "$s" ] && [ $s -ge 796 ] && [ $s -le 816 ] && echo grown || echo "size=$s"
+      expect: {match: exact, value: grown}
+    - id: fs-grown
+      description: The XFS filesystem uses the new space
+      type: shell
+      on: tr-fares-02
+      skills: [linux.storage.lvm]
+      weight: 1.5
+      command: s=$(df -B1M --output=size /srv/ledger 2>/dev/null | tail -1 | tr -d ' '); [ -n "$s" ] && [ $s -ge 770 ] && echo grown || echo "fs=${s}MiB"
+      expect: {match: exact, value: grown}
+    - id: never-unmounted
+      description: /srv/ledger stayed mounted the whole time (same mount)
+      type: shell
+      on: tr-fares-02
+      skills: [linux.storage.lvm]
+      weight: 1
+      command: '[ "$(awk ''$5 == "/srv/ledger" {print $1}'' /proc/self/mountinfo)" = "$(cat /var/lib/cloudtrain/ledger.mountid)" ] && echo same-mount || echo remounted'
+      expect: {match: exact, value: same-mount}
+    - id: writer-alive
+      description: The writer still runs and nothing was lost
+      type: shell
+      on: tr-fares-02
+      skills: [linux.storage.lvm]
+      weight: 1
+      timeoutSec: 30
+      command: |
+        a=$(wc -l < /srv/ledger/entries.log); sleep 3; b=$(wc -l < /srv/ledger/entries.log)
+        [ "$(systemctl is-active ledger-writer.service)" = active ] && [ $b -gt $a ] && [ "$(stat -c %s /srv/ledger/archive-2025.bin)" = "$(cat /var/lib/cloudtrain/ledger.archive-size)" ] && echo writing || echo "stalled a=$a b=$b"
+      expect: {match: exact, value: writing}
+  hints:
+    - title: How much is free
+      command: sudo vgs vg-fares; df -h /srv/ledger
+      body: "VFree in vgs is what lvextend can take; df shows the filesystem, which only grows when you tell it to."
+      cost: 0
+    - title: Grow both layers
+      body: "lvextend -L +300M grows the volume; -r (--resizefs) also grows the filesystem in the same step."
+      cost: 1
+    - title: XFS grows while mounted
+      body: "xfs_growfs takes the mount point (/srv/ledger), not the device, and works online. XFS can never shrink."
+      cost: 1
+  misconceptions:
+    - id: lv-only
+      description: Extends the logical volume but not the filesystem.
+      feedback: "df still shows the old size: the filesystem does not grow by itself. Run xfs_growfs /srv/ledger (or use lvextend -r next time)."
+      expectFail: [fs-grown]
+      mutation:
+        on: tr-fares-02
+        as: learner
+        run: sudo lvextend -L +300M vg-fares/lv-ledger
+    - id: unmount-first
+      description: Stops the writer and unmounts before resizing.
+      feedback: "XFS grows online; unmounting meant downtime for the ledger writer. Grow it while mounted."
+      expectFail: [never-unmounted]
+      mutation:
+        on: tr-fares-02
+        as: learner
+        run: |
+          set -e
+          sudo systemctl stop ledger-writer.service; sudo umount /srv/ledger
+          sudo lvextend -L +300M vg-fares/lv-ledger
+          sudo mount /srv/ledger; sudo xfs_growfs /srv/ledger >/dev/null
+          sudo systemctl start ledger-writer.service
+  solution:
+    explanation: |
+      lvextend -r -L +300M takes 300 MiB of free extents and then calls xfs_growfs on the
+      mounted filesystem, so the writer never notices.
+    steps:
+      - on: tr-fares-02
+        as: learner
+        run: |
+          sudo lvextend -r -L +300M vg-fares/lv-ledger
+          df -h /srv/ledger
+    alternatives:
+      - id: two-steps
+        description: lvextend, then xfs_growfs on the mount point.
+        steps:
+          - on: tr-fares-02
+            as: learner
+            run: |
+              set -e
+              sudo lvextend -l +38 vg-fares/lv-ledger
+              sudo xfs_growfs /srv/ledger

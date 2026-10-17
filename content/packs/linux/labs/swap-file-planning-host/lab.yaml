@@ -1,0 +1,147 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: swap-file-planning-host
+  title: Add swap to the planning host without repartitioning
+  domain: linux
+  frameworks: [rhcsa-aligned:local-storage, lfcs:storage]
+  difficulty: easy
+  estimatedMinutes: 10
+  tags: [storage, swap, fstab]
+  version: 1
+spec:
+  description: |
+    The crew-planning optimiser on **`tr-plan-01`** (`ssh tr-plan-01`; you have `sudo`)
+    runs out of memory during the timetable change. The system disk cannot be
+    repartitioned, but a small data disk **`/dev/vdc`** (1 GiB, empty) was attached.
+
+    Add two swap areas, both **active now and after every boot**:
+
+    1. a **swap file** **`/var/swap/planning.swap`** of **1 GiB** with **priority 5**;
+    2. a **swap partition** of **512 MiB** on `/dev/vdc` with **priority 10**, so the
+       kernel prefers it.
+
+    The swap file must not be readable by ordinary users.
+  objectives:
+    - Create and activate a swap file and a swap partition
+    - Set swap priorities persistently in /etc/fstab
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-plan-01
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["1Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-plan-01
+      run: |
+        set -eu
+        [ "$(readlink -f /dev/disk/by-id/virtio-ct-data1)" = /dev/vdc ]
+        test -b /dev/vdc
+        wipefs -a /dev/vdc >/dev/null
+        rm -f /var/swap/planning.swap
+  checks:
+    - id: file-active
+      description: The 1 GiB swap file is active with priority 5
+      type: shell
+      on: tr-plan-01
+      skills: [linux.storage.swap]
+      weight: 1
+      command: |
+        swapon --show=NAME,SIZE,PRIO --bytes --noheadings | awk '$1 == "/var/swap/planning.swap" { m = $2 / 1048576; print (m >= 1000 && m <= 1025 ? "size-ok" : "size=" m), "prio=" $3; f = 1 } END { if (!f) print "inactive" }'
+      expect: {match: exact, value: "size-ok prio=5"}
+    - id: partition-active
+      description: A 512 MiB swap partition on /dev/vdc is active with priority 10
+      type: shell
+      on: tr-plan-01
+      skills: [linux.storage.swap]
+      weight: 1
+      command: |
+        swapon --show=NAME,SIZE,PRIO --bytes --noheadings | awk '$1 ~ /^\/dev\/vdc[0-9]+$/ { m = $2 / 1048576; print (m >= 500 && m <= 520 ? "size-ok" : "size=" m), "prio=" $3; f = 1 } END { if (!f) print "inactive" }'
+      expect: {match: exact, value: "size-ok prio=10"}
+    - id: fstab
+      description: /etc/fstab activates both at boot with their priorities
+      type: shell
+      on: tr-plan-01
+      skills: [linux.storage.swap]
+      weight: 1.5
+      command: |
+        p=$(swapon --show=NAME --noheadings | grep '^/dev/vdc' | head -1)
+        u=$( [ -n "$p" ] && blkid -s UUID -o value $p ); pu=$( [ -n "$p" ] && blkid -s PARTUUID -o value $p )
+        f=$(awk '!/^[[:space:]]*#/ && $3 == "swap" && $1 == "/var/swap/planning.swap" && ("," $4 ",") ~ /,pri=5,/' /etc/fstab | grep -c .)
+        q=$(awk -v p="$p" -v u="UUID=$u" -v pu="PARTUUID=$pu" '!/^[[:space:]]*#/ && $3 == "swap" && ($1 == p || $1 == u || $1 == pu) && ("," $4 ",") ~ /,pri=10,/' /etc/fstab | grep -c .)
+        echo "file=$f partition=$q"
+      expect: {match: exact, value: "file=1 partition=1"}
+    - id: file-mode
+      description: The swap file is readable by root only
+      type: shell
+      on: tr-plan-01
+      skills: [linux.storage.swap]
+      weight: 0.5
+      command: stat -c '%a %U' /var/swap/planning.swap 2>/dev/null || echo missing
+      expect: {match: exact, value: "600 root"}
+  hints:
+    - title: A swap file in three steps
+      body: "Allocate the space (fallocate -l 1G or dd), chmod 600 it, then mkswap it. swapon activates it."
+      cost: 1
+    - title: Priorities
+      body: "swapon -p 10 sets a priority now; in /etc/fstab the option is pri=10 (e.g. 'defaults,pri=10'). Higher numbers are used first."
+      cost: 1
+    - title: Check your work
+      command: swapon --show; sudo swapoff -a && sudo swapon -a && swapon --show
+      body: "swapoff -a then swapon -a re-reads /etc/fstab: if both come back with their priorities, the next boot will do the same."
+      cost: 0
+  misconceptions:
+    - id: no-priorities
+      description: Activates both swap areas without priorities.
+      feedback: "Without pri= the kernel assigns negative priorities in activation order; set pri=5 and pri=10 in /etc/fstab."
+      expectFail: [file-active, partition-active, fstab]
+      mutation:
+        on: tr-plan-01
+        as: learner
+        run: |
+          set -e
+          sudo mkdir -p /var/swap; sudo fallocate -l 1G /var/swap/planning.swap; sudo chmod 600 /var/swap/planning.swap; sudo mkswap -q /var/swap/planning.swap
+          sudo parted -s /dev/vdc mklabel gpt mkpart swap linux-swap 1MiB 513MiB; sudo udevadm settle; sudo mkswap -q /dev/vdc1
+          printf '/var/swap/planning.swap none swap defaults 0 0\n/dev/vdc1 none swap defaults 0 0\n' | sudo tee -a /etc/fstab >/dev/null
+          sudo swapon -a
+    - id: world-readable
+      description: Leaves the swap file mode 644.
+      feedback: "Swap holds memory pages, including secrets; chmod 600 the file (swapon warns about insecure permissions)."
+      expectFail: [file-mode]
+      mutation:
+        on: tr-plan-01
+        as: learner
+        run: |
+          set -e
+          sudo mkdir -p /var/swap; sudo dd if=/dev/zero of=/var/swap/planning.swap bs=1M count=1024 status=none; sudo chmod 644 /var/swap/planning.swap; sudo mkswap -q /var/swap/planning.swap
+          sudo parted -s /dev/vdc mklabel gpt mkpart swap linux-swap 1MiB 513MiB; sudo udevadm settle; sudo mkswap -q /dev/vdc1
+          printf '/var/swap/planning.swap none swap defaults,pri=5 0 0\n/dev/vdc1 none swap defaults,pri=10 0 0\n' | sudo tee -a /etc/fstab >/dev/null
+          sudo swapon -a
+  solution:
+    explanation: |
+      The file is allocated, locked to mode 600 and formatted with mkswap; the partition
+      gets a GPT label and mkswap. Two fstab lines with pri=5 and pri=10 activate both
+      at boot, and swapon -a activates them now.
+    steps:
+      - on: tr-plan-01
+        as: learner
+        run: |
+          set -e
+          sudo mkdir -p /var/swap
+          sudo fallocate -l 1G /var/swap/planning.swap
+          sudo chmod 600 /var/swap/planning.swap
+          sudo mkswap -q /var/swap/planning.swap
+          sudo parted -s /dev/vdc mklabel gpt mkpart swap linux-swap 1MiB 513MiB
+          sudo udevadm settle
+          sudo mkswap -q /dev/vdc1
+          echo "/var/swap/planning.swap none swap defaults,pri=5 0 0" | sudo tee -a /etc/fstab >/dev/null
+          echo "UUID=$(sudo blkid -s UUID -o value /dev/vdc1) none swap defaults,pri=10 0 0" | sudo tee -a /etc/fstab >/dev/null
+          sudo systemctl daemon-reload
+          sudo swapon -a
+          swapon --show

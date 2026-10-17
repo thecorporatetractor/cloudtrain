@@ -1,0 +1,103 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xel-timer-job
+  title: Schedule a job with a systemd timer
+  domain: linux
+  frameworks: [rhcsa-aligned:deploy-maintain]
+  difficulty: medium
+  estimatedMinutes: 8
+  tags: [exam, systemd, timers]
+  version: 1
+spec:
+  description: |
+    **Host:** node 1, `tr-el-01` (`ssh tr-el-01`, then `sudo -i`)
+
+    The command **`/usr/local/bin/tr-{{job}}`** must run **every day at
+    {{hh}}:{{mm}}** (local time). Schedule it with a **systemd timer**:
+
+    - a service unit **`tr-{{job}}.service`** that runs the command;
+    - a timer unit **`tr-{{job}}.timer`** with that calendar time, **enabled** so it
+      survives reboots, and **active** now.
+
+    Do not use cron.
+  objectives:
+    - Write a oneshot service and a calendar timer
+  params:
+    job:
+      type: choice
+      values: [fare-export, crew-sync, depot-backup]
+    hh:
+      type: choice
+      values: ["01", "02", "03", "23"]
+    mm:
+      type: choice
+      values: ["05", "15", "30", "45"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-el-01
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["2Gi", "1Gi", "2Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-el-01
+      run: |
+        set -eu
+        printf '%s\n' '#!/bin/bash' 'echo "$(date -Is) run" >> /var/log/tr-{{job}}.log' > /usr/local/bin/tr-{{job}}
+        chmod 0755 /usr/local/bin/tr-{{job}}
+        rm -f /etc/systemd/system/tr-{{job}}.*; systemctl daemon-reload
+  checks:
+    - id: service
+      description: tr-{{job}}.service runs the command
+      type: shell
+      on: tr-el-01
+      skills: [linux.systemd.timers]
+      weight: 1
+      command: systemctl show -P ExecStart tr-{{job}}.service 2>/dev/null | grep -q 'path=/usr/local/bin/tr-{{job}} ' && echo runs-job || echo no
+      expect: {match: exact, value: runs-job}
+    - id: calendar
+      description: The timer fires daily at the requested time
+      type: shell
+      on: tr-el-01
+      skills: [linux.systemd.timers]
+      weight: 2
+      command: |
+        c=$(systemctl show -P TimersCalendar tr-{{job}}.timer 2>/dev/null)
+        echo "$c" | grep -q 'OnCalendar=\*-\*-\* {{hh}}:{{mm}}:00' && echo daily || echo "calendar=$c"
+      expect: {match: exact, value: daily}
+    - id: enabled
+      description: The timer is enabled and active
+      type: shell
+      on: tr-el-01
+      skills: [linux.systemd.timers]
+      weight: 1
+      command: echo "$(systemctl is-enabled tr-{{job}}.timer 2>/dev/null) $(systemctl is-active tr-{{job}}.timer 2>/dev/null)"
+      expect: {match: exact, value: "enabled active"}
+  misconceptions:
+    - id: not-enabled
+      description: Starts the timer but does not enable it.
+      feedback: "systemctl start lasts until the next boot; systemctl enable --now also hooks it into timers.target."
+      expectFail: [enabled]
+      mutation:
+        on: tr-el-01
+        as: learner
+        run: |
+          printf '[Unit]\nDescription=tr {{job}}\n[Service]\nType=oneshot\nExecStart=/usr/local/bin/tr-{{job}}\n' | sudo tee /etc/systemd/system/tr-{{job}}.service >/dev/null
+          printf '[Unit]\nDescription=tr {{job}} daily\n[Timer]\nOnCalendar=*-*-* {{hh}}:{{mm}}:00\n[Install]\nWantedBy=timers.target\n' | sudo tee /etc/systemd/system/tr-{{job}}.timer >/dev/null
+          sudo systemctl daemon-reload; sudo systemctl start tr-{{job}}.timer
+  solution:
+    explanation: A oneshot service runs the command; the timer's OnCalendar sets the daily time and [Install] WantedBy=timers.target makes enable persistent.
+    steps:
+      - on: tr-el-01
+        as: learner
+        run: |
+          printf '[Unit]\nDescription=Tallowmere {{job}}\n\n[Service]\nType=oneshot\nExecStart=/usr/local/bin/tr-{{job}}\n' | sudo tee /etc/systemd/system/tr-{{job}}.service >/dev/null
+          printf '[Unit]\nDescription=Daily Tallowmere {{job}}\n\n[Timer]\nOnCalendar=*-*-* {{hh}}:{{mm}}:00\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n' | sudo tee /etc/systemd/system/tr-{{job}}.timer >/dev/null
+          sudo systemctl daemon-reload
+          sudo systemctl enable --now tr-{{job}}.timer

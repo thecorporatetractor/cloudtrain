@@ -1,0 +1,191 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: unit-author-delay-feed
+  title: Turn the delay-feed collector into a systemd service
+  domain: linux
+  frameworks: [lfcs:essential-commands, linuxplus:services-users]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [systemd, unit-files, services]
+  version: 1
+spec:
+  description: |
+    The delay-feed collector gathers late-running reports from the signal boxes. Until
+    now somebody started **`/opt/delayfeed/collector`** by hand in a `tmux` session on
+    **`tr-feed-01`** (`ssh tr-feed-01`; you have `sudo`), and it died with every reboot.
+
+    Write a systemd service **`delayfeed.service`** (in `/etc/systemd/system`) so that
+    the collector:
+
+    - runs as the unprivileged user **`delayfeed`**, never as root;
+    - starts only **after the network is online** (and asks for that target);
+    - is **restarted automatically when it fails**, at most **5 seconds** later;
+    - **starts at boot** and is **running now**.
+
+    The collector writes a heartbeat to `/var/lib/delayfeed/heartbeat`; it keeps no
+    other state, so a restart is always safe.
+  objectives:
+    - Write a service unit with User, After/Wants, Restart and RestartSec
+    - Install it into a target and start it
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-feed-01
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536}
+        access: [ssh, console]
+  setup:
+    - on: tr-feed-01
+      run: |
+        set -eu
+        id delayfeed >/dev/null 2>&1 || useradd -r -d /var/lib/delayfeed -s /sbin/nologin delayfeed
+        install -d -o delayfeed -g delayfeed -m 0750 /var/lib/delayfeed
+        install -d -m 0755 /opt/delayfeed
+        printf '%s\n' '#!/bin/bash' '# Tallowmere delay-feed collector' 'echo "collector $$ starting as $(id -un)"' \
+          'while :; do date +%s > /var/lib/delayfeed/heartbeat || exit 1; sleep 2; done' > /opt/delayfeed/collector
+        chmod 0755 /opt/delayfeed/collector
+        restorecon -R /opt/delayfeed 2>/dev/null || true
+        rm -f /etc/systemd/system/delayfeed.service; systemctl daemon-reload
+  checks:
+    - id: running-as-user
+      description: delayfeed.service runs the collector as user delayfeed
+      type: shell
+      on: tr-feed-01
+      skills: [linux.systemd.unit-authoring]
+      weight: 1.5
+      command: |
+        p=$(systemctl show -P MainPID delayfeed.service 2>/dev/null)
+        [ "${p:-0}" != 0 ] && echo "$(ps -o user= -p $p) $(tr '\0' ' ' < /proc/$p/cmdline | grep -c /opt/delayfeed/collector)" || echo "not running"
+      expect: {match: exact, value: "delayfeed 1"}
+    - id: network-online
+      description: The unit is ordered after and wants network-online.target
+      type: shell
+      on: tr-feed-01
+      skills: [linux.systemd.unit-authoring]
+      weight: 1
+      command: |
+        a=$(systemctl show -P After delayfeed.service); w=$(systemctl show -P Wants delayfeed.service; systemctl show -P Requires delayfeed.service)
+        echo " $a " | grep -q ' network-online.target ' && echo " $w " | grep -q 'network-online.target' && echo ordered || echo "after=$a"
+      expect: {match: exact, value: ordered}
+    - id: restart-policy
+      description: The unit restarts on failure within 5 seconds
+      type: shell
+      on: tr-feed-01
+      skills: [linux.systemd.unit-authoring]
+      weight: 1
+      command: |
+        r=$(systemctl show -P Restart delayfeed.service); s=$(systemctl show -P RestartUSec delayfeed.service)
+        us=$(systemd-analyze timespan "$s" 2>/dev/null | awk '/μs:|us:/ {print $2}')
+        case "$r" in on-failure|always|on-abnormal) [ -n "$us" ] && [ "$us" -le 5000000 ] && echo restarts || echo "delay=$s" ;; *) echo "restart=$r" ;; esac
+      expect: {match: exact, value: restarts}
+    - id: survives-kill
+      description: After the collector is killed, systemd brings it back
+      type: shell
+      on: tr-feed-01
+      skills: [linux.systemd.unit-authoring]
+      weight: 1.5
+      timeoutSec: 40
+      command: |
+        p=$(systemctl show -P MainPID delayfeed.service)
+        [ "${p:-0}" != 0 ] || { echo "not running"; exit 0; }
+        kill -9 $p
+        for i in $(seq 15); do sleep 1; n=$(systemctl show -P MainPID delayfeed.service); [ "${n:-0}" != 0 ] && [ "$n" != "$p" ] && { echo restarted; exit 0; }; done
+        echo "stayed down"
+      expect: {match: exact, value: restarted}
+    - id: enabled
+      description: The service starts at boot
+      type: shell
+      on: tr-feed-01
+      skills: [linux.systemd.units]
+      weight: 1
+      command: systemctl is-enabled delayfeed.service 2>/dev/null || true
+      expect: {match: exact, value: enabled}
+  hints:
+    - title: Where unit files go
+      body: "Your own units belong in /etc/systemd/system. After creating or editing one, run `systemctl daemon-reload`."
+      cost: 0
+    - title: The three sections
+      body: "[Unit] holds Description, After= and Wants=; [Service] holds ExecStart=, User=, Restart= and RestartSec=; [Install] holds WantedBy=multi-user.target, which is what `systemctl enable` uses."
+      cost: 1
+    - title: Ordering is not a dependency
+      body: "After=network-online.target only orders the start. Add Wants=network-online.target so the target is actually pulled in."
+      cost: 2
+    - title: Read it back
+      command: systemctl show -p User,After,Wants,Restart,RestartUSec delayfeed.service
+      body: "systemctl show prints the values systemd actually loaded, which catches typos in key names."
+      cost: 1
+  misconceptions:
+    - id: runs-as-root
+      description: Leaves out User=, so the collector runs as root.
+      feedback: "Without User= a system service runs as root. Add User=delayfeed to the [Service] section."
+      expectFail: [running-as-user]
+      mutation:
+        on: tr-feed-01
+        as: learner
+        run: |
+          printf '[Unit]\nDescription=Delay feed\nWants=network-online.target\nAfter=network-online.target\n\n[Service]\nExecStart=/opt/delayfeed/collector\nRestart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n' | sudo tee /etc/systemd/system/delayfeed.service >/dev/null
+          sudo systemctl daemon-reload; sudo systemctl enable --now delayfeed.service
+    - id: no-restart
+      description: Writes the unit without a restart policy.
+      feedback: "The default Restart=no leaves a crashed collector dead. Restart=on-failure with RestartSec=5 brings it back."
+      expectFail: [restart-policy, survives-kill]
+      mutation:
+        on: tr-feed-01
+        as: learner
+        run: |
+          printf '[Unit]\nDescription=Delay feed\nWants=network-online.target\nAfter=network-online.target\n\n[Service]\nUser=delayfeed\nExecStart=/opt/delayfeed/collector\n\n[Install]\nWantedBy=multi-user.target\n' | sudo tee /etc/systemd/system/delayfeed.service >/dev/null
+          sudo systemctl daemon-reload; sudo systemctl enable --now delayfeed.service
+    - id: after-only
+      description: Orders the unit after network-online.target without wanting it.
+      feedback: "After= alone does not pull network-online.target into the boot; add Wants=network-online.target."
+      expectFail: [network-online]
+      mutation:
+        on: tr-feed-01
+        as: learner
+        run: |
+          printf '[Unit]\nDescription=Delay feed\nAfter=network.target\n\n[Service]\nUser=delayfeed\nExecStart=/opt/delayfeed/collector\nRestart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n' | sudo tee /etc/systemd/system/delayfeed.service >/dev/null
+          sudo systemctl daemon-reload; sudo systemctl enable --now delayfeed.service
+  solution:
+    explanation: |
+      A unit in /etc/systemd/system with Wants= and After=network-online.target, a
+      [Service] section that runs the collector as delayfeed with Restart=on-failure and
+      RestartSec=5, and WantedBy=multi-user.target so enable hooks it into the boot.
+    steps:
+      - on: tr-feed-01
+        as: learner
+        run: |
+          sudo tee /etc/systemd/system/delayfeed.service >/dev/null <<'UNIT'
+          [Unit]
+          Description=Tallowmere delay-feed collector
+          Wants=network-online.target
+          After=network-online.target
+
+          [Service]
+          User=delayfeed
+          Group=delayfeed
+          ExecStart=/opt/delayfeed/collector
+          Restart=on-failure
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+          UNIT
+          sudo systemctl daemon-reload
+          sudo systemctl enable --now delayfeed.service
+    alternatives:
+      - id: restart-always
+        description: Restart=always with a shorter delay is also acceptable.
+        steps:
+          - on: tr-feed-01
+            as: learner
+            run: |
+              printf '[Unit]\nDescription=Delay feed\nRequires=network-online.target\nAfter=network-online.target\n[Service]\nUser=delayfeed\nExecStart=/opt/delayfeed/collector\nRestart=always\nRestartSec=2s\n[Install]\nWantedBy=multi-user.target\n' | sudo tee /etc/systemd/system/delayfeed.service >/dev/null
+              sudo systemctl daemon-reload
+              sudo systemctl enable delayfeed.service
+              sudo systemctl start delayfeed.service

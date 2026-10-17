@@ -1,0 +1,211 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: sshd-keys-only
+  title: Restrict the jump host to key logins for the ops group
+  domain: linux
+  frameworks: [lfcs:networking, rhcsa-aligned:security, linuxplus:security]
+  difficulty: medium
+  estimatedMinutes: 12
+  tags: [sshd, sshd_config, hardening, sudo]
+  version: 1
+spec:
+  description: |
+    `tr-jump-1` is the jump host every Tallowmere Rail admin goes through, and its SSH
+    server still takes passwords from anyone. Harden it. You have full sudo rights here;
+    sshd listens on `localhost` port 22 (there is no systemd on this host:
+    `sudo service ssh reload|restart|status` manages it).
+
+    The SSH server must:
+
+    1. accept **only public-key authentication** (no passwords, no keyboard-interactive);
+    2. let in **only members of group `ops`**;
+    3. refuse **root** logins completely, with or without a key.
+
+    Members of `ops`: you (`learner`) and `{{opsUser}}`. Your own key login
+    (`ssh localhost`) must keep working, so test before you log out of anything.
+    `tamsin` (a contractor, not in ops) and `{{opsUser}}` still have the password
+    `{{password}}` for you to test with.
+
+    Watch out: this host was built from a cloud image, so `/etc/ssh/sshd_config` is not
+    the only file sshd reads.
+  objectives:
+    - Disable password authentication and root login in sshd
+    - Restrict logins to a group with AllowGroups
+    - Find the effective sshd configuration with sshd -T, including drop-ins
+    - Validate and reload sshd without losing access
+  params:
+    opsUser:
+      type: choice
+      values: [mira, ewan, sofia]
+    password:
+      type: choice
+      values: [Junction-Box-12, Points-Heater-58]
+  topology:
+    entry: tr-jump-1
+    nodes:
+      - name: tr-jump-1
+        driver: container
+        image: deb-lab:24.04
+        access: [shell]
+        learnerSudo: true
+  setup:
+    - on: tr-jump-1
+      run: |
+        set -eu
+        echo 'learner ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/learner && chmod 0440 /etc/sudoers.d/learner
+        getent group ops >/dev/null || groupadd ops
+        usermod -aG ops learner
+        for u in {{opsUser}} tamsin; do id $u >/dev/null 2>&1 || useradd -m -s /bin/bash $u; echo "$u:{{password}}" | chpasswd; done
+        usermod -aG ops {{opsUser}}
+        # Grader keys (root-only) for the test logins.
+        mkdir -p /var/lib/cloudtrain && chmod 0700 /var/lib/cloudtrain
+        k=/var/lib/cloudtrain/probe; [ -f $k ] || ssh-keygen -q -t ed25519 -N '' -C probe -f $k
+        for u in {{opsUser}} tamsin root; do
+          h=$(getent passwd $u | cut -d: -f6); install -d -m 0700 -o $u -g $u $h/.ssh
+          cp $k.pub $h/.ssh/authorized_keys; chown $u:$u $h/.ssh/authorized_keys; chmod 0600 $h/.ssh/authorized_keys
+        done
+        cat /home/learner/.ssh/id_ed25519.pub >> /home/learner/.ssh/authorized_keys
+        chown learner:learner /home/learner/.ssh/authorized_keys; chmod 0600 /home/learner/.ssh/authorized_keys
+        # The distribution config plus the drop-ins a cloud image leaves behind.
+        ssh-keygen -A >/dev/null
+        mkdir -p /run/sshd /etc/ssh/sshd_config.d
+        printf '# Tallowmere Rail: listen on the loopback only on lab hosts\nListenAddress 127.0.0.1\n' > /etc/ssh/sshd_config.d/10-listen.conf
+        printf 'PasswordAuthentication yes\n' > /etc/ssh/sshd_config.d/50-cloud-init.conf
+        sed -i 's/^#\?PermitRootLogin.*/#PermitRootLogin prohibit-password/; s/^#\?PasswordAuthentication.*/#PasswordAuthentication yes/' /etc/ssh/sshd_config
+        service ssh stop >/dev/null 2>&1 || true
+        service ssh start >/dev/null
+        touch /home/learner/.ssh/known_hosts
+        echo "localhost,127.0.0.1,tr-jump-1 $(cut -d' ' -f1,2 /etc/ssh/ssh_host_ed25519_key.pub)" >> /home/learner/.ssh/known_hosts
+        chown learner:learner /home/learner/.ssh/known_hosts
+  checks:
+    - id: effective-config
+      description: "The effective sshd configuration (sshd -T) has no password or keyboard-interactive logins, no root login and AllowGroups ops"
+      type: shell
+      on: tr-jump-1
+      skills: [linux.services.sshd]
+      command: |
+        t=$(sshd -T 2>/dev/null) || { echo "config error"; exit 0; }
+        printf '%s\n' "$t" | awk '
+          $1 == "passwordauthentication" {p = $2} $1 == "kbdinteractiveauthentication" {k = $2}
+          $1 == "permitrootlogin" {r = $2} $1 == "pubkeyauthentication" {u = $2}
+          $1 == "allowgroups" {for (i = 2; i <= NF; i++) g = g " " $i}
+          END {print "password=" p, "kbd=" k, "root=" r, "pubkey=" u, "groups=" g}'
+      expect: {match: exact, value: "password=no kbd=no root=no pubkey=yes groups= ops"}
+    - id: no-passwords
+      description: The running SSH server refuses password logins, even for ops members
+      type: shell
+      on: tr-jump-1
+      skills: [linux.services.sshd]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        cd /tmp; a=/var/lib/cloudtrain/askpass; printf '#!/bin/sh\necho {{password}}\n' > $a; chmod 0700 $a
+        SSH_ASKPASS=$a SSH_ASKPASS_REQUIRE=force DISPLAY=none setsid -w ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+          -o PubkeyAuthentication=no -o ConnectTimeout=5 -o NumberOfPasswordPrompts=1 {{opsUser}}@127.0.0.1 true </dev/null >/dev/null 2>&1 && echo accepted || echo refused
+      expect: {match: exact, value: refused}
+    - id: no-root
+      description: The running SSH server refuses root, even with an authorized key
+      type: shell
+      on: tr-jump-1
+      skills: [linux.services.sshd]
+      timeoutSec: 30
+      command: cd /tmp && ssh -i /var/lib/cloudtrain/probe -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 root@127.0.0.1 true </dev/null >/dev/null 2>&1 && echo accepted || echo refused
+      expect: {match: exact, value: refused}
+    - id: ops-only
+      description: Accounts outside ops are refused even with a valid key
+      type: shell
+      on: tr-jump-1
+      skills: [linux.services.sshd]
+      timeoutSec: 30
+      command: cd /tmp && ssh -i /var/lib/cloudtrain/probe -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 tamsin@127.0.0.1 true </dev/null >/dev/null 2>&1 && echo accepted || echo refused
+      expect: {match: exact, value: refused}
+    - id: ops-keys-work
+      description: Members of ops (the learner and {{opsUser}}) still log in with their keys
+      type: shell
+      on: tr-jump-1
+      skills: [linux.services.sshd]
+      weight: 2
+      timeoutSec: 40
+      command: |
+        cd /tmp; r=""
+        a=$(ssh -i /var/lib/cloudtrain/probe -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 {{opsUser}}@127.0.0.1 id -un </dev/null 2>/dev/null)
+        b=$(runuser -u learner -- sh -c 'cd && ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 localhost id -un' </dev/null 2>/dev/null)
+        echo "$a $b"
+      expect: {match: exact, value: "{{opsUser}} learner"}
+  hints:
+    - title: What sshd really uses
+      command: sudo sshd -T | grep -Ei 'passwordauth|kbdinteractive|permitroot|allowgroups'
+      body: "`sshd -T` prints the effective settings after reading every file. For each keyword the FIRST value sshd reads wins, and /etc/ssh/sshd_config includes /etc/ssh/sshd_config.d/*.conf at its top."
+      cost: 1
+    - title: The cloud-init drop-in
+      body: "Look in /etc/ssh/sshd_config.d/: a cloud image's 50-cloud-init.conf re-enables passwords. Change it, or put your settings in a drop-in that sorts before it (e.g. 01-hardening.conf)."
+      cost: 1
+    - title: Test, then reload
+      body: "`sudo sshd -t` checks the syntax. `sudo service ssh reload` makes the running server re-read its configuration; existing sessions stay open."
+      cost: 2
+  misconceptions:
+    - id: main-file-only
+      description: Edits only /etc/ssh/sshd_config, so the cloud-init drop-in still enables passwords.
+      feedback: "Drop-ins in sshd_config.d are read first and the first value wins. Check with `sshd -T`."
+      expectFail: [effective-config, no-passwords]
+      mutation:
+        on: tr-jump-1
+        as: learner
+        run: |
+          printf 'PasswordAuthentication no\nKbdInteractiveAuthentication no\nPermitRootLogin no\nAllowGroups ops\n' | sudo tee -a /etc/ssh/sshd_config >/dev/null
+          sudo sshd -t && sudo service ssh reload
+    - id: allow-users
+      description: Allows only the learner's own account instead of the ops group.
+      feedback: "AllowUsers learner locks out the other ops members. Use AllowGroups ops."
+      expectFail: [effective-config, ops-keys-work]
+      mutation:
+        on: tr-jump-1
+        as: learner
+        run: |
+          printf 'PasswordAuthentication no\nKbdInteractiveAuthentication no\nPermitRootLogin no\nAllowUsers learner\n' | sudo tee /etc/ssh/sshd_config.d/01-hardening.conf >/dev/null
+          sudo sshd -t && sudo service ssh reload
+    - id: prohibit-password
+      description: Leaves root at prohibit-password, which still allows root key logins.
+      feedback: "prohibit-password blocks root passwords but not root keys. The task says no root logins at all: PermitRootLogin no (AllowGroups alone is one setting away from letting root back in)."
+      expectFail: [effective-config]
+      mutation:
+        on: tr-jump-1
+        as: learner
+        run: |
+          printf 'PasswordAuthentication no\nKbdInteractiveAuthentication no\nPermitRootLogin prohibit-password\nAllowGroups ops\n' | sudo tee /etc/ssh/sshd_config.d/01-hardening.conf >/dev/null
+          sudo sshd -t && sudo service ssh reload
+    - id: no-reload
+      description: Writes the right configuration but never reloads sshd.
+      feedback: "The running server keeps its old settings until it is reloaded or restarted."
+      expectFail: [no-passwords, no-root, ops-only]
+      mutation:
+        on: tr-jump-1
+        as: learner
+        run: printf 'PasswordAuthentication no\nKbdInteractiveAuthentication no\nPermitRootLogin no\nAllowGroups ops\n' | sudo tee /etc/ssh/sshd_config.d/01-hardening.conf >/dev/null
+  solution:
+    explanation: |
+      A hardening drop-in that sorts before 50-cloud-init.conf sets the four keywords
+      (first value wins), sshd -t validates it and a reload applies it to the running
+      server without dropping sessions.
+    steps:
+      - on: tr-jump-1
+        as: learner
+        run: |
+          printf 'PasswordAuthentication no\nKbdInteractiveAuthentication no\nPubkeyAuthentication yes\nPermitRootLogin no\nAllowGroups ops\n' | sudo tee /etc/ssh/sshd_config.d/01-hardening.conf >/dev/null
+          sudo sshd -t
+          sudo service ssh reload
+          sleep 1
+          ssh -o BatchMode=yes localhost true
+    alternatives:
+      - id: fix-cloud-init-file-restart
+        description: Fixes the cloud-init drop-in itself, adds the rest to the main file and restarts.
+        steps:
+          - on: tr-jump-1
+            as: learner
+            run: |
+              echo 'PasswordAuthentication no' | sudo tee /etc/ssh/sshd_config.d/50-cloud-init.conf >/dev/null
+              sudo sed -i 's/^#PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config
+              printf 'AllowGroups ops\n' | sudo tee -a /etc/ssh/sshd_config >/dev/null
+              sudo sshd -t && sudo service ssh restart
+              sleep 1

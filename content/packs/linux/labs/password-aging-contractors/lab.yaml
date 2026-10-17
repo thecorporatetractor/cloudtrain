@@ -1,0 +1,191 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: password-aging-contractors
+  title: Apply password aging to contractor accounts
+  domain: linux
+  frameworks: [rhcsa-aligned:users-groups, lpic1:security, linuxplus:security]
+  difficulty: easy
+  estimatedMinutes: 10
+  tags: [users, chage, login.defs, shadow, passwd, sudo]
+  version: 1
+spec:
+  description: |
+    Tallowmere Rail's audit found that agency contractors on `tr-hr-01` never have to
+    change their passwords. Every contractor account is a member of the group
+    **`agency`**. With `sudo`:
+
+    1. Every **current** contractor in `agency` must change their password at least
+       every **45 days** and be warned **7 days** before it expires.
+    2. **`{{departed}}`** left the agency last Friday: **lock** the account (do not
+       delete it; HR keeps the home directory for 90 days).
+    3. Accounts created from now on must default to a maximum password age of
+       **60 days**.
+
+    Permanent staff accounts (not in `agency`) keep their current settings.
+  objectives:
+    - Set password maximum age and warning period per user
+    - Lock an account without deleting it
+    - Change the defaults for new accounts in /etc/login.defs
+  params:
+    departed:
+      type: choice
+      values: [kofi, lena, milo, nadia]
+  topology:
+    entry: tr-hr-01
+    nodes:
+      - name: tr-hr-01
+        driver: container
+        image: el-lab:10
+        learnerSudo: true
+        access: [shell]
+  setup:
+    - on: tr-hr-01
+      run: |
+        set -eu
+        echo 'learner ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/learner
+        chmod 0440 /etc/sudoers.d/learner
+        getent group agency >/dev/null || groupadd agency
+        for u in kofi lena milo nadia; do
+          id $u >/dev/null 2>&1 || useradd -m -G agency $u
+        done
+        for u in petra quinn; do id $u >/dev/null 2>&1 || useradd -m $u; done
+        for u in kofi lena milo nadia petra quinn; do
+          echo "$u:$(head -c 12 /dev/urandom | base64)" | chpasswd
+          chage -M 99999 -W 14 -d "$(date -u -d '-20 days' +%F)" $u
+        done
+        chage -M 120 -W 10 quinn
+        sed -i 's/^PASS_MAX_DAYS.*/PASS_MAX_DAYS\t99999/' /etc/login.defs
+  checks:
+    - id: max-45
+      description: Every current contractor has a maximum password age of 45 days
+      type: shell
+      on: tr-hr-01
+      skills: [linux.users.password-aging]
+      weight: 1.5
+      command: |
+        n=0; t=0
+        for u in kofi lena milo nadia; do
+          [ $u = {{departed}} ] && continue
+          t=$((t+1)); [ "$(getent shadow $u | cut -d: -f5)" = 45 ] && n=$((n+1))
+        done
+        echo "$n/$t"
+      expect: {match: exact, value: "3/3"}
+    - id: warn-7
+      description: Every current contractor is warned 7 days before expiry
+      type: shell
+      on: tr-hr-01
+      skills: [linux.users.password-aging]
+      weight: 1
+      command: |
+        n=0; t=0
+        for u in kofi lena milo nadia; do
+          [ $u = {{departed}} ] && continue
+          t=$((t+1)); [ "$(getent shadow $u | cut -d: -f6)" = 7 ] && n=$((n+1))
+        done
+        echo "$n/$t"
+      expect: {match: exact, value: "3/3"}
+    - id: departed-locked
+      description: The departed contractor's account is locked but still exists with its home
+      type: shell
+      on: tr-hr-01
+      skills: [linux.users.password-aging]
+      weight: 1.5
+      command: |
+        u={{departed}}
+        getent passwd $u >/dev/null && [ -d /home/$u ] || { echo deleted; exit 0; }
+        p=$(getent shadow $u | cut -d: -f2); e=$(getent shadow $u | cut -d: -f8)
+        case "$p" in '!'*|'*'*) echo locked ;; *) [ -n "$e" ] && [ "$e" -le $(( $(date +%s) / 86400 )) ] && echo locked || echo open ;; esac
+      expect: {match: exact, value: locked}
+    - id: new-default-60
+      description: New accounts default to a 60-day maximum password age
+      type: shell
+      on: tr-hr-01
+      skills: [linux.users.password-aging]
+      weight: 1
+      command: awk '$1 == "PASS_MAX_DAYS" {v = $2} END {print v}' /etc/login.defs
+      expect: {match: exact, value: "60"}
+    - id: staff-untouched
+      description: Staff accounts petra and quinn keep their settings
+      type: shell
+      on: tr-hr-01
+      skills: [linux.users.password-aging]
+      weight: 0.5
+      command: |
+        echo "$(getent shadow petra | cut -d: -f5,6) $(getent shadow quinn | cut -d: -f5,6)"
+      expect: {match: exact, value: "99999:14 120:10"}
+  hints:
+    - title: Who is a contractor?
+      command: getent group agency
+      body: The fourth field lists the members. `sudo chage -l USER` shows a user's current aging.
+      cost: 0
+    - title: Aging per user
+      body: "`sudo chage -M 45 -W 7 USER` sets the maximum age and the warning period."
+      cost: 1
+    - title: Locking
+      body: "`sudo usermod -L USER` (or `passwd -l`) puts a `!` in front of the password hash; the account and home stay. `userdel` would remove the account."
+      cost: 1
+    - title: Defaults for new accounts
+      body: "useradd reads `PASS_MAX_DAYS` from `/etc/login.defs`. It only affects accounts created later."
+      cost: 1
+  misconceptions:
+    - id: deletes-departed
+      description: Deletes the departed contractor's account instead of locking it.
+      feedback: "HR needs the account and home for 90 days. Lock it with usermod -L (or passwd -l) instead of userdel."
+      expectFail: [departed-locked]
+      mutation:
+        on: tr-hr-01
+        as: learner
+        run: |
+          for u in kofi lena milo nadia; do [ $u = {{departed}} ] || sudo chage -M 45 -W 7 $u; done
+          sudo userdel -r {{departed}}
+          sudo sed -i 's/^PASS_MAX_DAYS.*/PASS_MAX_DAYS\t60/' /etc/login.defs
+    - id: only-login-defs
+      description: Changes only /etc/login.defs and expects existing accounts to follow.
+      feedback: "login.defs is read when an account is created; existing accounts keep the values in /etc/shadow. Use chage on each contractor."
+      expectFail: [max-45, warn-7]
+      mutation:
+        on: tr-hr-01
+        as: learner
+        run: |
+          sudo usermod -L {{departed}}
+          sudo sed -i 's/^PASS_MAX_DAYS.*/PASS_MAX_DAYS\t45/; s/^PASS_WARN_AGE.*/PASS_WARN_AGE\t7/' /etc/login.defs
+    - id: everyone-aged
+      description: Applies the contractor policy to every account.
+      feedback: "Only members of agency were in scope; staff accounts keep their own policy."
+      expectFail: [staff-untouched]
+      mutation:
+        on: tr-hr-01
+        as: learner
+        run: |
+          for u in kofi lena milo nadia petra quinn; do sudo chage -M 45 -W 7 $u; done
+          sudo usermod -L {{departed}}
+          sudo sed -i 's/^PASS_MAX_DAYS.*/PASS_MAX_DAYS\t60/' /etc/login.defs
+  solution:
+    explanation: chage each current agency member, lock the departed account with usermod -L, set PASS_MAX_DAYS 60 in /etc/login.defs.
+    steps:
+      - on: tr-hr-01
+        as: learner
+        run: |
+          set -e
+          for u in $(getent group agency | cut -d: -f4 | tr , ' '); do
+            [ "$u" = {{departed}} ] && continue
+            sudo chage -M 45 -W 7 "$u"
+          done
+          sudo usermod -L {{departed}}
+          sudo sed -i 's/^PASS_MAX_DAYS.*/PASS_MAX_DAYS\t60/' /etc/login.defs
+    alternatives:
+      - id: passwd-and-expire
+        description: passwd -x/-w per user, passwd -l to lock
+        steps:
+          - on: tr-hr-01
+            as: learner
+            run: |
+              set -e
+              for u in kofi lena milo nadia; do
+                [ "$u" = {{departed}} ] && continue
+                sudo passwd -x 45 -w 7 "$u"
+              done
+              sudo passwd -l {{departed}}
+              sudo sed -i '/^PASS_MAX_DAYS/d' /etc/login.defs
+              echo 'PASS_MAX_DAYS 60' | sudo tee -a /etc/login.defs >/dev/null
