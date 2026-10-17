@@ -1,0 +1,229 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xnt-render-config-from-yaml
+  title: Render a router configuration from YAML
+  domain: networking
+  frameworks: [ccna:automation-programmability]
+  difficulty: medium
+  estimatedMinutes: 10
+  tags: [exam, jinja2, yaml, config-generation, frr]
+  version: 1
+spec:
+  description: |
+    **Devices:** `mv-automation-11` (shell; Python 3 with Jinja2), `mv-annex-11` (FRR console)
+
+    In `/root/annex/` on `mv-automation-11`:
+
+    - `annex.yaml` describes the annex router: `hostname`, a list of
+      `interfaces` (each with `name`, `description`, `address`) and a
+      `default_gateway`;
+    - `annex.j2` is an unfinished Jinja2 template; it already renders the
+      hostname and the default route;
+    - `render TEMPLATE DATA` prints a template rendered with a YAML file
+      (`trim_blocks` and `lstrip_blocks` are on).
+
+    1. Complete `annex.j2` so that, for **every** entry of `interfaces`, in list
+       order, it renders this block between the hostname line and the default
+       route (the template must not hard-code any value from `annex.yaml`; it
+       is also graded against other data):
+
+           interface NAME
+            description DESCRIPTION
+            ip address ADDRESS
+           exit
+
+    2. Save the rendering of `annex.yaml` as `/root/annex/annex.frr`.
+    3. Apply that configuration to `mv-annex-11` (paste it into its console in
+       configuration mode) so the annex LANs are reachable from `mv-core-11`.
+  objectives:
+    - Generate a device configuration from structured data with a Jinja2 loop and apply it
+  params:
+    octet: { type: int, min: 20, max: 90 }
+    lan: { type: int, min: 100, max: 149 }
+    lan2: { type: int, min: 150, max: 199 }
+  topology:
+    entry: workstation
+    nodes:
+      - { name: workstation, driver: container, image: jumphost:1, access: [shell] }
+      - { name: mv-automation-11, driver: container, image: netsvc:1, resources: { cpu: 0.2, memoryMiB: 96 }, access: [shell] }
+      - { name: mv-annex-11, driver: netdev, image: frr:10, access: [console] }
+      - { name: mv-core-11, driver: netdev, image: frr:10 }
+    links:
+      - { a: "mv-core-11:eth1", b: "mv-annex-11:eth1", subnet: "10.{{octet}}.6.0/30" }
+  setup:
+    - on: mv-automation-11
+      run: |
+        mkdir -p /root/annex
+        cat > /usr/local/bin/render <<'PY'
+        #!/usr/bin/env python3
+        """render TEMPLATE DATA: print TEMPLATE rendered with the YAML file DATA."""
+        import sys, yaml, jinja2
+        if len(sys.argv) != 3:
+            sys.exit("usage: render TEMPLATE DATA")
+        env = jinja2.Environment(loader=jinja2.FileSystemLoader("/"), trim_blocks=True, lstrip_blocks=True,
+                                 undefined=jinja2.StrictUndefined, keep_trailing_newline=True)
+        import os
+        print(env.get_template(os.path.abspath(sys.argv[1])).render(**yaml.safe_load(open(sys.argv[2]))), end="")
+        PY
+        chmod 755 /usr/local/bin/render
+        cat > /root/annex/annex.yaml <<'YML'
+        hostname: mv-annex-11
+        interfaces:
+          - name: eth1
+            description: uplink to mv-core-11
+            address: 10.{{octet}}.6.2/30
+          - name: lan1
+            description: annex staff
+            address: 10.{{octet}}.{{lan}}.1/24
+          - name: lan2
+            description: annex workshops
+            address: 10.{{octet}}.{{lan2}}.1/24
+        default_gateway: 10.{{octet}}.6.1
+        YML
+        printf '%s\n' 'hostname @{ hostname }@' '{# TODO: one interface block per entry of interfaces #}' 'ip route 0.0.0.0/0 @{ default_gateway }@' \
+          | sed -e 's/@{/{''{/g' -e 's/}@/}''}/g' > /root/annex/annex.j2
+    - on: mv-annex-11
+      run: for i in lan1 lan2; do ip link add $i type dummy 2>/dev/null; ip link set $i up; done
+    - on: mv-core-11
+      run: ip link add lan1 type dummy 2>/dev/null; ip link set lan1 up
+    - on: mv-core-11
+      config: |
+        interface eth1
+         ip address 10.{{octet}}.6.1/30
+        interface lan1
+         ip address 10.{{octet}}.250.1/24
+        ip route 10.{{octet}}.{{lan}}.0/24 10.{{octet}}.6.2
+        ip route 10.{{octet}}.{{lan2}}.0/24 10.{{octet}}.6.2
+  checks:
+    - id: template-renders-data
+      description: annex.j2 renders annex.yaml into the expected configuration
+      type: shell
+      on: mv-automation-11
+      command: |
+        [ -f /root/annex/annex.j2 ] || { echo missing; exit 0; }
+        python3 - /root/annex/annex.yaml <<'PY'
+        import sys, subprocess, yaml
+        d = yaml.safe_load(open(sys.argv[1]))
+        want = ["hostname " + d["hostname"]]
+        for i in d["interfaces"]:
+            want += ["interface " + i["name"], "description " + i["description"], "ip address " + i["address"], "exit"]
+        want.append("ip route 0.0.0.0/0 " + d["default_gateway"])
+        r = subprocess.run(["render", "/root/annex/annex.j2", sys.argv[1]], capture_output=True, text=True)
+        got = [l.strip() for l in r.stdout.splitlines() if l.strip() and not l.strip().startswith("!")]
+        print("match" if r.returncode == 0 and got == want else "differs")
+        PY
+      expect: { match: exact, value: match }
+      skills: [net.automation.config-templates]
+      weight: 2
+    - id: template-generic
+      description: annex.j2 also renders different data correctly (nothing hard-coded)
+      type: shell
+      on: mv-automation-11
+      command: |
+        mkdir -p /var/lib/cloudtrain
+        cat > /var/lib/cloudtrain/other.yaml <<'YML'
+        hostname: mv-test-router
+        interfaces:
+          - name: eth7
+            description: test uplink
+            address: 192.0.2.1/31
+          - name: lan9
+            description: test lan
+            address: 172.16.9.1/24
+          - name: lan10
+            description: second test lan
+            address: 172.16.10.1/24
+          - name: lan11
+            description: third test lan
+            address: 172.16.11.1/24
+        default_gateway: 192.0.2.0
+        YML
+        [ -f /root/annex/annex.j2 ] || { echo missing; exit 0; }
+        python3 - /var/lib/cloudtrain/other.yaml <<'PY'
+        import sys, subprocess, yaml
+        d = yaml.safe_load(open(sys.argv[1]))
+        want = ["hostname " + d["hostname"]]
+        for i in d["interfaces"]:
+            want += ["interface " + i["name"], "description " + i["description"], "ip address " + i["address"], "exit"]
+        want.append("ip route 0.0.0.0/0 " + d["default_gateway"])
+        r = subprocess.run(["render", "/root/annex/annex.j2", sys.argv[1]], capture_output=True, text=True)
+        got = [l.strip() for l in r.stdout.splitlines() if l.strip() and not l.strip().startswith("!")]
+        print("match" if r.returncode == 0 and got == want else "differs")
+        PY
+      expect: { match: exact, value: match }
+      skills: [net.automation.config-templates]
+      weight: 2
+    - id: rendered-file
+      description: /root/annex/annex.frr holds the rendering of annex.yaml
+      type: shell
+      on: mv-automation-11
+      command: |
+        [ -f /root/annex/annex.frr ] || { echo missing; exit 0; }
+        render /root/annex/annex.j2 /root/annex/annex.yaml | grep -v '^[[:space:]]*$' > /tmp/.want 2>/dev/null
+        grep -v '^[[:space:]]*$' /root/annex/annex.frr | cmp -s - /tmp/.want && echo same || echo differs; rm -f /tmp/.want
+      expect: { match: exact, value: same }
+      skills: [net.automation.config-templates]
+    - id: annex-applied
+      description: mv-annex-11 runs the rendered addresses and default route
+      type: shell
+      on: mv-annex-11
+      command: |
+        a=$(for i in eth1 lan1 lan2; do vtysh -c "show running-config" | sed -n "/^interface $i\$/,/^exit/s/^ ip address //p"; done | tr '\n' ' ')
+        g=$(vtysh -c 'show running-config' | grep -c '^ip route 0.0.0.0/0 10.{{octet}}.6.1$')
+        echo "$a$g"
+      expect: { match: exact, value: "10.{{octet}}.6.2/30 10.{{octet}}.{{lan}}.1/24 10.{{octet}}.{{lan2}}.1/24 1" }
+      skills: [net.automation.config-templates]
+      weight: 2
+    - id: annex-reachable
+      description: mv-core-11 reaches both annex LANs
+      type: shell
+      on: mv-core-11
+      command: |
+        r=ok; for a in 10.{{octet}}.{{lan}}.1 10.{{octet}}.{{lan2}}.1; do ping -c1 -W2 -I 10.{{octet}}.250.1 $a >/dev/null 2>&1 || r=fail; done; echo $r
+      expect: { match: exact, value: ok }
+      skills: [net.automation.config-templates]
+  misconceptions:
+    - id: hard-coded
+      description: Writes the three interface blocks literally into the template
+      mutation:
+        on: mv-automation-11
+        run: |
+          cd /root/annex
+          python3 - <<'PY'
+          import yaml
+          d = yaml.safe_load(open("annex.yaml"))
+          body = "".join("interface %s\n description %s\n ip address %s\nexit\n" % (i["name"], i["description"], i["address"]) for i in d["interfaces"])
+          t = open("annex.j2").read().splitlines(True)
+          open("annex.j2", "w").write(t[0] + body + t[2])
+          PY
+          render annex.j2 annex.yaml > annex.frr
+      expectFail: [template-generic, annex-applied]
+  solution:
+    explanation: |
+      Replace the TODO comment with a loop over `interfaces` that prints the
+      four lines per entry, render `annex.yaml` into `annex.frr`, then paste
+      `annex.frr` into `configure terminal` on the annex console.
+    steps:
+      - on: mv-automation-11
+        run: |
+          cd /root/annex
+          printf '%s\n' 'hostname @{ hostname }@' '{% for i in interfaces %}' 'interface @{ i.name }@' ' description @{ i.description }@' ' ip address @{ i.address }@' 'exit' '{% endfor %}' 'ip route 0.0.0.0/0 @{ default_gateway }@' \
+            | sed -e 's/@{/{''{/g' -e 's/}@/}''}/g' > annex.j2
+          render annex.j2 annex.yaml > annex.frr
+      - on: mv-annex-11
+        config: |
+          hostname mv-annex-11
+          interface eth1
+           description uplink to mv-core-11
+           ip address 10.{{octet}}.6.2/30
+          exit
+          interface lan1
+           description annex staff
+           ip address 10.{{octet}}.{{lan}}.1/24
+          exit
+          interface lan2
+           description annex workshops
+           ip address 10.{{octet}}.{{lan2}}.1/24
+          exit
+          ip route 0.0.0.0/0 10.{{octet}}.6.1
