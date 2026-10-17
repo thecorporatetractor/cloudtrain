@@ -52,15 +52,11 @@ report, inter-VLAN, link-local, SLAAC, capture, WireGuard, SNMPv3, JSON-RPC).
 
 ## Platform problems found (not fixed)
 
-- **`labctl verify` cannot run solution/mutation steps on netdev (FRR) nodes.**
-  `cmd/labctl/verify.go` builds its exec runtime with `drivers.NewRuntime`, whose
-  netdev driver is the clabernetes stub; the manager replaces it
-  (`reg.Replace(drivers.NewNetdev(rt.Container))` in `cmd/manager/main.go`), labctl
-  does not. Every step on an FRR node fails with `driver netdev (clabernetes): exec
-  not implemented`. Fix: the same `Replace` after `NewRuntime` in `newVerifier`
-  (and in the exam runner's auto-solve path). This round verified with a labctl
-  built locally with that one line (scratchpad binary, not committed); setup,
-  grading and teardown ran through the real manager as usual.
+- **Fixed:** `labctl verify` and the exam auto-solve couldn't run solution/mutation
+  steps on netdev (FRR) nodes (`driver netdev (clabernetes): exec not implemented`).
+  `drivers.NewRuntime` now registers the real netdev driver, which is the same
+  one-line change round 3 verified with in a scratchpad labctl, so the manager, labctl
+  and the exam runner all share it.
 - P1/P2 (L2 on links), P3, P4 and link rate limiting are fixed in main (#24, #35).
   The labs keep their own `tbf` caps on switch ports (harmless). Drafts still
   carry P4 workarounds: `net-ipv6-dual-stack-office` uses dhcpcd for SLAAC and

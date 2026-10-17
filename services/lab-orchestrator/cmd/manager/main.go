@@ -198,7 +198,6 @@ func main() {
 		linkNet.OVN = ovn
 	}
 	rt.Container.Network = linkNet
-	reg.Replace(drivers.NewNetdev(rt.Container))
 
 	poolMetrics := controller.NewPoolMetrics()
 	poolMetrics.Register()
