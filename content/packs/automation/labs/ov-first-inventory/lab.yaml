@@ -1,0 +1,295 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ov-first-inventory
+  title: Describe the claims fleet in an inventory
+  domain: automation
+  frameworks: [ex294-aligned:config-inventory, ex294-aligned:core-components]
+  difficulty: easy
+  estimatedMinutes: 15
+  tags: [ansible, inventory, yaml, groups, ping]
+  version: 1
+spec:
+  description: |
+    Orrin & Vale Insurance is moving the claims platform from hand-run SSH sessions to
+    Ansible. You are on the control node **`ov-ctl`**; Ansible is installed
+    (`ansible --version`). These managed nodes are reachable by name over SSH:
+
+    | Host | Role |
+    |---|---|
+    | `ov-claims-web1`, `ov-claims-web2` | claims portal web nodes |
+    | `ov-db-1` | policy database |
+    | `ov-quote-api1` | quoting API |
+
+    Every node has the automation account **`ovauto`**, which already accepts your SSH
+    key (`~/.ssh/id_ed25519`). Your own account on the nodes, `learner`, does not.
+
+    Write the inventory **`/home/learner/claims-automation/inventory.yml`** in **YAML**
+    format, so that `ansible-inventory -i inventory.yml --graph` shows exactly this tree
+    (`ungrouped` may appear empty):
+
+    ```
+    @all:
+      |--@claims:
+      |  |--@claims_web:
+      |  |  |--ov-claims-web1
+      |  |  |--ov-claims-web2
+      |  |--@claims_db:
+      |  |  |--ov-db-1
+      |--@quoting:
+      |  |--ov-quote-api1
+    ```
+
+    `claims` holds no hosts of its own, only the two child groups. Then make every host
+    answer Ansible's `ping` module through this inventory, **with no `-u` on the command
+    line**: the inventory itself must say that Ansible connects as `ovauto`.
+  objectives:
+    - Write a static inventory in YAML with child groups
+    - Read the group tree with ansible-inventory
+    - Set connection variables for all hosts in the inventory
+    - Check reachability with the ping module
+  params:
+    bootpw:
+      type: int
+      min: 100000
+      max: 999999
+  topology:
+    entry: ov-ctl
+    nodes:
+      - { name: ov-ctl, driver: container, image: ansible-ctl:2.21, access: [shell] }
+      - { name: ov-claims-web1, driver: container, image: el-lab:10, resources: { cpu: 0.2, memoryMiB: 256 } }
+      - { name: ov-claims-web2, driver: container, image: el-lab:10, resources: { cpu: 0.2, memoryMiB: 256 } }
+      - { name: ov-db-1, driver: container, image: el-lab:10, resources: { cpu: 0.2, memoryMiB: 256 } }
+      - { name: ov-quote-api1, driver: container, image: deb-lab:24.04, resources: { cpu: 0.2, memoryMiB: 256 } }
+    links:
+      - { a: "ov-ctl:eth1", b: "ov-claims-web1:eth1" }
+      - { a: "ov-ctl:eth2", b: "ov-claims-web2:eth1" }
+      - { a: "ov-ctl:eth3", b: "ov-db-1:eth1" }
+      - { a: "ov-ctl:eth4", b: "ov-quote-api1:eth1" }
+  setup:
+    - on: ov-claims-web1
+      run: &ov-node |
+        set -eu
+        case $(hostname) in
+          ov-claims-web1) a=11 ;; ov-claims-web2) a=12 ;; ov-db-1) a=21 ;; ov-quote-api1) a=31 ;;
+          *) echo "unknown host $(hostname)" >&2; exit 1 ;;
+        esac
+        ip link set eth1 up
+        ip addr replace 10.70.0.$a/24 dev eth1
+        id ovauto >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Orrin and Vale automation" ovauto
+        echo 'ovauto:Ov-boot-{{bootpw}}' | chpasswd
+        printf 'ovauto ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/ovauto
+        chmod 0440 /etc/sudoers.d/ovauto
+        ssh-keygen -A >/dev/null 2>&1
+        mkdir -p /run/sshd
+        pgrep -x sshd >/dev/null || /usr/sbin/sshd
+    - { on: ov-claims-web2, run: *ov-node }
+    - { on: ov-db-1, run: *ov-node }
+    - { on: ov-quote-api1, run: *ov-node }
+    - on: ov-ctl
+      timeoutSec: 240
+      run: &ov-ctl |
+        set -eu
+        ct-fleet-net 10.70.0.10/24 ov-claims-web1=10.70.0.11 ov-claims-web2=10.70.0.12 ov-db-1=10.70.0.21 ov-quote-api1=10.70.0.31
+        ct-ansible pushkey --seal ovauto Ov-boot-{{bootpw}} ov-claims-web1 ov-claims-web2 ov-db-1 ov-quote-api1
+        install -d -o learner -g learner /home/learner/claims-automation
+  checks:
+    - id: yaml-inventory
+      description: inventory.yml is a YAML inventory that ansible-inventory can read
+      type: shell
+      on: ov-ctl
+      skills: [automation.inventory.static]
+      timeoutSec: 60
+      command: |
+        cd /home/learner/claims-automation 2>/dev/null && [ -f inventory.yml ] || { echo missing; exit 0; }
+        ct-ansible run . env ANSIBLE_INVENTORY_ENABLED=ansible.builtin.yaml ANSIBLE_INVENTORY_UNPARSED_FAILED=1 \
+          ansible-inventory -i inventory.yml --list >/dev/null 2>&1 && echo yaml || echo not-yaml
+      expect: { match: exact, value: yaml }
+    - id: group-tree
+      description: The groups and their members match the agreed tree
+      type: shell
+      on: ov-ctl
+      skills: [automation.inventory.static]
+      weight: 2
+      timeoutSec: 60
+      command: |
+        cd /home/learner/claims-automation 2>/dev/null && [ -f inventory.yml ] || { echo missing; exit 0; }
+        ct-ansible run . ansible-inventory -i inventory.yml --list 2>/dev/null | jq -r '
+          def h(g): ((.[g].hosts // []) | sort | join(","));
+          def c(g): ((.[g].children // []) | sort | join(","));
+          "claims=[" + h("claims") + "|" + c("claims") + "] web=[" + h("claims_web") + "] db=[" + h("claims_db") + "] quoting=[" + h("quoting") + "]"' 2>/dev/null || echo unreadable
+      expect: { match: exact, value: "claims=[|claims_db,claims_web] web=[ov-claims-web1,ov-claims-web2] db=[ov-db-1] quoting=[ov-quote-api1]" }
+    - id: connect-as-ovauto
+      description: The inventory makes Ansible connect to every host as ovauto
+      type: shell
+      on: ov-ctl
+      skills: [automation.inventory.static]
+      timeoutSec: 60
+      command: |
+        cd /home/learner/claims-automation 2>/dev/null && [ -f inventory.yml ] || { echo missing; exit 0; }
+        r=""
+        for h in ov-claims-web1 ov-claims-web2 ov-db-1 ov-quote-api1; do
+          u=$(ct-ansible run . ansible-inventory -i inventory.yml --host "$h" 2>/dev/null | jq -r '.ansible_user // .ansible_ssh_user // "unset"' 2>/dev/null)
+          r="$r ${u:-unset}"
+        done
+        echo $r
+      expect: { match: exact, value: "ovauto ovauto ovauto ovauto" }
+    - id: all-ping
+      description: Every host answers the ping module through the inventory
+      type: shell
+      on: ov-ctl
+      skills: [automation.foundations.adhoc]
+      weight: 2
+      timeoutSec: 120
+      command: |
+        cd /home/learner/claims-automation 2>/dev/null && [ -f inventory.yml ] || { echo missing; exit 0; }
+        n=$(ct-ansible run . ansible -i inventory.yml all -m ansible.builtin.ping -o 2>/dev/null | grep -c ' | SUCCESS ')
+        echo "pong=$n"
+      expect: { match: exact, value: "pong=4" }
+  hints:
+    - title: The shape of a YAML inventory
+      body: |
+        A YAML inventory starts at `all:`. Every group can have `hosts:` (a mapping of host
+        names, each with an empty value or its own variables), `vars:` and `children:`
+        (a mapping of child group names, each a group definition in turn).
+      cost: 1
+    - title: Check the tree before you ping
+      body: "`ansible-inventory --graph` prints the tree, `--list` the same data with every host's variables, and `--host <name>` one host's variables."
+      command: cd ~/claims-automation && ansible-inventory -i inventory.yml --graph
+      cost: 1
+    - title: Connection variables for every host
+      body: |
+        Variables under `all: vars:` apply to every host. `ansible_user` is the account
+        Ansible logs in as; without it ssh uses your own user name, and the nodes refuse
+        your key for `learner`.
+      cost: 2
+  misconceptions:
+    - id: ini-format
+      description: Writes the right tree in INI format under the .yml name.
+      feedback: The file must be YAML. INI sections like [claims:children] parse with the ini plugin, not the yaml one.
+      expectFail: [yaml-inventory]
+      mutation:
+        on: ov-ctl
+        as: learner
+        run: |
+          cd ~/claims-automation
+          printf '%s\n' '[claims_web]' 'ov-claims-web1' 'ov-claims-web2' '[claims_db]' 'ov-db-1' '[quoting]' 'ov-quote-api1' \
+            '[claims:children]' 'claims_web' 'claims_db' '[all:vars]' 'ansible_user=ovauto' > inventory.yml
+    - id: flat-groups
+      description: Lists the claims hosts directly under claims instead of nesting the two groups.
+      feedback: claims must contain the groups claims_web and claims_db as children, not hosts of its own.
+      expectFail: [group-tree]
+      mutation:
+        on: ov-ctl
+        as: learner
+        run: |
+          cd ~/claims-automation
+          cat > inventory.yml <<'EOF'
+          all:
+            vars:
+              ansible_user: ovauto
+            children:
+              claims:
+                hosts:
+                  ov-claims-web1:
+                  ov-claims-web2:
+                  ov-db-1:
+              claims_web:
+                hosts:
+                  ov-claims-web1:
+                  ov-claims-web2:
+              claims_db:
+                hosts:
+                  ov-db-1:
+              quoting:
+                hosts:
+                  ov-quote-api1:
+          EOF
+    - id: no-user
+      description: Gets the tree right but never says which account Ansible connects as.
+      feedback: Ansible then logs in as learner, which the nodes refuse. Set ansible_user for all hosts in the inventory.
+      expectFail: [connect-as-ovauto, all-ping]
+      mutation:
+        on: ov-ctl
+        as: learner
+        run: |
+          cd ~/claims-automation
+          cat > inventory.yml <<'EOF'
+          all:
+            children:
+              claims:
+                children:
+                  claims_web:
+                    hosts:
+                      ov-claims-web1:
+                      ov-claims-web2:
+                  claims_db:
+                    hosts:
+                      ov-db-1:
+              quoting:
+                hosts:
+                  ov-quote-api1:
+          EOF
+  solution:
+    explanation: |
+      `claims` gets `children:` with the two groups and no `hosts:`; `quoting` is a
+      second top-level group. `ansible_user: ovauto` under `all: vars:` applies to every
+      host, so `ansible -i inventory.yml all -m ping` logs in as ovauto everywhere.
+    steps:
+      - on: ov-ctl
+        as: learner
+        timeoutSec: 120
+        run: |
+          set -e
+          cd ~/claims-automation
+          cat > inventory.yml <<'EOF'
+          all:
+            vars:
+              ansible_user: ovauto
+            children:
+              claims:
+                children:
+                  claims_web:
+                    hosts:
+                      ov-claims-web1:
+                      ov-claims-web2:
+                  claims_db:
+                    hosts:
+                      ov-db-1:
+              quoting:
+                hosts:
+                  ov-quote-api1:
+          EOF
+          ansible-inventory -i inventory.yml --graph
+          ansible -i inventory.yml all -m ansible.builtin.ping
+    alternatives:
+      - id: per-group-vars
+        description: ansible_user set on each top-level group instead of all, groups defined at the top level and nested by reference.
+        steps:
+          - on: ov-ctl
+            as: learner
+            timeoutSec: 120
+            run: |
+              set -e
+              cd ~/claims-automation
+              cat > inventory.yml <<'EOF'
+              claims_web:
+                hosts:
+                  ov-claims-web1:
+                  ov-claims-web2:
+              claims_db:
+                hosts:
+                  ov-db-1:
+              claims:
+                vars:
+                  ansible_user: ovauto
+                children:
+                  claims_web:
+                  claims_db:
+              quoting:
+                vars:
+                  ansible_user: ovauto
+                hosts:
+                  ov-quote-api1:
+              EOF
+              ansible -i inventory.yml all -m ansible.builtin.ping

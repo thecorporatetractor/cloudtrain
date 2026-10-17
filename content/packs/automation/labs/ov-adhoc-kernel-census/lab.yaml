@@ -1,0 +1,214 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ov-adhoc-kernel-census
+  title: Take a kernel census of the fleet with ad-hoc commands
+  domain: automation
+  frameworks: [ex294-aligned:core-components, linuxplus:automation-scripting]
+  difficulty: easy
+  estimatedMinutes: 10
+  tags: [ansible, ad-hoc, facts, setup-module, reporting]
+  version: 1
+spec:
+  description: |
+    Audit wants a census of the claims fleet by 9am: which kernel and which operating
+    system release every host runs. There is no time for a playbook; use **ad-hoc**
+    commands from the project `/home/learner/claims-automation` on `ov-ctl` (its
+    `ansible.cfg` and inventory are ready: `ansible all -m ansible.builtin.ping` works).
+
+    Write **`/home/learner/audit/kernels.txt`** with one line per host of the inventory,
+    sorted by host name, no header, in the form
+
+    ```
+    <inventory host name>,<kernel release>,<distribution>,<distribution version>
+    ```
+
+    using the values Ansible's facts report for each host (`ansible_kernel`,
+    `ansible_distribution`, `ansible_distribution_version`), for example
+    `ov-db-1,6.1.0-27-amd64,AlmaLinux,10.2`. Change nothing on the hosts.
+  objectives:
+    - Run modules ad hoc against groups of hosts
+    - Gather selected facts with the setup module
+    - Turn ad-hoc output into a report with shell tools
+  params:
+    bootpw:
+      type: int
+      min: 100000
+      max: 999999
+  topology:
+    entry: ov-ctl
+    nodes:
+      - { name: ov-ctl, driver: container, image: ansible-ctl:2.21, access: [shell] }
+      - { name: ov-claims-web1, driver: container, image: el-lab:10, resources: { cpu: 0.2, memoryMiB: 256 } }
+      - { name: ov-claims-web2, driver: container, image: el-lab:10, resources: { cpu: 0.2, memoryMiB: 256 } }
+      - { name: ov-db-1, driver: container, image: el-lab:10, resources: { cpu: 0.2, memoryMiB: 256 } }
+      - { name: ov-quote-api1, driver: container, image: deb-lab:24.04, resources: { cpu: 0.2, memoryMiB: 256 } }
+    links:
+      - { a: "ov-ctl:eth1", b: "ov-claims-web1:eth1" }
+      - { a: "ov-ctl:eth2", b: "ov-claims-web2:eth1" }
+      - { a: "ov-ctl:eth3", b: "ov-db-1:eth1" }
+      - { a: "ov-ctl:eth4", b: "ov-quote-api1:eth1" }
+  setup:
+    - on: ov-claims-web1
+      run: &ov-node |
+        set -eu
+        case $(hostname) in
+          ov-claims-web1) a=11 ;; ov-claims-web2) a=12 ;; ov-db-1) a=21 ;; ov-quote-api1) a=31 ;;
+          *) echo "unknown host $(hostname)" >&2; exit 1 ;;
+        esac
+        ip link set eth1 up
+        ip addr replace 10.70.0.$a/24 dev eth1
+        id ovauto >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Orrin and Vale automation" ovauto
+        echo 'ovauto:Ov-boot-{{bootpw}}' | chpasswd
+        printf 'ovauto ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/ovauto
+        chmod 0440 /etc/sudoers.d/ovauto
+        ssh-keygen -A >/dev/null 2>&1
+        mkdir -p /run/sshd
+        pgrep -x sshd >/dev/null || /usr/sbin/sshd
+    - { on: ov-claims-web2, run: *ov-node }
+    - { on: ov-db-1, run: *ov-node }
+    - { on: ov-quote-api1, run: *ov-node }
+    - on: ov-ctl
+      timeoutSec: 240
+      run: |
+        set -eu
+        ct-fleet-net 10.70.0.10/24 ov-claims-web1=10.70.0.11 ov-claims-web2=10.70.0.12 ov-db-1=10.70.0.21 ov-quote-api1=10.70.0.31
+        ct-ansible pushkey --seal ovauto Ov-boot-{{bootpw}} ov-claims-web1 ov-claims-web2 ov-db-1 ov-quote-api1
+        p=/home/learner/claims-automation
+        install -d -o learner -g learner $p /home/learner/audit
+        cat > $p/inventory.yml <<'EOF'
+        claims:
+          children:
+            claims_web:
+              hosts:
+                ov-claims-web1:
+                ov-claims-web2:
+            claims_db:
+              hosts:
+                ov-db-1:
+        quoting:
+          hosts:
+            ov-quote-api1:
+        EOF
+        printf '[defaults]\ninventory = inventory.yml\nremote_user = ovauto\n' > $p/ansible.cfg
+        chown learner:learner $p/inventory.yml $p/ansible.cfg
+        cp $p/inventory.yml /var/tmp/.ct-fleet.yml && chmod 0644 /var/tmp/.ct-fleet.yml
+        for h in ov-claims-web1 ov-claims-web2 ov-db-1 ov-quote-api1; do ssh-keygen -F $h -f /etc/ssh/ssh_known_hosts >/dev/null; done
+  checks:
+    - id: census-file
+      description: kernels.txt has one line per host, sorted, in the required format
+      type: shell
+      on: ov-ctl
+      skills: [automation.foundations.adhoc, linux.shell.text-processing]
+      timeoutSec: 30
+      command: |
+        f=/home/learner/audit/kernels.txt
+        [ -f "$f" ] || { echo missing; exit 0; }
+        cut -d, -f1 "$f" | tr '\n' ' ' | sed 's/ $//'
+        grep -vcE '^[^,]+,[^,]+,[^,]+,[^,]+$' "$f" | sed 's/^/ bad-lines=/'
+      expect: { match: exact, value: "ov-claims-web1 ov-claims-web2 ov-db-1 ov-quote-api1 bad-lines=0" }
+    - id: census-values
+      description: Every line carries the kernel and OS release that host's facts report
+      type: shell
+      on: ov-ctl
+      skills: [automation.data.facts, automation.foundations.adhoc]
+      weight: 2
+      timeoutSec: 120
+      command: |
+        f=/home/learner/audit/kernels.txt
+        [ -f "$f" ] || { echo missing; exit 0; }
+        want=$(ct-ansible run / env ANSIBLE_LOAD_CALLBACK_PLUGINS=1 ANSIBLE_STDOUT_CALLBACK=ansible.posix.json \
+          ansible -i /var/tmp/.ct-fleet.yml all -u ovauto -m ansible.builtin.setup \
+          -a 'filter=ansible_kernel,ansible_distribution,ansible_distribution_version' 2>/dev/null \
+          | jq -r '.plays[0].tasks[0].hosts | to_entries[] | [.key, .value.ansible_facts.ansible_kernel, .value.ansible_facts.ansible_distribution, .value.ansible_facts.ansible_distribution_version] | join(",")' | sort)
+        [ -n "$want" ] || { echo grader-could-not-gather; exit 0; }
+        [ "$(cat "$f")" = "$want" ] && echo match || echo differs
+      expect: { match: exact, value: match }
+  hints:
+    - title: Facts on demand
+      body: "The setup module gathers facts; its `filter` argument keeps only the ones you name, so the output stays short."
+      command: cd ~/claims-automation && ansible all -m ansible.builtin.setup -a 'filter=ansible_kernel'
+      cost: 1
+    - title: One line per host
+      body: |
+        `-o` (one line) squeezes each host's result onto a single line, which `sed`, `awk`
+        or `cut` can take apart. Another route: `ansible -m ansible.builtin.debug -a
+        'msg=...'` with a Jinja expression that builds the whole line, then `sort`.
+      cost: 2
+  misconceptions:
+    - id: header-line
+      description: Adds a header line to the report.
+      feedback: The format has no header; Audit's import treats every line as a host.
+      expectFail: [census-file, census-values]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 120
+        run: |
+          set -e
+          cd ~/claims-automation
+          ansible all -m ansible.builtin.setup -a 'filter=ansible_kernel,ansible_distribution,ansible_distribution_version' -o \
+            | sed -E 's/^([^ ]+) \| SUCCESS => (.*)$/\1\t\2/' \
+            | while IFS="$(printf '\t')" read -r h j; do
+                printf '%s,%s\n' "$h" "$(echo "$j" | jq -r '.ansible_facts | [.ansible_kernel, .ansible_distribution, .ansible_distribution_version] | join(",")')"
+              done | sort > /tmp/.census
+          { echo host,kernel,distribution,version; cat /tmp/.census; } > ~/audit/kernels.txt
+    - id: control-node-only
+      description: Writes the control node's own uname and os-release values for every host.
+      feedback: The values must come from each host. The control node runs Ubuntu; the claims nodes run AlmaLinux.
+      expectFail: [census-values]
+      mutation:
+        on: ov-ctl
+        as: learner
+        run: |
+          . /etc/os-release
+          for h in ov-claims-web1 ov-claims-web2 ov-db-1 ov-quote-api1; do echo "$h,$(uname -r),$NAME,$VERSION_ID"; done > ~/audit/kernels.txt
+    - id: unsorted
+      description: Leaves the lines in the order Ansible printed them.
+      feedback: Ansible prints hosts in the order they finish, which changes from run to run. Sort the lines by host name.
+      expectFail: [census-file, census-values]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 120
+        run: |
+          set -e
+          cd ~/claims-automation
+          ansible all -m ansible.builtin.setup -a 'filter=ansible_kernel,ansible_distribution,ansible_distribution_version' -o \
+            | sed -E 's/^([^ ]+) \| SUCCESS => (.*)$/\1\t\2/' \
+            | while IFS="$(printf '\t')" read -r h j; do
+                printf '%s,%s\n' "$h" "$(echo "$j" | jq -r '.ansible_facts | [.ansible_kernel, .ansible_distribution, .ansible_distribution_version] | join(",")')"
+              done | sort -r > ~/audit/kernels.txt
+  solution:
+    explanation: |
+      `ansible all -m ansible.builtin.setup -a 'filter=...' -o` prints one line per host:
+      the host name, `| SUCCESS =>` and the facts as JSON. Split the line, extract the
+      three facts with jq and sort the result by host name.
+    steps:
+      - on: ov-ctl
+        as: learner
+        timeoutSec: 120
+        run: |
+          set -e
+          cd ~/claims-automation
+          ansible all -m ansible.builtin.setup -a 'filter=ansible_kernel,ansible_distribution,ansible_distribution_version' -o \
+            | sed -E 's/^([^ ]+) \| SUCCESS => (.*)$/\1\t\2/' \
+            | while IFS="$(printf '\t')" read -r h j; do
+                printf '%s,%s\n' "$h" "$(echo "$j" | jq -r '.ansible_facts | [.ansible_kernel, .ansible_distribution, .ansible_distribution_version] | join(",")')"
+              done | sort > ~/audit/kernels.txt
+          cat ~/audit/kernels.txt
+    alternatives:
+      - id: fact-cache
+        description: Gathers facts into a JSON fact cache once, then a debug ad-hoc command prints each line from the cache.
+        steps:
+          - on: ov-ctl
+            as: learner
+            timeoutSec: 180
+            run: |
+              set -e
+              cd ~/claims-automation
+              export ANSIBLE_CACHE_PLUGIN=ansible.builtin.jsonfile ANSIBLE_CACHE_PLUGIN_CONNECTION=/tmp/ov-facts
+              ansible all -m ansible.builtin.setup >/dev/null
+              ansible all -m ansible.builtin.debug -a 'msg="CENSUS {{ inventory_hostname }},{{ ansible_kernel }},{{ ansible_distribution }},{{ ansible_distribution_version }}"' \
+                | grep -oE 'CENSUS [^"]+' | cut -d' ' -f2 | sort > ~/audit/kernels.txt
+              cat ~/audit/kernels.txt

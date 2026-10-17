@@ -1,0 +1,214 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xan-core-loop-groups-users
+  title: Create users from a list with per-group rules
+  domain: automation
+  frameworks: [ex294-aligned:core-components]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [exam, ansible, loops, users, groups]
+  version: 1
+spec:
+  description: |
+    **Exam environment.** You work as `learner` on the control node `control`. The
+    managed nodes are `node1` (group `dev`), `node2` (`test`), `node3` (`prod`, also in
+    `webservers`) and `node4` (`balancers`), all Enterprise Linux 10; the account
+    `devops` on every node accepts your SSH key and may use sudo without a password.
+    Packages come from each node's local repository. Every playbook you write is run
+    again by the grader (it must report no changes), then every node is rebooted before
+    the final checks.
+
+    `/home/learner/exam/users/user_list.yml` lists accounts with `username`, `uid` and
+    `job`. Write **`/home/learner/exam/users/users.yml`** that:
+
+    - on the **dev** hosts creates every user whose job is **developer**, with the UID from
+      the file and the supplementary group **`devops`**;
+    - on the **prod** hosts creates every user whose job is **manager**, with the UID from
+      the file and the supplementary group **`opsmgr`** (create the group if needed).
+
+    No other host gets any of these users. Run the playbook.
+  objectives:
+    - Loop over a data file and filter by an attribute
+    - Create users and groups on different host groups
+  params:
+    base:
+      type: int
+      min: 61
+      max: 79
+    d1:
+      type: choice
+      values: [alana, bertil, corin]
+    d2:
+      type: choice
+      values: [dagny, eskil, farah]
+    m1:
+      type: choice
+      values: [gideon, halla, ivor]
+    m2:
+      type: choice
+      values: [jessa, kalle, linnea]
+  topology:
+    entry: control
+    nodes:
+      - { name: control, driver: container, image: ansible-ctl:2.21, access: [shell] }
+      - { name: node1, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node2, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node3, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node4, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+  setup:
+    - on: node1
+      timeoutSec: 120
+      run: &exam-node |
+        set -eu
+        id devops >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Exam automation" devops
+        install -d -m 0700 -o devops -g devops /home/devops/.ssh
+        install -m 0600 -o devops -g devops /home/learner/.ssh/authorized_keys /home/devops/.ssh/authorized_keys
+        printf 'devops ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/devops
+        chmod 0440 /etc/sudoers.d/devops
+    - { on: node2, timeoutSec: 120, run: *exam-node }
+    - { on: node3, timeoutSec: 120, run: *exam-node }
+    - { on: node4, timeoutSec: 120, run: *exam-node }
+    - on: control
+      run: |
+        set -eu
+        p=/home/learner/exam/users
+        install -d -o learner -g learner /home/learner/exam $p
+        cat > $p/inventory.yml <<'EOF'
+        dev:
+          hosts:
+            node1:
+        test:
+          hosts:
+            node2:
+        prod:
+          hosts:
+            node3:
+        balancers:
+          hosts:
+            node4:
+        webservers:
+          children:
+            prod:
+        EOF
+        printf '[defaults]\ninventory = inventory.yml\nremote_user = devops\n' > $p/ansible.cfg
+        cat > $p/user_list.yml <<'EOF'
+        users:
+          - username: {{d1}}
+            uid: {{base}}31
+            job: developer
+          - username: {{m1}}
+            uid: {{base}}32
+            job: manager
+          - username: {{d2}}
+            uid: {{base}}33
+            job: developer
+          - username: {{m2}}
+            uid: {{base}}34
+            job: manager
+        EOF
+        chown -R learner:learner $p
+  checks:
+    - id: developers-dev
+      description: On node1 the developers exist with their UIDs and the devops group, the managers do not
+      type: shell
+      on: node1
+      skills: [automation.control-flow.loops, automation.modules.users]
+      weight: 2
+      command: |
+        r=""
+        for u in {{d1}}:{{base}}31 {{d2}}:{{base}}33; do n=${u%:*}; [ "$(id -u $n 2>/dev/null)" = "${u#*:}" ] && id -nG $n | tr ' ' '\n' | grep -qx devops || r="$r $n"; done
+        for n in {{m1}} {{m2}}; do id $n >/dev/null 2>&1 && r="$r $n:present"; done
+        echo "${r:-ok}"
+      expect: { match: exact, value: ok }
+    - id: managers-prod
+      description: On node3 the managers exist with their UIDs and the opsmgr group, the developers do not
+      type: shell
+      on: node3
+      skills: [automation.control-flow.loops, automation.modules.users]
+      weight: 2
+      command: |
+        r=""
+        for u in {{m1}}:{{base}}32 {{m2}}:{{base}}34; do n=${u%:*}; [ "$(id -u $n 2>/dev/null)" = "${u#*:}" ] && id -nG $n | tr ' ' '\n' | grep -qx opsmgr || r="$r $n"; done
+        for n in {{d1}} {{d2}}; do id $n >/dev/null 2>&1 && r="$r $n:present"; done
+        echo "${r:-ok}"
+      expect: { match: exact, value: ok }
+    - id: others-clean
+      description: node2 and node4 have none of the users
+      type: shell
+      on: node2
+      skills: [automation.control-flow.conditionals]
+      command: &none |
+        n=0; for u in {{d1}} {{d2}} {{m1}} {{m2}}; do id $u >/dev/null 2>&1 && n=$((n+1)); done; echo "users=$n"
+      expect: { match: exact, value: users=0 }
+    - { id: others-clean-node4, description: node4 has none of the users, type: shell, on: node4, skills: [automation.control-flow.conditionals], command: *none, expect: { match: exact, value: users=0 } }
+  exam:
+    rerun:
+      - on: control
+        timeoutSec: 600
+        run: |
+          r=$(ct-ansible recap /home/learner/exam/users users.yml)
+          echo "$r"
+          [ "$r" = "changed=0 failed=0 unreachable=0" ]
+  misconceptions:
+    - id: everyone-everywhere
+      description: Creates every user on both groups without filtering by job.
+      feedback: Developers belong on dev only and managers on prod only.
+      expectFail: [developers-dev, managers-prod]
+      mutation:
+        on: control
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/exam/users
+          cat > users.yml <<'EOF'
+          - hosts: dev:prod
+            become: true
+            vars_files: [user_list.yml]
+            tasks:
+              - ansible.builtin.group: { name: opsmgr }
+              - ansible.builtin.user: { name: "{{ item.username }}", uid: "{{ item.uid }}", groups: devops, append: true }
+                loop: "{{ users }}"
+          EOF
+          ansible-playbook users.yml
+  solution:
+    explanation: Two plays load user_list.yml; each loops over the users with a when on item.job and sets uid and supplementary groups.
+    steps:
+      - on: control
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/exam/users
+          cat > users.yml <<'EOF'
+          - name: Developers
+            hosts: dev
+            become: true
+            vars_files: [user_list.yml]
+            tasks:
+              - name: Developer accounts
+                ansible.builtin.user:
+                  name: "{{ item.username }}"
+                  uid: "{{ item.uid }}"
+                  groups: devops
+                  append: true
+                loop: "{{ users }}"
+                when: item.job == 'developer'
+          - name: Managers
+            hosts: prod
+            become: true
+            vars_files: [user_list.yml]
+            tasks:
+              - name: opsmgr group
+                ansible.builtin.group:
+                  name: opsmgr
+              - name: Manager accounts
+                ansible.builtin.user:
+                  name: "{{ item.username }}"
+                  uid: "{{ item.uid }}"
+                  groups: opsmgr
+                  append: true
+                loop: "{{ users | selectattr('job', 'equalto', 'manager') }}"
+          EOF
+          ansible-playbook users.yml

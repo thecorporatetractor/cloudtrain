@@ -1,0 +1,149 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xan-git-push-project
+  title: Commit and push the exam project
+  domain: automation
+  frameworks: [ex294-aligned:git-devworkflow]
+  difficulty: easy
+  estimatedMinutes: 8
+  tags: [exam, ansible, git]
+  version: 1
+spec:
+  description: |
+    **Exam environment.** You work as `learner` on the control node `control`. The
+    managed nodes are `node1` (group `dev`), `node2` (`test`), `node3` (`prod`, also in
+    `webservers`) and `node4` (`balancers`), all Enterprise Linux 10; the account
+    `devops` on every node accepts your SSH key and may use sudo without a password.
+    Packages come from each node's local repository. Every playbook you write is run
+    again by the grader (it must report no changes), then every node is rebooted before
+    the final checks.
+
+    The exam repository is **`/home/learner/git/exam.git`** (a bare repository on the
+    control node). Your playbooks are in `/home/learner/exam/git/work/`: `web.yml` and
+    `users.yml`, next to an `artifacts/` directory and a vault password file
+    `vault-pass.txt`, neither of which may ever be committed.
+
+    Clone the repository to **`/home/learner/exam/git/exam-repo`**, add both playbooks
+    under **`playbooks/`**, add a **`.gitignore`** that excludes `artifacts/` and the file
+    `vault-pass.txt` wherever they appear, commit, and push to a new branch **`exam`**.
+  objectives:
+    - Clone, commit and push to a new branch
+    - Keep generated files and secrets out of a repository with .gitignore
+  topology:
+    entry: control
+    nodes:
+      - { name: control, driver: container, image: ansible-ctl:2.21, access: [shell] }
+      - { name: node1, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node2, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node3, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node4, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+  setup:
+    - on: node1
+      timeoutSec: 120
+      run: &exam-node |
+        set -eu
+        id devops >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Exam automation" devops
+        install -d -m 0700 -o devops -g devops /home/devops/.ssh
+        install -m 0600 -o devops -g devops /home/learner/.ssh/authorized_keys /home/devops/.ssh/authorized_keys
+        printf 'devops ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/devops
+        chmod 0440 /etc/sudoers.d/devops
+    - { on: node2, timeoutSec: 120, run: *exam-node }
+    - { on: node3, timeoutSec: 120, run: *exam-node }
+    - { on: node4, timeoutSec: 120, run: *exam-node }
+    - on: control
+      run: |
+        set -eu
+        export HOME=/root
+        install -d -o learner -g learner /home/learner/git /home/learner/exam /home/learner/exam/git /home/learner/exam/git/work /home/learner/exam/git/work/artifacts
+        [ -d /home/learner/git/exam.git ] || {
+          git init -q --bare -b main /home/learner/git/exam.git
+          t=$(mktemp -d); git -C $t init -q -b main
+          printf '# Exam automation\n' > $t/README.md
+          git -C $t add README.md
+          git -C $t -c user.name=examiner -c user.email=examiner@orrinvale.example commit -q -m "Initial commit"
+          git -C $t push -q /home/learner/git/exam.git main; rm -rf $t; }
+        w=/home/learner/exam/git/work
+        printf -- '- hosts: webservers\n  become: true\n  tasks:\n    - ansible.builtin.dnf: { name: httpd, state: present }\n' > $w/web.yml
+        printf -- '- hosts: dev\n  become: true\n  tasks:\n    - ansible.builtin.user: { name: exam{{tag}} }\n' > $w/users.yml
+        printf '{"plays": []}\n' > $w/artifacts/site-artifact.json
+        printf 'Vault-{{tag}}\n' > $w/vault-pass.txt
+        chown -R learner:learner /home/learner/git /home/learner/exam/git
+  params:
+    tag:
+      type: int
+      min: 1000
+      max: 9999
+  checks:
+    - id: branch-pushed
+      description: Branch exam exists in the exam repository with both playbooks under playbooks/
+      type: shell
+      on: control
+      skills: [automation.devworkflow.git]
+      weight: 2
+      command: |
+        g="git --git-dir=/home/learner/git/exam.git"
+        $g rev-parse -q --verify refs/heads/exam >/dev/null || { echo no-branch; exit 0; }
+        r=""
+        for f in web.yml users.yml; do
+          [ "$($g show exam:playbooks/$f 2>/dev/null)" = "$(cat /home/learner/exam/git/work/$f)" ] || r="$r $f"
+        done
+        echo "${r:-both}"
+      expect: { match: exact, value: both }
+    - id: nothing-secret
+      description: No artifacts or vault password file is committed on branch exam
+      type: shell
+      on: control
+      skills: [automation.devworkflow.git]
+      command: |
+        g="git --git-dir=/home/learner/git/exam.git"
+        $g rev-parse -q --verify refs/heads/exam >/dev/null || { echo no-branch; exit 0; }
+        n=$($g ls-tree -r --name-only exam | grep -cE '(^|/)artifacts/|(^|/)vault-pass\.txt$')
+        echo "secret-files=$n"
+      expect: { match: exact, value: secret-files=0 }
+    - id: gitignore
+      description: The committed .gitignore excludes artifacts/ and vault-pass.txt in any directory
+      type: shell
+      on: control
+      skills: [automation.devworkflow.git]
+      command: |
+        g="git --git-dir=/home/learner/git/exam.git"
+        t=$(mktemp -d); git -C $t init -q
+        $g show exam:.gitignore > $t/.gitignore 2>/dev/null || { echo no-gitignore; rm -rf $t; exit 0; }
+        r=""
+        for p in artifacts/run.json playbooks/artifacts/x.json vault-pass.txt playbooks/vault-pass.txt; do
+          git -C $t check-ignore -q --no-index "$p" || r="$r $p"
+        done
+        git -C $t check-ignore -q --no-index playbooks/web.yml && r="$r playbooks-ignored"
+        rm -rf $t; echo "${r:-ignores}"
+      expect: { match: exact, value: ignores }
+  misconceptions:
+    - id: committed-everything
+      description: Copies the whole work directory into the repository and commits it.
+      feedback: The artifacts and the vault password file are now in the history; ignore them before committing.
+      expectFail: [nothing-secret, gitignore]
+      mutation:
+        on: control
+        as: learner
+        run: |
+          set -e
+          cd ~/exam/git && rm -rf exam-repo && git clone -q ~/git/exam.git exam-repo && cd exam-repo
+          git config user.name learner && git config user.email learner@orrinvale.example
+          git switch -q -c exam && mkdir -p playbooks && cp -r ../work/. playbooks/
+          git add -A && git commit -q -m "Add playbooks" && git push -q origin exam
+  solution:
+    explanation: Clone, create branch exam, copy the two playbooks, write .gitignore with artifacts/ and vault-pass.txt, commit and push with upstream.
+    steps:
+      - on: control
+        as: learner
+        timeoutSec: 120
+        run: |
+          set -e
+          cd ~/exam/git && git clone -q ~/git/exam.git exam-repo && cd exam-repo
+          git config user.name learner && git config user.email learner@orrinvale.example
+          git switch -q -c exam
+          mkdir -p playbooks && cp ../work/web.yml ../work/users.yml playbooks/
+          printf 'artifacts/\nvault-pass.txt\n' > .gitignore
+          git add .gitignore playbooks
+          git commit -q -m "Add exam playbooks"
+          git push -q -u origin exam
