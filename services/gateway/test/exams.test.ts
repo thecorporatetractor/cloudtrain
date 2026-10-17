@@ -51,9 +51,11 @@ describe('exam catalog', () => {
     expect(cka?.availability).toBe('available'); // every pool has authored exam tasks
     expect(cka?.def.envTier).toBe('K');
     const net = cat.exams.get('sim-net-associate');
-    expect(net?.availability).toBe('coming-soon');
-    expect(net?.availabilityNote).toMatch(/still being authored/);
+    expect(net?.availability).toBe('available'); // every pool covers its draw
     expect(net?.def.envTier).toBe('N'); // YAML 1.2
+    const pro = cat.exams.get('sim-linux-pro');
+    expect(pro?.availability).toBe('coming-soon');
+    expect(pro?.availabilityNote).toMatch(/still being authored/);
     expect(cat.objectiveNames.get('ckad:deployment')).toBeTruthy();
     expect(cat.issues).toEqual([]);
   });
@@ -117,7 +119,7 @@ describe('exam service', () => {
     // A second start while one runs is refused.
     await expect(svc.start(alice, EXAM)).rejects.toThrow(/in progress/);
     // Coming-soon exams cannot start.
-    await expect(svc.start(alice, 'sim-net-associate')).rejects.toThrow(/still being authored/);
+    await expect(svc.start(alice, 'sim-linux-pro')).rejects.toThrow(/still being authored/);
   });
 
   it('serves the running attempt without checks, hints or solutions; flags; submit', async () => {
