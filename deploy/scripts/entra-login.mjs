@@ -33,6 +33,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_ENV = path.join(os.homedir(), '.config/cloudtrain/entra-e2e.env');
+const MICROSOFT_LOGIN_HOSTS = new Set(['login.microsoftonline.com', 'login.microsoft.com', 'login.live.com']);
 
 /** playwright-core is a dev dependency of apps/web; resolve it from there. */
 async function loadChromium() {
@@ -143,7 +144,7 @@ export async function entraLogin({ gateway = 'http://localhost:8787', web = 'htt
         }
         break;
       }
-      if (/login\.microsoftonline\.com|login\.live\.com|login\.microsoft\.com/.test(url.host)) {
+      if (MICROSOFT_LOGIN_HOSTS.has(url.hostname)) {
         const err = await entraErrorOf(page);
         if (err) throw err;
         if (await visible(page, 'input[name="loginfmt"]:not([aria-hidden="true"])')) {
