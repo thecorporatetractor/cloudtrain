@@ -12,13 +12,13 @@ Legend. **Type**: learn = guided first exposure, do = complete a task, fix = rep
 
 | Domain | Paths | Learning labs | Exam tasks | Exams | Verified | Built | Proposed | Tier mix (all labs) | Learning hours |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Kubernetes | 5 | 89 | 103 | 3 | 54 | 136 | 2 | C 1, K 112, V 79 | 25 |
-| Linux administration | 11 | 159 | 119 | 3 | 1 | 21 | 256 | A 84, B 69, C 125 | 48 |
+| Kubernetes | 5 | 89 | 103 | 3 | 55 | 135 | 2 | C 1, K 112, V 79 | 25 |
+| Linux administration | 11 | 159 | 119 | 3 | 2 | 20 | 256 | A 84, B 69, C 125 | 48 |
 | Containers with Docker | 11 | 91 | 44 | 2 | 24 | 0 | 111 | B 71, C 64 | 28 |
 | Infrastructure as code with Terraform | 5 | 54 | 45 | 2 | 48 | 0 | 51 | A 53, B 1, V 45 | 21 |
 | Configuration management and automation | 7 | 61 | 36 | 1 | 0 | 0 | 97 | A 39, B 7, C 45, N 6 | 26 |
 | Network administration | 4 | 45 | 32 | 1 | 2 | 0 | 75 | N 77 | 15 |
-| **Total** | 43 | 499 | 379 | 13 | 129 | 157 | 592 | A 176, B 148, C 235, K 112, V 124, N 83 | 161 |
+| **Total** | 43 | 499 | 379 | 13 | 131 | 155 | 592 | A 176, B 148, C 235, K 112, V 124, N 83 | 161 |
 
 Cross-domain exams: Platform engineer practical capstone. Exam tasks are counted under the domain of each task. Learning labs by type: learn 47, do 356, fix 83, hack 13. New skills proposed: 291.
 
@@ -170,7 +170,7 @@ _CloudTrain is not affiliated with or endorsed by the Cloud Native Computing Fou
 | `immutable-label-printers` | Make the label printers immutable at runtime | do | medium | 15 | V | verified | cks:monitoring-runtime-security | Run the label-printer containers with a read-only root filesystem, non-root user and no privilege escalation, giving only /tmp and the spool directory writable emptyDir volumes. |
 | `waybill-image-slim-scan` | Rebuild an image smaller and scan it | do | hard | 30 | K | built | cks:supply-chain-security, ckad:design-build | Rebuild the waybill image as a multi-stage, non-root image on a minimal base so it is under 40 MB, scan before and after, and record the remaining high CVEs in a report. |
 | `seccomp-apparmor-printer` | Confine a container with seccomp and AppArmor | do | hard | 25 | K | built | cks:system-hardening | Load the provided AppArmor profile on the fleet workers and run the barcode service with it plus the RuntimeDefault seccomp profile, so its write to /etc is denied. |
-| `gvisor-runtimeclass` | Run untrusted converters in a sandboxed runtime | do | medium | 15 | K | built | cks:microservice-vulnerabilities | Create a RuntimeClass for the gVisor handler and move the third-party document converter Deployment onto it, proving its Pods run under the sandbox kernel. |
+| `gvisor-runtimeclass` | Run untrusted converters in a sandboxed runtime | do | medium | 15 | K | verified | cks:microservice-vulnerabilities | Create a RuntimeClass for the gVisor handler and move the third-party document converter Deployment onto it, proving its Pods run under the sandbox kernel. |
 | `secrets-encryption-at-rest` | Encrypt Secrets at rest in etcd | do | hard | 30 | K | built | cks:microservice-vulnerabilities | Configure an aescbc encryption provider on the qm-ledger API server, re-write all existing Secrets, and prove from etcd that the billing Secret is no longer stored in plain text. |
 | `sa-token-automount-off` | Stop handing API tokens to Pods that need none | do | easy | 10 | V | verified | cks:cluster-hardening | Disable token automounting on the default ServiceAccounts of the depot namespaces and on the Pods that never call the API, while route-sync keeps its projected token. |
 | `rbac-overgrant-cleanup` | Strip an over-broad grant back to least privilege | fix | medium | 15 | V | verified | cks:cluster-hardening | The dashboard ServiceAccount is bound to cluster-admin; replace the binding with a namespaced read-only grant on exactly the resources it uses, without breaking the dashboard. |
@@ -363,7 +363,7 @@ _CloudTrain is not affiliated with or endorsed by Red Hat, Inc. or CompTIA, Inc.
 | `file-ops-roster-cleanup` | Reorganise the crew roster directory with globbing | do | easy | 10 | A | built | lpic1:gnu-commands, rhcsa-aligned:essential-tools | Move every 2026 crew roster under ~/rosters into per-month directories (2026-01 ... 2026-12) using globs and brace expansion, deleting only the *.bak copies. |
 | `links-shared-timetable` | Publish the current timetable with links | do | easy | 8 | A | built | lpic1:devices-filesystems, rhcsa-aligned:essential-tools | Make /srv/timetable/current a symbolic link to the approved draft and create a hard link archive copy, so both survive a rename of the draft directory as the grader checks inode and target. |
 | `streams-delay-report` | Split delay-feed output and errors into separate files | do | easy | 8 | A | built | lpic1:gnu-commands, rhcsa-aligned:essential-tools, linuxplus:system-management | Run the delay-feed collector so its stdout lands in /var/tmp/delays.log, its errors in delays.err, and a copy of stdout scrolls on screen via tee. |
-| `text-filters-ticket-sales` | Rank stations by ticket sales from a CSV export | do | easy | 12 | A | built | lpic1:gnu-commands, linuxplus:automation-scripting | From the ticketing export sales.csv, write the five stations with the highest weekend revenue, sorted descending, to ~/answers/top5.txt using cut, sort, uniq and head. |
+| `text-filters-ticket-sales` | Rank stations by ticket sales from a CSV export | do | easy | 12 | A | verified | lpic1:gnu-commands, linuxplus:automation-scripting | From the ticketing export sales.csv, write the five stations with the highest weekend revenue, sorted descending, to ~/answers/top5.txt using cut, sort, uniq and head. |
 | `vim-fix-signal-config` | Edit a signalling config file in vim without breaking it | learn | easy | 10 | A | built | lpic1:gnu-commands, rhcsa-aligned:essential-tools | Change three parameters in /etc/tr-signal/interlock.conf with vim, keeping its comments and file mode intact; the grader diffs everything except the three lines. |
 | `regex-extract-train-ids` | Extract malformed train IDs with regular expressions | do | medium | 15 | A | built | lpic1:gnu-commands, rhcsa-aligned:essential-tools, linuxplus:automation-scripting | Use grep -E and sed to list every train ID in the dispatch log that breaks the two-letters-four-digits rule and write a corrected copy of the log to ~/dispatch-fixed.log. |
 | `find-stale-depot-files` | Find and archive stale depot inspection files | do | medium | 12 | A | built | lpic1:devices-filesystems, lfcs:essential-commands, rhcsa-aligned:essential-tools | Find every inspection report under /srv/depot older than 90 days and larger than 1 MiB owned by user inspector, and copy them preserving paths into /srv/archive/stale. |
