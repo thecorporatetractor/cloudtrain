@@ -8,7 +8,7 @@ python3 $S/setstatus.py . $lab $st "$note"
 python3 $S/sync_pack.py .
 node tools/curriculum/render.mjs >/dev/null
 node tools/lab-verify/bin/lab-verify.mjs --strict 2>&1 | grep -E '^(ERROR|WARN)|error\(s\)' || true
-git add -A content/packs/networking/labs/$lab content/packs/networking/pack.yaml docs/handoffs/networking-drafts/$lab content/curriculum.yaml docs/curriculum.md README.md
+git add -A content/packs/networking/labs/$lab content/packs/networking/pack.yaml content/curriculum.yaml docs/curriculum.md README.md
 [ -f deploy/.results/verify/$lab.json ] && git add -f deploy/.results/verify/$lab.json
 git commit -q --cleanup=strip -m "content(networking): $lab ($st)" -m "$msg"
 git log --oneline -1
