@@ -1,0 +1,36 @@
+#!/bin/bash
+# ct-vcsim: a simulated vCenter (govmomi vcsim, Apache-2.0) inside the learner's pod for
+# vSphere provider labs. Inventory only: no guest operations or clones. Listens on
+# https://127.0.0.1:8989/sdk (self-signed: providers set allow_unverified_ssl), user
+# saltmarsh / password saltmarsh-lab. vcsim keeps its inventory in memory, so `ensure`
+# after a pod restart brings back an empty simulator from the same layout; labs that
+# need objects to survive re-create them with their seed (state then shows drift).
+#
+#   ct-vcsim start [VCSIM ARGS]   start it now (args, e.g. -dc 1 -cluster 1, are kept)
+#   ct-vcsim ensure               start it again if it was started before and is down
+#   ct-vcsim status               up | down
+set -uo pipefail
+PORT=8989
+H=/home/learner
+DATA=$H/.local/share/ct-vcsim
+FLAG=$H/.config/ct-vcsim/args
+if [[ $(id -u) == 0 ]]; then
+  exec runuser -u learner -- env -i HOME=$H USER=learner LOGNAME=learner \
+    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin "$0" "$@"
+fi
+up() { curl -sk -o /dev/null --max-time 2 "https://127.0.0.1:$PORT/about"; }
+start() {
+  up && return 0
+  mkdir -p "$DATA"
+  # shellcheck disable=SC2086
+  setsid nohup vcsim -l "127.0.0.1:$PORT" -username saltmarsh -password saltmarsh-lab $(cat "$FLAG") \
+    >"$DATA/vcsim.log" 2>&1 </dev/null &
+  for _ in $(seq 1 60); do up && return 0; sleep 1; done
+  echo "ct-vcsim: simulator did not come up, see $DATA/vcsim.log" >&2; return 1
+}
+case ${1:-} in
+  start) shift; mkdir -p "$(dirname "$FLAG")"; echo "$*" > "$FLAG"; start ;;
+  ensure) [[ -e $FLAG ]] || exit 0; start ;;
+  status) up && echo up || echo down ;;
+  *) echo "usage: ct-vcsim start [ARGS]|ensure|status" >&2; exit 2 ;;
+esac

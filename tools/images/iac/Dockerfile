@@ -27,6 +27,19 @@ ARG TOFU_VERSION
 ARG TOFU_ZIP_SHA256
 ARG SEAWEEDFS_VERSION
 ARG SEAWEEDFS_TARBALL_SHA256
+ARG TERRAFORM_STAGED_19_VERSION
+ARG TERRAFORM_STAGED_19_ZIP_SHA256
+ARG TERRAFORM_STAGED_15_VERSION
+ARG TERRAFORM_STAGED_15_ZIP_SHA256
+ARG TERRAFORM_STAGED_15_LICENSE_SHA256
+ARG CONFTEST_VERSION
+ARG CONFTEST_TARBALL_SHA256
+ARG GOVMOMI_VERSION
+ARG VCSIM_TARBALL_SHA256
+ARG ORAS_VERSION
+ARG ORAS_TARBALL_SHA256
+ARG DISTRIBUTION_VERSION
+ARG DISTRIBUTION_TARBALL_SHA256
 ARG IAC_CLI=terraform
 ARG TERRAFORM_SHIM=1
 ENV DEBIAN_FRONTEND=noninteractive
@@ -37,7 +50,7 @@ RUN test -n "$UBUNTU_APT_SNAPSHOT" \
  && apt-get -o Acquire::ForceIPv4=true -o APT::Update::Error-Mode=any update --snapshot "$UBUNTU_APT_SNAPSHOT" \
  && apt-get -o Acquire::ForceIPv4=true install -y --no-install-recommends --snapshot "$UBUNTU_APT_SNAPSHOT" \
       openssh-client bash-completion vim nano less curl jq tar gzip unzip git tree make \
-      python3 iproute2 iputils-ping dnsutils netcat-openbsd tmux \
+      python3 iproute2 iputils-ping dnsutils netcat-openbsd tmux openssl systemd \
  && rm -rf /var/lib/apt/lists/*
 
 # Kubernetes CLIs (kubectl: dl.k8s.io .sha256; helm, yq: pinned sha256).
@@ -75,7 +88,38 @@ RUN set -eu; cd /tmp \
  && echo "${SEAWEEDFS_TARBALL_SHA256}  weed.tgz" | sha256sum -c - \
  && tar -xzf weed.tgz -C /usr/local/bin weed && rm -f weed.tgz && chmod 0755 /usr/local/bin/weed \
  && weed version | head -1
-COPY --chmod=0755 iac ct-iac ct-s3 /usr/local/bin/
+# Older Terraform releases for upgrade/migration labs, never on PATH as `terraform`:
+# terraform-1.9 (BUSL-1.1, Terraform flavour only) and terraform-1.5 (MPL-2.0, both).
+RUN set -eu; cd /tmp; d=/opt/cloudtrain/terraform \
+ && stage() { v=$1 sha=$2; curl -fsSLo tf.zip "https://releases.hashicorp.com/terraform/${v}/terraform_${v}_linux_amd64.zip" \
+      && echo "${sha}  tf.zip" | sha256sum -c - && install -d "$d/$v" && unzip -q -o tf.zip -d "$d/$v" && rm -f tf.zip \
+      && ln -s "$d/$v/terraform" "/usr/local/bin/terraform-${v%.*}"; } \
+ && stage "$TERRAFORM_STAGED_15_VERSION" "$TERRAFORM_STAGED_15_ZIP_SHA256" \
+ && curl -fsSLo "$d/$TERRAFORM_STAGED_15_VERSION/LICENSE" "https://raw.githubusercontent.com/hashicorp/terraform/v${TERRAFORM_STAGED_15_VERSION}/LICENSE" \
+ && echo "${TERRAFORM_STAGED_15_LICENSE_SHA256}  $d/$TERRAFORM_STAGED_15_VERSION/LICENSE" | sha256sum -c - \
+ && if [ "$IAC_CLI" = terraform ]; then stage "$TERRAFORM_STAGED_19_VERSION" "$TERRAFORM_STAGED_19_ZIP_SHA256"; fi \
+ && chmod -R a+rX "$d" && terraform-1.5 version
+# conftest (policy on plan JSON), vcsim (vSphere API simulator, ct-vcsim), oras and the
+# distribution registry (OCI artifacts, ct-oci). Licences under /usr/share/doc/<tool>.
+RUN set -eu; cd /tmp \
+ && get() { curl -fsSLo "$1.tgz" "$2" && echo "$3  $1.tgz" | sha256sum -c - && install -d "$1.d" "/usr/share/doc/$1" \
+      && tar -xzf "$1.tgz" -C "$1.d" && install -m 0755 "$1.d/$1" /usr/local/bin/ \
+      && install -m 0644 "$1.d"/LICENSE* "/usr/share/doc/$1/" && rm -rf "$1.tgz" "$1.d"; } \
+ && get conftest "https://github.com/open-policy-agent/conftest/releases/download/v${CONFTEST_VERSION}/conftest_${CONFTEST_VERSION}_Linux_x86_64.tar.gz" "$CONFTEST_TARBALL_SHA256" \
+ && get vcsim "https://github.com/vmware/govmomi/releases/download/v${GOVMOMI_VERSION}/vcsim_Linux_x86_64.tar.gz" "$VCSIM_TARBALL_SHA256" \
+ && get oras "https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/oras_${ORAS_VERSION}_linux_amd64.tar.gz" "$ORAS_TARBALL_SHA256" \
+ && get registry "https://github.com/distribution/distribution/releases/download/v${DISTRIBUTION_VERSION}/registry_${DISTRIBUTION_VERSION}_linux_amd64.tar.gz" "$DISTRIBUTION_TARBALL_SHA256" \
+ && conftest --version && oras version >/dev/null
+# TLS for the in-pod OCI registry (OpenTofu fetches OCI artifacts over HTTPS only): a lab
+# CA generated at build time, trusted system-wide; the registry serves 127.0.0.1/localhost.
+RUN set -eu; d=/etc/cloudtrain/oci-tls; install -d "$d"; cd "$d" \
+ && openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -subj "/CN=CloudTrain lab registry CA" -keyout ca.key -out ca.crt 2>/dev/null \
+ && openssl req -newkey rsa:2048 -nodes -subj "/CN=localhost" -keyout tls.key -out tls.csr 2>/dev/null \
+ && printf 'subjectAltName=DNS:localhost,DNS:registry.saltmarsh.lab,IP:127.0.0.1\n' > ext.cnf \
+ && openssl x509 -req -in tls.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 3650 -extfile ext.cnf -out tls.crt 2>/dev/null \
+ && rm -f ca.key ca.srl tls.csr ext.cnf && chmod 0644 ./* \
+ && cp ca.crt /usr/local/share/ca-certificates/cloudtrain-lab-registry.crt && update-ca-certificates >/dev/null
+COPY --chmod=0755 iac ct-iac ct-s3 ct-vcsim ct-oci /usr/local/bin/
 COPY --chmod=0755 terraform-shim /usr/local/lib/cloudtrain/terraform-shim
 RUN install -d /etc/cloudtrain && mv /tmp/iac.env /etc/cloudtrain/iac.env \
  && if [ "$IAC_CLI" = tofu ] && [ "$TERRAFORM_SHIM" = 1 ]; then ln -s /usr/local/lib/cloudtrain/terraform-shim /usr/local/bin/terraform; fi \
