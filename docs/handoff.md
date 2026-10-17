@@ -43,6 +43,11 @@ Kata and the kubeadm proof under load:
    draft (VLAN 20/30 tagged + native 99 across two Linux bridges). The L2 drafts in
    `docs/handoffs/networking-drafts/` no longer need `l2shim.sh`. P3, P4 and the
    link rate limit: fixed in round 4 (item 0); `net-fix-broadcast-storm` may run.
+   Networking round 3 verified every L2 lab on it except the broadcast storm.
+   **Open platform bug:** `labctl verify` (and the exam auto-solve) builds its exec
+   runtime with the stub netdev driver, so solution/mutation steps on FRR nodes
+   fail (`driver netdev (clabernetes): exec not implemented`); the one-line fix is
+   in `docs/handoffs/networking.md`.
 4. **Learner sudo: available as an opt-in.** Entry node `learnerSudo: true`
    (security trade-off, see `docs/dev-environment.md`); the lab's setup grants the
    sudoers rule. Default stays `allowPrivilegeEscalation: false`; operators can
@@ -72,7 +77,7 @@ Kata and the kubeadm proof under load:
 | k8s-admin | 88 | 5 | 63 | 18 blocked on add-ons, 2 not written | `docs/handoffs/k8s-admin.md` |
 | k8s-dev | 42 | 33 (every V-tier lab; round 3, 2026-10-17); sim-k8s-developer exam run live: auto-solve 100 %, no-solve 14.5 % | 5 K-tier (vm slot) | 4 blocked (buildah, metrics-server, ingress) | `docs/handoffs/k8s-dev.md` |
 | k8s-sec | 51 | 12 (every V-tier lab; round 3) | 27 K-tier (vm slot) | 12 blocked on security tooling | `docs/handoffs/k8s-sec.md` |
-| networking | 77 | 2 | 31 drafts (parked in `docs/handoffs/networking-drafts/`) | 44 not started (exam tasks, SR Linux, Ansible) | `docs/handoffs/networking.md` |
+| networking | 77 | 24 (round 3, 2026-10-17: 9 learning labs incl. every VLAN/trunk/STP/LACP/VRRP lab, 15 sim-net-associate tasks = every objective's draw; exam compiles with `--allow-missing`, exam run not yet done) | 1 built (net-fix-broadcast-storm, flaky capture check) + 22 drafts in `docs/handoffs/networking-drafts/` | 15 pool tasks, SR Linux/Ansible labs, security/VPN learning labs; `labctl verify` cannot exec steps on FRR nodes (see handoff) | `docs/handoffs/networking.md` |
 | linux-a | 62 | 1 | 21 | ~40 not started (sudo, mirror, mis-tiered) | `docs/handoffs/linux-a.md` |
 | original 11 K8s labs | 11 | 4+ | — | — | `content/packs/kubernetes` |
 | iac (wave 2) | 99 | 48 (23 foundations labs + 25 sim-iac-associate tasks; exam runs 100 % / 11.7 %) | 0 | 31 learning labs, 18 sim-iac-advanced tasks, 2 capstone tasks not started | `docs/handoffs/iac.md` |
