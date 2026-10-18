@@ -1505,7 +1505,7 @@ _CloudTrain is not affiliated with or endorsed by CompTIA. Linux+ is a trademark
 
 | Task | Objective | Title | Difficulty | Min | Tier | Scenario |
 | --- | --- | --- | --- | --- | --- | --- |
-| `xlp-netplan-address` | linuxplus:system-management | Apply a Netplan address change safely | medium | 5 | B | Change the secondary interface to the requested address through Netplan and apply it. |
+| `xlp-netplan-address` | linuxplus:system-management | Apply a persistent address to a second interface | medium | 5 | B | Change the secondary interface to the requested address through Netplan and apply it. |
 | `xlp-lvm-raid-mount-opts` | linuxplus:system-management | Mount a volume with restrictive options | easy | 4 | B | Mount the given LV at the given path with noexec and nosuid, persistently. |
 | `xlp-backup-restore-tar` | linuxplus:system-management | Restore one directory from a backup archive | easy | 4 | A | Restore only the requested directory from the given archive to its original place with ownership intact. |
 | `xlp-fhs-locate-config` | linuxplus:system-management | Locate the files the auditor asks for | easy | 4 | A | Write the paths of the requested config, log and variable-data files of the given service to the answer file. |
@@ -1534,7 +1534,7 @@ _CloudTrain is not affiliated with or endorsed by CompTIA. Linux+ is a trademark
 | `xlp-script-fix-loop` | linuxplus:automation-scripting | Fix a broken loop in a provided script | medium | 6 | A | Correct the provided script so it processes every input line and produces the expected output file. |
 | `xlp-git-revert-commit` | linuxplus:automation-scripting | Revert a bad commit and push | medium | 5 | A | Revert the commit that set the key to 0 in the bare repository and push the result to main. |
 | `xlp-python-parse-json` | linuxplus:automation-scripting | Extract a value from JSON with a short Python script | medium | 6 | A | Write a Python script that prints the requested field from every record of the given JSON file. |
-| `xlp-cloud-init-userdata` | linuxplus:automation-scripting | Correct a cloud-init user-data file | medium | 6 | A | Fix the provided user-data so it creates the requested user and package set, validated by the cloud-init schema check. |
+| `xlp-cloud-init-userdata` | linuxplus:automation-scripting | Correct a provisioning user-data file | medium | 6 | A | Fix the provided user-data so it creates the requested user and package set, validated by the cloud-init schema check. |
 | `xlp-sed-bulk-edit` | linuxplus:automation-scripting | Change a setting in many config files at once | easy | 4 | A | Change the requested key's value in every matching config file under the given directory, leaving other lines intact. |
 | `xlp-script-exit-codes` | linuxplus:automation-scripting | Make a script return meaningful exit codes | easy | 5 | A | Change the provided health-check script to exit 0, 1 or 2 for the three documented states. |
 | `xlp-fix-disk-full` | linuxplus:troubleshooting | Restore writes on a full filesystem | medium | 5 | A | Free space on the full filesystem so the given service can write again, without deleting protected data. |
