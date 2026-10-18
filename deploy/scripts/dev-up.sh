@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # Bring up the CloudTrain local runtime: kind + Kube-OVN + Multus + KubeVirt (KVM) + CDI.
 # Idempotent: re-running converges an existing cluster.
+# KIND_PROFILE (lib.sh): kubeovn-primary (default, cluster cloudtrain-dev) or
+# managed-cni (cluster cloudtrain-mcni: Cilium primary, Kube-OVN non-primary
+# behind Multus, emulating a managed cloud cluster; docs/any-kubernetes.md).
 # Host overrides (default: the reference machine's files):
 #   KIND_CONFIG=<file>            kind cluster config, used only when the cluster is created
 #   KUBE_OVN_EXTRA_VALUES=<file>  extra Helm values merged over deploy/kube-ovn/values.yaml
@@ -8,6 +11,13 @@ source "$(dirname "$0")/lib.sh"
 for t in docker kind kubectl helm virtctl jq yq curl; do need "$t"; done
 
 T0=$SECONDS
+DEFAULT_KIND_CONFIG=$REPO_ROOT/deploy/kind/cluster.yaml
+KUBE_OVN_PROFILE_VALUES=()
+if [[ $KIND_PROFILE == managed-cni ]]; then
+  DEFAULT_KIND_CONFIG=$REPO_ROOT/deploy/kind/cluster-managed-cni.yaml
+  KUBE_OVN_PROFILE_VALUES=(-f "$REPO_ROOT/deploy/kube-ovn/values-secondary.yaml")
+fi
+log "profile $KIND_PROFILE, cluster $CLUSTER_NAME"
 for f in ${KIND_CONFIG:+"$KIND_CONFIG"} ${KUBE_OVN_EXTRA_VALUES:+"$KUBE_OVN_EXTRA_VALUES"}; do
   [[ -f $f ]] || die "override file not found: $f"
 done
@@ -33,7 +43,7 @@ else
   # user's previous context back (every call here uses --context explicitly).
   prev_ctx=$(kubectl config current-context 2>/dev/null || true)
   kind create cluster --name "$CLUSTER_NAME" --image "$KIND_NODE_IMAGE" \
-    --config "${KIND_CONFIG:-$REPO_ROOT/deploy/kind/cluster.yaml}" --wait 0s
+    --config "${KIND_CONFIG:-$DEFAULT_KIND_CONFIG}" --wait 0s
   if [[ -n $prev_ctx ]]; then kubectl config use-context "$prev_ctx" >/dev/null; fi
 fi
 # Every node must have the KVM/virtio-net device nodes as character devices.
@@ -47,7 +57,18 @@ for node in $(docker ps --filter "$NODE_FILTER" --format '{{.Names}}'); do
 done
 wait_for "API server of $CLUSTER_NAME" 180 k get --raw /readyz
 
-# --- 2. Kube-OVN (primary CNI) -----------------------------------------------
+# --- 1b. Cilium (managed-cni: the primary CNI, standing in for the cloud's) ---
+if [[ $KIND_PROFILE == managed-cni ]]; then
+  log "installing Cilium $CILIUM_CHART_VERSION (primary CNI)"
+  helm repo add cilium https://helm.cilium.io >/dev/null 2>&1 || true
+  helm repo update cilium >/dev/null
+  helm --kube-context "$KUBECONTEXT" upgrade --install cilium cilium/cilium \
+    --version "$CILIUM_CHART_VERSION" --namespace kube-system \
+    -f "$REPO_ROOT/deploy/cilium/values.yaml" --wait --timeout 10m
+  wait_for "all nodes Ready (Cilium)" 300 k wait --for=condition=Ready nodes --all --timeout=5s
+fi
+
+# --- 2. Kube-OVN (primary CNI; non-primary behind Multus for managed-cni) -----
 CP_NODE="${CLUSTER_NAME}-control-plane"
 # Docker's address for the node container (what kubelet will report once it is up).
 CP_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$CP_NODE")
@@ -75,7 +96,8 @@ helm repo add kubeovn https://kubeovn.github.io/kube-ovn/ >/dev/null 2>&1 || tru
 helm repo update kubeovn >/dev/null
 helm --kube-context "$KUBECONTEXT" upgrade --install kube-ovn kubeovn/kube-ovn \
   --version "$KUBE_OVN_CHART_VERSION" --namespace kube-system \
-  -f "$REPO_ROOT/deploy/kube-ovn/values.yaml" ${KUBE_OVN_EXTRA_VALUES:+-f "$KUBE_OVN_EXTRA_VALUES"} \
+  -f "$REPO_ROOT/deploy/kube-ovn/values.yaml" ${KUBE_OVN_PROFILE_VALUES[@]+"${KUBE_OVN_PROFILE_VALUES[@]}"} \
+  ${KUBE_OVN_EXTRA_VALUES:+-f "$KUBE_OVN_EXTRA_VALUES"} \
   --set MASTER_NODES="$CP_IP" --wait --timeout 10m
 if [[ ${RESTART_OVN:-0} == 1 ]]; then
   k -n kube-system rollout restart deploy/ovn-central deploy/kube-ovn-controller ds/ovs-ovn ds/kube-ovn-cni >/dev/null
@@ -102,7 +124,13 @@ log "installing KubeVirt $KUBEVIRT_VERSION"
 fetch_pinned "https://github.com/kubevirt/kubevirt/releases/download/${KUBEVIRT_VERSION}/kubevirt-operator.yaml" \
   "$KUBEVIRT_OPERATOR_SHA256" "$MANIFEST_CACHE/kubevirt-operator-${KUBEVIRT_VERSION}.yaml"
 k apply -f "$MANIFEST_CACHE/kubevirt-operator-${KUBEVIRT_VERSION}.yaml" >/dev/null
-k apply -f "$REPO_ROOT/deploy/kubevirt/kubevirt-cr.yaml" >/dev/null
+if [[ $KIND_PROFILE == managed-cni ]]; then
+  # Lab VMs take the session lab segment as their Multus default network
+  # (multus.default: true), never the pod network: no bridge on the pod network.
+  yq '.spec.configuration.network.permitBridgeInterfaceOnPodNetwork = false' "$REPO_ROOT/deploy/kubevirt/kubevirt-cr.yaml" | k apply -f - >/dev/null
+else
+  k apply -f "$REPO_ROOT/deploy/kubevirt/kubevirt-cr.yaml" >/dev/null
+fi
 wait_for "KubeVirt Available" 900 k -n kubevirt wait kv/kubevirt --for=condition=Available --timeout=5s
 
 # --- 5. CDI ------------------------------------------------------------------

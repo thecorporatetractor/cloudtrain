@@ -7,6 +7,19 @@ export REPO_ROOT
 # shellcheck source=../versions.env
 set -a; source "$REPO_ROOT/deploy/versions.env"; set +a
 export PATH="$HOME/.local/bin:$PATH"
+# KIND_PROFILE picks the cluster flavour (docs/any-kubernetes.md, section 6):
+#   kubeovn-primary (default): Kube-OVN is the primary CNI (vCenter / bare metal model)
+#   managed-cni: Cilium is the primary CNI (stands in for a managed cloud's CNI),
+#     Kube-OVN runs non-primary behind Multus, the orchestrator uses --network-mode=secondary.
+#     Its own cluster (default name cloudtrain-mcni), so it never touches cloudtrain-dev.
+# CT_CLUSTER_NAME overrides the cluster name of either profile.
+export KIND_PROFILE=${KIND_PROFILE:-kubeovn-primary}
+case $KIND_PROFILE in
+  kubeovn-primary) ;;
+  managed-cni) CLUSTER_NAME=cloudtrain-mcni ;;
+  *) printf 'unknown KIND_PROFILE %s (kubeovn-primary or managed-cni)\n' "$KIND_PROFILE" >&2; exit 2 ;;
+esac
+export CLUSTER_NAME=${CT_CLUSTER_NAME:-$CLUSTER_NAME}
 export KUBECONTEXT="kind-${CLUSTER_NAME}"
 
 log()  { printf '\033[1;34m[%s]\033[0m %s\n' "$(date +%H:%M:%S)" "$*" >&2; }

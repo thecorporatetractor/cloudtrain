@@ -1,8 +1,9 @@
 # CloudTrain on any Kubernetes
 
-Status: design proposal, 2026-10-18. Nothing here is implemented yet; the
-decisions in section 7 are open for the product owner. Separate agents implement
-after the decisions are made.
+Status: design proposal, 2026-10-18. The CNI spike for option (b) passed on
+every property (section 8), so the default-network override is the chosen
+design and the fallback is not needed. The other decisions in section 7 are
+open for the product owner.
 
 Requirement: the platform runs on vCenter (self-managed Kubernetes on vSphere
 VMs, or VKS), Azure AKS, AWS EKS, Google GKE and bare metal, not only on the kind
@@ -225,6 +226,7 @@ Work and risks:
 - A spike must prove two things not stated in Kube-OVN's page: a `kube-ovn` NAD
   used as the Multus *default* network in non-primary mode (pods), and KubeVirt
   `multus.default` on a Kube-OVN NAD with a fixed IP and bridge binding (VMs).
+  **Both proven** on a kind emulation, 2026-10-18 (section 8).
   KubeVirt + Kube-OVN secondary NICs are documented; the default-network case
   is the one to prove. Fallback if it fails: eth0 on the cloud network with a
   deny-all NetworkPolicy, and the lab segment as `net1` (VMs then need cloud-init
@@ -290,7 +292,7 @@ unreachable while this was written (AZ move), so no new node experiments were ru
 |---|---|---|---|---|---|
 | Primary CNI | Kube-OVN (primary or non-primary) | Azure CNI (overlay / powered by Cilium); BYO-CNI possible but CNI unsupported by Microsoft [D] ([BYO CNI](https://learn.microsoft.com/en-us/azure/aks/use-byo-cni)) | VPC CNI only supported CNI; alternates allowed with partner support; **Auto Mode forbids alternates** [D] ([alternate CNIs](https://docs.aws.amazon.com/eks/latest/userguide/alternate-cni-plugins.html)) | Dataplane V2 (Cilium); not replaceable [U] | Kube-OVN |
 | Multus | install | install (no official doc) [U] | install; VPC CNI multi-NIC exists for ENIs [D] ([multi NIC](https://docs.aws.amazon.com/eks/latest/userguide/pod-multiple-network-interfaces.html)) | Google documents Multus + ipvlan [D] ([GKE Multus](https://docs.cloud.google.com/kubernetes-engine/docs/concepts/multus-ipvlan-whereabouts)); GKE multi-network is L3 [D] | install |
-| Kube-OVN non-primary | n/a or yes | yes [U, spike] | yes [U, spike] | yes, Ubuntu nodes [U, spike] | n/a or yes |
+| Kube-OVN non-primary | n/a or yes | yes [U; mechanism V on kind + Cilium, section 8] | yes [U; mechanism V, section 8] | yes, Ubuntu nodes [U; mechanism V, section 8] | n/a or yes |
 | Underlay MTU for 1400-byte lab links | port group MTU >= 1600 recommended [V, dev-environment.md] | 1500 [U] | 9001 [U] | default 1460: **set VPC MTU 1500 or 8896** [U] | >= 1500 |
 | NetworkPolicy engine | Kube-OVN | Cilium / Azure NPM | VPC CNI `enableNetworkPolicy` must be on [U] | Dataplane V2 | Kube-OVN |
 | LoadBalancer | NSX / Avi on VKS, else MetalLB or kube-vip [U] | Azure LB | AWS LB Controller (NLB) [U] | native | MetalLB |
@@ -445,3 +447,75 @@ with the run id, and a scheduled janitor deletes anything older than 6 hours.
 | 8 | Real-cloud CI | none / on demand / scheduled | **Scheduled weekly per provider + manual trigger**, budget cap in the cloud accounts, everything destroyed by the job (and a janitor on tags) |
 | 9 | Images | GHCR only / per-provider registry | **GHCR as the source** (signed), mirrored into the provider registry by the install guide; catalog overlay generated per release |
 | 10 | Lab content MTU | keep 1400 / derive from cluster | **Keep 1400** as a platform guarantee (preflight enforces it); document the underlay MTU per provider |
+
+## 8. Spike: cloud CNI primary, Kube-OVN non-primary (2026-10-18)
+
+Goal: prove or disprove option (b) before any code depends on it. Result:
+**every property passed**; the fallback (eth0 on the cloud network plus a
+deny-all policy, lab network on `net1`) is not needed.
+
+### Setup
+
+A throwaway kind cluster `ct-cni-spike` on the verify VM (own kubeconfig, one
+control plane and two workers, next to the batch runner's `cloudtrain-dev`),
+built with the new `KIND_PROFILE=managed-cni` profile of `task dev:up`
+(`deploy/kind/cluster-managed-cni.yaml`, `tools/verify-vm/kind-managed-cni.yaml`
+on the VM):
+
+| Component | Version | Settings |
+|---|---|---|
+| Kubernetes (kind) | 1.36.4 | pod subnet 10.32.0.0/16 (Cilium), service 10.96.0.0/12 |
+| Cilium (primary CNI, stands in for AKS Azure CNI powered by Cilium / GKE Dataplane V2) | 1.20.3 | `cni.exclusive: false`, kube-proxy kept, IPAM `kubernetes`, VXLAN tunnel (`deploy/cilium/values.yaml`) |
+| Multus thick | 4.3.1 | unchanged vendored manifest, `multusConfigFile: auto` (picks `05-cilium.conflist`) |
+| Kube-OVN | 1.16.13 | `cni_conf.NON_PRIMARY_CNI: true`, `CNI_CONFIG_PRIORITY: "90"` so Multus keeps Cilium as the cluster default (`deploy/kube-ovn/values-secondary.yaml`); NetworkPolicy on |
+| KubeVirt | 1.9.1 | `permitBridgeInterfaceOnPodNetwork: false` (to prove it is not needed) |
+
+Two emulated sessions (`spike-a`, `spike-b`), each a `Vpc` with the session
+segments of today's orchestrator, all with `spec.mtu: 1400` and a provider
+(so each is a NAD): management `198.19.255.0/24`, one link carrier
+`198.18.0.0/28`, lab `192.168.100.0/24`, access `192.168.99.0/24`. Per session:
+two wired pods on different workers with `v1.multus-cni.io/default-network:
+<ns>/mgmt` plus link and lab attachments; one VMI (cirros) with
+`networks: [{name: default, multus: {networkName: <ns>/lab, default: true}}]`,
+bridge binding and `<provider>.kubernetes.io/ip_address: 192.168.100.10`.
+In `spike-a` also an entry-style pod (Cilium eth0 plus the access NAD with
+`.5` and a route to the lab subnet), two lab peers with the headless Service,
+subdomain and DNS search of `labpeers.go`, and the peer and entry policies.
+
+### Results
+
+| # | Property | Result | Evidence |
+|---|---|---|---|
+| 1 | Pods: `kube-ovn` NAD as the Multus default network in non-primary mode | **pass** | Kube-OVN allocated from the default-network annotation (fixed IP honoured), eth0 = `198.19.255.10/24`, default route via the VPC gateway, `status.podIP` is the session IP; pods run without any Cilium endpoint |
+| 2 | VMs: KubeVirt `multus.default: true` on a Kube-OVN NAD, fixed IP, bridge binding | **pass** | VMI `Running` with IP `192.168.100.10` from the annotation; reachable from a pod on the other worker, and from the entry pod through the VPC router; `permitBridgeInterfaceOnPodNetwork: false` |
+| 3 | Cross-node L2 on lab links (two workers) | **pass** | link carrier address flushed, lab addresses `10.0.0.1/30`, `10.0.0.2/30` set by hand: ping and `arping` across workers |
+| 4 | Isolation between sessions | **pass** | both sessions use the same IPs (`.10`, `.20`, `192.168.100.10`); `spike-a` cannot reach an address that only `spike-b` has; wired pods reach neither the Cilium pod network (CoreDNS), the node IPs, the API service `10.96.0.1:443` nor the internet |
+| 5 | 1400-byte MTU | **pass** | every Kube-OVN interface (eth0, links, lab, access) has MTU 1400 from `Subnet.spec.mtu`; `ping -M do -s 1372` (1400-byte packets) passes cross-node on eth0, link and VM paths; `-s 1373` is refused. Cilium's own eth0 is 1450 (VXLAN), which lab traffic never uses |
+| 6 | Lab peers resolve each other by name | **pass** | `getent hosts bravo` (search domain) and the full name `bravo.ct-nodes.spike-a.svc.cluster.local`, TCP by name across workers |
+| 7 | NetworkPolicy, cloud CNI | **pass** | Cilium enforces the peer and entry policies on eth0: peer to another namespace's pod blocked (egress), other namespace to peer blocked (ingress), entry has DNS but no internet and no other pods; controls: the same connections succeed without the policy |
+| 8 | NetworkPolicy, Kube-OVN | **pass** | Kube-OVN still enforces the entry policy on the access attachment in non-primary mode: lab subnet to entry `192.168.99.5` blocked with the policy, reachable without it (control); entry to lab works (egress allowed) |
+
+Findings that shaped the implementation:
+
+- Kube-OVN's `install-cni` still writes `<priority>-kube-ovn.conflist` in
+  non-primary mode. With the default priority `01` Multus (`auto`) would pick
+  Kube-OVN as the cluster network; the profile sets `90`. A production chart
+  must do the same (or point Multus at the cloud CNI's file explicitly).
+- `Subnet.spec.mtu` pins the segment MTU, so the 1400-byte guarantee no longer
+  depends on the node MTU (it still needs underlay MTU >= 1500 for geneve).
+  The orchestrator sets it on every session segment (`--lab-mtu`, default 1400).
+- Cilium needs `cni.exclusive: false`, or it renames the Multus and Kube-OVN
+  configs away.
+- Pods on the default-network override are not Cilium endpoints, so no cloud
+  policy applies to them; they need none (no route out of the VPC), and the
+  session VPC is the isolation, as with Kube-OVN primary today.
+- Not covered by the spike: the default-network override on a cluster where
+  Kube-OVN *is* primary (vCenter / bare metal keep `--network-mode=primary`,
+  which is unchanged), Calico or the AWS VPC CNI as the primary CNI, and a
+  real cloud underlay. The implementation's `labctl preflight` network probe
+  repeats the core checks on any cluster.
+
+Method: `ip`, `ping -M do`, `arping`, `getent` and `nc` from the nettools
+image, run by `kubectl exec`. The spike cluster is reused for the `labctl
+verify` runs of the implementation (`--network-mode=secondary`) and deleted
+afterwards.
