@@ -1,0 +1,191 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: packages-install-from-mirror
+  title: Install the platform tools from the local mirror
+  domain: linux
+  frameworks: [lpic1:install-packages, linuxplus:services-users]
+  difficulty: easy
+  estimatedMinutes: 10
+  tags: [apt, packages, mirror, version-pinning]
+  version: 1
+spec:
+  description: |
+    You are on `tr-ops-02`, a Tallowmere Rail operations workstation with no internet
+    access: its package manager only knows the local mirror and the fares team's own
+    depot repository. A shell is already open here and you have `sudo`.
+
+    1. Refresh the package indexes, then install **`{{pkgA}}`** and **`{{pkgB}}`** from
+       the mirror.
+    2. Install **`tr-fares-client` version {{ver}}** exactly, from the depot repository
+       (`/etc/apt/sources.list.d/tr-depot.sources`), not the newest one.
+    3. **Keep it at that version**: a later `apt-get upgrade` must not replace it.
+    4. Record the installed versions of the three packages in `~/answers/versions.txt`,
+       one line per package: the package name, a space, the version string as dpkg
+       reports it.
+  objectives:
+    - Refresh package indexes and install packages with apt
+    - Find the available versions of a package and install one of them
+    - Keep a package at its version with a hold or a pin
+    - Read installed versions from the dpkg database
+  params:
+    pkgA:
+      type: choice
+      values: [socat, tcpdump]
+    pkgB:
+      type: choice
+      values: [telnet, mtr-tiny]
+    ver:
+      type: choice
+      values: ["2.1.0", "2.2.3"]
+  topology:
+    entry: tr-ops-02
+    nodes:
+      - name: tr-ops-02
+        driver: container
+        image: deb-lab:24.04
+        access: [shell]
+        learnerSudo: true
+  setup:
+    - on: tr-ops-02
+      timeoutSec: 120
+      run: |
+        set -eu
+        echo 'learner ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/learner && chmod 0440 /etc/sudoers.d/learner
+        # The fares depot: a small flat apt repository served on the loopback.
+        R=/srv/tr-depot; rm -rf $R; mkdir -p $R
+        b=$(mktemp -d)
+        for v in 2.1.0 2.2.3 2.3.1; do
+          d=$b/tr-fares-client_$v; mkdir -p $d/DEBIAN $d/usr/bin
+          printf '#!/bin/sh\necho "tr-fares-client %s"\n' $v > $d/usr/bin/tr-fares-client; chmod 0755 $d/usr/bin/tr-fares-client
+          printf 'Package: tr-fares-client\nVersion: %s\nArchitecture: all\nMaintainer: Tallowmere Fares <fares@tallowmere.example>\nDescription: Tallowmere fares client\n' $v > $d/DEBIAN/control
+          dpkg-deb -b --root-owner-group $d $R/tr-fares-client_${v}_all.deb >/dev/null
+        done
+        rm -rf $b
+        cd $R
+        for f in *.deb; do dpkg-deb -f $f; echo "Filename: ./$f"; echo "Size: $(stat -c %s $f)"; echo "SHA256: $(sha256sum $f | cut -d' ' -f1)"; echo; done > Packages
+        gzip -kf Packages
+        { printf 'Origin: Tallowmere\nLabel: Depot\nSuite: stable\nDate: %s\nSHA256:\n' "$(date -Ru)"
+          for f in Packages Packages.gz; do printf ' %s %s %s\n' "$(sha256sum $f | cut -d' ' -f1)" "$(stat -c %s $f)" $f; done; } > Release
+        printf 'Types: deb\nURIs: http://127.0.0.1:8801/\nSuites: ./\nTrusted: yes\n' > /etc/apt/sources.list.d/tr-depot.sources
+        pgrep -f '^python3 -m http.server 8801' >/dev/null || { setsid nohup python3 -m http.server 8801 --bind 127.0.0.1 --directory $R >/dev/null 2>&1 </dev/null & }
+        for i in $(seq 20); do curl -sf -o /dev/null http://127.0.0.1:8801/Release && break; sleep 0.5; done
+        # Stale indexes: the learner has to run apt-get update first.
+        rm -rf /var/lib/apt/lists/*
+        install -d -o learner -g learner /home/learner/answers
+        rm -f /home/learner/answers/versions.txt
+  checks:
+    - id: mirror-tools
+      description: "{{pkgA}} and {{pkgB}} are installed"
+      type: shell
+      on: tr-ops-02
+      skills: [linux.packages.apt]
+      command: |
+        for p in {{pkgA}} {{pkgB}}; do dpkg-query -W -f '${db:Status-Status}\n' $p 2>/dev/null || echo missing; done | tr '\n' ' '
+      expect: {match: exact, value: "installed installed "}
+    - id: fares-version
+      description: tr-fares-client {{ver}} is installed
+      type: shell
+      on: tr-ops-02
+      skills: [linux.packages.apt]
+      weight: 2
+      command: dpkg-query -W -f '${db:Status-Status} ${Version}' tr-fares-client 2>/dev/null || echo missing
+      expect: {match: exact, value: "installed {{ver}}"}
+    - id: upgrade-safe
+      description: A simulated apt-get upgrade does not replace tr-fares-client
+      type: shell
+      on: tr-ops-02
+      skills: [linux.packages.apt]
+      weight: 1.5
+      timeoutSec: 60
+      command: |
+        [ "$(dpkg-query -W -f '${Version}' tr-fares-client 2>/dev/null)" = "{{ver}}" ] || { echo not-installed; exit 0; }
+        apt-get update -q >/dev/null 2>&1 || true
+        apt-get -s upgrade 2>/dev/null | grep -q '^Inst tr-fares-client' && echo upgrades || echo stays
+      expect: {match: exact, value: stays}
+    - id: versions-file
+      description: ~/answers/versions.txt lists the three packages with their installed versions
+      type: shell
+      on: tr-ops-02
+      skills: [linux.packages.apt]
+      weight: 1.5
+      command: |
+        want=$(for p in {{pkgA}} {{pkgB}} tr-fares-client; do echo "$p $(dpkg-query -W -f '${Version}' $p 2>/dev/null)"; done | sort)
+        got=$(awk 'NF {print $1, $2}' /home/learner/answers/versions.txt 2>/dev/null | sort)
+        [ "$want" = "$got" ] && echo match || echo mismatch
+      expect: {match: exact, value: match}
+  hints:
+    - title: Refresh first
+      body: "The package indexes are empty on this host. `sudo apt-get update` fetches them from every source in /etc/apt/sources.list.d."
+      cost: 1
+    - title: Which versions exist
+      body: "`apt-cache madison tr-fares-client` lists every version and the repository it comes from; `apt-cache policy` shows installed and candidate."
+      cost: 1
+    - title: Install an exact version
+      body: "`apt-get install tr-fares-client=VERSION` installs that version. To stop upgrades, either `apt-mark hold tr-fares-client` or a pin in /etc/apt/preferences.d."
+      cost: 1
+    - title: Reading the versions back
+      body: "`dpkg-query -W -f '${Package} ${Version}\\n' PKG...` prints exactly the two columns the answer file needs."
+      cost: 1
+  misconceptions:
+    - id: newest-version
+      description: Installs tr-fares-client without naming a version, so the newest one is installed.
+      feedback: "apt installs the candidate (the highest version) unless you name one. Use `apt-get install tr-fares-client=VERSION`; `apt-cache madison` lists the choices."
+      expectFail: [fares-version]
+      mutation:
+        on: tr-ops-02
+        as: learner
+        run: |
+          sudo apt-get update -q >/dev/null
+          sudo apt-get install -y -q {{pkgA}} {{pkgB}} tr-fares-client >/dev/null
+          sudo apt-mark hold tr-fares-client >/dev/null
+          for p in {{pkgA}} {{pkgB}} tr-fares-client; do echo "$p $(dpkg-query -W -f '${Version}' $p)"; done > ~/answers/versions.txt
+    - id: no-hold
+      description: Installs the right version but leaves it free to be upgraded.
+      feedback: "An exact install is not sticky: the next `apt-get upgrade` replaces it with the newest version. Hold the package (`apt-mark hold`) or pin it."
+      expectFail: [upgrade-safe]
+      mutation:
+        on: tr-ops-02
+        as: learner
+        run: |
+          sudo apt-get update -q >/dev/null
+          sudo apt-get install -y -q {{pkgA}} {{pkgB}} tr-fares-client={{ver}} >/dev/null
+          for p in {{pkgA}} {{pkgB}} tr-fares-client; do echo "$p $(dpkg-query -W -f '${Version}' $p)"; done > ~/answers/versions.txt
+    - id: candidate-versions
+      description: Copies the versions apt would install now (the candidates) into the answer file.
+      feedback: "The answer file must show what is installed, not what is available. `dpkg-query -W` reads the installed version; `apt-cache policy` also shows the candidate."
+      expectFail: [versions-file]
+      mutation:
+        on: tr-ops-02
+        as: learner
+        run: |
+          sudo apt-get update -q >/dev/null
+          sudo apt-get install -y -q {{pkgA}} {{pkgB}} tr-fares-client={{ver}} >/dev/null
+          sudo apt-mark hold tr-fares-client >/dev/null
+          for p in {{pkgA}} {{pkgB}} tr-fares-client; do echo "$p $(apt-cache madison $p | head -1 | awk '{print $3}')"; done > ~/answers/versions.txt
+  solution:
+    explanation: |
+      Update the indexes, install the two tools from the mirror and tr-fares-client
+      with an explicit `=VERSION`, hold it so upgrades skip it, then read the installed
+      versions from dpkg.
+    steps:
+      - on: tr-ops-02
+        as: learner
+        run: |
+          sudo apt-get update -q >/dev/null
+          apt-cache madison tr-fares-client
+          sudo apt-get install -y -q {{pkgA}} {{pkgB}} tr-fares-client={{ver}}
+          sudo apt-mark hold tr-fares-client
+          dpkg-query -W -f '${Package} ${Version}\n' {{pkgA}} {{pkgB}} tr-fares-client > ~/answers/versions.txt
+    alternatives:
+      - id: pin-and-download
+        description: Pin the package in apt preferences and install the .deb fetched with apt-get download.
+        steps:
+          - on: tr-ops-02
+            as: learner
+            run: |
+              sudo apt-get update -q >/dev/null
+              sudo apt-get install -y -q {{pkgA}} {{pkgB}}
+              printf 'Package: tr-fares-client\nPin: version {{ver}}\nPin-Priority: 1001\n' | sudo tee /etc/apt/preferences.d/tr-fares-client >/dev/null
+              cd "$(mktemp -d)" && apt-get download tr-fares-client={{ver}} && sudo dpkg -i ./tr-fares-client_{{ver}}_all.deb
+              for p in {{pkgA}} {{pkgB}} tr-fares-client; do echo "$p $(dpkg-query -W -f '${Version}' $p)"; done > ~/answers/versions.txt

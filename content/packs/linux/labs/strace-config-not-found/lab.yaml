@@ -1,0 +1,200 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: strace-config-not-found
+  title: Find which config file a silent tool tries to open
+  domain: linux
+  frameworks: [linuxplus:troubleshooting]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [strace, syscalls, troubleshooting, permissions, config]
+  version: 1
+spec:
+  description: |
+    On `tr-fleet-02`, the vendor's fleet synchroniser `/usr/local/bin/fleet-sync` exits
+    with status 1 and prints nothing at all, even though the {{site}} depot should be
+    syncing. It is a packed, vendor-supplied program: reading its source is not the way
+    in, and you must not modify it. A shell is open on this host and you have `sudo`.
+
+    Run it as yourself, then use **`strace`** on it to see which files it tries to open
+    and what the kernel answers. There are two problems, a missing file and a permission
+    problem. Fix both so that
+
+    ```
+    fleet-sync
+    ```
+
+    run **as `learner`** (not root) succeeds and prints a line starting `sync ok`.
+
+    Rules: do not edit `fleet-sync`; do not make the secret it reads readable by everyone
+    (`other` must have no access to it); a file the tool needs must come from where the
+    tool looks for it, not from a copy somewhere else.
+  objectives:
+    - Trace a program's system calls with strace and filter the output
+    - Recognise ENOENT and EACCES in openat calls
+    - Fix a missing config file and a permission problem without changing the program
+  params:
+    site:
+      type: choice
+      values: [ashford, brimley, carrow]
+  topology:
+    entry: tr-fleet-02
+    nodes:
+      - name: tr-fleet-02
+        driver: container
+        image: el-lab:10
+        access: [shell]
+        learnerSudo: true
+  setup:
+    - on: tr-fleet-02
+      run: |
+        set -eu
+        echo 'learner ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/learner && chmod 0440 /etc/sudoers.d/learner
+        mkdir -p /var/lib/cloudtrain /etc/tr-fleet/{{site}}
+        chmod 0700 /var/lib/cloudtrain
+        T=/etc/tr-fleet/{{site}}/token
+        printf 'fleet-{{site}}-8c41e7\n' > $T; chown root:root $T; chmod 0600 $T
+        rm -f /etc/tr-fleet/{{site}}/fleet.conf
+        printf '# Tallowmere fleet synchroniser: copy to /etc/tr-fleet/SITE/fleet.conf\nendpoint=http://fleet-api.tallowmere.test/v2\ntoken_file=/etc/tr-fleet/{{site}}/token\n' > /etc/tr-fleet/fleet.conf.example
+        cat > /var/lib/cloudtrain/fleet-sync.src <<'EOT'
+        import sys
+        CONF = "/etc/tr-fleet/{{site}}/fleet.conf"
+        try:
+            with open(CONF) as f:
+                text = f.read()
+        except OSError:
+            sys.exit(1)
+        conf = {}
+        for line in text.splitlines():
+            if "=" in line and not line.lstrip().startswith("#"):
+                k, v = line.split("=", 1)
+                conf[k.strip()] = v.strip()
+        try:
+            with open(conf["token_file"]) as f:
+                token = f.read().strip()
+        except (OSError, KeyError):
+            sys.exit(1)
+        if token != "fleet-{{site}}-8c41e7" or not conf.get("endpoint"):
+            sys.exit(1)
+        print("sync ok {{site}} records=4")
+        EOT
+        python3 - <<'EOT'
+        import base64, zlib
+        src = open("/var/lib/cloudtrain/fleet-sync.src", "rb").read()
+        blob = base64.b64encode(zlib.compress(src, 9)).decode()
+        open("/usr/local/bin/fleet-sync", "w").write(
+            "#!/usr/bin/python3\nimport base64, zlib\nexec(compile(zlib.decompress(base64.b64decode(%r)), 'fleet-sync', 'exec'))\n" % blob)
+        EOT
+        chmod 0755 /usr/local/bin/fleet-sync
+        sha256sum /usr/local/bin/fleet-sync | cut -d' ' -f1 > /var/lib/cloudtrain/fleet-sync.sha256
+        rm -f /var/lib/cloudtrain/fleet-sync.src
+  checks:
+    - id: sync-as-learner
+      description: Run as learner, fleet-sync succeeds and prints its "sync ok" line
+      type: shell
+      on: tr-fleet-02
+      skills: [linux.performance.tracing]
+      weight: 2.5
+      timeoutSec: 30
+      command: |
+        cd /tmp; out=$(runuser -u learner -- sh -c 'cd && fleet-sync' 2>&1); rc=$?
+        [ $rc -eq 0 ] && echo "$out" || echo "failed rc=$rc"
+      expect: {match: exact, value: "sync ok {{site}} records=4"}
+    - id: secret-not-open
+      description: The token file is not accessible to others and still holds its value
+      type: shell
+      on: tr-fleet-02
+      skills: [linux.performance.tracing]
+      weight: 1.5
+      command: |
+        grep -q '^token_file=/etc/tr-fleet/{{site}}/token' /etc/tr-fleet/{{site}}/fleet.conf 2>/dev/null || { echo not-started; exit 0; }
+        T=/etc/tr-fleet/{{site}}/token
+        [ "$(cat $T 2>/dev/null)" = "fleet-{{site}}-8c41e7" ] || { echo changed; exit 0; }
+        m=$(stat -c %a $T)
+        [ $(( 0$m & 7 )) -eq 0 ] && [ "$(getfacl -p $T 2>/dev/null | sed -n 's/^other:://p')" = "---" ] && echo private || echo "open-to-others ($m)"
+      expect: {match: exact, value: private}
+    - id: config-at-expected-path
+      description: The config file is at the path the tool opens and is not writable by group or others
+      type: shell
+      on: tr-fleet-02
+      skills: [linux.performance.tracing]
+      command: |
+        C=/etc/tr-fleet/{{site}}/fleet.conf
+        [ -f $C ] && grep -q '^token_file=/etc/tr-fleet/{{site}}/token' $C || { echo missing; exit 0; }
+        [ -z "$(find $C -maxdepth 0 -perm /022)" ] && echo ok || echo writable
+      expect: {match: exact, value: ok}
+    - id: tool-untouched
+      description: fleet-sync itself has not been modified
+      type: shell
+      on: tr-fleet-02
+      skills: [linux.performance.tracing]
+      command: |
+        grep -q '^token_file=/etc/tr-fleet/{{site}}/token' /etc/tr-fleet/{{site}}/fleet.conf 2>/dev/null || { echo not-started; exit 0; }
+        [ "$(sha256sum /usr/local/bin/fleet-sync | cut -d' ' -f1)" = "$(cat /var/lib/cloudtrain/fleet-sync.sha256)" ] && echo intact || echo modified
+      expect: {match: exact, value: intact}
+  hints:
+    - title: Trace only what matters
+      body: "`strace -f -e trace=openat,stat,access fleet-sync 2>&1 | grep -v ENOENT.*python` is noisy; try `strace -e trace=openat fleet-sync 2>&1 | grep -E 'tr-fleet|ENOENT|EACCES' | tail`. The failing open that matters is the last one before `exit_group(1)`."
+      cost: 1
+    - title: Read the errno
+      body: "`ENOENT` means the path does not exist; `EACCES` means it exists but you may not open it. `strace -o /tmp/t.out fleet-sync` keeps the trace in a file you can grep. `/etc/tr-fleet/fleet.conf.example` shows what the config should contain."
+      cost: 1
+    - title: Permission fix without opening it up
+      body: "Give access to the one account that needs it: `sudo chown learner /etc/tr-fleet/SITE/token`, or `sudo setfacl -m u:learner:r ...`, rather than `chmod o+r`."
+      cost: 2
+  misconceptions:
+    - id: config-only
+      description: Creates the missing config file but never finds the permission problem.
+      feedback: "There were two failures in the trace. After the config file opens, the next openat of the token file returns EACCES for your user. Look at the end of the trace again."
+      expectFail: [sync-as-learner]
+      mutation:
+        on: tr-fleet-02
+        as: learner
+        run: |
+          sudo cp /etc/tr-fleet/fleet.conf.example /etc/tr-fleet/{{site}}/fleet.conf
+    - id: world-readable-token
+      description: Makes the token readable by everyone to get past EACCES.
+      feedback: "That works, but the token is a secret: any account on the host can now read it. Give access only to the account that runs the tool (owner, group or ACL)."
+      expectFail: [secret-not-open]
+      mutation:
+        on: tr-fleet-02
+        as: learner
+        run: |
+          sudo cp /etc/tr-fleet/fleet.conf.example /etc/tr-fleet/{{site}}/fleet.conf
+          sudo chmod 0644 /etc/tr-fleet/{{site}}/token
+    - id: run-as-root
+      description: Runs the tool with sudo, where it works, and calls it fixed.
+      feedback: "As root the permission problem disappears, but the tool is meant to run as an ordinary user. Check the result of `fleet-sync` as yourself."
+      expectFail: [sync-as-learner]
+      mutation:
+        on: tr-fleet-02
+        as: learner
+        run: |
+          sudo cp /etc/tr-fleet/fleet.conf.example /etc/tr-fleet/{{site}}/fleet.conf
+          sudo /usr/local/bin/fleet-sync || true
+  solution:
+    explanation: |
+      strace shows an openat of /etc/tr-fleet/SITE/fleet.conf returning ENOENT (copy the
+      example there); after that an openat of the token file returns EACCES for the
+      unprivileged user (it is root:root 0600). Handing the file to the account that runs
+      the tool fixes it without opening it to others.
+    steps:
+      - on: tr-fleet-02
+        as: learner
+        run: |
+          strace -f -o /tmp/fs.trace -e trace=openat fleet-sync || true
+          grep -E 'tr-fleet.*(ENOENT|EACCES)' /tmp/fs.trace
+          sudo cp /etc/tr-fleet/fleet.conf.example /etc/tr-fleet/{{site}}/fleet.conf
+          strace -f -o /tmp/fs.trace -e trace=openat fleet-sync || true
+          grep -E 'tr-fleet.*(ENOENT|EACCES)' /tmp/fs.trace
+          sudo chown learner /etc/tr-fleet/{{site}}/token
+          fleet-sync
+    alternatives:
+      - id: acl-for-learner
+        description: Grant the learner read access to the token with an ACL and create the config with install.
+        steps:
+          - on: tr-fleet-02
+            as: learner
+            run: |
+              sudo install -m 0644 /etc/tr-fleet/fleet.conf.example /etc/tr-fleet/{{site}}/fleet.conf
+              sudo setfacl -m u:learner:r /etc/tr-fleet/{{site}}/token

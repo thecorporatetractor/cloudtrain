@@ -1,0 +1,211 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: package-repo-pinning
+  title: Add the vendor repository and pin the signalling agent version
+  domain: linux
+  frameworks: [lfcs:operations-deployment, linuxplus:services-users]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [apt, repositories, signed-by, apt-mark, pinning]
+  version: 1
+spec:
+  description: |
+    The signalling vendor publishes `tr-agent` in its own apt repository, served on
+    `tr-ops-03` at **`http://tr-vendor:8802/`** (a flat repository: suite `./`). Its
+    signing key is published next to it, at **`http://tr-vendor:8802/tallowmere-vendor.asc`**.
+    The repository carries three versions: 3.4.2, 3.5.0 and 3.6.1. A shell is open on this
+    host and you have `sudo`; everything else on the host comes from the local mirror.
+
+    1. Add the repository as an apt source that **verifies the vendor's signature** with that
+       key: use `signed-by` and never `trusted=yes` or any switch that disables checking.
+    2. Install **`tr-agent` version {{ver}}** exactly, not the newest one.
+    3. **Hold the version**: a later `apt-get full-upgrade` must leave `tr-agent` at
+       {{ver}}. (The platform team accepts either `apt-mark hold` or an apt pin.)
+  objectives:
+    - Add a third-party apt repository with its signing key and signed-by
+    - Install an exact package version
+    - Keep a package at its version with a hold or a pin
+  params:
+    ver:
+      type: choice
+      values: ["3.4.2", "3.5.0"]
+  topology:
+    entry: tr-ops-03
+    nodes:
+      - name: tr-ops-03
+        driver: container
+        image: deb-lab:24.04
+        access: [shell]
+        learnerSudo: true
+  setup:
+    - on: tr-ops-03
+      timeoutSec: 300
+      run: |
+        set -eu
+        echo 'learner ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/learner && chmod 0440 /etc/sudoers.d/learner
+        apt-get update -q >/dev/null
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -q gnupg apt-utils >/dev/null
+        grep -q ' tr-vendor$' /etc/hosts || echo '127.0.0.1 tr-vendor' >> /etc/hosts
+        R=/srv/vendor/apt; rm -rf /srv/vendor; mkdir -p $R
+        b=$(mktemp -d)
+        for v in 3.4.2 3.5.0 3.6.1; do
+          d=$b/tr-agent_$v; mkdir -p $d/DEBIAN $d/usr/bin
+          printf '#!/bin/sh\necho "tr-agent %s"\n' $v > $d/usr/bin/tr-agent; chmod 0755 $d/usr/bin/tr-agent
+          printf 'Package: tr-agent\nVersion: %s\nArchitecture: all\nMaintainer: Tallowmere Signalling <vendor@tallowmere.example>\nDescription: Tallowmere signalling agent\n' $v > $d/DEBIAN/control
+          dpkg-deb -b --root-owner-group $d $R/tr-agent_${v}_all.deb >/dev/null
+        done
+        cd $R && apt-ftparchive packages . > Packages && gzip -kf Packages
+        apt-ftparchive -o APT::FTPArchive::Release::Origin=Tallowmere -o APT::FTPArchive::Release::Label=Vendor release . > Release
+        G=$b/gpg; mkdir -m 0700 $G
+        gpg --batch --homedir $G --pinentry-mode loopback --passphrase '' --quick-gen-key 'Tallowmere Vendor <vendor@tallowmere.example>' ed25519 sign never >/dev/null 2>&1
+        gpg --batch --homedir $G --armor --export > $R/tallowmere-vendor.asc
+        mkdir -p /var/lib/cloudtrain; chmod 0700 /var/lib/cloudtrain
+        gpg --batch --homedir $G --with-colons --list-keys | awk -F: '/^fpr/ {print $10; exit}' > /var/lib/cloudtrain/vendor.fpr
+        gpg --batch --homedir $G --clearsign -o InRelease Release >/dev/null 2>&1
+        gpg --batch --homedir $G -abs -o Release.gpg Release >/dev/null 2>&1
+        gpgconf --homedir $G --kill all 2>/dev/null || true
+        rm -rf $b
+        rm -f /etc/apt/sources.list.d/tallowmere-vendor.* /etc/apt/preferences.d/tr-agent* /etc/apt/keyrings/tallowmere-vendor.*
+        pgrep -f '^python3 -m http.server 8802' >/dev/null || { setsid nohup python3 -m http.server 8802 --bind 127.0.0.1 --directory $R >/dev/null 2>&1 </dev/null & }
+        for i in $(seq 20); do curl -sf -o /dev/null http://tr-vendor:8802/InRelease && break; sleep 0.5; done
+  checks:
+    - id: version
+      description: tr-agent {{ver}} is installed
+      type: shell
+      on: tr-ops-03
+      skills: [linux.packages.version-pinning]
+      weight: 2
+      command: dpkg-query -W -f '${db:Status-Status} ${Version}' tr-agent 2>/dev/null || echo missing
+      expect: {match: exact, value: "installed {{ver}}"}
+    - id: survives-full-upgrade
+      description: A simulated apt-get full-upgrade does not replace tr-agent
+      type: shell
+      on: tr-ops-03
+      skills: [linux.packages.version-pinning]
+      weight: 1.5
+      timeoutSec: 90
+      command: |
+        [ "$(dpkg-query -W -f '${Version}' tr-agent 2>/dev/null)" = "{{ver}}" ] || { echo not-installed; exit 0; }
+        apt-get update -q >/dev/null 2>&1 || true
+        apt-cache policy tr-agent 2>/dev/null | grep -q '3.6.1' || { echo newer-version-not-visible; exit 0; }
+        apt-get -s full-upgrade 2>/dev/null | grep -q '^Inst tr-agent' && echo upgrades || echo stays
+      expect: {match: exact, value: stays}
+    - id: signed-source
+      description: The vendor source verifies signatures with the vendor key and nothing disables checking
+      type: shell
+      on: tr-ops-03
+      skills: [linux.packages.repositories]
+      weight: 1.5
+      timeoutSec: 90
+      command: |
+        if grep -rsiqE 'trusted(=|: *)yes|allow-insecure|AllowInsecureRepositories|AllowUnauthenticated' /etc/apt/sources.list /etc/apt/sources.list.d /etc/apt/apt.conf.d; then echo insecure; exit 0; fi
+        timeout 60 apt-get update 2>&1 | grep -qiE 'NO_PUBKEY|not signed|insecure|not been verified' && { echo unverified; exit 0; }
+        apt-cache policy tr-agent 2>/dev/null | grep -q 'http://tr-vendor:8802' || { echo no-source; exit 0; }
+        python3 - <<'PY'
+        import glob, re, subprocess
+        fpr = open('/var/lib/cloudtrain/vendor.fpr').read().strip()
+        keys = []
+        for f in ['/etc/apt/sources.list'] + glob.glob('/etc/apt/sources.list.d/*'):
+            try:
+                t = open(f).read()
+            except OSError:
+                continue
+            if f.endswith('.sources'):
+                for st in re.split(r'\n\s*\n', t):
+                    if 'tr-vendor:8802' in st:
+                        keys += re.findall(r'(?im)^signed-by:\s*(\S+)', st)
+            else:
+                for ln in t.splitlines():
+                    if 'tr-vendor:8802' in ln and not ln.lstrip().startswith('#'):
+                        keys += re.findall(r'(?i)signed-by=([^\]\s]+)', ln)
+        for k in keys:
+            try:
+                o = subprocess.run(['gpg', '--batch', '--show-keys', '--with-colons', k], capture_output=True, text=True).stdout
+            except OSError:
+                continue
+            if fpr and fpr in o:
+                print('signed'); raise SystemExit
+        print('no-signed-by')
+        PY
+      expect: {match: exact, value: signed}
+  hints:
+    - title: Key and source
+      body: "`sudo install -d -m 0755 /etc/apt/keyrings`, download the key into it (`curl -o ...`), then a source file in /etc/apt/sources.list.d naming it: `deb [signed-by=/etc/apt/keyrings/tallowmere-vendor.asc] http://tr-vendor:8802/ ./` (one-line format) or a deb822 `.sources` file with `Signed-By:`. Then `sudo apt-get update`."
+      cost: 1
+    - title: Exact version
+      body: "`apt-cache policy tr-agent` lists the versions; `sudo apt-get install tr-agent=VERSION` installs one."
+      cost: 1
+    - title: Keeping it
+      body: "`sudo apt-mark hold tr-agent` (check with `apt-mark showhold`) or a file in /etc/apt/preferences.d with `Package: tr-agent`, `Pin: version VERSION`, `Pin-Priority: 1001`. `apt-get -s full-upgrade` simulates an upgrade without changing anything."
+      cost: 1
+  misconceptions:
+    - id: newest-installed
+      description: Installs tr-agent without a version, which picks 3.6.1.
+      feedback: "Without `=VERSION` apt installs the highest version available. List the choices with apt-cache policy and name the one you need."
+      expectFail: [version]
+      mutation:
+        on: tr-ops-03
+        as: learner
+        timeoutSec: 180
+        run: |
+          sudo install -d -m 0755 /etc/apt/keyrings
+          sudo curl -sfo /etc/apt/keyrings/tallowmere-vendor.asc http://tr-vendor:8802/tallowmere-vendor.asc
+          echo 'deb [signed-by=/etc/apt/keyrings/tallowmere-vendor.asc] http://tr-vendor:8802/ ./' | sudo tee /etc/apt/sources.list.d/tallowmere-vendor.list >/dev/null
+          sudo apt-get update -q >/dev/null && sudo apt-get install -y -q tr-agent >/dev/null && sudo apt-mark hold tr-agent
+    - id: trusted-yes
+      description: Skips signature checking with trusted=yes.
+      feedback: "trusted=yes accepts unsigned or forged repository metadata. Download the key and reference it with signed-by."
+      expectFail: [signed-source]
+      mutation:
+        on: tr-ops-03
+        as: learner
+        timeoutSec: 180
+        run: |
+          echo 'deb [trusted=yes] http://tr-vendor:8802/ ./' | sudo tee /etc/apt/sources.list.d/tallowmere-vendor.list >/dev/null
+          sudo apt-get update -q >/dev/null && sudo apt-get install -y -q tr-agent={{ver}} >/dev/null && sudo apt-mark hold tr-agent
+    - id: not-held
+      description: Installs the right version but does not hold or pin it.
+      feedback: "An exact install is not sticky: the next full-upgrade moves tr-agent to 3.6.1. Hold it (apt-mark hold) or pin it."
+      expectFail: [survives-full-upgrade]
+      mutation:
+        on: tr-ops-03
+        as: learner
+        timeoutSec: 180
+        run: |
+          sudo install -d -m 0755 /etc/apt/keyrings
+          sudo curl -sfo /etc/apt/keyrings/tallowmere-vendor.asc http://tr-vendor:8802/tallowmere-vendor.asc
+          echo 'deb [signed-by=/etc/apt/keyrings/tallowmere-vendor.asc] http://tr-vendor:8802/ ./' | sudo tee /etc/apt/sources.list.d/tallowmere-vendor.list >/dev/null
+          sudo apt-get update -q >/dev/null && sudo apt-get install -y -q tr-agent={{ver}} >/dev/null
+  solution:
+    explanation: |
+      Download the key into /etc/apt/keyrings, reference it with signed-by in a source file,
+      update, install tr-agent=VERSION and hold it with apt-mark.
+    steps:
+      - on: tr-ops-03
+        as: learner
+        timeoutSec: 180
+        run: |
+          set -e
+          sudo install -d -m 0755 /etc/apt/keyrings
+          sudo curl -sfo /etc/apt/keyrings/tallowmere-vendor.asc http://tr-vendor:8802/tallowmere-vendor.asc
+          echo 'deb [signed-by=/etc/apt/keyrings/tallowmere-vendor.asc] http://tr-vendor:8802/ ./' | sudo tee /etc/apt/sources.list.d/tallowmere-vendor.list >/dev/null
+          sudo apt-get update -q >/dev/null
+          apt-cache policy tr-agent
+          sudo apt-get install -y -q tr-agent={{ver}} >/dev/null
+          sudo apt-mark hold tr-agent
+    alternatives:
+      - id: deb822-and-pin
+        description: A deb822 .sources file, and an apt preferences pin instead of a hold.
+        steps:
+          - on: tr-ops-03
+            as: learner
+            timeoutSec: 180
+            run: |
+              set -e
+              sudo install -d -m 0755 /etc/apt/keyrings
+              curl -sf http://tr-vendor:8802/tallowmere-vendor.asc | sudo tee /etc/apt/keyrings/tallowmere-vendor.asc >/dev/null
+              printf 'Types: deb\nURIs: http://tr-vendor:8802/\nSuites: ./\nSigned-By: /etc/apt/keyrings/tallowmere-vendor.asc\n' | sudo tee /etc/apt/sources.list.d/tallowmere-vendor.sources >/dev/null
+              printf 'Package: tr-agent\nPin: version {{ver}}\nPin-Priority: 1001\n' | sudo tee /etc/apt/preferences.d/tr-agent >/dev/null
+              sudo apt-get update -q >/dev/null
+              sudo apt-get install -y -q --allow-downgrades tr-agent={{ver}} >/dev/null

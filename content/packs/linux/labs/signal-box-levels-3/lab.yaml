@@ -1,0 +1,229 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: signal-box-levels-3
+  title: 'Signal box challenge: levels 11 to 15'
+  domain: linux
+  frameworks: [lpic1:security]
+  difficulty: hard
+  estimatedMinutes: 40
+  tags: [challenge, ctf, ssh, sftp, nc, tls, cron]
+  version: 1
+spec:
+  description: |
+    The signal-box puzzle ends here. Level 11 is open: start in `~/signalbox/level11`
+    and read its `README`. This time the levels live behind services on the host
+    `sb-gate` (the loopback): ssh logins, a plain-text relay, a TLS relay and a job that
+    cron runs.
+
+    When you find a level's password, unlock the next level with
+    `sb-unlock NEXT_LEVEL PASSWORD`; it appears as `~/signalbox/levelN`. Level 15
+    leads to the **final token**: write it (just the token) to
+    `~/answers/signal-box-3.txt`.
+
+    Passwords are 24 hexadecimal characters. You are an ordinary user on this host: no
+    `sudo`, and the answers are not on disk where you can read them.
+  objectives:
+    - Log in with an ssh key and fix its permissions
+    - Transfer files with sftp on a non-default port
+    - Talk to a plain-text and a TLS service with nc and openssl s_client
+    - Read a cron entry and the script it runs to see how a scheduled job works
+  params:
+    key:
+      type: int
+      min: 100000
+      max: 999999
+  topology:
+    entry: tr-signalbox-03
+    nodes:
+      - name: tr-signalbox-03
+        driver: container
+        image: deb-lab:24.04
+        access: [shell]
+  setup:
+    - on: tr-signalbox-03
+      file: {path: /usr/local/bin/sb-unlock, source: assets/sb-unlock, mode: "0755"}
+    - on: tr-signalbox-03
+      file: {path: /usr/local/lib/signalbox/relay.py, source: assets/relay.py, mode: "0644"}
+    - on: tr-signalbox-03
+      file: {path: /var/lib/cloudtrain/build-levels.sh, source: assets/build-levels.sh, mode: "0700"}
+    - on: tr-signalbox-03
+      timeoutSec: 120
+      run: |
+        set -eu
+        chmod 0755 /usr/local/bin/sb-unlock; chmod 0700 /var/lib/cloudtrain /var/lib/cloudtrain/build-levels.sh
+        bash /var/lib/cloudtrain/build-levels.sh {{key}}
+        install -d -o learner -g learner /home/learner/answers
+        rm -f /home/learner/answers/signal-box-3.txt
+  checks:
+    - id: reached-level-13
+      description: Levels 12 and 13 are unlocked
+      type: shell
+      on: tr-signalbox-03
+      skills: [linux.remote.ssh]
+      weight: 0.5
+      command: |
+        want=$(printf 'sb-%s-%s' {{key}} 1013 | sha256sum | cut -c1-24)
+        [ "$(sed -n 's/^gate-ref: //p' /home/learner/signalbox/level13/README 2>/dev/null)" = "$want" ] && echo yes || echo no
+      expect: {match: exact, value: "yes"}
+    - id: reached-level-15
+      description: Levels 14 and 15 are unlocked
+      type: shell
+      on: tr-signalbox-03
+      skills: [linux.net.troubleshooting]
+      command: |
+        want=$(printf 'sb-%s-%s' {{key}} 1015 | sha256sum | cut -c1-24)
+        [ "$(sed -n 's/^gate-ref: //p' /home/learner/signalbox/level15/README 2>/dev/null)" = "$want" ] && echo yes || echo no
+      expect: {match: exact, value: "yes"}
+    - id: final-token
+      description: ~/answers/signal-box-3.txt holds the final token
+      type: shell
+      on: tr-signalbox-03
+      skills: [linux.processes.scheduled-jobs]
+      weight: 2
+      command: |
+        want=$(printf 'sb-%s-%s' {{key}} 15 | sha256sum | cut -c1-24)
+        [ "$(tr -d '[:space:]' < /home/learner/answers/signal-box-3.txt 2>/dev/null)" = "$want" ] && echo correct || echo wrong
+      expect: {match: exact, value: correct}
+  hints:
+    - title: Level 11
+      body: "ssh refuses a private key that others can read: `chmod 600` it, then `ssh -i level11/id_gate11 gate11@sb-gate`. You can run a command instead of a shell: `ssh ... cat password-12`."
+      cost: 1
+    - title: Level 12
+      body: "A server on port 2222 that only offers file transfer: `sftp -P 2222 -i KEY gate12@sb-gate` (capital P), then `get relay.txt`."
+      cost: 1
+    - title: Level 13
+      body: "`nc 127.0.0.1 30013`, then type the password. If nc exits before the answer arrives, send the line with a short delay: `(echo PASSWORD; sleep 1) | nc ...`."
+      cost: 1
+    - title: Level 14
+      body: "The port speaks TLS, so nc shows only noise. `openssl s_client -quiet -connect 127.0.0.1:30014` does the handshake (the certificate is self-signed; -quiet skips the report)."
+      cost: 2
+    - title: Level 15
+      body: "`cat /etc/cron.d/sb-dispatch`, then read the script it runs. It tells you what to leave behind so the next run delivers the token to you. Cron runs it once a minute."
+      cost: 2
+  misconceptions:
+    - id: previous-password
+      description: Writes the level 14 password instead of the token delivered at level 15.
+      feedback: "The last password you unlocked with is not the final token. The token arrives in reply.txt after the dispatcher has run for your request."
+      expectFail: [final-token]
+      mutation:
+        on: tr-signalbox-03
+        as: learner
+        run: |
+          bash <<'EOS'
+          set -e
+          o="-o StrictHostKeyChecking=accept-new -o BatchMode=yes"
+          cd ~/signalbox
+          chmod 600 level11/id_gate11
+          p=$(ssh -n $o -i level11/id_gate11 gate11@sb-gate cat password-12 | awk '{print $NF}'); sb-unlock 12 "$p"
+          chmod 600 level12/id_gate12
+          echo 'get relay.txt /tmp/relay.txt' | sftp $o -P 2222 -i level12/id_gate12 -b - gate12@sb-gate >/dev/null
+          p=$(awk '{print $NF}' /tmp/relay.txt); sb-unlock 13 "$p"
+          q=$( (echo "$p"; sleep 1) | nc 127.0.0.1 30013 | awk '{print $NF}' | tail -1); sb-unlock 14 "$q"
+          r=$( (echo "$q"; sleep 1) | openssl s_client -quiet -connect 127.0.0.1:30014 2>/dev/null | awk '{print $NF}' | tail -1); sb-unlock 15 "$r"
+          echo "$r" > ~/answers/signal-box-3.txt
+          EOS
+    - id: nc-on-tls-port
+      description: Talks to the level 14 service with nc and never gets past it.
+      feedback: "Port 30014 speaks TLS: nc sends plain text into a handshake and gets nothing useful back. Use a TLS client such as openssl s_client."
+      expectFail: [reached-level-15, final-token]
+      mutation:
+        on: tr-signalbox-03
+        as: learner
+        run: |
+          bash <<'EOS'
+          set -e
+          o="-o StrictHostKeyChecking=accept-new -o BatchMode=yes"
+          cd ~/signalbox
+          chmod 600 level11/id_gate11
+          p=$(ssh -n $o -i level11/id_gate11 gate11@sb-gate cat password-12 | awk '{print $NF}'); sb-unlock 12 "$p"
+          chmod 600 level12/id_gate12
+          echo 'get relay.txt /tmp/relay.txt' | sftp $o -P 2222 -i level12/id_gate12 -b - gate12@sb-gate >/dev/null
+          p=$(awk '{print $NF}' /tmp/relay.txt); sb-unlock 13 "$p"
+          q=$( (echo "$p"; sleep 1) | nc 127.0.0.1 30013 | awk '{print $NF}' | tail -1); sb-unlock 14 "$q"
+          (echo "$q"; sleep 1) | nc -w 3 127.0.0.1 30014 > /dev/null || true
+          EOS
+    - id: touch-request-only
+      description: Skips levels 11 to 14 and just leaves an empty request for the dispatcher.
+      feedback: "The dispatcher answers only a request that holds the password which unlocks level 15, so there is no shortcut around the earlier levels."
+      expectFail: [final-token, reached-level-15]
+      mutation:
+        on: tr-signalbox-03
+        as: learner
+        timeoutSec: 150
+        run: |
+          mkdir -p ~/signalbox/level15 && touch ~/signalbox/level15/request ~/signalbox/level15/README
+          for i in $(seq 45); do [ -s ~/signalbox/level15/reply.txt ] && break; sleep 2; done
+          awk '{print $NF}' ~/signalbox/level15/reply.txt > ~/answers/signal-box-3.txt 2>/dev/null || true
+    - id: symlink-request
+      description: Symlinks the request to the dispatcher's own token file instead of solving levels 11 to 14.
+      feedback: "The dispatcher refuses links and only trusts a request you wrote yourself with the password that unlocks level 15, so there is no shortcut around the earlier levels."
+      expectFail: [final-token, reached-level-15]
+      mutation:
+        on: tr-signalbox-03
+        as: learner
+        timeoutSec: 150
+        run: |
+          mkdir -p ~/signalbox/level15 && ln -sf /var/lib/cloudtrain/sb14.token ~/signalbox/level15/request
+          for i in $(seq 45); do [ -L ~/signalbox/level15/request ] || break; sleep 2; done
+          awk '{print $NF}' ~/signalbox/level15/reply.txt > ~/answers/signal-box-3.txt 2>/dev/null || true
+  solution:
+    explanation: |
+      Level 11: fix the key's mode and run `cat` over ssh. Level 12: sftp on port 2222.
+      Level 13: nc to the plain relay. Level 14: openssl s_client to the TLS relay.
+      Level 15: the cron entry runs /usr/local/sbin/sb-dispatch, which answers a
+      `request` file left in ~/signalbox/level15 on its next run, but only when the file
+      holds the password that unlocked level 15.
+    steps:
+      - on: tr-signalbox-03
+        timeoutSec: 180
+        as: learner
+        run: |
+          bash <<'EOS'
+          set -e
+          o="-o StrictHostKeyChecking=accept-new -o BatchMode=yes"
+          cd ~/signalbox
+          chmod 600 level11/id_gate11
+          p=$(ssh -n $o -i level11/id_gate11 gate11@sb-gate cat password-12 | awk '{print $NF}'); sb-unlock 12 "$p"
+          chmod 600 level12/id_gate12
+          echo 'get relay.txt /tmp/relay.txt' | sftp $o -P 2222 -i level12/id_gate12 -b - gate12@sb-gate >/dev/null
+          p=$(awk '{print $NF}' /tmp/relay.txt); sb-unlock 13 "$p"
+          q=$( (echo "$p"; sleep 1) | nc 127.0.0.1 30013 | awk '{print $NF}' | tail -1); sb-unlock 14 "$q"
+          r=$( (echo "$q"; sleep 1) | openssl s_client -quiet -connect 127.0.0.1:30014 2>/dev/null | awk '{print $NF}' | tail -1); sb-unlock 15 "$r"
+          cat /etc/cron.d/sb-dispatch /usr/local/sbin/sb-dispatch
+          echo "$r" > level15/request
+          for i in $(seq 90); do [ -s level15/reply.txt ] && break; sleep 2; done
+          awk '{print $NF}' level15/reply.txt > ~/answers/signal-box-3.txt
+          cat ~/answers/signal-box-3.txt
+          EOS
+    alternatives:
+      - id: python-tls-client
+        description: Use a small python3 TLS client for level 14 and ssh -p / scp-style options for the early levels.
+        steps:
+          - on: tr-signalbox-03
+            timeoutSec: 180
+            as: learner
+            run: |
+              bash <<'EOS'
+              set -e
+              cd ~/signalbox
+              install -m 600 level11/id_gate11 /tmp/k11
+              printf 'Host sb-gate\n  StrictHostKeyChecking accept-new\n  BatchMode yes\n' > ~/.ssh/config
+              p=$(ssh -n -i /tmp/k11 gate11@sb-gate 'grep -o "[0-9a-f]\{24\}" password-12'); sb-unlock 12 "$p"
+              install -m 600 level12/id_gate12 /tmp/k12
+              sftp -P 2222 -i /tmp/k12 gate12@sb-gate:relay.txt /tmp/relay.txt >/dev/null </dev/null
+              p=$(grep -o '[0-9a-f]\{24\}' /tmp/relay.txt); sb-unlock 13 "$p"
+              q=$(echo "$p" | nc -q 1 127.0.0.1 30013 | grep -o '[0-9a-f]\{24\}$'); sb-unlock 14 "$q"
+              r=$(python3 - "$q" <<'PY'
+              import socket, ssl, sys, re
+              c = ssl.create_default_context(); c.check_hostname = False; c.verify_mode = ssl.CERT_NONE
+              with c.wrap_socket(socket.create_connection(("127.0.0.1", 30014)), server_hostname="sb-gate") as s:
+                  s.recv(200); s.sendall(sys.argv[1].encode() + b"\n")
+                  print(re.search(r"[0-9a-f]{24}$", s.recv(200).decode().strip()).group(0))
+              PY
+              )
+              sb-unlock 15 "$r"
+              echo "$r" > level15/request
+              until [ -s level15/reply.txt ]; do sleep 3; done
+              grep -o '[0-9a-f]\{24\}' level15/reply.txt > ~/answers/signal-box-3.txt
+              EOS

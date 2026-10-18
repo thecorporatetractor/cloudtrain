@@ -1,0 +1,239 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: haproxy-ticket-backends
+  title: Load-balance the ticket API with health checks
+  domain: linux
+  frameworks: [lfcs:networking, lpic2:http]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [haproxy, load-balancing, health-checks, round-robin]
+  version: 1
+spec:
+  description: |
+    The ticket API on `tr-tickets-01` runs as three instances on `127.0.0.1:8081`,
+    `127.0.0.1:8082` and `127.0.0.1:8083` (each answers `/` with its own name and `/health`
+    with `ok`). Clients should use **`http://tickets-api.tallowmere.test/`** (port 80, this
+    host) and never notice when an instance dies. HAProxy is installed but not running;
+    there is no systemd, so you start it yourself
+    (`sudo haproxy -D -f /etc/haproxy/haproxy.cfg -p /run/haproxy.pid`) and, after a change,
+    reload it with `sudo haproxy -D -f /etc/haproxy/haproxy.cfg -p /run/haproxy.pid -sf $(cat /run/haproxy.pid)`.
+    A shell is open on this host and you have `sudo`.
+
+    Configure `/etc/haproxy/haproxy.cfg` so that:
+
+    1. HAProxy listens on **port 80** and spreads requests **round robin** over all three
+       instances;
+    2. every instance has an **HTTP health check** (`GET /health`), so a stopped instance
+       **and** one that still accepts connections but answers errors are taken out of
+       rotation;
+    3. once the health check has marked an instance down (allow about 10 seconds), requests
+       keep succeeding on the remaining ones, and the instance returns to rotation when it
+       is healthy again.
+
+    The file must pass `haproxy -c -f /etc/haproxy/haproxy.cfg`, and HAProxy must be
+    running with it.
+  objectives:
+    - Define a frontend and backend with round-robin balancing
+    - Add HTTP health checks that catch a broken but listening backend
+    - Start and reload HAProxy without systemd
+  params:
+    prefix:
+      type: choice
+      values: [tkt, api]
+  topology:
+    entry: tr-tickets-01
+    nodes:
+      - name: tr-tickets-01
+        driver: container
+        image: deb-lab:24.04
+        access: [shell]
+        learnerSudo: true
+  setup:
+    - on: tr-tickets-01
+      timeoutSec: 240
+      run: |
+        set -eu
+        echo 'learner ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/learner && chmod 0440 /etc/sudoers.d/learner
+        dpkg -s haproxy >/dev/null 2>&1 || { apt-get update -q >/dev/null; DEBIAN_FRONTEND=noninteractive apt-get install -y -q haproxy >/dev/null; }
+        V=/var/lib/cloudtrain; mkdir -p $V; chmod 0700 $V
+        grep -q ' tickets-api.tallowmere.test$' /etc/hosts || echo '127.0.0.1 tickets-api.tallowmere.test' >> /etc/hosts
+        mkdir -p /usr/local/lib/tr-backends /run/tr-backends /run/haproxy /var/lib/haproxy
+        cat > /usr/local/lib/tr-backends/backend.py <<'EOT'
+        #!/usr/bin/env python3
+        import http.server, os, sys
+        PORT, NAME = int(sys.argv[1]), sys.argv[2]
+        SICK = "/run/tr-backends/%d.sick" % PORT
+        class H(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.0"
+            def do_GET(self):
+                if os.path.exists(SICK):
+                    code, body = 503, "unavailable\n"
+                elif self.path == "/health":
+                    code, body = 200, "ok\n"
+                elif self.path == "/echo":
+                    code, body = 200, "host=%s\nxff=%s\n" % (self.headers.get("Host"), self.headers.get("X-Forwarded-For"))
+                else:
+                    code, body = 200, NAME + "\n"
+                self.send_response(code); self.send_header("Content-Type", "text/plain"); self.send_header("Content-Length", str(len(body))); self.end_headers()
+                self.wfile.write(body.encode())
+            def log_message(self, *a):
+                pass
+        class S(http.server.ThreadingHTTPServer):
+            allow_reuse_address = True
+        S(("127.0.0.1", PORT), H).serve_forever()
+        EOT
+        printf '8081 {{prefix}}-1\n8082 {{prefix}}-2\n8083 {{prefix}}-3\n' > $V/backends.map
+        cat > $V/backend-ctl <<'EOT'
+        #!/bin/sh
+        # backend-ctl start|stop|sick|heal PORT (grader helper)
+        p=$2; n=$(awk -v p=$p '$1 == p {print $2}' /var/lib/cloudtrain/backends.map)
+        case "$1" in
+          stop) pkill -f "^python3 /usr/local/lib/tr-backends/backend.py $p " || true ;;
+          start) pgrep -f "^python3 /usr/local/lib/tr-backends/backend.py $p " >/dev/null || (setsid nohup python3 /usr/local/lib/tr-backends/backend.py $p $n >/dev/null 2>&1 </dev/null &) ;;
+          sick) touch /run/tr-backends/$p.sick ;;
+          heal) rm -f /run/tr-backends/$p.sick ;;
+        esac
+        EOT
+        chmod 0700 $V/backend-ctl
+        rm -f /run/tr-backends/*.sick
+        for p in 8081 8082 8083; do $V/backend-ctl stop $p; done
+        sleep 1
+        for p in 8081 8082 8083; do $V/backend-ctl start $p; done
+        for i in $(seq 20); do curl -sf -o /dev/null http://127.0.0.1:8081/health && curl -sf -o /dev/null http://127.0.0.1:8082/health && curl -sf -o /dev/null http://127.0.0.1:8083/health && break; sleep 0.5; done
+        # --- HAProxy: distribution configuration (global/defaults only), not running
+        pkill -x haproxy 2>/dev/null || true
+        [ -f /etc/haproxy/haproxy.cfg.dist ] || cp /etc/haproxy/haproxy.cfg /etc/haproxy/haproxy.cfg.dist
+        awk '/^(frontend|backend|listen) / {exit} {print}' /etc/haproxy/haproxy.cfg.dist > /etc/haproxy/haproxy.cfg
+        rm -f /run/haproxy.pid
+  checks:
+    - id: config-running
+      description: haproxy.cfg passes haproxy -c and HAProxy is running
+      type: shell
+      on: tr-tickets-01
+      skills: [linux.services.web-proxy]
+      command: |
+        haproxy -c -f /etc/haproxy/haproxy.cfg >/dev/null 2>&1 && c=valid || c=invalid
+        pgrep -x haproxy >/dev/null && p=running || p=stopped
+        echo "$c $p"
+      expect: {match: exact, value: "valid running"}
+    - id: round-robin
+      description: Twelve requests to port 80 are shared equally over the three instances
+      type: shell
+      on: tr-tickets-01
+      skills: [linux.services.web-proxy]
+      weight: 2
+      timeoutSec: 40
+      command: |
+        cd /tmp
+        for i in $(seq 12); do curl -s --max-time 5 http://tickets-api.tallowmere.test/; done | sort | uniq -c | awk '{printf "%s:%s ", $2, $1}'
+      expect: {match: exact, value: "{{prefix}}-1:4 {{prefix}}-2:4 {{prefix}}-3:4 "}
+    - id: stopped-instance-removed
+      description: With the second instance stopped, requests keep succeeding and none goes to it; it returns once it is back
+      type: shell
+      on: tr-tickets-01
+      skills: [linux.services.web-proxy]
+      weight: 2
+      timeoutSec: 120
+      command: |
+        cd /tmp; C=/var/lib/cloudtrain/backend-ctl
+        $C stop 8082; sleep 10
+        bad=0; seen=$(for i in $(seq 15); do b=$(curl -s --max-time 5 -w '|%{http_code}' http://tickets-api.tallowmere.test/); [ "${b#*|}" = 200 ] || echo FAIL; echo "${b%|*}"; done | grep -v '^$' | sort -u | tr '\n' ',')
+        $C start 8082; sleep 14
+        back=$(for i in $(seq 12); do curl -s --max-time 5 http://tickets-api.tallowmere.test/; done | sort -u | wc -l)
+        echo "seen=$seen back=$back"
+      expect: {match: exact, value: "seen={{prefix}}-1,{{prefix}}-3, back=3"}
+    - id: sick-instance-removed
+      description: An instance that still accepts connections but answers 503 is taken out of rotation too
+      type: shell
+      on: tr-tickets-01
+      skills: [linux.services.web-proxy]
+      weight: 2
+      timeoutSec: 120
+      command: |
+        cd /tmp; C=/var/lib/cloudtrain/backend-ctl
+        $C sick 8083; sleep 10
+        seen=$(for i in $(seq 15); do b=$(curl -s --max-time 5 -w '|%{http_code}' http://tickets-api.tallowmere.test/); [ "${b#*|}" = 200 ] || echo FAIL; echo "${b%|*}"; done | grep -v '^$' | sort -u | tr '\n' ',')
+        $C heal 8083; sleep 14
+        echo "seen=$seen"
+      expect: {match: exact, value: "seen={{prefix}}-1,{{prefix}}-2,"}
+  hints:
+    - title: Frontend and backend
+      body: "`frontend tickets` with `bind *:80`, `default_backend api`; `backend api` with `balance roundrobin` and one `server NAME 127.0.0.1:PORT check` line per instance (defaults already say `mode http`)."
+      cost: 1
+    - title: A check that speaks HTTP
+      body: "A bare `check` only tests that the TCP port accepts connections. `option httpchk GET /health` in the backend makes `check` send that request and require a 2xx/3xx answer. Tune detection with `inter 2s fall 3 rise 2` on the server lines."
+      cost: 1
+    - title: Starting and reloading
+      body: "`sudo haproxy -c -f /etc/haproxy/haproxy.cfg` validates. Start with `-D -p /run/haproxy.pid`; to reload add `-sf $(cat /run/haproxy.pid)` so the old process finishes its connections and exits."
+      cost: 1
+  misconceptions:
+    - id: tcp-check-only
+      description: Enables check on the servers but not an HTTP health check.
+      feedback: "A plain `check` only opens the TCP port, so an instance that is up but answering 503 stays in rotation and one in three requests fails. Add `option httpchk GET /health`."
+      expectFail: [sick-instance-removed]
+      mutation:
+        on: tr-tickets-01
+        as: learner
+        run: |
+          printf '%s\n' '' 'frontend tickets' '    bind *:80' '    default_backend api' '' 'backend api' '    balance roundrobin' '    server a 127.0.0.1:8081 check' '    server b 127.0.0.1:8082 check' '    server c 127.0.0.1:8083 check' | sudo tee -a /etc/haproxy/haproxy.cfg >/dev/null
+          sudo haproxy -D -f /etc/haproxy/haproxy.cfg -p /run/haproxy.pid
+          sleep 2
+    - id: source-balancing
+      description: Uses balance source, which sends one client to one instance.
+      feedback: "`balance source` hashes the client address, so a single client always reaches the same server. Round robin rotates through all of them."
+      expectFail: [round-robin]
+      mutation:
+        on: tr-tickets-01
+        as: learner
+        run: |
+          printf '%s\n' '' 'frontend tickets' '    bind *:80' '    default_backend api' '' 'backend api' '    balance source' '    option httpchk GET /health' '    server a 127.0.0.1:8081 check' '    server b 127.0.0.1:8082 check' '    server c 127.0.0.1:8083 check' | sudo tee -a /etc/haproxy/haproxy.cfg >/dev/null
+          sudo haproxy -D -f /etc/haproxy/haproxy.cfg -p /run/haproxy.pid
+          sleep 2
+    - id: no-health-checks
+      description: Lists the three servers without any check.
+      feedback: "Without `check` HAProxy keeps sending traffic to a dead instance and clients get errors. Every server line needs `check` (and the backend an HTTP check)."
+      expectFail: [stopped-instance-removed, sick-instance-removed]
+      mutation:
+        on: tr-tickets-01
+        as: learner
+        run: |
+          printf '%s\n' '' 'frontend tickets' '    bind *:80' '    default_backend api' '' 'backend api' '    balance roundrobin' '    server a 127.0.0.1:8081' '    server b 127.0.0.1:8082' '    server c 127.0.0.1:8083' | sudo tee -a /etc/haproxy/haproxy.cfg >/dev/null
+          sudo haproxy -D -f /etc/haproxy/haproxy.cfg -p /run/haproxy.pid
+          sleep 2
+    - id: never-started
+      description: Writes a correct configuration but never starts HAProxy.
+      feedback: "There is no systemd, and the package does not start the daemon in this lab. Start it with `haproxy -D -f ... -p /run/haproxy.pid`."
+      expectFail: [config-running, round-robin, stopped-instance-removed, sick-instance-removed]
+      mutation:
+        on: tr-tickets-01
+        as: learner
+        run: |
+          printf '%s\n' '' 'frontend tickets' '    bind *:80' '    default_backend api' '' 'backend api' '    balance roundrobin' '    option httpchk GET /health' '    server a 127.0.0.1:8081 check' '    server b 127.0.0.1:8082 check' '    server c 127.0.0.1:8083 check' | sudo tee -a /etc/haproxy/haproxy.cfg >/dev/null
+  solution:
+    explanation: |
+      A frontend on port 80 with a backend using round robin, `option httpchk GET /health`
+      and `check` on each of the three servers; validate with `haproxy -c` and start (or
+      reload with -sf) the daemon.
+    steps:
+      - on: tr-tickets-01
+        as: learner
+        timeoutSec: 60
+        run: |
+          printf '%s\n' '' 'frontend tickets' '    bind *:80' '    default_backend api' '' 'backend api' '    balance roundrobin' '    option httpchk GET /health' '    default-server inter 2s fall 3 rise 2' '    server a 127.0.0.1:8081 check' '    server b 127.0.0.1:8082 check' '    server c 127.0.0.1:8083 check' | sudo tee -a /etc/haproxy/haproxy.cfg >/dev/null
+          sudo haproxy -c -f /etc/haproxy/haproxy.cfg
+          sudo haproxy -D -f /etc/haproxy/haproxy.cfg -p /run/haproxy.pid
+          sleep 3
+          for i in 1 2 3; do curl -s http://tickets-api.tallowmere.test/; done
+    alternatives:
+      - id: listen-section-faster-checks
+        description: A single listen section with the http-check send/expect syntax and quicker detection settings.
+        steps:
+          - on: tr-tickets-01
+            as: learner
+            timeoutSec: 60
+            run: |
+              printf '%s\n' '' 'listen tickets' '    bind 0.0.0.0:80' '    balance roundrobin' '    option httpchk' '    http-check send meth GET uri /health' '    http-check expect status 200' '    server s1 127.0.0.1:8081 check inter 1s fall 2 rise 2' '    server s2 127.0.0.1:8082 check inter 1s fall 2 rise 2' '    server s3 127.0.0.1:8083 check inter 1s fall 2 rise 2' | sudo tee -a /etc/haproxy/haproxy.cfg >/dev/null
+              sudo haproxy -c -f /etc/haproxy/haproxy.cfg
+              sudo haproxy -D -f /etc/haproxy/haproxy.cfg -p /run/haproxy.pid
+              sleep 3

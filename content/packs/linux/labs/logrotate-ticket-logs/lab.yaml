@@ -1,0 +1,230 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: logrotate-ticket-logs
+  title: Rotate the ticket API logs before they fill the disk
+  domain: linux
+  frameworks: [lpic1:essential-services, linuxplus:security]
+  difficulty: easy
+  estimatedMinutes: 12
+  tags: [logrotate, logs, postrotate, signals, retention]
+  version: 1
+spec:
+  description: |
+    The ticket API on `tr-ticket-02` writes two logs, `api.log` and `audit.log`, in
+    **`{{logdir}}`**, and nothing rotates them. A shell is open on this host and you have
+    `sudo`; there is no systemd, so the API is a plain background process (user
+    `ticketapi`, pid in `/run/tr-ticket/api.pid`).
+
+    Add a logrotate policy as **`/etc/logrotate.d/tr-ticket`** that, for both logs:
+
+    - rotates **daily**;
+    - keeps **14** old copies, **compressed** (the default numbered names:
+      `api.log.1.gz` ... `api.log.14.gz`);
+    - makes the API **reopen its log files after each rotation**. The API reopens them when
+      it receives `SIGHUP`; do not use `copytruncate`;
+    - does not fail if a log is missing or rotate a log that is empty.
+
+    Then prove it with a forced run (`sudo logrotate -f /etc/logrotate.d/tr-ticket`): the
+    API must keep logging into the new files, not into the rotated ones.
+  objectives:
+    - Write a logrotate stanza with daily, rotate and compress
+    - Tell a daemon to reopen its logs from postrotate
+    - Test a policy with logrotate -d and a forced run
+  params:
+    logdir:
+      type: choice
+      values: [/var/log/tr-ticket, /var/log/ticketing]
+  topology:
+    entry: tr-ticket-02
+    nodes:
+      - name: tr-ticket-02
+        driver: container
+        image: deb-lab:24.04
+        access: [shell]
+        learnerSudo: true
+  setup:
+    - on: tr-ticket-02
+      run: |
+        set -eu
+        echo 'learner ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/learner && chmod 0440 /etc/sudoers.d/learner
+        id ticketapi >/dev/null 2>&1 || useradd -r -m -s /usr/sbin/nologin ticketapi
+        V=/var/lib/cloudtrain; mkdir -p $V; chmod 0700 $V
+        pkill -f '^python3 /usr/local/lib/tr-ticket/api.py' 2>/dev/null || true
+        sleep 1
+        rm -rf {{logdir}} /run/tr-ticket /etc/logrotate.d/tr-ticket /var/lib/logrotate/status
+        mkdir -p {{logdir}} /run/tr-ticket /usr/local/lib/tr-ticket
+        chown ticketapi:ticketapi /run/tr-ticket {{logdir}}
+        for n in api audit; do
+          for i in $(seq 1 200); do printf '2026-10-17 21:%02d:%02d seed-%s-%s entry %s\n' $((i / 60)) $((i % 60)) $n {{logdir}} $i; done > {{logdir}}/$n.log
+          chown ticketapi:ticketapi {{logdir}}/$n.log; chmod 0640 {{logdir}}/$n.log
+        done
+        cat > /usr/local/lib/tr-ticket/api.py <<'EOT'
+        #!/usr/bin/env python3
+        """Ticket API stand-in: logs to two files and reopens them on SIGHUP."""
+        import os, signal, sys, time
+        LOG = sys.argv[1]
+        PID = "/run/tr-ticket/api.pid"
+        COUNT = "/run/tr-ticket/reopens"
+        reopen_flag = [True]
+        reopens = [0]
+        signal.signal(signal.SIGHUP, lambda *_: reopen_flag.__setitem__(0, True))
+        open(PID, "w").write(str(os.getpid()))
+        files = {}
+        i = 0
+        while True:
+            if reopen_flag[0]:
+                reopen_flag[0] = False
+                for n in ("api", "audit"):
+                    if n in files:
+                        files[n].close()
+                    files[n] = open("%s/%s.log" % (LOG, n), "a", buffering=1)
+                reopens[0] += 1
+                open(COUNT, "w").write(str(reopens[0] - 1))
+            i += 1
+            files["api"].write("%s GET /tickets/%d 200\n" % (time.strftime("%F %T"), i))
+            files["audit"].write("%s audit purchase %d\n" % (time.strftime("%F %T"), i))
+            time.sleep(0.2)
+        EOT
+        chmod 0755 /usr/local/lib/tr-ticket/api.py
+        (setsid nohup runuser -u ticketapi -- python3 /usr/local/lib/tr-ticket/api.py {{logdir}} >/dev/null 2>&1 </dev/null &)
+        for i in $(seq 20); do [ -s /run/tr-ticket/api.pid ] && break; sleep 0.5; done
+  checks:
+    - id: policy-parses
+      description: /etc/logrotate.d/tr-ticket parses and covers both logs with daily rotation, 14 rotations and compression
+      type: shell
+      on: tr-ticket-02
+      skills: [linux.observability.logrotate]
+      weight: 2
+      command: |
+        f=/etc/logrotate.d/tr-ticket
+        [ -f $f ] || { echo missing; exit 0; }
+        o=$(logrotate -d -s /tmp/lr-check.state $f 2>&1; logrotate -d -f -s /tmp/lr-check.state $f 2>&1)
+        printf '%s\n' "$o" | grep -qi 'error' && { echo error; exit 0; }
+        for n in api audit; do printf '%s\n' "$o" | grep -q "considering log {{logdir}}/$n.log" || { echo "not-covered:$n"; exit 0; }; done
+        printf '%s\n' "$o" | grep -q 'after 1 days (14 rotations)' || { echo "not-daily-14"; exit 0; }
+        printf '%s\n' "$o" | grep -q 'compressing log with' || { echo "no-compress"; exit 0; }
+        grep -qE '^[[:space:]]*(copytruncate|dateext)' $f && { echo "copytruncate-or-dateext"; exit 0; }
+        printf '%s\n' "$o" | grep -q 'empty log files are not rotated' || { echo "rotates-empty"; exit 0; }
+        sed 's#{{logdir}}#/nonexistent-lr-dir#g' $f > /tmp/lr-missing.conf
+        logrotate -d -s /tmp/lr-check2.state /tmp/lr-missing.conf 2>&1 | grep -qi 'error' && { echo "fails-on-missing"; rm -f /tmp/lr-missing.conf; exit 0; }
+        rm -f /tmp/lr-missing.conf
+        echo ok
+      expect: {match: exact, value: ok}
+    - id: forced-rotation
+      description: A forced run rotates and compresses both logs, signals the API (it reopens) and the API logs into the new files
+      type: shell
+      on: tr-ticket-02
+      skills: [linux.observability.logrotate]
+      weight: 2.5
+      timeoutSec: 60
+      command: |
+        L={{logdir}}; f=/etc/logrotate.d/tr-ticket
+        [ -f $f ] || { echo no-policy; exit 0; }
+        pid=$(cat /run/tr-ticket/api.pid); kill -0 $pid 2>/dev/null || { echo api-dead; exit 0; }
+        before=$(cat /run/tr-ticket/reopens 2>/dev/null || echo 0)
+        logrotate -f -s /var/lib/cloudtrain/lr.state $f >/dev/null 2>&1
+        sleep 3
+        r=""
+        [ -s $L/api.log.1.gz ] && [ -s $L/audit.log.1.gz ] && r="rotated" || r="not-rotated"
+        zcat $L/api.log.*.gz 2>/dev/null | grep -q 'seed-api' && r="$r content" || r="$r no-content"
+        [ -s $L/api.log ] && grep -q 'GET /tickets' $L/api.log && r="$r new-api-log" || r="$r api-log-empty"
+        after=$(cat /run/tr-ticket/reopens 2>/dev/null || echo 0)
+        [ "$after" -gt "$before" ] && r="$r reopened" || r="$r not-signalled"
+        kill -0 $pid 2>/dev/null && r="$r alive" || r="$r killed"
+        echo $r
+      expect: {match: exact, value: "rotated content new-api-log reopened alive"}
+    - id: keeps-fourteen
+      description: After many forced runs exactly 14 compressed copies of each log remain
+      type: shell
+      on: tr-ticket-02
+      skills: [linux.observability.logrotate]
+      weight: 1.5
+      timeoutSec: 90
+      command: |
+        L={{logdir}}; f=/etc/logrotate.d/tr-ticket
+        [ -f $f ] || { echo no-policy; exit 0; }
+        for i in $(seq 17); do logrotate -f -s /var/lib/cloudtrain/lr.state $f >/dev/null 2>&1; sleep 0.6; done
+        echo "$(ls $L/api.log.*.gz 2>/dev/null | wc -l) $(ls $L/audit.log.*.gz 2>/dev/null | wc -l)"
+      expect: {match: exact, value: "14 14"}
+  hints:
+    - title: A stanza
+      body: "`man logrotate`: a stanza is `/path/to/log /path/to/other { directives }`. Directives you need: `daily`, `rotate N`, `compress`, `missingok`, `notifempty`, `sharedscripts`, `postrotate ... endscript`."
+      cost: 1
+    - title: Telling the daemon
+      body: "A process keeps writing to the file it opened, even after logrotate renames it. The API reopens its files on SIGHUP: in `postrotate` send `kill -HUP \"$(cat /run/tr-ticket/api.pid)\"`. With `sharedscripts` the script runs once for all logs."
+      cost: 1
+    - title: Test without waiting a day
+      body: "`sudo logrotate -d /etc/logrotate.d/tr-ticket` shows what would happen without doing it (it parses errors, too); `sudo logrotate -f ...` forces a rotation now."
+      cost: 1
+  misconceptions:
+    - id: no-signal
+      description: Rotates and compresses but never tells the API to reopen its files.
+      feedback: "After the rename the API still writes to the old (now compressed and deleted) file, so the live log stays empty. Send SIGHUP from postrotate."
+      expectFail: [forced-rotation]
+      mutation:
+        on: tr-ticket-02
+        as: learner
+        run: |
+          printf '%s\n' '{{logdir}}/*.log {' '    daily' '    rotate 14' '    compress' '    missingok' '    notifempty' '}' | sudo tee /etc/logrotate.d/tr-ticket >/dev/null
+    - id: weekly-four
+      description: Uses weekly with four copies.
+      feedback: "The policy asked for daily rotation and 14 copies. `weekly` and `rotate 4` keep a month at most and rotate too rarely."
+      expectFail: [policy-parses, keeps-fourteen]
+      mutation:
+        on: tr-ticket-02
+        as: learner
+        run: |
+          printf '%s\n' '{{logdir}}/*.log {' '    weekly' '    rotate 4' '    compress' '    missingok' '    notifempty' '    sharedscripts' '    postrotate' '        kill -HUP "$(cat /run/tr-ticket/api.pid)"' '    endscript' '}' | sudo tee /etc/logrotate.d/tr-ticket >/dev/null
+    - id: copytruncate-shortcut
+      description: Uses copytruncate instead of signalling the service.
+      feedback: "copytruncate can lose lines written between the copy and the truncate and is a workaround for programs that cannot reopen their logs. This one can: signal it."
+      expectFail: [policy-parses, forced-rotation]
+      mutation:
+        on: tr-ticket-02
+        as: learner
+        run: |
+          printf '%s\n' '{{logdir}}/*.log {' '    daily' '    rotate 14' '    compress' '    missingok' '    notifempty' '    copytruncate' '}' | sudo tee /etc/logrotate.d/tr-ticket >/dev/null
+    - id: no-compress
+      description: Forgets the compress directive.
+      feedback: "Without `compress` the old copies stay as plain text and use the disk the policy is meant to protect."
+      expectFail: [policy-parses, forced-rotation]
+      mutation:
+        on: tr-ticket-02
+        as: learner
+        run: |
+          printf '%s\n' '{{logdir}}/*.log {' '    daily' '    rotate 14' '    missingok' '    notifempty' '    sharedscripts' '    postrotate' '        kill -HUP "$(cat /run/tr-ticket/api.pid)"' '    endscript' '}' | sudo tee /etc/logrotate.d/tr-ticket >/dev/null
+    - id: no-missingok-notifempty
+      description: Signals the API correctly but leaves out missingok and notifempty.
+      feedback: "The policy must not fail when a log is missing (`missingok`) and must not rotate an empty log (`notifempty`)."
+      expectFail: [policy-parses]
+      mutation:
+        on: tr-ticket-02
+        as: learner
+        run: |
+          printf '%s\n' '{{logdir}}/*.log {' '    daily' '    rotate 14' '    compress' '    sharedscripts' '    postrotate' '        kill -HUP "$(cat /run/tr-ticket/api.pid)"' '    endscript' '}' | sudo tee /etc/logrotate.d/tr-ticket >/dev/null
+  solution:
+    explanation: |
+      One stanza for both logs: daily, rotate 14, compress, missingok, notifempty, and a
+      postrotate script that sends SIGHUP to the API (sharedscripts so it runs once). A
+      forced run proves the files rotate and the API reopens them.
+    steps:
+      - on: tr-ticket-02
+        as: learner
+        run: |
+          printf '%s\n' '{{logdir}}/*.log {' '    daily' '    rotate 14' '    compress' '    missingok' '    notifempty' '    sharedscripts' '    postrotate' '        kill -HUP "$(cat /run/tr-ticket/api.pid)"' '    endscript' '}' | sudo tee /etc/logrotate.d/tr-ticket >/dev/null
+          sudo logrotate -d /etc/logrotate.d/tr-ticket 2>&1 | tail -n 5
+          sudo logrotate -f /etc/logrotate.d/tr-ticket
+          sleep 2; ls -l {{logdir}}
+    alternatives:
+      - id: one-stanza-per-log
+        description: Separate stanzas for api.log and audit.log, each signalling through a small reload script.
+        steps:
+          - on: tr-ticket-02
+            as: learner
+            run: |
+              printf '%s\n' '#!/bin/sh' 'kill -HUP "$(cat /run/tr-ticket/api.pid)"' | sudo tee /usr/local/sbin/tr-ticket-reopen >/dev/null
+              sudo chmod 0755 /usr/local/sbin/tr-ticket-reopen
+              for n in api audit; do
+                printf '%s\n' '{{logdir}}/'$n'.log {' '    daily' '    rotate 14' '    compress' '    missingok' '    notifempty' '    postrotate' '        /usr/local/sbin/tr-ticket-reopen' '    endscript' '}'
+              done | sudo tee /etc/logrotate.d/tr-ticket >/dev/null

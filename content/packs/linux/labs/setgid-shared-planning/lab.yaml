@@ -1,0 +1,176 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: setgid-shared-planning
+  title: Build a collaborative directory for the planning team
+  domain: linux
+  frameworks: [rhcsa-aligned:filesystems, lpic1:devices-filesystems]
+  difficulty: easy
+  estimatedMinutes: 10
+  tags: [setgid, sticky-bit, permissions, groups, mkdir]
+  version: 1
+spec:
+  description: |
+    The timetable planners on `tr-planning-01` need a shared working directory,
+    **`/srv/planning`**. A shell is open on this host and you have `sudo`.
+
+    The group **`planners`** already exists. Its members are `{{u1}}`, `{{u2}}` and
+    `{{u3}}`. The account `{{outsider}}` is not a planner. Create the directory so that:
+
+    - it belongs to the group `planners`, and only planners can enter it (members have
+      full access; everyone else none);
+    - **files and subdirectories created in it automatically belong to `planners`**, not
+      to the creator's own primary group (and new subdirectories behave the same way);
+    - a member **cannot delete or rename another member's files**, even though the group
+      has write access to the directory;
+    - members can still read and, when their umask allows group write, edit each other's
+      files.
+
+    Test with `sudo -u {{u1}} ...` (use `sh -c 'umask 002; touch /srv/planning/x'` for a
+    team-style umask) and inspect with `ls -ld` and `stat`.
+  objectives:
+    - Use the setgid bit on a directory so new files inherit its group
+    - Use the sticky bit to stop members deleting each other's files
+    - Read special bits in ls -l and numeric modes
+  params:
+    u1:
+      type: choice
+      values: [ravi, noor]
+    u2:
+      type: choice
+      values: [hana, piet]
+    u3:
+      type: choice
+      values: [amara, bram]
+    outsider:
+      type: choice
+      values: [kofi, mina]
+  topology:
+    entry: tr-planning-01
+    nodes:
+      - name: tr-planning-01
+        driver: container
+        image: el-lab:10
+        access: [shell]
+        learnerSudo: true
+  setup:
+    - on: tr-planning-01
+      run: |
+        set -eu
+        echo 'learner ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/learner && chmod 0440 /etc/sudoers.d/learner
+        getent group planners >/dev/null || groupadd planners
+        for u in {{u1}} {{u2}} {{u3}} {{outsider}}; do id $u >/dev/null 2>&1 || useradd -m $u; done
+        for u in {{u1}} {{u2}} {{u3}}; do usermod -aG planners $u; done
+        gpasswd -d {{outsider}} planners >/dev/null 2>&1 || true
+        rm -rf /srv/planning
+  checks:
+    - id: dir-mode
+      description: /srv/planning is a directory of group planners with mode 3770 (setgid, sticky, no access for others)
+      type: shell
+      on: tr-planning-01
+      skills: [linux.files.special-bits]
+      weight: 2
+      command: stat -c '%G %a' /srv/planning 2>/dev/null || echo missing
+      expect: {match: exact, value: "planners 3770"}
+    - id: group-inherited
+      description: Files and subdirectories created by a member belong to planners, and a new subdirectory is setgid too
+      type: shell
+      on: tr-planning-01
+      skills: [linux.files.special-bits]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        cd /tmp; d=/srv/planning
+        runuser -u {{u1}} -- sh -c "umask 002; touch $d/inh-file; mkdir $d/inh-dir; touch $d/inh-dir/f" >/dev/null 2>&1
+        r="$(stat -c %G $d/inh-file $d/inh-dir $d/inh-dir/f 2>/dev/null | tr '\n' ' ')$(stat -c %A $d/inh-dir 2>/dev/null | cut -c7)"
+        rm -rf $d/inh-file $d/inh-dir; echo "$r"
+      expect: {match: exact, value: "planners planners planners s"}
+    - id: no-cross-delete
+      description: "{{u2}} can edit but not delete or rename {{u1}}'s file, while {{u1}} can delete their own"
+      type: shell
+      on: tr-planning-01
+      skills: [linux.files.special-bits]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        cd /tmp; d=/srv/planning; r=""
+        runuser -u {{u1}} -- sh -c "umask 002; echo v1 > $d/team.txt" >/dev/null 2>&1
+        runuser -u {{u2}} -- sh -c "echo v2 >> $d/team.txt" >/dev/null 2>&1 && r="$r edits" || r="$r noedit"
+        runuser -u {{u2}} -- rm -f $d/team.txt >/dev/null 2>&1; [ -e $d/team.txt ] && r="$r rm-blocked" || r="$r rm-allowed"
+        runuser -u {{u2}} -- mv $d/team.txt $d/stolen.txt >/dev/null 2>&1; [ -e $d/team.txt ] && r="$r mv-blocked" || r="$r mv-allowed"
+        runuser -u {{u1}} -- rm -f $d/team.txt >/dev/null 2>&1; [ -e $d/team.txt ] && r="$r owner-stuck" || r="$r owner-rm"
+        rm -f $d/team.txt $d/stolen.txt; echo $r
+      expect: {match: exact, value: "edits rm-blocked mv-blocked owner-rm"}
+    - id: outsiders-locked-out
+      description: "{{outsider}} cannot list, read or create anything in the directory; {{u3}} can"
+      type: shell
+      on: tr-planning-01
+      skills: [linux.files.special-bits]
+      timeoutSec: 30
+      command: |
+        cd /tmp; d=/srv/planning; r=""
+        runuser -u {{u3}} -- sh -c "touch $d/u3.txt" >/dev/null 2>&1 && r="$r member-creates" || r="$r member-blocked"
+        runuser -u {{outsider}} -- ls $d >/dev/null 2>&1 && r="$r outsider-lists" || r="$r outsider-denied"
+        runuser -u {{outsider}} -- touch $d/o.txt >/dev/null 2>&1 && r="$r outsider-creates" || r="$r outsider-no-create"
+        rm -f $d/u3.txt $d/o.txt; echo $r
+      expect: {match: exact, value: "member-creates outsider-denied outsider-no-create"}
+  hints:
+    - title: Special bits on a directory
+      body: "On a directory the setgid bit (`chmod g+s`, the leading 2 in a numeric mode) makes new entries inherit the directory's group; the sticky bit (`chmod +t`, leading 1) lets only an entry's owner (or the directory's owner) delete or rename it."
+      cost: 1
+    - title: Numeric mode
+      body: "Special bits form a fourth leading digit: setgid 2 + sticky 1 = 3, so `chmod 3770` gives `drwxrws--T`. `install -d -m 3770 -g planners /srv/planning` creates and sets it in one go."
+      cost: 1
+    - title: Reading ls -l
+      body: "An `s` in the group position means setgid with execute; `T` at the end means sticky without execute for others (`t` with it). Capital letters mean the underlying execute bit is missing."
+      cost: 1
+  misconceptions:
+    - id: setgid-only
+      description: Sets the group and setgid but forgets the sticky bit.
+      feedback: "With only setgid, any member can still delete or rename the other members' files, because the group has write access to the directory. Add the sticky bit (+t)."
+      expectFail: [dir-mode, no-cross-delete]
+      mutation:
+        on: tr-planning-01
+        as: learner
+        run: |
+          sudo mkdir /srv/planning && sudo chgrp planners /srv/planning && sudo chmod 2770 /srv/planning
+    - id: sticky-only
+      description: Sets the sticky bit but forgets setgid, so new files get the creator's own group.
+      feedback: "Without setgid, a new file takes the creator's primary group, not planners, and the other members may not be able to read it. Set the setgid bit on the directory (g+s)."
+      expectFail: [dir-mode, group-inherited]
+      mutation:
+        on: tr-planning-01
+        as: learner
+        run: |
+          sudo mkdir /srv/planning && sudo chgrp planners /srv/planning && sudo chmod 1770 /srv/planning
+    - id: open-to-all
+      description: Uses 3777 so that everyone can work in the directory.
+      feedback: "The mode must keep others out: 3770, not 3777. World access lets accounts outside the team list and write in the planners' directory."
+      expectFail: [dir-mode, outsiders-locked-out]
+      mutation:
+        on: tr-planning-01
+        as: learner
+        run: |
+          sudo mkdir /srv/planning && sudo chgrp planners /srv/planning && sudo chmod 3777 /srv/planning
+  solution:
+    explanation: |
+      Create the directory with group planners and mode 3770: the leading 3 is setgid (new
+      entries inherit planners, subdirectories included) plus sticky (only the owner of an
+      entry can remove or rename it); 770 keeps everyone but the group out.
+    steps:
+      - on: tr-planning-01
+        as: learner
+        run: |
+          sudo install -d -m 3770 -g planners /srv/planning
+          ls -ld /srv/planning
+    alternatives:
+      - id: symbolic-modes
+        description: Build the directory step by step with symbolic chmod.
+        steps:
+          - on: tr-planning-01
+            as: learner
+            run: |
+              sudo mkdir /srv/planning
+              sudo chgrp planners /srv/planning
+              sudo chmod u=rwx,g=rwx,o= /srv/planning
+              sudo chmod g+s,+t /srv/planning

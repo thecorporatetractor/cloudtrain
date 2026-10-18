@@ -1,0 +1,189 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: python-venv-fleet-report
+  title: Ship a Python fleet report in its own virtual environment
+  domain: linux
+  frameworks: [linuxplus:automation-scripting]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [python, venv, pip, dependencies]
+  version: 1
+spec:
+  description: |
+    The rolling-stock team on `tr-fleet-01` has a Python report script,
+    `/opt/fleet-report/report.py`, that fetches the {{depot}} depot's fleet list from the
+    fleet API (`http://127.0.0.1:8803/fleet.json`) and prints a table. It needs the
+    **`requests`** and **`rich`** libraries, which are not installed, and the service
+    account **`fleet`** has to run it nightly. A shell is open on this host and you have
+    `sudo`.
+
+    The host has no internet access; `pip` is already configured to use the offline index
+    at `http://mirror.cloudtrain-mirrors.svc/pypi/simple/`.
+
+    1. Create a virtual environment in **`/opt/fleet-report`** (the script already lives
+       there) and install `requests` and `rich` **into it**.
+    2. Do not touch the system Python: the system interpreter must still not have these
+       libraries.
+    3. The command `/opt/fleet-report/bin/python /opt/fleet-report/report.py` must print
+       the rolling-stock table when run by the user `fleet`.
+  objectives:
+    - Create a virtual environment with python3 -m venv
+    - Install packages into the environment with its own pip
+    - Run a script with the environment's interpreter without activating it
+    - Keep dependencies out of the system Python
+  params:
+    depot:
+      type: choice
+      values: [Ashford, Brimley, Carrow]
+  topology:
+    entry: tr-fleet-01
+    nodes:
+      - name: tr-fleet-01
+        driver: container
+        image: deb-lab:24.04
+        access: [shell]
+        learnerSudo: true
+  setup:
+    - on: tr-fleet-01
+      run: |
+        set -eu
+        echo 'learner ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/learner && chmod 0440 /etc/sudoers.d/learner
+        id fleet >/dev/null 2>&1 || useradd -m -s /bin/bash fleet
+        rm -rf /opt/fleet-report /srv/fleet-api; mkdir -p /opt/fleet-report /srv/fleet-api
+        cat > /opt/fleet-report/report.py <<'EOT'
+        #!/usr/bin/env python3
+        """Rolling-stock report for one depot (Tallowmere Rail)."""
+        import requests
+        from rich.console import Console
+        from rich.table import Table
+
+        data = requests.get("http://127.0.0.1:8803/fleet.json", timeout=5).json()
+        table = Table(title="Rolling stock: " + data["depot"])
+        for col in ("Unit", "Class", "Status", "Km since overhaul"):
+            table.add_column(col)
+        for u in sorted(data["units"], key=lambda u: u["id"]):
+            table.add_row(u["id"], u["class"], u["status"], str(u["km"]))
+        Console(width=100).print(table)
+        in_service = sum(1 for u in data["units"] if u["status"] == "in service")
+        print("Fleet: %d units, %d in service" % (len(data["units"]), in_service))
+        EOT
+        chmod 0644 /opt/fleet-report/report.py
+        python3 - {{depot}} > /srv/fleet-api/fleet.json <<'EOT'
+        import json, random, sys
+        depot = sys.argv[1]
+        r = random.Random(depot)
+        status = ["in service", "in service", "in service", "maintenance", "stored"]
+        units = [{"id": "TR-%s-%02d" % (depot[:3].upper(), n), "class": r.choice(["158", "170", "195"]),
+                  "status": r.choice(status), "km": r.randrange(20000, 480000, 500)} for n in range(1, 10)]
+        print(json.dumps({"depot": depot, "units": units}))
+        EOT
+        pgrep -f '^python3 -m http.server 8803' >/dev/null || { setsid nohup python3 -m http.server 8803 --bind 127.0.0.1 --directory /srv/fleet-api >/dev/null 2>&1 </dev/null & }
+        for i in $(seq 20); do curl -sf -o /dev/null http://127.0.0.1:8803/fleet.json && break; sleep 0.5; done
+  checks:
+    - id: venv-in-place
+      description: /opt/fleet-report is a virtual environment that does not use the system site-packages
+      type: shell
+      on: tr-fleet-01
+      skills: [linux.packages.language-envs]
+      command: |
+        [ -x /opt/fleet-report/bin/python ] || { echo no-venv; exit 0; }
+        /opt/fleet-report/bin/python -c 'import sys; print("venv" if sys.prefix != sys.base_prefix else "not-venv")' 2>/dev/null || echo broken
+        grep -q 'include-system-site-packages = false' /opt/fleet-report/pyvenv.cfg 2>/dev/null || echo system-site
+      expect: {match: exact, value: venv}
+    - id: deps-isolated
+      description: requests and rich import inside the environment but not in the system Python
+      type: shell
+      on: tr-fleet-01
+      skills: [linux.packages.language-envs, linux.shell.python-basics]
+      weight: 1.5
+      timeoutSec: 30
+      command: |
+        /opt/fleet-report/bin/python -c 'import requests, rich' 2>/dev/null && v=venv-yes || v=venv-no
+        /usr/bin/python3 -c 'import requests' 2>/dev/null && s=system-has-requests || s=system-clean
+        /usr/bin/python3 -c 'import rich' 2>/dev/null && r=system-has-rich || r=system-clean
+        echo "$v $s $r"
+      expect: {match: exact, value: "venv-yes system-clean system-clean"}
+    - id: report-output
+      description: Run as the user fleet, the script prints every unit of the depot and the correct summary line
+      type: shell
+      on: tr-fleet-01
+      skills: [linux.shell.python-basics]
+      weight: 2
+      timeoutSec: 60
+      command: |
+        out=$(cd /tmp && runuser -u fleet -- /opt/fleet-report/bin/python /opt/fleet-report/report.py 2>&1)
+        python3 - "$out" <<'EOT'
+        import json, sys
+        out = sys.argv[1]
+        d = json.load(open("/srv/fleet-api/fleet.json"))
+        lines = out.splitlines()
+        miss = [u["id"] for u in d["units"] if not any(u["id"] in l and u["status"] in l and u["class"] in l for l in lines)]
+        ins = sum(1 for u in d["units"] if u["status"] == "in service")
+        want = "Fleet: %d units, %d in service" % (len(d["units"]), ins)
+        print("ok" if not miss and lines and lines[-1] == want else "bad")
+        EOT
+      expect: {match: exact, value: ok}
+  hints:
+    - title: Where to create it
+      body: "`/opt` belongs to root, so `sudo python3 -m venv /opt/fleet-report` (the directory already exists and may be used as is)."
+      cost: 1
+    - title: Install into the environment, not the system
+      body: "Use the environment's own pip: `sudo /opt/fleet-report/bin/pip install requests rich`. The bare `pip` command belongs to the system Python."
+      cost: 1
+    - title: Run without activating
+      body: "`/opt/fleet-report/bin/python report.py` uses the environment's libraries; no `source bin/activate` is needed in a cron job or a unit file."
+      cost: 1
+  misconceptions:
+    - id: system-wide-install
+      description: Installs the libraries system-wide instead of into a virtual environment.
+      feedback: "System-wide installs change what every other script on the host imports and can break distribution tools. Keep the libraries in a venv and run the script with its interpreter."
+      expectFail: [venv-in-place, deps-isolated, report-output]
+      mutation:
+        on: tr-fleet-01
+        as: learner
+        run: |
+          sudo pip install --break-system-packages -q requests rich >/dev/null
+    - id: venv-in-home
+      description: Builds the environment in the home directory instead of /opt/fleet-report.
+      feedback: "The nightly job runs as fleet and expects /opt/fleet-report/bin/python. An environment in your home directory is not where the job looks."
+      expectFail: [venv-in-place, deps-isolated, report-output]
+      mutation:
+        on: tr-fleet-01
+        as: learner
+        run: |
+          python3 -m venv ~/fleet-venv && ~/fleet-venv/bin/pip install -q requests rich >/dev/null
+    - id: only-requests
+      description: Installs requests but forgets rich, so the report crashes on import.
+      feedback: "The script imports both libraries. Run it with the venv's python to see the ModuleNotFoundError, then install what is missing."
+      expectFail: [deps-isolated, report-output]
+      mutation:
+        on: tr-fleet-01
+        as: learner
+        run: |
+          sudo python3 -m venv /opt/fleet-report && sudo /opt/fleet-report/bin/pip install -q requests >/dev/null
+  solution:
+    explanation: |
+      Create the environment in /opt/fleet-report, install both libraries with that
+      environment's pip (it picks up the offline index from the system pip configuration)
+      and run the script with the environment's interpreter.
+    steps:
+      - on: tr-fleet-01
+        as: learner
+        timeoutSec: 180
+        run: |
+          sudo python3 -m venv /opt/fleet-report
+          sudo /opt/fleet-report/bin/pip install -q requests rich
+          /opt/fleet-report/bin/python /opt/fleet-report/report.py
+    alternatives:
+      - id: wheels-then-offline-install
+        description: Download the wheels first, then install into the environment from that folder only.
+        steps:
+          - on: tr-fleet-01
+            as: learner
+            timeoutSec: 180
+            run: |
+              sudo python3 -m venv /opt/fleet-report
+              w=$(mktemp -d)
+              sudo /opt/fleet-report/bin/pip download -q -d "$w" requests rich
+              sudo /opt/fleet-report/bin/pip install -q --no-index --find-links "$w" requests rich

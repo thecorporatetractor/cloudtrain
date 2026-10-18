@@ -1,0 +1,227 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: fix-cron-silent-failure
+  title: Fix a cron job that works by hand but not on schedule
+  domain: linux
+  frameworks: [linuxplus:troubleshooting, lpic1:admin-tasks]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [cron, crontab, environment, PATH, troubleshooting]
+  version: 1
+spec:
+  description: |
+    On `tr-timetable-02` the timetable sync merges the regional CSV drops in
+    `/srv/timetable/inbox/` into one file per day, `/srv/timetable/sync/sync-YYYY-MM-DD.csv`.
+    It runs as the service user **`ttsync`** from that user's crontab, every {{step}} minutes.
+    A shell is open on this host and you have `sudo`; the cron daemon is running.
+
+    Run by hand it works:
+
+    ```
+    sudo -u ttsync -i /opt/timetable/sync.sh
+    ```
+
+    but the scheduled run never produces anything and nothing complains. Find out why and
+    fix it, so that:
+
+    1. the job in **ttsync's crontab** (edit it with `sudo crontab -u ttsync -e`) produces
+       today's sync file when cron runs it;
+    2. its standard output **and** standard error end up in today's log file
+       `/var/log/tt-sync/sync-YYYY-MM-DD.log` (appended), so the next failure is visible;
+    3. it keeps running every {{step}} minutes.
+
+    Do not copy a pre-built file into place: the sync must keep merging whatever is in the
+    inbox. The behaviour you are matching is that of cron, not of a login shell.
+  objectives:
+    - Reproduce a cron job's minimal environment outside cron
+    - Fix PATH and missing variables with crontab environment lines
+    - Handle the special meaning of % in a crontab command
+    - Keep the output of scheduled jobs in a log
+  params:
+    step:
+      type: choice
+      values: ["5", "10", "15"]
+    region:
+      type: choice
+      values: [north, coast, valley]
+  topology:
+    entry: tr-timetable-02
+    nodes:
+      - name: tr-timetable-02
+        driver: container
+        image: deb-lab:24.04
+        access: [shell]
+        learnerSudo: true
+  setup:
+    - on: tr-timetable-02
+      run: |
+        set -eu
+        echo 'learner ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/learner && chmod 0440 /etc/sudoers.d/learner
+        id ttsync >/dev/null 2>&1 || useradd -m -s /bin/bash ttsync
+        mkdir -p /opt/tr/bin /opt/timetable /srv/timetable/inbox /srv/timetable/sync /var/log/tt-sync /var/lib/cloudtrain
+        chmod 0700 /var/lib/cloudtrain
+        chown ttsync: /srv/timetable/sync /var/log/tt-sync
+        rm -f /srv/timetable/sync/* /var/log/tt-sync/* /srv/timetable/inbox/*
+        # The merge helper lives outside cron's default PATH; the login profile adds it.
+        cat > /opt/tr/bin/tt-merge <<'EOT'
+        #!/bin/sh
+        # tt-merge FILE...: one header line, then the sorted unique rows of all files.
+        head -n 1 "$1"; for f in "$@"; do tail -n +2 "$f"; done | sort -u
+        EOT
+        chmod 0755 /opt/tr/bin/tt-merge
+        printf '%s\n' '# Tallowmere timetable environment' 'export PATH="$PATH:/opt/tr/bin"' 'export TT_OUT=/srv/timetable/sync' > /etc/profile.d/tr-timetable.sh
+        cat > /opt/timetable/sync.sh <<'EOT'
+        #!/bin/bash
+        # Tallowmere Rail timetable sync: merge the regional drops into today's file.
+        set -eu
+        : "${TT_OUT:?TT_OUT is not set}"
+        day=$(date +%F)
+        tt-merge /srv/timetable/inbox/*.csv > "$TT_OUT/sync-$day.csv.tmp"
+        mv "$TT_OUT/sync-$day.csv.tmp" "$TT_OUT/sync-$day.csv"
+        echo "$(date '+%F %T') sync ok rows=$(( $(wc -l < "$TT_OUT/sync-$day.csv") - 1 ))"
+        EOT
+        chmod 0755 /opt/timetable/sync.sh
+        printf 'train,dep,platform\nTR{{region}}01,06:10,2\nTR{{region}}02,06:40,1\n' > /srv/timetable/inbox/{{region}}-am.csv
+        printf 'train,dep,platform\nTR{{region}}03,17:05,3\nTR{{region}}02,06:40,1\n' > /srv/timetable/inbox/{{region}}-pm.csv
+        printf 'train,dep,platform\nTRfreight9,23:50,5\n' > /srv/timetable/inbox/freight.csv
+        chown -R ttsync: /srv/timetable/inbox
+        # What cron does: a minimal environment, /bin/sh, % ends the command. The grader
+        # replays the user's crontab entry through this.
+        cat > /var/lib/cloudtrain/cronsim.py <<'EOT'
+        #!/usr/bin/env python3
+        import subprocess, re, sys, pwd
+        user = sys.argv[1]
+        tab = subprocess.run(["crontab", "-u", user, "-l"], capture_output=True, text=True).stdout
+        env = {"HOME": pwd.getpwnam(user).pw_dir, "LOGNAME": user, "SHELL": "/bin/sh", "PATH": "/usr/bin:/bin"}
+        job = None
+        for line in tab.splitlines():
+            s = line.strip()
+            if not s or s.startswith("#"):
+                continue
+            m = re.match(r'^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$', s)
+            if m:
+                v = m.group(2).strip()
+                if len(v) > 1 and v[0] == v[-1] and v[0] in "\"'":
+                    v = v[1:-1]
+                env[m.group(1)] = v
+                continue
+            f = s.split(None, 5)
+            if len(f) == 6:
+                job = f[5]
+                break
+        if job is None:
+            print("no-job")
+            sys.exit(2)
+        cmd, inp, i = "", None, 0
+        while i < len(job):
+            c = job[i]
+            if c == "\\" and i + 1 < len(job) and job[i + 1] == "%":
+                cmd += "%"; i += 2; continue
+            if c == "%":
+                inp = job[i + 1:].replace("%", "\n"); break
+            cmd += c; i += 1
+        subprocess.run(["runuser", "-u", user, "--", "env", "-i"] + [k + "=" + v for k, v in env.items()] + [env["SHELL"], "-c", cmd],
+                       input=inp or "", capture_output=True, text=True, cwd=env["HOME"], timeout=60)
+        EOT
+        chmod 0700 /var/lib/cloudtrain/cronsim.py
+        printf '%s\n' '# timetable sync (ttsync)' '*/{{step}} * * * * /opt/timetable/sync.sh >> /var/log/tt-sync/sync-$(date +%F).log 2>&1' | crontab -u ttsync -
+        pgrep -x cron >/dev/null || cron
+  checks:
+    - id: produces-sync
+      description: Replaying the crontab entry the way cron runs it (minimal environment, /bin/sh) produces today's merged file
+      type: shell
+      on: tr-timetable-02
+      skills: [linux.processes.scheduled-jobs]
+      weight: 2
+      timeoutSec: 90
+      command: |
+        day=$(date +%F); f=/srv/timetable/sync/sync-$day.csv
+        rm -f "$f" /var/log/tt-sync/sync-$day.log
+        printf 'train,dep,platform\nTRcheck77,03:30,9\n' > /srv/timetable/inbox/zz-check.csv
+        python3 /var/lib/cloudtrain/cronsim.py ttsync >/dev/null 2>&1
+        want=$( { echo 'train,dep,platform'; for x in /srv/timetable/inbox/*.csv; do tail -n +2 "$x"; done | sort -u; } )
+        rm -f /srv/timetable/inbox/zz-check.csv
+        [ -f "$f" ] && [ "$(cat "$f")" = "$want" ] && echo produced || echo missing
+      expect: {match: exact, value: produced}
+    - id: output-logged
+      description: The job's output is appended to today's log file
+      type: shell
+      on: tr-timetable-02
+      skills: [linux.processes.scheduled-jobs, linux.shell.scripting]
+      weight: 1.5
+      timeoutSec: 90
+      command: |
+        day=$(date +%F); l=/var/log/tt-sync/sync-$day.log
+        rm -f /srv/timetable/sync/sync-$day.csv "$l"
+        python3 /var/lib/cloudtrain/cronsim.py ttsync >/dev/null 2>&1
+        python3 /var/lib/cloudtrain/cronsim.py ttsync >/dev/null 2>&1
+        n=$(grep -c ' sync ok rows=' "$l" 2>/dev/null); [ "${n:-0}" -ge 2 ] && echo logged || echo "missing-${n:-0}"
+      expect: {match: exact, value: logged}
+    - id: schedule-kept
+      description: ttsync's crontab still has its job running every {{step}} minutes and cron is running
+      type: shell
+      on: tr-timetable-02
+      skills: [linux.processes.scheduled-jobs]
+      command: |
+        s=$(crontab -u ttsync -l 2>/dev/null | grep -v '^[[:space:]]*#' | awk '$1 !~ /=/ && NF >= 6 {print $1, $2, $3, $4, $5; exit}')
+        pgrep -x cron >/dev/null && c=up || c=down
+        echo "$s|$c"
+      expect: {match: exact, value: "*/{{step}} * * * *|up"}
+  hints:
+    - title: Reproduce cron's environment
+      body: "Cron starts jobs with a tiny environment and /bin/sh. `sudo -u ttsync env -i HOME=/home/ttsync SHELL=/bin/sh PATH=/usr/bin:/bin /bin/sh -c /opt/timetable/sync.sh` shows what cron sees, including the error."
+      cost: 1
+    - title: Where the missing pieces come from
+      body: "The login shell reads /etc/profile.d/*.sh; cron does not. Look at /etc/profile.d/tr-timetable.sh and `man 5 crontab`: variable assignments at the top of a crontab apply to its jobs."
+      cost: 1
+    - title: A second, unrelated problem
+      body: "In a crontab command, an unescaped % ends the command; everything after it becomes standard input. `man 5 crontab` explains how to write a literal percent sign in a date format."
+      cost: 2
+  misconceptions:
+    - id: path-only
+      description: Fixes PATH for the job but not the missing variable or the % in the log name.
+      feedback: "PATH was only one of three differences. The script also needs TT_OUT (set by a profile that cron never reads), and the % in `date +%F` cuts the command short."
+      expectFail: [produces-sync, output-logged]
+      mutation:
+        on: tr-timetable-02
+        as: learner
+        run: |
+          printf '%s\n' 'PATH=/usr/local/bin:/usr/bin:/bin:/opt/tr/bin' '*/{{step}} * * * * /opt/timetable/sync.sh >> /var/log/tt-sync/sync-$(date +%F).log 2>&1' | sudo crontab -u ttsync -
+    - id: percent-not-escaped
+      description: Sets PATH and TT_OUT but leaves the % unescaped in the log file name.
+      feedback: "cron treats an unescaped % as the end of the command and feeds the rest to it as input, so the redirect never happens. Write \\% in crontab lines (or move the logic into a script)."
+      expectFail: [produces-sync, output-logged]
+      mutation:
+        on: tr-timetable-02
+        as: learner
+        run: |
+          printf '%s\n' 'PATH=/usr/local/bin:/usr/bin:/bin:/opt/tr/bin' 'TT_OUT=/srv/timetable/sync' '*/{{step}} * * * * /opt/timetable/sync.sh >> /var/log/tt-sync/sync-$(date +%F).log 2>&1' | sudo crontab -u ttsync -
+    - id: output-discarded
+      description: Gets the job working again but throws the output away.
+      feedback: "The next failure will be just as silent. Append stdout and stderr to the daily log: >> /var/log/tt-sync/sync-$(date +\\%F).log 2>&1."
+      expectFail: [output-logged]
+      mutation:
+        on: tr-timetable-02
+        as: learner
+        run: |
+          printf '%s\n' 'PATH=/usr/local/bin:/usr/bin:/bin:/opt/tr/bin' 'TT_OUT=/srv/timetable/sync' '*/{{step}} * * * * /opt/timetable/sync.sh >/dev/null 2>&1' | sudo crontab -u ttsync -
+  solution:
+    explanation: |
+      The login shell gets PATH (with /opt/tr/bin) and TT_OUT from /etc/profile.d; cron
+      does not. Set both at the top of the crontab, and escape the % in the date format of
+      the log file name: an unescaped % ends the command line in a crontab.
+    steps:
+      - on: tr-timetable-02
+        as: learner
+        run: |
+          printf '%s\n' 'PATH=/usr/local/bin:/usr/bin:/bin:/opt/tr/bin' 'TT_OUT=/srv/timetable/sync' '*/{{step}} * * * * /opt/timetable/sync.sh >> /var/log/tt-sync/sync-$(date +\%F).log 2>&1' | sudo crontab -u ttsync -
+          sudo crontab -u ttsync -l
+    alternatives:
+      - id: login-shell-wrapper
+        description: Let the job run through a login shell so it reads the same profile as an interactive run.
+        steps:
+          - on: tr-timetable-02
+            as: learner
+            run: |
+              printf '%s\n' '*/{{step}} * * * * /bin/bash -lc /opt/timetable/sync.sh >> /var/log/tt-sync/sync-$(date +\%F).log 2>&1' | sudo crontab -u ttsync -

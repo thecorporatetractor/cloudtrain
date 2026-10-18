@@ -1,0 +1,214 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: unbound-caching-forwarder
+  title: Run a caching resolver that forwards the internal zone
+  domain: linux
+  frameworks: [lpic2:dns]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [unbound, dns, forwarder, cache, access-control, dig]
+  version: 1
+spec:
+  description: |
+    The depot network on `tr-dns-02` needs a caching resolver. Unbound is installed and
+    already running with a minimal configuration (`/etc/unbound/unbound.conf.d/10-tr-base.conf`);
+    there is no systemd, so reload changes with `sudo unbound-control reload` (the daemon
+    runs as `sudo unbound -c /etc/unbound/unbound.conf`). A shell is open on this host and you
+    have `sudo`.
+
+    The internal zone `tallowmere.test` is served by the authoritative server
+    `tr-auth-1`, at **127.0.0.2 port 5300** (it answers `tickets.tallowmere.test` and
+    `timetable.tallowmere.test`). Configure Unbound in a new file
+    `/etc/unbound/unbound.conf.d/20-depot.conf` so that:
+
+    1. queries for **`tallowmere.test`** are **forwarded** to `127.0.0.2@5300`, and Unbound
+       returns the answers (not an error);
+    2. answers are **cached**: asking the same name again does not reach `tr-auth-1`
+       (its query log is `/var/log/tr-auth.log`);
+    3. only clients in the depot subnets **{{netA}}** and **{{netB}}** are answered; every
+       other source address is **refused**. The pod has no extra network interfaces, so the
+       subnets are loopback ranges: test with `dig -b SOURCE @127.0.0.1 NAME`
+       (for example `-b` the `.5` address of a subnet);
+    4. `unbound-checkconf` reports no errors and the running daemon uses the new settings.
+  objectives:
+    - Forward a zone to another DNS server from Unbound
+    - Limit who may query a resolver with access-control
+    - Verify caching from the upstream query log
+    - Diagnose why a forwarded zone answers SERVFAIL or NXDOMAIN
+  params:
+    netA:
+      type: choice
+      values: ["127.0.0.0/24", "127.0.2.0/24"]
+    netB:
+      type: choice
+      values: ["127.0.5.0/24", "127.0.6.0/24"]
+    net:
+      type: choice
+      values: ["10.61.0", "10.62.0"]
+  topology:
+    entry: tr-dns-02
+    nodes:
+      - name: tr-dns-02
+        driver: container
+        image: deb-lab:24.04
+        access: [shell]
+        learnerSudo: true
+  setup:
+    - on: tr-dns-02
+      timeoutSec: 300
+      run: |
+        set -eu
+        echo 'learner ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/learner && chmod 0440 /etc/sudoers.d/learner
+        dpkg -s unbound dnsmasq >/dev/null 2>&1 || { apt-get update -q >/dev/null; DEBIAN_FRONTEND=noninteractive apt-get install -y -q unbound dnsmasq dnsutils >/dev/null; }
+        V=/var/lib/cloudtrain; mkdir -p $V; chmod 0700 $V
+        grep -q ' tr-auth-1$' /etc/hosts || echo '127.0.0.2 tr-auth-1' >> /etc/hosts
+        # --- tr-auth-1: a small authoritative-style server for the internal names (dnsmasq on 127.0.0.2:5300)
+        pkill -x dnsmasq 2>/dev/null || true; pkill -x unbound 2>/dev/null || true
+        sleep 1
+        printf '%s\n' 'port=5300' 'listen-address=127.0.0.2' 'bind-interfaces' 'no-resolv' 'no-hosts' 'local-ttl=300' \
+          'host-record=tickets.tallowmere.test,{{net}}.21' 'host-record=timetable.tallowmere.test,{{net}}.22' \
+          'address=/probe.tallowmere.test/{{net}}.99' 'log-queries' 'log-facility=/var/log/tr-auth.log' 'pid-file=/run/tr-auth.pid' > /etc/tr-auth.conf
+        : > /var/log/tr-auth.log; chmod 0644 /var/log/tr-auth.log
+        dnsmasq -C /etc/tr-auth.conf
+        # --- Unbound: package files do not start it, and Debian's trust anchor comes from a systemd helper
+        mkdir -p /var/lib/unbound; cp /usr/share/dns/root.key /var/lib/unbound/root.key; chown unbound:unbound /var/lib/unbound/root.key
+        rm -f /etc/unbound/unbound.conf.d/20-*.conf
+        printf '%s\n' 'server:' '    # logging to a file: there is no syslog here' '    logfile: "/var/log/unbound.log"' '    verbosity: 1' '    # the internal test zone is unsigned: do not insist on a DNSSEC chain for it' '    domain-insecure: "tallowmere.test"' > /etc/unbound/unbound.conf.d/10-tr-base.conf
+        : > /var/log/unbound.log; chown unbound:unbound /var/log/unbound.log
+        unbound-checkconf >/dev/null
+        unbound -c /etc/unbound/unbound.conf
+        for i in $(seq 20); do unbound-control status >/dev/null 2>&1 && break; sleep 0.5; done
+  checks:
+    - id: config-running
+      description: unbound-checkconf passes and Unbound is running with a 20-depot.conf in place
+      type: shell
+      on: tr-dns-02
+      skills: [linux.services.dns-server]
+      command: |
+        unbound-checkconf >/dev/null 2>&1 && c=valid || c=invalid
+        pgrep -x unbound >/dev/null && p=running || p=stopped
+        [ -s /etc/unbound/unbound.conf.d/20-depot.conf ] && f=file || f=no-file
+        echo "$c $p $f"
+      expect: {match: exact, value: "valid running file"}
+    - id: forwards-internal-zone
+      description: tickets and timetable resolve through Unbound to the addresses served by tr-auth-1
+      type: shell
+      on: tr-dns-02
+      skills: [linux.services.dns-server]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        pa=$(echo "{{netA}}" | sed 's#0/24$#5#')
+        a=$(dig +short +time=3 +tries=1 -b $pa @127.0.0.1 tickets.tallowmere.test 2>/dev/null | tr '\n' ' ')
+        b=$(dig +short +time=3 +tries=1 -b $pa @127.0.0.1 timetable.tallowmere.test 2>/dev/null | tr '\n' ' ')
+        echo "$a$b"
+      expect: {match: exact, value: "{{net}}.21 {{net}}.22 "}
+    - id: answers-are-cached
+      description: Three identical queries for a fresh name reach the authoritative server once
+      type: shell
+      on: tr-dns-02
+      skills: [linux.services.dns-server]
+      weight: 1.5
+      timeoutSec: 30
+      command: |
+        pa=$(echo "{{netA}}" | sed 's#0/24$#5#'); n=cache-$(date +%s%N).probe.tallowmere.test
+        for i in 1 2 3; do dig +short +time=3 +tries=1 -b $pa @127.0.0.1 $n >/dev/null 2>&1; done
+        sleep 1
+        echo "$(grep -c "query\[A\] $n" /var/log/tr-auth.log)"
+      expect: {match: exact, value: "1"}
+    - id: access-control
+      description: Sources in both depot subnets are answered; sources outside them are refused
+      type: shell
+      on: tr-dns-02
+      skills: [linux.services.dns-server]
+      weight: 2
+      timeoutSec: 40
+      command: |
+        pa=$(echo "{{netA}}" | sed 's#0/24$#5#'); pb=$(echo "{{netB}}" | sed 's#0/24$#5#'); r=""
+        for src in $pa $pb 127.0.1.5 127.0.9.5; do
+          o=$(dig +time=3 +tries=1 -b $src @127.0.0.1 tickets.tallowmere.test 2>/dev/null)
+          s=$(printf '%s\n' "$o" | grep -o 'status: [A-Z]*' | cut -d' ' -f2)
+          if [ "$s" = NOERROR ] && printf '%s\n' "$o" | grep -q "{{net}}.21"; then r="$r allowed"; elif [ "$s" = REFUSED ]; then r="$r refused"; else r="$r ${s:-none}"; fi
+        done
+        echo $r
+      expect: {match: exact, value: "allowed allowed refused refused"}
+  hints:
+    - title: Forwarding
+      body: "A `forward-zone:` block with `name: \"tallowmere.test.\"` and `forward-addr: 127.0.0.2@5300`. Check with `dig @127.0.0.1 tickets.tallowmere.test`; `unbound-control reload` applies changes."
+      cost: 1
+    - title: SERVFAIL for a loopback upstream
+      body: "Unbound refuses to send queries to loopback addresses by default (to stop attackers using it against local services): `do-not-query-localhost: no` in the `server:` block allows it. Here the upstream really is on 127.0.0.2."
+      cost: 1
+    - title: NXDOMAIN for a zone that exists
+      body: "Unbound ships built-in local zones for special names; `unbound-control list_local_zones` shows `test. static`, which answers NXDOMAIN before any forwarder is asked. Declare `local-zone: \"tallowmere.test.\" transparent` (or `local-zone: \"test.\" nodefault`)."
+      cost: 2
+    - title: Who may query
+      body: "`access-control: SUBNET allow|refuse|deny|...`; the most specific match wins. Unbound's built-in default allows 127.0.0.0/8, so every other loopback source is answered unless you add `access-control: 127.0.0.0/8 refuse` (or `0.0.0.0/0 refuse`) alongside the two allow lines."
+      cost: 2
+  misconceptions:
+    - id: loopback-upstream-blocked
+      description: Writes the forward zone but leaves Unbound's default of not querying loopback addresses.
+      feedback: "SERVFAIL here comes from Unbound itself: it will not query a loopback upstream unless `do-not-query-localhost: no` is set."
+      expectFail: [forwards-internal-zone, answers-are-cached]
+      mutation:
+        on: tr-dns-02
+        as: learner
+        run: |
+          printf '%s\n' 'server:' '    local-zone: "tallowmere.test." transparent' '    access-control: 127.0.0.0/8 refuse' '    access-control: {{netA}} allow' '    access-control: {{netB}} allow' 'forward-zone:' '    name: "tallowmere.test."' '    forward-addr: 127.0.0.2@5300' | sudo tee /etc/unbound/unbound.conf.d/20-depot.conf >/dev/null
+          sudo unbound-checkconf >/dev/null && sudo unbound-control reload >/dev/null; sleep 1
+    - id: test-zone-built-in
+      description: Forgets that Unbound answers the special name test. itself.
+      feedback: "NXDOMAIN means Unbound answered locally: `test.` is a built-in static zone. Override it for tallowmere.test (transparent) or remove the default."
+      expectFail: [forwards-internal-zone, answers-are-cached]
+      mutation:
+        on: tr-dns-02
+        as: learner
+        run: |
+          printf '%s\n' 'server:' '    do-not-query-localhost: no' '    access-control: 127.0.0.0/8 refuse' '    access-control: {{netA}} allow' '    access-control: {{netB}} allow' 'forward-zone:' '    name: "tallowmere.test."' '    forward-addr: 127.0.0.2@5300' | sudo tee /etc/unbound/unbound.conf.d/20-depot.conf >/dev/null
+          sudo unbound-checkconf >/dev/null && sudo unbound-control reload >/dev/null; sleep 1
+    - id: default-acl-left-open
+      description: Adds allow lines for the two subnets but relies on the defaults for everyone else.
+      feedback: "Unbound already allows 127.0.0.0/8 by default, so the allow lines change nothing. Say what happens to everything else: refuse the wider range."
+      expectFail: [access-control]
+      mutation:
+        on: tr-dns-02
+        as: learner
+        run: |
+          printf '%s\n' 'server:' '    do-not-query-localhost: no' '    local-zone: "tallowmere.test." transparent' '    access-control: {{netA}} allow' '    access-control: {{netB}} allow' 'forward-zone:' '    name: "tallowmere.test."' '    forward-addr: 127.0.0.2@5300' | sudo tee /etc/unbound/unbound.conf.d/20-depot.conf >/dev/null
+          sudo unbound-checkconf >/dev/null && sudo unbound-control reload >/dev/null; sleep 1
+    - id: not-reloaded
+      description: Writes the right file but never reloads the running daemon.
+      feedback: "Unbound reads its configuration at start and on `unbound-control reload`. Check what it is really using with `unbound-control list_forwards`."
+      expectFail: [forwards-internal-zone, answers-are-cached, access-control]
+      mutation:
+        on: tr-dns-02
+        as: learner
+        run: |
+          printf '%s\n' 'server:' '    do-not-query-localhost: no' '    local-zone: "tallowmere.test." transparent' '    access-control: 127.0.0.0/8 refuse' '    access-control: {{netA}} allow' '    access-control: {{netB}} allow' 'forward-zone:' '    name: "tallowmere.test."' '    forward-addr: 127.0.0.2@5300' | sudo tee /etc/unbound/unbound.conf.d/20-depot.conf >/dev/null
+  solution:
+    explanation: |
+      A forward-zone to 127.0.0.2@5300; do-not-query-localhost: no because that upstream is on
+      loopback; a transparent local-zone for tallowmere.test so the built-in test. zone does not
+      answer first; access-control lines allowing the two subnets and refusing the rest of
+      127.0.0.0/8; then unbound-checkconf and a reload.
+    steps:
+      - on: tr-dns-02
+        as: learner
+        run: |
+          printf '%s\n' 'server:' '    do-not-query-localhost: no' '    local-zone: "tallowmere.test." transparent' '    access-control: 127.0.0.0/8 refuse' '    access-control: {{netA}} allow' '    access-control: {{netB}} allow' 'forward-zone:' '    name: "tallowmere.test."' '    forward-addr: 127.0.0.2@5300' | sudo tee /etc/unbound/unbound.conf.d/20-depot.conf >/dev/null
+          sudo unbound-checkconf
+          sudo unbound-control reload
+          sleep 1
+          dig +short -b $(echo {{netA}} | sed 's#0/24$#5#') @127.0.0.1 tickets.tallowmere.test
+    alternatives:
+      - id: stub-zone-and-default-refuse
+        description: A stub zone instead of a forward zone, removing the built-in test. zone, and refusing everything by default.
+        steps:
+          - on: tr-dns-02
+            as: learner
+            run: |
+              printf '%s\n' 'server:' '    do-not-query-localhost: no' '    local-zone: "test." nodefault' '    access-control: 0.0.0.0/0 refuse' '    access-control: 127.0.0.0/8 refuse' '    access-control: {{netB}} allow' '    access-control: {{netA}} allow' 'stub-zone:' '    name: "tallowmere.test."' '    stub-addr: 127.0.0.2@5300' | sudo tee /etc/unbound/unbound.conf.d/20-depot.conf >/dev/null
+              sudo unbound-checkconf
+              sudo unbound-control reload
+              sleep 1

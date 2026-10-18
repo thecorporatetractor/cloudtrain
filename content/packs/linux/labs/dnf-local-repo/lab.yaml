@@ -1,0 +1,202 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: dnf-local-repo
+  title: Configure the Enterprise Linux repositories from a local mirror
+  domain: linux
+  frameworks: [rhcsa-aligned:software, linuxplus:services-users, lpic1:install-packages]
+  difficulty: easy
+  estimatedMinutes: 12
+  tags: [dnf, yum, repositories, gpgcheck, rpm]
+  version: 1
+spec:
+  description: |
+    The new build host `tr-build-02` was cloned from a template that still carries an old
+    repository definition. Tallowmere Rail's rule is: packages come from the local mirror,
+    from signed repositories, and the repository files are named after what they hold.
+    A shell is open on this host and you have `sudo`.
+
+    1. **Replace** the default repository file in `/etc/yum.repos.d/` with two files,
+       **`tr-baseos.repo`** (repository id `tr-baseos`) and **`tr-appstream.repo`**
+       (repository id `tr-appstream`). Both must be **enabled**, must **check package
+       signatures** (`gpgcheck=1`) and name the vendor key with `gpgkey=`. The old
+       definition must no longer be in use.
+    2. The mirror publishes BaseOS and AppStream as one combined snapshot, so both files
+       use the same base URL, **`http://mirror.cloudtrain-mirrors.svc/el10/`**. The vendor
+       key is published at
+       **`http://mirror.cloudtrain-mirrors.svc/keys/RPM-GPG-KEY-AlmaLinux-10`**.
+    3. Install **`{{pkg}}`** from these repositories, with signature checking on (the key is
+       not imported on this host yet).
+    4. Write the **repository id** that dnf reports as the origin of the installed `{{pkg}}`
+       (`From repo`) to `~/answers/origin.txt`.
+  params:
+    pkg:
+      type: choice
+      values: [httpd, nginx]
+  objectives:
+    - Write .repo files with baseurl, enabled, gpgcheck and gpgkey
+    - Retire a repository definition so dnf stops using it
+    - Import a vendor GPG key as part of the first signed install
+    - Find where an installed package came from
+  topology:
+    entry: tr-build-02
+    nodes:
+      - name: tr-build-02
+        driver: container
+        image: el-lab:10
+        access: [shell]
+        learnerSudo: true
+  setup:
+    - on: tr-build-02
+      timeoutSec: 120
+      run: |
+        set -eu
+        echo 'learner ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/learner && chmod 0440 /etc/sudoers.d/learner
+        [ -f /var/lib/cloudtrain/orig-cloudtrain.repo ] || { mkdir -p /var/lib/cloudtrain; chmod 0700 /var/lib/cloudtrain; cp /etc/yum.repos.d/cloudtrain.repo /var/lib/cloudtrain/orig-cloudtrain.repo; }
+        cp /var/lib/cloudtrain/orig-cloudtrain.repo /etc/yum.repos.d/cloudtrain.repo
+        rm -f /etc/yum.repos.d/tr-*.repo
+        # the vendor key is not trusted yet
+        for k in $(rpm -q gpg-pubkey 2>/dev/null | grep -v 'not installed'); do rpm -e "$k" >/dev/null 2>&1 || true; done
+        rm -f /etc/pki/rpm-gpg/RPM-GPG-KEY-AlmaLinux-10
+        for p in httpd nginx; do rpm -q $p >/dev/null 2>&1 && dnf remove -y -q $p >/dev/null 2>&1 || true; done
+        dnf clean all -q >/dev/null 2>&1 || true
+        install -d -o learner -g learner /home/learner/answers
+        rm -f /home/learner/answers/origin.txt
+  checks:
+    - id: only-the-new-repos
+      description: The enabled repositories are exactly tr-baseos and tr-appstream
+      type: shell
+      on: tr-build-02
+      skills: [linux.packages.repositories]
+      weight: 1.5
+      timeoutSec: 60
+      command: dnf repolist --enabled -q 2>/dev/null | awk 'NR > 1 {print $1}' | sort | tr '\n' ' '
+      expect: {match: exact, value: "tr-appstream tr-baseos "}
+    - id: repo-files-correct
+      description: "tr-baseos.repo and tr-appstream.repo each define their own repo id with the mirror URL, gpgcheck=1 and a gpgkey"
+      type: shell
+      on: tr-build-02
+      skills: [linux.packages.repositories]
+      weight: 2
+      command: |
+        r=""
+        for id in baseos appstream; do
+          f=/etc/yum.repos.d/tr-$id.repo
+          [ -f $f ] || { r="$r $id:missing"; continue; }
+          s=$(awk -v id="tr-$id" '/^\[/ {cur = ($0 == "[" id "]")} cur' $f)
+          [ -n "$s" ] || { r="$r $id:no-section"; continue; }
+          printf '%s\n' "$s" | grep -qE '^baseurl[[:space:]]*=[[:space:]]*http://mirror.cloudtrain-mirrors.svc/el10/?$' || { r="$r $id:baseurl"; continue; }
+          printf '%s\n' "$s" | grep -qE '^gpgcheck[[:space:]]*=[[:space:]]*(1|yes|true)$' || { r="$r $id:gpgcheck"; continue; }
+          printf '%s\n' "$s" | grep -qE '^gpgkey[[:space:]]*=[[:space:]]*(http://mirror.cloudtrain-mirrors.svc/keys/RPM-GPG-KEY-AlmaLinux-10|file:///.*RPM-GPG-KEY-AlmaLinux-10)$' || { r="$r $id:gpgkey"; continue; }
+          ! printf '%s\n' "$s" | grep -qE '^enabled[[:space:]]*=[[:space:]]*(0|no|false)$' || { r="$r $id:disabled"; continue; }
+          r="$r $id:ok"
+        done
+        echo $r
+      expect: {match: exact, value: "baseos:ok appstream:ok"}
+    - id: pkg-signed-install
+      description: "{{pkg}} is installed, its package signature verifies, the vendor key is in the rpm database and no install disabled signature checking"
+      type: shell
+      on: tr-build-02
+      skills: [linux.packages.dnf, linux.packages.repositories]
+      weight: 2
+      timeoutSec: 60
+      command: |
+        rpm -q {{pkg}} >/dev/null 2>&1 || { echo not-installed; exit 0; }
+        for id in $(dnf history list -q 2>/dev/null | awk '$1 ~ /^[0-9]+$/ {print $1}'); do
+          dnf history info "$id" 2>/dev/null | grep -qiE 'Command Line.*(nogpgcheck|gpgcheck=0|gpgcheck=false)' && { echo checking-disabled; exit 0; }
+        done
+        k=$(rpm -q gpg-pubkey 2>/dev/null | grep -vc 'not installed')
+        sig=$(rpm -q --qf '%{SIGPGP:pgpsig}' {{pkg}} 2>/dev/null)
+        [ "$k" -ge 1 ] && [ -n "$sig" ] && [ "$sig" != "(none)" ] && echo "signed key-imported" || echo "unsigned-or-no-key"
+      expect: {match: exact, value: "signed key-imported"}
+    - id: origin-answer
+      description: ~/answers/origin.txt holds the repository id dnf reports for the installed {{pkg}}
+      type: shell
+      on: tr-build-02
+      skills: [linux.packages.dnf]
+      weight: 1
+      timeoutSec: 60
+      command: |
+        want=$(dnf info installed {{pkg}} 2>/dev/null | awk -F: '/^From repo/ {gsub(/[[:space:]]/, "", $2); print $2}')
+        case "$want" in tr-baseos|tr-appstream) ;; *) echo "origin($want)"; exit 0 ;; esac
+        [ "$(tr -d '[:space:]' < /home/learner/answers/origin.txt 2>/dev/null)" = "$want" ] && echo correct || echo wrong
+      expect: {match: exact, value: correct}
+  hints:
+    - title: A repository file
+      body: "`[tr-baseos]` section header (the repo id), `name=`, `baseurl=`, `enabled=1`, `gpgcheck=1`, `gpgkey=`. `dnf repolist --all` shows every repo and whether it is enabled; `dnf repolist -v tr-baseos` shows what dnf parsed."
+      cost: 1
+    - title: Retiring the old definition
+      body: "Delete or rename /etc/yum.repos.d/cloudtrain.repo, or set `enabled=0` in it. Files that do not end in .repo are ignored by dnf."
+      cost: 1
+    - title: The key and the origin
+      body: "With `gpgkey=` pointing at the URL, `dnf install` offers to import the key on first use (`-y` accepts). `dnf info {{pkg}}` prints `From repo` for an installed package."
+      cost: 1
+  misconceptions:
+    - id: gpg-check-off
+      description: Switches signature checking off to avoid the key prompt.
+      feedback: "gpgcheck=0 installs whatever the repository serves without verifying it. The requirement is a signed install: name the key and let dnf import it."
+      expectFail: [repo-files-correct, pkg-signed-install]
+      mutation:
+        on: tr-build-02
+        as: learner
+        run: |
+          sudo rm -f /etc/yum.repos.d/cloudtrain.repo
+          for id in baseos appstream; do printf '%s\n' "[tr-$id]" "name=Tallowmere $id" "baseurl=http://mirror.cloudtrain-mirrors.svc/el10/" "enabled=1" "gpgcheck=0" | sudo tee /etc/yum.repos.d/tr-$id.repo >/dev/null; done
+          sudo dnf install -y -q {{pkg}} >/dev/null 2>&1
+          dnf info installed {{pkg}} 2>/dev/null | awk -F: '/^From repo/ {gsub(/[[:space:]]/, "", $2); print $2}' > ~/answers/origin.txt
+    - id: old-repo-still-enabled
+      description: Adds the two new repository files but leaves the old one in place.
+      feedback: "The old definition is still enabled, so dnf has three repositories and the policy (only the named repositories) is not met."
+      expectFail: [only-the-new-repos]
+      mutation:
+        on: tr-build-02
+        as: learner
+        run: |
+          for id in baseos appstream; do printf '%s\n' "[tr-$id]" "name=Tallowmere $id" "baseurl=http://mirror.cloudtrain-mirrors.svc/el10/" "enabled=1" "gpgcheck=1" "gpgkey=http://mirror.cloudtrain-mirrors.svc/keys/RPM-GPG-KEY-AlmaLinux-10" | sudo tee /etc/yum.repos.d/tr-$id.repo >/dev/null; done
+          sudo dnf install -y -q {{pkg}} >/dev/null 2>&1
+          dnf info installed {{pkg}} 2>/dev/null | awk -F: '/^From repo/ {gsub(/[[:space:]]/, "", $2); print $2}' > ~/answers/origin.txt
+    - id: wrong-origin-recorded
+      description: Records a repository name from memory instead of reading what dnf reports.
+      feedback: "Both repositories serve the same snapshot, so either could be the origin. dnf records which one it used: read `From repo` in `dnf info {{pkg}}`."
+      expectFail: [origin-answer]
+      mutation:
+        on: tr-build-02
+        as: learner
+        run: |
+          sudo rm -f /etc/yum.repos.d/cloudtrain.repo
+          for id in baseos appstream; do printf '%s\n' "[tr-$id]" "name=Tallowmere $id" "baseurl=http://mirror.cloudtrain-mirrors.svc/el10/" "enabled=1" "gpgcheck=1" "gpgkey=http://mirror.cloudtrain-mirrors.svc/keys/RPM-GPG-KEY-AlmaLinux-10" | sudo tee /etc/yum.repos.d/tr-$id.repo >/dev/null; done
+          sudo dnf install -y -q {{pkg}} >/dev/null 2>&1
+          echo BaseOS > ~/answers/origin.txt
+  solution:
+    explanation: |
+      Move the old file out of the way, write the two repo files with the mirror URL,
+      gpgcheck=1 and the key URL, install {{pkg}} (dnf imports the key from the URL) and read the
+      origin from dnf info.
+    steps:
+      - on: tr-build-02
+        as: learner
+        timeoutSec: 90
+        run: |
+          sudo rm -f /etc/yum.repos.d/cloudtrain.repo
+          for id in baseos appstream; do
+            printf '%s\n' "[tr-$id]" "name=Tallowmere $id" "baseurl=http://mirror.cloudtrain-mirrors.svc/el10/" "enabled=1" "gpgcheck=1" "gpgkey=http://mirror.cloudtrain-mirrors.svc/keys/RPM-GPG-KEY-AlmaLinux-10" | sudo tee /etc/yum.repos.d/tr-$id.repo >/dev/null
+          done
+          dnf repolist
+          sudo dnf install -y {{pkg}}
+          dnf info installed {{pkg}} | awk -F: '/^From repo/ {gsub(/[[:space:]]/, "", $2); print $2}' | tee ~/answers/origin.txt
+    alternatives:
+      - id: key-from-local-file-and-disabled-old-repo
+        description: Download the key to /etc/pki/rpm-gpg, reference it with file://, and keep the old file but disabled.
+        steps:
+          - on: tr-build-02
+            as: learner
+            timeoutSec: 90
+            run: |
+              sudo curl -fsS -o /etc/pki/rpm-gpg/RPM-GPG-KEY-AlmaLinux-10 http://mirror.cloudtrain-mirrors.svc/keys/RPM-GPG-KEY-AlmaLinux-10
+              sudo sed -i 's/^enabled=1/enabled=0/' /etc/yum.repos.d/cloudtrain.repo
+              for id in baseos appstream; do
+                printf '%s\n' "[tr-$id]" "name=Tallowmere $id" "baseurl=http://mirror.cloudtrain-mirrors.svc/el10/" "enabled=1" "gpgcheck=1" "gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-AlmaLinux-10" | sudo tee /etc/yum.repos.d/tr-$id.repo >/dev/null
+              done
+              sudo rpm --import /etc/pki/rpm-gpg/RPM-GPG-KEY-AlmaLinux-10
+              sudo dnf install -y {{pkg}}
+              dnf info installed {{pkg}} | awk -F: '/^From repo/ {gsub(/[[:space:]]/, "", $2); print $2}' > ~/answers/origin.txt
