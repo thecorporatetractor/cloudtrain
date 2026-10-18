@@ -69,6 +69,9 @@ RUN userdel -r ubuntu 2>/dev/null; useradd -m -u 1000 -U -s /bin/bash learner \
  && /opt/ansible/bin/pip freeze --all | sed 's/^/PY: /' >> /etc/cloudtrain-release \
  && ansible-galaxy collection list -p /usr/share/ansible/collections 2>/dev/null | awk '$1 ~ /\./ {print "COLLECTION: "$1" "$2}' >> /etc/cloudtrain-release
 ENV ANSIBLE_FORCE_COLOR=0 PY_COLORS=0
+# A lab workstation that only sleeps: Kubernetes ignores image health checks, the pod is
+# ready when it runs.
+HEALTHCHECK NONE
 USER learner
 WORKDIR /home/learner
 CMD ["sleep", "infinity"]
