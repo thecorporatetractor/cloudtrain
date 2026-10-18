@@ -34,7 +34,7 @@ sim-linux-sysadmin networking pool is now 8/8 (draw 4, so 2x); `labctl exam comp
 - fix-routing-asymmetric: `eth1`/`eth2` are veth ends into dead-end router namespaces; the field
   client at 10.66.9.20 sits behind `rtr-b`. Fix is a routing table and rule (Netplan `routes: table:` +
   `routing-policy:`, or a networkd drop-in).
-- mtu-mismatch-tunnel: GRE to a depot namespace through an `isp` namespace whose second segment has
+- mtu-mismatch-tunnel: GRE to a depot namespace through `isp1`/`isp2` namespaces whose middle segment has
   MTU 1400 and which drops its own ICMP errors (a real PMTU black hole). The tunnel is created by
   `tr-gre.service` from `/etc/default/tr-gre`; persistence is that file (MTU <= 1376) or a saved nft
   MSS clamp. Needs `ip_gre`.

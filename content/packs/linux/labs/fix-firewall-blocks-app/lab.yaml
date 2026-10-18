@@ -66,8 +66,8 @@ spec:
         for n in tablets visitors; do ip netns del $n 2>/dev/null || true; ip netns add $n; ip -n $n link set lo up; done
         for l in fw-tab fw-vis; do ip link del $l 2>/dev/null || true; done
         mk() { # ns hostif hostaddr peeraddr
-          ip link add $2 type veth peer name eth0
-          ip link set eth0 netns $1
+          ip link add $2 type veth peer name $2-p
+          ip link set $2-p netns $1 name eth0
           ip addr add $3 dev $2; ip link set $2 up
           ip -n $1 addr add $4 dev eth0; ip -n $1 link set eth0 up
           command -v nmcli >/dev/null 2>&1 && nmcli device set $2 managed no >/dev/null 2>&1 || true
@@ -142,7 +142,7 @@ spec:
         ip netns exec trchk nft -f /etc/sysconfig/nftables.conf >/dev/null 2>&1
         r=$(ip netns exec trchk nft list ruleset 2>/dev/null)
         ip netns del trchk 2>/dev/null
-        echo "$r" | grep -Eq '10\.42\.7\.0/24.*(dport 9443|9443).*accept|dport 9443.*10\.42\.7\.0/24.*accept' && echo "$r" | grep -q '3306' && echo "$r" | grep -q '{{blocked}}' && echo persistent || echo incomplete
+        echo "$r" | grep -Eq '10\.42\.7\.0/24.*(dport 9443|9443).*accept|dport 9443.*10\.42\.7\.0/24.*accept|!= 10\.42\.7\.0/24 tcp dport 9443 drop' && echo "$r" | grep -q '3306' && echo "$r" | grep -q '{{blocked}}' && echo persistent || echo incomplete
       expect: {match: exact, value: persistent}
   hints:
     - title: Read the live ruleset
@@ -191,12 +191,12 @@ spec:
           sudo nft list ruleset
     alternatives:
       - id: split-set
-        description: Rewrite the drop so 9443 is dropped only for sources outside the tablet subnet.
+        description: Rewrite the drop so 9443 is dropped only for sources outside the tablet subnet, and keep the other ports in their own drop rule.
         steps:
           - on: tr-el-01
             as: learner
             run: |
               set -e
-              sudo sed -i 's|^\( *\)tcp dport { 9443, \(.*\)} drop|\1ip saddr 10.42.7.0/24 tcp dport 9443 accept\n\1tcp dport { 9443, \2} drop|' /etc/nftables/hardening.nft
+              sudo sed -i 's|^\( *\)tcp dport { 9443, \(.*\) } drop|\1ip saddr != 10.42.7.0/24 tcp dport 9443 drop\n\1tcp dport { \2 } drop|' /etc/nftables/hardening.nft
               sudo nft -c -f /etc/sysconfig/nftables.conf
               sudo systemctl restart nftables

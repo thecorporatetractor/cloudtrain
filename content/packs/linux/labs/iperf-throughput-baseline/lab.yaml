@@ -20,7 +20,8 @@ spec:
     | `depot-b` | 10.74.1.2/24 | `eth0` |
 
     The network team needs a throughput baseline for the depot link before and after a
-    tuning change. `iperf3` is installed.
+    tuning change. `iperf3` is installed and an `iperf3` **server is already running in
+    `depot-b`** (port 5201); you only run the clients.
 
     1. Run an `iperf3` **TCP** test and a **UDP** test (`-u -b 1G`) from `depot-a` to
        `depot-b` for **{{duration}} seconds** each (`-t {{duration}}`), with the default MTU
@@ -35,7 +36,7 @@ spec:
 
     Do not touch `eth0` of `tr-net-01`.
   objectives:
-    - Run iperf3 server and client in two namespaces
+    - Run iperf3 clients in one namespace against a server in another
     - Compare TCP and UDP throughput before and after an MTU change
     - Record measured values from the JSON output
   params:
@@ -72,6 +73,11 @@ spec:
         ip -n depot-a addr add 10.74.1.1/24 dev eth0; ip -n depot-a link set eth0 up
         ip -n depot-b addr add 10.74.1.2/24 dev eth0; ip -n depot-b link set eth0 up
         ip netns exec depot-a ping -c1 -W2 10.74.1.2 >/dev/null
+        systemctl stop tr-iperf.service 2>/dev/null || true; systemctl reset-failed tr-iperf.service 2>/dev/null || true
+        rm -f /var/lib/cloudtrain/iperf-server.log
+        systemd-run -q --unit=tr-iperf -p NetworkNamespacePath=/run/netns/depot-b "$(command -v iperf3)" -s -J --logfile /var/lib/cloudtrain/iperf-server.log
+        sleep 1
+        systemctl is-active tr-iperf.service >/dev/null
         rm -rf /home/learner/answers; install -d -o learner -g learner -m 0755 /home/learner/answers
   checks:
     - id: mtu-tuned
@@ -83,7 +89,7 @@ spec:
       command: echo "$(ip -n depot-a -o link show eth0 | grep -o 'mtu [0-9]*') $(ip -n depot-b -o link show eth0 | grep -o 'mtu [0-9]*')"
       expect: {match: exact, value: "mtu 9000 mtu 9000"}
     - id: reports
-      description: The four iperf3 JSON reports are genuine runs and the after runs used larger segments
+      description: The four iperf3 JSON reports are genuine runs seen by the depot-b server and the after runs used larger segments
       type: shell
       on: tr-net-01
       skills: [linux.performance.network]
@@ -91,13 +97,35 @@ spec:
       command: |
         python3 - <<'EOP'
         import json
+        def server():
+            out = {}
+            txt = open("/var/lib/cloudtrain/iperf-server.log").read()
+            dec = json.JSONDecoder(); i = 0
+            while True:
+                while i < len(txt) and txt[i].isspace(): i += 1
+                if i >= len(txt): break
+                try: o, i = dec.raw_decode(txt, i)
+                except ValueError: break
+                try: out[o["start"]["cookie"]] = o
+                except (KeyError, TypeError): pass
+            return out
         d = "/home/learner/answers/"
         try:
             r = {n: json.load(open(d + n + ".json")) for n in ("tcp-before", "tcp-after", "udp-before", "udp-after")}
+            srv = server()
         except (OSError, ValueError):
             print("missing-or-invalid"); raise SystemExit
         try:
+            if len({j["start"]["cookie"] for j in r.values()}) != 4:
+                print("duplicate-runs"); raise SystemExit
             for n, j in r.items():
+                s = srv.get(j["start"]["cookie"])
+                if s is None or s["start"]["test_start"]["protocol"] != j["start"]["test_start"]["protocol"]:
+                    print("not-seen-by-server:" + n); raise SystemExit
+                if n.startswith("tcp"):
+                    cb = j["end"]["sum_received"]["bytes"]; sb = s["end"]["sum_received"]["bytes"]
+                    if sb <= 0 or abs(cb - sb) > 0.01 * sb:
+                        print("bytes-differ:" + n); raise SystemExit
                 ts = j["start"]["test_start"]
                 if ts["protocol"] != ("TCP" if n.startswith("tcp") else "UDP") or int(ts["duration"]) != {{duration}}:
                     print("bad-test:" + n); raise SystemExit
@@ -111,7 +139,7 @@ spec:
         EOP
       expect: {match: exact, value: ok}
     - id: baseline-matches
-      description: baseline.txt records the throughput iperf3 measured
+      description: baseline.txt records the throughput iperf3 measured in the server-confirmed runs
       type: shell
       on: tr-net-01
       skills: [linux.performance.network]
@@ -119,12 +147,27 @@ spec:
       command: |
         python3 - <<'EOP'
         import json
+        def server():
+            out = {}
+            txt = open("/var/lib/cloudtrain/iperf-server.log").read()
+            dec = json.JSONDecoder(); i = 0
+            while True:
+                while i < len(txt) and txt[i].isspace(): i += 1
+                if i >= len(txt): break
+                try: o, i = dec.raw_decode(txt, i)
+                except ValueError: break
+                try: out[o["start"]["cookie"]] = o
+                except (KeyError, TypeError): pass
+            return out
         d = "/home/learner/answers/"
         try:
+            srv = server()
             vals = dict(l.strip().split("=", 1) for l in open(d + "baseline.txt") if "=" in l)
             for k, f, path in (("tcp_before", "tcp-before", ("end", "sum_received")), ("tcp_after", "tcp-after", ("end", "sum_received")),
                                ("udp_before", "udp-before", ("end", "sum")), ("udp_after", "udp-after", ("end", "sum"))):
                 j = json.load(open(d + f + ".json"))
+                if j["start"]["cookie"] not in srv:
+                    print("not-seen-by-server:" + k); raise SystemExit
                 m = j[path[0]][path[1]]["bits_per_second"] / 1e6
                 v = float(vals[k])
                 if m <= 0 or abs(v - m) > 0.05 * m:
@@ -135,9 +178,9 @@ spec:
         EOP
       expect: {match: exact, value: ok}
   hints:
-    - title: Server and client
-      command: sudo ip netns exec depot-b iperf3 -s -D
-      body: "iperf3 needs one side listening. Start the server in depot-b, then run the client in depot-a: sudo ip netns exec depot-a iperf3 -c 10.74.1.2 -t {{duration}} -J."
+    - title: Run the client
+      command: sudo ip netns exec depot-a iperf3 -c 10.74.1.2 -t {{duration}} -J
+      body: "The server already listens in depot-b. Run the client in depot-a against 10.74.1.2 and redirect the JSON to the answer file."
       cost: 0
     - title: UDP and JSON
       body: "-u switches to UDP (set a target with -b 1G or the sender is limited to 1 Mbit/s). -J prints JSON; redirect it to the answer file. TCP reports use end.sum_received, UDP reports end.sum."
@@ -154,21 +197,21 @@ spec:
       mutation:
         on: tr-net-01
         as: learner
+        timeoutSec: 150
         run: |
-          sudo ip -n depot-a link set eth0 mtu 9000
+          set -e
+          A=/home/learner/answers
+          c() { sudo ip netns exec depot-a iperf3 -c 10.74.1.2 -t {{duration}} -J "$@"; }
+          c > $A/tcp-before.json; c -u -b 1G > $A/udp-before.json
+          sudo ip -n depot-a link set eth0 mtu 9000; sudo ip -n depot-b link set eth0 mtu 9000
+          c > $A/tcp-after.json; c -u -b 1G > $A/udp-after.json
+          sudo ip -n depot-b link set eth0 mtu 1500
           python3 - <<'EOP'
           import json
-          d = "/home/learner/answers/"
-          def rep(proto, mss, bps, key):
-              return {"start": {"connecting_to": {"host": "10.74.1.2"}, "test_start": {"protocol": proto, "duration": {{duration}}}, "tcp_mss_default": mss}, "end": {key: {"bits_per_second": bps}}}
-          files = {"tcp-before": rep("TCP", 1448, 9.4e9, "sum_received"), "tcp-after": rep("TCP", 8948, 2.1e10, "sum_received"),
-                   "udp-before": rep("UDP", 0, 9.9e8, "sum"), "udp-after": rep("UDP", 0, 9.9e8, "sum")}
-          vals = []
-          for n, j in files.items():
-              json.dump(j, open(d + n + ".json", "w"))
-              key = "sum_received" if n.startswith("tcp") else "sum"
-              vals.append("%s=%s" % (n.replace("-", "_"), j["end"][key]["bits_per_second"] / 1e6))
-          open(d + "baseline.txt", "w").write("\n".join(vals) + "\n")
+          A = "/home/learner/answers/"
+          def mbit(f, k):
+              return json.load(open(A + f))["end"][k]["bits_per_second"] / 1e6
+          open(A + "baseline.txt", "w").write("tcp_before=%f\ntcp_after=%f\nudp_before=%f\nudp_after=%f\n" % (mbit("tcp-before.json", "sum_received"), mbit("tcp-after.json", "sum_received"), mbit("udp-before.json", "sum"), mbit("udp-after.json", "sum")))
           EOP
     - id: numbers-invented
       description: Writes round numbers into baseline.txt instead of the measured values.
@@ -177,22 +220,17 @@ spec:
       mutation:
         on: tr-net-01
         as: learner
+        timeoutSec: 150
         run: |
-          sudo ip -n depot-a link set eth0 mtu 9000
-          sudo ip -n depot-b link set eth0 mtu 9000
-          python3 - <<'EOP'
-          import json
-          d = "/home/learner/answers/"
-          def rep(proto, mss, bps, key):
-              return {"start": {"connecting_to": {"host": "10.74.1.2"}, "test_start": {"protocol": proto, "duration": {{duration}}}, "tcp_mss_default": mss}, "end": {key: {"bits_per_second": bps}}}
-          files = {"tcp-before": rep("TCP", 1448, 9.4e9, "sum_received"), "tcp-after": rep("TCP", 8948, 2.1e10, "sum_received"),
-                   "udp-before": rep("UDP", 0, 9.9e8, "sum"), "udp-after": rep("UDP", 0, 9.9e8, "sum")}
-          for n, j in files.items():
-              json.dump(j, open(d + n + ".json", "w"))
-          open(d + "baseline.txt", "w").write("tcp_before=1000\ntcp_after=2000\nudp_before=1000\nudp_after=1000\n")
-          EOP
+          set -e
+          A=/home/learner/answers
+          c() { sudo ip netns exec depot-a iperf3 -c 10.74.1.2 -t {{duration}} -J "$@"; }
+          c > $A/tcp-before.json; c -u -b 1G > $A/udp-before.json
+          sudo ip -n depot-a link set eth0 mtu 9000; sudo ip -n depot-b link set eth0 mtu 9000
+          c > $A/tcp-after.json; c -u -b 1G > $A/udp-after.json
+          printf 'tcp_before=1000\ntcp_after=2000\nudp_before=1000\nudp_after=1000\n' > $A/baseline.txt
   solution:
-    explanation: Run the server in one namespace and the client in the other for each protocol, keep the JSON, raise the MTU of both ends to 9000 and repeat. The values written to baseline.txt come straight from the JSON reports.
+    explanation: Run the client in depot-a against the server in depot-b for each protocol, keep the JSON, raise the MTU of both ends to 9000 and repeat. The values written to baseline.txt come straight from the JSON reports.
     steps:
       - on: tr-net-01
         as: learner
@@ -200,8 +238,6 @@ spec:
         run: |
           set -e
           A=/home/learner/answers
-          sudo ip netns exec depot-b iperf3 -s -D --pidfile /tmp/tr-iperf.pid
-          sleep 1
           sudo ip netns exec depot-a iperf3 -c 10.74.1.2 -t {{duration}} -J > $A/tcp-before.json
           sudo ip netns exec depot-a iperf3 -c 10.74.1.2 -u -b 1G -t {{duration}} -J > $A/udp-before.json
           sudo ip -n depot-a link set eth0 mtu 9000
@@ -215,4 +251,3 @@ spec:
               return json.load(open(A + f))["end"][k]["bits_per_second"] / 1e6
           open(A + "baseline.txt", "w").write("tcp_before=%f\ntcp_after=%f\nudp_before=%f\nudp_after=%f\n" % (mbit("tcp-before.json", "sum_received"), mbit("tcp-after.json", "sum_received"), mbit("udp-before.json", "sum"), mbit("udp-after.json", "sum")))
           EOP
-          sudo kill "$(cat /tmp/tr-iperf.pid)" 2>/dev/null || true
