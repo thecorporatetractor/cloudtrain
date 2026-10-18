@@ -201,7 +201,7 @@ spec:
       command: kubectl config use-context qm-depot
       cost: 0
     - title: The container that crashed is gone
-      body: "`--previous` (`-p`) prints the logs of the last terminated instance of a container."
+      body: "`--previous` (`-p`) prints the logs of the last terminated instance of a container. If it reports the previous container as not found, the crashed run is the current container: read its logs without `--previous`."
       command: kubectl -n label-printing logs deploy/label-printer --previous
       cost: 1
     - title: Events of one Pod
@@ -245,13 +245,12 @@ spec:
       mutation:
         on: workstation
         as: learner
-        timeoutSec: 300
+        timeoutSec: 150
         run: |
           kubectl config use-context qm-depot
-          for i in $(seq 1 40); do
-            line=$(kubectl -n label-printing logs deploy/label-printer --previous 2>/dev/null | grep '^ERROR') && break
-            sleep 5
-          done
+          pod=$(kubectl -n label-printing get pod -l app=label-printer -o jsonpath='{.items[0].metadata.name}')
+          # --previous can point at an already garbage-collected instance; the crashed one is then the current container
+          line=$({ kubectl -n label-printing logs "$pod" --previous 2>/dev/null; kubectl -n label-printing logs "$pod" 2>/dev/null; } | grep -m1 '^ERROR')
           printf '%s\nCrashLoopBackOff\n' "$line" > ~/reports/label-printer.txt
           kubectl -n label-printing patch deployment label-printer --type=json \
             -p '[{"op":"replace","path":"/spec/template/spec/containers/0/args","value":["--queue={{queue}}","--dpi=300"]}]'
@@ -266,15 +265,12 @@ spec:
     steps:
       - on: workstation
         as: learner
-        timeoutSec: 300
+        timeoutSec: 150
         run: |
           kubectl config use-context qm-depot
           pod=$(kubectl -n label-printing get pod -l app=label-printer -o jsonpath='{.items[0].metadata.name}')
-          # the previous instance's log can be briefly unreadable while the kubelet recreates the container: retry
-          for i in $(seq 1 40); do
-            kubectl -n label-printing logs "$pod" --previous 2>/dev/null | grep '^ERROR' > ~/reports/label-printer.txt && break
-            sleep 5
-          done
+          # --previous can point at an already garbage-collected instance; the crashed one is then the current container
+          { kubectl -n label-printing logs "$pod" --previous 2>/dev/null; kubectl -n label-printing logs "$pod" 2>/dev/null; } | grep -m1 '^ERROR' > ~/reports/label-printer.txt
           kubectl -n label-printing events --for "pod/$pod" --types=Warning -o jsonpath='{.items[*].reason}' | tr ' ' '\n' | grep -x BackOff | head -1 >> ~/reports/label-printer.txt
           kubectl -n label-printing patch deployment label-printer --type=json \
             -p '[{"op":"replace","path":"/spec/template/spec/containers/0/args","value":["--queue={{queue}}","--dpi=300"]}]'
@@ -285,13 +281,10 @@ spec:
         steps:
           - on: workstation
             as: learner
-            timeoutSec: 300
+            timeoutSec: 150
             run: |
               kubectl config use-context qm-depot
-              for i in $(seq 1 40); do
-                line=$(kubectl -n label-printing logs deploy/label-printer -p 2>/dev/null | grep ERROR) && break
-                sleep 5
-              done
+              line=$({ kubectl -n label-printing logs deploy/label-printer -p 2>/dev/null; kubectl -n label-printing logs deploy/label-printer 2>/dev/null; } | grep -m1 ERROR)
               reason=$(kubectl -n label-printing describe pod -l app=label-printer | awk '$1 == "Warning" && $2 == "BackOff" {print $2; exit}')
               printf '%s\n%s\n' "$line" "$reason" > ~/reports/label-printer.txt
               kubectl -n label-printing get deployment label-printer -o yaml \
