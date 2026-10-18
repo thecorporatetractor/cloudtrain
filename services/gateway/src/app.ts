@@ -119,15 +119,17 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   if (cors.size) {
     // Credentialed CORS for the listed origins only (never a wildcard). The CSRF header
     // still applies; SameSite=Lax cookies only flow between same-site origins.
+    // The allowed value is the configured origin itself, never the request header.
+    const allowed = (origin: string | undefined) => [...cors].find((o) => o === origin);
     app.addHook('onRequest', async (req, reply) => {
-      const origin = req.headers.origin;
-      if (!origin || !cors.has(origin) || !req.url.startsWith('/api/')) return;
+      const origin = allowed(req.headers.origin);
+      if (!origin || !req.url.startsWith('/api/')) return;
       reply.header('access-control-allow-origin', origin);
       reply.header('access-control-allow-credentials', 'true');
       reply.header('vary', 'Origin');
     });
     app.options('/api/*', { config: { public: true } }, async (req, reply) => {
-      if (!req.headers.origin || !cors.has(req.headers.origin)) return reply.code(403).send({ error: 'Origin not allowed', code: 'forbidden' });
+      if (!allowed(req.headers.origin)) return reply.code(403).send({ error: 'Origin not allowed', code: 'forbidden' });
       reply.header('access-control-allow-methods', 'GET, POST, PUT, PATCH, DELETE');
       reply.header('access-control-allow-headers', `content-type, ${CSRF_HEADER}`);
       reply.header('access-control-max-age', '600');

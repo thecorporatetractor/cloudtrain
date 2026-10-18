@@ -13,7 +13,7 @@ RUN pnpm install --frozen-lockfile --filter web... \
  && VITE_API_MODE=real pnpm --filter web build
 
 FROM nginxinc/nginx-unprivileged:1.30-alpine@sha256:782bb89768cc87b7f95c18b95baa1af250e5d451f26794f59363540161147c01
-USER root
+USER 0
 RUN rm -f /etc/nginx/conf.d/default.conf /usr/share/nginx/html/*
 COPY apps/web/docker/nginx.conf /etc/nginx/nginx.conf
 COPY apps/web/docker/security-headers.conf /etc/nginx/cloudtrain/security-headers.conf
