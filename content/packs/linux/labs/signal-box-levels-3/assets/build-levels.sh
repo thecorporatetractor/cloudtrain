@@ -80,6 +80,7 @@ cat > /usr/local/sbin/sb-dispatch <<'EOT'
 # Signal box dispatcher. Delivers the final-level report to every user who has left a
 # file named `request` in ~/signalbox/level15 that holds the level 15 unlock password,
 # then removes the request.
+PATH=/usr/sbin:/usr/bin:/sbin:/bin   # cron's PATH lacks /usr/sbin, where runuser lives
 for d in /home/*/signalbox/level15; do
   [ -L "$d" ] && continue
   [ -d "$d" ] && [ -e "$d/request" ] || continue
