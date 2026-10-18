@@ -49,7 +49,7 @@ RUN cd kusto-loco && if [[ $RUN_TESTS == 1 ]]; then \
    && dotnet test test/LokqlEngineTests -c Release $KQL_BUILD_PROPS --logger "console;verbosity=minimal"; fi
 # hadolint ignore=SC2086
 RUN cd kusto-loco && dotnet publish applications/lokql/lokql.csproj -c Release -r linux-x64 --self-contained \
-      -p:PublishSingleFile=false -p:PublishReadyToRun=true -p:InvariantGlobalization=true $KQL_BUILD_PROPS -o /out/lokql \
+      -p:PublishSingleFile=false -p:PublishReadyToRun=true $KQL_BUILD_PROPS -o /out/lokql \
  && ! ls /out/lokql | grep -qiE '^Kusto\.(Data|Cloud)' \
  && rm -f /out/lokql/*.pdb
 # Licence notices of everything published: KustoLoco, Kusto.Language, every NuGet package
@@ -101,17 +101,17 @@ ARG KUSTOLOCO_COMMIT
 ARG KUSTO_LANGUAGE_COMMIT
 ARG AZURE_SENTINEL_COMMIT
 ENV DEBIAN_FRONTEND=noninteractive LANG=C.UTF-8 LC_ALL=C.UTF-8 \
-    DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1 DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_TieredPGO=0
+    DOTNET_CLI_TELEMETRY_OPTOUT=1
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
-# .NET runtime dependencies (libc6, libgcc-s1, libstdc++6, libssl3, zlib1g are in the base or
-# pulled in), fontconfig + DejaVu for chart rendering, and the shell tools.
+# .NET runtime dependencies (libc6, libgcc-s1, libstdc++6, libssl3, zlib1g, ICU: lokql needs cultures,
+# so no invariant globalization), fontconfig + DejaVu for chart rendering, and the shell tools.
 # hadolint ignore=DL3008
 RUN test -n "$UBUNTU_APT_SNAPSHOT" \
  && apt-get -o Acquire::ForceIPv4=true update \
  && apt-get install -y --no-install-recommends ca-certificates \
  && apt-get -o Acquire::ForceIPv4=true -o APT::Update::Error-Mode=any update --snapshot "$UBUNTU_APT_SNAPSHOT" \
  && apt-get -o Acquire::ForceIPv4=true install -y --no-install-recommends --snapshot "$UBUNTU_APT_SNAPSHOT" \
-      libstdc++6 libssl3t64 zlib1g libfontconfig1 fonts-dejavu-core python3 jq less vim nano \
+      libstdc++6 libssl3t64 zlib1g libicu74 libfontconfig1 fonts-dejavu-core python3 jq less vim nano \
       bash-completion curl file tree \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=build /out/lokql /opt/cloudtrain/kql/lokql
@@ -129,14 +129,17 @@ RUN userdel -r ubuntu 2>/dev/null; useradd -m -u 1000 -U -s /bin/bash learner \
  && echo '[ -f /etc/cloudtrain/bashrc ] && . /etc/cloudtrain/bashrc' | tee -a /etc/skel/.bashrc /root/.bashrc >> /home/learner/.bashrc \
  && ln -s /opt/cloudtrain/loggen/ct-loggen /usr/local/bin/ct-loggen \
  && ln -s /opt/cloudtrain/kql/lokql/lokql /usr/local/bin/lokql \
- && chmod -R a+rX /opt/cloudtrain /usr/share/doc/cloudtrain-kql \
+ && chmod -R a+rX /usr/share/doc/cloudtrain-kql \
  && install -d -m 0755 /srv/kql && install -d -m 0700 /var/lib/cloudtrain/kql \
  && printf 'CLOUDTRAIN_IMAGE=kql-ws\nKUSTOLOCO_VERSION=%s\nKUSTOLOCO_COMMIT=%s\nKUSTO_LANGUAGE_COMMIT=%s\nAZURE_SENTINEL_COMMIT=%s\n' \
       "$KUSTOLOCO_VERSION" "$KUSTOLOCO_COMMIT" "$KUSTO_LANGUAGE_COMMIT" "$AZURE_SENTINEL_COMMIT" > /etc/cloudtrain-release
 # smoke test: the demo dataset loads with its types and a grader query answers correctly
-RUN out=$(KQL_DATA=/opt/cloudtrain/kql/datasets/demo ct-kql scalar 'SigninLogs | where ResultType == "500121" | summarize dcount(UserPrincipalName)') \
- && test "$out" = 1 \
- && test "$(KQL_DATA=/opt/cloudtrain/kql/datasets/sentinel-sample ct-kql count 'Syslog | take 3')" = 3
+ARG SMOKE=1
+RUN [[ $SMOKE != 1 ]] || { \
+      out=$(KQL_DATA=/opt/cloudtrain/kql/datasets/demo ct-kql scalar 'SigninLogs | where ResultType == "500121" | summarize dcount(UserPrincipalName)'); \
+      echo "smoke 1: $out"; test "$out" = 1; \
+      out=$(KQL_DATA=/opt/cloudtrain/kql/datasets/sentinel-sample ct-kql count 'Syslog | take 3'); \
+      echo "smoke 2: $out"; test "$out" = 3; }
 # A lab workstation that only sleeps: Kubernetes ignores image health checks, the pod is
 # ready when it runs.
 HEALTHCHECK NONE
