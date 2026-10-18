@@ -17,8 +17,8 @@ Legend. **Type**: learn = guided first exposure, do = complete a task, fix = rep
 | Containers with Docker | 11 | 91 | 44 | 2 | 24 | 23 | 88 | B 71, C 64 | 28 |
 | Infrastructure as code with Terraform | 5 | 54 | 45 | 2 | 99 | 0 | 0 | A 53, B 1, V 45 | 21 |
 | Configuration management and automation | 7 | 61 | 36 | 1 | 9 | 36 | 52 | A 39, B 7, C 45, N 6 | 26 |
-| Network administration | 4 | 45 | 32 | 1 | 25 | 29 | 23 | N 77 | 15 |
-| **Total** | 43 | 499 | 379 | 13 | 280 | 275 | 323 | A 176, B 148, C 235, K 112, V 124, N 83 | 161 |
+| Network administration | 4 | 45 | 33 | 1 | 25 | 46 | 7 | N 78 | 15 |
+| **Total** | 43 | 499 | 380 | 13 | 280 | 292 | 307 | A 176, B 148, C 235, K 112, V 124, N 84 | 161 |
 
 Cross-domain exams: Platform engineer practical capstone. Exam tasks are counted under the domain of each task. Learning labs by type: learn 47, do 356, fix 83, hack 13. New skills proposed: 201.
 
@@ -1149,7 +1149,7 @@ _CloudTrain is not affiliated with or endorsed by Cisco Systems, Inc. or Red Hat
 | `sim-iac-associate` | Infrastructure as code associate exam simulation | tf-associate | practical-simulation | 60 min | 70% | 12 | 25 | shared | no | A |
 | `sim-iac-advanced` | Infrastructure as code advanced lab exam simulation | tf-advanced | practical | 240 min | 70% | 9 | 18 | shared | no | V |
 | `sim-el-automation` | Enterprise Linux automation practical exam simulation | ex294-aligned | practical | 240 min | 70% | 15 | 32 | shared | yes | C |
-| `sim-net-associate` | Associate network engineer practical exam simulation | ccna | practical-simulation | 120 min | 80% | 15 | 30 | shared | no | N |
+| `sim-net-associate` | Associate network engineer practical exam simulation | ccna | practical-simulation | 120 min | 80% | 15 | 31 | shared | no | N |
 | `sim-platform-engineer` | Platform engineer practical capstone | ct-platform | practical | 240 min | 70% | 10 | 20 | shared | yes | K |
 
 ### Kubernetes administrator practical exam simulation
@@ -1840,7 +1840,7 @@ Aligns to: ccna.
 | ccna:ip-connectivity | 25% | 4 | 8 |
 | ccna:ip-services | 10% | 2 | 4 |
 | ccna:security-fundamentals | 15% | 2 | 4 |
-| ccna:automation-programmability | 10% | 1 | 2 |
+| ccna:automation-programmability | 10% | 1 | 3 |
 
 **Rules.** Hints: none. Timer: one timer across all tasks. Tasks in any order. Flag for review. Reboot before grading: no. Docs: local man pages, FRR and SR Linux offline documentation only. Partial credit: per-check. One shared district topology for all tasks; tasks touch disjoint devices or VLANs so the drawn set never conflicts. Failover checks (floating static, VRRP, LACP) are run by the grader by shutting links after the timer ends.
 
@@ -1850,7 +1850,7 @@ Aligns to: ccna.
 
 _CloudTrain is not affiliated with or endorsed by Cisco Systems, Inc. CCNA is a trademark of Cisco Systems, Inc. This simulation covers objectives aligned to that exam; passing it confers no certification._
 
-<details><summary>Task pool (30 tasks)</summary>
+<details><summary>Task pool (31 tasks)</summary>
 
 | Task | Objective | Title | Difficulty | Min | Tier | Scenario |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -1865,7 +1865,7 @@ _CloudTrain is not affiliated with or endorsed by Cisco Systems, Inc. CCNA is a 
 | `xnt-native-vlan-repair` | ccna:network-access | Repair a trunk that leaks between VLANs | medium | 8 | N | Find and fix the native VLAN mismatch on the annex trunk so management hosts no longer reach student hosts and both VLANs still cross the trunk. |
 | `xnt-rstp-root-choice` | ccna:network-access | Make a chosen switch the spanning-tree root | medium | 8 | N | Set rapid spanning tree priorities so the data-centre switch is root for the campus triangle and the named access link is the blocked one. |
 | `xnt-lacp-server-bond` | ccna:network-access | Bundle two server links with LACP | medium | 8 | N | Aggregate the two links to the backup server with LACP so the bundle is up with both members active and the server survives losing either link. |
-| `xnt-inter-vlan-annex` | ccna:network-access | Route between two annex VLANs on one link | medium | 8 | N | Add 802.1Q subinterfaces on the annex router for VLANs 20 and 30 so hosts in each VLAN reach the other through their gateway. |
+| `xnt-inter-vlan-annex` | ccna:network-access | Route between two annex VLANs on one link | medium | 8 | N | Add 802.1Q subinterfaces on the annex router for the two given VLANs so hosts in each VLAN reach the other through their gateway. |
 | `xnt-static-campus-reachability` | ccna:ip-connectivity | Restore reachability between two campuses with static routes | easy | 6 | N | Add the static routes needed so the south and east campus LANs reach each other in both directions through the core. |
 | `xnt-floating-backup-route` | ccna:ip-connectivity | Add a backup route that is used only on failure | medium | 8 | N | Add a floating static route over the radio link so the annex keeps reaching the core when the grader takes the fibre down, and the fibre path stays preferred while it is up. |
 | `xnt-ipv6-default-route` | ccna:ip-connectivity | Give a campus router an IPv6 default route | medium | 6 | N | Configure an IPv6 default route on the north campus router via the core router's link-local address so north IPv6 hosts reach the district office. |
@@ -1884,6 +1884,7 @@ _CloudTrain is not affiliated with or endorsed by Cisco Systems, Inc. CCNA is a 
 | `xnt-snmpv3-only` | ccna:security-fundamentals | Replace community-based SNMP with SNMPv3 | medium | 8 | N | Remove community-based SNMP access from the edge router and add the given authenticated and encrypted SNMPv3 user readable only from the monitoring host. |
 | `xnt-api-interface-desc` | ccna:automation-programmability | Set interface descriptions through a device API | medium | 10 | N | Using the switch's JSON-RPC API, set the descriptions given in a YAML file on three ports and write the API's response for one port to the given file. |
 | `xnt-render-config-from-yaml` | ccna:automation-programmability | Render a router config from structured data | medium | 10 | N | Complete the provided Jinja2 template so it renders the annex router's interface addresses from the given YAML, apply the result and make the annex LANs reachable. |
+| `xnt-json-neighbour-export` | ccna:automation-programmability | Export OSPF neighbour state as JSON | medium | 10 | N | Read the core router's OSPF neighbours as JSON from its read-only vtysh endpoint and write a JSON file in the given schema with jq or Python; the grader recomputes the expected content from the live device. |
 
 </details>
 
@@ -1932,8 +1933,8 @@ _CloudTrain internal assessment. It is not aligned to, affiliated with or endors
 | `xpe-k8s-ingress-route` | ct-platform:kubernetes-operations | Route the public tracking host to the API | medium | 15 | K | Publish the tracking API under host track.quillmoor.example path /api through the cluster's Ingress controller with TLS from the provided certificate Secret. |
 | `xpe-worker-notready-recovery` | ct-platform:kubernetes-operations | Return a NotReady worker to service | hard | 20 | K | Worker harbour-wk-2 went NotReady after the node-agent rollout; find the cause in the kubelet journal, repair it and confirm the node schedules Pods again. |
 | `xpe-k8s-autoscale-tracking` | ct-platform:kubernetes-operations | Autoscale the tracking API on CPU | medium | 15 | K | Add a HorizontalPodAutoscaler that keeps the tracking API between 3 and 8 replicas at 70 percent average CPU utilisation and confirm it reads metrics. |
-| `xpe-net-depot-route` | ct-platform:networking-connectivity | Reach the depot subnet from the harbour cluster | medium | 20 | N | Add OSPF adjacency between router qm-edge-1 and the depot router so the harbour cluster nodes reach 10.40.8.0/24, and the depot scanners reach the tracking Ingress address. |
-| `xpe-net-edge-nat` | ct-platform:networking-connectivity | Give the harbour subnet controlled egress | medium | 20 | N | Configure source NAT on the Linux edge router so only the harbour node subnet reaches the upstream mirror network, with forwarding from every other subnet dropped. |
+| `xpe-net-depot-route` | ct-platform:networking-connectivity | Reach the depot subnet from the harbour cluster | medium | 20 | N | Add an OSPF adjacency between router qm-edge-1 and the depot router, advertise the harbour node subnet passively and save the configuration, so the harbour cluster nodes reach the depot subnet and the depot scanners reach the tracking Ingress address. |
+| `xpe-net-edge-nat` | ct-platform:networking-connectivity | Give the harbour subnet controlled egress | medium | 20 | N | Configure source NAT and a forwarding policy on the Linux edge router so only the harbour node subnet reaches the upstream mirror network, with forwarding from every other subnet dropped, and save the ruleset to /etc/nftables.nft. |
 | `xpe-sec-restricted-namespace` | ct-platform:security-hardening | Enforce the restricted profile on the tracking namespace | medium | 15 | K | Label the tracking namespace to enforce the restricted Pod Security Standard and change the Deployment so its Pods still start: non-root, no privilege escalation, all capabilities dropped, RuntimeDefault seccomp. |
 | `xpe-sec-least-privilege-ci` | ct-platform:security-hardening | Cut the CI service account down to what it uses | medium | 15 | K | The ci-deployer ServiceAccount holds cluster-admin; replace that with a namespaced Role that only lets it update Deployments and read Pods in the tracking namespace, and disable token automounting for other Pods. |
 | `xpe-incident-tracking-outage` | ct-platform:incident-response | Restore the tracking service and write the timeline | hard | 30 | K | Customers see 503s from track.quillmoor.example; restore service end to end and record the root cause and the fixing change in /home/learner/incident/summary.txt in the given three-line format. |

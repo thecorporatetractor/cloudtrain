@@ -114,3 +114,32 @@ bug is fixed, point `v.sh` at a labctl built with the one-line patch.
 
 Next: verify the 22 drafts in path order, then write the missing 15 pool tasks so
 retakes get a fresh draw (the exam itself now runs end to end: 100 % / 14.3 %).
+
+## Round 5 wave 2 (write-only, status built)
+
+- The seven security/VPN learning labs (`net-acl-grades-server` ... `net-fix-mtu-blackhole`)
+  already existed from wave 1; this wave corrected their curriculum `images` to `netsvc:1`
+  (Linux routers and firewalls are netsvc) and recorded the kernel risks.
+- 16 new `sim-net-associate` pool tasks (`xnt-ipv6-office-slaac` ... `xnt-snmpv3-only`) plus the
+  new `xnt-json-neighbour-export` (automation pool: 2 runnable tasks against a draw of 1;
+  `xnt-api-interface-desc` stays blocked on SR Linux). Pools now: fundamentals 6/6, access 6/6,
+  ip-connectivity 8/8, ip-services 4/4, security 4/4, automation 2 (+1 blocked).
+  `labctl exam compile --allow-missing sim-net-associate` passes; without the flag it fails only on
+  `xnt-api-interface-desc`.
+- The two `sim-platform-engineer` network tasks (`xpe-net-depot-route`, `xpe-net-edge-nat`, Quillmoor
+  `qm-*` estate). The harbour cluster nodes are VMs a netdev router cannot be wired to, so both use
+  netsvc stand-ins; persistence is checked (FRR `write memory`, parsed per interface stanza in
+  `/etc/frr/*.conf`; nftables: the weight-0 trigger runs `restore-firewall`, which flushes the live
+  ruleset and loads `/etc/nftables.nft`, so the functional checks grade the saved file).
+- Design notes: `xnt-inter-vlan-annex` uses a netsvc Linux router (the learner creates the 802.1Q
+  subinterfaces); `xnt-route-preference-report` keeps `mv-core-21` console-only (a netdev node gives the
+  learner vtysh only): the answer file lives on the netsvc host `noc-21`, the core serves
+  `show ip route <dest> json` read-only over HTTP, and params `rot`/`fad` permute which destination gets
+  the static /24, the static /23 and the floating static (AD 90 or 250); `xnt-json-neighbour-export` serves read-only vtysh JSON over
+  HTTP from a small python3 server on the core; `xnt-capture-dns-transport` compares the answer file
+  with a grader-owned pcap started in setup.
+- Verify queue (none run live this wave): every task above per-lab `labctl verify`; first-verify risks
+  are the WireGuard/IPsec kernel modules in the user-namespaced netns (net-wireguard-annex-tunnel,
+  net-ipsec-partner-tunnel, xnt-wireguard-annex), `ip_gre` and 1400-byte frames on the pod network
+  (net-fix-mtu-blackhole, GRE tunnel, not WireGuard), FRR JSON field names
+  (`state` DR/Backup/DROther, `ifaceName`), and `show ip route <dest> json` entry layout.

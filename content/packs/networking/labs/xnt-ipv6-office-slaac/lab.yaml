@@ -1,0 +1,160 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xnt-ipv6-office-slaac
+  title: Give an office LAN IPv6 with SLAAC
+  domain: networking
+  frameworks: [ccna:network-fundamentals]
+  difficulty: medium
+  estimatedMinutes: 8
+  tags: [exam, ipv6, slaac, router-advertisement, frr]
+  version: 1
+spec:
+  description: |
+    **Device:** `mv-campus-north-12` (FRR console)
+
+    | Interface | Segment | Address |
+    |---|---|---|
+    | `eth1` | north office LAN (hosts `office-12a` and `office-12b` through `mv-sw-north-12`) | IPv4 `10.{{octet}}.12.1/24` (already set) |
+
+    The district has delegated the global prefix **2001:db8:{{octet}}:{{net}}::/64**
+    to the north office. Give `eth1` the address `2001:db8:{{octet}}:{{net}}::1/64`
+    and advertise the prefix with router advertisements, so both office hosts
+    build their own global address with SLAAC, learn the router as their IPv6
+    default gateway, and reach `2001:db8:{{octet}}:{{net}}::1`. Do not
+    configure IPv6 addresses on the hosts. The hosts re-solicit when their link
+    comes up (the grader bounces their interface before it looks).
+  objectives:
+    - Assign a global IPv6 address on a router interface
+    - Enable router advertisements for the prefix so hosts autoconfigure
+  params:
+    octet: { type: int, min: 20, max: 90 }
+    net: { type: int, min: 10, max: 99 }
+  topology:
+    entry: workstation
+    nodes:
+      - { name: workstation, driver: container, image: jumphost:1, access: [shell] }
+      - { name: mv-campus-north-12, driver: netdev, image: frr:10, access: [console] }
+      - { name: mv-sw-north-12, driver: container, image: netsvc:1, resources: { cpu: 0.1, memoryMiB: 64 } }
+      - { name: office-12a, driver: container, image: netsvc:1, resources: { cpu: 0.1, memoryMiB: 64 }, access: [shell] }
+      - { name: office-12b, driver: container, image: netsvc:1, resources: { cpu: 0.1, memoryMiB: 64 }, access: [shell] }
+    links:
+      - { a: "mv-campus-north-12:eth1", b: "mv-sw-north-12:eth1" }
+      - { a: "mv-sw-north-12:eth2", b: "office-12a:eth1" }
+      - { a: "mv-sw-north-12:eth3", b: "office-12b:eth1" }
+  setup:
+    - on: mv-sw-north-12
+      run: |
+        ip link add br0 type bridge 2>/dev/null || true
+        for p in eth1 eth2 eth3; do ip link set $p master br0; done; ip link set br0 up
+    - on: mv-campus-north-12
+      config: |
+        interface eth1
+         description north office LAN
+         ip address 10.{{octet}}.12.1/24
+    - on: office-12a
+      run: &host |
+        echo 0 > /proc/sys/net/ipv6/conf/eth1/disable_ipv6
+        echo 0 > /proc/sys/net/ipv6/conf/eth1/forwarding
+        echo 1 > /proc/sys/net/ipv6/conf/eth1/accept_ra
+        ip link set eth1 down; ip link set eth1 up
+    - on: office-12b
+      run: *host
+  checks:
+    - id: router-address
+      description: mv-campus-north-12 has the office /64 address on eth1
+      type: shell
+      on: mv-campus-north-12
+      command: ip -6 -o addr show dev eth1 scope global | awk '{print $4}'
+      expect: { match: exact, value: "2001:db8:{{octet}}:{{net}}::1/64" }
+      skills: [net.addressing.ipv6]
+    - id: office-12a-slaac
+      description: office-12a autoconfigured an address in the office prefix and uses the router as default gateway
+      type: shell
+      on: office-12a
+      command: &slaac |
+        ip link set eth1 down; ip link set eth1 up
+        for i in $(seq 40); do
+          a=$(ip -6 -o addr show dev eth1 scope global dynamic | awk '$4 ~ /^2001:db8:{{octet}}:{{net}}:/ {print $4}' | head -1)
+          g=$(ip -6 route show default dev eth1 | head -1)
+          [ -n "$a" ] && [ -n "$g" ] && { echo ok; exit 0; }
+          sleep 1
+        done
+        echo none
+      expect: { match: exact, value: ok }
+      timeoutSec: 60
+      skills: [net.addressing.ipv6-slaac]
+      weight: 2
+    - id: office-12b-slaac
+      description: office-12b autoconfigured an address in the office prefix and uses the router as default gateway
+      type: shell
+      on: office-12b
+      command: *slaac
+      expect: { match: exact, value: ok }
+      timeoutSec: 60
+      skills: [net.addressing.ipv6-slaac]
+      weight: 2
+    - id: host-a-reaches-router
+      description: office-12a reaches the router global address over IPv6
+      type: shell
+      on: office-12a
+      command: |
+        for i in $(seq 25); do ping -6 -c1 -W2 2001:db8:{{octet}}:{{net}}::1 >/dev/null 2>&1 && { echo ok; exit 0; }; sleep 1; done; echo no
+      expect: { match: exact, value: ok }
+      timeoutSec: 60
+      skills: [net.addressing.ipv6]
+    - id: host-b-reaches-router
+      description: office-12b reaches the router's global address over IPv6
+      type: shell
+      on: office-12b
+      command: |
+        for i in $(seq 25); do ping -6 -c1 -W2 2001:db8:{{octet}}:{{net}}::1 >/dev/null 2>&1 && { echo ok; exit 0; }; sleep 1; done; echo no
+      expect: { match: exact, value: ok }
+      timeoutSec: 60
+      skills: [net.addressing.ipv6]
+  misconceptions:
+    - id: address-without-ra
+      description: Gives the router its address but leaves router advertisements suppressed
+      mutation:
+        on: mv-campus-north-12
+        config: |
+          interface eth1
+           ipv6 address 2001:db8:{{octet}}:{{net}}::1/64
+      expectFail: [office-12a-slaac, office-12b-slaac]
+    - id: no-autoconfig-flag
+      description: Advertises the prefix with the autonomous (A) flag cleared
+      mutation:
+        on: mv-campus-north-12
+        config: |
+          interface eth1
+           ipv6 address 2001:db8:{{octet}}:{{net}}::1/64
+           ipv6 nd prefix 2001:db8:{{octet}}:{{net}}::/64 no-autoconfig
+           ipv6 nd ra-interval 5
+           no ipv6 nd suppress-ra
+      expectFail: [office-12a-slaac, office-12b-slaac]
+  solution:
+    explanation: |
+      Address eth1 with the first address of the /64 and advertise the prefix:
+      `ipv6 nd prefix`, a short RA interval and `no ipv6 nd suppress-ra`. The hosts
+      build addresses from the prefix and take the router's link-local address
+      as default gateway.
+    steps:
+      - on: mv-campus-north-12
+        config: |
+          interface eth1
+           ipv6 address 2001:db8:{{octet}}:{{net}}::1/64
+           ipv6 nd prefix 2001:db8:{{octet}}:{{net}}::/64
+           ipv6 nd ra-interval 5
+           no ipv6 nd suppress-ra
+      - on: office-12a
+        timeoutSec: 60
+        run: &wait |
+          for i in $(seq 40); do
+            ip -6 addr show dev eth1 scope global | grep -q dynamic && exit 0
+            if [ $((i % 10)) = 0 ]; then ip link set eth1 down; ip link set eth1 up; fi
+            sleep 1
+          done
+          exit 1
+      - on: office-12b
+        timeoutSec: 60
+        run: *wait

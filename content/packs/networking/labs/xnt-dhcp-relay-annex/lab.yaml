@@ -1,0 +1,104 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xnt-dhcp-relay-annex
+  title: Relay DHCP for a remote subnet
+  domain: networking
+  frameworks: [ccna:ip-services]
+  difficulty: medium
+  estimatedMinutes: 8
+  tags: [exam, dhcp, relay, dnsmasq]
+  version: 1
+spec:
+  description: |
+    **Device:** `mv-annex-23` (Linux router, shell; dnsmasq installed)
+
+    | Device | Address |
+    |---|---|
+    | `mv-annex-23` `eth1` (annex student LAN) | `10.{{octet}}.{{lan}}.1/24` |
+    | `mv-annex-23` `eth2` (towards the data centre) | `10.{{octet}}.100.1/24` |
+    | `dhcp-dc-23` `eth1` | `10.{{octet}}.100.10/24`, default gateway `10.{{octet}}.100.1` |
+    | `student-annex-23` `eth1` | DHCP client on the annex student LAN |
+
+    The data-centre DHCP server `dhcp-dc-23` already has a pool for
+    `10.{{octet}}.{{lan}}.0/24` (gateway `10.{{octet}}.{{lan}}.1`), but the
+    annex student hosts get no address: DHCP discovers are broadcasts and the router
+    does not forward them. Configure `mv-annex-23` as a DHCP relay agent for its
+    student LAN towards `dhcp-dc-23`, so `student-annex-23` leases an address from
+    the annex pool. Do not change the DHCP server and do not run a second DHCP
+    server.
+  objectives:
+    - Configure a DHCP relay agent with the correct local address and server
+  params:
+    octet: { type: int, min: 20, max: 90 }
+    lan: { type: int, min: 30, max: 39 }
+  topology:
+    entry: workstation
+    nodes:
+      - { name: workstation, driver: container, image: jumphost:1, access: [shell] }
+      - { name: mv-annex-23, driver: container, image: netsvc:1, resources: { cpu: 0.2, memoryMiB: 64 }, access: [shell] }
+      - { name: dhcp-dc-23, driver: container, image: netsvc:1, resources: { cpu: 0.2, memoryMiB: 64 } }
+      - { name: student-annex-23, driver: container, image: nettools:1, resources: { cpu: 0.1, memoryMiB: 48 } }
+    links:
+      - { a: "student-annex-23:eth1", b: "mv-annex-23:eth1" }
+      - { a: "mv-annex-23:eth2", b: "dhcp-dc-23:eth1" }
+  setup:
+    - on: mv-annex-23
+      run: |
+        echo 1 > /proc/sys/net/ipv4/ip_forward
+        ip addr replace 10.{{octet}}.{{lan}}.1/24 dev eth1
+        ip addr replace 10.{{octet}}.100.1/24 dev eth2
+    - on: dhcp-dc-23
+      run: |
+        O={{octet}}; L={{lan}}
+        ip addr replace 10.$O.100.10/24 dev eth1; ip route replace default via 10.$O.100.1
+        mkdir -p /etc/dnsmasq.d /var/lib/misc; f=/etc/dnsmasq.d/district.conf
+        printf 'port=0\ninterface=eth1\ndhcp-range=set:annex,10.%s.%s.100,10.%s.%s.199,255.255.255.0,12h\ndhcp-option=tag:annex,option:router,10.%s.%s.1\ndhcp-option=option:dns-server,10.%s.0.53\ndhcp-leasefile=/var/lib/misc/dnsmasq.leases\n' $O $L $O $L $O $L $O > $f
+        dnsmasq -C $f
+    - { on: student-annex-23, file: { path: /usr/local/bin/dhcp-probe, mode: "0755", source: assets/dhcp-probe } }
+  checks:
+    - id: student-lease
+      description: A student client on the annex LAN gets an address from the annex pool with the annex gateway
+      type: shell
+      on: student-annex-23
+      command: dhcp-probe eth1
+      expect: { match: regex, value: "^10\\.{{octet}}\\.{{lan}}\\.1[0-9][0-9] 10\\.{{octet}}\\.{{lan}}\\.1 10\\.{{octet}}\\.0\\.53$" }
+      timeoutSec: 30
+      skills: [net.services.dhcp-relay]
+      weight: 3
+    - id: server-saw-relay
+      description: The DHCP server leased the address to a client behind the relay
+      type: shell
+      on: dhcp-dc-23
+      command: grep -c ' 10\.{{octet}}\.{{lan}}\.1[0-9][0-9] ' /var/lib/misc/dnsmasq.leases
+      expect: { match: regex, value: "^[1-9][0-9]*$" }
+      skills: [net.services.dhcp-relay]
+    - id: server-unchanged
+      description: The DHCP server configuration was not changed
+      type: shell
+      on: dhcp-dc-23
+      command: grep -c '^dhcp-range' /etc/dnsmasq.d/district.conf
+      expect: { match: exact, value: "1" }
+      skills: [net.services.dhcp-relay]
+      weight: 0.5
+  misconceptions:
+    - id: uplink-giaddr
+      description: Uses the router's data-centre-side address as the relay's local address
+      mutation:
+        on: mv-annex-23
+        run: dnsmasq --port=0 --dhcp-relay=10.{{octet}}.100.1,10.{{octet}}.100.10 --interface=eth1,eth2
+      expectFail: [student-lease, server-saw-relay]
+    - id: local-server
+      description: Runs a second DHCP server on the annex router instead of relaying
+      mutation:
+        on: mv-annex-23
+        run: dnsmasq --port=0 --interface=eth1 --dhcp-range=10.{{octet}}.{{lan}}.100,10.{{octet}}.{{lan}}.199,12h --dhcp-option=option:dns-server,10.{{octet}}.0.53
+      expectFail: [server-saw-relay]
+  solution:
+    explanation: |
+      dnsmasq in relay mode forwards broadcasts from the student LAN to the data-centre
+      server with giaddr 10.{{octet}}.{{lan}}.1; the server picks the matching pool and answers
+      the relay, which hands the offer back to the client.
+    steps:
+      - on: mv-annex-23
+        run: dnsmasq --port=0 --dhcp-relay=10.{{octet}}.{{lan}}.1,10.{{octet}}.100.10

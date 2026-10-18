@@ -1,0 +1,214 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xnt-floating-backup-route
+  title: Add a backup route that is used only on failure
+  domain: networking
+  frameworks: [ccna:ip-connectivity]
+  difficulty: medium
+  estimatedMinutes: 8
+  tags: [exam, static-route, floating-static, failover, frr]
+  version: 1
+spec:
+  description: |
+    **Device:** `mv-annex-18` (FRR console)
+
+    | Link | annex end | core end (`mv-core-18`) |
+    |---|---|---|
+    | fibre: `eth1` | `10.{{octet}}.0.2/30` | `10.{{octet}}.0.1/30` |
+    | radio: `eth2` (slow) | `10.{{octet}}.0.6/30` | `10.{{octet}}.0.5/30` |
+
+    The annex LAN is `10.{{octet}}.60.0/24` (`annex-pc-18` `.10`), the district
+    office LAN is `10.{{octet}}.1.0/24` (`office-pc-18` `.10`). The core learns the
+    annex LAN over OSPF and its return path already fails over by itself;
+    `mv-annex-18` does not install OSPF-learned routes. On `mv-annex-18` configure
+    static routes to the office LAN so that:
+
+    - it uses the fibre while the fibre is up;
+    - it uses the radio link, with administrative distance **{{ad}}**, only when
+      the fibre is down;
+    - it goes back to the fibre when the fibre recovers.
+
+    The grader shuts `mv-annex-18:eth1` for 40 seconds and checks that
+    `annex-pc-18` still reaches `office-pc-18`, then that traffic returns to the fibre.
+  objectives:
+    - Configure a static route and a floating static route with a given administrative distance
+  params:
+    octet: { type: int, min: 20, max: 90 }
+    ad: { type: int, min: 150, max: 220 }
+  topology:
+    entry: workstation
+    nodes:
+      - { name: workstation, driver: container, image: jumphost:1, access: [shell] }
+      - { name: mv-annex-18, driver: netdev, image: frr:10, access: [console] }
+      - { name: mv-core-18, driver: netdev, image: frr:10 }
+      - { name: annex-pc-18, driver: container, image: nettools:1, resources: { cpu: 0.1, memoryMiB: 48 }, access: [shell] }
+      - { name: office-pc-18, driver: container, image: nettools:1, resources: { cpu: 0.1, memoryMiB: 48 } }
+    links:
+      - { a: "mv-annex-18:eth1", b: "mv-core-18:eth1" }
+      - { a: "mv-annex-18:eth2", b: "mv-core-18:eth2" }
+      - { a: "mv-annex-18:eth3", b: "annex-pc-18:eth1" }
+      - { a: "mv-core-18:eth3", b: "office-pc-18:eth1" }
+  setup:
+    - on: mv-core-18
+      config: |
+        interface eth1
+         ip address 10.{{octet}}.0.1/30
+         ip ospf area 0
+         ip ospf network point-to-point
+         ip ospf hello-interval 1
+         ip ospf dead-interval 3
+         ip ospf cost 10
+        interface eth2
+         ip address 10.{{octet}}.0.5/30
+         ip ospf area 0
+         ip ospf network point-to-point
+         ip ospf hello-interval 1
+         ip ospf dead-interval 3
+         ip ospf cost 100
+        interface eth3
+         ip address 10.{{octet}}.1.1/24
+         ip ospf area 0
+         ip ospf passive
+        router ospf
+         ospf router-id 10.255.{{octet}}.1
+    - on: mv-annex-18
+      config: |
+        interface eth1
+         ip address 10.{{octet}}.0.2/30
+         ip ospf area 0
+         ip ospf network point-to-point
+         ip ospf hello-interval 1
+         ip ospf dead-interval 3
+         ip ospf cost 10
+        interface eth2
+         ip address 10.{{octet}}.0.6/30
+         ip ospf area 0
+         ip ospf network point-to-point
+         ip ospf hello-interval 1
+         ip ospf dead-interval 3
+         ip ospf cost 100
+        interface eth3
+         ip address 10.{{octet}}.60.1/24
+         ip ospf area 0
+         ip ospf passive
+        router ospf
+         ospf router-id 10.255.{{octet}}.2
+        route-map NO-OSPF-ROUTES deny 10
+        ip protocol ospf route-map NO-OSPF-ROUTES
+    - { on: annex-pc-18, run: "ip addr replace 10.{{octet}}.60.10/24 dev eth1 && ip route replace default via 10.{{octet}}.60.1" }
+    - { on: office-pc-18, run: "ip addr replace 10.{{octet}}.1.10/24 dev eth1 && ip route replace default via 10.{{octet}}.1.1" }
+    - on: mv-core-18
+      timeoutSec: 90
+      run: |
+        for i in $(seq 70); do vtysh -c 'show ip route ospf' | grep -q '10.{{octet}}.60.0/24' && exit 0; sleep 1; done; exit 1
+  checks:
+    - id: fibre-preferred
+      description: With both links up, mv-annex-18 forwards to the office LAN over the fibre
+      type: shell
+      on: mv-annex-18
+      command: |
+        for i in $(seq 45); do r=$(ip route get 10.{{octet}}.1.10 | head -1); case "$r" in *"via 10.{{octet}}.0.1 dev eth1"*) break;; esac; sleep 1; done
+        echo "$r"
+      expect: { match: regex, value: "via 10\\.{{octet}}\\.0\\.1 dev eth1" }
+      timeoutSec: 60
+      skills: [net.routing.route-selection]
+    - id: floating-configured
+      description: A static route to the office LAN over the radio with administrative distance {{ad}} exists
+      type: shell
+      on: mv-annex-18
+      command: |
+        vtysh -c 'show running-config' | awk '$1=="ip" && $2=="route" && $3=="10.{{octet}}.1.0/24" && $4=="10.{{octet}}.0.5" {d=($NF ~ /^[0-9]+$/ && NF>4)?$NF:1; print d}'
+      expect: { match: exact, value: "{{ad}}" }
+      skills: [net.routing.floating-static]
+    - id: end-to-end
+      description: annex-pc-18 reaches office-pc-18
+      type: reachability
+      on: annex-pc-18
+      target: 10.{{octet}}.1.10
+      skills: [net.routing.static]
+    - id: fail-fibre
+      description: (failover test) the fibre port mv-annex-18:eth1 is shut for 40 seconds
+      type: shell
+      on: mv-annex-18
+      command: |
+        ip link set eth1 down
+        setsid sh -c 'sleep 40; ip link set eth1 up' </dev/null >/dev/null 2>&1 &
+        echo started
+      expect: { match: exact, value: started }
+      skills: [net.routing.floating-static]
+      weight: 0
+    - id: failover-route
+      description: With the fibre down, mv-annex-18 forwards to the office LAN over the radio
+      type: shell
+      on: mv-annex-18
+      command: |
+        for i in $(seq 15); do r=$(ip route get 10.{{octet}}.1.10 | head -1); case "$r" in *"via 10.{{octet}}.0.5 dev eth2"*) break;; esac; sleep 1; done
+        echo "$r"
+      expect: { match: regex, value: "via 10\\.{{octet}}\\.0\\.5 dev eth2" }
+      timeoutSec: 30
+      skills: [net.routing.floating-static]
+      weight: 2
+    - id: failover-ping
+      description: With the fibre down, annex-pc-18 still reaches office-pc-18
+      type: shell
+      on: annex-pc-18
+      command: |
+        for i in $(seq 25); do ping -c1 -W1 10.{{octet}}.1.10 >/dev/null 2>&1 && { echo ok; exit 0; }; sleep 1; done; echo lost
+      expect: { match: exact, value: ok }
+      timeoutSec: 45
+      skills: [net.routing.floating-static]
+      weight: 2
+    - id: failback
+      description: After the fibre recovers, traffic goes back over the fibre
+      type: shell
+      on: mv-annex-18
+      command: |
+        for i in $(seq 80); do r=$(ip route get 10.{{octet}}.1.10 | head -1); case "$r" in *"via 10.{{octet}}.0.1 dev eth1"*) break;; esac; sleep 1; done
+        echo "$r"
+      expect: { match: regex, value: "via 10\\.{{octet}}\\.0\\.1 dev eth1" }
+      timeoutSec: 100
+      skills: [net.routing.floating-static]
+  misconceptions:
+    - id: equal-distance
+      description: Adds both routes with the default distance, so the radio carries traffic too
+      mutation:
+        on: mv-annex-18
+        config: |
+          ip route 10.{{octet}}.1.0/24 10.{{octet}}.0.1
+          ip route 10.{{octet}}.1.0/24 10.{{octet}}.0.5
+      expectFail: [floating-configured]
+    - id: no-backup
+      description: Configures only the fibre route
+      mutation:
+        on: mv-annex-18
+        config: |
+          ip route 10.{{octet}}.1.0/24 10.{{octet}}.0.1
+      expectFail: [floating-configured, failover-route, failover-ping]
+    - id: backup-preferred
+      description: Gives the radio route the lower distance by mistake
+      mutation:
+        on: mv-annex-18
+        config: |
+          ip route 10.{{octet}}.1.0/24 10.{{octet}}.0.1 {{ad}}
+          ip route 10.{{octet}}.1.0/24 10.{{octet}}.0.5
+      expectFail: [fibre-preferred, floating-configured]
+  solution:
+    explanation: |
+      A static route via the fibre (distance 1) and the same prefix via the radio
+      with the requested distance. While eth1 is up only the fibre route is
+      installed; when it goes down FRR withdraws it and installs the floating route.
+    steps:
+      - on: mv-annex-18
+        config: |
+          ip route 10.{{octet}}.1.0/24 10.{{octet}}.0.1
+          ip route 10.{{octet}}.1.0/24 10.{{octet}}.0.5 {{ad}}
+      - on: mv-annex-18
+        timeoutSec: 120
+        run: |
+          # an earlier grading round shuts the fibre for 40 s; wait for it and for OSPF on the core side
+          for i in $(seq 100); do
+            ip route get 10.{{octet}}.1.10 | grep -q 'via 10.{{octet}}.0.1 dev eth1' && [ "$(vtysh -c 'show ip ospf neighbor' | grep -c Full)" = 2 ] && break
+            sleep 1
+          done
+          sleep 3

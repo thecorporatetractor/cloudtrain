@@ -1,0 +1,148 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xnt-neighbour-link-local
+  title: Report a neighbour's link-local and MAC address
+  domain: networking
+  frameworks: [ccna:network-fundamentals]
+  difficulty: easy
+  estimatedMinutes: 5
+  tags: [exam, ipv6, neighbor-discovery, link-local]
+  version: 1
+spec:
+  description: |
+    **Device:** `staff-east-14` (shell)
+
+    | Device | Address |
+    |---|---|
+    | `staff-east-14` `eth1` | `10.{{octet}}.14.{{h}}/24` and a SLAAC address, on the east staff LAN |
+    | `printer-east-14` `eth1` | `10.{{octet}}.14.40/24`, same LAN |
+    | `mv-campus-east-14` `eth1` | `10.{{octet}}.14.1/24` (FRR), advertises an IPv6 prefix on the LAN |
+
+    `staff-east-14` uses `mv-campus-east-14` as its default gateway, for IPv4
+    and IPv6. From the host's neighbour tables, write the gateway's IPv6
+    **link-local address** and **MAC address** to `/root/gateway-neighbour.txt`
+    on `staff-east-14` as exactly two lines (MAC in lower case with colons):
+
+    ```
+    gateway_link_local: <fe80:: address of the gateway>
+    gateway_mac: <MAC address of the gateway>
+    ```
+
+    The printer is also in the neighbour table; it is not the gateway.
+  objectives:
+    - Read the IPv6 default route and the neighbour table to find a gateway's link-local and MAC address
+  params:
+    octet: { type: int, min: 20, max: 90 }
+    h: { type: int, min: 50, max: 59 }
+  topology:
+    entry: workstation
+    nodes:
+      - { name: workstation, driver: container, image: jumphost:1, access: [shell] }
+      - { name: mv-campus-east-14, driver: netdev, image: frr:10, access: [console] }
+      - { name: mv-sw-east-14, driver: container, image: netsvc:1, resources: { cpu: 0.1, memoryMiB: 64 } }
+      - { name: staff-east-14, driver: container, image: netsvc:1, resources: { cpu: 0.1, memoryMiB: 64 }, access: [shell] }
+      - { name: printer-east-14, driver: container, image: netsvc:1, resources: { cpu: 0.1, memoryMiB: 64 } }
+    links:
+      - { a: "mv-campus-east-14:eth1", b: "mv-sw-east-14:eth1" }
+      - { a: "mv-sw-east-14:eth2", b: "staff-east-14:eth1" }
+      - { a: "mv-sw-east-14:eth3", b: "printer-east-14:eth1" }
+  setup:
+    - on: mv-sw-east-14
+      run: |
+        ip link add br0 type bridge 2>/dev/null || true
+        for p in eth1 eth2 eth3; do ip link set $p master br0; done; ip link set br0 up
+    - on: mv-campus-east-14
+      config: |
+        interface eth1
+         ip address 10.{{octet}}.14.1/24
+         ipv6 address 2001:db8:{{octet}}:14::1/64
+         ipv6 nd prefix 2001:db8:{{octet}}:14::/64
+         ipv6 nd ra-interval 5
+         no ipv6 nd suppress-ra
+    - on: staff-east-14
+      run: |
+        echo 0 > /proc/sys/net/ipv6/conf/eth1/disable_ipv6
+        echo 1 > /proc/sys/net/ipv6/conf/eth1/accept_ra
+        ip addr replace 10.{{octet}}.14.{{h}}/24 dev eth1
+        ip route replace default via 10.{{octet}}.14.1
+        ip neigh flush all
+    - on: printer-east-14
+      run: |
+        echo 0 > /proc/sys/net/ipv6/conf/eth1/disable_ipv6
+        ip addr replace 10.{{octet}}.14.40/24 dev eth1
+        setsid sh -c 'while :; do ping -c1 -W1 10.{{octet}}.14.{{h}} >/dev/null 2>&1; sleep 4; done' </dev/null >/dev/null 2>&1 &
+  checks:
+    - id: gateway-link-local
+      description: The report gives the gateway's IPv6 link-local address (the next hop of the IPv6 default route)
+      type: shell
+      on: staff-east-14
+      command: |
+        f=/root/gateway-neighbour.txt; [ -f "$f" ] || { echo nofile; exit 0; }
+        got=$(sed -n 's/^gateway_link_local: *\([0-9a-fA-F:]*\) *$/\1/p' "$f" | tr A-F a-f)
+        for i in $(seq 15); do want=$(ip -6 route show default dev eth1 | awk '/via fe80/{print $3; exit}'); [ -n "$want" ] && break; sleep 1; done
+        [ -n "$want" ] && [ "$got" = "$want" ] && echo ok || echo "bad got=$got want=$want"
+      expect: { match: exact, value: ok }
+      timeoutSec: 30
+      skills: [net.addressing.ipv6, net.fundamentals.arp-nd]
+      weight: 2
+    - id: gateway-mac
+      description: The report gives the MAC address of the gateway from the neighbour table
+      type: shell
+      on: staff-east-14
+      command: |
+        f=/root/gateway-neighbour.txt; [ -f "$f" ] || { echo nofile; exit 0; }
+        got=$(sed -n 's/^gateway_mac: *\([0-9a-fA-F:]*\) *$/\1/p' "$f" | tr A-F a-f)
+        ping -c1 -W2 10.{{octet}}.14.1 >/dev/null 2>&1
+        want=$(ip neigh show 10.{{octet}}.14.1 dev eth1 | awk '{print $3}')
+        [ -n "$want" ] && [ "$got" = "$want" ] && echo ok || echo "bad got=$got want=$want"
+      expect: { match: exact, value: ok }
+      timeoutSec: 20
+      skills: [net.fundamentals.arp-nd]
+      weight: 2
+    - id: link-local-matches-mac
+      description: The reported link-local address resolves to the reported MAC in the IPv6 neighbour table
+      type: shell
+      on: staff-east-14
+      command: |
+        f=/root/gateway-neighbour.txt; [ -f "$f" ] || { echo nofile; exit 0; }
+        ll=$(sed -n 's/^gateway_link_local: *\([0-9a-fA-F:]*\) *$/\1/p' "$f" | tr A-F a-f)
+        mac=$(sed -n 's/^gateway_mac: *\([0-9a-fA-F:]*\) *$/\1/p' "$f" | tr A-F a-f)
+        ping -6 -c1 -W2 -I eth1 "$ll" >/dev/null 2>&1
+        ip -6 neigh show dev eth1 | tr A-F a-f | grep -q "^$ll lladdr $mac " && echo ok || echo bad
+      expect: { match: exact, value: ok }
+      timeoutSec: 20
+      skills: [net.fundamentals.arp-nd, net.addressing.ipv6]
+  misconceptions:
+    - id: printer-neighbour
+      description: Reports the printer's link-local address and MAC, which sit in the same neighbour table
+      mutation:
+        on: staff-east-14
+        run: |
+          ping -c2 -W2 -I eth1 ff02::1 >/dev/null 2>&1; ping -c1 -W2 10.{{octet}}.14.40 >/dev/null 2>&1
+          gw=$(ip -6 route show default dev eth1 | awk '/via fe80/{print $3; exit}')
+          ll=$(ip -6 neigh show dev eth1 | awk -v gw="$gw" '/^fe80/ && $1!=gw {print $1; exit}')
+          mac=$(ip neigh show 10.{{octet}}.14.40 dev eth1 | awk '{print $3}')
+          printf 'gateway_link_local: %s\ngateway_mac: %s\n' "$ll" "$mac" > /root/gateway-neighbour.txt
+      expectFail: [gateway-link-local, gateway-mac]
+    - id: own-addresses
+      description: Reports the host's own link-local address and MAC from `ip addr`
+      mutation:
+        on: staff-east-14
+        run: |
+          ll=$(ip -6 addr show dev eth1 scope link | awk '/inet6/{print $2}' | cut -d/ -f1)
+          printf 'gateway_link_local: %s\ngateway_mac: %s\n' "$ll" "$(cat /sys/class/net/eth1/address)" > /root/gateway-neighbour.txt
+      expectFail: [gateway-link-local, gateway-mac]
+  solution:
+    explanation: |
+      The next hop of the IPv6 default route (`ip -6 route show default`) is the
+      gateway's link-local address; its MAC is in the neighbour table once the
+      address has been used (`ip neigh`).
+    steps:
+      - on: staff-east-14
+        timeoutSec: 60
+        run: |
+          for i in $(seq 40); do gw=$(ip -6 route show default dev eth1 | awk '/via fe80/{print $3; exit}'); [ -n "$gw" ] && break; sleep 1; done
+          ping -6 -c2 -W2 -I eth1 "$gw" >/dev/null 2>&1
+          mac=$(ip -6 neigh show dev eth1 | awk -v gw="$gw" '$1==gw {print $3; exit}')
+          printf 'gateway_link_local: %s\ngateway_mac: %s\n' "$gw" "$mac" > /root/gateway-neighbour.txt

@@ -1,0 +1,221 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xnt-vrrp-lab-gateway
+  title: Provide a redundant gateway with VRRP
+  domain: networking
+  frameworks: [ccna:ip-connectivity]
+  difficulty: medium
+  estimatedMinutes: 10
+  tags: [exam, vrrp, fhrp, frr, redundancy]
+  version: 1
+spec:
+  description: |
+    **Devices:** `mv-campus-north-20a`, `mv-campus-north-20b` (FRR consoles)
+
+    | Device | Interface | Address |
+    |---|---|---|
+    | `mv-campus-north-20a` | `eth1` (science wing LAN) | `10.{{octet}}.10.2/24` |
+    | `mv-campus-north-20b` | `eth1` (science wing LAN) | `10.{{octet}}.10.3/24` |
+    | `mv-core-20` | uplinks to both routers, LAN `10.{{octet}}.1.0/24` | reached at `10.{{octet}}.1.1` |
+    | `lab-host-20` | science wing host | `10.{{octet}}.10.50`, default gateway `10.{{octet}}.10.1` |
+
+    The science-wing routers and the core already run OSPF (hello 1 s, dead 3 s)
+    and the VRRP daemon and macvlan interfaces for VRID {{vrid}} (`vrrp4-{{vrid}}`)
+    are prepared. Configure VRRP version 3, group **{{vrid}}**, on `eth1` of both
+    routers with the virtual address `10.{{octet}}.10.1`:
+    `mv-campus-north-20a` is master with priority **{{prio}}**,
+    `mv-campus-north-20b` keeps the default priority and takes over when `-20a`
+    fails. The grader shuts `eth1` on `mv-campus-north-20a` for 30 seconds and
+    checks that `lab-host-20` still reaches `mv-core-20`.
+  objectives:
+    - Configure a VRRP group with a virtual address, priorities and a backup that takes over
+  params:
+    octet: { type: int, min: 20, max: 90 }
+    vrid: { type: int, min: 10, max: 99 }
+    prio: { type: int, min: 150, max: 250 }
+  topology:
+    entry: workstation
+    nodes:
+      - { name: workstation, driver: container, image: jumphost:1, access: [shell] }
+      - { name: mv-campus-north-20a, driver: netdev, image: frr:10, access: [console] }
+      - { name: mv-campus-north-20b, driver: netdev, image: frr:10, access: [console] }
+      - { name: mv-core-20, driver: netdev, image: frr:10, access: [console] }
+      - { name: mv-sw-science-20, driver: container, image: netsvc:1, resources: { cpu: 0.1, memoryMiB: 64 } }
+      - { name: lab-host-20, driver: container, image: nettools:1, resources: { cpu: 0.1, memoryMiB: 48 }, access: [shell] }
+    links:
+      - { a: "mv-campus-north-20a:eth1", b: "mv-sw-science-20:eth1" }
+      - { a: "mv-campus-north-20b:eth1", b: "mv-sw-science-20:eth2" }
+      - { a: "lab-host-20:eth1", b: "mv-sw-science-20:eth3" }
+      - { a: "mv-campus-north-20a:eth2", b: "mv-core-20:eth1", subnet: "10.{{octet}}.0.0/30" }
+      - { a: "mv-campus-north-20b:eth2", b: "mv-core-20:eth2", subnet: "10.{{octet}}.0.4/30" }
+  setup:
+    - on: mv-sw-science-20
+      run: |
+        ip link add br0 type bridge 2>/dev/null || true
+        for p in eth1 eth2 eth3; do ip link set $p master br0; done; ip link set br0 up
+    - on: mv-campus-north-20a
+      run: &vrrpprep |
+        pgrep -x vrrpd >/dev/null || setsid /usr/lib/frr/vrrpd -d -F traditional -A 127.0.0.1 --limit-fds 1024 </dev/null >/dev/null 2>&1
+        V=$(printf '%02x' {{vrid}})
+        ip link add vrrp4-{{vrid}} link eth1 type macvlan mode bridge 2>/dev/null || true
+        ip link set dev vrrp4-{{vrid}} address 00:00:5e:00:01:$V
+        ip addr replace 10.{{octet}}.10.1/24 dev vrrp4-{{vrid}}
+        ip link set vrrp4-{{vrid}} protodown on 2>/dev/null || true
+        ip link set vrrp4-{{vrid}} up
+        for i in $(seq 20); do vtysh -c 'show vrrp' >/dev/null 2>&1 && exit 0; sleep 1; done; exit 1
+    - on: mv-campus-north-20b
+      run: *vrrpprep
+    - on: mv-campus-north-20a
+      config: |
+        interface eth1
+         ip address 10.{{octet}}.10.2/24
+         ip ospf area 0
+         ip ospf hello-interval 1
+         ip ospf dead-interval 3
+        interface eth2
+         ip address 10.{{octet}}.0.2/30
+         ip ospf area 0
+         ip ospf network point-to-point
+         ip ospf hello-interval 1
+         ip ospf dead-interval 3
+        router ospf
+         ospf router-id 10.255.{{octet}}.2
+    - on: mv-campus-north-20b
+      config: |
+        interface eth1
+         ip address 10.{{octet}}.10.3/24
+         ip ospf area 0
+         ip ospf hello-interval 1
+         ip ospf dead-interval 3
+        interface eth2
+         ip address 10.{{octet}}.0.6/30
+         ip ospf area 0
+         ip ospf network point-to-point
+         ip ospf hello-interval 1
+         ip ospf dead-interval 3
+        router ospf
+         ospf router-id 10.255.{{octet}}.3
+    - on: mv-core-20
+      run: ip link add lan1 type dummy 2>/dev/null; ip link set lan1 up
+    - on: mv-core-20
+      config: |
+        interface eth1
+         ip address 10.{{octet}}.0.1/30
+         ip ospf area 0
+         ip ospf network point-to-point
+         ip ospf hello-interval 1
+         ip ospf dead-interval 3
+        interface eth2
+         ip address 10.{{octet}}.0.5/30
+         ip ospf area 0
+         ip ospf network point-to-point
+         ip ospf hello-interval 1
+         ip ospf dead-interval 3
+        interface lan1
+         ip address 10.{{octet}}.1.1/24
+         ip ospf area 0
+         ip ospf passive
+        router ospf
+         ospf router-id 10.255.{{octet}}.1
+    - { on: lab-host-20, run: "ip addr replace 10.{{octet}}.10.50/24 dev eth1 && ip route replace default via 10.{{octet}}.10.1" }
+  checks:
+    - id: a-master
+      description: mv-campus-north-20a is VRRP master for the group with priority {{prio}}
+      type: shell
+      on: mv-campus-north-20a
+      command: vtysh -c 'show vrrp summary' | awk '$1=="eth1" && $2=="{{vrid}}"{print $3, $4, $6}'
+      expect: { match: exact, value: "{{prio}} 1 Master" }
+      skills: [net.routing.vrrp]
+      weight: 2
+    - id: b-backup
+      description: mv-campus-north-20b is VRRP backup for the group with priority 100 and the same virtual address
+      type: shell
+      on: mv-campus-north-20b
+      command: |
+        vtysh -c 'show vrrp interface eth1 {{vrid}}' | grep -q '10.{{octet}}.10.1' || exit 1
+        vtysh -c 'show vrrp summary' | awk '$1=="eth1" && $2=="{{vrid}}"{print $3, $4, $6}'
+      expect: { match: exact, value: "100 1 Backup" }
+      skills: [net.routing.vrrp]
+    - id: gateway-works
+      description: lab-host-20 reaches the core through the virtual gateway
+      type: shell
+      on: lab-host-20
+      command: |
+        for i in $(seq 15); do ping -c1 -W1 10.{{octet}}.1.1 >/dev/null 2>&1 && { echo ok; exit 0; }; sleep 1; done; echo lost
+      expect: { match: exact, value: ok }
+      timeoutSec: 40
+      skills: [net.routing.vrrp]
+    - id: fail-master
+      description: (failover test) mv-campus-north-20a's LAN interface is shut for 30 seconds
+      type: shell
+      on: mv-campus-north-20a
+      command: |
+        ip link set eth1 down
+        setsid sh -c 'sleep 30; ip link set eth1 up' </dev/null >/dev/null 2>&1 &
+        echo started
+      expect: { match: exact, value: started }
+      skills: [net.routing.vrrp]
+      weight: 0
+    - id: b-took-over
+      description: mv-campus-north-20b became master during the failure
+      type: shell
+      on: mv-campus-north-20b
+      command: |
+        for i in $(seq 10); do st=$(vtysh -c 'show vrrp summary' | awk '$1=="eth1" && $2=="{{vrid}}"{print $6}'); [ "$st" = Master ] && break; sleep 1; done; echo "$st"
+      timeoutSec: 20
+      expect: { match: exact, value: Master }
+      skills: [net.routing.vrrp]
+    - id: survives-failover
+      description: While mv-campus-north-20a is down, lab-host-20 still reaches the core
+      type: shell
+      on: lab-host-20
+      command: |
+        for i in $(seq 8); do ping -c1 -W1 10.{{octet}}.1.1 >/dev/null 2>&1 && { echo ok; exit 0; }; done; echo lost
+      expect: { match: exact, value: ok }
+      timeoutSec: 15
+      skills: [net.routing.vrrp]
+      weight: 2
+  misconceptions:
+    - id: only-master
+      description: Configures VRRP on the master router only
+      mutation:
+        on: mv-campus-north-20a
+        config: |
+          interface eth1
+           vrrp {{vrid}} version 3
+           vrrp {{vrid}} priority {{prio}}
+           vrrp {{vrid}} ip 10.{{octet}}.10.1
+      expectFail: [b-backup, survives-failover, b-took-over]
+    - id: equal-priorities
+      description: Leaves mv-campus-north-20a at the default priority
+      mutation:
+        on: mv-campus-north-20a
+        config: |
+          interface eth1
+           vrrp {{vrid}} version 3
+           vrrp {{vrid}} ip 10.{{octet}}.10.1
+      expectFail: [a-master]
+  solution:
+    explanation: |
+      Both routers join VRRP group {{vrid}} with the same virtual address; -20a has
+      priority {{prio}} and becomes master, -20b stays backup at 100 and takes over when
+      -20a stops advertising. Preemption (on by default) returns the role to -a.
+    steps:
+      - on: mv-campus-north-20a
+        config: |
+          interface eth1
+           vrrp {{vrid}} version 3
+           vrrp {{vrid}} priority {{prio}}
+           vrrp {{vrid}} ip 10.{{octet}}.10.1
+      - on: mv-campus-north-20b
+        config: |
+          interface eth1
+           vrrp {{vrid}} version 3
+           vrrp {{vrid}} ip 10.{{octet}}.10.1
+      - on: mv-campus-north-20a
+        timeoutSec: 90
+        run: |
+          # an earlier grading round may have shut eth1 for 30 s; wait until -20a is master again
+          for i in $(seq 60); do vtysh -c 'show vrrp summary' | awk '$1=="eth1" && $2=="{{vrid}}"{print $6}' | grep -qx Master && break; sleep 1; done
+          sleep 3

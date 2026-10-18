@@ -1,0 +1,230 @@
+# Quillmoor Logistics (qm-*) estate task of the platform-engineer exam, not Marlow Valley:
+# the shared sim-platform-engineer estate is Quillmoor. The harbour cluster nodes are VMs
+# that a netdev (FRR) router cannot be wired to, so `harbour-net-1` is a netsvc stand-in
+# that holds an address of the harbour node subnet and answers on the tracking Ingress address.
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xpe-net-depot-route
+  title: Reach the depot subnet from the harbour cluster
+  domain: networking
+  frameworks: [ct-platform:networking-connectivity]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [exam, ospf, routing, persistence, frr]
+  version: 1
+spec:
+  description: |
+    **Devices:** `qm-edge-1` (FRR console), `qm-depot-rtr` (FRR, already configured)
+
+    Quillmoor's harbour cluster nodes live in `10.{{octet}}.10.0/24`, behind `qm-edge-1`
+    (`eth1`, address `10.{{octet}}.10.1/24`). In this exercise the node subnet is
+    represented by `harbour-net-1` (`10.{{octet}}.10.11`), which also answers HTTPS-style
+    connections on the tracking **Ingress address `10.{{octet}}.10.{{vip}}`, TCP 443**.
+    The depot sits behind `qm-depot-rtr`; the two routers are cabled `qm-edge-1:eth2` -
+    `qm-depot-rtr:eth1` (`10.{{octet}}.0.0/30`, edge `.1`, depot `.2`). The depot
+    scanners (`depot-scanner-1`, `10.{{octet}}.8.10`) are on `10.{{octet}}.8.0/24`.
+
+    `qm-depot-rtr` already runs OSPFv2 in area 0 (router ID `10.255.{{octet}}.2`) on its
+    transit link and advertises the depot LAN. On `qm-edge-1`:
+
+    - enable OSPFv2 with router ID **10.255.{{octet}}.1**, put the link to the depot
+      router in area 0 and form a **Full** adjacency;
+    - advertise the harbour node subnet in area 0 and do **not** send OSPF hellos into
+      it;
+    - make the result survive a reboot: **save the running configuration**.
+
+    Afterwards the harbour cluster nodes (source `10.{{octet}}.10.11`) must reach
+    `10.{{octet}}.8.0/24` and the depot scanners must reach the Ingress address on
+    TCP 443. The exam reboots the devices before grading.
+  objectives:
+    - Establish an OSPF adjacency, advertise a connected subnet passively and persist the configuration
+  params:
+    octet: { type: int, min: 20, max: 90 }
+    vip: { type: int, min: 100, max: 120 }
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - { name: qm-edge-1, driver: netdev, image: frr:10, access: [console] }
+      - { name: qm-depot-rtr, driver: netdev, image: frr:10 }
+      - { name: depot-scanner-1, driver: container, image: netsvc:1, resources: { cpu: 0.1, memoryMiB: 64 } }
+      - { name: harbour-net-1, driver: container, image: netsvc:1, resources: { cpu: 0.1, memoryMiB: 64 } }
+    links:
+      - { a: "qm-edge-1:eth1", b: "harbour-net-1:eth1" }
+      - { a: "qm-edge-1:eth2", b: "qm-depot-rtr:eth1", subnet: "10.{{octet}}.0.0/30" }
+      - { a: "qm-depot-rtr:eth2", b: "depot-scanner-1:eth1" }
+  setup:
+    - on: harbour-net-1
+      run: |
+        ip addr replace 10.{{octet}}.10.11/24 dev eth1
+        ip addr add 10.{{octet}}.10.{{vip}}/32 dev eth1
+        ip route replace default via 10.{{octet}}.10.1
+        setsid ncat -l -k -p 443 --sh-exec 'echo tracking-ingress' </dev/null >/dev/null 2>&1 &
+        sleep 1
+    - on: depot-scanner-1
+      run: |
+        ip addr replace 10.{{octet}}.8.10/24 dev eth1
+        ip route replace default via 10.{{octet}}.8.1
+    - on: qm-depot-rtr
+      config: |
+        interface eth1
+         ip address 10.{{octet}}.0.2/30
+         ip ospf area 0
+         ip ospf network point-to-point
+        interface eth2
+         ip address 10.{{octet}}.8.1/24
+         ip ospf area 0
+         ip ospf passive
+        router ospf
+         ospf router-id 10.255.{{octet}}.2
+    - on: qm-edge-1
+      config: |
+        interface eth1
+         ip address 10.{{octet}}.10.1/24
+        interface eth2
+         ip address 10.{{octet}}.0.1/30
+         ip ospf network point-to-point
+  checks:
+    - id: adjacency
+      description: qm-edge-1 has a Full OSPF adjacency with the depot router (router ID 10.255.{{octet}}.1 on the edge)
+      type: shell
+      on: qm-edge-1
+      command: |
+        for i in $(seq 40); do
+          r=$(vtysh -c 'show ip ospf json' | python3 -c 'import json,sys; print(json.load(sys.stdin).get("routerId",""))')
+          s=$(vtysh -c 'show ip ospf neighbor json' | python3 -c '
+        import json,sys
+        d=json.load(sys.stdin).get("neighbors",{})
+        print(" ".join(sorted(n.get("nbrState","").split("/")[0] for k,v in d.items() if k=="10.255.{{octet}}.2" for n in v)))')
+          [ "$r" = "10.255.{{octet}}.1" ] && [ "$s" = Full ] && break; sleep 2
+        done; echo "$r $s"
+      expect: { match: exact, value: "10.255.{{octet}}.1 Full" }
+      timeoutSec: 100
+      skills: [net.routing.ospf]
+      weight: 2
+    - id: node-subnet-passive
+      description: The harbour node subnet is in area 0 on eth1 and passive (no hellos into the nodes)
+      type: shell
+      on: qm-edge-1
+      command: |
+        vtysh -c 'show ip ospf interface json' | python3 -c '
+        import json,sys
+        d=json.load(sys.stdin).get("interfaces",{}).get("eth1",{})
+        print("passive" if d.get("timerPassiveIface") else "not-passive" if d else "absent")'
+      expect: { match: exact, value: passive }
+      skills: [net.routing.ospf]
+    - id: nodes-reach-depot
+      description: Traffic from the harbour node subnet reaches the depot scanners
+      type: shell
+      on: harbour-net-1
+      command: |
+        for i in $(seq 25); do ping -c1 -W2 -I 10.{{octet}}.10.11 10.{{octet}}.8.10 >/dev/null 2>&1 && { echo ok; exit 0; }; sleep 2; done; echo lost
+      expect: { match: exact, value: ok }
+      timeoutSec: 70
+      skills: [net.routing.ospf]
+      weight: 2
+    - id: scanner-reaches-ingress
+      description: The depot scanner reaches the tracking Ingress address on TCP 443
+      type: shell
+      on: depot-scanner-1
+      command: |
+        for i in $(seq 25); do r=$(ncat -w2 10.{{octet}}.10.{{vip}} 443 </dev/null 2>/dev/null); [ "$r" = tracking-ingress ] && { echo ok; exit 0; }; sleep 2; done; echo closed
+      expect: { match: exact, value: ok }
+      timeoutSec: 70
+      skills: [net.routing.ospf]
+      weight: 2
+    - id: config-saved
+      description: The OSPF configuration is saved in the FRR configuration file, so it survives a reboot
+      type: shell
+      on: qm-edge-1
+      command: |
+        cat /etc/frr/*.conf 2>/dev/null | awk '
+          /^interface /      { cur=$2; sec="if"; next }
+          /^router ospf/     { cur=""; sec="ospf"; next }
+          /^[a-z!]/          { cur=""; sec=""; next }
+          sec=="if"  && /^ ip ospf area 0(\.0\.0\.0)?$/ { area[cur]=1 }
+          sec=="if"  && /^ ip ospf passive$/ { pas[cur]=1 }
+          sec=="ospf" && /^ ospf router-id 10\.255\.{{octet}}\.1$/ { rid=1 }
+          sec=="ospf" && /^ network 10\.{{octet}}\.0\.0\/30 area 0(\.0\.0\.0)?$/ { net2=1 }
+          sec=="ospf" && /^ network 10\.{{octet}}\.10\.0\/24 area 0(\.0\.0\.0)?$/ { net1=1 }
+          sec=="ospf" && /^ passive-interface eth1$/ { pas["eth1"]=1 }
+          END {
+            ok2 = area["eth2"] || net2
+            ok1 = (area["eth1"] || net1) && pas["eth1"]
+            print (rid && ok1 && ok2) ? "saved" : "not-saved"
+          }'
+      expect: { match: exact, value: saved }
+      skills: [net.routing.ospf]
+  misconceptions:
+    - id: not-saved
+      description: Configures OSPF correctly but never saves the configuration
+      mutation:
+        on: qm-edge-1
+        config: |
+          interface eth1
+           ip ospf area 0
+           ip ospf passive
+          interface eth2
+           ip ospf area 0
+          router ospf
+           ospf router-id 10.255.{{octet}}.1
+      expectFail: [config-saved]
+    - id: static-routes
+      description: Adds static routes instead of an OSPF adjacency
+      mutation:
+        on: qm-edge-1
+        config: |
+          ip route 10.{{octet}}.8.0/24 10.{{octet}}.0.2
+      expectFail: [adjacency, node-subnet-passive, nodes-reach-depot, scanner-reaches-ingress]
+    - id: active-node-subnet
+      description: Enables OSPF on the node subnet but leaves it active, sending hellos into the cluster nodes
+      mutation:
+        on: qm-edge-1
+        config: |
+          interface eth1
+           ip ospf area 0
+          interface eth2
+           ip ospf area 0
+          router ospf
+           ospf router-id 10.255.{{octet}}.1
+      expectFail: [node-subnet-passive]
+  solution:
+    explanation: |
+      Enable OSPF with the explicit router ID, put eth2 (the depot link) and eth1 (the
+      harbour node subnet, passive) in area 0, wait for the adjacency, then save the
+      configuration with `write memory`.
+    steps:
+      - on: qm-edge-1
+        config: |
+          router ospf
+           ospf router-id 10.255.{{octet}}.1
+          interface eth2
+           ip ospf area 0
+          interface eth1
+           ip ospf area 0
+           ip ospf passive
+      - on: qm-edge-1
+        timeoutSec: 90
+        run: |
+          for i in $(seq 60); do vtysh -c 'show ip ospf neighbor' | grep -q Full && break; sleep 1; done
+          vtysh -c 'write memory'
+    alternatives:
+      - id: network-statements
+        description: network statements and passive-interface under router ospf, then write memory
+        steps:
+          - on: qm-edge-1
+            config: |
+              router ospf
+               ospf router-id 10.255.{{octet}}.1
+               network 10.{{octet}}.0.0/30 area 0
+               network 10.{{octet}}.10.0/24 area 0
+               passive-interface eth1
+          - on: qm-edge-1
+            timeoutSec: 90
+            run: |
+              for i in $(seq 60); do vtysh -c 'show ip ospf neighbor' | grep -q Full && break; sleep 1; done
+              vtysh -c 'write memory'

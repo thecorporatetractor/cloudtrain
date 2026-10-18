@@ -1,0 +1,210 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xnt-lacp-server-bond
+  title: Bundle two server links with LACP
+  domain: networking
+  frameworks: [ccna:network-access]
+  difficulty: medium
+  estimatedMinutes: 8
+  tags: [exam, lacp, bonding, etherchannel]
+  version: 1
+spec:
+  description: |
+    **Devices:** `mv-sw-core-16` (Linux bridge `br0`, shell), `backup-server-16` (shell)
+
+    | Link | Ports |
+    |---|---|
+    | server link 1 | `backup-server-16:eth1` - `mv-sw-core-16:eth1` |
+    | server link 2 | `backup-server-16:eth2` - `mv-sw-core-16:eth2` |
+    | admin PC | `admin-16:eth1` - `mv-sw-core-16:eth3` |
+
+    `br0` on the switch holds `eth1` and `eth3` and the address
+    `10.{{octet}}.16.1/24`; the server uses `10.{{octet}}.16.20/24` on `eth1`,
+    `admin-16` is `10.{{octet}}.16.10`. Bundle both server links with LACP
+    (802.3ad, LACP rate **{{rate}}**) on **both** ends:
+
+    - on `backup-server-16`, create `bond0` over `eth1` and `eth2` and move the
+      server address onto it;
+    - on `mv-sw-core-16`, create `bond0` over `eth1` and `eth2` and make `bond0`
+      (not the member links) the port of `br0`.
+
+    Both members must be active in one aggregator with the switch as partner, and
+    `admin-16` must keep reaching the server when either link fails: the grader
+    shuts `backup-server-16:eth1` for 25 seconds.
+  objectives:
+    - Build a matching 802.3ad bond on a server and on a switch with the requested LACP rate
+    - Verify both members join one aggregator
+  params:
+    octet: { type: int, min: 20, max: 90 }
+    rate: { type: choice, values: [fast, slow] }
+  topology:
+    entry: workstation
+    nodes:
+      - { name: workstation, driver: container, image: jumphost:1, access: [shell] }
+      - { name: mv-sw-core-16, driver: container, image: netsvc:1, resources: { cpu: 0.2, memoryMiB: 64 }, access: [shell] }
+      - { name: backup-server-16, driver: container, image: netsvc:1, resources: { cpu: 0.2, memoryMiB: 64 }, access: [shell] }
+      - { name: admin-16, driver: container, image: nettools:1, resources: { cpu: 0.1, memoryMiB: 48 } }
+    links:
+      - { a: "mv-sw-core-16:eth1", b: "backup-server-16:eth1" }
+      - { a: "mv-sw-core-16:eth2", b: "backup-server-16:eth2" }
+      - { a: "mv-sw-core-16:eth3", b: "admin-16:eth1" }
+  setup:
+    - on: mv-sw-core-16
+      run: |
+        ip link add br0 type bridge 2>/dev/null || true
+        ip link set eth1 master br0; ip link set eth3 master br0; ip link set br0 up
+        ip addr replace 10.{{octet}}.16.1/24 dev br0
+    - { on: backup-server-16, run: "ip addr replace 10.{{octet}}.16.20/24 dev eth1" }
+    - { on: admin-16, run: "ip addr replace 10.{{octet}}.16.10/24 dev eth1" }
+  checks:
+    - id: server-bond
+      description: backup-server-16 runs an 802.3ad bond with the requested LACP rate and both members in the same aggregator
+      type: shell
+      on: backup-server-16
+      command: |
+        for i in $(seq 25); do
+          r=$(ip -d -j link show | python3 -c '
+        import json,sys
+        L={l["ifname"]:l for l in json.load(sys.stdin)}
+        d=L.get("bond0",{}).get("linkinfo",{}).get("info_data",{}); b=d.get("ad_info",{})
+        rate=str(d.get("ad_lacp_rate") or d.get("lacp_rate") or "")
+        ok=d.get("mode")=="802.3ad" and rate.split()[0:1]==["{{rate}}"] and b.get("num_ports")==2 and b.get("partner_mac","00:00:00:00:00:00")!="00:00:00:00:00:00"
+        for m in ("eth1","eth2"):
+            l=L.get(m,{}); sd=l.get("linkinfo",{}).get("info_slave_data",{})
+            ok=ok and l.get("master")=="bond0" and sd.get("ad_aggregator_id")==b.get("aggregator")
+        print("bundled" if ok else "not-bundled")')
+          [ "$r" = bundled ] && break; sleep 2
+        done
+        echo "$r"
+      expect: { match: exact, value: bundled }
+      timeoutSec: 70
+      skills: [net.switching.etherchannel]
+      weight: 2
+    - id: server-address
+      description: The server address sits on bond0
+      type: shell
+      on: backup-server-16
+      command: ip -4 -o addr show dev bond0 | awk '{print $4}'
+      expect: { match: exact, value: "10.{{octet}}.16.20/24" }
+      skills: [net.switching.etherchannel]
+    - id: switch-bond
+      description: mv-sw-core-16 runs an 802.3ad bond with the requested rate, both members in one aggregator, bridged as a single port
+      type: shell
+      on: mv-sw-core-16
+      command: |
+        [ -e /sys/class/net/br0/brif/bond0 ] && [ ! -e /sys/class/net/br0/brif/eth1 ] && [ ! -e /sys/class/net/br0/brif/eth2 ] || { echo not-bridged; exit 0; }
+        for i in $(seq 25); do
+          r=$(ip -d -j link show | python3 -c '
+        import json,sys
+        L={l["ifname"]:l for l in json.load(sys.stdin)}
+        d=L.get("bond0",{}).get("linkinfo",{}).get("info_data",{}); b=d.get("ad_info",{})
+        rate=str(d.get("ad_lacp_rate") or d.get("lacp_rate") or "")
+        ok=d.get("mode")=="802.3ad" and rate.split()[0:1]==["{{rate}}"] and b.get("num_ports")==2 and b.get("partner_mac","00:00:00:00:00:00")!="00:00:00:00:00:00"
+        for m in ("eth1","eth2"):
+            l=L.get(m,{}); sd=l.get("linkinfo",{}).get("info_slave_data",{})
+            ok=ok and l.get("master")=="bond0" and sd.get("ad_aggregator_id")==b.get("aggregator")
+        print("bundled" if ok else "not-bundled")')
+          [ "$r" = bundled ] && break; sleep 2
+        done
+        echo "$r"
+      expect: { match: exact, value: bundled }
+      timeoutSec: 70
+      skills: [net.switching.etherchannel]
+      weight: 2
+    - id: reachable
+      description: admin-16 reaches the server
+      type: shell
+      on: admin-16
+      command: |
+        for i in $(seq 20); do ping -c1 -W1 10.{{octet}}.16.20 >/dev/null 2>&1 && { echo ok; exit 0; }; sleep 1; done; echo lost
+      expect: { match: exact, value: ok }
+      timeoutSec: 40
+      skills: [net.switching.etherchannel]
+    - id: fail-member
+      description: (failover test) the server link backup-server-16:eth1 is shut for 25 seconds
+      type: shell
+      on: backup-server-16
+      command: |
+        ip link set eth1 down
+        setsid sh -c 'sleep 25; ip link set eth1 up' </dev/null >/dev/null 2>&1 &
+        echo started
+      expect: { match: exact, value: started }
+      skills: [net.switching.etherchannel]
+      weight: 0
+    - id: survives-member-loss
+      description: While one member link is down, admin-16 still reaches the server
+      type: shell
+      on: admin-16
+      command: |
+        for i in $(seq 20); do ping -c1 -W1 10.{{octet}}.16.20 >/dev/null 2>&1 && { echo ok; exit 0; }; sleep 1; done; echo lost
+      expect: { match: exact, value: ok }
+      timeoutSec: 40
+      skills: [net.switching.etherchannel]
+      weight: 2
+    - id: member-rejoins
+      description: When the link returns, both members are back in the aggregator
+      type: shell
+      on: backup-server-16
+      command: |
+        for i in $(seq 50); do
+          n=$(ip -d -j link show bond0 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["linkinfo"]["info_data"].get("ad_info",{}).get("num_ports",0))' 2>/dev/null)
+          [ "$n" = 2 ] && { echo two; exit 0; }; sleep 2
+        done; echo "${n:-none}"
+      expect: { match: exact, value: two }
+      timeoutSec: 110
+      skills: [net.switching.etherchannel]
+  misconceptions:
+    - id: server-only
+      description: Bonds the server but leaves the switch ports as two separate bridge ports
+      mutation:
+        on: backup-server-16
+        run: |
+          ip addr flush dev eth1
+          ip link add bond0 type bond mode 802.3ad lacp_rate {{rate}} miimon 100
+          for m in eth1 eth2; do ip link set $m down; ip link set $m master bond0; done
+          ip link set bond0 up; ip addr add 10.{{octet}}.16.20/24 dev bond0
+      expectFail: [switch-bond, server-bond]
+    - id: active-backup
+      description: Uses an active-backup bond instead of LACP
+      mutation:
+        on: backup-server-16
+        run: |
+          ip addr flush dev eth1
+          ip link add bond0 type bond mode active-backup miimon 100
+          for m in eth1 eth2; do ip link set $m down; ip link set $m master bond0; done
+          ip link set bond0 up; ip addr add 10.{{octet}}.16.20/24 dev bond0
+      expectFail: [server-bond]
+    - id: wrong-rate
+      description: Builds the bond on the server with the other LACP rate
+      mutation:
+        on: backup-server-16
+        run: |
+          ip addr flush dev eth1
+          ip link add bond0 type bond mode 802.3ad lacp_rate $([ "{{rate}}" = fast ] && echo slow || echo fast) miimon 100
+          for m in eth1 eth2; do ip link set $m down; ip link set $m master bond0; done
+          ip link set bond0 up; ip addr add 10.{{octet}}.16.20/24 dev bond0
+      expectFail: [server-bond]
+  solution:
+    explanation: |
+      Create an 802.3ad bond with the requested LACP rate on both ends with the two
+      links as members. On the server the address moves to bond0; on the switch
+      bond0 replaces eth1 as the bridge port. Both members join one aggregator and
+      the bond keeps forwarding when a member goes down.
+    steps:
+      - on: mv-sw-core-16
+        run: |
+          ip link set eth1 nomaster
+          ip link add bond0 type bond mode 802.3ad lacp_rate {{rate}} miimon 100
+          for m in eth1 eth2; do ip link set $m down; ip link set $m master bond0; done
+          ip link set bond0 up; ip link set bond0 master br0
+      - on: backup-server-16
+        timeoutSec: 120
+        run: |
+          # an earlier grading round shuts eth1 for 25 s; wait until the link is back before bonding
+          for i in $(seq 40); do [ "$(cat /sys/class/net/eth1/operstate)" = up ] && break; sleep 1; done
+          ip addr flush dev eth1
+          ip link add bond0 type bond mode 802.3ad lacp_rate {{rate}} miimon 100
+          for m in eth1 eth2; do ip link set $m down; ip link set $m master bond0; done
+          ip link set bond0 up; ip addr add 10.{{octet}}.16.20/24 dev bond0
+          for i in $(seq 40); do ping -c1 -W1 10.{{octet}}.16.10 >/dev/null 2>&1 && break; sleep 1; done

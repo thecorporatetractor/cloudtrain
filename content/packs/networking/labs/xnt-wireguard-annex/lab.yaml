@@ -1,0 +1,200 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xnt-wireguard-annex
+  title: Bring up a site-to-site tunnel with given keys
+  domain: networking
+  frameworks: [ccna:security-fundamentals]
+  difficulty: medium
+  estimatedMinutes: 10
+  tags: [exam, wireguard, vpn, tunnel]
+  version: 1
+spec:
+  description: |
+    **Devices:** `mv-edge-24`, `mv-annex-24` (Linux routers, shell)
+
+    | Router | Transit | Inside | Tunnel address (`wg0`) |
+    |---|---|---|---|
+    | `mv-edge-24` | `eth1` `203.0.113.1/30` | core-side address `10.{{octet}}.1.1/24` (on `core0`) | `10.{{octet}}.200.1/30` |
+    | `mv-annex-24` | `eth1` `203.0.113.2/30` | `eth2` annex LAN `10.{{octet}}.{{lan}}.0/24` (`.1`), host `staff-annex-24` (`.10`) | `10.{{octet}}.200.2/30` |
+
+    A WireGuard tunnel is half built. On each router `/root/wg/` holds the
+    router's own key (`private.key`), the peer's public key (`peer.pub`) and a
+    `wg0.conf` with the `[Interface]` section (address, listen port **{{port}}**,
+    private key) and a `[Peer]` section that only has the peer's public key. Complete
+    the configuration with the **peer's endpoint** (the other router's transit
+    address, port {{port}}) and **AllowedIPs** (the peer's tunnel address and the
+    far inside subnet: the annex LAN `10.{{octet}}.{{lan}}.0/24` towards the annex,
+    `10.{{octet}}.1.0/24` towards the core side), then bring `wg0` up on both routers.
+
+    Afterwards `staff-annex-24` must reach `10.{{octet}}.1.1` and `mv-edge-24`
+    must reach `staff-annex-24`, both through the tunnel.
+  objectives:
+    - Complete a half-built WireGuard configuration with endpoint and allowed IPs
+    - Route the far subnet through the tunnel
+  params:
+    octet: { type: int, min: 20, max: 90 }
+    lan: { type: int, min: 100, max: 149 }
+    port: { type: choice, values: [51821, 51822, 51823] }
+    # seeds this session's throw-away WireGuard key pairs (derived in setup, never stored in the lab)
+    wgseed: { type: int, min: 100000000, max: 999999999 }
+  topology:
+    entry: workstation
+    nodes:
+      - { name: workstation, driver: container, image: jumphost:1, access: [shell] }
+      - { name: mv-edge-24, driver: container, image: netsvc:1, resources: { cpu: 0.2, memoryMiB: 64 }, access: [shell] }
+      - { name: mv-annex-24, driver: container, image: netsvc:1, resources: { cpu: 0.2, memoryMiB: 64 }, access: [shell] }
+      - { name: staff-annex-24, driver: container, image: nettools:1, resources: { cpu: 0.1, memoryMiB: 48 } }
+    links:
+      - { a: "mv-edge-24:eth1", b: "mv-annex-24:eth1", subnet: "203.0.113.0/30" }
+      - { a: "mv-annex-24:eth2", b: "staff-annex-24:eth1" }
+  setup:
+    - on: mv-edge-24
+      run: |
+        echo 1 > /proc/sys/net/ipv4/ip_forward
+        ip link add core0 type dummy 2>/dev/null; ip addr replace 10.{{octet}}.1.1/24 dev core0; ip link set core0 up
+        wgkey() { python3 -c 'import base64,hashlib,sys
+        k = bytearray(hashlib.sha256(sys.argv[1].encode()).digest()); k[0] &= 248; k[31] = (k[31] & 127) | 64
+        print(base64.b64encode(bytes(k)).decode())' "marlowvalley-wgx-$1-{{wgseed}}"; }
+        mkdir -p /root/wg; umask 077
+        wgkey edge > /root/wg/private.key
+        wgkey annex | wg pubkey > /root/wg/peer.pub
+        {
+          echo '[Interface]'
+          echo 'Address = 10.{{octet}}.200.1/30'
+          echo 'ListenPort = {{port}}'
+          echo "PrivateKey = $(cat /root/wg/private.key)"
+          echo
+          echo '[Peer]'
+          echo "PublicKey = $(cat /root/wg/peer.pub)"
+          echo '# Endpoint = ?'
+          echo '# AllowedIPs = ?'
+        } > /root/wg/wg0.conf
+    - on: mv-annex-24
+      run: |
+        echo 1 > /proc/sys/net/ipv4/ip_forward
+        ip addr replace 10.{{octet}}.{{lan}}.1/24 dev eth2
+        wgkey() { python3 -c 'import base64,hashlib,sys
+        k = bytearray(hashlib.sha256(sys.argv[1].encode()).digest()); k[0] &= 248; k[31] = (k[31] & 127) | 64
+        print(base64.b64encode(bytes(k)).decode())' "marlowvalley-wgx-$1-{{wgseed}}"; }
+        mkdir -p /root/wg; umask 077
+        wgkey annex > /root/wg/private.key
+        wgkey edge | wg pubkey > /root/wg/peer.pub
+        {
+          echo '[Interface]'
+          echo 'Address = 10.{{octet}}.200.2/30'
+          echo 'ListenPort = {{port}}'
+          echo "PrivateKey = $(cat /root/wg/private.key)"
+          echo
+          echo '[Peer]'
+          echo "PublicKey = $(cat /root/wg/peer.pub)"
+          echo '# Endpoint = ?'
+          echo '# AllowedIPs = ?'
+        } > /root/wg/wg0.conf
+    - on: staff-annex-24
+      run: |
+        ip addr replace 10.{{octet}}.{{lan}}.10/24 dev eth1 && ip route replace default via 10.{{octet}}.{{lan}}.1
+  checks:
+    - id: handshake
+      description: mv-edge-24 completed a WireGuard handshake with the annex and listens on the given port
+      type: shell
+      on: mv-edge-24
+      command: |
+        for i in $(seq 20); do
+          h=$(wg show wg0 latest-handshakes 2>/dev/null | awk '{print $2}' | sort -rn | head -1)
+          p=$(wg show wg0 listen-port 2>/dev/null)
+          [ -n "$h" ] && [ "$h" -gt 0 ] 2>/dev/null && [ "$p" = "{{port}}" ] && { echo up; exit 0; }
+          sleep 1
+        done; echo down
+      expect: { match: exact, value: up }
+      timeoutSec: 35
+      skills: [net.security.wireguard]
+      weight: 2
+    - id: annex-handshake
+      description: mv-annex-24 completed a WireGuard handshake with the edge
+      type: shell
+      on: mv-annex-24
+      command: |
+        for i in $(seq 20); do
+          h=$(wg show wg0 latest-handshakes 2>/dev/null | awk '{print $2}' | sort -rn | head -1)
+          [ -n "$h" ] && [ "$h" -gt 0 ] 2>/dev/null && { echo up; exit 0; }
+          sleep 1
+        done; echo down
+      expect: { match: exact, value: up }
+      timeoutSec: 35
+      skills: [net.security.wireguard]
+    - id: annex-reaches-core
+      description: staff-annex-24 reaches the core-side address through the tunnel
+      type: shell
+      on: staff-annex-24
+      command: |
+        for i in $(seq 15); do ping -c1 -W2 10.{{octet}}.1.1 >/dev/null 2>&1 && { echo ok; exit 0; }; sleep 1; done; echo lost
+      expect: { match: exact, value: ok }
+      timeoutSec: 40
+      skills: [net.security.wireguard]
+      weight: 2
+    - id: edge-routes-annex-lan
+      description: mv-edge-24 sends the annex LAN through wg0 and reaches staff-annex-24
+      type: shell
+      on: mv-edge-24
+      command: |
+        for i in $(seq 15); do
+          r=$(ip route get 10.{{octet}}.{{lan}}.10 | head -1)
+          case "$r" in *"dev wg0"*) ping -c1 -W2 -I 10.{{octet}}.1.1 10.{{octet}}.{{lan}}.10 >/dev/null 2>&1 && { echo ok; exit 0; };; esac
+          sleep 1
+        done; echo "no $r"
+      expect: { match: exact, value: ok }
+      timeoutSec: 40
+      skills: [net.security.wireguard]
+      weight: 2
+  misconceptions:
+    - id: tunnel-only-allowed-ips
+      description: Brings the tunnel up but leaves the far LAN out of AllowedIPs
+      mutation:
+        on: mv-edge-24
+        run: |
+          sed -i 's/^# Endpoint = ?/Endpoint = 203.0.113.2:{{port}}/; s|^# AllowedIPs = ?|AllowedIPs = 10.{{octet}}.200.2/32|' /root/wg/wg0.conf
+          wg-quick up /root/wg/wg0.conf
+      expectFail: [edge-routes-annex-lan]
+    - id: default-port-endpoint
+      description: Points the endpoint at the default port 51820 instead of the configured listen port
+      mutation:
+        on: mv-edge-24
+        run: |
+          sed -i 's/^# Endpoint = ?/Endpoint = 203.0.113.2:51820/; s|^# AllowedIPs = ?|AllowedIPs = 10.{{octet}}.200.2/32, 10.{{octet}}.{{lan}}.0/24|' /root/wg/wg0.conf
+          wg-quick up /root/wg/wg0.conf
+      expectFail: [handshake, annex-reaches-core]
+  solution:
+    explanation: |
+      Add `Endpoint` and `AllowedIPs` to the [Peer] section on each router (the peer's
+      transit address and port, the peer's tunnel address and the far inside subnet)
+      and bring wg0 up with wg-quick, which also installs the routes for AllowedIPs.
+    steps:
+      - on: mv-edge-24
+        run: |
+          sed -i 's/^# Endpoint = ?/Endpoint = 203.0.113.2:{{port}}/; s|^# AllowedIPs = ?|AllowedIPs = 10.{{octet}}.200.2/32, 10.{{octet}}.{{lan}}.0/24|' /root/wg/wg0.conf
+          wg-quick up /root/wg/wg0.conf
+      - on: mv-annex-24
+        run: |
+          sed -i 's/^# Endpoint = ?/Endpoint = 203.0.113.1:{{port}}/; s|^# AllowedIPs = ?|AllowedIPs = 10.{{octet}}.200.1/32, 10.{{octet}}.1.0/24|' /root/wg/wg0.conf
+          wg-quick up /root/wg/wg0.conf
+          for i in $(seq 15); do ping -c1 -W2 -I 10.{{octet}}.{{lan}}.1 10.{{octet}}.1.1 >/dev/null 2>&1 && exit 0; sleep 1; done
+    alternatives:
+      - id: wg-set
+        description: Configure the interface with ip and wg set from the same key files
+        steps:
+          - on: mv-edge-24
+            run: |
+              ip link add wg0 type wireguard 2>/dev/null
+              ip addr add 10.{{octet}}.200.1/30 dev wg0 2>/dev/null
+              wg set wg0 private-key /root/wg/private.key listen-port {{port}} peer $(cat /root/wg/peer.pub) endpoint 203.0.113.2:{{port}} allowed-ips 10.{{octet}}.200.2/32,10.{{octet}}.{{lan}}.0/24
+              ip link set wg0 up
+              ip route replace 10.{{octet}}.{{lan}}.0/24 dev wg0
+          - on: mv-annex-24
+            run: |
+              ip link add wg0 type wireguard 2>/dev/null
+              ip addr add 10.{{octet}}.200.2/30 dev wg0 2>/dev/null
+              wg set wg0 private-key /root/wg/private.key listen-port {{port}} peer $(cat /root/wg/peer.pub) endpoint 203.0.113.1:{{port}} allowed-ips 10.{{octet}}.200.1/32,10.{{octet}}.1.0/24
+              ip link set wg0 up
+              ip route replace 10.{{octet}}.1.0/24 dev wg0
+              for i in $(seq 15); do ping -c1 -W2 -I 10.{{octet}}.{{lan}}.1 10.{{octet}}.1.1 >/dev/null 2>&1 && exit 0; sleep 1; done

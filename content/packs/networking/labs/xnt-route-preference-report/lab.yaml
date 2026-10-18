@@ -1,0 +1,263 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xnt-route-preference-report
+  title: Report which route forwards to a destination and why
+  domain: networking
+  frameworks: [ccna:ip-connectivity]
+  difficulty: medium
+  estimatedMinutes: 6
+  tags: [exam, route-selection, administrative-distance, longest-prefix, ospf, frr]
+  version: 1
+spec:
+  description: |
+    **Devices:** `mv-core-21` (FRR console) and `noc-21` (shell; write the file here)
+
+    | Link | Core end | Neighbour |
+    |---|---|---|
+    | `eth1` | `10.{{octet}}.1.1/30` | `mv-campus-north-21` `10.{{octet}}.1.2` (OSPF) |
+    | `eth2` | `10.{{octet}}.1.5/30` | `mv-campus-south-21` `10.{{octet}}.1.6` (OSPF) |
+    | `eth3` | `10.{{octet}}.2.1/30` | `noc-21` `10.{{octet}}.2.2` |
+
+    The core has static routes and OSPF routes that overlap. For each of these
+    three destinations work out which route the core really forwards with and
+    write one line each to `/root/route-report.txt` on `noc-21`:
+
+    ```
+    <destination> <matching prefix> <protocol: static or ospf> <next hop>
+    ```
+
+    Destinations: **10.{{octet}}.64.{{h}}**, **10.{{octet}}.80.{{h}}** and
+    **10.{{octet}}.96.{{h}}**, in that order. The protocol is the one that
+    installed the route in the forwarding table, the next hop is its gateway
+    address. Read the routing table on the `mv-core-21` console. The grader
+    compares your lines with the live routing table of the core.
+  objectives:
+    - Apply longest prefix match, then administrative distance, to overlapping routes
+    - Read the selected route and its next hop from the routing table
+  params:
+    octet: { type: int, min: 20, max: 90 }
+    h: { type: int, min: 10, max: 99 }
+    rot: { type: int, min: 0, max: 2 }
+    fad: { type: choice, values: ["90", "250"] }
+  topology:
+    entry: workstation
+    nodes:
+      - { name: workstation, driver: container, image: jumphost:1, access: [shell] }
+      - { name: mv-core-21, driver: netdev, image: frr:10, access: [console] }
+      - { name: noc-21, driver: container, image: netsvc:1, resources: { cpu: 0.1, memoryMiB: 64 }, access: [shell] }
+      - { name: mv-campus-north-21, driver: netdev, image: frr:10 }
+      - { name: mv-campus-south-21, driver: netdev, image: frr:10 }
+    links:
+      - { a: "mv-core-21:eth1", b: "mv-campus-north-21:eth1", subnet: "10.{{octet}}.1.0/30" }
+      - { a: "mv-core-21:eth2", b: "mv-campus-south-21:eth1", subnet: "10.{{octet}}.1.4/30" }
+      - { a: "mv-core-21:eth3", b: "noc-21:eth1", subnet: "10.{{octet}}.2.0/30" }
+  setup:
+    - on: mv-campus-north-21
+      run: for i in n64 n80 n96; do ip link add $i type dummy 2>/dev/null; ip link set $i up; done
+    - on: mv-campus-south-21
+      run: ip link add s70 type dummy 2>/dev/null; ip link set s70 up
+    - on: mv-campus-north-21
+      config: |
+        interface eth1
+         ip address 10.{{octet}}.1.2/30
+         ip ospf area 0
+         ip ospf network point-to-point
+        interface n64
+         ip address 10.{{octet}}.64.1/24
+         ip ospf area 0
+         ip ospf passive
+        interface n80
+         ip address 10.{{octet}}.80.1/24
+         ip ospf area 0
+         ip ospf passive
+        interface n96
+         ip address 10.{{octet}}.96.1/24
+         ip ospf area 0
+         ip ospf passive
+        router ospf
+         ospf router-id 10.255.{{octet}}.2
+    - on: mv-campus-south-21
+      config: |
+        interface eth1
+         ip address 10.{{octet}}.1.6/30
+         ip ospf area 0
+         ip ospf network point-to-point
+        interface s70
+         ip address 10.{{octet}}.70.1/24
+         ip ospf area 0
+         ip ospf passive
+        router ospf
+         ospf router-id 10.255.{{octet}}.3
+    - on: mv-core-21
+      config: |
+        interface eth1
+         ip address 10.{{octet}}.1.1/30
+         ip ospf area 0
+         ip ospf network point-to-point
+        interface eth2
+         ip address 10.{{octet}}.1.5/30
+         ip ospf area 0
+         ip ospf network point-to-point
+        interface eth3
+         ip address 10.{{octet}}.2.1/30
+        router ospf
+         ospf router-id 10.255.{{octet}}.1
+    - on: mv-core-21
+      run: |
+        # roles rotate with rot: 0 = static /24 (AD 1), 1 = static /23, 2 = floating static /24 (AD {{fad}})
+        for i in 0 1 2; do
+          sub=$((64 + 16 * i)); t=$(( (i + {{rot}}) % 3 ))
+          case $t in
+            0) r="ip route 10.{{octet}}.$sub.0/24 10.{{octet}}.1.6" ;;
+            1) r="ip route 10.{{octet}}.$sub.0/23 10.{{octet}}.1.6" ;;
+            2) r="ip route 10.{{octet}}.$sub.0/24 10.{{octet}}.1.6 {{fad}}" ;;
+          esac
+          vtysh -c 'configure terminal' -c "$r"
+        done
+    - on: mv-core-21
+      timeoutSec: 90
+      run: |
+        for i in $(seq 70); do
+          [ "$(vtysh -c 'show ip ospf route' | grep -c '10.{{octet}}.\(64\|80\|96\).0/24')" -ge 3 ] && exit 0; sleep 1
+        done; exit 1
+    - on: noc-21
+      run: for i in $(seq 20); do ping -c1 -W1 10.{{octet}}.2.1 >/dev/null 2>&1 && break; sleep 1; done
+    - on: noc-21
+      run: |
+        # read-only: serves only the learner's answer file to the grader (the core fetches it)
+        mkdir -p /var/lib/cloudtrain
+        cat > /var/lib/cloudtrain/report-srv.py <<'PY'
+        import http.server
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                try:
+                    out = open("/root/route-report.txt", "rb").read()
+                except OSError:
+                    self.send_error(404); return
+                self.send_response(200); self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", str(len(out))); self.end_headers(); self.wfile.write(out)
+            def log_message(self, *a): pass
+        http.server.ThreadingHTTPServer(("10.{{octet}}.2.2", 8082), H).serve_forever()
+        PY
+        setsid python3 /var/lib/cloudtrain/report-srv.py </dev/null >/dev/null 2>&1 &
+  checks:
+    - id: report-64
+      description: The line for 10.{{octet}}.64.{{h}} names the route the core forwards with
+      type: shell
+      on: mv-core-21
+      command: |
+        d=10.{{octet}}.64.{{h}}
+        want=$(vtysh -c "show ip route $d json" | python3 -c '
+        import json,sys
+        d=json.load(sys.stdin)
+        for p,es in d.items():
+            for e in es:
+                if e.get("selected"):
+                    nh=(e.get("nexthops") or [{}])[0].get("ip","")
+                    print(p, e.get("protocol"), nh)')
+        f=$(python3 -c 'import urllib.request;print(urllib.request.urlopen("http://10.{{octet}}.2.2:8082/",timeout=5).read().decode())' 2>/dev/null)
+        [ -n "$f" ] || { echo nofile; exit 0; }
+        got=$(echo "$f" | awk -v d="$d" '$1==d {print $2, tolower($3), $4}' | head -1)
+        [ -n "$want" ] && [ "$got" = "$want" ] && echo ok || echo "bad got=[$got] want=[$want]"
+      expect: { match: exact, value: ok }
+      timeoutSec: 20
+      skills: [net.routing.route-selection]
+      weight: 2
+    - id: report-80
+      description: The line for 10.{{octet}}.80.{{h}} names the route the core forwards with
+      type: shell
+      on: mv-core-21
+      command: |
+        d=10.{{octet}}.80.{{h}}
+        want=$(vtysh -c "show ip route $d json" | python3 -c '
+        import json,sys
+        d=json.load(sys.stdin)
+        for p,es in d.items():
+            for e in es:
+                if e.get("selected"):
+                    nh=(e.get("nexthops") or [{}])[0].get("ip","")
+                    print(p, e.get("protocol"), nh)')
+        f=$(python3 -c 'import urllib.request;print(urllib.request.urlopen("http://10.{{octet}}.2.2:8082/",timeout=5).read().decode())' 2>/dev/null)
+        [ -n "$f" ] || { echo nofile; exit 0; }
+        got=$(echo "$f" | awk -v d="$d" '$1==d {print $2, tolower($3), $4}' | head -1)
+        [ -n "$want" ] && [ "$got" = "$want" ] && echo ok || echo "bad got=[$got] want=[$want]"
+      expect: { match: exact, value: ok }
+      timeoutSec: 20
+      skills: [net.routing.route-selection]
+      weight: 2
+    - id: report-96
+      description: The line for 10.{{octet}}.96.{{h}} names the route the core forwards with
+      type: shell
+      on: mv-core-21
+      command: |
+        d=10.{{octet}}.96.{{h}}
+        want=$(vtysh -c "show ip route $d json" | python3 -c '
+        import json,sys
+        d=json.load(sys.stdin)
+        for p,es in d.items():
+            for e in es:
+                if e.get("selected"):
+                    nh=(e.get("nexthops") or [{}])[0].get("ip","")
+                    print(p, e.get("protocol"), nh)')
+        f=$(python3 -c 'import urllib.request;print(urllib.request.urlopen("http://10.{{octet}}.2.2:8082/",timeout=5).read().decode())' 2>/dev/null)
+        [ -n "$f" ] || { echo nofile; exit 0; }
+        got=$(echo "$f" | awk -v d="$d" '$1==d {print $2, tolower($3), $4}' | head -1)
+        [ -n "$want" ] && [ "$got" = "$want" ] && echo ok || echo "bad got=[$got] want=[$want]"
+      expect: { match: exact, value: ok }
+      timeoutSec: 20
+      skills: [net.routing.route-selection]
+      weight: 2
+  misconceptions:
+    - id: inverted-preference
+      description: Prefers the shorter prefix and the higher administrative distance, so every line names the route that loses
+      mutation:
+        on: noc-21
+        run: |
+          : > /root/route-report.txt
+          for i in 0 1 2; do
+            sub=$((64 + 16 * i)); t=$(( (i + {{rot}}) % 3 ))
+            d=10.{{octet}}.$sub.{{h}}
+            ospf="$d 10.{{octet}}.$sub.0/24 ospf 10.{{octet}}.1.2"
+            case $t in
+              0) echo "$ospf" ;;
+              1) echo "$d 10.{{octet}}.$sub.0/23 static 10.{{octet}}.1.6" ;;
+              2) if [ {{fad}} -lt 110 ]; then echo "$ospf"; else echo "$d 10.{{octet}}.$sub.0/24 static 10.{{octet}}.1.6"; fi ;;
+            esac >> /root/route-report.txt
+          done
+      expectFail: [report-64, report-80, report-96]
+    - id: wrong-next-hop
+      description: Finds the right prefix and protocol but reports the neighbour on the other uplink as the next hop
+      mutation:
+        on: noc-21
+        run: |
+          : > /root/route-report.txt
+          for i in 0 1 2; do
+            sub=$((64 + 16 * i)); t=$(( (i + {{rot}}) % 3 )); d=10.{{octet}}.$sub.{{h}}
+            case $t in
+              0) echo "$d 10.{{octet}}.$sub.0/24 static 10.{{octet}}.1.2" ;;
+              1) echo "$d 10.{{octet}}.$sub.0/24 ospf 10.{{octet}}.1.6" ;;
+              2) if [ {{fad}} -lt 110 ]; then echo "$d 10.{{octet}}.$sub.0/24 static 10.{{octet}}.1.2"; else echo "$d 10.{{octet}}.$sub.0/24 ospf 10.{{octet}}.1.6"; fi ;;
+            esac >> /root/route-report.txt
+          done
+      expectFail: [report-64, report-80, report-96]
+  solution:
+    explanation: |
+      The longest matching prefix decides first; only routes to the same prefix
+      are compared by administrative distance. Depending on the draw, a destination is
+      covered by a static /24 (distance 1, beats the OSPF /24 at 110), by a static /23
+      (the OSPF /24 is longer, so OSPF forwards) or by a floating static /24 whose
+      distance decides: below 110 it wins, above 110 the OSPF /24 does. The routing table
+      shows the selected entry for each destination (`show ip route <address>`).
+    steps:
+      - on: noc-21
+        run: |
+          : > /root/route-report.txt
+          for i in 0 1 2; do
+            sub=$((64 + 16 * i)); t=$(( (i + {{rot}}) % 3 )); d=10.{{octet}}.$sub.{{h}}
+            case $t in
+              0) echo "$d 10.{{octet}}.$sub.0/24 static 10.{{octet}}.1.6" ;;
+              1) echo "$d 10.{{octet}}.$sub.0/24 ospf 10.{{octet}}.1.2" ;;
+              2) if [ {{fad}} -lt 110 ]; then echo "$d 10.{{octet}}.$sub.0/24 static 10.{{octet}}.1.6"; else echo "$d 10.{{octet}}.$sub.0/24 ospf 10.{{octet}}.1.2"; fi ;;
+            esac >> /root/route-report.txt
+          done

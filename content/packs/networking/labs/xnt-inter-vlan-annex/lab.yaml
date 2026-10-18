@@ -1,0 +1,124 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xnt-inter-vlan-annex
+  title: Route between two annex VLANs on one link
+  domain: networking
+  frameworks: [ccna:network-access]
+  difficulty: medium
+  estimatedMinutes: 8
+  tags: [exam, vlan, inter-vlan, router-on-a-stick, frr]
+  version: 1
+spec:
+  description: |
+    **Device:** `mv-annex-17` (Linux router shell)
+
+    The annex router has one cable, `eth1`, to the switch `mv-sw-annex-17`. The
+    switch port facing the router is an 802.1Q trunk carrying VLANs **{{va}}** and
+    **{{vb}}**. IP forwarding is already enabled on the router, `eth1` is up and has no
+    address.
+
+    | VLAN | Subinterface | Gateway to configure | Host |
+    |---|---|---|---|
+    | {{va}} (workshop staff) | `eth1.{{va}}` (create, VLAN id {{va}}) | `10.{{octet}}.{{va}}.1/24` | `staff-annex-17` (`10.{{octet}}.{{va}}.10`) |
+    | {{vb}} (shop floor) | `eth1.{{vb}}` (create, VLAN id {{vb}}) | `10.{{octet}}.{{vb}}.1/24` | `shop-annex-17` (`10.{{octet}}.{{vb}}.10`) |
+
+    The hosts are addressed and point at their gateway. Create one 802.1Q
+    subinterface per VLAN on `eth1`, bring it up and give it its gateway address so the two hosts reach their gateway and
+    each other through the router. Do not put an address on `eth1` itself.
+  objectives:
+    - Add 802.1Q subinterfaces as per-VLAN gateways so hosts in different VLANs reach each other
+  params:
+    octet: { type: int, min: 20, max: 90 }
+    va: { type: int, min: 20, max: 29 }
+    vb: { type: int, min: 30, max: 39 }
+  topology:
+    entry: workstation
+    nodes:
+      - { name: workstation, driver: container, image: jumphost:1, access: [shell] }
+      - { name: mv-annex-17, driver: container, image: netsvc:1, resources: { cpu: 0.1, memoryMiB: 64 }, access: [shell] }
+      - { name: mv-sw-annex-17, driver: container, image: netsvc:1, resources: { cpu: 0.1, memoryMiB: 64 } }
+      - { name: staff-annex-17, driver: container, image: nettools:1, resources: { cpu: 0.1, memoryMiB: 48 }, access: [shell] }
+      - { name: shop-annex-17, driver: container, image: nettools:1, resources: { cpu: 0.1, memoryMiB: 48 }, access: [shell] }
+    links:
+      - { a: "mv-annex-17:eth1", b: "mv-sw-annex-17:eth3" }
+      - { a: "mv-sw-annex-17:eth1", b: "staff-annex-17:eth1" }
+      - { a: "mv-sw-annex-17:eth2", b: "shop-annex-17:eth1" }
+  setup:
+    - on: mv-sw-annex-17
+      run: |
+        ip link add br0 type bridge vlan_filtering 1 2>/dev/null || true
+        for p in eth1 eth2 eth3; do ip link set $p master br0; done; ip link set br0 up
+        bridge vlan add dev eth1 vid {{va}} pvid untagged; bridge vlan del dev eth1 vid 1
+        bridge vlan add dev eth2 vid {{vb}} pvid untagged; bridge vlan del dev eth2 vid 1
+        for v in {{va}} {{vb}}; do bridge vlan add dev eth3 vid $v; done; bridge vlan del dev eth3 vid 1
+    - on: mv-annex-17
+      run: |
+        sysctl -w net.ipv4.ip_forward=1
+        ip link set eth1 up
+    - { on: staff-annex-17, run: "ip addr replace 10.{{octet}}.{{va}}.10/24 dev eth1 && ip route replace default via 10.{{octet}}.{{va}}.1" }
+    - { on: shop-annex-17, run: "ip addr replace 10.{{octet}}.{{vb}}.10/24 dev eth1 && ip route replace default via 10.{{octet}}.{{vb}}.1" }
+  checks:
+    - id: subinterfaces
+      description: The VLAN subinterfaces on eth1 carry the gateway addresses and eth1 itself has none
+      type: shell
+      on: mv-annex-17
+      command: |
+        ip -j -d addr show | python3 -c '
+        import json,sys
+        out=[]; parent=0
+        for i in json.load(sys.stdin):
+            if i["ifname"]=="eth1": parent=len([a for a in i.get("addr_info",[]) if a["family"]=="inet"])
+            li=i.get("linkinfo",{})
+            if li.get("info_kind")=="vlan" and i.get("link")=="eth1":
+                for a in i.get("addr_info",[]):
+                    if a["family"]=="inet": out.append("%s %s/%s" % (li["info_data"]["id"], a["local"], a["prefixlen"]))
+        print(" ".join(sorted(out)), "parent=%d" % parent)'
+      expect: { match: exact, value: "{{va}} 10.{{octet}}.{{va}}.1/24 {{vb}} 10.{{octet}}.{{vb}}.1/24 parent=0" }
+      skills: [net.switching.inter-vlan]
+      weight: 2
+    - { id: staff-gateway, description: staff-annex-17 reaches its gateway, type: reachability, on: staff-annex-17, target: "10.{{octet}}.{{va}}.1", skills: [net.switching.inter-vlan] }
+    - { id: shop-gateway, description: shop-annex-17 reaches its gateway, type: reachability, on: shop-annex-17, target: "10.{{octet}}.{{vb}}.1", skills: [net.switching.inter-vlan] }
+    - { id: staff-to-shop, description: staff-annex-17 reaches shop-annex-17 through the router, type: reachability, on: staff-annex-17, target: "10.{{octet}}.{{vb}}.10", skills: [net.switching.inter-vlan], weight: 2 }
+    - { id: shop-to-staff, description: shop-annex-17 reaches staff-annex-17 through the router, type: reachability, on: shop-annex-17, target: "10.{{octet}}.{{va}}.10", skills: [net.switching.inter-vlan], weight: 2 }
+  misconceptions:
+    - id: address-on-parent
+      description: Puts the gateway addresses on eth1 itself instead of creating VLAN subinterfaces
+      mutation:
+        on: mv-annex-17
+        run: |
+          ip addr add 10.{{octet}}.{{va}}.1/24 dev eth1
+          ip addr add 10.{{octet}}.{{vb}}.1/24 dev eth1
+      expectFail: [subinterfaces, staff-gateway, shop-gateway, staff-to-shop, shop-to-staff]
+    - id: one-vlan-only
+      description: Creates and addresses only the first VLAN subinterface
+      mutation:
+        on: mv-annex-17
+        run: |
+          ip link add link eth1 name eth1.{{va}} type vlan id {{va}}
+          ip addr add 10.{{octet}}.{{va}}.1/24 dev eth1.{{va}}
+          ip link set eth1.{{va}} up
+      expectFail: [subinterfaces, shop-gateway, staff-to-shop, shop-to-staff]
+    - id: wrong-vlan-id
+      description: Names each subinterface after its VLAN but tags it with the other VLAN's id
+      mutation:
+        on: mv-annex-17
+        run: |
+          ip link add link eth1 name eth1.{{va}} type vlan id {{vb}}
+          ip link add link eth1 name eth1.{{vb}} type vlan id {{va}}
+          ip addr add 10.{{octet}}.{{va}}.1/24 dev eth1.{{va}}
+          ip addr add 10.{{octet}}.{{vb}}.1/24 dev eth1.{{vb}}
+          ip link set eth1.{{va}} up; ip link set eth1.{{vb}} up
+      expectFail: [subinterfaces, staff-gateway, shop-gateway, staff-to-shop, shop-to-staff]
+  solution:
+    explanation: |
+      Each VLAN gets its own 802.1Q subinterface on eth1 with the matching VLAN id and the
+      gateway address; the router then forwards between the two connected subnets.
+    steps:
+      - on: mv-annex-17
+        run: |
+          for v in {{va}} {{vb}}; do
+            ip link add link eth1 name eth1.$v type vlan id $v
+            ip addr add 10.{{octet}}.$v.1/24 dev eth1.$v
+            ip link set eth1.$v up
+          done

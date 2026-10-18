@@ -1,0 +1,155 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xnt-capture-dns-transport
+  title: Record the transport details of a name lookup
+  domain: networking
+  frameworks: [ccna:network-fundamentals]
+  difficulty: easy
+  estimatedMinutes: 6
+  tags: [exam, dns, tcp-udp, capture, tcpdump]
+  version: 1
+spec:
+  description: |
+    **Devices:** `annex-host-13` (shell, busybox `nslookup` and `tcpdump`), `dns-dc-13` (DNS server, no access needed)
+
+    | Device | Address |
+    |---|---|
+    | `annex-host-13` `eth1` | `10.{{octet}}.13.20/24`, gateway `10.{{octet}}.13.1` (`mv-annex-13`) |
+    | `dns-dc-13` `eth1` | `10.{{octet}}.100.53/24` |
+
+    From `annex-host-13`, look up **`{{name}}.mv.example`** on the data-centre
+    DNS server `10.{{octet}}.100.53`. Capture the exchange (`tcpdump`) and write
+    what the capture shows to `/root/dns-transport.txt` on `annex-host-13` as
+    exactly three lines:
+
+    ```
+    transport: <udp or tcp>
+    server_port: <port the server listened on>
+    client_port: <port the client sent from>
+    ```
+
+    The client port is the source port of your own query, so it will differ from
+    run to run. The grader keeps its own capture of everything that crosses
+    `annex-host-13` and compares your file with it.
+  objectives:
+    - Identify the transport protocol and the server and client ports of a DNS lookup from a capture
+  params:
+    octet: { type: int, min: 20, max: 90 }
+    name: { type: choice, values: [timetable, grades, library, kiosk] }
+  topology:
+    entry: workstation
+    nodes:
+      - { name: workstation, driver: container, image: jumphost:1, access: [shell] }
+      - { name: annex-host-13, driver: container, image: nettools:1, resources: { cpu: 0.1, memoryMiB: 48 }, access: [shell] }
+      - { name: mv-annex-13, driver: container, image: netsvc:1, resources: { cpu: 0.1, memoryMiB: 64 } }
+      - { name: dns-dc-13, driver: container, image: netsvc:1, resources: { cpu: 0.1, memoryMiB: 64 } }
+    links:
+      - { a: "annex-host-13:eth1", b: "mv-annex-13:eth1" }
+      - { a: "mv-annex-13:eth2", b: "dns-dc-13:eth1" }
+  setup:
+    - on: mv-annex-13
+      run: |
+        echo 1 > /proc/sys/net/ipv4/ip_forward
+        ip addr replace 10.{{octet}}.13.1/24 dev eth1
+        ip addr replace 10.{{octet}}.100.1/24 dev eth2
+    - on: dns-dc-13
+      run: |
+        ip addr replace 10.{{octet}}.100.53/24 dev eth1
+        ip route replace default via 10.{{octet}}.100.1
+        mkdir -p /etc/dnsmasq.d
+        cat > /etc/dnsmasq.d/district.conf <<'EOC'
+        port=53
+        no-resolv
+        no-hosts
+        address=/timetable.mv.example/10.30.0.21
+        address=/grades.mv.example/10.30.0.22
+        address=/library.mv.example/10.30.0.23
+        address=/kiosk.mv.example/10.30.0.24
+        EOC
+        dnsmasq -C /etc/dnsmasq.d/district.conf
+    - on: annex-host-13
+      run: |
+        ip addr replace 10.{{octet}}.13.20/24 dev eth1
+        ip route replace default via 10.{{octet}}.13.1
+        # grader-owned capture of all DNS traffic on this host
+        mkdir -p /var/lib/cloudtrain
+        setsid tcpdump -i eth1 -nn -U -w /var/lib/cloudtrain/dns-all.pcap 'port 53' </dev/null >/dev/null 2>&1 &
+        sleep 1
+  checks:
+    - id: lookup-captured
+      description: A lookup of the requested name from annex-host-13 to the DNS server is in the grader capture
+      type: shell
+      on: annex-host-13
+      command: |
+        sleep 1
+        n=$(tcpdump -nn -r /var/lib/cloudtrain/dns-all.pcap "src host 10.{{octet}}.13.20 and dst host 10.{{octet}}.100.53 and dst port 53" 2>/dev/null | grep -c '{{name}}\.mv\.example')
+        [ "$n" -gt 0 ] && echo seen || echo missing
+      expect: { match: exact, value: seen }
+      skills: [net.troubleshooting.packet-capture]
+    - id: report-transport
+      description: The report names the transport protocol the query used
+      type: shell
+      on: annex-host-13
+      command: |
+        f=/root/dns-transport.txt; [ -f "$f" ] || { echo nofile; exit 0; }
+        got=$(sed -n 's/^transport: *\([A-Za-z]*\) *$/\1/p' "$f" | tr A-Z a-z)
+        # the protocol of the captured query packets for the requested name; no such query at all is a failure
+        q() { tcpdump -nn -r /var/lib/cloudtrain/dns-all.pcap "src host 10.{{octet}}.13.20 and dst port 53 and $1" 2>/dev/null | grep -q '{{name}}\.mv\.example'; }
+        if q udp; then real=udp; elif q tcp; then real=tcp; else real=none; fi
+        [ "$real" != none ] || { echo "bad no query in capture"; exit 0; }
+        [ "$got" = "$real" ] && echo ok || echo "bad $got"
+      expect: { match: exact, value: ok }
+      skills: [net.fundamentals.tcp-udp-ports]
+      weight: 2
+    - id: report-server-port
+      description: The report gives the port the DNS server listens on
+      type: shell
+      on: annex-host-13
+      command: |
+        f=/root/dns-transport.txt; [ -f "$f" ] || { echo nofile; exit 0; }
+        got=$(sed -n 's/^server_port: *\([0-9]*\) *$/\1/p' "$f")
+        [ "$got" = 53 ] && echo ok || echo "bad $got"
+      expect: { match: exact, value: ok }
+      skills: [net.fundamentals.tcp-udp-ports]
+    - id: report-client-port
+      description: The report gives the source port of a real query for the requested name in the capture
+      type: shell
+      on: annex-host-13
+      command: |
+        f=/root/dns-transport.txt; [ -f "$f" ] || { echo nofile; exit 0; }
+        got=$(sed -n 's/^client_port: *\([0-9]*\) *$/\1/p' "$f")
+        [ -n "$got" ] || { echo bad; exit 0; }
+        tcpdump -nn -r /var/lib/cloudtrain/dns-all.pcap "src host 10.{{octet}}.13.20 and dst port 53" 2>/dev/null \
+          | grep '{{name}}\.mv\.example' | awk '{print $3}' | sed 's/.*\.//' | grep -qx "$got" && echo ok || echo "bad $got"
+      expect: { match: exact, value: ok }
+      skills: [net.fundamentals.tcp-udp-ports, net.troubleshooting.packet-capture]
+      weight: 2
+  misconceptions:
+    - id: tcp-guess
+      description: Assumes DNS uses TCP and reports the well-known port as both ports without reading the capture
+      mutation:
+        on: annex-host-13
+        run: |
+          nslookup {{name}}.mv.example 10.{{octet}}.100.53 >/dev/null 2>&1
+          printf 'transport: tcp\nserver_port: 53\nclient_port: 53\n' > /root/dns-transport.txt
+      expectFail: [report-transport, report-client-port]
+    - id: server-port-as-client
+      description: Reports the DNS server port as the client port
+      mutation:
+        on: annex-host-13
+        run: |
+          nslookup {{name}}.mv.example 10.{{octet}}.100.53 >/dev/null 2>&1
+          printf 'transport: udp\nserver_port: 53\nclient_port: 53\n' > /root/dns-transport.txt
+      expectFail: [report-client-port]
+  solution:
+    explanation: |
+      Run the lookup, read the query packet in the capture (UDP, destination port
+      53, an ephemeral source port) and write those three values to the file.
+    steps:
+      - on: annex-host-13
+        run: |
+          nslookup {{name}}.mv.example 10.{{octet}}.100.53 >/dev/null 2>&1
+          sleep 1
+          cp=$(tcpdump -nn -r /var/lib/cloudtrain/dns-all.pcap "src host 10.{{octet}}.13.20 and udp and dst port 53" 2>/dev/null | grep '{{name}}\.mv\.example' | tail -1 | awk '{print $3}' | sed 's/.*\.//')
+          printf 'transport: udp\nserver_port: 53\nclient_port: %s\n' "$cp" > /root/dns-transport.txt

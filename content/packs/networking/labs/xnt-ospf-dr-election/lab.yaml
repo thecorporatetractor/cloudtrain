@@ -1,0 +1,219 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xnt-ospf-dr-election
+  title: Control the DR on a shared segment
+  domain: networking
+  frameworks: [ccna:ip-connectivity]
+  difficulty: medium
+  estimatedMinutes: 8
+  tags: [exam, ospf, dr, bdr, priority, frr]
+  version: 1
+spec:
+  description: |
+    **Devices:** `mv-core-19`, `mv-campus-north-19`, `mv-campus-south-19` (FRR consoles)
+
+    The three routers share the data-centre segment `10.{{octet}}.19.0/24` through
+    `mv-sw-dc-19` on `eth1` (core `.1`, north `.2`, south `.3`) and run OSPF area 0
+    on it (hello 1 s, dead 3 s). Each campus router also has a LAN
+    (`lan1`: north `10.{{octet}}.31.0/24`, south `10.{{octet}}.32.0/24`, passive).
+    All priorities are at the default 1, so the router with the highest router ID
+    (`mv-campus-north-19`) is DR today.
+
+    Make **`mv-core-19` the DR** with OSPF priority **{{prio}}** on `eth1`, and make
+    sure **`mv-campus-south-19` can never become DR or BDR** on that segment
+    (priority 0); `mv-campus-north-19` keeps the default priority and is the
+    BDR. All adjacencies must be Full afterwards and the core must learn both
+    campus LANs. Note that a DR is not preempted: a priority change alone does not
+    change a segment that has already elected one.
+  objectives:
+    - Use OSPF interface priorities to choose the DR and exclude a router from the election
+    - Re-run the election after a priority change
+  params:
+    octet: { type: int, min: 20, max: 90 }
+    prio: { type: int, min: 20, max: 250 }
+  topology:
+    entry: workstation
+    nodes:
+      - { name: workstation, driver: container, image: jumphost:1, access: [shell] }
+      - { name: mv-core-19, driver: netdev, image: frr:10, access: [console] }
+      - { name: mv-campus-north-19, driver: netdev, image: frr:10, access: [console] }
+      - { name: mv-campus-south-19, driver: netdev, image: frr:10, access: [console] }
+      - { name: mv-sw-dc-19, driver: container, image: netsvc:1, resources: { cpu: 0.1, memoryMiB: 64 } }
+    links:
+      - { a: "mv-core-19:eth1", b: "mv-sw-dc-19:eth1" }
+      - { a: "mv-campus-north-19:eth1", b: "mv-sw-dc-19:eth2" }
+      - { a: "mv-campus-south-19:eth1", b: "mv-sw-dc-19:eth3" }
+  setup:
+    - on: mv-sw-dc-19
+      run: |
+        ip link add br0 type bridge 2>/dev/null || true
+        for p in eth1 eth2 eth3; do ip link set $p master br0; done; ip link set br0 up
+    - { on: mv-campus-north-19, run: "ip link add lan1 type dummy 2>/dev/null; ip link set lan1 up" }
+    - { on: mv-campus-south-19, run: "ip link add lan1 type dummy 2>/dev/null; ip link set lan1 up" }
+    - on: mv-core-19
+      config: |
+        interface eth1
+         ip address 10.{{octet}}.19.1/24
+         ip ospf area 0
+         ip ospf hello-interval 1
+         ip ospf dead-interval 3
+        router ospf
+         ospf router-id 10.255.{{octet}}.10
+    - on: mv-campus-north-19
+      config: |
+        interface eth1
+         ip address 10.{{octet}}.19.2/24
+         ip ospf area 0
+         ip ospf hello-interval 1
+         ip ospf dead-interval 3
+        interface lan1
+         ip address 10.{{octet}}.31.1/24
+         ip ospf area 0
+         ip ospf passive
+        router ospf
+         ospf router-id 10.255.{{octet}}.30
+    - on: mv-campus-south-19
+      config: |
+        interface eth1
+         ip address 10.{{octet}}.19.3/24
+         ip ospf area 0
+         ip ospf hello-interval 1
+         ip ospf dead-interval 3
+        interface lan1
+         ip address 10.{{octet}}.32.1/24
+         ip ospf area 0
+         ip ospf passive
+        router ospf
+         ospf router-id 10.255.{{octet}}.20
+    - on: mv-core-19
+      timeoutSec: 60
+      run: |
+        for i in $(seq 40); do [ "$(vtysh -c 'show ip ospf neighbor' | grep -c Full)" = 2 ] && exit 0; sleep 1; done; exit 1
+  checks:
+    - id: core-is-dr
+      description: mv-core-19 is the DR on eth1 with the requested priority
+      type: shell
+      on: mv-core-19
+      command: |
+        for i in $(seq 30); do
+          r=$(vtysh -c 'show ip ospf interface eth1 json' | python3 -c '
+        import json,sys
+        d=json.load(sys.stdin).get("interfaces",{}).get("eth1",{})
+        print(d.get("state",""), d.get("priority",""))')
+          case "$r" in "DR {{prio}}") break;; esac; sleep 1
+        done
+        echo "$r"
+      expect: { match: exact, value: "DR {{prio}}" }
+      timeoutSec: 45
+      skills: [net.routing.ospf-tuning]
+      weight: 2
+    - id: south-never-dr
+      description: mv-campus-south-19 has priority 0 and is neither DR nor BDR
+      type: shell
+      on: mv-campus-south-19
+      command: |
+        for i in $(seq 30); do
+          r=$(vtysh -c 'show ip ospf interface eth1 json' | python3 -c '
+        import json,sys
+        d=json.load(sys.stdin).get("interfaces",{}).get("eth1",{})
+        print(d.get("state",""), d.get("priority",""))')
+          [ "$r" = "DROther 0" ] && break; sleep 1
+        done
+        echo "$r"
+      expect: { match: exact, value: "DROther 0" }
+      timeoutSec: 45
+      skills: [net.routing.ospf-tuning]
+      weight: 2
+    - id: north-is-bdr
+      description: mv-campus-north-19 is the BDR
+      type: shell
+      on: mv-campus-north-19
+      command: |
+        for i in $(seq 30); do
+          r=$(vtysh -c 'show ip ospf interface eth1 json' | python3 -c '
+        import json,sys
+        d=json.load(sys.stdin).get("interfaces",{}).get("eth1",{})
+        print(d.get("state",""))')
+          [ "$r" = Backup ] && break; sleep 1
+        done
+        echo "$r"
+      expect: { match: exact, value: Backup }
+      timeoutSec: 45
+      skills: [net.routing.ospf-tuning]
+    - id: adjacencies-full
+      description: mv-core-19 has Full adjacencies with both campus routers
+      type: shell
+      on: mv-core-19
+      command: |
+        for i in $(seq 30); do n=$(vtysh -c 'show ip ospf neighbor json' | python3 -c '
+        import json,sys
+        d=json.load(sys.stdin).get("neighbors",{})
+        print(sum(1 for v in d.values() for n in v if n.get("nbrState","").startswith("Full")))'); [ "$n" = 2 ] && break; sleep 1; done
+        echo "$n"
+      expect: { match: exact, value: "2" }
+      timeoutSec: 45
+      skills: [net.routing.ospf]
+    - id: lans-learned
+      description: mv-core-19 learns both campus LANs through OSPF
+      type: shell
+      on: mv-core-19
+      command: |
+        for i in $(seq 20); do
+          r=$(vtysh -c 'show ip route ospf json' | python3 -c '
+        import json,sys
+        d=json.load(sys.stdin)
+        print(" ".join(p for p in ("10.{{octet}}.31.0/24","10.{{octet}}.32.0/24") if any(r.get("selected") for r in d.get(p,[]))))')
+          [ "$r" = "10.{{octet}}.31.0/24 10.{{octet}}.32.0/24" ] && break; sleep 1
+        done
+        echo "$r"
+      expect: { match: exact, value: "10.{{octet}}.31.0/24 10.{{octet}}.32.0/24" }
+      timeoutSec: 40
+      skills: [net.routing.ospf]
+  misconceptions:
+    - id: priority-without-new-election
+      description: Sets the priorities but leaves the existing DR in place, forgetting that a DR is not preempted
+      mutation:
+        on: mv-core-19
+        config: |
+          interface eth1
+           ip ospf priority {{prio}}
+      expectFail: [core-is-dr]
+    - id: south-zero-only
+      description: Sets priority 0 on the south router and bounces its interface, but never raises the intended DR's priority
+      mutation:
+        on: mv-campus-south-19
+        run: |
+          vtysh -c 'configure terminal' -c 'interface eth1' -c 'ip ospf priority 0'
+          ip link set eth1 down; sleep 1; ip link set eth1 up; sleep 8
+      expectFail: [core-is-dr]
+  solution:
+    explanation: |
+      Set the priorities (core {{prio}}, south 0, north unchanged) and then force a new
+      election, because the existing DR is not preempted: take the OSPF interface down
+      on all three routers together and bring them back up. The core wins on priority,
+      north (highest router ID of the eligible rest) becomes BDR and south stays
+      DROther.
+    steps:
+      - on: mv-core-19
+        config: |
+          interface eth1
+           ip ospf priority {{prio}}
+      - on: mv-campus-south-19
+        config: |
+          interface eth1
+           ip ospf priority 0
+      - { on: mv-core-19, run: "ip link set eth1 down" }
+      - { on: mv-campus-north-19, run: "ip link set eth1 down" }
+      - { on: mv-campus-south-19, run: "ip link set eth1 down" }
+      - { on: mv-core-19, run: "sleep 4; ip link set eth1 up" }
+      - { on: mv-campus-north-19, run: "ip link set eth1 up" }
+      - { on: mv-campus-south-19, run: "ip link set eth1 up" }
+      - on: mv-core-19
+        timeoutSec: 60
+        run: |
+          for i in $(seq 40); do
+            vtysh -c 'show ip ospf interface eth1 json' | grep -q '"state": *"DR"' && [ "$(vtysh -c 'show ip ospf neighbor' | grep -c Full)" = 2 ] && exit 0
+            sleep 1
+          done
+          exit 1
