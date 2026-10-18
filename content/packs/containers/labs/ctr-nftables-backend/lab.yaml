@@ -83,7 +83,8 @@ spec:
         /usr/local/sbin/cl-sim-clients
         # engine on the iptables backend with a host label the learner must keep
         install -d /etc/docker
-        echo '{"labels": ["site=copperleaf-edge"]}' > /etc/docker/daemon.json
+        [ -s /etc/docker/daemon.json ] || echo '{}' > /etc/docker/daemon.json
+        jq '. + {labels: ["site=copperleaf-edge"]}' /etc/docker/daemon.json > /etc/docker/daemon.json.new && mv /etc/docker/daemon.json.new /etc/docker/daemon.json
         systemctl restart docker
         for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
         rm -f /etc/systemd/system/cl-edge-nft.service /etc/copperleaf/edge.nft
@@ -166,7 +167,7 @@ spec:
       skills: [containers.network.host-firewall]
       weight: 2
       command: |
-        n=$(nft list ruleset 2>/dev/null | awk '/^table/{t=$0} /(drop|reject)/{ if (t !~ /docker/) c++ } END{print c+0}')
+        n=$(nft -j list ruleset 2>/dev/null | jq '[.nftables[]? | .rule? | select(. != null) | select((.table | test("docker") | not) and (.table | IN("filter","nat","raw","mangle","security") | not)) | select(any(.expr[]?; type == "object" and (has("drop") or has("reject")))) | select(tostring | contains("{{port}}"))] | length' 2>/dev/null || echo 0)
         u=$(systemctl is-enabled cl-edge-user.service 2>/dev/null || true)
         echo "own-drop-rules=$([ "$n" -ge 1 ] && echo yes || echo no) old-unit=$([ "$u" = enabled ] && echo enabled || echo retired)"
       expect: {match: exact, value: "own-drop-rules=yes old-unit=retired"}
