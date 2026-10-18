@@ -4,6 +4,7 @@
 # Needs helm and yq (mikefarah v4).
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+for t in helm yq; do command -v "$t" >/dev/null || { echo "tools/charts/test.sh needs $t" >&2; exit 2; }; done
 CHART=$ROOT/deploy/charts/cloudtrain
 CRDS=$ROOT/deploy/charts/cloudtrain-crds
 OUT=${OUT:-$(mktemp -d)}
@@ -53,7 +54,7 @@ check "orchestrator --image-mirror" q 'select(.kind == "Deployment" and .metadat
 check "catalog ConfigMap with OpenTofu overlay" q 'select(.kind == "ConfigMap" and .metadata.name == "ct-cloudtrain-orchestrator-catalog") | .data["10-iac-opentofu.yaml"] | contains("iac-ws:1.15-tofu")' "$OUT/values-kind.yaml"
 check "orchestrator scoped to its sessions namespace" q 'select(.kind == "Deployment" and .metadata.name == "ct-cloudtrain-orchestrator") | .spec.template.spec.containers[0].args[] | select(. == "--watch-namespace=ct-deploy-sessions")' "$OUT/values-kind.yaml"
 check "cluster-scoped names carry the namespace" q 'select(.kind == "ClusterRole" and .metadata.name == "ct-cloudtrain-orchestrator-cloudtrain")' "$OUT/values-kind.yaml"
-render -f "$CHART/examples/values-kind.yaml" --set imagePullSecrets.create=true --set imagePullSecrets.username=u --set imagePullSecrets.password=p --set 'orchestrator.images.pullSecrets[0]=cloudtrain-registry' >"$OUT/pull.yaml"
+render -f "$CHART/examples/values-kind.yaml" --set imagePullSecrets.create=true --set imagePullSecrets.username=u --set imagePullSecrets.token=p --set 'orchestrator.images.pullSecrets[0]=cloudtrain-registry' >"$OUT/pull.yaml"
 check "pull secret in release and sessions namespaces" bash -c "[[ \$(yq -N 'select(.kind == \"Secret\" and .type == \"kubernetes.io/dockerconfigjson\") | .metadata.namespace' '$OUT/pull.yaml' | sort | tr '\n' ' ') == 'cloudtrain ct-deploy-sessions ' ]]"
 check "orchestrator --image-pull-secrets" q 'select(.kind == "Deployment" and .metadata.name == "ct-cloudtrain-orchestrator") | .spec.template.spec.containers[0].args[] | select(. == "--image-pull-secrets=cloudtrain-registry")' "$OUT/pull.yaml"
 render -f "$CHART/examples/values-kind.yaml" --set-file orchestrator.catalog.releaseOverlay="$ROOT/deploy/images/overlays/iac-opentofu.yaml" >"$OUT/overlay.yaml"

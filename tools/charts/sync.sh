@@ -2,9 +2,12 @@
 # Copy the files the Helm charts embed from their sources of truth (Helm cannot
 # read outside a chart directory):
 #   services/lab-orchestrator/config/crd/*.yaml  -> deploy/charts/cloudtrain-crds/files/
-#   services/lab-orchestrator/config/rbac/role.yaml -> deploy/charts/cloudtrain/files/orchestrator-role.yaml
+#   services/lab-orchestrator/config/rbac/role.yaml -> deploy/charts/cloudtrain/files/orchestrator-role.txt
 #   deploy/images/catalog.yaml                    -> deploy/charts/cloudtrain/files/catalog.yaml
 #   deploy/images/overlays/iac-opentofu.yaml      -> deploy/charts/cloudtrain/files/catalog-iac-opentofu.yaml
+# The ClusterRole copy is a .txt file: scanners already report (and the repo accepts,
+# .github/iac/trivyignore.yaml) the source role.yaml; a second .yaml copy would
+# duplicate every finding. The chart renders it with the release's names.
 # Usage: tools/charts/sync.sh [--check]   (--check: fail if a copy is stale; CI)
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
@@ -13,7 +16,7 @@ CHECK=0
 CRDS=$ROOT/deploy/charts/cloudtrain-crds/files
 APP=$ROOT/deploy/charts/cloudtrain/files
 pairs=(
-  "$ROOT/services/lab-orchestrator/config/rbac/role.yaml|$APP/orchestrator-role.yaml"
+  "$ROOT/services/lab-orchestrator/config/rbac/role.yaml|$APP/orchestrator-role.txt"
   "$ROOT/deploy/images/catalog.yaml|$APP/catalog.yaml"
   "$ROOT/deploy/images/overlays/iac-opentofu.yaml|$APP/catalog-iac-opentofu.yaml"
 )
