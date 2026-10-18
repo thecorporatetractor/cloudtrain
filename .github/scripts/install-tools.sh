@@ -15,6 +15,7 @@ TOOLS=(
   "gitleaks|8.30.1|$GH/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz|551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb|gitleaks"
   "gosec|2.29.0|$GH/securego/gosec/releases/download/v2.29.0/gosec_2.29.0_linux_amd64.tar.gz|6431b119741c1f4a50fdfcf94e782e16b9e642afc8c7fa9b5d39d48bf3003095|gosec"
   "grype|0.120.1|$GH/anchore/grype/releases/download/v0.120.1/grype_0.120.1_linux_amd64.tar.gz|0a9ee97ef5ae2ee953b0a80098105052e846cdbe319a57d808b519c33cd1343d|grype"
+  "helm|3.22.0|https://get.helm.sh/helm-v3.22.0-linux-amd64.tar.gz|1e4ab49e429626cf6c6958d914248b78c9730803c2751b87627e171dc800e7bb|linux-amd64/helm"
   "hadolint|2.15.1|$GH/hadolint/hadolint/releases/download/v2.15.1/hadolint-linux-x86_64|c7187db94eeeeca956519a6af171adc31453941a1e777961f6e680f697c8c507|"
   "kube-linter|0.8.3|$GH/stackrox/kube-linter/releases/download/v0.8.3/kube-linter-linux.tar.gz|1a6d8419b11971372971fdbc22682b684ebfb7cf1c39591662d1b6ca736c41df|kube-linter"
   "osv-scanner|2.7.0|$GH/google/osv-scanner/releases/download/v2.7.0/osv-scanner_linux_amd64|160c6253e2922e9e0a6a9771c5c4c40a4b3c6090b34a3cdd5e80c96cc2e4218b|"

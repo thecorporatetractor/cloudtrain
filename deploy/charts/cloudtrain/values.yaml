@@ -1,0 +1,234 @@
+# CloudTrain platform chart. Install guide and per-provider values:
+# docs/deploy.md. Examples: deploy/charts/cloudtrain/examples/values-*.yaml.
+
+# Public host name the browser uses. Everything else is derived from it: the
+# Ingress/HTTPRoute host, the gateway's CT_PUBLIC_URL/CT_WEB_URL and with them the
+# OIDC redirect URI (https://<host>/api/auth/callback) and post-logout redirect.
+host: labs.example.com
+
+global:
+  # Registry path holding gateway, web and lab-orchestrator (a mirror of GHCR,
+  # docs/deploy.md "Pulling from the cluster's own registry").
+  imageRegistry: ghcr.io/thecorporatetractor/cloudtrain
+  # Image tag of all three; empty = the chart's appVersion.
+  imageTag: ""
+  imagePullPolicy: IfNotPresent
+  # Pull secrets (names) for the platform pods.
+  imagePullSecrets: []
+
+# Optionally create a docker-registry Secret for private registries (GHCR
+# private packages, Harbor robot accounts). It is created in the release
+# namespace and, for lab pods, in the sessions namespace; reference it in
+# global.imagePullSecrets and orchestrator.images.pullSecrets by name.
+imagePullSecrets:
+  create: false
+  name: cloudtrain-registry
+  registry: ghcr.io
+  username: ""
+  password: ""
+
+# ------------------------------------------------------------------ exposure
+exposure:
+  # ingress | gatewayAPI | none
+  type: ingress
+  ingress:
+    # IngressClass: nginx, webapprouting.kubernetes.azure.com (AKS app routing),
+    # alb (AWS Load Balancer Controller), gce, traefik, ...
+    className: ""
+    annotations: {}
+    # ImplementationSpecific for ALB/GCE wildcard paths; Prefix everywhere else.
+    pathType: Prefix
+  gatewayAPI:
+    # HTTPRoute parents. With createGateway these default to the chart's Gateway.
+    parentRefs: []
+    #  - name: shared-gateway
+    #    namespace: gateway-system
+    #    sectionName: https
+    annotations: {}
+    # Gateway API timeouts for the route rules (terminal WebSockets are long-lived;
+    # "0s" disables the request timeout where the implementation supports it).
+    timeouts: {}
+    #  request: 0s
+    # Create a Gateway for this release (when the app team owns the listener,
+    # e.g. GKE Gateway or Envoy Gateway); otherwise attach to parentRefs.
+    createGateway: false
+    gatewayClassName: ""
+    gatewayAnnotations: {}
+
+tls:
+  enabled: true
+  # secret: an existing kubernetes.io/tls Secret named secretName
+  # certManager: a cert-manager Certificate writes secretName (issuerRef below)
+  # external: TLS ends in front of the cluster (ALB with ACM, a CDN): no Secret,
+  #           the public URL is still https
+  mode: secret
+  secretName: cloudtrain-tls
+  certManager:
+    issuerRef:
+      name: letsencrypt
+      kind: ClusterIssuer
+      group: cert-manager.io
+
+# ------------------------------------------------------------------- gateway
+gateway:
+  enabled: true
+  replicas: 2
+  image:
+    repository: gateway
+    tag: ""
+  port: 8787
+  # Namespace of LabTemplates and LabSessions (CT_NAMESPACE).
+  sessionsNamespace: cloudtrain-sessions
+  # Proxies whose X-Forwarded-* headers the gateway trusts (CT_TRUST_PROXY):
+  # the pod CIDR(s) of the Ingress/Gateway data plane. Private ranges by default.
+  trustProxy: "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,100.64.0.0/10,fc00::/7"
+  # Extra web origins allowed to call /api cross-origin (CT_CORS_ORIGINS); only
+  # needed when web.runtimeConfig.apiBase points at another origin.
+  corsOrigins: []
+  logLevel: info
+  oidc:
+    # The IdP's issuer (Keycloak realm, Entra, ...). The redirect URI to register
+    # is https://<host>/api/auth/callback (see NOTES after install).
+    issuer: ""
+    clientId: cloudtrain-gateway
+  keycloak:
+    # Keycloak admin API (SSO connections, invitations); empty url = off.
+    url: ""
+    realm: cloudtrain
+    adminClientId: cloudtrain-gateway-admin
+  # IdP aliases whose CloudTrain.PlatformAdmin app role grants platform_admin.
+  platformIdps: ""
+  smtp:
+    host: ""
+    port: 587
+    from: "CloudTrain <no-reply@example.com>"
+  # Secret with the gateway's credentials. Keys: CT_DATABASE_URL,
+  # CT_DATABASE_OWNER_URL (migrations), CT_OIDC_CLIENT_SECRET, CT_SESSION_SECRET
+  # (>= 16 chars), optional CT_KEYCLOAK_ADMIN_CLIENT_SECRET. Required unless
+  # postgres.demo.enabled and gateway.secrets.create are used.
+  existingSecret: ""
+  secrets:
+    # Create the Secret from these values (demos; prefer existingSecret).
+    # sessionSecret is generated once and kept across upgrades when empty.
+    create: false
+    oidcClientSecret: ""
+    keycloakAdminClientSecret: ""
+    sessionSecret: ""
+    databaseUrl: ""
+    databaseOwnerUrl: ""
+  # Run the schema migrations (dist/db/cli.js migrate, as the owner role) in an
+  # init container before every rollout; idempotent and locked by Kysely.
+  migrate: true
+  # Read cluster-wide capacity for the admin dashboard (nodes, pods, VMIs).
+  clusterCapacity: true
+  extraEnv: []
+  resources:
+    requests: {cpu: 100m, memory: 256Mi}
+    limits: {memory: 1Gi}
+  service:
+    annotations: {}
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# ----------------------------------------------------------------------- web
+web:
+  enabled: true
+  replicas: 2
+  image:
+    repository: web
+    tag: ""
+  port: 8080
+  # window.__CLOUDTRAIN_CONFIG__ (apps/web/src/lib/runtimeConfig.ts), rendered
+  # at container start: no rebuild per environment.
+  runtimeConfig:
+    # Origin of /api; empty = same origin (the route sends /api to the gateway).
+    apiBase: ""
+    environment: production
+  # Extra Content-Security-Policy sources (space-separated), e.g. a separate
+  # API origin in connect (https://api.example.com wss://api.example.com).
+  csp:
+    scriptSrc: ""
+    connectSrc: ""
+    imgSrc: ""
+    frameSrc: ""
+  resources:
+    requests: {cpu: 20m, memory: 32Mi}
+    limits: {memory: 128Mi}
+  service:
+    annotations: {}
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# -------------------------------------------------------------- orchestrator
+orchestrator:
+  enabled: true
+  image:
+    repository: lab-orchestrator
+    tag: ""
+  # Restrict the manager to one namespace ("" = all; vcluster host namespaces
+  # need all) and to sessions with these labels ("" = all). Only one manager may
+  # reconcile a session.
+  watchNamespace: ""
+  sessionSelector: ""
+  maxConcurrentReconciles: 8
+  provisionTimeout: ""
+  # VM root disks: persistent (CDI DataVolumes, hibernate keeps them) or ephemeral.
+  vmDisks: persistent
+  # StorageClass of learner homes, vcluster databases and VM disks ("" = default).
+  storageClass: ""
+  # RuntimeClass for lab container nodes (e.g. kata); "" = cluster default.
+  runtimeClass: ""
+  vclusterPodSecurity: baseline
+  catalog:
+    # Merge the OpenTofu overlay (terraform-ws:1.15 runs OpenTofu; Terraform,
+    # BUSL-1.1, is never published).
+    opentofu: true
+    # catalog-release.yaml of the release (images.yml artifact / release asset):
+    # every publishable ref pinned to ghcr.io/...@sha256. Paste its content here.
+    releaseOverlay: ""
+    # More overlays, merged last: {file-name.yaml: "<ImageCatalog YAML>"}.
+    overlays: {}
+  images:
+    # Prefix for unqualified catalog images (--image-registry).
+    registry: ""
+    # Registry rewrites (--image-mirror), e.g. GHCR to ACR:
+    #  - ghcr.io/thecorporatetractor/cloudtrain=myacr.azurecr.io/cloudtrain
+    #  - docker.io=mirror.gcr.io
+    mirrors: []
+    # Secrets in the sessions namespace lab pods pull with (--image-pull-secrets).
+    pullSecrets: []
+  extraArgs: []
+  resources:
+    requests: {cpu: 100m, memory: 128Mi}
+    limits: {memory: 512Mi}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# The sessions namespace (lab pods, VMs, LabSessions). Lab pods need privileged
+# Pod Security (net-init for wired labs; see docs/any-kubernetes.md 1.4).
+sessions:
+  createNamespace: true
+  podSecurity: privileged
+
+# Demo only: a single Postgres pod on an emptyDir (data is lost with the pod),
+# with the cloudtrain_owner/cloudtrain_app roles and generated passwords.
+# Production uses an external Postgres (gateway.existingSecret).
+postgres:
+  demo:
+    enabled: false
+    image: docker.io/library/postgres:18.6-alpine@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873
+
+networkPolicy:
+  # Allow traffic to gateway and web only from the ingress data plane namespace(s).
+  enabled: false
+  ingressNamespaceSelector: {}
+  #  matchLabels: {kubernetes.io/metadata.name: ingress-nginx}
+
+# Extra manifests rendered with the release (templated), e.g. GKE
+# HealthCheckPolicy/GCPBackendPolicy or Envoy Gateway BackendTrafficPolicy.
+extraObjects: []

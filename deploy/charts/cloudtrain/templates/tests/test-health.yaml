@@ -1,0 +1,29 @@
+{{- if .Values.gateway.enabled }}
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ include "ct.fullname" . }}-test-health
+  labels:
+    {{- include "ct.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: test
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  {{- include "ct.pullSecrets" . | nindent 2 }}
+  {{- include "ct.podSecurity" . | nindent 2 }}
+  containers:
+    # The gateway image's node: probe the gateway and the web app in-cluster.
+    - name: health
+      image: {{ include "ct.image" (list . .Values.gateway) }}
+      command: [/nodejs/bin/node, -e]
+      args:
+        - |
+          const urls = ['http://{{ include "ct.fullname" . }}-gateway:{{ .Values.gateway.port }}/readyz', 'http://{{ include "ct.fullname" . }}-gateway:{{ .Values.gateway.port }}/api/health'{{ if .Values.web.enabled }}, 'http://{{ include "ct.fullname" . }}-web:{{ .Values.web.port }}/healthz'{{ end }}];
+          (async () => { for (const u of urls) { const r = await fetch(u); console.log(r.status, u); if (!r.ok) process.exit(1); } })().catch((e) => { console.error(e); process.exit(1); });
+      {{- include "ct.containerSecurity" . | nindent 6 }}
+      resources:
+        requests: {cpu: 10m, memory: 32Mi}
+        limits: {memory: 128Mi}
+{{- end }}

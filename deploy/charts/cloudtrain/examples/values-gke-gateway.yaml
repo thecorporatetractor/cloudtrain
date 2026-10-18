@@ -1,0 +1,60 @@
+# GKE Gateway controller (Gateway API enabled on the cluster:
+#   gcloud container clusters update <c> --gateway-api=standard).
+# The chart creates a global external Application Load Balancer Gateway with an
+# HTTPS listener on the cert-manager Secret, plus GKE policies for the backends.
+host: labs.example.com
+global:
+  imageRegistry: europe-west4-docker.pkg.dev/my-project/ghcr/thecorporatetractor/cloudtrain
+exposure:
+  type: gatewayAPI
+  gatewayAPI:
+    createGateway: true
+    gatewayClassName: gke-l7-global-external-managed
+tls:
+  enabled: true
+  mode: certManager
+  certManager:
+    issuerRef: {name: letsencrypt, kind: ClusterIssuer}
+gateway:
+  existingSecret: cloudtrain-gateway
+  oidc:
+    issuer: https://keycloak.example.com/realms/cloudtrain
+  # Google front ends and health checkers (GKE Gateway proxies from these ranges).
+  trustProxy: "35.191.0.0/16,130.211.0.0/22"
+orchestrator:
+  storageClass: premium-rwo
+  images:
+    mirrors:
+      - ghcr.io=europe-west4-docker.pkg.dev/my-project/ghcr
+      - docker.io=europe-west4-docker.pkg.dev/my-project/docker-hub
+# The load balancer health-checks "/" by default; the gateway answers /healthz.
+# The backend timeout (default 30 s) would cut terminal WebSockets.
+extraObjects:
+  - apiVersion: networking.gke.io/v1
+    kind: HealthCheckPolicy
+    metadata:
+      name: '{{ include "ct.fullname" . }}-gateway'
+    spec:
+      default:
+        config:
+          type: HTTP
+          httpHealthCheck: {requestPath: /healthz, port: 8787}
+      targetRef: {group: "", kind: Service, name: '{{ include "ct.fullname" . }}-gateway'}
+  - apiVersion: networking.gke.io/v1
+    kind: HealthCheckPolicy
+    metadata:
+      name: '{{ include "ct.fullname" . }}-web'
+    spec:
+      default:
+        config:
+          type: HTTP
+          httpHealthCheck: {requestPath: /healthz, port: 8080}
+      targetRef: {group: "", kind: Service, name: '{{ include "ct.fullname" . }}-web'}
+  - apiVersion: networking.gke.io/v1
+    kind: GCPBackendPolicy
+    metadata:
+      name: '{{ include "ct.fullname" . }}-gateway'
+    spec:
+      default:
+        timeoutSec: 3600
+      targetRef: {group: "", kind: Service, name: '{{ include "ct.fullname" . }}-gateway'}

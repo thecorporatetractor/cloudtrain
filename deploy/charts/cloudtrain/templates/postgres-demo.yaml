@@ -1,0 +1,113 @@
+{{- if .Values.postgres.demo.enabled }}
+{{- /* DEMO ONLY: one Postgres pod, data on an emptyDir (lost with the pod). */}}
+{{- $name := printf "%s-postgres" (include "ct.fullname" .) }}
+{{- $prev := (lookup "v1" "Secret" .Release.Namespace $name).data | default dict }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "ct.labels" . | nindent 4 }}
+    app.kubernetes.io/component: postgres
+type: Opaque
+data:
+  superuser-password: {{ index $prev "superuser-password" | default (randAlphaNum 32 | b64enc) }}
+  owner-password: {{ index $prev "owner-password" | default (randAlphaNum 32 | b64enc) }}
+  app-password: {{ index $prev "app-password" | default (randAlphaNum 32 | b64enc) }}
+---
+# A Secret, not a ConfigMap: the script only reads the passwords from the
+# environment, but it is still credential handling.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $name }}-init
+  labels:
+    {{- include "ct.labels" . | nindent 4 }}
+    app.kubernetes.io/component: postgres
+type: Opaque
+stringData:
+  # The roles of deploy/dev/postgres/init.sql, with the generated passwords.
+  10-roles.sh: |
+    #!/bin/sh
+    set -eu
+    psql -v ON_ERROR_STOP=1 -v owner="$PG_OWNER_PASSWORD" -v app="$PG_APP_PASSWORD" --username postgres <<'SQL'
+    CREATE ROLE cloudtrain_owner LOGIN PASSWORD :'owner';
+    CREATE ROLE cloudtrain_app LOGIN PASSWORD :'app' NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE;
+    CREATE DATABASE cloudtrain OWNER cloudtrain_owner;
+    \connect cloudtrain
+    REVOKE ALL ON SCHEMA public FROM PUBLIC;
+    GRANT USAGE, CREATE ON SCHEMA public TO cloudtrain_owner;
+    GRANT USAGE ON SCHEMA public TO cloudtrain_app;
+    SQL
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "ct.labels" . | nindent 4 }}
+    app.kubernetes.io/component: postgres
+spec:
+  selector:
+    {{- include "ct.selector" (list . "postgres") | nindent 4 }}
+  ports:
+    - {name: postgres, port: 5432, targetPort: postgres}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "ct.labels" . | nindent 4 }}
+    app.kubernetes.io/component: postgres
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels:
+      {{- include "ct.selector" (list . "postgres") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "ct.labels" . | nindent 8 }}
+        app.kubernetes.io/component: postgres
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 70
+        runAsGroup: 70
+        fsGroup: 70
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: postgres
+          image: {{ .Values.postgres.demo.image }}
+          ports:
+            - {name: postgres, containerPort: 5432}
+          env:
+            - {name: PGDATA, value: /var/lib/postgresql/data/pgdata}
+            - name: POSTGRES_PASSWORD
+              valueFrom: {secretKeyRef: {name: {{ $name }}, key: superuser-password}}
+            - name: PG_OWNER_PASSWORD
+              valueFrom: {secretKeyRef: {name: {{ $name }}, key: owner-password}}
+            - name: PG_APP_PASSWORD
+              valueFrom: {secretKeyRef: {name: {{ $name }}, key: app-password}}
+          readinessProbe:
+            exec: {command: [pg_isready, -U, postgres, -d, cloudtrain]}
+            periodSeconds: 5
+          {{- include "ct.containerSecurity" . | nindent 10 }}
+          resources:
+            requests: {cpu: 50m, memory: 128Mi}
+            limits: {memory: 512Mi}
+          volumeMounts:
+            - {name: data, mountPath: /var/lib/postgresql/data}
+            - {name: run, mountPath: /var/run/postgresql}
+            - {name: tmp, mountPath: /tmp}
+            - {name: init, mountPath: /docker-entrypoint-initdb.d, readOnly: true}
+      volumes:
+        - {name: data, emptyDir: {}}
+        - {name: run, emptyDir: {}}
+        - {name: tmp, emptyDir: {}}
+        - name: init
+          secret: {secretName: {{ $name }}-init, defaultMode: 0555}
+{{- end }}

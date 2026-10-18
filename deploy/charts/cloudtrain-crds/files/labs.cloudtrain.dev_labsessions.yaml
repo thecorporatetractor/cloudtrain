@@ -1,0 +1,659 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.22.0
+  name: labsessions.labs.cloudtrain.dev
+spec:
+  group: labs.cloudtrain.dev
+  names:
+    categories:
+    - cloudtrain
+    kind: LabSession
+    listKind: LabSessionList
+    plural: labsessions
+    shortNames:
+    - ls
+    singular: labsession
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.templateRef.name
+      name: Template
+      type: string
+    - jsonPath: .spec.learner.id
+      name: Learner
+      type: string
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .status.expiresAt
+      name: Expires
+      type: date
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: 'LabSession is one learner attempt: a running instance of a LabTemplate.'
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: LabSessionSpec is one learner attempt at a lab.
+            properties:
+              accessRevoked:
+                description: |-
+                  AccessRevoked freezes the session for the learner (exam time is up):
+                  endpoints are withdrawn and the learner's processes on the entry node
+                  and the VM nodes are killed, while the nodes keep running so the
+                  session can still be graded (checks and admin actions are unaffected).
+                  It is sticky: once the AccessRevoked condition is True, clearing the
+                  field does not restore access.
+                type: boolean
+              expiresAt:
+                description: ExpiresAt overrides TTL with an absolute expiry.
+                format: date-time
+                type: string
+              hibernate:
+                description: |-
+                  Hibernate releases compute while keeping the session (drivers that
+                  support it stop their workloads; endpoints are withdrawn).
+                type: boolean
+              learner:
+                description: LearnerRef identifies the learner owning a session.
+                properties:
+                  id:
+                    description: ID is the stable learner id from the identity service.
+                    minLength: 1
+                    type: string
+                  org:
+                    type: string
+                required:
+                - id
+                type: object
+              resetGeneration:
+                description: |-
+                  ResetGeneration requests a lab reset: whenever it is raised above
+                  status.observedResetGeneration, every node is reset through its driver
+                  and the setup actions run again.
+                format: int64
+                minimum: 0
+                type: integer
+              seed:
+                description: Seed deterministically resolves the template's {{params}}.
+                format: int64
+                type: integer
+                x-kubernetes-validations:
+                - message: seed is immutable
+                  rule: self == oldSelf
+              templateRef:
+                description: TemplateReference points at a LabTemplate in the session's
+                  namespace.
+                properties:
+                  name:
+                    minLength: 1
+                    type: string
+                required:
+                - name
+                type: object
+                x-kubernetes-validations:
+                - message: templateRef is immutable
+                  rule: self == oldSelf
+              ttl:
+                description: |-
+                  TTL from creation after which the session expires. Defaults to twice
+                  the lab's estimatedMinutes (minimum 30m).
+                type: string
+              validateRequest:
+                description: |-
+                  ValidateRequest asks the controller to grade the session: every time
+                  it changes, the grader runs all checks once and publishes the result
+                  in status.validation with the same observedRequest.
+                format: int64
+                type: integer
+              warmPoolRef:
+                description: |-
+                  WarmPoolRef asks for a pre-provisioned session from the named WarmPool
+                  (same namespace and templateRef). On its first reconcile the session
+                  claims a Ready pooled session (optimistic update of its claimed-by
+                  label, so no pooled session is claimed twice) and from then on fronts
+                  it: status mirrors the pooled session (status.pooledSession), and
+                  learner, ttl/expiresAt, hibernate, resetGeneration and validateRequest
+                  are forwarded to it. The pooled session's seed decides the params
+                  (spec.seed is not used). Deleting this session deletes the pooled one.
+                  If the pool has no Ready session, the session is provisioned normally
+                  (condition Claimed=False, reason PoolExhausted).
+                type: string
+            required:
+            - learner
+            - seed
+            - templateRef
+            type: object
+          status:
+            description: LabSessionStatus is the observed state of a LabSession.
+            properties:
+              computedAnswers:
+                additionalProperties:
+                  type: string
+                description: |-
+                  ComputedAnswers are the expected values of answer checks with
+                  answer.compute (by check id), computed right after setup. Platform
+                  only: the gateway grades with them and never sends them to learners.
+                type: object
+              conditions:
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              endpoints:
+                description: Endpoints for access points of the session's nodes.
+                items:
+                  description: Endpoint is how the access gateway reaches one access
+                    point of a node.
+                  properties:
+                    access:
+                      description: AccessType is a way a learner reaches a node.
+                      enum:
+                      - shell
+                      - ssh
+                      - console
+                      - web
+                      - rdp
+                      type: string
+                    command:
+                      description: |-
+                        Command is the program the access gateway starts for a k8s-exec
+                        endpoint instead of a login shell, e.g. "vtysh" for a router console
+                        (whitespace-separated argv; empty = login shell).
+                      type: string
+                    host:
+                      description: Host is a DNS name or IP reachable from the access
+                        gateway.
+                      type: string
+                    node:
+                      type: string
+                    port:
+                      format: int32
+                      type: integer
+                    protocol:
+                      description: Protocol is e.g. "k8s-exec", "ssh", "http".
+                      type: string
+                    secretRef:
+                      description: |-
+                        SecretRef points at the credential for this endpoint (kubeconfig,
+                        password, private key) in the session's namespace.
+                      properties:
+                        key:
+                          type: string
+                        name:
+                          type: string
+                      required:
+                      - name
+                      type: object
+                    target:
+                      description: Target is protocol-specific, e.g. "namespace/pod/container"
+                        for k8s-exec.
+                      type: string
+                    url:
+                      type: string
+                  required:
+                  - access
+                  - node
+                  - protocol
+                  type: object
+                type: array
+              entryNode:
+                description: EntryNode is the node the learner's terminal opens on.
+                type: string
+              expiresAt:
+                format: date-time
+                type: string
+              hibernated:
+                type: boolean
+              links:
+                description: |-
+                  Links are the provisioned topology links (L2 segments), for the grader
+                  and the UI.
+                items:
+                  description: LinkStatus describes one provisioned topology link.
+                  properties:
+                    ends:
+                      items:
+                        description: LinkEndStatus is one end of a link.
+                        properties:
+                          address:
+                            description: Address in CIDR notation when AddressMode
+                              is "platform".
+                            type: string
+                          addressMode:
+                            description: |-
+                              AddressMode is "platform" (Address assigned by the platform), "lab"
+                              (configured by the lab: device config or setup) or "none" (no subnet).
+                            type: string
+                          interface:
+                            type: string
+                          node:
+                            type: string
+                        required:
+                        - addressMode
+                        - interface
+                        - node
+                        type: object
+                      type: array
+                    id:
+                      description: ID is "link-<index>" (index into topology.links).
+                      type: string
+                    impair:
+                      description: LinkImpairment is applied with tc netem.
+                      properties:
+                        latencyMs:
+                          format: int32
+                          type: integer
+                        lossPct:
+                          description: LossPct is a decimal percentage, e.g. "0.5".
+                          pattern: ^[0-9]+(\.[0-9]+)?$
+                          type: string
+                        mtu:
+                          format: int32
+                          type: integer
+                      type: object
+                    network:
+                      description: Network is the Multus NetworkAttachmentDefinition
+                        ("namespace/name").
+                      type: string
+                    segment:
+                      description: Segment is the Kube-OVN logical switch (Subnet)
+                        carrying the link.
+                      type: string
+                    subnet:
+                      description: Subnet is the lab subnet declared on the link,
+                        if any.
+                      type: string
+                  required:
+                  - ends
+                  - id
+                  - network
+                  - segment
+                  type: object
+                type: array
+              nodes:
+                items:
+                  description: NodeStatus is the observed state of one topology node.
+                  properties:
+                    details:
+                      additionalProperties:
+                        type: string
+                      description: |-
+                        Details are driver-reported facts about the node (addresses, cluster
+                        member states, ...) for the grader and other nodes.
+                      type: object
+                    driver:
+                      description: DriverName selects the NodeDriver that runs a topology
+                        node.
+                      enum:
+                      - container
+                      - vm
+                      - k8s-cluster
+                      - netdev
+                      type: string
+                    instanceID:
+                      description: |-
+                        InstanceID identifies the node's current backing instance (e.g. pod UID
+                        plus restart count). A change means the node was recreated from its
+                        image and setup must run again.
+                      type: string
+                    message:
+                      type: string
+                    name:
+                      type: string
+                    phase:
+                      description: NodePhase is the lifecycle phase of a single topology
+                        node.
+                      type: string
+                  required:
+                  - driver
+                  - name
+                  - phase
+                  type: object
+                type: array
+              observedGeneration:
+                format: int64
+                type: integer
+              observedResetGeneration:
+                description: ObservedResetGeneration is the last spec.resetGeneration
+                  acted upon.
+                format: int64
+                type: integer
+              phase:
+                description: LabSessionPhase is the coarse lifecycle phase of a LabSession.
+                enum:
+                - Pending
+                - Provisioning
+                - Ready
+                - Grading
+                - Hibernated
+                - Expired
+                - Failed
+                type: string
+              pooledSession:
+                description: |-
+                  PooledSession is the claimed pooled LabSession that actually runs
+                  this session's nodes (spec.warmPoolRef).
+                type: string
+              readyAt:
+                format: date-time
+                type: string
+              resolvedParams:
+                additionalProperties:
+                  type: string
+                description: ResolvedParams are the param values derived from spec.seed.
+                type: object
+              setupProgress:
+                description: |-
+                  SetupProgress is the number of setup actions completed so far; it is
+                  persisted after every action so retries resume instead of re-running.
+                format: int32
+                type: integer
+              topology:
+                description: |-
+                  Topology is the resolved topology the session's resources were
+                  provisioned from. It is recorded before anything is provisioned and
+                  drives teardown, so cleanup never depends on the live LabTemplate.
+                properties:
+                  entry:
+                    description: Entry is the node the learner's terminal opens on.
+                    type: string
+                  links:
+                    items:
+                      description: Link is an L2 wire between two node interfaces.
+                      properties:
+                        a:
+                          description: A is "node:interface".
+                          type: string
+                        b:
+                          type: string
+                        impair:
+                          description: LinkImpairment is applied with tc netem.
+                          properties:
+                            latencyMs:
+                              format: int32
+                              type: integer
+                            lossPct:
+                              description: LossPct is a decimal percentage, e.g. "0.5".
+                              pattern: ^[0-9]+(\.[0-9]+)?$
+                              type: string
+                            mtu:
+                              format: int32
+                              type: integer
+                          type: object
+                        subnet:
+                          type: string
+                      required:
+                      - a
+                      - b
+                      type: object
+                    type: array
+                  nodes:
+                    items:
+                      description: Node is a topology node run by a driver.
+                      properties:
+                        access:
+                          items:
+                            description: AccessType is a way a learner reaches a node.
+                            enum:
+                            - shell
+                            - ssh
+                            - console
+                            - web
+                            - rdp
+                            type: string
+                          type: array
+                        cluster:
+                          description: Cluster is only set for driver=k8s-cluster.
+                          properties:
+                            context:
+                              description: Context is the kubeconfig context name
+                                exposed on the entry node.
+                              type: string
+                            mode:
+                              description: ClusterMode of a k8s-cluster node.
+                              enum:
+                              - virtual
+                              - kubeadm
+                              type: string
+                            nodes:
+                              items:
+                                description: ClusterNode is a member of a kubeadm
+                                  cluster.
+                                properties:
+                                  labels:
+                                    additionalProperties:
+                                      type: string
+                                    type: object
+                                  name:
+                                    type: string
+                                  role:
+                                    description: ClusterNodeRole of a kubeadm cluster
+                                      member.
+                                    enum:
+                                    - control-plane
+                                    - worker
+                                    type: string
+                                  state:
+                                    description: ClusterNodeState is the initial state
+                                      of a kubeadm cluster member.
+                                    enum:
+                                    - ready
+                                    - notready
+                                    - unjoined
+                                    type: string
+                                  taints:
+                                    items:
+                                      type: string
+                                    type: array
+                                required:
+                                - name
+                                - role
+                                type: object
+                              type: array
+                            version:
+                              type: string
+                          type: object
+                        driver:
+                          description: DriverName selects the NodeDriver that runs
+                            a topology node.
+                          enum:
+                          - container
+                          - vm
+                          - k8s-cluster
+                          - netdev
+                          type: string
+                        image:
+                          description: Image is a catalog image ref, e.g. 'jumphost:1',
+                            'frr:10', 'kubeadm:1.35'.
+                          type: string
+                        learnerSudo:
+                          description: |-
+                            LearnerSudo (entry container node only, opt-in security trade-off)
+                            allows privilege escalation in the node container so setuid/setgid
+                            programs (sudo, crontab, passwd) work for the learner. Default false:
+                            allowPrivilegeEscalation is false and the learner cannot become root.
+                          type: boolean
+                        name:
+                          pattern: ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$
+                          type: string
+                        resources:
+                          description: NodeResources requested by a node.
+                          properties:
+                            cpu:
+                              anyOf:
+                              - type: integer
+                              - type: string
+                              pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                              x-kubernetes-int-or-string: true
+                            disks:
+                              description: |-
+                                Disks (vm nodes): sizes of extra blank data disks, e.g. ["2Gi", "2Gi"],
+                                attached as /dev/vdb, /dev/vdc, ... (serials ct-data1, ct-data2, ...).
+                              items:
+                                type: string
+                              maxItems: 6
+                              type: array
+                            memoryMiB:
+                              format: int64
+                              type: integer
+                          type: object
+                      required:
+                      - driver
+                      - name
+                      type: object
+                    minItems: 1
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - name
+                    x-kubernetes-list-type: map
+                required:
+                - nodes
+                type: object
+              validation:
+                description: Validation is the latest grading result.
+                properties:
+                  checks:
+                    items:
+                      description: CheckResult is the outcome of one check.
+                      properties:
+                        durationMs:
+                          format: int64
+                          type: integer
+                        id:
+                          type: string
+                        message:
+                          description: Message is a short learner-safe explanation
+                            (never the expected value).
+                          type: string
+                        output:
+                          description: Output is the check's raw output, truncated
+                            to 2 KiB, for authors.
+                          type: string
+                        passed:
+                          type: boolean
+                        skills:
+                          items:
+                            type: string
+                          type: array
+                        weight:
+                          description: Weight is a decimal, as in the template.
+                          type: string
+                      required:
+                      - id
+                      - passed
+                      type: object
+                    type: array
+                  completedAt:
+                    format: date-time
+                    type: string
+                  message:
+                    type: string
+                  observedRequest:
+                    description: ObservedRequest is the spec.validateRequest this
+                      result answers.
+                    format: int64
+                    type: integer
+                  phase:
+                    description: ValidationPhase is the state of one grading run.
+                    enum:
+                    - Running
+                    - Complete
+                    - Failed
+                    type: string
+                  score:
+                    description: Score is the weighted percentage of passed checks,
+                      0-100.
+                    format: int32
+                    type: integer
+                  startedAt:
+                    format: date-time
+                    type: string
+                required:
+                - observedRequest
+                - phase
+                - score
+                type: object
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

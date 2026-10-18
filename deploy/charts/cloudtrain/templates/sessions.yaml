@@ -1,0 +1,33 @@
+{{- $ns := .Values.gateway.sessionsNamespace }}
+{{- if and .Values.sessions.createNamespace (ne $ns .Release.Namespace) }}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ $ns }}
+  labels:
+    {{- include "ct.labels" . | nindent 4 }}
+    # Lab pods: privileged net-init for wired labs, user namespaces, procMount
+    # (docs/any-kubernetes.md 1.4). Platform pods do not run here.
+    pod-security.kubernetes.io/enforce: {{ .Values.sessions.podSecurity }}
+    pod-security.kubernetes.io/warn: {{ .Values.sessions.podSecurity }}
+  annotations:
+    # Keep the namespace (and running labs) on uninstall.
+    helm.sh/resource-policy: keep
+{{- end }}
+{{- if .Values.imagePullSecrets.create }}
+{{- $p := .Values.imagePullSecrets }}
+{{- $auth := dict "auths" (dict $p.registry (dict "username" $p.username "password" $p.password "auth" (printf "%s:%s" $p.username $p.password | b64enc))) | toJson | b64enc }}
+{{- range $target := uniq (list $.Release.Namespace $ns) }}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $p.name }}
+  namespace: {{ $target }}
+  labels:
+    {{- include "ct.labels" $ | nindent 4 }}
+type: kubernetes.io/dockerconfigjson
+data:
+  .dockerconfigjson: {{ $auth }}
+{{- end }}
+{{- end }}

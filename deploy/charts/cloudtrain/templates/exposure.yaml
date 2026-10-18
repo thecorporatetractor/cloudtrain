@@ -1,0 +1,146 @@
+{{- $fullname := include "ct.fullname" . }}
+{{- $e := .Values.exposure }}
+{{- $gw := printf "%s-gateway" $fullname }}
+{{- $web := printf "%s-web" $fullname }}
+{{- /* Routes: /api (REST and the terminal WebSocket) to the gateway, everything else to the web app. */}}
+{{- if eq $e.type "ingress" }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $fullname }}
+  labels:
+    {{- include "ct.labels" . | nindent 4 }}
+  {{- with $e.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with $e.ingress.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  {{- if and .Values.tls.enabled (ne .Values.tls.mode "external") }}
+  tls:
+    - hosts: [{{ .Values.host | quote }}]
+      secretName: {{ .Values.tls.secretName }}
+  {{- end }}
+  rules:
+    - host: {{ .Values.host | quote }}
+      http:
+        paths:
+          - path: /api
+            pathType: {{ $e.ingress.pathType }}
+            backend:
+              service: {name: {{ $gw }}, port: {name: http}}
+          - path: /
+            pathType: {{ $e.ingress.pathType }}
+            backend:
+              service: {name: {{ $web }}, port: {name: http}}
+{{- else if eq $e.type "gatewayAPI" }}
+{{- $g := $e.gatewayAPI }}
+{{- if $g.createGateway }}
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: {{ $fullname }}
+  labels:
+    {{- include "ct.labels" . | nindent 4 }}
+  {{- with $g.gatewayAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  gatewayClassName: {{ required "exposure.gatewayAPI.gatewayClassName is required with createGateway" $g.gatewayClassName }}
+  listeners:
+    {{- if and .Values.tls.enabled (ne .Values.tls.mode "external") }}
+    - name: https
+      protocol: HTTPS
+      port: 443
+      hostname: {{ .Values.host | quote }}
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - {kind: Secret, name: {{ .Values.tls.secretName }}}
+      allowedRoutes:
+        namespaces: {from: Same}
+    {{- end }}
+    - name: http
+      protocol: HTTP
+      port: 80
+      hostname: {{ .Values.host | quote }}
+      allowedRoutes:
+        namespaces: {from: Same}
+---
+{{- end }}
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: {{ $fullname }}
+  labels:
+    {{- include "ct.labels" . | nindent 4 }}
+  {{- with $g.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  parentRefs:
+    {{- if $g.parentRefs }}
+    {{- toYaml $g.parentRefs | nindent 4 }}
+    {{- else }}
+    - name: {{ $fullname }}
+      {{- if and .Values.tls.enabled (ne .Values.tls.mode "external") }}
+      sectionName: https
+      {{- else }}
+      sectionName: http
+      {{- end }}
+    {{- end }}
+  hostnames: [{{ .Values.host | quote }}]
+  rules:
+    - matches:
+        - path: {type: PathPrefix, value: /api}
+      backendRefs:
+        - {name: {{ $gw }}, port: {{ .Values.gateway.port }}}
+      {{- with $g.timeouts }}
+      timeouts:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    - matches:
+        - path: {type: PathPrefix, value: /}
+      backendRefs:
+        - {name: {{ $web }}, port: {{ .Values.web.port }}}
+{{- if and $g.createGateway .Values.tls.enabled (ne .Values.tls.mode "external") }}
+---
+# Plain HTTP on the chart's Gateway only redirects to HTTPS.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: {{ $fullname }}-https-redirect
+  labels:
+    {{- include "ct.labels" . | nindent 4 }}
+spec:
+  parentRefs:
+    - {name: {{ $fullname }}, sectionName: http}
+  hostnames: [{{ .Values.host | quote }}]
+  rules:
+    - filters:
+        - type: RequestRedirect
+          requestRedirect: {scheme: https, statusCode: 301}
+{{- end }}
+{{- end }}
+{{- if and .Values.tls.enabled (eq .Values.tls.mode "certManager") (ne $e.type "none") }}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ $fullname }}
+  labels:
+    {{- include "ct.labels" . | nindent 4 }}
+spec:
+  secretName: {{ .Values.tls.secretName }}
+  dnsNames: [{{ .Values.host | quote }}]
+  issuerRef:
+    {{- toYaml .Values.tls.certManager.issuerRef | nindent 4 }}
+{{- end }}
+{{- range .Values.extraObjects }}
+---
+{{ tpl (toYaml .) $ }}
+{{- end }}
