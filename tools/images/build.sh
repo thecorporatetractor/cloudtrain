@@ -30,7 +30,9 @@
 #   4. sparsify + compress, wrap as a KubeVirt containerDisk image
 #   5. optionally `kind load` it into the dev cluster (LOAD_INTO_KIND=1)
 #
-# Env: UPDATE_LOCK=1 re-resolves digests into the lock files; LOCK_ONLY=1 stops after
+# Env: DOCKERIO_MIRROR=<host> pulls the preloaded docker.io images through that mirror
+# (same digests; e.g. mirror.gcr.io where Docker Hub rate-limits anonymous pulls).
+# UPDATE_LOCK=1 re-resolves digests into the lock files; LOCK_ONLY=1 stops after
 # step 2 (with UPDATE_LOCK=1 that is `task image:lock`).
 source "$(dirname "$0")/../../deploy/scripts/lib.sh"
 need docker; need curl; need jq; need yq
@@ -289,6 +291,7 @@ KUBE_BENCH_VERSION=${KUBE_BENCH_VERSION}
 CONTAINERD_VERSION=${CONTAINERD_VERSION}
 KUBERNETES_CNI_VERSION=${KUBERNETES_CNI_VERSION}
 UBUNTU_APT_SNAPSHOT=${UBUNTU_APT_SNAPSHOT}
+DOCKERIO_MIRROR=${DOCKERIO_MIRROR:-}
 DOCKER_APT_KEY_FPR=${DOCKER_APT_KEY_FPR}
 DOCKER_CE_VERSION=${DOCKER_CE_VERSION}
 DOCKER_BUILDX_VERSION=${DOCKER_BUILDX_VERSION}

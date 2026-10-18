@@ -59,7 +59,7 @@ while read -r ref; do
   [ -n "$ref" ] || continue
   tagged=${ref%@*}; bydigest=${tagged%:*}@${ref#*@}
   for try in 1 2 3; do
-    ctr -n k8s.io images pull --platform linux/amd64 "$bydigest" >/dev/null && break
+    ctr -n k8s.io images pull "${CTR_HOSTS[@]}" --platform linux/amd64 "$bydigest" >/dev/null && break
     [ "$try" = 3 ] && { echo "pull failed: $bydigest"; exit 1; }; sleep 5
   done
   ctr -n k8s.io images tag --force "$bydigest" "$tagged" >/dev/null
@@ -71,6 +71,7 @@ ctr -n k8s.io images ls -q | grep -v '^sha256:' | sort | tee /opt/cloudtrain/ima
 sed 's/@.*//' "$B/addon-images.txt" | sort -u | comm -23 - /opt/cloudtrain/images/IMAGES | tee /tmp/missing
 [ ! -s /tmp/missing ]
 kill $CPID; wait $CPID || true
+rm -rf /tmp/ct-hosts
 
 sed -i "s/^CLOUDTRAIN_IMAGE_TAG=.*/CLOUDTRAIN_IMAGE_TAG=${CLOUDTRAIN_IMAGE_TAG}/; s/^CLOUDTRAIN_CATALOG_REF=.*/CLOUDTRAIN_CATALOG_REF=${CLOUDTRAIN_CATALOG_REF}/" /etc/cloudtrain-release
 cat >> /etc/cloudtrain-release <<R
