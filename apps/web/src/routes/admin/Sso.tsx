@@ -10,6 +10,7 @@ import { When } from '@/components/platform';
 import { Badge, Button, Card, Checkbox, ChipSelect, ConfirmDialog, Dialog, Drawer, EmptyState, ErrorState, Field, Input, PageSkeleton, Segmented, Switch, Textarea, Tooltip } from '@/components/ui';
 import { cn } from '@/lib/utils';
 import { adminSsoRoute } from '@/router';
+import { apiOrigin } from '@/lib/runtimeConfig';
 
 const ROLES: OrgRole[] = ['learner', 'manager', 'instructor', 'author', 'org_admin'];
 const statusMeta: Record<SsoStatus, { label: string; tone: 'ok' | 'neutral' | 'err' | 'warn' }> = { active: { label: 'Active', tone: 'ok' }, draft: { label: 'Draft', tone: 'neutral' }, error: { label: 'Error', tone: 'err' }, disabled: { label: 'Disabled', tone: 'warn' } };
@@ -299,7 +300,7 @@ function ConnectionDrawer({ id, connections, domains, onClose }: { id: string | 
                 </>
               )}
               <dt>Redirect URI</dt>
-              <dd className="truncate">{`${window.location.origin}/api/auth/callback`}</dd>
+              <dd className="truncate">{`${apiOrigin(window.location.origin)}/api/auth/callback`}</dd>
             </dl>
           </section>
 
@@ -468,7 +469,7 @@ function AddConnectionWizard({ open, onOpenChange, onCreated }: { open: boolean;
       {step === 1 && type === 'oidc' && (
         <div className="stack" style={{ gap: 12 }}>
           <div className="callout xs">
-            Register CloudTrain in your provider with redirect URI <span className="mono">{`${window.location.origin}/api/auth/callback`}</span> and a confidential client (code flow + PKCE).
+            Register CloudTrain in your provider with redirect URI <span className="mono">{`${apiOrigin(window.location.origin)}/api/auth/callback`}</span> and a confidential client (code flow + PKCE).
           </div>
           <Field label="Discovery URL" required hint="The .well-known/openid-configuration document.">
             {({ id, describedBy }) => <Input id={id} aria-describedby={describedBy} value={discoveryUrl} onChange={(e) => setDiscoveryUrl(e.target.value)} className="mono" />}
@@ -489,7 +490,7 @@ function AddConnectionWizard({ open, onOpenChange, onCreated }: { open: boolean;
       {step === 1 && type === 'saml' && (
         <div className="stack" style={{ gap: 12 }}>
           <div className="callout xs">
-            Service provider entity ID <span className="mono">{`${window.location.origin}/api/auth/saml`}</span> · ACS URL <span className="mono">{`${window.location.origin}/api/auth/callback`}</span>
+            Service provider entity ID <span className="mono">{`${apiOrigin(window.location.origin)}/api/auth/saml`}</span> · ACS URL <span className="mono">{`${apiOrigin(window.location.origin)}/api/auth/callback`}</span>
           </div>
           <Segmented<'url' | 'xml'> label="Metadata" value={metadataMode} onChange={setMetadataMode} options={[{ value: 'url', label: 'Metadata URL' }, { value: 'xml', label: 'Paste XML' }]} />
           {metadataMode === 'url' ? (

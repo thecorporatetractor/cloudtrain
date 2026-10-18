@@ -102,13 +102,16 @@ async function main() {
     logger: { level: config.logLevel },
     devImpersonate: config.devImpersonate,
     site: { config: site, exams: examCatalog, ratePerMinute: config.publicRatePerMinute },
+    trustProxy: config.trustProxy,
+    corsOrigins: config.corsOrigins,
+    readiness: { postgres: () => sql`SELECT 1`.execute(db) },
   });
   log = app.log;
   for (const i of examCatalog.issues) app.log.warn({ file: i.file }, `exams skipped: ${i.message}`);
   app.log.info({ exams: examCatalog.exams.size, available: [...examCatalog.exams.values()].filter((e) => e.availability === 'available').map((e) => e.def.id) }, 'exam catalog loaded');
 
   for (const i of content.issues) app.log.warn({ file: i.file }, `lab skipped: ${i.message}`);
-  app.log.info({ labs: content.labs.size, skills: content.skills.length, frameworks: content.frameworks.length, context: config.kubeContext, namespace: config.namespace }, 'content loaded');
+  app.log.info({ labs: content.labs.size, skills: content.skills.length, frameworks: content.frameworks.length, context: config.kubeContext, namespace: config.namespace, contentDir: config.contentDir }, 'content loaded');
   if (config.devImpersonate) app.log.warn({ publicUrl: config.publicUrl }, 'DEV ONLY: CT_DEV_IMPERSONATE=1, POST /api/dev/sign-in-as is enabled (loopback callers only)');
   app.log.info({ file: config.siteConfigFile, brand: site.brand.name, flags: site.flags }, 'public website config loaded');
   app.log.info({ issuer: config.oidc.issuer, publicUrl: config.publicUrl, webUrl: config.webUrl, platformIdps: config.platformIdps, domainVerifyBypass: config.devDomainVerifyBypass }, 'auth: OIDC (BFF)');

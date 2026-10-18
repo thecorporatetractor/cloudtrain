@@ -56,12 +56,15 @@ CT_EXTRA_LAB_DIRS=services/gateway/test/fixtures/labs task dev:gateway
 
 | Variable | Default | |
 |---|---|---|
-| `CT_HOST` / `CT_PORT` | `127.0.0.1` / `8787` | listen address |
-| `CT_KUBE_CONTEXT` | `kind-cloudtrain-dev` | kubeconfig context, selected in memory only; the kubeconfig's current-context is never changed |
+| `CT_HOST` / `CT_PORT` | `127.0.0.1` / `8787` | listen address (the container image: `0.0.0.0`) |
+| `CT_TRUST_PROXY` | `127.0.0.1` | proxies whose `X-Forwarded-*` headers are trusted: `true` or addresses/CIDRs of the Ingress/Gateway pods (hop counts are refused) |
+| `CT_CORS_ORIGINS` | off | web origins (comma-separated) allowed to call `/api` cross-origin with cookies, for a web app on another same-site origin |
+| `CT_KUBE_CONTEXT` | `kind-cloudtrain-dev`; `in-cluster` in a pod | kubeconfig context, selected in memory only; the kubeconfig's current-context is never changed. `in-cluster` uses the pod's ServiceAccount (the default when `KUBERNETES_SERVICE_HOST` is set) |
+| `CT_BASE_DIR` | repository root | base of the relative paths below |
 | `CT_NAMESPACE` | `cloudtrain-sessions` | namespace for LabTemplates and LabSessions (must exist) |
-| `CT_CONTENT_DIR` | `content` | content root |
+| `CT_CONTENT_DIR` | `content` | content root (image: `/opt/cloudtrain/content`, baked in; mount another directory to replace it) |
 | `CT_EXTRA_LAB_DIRS` | | extra lab directories (`:`-separated), e.g. test fixtures |
-| `CT_LABCTL` | `services/lab-orchestrator/bin/labctl` | Go compiler binary (`task gateway:labctl`) |
+| `CT_LABCTL` | `services/lab-orchestrator/bin/labctl` | Go compiler binary (`task gateway:labctl`; image: `/usr/local/bin/labctl`) |
 | `CT_VALIDATE_TIMEOUT_MS` | `60000` | how long `POST /validate` waits for the grader |
 | `CT_SESSION_TTL_MINUTES` | controller default | sets `spec.ttl` on new sessions |
 | `CT_LOG_LEVEL` | `info` | |
@@ -84,6 +87,17 @@ CT_EXTRA_LAB_DIRS=services/gateway/test/fixtures/labs task dev:gateway
 | `CT_PUBLIC_RATE_PER_MINUTE` | `120` | requests per minute one client address may make to `/api/public/*` (429 + `Retry-After` beyond) |
 
 Relative paths are relative to the repository root.
+
+## Container image
+
+`services/gateway/Dockerfile` (built, scanned and published to GHCR by
+`.github/workflows/images.yml`): distroless Node 22, non-root (65532), works on a
+read-only root filesystem (mount a writable `/tmp`), with `labctl` and `content/`
+baked in. Probes: `GET /healthz` (process up) and `GET /readyz` (labs loaded,
+Postgres answers within 2 s; 503 otherwise). Both live outside `/api`, so the
+Ingress, which routes only `/api` here, never exposes them.
+`node dist/db/cli.js migrate` applies the schema migrations (the Helm chart runs
+it as a hook). Deployment: [docs/deploy.md](../../docs/deploy.md).
 
 ## API
 
@@ -193,7 +207,7 @@ with session `<attempt>/t<index>`, hints 0, then the lab attempt is closed) and
 teams and cohorts). `MemoryExamStore` and `MemoryEvidenceSink` remain for unit
 tests.
 
-Settings: `CT_CURRICULUM_FILE` (default `content/curriculum.yaml`),
+Settings: `CT_CURRICULUM_FILE` (default `<CT_CONTENT_DIR>/curriculum.yaml`),
 `CT_EXTRA_EXAM_FILES` (e.g.
 `services/lab-orchestrator/testdata/exams/exams.yaml`, with
 `CT_EXTRA_LAB_DIRS=services/lab-orchestrator/testdata/exams/tasks`),

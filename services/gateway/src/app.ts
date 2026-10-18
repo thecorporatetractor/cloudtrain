@@ -1,8 +1,9 @@
-import Fastify, { type FastifyInstance } from 'fastify';
+import Fastify, { type FastifyInstance, type FastifyServerOptions } from 'fastify';
 import cookie from '@fastify/cookie';
 import websocket from '@fastify/websocket';
 import type { Lab, SiteConfig } from '@cloudtrain/api-types';
 import type { Authenticator } from './auth.js';
+import type { TrustProxy } from './config.js';
 import { can, forbidden } from './authz.js';
 import type { Content } from './content/load.js';
 import { learnerLab } from './content/view.js';
@@ -50,11 +51,42 @@ export interface AppDeps {
   hub?: TerminalHub;
   /** DEV ONLY: `POST /api/dev/sign-in-as` (CT_DEV_IMPERSONATE=1; needs `platform` and `oidc`). Absent = not registered. */
   devImpersonate?: boolean;
+  /** Fastify trustProxy (CT_TRUST_PROXY); default loopback. */
+  trustProxy?: TrustProxy;
+  /**
+   * Web origins allowed to call /api cross-origin with cookies (CT_CORS_ORIGINS), for a
+   * web app served from another same-site origin. Empty (default) = same-origin only.
+   */
+  corsOrigins?: string[];
+  /** Readiness checks for GET /readyz (e.g. Postgres); each resolves or throws. */
+  readiness?: Record<string, () => Promise<unknown>>;
   /**
    * The public website (`/api/public/*`, no sign-in): site configuration plus the read-only
    * catalog from content/ and the exam catalog. Omitted = not served.
    */
   site?: { config: SiteConfig; exams?: ExamCatalog; ratePerMinute?: number };
+}
+
+/** Each readiness check must answer within this time, or the pod reports not ready. */
+export const READINESS_TIMEOUT_MS = 2_000;
+
+/** Runs every readiness check with a timeout; ok only when all of them pass. */
+export async function runReadiness(checks: Record<string, () => Promise<unknown>>, timeoutMs = READINESS_TIMEOUT_MS): Promise<{ ok: boolean; checks: Record<string, 'ok' | string> }> {
+  const out: Record<string, 'ok' | string> = {};
+  await Promise.all(
+    Object.entries(checks).map(async ([name, check]) => {
+      let timer: NodeJS.Timeout | undefined;
+      try {
+        await Promise.race([check(), new Promise((_, reject) => (timer = setTimeout(() => reject(new Error(`timed out after ${timeoutMs} ms`)), timeoutMs)))]);
+        out[name] = 'ok';
+      } catch (e) {
+        out[name] = (e as Error).message || 'failed';
+      } finally {
+        clearTimeout(timer);
+      }
+    }),
+  );
+  return { ok: Object.values(out).every((v) => v === 'ok'), checks: out };
 }
 
 /** onRoute hook: an /api route without `config.permission` or `config.public` is a startup error. */
@@ -74,7 +106,8 @@ const UNSAFE = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   const { content, auth, sessions, cluster, platform: ps } = deps;
   const hub = deps.hub ?? new TerminalHub();
-  const app = Fastify({ logger: deps.logger ?? false, trustProxy: '127.0.0.1' });
+  const options: FastifyServerOptions = { logger: deps.logger ?? false, trustProxy: deps.trustProxy ?? '127.0.0.1' };
+  const app: FastifyInstance = Fastify(options);
   // Fail at startup, not at request time: every /api route must declare a permission or be public.
   app.addHook('onRoute', requireDeclaredPermission);
   // Every response is per-user API data or a download: never sniffed, never cached.
@@ -82,6 +115,27 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     reply.header('x-content-type-options', 'nosniff');
     if (!reply.hasHeader('cache-control')) reply.header('cache-control', 'no-store');
   });
+  const cors = new Set(deps.corsOrigins ?? []);
+  if (cors.size) {
+    // Credentialed CORS for the listed origins only (never a wildcard). The CSRF header
+    // still applies; SameSite=Lax cookies only flow between same-site origins.
+    // The allowed value is the configured origin itself, never the request header.
+    const allowed = (origin: string | undefined) => [...cors].find((o) => o === origin);
+    app.addHook('onRequest', async (req, reply) => {
+      const origin = allowed(req.headers.origin);
+      if (!origin || !req.url.startsWith('/api/')) return;
+      reply.header('access-control-allow-origin', origin);
+      reply.header('access-control-allow-credentials', 'true');
+      reply.header('vary', 'Origin');
+    });
+    app.options('/api/*', { config: { public: true } }, async (req, reply) => {
+      if (!allowed(req.headers.origin)) return reply.code(403).send({ error: 'Origin not allowed', code: 'forbidden' });
+      reply.header('access-control-allow-methods', 'GET, POST, PUT, PATCH, DELETE');
+      reply.header('access-control-allow-headers', `content-type, ${CSRF_HEADER}`);
+      reply.header('access-control-max-age', '600');
+      return reply.code(204).send();
+    });
+  }
   await app.register(cookie);
   await app.register(websocket, { options: { maxPayload: 1 << 20 } });
   app.addContentTypeParser('application/x-www-form-urlencoded', { parseAs: 'string' }, (_req, body, done) => done(null, Object.fromEntries(new URLSearchParams(body as string))));
@@ -132,6 +186,17 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   });
 
   app.get('/api/health', { config: { public: true } }, async () => ({ ok: true, labs: content.labs.size, contentIssues: content.issues.length, platform: !!ps }));
+  // Kubernetes probes, outside /api so the Ingress/HTTPRoute (which routes /api only) never
+  // exposes them. Liveness: the process answers. Readiness: content loaded and every
+  // dependency check (Postgres) passes; details are only check names and error messages.
+  app.get('/healthz', { config: { public: true }, logLevel: 'warn' }, async () => ({ ok: true }));
+  app.get('/readyz', { config: { public: true }, logLevel: 'warn' }, async (_req, reply) => {
+    const loaded = async () => {
+      if (content.labs.size === 0) throw new Error('no labs loaded');
+    };
+    const r = await runReadiness({ content: loaded, ...(deps.readiness ?? {}) });
+    return reply.code(r.ok ? 200 : 503).send(r);
+  });
 
   const run = { config: { permission: 'lab.run' as const } };
   const self = { config: { permission: 'progress.read.self' as const } };

@@ -18,6 +18,7 @@ import type {
   StudioDraft,
   ValidateResponse,
 } from './types';
+import { apiCredentials, apiUrl } from '@/lib/runtimeConfig';
 
 export class ApiError extends Error {
   constructor(
@@ -42,7 +43,7 @@ export const setCsrfToken = (t: string | undefined) => (csrfToken = t);
 export async function request<T>(url: string, init?: RequestInit): Promise<T> {
   const method = (init?.method ?? 'GET').toUpperCase();
   const mutating = method !== 'GET' && method !== 'HEAD';
-  const res = await fetch(url, { ...init, headers: { 'content-type': 'application/json', ...(mutating && csrfToken ? { 'x-csrf-token': csrfToken } : {}), ...(init?.headers ?? {}) } });
+  const res = await fetch(apiUrl(url), { credentials: apiCredentials(), ...init, headers: { 'content-type': 'application/json', ...(mutating && csrfToken ? { 'x-csrf-token': csrfToken } : {}), ...(init?.headers ?? {}) } });
   if (!res.ok) {
     let message = res.statusText || 'Request failed';
     let code: ErrorCode | undefined;

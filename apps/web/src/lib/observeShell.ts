@@ -1,4 +1,5 @@
 import type { IDisposable, Terminal } from '@xterm/xterm';
+import { wsUrl } from './runtimeConfig';
 
 /**
  * Read-only mirror of a learner's terminal for instructors:
@@ -30,8 +31,7 @@ export class ObserveShell {
     const { sessionId, onState } = this.opts;
     onState?.('connecting');
     const q = new URLSearchParams({ observe: '1', cols: String(this.term.cols), rows: String(this.term.rows) });
-    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-    const ws = new WebSocket(`${proto}://${location.host}/api/sessions/${encodeURIComponent(sessionId)}/terminal?${q}`);
+    const ws = new WebSocket(wsUrl(`/api/sessions/${encodeURIComponent(sessionId)}/terminal?${q}`, location));
     ws.binaryType = 'arraybuffer';
     this.ws = ws;
     let ended = false;

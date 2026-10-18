@@ -61,6 +61,7 @@ import type {
   VerifyDomainResponse,
 } from './types';
 import { del, patch, post, put, request } from './client';
+import { apiCredentials, apiUrl } from '@/lib/runtimeConfig';
 
 const qs = (params: Record<string, string | number | boolean | undefined | null>) => {
   const u = new URLSearchParams();
@@ -358,7 +359,7 @@ export function useObserveRegistration() {
 
 /** Download a CSV endpoint through the session cookie (an `<a download>` would skip the CSRF-free GET just fine, but we want errors surfaced). */
 export async function downloadCsv(url: string, filename: string) {
-  const res = await fetch(url);
+  const res = await fetch(apiUrl(url), { credentials: apiCredentials() });
   if (!res.ok) {
     let message = res.statusText;
     try {

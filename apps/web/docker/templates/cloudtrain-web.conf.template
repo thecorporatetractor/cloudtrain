@@ -1,0 +1,50 @@
+# Rendered by the nginx image's entrypoint (envsubst of CT_* variables only) to
+# /tmp/cloudtrain-web.conf (the CSP to /tmp/cloudtrain-csp.conf). Every location that sets its own add_header must
+# include security-headers.conf again: nginx does not inherit add_header into a
+# location that has any.
+server {
+  listen ${CT_WEB_PORT};
+  root /usr/share/nginx/html;
+  index index.html;
+
+  include /etc/nginx/cloudtrain/security-headers.conf;
+  include /tmp/cloudtrain-csp.conf;
+
+  # Probes (not routed by the Ingress, which sends /api to the gateway and the rest here).
+  location = /healthz {
+    access_log off;
+    default_type text/plain;
+    return 200 "ok\n";
+  }
+
+  # Per-environment settings for the browser (src/lib/runtimeConfig.ts).
+  location = /runtime-config.js {
+    alias /tmp/runtime-config.js;
+    default_type application/javascript;
+    include /etc/nginx/cloudtrain/security-headers.conf;
+    include /tmp/cloudtrain-csp.conf;
+    add_header Cache-Control "no-cache" always;
+  }
+
+  # Content-hashed bundles: cache for a year.
+  location /assets/ {
+    include /etc/nginx/cloudtrain/security-headers.conf;
+    include /tmp/cloudtrain-csp.conf;
+    add_header Cache-Control "public, max-age=31536000, immutable" always;
+    try_files $uri =404;
+  }
+
+  # The gateway owns /api; if a request still lands here, answer like it does.
+  location /api/ {
+    default_type application/json;
+    return 404 '{"error":"Not found","code":"not_found"}';
+  }
+
+  # Single-page app: unknown paths get index.html, never cached.
+  location / {
+    include /etc/nginx/cloudtrain/security-headers.conf;
+    include /tmp/cloudtrain-csp.conf;
+    add_header Cache-Control "no-cache" always;
+    try_files $uri $uri/ /index.html;
+  }
+}
