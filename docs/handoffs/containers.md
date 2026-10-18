@@ -303,6 +303,63 @@ All 23 are marked built (never run live). Courses added to `pack.yaml` mirror th
 ### Verify queue
 Wave 3 after waves 1 and 2: Compose labs first (`ctr-compose-first-stack` onward), then storage and basic networking, then the namespace-based firewall labs, `ctr-net-mtu-hang`, `ctr-containerd-store-migration`; `ctr-macvlan-encoder` last (blocked).
 
+## Round 5 closing handoff (2026-10-18)
+
+State at the end of round 5. Everything below is `built` (static checks only: lab-verify --strict, schema, render --check, exam compile); nothing from waves 1 to 4 has run live. Verified live remains the original 24 (12 learning, 12 exam tasks).
+
+| Wave | PR | Built | State |
+|---|---|---|---|
+| 1 | #58 | 23 (12 xcd tasks, 11 learning) | merged |
+| 2 | #63 | 21 (16 xct Podman tasks, 5 learning) | merged |
+| 3 | #87 | 23 (Compose, networking, storage), commit 397395c | merged |
+| 4 | #114 | 25 (registries, security, supply chain, 4 xpe tasks) | NOT merged: review round 3 not approved |
+
+Pools: sim-containers-docker and sim-containers-podman are at 2x their draw. The sim-platform-engineer containers-delivery pool is 4/2 once #114 merges.
+
+### Unmerged: PR #114 (wave 4)
+
+Static gates pass (lab-verify --strict 0 errors, 0 warnings); the open review findings are content bugs to fix before merge:
+
+- Blocker: `xpe-image-slim-fix` exec-form check uses `test("sh$")`, which matches the solution's own `ENTRYPOINT ["/printer.sh"]`; solution and alternative both fail.
+- Major: `xpe-image-build-push` reads the digest with `buildx imagetools` against a registry whose CA is trusted only in `/etc/docker/certs.d`; imagetools likely ignores that, so `digest.txt` is empty.
+- Major: `ctr-notation-sign-verify` alternative `trustedIdentities` names the CA subject instead of the leaf and lacks C/ST/O.
+- Major: `ctr-notation-sign-verify` and `ctr-signed-only-gate` create CA certs without keyUsage `keyCertSign`, which notation rejects.
+- Major: `ctr-content-trust-retired` kept-content-trust mutation pulls by digest, which skips the content-trust lookup, so the misconception is not caught.
+- Minor: unused params (`tag` in `ctr-remote-engine-ssh`, `rel` in `ctr-content-trust-retired`); possible Ubuntu 24.04 AppArmor userns block for `ctr-rootless-engine`; fixed /tmp log path in the gate; weak risk-note check in `ctr-socket-escape`.
+
+### Blockers per lab (all written and marked built)
+
+| Lab | Wave | Blocker |
+|---|---|---|
+| `ctr-buildx-cache-export` | 1 | needs `moby/buildkit:v0.23.2` preloaded |
+| `xcd-build-multistage-nonroot` | 1 | needs `golang:1.25-alpine` preloaded |
+| `xcd-supply-sbom-sign` | 1 | no cosign, no buildkit-syft-scanner image; keep out of live draws |
+| `ctr-reproducible-build` | 1 | `rewrite-timestamps` unconfirmed; confirm offline `FROM tag@digest` |
+| `ctr-digest-pin` | 1 | unconfirmed BuildKit pull from plain-HTTP mirror |
+| `ctr-macvlan-encoder` | 3 | needs a second NIC on a Multus L2 segment shared with a `nettools:1` studio host |
+| `ctr-nftables-backend` | 3 | nftables backend experimental in Engine 29; confirm table/chain names |
+| `ctr-image-mount-models` | 3 | confirm image mount options (readonly, image-subpath) on 29.x |
+| `ctr-compose-oci-publish` | 3 | `docker compose publish` against plain-HTTP localhost registry may need insecure-registry |
+| `ctr-containerd-store-migration` | 3 | depends on save/load between stores, `image inspect --platform`, imagetools against localhost:5000; disk heavy |
+| `ctr-scan-triage-vex`, `ctr-scout-policy` | 4 | no trivy/grype/scout, no offline vulnerability DB |
+| `ctr-cosign-sign-verify`, `ctr-content-trust-retired`, `xpe-image-sign-verify` | 4 | no cosign on docker-vm:29 (handoff pins cosign v2) |
+| `ctr-notation-sign-verify`, `ctr-signed-only-gate` | 4 | no notation CLI on docker-vm:29 |
+| wave 2 labs | 2 | unconfirmed items listed in the wave 2 section (kube play secrets, Quadlet at boot, oci-archive load, keep-id) |
+
+### Verify queue by slot kind
+
+Every containers lab is a `jumphost:1` workstation pod plus one `docker-vm:29` KubeVirt VM (wave 2: `el-vm:10` plus a `docker-vm:29` registry VM), so the whole domain uses the vm slot, one `labctl verify` at a time. No kubeadm or netdev labs.
+
+- pod: none.
+- vm, ready to verify: wave 1 minus 5 blocked (18 labs; xcd tasks first, then learning labs), wave 2 (21; learning labs first, after confirming Podman on `el-vm:10`), wave 3 minus the 5 blocked (18; Compose labs first, then storage and basic networking, then namespace firewall labs and `ctr-net-mtu-hang`), wave 4 after #114 is fixed and merged (18 of 25 not image-blocked).
+- kubeadm: none.
+- netdev: none.
+- Kata-blocked: none individually. The tier-B Kata `dockerd:29` variants are not built, so every lab runs as tier C (VM) only.
+- image-blocked (verify only after the docker-vm rebuild or tool install): `ctr-buildx-cache-export`, `xcd-build-multistage-nonroot`, `xcd-supply-sbom-sign`, `ctr-scan-triage-vex`, `ctr-scout-policy`, `ctr-cosign-sign-verify`, `ctr-content-trust-retired`, `xpe-image-sign-verify`, `ctr-notation-sign-verify`, `ctr-signed-only-gate`.
+- infra-blocked: `ctr-macvlan-encoder` (second NIC).
+- unconfirmed-behaviour, verify last: the remaining wave 1 and 3 items in the table above.
+- Exam reboot pass of `sim-containers-docker` and `sim-containers-podman` is not part of `labctl verify`.
+
 ## Open questions for the user
 
 - Drop the legacy Docker-cert overlay path (`dca-legacy` refs stay on the labs until
