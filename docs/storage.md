@@ -26,13 +26,13 @@ class.
 | `--storage-class` | empty | Class for everything; empty = cluster default class |
 | `--home-storage-class` | empty | Override for homes and vcluster databases |
 | `--vm-disk-storage-class` | empty | Override for VM disks |
-| `--vm-disk-volume-mode` | empty | `Block` or `Filesystem`; empty = the class's CDI StorageProfile decides (Block where the class supports it) |
+| `--vm-disk-volume-mode` | empty | `Block` or `Filesystem`; empty = the class's CDI StorageProfile decides (the first claim property set matching the access modes, e.g. Block on EBS/PD/Azure Disk, Filesystem on local-path; Filesystem when the profile is empty) |
 | `--vm-disk-access-modes` | `ReadWriteOnce` | A VM disk is mounted by one VM, so RWO works on every class |
 | `--storage-preflight` | `warn` | Startup check: `warn` logs, `strict` exits when a configured class is missing, `off` skips |
 
 Preflight: every class named by a flag must exist; if a volume type relies on
 the cluster default and no class is marked default, the manager logs a warning
-(PVCs would stay Pending). It needs `get,list` on `storage.k8s.io/storageclasses`
+(PVCs would stay Pending). It needs `list` on `storage.k8s.io/storageclasses`
 (in the shipped ClusterRole); without it the check is skipped with a warning.
 
 All PVCs use the class's own binding mode, so `WaitForFirstConsumer` classes work
@@ -49,9 +49,10 @@ as before.
 ## Per-provider examples
 
 ```
-# AKS (Azure Disk CSI)
+# AKS (Azure Disk CSI; managed-csi is built in, the class named `default` is the default)
 --storage-class=managed-csi --vm-disk-volume-mode=Block
-# EKS (EBS CSI, gp3)
+# EKS (EBS CSI add-on; create a gp3 class with provisioner ebs.csi.aws.com, the
+# built-in gp2 class is in-tree and, on recent EKS versions, not marked default)
 --storage-class=gp3 --vm-disk-volume-mode=Block
 # GKE (PD CSI, WaitForFirstConsumer)
 --storage-class=standard-rwo --vm-disk-volume-mode=Block
@@ -62,5 +63,5 @@ as before.
 
 Also set the CDI CR's `scratchSpaceStorageClass` if the default class cannot
 provide scratch space. Block mode needs a CSI driver with raw block support
-(Azure Disk, EBS, PD do; vSphere CSI block is RWO only, so Filesystem is the safe
-choice there).
+(Azure Disk, EBS and PD do). On vSphere CSI use Filesystem: raw block support
+depends on the driver version and flavor, Filesystem works everywhere.

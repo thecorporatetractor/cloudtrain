@@ -183,7 +183,10 @@ func main() {
 		if vmDisks == "persistent" {
 			want["VM disks"] = firstNonEmpty(vmDiskStorageClass, storageClass)
 		}
-		for _, f := range drivers.CheckStorage(context.Background(), direct, want) {
+		pctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		findings := drivers.CheckStorage(pctx, direct, want)
+		cancel()
+		for _, f := range findings {
 			if f.Fatal && storagePreflight == "strict" {
 				log.Error(nil, f.Message)
 				os.Exit(1)

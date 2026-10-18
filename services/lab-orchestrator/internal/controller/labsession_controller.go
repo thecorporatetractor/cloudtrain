@@ -125,7 +125,7 @@ type LabSessionReconciler struct {
 // +kubebuilder:rbac:groups="",resources=pods/exec,verbs=create
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list
 // Storage preflight at startup: the configured or default StorageClass must exist.
-// +kubebuilder:rbac:groups=storage.k8s.io,resources=storageclasses,verbs=get;list
+// +kubebuilder:rbac:groups=storage.k8s.io,resources=storageclasses,verbs=list
 // +kubebuilder:rbac:groups=node.k8s.io,resources=runtimeclasses,verbs=get
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch

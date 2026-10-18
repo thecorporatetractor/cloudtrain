@@ -6,8 +6,11 @@ import (
 
 	storagev1 "k8s.io/api/storage/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	labsv1 "github.com/cloudtrain/cloudtrain/services/lab-orchestrator/api/v1alpha1"
 )
 
 func scs(def bool, names ...string) *fake.ClientBuilder {
@@ -88,8 +91,41 @@ func TestRuntimeStorageClassPrecedence(t *testing.T) {
 	if rt.Container.HomeStorageClass != "homes" {
 		t.Fatalf("home class %q", rt.Container.HomeStorageClass)
 	}
-	rt, _ = NewRuntime(RuntimeOptions{StorageClass: "base"})
+	vmd, _ := rt.Registry.Get(labsv1.DriverVM)
+	if c := vmd.(*VMDriver).Disks.StorageClass; c != "base" {
+		t.Fatalf("VM disks fall back to --storage-class, got %q", c)
+	}
+	cd, _ := rt.Registry.Get(labsv1.DriverK8sCluster)
+	if c := cd.(*ClusterDriver).Virtual.(*VClusterDriver).StorageClass; c != "homes" {
+		t.Fatalf("vcluster class follows the home class, got %q", c)
+	}
+	rt, _ = NewRuntime(RuntimeOptions{StorageClass: "base", VMDisks: VMDiskOptions{StorageClass: "disks"}})
 	if rt.Container.HomeStorageClass != "base" {
 		t.Fatalf("home class falls back to the default, got %q", rt.Container.HomeStorageClass)
+	}
+	vmd, _ = rt.Registry.Get(labsv1.DriverVM)
+	if c := vmd.(*VMDriver).Disks.StorageClass; c != "disks" {
+		t.Fatalf("--vm-disk-storage-class overrides --storage-class, got %q", c)
+	}
+}
+
+// The persistent root and data disk DataVolumes leave volumeMode and class to
+// the cluster unless configured (they used to force Filesystem).
+func TestBuildVMDiskStorageFollowsCluster(t *testing.T) {
+	s := &labsv1.LabSession{ObjectMeta: metav1.ObjectMeta{Name: "s", Namespace: "labs"}}
+	vm := buildVM(s, NewLabNet(s), vmSpec{Name: "vm", Image: "img", CISecret: "ci", ExtraDisks: []string{"2Gi"},
+		Disk: VMDiskOptions{Persistent: true}})
+	dvs, _, _ := unstructured.NestedSlice(vm.Object, "spec", "dataVolumeTemplates")
+	if len(dvs) != 2 {
+		t.Fatalf("dvs %d", len(dvs))
+	}
+	for _, dv := range dvs {
+		st := dv.(map[string]any)["spec"].(map[string]any)["storage"].(map[string]any)
+		if _, ok := st["volumeMode"]; ok {
+			t.Fatalf("volumeMode set: %v", st)
+		}
+		if _, ok := st["storageClassName"]; ok {
+			t.Fatalf("storageClassName set: %v", st)
+		}
 	}
 }
