@@ -30,8 +30,8 @@ async function main() {
 }
 
 main().catch((e: unknown) => {
-  // Fixed texts only: nothing read from the environment can end up in the output.
-  if (e instanceof StripeError) console.error(`stripe:sync failed: Stripe answered ${e.status}${e.code ? ` (${e.code})` : ''}`);
+  // Fixed texts only: nothing read from the environment or from Stripe's answer is echoed.
+  if (e instanceof StripeError) console.error('stripe:sync failed: Stripe refused a request (check the key, STRIPE_MODE and the plan configuration; the dashboard log has the details)');
   else if (e instanceof Error && /STRIPE_SECRET_KEY|STRIPE_MODE/.test(e.message)) console.error('stripe:sync refused: STRIPE_SECRET_KEY must be a test-mode key and STRIPE_MODE must be test');
   else if (e instanceof Error && /site config/.test(e.message)) console.error('stripe:sync failed: the site configuration is invalid (run lab-verify for details)');
   else console.error('stripe:sync failed');
