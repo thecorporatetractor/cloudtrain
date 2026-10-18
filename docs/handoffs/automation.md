@@ -229,23 +229,28 @@ ov-devcontainer-workflow (code-server + web proxy).
 
 ## Round 5, wave 3 (write-only, PR #126 NOT merged)
 
-PR #126 (`content/automation-r5-w3`, head 7502eb7): 21 labs, all `built` (none verified, none
+PR #126 (`content/automation-r5-w3`, head 1aef53b): 21 labs, all `built` (none verified, none
 run live): 12 runnable VM labs, 9 blocked (setup stops with a clear "blocked:" message; the
 blocker is in each lab's curriculum notes). None of the labs exist on PR #84's branch. Static
-gates pass (lab-verify --strict 0 errors and warnings, render --check clean); the three
-required GitHub checks (including the go labs job) were still running at review time, none
-failed. Round-3 review verdict: not approved until two majors are fixed.
+review of head 1aef53b (all 21 labs, curriculum, pack.yaml): not approved, two majors remain
+(below). `render --check` passes; `lab-verify --strict` could not run in the reviewer's checkout
+(stale local lab-schema build), so CI decides. CI checks were still pending at review time.
+Round-3 fixes confirmed: the backup-restore git reads now run as learner (the earlier root
+`safe.directory=*` security finding is gone), the srlinux trunk peer, the EE rsync install and
+the EDA `set -eu` after the blocked guard.
 
 Majors to fix before merge:
 
 | Lab | Major |
 |---|---|
-| ov-net-parse-neighbors | the failures-ignored mutation is not caught: with `ignore_errors` Ansible still prints `failed:`/`fatal: [host]` lines, and the `reported` check reads failed hosts from those lines instead of the PLAY RECAP, so its expectFail fails at live verify |
-| ov-net-config-backup-restore | security: the backup-commit check runs git as root with `safe.directory=*` on the learner-owned bare repo; a repo-configured `gpg.program` runs under `log.showSignature` during `git log --format=%s`, so the learner can run code as root on ov-ctl. Run the check as the learner or drop root and `safe.directory=*` |
+| ov-net-parse-neighbors | the `reported` check scrapes `fatal:`/`failed: [host]` lines, which Ansible prints even for ignored failures, so the failures-ignored mutation is not caught and a learner using `ignore_errors` passes. Read the failing hosts from PLAY RECAP |
+| ov-block-rescue-db-maintenance | a playbook that only appends a `status=rolled-back` line passes every check: service and schema already pass at start and nothing proves the migration or block/rescue/always ran. Have ov-schema-apply record each call and add a check on the service restart timestamp or a structure check |
 
-Minors: rsync install guard in the EE setup, two gaps in what the async lab grades, the EDA lab
-has no playbook-run check (not noted in the curriculum), os-family file mode, template lab's
-template file pick.
+Minors: ov-net-inventory-facts (files must drop changing fields such as uptimes and counters to
+pass the re-run, but neither the description nor the hints say so, and hint 2 points the other
+way); ov-net-ospf-branch-config (the "only another host_vars file" requirement is not graded);
+ov-system-role-timesync (the uses-role scan stops at the first `include_role` task, so a play
+that includes another role first is graded as not using timesync).
 
 Runnable VM labs (el-vm:10 fleets with `ansible-ctl:2.21`; conditionals-os-family also uses
 ubuntu-vm:24.04): ov-conditionals-os-family, ov-handlers-web-reload, ov-template-claims-vhost,
@@ -272,7 +277,7 @@ Blockers per lab:
 - **netdev**, **kubeadm**, **Kata**: none.
 - **image-blocked**: ov-devcontainer-workflow (code-server + web proxy, PR #84); ov-system-role-timesync and the xan roles timesync/selinux tasks (`fedora.linux_system_roles`); ov-execution-environment-build (EE/registry images); the 6 `ov-net-*` labs (frr:10 SSH/python3/account, SR Linux image); ov-eda-webhook-rulebook (ansible-rulebook + JDK).
 
-Unmerged PRs: #84 (wave 2, 23 pod labs), #126 (wave 3, 21 labs, two majors).
+Unmerged PRs: #84 (wave 2, 23 pod labs), #126 (wave 3, 21 labs, not approved: two majors, three minors).
 
 ## Next steps
 
