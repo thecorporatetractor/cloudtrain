@@ -278,12 +278,22 @@ cycle() { # cycle [ids]
 }
 
 summary() {
+  local t1 t2 f
+  t1=$(mktemp "$RES/.summary.tsv.XXXXXX"); t2=$(mktemp "$RES/.summary.json.XXXXXX")
   { printf 'id\tstatus\tslot\tdurationSec\tfinishedAt\tfailingStep\n'
-    for f in "$RES"/labs/*.json; do [[ -f $f ]] && jq -r '[.id, .status, .slot // "", .durationSec // "", .finishedAt // "", (.failingStep // "" | gsub("[\t\n]"; " "))] | @tsv' "$f"; done | sort -k2,2 -k1,1
-    for f in "$RES"/exams/*.json; do [[ -f $f ]] && jq -r '["exam:" + .exam + ":" + .mode, .status, "vm", .durationSec, .finishedAt, (.failingStep // "" | gsub("[\t\n]"; " "))] | @tsv' "$f"; done
-  } > "$RES/summary.tsv.$BASHPID" && mv "$RES/summary.tsv.$BASHPID" "$RES/summary.tsv"
-  jq -s '{generatedAt:(now|todate), counts:(group_by(.status) | map({key:.[0].status, value:length}) | from_entries), labs:.}' \
-    "$RES"/labs/*.json > "$RES/summary.json.$BASHPID" 2>/dev/null && mv "$RES/summary.json.$BASHPID" "$RES/summary.json"
+    for f in "$RES"/labs/*.json; do
+      [[ -f $f ]] || continue
+      jq -r '[.id, .status, .slot // "", .durationSec // "", .finishedAt // "", (.failingStep // "" | gsub("[\t\n]"; " "))] | @tsv' "$f"
+    done | sort -k2,2 -k1,1
+    for f in "$RES"/exams/*.json; do
+      [[ -f $f ]] || continue
+      jq -r '["exam:" + .exam + ":" + .mode, .status, "vm", .durationSec, .finishedAt, (.failingStep // "" | gsub("[\t\n]"; " "))] | @tsv' "$f"
+    done
+  } > "$t1"
+  mv "$t1" "$RES/summary.tsv"
+  if cat "$RES"/labs/*.json 2>/dev/null | jq -s '{generatedAt:(now|todate), counts:(group_by(.status) | map({key:.[0].status, value:length}) | from_entries), labs:.}' > "$t2"; then
+    mv "$t2" "$RES/summary.json"
+  else rm -f "$t2"; fi
   cat "$RES/summary.tsv"
 }
 
