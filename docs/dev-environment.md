@@ -729,8 +729,9 @@ first when a lab passes locally and fails here.
 4. **Multus thick daemon limits (50Mi/100m upstream) are too small.** Delegate plugins
    such as portmap run in its cgroup, hit `memory.max` about 300k times, and sandboxes fail
    with `failed to reserve sandbox name`. The manifest is vendored in
-   `deploy/multus/multus-daemonset-thick.yaml` with 100Mi request / 512Mi limit and no CPU
-   limit, and with the image pinned to `v4.3.1-thick` by digest. It is applied as is, so a
+   `deploy/multus/multus-daemonset-thick.yaml` with a 200m / 256Mi request, a 2Gi memory
+   limit and no CPU limit (512Mi was OOMKilled up to 16 times on the verify VM under lab pod
+   bursts, and every sandbox then failed with `multus-shim ... Post "http://dummy/cni": EOF`), and with the image pinned to `v4.3.1-thick` by digest. It is applied as is, so a
    re-run of `dev:up` is a no-op (the earlier apply-then-patch bumped the DaemonSet twice
    and bounced a Multus pod on every run). The upstream file's sha256 is recorded in
    `versions.env`; re-vendor it when bumping `MULTUS_VERSION`.
