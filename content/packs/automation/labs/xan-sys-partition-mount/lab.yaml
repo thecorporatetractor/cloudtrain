@@ -1,0 +1,237 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xan-sys-partition-mount
+  title: Partition a disk and mount it persistently
+  domain: automation
+  frameworks: [ex294-aligned:automate-system-tasks]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [exam, ansible, storage, partitions, xfs, fstab]
+  version: 1
+spec:
+  description: |
+    **Exam environment.** You work as `learner` on the control node `control`. The
+    managed nodes are `node1` (group `dev`), `node2` (`test`), `node3` (`prod`, also in
+    `webservers`) and `node4` (`balancers`), all Enterprise Linux 10; the account
+    `devops` on every node accepts your SSH key and may use sudo without a password.
+    Packages come from each node's local repository. Every playbook you write is run
+    again by the grader (it must report no changes), then every node is rebooted before
+    the final checks.
+
+    On the **test** hosts the second data disk is empty. It is addressed by its serial
+    number as **`/dev/disk/by-id/virtio-ct-data2`** (1 GiB).
+
+    Write the playbook **`/home/learner/exam/partition/partition.yml`** (the directory has
+    an inventory and an `ansible.cfg` with the remote user `devops`) that, on the **test**
+    group:
+
+    - creates **one partition of {{size}} MiB** on that disk (GPT label, starting at 1 MiB);
+    - creates an **xfs** filesystem on it;
+    - mounts it on **`/mnt/{{mp}}`**, and makes the mount **persistent by filesystem UUID**
+      in `/etc/fstab`, so that it is mounted again after a reboot.
+
+    Run it. A second run must report no changes. No other host and no other disk may change.
+  objectives:
+    - Partition a disk and create a filesystem with Ansible modules
+    - Mount a filesystem persistently by UUID
+  params:
+    size:
+      type: int
+      min: 400
+      max: 600
+    mp:
+      type: choice
+      values: [archive, ledger, exports]
+  topology:
+    entry: control
+    nodes:
+      - { name: control, driver: container, image: ansible-ctl:2.21, access: [shell] }
+      - { name: node1, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node2, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node3, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node4, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+  setup:
+    - on: node1
+      timeoutSec: 120
+      run: &exam-node |
+        set -eu
+        id devops >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Exam automation" devops
+        install -d -m 0700 -o devops -g devops /home/devops/.ssh
+        install -m 0600 -o devops -g devops /home/learner/.ssh/authorized_keys /home/devops/.ssh/authorized_keys
+        printf 'devops ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/devops
+        chmod 0440 /etc/sudoers.d/devops
+    - { on: node2, timeoutSec: 120, run: *exam-node }
+    - { on: node3, timeoutSec: 120, run: *exam-node }
+    - { on: node4, timeoutSec: 120, run: *exam-node }
+    - on: control
+      run: |
+        set -eu
+        p=/home/learner/exam/partition
+        install -d -o learner -g learner /home/learner/exam $p
+        cat > $p/inventory.yml <<'EOF'
+        dev:
+          hosts:
+            node1:
+        test:
+          hosts:
+            node2:
+        prod:
+          hosts:
+            node3:
+        balancers:
+          hosts:
+            node4:
+        webservers:
+          children:
+            prod:
+        EOF
+        printf '[defaults]\ninventory = inventory.yml\nremote_user = devops\n' > $p/ansible.cfg
+        chown -R learner:learner $p
+  checks:
+    - id: partition
+      description: node2 has exactly one partition on the second data disk with the requested size and an xfs filesystem
+      type: shell
+      on: node2
+      skills: [automation.modules.storage]
+      weight: 2
+      command: |
+        n=$(ls /dev/disk/by-id/virtio-ct-data2-part* 2>/dev/null | wc -l)
+        [ "$n" = 1 ] || { echo "parts=$n"; exit 0; }
+        p=$(readlink -f /dev/disk/by-id/virtio-ct-data2-part1)
+        s=$(( $(blockdev --getsize64 $p) / 1048576 - {{size}} ))
+        [ "$s" -ge -2 ] && [ "$s" -le 2 ] && z=size-ok || z=size-wrong
+        echo "parts=1 $z $(blkid -s TYPE -o value $p)"
+      expect: { match: exact, value: "parts=1 size-ok xfs" }
+    - id: mounted
+      description: The partition is mounted on the requested directory right now
+      type: shell
+      on: node2
+      skills: [automation.modules.storage]
+      command: |
+        p=$(readlink -f /dev/disk/by-id/virtio-ct-data2-part1 2>/dev/null)
+        s=$(findmnt -n -o SOURCE,FSTYPE /mnt/{{mp}} 2>/dev/null)
+        [ -n "$p" ] && [ "$s" = "$p xfs" ] && echo mounted || echo "not-mounted"
+      expect: { match: exact, value: mounted }
+    - id: fstab-uuid
+      description: /etc/fstab mounts the partition on the requested directory by its filesystem UUID
+      type: shell
+      on: node2
+      skills: [automation.modules.storage]
+      weight: 2
+      command: |
+        p=$(readlink -f /dev/disk/by-id/virtio-ct-data2-part1 2>/dev/null)
+        u=$(blkid -s UUID -o value "$p" 2>/dev/null)
+        [ -n "$u" ] && grep -Eq "^UUID=$u[[:space:]]+/mnt/{{mp}}[[:space:]]+xfs[[:space:]]" /etc/fstab && echo by-uuid || echo not-by-uuid
+      expect: { match: exact, value: by-uuid }
+    - id: others-clean
+      description: node2 has the partition and node1, node3 and node4 have no partition on the second data disk and no mount for it
+      type: shell
+      on: control
+      skills: [automation.modules.storage]
+      timeoutSec: 120
+      command: |
+        r() { ct-ansible run /home/learner ssh -o BatchMode=yes -o ConnectTimeout=10 devops@$1 "$2" 2>/dev/null; }
+        [ "$(r node2 'ls /dev/disk/by-id/virtio-ct-data2-part* 2>/dev/null | wc -l')" = 1 ] || { echo node2-not-done; exit 0; }
+        n=0
+        for h in node1 node3 node4; do
+          [ "$(r $h 'n=$(ls /dev/disk/by-id/virtio-ct-data2-part* 2>/dev/null | wc -l); findmnt -n /mnt/{{mp}} >/dev/null 2>&1 && m=mount || m=no-mount; echo "parts=$n $m"')" = "parts=0 no-mount" ] || n=$((n+1))
+        done
+        [ $n = 0 ] && echo ok || echo "dirty=$n"
+      expect: { match: exact, value: ok }
+  exam:
+    rerun:
+      - on: control
+        timeoutSec: 600
+        run: |
+          r=$(ct-ansible recap /home/learner/exam/partition partition.yml)
+          echo "$r"
+          [ "$r" = "changed=0 failed=0 unreachable=0" ]
+  misconceptions:
+    - id: fstab-by-name
+      description: Mounts the partition persistently through its device name instead of its UUID.
+      feedback: Device names can change between boots; the fstab entry must use the filesystem UUID.
+      expectFail: [fstab-uuid]
+      mutation:
+        on: control
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/exam/partition
+          cat > partition.yml <<'EOF'
+          - hosts: test
+            become: true
+            tasks:
+              - community.general.parted: { device: /dev/disk/by-id/virtio-ct-data2, number: 1, label: gpt, part_start: 1MiB, part_end: "{{ 1 + {{size}} }}MiB", state: present }
+              - { ansible.builtin.command: udevadm settle, changed_when: false }
+              - community.general.filesystem: { fstype: xfs, dev: /dev/disk/by-id/virtio-ct-data2-part1 }
+              - ansible.posix.mount: { path: "/mnt/{{mp}}", src: /dev/disk/by-id/virtio-ct-data2-part1, fstype: xfs, state: mounted }
+          EOF
+          ansible-playbook partition.yml
+    - id: whole-disk
+      description: Formats the whole disk instead of creating a partition of the requested size.
+      feedback: The task asks for one partition of a given size, not a filesystem on the raw disk.
+      expectFail: [partition, mounted]
+      mutation:
+        on: control
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/exam/partition
+          cat > partition.yml <<'EOF'
+          - hosts: test
+            become: true
+            tasks:
+              - community.general.filesystem: { fstype: xfs, dev: /dev/disk/by-id/virtio-ct-data2 }
+              - ansible.builtin.command: blkid -s UUID -o value /dev/disk/by-id/virtio-ct-data2
+                register: uuid
+                changed_when: false
+              - ansible.posix.mount: { path: "/mnt/{{mp}}", src: "UUID={{ uuid.stdout }}", fstype: xfs, state: mounted }
+          EOF
+          ansible-playbook partition.yml
+  solution:
+    explanation: |
+      parted creates the GPT label and the partition (end = start + size), filesystem formats it,
+      and mount with a UUID source writes the fstab line and mounts it; all three modules check the
+      current state first, so the second run changes nothing.
+    steps:
+      - on: control
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/exam/partition
+          cat > partition.yml <<'EOF'
+          - name: Archive partition on the test hosts
+            hosts: test
+            become: true
+            tasks:
+              - name: Partition
+                community.general.parted:
+                  device: /dev/disk/by-id/virtio-ct-data2
+                  number: 1
+                  label: gpt
+                  part_start: 1MiB
+                  part_end: "{{ 1 + {{size}} }}MiB"
+                  state: present
+              - name: Wait for the device link
+                ansible.builtin.command: udevadm settle
+                changed_when: false
+              - name: xfs filesystem
+                community.general.filesystem:
+                  fstype: xfs
+                  dev: /dev/disk/by-id/virtio-ct-data2-part1
+              - name: Filesystem UUID
+                ansible.builtin.command: blkid -s UUID -o value /dev/disk/by-id/virtio-ct-data2-part1
+                register: uuid
+                changed_when: false
+              - name: Mount persistently
+                ansible.posix.mount:
+                  path: "/mnt/{{mp}}"
+                  src: "UUID={{ uuid.stdout }}"
+                  fstype: xfs
+                  state: mounted
+          EOF
+          ansible-playbook partition.yml

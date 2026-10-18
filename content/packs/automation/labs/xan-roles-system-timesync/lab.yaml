@@ -1,0 +1,228 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xan-roles-system-timesync
+  title: Configure time sources with the platform's supported role
+  domain: automation
+  frameworks: [ex294-aligned:roles-collections]
+  difficulty: easy
+  estimatedMinutes: 10
+  tags: [exam, ansible, roles, collections, chrony, time]
+  version: 1
+spec:
+  description: |
+    **Exam environment.** You work as `learner` on the control node `control`. The
+    managed nodes are `node1` (group `dev`), `node2` (`test`), `node3` (`prod`, also in
+    `webservers`) and `node4` (`balancers`), all Enterprise Linux 10; the account
+    `devops` on every node accepts your SSH key and may use sudo without a password.
+    Packages come from each node's local repository. Every playbook you write is run
+    again by the grader (it must report no changes), then every node is rebooted before
+    the final checks.
+
+    The time server of the estate is **`node4`** (it serves NTP to the lab network). The
+    other nodes still point at an old corporate pool. The collection
+    `fedora.linux_system_roles` is installed on the control node and provides the
+    **`timesync`** role.
+
+    Write the playbook **`/home/learner/exam/timesync/timesync.yml`** (the directory has an
+    inventory and an `ansible.cfg` with the remote user `devops`) that uses that role on
+    every node **except the balancers group** so that each of them:
+
+    - has **`node4`** as its **only** time source, with **`iburst`** and a **`minpoll`** of
+      **`{{mp}}`**;
+    - runs `chronyd` and has it enabled at boot.
+
+    Run it. A second run must report no changes.
+  objectives:
+    - Use a system role from an installed collection by overriding its variables
+    - Replace the time sources of a fleet declaratively
+  params:
+    mp:
+      type: int
+      min: 4
+      max: 6
+  topology:
+    entry: control
+    nodes:
+      - { name: control, driver: container, image: ansible-ctl:2.21, access: [shell] }
+      - { name: node1, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node2, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node3, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node4, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+  setup:
+    - on: node1
+      timeoutSec: 120
+      run: &exam-node |
+        set -eu
+        id devops >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Exam automation" devops
+        install -d -m 0700 -o devops -g devops /home/devops/.ssh
+        install -m 0600 -o devops -g devops /home/learner/.ssh/authorized_keys /home/devops/.ssh/authorized_keys
+        printf 'devops ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/devops
+        chmod 0440 /etc/sudoers.d/devops
+    - { on: node2, timeoutSec: 120, run: *exam-node }
+    - { on: node3, timeoutSec: 120, run: *exam-node }
+    - { on: node4, timeoutSec: 120, run: *exam-node }
+    - on: control
+      run: |
+        set -eu
+        c=/usr/share/ansible/collections/ansible_collections/fedora/linux_system_roles
+        [ -d "$c" ] || { echo "fedora.linux_system_roles is not installed on this control node; this task cannot run in this image" >&2; exit 1; }
+        p=/home/learner/exam/timesync
+        install -d -o learner -g learner /home/learner/exam $p
+        cat > $p/inventory.yml <<'EOF'
+        dev:
+          hosts:
+            node1:
+        test:
+          hosts:
+            node2:
+        prod:
+          hosts:
+            node3:
+        balancers:
+          hosts:
+            node4:
+        webservers:
+          children:
+            prod:
+        EOF
+        printf '[defaults]\ninventory = inventory.yml\nremote_user = devops\n' > $p/ansible.cfg
+        chown -R learner:learner $p
+    - on: node4
+      timeoutSec: 180
+      run: |
+        set -eu
+        [ -f /var/tmp/.ct-timesync-seeded ] && exit 0
+        install -d /etc/chrony.d
+        grep -qE '^(confdir|include)[[:space:]]' /etc/chrony.conf || echo 'confdir /etc/chrony.d' >> /etc/chrony.conf
+        printf 'allow\nlocal stratum 10\n' > /etc/chrony.d/ov-server.conf
+        systemctl enable chronyd >/dev/null 2>&1; systemctl restart chronyd
+        firewall-cmd -q --permanent --add-service=ntp; firewall-cmd -q --reload
+        touch /var/tmp/.ct-timesync-seeded
+    - on: node1
+      timeoutSec: 120
+      run: &oldntp |
+        set -eu
+        [ -f /var/tmp/.ct-timesync-seeded ] && exit 0
+        grep -q '^pool ntp.orrinvale.example' /etc/chrony.conf || sed -i '1i pool ntp.orrinvale.example iburst' /etc/chrony.conf
+        systemctl enable chronyd >/dev/null 2>&1; systemctl restart chronyd
+        touch /var/tmp/.ct-timesync-seeded
+    - { on: node2, timeoutSec: 120, run: *oldntp }
+    - { on: node3, timeoutSec: 120, run: *oldntp }
+  checks:
+    - id: sources-node1
+      description: node1 uses only the estate time server with the required options and chronyd is running and enabled
+      type: shell
+      on: node1
+      skills: [automation.reuse.system-roles]
+      weight: 2
+      command: &ntp-state |
+        cat /etc/chrony.conf /etc/chrony.d/*.conf 2>/dev/null | grep -E '^(server|pool|peer)[[:space:]]' > /tmp/.ct-src
+        n=$(wc -l < /tmp/.ct-src)
+        grep -E '^server[[:space:]]+node4([[:space:]]|$)' /tmp/.ct-src | grep -qw iburst && grep -qE 'minpoll[[:space:]]+{{mp}}([[:space:]]|$)' /tmp/.ct-src && o=options-ok || o=options-wrong
+        rm -f /tmp/.ct-src
+        echo "sources=$n $o $(systemctl is-active chronyd) $(systemctl is-enabled chronyd)"
+      expect: { match: exact, value: "sources=1 options-ok active enabled" }
+    - { id: sources-node2, description: "node2 uses only the estate time server with the required options and chronyd is running and enabled", type: shell, on: node2, skills: [automation.reuse.system-roles], weight: 2, command: *ntp-state, expect: { match: exact, value: "sources=1 options-ok active enabled" } }
+    - { id: sources-node3, description: "node3 uses only the estate time server with the required options and chronyd is running and enabled", type: shell, on: node3, skills: [automation.reuse.system-roles], weight: 2, command: *ntp-state, expect: { match: exact, value: "sources=1 options-ok active enabled" } }
+    - id: server-untouched
+      description: The time server itself is still configured to serve the lab network
+      type: shell
+      on: node4
+      skills: [automation.reuse.system-roles]
+      command: grep -qE '^allow' /etc/chrony.d/ov-server.conf && systemctl is-active chronyd || echo changed
+      expect: { match: exact, value: active }
+    - id: uses-role
+      description: timesync.yml uses the timesync role from the collection and leaves out the balancers
+      type: shell
+      on: control
+      skills: [automation.reuse.system-roles]
+      command: |
+        /opt/ansible/bin/python3 - /home/learner/exam/timesync/timesync.yml <<'PY' 2>/dev/null || echo no-playbook
+        import sys, yaml
+        plays = yaml.safe_load(open(sys.argv[1])) or []
+        def uses(p):
+            for r in (p.get("roles") or []):
+                n = r if isinstance(r, str) else str(r.get("role", r.get("name", "")))
+                if n.endswith("timesync"): return True
+            for t in (p.get("tasks") or []):
+                if isinstance(t, dict) and any(k in t for k in ("include_role", "import_role", "ansible.builtin.include_role", "ansible.builtin.import_role")):
+                    return "timesync" in str(t)
+            return False
+        ok = any(uses(p) for p in plays)
+        print("ok" if ok else "no-role")
+        PY
+      expect: { match: exact, value: ok }
+  exam:
+    rerun:
+      - on: control
+        timeoutSec: 600
+        run: |
+          r=$(ct-ansible recap /home/learner/exam/timesync timesync.yml)
+          echo "$r"
+          [ "$r" = "changed=0 failed=0 unreachable=0" ]
+  misconceptions:
+    - id: pool-kept
+      description: Adds the time server with a line edit and leaves the old corporate pool in place.
+      feedback: The estate server must be the only source; the old pool line has to go.
+      expectFail: [sources-node1, sources-node2, sources-node3]
+      mutation:
+        on: control
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/exam/timesync
+          cat > timesync.yml <<'EOF'
+          - hosts: all:!balancers
+            become: true
+            tasks:
+              - ansible.builtin.lineinfile: { path: /etc/chrony.conf, line: "server node4 iburst minpoll {{mp}}", insertafter: BOF }
+              - ansible.builtin.service: { name: chronyd, state: restarted, enabled: true }
+          EOF
+          ansible-playbook timesync.yml
+    - id: no-options
+      description: Uses the role with the server name only, without the options.
+      feedback: The source needs iburst and the minpoll value; the role takes them as keys of each server entry.
+      expectFail: [sources-node1, sources-node2, sources-node3]
+      mutation:
+        on: control
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/exam/timesync
+          cat > timesync.yml <<'EOF'
+          - hosts: all:!balancers
+            become: true
+            vars:
+              timesync_ntp_servers:
+                - hostname: node4
+            roles:
+              - fedora.linux_system_roles.timesync
+          EOF
+          ansible-playbook timesync.yml
+  solution:
+    explanation: |
+      The role replaces the whole source list from timesync_ntp_servers, so one entry for node4
+      with iburst and minpoll leaves it as the only source; the balancers group is excluded in the host pattern.
+    steps:
+      - on: control
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/exam/timesync
+          cat > timesync.yml <<'EOF'
+          - name: Time sources
+            hosts: all:!balancers
+            become: true
+            vars:
+              timesync_ntp_servers:
+                - hostname: node4
+                  iburst: true
+                  minpoll: {{mp}}
+            roles:
+              - fedora.linux_system_roles.timesync
+          EOF
+          ansible-playbook timesync.yml

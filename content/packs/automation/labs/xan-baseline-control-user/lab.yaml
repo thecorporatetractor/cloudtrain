@@ -1,0 +1,209 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xan-baseline-control-user
+  title: Prepare the automation key pair and project directory
+  domain: automation
+  frameworks: [ex294-aligned:rhcsa-baseline]
+  difficulty: easy
+  estimatedMinutes: 8
+  tags: [exam, ansible, ssh, keys, baseline]
+  version: 1
+spec:
+  description: |
+    **Exam environment.** You work as `learner` on the control node `control`. The
+    managed nodes are `node1` (group `dev`), `node2` (`test`), `node3` (`prod`, also in
+    `webservers`) and `node4` (`balancers`), all Enterprise Linux 10; the account
+    `devops` on every node accepts your SSH key and may use sudo without a password.
+    Packages come from each node's local repository. Every playbook you write is run
+    again by the grader (it must report no changes), then every node is rebooted before
+    the final checks.
+
+    The control node has no separate automation account, so you prepare your own. As
+    `learner` on `control`:
+
+    1. generate an **ed25519** key pair without a passphrase at
+       **`/home/learner/.ssh/devops_exam`** (private) and **`devops_exam.pub`** (public),
+       with the key comment **`exam-{{tag}}`**;
+    2. add the public key to the `devops` account on **every** managed node, **in
+       addition to** the keys that are already accepted there;
+    3. create the project directory **`/home/learner/exam/ansible-home`** with an
+       **`inventory.yml`** that defines the groups `dev` (node1), `test` (node2), `prod`
+       (node3) and `balancers` (node4) and a group `webservers` that contains `prod`, and an
+       **`ansible.cfg`** that makes `devops` the remote user, uses the new private key and
+       points to that inventory.
+
+    `ansible all -m ping` run in the project directory must answer from all four nodes.
+  objectives:
+    - Generate a dedicated SSH key pair and distribute it to the managed nodes
+    - Prepare an Ansible project directory with inventory and configuration
+  params:
+    tag:
+      type: int
+      min: 1000
+      max: 9999
+  topology:
+    entry: control
+    nodes:
+      - { name: control, driver: container, image: ansible-ctl:2.21, access: [shell] }
+      - { name: node1, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node2, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node3, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node4, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+  setup:
+    - on: node1
+      timeoutSec: 120
+      run: &exam-node |
+        set -eu
+        id devops >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Exam automation" devops
+        install -d -m 0700 -o devops -g devops /home/devops/.ssh
+        install -m 0600 -o devops -g devops /home/learner/.ssh/authorized_keys /home/devops/.ssh/authorized_keys
+        printf 'devops ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/devops
+        chmod 0440 /etc/sudoers.d/devops
+    - { on: node2, timeoutSec: 120, run: *exam-node }
+    - { on: node3, timeoutSec: 120, run: *exam-node }
+    - { on: node4, timeoutSec: 120, run: *exam-node }
+    - on: control
+      run: |
+        set -eu
+        install -d -o learner -g learner /home/learner/exam
+  checks:
+    - id: key-pair
+      description: The dedicated key pair exists with the required type, comment and file permissions
+      type: shell
+      on: control
+      skills: [linux.remote.ssh]
+      weight: 2
+      command: |
+        k=/home/learner/.ssh/devops_exam
+        [ -f $k ] && [ -f $k.pub ] || { echo missing; exit 0; }
+        [ "$(stat -c '%a %U' $k)" = "600 learner" ] || { echo bad-permissions; exit 0; }
+        ssh-keygen -y -f $k 2>/dev/null | cut -d' ' -f1,2 > /tmp/.ct-bcu-pub || { echo passphrase-or-broken; exit 0; }
+        [ "$(cut -d' ' -f1,2 $k.pub)" = "$(cat /tmp/.ct-bcu-pub)" ] || { echo pair-mismatch; rm -f /tmp/.ct-bcu-pub; exit 0; }
+        rm -f /tmp/.ct-bcu-pub
+        awk '{print $1 " " $3}' $k.pub
+      expect: { match: exact, value: "ssh-ed25519 exam-{{tag}}" }
+    - id: key-accepted
+      description: Every node's devops account accepts the new key by itself
+      type: shell
+      on: control
+      skills: [linux.remote.ssh]
+      weight: 2
+      timeoutSec: 90
+      command: |
+        r=""
+        for n in node1 node2 node3 node4; do
+          ct-ansible run /home/learner ssh -F /dev/null -i /home/learner/.ssh/devops_exam -o IdentitiesOnly=yes -o UserKnownHostsFile=/home/learner/.ssh/known_hosts -o StrictHostKeyChecking=yes -o BatchMode=yes -o ConnectTimeout=10 devops@$n true >/dev/null 2>&1 || r="$r $n"
+        done
+        echo "${r:-ok}"
+      expect: { match: exact, value: ok }
+    - id: project
+      description: The project has the required inventory groups and an ansible.cfg that sets the user and the new key
+      type: shell
+      on: control
+      skills: [automation.foundations.config]
+      command: |
+        d=/home/learner/exam/ansible-home
+        [ -f $d/ansible.cfg ] && [ -f $d/inventory.yml ] || { echo missing; exit 0; }
+        c=$(ct-ansible run $d ansible-config dump --only-changed 2>/dev/null)
+        echo "$c" | grep -q 'DEFAULT_PRIVATE_KEY_FILE.*devops_exam' || { echo no-key-in-cfg; exit 0; }
+        echo "$c" | grep -q 'DEFAULT_REMOTE_USER.*devops' || { echo no-user-in-cfg; exit 0; }
+        ct-ansible run $d ansible-inventory --list 2>/dev/null | /opt/ansible/bin/python3 -c '
+        import sys, json
+        d = json.load(sys.stdin)
+        g = lambda n: sorted(d.get(n, {}).get("hosts", []))
+        ok = g("dev") == ["node1"] and g("test") == ["node2"] and g("prod") == ["node3"] and g("balancers") == ["node4"] and d.get("webservers", {}).get("children") == ["prod"]
+        print("ok" if ok else "wrong-groups")' || echo no-inventory
+      expect: { match: exact, value: ok }
+    - id: ping-all
+      description: ansible all -m ping in the project directory answers from all four nodes
+      type: shell
+      on: control
+      skills: [automation.foundations.control-node]
+      timeoutSec: 90
+      command: ct-ansible run /home/learner/exam/ansible-home ansible all -m ansible.builtin.ping -o 2>/dev/null | grep -c SUCCESS
+      expect: { match: exact, value: "4" }
+    - id: node1-key
+      description: node1 devops account has the new key and still accepts the previous keys
+      type: shell
+      on: node1
+      skills: [linux.remote.ssh]
+      command: &devops-key |
+        f=/home/devops/.ssh/authorized_keys
+        n=$(grep -c ' exam-{{tag}}$' $f)
+        grep -qFxf /home/learner/.ssh/authorized_keys $f && o=kept || o=lost
+        echo "$n $o"
+      expect: { match: exact, value: "1 kept" }
+    - { id: node2-key, description: "node2 devops account has the new key and still accepts the previous keys", type: shell, on: node2, skills: [linux.remote.ssh], command: *devops-key, expect: { match: exact, value: "1 kept" } }
+    - { id: node3-key, description: "node3 devops account has the new key and still accepts the previous keys", type: shell, on: node3, skills: [linux.remote.ssh], command: *devops-key, expect: { match: exact, value: "1 kept" } }
+    - { id: node4-key, description: "node4 devops account has the new key and still accepts the previous keys", type: shell, on: node4, skills: [linux.remote.ssh], command: *devops-key, expect: { match: exact, value: "1 kept" } }
+  misconceptions:
+    - id: rsa-key
+      description: Generates an RSA key instead of an ed25519 key and distributes it.
+      feedback: The task asks for an ed25519 key pair; generate it with ssh-keygen -t ed25519.
+      expectFail: [key-pair]
+      mutation:
+        on: control
+        as: learner
+        timeoutSec: 120
+        run: |
+          set -e
+          rm -f ~/.ssh/devops_exam ~/.ssh/devops_exam.pub
+          ssh-keygen -q -t rsa -b 3072 -N '' -C exam-{{tag}} -f ~/.ssh/devops_exam
+          for n in node1 node2 node3 node4; do
+            ssh devops@$n 'umask 077; mkdir -p ~/.ssh; cat >> ~/.ssh/authorized_keys' < ~/.ssh/devops_exam.pub
+          done
+    - id: no-key-in-config
+      description: Creates the key and the inventory but never points ansible.cfg at the new key.
+      feedback: ansible.cfg must name the new private key, otherwise the project still relies on the default identity.
+      expectFail: [project]
+      mutation:
+        on: control
+        as: learner
+        timeoutSec: 120
+        run: |
+          set -e
+          rm -f ~/.ssh/devops_exam ~/.ssh/devops_exam.pub
+          ssh-keygen -q -t ed25519 -N '' -C exam-{{tag}} -f ~/.ssh/devops_exam
+          for n in node1 node2 node3 node4; do
+            ssh devops@$n 'umask 077; mkdir -p ~/.ssh; cat >> ~/.ssh/authorized_keys' < ~/.ssh/devops_exam.pub
+          done
+          mkdir -p ~/exam/ansible-home && cd ~/exam/ansible-home
+          printf 'dev:\n  hosts:\n    node1:\ntest:\n  hosts:\n    node2:\nprod:\n  hosts:\n    node3:\nbalancers:\n  hosts:\n    node4:\nwebservers:\n  children:\n    prod:\n' > inventory.yml
+          printf '[defaults]\ninventory = inventory.yml\nremote_user = devops\n' > ansible.cfg
+  solution:
+    explanation: |
+      ssh-keygen creates the key pair (the private key is mode 600 by default); appending the
+      public key over the already accepted login keeps the existing keys; ansible.cfg carries
+      remote_user, private_key_file and inventory.
+    steps:
+      - on: control
+        as: learner
+        timeoutSec: 180
+        run: |
+          set -e
+          rm -f ~/.ssh/devops_exam ~/.ssh/devops_exam.pub
+          ssh-keygen -q -t ed25519 -N '' -C exam-{{tag}} -f ~/.ssh/devops_exam
+          for n in node1 node2 node3 node4; do
+            ssh devops@$n 'umask 077; mkdir -p ~/.ssh; cat >> ~/.ssh/authorized_keys' < ~/.ssh/devops_exam.pub
+          done
+          mkdir -p ~/exam/ansible-home && cd ~/exam/ansible-home
+          cat > inventory.yml <<'EOF'
+          dev:
+            hosts:
+              node1:
+          test:
+            hosts:
+              node2:
+          prod:
+            hosts:
+              node3:
+          balancers:
+            hosts:
+              node4:
+          webservers:
+            children:
+              prod:
+          EOF
+          printf '[defaults]\ninventory = inventory.yml\nremote_user = devops\nprivate_key_file = /home/learner/.ssh/devops_exam\n' > ansible.cfg
+          ansible all -m ansible.builtin.ping

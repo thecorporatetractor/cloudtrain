@@ -1,0 +1,295 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xan-errors-register-branch
+  title: Branch on a registered package query
+  domain: automation
+  frameworks: [ex294-aligned:plays-errors]
+  difficulty: medium
+  estimatedMinutes: 12
+  tags: [exam, ansible, register, conditionals, packages]
+  version: 1
+spec:
+  description: |
+    **Exam environment.** You work as `learner` on the control node `control`. The
+    managed nodes are `node1` (group `dev`), `node2` (`test`), `node3` (`prod`, also in
+    `webservers`) and `node4` (`balancers`), all Enterprise Linux 10; the account
+    `devops` on every node accepts your SSH key and may use sudo without a password.
+    Packages come from each node's local repository. Every playbook you write is run
+    again by the grader (it must report no changes), then every node is rebooted before
+    the final checks.
+
+    Some nodes still run the legacy agent package **`ov-legacy-agent`**; the replacement is
+    **`ov-agent`**. Both come from a local repository that is already configured on every
+    node. Do not install or remove anything by hand.
+
+    Write the playbook **`/home/learner/exam/migrate/migrate.yml`** (the directory has an
+    inventory and an `ansible.cfg` with the remote user `devops`) that, on **all** nodes:
+
+    - **queries** whether `ov-legacy-agent` is installed and keeps the answer;
+    - **only on the nodes where it is installed**, removes it and installs `ov-agent`;
+    - records the name of each migrated node, one per line, in
+      **`/home/learner/exam/migrate/migrated.txt`** on the control node.
+
+    Nodes that do not have the legacy agent must be left as they are. Run the playbook; a
+    second run must report no changes.
+  objectives:
+    - Register a query result and branch on it
+    - Change only the hosts that match a condition
+  params:
+    legacy:
+      type: choice
+      values: ["node1 node3", "node2 node4", "node1 node2 node4", "node2 node3 node4"]
+  topology:
+    entry: control
+    nodes:
+      - { name: control, driver: container, image: ansible-ctl:2.21, access: [shell] }
+      - { name: node1, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node2, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node3, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node4, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+  setup:
+    - on: node1
+      timeoutSec: 120
+      run: &exam-node |
+        set -eu
+        id devops >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Exam automation" devops
+        install -d -m 0700 -o devops -g devops /home/devops/.ssh
+        install -m 0600 -o devops -g devops /home/learner/.ssh/authorized_keys /home/devops/.ssh/authorized_keys
+        printf 'devops ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/devops
+        chmod 0440 /etc/sudoers.d/devops
+    - { on: node2, timeoutSec: 120, run: *exam-node }
+    - { on: node3, timeoutSec: 120, run: *exam-node }
+    - { on: node4, timeoutSec: 120, run: *exam-node }
+    - on: node1
+      timeoutSec: 600
+      run: &agents |
+        set -eu
+        [ -f /var/tmp/.ct-agents-seeded ] && exit 0
+        dnf -y -q install rpm-build createrepo_c >/dev/null
+        b=$(mktemp -d)
+        mk() {
+          cat > $b/$1.spec <<SPEC
+        Name: $1
+        Version: $2
+        Release: 1
+        Summary: Orrin and Vale $1
+        License: MIT
+        BuildArch: noarch
+        %description
+        $1 for the Orrin and Vale fleet.
+        %install
+        install -d %{buildroot}/usr/share/ov-agent
+        echo $1 > %{buildroot}/usr/share/ov-agent/$1.txt
+        %files
+        /usr/share/ov-agent/$1.txt
+        SPEC
+          rpmbuild -bb --define "_topdir $b/top" $b/$1.spec >/dev/null 2>&1
+        }
+        mk ov-legacy-agent 1.0
+        mk ov-agent 2.0
+        mkdir -p /opt/ov-agents
+        cp $b/top/RPMS/noarch/*.rpm /opt/ov-agents/
+        createrepo_c -q /opt/ov-agents
+        rm -rf $b
+        printf '[ov-agents]\nname=Orrin and Vale agents\nbaseurl=file:///opt/ov-agents\nenabled=1\ngpgcheck=0\n' > /etc/yum.repos.d/ov-agents.repo
+        h=$(hostname)
+        for x in {{legacy}}; do
+          case "$h" in "$x"*) dnf -y -q install ov-legacy-agent >/dev/null ;; esac
+        done
+        touch /var/tmp/.ct-agents-seeded
+    - { on: node2, timeoutSec: 600, run: *agents }
+    - { on: node3, timeoutSec: 600, run: *agents }
+    - { on: node4, timeoutSec: 600, run: *agents }
+    - on: control
+      run: |
+        set -eu
+        p=/home/learner/exam/migrate
+        install -d -o learner -g learner /home/learner/exam $p
+        cat > $p/inventory.yml <<'EOF'
+        dev:
+          hosts:
+            node1:
+        test:
+          hosts:
+            node2:
+        prod:
+          hosts:
+            node3:
+        balancers:
+          hosts:
+            node4:
+        webservers:
+          children:
+            prod:
+        EOF
+        printf '[defaults]\ninventory = inventory.yml\nremote_user = devops\n' > $p/ansible.cfg
+        chown -R learner:learner $p
+  checks:
+    - id: node1-agent
+      description: node1 runs the replacement agent only if it had the legacy one, and the legacy agent is gone
+      type: shell
+      on: node1
+      skills: [automation.data.register, automation.control-flow.conditionals]
+      weight: 2
+      command: &node-state |
+        { journalctl --no-pager _COMM=sudo 2>/dev/null; cat /var/log/secure 2>/dev/null; } | grep -q 'BECOME-SUCCESS' || { echo "not-run"; exit 0; }
+        h=$(hostname); want=skipped
+        for x in {{legacy}}; do case "$h" in "$x"*) want=migrated ;; esac; done
+        rpm -q ov-legacy-agent >/dev/null 2>&1 && l=legacy || l=no-legacy
+        rpm -q ov-agent >/dev/null 2>&1 && a=agent || a=no-agent
+        case "$l $a" in "no-legacy agent") got=migrated ;; "no-legacy no-agent") got=skipped ;; *) got="$l $a" ;; esac
+        [ "$got" = "$want" ] && echo ok || echo "mismatch: $l $a"
+      expect: { match: exact, value: ok }
+    - { id: node2-agent, description: "node2 runs the replacement agent only if it had the legacy one and the legacy agent is gone", type: shell, on: node2, skills: [automation.data.register, automation.control-flow.conditionals], weight: 2, command: *node-state, expect: { match: exact, value: ok } }
+    - { id: node3-agent, description: "node3 runs the replacement agent only if it had the legacy one and the legacy agent is gone", type: shell, on: node3, skills: [automation.data.register, automation.control-flow.conditionals], weight: 2, command: *node-state, expect: { match: exact, value: ok } }
+    - { id: node4-agent, description: "node4 runs the replacement agent only if it had the legacy one and the legacy agent is gone", type: shell, on: node4, skills: [automation.data.register, automation.control-flow.conditionals], weight: 2, command: *node-state, expect: { match: exact, value: ok } }
+    - id: fleet-state
+      description: Across the fleet the replacement agent is installed on exactly the nodes that had the legacy agent
+      type: shell
+      on: control
+      skills: [automation.control-flow.conditionals]
+      timeoutSec: 90
+      command: |
+        got=""
+        for n in node1 node2 node3 node4; do
+          ct-ansible run /home/learner ssh -o BatchMode=yes -o ConnectTimeout=10 devops@$n rpm -q ov-agent >/dev/null 2>&1 && got="$got $n"
+        done
+        want=$(echo {{legacy}} | tr ' ' '\n' | sort | tr '\n' ' ')
+        [ "$(echo $got | tr ' ' '\n' | sort | tr '\n' ' ')" = "$want" ] && echo ok || echo differs
+      expect: { match: exact, value: ok }
+    - id: migrated-list
+      description: migrated.txt lists the migrated nodes, one name per line, and nothing else
+      type: shell
+      on: control
+      skills: [automation.data.register]
+      weight: 2
+      command: |
+        f=/home/learner/exam/migrate/migrated.txt
+        [ -f $f ] || { echo missing; exit 0; }
+        want=$(echo {{legacy}} | tr ' ' '\n' | sort | tr '\n' ' ')
+        [ "$(grep -v '^[[:space:]]*$' $f | sort | tr '\n' ' ')" = "$want" ] && echo ok || echo differs
+      expect: { match: exact, value: ok }
+    - id: uses-register
+      description: migrate.yml registers a query result and uses it in a when condition
+      type: shell
+      on: control
+      skills: [automation.data.register]
+      command: |
+        /opt/ansible/bin/python3 - /home/learner/exam/migrate/migrate.yml <<'PY' 2>/dev/null || echo no-playbook
+        import sys, yaml
+        plays = yaml.safe_load(open(sys.argv[1])) or []
+        tasks = [t for p in plays for t in (p.get("tasks") or []) if isinstance(t, dict)]
+        print("ok" if any("register" in t for t in tasks) and any("when" in t for t in tasks) else "no-register-when")
+        PY
+      expect: { match: exact, value: ok }
+  exam:
+    rerun:
+      - on: control
+        timeoutSec: 600
+        run: |
+          r=$(ct-ansible recap /home/learner/exam/migrate migrate.yml)
+          echo "$r"
+          [ "$r" = "changed=0 failed=0 unreachable=0" ]
+  misconceptions:
+    - id: install-everywhere
+      description: Installs the new agent on every node instead of only where the legacy one was.
+      feedback: Only nodes that had the legacy agent are migrated; the condition must come from the registered query.
+      expectFail: [fleet-state]
+      mutation:
+        on: control
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/exam/migrate
+          cat > migrate.yml <<'EOF'
+          - hosts: all
+            become: true
+            tasks:
+              - ansible.builtin.command: rpm -q ov-legacy-agent
+                register: legacy
+                changed_when: false
+                failed_when: false
+              - ansible.builtin.dnf: { name: ov-legacy-agent, state: absent }
+              - ansible.builtin.dnf: { name: ov-agent, state: present }
+              - ansible.builtin.lineinfile: { path: /home/learner/exam/migrate/migrated.txt, line: "{{ inventory_hostname }}", create: true }
+                delegate_to: localhost
+                become: false
+                throttle: 1
+                when: legacy.rc == 0
+          EOF
+          ansible-playbook migrate.yml
+    - id: list-everything
+      description: Migrates correctly but writes every host name into migrated.txt.
+      feedback: migrated.txt must name only the nodes that were migrated.
+      expectFail: [migrated-list]
+      mutation:
+        on: control
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/exam/migrate
+          cat > migrate.yml <<'EOF'
+          - hosts: all
+            become: true
+            tasks:
+              - ansible.builtin.command: rpm -q ov-legacy-agent
+                register: legacy
+                changed_when: false
+                failed_when: false
+              - ansible.builtin.dnf: { name: ov-legacy-agent, state: absent }
+                when: legacy.rc == 0
+              - ansible.builtin.dnf: { name: ov-agent, state: present }
+                when: legacy.rc == 0
+              - ansible.builtin.lineinfile: { path: /home/learner/exam/migrate/migrated.txt, line: "{{ inventory_hostname }}", create: true }
+                delegate_to: localhost
+                become: false
+          EOF
+          ansible-playbook migrate.yml
+  solution:
+    explanation: |
+      rpm -q is registered with changed_when false and failed_when limited to real errors; the
+      removal, the install and the lineinfile on localhost all carry when: legacy.rc == 0 (throttle: 1 serialises
+      the writes so parallel forks cannot overwrite each other's lines), so
+      a second run finds no legacy agent and changes nothing.
+    steps:
+      - on: control
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/exam/migrate
+          cat > migrate.yml <<'EOF'
+          - name: Migrate the legacy agent
+            hosts: all
+            become: true
+            tasks:
+              - name: Is the legacy agent installed
+                ansible.builtin.command: rpm -q ov-legacy-agent
+                register: legacy
+                changed_when: false
+                failed_when: legacy.rc not in [0, 1]
+              - name: Remove the legacy agent
+                ansible.builtin.dnf:
+                  name: ov-legacy-agent
+                  state: absent
+                when: legacy.rc == 0
+              - name: Install the replacement agent
+                ansible.builtin.dnf:
+                  name: ov-agent
+                  state: present
+                when: legacy.rc == 0
+              - name: Record the migrated node
+                ansible.builtin.lineinfile:
+                  path: /home/learner/exam/migrate/migrated.txt
+                  line: "{{ inventory_hostname }}"
+                  create: true
+                  mode: "0644"
+                delegate_to: localhost
+                become: false
+                throttle: 1
+                when: legacy.rc == 0
+          EOF
+          ansible-playbook migrate.yml

@@ -1,0 +1,256 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xan-sys-lvm-volumes
+  title: Create logical volumes where capacity allows
+  domain: automation
+  frameworks: [ex294-aligned:automate-system-tasks]
+  difficulty: hard
+  estimatedMinutes: 20
+  tags: [exam, ansible, lvm, storage, error-handling]
+  version: 1
+spec:
+  description: |
+    **Exam environment.** You work as `learner` on the control node `control`. The
+    managed nodes are `node1` (group `dev`), `node2` (`test`), `node3` (`prod`, also in
+    `webservers`) and `node4` (`balancers`), all Enterprise Linux 10; the account
+    `devops` on every node accepts your SSH key and may use sudo without a password.
+    Packages come from each node's local repository. Every playbook you write is run
+    again by the grader (it must report no changes), then every node is rebooted before
+    the final checks.
+
+    The data disks of the nodes are addressed by serial number
+    (`/dev/disk/by-id/virtio-ct-data1` and `virtio-ct-data2`); not every node has the
+    volume group **`research`**, and where it exists it is not equally large.
+
+    Write the playbook **`/home/learner/exam/lvm/lvm.yml`** (the directory has an inventory
+    and an `ansible.cfg` with the remote user `devops`) that, on **all** nodes:
+
+    - creates the logical volume **`{{lv}}`** of **{{big}} MiB** in the volume group
+      `research`;
+    - where the volume group is **too small** for that, prints the message
+      **`Could not create logical volume of that size`** and creates the volume with
+      **{{small}} MiB** instead;
+    - where the volume group **does not exist**, prints the message
+      **`volume group does not exist`** and does nothing else on that node;
+    - puts an **ext4** filesystem on each logical volume it created, without mounting it.
+
+    Run it. A second run must report no changes.
+  objectives:
+    - Create logical volumes with the lvol module and fall back when the volume group is too small
+    - Handle a missing volume group without failing the play
+  params:
+    lv:
+      type: choice
+      values: [data, reports, staging]
+    big:
+      type: choice
+      values: ["1400", "1500", "1600", "1700"]
+    small:
+      type: choice
+      values: ["600", "700", "800"]
+  topology:
+    entry: control
+    nodes:
+      - { name: control, driver: container, image: ansible-ctl:2.21, access: [shell] }
+      - { name: node1, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node2, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node3, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node4, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+  setup:
+    - on: node1
+      timeoutSec: 120
+      run: &exam-node |
+        set -eu
+        id devops >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Exam automation" devops
+        install -d -m 0700 -o devops -g devops /home/devops/.ssh
+        install -m 0600 -o devops -g devops /home/learner/.ssh/authorized_keys /home/devops/.ssh/authorized_keys
+        printf 'devops ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/devops
+        chmod 0440 /etc/sudoers.d/devops
+    - { on: node2, timeoutSec: 120, run: *exam-node }
+    - { on: node3, timeoutSec: 120, run: *exam-node }
+    - { on: node4, timeoutSec: 120, run: *exam-node }
+    - on: node1
+      timeoutSec: 180
+      run: &vgfull |
+        set -eu
+        [ -f /var/tmp/.ct-lvm-seeded ] && exit 0
+        d=/dev/disk/by-id/virtio-ct-data1
+        [ -e $d ] || { echo "data disk $d is not present" >&2; exit 1; }
+        pvcreate -ff -y $d >/dev/null
+        vgcreate research $d >/dev/null
+        touch /var/tmp/.ct-lvm-seeded
+    - on: node2
+      timeoutSec: 180
+      run: |
+        set -eu
+        [ -f /var/tmp/.ct-lvm-seeded ] && exit 0
+        d=/dev/disk/by-id/virtio-ct-data1
+        [ -e $d ] || { echo "data disk $d is not present" >&2; exit 1; }
+        parted -s $d mklabel gpt mkpart primary 1MiB 1025MiB
+        partprobe $d; udevadm settle
+        for i in $(seq 20); do [ -e $d-part1 ] && break; sleep 1; done
+        pvcreate -ff -y $d-part1 >/dev/null
+        vgcreate research $d-part1 >/dev/null
+        touch /var/tmp/.ct-lvm-seeded
+    - { on: node3, timeoutSec: 180, run: *vgfull }
+    - on: control
+      run: |
+        set -eu
+        p=/home/learner/exam/lvm
+        install -d -o learner -g learner /home/learner/exam $p
+        cat > $p/inventory.yml <<'EOF'
+        dev:
+          hosts:
+            node1:
+        test:
+          hosts:
+            node2:
+        prod:
+          hosts:
+            node3:
+        balancers:
+          hosts:
+            node4:
+        webservers:
+          children:
+            prod:
+        EOF
+        printf '[defaults]\ninventory = inventory.yml\nremote_user = devops\n' > $p/ansible.cfg
+        chown -R learner:learner $p
+  checks:
+    - id: lv-node1
+      description: node1 has the logical volume with the full size and an unmounted ext4 filesystem
+      type: shell
+      on: node1
+      skills: [automation.modules.storage]
+      weight: 2
+      command: &lv-state |
+        s=$(lvs --noheadings --nosuffix --units m -o lv_size research/{{lv}} 2>/dev/null | awk '{printf "%d", $1}')
+        t=$(blkid -o value -s TYPE /dev/research/{{lv}} 2>/dev/null)
+        findmnt -n /dev/mapper/research-{{lv}} >/dev/null 2>&1 && m=mounted || m=unmounted
+        echo "${s:-none} ${t:-nofs} $m"
+      expect: { match: exact, value: "{{big}} ext4 unmounted" }
+    - id: lv-node2
+      description: node2 has the logical volume with the reduced size and an unmounted ext4 filesystem
+      type: shell
+      on: node2
+      skills: [automation.modules.storage, automation.control-flow.error-handling]
+      weight: 2
+      command: *lv-state
+      expect: { match: exact, value: "{{small}} ext4 unmounted" }
+    - { id: lv-node3, description: "node3 has the logical volume with the full size and an unmounted ext4 filesystem", type: shell, on: node3, skills: [automation.modules.storage], weight: 2, command: *lv-state, expect: { match: exact, value: "{{big}} ext4 unmounted" } }
+    - id: node4-nothing
+      description: node4 has no volume group and no new logical volume
+      type: shell
+      on: node4
+      skills: [automation.control-flow.error-handling]
+      command: |
+        vgs research >/dev/null 2>&1 && v=vg || v=no-vg
+        lvs 2>/dev/null | grep -c '{{lv}}' | sed "s/^/$v lvs=/"
+      expect: { match: exact, value: "no-vg lvs=0" }
+    - id: messages
+      description: lvm.yml prints both required messages
+      type: shell
+      on: control
+      skills: [automation.control-flow.error-handling]
+      command: |
+        f=/home/learner/exam/lvm/lvm.yml
+        [ -f $f ] || { echo missing; exit 0; }
+        grep -q 'Could not create logical volume of that size' $f && grep -q 'volume group does not exist' $f && echo ok || echo missing-message
+      expect: { match: exact, value: ok }
+  exam:
+    rerun:
+      - on: control
+        timeoutSec: 600
+        run: |
+          r=$(ct-ansible recap /home/learner/exam/lvm lvm.yml)
+          echo "$r"
+          [ "$r" = "changed=0 failed=0 unreachable=0" ]
+  misconceptions:
+    - id: no-fallback
+      description: Creates the volume with the full size everywhere and lets the small volume group fail the play.
+      feedback: The node with the small volume group needs the fallback size instead of an error.
+      expectFail: [lv-node2]
+      mutation:
+        on: control
+        as: learner
+        timeoutSec: 600
+        run: |
+          cd ~/exam/lvm
+          cat > lvm.yml <<'EOF'
+          - hosts: all
+            become: true
+            tasks:
+              - community.general.lvol: { vg: research, lv: "{{lv}}", size: "{{big}}" }
+              - community.general.filesystem: { fstype: ext4, dev: "/dev/research/{{lv}}" }
+          EOF
+          ansible-playbook lvm.yml || true
+    - id: mounted
+      description: Mounts the new filesystems although the task says to leave them unmounted.
+      feedback: The volumes are only formatted; leave them unmounted.
+      expectFail: [lv-node1, lv-node2, lv-node3]
+      mutation:
+        on: control
+        as: learner
+        timeoutSec: 600
+        run: |
+          cd ~/exam/lvm
+          cat > lvm.yml <<'EOF'
+          - hosts: all:!balancers
+            become: true
+            tasks:
+              - community.general.lvol: { vg: research, lv: "{{lv}}", size: "{{small}}" }
+              - community.general.filesystem: { fstype: ext4, dev: "/dev/research/{{lv}}" }
+              - ansible.posix.mount: { path: "/mnt/{{lv}}", src: "/dev/research/{{lv}}", fstype: ext4, state: mounted }
+          EOF
+          ansible-playbook lvm.yml || true
+  solution:
+    explanation: |
+      vgs registers whether the group exists; a block with the full-size lvol falls back to the
+      small size in its rescue section, and the filesystem task runs only where the group exists.
+    steps:
+      - on: control
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/exam/lvm
+          cat > lvm.yml <<'EOF'
+          - name: Logical volumes where capacity allows
+            hosts: all
+            become: true
+            tasks:
+              - name: Does the volume group exist
+                ansible.builtin.command: vgs --noheadings research
+                register: vg
+                changed_when: false
+                failed_when: false
+              - name: Missing volume group
+                ansible.builtin.debug:
+                  msg: volume group does not exist
+                when: vg.rc != 0
+              - name: Create the volume
+                when: vg.rc == 0
+                block:
+                  - name: Full size
+                    community.general.lvol:
+                      vg: research
+                      lv: "{{lv}}"
+                      size: "{{big}}"
+                rescue:
+                  - name: Too small
+                    ansible.builtin.debug:
+                      msg: Could not create logical volume of that size
+                  - name: Reduced size
+                    community.general.lvol:
+                      vg: research
+                      lv: "{{lv}}"
+                      size: "{{small}}"
+              - name: ext4 filesystem
+                community.general.filesystem:
+                  fstype: ext4
+                  dev: "/dev/research/{{lv}}"
+                when: vg.rc == 0
+          EOF
+          ansible-playbook lvm.yml

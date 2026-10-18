@@ -1,0 +1,240 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xpe-ansible-ssh-hardening
+  title: Enforce the SSH baseline across the fleet
+  domain: automation
+  frameworks: [ct-platform:config-automation]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [exam, capstone, ansible, ssh, sshd, roles, hardening]
+  version: 1
+spec:
+  description: |
+    **Directory:** `~/exam/ssh-hardening` · **Hosts:** `qm-build-1`, `qm-build-2` (group `builders`)
+
+    Quillmoor Logistics' security baseline for SSH is not applied on the build hosts yet.
+    You work as `learner` on the workstation; the account `devops` on both hosts accepts
+    your SSH key and may use sudo without a password. Only members of the group **`ops`**
+    (it holds `devops`, the lab account `learner` and `root`) may keep logging in. Root must
+    keep its key login, because the lab platform administers the hosts through it. Every playbook
+    you write is run again by the grader (it must report no changes).
+
+    The project directory has an inventory (group `builders`) and an `ansible.cfg` with the
+    remote user `devops` and the role path. Write a role **`sshd_baseline`** under `roles/`
+    and the playbook **`ssh.yml`** that applies it to the **builders** group so that, on
+    both hosts, the **effective** sshd configuration (what `sshd -T` prints) has:
+
+    - **password authentication off** and **root login by password refused** (`PermitRootLogin prohibit-password`, key logins only);
+    - **`AllowGroups ops root`** and **`MaxAuthTries {{tries}}`**.
+
+    The role must **validate** a new configuration with sshd itself before it is installed,
+    and apply it by **reloading** the SSH service, not by restarting it. The key logins of
+    `devops` and `learner` must keep working. Run it.
+  objectives:
+    - Write a role that manages sshd settings safely with validation and a reload handler
+    - Know that the first value of a directive wins across sshd configuration files
+  params:
+    tries:
+      type: int
+      min: 3
+      max: 6
+  topology:
+    entry: workstation
+    nodes:
+      - { name: workstation, driver: container, image: ansible-ctl:2.21, access: [shell] }
+      - { name: qm-build-1, driver: vm, image: ubuntu-vm:24.04, resources: { cpu: 1, memoryMiB: 1280 }, access: [ssh] }
+      - { name: qm-build-2, driver: vm, image: ubuntu-vm:24.04, resources: { cpu: 1, memoryMiB: 1280 }, access: [ssh] }
+  setup:
+    - on: qm-build-1
+      timeoutSec: 300
+      run: &qm-host |
+        set -eu
+        id devops >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Exam automation" devops
+        install -d -m 0700 -o devops -g devops /home/devops/.ssh
+        install -m 0600 -o devops -g devops /home/learner/.ssh/authorized_keys /home/devops/.ssh/authorized_keys
+        printf 'devops ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/devops
+        chmod 0440 /etc/sudoers.d/devops
+        [ -f /var/tmp/.ct-qmssh-seeded ] && exit 0
+        # ubuntu-vm: cloud-init re-creates the online ubuntu.sources at first boot; keep apt offline (local repos only)
+        if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then mv /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list.d/ubuntu.sources.cloud-init; rm -rf /var/lib/apt/lists/*; fi
+        apt-get update -q >/dev/null
+        groupadd -f ops
+        usermod -aG ops devops
+        usermod -aG ops learner
+        usermod -aG ops root
+        printf '# Quillmoor legacy build host settings\nPasswordAuthentication yes\nPermitRootLogin yes\nMaxAuthTries 10\n' > /etc/ssh/sshd_config.d/40-qm-legacy.conf
+        sshd -t
+        systemctl reload ssh || systemctl restart ssh
+        touch /var/tmp/.ct-qmssh-seeded
+    - { on: qm-build-2, timeoutSec: 300, run: *qm-host }
+    - on: workstation
+      run: |
+        set -eu
+        p=/home/learner/exam/ssh-hardening
+        install -d -o learner -g learner /home/learner/exam $p $p/roles
+        printf 'builders:\n  hosts:\n    qm-build-1:\n    qm-build-2:\n' > $p/inventory.yml
+        printf '[defaults]\ninventory = inventory.yml\nremote_user = devops\nroles_path = /home/learner/exam/ssh-hardening/roles\n' > $p/ansible.cfg
+        chown -R learner:learner $p
+  checks:
+    - id: effective-build-1
+      description: qm-build-1 has the baseline in its effective sshd configuration
+      type: shell
+      on: qm-build-1
+      skills: [linux.remote.ssh, linux.security.ssh-hardening]
+      weight: 2
+      command: &sshd-effective |
+        mkdir -p /run/sshd; sshd -T 2>/dev/null | awk '$1=="allowgroups"{g=g (g?" ":"") $2; next} $1~/^(maxauthtries|passwordauthentication|permitrootlogin)$/{print} END{print "allowgroups " g}' | sed 's/prohibit-password/without-password/' | sort | paste -sd,
+      expect: { match: exact, value: "allowgroups ops root,maxauthtries {{tries}},passwordauthentication no,permitrootlogin without-password" }
+    - { id: effective-build-2, description: "qm-build-2 has the baseline in its effective sshd configuration", type: shell, on: qm-build-2, skills: [linux.remote.ssh, linux.security.ssh-hardening], weight: 2, command: *sshd-effective, expect: { match: exact, value: "allowgroups ops root,maxauthtries {{tries}},passwordauthentication no,permitrootlogin without-password" } }
+    - id: daemon-live
+      description: The running SSH daemons offer only public key login and the key logins of devops and learner still work
+      type: shell
+      on: workstation
+      skills: [linux.remote.ssh]
+      weight: 2
+      timeoutSec: 120
+      command: |
+        r=""
+        for h in qm-build-1 qm-build-2; do
+          m=$(ct-ansible run /home/learner ssh -o BatchMode=yes -o PreferredAuthentications=password -o PubkeyAuthentication=no -o ConnectTimeout=10 devops@$h true 2>&1)
+          if echo "$m" | grep -q password || ! echo "$m" | grep -q publickey; then r="$r $h:password-offered"; fi
+          for u in devops learner; do
+            ct-ansible run /home/learner ssh -o BatchMode=yes -o ConnectTimeout=10 $u@$h true >/dev/null 2>&1 || r="$r $u@$h:locked-out"
+          done
+        done
+        echo "${r:-ok}"
+      expect: { match: exact, value: ok }
+    - id: role-shape
+      description: The role validates the configuration with sshd, reloads the service from a handler, and ssh.yml applies it to builders
+      type: shell
+      on: workstation
+      skills: [automation.reuse.roles]
+      command: |
+        p=/home/learner/exam/ssh-hardening
+        r=$p/roles/sshd_baseline
+        [ -f $r/tasks/main.yml ] || { echo no-role; exit 0; }
+        grep -rqE 'validate:.*sshd.* -t' $r/tasks || { echo no-validate; exit 0; }
+        grep -rqE 'reloaded|reload' $r/handlers 2>/dev/null || { echo no-reload-handler; exit 0; }
+        grep -rqE 'notify' $r/tasks || { echo no-notify; exit 0; }
+        /opt/ansible/bin/python3 - $p/ssh.yml <<'PY' 2>/dev/null || { echo no-playbook; exit 0; }
+        import sys, yaml
+        plays = yaml.safe_load(open(sys.argv[1])) or []
+        ok = any(p.get("hosts") == "builders" and any((x if isinstance(x, str) else x.get("role", x.get("name"))) == "sshd_baseline" for x in p.get("roles", [])) for p in plays)
+        sys.exit(0 if ok else 1)
+        PY
+        echo ok
+      expect: { match: exact, value: ok }
+  exam:
+    rerun:
+      - on: workstation
+        timeoutSec: 600
+        run: |
+          r=$(ct-ansible recap /home/learner/exam/ssh-hardening ssh.yml)
+          echo "$r"
+          [ "$r" = "changed=0 failed=0 unreachable=0" ]
+  misconceptions:
+    - id: main-file-edit
+      description: Edits /etc/ssh/sshd_config with line edits although a drop-in earlier in the include order sets the old values.
+      feedback: sshd uses the first value it reads and the drop-in directory is included at the top of the main file; check the effective configuration with sshd -T.
+      expectFail: [effective-build-1, effective-build-2, daemon-live]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/exam/ssh-hardening
+          mkdir -p roles/sshd_baseline/tasks roles/sshd_baseline/handlers
+          cat > roles/sshd_baseline/tasks/main.yml <<'EOF'
+          - ansible.builtin.lineinfile:
+              path: /etc/ssh/sshd_config
+              regexp: "^#?{{ item.key }} "
+              line: "{{ item.key }} {{ item.value }}"
+              validate: "/usr/sbin/sshd -t -f %s"
+            loop:
+              - { key: PermitRootLogin, value: prohibit-password }
+              - { key: PasswordAuthentication, value: "no" }
+              - { key: AllowGroups, value: "ops root" }
+              - { key: MaxAuthTries, value: "{{tries}}" }
+            notify: Reload sshd
+          EOF
+          printf -- '- name: Reload sshd\n  ansible.builtin.service: { name: ssh, state: reloaded }\n' > roles/sshd_baseline/handlers/main.yml
+          printf -- '- hosts: builders\n  become: true\n  roles:\n    - sshd_baseline\n' > ssh.yml
+          ansible-playbook ssh.yml
+    - id: no-validation
+      description: Installs the baseline drop-in without letting sshd validate it first.
+      feedback: A broken sshd configuration can lock every administrator out; validate the new file with sshd -t before it replaces the old one.
+      expectFail: [role-shape]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/exam/ssh-hardening
+          mkdir -p roles/sshd_baseline/tasks roles/sshd_baseline/handlers
+          cat > roles/sshd_baseline/tasks/main.yml <<'EOF'
+          - ansible.builtin.file: { path: /etc/ssh/sshd_config.d/40-qm-legacy.conf, state: absent }
+          - ansible.builtin.copy:
+              dest: /etc/ssh/sshd_config.d/00-qm-baseline.conf
+              content: "PermitRootLogin prohibit-password\nPasswordAuthentication no\nAllowGroups ops root\nMaxAuthTries {{tries}}\n"
+              mode: "0644"
+            notify: Reload sshd
+          EOF
+          printf -- '- name: Reload sshd\n  ansible.builtin.service: { name: ssh, state: reloaded }\n' > roles/sshd_baseline/handlers/main.yml
+          printf -- '- hosts: builders\n  become: true\n  roles:\n    - sshd_baseline\n' > ssh.yml
+          ansible-playbook ssh.yml
+  solution:
+    explanation: |
+      sshd takes the first value of a directive and reads sshd_config.d/*.conf before the rest of
+      sshd_config, so the legacy drop-in has to go (or the new file has to sort before it). The template
+      task validates the fragment with sshd -t -f and notifies a handler that reloads the ssh service.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/exam/ssh-hardening
+          mkdir -p roles/sshd_baseline/tasks roles/sshd_baseline/handlers roles/sshd_baseline/templates
+          cat > roles/sshd_baseline/templates/baseline.conf.j2 <<'EOF'
+          # Managed by Ansible: Quillmoor SSH baseline
+          PermitRootLogin prohibit-password
+          PasswordAuthentication no
+          KbdInteractiveAuthentication no
+          AllowGroups ops root
+          MaxAuthTries {{tries}}
+          EOF
+          cat > roles/sshd_baseline/tasks/main.yml <<'EOF'
+          ---
+          - name: Remove the legacy drop-in that sets the old values first
+            ansible.builtin.file:
+              path: /etc/ssh/sshd_config.d/40-qm-legacy.conf
+              state: absent
+            notify: Reload sshd
+          - name: Baseline drop-in
+            ansible.builtin.template:
+              src: baseline.conf.j2
+              dest: /etc/ssh/sshd_config.d/00-qm-baseline.conf
+              owner: root
+              group: root
+              mode: "0644"
+              validate: /usr/sbin/sshd -t -f %s
+            notify: Reload sshd
+          EOF
+          cat > roles/sshd_baseline/handlers/main.yml <<'EOF'
+          ---
+          - name: Reload sshd
+            ansible.builtin.service:
+              name: ssh
+              state: reloaded
+          EOF
+          cat > ssh.yml <<'EOF'
+          - name: SSH baseline
+            hosts: builders
+            become: true
+            roles:
+              - sshd_baseline
+          EOF
+          ansible-playbook ssh.yml

@@ -12,7 +12,8 @@ The source of truth is each lab's `status`/`notes` in `content/curriculum.yaml`.
 |---|---|---|---|
 | Path `ansible-fundamentals`, tier-A labs (9 of 12) | 9 | **9** | 0 |
 | Path `ansible-fundamentals`, tier-B labs (`ov-conditionals-os-family`, `ov-handlers-web-reload`, `ov-template-claims-vhost`) | 0 | 0 | 3 (need VMs, see Next steps) |
-| Exam `sim-el-automation` pool (34 tasks) | 15 (one per draw) | 0 per-task; all 15 passed a live exam run | 19 |
+| Exam `sim-el-automation` pool (32 pooled tasks) | 34 written (15 passed a live exam run; 19 written in round 5 wave 1, never run live; 2 of those blocked and held out of the pools) | 0 per-task | 0 |
+| Capstone tasks `xpe-ansible-node-agents`, `xpe-ansible-ssh-hardening` (pool of `sim-platform-engineer`) | 2 (round 5 wave 1, never run live) | 0 | 0 |
 | Paths `el-automation-engineer`, `automation-engineering-practices`, `automation-content-developer`, `automation-controller-operations`, `network-automation`, `event-driven-automation` | 0 | 0 | 49 |
 
 Verified learning labs (path order): ov-first-inventory, ov-bootstrap-automation-user,
@@ -147,10 +148,49 @@ corresponding source is the unmodified PyPI release named in `requirements.lock`
 navigator, Molecule, ansible-builder, ansible-runner and the collections are GPL-3.0 or
 Apache/MIT/BSD; same treatment. The inventory header now says so.
 
+## Round 5, wave 1 (write-only)
+
+PR `content/automation-r5-w1`: the 19 remaining `xan-*` exam tasks and the 2 `xpe-ansible-*`
+capstone tasks, all `built`, none run live (no heavy slot this round). `sim-el-automation` now
+compiles without `--allow-missing` (32 pooled tasks (34 written) against 30 needed) and is on the CI compile list.
+Pools: baseline 2/2, core 4/4, inventory 2/2, nodes 2/2, run 2/2, git 2/2, errors 4/4,
+roles 4/4 (timesync and selinux written but held out, blocked), sys 8/8, tpl 2/2.
+
+Shared gate change: `tools/lab-verify/src/curriculum.mjs` now lets an exam task whose notes start with
+`blocked:` sit in no exam pool (all other exam tasks must still be pooled); other domain owners may use this
+for blocked exam tasks.
+
+Conventions (see each lab's notes in `content/curriculum.yaml`): all 34 tasks share the four
+VMs, so every setup is idempotent (`/var/tmp/.ct-<task>-seeded`), the node's local repo, sshd
+port 22, `devops` and the learner key are never touched, and ports / users / directories are
+unique per task (repo server 8800-8809 on node4, slow service 8830-8839 on node3, backends
+8840-8849 on node2/node3, repo ids `ov-*`). Checks and setups run through `/bin/sh -c`: dash on
+the control node and Ubuntu VMs, bash on the Alma VMs.
+
+Adaptations: no Linux user devops on the control node (baseline: dedicated key pair
+`~/.ssh/devops_exam`); bootstrap uses a different account through an installer account
+`ovinstall`; handler task runs on node2 (test group); hotfix repo is a separate bare repo;
+data disks are addressed by serial (`/dev/disk/by-id/virtio-ct-data1/2`); the 1 GiB partition
+becomes a 400-600 MiB param; el10 has no php and the local repo has no comps groups (php became
+httpd, setup builds a metadata-only `/opt/ov-groups` repo with the group Development Tools); the
+Galaxy role is a CloudTrain-written `balancer` role; the time server is a chronyd on node4.
+
+Blockers recorded in the curriculum notes: `xan-roles-system-timesync` and
+`xan-roles-system-selinux` need `fedora.linux_system_roles` in `ansible-ctl` / the Ansible
+mirror (setup fails fast with a clear message; both are taken out of the `sim-el-automation` roles pool, which keeps 4 tasks for a draw of 2, because the exam draw does not filter by status; add them back to the blueprint once the collection ships). The
+shared Quillmoor estate topology for the `xpe-*` tasks is still undecided (the two automation
+tasks use a standalone workstation plus `qm-build-1/2`); the assessment owner decides.
+Assumptions to confirm live: node names resolve from the managed nodes (repo and backend
+URLs use `node4`, `node2`, `node3`), `/dev/disk/by-id/virtio-ct-data*` links exist, and
+`ansible-navigator run` accepts `--tags` / `--limit`, and the navigator artifact key names (`.plays[].tasks[].task` / `.host`; the `xan-run-limit-tags` check also accepts `__task` / `__host`). `xpe-ansible-ssh-hardening` keeps root key logins (`PermitRootLogin prohibit-password`, `AllowGroups ops root`) because the platform administers VMs as root over SSH; confirm `sshd -T` prints `without-password` on noble.
+
+Verify queue for the testing round: two disjoint `exam run --auto-solve --attempts 2` runs plus
+`--no-solve` for `sim-el-automation`, then a per-task `labctl verify` of all 19 tasks and the 2
+`xpe-ansible-*` tasks in the vm slot (one session at a time; four VMs per exam session).
+
 ## Next steps
 
-1. **Exam pool:** author the other 19 `xan-*` tasks so each pool holds twice its draw
-   (compile without `--allow-missing`), then two disjoint `exam run --auto-solve
+1. **Exam pool:** (authored in round 5 wave 1) run two disjoint `exam run --auto-solve
    --attempts 2` runs plus `--no-solve`. Per-task `labctl verify` of exam tasks boots four
    el-vm VMs per session: run them one at a time in the vm slot, or rely on exam runs.
 2. **Tier-B fundamentals labs** (`ov-conditionals-os-family`, `ov-handlers-web-reload`,

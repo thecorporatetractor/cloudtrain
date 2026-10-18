@@ -1,0 +1,228 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xan-tpl-hosts-file
+  title: Generate a hosts file from inventory facts
+  domain: automation
+  frameworks: [ex294-aligned:templates-vault]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [exam, ansible, templates, facts, hostvars]
+  version: 1
+spec:
+  description: |
+    **Exam environment.** You work as `learner` on the control node `control`. The
+    managed nodes are `node1` (group `dev`), `node2` (`test`), `node3` (`prod`, also in
+    `webservers`) and `node4` (`balancers`), all Enterprise Linux 10; the account
+    `devops` on every node accepts your SSH key and may use sudo without a password.
+    Packages come from each node's local repository. Every playbook you write is run
+    again by the grader (it must report no changes), then every node is rebooted before
+    the final checks.
+
+    Write a Jinja2 template **`hosts.j2`** and the playbook
+    **`/home/learner/exam/hostsfile/hosts.yml`** (the directory has an inventory and an
+    `ansible.cfg` with the remote user `devops`) that create **`/etc/myhosts`** on the
+    **dev** hosts only, owned by `root`, mode `0644`, containing:
+
+    - first the comment line **`# Orrin and Vale estate hosts - {{site}}`**;
+    - then **one line for every host of the inventory** (all four nodes, not only the dev
+      host), in the format of `/etc/hosts`: the host's **IPv4 address**, its **FQDN** and its
+      **short host name**, separated by spaces.
+
+    The values must come from the hosts' own facts, not typed in. Run the playbook; a second
+    run must report no changes.
+  objectives:
+    - Render a file from a Jinja2 template using facts of every inventory host
+    - Gather facts for hosts that a play does not target
+  params:
+    site:
+      type: choice
+      values: [Leeds, Bristol, Cardiff, York]
+  topology:
+    entry: control
+    nodes:
+      - { name: control, driver: container, image: ansible-ctl:2.21, access: [shell] }
+      - { name: node1, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node2, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node3, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node4, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+  setup:
+    - on: node1
+      timeoutSec: 120
+      run: &exam-node |
+        set -eu
+        id devops >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Exam automation" devops
+        install -d -m 0700 -o devops -g devops /home/devops/.ssh
+        install -m 0600 -o devops -g devops /home/learner/.ssh/authorized_keys /home/devops/.ssh/authorized_keys
+        printf 'devops ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/devops
+        chmod 0440 /etc/sudoers.d/devops
+    - { on: node2, timeoutSec: 120, run: *exam-node }
+    - { on: node3, timeoutSec: 120, run: *exam-node }
+    - { on: node4, timeoutSec: 120, run: *exam-node }
+    - on: control
+      run: |
+        set -eu
+        p=/home/learner/exam/hostsfile
+        install -d -o learner -g learner /home/learner/exam $p
+        cat > $p/inventory.yml <<'EOF'
+        dev:
+          hosts:
+            node1:
+        test:
+          hosts:
+            node2:
+        prod:
+          hosts:
+            node3:
+        balancers:
+          hosts:
+            node4:
+        webservers:
+          children:
+            prod:
+        EOF
+        printf '[defaults]\ninventory = inventory.yml\nremote_user = devops\n' > $p/ansible.cfg
+        chown -R learner:learner $p
+  checks:
+    - id: hosts-content
+      description: /etc/myhosts on node1 lists the address, FQDN and short name of all four hosts, matching their facts
+      type: shell
+      on: control
+      skills: [automation.content.templates, automation.data.facts]
+      weight: 3
+      timeoutSec: 150
+      command: |
+        d=/home/learner/exam/hostsfile
+        want=$(ct-ansible run $d env ANSIBLE_LOAD_CALLBACK_PLUGINS=1 ANSIBLE_STDOUT_CALLBACK=ansible.posix.json \
+          ansible all -m ansible.builtin.setup -a 'filter=ansible_fqdn,ansible_hostname,ansible_default_ipv4' 2>/dev/null \
+          | jq -r '.plays[0].tasks[0].hosts | to_entries[] | .value.ansible_facts | "\(.ansible_default_ipv4.address) \(.ansible_fqdn) \(.ansible_hostname)"' | sort)
+        got=$(ct-ansible run $d ssh -o BatchMode=yes devops@node1 cat /etc/myhosts 2>/dev/null \
+          | grep -v '^[[:space:]]*#' | grep -v '^[[:space:]]*$' | sed 's/[[:space:]][[:space:]]*/ /g; s/ $//' | sort)
+        [ "$(echo "$want" | wc -l)" = 4 ] && [ "$want" = "$got" ] && echo ok || echo differs
+      expect: { match: exact, value: ok }
+    - id: hosts-file
+      description: /etc/myhosts on node1 is owned by root with mode 0644 and starts with the required comment line
+      type: shell
+      on: node1
+      skills: [automation.content.templates]
+      command: echo "$(stat -c '%U %a' /etc/myhosts 2>/dev/null) $(head -n 1 /etc/myhosts 2>/dev/null)"
+      expect: { match: exact, value: "root 644 # Orrin and Vale estate hosts - {{site}}" }
+    - id: others-absent
+      description: node1 has /etc/myhosts and node2, node3 and node4 have none
+      type: shell
+      on: control
+      skills: [automation.content.templates]
+      timeoutSec: 120
+      command: |
+        r() { ct-ansible run /home/learner ssh -o BatchMode=yes -o ConnectTimeout=10 devops@$1 '[ -e /etc/myhosts ] && echo present || echo absent' 2>/dev/null; }
+        [ "$(r node1)" = present ] || { echo node1-missing; exit 0; }
+        n=0; for h in node2 node3 node4; do [ "$(r $h)" = absent ] || n=$((n+1)); done
+        [ $n = 0 ] && echo ok || echo "present=$n"
+      expect: { match: exact, value: ok }
+    - id: uses-template
+      description: hosts.yml renders the file with the template module from a template that reads host variables
+      type: shell
+      on: control
+      skills: [automation.content.templates]
+      command: |
+        d=/home/learner/exam/hostsfile
+        /opt/ansible/bin/python3 - $d/hosts.yml <<'PY' 2>/dev/null || { echo no-playbook; exit 0; }
+        import sys, json, yaml
+        plays = yaml.safe_load(open(sys.argv[1])) or []
+        ok = any(isinstance(t, dict) and ("template" in t or "ansible.builtin.template" in t) for p in plays for t in (p.get("tasks") or []))
+        sys.exit(0 if ok else 1)
+        PY
+        [ $? -eq 0 ] || { echo no-template-task; exit 0; }
+        grep -qs hostvars $d/*.j2 $d/templates/*.j2 2>/dev/null && echo ok || echo no-hostvars
+      expect: { match: exact, value: ok }
+  exam:
+    rerun:
+      - on: control
+        timeoutSec: 600
+        run: |
+          r=$(ct-ansible recap /home/learner/exam/hostsfile hosts.yml)
+          echo "$r"
+          [ "$r" = "changed=0 failed=0 unreachable=0" ]
+  misconceptions:
+    - id: own-facts-only
+      description: Writes every line with the facts of the host being configured instead of each host's own.
+      feedback: Each line must carry that host's own address and names; read them from hostvars of every inventory host.
+      expectFail: [hosts-content]
+      mutation:
+        on: control
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/exam/hostsfile
+          cat > hosts.j2 <<'EOF'
+          # Orrin and Vale estate hosts - {{site}}
+          {% for h in groups['all'] %}
+          {{ ansible_default_ipv4.address }} {{ ansible_fqdn }} {{ h }}
+          {% endfor %}
+          EOF
+          cat > hosts.yml <<'EOF'
+          - hosts: dev
+            become: true
+            tasks:
+              - ansible.builtin.template: { src: hosts.j2, dest: /etc/myhosts, owner: root, group: root, mode: "0644" }
+          EOF
+          ansible-playbook hosts.yml
+    - id: no-facts-for-others
+      description: Runs only against the dev group, so the facts of the other hosts are not available to the template.
+      feedback: The template needs facts of hosts the play does not target; gather them in an earlier play for all hosts.
+      expectFail: [hosts-content]
+      mutation:
+        on: control
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/exam/hostsfile
+          cat > hosts.j2 <<'EOF'
+          # Orrin and Vale estate hosts - {{site}}
+          {% for h in groups['all'] %}
+          {{ hostvars[h].ansible_default_ipv4.address | default('0.0.0.0') }} {{ hostvars[h].ansible_fqdn | default(h) }} {{ h }}
+          {% endfor %}
+          EOF
+          cat > hosts.yml <<'EOF'
+          - hosts: dev
+            become: true
+            tasks:
+              - ansible.builtin.template: { src: hosts.j2, dest: /etc/myhosts, owner: root, group: root, mode: "0644" }
+          EOF
+          ansible-playbook hosts.yml
+  solution:
+    explanation: |
+      A first play for all hosts only gathers facts, so hostvars holds every node's facts; the
+      second play, limited to dev, renders the template that loops over groups['all'].
+    steps:
+      - on: control
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/exam/hostsfile
+          cat > hosts.j2 <<'EOF'
+          # Orrin and Vale estate hosts - {{site}}
+          {% for h in groups['all'] %}
+          {{ hostvars[h].ansible_default_ipv4.address }} {{ hostvars[h].ansible_fqdn }} {{ hostvars[h].ansible_hostname }}
+          {% endfor %}
+          EOF
+          cat > hosts.yml <<'EOF'
+          - name: Gather facts everywhere
+            hosts: all
+            tasks: []
+          - name: Hosts file on the dev hosts
+            hosts: dev
+            become: true
+            tasks:
+              - name: /etc/myhosts
+                ansible.builtin.template:
+                  src: hosts.j2
+                  dest: /etc/myhosts
+                  owner: root
+                  group: root
+                  mode: "0644"
+          EOF
+          ansible-playbook hosts.yml

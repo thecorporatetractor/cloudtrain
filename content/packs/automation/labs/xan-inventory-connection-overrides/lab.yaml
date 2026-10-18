@@ -1,0 +1,197 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xan-inventory-connection-overrides
+  title: Reach a node on a non-standard SSH port
+  domain: automation
+  frameworks: [ex294-aligned:config-inventory]
+  difficulty: easy
+  estimatedMinutes: 8
+  tags: [exam, ansible, inventory, ssh, connection]
+  version: 1
+spec:
+  description: |
+    **Exam environment.** You work as `learner` on the control node `control`. The
+    managed nodes are `node1` (group `dev`), `node2` (`test`), `node3` (`prod`, also in
+    `webservers`) and `node4` (`balancers`), all Enterprise Linux 10; the account
+    `devops` on every node accepts your SSH key and may use sudo without a password.
+    Packages come from each node's local repository. Every playbook you write is run
+    again by the grader (it must report no changes), then every node is rebooted before
+    the final checks.
+
+    In **`/home/learner/exam/overrides`** the inventory `inventory.yml` and `ansible.cfg`
+    (remote user `devops`) are supplied. The balancer is listed there under the name
+    **`legacy-api`**, which does not resolve in DNS: it is the machine you know as
+    `node4`. The legacy listener on that machine is a second SSH port, **2202**, and only
+    the account **`{{legacyuser}}`** may log in through it (your key is installed for it).
+
+    Edit the inventory so that every host answers `ansible all -m ping` run in that
+    directory. Describe the connection of `legacy-api` with **host variables in the
+    inventory**; do not change the machine, `ansible.cfg`, your SSH configuration or the
+    other hosts.
+  objectives:
+    - Override the address, port and user of one inventory host
+  params:
+    legacyuser:
+      type: choice
+      values: [ovlegacy, ovedge, ovsvc]
+  topology:
+    entry: control
+    nodes:
+      - { name: control, driver: container, image: ansible-ctl:2.21, access: [shell] }
+      - { name: node1, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node2, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node3, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node4, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+  setup:
+    - on: node1
+      timeoutSec: 120
+      run: &exam-node |
+        set -eu
+        id devops >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Exam automation" devops
+        install -d -m 0700 -o devops -g devops /home/devops/.ssh
+        install -m 0600 -o devops -g devops /home/learner/.ssh/authorized_keys /home/devops/.ssh/authorized_keys
+        printf 'devops ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/devops
+        chmod 0440 /etc/sudoers.d/devops
+    - { on: node2, timeoutSec: 120, run: *exam-node }
+    - { on: node3, timeoutSec: 120, run: *exam-node }
+    - { on: node4, timeoutSec: 120, run: *exam-node }
+    - on: node4
+      timeoutSec: 180
+      run: |
+        set -eu
+        [ -f /var/tmp/.ct-overrides-seeded ] && exit 0
+        id {{legacyuser}} >/dev/null 2>&1 || useradd -m -s /bin/bash {{legacyuser}}
+        install -d -m 0700 -o {{legacyuser}} -g {{legacyuser}} /home/{{legacyuser}}/.ssh
+        install -m 0600 -o {{legacyuser}} -g {{legacyuser}} /home/learner/.ssh/authorized_keys /home/{{legacyuser}}/.ssh/authorized_keys
+        command -v semanage >/dev/null || dnf -y -q install policycoreutils-python-utils >/dev/null
+        cat > /etc/ssh/sshd_config.d/50-ov-legacy.conf <<'CONF'
+        Port 22
+        Port 2202
+        Match LocalPort 2202
+            AllowUsers {{legacyuser}}
+        CONF
+        sshd -t
+        semanage port -a -t ssh_port_t -p tcp 2202 2>/dev/null || semanage port -m -t ssh_port_t -p tcp 2202
+        firewall-cmd -q --permanent --add-port=2202/tcp; firewall-cmd -q --reload
+        sha256sum /etc/ssh/sshd_config.d/50-ov-legacy.conf > /var/tmp/.ct-overrides-sha
+        systemctl reload sshd
+        for i in $(seq 20); do ss -ltn | grep -q ':2202 ' && break; sleep 1; done
+        touch /var/tmp/.ct-overrides-seeded
+    - on: control
+      run: |
+        set -eu
+        p=/home/learner/exam/overrides
+        install -d -o learner -g learner /home/learner/exam $p
+        cat > $p/inventory.yml <<'EOF'
+        dev:
+          hosts:
+            node1:
+        test:
+          hosts:
+            node2:
+        prod:
+          hosts:
+            node3:
+        balancers:
+          hosts:
+            legacy-api:
+        webservers:
+          children:
+            prod:
+        EOF
+        printf '[defaults]\ninventory = inventory.yml\nremote_user = devops\n' > $p/ansible.cfg
+        chown -R learner:learner $p
+        kh=/home/learner/.ssh/known_hosts
+        if ! grep -q '^\[node4\]:2202' $kh 2>/dev/null; then
+          ip=$(getent ahostsv4 node4 | awk 'NR==1{print $1}')
+          k=$(grep -E '^node4[, ]' $kh | head -1 | cut -d' ' -f2-)
+          [ -n "$k" ] && echo "[node4]:2202,[$ip]:2202 $k" >> $kh
+          chown learner:learner $kh
+        fi
+  checks:
+    - id: ping-all
+      description: ansible all -m ping answers from all four hosts
+      type: shell
+      on: control
+      skills: [automation.inventory.connection-vars]
+      weight: 2
+      timeoutSec: 90
+      command: ct-ansible run /home/learner/exam/overrides ansible all -m ansible.builtin.ping -o 2>/dev/null | grep -c SUCCESS
+      expect: { match: exact, value: "4" }
+    - id: overrides
+      description: legacy-api carries host variables for the address of node4, the legacy port and the legacy account
+      type: shell
+      on: control
+      skills: [automation.inventory.connection-vars]
+      weight: 2
+      command: |
+        d=/home/learner/exam/overrides
+        h=$(ct-ansible run $d ansible-inventory --host legacy-api 2>/dev/null) || { echo no-host; exit 0; }
+        a=$(echo "$h" | /opt/ansible/bin/python3 -c 'import sys, json; d = json.load(sys.stdin); print(d.get("ansible_host", "-"), d.get("ansible_port", "-"), d.get("ansible_user", "-"))')
+        set -- $a
+        want=$(getent ahostsv4 node4 | awk 'NR==1{print $1}')
+        got=$(getent ahostsv4 "${1:-none}" | awk 'NR==1{print $1}')
+        [ -n "$want" ] && [ "$got" = "$want" ] && [ "${2:-}" = "2202" ] && [ "${3:-}" = "{{legacyuser}}" ] && echo ok || echo "host=${got:+match} port=${2:-} user=${3:-}"
+      expect: { match: exact, value: ok }
+    - id: inventory-shape
+      description: The groups of the inventory are unchanged and no host variables were added to the other hosts
+      type: shell
+      on: control
+      skills: [automation.inventory.static]
+      command: |
+        ct-ansible run /home/learner/exam/overrides ansible-inventory --list 2>/dev/null | /opt/ansible/bin/python3 -c '
+        import sys, json
+        d = json.load(sys.stdin)
+        g = lambda n: sorted(d.get(n, {}).get("hosts", []))
+        hv = d["_meta"]["hostvars"]
+        plain = all(not any(k.startswith("ansible_") for k in hv.get(h, {})) for h in ("node1", "node2", "node3"))
+        ok = hv.get("legacy-api", {}).get("ansible_port") in (2202, "2202") and g("dev") == ["node1"] and g("test") == ["node2"] and g("prod") == ["node3"] and g("balancers") == ["legacy-api"] and d.get("webservers", {}).get("children") == ["prod"] and plain
+        print("ok" if ok else "changed")' || echo no-inventory
+      expect: { match: exact, value: ok }
+    - id: node-unchanged
+      description: node4 still listens on both SSH ports with its original sshd drop-in
+      type: shell
+      on: node4
+      skills: [automation.inventory.connection-vars]
+      command: |
+        journalctl -u sshd --no-pager 2>/dev/null | grep -q 'Accepted publickey for {{legacyuser}} ' || { echo no-login; exit 0; }
+        sha256sum -c /var/tmp/.ct-overrides-sha >/dev/null 2>&1 && s=unchanged || s=modified
+        echo "$s $(ss -ltn | grep -oE ':(22|2202) ' | sort -u | wc -l)"
+      expect: { match: exact, value: "unchanged 2" }
+  misconceptions:
+    - id: default-user
+      description: Sets the address and the port but keeps the default remote user.
+      feedback: The legacy port accepts only its own account; give legacy-api that user as a host variable.
+      expectFail: [overrides, ping-all]
+      mutation:
+        on: control
+        as: learner
+        run: |
+          set -e
+          cd ~/exam/overrides
+          sed -i 's/^    legacy-api:$/    legacy-api:\n      ansible_host: node4\n      ansible_port: 2202/' inventory.yml
+    - id: no-address
+      description: Sets the port and the user but leaves the unresolvable name as the address.
+      feedback: legacy-api does not resolve; the host needs an ansible_host variable with the node's address.
+      expectFail: [overrides, ping-all]
+      mutation:
+        on: control
+        as: learner
+        run: |
+          set -e
+          cd ~/exam/overrides
+          sed -i 's/^    legacy-api:$/    legacy-api:\n      ansible_port: 2202\n      ansible_user: {{legacyuser}}/' inventory.yml
+  solution:
+    explanation: |
+      ansible_host, ansible_port and ansible_user are connection variables; set under the
+      host in the inventory they override the name, the default port and the remote user for
+      that host only.
+    steps:
+      - on: control
+        as: learner
+        run: |
+          set -e
+          cd ~/exam/overrides
+          sed -i 's/^    legacy-api:$/    legacy-api:\n      ansible_host: node4\n      ansible_port: 2202\n      ansible_user: {{legacyuser}}/' inventory.yml
+          ansible all -m ansible.builtin.ping

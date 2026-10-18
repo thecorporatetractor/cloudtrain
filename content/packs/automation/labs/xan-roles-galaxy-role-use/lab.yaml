@@ -1,0 +1,356 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xan-roles-galaxy-role-use
+  title: Use an installed role with overridden variables
+  domain: automation
+  frameworks: [ex294-aligned:roles-collections]
+  difficulty: medium
+  estimatedMinutes: 12
+  tags: [exam, ansible, roles, variables, haproxy]
+  version: 1
+spec:
+  description: |
+    **Exam environment.** You work as `learner` on the control node `control`. The
+    managed nodes are `node1` (group `dev`), `node2` (`test`), `node3` (`prod`, also in
+    `webservers`) and `node4` (`balancers`), all Enterprise Linux 10; the account
+    `devops` on every node accepts your SSH key and may use sudo without a password.
+    Packages come from each node's local repository. Every playbook you write is run
+    again by the grader (it must report no changes), then every node is rebooted before
+    the final checks.
+
+    Two small page servers run on **`node2`** and **`node3`**, both on port
+    **`{{bport}}`** (each page names its server). The role **`balancer`**, written by the
+    platform team, is installed in `/home/learner/exam/balancer/roles/`; it sets up
+    a load balancer and documents its variables in its README and argument specification
+    (`ansible-doc -t role balancer` shows them). Do not edit the role.
+
+    Write the playbook **`/home/learner/exam/balancer/balancer.yml`** (the directory has an
+    inventory and an `ansible.cfg` with the remote user `devops` and the role path) that
+    applies the role to the **balancers** group, overriding its variables so that:
+
+    - the two page servers above are the **backends**;
+    - requests are **shared between the backends in turn** (the role's default does not do
+      that).
+
+    Run it. Requests to `http://node4/` must then be answered by both servers, and a second
+    run must report no changes.
+  objectives:
+    - Apply an existing role by overriding its documented variables
+    - Read a role's argument specification to find the right variables
+  params:
+    bport:
+      type: int
+      min: 8840
+      max: 8849
+    site:
+      type: choice
+      values: [Leeds, Bristol, Cardiff, York]
+  topology:
+    entry: control
+    nodes:
+      - { name: control, driver: container, image: ansible-ctl:2.21, access: [shell] }
+      - { name: node1, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node2, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node3, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node4, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+  setup:
+    - on: node1
+      timeoutSec: 120
+      run: &exam-node |
+        set -eu
+        id devops >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Exam automation" devops
+        install -d -m 0700 -o devops -g devops /home/devops/.ssh
+        install -m 0600 -o devops -g devops /home/learner/.ssh/authorized_keys /home/devops/.ssh/authorized_keys
+        printf 'devops ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/devops
+        chmod 0440 /etc/sudoers.d/devops
+    - { on: node2, timeoutSec: 120, run: *exam-node }
+    - { on: node3, timeoutSec: 120, run: *exam-node }
+    - { on: node4, timeoutSec: 120, run: *exam-node }
+    - on: node2
+      timeoutSec: 120
+      run: &backend |
+        set -eu
+        [ -f /var/tmp/.ct-balancer-seeded ] && exit 0
+        case "$(hostname)" in node2*) n=node2 ;; node3*) n=node3 ;; *) n=$(hostname -s) ;; esac
+        install -d /srv/ov-backend
+        printf 'backend %s - {{site}}\n' "$n" > /srv/ov-backend/index.html
+        cat > /etc/systemd/system/ov-backend.service <<'UNIT'
+        [Unit]
+        Description=Orrin and Vale page backend
+        After=network-online.target
+        [Service]
+        ExecStart=/usr/bin/python3 -m http.server {{bport}} --directory /srv/ov-backend
+        Restart=always
+        [Install]
+        WantedBy=multi-user.target
+        UNIT
+        systemctl daemon-reload; systemctl enable --now ov-backend
+        firewall-cmd -q --permanent --add-port={{bport}}/tcp; firewall-cmd -q --reload
+        touch /var/tmp/.ct-balancer-seeded
+    - { on: node3, timeoutSec: 120, run: *backend }
+    - on: node4
+      timeoutSec: 240
+      run: |
+        set -eu
+        rpm -q policycoreutils-python-utils >/dev/null 2>&1 || dnf -y -q install policycoreutils-python-utils >/dev/null
+    - on: control
+      run: |
+        set -eu
+        p=/home/learner/exam/balancer
+        r=$p/roles/balancer
+        install -d -o learner -g learner /home/learner/exam $p
+        install -d $r/defaults $r/tasks $r/handlers $r/templates $r/meta
+        cat > $p/inventory.yml <<'EOF'
+        dev:
+          hosts:
+            node1:
+        test:
+          hosts:
+            node2:
+        prod:
+          hosts:
+            node3:
+        balancers:
+          hosts:
+            node4:
+        webservers:
+          children:
+            prod:
+        EOF
+        printf '[defaults]\ninventory = inventory.yml\nremote_user = devops\nroles_path = /home/learner/exam/balancer/roles\n' > $p/ansible.cfg
+        cat > $r/defaults/main.yml <<'EOF'
+        ---
+        balancer_listen_port: 80
+        balancer_algorithm: first
+        EOF
+        cat > $r/meta/argument_specs.yml <<'EOF'
+        ---
+        argument_specs:
+          main:
+            short_description: HTTP load balancer in front of web backends
+            options:
+              balancer_backends:
+                type: list
+                elements: dict
+                required: true
+                description:
+                  - Servers that receive the traffic.
+                options:
+                  name:
+                    type: str
+                    required: true
+                    description: Name shown in the balancer configuration.
+                  address:
+                    type: str
+                    required: true
+                    description: Host name or address of the backend.
+                  port:
+                    type: int
+                    default: 80
+                    description: TCP port of the backend.
+              balancer_listen_port:
+                type: int
+                default: 80
+                description: Port the balancer listens on.
+              balancer_algorithm:
+                type: str
+                default: first
+                choices: [first, roundrobin, leastconn]
+                description:
+                  - How requests are spread over the backends.
+                  - C(first) sends everything to the first healthy backend.
+        EOF
+        printf -- '---\ngalaxy_info:\n  author: Orrin and Vale platform team\n  description: HTTP load balancer\n  license: MIT\n  min_ansible_version: "2.16"\n  platforms: [{name: EL, versions: ["10"]}]\ndependencies: []\n' > $r/meta/main.yml
+        cat > $r/tasks/main.yml <<'EOF'
+        ---
+        - name: HAProxy package
+          ansible.builtin.dnf:
+            name: haproxy
+            state: present
+        - name: Allow HAProxy to reach any backend port
+          ansible.posix.seboolean:
+            name: haproxy_connect_any
+            state: true
+            persistent: true
+        - name: Balancer configuration
+          ansible.builtin.template:
+            src: haproxy.cfg.j2
+            dest: /etc/haproxy/haproxy.cfg
+            mode: "0644"
+            validate: haproxy -c -f %s
+          notify: Restart haproxy
+        - name: HAProxy running and enabled
+          ansible.builtin.service:
+            name: haproxy
+            state: started
+            enabled: true
+        - name: Listen port open in firewalld
+          ansible.posix.firewalld:
+            port: "{{ balancer_listen_port }}/tcp"
+            state: enabled
+            permanent: true
+            immediate: true
+        EOF
+        cat > $r/handlers/main.yml <<'EOF'
+        ---
+        - name: Restart haproxy
+          ansible.builtin.service:
+            name: haproxy
+            state: restarted
+        EOF
+        cat > $r/templates/haproxy.cfg.j2 <<'EOF'
+        # Managed by the balancer role
+        global
+            maxconn 256
+        defaults
+            mode http
+            timeout connect 5s
+            timeout client 30s
+            timeout server 30s
+        frontend ov_front
+            bind *:{{ balancer_listen_port }}
+            default_backend ov_back
+        backend ov_back
+            balance {{ balancer_algorithm }}
+        {% for b in balancer_backends %}
+            server {{ b.name }} {{ b.address }}:{{ b.port | default(80) }} check
+        {% endfor %}
+        EOF
+        cat > $r/README.md <<'EOF'
+        # balancer
+
+        Installs HAProxy and spreads HTTP requests over a list of backends.
+
+        | Variable | Default | Meaning |
+        |---|---|---|
+        | `balancer_backends` | (required) | list of `{name, address, port}` |
+        | `balancer_listen_port` | `80` | port the balancer listens on |
+        | `balancer_algorithm` | `first` | `first`, `roundrobin` or `leastconn` |
+
+        The role sets the SELinux boolean `haproxy_connect_any` so that HAProxy may use
+        backends on non-standard ports, and opens the listen port in firewalld.
+        EOF
+        chown -R learner:learner $p
+        (cd $p && find roles -type f | sort | xargs sha256sum > /var/tmp/.ct-balancer-sha)
+        chmod 0444 /var/tmp/.ct-balancer-sha
+  checks:
+    - id: alternates
+      description: Repeated requests to http://node4/ are answered by both page servers
+      type: shell
+      on: control
+      skills: [automation.reuse.roles, automation.data.variables]
+      weight: 3
+      command: |
+        for i in 1 2 3 4 5 6; do curl -s -m 5 http://node4/ | awk '{print $2}'; done | sort -u | tr '\n' ' ' | sed 's/ $//'
+      expect: { match: exact, value: node2 node3 }
+    - id: role-intact
+      description: The supplied role is unchanged and balancer.yml applies it to the balancers group
+      type: shell
+      on: control
+      skills: [automation.reuse.roles]
+      command: |
+        p=/home/learner/exam/balancer
+        (cd $p && sha256sum -c /var/tmp/.ct-balancer-sha >/dev/null 2>&1) || { echo role-modified; exit 0; }
+        /opt/ansible/bin/python3 - $p/balancer.yml <<'PY' 2>/dev/null || echo no-playbook
+        import sys, yaml
+        plays = yaml.safe_load(open(sys.argv[1])) or []
+        ok = any(p.get("hosts") == "balancers" and any((r if isinstance(r, str) else r.get("role", r.get("name"))) == "balancer" for r in p.get("roles", [])) for p in plays)
+        print("ok" if ok else "no-play")
+        PY
+      expect: { match: exact, value: ok }
+    - id: balancer-host
+      description: HAProxy runs, is enabled and listens on the HTTP port, with the SELinux boolean set persistently and the port open in firewalld
+      type: shell
+      on: node4
+      skills: [automation.modules.firewall-selinux]
+      weight: 2
+      command: |
+        s="$(systemctl is-active haproxy) $(systemctl is-enabled haproxy)"
+        b=$(semanage boolean -l 2>/dev/null | awk '$1 == "haproxy_connect_any" {print $2 $3 $4}')
+        firewall-cmd --permanent --query-port=80/tcp >/dev/null 2>&1 || firewall-cmd --permanent --query-service=http >/dev/null 2>&1 && f=open || f=closed
+        echo "$s $b $f"
+      expect: { match: exact, value: "active enabled (on,on) open" }
+  exam:
+    rerun:
+      - on: control
+        timeoutSec: 600
+        run: |
+          r=$(ct-ansible recap /home/learner/exam/balancer balancer.yml)
+          echo "$r"
+          [ "$r" = "changed=0 failed=0 unreachable=0" ]
+  misconceptions:
+    - id: default-algorithm
+      description: Sets the backends but leaves the balancing algorithm at the role's default.
+      feedback: The default sends every request to the first backend; the role documents a variable that shares them in turn.
+      expectFail: [alternates]
+      mutation:
+        on: control
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/exam/balancer
+          cat > balancer.yml <<'EOF'
+          - hosts: balancers
+            become: true
+            vars:
+              balancer_backends:
+                - { name: node2, address: node2, port: {{bport}} }
+                - { name: node3, address: node3, port: {{bport}} }
+            roles:
+              - balancer
+          EOF
+          ansible-playbook balancer.yml
+    - id: edited-role
+      description: Changes the role's own defaults instead of overriding variables from the playbook.
+      feedback: The role is shared; override its variables in your playbook instead of editing it.
+      expectFail: [role-intact]
+      mutation:
+        on: control
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/exam/balancer
+          sed -i 's/^balancer_algorithm: first/balancer_algorithm: roundrobin/' roles/balancer/defaults/main.yml
+          cat > balancer.yml <<'EOF'
+          - hosts: balancers
+            become: true
+            vars:
+              balancer_backends:
+                - { name: node2, address: node2, port: {{bport}} }
+                - { name: node3, address: node3, port: {{bport}} }
+            roles:
+              - balancer
+          EOF
+          ansible-playbook balancer.yml
+  solution:
+    explanation: |
+      ansible-doc -t role balancer lists balancer_backends and balancer_algorithm; the play
+      passes both as play vars and applies the role to the balancers group.
+    steps:
+      - on: control
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/exam/balancer
+          ansible-doc -t role balancer >/dev/null
+          cat > balancer.yml <<'EOF'
+          - name: Load balancer
+            hosts: balancers
+            become: true
+            vars:
+              balancer_algorithm: roundrobin
+              balancer_backends:
+                - name: node2
+                  address: node2
+                  port: {{bport}}
+                - name: node3
+                  address: node3
+                  port: {{bport}}
+            roles:
+              - balancer
+          EOF
+          ansible-playbook balancer.yml

@@ -1,0 +1,251 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xan-core-handler-web
+  title: Deploy a web server that restarts only when its configuration changes
+  domain: automation
+  frameworks: [ex294-aligned:core-components]
+  difficulty: easy
+  estimatedMinutes: 12
+  tags: [exam, ansible, handlers, httpd, idempotency]
+  version: 1
+spec:
+  description: |
+    **Exam environment.** You work as `learner` on the control node `control`. The
+    managed nodes are `node1` (group `dev`), `node2` (`test`), `node3` (`prod`, also in
+    `webservers`) and `node4` (`balancers`), all Enterprise Linux 10; the account
+    `devops` on every node accepts your SSH key and may use sudo without a password.
+    Packages come from each node's local repository. Every playbook you write is run
+    again by the grader (it must report no changes), then every node is rebooted before
+    the final checks.
+
+    In **`/home/learner/exam/handler`** are two supplied files: **`index.html`** and the web
+    server configuration snippet **`ov-site.conf`**. Do not edit them.
+
+    Write the playbook **`/home/learner/exam/handler/handler.yml`** (the directory has an
+    inventory and an `ansible.cfg` with the remote user `devops`) that, on the **test**
+    group:
+
+    - installs **httpd**, starts it and enables it at boot;
+    - opens the **http** service in firewalld, permanently and immediately;
+    - copies `index.html` to **`/var/www/html/index.html`**;
+    - copies `ov-site.conf` to **`/etc/httpd/conf.d/ov-site.conf`**, and restarts httpd
+      **through a handler**, so that it restarts only when that file actually changed.
+
+    Run it. A second run must report no changes and must not restart the service.
+  objectives:
+    - Notify a handler from a configuration change
+    - Manage a web server's package, service and firewall rule together
+  params:
+    zone:
+      type: choice
+      values: [alpine, coastal, lowland, upland]
+    site:
+      type: choice
+      values: [Leeds, Bristol, Cardiff, York]
+  topology:
+    entry: control
+    nodes:
+      - { name: control, driver: container, image: ansible-ctl:2.21, access: [shell] }
+      - { name: node1, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node2, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node3, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node4, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+  setup:
+    - on: node1
+      timeoutSec: 120
+      run: &exam-node |
+        set -eu
+        id devops >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Exam automation" devops
+        install -d -m 0700 -o devops -g devops /home/devops/.ssh
+        install -m 0600 -o devops -g devops /home/learner/.ssh/authorized_keys /home/devops/.ssh/authorized_keys
+        printf 'devops ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/devops
+        chmod 0440 /etc/sudoers.d/devops
+    - { on: node2, timeoutSec: 120, run: *exam-node }
+    - { on: node3, timeoutSec: 120, run: *exam-node }
+    - { on: node4, timeoutSec: 120, run: *exam-node }
+    - on: control
+      run: |
+        set -eu
+        p=/home/learner/exam/handler
+        install -d -o learner -g learner /home/learner/exam $p
+        cat > $p/inventory.yml <<'EOF'
+        dev:
+          hosts:
+            node1:
+        test:
+          hosts:
+            node2:
+        prod:
+          hosts:
+            node3:
+        balancers:
+          hosts:
+            node4:
+        webservers:
+          children:
+            prod:
+        EOF
+        printf '[defaults]\ninventory = inventory.yml\nremote_user = devops\n' > $p/ansible.cfg
+        printf 'Orrin and Vale - {{site}} claims desk\n' > $p/index.html
+        printf 'Header always set X-Ov-Zone "{{zone}}"\n' > $p/ov-site.conf
+        chown -R learner:learner $p
+        (cd $p && sha256sum index.html ov-site.conf > /var/tmp/.ct-handler-sha)
+        chmod 0444 /var/tmp/.ct-handler-sha
+  checks:
+    - id: page-served
+      description: The supplied index.html is served unchanged at http://node2/
+      type: shell
+      on: control
+      skills: [automation.modules.packages-services]
+      weight: 2
+      command: |
+        d=/home/learner/exam/handler
+        (cd $d && sha256sum -c /var/tmp/.ct-handler-sha >/dev/null 2>&1) || { echo supplied-files-changed; exit 0; }
+        [ "$(curl -s -m 8 http://node2/)" = "$(cat $d/index.html)" ] && echo ok || echo differs
+      expect: { match: exact, value: ok }
+    - id: config-active
+      description: The configuration snippet is loaded by the running web server
+      type: shell
+      on: control
+      skills: [automation.control-flow.handlers]
+      weight: 2
+      command: |
+        curl -sI -m 8 http://node2/ | tr -d '\r' | awk -F': ' 'tolower($1) == "x-ov-zone" {print $2}'
+      expect: { match: exact, value: "{{zone}}" }
+    - id: service-state
+      description: httpd is running and enabled and http is permanently open in firewalld on node2
+      type: shell
+      on: node2
+      skills: [automation.modules.packages-services]
+      command: |
+        firewall-cmd --permanent --list-services | tr ' ' '\n' | grep -qx http && f=http-open || f=http-closed
+        echo "$(systemctl is-active httpd) $(systemctl is-enabled httpd) $f"
+      expect: { match: exact, value: active enabled http-open }
+    - id: uses-handler
+      description: handler.yml restarts httpd from a handler that a task notifies
+      type: shell
+      on: control
+      skills: [automation.control-flow.handlers]
+      command: |
+        /opt/ansible/bin/python3 - /home/learner/exam/handler/handler.yml <<'PY' 2>/dev/null || echo no-playbook
+        import sys, yaml
+        plays = yaml.safe_load(open(sys.argv[1])) or []
+        def notifies(tasks):
+            for t in tasks or []:
+                if isinstance(t, dict) and (t.get("notify") or any(notifies(t.get(k)) for k in ("block", "rescue", "always"))):
+                    return True
+            return False
+        ok = any(p.get("handlers") and notifies(p.get("tasks")) for p in plays)
+        print("ok" if ok else "no-handler")
+        PY
+      expect: { match: exact, value: ok }
+  exam:
+    rerun:
+      - on: control
+        timeoutSec: 600
+        run: |
+          pid() { ct-ansible run /home/learner/exam/handler ssh -o BatchMode=yes devops@node2 systemctl show -p MainPID --value httpd; }
+          before=$(pid)
+          r=$(ct-ansible recap /home/learner/exam/handler handler.yml)
+          after=$(pid)
+          echo "$r pid-stable=$([ -n "$before" ] && [ "$before" = "$after" ] && echo yes || echo no)"
+          [ "$r" = "changed=0 failed=0 unreachable=0" ] && [ -n "$before" ] && [ "$before" = "$after" ]
+  misconceptions:
+    - id: restart-task
+      description: Restarts httpd with an ordinary task on every run instead of a handler.
+      feedback: A restart task runs and reports a change every time; a handler restarts the service only when the notifying task changed something.
+      expectFail: [uses-handler]
+      mutation:
+        on: control
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/exam/handler
+          cat > handler.yml <<'EOF'
+          - hosts: test
+            become: true
+            tasks:
+              - ansible.builtin.dnf: { name: httpd, state: present }
+              - ansible.builtin.copy: { src: index.html, dest: /var/www/html/index.html }
+              - ansible.builtin.copy: { src: ov-site.conf, dest: /etc/httpd/conf.d/ov-site.conf }
+              - ansible.builtin.service: { name: httpd, state: restarted, enabled: true }
+              - ansible.posix.firewalld: { service: http, state: enabled, permanent: true, immediate: true }
+          EOF
+          ansible-playbook handler.yml
+    - id: config-outside-include
+      description: Copies the snippet to a directory that httpd does not read.
+      feedback: httpd only reads snippets from conf.d; check that the running server really loaded the setting.
+      expectFail: [config-active]
+      mutation:
+        on: control
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/exam/handler
+          cat > handler.yml <<'EOF'
+          - hosts: test
+            become: true
+            tasks:
+              - ansible.builtin.dnf: { name: httpd, state: present }
+              - ansible.builtin.copy: { src: index.html, dest: /var/www/html/index.html }
+              - ansible.builtin.copy: { src: ov-site.conf, dest: /etc/httpd/conf/ov-site.conf }
+                notify: restart httpd
+              - ansible.builtin.service: { name: httpd, state: started, enabled: true }
+              - ansible.posix.firewalld: { service: http, state: enabled, permanent: true, immediate: true }
+            handlers:
+              - name: restart httpd
+                ansible.builtin.service: { name: httpd, state: restarted }
+          EOF
+          ansible-playbook handler.yml
+  solution:
+    explanation: |
+      The configuration copy task notifies a handler; the handler restarts httpd only when
+      that task reports a change, so the second run changes nothing and leaves the process alone.
+    steps:
+      - on: control
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/exam/handler
+          cat > handler.yml <<'EOF'
+          - name: Web server on the test group
+            hosts: test
+            become: true
+            tasks:
+              - name: httpd package
+                ansible.builtin.dnf:
+                  name: httpd
+                  state: present
+              - name: Index page
+                ansible.builtin.copy:
+                  src: index.html
+                  dest: /var/www/html/index.html
+                  mode: "0644"
+              - name: Site configuration
+                ansible.builtin.copy:
+                  src: ov-site.conf
+                  dest: /etc/httpd/conf.d/ov-site.conf
+                  mode: "0644"
+                notify: Restart httpd
+              - name: httpd running and enabled
+                ansible.builtin.service:
+                  name: httpd
+                  state: started
+                  enabled: true
+              - name: http open in firewalld
+                ansible.posix.firewalld:
+                  service: http
+                  state: enabled
+                  permanent: true
+                  immediate: true
+            handlers:
+              - name: Restart httpd
+                ansible.builtin.service:
+                  name: httpd
+                  state: restarted
+          EOF
+          ansible-playbook handler.yml

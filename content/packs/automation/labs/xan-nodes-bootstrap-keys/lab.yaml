@@ -1,0 +1,225 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xan-nodes-bootstrap-keys
+  title: Bootstrap managed nodes with a key and a sudo rule
+  domain: automation
+  frameworks: [ex294-aligned:managed-nodes]
+  difficulty: medium
+  estimatedMinutes: 12
+  tags: [exam, ansible, bootstrap, ssh, sudo]
+  version: 1
+spec:
+  description: |
+    **Exam environment.** You work as `learner` on the control node `control`. The
+    managed nodes are `node1` (group `dev`), `node2` (`test`), `node3` (`prod`, also in
+    `webservers`) and `node4` (`balancers`), all Enterprise Linux 10; the account
+    `devops` on every node accepts your SSH key and may use sudo without a password.
+    Packages come from each node's local repository. Every playbook you write is run
+    again by the grader (it must report no changes), then every node is rebooted before
+    the final checks.
+
+    The nodes also have an installer account **`ovinstall`** that logs in with the
+    one-time password **`Ov-boot-{{bootpw}}`** and may use sudo without a password. In
+    **`/home/learner/exam/bootstrap`** the inventory and an `ansible.cfg` (remote user
+    `ovinstall`) are supplied; `sshpass` is available.
+
+    Write the playbook **`/home/learner/exam/bootstrap/bootstrap.yml`** that, on **all**
+    nodes, using the installer account and its password:
+
+    - creates the automation user **`{{acct}}`**;
+    - installs your public key `~/.ssh/id_ed25519.pub` for it;
+    - gives it passwordless sudo through a **drop-in file in `/etc/sudoers.d`**, checked with
+      `visudo` before it is installed;
+    - **disables password login** for `{{acct}}` (key only).
+
+    Run it. Afterwards `ssh {{acct}}@node1 sudo -n true` must work without any password,
+    and a second run of the playbook must report no changes.
+  objectives:
+    - Bootstrap an automation account with a key and a validated sudo drop-in
+    - Disable password login for the automation account
+  params:
+    acct:
+      type: choice
+      values: [ansadm, ovops, ovdeploy]
+    bootpw:
+      type: int
+      min: 100000
+      max: 999999
+  topology:
+    entry: control
+    nodes:
+      - { name: control, driver: container, image: ansible-ctl:2.21, access: [shell] }
+      - { name: node1, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node2, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node3, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node4, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+  setup:
+    - on: node1
+      timeoutSec: 120
+      run: &exam-node |
+        set -eu
+        id devops >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Exam automation" devops
+        install -d -m 0700 -o devops -g devops /home/devops/.ssh
+        install -m 0600 -o devops -g devops /home/learner/.ssh/authorized_keys /home/devops/.ssh/authorized_keys
+        printf 'devops ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/devops
+        chmod 0440 /etc/sudoers.d/devops
+    - { on: node2, timeoutSec: 120, run: *exam-node }
+    - { on: node3, timeoutSec: 120, run: *exam-node }
+    - { on: node4, timeoutSec: 120, run: *exam-node }
+    - on: node1
+      timeoutSec: 120
+      run: &installer |
+        set -eu
+        [ -f /var/tmp/.ct-bootstrap-seeded ] && exit 0
+        id ovinstall >/dev/null 2>&1 || useradd -m -s /bin/bash ovinstall
+        echo "ovinstall:Ov-boot-{{bootpw}}" | chpasswd
+        printf 'ovinstall ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/ovinstall
+        chmod 0440 /etc/sudoers.d/ovinstall
+        printf 'Match User ovinstall\n    PasswordAuthentication yes\n' > /etc/ssh/sshd_config.d/45-ov-install.conf
+        sshd -t
+        systemctl reload sshd
+        touch /var/tmp/.ct-bootstrap-seeded
+    - { on: node2, timeoutSec: 120, run: *installer }
+    - { on: node3, timeoutSec: 120, run: *installer }
+    - { on: node4, timeoutSec: 120, run: *installer }
+    - on: control
+      run: |
+        set -eu
+        p=/home/learner/exam/bootstrap
+        install -d -o learner -g learner /home/learner/exam $p
+        cat > $p/inventory.yml <<'EOF'
+        dev:
+          hosts:
+            node1:
+        test:
+          hosts:
+            node2:
+        prod:
+          hosts:
+            node3:
+        balancers:
+          hosts:
+            node4:
+        webservers:
+          children:
+            prod:
+        EOF
+        printf '[defaults]\ninventory = inventory.yml\nremote_user = ovinstall\n' > $p/ansible.cfg
+        chown -R learner:learner $p
+  checks:
+    - id: key-login
+      description: The automation user logs in to every node with the key alone and can use sudo without a password
+      type: shell
+      on: control
+      skills: [automation.inventory.bootstrap]
+      weight: 2
+      timeoutSec: 90
+      command: |
+        r=""
+        for n in node1 node2 node3 node4; do
+          [ "$(ct-ansible run /home/learner ssh -o BatchMode=yes -o PreferredAuthentications=publickey -o ConnectTimeout=10 {{acct}}@$n sudo -n id -u 2>/dev/null)" = 0 ] || r="$r $n"
+        done
+        echo "${r:-ok}"
+      expect: { match: exact, value: ok }
+    - id: account-node1
+      description: node1 has the account locked for passwords, one key, and a validated sudo drop-in
+      type: shell
+      on: node1
+      skills: [automation.inventory.bootstrap]
+      weight: 2
+      command: &acct-state |
+        case $(getent shadow {{acct}} | cut -d: -f2) in '$'*) st=password ;; *) st=locked ;; esac
+        visudo -c -q >/dev/null 2>&1 && v=valid || v=invalid
+        sudo -l -U {{acct}} 2>/dev/null | grep -q 'NOPASSWD: ALL' && s=sudo-ok || s=no-sudo
+        d=$(grep -lE '^{{acct}}[[:space:]]' /etc/sudoers.d/* 2>/dev/null | wc -l)
+        grep -qE '^{{acct}}[[:space:]]' /etc/sudoers && m=inline || m=dropin
+        k=$(grep -c '^ssh-ed25519 ' /home/{{acct}}/.ssh/authorized_keys 2>/dev/null)
+        echo "$st $v $s $m-$d keys=$k"
+      expect: { match: exact, value: "locked valid sudo-ok dropin-1 keys=1" }
+    - { id: account-node2, description: "node2 has the account locked for passwords, one key, and a validated sudo drop-in", type: shell, on: node2, skills: [automation.inventory.bootstrap], weight: 2, command: *acct-state, expect: { match: exact, value: "locked valid sudo-ok dropin-1 keys=1" } }
+    - { id: account-node3, description: "node3 has the account locked for passwords, one key, and a validated sudo drop-in", type: shell, on: node3, skills: [automation.inventory.bootstrap], weight: 2, command: *acct-state, expect: { match: exact, value: "locked valid sudo-ok dropin-1 keys=1" } }
+    - { id: account-node4, description: "node4 has the account locked for passwords, one key, and a validated sudo drop-in", type: shell, on: node4, skills: [automation.inventory.bootstrap], weight: 2, command: *acct-state, expect: { match: exact, value: "locked valid sudo-ok dropin-1 keys=1" } }
+  exam:
+    rerun:
+      - on: control
+        timeoutSec: 600
+        run: |
+          r=$(ct-ansible recap /home/learner/exam/bootstrap bootstrap.yml -e ansible_user=ovinstall -e ansible_password=Ov-boot-{{bootpw}})
+          echo "$r"
+          [ "$r" = "changed=0 failed=0 unreachable=0" ]
+  misconceptions:
+    - id: sudo-inline
+      description: Appends the sudo rule to /etc/sudoers itself instead of a drop-in file.
+      feedback: The rule belongs in its own file under /etc/sudoers.d, validated before it is installed.
+      expectFail: [account-node1, account-node2, account-node3, account-node4]
+      mutation:
+        on: control
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/exam/bootstrap
+          cat > bootstrap.yml <<'EOF'
+          - hosts: all
+            become: true
+            tasks:
+              - ansible.builtin.user: { name: "{{acct}}", password_lock: true }
+              - ansible.posix.authorized_key: { user: "{{acct}}", key: "{{ lookup('file', '/home/learner/.ssh/id_ed25519.pub') }}" }
+              - ansible.builtin.lineinfile: { path: /etc/sudoers, line: "{{acct}} ALL=(ALL) NOPASSWD: ALL", validate: "visudo -cf %s" }
+          EOF
+          ansible-playbook bootstrap.yml -e ansible_password=Ov-boot-{{bootpw}}
+    - id: password-left
+      description: Creates the account with a password and never locks it.
+      feedback: The automation account must be key only; its password has to be locked.
+      expectFail: [account-node1, account-node2, account-node3, account-node4]
+      mutation:
+        on: control
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/exam/bootstrap
+          cat > bootstrap.yml <<'EOF'
+          - hosts: all
+            become: true
+            tasks:
+              - ansible.builtin.user: { name: "{{acct}}", password: "{{ 'tmp-{{bootpw}}' | password_hash('sha512', 'ovsalt') }}" }
+              - ansible.posix.authorized_key: { user: "{{acct}}", key: "{{ lookup('file', '/home/learner/.ssh/id_ed25519.pub') }}" }
+              - ansible.builtin.copy: { dest: "/etc/sudoers.d/{{acct}}", content: "{{acct}} ALL=(ALL) NOPASSWD: ALL\n", mode: "0440", validate: "visudo -cf %s" }
+          EOF
+          ansible-playbook bootstrap.yml -e ansible_password=Ov-boot-{{bootpw}} || ansible-playbook bootstrap.yml -e ansible_password=Ov-boot-{{bootpw}}
+  solution:
+    explanation: |
+      Connected as the installer account with its password (sshpass is used by Ansible),
+      one play creates the user with a locked password, installs the key with authorized_key
+      and writes a sudoers drop-in checked by visudo -cf before it is moved into place.
+    steps:
+      - on: control
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/exam/bootstrap
+          cat > bootstrap.yml <<'EOF'
+          - name: Bootstrap the automation account
+            hosts: all
+            become: true
+            tasks:
+              - name: Automation user
+                ansible.builtin.user:
+                  name: "{{acct}}"
+                  shell: /bin/bash
+                  password_lock: true
+              - name: Public key
+                ansible.posix.authorized_key:
+                  user: "{{acct}}"
+                  key: "{{ lookup('file', '/home/learner/.ssh/id_ed25519.pub') }}"
+              - name: Passwordless sudo
+                ansible.builtin.copy:
+                  dest: "/etc/sudoers.d/{{acct}}"
+                  content: "{{acct}} ALL=(ALL) NOPASSWD: ALL\n"
+                  mode: "0440"
+                  validate: "visudo -cf %s"
+          EOF
+          ansible-playbook bootstrap.yml -e ansible_password=Ov-boot-{{bootpw}} || ansible-playbook bootstrap.yml -e ansible_password=Ov-boot-{{bootpw}}
