@@ -25,11 +25,11 @@ const queryClient = new QueryClient({
 
 async function boot() {
   // The env check is inlined (not API_MODE) so the bundler drops the MSW chunk from builds that
-  // never start it; Rolldown does not constant-fold the imported const.
+  // never start it; Rolldown does not constant-fold the imported const. In real mode the gateway
+  // serves everything except Scenario Studio, whose sample worker starts when a Studio route
+  // loads (mocks/sample.ts): no service worker sits in front of the public website.
   if (import.meta.env.VITE_API_MODE === 'real') {
-    // The gateway serves everything except Scenario Studio, which stays sample data.
-    const { startMocks } = await import('./mocks/browser');
-    await startMocks({ sampleOnly: true });
+    /* nothing at boot */
   } else if (import.meta.env.DEV || import.meta.env.VITE_MOCK_API === '1') {
     const { startMocks } = await import('./mocks/browser');
     await startMocks();

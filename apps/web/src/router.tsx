@@ -4,6 +4,7 @@ import { Shell } from './app/Shell';
 import { NotFound } from './app/NotFound';
 import { PageSkeleton } from './components/ui';
 import { CatalogIndex, RootIndex } from './routes/site/Hybrid';
+import { ensureSampleMocks } from './mocks/sample';
 
 // Screens that pull in React Flow or xterm are loaded on demand so the other
 // pages do not download them (see vite.config.ts manualChunks). Role-specific
@@ -198,8 +199,9 @@ export const examResultsRoute = createRoute({ getParentRoute: () => rootRoute, p
 
 /* ------------------------------------------------------------------ author */
 
-export const studioRoute = createRoute({ getParentRoute: () => rootRoute, path: '/studio', component: Studio });
-export const studioDraftRoute = createRoute({ getParentRoute: () => rootRoute, path: '/studio/$draftId', component: StudioDraft });
+// Real mode: Studio's sample data lives in MSW, registered on first use (mocks/sample.ts).
+export const studioRoute = createRoute({ getParentRoute: () => rootRoute, path: '/studio', beforeLoad: () => ensureSampleMocks(), component: Studio });
+export const studioDraftRoute = createRoute({ getParentRoute: () => rootRoute, path: '/studio/$draftId', beforeLoad: () => ensureSampleMocks(), component: StudioDraft });
 
 /* ------------------------------------------------------------------ manager */
 

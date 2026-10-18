@@ -191,9 +191,10 @@ try {
     }
     await ctx.close();
   }
-  if (!only?.length && !storage) {
+  if (!storage) {
     for (const theme of ['light', 'cream']) {
       for (const [name, persona, url, waitFor] of [VIEWS.find((v) => v[0] === 'landing'), VIEWS.find((v) => v[0] === 'catalog-public'), VIEWS.find((v) => v[0] === 'sign-in'), VIEWS.find((v) => v[0] === 'team-dashboard'), VIEWS.find((v) => v[0] === 'cohort-board'), VIEWS.find((v) => v[0] === 'admin-users'), VIEWS.find((v) => v[0] === 'admin-sso')]) {
+        if (only?.length && !only.includes(name)) continue;
         const { ctx, page } = await session(theme, persona);
         await open(page, url, waitFor);
         await shot(page, `${name}-${theme}`);
@@ -202,6 +203,7 @@ try {
     }
     // Tables at 1280px.
     for (const [name, persona, url, waitFor] of [VIEWS.find((v) => v[0] === 'team-dashboard'), VIEWS.find((v) => v[0] === 'cohort-board'), VIEWS.find((v) => v[0] === 'admin-audit')]) {
+      if (only?.length && !only.includes(name)) continue;
       const { ctx, page } = await session('dark', persona, 1280);
       await open(page, url, waitFor);
       await shot(page, `${name}-dark-1280`);
