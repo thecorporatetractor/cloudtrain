@@ -56,12 +56,17 @@ spec:
     - on: qm-ledger/ledger-wk-1
       timeoutSec: 120
       run: |
-        # Baseline: the worker's kubelet credentials can label another node.
+        # Baseline: the worker's kubelet credentials can modify another node. A raw PATCH is
+        # used because kubectl label/patch GET the object first, and the node authorizer
+        # already denies a foreign GET whatever the admission plugins are.
+        c=/var/lib/kubelet/pki/kubelet-client-current.pem
+        s=$(sed -n 's/^ *server: //p' /etc/kubernetes/kubelet.conf | head -n1)
+        cp_label() { curl -sk --cert $c --key $c -X PATCH -H 'Content-Type: application/merge-patch+json' -d "{\"metadata\":{\"labels\":{\"$1\":$2}}}" "$s/api/v1/nodes/ledger-cp-1"; }
         for i in $(seq 1 20); do
-          kubectl --kubeconfig /etc/kubernetes/kubelet.conf label node ledger-cp-1 qm-baseline=1 --overwrite >/dev/null 2>&1 && break
+          cp_label qm-baseline '"1"' | grep -q '"kind": *"Node"' && break
           sleep 3
         done
-        kubectl --kubeconfig /etc/kubernetes/kubelet.conf label node ledger-cp-1 qm-baseline- >/dev/null
+        cp_label qm-baseline null | grep -q '"kind": *"Node"' || { echo 'baseline: kubelet cannot patch foreign node' >&2; exit 1; }
   checks:
     - id: plugin-enabled
       description: The running kube-apiserver lists NodeRestriction in --enable-admission-plugins and keeps ServiceAccount
@@ -83,8 +88,11 @@ spec:
       weight: 3
       timeoutSec: 30
       command: |
-        out=$(kubectl --kubeconfig /etc/kubernetes/kubelet.conf label node ledger-cp-1 qm-probe=1 --overwrite 2>&1)
-        case "$out" in *forbidden*|*Forbidden*) echo denied ;; *labeled*) kubectl --kubeconfig /etc/kubernetes/kubelet.conf label node ledger-cp-1 qm-probe- >/dev/null 2>&1; echo allowed ;; *) echo "error: $out" ;; esac
+        c=/var/lib/kubelet/pki/kubelet-client-current.pem
+        s=$(sed -n 's/^ *server: //p' /etc/kubernetes/kubelet.conf | head -n1)
+        cp_label() { curl -sk --cert $c --key $c -X PATCH -H 'Content-Type: application/merge-patch+json' -d "{\"metadata\":{\"labels\":{\"$1\":$2}}}" "$s/api/v1/nodes/ledger-cp-1"; }
+        out=$(cp_label qm-probe '"1"')
+        case "$out" in *'"reason": "Forbidden"'*|*'"reason":"Forbidden"'*) echo denied ;; *'"kind": "Node"'*|*'"kind":"Node"'*) cp_label qm-probe null >/dev/null; echo allowed ;; *) echo "error: $out" ;; esac
       expect: {match: exact, value: denied}
     - id: own-node-allowed
       description: ledger-wk-1's kubelet can still update its own Node and the node is Ready
