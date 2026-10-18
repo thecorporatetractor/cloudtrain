@@ -17,6 +17,7 @@ describe('deployable configuration', () => {
     expect(c.kubeContext).toBe('kind-cloudtrain-dev');
     expect(c.contentDir).toBe(path.join(repoRoot, 'content'));
     expect(c.curriculumFile).toBe(path.join(repoRoot, 'content', 'curriculum.yaml'));
+    expect(c.siteConfigFile).toBe(path.join(repoRoot, 'content', 'site.yaml'));
     expect(c.labctl).toBe(path.join(repoRoot, 'services/lab-orchestrator/bin/labctl'));
   });
 
@@ -25,6 +26,9 @@ describe('deployable configuration', () => {
     expect(c).toMatchObject({ host: '0.0.0.0', port: 8080, contentDir: '/opt/cloudtrain/content', labctl: '/usr/local/bin/labctl', trustProxy: '10.0.0.0/8' });
     // The curriculum follows the content directory unless set on its own.
     expect(c.curriculumFile).toBe('/opt/cloudtrain/content/curriculum.yaml');
+    // So does the public website's site.yaml (the image has no repository root).
+    expect(c.siteConfigFile).toBe('/opt/cloudtrain/content/site.yaml');
+    expect(loadConfig({ CT_CONTENT_DIR: '/c', CT_SITE_CONFIG: '/etc/site.yaml' }).siteConfigFile).toBe('/etc/site.yaml');
     expect(loadConfig({ CT_CONTENT_DIR: '/c', CT_CURRICULUM_FILE: '/x/cur.yaml' }).curriculumFile).toBe('/x/cur.yaml');
   });
 
