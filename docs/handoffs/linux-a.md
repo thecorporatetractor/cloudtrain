@@ -1,5 +1,12 @@
 # Handoff: stream linux-a (Linux labs on tier A)
 
+> **Round 4 (2026-10-17/18): superseded for current state by `docs/handoffs/linux-bc.md`.**
+> Every tier-A lab now runs on deb-lab:24.04 / el-lab:10 (interim images removed), 22 are
+> verified live, and the 14 sudo-blocked root labs below were written with `learnerSudo: true`
+> and verified (ssh-hardening-fail2ban stays proposed). The ssh-config-depot-hosts mutation
+> issue is fixed (platform `Host *` block moved to /etc/ssh/ssh_config.d in setup). The tables
+> below are the round-1 record.
+
 Paused 2026-10-14 on request. Branch `build/linux-a`, worktree
 `/home/hackrvl/cloudtrain/.worktrees/b-linux-a`. Pack `content/packs/linux`.
 

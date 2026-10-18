@@ -13,12 +13,12 @@ Legend. **Type**: learn = guided first exposure, do = complete a task, fix = rep
 | Domain | Paths | Learning labs | Exam tasks | Exams | Verified | Built | Proposed | Tier mix (all labs) | Learning hours |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | Kubernetes | 5 | 89 | 103 | 3 | 55 | 135 | 2 | C 1, K 112, V 79 | 25 |
-| Linux administration | 11 | 159 | 119 | 3 | 42 | 76 | 160 | A 84, B 69, C 125 | 48 |
+| Linux administration | 11 | 159 | 119 | 3 | 53 | 65 | 160 | A 84, B 69, C 125 | 48 |
 | Containers with Docker | 11 | 91 | 44 | 2 | 24 | 0 | 111 | B 71, C 64 | 28 |
 | Infrastructure as code with Terraform | 5 | 54 | 45 | 2 | 48 | 0 | 51 | A 53, B 1, V 45 | 21 |
 | Configuration management and automation | 7 | 61 | 36 | 1 | 0 | 0 | 97 | A 39, B 7, C 45, N 6 | 26 |
 | Network administration | 4 | 45 | 32 | 1 | 25 | 0 | 52 | N 77 | 15 |
-| **Total** | 43 | 499 | 379 | 13 | 194 | 211 | 473 | A 176, B 148, C 235, K 112, V 124, N 83 | 161 |
+| **Total** | 43 | 499 | 379 | 13 | 205 | 200 | 473 | A 176, B 148, C 235, K 112, V 124, N 83 | 161 |
 
 Cross-domain exams: Platform engineer practical capstone. Exam tasks are counted under the domain of each task. Learning labs by type: learn 47, do 356, fix 83, hack 13. New skills proposed: 201.
 

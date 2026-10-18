@@ -68,8 +68,8 @@ Kata and the kubeadm proof under load:
 4. **Learner sudo: available as an opt-in.** Entry node `learnerSudo: true`
    (security trade-off, see `docs/dev-environment.md`); the lab's setup grants the
    sudoers rule. Default stays `allowPrivilegeEscalation: false`; operators can
-   refuse such labs with `--allow-learner-sudo=false`. The linux-a root labs can
-   now be written.
+   refuse such labs with `--allow-learner-sudo=false`. The linux-a root labs were
+   written with it in round 4 (14 verified, `docs/handoffs/linux-bc.md`).
 5. **Windows C: drive is nearly full** (~16 GB free on 2026-10-15). Docker's disk file is
    ~237 GB though Docker now holds ~80 GB; compact it (see "Machine" below).
 
@@ -95,7 +95,7 @@ Kata and the kubeadm proof under load:
 | k8s-dev | 42 | 33 (every V-tier lab; round 3, 2026-10-17); sim-k8s-developer exam run live: auto-solve 100 %, no-solve 14.5 % | 5 K-tier (vm slot) | 4 blocked (buildah, metrics-server, ingress) | `docs/handoffs/k8s-dev.md` |
 | k8s-sec | 51 | 12 (every V-tier lab; round 3) | 27 K-tier (vm slot) | 12 blocked on security tooling | `docs/handoffs/k8s-sec.md` |
 | networking | 77 | 25 (net-fix-broadcast-storm in platform round 5; round 3, 2026-10-17: 9 learning labs incl. every VLAN/trunk/STP/LACP/VRRP lab, 15 sim-net-associate tasks = every objective's draw; exam compiles with `--allow-missing`; exam run live in platform round 5: auto-solve 100 %, no-solve 14.3 %, clean teardowns) | 22 drafts in `docs/handoffs/networking-drafts/` | 15 pool tasks, SR Linux/Ansible labs, security/VPN learning labs; `labctl verify` cannot exec steps on FRR nodes (see handoff) | `docs/handoffs/networking.md` |
-| linux-a | 62 | 1 | 21 | ~40 not started (sudo, mirror, mis-tiered) | `docs/handoffs/linux-a.md` |
+| linux (round 4) | 278 in curriculum | 53 (36 tier A incl. 14 root labs with learnerSudo; 17 sim-el-sysadmin tasks) | 20 sim-el-sysadmin + 30 sim-linux-sysadmin tasks, 14 tier B/C learning labs (built) | tier B/C beyond systemd/storage/SELinux/AppArmor, sim-linux-pro, mirror/server tier-A labs; image gaps (autofs, ubuntu-vm apt) | `docs/handoffs/linux-bc.md` |
 | original 11 K8s labs | 11 | 4+ | — | — | `content/packs/kubernetes` |
 | iac (wave 2) | 99 | 48 (23 foundations labs + 25 sim-iac-associate tasks; exam runs 100 % / 11.7 %) | 0 | 31 learning labs, 18 sim-iac-advanced tasks, 2 capstone tasks not started | `docs/handoffs/iac.md` |
 | containers (wave 2, Docker on `docker-vm:29`) | 135 | 24 (12 learning, 12 exam tasks) | 0 | 12 exam tasks (5 need more image content) + 79 learning labs not started | `docs/handoffs/containers.md` |
@@ -107,7 +107,7 @@ boot-tested; labs must call `addons-install <list> --wait` in their setup.
 Wave 2: IaC has started (see the iac row; image `terraform-ws:1.15`, Terraform/OpenTofu
 swappable per tenant), and so has containers (see the containers row; every lab runs on
 a `docker-vm:29` KubeVirt VM, design and escape test in `docs/handoffs/containers.md`).
-Not started at all: Linux tier B/C labs, automation (Ansible), and the exam task pools of
+Linux tier B/C started in round 4 (`docs/handoffs/linux-bc.md`). Not started at all: automation (Ansible), and the exam task pools of
 those domains.
 
 ## Resume order
@@ -193,11 +193,7 @@ those domains.
 
 ## Integration notes (wave-1 merge)
 
-- Linux labs still use the interim `linux-pod-deb:24.04` / `linux-pod-el:10` images
-  (`tools/images/linux-pod-interim/`); `deb-lab` is built and verified (first lab
-  switched: text-filters-ticket-sales), so switch the rest to `deb-lab:24.04` /
-  `el-lab:10`, then drop the interim catalog entries.
-- The gateway serves curriculum `newSkills` that loaded labs use (a bridge);
-  promote the Linux skills into `content/skills.yaml` like networking did.
+- Linux labs run on `deb-lab:24.04` / `el-lab:10` (round 4); the interim images are gone.
+- The Linux `newSkills` are promoted into `content/skills.yaml` (round 4).
 - `secrets.yml` must scan history or tracked files only (gitignored `apps/web/dist`
   trips gitleaks in a working-tree scan).
