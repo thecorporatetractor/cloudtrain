@@ -1,0 +1,265 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-reproducible-build
+  title: Rebuild the subtitle image bit for bit from the same commit
+  domain: containers
+  frameworks: [docker-practitioner:build]
+  difficulty: hard
+  estimatedMinutes: 25
+  tags: [docker, buildkit, reproducible, source-date-epoch, digest]
+  version: 1
+spec:
+  description: |
+    Auditors want to rebuild `subtitle:4.3.0` from the release commit and get **the same
+    image digest** every time. The repository is `~/subtitle-release/` on `cl-audit-01`
+    (`ssh cl-audit-01`; you are in the `docker` group); its single commit was made at a
+    fixed time (release {{rev}}). Today the Dockerfile stamps the wall clock into a label
+    and a file, and `build.sh` uses the current time.
+
+    1. Rewrite `Dockerfile` and `build.sh` so that `./build.sh OUT.tar` writes an OCI
+       archive of `copperleaf/subtitle:4.3.0` whose manifest digest is **identical on every
+       run**, even on an empty build cache. The image must still print
+       `subtitle 4.3.0 rev {{rev}}` when run (`/opt/subtitle/banner.txt` and
+       `/opt/subtitle/config/defaults.json` must be in it).
+    2. Pin the base image by **digest** and derive every timestamp from the commit time
+       (`SOURCE_DATE_EPOCH`): the image's `created` time must be the commit time.
+    3. Run `./build.sh` once and write the archive's manifest digest (`sha256:...` from its
+       `index.json`) to `~/subtitle-release/digest.txt`.
+
+    File times, user ids and ordering end up in the layer tarballs, and a directory that
+    a build step creates gets the time of the build.
+  objectives:
+    - Derive SOURCE_DATE_EPOCH from the commit
+    - Remove clock-dependent content from layers, labels and files
+    - Pin inputs and prove two clean builds give one digest
+  params:
+    rev:
+      type: int
+      min: 100
+      max: 899
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-audit-01
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-audit-01
+      timeoutSec: 240
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        s=/home/learner/subtitle-release
+        rm -rf "$s"; install -d -o learner -g learner "$s" "$s/src/config"
+        ts=$(( 1735689600 + {{rev}} * 3600 ))
+        printf '%s\n' 'subtitle 4.3.0 rev {{rev}}' > "$s/src/banner.txt"
+        printf '%s\n' '{"language": "en", "format": "srt"}' > "$s/src/config/defaults.json"
+        cat > "$s/Dockerfile" <<'DF'
+        FROM alpine:3.22
+        ARG BUILD_DATE
+        LABEL org.opencontainers.image.created=$BUILD_DATE
+        COPY src/ /opt/subtitle/
+        RUN echo "built $(date +%s)" > /opt/subtitle/BUILD-INFO
+        CMD ["cat", "/opt/subtitle/banner.txt"]
+        DF
+        cat > "$s/build.sh" <<'SH'
+        #!/bin/sh
+        # usage: ./build.sh OUT.tar   writes an OCI archive of copperleaf/subtitle:4.3.0
+        set -eu
+        docker buildx build --build-arg BUILD_DATE="$(date -u +%FT%TZ)" -t copperleaf/subtitle:4.3.0 --output "type=oci,dest=$1" .
+        SH
+        chmod 0755 "$s/build.sh"
+        chown -R learner:learner "$s"
+        runuser -u learner -- sh -c "cd $s && git init -q . && git config user.email release@copperleaf.example && git config user.name release && git add -A && GIT_AUTHOR_DATE='@$ts +0000' GIT_COMMITTER_DATE='@$ts +0000' git commit -qm 'subtitle 4.3.0'"
+        rm -f "$s/digest.txt"
+  checks:
+    - id: identical-builds
+      description: Two builds with an empty build cache produce the same manifest digest
+      type: shell
+      timeoutSec: 600
+      on: cl-audit-01
+      skills: [containers.build.reproducible]
+      weight: 4
+      command: |
+        w=$(mktemp -d); chmod 0777 "$w"
+        run() { docker builder prune -af >/dev/null 2>&1; runuser -u learner -- sh -c "cd /home/learner/subtitle-release && ./build.sh $1" >/dev/null 2>&1; }
+        run "$w/a.tar" || { echo build-failed; rm -rf "$w"; exit 0; }
+        sleep 3
+        run "$w/b.tar" || { echo build-failed; rm -rf "$w"; exit 0; }
+        da=$(tar -xOf "$w/a.tar" index.json 2>/dev/null | jq -r '.manifests[0].digest // empty')
+        db=$(tar -xOf "$w/b.tar" index.json 2>/dev/null | jq -r '.manifests[0].digest // empty')
+        mkdir -p /var/lib/cloudtrain; echo "$da" > /var/lib/cloudtrain/repro.digest
+        cp "$w/a.tar" /var/lib/cloudtrain/repro.tar
+        rm -rf "$w"
+        if [ -n "$da" ] && [ "$da" = "$db" ]; then echo identical; else echo differs; fi
+      expect: {match: exact, value: identical}
+    - id: created-from-commit
+      description: The image config's created time is the commit time
+      type: shell
+      timeoutSec: 60
+      on: cl-audit-01
+      skills: [containers.build.reproducible]
+      weight: 2
+      command: |
+        t=/var/lib/cloudtrain/repro.tar; [ -f "$t" ] || { echo no-build; exit 0; }
+        m=$(tar -xOf "$t" index.json | jq -r '.manifests[0].digest | sub("sha256:"; "")')
+        c=$(tar -xOf "$t" "blobs/sha256/$m" | jq -r '.config.digest | sub("sha256:"; "")')
+        got=$(tar -xOf "$t" "blobs/sha256/$c" | jq -r '.created // "none"')
+        want=$(date -u -d "@$(git -c safe.directory='*' -C /home/learner/subtitle-release log -1 --format=%ct)" +%Y-%m-%dT%H:%M:%SZ)
+        [ "$got" = "$want" ] && echo commit-time || echo "created=$got"
+      expect: {match: exact, value: commit-time}
+    - id: base-pinned
+      description: Every FROM reference in the Dockerfile is pinned by digest
+      type: shell
+      timeoutSec: 30
+      on: cl-audit-01
+      skills: [containers.build.digest-pinning]
+      weight: 1.5
+      command: |
+        awk 'tolower($1)=="from"{i=2; while ($i ~ /^--/) i++; ref=$i; if (ref=="scratch" || (tolower(ref) in st)) next; t++; if (ref ~ /@sha256:[0-9a-f]{64}$/) p++; for (j=i+1; j<=NF; j++) if (tolower($j)=="as") st[tolower($(j+1))]=1} END {print "pinned " p+0 " of " t+0}' /home/learner/subtitle-release/Dockerfile
+      expect: {match: exact, value: "pinned 1 of 1"}
+    - id: image-content
+      description: The archive loads and the image prints the banner with its default config
+      type: shell
+      timeoutSec: 120
+      on: cl-audit-01
+      skills: [containers.build.reproducible]
+      weight: 1.5
+      command: |
+        t=/var/lib/cloudtrain/repro.tar; [ -f "$t" ] || { echo no-build; exit 0; }
+        ref=$(docker load -i "$t" 2>&1 | sed -n 's/^Loaded image[^:]*: //p' | head -n 1)
+        [ -n "$ref" ] || { echo load-failed; exit 0; }
+        b=$(docker run --rm "$ref" 2>&1 | tail -n 1)
+        c=$(docker run --rm --entrypoint cat "$ref" /opt/subtitle/config/defaults.json 2>&1 | jq -r .format 2>/dev/null)
+        echo "$b $c"
+      expect: {match: exact, value: "subtitle 4.3.0 rev {{rev}} srt"}
+    - id: digest-recorded
+      description: ~/subtitle-release/digest.txt holds the digest of the reproducible archive
+      type: shell
+      timeoutSec: 30
+      on: cl-audit-01
+      skills: [containers.build.reproducible, containers.build.digest-pinning]
+      weight: 1
+      command: |
+        d=$(cat /var/lib/cloudtrain/repro.digest 2>/dev/null)
+        [ -n "$d" ] && grep -qF "$d" /home/learner/subtitle-release/digest.txt 2>/dev/null && echo recorded || echo wrong
+      expect: {match: exact, value: recorded}
+  hints:
+    - title: One epoch for everything
+      body: "`git log -1 --format=%ct` is the commit time in seconds. Pass it as `--build-arg SOURCE_DATE_EPOCH=...`: BuildKit uses it for the image `created` time and the history entries."
+      cost: 1
+    - title: Where the clock still leaks
+      body: "A `RUN` that prints the date, a `BUILD_DATE` label and the mtime of files and directories created by the build all change the layer. Remove the first two. For the third, build the file tree yourself with fixed times and add it with `ADD tree.tar /`: a tar archive brings its own directory entries (include `./` and `opt/`)."
+      cost: 2
+    - title: Pinning the base and checking
+      body: "`docker image inspect alpine:3.22 | jq -r '.[0].RepoDigests[0] // .[0].Descriptor.digest'` gives a digest for the local base. Compare two builds with `tar -xOf out.tar index.json | jq -r '.manifests[0].digest'`; add `--provenance=false --sbom=false` so no attestation with its own timestamps joins the index."
+      cost: 2
+  misconceptions:
+    - id: epoch-only
+      description: Sets SOURCE_DATE_EPOCH but keeps the COPY and RUN steps that create fresh timestamps.
+      feedback: "SOURCE_DATE_EPOCH fixes the created time, but the directories and files that COPY/RUN create still carry the build time, so the layer differs on every build."
+      expectFail: [identical-builds]
+      mutation:
+        on: cl-audit-01
+        as: learner
+        run: |
+          cd ~/subtitle-release
+          printf '%s\n' '#!/bin/sh' 'set -eu' 'epoch=$(git log -1 --format=%ct)' \
+            'docker buildx build --provenance=false --sbom=false --build-arg SOURCE_DATE_EPOCH="$epoch" -t copperleaf/subtitle:4.3.0 --output "type=oci,dest=$1" .' > build.sh
+          printf '%s\n' 'FROM alpine:3.22' 'COPY src/ /opt/subtitle/' 'CMD ["cat", "/opt/subtitle/banner.txt"]' > Dockerfile
+          ./build.sh /tmp/first.tar
+    - id: floating-base
+      description: Makes the layers deterministic but leaves the base image on a floating tag.
+      feedback: "A tag can move between two builds; without the digest nobody can say the same base layers were used. Pin FROM by digest."
+      expectFail: [base-pinned]
+      mutation:
+        on: cl-audit-01
+        as: learner
+        run: |
+          cd ~/subtitle-release
+          cat > build.sh <<'SH'
+          #!/bin/sh
+          set -eu
+          epoch=$(git log -1 --format=%ct)
+          ctx=$(mktemp -d)
+          mkdir -p "$ctx/rootfs/opt/subtitle"
+          git archive HEAD:src | tar -x -C "$ctx/rootfs/opt/subtitle"
+          tar --sort=name --mtime="@$epoch" --owner=0 --group=0 --numeric-owner -cf "$ctx/overlay.tar" -C "$ctx/rootfs" .
+          cp Dockerfile "$ctx/Dockerfile"
+          docker buildx build --provenance=false --sbom=false --build-arg SOURCE_DATE_EPOCH="$epoch" -t copperleaf/subtitle:4.3.0 --output "type=oci,dest=$1" "$ctx"
+          rm -rf "$ctx"
+          SH
+          printf '%s\n' 'FROM alpine:3.22' 'ADD overlay.tar /' 'CMD ["cat", "/opt/subtitle/banner.txt"]' > Dockerfile
+          ./build.sh /tmp/first.tar
+    - id: wall-clock-kept
+      description: Leaves the BUILD_DATE argument and the date-stamping RUN in place.
+      feedback: "Anything derived from the current time (a label, a file written by RUN) makes each build different. Use the commit time or remove it."
+      expectFail: [identical-builds, created-from-commit]
+      mutation:
+        on: cl-audit-01
+        as: learner
+        run: |
+          cd ~/subtitle-release
+          ./build.sh /tmp/first.tar
+  solution:
+    explanation: |
+      Everything that varies comes from the clock or from implicit directories. The build
+      script computes the epoch from the commit, assembles the file tree into a tar with
+      fixed times (including the parent directory entries), and builds with
+      `SOURCE_DATE_EPOCH` and attestations off. The Dockerfile pins the base by digest and
+      adds the tar instead of `COPY`/`RUN`. Two clean builds then give one digest.
+    steps:
+      - on: cl-audit-01
+        as: learner
+        run: |
+          cd ~/subtitle-release
+          base=$(docker image inspect alpine:3.22 | jq -r '.[0].RepoDigests[0] // .[0].Descriptor.digest | sub(".*@"; "")')
+          printf '%s\n' "FROM alpine:3.22@$base" 'ADD overlay.tar /' 'CMD ["cat", "/opt/subtitle/banner.txt"]' > Dockerfile
+          cat > build.sh <<'SH'
+          #!/bin/sh
+          # usage: ./build.sh OUT.tar   writes an OCI archive of copperleaf/subtitle:4.3.0
+          set -eu
+          epoch=$(git log -1 --format=%ct)
+          ctx=$(mktemp -d)
+          mkdir -p "$ctx/rootfs/opt/subtitle"
+          git archive HEAD:src | tar -x -C "$ctx/rootfs/opt/subtitle"
+          tar --sort=name --mtime="@$epoch" --owner=0 --group=0 --numeric-owner -cf "$ctx/overlay.tar" -C "$ctx/rootfs" .
+          cp Dockerfile "$ctx/Dockerfile"
+          docker buildx build --provenance=false --sbom=false --build-arg SOURCE_DATE_EPOCH="$epoch" -t copperleaf/subtitle:4.3.0 --output "type=oci,dest=$1" "$ctx"
+          rm -rf "$ctx"
+          SH
+          ./build.sh /tmp/a.tar
+          tar -xOf /tmp/a.tar index.json | jq -r '.manifests[0].digest' > digest.txt
+    alternatives:
+      - id: touched-copy
+        description: Build the file tree with cp and touch instead of git archive.
+        steps:
+          - on: cl-audit-01
+            as: learner
+            run: |
+              cd ~/subtitle-release
+              base=$(docker image inspect alpine:3.22 | jq -r '.[0].RepoDigests[0] // .[0].Descriptor.digest | sub(".*@"; "")')
+              printf '%s\n' "FROM alpine:3.22@$base" 'ADD overlay.tar /' 'LABEL org.opencontainers.image.version=4.3.0' 'CMD ["cat", "/opt/subtitle/banner.txt"]' > Dockerfile
+              cat > build.sh <<'SH'
+              #!/bin/sh
+              set -eu
+              epoch=$(git log -1 --format=%ct)
+              ctx=$(mktemp -d)
+              mkdir -p "$ctx/rootfs/opt/subtitle"
+              cp -r src/. "$ctx/rootfs/opt/subtitle/"
+              find "$ctx/rootfs" -exec touch -h -d "@$epoch" {} +
+              tar --sort=name --mtime="@$epoch" --owner=0 --group=0 --numeric-owner -cf "$ctx/overlay.tar" -C "$ctx/rootfs" .
+              cp Dockerfile "$ctx/Dockerfile"
+              docker buildx build --provenance=false --sbom=false --build-arg SOURCE_DATE_EPOCH="$epoch" -t copperleaf/subtitle:4.3.0 --output "type=oci,dest=$1" "$ctx"
+              rm -rf "$ctx"
+              SH
+              ./build.sh /tmp/a.tar
+              tar -xOf /tmp/a.tar index.json | jq -r '.manifests[0].digest' > digest.txt

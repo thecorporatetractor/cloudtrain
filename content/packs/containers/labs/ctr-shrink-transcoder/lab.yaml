@@ -1,0 +1,217 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-shrink-transcoder
+  title: Shrink the transcoder image with a multi-stage build
+  domain: containers
+  frameworks: [ckad:design-build, cks:supply-chain-security, ex188-aligned:build-images, docker-practitioner:build]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [docker, dockerfile, multi-stage, image-size]
+  version: 1
+spec:
+  description: |
+    The transcoder image (release {{rev}}) ships its whole build toolchain: it weighs
+    about 300 MiB here (the real one is closer to 900 MB) although the program itself is
+    a few kilobytes. The repository is `~/transcoder/` on `cl-build-03`
+    (`ssh cl-build-03`; you are in the `docker` group):
+
+    ```
+    transcoder/
+    ├── Dockerfile        single stage: installs the toolchain, then builds
+    ├── toolchain.sh      installs /opt/cl-toolchain and the cl-build compiler
+    └── src/              transcoder.sh and probe-media.sh
+    ```
+
+    1. Rewrite the `Dockerfile` with multiple stages so the final image holds only the two
+       programs `transcoder` and `probe-media` (in `/usr/local/bin`) on a small base, and
+       is **under 60 MiB** (a real build would aim for under 120 MB).
+    2. Build **`copperleaf/transcoder:2.0`**. `docker run --rm copperleaf/transcoder:2.0`
+       must print `transcoder 2.0 rev {{rev}}` and the bundled self-test
+       `probe-media` (run as the entrypoint override) must print `probe-media ok`.
+    3. No layer of the final image may contain the toolchain (`/opt/cl-toolchain`,
+       `cl-build`).
+  objectives:
+    - Split build and runtime into stages and copy only the artifacts
+    - Pick a small final base
+    - Confirm that no build tooling remains in any layer
+  params:
+    rev:
+      type: int
+      min: 100
+      max: 899
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-build-03
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-build-03
+      timeoutSec: 300
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        s=/home/learner/transcoder
+        rm -rf "$s"; install -d "$s/src"
+        cat > "$s/toolchain.sh" <<'SH'
+        #!/bin/sh
+        # Installs the (synthetic, incompressible) toolchain and the cl-build compiler.
+        set -eu
+        mkdir -p /opt/cl-toolchain
+        head -c 314572800 /dev/urandom > /opt/cl-toolchain/sdk.bin
+        cat > /usr/local/bin/cl-build <<'EOF'
+        #!/bin/sh
+        # cl-build SRC DEST: compiles the transcoder sources into DEST
+        set -eu
+        test -f /opt/cl-toolchain/sdk.bin
+        install -m 0755 "$1/transcoder.sh" "$2/transcoder"
+        install -m 0755 "$1/probe-media.sh" "$2/probe-media"
+        EOF
+        chmod 0755 /usr/local/bin/cl-build
+        SH
+        printf '%s\n' '#!/bin/sh' 'echo "transcoder 2.0 rev {{rev}}"' > "$s/src/transcoder.sh"
+        printf '%s\n' '#!/bin/sh' 'echo "probe-media ok"' > "$s/src/probe-media.sh"
+        cat > "$s/Dockerfile" <<'DF'
+        FROM alpine:3.22
+        COPY toolchain.sh /tmp/toolchain.sh
+        RUN sh /tmp/toolchain.sh
+        COPY src/ /src/
+        RUN cl-build /src /usr/local/bin
+        ENTRYPOINT ["transcoder"]
+        DF
+        chown -R learner:learner "$s"
+  checks:
+    - id: small-image
+      description: The exported image is under 60 MiB
+      type: shell
+      timeoutSec: 180
+      on: cl-build-03
+      skills: [containers.build.minimal-base, k8s.delivery.image-build]
+      weight: 3
+      command: |
+        docker image inspect copperleaf/transcoder:2.0 >/dev/null 2>&1 || { echo no-image; exit 0; }
+        n=$(docker save copperleaf/transcoder:2.0 2>/dev/null | wc -c)
+        if [ "$n" -gt 1000000 ] && [ "$n" -lt 62914560 ]; then echo small; else echo "bytes=$n"; fi
+      expect: {match: exact, value: small}
+    - id: no-toolchain
+      description: No layer of the image contains the toolchain or the compiler
+      type: shell
+      timeoutSec: 180
+      on: cl-build-03
+      skills: [containers.build.multi-stage, k8s.security.image-footprint]
+      weight: 2
+      command: |
+        docker image inspect copperleaf/transcoder:2.0 >/dev/null 2>&1 || { echo no-image; exit 0; }
+        t=$(mktemp -d); docker save copperleaf/transcoder:2.0 2>/dev/null | tar -x -C "$t" 2>/dev/null
+        find "$t" -type f > "$t.lst"; n=0
+        while IFS= read -r f; do zcat -f "$f" 2>/dev/null | tar -tf - 2>/dev/null | grep -qE '(^|/)(opt/cl-toolchain/|usr/local/bin/cl-build$)' && n=$((n + 1)); done < "$t.lst"
+        rm -rf "$t" "$t.lst"; [ "$n" = 0 ] && echo clean || echo "toolchain-in-$n-layers"
+      expect: {match: exact, value: clean}
+    - id: programs-work
+      description: The default command prints the transcoder banner and probe-media passes its self-test
+      type: shell
+      timeoutSec: 60
+      on: cl-build-03
+      skills: [containers.build.multi-stage]
+      weight: 2
+      command: |
+        a=$(docker run --rm copperleaf/transcoder:2.0 2>&1 | tail -n 1)
+        b=$(docker run --rm --entrypoint probe-media copperleaf/transcoder:2.0 2>&1 | tail -n 1)
+        echo "$a / $b"
+      expect: {match: exact, value: "transcoder 2.0 rev {{rev}} / probe-media ok"}
+  hints:
+    - title: Two FROM lines
+      body: "Name the first stage with `FROM alpine:3.22 AS build`, do the toolchain install and `cl-build` there into a scratch directory such as `/out`, and start a new stage with a small `FROM`."
+      cost: 1
+    - title: Copy only the artifacts
+      body: "`COPY --from=build /out/ /usr/local/bin/` brings the two programs into the final stage. Copying `/` or `/opt` brings the toolchain along."
+      cost: 1
+    - title: Deleting is not shrinking
+      body: "A `RUN rm -rf /opt/cl-toolchain` after the install adds a layer that hides the files; the earlier layer, and its 300 MiB, stays in the image."
+      cost: 1
+  misconceptions:
+    - id: rm-in-later-layer
+      description: Keeps one stage and deletes the toolchain in a later RUN.
+      feedback: "A deleting layer only hides the files. The layer that wrote them is still part of the image, so it stays large and the toolchain is still in a layer. Use a separate build stage."
+      expectFail: [small-image, no-toolchain]
+      mutation:
+        on: cl-build-03
+        as: learner
+        run: |
+          cd ~/transcoder
+          sed -i '/^ENTRYPOINT/i RUN rm -rf /opt/cl-toolchain /usr/local/bin/cl-build' Dockerfile
+          docker build -q -t copperleaf/transcoder:2.0 .
+    - id: copy-whole-build-stage
+      description: Uses two stages but copies the whole build filesystem into the final image.
+      feedback: "COPY --from=build / / brings the toolchain along. Copy only the directory with the built programs."
+      expectFail: [small-image, no-toolchain]
+      mutation:
+        on: cl-build-03
+        as: learner
+        run: |
+          cd ~/transcoder
+          printf '%s\n' 'FROM alpine:3.22 AS build' 'COPY toolchain.sh /tmp/toolchain.sh' 'RUN sh /tmp/toolchain.sh' 'COPY src/ /src/' \
+            'RUN cl-build /src /usr/local/bin' 'FROM alpine:3.22' 'COPY --from=build / /' 'ENTRYPOINT ["transcoder"]' > Dockerfile
+          docker build -q -t copperleaf/transcoder:2.0 .
+    - id: only-one-program
+      description: Copies only transcoder into the final stage and forgets probe-media.
+      feedback: "The image is small and clean, but the bundled self-test probe-media is missing. Both programs belong in /usr/local/bin."
+      expectFail: [programs-work]
+      mutation:
+        on: cl-build-03
+        as: learner
+        run: |
+          cd ~/transcoder
+          printf '%s\n' 'FROM alpine:3.22 AS build' 'COPY toolchain.sh /tmp/toolchain.sh' 'RUN sh /tmp/toolchain.sh' 'COPY src/ /src/' \
+            'RUN mkdir /out && cl-build /src /out' 'FROM alpine:3.22' 'COPY --from=build /out/transcoder /usr/local/bin/transcoder' 'ENTRYPOINT ["transcoder"]' > Dockerfile
+          docker build -q -t copperleaf/transcoder:2.0 .
+  solution:
+    explanation: |
+      Build in a first stage that writes the programs into `/out`, then start a fresh
+      small stage and copy only `/out`. The toolchain layers never become part of the
+      final image.
+    steps:
+      - on: cl-build-03
+        as: learner
+        run: |
+          cd ~/transcoder
+          cat > Dockerfile <<'DF'
+          FROM alpine:3.22 AS build
+          COPY toolchain.sh /tmp/toolchain.sh
+          RUN sh /tmp/toolchain.sh
+          COPY src/ /src/
+          RUN mkdir /out && cl-build /src /out
+
+          FROM alpine:3.22
+          COPY --from=build /out/ /usr/local/bin/
+          ENTRYPOINT ["transcoder"]
+          DF
+          docker build -t copperleaf/transcoder:2.0 .
+    alternatives:
+      - id: busybox-final
+        description: Use the smaller busybox image as the final stage.
+        steps:
+          - on: cl-build-03
+            as: learner
+            run: |
+              cd ~/transcoder
+              cat > Dockerfile <<'DF'
+              FROM alpine:3.22 AS build
+              COPY toolchain.sh /tmp/toolchain.sh
+              RUN sh /tmp/toolchain.sh
+              COPY src/ /src/
+              RUN mkdir /out && cl-build /src /out
+
+              FROM busybox:1.37
+              COPY --from=build /out/transcoder /out/probe-media /usr/local/bin/
+              ENTRYPOINT ["transcoder"]
+              DF
+              docker build -t copperleaf/transcoder:2.0 .

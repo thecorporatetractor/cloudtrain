@@ -1,0 +1,281 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-buildkit-cache-mount
+  title: Stop re-downloading Python wheels on every rebuild
+  domain: containers
+  frameworks: [docker-practitioner:build]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [docker, buildkit, cache-mount, pip]
+  version: 1
+spec:
+  description: |
+    Subtitle release **{{rev}}** needs a newer `timecode` package, and every change to
+    `requirements.txt` makes the build download all six packages again. The repository is
+    `~/subtitle/` on `cl-build-04` (`ssh cl-build-04`; you are in the `docker` group). The
+    package index it uses logs every download.
+
+    1. Change `~/subtitle/Dockerfile` so pip keeps its download cache between builds in a
+       **BuildKit cache mount** (the cache must not end up in the image).
+    2. Bump `timecode` to **1.3.0** in `requirements.txt` (the index has it) and build
+       **`copperleaf/subtitle:dev`**. Running it must print `subtitle {{rev}} timecode 1.3.0`.
+
+    Afterwards, adding one new package to `requirements.txt` must download only that
+    package.
+  objectives:
+    - Add a BuildKit cache mount for a package manager cache
+    - Keep the cache out of the image layers
+    - Prove cache reuse from the package index log
+  params:
+    rev:
+      type: int
+      min: 100
+      max: 899
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-build-04
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-build-04
+      timeoutSec: 300
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        GW=$(docker network inspect bridge | jq -r '.[0].IPAM.Config[0].Gateway')
+        PYROOT=/srv/pypi; PYPORT=3141; PYTOKEN=''; PYLOG=/var/log/copperleaf/pypi.log; PYUNIT=copperleaf-pypi
+        PYSPEC='[{"name":"srt-parse","version":"2.1.0"},{"name":"vtt-lite","version":"1.4.2"},{"name":"charset-sniff","version":"3.0.1"},{"name":"lang-detect","version":"0.9.4"},{"name":"timecode","version":"1.2.0"},{"name":"timecode","version":"1.3.0"},{"name":"status-badge","version":"2.0.0"},{"name":"frame-math","version":"0.4.0"}]'
+        # needs: PYROOT PYPORT PYTOKEN PYLOG PYUNIT PYSPEC (JSON list of packages)
+        install -d "$PYROOT" "$(dirname "$PYLOG")"
+        cat > "$PYROOT/mkindex.py" <<'PY'
+        import hashlib, io, json, os, sys, tarfile
+        root, spec = sys.argv[1], json.loads(sys.argv[2])
+        BACKEND = '''import base64, hashlib, zipfile
+        NAME, VERSION, REQUIRES, BODY = %r, %r, %r, %r
+        def _b64(d):
+            return base64.urlsafe_b64encode(hashlib.sha256(d).digest()).rstrip(b"=").decode()
+        def get_requires_for_build_wheel(config_settings=None):
+            return []
+        def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
+            norm = NAME.replace("-", "_")
+            di = f"{norm}-{VERSION}.dist-info"
+            meta = f"Metadata-Version: 2.1\\nName: {NAME}\\nVersion: {VERSION}\\n" + "".join(f"Requires-Dist: {r}\\n" for r in REQUIRES)
+            files = {f"{norm}/__init__.py": f"VERSION = {VERSION!r}\\n" + BODY, f"{di}/METADATA": meta,
+                     f"{di}/WHEEL": "Wheel-Version: 1.0\\nGenerator: cfbuild\\nRoot-Is-Purelib: true\\nTag: py3-none-any\\n"}
+            rec = "".join(f"{k},sha256={_b64(v.encode())},{len(v.encode())}\\n" for k, v in files.items()) + f"{di}/RECORD,,\\n"
+            name = f"{norm}-{VERSION}-py3-none-any.whl"
+            with zipfile.ZipFile(f"{wheel_directory}/{name}", "w") as z:
+                for k, v in files.items():
+                    z.writestr(k, v)
+                z.writestr(f"{di}/RECORD", rec)
+            return name
+        '''
+        def add(t, path, text):
+            b = text.encode()
+            i = tarfile.TarInfo(path); i.size = len(b); i.mtime = 1577836800
+            t.addfile(i, io.BytesIO(b))
+        for p in spec:
+            name, ver = p["name"], p["version"]
+            d = os.path.join(root, "simple", name)
+            os.makedirs(d, exist_ok=True)
+            top = f"{name}-{ver}"
+            with tarfile.open(os.path.join(d, top + ".tar.gz"), "w:gz") as t:
+                add(t, f"{top}/pyproject.toml", '[build-system]\nrequires = []\nbuild-backend = "cfbuild"\nbackend-path = ["."]\n')
+                add(t, f"{top}/cfbuild.py", BACKEND % (name, ver, p.get("requires", []), p.get("body", "")))
+                add(t, f"{top}/PKG-INFO", f"Metadata-Version: 2.1\nName: {name}\nVersion: {ver}\n")
+            links = sorted(f for f in os.listdir(d) if f.endswith(".tar.gz"))
+            with open(os.path.join(d, "index.html"), "w") as f:
+                f.write("<!doctype html><html><body>" + "".join(f'<a href="{l}">{l}</a><br>' for l in links) + "</body></html>\n")
+        PY
+        cat > "$PYROOT/serve.py" <<'PY'
+        import base64, functools, http.server, sys
+        root, port, token, log = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
+        class H(http.server.SimpleHTTPRequestHandler):
+            def do_GET(self):
+                if token:
+                    ok = False
+                    a = self.headers.get("Authorization", "")
+                    if a.startswith("Basic "):
+                        try:
+                            ok = base64.b64decode(a[6:]).decode().split(":", 1)[1] == token
+                        except Exception:
+                            pass
+                    if not ok:
+                        self.send_response(401)
+                        self.send_header("WWW-Authenticate", 'Basic realm="copperleaf"')
+                        self.send_header("Content-Length", "0")
+                        self.end_headers()
+                        return
+                with open(log, "a") as f:
+                    f.write("GET " + self.path + "\n")
+                super().do_GET()
+            def end_headers(self):
+                self.send_header("Cache-Control", "max-age=3600")
+                super().end_headers()
+            def log_message(self, *a):
+                pass
+        http.server.ThreadingHTTPServer(("0.0.0.0", port), functools.partial(H, directory=root)).serve_forever()
+        PY
+        python3 "$PYROOT/mkindex.py" "$PYROOT" "$PYSPEC"
+        : > "$PYLOG"
+        cat > "/etc/systemd/system/$PYUNIT.service" <<UNIT
+        [Unit]
+        Description=Copperleaf offline Python package index ($PYPORT)
+        After=network.target
+        [Service]
+        ExecStart=/usr/bin/python3 $PYROOT/serve.py $PYROOT $PYPORT '$PYTOKEN' $PYLOG
+        Restart=always
+        [Install]
+        WantedBy=multi-user.target
+        UNIT
+        systemctl daemon-reload
+        systemctl enable "$PYUNIT.service" >/dev/null 2>&1
+        systemctl restart "$PYUNIT.service"
+        for i in $(seq 30); do curl -fs -o /dev/null -u "__token__:$PYTOKEN" "http://127.0.0.1:$PYPORT/simple/$(echo "$PYSPEC" | jq -r '.[0].name')/" && break; sleep 1; done
+        : > "$PYLOG"
+        s=/home/learner/subtitle
+        rm -rf "$s"; install -d "$s/src"
+        cat > "$s/src/app.py" <<'PY'
+        import importlib
+        REV = {{rev}}
+        for m in ["srt_parse", "vtt_lite", "charset_sniff", "lang_detect", "frame_math"]:
+            importlib.import_module(m)
+        print(f"subtitle {REV} timecode {importlib.import_module('timecode').VERSION}")
+        PY
+        printf '%s\n' srt-parse==2.1.0 vtt-lite==1.4.2 charset-sniff==3.0.1 lang-detect==0.9.4 frame-math==0.4.0 timecode==1.2.0 > "$s/requirements.txt"
+        cat > "$s/Dockerfile" <<'DF'
+        FROM python:3.13-alpine
+        ENV PIP_INDEX_URL=http://@GW@:3141/simple PIP_TRUSTED_HOST=@GW@ PIP_DISABLE_PIP_VERSION_CHECK=1
+        WORKDIR /app
+        COPY requirements.txt .
+        RUN pip install --no-cache-dir -r requirements.txt
+        COPY src/ src/
+        CMD ["python3", "src/app.py"]
+        DF
+        sed -i "s/@GW@/$GW/g" "$s/Dockerfile"
+        chown -R learner:learner "$s"
+  checks:
+    - id: image-works
+      description: copperleaf/subtitle:dev runs with timecode 1.3.0
+      type: shell
+      timeoutSec: 60
+      on: cl-build-04
+      skills: [containers.buildkit.mounts]
+      weight: 1
+      command: docker run --rm copperleaf/subtitle:dev 2>&1 | tail -n 1
+      expect: {match: exact, value: "subtitle {{rev}} timecode 1.3.0"}
+    - id: only-new-fetched
+      description: Adding one package to requirements.txt downloads only that package
+      type: shell
+      timeoutSec: 300
+      on: cl-build-04
+      skills: [containers.buildkit.mounts]
+      weight: 3
+      command: |
+        d=$(mktemp -d); cp -a /home/learner/subtitle/. "$d/"
+        [ -f "$d/requirements.txt" ] || { echo no-requirements; rm -rf "$d"; exit 0; }
+        docker build -q -t ct-probe/subtitle:warm "$d" >/dev/null 2>&1 || { echo build-failed; rm -rf "$d"; exit 0; }
+        echo 'status-badge==2.0.0' >> "$d/requirements.txt"
+        before=$(grep -c '\.tar\.gz' /var/log/copperleaf/pypi.log || true)
+        docker build -q -t ct-probe/subtitle:probe "$d" >/dev/null 2>&1 || { echo build-failed; rm -rf "$d"; exit 0; }
+        after=$(grep -c '\.tar\.gz' /var/log/copperleaf/pypi.log || true)
+        rm -rf "$d"; docker rmi -f ct-probe/subtitle:warm ct-probe/subtitle:probe >/dev/null 2>&1
+        echo "fetched-$((after - before))"
+      expect: {match: exact, value: "fetched-1"}
+    - id: cache-not-in-image
+      description: The pip cache is not stored in any layer of the image
+      type: shell
+      timeoutSec: 90
+      on: cl-build-04
+      skills: [containers.buildkit.mounts]
+      weight: 2
+      command: |
+        docker image inspect copperleaf/subtitle:dev >/dev/null 2>&1 || { echo no-image; exit 0; }
+        t=$(mktemp -d); docker save copperleaf/subtitle:dev 2>/dev/null | tar -x -C "$t" 2>/dev/null
+        find "$t" -type f > "$t.lst"; n=0
+        while IFS= read -r f; do zcat -f "$f" 2>/dev/null | tar -tf - 2>/dev/null | grep -qE '(^|/)\.cache/pip/[^/]' && n=$((n + 1)); done < "$t.lst"
+        rm -rf "$t" "$t.lst"; [ "$n" = 0 ] && echo clean || echo "cache-in-$n-layers"
+      expect: {match: exact, value: clean}
+  hints:
+    - title: Where pip keeps its cache
+      body: "As root pip caches downloads and built wheels under `/root/.cache/pip`. A cache mount is declared on the instruction that uses it: `RUN --mount=type=cache,target=/root/.cache/pip pip install ...`."
+      cost: 1
+    - title: pip must be allowed to cache
+      body: "`--no-cache-dir` tells pip not to use a cache, so a mount behind it stays empty. Remove the flag."
+      cost: 1
+    - title: Read the log
+      body: "`grep -c tar.gz /var/log/copperleaf/pypi.log` (use sudo) counts the downloads the index has served. Rebuild after a change and count again."
+      cost: 1
+  misconceptions:
+    - id: flag-only
+      description: Removes --no-cache-dir but declares no cache mount.
+      feedback: "Without a cache mount the pip cache is written into the layer (it bloats the image) and the next build starts with an empty one. Mount the cache directory instead."
+      expectFail: [only-new-fetched, cache-not-in-image]
+      mutation:
+        on: cl-build-04
+        as: learner
+        run: |
+          cd ~/subtitle
+          sed -i 's/ --no-cache-dir//; s/timecode==1.2.0/timecode==1.3.0/' Dockerfile requirements.txt
+          docker build -q -t copperleaf/subtitle:dev .
+    - id: mount-but-no-cache-dir
+      description: Adds the cache mount but keeps --no-cache-dir.
+      feedback: "pip never writes to its cache while --no-cache-dir is set, so the mounted directory stays empty and every build downloads everything."
+      expectFail: [only-new-fetched]
+      mutation:
+        on: cl-build-04
+        as: learner
+        run: |
+          cd ~/subtitle
+          sed -i 's|^RUN pip|RUN --mount=type=cache,target=/root/.cache/pip pip|' Dockerfile
+          sed -i 's/timecode==1.2.0/timecode==1.3.0/' requirements.txt
+          docker build -q -t copperleaf/subtitle:dev .
+    - id: wrong-target
+      description: Mounts the cache somewhere pip does not look.
+      feedback: "The mount must be the directory pip really uses (as root, /root/.cache/pip, or the one named by PIP_CACHE_DIR). A mount elsewhere is just an empty directory."
+      expectFail: [only-new-fetched]
+      mutation:
+        on: cl-build-04
+        as: learner
+        run: |
+          cd ~/subtitle
+          sed -i 's|^RUN pip|RUN --mount=type=cache,target=/var/cache/wheels pip|; s/ --no-cache-dir//' Dockerfile
+          sed -i 's/timecode==1.2.0/timecode==1.3.0/' requirements.txt
+          docker build -q -t copperleaf/subtitle:dev .
+  solution:
+    explanation: |
+      Mount BuildKit's persistent cache over pip's cache directory for the install step and
+      let pip use it (no `--no-cache-dir`). The mount is not part of the image, so the layer
+      stays small, and the next build with a changed `requirements.txt` only downloads what
+      the cache does not hold.
+    steps:
+      - on: cl-build-04
+        as: learner
+        run: |
+          cd ~/subtitle
+          sed -i 's|^RUN pip install --no-cache-dir|RUN --mount=type=cache,target=/root/.cache/pip pip install|' Dockerfile
+          docker build -q -t copperleaf/subtitle:dev .
+          sed -i 's/timecode==1.2.0/timecode==1.3.0/' requirements.txt
+          docker build -t copperleaf/subtitle:dev .
+    alternatives:
+      - id: pip-cache-dir-env
+        description: Point PIP_CACHE_DIR at a mounted directory of your own.
+        steps:
+          - on: cl-build-04
+            as: learner
+            run: |
+              cd ~/subtitle
+              sed -i 's|^WORKDIR /app|ENV PIP_CACHE_DIR=/var/cache/pip\nWORKDIR /app|' Dockerfile
+              sed -i 's|^RUN pip install --no-cache-dir|RUN --mount=type=cache,target=/var/cache/pip pip install|' Dockerfile
+              docker build -q -t copperleaf/subtitle:dev .
+              sed -i 's/timecode==1.2.0/timecode==1.3.0/' requirements.txt
+              docker build -t copperleaf/subtitle:dev .

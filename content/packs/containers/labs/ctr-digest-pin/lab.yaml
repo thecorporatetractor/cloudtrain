@@ -1,0 +1,228 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-digest-pin
+  title: Pin every base image of the catalogue build by digest
+  domain: containers
+  frameworks: [cks:supply-chain-security, docker-practitioner:build]
+  difficulty: medium
+  estimatedMinutes: 12
+  tags: [docker, dockerfile, digest, supply-chain, registry]
+  version: 1
+spec:
+  description: |
+    The catalogue build pulls its two base images from Copperleaf's mirror
+    (`registry.copperleaf.example:5000/mirror/...`, plain HTTP, on the build host
+    `cl-catalogue-03`; `ssh cl-catalogue-03`, you are in the `docker` group). Their
+    `stable` tags move: the mirror was refreshed to toolchain revision **{{rev}}** this
+    morning, and the Dockerfile in `~/catalogue/` still builds from a stale pin and a
+    floating tag.
+
+    1. In `~/catalogue/Dockerfile`, make **every** `FROM` reference an `@sha256:` digest
+       that the mirror **serves right now** for the `stable` tag of that repository.
+    2. Build **`copperleaf/catalogue:3.1`** from it. Running it must print
+       `catalogue 3.1 toolchain {{rev}} runtime rt-{{rev}}`.
+  objectives:
+    - Look up the digest a registry currently serves for a tag
+    - Pin each FROM line by digest
+    - Recognise a stale pin
+  params:
+    rev:
+      type: int
+      min: 200
+      max: 899
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-catalogue-03
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-catalogue-03
+      timeoutSec: 420
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        # merge the plain-HTTP mirror into daemon.json without replacing the file
+        install -d /etc/docker; [ -s /etc/docker/daemon.json ] || echo '{}' > /etc/docker/daemon.json
+        jq '. + {"insecure-registries": (((."insecure-registries" // []) + ["registry.copperleaf.example:5000"]) | unique)}' /etc/docker/daemon.json > /etc/docker/daemon.json.new
+        mv /etc/docker/daemon.json.new /etc/docker/daemon.json
+        grep -q ' registry.copperleaf.example' /etc/hosts || echo '127.0.0.1 registry.copperleaf.example' >> /etc/hosts
+        systemctl restart docker
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        # digest_of <host:port> <repo> <tag>: the digest a registry serves for a tag (index or manifest)
+        digest_of() {
+          curl -fsSI -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json' "http://$1/v2/$2/manifests/$3" \
+            | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}'
+        }
+        docker rm -f registry >/dev/null 2>&1 || true
+        docker run -d --name registry --restart always -p 127.0.0.1:5000:5000 registry:3 >/dev/null
+        for i in $(seq 30); do curl -fs http://127.0.0.1:5000/v2/ >/dev/null && break; sleep 1; done
+        R=registry.copperleaf.example:5000/mirror
+        mk() {  # mk <repo> <base> <revision>: build FROM base, push as :stable
+          d=$(mktemp -d)
+          printf '%s\n' "FROM $2" "LABEL com.copperleaf.mirror.rev=$3" "RUN echo $3 > /etc/mirror-rev" > "$d/Dockerfile"
+          docker build -q -t "$R/$1:stable" "$d" >/dev/null
+          docker push -q "$R/$1:stable" >/dev/null
+          rm -rf "$d"
+        }
+        mk toolchain alpine:3.22 $(( {{rev}} - 111 ))
+        old=$(digest_of registry.copperleaf.example:5000 mirror/toolchain stable)
+        mk toolchain alpine:3.22 {{rev}}
+        mk runtime busybox:1.37 rt-{{rev}}
+        mkdir -p /var/lib/cloudtrain
+        jq -n --arg t "$(digest_of registry.copperleaf.example:5000 mirror/toolchain stable)" --arg r "$(digest_of registry.copperleaf.example:5000 mirror/runtime stable)" \
+          '{toolchain: $t, runtime: $r}' > /var/lib/cloudtrain/pin.json
+        jq -e '.toolchain | test("^sha256:[0-9a-f]{64}$")' /var/lib/cloudtrain/pin.json >/dev/null
+        jq -e '.runtime | test("^sha256:[0-9a-f]{64}$")' /var/lib/cloudtrain/pin.json >/dev/null
+        [ "$old" != "$(jq -r .toolchain /var/lib/cloudtrain/pin.json)" ]
+        docker images --format json | jq -r 'select(.Repository | startswith("registry.copperleaf.example:5000/mirror/")) | .Repository + ":" + .Tag' | xargs -r docker rmi >/dev/null
+        s=/home/learner/catalogue
+        rm -rf "$s"; install -d "$s"
+        cat > "$s/Dockerfile" <<DF
+        FROM registry.copperleaf.example:5000/mirror/toolchain:stable@$old AS build
+        RUN echo "catalogue 3.1 toolchain \$(cat /etc/mirror-rev)" > /out.txt
+
+        FROM registry.copperleaf.example:5000/mirror/runtime:stable
+        COPY --from=build /out.txt /srv/out.txt
+        CMD ["sh", "-c", "echo \$(cat /srv/out.txt) runtime \$(cat /etc/mirror-rev)"]
+        DF
+        chown -R learner:learner "$s"
+  checks:
+    - id: pins-current
+      description: Every FROM reference carries the digest the mirror serves now for its stable tag
+      type: shell
+      timeoutSec: 60
+      on: cl-catalogue-03
+      skills: [containers.build.digest-pinning, k8s.security.supply-chain]
+      weight: 3
+      command: |
+        cd /home/learner/catalogue || exit 0
+        refs=$(awk 'tolower($1)=="from"{i=2; while ($i ~ /^--/) i++; ref=$i; if (ref=="scratch" || (tolower(ref) in st)) next; print ref; for (j=i+1; j<=NF; j++) if (tolower($j)=="as") st[tolower($(j+1))]=1}' Dockerfile)
+        total=0; ok=0
+        for ref in $refs; do
+          total=$((total + 1))
+          b=${ref##*/}; name=${b%%[:@]*}
+          case "$ref" in *@sha256:*) dig=${ref#*@} ;; *) dig=none ;; esac
+          [ "$dig" = "$(jq -r --arg n "$name" '.[$n] // "unknown"' /var/lib/cloudtrain/pin.json)" ] && ok=$((ok + 1))
+        done
+        echo "pinned $ok of $total"
+      expect: {match: exact, value: "pinned 2 of 2"}
+    - id: image-built
+      description: copperleaf/catalogue:3.1 reports the current toolchain and runtime revisions
+      type: shell
+      timeoutSec: 60
+      on: cl-catalogue-03
+      skills: [containers.build.digest-pinning]
+      weight: 2
+      command: docker run --rm copperleaf/catalogue:3.1 2>&1 | tail -n 1
+      expect: {match: exact, value: "catalogue 3.1 toolchain {{rev}} runtime rt-{{rev}}"}
+    - id: dockerfile-builds
+      description: The Dockerfile in the repository builds from scratch and gives the same output
+      type: shell
+      timeoutSec: 180
+      on: cl-catalogue-03
+      skills: [containers.build.digest-pinning]
+      weight: 1
+      command: |
+        cd /home/learner/catalogue || exit 0
+        docker build -q --no-cache -t ct-probe/catalogue:probe . >/dev/null 2>&1 || { echo build-failed; exit 0; }
+        docker run --rm ct-probe/catalogue:probe 2>&1 | tail -n 1; docker rmi -f ct-probe/catalogue:probe >/dev/null 2>&1
+      expect: {match: exact, value: "catalogue 3.1 toolchain {{rev}} runtime rt-{{rev}}"}
+  hints:
+    - title: Ask the registry
+      body: "A registry answers `HEAD /v2/<repo>/manifests/<tag>` with a `Docker-Content-Digest` header (send an `Accept` header for index and manifest media types). `skopeo inspect --raw --tls-verify=false docker://...` piped to `sha256sum` gives the same digest."
+      cost: 2
+    - title: Both lines
+      body: "One `FROM` already has a digest, but from before the refresh. A stale pin is still a pin: compare it with what the registry serves now."
+      cost: 1
+    - title: Reference shape
+      body: "`FROM registry.copperleaf.example:5000/mirror/runtime:stable@sha256:<64 hex>`; the tag is kept for readers, the digest decides."
+      cost: 1
+  misconceptions:
+    - id: tag-and-stale-pin
+      description: Builds the Dockerfile as it is, with a floating tag and the stale pin.
+      feedback: "The runtime line floats with the tag and the toolchain line is pinned to the digest from before the refresh. Look up the current digest of each stable tag."
+      expectFail: [pins-current, image-built]
+      mutation:
+        on: cl-catalogue-03
+        as: learner
+        run: |
+          cd ~/catalogue
+          docker build -q -t copperleaf/catalogue:3.1 .
+    - id: stale-pin-kept
+      description: Pins the runtime base but keeps the stale toolchain digest.
+      feedback: "The toolchain digest is the one from before this morning's refresh; it still pulls, but it is not what the mirror serves now."
+      expectFail: [pins-current, image-built]
+      mutation:
+        on: cl-catalogue-03
+        as: learner
+        run: |
+          cd ~/catalogue
+          rd=$(curl -fsSI -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json' \
+            http://registry.copperleaf.example:5000/v2/mirror/runtime/manifests/stable | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}')
+          sed -i "s|^FROM registry.copperleaf.example:5000/mirror/runtime:stable\$|FROM registry.copperleaf.example:5000/mirror/runtime:stable@$rd|" Dockerfile
+          docker build -q -t copperleaf/catalogue:3.1 .
+    - id: config-digest-as-pin
+      description: Pins the digest of the image configuration instead of the manifest digest.
+      feedback: "The configuration blob digest names the image's settings, not the manifest the registry serves for the tag. A FROM pin must be the manifest (or index) digest: the registry's Docker-Content-Digest or the RepoDigests value."
+      expectFail: [pins-current]
+      mutation:
+        on: cl-catalogue-03
+        as: learner
+        run: |
+          cd ~/catalogue
+          for n in toolchain runtime; do
+            id=sha256:$(printf %s "$(skopeo inspect --config --raw --tls-verify=false docker://registry.copperleaf.example:5000/mirror/$n:stable)" | sha256sum | cut -d' ' -f1)
+            sed -i "s|^\(FROM registry.copperleaf.example:5000/mirror/$n\):stable[^ ]*|\1:stable@$id|" Dockerfile
+          done
+          docker build -q -t copperleaf/catalogue:3.1 . || true
+  solution:
+    explanation: |
+      Read the digest each `stable` tag resolves to now (registry API, skopeo, or the
+      RepoDigests of a pull) and put it behind `@` on both `FROM` lines, replacing the
+      stale one. The build then always starts from exactly those base layers.
+    steps:
+      - on: cl-catalogue-03
+        as: learner
+        run: |
+          cd ~/catalogue
+          A='Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json'
+          for n in toolchain runtime; do
+            d=$(curl -fsSI -H "$A" http://registry.copperleaf.example:5000/v2/mirror/$n/manifests/stable | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}')
+            sed -i "s|^\(FROM registry.copperleaf.example:5000/mirror/$n\):stable[^ ]*|\1:stable@$d|" Dockerfile
+          done
+          docker build -t copperleaf/catalogue:3.1 .
+    alternatives:
+      - id: skopeo
+        description: Hash the raw manifest with skopeo.
+        steps:
+          - on: cl-catalogue-03
+            as: learner
+            run: |
+              cd ~/catalogue
+              for n in toolchain runtime; do
+                d=sha256:$(skopeo inspect --raw --tls-verify=false docker://registry.copperleaf.example:5000/mirror/$n:stable | sha256sum | cut -d' ' -f1)
+                sed -i "s|^\(FROM registry.copperleaf.example:5000/mirror/$n\):stable[^ ]*|\1:stable@$d|" Dockerfile
+              done
+              docker build -t copperleaf/catalogue:3.1 .
+      - id: pull-repodigests
+        description: Pull the tags and read RepoDigests.
+        steps:
+          - on: cl-catalogue-03
+            as: learner
+            run: |
+              cd ~/catalogue
+              for n in toolchain runtime; do
+                docker pull -q registry.copperleaf.example:5000/mirror/$n:stable >/dev/null
+                d=$(docker image inspect registry.copperleaf.example:5000/mirror/$n:stable | jq -r '.[0].RepoDigests[0]' | sed 's/.*@//')
+                sed -i "s|^\(FROM registry.copperleaf.example:5000/mirror/$n\):stable[^ ]*|\1:stable@$d|" Dockerfile
+              done
+              docker build -t copperleaf/catalogue:3.1 .

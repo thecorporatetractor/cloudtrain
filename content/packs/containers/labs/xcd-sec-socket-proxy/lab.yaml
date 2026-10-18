@@ -1,0 +1,256 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xcd-sec-socket-proxy
+  title: Take the engine socket away from a monitoring container
+  domain: containers
+  frameworks: [docker-practitioner:security]
+  difficulty: hard
+  estimatedMinutes: 15
+  tags: [exam, docker, socket, security, proxy]
+  version: 1
+spec:
+  description: |
+    **Host:** `cl-docker-01` (`ssh cl-docker-01`)
+
+    The monitoring dashboard **`monitor`** (image `copperleaf/monitor:1`, published on
+    `127.0.0.1:8091`) mounts `/var/run/docker.sock` read-write, which gives it control of
+    the whole engine. It lists the running containers (site {{site}}). Redeploy it so that
+    it never touches the socket:
+
+    1. Run the allowlist proxy from the supplied image **`copperleaf/socket-proxy:1`** as
+       the container **`socket-proxy`** on a user-defined network named **`monitoring`**.
+       The proxy is the only container that mounts the socket, **read-only**. It listens
+       on port 2375 and only forwards `GET /containers/json` and `/_ping`.
+    2. Recreate **`monitor`** on the `monitoring` network **without any socket mount**,
+       pointing it at the proxy with `DOCKER_API=tcp://socket-proxy:2375`, still published
+       on `127.0.0.1:8091` (container port 8000).
+    3. Both containers must come back after an engine restart and a reboot.
+
+    The dashboard must keep listing containers, and it must no longer be able to create
+    one.
+  objectives:
+    - Remove a direct docker.sock mount from an application container
+    - Put a filtering proxy between the application and the engine API
+  params:
+    site:
+      type: choice
+      values: [playout-a, playout-b, playout-c]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-docker-01
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-docker-01
+      timeoutSec: 420
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        d=$(mktemp -d)
+        cat > "$d/monitor.py" <<'PY'
+        import http.client, http.server, json, os, socket
+        API = os.environ.get("DOCKER_API", "unix:///var/run/docker.sock")
+        SITE = os.environ.get("SITE", "-")
+        class Unix(http.client.HTTPConnection):
+            def __init__(self, path):
+                super().__init__("localhost")
+                self.path = path
+            def connect(self):
+                s = socket.socket(socket.AF_UNIX)
+                s.connect(self.path)
+                self.sock = s
+        def call(method, path, body=None):
+            if API.startswith("unix://"):
+                c = Unix(API[len("unix://"):])
+            else:
+                host, port = API[len("tcp://"):].split(":")
+                c = http.client.HTTPConnection(host, int(port), timeout=3)
+            c.request(method, path, body=body, headers={"Content-Type": "application/json"})
+            r = c.getresponse()
+            return r.status, r.read()
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                try:
+                    if self.path.startswith("/probe"):
+                        out = "create=%d" % call("POST", "/containers/create", b"{}")[0]
+                    else:
+                        st, data = call("GET", "/containers/json")
+                        kind = "unix" if API.startswith("unix") else "tcp"
+                        out = ("monitor ok site %s containers=%d source=%s" % (SITE, len(json.loads(data)), kind)) if st == 200 else "monitor error status=%d" % st
+                except Exception as e:
+                    out = "monitor error %s" % type(e).__name__
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write((out + "\n").encode())
+            def log_message(self, *a):
+                pass
+        http.server.ThreadingHTTPServer(("", 8000), H).serve_forever()
+        PY
+        printf '%s\n' 'FROM python:3.13-alpine' 'COPY monitor.py /app/monitor.py' 'CMD ["python3", "/app/monitor.py"]' > "$d/Dockerfile"
+        docker build -q -t copperleaf/monitor:1 "$d" >/dev/null
+        rm -rf "$d"
+        d=$(mktemp -d)
+        cat > "$d/nginx.conf" <<'NGX'
+        user root;
+        worker_processes 1;
+        events { worker_connections 64; }
+        http {
+          access_log off;
+          server {
+            listen 2375;
+            location = /_ping {
+              limit_except GET HEAD { deny all; }
+              proxy_pass http://unix:/var/run/docker.sock:;
+            }
+            location = /containers/json {
+              limit_except GET { deny all; }
+              proxy_pass http://unix:/var/run/docker.sock:;
+            }
+            location / {
+              return 403;
+            }
+          }
+        }
+        NGX
+        printf '%s\n' 'FROM nginx:1.29-alpine' 'COPY nginx.conf /etc/nginx/nginx.conf' > "$d/Dockerfile"
+        docker build -q -t copperleaf/socket-proxy:1 "$d" >/dev/null
+        rm -rf "$d"
+        docker rm -f monitor socket-proxy >/dev/null 2>&1 || true
+        docker network rm monitoring >/dev/null 2>&1 || true
+        docker run -d --name monitor --restart unless-stopped -e SITE={{site}} -p 127.0.0.1:8091:8000 \
+          -v /var/run/docker.sock:/var/run/docker.sock copperleaf/monitor:1 >/dev/null
+  checks:
+    - id: dashboard-via-proxy
+      description: The dashboard lists containers through the proxy (not the socket)
+      type: shell
+      timeoutSec: 90
+      on: cl-docker-01
+      skills: [containers.runtime-security.daemon-socket]
+      weight: 2.5
+      command: |
+        r=down; for i in $(seq 20); do r=$(curl -fsS --max-time 3 http://127.0.0.1:8091/ 2>/dev/null | sed -E 's/containers=[0-9]+/containers=N/'); case "$r" in *source=tcp*) break ;; esac; sleep 2; done; echo "$r"
+      expect: {match: exact, value: "monitor ok site {{site}} containers=N source=tcp"}
+    - id: monitor-has-no-socket
+      description: The monitor container has no mount or bind of the engine socket
+      type: shell
+      timeoutSec: 60
+      on: cl-docker-01
+      skills: [containers.runtime-security.daemon-socket]
+      weight: 2.5
+      command: |
+        docker inspect monitor 2>/dev/null | jq -r '[(.[0].Mounts // [])[] | select((.Source // "") | test("docker.sock"))] as $m | [(.[0].HostConfig.Binds // [])[] | select(test("docker.sock"))] as $b | if ($m | length) + ($b | length) == 0 then "none" else "socket-mounted" end'
+      expect: {match: exact, value: none}
+    - id: cannot-create
+      description: The dashboard's attempt to create a container is refused by the proxy
+      type: shell
+      timeoutSec: 60
+      on: cl-docker-01
+      skills: [containers.runtime-security.daemon-socket]
+      weight: 3
+      command: curl -fsS --max-time 5 http://127.0.0.1:8091/probe 2>/dev/null || echo down
+      expect: {match: exact, value: "create=403"}
+    - id: proxy-allowlist
+      description: The proxy answers the ping, lists containers, and refuses everything else
+      type: shell
+      timeoutSec: 60
+      on: cl-docker-01
+      skills: [containers.runtime-security.daemon-socket]
+      weight: 2
+      command: |
+        docker exec monitor python3 -c '
+        import http.client
+        def s(m, p):
+            c = http.client.HTTPConnection("socket-proxy", 2375, timeout=3)
+            c.request(m, p)
+            return c.getresponse().status
+        print(s("GET", "/_ping"), s("GET", "/containers/json"), s("GET", "/images/json"), s("DELETE", "/containers/json"), s("GET", "/info"))' 2>/dev/null || echo failed
+      expect: {match: exact, value: "200 200 403 403 403"}
+    - id: socket-only-in-proxy
+      description: Only socket-proxy mounts the socket, read-only, and both containers restart on their own
+      type: shell
+      timeoutSec: 60
+      on: cl-docker-01
+      skills: [containers.runtime-security.daemon-socket, containers.operations.restart-health]
+      weight: 2
+      command: |
+        docker inspect socket-proxy monitor 2>/dev/null | jq -r '
+          (.[0].Mounts // [] | map(select((.Source // "") | test("docker.sock")) | (.RW | tostring)) | join(",")) as $rw
+          | ([.[] | select(.HostConfig.RestartPolicy.Name | IN("always", "unless-stopped"))] | length) as $r
+          | (.[0].NetworkSettings.Networks | keys | join(",")) as $n
+          | "rw=" + $rw + " restart=" + ($r | tostring) + " net=" + $n'
+      expect: {match: exact, value: "rw=false restart=2 net=monitoring"}
+  misconceptions:
+    - id: read-only-socket
+      description: Keeps the socket mount in the monitor and just adds :ro.
+      feedback: "A read-only bind of the socket protects nothing: the API is still reachable and a client can create privileged containers through it. Remove the mount and put a filtering proxy between the monitor and the engine."
+      expectFail: [dashboard-via-proxy, monitor-has-no-socket, cannot-create]
+      mutation:
+        on: cl-docker-01
+        as: learner
+        run: |
+          docker rm -f monitor
+          docker run -d --name monitor --restart unless-stopped -e SITE={{site}} -p 127.0.0.1:8091:8000 -v /var/run/docker.sock:/var/run/docker.sock:ro copperleaf/monitor:1
+    - id: proxy-without-restart
+      description: Builds the right topology but forgets restart policies.
+      feedback: "After an engine restart or reboot the dashboard would stay down. Both containers need a restart policy."
+      expectFail: [socket-only-in-proxy]
+      mutation:
+        on: cl-docker-01
+        as: learner
+        run: |
+          docker network create monitoring
+          docker run -d --name socket-proxy --network monitoring -v /var/run/docker.sock:/var/run/docker.sock:ro copperleaf/socket-proxy:1
+          docker rm -f monitor
+          docker run -d --name monitor --network monitoring -e SITE={{site}} -e DOCKER_API=tcp://socket-proxy:2375 -p 127.0.0.1:8091:8000 copperleaf/monitor:1
+          sleep 3
+    - id: writable-socket-in-proxy
+      description: Mounts the socket read-write into the proxy.
+      feedback: "The proxy enforces the allowlist, but the socket mount should still be read-only: it is the only container allowed near the engine, so give it the least access."
+      expectFail: [socket-only-in-proxy]
+      mutation:
+        on: cl-docker-01
+        as: learner
+        run: |
+          docker network create monitoring
+          docker run -d --name socket-proxy --restart unless-stopped --network monitoring -v /var/run/docker.sock:/var/run/docker.sock copperleaf/socket-proxy:1
+          docker rm -f monitor
+          docker run -d --name monitor --restart unless-stopped --network monitoring -e SITE={{site}} -e DOCKER_API=tcp://socket-proxy:2375 -p 127.0.0.1:8091:8000 copperleaf/monitor:1
+          sleep 3
+  solution:
+    explanation: |
+      The proxy container is the only one that mounts the socket (read-only); the monitor
+      talks to it over a private network and has no mount. The proxy's allowlist refuses
+      every request except listing containers and the ping, so the monitor cannot create
+      anything even though the dashboard keeps working.
+    steps:
+      - on: cl-docker-01
+        as: learner
+        run: |
+          docker network create monitoring
+          docker run -d --name socket-proxy --restart unless-stopped --network monitoring \
+            -v /var/run/docker.sock:/var/run/docker.sock:ro copperleaf/socket-proxy:1
+          docker rm -f monitor
+          docker run -d --name monitor --restart unless-stopped --network monitoring \
+            -e SITE={{site}} -e DOCKER_API=tcp://socket-proxy:2375 -p 127.0.0.1:8091:8000 copperleaf/monitor:1
+          sleep 3
+    alternatives:
+      - id: restart-always
+        description: Same topology with restart policy always and the network created first with an explicit driver.
+        steps:
+          - on: cl-docker-01
+            as: learner
+            run: |
+              docker network create --driver bridge monitoring
+              docker run -d --name socket-proxy --restart always --network monitoring --mount type=bind,source=/var/run/docker.sock,target=/var/run/docker.sock,readonly copperleaf/socket-proxy:1
+              docker rm -f monitor
+              docker run -d --name monitor --restart always --network monitoring -e SITE={{site}} -e DOCKER_API=tcp://socket-proxy:2375 -p 127.0.0.1:8091:8000 copperleaf/monitor:1
+              sleep 3

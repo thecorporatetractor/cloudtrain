@@ -29,8 +29,8 @@ describe('content loader (real content/)', () => {
     expect(c.competencies.find((k) => k.id === 'linux.git')?.skillIds).toContain('linux.git.basics');
     // ...but newSkills no lab uses do not (the Linux newSkills were promoted in round 4).
     expect(ids.has('linux.shell.help-docs')).toBe(true);
-    const unused = c.skills.filter((s) => s.id === 'containers.build.multi-stage');
-    expect(unused).toEqual([]);
+    // containers.build.multi-stage became a used skill with the efficient-images labs (round 5).
+    expect(ids.has('containers.build.multi-stage')).toBe(true);
   });
 
   it('maps frameworks: ids prefixed per objective, weights summing to 1', async () => {

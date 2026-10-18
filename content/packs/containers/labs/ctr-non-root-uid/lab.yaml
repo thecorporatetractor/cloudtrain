@@ -1,0 +1,198 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-non-root-uid
+  title: Run the thumbnailer as UID 10001 with one writable cache path
+  domain: containers
+  frameworks: [ex188-aligned:build-images, cks:supply-chain-security, docker-practitioner:build]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [docker, dockerfile, user, non-root, security]
+  version: 1
+spec:
+  description: |
+    Security wants the thumbnailer to run without root. It cuts **{{frames}}** thumbnails at
+    start-up into `/var/cache/thumbs` and then idles. The repository is `~/thumbnailer/`
+    on `cl-thumbs-02` (`ssh cl-thumbs-02`; you are in the `docker` group); its image
+    runs as root today.
+
+    1. Change the `Dockerfile` so the image runs as **UID 10001 and GID 10001**, with
+       **only `/var/cache/thumbs`** writable by that user (the application files and `/etc`
+       stay read-only for it).
+    2. Build **`copperleaf/thumbnailer:1.5`** and run it as the detached container
+       **`thumbnailer`**. It must start and write its thumbnails.
+  objectives:
+    - Create or choose a fixed numeric UID and GID in an image
+    - Give a non-root user write access to exactly one path
+  params:
+    frames:
+      type: int
+      min: 6
+      max: 12
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-thumbs-02
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-thumbs-02
+      timeoutSec: 240
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        docker rm -f thumbnailer >/dev/null 2>&1 || true
+        s=/home/learner/thumbnailer
+        rm -rf "$s"; install -d "$s"
+        echo {{frames}} > "$s/frames.conf"
+        cat > "$s/thumbnailer.py" <<'PY'
+        import os, pathlib, time
+        out = pathlib.Path("/var/cache/thumbs")
+        n = int(pathlib.Path("/app/frames.conf").read_text().strip())
+        for i in range(n):
+            (out / f"thumb-{i:03d}.jpg").write_text(f"thumbnail {i}\n")
+        print(f"thumbnailer wrote {n} thumbnails as uid {os.getuid()}", flush=True)
+        while True:
+            time.sleep(5)
+        PY
+        cat > "$s/Dockerfile" <<'DF'
+        FROM python:3.13-alpine
+        WORKDIR /app
+        COPY thumbnailer.py frames.conf ./
+        RUN mkdir -p /var/cache/thumbs
+        CMD ["python3", "/app/thumbnailer.py"]
+        DF
+        chown -R learner:learner "$s"
+  checks:
+    - id: image-uid-gid
+      description: A fresh container of copperleaf/thumbnailer:1.5 runs as 10001:10001 with no flags
+      type: shell
+      timeoutSec: 60
+      on: cl-thumbs-02
+      skills: [containers.build.non-root]
+      weight: 2
+      command: docker run --rm --entrypoint sh copperleaf/thumbnailer:1.5 -c 'echo "$(id -u):$(id -g)"' 2>/dev/null || echo no-image
+      expect: {match: exact, value: "10001:10001"}
+    - id: writes-thumbnails
+      description: The running container thumbnailer wrote its thumbnails, owned by 10001
+      type: shell
+      timeoutSec: 90
+      on: cl-thumbs-02
+      skills: [containers.build.non-root]
+      weight: 2
+      command: |
+        r=not-running
+        for i in $(seq 15); do
+          r=$(docker exec thumbnailer sh -c 'echo "count=$(ls /var/cache/thumbs | wc -l) owner=$(stat -c %u /var/cache/thumbs/thumb-000.jpg 2>/dev/null)"' 2>/dev/null) && [ "$r" = "count={{frames}} owner=10001" ] && break
+          sleep 2
+        done
+        echo "$r"
+      expect: {match: exact, value: "count={{frames}} owner=10001"}
+    - id: only-cache-writable
+      description: As that user, the cache directory is writable and the application directory and /etc are not
+      type: shell
+      timeoutSec: 60
+      on: cl-thumbs-02
+      skills: [containers.build.non-root, k8s.security.image-footprint]
+      weight: 3
+      command: |
+        docker run --rm --entrypoint sh copperleaf/thumbnailer:1.5 -c '
+          w() { if touch "$1" 2>/dev/null; then rm -f "$1"; echo allow; else echo deny; fi; }
+          echo "$(w /app/probe) $(w /etc/probe) $(w /var/cache/thumbs/.probe)"' 2>/dev/null || echo no-image
+      expect: {match: exact, value: "deny deny allow"}
+  hints:
+    - title: A fixed UID
+      body: "`USER` accepts numbers. To get a named user with a fixed id on Alpine: `addgroup -g 10001 thumbs && adduser -D -u 10001 -G thumbs thumbs`."
+      cost: 1
+    - title: Ownership of the one path
+      body: "Create `/var/cache/thumbs` and `chown` it to `10001:10001` in a `RUN` before the `USER` line; leave `/app` owned by root."
+      cost: 1
+    - title: Check it
+      body: "`docker run --rm --entrypoint sh copperleaf/thumbnailer:1.5 -c 'id; touch /app/x; ls -ld /var/cache/thumbs'` shows the user and what it may write."
+      cost: 1
+  misconceptions:
+    - id: cache-owned-by-root
+      description: Sets USER 10001 but leaves the cache directory owned by root.
+      feedback: "The process runs as 10001 but cannot create files in a root-owned directory, so it exits at start-up. chown the cache directory to the new user."
+      expectFail: [writes-thumbnails]
+      mutation:
+        on: cl-thumbs-02
+        as: learner
+        run: |
+          cd ~/thumbnailer
+          sed -i 's|^CMD|USER 10001:10001\nCMD|' Dockerfile
+          docker build -q -t copperleaf/thumbnailer:1.5 .
+          docker run -d --name thumbnailer copperleaf/thumbnailer:1.5
+          sleep 3
+    - id: world-writable
+      description: Makes the application directories world-writable so the new user can write anywhere.
+      feedback: "The task is least privilege: only /var/cache/thumbs may be writable. Do not open up /app or /etc."
+      expectFail: [only-cache-writable]
+      mutation:
+        on: cl-thumbs-02
+        as: learner
+        run: |
+          cd ~/thumbnailer
+          sed -i 's|^RUN mkdir -p /var/cache/thumbs|RUN mkdir -p /var/cache/thumbs \&\& chmod -R a+rwX /var/cache/thumbs /app /etc|; s|^CMD|USER 10001:10001\nCMD|' Dockerfile
+          docker build -q -t copperleaf/thumbnailer:1.5 .
+          docker run -d --name thumbnailer copperleaf/thumbnailer:1.5
+          sleep 3
+    - id: wrong-uid
+      description: Adds a user without a fixed UID, which gets the next free number.
+      feedback: "adduser picks the next free UID (1000 here). The requirement is exactly 10001:10001, so name the numbers."
+      expectFail: [image-uid-gid]
+      mutation:
+        on: cl-thumbs-02
+        as: learner
+        run: |
+          cd ~/thumbnailer
+          sed -i 's|^RUN mkdir -p /var/cache/thumbs|RUN adduser -D thumbs \&\& mkdir -p /var/cache/thumbs \&\& chown thumbs /var/cache/thumbs|; s|^CMD|USER thumbs\nCMD|' Dockerfile
+          docker build -q -t copperleaf/thumbnailer:1.5 .
+          docker run -d --name thumbnailer copperleaf/thumbnailer:1.5
+          sleep 3
+  solution:
+    explanation: |
+      Create the group and user with fixed ids, give them the cache directory only, and
+      switch to them with `USER` after the files are in place. `/app` and `/etc` stay
+      root-owned, so the user cannot write there.
+    steps:
+      - on: cl-thumbs-02
+        as: learner
+        run: |
+          cd ~/thumbnailer
+          cat > Dockerfile <<'DF'
+          FROM python:3.13-alpine
+          RUN addgroup -g 10001 thumbs && adduser -D -u 10001 -G thumbs thumbs \
+           && mkdir -p /var/cache/thumbs && chown 10001:10001 /var/cache/thumbs
+          WORKDIR /app
+          COPY thumbnailer.py frames.conf ./
+          USER 10001:10001
+          CMD ["python3", "/app/thumbnailer.py"]
+          DF
+          docker build -t copperleaf/thumbnailer:1.5 .
+          docker run -d --name thumbnailer copperleaf/thumbnailer:1.5
+    alternatives:
+      - id: numeric-only
+        description: No account at all, only the numeric ids the process runs under.
+        steps:
+          - on: cl-thumbs-02
+            as: learner
+            run: |
+              cd ~/thumbnailer
+              cat > Dockerfile <<'DF'
+              FROM python:3.13-alpine
+              WORKDIR /app
+              COPY thumbnailer.py frames.conf ./
+              RUN mkdir -p /var/cache/thumbs && chown 10001:10001 /var/cache/thumbs
+              USER 10001:10001
+              CMD ["python3", "/app/thumbnailer.py"]
+              DF
+              docker build -t copperleaf/thumbnailer:1.5 .
+              docker run -d --name thumbnailer copperleaf/thumbnailer:1.5
