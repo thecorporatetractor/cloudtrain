@@ -185,6 +185,7 @@ func TestDecoratePod(t *testing.T) {
 		"net.ipv4.conf.all.rp_filter=0 net.ipv4.conf.default.rp_filter=0",
 		`for f in /proc/sys/net/ipv4/conf/*/rp_filter; do echo 0 > "$f"; done`,
 		"net.ipv4.conf.default.ignore_routes_with_linkdown=1",
+		"net.ipv4.conf.all.arp_ignore=1",
 		`/proc/sys/net/ipv6/conf/*/ignore_routes_with_linkdown; do echo 1 > "$f" 2>/dev/null || true; done`,
 		"net.ipv4.ping_group_range='0 65535'",
 		"ip -4 route del default via 198.19.255.1 dev eth0",
@@ -243,7 +244,7 @@ func TestDecoratePod(t *testing.T) {
 		t.Fatal(err)
 	}
 	hs := host.Spec.InitContainers[0].Command[2]
-	if !strings.Contains(hs, "ip addr replace 10.99.0.1/31 dev eth2") || strings.Contains(hs, "ip_forward") || strings.Contains(hs, "rp_filter") || strings.Contains(hs, "linkdown") {
+	if !strings.Contains(hs, "ip addr replace 10.99.0.1/31 dev eth2") || strings.Contains(hs, "ip_forward") || strings.Contains(hs, "rp_filter") || strings.Contains(hs, "linkdown") || strings.Contains(hs, "arp_ignore") {
 		t.Errorf("host script:\n%s", hs)
 	}
 

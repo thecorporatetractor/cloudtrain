@@ -142,7 +142,8 @@ because the user namespace does not own them. Without user namespaces
 `net-init` also sets `ping_group_range` so the learner can ping without NET_RAW; on router
 (netdev) pods it enables forwarding, turns `rp_filter` off and sets `ignore_routes_with_linkdown`
 on every interface (and the default for new ones), so a connected route of an interface without
-carrier is not used, as on a real router (a VRRP backup's protodown macvlan). Unwired nodes
+carrier is not used, and `arp_ignore=1`, so ARP is answered only for addresses of the receiving
+interface, as on a real router (a VRRP backup's protodown macvlan holds the virtual address). Unwired nodes
 (e.g. a jumphost without links) are untouched.
 
 **Links are pure L2.** Kube-OVN needs a CIDR, gateway and IP per port, so each
