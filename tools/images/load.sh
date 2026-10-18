@@ -46,7 +46,7 @@ load_workloads() {
       tagged=${ref%@*}; digest=${ref#*@}; bydigest=${tagged%:*}@$digest
       have=$(docker exec "$node" ctr -n k8s.io images ls "name==$tagged" 2>/dev/null | awk 'NR>1{print $3}')
       [[ $have == "$digest" ]] && continue
-      docker exec "$node" ctr -n k8s.io images pull --platform linux/amd64 "$bydigest" >/dev/null \
+      docker exec "$node" ctr -n k8s.io images pull --hosts-dir /etc/containerd/certs.d --platform linux/amd64 "$bydigest" >/dev/null \
         || die "pull $bydigest on $node failed"
       docker exec "$node" ctr -n k8s.io images tag --force "$bydigest" "$tagged" >/dev/null
       docker exec "$node" ctr -n k8s.io images label "$tagged" io.cri-containerd.image=managed >/dev/null

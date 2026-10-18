@@ -11,6 +11,18 @@ B=/opt/cloudtrain/build
 source "$B/build.env"
 export DEBIAN_FRONTEND=noninteractive
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# Optional pull-through mirror for docker.io (DOCKERIO_MIRROR, e.g. mirror.gcr.io) for the
+# image pulls below: names and digests stay docker.io's, and the hosts dir lives in /tmp
+# only for the build, so nothing of it ends up in the image.
+# shellcheck disable=SC2034 # used by the guest-*.sh scripts that source this file
+CTR_HOSTS=()
+# shellcheck disable=SC2034
+if [ -n "${DOCKERIO_MIRROR:-}" ]; then
+  install -d /tmp/ct-hosts/docker.io
+  printf 'server = "https://registry-1.docker.io"\n[host."https://%s"]\n  capabilities = ["pull", "resolve"]\n' \
+    "$DOCKERIO_MIRROR" > /tmp/ct-hosts/docker.io/hosts.toml
+  CTR_HOSTS=(--hosts-dir /tmp/ct-hosts)
+fi
 
 # Grow root fs into the resized virtual disk. Inside the libguestfs appliance the
 # guest disk is not necessarily /dev/sda, so derive it from the mounted root.

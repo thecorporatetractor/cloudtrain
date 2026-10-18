@@ -45,7 +45,7 @@ while read -r ref; do
   [ -n "$ref" ] || continue
   tagged=${ref%@*}; bydigest=${tagged%:*}@${ref#*@}
   for try in 1 2 3; do
-    ctr -n moby images pull --platform linux/amd64 "$bydigest" >/dev/null && break
+    ctr -n moby images pull "${CTR_HOSTS[@]}" --platform linux/amd64 "$bydigest" >/dev/null && break
     [ "$try" = 3 ] && { echo "pull failed: $bydigest"; exit 1; }; sleep 5
   done
   ctr -n moby images tag --force "$bydigest" "$tagged" >/dev/null
@@ -55,6 +55,7 @@ ctr -n moby images ls -q | grep -v '^sha256:' | sort | tee /opt/cloudtrain/image
 sed 's/@.*//' /opt/cloudtrain/images/images.txt | sort -u | comm -23 - /opt/cloudtrain/images/IMAGES | tee /tmp/missing
 [ ! -s /tmp/missing ]
 kill $CPID; wait $CPID || true
+rm -rf /tmp/ct-hosts
 rm -f /tmp/containerd.log
 
 write_release \

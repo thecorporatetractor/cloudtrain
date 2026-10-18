@@ -22,7 +22,9 @@ if ! docker image inspect "$MIRROR_CONTENT_IMAGE" >/dev/null 2>&1; then
   ctx=$(mktemp -d); trap 'rm -rf "$ctx"' EXIT
   cp "$REPO_ROOT/tools/mirrors/content/"* "$ctx/"
   # hard links: no second copy of the content on disk
-  cp -al "$CONTENT" "$ctx/content" 2>/dev/null || cp -a "$CONTENT" "$ctx/content"
+  # (mktemp's /tmp can be another filesystem: then the hard links fail half-way, so start
+  # the copy from an empty directory, or the content lands in content/<snapshot>/)
+  cp -al "$CONTENT" "$ctx/content" 2>/dev/null || { rm -rf "$ctx/content"; cp -a "$CONTENT" "$ctx/content"; }
   rm -f "$ctx/content/"*/.wanted
   docker build -q -t "$MIRROR_CONTENT_IMAGE" --build-arg NGINX_IMAGE="$NGINX_UNPRIVILEGED_IMAGE" "$ctx" >/dev/null
 fi
@@ -41,8 +43,11 @@ ZOT_ALLOWLIST=$(for i in "${imgs[@]}"; do
   repo=${i%:*}; tag=${i##*:}; [[ $repo == */* ]] || repo="library/$repo"
   jq -nc --arg p "$repo" --arg t "^$(sed 's/[.]/\\./g' <<<"$tag")\$" '{prefix: $p, tags: {regex: $t}}'
 done | jq -sc .)
-export ZOT_ALLOWLIST MIRROR_NAMESPACE MIRROR_CONTENT_IMAGE ZOT_IMAGE GITEA_IMAGE
-ZOT_CONFIG_HASH=$(sha256sum <<<"$ZOT_ALLOWLIST" | cut -c1-12); export ZOT_CONFIG_HASH
+# zot syncs docker.io; DOCKERIO_MIRROR=<host> (e.g. mirror.gcr.io) syncs from that mirror
+# instead, where Docker Hub rate-limits anonymous pulls (same repositories and digests).
+ZOT_UPSTREAM=https://${DOCKERIO_MIRROR:-registry-1.docker.io}
+export ZOT_ALLOWLIST ZOT_UPSTREAM MIRROR_NAMESPACE MIRROR_CONTENT_IMAGE ZOT_IMAGE GITEA_IMAGE
+ZOT_CONFIG_HASH=$(sha256sum <<<"$ZOT_ALLOWLIST $ZOT_UPSTREAM" | cut -c1-12); export ZOT_CONFIG_HASH
 k get ns "$NS" >/dev/null 2>&1 || k create ns "$NS" >/dev/null
 if ! k -n "$NS" get secret mirror-admin >/dev/null 2>&1; then
   pw=$(head -c 18 /dev/urandom | base64 | tr -d '/+=')
@@ -54,7 +59,7 @@ if ! k -n "$NS" get secret mirror-admin >/dev/null 2>&1; then
 fi
 # Only these variables are substituted (like `envsubst '${A} ${B}'`; perl, since gettext's
 # envsubst is not installed everywhere).
-perl -pe 's/\$\{(MIRROR_NAMESPACE|MIRROR_CONTENT_IMAGE|ZOT_IMAGE|GITEA_IMAGE|ZOT_ALLOWLIST|ZOT_CONFIG_HASH)\}/$ENV{$1}/g' \
+perl -pe 's/\$\{(MIRROR_NAMESPACE|MIRROR_CONTENT_IMAGE|ZOT_IMAGE|GITEA_IMAGE|ZOT_ALLOWLIST|ZOT_UPSTREAM|ZOT_CONFIG_HASH)\}/$ENV{$1}/g' \
   < "$REPO_ROOT/deploy/mirrors/mirrors.yaml" | k apply -f - >/dev/null
 for d in mirror registry git; do
   wait_for "$NS/$d rollout" 300 k -n "$NS" rollout status deploy/$d --timeout=5s
