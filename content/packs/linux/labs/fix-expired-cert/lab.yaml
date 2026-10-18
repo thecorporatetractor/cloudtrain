@@ -99,6 +99,8 @@ spec:
         sed -i '1i # service  port  certificate  key' /etc/tr-certs/services.conf
         chmod 0644 /etc/tr-certs/*.crt /etc/tr-certs/*.csr /etc/tr-certs/services.conf
         sha256sum /etc/tr-certs/edge-*.crt > $V/certs.sha256
+        tk=$(awk '$1 == "timetable" {print $4}' /etc/tr-certs/services.conf)
+        openssl pkey -in "$tk" -pubout | openssl sha256 | awk '{print $NF}' > $V/timetable-key.sha256
         # --- tr-certd: one TLS server per service, certificates reloaded on SIGHUP
         mkdir -p /usr/local/lib/tr-certd
         cat > /usr/local/lib/tr-certd/certd.py <<'EOT'
@@ -206,6 +208,7 @@ spec:
           grep -q "  /etc/tr-certs/$f\$" /var/lib/cloudtrain/certs.sha256 && [ "$(sha256sum /etc/tr-certs/$f | cut -d' ' -f1)" = "$(grep "  /etc/tr-certs/$f\$" /var/lib/cloudtrain/certs.sha256 | cut -d' ' -f1)" ] || r="$r changed:$f"
         done
         [ "$(openssl x509 -in $t -noout -pubkey | openssl sha256)" = "$(openssl pkey -in $k -pubout | openssl sha256)" ] || r="$r key-changed"
+        [ "$(openssl x509 -in $t -noout -pubkey | openssl sha256 | awk '{print $NF}')" = "$(cat /var/lib/cloudtrain/timetable-key.sha256)" ] || r="$r key-changed"
         openssl x509 -in $t -noout -checkend $((300 * 86400)) >/dev/null || r="$r short-validity"
         openssl x509 -in $t -noout -ext subjectAltName 2>/dev/null | grep -q 'DNS:timetable.tallowmere.test' || r="$r san-lost"
         echo "ok$r"
@@ -257,6 +260,22 @@ spec:
           cd "$(mktemp -d)"
           openssl req -new -newkey rsa:2048 -nodes -keyout n.key -out n.csr -subj /CN=timetable.tallowmere.test -addext subjectAltName=DNS:timetable.tallowmere.test >/dev/null 2>&1
           sudo tr-ca-sign --csr n.csr --out n.crt --days 365 >/dev/null
+          sudo install -m 0644 n.crt "$f"
+          sudo tr-certd-ctl reload >/dev/null
+    - id: new-key-and-cert-replaced
+      description: Makes a brand new key and replaces both the key and the certificate.
+      feedback: "The new pair loads and is served, but the task is to keep the existing private key: renew from the stored CSR (or a request made from the existing key) so the key never changes."
+      expectFail: [only-the-expired-renewed]
+      mutation:
+        on: tr-api-01
+        as: learner
+        run: |
+          f=$(awk '$1 == "timetable" {print $3}' /etc/tr-certs/services.conf)
+          k=$(awk '$1 == "timetable" {print $4}' /etc/tr-certs/services.conf)
+          cd "$(mktemp -d)"
+          openssl req -new -newkey rsa:2048 -nodes -keyout n.key -out n.csr -subj /CN=timetable.tallowmere.test -addext subjectAltName=DNS:timetable.tallowmere.test >/dev/null 2>&1
+          sudo tr-ca-sign --csr n.csr --out n.crt --days 365 >/dev/null
+          sudo install -m 0600 n.key "$k"
           sudo install -m 0644 n.crt "$f"
           sudo tr-certd-ctl reload >/dev/null
     - id: not-reloaded
