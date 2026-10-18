@@ -40,20 +40,22 @@ COPY kusto-language-codegen/ /src/kusto-language-codegen/
 RUN dotnet run --project /src/kusto-language-codegen -c Release -p:KustoLanguageSrc=/src/kusto-language/src \
       -- /src/kusto-language/src/Kusto.Language
 COPY patches/ /src/patches/
-RUN cd kusto-loco && git -c user.name=cloudtrain-build -c user.email=build@cloudtrain.invalid am -q --keep-cr --whitespace=nowarn /src/patches/*.patch
+WORKDIR /src/kusto-loco
+RUN git -c user.name=cloudtrain-build -c user.email=build@cloudtrain.invalid am -q --keep-cr --whitespace=nowarn /src/patches/*.patch
 # KustoLanguageProject / LokqlAzureConnectors: see the licence-clean profile patch
 ENV KQL_BUILD_PROPS="-p:KustoLanguageProject=/src/kusto-language/src/Kusto.Language/Kusto.Language.csproj -p:LokqlAzureConnectors=false"
 # hadolint ignore=SC2086
-RUN cd kusto-loco && if [[ $RUN_TESTS == 1 ]]; then \
+RUN if [ "$RUN_TESTS" = 1 ]; then \
       dotnet test test/BasicTests -c Release $KQL_BUILD_PROPS --logger "console;verbosity=minimal" \
    && dotnet test test/LokqlEngineTests -c Release $KQL_BUILD_PROPS --logger "console;verbosity=minimal"; fi
 # hadolint ignore=SC2086
-RUN cd kusto-loco && dotnet publish applications/lokql/lokql.csproj -c Release -r linux-x64 --self-contained \
+RUN dotnet publish applications/lokql/lokql.csproj -c Release -r linux-x64 --self-contained \
       -p:PublishSingleFile=false -p:PublishReadyToRun=true $KQL_BUILD_PROPS -o /out/lokql \
- && ! compgen -G '/out/lokql/Kusto.Data*' && ! compgen -G '/out/lokql/Kusto.Cloud*' \
+ && test -z "$(find /out/lokql -name 'Kusto.Data*' -o -name 'Kusto.Cloud*')" \
  && rm -f /out/lokql/*.pdb
 # Licence notices of everything published: KustoLoco, Kusto.Language, every NuGet package
 # in lokql's dependency graph (licence files from the package, or its declared licence).
+WORKDIR /src
 COPY licences/ /src/licences/
 RUN mkdir -p /out/doc \
  && cp kusto-loco/LICENSE /out/doc/kusto-loco-LICENSE \
@@ -88,7 +90,8 @@ RUN set -eu; base="https://raw.githubusercontent.com/Azure/Azure-Sentinel/${AZUR
     done; \
     python3 -I /build/sample-data/import.py /build/src /out/datasets/sentinel-sample /build/sample-data/sources.lock
 # the generator's own tests, then a fixed demo dataset (seed "demo") for `kql` outside a lab
-RUN cd /opt/cloudtrain/loggen && python3 -I -m unittest discover -s tests -t . -q \
+WORKDIR /opt/cloudtrain/loggen
+RUN python3 -I -m unittest discover -s tests -t . -q \
  && python3 -I /opt/cloudtrain/loggen/ct-loggen generate --seed demo --end 2026-10-18T12:00:00Z \
       --out /out/datasets/demo --answers /out/demo-answers.json \
  && rm -rf /opt/cloudtrain/loggen/tests && find /opt/cloudtrain/loggen -name __pycache__ -prune -exec rm -rf {} +
@@ -135,7 +138,7 @@ RUN userdel -r ubuntu 2>/dev/null; useradd -m -u 1000 -U -s /bin/bash learner \
       "$KUSTOLOCO_VERSION" "$KUSTOLOCO_COMMIT" "$KUSTO_LANGUAGE_COMMIT" "$AZURE_SENTINEL_COMMIT" > /etc/cloudtrain-release
 # smoke test: the demo dataset loads with its types and a grader query answers correctly
 ARG SMOKE=1
-RUN [[ $SMOKE != 1 ]] || { \
+RUN [ "$SMOKE" != 1 ] || { \
       out=$(KQL_DATA=/opt/cloudtrain/kql/datasets/demo ct-kql scalar 'SigninLogs | where ResultType == "500121" | summarize dcount(UserPrincipalName)'); \
       echo "smoke 1: $out"; test "$out" = 1; \
       out=$(KQL_DATA=/opt/cloudtrain/kql/datasets/sentinel-sample ct-kql count 'Syslog | take 3'); \
