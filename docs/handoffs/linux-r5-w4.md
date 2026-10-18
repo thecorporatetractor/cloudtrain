@@ -2,8 +2,9 @@
 
 Branch `content/linux-r5-w4`, pack `content/packs/linux`. Source of truth for each lab's state
 is `status` / `notes` in `content/curriculum.yaml`. All 23 labs are `built`: written and
-statically checked (lab-verify --strict, labctl validate, `labctl exam compile --allow-missing
-sim-linux-sysadmin`, curriculum render), none run live.
+written and checked with lab-verify --strict and the curriculum render; labctl validate, the
+content tests and `labctl exam compile --allow-missing sim-linux-sysadmin` are pending CI (no labctl
+binary or built lab-schema locally). None run live.
 
 ## Labs
 
