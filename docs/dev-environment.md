@@ -683,13 +683,16 @@ every `tools/slots/run.sh` job on the host, the runner's and the fix-verify clon
 `/srv/ct-work/fix/` (they share the slot locks), and the log shows both (`jobs heavy
 running/all (sessions) ... fix running/all`). A job's weight is its `--parallel`: the load
 overshoot came from fix verifies with `--parallel 3` on top of the batch, so the heavy limit
-does not rise while the sessions in heavy slots reach `VM_SESSIONS_MAX` (3 x MAX), and no limit
+does not rise while the sessions in heavy slots reach `VM_SESSIONS_MAX` (3 x MAX) or the running
+VMIs on the cluster reach `VMI_MAX` (90; a job counts as running only once `run.sh` has started its
+command, not while it waits with a `sleep` child), and no limit
 rises while the 1-minute load is over `LOAD_MAX` (the window average lags such a burst). Fix
 verifies run like the runner: `CT_SLOTS_ENV=/srv/ct-work/vm-config/runner.env tools/slots/run.sh
 <slot> -- labctl verify ... --grade-timeout 15m`. `run.sh` re-reads the limit from `CT_SLOTS_ENV`
 on every wait round (the runner exports it); a job started without it keeps the limit it was
 started with and can only ever take the first slots (21 VM jobs started at limit 2 waited for
-heavy.1/heavy.2 while the limit rose to 27). The runner passes
+heavy.1/heavy.2 while the limit rose to 27). The runner also re-reads `PAR_VM`/`PAR_POD` from `runner.env` for
+every dispatch, so a changed `--parallel` applies to the next lab without a restart. The runner passes
 `--grade-timeout "${GRADE_TIMEOUT:-15m}"` (labctl's 5 m default cut grading rounds short on a
 loaded host).
 

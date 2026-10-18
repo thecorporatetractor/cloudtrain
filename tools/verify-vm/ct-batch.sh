@@ -130,6 +130,7 @@ needs_run() { # needs_run <id> <dir> <force>
 
 run_lab() { # run_lab <id> <dir> <slot>
   local id=$1 dir=$2 slot=$3 t0 rc par lh ph log=$RES/logs/$1.log rep=$REPO/deploy/.results/verify/$1.json
+  reload_limits   # PAR_VM/PAR_POD as of this dispatch
   par=$([[ $slot == vm ]] && echo "$PAR_VM" || echo "$PAR_POD")
   lh=$(lab_hash "$dir"); ph=$(platform_hash); t0=$(date +%s)
   rm -f "$rep"
@@ -209,8 +210,9 @@ declare -A RUNNING=()   # pid -> slot
 running_count() { pgrep -fc "tools/slots/run.sh $1 --" || true; }
 alive() { pgrep -f -- "bin/labctl verify .*--ready-timeout [^ ]+ $1\$" >/dev/null; }
 reap() { local p; for p in "${!RUNNING[@]}"; do kill -0 "$p" 2>/dev/null || { wait "$p" 2>/dev/null; unset "RUNNING[$p]"; }; done; }
-# Slot limits are re-read from $CFG before every dispatch, so they can be changed while the runner runs.
-reload_limits() { [[ -f $CFG ]] && eval "$(grep -E '^(export )?CT_SLOTS_(HEAVY|POD)=[0-9]+$' "$CFG")"; export CT_SLOTS_HEAVY CT_SLOTS_POD; }
+# Slot limits and PAR_VM/PAR_POD (labctl --parallel) are re-read from $CFG before every dispatch,
+# so they can be changed while the runner runs.
+reload_limits() { [[ -f $CFG ]] && eval "$(grep -E '^(export )?(CT_SLOTS_(HEAVY|POD)|PAR_(VM|POD))=[0-9]+$' "$CFG")"; export CT_SLOTS_HEAVY CT_SLOTS_POD; }
 limit_for() { reload_limits; [[ $1 == vm ]] && echo "$CT_SLOTS_HEAVY" || echo "$CT_SLOTS_POD"; }
 
 # Requeue: `once <ids>` while the loop holds the runner lock appends the ids to state/requeue;
