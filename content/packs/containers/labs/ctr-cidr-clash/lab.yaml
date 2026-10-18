@@ -1,0 +1,230 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-cidr-clash
+  title: Move container networks off the office VPN range
+  domain: containers
+  frameworks: [dca-legacy:networking, docker-practitioner:networking, docker-practitioner:operations]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [docker, networking, address-pools, daemon-json, vpn]
+  version: 1
+spec:
+  description: |
+    On `cl-edit-01` (`ssh cl-edit-01`; you are in the `docker` group, with `sudo`) the
+    editing team syncs rushes from the archive host **172.20.{{octet}}.10** over the
+    office VPN (interface `clvpn0`, route `172.20.0.0/16`). The Compose project in
+    `~/archive-sync` created its network on **172.20.0.0/16**, the same range, so the
+    host now sends archive traffic into the bridge instead of the VPN
+    (`ip route get 172.20.{{octet}}.10` shows the wrong device).
+
+    Fix it for good, not just for this one network:
+
+    1. Configure the engine's **default address pools** so every new network is a **/24
+       taken from 10.210.0.0/16**. Keep what is already in `/etc/docker/daemon.json`
+       (the host label), and restart the engine.
+    2. Recreate the `archive-sync` project (`docker compose down` and `up -d`) so its
+       network lands in the new pool and the sync container runs again.
+    3. `ip route get 172.20.{{octet}}.10` must go out through `clvpn0` again.
+  objectives:
+    - Set default-address-pools in daemon.json without losing other settings
+    - Explain why existing networks keep their old subnets
+    - Verify routing against the host route table
+  params:
+    octet:
+      type: int
+      min: 20
+      max: 99
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-edit-01
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-edit-01
+      timeoutSec: 300
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        ip route del 172.20.0.0/16 dev clvpn0 >/dev/null 2>&1 || true
+        p=/home/learner/archive-sync
+        if [ -d "$p" ]; then (cd "$p" && docker compose down -t 2 >/dev/null 2>&1) || true; fi
+        docker network rm cl-pad-a cl-pad-b >/dev/null 2>&1 || true
+        # engine configuration the learner must keep: a host label, no address pools yet
+        install -d /etc/docker
+        [ -s /etc/docker/daemon.json ] || echo '{}' > /etc/docker/daemon.json
+        jq '. + {labels: ["site=copperleaf-edit"]}' /etc/docker/daemon.json > /etc/docker/daemon.json.new && mv /etc/docker/daemon.json.new /etc/docker/daemon.json
+        systemctl restart docker
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        rm -rf "$p"; install -d -o learner -g learner "$p"
+        cat > "$p/compose.yaml" <<'YML'
+        name: archive-sync
+        services:
+          sync:
+            image: busybox:1.37
+            command: ["sleep", "86400"]
+            restart: unless-stopped
+        YML
+        chown -R learner:learner "$p"
+        # two stand-in networks so the next default network is the 172.20 /16, then the project network
+        docker network create cl-pad-a >/dev/null; docker network create cl-pad-b >/dev/null
+        (cd "$p" && docker compose up -d >/dev/null)
+        docker network rm cl-pad-a cl-pad-b >/dev/null
+        s=$(docker network inspect archive-sync_default | jq -r '.[0].IPAM.Config[0].Subnet')
+        [ "$s" = 172.20.0.0/16 ]
+        # the office VPN comes up afterwards: a dummy interface with the archive route
+        ip link add clvpn0 type dummy 2>/dev/null || true
+        ip addr replace 172.20.255.2/32 dev clvpn0; ip link set clvpn0 up
+        ip route replace 172.20.0.0/16 dev clvpn0 metric 100
+  checks:
+    - id: pool-configured
+      description: The engine's default address pools are 10.210.0.0/16 with /24 blocks
+      type: shell
+      timeoutSec: 60
+      on: cl-edit-01
+      skills: [containers.network.address-pools, containers.operations.daemon-config]
+      weight: 2
+      command: docker info --format json 2>/dev/null | jq -r '(.DefaultAddressPools // []) | map(.Base + "/" + (.Size | tostring)) | join(",")'
+      expect: {match: exact, value: "10.210.0.0/16/24"}
+    - id: new-networks-use-pool
+      description: A newly created network takes a /24 from 10.210.0.0/16
+      type: shell
+      timeoutSec: 60
+      on: cl-edit-01
+      skills: [containers.network.address-pools]
+      weight: 2
+      command: |
+        docker network rm ct-probe-net >/dev/null 2>&1
+        docker network create ct-probe-net >/dev/null 2>&1 || { echo create-failed; exit 0; }
+        s=$(docker network inspect ct-probe-net | jq -r '.[0].IPAM.Config[0].Subnet')
+        docker network rm ct-probe-net >/dev/null 2>&1
+        case "$s" in 10.210.*.0/24) echo in-pool ;; *) echo "subnet=$s" ;; esac
+      expect: {match: exact, value: in-pool}
+    - id: project-moved
+      description: The archive-sync network is on a 10.210 /24 and its sync container is running on it
+      type: shell
+      timeoutSec: 60
+      on: cl-edit-01
+      skills: [containers.network.address-pools]
+      weight: 3
+      command: |
+        s=$(docker network inspect archive-sync_default 2>/dev/null | jq -r '.[0].IPAM.Config[0].Subnet // "none"')
+        c=$(docker ps -q --filter label=com.docker.compose.project=archive-sync --filter label=com.docker.compose.service=sync | head -1)
+        n=$([ -n "$c" ] && docker inspect "$c" | jq -r '.[0].NetworkSettings.Networks["archive-sync_default"].IPAddress // "none"' || echo none)
+        case "$s" in 10.210.*.0/24) echo "moved running=$([ "$n" != none ] && echo yes || echo no)" ;; *) echo "subnet=$s" ;; esac
+      expect: {match: exact, value: "moved running=yes"}
+    - id: vpn-route-restored
+      description: The archive host is reached through clvpn0 again
+      type: shell
+      timeoutSec: 30
+      on: cl-edit-01
+      skills: [containers.network.address-pools]
+      weight: 2
+      command: ip route get 172.20.{{octet}}.10 2>/dev/null | grep -oE 'dev [a-z0-9]+' | head -1
+      expect: {match: exact, value: "dev clvpn0"}
+    - id: host-label-kept
+      description: The existing host label in daemon.json survived the change
+      type: shell
+      timeoutSec: 60
+      on: cl-edit-01
+      skills: [containers.operations.daemon-config]
+      weight: 1
+      command: docker info --format json 2>/dev/null | jq -r '(.Labels // []) | if index("site=copperleaf-edit") then "kept" else "lost" end'
+      expect: {match: exact, value: kept}
+  hints:
+    - title: Address pools live in daemon.json
+      body: "`default-address-pools` is a list of `{base, size}` objects: the engine carves networks of `size` bits from `base`. `{\"base\": \"10.210.0.0/16\", \"size\": 24}` gives /24 networks."
+      cost: 1
+    - title: Edit, do not overwrite
+      body: "daemon.json already has settings. Merge the new key (for example with `jq`) and restart the engine with `sudo systemctl restart docker`."
+      command: |
+        sudo jq '. + {"default-address-pools": [{"base": "10.210.0.0/16", "size": 24}]}' /etc/docker/daemon.json
+      cost: 2
+    - title: Old networks keep their subnet
+      body: "Changing the pools does not move networks that already exist. Recreate the project's network: `docker compose down` then `docker compose up -d` in ~/archive-sync."
+      cost: 1
+  misconceptions:
+    - id: pool-too-big
+      description: Sets the pool size to 16, so each network takes a whole /16.
+      feedback: "The size is the prefix length of each network. With 10.210.0.0/16 and size 16 the first network takes the entire pool; use 24."
+      expectFail: [pool-configured, new-networks-use-pool]
+      mutation:
+        on: cl-edit-01
+        as: learner
+        timeoutSec: 180
+        run: |
+          sudo sh -c 'jq ". + {\"default-address-pools\": [{\"base\": \"10.210.0.0/16\", \"size\": 16}]}" /etc/docker/daemon.json > /etc/docker/daemon.json.new && mv /etc/docker/daemon.json.new /etc/docker/daemon.json'
+          sudo systemctl restart docker
+          sleep 8
+          cd ~/archive-sync && docker compose down && docker compose up -d
+    - id: network-not-recreated
+      description: Configures the pools and restarts the engine but leaves the existing project network.
+      feedback: "Existing networks keep their subnet. Recreate archive-sync (compose down, then up -d) so its network is allocated from the new pool and the 172.20 route is freed."
+      expectFail: [project-moved, vpn-route-restored]
+      mutation:
+        on: cl-edit-01
+        as: learner
+        timeoutSec: 180
+        run: |
+          sudo sh -c 'jq ". + {\"default-address-pools\": [{\"base\": \"10.210.0.0/16\", \"size\": 24}]}" /etc/docker/daemon.json > /etc/docker/daemon.json.new && mv /etc/docker/daemon.json.new /etc/docker/daemon.json'
+          sudo systemctl restart docker
+    - id: daemon-json-overwritten
+      description: Replaces daemon.json with only the pool setting.
+      feedback: "daemon.json held other settings (the host label). Merge the new key into the existing file instead of overwriting it."
+      expectFail: [host-label-kept]
+      mutation:
+        on: cl-edit-01
+        as: learner
+        timeoutSec: 180
+        run: |
+          echo '{"default-address-pools": [{"base": "10.210.0.0/16", "size": 24}]}' | sudo tee /etc/docker/daemon.json
+          sudo systemctl restart docker
+          sleep 8
+          cd ~/archive-sync && docker compose down && docker compose up -d
+  solution:
+    explanation: |
+      Default address pools tell the engine where to allocate networks from; they apply to
+      networks created after the engine restarts. The existing project network has to be
+      recreated to move, which frees 172.20.0.0/16, so the VPN's 172.20.0.0/16 route
+      (metric 100) is the only match again.
+    steps:
+      - on: cl-edit-01
+        as: learner
+        timeoutSec: 180
+        run: |
+          sudo sh -c 'jq ". + {\"default-address-pools\": [{\"base\": \"10.210.0.0/16\", \"size\": 24}]}" /etc/docker/daemon.json > /etc/docker/daemon.json.new && mv /etc/docker/daemon.json.new /etc/docker/daemon.json'
+          sudo systemctl restart docker
+          for i in $(seq 30); do docker info >/dev/null 2>&1 && break; sleep 2; done
+          cd ~/archive-sync
+          docker compose down
+          docker compose up -d
+          docker network inspect archive-sync_default | jq -r '.[0].IPAM.Config[0].Subnet'
+          ip route get 172.20.{{octet}}.10
+    alternatives:
+      - id: edit-in-place-and-network-prune
+        description: Edit the file with a here-document that keeps the label, and remove the old network explicitly.
+        steps:
+          - on: cl-edit-01
+            as: learner
+            timeoutSec: 180
+            run: |
+              sudo tee /etc/docker/daemon.json >/dev/null <<'JSON'
+              {
+                "labels": ["site=copperleaf-edit"],
+                "default-address-pools": [{"base": "10.210.0.0/16", "size": 24}]
+              }
+              JSON
+              sudo systemctl restart docker
+              for i in $(seq 30); do docker info >/dev/null 2>&1 && break; sleep 2; done
+              cd ~/archive-sync
+              docker compose down
+              docker network rm archive-sync_default 2>/dev/null || true
+              docker compose up -d

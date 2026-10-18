@@ -1,0 +1,267 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-compose-first-stack
+  title: Describe the catalogue API and its cache as a Compose project
+  domain: containers
+  frameworks: [ex188-aligned:multi-container, docker-practitioner:compose]
+  difficulty: easy
+  estimatedMinutes: 15
+  tags: [docker, compose, networks, volumes]
+  version: 1
+spec:
+  description: |
+    On `cl-catalogue-04` (`ssh cl-catalogue-04`; you are in the `docker` group) the
+    catalogue API image `copperleaf/catalogue-api:3.4` is built, and so is the cache
+    image it talks to, `redis:7.4-alpine`. Today an engineer starts them by hand; the
+    team wants one Compose file instead. The API looks its cache up by the name
+    **`cache`** and, once it can reach it, answers `titles={{titles}}` on
+    `/titles` (port 8080 inside the container).
+
+    Write `~/catalogue/compose.yaml` so that `docker compose up -d` in that directory
+    starts a project named **`catalogue`** with:
+
+    - a service **`api`** from `copperleaf/catalogue-api:3.4`, published on **host
+      port 8080**;
+    - a service **`cache`** from `redis:7.4-alpine`, whose data directory `/data` lives
+      in a **named volume** (so it survives `docker compose down`);
+    - both services attached to a **named network** that the file declares (not only
+      the implicit `default` network).
+
+    Leave the stack running when you are done.
+  objectives:
+    - Describe services, a named volume and a named network in one Compose file
+    - Start a project with docker compose up and find its containers by label
+    - Rely on service names for container-to-container DNS
+  params:
+    titles:
+      type: int
+      min: 4100
+      max: 4899
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-catalogue-04
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-catalogue-04
+      timeoutSec: 300
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        docker ps -aq --filter label=com.docker.compose.project=catalogue | xargs -r docker rm -f >/dev/null
+        docker volume rm -f catalogue_cache-data >/dev/null 2>&1 || true
+        d=$(mktemp -d)
+        cat > "$d/app.py" <<'PY'
+        # Copperleaf catalogue API (lab stand-in): fills its cache, then serves the titles from it.
+        import os, socket, threading, time
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        HOST = os.environ.get("CACHE_HOST", "cache")
+
+        def redis(*args):
+            s = socket.create_connection((HOST, 6379), timeout=2)
+            s.sendall(b"*%d\r\n" % len(args) + b"".join(b"$%d\r\n%s\r\n" % (len(a.encode()), a.encode()) for a in args))
+            d = s.recv(4096); s.close()
+            return None if d.startswith(b"$-1") else d.split(b"\r\n")[1 if d.startswith(b"$") else 0].lstrip(b"+").decode()
+
+        def fill():
+            while True:
+                try:
+                    redis("SET", "catalogue:titles", os.environ["TITLES"]); return
+                except OSError:
+                    time.sleep(1)
+
+        class H(BaseHTTPRequestHandler):
+            def do_GET(self):
+                try:
+                    v = redis("GET", "catalogue:titles") or "unavailable"
+                except OSError:
+                    v = "unavailable"
+                b = ("titles=%s\n" % v).encode()
+                self.send_response(200); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
+            def log_message(self, *a): pass
+
+        threading.Thread(target=fill, daemon=True).start()
+        HTTPServer(("", 8080), H).serve_forever()
+        PY
+        printf '%s\n' 'FROM python:3.13-alpine' 'COPY app.py /app.py' 'ENV TITLES={{titles}}' 'EXPOSE 8080' 'CMD ["python", "-u", "/app.py"]' > "$d/Dockerfile"
+        docker build -q -t copperleaf/catalogue-api:3.4 "$d" >/dev/null
+        rm -rf "$d"
+        install -d -o learner -g learner /home/learner/catalogue
+        rm -f /home/learner/catalogue/compose.y*ml
+  checks:
+    - id: file-model
+      description: The rendered project has api and cache, a named volume on /data and a declared network shared by both
+      type: shell
+      timeoutSec: 60
+      on: cl-catalogue-04
+      skills: [containers.compose.model]
+      weight: 3
+      command: |
+        cd /home/learner/catalogue 2>/dev/null || { echo no-dir; exit 0; }
+        docker compose config --format json 2>/dev/null | jq -r '
+          (.networks // {} | del(.default) | keys) as $named
+          | [ (.services | keys | join(",")),
+              (.services.api.image // "-"), (.services.cache.image // "-"),
+              ([.services.cache.volumes[]? | select(.target == "/data" and .type == "volume")] | length | tostring),
+              (if ($named | length) > 0 and ([.services.api, .services.cache | [(.networks // {} | keys)[] | select(. as $n | $named | index($n))]] | (.[0] - (.[0] - .[1])) | length) > 0 then "net" else "no-net" end)
+            ] | join(" ")' 2>/dev/null || echo invalid
+      expect: {match: exact, value: "api,cache copperleaf/catalogue-api:3.4 redis:7.4-alpine 1 net"}
+    - id: stack-running
+      description: The project catalogue has a running api container and a running cache container
+      type: shell
+      timeoutSec: 60
+      on: cl-catalogue-04
+      skills: [containers.compose.model]
+      weight: 2
+      command: |
+        n() { docker ps -q --filter label=com.docker.compose.project=catalogue --filter label=com.docker.compose.service="$1" | wc -l; }
+        echo "api=$(n api) cache=$(n cache)"
+      expect: {match: exact, value: "api=1 cache=1"}
+    - id: api-serves-cached-titles
+      description: The API on host port 8080 answers with the titles it stored in the cache
+      type: shell
+      timeoutSec: 60
+      on: cl-catalogue-04
+      skills: [containers.compose.model, containers.network.bridge-dns]
+      weight: 3
+      command: |
+        for i in $(seq 20); do r=$(curl -fsS --max-time 3 http://127.0.0.1:8080/titles 2>/dev/null) && [ "$r" != titles=unavailable ] && break; sleep 1; done
+        echo "${r:-down}"
+      expect: {match: exact, value: "titles={{titles}}"}
+    - id: cache-data-in-volume
+      description: The running cache container keeps /data in a named volume
+      type: shell
+      timeoutSec: 60
+      on: cl-catalogue-04
+      skills: [containers.compose.model, containers.storage.mount-types]
+      weight: 2
+      command: |
+        c=$(docker ps -q --filter label=com.docker.compose.project=catalogue --filter label=com.docker.compose.service=cache | head -1)
+        [ -n "$c" ] || { echo no-container; exit 0; }
+        docker inspect "$c" | jq -r '[.[0].Mounts[] | select(.Destination == "/data") | .Type + ":" + ((.Name // "") | if . == "" then "anonymous" elif test("^[0-9a-f]{64}$") then "anonymous" else "named" end)] | join(",")'
+      expect: {match: exact, value: "volume:named"}
+  hints:
+    - title: Services, volumes and networks are top-level keys
+      body: "A Compose file has `services:`, and next to it `volumes:` and `networks:` where named volumes and networks are declared. A service then refers to them by name under its own `volumes:` and `networks:`."
+      cost: 1
+    - title: A shape to start from
+      body: "Under each service: `image:`, and for the API `ports: [\"8080:8080\"]`. For the cache: `volumes: [\"cache-data:/data\"]`. Declare `cache-data:` under the top-level `volumes:` and a network such as `backend:` under `networks:`."
+      cost: 2
+    - title: Check what you wrote
+      body: "`docker compose config` renders the file as the engine will read it (add `--format json | jq` to inspect it), `docker compose ps` lists the project's containers, and `curl localhost:8080/titles` talks to the API."
+      command: cd ~/catalogue && docker compose config
+      cost: 1
+  misconceptions:
+    - id: cache-bind-mount
+      description: Keeps the cache data in a bind-mounted directory instead of a named volume.
+      feedback: "A bind mount ties the data to a host path and to its permissions. For data the engine should manage, declare a named volume under the top-level volumes: key and mount it by name."
+      expectFail: [file-model, cache-data-in-volume]
+      mutation:
+        on: cl-catalogue-04
+        as: learner
+        run: |
+          cd ~/catalogue
+          mkdir -p data
+          printf '%s\n' 'name: catalogue' 'services:' '  api:' '    image: copperleaf/catalogue-api:3.4' '    ports: ["8080:8080"]' '    networks: [backend]' \
+            '  cache:' '    image: redis:7.4-alpine' '    volumes: ["./data:/data"]' '    networks: [backend]' 'networks:' '  backend: {}' > compose.yaml
+          docker compose up -d
+    - id: default-network-only
+      description: Declares no network, so both services sit on the implicit default network.
+      feedback: "The default network already gives you name resolution, but the task asks for a network the file declares by name. Add a top-level networks: entry and attach both services to it."
+      expectFail: [file-model]
+      mutation:
+        on: cl-catalogue-04
+        as: learner
+        run: |
+          cd ~/catalogue
+          printf '%s\n' 'name: catalogue' 'services:' '  api:' '    image: copperleaf/catalogue-api:3.4' '    ports: ["8080:8080"]' \
+            '  cache:' '    image: redis:7.4-alpine' '    volumes: ["cache-data:/data"]' 'volumes:' '  cache-data: {}' > compose.yaml
+          docker compose up -d
+    - id: api-not-published
+      description: Forgets to publish the API port.
+      feedback: "Containers on a Compose network talk to each other without published ports, but the grader (and your users) reach the API through the host, so publish 8080:8080 on the api service."
+      expectFail: [api-serves-cached-titles]
+      mutation:
+        on: cl-catalogue-04
+        as: learner
+        run: |
+          cd ~/catalogue
+          printf '%s\n' 'name: catalogue' 'services:' '  api:' '    image: copperleaf/catalogue-api:3.4' '    networks: [backend]' \
+            '  cache:' '    image: redis:7.4-alpine' '    volumes: ["cache-data:/data"]' '    networks: [backend]' \
+            'networks:' '  backend: {}' 'volumes:' '  cache-data: {}' > compose.yaml
+          docker compose up -d
+  solution:
+    explanation: |
+      One file describes the whole application. The service name `cache` becomes the DNS
+      name the API uses, the named volume keeps Redis's `/data` outside the container's
+      writable layer, and the declared network replaces the implicit default one.
+    steps:
+      - on: cl-catalogue-04
+        as: learner
+        run: |
+          cd ~/catalogue
+          cat > compose.yaml <<'YML'
+          name: catalogue
+          services:
+            api:
+              image: copperleaf/catalogue-api:3.4
+              ports:
+                - "8080:8080"
+              networks: [backend]
+              depends_on: [cache]
+            cache:
+              image: redis:7.4-alpine
+              volumes:
+                - cache-data:/data
+              networks: [backend]
+          networks:
+            backend: {}
+          volumes:
+            cache-data: {}
+          YML
+          docker compose up -d
+          sleep 3
+          curl -s localhost:8080/titles
+    alternatives:
+      - id: long-syntax-external-volume
+        description: Pre-create the volume and reference it as external, using the long port and volume syntax.
+        steps:
+          - on: cl-catalogue-04
+            as: learner
+            run: |
+              cd ~/catalogue
+              docker volume create catalogue-cache-data >/dev/null
+              cat > compose.yaml <<'YML'
+              name: catalogue
+              services:
+                api:
+                  image: copperleaf/catalogue-api:3.4
+                  ports:
+                    - target: 8080
+                      published: "8080"
+                  networks: [media]
+                cache:
+                  image: redis:7.4-alpine
+                  volumes:
+                    - type: volume
+                      source: cachedata
+                      target: /data
+                  networks: [media]
+              networks:
+                media:
+                  name: catalogue-media
+              volumes:
+                cachedata:
+                  external: true
+                  name: catalogue-cache-data
+              YML
+              docker compose up -d

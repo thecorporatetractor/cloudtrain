@@ -1,0 +1,205 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-publish-scoped
+  title: Publish the transcoder API on the private address only
+  domain: containers
+  frameworks: [dca-legacy:networking, ex188-aligned:run-containers, docker-practitioner:networking]
+  difficulty: easy
+  estimatedMinutes: 10
+  tags: [docker, networking, publish, ports]
+  version: 1
+spec:
+  description: |
+    On `cl-transcode-02` (`ssh cl-transcode-02`; you are in the `docker` group) the
+    container **`transcoder`** (image `copperleaf/transcoder-api:5.1`) serves the job API
+    on container port **8080** and its Prometheus-style metrics on port **9100**. It was
+    started with both ports published on every address, so the metrics are visible to the
+    whole network.
+
+    Recreate it (same name, same image, detached) so that:
+
+    - the job API is published on **host port {{port}}**, on the host's **private
+      address** only (listed in `/etc/copperleaf/transcoder/addresses.txt`), not on
+      other addresses and not on `0.0.0.0`;
+    - the metrics port is published on host port **9100**, on **127.0.0.1 only**.
+
+    The grader reaches the API from the workstation (the second host) through the
+    private address, and must get nothing from the metrics port there.
+  objectives:
+    - Bind a published port to one host address
+    - Keep an operational port on loopback
+    - Verify exposure from a second host
+  params:
+    port:
+      type: int
+      min: 18000
+      max: 18999
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-transcode-02
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-transcode-02
+      timeoutSec: 240
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        d=$(mktemp -d); mkdir -p "$d/api" "$d/metrics"
+        echo "transcoder api {{port}}" > "$d/api/index.html"
+        printf '%s\n' '# TYPE transcoder_up gauge' 'transcoder_up 1' > "$d/metrics/metrics"
+        printf '%s\n' '#!/bin/sh' 'httpd -p 8080 -h /srv/api' 'exec httpd -f -p 9100 -h /srv/metrics' > "$d/run.sh"
+        chmod 0755 "$d/run.sh"
+        printf '%s\n' 'FROM busybox:1.37' 'COPY api /srv/api' 'COPY metrics /srv/metrics' 'COPY run.sh /run.sh' 'EXPOSE 8080 9100' 'ENTRYPOINT ["/run.sh"]' > "$d/Dockerfile"
+        docker build -q -t copperleaf/transcoder-api:5.1 "$d" >/dev/null; rm -rf "$d"
+        ip=$(ip -4 -o addr show scope global | awk '$2 !~ /^(docker|br-|veth|clpart)/ {print $4}' | cut -d/ -f1 | head -1)
+        [ -n "$ip" ]
+        install -d /etc/copperleaf/transcoder
+        printf '%s\n' "Private address: $ip" 'Loopback: 127.0.0.1' > /etc/copperleaf/transcoder/addresses.txt
+        install -d -m 0700 /var/lib/cloudtrain
+        echo "$ip" > /var/lib/cloudtrain/private.addr
+        docker rm -f transcoder >/dev/null 2>&1 || true
+        docker run -d --name transcoder -p {{port}}:8080 -p 9100:9100 copperleaf/transcoder-api:5.1 >/dev/null
+  checks:
+    - id: api-on-private-address
+      description: The job API is published only on the private address, host port {{port}}
+      type: shell
+      timeoutSec: 60
+      on: cl-transcode-02
+      skills: [containers.network.publishing]
+      weight: 3
+      command: |
+        ip=$(cat /var/lib/cloudtrain/private.addr)
+        v=$(docker inspect transcoder 2>/dev/null | jq -r '[.[0].NetworkSettings.Ports["8080/tcp"] // [] | .[] | .HostIp + ":" + .HostPort] | sort | join(",")')
+        if [ "$v" = "$ip:{{port}}" ]; then echo private-only; else echo "bindings=$v"; fi
+      expect: {match: exact, value: private-only}
+    - id: metrics-on-loopback
+      description: The metrics port is published only on 127.0.0.1:9100
+      type: shell
+      timeoutSec: 60
+      on: cl-transcode-02
+      skills: [containers.network.publishing]
+      weight: 3
+      command: docker inspect transcoder 2>/dev/null | jq -r '[.[0].NetworkSettings.Ports["9100/tcp"] // [] | .[] | .HostIp + ":" + .HostPort] | sort | join(",")'
+      expect: {match: exact, value: "127.0.0.1:9100"}
+    - id: second-host-reaches-api
+      description: The workstation reaches the API through the VM's private address
+      type: shell
+      timeoutSec: 60
+      on: workstation
+      skills: [containers.network.publishing]
+      weight: 2
+      command: |
+        ip=$(getent ahostsv4 cl-transcode-02 | awk 'NR==1{print $1}')
+        curl -fsS --max-time 4 "http://$ip:{{port}}/" 2>/dev/null || echo unreachable
+      expect: {match: exact, value: "transcoder api {{port}}"}
+    - id: second-host-blocked-from-metrics
+      description: The workstation gets no answer from the metrics port on that address
+      type: shell
+      timeoutSec: 60
+      on: workstation
+      skills: [containers.network.publishing]
+      weight: 2
+      command: |
+        ip=$(getent ahostsv4 cl-transcode-02 | awk 'NR==1{print $1}')
+        curl -s --max-time 4 -o /dev/null -w '%{http_code}' "http://$ip:9100/metrics" 2>/dev/null || true
+      expect: {match: exact, value: "000"}
+    - id: local-metrics-work
+      description: On the host itself the metrics answer on loopback
+      type: shell
+      timeoutSec: 60
+      on: cl-transcode-02
+      skills: [containers.network.publishing]
+      weight: 1
+      command: curl -fsS --max-time 4 http://127.0.0.1:9100/metrics 2>/dev/null | grep -c '^transcoder_up 1' || true
+      expect: {match: exact, value: "1"}
+  hints:
+    - title: The -p syntax has an address part
+      body: "`-p [host-ip:]host-port:container-port`. Without the first part Docker binds every address (0.0.0.0)."
+      cost: 1
+    - title: Find the private address
+      body: "`cat /etc/copperleaf/transcoder/addresses.txt` names it; `ip -4 addr` shows it on the interface."
+      cost: 1
+    - title: See what is bound
+      body: "`docker port transcoder` lists each published port with the address it is bound to; `ss -ltn` shows what the host listens on."
+      command: docker port transcoder
+      cost: 1
+  misconceptions:
+    - id: all-addresses
+      description: Recreates the container but still publishes both ports without an address.
+      feedback: "Without a host IP, Docker binds 0.0.0.0, so every network that can reach the host can reach the port. Give each -p an address."
+      expectFail: [api-on-private-address, metrics-on-loopback, second-host-blocked-from-metrics]
+      mutation:
+        on: cl-transcode-02
+        as: learner
+        run: |
+          docker rm -f transcoder
+          docker run -d --name transcoder -p {{port}}:8080 -p 9100:9100 copperleaf/transcoder-api:5.1
+    - id: everything-on-loopback
+      description: Publishes both ports on 127.0.0.1.
+      feedback: "Loopback is right for the metrics but the API must be reachable from the second host, so it needs the private address."
+      expectFail: [api-on-private-address, second-host-reaches-api]
+      mutation:
+        on: cl-transcode-02
+        as: learner
+        run: |
+          docker rm -f transcoder
+          docker run -d --name transcoder -p 127.0.0.1:{{port}}:8080 -p 127.0.0.1:9100:9100 copperleaf/transcoder-api:5.1
+    - id: scopes-swapped
+      description: Puts the API on loopback and the metrics on the private address.
+      feedback: "The other way round: the job API serves other hosts (private address) and the metrics are for local scraping only (loopback)."
+      expectFail: [api-on-private-address, metrics-on-loopback, second-host-reaches-api, second-host-blocked-from-metrics, local-metrics-work]
+      mutation:
+        on: cl-transcode-02
+        as: learner
+        run: |
+          ip=$(awk '/Private/{print $NF}' /etc/copperleaf/transcoder/addresses.txt)
+          docker rm -f transcoder
+          docker run -d --name transcoder -p 127.0.0.1:{{port}}:8080 -p $ip:9100:9100 copperleaf/transcoder-api:5.1
+  solution:
+    explanation: |
+      Published ports bind to the host address in front of the host port. The API gets the
+      private address; the metrics stay on loopback, so only processes on the host reach
+      them.
+    steps:
+      - on: cl-transcode-02
+        as: learner
+        run: |
+          ip=$(awk '/Private/{print $NF}' /etc/copperleaf/transcoder/addresses.txt)
+          docker rm -f transcoder
+          docker run -d --name transcoder -p $ip:{{port}}:8080 -p 127.0.0.1:9100:9100 copperleaf/transcoder-api:5.1
+          docker port transcoder
+    alternatives:
+      - id: compose-host-ip
+        description: Describe the same publishing in a Compose file with the long port syntax.
+        steps:
+          - on: cl-transcode-02
+            as: learner
+            run: |
+              ip=$(awk '/Private/{print $NF}' /etc/copperleaf/transcoder/addresses.txt)
+              docker rm -f transcoder
+              mkdir -p ~/transcoder && cd ~/transcoder
+              cat > compose.yaml <<YML
+              name: transcoder
+              services:
+                transcoder:
+                  container_name: transcoder
+                  image: copperleaf/transcoder-api:5.1
+                  ports:
+                    - target: 8080
+                      published: "{{port}}"
+                      host_ip: $ip
+                    - target: 9100
+                      published: "9100"
+                      host_ip: 127.0.0.1
+              YML
+              docker compose up -d

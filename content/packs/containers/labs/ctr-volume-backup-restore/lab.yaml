@@ -1,0 +1,191 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-volume-backup-restore
+  title: Back up the rights database volume and restore it elsewhere
+  domain: containers
+  frameworks: [dca-legacy:storage, docker-practitioner:storage]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [docker, volumes, backup, restore]
+  version: 1
+spec:
+  description: |
+    On `cl-rights-02` (`ssh cl-rights-02`; you are in the `docker` group) the rights
+    database (a Redis-based stand-in for the production database) runs as the container
+    **`rights-db`** with its data in the named volume **`rights-db`**. It holds
+    **{{titles}}** titles (`rights:titles`) and a ledger of entries. The data must be
+    copied to a second environment.
+
+    1. **Archive** the whole `rights-db` volume with a throwaway container to
+       **`~/backups/rights-db.tar.gz`** (a gzip tar whose members are the volume's files,
+       not a nested path).
+    2. **Restore** the archive into a **new** named volume **`rights-db-restore`**, again
+       with a throwaway container.
+    3. Start a second database container from `redis:7.4-alpine` (any name other than
+       `rights-db`) on the restored volume, with the data directory `/data` and AOF on
+       (`redis-server --appendonly yes`), so that it reports the same title count and
+       the same number of keys as the original.
+
+    Leave `rights-db` running and untouched.
+  objectives:
+    - Archive a named volume with a throwaway container
+    - Restore an archive into a new volume
+    - Verify a restore from the application's own view of the data
+  params:
+    titles:
+      type: int
+      min: 3000
+      max: 9999
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-rights-02
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-rights-02
+      timeoutSec: 300
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        for c in $(docker ps -aq --filter volume=rights-db-restore); do docker rm -f "$c" >/dev/null; done
+        docker rm -f rights-db >/dev/null 2>&1 || true
+        docker volume rm -f rights-db rights-db-restore >/dev/null 2>&1 || true
+        docker volume create rights-db >/dev/null
+        docker run -d --name rights-db -v rights-db:/data redis:7.4-alpine redis-server --appendonly yes >/dev/null
+        for i in $(seq 30); do docker exec rights-db redis-cli ping 2>/dev/null | grep -q PONG && break; sleep 1; done
+        docker exec rights-db redis-cli set rights:titles {{titles}} >/dev/null
+        for i in $(seq 40); do docker exec rights-db redis-cli rpush rights:ledger "entry-$i" >/dev/null; done
+        docker exec rights-db redis-cli save >/dev/null
+        docker exec rights-db redis-cli bgrewriteaof >/dev/null
+        sleep 3
+        install -d -m 0700 /var/lib/cloudtrain
+        docker exec rights-db redis-cli dbsize > /var/lib/cloudtrain/rights.dbsize
+        rm -rf /home/learner/backups
+  checks:
+    - id: archive-valid
+      description: ~/backups/rights-db.tar.gz is a gzip tar of the volume's files
+      type: shell
+      timeoutSec: 60
+      on: cl-rights-02
+      skills: [containers.storage.backup-restore]
+      weight: 3
+      command: |
+        f=/home/learner/backups/rights-db.tar.gz
+        [ -s "$f" ] || { echo missing; exit 0; }
+        tar -tzf "$f" >/dev/null 2>&1 || { echo not-a-tarball; exit 0; }
+        top=$(tar -tzf "$f" | sed 's|^\./||' | awk -F/ 'NF && $1 != "" {print $1}' | sort -u | tr '\n' ' ')
+        keys=$(tar -xzOf "$f" 2>/dev/null | grep -a -c 'rights:titles' || true)
+        case "$top" in *dump.rdb*|*appendonlydir*) echo "flat keys=$([ "${keys:-0}" -ge 1 ] && echo yes || echo no)" ;; *) echo "nested:$top" ;; esac
+      expect: {match: exact, value: "flat keys=yes"}
+    - id: restored-volume-serves-same-data
+      description: A running second database container on the volume rights-db-restore reports the same titles and key count
+      type: shell
+      timeoutSec: 60
+      on: cl-rights-02
+      skills: [containers.storage.backup-restore, containers.storage.mount-types]
+      weight: 4
+      command: |
+        c=$(docker ps -q --filter volume=rights-db-restore | head -1)
+        [ -n "$c" ] || { echo no-container; exit 0; }
+        [ "$(docker inspect "$c" | jq -r '.[0].Name')" != /rights-db ] || { echo same-container; exit 0; }
+        docker inspect "$c" | jq -e '[.[0].Mounts[] | select(.Destination == "/data" and .Name == "rights-db-restore")] | length == 1' >/dev/null || { echo wrong-mount; exit 0; }
+        t=$(docker exec "$c" redis-cli get rights:titles 2>/dev/null)
+        k=$(docker exec "$c" redis-cli dbsize 2>/dev/null)
+        echo "titles=$t keys=$k"
+      expect: {match: exact, value: "titles={{titles}} keys=2"}
+    - id: original-untouched
+      description: rights-db is still running on its own volume with all of its data
+      type: shell
+      timeoutSec: 60
+      on: cl-rights-02
+      skills: [containers.storage.backup-restore]
+      weight: 1
+      command: |
+        docker inspect rights-db 2>/dev/null | jq -e '.[0].State.Running and ([.[0].Mounts[] | select(.Name == "rights-db")] | length == 1)' >/dev/null 2>&1 || { echo changed; exit 0; }
+        echo "titles=$(docker exec rights-db redis-cli get rights:titles 2>/dev/null) keys=$(docker exec rights-db redis-cli dbsize 2>/dev/null)"
+      expect: {match: exact, value: "titles={{titles}} keys=2"}
+  hints:
+    - title: A throwaway container with the volume and a host directory
+      body: "`docker run --rm -v rights-db:/data:ro -v ~/backups:/backup busybox:1.37 tar -czf /backup/rights-db.tar.gz -C /data .` archives the volume's files; `-C /data .` keeps the members flat instead of nesting them under `/data`."
+      cost: 2
+    - title: Restore the same way, backwards
+      body: "Create the target (`docker volume create rights-db-restore`), then untar into it from a throwaway container: `tar -xzf /backup/rights-db.tar.gz -C /data` with the volume mounted at /data."
+      cost: 1
+    - title: Ask the database
+      body: "A restore is only proven by the application: `docker exec <container> redis-cli get rights:titles` and `redis-cli dbsize` on the new container must match the original."
+      cost: 1
+  misconceptions:
+    - id: nested-archive
+      description: Archives /data by absolute path, so the members are nested and the restore lands in the wrong place.
+      feedback: "tar stored the files under data/... and the restore put them in a subdirectory the database does not read, so it started empty. Archive with -C /data . and restore with -C /data."
+      expectFail: [archive-valid, restored-volume-serves-same-data]
+      mutation:
+        on: cl-rights-02
+        as: learner
+        run: |
+          mkdir -p ~/backups
+          docker run --rm -v rights-db:/data:ro -v ~/backups:/backup busybox:1.37 tar -czf /backup/rights-db.tar.gz /data
+          docker volume create rights-db-restore
+          docker run --rm -v rights-db-restore:/data -v ~/backups:/backup:ro busybox:1.37 tar -xzf /backup/rights-db.tar.gz -C /data
+          docker run -d --name rights-db-2 -v rights-db-restore:/data redis:7.4-alpine redis-server --appendonly yes
+    - id: second-db-on-original-volume
+      description: Starts the second database on the original volume instead of a restored copy.
+      feedback: "Two databases on one volume corrupt each other and prove nothing about the archive. Restore into rights-db-restore and start the second container on that."
+      expectFail: [restored-volume-serves-same-data]
+      mutation:
+        on: cl-rights-02
+        as: learner
+        run: |
+          mkdir -p ~/backups
+          docker run --rm -v rights-db:/data:ro -v ~/backups:/backup busybox:1.37 tar -czf /backup/rights-db.tar.gz -C /data .
+          docker volume create rights-db-restore
+          docker run -d --name rights-db-2 -v rights-db:/data redis:7.4-alpine redis-server --appendonly yes --port 6380
+    - id: archive-never-restored
+      description: Makes the archive and creates the empty volume, then starts the database on it without restoring.
+      feedback: "The new volume is empty until you unpack the archive into it; the database starts with no data."
+      expectFail: [restored-volume-serves-same-data]
+      mutation:
+        on: cl-rights-02
+        as: learner
+        run: |
+          mkdir -p ~/backups
+          docker run --rm -v rights-db:/data:ro -v ~/backups:/backup busybox:1.37 tar -czf /backup/rights-db.tar.gz -C /data .
+          docker volume create rights-db-restore
+          docker run -d --name rights-db-2 -v rights-db-restore:/data redis:7.4-alpine redis-server --appendonly yes
+  solution:
+    explanation: |
+      A volume is just a directory the engine manages, so a throwaway container that mounts it
+      next to a host directory can tar it out and untar it into a new volume. The restored
+      database starts from the same AOF/RDB files and reports the same data.
+    steps:
+      - on: cl-rights-02
+        as: learner
+        run: |
+          mkdir -p ~/backups
+          docker run --rm -v rights-db:/data:ro -v ~/backups:/backup busybox:1.37 tar -czf /backup/rights-db.tar.gz -C /data .
+          docker volume create rights-db-restore
+          docker run --rm -v rights-db-restore:/data -v ~/backups:/backup:ro busybox:1.37 tar -xzf /backup/rights-db.tar.gz -C /data
+          docker run -d --name rights-db-restored -v rights-db-restore:/data redis:7.4-alpine redis-server --appendonly yes
+          sleep 3
+          docker exec rights-db-restored redis-cli get rights:titles
+    alternatives:
+      - id: volumes-from-and-pipe
+        description: Use --volumes-from for the backup and stream the archive into the new volume without an intermediate bind mount on the restore side.
+        steps:
+          - on: cl-rights-02
+            as: learner
+            run: |
+              mkdir -p ~/backups
+              docker run --rm --volumes-from rights-db -v ~/backups:/backup busybox:1.37 tar -czf /backup/rights-db.tar.gz -C /data .
+              docker volume create rights-db-restore
+              docker run --rm -i -v rights-db-restore:/data busybox:1.37 tar -xzf - -C /data < ~/backups/rights-db.tar.gz
+              docker run -d --name rights-db-copy -v rights-db-restore:/data redis:7.4-alpine redis-server --appendonly yes

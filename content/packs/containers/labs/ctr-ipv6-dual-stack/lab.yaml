@@ -1,0 +1,204 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-ipv6-dual-stack
+  title: Serve the catalogue API to IPv6-only set-top boxes
+  domain: containers
+  frameworks: [docker-practitioner:networking, dca-legacy:networking]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [docker, networking, ipv6, ula]
+  version: 1
+spec:
+  description: |
+    Copperleaf's new set-top boxes are IPv6-only. On `cl-catalogue-07`
+    (`ssh cl-catalogue-07`; you are in the `docker` group, with `sudo`) the container
+    **`catalogue-api`** (image `copperleaf/catalogue-api-v6:1`, port 80) runs on the
+    default bridge, published on IPv4 only (`0.0.0.0:{{port}}`). The network team
+    assigned this host the unique-local prefix **`fd00:ca7a:{{site}}::/64`**
+    (`/etc/copperleaf/network/ipv6-plan.txt`).
+
+    Make it dual-stack:
+
+    1. Create a user-defined bridge network **`catalogue6`** with IPv6 enabled on the
+       assigned prefix (keep an IPv4 subnet too; the engine can pick it).
+    2. Recreate **`catalogue-api`** (same name, same image, detached) on that network,
+       published on host port **{{port}}** for both address families.
+    3. The API (`catalogue-api {{n}}`) must answer on the host's IPv4 loopback
+       (`curl http://127.0.0.1:{{port}}/`) **and** on its IPv6 loopback
+       (`curl -g 'http://[::1]:{{port}}/'`), and the container must hold an address from
+       the assigned prefix.
+  objectives:
+    - Create an IPv6-enabled user-defined network on a ULA prefix
+    - Attach a container and publish its port on both address families
+    - Verify IPv4 and IPv6 reachability separately
+  params:
+    site:
+      type: int
+      min: 10
+      max: 99
+    port:
+      type: int
+      min: 18000
+      max: 18999
+    n:
+      type: int
+      min: 100
+      max: 999
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-catalogue-07
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-catalogue-07
+      timeoutSec: 240
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        d=$(mktemp -d); mkdir "$d/www"; echo "catalogue-api {{n}}" > "$d/www/index.html"
+        printf '%s\n' 'FROM busybox:1.37' 'COPY www /www' 'EXPOSE 80' 'CMD ["httpd", "-f", "-p", "80", "-h", "/www"]' > "$d/Dockerfile"
+        docker build -q -t copperleaf/catalogue-api-v6:1 "$d" >/dev/null; rm -rf "$d"
+        docker rm -f catalogue-api >/dev/null 2>&1 || true
+        docker network rm catalogue6 >/dev/null 2>&1 || true
+        install -d /etc/copperleaf/network
+        printf '%s\n' 'IPv6 plan for cl-catalogue-07' 'Unique-local prefix: fd00:ca7a:{{site}}::/64' > /etc/copperleaf/network/ipv6-plan.txt
+        docker run -d --name catalogue-api --restart unless-stopped -p 0.0.0.0:{{port}}:80 copperleaf/catalogue-api-v6:1 >/dev/null
+  checks:
+    - id: network-dual-stack
+      description: catalogue6 is a bridge network with IPv6 enabled on the assigned prefix and an IPv4 subnet
+      type: shell
+      timeoutSec: 60
+      on: cl-catalogue-07
+      skills: [containers.network.ipv6]
+      weight: 3
+      command: |
+        docker network inspect catalogue6 2>/dev/null | jq -r '.[0] | [.Driver, (.EnableIPv6 | tostring), ([.IPAM.Config[].Subnet | select(contains(":"))] | sort | join(",")), ([.IPAM.Config[].Subnet | select(contains(".") and (contains(":") | not))] | length | tostring)] | join(" ")' 2>/dev/null || echo missing
+      expect: {match: exact, value: "bridge true fd00:ca7a:{{site}}::/64 1"}
+    - id: api-on-network
+      description: catalogue-api is running on catalogue6 with an address from the assigned prefix
+      type: shell
+      timeoutSec: 60
+      on: cl-catalogue-07
+      skills: [containers.network.ipv6]
+      weight: 3
+      command: |
+        docker inspect catalogue-api 2>/dev/null | jq -r '.[0] | [(.State.Running | tostring), (.NetworkSettings.Networks.catalogue6.GlobalIPv6Address // "none" | if startswith("fd00:ca7a:{{site}}:") then "ula" else . end)] | join(" ")' 2>/dev/null || echo missing
+      expect: {match: exact, value: "true ula"}
+    - id: answers-ipv4
+      description: The API answers on the IPv4 loopback at the published port
+      type: shell
+      timeoutSec: 60
+      on: cl-catalogue-07
+      skills: [containers.network.ipv6, containers.network.publishing]
+      weight: 2
+      command: |
+        for i in $(seq 10); do r=$(curl -fsS --max-time 3 http://127.0.0.1:{{port}}/ 2>/dev/null) && break; sleep 1; done
+        echo "${r:-down}"
+      expect: {match: exact, value: "catalogue-api {{n}}"}
+    - id: answers-ipv6
+      description: The API answers on the IPv6 loopback at the published port
+      type: shell
+      timeoutSec: 60
+      on: cl-catalogue-07
+      skills: [containers.network.ipv6, containers.network.publishing]
+      weight: 3
+      command: |
+        for i in $(seq 10); do r=$(curl -fsS -g --max-time 3 'http://[::1]:{{port}}/' 2>/dev/null) && break; sleep 1; done
+        echo "${r:-down}"
+      expect: {match: exact, value: "catalogue-api {{n}}"}
+  hints:
+    - title: IPv6 is opt-in per network
+      body: "A user-defined bridge gets IPv6 only when you ask: `docker network create --ipv6 --subnet <prefix> <name>`. Give an IPv6 subnet from your assigned prefix; the engine picks an IPv4 one from its pools."
+      cost: 1
+    - title: Move the container
+      body: "A container's network is fixed at creation for published ports: remove `catalogue-api` and run it again with `--network catalogue6 -p {{port}}:80` (no host address means both families)."
+      cost: 2
+    - title: Check each family
+      body: "`curl http://127.0.0.1:{{port}}/` and `curl -g 'http://[::1]:{{port}}/'` test the two families; `docker inspect catalogue-api | jq '.[0].NetworkSettings.Networks'` shows the container's addresses."
+      cost: 1
+  misconceptions:
+    - id: ipv4-only-network
+      description: Creates the network without enabling IPv6.
+      feedback: "Without --ipv6 the network is IPv4-only and the container gets no IPv6 address. Create it with --ipv6 and a subnet from the assigned prefix."
+      expectFail: [network-dual-stack, api-on-network]
+      mutation:
+        on: cl-catalogue-07
+        as: learner
+        run: |
+          docker network create catalogue6
+          docker rm -f catalogue-api
+          docker run -d --name catalogue-api --network catalogue6 -p {{port}}:80 copperleaf/catalogue-api-v6:1
+    - id: wrong-prefix
+      description: Uses a made-up IPv6 prefix instead of the assigned one.
+      feedback: "Only the assigned prefix is routed and unique to this host. Use fd00:ca7a:{{site}}::/64."
+      expectFail: [network-dual-stack, api-on-network]
+      mutation:
+        on: cl-catalogue-07
+        as: learner
+        run: |
+          docker network create --ipv6 --subnet fd00:dead:beef::/64 catalogue6
+          docker rm -f catalogue-api
+          docker run -d --name catalogue-api --network catalogue6 -p {{port}}:80 copperleaf/catalogue-api-v6:1
+    - id: not-published
+      description: Builds the dual-stack network and moves the container, but forgets to publish the port.
+      feedback: "Attaching the container to the network does not publish it. Add -p {{port}}:80."
+      expectFail: [answers-ipv4, answers-ipv6]
+      mutation:
+        on: cl-catalogue-07
+        as: learner
+        run: |
+          docker network create --ipv6 --subnet fd00:ca7a:{{site}}::/64 catalogue6
+          docker rm -f catalogue-api
+          docker run -d --name catalogue-api --network catalogue6 copperleaf/catalogue-api-v6:1
+  solution:
+    explanation: |
+      `--ipv6` with a subnet makes the user-defined bridge dual-stack. A published port
+      with no host address is bound on both `0.0.0.0` and `[::]`, so the same `-p` works
+      for IPv4 and IPv6 clients.
+    steps:
+      - on: cl-catalogue-07
+        as: learner
+        run: |
+          docker network create --ipv6 --subnet fd00:ca7a:{{site}}::/64 catalogue6
+          docker rm -f catalogue-api
+          docker run -d --name catalogue-api --restart unless-stopped --network catalogue6 -p {{port}}:80 copperleaf/catalogue-api-v6:1
+          sleep 2
+          curl -s http://127.0.0.1:{{port}}/
+          curl -s -g 'http://[::1]:{{port}}/'
+    alternatives:
+      - id: compose-dual-stack
+        description: Describe the dual-stack network and the published port in a Compose file.
+        steps:
+          - on: cl-catalogue-07
+            as: learner
+            run: |
+              docker rm -f catalogue-api
+              mkdir -p ~/catalogue6 && cd ~/catalogue6
+              cat > compose.yaml <<'YML'
+              name: catalogue6
+              services:
+                catalogue-api:
+                  container_name: catalogue-api
+                  image: copperleaf/catalogue-api-v6:1
+                  restart: unless-stopped
+                  ports:
+                    - "{{port}}:80"
+                  networks: [catalogue6]
+              networks:
+                catalogue6:
+                  name: catalogue6
+                  enable_ipv6: true
+                  ipam:
+                    config:
+                      - subnet: fd00:ca7a:{{site}}::/64
+              YML
+              docker compose up -d

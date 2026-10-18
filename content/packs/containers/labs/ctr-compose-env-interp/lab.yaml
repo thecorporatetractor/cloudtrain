@@ -1,0 +1,204 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-compose-env-interp
+  title: Drive staging and production ports from .env files
+  domain: containers
+  frameworks: [docker-practitioner:compose]
+  difficulty: easy
+  estimatedMinutes: 12
+  tags: [docker, compose, env-file, interpolation]
+  version: 1
+spec:
+  description: |
+    On `cl-catalogue-05` (`ssh cl-catalogue-05`; you are in the `docker` group) the
+    catalogue project in `~/catalogue-env` has one Compose file with the image tag and
+    the host port written into it. Staging and production differ in both, and the
+    values already sit in two env files next to it:
+
+    | File | Tag | Host port |
+    |---|---|---|
+    | `.env.staging` | `2.{{minor}}-rc1` | `18080` |
+    | `.env.prod` | `2.{{minor}}` | `8080` |
+
+    Parameterise `~/catalogue-env/compose.yaml` (service **`api`**, container port 80)
+    so that the image is `copperleaf/catalogue-api:` plus the tag from the env file and
+    the host port comes from the env file too. Then
+    `docker compose --env-file .env.staging config` must render the staging tag and
+    **18080:80**, and `--env-file .env.prod` the production tag and **8080:80**. A
+    variable set in the shell must still win over the file. Do not edit the env files.
+  objectives:
+    - Interpolate variables in a Compose file from an env file
+    - Select an environment with --env-file and read the result with compose config
+    - Know that the shell environment outranks the env file
+  params:
+    minor:
+      type: int
+      min: 10
+      max: 89
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-catalogue-05
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-catalogue-05
+      timeoutSec: 300
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        for v in 2.{{minor}} 2.{{minor}}-rc1; do
+          d=$(mktemp -d); mkdir "$d/www"; echo "catalogue-api $v" > "$d/www/index.html"
+          printf '%s\n' 'FROM busybox:1.37' 'COPY www /www' 'EXPOSE 80' 'CMD ["httpd", "-f", "-p", "80", "-h", "/www"]' > "$d/Dockerfile"
+          docker build -q -t "copperleaf/catalogue-api:$v" "$d" >/dev/null; rm -rf "$d"
+        done
+        p=/home/learner/catalogue-env
+        rm -rf "$p"; install -d -o learner -g learner "$p"
+        printf '%s\n' 'API_TAG=2.{{minor}}-rc1' 'API_PORT=18080' > "$p/.env.staging"
+        printf '%s\n' 'API_TAG=2.{{minor}}' 'API_PORT=8080' > "$p/.env.prod"
+        cat > "$p/compose.yaml" <<'YML'
+        name: catalogue-env
+        services:
+          api:
+            image: copperleaf/catalogue-api:2.0
+            ports:
+              - "8080:80"
+        YML
+        chown -R learner:learner "$p"
+        install -d -m 0700 /var/lib/cloudtrain
+        (cd "$p" && sha256sum .env.staging .env.prod) > /var/lib/cloudtrain/envfiles.sha
+  checks:
+    - id: staging-render
+      description: With .env.staging the api service renders the staging tag and 18080:80
+      type: shell
+      timeoutSec: 60
+      on: cl-catalogue-05
+      skills: [containers.compose.interpolation]
+      weight: 3
+      command: |
+        cd /home/learner/catalogue-env 2>/dev/null || { echo no-dir; exit 0; }
+        docker compose --env-file .env.staging config --format json 2>/dev/null | jq -r '.services.api | .image + " " + (.ports[0].published | tostring) + ":" + (.ports[0].target | tostring)' 2>/dev/null || echo invalid
+      expect: {match: exact, value: "copperleaf/catalogue-api:2.{{minor}}-rc1 18080:80"}
+    - id: prod-render
+      description: With .env.prod the api service renders the production tag and 8080:80
+      type: shell
+      timeoutSec: 60
+      on: cl-catalogue-05
+      skills: [containers.compose.interpolation]
+      weight: 3
+      command: |
+        cd /home/learner/catalogue-env 2>/dev/null || { echo no-dir; exit 0; }
+        docker compose --env-file .env.prod config --format json 2>/dev/null | jq -r '.services.api | .image + " " + (.ports[0].published | tostring) + ":" + (.ports[0].target | tostring)' 2>/dev/null || echo invalid
+      expect: {match: exact, value: "copperleaf/catalogue-api:2.{{minor}} 8080:80"}
+    - id: nothing-hardcoded
+      description: Any other env file, and a variable in the shell, changes the rendered tag and port
+      type: shell
+      timeoutSec: 60
+      on: cl-catalogue-05
+      skills: [containers.compose.interpolation]
+      weight: 2
+      command: |
+        cd /home/learner/catalogue-env 2>/dev/null || { echo no-dir; exit 0; }
+        f='.services.api | .image + " " + (.ports[0].published | tostring)'
+        printf '%s\n' 'API_TAG=9.9-grader' 'API_PORT=19999' > /tmp/cl-grader.env
+        a=$(docker compose --env-file /tmp/cl-grader.env config --format json 2>/dev/null | jq -r "$f" 2>/dev/null)
+        b=$(API_PORT=17777 docker compose --env-file .env.prod config --format json 2>/dev/null | jq -r "$f" 2>/dev/null)
+        rm -f /tmp/cl-grader.env
+        echo "$a / $b"
+      expect: {match: exact, value: "copperleaf/catalogue-api:9.9-grader 19999 / copperleaf/catalogue-api:2.{{minor}} 17777"}
+    - id: env-files-untouched
+      description: The two env files still hold their original values
+      type: shell
+      timeoutSec: 30
+      on: cl-catalogue-05
+      skills: [containers.compose.interpolation]
+      weight: 1
+      command: cd /home/learner/catalogue-env && sha256sum -c --quiet /var/lib/cloudtrain/envfiles.sha >/dev/null 2>&1 && echo unchanged || echo changed
+      expect: {match: exact, value: unchanged}
+  hints:
+    - title: Variables in a Compose file
+      body: "Write `${NAME}` where a value should come from the environment. Compose reads variables from the shell and from the file given with `--env-file`; the shell wins."
+      cost: 1
+    - title: Where the variables go
+      body: "The image is a string (`copperleaf/catalogue-api:${API_TAG}`) and a port mapping is a string too (`\"${API_PORT}:80\"`). Quote the mapping."
+      cost: 2
+    - title: See what Compose will use
+      body: "`docker compose --env-file .env.prod config` prints the resolved file, with every variable replaced."
+      command: cd ~/catalogue-env && docker compose --env-file .env.prod config
+      cost: 1
+  misconceptions:
+    - id: copied-values
+      description: Copies the production values into the Compose file instead of using variables.
+      feedback: "That works for one environment only. Use ${API_TAG} and ${API_PORT} so --env-file chooses the values."
+      expectFail: [staging-render, nothing-hardcoded]
+      mutation:
+        on: cl-catalogue-05
+        as: learner
+        run: |
+          cd ~/catalogue-env
+          printf '%s\n' 'name: catalogue-env' 'services:' '  api:' '    image: copperleaf/catalogue-api:2.{{minor}}' '    ports:' '      - "8080:80"' > compose.yaml
+    - id: port-only
+      description: Parameterises the port but leaves the tag fixed.
+      feedback: "Both values differ per environment. The image tag has to come from the env file too: copperleaf/catalogue-api:${API_TAG}."
+      expectFail: [staging-render, prod-render, nothing-hardcoded]
+      mutation:
+        on: cl-catalogue-05
+        as: learner
+        run: |
+          cd ~/catalogue-env
+          printf '%s\n' 'name: catalogue-env' 'services:' '  api:' '    image: copperleaf/catalogue-api:2.0' '    ports:' '      - "${API_PORT}:80"' > compose.yaml
+    - id: port-both-sides
+      description: Uses the port variable for the container side as well.
+      feedback: "Only the host side of the mapping changes. The container still listens on 80, so the mapping is \"${API_PORT}:80\"."
+      expectFail: [staging-render, prod-render]
+      mutation:
+        on: cl-catalogue-05
+        as: learner
+        run: |
+          cd ~/catalogue-env
+          printf '%s\n' 'name: catalogue-env' 'services:' '  api:' '    image: copperleaf/catalogue-api:${API_TAG}' '    ports:' '      - "${API_PORT}:${API_PORT}"' > compose.yaml
+  solution:
+    explanation: |
+      Interpolation happens when Compose reads the file: `${API_TAG}` and `${API_PORT}` are
+      resolved from the shell first, then from the file passed with `--env-file`. The
+      container port stays 80 in both environments.
+    steps:
+      - on: cl-catalogue-05
+        as: learner
+        run: |
+          cd ~/catalogue-env
+          cat > compose.yaml <<'YML'
+          name: catalogue-env
+          services:
+            api:
+              image: copperleaf/catalogue-api:${API_TAG}
+              ports:
+                - "${API_PORT}:80"
+          YML
+          docker compose --env-file .env.staging config | grep -E 'image|published'
+    alternatives:
+      - id: required-and-long-syntax
+        description: Mark the variables as required and use the long port syntax.
+        steps:
+          - on: cl-catalogue-05
+            as: learner
+            run: |
+              cd ~/catalogue-env
+              cat > compose.yaml <<'YML'
+              name: catalogue-env
+              services:
+                api:
+                  image: "copperleaf/catalogue-api:${API_TAG:?set API_TAG}"
+                  ports:
+                    - target: 80
+                      published: "${API_PORT:?set API_PORT}"
+              YML
+              docker compose --env-file .env.prod config | grep -E 'image|published'

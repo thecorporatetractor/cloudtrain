@@ -1,0 +1,208 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-net-tcpdump-veth
+  title: Prove which container is flooding the ad-decision service
+  domain: containers
+  frameworks: [docker-practitioner:networking]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [docker, networking, tcpdump, nsenter, veth]
+  version: 1
+spec:
+  description: |
+    On `cl-ads-03` (`ssh cl-ads-03`; you are in the `docker` group, with `sudo`) the
+    ad-decision service (container **`ad-decision`**, port 8080) shares the user-defined
+    network **`ads-net`** with three client containers, `ads-client-1`, `ads-client-2`
+    and `ads-client-3`. One of the clients hammers the service with requests in a tight
+    loop; the other two make an occasional call.
+
+    1. **Prove it with a capture.** Use `tcpdump` on the network's bridge (or inside the
+       service's network namespace with `nsenter`) to count requests per source address,
+       and map the busiest address back to its container.
+    2. Write that container's **name** to `~/flooder.txt`.
+    3. **Disconnect** it from `ads-net` (`docker network disconnect`). Do not remove or
+       stop any container, and leave the other clients and the service attached and
+       running.
+
+    The service counts the requests it serves; the grader watches the rate drop.
+  objectives:
+    - Find the bridge interface and the namespace behind a Docker network
+    - Capture traffic and attribute it to a container by address
+    - Isolate a noisy container without destroying evidence
+  params:
+    culprit:
+      type: int
+      min: 1
+      max: 3
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-ads-03
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-ads-03
+      timeoutSec: 300
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        docker rm -f ad-decision ads-client-1 ads-client-2 ads-client-3 >/dev/null 2>&1 || true
+        docker network rm ads-net >/dev/null 2>&1 || true
+        d=$(mktemp -d)
+        cat > "$d/app.py" <<'PY'
+        # Copperleaf ad-decision service (lab stand-in): answers decisions and counts them.
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        n = 0
+        lock = threading.Lock()
+        class H(BaseHTTPRequestHandler):
+            def do_GET(self):
+                global n
+                if self.path == "/count":
+                    with lock: b = ("%d\n" % n).encode()
+                else:
+                    with lock: n += 1
+                    b = b"decision: ok\n"
+                self.send_response(200); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
+            def log_message(self, *a): pass
+        ThreadingHTTPServer(("", 8080), H).serve_forever()
+        PY
+        printf '%s\n' 'FROM python:3.13-alpine' 'COPY app.py /app.py' 'EXPOSE 8080' 'CMD ["python", "-u", "/app.py"]' > "$d/Dockerfile"
+        docker build -q -t copperleaf/ad-decision:3.1 "$d" >/dev/null
+        rm -rf "$d"
+        docker network create ads-net >/dev/null
+        docker run -d --name ad-decision --network ads-net copperleaf/ad-decision:3.1 >/dev/null
+        for i in 1 2 3; do
+          if [ "$i" = "{{culprit}}" ]; then pause=0.05; else pause=3; fi
+          docker run -d --name "ads-client-$i" --network ads-net busybox:1.37 sh -c "while :; do wget -q -O /dev/null http://ad-decision:8080/ 2>/dev/null; sleep $pause; done" >/dev/null
+        done
+        rm -f /home/learner/flooder.txt
+  checks:
+    - id: flooder-named
+      description: ~/flooder.txt names the container that flooded the service
+      type: shell
+      timeoutSec: 30
+      on: cl-ads-03
+      skills: [containers.network.diagnosis]
+      weight: 3
+      command: |
+        f=/home/learner/flooder.txt
+        [ -s "$f" ] || { echo missing; exit 0; }
+        tr -d ' \t\r\n' < "$f"; echo
+      expect: {match: exact, value: "ads-client-{{culprit}}"}
+    - id: flooder-disconnected
+      description: The flooding container still exists but is no longer attached to ads-net
+      type: shell
+      timeoutSec: 60
+      on: cl-ads-03
+      skills: [containers.network.diagnosis, containers.network.bridge-dns]
+      weight: 3
+      command: |
+        docker inspect ads-client-{{culprit}} 2>/dev/null | jq -r '.[0] | (if (.NetworkSettings.Networks | has("ads-net")) then "attached" else "detached" end) + " running=" + (.State.Running | tostring)' 2>/dev/null || echo removed
+      expect: {match: exact, value: "detached running=true"}
+    - id: others-untouched
+      description: The service and the two other clients are running and attached to ads-net
+      type: shell
+      timeoutSec: 60
+      on: cl-ads-03
+      skills: [containers.network.diagnosis]
+      weight: 2
+      command: |
+        ok=0
+        for c in ad-decision ads-client-1 ads-client-2 ads-client-3; do
+          [ "$c" = "ads-client-{{culprit}}" ] && continue
+          docker inspect "$c" 2>/dev/null | jq -e '.[0] | .State.Running and (.NetworkSettings.Networks | has("ads-net"))' >/dev/null 2>&1 && ok=$((ok+1))
+        done
+        echo "healthy=$ok"
+      expect: {match: exact, value: "healthy=3"}
+    - id: request-rate-dropped
+      description: The service now serves only the occasional requests (few in a 6 second window)
+      type: shell
+      timeoutSec: 60
+      on: cl-ads-03
+      skills: [containers.network.diagnosis]
+      weight: 2
+      command: |
+        ip=$(docker inspect ad-decision 2>/dev/null | jq -r '.[0].NetworkSettings.Networks["ads-net"].IPAddress // empty')
+        [ -n "$ip" ] || { echo no-service; exit 0; }
+        a=$(curl -fsS --max-time 3 "http://$ip:8080/count" 2>/dev/null) || { echo no-count; exit 0; }
+        sleep 6
+        b=$(curl -fsS --max-time 3 "http://$ip:8080/count" 2>/dev/null) || { echo no-count; exit 0; }
+        d=$((b - a))
+        if [ "$d" -le 12 ]; then echo quiet; else echo "busy=$d"; fi
+      expect: {match: exact, value: quiet}
+  hints:
+    - title: Where to capture
+      body: "Every user-defined network is a Linux bridge named `br-` plus the first 12 characters of the network ID. `docker network inspect ads-net | jq -r '.[0].Id[:12]'` gives them. Alternatively `sudo nsenter -t <pid> -n tcpdump ...` captures inside the service's own namespace (pid from `docker inspect`)."
+      cost: 1
+    - title: Count requests per source
+      body: "Filter to the service port and print only sources: `sudo tcpdump -nn -i br-<id> -c 300 'tcp dst port 8080 and tcp[tcpflags] & tcp-syn != 0'`. Count the second column's addresses with `sort | uniq -c`."
+      cost: 2
+    - title: From address to name
+      body: "`docker network inspect ads-net | jq '.[0].Containers'` lists every attached container with its IPv4 address. Then `docker network disconnect ads-net <name>`."
+      cost: 1
+  misconceptions:
+    - id: blames-the-service
+      description: Names the ad-decision service itself as the flooder.
+      feedback: "The service is the one being hit. In the capture, requests go to its address; the flooder is the busiest source address."
+      expectFail: [flooder-named, flooder-disconnected, request-rate-dropped]
+      mutation:
+        on: cl-ads-03
+        as: learner
+        run: echo ad-decision > ~/flooder.txt
+    - id: removes-the-container
+      description: Removes the flooding container instead of disconnecting it.
+      feedback: "Removing the container destroys the evidence and the service it belongs to. Disconnect it from the network and leave it for the owning team."
+      expectFail: [flooder-disconnected]
+      mutation:
+        on: cl-ads-03
+        as: learner
+        run: |
+          echo ads-client-{{culprit}} > ~/flooder.txt
+          docker rm -f ads-client-{{culprit}}
+    - id: stops-everything
+      description: Stops all clients to make the flood stop.
+      feedback: "That stops the flood but also two healthy clients. Capture first, find the one busy source and isolate only that container."
+      expectFail: [others-untouched, flooder-disconnected]
+      mutation:
+        on: cl-ads-03
+        as: learner
+        run: |
+          echo ads-client-{{culprit}} > ~/flooder.txt
+          docker stop ads-client-1 ads-client-2 ads-client-3
+  solution:
+    explanation: |
+      Requests from each client come from its address on the network's bridge. Counting
+      TCP connection attempts per source on the bridge shows one address far busier than the
+      others; the network's container list maps that address to a name, and disconnecting
+      that container from `ads-net` silences it without touching anything else.
+    steps:
+      - on: cl-ads-03
+        as: learner
+        run: |
+          br=br-$(docker network inspect ads-net | jq -r '.[0].Id[:12]')
+          top=$(sudo timeout 20 tcpdump -nn -l -i "$br" -c 300 'tcp dst port 8080 and tcp[tcpflags] & tcp-syn != 0' 2>/dev/null | awk '{print $3}' | sed 's/\.[0-9]*$//' | sort | uniq -c | sort -rn | awk 'NR==1{print $2}')
+          name=$(docker network inspect ads-net | jq -r --arg ip "$top" '.[0].Containers[] | select(.IPv4Address | startswith($ip + "/")) | .Name')
+          echo "$name" > ~/flooder.txt
+          docker network disconnect ads-net "$name"
+          cat ~/flooder.txt
+    alternatives:
+      - id: nsenter-in-service-namespace
+        description: Capture inside the service's own network namespace with nsenter instead of on the bridge.
+        steps:
+          - on: cl-ads-03
+            as: learner
+            run: |
+              pid=$(docker inspect ad-decision | jq -r '.[0].State.Pid')
+              top=$(sudo timeout 20 nsenter -t "$pid" -n tcpdump -nn -l -i eth0 -c 300 'tcp dst port 8080 and tcp[tcpflags] & tcp-syn != 0' 2>/dev/null | awk '{print $3}' | sed 's/\.[0-9]*$//' | sort | uniq -c | sort -rn | awk 'NR==1{print $2}')
+              name=$(docker network inspect ads-net | jq -r --arg ip "$top" '.[0].Containers[] | select(.IPv4Address | startswith($ip + "/")) | .Name')
+              echo "$name" > ~/flooder.txt
+              docker network disconnect ads-net "$name"

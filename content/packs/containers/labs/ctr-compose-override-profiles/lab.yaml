@@ -1,0 +1,247 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-compose-override-profiles
+  title: Add a debug toolbox that only starts on request
+  domain: containers
+  frameworks: [docker-practitioner:compose]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [docker, compose, override, profiles]
+  version: 1
+spec:
+  description: |
+    On `cl-catalogue-06` (`ssh cl-catalogue-06`; you are in the `docker` group) the
+    project in `~/catalogue-local` has a single `compose.yaml` that mixes what every
+    environment needs with what only a developer's laptop needs: the `api` service
+    publishes port **{{port}}** and sets `LOG_LEVEL=debug`. Restructure it:
+
+    1. **`compose.yaml`** keeps only the shared definition: services `api` and
+       `cache`, their images, no published ports and no `LOG_LEVEL` variable.
+    2. **`compose.override.yaml`** (picked up automatically by `docker compose`) holds
+       the local settings: the published port {{port}}:80 and `LOG_LEVEL=debug` on `api`.
+    3. A new service **`toolbox`** (image `copperleaf/toolbox:1`, which just sleeps)
+       belongs to the **`debug` profile**: a plain `docker compose up -d` starts two
+       services, `docker compose --profile debug up -d` starts three.
+
+    Leave the plain stack (two services, no toolbox) running.
+  objectives:
+    - Split shared and environment-specific settings with an override file
+    - Gate an optional service behind a profile
+    - Compare what a plain and a profile-enabled up would start
+  params:
+    port:
+      type: int
+      min: 8200
+      max: 8299
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-catalogue-06
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-catalogue-06
+      timeoutSec: 300
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        docker ps -aq --filter label=com.docker.compose.project=catalogue-local | xargs -r docker rm -f >/dev/null
+        d=$(mktemp -d); mkdir "$d/www"; echo "catalogue site" > "$d/www/index.html"
+        printf '%s\n' 'FROM busybox:1.37' 'COPY www /www' 'EXPOSE 80' 'CMD ["httpd", "-f", "-p", "80", "-h", "/www"]' > "$d/Dockerfile"
+        docker build -q -t copperleaf/catalogue-site:1.0 "$d" >/dev/null; rm -rf "$d"
+        d=$(mktemp -d)
+        printf '%s\n' 'FROM busybox:1.37' 'CMD ["sleep", "86400"]' > "$d/Dockerfile"
+        docker build -q -t copperleaf/toolbox:1 "$d" >/dev/null; rm -rf "$d"
+        p=/home/learner/catalogue-local
+        rm -rf "$p"; install -d -o learner -g learner "$p"
+        cat > "$p/compose.yaml" <<'YML'
+        name: catalogue-local
+        services:
+          api:
+            image: copperleaf/catalogue-site:1.0
+            environment:
+              LOG_LEVEL: debug
+            ports:
+              - "{{port}}:80"
+          cache:
+            image: redis:7.4-alpine
+        YML
+        chown -R learner:learner "$p"
+  checks:
+    - id: base-is-shared-only
+      description: compose.yaml alone has api and cache, no published port and no LOG_LEVEL
+      type: shell
+      timeoutSec: 60
+      on: cl-catalogue-06
+      skills: [containers.compose.overrides]
+      weight: 3
+      command: |
+        cd /home/learner/catalogue-local 2>/dev/null || { echo no-dir; exit 0; }
+        docker compose -f compose.yaml --profile '*' config --format json 2>/dev/null | jq -r '
+          [ (.services | del(.toolbox) | keys | join(",")),
+            ([.services[] | (.ports // [])[]] | length | tostring),
+            ([.services[] | (.environment // {}) | has("LOG_LEVEL")] | any | tostring) ] | join(" ")' 2>/dev/null || echo invalid
+      expect: {match: exact, value: "api,cache 0 false"}
+    - id: override-has-local-settings
+      description: The merged project publishes {{port}} and sets LOG_LEVEL=debug on api
+      type: shell
+      timeoutSec: 60
+      on: cl-catalogue-06
+      skills: [containers.compose.overrides]
+      weight: 3
+      command: |
+        cd /home/learner/catalogue-local 2>/dev/null || { echo no-dir; exit 0; }
+        [ -s compose.override.yaml ] || [ -s compose.override.yml ] || { echo no-override-file; exit 0; }
+        docker compose config --format json 2>/dev/null | jq -r '.services.api | ((.ports[0].published | tostring) + ":" + (.ports[0].target | tostring) + " " + (.environment.LOG_LEVEL // "unset"))' 2>/dev/null || echo invalid
+      expect: {match: exact, value: "{{port}}:80 debug"}
+    - id: toolbox-profile
+      description: toolbox is part of the project only with the debug profile
+      type: shell
+      timeoutSec: 60
+      on: cl-catalogue-06
+      skills: [containers.compose.overrides]
+      weight: 3
+      command: |
+        cd /home/learner/catalogue-local 2>/dev/null || { echo no-dir; exit 0; }
+        a=$(docker compose config --services 2>/dev/null | sort | paste -sd, -)
+        b=$(docker compose --profile debug config --services 2>/dev/null | sort | paste -sd, -)
+        i=$(docker compose --profile debug config --format json 2>/dev/null | jq -r '.services.toolbox.image // "none"' 2>/dev/null)
+        echo "$a / $b / $i"
+      expect: {match: exact, value: "api,cache / api,cache,toolbox / copperleaf/toolbox:1"}
+    - id: plain-stack-running
+      description: The plain stack is up with api and cache, and the api answers on the local port
+      type: shell
+      timeoutSec: 60
+      on: cl-catalogue-06
+      skills: [containers.compose.overrides]
+      weight: 2
+      command: |
+        n() { docker ps -q --filter label=com.docker.compose.project=catalogue-local --filter label=com.docker.compose.service="$1" | wc -l; }
+        r=$(curl -fsS --max-time 3 http://127.0.0.1:{{port}}/ 2>/dev/null || echo down)
+        echo "api=$(n api) cache=$(n cache) toolbox=$(n toolbox) $r"
+      expect: {match: exact, value: "api=1 cache=1 toolbox=0 catalogue site"}
+    - id: debug-up-adds-toolbox
+      description: Starting the project with the debug profile brings up the toolbox next to the other two
+      type: shell
+      timeoutSec: 120
+      on: cl-catalogue-06
+      skills: [containers.compose.overrides]
+      weight: 2
+      command: |
+        cd /home/learner/catalogue-local 2>/dev/null || { echo no-dir; exit 0; }
+        docker compose --profile debug up -d >/dev/null 2>&1
+        n=$(docker ps -q --filter label=com.docker.compose.project=catalogue-local | wc -l)
+        t=$(docker ps -q --filter label=com.docker.compose.project=catalogue-local --filter label=com.docker.compose.service=toolbox | wc -l)
+        docker compose --profile debug rm -sf toolbox >/dev/null 2>&1
+        echo "total=$n toolbox=$t"
+      expect: {match: exact, value: "total=3 toolbox=1"}
+  hints:
+    - title: Two files, one project
+      body: "`docker compose` reads `compose.yaml` and then merges `compose.override.yaml` on top of it automatically. Lists such as `ports` are appended, maps such as `environment` are merged."
+      cost: 1
+    - title: What a profile does
+      body: "A service with `profiles: [debug]` is left out unless that profile is enabled (`--profile debug` or `COMPOSE_PROFILES=debug`). Services without profiles always start."
+      cost: 2
+    - title: Compare the three views
+      body: "`docker compose -f compose.yaml config` shows the base alone, `docker compose config --services` the plain project and `docker compose --profile debug config --services` the project with the toolbox."
+      cost: 1
+  misconceptions:
+    - id: ports-left-in-base
+      description: Adds the profile and the toolbox but leaves the local port and LOG_LEVEL in compose.yaml.
+      feedback: "The point of the split is a shared base. Move the published port and LOG_LEVEL into compose.override.yaml so another environment can use compose.yaml unchanged."
+      expectFail: [base-is-shared-only, override-has-local-settings]
+      mutation:
+        on: cl-catalogue-06
+        as: learner
+        run: |
+          cd ~/catalogue-local
+          printf '%s\n' 'name: catalogue-local' 'services:' '  api:' '    image: copperleaf/catalogue-site:1.0' '    environment:' '      LOG_LEVEL: debug' '    ports:' '      - "{{port}}:80"' \
+            '  cache:' '    image: redis:7.4-alpine' '  toolbox:' '    image: copperleaf/toolbox:1' '    profiles: [debug]' > compose.yaml
+          docker compose up -d
+    - id: toolbox-always-on
+      description: Defines toolbox without a profile, so it starts with everything else.
+      feedback: "A service without profiles is always part of the project. Add profiles: [debug] to toolbox."
+      expectFail: [toolbox-profile, plain-stack-running]
+      mutation:
+        on: cl-catalogue-06
+        as: learner
+        run: |
+          cd ~/catalogue-local
+          printf '%s\n' 'name: catalogue-local' 'services:' '  api:' '    image: copperleaf/catalogue-site:1.0' '  cache:' '    image: redis:7.4-alpine' \
+            '  toolbox:' '    image: copperleaf/toolbox:1' > compose.yaml
+          printf '%s\n' 'services:' '  api:' '    environment:' '      LOG_LEVEL: debug' '    ports:' '      - "{{port}}:80"' > compose.override.yaml
+          docker compose up -d
+    - id: wrong-profile-name
+      description: Puts toolbox in a differently named profile.
+      feedback: "The task enables the debug profile. A profile named dev is never switched on by --profile debug."
+      expectFail: [toolbox-profile, debug-up-adds-toolbox]
+      mutation:
+        on: cl-catalogue-06
+        as: learner
+        run: |
+          cd ~/catalogue-local
+          printf '%s\n' 'name: catalogue-local' 'services:' '  api:' '    image: copperleaf/catalogue-site:1.0' '  cache:' '    image: redis:7.4-alpine' \
+            '  toolbox:' '    image: copperleaf/toolbox:1' '    profiles: [dev]' > compose.yaml
+          printf '%s\n' 'services:' '  api:' '    environment:' '      LOG_LEVEL: debug' '    ports:' '      - "{{port}}:80"' > compose.override.yaml
+          docker compose up -d
+  solution:
+    explanation: |
+      The base file keeps what every environment shares. The override file, which Compose
+      merges automatically, adds the laptop-only port and log level. The toolbox carries a
+      profile, so it only exists in the project when that profile is switched on.
+    steps:
+      - on: cl-catalogue-06
+        as: learner
+        run: |
+          cd ~/catalogue-local
+          cat > compose.yaml <<'YML'
+          name: catalogue-local
+          services:
+            api:
+              image: copperleaf/catalogue-site:1.0
+            cache:
+              image: redis:7.4-alpine
+            toolbox:
+              image: copperleaf/toolbox:1
+              profiles: [debug]
+          YML
+          cat > compose.override.yaml <<'YML'
+          services:
+            api:
+              environment:
+                LOG_LEVEL: debug
+              ports:
+                - "{{port}}:80"
+          YML
+          docker compose up -d --remove-orphans
+          docker compose ps
+    alternatives:
+      - id: toolbox-in-override
+        description: Keep the toolbox with the local settings in the override file, and enable the profile through the environment variable when needed.
+        steps:
+          - on: cl-catalogue-06
+            as: learner
+            run: |
+              cd ~/catalogue-local
+              printf '%s\n' 'name: catalogue-local' 'services:' '  api:' '    image: copperleaf/catalogue-site:1.0' '  cache:' '    image: redis:7.4-alpine' > compose.yaml
+              cat > compose.override.yaml <<'YML'
+              services:
+                api:
+                  environment:
+                    LOG_LEVEL: debug
+                  ports:
+                    - target: 80
+                      published: "{{port}}"
+                toolbox:
+                  image: copperleaf/toolbox:1
+                  profiles: ["debug"]
+              YML
+              docker compose up -d --remove-orphans

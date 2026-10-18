@@ -1,0 +1,334 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-compose-include-split
+  title: Split the media platform Compose file per team
+  domain: containers
+  frameworks: [docker-practitioner:compose]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [docker, compose, include, extends]
+  version: 1
+spec:
+  description: |
+    On `cl-platform-01` (`ssh cl-platform-01`; you are in the `docker` group) the media
+    platform's `~/platform/compose.yaml` (project `platform`, a scaled-down copy of the
+    600-line production file) is edited by three teams and conflicts constantly. It
+    holds the catalogue team's `catalogue-api` and `catalogue-cache`, the subtitle
+    team's `subtitle` and the ads team's `ads`, and the same `logging:` block is pasted
+    into all four services.
+
+    Restructure it **without changing what Compose renders**:
+
+    1. `~/platform/compose.yaml` keeps only `name: platform` and an `include:` of three
+       files: **`catalogue.yaml`**, **`subtitle.yaml`** and **`ads.yaml`** in the same
+       directory, each holding its team's services (and the `catalogue-data` volume
+       with the catalogue files).
+    2. The logging block lives **once**, in a shared file in that directory or a subdirectory of it, and every
+       service gets it through **`extends`**.
+    3. `docker compose config` must render exactly what it rendered before.
+
+    Each team file must also be valid on its own (`docker compose -f ads.yaml config`).
+  objectives:
+    - Assemble a project from several files with include
+    - Share a block of service settings with extends
+    - Prove a refactor by comparing rendered configuration
+  params:
+    port:
+      type: int
+      min: 8100
+      max: 8199
+    shards:
+      type: int
+      min: 3
+      max: 12
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-platform-01
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-platform-01
+      timeoutSec: 240
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        p=/home/learner/platform
+        rm -rf "$p"; install -d -o learner -g learner "$p"
+        cat > "$p/compose.yaml" <<'YML'
+        name: platform
+        services:
+          catalogue-api:
+            image: copperleaf/catalogue-site:1.0
+            ports:
+              - "{{port}}:80"
+            logging:
+              driver: json-file
+              options:
+                max-size: 10m
+                max-file: "3"
+          catalogue-cache:
+            image: redis:7.4-alpine
+            volumes:
+              - catalogue-data:/data
+            logging:
+              driver: json-file
+              options:
+                max-size: 10m
+                max-file: "3"
+          subtitle:
+            image: copperleaf/subtitle:1.0
+            environment:
+              SHARDS: "{{shards}}"
+            logging:
+              driver: json-file
+              options:
+                max-size: 10m
+                max-file: "3"
+          ads:
+            image: copperleaf/ad-insertion:4.2
+            logging:
+              driver: json-file
+              options:
+                max-size: 10m
+                max-file: "3"
+        volumes:
+          catalogue-data: {}
+        YML
+        chown -R learner:learner "$p"
+        install -d -m 0700 /var/lib/cloudtrain
+        (cd "$p" && docker compose config --format json | jq -S .) > /var/lib/cloudtrain/platform.baseline.json
+        test -s /var/lib/cloudtrain/platform.baseline.json
+  checks:
+    - id: renders-identically
+      description: docker compose config renders exactly what the original file rendered
+      type: shell
+      timeoutSec: 60
+      on: cl-platform-01
+      skills: [containers.compose.include, containers.compose.overrides]
+      weight: 4
+      command: |
+        cd /home/learner/platform 2>/dev/null || { echo no-dir; exit 0; }
+        docker compose config --format json 2>/dev/null | jq -S . > /tmp/cl-platform.now.json 2>/dev/null
+        if [ -s /tmp/cl-platform.now.json ] && cmp -s /tmp/cl-platform.now.json /var/lib/cloudtrain/platform.baseline.json; then echo identical; else echo different; fi
+      expect: {match: exact, value: identical}
+    - id: team-files-valid-alone
+      description: Each team file is a valid Compose file on its own holding that team's services
+      type: shell
+      timeoutSec: 90
+      on: cl-platform-01
+      skills: [containers.compose.include]
+      weight: 3
+      command: |
+        cd /home/learner/platform 2>/dev/null || { echo no-dir; exit 0; }
+        s() { docker compose -f "$1" config --services 2>/dev/null | sort | paste -sd, - ; }
+        echo "$(s catalogue.yaml) / $(s subtitle.yaml) / $(s ads.yaml)"
+      expect: {match: exact, value: "catalogue-api,catalogue-cache / subtitle / ads"}
+    - id: main-file-only-includes
+      description: compose.yaml includes the three files and defines no service of its own
+      type: shell
+      timeoutSec: 30
+      on: cl-platform-01
+      skills: [containers.compose.include]
+      weight: 2
+      command: |
+        cd /home/learner/platform 2>/dev/null || { echo no-dir; exit 0; }
+        inc=0; for f in catalogue.yaml subtitle.yaml ads.yaml; do grep -q "$f" compose.yaml && inc=$((inc+1)); done
+        img=$(grep -c 'image:' compose.yaml || true)
+        top=$(grep -cE '^include:' compose.yaml || true)
+        echo "include=$top files=$inc images=$img"
+      expect: {match: exact, value: "include=1 files=3 images=0"}
+    - id: logging-defined-once
+      description: The logging options exist in exactly one file and all four services extend it
+      type: shell
+      timeoutSec: 30
+      on: cl-platform-01
+      skills: [containers.compose.include, containers.compose.overrides]
+      weight: 3
+      command: |
+        cd /home/learner/platform 2>/dev/null || { echo no-dir; exit 0; }
+        all() { find . -type f \( -name '*.yaml' -o -name '*.yml' \) -exec cat {} +; }
+        defs=$(all 2>/dev/null | grep -c 'max-size' || true)
+        ext=$(all 2>/dev/null | grep -c 'extends:' || true)
+        echo "logging-defs=$defs extends=$ext"
+      expect: {match: exact, value: "logging-defs=1 extends=4"}
+  hints:
+    - title: include and extends do different jobs
+      body: "`include:` pulls whole Compose files (services, volumes, networks) into the project. `extends:` lets one service inherit settings from a service in the same or another file."
+      cost: 1
+    - title: A home for the logging block
+      body: "Create a small file, say `common.yaml`, with one service (for example `base`, with an image and the `logging:` block). Every service then has `extends: {file: common.yaml, service: base}` plus its own image and settings."
+      cost: 2
+    - title: Compare before and after
+      body: "Save the rendered config before you start (`docker compose config > /tmp/before.yaml`), then diff it with the new one: the two must match."
+      command: cd ~/platform && docker compose config > /tmp/before.yaml
+      cost: 1
+  misconceptions:
+    - id: logging-copied
+      description: Splits the file but keeps a copy of the logging block in every service.
+      feedback: "The point of the shared block is one place to change. Define the logging options once and have each service extend it."
+      expectFail: [logging-defined-once]
+      mutation:
+        on: cl-platform-01
+        as: learner
+        run: |
+          cd ~/platform
+          L='    logging: {driver: json-file, options: {max-size: 10m, max-file: "3"}}'
+          printf '%s\n' 'name: platform' 'include:' '  - catalogue.yaml' '  - subtitle.yaml' '  - ads.yaml' > compose.yaml
+          printf '%s\n' 'services:' '  catalogue-api:' '    image: copperleaf/catalogue-site:1.0' '    ports: ["{{port}}:80"]' "$L" \
+            '  catalogue-cache:' '    image: redis:7.4-alpine' '    volumes: ["catalogue-data:/data"]' "$L" 'volumes:' '  catalogue-data: {}' > catalogue.yaml
+          printf '%s\n' 'services:' '  subtitle:' '    image: copperleaf/subtitle:1.0' '    environment: {SHARDS: "{{shards}}"}' "$L" > subtitle.yaml
+          printf '%s\n' 'services:' '  ads:' '    image: copperleaf/ad-insertion:4.2' "$L" > ads.yaml
+    - id: team-dropped
+      description: Forgets to include the ads file in the main compose.yaml.
+      feedback: "A file that is not included is not part of the project. The rendered configuration lost the ads service."
+      expectFail: [renders-identically, main-file-only-includes]
+      mutation:
+        on: cl-platform-01
+        as: learner
+        run: |
+          cd ~/platform
+          printf '%s\n' 'services:' '  base:' '    image: busybox:1.37' '    logging: {driver: json-file, options: {max-size: 10m, max-file: "3"}}' > common.yaml
+          E='    extends: {file: common.yaml, service: base}'
+          printf '%s\n' 'name: platform' 'include:' '  - catalogue.yaml' '  - subtitle.yaml' > compose.yaml
+          printf '%s\n' 'services:' '  catalogue-api:' "$E" '    image: copperleaf/catalogue-site:1.0' '    ports: ["{{port}}:80"]' \
+            '  catalogue-cache:' "$E" '    image: redis:7.4-alpine' '    volumes: ["catalogue-data:/data"]' 'volumes:' '  catalogue-data: {}' > catalogue.yaml
+          printf '%s\n' 'services:' '  subtitle:' "$E" '    image: copperleaf/subtitle:1.0' '    environment: {SHARDS: "{{shards}}"}' > subtitle.yaml
+          printf '%s\n' 'services:' '  ads:' "$E" '    image: copperleaf/ad-insertion:4.2' > ads.yaml
+    - id: merge-with-f-flags
+      description: Leaves everything in compose.yaml and adds the team files for use with -f.
+      feedback: "Stacking files with -f is not the same as include: the main file must still be the whole project, and it must be assembled by include so a plain docker compose config works."
+      expectFail: [team-files-valid-alone, main-file-only-includes]
+      mutation:
+        on: cl-platform-01
+        as: learner
+        run: |
+          cd ~/platform
+          printf '%s\n' 'services:' '  catalogue-api:' '    environment: {TEAM: catalogue}' > catalogue.yaml
+          printf '%s\n' 'services:' '  subtitle:' '    environment: {TEAM: subtitle}' > subtitle.yaml
+          printf '%s\n' 'services:' '  ads:' '    environment: {TEAM: ads}' > ads.yaml
+  solution:
+    explanation: |
+      `include` assembles the project from the three team files, each valid on its own, and
+      `extends` gives every service the logging block that now lives once in `common.yaml`.
+      The merged model is the same as before, so `docker compose config` is unchanged.
+    steps:
+      - on: cl-platform-01
+        as: learner
+        run: |
+          cd ~/platform
+          cat > common.yaml <<'YML'
+          services:
+            base:
+              image: busybox:1.37
+              logging:
+                driver: json-file
+                options:
+                  max-size: 10m
+                  max-file: "3"
+          YML
+          cat > compose.yaml <<'YML'
+          name: platform
+          include:
+            - catalogue.yaml
+            - subtitle.yaml
+            - ads.yaml
+          YML
+          cat > catalogue.yaml <<'YML'
+          services:
+            catalogue-api:
+              extends:
+                file: common.yaml
+                service: base
+              image: copperleaf/catalogue-site:1.0
+              ports:
+                - "{{port}}:80"
+            catalogue-cache:
+              extends:
+                file: common.yaml
+                service: base
+              image: redis:7.4-alpine
+              volumes:
+                - catalogue-data:/data
+          volumes:
+            catalogue-data: {}
+          YML
+          cat > subtitle.yaml <<'YML'
+          services:
+            subtitle:
+              extends:
+                file: common.yaml
+                service: base
+              image: copperleaf/subtitle:1.0
+              environment:
+                SHARDS: "{{shards}}"
+          YML
+          cat > ads.yaml <<'YML'
+          services:
+            ads:
+              extends:
+                file: common.yaml
+                service: base
+              image: copperleaf/ad-insertion:4.2
+          YML
+          docker compose config --services | sort
+    alternatives:
+      - id: shared-subdirectory-long-include
+        description: Use the long include syntax and keep the shared file in a subdirectory.
+        steps:
+          - on: cl-platform-01
+            as: learner
+            run: |
+              cd ~/platform
+              mkdir -p shared
+              cat > shared/logging.yaml <<'YML'
+              services:
+                base:
+                  image: busybox:1.37
+                  logging:
+                    driver: json-file
+                    options:
+                      max-size: 10m
+                      max-file: "3"
+              YML
+              cat > compose.yaml <<'YML'
+              name: platform
+              include:
+                - path: ./catalogue.yaml
+                - path: ./subtitle.yaml
+                - path: ./ads.yaml
+              YML
+              cat > catalogue.yaml <<'YML'
+              services:
+                catalogue-api:
+                  extends: {file: shared/logging.yaml, service: base}
+                  image: copperleaf/catalogue-site:1.0
+                  ports: ["{{port}}:80"]
+                catalogue-cache:
+                  extends: {file: shared/logging.yaml, service: base}
+                  image: redis:7.4-alpine
+                  volumes: ["catalogue-data:/data"]
+              volumes:
+                catalogue-data: {}
+              YML
+              cat > subtitle.yaml <<'YML'
+              services:
+                subtitle:
+                  extends: {file: shared/logging.yaml, service: base}
+                  image: copperleaf/subtitle:1.0
+                  environment: {SHARDS: "{{shards}}"}
+              YML
+              cat > ads.yaml <<'YML'
+              services:
+                ads:
+                  extends: {file: shared/logging.yaml, service: base}
+                  image: copperleaf/ad-insertion:4.2
+              YML
