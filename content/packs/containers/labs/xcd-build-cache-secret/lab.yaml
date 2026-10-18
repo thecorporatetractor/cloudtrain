@@ -53,7 +53,6 @@ spec:
         set -eu
         usermod -aG docker learner
         for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
-        GW=$(docker network inspect bridge | jq -r '.[0].IPAM.Config[0].Gateway')
         PYROOT=/srv/exam/build-cache-secret/pypi; PYPORT=3142; PYTOKEN='cl-pkg-{{tok}}'; PYLOG=/srv/exam/build-cache-secret/pypi.log; PYUNIT=xcd-pypi-pricing
         PYSPEC='[{"name":"ratecalc","version":"1.2.0"},{"name":"tax-tables","version":"3.0.1"},{"name":"fx-feed","version":"0.8.0"},{"name":"ledger-sync","version":"1.0.0"}]'
         # needs: PYROOT PYPORT PYTOKEN PYLOG PYUNIT PYSPEC (JSON list of packages)
@@ -139,7 +138,20 @@ spec:
         [Install]
         WantedBy=multi-user.target
         UNIT
+        # fixed host address for the index: does not depend on docker0, so it survives a reboot and any bridge address change
+        cat > /etc/systemd/system/clpkgs0.service <<'UNIT'
+        [Unit]
+        Description=Fixed address for the Copperleaf package index
+        Before=network-online.target
+        [Service]
+        Type=oneshot
+        RemainAfterExit=yes
+        ExecStart=/bin/sh -c 'ip link show clpkgs0 >/dev/null 2>&1 || ip link add clpkgs0 type dummy; ip addr replace 198.18.0.42/32 dev clpkgs0; ip link set clpkgs0 up'
+        [Install]
+        WantedBy=multi-user.target
+        UNIT
         systemctl daemon-reload
+        systemctl enable --now clpkgs0.service >/dev/null 2>&1
         systemctl enable "$PYUNIT.service" >/dev/null 2>&1
         systemctl restart "$PYUNIT.service"
         for i in $(seq 30); do curl -fs -o /dev/null -u "__token__:$PYTOKEN" "http://127.0.0.1:$PYPORT/simple/$(echo "$PYSPEC" | jq -r '.[0].name')/" && break; sleep 1; done
@@ -157,7 +169,7 @@ spec:
         PY
         cat > "$s/Dockerfile" <<'DF'
         FROM python:3.13-alpine
-        ENV PIP_DISABLE_PIP_VERSION_CHECK=1 PKG_HOST=@GW@:3142
+        ENV PIP_DISABLE_PIP_VERSION_CHECK=1 PKG_HOST=198.18.0.42:3142 PIP_TRUSTED_HOST=198.18.0.42
         ARG PKG_TOKEN
         WORKDIR /app
         COPY requirements.txt .
@@ -165,7 +177,6 @@ spec:
         COPY src/ src/
         CMD ["python3", "src/app.py"]
         DF
-        sed -i "s/@GW@/$GW/" "$s/Dockerfile"
         chown -R learner:learner "$s"
   checks:
     - id: image-works
@@ -262,7 +273,7 @@ spec:
         run: |
           cd ~/exam/pricing
           host=$(sed -n 's/^ENV .*PKG_HOST=\([^ ]*\).*/\1/p' Dockerfile)
-          printf '%s\n' 'FROM python:3.13-alpine' "ENV PIP_DISABLE_PIP_VERSION_CHECK=1 PKG_HOST=$host" 'WORKDIR /app' 'COPY requirements.txt .' \
+          printf '%s\n' 'FROM python:3.13-alpine' "ENV PIP_DISABLE_PIP_VERSION_CHECK=1 PKG_HOST=$host PIP_TRUSTED_HOST=${host%%:*}" 'WORKDIR /app' 'COPY requirements.txt .' \
             'RUN --mount=type=cache,target=/root/.cache/pip --mount=type=secret,id=pkgtoken pip install --index-url "http://__token__:$(cat /run/secrets/pkgtoken)@${PKG_HOST}/simple" -r requirements.txt' \
             'COPY src/ src/' 'CMD ["python3", "src/app.py"]' > Dockerfile
           docker build --secret id=pkgtoken,src=pkgtoken.txt -t copperleaf/pricing:2.0 .
@@ -275,7 +286,7 @@ spec:
             run: |
               cd ~/exam/pricing
               host=$(sed -n 's/^ENV .*PKG_HOST=\([^ ]*\).*/\1/p' Dockerfile)
-              printf '%s\n' 'FROM python:3.13-alpine' "ENV PIP_DISABLE_PIP_VERSION_CHECK=1 PKG_HOST=$host PIP_CACHE_DIR=/var/cache/pip" 'WORKDIR /app' 'COPY requirements.txt .' \
+              printf '%s\n' 'FROM python:3.13-alpine' "ENV PIP_DISABLE_PIP_VERSION_CHECK=1 PKG_HOST=$host PIP_TRUSTED_HOST=${host%%:*} PIP_CACHE_DIR=/var/cache/pip" 'WORKDIR /app' 'COPY requirements.txt .' \
                 'RUN --mount=type=cache,target=/var/cache/pip --mount=type=secret,id=pkgtoken,env=PKG_TOKEN pip install --index-url "http://__token__:${PKG_TOKEN}@${PKG_HOST}/simple" -r requirements.txt' \
                 'COPY src/ src/' 'CMD ["python3", "src/app.py"]' > Dockerfile
               docker build --secret id=pkgtoken,src=pkgtoken.txt -t copperleaf/pricing:2.0 .

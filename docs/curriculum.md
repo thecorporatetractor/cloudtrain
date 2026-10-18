@@ -1565,7 +1565,7 @@ The main containers exam. No live hands-on Docker exam exists (the legacy associ
 | docker-practitioner:supply-chain | 10% | 1 | 2 |
 | docker-practitioner:operations | 16% | 2 | 4 |
 
-**Rules.** Hints: none. Timer: one timer across all tasks. Tasks in any order. Flag for review. Reboot before grading: yes. Docs: offline Docker documentation and man pages only; no internet. Partial credit: per-task. One docker-vm:29 host (Engine 29, containerd image store) with a local TLS registry; the grader restarts the engine and reboots the VM, then checks end state. Tasks that feed later tasks (for example reports:1.0) are seeded when the producing task is not drawn.
+**Rules.** Hints: none. Timer: one timer across all tasks. Tasks in any order. Flag for review. Reboot before grading: yes. Docs: offline Docker documentation and man pages only; no internet. Partial credit: per-task. One docker-vm:29 host (Engine 29, containerd image store) with a local TLS registry; the grader restarts the engine and reboots the VM, then checks end state. Tasks that feed later tasks (for example reports:1.0) are seeded when the producing task is not drawn. Before any live exam run, exclude xcd-build-multistage-nonroot (no Go toolchain image) and xcd-supply-sbom-sign (no cosign, no syft scanner image) from the draw, or rebuild docker-vm first.
 
 **Retakes.** 1 free retake(s); 24 h cooldown; at most 3 attempts per 30 days; every attempt draws fresh tasks and parameters. a retake draws different tasks and new parameters
 

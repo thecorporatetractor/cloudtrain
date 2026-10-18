@@ -170,9 +170,9 @@ spec:
             http://registry.copperleaf.example:5000/v2/mirror/runtime/manifests/stable | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}')
           sed -i "s|^FROM registry.copperleaf.example:5000/mirror/runtime:stable\$|FROM registry.copperleaf.example:5000/mirror/runtime:stable@$rd|" Dockerfile
           docker build -q -t copperleaf/catalogue:3.1 .
-    - id: image-id-as-digest
-      description: Uses the local image ID as if it were the registry digest.
-      feedback: "`docker image inspect` .Id is the digest of the image configuration, not of the manifest the registry serves. Pin the RepoDigests value or the registry's Docker-Content-Digest."
+    - id: config-digest-as-pin
+      description: Pins the digest of the image configuration instead of the manifest digest.
+      feedback: "The configuration blob digest names the image's settings, not the manifest the registry serves for the tag. A FROM pin must be the manifest (or index) digest: the registry's Docker-Content-Digest or the RepoDigests value."
       expectFail: [pins-current]
       mutation:
         on: cl-catalogue-03
@@ -180,8 +180,7 @@ spec:
         run: |
           cd ~/catalogue
           for n in toolchain runtime; do
-            docker pull -q registry.copperleaf.example:5000/mirror/$n:stable >/dev/null
-            id=$(docker image inspect registry.copperleaf.example:5000/mirror/$n:stable | jq -r '.[0].Id')
+            id=sha256:$(printf %s "$(skopeo inspect --config --raw --tls-verify=false docker://registry.copperleaf.example:5000/mirror/$n:stable)" | sha256sum | cut -d' ' -f1)
             sed -i "s|^\(FROM registry.copperleaf.example:5000/mirror/$n\):stable[^ ]*|\1:stable@$id|" Dockerfile
           done
           docker build -q -t copperleaf/catalogue:3.1 . || true

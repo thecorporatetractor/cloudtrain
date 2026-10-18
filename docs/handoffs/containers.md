@@ -156,7 +156,7 @@ linux and networking, so containers labs are not shown in the UI yet.
 | `xcd-storage-volume-restore` | storage | verified | verified live 2026-10-17 on docker-vm:29 (3 runs, 257s); reboot pass not exercised by labctl verify |
 | `xcd-supply-leaked-secret` | supply-chain | verified | verified live 2026-10-17 on docker-vm:29 (4 runs, 290s); reboot pass not exercised by labctl verify |
 
-Not written yet (12; written in round 5 wave 1, see the section below). Writable with the current image: `xcd-build-bake-targets`, `xcd-build-cache-secret`, `xcd-compose-env-profiles`, `xcd-compose-secret-file`, `xcd-net-address-pool`, `xcd-net-docker-user-rule`, `xcd-ops-log-rotation`. Blocked on image content docker-vm:29 does not have yet: `xcd-build-multistage-nonroot` (Go toolchain image), `xcd-ops-debug-shell-less` (a distroless/static base), `xcd-registry-multiarch-index` (arm64 base content + binfmt), `xcd-sec-socket-proxy` (a socket-proxy image), `xcd-supply-sbom-sign` (cosign binary). Add those to `tools/images/docker-vm/preload-images.txt` or the guest script and rebuild. The other 79 learning labs of the domain (paths ctr-building-images module 2 onward, compose, networking, storage, registries, security, troubleshooting, internals, podman, swarm) are not started.
+Superseded by the round 5 wave 1 section below (all of these are now written; the blocked list in this paragraph is outdated: `xcd-ops-debug-shell-less`, `xcd-registry-multiarch-index` and `xcd-sec-socket-proxy` are unblocked by the recipes below). Original text: not written yet (12). Writable with the current image: `xcd-build-bake-targets`, `xcd-build-cache-secret`, `xcd-compose-env-profiles`, `xcd-compose-secret-file`, `xcd-net-address-pool`, `xcd-net-docker-user-rule`, `xcd-ops-log-rotation`. Blocked on image content docker-vm:29 does not have yet: `xcd-build-multistage-nonroot` (Go toolchain image), `xcd-ops-debug-shell-less` (a distroless/static base), `xcd-registry-multiarch-index` (arm64 base content + binfmt), `xcd-sec-socket-proxy` (a socket-proxy image), `xcd-supply-sbom-sign` (cosign binary). Add those to `tools/images/docker-vm/preload-images.txt` or the guest script and rebuild. The other 79 learning labs of the domain (paths ctr-building-images module 2 onward, compose, networking, storage, registries, security, troubleshooting, internals, podman, swarm) are not started.
 
 ## Round 5, wave 1 (branch `content/containers-r5-w1`): write-first, 23 labs
 
@@ -180,9 +180,14 @@ multi-platform images" (titles carry no product names).
   (a `pyproject.toml` with an in-tree PEP 517 backend, no setuptools needed) into
   `/srv/pypi/simple/<pkg>/` (PEP 503) and serves them with a small Python server under a
   systemd unit (port 3141; the exam task uses 3142 and a basic-auth token). Builds reach it
-  at the docker0 gateway (`docker network inspect bridge | jq`). Why sdists and not wheels:
-  pip's HTTP cache only applies to https, so a cache mount over plain-HTTP wheels saves
-  nothing, while a built wheel from an sdist lands in pip's wheel cache and the rebuild
+  at the docker0 gateway (`docker network inspect bridge | jq`) in the learning labs; pip
+  refuses a plain-HTTP index that is not loopback unless the host is trusted, so every
+  Dockerfile sets `PIP_TRUSTED_HOST=<host>`. The exam task `xcd-build-cache-secret` uses a
+  fixed address instead, 198.18.0.42 on a dummy interface `clpkgs0` made by a oneshot unit,
+  because docker0 moves when `xcd-net-address-pool` changes the pools and the exam reboots
+  before grading. Why sdists and not wheels: a cache mount over plain-HTTP wheels saves
+  nothing useful, while a wheel built from an sdist lands in pip's wheel cache and the
+  rebuild
   does not download the tarball again (checked locally with pip). The grader counts
   `.tar.gz` lines in the server's access log.
 - **Shell-less runtime** (`xcd-ops-debug-shell-less`): `copperleaf/pyruntime:1` is built in
@@ -223,7 +228,7 @@ Other image wishes already known: binfmt/arm64 bases, vulnerability DB and scann
 ### Verify queue for the testing round (containers)
 
 1. Wave 1 minus the four blocked labs (19 labs), one `labctl verify` at a time (6 to 8
-   VMs each): the 11 xcd tasks first (shortest), then the 8 learning labs.
+   VMs each): the 10 xcd tasks first (shortest), then the 9 learning labs.
 2. After the image rebuild: `ctr-buildx-cache-export`, `xcd-build-multistage-nonroot`,
    `xcd-supply-sbom-sign`; then confirm `ctr-reproducible-build`.
 3. Waves 2 to 5 as they land (wave 2 once el-vm podman is confirmed).
