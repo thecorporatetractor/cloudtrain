@@ -15,15 +15,18 @@ spec:
     `~/catalogue-api/Dockerfile`, pushed to `localhost:5000/catalogue-api:{{rel}}`) fails
     three of Copperleaf's supply-chain policies:
 
-    - it has **fixable high-severity CVEs** (a scan report is at `~/scout-before.json`);
+    - it has **fixable high-severity CVEs** (it is built on the platform base
+      `copperleaf/pybase:1.0`; the fixed base is named in `/srv/scan-db/fixed-base.txt`);
     - it carries **no provenance attestation**;
     - it still runs as the **root** user by default.
 
     `/usr/local/bin/cl-policy-eval` evaluates an image against the three policies and
     prints one `PASS`/`FAIL` line per policy plus an overall `PASS`/`FAIL`.
 
-    Fix all three: fewer fixable highs (bump the base per `/srv/scan-db/fixed-base.txt`),
-    attach build provenance, and run as a named non-root user. Rebuild, push under the
+    First record a baseline scan of the pushed image as **`~/scout-before.json`**
+    (`docker scout cves`). Then fix all three: fewer fixable highs (bump the base per
+    `/srv/scan-db/fixed-base.txt`), attach build provenance, and run as a named non-root
+    user. Rebuild, push under the
     **same tag**, and show `cl-policy-eval localhost:5000/catalogue-api:{{rel}}` reports
     **PASS** on every line.
   objectives:
@@ -58,10 +61,17 @@ spec:
         rm -rf /srv/registry /srv/scan-db; install -d /srv/registry /srv/scan-db
         docker run -d --name registry --restart always -p 127.0.0.1:5000:5000 -v /srv/registry:/var/lib/registry registry:3 >/dev/null
         for i in $(seq 30); do curl -fs http://127.0.0.1:5000/v2/ >/dev/null && break; sleep 1; done
-        echo "python:3.13-alpine" > /srv/scan-db/fixed-base.txt
+        echo "copperleaf/pybase:1.1" > /srv/scan-db/fixed-base.txt
+        chmod 0644 /srv/scan-db/fixed-base.txt
+        d=$(mktemp -d)
+        for v in 1.0 1.1; do
+          printf '%s\n' 'FROM alpine:3.22' "RUN echo '$v' > /etc/pybase-release" > "$d/Dockerfile"
+          docker build -q --provenance=false --sbom=false -t "copperleaf/pybase:$v" "$d" >/dev/null
+        done
+        rm -rf "$d"
         s=/home/learner/catalogue-api
         install -d -o learner -g learner "$s"
-        printf '%s\n' 'FROM python:3.11-alpine' 'RUN echo "catalogue-api {{rel}}" > /version' 'CMD ["cat", "/version"]' > "$s/Dockerfile"
+        printf '%s\n' 'FROM copperleaf/pybase:1.0' 'RUN echo "catalogue-api {{rel}}" > /version' 'CMD ["cat", "/version"]' > "$s/Dockerfile"
         chown -R learner:learner "$s"
         docker build -q --provenance=false -t localhost:5000/catalogue-api:{{rel}} "$s" >/dev/null
         docker push -q localhost:5000/catalogue-api:{{rel}} >/dev/null
@@ -70,7 +80,9 @@ spec:
         set -u
         ref=$1
         fail=0
-        if docker history --no-trunc "$ref" 2>/dev/null | grep -q "$(cat /srv/scan-db/fixed-base.txt)"; then echo "PASS fixable-highs"; else echo "FAIL fixable-highs"; fail=1; fi
+        want=$(sed 's/.*://' /srv/scan-db/fixed-base.txt)
+        have=$(docker run --rm --entrypoint cat "$ref" /etc/pybase-release 2>/dev/null || echo none)
+        if [ "$have" = "$want" ]; then echo "PASS fixable-highs"; else echo "FAIL fixable-highs"; fail=1; fi
         prov=$(docker buildx imagetools inspect --format '{{json .Provenance}}' "$ref" 2>/dev/null)
         if [ -n "$prov" ] && [ "$prov" != "null" ] && [ "$prov" != "{}" ]; then echo "PASS provenance"; else echo "FAIL provenance"; fail=1; fi
         u=$(docker inspect "$ref" 2>/dev/null | jq -r '.[0].Config.User // ""')
@@ -127,7 +139,7 @@ spec:
         as: learner
         run: |
           cd ~/catalogue-api
-          printf '%s\n' 'FROM python:3.13-alpine' 'RUN adduser -D -u 10010 svc' 'RUN echo "catalogue-api {{rel}}" > /version' 'USER svc' 'CMD ["cat", "/version"]' > Dockerfile
+          printf '%s\n' 'FROM copperleaf/pybase:1.1' 'RUN adduser -D -u 10010 svc' 'RUN echo "catalogue-api {{rel}}" > /version' 'USER svc' 'CMD ["cat", "/version"]' > Dockerfile
           docker build -q --provenance=false -t localhost:5000/catalogue-api:{{rel}} .
           docker push -q localhost:5000/catalogue-api:{{rel}}
     - id: root-user-left
@@ -139,7 +151,7 @@ spec:
         as: learner
         run: |
           cd ~/catalogue-api
-          printf '%s\n' 'FROM python:3.13-alpine' 'RUN echo "catalogue-api {{rel}}" > /version' 'CMD ["cat", "/version"]' > Dockerfile
+          printf '%s\n' 'FROM copperleaf/pybase:1.1' 'RUN echo "catalogue-api {{rel}}" > /version' 'CMD ["cat", "/version"]' > Dockerfile
           docker buildx build --provenance=mode=max --push -t localhost:5000/catalogue-api:{{rel}} .
   solution:
     explanation: |
@@ -150,7 +162,7 @@ spec:
       - on: cl-catalogue-05
         as: learner
         run: |
-          trivy image --skip-db-update --cache-dir /srv/scan-db --format json -o ~/scout-before.json localhost:5000/catalogue-api:{{rel}} 2>/dev/null || echo '{"ArtifactName":"catalogue-api"}' > ~/scout-before.json
+          docker scout cves --format sarif --output ~/scout-before.json localhost:5000/catalogue-api:{{rel}}
           cd ~/catalogue-api
           printf '%s\n' "FROM $(cat /srv/scan-db/fixed-base.txt)" 'RUN adduser -D -u 10010 svc' 'RUN echo "catalogue-api {{rel}}" > /version' 'USER svc' 'CMD ["cat", "/version"]' > Dockerfile
           docker buildx build --provenance=mode=max --push -t localhost:5000/catalogue-api:{{rel}} .
@@ -162,6 +174,7 @@ spec:
           - on: cl-catalogue-05
             as: learner
             run: |
+              docker scout cves --only-severity high,critical --format sarif --output ~/scout-before.json localhost:5000/catalogue-api:{{rel}}
               cd ~/catalogue-api
               printf '%s\n' "FROM $(cat /srv/scan-db/fixed-base.txt)" 'RUN echo "catalogue-api {{rel}}" > /version' 'USER 10010' 'CMD ["cat", "/version"]' > Dockerfile
               docker buildx build --provenance=mode=max --push -t localhost:5000/catalogue-api:{{rel}} .

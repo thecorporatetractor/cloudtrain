@@ -12,15 +12,17 @@ metadata:
 spec:
   description: |
     On **`cl-catalogue-03`** (`ssh cl-catalogue-03`) `catalogue-api:{{rel}}` is built from
-    `~/catalogue-api/Dockerfile` on a base with known fixable vulnerabilities, plus a
+    `~/catalogue-api/Dockerfile` on the platform base `copperleaf/pybase:1.0` (which has
+    known fixable vulnerabilities), plus a
     single non-exploitable finding `CVE-2024-{{cve}}` (the vulnerable code path is never
     reached by this service). The offline vulnerability database is mirrored at
     `/srv/scan-db`.
 
     1. **Scan** `catalogue-api:{{rel}}` with `trivy` against the offline database and
        save the JSON report to `~/scan-before.json`.
-    2. **Bump the base image** to the version named in `/srv/scan-db/fixed-base.txt` and
-       rebuild, so every **fixable critical** finding is gone.
+    2. **Bump the base image** to the base named in `/srv/scan-db/fixed-base.txt` and
+       rebuild, so every **fixable critical** finding is gone. The rebuilt image must
+       carry that base's `/etc/pybase-release`.
     3. Write a **VEX document** `~/catalogue-api.vex.json` (OpenVEX) that records
        `CVE-2024-{{cve}}` as **`not_affected`** for this image, with a justification.
     4. **Rescan** with the VEX document applied and save the JSON report to
@@ -59,10 +61,17 @@ spec:
         usermod -aG docker learner
         for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
         install -d /srv/scan-db
-        echo "python:3.13-alpine" > /srv/scan-db/fixed-base.txt
+        echo "copperleaf/pybase:1.1" > /srv/scan-db/fixed-base.txt
+        chmod 0644 /srv/scan-db/fixed-base.txt
+        d=$(mktemp -d)
+        for v in 1.0 1.1; do
+          printf '%s\n' 'FROM alpine:3.22' "RUN echo '$v' > /etc/pybase-release" > "$d/Dockerfile"
+          docker build -q --provenance=false --sbom=false -t "copperleaf/pybase:$v" "$d" >/dev/null
+        done
+        rm -rf "$d"
         s=/home/learner/catalogue-api
         install -d -o learner -g learner "$s"
-        printf '%s\n' 'FROM python:3.11-alpine' 'RUN echo "catalogue-api {{rel}}" > /version' 'CMD ["cat", "/version"]' > "$s/Dockerfile"
+        printf '%s\n' 'FROM copperleaf/pybase:1.0' 'RUN echo "catalogue-api {{rel}}" > /version' 'CMD ["cat", "/version"]' > "$s/Dockerfile"
         chown -R learner:learner "$s"
         docker build -q -t catalogue-api:{{rel}} "$s" >/dev/null
         rm -f /home/learner/scan-before.json /home/learner/scan-after.json /home/learner/catalogue-api.vex.json
@@ -83,8 +92,8 @@ spec:
       on: cl-catalogue-03
       skills: [containers.supply-chain.scanning]
       weight: 2
-      command: docker image inspect catalogue-api:{{rel}} 2>/dev/null | jq -r '.[0].Config.Image // .[0].RepoTags[0] // "none"' >/dev/null; docker history --no-trunc catalogue-api:{{rel}} 2>/dev/null | grep -qF "$(cat /srv/scan-db/fixed-base.txt)" && echo fixed || echo stale
-      expect: {match: exact, value: fixed}
+      command: docker run --rm --entrypoint cat catalogue-api:{{rel}} /etc/pybase-release 2>/dev/null || echo none
+      expect: {match: exact, value: "1.1"}
     - id: vex-recorded
       description: The VEX document records CVE-2024-{{cve}} as not_affected
       type: shell
@@ -132,7 +141,7 @@ spec:
         as: learner
         run: |
           cd ~/catalogue-api
-          sed -i 's/^FROM .*/FROM python:3.13-alpine/' Dockerfile
+          sed -i "s#^FROM .*#FROM $(cat /srv/scan-db/fixed-base.txt)#" Dockerfile
           docker build -q -t catalogue-api:{{rel}} .
   solution:
     explanation: |
@@ -151,16 +160,23 @@ spec:
             "statements": [{"vulnerability": {"name": $c}, "products": [{"@id": "catalogue-api:{{rel}}"}], "status": "not_affected", "justification": "vulnerable_code_not_in_execute_path"}]}' > ~/catalogue-api.vex.json
           trivy image --skip-db-update --cache-dir /srv/scan-db --vex ~/catalogue-api.vex.json --format json -o ~/scan-after.json catalogue-api:{{rel}}
     alternatives:
-      - id: ignore-file
-        description: Use trivyignore with VEX-equivalent CVE filtering for teams that prefer that workflow.
+      - id: env-config-python-vex
+        description: Configure trivy through environment variables, patch the base with a printf, and write the OpenVEX document with Python.
         steps:
           - on: cl-catalogue-03
             as: learner
             run: |
-              trivy image --skip-db-update --cache-dir /srv/scan-db --format json -o ~/scan-before.json catalogue-api:{{rel}}
+              export TRIVY_SKIP_DB_UPDATE=true TRIVY_CACHE_DIR=/srv/scan-db TRIVY_FORMAT=json
+              trivy image -o ~/scan-before.json catalogue-api:{{rel}}
               cd ~/catalogue-api
-              sed -i "s/^FROM .*/FROM $(cat /srv/scan-db/fixed-base.txt)/" Dockerfile
+              printf '%s\n' "FROM $(cat /srv/scan-db/fixed-base.txt)" 'RUN echo "catalogue-api {{rel}}" > /version' 'CMD ["cat", "/version"]' > Dockerfile
               docker build -q -t catalogue-api:{{rel}} .
-              jq -n --arg c "CVE-2024-{{cve}}" '{"@context": "https://openvex.dev/ns/v0.2.0", "@id": "urn:catalogue-api", "author": "copperleaf-security", "timestamp": "2026-01-01T00:00:00Z",
-                "statements": [{"vulnerability": {"name": $c}, "products": [{"@id": "catalogue-api:{{rel}}"}], "status": "not_affected", "justification": "vulnerable_code_not_in_execute_path"}]}' > ~/catalogue-api.vex.json
-              trivy image --skip-db-update --cache-dir /srv/scan-db --vex ~/catalogue-api.vex.json --format json -o ~/scan-after.json catalogue-api:{{rel}}
+              python3 - <<'PY'
+              import json
+              doc = {"@context": "https://openvex.dev/ns/v0.2.0", "@id": "urn:catalogue-api", "author": "copperleaf-security",
+                     "timestamp": "2026-01-01T00:00:00Z",
+                     "statements": [{"vulnerability": {"name": "CVE-2024-{{cve}}"}, "products": [{"@id": "catalogue-api:{{rel}}"}],
+                                     "status": "not_affected", "justification": "vulnerable_code_not_in_execute_path"}]}
+              json.dump(doc, open("/home/learner/catalogue-api.vex.json", "w"))
+              PY
+              trivy image --vex ~/catalogue-api.vex.json -o ~/scan-after.json catalogue-api:{{rel}}

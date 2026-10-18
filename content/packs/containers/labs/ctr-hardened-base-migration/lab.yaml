@@ -20,7 +20,8 @@ spec:
     signature `/srv/hardened/python-3.13.sbom.json.sig` (verified against
     `/srv/hardened/signing.pub`).
 
-    1. **Verify** the hardened runtime's SBOM signature before using it.
+    1. **Verify** the hardened runtime's SBOM signature before using it, and save the
+       `openssl` output to **`~/sbom-verify.txt`**.
     2. **Rebuild** the subtitle service as a multi-stage image: the **dev** hardened
        image for the build stage, the **plain (non-dev) hardened** image for the final
        stage.
@@ -80,17 +81,19 @@ spec:
             print("subtitle 4.2 ok rev {{rev}}")
         PY
         printf '%s\n' 'FROM python:3.13-alpine' 'COPY selftest.py /app/selftest.py' 'ENTRYPOINT ["python3", "/app/selftest.py"]' > "$s/Dockerfile"
+        rm -f /home/learner/sbom-verify.txt
         chown -R learner:learner "$s"
   checks:
     - id: sbom-verified
-      description: The hardened SBOM's signature was checked against the public key
+      description: The SBOM signature is valid and the learner recorded the verification in ~/sbom-verify.txt
       type: shell
       timeoutSec: 60
       on: cl-subtitle-02
       skills: [containers.supply-chain.hardened-bases]
       weight: 2
       command: |
-        openssl dgst -sha256 -verify /srv/hardened/signing.pub -signature /srv/hardened/python-3.13.sbom.json.sig /srv/hardened/python-3.13.sbom.json >/dev/null 2>&1 && echo verified || echo bad
+        openssl dgst -sha256 -verify /srv/hardened/signing.pub -signature /srv/hardened/python-3.13.sbom.json.sig /srv/hardened/python-3.13.sbom.json >/dev/null 2>&1 || { echo bad; exit 0; }
+        grep -qx 'Verified OK' /home/learner/sbom-verify.txt 2>/dev/null && echo verified || echo not-recorded
       expect: {match: exact, value: verified}
     - id: hardened-base
       description: subtitle:4.2 is built on the hardened runtime image (not the plain python base, not the dev variant)
@@ -100,10 +103,8 @@ spec:
       skills: [containers.supply-chain.hardened-bases]
       weight: 3
       command: |
-        h=$(docker history --no-trunc subtitle:4.2 2>/dev/null | grep -c 'hardened-python 3.13$')
-        d=$(docker history --no-trunc subtitle:4.2 2>/dev/null | grep -c 'hardened-python 3.13-dev')
-        echo "runtime=$h dev-in-final=$d"
-      expect: {match: exact, value: "runtime=1 dev-in-final=0"}
+        docker run --rm --entrypoint cat subtitle:4.2 /etc/hardened-marker 2>/dev/null || echo none
+      expect: {match: exact, value: "hardened-python 3.13"}
     - id: non-root
       description: The final image runs as a non-root user
       type: shell
@@ -166,7 +167,7 @@ spec:
       - on: cl-subtitle-02
         as: learner
         run: |
-          openssl dgst -sha256 -verify /srv/hardened/signing.pub -signature /srv/hardened/python-3.13.sbom.json.sig /srv/hardened/python-3.13.sbom.json
+          openssl dgst -sha256 -verify /srv/hardened/signing.pub -signature /srv/hardened/python-3.13.sbom.json.sig /srv/hardened/python-3.13.sbom.json | tee ~/sbom-verify.txt
           cd ~/subtitle-src
           printf '%s\n' 'FROM registry.copperleaf.example:5000/hardened/python:3.13-dev AS build' 'COPY selftest.py /app/selftest.py' \
             'FROM registry.copperleaf.example:5000/hardened/python:3.13' 'COPY --from=build /app /app' 'RUN adduser -D -u 10020 svc' 'USER svc' \
@@ -180,7 +181,7 @@ spec:
           - on: cl-subtitle-02
             as: learner
             run: |
-              openssl dgst -sha256 -verify /srv/hardened/signing.pub -signature /srv/hardened/python-3.13.sbom.json.sig /srv/hardened/python-3.13.sbom.json
+              openssl dgst -sha256 -verify /srv/hardened/signing.pub -signature /srv/hardened/python-3.13.sbom.json.sig /srv/hardened/python-3.13.sbom.json | tee ~/sbom-verify.txt
               cd ~/subtitle-src
               printf '%s\n' 'FROM registry.copperleaf.example:5000/hardened/python:3.13-dev AS build' 'COPY selftest.py /app/selftest.py' \
                 'FROM registry.copperleaf.example:5000/hardened/python:3.13' 'COPY --from=build /app /app' 'USER 10020' \

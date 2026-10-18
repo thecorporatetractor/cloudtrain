@@ -20,7 +20,9 @@ spec:
     2. Add a verification step with **`cosign verify`** against the public key
        `~/deploy/release.pub`, so the script only deploys a digest whose signature
        verifies.
-    3. Run `~/deploy/release.sh` and confirm it deploys the signed digest.
+    3. Pull by the **digest** you verified (not by the tag, which could move between the
+       verify and the pull), then run `~/deploy/release.sh` as `learner` and confirm it
+       deploys the signed digest.
   objectives:
     - Explain why Docker Content Trust and cosign verification are not interchangeable
     - Replace a retired trust mechanism with explicit signature verification
@@ -104,7 +106,7 @@ spec:
       on: cl-deploy-01
       skills: [containers.supply-chain.signing]
       weight: 2.5
-      command: ~/deploy/release.sh 2>&1 | tail -n 1
+      command: runuser -u learner -- env HOME=/home/learner /home/learner/deploy/release.sh 2>&1 | tail -n 1
       expect: {match: exact, value: "deployed localhost:5000/ad-insertion:3.1"}
   hints:
     - title: Two different mechanisms
@@ -130,7 +132,7 @@ spec:
           export DOCKER_CONTENT_TRUST=1
           d=$(curl -fsSI -H 'Accept: application/vnd.oci.image.manifest.v1+json' http://127.0.0.1:5000/v2/ad-insertion/manifests/3.1 | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}')
           cosign verify --key release.pub --insecure-ignore-tlog=true --allow-insecure-registry "localhost:5000/ad-insertion@$d"
-          docker pull localhost:5000/ad-insertion:3.1
+          docker pull "localhost:5000/ad-insertion@$d"
           echo "deployed localhost:5000/ad-insertion:3.1"
           SH
           chmod 0755 release.sh
@@ -150,7 +152,7 @@ spec:
           cd "$(dirname "$0")"
           d=$(curl -fsSI -H 'Accept: application/vnd.oci.image.manifest.v1+json' http://127.0.0.1:5000/v2/ad-insertion/manifests/3.1 | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}')
           cosign verify --key wrong.pub --insecure-ignore-tlog=true --allow-insecure-registry "localhost:5000/ad-insertion@$d"
-          docker pull localhost:5000/ad-insertion:3.1
+          docker pull "localhost:5000/ad-insertion@$d"
           echo "deployed localhost:5000/ad-insertion:3.1"
           SH
           chmod 0755 release.sh
@@ -170,14 +172,14 @@ spec:
           cd "$(dirname "$0")"
           d=$(curl -fsSI -H 'Accept: application/vnd.oci.image.manifest.v1+json' http://127.0.0.1:5000/v2/ad-insertion/manifests/3.1 | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}')
           cosign verify --key release.pub --insecure-ignore-tlog=true --allow-insecure-registry "localhost:5000/ad-insertion@$d"
-          docker pull localhost:5000/ad-insertion:3.1
+          docker pull "localhost:5000/ad-insertion@$d"
           echo "deployed localhost:5000/ad-insertion:3.1"
           SH
           chmod 0755 release.sh
           ./release.sh
     alternatives:
       - id: verify-by-tag
-        description: Verify against the tag reference instead of resolving the digest first (cosign resolves it internally).
+        description: Resolve the digest with buildx imagetools instead of curl, then verify and pull by that digest.
         steps:
           - on: cl-deploy-01
             as: learner
@@ -187,8 +189,9 @@ spec:
               #!/bin/sh
               set -eu
               cd "$(dirname "$0")"
-              cosign verify --key release.pub --insecure-ignore-tlog=true --allow-insecure-registry localhost:5000/ad-insertion:3.1
-              docker pull localhost:5000/ad-insertion:3.1
+              d=$(docker buildx imagetools inspect localhost:5000/ad-insertion:3.1 --format '{{json .Manifest}}' | jq -r .digest)
+              cosign verify --key release.pub --insecure-ignore-tlog=true --allow-insecure-registry "localhost:5000/ad-insertion@$d"
+              docker pull "localhost:5000/ad-insertion@$d"
               echo "deployed localhost:5000/ad-insertion:3.1"
               SH
               chmod 0755 release.sh

@@ -127,9 +127,11 @@ spec:
       mutation:
         on: cl-encode-01
         as: admin
+        timeoutSec: 120
         run: |
+          usermod -aG docker encoder
           docker load -i /var/lib/cloudtrain-preview.tar >/dev/null
-          sudo -u encoder docker run -d --name preview -p 127.0.0.1:8080:80 copperleaf/preview:1
+          sudo -u encoder docker run -d --name preview -p 127.0.0.1:8080:80 copperleaf/preview:1 || true
     - id: no-linger
       description: Sets up rootless Docker correctly but never enables linger.
       feedback: "Without linger, encoder's user systemd instance (and its rootless dockerd) stops when the last session for that user ends. loginctl enable-linger encoder keeps it running."
@@ -137,10 +139,13 @@ spec:
       mutation:
         on: cl-encode-01
         as: admin
+        timeoutSec: 300
         run: |
           u=$(id -u encoder)
-          sudo -u encoder XDG_RUNTIME_DIR=/run/user/$u dockerd-rootless-setuptool.sh install --skip-iptables -f 2>&1 | tail -5 || true
-          sudo -u encoder XDG_RUNTIME_DIR=/run/user/$u systemctl --user start docker 2>/dev/null || true
+          systemctl start user@"$u".service
+          for i in $(seq 60); do [ -S /run/user/$u/bus ] && break; sleep 1; done
+          sudo -u encoder XDG_RUNTIME_DIR=/run/user/$u DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$u/bus dockerd-rootless-setuptool.sh install --skip-iptables -f 2>&1 | tail -5 || true
+          sudo -u encoder XDG_RUNTIME_DIR=/run/user/$u DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$u/bus systemctl --user start docker 2>/dev/null || true
           sleep 3
           sudo -u encoder XDG_RUNTIME_DIR=/run/user/$u DOCKER_HOST=unix:///run/user/$u/docker.sock docker load -i /var/lib/cloudtrain-preview.tar >/dev/null 2>&1 || true
           sudo -u encoder XDG_RUNTIME_DIR=/run/user/$u DOCKER_HOST=unix:///run/user/$u/docker.sock docker run -d --name preview -p 127.0.0.1:8080:80 copperleaf/preview:1 2>/dev/null || true
@@ -153,26 +158,32 @@ spec:
     steps:
       - on: cl-encode-01
         as: admin
+        timeoutSec: 300
         run: |
           loginctl enable-linger encoder
           u=$(id -u encoder)
-          sudo -u encoder XDG_RUNTIME_DIR=/run/user/$u dockerd-rootless-setuptool.sh install --skip-iptables -f
-          sudo -u encoder XDG_RUNTIME_DIR=/run/user/$u systemctl --user enable --now docker
-          for i in $(seq 30); do sudo -u encoder XDG_RUNTIME_DIR=/run/user/$u DOCKER_HOST=unix:///run/user/$u/docker.sock docker info >/dev/null 2>&1 && break; sleep 2; done
-          sudo -u encoder XDG_RUNTIME_DIR=/run/user/$u DOCKER_HOST=unix:///run/user/$u/docker.sock docker load -i /var/lib/cloudtrain-preview.tar
-          sudo -u encoder XDG_RUNTIME_DIR=/run/user/$u DOCKER_HOST=unix:///run/user/$u/docker.sock docker run -d --name preview -p 127.0.0.1:8080:80 copperleaf/preview:1
+          for i in $(seq 60); do [ -S /run/user/$u/bus ] && break; sleep 1; done
+          E="XDG_RUNTIME_DIR=/run/user/$u DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$u/bus"
+          sudo -u encoder env $E dockerd-rootless-setuptool.sh install --skip-iptables -f
+          sudo -u encoder env $E systemctl --user enable --now docker
+          for i in $(seq 30); do sudo -u encoder env $E DOCKER_HOST=unix:///run/user/$u/docker.sock docker info >/dev/null 2>&1 && break; sleep 2; done
+          sudo -u encoder env $E DOCKER_HOST=unix:///run/user/$u/docker.sock docker load -i /var/lib/cloudtrain-preview.tar
+          sudo -u encoder env $E DOCKER_HOST=unix:///run/user/$u/docker.sock docker run -d --name preview -p 127.0.0.1:8080:80 copperleaf/preview:1
     alternatives:
-      - id: machinectl-shell
-        description: Do the setup from inside an encoder login shell started with machinectl instead of sudo -u.
+      - id: login-shell
+        description: Do the setup from inside one encoder login shell (sudo -iu) instead of prefixing every command.
         steps:
           - on: cl-encode-01
             as: admin
+            timeoutSec: 300
             run: |
               loginctl enable-linger encoder
-              machinectl shell encoder@ /bin/bash -lc '
-                export XDG_RUNTIME_DIR=/run/user/$(id -u)
+              u=$(id -u encoder)
+              for i in $(seq 60); do [ -S /run/user/$u/bus ] && break; sleep 1; done
+              sudo -iu encoder env XDG_RUNTIME_DIR=/run/user/$u DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$u/bus bash -c '
                 dockerd-rootless-setuptool.sh install --skip-iptables -f
                 systemctl --user enable --now docker
+                export DOCKER_HOST=unix:///run/user/$(id -u)/docker.sock
                 for i in $(seq 30); do docker info >/dev/null 2>&1 && break; sleep 2; done
                 docker load -i /var/lib/cloudtrain-preview.tar
                 docker run -d --name preview -p 127.0.0.1:8080:80 copperleaf/preview:1

@@ -21,13 +21,17 @@ spec:
        `application/vnd.copperleaf.captions.layer.v1.tar`), the standard empty config
        (`application/vnd.oci.empty.v1+json`, content `{}`) and a **`subject`** pointing at
        the digest of `catalogue-api:2.3`. The artifact is addressed by its digest.
-    2. Ask the registry for the **referrers** of `catalogue-api:2.3`'s digest and save the
-       response (an OCI image index) to **`~/referrers.json`**.
+    2. This registry (distribution 3) does **not** serve the `/referrers/<digest>` API, so
+       publish the referrers list with the OCI **tag schema** fallback: push an OCI image
+       index whose single entry describes the artifact manifest (digest, size, media type
+       and `artifactType`) under the tag **`sha256-<hex>`** of the image digest (the digest
+       with `:` replaced by `-`). Save that index (as the registry returns it for the tag) to
+       **`~/referrers.json`**.
     3. Do not change `catalogue-api:2.3` itself.
   objectives:
     - Push a non-image artifact with the registry HTTP API
     - Link an artifact to an image through the subject field
-    - List referrers of a digest
+    - Publish and read a referrers list with the tag-schema fallback
   params:
     rev:
       type: int
@@ -72,15 +76,15 @@ spec:
         chown -R learner:learner "$c"
   checks:
     - id: referrer-listed
-      description: The registry's referrers API lists exactly one captions artifact for the image digest
+      description: The referrers tag of the image digest holds an index listing exactly one captions artifact
       type: shell
       timeoutSec: 60
       on: cl-registry-04
       skills: [containers.registry.oci-artifacts]
       weight: 3
       command: |
-        d=$(cat /var/lib/cloudtrain/subject.digest)
-        curl -fsS -H 'Accept: application/vnd.oci.image.index.v1+json' "http://127.0.0.1:5000/v2/catalogue-api/referrers/$d" 2>/dev/null \
+        d=$(cat /var/lib/cloudtrain/subject.digest); t=$(echo "$d" | sed 's/:/-/')
+        curl -fsS -H 'Accept: application/vnd.oci.image.index.v1+json' "http://127.0.0.1:5000/v2/catalogue-api/manifests/$t" 2>/dev/null \
           | jq -r '[.manifests[]? | select(.artifactType == "application/vnd.copperleaf.captions.v1")] | length' || echo none
       expect: {match: exact, value: "1"}
     - id: artifact-content
@@ -91,25 +95,25 @@ spec:
       skills: [containers.registry.oci-artifacts]
       weight: 3
       command: |
-        R=http://127.0.0.1:5000/v2/catalogue-api; d=$(cat /var/lib/cloudtrain/subject.digest)
-        a=$(curl -fsS -H 'Accept: application/vnd.oci.image.index.v1+json' "$R/referrers/$d" 2>/dev/null | jq -r '[.manifests[]? | select(.artifactType == "application/vnd.copperleaf.captions.v1")][0].digest // empty')
+        R=http://127.0.0.1:5000/v2/catalogue-api; d=$(cat /var/lib/cloudtrain/subject.digest); t=$(echo "$d" | sed 's/:/-/')
+        a=$(curl -fsS -H 'Accept: application/vnd.oci.image.index.v1+json' "$R/manifests/$t" 2>/dev/null | jq -r '[.manifests[]? | select(.artifactType == "application/vnd.copperleaf.captions.v1")][0].digest // empty')
         [ -n "$a" ] || { echo no-artifact; exit 0; }
         m=$(curl -fsS -H 'Accept: application/vnd.oci.image.manifest.v1+json' "$R/manifests/$a")
-        mt=$(echo "$m" | jq -r '[.config.mediaType, .layers[0].mediaType, (.layers | length | tostring)] | join(" ")')
+        mt=$(echo "$m" | jq -r --arg d "$d" '[.config.mediaType, .layers[0].mediaType, (.layers | length | tostring), (if .subject.digest == $d then "subject-ok" else "no-subject" end)] | join(" ")')
         l=$(echo "$m" | jq -r '.layers[0].digest')
         body=$(curl -fsS "$R/blobs/$l" | tar -xO 2>/dev/null | head -n 1)
         echo "$mt | $body"
-      expect: {match: exact, value: "application/vnd.oci.empty.v1+json application/vnd.copperleaf.captions.layer.v1.tar 1 | caption style rev {{rev}}"}
+      expect: {match: exact, value: "application/vnd.oci.empty.v1+json application/vnd.copperleaf.captions.layer.v1.tar 1 subject-ok | caption style rev {{rev}}"}
     - id: response-saved
-      description: ~/referrers.json is the referrers index for the image digest
+      description: ~/referrers.json is the referrers index served under the image's tag
       type: shell
       timeoutSec: 60
       on: cl-registry-04
       skills: [containers.registry.oci-artifacts]
       weight: 2
       command: |
-        d=$(cat /var/lib/cloudtrain/subject.digest)
-        live=$(curl -fsS -H 'Accept: application/vnd.oci.image.index.v1+json' "http://127.0.0.1:5000/v2/catalogue-api/referrers/$d" 2>/dev/null | jq -r '[.manifests[]? | .digest] | sort | join(",")')
+        d=$(cat /var/lib/cloudtrain/subject.digest); t=$(echo "$d" | sed 's/:/-/')
+        live=$(curl -fsS -H 'Accept: application/vnd.oci.image.index.v1+json' "http://127.0.0.1:5000/v2/catalogue-api/manifests/$t" 2>/dev/null | jq -r '[.manifests[]? | .digest] | sort | join(",")')
         saved=$(jq -r '[.manifests[]? | .digest] | sort | join(",")' /home/learner/referrers.json 2>/dev/null || echo bad)
         kind=$(jq -r '.mediaType // "none"' /home/learner/referrers.json 2>/dev/null || echo bad)
         if [ -n "$live" ] && [ "$live" = "$saved" ] && [ "$kind" = "application/vnd.oci.image.index.v1+json" ]; then echo saved; else echo "kind=$kind"; fi
@@ -130,10 +134,10 @@ spec:
       body: "An OCI 1.1 manifest with `schemaVersion` 2, `mediaType` `application/vnd.oci.image.manifest.v1+json`, `artifactType`, a `config` descriptor for the empty blob (`{}`, 2 bytes), `layers` with the tar, and `subject` with the media type, digest and size of the image manifest."
       cost: 1
     - title: Uploading blobs
-      body: "`POST /v2/<repo>/blobs/uploads/` returns a `Location`; `PUT` to it with `?digest=sha256:<hex>` (use `&` if the location already has a query string) and the bytes as the body completes a monolithic upload. Do this for the tar and for the 2-byte `{}` config."
+      body: "`POST /v2/<repo>/blobs/uploads/` returns a `Location`; `PUT` to it with `?digest=sha256:<hex>` (use `&` if the location already has a query string), the header `Content-Type: application/octet-stream` and the bytes as the body completes a monolithic upload. Do this for the tar and for the 2-byte `{}` config."
       cost: 2
-    - title: Reading the response
-      body: "`GET /v2/<repo>/referrers/<digest>` with `Accept: application/vnd.oci.image.index.v1+json` returns an index whose manifests are the artifacts that name that digest as their subject."
+    - title: The referrers tag
+      body: "Without a referrers API a client keeps an image index under the tag `sha256-<hex>` (the subject digest with `:` swapped for `-`); its `manifests` list the artifact descriptors, each with an `artifactType`. PUT it with `Content-Type: application/vnd.oci.image.index.v1+json`; read it back with the same media type in `Accept`."
       cost: 1
   misconceptions:
     - id: no-subject
@@ -150,7 +154,7 @@ spec:
             loc=$(curl -fsSi -X POST $R/blobs/uploads/ | tr -d '\r' | awk 'tolower($1)=="location:"{print $2}')
             case "$loc" in http*) ;; *) loc=$H$loc ;; esac
             case "$loc" in *\?*) sep='&' ;; *) sep='?' ;; esac
-            curl -fsS -X PUT --data-binary @"$1" "${loc}${sep}digest=sha256:$(sha256sum "$1" | cut -d' ' -f1)" >/dev/null
+            curl -fsS -X PUT -H 'Content-Type: application/octet-stream' --data-binary @"$1" "${loc}${sep}digest=sha256:$(sha256sum "$1" | cut -d' ' -f1)" >/dev/null
           }
           cd ~/captions; printf '{}' > empty.json; up empty.json; up styles.tar
           jq -n --arg ld "sha256:$(sha256sum styles.tar | cut -d' ' -f1)" --argjson ls "$(stat -c %s styles.tar)" \
@@ -158,12 +162,14 @@ spec:
               config: {mediaType: "application/vnd.oci.empty.v1+json", digest: "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a", size: 2},
               layers: [{mediaType: "application/vnd.copperleaf.captions.layer.v1.tar", digest: $ld, size: $ls}]}' > m.json
           curl -fsS -X PUT -H 'Content-Type: application/vnd.oci.image.manifest.v1+json' --data-binary @m.json "$R/manifests/sha256:$(sha256sum m.json | cut -d' ' -f1)" >/dev/null
-          curl -sS -H 'Accept: application/vnd.oci.image.index.v1+json' "$R/referrers/$(curl -fsSI -H 'Accept: application/vnd.oci.image.manifest.v1+json' $R/manifests/2.3 | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}')" > ~/referrers.json
   solution:
     explanation: |
-      Upload the empty config and the tar as blobs, PUT an artifact manifest by digest
-      that carries `artifactType` and a `subject` for the image manifest, then read the
-      referrers API for the image digest. The registry builds the referrers index itself.
+      Upload the empty config and the tar as blobs (with an explicit octet-stream content
+      type), PUT an artifact manifest by digest that carries `artifactType` and a `subject`
+      for the image manifest, then publish the referrers list the way the OCI distribution
+      spec's tag schema does for registries without the referrers API: an image index listing
+      the artifact descriptor, pushed under the tag `sha256-<hex>`. Read it back to
+      `~/referrers.json`.
     steps:
       - on: cl-registry-04
         as: learner
@@ -176,7 +182,7 @@ spec:
             loc=$(curl -fsSi -X POST $R/blobs/uploads/ | tr -d '\r' | awk 'tolower($1)=="location:"{print $2}')
             case "$loc" in http*) ;; *) loc=$H$loc ;; esac
             case "$loc" in *\?*) sep='&' ;; *) sep='?' ;; esac
-            curl -fsS -X PUT --data-binary @"$1" "${loc}${sep}digest=sha256:$(sha256sum "$1" | cut -d' ' -f1)" >/dev/null
+            curl -fsS -X PUT -H 'Content-Type: application/octet-stream' --data-binary @"$1" "${loc}${sep}digest=sha256:$(sha256sum "$1" | cut -d' ' -f1)" >/dev/null
           }
           cd ~/captions
           printf '{}' > empty.json
@@ -186,8 +192,14 @@ spec:
               config: {mediaType: "application/vnd.oci.empty.v1+json", digest: "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a", size: 2},
               layers: [{mediaType: "application/vnd.copperleaf.captions.layer.v1.tar", digest: $ld, size: $ls}],
               subject: {mediaType: "application/vnd.oci.image.manifest.v1+json", digest: $sd, size: $ssz}}' > m.json
-          curl -fsS -X PUT -H 'Content-Type: application/vnd.oci.image.manifest.v1+json' --data-binary @m.json "$R/manifests/sha256:$(sha256sum m.json | cut -d' ' -f1)"
-          curl -fsS -H 'Accept: application/vnd.oci.image.index.v1+json' "$R/referrers/$sd" > ~/referrers.json
+          md="sha256:$(sha256sum m.json | cut -d' ' -f1)"
+          curl -fsS -X PUT -H 'Content-Type: application/vnd.oci.image.manifest.v1+json' --data-binary @m.json "$R/manifests/$md" >/dev/null
+          jq -n --arg md "$md" --argjson ms "$(stat -c %s m.json)" \
+            '{schemaVersion: 2, mediaType: "application/vnd.oci.image.index.v1+json",
+              manifests: [{mediaType: "application/vnd.oci.image.manifest.v1+json", digest: $md, size: $ms, artifactType: "application/vnd.copperleaf.captions.v1"}]}' > idx.json
+          t=$(echo "$sd" | sed 's/:/-/')
+          curl -fsS -X PUT -H 'Content-Type: application/vnd.oci.image.index.v1+json' --data-binary @idx.json "$R/manifests/$t" >/dev/null
+          curl -fsS -H 'Accept: application/vnd.oci.image.index.v1+json' "$R/manifests/$t" > ~/referrers.json
     alternatives:
       - id: python-client
         description: Do the same with a short Python script using the standard library.
@@ -207,7 +219,7 @@ spec:
                   if not loc.startswith("http"):
                       loc = H + loc
                   dg = "sha256:" + hashlib.sha256(data).hexdigest()
-                  call("PUT", loc + ("&" if "?" in loc else "?") + "digest=" + dg, data)
+                  call("PUT", loc + ("&" if "?" in loc else "?") + "digest=" + dg, data, {"Content-Type": "application/octet-stream"})
                   return dg
               acc = {"Accept": "application/vnd.oci.image.manifest.v1+json"}
               r = call("GET", R + "/manifests/2.3", headers=acc)
@@ -220,7 +232,13 @@ spec:
                    "layers": [{"mediaType": "application/vnd.copperleaf.captions.layer.v1.tar", "digest": ld, "size": len(tar)}],
                    "subject": {"mediaType": "application/vnd.oci.image.manifest.v1+json", "digest": sd, "size": len(body)}}
               mb = json.dumps(m).encode()
-              call("PUT", R + "/manifests/sha256:" + hashlib.sha256(mb).hexdigest(), mb, {"Content-Type": "application/vnd.oci.image.manifest.v1+json"})
-              ref = call("GET", R + "/referrers/" + sd, headers={"Accept": "application/vnd.oci.image.index.v1+json"}).read()
+              md = "sha256:" + hashlib.sha256(mb).hexdigest()
+              call("PUT", R + "/manifests/" + md, mb, {"Content-Type": "application/vnd.oci.image.manifest.v1+json"})
+              idx = {"schemaVersion": 2, "mediaType": "application/vnd.oci.image.index.v1+json",
+                     "manifests": [{"mediaType": "application/vnd.oci.image.manifest.v1+json", "digest": md, "size": len(mb),
+                                    "artifactType": "application/vnd.copperleaf.captions.v1"}]}
+              t = sd.replace(":", "-")
+              call("PUT", R + "/manifests/" + t, json.dumps(idx).encode(), {"Content-Type": "application/vnd.oci.image.index.v1+json"})
+              ref = call("GET", R + "/manifests/" + t, headers={"Accept": "application/vnd.oci.image.index.v1+json"}).read()
               open("/home/learner/referrers.json", "wb").write(ref)
               PY

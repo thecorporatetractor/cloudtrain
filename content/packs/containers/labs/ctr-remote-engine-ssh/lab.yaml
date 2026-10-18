@@ -18,11 +18,12 @@ spec:
     empty `~/.ssh/authorized_keys`.
 
     1. **Close port 2375**: the engine must no longer listen on any TCP socket.
-    2. Generate an SSH key pair on the **workstation**, install the public key into
-       `operator`'s `~/.ssh/authorized_keys` on `cl-batch-02` (you have sudo there as
-       `learner`), then create a docker context named **`cl-batch-02`** on the
-       workstation that reaches the engine over **`ssh://operator@cl-batch-02`** using
-       that key. `docker --context cl-batch-02 info` must succeed from the workstation.
+    2. Setup already generated an SSH key pair for `learner` (`~/.ssh/id_ed25519`). Install
+       the public key into `operator`'s `~/.ssh/authorized_keys` (you have `sudo`), put the
+       identity and host-key settings for `localhost` into `~/.ssh/config`, and create a docker
+       context named **`cl-batch-02`** as `learner` that reaches the engine over
+       **`ssh://operator@localhost`** (the engine is the one on this host, reached the way an
+       operator's laptop would reach it). `docker --context cl-batch-02 info` must succeed.
     3. The engine on `cl-batch-02` must still serve local clients (the `docker` group)
        exactly as before.
   objectives:
@@ -59,6 +60,10 @@ spec:
         chmod 0600 /home/operator/.ssh/authorized_keys
         chown operator:operator /home/operator/.ssh/authorized_keys
         install -d /var/lib/cloudtrain
+        install -d -m 0700 -o learner -g learner /home/learner/.ssh
+        rm -f /home/learner/.ssh/config
+        runuser -u learner -- docker context rm -f cl-batch-02 >/dev/null 2>&1 || true
+        [ -f /home/learner/.ssh/id_ed25519 ] || runuser -u learner -- ssh-keygen -q -t ed25519 -N '' -f /home/learner/.ssh/id_ed25519
         mkdir -p /etc/systemd/system/docker.service.d
         cat > /etc/systemd/system/docker.service.d/listen.conf <<'UNIT'
         [Service]
@@ -89,19 +94,18 @@ spec:
       command: runuser -u learner -- docker info --format json 2>/dev/null | jq -r '.ServerVersion // "down"' | grep -qE '^[0-9]' && echo up || echo down
       expect: {match: exact, value: up}
     - id: ssh-context-works
-      description: The workstation's cl-batch-02 context reaches the remote engine over SSH
+      description: learner's cl-batch-02 context points at ssh://operator@localhost and reaches the engine
       type: shell
       timeoutSec: 90
-      on: workstation
+      on: cl-batch-02
       skills: [containers.runtime-security.daemon-socket, containers.operations.daemon-config]
       weight: 3
       command: |
-        f=/root/.ssh/batch_operator
-        [ -f "$f" ] || { echo unreachable; exit 0; }
-        docker context rm -f cl-batch-02 >/dev/null 2>&1 || true
-        docker context create cl-batch-02 --docker "host=ssh://operator@cl-batch-02?IdentityFile=$f&StrictHostKeyChecking=no" >/dev/null 2>&1
-        docker --context cl-batch-02 info --format json 2>/dev/null | jq -r '.ServerVersion // "none"' | grep -qE '^[0-9]' && echo reachable || echo unreachable
-      expect: {match: exact, value: reachable}
+        h=$(runuser -u learner -- env HOME=/home/learner docker context inspect cl-batch-02 --format json 2>/dev/null | jq -r '.[0].Endpoints.docker.Host // "none"')
+        v=$(runuser -u learner -- env HOME=/home/learner docker --context cl-batch-02 info --format json 2>/dev/null | jq -r '.ServerVersion // "none"')
+        case "$v" in [0-9]*) r=reachable ;; *) r=unreachable ;; esac
+        echo "$h $r"
+      expect: {match: exact, value: "ssh://operator@localhost reachable"}
     - id: drop-in-not-overwrite
       description: The engine unit was changed with a drop-in, not by replacing docker.service
       type: shell
@@ -122,7 +126,7 @@ spec:
       body: "A context's host can be `ssh://user@host`; docker opens an SSH connection and runs a remote helper, no TCP listener needed on the far side."
       cost: 1
     - title: Key and host checking
-      body: "Point IdentityFile at the private key and, since this is a lab VM with no known_hosts entry yet, set StrictHostKeyChecking=no on the context (or accept the host key once with a plain ssh command first)."
+      body: "The docker CLI runs the plain `ssh` client, so settings go in `~/.ssh/config` (not in the context URL): a `Host localhost` block with `IdentityFile`, and `StrictHostKeyChecking no` (or accept the host key once with `ssh-keyscan localhost >> ~/.ssh/known_hosts`). Append the public key to `/home/operator/.ssh/authorized_keys` with `sudo tee -a`."
       cost: 1
   misconceptions:
     - id: stopped-but-reopens
@@ -156,17 +160,17 @@ spec:
       feedback: "A plain tcp:// context does nothing for security: it is the same unauthenticated port the task asks you to close. Use an ssh:// context."
       expectFail: [port-closed, ssh-context-works]
       mutation:
-        on: workstation
+        on: cl-batch-02
         as: learner
         run: |
           docker context rm -f cl-batch-02 >/dev/null 2>&1 || true
-          docker context create cl-batch-02 --docker "host=tcp://cl-batch-02:2375" >/dev/null 2>&1
-          sudo ssh-keygen -t ed25519 -N '' -f /root/.ssh/batch_operator -q <<< y >/dev/null 2>&1 || true
+          docker context create cl-batch-02 --docker "host=tcp://localhost:2375" >/dev/null
   solution:
     explanation: |
       A systemd drop-in rewrites dockerd's ExecStart without the TCP listener, closing
       2375 while keeping the Unix socket for local clients. The workstation reaches the
-      engine instead through an SSH-backed docker context using the operator key.
+      engine instead through an SSH-backed docker context (ssh://operator@localhost) using a key
+      installed for the operator account, with the ssh client settings in ~/.ssh/config.
     steps:
       - on: cl-batch-02
         as: admin
@@ -180,13 +184,14 @@ spec:
           systemctl daemon-reload
           systemctl restart docker
           for i in $(seq 60); do docker info >/dev/null 2>&1 && break; sleep 2; done
-      - on: workstation
+      - on: cl-batch-02
         as: learner
         run: |
-          sudo ssh-keygen -t ed25519 -N '' -f /root/.ssh/batch_operator -q
-          ssh -o StrictHostKeyChecking=no cl-batch-02 "sudo tee -a /home/operator/.ssh/authorized_keys >/dev/null" <<< "$(sudo cat /root/.ssh/batch_operator.pub)"
-          docker context create cl-batch-02 --docker "host=ssh://operator@cl-batch-02?IdentityFile=/root/.ssh/batch_operator&StrictHostKeyChecking=no"
-          docker --context cl-batch-02 info
+          sudo tee -a /home/operator/.ssh/authorized_keys < ~/.ssh/id_ed25519.pub >/dev/null
+          printf '%s\n' 'Host localhost' '  IdentityFile ~/.ssh/id_ed25519' '  IdentitiesOnly yes' '  StrictHostKeyChecking no' '  UserKnownHostsFile /dev/null' '  LogLevel ERROR' >> ~/.ssh/config
+          chmod 600 ~/.ssh/config
+          docker context create cl-batch-02 --docker host=ssh://operator@localhost
+          docker --context cl-batch-02 info >/dev/null
     alternatives:
       - id: use-context
         description: Create the context then switch to it with `docker context use` instead of passing --context each time.
@@ -199,11 +204,13 @@ spec:
               systemctl daemon-reload
               systemctl restart docker
               for i in $(seq 60); do docker info >/dev/null 2>&1 && break; sleep 2; done
-          - on: workstation
+          - on: cl-batch-02
             as: learner
             run: |
-              sudo ssh-keygen -t ed25519 -N '' -f /root/.ssh/batch_operator -q
-              ssh -o StrictHostKeyChecking=no cl-batch-02 "sudo tee -a /home/operator/.ssh/authorized_keys >/dev/null" <<< "$(sudo cat /root/.ssh/batch_operator.pub)"
-              docker context create cl-batch-02 --docker "host=ssh://operator@cl-batch-02?IdentityFile=/root/.ssh/batch_operator&StrictHostKeyChecking=no"
+              sudo sh -c 'cat /home/learner/.ssh/id_ed25519.pub >> /home/operator/.ssh/authorized_keys'
+              ssh-keyscan -H localhost >> ~/.ssh/known_hosts 2>/dev/null
+              printf '%s\n' 'Host localhost' '  IdentityFile ~/.ssh/id_ed25519' >> ~/.ssh/config
+              chmod 600 ~/.ssh/config
+              docker context create cl-batch-02 --docker host=ssh://operator@localhost
               docker context use cl-batch-02
-              docker info
+              docker info >/dev/null

@@ -51,7 +51,7 @@ spec:
         usermod -aG docker learner
         for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
         grep -q ' registry.quillmoor.example' /etc/hosts || echo '127.0.0.1 registry.quillmoor.example' >> /etc/hosts
-        r=/srv/exam/registry; mkdir -p "$r/certs"
+        r=/srv/exam/registry; mkdir -p "$r/certs" "$r/data"
         if [ ! -f "$r/certs/server.crt" ]; then
           cd "$r/certs"
           openssl req -x509 -newkey rsa:2048 -nodes -keyout ca.key -out ca.crt -days 30 -subj "/CN=Quillmoor exam CA" 2>/dev/null
@@ -61,8 +61,9 @@ spec:
           chmod 0644 server.key; rm -f server.csr ext.cnf ca.srl ca.key
         fi
         install -D -m 0644 "$r/certs/ca.crt" /etc/docker/certs.d/registry.quillmoor.example:5443/ca.crt
-        docker inspect qm-exam-registry >/dev/null 2>&1 || docker run -d --name qm-exam-registry --restart always -p 5443:5443 -v "$r/certs:/certs:ro" \
+        docker inspect qm-exam-registry >/dev/null 2>&1 || docker run -d --name qm-exam-registry --restart always -p 5443:5443 -v "$r/certs:/certs:ro" -v "$r/data:/var/lib/registry" \
           -e REGISTRY_HTTP_ADDR=0.0.0.0:5443 -e REGISTRY_HTTP_TLS_CERTIFICATE=/certs/server.crt -e REGISTRY_HTTP_TLS_KEY=/certs/server.key registry:3 >/dev/null
+        docker start qm-exam-registry >/dev/null 2>&1 || true
         for i in $(seq 30); do curl -fs --cacert "$r/certs/ca.crt" https://registry.quillmoor.example:5443/v2/ >/dev/null && break; sleep 1; done
         s=/home/learner/exam/label-printer
         rm -rf "$s"; install -d -o learner -g learner /home/learner/exam "$s"
@@ -139,6 +140,7 @@ spec:
     steps:
       - on: qm-docker-1
         as: learner
+        timeoutSec: 300
         run: |
           cd ~/exam/label-printer
           cat > Dockerfile <<'DF'
@@ -155,6 +157,7 @@ spec:
         steps:
           - on: qm-docker-1
             as: learner
+            timeoutSec: 300
             run: |
               cd ~/exam/label-printer
               cat > Dockerfile <<'DF'
@@ -176,6 +179,7 @@ spec:
       mutation:
         on: qm-docker-1
         as: learner
+        timeoutSec: 300
         run: |
           cd ~/exam/label-printer
           printf '%s\n' 'FROM alpine:3.22' 'COPY printer.sh /printer.sh' 'ENTRYPOINT /printer.sh' > Dockerfile
@@ -189,6 +193,7 @@ spec:
       mutation:
         on: qm-docker-1
         as: learner
+        timeoutSec: 300
         run: |
           cd ~/exam/label-printer
           printf '%s\n' 'FROM alpine:3.22' 'COPY toolchain.sh /tmp/toolchain.sh' 'RUN sh /tmp/toolchain.sh' 'RUN rm -rf /opt/qm-toolchain' \
