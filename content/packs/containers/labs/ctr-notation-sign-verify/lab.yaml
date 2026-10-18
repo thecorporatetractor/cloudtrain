@@ -63,7 +63,7 @@ spec:
         s=/home/learner/notation-setup
         rm -rf "$s" /home/learner/.config/notation; install -d -o learner -g learner "$s"
         for n in copperleaf other; do
-          openssl req -x509 -newkey rsa:2048 -nodes -keyout "$s/${n}-ca.key" -out "$s/${n}-ca.crt" -days 30 -subj "/CN=${n} test CA" 2>/dev/null
+          openssl req -x509 -newkey rsa:2048 -nodes -keyout "$s/${n}-ca.key" -out "$s/${n}-ca.crt" -days 30 -subj "/C=US/ST=CA/O=${n}/CN=${n} test CA" -addext basicConstraints=critical,CA:TRUE -addext keyUsage=critical,keyCertSign,cRLSign 2>/dev/null
         done
         printf '%s\n' 'basicConstraints=CA:FALSE' 'keyUsage=critical,digitalSignature' 'extendedKeyUsage=codeSigning' > "$s/leaf.ext"
         d=$(mktemp -d)
@@ -76,7 +76,7 @@ spec:
         rm -rf "$d"
         if command -v notation >/dev/null 2>&1; then
           cd "$s"
-          openssl req -new -newkey rsa:2048 -nodes -keyout other-leaf.key -out other-leaf.csr -subj "/CN=other source signer" 2>/dev/null
+          openssl req -new -newkey rsa:2048 -nodes -keyout other-leaf.key -out other-leaf.csr -subj "/C=US/ST=CA/O=other/CN=other source signer" 2>/dev/null
           openssl x509 -req -in other-leaf.csr -CA other-ca.crt -CAkey other-ca.key -CAcreateserial -out other-leaf.crt -days 7 -extfile leaf.ext 2>/dev/null
           cat other-leaf.crt other-ca.crt > other-chain.crt
           chown -R learner:learner "$s"
@@ -169,7 +169,7 @@ spec:
         timeoutSec: 180
         run: |
           cd ~/notation-setup
-          openssl req -new -newkey rsa:2048 -nodes -keyout leaf.key -out leaf.csr -subj "/CN=copperleaf release signer" 2>/dev/null
+          openssl req -new -newkey rsa:2048 -nodes -keyout leaf.key -out leaf.csr -subj "/C=US/ST=CA/O=copperleaf/CN=copperleaf release signer" 2>/dev/null
           openssl x509 -req -in leaf.csr -CA copperleaf-ca.crt -CAkey copperleaf-ca.key -CAcreateserial -out leaf.crt -days 7 -extfile leaf.ext 2>/dev/null
           cat leaf.crt copperleaf-ca.crt > chain.crt
           notation key add copperleaf-release leaf.key chain.crt
@@ -182,7 +182,7 @@ spec:
           notation verify --insecure-registry localhost:5000/other-source:1.0 || true
     alternatives:
       - id: strict-trusted-identity
-        description: Narrow trustedIdentities to the CA's subject and use explicit repository scopes instead of a wildcard.
+        description: Narrow trustedIdentities to the signing certificate's subject and use explicit repository scopes instead of a wildcard.
         steps:
           - on: cl-subtitle-04
             as: learner
@@ -190,9 +190,9 @@ spec:
             run: |
               cd ~/notation-setup
               notation cert add -t ca -s copperleaf copperleaf-ca.crt
-              jq -n '{"version": "1.0", "trustPolicies": [{"name": "copperleaf", "registryScopes": ["localhost:5000/subtitle", "localhost:5000/other-source"], "signatureVerification": {"level": "strict"}, "trustStores": ["ca:copperleaf"], "trustedIdentities": ["x509.subject: CN=copperleaf test CA"]}]}' > trustpolicy.json
+              jq -n '{"version": "1.0", "trustPolicies": [{"name": "copperleaf", "registryScopes": ["localhost:5000/subtitle", "localhost:5000/other-source"], "signatureVerification": {"level": "strict"}, "trustStores": ["ca:copperleaf"], "trustedIdentities": ["x509.subject: C=US,ST=CA,O=copperleaf,CN=copperleaf release signer"]}]}' > trustpolicy.json
               notation policy import --force trustpolicy.json
-              openssl req -new -newkey rsa:2048 -nodes -keyout leaf.key -out leaf.csr -subj "/CN=copperleaf release signer" 2>/dev/null
+              openssl req -new -newkey rsa:2048 -nodes -keyout leaf.key -out leaf.csr -subj "/C=US/ST=CA/O=copperleaf/CN=copperleaf release signer" 2>/dev/null
               openssl x509 -req -in leaf.csr -CA copperleaf-ca.crt -CAkey copperleaf-ca.key -CAcreateserial -out leaf.crt -days 7 -extfile leaf.ext 2>/dev/null
               cat leaf.crt copperleaf-ca.crt > chain.crt
               notation key add copperleaf-release leaf.key chain.crt
