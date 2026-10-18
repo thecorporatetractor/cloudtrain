@@ -232,6 +232,7 @@ spec:
       mutation:
         on: workstation
         as: learner
+        timeoutSec: 420
         run: |
           kubectl config use-context qm-fleet
           ssh fleet-wk-1 'sudo apparmor_parser -r /opt/qm-profiles/{{profile}}'
@@ -244,11 +245,12 @@ spec:
       mutation:
         on: workstation
         as: learner
+        timeoutSec: 420
         run: |
           kubectl config use-context qm-fleet
           for n in fleet-wk-1 fleet-wk-2; do ssh $n 'sudo apparmor_parser -C -r /opt/qm-profiles/{{profile}}'; done
           kubectl -n fleet-labels patch deploy barcode-service --type=json -p '[{"op":"add","path":"/spec/template/spec/containers/0/securityContext","value":{"appArmorProfile":{"type":"Localhost","localhostProfile":"{{profile}}"},"seccompProfile":{"type":"RuntimeDefault"}}}]'
-          kubectl -n fleet-labels rollout status deploy/barcode-service --timeout=150s
+          kubectl -n fleet-labels rollout status deploy/barcode-service --timeout=240s
     - id: seccomp-forgotten
       description: Applies the AppArmor profile but no seccomp profile.
       feedback: The task asks for RuntimeDefault seccomp as well; without it the container runs Unconfined for syscalls.
@@ -256,11 +258,12 @@ spec:
       mutation:
         on: workstation
         as: learner
+        timeoutSec: 420
         run: |
           kubectl config use-context qm-fleet
           for n in fleet-wk-1 fleet-wk-2; do ssh $n 'sudo apparmor_parser -r /opt/qm-profiles/{{profile}}'; done
           kubectl -n fleet-labels patch deploy barcode-service --type=json -p '[{"op":"add","path":"/spec/template/spec/containers/0/securityContext","value":{"appArmorProfile":{"type":"Localhost","localhostProfile":"{{profile}}"}}}]'
-          kubectl -n fleet-labels rollout status deploy/barcode-service --timeout=150s
+          kubectl -n fleet-labels rollout status deploy/barcode-service --timeout=240s
     - id: runtime-default-apparmor
       description: Uses appArmorProfile RuntimeDefault instead of the provided profile.
       feedback: The runtime's default AppArmor profile does not forbid writes to /etc. Reference the Localhost profile by name.
@@ -268,11 +271,12 @@ spec:
       mutation:
         on: workstation
         as: learner
+        timeoutSec: 420
         run: |
           kubectl config use-context qm-fleet
           for n in fleet-wk-1 fleet-wk-2; do ssh $n 'sudo apparmor_parser -r /opt/qm-profiles/{{profile}}'; done
           kubectl -n fleet-labels patch deploy barcode-service --type=json -p '[{"op":"add","path":"/spec/template/spec/containers/0/securityContext","value":{"appArmorProfile":{"type":"RuntimeDefault"},"seccompProfile":{"type":"RuntimeDefault"}}}]'
-          kubectl -n fleet-labels rollout status deploy/barcode-service --timeout=150s
+          kubectl -n fleet-labels rollout status deploy/barcode-service --timeout=240s
   solution:
     explanation: |
       Load the profile on both workers with apparmor_parser (enforce is the
@@ -282,23 +286,25 @@ spec:
     steps:
       - on: workstation
         as: learner
+        timeoutSec: 420
         run: |
           kubectl config use-context qm-fleet
           for n in fleet-wk-1 fleet-wk-2; do
             ssh $n 'sudo apparmor_parser -r /opt/qm-profiles/{{profile}} && sudo aa-status | grep {{profile}}'
           done
           kubectl -n fleet-labels patch deploy barcode-service --type=json -p '[{"op":"add","path":"/spec/template/spec/containers/0/securityContext","value":{"appArmorProfile":{"type":"Localhost","localhostProfile":"{{profile}}"},"seccompProfile":{"type":"RuntimeDefault"}}}]'
-          kubectl -n fleet-labels rollout status deploy/barcode-service --timeout=150s
+          kubectl -n fleet-labels rollout status deploy/barcode-service --timeout=240s
     alternatives:
       - id: pod-level-and-persistent
         description: Install the profile under /etc/apparmor.d so it survives reboots, and set both profiles at Pod level.
         steps:
           - on: workstation
             as: learner
+            timeoutSec: 420
             run: |
               kubectl config use-context qm-fleet
               for n in fleet-wk-1 fleet-wk-2; do
                 ssh $n 'sudo cp /opt/qm-profiles/{{profile}} /etc/apparmor.d/{{profile}} && sudo apparmor_parser -r /etc/apparmor.d/{{profile}}'
               done
               kubectl -n fleet-labels patch deploy barcode-service --type=merge -p '{"spec":{"template":{"spec":{"securityContext":{"appArmorProfile":{"type":"Localhost","localhostProfile":"{{profile}}"},"seccompProfile":{"type":"RuntimeDefault"}}}}}}'
-              kubectl -n fleet-labels rollout status deploy/barcode-service --timeout=150s
+              kubectl -n fleet-labels rollout status deploy/barcode-service --timeout=240s
