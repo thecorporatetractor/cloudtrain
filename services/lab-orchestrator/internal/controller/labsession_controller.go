@@ -95,7 +95,8 @@ type LabSessionReconciler struct {
 	// once the other nodes' access material exists.
 	Session drivers.SessionProvisioner
 	// Reader, when set, is an uncached reader (mgr.GetAPIReader()) used to
-	// find a claimant's pooled session without cache lag.
+	// find a claimant's pooled session and to confirm a grading request
+	// without cache lag.
 	Reader client.Reader
 	// Metrics, when set, counts warm pool claims.
 	Metrics *PoolMetrics
@@ -528,7 +529,7 @@ func (r *LabSessionReconciler) reconcileNodes(ctx context.Context, s *labsv1.Lab
 		r.event(s, "Normal", ReasonReady, "lab session is ready")
 	}
 	r.setCondition(s, labsv1.ConditionReady, metav1.ConditionTrue, ReasonReady, "lab session is ready")
-	if gradingRequested(s) {
+	if gradingRequested(s) && r.gradingStillRequested(ctx, s) {
 		if err := r.grade(ctx, s, tpl, save); err != nil {
 			return ctrl.Result{}, err
 		}
