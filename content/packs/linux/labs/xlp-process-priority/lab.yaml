@@ -1,0 +1,140 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xlp-process-priority
+  title: Renice a running process tree
+  domain: linux
+  frameworks: [linuxplus:services-users]
+  difficulty: easy
+  estimatedMinutes: 3
+  tags: [exam, processes, nice, renice]
+  version: 1
+spec:
+  description: |
+    **Host:** `tr-lp-01` (a shell is open on it)
+
+    The batch runner **`{{svc}}`** (a parent process with three worker children, started
+    by you; its pid is in `/run/{{svc}}/pid`) is hogging the CPU. Without stopping or
+    restarting anything, lower the priority of the parent **and all its workers** to a
+    niceness of **{{nice}}**.
+
+    Another job of yours, `tr-reports`, runs next to it; leave its priority alone.
+  objectives:
+    - Find a process and its children
+    - Change the niceness of running processes with renice
+  params:
+    svc:
+      type: choice
+      values: [tr-batch, tr-reporter]
+    nice:
+      type: choice
+      values: ["10", "15"]
+  topology:
+    entry: tr-lp-01
+    nodes:
+      - name: tr-lp-01
+        driver: container
+        image: deb-lab:24.04
+        access: [shell]
+  setup:
+    - on: tr-lp-01
+      timeoutSec: 60
+      run: |
+        set -eu
+        V=/var/lib/cloudtrain; install -d -m 0700 $V
+        pkill -u learner -f '/usr/local/bin/tr-(batch|reporter|reports)\.sh' 2>/dev/null || true
+        pkill -u learner -x sleep 2>/dev/null || true
+        sleep 1
+        cat > /usr/local/bin/tr-batch.sh <<'EOT'
+        #!/bin/bash
+        # batch runner: a parent with three workers
+        mkdir -p /run/$1; echo $$ > /run/$1/pid
+        for i in 1 2 3; do sleep 100000 & done
+        wait
+        EOT
+        cat > /usr/local/bin/tr-reports.sh <<'EOT'
+        #!/bin/bash
+        mkdir -p /run/tr-reports; echo $$ > /run/tr-reports/pid
+        sleep 100000 &
+        wait
+        EOT
+        chmod 0755 /usr/local/bin/tr-batch.sh /usr/local/bin/tr-reports.sh
+        rm -rf /run/tr-batch /run/tr-reporter /run/tr-reports
+        mkdir -p /run/{{svc}} /run/tr-reports; chown learner:learner /run/{{svc}} /run/tr-reports
+        setsid -f setpriv --reuid=learner --regid=learner --init-groups /usr/local/bin/tr-batch.sh {{svc}} </dev/null >/dev/null 2>&1
+        setsid -f setpriv --reuid=learner --regid=learner --init-groups /usr/local/bin/tr-reports.sh </dev/null >/dev/null 2>&1
+        for i in $(seq 20); do [ -s /run/{{svc}}/pid ] && [ -s /run/tr-reports/pid ] && [ "$(pgrep -P "$(cat /run/{{svc}}/pid)" | wc -l)" = 3 ] && break; sleep 0.5; done
+        p=$(cat /run/{{svc}}/pid)
+        { echo $p; pgrep -P $p | sort -n; } | paste -sd' ' > $V/xlp-prio.pids
+        r=$(cat /run/tr-reports/pid); { echo $r; pgrep -P $r; } | paste -sd' ' > $V/xlp-prio.decoy
+        [ "$(wc -w < $V/xlp-prio.pids)" = 4 ]
+  checks:
+    - id: tree
+      description: The parent and its three workers have niceness {{nice}}
+      type: shell
+      on: tr-lp-01
+      skills: [linux.processes.management]
+      weight: 2
+      command: |
+        out=""
+        for p in $(cat /var/lib/cloudtrain/xlp-prio.pids); do
+          n=$(ps -o ni= -p $p 2>/dev/null | tr -d ' '); out="$out${out:+,}${n:-gone}"
+        done
+        echo "$out"
+      expect: {match: exact, value: "{{nice}},{{nice}},{{nice}},{{nice}}"}
+    - id: same-processes
+      description: The same processes are still running (nothing was restarted)
+      type: shell
+      on: tr-lp-01
+      skills: [linux.processes.management]
+      weight: 1
+      command: |
+        p=$(cut -d' ' -f1 /var/lib/cloudtrain/xlp-prio.pids)
+        now=$({ echo $p; pgrep -P $p | sort -n; } | paste -sd' ')
+        [ "$now" = "$(cat /var/lib/cloudtrain/xlp-prio.pids)" ] && echo same || echo changed
+      expect: {match: exact, value: same}
+    - id: decoy-untouched
+      description: tr-reports still has niceness 0
+      type: shell
+      on: tr-lp-01
+      skills: [linux.processes.management]
+      weight: 1
+      command: |
+        out=""
+        for p in $(cat /var/lib/cloudtrain/xlp-prio.decoy); do n=$(ps -o ni= -p $p 2>/dev/null | tr -d ' '); out="$out${out:+,}${n:-gone}"; done
+        echo "$out"
+      expect: {match: exact, value: "0,0"}
+  misconceptions:
+    - id: parent-only
+      description: Renices only the parent, so the workers keep their priority.
+      feedback: "A child keeps the niceness it was started with; renice the workers too (pgrep -P PARENT lists them), or renice the whole process group with -g."
+      expectFail: [tree]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        run: renice -n {{nice}} -p $(cat /run/{{svc}}/pid)
+    - id: every-sleep
+      description: Renices every sleep process, including the unrelated job.
+      feedback: "Select the right processes by parent (pgrep -P) or process group instead of by name; the other job was not part of the task."
+      expectFail: [decoy-untouched]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        run: |
+          renice -n {{nice}} -p $(cat /run/{{svc}}/pid) $(pgrep -u learner -x sleep) >/dev/null
+  solution:
+    explanation: pgrep -P lists the children of the parent pid from the pid file; renice -n takes several pids at once (or -g takes the whole process group, which here is the parent's pid).
+    steps:
+      - on: tr-lp-01
+        as: learner
+        run: |
+          p=$(cat /run/{{svc}}/pid)
+          renice -n {{nice}} -p $p $(pgrep -P $p)
+          ps -o pid,ni,args -p $p,$(pgrep -P $p | paste -sd,)
+    alternatives:
+      - id: process-group
+        description: Renice the whole process group.
+        steps:
+          - on: tr-lp-01
+            as: learner
+            run: renice -n {{nice}} -g $(cat /run/{{svc}}/pid)

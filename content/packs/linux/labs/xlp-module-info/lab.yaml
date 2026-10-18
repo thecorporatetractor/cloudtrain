@@ -1,0 +1,126 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xlp-module-info
+  title: Report and load a kernel module
+  domain: linux
+  frameworks: [linuxplus:system-management]
+  difficulty: easy
+  estimatedMinutes: 4
+  tags: [exam, kernel, modules, modinfo]
+  version: 1
+spec:
+  description: |
+    **Host:** `tr-lp-01` (`ssh tr-lp-01`, then `sudo -i`)
+
+    1. Load the kernel module **`{{mod}}`** now.
+    2. Write a report to **`/home/learner/module-report.txt`** with exactly these
+       three lines:
+
+       ```
+       module={{mod}}
+       vermagic=<the kernel release the module was built for: the first word of its vermagic>
+       params=<the module's parameter names, sorted, separated by commas, no types or descriptions>
+       ```
+  objectives:
+    - Load a kernel module with modprobe
+    - Read module metadata with modinfo
+  params:
+    mod:
+      type: choice
+      values: [brd, dummy]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-lp-01
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["1Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-lp-01
+      run: |
+        set -eu
+        modinfo {{mod}} >/dev/null
+        modprobe -r brd 2>/dev/null || true
+        modprobe -r dummy 2>/dev/null || true
+        rm -f /home/learner/module-report.txt
+        ! grep -q '^{{mod}} ' /proc/modules
+  checks:
+    - id: loaded
+      description: The module is loaded
+      type: shell
+      on: tr-lp-01
+      skills: [linux.kernel.modules]
+      weight: 1
+      command: grep -q '^{{mod}} ' /proc/modules && echo loaded || echo not-loaded
+      expect: {match: exact, value: loaded}
+    - id: report-version
+      description: The report names the module and its vermagic release
+      type: shell
+      on: tr-lp-01
+      skills: [linux.kernel.modules]
+      weight: 1.5
+      command: |
+        f=/home/learner/module-report.txt
+        want="module={{mod}}
+        vermagic=$(modinfo -F vermagic {{mod}} | cut -d' ' -f1)"
+        got=$(sed -n '1,2p' $f 2>/dev/null)
+        [ "$got" = "$want" ] && echo correct || echo "got=$(echo $got)"
+      expect: {match: exact, value: correct}
+    - id: report-params
+      description: The report lists the parameter names, sorted
+      type: shell
+      on: tr-lp-01
+      skills: [linux.kernel.modules]
+      weight: 1.5
+      command: |
+        want="params=$(modinfo -F parm {{mod}} | cut -d: -f1 | sort | paste -sd,)"
+        got=$(sed -n '3p' /home/learner/module-report.txt 2>/dev/null)
+        [ "$got" = "$want" ] && echo correct || echo "got=$got"
+      expect: {match: exact, value: correct}
+  misconceptions:
+    - id: report-only
+      description: Writes the report from modinfo but never loads the module.
+      feedback: "modinfo only reads the module file; modprobe {{mod}} loads it, and /proc/modules (lsmod) confirms."
+      expectFail: [loaded]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        run: |
+          { echo "module={{mod}}"; echo "vermagic=$(modinfo -F vermagic {{mod}} | cut -d' ' -f1)"; echo "params=$(modinfo -F parm {{mod}} | cut -d: -f1 | sort | paste -sd,)"; } > /home/learner/module-report.txt
+    - id: srcversion
+      description: Reports the srcversion hash instead of the vermagic release.
+      feedback: "srcversion is a checksum of the module source; the kernel release it was built for is the first word of the vermagic field."
+      expectFail: [report-version]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        run: |
+          sudo modprobe {{mod}}
+          { echo "module={{mod}}"; echo "vermagic=$(modinfo -F srcversion {{mod}})"; echo "params=$(modinfo -F parm {{mod}} | cut -d: -f1 | sort | paste -sd,)"; } > /home/learner/module-report.txt
+  solution:
+    explanation: modprobe loads the module; modinfo -F prints single fields (vermagic, parm) that cut and sort turn into the requested lines.
+    steps:
+      - on: tr-lp-01
+        as: learner
+        run: |
+          set -e
+          sudo modprobe {{mod}}
+          { echo "module={{mod}}"; echo "vermagic=$(modinfo -F vermagic {{mod}} | cut -d' ' -f1)"; echo "params=$(modinfo -F parm {{mod}} | cut -d: -f1 | sort | paste -sd,)"; } > /home/learner/module-report.txt
+    alternatives:
+      - id: awk-parse
+        description: Parse the full modinfo output with awk.
+        steps:
+          - on: tr-lp-01
+            as: learner
+            run: |
+              set -e
+              sudo modprobe {{mod}}
+              v=$(modinfo {{mod}} | awk '$1 == "vermagic:" {print $2}')
+              p=$(modinfo {{mod}} | awk '$1 == "parm:" {split($2, a, ":"); print a[1]}' | sort | paste -sd,)
+              printf 'module={{mod}}\nvermagic=%s\nparams=%s\n' "$v" "$p" > /home/learner/module-report.txt

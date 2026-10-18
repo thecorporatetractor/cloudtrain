@@ -1,0 +1,133 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xlp-at-job
+  title: Schedule a one-off job
+  domain: linux
+  frameworks: [linuxplus:services-users]
+  difficulty: easy
+  estimatedMinutes: 3
+  tags: [exam, at, atd, scheduling]
+  version: 1
+spec:
+  description: |
+    **Host:** `tr-lp-01` (a shell is open on it; you have `sudo`)
+
+    Schedule **one** run of the command
+
+    ```
+    {{cmd}}
+    ```
+
+    as the user **`{{u}}`**, at **{{time}}** (the next time the clock reaches it). Use the
+    `at` service, not cron. The `atd` daemon is already running; jobs that other users
+    have queued must stay queued.
+  objectives:
+    - Queue a one-off job with at, as another user
+    - Inspect the queue with atq and at -c
+  params:
+    u:
+      type: choice
+      values: [tr-ops, tr-pis]
+    time:
+      type: choice
+      values: ["23:15", "23:45", "04:30"]
+    cmd:
+      type: choice
+      values: ["/usr/local/bin/tr-export-fares --full", "/usr/local/bin/tr-refresh-board --all"]
+  topology:
+    entry: tr-lp-01
+    nodes:
+      - name: tr-lp-01
+        driver: container
+        image: el-lab:10
+        access: [shell]
+        learnerSudo: true
+  setup:
+    - on: tr-lp-01
+      timeoutSec: 240
+      run: |
+        set -eu
+        echo 'learner ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/learner && chmod 0440 /etc/sudoers.d/learner
+        rpm -q at >/dev/null 2>&1 || dnf -y -q install at >/dev/null
+        for u in tr-ops tr-pis tr-fares; do id $u >/dev/null 2>&1 || useradd -m $u; done
+        printf '#!/bin/sh\necho "$0 $*" >> /var/tmp/tr-job.log\n' > /usr/local/bin/tr-export-fares; cp /usr/local/bin/tr-export-fares /usr/local/bin/tr-refresh-board
+        chmod 0755 /usr/local/bin/tr-export-fares /usr/local/bin/tr-refresh-board
+        : > /etc/at.deny; rm -f /etc/at.allow
+        pgrep -x atd >/dev/null || /usr/sbin/atd
+        sleep 1
+        pgrep -x atd >/dev/null
+        for j in $(atq 2>/dev/null | awk '{print $1}'); do atrm $j; done
+        # a job another user queued earlier: it must survive
+        echo '/usr/local/bin/tr-export-fares --nightly' | su - tr-fares -c 'at 05:55' >/dev/null 2>&1
+        atq | awk '$NF == "tr-fares"' | grep -q .
+  checks:
+    - id: job
+      description: Exactly one job runs the command at {{time}}
+      type: shell
+      on: tr-lp-01
+      skills: [linux.processes.scheduled-jobs]
+      weight: 2
+      command: |
+        n=0; tm=none
+        for id in $(atq | awk '{print $1}'); do
+          if at -c $id 2>/dev/null | grep -Fxq '{{cmd}}'; then n=$((n + 1)); tm=$(atq | awk -v i=$id '$1 == i {print substr($5, 1, 5)}'); fi
+        done
+        echo "n=$n time=$tm"
+      expect: {match: exact, value: "n=1 time={{time}}"}
+    - id: owner
+      description: The job belongs to {{u}}
+      type: shell
+      on: tr-lp-01
+      skills: [linux.processes.scheduled-jobs]
+      weight: 2
+      command: |
+        for id in $(atq | awk '{print $1}'); do
+          if at -c $id 2>/dev/null | grep -Fxq '{{cmd}}'; then atq | awk -v i=$id '$1 == i {print $NF}'; fi
+        done | sort -u | paste -sd,
+      expect: {match: exact, value: "{{u}}"}
+    - id: others-kept
+      description: The earlier job of tr-fares is still queued
+      type: shell
+      on: tr-lp-01
+      skills: [linux.processes.scheduled-jobs]
+      weight: 0.5
+      command: atq | awk '$NF == "tr-fares"' | grep -q . && echo kept || echo removed
+      expect: {match: exact, value: kept}
+  misconceptions:
+    - id: as-root
+      description: Queues the job from root's shell, so it runs as root.
+      feedback: "at queues the job for the user who runs it; run it as the target user (sudo -u USER at ...) or su to that user first."
+      expectFail: [owner]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        run: echo '{{cmd}}' | sudo at {{time}}
+    - id: cleared-queue
+      description: Removes every queued job, including another user's, and then schedules the right one.
+      feedback: "atrm removes a job for good; only touch the job you were asked about."
+      expectFail: [others-kept]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        run: |
+          for j in $(sudo atq | awk '{print $1}'); do sudo atrm $j; done
+          echo '{{cmd}}' | sudo -u {{u}} at {{time}}
+  solution:
+    explanation: Run at as the target user with the command on standard input; atq lists the queue and at -c shows what a job will execute.
+    steps:
+      - on: tr-lp-01
+        as: learner
+        run: |
+          echo '{{cmd}}' | sudo -u {{u}} at {{time}}
+          sudo atq
+    alternatives:
+      - id: su-heredoc
+        description: Switch to the user and use a here-document.
+        steps:
+          - on: tr-lp-01
+            as: learner
+            run: |
+              sudo su - {{u}} -c "at {{time}} <<'EOT'
+              {{cmd}}
+              EOT"

@@ -1,0 +1,105 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xlp-sysctl-runtime
+  title: Change a kernel parameter persistently
+  domain: linux
+  frameworks: [linuxplus:system-management]
+  difficulty: easy
+  estimatedMinutes: 3
+  tags: [exam, sysctl, kernel, persistence]
+  version: 1
+spec:
+  description: |
+    **Host:** `tr-lp-01` (`ssh tr-lp-01`, then `sudo -i`)
+
+    Set the kernel parameter **`{{key}}`** to **`{{val}}`**: in the running kernel now,
+    and so that the value is the one in effect after a reboot. A tuning file from an
+    earlier project may already exist on the host.
+  objectives:
+    - Change a sysctl value at runtime
+    - Persist it in the sysctl configuration without being shadowed
+  params:
+    key:
+      type: choice
+      values: [vm.swappiness, vm.vfs_cache_pressure]
+    val:
+      type: choice
+      values: ["10", "25", "40"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-lp-01
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["1Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-lp-01
+      run: |
+        set -eu
+        rm -f /etc/sysctl.d/*tr-vm*.conf /etc/sysctl.d/*tr-tuning*.conf
+        printf '# earlier tuning project\n{{key}} = 150\n' > /etc/sysctl.d/60-tr-tuning.conf
+        sysctl -qw {{key}}=150
+  checks:
+    - id: live
+      description: The running kernel has {{key}} = {{val}}
+      type: shell
+      on: tr-lp-01
+      skills: [linux.kernel.sysctl]
+      weight: 1
+      command: sysctl -n {{key}}
+      expect: {match: exact, value: "{{val}}"}
+    - id: at-boot
+      description: The effective configuration sets {{key}} to {{val}}
+      type: shell
+      on: tr-lp-01
+      skills: [linux.kernel.sysctl]
+      weight: 2
+      command: |
+        systemd-analyze cat-config sysctl.d 2>/dev/null | sed 's/[;#].*//' | awk -F= -v k='{{key}}' '
+          { n = $1; gsub(/[ \t]/, "", n); gsub("/", ".", n); sub(/^-/, "", n)
+            if (n == k) { v = $2; gsub(/[ \t]/, "", v); last = v } }
+          END { print (last == "" ? "unset" : last) }'
+      expect: {match: exact, value: "{{val}}"}
+  misconceptions:
+    - id: runtime-only
+      description: Sets the value with sysctl -w only.
+      feedback: "sysctl -w changes the running kernel and is lost at reboot; put the setting in a file under /etc/sysctl.d."
+      expectFail: [at-boot]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        run: sudo sysctl -w {{key}}={{val}}
+    - id: shadowed
+      description: Writes a drop-in that sorts before the old tuning file.
+      feedback: "sysctl.d files are read in name order and the last assignment wins; 50-... loses to the existing 60-tr-tuning.conf. Edit that file or use a name that sorts after it."
+      expectFail: [at-boot]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        run: |
+          echo '{{key}} = {{val}}' | sudo tee /etc/sysctl.d/50-tr-vm.conf >/dev/null
+          sudo sysctl -qw {{key}}={{val}}
+  solution:
+    explanation: A drop-in that sorts after 60-tr-tuning.conf (or an edit of that file) sets the value for the next boot; sysctl --system re-reads all files so the running kernel matches.
+    steps:
+      - on: tr-lp-01
+        as: learner
+        run: |
+          echo '{{key}} = {{val}}' | sudo tee /etc/sysctl.d/90-tr-vm.conf >/dev/null
+          sudo sysctl --system >/dev/null
+          sysctl {{key}}
+    alternatives:
+      - id: edit-existing
+        description: Edit the existing tuning file in place.
+        steps:
+          - on: tr-lp-01
+            as: learner
+            run: |
+              sudo sed -i 's/^{{key}}.*/{{key}} = {{val}}/' /etc/sysctl.d/60-tr-tuning.conf
+              sudo sysctl -p /etc/sysctl.d/60-tr-tuning.conf >/dev/null

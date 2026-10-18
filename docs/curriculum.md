@@ -13,12 +13,12 @@ Legend. **Type**: learn = guided first exposure, do = complete a task, fix = rep
 | Domain | Paths | Learning labs | Exam tasks | Exams | Verified | Built | Proposed | Tier mix (all labs) | Learning hours |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | Kubernetes | 5 | 89 | 103 | 3 | 70 | 122 | 0 | C 1, K 112, V 79 | 25 |
-| Linux administration | 11 | 160 | 119 | 3 | 56 | 87 | 136 | A 85, B 69, C 125 | 48 |
+| Linux administration | 11 | 160 | 119 | 3 | 56 | 111 | 112 | A 85, B 69, C 125 | 48 |
 | Containers with Docker | 11 | 91 | 44 | 2 | 24 | 67 | 44 | B 71, C 64 | 28 |
 | Infrastructure as code with Terraform | 5 | 54 | 45 | 2 | 99 | 0 | 0 | A 53, B 1, V 45 | 21 |
 | Configuration management and automation | 7 | 61 | 36 | 1 | 9 | 36 | 52 | A 39, B 7, C 45, N 6 | 26 |
 | Network administration | 4 | 45 | 33 | 1 | 25 | 47 | 6 | N 78 | 15 |
-| **Total** | 43 | 500 | 380 | 13 | 283 | 359 | 238 | A 177, B 148, C 235, K 112, V 124, N 84 | 162 |
+| **Total** | 43 | 500 | 380 | 13 | 283 | 383 | 214 | A 177, B 148, C 235, K 112, V 124, N 84 | 162 |
 
 Cross-domain exams: Platform engineer practical capstone. Exam tasks are counted under the domain of each task. Learning labs by type: learn 47, do 356, fix 83, hack 13, ctf 1. New skills proposed: 201.
 
@@ -1512,7 +1512,7 @@ _CloudTrain is not affiliated with or endorsed by CompTIA. Linux+ is a trademark
 | `xlp-lvm-extend-vg` | linuxplus:system-management | Extend a volume group and logical volume | medium | 6 | B | Add the spare disk to the VG and grow the given LV and its filesystem by the requested size. |
 | `xlp-module-info` | linuxplus:system-management | Report and load a kernel module | easy | 4 | B | Load the given module and write its version and parameters to the answer file. |
 | `xlp-hardware-report` | linuxplus:system-management | Report CPU, memory and disks | easy | 4 | B | Write the CPU count, total memory and block device sizes of the host to the answer file in the requested format. |
-| `xlp-raid-status` | linuxplus:system-management | Report and repair a RAID array's state | medium | 6 | B | Report the degraded array's state to the answer file and re-add the replacement disk. |
+| `xlp-raid-status` | linuxplus:system-management | Report and repair a RAID array's state | medium | 6 | B | Report the degraded array's state to the answer file, then replace the failed member with the new disk. |
 | `xlp-sysctl-runtime` | linuxplus:system-management | Change a kernel parameter persistently | easy | 3 | B | Set the given kernel parameter to the requested value now and at boot. |
 | `xlp-shell-pipeline` | linuxplus:system-management | Answer a question with a one-line pipeline | easy | 4 | A | Write the count of unique failed source addresses in the given log to the answer file. |
 | `xlp-user-group-membership` | linuxplus:services-users | Fix a user's group membership | easy | 3 | A | Make the given user a member of the requested supplementary groups without removing existing ones. |
@@ -1532,7 +1532,7 @@ _CloudTrain is not affiliated with or endorsed by CompTIA. Linux+ is a trademark
 | `xlp-faillock-policy` | linuxplus:security | Lock accounts after repeated failures | medium | 6 | B | Configure the authentication stack to lock an account after the requested number of failures. |
 | `xlp-checksum-verify` | linuxplus:security | Identify the tampered download | easy | 4 | A | Verify the downloads against the signed checksum list and write the name of the one that fails to the answer file. |
 | `xlp-script-fix-loop` | linuxplus:automation-scripting | Fix a broken loop in a provided script | medium | 6 | A | Correct the provided script so it processes every input line and produces the expected output file. |
-| `xlp-git-revert-commit` | linuxplus:automation-scripting | Revert a bad commit and push | medium | 5 | A | Revert the commit that broke the config in the given repository and push the result. |
+| `xlp-git-revert-commit` | linuxplus:automation-scripting | Revert a bad commit and push | medium | 5 | A | Revert the commit that set the key to 0 in the bare repository and push the result to main. |
 | `xlp-python-parse-json` | linuxplus:automation-scripting | Extract a value from JSON with a short Python script | medium | 6 | A | Write a Python script that prints the requested field from every record of the given JSON file. |
 | `xlp-cloud-init-userdata` | linuxplus:automation-scripting | Correct a cloud-init user-data file | medium | 6 | A | Fix the provided user-data so it creates the requested user and package set, validated by the cloud-init schema check. |
 | `xlp-sed-bulk-edit` | linuxplus:automation-scripting | Change a setting in many config files at once | easy | 4 | A | Change the requested key's value in every matching config file under the given directory, leaving other lines intact. |

@@ -1,0 +1,138 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xlp-sed-bulk-edit
+  title: Change a setting in many config files at once
+  domain: linux
+  frameworks: [linuxplus:automation-scripting]
+  difficulty: easy
+  estimatedMinutes: 4
+  tags: [exam, sed, find, config]
+  version: 1
+spec:
+  description: |
+    **Host:** `tr-lp-01` (a shell is open on it)
+
+    Every station controller has a `.conf` file under **`{{dir}}`**, in the directory
+    itself and in its subdirectories. Set **`{{key}}`** to **`{{val}}`** in every one of
+    those `.conf` files.
+
+    Only the line that sets `{{key}}` changes. Leave everything else as it is: other
+    keys (including ones whose names start the same way), comment lines, other file
+    types such as the README and `.conf.bak` backups.
+  objectives:
+    - Edit many files in place with sed
+    - Select files with find or a glob, and match a key precisely
+  params:
+    dir:
+      type: choice
+      values: [/srv/tr/stations.d, /srv/tr/controllers.d]
+    key:
+      type: choice
+      values: [poll_interval, refresh_secs]
+    val:
+      type: choice
+      values: ["45", "90", "120"]
+  topology:
+    entry: tr-lp-01
+    nodes:
+      - name: tr-lp-01
+        driver: container
+        image: el-lab:10
+        access: [shell]
+  setup:
+    - on: tr-lp-01
+      run: |
+        set -eu
+        V=/var/lib/cloudtrain; install -d -m 0700 $V
+        rm -rf /srv/tr $V/xlp-sed.*; mkdir -p {{dir}}/depots
+        n=0
+        for f in ashby bramwell corran dunmere elsford depots/north depots/south; do
+          n=$((n + 1))
+          if [ $((n % 2)) = 0 ]; then sp=' = '; else sp='='; fi
+          {
+            echo "# controller $f"
+            echo "name$sp$f"
+            echo "# {{key}}=999 was the old default"
+            echo "{{key}}$sp$((n * 10))"
+            echo "{{key}}_max$sp600"
+            echo "retries$sp3"
+          } > {{dir}}/$f.conf
+        done
+        echo "{{key}}=5 (backup, do not touch)" > {{dir}}/ashby.conf.bak
+        echo "Notes: {{key}}=30 in the examples." > {{dir}}/README
+        chown -R learner:learner /srv/tr
+        cp -a {{dir}} $V/xlp-sed.orig
+        for f in $(cd {{dir}} && find . -name '*.conf'); do
+          sed -E "s/^([[:space:]]*{{key}}[[:space:]]*=[[:space:]]*).*/\1{{val}}/" {{dir}}/$f | sed -E 's/^({{key}})[[:space:]]*=[[:space:]]*/\1=/' > $V/xlp-sed.orig/$f.expected
+        done
+  checks:
+    - id: top-level
+      description: The .conf files directly in the directory have the new value and nothing else changed
+      type: shell
+      on: tr-lp-01
+      skills: [linux.shell.regex-sed-awk]
+      weight: 1.5
+      command: |
+        bad=0; n=0
+        for f in $(cd {{dir}} && find . -maxdepth 1 -name '*.conf'); do
+          n=$((n + 1))
+          sed -E 's/^({{key}})[[:space:]]*=[[:space:]]*/\1=/' {{dir}}/$f | cmp -s - /var/lib/cloudtrain/xlp-sed.orig/$f.expected || bad=$((bad + 1))
+        done
+        [ $n -gt 0 ] && [ $bad = 0 ] && echo clean || echo "wrong=$bad of $n"
+      expect: {match: exact, value: clean}
+    - id: subdirs
+      description: The .conf files in the subdirectories have the new value and nothing else changed
+      type: shell
+      on: tr-lp-01
+      skills: [linux.shell.regex-sed-awk]
+      weight: 1.5
+      command: |
+        bad=0; n=0
+        for f in $(cd {{dir}} && find . -mindepth 2 -name '*.conf'); do
+          n=$((n + 1))
+          sed -E 's/^({{key}})[[:space:]]*=[[:space:]]*/\1=/' {{dir}}/$f | cmp -s - /var/lib/cloudtrain/xlp-sed.orig/$f.expected || bad=$((bad + 1))
+        done
+        [ $n -gt 0 ] && [ $bad = 0 ] && echo clean || echo "wrong=$bad of $n"
+      expect: {match: exact, value: clean}
+    - id: others-untouched
+      description: The README and the backup file are unchanged
+      type: shell
+      on: tr-lp-01
+      skills: [linux.shell.regex-sed-awk]
+      weight: 1
+      command: |
+        cmp -s {{dir}}/README /var/lib/cloudtrain/xlp-sed.orig/README && cmp -s {{dir}}/ashby.conf.bak /var/lib/cloudtrain/xlp-sed.orig/ashby.conf.bak && echo untouched || echo changed
+      expect: {match: exact, value: untouched}
+  misconceptions:
+    - id: top-only
+      description: Edits only the files in the top directory, missing the subdirectories.
+      feedback: "A glob like *.conf stays in one directory; find DIR -name '*.conf' (with -exec sed -i or xargs) walks the subdirectories as well."
+      expectFail: [subdirs]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        run: sed -i -E 's/^({{key}}[[:space:]]*=[[:space:]]*).*/\1{{val}}/' {{dir}}/*.conf
+    - id: every-file
+      description: Edits every file under the directory, including backups.
+      feedback: "Select files by name (-name '*.conf'); a backup is a record of the old value and must stay as it was."
+      expectFail: [others-untouched]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        run: find {{dir}} -type f -exec sed -i -E 's/^({{key}}[[:space:]]*=[[:space:]]*).*/\1{{val}}/' {} +
+  solution:
+    explanation: find selects the .conf files at any depth and sed -i edits them in place; anchoring the pattern at the line start with the key and the equals sign leaves comments and longer key names alone.
+    steps:
+      - on: tr-lp-01
+        as: learner
+        run: |
+          find {{dir}} -name '*.conf' -exec sed -i -E 's/^({{key}}[[:space:]]*=[[:space:]]*).*/\1{{val}}/' {} +
+          grep -rn '^{{key}}' {{dir}}
+    alternatives:
+      - id: xargs
+        description: Feed the file list to xargs.
+        steps:
+          - on: tr-lp-01
+            as: learner
+            run: find {{dir}} -type f -name '*.conf' -print0 | xargs -0 sed -i -E 's/^({{key}}[[:space:]]*=[[:space:]]*).*/\1{{val}}/'

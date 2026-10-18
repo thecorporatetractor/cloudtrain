@@ -1,0 +1,112 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xlp-shell-pipeline
+  title: Answer a question with a one-line pipeline
+  domain: linux
+  frameworks: [linuxplus:system-management]
+  difficulty: easy
+  estimatedMinutes: 4
+  tags: [exam, shell, pipeline, text-processing]
+  version: 1
+spec:
+  description: |
+    **Host:** `tr-lp-01` (a shell is open on it)
+
+    The gateway's authentication log is **`{{logfile}}`**. How many **different source
+    addresses inside `{{net}}.0.0/16`** had a line `Failed password` in it?
+
+    Write just that number (digits only, one line) to **`/home/learner/answer.txt`**.
+    Lines for accepted logins and for other kinds of failures do not count.
+  objectives:
+    - Filter, extract, de-duplicate and count with a pipeline
+  params:
+    net:
+      type: choice
+      values: ["10.20", "10.30"]
+    logfile:
+      type: choice
+      values: [/var/log/tr-gw/auth.log, /var/log/tr-gw/ssh-auth.log]
+  topology:
+    entry: tr-lp-01
+    nodes:
+      - name: tr-lp-01
+        driver: container
+        image: deb-lab:24.04
+        access: [shell]
+  setup:
+    - on: tr-lp-01
+      run: |
+        set -eu
+        V=/var/lib/cloudtrain; install -d -m 0700 $V
+        rm -rf /var/log/tr-gw; mkdir -p /var/log/tr-gw
+        awk 'BEGIN {
+          srand(41)
+          split("10.20 10.30 10.40", nets, " ")
+          for (i = 0; i < 420; i++) {
+            net = nets[int(rand() * 3) + 1]
+            ip = net "." (1 + int(rand() * 4)) "." (1 + int(rand() * 14))
+            r = rand()
+            if (r < 0.55) msg = "Failed password for invalid user admin from " ip " port " (20000 + int(rand() * 9000)) " ssh2"
+            else if (r < 0.70) msg = "Failed publickey for deploy from " ip " port " (20000 + int(rand() * 9000)) " ssh2"
+            else if (r < 0.90) msg = "Accepted password for signaller from " ip " port " (20000 + int(rand() * 9000)) " ssh2"
+            else msg = "Connection closed by " ip " port " (20000 + int(rand() * 9000)) " [preauth]"
+            printf "Oct 14 %02d:%02d:%02d tr-gw-01 sshd[%d]: %s\n", int(i / 20), (i * 7) % 60, (i * 13) % 60, 1000 + i, msg
+          }
+        }' > {{logfile}}
+        cp {{logfile}} $V/xlp-pipe.log
+        awk '/Failed password/ {for (i = 1; i <= NF; i++) if ($i == "from") print $(i + 1)}' $V/xlp-pipe.log | grep -E '^{{net}}\.' | sort -u | wc -l > $V/xlp-pipe.count
+        rm -f /home/learner/answer.txt
+  checks:
+    - id: count
+      description: The answer is the number of distinct failing addresses in the range
+      type: shell
+      on: tr-lp-01
+      skills: [linux.shell.text-processing]
+      weight: 2
+      command: |
+        v=$(tr -d ' \n' < /home/learner/answer.txt 2>/dev/null)
+        [ "$v" = "$(tr -d ' \n' < /var/lib/cloudtrain/xlp-pipe.count)" ] && echo correct || echo "got=$v"
+      expect: {match: exact, value: correct}
+    - id: format
+      description: The file holds only the number, on one line
+      type: shell
+      on: tr-lp-01
+      skills: [linux.shell.text-processing]
+      weight: 0.5
+      command: |
+        [ "$(wc -l < /home/learner/answer.txt 2>/dev/null)" = 1 ] && grep -Eqx '[0-9]+' /home/learner/answer.txt 2>/dev/null && echo plain || echo not-plain
+      expect: {match: exact, value: plain}
+  misconceptions:
+    - id: counts-lines
+      description: Counts matching lines instead of distinct addresses.
+      feedback: "wc -l counts every failed attempt; extract the address, sort -u (or sort | uniq) and then count."
+      expectFail: [count]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        run: grep 'Failed password' {{logfile}} | grep -c ' from {{net}}\.' > /home/learner/answer.txt
+    - id: wrong-range
+      description: Counts distinct addresses from every network.
+      feedback: "The question is limited to {{net}}.0.0/16; filter on the address prefix before counting."
+      expectFail: [count]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        run: |
+          grep 'Failed password' {{logfile}} | awk '{for (i = 1; i <= NF; i++) if ($i == "from") print $(i + 1)}' | sort -u | wc -l > /home/learner/answer.txt
+  solution:
+    explanation: Select the Failed password lines, pull out the word after from, keep the range, de-duplicate and count.
+    steps:
+      - on: tr-lp-01
+        as: learner
+        run: |
+          grep 'Failed password' {{logfile}} | awk '{for (i = 1; i <= NF; i++) if ($i == "from") print $(i + 1)}' | grep '^{{net}}\.' | sort -u | wc -l > /home/learner/answer.txt
+    alternatives:
+      - id: grep-o
+        description: Extract the addresses with grep -o and de-duplicate with sort | uniq.
+        steps:
+          - on: tr-lp-01
+            as: learner
+            run: |
+              grep 'Failed password' {{logfile}} | grep -oE 'from {{net}}\.[0-9]+\.[0-9]+' | sort | uniq | wc -l > /home/learner/answer.txt

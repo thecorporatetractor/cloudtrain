@@ -1,0 +1,222 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xlp-cloud-init-userdata
+  title: Correct a cloud-init user-data file
+  domain: linux
+  frameworks: [linuxplus:automation-scripting]
+  difficulty: medium
+  estimatedMinutes: 6
+  tags: [exam, cloud-init, yaml, provisioning]
+  version: 1
+spec:
+  description: |
+    **Host:** `tr-lp-01` (a shell is open on it; you have `sudo`)
+
+    The provisioning file **`/home/learner/user-data.yaml`** is meant to give new
+    passenger-information servers a deploy user and a package set, but cloud-init rejects
+    it. Fix the file so that:
+
+    - it passes **`cloud-init schema --config-file /home/learner/user-data.yaml`**;
+    - it still creates the user **`{{user}}`** (group `sudo`, shell `/bin/bash`) with its
+      SSH public key;
+    - it installs the packages **`{{p1}}`** and **`{{p2}}`**;
+    - the host name and the command that enables chrony stay as they are.
+
+    cloud-init is installed on this host (`cloud-init schema --help`).
+  objectives:
+    - Validate user-data against the cloud-init schema
+    - Use the right YAML types for lists and strings
+  params:
+    user:
+      type: choice
+      values: [tr-deploy, tr-ansible]
+    p1:
+      type: choice
+      values: [chrony, rsync]
+    p2:
+      type: choice
+      values: [htop, tmux]
+  topology:
+    entry: tr-lp-01
+    nodes:
+      - name: tr-lp-01
+        driver: container
+        image: deb-lab:24.04
+        access: [shell]
+        learnerSudo: true
+  setup:
+    - on: tr-lp-01
+      timeoutSec: 420
+      run: |
+        set -eu
+        echo 'learner ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/learner && chmod 0440 /etc/sudoers.d/learner
+        dpkg -s cloud-init >/dev/null 2>&1 || { apt-get update -q >/dev/null; DEBIAN_FRONTEND=noninteractive apt-get install -y -q cloud-init >/dev/null; }
+        V=/var/lib/cloudtrain; install -d -m 0700 $V
+        echo 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl {{user}}@tallowmere.example' > $V/xlp-ci.key
+        cat > /home/learner/user-data.yaml <<'EOT'
+        #cloud-config
+        hostname: tr-pis-14
+        users:
+          - name: {{user}}
+            groups: sudo
+            shell: /bin/bash
+            ssh_authorized_keys: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl {{user}}@tallowmere.example
+        package_update: true
+        packages: {{p1}} {{p2}}
+        runcmd: systemctl enable --now chrony
+        EOT
+        chown learner:learner /home/learner/user-data.yaml
+        ! cloud-init schema --config-file /home/learner/user-data.yaml >/dev/null 2>&1
+  checks:
+    - id: schema
+      description: cloud-init schema accepts the file
+      type: shell
+      on: tr-lp-01
+      skills: [linux.virt.cloud-init]
+      weight: 2
+      timeoutSec: 60
+      command: cloud-init schema --config-file /home/learner/user-data.yaml >/dev/null 2>&1 && echo valid || echo invalid
+      expect: {match: exact, value: valid}
+    - id: user
+      description: The file creates {{user}} in group sudo with the SSH key
+      type: shell
+      on: tr-lp-01
+      skills: [linux.virt.cloud-init]
+      weight: 2
+      command: |
+        python3 -c '
+        import sys, yaml
+        key = open("/var/lib/cloudtrain/xlp-ci.key").read().strip()
+        try:
+            d = yaml.safe_load(open("/home/learner/user-data.yaml"))
+            users = [u for u in d.get("users", []) if isinstance(u, dict) and u.get("name") == "{{user}}"]
+            u = users[0]
+            g = u.get("groups", [])
+            groups = g.split(",") if isinstance(g, str) else g
+            keys = u.get("ssh_authorized_keys", [])
+            ok = "sudo" in [x.strip() for x in groups] and u.get("shell") == "/bin/bash" and isinstance(keys, list) and key in keys
+            print("ok" if ok else "wrong")
+        except Exception:
+            print("wrong")
+        '
+      expect: {match: exact, value: ok}
+    - id: packages
+      description: The packages are a list of {{p1}} and {{p2}}
+      type: shell
+      on: tr-lp-01
+      skills: [linux.virt.cloud-init]
+      weight: 1.5
+      command: |
+        python3 -c '
+        import yaml
+        try:
+            p = yaml.safe_load(open("/home/learner/user-data.yaml")).get("packages")
+            print("ok" if isinstance(p, list) and sorted(p) == sorted(["{{p1}}", "{{p2}}"]) else "wrong")
+        except Exception:
+            print("wrong")
+        '
+      expect: {match: exact, value: ok}
+    - id: kept
+      description: The host name, the first line and the chrony command are unchanged
+      type: shell
+      on: tr-lp-01
+      skills: [linux.virt.cloud-init]
+      weight: 0.5
+      command: |
+        head -1 /home/learner/user-data.yaml | grep -qx '#cloud-config' || { echo no-header; exit 0; }
+        python3 -c '
+        import yaml
+        d = yaml.safe_load(open("/home/learner/user-data.yaml"))
+        r = d.get("runcmd")
+        text = r if isinstance(r, str) else " ".join(x if isinstance(x, str) else " ".join(x) for x in (r or []))
+        print("kept" if d.get("hostname") == "tr-pis-14" and "systemctl enable --now chrony" in text else "changed")
+        ' 2>/dev/null || echo changed
+      expect: {match: exact, value: kept}
+  misconceptions:
+    - id: strings-not-lists
+      description: Fixes the key but leaves packages and runcmd as plain strings.
+      feedback: "cloud-init's schema wants lists for packages, runcmd and ssh_authorized_keys; a space-separated string is a string, not a list."
+      expectFail: [schema, packages]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        run: |
+          cat > /home/learner/user-data.yaml <<'EOT'
+          #cloud-config
+          hostname: tr-pis-14
+          users:
+            - name: {{user}}
+              groups: sudo
+              shell: /bin/bash
+              ssh_authorized_keys:
+                - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl {{user}}@tallowmere.example
+          package_update: true
+          packages: {{p1}} {{p2}}
+          runcmd: systemctl enable --now chrony
+          EOT
+    - id: wrong-user
+      description: Makes the file valid but renames the user.
+      feedback: "The file has to keep creating the requested user; fix the types, not the content."
+      expectFail: [user]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        run: |
+          cat > /home/learner/user-data.yaml <<'EOT'
+          #cloud-config
+          hostname: tr-pis-14
+          users:
+            - name: deploy
+              groups: sudo
+              shell: /bin/bash
+              ssh_authorized_keys:
+                - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl {{user}}@tallowmere.example
+          package_update: true
+          packages: [{{p1}}, {{p2}}]
+          runcmd:
+            - systemctl enable --now chrony
+          EOT
+  solution:
+    explanation: cloud-init schema names each offending key; the SSH keys, the packages and runcmd must be YAML lists.
+    steps:
+      - on: tr-lp-01
+        as: learner
+        run: |
+          cloud-init schema --config-file /home/learner/user-data.yaml || true
+          cat > /home/learner/user-data.yaml <<'EOT'
+          #cloud-config
+          hostname: tr-pis-14
+          users:
+            - name: {{user}}
+              groups: sudo
+              shell: /bin/bash
+              ssh_authorized_keys:
+                - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl {{user}}@tallowmere.example
+          package_update: true
+          packages:
+            - {{p1}}
+            - {{p2}}
+          runcmd:
+            - systemctl enable --now chrony
+          EOT
+          cloud-init schema --config-file /home/learner/user-data.yaml
+    alternatives:
+      - id: flow-style
+        description: Use flow-style lists and a groups list.
+        steps:
+          - on: tr-lp-01
+            as: learner
+            run: |
+              cat > /home/learner/user-data.yaml <<'EOT'
+              #cloud-config
+              hostname: tr-pis-14
+              users:
+                - name: {{user}}
+                  groups: [sudo]
+                  shell: /bin/bash
+                  ssh_authorized_keys: ["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl {{user}}@tallowmere.example"]
+              package_update: true
+              packages: [{{p1}}, {{p2}}]
+              runcmd: ["systemctl enable --now chrony"]
+              EOT

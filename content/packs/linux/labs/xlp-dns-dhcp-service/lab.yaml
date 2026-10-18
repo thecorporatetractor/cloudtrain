@@ -1,0 +1,130 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xlp-dns-dhcp-service
+  title: Add a host record to the local DNS service
+  domain: linux
+  frameworks: [linuxplus:services-users]
+  difficulty: medium
+  estimatedMinutes: 6
+  tags: [exam, dnsmasq, dns, ptr]
+  version: 1
+spec:
+  description: |
+    **Host:** `tr-lp-01` (a shell is open on it; you have `sudo`)
+
+    A local name service (dnsmasq) answers on `127.0.0.1` port 53 for the zone
+    `tallowmere.test`. Add the new host **`{{host}}.tallowmere.test`** with address
+    **`{{ip}}`** to it so that both lookups work:
+
+    - the **A record**: `{{host}}.tallowmere.test` resolves to `{{ip}}`;
+    - the **PTR record**: `{{ip}}` resolves back to `{{host}}.tallowmere.test`.
+
+    Keep the service running and keep the existing records. Test with
+    `dig @127.0.0.1`.
+  objectives:
+    - Find where a running dnsmasq reads its records
+    - Add forward and reverse records and make the daemon pick them up
+  params:
+    host:
+      type: choice
+      values: [tr-pis-09, tr-gate-14]
+    ip:
+      type: choice
+      values: [10.20.4.19, 10.20.8.41]
+  topology:
+    entry: tr-lp-01
+    nodes:
+      - name: tr-lp-01
+        driver: container
+        image: el-lab:10
+        access: [shell]
+        learnerSudo: true
+  setup:
+    - on: tr-lp-01
+      timeoutSec: 240
+      run: |
+        set -eu
+        echo 'learner ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/learner && chmod 0440 /etc/sudoers.d/learner
+        rpm -q dnsmasq bind-utils >/dev/null 2>&1 || dnf -y -q install dnsmasq bind-utils >/dev/null
+        pkill -x dnsmasq 2>/dev/null || true
+        sleep 1
+        rm -rf /etc/tr-dns; mkdir -p /etc/tr-dns/conf.d
+        printf '10.20.1.5 tr-ops-01.tallowmere.test\n10.20.1.6 tr-ops-02.tallowmere.test\n' > /etc/tr-dns/hosts
+        printf '%s\n' 'port=53' 'listen-address=127.0.0.1' 'bind-interfaces' 'no-resolv' 'no-hosts' 'domain=tallowmere.test' 'local=/tallowmere.test/' \
+          'addn-hosts=/etc/tr-dns/hosts' 'conf-dir=/etc/tr-dns/conf.d,*.conf' 'pid-file=/run/dnsmasq.pid' > /etc/tr-dns/dnsmasq.conf
+        chmod 0644 /etc/tr-dns/hosts /etc/tr-dns/dnsmasq.conf
+        dnsmasq -C /etc/tr-dns/dnsmasq.conf
+        for i in $(seq 20); do dig +short +time=1 +tries=1 @127.0.0.1 tr-ops-01.tallowmere.test | grep -q 10.20.1.5 && break; sleep 0.5; done
+        dig +short +time=1 +tries=1 @127.0.0.1 tr-ops-01.tallowmere.test | grep -q 10.20.1.5
+  checks:
+    - id: a-record
+      description: "{{host}}.tallowmere.test resolves to {{ip}}"
+      type: shell
+      on: tr-lp-01
+      skills: [linux.services.dns-server]
+      weight: 1.5
+      command: dig +short +time=2 +tries=1 @127.0.0.1 {{host}}.tallowmere.test A | head -1
+      expect: {match: exact, value: "{{ip}}"}
+    - id: ptr-record
+      description: "{{ip}} resolves back to {{host}}.tallowmere.test"
+      type: shell
+      on: tr-lp-01
+      skills: [linux.services.dns-server]
+      weight: 1.5
+      command: dig +short +time=2 +tries=1 @127.0.0.1 -x {{ip}} | head -1
+      expect: {match: exact, value: "{{host}}.tallowmere.test."}
+    - id: existing-kept
+      description: The existing records for tr-ops-01 still resolve both ways
+      type: shell
+      on: tr-lp-01
+      skills: [linux.services.dns-server]
+      weight: 1
+      command: |
+        a=$(dig +short +time=2 +tries=1 @127.0.0.1 tr-ops-01.tallowmere.test A | head -1)
+        p=$(dig +short +time=2 +tries=1 @127.0.0.1 -x 10.20.1.5 | head -1)
+        echo "$a $p"
+      expect: {match: exact, value: "10.20.1.5 tr-ops-01.tallowmere.test."}
+  misconceptions:
+    - id: not-reloaded
+      description: Edits the records file but never tells dnsmasq to re-read it.
+      feedback: "dnsmasq reads addn-hosts files at start and on SIGHUP; send it a HUP (kill -HUP $(cat /run/dnsmasq.pid)) or restart it."
+      expectFail: [a-record, ptr-record]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        run: echo '{{ip}} {{host}}.tallowmere.test' | sudo tee -a /etc/tr-dns/hosts >/dev/null
+    - id: forward-only
+      description: Adds an address= line, which gives an A record but no PTR record.
+      feedback: "address=/name/ip answers forward lookups only; a hosts-file line or host-record= creates the A and the PTR together."
+      expectFail: [ptr-record]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        run: |
+          echo 'address=/{{host}}.tallowmere.test/{{ip}}' | sudo tee /etc/tr-dns/conf.d/extra.conf >/dev/null
+          sudo kill $(cat /run/dnsmasq.pid); sleep 1
+          sudo dnsmasq -C /etc/tr-dns/dnsmasq.conf
+          sleep 1
+  solution:
+    explanation: The running dnsmasq reads /etc/tr-dns/hosts (addn-hosts); a line there yields both the A and the PTR record, and SIGHUP makes the daemon re-read the file without restarting.
+    steps:
+      - on: tr-lp-01
+        as: learner
+        run: |
+          ps -o args= -C dnsmasq
+          echo '{{ip}} {{host}}.tallowmere.test' | sudo tee -a /etc/tr-dns/hosts >/dev/null
+          sudo kill -HUP $(cat /run/dnsmasq.pid)
+          sleep 1
+          dig +short @127.0.0.1 {{host}}.tallowmere.test; dig +short @127.0.0.1 -x {{ip}}
+    alternatives:
+      - id: host-record
+        description: Add a host-record line in conf.d and restart the daemon.
+        steps:
+          - on: tr-lp-01
+            as: learner
+            run: |
+              echo 'host-record={{host}}.tallowmere.test,{{ip}}' | sudo tee /etc/tr-dns/conf.d/extra.conf >/dev/null
+              sudo kill $(cat /run/dnsmasq.pid); sleep 1
+              sudo dnsmasq -C /etc/tr-dns/dnsmasq.conf
+              sleep 1

@@ -1,0 +1,117 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xlp-user-group-membership
+  title: Fix a user's group membership
+  domain: linux
+  frameworks: [linuxplus:services-users]
+  difficulty: easy
+  estimatedMinutes: 3
+  tags: [exam, users, groups, usermod]
+  version: 1
+spec:
+  description: |
+    **Host:** `tr-lp-01` (a shell is open on it; you have `sudo`)
+
+    The signaller **`{{u}}`** needs access to the shared areas of two more teams. Make
+    `{{u}}` a member of the groups **`{{g1}}`** and **`{{g2}}`** (both already exist).
+
+    The groups `{{u}}` already belongs to, and the primary group, must stay exactly as
+    they are.
+  objectives:
+    - Add a user to supplementary groups without dropping the existing ones
+  params:
+    u:
+      type: choice
+      values: [rhys, delyth]
+    g1:
+      type: choice
+      values: [tr-signal, tr-fares]
+    g2:
+      type: choice
+      values: [tr-depot, tr-pis]
+  topology:
+    entry: tr-lp-01
+    nodes:
+      - name: tr-lp-01
+        driver: container
+        image: el-lab:10
+        access: [shell]
+        learnerSudo: true
+  setup:
+    - on: tr-lp-01
+      run: |
+        set -eu
+        echo 'learner ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/learner && chmod 0440 /etc/sudoers.d/learner
+        V=/var/lib/cloudtrain; install -d -m 0700 $V
+        for g in tr-ops tr-audit {{g1}} {{g2}}; do getent group $g >/dev/null || groupadd $g; done
+        id {{u}} >/dev/null 2>&1 && userdel -r {{u}} 2>/dev/null || true
+        useradd -m -G tr-ops,tr-audit {{u}}
+        gpasswd -d {{u}} {{g1}} >/dev/null 2>&1 || true
+        gpasswd -d {{u}} {{g2}} >/dev/null 2>&1 || true
+        id -gn {{u}} > $V/xlp-grp.primary
+        id -nG {{u}} | tr ' ' '\n' | sort > $V/xlp-grp.orig
+        { cat $V/xlp-grp.orig; echo {{g1}}; echo {{g2}}; } | sort -u > $V/xlp-grp.want
+  checks:
+    - id: groups
+      description: "{{u}} is in exactly the original groups plus {{g1}} and {{g2}}"
+      type: shell
+      on: tr-lp-01
+      skills: [linux.users.accounts]
+      weight: 2
+      command: |
+        got=$(id -nG {{u}} 2>/dev/null | tr ' ' '\n' | sort)
+        [ "$got" = "$(cat /var/lib/cloudtrain/xlp-grp.want)" ] && echo correct || echo "got=$(echo $got)"
+      expect: {match: exact, value: correct}
+    - id: primary
+      description: The primary group is unchanged
+      type: shell
+      on: tr-lp-01
+      skills: [linux.users.accounts]
+      weight: 1
+      command: '[ "$(id -gn {{u}} 2>/dev/null)" = "$(cat /var/lib/cloudtrain/xlp-grp.primary)" ] && echo unchanged || echo changed'
+      expect: {match: exact, value: unchanged}
+    - id: account
+      description: The account itself is untouched (same shell, home directory kept)
+      type: shell
+      on: tr-lp-01
+      skills: [linux.users.accounts]
+      weight: 0.5
+      command: 'getent passwd {{u}} | awk -F: ''{print $6 ":" $7}'''
+      expect: {match: exact, value: "/home/{{u}}:/bin/bash"}
+  misconceptions:
+    - id: replaced-groups
+      description: Uses usermod -G without -a, which replaces the supplementary list.
+      feedback: "usermod -G sets the whole list; add -a (append) or list the old groups too."
+      expectFail: [groups]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        run: sudo usermod -G {{g1}},{{g2}} {{u}}
+    - id: primary-changed
+      description: Changes the primary group with usermod -g.
+      feedback: "Lowercase -g replaces the primary group; supplementary groups are -G, and -aG appends."
+      expectFail: [groups, primary]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        run: |
+          sudo usermod -g {{g1}} {{u}}
+          sudo usermod -aG {{g2}} {{u}}
+  solution:
+    explanation: usermod -aG appends to the supplementary group list and leaves the primary group alone.
+    steps:
+      - on: tr-lp-01
+        as: learner
+        run: |
+          sudo usermod -aG {{g1}},{{g2}} {{u}}
+          id {{u}}
+    alternatives:
+      - id: gpasswd
+        description: Add the user to each group with gpasswd.
+        steps:
+          - on: tr-lp-01
+            as: learner
+            run: |
+              sudo gpasswd -a {{u}} {{g1}}
+              sudo gpasswd -a {{u}} {{g2}}

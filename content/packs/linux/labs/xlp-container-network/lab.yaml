@@ -1,0 +1,144 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xlp-container-network
+  title: Run two containers on a shared network
+  domain: linux
+  frameworks: [linuxplus:services-users]
+  difficulty: medium
+  estimatedMinutes: 6
+  tags: [exam, podman, containers, networking]
+  version: 1
+spec:
+  description: |
+    **Host:** `tr-lp-01` (`ssh tr-lp-01`, then `sudo -i`; use root podman)
+
+    The image **`registry.tallowmere.test/tt-api:1`** is already in the local image store
+    (the host has no registry access, so always run with `--pull=never`).
+
+    1. Create a podman network named **`{{net}}`**.
+    2. Start the server: a detached container named **`tt-api`** on that network running
+       `python3 -m http.server {{port}} --directory /etc`.
+    3. Prove the name works: run a one-off client container, also on `{{net}}`, that
+       fetches `http://tt-api:{{port}}/os-release` and prints the HTTP status. The
+       server must stay running when you are done.
+  objectives:
+    - Create a user-defined container network
+    - Reach one container from another by name
+  params:
+    net:
+      type: choice
+      values: [tt-backend, tt-internal]
+    port:
+      type: choice
+      values: ["8080", "8000"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-lp-01
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["1Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-lp-01
+      timeoutSec: 420
+      run: |
+        set -eu
+        rpm -q podman netavark aardvark-dns >/dev/null 2>&1 || dnf -y -q install podman netavark aardvark-dns >/dev/null
+        podman rm -f tt-api tt-client >/dev/null 2>&1 || true
+        podman network rm -f {{net}} >/dev/null 2>&1 || true
+        if ! podman image exists registry.tallowmere.test/tt-api:1; then
+          # No registry is reachable: build a small root filesystem from the local repository and import it
+          rm -rf /tmp/r; mkdir -p /tmp/r
+          dnf -y -q --installroot=/tmp/r --releasever=10 --setopt=install_weak_deps=0 install python3 coreutils-single >/dev/null
+          tar -C /tmp/r -c . | podman import - registry.tallowmere.test/tt-api:1 >/dev/null
+          rm -rf /tmp/r
+        fi
+        podman image exists registry.tallowmere.test/tt-api:1
+  checks:
+    - id: network
+      description: The network {{net}} exists with name resolution enabled
+      type: shell
+      on: tr-lp-01
+      skills: [linux.internals.podman]
+      weight: 1
+      command: |
+        podman network inspect {{net}} 2>/dev/null | grep -q '"dns_enabled": true' && echo dns || echo missing-or-no-dns
+      expect: {match: exact, value: dns}
+    - id: server
+      description: tt-api is running, only on {{net}}
+      type: shell
+      on: tr-lp-01
+      skills: [linux.internals.podman]
+      weight: 1.5
+      command: |
+        podman container inspect tt-api 2>/dev/null | python3 -c '
+        import json, sys
+        try:
+            d = json.load(sys.stdin)[0]
+        except Exception:
+            print("no-container"); sys.exit()
+        nets = sorted(d["NetworkSettings"]["Networks"])
+        print("running on " + ",".join(nets) if d["State"]["Running"] else "stopped")
+        '
+      expect: {match: exact, value: "running on {{net}}"}
+    - id: reach-by-name
+      description: A client on {{net}} gets HTTP 200 from tt-api by name
+      type: shell
+      on: tr-lp-01
+      skills: [linux.internals.podman]
+      weight: 2.5
+      timeoutSec: 60
+      command: |
+        timeout 40 podman run --rm --pull=never --network {{net}} registry.tallowmere.test/tt-api:1 python3 -c 'import urllib.request; print(urllib.request.urlopen("http://tt-api:{{port}}/os-release", timeout=5).status)' 2>/dev/null | tail -1
+      expect: {match: exact, value: "200"}
+  misconceptions:
+    - id: default-network
+      description: Runs the server on the default podman network, where names do not resolve.
+      feedback: "The default network has no DNS name resolution between containers; create a network (podman network create NAME) and start both containers with --network NAME."
+      expectFail: [network, server, reach-by-name]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        timeoutSec: 60
+        run: sudo podman run -d --pull=never --name tt-api registry.tallowmere.test/tt-api:1 python3 -m http.server {{port}} --directory /etc
+    - id: no-dns
+      description: Creates the network with name resolution disabled.
+      feedback: "--disable-dns turns off the aardvark-dns resolver, so tt-api cannot be found by name; leave DNS enabled (the default)."
+      expectFail: [network, reach-by-name]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        timeoutSec: 60
+        run: |
+          sudo podman network create --disable-dns {{net}} >/dev/null
+          sudo podman run -d --pull=never --name tt-api --network {{net}} registry.tallowmere.test/tt-api:1 python3 -m http.server {{port}} --directory /etc
+  solution:
+    explanation: A user-defined network (netavark with aardvark-dns) resolves container names; the server joins it with --network and the client reaches it as tt-api.
+    steps:
+      - on: tr-lp-01
+        as: learner
+        timeoutSec: 90
+        run: |
+          set -e
+          sudo podman network create {{net}}
+          sudo podman run -d --pull=never --name tt-api --network {{net}} registry.tallowmere.test/tt-api:1 python3 -m http.server {{port}} --directory /etc
+          sleep 2
+          sudo podman run --rm --pull=never --network {{net}} registry.tallowmere.test/tt-api:1 python3 -c 'import urllib.request; print(urllib.request.urlopen("http://tt-api:{{port}}/os-release").status)'
+    alternatives:
+      - id: explicit-subnet
+        description: Create the network with an explicit subnet.
+        steps:
+          - on: tr-lp-01
+            as: learner
+            timeoutSec: 90
+            run: |
+              set -e
+              sudo podman network create --subnet 10.89.77.0/24 {{net}}
+              sudo podman run -d --pull=never --name tt-api --network {{net}} registry.tallowmere.test/tt-api:1 python3 -m http.server {{port}} --directory /etc
+              sleep 2

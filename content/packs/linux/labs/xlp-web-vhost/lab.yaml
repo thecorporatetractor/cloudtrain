@@ -1,0 +1,146 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xlp-web-vhost
+  title: Add a virtual host to the web server
+  domain: linux
+  frameworks: [linuxplus:services-users]
+  difficulty: medium
+  estimatedMinutes: 6
+  tags: [exam, nginx, virtual-host, web]
+  version: 1
+spec:
+  description: |
+    **Host:** `tr-lp-01` (a shell is open on it; you have `sudo`)
+
+    nginx is running on port 80 and already serves two sites. Add a third: requests for
+    the host name **`{{site}}.tallowmere.test`** must be answered from the directory
+    **`/srv/www/{{site}}`** (it already holds an `index.html`).
+
+    The configuration must pass `nginx -t` and be loaded in the running server. The
+    existing sites, and the default site that answers every other host name, must keep
+    working as they are.
+  objectives:
+    - Write an nginx server block for a new host name
+    - Test and reload the configuration
+  params:
+    site:
+      type: choice
+      values: [timetables, journeys]
+  topology:
+    entry: tr-lp-01
+    nodes:
+      - name: tr-lp-01
+        driver: container
+        image: deb-lab:24.04
+        access: [shell]
+        learnerSudo: true
+  setup:
+    - on: tr-lp-01
+      timeoutSec: 240
+      run: |
+        set -eu
+        echo 'learner ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/learner && chmod 0440 /etc/sudoers.d/learner
+        dpkg -s nginx curl >/dev/null 2>&1 || { apt-get update -q >/dev/null; DEBIAN_FRONTEND=noninteractive apt-get install -y -q nginx curl >/dev/null; }
+        rm -rf /srv/www; mkdir -p /srv/www/default /srv/www/fares /srv/www/{{site}}
+        echo "tallowmere default site" > /srv/www/default/index.html
+        echo "tallowmere fares site" > /srv/www/fares/index.html
+        echo "tallowmere {{site}} site" > /srv/www/{{site}}/index.html
+        chmod -R a+rX /srv/www
+        rm -f /etc/nginx/sites-enabled/* /etc/nginx/conf.d/*.conf
+        sed -i 's/^worker_processes.*/worker_processes 1;/' /etc/nginx/nginx.conf
+        cat > /etc/nginx/conf.d/00-default.conf <<'EOT'
+        server {
+            listen 80 default_server;
+            server_name _;
+            root /srv/www/default;
+        }
+        EOT
+        cat > /etc/nginx/conf.d/10-fares.conf <<'EOT'
+        server {
+            listen 80;
+            server_name fares.tallowmere.test;
+            root /srv/www/fares;
+        }
+        EOT
+        nginx -t >/dev/null 2>&1
+        pgrep -x nginx >/dev/null && nginx -s reload || nginx
+        for i in $(seq 20); do curl -sf -o /dev/null http://127.0.0.1/ && break; sleep 0.5; done
+  checks:
+    - id: new-site
+      description: "{{site}}.tallowmere.test is served from /srv/www/{{site}}"
+      type: shell
+      on: tr-lp-01
+      skills: [linux.services.web-proxy]
+      weight: 2
+      command: |
+        curl -s --max-time 5 -H 'Host: {{site}}.tallowmere.test' http://127.0.0.1/
+      expect: {match: exact, value: "tallowmere {{site}} site"}
+    - id: fares-kept
+      description: The fares site still answers for its host name
+      type: shell
+      on: tr-lp-01
+      skills: [linux.services.web-proxy]
+      weight: 1
+      command: |
+        curl -s --max-time 5 -H 'Host: fares.tallowmere.test' http://127.0.0.1/
+      expect: {match: exact, value: "tallowmere fares site"}
+    - id: default-kept
+      description: Other host names still get the default site
+      type: shell
+      on: tr-lp-01
+      skills: [linux.services.web-proxy]
+      weight: 1.5
+      command: |
+        curl -s --max-time 5 -H 'Host: unknown.tallowmere.test' http://127.0.0.1/
+      expect: {match: exact, value: "tallowmere default site"}
+    - id: config-valid
+      description: nginx -t passes and nginx is running
+      type: shell
+      on: tr-lp-01
+      skills: [linux.services.web-proxy]
+      weight: 0.5
+      command: nginx -t >/dev/null 2>&1 && pgrep -x nginx >/dev/null && echo valid || echo broken
+      expect: {match: exact, value: valid}
+  misconceptions:
+    - id: not-reloaded
+      description: Writes the server block but never reloads nginx.
+      feedback: "nginx reads its configuration at start and on reload; run nginx -t and then nginx -s reload (or systemctl reload nginx)."
+      expectFail: [new-site]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        run: |
+          printf 'server {\n    listen 80;\n    server_name {{site}}.tallowmere.test;\n    root /srv/www/{{site}};\n}\n' | sudo tee /etc/nginx/conf.d/20-{{site}}.conf >/dev/null
+    - id: hijacked-default
+      description: Points the default site at the new directory instead of adding a server block.
+      feedback: "Changing the default server's root makes every unknown host name show the new site; add a separate server block with its own server_name."
+      expectFail: [default-kept]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        run: |
+          sudo sed -i 's#root /srv/www/default;#root /srv/www/{{site}};#' /etc/nginx/conf.d/00-default.conf
+          sudo nginx -t 2>/dev/null && sudo nginx -s reload
+  solution:
+    explanation: A new server block with its own server_name and root, checked with nginx -t and loaded with a reload, leaves the default and fares blocks alone.
+    steps:
+      - on: tr-lp-01
+        as: learner
+        run: |
+          set -e
+          printf 'server {\n    listen 80;\n    server_name {{site}}.tallowmere.test;\n    root /srv/www/{{site}};\n}\n' | sudo tee /etc/nginx/conf.d/20-{{site}}.conf >/dev/null
+          sudo nginx -t
+          sudo nginx -s reload
+    alternatives:
+      - id: sites-enabled
+        description: Put the block in sites-available and link it into sites-enabled.
+        steps:
+          - on: tr-lp-01
+            as: learner
+            run: |
+              set -e
+              printf 'server {\n    listen 80;\n    server_name {{site}}.tallowmere.test;\n    root /srv/www/{{site}};\n}\n' | sudo tee /etc/nginx/sites-available/{{site}} >/dev/null
+              sudo ln -sf /etc/nginx/sites-available/{{site}} /etc/nginx/sites-enabled/{{site}}
+              sudo nginx -t
+              sudo nginx -s reload

@@ -1,0 +1,132 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xlp-fhs-locate-config
+  title: Locate the files the auditor asks for
+  domain: linux
+  frameworks: [linuxplus:system-management]
+  difficulty: easy
+  estimatedMinutes: 4
+  tags: [exam, fhs, find, filesystem-hierarchy]
+  version: 1
+spec:
+  description: |
+    **Host:** `tr-lp-01` (a shell is open on it; you have `sudo`)
+
+    The auditor needs to know where the **`{{svc}}`** service keeps its files. Write
+    three lines to **`/home/learner/answer.txt`**, each with the full path:
+
+    ```
+    config=<the main configuration file the service is started with>
+    log=<the log file the service writes>
+    data=<the directory holding the service's variable state data>
+    ```
+
+    Use the service's own unit file and configuration to find them; there are leftover
+    copies and samples elsewhere that are not the ones in use.
+  objectives:
+    - Find a service's configuration, log and variable data locations
+    - Tell the live files from samples and backups
+  params:
+    svc:
+      type: choice
+      values: [tr-pisd, tr-faresd]
+  topology:
+    entry: tr-lp-01
+    nodes:
+      - name: tr-lp-01
+        driver: container
+        image: el-lab:10
+        access: [shell]
+        learnerSudo: true
+  setup:
+    - on: tr-lp-01
+      run: |
+        set -eu
+        echo 'learner ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/learner && chmod 0440 /etc/sudoers.d/learner
+        V=/var/lib/cloudtrain; install -d -m 0700 $V
+        s={{svc}}
+        rm -rf /etc/$s /var/log/$s /var/lib/$s /var/cache/$s /usr/share/$s /opt/old-$s /usr/lib/systemd/system/$s.service /home/learner/answer.txt
+        mkdir -p /etc/$s /var/log/$s /var/lib/$s/state /var/cache/$s /usr/share/$s /opt/old-$s/etc /usr/lib/systemd/system
+        # live files: the main config is named in the unit; the log and state dir come from the config
+        printf '[Unit]\nDescription=Tallowmere %s\n[Service]\nExecStart=/usr/sbin/%s --config /etc/%s/%s-main.conf\n[Install]\nWantedBy=multi-user.target\n' $s $s $s $s > /usr/lib/systemd/system/$s.service
+        printf '# %s main configuration\nlisten = 127.0.0.1:7040\nlog_file = /var/log/%s/service.log\nstate_dir = /var/lib/%s/state\ncache_dir = /var/cache/%s\n' $s $s $s $s > /etc/$s/$s-main.conf
+        echo "$(date +%F) service started" > /var/log/$s/service.log
+        echo "2025-01-01 service started (rotated)" > /var/log/$s/service.log-1
+        echo 'snapshot 7' > /var/lib/$s/state/snapshot.dat
+        # decoys
+        cp /etc/$s/$s-main.conf /etc/$s/$s-main.conf.rpmsave
+        sed 's#state_dir = .*#state_dir = /var/lib/old#' /etc/$s/$s-main.conf > /usr/share/$s/$s-main.conf.sample
+        cp /etc/$s/$s-main.conf /opt/old-$s/etc/$s-main.conf
+        echo "$s" > /var/cache/$s/index.cache
+        printf '%s\n' "/etc/$s/$s-main.conf" > $V/xlp-fhs.config
+        printf '%s\n' "/var/log/$s/service.log" > $V/xlp-fhs.log
+        printf '%s\n' "/var/lib/$s/state" > $V/xlp-fhs.data
+        chown -R learner:learner /home/learner
+  checks:
+    - id: config
+      description: The answer names the live configuration file
+      type: shell
+      on: tr-lp-01
+      skills: [linux.files.find-locate]
+      weight: 1
+      command: |
+        v=$(sed -n 's/^config=//p' /home/learner/answer.txt 2>/dev/null | head -1 | tr -d ' ')
+        [ "$v" = "$(cat /var/lib/cloudtrain/xlp-fhs.config)" ] && echo correct || echo "got=$v"
+      expect: {match: exact, value: correct}
+    - id: log
+      description: The answer names the log file the service writes
+      type: shell
+      on: tr-lp-01
+      skills: [linux.files.find-locate]
+      weight: 1
+      command: |
+        v=$(sed -n 's/^log=//p' /home/learner/answer.txt 2>/dev/null | head -1 | tr -d ' ')
+        [ "$v" = "$(cat /var/lib/cloudtrain/xlp-fhs.log)" ] && echo correct || echo "got=$v"
+      expect: {match: exact, value: correct}
+    - id: data
+      description: The answer names the variable state directory
+      type: shell
+      on: tr-lp-01
+      skills: [linux.files.find-locate]
+      weight: 1
+      command: |
+        v=$(sed -n 's/^data=//p' /home/learner/answer.txt 2>/dev/null | head -1 | tr -d ' ' | sed 's#/*$##')
+        [ "$v" = "$(cat /var/lib/cloudtrain/xlp-fhs.data)" ] && echo correct || echo "got=$v"
+      expect: {match: exact, value: correct}
+  misconceptions:
+    - id: sample-config
+      description: Reports the sample file shipped under /usr/share.
+      feedback: "/usr/share holds read-only package data and samples; the unit file's ExecStart names the configuration in /etc that the service really reads."
+      expectFail: [config]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        run: |
+          printf 'config=/usr/share/{{svc}}/{{svc}}-main.conf.sample\nlog=/var/log/{{svc}}/service.log\ndata=/var/lib/{{svc}}/state\n' > /home/learner/answer.txt
+    - id: cache-for-data
+      description: Reports the cache directory as the state data.
+      feedback: "/var/cache is disposable cache; the service's own configuration (state_dir) names the directory under /var/lib that holds its state."
+      expectFail: [data]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        run: |
+          printf 'config=/etc/{{svc}}/{{svc}}-main.conf\nlog=/var/log/{{svc}}/service.log\ndata=/var/cache/{{svc}}\n' > /home/learner/answer.txt
+  solution:
+    explanation: The unit file in /usr/lib/systemd/system names the configuration; the configuration names the log file and the state directory (variable data lives under /var).
+    steps:
+      - on: tr-lp-01
+        as: learner
+        run: |
+          grep ExecStart /usr/lib/systemd/system/{{svc}}.service
+          cat /etc/{{svc}}/{{svc}}-main.conf
+          printf 'config=/etc/{{svc}}/{{svc}}-main.conf\nlog=/var/log/{{svc}}/service.log\ndata=/var/lib/{{svc}}/state\n' > /home/learner/answer.txt
+    alternatives:
+      - id: trailing-slash
+        description: Name the state directory with a trailing slash.
+        steps:
+          - on: tr-lp-01
+            as: learner
+            run: |
+              printf 'config=/etc/{{svc}}/{{svc}}-main.conf\nlog=/var/log/{{svc}}/service.log\ndata=/var/lib/{{svc}}/state/\n' > /home/learner/answer.txt

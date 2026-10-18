@@ -1,0 +1,138 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xlp-backup-restore-tar
+  title: Restore one directory from a backup archive
+  domain: linux
+  frameworks: [linuxplus:system-management]
+  difficulty: easy
+  estimatedMinutes: 4
+  tags: [exam, tar, backup, restore]
+  version: 1
+spec:
+  description: |
+    **Host:** `tr-lp-01` (a shell is open on it; you have `sudo`)
+
+    The records share (`/srv/records`) is backed up to
+    **`/var/backups/{{arch}}`**. The directory **`/srv/records/{{dir}}`** was deleted by
+    mistake. The other directories in the share have been updated since the backup was
+    taken.
+
+    Restore **only `/srv/records/{{dir}}`** from the archive, to its original place, with
+    its **original owners, groups and modes**. Leave everything else in `/srv/records`
+    exactly as it is now.
+  objectives:
+    - Extract a single directory from a tar archive
+    - Preserve ownership and permissions on restore
+  params:
+    dir:
+      type: choice
+      values: [ticketing, fares, pis]
+    arch:
+      type: choice
+      values: [records-nightly.tar.gz, records-weekly.tar.gz]
+  topology:
+    entry: tr-lp-01
+    nodes:
+      - name: tr-lp-01
+        driver: container
+        image: deb-lab:24.04
+        access: [shell]
+        learnerSudo: true
+  setup:
+    - on: tr-lp-01
+      timeoutSec: 120
+      run: |
+        set -eu
+        echo 'learner ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/learner && chmod 0440 /etc/sudoers.d/learner
+        V=/var/lib/cloudtrain; install -d -m 0700 $V
+        for u in trtickets trfares trpis; do id $u >/dev/null 2>&1 || useradd -r -M -s /usr/sbin/nologin $u; done
+        getent group trrecords >/dev/null || groupadd trrecords
+        rm -rf /srv/records /var/backups/records-*.tar.gz; mkdir -p /srv/records /var/backups
+        mk() { # dir owner mode
+          d=/srv/records/$1; mkdir -p $d/archive
+          seq 1 30 | sed "s/^/$1 record /" > $d/current.txt
+          seq 31 60 | sed "s/^/$1 record /" > $d/archive/old.txt
+          echo "$1 contact sheet" > $d/contacts.txt
+          chown -R $2:trrecords $d; chmod 2750 $d $d/archive; chmod 0640 $d/current.txt $d/archive/old.txt; chmod 0600 $d/contacts.txt
+        }
+        mk ticketing trtickets; mk fares trfares; mk pis trpis
+        chown root:trrecords /srv/records; chmod 0755 /srv/records
+        tar -czpf /var/backups/{{arch}} -C / srv/records
+        # the other directories change after the backup
+        for o in ticketing fares pis; do [ $o = {{dir}} ] && continue; echo "$o update after backup" >> /srv/records/$o/current.txt; done
+        find /srv/records/{{dir}} -printf '%P %u:%g %m\n' | sort > $V/xlp-tar.owners
+        (cd /srv/records/{{dir}} && find . -type f -exec sha256sum {} + | sort -k2) > $V/xlp-tar.sums
+        (cd /srv/records && for o in ticketing fares pis; do [ $o = {{dir}} ] && continue; find $o -type f -exec sha256sum {} +; done | sort -k2) > $V/xlp-tar.others
+        rm -rf /srv/records/{{dir}}
+        chmod 0600 /var/backups/{{arch}} 2>/dev/null || true; chown learner /var/backups/{{arch}}
+  checks:
+    - id: content
+      description: Every file of {{dir}} is back with its original content
+      type: shell
+      on: tr-lp-01
+      skills: [linux.files.links-archives]
+      weight: 1.5
+      command: |
+        [ -d /srv/records/{{dir}} ] || { echo missing; exit 0; }
+        got=$(cd /srv/records/{{dir}} && find . -type f -exec sha256sum {} + | sort -k2)
+        [ "$got" = "$(cat /var/lib/cloudtrain/xlp-tar.sums)" ] && echo restored || echo different
+      expect: {match: exact, value: restored}
+    - id: ownership
+      description: Owners, groups and modes of {{dir}} are the original ones
+      type: shell
+      on: tr-lp-01
+      skills: [linux.files.links-archives]
+      weight: 1.5
+      command: |
+        [ -d /srv/records/{{dir}} ] || { echo missing; exit 0; }
+        got=$(find /srv/records/{{dir}} -printf '%P %u:%g %m\n' | sort)
+        [ "$got" = "$(cat /var/lib/cloudtrain/xlp-tar.owners)" ] && echo intact || echo changed
+      expect: {match: exact, value: intact}
+    - id: others-untouched
+      description: The other directories still hold their newer files
+      type: shell
+      on: tr-lp-01
+      skills: [linux.files.links-archives]
+      weight: 1
+      command: |
+        got=$(cd /srv/records && for o in ticketing fares pis; do [ $o = {{dir}} ] && continue; find $o -type f -exec sha256sum {} +; done | sort -k2)
+        [ "$got" = "$(cat /var/lib/cloudtrain/xlp-tar.others)" ] && echo untouched || echo overwritten
+      expect: {match: exact, value: untouched}
+  misconceptions:
+    - id: restore-everything
+      description: Extracts the whole archive over the share.
+      feedback: "Name the member to restore after the archive (tar -xzpf ARCHIVE -C / srv/records/NAME); extracting everything also rolls back the other directories."
+      expectFail: [others-untouched]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        run: sudo tar -xzpf /var/backups/{{arch}} -C /
+    - id: lost-owners
+      description: Restores the files but not their owners.
+      feedback: "Run tar as root so it can set owners (it does by default for root); --no-same-owner or extracting as a normal user leaves everything owned by the extracting account."
+      expectFail: [ownership]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        run: sudo tar -xzf /var/backups/{{arch}} -C / --no-same-owner srv/records/{{dir}}
+  solution:
+    explanation: Archive members are stored without the leading slash; name the directory after the archive and extract with -C / as root so owners and modes (-p) come back.
+    steps:
+      - on: tr-lp-01
+        as: learner
+        run: |
+          tar -tzf /var/backups/{{arch}} | grep '^srv/records/{{dir}}/' | head -3
+          sudo tar -xzpf /var/backups/{{arch}} -C / srv/records/{{dir}}
+    alternatives:
+      - id: stage-and-copy
+        description: Extract into a scratch directory and copy back with cp -a.
+        steps:
+          - on: tr-lp-01
+            as: learner
+            run: |
+              set -e
+              sudo rm -rf /tmp/stage; mkdir /tmp/stage
+              sudo tar -xzpf /var/backups/{{arch}} -C /tmp/stage srv/records/{{dir}}
+              sudo cp -a /tmp/stage/srv/records/{{dir}} /srv/records/
+              sudo rm -rf /tmp/stage
