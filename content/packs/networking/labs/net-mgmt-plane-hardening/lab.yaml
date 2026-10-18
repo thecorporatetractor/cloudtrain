@@ -1,0 +1,214 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: net-mgmt-plane-hardening
+  title: Lock router management to SSH from the admin VLAN
+  domain: networking
+  frameworks: [ccna:security-fundamentals]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [management-plane, ssh, hardening, nftables, banner]
+  version: 1
+spec:
+  description: |
+    The campus router `mv-campus-1` is a Linux router (shell) that is currently
+    managed over SSH with passwords, from anywhere.
+
+    | Interface | Subnet | Host |
+    |---|---|---|
+    | `eth1` | network admins `10.{{octet}}.{{admin}}.0/24` (router `.1`) | `admin-pc` (`.10`) |
+    | `eth2` | classrooms `10.{{octet}}.30.0/24` (router `.1`) | `classroom-pc` (`.10`) |
+
+    Harden the management plane of `mv-campus-1`:
+
+    1. Create a per-admin local account **`{{adminuser}}`** and install the public
+       key the admin workstation already generated (it is on the router at
+       `/root/{{adminuser}}.pub`); `admin-pc` holds the matching private key at
+       `/root/.ssh/id_ed25519`.
+    2. Configure `sshd` for **key-only** login (no password or keyboard-interactive
+       authentication offered) and show a login
+       banner from `/etc/ssh/banner.txt` containing the word `AUTHORISED`.
+    3. Restrict TCP 22 on the router so it is reachable only from the
+       network-admin subnet; attempts from the classroom subnet must be refused
+       or dropped. Do not break traffic the router forwards between the subnets.
+
+    Restart sshd with `sshd-restart`.
+  objectives:
+    - Create a per-admin account and enable public-key-only SSH with a banner
+    - Filter the management plane to a single source subnet
+  params:
+    octet: { type: int, min: 20, max: 90 }
+    admin: { type: int, min: 100, max: 199 }
+    adminuser:
+      type: choice
+      values: [jvance, rholt, skerr, tmunro]
+  topology:
+    entry: workstation
+    nodes:
+      - { name: workstation, driver: container, image: jumphost:1, access: [shell] }
+      - { name: mv-campus-1, driver: container, image: netsvc:1, resources: { cpu: 0.25, memoryMiB: 128 }, access: [shell] }
+      - { name: admin-pc, driver: container, image: netsvc:1, resources: { cpu: 0.15, memoryMiB: 96 }, access: [shell] }
+      - { name: classroom-pc, driver: container, image: netsvc:1, resources: { cpu: 0.1, memoryMiB: 64 }, access: [shell] }
+    links:
+      - { a: "mv-campus-1:eth1", b: "admin-pc:eth1" }
+      - { a: "mv-campus-1:eth2", b: "classroom-pc:eth1" }
+  setup:
+    - on: mv-campus-1
+      run: |
+        ip addr replace 10.{{octet}}.{{admin}}.1/24 dev eth1
+        ip addr replace 10.{{octet}}.30.1/24 dev eth2
+        ssh-keygen -A >/dev/null 2>&1
+        cat > /usr/local/bin/sshd-restart <<'EOS'
+        #!/bin/sh
+        # sshd must run from its full path; stop the old one by its pid file
+        /usr/sbin/sshd -t || exit 1
+        [ -f /run/sshd.pid ] && kill "$(cat /run/sshd.pid)" 2>/dev/null; sleep 1
+        /usr/sbin/sshd
+        EOS
+        chmod +x /usr/local/bin/sshd-restart
+        setsid /usr/sbin/sshd </dev/null >/dev/null 2>&1
+        sleep 1
+    # The admin workstation generates its own key pair for this session; the router
+    # fetches the public half once over the admin LAN, so no key is stored in the lab.
+    - on: admin-pc
+      run: |
+        ip addr replace 10.{{octet}}.{{admin}}.10/24 dev eth1 && ip route replace default via 10.{{octet}}.{{admin}}.1
+        mkdir -p /root/.ssh && chmod 700 /root/.ssh
+        [ -f /root/.ssh/id_ed25519 ] || ssh-keygen -q -t ed25519 -N '' -C netadmin@marlowvalley -f /root/.ssh/id_ed25519
+        setsid timeout 120 ncat -l -k -p 7022 --sh-exec 'cat /root/.ssh/id_ed25519.pub' </dev/null >/dev/null 2>&1 &
+        sleep 1
+    - on: mv-campus-1
+      run: |
+        for i in $(seq 30); do
+          ncat --recv-only -w3 10.{{octet}}.{{admin}}.10 7022 </dev/null > /root/{{adminuser}}.pub 2>/dev/null
+          grep -q '^ssh-ed25519 ' /root/{{adminuser}}.pub && exit 0
+          sleep 1
+        done; exit 1
+    - { on: admin-pc, run: "pkill -f 'ncat -l -k -p [7]022' 2>/dev/null; true" }
+    - on: classroom-pc
+      run: "ip addr replace 10.{{octet}}.30.10/24 dev eth1 && ip route replace default via 10.{{octet}}.30.1"
+  checks:
+    - id: account-exists
+      description: The per-admin account exists on the router
+      type: shell
+      on: mv-campus-1
+      command: id -u {{adminuser}} >/dev/null 2>&1 && echo yes || echo no
+      expect: { match: exact, value: "yes" }
+      skills: [net.security.device-hardening]
+    - id: key-login-works
+      description: admin-pc logs in by key as the admin user and runs a command
+      type: shell
+      on: admin-pc
+      command: |
+        ssh -i /root/.ssh/id_ed25519 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+          -o BatchMode=yes -o ConnectTimeout=5 {{adminuser}}@10.{{octet}}.{{admin}}.1 id -un 2>/dev/null
+      expect: { match: exact, value: "{{adminuser}}" }
+      timeoutSec: 15
+      skills: [net.security.device-hardening]
+      weight: 2
+    - id: password-auth-off
+      description: The running sshd offers public-key authentication only (no passwords)
+      type: shell
+      on: admin-pc
+      command: |
+        m=$(ssh -o PubkeyAuthentication=no -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+          -o BatchMode=yes -o ConnectTimeout=5 {{adminuser}}@10.{{octet}}.{{admin}}.1 true 2>&1 | grep -o 'Permission denied ([^)]*)')
+        case "$m" in *password*|*keyboard-interactive*) echo "offered: $m";; '') echo no-answer;; *) echo key-only;; esac
+      expect: { match: exact, value: key-only }
+      timeoutSec: 15
+      skills: [net.security.device-hardening]
+      weight: 2
+    - id: banner-set
+      description: The running sshd shows a login banner containing AUTHORISED
+      type: shell
+      on: admin-pc
+      command: |
+        ssh -i /root/.ssh/id_ed25519 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+          -o BatchMode=yes -o ConnectTimeout=5 {{adminuser}}@10.{{octet}}.{{admin}}.1 true 2>&1 | grep -q AUTHORISED && echo ok || echo no
+      expect: { match: exact, value: ok }
+      timeoutSec: 15
+      skills: [net.security.device-hardening]
+    - id: classroom-blocked
+      description: classroom-pc cannot reach SSH on the router
+      type: shell
+      on: classroom-pc
+      command: ncat -z -w2 10.{{octet}}.30.1 22 && echo open || echo closed
+      expect: { match: exact, value: closed }
+      timeoutSec: 10
+      skills: [net.security.device-hardening]
+      weight: 2
+    - id: admin-reaches-ssh
+      description: admin-pc can still reach the router's SSH port
+      type: shell
+      on: admin-pc
+      command: ncat -z -w2 10.{{octet}}.{{admin}}.1 22 && echo open || echo closed
+      expect: { match: exact, value: open }
+      timeoutSec: 10
+      skills: [net.security.device-hardening]
+    - { id: forwarding-ok, description: The router still forwards between the admin and classroom subnets, type: reachability, on: classroom-pc, target: "10.{{octet}}.{{admin}}.10", skills: [net.security.device-hardening] }
+  hints:
+    - title: Key-only sshd
+      body: "In a drop-in such as `/etc/ssh/sshd_config.d/10-harden.conf` set `PasswordAuthentication no`, `KbdInteractiveAuthentication no`, `PubkeyAuthentication yes` and `Banner /etc/ssh/banner.txt`, then `sshd-restart`. Install the key into `/home/{{adminuser}}/.ssh/authorized_keys` owned by the user, mode 600. On this Alpine router `adduser -D` leaves the account locked (`!` in `/etc/shadow`) and sshd refuses locked accounts even for key logins: give it a `*` password field instead."
+      cost: 2
+    - title: Management filter
+      body: "Use the input hook so you only touch traffic to the router itself: accept TCP 22 from `10.{{octet}}.{{admin}}.0/24`, drop TCP 22 from everything else. The forward hook (routed traffic) stays untouched."
+      cost: 1
+  misconceptions:
+    - id: password-left-on
+      description: Installs the key but leaves password authentication enabled
+      mutation:
+        on: mv-campus-1
+        run: |
+          adduser -D -s /bin/sh {{adminuser}}
+          sed -i 's/^{{adminuser}}:!:/{{adminuser}}:*:/' /etc/shadow
+          install -d -m700 -o {{adminuser}} -g {{adminuser}} /home/{{adminuser}}/.ssh
+          install -m600 -o {{adminuser}} -g {{adminuser}} /root/{{adminuser}}.pub /home/{{adminuser}}/.ssh/authorized_keys
+          printf 'PubkeyAuthentication yes\nBanner /etc/ssh/banner.txt\n' > /etc/ssh/sshd_config.d/10-harden.conf
+          echo AUTHORISED access only > /etc/ssh/banner.txt
+          nft add table inet mgmt
+          nft 'add chain inet mgmt in { type filter hook input priority 0; policy accept; }'
+          nft add rule inet mgmt in ip saddr 10.{{octet}}.{{admin}}.0/24 tcp dport 22 accept
+          nft add rule inet mgmt in tcp dport 22 drop
+          sshd-restart
+      expectFail: [password-auth-off]
+      feedback: Key-only means passwords must be refused; set PasswordAuthentication no (and KbdInteractiveAuthentication no).
+    - id: no-filter
+      description: Hardens sshd but never restricts the source subnet
+      mutation:
+        on: mv-campus-1
+        run: |
+          printf 'PasswordAuthentication no\nKbdInteractiveAuthentication no\nPubkeyAuthentication yes\nBanner /etc/ssh/banner.txt\n' > /etc/ssh/sshd_config.d/10-harden.conf
+          echo AUTHORISED access only > /etc/ssh/banner.txt
+          sshd-restart
+      expectFail: [classroom-blocked]
+      feedback: Key-only SSH still answers everyone; the classroom subnet must be filtered out of the management plane.
+  solution:
+    explanation: |
+      Create the account, install the admin workstation's public key as its
+      authorized_keys, turn off passwords and set a banner in an sshd drop-in,
+      restart sshd, and add an input-hook filter that accepts TCP 22 only from the
+      admin subnet and drops it from the rest. The learner copies
+      `/root/{{adminuser}}.pub`; the grader proves the login works with the real
+      key held on `admin-pc`.
+    steps:
+      - on: mv-campus-1
+        run: |
+          id -u {{adminuser}} >/dev/null 2>&1 || adduser -D -s /bin/sh {{adminuser}}
+          # adduser -D leaves the password field '!' (locked); sshd refuses locked accounts even for keys
+          sed -i 's/^{{adminuser}}:!:/{{adminuser}}:*:/' /etc/shadow
+          install -d -m700 -o {{adminuser}} -g {{adminuser}} /home/{{adminuser}}/.ssh
+          cp /root/{{adminuser}}.pub /home/{{adminuser}}/.ssh/authorized_keys
+          chown {{adminuser}} /home/{{adminuser}}/.ssh/authorized_keys; chmod 600 /home/{{adminuser}}/.ssh/authorized_keys
+          echo 'AUTHORISED access only. All activity is logged.' > /etc/ssh/banner.txt
+          cat > /etc/ssh/sshd_config.d/10-harden.conf <<'EOC'
+          PasswordAuthentication no
+          KbdInteractiveAuthentication no
+          PubkeyAuthentication yes
+          PermitRootLogin no
+          Banner /etc/ssh/banner.txt
+          EOC
+          sshd-restart; sleep 1
+          nft add table inet mgmt
+          nft 'add chain inet mgmt in { type filter hook input priority 0; policy accept; }'
+          nft add rule inet mgmt in ip saddr 10.{{octet}}.{{admin}}.0/24 tcp dport 22 accept
+          nft add rule inet mgmt in tcp dport 22 drop

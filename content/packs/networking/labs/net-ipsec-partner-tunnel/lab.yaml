@@ -1,0 +1,276 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: net-ipsec-partner-tunnel
+  title: Build an IPsec tunnel to a partner college
+  domain: networking
+  frameworks: [ccna:security-fundamentals]
+  difficulty: hard
+  estimatedMinutes: 30
+  tags: [ipsec, ikev2, strongswan, swanctl, psk, vpn]
+  version: 1
+spec:
+  description: |
+    Marlow Valley shares courses with a partner college. Bring up an **IKEv2
+    site-to-site IPsec tunnel with a pre-shared key** between the district edge
+    router `mv-edge-1` and the partner gateway across the regional network, so
+    that **only** the shared-course subnets cross it, encrypted.
+
+    | Router | Transit | Shared-course LAN | Other LAN |
+    |---|---|---|---|
+    | `mv-edge-1` | `eth1` `198.51.100.{{epub}}/24` -> regional `.1` | `eth2` `10.{{octet}}.80.0/24` (`.1`), `course-pc` (`.10`) | `eth3` `10.{{octet}}.90.0/24` (`.1`), `other-pc` (`.10`) |
+    | `partner-gw` | `eth1` `203.0.113.{{ppub}}/24` -> regional `.1` | `eth2` `10.{{octet}}.88.0/24` (`.1`), `partner-pc` (`.10`) | — |
+
+    The partner gateway is already configured and waiting. On `mv-edge-1`,
+    strongSwan is installed; the pre-shared key is in `/root/partner.psk` and the
+    IKE identities are `mv-edge` (local) and `partner-gw` (remote). Charon is
+    started with `charon-start`, and `swanctl --load-all` reloads
+    `/etc/swanctl/swanctl.conf`.
+
+    Configure and bring up the connection so the traffic selectors are
+    `10.{{octet}}.80.0/24` (local) and `10.{{octet}}.88.0/24` (remote) only. The
+    `other` LAN must not cross.
+  objectives:
+    - Write an IKEv2 PSK site-to-site connection with swanctl and initiate it
+    - Limit the traffic selectors to the shared-course subnets
+    - Verify an installed SA and encrypted reachability
+  params:
+    octet: { type: int, min: 20, max: 90 }
+    epub: { type: int, min: 20, max: 250 }
+    ppub: { type: int, min: 20, max: 250 }
+    secret:
+      type: choice
+      values: [heron, alder, quarry, lantern]
+  topology:
+    entry: workstation
+    nodes:
+      - { name: workstation, driver: container, image: jumphost:1, access: [shell] }
+      - { name: mv-edge-1, driver: container, image: netsvc:1, resources: { cpu: 0.3, memoryMiB: 160 }, access: [shell] }
+      - { name: partner-gw, driver: container, image: netsvc:1, resources: { cpu: 0.3, memoryMiB: 160 }, access: [shell] }
+      - { name: regional-gw, driver: container, image: netsvc:1, resources: { cpu: 0.2, memoryMiB: 96 } }
+      - { name: course-pc, driver: container, image: netsvc:1, resources: { cpu: 0.1, memoryMiB: 64 }, access: [shell] }
+      - { name: other-pc, driver: container, image: netsvc:1, resources: { cpu: 0.1, memoryMiB: 64 }, access: [shell] }
+      - { name: partner-pc, driver: container, image: netsvc:1, resources: { cpu: 0.1, memoryMiB: 64 }, access: [shell] }
+    links:
+      - { a: "mv-edge-1:eth1", b: "regional-gw:eth1" }
+      - { a: "partner-gw:eth1", b: "regional-gw:eth2" }
+      - { a: "mv-edge-1:eth2", b: "course-pc:eth1" }
+      - { a: "mv-edge-1:eth3", b: "other-pc:eth1" }
+      - { a: "partner-gw:eth2", b: "partner-pc:eth1" }
+  setup:
+    - on: regional-gw
+      run: |
+        ip addr replace 198.51.100.1/24 dev eth1
+        ip addr replace 203.0.113.1/24 dev eth2
+        sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+    - on: mv-edge-1
+      run: |
+        ip addr replace 198.51.100.{{epub}}/24 dev eth1
+        ip addr replace 10.{{octet}}.80.1/24 dev eth2
+        ip addr replace 10.{{octet}}.90.1/24 dev eth3
+        ip route replace 203.0.113.0/24 via 198.51.100.1
+        ip route replace 10.{{octet}}.88.0/24 via 198.51.100.1
+        sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+        printf '%s\n' 'Marlow-Partner-PSK-{{secret}}' > /root/partner.psk
+        cat > /usr/local/bin/charon-start <<'EOS'
+        #!/bin/sh
+        # busybox pgrep -x does not match a daemon started by its full path; ask vici instead
+        swanctl --stats >/dev/null 2>&1 && exit 0
+        rm -f /var/run/charon.pid /var/run/charon.vici
+        setsid /usr/lib/strongswan/charon </dev/null >>/var/log/charon.log 2>&1 &
+        for i in $(seq 15); do swanctl --stats >/dev/null 2>&1 && exit 0; sleep 1; done; exit 1
+        EOS
+        chmod +x /usr/local/bin/charon-start
+        # bypass-lan would exempt the directly attached LANs from the tunnel policies
+        printf 'charon {\n  plugins {\n    bypass-lan {\n      load = no\n    }\n  }\n}\n' > /etc/strongswan.d/charon/bypass-lan.conf
+        charon-start
+    - on: partner-gw
+      run: |
+        ip addr replace 203.0.113.{{ppub}}/24 dev eth1
+        ip addr replace 10.{{octet}}.88.1/24 dev eth2
+        ip route replace 198.51.100.0/24 via 203.0.113.1
+        ip route replace 10.{{octet}}.80.0/24 via 203.0.113.1
+        sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+        cat > /etc/swanctl/swanctl.conf <<EOF
+        connections {
+          marlow {
+            local_addrs = 203.0.113.{{ppub}}
+            remote_addrs = 198.51.100.{{epub}}
+            version = 2
+            local { auth = psk
+              id = partner-gw }
+            remote { auth = psk
+              id = mv-edge }
+            children {
+              shared {
+                local_ts = 10.{{octet}}.88.0/24
+                remote_ts = 10.{{octet}}.80.0/24
+                start_action = trap
+              }
+            }
+          }
+        }
+        secrets {
+          ike-marlow {
+            id-1 = partner-gw
+            id-2 = mv-edge
+            secret = "Marlow-Partner-PSK-{{secret}}"
+          }
+        }
+        EOF
+        printf 'charon {\n  plugins {\n    bypass-lan {\n      load = no\n    }\n  }\n}\n' > /etc/strongswan.d/charon/bypass-lan.conf
+        setsid /usr/lib/strongswan/charon </dev/null >>/var/log/charon.log 2>&1 &
+        for i in $(seq 15); do swanctl --stats >/dev/null 2>&1 && break; sleep 1; done
+        swanctl --load-all >/dev/null
+    - { on: course-pc, run: "ip addr replace 10.{{octet}}.80.10/24 dev eth1 && ip route replace default via 10.{{octet}}.80.1" }
+    - { on: other-pc, run: "ip addr replace 10.{{octet}}.90.10/24 dev eth1 && ip route replace default via 10.{{octet}}.90.1" }
+    - { on: partner-pc, run: "ip addr replace 10.{{octet}}.88.10/24 dev eth1 && ip route replace default via 10.{{octet}}.88.1" }
+  checks:
+    - id: sa-installed
+      description: mv-edge-1 has an installed child SA to the partner
+      type: shell
+      on: mv-edge-1
+      command: |
+        for i in $(seq 12); do
+          swanctl --list-sas 2>/dev/null | grep -qi 'INSTALLED' && { echo installed; exit 0; }
+          sleep 1
+        done; echo none
+      expect: { match: exact, value: installed }
+      timeoutSec: 30
+      skills: [net.security.ipsec]
+      weight: 2
+    - id: course-reaches-partner
+      description: course-pc reaches partner-pc over the tunnel
+      type: shell
+      on: course-pc
+      command: |
+        for i in $(seq 10); do ping -c1 -W2 10.{{octet}}.88.10 >/dev/null 2>&1 && { echo ok; exit 0; }; sleep 1; done; echo lost
+      expect: { match: exact, value: ok }
+      timeoutSec: 45
+      skills: [net.security.ipsec]
+      weight: 2
+    - id: encrypted-esp
+      description: Traffic to the partner subnet leaves mv-edge-1 as ESP, not plaintext ICMP
+      type: shell
+      on: mv-edge-1
+      command: |
+        # outbound only: the kernel also shows decrypted inbound packets on eth1
+        ( sleep 1; ping -c3 -W1 -I 10.{{octet}}.80.1 10.{{octet}}.88.10 >/dev/null 2>&1 ) &
+        timeout 6 tcpdump -l -nn -Q out -i eth1 'esp or icmp' > /tmp/esp.txt 2>/dev/null
+        wait
+        esp=$(grep -c ESP /tmp/esp.txt); icmp=$(grep -c ICMP /tmp/esp.txt)
+        [ "$esp" -gt 0 ] && [ "$icmp" -eq 0 ] && echo encrypted || echo "esp=$esp icmp=$icmp"
+      expect: { match: exact, value: encrypted }
+      timeoutSec: 20
+      skills: [net.security.ipsec]
+      weight: 2
+    - id: other-excluded
+      description: The non-course LAN is not carried into the tunnel
+      type: shell
+      on: other-pc
+      command: ping -c1 -W2 10.{{octet}}.88.10 >/dev/null 2>&1 && echo reached || echo excluded
+      expect: { match: exact, value: excluded }
+      timeoutSec: 10
+      skills: [net.security.ipsec]
+  hints:
+    - title: swanctl connection
+      body: "In `/etc/swanctl/swanctl.conf` add a `connections { ... }` block with `local_addrs = 198.51.100.{{epub}}`, `remote_addrs = 203.0.113.{{ppub}}`, `version = 2`, a `local` section (`auth = psk`, `id = mv-edge`), a `remote` section (`auth = psk`, `id = partner-gw`) and a child with `local_ts = 10.{{octet}}.80.0/24`, `remote_ts = 10.{{octet}}.88.0/24`, `start_action = start`. Put one setting per line: swanctl.conf has no `;` separator."
+      cost: 2
+    - title: The secret and bring-up
+      body: "Add a `secrets` block with an `ike-x` section holding `id-1 = mv-edge`, `id-2 = partner-gw` and `secret = \"<from /root/partner.psk>\"`, each on its own line, then `swanctl --load-all` and `swanctl --initiate --child shared`."
+      cost: 1
+  misconceptions:
+    - id: wrong-psk
+      description: Uses the wrong pre-shared key, so IKE authentication fails
+      mutation:
+        on: mv-edge-1
+        run: |
+          cat > /etc/swanctl/swanctl.conf <<EOF
+          connections { marlow {
+            local_addrs = 198.51.100.{{epub}}
+            remote_addrs = 203.0.113.{{ppub}}
+            version = 2
+            local { auth = psk
+              id = mv-edge }
+            remote { auth = psk
+              id = partner-gw }
+            children { shared {
+              local_ts = 10.{{octet}}.80.0/24
+              remote_ts = 10.{{octet}}.88.0/24
+              start_action = start } } } }
+          secrets { ike-x {
+            id-1 = mv-edge
+            id-2 = partner-gw
+            secret = "Marlow-Partner-PSK" } }
+          EOF
+          charon-start; swanctl --load-all >/dev/null 2>&1; swanctl --initiate --child shared >/dev/null 2>&1 || true
+      expectFail: [sa-installed, course-reaches-partner]
+      feedback: Both ends must share the identical pre-shared key; copy it from /root/partner.psk.
+    - id: wrong-local-ts
+      description: Puts the other LAN in the local traffic selector instead of the course subnet
+      mutation:
+        on: mv-edge-1
+        run: |
+          cat > /etc/swanctl/swanctl.conf <<EOF
+          connections { marlow {
+            local_addrs = 198.51.100.{{epub}}
+            remote_addrs = 203.0.113.{{ppub}}
+            version = 2
+            local { auth = psk
+              id = mv-edge }
+            remote { auth = psk
+              id = partner-gw }
+            children { shared {
+              local_ts = 10.{{octet}}.90.0/24
+              remote_ts = 10.{{octet}}.88.0/24
+              start_action = start } } } }
+          secrets { ike-x {
+            id-1 = mv-edge
+            id-2 = partner-gw
+            secret = "Marlow-Partner-PSK-{{secret}}" } }
+          EOF
+          charon-start; swanctl --load-all >/dev/null 2>&1; swanctl --initiate --child shared >/dev/null 2>&1 || true
+      expectFail: [course-reaches-partner]
+      feedback: The partner only accepts the course subnet as the remote selector; advertise 10.{{octet}}.80.0/24, not another LAN.
+  solution:
+    explanation: |
+      Write an IKEv2 PSK connection on mv-edge-1 whose selectors are the two
+      course subnets, add the shared secret from /root/partner.psk, load it and
+      initiate. The partner is already trapping the matching policy, so the SA
+      installs and the course subnets reach each other over ESP; the other LAN has
+      no matching policy and stays off the tunnel.
+    steps:
+      - on: mv-edge-1
+        run: |
+          PSK=$(cat /root/partner.psk)
+          cat > /etc/swanctl/swanctl.conf <<EOF
+          connections {
+            marlow {
+              local_addrs = 198.51.100.{{epub}}
+              remote_addrs = 203.0.113.{{ppub}}
+              version = 2
+              local { auth = psk
+                id = mv-edge }
+              remote { auth = psk
+                id = partner-gw }
+              children {
+                shared {
+                  local_ts = 10.{{octet}}.80.0/24
+                  remote_ts = 10.{{octet}}.88.0/24
+                  start_action = start
+                }
+              }
+            }
+          }
+          secrets {
+            ike-marlow {
+              id-1 = mv-edge
+              id-2 = partner-gw
+              secret = "$PSK"
+            }
+          }
+          EOF
+          charon-start
+          swanctl --load-all
+          swanctl --initiate --child shared || true
+          sleep 2

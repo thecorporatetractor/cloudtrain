@@ -1,0 +1,163 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: net-acl-grades-server
+  title: Allow only staff to reach the grades server
+  domain: networking
+  frameworks: [ccna:security-fundamentals]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [acl, nftables, forward-filter, security]
+  version: 1
+spec:
+  description: |
+    The district core router `mv-core-1` is a Linux router (shell, nftables) that
+    forwards between four segments:
+
+    | Interface | Segment | Host |
+    |---|---|---|
+    | `eth1` | staff LAN `10.{{octet}}.20.0/24` (router `.1`) | `staff-pc` (`.10`) |
+    | `eth2` | student LAN `10.{{octet}}.30.0/24` (router `.1`) | `student-pc` (`.10`) |
+    | `eth3` | printer LAN `10.{{octet}}.40.0/24` (router `.1`) | `printer-pc` (`.10`) |
+    | `eth4` | server LAN `10.{{octet}}.50.0/24` (router `.1`) | `grades-srv` (`.10`) |
+
+    `grades-srv` answers on TCP 443. Write a forwarding filter on `mv-core-1` so
+    that **only** the staff LAN reaches `grades-srv` on TCP 443; the student and
+    printer LANs must be dropped when they try to reach it there. Every other
+    flow the router forwards (staff to printers, students to printers, hosts
+    reaching each other) must keep working.
+  objectives:
+    - Write a stateful forward-chain filter that permits one source subnet to one service
+    - Drop the other subnets to that service without affecting unrelated forwarded traffic
+  params:
+    octet: { type: int, min: 20, max: 90 }
+  topology:
+    entry: workstation
+    nodes:
+      - { name: workstation, driver: container, image: jumphost:1, access: [shell] }
+      - { name: mv-core-1, driver: container, image: netsvc:1, resources: { cpu: 0.25, memoryMiB: 96 }, access: [shell] }
+      - { name: staff-pc, driver: container, image: netsvc:1, resources: { cpu: 0.1, memoryMiB: 64 }, access: [shell] }
+      - { name: student-pc, driver: container, image: netsvc:1, resources: { cpu: 0.1, memoryMiB: 64 }, access: [shell] }
+      - { name: printer-pc, driver: container, image: netsvc:1, resources: { cpu: 0.1, memoryMiB: 64 }, access: [shell] }
+      - { name: grades-srv, driver: container, image: netsvc:1, resources: { cpu: 0.1, memoryMiB: 64 }, access: [shell] }
+    links:
+      - { a: "mv-core-1:eth1", b: "staff-pc:eth1" }
+      - { a: "mv-core-1:eth2", b: "student-pc:eth1" }
+      - { a: "mv-core-1:eth3", b: "printer-pc:eth1" }
+      - { a: "mv-core-1:eth4", b: "grades-srv:eth1" }
+  setup:
+    - on: mv-core-1
+      run: |
+        ip addr replace 10.{{octet}}.20.1/24 dev eth1
+        ip addr replace 10.{{octet}}.30.1/24 dev eth2
+        ip addr replace 10.{{octet}}.40.1/24 dev eth3
+        ip addr replace 10.{{octet}}.50.1/24 dev eth4
+    - { on: staff-pc, run: "ip addr replace 10.{{octet}}.20.10/24 dev eth1 && ip route replace default via 10.{{octet}}.20.1" }
+    - { on: student-pc, run: "ip addr replace 10.{{octet}}.30.10/24 dev eth1 && ip route replace default via 10.{{octet}}.30.1" }
+    - on: printer-pc
+      run: |
+        ip addr replace 10.{{octet}}.40.10/24 dev eth1 && ip route replace default via 10.{{octet}}.40.1
+        for p in 631 9100; do setsid ncat -l -k -p $p --sh-exec 'echo printer' </dev/null >/dev/null 2>&1 & done
+        sleep 1
+    - on: grades-srv
+      run: |
+        ip addr replace 10.{{octet}}.50.10/24 dev eth1 && ip route replace default via 10.{{octet}}.50.1
+        setsid ncat -l -k -p 443 --sh-exec 'echo grades' </dev/null >/dev/null 2>&1 &
+        sleep 1
+  checks:
+    - id: staff-grades
+      description: staff-pc reaches the grades server on TCP 443
+      type: shell
+      on: staff-pc
+      command: ncat -z -w2 10.{{octet}}.50.10 443 && echo open || echo closed
+      expect: { match: exact, value: open }
+      timeoutSec: 10
+      skills: [net.security.acls]
+      weight: 2
+    - id: student-grades-dropped
+      description: student-pc cannot reach the grades server on TCP 443
+      type: shell
+      on: student-pc
+      command: ncat -z -w2 10.{{octet}}.50.10 443 && echo open || echo closed
+      expect: { match: exact, value: closed }
+      timeoutSec: 10
+      skills: [net.security.acls]
+      weight: 2
+    - id: printer-grades-dropped
+      description: printer-pc cannot reach the grades server on TCP 443
+      type: shell
+      on: printer-pc
+      command: ncat -z -w2 10.{{octet}}.50.10 443 && echo open || echo closed
+      expect: { match: exact, value: closed }
+      timeoutSec: 10
+      skills: [net.security.acls]
+      weight: 2
+    - id: printing-still-works
+      description: staff-pc still reaches the printer on TCP 9100 through the router
+      type: shell
+      on: staff-pc
+      command: ncat -z -w2 10.{{octet}}.40.10 9100 && echo open || echo closed
+      expect: { match: exact, value: open }
+      timeoutSec: 10
+      skills: [net.security.acls]
+    - { id: student-printer-ok, description: Student LAN still reaches the printer LAN (unrelated flow), type: reachability, on: student-pc, target: "10.{{octet}}.40.10", skills: [net.security.acls] }
+  hints:
+    - title: Which hook?
+      body: Traffic the router passes between subnets goes through the forward hook, not input. Match on destination address and port, then on source subnet.
+      command: "nft add table inet acl; nft 'add chain inet acl routed { type filter hook forward priority 0; policy accept; }'"
+      cost: 1
+    - title: Permit then drop
+      body: "Accept staff first, then drop the rest to the service: order matters because the first matching rule wins."
+      cost: 2
+  misconceptions:
+    - id: blanket-drop
+      description: Drops everyone to the grades server, including staff
+      mutation:
+        on: mv-core-1
+        run: |
+          nft add table inet acl
+          nft 'add chain inet acl routed { type filter hook forward priority 0; policy accept; }'
+          nft add rule inet acl routed ip daddr 10.{{octet}}.50.10 tcp dport 443 drop
+      expectFail: [staff-grades]
+      feedback: The staff LAN must still reach the grades server; accept it before the drop rule.
+    - id: input-hook
+      description: Filters on the input hook, which never sees forwarded traffic
+      mutation:
+        on: mv-core-1
+        run: |
+          nft add table inet acl
+          nft 'add chain inet acl mgmt { type filter hook input priority 0; policy accept; }'
+          nft add rule inet acl mgmt ip saddr 10.{{octet}}.30.0/24 tcp dport 443 drop
+          nft add rule inet acl mgmt ip saddr 10.{{octet}}.40.0/24 tcp dport 443 drop
+      expectFail: [student-grades-dropped, printer-grades-dropped]
+      feedback: Packets the router forwards between subnets traverse the forward hook; the input hook only sees traffic addressed to the router itself.
+    - id: students-only
+      description: Drops the student LAN to the grades server but forgets the printer LAN
+      mutation:
+        on: mv-core-1
+        run: |
+          nft add table inet acl
+          nft 'add chain inet acl routed { type filter hook forward priority 0; policy accept; }'
+          nft add rule inet acl routed ip daddr 10.{{octet}}.50.10 tcp dport 443 ip saddr 10.{{octet}}.30.0/24 drop
+      expectFail: [printer-grades-dropped]
+      feedback: Only staff is a permit list; denying the subnets you thought of leaves every other source (here the printer LAN) open. Accept staff, then drop everyone else.
+  solution:
+    explanation: |
+      A forward-hook chain that accepts the staff subnet to the grades server on
+      443 and then drops any other source to that service. The default accept
+      policy leaves every unrelated forwarded flow untouched.
+    steps:
+      - on: mv-core-1
+        run: |
+          nft add table inet acl
+          nft 'add chain inet acl routed { type filter hook forward priority 0; policy accept; }'
+          nft add rule inet acl routed ip daddr 10.{{octet}}.50.10 tcp dport 443 ip saddr 10.{{octet}}.20.0/24 accept
+          nft add rule inet acl routed ip daddr 10.{{octet}}.50.10 tcp dport 443 drop
+    alternatives:
+      - id: iptables-forward
+        description: iptables FORWARD rules with an explicit accept then drop
+        steps:
+          - on: mv-core-1
+            run: |
+              iptables -A FORWARD -d 10.{{octet}}.50.10 -p tcp --dport 443 -s 10.{{octet}}.20.0/24 -j ACCEPT
+              iptables -A FORWARD -d 10.{{octet}}.50.10 -p tcp --dport 443 -j DROP

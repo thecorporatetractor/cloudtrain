@@ -1,0 +1,157 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: net-hack-open-management
+  title: Abuse then close an exposed management plane
+  domain: networking
+  frameworks: [ccna:security-fundamentals]
+  difficulty: medium
+  estimatedMinutes: 25
+  tags: [hack, snmp, community, hardening, net-snmp]
+  version: 1
+spec:
+  description: |
+    A student has noticed that the vocational annex router `mv-annex-1` (Linux,
+    shell; net-snmp `snmpd`) still answers SNMP with the default read community
+    `public` from the student LAN. You are on `student-laptop`
+    (`10.{{octet}}.30.10`); the router is `10.{{octet}}.30.1`.
+
+    **Part 1 - show the exposure.** From `student-laptop`, read the router over
+    SNMPv2c with the community `public` and recover the operations contact string
+    the device leaks (the SNMP `sysContact`, OID `.1.3.6.1.2.1.1.4.0`). Write that
+    string, and nothing else, to `/root/leaked.txt` on `student-laptop`.
+
+    **Part 2 - close it.** On `mv-annex-1`, remove the community-based access so
+    the same probe from `student-laptop` returns nothing at all. Restart snmpd
+    with `snmpd-restart`.
+
+    (Only the annex router's exposure is in scope; `student-laptop` keeps its
+    network access.)
+  objectives:
+    - Read a device over SNMP with a default community and capture the leaked data
+    - Remove community-based SNMP so the probe no longer answers
+  params:
+    octet: { type: int, min: 20, max: 90 }
+    secret:
+      type: choice
+      values: [heron, alder, quarry, lantern]
+  topology:
+    entry: workstation
+    nodes:
+      - { name: workstation, driver: container, image: jumphost:1, access: [shell] }
+      - { name: mv-annex-1, driver: container, image: netsvc:1, resources: { cpu: 0.2, memoryMiB: 96 }, access: [shell] }
+      - { name: student-laptop, driver: container, image: netsvc:1, resources: { cpu: 0.15, memoryMiB: 80 }, access: [shell] }
+    links:
+      - { a: "mv-annex-1:eth1", b: "student-laptop:eth1" }
+  setup:
+    - on: mv-annex-1
+      run: |
+        ip addr replace 10.{{octet}}.30.1/24 dev eth1
+        mkdir -p /var/lib/net-snmp
+        cat > /etc/snmp/snmpd.conf <<'EOC'
+        agentAddress udp:161
+        sysName mv-annex-1
+        sysLocation Marlow Valley vocational annex
+        sysContact ops-backup-code-{{secret}}-mv
+        rocommunity public default
+        EOC
+        cat > /usr/local/bin/snmpd-restart <<'EOS'
+        #!/bin/sh
+        pkill -x snmpd 2>/dev/null; sleep 1
+        setsid snmpd -C -Lsd -p /run/snmpd.pid -c /etc/snmp/snmpd.conf </dev/null >/dev/null 2>&1
+        EOS
+        chmod +x /usr/local/bin/snmpd-restart; snmpd-restart; sleep 1
+    - { on: student-laptop, run: "ip addr replace 10.{{octet}}.30.10/24 dev eth1 && ip route replace default via 10.{{octet}}.30.1" }
+  checks:
+    - id: leaked-recorded
+      description: /root/leaked.txt holds the sysContact string the router leaked over public SNMP
+      type: shell
+      on: student-laptop
+      command: |
+        [ -f /root/leaked.txt ] || { echo missing; exit 0; }
+        got=$(tr -d ' \t\r\n"' < /root/leaked.txt)
+        [ "$got" = "ops-backup-code-{{secret}}-mv" ] && echo ok || echo "differs:$got"
+      expect: { match: exact, value: ok }
+      skills: [net.services.snmp]
+      weight: 2
+    - id: probe-silent
+      description: SNMPv2c with the public community no longer answers from the student laptop
+      type: shell
+      on: student-laptop
+      command: |
+        snmpget -v2c -c public -t 1 -r 1 10.{{octet}}.30.1 .1.3.6.1.2.1.1.4.0 >/dev/null 2>&1 && echo answered || echo silent
+      expect: { match: exact, value: silent }
+      timeoutSec: 10
+      skills: [net.security.device-hardening]
+      weight: 2
+    - id: v1-silent
+      description: SNMPv1 with the public community also no longer answers
+      type: shell
+      on: student-laptop
+      command: |
+        snmpget -v1 -c public -t 1 -r 1 10.{{octet}}.30.1 .1.3.6.1.2.1.1.4.0 >/dev/null 2>&1 && echo answered || echo silent
+      expect: { match: exact, value: silent }
+      timeoutSec: 10
+      skills: [net.security.device-hardening]
+    - id: no-community-left
+      description: The agent no longer grants any SNMPv1/v2c community access (or no longer listens)
+      type: shell
+      on: mv-annex-1
+      command: |
+        # a killed snmpd stays a zombie (no init in the node), so ask the socket table
+        ss -Hlun 'sport = :161' | grep -q . || { echo none; exit 0; }
+        grep -Eiq '^[[:space:]]*(r[ow]community6?|com2sec6?)[[:space:]]' /etc/snmp/snmpd.conf && echo community || echo none
+      expect: { match: exact, value: none }
+      skills: [net.security.device-hardening]
+  hints:
+    - title: Reading the contact
+      body: "`snmpget -v2c -c public -Oqv 10.{{octet}}.30.1 .1.3.6.1.2.1.1.4.0` prints the sysContact value alone; redirect it into the file."
+      command: "snmpget -v2c -c public -Oqv 10.{{octet}}.30.1 .1.3.6.1.2.1.1.4.0"
+      cost: 1
+    - title: Closing it
+      body: "Remove the `rocommunity` line from `/etc/snmp/snmpd.conf` (or replace community access with an authPriv SNMPv3 user), then `snmpd-restart`. A community probe then gets no reply."
+      cost: 2
+  misconceptions:
+    - id: change-location-only
+      description: Edits the leaked string but leaves the public community answering
+      mutation:
+        on: mv-annex-1
+        run: |
+          sed -i 's/^sysContact.*/sysContact redacted/' /etc/snmp/snmpd.conf
+          snmpd-restart; sleep 1
+      expectFail: [probe-silent, v1-silent]
+      feedback: Hiding the string is not enough; the community itself must be removed so the router stops answering unauthenticated polls.
+    - id: rename-community
+      description: Swaps the default community for another guessable string instead of removing community access
+      mutation:
+        on: mv-annex-1
+        run: |
+          sed -i 's/^rocommunity public /rocommunity annex2024 /' /etc/snmp/snmpd.conf
+          snmpd-restart; sleep 1
+      expectFail: [no-community-left]
+      feedback: A community string is a clear-text password sent in every poll; renaming it only hides it from this one probe. Remove v1/v2c community access (use an authPriv SNMPv3 user if monitoring is needed).
+  solution:
+    explanation: |
+      Part 1 reads the sysContact with the default community and saves it. Part 2
+      deletes the rocommunity line so snmpd no longer answers v1/v2c, which makes
+      the earlier probe silent.
+    steps:
+      - on: student-laptop
+        run: |
+          snmpget -v2c -c public -Oqv 10.{{octet}}.30.1 .1.3.6.1.2.1.1.4.0 | tr -d '"' > /root/leaked.txt
+          cat /root/leaked.txt
+      - on: mv-annex-1
+        run: |
+          sed -i '/^rocommunity/d; /^rwcommunity/d' /etc/snmp/snmpd.conf
+          snmpd-restart; sleep 1
+    alternatives:
+      - id: stop-agent
+        description: Stop the SNMP agent entirely so nothing answers (the leak is recorded first)
+        steps:
+          - on: student-laptop
+            run: |
+              snmpget -v2c -c public -Oqv 10.{{octet}}.30.1 .1.3.6.1.2.1.1.4.0 | tr -d '"' > /root/leaked.txt
+          - on: mv-annex-1
+            run: |
+              sed -i 's#^setsid snmpd .*#true#' /usr/local/bin/snmpd-restart
+              pkill -x snmpd 2>/dev/null; sleep 1; true
