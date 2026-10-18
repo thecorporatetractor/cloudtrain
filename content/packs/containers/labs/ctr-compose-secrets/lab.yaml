@@ -1,0 +1,249 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-compose-secrets
+  title: Deliver the ad partner key as a Compose secret
+  domain: containers
+  frameworks: [ex188-aligned:multi-container, docker-practitioner:compose]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [docker, compose, secrets]
+  version: 1
+spec:
+  description: |
+    On `cl-ads-01` (`ssh cl-ads-01`; you are in the `docker` group) the ad-insertion
+    service in `~/ads` authenticates to the ad partner with an API key, and today the
+    key sits in the Compose file as an environment variable, so it shows up in
+    `docker inspect` and in every `docker compose config`. The key lives in
+    `/etc/copperleaf/ads/partner.key` (root-owned, mode 0600).
+
+    Change `~/ads/compose.yaml` (project `ads`, service **`ads`**) so that:
+
+    - the key is provided as a Compose **secret** named **`partner_key`** whose source
+      is the file `/etc/copperleaf/ads/partner.key`, mounted at
+      `/run/secrets/partner_key`;
+    - the key no longer appears anywhere in the container's environment or in
+      `docker inspect` output;
+    - the service answers `authorised` on `http://127.0.0.1:{{port}}/auth` (it reads the
+      key from `/run/secrets/partner_key` when it is there).
+
+    Leave the stack running.
+  objectives:
+    - Declare a file-based Compose secret and attach it to a service
+    - Read a secret from /run/secrets inside the container
+    - Verify that the secret does not leak into the environment or inspect output
+  params:
+    port:
+      type: int
+      min: 8500
+      max: 8599
+    keyn:
+      type: int
+      min: 100000
+      max: 999999
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-ads-01
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-ads-01
+      timeoutSec: 300
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        docker ps -aq --filter label=com.docker.compose.project=ads | xargs -r docker rm -f >/dev/null
+        install -d -m 0755 /etc/copperleaf/ads
+        printf '%s' 'ptk-{{keyn}}-copperleaf' > /etc/copperleaf/ads/partner.key
+        chmod 0600 /etc/copperleaf/ads/partner.key
+        sha=$(sha256sum /etc/copperleaf/ads/partner.key | cut -d' ' -f1)
+        d=$(mktemp -d)
+        cat > "$d/app.py" <<'PY'
+        # Copperleaf ad-insertion service (lab stand-in): authenticates with the partner key.
+        import hashlib, os
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        def key():
+            try:
+                return open("/run/secrets/partner_key").read().strip()
+            except OSError:
+                return os.environ.get("PARTNER_KEY", "")
+
+        class H(BaseHTTPRequestHandler):
+            def do_GET(self):
+                good = hashlib.sha256(key().encode()).hexdigest() == os.environ["EXPECT_SHA"]
+                b = b"authorised\n" if good else b"rejected\n"
+                self.send_response(200 if good else 403); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
+            def log_message(self, *a): pass
+
+        HTTPServer(("", 8090), H).serve_forever()
+        PY
+        printf '%s\n' 'FROM python:3.13-alpine' 'COPY app.py /app.py' "ENV EXPECT_SHA=$(printf '%s' 'ptk-{{keyn}}-copperleaf' | sha256sum | cut -d' ' -f1)" 'EXPOSE 8090' 'CMD ["python", "-u", "/app.py"]' > "$d/Dockerfile"
+        docker build -q -t copperleaf/ad-insertion:4.2 "$d" >/dev/null
+        rm -rf "$d"
+        p=/home/learner/ads
+        rm -rf "$p"; install -d -o learner -g learner "$p"
+        cat > "$p/compose.yaml" <<'YML'
+        name: ads
+        services:
+          ads:
+            image: copperleaf/ad-insertion:4.2
+            environment:
+              PARTNER_KEY: ptk-{{keyn}}-copperleaf
+            ports:
+              - "{{port}}:8090"
+        YML
+        chown -R learner:learner "$p"
+        (cd "$p" && docker compose up -d >/dev/null 2>&1) || true
+  checks:
+    - id: secret-declared
+      description: The project declares a file secret partner_key from the key file and the ads service uses it
+      type: shell
+      timeoutSec: 60
+      on: cl-ads-01
+      skills: [containers.compose.secrets-configs]
+      weight: 3
+      command: |
+        cd /home/learner/ads 2>/dev/null || { echo no-dir; exit 0; }
+        docker compose config --format json 2>/dev/null | jq -r '[(.secrets.partner_key.file // "none"), ([.services.ads.secrets[]? | (if type == "string" then . else .source end)] | join(","))] | join(" ")' 2>/dev/null || echo invalid
+      expect: {match: exact, value: "/etc/copperleaf/ads/partner.key partner_key"}
+    - id: secret-mounted
+      description: The running container has the key at /run/secrets/partner_key
+      type: shell
+      timeoutSec: 60
+      on: cl-ads-01
+      skills: [containers.compose.secrets-configs]
+      weight: 3
+      command: |
+        c=$(docker ps -q --filter label=com.docker.compose.project=ads --filter label=com.docker.compose.service=ads | head -1)
+        [ -n "$c" ] || { echo no-container; exit 0; }
+        docker exec "$c" cat /run/secrets/partner_key 2>/dev/null || echo missing
+      expect: {match: exact, value: "ptk-{{keyn}}-copperleaf"}
+    - id: no-leak
+      description: The key text appears neither in docker inspect output nor in the container environment
+      type: shell
+      timeoutSec: 60
+      on: cl-ads-01
+      skills: [containers.compose.secrets-configs]
+      weight: 3
+      command: |
+        c=$(docker ps -q --filter label=com.docker.compose.project=ads --filter label=com.docker.compose.service=ads | head -1)
+        [ -n "$c" ] || { echo no-container; exit 0; }
+        a=$(docker inspect "$c" | grep -c 'ptk-{{keyn}}-copperleaf' || true)
+        b=$(docker exec "$c" env 2>/dev/null | grep -c 'ptk-{{keyn}}-copperleaf' || true)
+        echo "inspect=$a env=$b"
+      expect: {match: exact, value: "inspect=0 env=0"}
+    - id: authorised
+      description: The service authenticates with the secret
+      type: shell
+      timeoutSec: 60
+      on: cl-ads-01
+      skills: [containers.compose.secrets-configs]
+      weight: 1
+      command: curl -fsS --max-time 3 http://127.0.0.1:{{port}}/auth 2>/dev/null || echo down
+      expect: {match: exact, value: authorised}
+  hints:
+    - title: Two places
+      body: "A Compose secret has two parts: a top-level `secrets:` entry that says where it comes from (`file:`), and a `secrets:` list on the service that receives it. It appears as a file under `/run/secrets/<name>`."
+      cost: 1
+    - title: Remove the old variable
+      body: "The environment entry is what leaks. Delete `PARTNER_KEY` from the service. The service already looks for the file first."
+      cost: 1
+    - title: Verify
+      body: "`docker compose up -d` recreates the container with the new definition. `docker exec <container> ls /run/secrets` lists the secret files, `docker inspect <container> | grep -c ptk` should print 0."
+      cost: 2
+  misconceptions:
+    - id: key-still-in-env
+      description: Adds the secret but leaves the PARTNER_KEY environment variable in place.
+      feedback: "The secret works, but the key is still in the environment and in docker inspect. Remove the environment entry."
+      expectFail: [no-leak]
+      mutation:
+        on: cl-ads-01
+        as: learner
+        run: |
+          cd ~/ads
+          printf '%s\n' 'name: ads' 'services:' '  ads:' '    image: copperleaf/ad-insertion:4.2' '    environment:' '      PARTNER_KEY: ptk-{{keyn}}-copperleaf' \
+            '    secrets: [partner_key]' '    ports: ["{{port}}:8090"]' 'secrets:' '  partner_key:' '    file: /etc/copperleaf/ads/partner.key' > compose.yaml
+          docker compose up -d
+    - id: bind-mounted-file
+      description: Bind-mounts the key file into /run/secrets instead of declaring a secret.
+      feedback: "A bind mount delivers the bytes but is not a Compose secret: it is not declared, named or managed by the project. Declare the secret under secrets: and attach it to the service."
+      expectFail: [secret-declared]
+      mutation:
+        on: cl-ads-01
+        as: learner
+        run: |
+          cd ~/ads
+          printf '%s\n' 'name: ads' 'services:' '  ads:' '    image: copperleaf/ad-insertion:4.2' '    volumes:' '      - /etc/copperleaf/ads/partner.key:/run/secrets/partner_key:ro' \
+            '    ports: ["{{port}}:8090"]' > compose.yaml
+          docker compose up -d
+    - id: secret-not-attached
+      description: Declares the secret at the top level but never attaches it to the service.
+      feedback: "A top-level secret is only a definition. List partner_key under the service's secrets: to mount it."
+      expectFail: [secret-declared, secret-mounted, authorised]
+      mutation:
+        on: cl-ads-01
+        as: learner
+        run: |
+          cd ~/ads
+          printf '%s\n' 'name: ads' 'services:' '  ads:' '    image: copperleaf/ad-insertion:4.2' '    ports: ["{{port}}:8090"]' 'secrets:' '  partner_key:' '    file: /etc/copperleaf/ads/partner.key' > compose.yaml
+          docker compose up -d
+  solution:
+    explanation: |
+      A file-based secret is declared once at the top level and granted to the services
+      that need it; the engine mounts it read-only at `/run/secrets/<name>`. Removing the
+      environment variable takes the key out of `docker inspect` and the process
+      environment.
+    steps:
+      - on: cl-ads-01
+        as: learner
+        run: |
+          cd ~/ads
+          cat > compose.yaml <<'YML'
+          name: ads
+          services:
+            ads:
+              image: copperleaf/ad-insertion:4.2
+              secrets:
+                - partner_key
+              ports:
+                - "{{port}}:8090"
+          secrets:
+            partner_key:
+              file: /etc/copperleaf/ads/partner.key
+          YML
+          docker compose up -d
+          sleep 2
+          curl -s localhost:{{port}}/auth
+    alternatives:
+      - id: long-form-secret
+        description: Use the long secret syntax with an explicit target and mode.
+        steps:
+          - on: cl-ads-01
+            as: learner
+            run: |
+              cd ~/ads
+              cat > compose.yaml <<'YML'
+              name: ads
+              services:
+                ads:
+                  image: copperleaf/ad-insertion:4.2
+                  secrets:
+                    - source: partner_key
+                      target: partner_key
+                      mode: 0440
+                  ports:
+                    - "{{port}}:8090"
+              secrets:
+                partner_key:
+                  file: /etc/copperleaf/ads/partner.key
+              YML
+              docker compose up -d

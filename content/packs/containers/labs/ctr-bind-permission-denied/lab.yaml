@@ -1,0 +1,179 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-bind-permission-denied
+  title: Let the non-root thumbnailer write to its bind mount
+  domain: containers
+  frameworks: [ex188-aligned:troubleshoot, docker-practitioner:storage]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [docker, bind-mounts, permissions, uid]
+  version: 1
+spec:
+  description: |
+    On `cl-thumbs-01` (`ssh cl-thumbs-01`; you are in the `docker` group, with `sudo`)
+    the thumbnailer runs as the container **`thumbnailer`** (image
+    `copperleaf/thumbnailer:2.2`) as the non-root user **UID {{uid}}**. It writes
+    thumbnails to `/var/cache/thumbs`, a bind mount of the host directory `/srv/thumbs`,
+    and its log says `Permission denied` on every write; the directory holds three older
+    thumbnails that must stay.
+
+    Fix it **on the host side** so the thumbnailer writes thumbnails without running as
+    root: keep the container as it is (same user, same bind mount; do not recreate it
+    with `--user 0` or `--privileged`), do not make the directory world-writable, and
+    keep the existing files.
+  objectives:
+    - Explain why a bind mount keeps the host's numeric ownership
+    - Grant a container UID access to a host directory without widening it to everyone
+    - Confirm the fix from the container's own log and the files it writes
+  params:
+    uid:
+      type: int
+      min: 10001
+      max: 10999
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-thumbs-01
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-thumbs-01
+      timeoutSec: 240
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        userdel -r thumbs >/dev/null 2>&1 || true
+        d=$(mktemp -d)
+        cat > "$d/thumbnailer" <<'SH'
+        #!/bin/sh
+        # Copperleaf thumbnailer (lab stand-in): writes one thumbnail every two seconds.
+        n=0
+        while :; do
+          n=$((n + 1))
+          if echo "thumbnail $n" > "/var/cache/thumbs/thumb-$(date +%s)-$n.jpg" 2>/dev/null; then echo "wrote thumb $n"; else echo "ERROR: cannot write /var/cache/thumbs: Permission denied"; fi
+          sleep 2
+        done
+        SH
+        chmod 0755 "$d/thumbnailer"
+        printf '%s\n' 'FROM busybox:1.37' 'COPY thumbnailer /usr/local/bin/thumbnailer' 'USER {{uid}}' 'ENTRYPOINT ["/usr/local/bin/thumbnailer"]' > "$d/Dockerfile"
+        docker build -q -t copperleaf/thumbnailer:2.2 "$d" >/dev/null
+        rm -rf "$d"
+        docker rm -f thumbnailer >/dev/null 2>&1 || true
+        rm -rf /srv/thumbs; install -d -m 0755 -o root -g root /srv/thumbs
+        for i in 1 2 3; do echo "seed thumbnail $i" > "/srv/thumbs/thumb-seed-$i.jpg"; done
+        chmod 0644 /srv/thumbs/thumb-seed-*.jpg
+        docker run -d --name thumbnailer --restart unless-stopped -v /srv/thumbs:/var/cache/thumbs copperleaf/thumbnailer:2.2 >/dev/null
+  checks:
+    - id: uid-can-write
+      description: The thumbnailer's UID can create files in /srv/thumbs
+      type: shell
+      timeoutSec: 30
+      on: cl-thumbs-01
+      skills: [containers.storage.permissions]
+      weight: 3
+      command: |
+        if setpriv --reuid={{uid}} --regid={{uid}} --clear-groups sh -c 'touch /srv/thumbs/.probe && rm -f /srv/thumbs/.probe' 2>/dev/null; then echo writable; else echo denied; fi
+      expect: {match: exact, value: writable}
+    - id: not-world-writable
+      description: /srv/thumbs is not writable by everyone
+      type: shell
+      timeoutSec: 30
+      on: cl-thumbs-01
+      skills: [containers.storage.permissions]
+      weight: 2
+      command: |
+        m=$(stat -c %a /srv/thumbs)
+        case "${m: -1}" in 2|3|6|7) echo "world-writable ($m)" ;; *) echo restricted ;; esac
+      expect: {match: exact, value: restricted}
+    - id: container-unchanged-and-writing
+      description: The same container, still user {{uid}} on the same bind mount, is writing new thumbnails
+      type: shell
+      timeoutSec: 60
+      on: cl-thumbs-01
+      skills: [containers.storage.permissions, containers.storage.mount-types]
+      weight: 3
+      command: |
+        docker inspect thumbnailer 2>/dev/null | jq -e '.[0] | .State.Running and (.Config.User == "{{uid}}") and ([.Mounts[] | select(.Type == "bind" and .Source == "/srv/thumbs" and .Destination == "/var/cache/thumbs")] | length == 1) and (.HostConfig.Privileged | not)' >/dev/null 2>&1 || { echo reconfigured; exit 0; }
+        a=$(ls /srv/thumbs | grep -c '^thumb-[0-9]' || true)
+        sleep 7
+        b=$(ls /srv/thumbs | grep -c '^thumb-[0-9]' || true)
+        if [ "$b" -gt "$a" ]; then echo writing; else echo "not-writing ($a -> $b)"; fi
+      expect: {match: exact, value: writing}
+    - id: old-thumbnails-kept
+      description: The three older thumbnails are still there
+      type: shell
+      timeoutSec: 30
+      on: cl-thumbs-01
+      skills: [containers.storage.permissions]
+      weight: 1
+      command: ls /srv/thumbs | grep -c '^thumb-seed-' || true
+      expect: {match: exact, value: "3"}
+  hints:
+    - title: Bind mounts show numbers, not names
+      body: "Inside the container the files keep the host's numeric owner. The container user {{uid}} has no special rights on a directory that root owns with mode 0755. `ls -ln /srv/thumbs` shows the numbers the kernel compares."
+      cost: 1
+    - title: Change the owner, not the mode
+      body: "`sudo chown {{uid}} /srv/thumbs` gives that UID ownership; no one else gains write access. `chmod 777` also works but opens the directory to every user on the host."
+      cost: 2
+    - title: Look for the proof
+      body: "`docker logs --tail 3 thumbnailer` switches from `Permission denied` to `wrote thumb N`, and new `thumb-<time>-<n>.jpg` files appear in /srv/thumbs, owned by {{uid}}."
+      cost: 1
+  misconceptions:
+    - id: world-writable
+      description: Makes the directory writable by everyone.
+      feedback: "chmod 777 makes the symptom go away for every user on the host. Give the directory to the container's UID instead."
+      expectFail: [not-world-writable]
+      mutation:
+        on: cl-thumbs-01
+        as: learner
+        run: sudo chmod 777 /srv/thumbs
+    - id: run-as-root
+      description: Recreates the container as root.
+      feedback: "Running as root hides the ownership problem and widens what a compromised thumbnailer can do. Keep the non-root user and fix the host directory."
+      expectFail: [uid-can-write, container-unchanged-and-writing]
+      mutation:
+        on: cl-thumbs-01
+        as: learner
+        run: |
+          docker rm -f thumbnailer
+          docker run -d --name thumbnailer --user 0 -v /srv/thumbs:/var/cache/thumbs copperleaf/thumbnailer:2.2
+    - id: wrong-owner
+      description: Gives the directory to a different UID.
+      feedback: "The container runs as UID {{uid}}; only that numeric owner (or a group or ACL entry for it) lets it write."
+      expectFail: [uid-can-write, container-unchanged-and-writing]
+      mutation:
+        on: cl-thumbs-01
+        as: learner
+        run: sudo chown 1000 /srv/thumbs
+  solution:
+    explanation: |
+      The bind mount exposes the host directory with its numeric owner. Making that owner the
+      container's UID lets the unprivileged process write, without widening access for
+      anyone else and without touching the container.
+    steps:
+      - on: cl-thumbs-01
+        as: learner
+        run: |
+          ls -ln /srv/thumbs | head -3
+          sudo chown {{uid}} /srv/thumbs
+          sleep 5
+          docker logs --tail 2 thumbnailer
+    alternatives:
+      - id: host-user-with-same-uid
+        description: Create a service account with that UID on the host and make it the owner.
+        steps:
+          - on: cl-thumbs-01
+            as: learner
+            run: |
+              sudo useradd --system --no-create-home --uid {{uid}} thumbs
+              sudo chown thumbs: /srv/thumbs
+              sleep 5
+              docker logs --tail 2 thumbnailer

@@ -1,0 +1,299 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-compose-proxy-repair
+  title: Repair the caption-render proxy that answers 502
+  domain: containers
+  frameworks: [ex188-aligned:troubleshoot, docker-practitioner:compose, docker-practitioner:networking]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [docker, compose, networks, proxy, nginx]
+  version: 1
+spec:
+  description: |
+    On `cl-captions-01` (`ssh cl-captions-01`; you are in the `docker` group) the
+    project in `~/captions` runs a reverse proxy (nginx, a stand-in for the production
+    proxy) on host port **{{port}}** in front of two caption renderers, `render1` and
+    `render2`. Every request through the proxy fails with **502 Bad Gateway**.
+
+    The proxy configuration is `~/captions/nginx.conf`, mounted into the proxy
+    container. Repair the **Compose project** (and the proxy configuration it mounts)
+    so that:
+
+    - requests to `http://127.0.0.1:{{port}}/` are answered by **both** renderers
+      (`renderer 1` and `renderer 2`);
+    - the renderers are reachable only through the proxy: they publish **no ports** on
+      the host;
+    - all three services keep running as project `captions`.
+
+    Hint on tooling: `docker compose logs proxy` says what the proxy cannot reach, and
+    nginx reads its configuration only when it starts or reloads.
+  objectives:
+    - Diagnose a 502 from a reverse proxy in a Compose project
+    - Put services that must talk on a common network
+    - Use the container port rather than a published port between services
+  params:
+    port:
+      type: int
+      min: 8700
+      max: 8799
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-captions-01
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-captions-01
+      timeoutSec: 300
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        docker ps -aq --filter label=com.docker.compose.project=captions | xargs -r docker rm -f >/dev/null
+        d=$(mktemp -d); mkdir "$d/www"
+        printf '%s\n' '#!/bin/sh' 'echo "renderer $RENDERER_ID" > /www/index.html' 'exec httpd -f -p "${PORT:-9000}" -h /www' > "$d/run.sh"
+        chmod 0755 "$d/run.sh"
+        printf '%s\n' 'FROM busybox:1.37' 'COPY run.sh /run.sh' 'EXPOSE 9000' 'ENTRYPOINT ["/run.sh"]' > "$d/Dockerfile"
+        docker build -q -t copperleaf/caption-render:1.3 "$d" >/dev/null; rm -rf "$d"
+        p=/home/learner/captions
+        rm -rf "$p"; install -d -o learner -g learner "$p"
+        cat > "$p/nginx.conf" <<'CONF'
+        events {}
+        http {
+          resolver 127.0.0.11 valid=5s;
+          split_clients "${request_id}" $backend {
+            50% render1;
+            *   render2;
+          }
+          server {
+            listen 80;
+            location / {
+              proxy_pass http://$backend:8080;
+              proxy_connect_timeout 2s;
+            }
+          }
+        }
+        CONF
+        cat > "$p/compose.yaml" <<'YML'
+        name: captions
+        services:
+          proxy:
+            image: nginx:1.29-alpine
+            volumes:
+              - ./nginx.conf:/etc/nginx/nginx.conf:ro
+            ports:
+              - "{{port}}:80"
+            networks: [edge]
+          render1:
+            image: copperleaf/caption-render:1.3
+            environment:
+              RENDERER_ID: "1"
+            networks: [render]
+          render2:
+            image: copperleaf/caption-render:1.3
+            environment:
+              RENDERER_ID: "2"
+            networks: [render]
+        networks:
+          edge: {}
+          render: {}
+        YML
+        chown -R learner:learner "$p"
+        (cd "$p" && docker compose up -d >/dev/null 2>&1) || true
+  checks:
+    - id: both-renderers-answer
+      description: 30 requests through the proxy are all answered, by both renderers
+      type: shell
+      timeoutSec: 120
+      on: cl-captions-01
+      skills: [containers.compose.model, containers.network.bridge-dns]
+      weight: 4
+      command: |
+        a=0; b=0; bad=0
+        for i in $(seq 30); do
+          r=$(curl -s -m 4 http://127.0.0.1:{{port}}/ 2>/dev/null)
+          case "$r" in "renderer 1") a=$((a+1)) ;; "renderer 2") b=$((b+1)) ;; *) bad=$((bad+1)) ;; esac
+        done
+        if [ "$bad" -eq 0 ] && [ "$a" -ge 5 ] && [ "$b" -ge 5 ]; then echo both-served; else echo "r1=$a r2=$b failed=$bad"; fi
+      expect: {match: exact, value: both-served}
+    - id: proxy-shares-network
+      description: The proxy shares a network with each renderer
+      type: shell
+      timeoutSec: 60
+      on: cl-captions-01
+      skills: [containers.network.bridge-dns]
+      weight: 2
+      command: |
+        nets() { c=$(docker ps -q --filter label=com.docker.compose.project=captions --filter label=com.docker.compose.service="$1" | head -1); [ -n "$c" ] && docker inspect "$c" | jq -r '.[0].NetworkSettings.Networks | keys[]'; }
+        p=$(nets proxy)
+        for s in render1 render2; do
+          if nets "$s" | grep -qxF "$p"; then printf '%s=shared ' "$s"; else printf '%s=separate ' "$s"; fi
+        done | sed 's/ $//'
+      expect: {match: exact, value: "render1=shared render2=shared"}
+    - id: renderers-unpublished
+      description: Neither renderer publishes a port and the proxy still publishes the front port
+      type: shell
+      timeoutSec: 60
+      on: cl-captions-01
+      skills: [containers.compose.model, containers.network.publishing]
+      weight: 2
+      command: |
+        pub() { c=$(docker ps -q --filter label=com.docker.compose.project=captions --filter label=com.docker.compose.service="$1" | head -1); [ -n "$c" ] && docker inspect "$c" | jq -r '[.[0].HostConfig.PortBindings // {} | to_entries[] | .value[]?.HostPort] | join(",")'; }
+        echo "proxy=$(pub proxy) render1=$(pub render1) render2=$(pub render2)"
+      expect: {match: exact, value: "proxy={{port}} render1= render2="}
+    - id: three-services-running
+      description: The project captions has a running proxy, render1 and render2
+      type: shell
+      timeoutSec: 60
+      on: cl-captions-01
+      skills: [containers.compose.model]
+      weight: 1
+      command: |
+        n() { docker ps -q --filter label=com.docker.compose.project=captions --filter label=com.docker.compose.service="$1" | wc -l; }
+        echo "proxy=$(n proxy) render1=$(n render1) render2=$(n render2)"
+      expect: {match: exact, value: "proxy=1 render1=1 render2=1"}
+  hints:
+    - title: Read the proxy's log
+      body: "`docker compose logs proxy` shows the failing upstream: the name either does not resolve or the connection is refused. Docker's DNS resolves service names only on networks the caller is attached to."
+      cost: 1
+    - title: Two separate faults
+      body: "The proxy and the renderers are on different networks, and the proxy dials port 8080 while the renderers listen on 9000 (look at `docker compose exec render1 netstat -ln`, or at the image's EXPOSE)."
+      cost: 2
+    - title: Reload after editing
+      body: "Compose does not notice a changed bind-mounted file. After editing nginx.conf run `docker compose restart proxy` (or `docker compose exec proxy nginx -s reload`)."
+      command: cd ~/captions && docker compose restart proxy
+      cost: 1
+  misconceptions:
+    - id: publish-renderers
+      description: Publishes both renderers on host ports and points the proxy at the host.
+      feedback: "That makes the proxy work but exposes internal services on the host. Containers on a shared network reach each other on the container port, no publishing needed."
+      expectFail: [renderers-unpublished, proxy-shares-network]
+      mutation:
+        on: cl-captions-01
+        as: learner
+        run: |
+          cd ~/captions
+          cat > nginx.conf <<'CONF'
+          events {}
+          http {
+            split_clients "${request_id}" $backend {
+              50% 172.17.0.1:9001;
+              *   172.17.0.1:9002;
+            }
+            server {
+              listen 80;
+              location / { proxy_pass http://$backend; }
+            }
+          }
+          CONF
+          cat > compose.yaml <<'YML'
+          name: captions
+          services:
+            proxy:
+              image: nginx:1.29-alpine
+              volumes: ["./nginx.conf:/etc/nginx/nginx.conf:ro"]
+              ports: ["{{port}}:80"]
+              networks: [edge]
+            render1:
+              image: copperleaf/caption-render:1.3
+              environment: {RENDERER_ID: "1"}
+              ports: ["9001:9000"]
+              networks: [render]
+            render2:
+              image: copperleaf/caption-render:1.3
+              environment: {RENDERER_ID: "2"}
+              ports: ["9002:9000"]
+              networks: [render]
+          networks:
+            edge: {}
+            render: {}
+          YML
+          docker compose up -d --force-recreate
+    - id: network-only
+      description: Joins the proxy to the renderers' network but leaves the upstream port at 8080.
+      feedback: "The name resolves now, but nothing listens on 8080 in the renderers. Use the port they actually listen on (9000)."
+      expectFail: [both-renderers-answer]
+      mutation:
+        on: cl-captions-01
+        as: learner
+        run: |
+          cd ~/captions
+          sed -i 's/networks: \[edge\]/networks: [edge, render]/' compose.yaml
+          docker compose up -d
+          docker compose restart proxy
+    - id: port-only
+      description: Corrects the upstream port but leaves the proxy on a different network.
+      feedback: "Docker's DNS only answers for networks a container is attached to, so the proxy still cannot resolve render1 and render2. Attach it to the renderers' network."
+      expectFail: [both-renderers-answer, proxy-shares-network]
+      mutation:
+        on: cl-captions-01
+        as: learner
+        run: |
+          cd ~/captions
+          sed -i 's/:8080/:9000/' nginx.conf
+          docker compose restart proxy
+  solution:
+    explanation: |
+      The proxy needs two things: a network it shares with both renderers (service names
+      resolve only inside a shared network) and the port the renderers really listen on,
+      9000. Nothing has to be published for container-to-container traffic.
+    steps:
+      - on: cl-captions-01
+        as: learner
+        run: |
+          cd ~/captions
+          sed -i 's/:8080/:9000/' nginx.conf
+          sed -i 's/networks: \[edge\]/networks: [edge, render]/' compose.yaml
+          docker compose up -d
+          docker compose restart proxy
+          sleep 2
+          for i in 1 2 3 4 5 6; do curl -s localhost:{{port}}/; done
+    alternatives:
+      - id: single-network-upstream
+        description: Put all three services on one network and use an upstream block with both renderers, restarting only the proxy.
+        steps:
+          - on: cl-captions-01
+            as: learner
+            run: |
+              cd ~/captions
+              cat > nginx.conf <<'CONF'
+              events {}
+              http {
+                upstream renderers {
+                  server render1:9000;
+                  server render2:9000;
+                }
+                server {
+                  listen 80;
+                  location / { proxy_pass http://renderers; }
+                }
+              }
+              CONF
+              cat > compose.yaml <<'YML'
+              name: captions
+              services:
+                proxy:
+                  image: nginx:1.29-alpine
+                  volumes:
+                    - ./nginx.conf:/etc/nginx/nginx.conf:ro
+                  ports:
+                    - "{{port}}:80"
+                  depends_on: [render1, render2]
+                render1:
+                  image: copperleaf/caption-render:1.3
+                  environment:
+                    RENDERER_ID: "1"
+                render2:
+                  image: copperleaf/caption-render:1.3
+                  environment:
+                    RENDERER_ID: "2"
+              YML
+              docker compose down
+              docker compose up -d

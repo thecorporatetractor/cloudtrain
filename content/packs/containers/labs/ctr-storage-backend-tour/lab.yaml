@@ -1,0 +1,158 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-storage-backend-tour
+  title: Find where the engine really keeps image layers
+  domain: containers
+  frameworks: [dca-legacy:storage, docker-practitioner:storage]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [docker, storage, containerd, overlay2, layers]
+  version: 1
+spec:
+  description: |
+    `cl-store-01` (`ssh cl-store-01`; you are in the `docker` group, with `sudo`) is a
+    freshly installed Engine 29 host. Nobody wrote down how it stores images. The image
+    **`copperleaf/transcoder:2.{{rel}}`** was built here; its last layer adds the file
+    `/opt/transcoder/build-{{rel}}`.
+
+    Write **`~/storage-report.txt`** with exactly these three lines, taken from the host
+    and not from documentation:
+
+    ```
+    image-store: containerd-snapshotter    (or: graph-driver)
+    driver: <the storage driver name the engine reports>
+    top-layer: <absolute host path of the directory holding that last layer's files>
+    ```
+
+    `top-layer` is the directory in which `opt/transcoder/build-{{rel}}` exists as a
+    regular file path (that is, the layer's own contents, not a merged view of a container).
+  objectives:
+    - Tell the containerd image store from a graph driver using the engine's own report
+    - Name the storage driver the engine reports
+    - Locate a layer's files on the host file system
+  params:
+    rel:
+      type: int
+      min: 10
+      max: 99
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-store-01
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-store-01
+      timeoutSec: 240
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        docker rmi -f copperleaf/transcoder:2.{{rel}} >/dev/null 2>&1 || true
+        d=$(mktemp -d)
+        printf '%s\n' 'FROM busybox:1.37' 'RUN mkdir -p /opt/transcoder && echo "release {{rel}}" > /opt/transcoder/build-{{rel}}' 'CMD ["sleep", "3600"]' > "$d/Dockerfile"
+        docker build -q -t copperleaf/transcoder:2.{{rel}} "$d" >/dev/null
+        rm -rf "$d"
+        rm -f /home/learner/storage-report.txt
+  checks:
+    - id: store-kind
+      description: The report names the right kind of image store
+      type: shell
+      timeoutSec: 30
+      on: cl-store-01
+      skills: [containers.storage.backends]
+      weight: 3
+      command: |
+        t=$(docker info --format json | jq -r '[.DriverStatus[]? | select(.[0] == "driver-type") | .[1]] | .[0] // ""')
+        if [ "$t" = "io.containerd.snapshotter.v1" ]; then want=containerd-snapshotter; else want=graph-driver; fi
+        got=$(grep '^image-store:' /home/learner/storage-report.txt 2>/dev/null | head -1 | sed 's/^image-store:[[:space:]]*//; s/[[:space:]]*$//')
+        [ "$got" = "$want" ] && echo ok || echo "wrong (got '$got')"
+      expect: {match: exact, value: ok}
+    - id: driver-name
+      description: The report names the storage driver exactly as the engine reports it
+      type: shell
+      timeoutSec: 30
+      on: cl-store-01
+      skills: [containers.storage.backends]
+      weight: 3
+      command: |
+        want=$(docker info --format json | jq -r '.Driver')
+        got=$(grep '^driver:' /home/learner/storage-report.txt 2>/dev/null | head -1 | sed 's/^driver:[[:space:]]*//; s/[[:space:]]*$//')
+        [ -n "$want" ] && [ "$got" = "$want" ] && echo ok || echo "wrong (got '$got')"
+      expect: {match: exact, value: ok}
+    - id: top-layer-path
+      description: top-layer is a directory that really holds the transcoder's last layer
+      type: shell
+      timeoutSec: 60
+      on: cl-store-01
+      skills: [containers.storage.backends]
+      weight: 4
+      command: |
+        p=$(grep '^top-layer:' /home/learner/storage-report.txt 2>/dev/null | head -1 | sed 's/^top-layer:[[:space:]]*//; s/[[:space:]]*$//')
+        case "$p" in /var/lib/*) ;; *) echo "not-a-store-path"; exit 0 ;; esac
+        [ -d "$p" ] || { echo missing; exit 0; }
+        if [ -f "$p/opt/transcoder/build-{{rel}}" ] || [ -f "$p/fs/opt/transcoder/build-{{rel}}" ] || [ -f "$p/diff/opt/transcoder/build-{{rel}}" ]; then echo ok; else echo "layer-not-here"; fi
+      expect: {match: exact, value: ok}
+  hints:
+    - title: Ask the engine
+      body: "`docker info --format json | jq '{Driver, DriverStatus}'` reports the driver; with the containerd image store `DriverStatus` includes a `driver-type` entry that a graph driver does not have."
+      cost: 1
+    - title: Find the layer by its file
+      body: "The layer is a directory somewhere under /var/lib. `sudo find /var/lib/containerd /var/lib/docker -path '*/opt/transcoder/build-{{rel}}'` lists matches; the report wants the directory above `opt`."
+      cost: 2
+  misconceptions:
+    - id: assumed-overlay2
+      description: Writes the classic answer from memory.
+      feedback: "On Engine 29 a fresh install uses the containerd image store, not the classic overlay2 graph driver. Read it from docker info and the file system."
+      expectFail: [store-kind, driver-name, top-layer-path]
+      mutation:
+        on: cl-store-01
+        as: learner
+        run: |
+          printf '%s\n' 'image-store: graph-driver' 'driver: overlay2' 'top-layer: /var/lib/docker/overlay2' > ~/storage-report.txt
+    - id: store-root-only
+      description: Names the root of the store instead of the layer.
+      feedback: "The path must hold the layer's own files: the directory whose opt/ contains the transcoder build file."
+      expectFail: [top-layer-path]
+      mutation:
+        on: cl-store-01
+        as: learner
+        run: |
+          t=$(docker info --format json | jq -r '[.DriverStatus[]? | select(.[0] == "driver-type") | .[1]] | .[0] // ""')
+          if [ "$t" = "io.containerd.snapshotter.v1" ]; then s=containerd-snapshotter; else s=graph-driver; fi
+          printf '%s\n' "image-store: $s" "driver: $(docker info --format json | jq -r .Driver)" 'top-layer: /var/lib/containerd' > ~/storage-report.txt
+  solution:
+    explanation: |
+      docker info reports the driver and, for the containerd image store, a driver-type of
+      io.containerd.snapshotter.v1. The top layer is found by searching the engine's data
+      directories for the file the last build step added.
+    steps:
+      - on: cl-store-01
+        as: learner
+        run: |
+          drv=$(docker info --format json | jq -r .Driver)
+          typ=$(docker info --format json | jq -r '[.DriverStatus[]? | select(.[0] == "driver-type") | .[1]] | .[0] // ""')
+          if [ "$typ" = "io.containerd.snapshotter.v1" ]; then store=containerd-snapshotter; else store=graph-driver; fi
+          top=$(sudo find /var/lib/containerd /var/lib/docker -path '*/opt/transcoder/build-{{rel}}' 2>/dev/null | head -1 | sed 's#/opt/transcoder/build-{{rel}}$##')
+          printf '%s\n' "image-store: $store" "driver: $drv" "top-layer: $top" > ~/storage-report.txt
+          cat ~/storage-report.txt
+    alternatives:
+      - id: from-image-inspect
+        description: Start from the image's own data, then confirm the path on disk.
+        steps:
+          - on: cl-store-01
+            as: learner
+            run: |
+              docker image inspect copperleaf/transcoder:2.{{rel}} | jq '.[0].GraphDriver, .[0].RootFS'
+              drv=$(docker info --format json | jq -r .Driver)
+              typ=$(docker info --format json | jq -r '[.DriverStatus[]? | select(.[0] == "driver-type") | .[1]] | .[0] // ""')
+              if [ "$typ" = "io.containerd.snapshotter.v1" ]; then store=containerd-snapshotter; else store=graph-driver; fi
+              top=$(sudo find / -xdev -path '*/opt/transcoder/build-{{rel}}' -not -path '/proc/*' 2>/dev/null | head -1 | sed 's#/opt/transcoder/build-{{rel}}$##')
+              printf '%s\n' "image-store: $store" "driver: $drv" "top-layer: $top" > ~/storage-report.txt

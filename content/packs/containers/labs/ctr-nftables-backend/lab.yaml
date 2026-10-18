@@ -1,0 +1,335 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-nftables-backend
+  title: Move the edge host's engine to the nftables firewall backend
+  domain: containers
+  frameworks: [docker-practitioner:networking]
+  difficulty: hard
+  estimatedMinutes: 25
+  tags: [docker, nftables, firewall, daemon-json]
+  version: 1
+spec:
+  description: |
+    On `cl-edge-01` (`ssh cl-edge-01`; you are in the `docker` group, with `sudo`) the
+    engine still writes its firewall rules with iptables. The container
+    **`transcoder-edge`** publishes port **{{port}}** (container port 8080); a unit
+    `cl-edge-user.service` adds an iptables rule to `DOCKER-USER` so that only the
+    partner range `198.51.100.0/24` reaches it. Two simulated clients are attached by
+    the lab (`ip netns exec partner ...` at 198.51.100.10, `ip netns exec other ...` at
+    203.0.113.10, host-side addresses 198.51.100.1 and 203.0.113.1).
+
+    Move the host to the engine's **nftables firewall backend**:
+
+    1. Set `"firewall-backend": "nftables"` in `/etc/docker/daemon.json` **without
+       losing the other keys** there, and restart the engine. The old backend's chains
+       and its `FORWARD` policy are left behind in iptables; remove them (with the
+       engine stopped) so that after a restart `iptables-save` shows **no Docker
+       chains**: the engine no longer writes iptables rules.
+    2. `DOCKER-USER` does not exist under this backend. Replace the old unit with an
+       **nftables rule of your own** (your own table, not Docker's) that lets only
+       `198.51.100.0/24` reach port {{port}}, applied by a systemd unit after
+       `docker.service`, and retire `cl-edge-user.service`.
+    3. The page (`transcoder-edge {{n}}`) must still reach the partner client and nobody
+       else, also after an engine restart.
+  objectives:
+    - Switch the engine's firewall backend and verify it from the host's rule sets
+    - Translate a DOCKER-USER rule into a user-owned nftables table
+    - Clean up the previous backend's leftovers
+  params:
+    port:
+      type: int
+      min: 18000
+      max: 18999
+    n:
+      type: int
+      min: 100
+      max: 999
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-edge-01
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-edge-01
+      timeoutSec: 300
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        cat > /usr/local/sbin/cl-sim-clients <<'SH'
+        #!/bin/sh
+        # Lab fixture: client "partner" (198.51.100.0/24) and client "other" (203.0.113.0/24), each in its own namespace behind a veth.
+        mk() {
+          ns=$1; net=$2
+          ip netns list | grep -qw "$ns" || ip netns add "$ns"
+          ip link show "v$ns" >/dev/null 2>&1 || { ip link add "v$ns" type veth peer name "p$ns"; ip link set "p$ns" netns "$ns"; }
+          ip addr replace "$net.1/24" dev "v$ns"; ip link set "v$ns" up
+          ip netns exec "$ns" ip addr replace "$net.10/24" dev "p$ns"
+          ip netns exec "$ns" ip link set "p$ns" up; ip netns exec "$ns" ip link set lo up
+          ip netns exec "$ns" ip route replace default via "$net.1"
+        }
+        mk partner 198.51.100
+        mk other 203.0.113
+        SH
+        chmod 0755 /usr/local/sbin/cl-sim-clients
+        /usr/local/sbin/cl-sim-clients
+        # engine on the iptables backend with a host label the learner must keep
+        install -d /etc/docker
+        echo '{"labels": ["site=copperleaf-edge"]}' > /etc/docker/daemon.json
+        systemctl restart docker
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        rm -f /etc/systemd/system/cl-edge-nft.service /etc/copperleaf/edge.nft
+        nft list tables 2>/dev/null | awk '$2 !~ /docker/ && $3 ~ /cl_/ {print $2, $3}' | while read -r f t; do nft delete table "$f" "$t"; done || true
+        d=$(mktemp -d); mkdir "$d/www"; echo "transcoder-edge {{n}}" > "$d/www/index.html"
+        printf '%s\n' 'FROM busybox:1.37' 'COPY www /www' 'EXPOSE 8080' 'CMD ["httpd", "-f", "-p", "8080", "-h", "/www"]' > "$d/Dockerfile"
+        docker build -q -t copperleaf/transcoder-edge:1 "$d" >/dev/null; rm -rf "$d"
+        docker rm -f transcoder-edge >/dev/null 2>&1 || true
+        docker run -d --name transcoder-edge --restart unless-stopped -p {{port}}:8080 copperleaf/transcoder-edge:1 >/dev/null
+        cat > /etc/systemd/system/cl-edge-user.service <<'UNIT'
+        [Unit]
+        Description=Allow the transcoder edge port from the partner range only (iptables)
+        After=docker.service
+        PartOf=docker.service
+
+        [Service]
+        Type=oneshot
+        RemainAfterExit=yes
+        ExecStart=/bin/sh -c 'iptables -C DOCKER-USER -p tcp -m conntrack --ctorigdstport {{port}} --ctdir ORIGINAL ! -s 198.51.100.0/24 -j DROP 2>/dev/null || iptables -I DOCKER-USER -p tcp -m conntrack --ctorigdstport {{port}} --ctdir ORIGINAL ! -s 198.51.100.0/24 -j DROP'
+
+        [Install]
+        WantedBy=multi-user.target docker.service
+        UNIT
+        systemctl daemon-reload
+        systemctl enable --now cl-edge-user.service
+  checks:
+    - id: nftables-backend-active
+      description: daemon.json selects the nftables backend, keeps the host label, and the engine has Docker tables in nftables
+      type: shell
+      timeoutSec: 60
+      on: cl-edge-01
+      skills: [containers.network.host-firewall, containers.operations.daemon-config]
+      weight: 3
+      command: |
+        b=$(jq -r '."firewall-backend" // "unset"' /etc/docker/daemon.json 2>/dev/null || echo invalid)
+        l=$(docker info --format json 2>/dev/null | jq -r '(.Labels // []) | if index("site=copperleaf-edge") then "kept" else "lost" end')
+        t=$(nft list tables 2>/dev/null | grep -ci docker || true)
+        echo "$b label=$l docker-tables=$([ "${t:-0}" -ge 1 ] && echo yes || echo no)"
+      expect: {match: exact, value: "nftables label=kept docker-tables=yes"}
+    - id: no-iptables-chains
+      description: After an engine restart iptables holds no Docker chains
+      type: shell
+      timeoutSec: 180
+      on: cl-edge-01
+      skills: [containers.network.host-firewall]
+      weight: 3
+      command: |
+        systemctl restart docker
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        c=$(iptables-save 2>/dev/null | grep -ciE '^:DOCKER|docker' || true)
+        echo "docker-chains=${c:-0}"
+      expect: {match: exact, value: "docker-chains=0"}
+    - id: partner-allowed
+      description: The partner client still gets the page
+      type: shell
+      timeoutSec: 60
+      on: cl-edge-01
+      skills: [containers.network.host-firewall]
+      weight: 1.5
+      command: |
+        /usr/local/sbin/cl-sim-clients
+        ip netns exec partner curl -s --max-time 4 -w '|%{http_code}' http://198.51.100.1:{{port}}/ 2>/dev/null | tr -d '\n'
+      expect: {match: exact, value: "transcoder-edge {{n}}|200"}
+    - id: other-blocked
+      description: The other client gets no answer
+      type: shell
+      timeoutSec: 60
+      on: cl-edge-01
+      skills: [containers.network.host-firewall]
+      weight: 3
+      command: |
+        /usr/local/sbin/cl-sim-clients
+        ip netns exec other curl -s --max-time 4 -w '|%{http_code}' http://203.0.113.1:{{port}}/ 2>/dev/null | tr -d '\n'
+      expect: {match: exact, value: "|000"}
+    - id: own-table-and-old-unit-retired
+      description: A table that is not Docker's holds the drop rule, and the old iptables unit is no longer enabled
+      type: shell
+      timeoutSec: 60
+      on: cl-edge-01
+      skills: [containers.network.host-firewall]
+      weight: 2
+      command: |
+        n=$(nft list ruleset 2>/dev/null | awk '/^table/{t=$0} /(drop|reject)/{ if (t !~ /docker/) c++ } END{print c+0}')
+        u=$(systemctl is-enabled cl-edge-user.service 2>/dev/null || true)
+        echo "own-drop-rules=$([ "$n" -ge 1 ] && echo yes || echo no) old-unit=$([ "$u" = enabled ] && echo enabled || echo retired)"
+      expect: {match: exact, value: "own-drop-rules=yes old-unit=retired"}
+    - id: survives-restart
+      description: After deleting the non-Docker tables and restarting the engine and the units, the filter is applied again
+      type: shell
+      timeoutSec: 300
+      on: cl-edge-01
+      skills: [containers.network.host-firewall, containers.operations.restart-health]
+      weight: 3
+      command: |
+        /usr/local/sbin/cl-sim-clients
+        nft list tables 2>/dev/null | awk '$2 !~ /docker/ {print $2, $3}' | while read -r f t; do nft delete table "$f" "$t" 2>/dev/null; done
+        systemctl restart docker
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        for u in $(grep -lE '(PartOf|WantedBy|RequiredBy|After)=.*docker\.service' /etc/systemd/system/*.service 2>/dev/null | xargs -r -n1 basename); do [ "$u" = cl-edge-user.service ] && continue; systemctl restart "$u" >/dev/null 2>&1 || true; done
+        for i in $(seq 60); do curl -fs --max-time 2 -o /dev/null http://127.0.0.1:{{port}}/ && break; sleep 2; done
+        /usr/local/sbin/cl-sim-clients
+        a=$(ip netns exec partner curl -s --max-time 4 -w '|%{http_code}' http://198.51.100.1:{{port}}/ 2>/dev/null | tr -d '\n')
+        b=$(ip netns exec other curl -s --max-time 4 -w '|%{http_code}' http://203.0.113.1:{{port}}/ 2>/dev/null | tr -d '\n')
+        echo "$a $b"
+      expect: {match: exact, value: "transcoder-edge {{n}}|200 |000"}
+  hints:
+    - title: Switching backends leaves iptables debris
+      body: "The engine does not clean up rules that the iptables backend wrote earlier. Stop the engine, flush and delete the chains in the `filter` and `nat` tables, and set the `FORWARD` policy back to ACCEPT (the old backend left it on DROP) before you start it again."
+      command: sudo systemctl stop docker docker.socket && sudo iptables -P FORWARD ACCEPT && sudo iptables -F && sudo iptables -X && sudo iptables -t nat -F && sudo iptables -t nat -X
+      cost: 2
+    - title: Your own table, your own hook
+      body: "Under nftables the engine owns its tables and has no DOCKER-USER. Create a table of your own with a base chain on the `forward` hook; a drop in any base chain on that hook is final. `ct original proto-dst` matches the port before NAT."
+      command: |
+        sudo nft add table inet cl_edge && sudo nft 'add chain inet cl_edge forward { type filter hook forward priority -10 ; policy accept ; }'
+      cost: 2
+    - title: Persist with a file and a unit
+      body: "Keep the rules in a file (starting with `table inet cl_edge`, `delete table inet cl_edge`, then the table, so it can be loaded repeatedly) and load it with `nft -f` from a oneshot unit with `After=docker.service` and `PartOf=docker.service`. Do not use a file that starts with `flush ruleset`: it would delete the engine's tables."
+      cost: 2
+  misconceptions:
+    - id: backend-only
+      description: Switches the backend and restarts the engine, but writes no replacement for the DOCKER-USER rule.
+      feedback: "The old rule lived in a chain the nftables backend does not create. Without a rule of your own the port is open to every client again."
+      expectFail: [other-blocked, own-table-and-old-unit-retired, survives-restart]
+      mutation:
+        on: cl-edge-01
+        as: learner
+        run: |
+          sudo systemctl disable --now cl-edge-user.service
+          sudo systemctl stop docker docker.socket
+          sudo iptables -P FORWARD ACCEPT; sudo iptables -F; sudo iptables -X; sudo iptables -t nat -F; sudo iptables -t nat -X
+          sudo sh -c 'jq ". + {\"firewall-backend\": \"nftables\"}" /etc/docker/daemon.json > /etc/docker/daemon.json.new && mv /etc/docker/daemon.json.new /etc/docker/daemon.json'
+          sudo systemctl start docker
+    - id: not-persistent
+      description: Adds the nftables rule by hand without a unit.
+      feedback: "The rule works until the table is lost (a reboot, or the file never loaded). Keep it in a file and load it from a unit that runs after docker.service."
+      expectFail: [survives-restart]
+      mutation:
+        on: cl-edge-01
+        as: learner
+        run: |
+          sudo systemctl disable --now cl-edge-user.service
+          sudo systemctl stop docker docker.socket
+          sudo iptables -P FORWARD ACCEPT; sudo iptables -F; sudo iptables -X; sudo iptables -t nat -F; sudo iptables -t nat -X
+          sudo sh -c 'jq ". + {\"firewall-backend\": \"nftables\"}" /etc/docker/daemon.json > /etc/docker/daemon.json.new && mv /etc/docker/daemon.json.new /etc/docker/daemon.json'
+          sudo systemctl start docker
+          sudo nft add table inet cl_edge
+          sudo nft 'add chain inet cl_edge forward { type filter hook forward priority -10 ; policy accept ; }'
+          sudo nft add rule inet cl_edge forward meta l4proto tcp ct original proto-dst {{port}} ip saddr != 198.51.100.0/24 drop
+    - id: daemon-json-overwritten
+      description: Replaces daemon.json with only the firewall-backend key.
+      feedback: "daemon.json held other settings (the host label). Merge the key into the existing file."
+      expectFail: [nftables-backend-active]
+      mutation:
+        on: cl-edge-01
+        as: learner
+        run: |
+          echo '{"firewall-backend": "nftables"}' | sudo tee /etc/docker/daemon.json
+          sudo systemctl stop docker docker.socket
+          sudo iptables -P FORWARD ACCEPT; sudo iptables -F; sudo iptables -X; sudo iptables -t nat -F; sudo iptables -t nat -X
+          sudo systemctl start docker
+  solution:
+    explanation: |
+      Stop the engine, remove what the iptables backend left behind, select the nftables
+      backend by merging the key into daemon.json and start the engine again. The engine
+      then owns its own nftables tables; the partner-only rule moves to a table of the
+      host's own that drops forwarded traffic to the original port from any other source,
+      loaded by a unit after docker.service.
+    steps:
+      - on: cl-edge-01
+        as: learner
+        run: |
+          sudo systemctl disable --now cl-edge-user.service
+          sudo rm -f /etc/systemd/system/cl-edge-user.service
+          sudo systemctl daemon-reload
+          sudo systemctl stop docker docker.socket
+          sudo iptables -P FORWARD ACCEPT; sudo iptables -F; sudo iptables -X
+          sudo iptables -t nat -F; sudo iptables -t nat -X
+          sudo sh -c 'jq ". + {\"firewall-backend\": \"nftables\"}" /etc/docker/daemon.json > /etc/docker/daemon.json.new && mv /etc/docker/daemon.json.new /etc/docker/daemon.json'
+          sudo systemctl start docker
+          sudo mkdir -p /etc/copperleaf
+          sudo tee /etc/copperleaf/edge.nft >/dev/null <<'NFT'
+          table inet cl_edge
+          delete table inet cl_edge
+          table inet cl_edge {
+            chain forward {
+              type filter hook forward priority -10; policy accept;
+              meta l4proto tcp ct original proto-dst {{port}} ip saddr != 198.51.100.0/24 drop
+            }
+          }
+          NFT
+          sudo tee /etc/systemd/system/cl-edge-nft.service >/dev/null <<'UNIT'
+          [Unit]
+          Description=Allow the transcoder edge port from the partner range only (nftables)
+          After=docker.service
+          PartOf=docker.service
+
+          [Service]
+          Type=oneshot
+          RemainAfterExit=yes
+          ExecStart=/usr/sbin/nft -f /etc/copperleaf/edge.nft
+
+          [Install]
+          WantedBy=multi-user.target docker.service
+          UNIT
+          sudo systemctl daemon-reload
+          sudo systemctl enable --now cl-edge-nft.service
+          sudo nft list ruleset | grep -c cl_edge
+    alternatives:
+      - id: reject-and-allow-rule
+        description: An explicit accept for the partner range followed by a reject, in an ip-family table with a different priority.
+        steps:
+          - on: cl-edge-01
+            as: learner
+            run: |
+              sudo systemctl disable --now cl-edge-user.service
+              sudo rm -f /etc/systemd/system/cl-edge-user.service
+              sudo systemctl daemon-reload
+              sudo systemctl stop docker docker.socket
+              sudo iptables -P FORWARD ACCEPT; sudo iptables -F; sudo iptables -X
+              sudo iptables -t nat -F; sudo iptables -t nat -X
+              sudo sh -c 'jq ". + {\"firewall-backend\": \"nftables\"}" /etc/docker/daemon.json > /etc/docker/daemon.json.new && mv /etc/docker/daemon.json.new /etc/docker/daemon.json'
+              sudo systemctl start docker
+              sudo mkdir -p /etc/copperleaf
+              sudo tee /etc/copperleaf/edge-ads.nft >/dev/null <<'NFT'
+              table ip cl_edge4
+              delete table ip cl_edge4
+              table ip cl_edge4 {
+                chain guard {
+                  type filter hook forward priority filter - 5; policy accept;
+                  ct original proto-dst {{port}} ip saddr 198.51.100.0/24 accept
+                  ct original proto-dst {{port}} reject with icmp type port-unreachable
+                }
+              }
+              NFT
+              sudo tee /etc/systemd/system/cl-edge-nft.service >/dev/null <<'UNIT'
+              [Unit]
+              After=docker.service
+              PartOf=docker.service
+
+              [Service]
+              Type=oneshot
+              RemainAfterExit=yes
+              ExecStart=/usr/sbin/nft -f /etc/copperleaf/edge-ads.nft
+
+              [Install]
+              WantedBy=multi-user.target
+              UNIT
+              sudo systemctl daemon-reload
+              sudo systemctl enable --now cl-edge-nft.service

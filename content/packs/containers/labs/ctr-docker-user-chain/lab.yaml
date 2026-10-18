@@ -1,0 +1,255 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-docker-user-chain
+  title: Restrict the ad-insertion port to partner networks
+  domain: containers
+  frameworks: [dca-legacy:networking, dca-legacy:security, docker-practitioner:networking]
+  difficulty: hard
+  estimatedMinutes: 25
+  tags: [docker, iptables, docker-user, firewall, hack]
+  version: 1
+spec:
+  description: |
+    On `cl-ads-02` (`ssh cl-ads-02`; you are in the `docker` group, with `sudo`) the
+    ad-insertion container **`ads-insertion`** publishes port **{{port}}** (container
+    port 8090). The admin added `iptables -I INPUT ... ! -s 198.51.100.0/24 -j DROP`
+    for that port, expecting only the partner range `198.51.100.0/24` to get through,
+    but the port still answers everyone.
+
+    Two simulated client networks are attached to the host by the lab:
+
+    | Client | Address | Host-side address |
+    |---|---|---|
+    | partner (`ip netns exec partner ...`) | 198.51.100.10 | 198.51.100.1 |
+    | other network (`ip netns exec other ...`) | 203.0.113.10 | 203.0.113.1 |
+
+    1. **Attack first.** From the `other` client, fetch `http://203.0.113.1:{{port}}/` and
+       save the page you get to `~/bypass-proof.txt`: the admin's rule did not stop it.
+    2. **Mitigate.** Use the engine's `DOCKER-USER` chain so that only
+       `198.51.100.0/24` reaches the port (the page reads `ads-insertion {{n}}`), everyone
+       else gets no answer. Do not unpublish the port or stop the container.
+    3. The rules must **survive an engine restart** (a systemd unit that applies them
+       after `docker.service`).
+  objectives:
+    - Show why host INPUT rules do not apply to published container ports
+    - Filter in DOCKER-USER, matching the pre-NAT destination port
+    - Persist firewall rules across engine restarts
+  params:
+    port:
+      type: int
+      min: 18000
+      max: 18999
+    n:
+      type: int
+      min: 100
+      max: 999
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-ads-02
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-ads-02
+      timeoutSec: 300
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        # simulated client networks, rebuilt by this script (also run by the checks)
+        cat > /usr/local/sbin/cl-sim-clients <<'SH'
+        #!/bin/sh
+        # Lab fixture: client "partner" (198.51.100.0/24) and client "other" (203.0.113.0/24), each in its own namespace behind a veth.
+        mk() {
+          ns=$1; net=$2
+          ip netns list | grep -qw "$ns" || ip netns add "$ns"
+          ip link show "v$ns" >/dev/null 2>&1 || { ip link add "v$ns" type veth peer name "p$ns"; ip link set "p$ns" netns "$ns"; }
+          ip addr replace "$net.1/24" dev "v$ns"; ip link set "v$ns" up
+          ip netns exec "$ns" ip addr replace "$net.10/24" dev "p$ns"
+          ip netns exec "$ns" ip link set "p$ns" up; ip netns exec "$ns" ip link set lo up
+          ip netns exec "$ns" ip route replace default via "$net.1"
+        }
+        mk partner 198.51.100
+        mk other 203.0.113
+        SH
+        chmod 0755 /usr/local/sbin/cl-sim-clients
+        /usr/local/sbin/cl-sim-clients
+        d=$(mktemp -d); mkdir "$d/www"; echo "ads-insertion {{n}}" > "$d/www/index.html"
+        printf '%s\n' 'FROM busybox:1.37' 'COPY www /www' 'EXPOSE 8090' 'CMD ["httpd", "-f", "-p", "8090", "-h", "/www"]' > "$d/Dockerfile"
+        docker build -q -t copperleaf/ad-insertion-edge:1 "$d" >/dev/null; rm -rf "$d"
+        docker rm -f ads-insertion >/dev/null 2>&1 || true
+        docker run -d --name ads-insertion --restart unless-stopped -p {{port}}:8090 copperleaf/ad-insertion-edge:1 >/dev/null
+        # no leftovers from an earlier attempt, then the admin's (ineffective) INPUT rule
+        iptables -S DOCKER-USER 2>/dev/null | grep -E -- "{{port}}|198\.51\.100" | sed 's/^-A/-D/' | while read -r r; do iptables $r; done || true
+        iptables -S INPUT 2>/dev/null | grep -E -- "--dport {{port}}" | sed 's/^-A/-D/' | while read -r r; do iptables $r; done || true
+        rm -f /etc/systemd/system/cl-ads-user*.service
+        systemctl daemon-reload
+        iptables -I INPUT -p tcp --dport {{port}} ! -s 198.51.100.0/24 -j DROP
+        rm -f /home/learner/bypass-proof.txt
+  checks:
+    - id: partner-allowed
+      description: The partner client still gets the page
+      type: shell
+      timeoutSec: 60
+      on: cl-ads-02
+      skills: [containers.network.host-firewall]
+      weight: 1.5
+      command: |
+        /usr/local/sbin/cl-sim-clients
+        ip netns exec partner curl -s --max-time 4 -w '|%{http_code}' http://198.51.100.1:{{port}}/ 2>/dev/null | tr -d '\n'
+      expect: {match: exact, value: "ads-insertion {{n}}|200"}
+    - id: other-blocked
+      description: The other client gets no answer
+      type: shell
+      timeoutSec: 60
+      on: cl-ads-02
+      skills: [containers.network.host-firewall]
+      weight: 3
+      command: |
+        /usr/local/sbin/cl-sim-clients
+        ip netns exec other curl -s --max-time 4 -w '|%{http_code}' http://203.0.113.1:{{port}}/ 2>/dev/null | tr -d '\n'
+      expect: {match: exact, value: "|000"}
+    - id: user-chain-rule
+      description: DOCKER-USER holds a DROP or REJECT rule
+      type: shell
+      timeoutSec: 30
+      on: cl-ads-02
+      skills: [containers.network.host-firewall]
+      weight: 1
+      command: |
+        n=$(iptables -S DOCKER-USER 2>/dev/null | grep -cE -- '-j (DROP|REJECT)' || true)
+        [ "${n:-0}" -ge 1 ] && echo present || echo absent
+      expect: {match: exact, value: present}
+    - id: survives-restart
+      description: After the rules are flushed and the engine restarted, the filter is applied again
+      type: shell
+      timeoutSec: 300
+      on: cl-ads-02
+      skills: [containers.network.host-firewall, containers.operations.restart-health]
+      weight: 3
+      command: |
+        /usr/local/sbin/cl-sim-clients
+        iptables -S DOCKER-USER 2>/dev/null | grep -E -- '-j (DROP|REJECT)' | sed 's/^-A/-D/' | while read -r r; do iptables $r; done
+        systemctl restart docker
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        for u in $(grep -lE '(PartOf|WantedBy|RequiredBy)=.*docker\.service' /etc/systemd/system/*.service 2>/dev/null | xargs -r -n1 basename); do systemctl restart "$u" >/dev/null 2>&1 || true; done
+        for i in $(seq 60); do curl -fs --max-time 2 -o /dev/null http://127.0.0.1:{{port}}/ && break; sleep 2; done
+        /usr/local/sbin/cl-sim-clients
+        a=$(ip netns exec partner curl -s --max-time 4 -w '|%{http_code}' http://198.51.100.1:{{port}}/ 2>/dev/null | tr -d '\n')
+        b=$(ip netns exec other curl -s --max-time 4 -w '|%{http_code}' http://203.0.113.1:{{port}}/ 2>/dev/null | tr -d '\n')
+        echo "$a $b"
+      expect: {match: exact, value: "ads-insertion {{n}}|200 |000"}
+    - id: bypass-demonstrated
+      description: ~/bypass-proof.txt holds the page the other client received through the admin's rule
+      type: shell
+      timeoutSec: 30
+      on: cl-ads-02
+      skills: [containers.network.host-firewall]
+      weight: 1
+      command: |
+        grep -qx 'ads-insertion {{n}}' /home/learner/bypass-proof.txt 2>/dev/null && echo proved || echo missing
+      expect: {match: exact, value: proved}
+  hints:
+    - title: Why the INPUT rule does nothing
+      body: "A published port is forwarded to the container: the packet is rewritten (DNAT) in PREROUTING and then crosses the FORWARD chain, never INPUT. Docker evaluates the `DOCKER-USER` chain first in FORWARD for exactly this reason."
+      cost: 1
+    - title: Match the original port
+      body: "In DOCKER-USER the destination port is already the container's 8090. Match the published port with `-m conntrack --ctorigdstport {{port}} --ctdir ORIGINAL`, and negate the allowed source with `! -s 198.51.100.0/24`."
+      command: sudo iptables -I DOCKER-USER -p tcp -m conntrack --ctorigdstport {{port}} --ctdir ORIGINAL ! -s 198.51.100.0/24 -j DROP
+      cost: 2
+    - title: Make it stick
+      body: "A restart of the engine rebuilds its chains. Put the command in a script and run it from a oneshot unit with `After=docker.service` and `PartOf=docker.service`, enabled for multi-user.target."
+      cost: 2
+  misconceptions:
+    - id: post-nat-port
+      description: Matches --dport {{port}} in DOCKER-USER, which already holds the translated port.
+      feedback: "By the time a packet reaches DOCKER-USER it has been through DNAT, so its destination port is the container's 8090. Match the original destination port with -m conntrack --ctorigdstport."
+      expectFail: [other-blocked]
+      mutation:
+        on: cl-ads-02
+        as: learner
+        run: sudo iptables -I DOCKER-USER -p tcp --dport {{port}} ! -s 198.51.100.0/24 -j DROP
+    - id: input-chain-only
+      description: Relies on the INPUT rule or adds another one there.
+      feedback: "Published-port traffic is forwarded, so INPUT never sees it. The rule has to be in DOCKER-USER."
+      expectFail: [other-blocked, user-chain-rule]
+      mutation:
+        on: cl-ads-02
+        as: learner
+        run: sudo iptables -I INPUT -p tcp --dport {{port}} -s 203.0.113.0/24 -j REJECT
+    - id: not-persistent
+      description: Adds the right rule by hand without anything that restores it after an engine restart.
+      feedback: "The rule works now, but Docker rebuilds its firewall state when the engine restarts. Apply the rule from a systemd unit that runs after docker.service."
+      expectFail: [survives-restart]
+      mutation:
+        on: cl-ads-02
+        as: learner
+        run: |
+          sudo iptables -I DOCKER-USER -p tcp -m conntrack --ctorigdstport {{port}} --ctdir ORIGINAL ! -s 198.51.100.0/24 -j DROP
+          sudo sh -c 'ip netns exec other curl -s --max-time 4 http://203.0.113.1:{{port}}/' > ~/bypass-proof.txt || true
+  solution:
+    explanation: |
+      Traffic to a published port is DNATed and forwarded, so only the FORWARD-side
+      `DOCKER-USER` chain (evaluated before Docker's own rules) can filter it, and by then
+      the destination port is the container's; conntrack still knows the original one. A
+      oneshot unit re-applies the rule whenever the engine starts.
+    steps:
+      - on: cl-ads-02
+        as: learner
+        run: |
+          # attack first: the admin's INPUT rule does not stop the other client
+          sudo ip netns exec other curl -s --max-time 4 http://203.0.113.1:{{port}}/ | tee ~/bypass-proof.txt
+          sudo tee /etc/systemd/system/cl-ads-user.service >/dev/null <<'UNIT'
+          [Unit]
+          Description=Allow the ad-insertion port from the partner range only
+          After=docker.service
+          PartOf=docker.service
+
+          [Service]
+          Type=oneshot
+          RemainAfterExit=yes
+          ExecStart=/bin/sh -c 'iptables -C DOCKER-USER -p tcp -m conntrack --ctorigdstport {{port}} --ctdir ORIGINAL ! -s 198.51.100.0/24 -j DROP 2>/dev/null || iptables -I DOCKER-USER -p tcp -m conntrack --ctorigdstport {{port}} --ctdir ORIGINAL ! -s 198.51.100.0/24 -j DROP'
+
+          [Install]
+          WantedBy=multi-user.target docker.service
+          UNIT
+          sudo systemctl daemon-reload
+          sudo systemctl enable --now cl-ads-user.service
+    alternatives:
+      - id: allow-then-reject
+        description: Script with an explicit ACCEPT for the partner range followed by a REJECT, run from the unit.
+        steps:
+          - on: cl-ads-02
+            as: learner
+            run: |
+              sudo ip netns exec other curl -s --max-time 4 http://203.0.113.1:{{port}}/ > ~/bypass-proof.txt
+              sudo tee /usr/local/sbin/cl-ads-user.sh >/dev/null <<'SH'
+              #!/bin/sh
+              set -eu
+              m="-p tcp -m conntrack --ctorigdstport {{port}} --ctdir ORIGINAL"
+              iptables -C DOCKER-USER $m -s 198.51.100.0/24 -j RETURN 2>/dev/null || iptables -I DOCKER-USER $m -s 198.51.100.0/24 -j RETURN
+              iptables -C DOCKER-USER $m -j REJECT --reject-with icmp-port-unreachable 2>/dev/null || iptables -A DOCKER-USER $m -j REJECT --reject-with icmp-port-unreachable
+              SH
+              sudo chmod 0755 /usr/local/sbin/cl-ads-user.sh
+              sudo tee /etc/systemd/system/cl-ads-user.service >/dev/null <<'UNIT'
+              [Unit]
+              After=docker.service
+              PartOf=docker.service
+
+              [Service]
+              Type=oneshot
+              RemainAfterExit=yes
+              ExecStart=/usr/local/sbin/cl-ads-user.sh
+
+              [Install]
+              WantedBy=multi-user.target
+              UNIT
+              sudo systemctl daemon-reload
+              sudo systemctl enable --now cl-ads-user.service

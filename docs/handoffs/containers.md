@@ -282,6 +282,27 @@ No image blockers for the labs themselves; wishlist for the next image work stay
 
 Wave 2 once `el-vm:10` Podman is confirmed (boot one VM, `dnf install podman`, run a rootless container as a new user): the 5 learning labs first (they are the shortest to debug), then the exam tasks. Each verify is three VMs (workstation pod, el-vm, docker-vm) per seed; one containers verify at a time. The exam's reboot pass is not part of `labctl verify`.
 
+## Round 5, wave 3 (branch `content/containers-r5-w3`): Compose, networking and storage, 23 labs
+
+All 23 are marked built (never run live). Courses added to `pack.yaml` mirror the curriculum modules: `ctr-compose-model`, `ctr-compose-operate`, `ctr-compose-scale`, `ctr-net-basics`, `ctr-net-host`, `ctr-net-diagnose`, `ctr-storage-mounts`, `ctr-storage-backends`. Every lab is a workstation plus one `docker-vm:29` VM (`ctr-macvlan-encoder` adds a `nettools:1` studio node).
+
+### Recipes and substitutions
+- Compose labs grade `docker compose -p <proj> config --format json`, containers filtered by the compose project and service labels, and curl. redis:7.4-alpine stands in for PostgreSQL (`ctr-compose-healthy-start`); nginx:1.29-alpine stands in for Caddy (`ctr-compose-proxy-repair`).
+- Source-range firewall labs (`ctr-docker-user-chain`, `ctr-nftables-backend`) build network namespaces on the VM so traffic really crosses FORWARD and DOCKER-USER; checks use `ip netns exec`.
+- `ctr-image-mount-models`: image mount of a FROM scratch models image; the check reads `HostConfig.Mounts` (type image).
+- `ctr-storage-backend-tour`: the report is graded against `docker info --format json` and the layer's marker file on disk.
+- `ctr-containerd-store-migration`: setup publishes a two-platform index with provenance to a registry container, `docker save`s registry:3 and busybox:1.37, flips daemon.json to the overlay2 store (jq merge), restarts, `docker load`s them and restarts the registry on the same data directory. The learner flips back, recreates the registry (containers of the old store are not visible) and pulls the digest with all platforms.
+
+### Blockers and unconfirmed points
+- `ctr-macvlan-encoder`: needs a second NIC on a Multus L2 segment shared with the studio node; cannot pass until that exists.
+- `ctr-nftables-backend`: firewall-backend nftables is experimental in Engine 29; table and chain names must be confirmed on the image at the first live run.
+- `ctr-image-mount-models`: confirm `type=image` options (readonly, image-subpath) on the installed 29.x.
+- `ctr-compose-oci-publish`: confirm `docker compose publish` works against the plain-HTTP localhost registry (may need `--insecure-registry`).
+- `ctr-containerd-store-migration`: assumes `docker save` of the preloaded images, `docker load` into overlay2, `docker image inspect --platform` and `docker buildx imagetools inspect --raw` against localhost:5000 behave as documented; disk heavy.
+
+### Verify queue
+Wave 3 after waves 1 and 2: Compose labs first (`ctr-compose-first-stack` onward), then storage and basic networking, then the namespace-based firewall labs, `ctr-net-mtu-hang`, `ctr-containerd-store-migration`; `ctr-macvlan-encoder` last (blocked).
+
 ## Open questions for the user
 
 - Drop the legacy Docker-cert overlay path (`dca-legacy` refs stay on the labs until

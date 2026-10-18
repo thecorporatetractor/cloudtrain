@@ -1,0 +1,202 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-image-mount-models
+  title: Mount the caption OCR model pack from an image
+  domain: containers
+  frameworks: [docker-practitioner:storage]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [docker, mounts, image-mount, volumes]
+  version: 1
+spec:
+  description: |
+    On `cl-ocr-01` (`ssh cl-ocr-01`; you are in the `docker` group) the caption OCR
+    worker image `copperleaf/ocr-worker:1.0` is lean on purpose: it serves whatever is
+    mounted at `/models` over HTTP on port 8080 and carries no models itself. The model
+    pack, version **3.{{pack}}**, is a directory of files in `~/ocr-pack/models/`
+    (`VERSION` says `ocr-pack 3.{{pack}}`). The team wants a model update to be a new
+    image tag, not a new worker image.
+
+    1. **Ship the pack as its own image**, tagged **`copperleaf/ocr-models:{{pack}}`**
+       (a file-only image; no base OS needed).
+    2. **Run the worker** as the container **`ocr-worker`** from `copperleaf/ocr-worker:1.0`,
+       publishing container port 8080 on host port **{{port}}**, with the pack **mounted
+       read-only from that image** at `/models`. Do not bake the files into the worker image
+       and do not use a bind mount or a volume.
+
+    `curl http://localhost:{{port}}/VERSION` must return the pack version.
+  objectives:
+    - Package data as a file-only image
+    - Mount an image into a container with the image mount type
+    - Choose the image subpath so the files land where the application expects them
+  params:
+    pack:
+      type: int
+      min: 10
+      max: 89
+    port:
+      type: int
+      min: 8300
+      max: 8399
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-ocr-01
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-ocr-01
+      timeoutSec: 240
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        docker rm -f ocr-worker >/dev/null 2>&1 || true
+        docker rmi -f copperleaf/ocr-models:{{pack}} >/dev/null 2>&1 || true
+        d=$(mktemp -d)
+        printf '%s\n' 'FROM busybox:1.37' 'EXPOSE 8080' 'CMD ["httpd", "-f", "-p", "8080", "-h", "/models"]' > "$d/Dockerfile"
+        docker build -q -t copperleaf/ocr-worker:1.0 "$d" >/dev/null
+        rm -rf "$d"
+        install -d -m 0700 /var/lib/cloudtrain
+        docker image inspect copperleaf/ocr-worker:1.0 | jq -r '.[0].Id' > /var/lib/cloudtrain/ocr-worker.id
+        p=/home/learner/ocr-pack
+        rm -rf "$p"; install -d -o learner -g learner "$p" "$p/models"
+        echo "ocr-pack 3.{{pack}}" > "$p/models/VERSION"
+        head -c 200000 /dev/urandom > "$p/models/detector.bin"
+        head -c 120000 /dev/urandom > "$p/models/recognizer.bin"
+        chown -R learner:learner "$p"
+  checks:
+    - id: models-image
+      description: The pack exists as the image copperleaf/ocr-models:{{pack}}
+      type: shell
+      timeoutSec: 30
+      on: cl-ocr-01
+      skills: [containers.storage.mount-types]
+      weight: 2
+      command: |
+        docker image inspect copperleaf/ocr-models:{{pack}} 2>/dev/null | jq -r 'if (.[0].RootFS.Layers | length) >= 1 then "present" else "empty" end' 2>/dev/null || echo missing
+      expect: {match: exact, value: present}
+    - id: mounted-as-image
+      description: ocr-worker runs from the lean worker image with the models image mounted read-only at /models
+      type: shell
+      timeoutSec: 30
+      on: cl-ocr-01
+      skills: [containers.storage.mount-types]
+      weight: 4
+      command: |
+        j=$(docker inspect ocr-worker 2>/dev/null) || { echo no-container; exit 0; }
+        echo "$j" | jq -e '.[0].State.Running' >/dev/null || { echo not-running; exit 0; }
+        src=$(echo "$j" | jq -r '[.[0].HostConfig.Mounts[]? | select(.Type == "image" and .Target == "/models" and .ReadOnly == true)] | .[0].Source // empty')
+        [ -n "$src" ] || { echo no-readonly-image-mount; exit 0; }
+        want=$(docker image inspect copperleaf/ocr-models:{{pack}} 2>/dev/null | jq -r '.[0].Id') || want=missing
+        got=$(docker image inspect "$src" 2>/dev/null | jq -r '.[0].Id') || got=none
+        [ "$want" = "$got" ] || { echo wrong-image; exit 0; }
+        echo "$j" | jq -e '[.[0].HostConfig.Binds[]?] | length == 0' >/dev/null || { echo also-bind; exit 0; }
+        echo image-mount
+      expect: {match: exact, value: image-mount}
+    - id: serves-pack
+      description: The worker answers on host port {{port}} with the pack version
+      type: shell
+      timeoutSec: 30
+      on: cl-ocr-01
+      skills: [containers.storage.mount-types]
+      weight: 3
+      command: curl -fsS --max-time 5 http://127.0.0.1:{{port}}/VERSION 2>/dev/null || echo unreachable
+      expect: {match: exact, value: "ocr-pack 3.{{pack}}"}
+    - id: worker-image-untouched
+      description: The worker is still the lean copperleaf/ocr-worker:1.0 image, without the models baked in
+      type: shell
+      timeoutSec: 30
+      on: cl-ocr-01
+      skills: [containers.storage.mount-types]
+      weight: 2
+      command: |
+        now=$(docker image inspect copperleaf/ocr-worker:1.0 2>/dev/null | jq -r '.[0].Id') || now=gone
+        used=$(docker inspect ocr-worker 2>/dev/null | jq -r '.[0].Image') || used=none
+        [ "$now" = "$(cat /var/lib/cloudtrain/ocr-worker.id)" ] && [ "$used" = "$now" ] && echo lean || echo changed
+      expect: {match: exact, value: lean}
+  hints:
+    - title: Files only
+      body: "A file-only image needs no OS: `FROM scratch` and a `COPY`. Remember that an image mount shows the image's root file system at the target, so decide where the files sit inside the image."
+      cost: 1
+    - title: The mount flag
+      body: "`--mount type=image,source=<image>,target=/models,readonly` mounts an image. If the files are in a subdirectory of the image, add `image-subpath=/models` to the mount."
+      cost: 1
+    - title: Check what the worker sees
+      body: "`docker exec ocr-worker ls -l /models` shows the mounted files; `docker inspect ocr-worker | jq '.[0].HostConfig.Mounts'` shows the mount type the engine recorded."
+      cost: 1
+  misconceptions:
+    - id: bind-mount
+      description: Serves the models from a host directory.
+      feedback: "A bind mount couples the worker to a host path instead of a versioned image tag. Mount the models image with type=image."
+      expectFail: [mounted-as-image]
+      mutation:
+        on: cl-ocr-01
+        as: learner
+        run: |
+          cd ~/ocr-pack
+          printf '%s\n' 'FROM scratch' 'COPY models/ /' > Dockerfile
+          docker build -q -t copperleaf/ocr-models:{{pack}} .
+          docker run -d --name ocr-worker -p {{port}}:8080 -v ~/ocr-pack/models:/models:ro copperleaf/ocr-worker:1.0
+    - id: baked-into-worker
+      description: Copies the pack into a new worker image.
+      feedback: "Baking the pack into the worker brings back the 2 GB worker image the team wants to avoid. Keep the worker lean and mount the models image."
+      expectFail: [mounted-as-image, worker-image-untouched]
+      mutation:
+        on: cl-ocr-01
+        as: learner
+        run: |
+          cd ~/ocr-pack
+          printf '%s\n' 'FROM scratch' 'COPY models/ /' > Dockerfile
+          docker build -q -t copperleaf/ocr-models:{{pack}} .
+          d=$(mktemp -d); cp -r models "$d/models"
+          printf '%s\n' 'FROM copperleaf/ocr-worker:1.0' 'COPY models /models' > "$d/Dockerfile"
+          docker build -q -t copperleaf/ocr-worker:1.0 "$d"
+          docker run -d --name ocr-worker -p {{port}}:8080 copperleaf/ocr-worker:1.0
+    - id: writable-mount
+      description: Mounts the models image without making it read-only.
+      feedback: "The model pack is an input. Add readonly to the mount so a bug in the worker cannot change it."
+      expectFail: [mounted-as-image]
+      mutation:
+        on: cl-ocr-01
+        as: learner
+        run: |
+          cd ~/ocr-pack
+          printf '%s\n' 'FROM scratch' 'COPY models/ /' > Dockerfile
+          docker build -q -t copperleaf/ocr-models:{{pack}} .
+          docker run -d --name ocr-worker -p {{port}}:8080 --mount type=image,source=copperleaf/ocr-models:{{pack}},target=/models copperleaf/ocr-worker:1.0
+  solution:
+    explanation: |
+      Package the files into a scratch-based image whose root holds them, then mount that
+      image at /models with the image mount type, read-only. A new model pack is then a
+      new tag, and the worker image never changes.
+    steps:
+      - on: cl-ocr-01
+        as: learner
+        run: |
+          cd ~/ocr-pack
+          printf '%s\n' 'FROM scratch' 'COPY models/ /' > Dockerfile
+          docker build -t copperleaf/ocr-models:{{pack}} .
+          docker run -d --name ocr-worker -p {{port}}:8080 --mount type=image,source=copperleaf/ocr-models:{{pack}},target=/models,readonly copperleaf/ocr-worker:1.0
+          sleep 2
+          curl -s http://localhost:{{port}}/VERSION
+    alternatives:
+      - id: image-subpath
+        description: Keep the files under /models in the image and select that subdirectory with image-subpath.
+        steps:
+          - on: cl-ocr-01
+            as: learner
+            run: |
+              cd ~/ocr-pack
+              printf '%s\n' 'FROM scratch' 'COPY models /models' > Dockerfile
+              docker build -t copperleaf/ocr-models:{{pack}} .
+              docker run -d --name ocr-worker -p {{port}}:8080 --mount type=image,source=copperleaf/ocr-models:{{pack}},target=/models,image-subpath=/models,readonly copperleaf/ocr-worker:1.0
+              sleep 2
+              curl -s http://localhost:{{port}}/VERSION

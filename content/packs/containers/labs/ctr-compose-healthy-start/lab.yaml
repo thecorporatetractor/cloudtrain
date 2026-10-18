@@ -1,0 +1,294 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-compose-healthy-start
+  title: Stop the rights service racing its database at startup
+  domain: containers
+  frameworks: [ex188-aligned:multi-container, docker-practitioner:compose]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [docker, compose, healthcheck, depends_on]
+  version: 1
+spec:
+  description: |
+    On `cl-rights-01` (`ssh cl-rights-01`; you are in the `docker` group) the
+    rights-ledger API in `~/rights` crash-loops on every `docker compose up`: it
+    connects to its database once at startup, and the database (`copperleaf/rights-db:1`,
+    a Redis-based stand-in for the production database) needs about {{delay}} seconds
+    before it accepts connections. `restart: on-failure` eventually hides the problem,
+    but the service must come up **healthy on the first try**, with no restarts.
+
+    Fix `~/rights/compose.yaml` (project `rights`) so that:
+
+    - the **`db`** service has a healthcheck that passes only when the database
+      answers;
+    - the **`api`** service waits for `db` to be **healthy**, not just started;
+    - after `docker compose down` and a cold `docker compose up -d`, `api` becomes
+      healthy with a **restart count of 0** and answers on host port **{{port}}**
+      (`/health` returns `ok`).
+
+    Leave the stack running.
+  objectives:
+    - Define a healthcheck for a dependency
+    - Order startup with depends_on conditions instead of retries
+    - Prove a cold start from container health and restart counts
+  params:
+    delay:
+      type: int
+      min: 8
+      max: 15
+    port:
+      type: int
+      min: 8400
+      max: 8499
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-rights-01
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-rights-01
+      timeoutSec: 300
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        docker ps -aq --filter label=com.docker.compose.project=rights | xargs -r docker rm -f >/dev/null
+        docker volume rm -f rights_ledger-data >/dev/null 2>&1 || true
+        # database stand-in: Redis that needs a warm-up before it listens
+        d=$(mktemp -d)
+        printf '%s\n' '#!/bin/sh' 'sleep {{delay}}' 'exec docker-entrypoint.sh redis-server --appendonly yes' > "$d/start-db.sh"
+        chmod 0755 "$d/start-db.sh"
+        printf '%s\n' 'FROM redis:7.4-alpine' 'COPY start-db.sh /usr/local/bin/start-db.sh' 'ENTRYPOINT ["/usr/local/bin/start-db.sh"]' > "$d/Dockerfile"
+        docker build -q -t copperleaf/rights-db:1 "$d" >/dev/null
+        rm -rf "$d"
+        # API: checks its database once at startup and exits if it is not there yet
+        d=$(mktemp -d)
+        cat > "$d/app.py" <<'PY'
+        # Copperleaf rights-ledger API (lab stand-in).
+        import socket, sys
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        def ping():
+            s = socket.create_connection(("db", 6379), timeout=2)
+            s.sendall(b"PING\r\n"); r = s.recv(64); s.close()
+            return r.startswith(b"+PONG")
+
+        try:
+            ok = ping()
+        except OSError:
+            ok = False
+        if not ok:
+            print("FATAL: ledger database db:6379 unreachable", flush=True)
+            sys.exit(1)
+        print("ledger database ok", flush=True)
+
+        class H(BaseHTTPRequestHandler):
+            def do_GET(self):
+                try:
+                    good = ping()
+                except OSError:
+                    good = False
+                b = b"ok\n" if good else b"database down\n"
+                self.send_response(200 if good else 503); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
+            def log_message(self, *a): pass
+
+        HTTPServer(("", 8081), H).serve_forever()
+        PY
+        printf '%s\n' 'FROM python:3.13-alpine' 'COPY app.py /app.py' 'EXPOSE 8081' \
+          'HEALTHCHECK --interval=2s --timeout=2s --retries=5 CMD wget -q -O /dev/null http://127.0.0.1:8081/health || exit 1' \
+          'CMD ["python", "-u", "/app.py"]' > "$d/Dockerfile"
+        docker build -q -t copperleaf/rights-ledger:2.1 "$d" >/dev/null
+        rm -rf "$d"
+        p=/home/learner/rights
+        rm -rf "$p"; install -d -o learner -g learner "$p"
+        cat > "$p/compose.yaml" <<'YML'
+        name: rights
+        services:
+          db:
+            image: copperleaf/rights-db:1
+            volumes:
+              - ledger-data:/data
+          api:
+            image: copperleaf/rights-ledger:2.1
+            restart: on-failure
+            depends_on:
+              - db
+            ports:
+              - "{{port}}:8081"
+        volumes:
+          ledger-data: {}
+        YML
+        chown -R learner:learner "$p"
+        (cd "$p" && docker compose up -d >/dev/null 2>&1) || true
+  checks:
+    - id: db-has-healthcheck
+      description: The db service defines a healthcheck that talks to the database
+      type: shell
+      timeoutSec: 60
+      on: cl-rights-01
+      skills: [containers.compose.startup-order]
+      weight: 2
+      command: |
+        cd /home/learner/rights 2>/dev/null || { echo no-dir; exit 0; }
+        docker compose config --format json 2>/dev/null | jq -r '.services.db.healthcheck | if . == null then "none" elif ((.test // []) | tostring | test("redis-cli|PING|ping")) then "database-probe" else "other-probe" end' 2>/dev/null || echo invalid
+      expect: {match: exact, value: database-probe}
+    - id: api-waits-for-healthy
+      description: The api service depends on db with the service_healthy condition
+      type: shell
+      timeoutSec: 60
+      on: cl-rights-01
+      skills: [containers.compose.startup-order]
+      weight: 2
+      command: |
+        cd /home/learner/rights 2>/dev/null || { echo no-dir; exit 0; }
+        docker compose config --format json 2>/dev/null | jq -r '.services.api.depends_on.db.condition // "none"' 2>/dev/null || echo invalid
+      expect: {match: exact, value: service_healthy}
+    - id: cold-start-clean
+      description: After a cold start the api is healthy, has never restarted and answers /health
+      type: shell
+      timeoutSec: 240
+      on: cl-rights-01
+      skills: [containers.compose.startup-order, containers.operations.restart-health]
+      weight: 4
+      command: |
+        cd /home/learner/rights 2>/dev/null || { echo no-dir; exit 0; }
+        docker compose down -t 2 >/dev/null 2>&1
+        timeout 150 docker compose up -d >/dev/null 2>&1
+        c=$(docker ps -aq --filter label=com.docker.compose.project=rights --filter label=com.docker.compose.service=api | head -1)
+        [ -n "$c" ] || { echo no-api; exit 0; }
+        for i in $(seq 60); do
+          h=$(docker inspect "$c" | jq -r '.[0].State.Health.Status // "none"')
+          [ "$h" = healthy ] && break; sleep 2
+        done
+        rc=$(docker inspect "$c" | jq -r '.[0].RestartCount')
+        r=$(curl -fsS --max-time 3 http://127.0.0.1:{{port}}/health 2>/dev/null || echo down)
+        echo "$h restarts=$rc $r"
+      expect: {match: exact, value: "healthy restarts=0 ok"}
+  hints:
+    - title: Started is not ready
+      body: "`depends_on` with no condition only waits until the dependency's container has started. Compose can wait for `condition: service_healthy` instead, which needs a healthcheck on the dependency."
+      cost: 1
+    - title: Shape of the fix
+      body: "On `db`: `healthcheck: {test: [\"CMD\", \"redis-cli\", \"ping\"], interval: 2s, timeout: 2s, retries: 15}`. On `api`: `depends_on: {db: {condition: service_healthy}}`."
+      cost: 2
+    - title: Prove it from a cold start
+      body: "`docker compose down` and `docker compose up -d`, then `docker inspect` the api container: State.Health.Status should be healthy and RestartCount 0."
+      command: cd ~/rights && docker compose down && docker compose up -d && docker compose ps
+      cost: 1
+  misconceptions:
+    - id: more-restarts
+      description: Switches the restart policy to always and relies on retries.
+      feedback: "A restart policy only retries after the crash. The task asks for a first-time start with no restarts: gate the api on a healthy database."
+      expectFail: [db-has-healthcheck, api-waits-for-healthy, cold-start-clean]
+      mutation:
+        on: cl-rights-01
+        as: learner
+        run: |
+          cd ~/rights
+          printf '%s\n' 'name: rights' 'services:' '  db:' '    image: copperleaf/rights-db:1' '    volumes: ["ledger-data:/data"]' \
+            '  api:' '    image: copperleaf/rights-ledger:2.1' '    restart: always' '    depends_on: [db]' '    ports: ["{{port}}:8081"]' 'volumes:' '  ledger-data: {}' > compose.yaml
+          docker compose up -d
+    - id: healthcheck-without-condition
+      description: Adds the database healthcheck but leaves depends_on in its short form.
+      feedback: "A healthcheck by itself only reports status. The api must say it waits for it: depends_on: {db: {condition: service_healthy}}."
+      expectFail: [api-waits-for-healthy, cold-start-clean]
+      mutation:
+        on: cl-rights-01
+        as: learner
+        run: |
+          cd ~/rights
+          printf '%s\n' 'name: rights' 'services:' '  db:' '    image: copperleaf/rights-db:1' '    volumes: ["ledger-data:/data"]' \
+            '    healthcheck:' '      test: ["CMD", "redis-cli", "ping"]' '      interval: 2s' '      retries: 15' \
+            '  api:' '    image: copperleaf/rights-ledger:2.1' '    restart: on-failure' '    depends_on: [db]' '    ports: ["{{port}}:8081"]' 'volumes:' '  ledger-data: {}' > compose.yaml
+          docker compose up -d
+    - id: probe-that-always-passes
+      description: Gives the database a healthcheck that checks nothing about the database.
+      feedback: "A check such as `true` passes at once, so the api starts early again. The probe must fail until the database answers: redis-cli ping."
+      expectFail: [db-has-healthcheck, cold-start-clean]
+      mutation:
+        on: cl-rights-01
+        as: learner
+        run: |
+          cd ~/rights
+          printf '%s\n' 'name: rights' 'services:' '  db:' '    image: copperleaf/rights-db:1' '    volumes: ["ledger-data:/data"]' \
+            '    healthcheck:' '      test: ["CMD", "true"]' '      interval: 2s' \
+            '  api:' '    image: copperleaf/rights-ledger:2.1' '    restart: on-failure' '    depends_on:' '      db:' '        condition: service_healthy' '    ports: ["{{port}}:8081"]' 'volumes:' '  ledger-data: {}' > compose.yaml
+          docker compose up -d
+  solution:
+    explanation: |
+      Give the database a real readiness probe and make the API wait for it. Compose then
+      starts the API only when `db` reports healthy, so the single startup connection
+      succeeds and the API never has to restart.
+    steps:
+      - on: cl-rights-01
+        as: learner
+        run: |
+          cd ~/rights
+          cat > compose.yaml <<'YML'
+          name: rights
+          services:
+            db:
+              image: copperleaf/rights-db:1
+              volumes:
+                - ledger-data:/data
+              healthcheck:
+                test: ["CMD", "redis-cli", "ping"]
+                interval: 2s
+                timeout: 2s
+                retries: 20
+            api:
+              image: copperleaf/rights-ledger:2.1
+              restart: on-failure
+              depends_on:
+                db:
+                  condition: service_healthy
+              ports:
+                - "{{port}}:8081"
+          volumes:
+            ledger-data: {}
+          YML
+          docker compose down
+          docker compose up -d --wait
+          docker compose ps
+    alternatives:
+      - id: healthcheck-pipe-and-wait
+        description: Use a shell-form probe, a start period and `up --wait`, and drop the restart policy.
+        steps:
+          - on: cl-rights-01
+            as: learner
+            run: |
+              cd ~/rights
+              cat > compose.yaml <<'YML'
+              name: rights
+              services:
+                db:
+                  image: copperleaf/rights-db:1
+                  volumes:
+                    - ledger-data:/data
+                  healthcheck:
+                    test: redis-cli ping | grep -q PONG
+                    interval: 2s
+                    timeout: 2s
+                    start_period: 5s
+                    retries: 20
+                api:
+                  image: copperleaf/rights-ledger:2.1
+                  depends_on:
+                    db:
+                      condition: service_healthy
+                      restart: true
+                  ports:
+                    - "{{port}}:8081"
+              volumes:
+                ledger-data: {}
+              YML
+              docker compose down
+              docker compose up -d --wait

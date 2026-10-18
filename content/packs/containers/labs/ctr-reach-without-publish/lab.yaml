@@ -1,0 +1,187 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-reach-without-publish
+  title: Query a distroless service's debug port without publishing it
+  domain: containers
+  frameworks: [docker-practitioner:networking, docker-practitioner:operations]
+  difficulty: medium
+  estimatedMinutes: 12
+  tags: [docker, networking, distroless, debugging, namespaces]
+  version: 1
+spec:
+  description: |
+    On `cl-subtitle-02` (`ssh cl-subtitle-02`; you are in the `docker` group) the
+    distroless subtitle service runs as the container **`subtitle-svc`** (no shell, no
+    `curl`, no `wget`). Its Go-style debug endpoint **`/debug/vars`** listens on
+    **`127.0.0.1:8081` inside the container only**; nothing is published, and it must stay
+    that way.
+
+    Start a throwaway toolbox container (for instance from `busybox:1.37`) that **shares
+    the network namespace** of `subtitle-svc`, fetch `http://127.0.0.1:8081/debug/vars`
+    from there, and save the response body to **`~/subtitle-vars.json`** on the host.
+    Do not recreate or restart `subtitle-svc`, and do not publish any port: the grader
+    checks that the same container is still running unpublished and that the file holds
+    the service's current boot id.
+  objectives:
+    - Share another container's network namespace
+    - Debug a shell-less container with a separate tool container
+    - Reach a loopback-only endpoint without publishing a port
+  params:
+    jobs:
+      type: int
+      min: 1000
+      max: 9999
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-subtitle-02
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-subtitle-02
+      timeoutSec: 480
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        d=$(mktemp -d)
+        cat > "$d/Dockerfile" <<'DF'
+        FROM python:3.13-alpine AS src
+        FROM scratch
+        COPY --from=src /lib/ /lib/
+        COPY --from=src /usr/lib/ /usr/lib/
+        COPY --from=src /usr/local/lib/ /usr/local/lib/
+        COPY --from=src /usr/local/bin/python3.13 /usr/local/bin/python3
+        ENV LD_LIBRARY_PATH=/usr/local/lib PYTHONUNBUFFERED=1
+        ENTRYPOINT ["/usr/local/bin/python3"]
+        DF
+        docker build -q -t copperleaf/pyruntime:1 "$d" >/dev/null
+        rm -rf "$d"
+        d=$(mktemp -d); mkdir "$d/app"
+        cat > "$d/app/subtitle.py" <<'PY'
+        # Copperleaf subtitle service (lab stand-in): the debug endpoint listens on loopback only.
+        import http.server, json, os
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path != "/debug/vars":
+                    self.send_response(404); self.end_headers(); return
+                body = json.dumps({"service": "subtitle", "jobs_total": int(os.environ["JOBS"]), "boot_id": os.environ["BOOT_ID"]}).encode()
+                self.send_response(200); self.send_header("Content-Type", "application/json"); self.end_headers(); self.wfile.write(body)
+            def log_message(self, *a): pass
+        http.server.HTTPServer(("127.0.0.1", 8081), H).serve_forever()
+        PY
+        printf '%s\n' 'FROM copperleaf/pyruntime:1' 'COPY app/ /opt/subtitle/' 'CMD ["/opt/subtitle/subtitle.py"]' > "$d/Dockerfile"
+        docker build -q -t copperleaf/subtitle-distroless:2.4 "$d" >/dev/null
+        rm -rf "$d"
+        docker rm -f subtitle-svc >/dev/null 2>&1 || true
+        boot=$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')
+        install -d -m 0700 /var/lib/cloudtrain
+        echo "$boot" > /var/lib/cloudtrain/subtitle.boot
+        docker run -d --name subtitle-svc --restart unless-stopped -e JOBS={{jobs}} -e BOOT_ID="$boot" copperleaf/subtitle-distroless:2.4 >/dev/null
+        docker inspect subtitle-svc | jq -r '.[0].Id' > /var/lib/cloudtrain/subtitle.id
+        rm -f /home/learner/subtitle-vars.json
+  checks:
+    - id: vars-saved
+      description: ~/subtitle-vars.json holds the service's debug variables, including its boot id
+      type: shell
+      timeoutSec: 60
+      on: cl-subtitle-02
+      skills: [containers.operations.debug-distroless, containers.network.drivers]
+      weight: 4
+      command: |
+        f=/home/learner/subtitle-vars.json
+        [ -s "$f" ] || { echo missing; exit 0; }
+        jq -r --arg b "$(cat /var/lib/cloudtrain/subtitle.boot)" 'if (.service == "subtitle" and .jobs_total == {{jobs}} and .boot_id == $b) then "saved" else "wrong-content" end' "$f" 2>/dev/null || echo not-json
+      expect: {match: exact, value: saved}
+    - id: same-container-running
+      description: The original subtitle-svc container is still running, not restarted or recreated
+      type: shell
+      timeoutSec: 60
+      on: cl-subtitle-02
+      skills: [containers.operations.debug-distroless]
+      weight: 2
+      command: |
+        id=$(docker inspect subtitle-svc 2>/dev/null | jq -r '.[0].Id // "none"')
+        run=$(docker inspect subtitle-svc 2>/dev/null | jq -r '.[0].State.Running // false')
+        rc=$(docker inspect subtitle-svc 2>/dev/null | jq -r '.[0].RestartCount // -1')
+        if [ "$id" = "$(cat /var/lib/cloudtrain/subtitle.id)" ] && [ "$run" = true ] && [ "$rc" = 0 ]; then echo untouched; else echo "id-match=$([ "$id" = "$(cat /var/lib/cloudtrain/subtitle.id)" ] && echo y || echo n) running=$run restarts=$rc"; fi
+      expect: {match: exact, value: untouched}
+    - id: nothing-published
+      description: subtitle-svc publishes no port and does not use the host network
+      type: shell
+      timeoutSec: 60
+      on: cl-subtitle-02
+      skills: [containers.network.drivers]
+      weight: 2
+      command: |
+        docker inspect subtitle-svc 2>/dev/null | jq -r '.[0] | ((.HostConfig.PortBindings // {} | length) + ([.NetworkSettings.Ports // {} | .[] | select(. != null)] | length) + (if .HostConfig.NetworkMode == "host" then 1 else 0 end)) | tostring'
+      expect: {match: exact, value: "0"}
+    - id: host-cannot-reach-it
+      description: The host itself still cannot reach port 8081 on any of its addresses
+      type: shell
+      timeoutSec: 60
+      on: cl-subtitle-02
+      skills: [containers.network.drivers]
+      weight: 1
+      command: |
+        ss -ltn 2>/dev/null | awk '{print $4}' | grep -cE ':8081$' || true
+      expect: {match: exact, value: "0"}
+  hints:
+    - title: A container can join another's network namespace
+      body: "`docker run --network container:<name> ...` starts a container in the network namespace of `<name>`. Inside it, 127.0.0.1 is the other container's loopback."
+      cost: 2
+    - title: Get the output out
+      body: "Run the tool container with `--rm`, let it print the body to stdout (`wget -qO- URL` in busybox) and redirect on the host: `docker run ... > ~/subtitle-vars.json`."
+      cost: 1
+    - title: Why not exec?
+      body: "`docker exec subtitle-svc sh` fails: the image has no shell, and adding tools to it would mean rebuilding it. A separate toolbox container leaves the service untouched."
+      cost: 1
+  misconceptions:
+    - id: recreated-with-publish
+      description: Recreates the service with the debug port published so it can be fetched from the host.
+      feedback: "That exposes a debug endpoint and replaces the container you were asked to leave alone. Join its network namespace from a toolbox container instead."
+      expectFail: [vars-saved, same-container-running, nothing-published]
+      mutation:
+        on: cl-subtitle-02
+        as: learner
+        run: |
+          docker rm -f subtitle-svc
+          docker run -d --name subtitle-svc -p 8081:8081 -e JOBS={{jobs}} -e BOOT_ID=guess copperleaf/subtitle-distroless:2.4
+          curl -s localhost:8081/debug/vars > ~/subtitle-vars.json || true
+    - id: fabricated-file
+      description: Writes a JSON file by hand instead of fetching the real endpoint.
+      feedback: "The file must be the service's own response, including its boot id; typing JSON proves nothing about the running service."
+      expectFail: [vars-saved]
+      mutation:
+        on: cl-subtitle-02
+        as: learner
+        run: |
+          printf '%s\n' '{"service": "subtitle", "jobs_total": {{jobs}}, "boot_id": "0000"}' > ~/subtitle-vars.json
+  solution:
+    explanation: |
+      A second container started with `--network container:subtitle-svc` shares its network
+      namespace, so the loopback-only endpoint is reachable from the toolbox at 127.0.0.1
+      while nothing is published and the service is never touched.
+    steps:
+      - on: cl-subtitle-02
+        as: learner
+        run: |
+          docker run --rm --network container:subtitle-svc busybox:1.37 wget -qO- http://127.0.0.1:8081/debug/vars > ~/subtitle-vars.json
+          cat ~/subtitle-vars.json
+    alternatives:
+      - id: nsenter-from-host
+        description: Enter the container's network namespace from the host with nsenter and use the host's curl.
+        steps:
+          - on: cl-subtitle-02
+            as: learner
+            run: |
+              pid=$(docker inspect subtitle-svc | jq -r '.[0].State.Pid')
+              sudo nsenter -t "$pid" -n curl -fsS http://127.0.0.1:8081/debug/vars > ~/subtitle-vars.json
+              cat ~/subtitle-vars.json

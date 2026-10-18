@@ -1,0 +1,263 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-containerd-store-migration
+  title: Move an upgraded host onto the new image store
+  domain: containers
+  frameworks: [docker-practitioner:storage]
+  difficulty: hard
+  estimatedMinutes: 25
+  tags: [docker, storage, containerd, overlay2, daemon-json, multi-platform]
+  version: 1
+spec:
+  description: |
+    `cl-batch-03` (`ssh cl-batch-03`; you are in the `docker` group, with `sudo`) was
+    upgraded from Engine 27 and still keeps its images in the classic **overlay2** store.
+    Release `1.{{rel}}` of the release-notes tool is published as a multi-platform image
+    (`linux/amd64` and `linux/arm64`, with build attestations) in the team's local registry:
+
+    - registry data: `/srv/release-registry` (plain HTTP on `127.0.0.1:5000`)
+    - repository: `release/relnote`, tag `1.{{rel}}`
+    - its index digest is in `~/release/DIGEST`
+
+    The registry runs as the container `release-registry` in the old store. Do the
+    migration:
+
+    1. Switch the engine to the **containerd image store** and keep every other setting
+       in `/etc/docker/daemon.json` (the log options are there on purpose).
+    2. Images and containers of the old store are not visible in the new one. Make the
+       registry serve the same data again on `127.0.0.1:5000` (container
+       `release-registry`, same data directory, image `registry:3`).
+    3. **Pull `localhost:5000/release/relnote` by its digest with every platform**, so the
+       local image is the full index and the arm64 content is present.
+    4. Write **`~/index-report.txt`** from what the registry now serves for that digest:
+       ```
+       index: sha256:<the digest>
+       platforms: <platforms sorted, space separated, e.g. linux/amd64 linux/s390x>
+       attestations: <number of attestation manifests in the index>
+       ```
+  objectives:
+    - Enable the containerd image store without losing other daemon.json settings
+    - Recover services whose containers lived in the previous store
+    - Pull a multi-platform index by digest and read its platforms and attestations
+  params:
+    rel:
+      type: int
+      min: 10
+      max: 89
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-batch-03
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-batch-03
+      timeoutSec: 600
+      run: |
+        set -eu
+        usermod -aG docker learner
+        wait_engine() { for i in $(seq 90); do docker info >/dev/null 2>&1 && return 0; sleep 2; done; return 1; }
+        wait_engine
+        install -d -m 0700 /var/lib/cloudtrain
+        docker rm -f release-registry >/dev/null 2>&1 || true
+        rm -rf /srv/release-registry; install -d /srv/release-registry
+        # 1. publish the multi-platform release (index + attestations) while the containerd store is active
+        docker run -d --name release-registry --restart always -p 127.0.0.1:5000:5000 -v /srv/release-registry:/var/lib/registry registry:3 >/dev/null
+        for i in $(seq 30); do curl -fs http://127.0.0.1:5000/v2/ >/dev/null && break; sleep 1; done
+        d=$(mktemp -d)
+        echo "relnote 1.{{rel}} amd64" > "$d/relnote-amd64"; echo "relnote 1.{{rel}} arm64" > "$d/relnote-arm64"
+        printf '%s\n' 'FROM scratch' 'ARG TARGETARCH' 'COPY relnote-${TARGETARCH} /relnote' 'ENTRYPOINT ["/relnote"]' > "$d/Dockerfile"
+        docker buildx build --provenance=mode=min --sbom=false --platform linux/amd64,linux/arm64 -t localhost:5000/release/relnote:1.{{rel}} --push "$d" >/dev/null
+        rm -rf "$d"
+        A='Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json'
+        curl -fsSI -H "$A" "http://127.0.0.1:5000/v2/release/relnote/manifests/1.{{rel}}" | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}' > /var/lib/cloudtrain/relnote.digest
+        grep -qE '^sha256:[0-9a-f]{64}$' /var/lib/cloudtrain/relnote.digest
+        curl -fsS -H "$A" "http://127.0.0.1:5000/v2/release/relnote/manifests/$(cat /var/lib/cloudtrain/relnote.digest)" \
+          | jq -r '[(.manifests // [])[] | select((.platform.os // "unknown") != "unknown") | .platform.os + "/" + .platform.architecture] | sort | join(" ")' > /var/lib/cloudtrain/relnote.platforms
+        curl -fsS -H "$A" "http://127.0.0.1:5000/v2/release/relnote/manifests/$(cat /var/lib/cloudtrain/relnote.digest)" \
+          | jq -r '[(.manifests // [])[] | select((.platform.os // "unknown") == "unknown")] | length' > /var/lib/cloudtrain/relnote.attestations
+        [ "$(cat /var/lib/cloudtrain/relnote.attestations)" -ge 1 ]
+        # 2. carry the images the host needs over to the overlay2 store
+        docker save -o /var/lib/cloudtrain/legacy-images.tar registry:3 busybox:1.37
+        docker rm -f release-registry >/dev/null
+        docker rmi -f localhost:5000/release/relnote:1.{{rel}} >/dev/null 2>&1 || true
+        # 3. put the host in the Engine 27 situation: overlay2 store, other settings kept
+        install -d /etc/docker; [ -s /etc/docker/daemon.json ] || echo '{}' > /etc/docker/daemon.json
+        jq '. + {"log-driver": "json-file", "log-opts": {"max-size": "5m", "max-file": "3"}, "features": ((.features // {}) + {"containerd-snapshotter": false})}' /etc/docker/daemon.json > /etc/docker/daemon.json.new
+        mv /etc/docker/daemon.json.new /etc/docker/daemon.json
+        systemctl restart docker
+        wait_engine
+        docker load -i /var/lib/cloudtrain/legacy-images.tar >/dev/null
+        rm -f /var/lib/cloudtrain/legacy-images.tar
+        docker run -d --name release-registry --restart always -p 127.0.0.1:5000:5000 -v /srv/release-registry:/var/lib/registry registry:3 >/dev/null
+        for i in $(seq 30); do curl -fs http://127.0.0.1:5000/v2/ >/dev/null && break; sleep 1; done
+        r=/home/learner/release
+        rm -rf "$r" /home/learner/index-report.txt; install -d -o learner -g learner "$r"
+        cp /var/lib/cloudtrain/relnote.digest "$r/DIGEST"; chown learner:learner "$r/DIGEST"
+  checks:
+    - id: containerd-store-active
+      description: The engine reports the containerd image store
+      type: shell
+      timeoutSec: 30
+      on: cl-batch-03
+      skills: [containers.storage.backends]
+      weight: 3
+      command: |
+        docker info --format json | jq -r '[.DriverStatus[]? | select(.[0] == "driver-type") | .[1]] | .[0] // "classic"'
+      expect: {match: exact, value: io.containerd.snapshotter.v1}
+    - id: daemon-settings-kept
+      description: The log options in daemon.json survived and the file is valid JSON
+      type: shell
+      timeoutSec: 30
+      on: cl-batch-03
+      skills: [containers.operations.daemon-config]
+      weight: 2
+      command: |
+        jq -e '(.["log-opts"]["max-size"] == "5m") and (.["log-driver"] == "json-file")' /etc/docker/daemon.json >/dev/null 2>&1 && echo kept || echo lost
+      expect: {match: exact, value: kept}
+    - id: registry-serving
+      description: The registry container runs again from the same data and serves the release index
+      type: shell
+      timeoutSec: 45
+      on: cl-batch-03
+      skills: [containers.storage.backends, containers.registry.run-registry]
+      weight: 2
+      command: |
+        docker inspect release-registry 2>/dev/null | jq -e '.[0].State.Running and ([.[0].Mounts[] | select(.Source == "/srv/release-registry")] | length == 1)' >/dev/null 2>&1 || { echo not-running; exit 0; }
+        A='Accept: application/vnd.oci.image.index.v1+json'
+        curl -fsSI -H "$A" "http://127.0.0.1:5000/v2/release/relnote/manifests/$(cat /var/lib/cloudtrain/relnote.digest)" 2>/dev/null | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}' | grep -qx "$(cat /var/lib/cloudtrain/relnote.digest)" && echo serving || echo no-index
+      expect: {match: exact, value: serving}
+    - id: pulled-by-digest
+      description: The release index is in the local store under its registry digest
+      type: shell
+      timeoutSec: 45
+      on: cl-batch-03
+      skills: [containers.storage.backends, containers.registry.references]
+      weight: 3
+      command: |
+        dg=$(cat /var/lib/cloudtrain/relnote.digest)
+        docker image inspect "localhost:5000/release/relnote@$dg" 2>/dev/null | jq -r --arg d "$dg" 'if (.[0].Descriptor.digest == $d) and (.[0].Descriptor.mediaType | test("index|manifest.list")) then "index-present" else "not-the-index" end' 2>/dev/null || echo missing
+      expect: {match: exact, value: index-present}
+    - id: arm64-content-present
+      description: The arm64 content of the index was pulled as well
+      type: shell
+      timeoutSec: 45
+      on: cl-batch-03
+      skills: [containers.storage.backends]
+      weight: 3
+      command: |
+        dg=$(cat /var/lib/cloudtrain/relnote.digest)
+        docker image inspect --platform linux/arm64 "localhost:5000/release/relnote@$dg" >/dev/null 2>&1 && echo arm64-present || echo arm64-missing
+      expect: {match: exact, value: arm64-present}
+    - id: index-report
+      description: index-report.txt states the digest, platforms and attestation count the registry serves
+      type: shell
+      timeoutSec: 30
+      on: cl-batch-03
+      skills: [containers.registry.references, containers.storage.backends]
+      weight: 3
+      command: |
+        f=/home/learner/index-report.txt
+        g() { grep "^$1:" "$f" 2>/dev/null | head -1 | sed "s/^$1:[[:space:]]*//; s/[[:space:]]*\$//"; }
+        [ "$(g index)" = "$(cat /var/lib/cloudtrain/relnote.digest)" ] || { echo "wrong-digest"; exit 0; }
+        [ "$(g platforms)" = "$(cat /var/lib/cloudtrain/relnote.platforms)" ] || { echo "wrong-platforms"; exit 0; }
+        [ "$(g attestations)" = "$(cat /var/lib/cloudtrain/relnote.attestations)" ] || { echo "wrong-attestations"; exit 0; }
+        echo report-ok
+      expect: {match: exact, value: report-ok}
+  hints:
+    - title: One key, merged
+      body: "`daemon.json` already holds log settings. Add `features.containerd-snapshotter` with `jq` and write the result back (to a new file, then `mv`); a plain `echo > daemon.json` loses the rest. Restart the engine and check `docker info`."
+      cost: 1
+    - title: The registry is gone, its data is not
+      body: "Containers of the old store do not show up after the switch, but `/srv/release-registry` is on the host. `registry:3` is available in the new store, so run the registry again with the same mount."
+      cost: 1
+    - title: Pull every platform
+      body: "A plain pull fetches your own platform only. `docker pull --all-platforms localhost:5000/release/relnote@<digest>` fetches the whole index; `docker buildx imagetools inspect --raw <ref>` prints the index so `jq` can count platforms and attestation entries (those with platform os `unknown`)."
+      cost: 2
+  misconceptions:
+    - id: overwrite-daemon-json
+      description: Replaces daemon.json with only the feature flag.
+      feedback: "Replacing the file drops the log options. Merge the key into the existing JSON instead."
+      expectFail: [daemon-settings-kept, registry-serving, pulled-by-digest, arm64-content-present, index-report]
+      mutation:
+        on: cl-batch-03
+        as: learner
+        run: |
+          echo '{"features": {"containerd-snapshotter": true}}' | sudo tee /etc/docker/daemon.json >/dev/null
+          sudo systemctl restart docker
+    - id: forgot-registry
+      description: Switches the store but never brings the registry back.
+      feedback: "The registry container lived in the old store and is not visible after the switch. Start it again from registry:3 with the same data directory before pulling from it."
+      expectFail: [registry-serving, pulled-by-digest, arm64-content-present, index-report]
+      mutation:
+        on: cl-batch-03
+        as: learner
+        run: |
+          sudo jq '.features = ((.features // {}) + {"containerd-snapshotter": true})' /etc/docker/daemon.json | sudo tee /etc/docker/daemon.json.new >/dev/null
+          sudo mv /etc/docker/daemon.json.new /etc/docker/daemon.json
+          sudo systemctl restart docker
+    - id: host-platform-only
+      description: Pulls the digest without --all-platforms.
+      feedback: "A pull without --all-platforms keeps only the host platform's content. Pull all platforms so the arm64 images and the whole index are local."
+      expectFail: [arm64-content-present, index-report]
+      mutation:
+        on: cl-batch-03
+        as: learner
+        run: |
+          sudo jq '.features = ((.features // {}) + {"containerd-snapshotter": true})' /etc/docker/daemon.json | sudo tee /etc/docker/daemon.json.new >/dev/null
+          sudo mv /etc/docker/daemon.json.new /etc/docker/daemon.json
+          sudo systemctl restart docker
+          for i in $(seq 60); do docker info >/dev/null 2>&1 && break; sleep 2; done
+          docker run -d --name release-registry --restart always -p 127.0.0.1:5000:5000 -v /srv/release-registry:/var/lib/registry registry:3
+          sleep 3
+          docker pull localhost:5000/release/relnote@$(cat ~/release/DIGEST)
+  solution:
+    explanation: |
+      Add the containerd-snapshotter feature to the existing daemon.json with jq, restart,
+      and recreate the registry from the host data directory (the old store's containers are
+      not visible). Pull the digest with --all-platforms so the index and every platform
+      are local, then read the platforms and attestations from the index.
+    steps:
+      - on: cl-batch-03
+        as: learner
+        run: |
+          sudo jq '.features = ((.features // {}) + {"containerd-snapshotter": true})' /etc/docker/daemon.json | sudo tee /etc/docker/daemon.json.new >/dev/null
+          sudo mv /etc/docker/daemon.json.new /etc/docker/daemon.json
+          sudo systemctl restart docker
+          for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+          docker run -d --name release-registry --restart always -p 127.0.0.1:5000:5000 -v /srv/release-registry:/var/lib/registry registry:3
+          for i in $(seq 30); do curl -fs http://127.0.0.1:5000/v2/ >/dev/null && break; sleep 1; done
+          dg=$(cat ~/release/DIGEST)
+          docker pull --all-platforms localhost:5000/release/relnote@$dg
+          idx=$(docker buildx imagetools inspect --raw localhost:5000/release/relnote@$dg)
+          plat=$(echo "$idx" | jq -r '[.manifests[] | select((.platform.os // "unknown") != "unknown") | .platform.os + "/" + .platform.architecture] | sort | join(" ")')
+          att=$(echo "$idx" | jq -r '[.manifests[] | select((.platform.os // "unknown") == "unknown")] | length')
+          printf '%s\n' "index: $dg" "platforms: $plat" "attestations: $att" > ~/index-report.txt
+          cat ~/index-report.txt
+    alternatives:
+      - id: per-platform-pulls-and-curl
+        description: Pull each platform by name and read the index straight from the registry API.
+        steps:
+          - on: cl-batch-03
+            as: learner
+            run: |
+              sudo jq '.features = ((.features // {}) + {"containerd-snapshotter": true})' /etc/docker/daemon.json | sudo tee /etc/docker/daemon.json.new >/dev/null
+              sudo mv /etc/docker/daemon.json.new /etc/docker/daemon.json
+              sudo systemctl restart docker
+              for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+              docker run -d --name release-registry --restart always -p 127.0.0.1:5000:5000 -v /srv/release-registry:/var/lib/registry registry:3
+              for i in $(seq 30); do curl -fs http://127.0.0.1:5000/v2/ >/dev/null && break; sleep 1; done
+              dg=$(cat ~/release/DIGEST)
+              docker pull --platform linux/amd64 localhost:5000/release/relnote@$dg
+              docker pull --platform linux/arm64 localhost:5000/release/relnote@$dg
+              idx=$(curl -fsS -H 'Accept: application/vnd.oci.image.index.v1+json' http://127.0.0.1:5000/v2/release/relnote/manifests/$dg)
+              plat=$(echo "$idx" | jq -r '[.manifests[] | select((.platform.os // "unknown") != "unknown") | .platform.os + "/" + .platform.architecture] | sort | join(" ")')
+              att=$(echo "$idx" | jq -r '[.manifests[] | select((.platform.os // "unknown") == "unknown")] | length')
+              printf '%s\n' "index: $dg" "platforms: $plat" "attestations: $att" > ~/index-report.txt

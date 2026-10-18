@@ -1,0 +1,218 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-macvlan-encoder
+  title: Give the playout encoder its own studio LAN address
+  domain: containers
+  frameworks: [dca-legacy:networking, docker-practitioner:networking]
+  difficulty: hard
+  estimatedMinutes: 25
+  tags: [docker, networking, macvlan, lan]
+  version: 1
+spec:
+  description: |
+    The playout encoder must appear on the studio LAN as **192.0.2.40**, a first-class
+    host there, not behind NAT. `cl-playout-01` (`ssh cl-playout-01`; you are in the
+    `docker` group, with `sudo`) has a second network interface for the studio LAN
+    (its name is in `/etc/copperleaf/playout/network.txt`); the studio host
+    `cl-studio-01` sits on the same segment at 192.0.2.10. The LAN is 192.0.2.0/24 with
+    its gateway at 192.0.2.1; addresses 192.0.2.1 to 192.0.2.31 belong to studio
+    equipment.
+
+    1. Create a **macvlan** network **`studio-lan`** on the studio NIC (not the
+       management NIC), subnet `192.0.2.0/24`, gateway `192.0.2.1`, and an address
+       range `192.0.2.32/27` so engine-assigned addresses stay clear of the studio
+       equipment.
+    2. Run the container **`playout-encoder`** (image `copperleaf/playout-encoder:6.0`)
+       on it with the fixed address **192.0.2.40**.
+    3. `cl-studio-01` must reach the encoder directly (ping and its HTTP page,
+       `playout-encoder {{n}}`).
+  objectives:
+    - Choose the parent interface for a macvlan network
+    - Give a container a fixed address on a physical LAN
+    - Verify reachability from another host on the segment
+  params:
+    n:
+      type: int
+      min: 100
+      max: 999
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-playout-01
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+      - name: cl-studio-01
+        driver: container
+        image: nettools:1
+        resources: {cpu: 0.25, memoryMiB: 128}
+        access: [shell]
+    links:
+      - { a: "cl-playout-01:eth1", b: "cl-studio-01:eth1" }
+  setup:
+    - on: cl-studio-01
+      timeoutSec: 60
+      run: |
+        set -eu
+        ip addr replace 192.0.2.10/24 dev eth1
+        ip link set eth1 up
+    - on: cl-playout-01
+      timeoutSec: 240
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        # the studio NIC is the interface without an IPv4 address (the management NIC has one)
+        nic=""
+        for p in /sys/class/net/*; do
+          n=$(basename "$p")
+          case "$n" in lo|docker*|br-*|veth*|virbr*) continue ;; esac
+          ip -4 -o addr show dev "$n" | grep -q . && continue
+          nic=$n; break
+        done
+        [ -n "$nic" ]
+        ip link set "$nic" up
+        install -d /etc/copperleaf/playout
+        printf '%s\n' "Studio LAN interface: $nic" 'Management interface: the one that has an address' > /etc/copperleaf/playout/network.txt
+        install -d -m 0700 /var/lib/cloudtrain
+        echo "$nic" > /var/lib/cloudtrain/studio.nic
+        d=$(mktemp -d); mkdir "$d/www"; echo "playout-encoder {{n}}" > "$d/www/index.html"
+        printf '%s\n' 'FROM busybox:1.37' 'COPY www /www' 'EXPOSE 80' 'CMD ["httpd", "-f", "-p", "80", "-h", "/www"]' > "$d/Dockerfile"
+        docker build -q -t copperleaf/playout-encoder:6.0 "$d" >/dev/null; rm -rf "$d"
+        docker rm -f playout-encoder >/dev/null 2>&1 || true
+        docker network rm studio-lan >/dev/null 2>&1 || true
+  checks:
+    - id: macvlan-on-studio-nic
+      description: studio-lan is a macvlan network on the studio NIC with the right subnet, gateway and range
+      type: shell
+      timeoutSec: 60
+      on: cl-playout-01
+      skills: [containers.network.drivers]
+      weight: 3
+      command: |
+        nic=$(cat /var/lib/cloudtrain/studio.nic)
+        docker network inspect studio-lan 2>/dev/null | jq -r --arg nic "$nic" '.[0] | [.Driver, (if .Options.parent == $nic then "studio-nic" else "parent=" + (.Options.parent // "none") end), (.IPAM.Config[0].Subnet // "-"), (.IPAM.Config[0].Gateway // "-"), (.IPAM.Config[0].IPRange // "-")] | join(" ")' 2>/dev/null || echo missing
+      expect: {match: exact, value: "macvlan studio-nic 192.0.2.0/24 192.0.2.1 192.0.2.32/27"}
+    - id: encoder-address
+      description: playout-encoder is running on studio-lan with the fixed address 192.0.2.40
+      type: shell
+      timeoutSec: 60
+      on: cl-playout-01
+      skills: [containers.network.drivers]
+      weight: 3
+      command: docker inspect playout-encoder 2>/dev/null | jq -r '.[0] | (.State.Running | tostring) + " " + (.NetworkSettings.Networks["studio-lan"].IPAddress // "none")' 2>/dev/null || echo missing
+      expect: {match: exact, value: "true 192.0.2.40"}
+    - id: studio-host-reaches-encoder
+      description: The studio host pings the encoder
+      type: shell
+      timeoutSec: 60
+      on: cl-studio-01
+      skills: [containers.network.drivers]
+      weight: 3
+      command: ping -c 3 -W 2 192.0.2.40 >/dev/null 2>&1 && echo reachable || echo unreachable
+      expect: {match: exact, value: reachable}
+    - id: encoder-page-on-lan
+      description: A second container on studio-lan fetches the encoder's page at its LAN address
+      type: shell
+      timeoutSec: 90
+      on: cl-playout-01
+      skills: [containers.network.drivers]
+      weight: 2
+      command: |
+        timeout 30 docker run --rm --network studio-lan busybox:1.37 wget -q -T 5 -O - http://192.0.2.40/ 2>/dev/null | tr -d '\n' || true
+      expect: {match: exact, value: "playout-encoder {{n}}"}
+  hints:
+    - title: macvlan needs a parent
+      body: "A macvlan network gives each container its own MAC address on a physical interface, the `parent`: `docker network create -d macvlan --subnet ... --gateway ... -o parent=<nic> <name>`. Use the studio NIC, not the one that carries the VM's own address."
+      cost: 2
+    - title: Keep clear of studio equipment
+      body: "`--ip-range 192.0.2.32/27` limits what the engine hands out automatically; a fixed address such as 192.0.2.40 is still allowed inside that range with `--ip`."
+      cost: 1
+    - title: The host cannot talk to its own macvlan
+      body: "A macvlan child is deliberately cut off from its parent interface's host. Test from the studio host (or another container on the macvlan network), not from the VM's own shell."
+      cost: 1
+  misconceptions:
+    - id: bridge-with-publish
+      description: Runs the encoder on a bridge network and publishes port 80.
+      feedback: "A published port is NAT on the VM's address, not a host on the LAN. The encoder must hold 192.0.2.40 itself, which is what macvlan provides."
+      expectFail: [macvlan-on-studio-nic, encoder-address, studio-host-reaches-encoder, encoder-page-on-lan]
+      mutation:
+        on: cl-playout-01
+        as: learner
+        run: |
+          docker network create studio-lan
+          docker run -d --name playout-encoder --network studio-lan -p 80:80 copperleaf/playout-encoder:6.0
+    - id: wrong-parent
+      description: Builds the macvlan network on the management interface.
+      feedback: "The studio LAN is the second NIC. A macvlan on the management NIC puts the encoder on the wrong segment, where the studio host cannot see it."
+      expectFail: [macvlan-on-studio-nic, studio-host-reaches-encoder]
+      mutation:
+        on: cl-playout-01
+        as: learner
+        run: |
+          mgmt=$(ip -4 route show default | awk '{print $5; exit}')
+          docker network create -d macvlan --subnet 192.0.2.0/24 --gateway 192.0.2.1 --ip-range 192.0.2.32/27 -o parent="$mgmt" studio-lan
+          docker run -d --name playout-encoder --network studio-lan --ip 192.0.2.40 copperleaf/playout-encoder:6.0
+    - id: no-fixed-address
+      description: Lets the engine pick the address from the range.
+      feedback: "The encoder must be 192.0.2.40: give the container that address with --ip."
+      expectFail: [encoder-address, studio-host-reaches-encoder, encoder-page-on-lan]
+      mutation:
+        on: cl-playout-01
+        as: learner
+        run: |
+          nic=$(awk -F': ' '/Studio LAN interface/{print $2}' /etc/copperleaf/playout/network.txt)
+          docker network create -d macvlan --subnet 192.0.2.0/24 --gateway 192.0.2.1 --ip-range 192.0.2.32/27 -o parent="$nic" studio-lan
+          docker run -d --name playout-encoder --network studio-lan copperleaf/playout-encoder:6.0
+  solution:
+    explanation: |
+      macvlan attaches containers straight to a physical interface with their own MAC and IP,
+      so the encoder is a host on the studio LAN. The parent is the studio NIC; the address
+      range keeps automatic assignments away from studio equipment, and `--ip` pins the
+      encoder to 192.0.2.40.
+    steps:
+      - on: cl-playout-01
+        as: learner
+        run: |
+          nic=$(awk -F': ' '/Studio LAN interface/{print $2}' /etc/copperleaf/playout/network.txt)
+          docker network create -d macvlan --subnet 192.0.2.0/24 --gateway 192.0.2.1 --ip-range 192.0.2.32/27 -o parent="$nic" studio-lan
+          docker run -d --name playout-encoder --restart unless-stopped --network studio-lan --ip 192.0.2.40 copperleaf/playout-encoder:6.0
+          docker inspect playout-encoder | jq -r '.[0].NetworkSettings.Networks["studio-lan"].IPAddress'
+    alternatives:
+      - id: compose-macvlan
+        description: Describe the macvlan network and the fixed address in a Compose file.
+        steps:
+          - on: cl-playout-01
+            as: learner
+            run: |
+              nic=$(awk -F': ' '/Studio LAN interface/{print $2}' /etc/copperleaf/playout/network.txt)
+              mkdir -p ~/playout && cd ~/playout
+              cat > compose.yaml <<YML
+              name: playout
+              services:
+                playout-encoder:
+                  container_name: playout-encoder
+                  image: copperleaf/playout-encoder:6.0
+                  restart: unless-stopped
+                  networks:
+                    studio-lan:
+                      ipv4_address: 192.0.2.40
+              networks:
+                studio-lan:
+                  name: studio-lan
+                  driver: macvlan
+                  driver_opts:
+                    parent: $nic
+                  ipam:
+                    config:
+                      - subnet: 192.0.2.0/24
+                        gateway: 192.0.2.1
+                        ip_range: 192.0.2.32/27
+              YML
+              docker compose up -d

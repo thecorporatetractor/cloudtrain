@@ -1,0 +1,277 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-net-mtu-hang
+  title: Fix uploads from containers that hang at the CDN ingest
+  domain: containers
+  frameworks: [docker-practitioner:networking]
+  difficulty: hard
+  estimatedMinutes: 25
+  tags: [docker, networking, mtu, tcpdump, pmtud]
+  version: 1
+spec:
+  description: |
+    On `cl-packager-01` (`ssh cl-packager-01`; you are in the `docker` group, with
+    `sudo`) the **`packager`** container, attached to the user-defined network
+    **`ingest-net`**, uploads media to the CDN ingest at **198.18.{{octet}}.2:8000**
+    (reached through the host). Small requests work; a large upload stalls and never
+    completes. A 50 MB test file is at `/srv/packager/upload-50m.bin`.
+
+    The path to the ingest carries a **smaller MTU** than the 1500 Docker gives
+    `ingest-net`, and the CDN's edge filter drops the ICMP "fragmentation needed"
+    messages that would normally tell the sender (the lab simulates the filter with an
+    `iptables` rule on this host: **leave it, and leave the path as it is**).
+
+    1. Find the path MTU (for example with `ping -M do -s <size>` and a capture), and
+       write the number to `~/path-mtu.txt`.
+    2. Fix the **Docker network**: recreate `ingest-net` with the MTU option
+       (`com.docker.network.driver.mtu`) set to a value the path carries, and put the
+       `packager` container back on it (same name, image `busybox:1.37`, running).
+    3. A fresh container on `ingest-net` must complete the 50 MB upload.
+  objectives:
+    - Recognise a path-MTU black hole (small works, large hangs)
+    - Measure the path MTU with Don't-Fragment pings and a capture
+    - Set the MTU of a user-defined Docker network
+  params:
+    octet:
+      type: int
+      min: 10
+      max: 99
+    pmtu:
+      type: int
+      min: 1300
+      max: 1450
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-packager-01
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-packager-01
+      timeoutSec: 300
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        docker rm -f packager >/dev/null 2>&1 || true
+        docker network rm ingest-net >/dev/null 2>&1 || true
+        # the CDN ingest: a namespace behind a veth whose host side has the smaller MTU
+        systemctl stop cl-cdn.service >/dev/null 2>&1 || true
+        cat > /usr/local/sbin/cl-ingest.py <<'PY'
+        # CDN ingest stand-in: reads an upload and reports how many bytes arrived.
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        class H(BaseHTTPRequestHandler):
+            def do_POST(self):
+                n = int(self.headers.get("Content-Length", "0")); left = n
+                while left > 0:
+                    b = self.rfile.read(min(65536, left))
+                    if not b: break
+                    left -= len(b)
+                out = ("received %d\n" % (n - left)).encode()
+                self.send_response(200); self.send_header("Content-Length", str(len(out))); self.end_headers(); self.wfile.write(out)
+            def do_GET(self):
+                out = b"cdn ingest ok\n"
+                self.send_response(200); self.send_header("Content-Length", str(len(out))); self.end_headers(); self.wfile.write(out)
+            def log_message(self, *a): pass
+        ThreadingHTTPServer(("0.0.0.0", 8000), H).serve_forever()
+        PY
+        cat > /usr/local/sbin/cl-cdn-net <<'SH'
+        #!/bin/sh
+        # Lab fixture: namespace cdn-ingest (198.18.{{octet}}.2) behind host veth clcdn0 (198.18.{{octet}}.1, MTU {{pmtu}}); the edge filter drops ICMP fragmentation-needed.
+        set -e
+        ip netns list | grep -qw cdn-ingest || ip netns add cdn-ingest
+        ip link show clcdn0 >/dev/null 2>&1 || { ip link add clcdn0 type veth peer name pcdn0; ip link set pcdn0 netns cdn-ingest; }
+        ip addr replace 198.18.{{octet}}.1/24 dev clcdn0; ip link set clcdn0 mtu {{pmtu}} up
+        ip netns exec cdn-ingest ip addr replace 198.18.{{octet}}.2/24 dev pcdn0
+        ip netns exec cdn-ingest ip link set pcdn0 mtu 1500 up; ip netns exec cdn-ingest ip link set lo up
+        ip netns exec cdn-ingest ip route replace default via 198.18.{{octet}}.1
+        iptables -C OUTPUT -p icmp --icmp-type fragmentation-needed -j DROP 2>/dev/null || iptables -I OUTPUT -p icmp --icmp-type fragmentation-needed -j DROP
+        SH
+        chmod 0755 /usr/local/sbin/cl-cdn-net
+        cat > /etc/systemd/system/cl-cdn.service <<'UNIT'
+        [Unit]
+        Description=Simulated CDN ingest behind a small-MTU path
+        After=network-online.target docker.service
+
+        [Service]
+        ExecStartPre=/usr/local/sbin/cl-cdn-net
+        ExecStart=/usr/bin/env ip netns exec cdn-ingest /usr/bin/python3 /usr/local/sbin/cl-ingest.py
+        Restart=always
+
+        [Install]
+        WantedBy=multi-user.target
+        UNIT
+        systemctl daemon-reload
+        systemctl enable --now cl-cdn.service
+        for i in $(seq 30); do ip netns exec cdn-ingest ss -ltn 2>/dev/null | grep -q ':8000' && break; sleep 1; done
+        install -d -o learner -g learner /srv/packager
+        [ -s /srv/packager/upload-50m.bin ] || head -c 52428800 /dev/urandom > /srv/packager/upload-50m.bin
+        chmod 0644 /srv/packager/upload-50m.bin
+        install -d -m 0700 /var/lib/cloudtrain
+        rm -f /home/learner/path-mtu.txt
+        docker network create ingest-net >/dev/null
+        docker run -d --name packager --network ingest-net --restart unless-stopped busybox:1.37 sleep 86400 >/dev/null
+  checks:
+    - id: path-mtu-found
+      description: ~/path-mtu.txt holds the path MTU
+      type: shell
+      timeoutSec: 30
+      on: cl-packager-01
+      skills: [containers.network.diagnosis]
+      weight: 2
+      command: |
+        f=/home/learner/path-mtu.txt
+        [ -s "$f" ] || { echo missing; exit 0; }
+        tr -d ' \t\r\n' < "$f"; echo
+      expect: {match: exact, value: "{{pmtu}}"}
+    - id: network-mtu-fits
+      description: ingest-net carries the MTU option and the value fits the path
+      type: shell
+      timeoutSec: 60
+      on: cl-packager-01
+      skills: [containers.network.diagnosis, containers.network.address-pools]
+      weight: 3
+      command: |
+        v=$(docker network inspect ingest-net 2>/dev/null | jq -r '.[0].Options["com.docker.network.driver.mtu"] // "unset"')
+        case "$v" in
+          unset|"") echo "mtu-option=unset" ;;
+          *[!0-9]*) echo "mtu-option=$v" ;;
+          *) if [ "$v" -le {{pmtu}} ] && [ "$v" -ge 1280 ]; then echo mtu-fits; else echo "mtu-option=$v"; fi ;;
+        esac
+      expect: {match: exact, value: mtu-fits}
+    - id: upload-completes
+      description: A fresh container on ingest-net uploads the 50 MB file to the ingest
+      type: shell
+      timeoutSec: 150
+      on: cl-packager-01
+      skills: [containers.network.diagnosis]
+      weight: 4
+      command: |
+        r=$(timeout 100 docker run --rm --network ingest-net -v /srv/packager:/data:ro busybox:1.37 wget -q -T 60 -O - --post-file /data/upload-50m.bin http://198.18.{{octet}}.2:8000/upload 2>/dev/null | tr -d '\n')
+        echo "${r:-stalled}"
+      expect: {match: exact, value: "received 52428800"}
+    - id: packager-back-on-network
+      description: The packager container runs on ingest-net with an interface MTU that fits the path
+      type: shell
+      timeoutSec: 60
+      on: cl-packager-01
+      skills: [containers.network.diagnosis]
+      weight: 2
+      command: |
+        docker inspect packager 2>/dev/null | jq -e '.[0] | .State.Running and (.NetworkSettings.Networks | has("ingest-net"))' >/dev/null 2>&1 || { echo not-attached; exit 0; }
+        m=$(docker exec packager cat /sys/class/net/eth0/mtu 2>/dev/null || echo 0)
+        if [ "$m" -le {{pmtu}} ] && [ "$m" -ge 1280 ]; then echo mtu-ok; else echo "eth0-mtu=$m"; fi
+      expect: {match: exact, value: mtu-ok}
+    - id: path-left-alone
+      description: The path MTU and the edge filter are untouched
+      type: shell
+      timeoutSec: 30
+      on: cl-packager-01
+      skills: [containers.network.diagnosis]
+      weight: 1
+      command: |
+        m=$(cat /sys/class/net/clcdn0/mtu 2>/dev/null || echo 0)
+        f=$(iptables -C OUTPUT -p icmp --icmp-type fragmentation-needed -j DROP 2>/dev/null && echo filter || echo no-filter)
+        echo "path-mtu=$m $f"
+      expect: {match: exact, value: "path-mtu={{pmtu}} filter"}
+  hints:
+    - title: Small works, big hangs
+      body: "A TCP handshake and small requests fit any MTU; full-size segments are dropped when a link in the path is smaller than the sender's MTU and the ICMP that would say so is filtered. Compare `ip link` MTUs along the path (the host side of the ingest link is `clcdn0`)."
+      cost: 1
+    - title: Measure it
+      body: "`ping -M do -s <size> -c 2 198.18.{{octet}}.2` from the host sets Don't-Fragment: the largest size that succeeds plus 28 bytes (IP + ICMP headers) is the path MTU. `sudo tcpdump -ni clcdn0 'tcp[tcpflags] & tcp-syn != 0 or icmp'` shows the MSS and the retransmits."
+      cost: 2
+    - title: Set the MTU on the network
+      body: "A user-defined network takes its MTU from the option `com.docker.network.driver.mtu`, applied to the bridge and to each container's eth0. It is only read at network creation: remove the container, remove the network, create it again with `-o com.docker.network.driver.mtu=<n>` and run the packager on it."
+      command: docker network create -o com.docker.network.driver.mtu=1400 ingest-net
+      cost: 2
+  misconceptions:
+    - id: raise-the-path
+      description: Raises the MTU of the host side of the ingest link instead of fixing Docker's network.
+      feedback: "The path MTU is the one the CDN edge really carries; raising a local interface hides the symptom here and fixes nothing for the real link. Size the Docker network to the path."
+      expectFail: [network-mtu-fits, path-left-alone]
+      mutation:
+        on: cl-packager-01
+        as: learner
+        run: |
+          sudo ip link set clcdn0 mtu 1500
+          echo {{pmtu}} > ~/path-mtu.txt
+    - id: mtu-slightly-too-high
+      description: Sets the network MTU a little above what the path carries.
+      feedback: "Anything above the path MTU still produces segments the path drops. Use the measured path MTU or lower."
+      expectFail: [network-mtu-fits, upload-completes]
+      mutation:
+        on: cl-packager-01
+        as: learner
+        run: |
+          echo {{pmtu}} > ~/path-mtu.txt
+          docker rm -f packager
+          docker network rm ingest-net
+          docker network create -o com.docker.network.driver.mtu=$(( {{pmtu}} + 20 )) ingest-net
+          docker run -d --name packager --network ingest-net busybox:1.37 sleep 86400
+    - id: network-not-recreated
+      description: Writes the right number but never changes the network.
+      feedback: "Measuring the path is half the job; the network still runs at 1500. Recreate ingest-net with the MTU option."
+      expectFail: [network-mtu-fits, upload-completes, packager-back-on-network]
+      mutation:
+        on: cl-packager-01
+        as: learner
+        run: echo {{pmtu}} > ~/path-mtu.txt
+  solution:
+    explanation: |
+      Docker gave `ingest-net` an MTU of 1500, so the packager's TCP stack sends full-size
+      segments that the smaller link drops, while the ICMP that would trigger path-MTU
+      discovery is filtered. Creating the network with `com.docker.network.driver.mtu` set to
+      the path MTU makes every container's eth0 (and the bridge) use it, so segments fit.
+    steps:
+      - on: cl-packager-01
+        as: learner
+        run: |
+          # measure: the largest DF ping that passes, plus 28 bytes
+          p=0
+          for s in $(seq 1472 -4 1200); do
+            if ping -M do -s "$s" -c 1 -W 1 198.18.{{octet}}.2 >/dev/null 2>&1; then p=$((s + 28)); break; fi
+          done
+          echo "$p" > ~/path-mtu.txt
+          docker rm -f packager
+          docker network rm ingest-net
+          docker network create -o com.docker.network.driver.mtu=$p ingest-net
+          docker run -d --name packager --network ingest-net --restart unless-stopped busybox:1.37 sleep 86400
+          cat ~/path-mtu.txt
+    alternatives:
+      - id: compose-driver-opts
+        description: Declare the network with driver_opts in a Compose file and run the packager from it.
+        steps:
+          - on: cl-packager-01
+            as: learner
+            run: |
+              p=0
+              for s in $(seq 1472 -1 1200); do
+                if ping -M do -s "$s" -c 1 -W 1 198.18.{{octet}}.2 >/dev/null 2>&1; then p=$((s + 28)); break; fi
+              done
+              echo "$p" > ~/path-mtu.txt
+              docker rm -f packager
+              docker network rm ingest-net
+              mkdir -p ~/packager && cd ~/packager
+              cat > compose.yaml <<YML
+              name: packager
+              services:
+                packager:
+                  container_name: packager
+                  image: busybox:1.37
+                  command: ["sleep", "86400"]
+                  networks: [ingest]
+              networks:
+                ingest:
+                  name: ingest-net
+                  driver_opts:
+                    com.docker.network.driver.mtu: "$p"
+              YML
+              docker compose up -d

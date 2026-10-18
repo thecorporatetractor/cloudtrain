@@ -1,0 +1,230 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-compose-watch
+  title: Live-sync subtitle templates while developing
+  domain: containers
+  frameworks: [docker-practitioner:compose]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [docker, compose, watch, develop]
+  version: 1
+spec:
+  description: |
+    On `cl-subtitle-01` (`ssh cl-subtitle-01`; you are in the `docker` group) the
+    subtitle service in `~/subtitles` (project `subtitles`, service **`subtitle`**,
+    built from the Dockerfile in that directory) serves its templates from
+    `/app/templates` on host port **{{port}}** (`/templates/<file>`), and reports the
+    `requirements.txt` it was built with on `/requirements`. Editing a template today
+    means rebuilding the image.
+
+    Add a `develop.watch` section to the `subtitle` service in `~/subtitles/compose.yaml`
+    so that, while `docker compose watch` runs:
+
+    - a change under **`templates/`** is **synced** into `/app/templates` in the running
+      container, without a rebuild or restart;
+    - a change to **`requirements.txt`** triggers an image **rebuild** and the service is
+      recreated.
+
+    The grader runs `docker compose watch` itself, adds a template file and a line to
+    `requirements.txt`, and checks both reach the service.
+  objectives:
+    - Configure develop.watch with sync and rebuild actions
+    - Choose the action that matches the kind of file that changed
+    - Observe a watch session from outside the container
+  params:
+    port:
+      type: int
+      min: 8600
+      max: 8699
+    ep:
+      type: int
+      min: 100
+      max: 899
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-subtitle-01
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-subtitle-01
+      timeoutSec: 300
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        docker ps -aq --filter label=com.docker.compose.project=subtitles | xargs -r docker rm -f >/dev/null
+        p=/home/learner/subtitles
+        rm -rf "$p"; install -d -o learner -g learner "$p" "$p/templates"
+        cat > "$p/app.py" <<'PY'
+        # Copperleaf subtitle service (lab stand-in): serves its templates and the requirements it was built with.
+        import os
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        class H(BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path == "/requirements":
+                    path = "/app/requirements.seen"
+                elif self.path.startswith("/templates/") and "/" not in self.path[len("/templates/"):]:
+                    path = "/app" + self.path
+                else:
+                    path = ""
+                if path and os.path.isfile(path):
+                    b = open(path, "rb").read(); code = 200
+                else:
+                    b = b"not found\n"; code = 404
+                self.send_response(code); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
+            def log_message(self, *a): pass
+
+        HTTPServer(("", 8080), H).serve_forever()
+        PY
+        printf '%s\n' 'FROM python:3.13-alpine' 'WORKDIR /app' 'COPY requirements.txt /app/requirements.txt' \
+          'RUN cp /app/requirements.txt /app/requirements.seen' 'COPY app.py /app/app.py' 'COPY templates /app/templates' \
+          'EXPOSE 8080' 'CMD ["python", "-u", "/app/app.py"]' > "$p/Dockerfile"
+        printf '%s\n' 'subtitle-core==2.{{ep}}' > "$p/requirements.txt"
+        printf '%s\n' 'default template {{ep}}' > "$p/templates/default.tpl"
+        cat > "$p/compose.yaml" <<'YML'
+        name: subtitles
+        services:
+          subtitle:
+            build: .
+            ports:
+              - "{{port}}:8080"
+        YML
+        chown -R learner:learner "$p"
+        (cd "$p" && docker compose build >/dev/null 2>&1) || true
+  checks:
+    - id: watch-config
+      description: The subtitle service syncs templates/ into /app/templates and rebuilds on requirements.txt
+      type: shell
+      timeoutSec: 60
+      on: cl-subtitle-01
+      skills: [containers.compose.watch]
+      weight: 3
+      command: |
+        cd /home/learner/subtitles 2>/dev/null || { echo no-dir; exit 0; }
+        docker compose config --format json 2>/dev/null | jq -r '[.services.subtitle.develop.watch[]? | .action + ":" + (.path | split("/") | last) + ":" + (.target // "-")] | sort | join(",")' 2>/dev/null || echo invalid
+      expect: {match: exact, value: "rebuild:requirements.txt:-,sync:templates:/app/templates"}
+    - id: watch-observed
+      description: Under docker compose watch a new template reaches the running service and a changed requirements.txt is rebuilt into it
+      type: shell
+      timeoutSec: 330
+      on: cl-subtitle-01
+      skills: [containers.compose.watch]
+      weight: 5
+      command: |
+        cd /home/learner/subtitles 2>/dev/null || { echo no-dir; exit 0; }
+        docker compose config --format json 2>/dev/null | jq -e '[.services.subtitle.develop.watch[]?] | length > 0' >/dev/null 2>&1 || { echo no-watch-config; exit 0; }
+        base="http://127.0.0.1:{{port}}"
+        docker compose down -t 2 >/dev/null 2>&1
+        nohup timeout 200 docker compose watch >/tmp/cl-watch.log 2>&1 &
+        wp=$!
+        for i in $(seq 60); do curl -fs -m 2 "$base/requirements" >/dev/null 2>&1 && break; sleep 2; done
+        f=grader-{{ep}}.tpl
+        echo "grader template {{ep}}" > "templates/$f"
+        sync=no
+        for i in $(seq 30); do [ "$(curl -fs -m 2 "$base/templates/$f" 2>/dev/null)" = "grader template {{ep}}" ] && { sync=yes; break; }; sleep 1; done
+        echo "grader-pkg=={{ep}}" >> requirements.txt
+        rebuild=no
+        for i in $(seq 70); do curl -fs -m 2 "$base/requirements" 2>/dev/null | grep -q "grader-pkg=={{ep}}" && { rebuild=yes; break; }; sleep 2; done
+        kill "$wp" 2>/dev/null; wait "$wp" 2>/dev/null
+        sed -i '/grader-pkg==/d' requirements.txt; rm -f "templates/$f"
+        echo "sync=$sync rebuild=$rebuild"
+      expect: {match: exact, value: "sync=yes rebuild=yes"}
+  hints:
+    - title: Where the section goes
+      body: "`develop.watch` is a list under the service. Each entry has an `action` (sync, rebuild, sync+restart), a `path` on the host and, for sync, a `target` in the container."
+      cost: 1
+    - title: Pick the action per file
+      body: "Templates are read at request time, so copying them is enough: `action: sync`, `path: ./templates`, `target: /app/templates`. A changed `requirements.txt` only takes effect in a new image: `action: rebuild`."
+      cost: 2
+    - title: Try it yourself
+      body: "Run `docker compose watch` in one terminal and edit a file from another. `docker compose config` shows the watch rules after validation."
+      command: cd ~/subtitles && docker compose watch
+      cost: 1
+  misconceptions:
+    - id: bind-mount-instead
+      description: Bind-mounts the templates directory and adds no watch rules.
+      feedback: "A bind mount shares the directory live, but it is not develop.watch, and requirements.txt changes still need a rebuild trigger. Describe both file kinds under develop.watch."
+      expectFail: [watch-config, watch-observed]
+      mutation:
+        on: cl-subtitle-01
+        as: learner
+        run: |
+          cd ~/subtitles
+          printf '%s\n' 'name: subtitles' 'services:' '  subtitle:' '    build: .' '    volumes: ["./templates:/app/templates"]' '    ports: ["{{port}}:8080"]' > compose.yaml
+    - id: sync-requirements
+      description: Syncs requirements.txt into the container instead of rebuilding.
+      feedback: "Copying requirements.txt into a running container changes nothing: the packages come from the image. A change to it needs action: rebuild."
+      expectFail: [watch-config, watch-observed]
+      mutation:
+        on: cl-subtitle-01
+        as: learner
+        run: |
+          cd ~/subtitles
+          printf '%s\n' 'name: subtitles' 'services:' '  subtitle:' '    build: .' '    ports: ["{{port}}:8080"]' '    develop:' '      watch:' \
+            '        - {action: sync, path: ./templates, target: /app/templates}' '        - {action: sync, path: ./requirements.txt, target: /app/requirements.txt}' > compose.yaml
+    - id: rebuild-everything
+      description: Rebuilds the image for every change, templates included.
+      feedback: "Rebuilding for a template edit works but throws away the point of watch: templates should be synced into the running container without a rebuild."
+      expectFail: [watch-config]
+      mutation:
+        on: cl-subtitle-01
+        as: learner
+        run: |
+          cd ~/subtitles
+          printf '%s\n' 'name: subtitles' 'services:' '  subtitle:' '    build: .' '    ports: ["{{port}}:8080"]' '    develop:' '      watch:' \
+            '        - {action: rebuild, path: ./templates}' '        - {action: rebuild, path: ./requirements.txt}' > compose.yaml
+  solution:
+    explanation: |
+      `sync` copies changed files into the running container, which suits templates that
+      are read on demand. `rebuild` rebuilds the image and recreates the service, which is
+      what a dependency list needs.
+    steps:
+      - on: cl-subtitle-01
+        as: learner
+        run: |
+          cd ~/subtitles
+          cat > compose.yaml <<'YML'
+          name: subtitles
+          services:
+            subtitle:
+              build: .
+              ports:
+                - "{{port}}:8080"
+              develop:
+                watch:
+                  - action: sync
+                    path: ./templates
+                    target: /app/templates
+                  - action: rebuild
+                    path: requirements.txt
+          YML
+          docker compose config | sed -n '/develop/,/^ *ports/p'
+    alternatives:
+      - id: watch-with-ignore
+        description: Same rules in flow style, with an ignore pattern for editor swap files.
+        steps:
+          - on: cl-subtitle-01
+            as: learner
+            run: |
+              cd ~/subtitles
+              cat > compose.yaml <<'YML'
+              name: subtitles
+              services:
+                subtitle:
+                  build:
+                    context: .
+                  ports: ["{{port}}:8080"]
+                  develop:
+                    watch:
+                      - {action: sync, path: ./templates, target: /app/templates, ignore: ["*.swp"]}
+                      - {action: rebuild, path: ./requirements.txt}
+              YML
