@@ -16,9 +16,9 @@
 # Not covered locally (CI only): CodeQL, DAST (ZAP), image builds and scans, IaC
 # scanners, dependency-review, osv-scanner, SBOM. See docs/security-ci.md.
 # Needs: git, node 22 + pnpm 9, go (go.mod's toolchain), gcc (go test -race), docker
-# (Postgres for the gateway's DB suites). Scanner CLIs (gitleaks, actionlint, zizmor,
-# shellcheck, hadolint) come pinned from .github/scripts/install-tools.sh into
-# ~/.cache/cloudtrain-ci/bin.
+# (Postgres for the gateway's DB suites). The scanner CLIs (gitleaks, actionlint,
+# zizmor, hadolint and the shell linter) come pinned from .github/scripts/install-tools.sh
+# into ~/.cache/cloudtrain-ci/bin.
 set -uo pipefail
 
 ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || { echo "run-local: not in a git checkout" >&2; exit 2; }
@@ -107,7 +107,7 @@ failed=0
 run() { # run <name> <command...>: one row of the table; output in $LOGS/<name>.log
   local name=$1 log t0 rc
   shift
-  log="$LOGS/$(tr -c 'A-Za-z0-9._-' '_' <<<"$name").log"
+  log="$LOGS/$(printf %s "$name" | tr -c 'A-Za-z0-9._-' '_').log"
   printf '  %-44s ' "$name"
   t0=$SECONDS
   "$@" >"$log" 2>&1

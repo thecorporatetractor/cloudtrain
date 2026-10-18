@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -55,20 +56,17 @@ func loadCatalogFlag(v string) (*drivers.ImageCatalog, error) {
 }
 
 // workflowImages lists the image names of the images workflow's build matrix
-// (jobs.build-scan.strategy.matrix.include[].name).
+// (the literal matrix.include[].name of any job: the publish matrix).
 func workflowImages(file string) ([]string, error) {
 	b, err := os.ReadFile(file)
 	if err != nil {
 		return nil, err
 	}
+	// A matrix may also be an expression (`${{ fromJSON(...) }}`, a string): skipped.
 	var wf struct {
 		Jobs map[string]struct {
 			Strategy struct {
-				Matrix struct {
-					Include []struct {
-						Name string `json:"name"`
-					} `json:"include"`
-				} `json:"matrix"`
+				Matrix json.RawMessage `json:"matrix"`
 			} `json:"strategy"`
 		} `json:"jobs"`
 	}
@@ -78,7 +76,18 @@ func workflowImages(file string) ([]string, error) {
 	seen := map[string]bool{}
 	var out []string
 	for _, j := range wf.Jobs {
-		for _, inc := range j.Strategy.Matrix.Include {
+		var m struct {
+			Include []struct {
+				Name string `json:"name"`
+			} `json:"include"`
+		}
+		if len(j.Strategy.Matrix) == 0 || j.Strategy.Matrix[0] != '{' {
+			continue
+		}
+		if err := json.Unmarshal(j.Strategy.Matrix, &m); err != nil {
+			return nil, fmt.Errorf("%s: %w", file, err)
+		}
+		for _, inc := range m.Include {
 			if inc.Name != "" && !seen[inc.Name] {
 				seen[inc.Name] = true
 				out = append(out, inc.Name)
