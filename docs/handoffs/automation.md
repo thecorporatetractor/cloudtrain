@@ -14,7 +14,7 @@ The source of truth is each lab's `status`/`notes` in `content/curriculum.yaml`.
 | Path `ansible-fundamentals`, tier-B labs (`ov-conditionals-os-family`, `ov-handlers-web-reload`, `ov-template-claims-vhost`) | 0 | 0 | 3 (need VMs, see Next steps) |
 | Exam `sim-el-automation` pool (32 pooled tasks) | 34 written (15 passed a live exam run; 19 written in round 5 wave 1, never run live; 2 of those blocked and held out of the pools) | 0 per-task | 0 |
 | Capstone tasks `xpe-ansible-node-agents`, `xpe-ansible-ssh-hardening` (pool of `sim-platform-engineer`) | 2 (round 5 wave 1, never run live) | 0 | 0 |
-| Paths `el-automation-engineer`, `automation-engineering-practices`, `automation-content-developer`, `automation-controller-operations`, `network-automation`, `event-driven-automation` | 0 | 0 | 49 |
+| Paths `el-automation-engineer`, `automation-engineering-practices`, `automation-content-developer`, `automation-controller-operations`, `network-automation`, `event-driven-automation` | 23 written in PR #84 (unmerged, 22 runnable, 1 blocked), none live | 0 | 26 |
 
 Verified learning labs (path order): ov-first-inventory, ov-bootstrap-automation-user,
 ov-ansible-cfg-project, ov-adhoc-kernel-census, ov-first-playbook-motd,
@@ -187,6 +187,44 @@ URLs use `node4`, `node2`, `node3`), `/dev/disk/by-id/virtio-ct-data*` links exi
 Verify queue for the testing round: two disjoint `exam run --auto-solve --attempts 2` runs plus
 `--no-solve` for `sim-el-automation`, then a per-task `labctl verify` of all 19 tasks and the 2
 `xpe-ansible-*` tasks in the vm slot (one session at a time; four VMs per exam session).
+
+## Round 5, wave 2 (write-only, PR #84 NOT merged)
+
+PR #84 (`content/automation-r5-w2`, head 520128d): 23 tier-A pod-fleet labs, all `built`
+(none verified, none run live). It was not merged: round-3 review found four majors and the
+branch conflicts with origin/main in `README.md` and `docs/curriculum.md` (so no CI ran). To
+land it: rebase, keep both sides, `node tools/curriculum/render.mjs`, fix the majors below,
+then keep curriculum images in sync with lab.yaml node images and `deploy/images/catalog.yaml`
+(lab-verify now errors otherwise). Static gates passed locally (lab-verify --strict 0 errors,
+render --check clean).
+
+Labs (22 runnable + 1 blocked): ov-automate-archive-evidence, ov-build-publish-collection,
+ov-ci-pipeline-lint-test, ov-collections-offline, ov-constructed-inventory,
+ov-custom-facts-tier, ov-custom-filter-plugin, ov-debug-failing-play, ov-delegate-lb-drain,
+ov-dynamic-inventory-cmdb, ov-git-push-playbooks, ov-lint-clean-role, ov-lookups-filters-ipam,
+ov-migrate-core-219 (runs on ansible-core 2.21; no staged 2.19 needed), ov-molecule-role-tests,
+ov-navigator-run-settings, ov-privilege-scoping, ov-python-module-check-mode,
+ov-register-disk-report, ov-rolling-update-serial, ov-tags-partial-runs, ov-vault-db-credentials;
+blocked: ov-devcontainer-workflow.
+
+Blockers per lab:
+
+| Lab | Blocker |
+|---|---|
+| ov-devcontainer-workflow | needs code-server in `ansible-ctl` and a gateway web-access proxy; written otherwise complete (title no longer names VS Code) |
+| ov-register-disk-report | major: grades a rerun with changed=0 and a pct-1 threshold on live `df` values that keep changing; correct learners can fail |
+| ov-build-publish-collection | major: grades a `requirements.yml` the statement never asks for |
+| ov-delegate-lb-drain | major: the no-wait-for-health mutation may not fail `no-failed-requests` (HAProxy re-checks a re-enabled server immediately); haproxy install in a pod is unconfirmed, test it first |
+| all of README/docs conflicts | PR conflicts in `README.md` and `docs/curriculum.md` |
+
+Minors: TOCTOU read by the root CI runner, Molecule checks grep log strings, the navigator
+artifact substring check, stale "Galaxy" curriculum title, fixed CMDB site set, lon host name
+vs the site param. The tags lab does not depend on the mirror (it removes the preinstalled
+`tree` package).
+
+Verify queue (all pod slot; no VM, kubeadm, netdev or Kata needs): 22 runnable labs above,
+after the majors are fixed, from origin/main by the batch runner. Kata-blocked: none. Image-blocked:
+ov-devcontainer-workflow (code-server + web proxy).
 
 ## Next steps
 
