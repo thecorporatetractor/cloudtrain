@@ -40,7 +40,7 @@ COPY kusto-language-codegen/ /src/kusto-language-codegen/
 RUN dotnet run --project /src/kusto-language-codegen -c Release -p:KustoLanguageSrc=/src/kusto-language/src \
       -- /src/kusto-language/src/Kusto.Language
 COPY patches/ /src/patches/
-RUN cd kusto-loco && git -c user.name=cloudtrain-build -c user.email=build@cloudtrain.invalid am -q /src/patches/*.patch
+RUN cd kusto-loco && git -c user.name=cloudtrain-build -c user.email=build@cloudtrain.invalid am -q --keep-cr --whitespace=nowarn /src/patches/*.patch
 # KustoLanguageProject / LokqlAzureConnectors: see the licence-clean profile patch
 ENV KQL_BUILD_PROPS="-p:KustoLanguageProject=/src/kusto-language/src/Kusto.Language/Kusto.Language.csproj -p:LokqlAzureConnectors=false"
 # hadolint ignore=SC2086
