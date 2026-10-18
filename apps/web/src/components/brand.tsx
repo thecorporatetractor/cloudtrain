@@ -1,24 +1,89 @@
+import type { CSSProperties } from 'react';
 import { DEFAULT_BRAND, useSite } from '@/api/public';
 import { useTheme } from '@/lib/theme';
 import { cn } from '@/lib/utils';
 
-/** The built-in cloud mark; a configured `brand.logo` replaces it (content/site.yaml). */
-export function BrandMark({ className }: { className?: string }) {
-  const site = useSite().data;
-  const { theme } = useTheme();
-  const logo = theme === 'dark' ? (site?.brand.logoDark ?? site?.brand.logo) : site?.brand.logo;
-  if (logo) return <img className={cn('brand-logo', className)} src={logo} alt="" aria-hidden />;
+/*
+ * The CloudTrain logo as inline SVG, drawn in currentColor so each theme picks the dark or white
+ * variant through the --brand-* tokens (tokens.css). The path data is copied verbatim from
+ * public/brand/cloudtrain-icon.svg and cloudtrain-wordmark.svg; scripts/brand-assets.mjs owns the files.
+ * A deployment with its own brand (content/site.yaml) replaces the mark with `brand.logo` and the
+ * wordmark with `brand.name`.
+ */
+export const MARK_VIEWBOX = '0 0 332.3 226.7';
+export const MARK_RATIO = 332.3 / 226.7;
+export const WORDMARK_VIEWBOX = '0 0 578.7 91';
+export const WORDMARK_RATIO = 578.7 / 91;
+/** cloudtrain-horizontal.svg: the mark at 0.61 beside the wordmark at 0.7. */
+export const LOCKUP_VIEWBOX = '0 0 634.89 139.3';
+export const LOCKUP_RATIO = 634.89 / 139.3;
+
+export const MARK_PATH =
+  'M126.3 0.0L316.7 0.0L317.7 2.3L273.7 55.7L139.3 56.0L129.0 58.7L122.7 62.7L31.7 141.7L29.3 143.3L27.3 143.3L2.3 119.0L0.0 111.3L0.0 104.7L1.3 99.3L4.3 93.7L68.0 40.3L105.0 8.0L115.0 2.7ZM95.3 112.0L249.0 112.0L253.0 114.0L282.3 155.0L283.3 158.0L282.3 159.0L140.3 159.0L133.7 156.7L129.3 153.7L93.0 119.7L93.0 113.7ZM72.3 130.7L76.7 130.7L80.0 132.3L120.0 169.3L124.3 172.3L132.7 175.7L138.3 176.7L297.7 176.7L330.0 221.0L332.3 225.3L331.3 226.7L123.0 226.7L115.3 224.7L107.0 220.7L103.0 217.7L42.0 158.0L42.0 156.0L43.3 154.3Z';
+
+export const WORDMARK_PATH =
+  'M494.0 0.0L498.0 0.0L501.7 1.7L504.0 4.3L505.3 7.7L504.7 14.0L502.3 17.0L498.7 19.0L494.7 19.3L490.3 18.0L488.0 16.0L486.0 12.3L486.0 7.0L487.0 4.7L490.3 1.3ZM72.0 3.0L81.0 3.3L81.0 88.7L80.3 89.3L71.7 89.0ZM290.3 3.0L298.0 3.0L298.7 3.7L298.7 89.0L290.0 89.0L289.7 80.3L288.7 80.3L281.3 86.7L273.0 90.0L263.0 90.3L253.7 88.0L244.0 81.0L239.3 74.3L237.3 69.7L235.7 58.0L236.3 52.0L239.0 44.3L242.0 39.3L248.0 33.3L255.3 29.0L263.0 27.0L270.3 27.0L276.3 28.3L283.0 31.7L288.3 37.0L289.7 37.3L289.7 4.0ZM323.3 9.0L339.0 9.0L339.3 27.3L340.0 28.0L356.0 28.3L355.7 41.7L340.3 41.7L339.3 42.3L339.3 68.3L340.0 71.0L342.3 74.0L346.3 75.7L355.0 75.7L354.7 89.7L345.7 90.3L335.0 88.7L329.0 85.0L324.3 78.0L323.0 72.7L323.0 42.3L321.7 41.7L312.3 42.0L311.7 41.3L311.7 28.7L323.0 27.3ZM552.0 26.7L560.0 27.3L566.7 30.0L573.7 36.0L576.0 40.0L578.7 50.3L578.7 88.7L577.7 89.3L562.3 89.3L561.7 88.7L561.7 53.0L560.7 49.3L558.0 45.0L555.3 43.0L550.7 41.3L544.7 41.3L538.3 44.0L535.0 47.7L533.3 51.3L532.7 54.3L532.7 88.7L532.0 89.3L516.0 89.0L516.0 28.3L532.0 28.0L533.3 35.7L536.7 32.0L541.3 29.0ZM28.3 27.0L36.7 27.0L45.3 29.3L53.0 34.0L57.3 39.0L56.0 41.3L52.0 44.3L50.7 44.3L46.7 40.3L38.7 36.3L34.7 35.7L26.3 36.3L18.3 40.3L14.3 44.3L10.3 52.0L9.7 62.0L11.3 68.7L14.0 73.0L22.0 79.7L29.0 81.7L39.3 81.0L45.7 78.0L50.7 73.0L52.3 73.0L57.3 77.3L56.0 80.3L51.0 85.0L45.3 88.0L38.7 90.0L25.7 90.0L14.7 85.7L9.3 81.7L5.0 76.7L0.3 65.0L0.0 57.0L1.0 50.7L6.0 40.0L10.3 35.0L15.3 31.3L22.0 28.3ZM120.0 27.0L132.0 27.3L138.3 29.3L143.7 32.3L151.7 40.3L154.7 45.7L156.3 51.3L157.0 62.0L156.0 67.7L153.0 74.7L150.0 79.0L143.7 85.0L132.0 90.0L127.3 90.7L117.3 90.0L107.0 85.7L98.0 77.0L95.0 71.7L93.3 66.3L93.0 54.3L97.0 42.3L101.0 37.0L107.0 32.0L112.7 29.0ZM438.7 27.0L450.3 27.0L459.7 29.3L467.7 34.3L471.7 39.3L475.0 49.7L474.7 89.3L460.0 89.3L459.0 88.7L459.0 83.0L457.7 83.0L453.3 87.0L446.3 90.0L440.3 91.0L430.3 90.7L422.7 88.0L416.3 82.0L414.0 75.7L414.0 68.7L416.3 62.0L421.0 57.0L426.7 54.0L431.7 52.7L458.0 51.7L457.7 48.7L456.0 45.7L453.3 43.0L449.3 41.3L437.3 41.7L433.7 43.0L426.7 47.7L418.0 39.7L417.3 37.0L423.3 32.3L430.0 29.0ZM400.7 27.3L407.7 27.3L408.7 28.3L408.7 41.7L407.7 42.7L398.7 42.7L394.3 44.0L390.0 47.0L387.0 50.7L385.3 54.0L384.3 59.3L384.3 88.7L383.7 89.3L368.3 89.3L367.7 88.7L368.0 28.3L383.0 28.0L384.0 29.0L384.0 36.3L384.7 36.7L391.3 30.3ZM169.3 28.0L177.3 28.0L178.0 28.7L178.0 67.7L180.0 74.0L186.0 79.7L193.7 81.7L203.0 79.7L208.0 76.0L210.7 72.7L213.7 64.0L213.7 29.3L214.3 28.0L222.3 28.0L223.0 28.7L223.0 89.0L214.3 89.3L213.7 81.0L212.7 81.0L205.0 87.7L196.3 90.3L189.3 90.3L183.3 89.0L179.3 87.0L174.3 82.7L170.3 75.7L168.7 68.3L168.7 29.0ZM487.7 28.0L503.3 28.0L504.0 28.7L504.0 88.7L503.3 89.3L487.0 89.0L487.0 28.7ZM122.0 36.0L114.3 38.3L107.3 44.3L103.0 52.3L102.3 61.3L105.3 70.7L110.3 76.7L118.3 81.0L128.0 81.7L136.0 79.0L142.3 73.7L147.0 64.7L147.7 57.0L146.0 50.0L140.0 41.3L132.7 37.0L129.0 36.0ZM263.7 36.0L255.7 39.0L250.0 44.3L246.0 52.3L245.3 59.7L247.0 68.3L252.3 76.0L260.3 81.0L268.0 82.0L276.7 80.0L284.7 73.7L289.0 65.0L289.7 55.7L286.7 46.7L280.7 40.0L272.7 36.3ZM439.7 64.0L433.7 66.0L431.0 69.7L431.0 73.0L432.0 75.0L436.3 78.0L443.7 78.3L449.7 77.0L455.7 72.7L457.7 68.3L457.7 64.0Z';
+
+type Decor = { title?: string; className?: string; style?: CSSProperties };
+
+/** The bare mark in the current brand ink. Decorative unless given a title. */
+export function BrandGlyph({ height = 16, title, className, style }: Decor & { height?: number }) {
   return (
-    <span className={cn('brand-mark', className)} aria-hidden>
-      <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
-        <path d="M3 12.5h9.2a3.3 3.3 0 0 0 .4-6.57A4.6 4.6 0 0 0 4 7.6 2.5 2.5 0 0 0 3 12.5Z" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round" />
-        <path d="M6.5 15.5h5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
-      </svg>
-    </span>
+    <svg viewBox={MARK_VIEWBOX} width={Math.round(height * MARK_RATIO * 10) / 10} height={height} className={cn('brand-glyph', className)} style={style} fill="currentColor" role={title ? 'img' : undefined} aria-hidden={title ? undefined : true}>
+      {title && <title>{title}</title>}
+      <path fillRule="evenodd" d={MARK_PATH} />
+    </svg>
   );
 }
 
 /** The configured brand name (falls back to the default until the site configuration arrives). */
 export function useBrandName(): string {
   return useSite().data?.brand.name ?? DEFAULT_BRAND;
+}
+
+/** The logo image a deployment configured (`brand.logo`, `brand.logoDark`), or undefined for the built-in mark. */
+function useConfiguredLogo(): string | undefined {
+  const site = useSite().data;
+  const { theme } = useTheme();
+  return theme === 'dark' ? (site?.brand.logoDark ?? site?.brand.logo) : site?.brand.logo;
+}
+
+/** The mark on its tile, as the app icon: a light tile in the dark theme, a dark one otherwise. A configured `brand.logo` replaces it. */
+export function BrandMark({ size = 26, className }: { size?: number; className?: string }) {
+  const logo = useConfiguredLogo();
+  if (logo) return <img className={cn('brand-logo', className)} src={logo} alt="" aria-hidden />;
+  return (
+    <span className={cn('brand-mark', className)} style={{ width: size, height: size, borderRadius: Math.round(size * 0.3) }} aria-hidden>
+      <BrandGlyph height={Math.round(size * 0.38)} />
+    </span>
+  );
+}
+
+/** The wordmark. Decorative beside the mark; labelled when it stands alone. */
+export function BrandWordmark({ height = 13, title, className, style }: Decor & { height?: number }) {
+  return (
+    <svg viewBox={WORDMARK_VIEWBOX} width={Math.round(height * WORDMARK_RATIO * 10) / 10} height={height} className={cn('brand-wordmark', className)} style={style} fill="currentColor" role={title ? 'img' : undefined} aria-hidden={title ? undefined : true}>
+      {title && <title>{title}</title>}
+      <path fillRule="evenodd" d={WORDMARK_PATH} />
+    </svg>
+  );
+}
+
+/** The brand name next to the mark: the CloudTrain wordmark by default, the configured name as text for another brand. */
+export function BrandName({ height = 13, className }: { height?: number; className?: string }) {
+  const brand = useBrandName();
+  const logo = useConfiguredLogo();
+  if (brand === DEFAULT_BRAND && !logo) return <BrandWordmark height={height} className={className} />;
+  return <span className={cn('brand-name', className)}>{brand}</span>;
+}
+
+/** Mark and wordmark side by side, the proportions of cloudtrain-horizontal.svg. */
+export function BrandLockup({ height = 28, title = DEFAULT_BRAND, className, style }: Decor & { height?: number }) {
+  return (
+    <svg viewBox={LOCKUP_VIEWBOX} width={Math.round(height * LOCKUP_RATIO * 10) / 10} height={height} className={cn('brand-lockup', className)} style={style} fill="currentColor" role="img" aria-label={title}>
+      <title>{title}</title>
+      <path fillRule="evenodd" transform="scale(0.61)" d={MARK_PATH} />
+      <path fillRule="evenodd" transform="translate(229.19 37.75) scale(0.7)" d={WORDMARK_PATH} />
+    </svg>
+  );
 }

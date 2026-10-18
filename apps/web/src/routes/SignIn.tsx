@@ -5,7 +5,7 @@ import { ApiError, useMe } from '@/api/client';
 import { isRealApi } from '@/api/mode';
 import { useSite } from '@/api/public';
 import { useDiscover, useMockLogin } from '@/api/platform';
-import { BrandMark, useBrandName } from '@/components/brand';
+import { BrandMark, BrandName, useBrandName } from '@/components/brand';
 import { Button, Field, Input } from '@/components/ui';
 import { signInRoute } from '@/router';
 import { apiUrl } from '@/lib/runtimeConfig';
@@ -79,7 +79,7 @@ export function SignIn() {
       <div className="signin-panel">
         <Link to="/" className="signin-brand" aria-label={`${brand} home`}>
           <BrandMark />
-          <span className="brand-name">{brand}</span>
+          <BrandName height={15} />
         </Link>
 
         {search.reason === 'expired' && (

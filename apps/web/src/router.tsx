@@ -2,6 +2,7 @@ import { createRootRoute, createRoute, createRouter, lazyRouteComponent } from '
 import type { Difficulty, Domain, FrameworkId } from './api/types';
 import { Shell } from './app/Shell';
 import { NotFound } from './app/NotFound';
+import { RouteError } from './app/RouteError';
 import { PageSkeleton } from './components/ui';
 import { CatalogIndex, RootIndex } from './routes/site/Hybrid';
 import { ensureSampleMocks } from './mocks/sample';
@@ -384,6 +385,7 @@ export const router = createRouter({
   routeTree,
   defaultPreload: 'intent',
   defaultPendingComponent: Pending,
+  defaultErrorComponent: RouteError,
   defaultPendingMs: 120,
   scrollRestoration: true,
   defaultPreloadStaleTime: 0,
