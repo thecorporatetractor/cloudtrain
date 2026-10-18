@@ -67,6 +67,18 @@ spec:
         apt-get install -y -q --allow-change-held-packages kubelet='1.37.1-*' kubectl='1.37.1-*' >/dev/null
         apt-mark hold kubeadm kubelet kubectl >/dev/null
         systemctl daemon-reload && systemctl restart kubelet
+        # The new kubelet recreates the static control-plane pods a few seconds after it
+        # starts, while the old API server container still answers. Wait for the API to
+        # stay up through that restart (50 s of consecutive successes) before going on.
+        export KUBECONFIG=/etc/kubernetes/admin.conf
+        sleep 15
+        ok=0
+        for i in $(seq 1 100); do
+          if kubectl --request-timeout=5s get --raw /readyz >/dev/null 2>&1; then ok=$((ok+1)); else ok=0; fi
+          [ "$ok" -ge 25 ] && exit 0
+          sleep 2
+        done
+        echo "API server did not become stably ready" >&2; exit 1
     - on: qm-harbour/harbour-wk-1
       run: apt-mark hold kubeadm kubelet kubectl
     - on: qm-harbour
@@ -144,7 +156,12 @@ spec:
           apt-get update -q
           apt-get install -y kubeadm='1.37.1-*'
           kubeadm upgrade node
-          apt-get install -y kubelet='1.37.1-*' kubectl='1.37.1-*'
+          # keep the install from restarting the running kubelet (invoke-rc.d policy, needrestart)
+          trap 'rm -f /usr/sbin/policy-rc.d' EXIT
+          printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d && chmod +x /usr/sbin/policy-rc.d
+          NEEDRESTART_SUSPEND=1 NEEDRESTART_MODE=l apt-get install -y kubelet='1.37.1-*' kubectl='1.37.1-*'
+          rm -f /usr/sbin/policy-rc.d
+          echo "kubelet main pid after install: $(systemctl show -p MainPID --value kubelet), started: $(systemctl show -p ActiveEnterTimestamp --value kubelet)"
           apt-mark hold kubeadm kubelet kubectl
           EOS
           kubectl uncordon harbour-wk-1
