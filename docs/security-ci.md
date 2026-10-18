@@ -20,16 +20,16 @@ SARIF) and/or artifacts; they are triaged there.
 
 | Workflow | Triggers | Jobs (check names) | Blocking | Report-only |
 |---|---|---|---|---|
-| `ci.yml` | PR, push main | `node (build, typecheck, test, content)`, `go (vet, test, build, generate drift, labs)`, `licenses (inventory drift, copyleft gate)` | everything: pnpm frozen install, build, typecheck, test (gateway DB suites against Postgres 18); lab-verify `--strict`; `docs/curriculum.md` up to date; go vet, `test -race`, build; `make generate` drift; `labctl validate` on every pack; exam compile of the exams whose pools are complete (`sim-k8s-admin`, `sim-k8s-developer`, `sim-k8s-security`, testdata); `THIRD_PARTY_LICENSES.md` drift; no GPL/LGPL/AGPL/SSPL/unknown license in production dependencies (`tools/licenses/check.sh`) | none |
-| `codeql.yml` | PR, push main, weekly | `analyze (javascript-typescript)`, `analyze (go)`, `analyze (actions)` | via the ruleset's code scanning rule (High+ security alerts) | all CodeQL `security-extended` alerts |
-| `sast.yml` | PR, push main, weekly | `semgrep (report)`, `gosec (report)`, `hadolint, shellcheck, actionlint, zizmor` | actionlint; zizmor (medium+); shellcheck `-S warning` over `deploy/`, `tools/`, `services/`, `.github/` (lab assets in `content/` are excluded on purpose); hadolint at `error` | semgrep (p/default, typescript, golang, secrets, dockerfile, kubernetes; `content/` and `docs/` excluded), gosec, hadolint warnings, zizmor (all) |
+| `ci.yml` | PR (path-aware), push main | `node (build, typecheck, test, content)`, `go (vet, test, build, generate drift, labs)`, `licenses (inventory drift, copyleft gate)` | everything: pnpm frozen install, build, typecheck, test (gateway DB suites against Postgres 18); lab-verify `--strict`; `docs/curriculum.md` up to date; go vet, `test -race`, build; `make generate` drift; `labctl validate` on every pack; exam compile of the exams whose pools are complete (`sim-k8s-admin`, `sim-k8s-developer`, `sim-k8s-security`, testdata); `THIRD_PARTY_LICENSES.md` drift; no GPL/LGPL/AGPL/SSPL/unknown license in production dependencies (`tools/licenses/check.sh`) | none |
+| `codeql.yml` | PR (path-aware), push main, weekly | `analyze (javascript-typescript)`, `analyze (go)`, `analyze (actions)` | via the ruleset's code scanning rule (High+ security alerts) | all CodeQL `security-extended` alerts |
+| `sast.yml` | PR (path-aware), push main, weekly | `semgrep (report)`, `gosec (report)`, `hadolint, shellcheck, actionlint, zizmor` | actionlint; zizmor (medium+); shellcheck `-S warning` over `deploy/`, `tools/`, `services/`, `.github/` (lab assets in `content/` are excluded on purpose); hadolint at `error` | semgrep (p/default, typescript, golang, secrets, dockerfile, kubernetes; `content/` and `docs/` excluded), gosec, hadolint warnings, zizmor (all) |
 | `secrets.yml` | PR, push main, nightly | `gitleaks` | gitleaks over the PR's commits / the pushed range; never the working tree (gitignored `apps/web/dist` would trip it) | nightly: every commit on every branch (also SARIF) |
-| `deps.yml` | PR, push main, daily | `dependency-review`, `govulncheck`, `osv-scanner` | dependency-review (PRs: new dependency with a high/critical advisory or a GPL/LGPL/AGPL/SSPL license); govulncheck (reachable Go vulnerabilities) | osv-scanner SARIF over `pnpm-lock.yaml` and `go.mod` |
+| `deps.yml` | PR (path-aware), push main, daily | `dependency-review`, `govulncheck`, `osv-scanner` | dependency-review (PRs: new dependency with a high/critical advisory or a GPL/LGPL/AGPL/SSPL license); govulncheck (reachable Go vulnerabilities) | osv-scanner SARIF over `pnpm-lock.yaml` and `go.mod` |
 | `dependabot.yml` | weekly (Mon); compose monthly | n/a | n/a | version PRs: npm (pnpm), gomod (k8s group), github-actions, docker, docker-compose; minor/patch grouped; security updates grouped; 7-day cooldown |
-| `sbom.yml` | PR, push main, release | `source`, `dependency-submission`, `release` | none | syft SPDX + CycloneDX of the source tree (artifact); on main, submitted to the dependency graph; on release, source and per-image SBOMs attached to the release |
-| `images.yml` | PR (image paths), push main, `v*` tags, nightly | `build + scan (<image>)`, `publish (<image>)` | the image build; no CRITICAL vulnerability with a fix (Trivy and Grype) | Trivy (vuln + secret) and Grype SARIF; SBOM artifacts. Push to main and `v*` only: GHCR push, cosign keyless signature, SLSA provenance (`attest-build-provenance`) and SBOM attestation, both pushed to the registry |
-| `iac.yml` | PR (deploy/config/images paths), push main, weekly | `iac` | kube-linter and Trivy HIGH+ on the kustomize-rendered lab-orchestrator manifests (accepted operator RBAC in `.github/iac/trivyignore.yaml`) | Trivy config (repo; `content/` excluded), checkov (deploy/, rendered manifests, tools/images, .github), kube-linter over deploy/ |
-| `dast.yml` | PR, push main, nightly, manual | `zap (gateway)`, `zap (web)` | PRs/main: ZAP passive baseline fails on High alerts or plan errors | nightly/manual `full`: spider + active scan; HTML/JSON/SARIF reports as artifacts and code scanning |
+| `sbom.yml` | PR (dependency paths), push main, release | `source`, `dependency-submission`, `release` | none | syft SPDX + CycloneDX of the source tree (artifact); on main, submitted to the dependency graph; on release, source and per-image SBOMs attached to the release |
+| `images.yml` | PR (image paths; changed images only), push main, `v*` tags, nightly | `build + scan (<image>)`, `publish (<image>)` | the image build; no CRITICAL vulnerability with a fix (Trivy and Grype) | Trivy (vuln + secret) and Grype SARIF; SBOM artifacts. Push to main and `v*` only: GHCR push, cosign keyless signature, SLSA provenance (`attest-build-provenance`) and SBOM attestation, both pushed to the registry |
+| `iac.yml` | PR (deploy/config/images/`*.tf` paths), push main, weekly | `iac` | kube-linter and Trivy HIGH+ on the kustomize-rendered lab-orchestrator manifests (accepted operator RBAC in `.github/iac/trivyignore.yaml`) | Trivy config (repo; `content/` excluded), checkov (deploy/, rendered manifests, tools/images, .github), kube-linter over deploy/ |
+| `dast.yml` | PR (path-aware), push main, nightly, manual | `zap (gateway)`, `zap (web)` | PRs/main: ZAP passive baseline fails on High alerts or plan errors | nightly/manual `full`: spider + active scan; HTML/JSON/SARIF reports as artifacts and code scanning |
 | `scorecard.yml` | push main, weekly, branch protection change | `analysis` | none | OpenSSF Scorecard (published to the OpenSSF API for the badge, and SARIF) |
 | `fuzz.yml` | nightly, manual (`fuzztime`) | `fuzz (FuzzYAMLToJSON / FuzzCompile / FuzzResolveIntParam)` | none (a crash fails the nightly run and uploads the input) | the seed corpora also run in `ci.yml` as unit tests |
 
@@ -59,6 +59,84 @@ DAST targets:
 - **web:** the mock-mode production build behind `vite preview`. Header alerts there
   (CSP, anti-clickjacking) are guidance for the production web server's configuration.
 
+## What runs when
+
+Pull requests run only the jobs their change needs. Each workflow that holds a
+required check starts with a small `changes` job: it lists the PR's files (GitHub
+API) and maps them to groups with `.github/scripts/changes.sh`. Every other job
+depends on it and has an `if:` on its group. A job that is skipped by its `if:`
+reports *skipped*, and GitHub counts that as success for a required check, so the
+merge is not blocked. Workflow-level `paths:` filters are used only on workflows
+with no required check (`images`, `iac`, `sbom`), because a workflow that never
+starts never reports its checks.
+
+Groups (`changes.sh` is the source of truth):
+
+| Changed paths | Groups |
+|---|---|
+| `content/**`, `docs/**`, `*.md`, `LICENSE`, `NOTICE` | content |
+| `tools/curriculum/**`, `tools/lab-verify/**` | content, code, js |
+| `apps/web/**` | node, web, code, js |
+| `services/gateway/**` | node, gateway, code, js |
+| `packages/**` (`packages/lab-schema/**` also go, content) | node, web, gateway, code, js |
+| `pnpm-lock.yaml`, `package.json`, `pnpm-workspace.yaml` | node, web, gateway, deps, licenses, code, js |
+| `services/lab-orchestrator/**` | go, content (the gateway's content tests run the real labctl), code |
+| `go.work*`, any `go.mod`/`go.sum`/`package.json` | deps, licenses (plus the directory's groups) |
+| `deploy/dev/postgres/**` | node, gateway, code |
+| `deploy/images/**` | go (labctl catalog check), code |
+| other `deploy/**`, `tools/**` | code (IaC and images run from their own path filters) |
+| `*.sh` outside `content/`, any `*Dockerfile*`, `.hadolint.yaml` | lint |
+| `.zap/**` | web, gateway |
+| `.github/**`, `tools/ci/**`, any path no rule knows | everything |
+
+Jobs by group:
+
+| Job (check name) | Runs on a PR when |
+|---|---|
+| `node (build, typecheck, test, content)` | node: full build, typecheck, test (Postgres). content only: *content mode*: lab-schema, lab-verify and gateway content tests, no database |
+| | always when it runs: `lab-verify --strict`, `render.mjs --check` |
+| `go (vet, test, build, generate drift, labs)` | go: vet, `test -race`, build, generate drift, catalog check. content only: *content mode*: `make labctl` |
+| | always when it runs: `labctl validate` (every pack), samples, exam compile |
+| `licenses (inventory drift, copyleft gate)` | licenses |
+| `analyze (javascript-typescript)` / `analyze (go)` / `analyze (actions)` | js / go / `.github/**` |
+| `semgrep (report)` | code (anything outside `content/` and `docs/`) |
+| `gosec (report)`, `govulncheck` | go (govulncheck also deps) |
+| `hadolint, shellcheck, actionlint, zizmor` | lint |
+| `gitleaks` | always |
+| `dependency-review`, `osv-scanner` | deps |
+| `zap (gateway)` / `zap (web)` | gateway / web |
+| `sbom` (workflow paths) | a dependency manifest or lockfile, or `sbom.yml` |
+| `iac` (workflow paths) | `deploy/**`, `**/*.tf`, `services/lab-orchestrator/config/**`, `tools/images/**`, `.github/iac/**` |
+| `build + scan (<image>)` (workflow paths) | the image's own `paths` in the `publish` matrix of `images.yml` (`.github/scripts/image-matrix.sh`); `images.yml` or its scripts rebuild all, `deploy/versions.env` rebuilds the images with build args |
+
+A content-only PR (a lab, a `lab.yaml`, docs) therefore runs three real jobs, `node`
+and `go` in content mode and `gitleaks`, plus five `changes` jobs of a few seconds
+each. Before, it ran 16 jobs: also licenses, CodeQL x3, semgrep, gosec, the lint job,
+govulncheck, osv-scanner, dependency-review, the SBOM and both ZAP scans.
+
+Fail-safe rules:
+- If `changes` fails, every gated job runs (the condition is
+  `needs.changes.result != 'success' || <group>`), so a broken detector never skips a gate.
+- A PR whose file list is empty or at the API's 3000-file limit runs everything.
+- Changes to `.github/**` (workflows, `changes.sh` itself) or `tools/ci/**` run everything.
+- `changes.sh` is under `.github/`, owned by CODEOWNERS like the workflows.
+
+**Push to main, schedules and manual runs run the full suite.** The `changes` job only
+runs on `pull_request`, so on main every gated job runs and `images` builds every image.
+Path filtering is a PR-time cost saving, not a coverage reduction: whatever a PR skipped
+(CodeQL for an untouched language, DAST, image scans, SBOM, semgrep) still runs on the
+merge commit, the security tab and the dependency graph stay current from main, and
+the nightly and weekly schedules rescan unchanged code for new advisories. Scorecard
+runs on main and weekly only, as before.
+
+Concurrency:
+- Pull requests: one group per workflow and PR, `cancel-in-progress`, so a new push
+  cancels the older run.
+- Main: one group per workflow and branch without cancel. GitHub keeps one running and
+  at most one pending run per group and replaces the pending one when another commit
+  lands, so a burst of merges batches into one run of the newest commit. This applies to
+  the heavy main-only work too (DAST, image builds and publishing, SBOM submission).
+
 ## What blocks a merge
 
 Make these jobs **required status checks** on `main`. Their check names are exact:
@@ -72,9 +150,17 @@ Make these jobs **required status checks** on `main`. Their check names are exac
 - `dependency-review`, `govulncheck`
 - `zap (gateway)`, `zap (web)`
 
+The repository ruleset ("Branch Protection") requires exactly these. On a PR their jobs
+are skipped when the change does not need them (see "What runs when"); a skipped job
+satisfies its required check. Keep their names literal: CodeQL and ZAP are one job per
+language/target (the language or target in the job's `env`, the steps shared through a
+YAML anchor) rather than a matrix. GitHub appends matrix values to a literal job name
+(`analyze (go) (go, manual)`), and a matrix job skipped by `if:` reports under its
+unexpanded name, so either way the required check would never resolve.
+
 Some checks block when they run but must **not** be required:
-- `images` and `iac` are path-filtered on PRs, and a required check that never runs
-  blocks the merge forever.
+- `images`, `iac` and `sbom` are path-filtered on PRs at the workflow level, and a
+  required check that never runs blocks the merge forever.
 - `semgrep (report)`, `gosec (report)`, `osv-scanner`, `sbom`, `scorecard` and `fuzz` never fail on findings.
 
 The CodeQL gate is the ruleset's "Require code scanning results" rule (CodeQL: security
@@ -122,6 +208,35 @@ Each entry carries its reason in the file itself:
   (go1.27.2).
 
 ## Running the checks locally
+
+**Required before every push:** `tools/ci/run-local.sh`. It diffs the branch against
+`origin/main` (plus uncommitted files), runs the same `changes.sh` as CI and then the
+checks CI would run for those groups:
+- node: `pnpm install --frozen-lockfile`, build, typecheck, test (the gateway's DB suites
+  against a throwaway Postgres container), or content mode;
+- go: vet, `test -race` (needs gcc), build, `make generate` drift, catalog check, or
+  `make labctl`; then `labctl validate`, samples, exam compile;
+- `lab-verify --strict`, `render.mjs --check`, the licenses gate;
+- gitleaks over the branch's commits and the uncommitted files;
+- hadolint, shellcheck, actionlint and zizmor when workflows, scripts or Dockerfiles changed;
+- semgrep with `--semgrep` (report-only, changed files).
+
+It prints a pass/fail table and exits non-zero on any failure. Heavy work belongs on the
+test VM, so the usual call from a laptop is:
+
+```bash
+tools/ci/run-local.sh --remote ct-testvm          # sync to /srv/ct-work/dev/<branch>, run there
+tools/ci/run-local.sh --remote ct-testvm --all    # what main runs
+```
+
+`--remote` keeps a run-local clone per branch (`--slug` to name it; it never reuses a
+directory it did not create), ships the branch's commits as a git bundle and the
+uncommitted files with rsync, and runs the script there. The toolchain is the VM's
+(`tools/verify-vm/toolchain.sh`: Go, Node, pnpm, gcc); the pinned scanner CLIs are
+installed into `~/.cache/cloudtrain-ci/bin`. CodeQL, ZAP, image builds and scans, the IaC
+scanners, dependency-review, osv-scanner and SBOM are CI only.
+
+The individual scanners, for a deeper look. Install the CLIs into `~/.local/bin`:
 
 Install the CLIs into `~/.local/bin`:
 

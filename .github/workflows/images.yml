@@ -1,8 +1,9 @@
 # Container images that CI can build: the platform (lab-orchestrator, gateway,
 # web) and the lab images, but not the KubeVirt golden VM images, which need KVM
 # (see docs/deploy.md, "Publishing containerDisks"), nor tools/images/linux-pod,
-# which needs the package mirror as a build context. Every run: build, Trivy + Grype (SARIF; fail on a CRITICAL
-# vulnerability that has a fix), SBOMs as artifacts. Push to main and v* tags
+# which needs the package mirror as a build context. Pull requests build only the
+# images whose inputs changed (`plan` job, per-image `paths`). Every build: Trivy +
+# Grype (SARIF; fail on a CRITICAL vulnerability that has a fix), SBOMs as artifacts. Push to main and v* tags
 # only: push to GHCR, cosign keyless signature, SLSA build provenance and SBOM
 # attestations (stored in the registry and in GitHub's attestation store).
 name: images
@@ -29,6 +30,9 @@ on:
       - deploy/vcluster/values.yaml
       - .github/workflows/images.yml
       - .github/scripts/install-tools.sh
+      - .github/scripts/build-args.sh
+      - .github/scripts/image-matrix.sh
+      - .github/images/**
   schedule:
     - cron: '23 1 * * *' # rescan for newly published vulnerabilities
   workflow_dispatch:
@@ -40,8 +44,45 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # Pull requests build and scan only the images whose inputs changed (the
+  # per-image `paths` in the publish matrix below). Push to main, v* tags, the
+  # nightly rescan and manual runs build every image.
+  plan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read # list the PR's files
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+      any: ${{ steps.m.outputs.any }}
+    steps:
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            .github/scripts
+            .github/workflows
+      - id: m
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [[ $EVENT == pull_request ]]; then
+            bash .github/scripts/image-matrix.sh .github/workflows/images.yml --pr "$PR" >> "$GITHUB_OUTPUT"
+          else
+            bash .github/scripts/image-matrix.sh .github/workflows/images.yml --all >> "$GITHUB_OUTPUT"
+          fi
+
   build-scan:
     name: build + scan (${{ matrix.name }})
+    needs: plan
+    if: needs.plan.outputs.any == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     permissions:
@@ -49,74 +90,7 @@ jobs:
       security-events: write
     strategy:
       fail-fast: false
-      matrix: &images
-        include:
-          - name: lab-orchestrator
-            context: .
-            file: services/lab-orchestrator/Dockerfile
-            args: ''
-          # Platform: the gateway (BFF + labctl + content) and the web app (static build
-          # behind unprivileged nginx). Deployed by deploy/charts/cloudtrain.
-          - name: gateway
-            context: .
-            file: services/gateway/Dockerfile
-            args: ''
-          - name: web
-            context: .
-            file: apps/web/Dockerfile
-            args: ''
-          - name: jumphost
-            context: tools/images/jumphost
-            file: tools/images/jumphost/Dockerfile
-            # build arg (=versions.env variable when the names differ), see tools/images/build-jumphost.sh
-            args: >-
-              UBUNTU_APT_SNAPSHOT KUBECTL_VERSION=LAB_K8S_VERSION HELM_VERSION HELM_TARBALL_SHA256
-              ETCD_VERSION ETCD_TARBALL_SHA256 YQ_VERSION YQ_BINARY_SHA256
-          - name: frr
-            context: tools/images/netdev/frr
-            file: tools/images/netdev/frr/Dockerfile
-            args: ''
-          - name: nettools
-            context: tools/images/netdev/nettools
-            file: tools/images/netdev/nettools/Dockerfile
-            args: ''
-          - name: netsvc
-            context: tools/images/netdev/netsvc
-            file: tools/images/netdev/netsvc/Dockerfile
-            args: ''
-          # In-lab OCI registry (catalog oci-registry:3): thin layer on CNCF Distribution registry:3.
-          - name: oci-registry
-            context: tools/images/oci-registry
-            file: tools/images/oci-registry/Dockerfile
-            args: ''
-          # IaC workstation, OpenTofu flavour only (IAC_CLI=tofu, no BUSL binary). The
-          # Terraform flavour is built locally with tools/images/build-iac-ws.sh and is
-          # never published from public CI (decision 2026-10-17, docs/handoff.md).
-          - name: iac-ws-tofu
-            context: tools/images/iac
-            file: tools/images/iac/Dockerfile
-            args: >-
-              IAC_CLI=IAC_CLI_PUBLISHED UBUNTU_APT_SNAPSHOT KUBECTL_VERSION=LAB_K8S_VERSION HELM_VERSION HELM_TARBALL_SHA256
-              YQ_VERSION YQ_BINARY_SHA256 TERRAFORM_VERSION TERRAFORM_ZIP_SHA256
-              TOFU_VERSION TOFU_ZIP_SHA256 SEAWEEDFS_VERSION SEAWEEDFS_TARBALL_SHA256
-              TERRAFORM_STAGED_19_VERSION TERRAFORM_STAGED_19_ZIP_SHA256 TERRAFORM_STAGED_15_VERSION
-              TERRAFORM_STAGED_15_ZIP_SHA256 TERRAFORM_STAGED_15_LICENSE_SHA256 CONFTEST_VERSION CONFTEST_TARBALL_SHA256
-              GOVMOMI_VERSION VCSIM_TARBALL_SHA256 ORAS_VERSION ORAS_TARBALL_SHA256 DISTRIBUTION_VERSION DISTRIBUTION_TARBALL_SHA256
-          # Ansible control node (catalog ansible-ctl:2.21). ansible-core is GPL-3.0-or-later,
-          # shipped as a separate program with its licence text (docs/handoffs/automation.md).
-          - name: ansible-ctl
-            context: tools/images/ansible
-            file: tools/images/ansible/Dockerfile
-            args: UBUNTU_APT_SNAPSHOT ANSIBLE_CORE_VERSION
-          # KQL workstation (catalog kql-ws:1): KustoLoco (MIT) + tools/images/kql-ws/patches,
-          # Kusto.Language from Apache-2.0 source, Azure-Sentinel sample data (MIT). The build
-          # runs KustoLoco's test suites on the patched tree.
-          - name: kql-ws
-            context: tools/images/kql-ws
-            file: tools/images/kql-ws/Dockerfile
-            args: >-
-              UBUNTU_APT_SNAPSHOT KUSTOLOCO_VERSION KUSTOLOCO_COMMIT KUSTO_LANGUAGE_COMMIT
-              AZURE_SENTINEL_COMMIT AZURE_SENTINEL_LICENSE_SHA256
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     env:
       IMAGE: ci.local/${{ matrix.name }}:scan
     steps:
@@ -189,7 +163,89 @@ jobs:
       attestations: write
     strategy:
       fail-fast: false
-      matrix: *images
+      # The image list: name, build context, Dockerfile, build args (deploy/versions.env)
+      # and the paths that rebuild it on a pull request (.github/scripts/image-matrix.sh;
+      # images.yml, the shared scripts and deploy/versions.env for images with args
+      # rebuild all). labctl catalog check reads the names from here.
+      matrix:
+        include:
+          - name: lab-orchestrator
+            paths: services/lab-orchestrator/* go.work go.work.sum deploy/vcluster/values.yaml deploy/versions.env .dockerignore
+            context: .
+            file: services/lab-orchestrator/Dockerfile
+            args: ''
+          # Platform: the gateway (BFF + labctl + content) and the web app (static build
+          # behind unprivileged nginx). Deployed by deploy/charts/cloudtrain.
+          - name: gateway
+            paths: services/gateway/* services/lab-orchestrator/* packages/* content/* pnpm-lock.yaml package.json pnpm-workspace.yaml turbo.json .dockerignore
+            context: .
+            file: services/gateway/Dockerfile
+            args: ''
+          - name: web
+            paths: apps/web/* packages/* pnpm-lock.yaml package.json pnpm-workspace.yaml turbo.json .dockerignore
+            context: .
+            file: apps/web/Dockerfile
+            args: ''
+          - name: jumphost
+            paths: tools/images/jumphost/*
+            context: tools/images/jumphost
+            file: tools/images/jumphost/Dockerfile
+            # build arg (=versions.env variable when the names differ), see tools/images/build-jumphost.sh
+            args: >-
+              UBUNTU_APT_SNAPSHOT KUBECTL_VERSION=LAB_K8S_VERSION HELM_VERSION HELM_TARBALL_SHA256
+              ETCD_VERSION ETCD_TARBALL_SHA256 YQ_VERSION YQ_BINARY_SHA256
+          - name: frr
+            paths: tools/images/netdev/frr/*
+            context: tools/images/netdev/frr
+            file: tools/images/netdev/frr/Dockerfile
+            args: ''
+          - name: nettools
+            paths: tools/images/netdev/nettools/*
+            context: tools/images/netdev/nettools
+            file: tools/images/netdev/nettools/Dockerfile
+            args: ''
+          - name: netsvc
+            paths: tools/images/netdev/netsvc/*
+            context: tools/images/netdev/netsvc
+            file: tools/images/netdev/netsvc/Dockerfile
+            args: ''
+          # In-lab OCI registry (catalog oci-registry:3): thin layer on CNCF Distribution registry:3.
+          - name: oci-registry
+            paths: tools/images/oci-registry/*
+            context: tools/images/oci-registry
+            file: tools/images/oci-registry/Dockerfile
+            args: ''
+          # IaC workstation, OpenTofu flavour only (IAC_CLI=tofu, no BUSL binary). The
+          # Terraform flavour is built locally with tools/images/build-iac-ws.sh and is
+          # never published from public CI (decision 2026-10-17, docs/handoff.md).
+          - name: iac-ws-tofu
+            paths: tools/images/iac/*
+            context: tools/images/iac
+            file: tools/images/iac/Dockerfile
+            args: >-
+              IAC_CLI=IAC_CLI_PUBLISHED UBUNTU_APT_SNAPSHOT KUBECTL_VERSION=LAB_K8S_VERSION HELM_VERSION HELM_TARBALL_SHA256
+              YQ_VERSION YQ_BINARY_SHA256 TERRAFORM_VERSION TERRAFORM_ZIP_SHA256
+              TOFU_VERSION TOFU_ZIP_SHA256 SEAWEEDFS_VERSION SEAWEEDFS_TARBALL_SHA256
+              TERRAFORM_STAGED_19_VERSION TERRAFORM_STAGED_19_ZIP_SHA256 TERRAFORM_STAGED_15_VERSION
+              TERRAFORM_STAGED_15_ZIP_SHA256 TERRAFORM_STAGED_15_LICENSE_SHA256 CONFTEST_VERSION CONFTEST_TARBALL_SHA256
+              GOVMOMI_VERSION VCSIM_TARBALL_SHA256 ORAS_VERSION ORAS_TARBALL_SHA256 DISTRIBUTION_VERSION DISTRIBUTION_TARBALL_SHA256
+          # Ansible control node (catalog ansible-ctl:2.21). ansible-core is GPL-3.0-or-later,
+          # shipped as a separate program with its licence text (docs/handoffs/automation.md).
+          - name: ansible-ctl
+            paths: tools/images/ansible/*
+            context: tools/images/ansible
+            file: tools/images/ansible/Dockerfile
+            args: UBUNTU_APT_SNAPSHOT ANSIBLE_CORE_VERSION
+          # KQL workstation (catalog kql-ws:1): KustoLoco (MIT) + tools/images/kql-ws/patches,
+          # Kusto.Language from Apache-2.0 source, Azure-Sentinel sample data (MIT). The build
+          # runs KustoLoco's test suites on the patched tree.
+          - name: kql-ws
+            paths: tools/images/kql-ws/*
+            context: tools/images/kql-ws
+            file: tools/images/kql-ws/Dockerfile
+            args: >-
+              UBUNTU_APT_SNAPSHOT KUSTOLOCO_VERSION KUSTOLOCO_COMMIT KUSTO_LANGUAGE_COMMIT
+              AZURE_SENTINEL_COMMIT AZURE_SENTINEL_LICENSE_SHA256
     steps:
       - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
         with:

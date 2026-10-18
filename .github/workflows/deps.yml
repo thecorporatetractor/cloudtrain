@@ -2,6 +2,9 @@
 # (a new dependency with a high/critical advisory or a copyleft license) and
 # govulncheck (reachable Go vulnerabilities). Report-only: osv-scanner SARIF
 # over both lockfiles (also catches advisories in unchanged dependencies).
+# Path-aware on pull requests (`changes` job): dependency-review and osv-scanner
+# when a manifest or lockfile changed, govulncheck for Go changes. Push to main
+# and the daily run do everything.
 name: deps
 
 on:
@@ -19,8 +22,36 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  dependency-review:
+  changes:
     if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read # list the PR's files
+    outputs:
+      deps: ${{ steps.c.outputs.deps }}
+      go: ${{ steps.c.outputs.go }}
+    steps:
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+      - id: c
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        run: bash .github/scripts/changes.sh --pr "$PR" >> "$GITHUB_OUTPUT"
+
+  # Gated jobs run when `changes` was skipped (not a PR) or failed (fail-safe), or
+  # when their group is on; they are skipped (= success) otherwise.
+  dependency-review:
+    needs: changes
+    if: ${{ github.event_name == 'pull_request' && !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.deps == 'true') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -42,6 +73,8 @@ jobs:
           show-patched-versions: true
 
   govulncheck:
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.go == 'true' || needs.changes.outputs.deps == 'true') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -65,6 +98,8 @@ jobs:
         run: govulncheck ./...
 
   osv-scanner:
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.deps == 'true') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:

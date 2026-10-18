@@ -19,11 +19,17 @@ once; the CLA check on your first pull request walks you through it.
 
 ## Checks to run
 
+**Before every push**, run the pre-push gate. It runs the checks CI would run for your
+diff (same change detection as the workflows) and prints a pass/fail table; fix every
+FAIL before pushing:
+
 ```bash
-pnpm -r build && pnpm -r test
-node tools/lab-verify/bin/lab-verify.mjs --strict
-cd services/lab-orchestrator && go vet ./... && go test ./...
+tools/ci/run-local.sh --remote ct-testvm   # on the test VM (preferred)
+tools/ci/run-local.sh                      # on a machine with the full toolchain
 ```
+
+See [docs/security-ci.md](docs/security-ci.md) ("What runs when", "Running the checks
+locally"). CI on a pull request runs only the jobs your change needs; main runs everything.
 
 Lab changes also need a live run on the local stack
 ([docs/dev-environment.md](docs/dev-environment.md)):

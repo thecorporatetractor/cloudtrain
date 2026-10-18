@@ -41,6 +41,22 @@ func TestCatalogCheckRefusesTerraform(t *testing.T) {
 	}
 }
 
+func TestWorkflowImagesSkipsExpressionMatrix(t *testing.T) {
+	wf := filepath.Join(t.TempDir(), "images.yml")
+	y := "jobs:\n  build-scan:\n    strategy:\n      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}\n" +
+		"  publish:\n    strategy:\n      matrix:\n        include:\n          - name: web\n          - name: jumphost\n"
+	if err := os.WriteFile(wf, []byte(y), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := workflowImages(wf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(got, ",") != "jumphost,web" {
+		t.Fatalf("got %v", got)
+	}
+}
+
 func TestCatalogOverlay(t *testing.T) {
 	dir := t.TempDir()
 	d := "sha256:" + strings.Repeat("c", 64)

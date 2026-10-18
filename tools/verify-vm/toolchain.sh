@@ -43,7 +43,8 @@ if ! helm version --short 2>/dev/null | grep -q "$HELM_VERSION"; then
   echo "$HELM_TARBALL_SHA256  $f" | sha256sum -c -
   tar -xzf "$f" && sudo install -m 0755 linux-amd64/helm /usr/local/bin/helm
 fi
-sudo apt-get install -y -qq tmux rsync sysstat bzip2 >/dev/null
+# build-essential: gcc for cgo, which `go test -race` needs (tools/ci/run-local.sh).
+sudo apt-get install -y -qq tmux rsync sysstat bzip2 build-essential >/dev/null
 go_bin=/usr/local/go/bin
 grep -q '/usr/local/go/bin' ~/.profile || cat >> ~/.profile <<'EOF'
 export PATH="$HOME/.local/bin:/usr/local/go/bin:$HOME/go/bin:$PATH"
