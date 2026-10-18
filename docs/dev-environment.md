@@ -652,7 +652,7 @@ the heavy slot, the rest in the pod slot). A lab starts only when every catalog 
 is in the kind nodes; a ref missing from the catalog is recorded as `blocked`. Then it runs
 `labctl exam run --auto-solve` (seed 1) and `--no-solve` (seed 2) for each exam whose drawn
 tasks all pass. It skips a lab that passed with the same lab tree and platform, re-runs a
-failure when either changed, and a run cut by a stop or reboot simply runs again. Results on
+failure when either changed, and a run cut by a stop or reboot simply runs again. Slot use is counted from the `tools/slots/run.sh` processes and the unit uses `KillMode=process`, so restarting the runner (to pick up an edit) leaves running verifies alone and the new runner adopts them; it also re-executes the installed script at every cycle. Results on
 the volume under `/srv/ct-work/results/`: `status.json` (one line, every minute),
 `summary.tsv`, `labs/<id>.json` (status, failing step, timing, log tail), `logs/<id>.log`,
 `reports/<id>.json` (labctl's report), `exams/<exam>-<mode>.json`, `runner.log`.
@@ -667,7 +667,7 @@ Measured on the VM: idle with the platform up, about 2 % CPU, load 2.5-3.5, 9 Gi
 steal. A calibration smoke run (one 3-node kubeadm lab, an el-vm and a docker-vm lab, a netdev
 lab and six pod labs at once) peaked at 66 % CPU, load 19, 30 GiB, steal 0, with iowait up to
 10 % on the original gp3 volume (6000 IOPS, 250 MB/s). The first half hour of the batch
-(heavy 4 -> 9, pod 12 -> 20): CPU 54 % on average, 84 % peak, load up to 49, 44 GiB used,
+(heavy 4 -> 9, pod 12 -> 20; then 20 / 40 with `--parallel 3` per VM lab): CPU 54 % on average, 84 % peak, load up to 49, 44 GiB used,
 steal 0.
 
 Gotchas: the instance is Spot (stops on interruption) and a CloudWatch alarm stops it after

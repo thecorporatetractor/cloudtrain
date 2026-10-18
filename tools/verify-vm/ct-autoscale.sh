@@ -8,7 +8,7 @@
 set -uo pipefail
 CFG=${CT_BATCH_ENV:-/srv/ct-work/vm-config/runner.env}
 RES=/srv/ct-work/results; LOG=$RES/state/autoscale.log
-INTERVAL=${INTERVAL:-150} MIN=${MIN:-2} MAX=${MAX:-30} POD_MIN=${POD_MIN:-4} POD_MAX=${POD_MAX:-48}
+INTERVAL=${INTERVAL:-150} MIN=${MIN:-2} MAX=${MAX:-40} POD_MIN=${POD_MIN:-4} POD_MAX=${POD_MAX:-64}
 STEP_HEAVY=${STEP_HEAVY:-3} STEP_POD=${STEP_POD:-8}
 CPU_HIGH=${CPU_HIGH:-80} CPU_MAX=${CPU_MAX:-95} STEAL_MAX=${STEAL_MAX:-3} MEM_MIN_GIB=${MEM_MIN_GIB:-40} MEM_LOW_GIB=${MEM_LOW_GIB:-20}
 mkdir -p "$RES/state"

@@ -201,7 +201,10 @@ exam_jobs() { # prints "<exam> <mode> <seed> <hash>" for exams whose drawn tasks
 
 # ---------------------------------------------------------------------------- scheduling
 declare -A RUNNING=()   # pid -> slot
-running_count() { local n=0 p; for p in "${!RUNNING[@]}"; do [[ ${RUNNING[$p]} == "$1" ]] && n=$((n + 1)); done; echo $n; }
+# Jobs in flight per slot kind, counted from the processes (so jobs of an earlier runner that
+# survived a restart, and manual runs through the slot runner, count too).
+running_count() { pgrep -fc "tools/slots/run.sh $1 --" || true; }
+alive() { pgrep -f -- "bin/labctl verify .*--ready-timeout [^ ]+ $1\$" >/dev/null; }
 reap() { local p; for p in "${!RUNNING[@]}"; do kill -0 "$p" 2>/dev/null || { wait "$p" 2>/dev/null; unset "RUNNING[$p]"; }; done; }
 # Slot limits are re-read from $CFG before every dispatch, so they can be changed while the runner runs.
 reload_limits() { [[ -f $CFG ]] && eval "$(grep -E '^(export )?CT_SLOTS_(HEAVY|POD)=[0-9]+$' "$CFG")"; export CT_SLOTS_HEAVY CT_SLOTS_POD; }
@@ -220,6 +223,7 @@ cycle() { # cycle [ids]
       jq -n --arg id "$id" '{id:$id, status:"error", failingStep:"no lab directory under content/packs", finishedAt:(now|todate)}' > "$RES/labs/$id.json"; continue
     fi
     needs_run "$id" "$dir" "$force" || continue
+    alive "$dir" && continue    # still running from before a runner restart
     # a ref the catalog does not know cannot be built here: record it, retry when the platform changes
     local r unknown=""
     for r in ${refs//,/ }; do [[ -n ${CAT[$r]:-} ]] || unknown+="$r "; done
@@ -252,13 +256,13 @@ cycle() { # cycle [ids]
           continue
         fi
         Q[$i]=""
-        run_lab "$id" "$dir" $q & RUNNING[$!]=$q
-        [[ $q == vm ]] && sleep 20 || sleep 5   # stagger boots
+        run_lab "$id" "$dir" $q 9>&- & RUNNING[$!]=$q
+        [[ $q == vm ]] && sleep 3 || sleep 1   # small stagger; slots fill within one pass
       done
       unset -n Q
     done
     ((left == 0 && ${#RUNNING[@]} == 0)) && break
-    sleep 15
+    sleep 5
   done
   # exam runs (heavy slot each), after the labs of this cycle
   [[ -n $only ]] && return 0
@@ -268,7 +272,7 @@ cycle() { # cycle [ids]
   for j in "${jobs[@]}"; do
     read -r ex mode seed ih <<<"$j"
     while (( $(running_count vm) >= $(limit_for vm) )); do sleep 15; reap; done
-    run_exam "$ex" "$mode" "$seed" "$ih" & RUNNING[$!]=vm; sleep 20
+    run_exam "$ex" "$mode" "$seed" "$ih" 9>&- & RUNNING[$!]=vm; sleep 20
   done
   while ((${#RUNNING[@]} > 0)); do sleep 15; reap; done
 }
@@ -290,14 +294,14 @@ case ${1:-loop} in
         if [[ $(readlink -f "$0") != "$RES/state/ct-batch.run.sh" ]]; then
           cp "$SELF" "$RES/state/ct-batch.run.sh" && CT_BATCH_SELF=$SELF exec bash "$RES/state/ct-batch.run.sh" loop
         fi
-        exec 9>"$RES/state/runner.lock"; flock -n 9 || { log "another runner holds the lock"; exit 1; }
+        exec 9>"$RES/state/runner.flock"; flock -n 9 || { log "another runner holds the lock"; exit 1; }
         log "runner cycle start (pid $$)"
         cycle || log "cycle failed; retrying after sleep"; summary >/dev/null
         log "cycle done; sleeping ${CYCLE_SLEEP}s"; sleep "$CYCLE_SLEEP"
         exec 9>&-
         cp "$SELF" "$RES/state/ct-batch.run.sh.new" && mv "$RES/state/ct-batch.run.sh.new" "$RES/state/ct-batch.run.sh"
         CT_BATCH_SELF=$SELF exec bash "$RES/state/ct-batch.run.sh" loop ;;
-  once) exec 9>"$RES/state/runner.lock"; flock -n 9 || { log "another runner holds the lock"; exit 1; }
+  once) exec 9>"$RES/state/runner.flock"; flock -n 9 || { log "another runner holds the lock"; exit 1; }
         cycle "${2:-}"; summary >/dev/null ;;
   summary) summary ;;
   list) load_catalog; while IFS=$'\t' read -r id dir slot refs; do
