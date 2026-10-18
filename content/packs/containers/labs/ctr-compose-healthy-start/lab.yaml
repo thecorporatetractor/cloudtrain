@@ -128,6 +128,15 @@ spec:
         YML
         chown -R learner:learner "$p"
         (cd "$p" && docker compose up -d >/dev/null 2>&1) || true
+        # let the initial crash-loop settle (db finished warming up, api running again)
+        # so later compose commands never race a container that is mid-restart/removal
+        for i in $(seq 90); do
+          a=$(docker ps -aq --filter label=com.docker.compose.project=rights --filter label=com.docker.compose.service=api | head -1)
+          [ -n "$a" ] && [ "$(docker inspect "$a" | jq -r '.[0].State.Status')" = running ] && \
+            [ "$(docker exec rights-db-1 redis-cli ping 2>/dev/null)" = PONG ] && break
+          sleep 2
+        done
+        sleep 3
   checks:
     - id: db-has-healthcheck
       description: The db service defines a healthcheck that talks to the database
