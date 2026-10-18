@@ -10,17 +10,17 @@ import { currentSession } from './platformHandlers';
  * portal returns to the page. State lives in localStorage per org and user.
  */
 
-const KEY = 'ct.mock.billing';
+const STORAGE = 'ct.mock.billing';
 interface MockState {
-  subscriptions: Record<string, BillingSubscription & { lookupKey: string }>;
+  subscriptions: Record<string, BillingSubscription & { priceRef: string }>;
   customers: Record<string, true>;
   events: BillingEventRow[];
 }
-const SCOPE_KEY = (orgId: string, userId: string | null) => `${orgId}:${userId ?? 'org'}`;
+const scopeOf = (orgId: string, userId: string | null) => `${orgId}:${userId ?? 'org'}`;
 
 function read(): MockState {
   try {
-    const raw = localStorage.getItem(KEY);
+    const raw = localStorage.getItem(STORAGE);
     if (raw) return JSON.parse(raw) as MockState;
   } catch {
     /* ignore */
@@ -29,7 +29,7 @@ function read(): MockState {
 }
 function write(s: MockState) {
   try {
-    localStorage.setItem(KEY, JSON.stringify(s));
+    localStorage.setItem(STORAGE, JSON.stringify(s));
   } catch {
     /* ignore */
   }
@@ -42,8 +42,8 @@ const unauthenticated = () => HttpResponse.json({ error: 'Not signed in', code: 
 
 function summary(scope: BillingScope, orgId: string, userId: string | null): BillingSummary {
   const s = read();
-  const key = SCOPE_KEY(orgId, userId);
-  const sub = s.subscriptions[key];
+  const scope = scopeOf(orgId, userId);
+  const sub = s.subscriptions[scope];
   const active = sub && (sub.status === 'active' || sub.status === 'trialing' || sub.status === 'past_due');
   const plan = active ? planState(plans().find((p) => p.id === sub.planId), 'subscription', sub.updatedAt) : planState(freePlan(), 'default');
   return {
@@ -52,14 +52,14 @@ function summary(scope: BillingScope, orgId: string, userId: string | null): Bil
     scope,
     ...(plan ? { plan } : {}),
     ...(sub ? { subscription: stripLookup(sub) } : {}),
-    portalAvailable: !!s.customers[key],
+    portalAvailable: !!s.customers[scope],
     plans: plans().filter((p) => (scope === 'org' ? p.kind === 'organisation' : p.kind === 'individual')),
     currency: site.plans?.currency ?? 'EUR',
     placeholder: !!(site.plans?.placeholder || plans().some((p) => p.placeholderPrices)),
     checkoutEnabled: true,
   };
 }
-const stripLookup = ({ lookupKey: _l, ...rest }: BillingSubscription & { lookupKey: string }): BillingSubscription => rest;
+const stripLookup = ({ priceRef: _p, ...rest }: BillingSubscription & { priceRef: string }): BillingSubscription => rest;
 
 function checkout(scope: BillingScope, orgId: string, userId: string | null, body: CheckoutRequest) {
   const plan = plans().find((p) => p.id === body.planId);
@@ -70,11 +70,11 @@ function checkout(scope: BillingScope, orgId: string, userId: string | null, bod
   if (!price) return HttpResponse.json({ error: `${plan.name} has no ${interval} price`, code: 'invalid' }, { status: 422 });
   const seats = plan.perSeat ? Math.max(plan.minSeats ?? 1, body.seats ?? plan.minSeats ?? 1) : 1;
   const s = read();
-  const key = SCOPE_KEY(orgId, userId);
+  const scope = scopeOf(orgId, userId);
   const now = new Date();
   const end = new Date(now.getTime() + (interval === 'yearly' ? 365 : 30) * 86_400_000);
-  s.customers[key] = true;
-  s.subscriptions[key] = { id: `sub_mock_${key.slice(0, 6)}`, planId: plan.id, interval, seats, status: 'active', currentPeriodEnd: end.toISOString(), cancelAtPeriodEnd: false, updatedAt: now.toISOString(), lookupKey: price.lookupKey };
+  s.customers[scope] = true;
+  s.subscriptions[scope] = { id: `sub_mock_${scope.slice(0, 6)}`, planId: plan.id, interval, seats, status: 'active', currentPeriodEnd: end.toISOString(), cancelAtPeriodEnd: false, updatedAt: now.toISOString(), priceRef: price.lookupKey };
   s.events.unshift(
     { id: `evt_${Date.now()}_a`, type: 'checkout.session.completed', receivedAt: now.toISOString(), processedAt: now.toISOString(), status: 'processed', summary: { plan: plan.id, seats, interval } },
     { id: `evt_${Date.now()}_b`, type: 'customer.subscription.created', receivedAt: now.toISOString(), processedAt: now.toISOString(), status: 'processed', summary: { plan: plan.id, status: 'active' } },
@@ -116,14 +116,14 @@ export const billingHandlers = [
     await delay(300);
     const sess = currentSession();
     if (!sess) return unauthenticated();
-    if (!read().customers[SCOPE_KEY(sess.orgId, sess.userId)]) return HttpResponse.json({ error: 'No billing account yet: subscribe to a plan first.', code: 'conflict' }, { status: 409 });
+    if (!read().customers[scopeOf(sess.orgId, sess.userId)]) return HttpResponse.json({ error: 'No billing account yet: subscribe to a plan first.', code: 'conflict' }, { status: 409 });
     return HttpResponse.json({ url: '/account/billing?portal=mock' });
   }),
   http.post('/api/billing/org/portal', async () => {
     await delay(300);
     const sess = currentSession();
     if (!sess) return unauthenticated();
-    if (!read().customers[SCOPE_KEY(sess.orgId, null)]) return HttpResponse.json({ error: 'No billing account yet: subscribe to a plan first.', code: 'conflict' }, { status: 409 });
+    if (!read().customers[scopeOf(sess.orgId, null)]) return HttpResponse.json({ error: 'No billing account yet: subscribe to a plan first.', code: 'conflict' }, { status: 409 });
     return HttpResponse.json({ url: '/admin/billing?portal=mock' });
   }),
 ];
