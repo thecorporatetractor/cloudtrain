@@ -12,7 +12,7 @@ export type Id = string;
  * This interface was referenced by `Curriculum`'s JSON-Schema
  * via the `definition` "domain".
  */
-export type Domain = "kubernetes" | "linux" | "containers" | "iac" | "automation" | "networking";
+export type Domain = "kubernetes" | "linux" | "containers" | "iac" | "automation" | "networking" | "secops";
 /**
  * This interface was referenced by `Curriculum`'s JSON-Schema
  * via the `definition` "imageRef".
