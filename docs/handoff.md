@@ -108,7 +108,7 @@ Kata and the kubeadm proof under load:
 | original 11 K8s labs | 11 | 4+ | — | — | `content/packs/kubernetes` |
 | iac (wave 2) | 99 | 99 (round 2, 2026-10-18: 31 learning labs in the other four paths, the 18-task sim-iac-advanced pool incl. 9 on a Moto lab peer, 2 capstone tasks standalone); sim-iac-associate 100 % / 11.7 %, sim-iac-advanced 100 % twice / 27.8 % | 0 | capstone tasks wait for a shared-workstation decision (jumphost has no Terraform); 3 labs Terraform-only | `docs/handoffs/iac.md` |
 | containers (wave 2, Docker on `docker-vm:29`) | 135 | 24 (12 learning, 12 exam tasks) | 0 | 12 exam tasks (5 need more image content) + 79 learning labs not started | `docs/handoffs/containers.md` |
-| automation (wave 2, Ansible on `ansible-ctl:2.21`) | 97 | 9 (ansible-fundamentals tier-A labs, pod fleets) EXAMCELL | 15 sim-el-automation tasks (one per draw) EXAMBUILT | 3 tier-B fundamentals labs (VMs), 19 exam tasks, 6 more paths (49 labs) | `docs/handoffs/automation.md` |
+| automation (wave 2, Ansible on `ansible-ctl:2.21`) | 97 | 9 (ansible-fundamentals tier-A labs, pod fleets) + sim-el-automation exam run live (15 tasks on 4 el-vm VMs incl. re-run and reboot: auto-solve 100 %, no-solve 2 %) | 15 sim-el-automation tasks (one per draw) | 3 tier-B fundamentals labs (VMs), 19 exam tasks, 6 more paths (49 labs) | `docs/handoffs/automation.md` |
 
 Most "blocked on add-ons" labs should unblock with `kubeadm:1.37-full` (metrics-server,
 Traefik ingress + Gateway API, MetalLB, local-path, Falco, gVisor, kube-bench), now

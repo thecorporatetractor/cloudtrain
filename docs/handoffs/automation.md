@@ -12,7 +12,7 @@ The source of truth is each lab's `status`/`notes` in `content/curriculum.yaml`.
 |---|---|---|---|
 | Path `ansible-fundamentals`, tier-A labs (9 of 12) | 9 | **9** | 0 |
 | Path `ansible-fundamentals`, tier-B labs (`ov-conditionals-os-family`, `ov-handlers-web-reload`, `ov-template-claims-vhost`) | 0 | 0 | 3 (need VMs, see Next steps) |
-| Exam `sim-el-automation` pool (34 tasks) | 15 (one per draw) | EXAM_VERIFIED | 19 |
+| Exam `sim-el-automation` pool (34 tasks) | 15 (one per draw) | 0 per-task; all 15 passed a live exam run | 19 |
 | Paths `el-automation-engineer`, `automation-engineering-practices`, `automation-content-developer`, `automation-controller-operations`, `network-automation`, `event-driven-automation` | 0 | 0 | 49 |
 
 Verified learning labs (path order): ov-first-inventory, ov-bootstrap-automation-user,
@@ -20,6 +20,14 @@ ov-ansible-cfg-project, ov-adhoc-kernel-census, ov-first-playbook-motd,
 ov-idempotency-shell-cleanup, ov-check-diff-preview, ov-branch-group-vars,
 ov-loop-adjuster-accounts. Every one passed `labctl verify` (two seeds, every misconception
 mutation, every alternative, clean teardown); pod sessions were Ready in 85-315 s.
+
+Exam run (2026-10-18, scoped manager, one shared environment, control + 4 el-vm VMs, Ready
+in 464 s): `labctl exam run --allow-missing --auto-solve --seed 1` scored **100 %** over all
+15 tasks through every grading pass (initial, idempotency re-run of each saved playbook,
+reboot of the four VMs, post-reboot grade; about 14 minutes from freeze to report);
+`--no-solve --seed 2` scored **2 %** (fail). Both environments were released and torn down
+cleanly. The tasks are still `built`, not `verified`: their misconception mutations have
+not run through `labctl verify` (four VMs per session; see Next steps 1).
 
 Exam tasks authored (one per draw, so `sim-el-automation` compiles with `--allow-missing`):
 xan-baseline-script-output, xan-core-loop-groups-users, xan-core-facts-hwreport,
