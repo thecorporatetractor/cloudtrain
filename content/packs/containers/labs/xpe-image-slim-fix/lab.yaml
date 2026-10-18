@@ -15,7 +15,8 @@ spec:
 
     The label-printer image builds from `~/exam/label-printer/` (`Dockerfile`,
     `printer.sh`) onto a large toolchain layer it does not need at run time, and its
-    entrypoint is written so `docker stop` never delivers `SIGTERM` to the process.
+    entrypoint is written in shell form so `docker stop` never delivers `SIGTERM` to the
+    process. The service logs `label-printer release {{tag}} running` on start.
 
     1. Rebuild **`label-printer:release`** so the exported image is **under 120 MB**
        (the current build is about 900 MB because of an unused build-time toolchain
@@ -87,7 +88,7 @@ spec:
         COPY toolchain.sh /tmp/toolchain.sh
         RUN sh /tmp/toolchain.sh
         COPY printer.sh /printer.sh
-        ENTRYPOINT /printer.sh
+        ENTRYPOINT /printer.sh; echo exited
         DF
         chown -R learner:learner "$s"
         docker rm -f label-printer >/dev/null 2>&1 || true
@@ -130,8 +131,19 @@ spec:
         sleep 2
         t0=$(date +%s%N); docker stop label-printer >/dev/null; ms=$(( ($(date +%s%N) - t0) / 1000000 ))
         log=$(docker logs label-printer 2>&1 | grep -c '^clean shutdown$')
-        if [ "$ms" -lt 3000 ] && [ "$log" = 1 ]; then echo fast; else echo "ms=$ms clean=$log"; fi
+        up=$(docker logs label-printer 2>&1 | grep -c '^label-printer release {{tag}} running$')
+        if [ "$ms" -lt 3000 ] && [ "$log" = 1 ] && [ "$up" = 1 ]; then echo fast; else echo "ms=$ms clean=$log up=$up"; fi
       expect: {match: exact, value: fast}
+    - id: exec-form
+      description: The image ENTRYPOINT is in exec form (not wrapped in a shell)
+      type: shell
+      timeoutSec: 60
+      on: qm-docker-1
+      skills: [k8s.delivery.image-build]
+      weight: 1.5
+      command: |
+        docker image inspect label-printer:release 2>/dev/null | jq -r 'if (.[0].Config.Entrypoint // []) | (.[0] // "") | test("sh$") then "shell-form" else "exec-form" end'
+      expect: {match: exact, value: exec-form}
   solution:
     explanation: |
       A build stage runs the toolchain step and nothing from it is copied into a fresh
@@ -175,14 +187,14 @@ spec:
     - id: shell-form-entrypoint
       description: Fixes the size but keeps a shell-form ENTRYPOINT, so SIGTERM goes to the shell, not the script's trap.
       feedback: "ENTRYPOINT /printer.sh runs through /bin/sh -c, which becomes PID 1 and does not forward SIGTERM to the script it started. Use exec form, ENTRYPOINT [\"/printer.sh\"], so the script itself is PID 1."
-      expectFail: [fast-stop]
+      expectFail: [exec-form]
       mutation:
         on: qm-docker-1
         as: learner
         timeoutSec: 300
         run: |
           cd ~/exam/label-printer
-          printf '%s\n' 'FROM alpine:3.22' 'COPY printer.sh /printer.sh' 'ENTRYPOINT /printer.sh' > Dockerfile
+          printf '%s\n' 'FROM alpine:3.22' 'COPY printer.sh /printer.sh' 'ENTRYPOINT /printer.sh; echo exited' > Dockerfile
           docker build -t label-printer:release .
           docker rm -f label-printer 2>/dev/null || true
           docker run -d --name label-printer label-printer:release

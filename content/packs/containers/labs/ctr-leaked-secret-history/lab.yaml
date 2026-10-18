@@ -17,12 +17,13 @@ spec:
     `~/transcoder-src/`. A mock key service runs on `127.0.0.1:9400` with a revoke
     endpoint at `POST /revoke/<key>`.
 
-    1. **Find** the key in the image (it is not visible from `docker inspect` alone).
+    1. **Find** the key in the image (look at the image history and config, not just its filesystem).
     2. **Revoke** it through the key service.
     3. **Rebuild** the image with **no layer, no history entry and no config field**
        containing the key, under the **same tag**, `transcoder:7.1`, and **push** it.
     4. **Delete** the leaked manifest (the one that still contains the key) from the
-       registry, so no digest in the registry carries it any more. The clean image must
+       registry and **garbage-collect** the registry, so no manifest or config blob that
+       carries the key remains. The clean image must
        still run and print `transcoder 7.1 ready` (it reads the key from
        `/run/secrets/storage_key` at run time if present, not at build time).
   objectives:
@@ -117,7 +118,8 @@ spec:
         A='Accept: application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json'
         install -d /var/lib/cloudtrain
         curl -fsSI -H "$A" http://127.0.0.1:5000/v2/transcoder/manifests/7.1 | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}' > /var/lib/cloudtrain/leaked.digest
-        chmod 0600 /var/lib/cloudtrain/leaked.digest; chmod 0700 /var/lib/cloudtrain
+        curl -fs -H "$A" "http://127.0.0.1:5000/v2/transcoder/manifests/$(cat /var/lib/cloudtrain/leaked.digest)" | jq -r '.config.digest' > /var/lib/cloudtrain/leaked.config
+        chmod 0600 /var/lib/cloudtrain/leaked.digest /var/lib/cloudtrain/leaked.config; chmod 0700 /var/lib/cloudtrain
   checks:
     - id: key-revoked
       description: The leaked key is revoked in the key service
@@ -155,6 +157,17 @@ spec:
         cur=$(curl -fsSI -H "$A" http://127.0.0.1:5000/v2/transcoder/manifests/7.1 | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}')
         if [ "$c" = 404 ] && [ "$cur" != "$d" ]; then echo deleted; else echo "code=$c same=$([ "$cur" = "$d" ] && echo yes || echo no)"; fi
       expect: {match: exact, value: deleted}
+    - id: leaked-blobs-gone
+      description: The leaked config blob (which carries the key) has been garbage-collected from registry storage
+      type: shell
+      timeoutSec: 60
+      on: cl-transcode-04
+      skills: [containers.registry.garbage-collection]
+      weight: 2
+      command: |
+        h=$(cut -d: -f2 /var/lib/cloudtrain/leaked.config)
+        if [ -e "/srv/registry/docker/registry/v2/blobs/sha256/$(echo "$h" | cut -c1-2)/$h" ]; then echo present; else echo gone; fi
+      expect: {match: exact, value: gone}
     - id: still-works
       description: The clean, pushed image still starts and prints the ready banner
       type: shell
@@ -172,13 +185,13 @@ spec:
       body: "A leaked key stays usable by anyone who already copied the old image or manifest until it is revoked at the source, independent of what you do to the registry afterward."
       cost: 1
     - title: Deleting the old manifest
-      body: "`DELETE /v2/<repo>/manifests/<digest>` on the registry's own digest for the old push removes that reference once a new one has replaced the tag."
+      body: "`DELETE /v2/<repo>/manifests/<digest>` on the registry's own digest for the old push removes that reference once a new one has replaced the tag. Blobs stay on disk until `registry garbage-collect /etc/distribution/config.yml` runs inside the registry container."
       cost: 1
   misconceptions:
     - id: revoke-only
       description: Revokes the key but never rebuilds the image, so the old key still sits in every layer and in history.
       feedback: "Revoking stops the key from working, but the leaked value is still published in the image's layers and history. Rebuild without it and remove the old manifest too."
-      expectFail: [no-key-anywhere, leaked-manifest-deleted]
+      expectFail: [no-key-anywhere, leaked-manifest-deleted, leaked-blobs-gone]
       mutation:
         on: cl-transcode-04
         as: learner
@@ -192,12 +205,13 @@ spec:
         on: cl-transcode-04
         as: learner
         run: |
+          d=$(curl -fsSI -H 'Accept: application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json' http://127.0.0.1:5000/v2/transcoder/manifests/7.1 | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}')
           cd ~/transcoder-src
           printf '%s\n' 'FROM busybox:1.37' 'COPY app.sh /app.sh' 'CMD ["/app.sh"]' > Dockerfile
           docker build -q --provenance=false --sbom=false -t localhost:5000/transcoder:7.1 .
           docker push -q localhost:5000/transcoder:7.1
-          d=$(curl -fsSI -H 'Accept: application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json' http://127.0.0.1:5000/v2/transcoder/manifests/7.1 | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}')
           curl -fsS -X DELETE "http://127.0.0.1:5000/v2/transcoder/manifests/$d" >/dev/null || true
+          docker exec registry registry garbage-collect /etc/distribution/config.yml >/dev/null
   solution:
     explanation: |
       Revoke the leaked key at the source first, then rebuild from a Dockerfile that
@@ -214,6 +228,7 @@ spec:
           docker build -q --provenance=false --sbom=false -t localhost:5000/transcoder:7.1 .
           docker push -q localhost:5000/transcoder:7.1
           curl -fsS -X DELETE "http://127.0.0.1:5000/v2/transcoder/manifests/$d"
+          docker exec registry registry garbage-collect /etc/distribution/config.yml
     alternatives:
       - id: skopeo-inspect-first
         description: Confirm the leak with skopeo inspect --config before rebuilding.
@@ -229,3 +244,4 @@ spec:
               docker build -q --provenance=false --sbom=false -t localhost:5000/transcoder:7.1 .
               docker push -q localhost:5000/transcoder:7.1
               curl -fsS -X DELETE "http://127.0.0.1:5000/v2/transcoder/manifests/$d"
+              docker exec registry registry garbage-collect /etc/distribution/config.yml
