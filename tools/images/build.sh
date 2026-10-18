@@ -16,7 +16,8 @@
 #   kubeadm-full     ${GOLDEN_IMAGE_REPO}:${KUBEADM_FULL_IMAGE_TAG}  catalog kubeadm:1.37-full (+ -sec)
 #                    LAYERED on the kubeadm-node containerDisk (must exist): add-ons for
 #                    /opt/cloudtrain/bin/addons-install + images, gVisor, kube-bench, AppArmor
-#                    profiles, audit policies (tools/images/kubeadm-addons)
+#                    profiles, audit policies, Trivy + offline DB, cosign + signed fixture,
+#                    podman, buildah base images (tools/images/kubeadm-addons)
 #   docker-vm        ${DOCKER_VM_IMAGE}                             catalog docker-vm:29
 #                    (Ubuntu cloud image + Docker Engine 29, buildx, compose, rootless extras;
 #                    tools/images/docker-vm/preload-images.txt preloaded, lock/docker-vm.lock)
@@ -192,8 +193,26 @@ elif [[ $GUEST == etcd-host ]]; then
   cp "$ETCD_TGZ" "$WORK/in/etcd.tar.gz"
   cp -r "$HERE/etcd-host/." "$WORK/in/"
 fi
+# fetch_trivy_db <dest>: the Trivy DB layer (db.tar.gz) of TRIVY_DB_REF (repo@manifest digest),
+# anonymously from the registry; the manifest must hash to the pinned digest and the layer to
+# the digest that manifest names. Cached under the manifest digest.
+fetch_trivy_db() {
+  local dest=$1 repo=${TRIVY_DB_REF%@*} digest=${TRIVY_DB_REF#*@} host path token manifest layer
+  host=${repo%%/*}; path=${repo#*/}
+  if [[ -s $dest && -s $dest.layer ]] && echo "$(cat "$dest.layer")  $dest" | sha256sum -c --status; then return 0; fi
+  token=$(curl -fsSL "https://$host/token?scope=repository:$path:pull" | jq -r .token) || die "no registry token for $repo"
+  manifest=$(curl -fsSL -H "Authorization: Bearer $token" -H "Accept: application/vnd.oci.image.manifest.v1+json" \
+    "https://$host/v2/$path/manifests/$digest") || die "cannot fetch $TRIVY_DB_REF"
+  [[ "sha256:$(printf '%s' "$manifest" | sha256sum | cut -d' ' -f1)" == "$digest" ]] || die "$TRIVY_DB_REF: manifest digest mismatch"
+  layer=$(jq -r '.layers[] | select(.mediaType == "application/vnd.aquasec.trivy.db.layer.v1.tar+gzip") | .digest' <<<"$manifest")
+  [[ $layer == sha256:* ]] || die "$TRIVY_DB_REF has no Trivy DB layer"
+  log "downloading Trivy DB ${TRIVY_DB_DATE} ($layer)"
+  curl -fSL --retry 3 -H "Authorization: Bearer $token" -o "$dest.tmp" "https://$host/v2/$path/blobs/$layer" || die "Trivy DB download failed"
+  echo "${layer#sha256:}  $dest.tmp" | sha256sum -c --status || die "Trivy DB layer sha256 mismatch"
+  mv "$dest.tmp" "$dest"; echo "${layer#sha256:}" > "$dest.layer"
+}
 if [[ $GUEST == kubeadm-addons ]]; then
-  A="$HERE/kubeadm-addons"; IN="$WORK/in"; rm -rf "$IN/addons"; mkdir -p "$IN/addons"/{metrics-server,gateway-api,traefik,metallb,local-path,falco}
+  A="$HERE/kubeadm-addons"; IN="$WORK/in"; rm -rf "$IN/addons"; mkdir -p "$IN/addons"/{metrics-server,gateway-api,traefik,metallb,local-path,falco,csi-hostpath}
   fetch_pinned "https://github.com/kubernetes-sigs/metrics-server/releases/download/${METRICS_SERVER_VERSION}/components.yaml" \
     "$METRICS_SERVER_MANIFEST_SHA256" "$CACHE/metrics-server-${METRICS_SERVER_VERSION}.yaml"
   # lab kubelets serve self-signed certificates
@@ -213,6 +232,7 @@ if [[ $GUEST == kubeadm-addons ]]; then
   grep -q 'busybox:1.37' "$IN/addons/local-path/local-path-storage.yaml" || die "could not pin the local-path helper image"
   cp "$A/manifests/traefik.yaml" "$A/manifests/traefik-crds.yaml" "$IN/addons/traefik/"
   cp "$A/falco.yaml" "$IN/addons/falco/falco.yaml"
+  cp "$A/manifests/csi-hostpath.yaml" "$IN/addons/csi-hostpath/csi-hostpath.yaml"
   cp "$A/addons-install" "$IN/"; rm -rf "$IN/security"; cp -r "$A/security" "$IN/security"
   fetch_pinned "https://github.com/google/gvisor/releases/download/${GVISOR_RELEASE}/gvisor-x86_64.tar.bz2" \
     "$GVISOR_TARBALL_SHA256" "$CACHE/gvisor-${GVISOR_RELEASE}.tar.bz2"
@@ -228,6 +248,35 @@ if [[ $GUEST == kubeadm-addons ]]; then
     | grep -v 'busybox:1.37' | while read -r i; do normalize "$i"; done | sort -u)
   lock_check "$LOCKDIR/addons.lock" "${AIMG[@]}"
   grep -v '^#' "$LOCKDIR/addons.lock" | grep . > "$IN/addon-images.txt"
+  # Supply-chain tools (Apache-2.0): Trivy + its dated offline DB, cosign, the signing fixture
+  fetch_pinned "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz" \
+    "$TRIVY_TARBALL_SHA256" "$CACHE/trivy-${TRIVY_VERSION}.tar.gz"
+  rm -rf "$IN/trivy"; mkdir -p "$IN/trivy"
+  tar -xzf "$CACHE/trivy-${TRIVY_VERSION}.tar.gz" -C "$IN/trivy" trivy LICENSE
+  fetch_pinned "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64" \
+    "$COSIGN_SHA256" "$CACHE/cosign-${COSIGN_VERSION}"
+  cp "$CACHE/cosign-${COSIGN_VERSION}" "$IN/cosign"
+  fetch_pinned "https://raw.githubusercontent.com/sigstore/cosign/${COSIGN_VERSION}/LICENSE" \
+    "$COSIGN_LICENSE_SHA256" "$CACHE/cosign-${COSIGN_VERSION}.LICENSE"
+  cp "$CACHE/cosign-${COSIGN_VERSION}.LICENSE" "$IN/cosign.LICENSE"
+  if [[ ${LOCK_ONLY:-0} != 1 ]]; then
+    fetch_trivy_db "$CACHE/trivy-db-${TRIVY_DB_REF##*:}.tar.gz"
+    cp "$CACHE/trivy-db-${TRIVY_DB_REF##*:}.tar.gz" "$IN/trivy-db.tar.gz"
+  fi
+  rm -rf "$IN/signing"; cp -r "$A/signing" "$IN/signing"
+  # Base images for buildah's storage: kubeadm-addons/buildah-images.txt, digests in
+  # lock/buildah-images.lock; the guest gets "<upstream>@<digest> <lab name>" lines.
+  mapfile -t BSRC < <(grep -v '^#' "$A/buildah-images.txt" | awk 'NF {print $1}' | while read -r i; do normalize "$i"; done)
+  ((${#BSRC[@]})) || die "kubeadm-addons/buildah-images.txt lists no image"
+  n0=${#LOCKED[@]}
+  lock_check "$LOCKDIR/buildah-images.lock" "${BSRC[@]}"
+  : > "$IN/buildah-images.txt"
+  while read -r src name; do
+    [[ -n $src && $src != \#* ]] || continue
+    src=$(normalize "$src")
+    ref=$(printf '%s\n' "${LOCKED[@]:$n0}" | grep -F "$src@") || die "$src not in buildah-images.lock"
+    echo "$ref $name" >> "$IN/buildah-images.txt"
+  done < "$A/buildah-images.txt"
 fi
 if [[ $GUEST == docker-vm ]]; then
   # Images preloaded into the engine: tools/images/docker-vm/preload-images.txt, by digest.
@@ -288,6 +337,11 @@ MIRROR_SNAPSHOT=${MIRROR_SNAPSHOT}
 ETCD_VERSION=${ETCD_VERSION}
 GVISOR_RELEASE=${GVISOR_RELEASE}
 KUBE_BENCH_VERSION=${KUBE_BENCH_VERSION}
+TRIVY_VERSION=${TRIVY_VERSION}
+TRIVY_DB_REF=${TRIVY_DB_REF}
+TRIVY_DB_DATE=${TRIVY_DB_DATE}
+COSIGN_VERSION=${COSIGN_VERSION}
+CSI_HOSTPATH_VERSION=${CSI_HOSTPATH_VERSION}
 CONTAINERD_VERSION=${CONTAINERD_VERSION}
 KUBERNETES_CNI_VERSION=${KUBERNETES_CNI_VERSION}
 UBUNTU_APT_SNAPSHOT=${UBUNTU_APT_SNAPSHOT}

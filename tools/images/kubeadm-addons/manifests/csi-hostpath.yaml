@@ -1,0 +1,268 @@
+# csi-hostpath add-on: the Kubernetes CSI hostpath driver (kubernetes-csi/csi-driver-host-path
+# CSI_HOSTPATH_VERSION, deploy/kubernetes-1.34 layout; Apache-2.0), trimmed for labs that need a
+# CSI driver with volume expansion. Changes from upstream:
+#   - namespace kube-system; one ServiceAccount with the provisioner and resizer RBAC
+#     (kubernetes-csi/external-provisioner v6.3.0 and external-resizer v2.2.1 deploy/kubernetes/rbac.yaml)
+#   - no attacher (attachRequired: false; the plugin runs without --enable-attach), no
+#     snapshotter (no snapshot CRDs) and no health monitor
+#   - storage capacity tracking (provisioner --enable-capacity, CSIDriver storageCapacity):
+#     the driver is single-node (one StatefulSet replica, data in /var/lib/csi-hostpath-data on
+#     that node), and capacity tracking makes the scheduler put WaitForFirstConsumer Pods on
+#     the node that runs the plugin
+#   - StorageClass "csi-hostpath" (not the default class; allowVolumeExpansion)
+# All images are preloaded (tools/images/lock/addons.lock).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: csi-hostpathplugin-sa
+  namespace: kube-system
+---
+apiVersion: storage.k8s.io/v1
+kind: CSIDriver
+metadata:
+  name: hostpath.csi.k8s.io
+spec:
+  volumeLifecycleModes: [Persistent, Ephemeral]
+  podInfoOnMount: true
+  attachRequired: false
+  storageCapacity: true
+  fsGroupPolicy: File
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: csi-hostpath
+provisioner: hostpath.csi.k8s.io
+reclaimPolicy: Delete
+allowVolumeExpansion: true
+volumeBindingMode: WaitForFirstConsumer
+---
+kind: ClusterRole
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: csi-hostpath-provisioner-runner
+rules:
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["get", "list", "watch", "create", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "update"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["list", "watch", "create", "update", "patch"]
+  - apiGroups: ["snapshot.storage.k8s.io"]
+    resources: ["volumesnapshots"]
+    verbs: ["get", "list", "watch", "update"]
+  - apiGroups: ["snapshot.storage.k8s.io"]
+    resources: ["volumesnapshotcontents"]
+    verbs: ["get", "list"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["csinodes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["volumeattachments"]
+    verbs: ["get", "list", "watch"]
+---
+kind: ClusterRole
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: csi-hostpath-resizer-runner
+rules:
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["get", "list", "watch", "patch"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims/status"]
+    verbs: ["patch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["list", "watch", "create", "update", "patch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["volumeattributesclasses"]
+    verbs: ["get", "list", "watch"]
+---
+kind: ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: csi-hostpath-provisioner
+subjects:
+  - kind: ServiceAccount
+    name: csi-hostpathplugin-sa
+    namespace: kube-system
+roleRef:
+  kind: ClusterRole
+  name: csi-hostpath-provisioner-runner
+  apiGroup: rbac.authorization.k8s.io
+---
+kind: ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: csi-hostpath-resizer
+subjects:
+  - kind: ServiceAccount
+    name: csi-hostpathplugin-sa
+    namespace: kube-system
+roleRef:
+  kind: ClusterRole
+  name: csi-hostpath-resizer-runner
+  apiGroup: rbac.authorization.k8s.io
+---
+kind: Role
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: csi-hostpath-cfg
+  namespace: kube-system
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "watch", "list", "delete", "update", "create"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["csistoragecapacities"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get"]
+  - apiGroups: ["apps"]
+    resources: ["replicasets", "statefulsets"]
+    verbs: ["get"]
+---
+kind: RoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: csi-hostpath-cfg
+  namespace: kube-system
+subjects:
+  - kind: ServiceAccount
+    name: csi-hostpathplugin-sa
+    namespace: kube-system
+roleRef:
+  kind: Role
+  name: csi-hostpath-cfg
+  apiGroup: rbac.authorization.k8s.io
+---
+kind: StatefulSet
+apiVersion: apps/v1
+metadata:
+  name: csi-hostpathplugin
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/name: csi-hostpathplugin
+spec:
+  serviceName: csi-hostpathplugin
+  # One replica only: the hostpath driver keeps every volume on the node it runs on.
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: csi-hostpathplugin
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: csi-hostpathplugin
+    spec:
+      serviceAccountName: csi-hostpathplugin-sa
+      containers:
+        - name: hostpath
+          image: registry.k8s.io/sig-storage/hostpathplugin:v1.17.1
+          args:
+            - --drivername=hostpath.csi.k8s.io
+            - --v=2
+            - --endpoint=$(CSI_ENDPOINT)
+            - --nodeid=$(KUBE_NODE_NAME)
+          env:
+            - name: CSI_ENDPOINT
+              value: unix:///csi/csi.sock
+            - name: KUBE_NODE_NAME
+              valueFrom:
+                fieldRef: {apiVersion: v1, fieldPath: spec.nodeName}
+          securityContext:
+            privileged: true
+          ports:
+            - {containerPort: 9898, name: healthz, protocol: TCP}
+          livenessProbe:
+            failureThreshold: 5
+            httpGet: {path: /healthz, port: healthz}
+            initialDelaySeconds: 10
+            timeoutSeconds: 3
+            periodSeconds: 2
+          volumeMounts:
+            - {mountPath: /csi, name: socket-dir}
+            - {mountPath: /var/lib/kubelet/pods, mountPropagation: Bidirectional, name: mountpoint-dir}
+            - {mountPath: /var/lib/kubelet/plugins, mountPropagation: Bidirectional, name: plugins-dir}
+            - {mountPath: /csi-data-dir, name: csi-data-dir}
+            - {mountPath: /dev, name: dev-dir}
+        - name: node-driver-registrar
+          image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.17.0
+          args:
+            - --v=2
+            - --csi-address=/csi/csi.sock
+            - --kubelet-registration-path=/var/lib/kubelet/plugins/csi-hostpath/csi.sock
+            - --http-endpoint=:9809
+          securityContext:
+            privileged: true
+          env:
+            - name: KUBE_NODE_NAME
+              valueFrom:
+                fieldRef: {apiVersion: v1, fieldPath: spec.nodeName}
+          ports:
+            - {containerPort: 9809, name: healthz-reg, protocol: TCP}
+          livenessProbe:
+            httpGet: {path: /healthz, port: healthz-reg}
+            initialDelaySeconds: 30
+            timeoutSeconds: 15
+            periodSeconds: 10
+            failureThreshold: 3
+          volumeMounts:
+            - {mountPath: /csi, name: socket-dir}
+            - {mountPath: /registration, name: registration-dir}
+            - {mountPath: /csi-data-dir, name: csi-data-dir}
+        - name: liveness-probe
+          image: registry.k8s.io/sig-storage/livenessprobe:v2.19.0
+          args: [--csi-address=/csi/csi.sock, --health-port=9898]
+          volumeMounts:
+            - {mountPath: /csi, name: socket-dir}
+        - name: csi-provisioner
+          image: registry.k8s.io/sig-storage/csi-provisioner:v6.3.0
+          args:
+            - --v=2
+            - --csi-address=/csi/csi.sock
+            - --feature-gates=Topology=true
+            - --enable-capacity
+            - --capacity-ownerref-level=1   # the StatefulSet owns the CSIStorageCapacity objects
+          env:
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef: {fieldPath: metadata.namespace}
+            - name: POD_NAME
+              valueFrom:
+                fieldRef: {fieldPath: metadata.name}
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - {mountPath: /csi, name: socket-dir}
+        - name: csi-resizer
+          image: registry.k8s.io/sig-storage/csi-resizer:v2.2.1
+          args: [--v=2, --csi-address=/csi/csi.sock]
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - {mountPath: /csi, name: socket-dir}
+      volumes:
+        - {name: socket-dir, hostPath: {path: /var/lib/kubelet/plugins/csi-hostpath, type: DirectoryOrCreate}}
+        - {name: mountpoint-dir, hostPath: {path: /var/lib/kubelet/pods, type: DirectoryOrCreate}}
+        - {name: registration-dir, hostPath: {path: /var/lib/kubelet/plugins_registry, type: Directory}}
+        - {name: plugins-dir, hostPath: {path: /var/lib/kubelet/plugins, type: Directory}}
+        - {name: csi-data-dir, hostPath: {path: /var/lib/csi-hostpath-data/, type: DirectoryOrCreate}}
+        - {name: dev-dir, hostPath: {path: /dev, type: Directory}}
