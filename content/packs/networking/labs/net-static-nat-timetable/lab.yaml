@@ -1,0 +1,171 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: net-static-nat-timetable
+  title: Publish the timetable server with static NAT
+  domain: networking
+  frameworks: [ccna:ip-services, lfcs:networking]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [nat, static-nat, dnat, snat, nftables]
+  version: 1
+spec:
+  description: |
+    `mv-edge-1` (Linux router, shell, nftables) already translates the inside
+    networks to its outside address 203.0.113.{{pub}} with PAT (table `ip nat`).
+    The regional education network now needs to reach the district timetable
+    server `timetable-dc` (10.{{octet}}.200.10, HTTPS on TCP 443).
+
+    The regional provider assigned a second outside address, **203.0.113.{{pub2}}**,
+    for it. Configure static (one-to-one) NAT on `mv-edge-1`:
+
+    - connections from outside to 203.0.113.{{pub2}} on TCP 443 reach
+      `timetable-dc`;
+    - connections that `timetable-dc` opens to the outside leave with source
+      203.0.113.{{pub2}};
+    - every other inside host, such as `staff-pc`, keeps using PAT with
+      203.0.113.{{pub}}.
+
+    `regional-client` (outside, behind `regional-gw`) tests with
+    `curl -k https://203.0.113.{{pub2}}/`; `regional-portal` (198.51.100.80)
+    records the source addresses it sees.
+  objectives:
+    - Configure destination NAT for an inbound service
+    - Pair it with source NAT so the mapping is one-to-one
+    - Keep PAT for every other inside host
+  params:
+    octet:
+      type: int
+      min: 20
+      max: 90
+    pub:
+      type: int
+      min: 20
+      max: 99
+    pub2:
+      type: int
+      min: 130
+      max: 199
+  topology:
+    entry: workstation
+    nodes:
+      - { name: workstation, driver: container, image: jumphost:1, access: [shell] }
+      - { name: mv-edge-1, driver: container, image: netsvc:1, resources: { cpu: 0.25, memoryMiB: 96 }, access: [shell] }
+      - { name: regional-gw, driver: netdev, image: frr:10 }
+      - { name: regional-portal, driver: container, image: netsvc:1, resources: { cpu: 0.2, memoryMiB: 96 } }
+      - { name: regional-client, driver: container, image: netsvc:1, resources: { cpu: 0.2, memoryMiB: 64 }, access: [shell] }
+      - { name: timetable-dc, driver: container, image: netsvc:1, resources: { cpu: 0.2, memoryMiB: 96 }, access: [shell] }
+      - { name: staff-pc, driver: container, image: nettools:1, resources: { cpu: 0.2, memoryMiB: 64 }, access: [shell] }
+    links:
+      - { a: "mv-edge-1:eth1", b: "timetable-dc:eth1" }
+      - { a: "mv-edge-1:eth2", b: "staff-pc:eth1" }
+      - { a: "mv-edge-1:eth4", b: "regional-gw:eth1" }
+      - { a: "regional-gw:eth2", b: "regional-portal:eth1" }
+      - { a: "regional-gw:eth3", b: "regional-client:eth1" }
+  setup:
+    - on: mv-edge-1
+      run: |
+        echo 1 > /proc/sys/net/ipv4/ip_forward
+        ip addr replace 10.{{octet}}.200.1/24 dev eth1
+        ip addr replace 10.{{octet}}.20.1/24 dev eth2
+        ip addr replace 203.0.113.{{pub}}/24 dev eth4
+        ip route replace default via 203.0.113.1
+        nft add table ip nat
+        nft 'add chain ip nat postrouting { type nat hook postrouting priority srcnat; }'
+        nft add rule ip nat postrouting oifname eth4 ip saddr 10.{{octet}}.0.0/16 masquerade
+    - on: regional-gw
+      config: |
+        interface eth1
+         ip address 203.0.113.1/24
+        interface eth2
+         ip address 198.51.100.1/25
+        interface eth3
+         ip address 198.51.100.129/25
+    - on: regional-portal
+      run: |
+        ip addr replace 198.51.100.80/25 dev eth1; ip route replace default via 198.51.100.1
+        mkdir -p /srv/www /var/lib/cloudtrain; echo 'regional portal' > /srv/www/index.html
+        setsid httpd -p 80 -h /srv/www </dev/null >/dev/null 2>&1 &
+        setsid tcpdump -i eth1 -nn -U -w /var/lib/cloudtrain/portal.pcap 'tcp dst port 80 and tcp[tcpflags] & tcp-syn != 0' </dev/null >/dev/null 2>&1 &
+        sleep 1
+    - { on: regional-client, run: "ip addr replace 198.51.100.130/25 dev eth1 && ip route replace default via 198.51.100.129" }
+    - on: timetable-dc
+      run: |
+        ip addr replace 10.{{octet}}.200.10/24 dev eth1; ip route replace default via 10.{{octet}}.200.1
+        setsid ncat --ssl -lk 443 --sh-exec "printf 'HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n\r\nMarlow Valley timetable\n'" </dev/null >/dev/null 2>&1 &
+        sleep 1
+    - { on: staff-pc, run: "ip addr replace 10.{{octet}}.20.10/24 dev eth1 && ip route replace default via 10.{{octet}}.20.1" }
+  checks:
+    - id: inbound-https
+      description: The regional client reaches the timetable server on 203.0.113.{{pub2}}:443
+      type: shell
+      on: regional-client
+      command: curl -sk -m 5 https://203.0.113.{{pub2}}/
+      expect: { match: exact, value: "Marlow Valley timetable" }
+      skills: [net.services.nat]
+      weight: 2
+    - id: probe-timetable
+      description: (probe) the timetable server opens a connection to the regional portal
+      type: shell
+      on: timetable-dc
+      command: curl -s -m 3 -o /dev/null http://198.51.100.80/; echo probed
+      expect: { match: exact, value: probed }
+      skills: [net.services.nat]
+      weight: 0
+    - id: probe-staff
+      description: (probe) staff-pc opens a connection to the regional portal
+      type: shell
+      on: staff-pc
+      command: wget -q -T 3 -O /dev/null http://198.51.100.80/; echo probed
+      expect: { match: exact, value: probed }
+      skills: [net.services.nat]
+      weight: 0
+    - id: one-to-one-and-pat
+      description: The portal saw the timetable server as 203.0.113.{{pub2}} and staff-pc as 203.0.113.{{pub}}, nothing else
+      type: shell
+      on: regional-portal
+      command: tcpdump -nn -r /var/lib/cloudtrain/portal.pcap 2>/dev/null | awk '{print $3}' | sed 's/\.[0-9]*$//' | sort -u | tr '\n' ' '
+      expect: { match: exact, value: "203.0.113.{{pub2}} 203.0.113.{{pub}} " }
+      skills: [net.services.nat, linux.net.nat-forwarding]
+      weight: 2
+  hints:
+    - title: The outside address must exist
+      body: The regional router ARPs for 203.0.113.{{pub2}}; add it to eth4 as a second address so the edge answers.
+      command: "ip addr add 203.0.113.{{pub2}}/24 dev eth4"
+      cost: 1
+    - title: Both directions
+      body: A prerouting `dnat to` rewrites inbound destinations; a postrouting `snat to` for the server's own address rewrites its outbound source. Put the snat rule before the masquerade rule.
+      cost: 2
+  misconceptions:
+    - id: dnat-only
+      description: Adds the inbound DNAT but no matching SNAT, so the server still leaves through PAT
+      mutation:
+        on: mv-edge-1
+        run: |
+          ip addr add 203.0.113.{{pub2}}/24 dev eth4
+          nft 'add chain ip nat prerouting { type nat hook prerouting priority dstnat; }'
+          nft add rule ip nat prerouting iifname eth4 ip daddr 203.0.113.{{pub2}} tcp dport 443 dnat to 10.{{octet}}.200.10
+      expectFail: [one-to-one-and-pat]
+      feedback: Inbound works, but connections the server opens still leave as the PAT address; one-to-one NAT needs the source rule too.
+    - id: snat-after-masquerade
+      description: Appends the SNAT rule after the masquerade rule, so it never matches
+      mutation:
+        on: mv-edge-1
+        run: |
+          ip addr add 203.0.113.{{pub2}}/24 dev eth4
+          nft 'add chain ip nat prerouting { type nat hook prerouting priority dstnat; }'
+          nft add rule ip nat prerouting iifname eth4 ip daddr 203.0.113.{{pub2}} tcp dport 443 dnat to 10.{{octet}}.200.10
+          nft add rule ip nat postrouting oifname eth4 ip saddr 10.{{octet}}.200.10 snat to 203.0.113.{{pub2}}
+      expectFail: [one-to-one-and-pat]
+      feedback: NAT rules are evaluated in order and the first matching NAT verdict wins; the server's rule must come before the masquerade.
+  solution:
+    explanation: |
+      Add 203.0.113.{{pub2}} to eth4, DNAT inbound TCP 443 on it to the server,
+      and insert an SNAT rule for the server ahead of the existing masquerade.
+    steps:
+      - on: mv-edge-1
+        run: |
+          ip addr add 203.0.113.{{pub2}}/24 dev eth4
+          nft 'add chain ip nat prerouting { type nat hook prerouting priority dstnat; }'
+          nft add rule ip nat prerouting iifname eth4 ip daddr 203.0.113.{{pub2}} tcp dport 443 dnat to 10.{{octet}}.200.10
+          nft insert rule ip nat postrouting oifname eth4 ip saddr 10.{{octet}}.200.10 snat to 203.0.113.{{pub2}}

@@ -1,0 +1,131 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: net-dhcp-relay-campus
+  title: Relay DHCP from a campus to the central server
+  domain: networking
+  frameworks: [ccna:ip-services]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [dhcp, relay, ip-helper]
+  version: 1
+spec:
+  description: |
+    Student hosts on the south campus get no address: the district DHCP server
+    `mv-dhcp-dc` (10.{{octet}}.100.10) sits in the data centre, two routers away,
+    and DHCP discovers are broadcasts that routers do not forward.
+
+    | Device | Role |
+    |---|---|
+    | `student-south` | client on the south student LAN 10.{{octet}}.{{lan}}.0/24 |
+    | `mv-campus-south` | Linux router (shell), `eth1` = student LAN (.1), `eth2` = uplink 10.{{octet}}.0.6/30 |
+    | `mv-core-1` | FRR core router (console) |
+    | `mv-dhcp-dc` | DHCP server, already has a pool for 10.{{octet}}.{{lan}}.0/24 |
+
+    Configure `mv-campus-south` as a DHCP relay agent so requests arriving on its
+    student interface are forwarded to `mv-dhcp-dc` and `student-south` leases an
+    address from the student pool with gateway 10.{{octet}}.{{lan}}.1. dnsmasq is
+    installed on the router. Do not change the DHCP server or the core.
+  objectives:
+    - Explain why DHCP needs a relay across routers
+    - Configure a relay agent with the right local address (giaddr) and server
+    - Verify leases from a remote subnet
+  params:
+    octet:
+      type: int
+      min: 20
+      max: 90
+    lan:
+      type: int
+      min: 30
+      max: 39
+  topology:
+    entry: workstation
+    nodes:
+      - { name: workstation, driver: container, image: jumphost:1, access: [shell] }
+      - { name: mv-campus-south, driver: container, image: netsvc:1, resources: { cpu: 0.25, memoryMiB: 96 }, access: [shell] }
+      - { name: mv-core-1, driver: netdev, image: frr:10, access: [console] }
+      - { name: mv-dhcp-dc, driver: container, image: netsvc:1, resources: { cpu: 0.25, memoryMiB: 96 }, access: [shell] }
+      - { name: student-south, driver: container, image: nettools:1, resources: { cpu: 0.2, memoryMiB: 64 }, access: [shell] }
+    links:
+      - { a: "student-south:eth1", b: "mv-campus-south:eth1" }
+      - { a: "mv-campus-south:eth2", b: "mv-core-1:eth1" }
+      - { a: "mv-core-1:eth2", b: "mv-dhcp-dc:eth1" }
+  setup:
+    - on: mv-core-1
+      config: |
+        interface eth1
+         ip address 10.{{octet}}.0.5/30
+        interface eth2
+         ip address 10.{{octet}}.100.1/24
+        ip route 10.{{octet}}.{{lan}}.0/24 10.{{octet}}.0.6
+    - on: mv-campus-south
+      run: |
+        echo 1 > /proc/sys/net/ipv4/ip_forward
+        ip addr replace 10.{{octet}}.{{lan}}.1/24 dev eth1
+        ip addr replace 10.{{octet}}.0.6/30 dev eth2
+        ip route replace default via 10.{{octet}}.0.5
+    - on: mv-dhcp-dc
+      run: |
+        O={{octet}}; L={{lan}}
+        ip addr replace 10.$O.100.10/24 dev eth1; ip route replace default via 10.$O.100.1
+        mkdir -p /etc/dnsmasq.d; f=/etc/dnsmasq.d/district.conf
+        printf 'port=0\ninterface=eth1\ndhcp-range=set:south,10.%s.%s.100,10.%s.%s.199,255.255.255.0,12h\ndhcp-option=tag:south,option:router,10.%s.%s.1\ndhcp-option=option:dns-server,10.%s.0.53\ndhcp-leasefile=/var/lib/misc/dnsmasq.leases\n' $O $L $O $L $O $L $O > $f
+        mkdir -p /var/lib/misc; dnsmasq -C $f
+    - { on: student-south, file: { path: /usr/local/bin/dhcp-probe, mode: "0755", source: assets/dhcp-probe } }
+  checks:
+    - id: student-lease
+      description: A student client gets an address from the south pool with the campus gateway
+      type: shell
+      on: student-south
+      command: dhcp-probe eth1
+      expect: { match: regex, value: "^10\\.{{octet}}\\.{{lan}}\\.1[0-9][0-9] 10\\.{{octet}}\\.{{lan}}\\.1 10\\.{{octet}}\\.0\\.53$" }
+      timeoutSec: 25
+      skills: [net.services.dhcp-relay]
+      weight: 3
+    - id: server-saw-relay
+      description: The DHCP server received the request through the relay (giaddr on the student LAN)
+      type: shell
+      on: mv-dhcp-dc
+      command: grep -c ' 10\.{{octet}}\.{{lan}}\.1[0-9][0-9] ' /var/lib/misc/dnsmasq.leases
+      expect: { match: regex, value: "^[1-9][0-9]*$" }
+      skills: [net.services.dhcp-relay]
+    - id: server-unchanged
+      description: The DHCP server configuration was not changed
+      type: shell
+      on: mv-dhcp-dc
+      command: grep -c '^dhcp-range' /etc/dnsmasq.d/district.conf
+      expect: { match: exact, value: "1" }
+      skills: [net.services.dhcp-relay]
+      weight: 0.5
+  hints:
+    - title: What a relay does
+      body: The relay receives the broadcast on the client LAN, writes its own LAN address into the giaddr field and unicasts the request to the server; the server picks the pool that matches giaddr.
+      cost: 1
+    - title: dnsmasq as a relay
+      body: "`dhcp-relay=<local address>,<server address>` turns dnsmasq into a relay for the interface that holds the local address; keep `port=0` so it does not answer DNS."
+      command: "dnsmasq --port=0 --dhcp-relay=10.{{octet}}.{{lan}}.1,10.{{octet}}.100.10"
+      cost: 2
+  misconceptions:
+    - id: uplink-giaddr
+      description: Uses the router's uplink address as the relay's local address
+      mutation:
+        on: mv-campus-south
+        run: dnsmasq --port=0 --dhcp-relay=10.{{octet}}.0.6,10.{{octet}}.100.10 --interface=eth1,eth2
+      expectFail: [student-lease, server-saw-relay]
+      feedback: The local address is the giaddr the server uses to choose a pool; it must be the address on the client LAN.
+    - id: local-server
+      description: Runs a second DHCP server on the campus router instead of relaying
+      mutation:
+        on: mv-campus-south
+        run: dnsmasq --port=0 --interface=eth1 --dhcp-range=10.{{octet}}.{{lan}}.100,10.{{octet}}.{{lan}}.199,12h --dhcp-option=option:dns-server,10.{{octet}}.0.53
+      expectFail: [server-saw-relay]
+      feedback: Clients get addresses, but from a rogue server the district does not manage; the task is to relay to mv-dhcp-dc.
+  solution:
+    explanation: |
+      dnsmasq in relay mode on mv-campus-south forwards broadcasts from the
+      student LAN to 10.{{octet}}.100.10 with giaddr 10.{{octet}}.{{lan}}.1; the
+      server answers the relay, which hands the offer back to the client.
+    steps:
+      - on: mv-campus-south
+        run: dnsmasq --port=0 --dhcp-relay=10.{{octet}}.{{lan}}.1,10.{{octet}}.100.10

@@ -1,0 +1,184 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: net-qos-voice-priority
+  title: Protect phone calls on a congested annex link
+  domain: networking
+  frameworks: [ccna:ip-services]
+  difficulty: hard
+  estimatedMinutes: 25
+  tags: [qos, dscp, tc, priority-queue, nftables]
+  version: 1
+spec:
+  description: |
+    The annex router `mv-annex-1` (Linux, shell) reaches the data centre over a
+    slow radio link on `eth2`, shaped to 2 Mbit/s by the root qdisc
+    `tbf` (handle `1:`) that models the radio. When students upload coursework
+    the queue fills and the annex IP phones (`phone-annex`, 10.{{octet}}.60.5)
+    become unusable.
+
+    On `mv-annex-1`:
+
+    1. Mark voice traffic, UDP from the annex phone LAN 10.{{octet}}.60.0/24 to
+       destination ports 16384-32767, with DSCP **EF** as it is forwarded.
+    2. Give EF-marked traffic strict priority over everything else in the queue
+       of `eth2`, while keeping the 2 Mbit/s `tbf` as the root qdisc.
+
+    The grader floods the radio link with a TCP upload from `annex-pc`, then
+    measures the round-trip time of 40 EF-marked probes from the phone LAN to
+    `dc-server` (10.{{octet}}.200.10); the 90th percentile must stay under 30 ms
+    and at least 30 of the 40 probes must be answered. It also
+    checks that voice packets reach `dc-server` marked EF and the upload does not.
+  objectives:
+    - Classify and mark traffic with DSCP
+    - Build a priority queue under a shaper with tc
+    - Measure queueing delay under congestion
+  params:
+    octet:
+      type: int
+      min: 20
+      max: 90
+    port:
+      type: int
+      min: 16384
+      max: 32767
+  topology:
+    entry: workstation
+    nodes:
+      - { name: workstation, driver: container, image: jumphost:1, access: [shell] }
+      - { name: mv-annex-1, driver: container, image: netsvc:1, resources: { cpu: 0.3, memoryMiB: 96 }, access: [shell] }
+      - { name: mv-core-1, driver: container, image: netsvc:1, resources: { cpu: 0.3, memoryMiB: 96 } }
+      - { name: dc-server, driver: container, image: netsvc:1, resources: { cpu: 0.3, memoryMiB: 128 } }
+      - { name: phone-annex, driver: container, image: nettools:1, resources: { cpu: 0.2, memoryMiB: 64 }, access: [shell] }
+      - { name: annex-pc, driver: container, image: nettools:1, resources: { cpu: 0.3, memoryMiB: 64 }, access: [shell] }
+    links:
+      - { a: "phone-annex:eth1", b: "mv-annex-1:eth1" }
+      - { a: "annex-pc:eth1", b: "mv-annex-1:eth3" }
+      - { a: "mv-annex-1:eth2", b: "mv-core-1:eth1" }
+      - { a: "mv-core-1:eth2", b: "dc-server:eth1" }
+  setup:
+    - on: mv-annex-1
+      run: |
+        echo 1 > /proc/sys/net/ipv4/ip_forward
+        ip addr replace 10.{{octet}}.60.1/24 dev eth1
+        ip addr replace 10.{{octet}}.61.1/24 dev eth3
+        ip addr replace 10.{{octet}}.0.2/30 dev eth2
+        ip route replace default via 10.{{octet}}.0.1
+        tc qdisc replace dev eth2 root handle 1: tbf rate 2mbit burst 6kb latency 400ms
+    - on: mv-core-1
+      run: |
+        echo 1 > /proc/sys/net/ipv4/ip_forward
+        ip addr replace 10.{{octet}}.0.1/30 dev eth1
+        ip addr replace 10.{{octet}}.200.1/24 dev eth2
+        ip route replace 10.{{octet}}.60.0/23 via 10.{{octet}}.0.2
+    - on: dc-server
+      run: |
+        ip addr replace 10.{{octet}}.200.10/24 dev eth1; ip route replace default via 10.{{octet}}.200.1
+        iperf3 -s -D
+        mkdir -p /var/lib/cloudtrain
+        setsid tcpdump -i eth1 -nn -v -U -w /var/lib/cloudtrain/marks.pcap '(udp dst port {{port}}) or (tcp dst port 5201 and tcp[tcpflags] & tcp-syn != 0)' </dev/null >/dev/null 2>&1 &
+        sleep 1
+    - { on: phone-annex, run: "ip addr replace 10.{{octet}}.60.5/24 dev eth1 && ip route replace default via 10.{{octet}}.60.1" }
+    - { on: annex-pc, run: "ip addr replace 10.{{octet}}.61.10/24 dev eth1 && ip route replace default via 10.{{octet}}.61.1" }
+  checks:
+    - id: voice-probe
+      description: (probe) the phone sends voice packets to the data centre
+      type: shell
+      on: phone-annex
+      command: for i in 1 2 3 4 5; do echo rtp | nc -u -w1 10.{{octet}}.200.10 {{port}}; done; echo sent
+      expect: { match: exact, value: sent }
+      timeoutSec: 15
+      skills: [net.services.qos]
+      weight: 0
+    - id: flood
+      description: (load) annex-pc starts a 25-second TCP upload across the radio link
+      type: shell
+      on: annex-pc
+      command: setsid iperf3 -c 10.{{octet}}.200.10 -t 25 </dev/null >/dev/null 2>&1 & sleep 1; echo started
+      expect: { match: exact, value: started }
+      skills: [net.services.qos]
+      weight: 0
+    - id: ef-latency
+      description: 90 percent of EF-marked probes see a round-trip time under 30 ms during the upload
+      type: shell
+      on: phone-annex
+      command: |
+        sleep 6
+        ping -Q 0xb8 -c 40 -i 0.2 -W 2 10.{{octet}}.200.10 | sed -n 's/.*time=\([0-9.]*\) ms.*/\1/p' | sort -n | awk '{a[NR]=$1} END{if (NR < 30) print "answered " NR; else {i=int(NR*0.9); if (a[i] < 30) print "ok"; else print "slow " a[i]}}'
+      expect: { match: exact, value: ok }
+      timeoutSec: 45
+      skills: [net.services.qos]
+      weight: 3
+    - id: voice-marked
+      description: Voice packets reach dc-server marked EF and the upload is not marked
+      type: shell
+      on: dc-server
+      command: |
+        v=$(tcpdump -nn -v -r /var/lib/cloudtrain/marks.pcap "udp dst port {{port}}" 2>/dev/null | grep -c 'tos 0xb8')
+        b=$(tcpdump -nn -v -r /var/lib/cloudtrain/marks.pcap "tcp dst port 5201" 2>/dev/null | grep -c 'tos 0xb8')
+        [ "$v" -gt 0 ] && [ "$b" = 0 ] && echo ok || echo "voice=$v bulk=$b"
+      expect: { match: exact, value: ok }
+      skills: [net.services.qos]
+      weight: 2
+    - id: shaper-kept
+      description: The 2 Mbit/s tbf is still the root qdisc of eth2
+      type: shell
+      on: mv-annex-1
+      command: tc qdisc show dev eth2 | awk '/root/{print $2, $3, $8}'
+      expect: { match: exact, value: "tbf 1: 2Mbit" }
+      skills: [net.services.qos]
+      weight: 0.5
+  hints:
+    - title: Marking
+      body: "An nftables rule in a forward or prerouting chain can set the DSCP: `ip saddr 10.{{octet}}.60.0/24 udp dport 16384-32767 ip dscp set ef`."
+      cost: 1
+    - title: A priority queue under the shaper
+      body: "The tbf has one child queue. Replace it with a `prio` qdisc (`tc qdisc add dev eth2 parent 1:1 handle 10: prio`) so the most urgent band is always sent first."
+      cost: 2
+    - title: Classify by DSCP
+      body: "A u32 filter on the TOS byte puts EF (0xb8) into band 1 (class 10:1): `tc filter add dev eth2 parent 10: protocol ip u32 match ip dsfield 0xb8 0xfc flowid 10:1`."
+      cost: 2
+  misconceptions:
+    - id: mark-only
+      description: Marks voice as EF but leaves a single FIFO queue
+      mutation:
+        on: mv-annex-1
+        run: |
+          nft add table ip qos
+          nft 'add chain ip qos markvoice { type filter hook forward priority mangle; }'
+          nft add rule ip qos markvoice ip saddr 10.{{octet}}.60.0/24 udp dport 16384-32767 ip dscp set ef
+      expectFail: [ef-latency]
+      feedback: A mark only helps where a queue acts on it; with one FIFO the voice packets still wait behind the upload.
+    - id: replace-shaper
+      description: Replaces the tbf root with a prio qdisc, losing the link model
+      mutation:
+        on: mv-annex-1
+        run: |
+          nft add table ip qos
+          nft 'add chain ip qos markvoice { type filter hook forward priority mangle; }'
+          nft add rule ip qos markvoice ip saddr 10.{{octet}}.60.0/24 udp dport 16384-32767 ip dscp set ef
+          tc qdisc replace dev eth2 root handle 1: prio
+      expectFail: [shaper-kept]
+      feedback: Without the shaper the queue builds in the radio instead of on the router, where priority no longer applies.
+  solution:
+    explanation: |
+      Mark voice with an nftables forward rule, then hang a prio qdisc under the
+      tbf and steer DSCP EF into its first band, so EF packets are always dequeued
+      before bulk traffic within the 2 Mbit/s budget.
+    steps:
+      - on: mv-annex-1
+        run: |
+          nft add table ip qos
+          nft 'add chain ip qos markvoice { type filter hook forward priority mangle; }'
+          nft add rule ip qos markvoice ip saddr 10.{{octet}}.60.0/24 udp dport 16384-32767 ip dscp set ef
+          tc qdisc add dev eth2 parent 1:1 handle 10: prio
+          tc filter add dev eth2 parent 10: protocol ip u32 match ip dsfield 0xb8 0xfc flowid 10:1
+    alternatives:
+      - id: iptables-dscp
+        description: Mark voice with an iptables DSCP target instead of nftables
+        steps:
+          - on: mv-annex-1
+            run: |
+              iptables -t mangle -A FORWARD -s 10.{{octet}}.60.0/24 -p udp --dport 16384:32767 -j DSCP --set-dscp-class EF
+              tc qdisc add dev eth2 parent 1:1 handle 10: prio
+              tc filter add dev eth2 parent 10: protocol ip u32 match ip dsfield 0xb8 0xfc flowid 10:1

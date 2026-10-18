@@ -1,0 +1,332 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: shipment-operator-crd
+  title: Install an operator and drive it with a custom resource
+  domain: kubernetes
+  frameworks: [cka:cluster-architecture, ckad:environment-config-security]
+  difficulty: medium
+  estimatedMinutes: 18
+  tags: [crd, operators, custom-resources, rbac]
+  version: 1
+spec:
+  description: |
+    Quillmoor Logistics models freight routes as a custom resource and runs
+    one worker Deployment per route through the **shipment operator**. The
+    operator's manifests are in `~/operator` on your workstation:
+
+    | File | Content |
+    |---|---|
+    | `crd.yaml` | the `ShipmentRoute` CustomResourceDefinition (`shipmentroutes.logistics.quillmoor.example`) |
+    | `rbac.yaml` | namespace `shipment-system`, the operator's ServiceAccount and its ClusterRole |
+    | `operator.yaml` | the operator Deployment (`shipment-operator`, runs as that ServiceAccount) |
+
+    Nothing is installed yet. Use context `qm-depot`:
+
+    ```bash
+    kubectl config use-context qm-depot
+    ```
+
+    1. Install the operator so that the CRD is **Established**, the Deployment
+       `shipment-operator` in `shipment-system` is **Available** and the
+       operator's ServiceAccount is allowed to create Deployments.
+    2. Create a ShipmentRoute named **`{{route}}`** in namespace **`route-ops`**
+       that runs the route from **{{origin}}** to **{{destination}}** with
+       **{{replicas}}** replicas. Find the field names with
+       `kubectl explain shipmentroute.spec`.
+
+    The operator creates a Deployment `route-{{route}}` for the route (owned by
+    the ShipmentRoute) and reports `Ready` in the route's status once it is
+    available.
+  objectives:
+    - Install a CRD before using its custom resources
+    - Wire an operator's ServiceAccount to the permissions it needs
+    - Author a custom resource from the CRD's schema
+  params:
+    route:
+      type: choice
+      values: [harbour-yard, yard-customs, depot-relay]
+    origin:
+      type: choice
+      values: [Harbour Terminal, North Yard, Customs Dock]
+    destination:
+      type: choice
+      values: [East Depot, West Depot, Ledger Hall]
+    replicas:
+      type: choice
+      values: ["2", "3"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-depot
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: qm-depot
+  setup:
+    - on: workstation
+      run: install -d -o learner -g learner -m 0755 /home/learner/operator
+    - { on: workstation, file: { path: /home/learner/operator/crd.yaml, mode: "0644", source: assets/crd.yaml } }
+    - { on: workstation, file: { path: /home/learner/operator/rbac.yaml, mode: "0644", source: assets/rbac.yaml } }
+    - { on: workstation, file: { path: /home/learner/operator/operator.yaml, mode: "0644", source: assets/operator.yaml } }
+    - on: workstation
+      run: chown -R learner:learner /home/learner/operator
+    - on: qm-depot
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: route-ops}
+    - on: qm-depot
+      timeoutSec: 60
+      run: |
+        # The "operator" is simulated by a reconcile loop in the platform's admin
+        # container (no operator image is available to the lab). It does nothing
+        # until the learner has installed the operator properly: the CRD is
+        # Established, Deployment shipment-system/shipment-operator is Available
+        # under its ServiceAccount, and that ServiceAccount may create Deployments.
+        cat > /tmp/shipment-route.jq <<'JQ'
+        def app: "route-" + .name;
+        {apiVersion: "apps/v1", kind: "Deployment",
+         metadata: {name: app, namespace: .ns,
+           labels: {app: app, "app.kubernetes.io/managed-by": "shipment-operator"},
+           ownerReferences: [{apiVersion: "logistics.quillmoor.example/v1", kind: "ShipmentRoute", name: .name, uid: .uid, controller: true, blockOwnerDeletion: true}]},
+         spec: {replicas: .rep, selector: {matchLabels: {app: app}},
+           template: {metadata: {labels: {app: app}},
+             spec: {terminationGracePeriodSeconds: 1, containers: [{name: "route", image: "busybox:1.37",
+               command: ["sh", "-c", "mkdir -p /www; echo \"route $ROUTE_ORIGIN to $ROUTE_DESTINATION ($ROUTE_PRIORITY)\" > /www/index.html; exec httpd -f -p 8080 -h /www"],
+               env: [{name: "ROUTE_ORIGIN", value: .org}, {name: "ROUTE_DESTINATION", value: .dst}, {name: "ROUTE_PRIORITY", value: .prio}],
+               ports: [{containerPort: 8080}],
+               resources: {requests: {cpu: "5m", memory: "8Mi"}}}]}}}}
+        JQ
+        cat > /tmp/shipment-operator.sh <<'SH'
+        CRD=shipmentroutes.logistics.quillmoor.example
+        SA=system:serviceaccount:shipment-system:shipment-operator
+        installed() {
+          [ "$(kubectl get crd $CRD -o jsonpath='{.status.conditions[?(@.type=="Established")].status}' 2>/dev/null)" = True ] || return 1
+          [ "$(kubectl -n shipment-system get deploy shipment-operator -o jsonpath='{.status.availableReplicas}|{.spec.template.spec.serviceAccountName}' 2>/dev/null)" = "1|shipment-operator" ] || return 1
+        }
+        while true; do
+          if installed; then
+            kubectl get shipmentroutes.logistics.quillmoor.example -A -o json 2>/dev/null \
+              | jq -c '.items[] | {ns: .metadata.namespace, name: .metadata.name, uid: .metadata.uid, rep: (.spec.replicas // 1), org: .spec.origin, dst: .spec.destination, prio: (.spec.priority // "standard")}' \
+              | while read -r item; do
+                  ns=$(echo "$item" | jq -r .ns); n=$(echo "$item" | jq -r .name); rep=$(echo "$item" | jq -r .rep)
+                  [ "$(kubectl auth can-i --as=$SA create deployments.apps -n "$ns" 2>/dev/null)" = yes ] || continue
+                  echo "$item" | jq -f /tmp/shipment-route.jq | kubectl apply -f - >/dev/null 2>&1
+                  avail=$(kubectl -n "$ns" get deploy "route-$n" -o jsonpath='{.status.availableReplicas}' 2>/dev/null)
+                  if [ "${avail:-0}" -ge "$rep" ]; then st=True; else st=False; fi
+                  kubectl -n "$ns" patch shipmentroutes.logistics.quillmoor.example "$n" --subresource=status --type=merge \
+                    -p "{\"status\":{\"conditions\":[{\"type\":\"Ready\",\"status\":\"$st\",\"reason\":\"DeploymentAvailable\",\"message\":\"route-$n has ${avail:-0}/$rep workers\"}]}}" >/dev/null 2>&1
+                done
+          fi
+          sleep 3
+        done
+        SH
+        pgrep -f "^sh /tmp/shipment-[o]perator.sh" >/dev/null || setsid nohup sh /tmp/shipment-operator.sh >/dev/null 2>&1 < /dev/null &
+        sleep 1
+  teardown:
+    - on: qm-depot
+      run: |
+        pkill -f "^sh /tmp/shipment-[o]perator.sh" || true
+        kubectl delete namespace route-ops shipment-system --ignore-not-found --wait=false
+        kubectl delete crd shipmentroutes.logistics.quillmoor.example --ignore-not-found --wait=false
+        kubectl delete clusterrolebinding,clusterrole -l app.kubernetes.io/part-of=shipment-operator --ignore-not-found
+        kubectl delete clusterrolebinding,clusterrole shipment-operator --ignore-not-found
+  checks:
+    - id: crd-established
+      description: The ShipmentRoute CRD is installed and Established
+      type: k8s-query
+      timeoutSec: 20
+      skills: [k8s.cluster.extensions]
+      query: {cluster: qm-depot, resource: customresourcedefinition, name: shipmentroutes.logistics.quillmoor.example, jsonpath: '{.status.conditions[?(@.type=="Established")].status}'}
+      expect: {match: exact, value: "True"}
+    - id: operator-available
+      description: Deployment shipment-operator in shipment-system is Available and runs as the shipment-operator ServiceAccount
+      type: k8s-query
+      timeoutSec: 20
+      skills: [k8s.cluster.extensions]
+      weight: 2
+      query: {cluster: qm-depot, resource: deployment, name: shipment-operator, namespace: shipment-system, jsonpath: '{.status.availableReplicas}|{.spec.template.spec.serviceAccountName}'}
+      expect: {match: exact, value: "1|shipment-operator"}
+    - id: operator-can-create
+      description: The operator's ServiceAccount may create Deployments in route-ops
+      type: k8s-can-i
+      timeoutSec: 20
+      skills: [k8s.cluster.packaging]
+      weight: 2
+      query: {cluster: qm-depot, verb: create, resource: deployments, namespace: route-ops, as: "system:serviceaccount:shipment-system:shipment-operator"}
+      expect: {match: exact, value: "yes"}
+    - id: route-spec
+      description: ShipmentRoute {{route}} in route-ops runs {{origin}} to {{destination}} with {{replicas}} replicas
+      type: k8s-query
+      timeoutSec: 20
+      skills: [k8s.cluster.extensions]
+      weight: 2
+      query: {cluster: qm-depot, resource: shipmentroutes.logistics.quillmoor.example, name: "{{route}}", namespace: route-ops, jsonpath: '{.spec.origin}|{.spec.destination}|{.spec.replicas}'}
+      expect: {match: exact, value: "{{origin}}|{{destination}}|{{replicas}}"}
+    - id: route-workload
+      description: The operator created Deployment route-{{route}}, owned by the ShipmentRoute, with all {{replicas}} replicas available
+      type: k8s-query
+      timeoutSec: 30
+      skills: [k8s.cluster.extensions]
+      weight: 3
+      query: {cluster: qm-depot, resource: deployment, name: "route-{{route}}", namespace: route-ops, jsonpath: '{.metadata.ownerReferences[0].kind}|{.spec.replicas}|{.status.availableReplicas}'}
+      expect: {match: exact, value: "ShipmentRoute|{{replicas}}|{{replicas}}"}
+    - id: route-ready
+      description: The route reports the Ready condition in its status
+      type: k8s-query
+      timeoutSec: 20
+      skills: [k8s.cluster.extensions]
+      weight: 2
+      query: {cluster: qm-depot, resource: shipmentroutes.logistics.quillmoor.example, name: "{{route}}", namespace: route-ops, jsonpath: '{.status.conditions[?(@.type=="Ready")].status}'}
+      expect: {match: exact, value: "True"}
+  hints:
+    - title: Order matters
+      body: "A custom resource can only be created once its CRD is Established, and the operator Deployment needs its namespace and ServiceAccount first. Apply crd.yaml, wait for the CRD, then rbac.yaml, then operator.yaml."
+      command: kubectl wait --for=condition=Established crd/shipmentroutes.logistics.quillmoor.example
+      cost: 1
+    - title: Does the operator have permissions?
+      body: "A ClusterRole grants nothing until a binding connects it to a subject. Ask the API server what the ServiceAccount may do and bind the ClusterRole to it."
+      command: "kubectl auth can-i create deployments -n route-ops --as=system:serviceaccount:shipment-system:shipment-operator"
+      cost: 2
+  misconceptions:
+    - id: cr-before-crd
+      description: Applies the ShipmentRoute together with, or before, the CRD and never re-applies it.
+      feedback: The API server does not know the ShipmentRoute kind until the CRD is Established, so the apply fails with "no matches for kind". Install and wait for the CRD first, then create the route.
+      expectFail: [route-spec, route-workload, route-ready]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-depot
+          cat > /tmp/route.yaml <<'YAML'
+          apiVersion: logistics.quillmoor.example/v1
+          kind: ShipmentRoute
+          metadata: {name: "{{route}}", namespace: route-ops}
+          spec: {origin: "{{origin}}", destination: "{{destination}}", replicas: {{replicas}}}
+          YAML
+          kubectl apply -f /tmp/route.yaml || true
+          kubectl apply -f ~/operator/crd.yaml
+          kubectl apply -f ~/operator/rbac.yaml
+          kubectl create clusterrolebinding shipment-operator --clusterrole=shipment-operator --serviceaccount=shipment-system:shipment-operator
+          kubectl apply -f ~/operator/operator.yaml
+          kubectl -n shipment-system rollout status deploy/shipment-operator --timeout=90s
+          sleep 8
+    - id: binding-omitted
+      description: Applies the three manifests as shipped, which creates the ClusterRole but no ClusterRoleBinding.
+      feedback: rbac.yaml defines the ServiceAccount and the ClusterRole, but nothing grants the role to the account. Without a ClusterRoleBinding the operator may not create the route's Deployment, so the status never becomes Ready.
+      expectFail: [operator-can-create, route-workload, route-ready]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-depot
+          kubectl apply -f ~/operator/crd.yaml
+          kubectl wait --for=condition=Established crd/shipmentroutes.logistics.quillmoor.example --timeout=60s
+          kubectl apply -f ~/operator/rbac.yaml
+          kubectl apply -f ~/operator/operator.yaml
+          kubectl -n shipment-system rollout status deploy/shipment-operator --timeout=90s
+          cat <<'YAML' | kubectl apply -f -
+          apiVersion: logistics.quillmoor.example/v1
+          kind: ShipmentRoute
+          metadata: {name: "{{route}}", namespace: route-ops}
+          spec: {origin: "{{origin}}", destination: "{{destination}}", replicas: {{replicas}}}
+          YAML
+          sleep 10
+    - id: guessed-field-names
+      description: Guesses field names (from, to, count) instead of reading the CRD schema.
+      feedback: The CRD's structural schema requires origin and destination and prunes unknown fields; kubectl explain shipmentroute.spec lists the real ones.
+      expectFail: [route-spec, route-workload, route-ready]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 150
+        run: |
+          kubectl config use-context qm-depot
+          kubectl apply -f ~/operator/crd.yaml
+          kubectl wait --for=condition=Established crd/shipmentroutes.logistics.quillmoor.example --timeout=60s
+          kubectl apply -f ~/operator/rbac.yaml
+          kubectl create clusterrolebinding shipment-operator --clusterrole=shipment-operator --serviceaccount=shipment-system:shipment-operator
+          kubectl apply -f ~/operator/operator.yaml
+          kubectl -n shipment-system rollout status deploy/shipment-operator --timeout=90s
+          cat <<'YAML' | kubectl apply -f - || true
+          apiVersion: logistics.quillmoor.example/v1
+          kind: ShipmentRoute
+          metadata: {name: "{{route}}", namespace: route-ops}
+          spec: {from: "{{origin}}", to: "{{destination}}", count: {{replicas}}}
+          YAML
+          sleep 8
+  solution:
+    explanation: |
+      Install in dependency order: the CRD first (and wait until it is
+      Established), then the namespace, ServiceAccount and ClusterRole, a
+      ClusterRoleBinding that grants the role to the operator's ServiceAccount
+      (rbac.yaml leaves it out), then the operator Deployment. With the operator
+      installed and allowed to create Deployments, a ShipmentRoute written with
+      the schema's field names (origin, destination, replicas) gets its
+      Deployment and a Ready condition.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 240
+        run: |
+          kubectl config use-context qm-depot
+          kubectl apply -f ~/operator/crd.yaml
+          kubectl wait --for=condition=Established crd/shipmentroutes.logistics.quillmoor.example --timeout=60s
+          kubectl apply -f ~/operator/rbac.yaml
+          kubectl create clusterrolebinding shipment-operator --clusterrole=shipment-operator --serviceaccount=shipment-system:shipment-operator
+          kubectl apply -f ~/operator/operator.yaml
+          kubectl -n shipment-system rollout status deploy/shipment-operator --timeout=90s
+          kubectl explain shipmentroute.spec
+          cat <<'YAML' | kubectl apply -f -
+          apiVersion: logistics.quillmoor.example/v1
+          kind: ShipmentRoute
+          metadata: {name: "{{route}}", namespace: route-ops}
+          spec: {origin: "{{origin}}", destination: "{{destination}}", replicas: {{replicas}}}
+          YAML
+          for i in $(seq 1 60); do
+            [ "$(kubectl -n route-ops get shipmentroute {{route}} -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')" = True ] && break
+            sleep 3
+          done
+    alternatives:
+      - id: binding-from-manifest
+        description: Add the ClusterRoleBinding to rbac.yaml as a manifest and apply everything in one ordered pass.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 240
+            run: |
+              kubectl config use-context qm-depot
+              kubectl apply -f ~/operator/crd.yaml
+              kubectl wait --for=condition=Established crd/shipmentroutes.logistics.quillmoor.example --timeout=60s
+              cat >> ~/operator/rbac.yaml <<'YAML'
+              ---
+              apiVersion: rbac.authorization.k8s.io/v1
+              kind: ClusterRoleBinding
+              metadata:
+                name: shipment-operator
+                labels: {app.kubernetes.io/part-of: shipment-operator}
+              roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: shipment-operator}
+              subjects:
+                - {kind: ServiceAccount, name: shipment-operator, namespace: shipment-system}
+              YAML
+              kubectl apply -f ~/operator/rbac.yaml
+              kubectl apply -f ~/operator/operator.yaml
+              kubectl -n shipment-system rollout status deploy/shipment-operator --timeout=90s
+              cat <<'YAML' | kubectl apply -f -
+              apiVersion: logistics.quillmoor.example/v1
+              kind: ShipmentRoute
+              metadata: {name: "{{route}}", namespace: route-ops}
+              spec: {origin: "{{origin}}", destination: "{{destination}}", replicas: {{replicas}}}
+              YAML
+              for i in $(seq 1 60); do
+                [ "$(kubectl -n route-ops get shipmentroute {{route}} -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')" = True ] && break
+                sleep 3
+              done

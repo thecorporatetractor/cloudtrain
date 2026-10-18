@@ -1,0 +1,224 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: net-static-routes-campuses
+  title: Connect the district office and two campuses with static routes
+  domain: networking
+  frameworks: [ccna:ip-connectivity]
+  difficulty: easy
+  estimatedMinutes: 15
+  tags: [static-routing, frr]
+  version: 1
+spec:
+  description: |
+    The district core router `mv-core-1` connects the district office LAN
+    (`10.{{octet}}.1.0/24`) to two campus routers over point-to-point links:
+
+    | Link | Subnet |
+    |---|---|
+    | mv-core-1 eth2 - mv-campus-north eth1 | 10.{{octet}}.0.0/30 (.1 core, .2 north) |
+    | mv-core-1 eth3 - mv-campus-south eth1 | 10.{{octet}}.0.4/30 (.5 core, .6 south) |
+
+    The north campus LAN is `10.{{octet}}.{{north}}.0/24` and the south campus LAN
+    is `10.{{octet}}.{{south}}.0/24`. Interfaces are addressed and every host has a
+    default route to its router, but the routers know only their connected
+    networks.
+
+    Add static routes on `mv-core-1`, `mv-campus-north` and `mv-campus-south` (FRR
+    consoles) so `office-host`, `north-host` and `south-host` all reach each other.
+    Every static route must point at a next hop on a directly connected subnet. Do
+    not run a routing protocol.
+  objectives:
+    - Decide which remote networks each router needs to know
+    - Configure static routes with reachable next hops in both directions
+    - Verify reachability and spot inactive routes
+  params:
+    octet:
+      type: int
+      min: 20
+      max: 90
+    north:
+      type: int
+      min: 10
+      max: 19
+    south:
+      type: int
+      min: 30
+      max: 39
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: mv-core-1
+        driver: netdev
+        image: frr:10
+        access: [console]
+      - name: mv-campus-north
+        driver: netdev
+        image: frr:10
+        access: [console]
+      - name: mv-campus-south
+        driver: netdev
+        image: frr:10
+        access: [console]
+      - name: office-host
+        driver: container
+        image: nettools:1
+        resources: { cpu: 0.25, memoryMiB: 96 }
+        access: [shell]
+      - name: north-host
+        driver: container
+        image: nettools:1
+        resources: { cpu: 0.25, memoryMiB: 96 }
+        access: [shell]
+      - name: south-host
+        driver: container
+        image: nettools:1
+        resources: { cpu: 0.25, memoryMiB: 96 }
+        access: [shell]
+    links:
+      - { a: "office-host:eth1", b: "mv-core-1:eth1" }
+      - { a: "mv-core-1:eth2", b: "mv-campus-north:eth1" }
+      - { a: "mv-core-1:eth3", b: "mv-campus-south:eth1" }
+      - { a: "mv-campus-north:eth2", b: "north-host:eth1" }
+      - { a: "mv-campus-south:eth2", b: "south-host:eth1" }
+  setup:
+    - on: mv-core-1
+      config: |
+        interface eth1
+         ip address 10.{{octet}}.1.1/24
+        interface eth2
+         ip address 10.{{octet}}.0.1/30
+        interface eth3
+         ip address 10.{{octet}}.0.5/30
+    - on: mv-campus-north
+      config: |
+        interface eth1
+         ip address 10.{{octet}}.0.2/30
+        interface eth2
+         ip address 10.{{octet}}.{{north}}.1/24
+    - on: mv-campus-south
+      config: |
+        interface eth1
+         ip address 10.{{octet}}.0.6/30
+        interface eth2
+         ip address 10.{{octet}}.{{south}}.1/24
+    - on: office-host
+      run: ip addr replace 10.{{octet}}.1.10/24 dev eth1 && ip route replace default via 10.{{octet}}.1.1
+    - on: north-host
+      run: ip addr replace 10.{{octet}}.{{north}}.10/24 dev eth1 && ip route replace default via 10.{{octet}}.{{north}}.1
+    - on: south-host
+      run: ip addr replace 10.{{octet}}.{{south}}.10/24 dev eth1 && ip route replace default via 10.{{octet}}.{{south}}.1
+  checks:
+    - id: north-to-south
+      description: north-host reaches south-host
+      type: reachability
+      on: north-host
+      target: 10.{{octet}}.{{south}}.10
+      skills: [net.routing.static]
+      weight: 2
+    - id: north-to-office
+      description: north-host reaches office-host
+      type: reachability
+      on: north-host
+      target: 10.{{octet}}.1.10
+      skills: [net.routing.static]
+    - id: south-to-office
+      description: south-host reaches office-host
+      type: reachability
+      on: south-host
+      target: 10.{{octet}}.1.10
+      skills: [net.routing.static]
+    - id: no-inactive-core
+      description: mv-core-1 has static routes and all of them are installed
+      type: shell
+      on: mv-core-1
+      command: &inactive |
+        out=$(vtysh -c 'show ip route static' | grep '^S'); [ -n "$out" ] || exit 1
+        ! echo "$out" | grep -v '^S>\*'
+      skills: [net.routing.static]
+      weight: 0.5
+    - id: no-inactive-north
+      description: mv-campus-north has static routes and all of them are installed
+      type: shell
+      on: mv-campus-north
+      command: *inactive
+      skills: [net.routing.static]
+      weight: 0.5
+    - id: no-inactive-south
+      description: mv-campus-south has static routes and all of them are installed
+      type: shell
+      on: mv-campus-south
+      command: *inactive
+      skills: [net.routing.static]
+      weight: 0.5
+    - id: no-dynamic
+      description: No routing protocol is configured on mv-core-1
+      type: shell
+      on: mv-core-1
+      command: "! vtysh -c 'show running-config' | grep -Eq '^router (ospf|ospf6|rip|ripng|bgp|isis|eigrp|babel)'"
+      skills: [net.routing.static]
+      weight: 0.5
+  hints:
+    - title: Which networks are missing?
+      body: Each router needs a route to every LAN it is not connected to. The core needs both campus LANs; each campus router needs the office LAN and the other campus LAN (or one default route towards the core).
+      command: "show ip route"
+      cost: 1
+    - title: Next hops
+      body: A next hop must be an address on a subnet the router is connected to, usually the neighbour's end of the point-to-point link. A route to a next hop the router cannot reach shows as inactive.
+      cost: 1
+    - title: Syntax
+      body: "In configure mode: `ip route <prefix>/<len> <next-hop>`, for example `ip route 10.{{octet}}.{{south}}.0/24 10.{{octet}}.0.6` on the core."
+      cost: 2
+  misconceptions:
+    - id: one-way
+      description: Adds routes on the core only, forgetting the return path on the campus routers
+      mutation:
+        on: mv-core-1
+        config: |
+          ip route 10.{{octet}}.{{north}}.0/24 10.{{octet}}.0.2
+          ip route 10.{{octet}}.{{south}}.0/24 10.{{octet}}.0.6
+      expectFail: [north-to-south, north-to-office, south-to-office]
+      feedback: Replies need a route back; each campus router must know how to reach the other networks too.
+    - id: remote-next-hop
+      description: Points north's route to the south LAN directly at mv-campus-south's address
+      mutation:
+        on: mv-campus-north
+        config: |
+          ip route 10.{{octet}}.{{south}}.0/24 10.{{octet}}.0.6
+      expectFail: [no-inactive-north]
+      feedback: 10.{{octet}}.0.6 is not on a subnet mv-campus-north is connected to, so the route stays inactive; the next hop is the core's end of the link.
+  solution:
+    explanation: |
+      The core routes each campus LAN to that campus router; each campus router
+      routes the office LAN and the other campus LAN to the core's end of its link.
+    steps:
+      - on: mv-core-1
+        config: |
+          ip route 10.{{octet}}.{{north}}.0/24 10.{{octet}}.0.2
+          ip route 10.{{octet}}.{{south}}.0/24 10.{{octet}}.0.6
+      - on: mv-campus-north
+        config: |
+          ip route 10.{{octet}}.1.0/24 10.{{octet}}.0.1
+          ip route 10.{{octet}}.{{south}}.0/24 10.{{octet}}.0.1
+      - on: mv-campus-south
+        config: |
+          ip route 10.{{octet}}.1.0/24 10.{{octet}}.0.5
+          ip route 10.{{octet}}.{{north}}.0/24 10.{{octet}}.0.5
+    alternatives:
+      - id: campus-defaults
+        description: Campus routers use a single default route to the core
+        steps:
+          - on: mv-core-1
+            config: |
+              ip route 10.{{octet}}.{{north}}.0/24 10.{{octet}}.0.2
+              ip route 10.{{octet}}.{{south}}.0/24 10.{{octet}}.0.6
+          - on: mv-campus-north
+            config: |
+              ip route 0.0.0.0/0 10.{{octet}}.0.1
+          - on: mv-campus-south
+            config: |
+              ip route 0.0.0.0/0 10.{{octet}}.0.5

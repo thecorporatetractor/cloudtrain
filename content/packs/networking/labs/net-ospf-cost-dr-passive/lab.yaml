@@ -1,0 +1,297 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: net-ospf-cost-dr-passive
+  title: Steer OSPF with cost, DR priority and passive interfaces
+  domain: networking
+  frameworks: [ccna:ip-connectivity]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [ospf, cost, dr, passive-interface, default-route]
+  version: 1
+spec:
+  description: |
+    OSPF area 0 already runs between four routers (FRR consoles):
+
+    | Link | Interfaces | Notes |
+    |---|---|---|
+    | fibre | `mv-campus-north:eth1` - `mv-core-1:eth1` (10.{{octet}}.0.0/30) | fast |
+    | copper | `mv-campus-north:eth2` - `mv-core-2:eth1` (10.{{octet}}.0.4/30) | slow |
+    | data-centre segment | `mv-core-1:eth2` - `mv-core-2:eth2` (10.{{octet}}.100.0/24) | broadcast network |
+    | edge | `mv-core-1:eth3` - `mv-edge-1:eth1` (10.{{octet}}.0.8/30) | |
+    | classroom LAN | `mv-campus-north:eth3` (10.{{octet}}.10.0/24, `classroom-north`) | |
+
+    Router IDs are the loopbacks 10.255.{{octet}}.N (core-1 = 1, core-2 = 2,
+    north = 3, edge = 4). Change the OSPF configuration so that:
+
+    1. traffic between `mv-campus-north` and `mv-core-2` (including core-2's
+       loopback) takes the fibre and the data-centre segment instead of the
+       copper link, in both directions, using interface costs only;
+    2. `mv-core-1` is the DR on the data-centre segment and `mv-core-2` can never
+       become DR or BDR there;
+    3. no OSPF hellos are sent on the classroom LAN, while the LAN is still
+       advertised;
+    4. `mv-edge-1` originates a default route into OSPF (it has no default route of
+       its own), and `mv-campus-north` uses it.
+  objectives:
+    - Influence OSPF path selection with interface cost
+    - Control DR/BDR election with interface priority
+    - Use passive interfaces and default-route origination
+  params:
+    octet:
+      type: int
+      min: 20
+      max: 90
+  topology:
+    entry: workstation
+    nodes:
+      - { name: workstation, driver: container, image: jumphost:1, access: [shell] }
+      - { name: mv-core-1, driver: netdev, image: frr:10, access: [console] }
+      - { name: mv-core-2, driver: netdev, image: frr:10, access: [console] }
+      - { name: mv-campus-north, driver: netdev, image: frr:10, access: [console] }
+      - { name: mv-edge-1, driver: netdev, image: frr:10, access: [console] }
+      - { name: classroom-north, driver: container, image: nettools:1, resources: { cpu: 0.2, memoryMiB: 64 }, access: [shell] }
+    links:
+      - { a: "mv-campus-north:eth1", b: "mv-core-1:eth1" }
+      - { a: "mv-campus-north:eth2", b: "mv-core-2:eth1" }
+      - { a: "mv-core-1:eth2", b: "mv-core-2:eth2" }
+      - { a: "mv-core-1:eth3", b: "mv-edge-1:eth1" }
+      - { a: "mv-campus-north:eth3", b: "classroom-north:eth1" }
+  setup:
+    - on: mv-core-1
+      config: |
+        interface lo
+         ip address 10.255.{{octet}}.1/32
+         ip ospf area 0
+        interface eth1
+         ip address 10.{{octet}}.0.1/30
+         ip ospf area 0
+        interface eth2
+         ip address 10.{{octet}}.100.1/24
+         ip ospf area 0
+         ip ospf priority 1
+        interface eth3
+         ip address 10.{{octet}}.0.9/30
+         ip ospf area 0
+        router ospf
+         ospf router-id 10.255.{{octet}}.1
+    - on: mv-core-2
+      config: |
+        interface lo
+         ip address 10.255.{{octet}}.2/32
+         ip ospf area 0
+        interface eth1
+         ip address 10.{{octet}}.0.6/30
+         ip ospf area 0
+        interface eth2
+         ip address 10.{{octet}}.100.2/24
+         ip ospf area 0
+         ip ospf priority 50
+        router ospf
+         ospf router-id 10.255.{{octet}}.2
+    - on: mv-campus-north
+      config: |
+        interface lo
+         ip address 10.255.{{octet}}.3/32
+         ip ospf area 0
+        interface eth1
+         ip address 10.{{octet}}.0.2/30
+         ip ospf area 0
+        interface eth2
+         ip address 10.{{octet}}.0.5/30
+         ip ospf area 0
+        interface eth3
+         ip address 10.{{octet}}.10.1/24
+         ip ospf area 0
+        router ospf
+         ospf router-id 10.255.{{octet}}.3
+    - on: mv-edge-1
+      config: |
+        interface lo
+         ip address 10.255.{{octet}}.4/32
+         ip ospf area 0
+        interface eth1
+         ip address 10.{{octet}}.0.10/30
+         ip ospf area 0
+        router ospf
+         ospf router-id 10.255.{{octet}}.4
+    - { on: classroom-north, run: "ip addr replace 10.{{octet}}.10.10/24 dev eth1 && ip route replace default via 10.{{octet}}.10.1" }
+    - on: mv-campus-north
+      run: |
+        for i in $(seq 90); do vtysh -c 'show ip route ospf' | grep -q '10.255.{{octet}}.4/32' && exit 0; sleep 1; done; exit 1
+      timeoutSec: 100
+  checks:
+    - id: north-to-core2-fibre
+      description: mv-campus-north reaches core-2's loopback via the fibre (next hop mv-core-1)
+      type: shell
+      on: mv-campus-north
+      command: |
+        for i in $(seq 40); do o=$(vtysh -c 'show ip route 10.255.{{octet}}.2/32' | grep -E '^\s+\*' | tr -s ' ' | tr '\n' ';'); echo "$o" | grep -q '^ \* 10\.{{octet}}\.0\.1, via eth1[^;]*;$' && break; sleep 1; done
+        echo "$o"
+      timeoutSec: 60
+      expect: { match: regex, value: "^ \\* 10\\.{{octet}}\\.0\\.1, via eth1[^;]*;$" }
+      skills: [net.routing.ospf-tuning]
+      weight: 2
+    - id: core2-to-north-fibre
+      description: mv-core-2 reaches the classroom LAN via the data-centre segment (next hop mv-core-1)
+      type: shell
+      on: mv-core-2
+      command: |
+        for i in $(seq 40); do o=$(vtysh -c 'show ip route 10.{{octet}}.10.0/24' | grep -E '^\s+\*' | tr -s ' ' | tr '\n' ';'); echo "$o" | grep -q '^ \* 10\.{{octet}}\.100\.1, via eth2[^;]*;$' && break; sleep 1; done
+        echo "$o"
+      timeoutSec: 60
+      expect: { match: regex, value: "^ \\* 10\\.{{octet}}\\.100\\.1, via eth2[^;]*;$" }
+      skills: [net.routing.ospf-tuning]
+      weight: 2
+    - id: core1-dr
+      description: mv-core-1 is DR on the data-centre segment and mv-core-2 is DROther with priority 0
+      type: shell
+      on: mv-core-2
+      command: |
+        for t in $(seq 40); do
+          i=$(vtysh -c 'show ip ospf interface eth2')
+          if echo "$i" | grep -q 'Priority 0' && echo "$i" | grep -q "Designated Router (ID) 10.255.{{octet}}.1" && echo "$i" | grep -q 'State DROther'; then echo ok; exit 0; fi
+          sleep 1
+        done
+        echo no
+      expect: { match: exact, value: ok }
+      timeoutSec: 60
+      skills: [net.routing.ospf-tuning]
+      weight: 2
+    - id: classroom-passive
+      description: The classroom LAN interface sends no hellos but is still advertised
+      type: shell
+      on: mv-campus-north
+      command: vtysh -c 'show ip ospf interface eth3' | grep -c 'No Hellos (Passive interface)'
+      expect: { match: exact, value: "1" }
+      skills: [net.routing.ospf-tuning]
+    - id: classroom-advertised
+      description: mv-edge-1 still learns the classroom LAN
+      type: shell
+      on: mv-edge-1
+      command: |
+        for i in $(seq 40); do n=$(vtysh -c 'show ip route ospf' | grep -c '^O>\* 10\.{{octet}}\.10\.0/24'); [ "$n" = 1 ] && break; sleep 1; done
+        echo "$n"
+      expect: { match: exact, value: "1" }
+      timeoutSec: 60
+      skills: [net.routing.ospf]
+    - id: default-originated
+      description: mv-campus-north has an OSPF default route towards the fibre
+      type: shell
+      on: mv-campus-north
+      command: |
+        for i in $(seq 40); do
+          n=$(vtysh -c 'show ip route 0.0.0.0/0' | awk '/Known via "ospf"/{o=1} o && /\* 10\.{{octet}}\.0\.1, via eth1/{c++} END{print c+0}')
+          [ "$n" = 1 ] && break; sleep 1
+        done
+        echo "$n"
+      expect: { match: exact, value: "1" }
+      timeoutSec: 60
+      skills: [net.routing.ospf-tuning]
+  hints:
+    - title: Cost is per interface and per direction
+      body: OSPF adds the cost of each outgoing interface along the path. Raise the copper link's cost on both of its ends so neither side prefers it.
+      command: "show ip ospf interface eth2"
+      cost: 1
+    - title: DR election is not pre-emptive
+      body: A priority change takes effect at the next election. Priority 0 means never DR/BDR; after changing it, restart the OSPF process on the routers of that segment.
+      command: "clear ip ospf process"
+      cost: 2
+    - title: Passive and default
+      body: "`ip ospf passive` under the interface (or `passive-interface` under router ospf) stops hellos but keeps the prefix advertised. `default-information originate always` under router ospf advertises a default even without one in the routing table."
+      cost: 2
+  misconceptions:
+    - id: cost-one-side
+      description: Raises the copper cost only on mv-campus-north
+      mutation:
+        on: mv-campus-north
+        config: |
+          interface eth2
+           ip ospf cost 100
+      expectFail: [core2-to-north-fibre]
+      feedback: Costs apply to outgoing interfaces; mv-core-2 still prefers its cheap copper interface back towards north.
+    - id: no-reelection
+      description: Sets the priorities but never lets the election run again
+      mutation:
+        on: mv-core-2
+        config: |
+          interface eth2
+           ip ospf priority 0
+      expectFail: [core1-dr]
+      feedback: Until the adjacency on the segment restarts, the old DR keeps its role.
+    - id: passive-by-removing
+      description: Removes OSPF from the classroom interface to stop hellos
+      mutation:
+        on: mv-campus-north
+        config: |
+          interface eth3
+           no ip ospf area
+      expectFail: [classroom-passive, classroom-advertised]
+      feedback: That stops the hellos but also withdraws the LAN; a passive interface keeps advertising it.
+  solution:
+    explanation: |
+      Cost 100 on both ends of the copper link makes north - core-1 - core-2
+      (10 + 10) cheaper than the copper (100). Priority 0 on core-2 and a higher
+      priority on core-1, followed by an OSPF restart on both, elects core-1 as DR.
+      `ip ospf passive` on north's eth3 stops hellos; `default-information
+      originate always` on the edge advertises a default.
+    steps:
+      - on: mv-campus-north
+        config: |
+          interface eth2
+           ip ospf cost 100
+          interface eth3
+           ip ospf passive
+      - on: mv-core-2
+        config: |
+          interface eth1
+           ip ospf cost 100
+          interface eth2
+           ip ospf priority 0
+      - on: mv-core-1
+        config: |
+          interface eth2
+           ip ospf priority 100
+      - on: mv-edge-1
+        config: |
+          router ospf
+           default-information originate always
+      - on: mv-core-2
+        run: vtysh -c 'clear ip ospf process' && sleep 2
+      - on: mv-core-1
+        run: |
+          vtysh -c 'clear ip ospf process'
+          for i in $(seq 90); do vtysh -c 'show ip ospf neighbor' | grep -c Full | grep -q 3 && break; sleep 1; done
+          sleep 5
+        timeoutSec: 120
+    alternatives:
+      - id: bounce-segment
+        description: Restart the adjacency on the data-centre segment by shutting and re-enabling the interfaces instead of clearing the process
+        steps:
+          - on: mv-campus-north
+            config: |
+              interface eth2
+               ip ospf cost 100
+              interface eth3
+               ip ospf passive
+          - on: mv-core-2
+            config: |
+              interface eth1
+               ip ospf cost 100
+              interface eth2
+               ip ospf priority 0
+          - on: mv-core-1
+            config: |
+              interface eth2
+               ip ospf priority 100
+          - on: mv-edge-1
+            config: |
+              router ospf
+               default-information originate always
+          - on: mv-core-2
+            run: ip link set eth2 down; sleep 3; ip link set eth2 up
+          - on: mv-core-1
+            run: |
+              for i in $(seq 90); do vtysh -c 'show ip ospf neighbor' | grep -c Full | grep -q 3 && break; sleep 1; done
+              sleep 5
+            timeoutSec: 120

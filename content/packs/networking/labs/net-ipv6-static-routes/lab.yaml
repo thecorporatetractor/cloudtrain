@@ -1,0 +1,163 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: net-ipv6-static-routes
+  title: Route IPv6 between the office and a campus
+  domain: networking
+  frameworks: [ccna:ip-connectivity]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [ipv6, static-routing, link-local]
+  version: 1
+spec:
+  description: |
+    Marlow Valley's district prefix is `2001:db8:{{site}}::/48`. IPv6 is addressed
+    on every interface but no router has IPv6 routes yet (FRR consoles):
+
+    | Link / LAN | Prefix | Addresses |
+    |---|---|---|
+    | office LAN (`mv-office-1:eth2`, `office-pc6`) | 2001:db8:{{site}}:1::/64 | router ::1, pc ::10 |
+    | `mv-office-1:eth1` - `mv-core-1:eth1` | 2001:db8:{{site}}:ff01::/64 | office ::2, core ::1 |
+    | `mv-core-1:eth2` - `mv-campus-north:eth1` | **link-local only** | core fe80::1, north fe80::2 |
+    | north LAN (`mv-campus-north:eth2`, `north-pc6`) | 2001:db8:{{site}}:20::/64 | router ::1, pc ::10 |
+    | `mv-core-1:eth3` - `mv-edge-1:eth1` | 2001:db8:{{site}}:ff03::/64 | core ::1, edge ::2 |
+
+    `mv-edge-1` already routes the district /48 towards the core. Add IPv6 static
+    routes so that `office-pc6` reaches `north-pc6` and the edge router
+    (`2001:db8:{{site}}:ff03::2`):
+
+    - `mv-office-1`: an IPv6 **default** route towards the core;
+    - `mv-core-1`: routes to the office LAN and the north LAN, and a default
+      route towards the edge;
+    - `mv-campus-north`: an IPv6 **default** route towards the core.
+
+    On the link-local-only link, use the neighbour's link-local address together
+    with the outgoing interface as next hop.
+  objectives:
+    - Configure IPv6 static and default routes in FRR
+    - Use a link-local next hop with an exit interface
+    - Verify IPv6 reachability end to end
+  params:
+    site:
+      type: choice
+      values: [a1, b2, c3, d4]
+  topology:
+    entry: workstation
+    nodes:
+      - { name: workstation, driver: container, image: jumphost:1, access: [shell] }
+      - { name: mv-office-1, driver: netdev, image: frr:10, access: [console] }
+      - { name: mv-core-1, driver: netdev, image: frr:10, access: [console] }
+      - { name: mv-campus-north, driver: netdev, image: frr:10, access: [console] }
+      - { name: mv-edge-1, driver: netdev, image: frr:10, access: [console] }
+      - { name: office-pc6, driver: container, image: nettools:1, resources: { cpu: 0.2, memoryMiB: 64 }, access: [shell] }
+      - { name: north-pc6, driver: container, image: nettools:1, resources: { cpu: 0.2, memoryMiB: 64 }, access: [shell] }
+    links:
+      - { a: "mv-office-1:eth1", b: "mv-core-1:eth1" }
+      - { a: "mv-core-1:eth2", b: "mv-campus-north:eth1" }
+      - { a: "mv-core-1:eth3", b: "mv-edge-1:eth1" }
+      - { a: "mv-office-1:eth2", b: "office-pc6:eth1" }
+      - { a: "mv-campus-north:eth2", b: "north-pc6:eth1" }
+  setup:
+    - on: mv-core-1
+      run: ip -6 addr add fe80::1/64 dev eth2 nodad 2>/dev/null; true
+    - on: mv-campus-north
+      run: ip -6 addr add fe80::2/64 dev eth1 nodad 2>/dev/null; true
+    - on: mv-office-1
+      config: |
+        interface eth1
+         ipv6 address 2001:db8:{{site}}:ff01::2/64
+        interface eth2
+         ipv6 address 2001:db8:{{site}}:1::1/64
+    - on: mv-core-1
+      config: |
+        interface eth1
+         ipv6 address 2001:db8:{{site}}:ff01::1/64
+        interface eth3
+         ipv6 address 2001:db8:{{site}}:ff03::1/64
+    - on: mv-campus-north
+      config: |
+        interface eth2
+         ipv6 address 2001:db8:{{site}}:20::1/64
+    - on: mv-edge-1
+      config: |
+        interface eth1
+         ipv6 address 2001:db8:{{site}}:ff03::2/64
+        ipv6 route 2001:db8:{{site}}::/48 2001:db8:{{site}}:ff03::1
+    - { on: office-pc6, run: "ip -6 addr add 2001:db8:{{site}}:1::10/64 dev eth1 nodad; ip -6 route replace default via 2001:db8:{{site}}:1::1" }
+    - { on: north-pc6, run: "ip -6 addr add 2001:db8:{{site}}:20::10/64 dev eth1 nodad; ip -6 route replace default via 2001:db8:{{site}}:20::1" }
+  checks:
+    - id: office-to-north
+      description: office-pc6 reaches north-pc6 over IPv6
+      type: shell
+      on: office-pc6
+      command: ping -6 -c2 -W2 2001:db8:{{site}}:20::10 >/dev/null
+      skills: [net.routing.ipv6-static]
+      weight: 2
+    - id: office-to-edge
+      description: office-pc6 reaches the edge router over IPv6
+      type: shell
+      on: office-pc6
+      command: ping -6 -c2 -W2 2001:db8:{{site}}:ff03::2 >/dev/null
+      skills: [net.routing.ipv6-static]
+    - id: office-default
+      description: mv-office-1 has an installed IPv6 default route
+      type: shell
+      on: mv-office-1
+      command: vtysh -c 'show ipv6 route ::/0' | grep -Ec '\* 2001:db8:{{site}}:ff01::1, via eth1'
+      expect: { match: exact, value: "1" }
+      skills: [net.routing.ipv6-static]
+    - id: north-default-link-local
+      description: mv-campus-north's IPv6 default route uses the core's link-local address on eth1
+      type: shell
+      on: mv-campus-north
+      command: vtysh -c 'show ipv6 route ::/0' | grep -Ec '\* fe80::1, via eth1'
+      expect: { match: exact, value: "1" }
+      skills: [net.routing.ipv6-static]
+      weight: 2
+    - id: core-north-link-local
+      description: mv-core-1 routes the north LAN via north's link-local address on eth2
+      type: shell
+      on: mv-core-1
+      command: vtysh -c 'show ipv6 route 2001:db8:{{site}}:20::/64' | grep -Ec '\* fe80::2, via eth2'
+      expect: { match: exact, value: "1" }
+      skills: [net.routing.ipv6-static]
+  hints:
+    - title: IPv6 static syntax
+      body: "`ipv6 route <prefix> <next-hop>`; the IPv6 default route is `::/0`."
+      cost: 1
+    - title: Link-local next hops
+      body: "The same fe80:: address can exist on every link, so a link-local next hop is ambiguous without an interface. Add the exit interface after the address."
+      command: "ipv6 route ::/0 fe80::1 eth1"
+      cost: 2
+  misconceptions:
+    - id: core-without-default
+      description: Configures routes on the core only and forgets the default routes on the office and north routers
+      mutation:
+        on: mv-core-1
+        config: |
+          ipv6 route 2001:db8:{{site}}:1::/64 2001:db8:{{site}}:ff01::2
+          ipv6 route 2001:db8:{{site}}:20::/64 fe80::2 eth2
+      expectFail: [office-to-north, office-default]
+      feedback: Every router on the path needs a route in both directions; the office and north routers know nothing beyond their own links.
+    - id: global-on-link-local-link
+      description: Gives mv-campus-north a default via a made-up global address on the link-local-only link
+      mutation:
+        on: mv-campus-north
+        config: |
+          ipv6 route ::/0 2001:db8:{{site}}:ff02::1
+      expectFail: [north-default-link-local]
+      feedback: That link has no global prefix, so the next hop is unreachable and the route stays inactive; use fe80::1 with eth1.
+  solution:
+    explanation: |
+      The office and north routers each get a default route towards the core;
+      north's uses the core's link-local address plus eth1. The core routes the
+      office LAN via the office router's global address, the north LAN via fe80::2
+      on eth2, and everything else to the edge.
+    steps:
+      - { on: mv-office-1, config: "ipv6 route ::/0 2001:db8:{{site}}:ff01::1\n" }
+      - on: mv-core-1
+        config: |
+          ipv6 route 2001:db8:{{site}}:1::/64 2001:db8:{{site}}:ff01::2
+          ipv6 route 2001:db8:{{site}}:20::/64 fe80::2 eth2
+          ipv6 route ::/0 2001:db8:{{site}}:ff03::2
+      - { on: mv-campus-north, config: "ipv6 route ::/0 fe80::1 eth1\n" }
