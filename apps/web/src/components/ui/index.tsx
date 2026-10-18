@@ -232,7 +232,7 @@ export function Segmented<T extends string>({ value, onChange, options, label, s
   return (
     <div className={cn('segmented', `segmented-${size}`)} role="radiogroup" aria-label={label}>
       {options.map((o) => (
-        <button key={o.value} role="radio" aria-checked={value === o.value} className={cn('segmented-item', value === o.value && 'is-active')} onClick={() => onChange(o.value)} title={o.title}>
+        <button key={o.value} type="button" role="radio" aria-checked={value === o.value} className={cn('segmented-item', value === o.value && 'is-active')} onClick={() => onChange(o.value)} title={o.title}>
           {o.label}
         </button>
       ))}
