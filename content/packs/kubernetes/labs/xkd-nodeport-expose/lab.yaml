@@ -100,12 +100,18 @@ spec:
       type: shell
       on: qm-yard/yard-cp-1
       skills: [k8s.networking.nodeport]
-      timeoutSec: 30
+      timeoutSec: 50
       command: |
         p=$(KUBECONFIG=/etc/kubernetes/admin.conf kubectl -n kiosk-front get svc kiosk-ui -o jsonpath='{.spec.ports[0].nodePort}' 2>/dev/null)
         ip=$(KUBECONFIG=/etc/kubernetes/admin.conf kubectl get node yard-wk-2 -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}')
         [ -n "$p" ] || { echo "no node port"; exit 0; }
-        curl -s -o /dev/null -w '%{http_code}' -m 5 "http://$ip:$p/" || echo unreachable
+        # kube-proxy/CNI rules on the target node can lag a few seconds behind a fresh Service
+        for i in 1 2 3 4 5 6 7 8; do
+          code=$(curl -s -o /dev/null -w '%{http_code}' -m 3 "http://$ip:$p/")
+          [ "$code" = 200 ] && break
+          sleep 3
+        done
+        echo "${code:-unreachable}"
       expect: {match: exact, value: "200"}
   misconceptions:
     - id: service-port-written
