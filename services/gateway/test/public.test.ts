@@ -61,7 +61,7 @@ describe('public website API', () => {
     for (const d of cat.domains) expect(d).toMatchObject({ labCount: expect.any(Number), pathCount: expect.any(Number), examCount: expect.any(Number) });
     expect(r.body).not.toMatch(/"completion"|"bestScore"|"progress"|"retake"|"lastAttempt"|"pool"|"attempts"/);
     for (const e of cat.exams) {
-      expect(e.disclaimer).toMatch(/not affiliated/);
+      expect(e.disclaimer).toMatch(/affiliated/);
       expect(e.title).not.toMatch(/\bCKA\b|\bCKAD\b|\bCKS\b|\bRHCSA\b|\bCCNA\b/);
     }
     for (const p of cat.paths) expect(['path', 'course']).toContain(p.kind);

@@ -21,7 +21,7 @@ Reference: `docs/website.md`.
 
 | Mode | How | What |
 |---|---|---|
-| mock (default) | `pnpm --filter web dev` or `task dev:web:mock` | Everything runs in the browser (MSW); no backend or cluster. Two fictional organisations with people in every role; a **persona switcher** in the navigation footer signs you in as any of them. |
+| mock (default) | `pnpm --filter web dev` or `task dev:web:mock` | Everything runs in the browser (MSW); no backend or cluster. A first visit is signed out and shows the public website; the landing page offers the sample personas, and a **persona switcher** in the navigation footer switches between them (two fictional organisations with people in every role). |
 | real | `VITE_API_MODE=real`, i.e. `task dev:web` | Vite proxies `/api`, including the terminal and observe WebSockets, to `services/gateway` (`CT_GATEWAY_URL`, default `http://127.0.0.1:8787`). Identity, assignments, teams, cohorts, admin and platform calls go to the gateway endpoints in `docs/api/platform.md`; Home and skill states are the gateway's learner model; only Scenario Studio stays in MSW (no backend yet). |
 
 Real mode needs the stack: `task dev:orchestrator`, `task dev:gateway`, `task dev:web`

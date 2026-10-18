@@ -5,6 +5,7 @@ import { isInternalHref, usePublicCatalog, useSite } from '@/api/public';
 import type { PublicCatalog, SiteConfig, SiteCta } from '@/api/types';
 import { DomainIcon } from '@/components/domain';
 import { Card, PageSkeleton } from '@/components/ui';
+import { MockSignIn } from '@/site/MockSignIn';
 import { FeatureIcon, SiteAnchor, useDocumentTitle } from '@/site/util';
 
 /**
@@ -94,6 +95,7 @@ function Hero({ site, cat }: { site: SiteConfig; cat: PublicCatalog | undefined 
             {h.secondaryCta && <Cta cta={h.secondaryCta} variant="secondary" />}
           </div>
           {h.note && <p className="xs subtle">{h.note}</p>}
+          <MockSignIn />
         </div>
         {stats.length > 0 && (
           <dl className="site-stats" aria-label="Catalog size">
