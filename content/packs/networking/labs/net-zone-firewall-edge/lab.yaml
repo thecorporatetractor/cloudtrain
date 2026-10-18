@@ -1,0 +1,193 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: net-zone-firewall-edge
+  title: Build an inside, DMZ and outside firewall policy
+  domain: networking
+  frameworks: [ccna:security-fundamentals, linuxplus:security]
+  difficulty: hard
+  estimatedMinutes: 30
+  tags: [firewall, zones, stateful, conntrack, nftables]
+  version: 1
+spec:
+  description: |
+    The district edge router `mv-edge-1` is a Linux router (shell, nftables) with
+    three zones:
+
+    | Interface | Zone | Network | Host |
+    |---|---|---|---|
+    | `eth1` | inside | `10.{{octet}}.10.0/24` (router `.1`) | `inside-pc` (`.10`) |
+    | `eth2` | dmz | `10.{{octet}}.70.0/24` (router `.1`) | `dmz-web` (`.10`) |
+    | `eth3` | outside | `203.0.113.0/24` (router `.{{pub}}`) | `outside-pc` (`.10`) |
+
+    `dmz-web` answers on TCP 443 and TCP 22. Build a **stateful** forwarding
+    policy on `mv-edge-1` so that:
+
+    - inside may open connections to any zone (dmz and outside);
+    - outside may open connections only to `dmz-web` on TCP 443, nothing else;
+    - the DMZ may **not** open new connections into the inside zone;
+    - reply traffic for connections that an allowed side opened always returns.
+
+    Leave the router's own management (input hook) alone; grade only forwarded
+    traffic.
+  objectives:
+    - Default-drop the forward hook and allow return traffic with connection tracking
+    - Permit inside egress, a single outside-to-DMZ service, and block DMZ-initiated flows inward
+  params:
+    octet: { type: int, min: 20, max: 90 }
+    pub: { type: int, min: 20, max: 250 }
+  topology:
+    entry: workstation
+    nodes:
+      - { name: workstation, driver: container, image: jumphost:1, access: [shell] }
+      - { name: mv-edge-1, driver: container, image: netsvc:1, resources: { cpu: 0.25, memoryMiB: 128 }, access: [shell] }
+      - { name: inside-pc, driver: container, image: netsvc:1, resources: { cpu: 0.1, memoryMiB: 80 }, access: [shell] }
+      - { name: dmz-web, driver: container, image: netsvc:1, resources: { cpu: 0.15, memoryMiB: 80 }, access: [shell] }
+      - { name: outside-pc, driver: container, image: netsvc:1, resources: { cpu: 0.1, memoryMiB: 80 }, access: [shell] }
+    links:
+      - { a: "mv-edge-1:eth1", b: "inside-pc:eth1" }
+      - { a: "mv-edge-1:eth2", b: "dmz-web:eth1" }
+      - { a: "mv-edge-1:eth3", b: "outside-pc:eth1" }
+  setup:
+    - on: mv-edge-1
+      run: |
+        ip addr replace 10.{{octet}}.10.1/24 dev eth1
+        ip addr replace 10.{{octet}}.70.1/24 dev eth2
+        ip addr replace 203.0.113.{{pub}}/24 dev eth3
+    - on: inside-pc
+      run: |
+        ip addr replace 10.{{octet}}.10.10/24 dev eth1 && ip route replace default via 10.{{octet}}.10.1
+        setsid ncat -l -k -p 8080 --sh-exec 'echo inside' </dev/null >/dev/null 2>&1 &
+        sleep 1
+    - on: dmz-web
+      run: |
+        ip addr replace 10.{{octet}}.70.10/24 dev eth1 && ip route replace default via 10.{{octet}}.70.1
+        setsid ncat -l -k -p 443 --sh-exec 'echo dmz-web' </dev/null >/dev/null 2>&1 &
+        setsid ncat -l -k -p 22 --sh-exec 'echo ssh' </dev/null >/dev/null 2>&1 &
+        sleep 1
+    - on: outside-pc
+      run: |
+        ip addr replace 203.0.113.10/24 dev eth1 && ip route replace default via 203.0.113.{{pub}}
+        setsid ncat -l -k -p 9000 --sh-exec 'echo outside' </dev/null >/dev/null 2>&1 &
+        sleep 1
+  checks:
+    - id: inside-to-outside
+      description: inside-pc may open a connection to the outside host
+      type: shell
+      on: inside-pc
+      command: ncat -w3 203.0.113.10 9000 </dev/null
+      expect: { match: exact, value: outside }
+      timeoutSec: 10
+      skills: [net.security.firewall-zones]
+    - id: inside-to-dmz
+      description: inside-pc may reach the DMZ web server on 443
+      type: shell
+      on: inside-pc
+      command: ncat -w3 10.{{octet}}.70.10 443 </dev/null
+      expect: { match: exact, value: dmz-web }
+      timeoutSec: 10
+      skills: [net.security.firewall-zones]
+    - id: outside-to-dmz-443
+      description: outside-pc may reach the DMZ web server on 443
+      type: shell
+      on: outside-pc
+      command: ncat -w3 10.{{octet}}.70.10 443 </dev/null
+      expect: { match: exact, value: dmz-web }
+      timeoutSec: 10
+      skills: [net.security.firewall-zones]
+      weight: 2
+    - id: outside-to-dmz-ssh-blocked
+      description: outside-pc cannot reach the DMZ on TCP 22
+      type: shell
+      on: outside-pc
+      command: ncat -z -w2 10.{{octet}}.70.10 22 && echo open || echo closed
+      expect: { match: exact, value: closed }
+      timeoutSec: 10
+      skills: [net.security.firewall-zones]
+      weight: 2
+    - id: outside-to-inside-blocked
+      description: outside-pc cannot reach the inside host at all
+      type: shell
+      on: outside-pc
+      command: ncat -z -w2 10.{{octet}}.10.10 8080 && echo open || echo closed
+      expect: { match: exact, value: closed }
+      timeoutSec: 10
+      skills: [net.security.firewall-zones]
+      weight: 2
+    - id: dmz-inward-blocked
+      description: The DMZ cannot open a new connection into the inside zone
+      type: shell
+      on: dmz-web
+      command: ncat -z -w2 10.{{octet}}.10.10 8080 && echo open || echo closed
+      expect: { match: exact, value: closed }
+      timeoutSec: 10
+      skills: [net.security.firewall-zones]
+      weight: 2
+  hints:
+    - title: Start from drop
+      body: "Set the forward hook policy to drop, then accept what you want. The first rule should accept established/related so replies always return."
+      command: "nft 'add chain inet fw forward { type filter hook forward priority 0; policy drop; }'; nft add rule inet fw forward ct state established,related accept"
+      cost: 1
+    - title: Match zones by interface
+      body: "`iifname eth1 accept` lets the inside open anything; `iifname eth3 oifname eth2 ip daddr 10.{{octet}}.70.10 tcp dport 443 ct state new accept` is the one outside service. Nothing else matches, so it is dropped."
+      cost: 2
+  misconceptions:
+    - id: stateless-open-both-ways
+      description: Opens inside-to-DMZ and DMZ-to-inside both, instead of relying on connection tracking
+      mutation:
+        on: mv-edge-1
+        run: |
+          nft add table inet fw
+          nft 'add chain inet fw forward { type filter hook forward priority 0; policy drop; }'
+          nft add rule inet fw forward iifname eth1 accept
+          nft add rule inet fw forward iifname eth2 accept
+          nft add rule inet fw forward iifname eth3 oifname eth2 tcp dport 443 accept
+      expectFail: [dmz-inward-blocked]
+      feedback: Accepting everything from the DMZ interface lets it start connections inward; permit only reply traffic (established,related) from the DMZ.
+    - id: no-conntrack
+      description: Forgets to accept established/related, so replies to inside's own connections are dropped
+      mutation:
+        on: mv-edge-1
+        run: |
+          nft add table inet fw
+          nft 'add chain inet fw forward { type filter hook forward priority 0; policy drop; }'
+          nft add rule inet fw forward iifname eth1 accept
+          nft add rule inet fw forward iifname eth3 oifname eth2 ip daddr 10.{{octet}}.70.10 tcp dport 443 ct state new accept
+      expectFail: [inside-to-outside, inside-to-dmz, outside-to-dmz-443]
+      feedback: Without an established,related accept rule, only the first packet of each flow is allowed and the replies never come back.
+    - id: outside-whole-dmz
+      description: Lets the outside open any port on the DMZ web server instead of only 443
+      mutation:
+        on: mv-edge-1
+        run: |
+          nft add table inet fw
+          nft 'add chain inet fw forward { type filter hook forward priority 0; policy drop; }'
+          nft add rule inet fw forward ct state established,related accept
+          nft add rule inet fw forward iifname eth1 ct state new accept
+          nft add rule inet fw forward iifname eth3 oifname eth2 ip daddr 10.{{octet}}.70.10 ct state new accept
+      expectFail: [outside-to-dmz-ssh-blocked]
+      feedback: The outside zone may reach one service only; match the destination port too, or SSH on the DMZ server is open to the internet.
+  solution:
+    explanation: |
+      Default-drop the forward hook, accept established and related first (so all
+      replies return), let the inside interface open anything, and add exactly one
+      new-connection rule for outside to the DMZ web server on 443. The DMZ has no
+      rule that lets it start connections inward, so conntrack drops those.
+    steps:
+      - on: mv-edge-1
+        run: |
+          nft add table inet fw
+          nft 'add chain inet fw forward { type filter hook forward priority 0; policy drop; }'
+          nft add rule inet fw forward ct state established,related accept
+          nft add rule inet fw forward iifname eth1 ct state new accept
+          nft add rule inet fw forward iifname eth3 oifname eth2 ip daddr 10.{{octet}}.70.10 tcp dport 443 ct state new accept
+    alternatives:
+      - id: iptables-stateful
+        description: iptables FORWARD with conntrack match
+        steps:
+          - on: mv-edge-1
+            run: |
+              iptables -P FORWARD DROP
+              iptables -A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+              iptables -A FORWARD -i eth1 -m conntrack --ctstate NEW -j ACCEPT
+              iptables -A FORWARD -i eth3 -o eth2 -d 10.{{octet}}.70.10 -p tcp --dport 443 -m conntrack --ctstate NEW -j ACCEPT

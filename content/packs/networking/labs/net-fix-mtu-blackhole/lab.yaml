@@ -1,0 +1,245 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: net-fix-mtu-blackhole
+  title: Unstick large uploads through a tunnel
+  domain: networking
+  frameworks: [ccna:ip-connectivity]
+  difficulty: hard
+  estimatedMinutes: 25
+  tags: [fix, mtu, pmtud, mss-clamp, tunnel, packet-capture]
+  version: 1
+spec:
+  description: |
+    Since the annex tunnel went live, small pages load from the annex but
+    coursework **uploads and downloads hang**. The annex and the core are joined
+    by a GRE tunnel `gre1` across the regional network. The district built the
+    tunnel for 1400-byte Ethernet (`gre1` MTU 1376), but the regional network in
+    between carries less, never reports it (no ICMP "fragmentation needed" comes
+    back), so Path MTU Discovery is black-holed: small packets pass, large ones
+    with Don't-Fragment vanish.
+
+    | Router | Transit | Inside LAN | Tunnel |
+    |---|---|---|---|
+    | `mv-edge-1` | `eth1` `198.51.100.{{epub}}/24` -> regional `.1` | `eth2` core `10.{{octet}}.1.0/24` (`.1`), `core-srv` (`.10`) | `gre1` `10.{{octet}}.200.1/30` |
+    | `mv-annex-1` | `eth1` `203.0.113.{{apub}}/24` -> regional `.1` | `eth2` annex `10.{{octet}}.60.0/24` (`.1`), `annex-pc` (`.10`) | `gre1` `10.{{octet}}.200.2/30` |
+
+    `core-srv` runs a byte sink on TCP 5001 that records how many bytes each
+    upload delivered (in `/var/lib/cloudtrain/last-size`) and serves a 256 KiB
+    download on `10.{{octet}}.1.11` TCP 5003.
+
+    1. Diagnose the black hole (compare a small ping with large
+       `ping -M do -s <size>` pings from `annex-pc` to `core-srv`, and capture if
+       you like) and write the **largest ICMP payload size** that still crosses
+       the tunnel with Don't-Fragment set, as a number, to `/root/finding.txt` on
+       `annex-pc`.
+    2. Fix it on the two routers so uploads and downloads complete, **without**
+       turning off Don't-Fragment and without changing the hosts or
+       `regional-gw`: lower the tunnel MTU on both ends to what the path carries,
+       or clamp the TCP MSS on both routers to fit it.
+
+    The grader uploads 256 KiB from `annex-pc` to `10.{{octet}}.1.10:5001`,
+    downloads 256 KiB from `10.{{octet}}.1.11:5003`, and checks that every byte arrives.
+  objectives:
+    - Recognise a PMTU black hole from the symptom (small works, large hangs)
+    - Measure the path MTU across a tunnel with Don't-Fragment pings
+    - Repair it with a tunnel MTU or an MSS clamp that fits the path, in both directions
+  params:
+    octet: { type: int, min: 20, max: 90 }
+    epub: { type: int, min: 20, max: 250 }
+    apub: { type: int, min: 20, max: 250 }
+  topology:
+    entry: workstation
+    nodes:
+      - { name: workstation, driver: container, image: jumphost:1, access: [shell] }
+      - { name: mv-edge-1, driver: container, image: netsvc:1, resources: { cpu: 0.25, memoryMiB: 128 }, access: [shell] }
+      - { name: mv-annex-1, driver: container, image: netsvc:1, resources: { cpu: 0.25, memoryMiB: 128 }, access: [shell] }
+      - { name: regional-gw, driver: container, image: netsvc:1, resources: { cpu: 0.2, memoryMiB: 96 } }
+      - { name: core-srv, driver: container, image: netsvc:1, resources: { cpu: 0.15, memoryMiB: 80 }, access: [shell] }
+      - { name: annex-pc, driver: container, image: netsvc:1, resources: { cpu: 0.15, memoryMiB: 80 }, access: [shell] }
+    links:
+      - { a: "mv-edge-1:eth1", b: "regional-gw:eth1" }
+      - { a: "mv-annex-1:eth1", b: "regional-gw:eth2" }
+      - { a: "mv-edge-1:eth2", b: "core-srv:eth1" }
+      - { a: "mv-annex-1:eth2", b: "annex-pc:eth1" }
+  setup:
+    # Every lab interface runs at MTU 1400 except the regional network, which
+    # carries only 1300-byte packets and silently drops anything larger.
+    - on: regional-gw
+      run: |
+        ip addr replace 198.51.100.1/24 dev eth1
+        ip addr replace 203.0.113.1/24 dev eth2
+        sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+        ip link set eth1 mtu 1300; ip link set eth2 mtu 1300
+        # the regional router never reports the smaller MTU, black-holing PMTUD
+        nft add table inet blackhole
+        nft 'add chain inet blackhole fwdh { type filter hook forward priority 0; policy accept; }'
+        nft 'add chain inet blackhole outh { type filter hook output priority 0; policy accept; }'
+        nft add rule inet blackhole fwdh icmp type destination-unreachable icmp code frag-needed drop
+        nft add rule inet blackhole outh icmp type destination-unreachable icmp code frag-needed drop
+    - on: mv-edge-1
+      run: |
+        ip link set eth1 mtu 1400; ip link set eth2 mtu 1400
+        ip addr replace 198.51.100.{{epub}}/24 dev eth1
+        ip addr replace 10.{{octet}}.1.1/24 dev eth2
+        ip route replace 203.0.113.0/24 via 198.51.100.1
+        sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+        ip link show gre1 >/dev/null 2>&1 || ip tunnel add gre1 mode gre local 198.51.100.{{epub}} remote 203.0.113.{{apub}} ttl 64
+        ip addr replace 10.{{octet}}.200.1/30 dev gre1
+        ip link set gre1 mtu 1376 up
+        ip route replace 10.{{octet}}.60.0/24 dev gre1
+    - on: mv-annex-1
+      run: |
+        ip link set eth1 mtu 1400; ip link set eth2 mtu 1400
+        ip addr replace 203.0.113.{{apub}}/24 dev eth1
+        ip addr replace 10.{{octet}}.60.1/24 dev eth2
+        ip route replace 198.51.100.0/24 via 203.0.113.1
+        sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+        ip link show gre1 >/dev/null 2>&1 || ip tunnel add gre1 mode gre local 203.0.113.{{apub}} remote 198.51.100.{{epub}} ttl 64
+        ip addr replace 10.{{octet}}.200.2/30 dev gre1
+        ip link set gre1 mtu 1376 up
+        ip route replace 10.{{octet}}.1.0/24 dev gre1
+    - on: core-srv
+      run: |
+        ip link set eth1 mtu 1400
+        ip addr replace 10.{{octet}}.1.10/24 dev eth1 && ip route replace default via 10.{{octet}}.1.1
+        # downloads come from a second address, so path MTUs annex-pc learned from uploads don't help them
+        ip addr replace 10.{{octet}}.1.11/24 dev eth1
+        mkdir -p /var/lib/cloudtrain; echo 0 > /var/lib/cloudtrain/last-size
+        setsid ncat -l -k -p 5001 --sh-exec 'wc -c > /var/lib/cloudtrain/last-size' </dev/null >/dev/null 2>&1 &
+        setsid ncat -l -k -p 5002 --sh-exec 'echo small' </dev/null >/dev/null 2>&1 &
+        setsid ncat -l -k -p 5003 --sh-exec 'head -c 262144 /dev/zero' </dev/null >/dev/null 2>&1 &
+        sleep 1
+    - { on: annex-pc, run: "ip link set eth1 mtu 1400 && ip addr replace 10.{{octet}}.60.10/24 dev eth1 && ip route replace default via 10.{{octet}}.60.1" }
+  checks:
+    - id: small-ok
+      description: A small request across the tunnel still works
+      type: shell
+      on: annex-pc
+      command: ncat -w3 10.{{octet}}.1.10 5002 </dev/null
+      expect: { match: exact, value: small }
+      timeoutSec: 10
+      skills: [net.troubleshooting.mtu]
+    - id: finding-recorded
+      description: /root/finding.txt holds the largest Don't-Fragment ping payload that crosses the tunnel
+      type: shell
+      on: annex-pc
+      command: |
+        [ -f /root/finding.txt ] || { echo missing; exit 0; }
+        n=$(tr -dc 0-9 < /root/finding.txt)
+        [ "$n" = 1248 ] && echo ok || echo "wrong:$n"
+      expect: { match: exact, value: ok }
+      skills: [net.troubleshooting.packet-capture]
+      weight: 2
+    - id: upload-completes
+      description: (probe) annex-pc uploads 256 KiB to core-srv
+      type: shell
+      on: annex-pc
+      command: |
+        head -c 262144 /dev/zero | timeout 15 ncat -i 6 10.{{octet}}.1.10 5001 >/dev/null 2>&1
+        sleep 1
+        echo requested
+      expect: { match: exact, value: requested }
+      timeoutSec: 25
+      skills: [net.troubleshooting.mtu]
+      weight: 0
+    - id: upload-arrived
+      description: core-srv recorded the full 256 KiB of the upload
+      type: shell
+      on: core-srv
+      command: |
+        for i in $(seq 8); do n=$(tr -dc 0-9 < /var/lib/cloudtrain/last-size 2>/dev/null); [ "$n" = 262144 ] && break; sleep 1; done
+        [ "$n" = 262144 ] && echo ok || echo "got:$n"
+      expect: { match: exact, value: ok }
+      timeoutSec: 15
+      skills: [net.troubleshooting.mtu]
+      weight: 3
+    - id: download-completes
+      description: annex-pc downloads the full 256 KiB from core-srv
+      type: shell
+      on: annex-pc
+      command: |
+        n=$(timeout 15 ncat -i 6 --recv-only 10.{{octet}}.1.11 5003 </dev/null 2>/dev/null | wc -c)
+        [ "$n" -eq 262144 ] && echo ok || echo "got:$n"
+      expect: { match: exact, value: ok }
+      timeoutSec: 25
+      skills: [net.troubleshooting.mtu]
+      weight: 3
+  hints:
+    - title: Measure the path
+      body: "`ping -c1 10.{{octet}}.1.10` works, `ping -c1 -M do -s 1348 10.{{octet}}.1.10` (the largest that fits gre1) vanishes. Halve the gap until you find the largest size that still gets a reply: payload + 28 bytes of IP/ICMP header + 24 bytes of GRE is what the regional path must carry."
+      command: "for s in 1200 1250 1300 1348; do ping -c1 -W1 -M do -s $s 10.{{octet}}.1.10 >/dev/null && echo $s ok || echo $s lost; done"
+      cost: 1
+    - title: Fix both directions
+      body: "Each router encapsulates the traffic it sends into the tunnel, so fix both: `ip link set gre1 mtu <path - 24>` on mv-edge-1 and mv-annex-1, or clamp SYNs leaving gre1 on both (`tcp flags syn tcp option maxseg size set <tunnel MTU - 40>`). `set rt mtu` clamps to gre1's MTU, which is the wrong number until gre1 itself is lowered."
+      cost: 2
+  misconceptions:
+    - id: one-end-only
+      description: Lowers the tunnel MTU on the annex router only
+      mutation:
+        on: mv-annex-1
+        run: ip link set gre1 mtu 1276
+      expectFail: [download-completes]
+      feedback: The annex router now fits its own packets to the path, but mv-edge-1 still sends 1376-byte packets into the tunnel, so downloads hang. Fix both ends.
+    - id: clamp-to-route-mtu
+      description: Clamps the MSS to the route MTU without lowering gre1
+      mutation:
+        on: mv-annex-1
+        run: |
+          nft add table inet clamp
+          nft 'add chain inet clamp forward { type filter hook forward priority mangle; policy accept; }'
+          nft add rule inet clamp forward oifname gre1 tcp flags syn tcp option maxseg size set rt mtu
+      expectFail: [upload-arrived, download-completes]
+      feedback: "`set rt mtu` derives the MSS from gre1's MTU (1376 - 40 = 1336), which is still too big for the 1300-byte path; lower gre1 or clamp to a fixed 1236."
+    - id: no-gre-overhead
+      description: Records the path MTU minus the ICMP header but forgets the GRE overhead
+      mutation:
+        on: annex-pc
+        run: echo 1272 > /root/finding.txt
+      expectFail: [finding-recorded]
+      feedback: Inside the tunnel every packet also carries 24 bytes of outer IP and GRE header, so the largest payload is 1300 - 24 - 28 = 1248.
+  solution:
+    explanation: |
+      The regional path carries 1300 bytes and reports nothing, so anything above
+      1300 - 24 (GRE) = 1276 bytes inside the tunnel vanishes; the largest
+      Don't-Fragment ping payload is 1276 - 28 = 1248. With gre1 lowered to 1276
+      on both routers, each router reports "fragmentation needed" for oversized
+      packets itself (that ICMP never crosses the regional network, so it is not
+      lost), and the SYN clamp on gre1 (`set rt mtu`, now 1236) makes TCP pick
+      fitting segments from the start, in both directions.
+    steps:
+      - on: annex-pc
+        run: |
+          for s in 1248 1249; do ping -c1 -W1 -M do -s $s 10.{{octet}}.1.10 >/dev/null 2>&1 && echo "$s crosses" || echo "$s lost"; done
+          echo 1248 > /root/finding.txt
+      - on: mv-edge-1
+        run: |
+          ip link set gre1 mtu 1276
+          nft add table inet clamp
+          nft 'add chain inet clamp forward { type filter hook forward priority mangle; policy accept; }'
+          nft add rule inet clamp forward oifname gre1 tcp flags syn tcp option maxseg size set rt mtu
+      - on: mv-annex-1
+        run: |
+          ip link set gre1 mtu 1276
+          nft add table inet clamp
+          nft 'add chain inet clamp forward { type filter hook forward priority mangle; policy accept; }'
+          nft add rule inet clamp forward oifname gre1 tcp flags syn tcp option maxseg size set rt mtu
+    alternatives:
+      - id: tunnel-mtu-only
+        description: Lower the GRE MTU on both ends so every packet fits the path
+        steps:
+          - on: annex-pc
+            run: echo 1248 > /root/finding.txt
+          - on: mv-edge-1
+            run: ip link set gre1 mtu 1276
+          - on: mv-annex-1
+            run: ip link set gre1 mtu 1276
+      - id: fixed-mss-clamp
+        description: Leave gre1 as it is and clamp TCP SYNs to a fixed MSS of 1236 on both routers
+        steps:
+          - on: annex-pc
+            run: echo 1248 > /root/finding.txt
+          - on: mv-edge-1
+            run: iptables -t mangle -A FORWARD -o gre1 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1236
+          - on: mv-annex-1
+            run: iptables -t mangle -A FORWARD -o gre1 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1236

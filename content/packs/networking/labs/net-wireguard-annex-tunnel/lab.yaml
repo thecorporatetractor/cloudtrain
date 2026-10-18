@@ -1,0 +1,220 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: net-wireguard-annex-tunnel
+  title: Link the annex to the core with a WireGuard tunnel
+  domain: networking
+  frameworks: [ccna:security-fundamentals]
+  difficulty: medium
+  estimatedMinutes: 25
+  tags: [wireguard, vpn, tunnel, encryption]
+  version: 1
+spec:
+  description: |
+    The vocational annex reaches the district core only across the untrusted
+    regional network, routed by `regional-gw`. Build a **WireGuard** tunnel
+    between the two Linux routers and carry the annex LAN through it, so a capture
+    on the regional link shows only encrypted UDP, never the inner traffic.
+
+    | Router | Public (transit) | Inside LAN | Tunnel address |
+    |---|---|---|---|
+    | `mv-edge-1` | `eth1` `198.51.100.{{epub}}/24` -> regional `.1` | `eth2` core LAN `10.{{octet}}.1.0/24` (`.1`), host `core-pc` (`.10`) | `wg0` `10.{{octet}}.200.1/30` |
+    | `mv-annex-1` | `eth1` `203.0.113.{{apub}}/24` -> regional `.1` | `eth2` annex LAN `10.{{octet}}.60.0/24` (`.1`), host `annex-pc` (`.10`) | `wg0` `10.{{octet}}.200.2/30` |
+
+    Each router already has its own WireGuard private key in
+    `/etc/wireguard/priv` and the **peer's** public key in
+    `/etc/wireguard/peer.pub`. Use UDP port **51820**.
+
+    1. Bring up `wg0` on each router with its tunnel address and the key material.
+    2. Set the peer's endpoint (the peer's transit address) and `allowed-ips` so
+       that the tunnel `/30` **and** the far inside LAN are reached through `wg0`.
+    3. Route each router's inside LAN to the other over the tunnel.
+
+    Afterwards `annex-pc` must reach `core-pc`, and the capture on `regional-gw`
+    must contain no inner (`10.{{octet}}.*`) packets.
+  objectives:
+    - Bring up a WireGuard interface from supplied key material
+    - Carry a remote subnet through the tunnel with the right allowed-ips and routes
+    - Confirm the transit path carries only encrypted UDP
+  params:
+    octet: { type: int, min: 20, max: 90 }
+    epub: { type: int, min: 20, max: 250 }
+    apub: { type: int, min: 20, max: 250 }
+    # seeds this session's throw-away WireGuard key pairs (derived in setup, never stored in the lab)
+    wgseed: { type: int, min: 100000000, max: 999999999 }
+  topology:
+    entry: workstation
+    nodes:
+      - { name: workstation, driver: container, image: jumphost:1, access: [shell] }
+      - { name: mv-edge-1, driver: container, image: netsvc:1, resources: { cpu: 0.25, memoryMiB: 128 }, access: [shell] }
+      - { name: mv-annex-1, driver: container, image: netsvc:1, resources: { cpu: 0.25, memoryMiB: 128 }, access: [shell] }
+      - { name: regional-gw, driver: container, image: netsvc:1, resources: { cpu: 0.2, memoryMiB: 96 }, access: [shell] }
+      - { name: core-pc, driver: container, image: netsvc:1, resources: { cpu: 0.1, memoryMiB: 64 }, access: [shell] }
+      - { name: annex-pc, driver: container, image: netsvc:1, resources: { cpu: 0.1, memoryMiB: 64 }, access: [shell] }
+    links:
+      - { a: "mv-edge-1:eth1", b: "regional-gw:eth1" }
+      - { a: "mv-annex-1:eth1", b: "regional-gw:eth2" }
+      - { a: "mv-edge-1:eth2", b: "core-pc:eth1" }
+      - { a: "mv-annex-1:eth2", b: "annex-pc:eth1" }
+  setup:
+    - on: regional-gw
+      run: |
+        # regional-gw routes between the two transit subnets but has no route to the inside LANs
+        ip addr replace 198.51.100.1/24 dev eth1
+        ip addr replace 203.0.113.1/24 dev eth2
+    - on: mv-edge-1
+      run: |
+        ip addr replace 198.51.100.{{epub}}/24 dev eth1
+        ip addr replace 10.{{octet}}.1.1/24 dev eth2
+        ip route replace 203.0.113.0/24 via 198.51.100.1
+        # Lab-only key material: both routers derive this session's two throw-away
+        # private keys from the random wgseed param and keep their own private key
+        # plus the peer's public key.
+        wgkey() { python3 -c 'import base64,hashlib,sys
+        k = bytearray(hashlib.sha256(sys.argv[1].encode()).digest()); k[0] &= 248; k[31] = (k[31] & 127) | 64
+        print(base64.b64encode(bytes(k)).decode())' "marlowvalley-wg-$1-{{wgseed}}"; }
+        mkdir -p /etc/wireguard; umask 077
+        wgkey edge > /etc/wireguard/priv
+        wgkey annex | wg pubkey > /etc/wireguard/peer.pub
+    - on: mv-annex-1
+      run: |
+        ip addr replace 203.0.113.{{apub}}/24 dev eth1
+        ip addr replace 10.{{octet}}.60.1/24 dev eth2
+        ip route replace 198.51.100.0/24 via 203.0.113.1
+        # Lab-only key material: both routers derive this session's two throw-away
+        # private keys from the random wgseed param and keep their own private key
+        # plus the peer's public key.
+        wgkey() { python3 -c 'import base64,hashlib,sys
+        k = bytearray(hashlib.sha256(sys.argv[1].encode()).digest()); k[0] &= 248; k[31] = (k[31] & 127) | 64
+        print(base64.b64encode(bytes(k)).decode())' "marlowvalley-wg-$1-{{wgseed}}"; }
+        mkdir -p /etc/wireguard; umask 077
+        wgkey annex > /etc/wireguard/priv
+        wgkey edge | wg pubkey > /etc/wireguard/peer.pub
+    - { on: core-pc, run: "ip addr replace 10.{{octet}}.1.10/24 dev eth1 && ip route replace default via 10.{{octet}}.1.1" }
+    - on: annex-pc
+      run: |
+        ip addr replace 10.{{octet}}.60.10/24 dev eth1 && ip route replace default via 10.{{octet}}.60.1
+        # a steady trickle of inner pings so the transit capture has something to judge
+        setsid sh -c 'while :; do ping -c1 -W1 10.{{octet}}.1.10 >/dev/null 2>&1; sleep 2; done' </dev/null >/dev/null 2>&1 &
+  checks:
+    - id: tunnel-handshake
+      description: mv-edge-1 has completed a WireGuard handshake with the annex
+      type: shell
+      on: mv-edge-1
+      command: |
+        for i in $(seq 15); do
+          h=$(wg show wg0 latest-handshakes 2>/dev/null | awk '{print $2}' | sort -rn | head -1)
+          [ -n "$h" ] && [ "$h" -gt 0 ] 2>/dev/null && { echo up; exit 0; }
+          sleep 1
+        done; echo down
+      expect: { match: exact, value: up }
+      timeoutSec: 30
+      skills: [net.security.wireguard]
+      weight: 2
+    - id: annex-reaches-core
+      description: annex-pc reaches core-pc through the tunnel
+      type: shell
+      on: annex-pc
+      command: |
+        for i in $(seq 10); do ping -c1 -W2 10.{{octet}}.1.10 >/dev/null 2>&1 && { echo ok; exit 0; }; sleep 1; done; echo lost
+      expect: { match: exact, value: ok }
+      timeoutSec: 25
+      skills: [net.security.wireguard]
+      weight: 2
+    - id: transit-encrypted
+      description: The regional capture carries encrypted UDP and no inner (plaintext) packets
+      type: shell
+      on: regional-gw
+      command: |
+        # a fresh 8 s capture on the annex-side transit link, while annex-pc's trickle runs
+        timeout 8 tcpdump -i eth2 -nn -U -w /tmp/transit.pcap 'udp port 51820 or ip net 10.{{octet}}.0.0/16' >/dev/null 2>&1
+        udp=$(tcpdump -nn -r /tmp/transit.pcap 'udp port 51820' 2>/dev/null | wc -l)
+        inner=$(tcpdump -nn -r /tmp/transit.pcap 'ip net 10.{{octet}}.0.0/16' 2>/dev/null | wc -l)
+        [ "$udp" -gt 0 ] && [ "$inner" -eq 0 ] && echo encrypted || echo "leak udp=$udp inner=$inner"
+      expect: { match: exact, value: encrypted }
+      timeoutSec: 20
+      skills: [net.security.wireguard]
+      weight: 2
+  hints:
+    - title: Bring up wg0
+      body: "`ip link add wg0 type wireguard`, `ip addr add <tunnel>/30 dev wg0`, then `wg set wg0 private-key /etc/wireguard/priv listen-port 51820 peer $(cat /etc/wireguard/peer.pub) endpoint <peer-transit>:51820 allowed-ips <tunnel/30>,<far-LAN/24>`, then `ip link set wg0 up`."
+      cost: 2
+    - title: Routing the LAN
+      body: "allowed-ips decides what WireGuard accepts and sends through the peer; you still add a kernel route for the far LAN out `wg0` (`ip route add <far-LAN/24> dev wg0`)."
+      cost: 1
+  misconceptions:
+    - id: plaintext-route
+      description: Routes the annex LAN straight over the transit network instead of through the tunnel
+      mutation:
+        on: mv-annex-1
+        run: |
+          # sends the annex LAN's traffic for the core in the clear to regional-gw
+          ip route replace 10.{{octet}}.1.0/24 via 203.0.113.1
+      expectFail: [transit-encrypted]
+      feedback: Routing inside traffic over the clear transit network exposes it; it must traverse wg0, where WireGuard encrypts it.
+    - id: missing-allowed-ips
+      description: Brings up the tunnel but leaves the far LAN out of allowed-ips
+      mutation:
+        on: mv-edge-1
+        run: |
+          ip link add wg0 type wireguard 2>/dev/null
+          ip addr add 10.{{octet}}.200.1/30 dev wg0 2>/dev/null
+          wg set wg0 private-key /etc/wireguard/priv listen-port 51820 \
+            peer $(cat /etc/wireguard/peer.pub) endpoint 203.0.113.{{apub}}:51820 allowed-ips 10.{{octet}}.200.2/32
+          ip link set wg0 up
+      expectFail: [annex-reaches-core]
+      feedback: WireGuard only forwards packets whose destination is in a peer's allowed-ips; add the far LAN there.
+  solution:
+    explanation: |
+      Create wg0 on each router, set the private key, listen port, peer public
+      key, peer endpoint and allowed-ips (the tunnel /30 plus the far LAN), bring
+      it up and route the far LAN out wg0. Inner traffic is then encapsulated in
+      UDP/51820 on the transit link.
+    steps:
+      - on: mv-edge-1
+        run: |
+          ip link add wg0 type wireguard 2>/dev/null
+          ip addr add 10.{{octet}}.200.1/30 dev wg0 2>/dev/null
+          wg set wg0 private-key /etc/wireguard/priv listen-port 51820 \
+            peer $(cat /etc/wireguard/peer.pub) endpoint 203.0.113.{{apub}}:51820 \
+            allowed-ips 10.{{octet}}.200.2/32,10.{{octet}}.60.0/24
+          ip link set wg0 up
+          ip route replace 10.{{octet}}.60.0/24 dev wg0
+      - on: mv-annex-1
+        run: |
+          ip link add wg0 type wireguard 2>/dev/null
+          ip addr add 10.{{octet}}.200.2/30 dev wg0 2>/dev/null
+          wg set wg0 private-key /etc/wireguard/priv listen-port 51820 \
+            peer $(cat /etc/wireguard/peer.pub) endpoint 198.51.100.{{epub}}:51820 \
+            allowed-ips 10.{{octet}}.200.1/32,10.{{octet}}.1.0/24
+          ip link set wg0 up
+          ip route replace 10.{{octet}}.1.0/24 dev wg0
+    alternatives:
+      - id: wg-quick-conf
+        description: Drive the interface from a wg-quick config file
+        steps:
+          - on: mv-edge-1
+            run: |
+              cat > /etc/wireguard/wg0.conf <<EOF
+              [Interface]
+              Address = 10.{{octet}}.200.1/30
+              ListenPort = 51820
+              PostUp = ip route replace 10.{{octet}}.60.0/24 dev wg0
+              EOF
+              echo "PrivateKey = $(cat /etc/wireguard/priv)" >> /etc/wireguard/wg0.conf
+              cat >> /etc/wireguard/wg0.conf <<EOF
+              [Peer]
+              PublicKey = $(cat /etc/wireguard/peer.pub)
+              Endpoint = 203.0.113.{{apub}}:51820
+              AllowedIPs = 10.{{octet}}.200.2/32, 10.{{octet}}.60.0/24
+              EOF
+              wg-quick up wg0
+          - on: mv-annex-1
+            run: |
+              ip link add wg0 type wireguard 2>/dev/null
+              ip addr add 10.{{octet}}.200.2/30 dev wg0 2>/dev/null
+              wg set wg0 private-key /etc/wireguard/priv listen-port 51820 \
+                peer $(cat /etc/wireguard/peer.pub) endpoint 198.51.100.{{epub}}:51820 \
+                allowed-ips 10.{{octet}}.200.1/32,10.{{octet}}.1.0/24
+              ip link set wg0 up
+              ip route replace 10.{{octet}}.1.0/24 dev wg0
