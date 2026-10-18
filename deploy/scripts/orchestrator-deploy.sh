@@ -81,12 +81,16 @@ fi
 # PROVISION_TIMEOUT (a Go duration, e.g. 40m) sets the manager's
 # --provision-timeout: sessions whose nodes are not ready by then fail. Empty
 # keeps the manager default (15m); kubeadm sessions on a loaded machine need more.
+# STORAGE_CLASS (default for homes, vcluster databases and VM disks),
+# HOME_STORAGE_CLASS, VM_DISK_STORAGE_CLASS, VM_DISK_VOLUME_MODE (Block|Filesystem)
+# and VM_DISK_ACCESS_MODES set the matching manager flags; all empty = the
+# cluster's default class and CDI StorageProfile (see docs/storage.md).
 # VCLUSTER_POD_SECURITY (baseline|restricted) sets --vcluster-pod-security.
 # NETWORK_MODE (see above) sets --network-mode; LAB_MTU sets --lab-mtu.
 NS=${ORCH_NAMESPACE:-cloudtrain-system}
 manifests() {
   kubectl kustomize "$SVC/config/default" \
-    | NS="$NS" IMG="$IMG" SEL="${SESSION_SELECTOR:-}" VMD="${VM_DISKS:-ephemeral}" PT="${PROVISION_TIMEOUT:-}" PSS="${VCLUSTER_POD_SECURITY:-}" NM="${NETWORK_MODE:-}" MTU="${LAB_MTU:-}" yq '
+    | NS="$NS" IMG="$IMG" SEL="${SESSION_SELECTOR:-}" VMD="${VM_DISKS:-ephemeral}" PT="${PROVISION_TIMEOUT:-}" PSS="${VCLUSTER_POD_SECURITY:-}" NM="${NETWORK_MODE:-}" MTU="${LAB_MTU:-}" SC="${STORAGE_CLASS:-}" HSC="${HOME_STORAGE_CLASS:-}" VSC="${VM_DISK_STORAGE_CLASS:-}" VVM="${VM_DISK_VOLUME_MODE:-}" VAM="${VM_DISK_ACCESS_MODES:-}" yq '
         (select(.kind == "Namespace") | .metadata.name) = strenv(NS) |
         (select(.metadata.namespace == "cloudtrain-system") | .metadata.namespace) = strenv(NS) |
         (select(.kind == "ClusterRole" and strenv(NS) != "cloudtrain-system") | .metadata.name) = "lab-orchestrator-" + strenv(NS) |
@@ -97,6 +101,11 @@ manifests() {
         (select(.kind == "Deployment") | .spec.template.spec.containers[0].args) += ["--leader-election-id=lab-orchestrator-" + strenv(NS)] |
         (select(.kind == "Deployment" and strenv(SEL) != "") | .spec.template.spec.containers[0].args) += ["--session-selector=" + strenv(SEL)] |
         (select(.kind == "Deployment") | .spec.template.spec.containers[0].args) += ["--vm-disks=" + strenv(VMD)] |
+        (select(.kind == "Deployment" and strenv(SC) != "") | .spec.template.spec.containers[0].args) += ["--storage-class=" + strenv(SC)] |
+        (select(.kind == "Deployment" and strenv(HSC) != "") | .spec.template.spec.containers[0].args) += ["--home-storage-class=" + strenv(HSC)] |
+        (select(.kind == "Deployment" and strenv(VSC) != "") | .spec.template.spec.containers[0].args) += ["--vm-disk-storage-class=" + strenv(VSC)] |
+        (select(.kind == "Deployment" and strenv(VVM) != "") | .spec.template.spec.containers[0].args) += ["--vm-disk-volume-mode=" + strenv(VVM)] |
+        (select(.kind == "Deployment" and strenv(VAM) != "") | .spec.template.spec.containers[0].args) += ["--vm-disk-access-modes=" + strenv(VAM)] |
         (select(.kind == "Deployment" and strenv(PT) != "") | .spec.template.spec.containers[0].args) += ["--provision-timeout=" + strenv(PT)] |
         (select(.kind == "Deployment" and strenv(PSS) != "") | .spec.template.spec.containers[0].args) += ["--vcluster-pod-security=" + strenv(PSS)] |
         (select(.kind == "Deployment" and strenv(NM) != "") | .spec.template.spec.containers[0].args) += ["--network-mode=" + strenv(NM)] |

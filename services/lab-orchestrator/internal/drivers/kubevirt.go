@@ -48,10 +48,40 @@ type VMDiskOptions struct {
 	// the disk. Otherwise VMs boot from the ephemeral containerDisk: a
 	// restart loses every change, so such VMs keep running while hibernated.
 	Persistent bool
-	// StorageClass of the root disks (empty: cluster default).
+	// StorageClass of the root and data disks (empty: cluster default).
 	StorageClass string
+	// VolumeMode of the disks: Block, Filesystem, or empty to let the CDI
+	// StorageProfile of the class choose (Block where the class supports it).
+	VolumeMode string
+	// AccessModes of the disks (default ReadWriteOnce: one VM mounts a disk,
+	// so every class supports it). Empty entries mean the default.
+	AccessModes []string
 	// Size of a root disk when the catalog entry has no diskSize.
 	Size string
+}
+
+// dvStorage renders the "storage" stanza of a DataVolume. The CDI storage API
+// completes what is left out from the class's StorageProfile, so a class that
+// is not named and a volume mode that is not set follow the cluster.
+func (o VMDiskOptions) dvStorage(size string) map[string]any {
+	modes := []any{}
+	for _, m := range o.AccessModes {
+		modes = append(modes, m)
+	}
+	if len(modes) == 0 {
+		modes = []any{"ReadWriteOnce"}
+	}
+	storage := map[string]any{
+		"accessModes": modes,
+		"resources":   map[string]any{"requests": map[string]any{"storage": size}},
+	}
+	if o.VolumeMode != "" {
+		storage["volumeMode"] = o.VolumeMode
+	}
+	if o.StorageClass != "" {
+		storage["storageClassName"] = o.StorageClass
+	}
+	return storage
 }
 
 // RootDiskName is the DataVolume (and PVC) of a VM's persistent root disk.
@@ -114,13 +144,7 @@ func buildVM(s *labsv1.LabSession, net LabNet, v vmSpec) *unstructured.Unstructu
 		if size == "" {
 			size = DefaultVMDiskSize
 		}
-		storage := map[string]any{
-			"accessModes": []any{"ReadWriteOnce"}, "volumeMode": "Filesystem",
-			"resources": map[string]any{"requests": map[string]any{"storage": size}},
-		}
-		if v.Disk.StorageClass != "" {
-			storage["storageClassName"] = v.Disk.StorageClass
-		}
+		storage := v.Disk.dvStorage(size)
 		dvLabels := map[string]any{}
 		for k, val := range v.Labels {
 			dvLabels[k] = val
@@ -151,13 +175,7 @@ func buildVM(s *labsv1.LabSession, net LabNet, v vmSpec) *unstructured.Unstructu
 			volumes = append(volumes, map[string]any{"name": name, "emptyDisk": map[string]any{"capacity": size}})
 			continue
 		}
-		storage := map[string]any{
-			"accessModes": []any{"ReadWriteOnce"}, "volumeMode": "Filesystem",
-			"resources": map[string]any{"requests": map[string]any{"storage": size}},
-		}
-		if v.Disk.StorageClass != "" {
-			storage["storageClassName"] = v.Disk.StorageClass
-		}
+		storage := v.Disk.dvStorage(size)
 		dvLabels := map[string]any{}
 		for k, val := range v.Labels {
 			dvLabels[k] = val

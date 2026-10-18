@@ -17,6 +17,7 @@ The platform runs **topologies**, not "Kubernetes scenarios". A lab is a graph o
 
 - Each lab gets an isolated Kube-OVN VPC; each topology link is an OVN logical switch, so VMs, containers and network devices share real L2 wires. Links support capture and impairment (`tc netem`).
 - Golden snapshots + per-lab identical private IPs make cloned kubeadm clusters boot in seconds.
+- Storage is class-agnostic: homes, vcluster databases and VM disks use the class given by `--storage-class` (or the cluster default); VM disks are CDI DataVolumes completed from StorageProfiles. See [storage.md](storage.md).
 - Production: self-hosted on a vCenter cluster (K8s worker VMs with nested virtualization, `vhv.enable`). Local: kind with `/dev/kvm` passed through (WSL2 has KVM).
 
 ## Services (monorepo)
