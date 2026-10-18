@@ -1,0 +1,152 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xlp-raid-status
+  title: Report and repair a RAID array's state
+  domain: linux
+  frameworks: [linuxplus:system-management]
+  difficulty: medium
+  estimatedMinutes: 6
+  tags: [exam, mdadm, raid, recovery]
+  version: 1
+spec:
+  description: |
+    **Host:** `tr-lp-01` (`ssh tr-lp-01`, then `sudo -i`)
+
+    The mirror **`/dev/md1`** lost a member disk. A blank replacement disk,
+    **`/dev/vde`**, has been fitted.
+
+    1. **First**, record the array's current state in **`/home/learner/raid-report.txt`**,
+       three lines exactly:
+
+       ```
+       state=<degraded or clean>
+       failed=<the device that failed, e.g. /dev/sdX>
+       active=<number of active devices right now>
+       ```
+    2. Then repair the array: remove the failed member, add `/dev/vde`, and wait until the
+       array is clean again with two active devices and no failed ones.
+  objectives:
+    - Read the state of a degraded RAID array
+    - Replace a failed member and let the array rebuild
+  params:
+    bad:
+      type: choice
+      values: [vdc, vdd]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-lp-01
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["1Gi", "1Gi", "1Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-lp-01
+      timeoutSec: 180
+      run: |
+        set -eu
+        for n in 1 2 3; do d=$(readlink -f /dev/disk/by-id/virtio-ct-data$n); [ "$d" = /dev/vd$(echo c d e | cut -d' ' -f$n) ]; done
+        V=/var/lib/cloudtrain; install -d -m 0700 $V
+        if ! [ -b /dev/md1 ]; then
+          mdadm --stop /dev/md1 2>/dev/null || true
+          mdadm --zero-superblock --force /dev/vdc /dev/vdd /dev/vde 2>/dev/null || true
+          wipefs -a /dev/vdc /dev/vdd /dev/vde >/dev/null
+          mdadm --create /dev/md1 --level=1 --raid-devices=2 --metadata=1.2 --run --force --assume-clean /dev/vdc /dev/vdd >/dev/null 2>&1
+        fi
+        mdadm /dev/md1 --fail /dev/{{bad}} >/dev/null
+        sleep 1
+        rm -f /home/learner/raid-report.txt
+        printf 'state=degraded\nfailed=/dev/{{bad}}\nactive=1\n' > $V/xlp-raid.report
+        mdadm --detail /dev/md1 | grep -q 'degraded'
+  checks:
+    - id: report
+      description: The report describes the degraded state, the failed disk and the active count
+      type: shell
+      on: tr-lp-01
+      skills: [linux.storage.raid]
+      weight: 1.5
+      command: |
+        [ "$(sed 's/ *$//' /home/learner/raid-report.txt 2>/dev/null)" = "$(cat /var/lib/cloudtrain/xlp-raid.report)" ] && echo correct || echo wrong
+      expect: {match: exact, value: correct}
+    - id: repaired
+      description: md1 is clean with the good disk and vde as its only members
+      type: shell
+      on: tr-lp-01
+      skills: [linux.storage.raid]
+      weight: 2.5
+      timeoutSec: 60
+      command: |
+        for i in $(seq 20); do mdadm --detail /dev/md1 2>/dev/null | grep -Eq 'recovering|resyncing' || break; sleep 2; done
+        if [ {{bad}} = vdc ]; then good=/dev/vdd; else good=/dev/vdc; fi
+        det=$(mdadm --detail /dev/md1 2>/dev/null)
+        st=$(echo "$det" | awk -F' : ' '/^ *State :/ {print $2}' | tr -d ' ')
+        act=$(echo "$det" | awk -F' : ' '/Active Devices :/ {print $2}' | tr -d ' ')
+        fl=$(echo "$det" | awk -F' : ' '/Failed Devices :/ {print $2}' | tr -d ' ')
+        mem=$(echo "$det" | awk '/active sync/ {print $NF}' | sort | paste -sd,)
+        [ "$st" = clean ] && [ "$act" = 2 ] && [ "$fl" = 0 ] && [ "$mem" = "$good,/dev/vde" ] && echo repaired || echo "state=$st active=$act failed=$fl members=$mem"
+      expect: {match: exact, value: repaired}
+    - id: bad-removed
+      description: The failed disk is no longer part of the array
+      type: shell
+      on: tr-lp-01
+      skills: [linux.storage.raid]
+      weight: 1
+      command: mdadm --detail /dev/md1 2>/dev/null | grep -q '/dev/{{bad}}' && echo still-listed || echo removed
+      expect: {match: exact, value: removed}
+  misconceptions:
+    - id: add-without-remove
+      description: Adds the new disk but leaves the failed one listed.
+      feedback: "The failed member stays in the array as faulty until it is removed: mdadm /dev/md1 --remove /dev/{{bad}} (or --remove failed), then --add."
+      expectFail: [repaired, bad-removed]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        timeoutSec: 90
+        run: |
+          printf 'state=degraded\nfailed=/dev/{{bad}}\nactive=1\n' > /home/learner/raid-report.txt
+          sudo mdadm /dev/md1 --add /dev/vde
+          sudo mdadm --wait /dev/md1 || true
+    - id: report-after
+      description: Writes the report after the repair, so it describes a healthy array.
+      feedback: "The report had to describe the degraded state first; read it with mdadm --detail before changing anything."
+      expectFail: [report]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        timeoutSec: 90
+        run: |
+          sudo mdadm /dev/md1 --remove /dev/{{bad}}
+          sudo mdadm /dev/md1 --add /dev/vde
+          sudo mdadm --wait /dev/md1 || true
+          printf 'state=clean\nfailed=none\nactive=2\n' > /home/learner/raid-report.txt
+  solution:
+    explanation: mdadm --detail shows State, the faulty member and the active count; --remove drops the faulty disk, --add brings in the replacement and the kernel rebuilds the mirror.
+    steps:
+      - on: tr-lp-01
+        as: learner
+        timeoutSec: 90
+        run: |
+          set -e
+          sudo mdadm --detail /dev/md1
+          printf 'state=degraded\nfailed=/dev/{{bad}}\nactive=1\n' > /home/learner/raid-report.txt
+          sudo mdadm /dev/md1 --remove /dev/{{bad}}
+          sudo mdadm /dev/md1 --add /dev/vde
+          sudo mdadm --wait /dev/md1 || true
+          cat /proc/mdstat
+    alternatives:
+      - id: remove-failed-keyword
+        description: Remove and add in one command with the failed keyword.
+        steps:
+          - on: tr-lp-01
+            as: learner
+            timeoutSec: 90
+            run: |
+              set -e
+              printf 'state=degraded\nfailed=/dev/{{bad}}\nactive=1\n' > /home/learner/raid-report.txt
+              sudo mdadm /dev/md1 --remove failed --add /dev/vde
+              sudo mdadm --wait /dev/md1 || true

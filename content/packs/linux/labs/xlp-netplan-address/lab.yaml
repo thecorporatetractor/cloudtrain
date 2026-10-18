@@ -1,0 +1,139 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xlp-netplan-address
+  title: Apply a persistent address to a second interface
+  domain: linux
+  frameworks: [linuxplus:system-management]
+  difficulty: medium
+  estimatedMinutes: 5
+  tags: [exam, netplan, networking, persistence]
+  version: 1
+spec:
+  description: |
+    **Host:** `tr-lp-01` (`ssh tr-lp-01`, then `sudo -i`)
+
+    The host has a secondary interface **`eth1`** for the passenger-information network.
+    It has no address yet. Configure it with **Netplan** so that it carries
+    **`{{addr}}`**, apply the configuration now, and make sure it is the same after a
+    reboot.
+
+    Do not touch `eth0`: its address and the default route must stay as they are.
+  objectives:
+    - Configure a static address for a second interface in Netplan
+    - Apply it without disturbing the management interface
+  params:
+    addr:
+      type: choice
+      values: [10.50.4.9/24, 10.60.8.17/24, 172.20.5.5/25]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-lp-01
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["1Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-lp-01
+      timeoutSec: 90
+      run: |
+        set -eu
+        # A veth pair stands in for a second NIC (the VM has one): eth1 is what the learner
+        # configures, eth1p is its always-up peer. The .netdev file recreates it at every boot.
+        # eth0 and its Netplan file are never touched.
+        printf '[NetDev]\nName=eth1\nKind=veth\n\n[Peer]\nName=eth1p\n' > /etc/systemd/network/10-tr-eth1.netdev
+        printf '[Match]\nName=eth1p\n\n[Network]\nLinkLocalAddressing=no\nConfigureWithoutCarrier=yes\n\n[Link]\nRequiredForOnline=no\n' > /etc/systemd/network/10-tr-eth1p.network
+        networkctl reload >/dev/null 2>&1 || true
+        for i in $(seq 15); do ip link show eth1 >/dev/null 2>&1 && break; sleep 1; done
+        ip link show eth1 >/dev/null 2>&1 || ip link add eth1 type veth peer name eth1p
+        ip link set eth1p up
+        # clean start: no Netplan stanza and no address for eth1
+        for f in /etc/netplan/*.yaml; do
+          [ -f "$f" ] || continue
+          python3 - "$f" <<'EOT'
+        import sys, yaml
+        p = sys.argv[1]
+        d = yaml.safe_load(open(p)) or {}
+        e = (d.get("network") or {}).get("ethernets") or {}
+        if "eth1" in e:
+            del e["eth1"]
+            yaml.safe_dump(d, open(p, "w"))
+        EOT
+        done
+        rm -f /etc/netplan/*eth1*.yaml /etc/netplan/70-netplan-set.yaml
+        ip addr flush dev eth1 || true
+        ip -br link show eth1 | grep -q eth1
+  checks:
+    - id: address-live
+      description: eth1 carries {{addr}} now
+      type: shell
+      on: tr-lp-01
+      skills: [linux.net.persistent-config]
+      weight: 1.5
+      command: ip -o -4 addr show dev eth1 scope global 2>/dev/null | awk '{print $4}' | paste -sd,
+      expect: {match: exact, value: "{{addr}}"}
+    - id: netplan-config
+      description: Netplan configures {{addr}} for eth1
+      type: shell
+      on: tr-lp-01
+      skills: [linux.net.persistent-config]
+      weight: 2
+      command: netplan get ethernets.eth1.addresses 2>/dev/null | tr -d ' \n-'
+      expect: {match: exact, value: "{{addr}}"}
+    - id: eth0-untouched
+      description: The default route still leaves through eth0
+      type: shell
+      on: tr-lp-01
+      skills: [linux.net.persistent-config]
+      weight: 1
+      command: ip route show default | awk '{for (i = 1; i <= NF; i++) if ($i == "dev") print $(i + 1)}' | sort -u | paste -sd,
+      expect: {match: exact, value: eth0}
+  misconceptions:
+    - id: ip-addr-only
+      description: Adds the address with ip addr and never writes it to Netplan.
+      feedback: "ip addr add lasts until the interface is recreated or the host reboots; the address belongs in a file under /etc/netplan, then netplan apply."
+      expectFail: [netplan-config]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        run: |
+          sudo ip addr add {{addr}} dev eth1
+          sudo ip link set eth1 up
+    - id: no-apply
+      description: Writes the Netplan file but never applies it.
+      feedback: "Netplan files do nothing until netplan apply (or a reboot) hands them to the network backend; netplan try is the safer way to test."
+      expectFail: [address-live]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        run: |
+          printf 'network:\n  version: 2\n  ethernets:\n    eth1:\n      addresses: [{{addr}}]\n' | sudo tee /etc/netplan/60-eth1.yaml >/dev/null
+          sudo chmod 0600 /etc/netplan/60-eth1.yaml
+  solution:
+    explanation: A file in /etc/netplan declares the address for eth1 and netplan apply renders it for systemd-networkd; eth0's stanza is left alone.
+    steps:
+      - on: tr-lp-01
+        as: learner
+        run: |
+          set -e
+          printf 'network:\n  version: 2\n  ethernets:\n    eth1:\n      addresses: [{{addr}}]\n' | sudo tee /etc/netplan/60-eth1.yaml >/dev/null
+          sudo chmod 0600 /etc/netplan/60-eth1.yaml
+          sudo netplan apply
+          sleep 2
+          ip -br addr show eth1
+    alternatives:
+      - id: netplan-set
+        description: Use netplan set instead of writing the file by hand.
+        steps:
+          - on: tr-lp-01
+            as: learner
+            run: |
+              set -e
+              sudo netplan set 'ethernets.eth1.addresses=[{{addr}}]'
+              sudo netplan apply
+              sleep 2

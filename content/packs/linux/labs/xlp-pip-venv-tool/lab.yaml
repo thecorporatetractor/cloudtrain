@@ -1,0 +1,141 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xlp-pip-venv-tool
+  title: Install a tool in a virtual environment from the offline index
+  domain: linux
+  frameworks: [linuxplus:services-users]
+  difficulty: easy
+  estimatedMinutes: 4
+  tags: [exam, python, venv, pip]
+  version: 1
+spec:
+  description: |
+    **Host:** `tr-lp-01` (a shell is open on it; you have `sudo`)
+
+    The timetable team wants the YAML linter **`yamllint`** available to their build
+    scripts, but it must not be installed system-wide. The host has no internet access;
+    `pip` is already configured to use the offline package index.
+
+    1. Create a virtual environment at **`{{venv}}`** that does **not** use the system
+       site-packages.
+    2. Install **`yamllint` version `1.38.0`** (exactly that version) into it.
+    3. The system Python must stay clean: `import yamllint` must fail outside the
+       environment.
+
+    The directory `/opt/tooling` already exists and belongs to you.
+  objectives:
+    - Create an isolated virtual environment
+    - Install an exact package version from an index
+  params:
+    venv:
+      type: choice
+      values: [/opt/tooling/lint-env, /opt/tooling/yaml-env]
+  topology:
+    entry: tr-lp-01
+    nodes:
+      - name: tr-lp-01
+        driver: container
+        image: deb-lab:24.04
+        access: [shell]
+        learnerSudo: true
+  setup:
+    - on: tr-lp-01
+      timeoutSec: 90
+      run: |
+        set -eu
+        echo 'learner ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/learner && chmod 0440 /etc/sudoers.d/learner
+        rm -rf /opt/tooling; install -d -o learner -g learner /opt/tooling
+        pip3 uninstall -y --break-system-packages yamllint >/dev/null 2>&1 || true
+        ! python3 -c 'import yamllint' 2>/dev/null
+        python3 -m venv --help >/dev/null
+  checks:
+    - id: venv
+      description: "{{venv}} is a virtual environment"
+      type: shell
+      on: tr-lp-01
+      skills: [linux.packages.language-envs]
+      weight: 1
+      command: '[ -x {{venv}}/bin/python ] && [ -f {{venv}}/pyvenv.cfg ] && echo venv || echo no-venv'
+      expect: {match: exact, value: venv}
+    - id: isolated
+      description: It does not use the system site-packages
+      type: shell
+      on: tr-lp-01
+      skills: [linux.packages.language-envs]
+      weight: 1
+      command: |
+        [ -f {{venv}}/pyvenv.cfg ] || { echo no-venv; exit 0; }
+        grep -Eiq '^include-system-site-packages *= *false' {{venv}}/pyvenv.cfg && echo isolated || echo shares-system
+      expect: {match: exact, value: isolated}
+    - id: version
+      description: yamllint 1.38.0 is installed in the environment
+      type: shell
+      on: tr-lp-01
+      skills: [linux.packages.language-envs]
+      weight: 2
+      command: |
+        [ -x {{venv}}/bin/python ] || { echo no-venv; exit 0; }
+        {{venv}}/bin/python -m pip list --format=freeze 2>/dev/null | grep -i '^yamllint==' || echo missing
+      expect: {match: exact, value: "yamllint==1.38.0"}
+    - id: runs
+      description: The tool runs from the environment
+      type: shell
+      on: tr-lp-01
+      skills: [linux.packages.language-envs]
+      weight: 1
+      command: '{{venv}}/bin/yamllint --version 2>&1 | head -1'
+      expect: {match: exact, value: "yamllint 1.38.0"}
+    - id: system-clean
+      description: The system Python does not have yamllint
+      type: shell
+      on: tr-lp-01
+      skills: [linux.packages.language-envs]
+      weight: 1.5
+      command: python3 -c 'import yamllint' 2>/dev/null && echo polluted || echo clean
+      expect: {match: exact, value: clean}
+  misconceptions:
+    - id: system-install
+      description: Installs yamllint into the system Python with --break-system-packages.
+      feedback: "That changes the system interpreter for everybody; python3 -m venv PATH, then PATH/bin/pip install yamllint==VERSION keeps it contained."
+      expectFail: [venv, isolated, version, runs, system-clean]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        timeoutSec: 90
+        run: sudo pip3 install --break-system-packages yamllint==1.38.0
+    - id: shares-system
+      description: Creates the environment with --system-site-packages.
+      feedback: "--system-site-packages lets the environment see the system's libraries; the default (no flag) gives an isolated one."
+      expectFail: [isolated]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        timeoutSec: 90
+        run: |
+          set -e
+          python3 -m venv --system-site-packages {{venv}}
+          {{venv}}/bin/python -m pip install -q yamllint==1.38.0
+  solution:
+    explanation: python3 -m venv builds an isolated environment; its own pip installs the pinned version, so the system interpreter is never touched.
+    steps:
+      - on: tr-lp-01
+        as: learner
+        timeoutSec: 90
+        run: |
+          set -e
+          python3 -m venv {{venv}}
+          {{venv}}/bin/pip install -q yamllint==1.38.0
+          {{venv}}/bin/yamllint --version
+    alternatives:
+      - id: activate
+        description: Activate the environment and use its pip.
+        steps:
+          - on: tr-lp-01
+            as: learner
+            timeoutSec: 90
+            run: |
+              set -e
+              python3 -m venv {{venv}}
+              . {{venv}}/bin/activate
+              python -m pip install -q 'yamllint==1.38.0'

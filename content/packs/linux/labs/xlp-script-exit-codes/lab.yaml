@@ -1,0 +1,155 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xlp-script-exit-codes
+  title: Make a script return meaningful exit codes
+  domain: linux
+  frameworks: [linuxplus:automation-scripting]
+  difficulty: easy
+  estimatedMinutes: 5
+  tags: [exam, bash, exit-codes, monitoring]
+  version: 1
+spec:
+  description: |
+    **Host:** `tr-lp-01` (a shell is open on it)
+
+    The monitoring system runs **`/home/learner/bin/pis-health`** and decides what to do
+    from its exit status, but the script always exits 0. Change it so that, besides
+    printing the state word it prints today, it exits with:
+
+    - **0** when the state is `OK` (the feed `{{svc}}` is running and its queue
+      `/var/spool/tr-pis/queue` has fewer than {{limit}} lines);
+    - **1** when the state is `DEGRADED` (the feed runs and the queue has {{limit}} lines
+      or more);
+    - **2** when the state is `DOWN` (the feed is not running).
+
+    Do not change what the script prints.
+  objectives:
+    - Return different exit statuses from a script
+    - Read the exit status of a command with $?
+  params:
+    svc:
+      type: choice
+      values: [tr-pis-feed, tr-gate-feed]
+    limit:
+      type: choice
+      values: ["100", "250"]
+  topology:
+    entry: tr-lp-01
+    nodes:
+      - name: tr-lp-01
+        driver: container
+        image: deb-lab:24.04
+        access: [shell]
+  setup:
+    - on: tr-lp-01
+      run: |
+        set -eu
+        install -d -o learner -g learner /home/learner/bin
+        install -d -m 0755 /var/spool/tr-pis
+        rm -f /usr/local/bin/tr-pis-feed /usr/local/bin/tr-gate-feed
+        ln -s /bin/sleep /usr/local/bin/{{svc}}
+        pkill -x {{svc}} 2>/dev/null || true
+        seq 1 7 > /var/spool/tr-pis/queue; chown root:root /var/spool/tr-pis/queue; chmod 0644 /var/spool/tr-pis/queue
+        setsid -f /usr/local/bin/{{svc}} 100000 </dev/null >/dev/null 2>&1
+        sleep 1
+        pgrep -x {{svc}} >/dev/null
+        cat > /home/learner/bin/pis-health <<'EOT'
+        #!/bin/bash
+        # pis-health: report the state of the passenger-information feed.
+        #   OK        the feed is running and the queue has fewer than {{limit}} lines
+        #   DEGRADED  the feed is running and the queue has {{limit}} lines or more
+        #   DOWN      the feed is not running
+        q=/var/spool/tr-pis/queue
+        if pgrep -x {{svc}} >/dev/null; then
+          n=$(wc -l < $q)
+          if [ "$n" -ge {{limit}} ]; then
+            echo DEGRADED
+          else
+            echo OK
+          fi
+        else
+          echo DOWN
+        fi
+        exit 0
+        EOT
+        chown learner:learner /home/learner/bin/pis-health; chmod 0755 /home/learner/bin/pis-health
+  checks:
+    - id: ok-state
+      description: Running feed, short queue (one line below the limit) prints OK and exits 0
+      type: shell
+      on: tr-lp-01
+      skills: [linux.shell.scripting]
+      weight: 1
+      timeoutSec: 20
+      command: |
+        pgrep -x {{svc}} >/dev/null || setsid -f /usr/local/bin/{{svc}} 100000 </dev/null >/dev/null 2>&1
+        sleep 0.5
+        seq 1 $(( {{limit}} - 1 )) > /var/spool/tr-pis/.q.$$ && mv -f /var/spool/tr-pis/.q.$$ /var/spool/tr-pis/queue
+        out=$(su learner -c /home/learner/bin/pis-health 2>/dev/null); rc=$?
+        seq 1 7 > /var/spool/tr-pis/.q.$$ && mv -f /var/spool/tr-pis/.q.$$ /var/spool/tr-pis/queue
+        echo "$out rc=$rc"
+      expect: {match: exact, value: "OK rc=0"}
+    - id: degraded-state
+      description: Running feed, queue at the limit prints DEGRADED and exits 1
+      type: shell
+      on: tr-lp-01
+      skills: [linux.shell.scripting]
+      weight: 1.5
+      timeoutSec: 20
+      command: |
+        pgrep -x {{svc}} >/dev/null || setsid -f /usr/local/bin/{{svc}} 100000 </dev/null >/dev/null 2>&1
+        sleep 0.5
+        seq 1 {{limit}} > /var/spool/tr-pis/.q.$$ && mv -f /var/spool/tr-pis/.q.$$ /var/spool/tr-pis/queue
+        out=$(su learner -c /home/learner/bin/pis-health 2>/dev/null); rc=$?
+        seq 1 7 > /var/spool/tr-pis/.q.$$ && mv -f /var/spool/tr-pis/.q.$$ /var/spool/tr-pis/queue
+        echo "$out rc=$rc"
+      expect: {match: exact, value: "DEGRADED rc=1"}
+    - id: down-state
+      description: Stopped feed prints DOWN and exits 2
+      type: shell
+      on: tr-lp-01
+      skills: [linux.shell.scripting]
+      weight: 1.5
+      timeoutSec: 20
+      command: |
+        pkill -x {{svc}} 2>/dev/null; sleep 0.5
+        out=$(su learner -c /home/learner/bin/pis-health 2>/dev/null); rc=$?
+        setsid -f /usr/local/bin/{{svc}} 100000 </dev/null >/dev/null 2>&1
+        echo "$out rc=$rc"
+      expect: {match: exact, value: "DOWN rc=2"}
+  misconceptions:
+    - id: swapped-codes
+      description: Returns 1 for DOWN and 2 for DEGRADED.
+      feedback: "The documented order is 0 OK, 1 DEGRADED, 2 DOWN; the monitoring system maps 2 to a page."
+      expectFail: [degraded-state, down-state]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        run: |
+          sed -i 's/echo DEGRADED/echo DEGRADED; exit 2/; s/echo DOWN/echo DOWN; exit 1/' /home/learner/bin/pis-health
+    - id: only-down
+      description: Sets an exit status for DOWN only; DEGRADED still exits 0.
+      feedback: "Every non-OK branch needs its own exit status; the final exit 0 hides the others."
+      expectFail: [degraded-state]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        run: |
+          sed -i 's/echo DOWN/echo DOWN; exit 2/' /home/learner/bin/pis-health
+  solution:
+    explanation: Put an exit with the right status after each echo (or store the status in a variable and exit with it once at the end); the trailing exit 0 must go.
+    steps:
+      - on: tr-lp-01
+        as: learner
+        run: |
+          sed -i 's/echo DEGRADED/echo DEGRADED; exit 1/; s/echo DOWN/echo DOWN; exit 2/; s/echo OK/echo OK; exit 0/' /home/learner/bin/pis-health
+          /home/learner/bin/pis-health; echo "status $?"
+    alternatives:
+      - id: variable
+        description: Keep the status in a variable and exit once at the end.
+        steps:
+          - on: tr-lp-01
+            as: learner
+            run: |
+              sed -i 's/echo DEGRADED/echo DEGRADED; rc=1/; s/echo DOWN/echo DOWN; rc=2/; s/echo OK/echo OK; rc=0/; s/^exit 0$/exit $rc/' /home/learner/bin/pis-health

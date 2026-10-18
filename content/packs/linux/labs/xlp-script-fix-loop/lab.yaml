@@ -1,0 +1,199 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xlp-script-fix-loop
+  title: Fix a broken loop in a provided script
+  domain: linux
+  frameworks: [linuxplus:automation-scripting]
+  difficulty: medium
+  estimatedMinutes: 6
+  tags: [exam, bash, loops, debugging]
+  version: 1
+spec:
+  description: |
+    **Host:** `tr-lp-01` (a shell is open on it)
+
+    The script **`/home/learner/bin/fare-totals.sh`** turns a list of fares into a report,
+    but it mishandles its input. Run as `fare-totals.sh INPUT OUTPUT`, it must read
+    `INPUT`, which holds one `route,fare` pair per line (route names can contain
+    spaces; the fare is a whole number of pence), and write `OUTPUT` with:
+
+    - one line `route: fare` for every pair, in input order;
+    - a last line `{{label}}: <sum of all fares>`.
+
+    Blank lines and lines starting with `#` are ignored. The last line of an input file
+    may have no newline at the end, and it still counts. A sample input is in
+    `/home/learner/sample-fares.csv`.
+
+    Fix the script so it does this for every input. Keep the name and the two arguments.
+  objectives:
+    - Read a file line by line with a while-read loop
+    - Keep a running total outside a pipeline subshell
+    - Handle spaces and a missing final newline
+  params:
+    label:
+      type: choice
+      values: [total, sum]
+  topology:
+    entry: tr-lp-01
+    nodes:
+      - name: tr-lp-01
+        driver: container
+        image: deb-lab:24.04
+        access: [shell]
+  setup:
+    - on: tr-lp-01
+      run: |
+        set -eu
+        V=/var/lib/cloudtrain; install -d -m 0700 $V
+        install -d -o learner -g learner /home/learner/bin
+        cat > /home/learner/bin/fare-totals.sh <<'EOT'
+        #!/bin/bash
+        # fare-totals.sh INPUT OUTPUT: report of fares per route, with a total
+        in=$1
+        out=$2
+        total=0
+        : > "$out"
+        for line in $(cat "$in"); do
+          route=${line%%,*}
+          fare=${line##*,}
+          echo "$route: $fare" >> "$out"
+          total=$((total + fare))
+        done
+        echo "{{label}}: $total" >> "$out"
+        EOT
+        chown learner:learner /home/learner/bin/fare-totals.sh; chmod 0755 /home/learner/bin/fare-totals.sh
+        printf '# fares, pence\nAshby Junction,320\nCoast & Valley Link,180\n\nMarsh Road (peak),450\nBramwell,95\n' > /home/learner/sample-fares.csv
+        chown learner:learner /home/learner/sample-fares.csv
+        # hidden cases: A has comments, a blank line and spaces; B has no newline at the end
+        printf '# autumn fares\nCorran Quay,210\nDunmere Parkway,75\n\n# peak\nElsford Parkway North,640\nFenwick,130\n' > $V/xlp-loop.a.in
+        printf 'Gale Street,55\n\nHarlow Heath Halt,300\nIvel Bridge,1200\nJarrow Cross Road,40' > $V/xlp-loop.b.in
+        for c in a b; do
+          awk -F, -v l='{{label}}' 'NF && $0 !~ /^#/ {print $1 ": " $2; s += $2} END {print l ": " s + 0}' $V/xlp-loop.$c.in > $V/xlp-loop.$c.out
+        done
+  checks:
+    - id: lines
+      description: Case A has one correct line per route
+      type: shell
+      on: tr-lp-01
+      skills: [linux.shell.scripting]
+      weight: 1.5
+      timeoutSec: 20
+      command: |
+        w=$(mktemp -d); chmod 0711 $w; d=$(mktemp -d); chmod 0777 $d
+        cp /var/lib/cloudtrain/xlp-loop.a.in $w/in; chmod 0644 $w/in
+        timeout 10 su learner -c "/home/learner/bin/fare-totals.sh $w/in $d/out" >/dev/null 2>&1 </dev/null
+        su learner -c "cat $d/out" > $w/got 2>/dev/null </dev/null
+        grep -v '^{{label}}: ' $w/got > $w/g2; grep -v '^{{label}}: ' /var/lib/cloudtrain/xlp-loop.a.out > $w/want
+        cmp -s $w/g2 $w/want && echo correct || echo wrong
+        rm -rf $d $w
+      expect: {match: exact, value: correct}
+    - id: total
+      description: Case A ends with the correct total
+      type: shell
+      on: tr-lp-01
+      skills: [linux.shell.scripting]
+      weight: 1.5
+      timeoutSec: 20
+      command: |
+        w=$(mktemp -d); chmod 0711 $w; d=$(mktemp -d); chmod 0777 $d
+        cp /var/lib/cloudtrain/xlp-loop.a.in $w/in; chmod 0644 $w/in
+        timeout 10 su learner -c "/home/learner/bin/fare-totals.sh $w/in $d/out" >/dev/null 2>&1 </dev/null
+        su learner -c "cat $d/out" > $w/got 2>/dev/null </dev/null
+        [ "$(tail -n 1 $w/got)" = "$(tail -n 1 /var/lib/cloudtrain/xlp-loop.a.out)" ] && echo correct || echo "got=$(tail -n 1 $w/got)"
+        rm -rf $d $w
+      expect: {match: exact, value: correct}
+    - id: last-line
+      description: Case B (no newline at the end) is reported completely
+      type: shell
+      on: tr-lp-01
+      skills: [linux.shell.scripting]
+      weight: 2
+      timeoutSec: 20
+      command: |
+        w=$(mktemp -d); chmod 0711 $w; d=$(mktemp -d); chmod 0777 $d
+        cp /var/lib/cloudtrain/xlp-loop.b.in $w/in; chmod 0644 $w/in
+        timeout 10 su learner -c "/home/learner/bin/fare-totals.sh $w/in $d/out" >/dev/null 2>&1 </dev/null
+        su learner -c "cat $d/out" > $w/got 2>/dev/null </dev/null
+        cmp -s $w/got /var/lib/cloudtrain/xlp-loop.b.out && echo correct || echo wrong
+        rm -rf $d $w
+      expect: {match: exact, value: correct}
+  misconceptions:
+    - id: subshell-total
+      description: Pipes the file into the loop, so the total is lost when the loop's subshell ends.
+      feedback: "A while loop on the right of a pipe runs in a subshell and its variables vanish; redirect the file into the loop (done < \"$in\") instead of cat | while."
+      expectFail: [total, last-line]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        run: |
+          cat > /home/learner/bin/fare-totals.sh <<'EOT'
+          #!/bin/bash
+          in=$1
+          out=$2
+          total=0
+          : > "$out"
+          cat "$in" | while IFS=, read -r route fare; do
+            [ -z "$route" ] && continue
+            case $route in \#*) continue;; esac
+            echo "$route: $fare" >> "$out"
+            total=$((total + fare))
+          done
+          echo "{{label}}: $total" >> "$out"
+          EOT
+    - id: lost-last-line
+      description: Uses while read without handling a final line that has no newline.
+      feedback: "read returns failure on a last line without a newline, so the body never runs for it; test the variable as well: while read -r x || [ -n \"$x\" ]."
+      expectFail: [last-line]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        run: |
+          cat > /home/learner/bin/fare-totals.sh <<'EOT'
+          #!/bin/bash
+          in=$1
+          out=$2
+          total=0
+          : > "$out"
+          while IFS=, read -r route fare; do
+            [ -z "$route" ] && continue
+            case $route in \#*) continue;; esac
+            echo "$route: $fare" >> "$out"
+            total=$((total + fare))
+          done < "$in"
+          echo "{{label}}: $total" >> "$out"
+          EOT
+  solution:
+    explanation: Read the file with a while loop that splits on commas, skips blank and comment lines, also runs for an unterminated last line, and keeps the total in the main shell by redirecting the file into the loop.
+    steps:
+      - on: tr-lp-01
+        as: learner
+        run: |
+          cat > /home/learner/bin/fare-totals.sh <<'EOT'
+          #!/bin/bash
+          in=$1
+          out=$2
+          total=0
+          : > "$out"
+          while IFS=, read -r route fare || [ -n "$route" ]; do
+            [ -z "$route" ] && continue
+            case $route in \#*) continue;; esac
+            echo "$route: $fare" >> "$out"
+            total=$((total + fare))
+          done < "$in"
+          echo "{{label}}: $total" >> "$out"
+          EOT
+          chmod 0755 /home/learner/bin/fare-totals.sh
+          /home/learner/bin/fare-totals.sh /home/learner/sample-fares.csv /tmp/sample-out.txt && cat /tmp/sample-out.txt
+    alternatives:
+      - id: awk
+        description: Rewrite the body with awk.
+        steps:
+          - on: tr-lp-01
+            as: learner
+            run: |
+              cat > /home/learner/bin/fare-totals.sh <<'EOT'
+              #!/bin/bash
+              awk -F, 'NF && $0 !~ /^#/ {print $1 ": " $2; s += $2} END {print "{{label}}: " s + 0}' "$1" > "$2"
+              EOT
+              chmod 0755 /home/learner/bin/fare-totals.sh

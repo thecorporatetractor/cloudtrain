@@ -1,0 +1,134 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xlp-systemd-enable-mask
+  title: Set the requested states of three units
+  domain: linux
+  frameworks: [linuxplus:services-users]
+  difficulty: easy
+  estimatedMinutes: 4
+  tags: [exam, systemd, units, mask]
+  version: 1
+spec:
+  description: |
+    **Host:** `tr-lp-01` (`ssh tr-lp-01`, then `sudo -i`)
+
+    Three feed services were installed by the vendor. Leave them in these states, which
+    must also hold after a reboot:
+
+    - **`tr-{{e}}.service`**: **enabled** (it starts at boot).
+    - **`tr-{{d}}.service`**: **disabled** (it does not start at boot, but it may still
+      be started by hand).
+    - **`tr-{{m}}.service`**: **masked** and **not running** (nothing can start it, not
+      even another unit).
+  objectives:
+    - Enable, disable and mask systemd units
+    - Know the difference between disable and mask
+  params:
+    e:
+      type: choice
+      values: [fares-sync, ticket-sync]
+    d:
+      type: choice
+      values: [pis-feed, board-feed]
+    m:
+      type: choice
+      values: [gate-poll, door-poll]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-lp-01
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["1Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-lp-01
+      timeoutSec: 90
+      run: |
+        set -eu
+        for u in {{e}} {{d}} {{m}}; do
+          systemctl unmask tr-$u.service 2>/dev/null || true
+          systemctl disable --now tr-$u.service 2>/dev/null || true
+          rm -f /etc/systemd/system/tr-$u.service /usr/lib/systemd/system/tr-$u.service
+          printf '[Unit]\nDescription=Tallowmere %s feed\n[Service]\nExecStart=/bin/sleep infinity\n[Install]\nWantedBy=multi-user.target\n' $u > /usr/lib/systemd/system/tr-$u.service
+        done
+        systemctl daemon-reload
+        # start state: the one to enable is disabled; the other two are enabled and running
+        systemctl enable --now tr-{{d}}.service tr-{{m}}.service >/dev/null 2>&1
+        systemctl is-enabled tr-{{d}}.service tr-{{m}}.service >/dev/null
+        systemctl is-active tr-{{m}}.service >/dev/null
+  checks:
+    - id: enabled-unit
+      description: tr-{{e}} is enabled
+      type: shell
+      on: tr-lp-01
+      skills: [linux.systemd.units]
+      weight: 1
+      command: systemctl is-enabled tr-{{e}}.service 2>&1 | head -1
+      expect: {match: exact, value: enabled}
+    - id: disabled-unit
+      description: tr-{{d}} is disabled (and not masked)
+      type: shell
+      on: tr-lp-01
+      skills: [linux.systemd.units]
+      weight: 1
+      command: systemctl is-enabled tr-{{d}}.service 2>&1 | head -1
+      expect: {match: exact, value: disabled}
+    - id: masked-unit
+      description: tr-{{m}} is masked and not running
+      type: shell
+      on: tr-lp-01
+      skills: [linux.systemd.units]
+      weight: 2
+      command: echo "$(systemctl is-enabled tr-{{m}}.service 2>&1 | head -1) $(systemctl is-active tr-{{m}}.service 2>&1 | head -1)"
+      expect: {match: exact, value: masked inactive}
+  misconceptions:
+    - id: disable-not-mask
+      description: Disables the unit that had to be masked.
+      feedback: "A disabled unit can still be started by hand or pulled in by a dependency; systemctl mask --now links it to /dev/null so nothing can start it."
+      expectFail: [masked-unit]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        run: |
+          sudo systemctl enable tr-{{e}}.service
+          sudo systemctl disable --now tr-{{d}}.service
+          sudo systemctl disable --now tr-{{m}}.service
+    - id: stop-not-disable
+      description: Stops the unit that had to be disabled but leaves it enabled.
+      feedback: "systemctl stop only ends the running process; the enable symlink stays and the unit starts again at boot. Use disable (or disable --now)."
+      expectFail: [disabled-unit]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        run: |
+          sudo systemctl enable tr-{{e}}.service
+          sudo systemctl stop tr-{{d}}.service
+          sudo systemctl mask --now tr-{{m}}.service
+  solution:
+    explanation: enable and disable add or remove the boot symlinks; mask replaces the unit with a link to /dev/null, and --now also stops a running instance.
+    steps:
+      - on: tr-lp-01
+        as: learner
+        run: |
+          set -e
+          sudo systemctl enable tr-{{e}}.service
+          sudo systemctl disable tr-{{d}}.service
+          sudo systemctl mask --now tr-{{m}}.service
+    alternatives:
+      - id: stop-then-mask
+        description: Stop the unit first, then mask it; disable --now for the second.
+        steps:
+          - on: tr-lp-01
+            as: learner
+            run: |
+              set -e
+              sudo systemctl enable --now tr-{{e}}.service
+              sudo systemctl disable --now tr-{{d}}.service
+              sudo systemctl stop tr-{{m}}.service
+              sudo systemctl mask tr-{{m}}.service

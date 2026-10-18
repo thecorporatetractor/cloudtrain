@@ -1,0 +1,152 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xlp-lvm-extend-vg
+  title: Extend a volume group and logical volume
+  domain: linux
+  frameworks: [linuxplus:system-management]
+  difficulty: medium
+  estimatedMinutes: 6
+  tags: [exam, lvm, xfs, resize]
+  version: 1
+spec:
+  description: |
+    **Host:** `tr-lp-01` (`ssh tr-lp-01`, then `sudo -i`)
+
+    The volume group **`vgfleet`** holds one logical volume, **`lvfleet`** (XFS, mounted at
+    `/srv/fleet`), and has no free space left. The unused disk
+    **`/dev/disk/by-id/virtio-ct-data2`** is available.
+
+    Add that disk to `vgfleet`, then grow **`lvfleet` by {{grow}} MiB** and its filesystem
+    with it, while it stays mounted. Do not give the volume more than the {{grow}} MiB.
+  objectives:
+    - Add a physical volume to a volume group
+    - Grow a logical volume and its XFS filesystem online
+  params:
+    grow:
+      type: choice
+      values: ["200", "300", "400"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-lp-01
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["1Gi", "1Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-lp-01
+      timeoutSec: 180
+      run: |
+        set -eu
+        [ "$(readlink -f /dev/disk/by-id/virtio-ct-data1)" = /dev/vdc ]
+        [ "$(readlink -f /dev/disk/by-id/virtio-ct-data2)" = /dev/vdd ]
+        V=/var/lib/cloudtrain; install -d -m 0700 $V
+        if ! vgs vgfleet >/dev/null 2>&1; then
+          wipefs -a /dev/vdc /dev/vdd >/dev/null
+          pvcreate -q -y /dev/vdc; vgcreate -q vgfleet /dev/vdc
+          lvcreate -q -y -n lvfleet -l 100%FREE vgfleet
+          mkfs.xfs -q /dev/vgfleet/lvfleet
+          mkdir -p /srv/fleet
+          echo '/dev/vgfleet/lvfleet /srv/fleet xfs defaults 0 0' >> /etc/fstab
+          systemctl daemon-reload; mount /srv/fleet
+          seq 1 3000 | sed 's/^/unit /' > /srv/fleet/units.txt
+          sha256sum /srv/fleet/units.txt > $V/xlp-fleet.sha
+          lvs --noheadings --units m --nosuffix -o lv_size vgfleet/lvfleet | tr -d ' ' | cut -d. -f1 > $V/xlp-fleet.lv
+          df -B1M --output=size /srv/fleet | tail -1 | tr -d ' ' > $V/xlp-fleet.fs
+          awk '$5 == "/srv/fleet" {print $1}' /proc/self/mountinfo > $V/xlp-fleet.mountid
+        fi
+        [ "$(vgs --noheadings -o vg_free_count vgfleet | tr -d ' ')" = 0 ]
+  checks:
+    - id: both-disks
+      description: vgfleet spans both disks
+      type: shell
+      on: tr-lp-01
+      skills: [linux.storage.lvm]
+      weight: 1
+      command: for d in $(pvs --noheadings -o pv_name -S vg_name=vgfleet 2>/dev/null); do readlink -f $d; done | sort | paste -sd,
+      expect: {match: exact, value: "/dev/vdc,/dev/vdd"}
+    - id: lv-size
+      description: lvfleet grew by exactly {{grow}} MiB
+      type: shell
+      on: tr-lp-01
+      skills: [linux.storage.lvm]
+      weight: 2
+      command: |
+        now=$(lvs --noheadings --units m --nosuffix -o lv_size vgfleet/lvfleet 2>/dev/null | tr -d ' ' | cut -d. -f1)
+        was=$(cat /var/lib/cloudtrain/xlp-fleet.lv)
+        d=$(( ${now:-0} - was ))
+        [ $d -ge $(( {{grow}} - 4 )) ] && [ $d -le $(( {{grow}} + 4 )) ] && echo grown || echo "delta=$d"
+      expect: {match: exact, value: grown}
+    - id: fs-size
+      description: The XFS filesystem uses the new space
+      type: shell
+      on: tr-lp-01
+      skills: [linux.storage.lvm]
+      weight: 2
+      command: |
+        now=$(df -B1M --output=size /srv/fleet 2>/dev/null | tail -1 | tr -d ' ')
+        was=$(cat /var/lib/cloudtrain/xlp-fleet.fs)
+        d=$(( ${now:-0} - was ))
+        [ $d -ge $(( {{grow}} - 12 )) ] && [ $d -le $(( {{grow}} + 4 )) ] && echo grown || echo "delta=$d"
+      expect: {match: exact, value: grown}
+    - id: data-mounted
+      description: The data is intact and /srv/fleet stayed on the same mount
+      type: shell
+      on: tr-lp-01
+      skills: [linux.storage.lvm]
+      weight: 1
+      command: |
+        [ "$(awk '$5 == "/srv/fleet" {print $1}' /proc/self/mountinfo)" = "$(cat /var/lib/cloudtrain/xlp-fleet.mountid)" ] && sha256sum -c --quiet /var/lib/cloudtrain/xlp-fleet.sha >/dev/null 2>&1 && echo intact || echo damaged
+      expect: {match: exact, value: intact}
+  misconceptions:
+    - id: lv-only
+      description: Extends the logical volume but not the filesystem.
+      feedback: "df still shows the old size: the XFS filesystem does not grow by itself. xfs_growfs /srv/fleet (or lvextend -r) does it."
+      expectFail: [fs-size]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        run: |
+          set -e
+          sudo pvcreate -q -y /dev/disk/by-id/virtio-ct-data2
+          sudo vgextend -q vgfleet /dev/disk/by-id/virtio-ct-data2
+          sudo lvextend -q -L +{{grow}}M vgfleet/lvfleet
+    - id: takes-all-free
+      description: Gives the volume all the new space instead of the requested size.
+      feedback: "The task asked for exactly {{grow}} MiB; use -L +{{grow}}M rather than -l +100%FREE."
+      expectFail: [lv-size, fs-size]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        run: |
+          set -e
+          sudo pvcreate -q -y /dev/disk/by-id/virtio-ct-data2
+          sudo vgextend -q vgfleet /dev/disk/by-id/virtio-ct-data2
+          sudo lvextend -q -r -l +100%FREE vgfleet/lvfleet
+  solution:
+    explanation: pvcreate and vgextend bring the disk into the group; lvextend -r grows the volume by the requested size and runs xfs_growfs on the mounted filesystem.
+    steps:
+      - on: tr-lp-01
+        as: learner
+        run: |
+          set -e
+          sudo pvcreate -y /dev/disk/by-id/virtio-ct-data2
+          sudo vgextend vgfleet /dev/disk/by-id/virtio-ct-data2
+          sudo lvextend -r -L +{{grow}}M vgfleet/lvfleet
+    alternatives:
+      - id: two-steps
+        description: Grow the volume, then the filesystem with xfs_growfs.
+        steps:
+          - on: tr-lp-01
+            as: learner
+            run: |
+              set -e
+              sudo pvcreate -y /dev/vdd
+              sudo vgextend vgfleet /dev/vdd
+              sudo lvextend -L +{{grow}}M vgfleet/lvfleet
+              sudo xfs_growfs /srv/fleet

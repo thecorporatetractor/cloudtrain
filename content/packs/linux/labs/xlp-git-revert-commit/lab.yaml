@@ -1,0 +1,147 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xlp-git-revert-commit
+  title: Revert a bad commit and push
+  domain: linux
+  frameworks: [linuxplus:automation-scripting]
+  difficulty: medium
+  estimatedMinutes: 5
+  tags: [exam, git, revert]
+  version: 1
+spec:
+  description: |
+    **Host:** `tr-lp-01` (a shell is open on it; work as `learner`)
+
+    The signalling configuration lives in the repository **`/srv/git/tt-config.git`**
+    (branch `main`). One earlier commit set **`{{key}}`** to `0` in `signalling.conf` and
+    trains stopped moving. Other, good commits were made before and after it.
+
+    Clone the repository, **revert only that commit** (do not rewrite history or reset
+    anything) and **push the result to `main`**. The good changes made after the bad
+    commit must stay.
+  objectives:
+    - Find the commit that introduced a change
+    - Undo it with git revert and push without rewriting history
+  params:
+    key:
+      type: choice
+      values: [signal_timeout, headway_seconds]
+  topology:
+    entry: tr-lp-01
+    nodes:
+      - name: tr-lp-01
+        driver: container
+        image: deb-lab:24.04
+        access: [shell]
+  setup:
+    - on: tr-lp-01
+      timeoutSec: 180
+      run: |
+        set -eu
+        command -v git >/dev/null || { apt-get update -q >/dev/null; DEBIAN_FRONTEND=noninteractive apt-get install -y -q git >/dev/null; }
+        V=/var/lib/cloudtrain; install -d -m 0700 $V
+        R=/srv/git/tt-config.git; rm -rf /srv/git /home/learner/tt-config; mkdir -p /srv/git
+        git init -q --bare -b main $R
+        w=$(mktemp -d); g="git -C $w -c user.name=Signalling -c user.email=signalling@tallowmere.example"
+        git -C $w init -q -b main
+        conf() { printf 'signal_timeout=%s\nheadway_seconds=%s\ndwell_limit=%s\ndepot_timeout=%s\n' "$1" "$2" "$3" "$4"; }
+        t=1700000000
+        commit() { GIT_AUTHOR_DATE="@$t +0000" GIT_COMMITTER_DATE="@$t +0000" $g commit -q -am "$1"; t=$((t + 3600)); }
+        conf 30 120 45 300 > $w/signalling.conf; $g add signalling.conf
+        GIT_AUTHOR_DATE="@$t +0000" GIT_COMMITTER_DATE="@$t +0000" $g commit -q -m "Initial signalling settings"; t=$((t + 3600))
+        conf 30 120 60 300 > $w/signalling.conf; commit "Raise platform dwell limit"
+        if [ {{key}} = signal_timeout ]; then conf 0 120 60 300 > $w/signalling.conf; else conf 30 0 60 300 > $w/signalling.conf; fi
+        commit "Tidy signalling settings"
+        bad=$($g rev-parse HEAD)
+        if [ {{key}} = signal_timeout ]; then conf 0 120 60 600 > $w/signalling.conf; else conf 30 0 60 600 > $w/signalling.conf; fi
+        commit "Lengthen depot timeout"
+        $g push -q $R main
+        git --git-dir=$R rev-parse main > $V/xlp-git.tip
+        echo $bad > $V/xlp-git.bad
+        conf 30 120 60 600 > $V/xlp-git.want
+        rm -rf $w
+        chown -R learner:learner /srv/git
+        printf '[user]\n\tname = Learner\n\temail = learner@tallowmere.example\n' > /home/learner/.gitconfig; chown learner:learner /home/learner/.gitconfig
+  checks:
+    - id: config-restored
+      description: main has the good settings, including the later good change
+      type: shell
+      on: tr-lp-01
+      skills: [linux.git.basics]
+      weight: 2
+      command: |
+        su learner -c "git --git-dir=/srv/git/tt-config.git show main:signalling.conf" 2>/dev/null </dev/null | cmp -s - /var/lib/cloudtrain/xlp-git.want && echo restored || echo different
+      expect: {match: exact, value: restored}
+    - id: history-kept
+      description: The old history is still there (the push added to it)
+      type: shell
+      on: tr-lp-01
+      skills: [linux.git.basics]
+      weight: 1.5
+      command: |
+        tip=$(cat /var/lib/cloudtrain/xlp-git.tip); bad=$(cat /var/lib/cloudtrain/xlp-git.bad)
+        g="git --git-dir=/srv/git/tt-config.git"
+        [ "$(su learner -c "$g rev-parse main" 2>/dev/null </dev/null)" != "$tip" ] || { echo unchanged; exit 0; }
+        su learner -c "$g merge-base --is-ancestor $tip main && $g merge-base --is-ancestor $bad main" >/dev/null 2>&1 </dev/null && echo kept || echo rewritten
+      expect: {match: exact, value: kept}
+    - id: revert-commit
+      description: A revert commit of the bad commit exists on main
+      type: shell
+      on: tr-lp-01
+      skills: [linux.git.basics]
+      weight: 1.5
+      command: |
+        bad=$(cat /var/lib/cloudtrain/xlp-git.bad)
+        su learner -c "git --git-dir=/srv/git/tt-config.git log main --format=%B" 2>/dev/null </dev/null | grep -q "This reverts commit $bad" && echo reverted || echo no-revert
+      expect: {match: exact, value: reverted}
+  misconceptions:
+    - id: reset-force
+      description: Resets history to before the bad commit and force-pushes.
+      feedback: "Resetting and force-pushing rewrites shared history and throws away the good commit that came after; git revert <sha> adds a new commit that undoes just the bad one."
+      expectFail: [config-restored, history-kept, revert-commit]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        run: |
+          set -e
+          rm -rf ~/tt-config; git clone -q /srv/git/tt-config.git ~/tt-config; cd ~/tt-config
+          git reset -q --hard HEAD~2
+          git push -q --force origin main
+    - id: hand-edit
+      description: Fixes the value by hand in a new commit instead of reverting.
+      feedback: "A hand edit can leave history without any link to the commit it undoes; git revert records which commit it reverts and applies exactly its inverse."
+      expectFail: [revert-commit]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        run: |
+          set -e
+          rm -rf ~/tt-config; git clone -q /srv/git/tt-config.git ~/tt-config; cd ~/tt-config
+          printf 'signal_timeout=30\nheadway_seconds=120\ndwell_limit=60\ndepot_timeout=600\n' > signalling.conf
+          git commit -qam 'Fix config'
+          git push -q origin main
+  solution:
+    explanation: git log -p (or git log -S) finds the commit that set the key to 0; git revert creates a new commit with the inverse change, which is a normal fast-forward push.
+    steps:
+      - on: tr-lp-01
+        as: learner
+        run: |
+          set -e
+          git clone -q /srv/git/tt-config.git ~/tt-config; cd ~/tt-config
+          bad=$(git log --format=%H -S'{{key}}=0' -- signalling.conf | head -1)
+          git revert --no-edit $bad
+          git push -q origin main
+    alternatives:
+      - id: revert-no-commit
+        description: Revert without committing, then commit and push by hand.
+        steps:
+          - on: tr-lp-01
+            as: learner
+            run: |
+              set -e
+              git clone -q /srv/git/tt-config.git ~/tt-config; cd ~/tt-config
+              bad=$(git log --format=%H -S'{{key}}=0' -- signalling.conf | head -1)
+              git revert -n $bad
+              git commit -q -m "Revert \"Tidy signalling settings\"" -m "This reverts commit $bad."
+              git push -q origin main

@@ -1,0 +1,155 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xlp-python-parse-json
+  title: Extract a value from JSON with a short Python script
+  domain: linux
+  frameworks: [linuxplus:automation-scripting]
+  difficulty: medium
+  estimatedMinutes: 6
+  tags: [exam, python, json]
+  version: 1
+spec:
+  description: |
+    **Host:** `tr-lp-01` (a shell is open on it)
+
+    The train describer exports its state as JSON; a sample is in
+    **`/home/learner/describer.json`**. It is an object with a list `trains`, and each
+    record in it describes one train.
+
+    Write a Python 3 script **`/home/learner/bin/list-field.py`** that takes the path of
+    such a file as its only argument and prints the value of the field
+    **`{{field}}`** of every record in `trains`, one per line, in file order. A record
+    without that field is skipped. Numbers print as plain numbers (`7`, not `7.0`).
+
+    The script will be run on other files with the same layout.
+  objectives:
+    - Load a JSON file with Python's standard library
+    - Iterate records and handle a missing key
+  params:
+    field:
+      type: choice
+      values: [headcode, platform]
+  topology:
+    entry: tr-lp-01
+    nodes:
+      - name: tr-lp-01
+        driver: container
+        image: deb-lab:24.04
+        access: [shell]
+  setup:
+    - on: tr-lp-01
+      run: |
+        set -eu
+        V=/var/lib/cloudtrain; install -d -m 0700 $V
+        install -d -o learner -g learner /home/learner/bin
+        rm -f /home/learner/bin/list-field.py
+        cat > /home/learner/describer.json <<'EOT'
+        {"updated": "2026-10-14T06:00:00Z", "trains": [
+          {"headcode": "1A04", "platform": 3, "dest": "Ashby Junction", "late": 0},
+          {"headcode": "2B17", "platform": 1, "dest": "Corran Quay", "late": 4},
+          {"headcode": "2C22", "platform": 2, "dest": "Dunmere", "late": 0},
+          {"headcode": "1A08", "platform": 6, "dest": "Elsford Parkway", "late": 12}
+        ]}
+        EOT
+        chown learner:learner /home/learner/describer.json
+        cp /home/learner/describer.json $V/xlp-json.a.json
+        cat > $V/xlp-json.b.json <<'EOT'
+        {"updated": "2026-10-15T17:30:00Z", "trains": [
+          {"platform": 2, "dest": "Fenwick", "late": 0},
+          {"headcode": "5Z90", "platform": 11, "dest": "Gale Street", "late": 31},
+          {"headcode": "1A12", "dest": "Harlow Heath", "late": 2},
+          {"headcode": "2K05", "platform": 4, "dest": "Ivel Bridge", "late": 0},
+          {"headcode": "0B01", "platform": 9, "dest": "Jarrow", "late": 0}
+        ]}
+        EOT
+  checks:
+    - id: script-sample
+      description: On the sample file it prints the {{field}} values
+      type: shell
+      on: tr-lp-01
+      skills: [linux.shell.python-basics]
+      weight: 1.5
+      timeoutSec: 20
+      command: |
+        d=$(mktemp -d); chmod 0755 $d; cp /var/lib/cloudtrain/xlp-json.a.json $d/in.json; chmod 0644 $d/in.json
+        python3 -c 'import json, sys
+        for r in json.load(open(sys.argv[1]))["trains"]:
+            if "{{field}}" in r: print(r["{{field}}"])' $d/in.json > $d/want
+        timeout 10 su learner -c "python3 /home/learner/bin/list-field.py $d/in.json" > $d/got 2>/dev/null </dev/null
+        cmp -s $d/got $d/want && [ -s $d/want ] && echo correct || echo wrong
+        rm -rf $d
+      expect: {match: exact, value: correct}
+    - id: script-missing-field
+      description: On a file where a record lacks the field it skips that record
+      type: shell
+      on: tr-lp-01
+      skills: [linux.shell.python-basics]
+      weight: 2
+      timeoutSec: 20
+      command: |
+        d=$(mktemp -d); chmod 0755 $d; cp /var/lib/cloudtrain/xlp-json.b.json $d/in.json; chmod 0644 $d/in.json
+        python3 -c 'import json, sys
+        for r in json.load(open(sys.argv[1]))["trains"]:
+            if "{{field}}" in r: print(r["{{field}}"])' $d/in.json > $d/want
+        timeout 10 su learner -c "python3 /home/learner/bin/list-field.py $d/in.json" > $d/got 2>/dev/null </dev/null
+        cmp -s $d/got $d/want && [ -s $d/want ] && echo correct || echo wrong
+        rm -rf $d
+      expect: {match: exact, value: correct}
+  misconceptions:
+    - id: key-error
+      description: Indexes the key directly, so a record without it raises KeyError.
+      feedback: "r['field'] raises KeyError when the key is missing; test with 'field' in r or use r.get('field') and skip None."
+      expectFail: [script-missing-field]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        run: |
+          cat > /home/learner/bin/list-field.py <<'EOT'
+          import json, sys
+          for r in json.load(open(sys.argv[1]))["trains"]:
+              print(r["{{field}}"])
+          EOT
+    - id: printed-list
+      description: Prints the whole Python list instead of one value per line.
+      feedback: "print(list) shows brackets and quotes on one line; loop over the values and print each one."
+      expectFail: [script-sample, script-missing-field]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        run: |
+          cat > /home/learner/bin/list-field.py <<'EOT'
+          import json, sys
+          data = json.load(open(sys.argv[1]))
+          print([r.get("{{field}}") for r in data["trains"] if "{{field}}" in r])
+          EOT
+  solution:
+    explanation: json.load turns the file into dicts and lists; a loop prints each record's value when the key is present.
+    steps:
+      - on: tr-lp-01
+        as: learner
+        run: |
+          cat > /home/learner/bin/list-field.py <<'EOT'
+          import json, sys
+
+          with open(sys.argv[1]) as f:
+              data = json.load(f)
+          for record in data["trains"]:
+              if "{{field}}" in record:
+                  print(record["{{field}}"])
+          EOT
+          python3 /home/learner/bin/list-field.py /home/learner/describer.json
+    alternatives:
+      - id: get
+        description: Use dict.get and skip None.
+        steps:
+          - on: tr-lp-01
+            as: learner
+            run: |
+              cat > /home/learner/bin/list-field.py <<'EOT'
+              import json, sys
+              for r in json.load(open(sys.argv[1]))["trains"]:
+                  v = r.get("{{field}}")
+                  if v is not None:
+                      print(v)
+              EOT

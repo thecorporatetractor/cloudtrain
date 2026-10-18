@@ -1,0 +1,132 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xlp-hardware-report
+  title: Report CPU, memory and disks
+  domain: linux
+  frameworks: [linuxplus:system-management]
+  difficulty: easy
+  estimatedMinutes: 4
+  tags: [exam, hardware, lscpu, lsblk, meminfo]
+  version: 1
+spec:
+  description: |
+    **Host:** `tr-lp-01` (`ssh tr-lp-01`)
+
+    The asset register needs this machine's hardware. Write
+    **`/home/learner/hw-report.txt`** with exactly these four lines, each `name{{sep}}value`
+    with no spaces and numbers only:
+
+    ```
+    cpus{{sep}}<number of CPUs>
+    mem_mib{{sep}}<total memory in MiB, rounded down>
+    vdc_mib{{sep}}<size of the disk /dev/vdc in MiB>
+    vdd_mib{{sep}}<size of the disk /dev/vdd in MiB>
+    ```
+  objectives:
+    - Read CPU, memory and block device information
+    - Convert units
+  params:
+    sep:
+      type: choice
+      values: ["=", ":"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-lp-01
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["2Gi", "1Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-lp-01
+      run: |
+        set -eu
+        [ "$(readlink -f /dev/disk/by-id/virtio-ct-data1)" = /dev/vdc ]
+        [ "$(readlink -f /dev/disk/by-id/virtio-ct-data2)" = /dev/vdd ]
+        rm -f /home/learner/hw-report.txt
+  checks:
+    - id: cpus
+      description: The CPU count is right
+      type: shell
+      on: tr-lp-01
+      skills: [linux.kernel.hardware-discovery]
+      weight: 1
+      command: |
+        v=$(sed -n 's/^cpus{{sep}}//p' /home/learner/hw-report.txt 2>/dev/null | head -1)
+        [ "$v" = "$(nproc --all)" ] && echo correct || echo "got=$v"
+      expect: {match: exact, value: correct}
+    - id: memory
+      description: The total memory is right, in MiB
+      type: shell
+      on: tr-lp-01
+      skills: [linux.kernel.hardware-discovery]
+      weight: 1.5
+      command: |
+        v=$(sed -n 's/^mem_mib{{sep}}//p' /home/learner/hw-report.txt 2>/dev/null | head -1)
+        want=$(awk '/^MemTotal:/ {print int($2 / 1024)}' /proc/meminfo)
+        case "$v" in ''|*[!0-9]*) echo "got=$v"; exit 0;; esac
+        d=$(( v - want )); [ $d -ge -1 ] && [ $d -le 1 ] && echo correct || echo "got=$v"
+      expect: {match: exact, value: correct}
+    - id: disks
+      description: The sizes of vdc and vdd are right, in MiB
+      type: shell
+      on: tr-lp-01
+      skills: [linux.kernel.hardware-discovery]
+      weight: 1.5
+      command: |
+        c=$(sed -n 's/^vdc_mib{{sep}}//p' /home/learner/hw-report.txt 2>/dev/null | head -1)
+        d=$(sed -n 's/^vdd_mib{{sep}}//p' /home/learner/hw-report.txt 2>/dev/null | head -1)
+        wc=$(( $(blockdev --getsize64 /dev/vdc) / 1048576 )); wd=$(( $(blockdev --getsize64 /dev/vdd) / 1048576 ))
+        [ "$c" = "$wc" ] && [ "$d" = "$wd" ] && echo correct || echo "got=$c,$d"
+      expect: {match: exact, value: correct}
+    - id: shape
+      description: The report has exactly the four lines
+      type: shell
+      on: tr-lp-01
+      skills: [linux.kernel.hardware-discovery]
+      weight: 0.5
+      command: |
+        [ "$(cut -d'{{sep}}' -f1 /home/learner/hw-report.txt 2>/dev/null | paste -sd,)" = "cpus,mem_mib,vdc_mib,vdd_mib" ] && echo ok || echo wrong
+      expect: {match: exact, value: ok}
+  misconceptions:
+    - id: kib-memory
+      description: Reports MemTotal in KiB as shown in /proc/meminfo.
+      feedback: "/proc/meminfo counts kibibytes; divide by 1024 for MiB (free -m does it for you)."
+      expectFail: [memory]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        run: |
+          printf 'cpus{{sep}}%s\nmem_mib{{sep}}%s\nvdc_mib{{sep}}%s\nvdd_mib{{sep}}%s\n' "$(nproc --all)" "$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)" "$(( $(sudo blockdev --getsize64 /dev/vdc) / 1048576 ))" "$(( $(sudo blockdev --getsize64 /dev/vdd) / 1048576 ))" > /home/learner/hw-report.txt
+    - id: gib-disks
+      description: Reports the disks in whole GiB instead of MiB.
+      feedback: "The register wants MiB: lsblk -b gives bytes, divide by 1048576 (1024 x 1024)."
+      expectFail: [disks]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        run: |
+          printf 'cpus{{sep}}%s\nmem_mib{{sep}}%s\nvdc_mib{{sep}}%s\nvdd_mib{{sep}}%s\n' "$(nproc --all)" "$(free -m | awk '/^Mem:/ {print $2}')" 2 1 > /home/learner/hw-report.txt
+  solution:
+    explanation: nproc counts CPUs, /proc/meminfo or free -m gives memory, and blockdev --getsize64 (or lsblk -b) gives disk sizes in bytes to divide by 1048576.
+    steps:
+      - on: tr-lp-01
+        as: learner
+        run: |
+          printf 'cpus{{sep}}%s\nmem_mib{{sep}}%s\nvdc_mib{{sep}}%s\nvdd_mib{{sep}}%s\n' "$(nproc --all)" "$(free -m | awk '/^Mem:/ {print $2}')" "$(( $(sudo blockdev --getsize64 /dev/vdc) / 1048576 ))" "$(( $(sudo blockdev --getsize64 /dev/vdd) / 1048576 ))" > /home/learner/hw-report.txt
+    alternatives:
+      - id: lsblk
+        description: Use lsblk -b and lscpu.
+        steps:
+          - on: tr-lp-01
+            as: learner
+            run: |
+              c=$(lscpu -p=CPU | grep -vc '^#')
+              m=$(( $(awk '/^MemTotal:/ {print $2}' /proc/meminfo) / 1024 ))
+              a=$(( $(lsblk -bdn -o SIZE /dev/vdc) / 1048576 )); b=$(( $(lsblk -bdn -o SIZE /dev/vdd) / 1048576 ))
+              printf 'cpus{{sep}}%s\nmem_mib{{sep}}%s\nvdc_mib{{sep}}%s\nvdd_mib{{sep}}%s\n' $c $m $a $b > /home/learner/hw-report.txt
