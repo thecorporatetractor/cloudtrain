@@ -247,6 +247,13 @@ Review majors and minors of head 1aef53b, fixed before merge:
 | ov-net-ospf-branch-config (minor) | "adding a router needs only another host_vars file" was not graded | new check `data-driven`: nothing in the project outside `host_vars/` and the inventory names a router or holds its addresses |
 | ov-system-role-timesync (minor) | the uses-role scan stopped at the first `include_role` task | the scan walks `pre_tasks`, `tasks`, `post_tasks` and nested blocks and matches the role name of every include/import |
 
+Pre-merge live verify (ct-testvm, PR clone, vm slot, `--parallel 1 --grade-timeout 15m`):
+ov-block-rescue-db-maintenance passed every run (2 seeds, 4 misconceptions, 1 alternative); the
+`marker-only` mutation fails log-db (`no-failed-migration`), rerun-safe (`migration-not-attempted`)
+and block-structure. It stays `built` until the batch runner verifies it from main.
+ov-net-parse-neighbors cannot run live (frr:10 blocker); its graders were unit-tested on synthetic
+playbook output and router JSON (ignored failures, faked files and unnamed neighbours are rejected).
+
 VM fleets (ov-ctl has no links; VMs come wired; setup makes `ovauto` with the learner's
 authorized_keys and a NOPASSWD drop-in; ansible.cfg remote_user ovauto):
 

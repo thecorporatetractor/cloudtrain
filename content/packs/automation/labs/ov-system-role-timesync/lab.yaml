@@ -145,13 +145,23 @@ spec:
         /opt/ansible/bin/python3 - /home/learner/claims-automation/timesync.yml <<'PY' 2>/dev/null || echo no-playbook
         import sys, yaml
         plays = yaml.safe_load(open(sys.argv[1])) or []
+        def walk(ts):
+            for t in ts if isinstance(ts, list) else []:
+                if isinstance(t, dict):
+                    yield t
+                    for k in ("block", "rescue", "always"):
+                        yield from walk(t.get(k))
         def uses(p):
+            if not isinstance(p, dict): return False
             for r in (p.get("roles") or []):
-                n = r if isinstance(r, str) else str(r.get("role", r.get("name", "")))
+                n = r if isinstance(r, str) else str(r.get("role", r.get("name", ""))) if isinstance(r, dict) else ""
                 if n.endswith("timesync"): return True
-            for t in (p.get("tasks") or []):
-                if isinstance(t, dict) and any(k in t for k in ("include_role", "import_role", "ansible.builtin.include_role", "ansible.builtin.import_role")):
-                    return "timesync" in str(t)
+            for k in ("pre_tasks", "tasks", "post_tasks"):
+                for t in walk(p.get(k)):
+                    for m in ("include_role", "import_role", "ansible.builtin.include_role", "ansible.builtin.import_role"):
+                        a = t.get(m)
+                        n = str(a.get("name", "")) if isinstance(a, dict) else ""
+                        if n.endswith("timesync"): return True
             return False
         print("ok" if any(uses(p) for p in plays) else "no-role")
         PY

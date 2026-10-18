@@ -119,10 +119,10 @@ objectives and never copy exam content.
 | Linux administration | 11 | 279 | 3 | 35 | 154 |
 | Containers with Docker | 11 | 135 | 2 | 68 | 67 |
 | Infrastructure as code with Terraform | 5 | 99 | 2 | — | 99 |
-| Configuration management and automation | 7 | 97 | 1 | 5 | 40 |
+| Configuration management and automation | 7 | 97 | 1 | 26 | 40 |
 | Network administration | 4 | 78 | 1 | 7 | 65 |
 | Security operations | 3 | 67 | 1 | — | — |
-| **Total** | **46** | **947** (542 learning, 405 exam tasks) | **14** | **155** | **577** |
+| **Total** | **46** | **947** (542 learning, 405 exam tasks) | **14** | **176** | **577** |
 <!-- curriculum-table:end -->
 
 "Built" means written and passing schema, skill and compile validation;

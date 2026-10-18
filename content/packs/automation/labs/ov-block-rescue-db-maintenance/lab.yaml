@@ -26,7 +26,10 @@ spec:
     and so that every run, successful or not, appends one line to **`/var/log/ov-maint.log`** on the node. The line
     ends with `status=ok` after a successful migration and with `status=rolled-back` after a rollback.
 
-    Do not edit the migration file. Run the playbook once; the grader runs it again.
+    Use `block`, `rescue` and `always` in `maintenance.yml` itself, with the status line written in the `always`
+    section. Do not edit the migration file. Run the playbook once; the grader runs it again and checks what that
+    run really did on the node: the migration was attempted with the service stopped and failed, the previous
+    schema is back, the service was started again, and the status line was written after the failed attempt.
   objectives:
     - "Group tasks with block, rescue and always"
     - "Restore a previous state after a failed change"
@@ -65,10 +68,16 @@ spec:
         #!/bin/sh
         while true; do date +%s > /run/ov-policy.beat; sleep 5; done
         EOS
+        install -d -m 0755 /var/lib/ov-policy
         cat > /usr/local/sbin/ov-schema-apply <<'EOS'
         #!/bin/sh
+        # every call is recorded in /var/lib/ov-policy/apply.log: time, content sha256, service state, exit code
+        h=$(sha256sum < "$1" | cut -d' ' -f1)
+        s=$(systemctl is-active ov-policy 2>/dev/null)
         n=$(grep -n 'SYNTAX ERROR' "$1" | head -1 | cut -d: -f1)
-        if [ -n "$n" ]; then echo "ov-schema-apply: syntax error at line $n" >&2; exit 1; fi
+        if [ -n "$n" ]; then rc=1; else rc=0; fi
+        echo "$(date +%s) ${h:-none} ${s:-unknown} $rc" >> /var/lib/ov-policy/apply.log
+        if [ $rc -ne 0 ]; then echo "ov-schema-apply: syntax error at line $n" >&2; exit 1; fi
         echo "schema applied: $(head -1 "$1")"
         EOS
         chmod 0755 /usr/local/sbin/ov-policy-svc /usr/local/sbin/ov-schema-apply
@@ -86,6 +95,8 @@ spec:
         printf -- '-- ov policy schema v{{ver}}\nCREATE TABLE policy (id integer, holder text);\nCREATE TABLE endorsement (id integer, policy_id integer);\n' > /etc/ov/policy/schema.sql
         sha256sum < /etc/ov/policy/schema.sql | cut -d' ' -f1 > /var/tmp/.ct-schema-orig
         rm -f /var/log/ov-maint.log
+        : > /var/lib/ov-policy/apply.log
+        chmod 0644 /var/lib/ov-policy/apply.log
         touch /var/tmp/.ct-policy-seeded
     - on: ov-ctl
       run: |
@@ -122,29 +133,86 @@ spec:
         [ "$(sha256sum < /etc/ov/policy/schema.sql | cut -d' ' -f1)" = "$(cat /var/tmp/.ct-schema-orig)" ] && echo restored || echo changed
       expect: { match: exact, value: "restored" }
     - id: log-db
-      description: "The last line of /var/log/ov-maint.log reports the outcome of the run"
+      description: "The last line of /var/log/ov-maint.log reports the rollback, and it was written after a failed migration attempt"
       type: shell
       on: ov-db-1
       skills: [automation.control-flow.error-handling, automation.data.register]
       weight: 2
       command: |
-        tail -n1 /var/log/ov-maint.log 2>/dev/null | grep -Eo 'status=[a-z-]+' || echo no-status
+        st=$(tail -n1 /var/log/ov-maint.log 2>/dev/null | grep -Eo 'status=[a-z-]+$' || echo no-status)
+        [ "$st" = status=rolled-back ] || { echo "$st"; exit 0; }
+        t=$(awk '$4 == 1 { t = $1 } END { print t }' /var/lib/ov-policy/apply.log 2>/dev/null)
+        [ -n "$t" ] || { echo no-failed-migration; exit 0; }
+        [ "$(stat -c %Y /var/log/ov-maint.log)" -ge "$t" ] && echo status=rolled-back || echo status-before-migration
       expect: { match: exact, value: "status=rolled-back" }
     - id: rerun-safe
-      description: "maintenance.yml can be run again: it does not fail, and adds exactly one line to the log; the supplied migration file is unchanged"
+      description: "Running maintenance.yml again really attempts the migration with the service stopped, rolls it back, starts the service again and adds one status=rolled-back line after the failed attempt; the play does not fail and the migration file is unchanged"
       type: shell
       on: ov-ctl
       skills: [automation.control-flow.error-handling, automation.data.register]
-      weight: 2
+      weight: 3
       timeoutSec: 600
       command: |
         d=/home/learner/policy-db
         sha256sum -c --quiet /var/tmp/.ct-migration.sum >/dev/null 2>&1 || { echo migration-edited; exit 0; }
-        n0=$(ct-ansible run $d ssh ov-db-1 'wc -l < /var/log/ov-maint.log' 2>/dev/null)
+        mh=$(cut -d' ' -f1 /var/tmp/.ct-migration.sum)
+        q() { ct-ansible run $d ssh -o BatchMode=yes ov-db-1 "$1" 2>/dev/null; }
+        b=$(q 'cat /var/log/ov-maint.log 2>/dev/null | wc -l; cat /var/lib/ov-policy/apply.log 2>/dev/null | wc -l; systemctl show -p InvocationID --value ov-policy')
+        n0=$(echo "$b" | sed -n 1p); a0=$(echo "$b" | sed -n 2p); i0=$(echo "$b" | sed -n 3p)
+        [ -n "$a0" ] || { echo node-unreadable; exit 0; }
         r=$(ct-ansible recap $d maintenance.yml)
-        n1=$(ct-ansible run $d ssh ov-db-1 'wc -l < /var/log/ov-maint.log' 2>/dev/null)
         case $r in *"failed=0 unreachable=0") ;; *) echo "$r"; exit 0 ;; esac
-        [ $(( ${n1:-0} - ${n0:-0} )) -eq 1 ] && echo ok || echo "log-lines-added=$(( ${n1:-0} - ${n0:-0} ))"
+        call=$(q "tail -n +$((a0 + 1)) /var/lib/ov-policy/apply.log" | awk -v h="$mh" '$2 == h && $4 == 1' | tail -n1)
+        [ -n "$call" ] || { echo migration-not-attempted; exit 0; }
+        set -- $call
+        t=$1
+        case $3 in inactive|failed) ;; *) echo service-running-during-migration; exit 0 ;; esac
+        a=$(q 'cat /var/tmp/.ct-schema-orig; sha256sum < /etc/ov/policy/schema.sql | cut -d" " -f1; systemctl is-active ov-policy; systemctl is-enabled ov-policy; systemctl show -p InvocationID --value ov-policy; cat /var/log/ov-maint.log 2>/dev/null | wc -l; stat -c %Y /var/log/ov-maint.log; tail -n1 /var/log/ov-maint.log')
+        l() { echo "$a" | sed -n "$1p"; }
+        [ -n "$(l 1)" ] && [ "$(l 1)" = "$(l 2)" ] || { echo schema-not-restored; exit 0; }
+        [ "$(l 3) $(l 4)" = "active enabled" ] || { echo "service=$(l 3) $(l 4)"; exit 0; }
+        [ -n "$(l 5)" ] && [ "$(l 5)" != "$i0" ] || { echo service-not-restarted; exit 0; }
+        [ $(( $(l 6) - ${n0:-0} )) -eq 1 ] || { echo "log-lines-added=$(( $(l 6) - ${n0:-0} ))"; exit 0; }
+        echo "$(l 8)" | grep -q 'status=rolled-back$' || { echo last-line-not-rolled-back; exit 0; }
+        [ "$(l 7)" -ge "$t" ] && echo ok || echo status-before-migration
+      expect: { match: exact, value: "ok" }
+    - id: block-structure
+      description: "maintenance.yml runs ov-schema-apply inside a block with a rescue section and writes the status line in its always section"
+      type: shell
+      on: ov-ctl
+      skills: [automation.control-flow.error-handling]
+      weight: 1
+      command: |
+        /opt/ansible/bin/python3 - /home/learner/policy-db/maintenance.yml <<'PY' 2>/dev/null || echo unreadable
+        import sys, yaml
+        plays = yaml.safe_load(open(sys.argv[1])) or []
+        def walk(ts):
+            for t in ts if isinstance(ts, list) else []:
+                if isinstance(t, dict):
+                    yield t
+                    for k in ("block", "rescue", "always"):
+                        yield from walk(t.get(k))
+        best = "no-block-around-ov-schema-apply"
+        for p in plays if isinstance(plays, list) else []:
+            if not isinstance(p, dict):
+                continue
+            for k in ("pre_tasks", "tasks", "post_tasks"):
+                for t in walk(p.get(k)):
+                    if "block" not in t or "ov-schema-apply" not in str(t.get("block")):
+                        continue
+                    if not t.get("rescue"):
+                        best = "no-rescue"
+                    elif not any(m in str(t.get("always")) for m in ("ov-maint.log", "status=")):
+                        best = "status-line-not-in-always"
+                    else:
+                        best = "ok"
+                        break
+                if best == "ok":
+                    break
+            if best == "ok":
+                break
+        print(best)
+        PY
       expect: { match: exact, value: "ok" }
   hints:
     - title: "Where a rescue goes"
@@ -220,7 +288,7 @@ spec:
     - id: log-only-on-success
       description: "Writes the status line as the last task of the block."
       feedback: "A task at the end of the block never runs when an earlier task fails; use the always section."
-      expectFail: [log-db, rerun-safe]
+      expectFail: [log-db, rerun-safe, block-structure]
       mutation:
         on: ov-ctl
         as: learner
@@ -281,7 +349,7 @@ spec:
     - id: ignore-the-error
       description: "Ignores the failed migration instead of restoring the previous schema."
       feedback: "Ignoring the error leaves the broken schema installed; restore the previous file in a rescue section."
-      expectFail: [schema-db]
+      expectFail: [schema-db, block-structure]
       mutation:
         on: ov-ctl
         as: learner
@@ -328,6 +396,30 @@ spec:
                       line: "{{ ansible_date_time.iso8601 }} host={{ inventory_hostname }} status={{ maint_status }}"
                       create: true
                       mode: "0644"
+          EOF
+          ansible-playbook maintenance.yml
+    - id: marker-only
+      description: "Only appends a status=rolled-back line to the log, without running or rolling back the migration."
+      feedback: "The status line has to report what really happened: run the migration in a block, restore the schema in rescue and write the line in always."
+      expectFail: [log-db, rerun-safe, block-structure]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/policy-db
+          cat > maintenance.yml <<'EOF'
+          - name: Policy database maintenance
+            hosts: claims_db
+            become: true
+            tasks:
+              - name: Status line
+                ansible.builtin.lineinfile:
+                  path: /var/log/ov-maint.log
+                  line: "{{ ansible_date_time.iso8601 }} host={{ inventory_hostname }} status=rolled-back"
+                  create: true
+                  mode: "0644"
           EOF
           ansible-playbook maintenance.yml
   solution:
