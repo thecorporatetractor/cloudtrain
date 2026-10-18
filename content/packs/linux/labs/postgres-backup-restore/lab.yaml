@@ -61,7 +61,7 @@ spec:
         P -d postgres -c "DROP DATABASE IF EXISTS fares" >/dev/null
         P -d postgres -c "CREATE DATABASE fares" >/dev/null
         P -d fares >/dev/null <<'EOT'
-        CREATE TABLE fares (id serial PRIMARY KEY, route text NOT NULL, class text NOT NULL, price numeric(6,2) NOT NULL);
+        CREATE TABLE fares (id serial, route text NOT NULL, class text NOT NULL, price numeric(6,2) NOT NULL);
         INSERT INTO fares (route, class, price)
           SELECT 'TR' || lpad(g::text, 3, '0'), CASE WHEN g % 3 = 0 THEN 'first' ELSE 'standard' END, round((2 + (g * 37 % 90) / 4.0)::numeric, 2) FROM generate_series(1, {{rows}}) g;
         CREATE TABLE fare_zones (id serial PRIMARY KEY, zone text NOT NULL, surcharge numeric(5,2) NOT NULL);
@@ -132,7 +132,7 @@ spec:
       body: "`sudo -u postgres pg_dump -Fc fares -f /var/backups/fares/fares.dump` writes the custom format (restore with pg_restore, selectively); plain `pg_dump fares > file.sql` is restored with psql. Both include schema and data by default."
       cost: 1
     - title: Restore only what is gone
-      body: "`pg_restore -l DUMP` lists the contents; `pg_restore -d fares -t TABLE DUMP` restores that one table (schema, data and indexes). Restoring the whole dump into a populated database appends the rows again to every table that still exists."
+      body: "`pg_restore -l DUMP` lists the contents (table, data, sequence, default, constraint ... each a line). `pg_restore -t TABLE` restores only the table definition and data, not its primary key or sequence default. To restore everything that belongs to one table, filter the list and feed it back: `pg_restore -l DUMP | grep ' public TABLE' > list`, then `pg_restore -L list -d fares DUMP`. Restoring the whole dump into a populated database without --clean appends the rows again to every table that still exists and has no unique key."
       cost: 1
     - title: Counting
       body: "`sudo -u postgres psql fares -Atc 'SELECT count(*) FROM fares'`. Take the counts before the drop and write them out; compare again after the restore."
@@ -140,7 +140,7 @@ spec:
   misconceptions:
     - id: full-restore-into-populated-db
       description: Restores the whole dump without dropping anything else, which appends every other table's rows a second time.
-      feedback: "pg_restore does not replace existing tables: it reports 'already exists' for their definitions but still loads their data again. Restore just the dropped table (-t), or use --clean --if-exists for the whole database."
+      feedback: "pg_restore does not replace existing tables: it reports 'already exists' for their definitions but still loads their data again, and a table without a unique key (fares) gets every row twice. Restore just the entries of the dropped table (a filtered list with -L), or use --clean --if-exists for the whole database."
       expectFail: [table-restored]
       mutation:
         on: tr-db-01
@@ -202,8 +202,9 @@ spec:
   solution:
     explanation: |
       Record the counts, take a custom-format dump of the whole database, drop the table and
-      restore only that table with pg_restore -t (schema, data and its primary key), then
-      compare the counts with the report.
+      restore the entries that belong to that table (a filtered pg_restore -l list passed with -L,
+      so the primary key and sequence default come back too), then compare the counts with the
+      report.
     steps:
       - on: tr-db-01
         as: learner
@@ -216,7 +217,8 @@ spec:
           sudo -u postgres pg_dump -Fc fares -f /var/backups/fares/fares-$(date +%F).dump
           sudo -u postgres pg_restore -l /var/backups/fares/fares-$(date +%F).dump | grep 'TABLE DATA'
           P -c "DROP TABLE {{tbl}}"
-          sudo -u postgres pg_restore -d fares -t {{tbl}} /var/backups/fares/fares-$(date +%F).dump
+          sudo -u postgres pg_restore -l /var/backups/fares/fares-$(date +%F).dump | grep -E ' public {{tbl}}(_id_seq)? ' > /tmp/restore.list
+          sudo -u postgres pg_restore -L /tmp/restore.list -d fares /var/backups/fares/fares-$(date +%F).dump
           for t in fares fare_zones concessions; do echo "$t $(P -c "SELECT count(*) FROM $t")"; done
           EOS
     alternatives:
