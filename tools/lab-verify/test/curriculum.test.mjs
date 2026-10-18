@@ -106,3 +106,17 @@ test("findCycle reports prerequisite loops", () => {
   assert.deepEqual(findCycle(new Map([["a", ["b"]], ["b", ["a"]]])), ["a", "b", "a"]);
   assert.equal(findCycle(new Map([["a", ["b"]], ["b", []]])), undefined);
 });
+
+test("a built lab must list the lab.yaml node images, all in the catalog", async () => {
+  const doc = base();
+  doc.labs[0].status = "built";
+  doc.labs[0].images = ["jumphost:1", "el-lab:10"];
+  const mk = (images) => ({ ...ctx(), packLabs: new Map([["free-deleted-log", { domain: "linux", frameworks: ["lfcs:storage"], images }]]) });
+  const c = mk(["jumphost:1", "el-lab:10"]);
+  c.catalog.images.set("el-lab:10", {});
+  assert.deepEqual((await run(doc, c)).errors, []);
+  const differ = await run(doc, Object.assign(mk(["jumphost:1"]), { catalog: c.catalog }));
+  assert.ok(differ.errors.some((m) => m.includes("differ from the lab.yaml node images")));
+  const missing = await run(doc, mk(["jumphost:1", "el-lab:10"])); // el-lab:10 only proposed, not in the catalog
+  assert.ok(missing.errors.some((m) => m.includes("not in the image catalog")));
+});

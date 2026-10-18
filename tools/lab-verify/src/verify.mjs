@@ -485,7 +485,7 @@ export async function verifyContent(contentDir, opts = {}) {
       const doc = await checkLab(labFile, skills, frameworkRefs, findings, { catalog, usedSkills, examTasks, curriculumFrameworkRefs, curriculumSkills });
       const ok = findings.filter((f) => f.level === "error").length === before;
       labs.push({ file: labFile, id: doc?.metadata?.id ?? lab, ok, checks: doc?.spec?.checks?.length ?? 0 });
-      packLabs.set(doc?.metadata?.id ?? lab, { domain: doc?.metadata?.domain, frameworks: doc?.metadata?.frameworks ?? [] });
+      packLabs.set(doc?.metadata?.id ?? lab, { domain: doc?.metadata?.domain, frameworks: doc?.metadata?.frameworks ?? [], images: [...new Set((doc?.spec?.topology?.nodes ?? []).map((n) => n.image).filter(Boolean))] });
       labIds.add(lab);
       if ((doc?.metadata?.tags ?? []).includes("exam")) examIds.add(lab);
     }

@@ -39,7 +39,7 @@ export function findCycle(edges) {
 /**
  * @param {string} file path of content/curriculum.yaml
  * @param {{ skills: Map<string, unknown>, frameworkRefs: Map<string, Set<string>>, catalog?: { images: Map<string, unknown> },
- *           packLabs: Map<string, { domain?: string, frameworks?: string[] }> }} ctx
+ *           packLabs: Map<string, { domain?: string, frameworks?: string[], images?: string[] }> }} ctx
  * @param {import("./verify.mjs").Finding[]} findings
  */
 export async function checkCurriculum(file, ctx, findings) {
@@ -144,6 +144,13 @@ export async function checkCurriculum(file, ctx, findings) {
         if (inPack.domain && inPack.domain !== l.domain) err(where, `domain '${l.domain}' differs from the pack lab's '${inPack.domain}'`);
         const a = [...(inPack.frameworks ?? [])].sort().join(","), b = [...(l.frameworks ?? [])].sort().join(",");
         if (a !== b) warn(where, `frameworks differ from the pack lab (${a})`);
+        // A built or verified lab must list the images its lab.yaml uses, all of them in the real catalog
+        // (the remote verify runner skips labs whose images are missing from it).
+        if (inPack.images) {
+          const want = [...new Set(inPack.images)].sort().join(", "), have = [...new Set(l.images ?? [])].sort().join(", ");
+          if (want !== have) err(where, `images [${have}] differ from the lab.yaml node images [${want}]`);
+          if (ctx.catalog) for (const i of l.images ?? []) if (!ctx.catalog.images.has(i)) err(where, `image '${i}' is not in the image catalog (status '${l.status}')`);
+        }
       }
     } else if (inPack) err(where, `a lab '${l.id}' already exists in content/packs; its status must be built or verified`);
     if (l.type === "exam" && !examPoolOf.has(l.id) && !String(l.notes ?? "").startsWith("blocked:")) err(where, "exam task is in no exam pool"); // blocked tasks are held out of the pools until unblocked
