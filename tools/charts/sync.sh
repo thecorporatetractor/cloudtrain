@@ -1,42 +1,37 @@
 #!/usr/bin/env bash
-# Copy the files the Helm charts embed from their sources of truth (Helm cannot
-# read outside a chart directory):
-#   services/lab-orchestrator/config/crd/*.yaml  -> deploy/charts/cloudtrain-crds/files/
-#   services/lab-orchestrator/config/rbac/role.yaml -> deploy/charts/cloudtrain/files/orchestrator-role.txt
-#   deploy/images/catalog.yaml                    -> deploy/charts/cloudtrain/files/catalog.yaml
-#   deploy/images/overlays/iac-opentofu.yaml      -> deploy/charts/cloudtrain/files/catalog-iac-opentofu.yaml
-# The ClusterRole copy is a .txt file: scanners already report (and the repo accepts,
-# .github/iac/trivyignore.yaml) the source role.yaml; a second .yaml copy would
-# duplicate every finding. The chart renders it with the release's names.
-# Usage: tools/charts/sync.sh [--check]   (--check: fail if a copy is stale; CI)
+# The Helm charts embed files from their sources of truth through relative
+# symlinks (Helm cannot read outside a chart directory; it follows symlinks when
+# rendering and packaging), so the copies can never drift:
+#   deploy/charts/cloudtrain-crds/files/*.yaml        -> services/lab-orchestrator/config/crd/
+#   deploy/charts/cloudtrain/files/orchestrator-role.txt -> services/lab-orchestrator/config/rbac/role.yaml
+#     (.txt so scanners do not report the accepted ClusterRole a second time)
+#   deploy/charts/cloudtrain/files/catalog.yaml       -> deploy/images/catalog.yaml
+#   deploy/charts/cloudtrain/files/catalog-iac-opentofu.yaml -> deploy/images/overlays/iac-opentofu.yaml
+# This script (re)creates the links, e.g. after a CRD is added or removed.
+# Usage: tools/charts/sync.sh [--check]   (--check: fail if a link is missing or wrong; CI)
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 CHECK=0
 [[ ${1:-} == --check ]] && CHECK=1
-CRDS=$ROOT/deploy/charts/cloudtrain-crds/files
-APP=$ROOT/deploy/charts/cloudtrain/files
-pairs=(
-  "$ROOT/services/lab-orchestrator/config/rbac/role.yaml|$APP/orchestrator-role.txt"
-  "$ROOT/deploy/images/catalog.yaml|$APP/catalog.yaml"
-  "$ROOT/deploy/images/overlays/iac-opentofu.yaml|$APP/catalog-iac-opentofu.yaml"
+links=(
+  "deploy/charts/cloudtrain/files/orchestrator-role.txt|../../../../services/lab-orchestrator/config/rbac/role.yaml"
+  "deploy/charts/cloudtrain/files/catalog.yaml|../../../images/catalog.yaml"
+  "deploy/charts/cloudtrain/files/catalog-iac-opentofu.yaml|../../../images/overlays/iac-opentofu.yaml"
 )
 for f in "$ROOT"/services/lab-orchestrator/config/crd/labs.cloudtrain.dev_*.yaml; do
-  pairs+=("$f|$CRDS/$(basename "$f")")
+  links+=("deploy/charts/cloudtrain-crds/files/$(basename "$f")|../../../../services/lab-orchestrator/config/crd/$(basename "$f")")
 done
-stale=0
-for p in "${pairs[@]}"; do
-  src=${p%%|*} dst=${p#*|}
-  if ((CHECK)); then
-    cmp -s "$src" "$dst" || { echo "stale: ${dst#"$ROOT"/} (run tools/charts/sync.sh)" >&2; stale=1; }
-  else
-    mkdir -p "$(dirname "$dst")"
-    cp "$src" "$dst"
-  fi
+bad=0
+for l in "${links[@]}"; do
+  path=$ROOT/${l%%|*} target=${l#*|}
+  if [[ -L $path && $(readlink "$path") == "$target" && -e $path ]]; then continue; fi
+  if ((CHECK)); then echo "not linked: ${l%%|*} -> $target (run tools/charts/sync.sh)" >&2; bad=1; continue; fi
+  mkdir -p "$(dirname "$path")"; rm -f "$path"; ln -s "$target" "$path"
 done
-# CRDs removed at the source must disappear from the chart too.
-for dst in "$CRDS"/*.yaml; do
-  [[ -e $dst ]] || continue
-  [[ -e $ROOT/services/lab-orchestrator/config/crd/$(basename "$dst") ]] && continue
-  if ((CHECK)); then echo "stale: ${dst#"$ROOT"/} has no source" >&2; stale=1; else rm -f "$dst"; fi
+# Links whose CRD was removed at the source.
+for p in "$ROOT"/deploy/charts/cloudtrain-crds/files/*.yaml; do
+  [[ -e $p ]] && continue
+  [[ -L $p ]] || continue
+  if ((CHECK)); then echo "dangling: ${p#"$ROOT"/}" >&2; bad=1; else rm -f "$p"; fi
 done
-exit $stale
+exit $bad

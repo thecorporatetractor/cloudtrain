@@ -201,9 +201,10 @@ path routing) needs none of this.
 load` them, install any ingress controller and use `examples/values-kind.yaml`. That
 file sets a demo Postgres, plain HTTP, `pullPolicy: Never`, and an orchestrator
 limited to its own sessions namespace, so it never reconciles the dev manager's
-sessions. `task chart:test` lints and renders every example and checks the result;
-`task chart:sync` refreshes the files the charts embed (CRDs, the orchestrator
-ClusterRole, the image catalog).
+sessions. `task chart:test` lints and renders every example and checks the result.
+The charts embed the CRDs, the orchestrator ClusterRole and the image catalog through
+symlinks to their sources (Helm follows them when rendering and packaging), so they
+never drift; `task chart:sync` re-creates the links after a CRD is added or removed.
 
 ## Not yet
 
