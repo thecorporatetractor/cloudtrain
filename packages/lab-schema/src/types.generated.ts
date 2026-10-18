@@ -207,7 +207,7 @@ export interface Node {
       labels?: {
         [k: string]: string;
       };
-      state?: "ready" | "notready";
+      state?: "ready" | "notready" | "unjoined";
     }[];
   };
 }

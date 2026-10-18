@@ -164,7 +164,7 @@ type ClusterSpec struct {
 type ClusterNodeRole string
 
 // ClusterNodeState is the initial state of a kubeadm cluster member.
-// +kubebuilder:validation:Enum=ready;notready
+// +kubebuilder:validation:Enum=ready;notready;unjoined
 type ClusterNodeState string
 
 // ClusterNode is a member of a kubeadm cluster.

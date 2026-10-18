@@ -23,8 +23,10 @@ import (
 	labsv1 "github.com/cloudtrain/cloudtrain/services/lab-orchestrator/api/v1alpha1"
 )
 
-// Kubeadm cluster defaults. Node resources of the cluster node apply to the
-// control plane; workers use the worker defaults.
+// Kubeadm cluster defaults. Node resources of the cluster node apply to every
+// control-plane member (also one that boots unjoined and joins later with
+// kubeadm join --control-plane: its preflight wants 2 CPUs and 1700 MB);
+// workers use the worker defaults.
 const (
 	kubeadmCPCores      = 2
 	kubeadmCPMemMiB     = 2048
@@ -99,13 +101,13 @@ func (d *KubeadmDriver) layout(ref NodeRef) (kubeadmLayout, error) {
 	}
 	cps := 0
 	for _, m := range ref.Node.Cluster.Nodes {
-		if m.Role == "control-plane" {
+		if m.Role == "control-plane" && m.State != StateUnjoined {
 			cps++
 			l.cp = m
 		}
 	}
 	if cps != 1 {
-		return l, fmt.Errorf("kubeadm cluster %s needs exactly one control-plane node, has %d: %w", ref.Node.Name, cps, ErrUnsupported)
+		return l, fmt.Errorf("kubeadm cluster %s needs exactly one control-plane node that is not unjoined (it runs kubeadm init), has %d: %w", ref.Node.Name, cps, ErrUnsupported)
 	}
 	for _, h := range HostPlan(&ref.Template.Topology) {
 		if h.Node == ref.Node.Name {
@@ -157,14 +159,10 @@ func (d *KubeadmDriver) Provision(ctx context.Context, ref NodeRef) (NodeState, 
 		if err := ensureSecret(ctx, d.Client, d.reader(), ref.Session, ci, map[string][]byte{"userdata": ud}); err != nil {
 			return NodeState{Phase: labsv1.NodeProvisioning, Message: err.Error()}, err
 		}
-		cores, mem := kubeadmWorkerCores, int64(kubeadmWorkerMemMiB)
-		if m.Role == "control-plane" {
-			c, mm := vmResources(ref.Node.Resources, kubeadmCPCores, kubeadmCPMemMiB)
-			cores, mem = int(c), mm
-		}
+		cores, mem := memberResources(ref.Node, m)
 		vm := buildVM(ref.Session, net, vmSpec{
 			Name: l.vms[i], Hostname: m.Name, IP: h.IP, Image: imageWithRegistry(d.ImageRegistry, img.Image),
-			Cores: int64(cores), MemMiB: mem, CISecret: ci, Labels: vmLabels(ref, m.Name),
+			Cores: cores, MemMiB: mem, CISecret: ci, Labels: vmLabels(ref, m.Name),
 			Disk: d.Disks, DiskSize: img.DiskSize,
 		})
 		if err := setOwner(ref.Session, vm, d.Client); err != nil {
@@ -183,6 +181,22 @@ func (d *KubeadmDriver) Provision(ctx context.Context, ref NodeRef) (NodeState, 
 		}
 	}
 	return d.observe(ctx, ref, l, true)
+}
+
+// StateUnjoined: the member boots as a prepared host (packages, runtime and
+// kernel settings of the image, kubelet not configured) and runs neither
+// kubeadm init nor join; the learner joins it. Its role still sizes the VM,
+// so a control-plane member gets the control-plane resources.
+const StateUnjoined labsv1.ClusterNodeState = "unjoined"
+
+// memberResources is the VM size of a member: the cluster node's resources
+// (or the control-plane defaults) for every control-plane member, the worker
+// defaults otherwise.
+func memberResources(n labsv1.Node, m labsv1.ClusterNode) (int64, int64) {
+	if m.Role == "control-plane" {
+		return vmResources(n.Resources, kubeadmCPCores, kubeadmCPMemMiB)
+	}
+	return kubeadmWorkerCores, kubeadmWorkerMemMiB
 }
 
 type clusterPKI struct {
@@ -353,7 +367,11 @@ func (d *KubeadmDriver) userdata(ref NodeRef, l kubeadmLayout, m labsv1.ClusterN
 	ci := cloudInit{Hostname: m.Name, LearnerPub: learnerPub, AdminPub: adminPub, HostKey: p.hostKey[m.Name],
 		Hosts: HostPlan(&ref.Template.Topology)}
 	nodeReg := map[string]any{"name": m.Name, "criSocket": criSocket, "taints": taints}
-	if m.Role == "control-plane" {
+	if m.State == StateUnjoined {
+		// Prepared host only: hosts, keys and accounts; the learner joins it.
+		return ci.Render()
+	}
+	if m.Name == l.cp.Name {
 		cfg, err := yamlDocs(
 			map[string]any{
 				"apiVersion": "kubeadm.k8s.io/v1beta4", "kind": "InitConfiguration",
@@ -464,6 +482,9 @@ want() {
 `)
 	needDNS := false
 	for _, m := range l.members {
+		if m.State == StateUnjoined {
+			continue // not registered until the learner joins it
+		}
 		state := "ready"
 		if m.State == "notready" {
 			state = "notready"
@@ -480,7 +501,7 @@ want() {
 		}
 	}
 	for _, m := range l.members {
-		if len(m.Labels) == 0 {
+		if len(m.Labels) == 0 || m.State == StateUnjoined {
 			continue
 		}
 		args := []string{"kubectl", "label", "node", m.Name, "--overwrite"}

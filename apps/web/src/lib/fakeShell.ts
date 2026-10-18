@@ -505,7 +505,7 @@ export class FakeShell {
         if (/^(no|node|nodes)$/.test(res)) {
           this.println(ctxTag);
           this.println(wide ? pad('NAME', 16) + pad('STATUS', 10) + pad('ROLES', 16) + pad('AGE', 6) + pad('VERSION', 10) + pad('INTERNAL-IP', 14) + 'OS-IMAGE' : pad('NAME', 16) + pad('STATUS', 10) + pad('ROLES', 16) + pad('AGE', 6) + 'VERSION');
-          nodes.forEach((n, i) => {
+          nodes.filter((n) => n.state !== 'unjoined').forEach((n, i) => {
             const base = pad(n.name, 16) + pad(n.state === 'notready' ? 'NotReady' : 'Ready', 10) + pad(n.role === 'control-plane' ? 'control-plane' : '<none>', 16) + pad(`${12 + i}d`, 6) + pad(`v${cluster.cluster?.version ?? '1.35.1'}`, 10);
             this.println(wide ? base + pad(`10.40.0.${11 + i}`, 14) + 'Ubuntu 24.04.1 LTS' : base.trimEnd());
           });

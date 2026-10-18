@@ -40,7 +40,7 @@ export interface ClusterNode {
   role: 'control-plane' | 'worker';
   taints?: string[];
   labels?: Record<string, string>;
-  state?: 'ready' | 'notready';
+  state?: 'ready' | 'notready' | 'unjoined';
 }
 
 export interface TopologyNode {

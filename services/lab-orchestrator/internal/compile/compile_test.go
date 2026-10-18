@@ -195,7 +195,7 @@ spec:
       - {name: ws, driver: container, image: "jumphost:1"}
       - name: k
         driver: k8s-cluster
-        cluster: {mode: kubeadm, nodes: [{name: w1, role: worker}]}
+        cluster: {mode: kubeadm, nodes: [{name: w1, role: worker}, {name: cp2, role: control-plane, state: unjoined, labels: {a: b}}]}
     links:
       - {a: "ws:eth1", b: "k8s"}
       - {a: "ws:eth1", b: "ghost:eth0"}
@@ -206,7 +206,8 @@ spec:
     steps: [{on: k/w9, run: "true"}]
 `),
 			[]string{
-				"kubeadm cluster needs at least one control-plane",
+				"kubeadm cluster needs exactly one control-plane node that is not unjoined",
+				`unjoined node "cp2" is not registered at boot`,
 				`endpoint "k8s" must be node:interface`,
 				`interface "ws:eth1" already used`,
 				`unknown node "ghost"`,
