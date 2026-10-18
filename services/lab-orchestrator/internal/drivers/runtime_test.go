@@ -219,6 +219,8 @@ func TestEntryPolicyNetworks(t *testing.T) {
 
 func TestKubeadmUserdata(t *testing.T) {
 	tpl := kubeadmTopology()
+	c := tpl.Topology.Nodes[1].Cluster
+	c.Nodes = append(c.Nodes, labsv1.ClusterNode{Name: "yard-cp-2", Role: "control-plane", State: StateUnjoined})
 	ref := NodeRef{Session: testSession(), Template: tpl, Node: tpl.Topology.Nodes[1]}
 	d := &KubeadmDriver{}
 	l, err := d.layout(ref)
@@ -273,6 +275,25 @@ func TestKubeadmUserdata(t *testing.T) {
 			if !strings.Contains(s, "systemctl disable --now kubelet") || !strings.Contains(s, "effect: NoSchedule") {
 				t.Error("notready worker must stop its kubelet and carry its taint")
 			}
+		case "yard-cp-2":
+			if strings.Contains(s, "kubeadm") || strings.Contains(s, "/etc/kubernetes/pki") || !strings.Contains(s, "/etc/cloudtrain/resolv.conf") {
+				t.Errorf("unjoined control plane: a prepared host without init, join or cluster PKI\n%s", s)
+			}
+		}
+	}
+	if l.cp.Name != "yard-cp-1" {
+		t.Errorf("init control plane %q, want yard-cp-1", l.cp.Name)
+	}
+	// Every control-plane member gets the control-plane size (an unjoined one
+	// joins later with --control-plane, whose preflight wants 2 CPUs, 1700 MB).
+	for _, m := range l.members {
+		c, mem := memberResources(ref.Node, m)
+		want := [2]int64{kubeadmWorkerCores, kubeadmWorkerMemMiB}
+		if m.Role == "control-plane" {
+			want = [2]int64{kubeadmCPCores, kubeadmCPMemMiB}
+		}
+		if [2]int64{c, mem} != want {
+			t.Errorf("%s: %d cores %d MiB, want %v", m.Name, c, mem, want)
 		}
 	}
 	script := convergeScript(ref, l)
@@ -280,6 +301,9 @@ func TestKubeadmUserdata(t *testing.T) {
 		if !strings.Contains(script, w) {
 			t.Errorf("converge script lacks %q:\n%s", w, script)
 		}
+	}
+	if strings.Contains(script, "yard-cp-2") {
+		t.Errorf("converge script waits for the unjoined member:\n%s", script)
 	}
 	if _, err := ParseTaint("bad"); err == nil {
 		t.Error("taint without effect accepted")

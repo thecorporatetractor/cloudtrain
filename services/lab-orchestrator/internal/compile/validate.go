@@ -100,16 +100,21 @@ func validateSemantics(s *labsv1.LabTemplateSpec) []Issue {
 			members := map[string]bool{}
 			cps := 0
 			for j, m := range n.Cluster.Nodes {
+				mp := fmt.Sprintf("%s/cluster/nodes/%d", path, j)
 				if members[m.Name] {
-					add(fmt.Sprintf("%s/cluster/nodes/%d", path, j), "duplicate cluster node %q", m.Name)
+					add(mp, "duplicate cluster node %q", m.Name)
 				}
 				members[m.Name] = true
-				if m.Role == "control-plane" {
+				if m.State == "unjoined" {
+					if len(m.Taints) > 0 || len(m.Labels) > 0 {
+						add(mp, "unjoined node %q is not registered at boot: it takes no taints or labels", m.Name)
+					}
+				} else if m.Role == "control-plane" {
 					cps++
 				}
 			}
-			if n.Cluster.Mode == labsv1.ClusterModeKubeadm && cps == 0 {
-				add(path+"/cluster", "kubeadm cluster needs at least one control-plane node")
+			if n.Cluster.Mode == labsv1.ClusterModeKubeadm && cps != 1 {
+				add(path+"/cluster", "kubeadm cluster needs exactly one control-plane node that is not unjoined (it runs kubeadm init), has %d; a further control plane joins later: role control-plane, state unjoined", cps)
 			}
 			if n.Cluster.Mode == labsv1.ClusterModeVirtual && len(n.Cluster.Nodes) > 0 {
 				add(path+"/cluster/nodes", "virtual clusters have no addressable nodes; use mode kubeadm")
