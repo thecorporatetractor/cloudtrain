@@ -1,0 +1,252 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctf-ticket-gate-breach
+  title: "Investigate a break-in on the ticket gateway (CTF)"
+  domain: linux
+  frameworks: [lpic1:gnu-commands, linuxplus:automation-scripting]
+  difficulty: easy
+  estimatedMinutes: 20
+  tags: [ctf, investigation, grep, awk, logs, text-processing]
+  version: 1
+spec:
+  description: |
+    Overnight, someone got into the Tallowmere Rail ticket gateway and exported a
+    file. The gateway writes one line per event to
+    `/var/log/tr-ticketing/gateway.log`:
+
+    ```
+    2026-10-18T01:02:03Z tkt-gateway event=login ip=192.0.2.14 user=bram result=fail ua="..."
+    2026-10-18T01:09:41Z tkt-gateway event=export ip=192.0.2.14 user=bram file=/srv/exports/... bytes=...
+    ```
+
+    Answer the questions in the **Questions** panel, in order: each one opens once
+    the one before it is answered (or out of attempts). Wrong answers and hints cost
+    points. Only the log is evidence; `grep`, `awk`, `sort`, `uniq` and `cut` are all
+    you need.
+
+    Finally, put the attacker's IP address on the gateway's blocklist: write it,
+    alone on one line, to `~/incident/blocklist.txt`, then validate.
+  objectives:
+    - Filter a log by field values with grep
+    - Count and rank values with sort and uniq -c
+    - Follow one actor through a log and extract fields with awk, sed or cut
+  params:
+    # Answers depend on these, so they are secret (never sent to the browser).
+    octet: {type: int, min: 10, max: 250, secret: true}
+    victim: {type: choice, values: [ada, bram, cato, dilys, edwin, freya, gideon, hulda], secret: true}
+    uaminor: {type: int, min: 20, max: 32, secret: true}
+    export: {type: choice, values: [fares-2026-10.csv, season-tickets.csv, staff-passes.csv, refunds-q3.csv, card-tokens.csv, booking-holds.csv], secret: true}
+    # Shapes the noise and the counts.
+    salt: {type: int, min: 1, max: 97}
+  topology:
+    entry: tkt-gate-01
+    nodes:
+      - name: tkt-gate-01
+        driver: container
+        image: deb-lab:24.04
+        access: [shell]
+  setup:
+    - on: tkt-gate-01
+      run: |
+        set -eu
+        mkdir -p /var/log/tr-ticketing
+        f=/var/log/tr-ticketing/gateway.log
+        awk -v salt={{salt}} -v octet={{octet}} -v victim={{victim}} -v uaminor={{uaminor}} -v export={{export}} '
+        function ts(sec,  h, m, s) { h = int(sec / 3600); m = int((sec % 3600) / 60); s = sec % 60; return sprintf("2026-10-18T%02d:%02d:%02dZ", h, m, s) }
+        function login(sec, ip, user, res, ua) { printf "%s tkt-gateway event=login ip=%s user=%s result=%s ua=\"%s\"\n", ts(sec), ip, user, res, ua }
+        function exportev(sec, ip, user, file, bytes) { printf "%s tkt-gateway event=export ip=%s user=%s file=/srv/exports/%s bytes=%d\n", ts(sec), ip, user, file, bytes }
+        BEGIN {
+          nu = split("ada,bram,cato,dilys,edwin,freya,gideon,hulda,ivo,jessamy", users, ",")
+          nb = split("Mozilla/5.0 (X11; Linux x86_64) Firefox/131.0|Mozilla/5.0 (Windows NT 10.0) Chrome/130.0|Mozilla/5.0 (Macintosh) Safari/605.1", browsers, "|")
+          nf = split("timetable-week42.csv,depot-rota.csv,platform-works.csv,fares-2026-09.csv", files, ",")
+          attacker = "203.0.113." octet
+          decoy = "203.0.113." ((octet + 37) % 240 + 10)
+          # Staff: logins over the night, a few typos, ordinary exports.
+          for (i = 1; i <= 60 + salt % 23; i++) {
+            u = users[(i * 7 + salt) % nu + 1]; ip = "192.0.2." (10 + (i * 13 + salt) % 50); ua = browsers[i % nb + 1]
+            sec = 3600 + (i * 397 + salt * 61) % 18000
+            if (i % 9 == 0) login(sec - 20, ip, u, "fail", ua)
+            login(sec, ip, u, "ok", ua)
+            if (i % 4 == 0) exportev(sec + 90, ip, u, files[i % nf + 1], 20000 + (i * 811) % 90000)
+          }
+          # Attacker: password spraying across the staff, then one account works.
+          fails = 30 + (salt * 7) % 40
+          start = 7200 + (salt * 37) % 3600
+          k = 0
+          for (i = 1; i <= fails; i++) {
+            do { u = users[(i + k + salt) % nu + 1]; if (u == victim) k++ } while (u == victim)
+            login(start + i * 11, attacker, u, "fail", "python-requests/2." uaminor ".0")
+          }
+          login(start + (fails + 1) * 11, attacker, victim, "ok", "python-requests/2." uaminor ".0")
+          exportev(start + (fails + 1) * 11 + 140, attacker, victim, export, 400000 + salt * 1013)
+          # A noisy scanner that fails a little less often and never gets in.
+          for (i = 1; i <= fails - 5 - salt % 7; i++) login(1800 + i * 23, decoy, users[(i * 3) % nu + 1], "fail", "curl/8.5.0")
+        }' > "$f.raw"
+        sort -k1,1 -s "$f.raw" > "$f"
+        rm -f "$f.raw"
+        test "$(grep -c 'event=login' "$f")" -gt 100
+        chmod 0755 /var/log/tr-ticketing
+        chmod 0644 "$f"
+        install -d -o learner -g learner /home/learner/incident
+        rm -f /home/learner/incident/blocklist.txt
+  questionOrder: sequential
+  checks:
+    - id: q-attacker-ip
+      type: answer
+      description: Which IP address made the most failed login attempts?
+      skills: [linux.shell.text-processing]
+      answer:
+        match: exact
+        value: "203.0.113.{{octet}}"
+        points: 100
+        maxAttempts: 5
+        penalty: 10
+        placeholder: 192.0.2.1
+        hints:
+          - body: "Keep only the failed logins (`result=fail`), then count the `ip=` values: `sort | uniq -c | sort -rn` ranks them."
+            cost: 10
+          - body: "`grep -o 'ip=[^ ]*'` prints just the ip=... field of every matching line."
+            cost: 25
+    - id: q-failed-count
+      type: answer
+      description: How many failed login attempts came from that address?
+      skills: [linux.shell.text-processing]
+      answer:
+        match: number
+        compute:
+          command: grep -F "ip=203.0.113.{{octet}} " /var/log/tr-ticketing/gateway.log | grep -c 'result=fail'
+        points: 100
+        maxAttempts: 3
+        penalty: 20
+        placeholder: "42"
+        hints:
+          - body: "`grep -c` counts matching lines. Match the address with a trailing space (`grep -F \"ip=203.0.113.5 \"`) so 203.0.113.5 does not also match 203.0.113.50."
+            cost: 20
+    - id: q-victim
+      type: answer
+      description: Which staff account did the attacker get into?
+      skills: [linux.shell.text-processing, linux.shell.regex-sed-awk]
+      answer:
+        match: exact
+        value: "{{victim}}"
+        points: 150
+        maxAttempts: 3
+        penalty: 25
+        placeholder: username
+        hints:
+          - body: "Follow only the attacker's lines and look for the one login that did not fail."
+            cost: 30
+    - id: q-tool
+      type: answer
+      description: Which tool did the attacker use, according to the user agent? Give it as name/version.
+      skills: [linux.shell.regex-sed-awk]
+      answer:
+        match: regex
+        value: "python-requests/2\\.{{uaminor}}(\\.0)?"
+        points: 100
+        maxAttempts: 4
+        penalty: 15
+        placeholder: tool/1.2
+        hints:
+          - body: "The user agent is the quoted ua=\"...\" field. `sed 's/.*ua=\"\\([^\"]*\\)\".*/\\1/'` prints just its value."
+            cost: 20
+    - id: q-exfil
+      type: answer
+      description: Which file did the attacker export? Give its name or full path.
+      skills: [linux.shell.text-processing]
+      answer:
+        match: any-of
+        values: ["/srv/exports/{{export}}", "{{export}}"]
+        points: 150
+        maxAttempts: 3
+        penalty: 25
+        placeholder: /srv/exports/example.csv
+        hints:
+          - body: "Exports are `event=export` lines; the attacker exported right after the successful login."
+            cost: 30
+    - id: blocklist
+      type: shell
+      on: tkt-gate-01
+      description: ~/incident/blocklist.txt holds the attacker's IP address, alone on one line
+      skills: [linux.shell.text-processing]
+      weight: 2
+      command: test "$(cat /home/learner/incident/blocklist.txt 2>/dev/null)" = "203.0.113.{{octet}}" && echo blocked || echo no
+      expect: {match: exact, value: blocked}
+  hints:
+    - title: Look before you filter
+      command: head -5 /var/log/tr-ticketing/gateway.log
+      body: Every line is one event with key=value fields; note which keys tell logins, results and addresses apart.
+      cost: 0
+  misconceptions:
+    - id: decoy-scanner
+      description: Ranks by the wrong count and blames the noisy scanner, which only comes second.
+      feedback: "Count failed logins per address and take the top one; the scanner fails often but less often than the attacker."
+      expectFail: [q-attacker-ip]
+      answers:
+        q-attacker-ip:
+          command: grep 'result=fail' /var/log/tr-ticketing/gateway.log | grep -o 'ip=[^ ]*' | sort | uniq -c | sort -rn | sed -n 2p | sed 's/.*ip=//'
+    - id: all-failures
+      description: Counts every failed login in the log, not just the attacker's.
+      feedback: "Filter on the attacker's address first, then count."
+      expectFail: [q-failed-count]
+      answers:
+        q-failed-count:
+          command: grep -c 'result=fail' /var/log/tr-ticketing/gateway.log
+    - id: first-tried-account
+      description: Names the first account the attacker tried instead of the one that worked.
+      feedback: "Only one of the attacker's logins has result=ok."
+      expectFail: [q-victim]
+      answers:
+        q-victim:
+          command: ip=$(grep 'result=fail' /var/log/tr-ticketing/gateway.log | grep -o 'ip=[^ ]*' | sort | uniq -c | sort -rn | head -1 | sed 's/.*ip=//'); grep -F "ip=$ip " /var/log/tr-ticketing/gateway.log | head -1 | grep -o 'user=[^ ]*' | cut -d= -f2
+    - id: tool-without-version
+      description: Names the tool but leaves out its version.
+      feedback: "The question asks for name/version, exactly as the user agent gives it."
+      expectFail: [q-tool]
+      answers:
+        q-tool: python-requests
+    - id: scanner-tool
+      description: Reads the user agent of the scanner instead of the attacker.
+      expectFail: [q-tool]
+      answers:
+        q-tool: curl/8.5.0
+    - id: staff-export
+      description: Reports the first export in the log, made by a member of staff.
+      feedback: "Follow the attacker's address to its export line."
+      expectFail: [q-exfil]
+      answers:
+        q-exfil:
+          command: ip=$(grep 'result=fail' /var/log/tr-ticketing/gateway.log | grep -o 'ip=[^ ]*' | sort | uniq -c | sort -rn | head -1 | sed 's/.*ip=//'); grep 'event=export' /var/log/tr-ticketing/gateway.log | grep -vF "ip=$ip " | head -1 | grep -o 'file=[^ ]*' | cut -d= -f2
+    - id: blocks-scanner
+      description: Blocks the scanner instead of the attacker.
+      expectFail: [blocklist]
+      mutation:
+        on: tkt-gate-01
+        as: learner
+        run: grep 'result=fail' /var/log/tr-ticketing/gateway.log | grep -o 'ip=[^ ]*' | sort | uniq -c | sort -rn | sed -n 2p | sed 's/.*ip=//' > ~/incident/blocklist.txt
+  solution:
+    explanation: |
+      Rank failed logins by address (`grep result=fail | grep -o 'ip=[^ ]*' | sort |
+      uniq -c | sort -rn`): the top address is the attacker, the runner-up a scanner
+      that never gets in. Follow the attacker's lines (`grep -F "ip=<addr> "`): count
+      its failures, find its one `result=ok` login (the account), read its user agent
+      and its `event=export` line (the file). Block the address.
+    steps:
+      - on: tkt-gate-01
+        as: learner
+        run: |
+          mkdir -p ~/incident
+          grep 'result=fail' /var/log/tr-ticketing/gateway.log | grep -o 'ip=[^ ]*' | sort | uniq -c | sort -rn | head -1 | sed 's/.*ip=//' > ~/incident/blocklist.txt
+          cat ~/incident/blocklist.txt
+    answers:
+      q-attacker-ip:
+        command: grep 'result=fail' /var/log/tr-ticketing/gateway.log | grep -o 'ip=[^ ]*' | sort | uniq -c | sort -rn | head -1 | sed 's/.*ip=//'
+      q-failed-count:
+        command: ip=$(cat ~/incident/blocklist.txt); grep -F "ip=$ip " /var/log/tr-ticketing/gateway.log | grep -c 'result=fail'
+      q-victim:
+        command: ip=$(cat ~/incident/blocklist.txt); grep -F "ip=$ip " /var/log/tr-ticketing/gateway.log | grep 'result=ok' | grep -o 'user=[^ ]*' | cut -d= -f2
+      q-tool:
+        command: ip=$(cat ~/incident/blocklist.txt); grep -F "ip=$ip " /var/log/tr-ticketing/gateway.log | head -1 | sed 's/.*ua="\([^"]*\)".*/\1/'
+      q-exfil:
+        command: ip=$(cat ~/incident/blocklist.txt); grep -F "ip=$ip " /var/log/tr-ticketing/gateway.log | grep 'event=export' | grep -o 'file=[^ ]*' | cut -d= -f2

@@ -79,7 +79,8 @@ export type CheckType =
   | 'service-state'
   | 'reachability'
   | 'device-cmd'
-  | 'http';
+  | 'http'
+  | 'answer';
 
 export interface LabCheck {
   id: string;

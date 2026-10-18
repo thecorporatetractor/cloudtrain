@@ -251,6 +251,7 @@ func (r *LabSessionReconciler) mirror(ctx context.Context, s, p *labsv1.LabSessi
 		st.Phase = labsv1.SessionPending
 	}
 	st.ResolvedParams = ps.ResolvedParams
+	st.ComputedAnswers = ps.ComputedAnswers
 	st.Nodes = ps.Nodes
 	st.Endpoints = ps.Endpoints
 	st.EntryNode = ps.EntryNode

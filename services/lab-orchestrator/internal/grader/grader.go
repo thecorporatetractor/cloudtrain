@@ -71,12 +71,16 @@ func (g *Grader) now() time.Time {
 	return time.Now()
 }
 
-// Grade runs every check once, in order, and returns the weighted score
-// (0-100) and per-check results.
+// Grade runs every end-state check once, in order, and returns the weighted
+// score (0-100) and per-check results. Answer checks are skipped: the
+// platform grades the learner's submitted answers instead (package answer).
 func (g *Grader) Grade(ctx context.Context, checks []labsv1.Check) (int32, []labsv1.CheckResult) {
 	results := make([]labsv1.CheckResult, 0, len(checks))
 	var total, got float64
 	for _, c := range checks {
+		if c.Type == labsv1.CheckTypeAnswer {
+			continue
+		}
 		start := g.now()
 		r := g.run(ctx, c)
 		r.DurationMs = g.now().Sub(start).Milliseconds()

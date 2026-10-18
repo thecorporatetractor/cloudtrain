@@ -46,6 +46,85 @@ export type Action = {
 export type Action1 = {
   [k: string]: unknown;
 };
+/**
+ * Answer check (type answer): the check's description is the question. The expected value comes from the session: `value`/`values` reference secret {{params}}, or `compute` runs a command on a lab node right after setup (stored server side, never sent to the browser). Answers are normalised (case, whitespace) before matching.
+ *
+ * This interface was referenced by `Lab`'s JSON-Schema
+ * via the `definition` "answer".
+ */
+export type Answer = {
+  /**
+   * exact: normalised strings are equal. number: both parse as decimal numbers within `tolerance`. regex: the normalised answer fully matches the pattern (RE2 subset shared by Go and JavaScript; template values are inserted verbatim). any-of: equal to one of the accepted values (`values`, or each non-empty line of the computed output).
+   */
+  match: "exact" | "number" | "regex" | "any-of";
+  /**
+   * Expected value (exact, number) or pattern (regex), templated with {{params}}.
+   */
+  value?: string;
+  /**
+   * Accepted values for any-of, templated with {{params}}.
+   *
+   * @minItems 1
+   */
+  values?: [string, ...string[]];
+  /**
+   * Computes the expected value once per session, right after setup: runs `command` as admin on `on` (default: the entry node) and keeps its stdout (trailing newline removed). For any-of, each non-empty line is one accepted value. A failing command fails the session's setup.
+   */
+  compute?: {
+    on?: string;
+    command: string;
+    timeoutSec?: number;
+  };
+  caseSensitive?: boolean;
+  /**
+   * trim: strip leading/trailing whitespace. collapse: trim, then every run of whitespace becomes one space. remove: drop all whitespace. none: compare as typed.
+   */
+  whitespace?: "trim" | "collapse" | "remove" | "none";
+  /**
+   * number: the largest accepted absolute difference.
+   */
+  tolerance?: number;
+  points?: number;
+  /**
+   * Wrong answers allowed before the question closes. Unlimited when absent.
+   */
+  maxAttempts?: number;
+  /**
+   * Points taken off the question's award for every wrong answer (never below 0).
+   */
+  penalty?: number;
+  /**
+   * Example of the expected format, shown in the empty answer box (e.g. 203.0.113.7).
+   */
+  placeholder?: string;
+  /**
+   * Question hints, revealed one at a time on request; each costs `cost` points off the question's award.
+   */
+  hints?: {
+    body: string;
+    cost?: number;
+  }[];
+} & Answer1;
+export type Answer1 = {
+  [k: string]: unknown;
+};
+/**
+ * An answer the verifier submits: a string (templated with {{params}}), or a command whose stdout (trimmed) is the answer.
+ *
+ * This interface was referenced by `Lab`'s JSON-Schema
+ * via the `definition` "answerInput".
+ */
+export type AnswerInput =
+  | string
+  | {
+      /**
+       * Node (default: the entry node).
+       */
+      on?: string;
+      as?: "learner" | "admin";
+      command: string;
+      timeoutSec?: number;
+    };
 
 /**
  * A hands-on lab: a topology of nodes and links, setup actions, typed checks tagged with skills, and a reference solution. Domain-agnostic (Kubernetes, Linux, networking).
@@ -83,6 +162,10 @@ export interface Lab {
         max?: number;
         prefix?: string;
         default?: unknown;
+        /**
+         * Never sent to the learner's browser. Required for every param an answer check's expected value references; a secret param must not appear in learner-visible text (description, objectives, hints, check descriptions, question hints).
+         */
+        secret?: boolean;
       };
     };
     topology: Topology;
@@ -92,6 +175,10 @@ export interface Lab {
      * @minItems 1
      */
     checks: [Check, ...Check[]];
+    /**
+     * How the lab's answer checks (questions) unlock. free: every question is open from the start. sequential: a question opens once the one before it is solved or has no attempts left.
+     */
+    questionOrder?: "free" | "sequential";
     hints?: {
       title: string;
       body: string;
@@ -106,7 +193,13 @@ export interface Lab {
       description: string;
       mutation?: Action;
       /**
-       * Ids of the checks aimed at this misconception. Each must fail after `mutation`; failures of other checks (e.g. the context check) do not count.
+       * Wrong answers for answer checks (by check id): the verifier submits each one in a fresh session and requires every check listed in `expectFail` to reject it. Use instead of `mutation`.
+       */
+      answers?: {
+        [k: string]: AnswerInput;
+      };
+      /**
+       * Ids of the checks aimed at this misconception. Each must fail after `mutation` (end-state checks) or reject the answer given in `answers` (answer checks); failures of other checks (e.g. the context check) do not count.
        *
        * @minItems 1
        */
@@ -119,12 +212,23 @@ export interface Lab {
     exam?: {
       rerun?: Action[];
     };
+    /**
+     * The reference solution: `steps` for end-state checks, `answers` for answer checks (a lab with both has both).
+     */
     solution: {
+      [k: string]: unknown;
+    } & {
       explanation?: string;
       /**
        * @minItems 1
        */
-      steps: [Action, ...Action[]];
+      steps?: [Action, ...Action[]];
+      /**
+       * The correct answer for every answer check (by check id). The verifier runs the steps first, then submits each answer and requires it to be accepted. Prefer a command (derive the answer from the lab like a learner would) over a templated string.
+       */
+      answers?: {
+        [k: string]: AnswerInput;
+      };
       /**
        * Other valid ways to solve the lab. The Scenario Studio verifier applies each alternative's steps in a fresh session and requires every check to pass, so a correct but different approach is never penalised.
        */
@@ -242,6 +346,9 @@ export interface Check {
    */
   skills: [string, ...string[]];
   weight?: number;
+  /**
+   * answer: a question the learner answers in the lab view (CTF style); the platform grades the submitted answer against `answer`. Every other type grades the lab's end state when the learner validates.
+   */
   type:
     | "shell"
     | "k8s-query"
@@ -251,7 +358,9 @@ export interface Check {
     | "service-state"
     | "reachability"
     | "device-cmd"
-    | "http";
+    | "http"
+    | "answer";
+  answer?: Answer;
   on?: string;
   command?: string;
   query?: {

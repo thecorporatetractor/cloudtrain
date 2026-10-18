@@ -172,6 +172,10 @@ func taskIssues(t *labsv1.LabTemplate) []string {
 			// environment; the final current context says nothing about one task.
 			out = append(out, fmt.Sprintf("task %s check %s: k8s-context checks are not allowed in exam tasks (the statement names the context instead)", id, c.ID))
 		}
+		if c.Type == labsv1.CheckTypeAnswer {
+			// Exam attempts are graded on end state only; CTF questions belong to CTF labs and events.
+			out = append(out, fmt.Sprintf("task %s check %s: answer checks are not allowed in exam tasks", id, c.ID))
+		}
 	}
 	return out
 }

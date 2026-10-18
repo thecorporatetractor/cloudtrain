@@ -2,7 +2,7 @@ import { readFile, readdir, stat } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import YAML from "yaml";
-import { validateLab, referencedParams } from "@cloudtrain/lab-schema";
+import { validateLab, referencedParams, secretParams } from "@cloudtrain/lab-schema";
 import { scanText } from "./denylist.mjs";
 import { checkCurriculum } from "./curriculum.mjs";
 
@@ -273,7 +273,7 @@ export async function checkLab(labFile, skills, frameworkRefs, findings, ctx = {
   const actions = [
     ["setup", spec.setup ?? []],
     ["teardown", spec.teardown ?? []],
-    ["solution/steps", spec.solution.steps],
+    ["solution/steps", spec.solution.steps ?? []],
     ...(spec.solution.alternatives ?? []).map((a, i) => [`solution/alternatives/${i}/steps`, a.steps ?? []]),
     // Map before filtering so the path index matches the misconception's position.
     ...(spec.misconceptions ?? []).map((m, i) => [`misconceptions/${i}/mutation`, m.mutation ? [m.mutation] : []]),
@@ -290,6 +290,41 @@ export async function checkLab(labFile, skills, frameworkRefs, findings, ctx = {
       }
     });
   }
+  // Answer checks (CTF questions): nodes, RE2 patterns, and answers that come from the session.
+  const secrets = secretParams(doc);
+  const refsIn = (t) => [...String(t ?? "").matchAll(/\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}/g)].map((m) => m[1]);
+  const answerIds = new Set(spec.checks.filter((c) => c.type === "answer").map((c) => c.id));
+  spec.checks.forEach((c, i) => {
+    if (c.type !== "answer" || !c.answer) return;
+    const at = `/spec/checks/${i}/answer`;
+    resolveOn(c.answer.compute?.on, `${at}/compute/on`);
+    if (c.answer.match === "regex" && c.answer.value) {
+      for (const problem of re2Problems(c.answer.value)) findings.push({ level: "error", file: labFile, path: `${at}/value`, message: `regex uses ${problem}, which Go's RE2 does not support` });
+    }
+    if (!c.answer.compute) {
+      const refs = [c.answer.value, ...(c.answer.values ?? [])].flatMap(refsIn);
+      if (!refs.length) findings.push({ level: "error", file: labFile, path: at, message: `the expected answer of '${c.id}' must come from the session: reference a secret {{param}} or use compute` });
+      for (const r of refs) if (!secrets.has(r)) findings.push({ level: "error", file: labFile, path: at, message: `param '${r}' gives the expected answer away: declare it secret: true` });
+    }
+    if (!(c.id in (spec.solution.answers ?? {}))) findings.push({ level: "error", file: labFile, path: "/spec/solution/answers", message: `no solution answer for '${c.id}'` });
+  });
+  const visible = [["/spec/description", spec.description], ...(spec.objectives ?? []).map((o, i) => [`/spec/objectives/${i}`, o])];
+  (spec.hints ?? []).forEach((h, i) => visible.push([`/spec/hints/${i}`, `${h.title} ${h.body} ${h.command ?? ""}`]));
+  spec.checks.forEach((c, i) => {
+    visible.push([`/spec/checks/${i}/description`, c.description]);
+    (c.answer?.hints ?? []).forEach((h, j) => visible.push([`/spec/checks/${i}/answer/hints/${j}`, h.body]));
+    if (c.answer?.placeholder) visible.push([`/spec/checks/${i}/answer/placeholder`, c.answer.placeholder]);
+  });
+  for (const [where, text] of visible) for (const r of refsIn(text)) if (secrets.has(r)) findings.push({ level: "error", file: labFile, path: where, message: `secret param '{{${r}}}' must not appear in learner-visible text` });
+  const answerInputs = [
+    ...Object.entries(spec.solution.answers ?? {}).map(([id, a]) => [`/spec/solution/answers/${id}`, id, a]),
+    ...(spec.misconceptions ?? []).flatMap((m, i) => Object.entries(m.answers ?? {}).map(([id, a]) => [`/spec/misconceptions/${i}/answers/${id}`, id, a])),
+  ];
+  for (const [where, id, a] of answerInputs) {
+    if (!answerIds.has(id)) findings.push({ level: "error", file: labFile, path: where, message: `'${id}' is not an answer check` });
+    if (typeof a === "object") resolveOn(a.on, `${where}/on`);
+  }
+
   spec.checks.forEach((c, i) => {
     resolveOn(c.on, `/spec/checks/${i}/on`);
     if (c.query?.cluster && nodes.get(c.query.cluster)?.driver !== "k8s-cluster") {
@@ -353,6 +388,12 @@ export async function checkLab(labFile, skills, frameworkRefs, findings, ctx = {
   const contextChecks = spec.checks.filter((c) => c.type === "k8s-context");
   (spec.misconceptions ?? []).forEach((m, i) => {
     const where = `/spec/misconceptions/${i}`;
+    if (m.answers) {
+      for (const id of m.expectFail ?? []) {
+        if (!(id in m.answers)) findings.push({ level: "error", file: labFile, path: `${where}/expectFail`, message: `'${id}' gets no wrong answer in misconception '${m.id}'` });
+      }
+      return;
+    }
     if (!m.mutation) {
       findings.push({ level: "warn", file: labFile, path: where, message: `misconception '${m.id}' has no mutation, so nothing proves a check catches it` });
       return;
@@ -395,9 +436,12 @@ export async function checkLab(labFile, skills, frameworkRefs, findings, ctx = {
   // Authoring quality bar for the pack. Exam tasks (curriculum type exam, or
   // tag `exam`) are graded without help, so they must have no hints instead.
   const isExam = ctx.examTasks?.has(doc.metadata.id) || (doc.metadata?.tags ?? []).includes("exam");
+  const questionHints = spec.checks.reduce((n, c) => n + (c.answer?.hints?.length ?? 0), 0);
   if (isExam) {
     if (spec.hints?.length) findings.push({ level: "error", file: labFile, path: "/spec/hints", message: "exam task must not have hints" });
-  } else if (!spec.hints?.length) findings.push({ level: "warn", file: labFile, message: "no hints" });
+    if (answerIds.size) findings.push({ level: "error", file: labFile, path: "/spec/checks", message: "exam tasks are graded on end state; answer checks are not allowed" });
+  } else if (!spec.hints?.length && !questionHints) findings.push({ level: "warn", file: labFile, message: "no hints" });
+  if (ctx.ctfLabs?.has(doc.metadata.id) && !answerIds.size) findings.push({ level: "error", file: labFile, path: "/spec/checks", message: "curriculum type ctf: the lab needs at least one answer check" });
   if (!spec.misconceptions?.length) findings.push({ level: "warn", file: labFile, message: "no misconceptions" });
 
   return doc;
@@ -457,6 +501,7 @@ export async function verifyContent(contentDir, opts = {}) {
   const labs = [];
   // Exam tasks (curriculum labs of type exam) follow exam rules: no hints, no course.
   const examTasks = new Set();
+  const ctfLabs = new Set();
   // The approved curriculum's own framework objectives and newSkills are valid lab references.
   const curriculumFrameworkRefs = new Set();
   const curriculumSkills = new Set();
@@ -464,6 +509,7 @@ export async function verifyContent(contentDir, opts = {}) {
   if (existsSync(curriculumFile)) {
     const cur = await loadYaml(curriculumFile, []);
     for (const l of cur?.labs ?? []) if (l?.type === "exam") examTasks.add(l.id);
+    for (const l of cur?.labs ?? []) if (l?.type === "ctf") ctfLabs.add(l.id);
     for (const f of cur?.frameworks ?? []) for (const o of f?.objectives ?? []) curriculumFrameworkRefs.add(`${f.id}:${o.id}`);
     for (const k of cur?.newSkills ?? []) if (k?.id) curriculumSkills.add(k.id);
   }
@@ -482,7 +528,7 @@ export async function verifyContent(contentDir, opts = {}) {
         continue;
       }
       const before = findings.filter((f) => f.level === "error").length;
-      const doc = await checkLab(labFile, skills, frameworkRefs, findings, { catalog, usedSkills, examTasks, curriculumFrameworkRefs, curriculumSkills });
+      const doc = await checkLab(labFile, skills, frameworkRefs, findings, { catalog, usedSkills, examTasks, ctfLabs, curriculumFrameworkRefs, curriculumSkills });
       const ok = findings.filter((f) => f.level === "error").length === before;
       labs.push({ file: labFile, id: doc?.metadata?.id ?? lab, ok, checks: doc?.spec?.checks?.length ?? 0 });
       packLabs.set(doc?.metadata?.id ?? lab, { domain: doc?.metadata?.domain, frameworks: doc?.metadata?.frameworks ?? [], images: [...new Set((doc?.spec?.topology?.nodes ?? []).map((n) => n.image).filter(Boolean))] });

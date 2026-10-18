@@ -7,6 +7,7 @@ import { ConflictError, type LabCluster } from '../kube/cluster.js';
 import type { Compiler } from '../kube/compile.js';
 import { ANNOTATION_HINTS, LABEL_LAB, LABEL_LEARNER, LABEL_MANAGED_BY, LABEL_ORG, LABS_API_VERSION, MANAGED_BY, type LabSession } from '../kube/types.js';
 import { labIdOf, phaseOf, revealedHints, toWebSession } from './map.js';
+import { endStateChecks } from '../content/view.js';
 
 /**
  * Platform side effects around the session lifecycle (quotas, content
@@ -221,7 +222,7 @@ export class SessionService {
       current = next;
     }
     const session = toWebSession(current, lab.lab);
-    const total = lab.lab.spec.checks.length;
+    const total = endStateChecks(lab.lab).length;
     const passed = session.results.filter((r) => r.status === 'pass').length;
     const skillsTouched = Array.from(new Set(session.results.flatMap((r) => r.skills ?? [])));
     const summary = { passed, total, score: session.score, skillsTouched };

@@ -34,6 +34,7 @@ type sourceSpec struct {
 	Setup          []sourceAction         `json:"setup"`
 	Teardown       []sourceAction         `json:"teardown"`
 	Checks         []sourceCheck          `json:"checks"`
+	QuestionOrder  string                 `json:"questionOrder"`
 	Hints          []sourceHint           `json:"hints"`
 	Misconceptions []sourceMisconception  `json:"misconceptions"`
 	Solution       sourceSolution         `json:"solution"`
@@ -51,6 +52,7 @@ type sourceParam struct {
 	Max     *int64 `json:"max"`
 	Prefix  string `json:"prefix"`
 	Default any    `json:"default"`
+	Secret  bool   `json:"secret"`
 }
 
 // UnmarshalJSON decodes numbers in values/default as json.Number (exact), and
@@ -149,6 +151,63 @@ type sourceCheck struct {
 	Port        *int32        `json:"port"`
 	Expect      *sourceExpect `json:"expect"`
 	TimeoutSec  *int32        `json:"timeoutSec"`
+	Answer      *sourceAnswer `json:"answer"`
+}
+
+type sourceAnswer struct {
+	Match         string             `json:"match"`
+	Value         *string            `json:"value"`
+	Values        []string           `json:"values"`
+	Compute       *sourceCompute     `json:"compute"`
+	CaseSensitive bool               `json:"caseSensitive"`
+	Whitespace    string             `json:"whitespace"`
+	Tolerance     *float64           `json:"tolerance"`
+	Points        *int32             `json:"points"`
+	MaxAttempts   *int32             `json:"maxAttempts"`
+	Penalty       *int32             `json:"penalty"`
+	Placeholder   string             `json:"placeholder"`
+	Hints         []sourceAnswerHint `json:"hints"`
+}
+
+type sourceCompute struct {
+	On         string `json:"on"`
+	Command    string `json:"command"`
+	TimeoutSec *int32 `json:"timeoutSec"`
+}
+
+type sourceAnswerHint struct {
+	Body string `json:"body"`
+	Cost *int32 `json:"cost"`
+}
+
+// sourceAnswerInput is a string or {on, as, command, timeoutSec}.
+type sourceAnswerInput struct {
+	Value      *string
+	On         string
+	As         string
+	Command    string
+	TimeoutSec *int32
+}
+
+func (a *sourceAnswerInput) UnmarshalJSON(b []byte) error {
+	var str string
+	if err := json.Unmarshal(b, &str); err == nil {
+		*a = sourceAnswerInput{Value: &str}
+		return nil
+	}
+	var obj struct {
+		On         string `json:"on"`
+		As         string `json:"as"`
+		Command    string `json:"command"`
+		TimeoutSec *int32 `json:"timeoutSec"`
+	}
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&obj); err != nil {
+		return err
+	}
+	*a = sourceAnswerInput{On: obj.On, As: obj.As, Command: obj.Command, TimeoutSec: obj.TimeoutSec}
+	return nil
 }
 
 type sourceQuery struct {
@@ -174,17 +233,19 @@ type sourceHint struct {
 }
 
 type sourceMisconception struct {
-	ID          string        `json:"id"`
-	Description string        `json:"description"`
-	Mutation    *sourceAction `json:"mutation"`
-	ExpectFail  []string      `json:"expectFail"`
-	Feedback    string        `json:"feedback"`
+	ID          string                       `json:"id"`
+	Description string                       `json:"description"`
+	Mutation    *sourceAction                `json:"mutation"`
+	Answers     map[string]sourceAnswerInput `json:"answers"`
+	ExpectFail  []string                     `json:"expectFail"`
+	Feedback    string                       `json:"feedback"`
 }
 
 type sourceSolution struct {
-	Explanation  string              `json:"explanation"`
-	Steps        []sourceAction      `json:"steps"`
-	Alternatives []sourceAlternative `json:"alternatives"`
+	Explanation  string                       `json:"explanation"`
+	Steps        []sourceAction               `json:"steps"`
+	Answers      map[string]sourceAnswerInput `json:"answers"`
+	Alternatives []sourceAlternative          `json:"alternatives"`
 }
 
 type sourceAlternative struct {

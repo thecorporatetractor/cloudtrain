@@ -46,7 +46,8 @@
               "min": { "type": "integer" },
               "max": { "type": "integer" },
               "prefix": { "type": "string" },
-              "default": {}
+              "default": {},
+              "secret": { "type": "boolean", "default": false, "description": "Never sent to the learner's browser. Required for every param an answer check's expected value references; a secret param must not appear in learner-visible text (description, objectives, hints, check descriptions, question hints)." }
             }
           }
         },
@@ -54,6 +55,10 @@
         "setup": { "type": "array", "items": { "$ref": "#/$defs/action" } },
         "teardown": { "type": "array", "items": { "$ref": "#/$defs/action" } },
         "checks": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/check" } },
+        "questionOrder": {
+          "description": "How the lab's answer checks (questions) unlock. free: every question is open from the start. sequential: a question opens once the one before it is solved or has no attempts left.",
+          "enum": ["free", "sequential"], "default": "free"
+        },
         "hints": {
           "type": "array",
           "items": {
@@ -72,13 +77,20 @@
             "properties": {
               "id": { "type": "string" }, "description": { "type": "string" },
               "mutation": { "$ref": "#/$defs/action" },
+              "answers": {
+                "description": "Wrong answers for answer checks (by check id): the verifier submits each one in a fresh session and requires every check listed in `expectFail` to reject it. Use instead of `mutation`.",
+                "type": "object", "minProperties": 1,
+                "additionalProperties": { "$ref": "#/$defs/answerInput" }
+              },
               "expectFail": {
-                "description": "Ids of the checks aimed at this misconception. Each must fail after `mutation`; failures of other checks (e.g. the context check) do not count.",
+                "description": "Ids of the checks aimed at this misconception. Each must fail after `mutation` (end-state checks) or reject the answer given in `answers` (answer checks); failures of other checks (e.g. the context check) do not count.",
                 "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string" }
               },
               "feedback": { "type": "string" }
             },
-            "dependentRequired": { "mutation": ["expectFail"], "expectFail": ["mutation"] }
+            "dependentRequired": { "mutation": ["expectFail"], "answers": ["expectFail"] },
+            "if": { "required": ["expectFail"] },
+            "then": { "anyOf": [{ "required": ["mutation"] }, { "required": ["answers"] }] }
           }
         },
         "exam": {
@@ -89,10 +101,17 @@
           }
         },
         "solution": {
-          "type": "object", "required": ["steps"], "additionalProperties": false,
+          "description": "The reference solution: `steps` for end-state checks, `answers` for answer checks (a lab with both has both).",
+          "type": "object", "additionalProperties": false,
+          "anyOf": [{ "required": ["steps"] }, { "required": ["answers"] }],
           "properties": {
             "explanation": { "type": "string" },
             "steps": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/action" } },
+            "answers": {
+              "description": "The correct answer for every answer check (by check id). The verifier runs the steps first, then submits each answer and requires it to be accepted. Prefer a command (derive the answer from the lab like a learner would) over a templated string.",
+              "type": "object", "minProperties": 1,
+              "additionalProperties": { "$ref": "#/$defs/answerInput" }
+            },
             "alternatives": {
               "description": "Other valid ways to solve the lab. The Scenario Studio verifier applies each alternative's steps in a fresh session and requires every check to pass, so a correct but different approach is never penalised.",
               "type": "array",
@@ -111,6 +130,63 @@
     }
   },
   "$defs": {
+    "answer": {
+      "description": "Answer check (type answer): the check's description is the question. The expected value comes from the session: `value`/`values` reference secret {{params}}, or `compute` runs a command on a lab node right after setup (stored server side, never sent to the browser). Answers are normalised (case, whitespace) before matching.",
+      "type": "object",
+      "required": ["match"],
+      "additionalProperties": false,
+      "properties": {
+        "match": {
+          "enum": ["exact", "number", "regex", "any-of"],
+          "description": "exact: normalised strings are equal. number: both parse as decimal numbers within `tolerance`. regex: the normalised answer fully matches the pattern (RE2 subset shared by Go and JavaScript; template values are inserted verbatim). any-of: equal to one of the accepted values (`values`, or each non-empty line of the computed output)."
+        },
+        "value": { "type": "string", "description": "Expected value (exact, number) or pattern (regex), templated with {{params}}." },
+        "values": { "type": "array", "minItems": 1, "items": { "type": "string" }, "description": "Accepted values for any-of, templated with {{params}}." },
+        "compute": {
+          "description": "Computes the expected value once per session, right after setup: runs `command` as admin on `on` (default: the entry node) and keeps its stdout (trailing newline removed). For any-of, each non-empty line is one accepted value. A failing command fails the session's setup.",
+          "type": "object", "required": ["command"], "additionalProperties": false,
+          "properties": {
+            "on": { "type": "string" },
+            "command": { "type": "string" },
+            "timeoutSec": { "type": "integer", "minimum": 1, "maximum": 300, "default": 30 }
+          }
+        },
+        "caseSensitive": { "type": "boolean", "default": false },
+        "whitespace": {
+          "enum": ["trim", "collapse", "remove", "none"], "default": "collapse",
+          "description": "trim: strip leading/trailing whitespace. collapse: trim, then every run of whitespace becomes one space. remove: drop all whitespace. none: compare as typed."
+        },
+        "tolerance": { "type": "number", "minimum": 0, "default": 0, "description": "number: the largest accepted absolute difference." },
+        "points": { "type": "integer", "minimum": 0, "maximum": 10000, "default": 100 },
+        "maxAttempts": { "type": "integer", "minimum": 1, "maximum": 100, "description": "Wrong answers allowed before the question closes. Unlimited when absent." },
+        "penalty": { "type": "integer", "minimum": 0, "default": 0, "description": "Points taken off the question's award for every wrong answer (never below 0)." },
+        "placeholder": { "type": "string", "maxLength": 80, "description": "Example of the expected format, shown in the empty answer box (e.g. 203.0.113.7)." },
+        "hints": {
+          "description": "Question hints, revealed one at a time on request; each costs `cost` points off the question's award.",
+          "type": "array",
+          "items": {
+            "type": "object", "required": ["body"], "additionalProperties": false,
+            "properties": { "body": { "type": "string" }, "cost": { "type": "integer", "minimum": 0, "default": 10 } }
+          }
+        }
+      },
+      "oneOf": [{ "required": ["value"] }, { "required": ["values"] }, { "required": ["compute"] }]
+    },
+    "answerInput": {
+      "description": "An answer the verifier submits: a string (templated with {{params}}), or a command whose stdout (trimmed) is the answer.",
+      "oneOf": [
+        { "type": "string" },
+        {
+          "type": "object", "required": ["command"], "additionalProperties": false,
+          "properties": {
+            "on": { "type": "string", "description": "Node (default: the entry node)." },
+            "as": { "enum": ["learner", "admin"], "default": "learner" },
+            "command": { "type": "string" },
+            "timeoutSec": { "type": "integer", "minimum": 1, "maximum": 300, "default": 60 }
+          }
+        }
+      ]
+    },
     "topology": {
       "type": "object",
       "required": ["nodes"],
@@ -206,14 +282,19 @@
       "type": "object",
       "required": ["id", "description", "type", "skills"],
       "additionalProperties": false,
+      "if": { "properties": { "type": { "const": "answer" } } },
+      "then": { "required": ["answer"], "not": { "anyOf": [{ "required": ["command"] }, { "required": ["query"] }, { "required": ["target"] }, { "required": ["expect"] }, { "required": ["on"] }] } },
+      "else": { "not": { "required": ["answer"] } },
       "properties": {
         "id": { "type": "string" },
         "description": { "type": "string" },
         "skills": { "type": "array", "minItems": 1, "items": { "type": "string" }, "description": "Skill ids from content/skills.yaml" },
         "weight": { "type": "number", "default": 1 },
         "type": {
-          "enum": ["shell", "k8s-query", "k8s-can-i", "k8s-context", "file", "service-state", "reachability", "device-cmd", "http"]
+          "enum": ["shell", "k8s-query", "k8s-can-i", "k8s-context", "file", "service-state", "reachability", "device-cmd", "http", "answer"],
+          "description": "answer: a question the learner answers in the lab view (CTF style); the platform grades the submitted answer against `answer`. Every other type grades the lab's end state when the learner validates."
         },
+        "answer": { "$ref": "#/$defs/answer" },
         "on": { "type": "string" },
         "command": { "type": "string" },
         "query": {

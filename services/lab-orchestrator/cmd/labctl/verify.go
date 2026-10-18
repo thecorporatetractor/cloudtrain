@@ -90,10 +90,14 @@ type RunReport struct {
 	Before      *GradeReport      `json:"gradeBefore,omitempty"`
 	After       *GradeReport      `json:"gradeAfter,omitempty"`
 	ExpectFail  []string          `json:"expectFail,omitempty"`
+	// Answers are the answers submitted to answer checks (base runs).
+	Answers     []AnswerReport    `json:"answers,omitempty"`
 	Teardown    string            `json:"teardown"` // clean, leftovers, skipped (--keep), failed
 	Leftovers   []string          `json:"leftovers,omitempty"`
 	Errors      []string          `json:"errors,omitempty"`
 	DurationSec float64           `json:"durationSeconds"`
+	// answerDigests: per answer check, a digest of its expected values.
+	answerDigests map[string]string
 }
 
 // LabReport is written to <out>/<lab>.json.
@@ -104,7 +108,9 @@ type LabReport struct {
 	StartedAt   time.Time   `json:"startedAt"`
 	DurationSec float64     `json:"durationSeconds"`
 	Errors      []string    `json:"errors,omitempty"`
-	Runs        []RunReport `json:"runs"`
+	// Warnings do not fail the lab (e.g. an answer the same for two seeds).
+	Warnings []string    `json:"warnings,omitempty"`
+	Runs     []RunReport `json:"runs"`
 }
 
 type labUnderTest struct {
@@ -445,6 +451,11 @@ func (v *verifier) verifyAll(ctx context.Context, labs []*labUnderTest) []LabRep
 		for _, rr := range r.Runs {
 			r.OK = r.OK && rr.OK
 		}
+		for _, id := range sameAnswersAcrossSeeds(r.Runs) {
+			msg := fmt.Sprintf("answer check %s expects the same answer for both seeds; learners could share it", id)
+			r.Warnings = append(r.Warnings, msg)
+			v.logf("%s: WARN %s", r.Lab, msg)
+		}
 		r.DurationSec = time.Since(r.StartedAt).Seconds()
 	}
 	return reports
@@ -536,6 +547,19 @@ func (v *verifier) run(ctx context.Context, r runSpec) (rep RunReport) {
 				fail("check %s fails after the %s (%s): %s", c.ID, r.kind, c.Message, tail(c.Output, 300))
 			}
 		}
+	}
+	if r.kind == runBase {
+		cur := &labsv1.LabSession{}
+		if err := v.c.Get(ctx, client.ObjectKeyFromObject(sess), cur); err == nil {
+			sess = cur
+		}
+		answers, problems, digests := verifyAnswers(ctx, spec, sess.Status.ComputedAnswers, execAnswerSource(ex, spec.Topology.Entry))
+		rep.Answers, rep.answerDigests = answers, digests
+		for _, p := range problems {
+			fail("%s", p)
+		}
+	}
+	switch r.kind {
 	case runMutation:
 		got := map[string]bool{}
 		for _, c := range after.Checks {
@@ -871,6 +895,11 @@ func printSummary(w io.Writer, reports []LabReport) {
 		}
 	}
 	_ = tw.Flush()
+	for _, r := range reports {
+		for _, msg := range r.Warnings {
+			fmt.Fprintf(w, "%s: warning: %s\n", r.Lab, msg)
+		}
+	}
 }
 
 func firstLine(s string) string {

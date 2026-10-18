@@ -157,3 +157,26 @@ test("pack labs may use curriculum newSkills; unknown skills are still errors", 
   const bad = await findingsAfter("scale-berth-planner", (s) => s.replace("skills: [k8s.workloads.scaling]", "skills: [k8s.workloads.no-such-skill]"));
   assert.ok(bad.some((x) => x.level === "error" && /unknown skill 'k8s.workloads.no-such-skill'/.test(x.message)), JSON.stringify(bad));
 });
+
+const ctfLab = "packs/linux/labs/ctf-ticket-gate-breach/lab.yaml";
+
+test("CTF lab: an answer param that is not secret is an error", async () => {
+  const f = await findingsAfterFile(ctfLab, (s) => s.replace("octet: {type: int, min: 10, max: 250, secret: true}", "octet: {type: int, min: 10, max: 250}"));
+  assert.ok(f.some((x) => x.level === "error" && /'octet' gives the expected answer away/.test(x.message)), JSON.stringify(f));
+});
+
+test("CTF lab: a secret param in the task text is an error", async () => {
+  const f = await findingsAfterFile(ctfLab, (s) => s.replace("Overnight, someone got into", "Overnight, {{victim}} got into"));
+  assert.ok(f.some((x) => x.level === "error" && x.path === "/spec/description" && /secret param/.test(x.message)), JSON.stringify(f));
+});
+
+test("CTF lab: a static expected answer is an error", async () => {
+  const f = await findingsAfterFile(ctfLab, (s) => s.replace('value: "{{victim}}"', 'value: "ada"'));
+  assert.ok(f.some((x) => x.level === "error" && /must come from the session/.test(x.message)), JSON.stringify(f));
+});
+
+test("CTF lab: a wrong answer for a check the misconception does not answer is an error", async () => {
+  const f = await findingsAfterFile(ctfLab, (s) => s.replace("expectFail: [q-failed-count]", "expectFail: [q-failed-count, q-victim]"));
+  assert.ok(f.some((x) => x.level === "error" && /'q-victim' gets no wrong answer/.test(x.message)), JSON.stringify(f));
+});
+

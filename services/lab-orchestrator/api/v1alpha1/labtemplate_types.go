@@ -23,6 +23,11 @@ type LabTemplateSpec struct {
 	Teardown []Action `json:"teardown,omitempty"`
 	// +kubebuilder:validation:MinItems=1
 	Checks []Check `json:"checks"`
+	// QuestionOrder is how answer checks unlock: free (default) or
+	// sequential (a question opens once the one before is solved or closed).
+	// +optional
+	// +kubebuilder:validation:Enum=free;sequential
+	QuestionOrder string `json:"questionOrder,omitempty"`
 	// +optional
 	Hints []Hint `json:"hints,omitempty"`
 	// +optional

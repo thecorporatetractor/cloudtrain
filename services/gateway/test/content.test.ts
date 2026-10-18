@@ -2,7 +2,9 @@ import { existsSync } from 'node:fs';
 import { readdir } from 'node:fs/promises';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { learnerLab, fillParams, revealedHint } from '../src/content/view.js';
+import { learnerLab, learnerParams, fillParams, revealedHint } from '../src/content/view.js';
+import { toWebSession } from '../src/sessions/map.js';
+import type { LabSession } from '../src/kube/types.js';
 import { LabctlCompiler } from '../src/kube/compile.js';
 import { fixtureLabs, realContent, repo } from './fakes.js';
 
@@ -124,6 +126,35 @@ describe('learner view of a lab', () => {
     expect(view.spec.checks[0]).toMatchObject({ type: 'k8s-context', on: 'workstation', weight: 0.5, skills: ['k8s.cli.contexts'] });
     expect(view.spec.hints?.every((h) => h.redacted && h.body === '' && h.title === '')).toBe(true);
     expect(view.spec.topology.entry).toBe('workstation');
+  });
+
+  it('keeps answer checks and secret params of a CTF lab on the server', async () => {
+    const c = await realContent();
+    const src = c.labs.get('ctf-ticket-gate-breach')!.lab;
+    const view = learnerLab(src);
+    const json = JSON.stringify(view);
+    for (const secret of ['"answer"', '"compute"', '"values"', 'octet', 'uaminor', 'python-requests', '203.0.113.']) expect(json).not.toContain(secret);
+    expect(view.spec.checks.map((ch) => ch.id)).toEqual(['blocklist']);
+    const params = { octet: '77', victim: 'ada', uaminor: '25', export: 'refunds-q3.csv', salt: '5' };
+    expect(learnerParams(src, params)).toEqual({ salt: '5' });
+    const ls: LabSession = {
+      apiVersion: 'labs.cloudtrain.dev/v1alpha1',
+      kind: 'LabSession',
+      metadata: { name: 'ctf-ticket-gate-breach-abc123', labels: { 'labs.cloudtrain.dev/lab-id': 'ctf-ticket-gate-breach' } },
+      spec: { templateRef: { name: 't' }, learner: { id: 'u' }, seed: 1, validateRequest: 1 },
+      status: {
+        phase: 'Ready',
+        resolvedParams: params,
+        computedAnswers: { 'q-failed-count': '7319' },
+        validation: { observedRequest: 1, phase: 'Complete', score: 100, checks: [{ id: 'blocklist', passed: true, output: '203.0.113.77' }] },
+      },
+    };
+    const web = toWebSession(ls, src);
+    expect(web.params).toEqual({ salt: '5' });
+    expect(web.results.map((r) => [r.checkId, r.status])).toEqual([['blocklist', 'pass']]);
+    expect(web.status).toBe('passed');
+    const wjson = JSON.stringify(web);
+    for (const secret of ['7319', '203.0.113', 'refunds', 'computedAnswers']) expect(wjson).not.toContain(secret);
   });
 
   it('fills params into text and revealed hints', async () => {

@@ -207,9 +207,9 @@ export interface Lab {
    */
   oneLine: string;
   /**
-   * exam = exam task: fully graded, no hints, only drawn by exam simulations.
+   * exam = exam task: fully graded, no hints, only drawn by exam simulations. ctf = investigation challenge: the learner answers questions (answer checks) about a seeded dataset or system; playable solo or in a CTF event.
    */
-  type: "learn" | "do" | "fix" | "hack" | "exam";
+  type: "learn" | "do" | "fix" | "hack" | "ctf" | "exam";
   difficulty: "easy" | "medium" | "hard";
   minutes: number;
   /**

@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	labsv1 "github.com/cloudtrain/cloudtrain/services/lab-orchestrator/api/v1alpha1"
+	"github.com/cloudtrain/cloudtrain/services/lab-orchestrator/internal/answer"
 )
 
 var (
@@ -254,6 +255,8 @@ func validateSemantics(s *labsv1.LabTemplateSpec) []Issue {
 		}
 	}
 
+	issues = append(issues, validateAnswers(s, nodes)...)
+
 	// Placeholders must reference declared params ("{{ name }}" with inner
 	// whitespace and an undeclared name is literal Jinja, see literalPlaceholder).
 	declared := func(n string) bool { _, ok := s.Params[n]; return ok }
@@ -263,6 +266,209 @@ func validateSemantics(s *labsv1.LabTemplateSpec) []Issue {
 		}
 		if !declared(ref.name) {
 			add(ref.path, "undefined param {{%s}}", ref.name)
+		}
+	}
+	return issues
+}
+
+// validateAnswers checks answer checks, the answers of the solution and of
+// misconceptions, and that expected answers can neither leak to the learner
+// nor be shared between learners.
+func validateAnswers(s *labsv1.LabTemplateSpec, nodes map[string]*labsv1.Node) []Issue {
+	var issues []Issue
+	add := func(path, format string, args ...any) {
+		issues = append(issues, Issue{Path: path, Message: fmt.Sprintf(format, args...)})
+	}
+	answerChecks := map[string]bool{}
+	endState := 0
+	for _, c := range s.Checks {
+		if c.Type == labsv1.CheckTypeAnswer {
+			answerChecks[c.ID] = true
+		} else {
+			endState++
+		}
+	}
+	secret := func(n string) bool { p, ok := s.Params[n]; return ok && p.Secret }
+	refs := func(v string) []string {
+		var out []string
+		for _, m := range placeholderRe.FindAllStringSubmatch(v, -1) {
+			if _, ok := s.Params[m[1]]; ok {
+				out = append(out, m[1])
+			}
+		}
+		return out
+	}
+	nodeOK := func(path, on string) {
+		if on == "" {
+			return
+		}
+		node, _, _ := strings.Cut(on, "/")
+		if nodes[node] == nil {
+			add(path, "unknown node %q", on)
+		}
+	}
+
+	for i, c := range s.Checks {
+		path := fmt.Sprintf("/spec/checks/%d", i)
+		if c.Type != labsv1.CheckTypeAnswer {
+			if c.Answer != nil {
+				add(path+"/answer", "answer is only allowed on checks of type answer")
+			}
+			continue
+		}
+		a := c.Answer
+		if a == nil {
+			add(path, "answer check requires answer")
+			continue
+		}
+		sources := 0
+		for _, set := range []bool{a.Value != nil, len(a.Values) > 0, a.Compute != nil} {
+			if set {
+				sources++
+			}
+		}
+		if sources != 1 {
+			add(path+"/answer", "exactly one of value, values and compute is required")
+		}
+		switch a.Match {
+		case labsv1.AnswerAnyOf:
+			if a.Value != nil {
+				add(path+"/answer/value", "any-of takes values (or compute), not value")
+			}
+		case labsv1.AnswerExact, labsv1.AnswerNumber, labsv1.AnswerRegex:
+			if len(a.Values) > 0 {
+				add(path+"/answer/values", "%s takes value (or compute), not values", a.Match)
+			}
+		default:
+			add(path+"/answer/match", "unknown match %q", a.Match)
+		}
+		if a.Tolerance != "" && a.Match != labsv1.AnswerNumber {
+			add(path+"/answer/tolerance", "tolerance only applies to match number")
+		}
+		if a.Value != nil {
+			probe := placeholderRe.ReplaceAllString(*a.Value, "0")
+			switch a.Match {
+			case labsv1.AnswerNumber:
+				if _, ok := answer.ParseNumber(probe); !ok {
+					add(path+"/answer/value", "value %q is not a decimal number", *a.Value)
+				}
+			case labsv1.AnswerRegex:
+				if _, err := regexp.Compile(probe); err != nil {
+					add(path+"/answer/value", "invalid regex: %v", err)
+				}
+			}
+		}
+		// The expected value must come from the session, so answers differ
+		// between learners and cannot be shared.
+		if a.Compute == nil {
+			vals := append([]string{}, a.Values...)
+			if a.Value != nil {
+				vals = append(vals, *a.Value)
+			}
+			used := 0
+			for _, v := range vals {
+				for _, n := range refs(v) {
+					used++
+					if !secret(n) {
+						add(path+"/answer", "param %q gives the expected answer away: declare it secret: true", n)
+					}
+				}
+			}
+			if used == 0 {
+				add(path+"/answer", "the expected answer must come from the session: reference a secret {{param}} or use compute")
+			}
+		} else {
+			if strings.TrimSpace(a.Compute.Command) == "" {
+				add(path+"/answer/compute/command", "compute needs a command")
+			}
+			nodeOK(path+"/answer/compute/on", a.Compute.On)
+		}
+		if a.MaxAttempts < 0 || a.Penalty < 0 || a.Points < 0 {
+			add(path+"/answer", "points, maxAttempts and penalty must not be negative")
+		}
+	}
+
+	// Secret params never appear in what the learner sees.
+	visible := []struct{ path, text string }{{"/spec/description", s.Description}}
+	for i, o := range s.Objectives {
+		visible = append(visible, struct{ path, text string }{fmt.Sprintf("/spec/objectives/%d", i), o})
+	}
+	for i, h := range s.Hints {
+		p := fmt.Sprintf("/spec/hints/%d", i)
+		visible = append(visible, struct{ path, text string }{p + "/title", h.Title}, struct{ path, text string }{p + "/body", h.Body}, struct{ path, text string }{p + "/command", h.Command})
+	}
+	for i, c := range s.Checks {
+		p := fmt.Sprintf("/spec/checks/%d", i)
+		visible = append(visible, struct{ path, text string }{p + "/description", c.Description})
+		if c.Answer != nil {
+			visible = append(visible, struct{ path, text string }{p + "/answer/placeholder", c.Answer.Placeholder})
+			for j, h := range c.Answer.Hints {
+				visible = append(visible, struct{ path, text string }{fmt.Sprintf("%s/answer/hints/%d/body", p, j), h.Body})
+			}
+		}
+	}
+	for _, v := range visible {
+		for _, n := range refs(v.text) {
+			if secret(n) {
+				add(v.path, "secret param {{%s}} must not appear in learner-visible text", n)
+			}
+		}
+	}
+
+	checkInputs := func(path string, in map[string]labsv1.AnswerInput) {
+		ids := make([]string, 0, len(in))
+		for id := range in {
+			ids = append(ids, id)
+		}
+		sort.Strings(ids)
+		for _, id := range ids {
+			a := in[id]
+			p := path + "/" + id
+			if !answerChecks[id] {
+				add(p, "%q is not an answer check", id)
+			}
+			if (a.Value != nil) == (a.Command != "") {
+				add(p, "give either a value or a command")
+			}
+			nodeOK(p+"/on", a.On)
+		}
+	}
+
+	// The solution answers every question and solves every end-state check.
+	if endState > 0 && len(s.Solution.Steps) == 0 {
+		add("/spec/solution/steps", "the lab has end-state checks, so the solution needs steps")
+	}
+	if len(answerChecks) == 0 && len(s.Solution.Steps) == 0 {
+		add("/spec/solution/steps", "solution needs steps")
+	}
+	checkInputs("/spec/solution/answers", s.Solution.Answers)
+	for _, c := range s.Checks {
+		if c.Type == labsv1.CheckTypeAnswer {
+			if _, ok := s.Solution.Answers[c.ID]; !ok {
+				add("/spec/solution/answers", "no answer for answer check %q", c.ID)
+			}
+		}
+	}
+
+	for i, m := range s.Misconceptions {
+		path := fmt.Sprintf("/spec/misconceptions/%d", i)
+		if len(m.Answers) > 0 && m.Mutation != nil {
+			add(path, "use either mutation or answers, not both")
+		}
+		if len(m.Answers) > 0 {
+			checkInputs(path+"/answers", m.Answers)
+			for j, id := range m.ExpectFail {
+				if _, ok := m.Answers[id]; !ok {
+					add(fmt.Sprintf("%s/expectFail/%d", path, j), "check %q gets no answer in this misconception", id)
+				}
+			}
+		}
+		if m.Mutation != nil {
+			for j, id := range m.ExpectFail {
+				if answerChecks[id] {
+					add(fmt.Sprintf("%s/expectFail/%d", path, j), "a mutation cannot make answer check %q fail; give a wrong answer in answers instead", id)
+				}
+			}
 		}
 	}
 	return issues

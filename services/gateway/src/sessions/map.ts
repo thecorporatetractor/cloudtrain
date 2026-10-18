@@ -1,6 +1,6 @@
 import type { Lab as SourceLab } from '@cloudtrain/lab-schema';
 import type { CheckResult, LabHint, LabSession as WebSession, NodeStatus as WebNodeStatus, SessionNodeState, SessionPhase } from '@cloudtrain/api-types';
-import { revealedHint } from '../content/view.js';
+import { endStateChecks, learnerParams, revealedHint } from '../content/view.js';
 import { ANNOTATION_HINTS, LABEL_LAB, type LabSession, type NodePhase } from '../kube/types.js';
 
 const NODE_STATUS: Record<NodePhase, WebNodeStatus> = {
@@ -67,7 +67,7 @@ export function resultsOf(ls: LabSession, lab: SourceLab): CheckResult[] {
   const v = ls.status?.validation;
   const finished = v && v.phase !== 'Running';
   const byId = new Map((finished ? (v.checks ?? []) : []).map((c) => [c.id, c]));
-  return lab.spec.checks.map((c): CheckResult => {
+  return endStateChecks(lab).map((c): CheckResult => {
     if (!finished) return { checkId: c.id, status: 'pending', skills: [...c.skills] };
     if (v.phase === 'Failed') return { checkId: c.id, status: 'error', skills: [...c.skills], ...(v.message ? { message: v.message } : {}) };
     const r = byId.get(c.id);
@@ -96,7 +96,8 @@ export function toWebSession(ls: LabSession, lab: SourceLab): WebSession {
   const v = ls.status?.validation;
   const complete = v?.phase === 'Complete';
   const allPassed = complete && results.length > 0 && results.every((r) => r.status === 'pass');
-  const params = ls.status?.resolvedParams;
+  // Secret params (expected answers) never reach the browser.
+  const params = learnerParams(lab, ls.status?.resolvedParams);
   const revealed = revealedHints(ls);
   const hints: Record<number, LabHint> = {};
   for (const i of revealed) {

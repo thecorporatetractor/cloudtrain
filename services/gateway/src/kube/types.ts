@@ -96,6 +96,8 @@ export interface LabSessionStatus {
   phase?: SessionPhase;
   conditions?: Condition[];
   resolvedParams?: Record<string, string>;
+  /** Expected values of answer checks with answer.compute (by check id). Server side only: never sent to the browser. */
+  computedAnswers?: Record<string, string>;
   nodes?: NodeStatus[];
   endpoints?: Endpoint[];
   entryNode?: string;

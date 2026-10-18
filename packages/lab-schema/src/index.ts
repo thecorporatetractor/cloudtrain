@@ -104,3 +104,14 @@ export function referencedParams(lab: Lab): Set<string> {
   walk(lab.spec);
   return names;
 }
+
+/** Names of the params declared `secret: true` (answer checks reference them; never sent to learners). */
+export function secretParams(lab: Lab): Set<string> {
+  const params = (lab.spec.params ?? {}) as Record<string, { secret?: boolean }>;
+  return new Set(Object.entries(params).filter(([, p]) => p?.secret === true).map(([n]) => n));
+}
+
+/** True for answer checks (CTF questions graded on the submitted answer, not on end state). */
+export function isAnswerCheck(check: { type: string }): boolean {
+  return check.type === "answer";
+}
