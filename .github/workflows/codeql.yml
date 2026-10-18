@@ -1,9 +1,9 @@
 # CodeQL (advanced setup): keep the repository's code scanning "default setup"
 # OFF, or the two configurations conflict. Blocking via the code scanning merge
 # protection rule (high or higher), see docs/security-ci.md.
-# Path-aware on pull requests: one job per language (literal check names, so a
-# skipped job still satisfies its required check), gated by the `changes` job.
-# Push to main, the weekly schedule and manual runs analyze every language.
+# Not path-filtered: the ruleset's code scanning rule needs results for every
+# configuration main has (/language:go, javascript-typescript, actions) on each PR,
+# or it reports "configurations not found" and blocks the merge.
 name: codeql
 
 on:
@@ -21,40 +21,11 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  changes:
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    permissions:
-      contents: read
-      pull-requests: read # list the PR's files
-    outputs:
-      js: ${{ steps.c.outputs.js }}
-      go: ${{ steps.c.outputs.go }}
-      actions: ${{ steps.c.outputs.actions }}
-    steps:
-      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
-        with:
-          egress-policy: audit
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-          sparse-checkout: .github/scripts
-      - id: c
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-          PR: ${{ github.event.pull_request.number }}
-        run: bash .github/scripts/changes.sh --pr "$PR" >> "$GITHUB_OUTPUT"
-
-  # Each job runs when `changes` was skipped (not a PR) or failed (fail-safe), or
-  # when its language's files changed. No matrix: GitHub would append the matrix
-  # values to the check name (and a skipped matrix job reports the unexpanded name),
-  # so the language comes from the job's env and the steps are a shared anchor.
+  # One job per language. No matrix: GitHub would append the matrix values to the
+  # check name, so the language comes from the job's env and the steps are a shared
+  # YAML anchor.
   analyze-js:
     name: analyze (javascript-typescript)
-    needs: changes
-    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.js == 'true') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     permissions: &codeql-permissions
@@ -97,8 +68,6 @@ jobs:
 
   analyze-go:
     name: analyze (go)
-    needs: changes
-    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.go == 'true') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     permissions: *codeql-permissions
@@ -109,8 +78,6 @@ jobs:
 
   analyze-actions:
     name: analyze (actions)
-    needs: changes
-    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.actions == 'true') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     permissions: *codeql-permissions

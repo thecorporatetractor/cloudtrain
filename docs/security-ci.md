@@ -21,7 +21,7 @@ SARIF) and/or artifacts; they are triaged there.
 | Workflow | Triggers | Jobs (check names) | Blocking | Report-only |
 |---|---|---|---|---|
 | `ci.yml` | PR (path-aware), push main | `node (build, typecheck, test, content)`, `go (vet, test, build, generate drift, labs)`, `licenses (inventory drift, copyleft gate)` | everything: pnpm frozen install, build, typecheck, test (gateway DB suites against Postgres 18); lab-verify `--strict`; `docs/curriculum.md` up to date; go vet, `test -race`, build; `make generate` drift; `labctl validate` on every pack; exam compile of the exams whose pools are complete (`sim-k8s-admin`, `sim-k8s-developer`, `sim-k8s-security`, testdata); `THIRD_PARTY_LICENSES.md` drift; no GPL/LGPL/AGPL/SSPL/unknown license in production dependencies (`tools/licenses/check.sh`) | none |
-| `codeql.yml` | PR (path-aware), push main, weekly | `analyze (javascript-typescript)`, `analyze (go)`, `analyze (actions)` | via the ruleset's code scanning rule (High+ security alerts) | all CodeQL `security-extended` alerts |
+| `codeql.yml` | PR, push main, weekly | `analyze (javascript-typescript)`, `analyze (go)`, `analyze (actions)` | via the ruleset's code scanning rule (High+ security alerts) | all CodeQL `security-extended` alerts |
 | `sast.yml` | PR (path-aware), push main, weekly | `semgrep (report)`, `gosec (report)`, `hadolint, shellcheck, actionlint, zizmor` | actionlint; zizmor (medium+); shellcheck `-S warning` over `deploy/`, `tools/`, `services/`, `.github/` (lab assets in `content/` are excluded on purpose); hadolint at `error` | semgrep (p/default, typescript, golang, secrets, dockerfile, kubernetes; `content/` and `docs/` excluded), gosec, hadolint warnings, zizmor (all) |
 | `secrets.yml` | PR, push main, nightly | `gitleaks` | gitleaks over the PR's commits / the pushed range; never the working tree (gitignored `apps/web/dist` would trip it) | nightly: every commit on every branch (also SARIF) |
 | `deps.yml` | PR (path-aware), push main, daily | `dependency-review`, `govulncheck`, `osv-scanner` | dependency-review (PRs: new dependency with a high/critical advisory or a GPL/LGPL/AGPL/SSPL license); govulncheck (reachable Go vulnerabilities) | osv-scanner SARIF over `pnpm-lock.yaml` and `go.mod` |
@@ -98,7 +98,7 @@ Jobs by group:
 | `go (vet, test, build, generate drift, labs)` | go: vet, `test -race`, build, generate drift, catalog check. content only: *content mode*: `make labctl` |
 | | always when it runs: `labctl validate` (every pack), samples, exam compile |
 | `licenses (inventory drift, copyleft gate)` | licenses |
-| `analyze (javascript-typescript)` / `analyze (go)` / `analyze (actions)` | js / go / `.github/**` |
+| `analyze (javascript-typescript)`, `analyze (go)`, `analyze (actions)` | always: the code scanning merge rule needs results for all three configurations on every PR |
 | `semgrep (report)` | code (anything outside `content/` and `docs/`) |
 | `gosec (report)`, `govulncheck` | go (govulncheck also deps) |
 | `hadolint, shellcheck, actionlint, zizmor` | lint |
@@ -109,10 +109,16 @@ Jobs by group:
 | `iac` (workflow paths) | `deploy/**`, `**/*.tf`, `services/lab-orchestrator/config/**`, `tools/images/**`, `.github/iac/**` |
 | `build + scan (<image>)` (workflow paths) | the image's own `paths` in the `publish` matrix of `images.yml` (`.github/scripts/image-matrix.sh`); `images.yml` or its scripts rebuild all, `deploy/versions.env` rebuilds the images with build args |
 
-A content-only PR (a lab, a `lab.yaml`, docs) therefore runs three real jobs, `node`
-and `go` in content mode and `gitleaks`, plus five `changes` jobs of a few seconds
-each. Before, it ran 16 jobs: also licenses, CodeQL x3, semgrep, gosec, the lint job,
-govulncheck, osv-scanner, dependency-review, the SBOM and both ZAP scans.
+A content-only PR (a lab, a `lab.yaml`, docs) therefore runs six real jobs, `node`
+and `go` in content mode, `gitleaks` and the three CodeQL analyses, plus four `changes`
+jobs of a few seconds each. Before, it ran 16 jobs: also licenses, semgrep, gosec, the
+lint job, govulncheck, osv-scanner, dependency-review, the SBOM and both ZAP scans.
+
+CodeQL is the exception to path gating. The ruleset's "Require code scanning results"
+rule compares the PR's CodeQL analyses with the configurations on `main`. If any is
+missing, it reports "configurations not found" and the PR stays blocked even when every
+required status check passed. Analyzing one language is not enough. Gating CodeQL would
+need that rule removed from the ruleset; CodeQL would then block only on main.
 
 Fail-safe rules:
 - If `changes` fails, every gated job runs (the condition is
@@ -152,7 +158,8 @@ Make these jobs **required status checks** on `main`. Their check names are exac
 
 The repository ruleset ("Branch Protection") requires exactly these. On a PR their jobs
 are skipped when the change does not need them (see "What runs when"); a skipped job
-satisfies its required check. Keep their names literal: CodeQL and ZAP are one job per
+satisfies its required check (CodeQL always runs, see "What runs when"). Keep their
+names literal: CodeQL and ZAP are one job per
 language/target (the language or target in the job's `env`, the steps shared through a
 YAML anchor) rather than a matrix. GitHub appends matrix values to a literal job name
 (`analyze (go) (go, manual)`), and a matrix job skipped by `if:` reports under its
