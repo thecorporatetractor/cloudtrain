@@ -126,7 +126,17 @@ spec:
         apiVersion: v1
         kind: Namespace
         metadata: {name: ledger-reports}
-        ---
+    # The default ServiceAccounts are created asynchronously by the controller
+    # manager; wait for them so the Pods below are not rejected.
+    - on: qm-ledger
+      timeoutSec: 150
+      run: |
+        for ns in billing ledger-reports; do
+          for i in $(seq 1 60); do kubectl -n $ns get serviceaccount default >/dev/null 2>&1 && break; sleep 2; done
+          kubectl -n $ns get serviceaccount default >/dev/null
+        done
+    - on: qm-ledger
+      apply: |
         apiVersion: v1
         kind: Secret
         metadata: {name: payment-gateway, namespace: billing}
@@ -357,7 +367,11 @@ spec:
       cost: 2
     - title: From IP to Pod
       command: kubectl get pods -A -o wide | grep <ip>
-      body: The audit event's sourceIPs is the Pod IP when a Pod calls the API directly.
+      body: |
+        The audit event's sourceIPs is the Pod IP only when the CNI does not
+        masquerade; otherwise it is the node IP. Then look for the Pod whose
+        environment references the leaked token Secret, and match the runtime
+        alerts' container IDs.
       cost: 1
     - title: Revoke without collateral damage
       body: Deleting a token Secret invalidates that token only. Deleting the ServiceAccount would also kill the legitimate projected tokens.
@@ -442,7 +456,7 @@ spec:
     explanation: |
       The audit log shows successful GETs of billing/payment-gateway by
       system:serviceaccount:ledger-reports:{{sa}} without a pod-name in
-      user.extra (a legacy Secret token), from the IP of {{pod}}; report-ui's
+      user.extra (a legacy Secret token), from {{pod}} (its source IP, or the node's when the CNI masquerades); report-ui's
       own reads fail with 403. The runtime alerts tie {{pod}}'s container to a
       token-shaped environment variable and API connections, and its process
       list shows the wget loop. Deleting the token Secret revokes only that
@@ -457,9 +471,10 @@ spec:
           ev=$(ssh ledger-cp-1 "sudo jq -r 'select(.objectRef.namespace==\"billing\" and .objectRef.resource==\"secrets\" and .responseStatus.code==200 and (.user.extra[\"authentication.kubernetes.io/pod-name\"] == null)) | \"\(.user.username) \(.sourceIPs[0])\"' /var/log/kubernetes/audit/audit.log" | sort -u | head -n1)
           user=${ev% *}; ip=${ev#* }
           sa_ns=$(echo "$user" | cut -d: -f3); sa=$(echo "$user" | cut -d: -f4)
-          pod=$(kubectl get pods -A -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name} {.status.podIP}{"\n"}{end}' | awk -v ip="$ip" '$2==ip{print $1}')
           secret=$(kubectl -n "$sa_ns" get secrets --field-selector type=kubernetes.io/service-account-token -o json \
             | jq -r --arg sa "$sa" '.items[] | select(.metadata.annotations["kubernetes.io/service-account.name"]==$sa) | .metadata.name')
+          # Node-level SNAT can hide the Pod IP, so find the Pod that carries the token in its environment.
+          pod=$(kubectl get pods -A -o json | jq -r --arg ns "$sa_ns" --arg s "$secret" '.items[] | select(.metadata.namespace==$ns and ([.spec.containers[].env[]? | .valueFrom.secretKeyRef.name] | index($s))) | "\(.metadata.namespace)/\(.metadata.name)"' | head -n1)
           mkdir -p ~/incident
           printf 'serviceaccount=%s/%s\ntoken-secret=%s/%s\npod=%s\n' "$sa_ns" "$sa" "$sa_ns" "$secret" "$pod" > ~/incident/findings.txt
           cat ~/incident/findings.txt
