@@ -74,9 +74,9 @@ spec:
     - on: dc-server
       run: |
         ip addr replace 10.{{octet}}.200.10/24 dev eth1; ip route replace default via 10.{{octet}}.200.1
-        iperf3 -s -D
+        for p in 5201 5202 5203 5204; do iperf3 -s -D -p $p; done
         mkdir -p /var/lib/cloudtrain
-        setsid tcpdump -i eth1 -nn -v -U -w /var/lib/cloudtrain/marks.pcap '(udp dst port {{port}}) or (tcp dst port 5201 and tcp[tcpflags] & tcp-syn != 0)' </dev/null >/dev/null 2>&1 &
+        setsid tcpdump -i eth1 -nn -v -U -w /var/lib/cloudtrain/marks.pcap '(udp dst port {{port}}) or (tcp dst portrange 5201-5204 and tcp[tcpflags] & tcp-syn != 0)' </dev/null >/dev/null 2>&1 &
         sleep 1
     - { on: phone-annex, run: "ip addr replace 10.{{octet}}.60.5/24 dev eth1 && ip route replace default via 10.{{octet}}.60.1" }
     - { on: annex-pc, run: "ip addr replace 10.{{octet}}.61.10/24 dev eth1 && ip route replace default via 10.{{octet}}.61.1" }
@@ -96,18 +96,18 @@ spec:
       on: annex-pc
       command: |
         pkill -x iperf3; sleep 1
-        for try in 1 2 3 4 5 6; do
-          setsid iperf3 -c 10.{{octet}}.200.10 -t 25 </dev/null >/tmp/flood.log 2>&1 &
-          for w in 1 2 3 4 5 6; do
+        for try in 1 2 3 4; do
+          setsid iperf3 -c 10.{{octet}}.200.10 -p $((5200 + try)) -t 25 </dev/null >/tmp/flood.log 2>&1 &
+          for w in $(seq 1 14); do
             grep -q 'sec ' /tmp/flood.log 2>/dev/null && { echo started; exit 0; }
             grep -qi 'busy\|error' /tmp/flood.log 2>/dev/null && break
             sleep 1
           done
-          pkill -x iperf3; sleep 2
+          pkill -x iperf3; sleep 1
         done
         echo "not started"
       expect: { match: exact, value: started }
-      timeoutSec: 60
+      timeoutSec: 75
       skills: [net.services.qos]
       weight: 0
     - id: ef-latency
@@ -127,7 +127,7 @@ spec:
       on: dc-server
       command: |
         v=$(tcpdump -nn -v -r /var/lib/cloudtrain/marks.pcap "udp dst port {{port}}" 2>/dev/null | grep -c 'tos 0xb8')
-        b=$(tcpdump -nn -v -r /var/lib/cloudtrain/marks.pcap "tcp dst port 5201" 2>/dev/null | grep -c 'tos 0xb8')
+        b=$(tcpdump -nn -v -r /var/lib/cloudtrain/marks.pcap "tcp dst portrange 5201-5204" 2>/dev/null | grep -c 'tos 0xb8')
         [ "$v" -gt 0 ] && [ "$b" = 0 ] && echo ok || echo "voice=$v bulk=$b"
       expect: { match: exact, value: ok }
       skills: [net.services.qos]
@@ -169,7 +169,8 @@ spec:
           nft add table ip qos
           nft 'add chain ip qos markvoice { type filter hook forward priority mangle; }'
           nft add rule ip qos markvoice ip saddr 10.{{octet}}.60.0/24 udp dport 16384-32767 ip dscp set ef
-          tc qdisc replace dev eth2 root handle 1: prio
+          tc qdisc del dev eth2 root
+          tc qdisc add dev eth2 root handle 1: prio
       expectFail: [shaper-kept]
       feedback: Without the shaper the queue builds in the radio instead of on the router, where priority no longer applies.
   solution:
