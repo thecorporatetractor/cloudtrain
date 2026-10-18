@@ -1,0 +1,181 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xcd-ops-debug-shell-less
+  title: Diagnose a shell-less service returning errors
+  domain: containers
+  frameworks: [docker-practitioner:operations]
+  difficulty: medium
+  estimatedMinutes: 12
+  tags: [exam, docker, debugging, distroless, namespaces]
+  version: 1
+spec:
+  description: |
+    **Host:** `cl-docker-01` (`ssh cl-docker-01`)
+
+    The container **`quote`** (image `copperleaf/quote-svc:1`, published on
+    `127.0.0.1:8092`) runs on a shell-less image: `docker exec quote sh` fails, there is
+    no package manager and no `cat`. `curl http://127.0.0.1:8092/quote` returns `500`.
+
+    1. Find out why. Attach a **debug container** that shares the namespaces of `quote`
+       (an image such as `busybox:1.37` is available) and read the evidence the service
+       leaves inside its own filesystem.
+    2. Fix the **run** of `quote`: recreate it from the **same image** with the missing
+       setting so `http://127.0.0.1:8092/quote` answers `200`. Do not build another image
+       and do not bake a shell into it. Keep the name `quote`, the published port and the
+       restart policy `unless-stopped`.
+  objectives:
+    - Share the pid and network namespaces of a shell-less container with a debug container
+    - Read files of another container through /proc/<pid>/root
+    - Correct a run configuration instead of the image
+  params:
+    region:
+      type: choice
+      values: [eu-west, eu-north, us-east]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-docker-01
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-docker-01
+      timeoutSec: 480
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        # copperleaf/pyruntime:1: a shell-less Python runtime (FROM scratch plus musl, libpython and the stdlib of python:3.13-alpine)
+        d=$(mktemp -d)
+        cat > "$d/Dockerfile" <<'DF'
+        FROM python:3.13-alpine AS src
+        FROM scratch
+        COPY --from=src /lib/ /lib/
+        COPY --from=src /usr/lib/ /usr/lib/
+        COPY --from=src /usr/local/lib/ /usr/local/lib/
+        COPY --from=src /usr/local/bin/python3.13 /usr/local/bin/python3
+        ENV LD_LIBRARY_PATH=/usr/local/lib PYTHONUNBUFFERED=1
+        ENTRYPOINT ["/usr/local/bin/python3"]
+        DF
+        docker build -q -t copperleaf/pyruntime:1 "$d" >/dev/null
+        rm -rf "$d"
+        d=$(mktemp -d); mkdir "$d/app"
+        cat > "$d/app/quote.py" <<'PY'
+        import http.server, os, pathlib
+        HINT = pathlib.Path("/opt/quote/region.hint").read_text().strip()
+        LOG = pathlib.Path("/var/log/quote/error.txt")
+        LOG.parent.mkdir(parents=True, exist_ok=True)
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                region = os.environ.get("QUOTE_REGION")
+                if region == HINT:
+                    self.send_response(200)
+                    self.end_headers()
+                    self.wfile.write(("quote ok region %s\n" % region).encode())
+                    return
+                LOG.write_text("500: environment variable QUOTE_REGION is not set to the region in /opt/quote/region.hint (got %r)\n" % region)
+                self.send_response(500)
+                self.end_headers()
+                self.wfile.write(b"internal error\n")
+            def log_message(self, *a):
+                pass
+        print("quote service listening on :8000", flush=True)
+        http.server.ThreadingHTTPServer(("", 8000), H).serve_forever()
+        PY
+        echo '{{region}}' > "$d/app/region.hint"
+        printf '%s\n' 'FROM copperleaf/pyruntime:1' 'COPY app/ /opt/quote/' 'CMD ["/opt/quote/quote.py"]' > "$d/Dockerfile"
+        docker build -q -t copperleaf/quote-svc:1 "$d" >/dev/null
+        mkdir -p /srv/exam/debug-shell-less
+        rm -rf /srv/exam/debug-shell-less/app; cp -r "$d/app" /srv/exam/debug-shell-less/app
+        rm -rf "$d"
+        docker rm -f quote >/dev/null 2>&1 || true
+        docker run -d --name quote --restart unless-stopped -p 127.0.0.1:8092:8000 copperleaf/quote-svc:1 >/dev/null
+  checks:
+    - id: answers-200
+      description: http://127.0.0.1:8092/quote answers 200 with the right region
+      type: shell
+      timeoutSec: 60
+      on: cl-docker-01
+      skills: [containers.operations.debug-distroless]
+      weight: 3
+      command: |
+        r=down; for i in $(seq 15); do r=$(curl -s --max-time 3 -w ' %{http_code}' http://127.0.0.1:8092/quote 2>/dev/null | tr -d '\n'); case "$r" in *' 200') break ;; esac; sleep 2; done; echo "$r"
+      expect: {match: exact, value: "quote ok region {{region}} 200"}
+    - id: same-shell-less-image
+      description: quote still runs copperleaf/quote-svc:1 and has no shell
+      type: shell
+      timeoutSec: 60
+      on: cl-docker-01
+      skills: [containers.operations.debug-distroless]
+      weight: 2
+      command: |
+        img=$(docker inspect quote 2>/dev/null | jq -r '.[0].Config.Image + " priv=" + (.[0].HostConfig.Privileged | tostring)')
+        if docker exec quote sh -c true >/dev/null 2>&1; then sh=has-shell; else sh=no-shell; fi
+        echo "$img $sh"
+      expect: {match: exact, value: "copperleaf/quote-svc:1 priv=false no-shell"}
+    - id: published-and-restarts
+      description: quote keeps the published loopback port and a restart policy that survives a reboot
+      type: shell
+      timeoutSec: 60
+      on: cl-docker-01
+      skills: [containers.operations.restart-health]
+      weight: 1
+      command: |
+        docker inspect quote 2>/dev/null | jq -r '[([.[0].HostConfig.PortBindings["8000/tcp"][]? | (.HostIp // "") + ":" + .HostPort] | join(",")), .[0].HostConfig.RestartPolicy.Name] | join(" ")'
+      expect: {match: exact, value: "127.0.0.1:8092 unless-stopped"}
+  misconceptions:
+    - id: other-image
+      description: Runs the application from a different image that has a shell.
+      feedback: "The point is to debug the running image without changing it. A fat image hides the real problem and ships a shell. Fix the run of copperleaf/quote-svc:1."
+      expectFail: [same-shell-less-image]
+      mutation:
+        on: cl-docker-01
+        as: learner
+        run: |
+          docker rm -f quote
+          docker run -d --name quote --restart unless-stopped -p 127.0.0.1:8092:8000 -e QUOTE_REGION={{region}} -v /srv/exam/debug-shell-less/app:/opt/quote:ro --entrypoint python3 python:3.13-alpine /opt/quote/quote.py
+          sleep 3
+    - id: wrong-region
+      description: Sets QUOTE_REGION to a value that is not the region in the hint file.
+      feedback: "The variable must carry the region named in /opt/quote/region.hint. Read the hint file through the debug container."
+      expectFail: [answers-200]
+      mutation:
+        on: cl-docker-01
+        as: learner
+        run: |
+          docker rm -f quote
+          docker run -d --name quote --restart unless-stopped -p 127.0.0.1:8092:8000 -e QUOTE_REGION=default copperleaf/quote-svc:1
+          sleep 3
+  solution:
+    explanation: |
+      A throwaway busybox container with `--pid container:quote --network container:quote`
+      can read the service's filesystem through `/proc/1/root`. The service records why it
+      fails in `/var/log/quote/error.txt` and names the hint file. Recreating the
+      container with `QUOTE_REGION` set to the hint fixes it, without touching the image.
+    steps:
+      - on: cl-docker-01
+        as: learner
+        run: |
+          docker run --rm --pid container:quote --network container:quote busybox:1.37 sh -c 'cat /proc/1/root/var/log/quote/error.txt 2>/dev/null; wget -q -O- http://127.0.0.1:8000/quote >/dev/null 2>&1; cat /proc/1/root/var/log/quote/error.txt; cat /proc/1/root/opt/quote/region.hint'
+          region=$(docker run --rm --pid container:quote busybox:1.37 cat /proc/1/root/opt/quote/region.hint)
+          docker rm -f quote
+          docker run -d --name quote --restart unless-stopped -p 127.0.0.1:8092:8000 -e QUOTE_REGION="$region" copperleaf/quote-svc:1
+          sleep 3
+    alternatives:
+      - id: nsenter-less
+        description: Read the evidence with a plain bind of the container's root from the host instead of a second container.
+        steps:
+          - on: cl-docker-01
+            as: learner
+            run: |
+              pid=$(docker inspect quote | jq -r '.[0].State.Pid')
+              region=$(sudo cat /proc/$pid/root/opt/quote/region.hint)
+              docker rm -f quote
+              docker run -d --name quote --restart unless-stopped -p 127.0.0.1:8092:8000 -e QUOTE_REGION="$region" copperleaf/quote-svc:1
+              sleep 3

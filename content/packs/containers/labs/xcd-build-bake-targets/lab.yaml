@@ -1,0 +1,235 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xcd-build-bake-targets
+  title: Build two images from one Bake definition
+  domain: containers
+  frameworks: [docker-practitioner:build]
+  difficulty: medium
+  estimatedMinutes: 10
+  tags: [exam, docker, buildx, bake, labels]
+  version: 1
+spec:
+  description: |
+    **Host:** `cl-docker-01` (`ssh cl-docker-01`)
+
+    `~/exam/orders/` holds two services, `api/` and `worker/`, each with a Dockerfile that
+    accepts a `VERSION` build argument. Write `~/exam/orders/docker-bake.hcl` with:
+
+    - a variable **`VERSION`** whose default is **`2.{{ver}}.0`**;
+    - a **default group** that builds the targets **`api`** and **`worker`**, each from
+      its own directory;
+    - the tags **`copperleaf/orders-api:${VERSION}`** and
+      **`copperleaf/orders-worker:${VERSION}`**, with `VERSION` also passed as the build
+      argument;
+    - the OCI labels **`org.opencontainers.image.version`** (the version) and
+      **`org.opencontainers.image.source`** (`https://git.copperleaf.example/orders/api`
+      for the api, `https://git.copperleaf.example/orders/worker` for the worker).
+
+    Then run a single `docker buildx bake` to produce both images.
+  objectives:
+    - Define a variable, two targets and a default group in a Bake file
+    - Set image labels and tags from one variable
+  params:
+    ver:
+      type: int
+      min: 10
+      max: 89
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-docker-01
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-docker-01
+      timeoutSec: 240
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        s=/home/learner/exam/orders
+        rm -rf "$s"; install -d -o learner -g learner /home/learner/exam "$s"
+        for svc in api worker; do
+          install -d "$s/$svc"
+          printf '%s\n' 'FROM busybox:1.37' 'ARG VERSION=dev' "RUN echo \"orders-$svc \$VERSION\" > /version.txt" 'CMD ["cat", "/version.txt"]' > "$s/$svc/Dockerfile"
+        done
+        chown -R learner:learner "$s"
+  checks:
+    - id: plan-targets
+      description: The default bake run builds exactly api and worker
+      type: shell
+      timeoutSec: 60
+      on: cl-docker-01
+      skills: [containers.buildkit.bake]
+      weight: 2
+      command: cd /home/learner/exam/orders && docker buildx bake --print 2>/dev/null | jq -r '(.target // {}) | keys | join(",")' 2>/dev/null || echo none
+      expect: {match: exact, value: "api,worker"}
+    - id: plan-tags-and-args
+      description: Tags and the VERSION build argument follow the VERSION variable (default and override)
+      type: shell
+      timeoutSec: 60
+      on: cl-docker-01
+      skills: [containers.buildkit.bake]
+      weight: 2.5
+      command: |
+        cd /home/learner/exam/orders
+        f='[.target[] | (.args.VERSION // "none") + "|" + ((.tags // []) | join(","))] | sort | join(" ")'
+        a=$(docker buildx bake --print 2>/dev/null | jq -r "$f" 2>/dev/null)
+        b=$(VERSION=7.7.7 docker buildx bake --print 2>/dev/null | jq -r "$f" 2>/dev/null)
+        echo "$a / $b"
+      expect: {match: exact, value: "2.{{ver}}.0|copperleaf/orders-api:2.{{ver}}.0 2.{{ver}}.0|copperleaf/orders-worker:2.{{ver}}.0 / 7.7.7|copperleaf/orders-api:7.7.7 7.7.7|copperleaf/orders-worker:7.7.7"}
+    - id: plan-labels
+      description: Each target sets the version and its own source label
+      type: shell
+      timeoutSec: 60
+      on: cl-docker-01
+      skills: [containers.build.args-labels, containers.buildkit.bake]
+      weight: 2
+      command: |
+        cd /home/learner/exam/orders && docker buildx bake --print 2>/dev/null \
+          | jq -r '[.target | to_entries[] | .key + "=" + (.value.labels["org.opencontainers.image.version"] // "none") + "," + (.value.labels["org.opencontainers.image.source"] // "none")] | sort | join(" ")' 2>/dev/null || echo none
+      expect: {match: exact, value: "api=2.{{ver}}.0,https://git.copperleaf.example/orders/api worker=2.{{ver}}.0,https://git.copperleaf.example/orders/worker"}
+    - id: images-built
+      description: Both images exist and carry the labels
+      type: shell
+      timeoutSec: 60
+      on: cl-docker-01
+      skills: [containers.buildkit.bake, containers.build.args-labels]
+      weight: 1.5
+      command: |
+        for s in api worker; do
+          docker image inspect "copperleaf/orders-$s:2.{{ver}}.0" 2>/dev/null | jq -r '.[0].Config.Labels | (."org.opencontainers.image.version" // "none") + "," + (."org.opencontainers.image.source" // "none")'
+        done | tr '\n' ' ' | sed 's/ $//'
+      expect: {match: exact, value: "2.{{ver}}.0,https://git.copperleaf.example/orders/api 2.{{ver}}.0,https://git.copperleaf.example/orders/worker"}
+  misconceptions:
+    - id: literal-version
+      description: Writes the version literally into tags and labels instead of using the variable.
+      feedback: "An override such as VERSION=7.7.7 then changes nothing. Interpolate ${VERSION} in tags, labels and the build argument."
+      expectFail: [plan-tags-and-args]
+      mutation:
+        on: cl-docker-01
+        as: learner
+        run: |
+          cd ~/exam/orders
+          {
+            printf '%s\n' 'variable "VERSION" {' '  default = "2.{{ver}}.0"' '}' 'group "default" {' '  targets = ["api", "worker"]' '}'
+            for s in api worker; do
+              printf '%s\n' "target \"$s\" {" "  context = \"$s\"" '  args = { VERSION = "2.{{ver}}.0" }' "  tags = [\"copperleaf/orders-$s:2.{{ver}}.0\"]" \
+                "  labels = { \"org.opencontainers.image.version\" = \"2.{{ver}}.0\", \"org.opencontainers.image.source\" = \"https://git.copperleaf.example/orders/$s\" }" '}'
+            done
+          } > docker-bake.hcl
+          docker buildx bake
+    - id: no-labels
+      description: Builds both images from the group but sets no OCI labels.
+      feedback: "The labels are part of the definition: add labels = { ... } to each target with the version and a per-service source URL."
+      expectFail: [plan-labels, images-built]
+      mutation:
+        on: cl-docker-01
+        as: learner
+        run: |
+          cd ~/exam/orders
+          {
+            printf '%s\n' 'variable "VERSION" {' '  default = "2.{{ver}}.0"' '}' 'group "default" {' '  targets = ["api", "worker"]' '}'
+            for s in api worker; do
+              printf '%s\n' "target \"$s\" {" "  context = \"$s\"" '  args = { VERSION = VERSION }' "  tags = [\"copperleaf/orders-$s:\${VERSION}\"]" '}'
+            done
+          } > docker-bake.hcl
+          docker buildx bake
+    - id: shared-source
+      description: Gives both services the api source URL.
+      feedback: "The source label must point at each service's own repository."
+      expectFail: [plan-labels, images-built]
+      mutation:
+        on: cl-docker-01
+        as: learner
+        run: |
+          cd ~/exam/orders
+          {
+            printf '%s\n' 'variable "VERSION" {' '  default = "2.{{ver}}.0"' '}' 'group "default" {' '  targets = ["api", "worker"]' '}'
+            for s in api worker; do
+              printf '%s\n' "target \"$s\" {" "  context = \"$s\"" '  args = { VERSION = VERSION }' "  tags = [\"copperleaf/orders-$s:\${VERSION}\"]" \
+                '  labels = { "org.opencontainers.image.version" = VERSION, "org.opencontainers.image.source" = "https://git.copperleaf.example/orders/api" }' '}'
+            done
+          } > docker-bake.hcl
+          docker buildx bake
+  solution:
+    explanation: |
+      One variable feeds the build argument, the tags and the version label. A shared
+      hidden target holds the common attributes; each real target adds its context, tags
+      and its own source label.
+    steps:
+      - on: cl-docker-01
+        as: learner
+        run: |
+          cd ~/exam/orders
+          cat > docker-bake.hcl <<'HCL'
+          variable "VERSION" {
+            default = "2.{{ver}}.0"
+          }
+
+          group "default" {
+            targets = ["api", "worker"]
+          }
+
+          target "_common" {
+            args = { VERSION = VERSION }
+          }
+
+          target "api" {
+            inherits = ["_common"]
+            context  = "api"
+            tags     = ["copperleaf/orders-api:${VERSION}"]
+            labels = {
+              "org.opencontainers.image.version" = VERSION
+              "org.opencontainers.image.source"  = "https://git.copperleaf.example/orders/api"
+            }
+          }
+
+          target "worker" {
+            inherits = ["_common"]
+            context  = "worker"
+            tags     = ["copperleaf/orders-worker:${VERSION}"]
+            labels = {
+              "org.opencontainers.image.version" = VERSION
+              "org.opencontainers.image.source"  = "https://git.copperleaf.example/orders/worker"
+            }
+          }
+          HCL
+          docker buildx bake
+    alternatives:
+      - id: matrix-with-function
+        description: Generate both targets from a matrix and derive the source URL.
+        steps:
+          - on: cl-docker-01
+            as: learner
+            run: |
+              cd ~/exam/orders
+              cat > docker-bake.hcl <<'HCL'
+              variable "VERSION" {
+                default = "2.{{ver}}.0"
+              }
+
+              group "default" {
+                targets = ["svc"]
+              }
+
+              target "svc" {
+                name    = svc
+                matrix  = { svc = ["api", "worker"] }
+                context = svc
+                args    = { VERSION = VERSION }
+                tags    = ["copperleaf/orders-${svc}:${VERSION}"]
+                labels = {
+                  "org.opencontainers.image.version" = VERSION
+                  "org.opencontainers.image.source"  = "https://git.copperleaf.example/orders/${svc}"
+                }
+              }
+              HCL
+              docker buildx bake

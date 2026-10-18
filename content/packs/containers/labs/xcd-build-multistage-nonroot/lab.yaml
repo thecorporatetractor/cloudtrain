@@ -1,0 +1,179 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xcd-build-multistage-nonroot
+  title: Build the report service as a small non-root image
+  domain: containers
+  frameworks: [docker-practitioner:build]
+  difficulty: medium
+  estimatedMinutes: 12
+  tags: [exam, docker, dockerfile, multi-stage, non-root]
+  version: 1
+spec:
+  description: |
+    **Host:** `cl-docker-01` (`ssh cl-docker-01`)
+
+    `~/exam/report-svc/` holds the source of the Go report service (`main.go`, `go.mod`)
+    but no Dockerfile. Write `~/exam/report-svc/Dockerfile` that compiles the program in
+    one stage from **`golang:1.25-alpine`** and ships only the binary on a minimal base, so
+    the image:
+
+    - is tagged **`copperleaf/report-svc:1.0`** and is **smaller than 30 MB**;
+    - runs as the numeric user **10001:10001**;
+    - contains no Go toolchain.
+
+    Build it. `docker run --rm copperleaf/report-svc:1.0` must print
+    `report-svc 1.0 uid 10001 site {{site}}`.
+  objectives:
+    - Compile in a build stage and ship only the binary
+    - Choose a minimal base and a fixed numeric user
+  params:
+    site:
+      type: choice
+      values: [amsterdam, frankfurt, london]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-docker-01
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-docker-01
+      timeoutSec: 240
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        s=/home/learner/exam/report-svc
+        rm -rf "$s"; install -d -o learner -g learner /home/learner/exam "$s"
+        printf '%s\n' 'module copperleaf.example/report-svc' '' 'go 1.25' > "$s/go.mod"
+        cat > "$s/main.go" <<'GO'
+        package main
+
+        import (
+            "fmt"
+            "os"
+        )
+
+        func main() {
+            fmt.Printf("report-svc 1.0 uid %d site %s\n", os.Getuid(), "{{site}}")
+        }
+        GO
+        chown -R learner:learner "$s"
+  checks:
+    - id: runs-as-10001
+      description: The image prints its banner and runs as UID 10001
+      type: shell
+      timeoutSec: 60
+      on: cl-docker-01
+      skills: [containers.build.non-root, containers.build.multi-stage]
+      weight: 2
+      command: docker run --rm copperleaf/report-svc:1.0 2>&1 | tail -n 1
+      expect: {match: exact, value: "report-svc 1.0 uid 10001 site {{site}}"}
+    - id: user-in-config
+      description: The image configuration sets the numeric user 10001:10001
+      type: shell
+      timeoutSec: 60
+      on: cl-docker-01
+      skills: [containers.build.non-root]
+      weight: 1
+      command: docker image inspect copperleaf/report-svc:1.0 2>/dev/null | jq -r '.[0].Config.User // "none"'
+      expect: {match: regex, value: "^10001(:10001)?$"}
+    - id: small-image
+      description: The exported image is under 30 MB
+      type: shell
+      timeoutSec: 120
+      on: cl-docker-01
+      skills: [containers.build.multi-stage]
+      weight: 2
+      command: |
+        docker image inspect copperleaf/report-svc:1.0 >/dev/null 2>&1 || { echo no-image; exit 0; }
+        n=$(docker save copperleaf/report-svc:1.0 2>/dev/null | wc -c)
+        if [ "$n" -gt 100000 ] && [ "$n" -lt 31457280 ]; then echo small; else echo "bytes=$n"; fi
+      expect: {match: exact, value: small}
+    - id: no-toolchain
+      description: No layer of the image contains the Go toolchain
+      type: shell
+      timeoutSec: 120
+      on: cl-docker-01
+      skills: [containers.build.multi-stage]
+      weight: 2
+      command: |
+        docker image inspect copperleaf/report-svc:1.0 >/dev/null 2>&1 || { echo no-image; exit 0; }
+        t=$(mktemp -d); docker save copperleaf/report-svc:1.0 2>/dev/null | tar -x -C "$t" 2>/dev/null
+        find "$t" -type f > "$t.lst"; n=0
+        while IFS= read -r f; do zcat -f "$f" 2>/dev/null | tar -tf - 2>/dev/null | grep -qE '(^|/)usr/local/go/' && n=$((n + 1)); done < "$t.lst"
+        rm -rf "$t" "$t.lst"; [ "$n" = 0 ] && echo clean || echo "toolchain-in-$n-layers"
+      expect: {match: exact, value: clean}
+  misconceptions:
+    - id: single-stage
+      description: Builds and runs in the golang image itself.
+      feedback: "The Go toolchain (hundreds of MB) stays in the image and the program runs as root. Compile in a build stage and copy only the static binary into a small final stage."
+      expectFail: [user-in-config, small-image, no-toolchain]
+      mutation:
+        on: cl-docker-01
+        as: learner
+        run: |
+          cd ~/exam/report-svc
+          printf '%s\n' 'FROM golang:1.25-alpine' 'WORKDIR /src' 'COPY go.mod main.go ./' 'RUN go build -o /usr/local/bin/report-svc .' 'ENTRYPOINT ["report-svc"]' > Dockerfile
+          docker build -q -t copperleaf/report-svc:1.0 .
+    - id: root-final
+      description: Uses two stages but forgets to switch to a non-root user.
+      feedback: "The image is small but still runs as root. Add USER 10001:10001 (a numeric id works even on a base without /etc/passwd)."
+      expectFail: [runs-as-10001, user-in-config]
+      mutation:
+        on: cl-docker-01
+        as: learner
+        run: |
+          cd ~/exam/report-svc
+          printf '%s\n' 'FROM golang:1.25-alpine AS build' 'WORKDIR /src' 'COPY go.mod main.go ./' 'RUN CGO_ENABLED=0 go build -o /out/report-svc .' \
+            'FROM scratch' 'COPY --from=build /out/report-svc /report-svc' 'ENTRYPOINT ["/report-svc"]' > Dockerfile
+          docker build -q -t copperleaf/report-svc:1.0 .
+  solution:
+    explanation: |
+      A static binary (`CGO_ENABLED=0`) needs no libc, so the final stage can be `scratch`
+      (or a small distribution image) with a numeric `USER`.
+    steps:
+      - on: cl-docker-01
+        as: learner
+        run: |
+          cd ~/exam/report-svc
+          cat > Dockerfile <<'DF'
+          FROM golang:1.25-alpine AS build
+          WORKDIR /src
+          COPY go.mod main.go ./
+          RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /out/report-svc .
+
+          FROM scratch
+          COPY --from=build /out/report-svc /report-svc
+          USER 10001:10001
+          ENTRYPOINT ["/report-svc"]
+          DF
+          docker build -t copperleaf/report-svc:1.0 .
+    alternatives:
+      - id: alpine-final
+        description: Use alpine as the final stage with an explicit user.
+        steps:
+          - on: cl-docker-01
+            as: learner
+            run: |
+              cd ~/exam/report-svc
+              cat > Dockerfile <<'DF'
+              FROM golang:1.25-alpine AS build
+              WORKDIR /src
+              COPY go.mod main.go ./
+              RUN CGO_ENABLED=0 go build -o /out/report-svc .
+
+              FROM alpine:3.22
+              RUN addgroup -g 10001 app && adduser -D -u 10001 -G app app
+              COPY --from=build /out/report-svc /usr/local/bin/report-svc
+              USER 10001:10001
+              ENTRYPOINT ["report-svc"]
+              DF
+              docker build -t copperleaf/report-svc:1.0 .

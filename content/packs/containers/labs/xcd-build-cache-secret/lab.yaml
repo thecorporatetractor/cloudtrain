@@ -1,0 +1,281 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xcd-build-cache-secret
+  title: Build with a cached dependency step and a secret token
+  domain: containers
+  frameworks: [docker-practitioner:build]
+  difficulty: medium
+  estimatedMinutes: 12
+  tags: [exam, docker, buildkit, cache-mount, secrets]
+  version: 1
+spec:
+  description: |
+    **Host:** `cl-docker-01` (`ssh cl-docker-01`)
+
+    `~/exam/pricing/` holds the pricing service. Its Dockerfile downloads the dependencies
+    from the private package index on this host (port 3142), which needs the token in
+    `~/exam/pricing/pkgtoken.txt`; today it passes the token as a build argument and
+    never reuses downloads.
+
+    Change the Dockerfile and build **`copperleaf/pricing:2.0`** so that:
+
+    - the dependency download uses a **BuildKit cache mount** for pip's cache, so adding
+      one package to `requirements.txt` fetches only that package on the next build;
+    - the token is read from a **build secret with the id `pkgtoken`**, and neither the
+      image history, the image configuration nor any layer contains the token.
+
+    The image must still start and print `pricing 2.0 ready`.
+  objectives:
+    - Add a cache mount and a secret mount to one RUN step
+    - Keep a credential out of history and layers
+  params:
+    tok:
+      type: int
+      min: 10000
+      max: 99999
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-docker-01
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-docker-01
+      timeoutSec: 300
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        GW=$(docker network inspect bridge | jq -r '.[0].IPAM.Config[0].Gateway')
+        PYROOT=/srv/exam/build-cache-secret/pypi; PYPORT=3142; PYTOKEN='cl-pkg-{{tok}}'; PYLOG=/srv/exam/build-cache-secret/pypi.log; PYUNIT=xcd-pypi-pricing
+        PYSPEC='[{"name":"ratecalc","version":"1.2.0"},{"name":"tax-tables","version":"3.0.1"},{"name":"fx-feed","version":"0.8.0"},{"name":"ledger-sync","version":"1.0.0"}]'
+        # needs: PYROOT PYPORT PYTOKEN PYLOG PYUNIT PYSPEC (JSON list of packages)
+        install -d "$PYROOT" "$(dirname "$PYLOG")"
+        cat > "$PYROOT/mkindex.py" <<'PY'
+        import hashlib, io, json, os, sys, tarfile
+        root, spec = sys.argv[1], json.loads(sys.argv[2])
+        BACKEND = '''import base64, hashlib, zipfile
+        NAME, VERSION, REQUIRES, BODY = %r, %r, %r, %r
+        def _b64(d):
+            return base64.urlsafe_b64encode(hashlib.sha256(d).digest()).rstrip(b"=").decode()
+        def get_requires_for_build_wheel(config_settings=None):
+            return []
+        def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
+            norm = NAME.replace("-", "_")
+            di = f"{norm}-{VERSION}.dist-info"
+            meta = f"Metadata-Version: 2.1\\nName: {NAME}\\nVersion: {VERSION}\\n" + "".join(f"Requires-Dist: {r}\\n" for r in REQUIRES)
+            files = {f"{norm}/__init__.py": f"VERSION = {VERSION!r}\\n" + BODY, f"{di}/METADATA": meta,
+                     f"{di}/WHEEL": "Wheel-Version: 1.0\\nGenerator: cfbuild\\nRoot-Is-Purelib: true\\nTag: py3-none-any\\n"}
+            rec = "".join(f"{k},sha256={_b64(v.encode())},{len(v.encode())}\\n" for k, v in files.items()) + f"{di}/RECORD,,\\n"
+            name = f"{norm}-{VERSION}-py3-none-any.whl"
+            with zipfile.ZipFile(f"{wheel_directory}/{name}", "w") as z:
+                for k, v in files.items():
+                    z.writestr(k, v)
+                z.writestr(f"{di}/RECORD", rec)
+            return name
+        '''
+        def add(t, path, text):
+            b = text.encode()
+            i = tarfile.TarInfo(path); i.size = len(b); i.mtime = 1577836800
+            t.addfile(i, io.BytesIO(b))
+        for p in spec:
+            name, ver = p["name"], p["version"]
+            d = os.path.join(root, "simple", name)
+            os.makedirs(d, exist_ok=True)
+            top = f"{name}-{ver}"
+            with tarfile.open(os.path.join(d, top + ".tar.gz"), "w:gz") as t:
+                add(t, f"{top}/pyproject.toml", '[build-system]\nrequires = []\nbuild-backend = "cfbuild"\nbackend-path = ["."]\n')
+                add(t, f"{top}/cfbuild.py", BACKEND % (name, ver, p.get("requires", []), p.get("body", "")))
+                add(t, f"{top}/PKG-INFO", f"Metadata-Version: 2.1\nName: {name}\nVersion: {ver}\n")
+            links = sorted(f for f in os.listdir(d) if f.endswith(".tar.gz"))
+            with open(os.path.join(d, "index.html"), "w") as f:
+                f.write("<!doctype html><html><body>" + "".join(f'<a href="{l}">{l}</a><br>' for l in links) + "</body></html>\n")
+        PY
+        cat > "$PYROOT/serve.py" <<'PY'
+        import base64, functools, http.server, sys
+        root, port, token, log = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
+        class H(http.server.SimpleHTTPRequestHandler):
+            def do_GET(self):
+                if token:
+                    ok = False
+                    a = self.headers.get("Authorization", "")
+                    if a.startswith("Basic "):
+                        try:
+                            ok = base64.b64decode(a[6:]).decode().split(":", 1)[1] == token
+                        except Exception:
+                            pass
+                    if not ok:
+                        self.send_response(401)
+                        self.send_header("WWW-Authenticate", 'Basic realm="copperleaf"')
+                        self.send_header("Content-Length", "0")
+                        self.end_headers()
+                        return
+                with open(log, "a") as f:
+                    f.write("GET " + self.path + "\n")
+                super().do_GET()
+            def end_headers(self):
+                self.send_header("Cache-Control", "max-age=3600")
+                super().end_headers()
+            def log_message(self, *a):
+                pass
+        http.server.ThreadingHTTPServer(("0.0.0.0", port), functools.partial(H, directory=root)).serve_forever()
+        PY
+        python3 "$PYROOT/mkindex.py" "$PYROOT" "$PYSPEC"
+        : > "$PYLOG"
+        cat > "/etc/systemd/system/$PYUNIT.service" <<UNIT
+        [Unit]
+        Description=Copperleaf offline Python package index ($PYPORT)
+        After=network.target
+        [Service]
+        ExecStart=/usr/bin/python3 $PYROOT/serve.py $PYROOT $PYPORT '$PYTOKEN' $PYLOG
+        Restart=always
+        [Install]
+        WantedBy=multi-user.target
+        UNIT
+        systemctl daemon-reload
+        systemctl enable "$PYUNIT.service" >/dev/null 2>&1
+        systemctl restart "$PYUNIT.service"
+        for i in $(seq 30); do curl -fs -o /dev/null -u "__token__:$PYTOKEN" "http://127.0.0.1:$PYPORT/simple/$(echo "$PYSPEC" | jq -r '.[0].name')/" && break; sleep 1; done
+        : > "$PYLOG"
+        chmod 0644 "$PYLOG"
+        s=/home/learner/exam/pricing
+        rm -rf "$s"; install -d -o learner -g learner /home/learner/exam "$s" "$s/src"
+        printf '%s\n' ratecalc==1.2.0 tax-tables==3.0.1 fx-feed==0.8.0 > "$s/requirements.txt"
+        printf '%s\n' 'cl-pkg-{{tok}}' > "$s/pkgtoken.txt"
+        cat > "$s/src/app.py" <<'PY'
+        import importlib
+        for m in ["ratecalc", "tax_tables", "fx_feed"]:
+            importlib.import_module(m)
+        print("pricing 2.0 ready")
+        PY
+        cat > "$s/Dockerfile" <<'DF'
+        FROM python:3.13-alpine
+        ENV PIP_DISABLE_PIP_VERSION_CHECK=1 PKG_HOST=@GW@:3142
+        ARG PKG_TOKEN
+        WORKDIR /app
+        COPY requirements.txt .
+        RUN pip install --no-cache-dir --index-url "http://__token__:${PKG_TOKEN}@${PKG_HOST}/simple" -r requirements.txt
+        COPY src/ src/
+        CMD ["python3", "src/app.py"]
+        DF
+        sed -i "s/@GW@/$GW/" "$s/Dockerfile"
+        chown -R learner:learner "$s"
+  checks:
+    - id: image-works
+      description: copperleaf/pricing:2.0 starts and prints its banner
+      type: shell
+      timeoutSec: 60
+      on: cl-docker-01
+      skills: [containers.buildkit.secrets]
+      weight: 1
+      command: docker run --rm copperleaf/pricing:2.0 2>&1 | tail -n 1
+      expect: {match: exact, value: "pricing 2.0 ready"}
+    - id: no-token-anywhere
+      description: The token is in no history entry, image config field or layer
+      type: shell
+      timeoutSec: 120
+      on: cl-docker-01
+      skills: [containers.buildkit.secrets, containers.supply-chain.secret-hygiene]
+      weight: 2.5
+      command: |
+        # leaks <image> <needle>: prints how many places (history, inspect output, files of docker save) hold the needle
+        leaks() {
+          n=0
+          docker history --no-trunc "$1" 2>/dev/null | grep -qF -- "$2" && n=$((n + 1))
+          docker image inspect "$1" 2>/dev/null | grep -qF -- "$2" && n=$((n + 1))
+          t=$(mktemp -d); docker save "$1" 2>/dev/null | tar -x -C "$t" 2>/dev/null
+          find "$t" -type f > "$t.lst"
+          while IFS= read -r f; do zcat -f "$f" 2>/dev/null | grep -aqF -- "$2" && n=$((n + 1)); done < "$t.lst"
+          rm -rf "$t" "$t.lst"; echo "$n"
+        }
+        docker image inspect copperleaf/pricing:2.0 >/dev/null 2>&1 || { echo no-image; exit 0; }
+        echo "leaks=$(leaks copperleaf/pricing:2.0 'cl-pkg-{{tok}}')"
+      expect: {match: exact, value: "leaks=0"}
+    - id: secret-and-cache
+      description: With only the pkgtoken secret, adding one requirement downloads exactly one package
+      type: shell
+      timeoutSec: 300
+      on: cl-docker-01
+      skills: [containers.buildkit.mounts, containers.buildkit.secrets]
+      weight: 3
+      command: |
+        d=$(mktemp -d); cp -a /home/learner/exam/pricing/. "$d/"
+        [ -f "$d/requirements.txt" ] || { echo no-requirements; rm -rf "$d"; exit 0; }
+        sec="--secret id=pkgtoken,src=/home/learner/exam/pricing/pkgtoken.txt"
+        docker build -q $sec -t ct-probe/pricing:warm "$d" >/dev/null 2>&1 || { echo build-failed; rm -rf "$d"; exit 0; }
+        echo 'ledger-sync==1.0.0' >> "$d/requirements.txt"
+        before=$(grep -c '\.tar\.gz' /srv/exam/build-cache-secret/pypi.log || true)
+        docker build -q $sec -t ct-probe/pricing:probe "$d" >/dev/null 2>&1 || { echo build-failed; rm -rf "$d"; exit 0; }
+        after=$(grep -c '\.tar\.gz' /srv/exam/build-cache-secret/pypi.log || true)
+        rm -rf "$d"; docker rmi -f ct-probe/pricing:warm ct-probe/pricing:probe >/dev/null 2>&1
+        echo "fetched-$((after - before))"
+      expect: {match: exact, value: "fetched-1"}
+  misconceptions:
+    - id: arg-token
+      description: Keeps the token as a build argument and only adds the cache mount.
+      feedback: "A build argument used by RUN is stored in the image history, and a build without that argument cannot authenticate. Read the token from a secret mount."
+      expectFail: [no-token-anywhere, secret-and-cache]
+      mutation:
+        on: cl-docker-01
+        as: learner
+        run: |
+          cd ~/exam/pricing
+          sed -i 's|^RUN pip install --no-cache-dir|RUN --mount=type=cache,target=/root/.cache/pip pip install|' Dockerfile
+          docker build -q --build-arg PKG_TOKEN="$(cat pkgtoken.txt)" -t copperleaf/pricing:2.0 .
+    - id: secret-without-cache
+      description: Moves the token into a secret but keeps pip's cache disabled and unmounted.
+      feedback: "The token is safe now, but the downloads are not reused: with --no-cache-dir pip never writes a cache. Mount the cache and let pip use it."
+      expectFail: [secret-and-cache]
+      mutation:
+        on: cl-docker-01
+        as: learner
+        run: |
+          cd ~/exam/pricing
+          sed -i '/^ARG PKG_TOKEN/d; s|^RUN pip install --no-cache-dir --index-url "http://__token__:${PKG_TOKEN}@|RUN --mount=type=secret,id=pkgtoken pip install --no-cache-dir --index-url "http://__token__:$(cat /run/secrets/pkgtoken)@|' Dockerfile
+          docker build -q --secret id=pkgtoken,src=pkgtoken.txt -t copperleaf/pricing:2.0 .
+    - id: cache-without-secret
+      description: Adds the cache mount and writes the token into the RUN line.
+      feedback: "A literal token in the Dockerfile ends up in the history and in version control. Use a build secret."
+      expectFail: [no-token-anywhere, secret-and-cache]
+      mutation:
+        on: cl-docker-01
+        as: learner
+        run: |
+          cd ~/exam/pricing
+          sed -i '/^ARG PKG_TOKEN/d; s|^RUN pip install --no-cache-dir|RUN --mount=type=cache,target=/root/.cache/pip pip install|; s|\${PKG_TOKEN}|cl-pkg-{{tok}}|' Dockerfile
+          docker build -q -t copperleaf/pricing:2.0 .
+  solution:
+    explanation: |
+      One RUN step carries both mounts: the cache mount over pip's cache directory (and
+      no `--no-cache-dir`), and the secret mount `pkgtoken`, read with `cat` inside the
+      command. Build with `--secret id=pkgtoken,src=pkgtoken.txt`.
+    steps:
+      - on: cl-docker-01
+        as: learner
+        run: |
+          cd ~/exam/pricing
+          host=$(sed -n 's/^ENV .*PKG_HOST=\([^ ]*\).*/\1/p' Dockerfile)
+          printf '%s\n' 'FROM python:3.13-alpine' "ENV PIP_DISABLE_PIP_VERSION_CHECK=1 PKG_HOST=$host" 'WORKDIR /app' 'COPY requirements.txt .' \
+            'RUN --mount=type=cache,target=/root/.cache/pip --mount=type=secret,id=pkgtoken pip install --index-url "http://__token__:$(cat /run/secrets/pkgtoken)@${PKG_HOST}/simple" -r requirements.txt' \
+            'COPY src/ src/' 'CMD ["python3", "src/app.py"]' > Dockerfile
+          docker build --secret id=pkgtoken,src=pkgtoken.txt -t copperleaf/pricing:2.0 .
+    alternatives:
+      - id: cache-dir-env
+        description: Keep the cache in a directory of your own and expose the secret as a variable.
+        steps:
+          - on: cl-docker-01
+            as: learner
+            run: |
+              cd ~/exam/pricing
+              host=$(sed -n 's/^ENV .*PKG_HOST=\([^ ]*\).*/\1/p' Dockerfile)
+              printf '%s\n' 'FROM python:3.13-alpine' "ENV PIP_DISABLE_PIP_VERSION_CHECK=1 PKG_HOST=$host PIP_CACHE_DIR=/var/cache/pip" 'WORKDIR /app' 'COPY requirements.txt .' \
+                'RUN --mount=type=cache,target=/var/cache/pip --mount=type=secret,id=pkgtoken,env=PKG_TOKEN pip install --index-url "http://__token__:${PKG_TOKEN}@${PKG_HOST}/simple" -r requirements.txt' \
+                'COPY src/ src/' 'CMD ["python3", "src/app.py"]' > Dockerfile
+              docker build --secret id=pkgtoken,src=pkgtoken.txt -t copperleaf/pricing:2.0 .

@@ -1,0 +1,189 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xcd-net-address-pool
+  title: Keep new networks off a reserved range
+  domain: containers
+  frameworks: [docker-practitioner:networking]
+  difficulty: medium
+  estimatedMinutes: 12
+  tags: [exam, docker, networks, address-pools, daemon-config]
+  version: 1
+spec:
+  description: |
+    **Host:** `cl-docker-01` (`ssh cl-docker-01`)
+
+    The office network uses `10.50.0.0/16` (`/etc/copperleaf/network/office-ranges.txt`),
+    but the network **`appnet`** was created on `10.50.4.0/24`, so containers on it cannot
+    reach the office. Its only container is **`appweb`**.
+
+    1. Change the engine's **default address pools** so that new networks come from
+       **`10.210.0.0/16`** in **`/24`** blocks. Keep the other settings in
+       `/etc/docker/daemon.json` (the host label `site=copperleaf-exam` must survive).
+    2. Recreate **`appnet`** (same name, without an explicit subnet) so it takes a
+       subnet from the new pool, and run **`appweb`** (image `copperleaf/appweb:1`, with the
+       restart policy `unless-stopped`) on it again.
+  objectives:
+    - Configure default-address-pools without losing other daemon settings
+    - Recreate a network and move its containers to the new subnet
+  params:
+    site:
+      type: int
+      min: 10
+      max: 99
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-docker-01
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-docker-01
+      timeoutSec: 300
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        # daemon.json is shared by several tasks: merge keys with jq, never overwrite the file
+        install -d /etc/docker; [ -s /etc/docker/daemon.json ] || echo '{}' > /etc/docker/daemon.json
+        jq '. + {"labels": (((.labels // []) + ["site=copperleaf-exam"]) | unique)}' /etc/docker/daemon.json > /etc/docker/daemon.json.new && mv /etc/docker/daemon.json.new /etc/docker/daemon.json
+        mkdir -p /etc/copperleaf/network
+        printf '%s\n' 'Office LAN: 10.50.0.0/16' 'Engine pool for new networks: not set' > /etc/copperleaf/network/office-ranges.txt
+        d=$(mktemp -d); mkdir "$d/www"; echo "appweb {{site}}" > "$d/www/index.html"
+        printf '%s\n' 'FROM busybox:1.37' 'COPY www /www' 'CMD ["httpd", "-f", "-p", "80", "-h", "/www"]' > "$d/Dockerfile"
+        docker build -q -t copperleaf/appweb:1 "$d" >/dev/null; rm -rf "$d"
+        docker rm -f appweb >/dev/null 2>&1 || true
+        docker network rm appnet >/dev/null 2>&1 || true
+        docker network create --subnet 10.50.4.0/24 appnet >/dev/null
+        docker run -d --name appweb --restart unless-stopped --network appnet copperleaf/appweb:1 >/dev/null
+  checks:
+    - id: pool-configured
+      description: The engine's default address pools are 10.210.0.0/16 with /24 blocks
+      type: shell
+      timeoutSec: 60
+      on: cl-docker-01
+      skills: [containers.network.address-pools, containers.operations.daemon-config]
+      weight: 2
+      command: docker info --format json 2>/dev/null | jq -r '(.DefaultAddressPools // []) | map(.Base + "/" + (.Size | tostring)) | join(",")'
+      expect: {match: exact, value: "10.210.0.0/16/24"}
+    - id: new-networks-use-pool
+      description: A newly created network takes a /24 from 10.210.0.0/16
+      type: shell
+      timeoutSec: 60
+      on: cl-docker-01
+      skills: [containers.network.address-pools]
+      weight: 2
+      command: |
+        docker network rm ct-probe-net >/dev/null 2>&1
+        docker network create ct-probe-net >/dev/null 2>&1 || { echo create-failed; exit 0; }
+        s=$(docker network inspect ct-probe-net | jq -r '.[0].IPAM.Config[0].Subnet')
+        docker network rm ct-probe-net >/dev/null 2>&1
+        case "$s" in 10.210.*.0/24) echo in-pool ;; *) echo "subnet=$s" ;; esac
+      expect: {match: exact, value: in-pool}
+    - id: appnet-moved
+      description: appnet exists on a subnet outside the office range and appweb runs on it, serving its page
+      type: shell
+      timeoutSec: 60
+      on: cl-docker-01
+      skills: [containers.network.address-pools]
+      weight: 3
+      command: |
+        s=$(docker network inspect appnet 2>/dev/null | jq -r '.[0].IPAM.Config[0].Subnet // "none"')
+        ip=$(docker inspect appweb 2>/dev/null | jq -r '.[0].NetworkSettings.Networks.appnet.IPAddress // "none"')
+        page=$(curl -fsS --max-time 3 "http://$ip/" 2>/dev/null || echo down)
+        case "$s" in 10.50.*) echo "office-range $s" ;; *) echo "$s $page" ;; esac
+      expect: {match: regex, value: "^10\\.210\\.[0-9]+\\.0/24 appweb {{site}}$"}
+    - id: appweb-restarts
+      description: appweb is running with a restart policy that survives a reboot
+      type: shell
+      timeoutSec: 60
+      on: cl-docker-01
+      skills: [containers.operations.restart-health]
+      weight: 1
+      command: docker inspect appweb 2>/dev/null | jq -r 'if (.[0].State.Running and (.[0].HostConfig.RestartPolicy.Name | IN("always", "unless-stopped"))) then "restarts" else "no" end'
+      expect: {match: exact, value: restarts}
+    - id: other-settings-kept
+      description: The host label from daemon.json is still set
+      type: shell
+      timeoutSec: 60
+      on: cl-docker-01
+      skills: [containers.operations.daemon-config]
+      weight: 1
+      command: docker info --format json 2>/dev/null | jq -r '(.Labels // []) | if index("site=copperleaf-exam") != null then "kept" else "lost" end'
+      expect: {match: exact, value: kept}
+  misconceptions:
+    - id: network-not-recreated
+      description: Changes the pools and restarts the engine, but leaves appnet on its old subnet.
+      feedback: "Address pools only apply to networks created afterwards. appnet keeps 10.50.4.0/24 until it is removed and created again."
+      expectFail: [appnet-moved]
+      mutation:
+        on: cl-docker-01
+        as: learner
+        run: |
+          sudo jq '. + {"default-address-pools": [{"base": "10.210.0.0/16", "size": 24}]}' /etc/docker/daemon.json | sudo tee /etc/docker/daemon.json.new >/dev/null
+          sudo mv /etc/docker/daemon.json.new /etc/docker/daemon.json
+          sudo systemctl restart docker
+          for i in $(seq 60); do docker info >/dev/null 2>&1 && break; sleep 1; done
+    - id: file-overwritten
+      description: Replaces daemon.json with only the pool setting.
+      feedback: "daemon.json held other settings (here a host label). Merge the new key into the file instead of overwriting it."
+      expectFail: [other-settings-kept]
+      mutation:
+        on: cl-docker-01
+        as: learner
+        run: |
+          echo '{"default-address-pools": [{"base": "10.210.0.0/16", "size": 24}]}' | sudo tee /etc/docker/daemon.json >/dev/null
+          sudo systemctl restart docker
+          for i in $(seq 60); do docker info >/dev/null 2>&1 && break; sleep 1; done
+          docker rm -f appweb >/dev/null; docker network rm appnet; docker network create appnet
+          docker run -d --name appweb --restart unless-stopped --network appnet copperleaf/appweb:1
+    - id: wrong-block-size
+      description: Sets the pool to 10.210.0.0/16 but with /16 blocks.
+      feedback: "size is the prefix length of each network handed out. A /16 block uses the whole pool for one network; ask for /24."
+      expectFail: [pool-configured, new-networks-use-pool]
+      mutation:
+        on: cl-docker-01
+        as: learner
+        run: |
+          sudo jq '. + {"default-address-pools": [{"base": "10.210.0.0/16", "size": 16}]}' /etc/docker/daemon.json | sudo tee /etc/docker/daemon.json.new >/dev/null
+          sudo mv /etc/docker/daemon.json.new /etc/docker/daemon.json
+          sudo systemctl restart docker
+          for i in $(seq 60); do docker info >/dev/null 2>&1 && break; sleep 1; done
+  solution:
+    explanation: |
+      Merge `default-address-pools` into daemon.json with jq and restart the engine; then
+      remove `appnet` (after removing its container) and create it again, so it takes a
+      subnet from the new pool, and start `appweb` on it.
+    steps:
+      - on: cl-docker-01
+        as: learner
+        run: |
+          sudo jq '. + {"default-address-pools": [{"base": "10.210.0.0/16", "size": 24}]}' /etc/docker/daemon.json | sudo tee /etc/docker/daemon.json.new >/dev/null
+          sudo mv /etc/docker/daemon.json.new /etc/docker/daemon.json
+          sudo systemctl restart docker
+          for i in $(seq 60); do docker info >/dev/null 2>&1 && break; sleep 1; done
+          docker rm -f appweb
+          docker network rm appnet
+          docker network create appnet
+          docker run -d --name appweb --restart unless-stopped --network appnet copperleaf/appweb:1
+    alternatives:
+      - id: edit-in-place
+        description: Edit the file with jq in place through a temporary copy and reload by restarting.
+        steps:
+          - on: cl-docker-01
+            as: learner
+            run: |
+              t=$(mktemp)
+              sudo jq '."default-address-pools" = [{"base": "10.210.0.0/16", "size": 24}]' /etc/docker/daemon.json > "$t"
+              sudo install -m 0644 "$t" /etc/docker/daemon.json
+              sudo systemctl restart docker
+              for i in $(seq 60); do docker info >/dev/null 2>&1 && break; sleep 1; done
+              docker stop appweb && docker rm appweb
+              docker network rm appnet && docker network create appnet
+              docker run -d --name appweb --restart unless-stopped --network appnet copperleaf/appweb:1

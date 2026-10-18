@@ -1,0 +1,297 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-build-secret-token
+  title: Move a private package token out of build arguments
+  domain: containers
+  frameworks: [cks:supply-chain-security, docker-practitioner:build, docker-practitioner:supply-chain]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [docker, buildkit, secrets, history, supply-chain]
+  version: 1
+spec:
+  description: |
+    The ad-insertion build installs a client library from Copperleaf's private package
+    feed and passes the feed token as a build argument, so the token is readable in the
+    image history. The repository is `~/adinsert/` on `cl-adinsert-02`
+    (`ssh cl-adinsert-02`; you are in the `docker` group). The token is in
+    `~/adinsert/feed-token.txt`; the feed answers `401` without it.
+
+    Change the build so that the image still builds, and **neither `docker history`, the
+    image configuration nor any layer contains the token** (`cl-feed-{{tok}}`):
+
+    1. Edit the `Dockerfile` to read the token from a BuildKit **secret** with the id
+       **`feedtoken`**.
+    2. Build **`copperleaf/adinsert:2.4`** from the secret alone (no build argument).
+  objectives:
+    - Pass a credential to a build step with a secret mount
+    - Verify history, config and layers for leaked credentials
+  params:
+    tok:
+      type: int
+      min: 10000
+      max: 99999
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-adinsert-02
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-adinsert-02
+      timeoutSec: 300
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        GW=$(docker network inspect bridge | jq -r '.[0].IPAM.Config[0].Gateway')
+        PYROOT=/srv/pypi; PYPORT=3141; PYTOKEN='cl-feed-{{tok}}'; PYLOG=/var/log/copperleaf/pypi.log; PYUNIT=copperleaf-pypi
+        PYSPEC='[{"name":"feed-client","version":"3.1.0"},{"name":"ad-schema","version":"1.8.0"},{"name":"vast-parse","version":"0.7.2"}]'
+        # needs: PYROOT PYPORT PYTOKEN PYLOG PYUNIT PYSPEC (JSON list of packages)
+        install -d "$PYROOT" "$(dirname "$PYLOG")"
+        cat > "$PYROOT/mkindex.py" <<'PY'
+        import hashlib, io, json, os, sys, tarfile
+        root, spec = sys.argv[1], json.loads(sys.argv[2])
+        BACKEND = '''import base64, hashlib, zipfile
+        NAME, VERSION, REQUIRES, BODY = %r, %r, %r, %r
+        def _b64(d):
+            return base64.urlsafe_b64encode(hashlib.sha256(d).digest()).rstrip(b"=").decode()
+        def get_requires_for_build_wheel(config_settings=None):
+            return []
+        def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
+            norm = NAME.replace("-", "_")
+            di = f"{norm}-{VERSION}.dist-info"
+            meta = f"Metadata-Version: 2.1\\nName: {NAME}\\nVersion: {VERSION}\\n" + "".join(f"Requires-Dist: {r}\\n" for r in REQUIRES)
+            files = {f"{norm}/__init__.py": f"VERSION = {VERSION!r}\\n" + BODY, f"{di}/METADATA": meta,
+                     f"{di}/WHEEL": "Wheel-Version: 1.0\\nGenerator: cfbuild\\nRoot-Is-Purelib: true\\nTag: py3-none-any\\n"}
+            rec = "".join(f"{k},sha256={_b64(v.encode())},{len(v.encode())}\\n" for k, v in files.items()) + f"{di}/RECORD,,\\n"
+            name = f"{norm}-{VERSION}-py3-none-any.whl"
+            with zipfile.ZipFile(f"{wheel_directory}/{name}", "w") as z:
+                for k, v in files.items():
+                    z.writestr(k, v)
+                z.writestr(f"{di}/RECORD", rec)
+            return name
+        '''
+        def add(t, path, text):
+            b = text.encode()
+            i = tarfile.TarInfo(path); i.size = len(b); i.mtime = 1577836800
+            t.addfile(i, io.BytesIO(b))
+        for p in spec:
+            name, ver = p["name"], p["version"]
+            d = os.path.join(root, "simple", name)
+            os.makedirs(d, exist_ok=True)
+            top = f"{name}-{ver}"
+            with tarfile.open(os.path.join(d, top + ".tar.gz"), "w:gz") as t:
+                add(t, f"{top}/pyproject.toml", '[build-system]\nrequires = []\nbuild-backend = "cfbuild"\nbackend-path = ["."]\n')
+                add(t, f"{top}/cfbuild.py", BACKEND % (name, ver, p.get("requires", []), p.get("body", "")))
+                add(t, f"{top}/PKG-INFO", f"Metadata-Version: 2.1\nName: {name}\nVersion: {ver}\n")
+            links = sorted(f for f in os.listdir(d) if f.endswith(".tar.gz"))
+            with open(os.path.join(d, "index.html"), "w") as f:
+                f.write("<!doctype html><html><body>" + "".join(f'<a href="{l}">{l}</a><br>' for l in links) + "</body></html>\n")
+        PY
+        cat > "$PYROOT/serve.py" <<'PY'
+        import base64, functools, http.server, sys
+        root, port, token, log = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
+        class H(http.server.SimpleHTTPRequestHandler):
+            def do_GET(self):
+                if token:
+                    ok = False
+                    a = self.headers.get("Authorization", "")
+                    if a.startswith("Basic "):
+                        try:
+                            ok = base64.b64decode(a[6:]).decode().split(":", 1)[1] == token
+                        except Exception:
+                            pass
+                    if not ok:
+                        self.send_response(401)
+                        self.send_header("WWW-Authenticate", 'Basic realm="copperleaf"')
+                        self.send_header("Content-Length", "0")
+                        self.end_headers()
+                        return
+                with open(log, "a") as f:
+                    f.write("GET " + self.path + "\n")
+                super().do_GET()
+            def end_headers(self):
+                self.send_header("Cache-Control", "max-age=3600")
+                super().end_headers()
+            def log_message(self, *a):
+                pass
+        http.server.ThreadingHTTPServer(("0.0.0.0", port), functools.partial(H, directory=root)).serve_forever()
+        PY
+        python3 "$PYROOT/mkindex.py" "$PYROOT" "$PYSPEC"
+        : > "$PYLOG"
+        cat > "/etc/systemd/system/$PYUNIT.service" <<UNIT
+        [Unit]
+        Description=Copperleaf offline Python package index ($PYPORT)
+        After=network.target
+        [Service]
+        ExecStart=/usr/bin/python3 $PYROOT/serve.py $PYROOT $PYPORT '$PYTOKEN' $PYLOG
+        Restart=always
+        [Install]
+        WantedBy=multi-user.target
+        UNIT
+        systemctl daemon-reload
+        systemctl enable "$PYUNIT.service" >/dev/null 2>&1
+        systemctl restart "$PYUNIT.service"
+        for i in $(seq 30); do curl -fs -o /dev/null -u "__token__:$PYTOKEN" "http://127.0.0.1:$PYPORT/simple/$(echo "$PYSPEC" | jq -r '.[0].name')/" && break; sleep 1; done
+        : > "$PYLOG"
+        s=/home/learner/adinsert
+        rm -rf "$s"; install -d "$s/src"
+        printf '%s\n' feed-client==3.1.0 ad-schema==1.8.0 vast-parse==0.7.2 > "$s/requirements.txt"
+        printf '%s\n' 'cl-feed-{{tok}}' > "$s/feed-token.txt"
+        cat > "$s/src/app.py" <<'PY'
+        import importlib
+        v = [importlib.import_module(m).VERSION for m in ["feed_client", "ad_schema", "vast_parse"]]
+        print(f"adinsert 2.4 ready with feed-client {v[0]}")
+        PY
+        cat > "$s/Dockerfile" <<'DF'
+        FROM python:3.13-alpine
+        ENV PIP_DISABLE_PIP_VERSION_CHECK=1
+        ARG FEED_TOKEN
+        WORKDIR /app
+        COPY requirements.txt .
+        RUN pip install --no-cache-dir --index-url "http://__token__:${FEED_TOKEN}@@GW@:3141/simple" -r requirements.txt
+        COPY src/ src/
+        CMD ["python3", "src/app.py"]
+        DF
+        sed -i "s/@GW@/$GW/" "$s/Dockerfile"
+        printf '%s\n' '#!/bin/sh' '# current build command' \
+          'docker build --build-arg FEED_TOKEN="$(cat feed-token.txt)" -t copperleaf/adinsert:2.4 .' > "$s/build.sh"
+        chmod 0755 "$s/build.sh"
+        chown -R learner:learner "$s"
+  checks:
+    - id: builds-from-secret
+      description: The context builds with only the feedtoken secret, runs, and the fresh image holds no token
+      type: shell
+      timeoutSec: 240
+      on: cl-adinsert-02
+      skills: [containers.buildkit.secrets]
+      weight: 2
+      command: |
+        # leaks <image> <needle>: prints how many places (history, inspect output, files of docker save) hold the needle
+        leaks() {
+          n=0
+          docker history --no-trunc "$1" 2>/dev/null | grep -qF -- "$2" && n=$((n + 1))
+          docker image inspect "$1" 2>/dev/null | grep -qF -- "$2" && n=$((n + 1))
+          t=$(mktemp -d); docker save "$1" 2>/dev/null | tar -x -C "$t" 2>/dev/null
+          find "$t" -type f > "$t.lst"
+          while IFS= read -r f; do zcat -f "$f" 2>/dev/null | grep -aqF -- "$2" && n=$((n + 1)); done < "$t.lst"
+          rm -rf "$t" "$t.lst"; echo "$n"
+        }
+        cd /home/learner/adinsert || exit 0
+        docker build -q --no-cache --secret id=feedtoken,src=/home/learner/adinsert/feed-token.txt -t ct-probe/adinsert:probe . >/dev/null 2>&1 || { echo build-failed; exit 0; }
+        r=$(docker run --rm ct-probe/adinsert:probe 2>&1 | tail -n 1)
+        n=$(leaks ct-probe/adinsert:probe 'cl-feed-{{tok}}')
+        docker rmi -f ct-probe/adinsert:probe >/dev/null 2>&1
+        echo "$r leaks=$n"
+      expect: {match: exact, value: "adinsert 2.4 ready with feed-client 3.1.0 leaks=0"}
+    - id: token-not-in-image
+      description: copperleaf/adinsert:2.4 holds the token in no history entry, config field or layer
+      type: shell
+      timeoutSec: 120
+      on: cl-adinsert-02
+      skills: [containers.supply-chain.secret-hygiene, k8s.security.supply-chain]
+      weight: 3
+      command: |
+        # leaks <image> <needle>: prints how many places (history, inspect output, files of docker save) hold the needle
+        leaks() {
+          n=0
+          docker history --no-trunc "$1" 2>/dev/null | grep -qF -- "$2" && n=$((n + 1))
+          docker image inspect "$1" 2>/dev/null | grep -qF -- "$2" && n=$((n + 1))
+          t=$(mktemp -d); docker save "$1" 2>/dev/null | tar -x -C "$t" 2>/dev/null
+          find "$t" -type f > "$t.lst"
+          while IFS= read -r f; do zcat -f "$f" 2>/dev/null | grep -aqF -- "$2" && n=$((n + 1)); done < "$t.lst"
+          rm -rf "$t" "$t.lst"; echo "$n"
+        }
+        docker image inspect copperleaf/adinsert:2.4 >/dev/null 2>&1 || { echo no-image; exit 0; }
+        echo "leaks=$(leaks copperleaf/adinsert:2.4 'cl-feed-{{tok}}')"
+      expect: {match: exact, value: "leaks=0"}
+    - id: image-runs
+      description: copperleaf/adinsert:2.4 starts and prints its banner
+      type: shell
+      timeoutSec: 60
+      on: cl-adinsert-02
+      skills: [containers.buildkit.secrets]
+      weight: 1
+      command: docker run --rm copperleaf/adinsert:2.4 2>&1 | tail -n 1
+      expect: {match: exact, value: "adinsert 2.4 ready with feed-client 3.1.0"}
+  hints:
+    - title: Secret mounts
+      body: "`RUN --mount=type=secret,id=feedtoken <command>` makes the secret available as the file `/run/secrets/feedtoken` for that one instruction only; it is never written to a layer."
+      cost: 1
+    - title: Passing the secret
+      body: "`docker build --secret id=feedtoken,src=feed-token.txt -t ... .` hands the file to the build. Use `$(cat /run/secrets/feedtoken)` inside the command."
+      cost: 2
+    - title: Look for it yourself
+      body: "`docker history --no-trunc copperleaf/adinsert:2.4 | grep cl-feed` shows whether the token is still there; `docker save` plus `grep -a` over the extracted layers covers the rest."
+      cost: 1
+  misconceptions:
+    - id: arg-kept
+      description: Keeps passing the token as a build argument.
+      feedback: "A build argument used by RUN is recorded in the image history. Pass the token as a secret mount instead."
+      expectFail: [token-not-in-image, builds-from-secret]
+      mutation:
+        on: cl-adinsert-02
+        as: learner
+        run: |
+          cd ~/adinsert
+          docker build -q --build-arg FEED_TOKEN="$(cat feed-token.txt)" -t copperleaf/adinsert:2.4 .
+    - id: copy-then-remove
+      description: Copies the token file into the image, uses it, and deletes it in a later step.
+      feedback: "Deleting the file in a later layer hides it, but the layer that holds it is still in the image. Mount the token as a secret so it never enters a layer."
+      expectFail: [token-not-in-image, builds-from-secret]
+      mutation:
+        on: cl-adinsert-02
+        as: learner
+        run: |
+          cd ~/adinsert
+          gw=$(sed -n 's/.*@\([0-9.]*\):3141.*/\1/p' Dockerfile)
+          printf '%s\n' 'FROM python:3.13-alpine' 'ENV PIP_DISABLE_PIP_VERSION_CHECK=1' 'WORKDIR /app' 'COPY requirements.txt feed-token.txt ./' \
+            "RUN pip install --no-cache-dir --index-url \"http://__token__:\$(cat feed-token.txt)@$gw:3141/simple\" -r requirements.txt" \
+            'RUN rm -f feed-token.txt' 'COPY src/ src/' 'CMD ["python3", "src/app.py"]' > Dockerfile
+          docker build -q -t copperleaf/adinsert:2.4 .
+    - id: hardcoded
+      description: Writes the token straight into the RUN command.
+      feedback: "A literal in a RUN line is stored in the history and in the source repository. Read it from a secret mount."
+      expectFail: [token-not-in-image, builds-from-secret]
+      mutation:
+        on: cl-adinsert-02
+        as: learner
+        run: |
+          cd ~/adinsert
+          sed -i '/^ARG FEED_TOKEN/d; s/\${FEED_TOKEN}/cl-feed-{{tok}}/' Dockerfile
+          docker build -q -t copperleaf/adinsert:2.4 .
+  solution:
+    explanation: |
+      Mount the token as a build secret for the one `RUN` that needs it and read it from
+      `/run/secrets/feedtoken`. The Dockerfile keeps no `ARG`, the history shows only the
+      unexpanded `$(cat ...)`, and no layer ever contains the file.
+    steps:
+      - on: cl-adinsert-02
+        as: learner
+        run: |
+          cd ~/adinsert
+          gw=$(sed -n 's/.*@\([0-9.]*\):3141.*/\1/p' Dockerfile)
+          printf '%s\n' 'FROM python:3.13-alpine' 'ENV PIP_DISABLE_PIP_VERSION_CHECK=1' 'WORKDIR /app' 'COPY requirements.txt .' \
+            "RUN --mount=type=secret,id=feedtoken pip install --no-cache-dir --index-url \"http://__token__:\$(cat /run/secrets/feedtoken)@$gw:3141/simple\" -r requirements.txt" \
+            'COPY src/ src/' 'CMD ["python3", "src/app.py"]' > Dockerfile
+          docker build --secret id=feedtoken,src=feed-token.txt -t copperleaf/adinsert:2.4 .
+    alternatives:
+      - id: secret-as-env
+        description: Expose the secret to the one command as an environment variable.
+        steps:
+          - on: cl-adinsert-02
+            as: learner
+            run: |
+              cd ~/adinsert
+              gw=$(sed -n 's/.*@\([0-9.]*\):3141.*/\1/p' Dockerfile)
+              printf '%s\n' 'FROM python:3.13-alpine' 'ENV PIP_DISABLE_PIP_VERSION_CHECK=1' 'WORKDIR /app' 'COPY requirements.txt .' \
+                "RUN --mount=type=secret,id=feedtoken,env=FEED_TOKEN pip install --no-cache-dir --index-url \"http://__token__:\${FEED_TOKEN}@$gw:3141/simple\" -r requirements.txt" \
+                'COPY src/ src/' 'CMD ["python3", "src/app.py"]' > Dockerfile
+              docker build --secret id=feedtoken,src=feed-token.txt -t copperleaf/adinsert:2.4 .

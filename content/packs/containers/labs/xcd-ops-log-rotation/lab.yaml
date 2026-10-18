@@ -1,0 +1,165 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xcd-ops-log-rotation
+  title: Cap container logs engine-wide
+  domain: containers
+  frameworks: [docker-practitioner:operations]
+  difficulty: easy
+  estimatedMinutes: 8
+  tags: [exam, docker, logging, daemon-config]
+  version: 1
+spec:
+  description: |
+    **Host:** `cl-docker-01` (`ssh cl-docker-01`)
+
+    The container **`chatty`** (image `copperleaf/chatty:1`, site {{site}}) writes a line per second and
+    its json-file log grows without bound. Configure the engine so that **new containers**
+    use the **`local`** log driver with **10 MB** files and **at most three** files per
+    container, then **recreate `chatty`** (same name and image, restart policy
+    `unless-stopped`) so it uses those defaults.
+
+    Keep the other settings in `/etc/docker/daemon.json` (the host label
+    `site=copperleaf-exam`). Leave `chatty` running.
+  objectives:
+    - Set daemon-wide log driver and rotation options
+    - Recreate a container to pick up new defaults
+  params:
+    site:
+      type: int
+      min: 10
+      max: 99
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-docker-01
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-docker-01
+      timeoutSec: 300
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        # daemon.json is shared by several tasks: merge keys with jq, never overwrite the file
+        install -d /etc/docker; [ -s /etc/docker/daemon.json ] || echo '{}' > /etc/docker/daemon.json
+        jq '. + {"labels": (((.labels // []) + ["site=copperleaf-exam"]) | unique)}' /etc/docker/daemon.json > /etc/docker/daemon.json.new && mv /etc/docker/daemon.json.new /etc/docker/daemon.json
+        d=$(mktemp -d)
+        printf '%s\n' 'FROM busybox:1.37' 'ENV SITE={{site}}' \
+          'CMD ["sh", "-c", "while :; do echo chatty $SITE line; sleep 1; done"]' > "$d/Dockerfile"
+        docker build -q -t copperleaf/chatty:1 "$d" >/dev/null; rm -rf "$d"
+        docker rm -f chatty >/dev/null 2>&1 || true
+        docker run -d --name chatty --restart unless-stopped --log-driver json-file copperleaf/chatty:1 >/dev/null
+  checks:
+    - id: daemon-defaults
+      description: daemon.json sets the local log driver with 10m files and three of them, and the engine runs with the driver
+      type: shell
+      timeoutSec: 60
+      on: cl-docker-01
+      skills: [containers.operations.logging, containers.operations.daemon-config]
+      weight: 3
+      command: |
+        f=$(jq -S -c '[."log-driver", ."log-opts"]' /etc/docker/daemon.json 2>/dev/null || echo bad-file)
+        e=$(docker info --format json 2>/dev/null | jq -r '.LoggingDriver')
+        echo "$f engine=$e"
+      expect: {match: exact, value: '["local",{"max-file":"3","max-size":"10m"}] engine=local'}
+    - id: chatty-recreated
+      description: chatty runs with the local driver and the rotation options in its own configuration
+      type: shell
+      timeoutSec: 60
+      on: cl-docker-01
+      skills: [containers.operations.logging]
+      weight: 3
+      command: |
+        docker inspect chatty 2>/dev/null | jq -r '[.[0].HostConfig.LogConfig.Type, (.[0].HostConfig.LogConfig.Config["max-size"] // "-"), (.[0].HostConfig.LogConfig.Config["max-file"] // "-"), (.[0].State.Running | tostring), .[0].Config.Image] | join(" ")'
+      expect: {match: exact, value: "local 10m 3 true copperleaf/chatty:1"}
+    - id: chatty-restarts
+      description: chatty keeps a restart policy that survives a reboot
+      type: shell
+      timeoutSec: 60
+      on: cl-docker-01
+      skills: [containers.operations.restart-health]
+      weight: 1
+      command: docker inspect chatty 2>/dev/null | jq -r 'if (.[0].HostConfig.RestartPolicy.Name | IN("always", "unless-stopped")) then "restarts" else "stays-down" end'
+      expect: {match: exact, value: restarts}
+    - id: other-settings-kept
+      description: The host label from daemon.json is still set
+      type: shell
+      timeoutSec: 60
+      on: cl-docker-01
+      skills: [containers.operations.daemon-config]
+      weight: 1
+      command: docker info --format json 2>/dev/null | jq -r '(.Labels // []) | if index("site=copperleaf-exam") != null then "kept" else "lost" end'
+      expect: {match: exact, value: kept}
+  misconceptions:
+    - id: container-flags-only
+      description: Recreates chatty with log flags but leaves the engine defaults alone.
+      feedback: "Flags on one container fix that container only. The task asks for the engine's defaults, so new containers rotate too. Set log-driver and log-opts in daemon.json."
+      expectFail: [daemon-defaults]
+      mutation:
+        on: cl-docker-01
+        as: learner
+        run: |
+          docker rm -f chatty
+          docker run -d --name chatty --restart unless-stopped --log-driver local --log-opt max-size=10m --log-opt max-file=3 copperleaf/chatty:1
+    - id: not-recreated
+      description: Changes the defaults and restarts the engine, but keeps the old container.
+      feedback: "A container keeps the log configuration it was created with. Remove it and run it again so it picks up the new defaults."
+      expectFail: [chatty-recreated]
+      mutation:
+        on: cl-docker-01
+        as: learner
+        run: |
+          sudo jq '. + {"log-driver": "local", "log-opts": {"max-size": "10m", "max-file": "3"}}' /etc/docker/daemon.json | sudo tee /etc/docker/daemon.json.new >/dev/null
+          sudo mv /etc/docker/daemon.json.new /etc/docker/daemon.json
+          sudo systemctl restart docker
+          for i in $(seq 60); do docker info >/dev/null 2>&1 && break; sleep 1; done
+    - id: json-file-rotation
+      description: Keeps the json-file driver and only adds rotation options.
+      feedback: "The task asks for the local driver, which is more compact. Set log-driver to local in daemon.json."
+      expectFail: [daemon-defaults, chatty-recreated]
+      mutation:
+        on: cl-docker-01
+        as: learner
+        run: |
+          sudo jq '. + {"log-driver": "json-file", "log-opts": {"max-size": "10m", "max-file": "3"}}' /etc/docker/daemon.json | sudo tee /etc/docker/daemon.json.new >/dev/null
+          sudo mv /etc/docker/daemon.json.new /etc/docker/daemon.json
+          sudo systemctl restart docker
+          for i in $(seq 60); do docker info >/dev/null 2>&1 && break; sleep 1; done
+          docker rm -f chatty
+          docker run -d --name chatty --restart unless-stopped copperleaf/chatty:1
+  solution:
+    explanation: |
+      Merge the two keys into daemon.json, restart the engine, then recreate the container:
+      it records the daemon defaults in its own configuration when it is created.
+    steps:
+      - on: cl-docker-01
+        as: learner
+        run: |
+          sudo jq '. + {"log-driver": "local", "log-opts": {"max-size": "10m", "max-file": "3"}}' /etc/docker/daemon.json | sudo tee /etc/docker/daemon.json.new >/dev/null
+          sudo mv /etc/docker/daemon.json.new /etc/docker/daemon.json
+          sudo systemctl restart docker
+          for i in $(seq 60); do docker info >/dev/null 2>&1 && break; sleep 1; done
+          docker rm -f chatty
+          docker run -d --name chatty --restart unless-stopped copperleaf/chatty:1
+    alternatives:
+      - id: jq-in-place
+        description: Edit the keys with jq through a temporary file.
+        steps:
+          - on: cl-docker-01
+            as: learner
+            run: |
+              t=$(mktemp)
+              sudo jq '."log-driver" = "local" | ."log-opts" = {"max-size": "10m", "max-file": "3"}' /etc/docker/daemon.json > "$t"
+              sudo install -m 0644 "$t" /etc/docker/daemon.json
+              sudo systemctl restart docker
+              for i in $(seq 60); do docker info >/dev/null 2>&1 && break; sleep 1; done
+              docker stop chatty && docker rm chatty
+              docker run -d --name chatty --restart unless-stopped copperleaf/chatty:1

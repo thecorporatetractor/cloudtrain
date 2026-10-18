@@ -1,0 +1,221 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xcd-net-docker-user-rule
+  title: Allow a published port from one subnet only
+  domain: containers
+  frameworks: [docker-practitioner:networking]
+  difficulty: hard
+  estimatedMinutes: 15
+  tags: [exam, docker, iptables, docker-user, firewall]
+  version: 1
+spec:
+  description: |
+    **Host:** `cl-docker-01` (`ssh cl-docker-01`)
+
+    The container **`edge-gw`** publishes its web port on host port **8443** (container
+    port 80) on every address, and the security team wants it reachable **only from the
+    office subnet `10.20.0.0/24`**. Do not change how the container is published and do
+    not stop it. Use the engine's **user chain** (`DOCKER-USER`), which the engine
+    evaluates before its own rules for published ports.
+
+    Clients from `10.20.0.0/24` must keep getting the page; clients from any other
+    source address must get no answer. The rule has to **survive an engine restart and a
+    host reboot**: make a systemd unit apply it.
+  objectives:
+    - Filter published-port traffic in the DOCKER-USER chain
+    - Match the original destination port after NAT
+    - Persist a firewall rule across engine restarts and reboots
+  params:
+    n:
+      type: int
+      min: 100
+      max: 999
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-docker-01
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-docker-01
+      timeoutSec: 300
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        d=$(mktemp -d); mkdir "$d/www"; echo "edge-gw {{n}}" > "$d/www/index.html"
+        printf '%s\n' 'FROM busybox:1.37' 'COPY www /www' 'EXPOSE 80' 'CMD ["httpd", "-f", "-p", "80", "-h", "/www"]' > "$d/Dockerfile"
+        docker build -q -t copperleaf/edge-gw:1 "$d" >/dev/null; rm -rf "$d"
+        docker rm -f edge-gw >/dev/null 2>&1 || true
+        docker run -d --name edge-gw --restart unless-stopped -p 8443:80 copperleaf/edge-gw:1 >/dev/null
+        # no leftovers from an earlier attempt
+        iptables -S DOCKER-USER 2>/dev/null | grep -E -- '8443|10\.20\.0' | sed 's/^-A/-D/' | while read -r r; do iptables $r; done || true
+        rm -f /etc/systemd/system/cl-docker-user*.service /etc/systemd/system/edge-gw-*.service
+        systemctl daemon-reload
+        mkdir -p /etc/copperleaf/network
+        printf '%s\n' 'Office subnet: 10.20.0.0/24' > /etc/copperleaf/network/office-subnet.txt
+  checks:
+    - id: office-allowed
+      description: A client in 10.20.0.0/24 still gets the page on port 8443
+      type: shell
+      timeoutSec: 60
+      on: cl-docker-01
+      skills: [containers.network.host-firewall]
+      weight: 1.5
+      command: |
+        # probe <name> <prefix>: what a client at <prefix>.2 (a throwaway namespace) gets from the published port 8443
+        probe() {
+          ip netns del "$1" >/dev/null 2>&1; ip link del "v$1" >/dev/null 2>&1
+          ip netns add "$1" && ip link add "v$1" type veth peer name "p$1" && ip link set "p$1" netns "$1" || { echo setup-failed; return; }
+          ip addr add "$2.1/24" dev "v$1"; ip link set "v$1" up
+          ip netns exec "$1" ip addr add "$2.2/24" dev "p$1"; ip netns exec "$1" ip link set "p$1" up; ip netns exec "$1" ip link set lo up
+          out=$(ip netns exec "$1" curl -s --max-time 4 -w '|%{http_code}' "http://$2.1:8443/" 2>/dev/null | tr -d '\n')
+          ip netns del "$1" >/dev/null 2>&1; ip link del "v$1" >/dev/null 2>&1
+          echo "$out"
+        }
+        probe xcd-office 10.20.0
+      expect: {match: exact, value: "edge-gw {{n}}|200"}
+    - id: others-blocked
+      description: A client outside the office subnet gets no answer on port 8443
+      type: shell
+      timeoutSec: 60
+      on: cl-docker-01
+      skills: [containers.network.host-firewall]
+      weight: 3
+      command: |
+        # probe <name> <prefix>: what a client at <prefix>.2 (a throwaway namespace) gets from the published port 8443
+        probe() {
+          ip netns del "$1" >/dev/null 2>&1; ip link del "v$1" >/dev/null 2>&1
+          ip netns add "$1" && ip link add "v$1" type veth peer name "p$1" && ip link set "p$1" netns "$1" || { echo setup-failed; return; }
+          ip addr add "$2.1/24" dev "v$1"; ip link set "v$1" up
+          ip netns exec "$1" ip addr add "$2.2/24" dev "p$1"; ip netns exec "$1" ip link set "p$1" up; ip netns exec "$1" ip link set lo up
+          out=$(ip netns exec "$1" curl -s --max-time 4 -w '|%{http_code}' "http://$2.1:8443/" 2>/dev/null | tr -d '\n')
+          ip netns del "$1" >/dev/null 2>&1; ip link del "v$1" >/dev/null 2>&1
+          echo "$out"
+        }
+        probe xcd-other 10.30.0
+      expect: {match: exact, value: "|000"}
+    - id: user-chain-rule
+      description: DOCKER-USER holds a DROP or REJECT rule
+      type: shell
+      timeoutSec: 30
+      on: cl-docker-01
+      skills: [containers.network.host-firewall]
+      weight: 1
+      command: |
+        n=$(iptables -S DOCKER-USER 2>/dev/null | grep -cE -- '-j (DROP|REJECT)' || true)
+        [ "${n:-0}" -ge 1 ] && echo present || echo absent
+      expect: {match: exact, value: present}
+    - id: survives-restart
+      description: After a fresh firewall state and an engine restart the filter is applied again
+      type: shell
+      timeoutSec: 300
+      on: cl-docker-01
+      skills: [containers.network.host-firewall, containers.operations.restart-health]
+      weight: 3
+      command: |
+        # probe <name> <prefix>: what a client at <prefix>.2 (a throwaway namespace) gets from the published port 8443
+        probe() {
+          ip netns del "$1" >/dev/null 2>&1; ip link del "v$1" >/dev/null 2>&1
+          ip netns add "$1" && ip link add "v$1" type veth peer name "p$1" && ip link set "p$1" netns "$1" || { echo setup-failed; return; }
+          ip addr add "$2.1/24" dev "v$1"; ip link set "v$1" up
+          ip netns exec "$1" ip addr add "$2.2/24" dev "p$1"; ip netns exec "$1" ip link set "p$1" up; ip netns exec "$1" ip link set lo up
+          out=$(ip netns exec "$1" curl -s --max-time 4 -w '|%{http_code}' "http://$2.1:8443/" 2>/dev/null | tr -d '\n')
+          ip netns del "$1" >/dev/null 2>&1; ip link del "v$1" >/dev/null 2>&1
+          echo "$out"
+        }
+        # emulate a reboot: drop the filter rules, restart the engine and the custom units, wait for the container
+        iptables -S DOCKER-USER 2>/dev/null | grep -E -- '-j (DROP|REJECT)' | sed 's/^-A/-D/' | while read -r r; do iptables $r; done
+        systemctl restart docker
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        for u in $(find /etc/systemd/system -maxdepth 1 -type f -name '*.service' ! -name 'xcd-pypi-*' -exec basename {} \;); do systemctl restart "$u" >/dev/null 2>&1 || true; done
+        for i in $(seq 60); do curl -fs --max-time 2 -o /dev/null http://127.0.0.1:8443/ && break; sleep 2; done
+        echo "$(probe xcd-office2 10.20.0) $(probe xcd-other2 10.30.0)"
+      expect: {match: exact, value: "edge-gw {{n}}|200 |000"}
+  misconceptions:
+    - id: post-nat-port
+      description: Matches --dport 8443 in DOCKER-USER, which is already the translated port 80 there.
+      feedback: "By the time a packet reaches DOCKER-USER it has been through DNAT, so its destination port is the container's port 80. Match the original destination port with -m conntrack --ctorigdstport 8443 --ctdir ORIGINAL."
+      expectFail: [others-blocked]
+      mutation:
+        on: cl-docker-01
+        as: learner
+        run: sudo iptables -I DOCKER-USER -p tcp --dport 8443 ! -s 10.20.0.0/24 -j DROP
+    - id: input-chain
+      description: Drops the traffic in INPUT, which never sees forwarded published-port traffic.
+      feedback: "Published ports are forwarded to the container, so INPUT does not apply. Use the DOCKER-USER chain."
+      expectFail: [others-blocked, user-chain-rule]
+      mutation:
+        on: cl-docker-01
+        as: learner
+        run: sudo iptables -I INPUT -p tcp --dport 8443 ! -s 10.20.0.0/24 -j DROP
+    - id: not-persistent
+      description: Adds the right rule by hand without anything that restores it after a reboot.
+      feedback: "The rule works now, but the firewall state is rebuilt at boot. Apply the rule from a systemd unit that runs after docker.service."
+      expectFail: [survives-restart]
+      mutation:
+        on: cl-docker-01
+        as: learner
+        run: sudo iptables -I DOCKER-USER -p tcp -m conntrack --ctorigdstport 8443 --ctdir ORIGINAL ! -s 10.20.0.0/24 -j DROP
+  solution:
+    explanation: |
+      In DOCKER-USER the destination port is already translated, so the rule matches the
+      original destination port through conntrack, in the original direction only (replies
+      must pass). A oneshot unit that is part of docker.service re-applies it whenever the
+      engine starts, including at boot.
+    steps:
+      - on: cl-docker-01
+        as: learner
+        run: |
+          sudo tee /etc/systemd/system/cl-docker-user.service >/dev/null <<'UNIT'
+          [Unit]
+          Description=Restrict published port 8443 to the office subnet
+          After=docker.service
+          PartOf=docker.service
+
+          [Service]
+          Type=oneshot
+          RemainAfterExit=yes
+          ExecStart=/bin/sh -c 'iptables -C DOCKER-USER -p tcp -m conntrack --ctorigdstport 8443 --ctdir ORIGINAL ! -s 10.20.0.0/24 -j DROP 2>/dev/null || iptables -I DOCKER-USER -p tcp -m conntrack --ctorigdstport 8443 --ctdir ORIGINAL ! -s 10.20.0.0/24 -j DROP'
+
+          [Install]
+          WantedBy=multi-user.target docker.service
+          UNIT
+          sudo systemctl daemon-reload
+          sudo systemctl enable --now cl-docker-user.service
+    alternatives:
+      - id: reject-in-script
+        description: Keep the rule in a script, call it from the unit, and REJECT instead of DROP.
+        steps:
+          - on: cl-docker-01
+            as: learner
+            run: |
+              sudo tee /usr/local/sbin/cl-docker-user.sh >/dev/null <<'SH'
+              #!/bin/sh
+              set -eu
+              r="-p tcp -m conntrack --ctorigdstport 8443 --ctdir ORIGINAL ! -s 10.20.0.0/24 -j REJECT --reject-with icmp-port-unreachable"
+              iptables -C DOCKER-USER $r 2>/dev/null || iptables -I DOCKER-USER $r
+              SH
+              sudo chmod 0755 /usr/local/sbin/cl-docker-user.sh
+              sudo tee /etc/systemd/system/cl-docker-user.service >/dev/null <<'UNIT'
+              [Unit]
+              After=docker.service
+              PartOf=docker.service
+
+              [Service]
+              Type=oneshot
+              RemainAfterExit=yes
+              ExecStart=/usr/local/sbin/cl-docker-user.sh
+
+              [Install]
+              WantedBy=multi-user.target
+              UNIT
+              sudo systemctl daemon-reload
+              sudo systemctl enable --now cl-docker-user.service

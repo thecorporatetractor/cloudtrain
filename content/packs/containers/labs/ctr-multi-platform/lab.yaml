@@ -1,0 +1,195 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-multi-platform
+  title: Publish the thumbnailer for amd64 and arm64 in one index
+  domain: containers
+  frameworks: [docker-practitioner:build, docker-practitioner:registry]
+  difficulty: hard
+  estimatedMinutes: 25
+  tags: [docker, buildx, multi-platform, registry, index]
+  version: 1
+spec:
+  description: |
+    Copperleaf's new ARM edge boxes need the thumbnailer (release **{{rev}}**). The
+    program is already compiled for both architectures: `~/thumbnailer/` on
+    `cl-registry-02` (`ssh cl-registry-02`; you are in the `docker` group) holds
+    `thumbnailer-amd64` and `thumbnailer-arm64`, and a Dockerfile that only knows the
+    first one. This host has no emulation, and none is needed: the image copies a prebuilt
+    file and runs nothing during the build.
+
+    The private registry is `registry.copperleaf.example:5000` (plain HTTP).
+
+    1. Build **`registry.copperleaf.example:5000/thumbnailer:3.1`** for **`linux/amd64`
+       and `linux/arm64`** and push it as a **single index**, so that each platform
+       gets the matching `thumbnailer` file.
+    2. Write the digest of the pushed **index** (`sha256:...`) to `~/index-digest.txt`.
+
+    Attestation manifests that the builder adds to the index do not count as platforms.
+  objectives:
+    - Build for two platforms without emulation
+    - Select per-platform inputs with TARGETARCH
+    - Publish one multi-platform index and read its digest
+  params:
+    rev:
+      type: int
+      min: 100
+      max: 899
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-registry-02
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-registry-02
+      timeoutSec: 300
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        # merge the plain-HTTP mirror into daemon.json without replacing the file
+        install -d /etc/docker; [ -s /etc/docker/daemon.json ] || echo '{}' > /etc/docker/daemon.json
+        jq '. + {"insecure-registries": (((."insecure-registries" // []) + ["registry.copperleaf.example:5000"]) | unique)}' /etc/docker/daemon.json > /etc/docker/daemon.json.new
+        mv /etc/docker/daemon.json.new /etc/docker/daemon.json
+        grep -q ' registry.copperleaf.example' /etc/hosts || echo '127.0.0.1 registry.copperleaf.example' >> /etc/hosts
+        systemctl restart docker
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        docker rm -f registry >/dev/null 2>&1 || true
+        docker run -d --name registry --restart always -p 127.0.0.1:5000:5000 registry:3 >/dev/null
+        for i in $(seq 30); do curl -fs http://127.0.0.1:5000/v2/ >/dev/null && break; sleep 1; done
+        s=/home/learner/thumbnailer
+        rm -rf "$s"; install -d "$s"
+        printf '%s\n' 'thumbnailer {{rev}} amd64' > "$s/thumbnailer-amd64"
+        printf '%s\n' 'thumbnailer {{rev}} arm64' > "$s/thumbnailer-arm64"
+        cat > "$s/Dockerfile" <<'DF'
+        FROM scratch
+        COPY thumbnailer-amd64 /thumbnailer
+        ENTRYPOINT ["/thumbnailer"]
+        DF
+        chown -R learner:learner "$s"
+        rm -f /home/learner/index-digest.txt
+  checks:
+    - id: index-two-platforms
+      description: The 3.1 tag is an index listing exactly linux/amd64 and linux/arm64 (attestations ignored)
+      type: shell
+      timeoutSec: 60
+      on: cl-registry-02
+      skills: [containers.buildkit.multi-platform]
+      weight: 3
+      command: |
+        A='Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json'
+        curl -fsS -H "$A" http://127.0.0.1:5000/v2/thumbnailer/manifests/3.1 2>/dev/null \
+          | jq -r '[(.manifests // [])[] | select((.platform.os // "unknown") != "unknown") | .platform.os + "/" + .platform.architecture] | sort | join(",")' 2>/dev/null || echo none
+      expect: {match: exact, value: "linux/amd64,linux/arm64"}
+    - id: platform-content
+      description: Each platform image carries the thumbnailer built for that architecture
+      type: shell
+      timeoutSec: 120
+      on: cl-registry-02
+      skills: [containers.buildkit.multi-platform]
+      weight: 3
+      command: |
+        out=""
+        for a in amd64 arm64; do
+          d=$(mktemp -d)
+          if skopeo copy -q --override-os linux --override-arch "$a" --src-tls-verify=false docker://registry.copperleaf.example:5000/thumbnailer:3.1 "dir:$d" >/dev/null 2>&1; then
+            c=""
+            for h in $(jq -r '.layers[].digest | sub("sha256:"; "")' "$d/manifest.json"); do
+              x=$(zcat -f "$d/$h" 2>/dev/null | tar -xO --wildcards '*thumbnailer' 2>/dev/null)
+              [ -n "$x" ] && c="$x"
+            done
+            out="$out $a=${c:-empty}"
+          else
+            out="$out $a=pull-failed"
+          fi
+          rm -rf "$d"
+        done
+        echo "${out# }"
+      expect: {match: exact, value: "amd64=thumbnailer {{rev}} amd64 arm64=thumbnailer {{rev}} arm64"}
+    - id: index-digest-recorded
+      description: ~/index-digest.txt holds the digest the registry serves for the 3.1 tag
+      type: shell
+      timeoutSec: 60
+      on: cl-registry-02
+      skills: [containers.registry.references]
+      weight: 1.5
+      command: |
+        A='Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json'
+        d=$(curl -sI -H "$A" http://127.0.0.1:5000/v2/thumbnailer/manifests/3.1 | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}')
+        [ -n "$d" ] && grep -qF "$d" /home/learner/index-digest.txt 2>/dev/null && echo recorded || echo wrong
+      expect: {match: exact, value: recorded}
+  hints:
+    - title: One file per architecture
+      body: "BuildKit sets `TARGETARCH` (amd64, arm64) for each platform of a multi-platform build once you declare `ARG TARGETARCH` after `FROM`. Use it in the file name: `COPY thumbnailer-${TARGETARCH} /thumbnailer`."
+      cost: 1
+    - title: One command, one index
+      body: "`docker buildx build --platform linux/amd64,linux/arm64 -t <ref> --push .` builds both and pushes a single index. Because nothing runs during the build, no emulation is needed."
+      cost: 2
+    - title: The index digest
+      body: "The tag points at the index. `curl -sI -H 'Accept: application/vnd.oci.image.index.v1+json' http://registry.copperleaf.example:5000/v2/thumbnailer/manifests/3.1` returns it in `Docker-Content-Digest`; `docker buildx build` also prints it when it pushes."
+      cost: 1
+  misconceptions:
+    - id: single-platform
+      description: Builds and pushes only for the host platform.
+      feedback: "Without --platform the build targets the host architecture only, and the registry gets a single manifest. List both platforms in the same build."
+      expectFail: [index-two-platforms, platform-content]
+      mutation:
+        on: cl-registry-02
+        as: learner
+        run: |
+          cd ~/thumbnailer
+          docker buildx build -t registry.copperleaf.example:5000/thumbnailer:3.1 --push .
+    - id: same-file-both
+      description: Builds both platforms but copies the amd64 file into both.
+      feedback: "The index lists both platforms, but the arm64 image holds the amd64 program. Select the input with TARGETARCH."
+      expectFail: [platform-content]
+      mutation:
+        on: cl-registry-02
+        as: learner
+        run: |
+          cd ~/thumbnailer
+          docker buildx build --platform linux/amd64,linux/arm64 -t registry.copperleaf.example:5000/thumbnailer:3.1 --push .
+    - id: two-tags
+      description: Pushes one tag per architecture instead of one index.
+      feedback: "Two separate tags force every client to pick the right one. Push one tag whose index lists both platforms and let the runtime choose."
+      expectFail: [index-two-platforms]
+      mutation:
+        on: cl-registry-02
+        as: learner
+        run: |
+          cd ~/thumbnailer
+          sed -i 's|^COPY .*|ARG TARGETARCH\nCOPY thumbnailer-${TARGETARCH} /thumbnailer|' Dockerfile
+          docker buildx build --platform linux/amd64 -t registry.copperleaf.example:5000/thumbnailer:3.1-amd64 --push .
+          docker buildx build --platform linux/arm64 -t registry.copperleaf.example:5000/thumbnailer:3.1-arm64 --push .
+  solution:
+    explanation: |
+      Declare `ARG TARGETARCH`, copy the matching prebuilt file, and run one `buildx build`
+      with both platforms and `--push`. No instruction executes inside the image, so the
+      docker driver builds each platform without emulation and pushes one index.
+    steps:
+      - on: cl-registry-02
+        as: learner
+        run: |
+          cd ~/thumbnailer
+          printf '%s\n' 'FROM scratch' 'ARG TARGETARCH' 'COPY thumbnailer-${TARGETARCH} /thumbnailer' 'ENTRYPOINT ["/thumbnailer"]' > Dockerfile
+          docker buildx build --platform linux/amd64,linux/arm64 -t registry.copperleaf.example:5000/thumbnailer:3.1 --push .
+          curl -sI -H 'Accept: application/vnd.oci.image.index.v1+json' http://registry.copperleaf.example:5000/v2/thumbnailer/manifests/3.1 \
+            | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}' > ~/index-digest.txt
+    alternatives:
+      - id: no-attestations
+        description: Build without attestations and read the digest with skopeo.
+        steps:
+          - on: cl-registry-02
+            as: learner
+            run: |
+              cd ~/thumbnailer
+              printf '%s\n' 'FROM scratch' 'ARG TARGETARCH' 'COPY thumbnailer-${TARGETARCH} /thumbnailer' 'ENTRYPOINT ["/thumbnailer"]' > Dockerfile
+              docker buildx build --provenance=false --sbom=false --platform linux/amd64,linux/arm64 -t registry.copperleaf.example:5000/thumbnailer:3.1 --push .
+              echo "sha256:$(skopeo inspect --raw --tls-verify=false docker://registry.copperleaf.example:5000/thumbnailer:3.1 | sha256sum | cut -d' ' -f1)" > ~/index-digest.txt

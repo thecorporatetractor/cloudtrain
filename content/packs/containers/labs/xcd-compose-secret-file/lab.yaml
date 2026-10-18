@@ -1,0 +1,326 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xcd-compose-secret-file
+  title: Give two services a password as a Compose secret
+  domain: containers
+  frameworks: [docker-practitioner:compose]
+  difficulty: medium
+  estimatedMinutes: 10
+  tags: [exam, docker, compose, secrets]
+  version: 1
+spec:
+  description: |
+    **Host:** `cl-docker-01` (`ssh cl-docker-01`)
+
+    `~/exam/payments/compose.yaml` (project `payments`) runs a Redis database `db` and the
+    payments API `api`, and passes the database password to both as the environment
+    variable `DB_PASSWORD`. The password is in `~/exam/payments/secrets/db_password.txt`.
+
+    Change the stack so that both services receive the password as a **file-based Compose
+    secret** named **`db_password`** (mounted at `/run/secrets/db_password`):
+
+    - `db` starts Redis with the password read from that file;
+    - `api` reads it through `DB_PASSWORD_FILE=/run/secrets/db_password`;
+    - the password appears in **no container environment, no `docker inspect` output, no
+      `docker compose config` output and not in `compose.yaml`**;
+    - both services restart automatically, and `api` still answers `200` on
+      **`127.0.0.1:8086`**.
+
+    Bring the stack up from that file.
+  objectives:
+    - Declare a file-based secret and attach it to services
+    - Pass the secret location instead of the secret value
+  params:
+    pw:
+      type: int
+      min: 100000
+      max: 999999
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-docker-01
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-docker-01
+      timeoutSec: 300
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        docker ps -aq --filter label=com.docker.compose.project=payments | xargs -r docker rm -f >/dev/null
+        d=$(mktemp -d)
+        cat > "$d/api.py" <<'PY'
+        import http.server, os, socket
+        def password():
+            f = os.environ.get("DB_PASSWORD_FILE")
+            if f:
+                return open(f).read().strip()
+            return os.environ.get("DB_PASSWORD", "")
+        def authenticated():
+            try:
+                s = socket.create_connection((os.environ.get("DB_HOST", "db"), 6379), timeout=2)
+                s.sendall(("AUTH " + password() + "\r\n").encode())
+                a = s.recv(64)
+                s.sendall(b"PING\r\n")
+                b = s.recv(64)
+                return a.startswith(b"+OK") and b.startswith(b"+PONG")
+            except Exception:
+                return False
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                ok = authenticated()
+                body = b"payments api ok\n" if ok else b"payments api cannot authenticate\n"
+                self.send_response(200 if ok else 503)
+                self.end_headers()
+                self.wfile.write(body)
+            def log_message(self, *a):
+                pass
+        http.server.ThreadingHTTPServer(("", 8000), H).serve_forever()
+        PY
+        printf '%s\n' 'FROM python:3.13-alpine' 'COPY api.py /app/api.py' 'CMD ["python3", "/app/api.py"]' > "$d/Dockerfile"
+        docker build -q -t copperleaf/payments-api:1 "$d" >/dev/null
+        rm -rf "$d"
+        s=/home/learner/exam/payments
+        rm -rf "$s"; install -d -o learner -g learner /home/learner/exam "$s" "$s/secrets"
+        printf '%s\n' 'Ledger-{{pw}}' > "$s/secrets/db_password.txt"
+        cat > "$s/compose.yaml" <<'YML2'
+        name: payments
+        services:
+          db:
+            image: redis:7.4-alpine
+            command: ["sh", "-c", "exec redis-server --requirepass \"$$DB_PASSWORD\""]
+            environment:
+              DB_PASSWORD: Ledger-{{pw}}
+          api:
+            image: copperleaf/payments-api:1
+            environment:
+              DB_HOST: db
+              DB_PASSWORD: Ledger-{{pw}}
+            ports:
+              - "127.0.0.1:8086:8000"
+        YML2
+        chown -R learner:learner "$s"
+  checks:
+    - id: secret-attached
+      description: The compose project defines a file secret db_password and attaches it to db and api
+      type: shell
+      timeoutSec: 60
+      on: cl-docker-01
+      skills: [containers.compose.secrets-configs]
+      weight: 2.5
+      command: |
+        cd /home/learner/exam/payments && docker compose config --format json 2>/dev/null | jq -r '
+          ((.secrets.db_password.file // "") | endswith("secrets/db_password.txt") | tostring) + " db:" +
+          (((.services.db.secrets // []) | map(.source) | index("db_password") != null) | tostring) + " api:" +
+          (((.services.api.secrets // []) | map(.source) | index("db_password") != null) | tostring)' 2>/dev/null || echo none
+      expect: {match: exact, value: "true db:true api:true"}
+    - id: password-hidden
+      description: The password is in no container inspect output, compose config output or compose.yaml
+      type: shell
+      timeoutSec: 60
+      on: cl-docker-01
+      skills: [containers.compose.secrets-configs, containers.supply-chain.secret-hygiene]
+      weight: 3
+      command: |
+        n=0
+        for c in $(docker ps -aq --filter label=com.docker.compose.project=payments); do
+          docker inspect "$c" | grep -qF 'Ledger-{{pw}}' && n=$((n + 1))
+        done
+        (cd /home/learner/exam/payments && docker compose config 2>/dev/null | grep -qF 'Ledger-{{pw}}') && n=$((n + 1))
+        grep -qF 'Ledger-{{pw}}' /home/learner/exam/payments/compose.yaml && n=$((n + 1))
+        c=$(docker ps -q --filter label=com.docker.compose.project=payments | wc -l)
+        echo "visible=$n running=$c"
+      expect: {match: exact, value: "visible=0 running=2"}
+    - id: api-authenticates
+      description: api answers 200 on 127.0.0.1:8086, which needs a working AUTH against db
+      type: shell
+      timeoutSec: 90
+      on: cl-docker-01
+      skills: [containers.compose.secrets-configs]
+      weight: 2
+      command: |
+        r=000; for i in $(seq 20); do r=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 http://127.0.0.1:8086/); [ "$r" = 200 ] && break; sleep 2; done; echo "$r"
+      expect: {match: exact, value: "200"}
+    - id: restarts
+      description: Both services restart automatically
+      type: shell
+      timeoutSec: 60
+      on: cl-docker-01
+      skills: [containers.operations.restart-health]
+      weight: 1
+      command: docker ps -aq --filter label=com.docker.compose.project=payments | xargs -r docker inspect | jq -r '[.[] | select(.HostConfig.RestartPolicy.Name | IN("always", "unless-stopped"))] | length'
+      expect: {match: exact, value: "2"}
+  misconceptions:
+    - id: env-kept
+      description: Declares the secret but leaves DB_PASSWORD in the environment.
+      feedback: "The secret is mounted, but the password is still a plain environment variable, visible in docker inspect. Remove it and pass only the file location."
+      expectFail: [password-hidden]
+      mutation:
+        on: cl-docker-01
+        as: learner
+        run: |
+          cd ~/exam/payments
+          cat > compose.yaml <<'YML2'
+          name: payments
+          services:
+            db:
+              image: redis:7.4-alpine
+              restart: unless-stopped
+              command: ["sh", "-c", "exec redis-server --requirepass \"$$DB_PASSWORD\""]
+              environment:
+                DB_PASSWORD: Ledger-{{pw}}
+              secrets: [db_password]
+            api:
+              image: copperleaf/payments-api:1
+              restart: unless-stopped
+              environment:
+                DB_HOST: db
+                DB_PASSWORD_FILE: /run/secrets/db_password
+                DB_PASSWORD: Ledger-{{pw}}
+              secrets: [db_password]
+              ports:
+                - "127.0.0.1:8086:8000"
+          secrets:
+            db_password:
+              file: ./secrets/db_password.txt
+          YML2
+          docker compose up -d
+    - id: api-only
+      description: Moves only the api to the secret and leaves the password in the db environment.
+      feedback: "Both services must get the password as a secret. db still carries it in its environment."
+      expectFail: [secret-attached, password-hidden]
+      mutation:
+        on: cl-docker-01
+        as: learner
+        run: |
+          cd ~/exam/payments
+          cat > compose.yaml <<'YML2'
+          name: payments
+          services:
+            db:
+              image: redis:7.4-alpine
+              restart: unless-stopped
+              command: ["sh", "-c", "exec redis-server --requirepass \"$$DB_PASSWORD\""]
+              environment:
+                DB_PASSWORD: Ledger-{{pw}}
+            api:
+              image: copperleaf/payments-api:1
+              restart: unless-stopped
+              environment:
+                DB_HOST: db
+                DB_PASSWORD_FILE: /run/secrets/db_password
+              secrets: [db_password]
+              ports:
+                - "127.0.0.1:8086:8000"
+          secrets:
+            db_password:
+              file: ./secrets/db_password.txt
+          YML2
+          docker compose up -d
+    - id: bind-mount
+      description: Mounts the password file as a plain bind mount instead of a Compose secret.
+      feedback: "A bind mount works but it is not a Compose secret: nothing declares or scopes it. Define the file under secrets: and attach it to the services."
+      expectFail: [secret-attached]
+      mutation:
+        on: cl-docker-01
+        as: learner
+        run: |
+          cd ~/exam/payments
+          cat > compose.yaml <<'YML2'
+          name: payments
+          services:
+            db:
+              image: redis:7.4-alpine
+              restart: unless-stopped
+              command: ["sh", "-c", "exec redis-server --requirepass \"$$(cat /run/secrets/db_password)\""]
+              volumes:
+                - ./secrets/db_password.txt:/run/secrets/db_password:ro
+            api:
+              image: copperleaf/payments-api:1
+              restart: unless-stopped
+              environment:
+                DB_HOST: db
+                DB_PASSWORD_FILE: /run/secrets/db_password
+              volumes:
+                - ./secrets/db_password.txt:/run/secrets/db_password:ro
+              ports:
+                - "127.0.0.1:8086:8000"
+          YML2
+          docker compose up -d
+  solution:
+    explanation: |
+      A top-level `secrets:` entry with `file:` plus `secrets: [db_password]` on both
+      services mounts the file at `/run/secrets/db_password`. Redis reads it with
+      `$(cat ...)` in its command (`$$` keeps Compose from interpolating it), and the api
+      gets only the path in `DB_PASSWORD_FILE`.
+    steps:
+      - on: cl-docker-01
+        as: learner
+        run: |
+          cd ~/exam/payments
+          cat > compose.yaml <<'YML2'
+          name: payments
+          services:
+            db:
+              image: redis:7.4-alpine
+              restart: unless-stopped
+              command: ["sh", "-c", "exec redis-server --requirepass \"$$(cat /run/secrets/db_password)\""]
+              secrets: [db_password]
+            api:
+              image: copperleaf/payments-api:1
+              restart: unless-stopped
+              environment:
+                DB_HOST: db
+                DB_PASSWORD_FILE: /run/secrets/db_password
+              secrets: [db_password]
+              ports:
+                - "127.0.0.1:8086:8000"
+          secrets:
+            db_password:
+              file: ./secrets/db_password.txt
+          YML2
+          docker compose up -d --force-recreate
+    alternatives:
+      - id: long-syntax
+        description: Use the long secret syntax with an explicit target and mode.
+        steps:
+          - on: cl-docker-01
+            as: learner
+            run: |
+              cd ~/exam/payments
+              cat > compose.yaml <<'YML2'
+              name: payments
+              services:
+                db:
+                  image: redis:7.4-alpine
+                  restart: always
+                  command: ["sh", "-c", "exec redis-server --requirepass \"$$(cat /run/secrets/db_password)\""]
+                  secrets:
+                    - source: db_password
+                      target: db_password
+                      mode: 0444
+                api:
+                  image: copperleaf/payments-api:1
+                  restart: always
+                  environment:
+                    DB_HOST: db
+                    DB_PASSWORD_FILE: /run/secrets/db_password
+                  secrets:
+                    - source: db_password
+                      target: db_password
+                      mode: 0444
+                  ports:
+                    - "127.0.0.1:8086:8000"
+              secrets:
+                db_password:
+                  file: ./secrets/db_password.txt
+              YML2
+              docker compose up -d --force-recreate

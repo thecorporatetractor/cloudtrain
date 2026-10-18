@@ -1,0 +1,177 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-build-checks
+  title: Clear every build-check warning in the subtitle Dockerfile
+  domain: containers
+  frameworks: [docker-practitioner:build]
+  difficulty: easy
+  estimatedMinutes: 10
+  tags: [docker, buildkit, lint, dockerfile]
+  version: 1
+spec:
+  description: |
+    The subtitle service's Dockerfile (release {{rev}}) builds, but the pipeline is about
+    to fail builds that carry lint warnings. The repository is `~/subtitle/` on
+    `cl-subtitle-05` (`ssh cl-subtitle-05`; you are in the `docker` group).
+
+    1. Fix **every** warning that `docker build --check .` reports in `~/subtitle`, so the
+       command exits cleanly. Do not silence the checks with a `# check=` directive.
+    2. Keep the behaviour: build **`copperleaf/subtitle:5.1`**. It must still print
+       `subtitle rev {{rev}}` and keep the maintainer as the image label
+       `org.opencontainers.image.authors` (`media-platform@copperleaf.example`).
+  objectives:
+    - Run the build checks and read their rule names
+    - Fix casing, legacy syntax, undefined variables and shell-form commands
+  params:
+    rev:
+      type: int
+      min: 100
+      max: 899
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-subtitle-05
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-subtitle-05
+      timeoutSec: 240
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        s=/home/learner/subtitle
+        rm -rf "$s"; install -d "$s/src"
+        printf '%s\n' 'print("subtitle rev {{rev}}")' > "$s/src/app.py"
+        cat > "$s/Dockerfile" <<'DF'
+        FROM python:3.13-alpine as Runtime
+        MAINTAINER media-platform@copperleaf.example
+        ENV APP_NAME subtitle
+        WORKDIR $APP_HOME
+        copy src/ $APP_HOME/
+        CMD python3 $APP_HOME/app.py
+        DF
+        chown -R learner:learner "$s"
+  checks:
+    - id: checks-clean
+      description: docker build --check reports no warning for the Dockerfile
+      type: shell
+      timeoutSec: 120
+      on: cl-subtitle-05
+      skills: [containers.buildkit.checks]
+      weight: 3
+      command: cd /home/learner/subtitle && { docker build --check . >/dev/null 2>&1 && echo clean || echo warnings; }
+      expect: {match: exact, value: clean}
+    - id: checks-not-silenced
+      description: The Dockerfile has no check directive that skips or downgrades rules
+      type: shell
+      timeoutSec: 30
+      on: cl-subtitle-05
+      skills: [containers.buildkit.checks]
+      weight: 2
+      command: grep -Eiq '^[[:space:]]*#[[:space:]]*check[[:space:]]*=' /home/learner/subtitle/Dockerfile && echo silenced || echo active
+      expect: {match: exact, value: active}
+    - id: image-ok
+      description: copperleaf/subtitle:5.1 prints its banner and carries the authors label
+      type: shell
+      timeoutSec: 60
+      on: cl-subtitle-05
+      skills: [containers.buildkit.checks, containers.build.dockerfile]
+      weight: 1
+      command: |
+        a=$(docker image inspect copperleaf/subtitle:5.1 2>/dev/null | jq -r '.[0].Config.Labels["org.opencontainers.image.authors"] // "none"')
+        echo "$(docker run --rm copperleaf/subtitle:5.1 2>&1 | tail -n 1) $a"
+      expect: {match: exact, value: "subtitle rev {{rev}} media-platform@copperleaf.example"}
+  hints:
+    - title: Read the rule names
+      body: "Each warning names its rule (for example `FromAsCasing`) and links to its page. Fix them one at a time and rerun `docker build --check .`."
+      cost: 1
+    - title: Defined variables
+      body: "`$APP_HOME` is used before anything defines it. Define it with `ENV APP_HOME=/opt/subtitle` above the first use."
+      cost: 1
+    - title: Where the maintainer went
+      body: "`MAINTAINER` is deprecated; the same information lives in `LABEL org.opencontainers.image.authors=...`."
+      cost: 1
+  misconceptions:
+    - id: skip-all
+      description: Silences the checks with a directive instead of fixing the Dockerfile.
+      feedback: "`# check=skip=all` makes the command pass without fixing anything. The pipeline wants the warnings fixed, so remove the directive and fix each rule."
+      expectFail: [checks-not-silenced]
+      mutation:
+        on: cl-subtitle-05
+        as: learner
+        run: |
+          cd ~/subtitle
+          sed -i '1i # check=skip=all' Dockerfile
+          sed -i 's|\$APP_HOME|/opt/subtitle|g' Dockerfile
+          docker build -q -t copperleaf/subtitle:5.1 .
+    - id: casing-only
+      description: Fixes the casing warnings but leaves the legacy syntax, the undefined variable and the shell-form command.
+      feedback: "Several rules are still reported: MaintainerDeprecated, LegacyKeyValueFormat, UndefinedVar and JSONArgsRecommended. Run the check again and read the remaining rule names."
+      expectFail: [checks-clean]
+      mutation:
+        on: cl-subtitle-05
+        as: learner
+        run: |
+          cd ~/subtitle
+          sed -i 's/ as Runtime/ AS runtime/; s/^copy /COPY /' Dockerfile
+          docker build -q -t copperleaf/subtitle:5.1 . || true
+    - id: drops-label
+      description: Deletes the MAINTAINER line instead of moving it into a label.
+      feedback: "The warning is gone but the authors information is lost. Keep it as LABEL org.opencontainers.image.authors."
+      expectFail: [image-ok]
+      mutation:
+        on: cl-subtitle-05
+        as: learner
+        run: |
+          cd ~/subtitle
+          printf '%s\n' 'FROM python:3.13-alpine AS runtime' 'ENV APP_NAME=subtitle' 'ENV APP_HOME=/opt/subtitle' 'WORKDIR $APP_HOME' \
+            'COPY src/ $APP_HOME/' 'CMD ["python3", "/opt/subtitle/app.py"]' > Dockerfile
+          docker build -q -t copperleaf/subtitle:5.1 .
+  solution:
+    explanation: |
+      The rules reported are FromAsCasing and StageNameCasing, MaintainerDeprecated,
+      LegacyKeyValueFormat, UndefinedVar, ConsistentInstructionCasing and
+      JSONArgsRecommended. Each has a one-line fix.
+    steps:
+      - on: cl-subtitle-05
+        as: learner
+        run: |
+          cd ~/subtitle
+          cat > Dockerfile <<'DF'
+          FROM python:3.13-alpine AS runtime
+          LABEL org.opencontainers.image.authors="media-platform@copperleaf.example"
+          ENV APP_NAME=subtitle
+          ENV APP_HOME=/opt/subtitle
+          WORKDIR $APP_HOME
+          COPY src/ $APP_HOME/
+          CMD ["python3", "/opt/subtitle/app.py"]
+          DF
+          docker build --check .
+          docker build -t copperleaf/subtitle:5.1 .
+    alternatives:
+      - id: arg-default
+        description: Define the directory as a build argument with a default and keep it in the environment.
+        steps:
+          - on: cl-subtitle-05
+            as: learner
+            run: |
+              cd ~/subtitle
+              cat > Dockerfile <<'DF'
+              FROM python:3.13-alpine AS runtime
+              ARG APP_HOME=/srv/subtitle
+              LABEL org.opencontainers.image.authors="media-platform@copperleaf.example"
+              ENV APP_NAME="subtitle" APP_HOME="${APP_HOME}"
+              WORKDIR ${APP_HOME}
+              COPY src/ ./
+              CMD ["python3", "app.py"]
+              DF
+              docker build --check .
+              docker build -t copperleaf/subtitle:5.1 .

@@ -1,0 +1,311 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-cache-order
+  title: Reorder the subtitle build so code edits reuse cached dependencies
+  domain: containers
+  frameworks: [ckad:design-build, docker-practitioner:build]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [docker, dockerfile, cache, layers]
+  version: 1
+spec:
+  description: |
+    Every one-line change to Copperleaf's subtitle service (revision **{{rev}}** now)
+    makes the build reinstall every dependency. The repository is `~/subtitle/` on
+    `cl-subtitle-02` (`ssh cl-subtitle-02`; you are in the `docker` group):
+
+    ```
+    subtitle/
+    ├── Dockerfile
+    ├── requirements.txt     five pinned Python packages, served by the offline index
+    ├── src/app.py           the service
+    └── tools/sys-deps.sh    installs ffprobe-lite the way an apt install would
+    ```
+
+    The package index is the local one the Dockerfile already points at, and it logs
+    every download. `tools/sys-deps.sh` behaves like `apt-get update && apt-get install`:
+    it downloads package lists into `/var/lib/cl-apt/lists` (12 MiB here instead of the
+    several hundred an apt mirror would leave) before it installs the tool.
+
+    1. Restructure the `Dockerfile` so that after editing only `src/`, a rebuild reuses
+       the dependency layers and downloads **no package at all**.
+    2. The system-dependency step must leave **no package lists in any layer** of the
+       image.
+    3. Build **`copperleaf/subtitle:dev`**. It must still print
+       `subtitle rev {{rev}} deps 5 tool ok` when run.
+  objectives:
+    - Order Dockerfile instructions from least to most frequently changing
+    - Copy dependency manifests before source code
+    - Clean package lists in the same layer that created them
+  params:
+    rev:
+      type: int
+      min: 100
+      max: 899
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-subtitle-02
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-subtitle-02
+      timeoutSec: 300
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        docker rm -f ct-probe-subtitle >/dev/null 2>&1 || true
+        GW=$(docker network inspect bridge | jq -r '.[0].IPAM.Config[0].Gateway')
+        PYROOT=/srv/pypi; PYPORT=3141; PYTOKEN=''; PYLOG=/var/log/copperleaf/pypi.log; PYUNIT=copperleaf-pypi
+        PYSPEC='[{"name":"srt-parse","version":"2.1.0"},{"name":"vtt-lite","version":"1.4.2"},{"name":"charset-sniff","version":"3.0.1"},{"name":"lang-detect","version":"0.9.4"},{"name":"timecode","version":"1.2.0"}]'
+        # needs: PYROOT PYPORT PYTOKEN PYLOG PYUNIT PYSPEC (JSON list of packages)
+        install -d "$PYROOT" "$(dirname "$PYLOG")"
+        cat > "$PYROOT/mkindex.py" <<'PY'
+        import hashlib, io, json, os, sys, tarfile
+        root, spec = sys.argv[1], json.loads(sys.argv[2])
+        BACKEND = '''import base64, hashlib, zipfile
+        NAME, VERSION, REQUIRES, BODY = %r, %r, %r, %r
+        def _b64(d):
+            return base64.urlsafe_b64encode(hashlib.sha256(d).digest()).rstrip(b"=").decode()
+        def get_requires_for_build_wheel(config_settings=None):
+            return []
+        def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
+            norm = NAME.replace("-", "_")
+            di = f"{norm}-{VERSION}.dist-info"
+            meta = f"Metadata-Version: 2.1\\nName: {NAME}\\nVersion: {VERSION}\\n" + "".join(f"Requires-Dist: {r}\\n" for r in REQUIRES)
+            files = {f"{norm}/__init__.py": f"VERSION = {VERSION!r}\\n" + BODY, f"{di}/METADATA": meta,
+                     f"{di}/WHEEL": "Wheel-Version: 1.0\\nGenerator: cfbuild\\nRoot-Is-Purelib: true\\nTag: py3-none-any\\n"}
+            rec = "".join(f"{k},sha256={_b64(v.encode())},{len(v.encode())}\\n" for k, v in files.items()) + f"{di}/RECORD,,\\n"
+            name = f"{norm}-{VERSION}-py3-none-any.whl"
+            with zipfile.ZipFile(f"{wheel_directory}/{name}", "w") as z:
+                for k, v in files.items():
+                    z.writestr(k, v)
+                z.writestr(f"{di}/RECORD", rec)
+            return name
+        '''
+        def add(t, path, text):
+            b = text.encode()
+            i = tarfile.TarInfo(path); i.size = len(b); i.mtime = 1577836800
+            t.addfile(i, io.BytesIO(b))
+        for p in spec:
+            name, ver = p["name"], p["version"]
+            d = os.path.join(root, "simple", name)
+            os.makedirs(d, exist_ok=True)
+            top = f"{name}-{ver}"
+            with tarfile.open(os.path.join(d, top + ".tar.gz"), "w:gz") as t:
+                add(t, f"{top}/pyproject.toml", '[build-system]\nrequires = []\nbuild-backend = "cfbuild"\nbackend-path = ["."]\n')
+                add(t, f"{top}/cfbuild.py", BACKEND % (name, ver, p.get("requires", []), p.get("body", "")))
+                add(t, f"{top}/PKG-INFO", f"Metadata-Version: 2.1\nName: {name}\nVersion: {ver}\n")
+            links = sorted(f for f in os.listdir(d) if f.endswith(".tar.gz"))
+            with open(os.path.join(d, "index.html"), "w") as f:
+                f.write("<!doctype html><html><body>" + "".join(f'<a href="{l}">{l}</a><br>' for l in links) + "</body></html>\n")
+        PY
+        cat > "$PYROOT/serve.py" <<'PY'
+        import base64, functools, http.server, sys
+        root, port, token, log = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
+        class H(http.server.SimpleHTTPRequestHandler):
+            def do_GET(self):
+                if token:
+                    ok = False
+                    a = self.headers.get("Authorization", "")
+                    if a.startswith("Basic "):
+                        try:
+                            ok = base64.b64decode(a[6:]).decode().split(":", 1)[1] == token
+                        except Exception:
+                            pass
+                    if not ok:
+                        self.send_response(401)
+                        self.send_header("WWW-Authenticate", 'Basic realm="copperleaf"')
+                        self.send_header("Content-Length", "0")
+                        self.end_headers()
+                        return
+                with open(log, "a") as f:
+                    f.write("GET " + self.path + "\n")
+                super().do_GET()
+            def end_headers(self):
+                self.send_header("Cache-Control", "max-age=3600")
+                super().end_headers()
+            def log_message(self, *a):
+                pass
+        http.server.ThreadingHTTPServer(("0.0.0.0", port), functools.partial(H, directory=root)).serve_forever()
+        PY
+        python3 "$PYROOT/mkindex.py" "$PYROOT" "$PYSPEC"
+        : > "$PYLOG"
+        cat > "/etc/systemd/system/$PYUNIT.service" <<UNIT
+        [Unit]
+        Description=Copperleaf offline Python package index ($PYPORT)
+        After=network.target
+        [Service]
+        ExecStart=/usr/bin/python3 $PYROOT/serve.py $PYROOT $PYPORT '$PYTOKEN' $PYLOG
+        Restart=always
+        [Install]
+        WantedBy=multi-user.target
+        UNIT
+        systemctl daemon-reload
+        systemctl enable "$PYUNIT.service" >/dev/null 2>&1
+        systemctl restart "$PYUNIT.service"
+        for i in $(seq 30); do curl -fs -o /dev/null -u "__token__:$PYTOKEN" "http://127.0.0.1:$PYPORT/simple/$(echo "$PYSPEC" | jq -r '.[0].name')/" && break; sleep 1; done
+        : > "$PYLOG"
+        s=/home/learner/subtitle
+        rm -rf "$s"; install -d "$s/src" "$s/tools"
+        cat > "$s/src/app.py" <<'PY'
+        import importlib, os
+        REV = {{rev}}
+        mods = ["srt_parse", "vtt_lite", "charset_sniff", "lang_detect", "timecode"]
+        deps = [importlib.import_module(m).VERSION for m in mods]
+        tool = os.access("/usr/local/bin/ffprobe-lite", os.X_OK)
+        print(f"subtitle rev {REV} deps {len(deps)} tool {'ok' if tool else 'missing'}")
+        PY
+        printf '%s\n' srt-parse==2.1.0 vtt-lite==1.4.2 charset-sniff==3.0.1 lang-detect==0.9.4 timecode==1.2.0 > "$s/requirements.txt"
+        cat > "$s/tools/sys-deps.sh" <<'SH'
+        #!/bin/sh
+        # Behaves like an apt install: package lists first, then the tool.
+        set -eu
+        mkdir -p /var/lib/cl-apt/lists
+        head -c 12582912 /dev/urandom > /var/lib/cl-apt/lists/index.db
+        printf '%s\n' '#!/bin/sh' 'echo ffprobe-lite 6.1' > /usr/local/bin/ffprobe-lite
+        chmod 0755 /usr/local/bin/ffprobe-lite
+        echo "installed ffprobe-lite"
+        SH
+        cat > "$s/Dockerfile" <<'DF'
+        FROM python:3.13-alpine
+        ENV PIP_INDEX_URL=http://@GW@:3141/simple PIP_DISABLE_PIP_VERSION_CHECK=1
+        WORKDIR /app
+        COPY . /app
+        RUN sh tools/sys-deps.sh
+        RUN pip install --no-cache-dir -r requirements.txt
+        CMD ["python3", "src/app.py"]
+        DF
+        sed -i "s/@GW@/$GW/" "$s/Dockerfile"
+        chown -R learner:learner "$s"
+  checks:
+    - id: image-works
+      description: copperleaf/subtitle:dev runs and reports its revision, five dependencies and the tool
+      type: shell
+      timeoutSec: 60
+      on: cl-subtitle-02
+      skills: [containers.build.cache-order]
+      weight: 1
+      command: docker run --rm copperleaf/subtitle:dev 2>&1 | tail -n 1
+      expect: {match: exact, value: "subtitle rev {{rev}} deps 5 tool ok"}
+    - id: deps-cached
+      description: After a change to src/ the rebuild downloads no package
+      type: shell
+      timeoutSec: 240
+      on: cl-subtitle-02
+      skills: [containers.build.cache-order, k8s.delivery.image-build]
+      weight: 3
+      command: |
+        d=$(mktemp -d); cp -a /home/learner/subtitle/. "$d/"
+        [ -f "$d/src/app.py" ] || { echo no-src; rm -rf "$d"; exit 0; }
+        echo "# edit $(date +%s)" >> "$d/src/app.py"
+        before=$(grep -c '\.tar\.gz' /var/log/copperleaf/pypi.log || true)
+        docker build -q -t ct-probe/subtitle:probe "$d" >/dev/null 2>&1 || { echo build-failed; rm -rf "$d"; exit 0; }
+        after=$(grep -c '\.tar\.gz' /var/log/copperleaf/pypi.log || true)
+        rm -rf "$d"; docker rmi -f ct-probe/subtitle:probe >/dev/null 2>&1
+        echo "fetched-$((after - before))"
+      expect: {match: exact, value: "fetched-0"}
+    - id: lists-gone
+      description: No layer of the image contains the package lists
+      type: shell
+      timeoutSec: 90
+      on: cl-subtitle-02
+      skills: [containers.build.cache-order]
+      weight: 2
+      command: |
+        docker image inspect copperleaf/subtitle:dev >/dev/null 2>&1 || { echo no-image; exit 0; }
+        t=$(mktemp -d); docker save copperleaf/subtitle:dev 2>/dev/null | tar -x -C "$t" 2>/dev/null
+        find "$t" -type f > "$t.lst"; n=0
+        while IFS= read -r f; do zcat -f "$f" 2>/dev/null | tar -tf - 2>/dev/null | grep -qE '(^|/)var/lib/cl-apt/lists/[^/]' && n=$((n + 1)); done < "$t.lst"
+        rm -rf "$t" "$t.lst"; [ "$n" = 0 ] && echo clean || echo "lists-in-$n-layers"
+      expect: {match: exact, value: clean}
+  hints:
+    - title: What invalidates the cache
+      body: "A layer is reused only if its instruction and everything it copies are unchanged, and every layer after a changed one is rebuilt. `COPY . /app` changes whenever any file changes."
+      cost: 1
+    - title: Order by how often things change
+      body: "Copy `requirements.txt` alone, install, and only then copy `src/`. The same goes for `tools/sys-deps.sh`: copy just that script before running it."
+      cost: 1
+    - title: Lists in the same layer
+      body: "Deleting files in a later `RUN` hides them but the earlier layer still stores them. Chain the cleanup to the command that created the files: `RUN sh tools/sys-deps.sh && rm -rf /var/lib/cl-apt/lists`."
+      cost: 2
+  misconceptions:
+    - id: copy-first
+      description: Keeps COPY . before the dependency install.
+      feedback: "With COPY . /app first, an edit to src/app.py changes that layer and every layer after it, including the pip install. Copy requirements.txt and the script on their own, install, then copy src/."
+      expectFail: [deps-cached]
+      mutation:
+        on: cl-subtitle-02
+        as: learner
+        run: |
+          cd ~/subtitle
+          head -n 3 Dockerfile > Dockerfile.new
+          printf '%s\n' 'COPY . /app' 'RUN sh tools/sys-deps.sh && rm -rf /var/lib/cl-apt/lists' \
+            'RUN pip install --no-cache-dir -r requirements.txt' 'CMD ["python3", "src/app.py"]' >> Dockerfile.new
+          mv Dockerfile.new Dockerfile
+          docker build -q -t copperleaf/subtitle:dev .
+    - id: lists-kept
+      description: Reorders the layers but leaves the package lists in the layer.
+      feedback: "The cache order is right, but /var/lib/cl-apt/lists is still stored in the layer that created it. Remove it in the same RUN."
+      expectFail: [lists-gone]
+      mutation:
+        on: cl-subtitle-02
+        as: learner
+        run: |
+          cd ~/subtitle
+          head -n 3 Dockerfile > Dockerfile.new
+          printf '%s\n' 'COPY tools/ tools/' 'RUN sh tools/sys-deps.sh' 'COPY requirements.txt .' \
+            'RUN pip install --no-cache-dir -r requirements.txt' 'COPY src/ src/' 'CMD ["python3", "src/app.py"]' >> Dockerfile.new
+          mv Dockerfile.new Dockerfile
+          docker build -q -t copperleaf/subtitle:dev .
+    - id: rm-in-later-layer
+      description: Removes the lists in a separate RUN after the install.
+      feedback: "A later layer only hides the files; the layer that wrote them still ships in the image. Chain rm to the install command with &&."
+      expectFail: [lists-gone]
+      mutation:
+        on: cl-subtitle-02
+        as: learner
+        run: |
+          cd ~/subtitle
+          head -n 3 Dockerfile > Dockerfile.new
+          printf '%s\n' 'COPY tools/ tools/' 'RUN sh tools/sys-deps.sh' 'RUN rm -rf /var/lib/cl-apt/lists' 'COPY requirements.txt .' \
+            'RUN pip install --no-cache-dir -r requirements.txt' 'COPY src/ src/' 'CMD ["python3", "src/app.py"]' >> Dockerfile.new
+          mv Dockerfile.new Dockerfile
+          docker build -q -t copperleaf/subtitle:dev .
+  solution:
+    explanation: |
+      Copy only what each step needs, in order of how rarely it changes: the system
+      script, then `requirements.txt`, then `src/`. The lists are removed in the same
+      `RUN` that creates them, so no layer keeps them.
+    steps:
+      - on: cl-subtitle-02
+        as: learner
+        run: |
+          cd ~/subtitle
+          head -n 3 Dockerfile > Dockerfile.new
+          printf '%s\n' 'COPY tools/ tools/' 'RUN sh tools/sys-deps.sh && rm -rf /var/lib/cl-apt/lists' 'COPY requirements.txt .' \
+            'RUN pip install --no-cache-dir -r requirements.txt' 'COPY src/ src/' 'CMD ["python3", "src/app.py"]' >> Dockerfile.new
+          mv Dockerfile.new Dockerfile
+          docker build -t copperleaf/subtitle:dev .
+    alternatives:
+      - id: deps-first
+        description: Install the Python packages first, then the system step, with a .dockerignore keeping the build context small.
+        steps:
+          - on: cl-subtitle-02
+            as: learner
+            run: |
+              cd ~/subtitle
+              printf '%s\n' '.git' 'Dockerfile' > .dockerignore
+              head -n 3 Dockerfile > Dockerfile.new
+              printf '%s\n' 'COPY requirements.txt .' 'RUN pip install --no-cache-dir -r requirements.txt' 'COPY tools/sys-deps.sh tools/sys-deps.sh' \
+                'RUN sh tools/sys-deps.sh && rm -rf /var/lib/cl-apt/lists' 'COPY src/ src/' 'CMD ["python3", "src/app.py"]' >> Dockerfile.new
+              mv Dockerfile.new Dockerfile
+              docker build -t copperleaf/subtitle:dev .

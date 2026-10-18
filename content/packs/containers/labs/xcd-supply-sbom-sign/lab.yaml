@@ -1,0 +1,165 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xcd-supply-sbom-sign
+  title: Attach an SBOM and a signature to a release
+  domain: containers
+  frameworks: [docker-practitioner:supply-chain]
+  difficulty: hard
+  estimatedMinutes: 15
+  tags: [exam, docker, sbom, signing, cosign, supply-chain]
+  version: 1
+spec:
+  description: |
+    **Host:** `cl-docker-01` (`ssh cl-docker-01`)
+
+    `~/exam/sbom-sign/` holds the reports service (build number {{rel}}), a key pair
+    `cosign.key` / `cosign.pub` (empty password) and a Dockerfile. The release registry
+    listens on **`localhost:5102`** (plain HTTP, no login, no transparency log).
+
+    1. Build and push **`localhost:5102/reports:1.1`** with an **SBOM attestation**
+       attached by the builder.
+    2. **Sign** the pushed image digest with `cosign.key`.
+    3. Verify the signature with `cosign.pub` and save the successful verification output to
+       **`~/exam/sbom-sign/verify.txt`**.
+  objectives:
+    - Generate an SBOM attestation at build time
+    - Sign an image digest and verify the signature
+  params:
+    rel:
+      type: int
+      min: 100
+      max: 999
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-docker-01
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-docker-01
+      timeoutSec: 300
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        r=/srv/exam/sbom-sign/registry
+        mkdir -p "$r"
+        docker rm -f xcd-sign-registry >/dev/null 2>&1 || true
+        docker run -d --name xcd-sign-registry --restart always -p 127.0.0.1:5102:5000 -v "$r:/var/lib/registry" registry:3 >/dev/null
+        for i in $(seq 30); do curl -fs http://127.0.0.1:5102/v2/ >/dev/null && break; sleep 1; done
+        rm -rf "$r/docker/registry/v2/repositories/reports"
+        s=/home/learner/exam/sbom-sign
+        rm -rf "$s"; install -d -o learner -g learner /home/learner/exam "$s"
+        printf '%s\n' 'FROM busybox:1.37' 'RUN echo "reports 1.1 build {{rel}}" > /reports-version' 'CMD ["cat", "/reports-version"]' > "$s/Dockerfile"
+        if command -v cosign >/dev/null 2>&1; then
+          (cd "$s" && COSIGN_PASSWORD='' cosign generate-key-pair >/dev/null 2>&1)
+        else
+          printf '%s\n' 'cosign is not installed on this host image, so no key pair could be created.' > "$s/NOTE.txt"
+        fi
+        chown -R learner:learner "$s"
+  checks:
+    - id: pushed
+      description: localhost:5102/reports:1.1 is in the registry
+      type: shell
+      timeoutSec: 60
+      on: cl-docker-01
+      skills: [containers.supply-chain.sbom-provenance]
+      weight: 1
+      command: |
+        A='Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json'
+        curl -s -H "$A" -o /dev/null -w '%{http_code}' http://127.0.0.1:5102/v2/reports/manifests/1.1
+      expect: {match: exact, value: "200"}
+    - id: sbom-attached
+      description: The image index carries an attestation manifest with an SPDX SBOM
+      type: shell
+      timeoutSec: 60
+      on: cl-docker-01
+      skills: [containers.supply-chain.sbom-provenance]
+      weight: 3
+      command: |
+        A='Accept: application/vnd.oci.image.index.v1+json,application/vnd.oci.image.manifest.v1+json'
+        idx=$(curl -fsS -H "$A" http://127.0.0.1:5102/v2/reports/manifests/1.1 2>/dev/null) || { echo no-image; exit 0; }
+        att=$(echo "$idx" | jq -r '[(.manifests // [])[] | select(.annotations["vnd.docker.reference.type"] == "attestation-manifest") | .digest][0] // empty')
+        [ -n "$att" ] || { echo no-attestation; exit 0; }
+        curl -fsS -H "$A" "http://127.0.0.1:5102/v2/reports/manifests/$att" 2>/dev/null \
+          | jq -r 'if ([.layers[]? | .annotations["in-toto.io/predicate-type"] // ""] | any(test("spdx"))) then "spdx-sbom" else "no-sbom" end'
+      expect: {match: exact, value: spdx-sbom}
+    - id: signature-verifies
+      description: The tag's digest carries a signature that verifies with cosign.pub
+      type: shell
+      timeoutSec: 90
+      on: cl-docker-01
+      skills: [containers.supply-chain.signing]
+      weight: 3
+      command: |
+        cosign verify --key /home/learner/exam/sbom-sign/cosign.pub --insecure-ignore-tlog=true --allow-insecure-registry localhost:5102/reports:1.1 >/dev/null 2>&1 && echo verified || echo not-verified
+      expect: {match: exact, value: verified}
+    - id: verification-recorded
+      description: verify.txt holds the successful verification output for the pushed digest
+      type: shell
+      timeoutSec: 60
+      on: cl-docker-01
+      skills: [containers.supply-chain.signing]
+      weight: 1.5
+      command: |
+        A='Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json'
+        d=$(curl -sI -H "$A" http://127.0.0.1:5102/v2/reports/manifests/1.1 | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}')
+        [ -n "$d" ] && grep -qF "$d" /home/learner/exam/sbom-sign/verify.txt 2>/dev/null && grep -q 'docker-manifest-digest' /home/learner/exam/sbom-sign/verify.txt && echo recorded || echo missing
+      expect: {match: exact, value: recorded}
+  misconceptions:
+    - id: no-sbom
+      description: Pushes and signs the image but does not ask the builder for an SBOM.
+      feedback: "A signature says who published the image, not what is inside. Build with --sbom=true so the SBOM is attached as an attestation."
+      expectFail: [sbom-attached]
+      mutation:
+        on: cl-docker-01
+        as: learner
+        run: |
+          cd ~/exam/sbom-sign
+          docker buildx build --provenance=false -t localhost:5102/reports:1.1 --push .
+          d=$(curl -sI -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json' http://localhost:5102/v2/reports/manifests/1.1 | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}')
+          COSIGN_PASSWORD='' cosign sign --key cosign.key --tlog-upload=false --allow-insecure-registry --yes "localhost:5102/reports@$d"
+          cosign verify --key cosign.pub --insecure-ignore-tlog=true --allow-insecure-registry "localhost:5102/reports@$d" > verify.txt
+    - id: unsigned
+      description: Attaches the SBOM but never signs the image.
+      feedback: "Without a signature nobody can tell the SBOM and image came from the release pipeline. Sign the digest with the supplied key and verify it with the public key."
+      expectFail: [signature-verifies, verification-recorded]
+      mutation:
+        on: cl-docker-01
+        as: learner
+        run: |
+          cd ~/exam/sbom-sign
+          docker buildx build --sbom=true --provenance=false -t localhost:5102/reports:1.1 --push .
+  solution:
+    explanation: |
+      `--sbom=true` makes BuildKit generate an SPDX SBOM and push it as an attestation
+      manifest in the image index. `cosign sign --key` signs the index digest (no transparency
+      log offline), and `cosign verify --key` proves it; its output goes to verify.txt.
+    steps:
+      - on: cl-docker-01
+        as: learner
+        run: |
+          cd ~/exam/sbom-sign
+          docker buildx build --sbom=true --provenance=false -t localhost:5102/reports:1.1 --push .
+          d=$(curl -sI -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json' http://localhost:5102/v2/reports/manifests/1.1 | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}')
+          COSIGN_PASSWORD='' cosign sign --key cosign.key --tlog-upload=false --allow-insecure-registry --yes "localhost:5102/reports@$d"
+          cosign verify --key cosign.pub --insecure-ignore-tlog=true --allow-insecure-registry "localhost:5102/reports@$d" > verify.txt
+    alternatives:
+      - id: provenance-too
+        description: Also attach provenance, and read the digest from the build metadata.
+        steps:
+          - on: cl-docker-01
+            as: learner
+            run: |
+              cd ~/exam/sbom-sign
+              docker buildx build --sbom=true --provenance=mode=min -t localhost:5102/reports:1.1 --push --metadata-file meta.json .
+              d=$(jq -r '."containerimage.digest"' meta.json)
+              COSIGN_PASSWORD='' cosign sign --key cosign.key --tlog-upload=false --allow-insecure-registry --yes "localhost:5102/reports@$d"
+              cosign verify --key cosign.pub --insecure-ignore-tlog=true --allow-insecure-registry "localhost:5102/reports@$d" > verify.txt

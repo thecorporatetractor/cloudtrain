@@ -1,0 +1,238 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-bake-matrix
+  title: Build three media services from one Bake file
+  domain: containers
+  frameworks: [docker-practitioner:build]
+  difficulty: hard
+  estimatedMinutes: 20
+  tags: [docker, buildx, bake, matrix]
+  version: 1
+spec:
+  description: |
+    Release 3.{{minor}}.0 ships three images: the transcoder, the subtitle service and the
+    thumbnailer. Today the release engineer runs three `docker build` commands by hand. The
+    sources are in `~/media-build/` on `cl-build-05` (`ssh cl-build-05`; you are in the
+    `docker` group), one directory per service, each with a Dockerfile that accepts a
+    `RELEASE` build argument and stores it in the label
+    `org.opencontainers.image.version`.
+
+    Write `~/media-build/docker-bake.hcl` so that:
+
+    - a variable **`RELEASE`** defaults to **`3.{{minor}}.0`**;
+    - the **default group** builds all three services (targets `transcoder`, `subtitle`
+      and `thumbnailer`, each using its own directory as context);
+    - every image is tagged **`copperleaf/<service>:${RELEASE}`** and receives the same
+      value as its `RELEASE` build argument, so that `RELEASE=... docker buildx bake`
+      changes tags and label together.
+
+    Then run a plain `docker buildx bake` to build all three.
+  objectives:
+    - Define variables, targets and a default group in a Bake file
+    - Share build arguments between targets
+    - Inspect the resolved build plan with --print
+  params:
+    minor:
+      type: int
+      min: 10
+      max: 89
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-build-05
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-build-05
+      timeoutSec: 240
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        s=/home/learner/media-build
+        rm -rf "$s"; install -d "$s"
+        for svc in transcoder subtitle thumbnailer; do
+          install -d "$s/$svc"
+          printf '%s\n' 'FROM busybox:1.37' 'ARG RELEASE=dev' 'LABEL org.opencontainers.image.version=$RELEASE' \
+            "RUN echo \"$svc \$RELEASE\" > /release.txt" 'CMD ["cat", "/release.txt"]' > "$s/$svc/Dockerfile"
+        done
+        chown -R learner:learner "$s"
+  checks:
+    - id: default-plan
+      description: The default bake run builds exactly transcoder, subtitle and thumbnailer
+      type: shell
+      timeoutSec: 60
+      on: cl-build-05
+      skills: [containers.buildkit.bake]
+      weight: 2
+      command: |
+        cd /home/learner/media-build && docker buildx bake --print 2>/dev/null | jq -r '(.target // {}) | keys | join(",")' 2>/dev/null || echo none
+      expect: {match: exact, value: "subtitle,thumbnailer,transcoder"}
+    - id: release-default
+      description: RELEASE defaults to 3.{{minor}}.0 and reaches the build arguments and tags of all three services
+      type: shell
+      timeoutSec: 60
+      on: cl-build-05
+      skills: [containers.buildkit.bake]
+      weight: 2
+      command: |
+        cd /home/learner/media-build && docker buildx bake --print 2>/dev/null \
+          | jq -r '[.target[] | (.args.RELEASE // "none") + "|" + ((.tags // []) | join(","))] | sort | join(" ")' 2>/dev/null || echo none
+      expect: {match: exact, value: "3.{{minor}}.0|copperleaf/subtitle:3.{{minor}}.0 3.{{minor}}.0|copperleaf/thumbnailer:3.{{minor}}.0 3.{{minor}}.0|copperleaf/transcoder:3.{{minor}}.0"}
+    - id: release-override
+      description: Setting RELEASE in the environment changes tags and build arguments together
+      type: shell
+      timeoutSec: 60
+      on: cl-build-05
+      skills: [containers.buildkit.bake]
+      weight: 2
+      command: |
+        cd /home/learner/media-build && RELEASE=9.9.9 docker buildx bake --print 2>/dev/null \
+          | jq -r '[.target[] | (.args.RELEASE // "none") + "|" + ((.tags // []) | join(","))] | sort | join(" ")' 2>/dev/null || echo none
+      expect: {match: exact, value: "9.9.9|copperleaf/subtitle:9.9.9 9.9.9|copperleaf/thumbnailer:9.9.9 9.9.9|copperleaf/transcoder:9.9.9"}
+    - id: images-built
+      description: All three images exist and carry the release in their version label
+      type: shell
+      timeoutSec: 60
+      on: cl-build-05
+      skills: [containers.buildkit.bake, containers.build.args-labels]
+      weight: 2
+      command: |
+        for s in transcoder subtitle thumbnailer; do
+          docker image inspect "copperleaf/$s:3.{{minor}}.0" 2>/dev/null | jq -r '.[0].Config.Labels["org.opencontainers.image.version"] // "none"' || echo missing
+        done | tr '\n' ' ' | sed 's/ $//'
+      expect: {match: exact, value: "3.{{minor}}.0 3.{{minor}}.0 3.{{minor}}.0"}
+  hints:
+    - title: Shape of a Bake file
+      body: "HCL blocks: `variable \"RELEASE\" { default = \"...\" }`, `group \"default\" { targets = [...] }` and one `target \"name\" { context = ..., args = {...}, tags = [...] }` per image. Put each block's attributes on their own lines."
+      cost: 1
+    - title: Share the arguments
+      body: "A hidden target such as `_common` can hold `args = { RELEASE = RELEASE }`; the real targets pull it in with `inherits = [\"_common\"]`."
+      cost: 1
+    - title: See the plan
+      body: "`docker buildx bake --print` shows the resolved targets, build arguments and tags without building anything. Try it with `RELEASE=9.9.9` in front."
+      cost: 1
+  misconceptions:
+    - id: hardcoded-tags
+      description: Writes the release into the tags literally instead of using the variable.
+      feedback: "The tags ignore RELEASE, so an override from CI would build the old version under the new label. Interpolate ${RELEASE} in the tags."
+      expectFail: [release-override]
+      mutation:
+        on: cl-build-05
+        as: learner
+        run: |
+          cd ~/media-build
+          {
+            printf '%s\n' 'variable "RELEASE" {' '  default = "3.{{minor}}.0"' '}' 'group "default" {' '  targets = ["transcoder", "subtitle", "thumbnailer"]' '}'
+            for s in transcoder subtitle thumbnailer; do
+              printf '%s\n' "target \"$s\" {" "  context = \"$s\"" '  args = { RELEASE = RELEASE }' "  tags = [\"copperleaf/$s:3.{{minor}}.0\"]" '}'
+            done
+          } > docker-bake.hcl
+          docker buildx bake
+    - id: no-default-group
+      description: Defines the targets but no default group.
+      feedback: "`docker buildx bake` without arguments builds the `default` target or group. Without one it has nothing to do."
+      expectFail: [default-plan, images-built]
+      mutation:
+        on: cl-build-05
+        as: learner
+        run: |
+          cd ~/media-build
+          {
+            printf '%s\n' 'variable "RELEASE" {' '  default = "3.{{minor}}.0"' '}'
+            for s in transcoder subtitle thumbnailer; do
+              printf '%s\n' "target \"$s\" {" "  context = \"$s\"" '  args = { RELEASE = RELEASE }' "  tags = [\"copperleaf/$s:\${RELEASE}\"]" '}'
+            done
+          } > docker-bake.hcl
+          docker buildx bake || true
+    - id: arg-not-passed
+      description: Tags the images with the variable but never passes it as a build argument.
+      feedback: "The tag says one thing and the label another: the Dockerfiles default RELEASE to dev. Pass the variable as the build argument as well."
+      expectFail: [release-default, images-built]
+      mutation:
+        on: cl-build-05
+        as: learner
+        run: |
+          cd ~/media-build
+          {
+            printf '%s\n' 'variable "RELEASE" {' '  default = "3.{{minor}}.0"' '}' 'group "default" {' '  targets = ["transcoder", "subtitle", "thumbnailer"]' '}'
+            for s in transcoder subtitle thumbnailer; do
+              printf '%s\n' "target \"$s\" {" "  context = \"$s\"" "  tags = [\"copperleaf/$s:\${RELEASE}\"]" '}'
+            done
+          } > docker-bake.hcl
+          docker buildx bake
+  solution:
+    explanation: |
+      One variable, a hidden `_common` target that passes it as the build argument, three
+      targets that inherit it and tag with it, and a default group that lists them.
+    steps:
+      - on: cl-build-05
+        as: learner
+        run: |
+          cd ~/media-build
+          cat > docker-bake.hcl <<'HCL'
+          variable "RELEASE" {
+            default = "3.{{minor}}.0"
+          }
+
+          group "default" {
+            targets = ["transcoder", "subtitle", "thumbnailer"]
+          }
+
+          target "_common" {
+            args = { RELEASE = RELEASE }
+          }
+
+          target "transcoder" {
+            inherits = ["_common"]
+            context  = "transcoder"
+            tags     = ["copperleaf/transcoder:${RELEASE}"]
+          }
+
+          target "subtitle" {
+            inherits = ["_common"]
+            context  = "subtitle"
+            tags     = ["copperleaf/subtitle:${RELEASE}"]
+          }
+
+          target "thumbnailer" {
+            inherits = ["_common"]
+            context  = "thumbnailer"
+            tags     = ["copperleaf/thumbnailer:${RELEASE}"]
+          }
+          HCL
+          docker buildx bake --print
+          docker buildx bake
+    alternatives:
+      - id: matrix
+        description: Generate the three targets from a matrix.
+        steps:
+          - on: cl-build-05
+            as: learner
+            run: |
+              cd ~/media-build
+              cat > docker-bake.hcl <<'HCL'
+              variable "RELEASE" {
+                default = "3.{{minor}}.0"
+              }
+
+              group "default" {
+                targets = ["svc"]
+              }
+
+              target "svc" {
+                name     = svc
+                matrix   = { svc = ["transcoder", "subtitle", "thumbnailer"] }
+                context  = svc
+                args     = { RELEASE = RELEASE }
+                tags     = ["copperleaf/${svc}:${RELEASE}"]
+              }
+              HCL
+              docker buildx bake

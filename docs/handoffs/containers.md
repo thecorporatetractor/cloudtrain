@@ -156,7 +156,82 @@ linux and networking, so containers labs are not shown in the UI yet.
 | `xcd-storage-volume-restore` | storage | verified | verified live 2026-10-17 on docker-vm:29 (3 runs, 257s); reboot pass not exercised by labctl verify |
 | `xcd-supply-leaked-secret` | supply-chain | verified | verified live 2026-10-17 on docker-vm:29 (4 runs, 290s); reboot pass not exercised by labctl verify |
 
-Not written yet (12). Writable with the current image: `xcd-build-bake-targets`, `xcd-build-cache-secret`, `xcd-compose-env-profiles`, `xcd-compose-secret-file`, `xcd-net-address-pool`, `xcd-net-docker-user-rule`, `xcd-ops-log-rotation`. Blocked on image content docker-vm:29 does not have yet: `xcd-build-multistage-nonroot` (Go toolchain image), `xcd-ops-debug-shell-less` (a distroless/static base), `xcd-registry-multiarch-index` (arm64 base content + binfmt), `xcd-sec-socket-proxy` (a socket-proxy image), `xcd-supply-sbom-sign` (cosign binary). Add those to `tools/images/docker-vm/preload-images.txt` or the guest script and rebuild. The other 79 learning labs of the domain (paths ctr-building-images module 2 onward, compose, networking, storage, registries, security, troubleshooting, internals, podman, swarm) are not started.
+Not written yet (12; written in round 5 wave 1, see the section below). Writable with the current image: `xcd-build-bake-targets`, `xcd-build-cache-secret`, `xcd-compose-env-profiles`, `xcd-compose-secret-file`, `xcd-net-address-pool`, `xcd-net-docker-user-rule`, `xcd-ops-log-rotation`. Blocked on image content docker-vm:29 does not have yet: `xcd-build-multistage-nonroot` (Go toolchain image), `xcd-ops-debug-shell-less` (a distroless/static base), `xcd-registry-multiarch-index` (arm64 base content + binfmt), `xcd-sec-socket-proxy` (a socket-proxy image), `xcd-supply-sbom-sign` (cosign binary). Add those to `tools/images/docker-vm/preload-images.txt` or the guest script and rebuild. The other 79 learning labs of the domain (paths ctr-building-images module 2 onward, compose, networking, storage, registries, security, troubleshooting, internals, podman, swarm) are not started.
+
+## Round 5, wave 1 (branch `content/containers-r5-w1`): write-first, 23 labs
+
+Written to the definition of done (status `built`, never run live: the containers labs are
+all KubeVirt VMs, so the vm slot and `labctl verify` wait for the testing round).
+
+| Group | Labs |
+|---|---|
+| Exam tasks (12), so every sim-containers-docker pool is at 2x its draw and the exam is in the CI `labctl exam compile` list | `xcd-build-multistage-nonroot`, `xcd-build-cache-secret`, `xcd-build-bake-targets`, `xcd-registry-multiarch-index`, `xcd-compose-env-profiles`, `xcd-compose-secret-file`, `xcd-net-docker-user-rule`, `xcd-net-address-pool`, `xcd-sec-socket-proxy`, `xcd-supply-sbom-sign`, `xcd-ops-log-rotation`, `xcd-ops-debug-shell-less` |
+| Module ctr-images-efficient (5) | `ctr-cache-order`, `ctr-shrink-transcoder`, `ctr-non-root-uid`, `ctr-digest-pin`, `ctr-reproducible-build` |
+| Module ctr-images-buildkit (6) | `ctr-buildkit-cache-mount`, `ctr-build-secret-token`, `ctr-build-checks`, `ctr-multi-platform`, `ctr-bake-matrix`, `ctr-buildx-cache-export` |
+
+Both modules are courses in `pack.yaml` (`ctr-images-efficient`, `ctr-images-buildkit`).
+The module title "BuildKit, buildx and Bake" became "Builders, secrets, caches and
+multi-platform images" (titles carry no product names).
+
+### Recipes used (each lab inlines its own copy)
+
+- **Offline package index** (`ctr-cache-order`, `ctr-buildkit-cache-mount`,
+  `ctr-build-secret-token`, `xcd-build-cache-secret`): setup writes pure-Python *sdists*
+  (a `pyproject.toml` with an in-tree PEP 517 backend, no setuptools needed) into
+  `/srv/pypi/simple/<pkg>/` (PEP 503) and serves them with a small Python server under a
+  systemd unit (port 3141; the exam task uses 3142 and a basic-auth token). Builds reach it
+  at the docker0 gateway (`docker network inspect bridge | jq`). Why sdists and not wheels:
+  pip's HTTP cache only applies to https, so a cache mount over plain-HTTP wheels saves
+  nothing, while a built wheel from an sdist lands in pip's wheel cache and the rebuild
+  does not download the tarball again (checked locally with pip). The grader counts
+  `.tar.gz` lines in the server's access log.
+- **Shell-less runtime** (`xcd-ops-debug-shell-less`): `copperleaf/pyruntime:1` is built in
+  setup FROM scratch with the libraries and python3 of python:3.13-alpine. Debug container:
+  `docker run --rm --pid container:X --network container:X busybox:1.37`, read the service
+  through `/proc/1/root`.
+- **Socket proxy** (`xcd-sec-socket-proxy`): `copperleaf/socket-proxy:1` is nginx:1.29-alpine
+  with an allowlist (GET /containers/json and /_ping, everything else 403). Unblocks the task.
+- **Multi-arch without emulation** (`ctr-multi-platform`, `xcd-registry-multiarch-index`):
+  `FROM scratch`, `ARG TARGETARCH`, `COPY file-${TARGETARCH} /x`, `buildx build --platform
+  linux/amd64,linux/arm64 --push`. A local run (Engine 27.5, containerd store, docker
+  driver) pushed a two-platform index; it also carries `unknown/unknown` attestation
+  entries, which the checks ignore.
+- **Size labs**: `ctr-shrink-transcoder` uses a synthetic ~300 MiB incompressible toolchain
+  layer and a 60 MiB limit (production: 900 MB and 120 MB).
+- **Throwaway client namespaces** (`xcd-net-docker-user-rule`): the checks create veth pairs
+  and network namespaces with source addresses 10.20.0.2 and 10.30.0.2 and curl the host's
+  published port; the rule must match `--ctorigdstport 8443 --ctdir ORIGINAL` because
+  DOCKER-USER sees the translated port. The restart check removes the DROP/REJECT rules,
+  restarts the engine and every custom unit to emulate a reboot.
+- **daemon.json** is only merged with jq (host label `site=copperleaf-exam` seeded by
+  `xcd-net-address-pool` and `xcd-ops-log-rotation`; the checks read it back through
+  `docker info --format json` or their own key).
+
+### Blockers and unconfirmed points (all labs are marked built)
+
+| Lab | Blocker | Needed in the next docker-vm rebuild |
+|---|---|---|
+| `ctr-buildx-cache-export` | the docker-container driver needs the moby/buildkit image | preload `moby/buildkit` |
+| `xcd-build-multistage-nonroot` | no Go toolchain image offline | preload `golang:1.25-alpine` |
+| `xcd-supply-sbom-sign` | no cosign, no docker/buildkit-syft-scanner image; setup writes NOTE.txt instead of keys without cosign, keep the task out of a live draw until then | install `cosign` (v2 flags assumed), preload `docker/buildkit-syft-scanner` |
+| `ctr-reproducible-build` | `rewrite-timestamps=true` was not honoured by the docker driver in a local test (Engine 27.5, BuildKit 0.18); the lab uses a fixed-mtime tar overlay instead; unconfirmed: offline `FROM tag@digest` resolution on 29.9 | none, confirm at verify |
+| `ctr-digest-pin` | unconfirmed: BuildKit pulling FROM from the plain-HTTP mirror configured through insecure-registries | none, confirm at verify |
+
+Other image wishes already known: binfmt/arm64 bases, vulnerability DB and scanners
+(trivy/grype/scout), notation, gitea, an Engine 28 apt repo (later waves).
+
+### Verify queue for the testing round (containers)
+
+1. Wave 1 minus the four blocked labs (19 labs), one `labctl verify` at a time (6 to 8
+   VMs each): the 11 xcd tasks first (shortest), then the 8 learning labs.
+2. After the image rebuild: `ctr-buildx-cache-export`, `xcd-build-multistage-nonroot`,
+   `xcd-supply-sbom-sign`; then confirm `ctr-reproducible-build`.
+3. Waves 2 to 5 as they land (wave 2 once el-vm podman is confirmed).
+4. Reboot pass of `sim-containers-docker` (all 24 tasks are written; the grader reboot is
+   not part of `labctl verify`).
+
+How to deploy a label-scoped manager for the testing round is in "How to resume" above:
+`SESSION_SELECTOR=labs.cloudtrain.dev/verify=containers`, one containers verify at a time.
 
 ## Open questions for the user
 
