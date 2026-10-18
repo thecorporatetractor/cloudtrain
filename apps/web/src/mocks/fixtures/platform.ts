@@ -184,7 +184,7 @@ const ROLE_PERMS: Record<Role, Permission[]> = {
   manager: ['progress.read.team', 'assignment.manage', 'report.export', 'event.manage'],
   instructor: ['progress.read.team', 'assignment.manage', 'report.export', 'session.observe', 'session.control', 'cohort.manage', 'event.manage'],
   author: ['studio.author', 'content.publish'],
-  org_admin: ['progress.read.team', 'assignment.manage', 'report.export', 'session.observe', 'session.control', 'cohort.manage', 'event.manage', 'studio.author', 'content.publish', 'content.visibility', 'user.manage', 'team.manage', 'role.assign', 'sso.manage', 'settings.manage', 'quota.manage', 'audit.read'],
+  org_admin: ['progress.read.team', 'assignment.manage', 'report.export', 'session.observe', 'session.control', 'cohort.manage', 'event.manage', 'studio.author', 'content.publish', 'content.visibility', 'user.manage', 'team.manage', 'role.assign', 'sso.manage', 'settings.manage', 'quota.manage', 'audit.read', 'billing.manage'],
   platform_admin: ['org.manage', 'capacity.read', 'support.access'],
 };
 const ALL_PERMS = Array.from(new Set(Object.values(ROLE_PERMS).flat()));

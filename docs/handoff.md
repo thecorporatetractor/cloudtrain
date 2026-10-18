@@ -87,7 +87,7 @@ Kata and the kubeadm proof under load:
 | Area | State | Detail |
 |---|---|---|
 | Platform: SSO, roles, Postgres + RLS, audit | merged, proven (54-check live proof) | `services/gateway/README.md`, `docs/platform-identity.md` |
-| Public website (landing, catalog, path/exam detail, pricing placeholder, about, FAQ, contact, legal) in `apps/web`; `content/site.yaml` + Site schema; gateway `/api/public/*` (cached, rate-limited, content only) | PRs 1 and 2 of the paid-path series merged (website; plans and pricing with placeholder prices); Stripe test mode (PR 3) follows | `docs/website.md`, `docs/handoffs/website.md` |
+| Public website (landing, catalog, path/exam detail, pricing placeholder, about, FAQ, contact, legal) in `apps/web`; `content/site.yaml` + Site schema; gateway `/api/public/*` (cached, rate-limited, content only) | PRs 1 to 3 of the paid-path series merged (website; plans and pricing with placeholder prices; Stripe TEST MODE behind `CT_BILLING_ENABLED`, entitlements recorded not enforced) | `docs/website.md`, `docs/billing.md`, `docs/handoffs/website.md` |
 | Entra ID SSO (AzarGuard tenant) | live: app "CloudTrain (local dev)", 6 app roles via 6 groups; secret expires 2027-04-14. Headless real sign-in for local end-to-end tests as `ct-e2e@azarguard.com` (no MFA, Conditional Access: this machine's IP + CloudTrain only): `deploy/scripts/entra-login.mjs`, proven 2026-10-17 (roles learner + manager, no admin) | `~/.config/cloudtrain/entra-dev.env`, `entra-e2e.env` (never commit); `docs/dev-environment.md` |
 | Web: learner, manager, instructor, admin, platform views | merged | `apps/web/README.md`, screenshots in `apps/web/docs/screenshots/platform/` |
 | Lab runtime: container, vcluster, kubeadm, VM, netdev drivers; grader; `labctl verify` | merged, verified on several labs | `services/lab-orchestrator/README.md` |
@@ -208,6 +208,9 @@ el-vm VMs for the exam).
 - vCenter details (version, NSX, storage, capacity) for production.
 - Employer IP release for contributions made on the corporate device.
 - Licensor legal entity name and licensing contact in `LICENSE`; CLA legal review.
+- Paid plans: individual vs organisation per seat, a free tier or not, final prices (the
+  defaults in `content/site.yaml` are placeholders); rotate the Stripe test key shared in
+  chat; Stripe Tax/VAT, terms and privacy review before any live mode (`docs/billing.md`).
 
 ## Integration notes (wave-1 merge)
 

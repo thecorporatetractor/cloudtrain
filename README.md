@@ -85,7 +85,7 @@ When a learner is ready, they take a timed exam simulation built the same way.
 | ![Admin SSO](docs/images/admin-sso.png) **Org admin**: SSO connections, domain verification, group-to-role mapping | ![Audit log](docs/images/audit-log.png) **Audit log**: every administrative action, filterable and exportable |
 | ![Sign in](docs/images/sign-in.png) **Sign-in**: identity-first, routes each email domain to its company's IdP | ![Scenario Studio](docs/images/studio.png) **Scenario Studio**: lab drafts and their verification gates |
 | ![Landing page](docs/images/landing.png) **Website**: the public landing page, served by the same app and configured from `content/site.yaml` | ![Public catalog](docs/images/catalog-public.png) **Public catalog**: paths, courses, labs and exam simulations, read-only until sign-in |
-| ![Pricing](docs/images/pricing.png) **Pricing**: plans as data (free, individual, per-seat) with entitlements, placeholder prices until final | ![Path detail](docs/images/catalog-path-public.png) **Path**: sections, labs and alignment disclaimer, "Start lab" through sign-in |
+| ![Pricing](docs/images/pricing.png) **Pricing**: plans as data (free, individual, per-seat) with entitlements, placeholder prices until final | ![Billing](docs/images/billing.png) **Billing**: the plan and entitlements per person or organisation; Stripe Checkout and portal in test mode, behind a flag |
 
 Three themes: dark, light and cream ([light](docs/images/workspace-light.png), [cream](docs/images/workspace-cream.png)).
 

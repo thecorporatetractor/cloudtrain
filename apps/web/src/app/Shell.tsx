@@ -1,7 +1,7 @@
 import { Link, Outlet, useNavigate, useRouterState } from '@tanstack/react-router';
 import * as DialogPrimitive from '@radix-ui/react-dialog';
 import { useEffect, useRef, useState, type ReactNode } from 'react';
-import { BookOpen, Building2, Flag, Check, ChevronLeft, ChevronRight, ClipboardList, FlaskConical, GraduationCap, HelpCircle, History, Home as HomeIcon, Keyboard, LogOut, Menu, Moon, Palette, Presentation, Search, Server, Settings, Shield, Sun, Sunset, UserCheck, Users, UserCog, Waypoints, X } from 'lucide-react';
+import { BookOpen, Building2, CreditCard, Flag, Check, ChevronLeft, ChevronRight, ClipboardList, FlaskConical, GraduationCap, HelpCircle, History, Home as HomeIcon, Keyboard, LogOut, Menu, Moon, Palette, Presentation, Search, Server, Settings, Shield, Sun, Sunset, UserCheck, Users, UserCog, Waypoints, X } from 'lucide-react';
 import { useMe } from '@/api/client';
 import { useLogout, useSwitchOrg } from '@/api/platform';
 import { isRealApi } from '@/api/mode';
@@ -418,6 +418,14 @@ function UserMenu({ me, navMode, side = 'right', onBeforeAction }: { me: Me | un
         </Dropdown.Item>
         <Dropdown.Item onSelect={cycle}>
           <Palette size={14} /> Switch theme <Kbd keys="mod+shift+l" />
+        </Dropdown.Item>
+        <Dropdown.Item
+          onSelect={() => {
+            onBeforeAction?.();
+            void navigate({ to: '/account/billing', search: {} });
+          }}
+        >
+          <CreditCard size={14} /> Plan and billing
         </Dropdown.Item>
         <Dropdown.Item disabled>
           <Settings size={14} /> Preferences

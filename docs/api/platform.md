@@ -51,6 +51,22 @@ the database. `ETag` + `Cache-Control: public, max-age=300`; 429 `rate_limited` 
 | `GET /public/paths/:id` | `PublicPathDetail` (sections, labs in order, related paths); 404 unknown | public |
 | `GET /public/exams/:id` | `PublicExamDetail` (objectives with weights and pool sizes, rules, report contents); 404 unknown | public |
 
+## Billing (Stripe, test mode, `CT_BILLING_ENABLED`)
+
+Plans come from the site configuration; details and the webhook flow in `docs/billing.md`.
+Entitlements are recorded and shown, not enforced.
+
+| Method + path | Request | Response | Permission | Audit |
+|---|---|---|---|---|
+| `GET /billing/me` | | `BillingSummary` (plan, entitlements, subscription, individual plans); works with billing off (`enabled: false`) | `progress.read.self` | |
+| `POST /billing/me/checkout` | `CheckoutRequest` `{ planId, interval }` | `201 CheckoutResponse { url, sessionId }`; `409` billing or checkout off; `422` plan/interval/seats | `progress.read.self` | `billing.checkout` |
+| `POST /billing/me/portal` | | `PortalResponse { url }`; `409` before the first checkout | `progress.read.self` | `billing.portal` |
+| `GET /billing/org` | | `BillingSummary` for the organisation (organisation plans, seats) | `billing.manage` | |
+| `GET /billing/org/events` | | `{ events: BillingEventRow[] }` | `billing.manage` | |
+| `POST /billing/org/checkout` | `CheckoutRequest` `{ planId, interval, seats }` | as above | `billing.manage` | `billing.checkout` |
+| `POST /billing/org/portal` | | as above | `billing.manage` | `billing.portal` |
+| `POST /billing/webhook` | raw Stripe event + `Stripe-Signature` | `{ received, eventId, type, status }` (`processed`, `ignored`, `duplicate`, `failed`); `400` bad signature, stale, live-mode | public (signature) | `billing.webhook`, `billing.subscription` |
+
 ## Learner
 
 | Method + path | Request | Response | Permission |
