@@ -107,7 +107,7 @@ function ScoreRow({ r, team, mine, compact }: { r: CtfScoreRow; team: boolean; m
         {r.points}
       </td>
       <td className="tnum small">{r.solves}</td>
-      {!compact && <td className="small subtle">{r.lastSolveAt ? new Date(r.lastSolveAt).toLocaleTimeString() : '—'}</td>}
+      {!compact && <td className="small subtle">{r.lastSolveAt ? new Date(r.lastSolveAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '—'}</td>}
     </tr>
   );
 }
