@@ -364,9 +364,8 @@ export class BillingService {
         .values({ org_id: orgId, user_id: userId, plan_id: effective.id, entitlements: JSON.stringify(effective.entitlements), source: active ? 'subscription' : 'default', subscription_id: active ? row.id : null })
         .onConflict((oc) => oc.columns(['org_id', 'scope_key']).doUpdateSet({ plan_id: effective.id, entitlements: JSON.stringify(effective.entitlements), source: active ? 'subscription' : 'default', subscription_id: active ? row.id : null, updated_at: this.now() }))
         .execute();
-    } else {
-      await tx.deleteFrom('billing_entitlements').where('org_id', '=', orgId).where('scope_key', '=', userId ?? '').execute().catch(() => undefined);
     }
+    // Without a free plan to fall back to, a lapsed subscription keeps its last recorded entitlements (nothing is enforced yet).
     await audit(tx, { orgId, actorId: null, actorName: 'Stripe' } satisfies AuditActor, 'billing.subscription', 'subscription', sub.id, { plan: plan.id, status, seats, interval: found.interval, cancelAtPeriodEnd: !!sub.cancel_at_period_end, scope: userId ? 'user' : 'org' }, plan.name);
     return { orgId, userId, planId: plan.id, seats };
   }
