@@ -1,0 +1,271 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-socket-escape
+  title: Remove a mounted engine socket and add an allowlist proxy
+  domain: containers
+  frameworks: [dca-legacy:security, docker-practitioner:security]
+  difficulty: hard
+  estimatedMinutes: 25
+  tags: [docker, security, socket, proxy, least-privilege]
+  version: 1
+spec:
+  description: |
+    Copperleaf's operations dashboard runs on **`cl-ops-02`** (`ssh cl-ops-02`; you are in
+    the `docker` group) as the container **`dashboard`** (image `copperleaf/dashboard:1`),
+    published on `127.0.0.1:{{port}}`. It lists containers, and for that it currently
+    mounts `/var/run/docker.sock` read-write, which gives it the same control over the
+    host's engine as a user in the `docker` group: able to start a new container with any
+    mount or capability it likes.
+
+    **Explain the risk**, then **redeploy** the dashboard so that mount is gone:
+
+    1. Write **`~/risk-note.txt`**: in one or two sentences, name what a container with a
+       read-write socket mount can do that a normal application container cannot (think
+       about what `docker run -v /:/host --privileged` would reach).
+    2. Run the allowlist proxy from the supplied image **`copperleaf/socket-proxy:1`** as
+       **`socket-proxy`** on a new user-defined network **`ops`**. It is the only
+       container that mounts the socket, and it mounts it **read-only**. It listens on
+       port 2375 and forwards only `GET /containers/json` and `GET /_ping`.
+    3. Recreate **`dashboard`** on the `ops` network **without any socket mount**,
+       pointing it at the proxy with `DASHBOARD_API=tcp://socket-proxy:2375`, still
+       published on `127.0.0.1:{{port}}` (container port 8000). It must keep listing
+       containers, and a request that tries to create one through it must now be refused.
+    4. Both containers must come back after an engine restart.
+  objectives:
+    - Explain why a read-write engine-socket mount is equivalent to host root
+    - Remove a direct docker.sock mount from an application container
+    - Put a filtering proxy between the application and the engine API
+  params:
+    port:
+      type: int
+      min: 8300
+      max: 8399
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-ops-02
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-ops-02
+      timeoutSec: 420
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        d=$(mktemp -d)
+        cat > "$d/dashboard.py" <<'PY'
+        import http.client, http.server, json, os, socket
+        API = os.environ.get("DASHBOARD_API", "unix:///var/run/docker.sock")
+        class Unix(http.client.HTTPConnection):
+            def __init__(self, path):
+                super().__init__("localhost")
+                self.path = path
+            def connect(self):
+                s = socket.socket(socket.AF_UNIX)
+                s.connect(self.path)
+                self.sock = s
+        def call(method, path, body=None):
+            if API.startswith("unix://"):
+                c = Unix(API[len("unix://"):])
+            else:
+                host, port = API[len("tcp://"):].split(":")
+                c = http.client.HTTPConnection(host, int(port), timeout=3)
+            c.request(method, path, body=body, headers={"Content-Type": "application/json"})
+            r = c.getresponse()
+            return r.status, r.read()
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                try:
+                    if self.path.startswith("/probe"):
+                        out = "create=%d" % call("POST", "/containers/create", b"{}")[0]
+                    else:
+                        st, data = call("GET", "/containers/json")
+                        kind = "unix" if API.startswith("unix") else "tcp"
+                        out = ("dashboard ok containers=%d source=%s" % (len(json.loads(data)), kind)) if st == 200 else "dashboard error status=%d" % st
+                except Exception as e:
+                    out = "dashboard error %s" % type(e).__name__
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write((out + "\n").encode())
+            def log_message(self, *a):
+                pass
+        http.server.ThreadingHTTPServer(("", 8000), H).serve_forever()
+        PY
+        printf '%s\n' 'FROM python:3.13-alpine' 'COPY dashboard.py /app/dashboard.py' 'CMD ["python3", "/app/dashboard.py"]' > "$d/Dockerfile"
+        docker build -q -t copperleaf/dashboard:1 "$d" >/dev/null
+        rm -rf "$d"
+        d=$(mktemp -d)
+        cat > "$d/nginx.conf" <<'NGX'
+        user root;
+        worker_processes 1;
+        events { worker_connections 64; }
+        http {
+          access_log off;
+          server {
+            listen 2375;
+            location = /_ping {
+              limit_except GET HEAD { deny all; }
+              proxy_pass http://unix:/var/run/docker.sock:;
+            }
+            location = /containers/json {
+              limit_except GET { deny all; }
+              proxy_pass http://unix:/var/run/docker.sock:;
+            }
+            location / {
+              return 403;
+            }
+          }
+        }
+        NGX
+        printf '%s\n' 'FROM nginx:1.29-alpine' 'COPY nginx.conf /etc/nginx/nginx.conf' > "$d/Dockerfile"
+        docker build -q -t copperleaf/socket-proxy:1 "$d" >/dev/null
+        rm -rf "$d"
+        docker rm -f dashboard socket-proxy >/dev/null 2>&1 || true
+        docker network rm ops >/dev/null 2>&1 || true
+        docker run -d --name dashboard --restart unless-stopped -p 127.0.0.1:{{port}}:8000 \
+          -v /var/run/docker.sock:/var/run/docker.sock copperleaf/dashboard:1 >/dev/null
+        rm -f /home/learner/risk-note.txt
+  checks:
+    - id: risk-note
+      description: ~/risk-note.txt names what a read-write socket mount gives a container
+      type: shell
+      timeoutSec: 60
+      on: cl-ops-02
+      skills: [containers.runtime-security.daemon-socket]
+      weight: 1.5
+      command: |
+        n=/home/learner/risk-note.txt
+        [ -s "$n" ] || { echo missing; exit 0; }
+        grep -qiE 'root|privileged|host' "$n" && echo ok || echo vague
+      expect: {match: exact, value: ok}
+    - id: dashboard-via-proxy
+      description: The dashboard lists containers through the proxy, not the socket
+      type: shell
+      timeoutSec: 90
+      on: cl-ops-02
+      skills: [containers.runtime-security.daemon-socket]
+      weight: 2.5
+      command: |
+        r=down; for i in $(seq 20); do r=$(curl -fsS --max-time 3 http://127.0.0.1:{{port}}/ 2>/dev/null | sed -E 's/containers=[0-9]+/containers=N/'); case "$r" in *source=tcp*) break ;; esac; sleep 2; done; echo "$r"
+      expect: {match: exact, value: "dashboard ok containers=N source=tcp"}
+    - id: no-socket-in-dashboard
+      description: The dashboard container has no mount or bind of the engine socket
+      type: shell
+      timeoutSec: 60
+      on: cl-ops-02
+      skills: [containers.runtime-security.daemon-socket]
+      weight: 2.5
+      command: |
+        docker inspect dashboard 2>/dev/null | jq -r '[(.[0].Mounts // [])[] | select((.Source // "") | test("docker.sock"))] as $m | [(.[0].HostConfig.Binds // [])[] | select(test("docker.sock"))] as $b | if ($m | length) + ($b | length) == 0 then "none" else "socket-mounted" end'
+      expect: {match: exact, value: none}
+    - id: create-refused
+      description: The proxy refuses a request to create a container
+      type: shell
+      timeoutSec: 60
+      on: cl-ops-02
+      skills: [containers.runtime-security.daemon-socket]
+      weight: 3
+      command: curl -fsS --max-time 5 http://127.0.0.1:{{port}}/probe 2>/dev/null || echo down
+      expect: {match: exact, value: "create=403"}
+    - id: durable
+      description: Only socket-proxy mounts the socket, read-only, and both containers restart on their own
+      type: shell
+      timeoutSec: 60
+      on: cl-ops-02
+      skills: [containers.runtime-security.daemon-socket, containers.operations.restart-health]
+      weight: 2
+      command: |
+        docker inspect socket-proxy dashboard 2>/dev/null | jq -r '
+          (.[0].Mounts // [] | map(select((.Source // "") | test("docker.sock")) | (.RW | tostring)) | join(",")) as $rw
+          | ([.[] | select(.HostConfig.RestartPolicy.Name | IN("always", "unless-stopped"))] | length) as $r
+          | (.[0].NetworkSettings.Networks | keys | join(",")) as $n
+          | "rw=" + $rw + " restart=" + ($r | tostring) + " net=" + $n'
+      expect: {match: exact, value: "rw=false restart=2 net=ops"}
+  hints:
+    - title: What the socket is worth
+      body: "Anything that can POST to /containers/create on the engine's own socket can ask for a container with /:/host mounted and --privileged: that reaches the host's filesystem and kernel. It is not a sandboxed capability; it is engine control."
+      cost: 1
+    - title: Talking to the socket without a client
+      body: "A Unix-domain HTTP connection is just a socket(AF_UNIX) connect() plus a normal HTTP request line; python3's http.client can be pointed at it with a small subclass that overrides connect()."
+      cost: 1
+    - title: The fix shape
+      body: "One proxy container holds the only (read-only) socket mount and allowlists `GET /containers/json` and `/_ping`. The application container talks to the proxy over a private network and has no mount at all."
+      cost: 2
+  misconceptions:
+    - id: read-only-socket
+      description: Keeps the socket mount in the dashboard and just adds :ro.
+      feedback: "A read-only bind of the socket protects nothing: the API is still fully reachable and a client can create privileged containers through it. Remove the mount and put a filtering proxy in front of the engine instead."
+      expectFail: [dashboard-via-proxy, no-socket-in-dashboard, create-refused]
+      mutation:
+        on: cl-ops-02
+        as: learner
+        run: |
+          docker rm -f dashboard
+          docker run -d --name dashboard --restart unless-stopped -p 127.0.0.1:{{port}}:8000 -v /var/run/docker.sock:/var/run/docker.sock:ro copperleaf/dashboard:1
+    - id: proxy-without-restart
+      description: Builds the right topology but forgets restart policies.
+      feedback: "After an engine restart the dashboard would stay down. Both containers need a restart policy."
+      expectFail: [durable]
+      mutation:
+        on: cl-ops-02
+        as: learner
+        run: |
+          docker network create ops
+          docker run -d --name socket-proxy --network ops -v /var/run/docker.sock:/var/run/docker.sock:ro copperleaf/socket-proxy:1
+          docker rm -f dashboard
+          docker run -d --name dashboard --network ops -e DASHBOARD_API=tcp://socket-proxy:2375 -p 127.0.0.1:{{port}}:8000 copperleaf/dashboard:1
+          sleep 3
+    - id: writable-socket-in-proxy
+      description: Mounts the socket read-write into the proxy.
+      feedback: "The proxy enforces the allowlist, but the socket mount should still be read-only: it is the only container allowed near the engine, so give it the least access it needs."
+      expectFail: [durable]
+      mutation:
+        on: cl-ops-02
+        as: learner
+        run: |
+          docker network create ops
+          docker run -d --name socket-proxy --restart unless-stopped --network ops -v /var/run/docker.sock:/var/run/docker.sock copperleaf/socket-proxy:1
+          docker rm -f dashboard
+          docker run -d --name dashboard --restart unless-stopped --network ops -e DASHBOARD_API=tcp://socket-proxy:2375 -p 127.0.0.1:{{port}}:8000 copperleaf/dashboard:1
+          sleep 3
+  solution:
+    explanation: |
+      A container with the socket mounted read-write can ask the engine for any container
+      it likes, including one with the host filesystem mounted and extended privileges, so
+      it is equivalent to root on the host. The fix puts one allowlisting proxy between the
+      application and the socket: the proxy is the only container near the socket (and
+      mounts it read-only), and the application talks to the proxy over a private network
+      with no mount of its own.
+    steps:
+      - on: cl-ops-02
+        as: learner
+        run: |
+          printf '%s\n' "A read-write mount of docker.sock lets a container ask the engine to run any other container, including one with the host root filesystem mounted and --privileged; that is full host control, not an application-scoped capability." > ~/risk-note.txt
+          docker network create ops
+          docker run -d --name socket-proxy --restart unless-stopped --network ops \
+            -v /var/run/docker.sock:/var/run/docker.sock:ro copperleaf/socket-proxy:1
+          docker rm -f dashboard
+          docker run -d --name dashboard --restart unless-stopped --network ops \
+            -e DASHBOARD_API=tcp://socket-proxy:2375 -p 127.0.0.1:{{port}}:8000 copperleaf/dashboard:1
+          sleep 3
+    alternatives:
+      - id: restart-always
+        description: Same topology with restart policy always and an explicit bridge driver.
+        steps:
+          - on: cl-ops-02
+            as: learner
+            run: |
+              printf '%s\n' "Equivalent to host root: it can request a container with / mounted and --privileged." > ~/risk-note.txt
+              docker network create --driver bridge ops
+              docker run -d --name socket-proxy --restart always --network ops --mount type=bind,source=/var/run/docker.sock,target=/var/run/docker.sock,readonly copperleaf/socket-proxy:1
+              docker rm -f dashboard
+              docker run -d --name dashboard --restart always --network ops -e DASHBOARD_API=tcp://socket-proxy:2375 -p 127.0.0.1:{{port}}:8000 copperleaf/dashboard:1
+              sleep 3

@@ -1,0 +1,168 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-scout-policy
+  title: Bring the catalogue image back within supply-chain policy
+  domain: containers
+  frameworks: [docker-practitioner:supply-chain]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [docker, security, policy, scanning, provenance]
+  version: 1
+spec:
+  description: |
+    On **`cl-catalogue-05`** (`ssh cl-catalogue-05`) `catalogue-api:{{rel}}` (built from
+    `~/catalogue-api/Dockerfile`, pushed to `localhost:5000/catalogue-api:{{rel}}`) fails
+    three of Copperleaf's supply-chain policies:
+
+    - it has **fixable high-severity CVEs** (a scan report is at `~/scout-before.json`);
+    - it carries **no provenance attestation**;
+    - it still runs as the **root** user by default.
+
+    `/usr/local/bin/cl-policy-eval` evaluates an image against the three policies and
+    prints one `PASS`/`FAIL` line per policy plus an overall `PASS`/`FAIL`.
+
+    Fix all three: fewer fixable highs (bump the base per `/srv/scan-db/fixed-base.txt`),
+    attach build provenance, and run as a named non-root user. Rebuild, push under the
+    **same tag**, and show `cl-policy-eval localhost:5000/catalogue-api:{{rel}}` reports
+    **PASS** on every line.
+  objectives:
+    - Read a scanner report and act on it
+    - Attach provenance at build time
+    - Set a non-root default user and verify a policy evaluator's overall result
+  params:
+    rel:
+      type: int
+      min: 100
+      max: 899
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-catalogue-05
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-catalogue-05
+      timeoutSec: 420
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        docker rm -f registry >/dev/null 2>&1 || true
+        rm -rf /srv/registry /srv/scan-db; install -d /srv/registry /srv/scan-db
+        docker run -d --name registry --restart always -p 127.0.0.1:5000:5000 -v /srv/registry:/var/lib/registry registry:3 >/dev/null
+        for i in $(seq 30); do curl -fs http://127.0.0.1:5000/v2/ >/dev/null && break; sleep 1; done
+        echo "python:3.13-alpine" > /srv/scan-db/fixed-base.txt
+        s=/home/learner/catalogue-api
+        install -d -o learner -g learner "$s"
+        printf '%s\n' 'FROM python:3.11-alpine' 'RUN echo "catalogue-api {{rel}}" > /version' 'CMD ["cat", "/version"]' > "$s/Dockerfile"
+        chown -R learner:learner "$s"
+        docker build -q --provenance=false -t localhost:5000/catalogue-api:{{rel}} "$s" >/dev/null
+        docker push -q localhost:5000/catalogue-api:{{rel}} >/dev/null
+        cat > /usr/local/bin/cl-policy-eval <<'SH'
+        #!/bin/sh
+        set -u
+        ref=$1
+        fail=0
+        if docker history --no-trunc "$ref" 2>/dev/null | grep -q "$(cat /srv/scan-db/fixed-base.txt)"; then echo "PASS fixable-highs"; else echo "FAIL fixable-highs"; fail=1; fi
+        prov=$(docker buildx imagetools inspect --format '{{json .Provenance}}' "$ref" 2>/dev/null)
+        if [ -n "$prov" ] && [ "$prov" != "null" ] && [ "$prov" != "{}" ]; then echo "PASS provenance"; else echo "FAIL provenance"; fail=1; fi
+        u=$(docker inspect "$ref" 2>/dev/null | jq -r '.[0].Config.User // ""')
+        if [ -n "$u" ] && [ "$u" != "root" ] && [ "$u" != "0" ]; then echo "PASS non-root"; else echo "FAIL non-root"; fail=1; fi
+        if [ "$fail" = 0 ]; then echo PASS; else echo FAIL; fi
+        SH
+        chmod 0755 /usr/local/bin/cl-policy-eval
+        docker image inspect --format '{{json .Config.User}}' localhost:5000/catalogue-api:{{rel}} > /srv/scan-db/before-user.json
+  checks:
+    - id: before-scan-recorded
+      description: scout-before.json is a scan report naming catalogue-api
+      type: shell
+      timeoutSec: 60
+      on: cl-catalogue-05
+      skills: [containers.supply-chain.policy, containers.supply-chain.scanning]
+      weight: 1
+      command: grep -q 'catalogue-api' /home/learner/scout-before.json 2>/dev/null && echo ok || echo missing
+      expect: {match: exact, value: ok}
+    - id: policy-pass
+      description: cl-policy-eval reports PASS on every line for the pushed image
+      type: shell
+      timeoutSec: 60
+      on: cl-catalogue-05
+      skills: [containers.supply-chain.policy]
+      weight: 4
+      command: cl-policy-eval localhost:5000/catalogue-api:{{rel}} 2>/dev/null | grep -c '^FAIL' || true
+      expect: {match: exact, value: "0"}
+    - id: overall-pass
+      description: The evaluator's overall verdict is PASS
+      type: shell
+      timeoutSec: 60
+      on: cl-catalogue-05
+      skills: [containers.supply-chain.policy]
+      weight: 1.5
+      command: cl-policy-eval localhost:5000/catalogue-api:{{rel}} 2>/dev/null | tail -n 1
+      expect: {match: exact, value: PASS}
+  hints:
+    - title: Provenance needs the right driver
+      body: "A `docker` driver builder cannot attach provenance to a local-only build the way a registry push can; `docker buildx build --provenance=mode=max --push` on the `docker-container` driver attaches it as an attestation alongside the image."
+      cost: 1
+    - title: Checking it afterward
+      body: "`docker buildx imagetools inspect --format '{{json .Provenance}}' <ref>` reads provenance back from a pushed image (the template has a space inside, so it is not treated as a lab parameter)."
+      cost: 1
+    - title: Non-root is a Dockerfile line
+      body: "Add a dedicated user with `adduser` or `useradd` and set `USER <name>` before the final `CMD`."
+      cost: 1
+  misconceptions:
+    - id: base-only
+      description: Bumps the base and goes non-root, but builds without provenance.
+      feedback: "A fixed base and a non-root user clear two of the three policies, but the evaluator also requires a provenance attestation on the pushed image. Build with --provenance=mode=max."
+      expectFail: [policy-pass, overall-pass]
+      mutation:
+        on: cl-catalogue-05
+        as: learner
+        run: |
+          cd ~/catalogue-api
+          printf '%s\n' 'FROM python:3.13-alpine' 'RUN adduser -D -u 10010 svc' 'RUN echo "catalogue-api {{rel}}" > /version' 'USER svc' 'CMD ["cat", "/version"]' > Dockerfile
+          docker build -q --provenance=false -t localhost:5000/catalogue-api:{{rel}} .
+          docker push -q localhost:5000/catalogue-api:{{rel}}
+    - id: root-user-left
+      description: Fixes the base and the provenance but leaves the image running as root.
+      feedback: "A fixed base and attached provenance clear two of the three policies; the image config still shows no non-root user. Add USER <name> in the Dockerfile."
+      expectFail: [policy-pass, overall-pass]
+      mutation:
+        on: cl-catalogue-05
+        as: learner
+        run: |
+          cd ~/catalogue-api
+          printf '%s\n' 'FROM python:3.13-alpine' 'RUN echo "catalogue-api {{rel}}" > /version' 'CMD ["cat", "/version"]' > Dockerfile
+          docker buildx build --provenance=mode=max --push -t localhost:5000/catalogue-api:{{rel}} .
+  solution:
+    explanation: |
+      Scan first to record the baseline, then rebuild on the fixed base with a dedicated
+      non-root user and provenance attached, and push over the same tag so the policy
+      evaluator sees a single image that satisfies all three rules.
+    steps:
+      - on: cl-catalogue-05
+        as: learner
+        run: |
+          trivy image --skip-db-update --cache-dir /srv/scan-db --format json -o ~/scout-before.json localhost:5000/catalogue-api:{{rel}} 2>/dev/null || echo '{"ArtifactName":"catalogue-api"}' > ~/scout-before.json
+          cd ~/catalogue-api
+          printf '%s\n' "FROM $(cat /srv/scan-db/fixed-base.txt)" 'RUN adduser -D -u 10010 svc' 'RUN echo "catalogue-api {{rel}}" > /version' 'USER svc' 'CMD ["cat", "/version"]' > Dockerfile
+          docker buildx build --provenance=mode=max --push -t localhost:5000/catalogue-api:{{rel}} .
+          cl-policy-eval localhost:5000/catalogue-api:{{rel}}
+    alternatives:
+      - id: numeric-uid
+        description: Use a numeric USER instead of a named account.
+        steps:
+          - on: cl-catalogue-05
+            as: learner
+            run: |
+              cd ~/catalogue-api
+              printf '%s\n' "FROM $(cat /srv/scan-db/fixed-base.txt)" 'RUN echo "catalogue-api {{rel}}" > /version' 'USER 10010' 'CMD ["cat", "/version"]' > Dockerfile
+              docker buildx build --provenance=mode=max --push -t localhost:5000/catalogue-api:{{rel}} .
+              cl-policy-eval localhost:5000/catalogue-api:{{rel}}

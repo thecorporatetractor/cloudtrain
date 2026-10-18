@@ -1,0 +1,177 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-notation-sign-verify
+  title: Sign the subtitle release with a trust policy
+  domain: containers
+  frameworks: [docker-practitioner:supply-chain]
+  difficulty: hard
+  estimatedMinutes: 20
+  tags: [docker, notation, signing, trust-policy, registry]
+  version: 1
+spec:
+  description: |
+    On **`cl-subtitle-04`** (`ssh cl-subtitle-04`) `subtitle:{{rel}}` is built and pushed
+    to `localhost:5000/subtitle:{{rel}}`. Copperleaf's test CA material is at
+    `~/notation-setup/`: `copperleaf-ca.crt`, `copperleaf-ca.key`, and a second,
+    unrelated CA `other-ca.crt` / `other-ca.key` used to sign an image from a different
+    (untrusted) source, `localhost:5000/other-source:1.0` (already pushed).
+
+    1. Issue a signing certificate from `copperleaf-ca` and **sign** the release digest
+       of `subtitle:{{rel}}` with Notation.
+    2. Write a **trust policy** at `~/notation-setup/trustpolicy.json` that trusts
+       **only** `copperleaf-ca` for repositories under `localhost:5000/*`.
+    3. Show **`notation verify`** (using that trust policy) **succeeds** for
+       `subtitle:{{rel}}` and **fails** for `other-source:1.0`, which was signed with the
+       unrelated CA.
+  objectives:
+    - Issue a signing certificate from a private CA
+    - Sign an image digest with Notation
+    - Write a trust policy that trusts exactly one CA for a set of repositories
+  params:
+    rel:
+      type: int
+      min: 100
+      max: 899
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-subtitle-04
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-subtitle-04
+      timeoutSec: 420
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        docker rm -f registry >/dev/null 2>&1 || true
+        rm -rf /srv/registry; install -d /srv/registry
+        docker run -d --name registry --restart always -p 127.0.0.1:5000:5000 -v /srv/registry:/var/lib/registry registry:3 >/dev/null
+        for i in $(seq 30); do curl -fs http://127.0.0.1:5000/v2/ >/dev/null && break; sleep 1; done
+        s=/home/learner/notation-setup
+        install -d -o learner -g learner "$s"
+        for n in copperleaf other; do
+          openssl req -x509 -newkey rsa:2048 -nodes -keyout "$s/${n}-ca.key" -out "$s/${n}-ca.crt" -days 30 -subj "/CN=${n} test CA" 2>/dev/null
+        done
+        d=$(mktemp -d)
+        printf '%s\n' 'FROM busybox:1.37' "RUN echo 'subtitle {{rel}}' > /version" > "$d/Dockerfile"
+        docker build -q --provenance=false --sbom=false -t localhost:5000/subtitle:{{rel}} "$d" >/dev/null
+        docker push -q localhost:5000/subtitle:{{rel}} >/dev/null
+        printf '%s\n' 'FROM busybox:1.37' "RUN echo 'other-source 1.0' > /version" > "$d/Dockerfile"
+        docker build -q --provenance=false --sbom=false -t localhost:5000/other-source:1.0 "$d" >/dev/null
+        docker push -q localhost:5000/other-source:1.0 >/dev/null
+        rm -rf "$d"
+        if command -v notation >/dev/null 2>&1; then
+          notation cert generate-test --trust-store-type ca other-source-signer >/dev/null 2>&1 || true
+          dother=$(curl -fsSI -H 'Accept: application/vnd.oci.image.manifest.v1+json' http://127.0.0.1:5000/v2/other-source/manifests/1.0 | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}')
+          notation sign --signature-format cose --key other-source-signer --insecure-registry "localhost:5000/other-source@$dother" >/dev/null 2>&1 || true
+        else
+          printf '%s\n' 'notation is not installed on this host image, so the comparison signature could not be created.' > "$s/NOTE.txt"
+        fi
+        chown -R learner:learner "$s"
+  checks:
+    - id: trust-policy-shape
+      description: trustpolicy.json trusts only copperleaf-ca for localhost:5000/*
+      type: shell
+      timeoutSec: 60
+      on: cl-subtitle-04
+      skills: [containers.supply-chain.signing]
+      weight: 2
+      command: |
+        f=/home/learner/notation-setup/trustpolicy.json
+        jq -r '.trustPolicies[0] | [(.registryScopes | join(",")), (.trustStores | join(",")), .signatureVerification.level] | join(" | ")' "$f" 2>/dev/null || echo invalid
+      expect: {match: regex, value: "^localhost:5000/\\* \\| ca:copperleaf.* \\| strict$"}
+    - id: subtitle-signed-and-verifies
+      description: subtitle:{{rel}} verifies against the trust policy
+      type: shell
+      timeoutSec: 90
+      on: cl-subtitle-04
+      skills: [containers.supply-chain.signing]
+      weight: 3
+      command: |
+        notation verify --trust-policy /home/learner/notation-setup/trustpolicy.json --insecure-registry localhost:5000/subtitle:{{rel}} >/dev/null 2>&1 && echo verified || echo not-verified
+      expect: {match: exact, value: verified}
+    - id: other-source-rejected
+      description: other-source:1.0 (signed with the unrelated CA) fails verification
+      type: shell
+      timeoutSec: 90
+      on: cl-subtitle-04
+      skills: [containers.supply-chain.signing]
+      weight: 2.5
+      command: |
+        notation verify --trust-policy /home/learner/notation-setup/trustpolicy.json --insecure-registry localhost:5000/other-source:1.0 >/dev/null 2>&1 && echo verified || echo rejected
+      expect: {match: exact, value: rejected}
+  hints:
+    - title: A signing certificate needs its own key
+      body: "`notation cert generate-test` makes a quick local self-signed setup; for a CA you control, a more realistic path is to create a leaf key and have `copperleaf-ca.key` sign its certificate, then import that chain into Notation's signing keys."
+      cost: 1
+    - title: Trust store vs trust policy
+      body: "The CA certificate goes into Notation's trust store (`notation cert add`), and the trust policy then names which trust store and which registry scopes require a signature from it."
+      cost: 1
+    - title: Scoping the policy
+      body: "`registryScopes: [\"localhost:5000/*\"]` matches every repository on this registry; `trustStores: [\"ca:copperleaf\"]` names only the Copperleaf CA, so other-source (signed by a different CA) will not verify."
+      cost: 2
+  misconceptions:
+    - id: trust-both-cas
+      description: Adds both CAs to the trust store, so the unrelated signature also verifies.
+      feedback: "A trust policy that trusts every CA you happen to have around defeats the point: it should trust only the organisation's own CA, so a signature from an unrelated source is rejected."
+      expectFail: [other-source-rejected]
+      mutation:
+        on: cl-subtitle-04
+        as: learner
+        run: |
+          cd ~/notation-setup
+          notation cert add -t ca -s acme copperleaf-ca.crt 2>/dev/null || true
+          notation cert add -t ca -s acme other-ca.crt 2>/dev/null || true
+          jq -n '{"version": "1.0", "trustPolicies": [{"name": "copperleaf", "registryScopes": ["localhost:5000/*"], "signatureVerification": {"level": "strict"}, "trustStores": ["ca:acme"], "trustedIdentities": ["*"]}]}' > trustpolicy.json
+    - id: scope-too-narrow
+      description: Scopes the trust policy to only the subtitle repository, so the gate cannot be reused for other repositories on the same registry.
+      feedback: "A scope of localhost:5000/subtitle* only covers one repository; the task asks for every repository under localhost:5000, so the policy generalises."
+      expectFail: [trust-policy-shape]
+      mutation:
+        on: cl-subtitle-04
+        as: learner
+        run: |
+          cd ~/notation-setup
+          notation cert add -t ca -s copperleaf copperleaf-ca.crt 2>/dev/null || true
+          jq -n '{"version": "1.0", "trustPolicies": [{"name": "copperleaf", "registryScopes": ["localhost:5000/subtitle*"], "signatureVerification": {"level": "strict"}, "trustStores": ["ca:copperleaf"], "trustedIdentities": ["*"]}]}' > trustpolicy.json
+  solution:
+    explanation: |
+      Import only the Copperleaf CA into Notation's trust store, scope the trust policy
+      to the whole registry, sign the release digest with a certificate chained to that
+      CA, and confirm verification succeeds for the signed release but fails for the
+      image signed by the unrelated CA.
+    steps:
+      - on: cl-subtitle-04
+        as: learner
+        run: |
+          cd ~/notation-setup
+          notation cert add -t ca -s copperleaf copperleaf-ca.crt
+          jq -n '{"version": "1.0", "trustPolicies": [{"name": "copperleaf", "registryScopes": ["localhost:5000/*"], "signatureVerification": {"level": "strict"}, "trustStores": ["ca:copperleaf"], "trustedIdentities": ["*"]}]}' > trustpolicy.json
+          notation cert generate-test --trust-store-type ca copperleaf-release
+          d=$(curl -fsSI -H 'Accept: application/vnd.oci.image.manifest.v1+json' http://127.0.0.1:5000/v2/subtitle/manifests/{{rel}} | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}')
+          notation sign --signature-format cose --key copperleaf-release --insecure-registry "localhost:5000/subtitle@$d"
+          notation verify --trust-policy trustpolicy.json --insecure-registry localhost:5000/subtitle:{{rel}}
+          notation verify --trust-policy trustpolicy.json --insecure-registry localhost:5000/other-source:1.0 || true
+    alternatives:
+      - id: strict-trusted-identity
+        description: Narrow trustedIdentities to the specific CA subject instead of a wildcard.
+        steps:
+          - on: cl-subtitle-04
+            as: learner
+            run: |
+              cd ~/notation-setup
+              notation cert add -t ca -s copperleaf copperleaf-ca.crt
+              jq -n '{"version": "1.0", "trustPolicies": [{"name": "copperleaf", "registryScopes": ["localhost:5000/*"], "signatureVerification": {"level": "strict"}, "trustStores": ["ca:copperleaf"], "trustedIdentities": ["x509.subject: CN=copperleaf test CA"]}]}' > trustpolicy.json
+              notation cert generate-test --trust-store-type ca copperleaf-release
+              d=$(curl -fsSI -H 'Accept: application/vnd.oci.image.manifest.v1+json' http://127.0.0.1:5000/v2/subtitle/manifests/{{rel}} | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}')
+              notation sign --signature-format cose --key copperleaf-release --insecure-registry "localhost:5000/subtitle@$d"
+              notation verify --trust-policy trustpolicy.json --insecure-registry localhost:5000/subtitle:{{rel}}

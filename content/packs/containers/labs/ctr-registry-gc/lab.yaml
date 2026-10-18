@@ -1,0 +1,195 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-registry-gc
+  title: Reclaim registry storage without losing production digests
+  domain: containers
+  frameworks: [docker-practitioner:registry]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [docker, registry, garbage-collection, delete, storage]
+  version: 1
+spec:
+  description: |
+    The build registry on **`cl-registry-03`** (`ssh cl-registry-03`; you are in the
+    `docker` group) runs as the container **`registry`** on `127.0.0.1:5000` with its data
+    in `/srv/registry/data`. The disk is nearly full of nightly builds of
+    `catalogue-api`: {{nightly}} tags named `nightly-1` to `nightly-{{nightly}}`, each
+    with a large layer. The production releases `2.1` and `2.2` are in the same
+    repository; their digests are listed in `/srv/registry/prod-digests.txt`.
+
+    1. Delete **every `nightly-*` manifest** from the registry (the registry currently
+       refuses deletes).
+    2. Run **garbage collection** so the disk usage of `/srv/registry/data` drops to at
+       most **half** of what it was.
+    3. Every digest in `prod-digests.txt` must still pull completely, and the registry
+       must keep serving on `127.0.0.1:5000`.
+  objectives:
+    - Enable deletes on a registry and delete manifests by digest
+    - Run garbage collection and measure the reclaimed space
+    - Keep referenced content intact
+  params:
+    nightly:
+      type: int
+      min: 6
+      max: 9
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-registry-03
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-registry-03
+      timeoutSec: 420
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        docker rm -f registry >/dev/null 2>&1 || true
+        rm -rf /srv/registry; install -d /srv/registry/data /var/lib/cloudtrain
+        docker run -d --name registry --restart always -p 127.0.0.1:5000:5000 -v /srv/registry/data:/var/lib/registry registry:3 >/dev/null
+        for i in $(seq 30); do curl -fs http://127.0.0.1:5000/v2/ >/dev/null && break; sleep 1; done
+        A='Accept: application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json'
+        push() {  # push <tag> <megabytes>
+          d=$(mktemp -d)
+          head -c $(( $2 * 1048576 )) /dev/urandom > "$d/payload.bin"
+          printf '%s\n' 'FROM busybox:1.37' 'COPY payload.bin /payload.bin' "RUN echo $1 > /build-tag" > "$d/Dockerfile"
+          docker build -q --provenance=false --sbom=false -t "localhost:5000/catalogue-api:$1" "$d" >/dev/null
+          docker push -q "localhost:5000/catalogue-api:$1" >/dev/null
+          docker rmi "localhost:5000/catalogue-api:$1" >/dev/null 2>&1 || true
+          rm -rf "$d"
+        }
+        : > /srv/registry/prod-digests.txt; : > /var/lib/cloudtrain/nightly.tags
+        for v in 2.1 2.2; do
+          push $v 2
+          curl -fsSI -H "$A" "http://127.0.0.1:5000/v2/catalogue-api/manifests/$v" | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}' >> /srv/registry/prod-digests.txt
+        done
+        for n in $(seq {{nightly}}); do push "nightly-$n" 14; echo "nightly-$n" >> /var/lib/cloudtrain/nightly.tags; done
+        chown learner:learner /srv/registry/prod-digests.txt
+        du -sk /srv/registry/data | cut -f1 > /var/lib/cloudtrain/baseline.kb
+  checks:
+    - id: nightlies-gone
+      description: No nightly-* manifest can be fetched from the registry any more
+      type: shell
+      timeoutSec: 60
+      on: cl-registry-03
+      skills: [containers.registry.garbage-collection]
+      weight: 2
+      command: |
+        A='Accept: application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json'
+        n=0; for t in $(cat /var/lib/cloudtrain/nightly.tags); do
+          c=$(curl -s -o /dev/null -w '%{http_code}' -H "$A" "http://127.0.0.1:5000/v2/catalogue-api/manifests/$t"); [ "$c" = 200 ] && n=$((n + 1)); done; echo "still-served=$n"
+      expect: {match: exact, value: "still-served=0"}
+    - id: space-reclaimed
+      description: /srv/registry/data uses at most half of its original size
+      type: shell
+      timeoutSec: 60
+      on: cl-registry-03
+      skills: [containers.registry.garbage-collection]
+      weight: 3
+      command: |
+        base=$(cat /var/lib/cloudtrain/baseline.kb); now=$(du -sk /srv/registry/data | cut -f1)
+        if [ $(( now * 2 )) -le "$base" ]; then echo reclaimed; else echo "now=${now}KB base=${base}KB"; fi
+      expect: {match: exact, value: reclaimed}
+    - id: prod-intact
+      description: Both production digests still pull completely (manifest and every blob)
+      type: shell
+      timeoutSec: 120
+      on: cl-registry-03
+      skills: [containers.registry.references]
+      weight: 3
+      command: |
+        ok=0; for d in $(cat /srv/registry/prod-digests.txt); do
+          t=$(mktemp -d)
+          skopeo copy -q --src-tls-verify=false "docker://127.0.0.1:5000/catalogue-api@$d" "dir:$t" >/dev/null 2>&1 && ok=$((ok + 1))
+          rm -rf "$t"; done; echo "pulled=$ok"
+      expect: {match: exact, value: "pulled=2"}
+    - id: registry-serving
+      description: The registry container is running and answers on 127.0.0.1:5000
+      type: shell
+      timeoutSec: 60
+      on: cl-registry-03
+      skills: [containers.registry.run-registry]
+      weight: 1
+      command: |
+        r=$(docker inspect registry 2>/dev/null | jq -r '.[0].State.Running // false'); c=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:5000/v2/); echo "$r $c"
+      expect: {match: exact, value: "true 200"}
+  hints:
+    - title: Deletes are off by default
+      body: "Recreate the registry container with `-e REGISTRY_STORAGE_DELETE_ENABLED=true` and the same data directory mounted; the stored images stay."
+      cost: 1
+    - title: Delete by digest
+      body: "`DELETE /v2/<repo>/manifests/<digest>` removes a manifest; a tag name does not work. Read each tag's digest from the `Docker-Content-Digest` header of a HEAD request (send an `Accept` header for the manifest type)."
+      cost: 2
+    - title: Deleting frees nothing yet
+      body: "Blobs stay on disk until garbage collection runs: `docker exec registry registry garbage-collect /etc/distribution/config.yml`. Compare `du -sk /srv/registry/data` before and after."
+      command: du -sk /srv/registry/data
+      cost: 1
+  misconceptions:
+    - id: deleted-not-collected
+      description: Deletes the nightly manifests but never runs garbage collection.
+      feedback: "A delete only removes the manifest reference. The layers stay on disk until `registry garbage-collect` finds them unreferenced and removes them."
+      expectFail: [space-reclaimed]
+      mutation:
+        on: cl-registry-03
+        as: learner
+        run: |
+          docker rm -f registry
+          docker run -d --name registry --restart always -p 127.0.0.1:5000:5000 -v /srv/registry/data:/var/lib/registry -e REGISTRY_STORAGE_DELETE_ENABLED=true registry:3
+          for i in $(seq 30); do curl -fs http://127.0.0.1:5000/v2/ >/dev/null && break; sleep 1; done
+          A='Accept: application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json'
+          for n in $(seq {{nightly}}); do
+            d=$(curl -fsSI -H "$A" "http://127.0.0.1:5000/v2/catalogue-api/manifests/nightly-$n" | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}')
+            curl -fsS -X DELETE "http://127.0.0.1:5000/v2/catalogue-api/manifests/$d"
+          done
+    - id: repository-wiped
+      description: Removes the whole repository directory and collects, which also destroys the production releases.
+      feedback: "Garbage collection must keep everything the production digests reference. Delete only the nightly manifests by digest."
+      expectFail: [prod-intact]
+      mutation:
+        on: cl-registry-03
+        as: learner
+        run: |
+          docker rm -f registry
+          docker run -d --name registry --restart always -p 127.0.0.1:5000:5000 -v /srv/registry/data:/var/lib/registry -e REGISTRY_STORAGE_DELETE_ENABLED=true registry:3
+          for i in $(seq 30); do curl -fs http://127.0.0.1:5000/v2/ >/dev/null && break; sleep 1; done
+          docker exec registry rm -rf /var/lib/registry/docker/registry/v2/repositories/catalogue-api
+          docker exec registry registry garbage-collect /etc/distribution/config.yml
+  solution:
+    explanation: |
+      Recreate the registry with deletes enabled on the same data directory, delete each
+      nightly manifest by its digest, then run the registry's garbage collector. Blobs
+      shared with the production images stay; the large nightly layers go.
+    steps:
+      - on: cl-registry-03
+        as: learner
+        run: |
+          docker rm -f registry
+          docker run -d --name registry --restart always -p 127.0.0.1:5000:5000 -v /srv/registry/data:/var/lib/registry -e REGISTRY_STORAGE_DELETE_ENABLED=true registry:3
+          for i in $(seq 30); do curl -fs http://127.0.0.1:5000/v2/ >/dev/null && break; sleep 1; done
+          A='Accept: application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json'
+          for n in $(seq {{nightly}}); do
+            d=$(curl -fsSI -H "$A" "http://127.0.0.1:5000/v2/catalogue-api/manifests/nightly-$n" | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}')
+            curl -fsS -X DELETE "http://127.0.0.1:5000/v2/catalogue-api/manifests/$d"
+          done
+          docker exec registry registry garbage-collect /etc/distribution/config.yml
+          du -sk /srv/registry/data
+    alternatives:
+      - id: skopeo-delete
+        description: Delete the manifests with skopeo and collect untagged content as well.
+        steps:
+          - on: cl-registry-03
+            as: learner
+            run: |
+              docker rm -f registry
+              docker run -d --name registry --restart always -p 127.0.0.1:5000:5000 -v /srv/registry/data:/var/lib/registry -e REGISTRY_STORAGE_DELETE_ENABLED=true registry:3
+              for i in $(seq 30); do curl -fs http://127.0.0.1:5000/v2/ >/dev/null && break; sleep 1; done
+              for n in $(seq {{nightly}}); do skopeo delete --tls-verify=false "docker://127.0.0.1:5000/catalogue-api:nightly-$n"; done
+              docker exec registry registry garbage-collect --delete-untagged /etc/distribution/config.yml

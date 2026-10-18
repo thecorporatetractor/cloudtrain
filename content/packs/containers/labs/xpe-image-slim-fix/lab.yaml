@@ -1,0 +1,198 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xpe-image-slim-fix
+  title: Shrink and fix a failing release image
+  domain: containers
+  frameworks: [ct-platform:containers-delivery]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [exam, docker, build, multi-stage, signals]
+  version: 1
+spec:
+  description: |
+    **Host:** `qm-docker-1` (`ssh qm-docker-1`)
+
+    The label-printer image builds from `~/exam/label-printer/` (`Dockerfile`,
+    `printer.sh`) onto a large toolchain layer it does not need at run time, and its
+    entrypoint is written so `docker stop` never delivers `SIGTERM` to the process.
+
+    1. Rebuild **`label-printer:release`** so the exported image is **under 120 MB**
+       (the current build is about 900 MB because of an unused build-time toolchain
+       layer).
+    2. Fix the entrypoint so `docker stop` finishes in **under 3 seconds**: run a
+       container named **`label-printer`** from the new image and confirm the service
+       logs `clean shutdown` and the stop completes quickly.
+  objectives:
+    - Use a multi-stage build to drop an unneeded toolchain from the final image
+    - Use exec form so SIGTERM reaches the process directly
+  params:
+    tag:
+      type: int
+      min: 100
+      max: 899
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-docker-1
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: qm-docker-1
+      timeoutSec: 420
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        grep -q ' registry.quillmoor.example' /etc/hosts || echo '127.0.0.1 registry.quillmoor.example' >> /etc/hosts
+        r=/srv/exam/registry; mkdir -p "$r/certs"
+        if [ ! -f "$r/certs/server.crt" ]; then
+          cd "$r/certs"
+          openssl req -x509 -newkey rsa:2048 -nodes -keyout ca.key -out ca.crt -days 30 -subj "/CN=Quillmoor exam CA" 2>/dev/null
+          openssl req -newkey rsa:2048 -nodes -keyout server.key -out server.csr -subj "/CN=registry.quillmoor.example" 2>/dev/null
+          printf 'subjectAltName=DNS:registry.quillmoor.example\nextendedKeyUsage=serverAuth\n' > ext.cnf
+          openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out server.crt -days 30 -extfile ext.cnf 2>/dev/null
+          chmod 0644 server.key; rm -f server.csr ext.cnf ca.srl ca.key
+        fi
+        install -D -m 0644 "$r/certs/ca.crt" /etc/docker/certs.d/registry.quillmoor.example:5443/ca.crt
+        docker inspect qm-exam-registry >/dev/null 2>&1 || docker run -d --name qm-exam-registry --restart always -p 5443:5443 -v "$r/certs:/certs:ro" \
+          -e REGISTRY_HTTP_ADDR=0.0.0.0:5443 -e REGISTRY_HTTP_TLS_CERTIFICATE=/certs/server.crt -e REGISTRY_HTTP_TLS_KEY=/certs/server.key registry:3 >/dev/null
+        for i in $(seq 30); do curl -fs --cacert "$r/certs/ca.crt" https://registry.quillmoor.example:5443/v2/ >/dev/null && break; sleep 1; done
+        s=/home/learner/exam/label-printer
+        rm -rf "$s"; install -d -o learner -g learner /home/learner/exam "$s"
+        cat > "$s/printer.sh" <<'SH'
+        #!/bin/sh
+        term() { echo "clean shutdown"; exit 0; }
+        trap term TERM
+        echo "label-printer release {{tag}} running"
+        while true; do sleep 1; done
+        SH
+        chmod 0755 "$s/printer.sh"
+        cat > "$s/toolchain.sh" <<'SH'
+        #!/bin/sh
+        set -eu
+        mkdir -p /opt/qm-toolchain
+        head -c 838860800 /dev/urandom > /opt/qm-toolchain/sdk.bin
+        SH
+        chmod 0755 "$s/toolchain.sh"
+        cat > "$s/Dockerfile" <<'DF'
+        FROM alpine:3.22
+        COPY toolchain.sh /tmp/toolchain.sh
+        RUN sh /tmp/toolchain.sh
+        COPY printer.sh /printer.sh
+        ENTRYPOINT /printer.sh
+        DF
+        chown -R learner:learner "$s"
+        docker rm -f label-printer >/dev/null 2>&1 || true
+  checks:
+    - id: small-image
+      description: label-printer:release is under 120 MB
+      type: shell
+      timeoutSec: 180
+      on: qm-docker-1
+      skills: [k8s.delivery.image-build, k8s.security.image-footprint]
+      weight: 3
+      command: |
+        docker image inspect label-printer:release >/dev/null 2>&1 || { echo no-image; exit 0; }
+        n=$(docker save label-printer:release 2>/dev/null | wc -c)
+        if [ "$n" -gt 1000000 ] && [ "$n" -lt 125829120 ]; then echo small; else echo "bytes=$n"; fi
+      expect: {match: exact, value: small}
+    - id: no-toolchain-layer
+      description: No layer of the image contains the toolchain
+      type: shell
+      timeoutSec: 180
+      on: qm-docker-1
+      skills: [k8s.delivery.image-build, k8s.security.image-footprint]
+      weight: 1.5
+      command: |
+        docker image inspect label-printer:release >/dev/null 2>&1 || { echo no-image; exit 0; }
+        t=$(mktemp -d); docker save label-printer:release 2>/dev/null | tar -x -C "$t" 2>/dev/null
+        n=0; for f in $(find "$t" -type f); do zcat -f "$f" 2>/dev/null | tar -tf - 2>/dev/null | grep -q '^opt/qm-toolchain/' && n=$((n + 1)); done
+        rm -rf "$t"; [ "$n" = 0 ] && echo clean || echo "toolchain-in-$n-layers"
+      expect: {match: exact, value: clean}
+    - id: fast-stop
+      description: docker stop delivers SIGTERM and finishes in under 3 seconds
+      type: shell
+      timeoutSec: 60
+      on: qm-docker-1
+      skills: [k8s.delivery.image-build]
+      weight: 3
+      command: |
+        docker rm -f label-printer >/dev/null 2>&1 || true
+        docker run -d --name label-printer label-printer:release >/dev/null
+        sleep 2
+        t0=$(date +%s%N); docker stop label-printer >/dev/null; ms=$(( ($(date +%s%N) - t0) / 1000000 ))
+        log=$(docker logs label-printer 2>&1 | grep -c '^clean shutdown$')
+        if [ "$ms" -lt 3000 ] && [ "$log" = 1 ]; then echo fast; else echo "ms=$ms clean=$log"; fi
+      expect: {match: exact, value: fast}
+  solution:
+    explanation: |
+      A build stage runs the toolchain step and nothing from it is copied into a fresh
+      final stage; an exec-form ENTRYPOINT (not a shell string) delivers SIGTERM straight
+      to the script's own trap instead of to an intermediate shell.
+    steps:
+      - on: qm-docker-1
+        as: learner
+        run: |
+          cd ~/exam/label-printer
+          cat > Dockerfile <<'DF'
+          FROM alpine:3.22
+          COPY printer.sh /printer.sh
+          ENTRYPOINT ["/printer.sh"]
+          DF
+          docker build -t label-printer:release .
+          docker rm -f label-printer 2>/dev/null || true
+          docker run -d --name label-printer label-printer:release
+    alternatives:
+      - id: keep-toolchain-stage-unused
+        description: Still define the toolchain in a named stage but never reference it from the final FROM, which the builder prunes from the exported image.
+        steps:
+          - on: qm-docker-1
+            as: learner
+            run: |
+              cd ~/exam/label-printer
+              cat > Dockerfile <<'DF'
+              FROM alpine:3.22 AS toolchain
+              COPY toolchain.sh /tmp/toolchain.sh
+              RUN sh /tmp/toolchain.sh
+              FROM alpine:3.22
+              COPY printer.sh /printer.sh
+              ENTRYPOINT ["/printer.sh"]
+              DF
+              docker build -t label-printer:release .
+              docker rm -f label-printer 2>/dev/null || true
+              docker run -d --name label-printer label-printer:release
+  misconceptions:
+    - id: shell-form-entrypoint
+      description: Fixes the size but keeps a shell-form ENTRYPOINT, so SIGTERM goes to the shell, not the script's trap.
+      feedback: "ENTRYPOINT /printer.sh runs through /bin/sh -c, which becomes PID 1 and does not forward SIGTERM to the script it started. Use exec form, ENTRYPOINT [\"/printer.sh\"], so the script itself is PID 1."
+      expectFail: [fast-stop]
+      mutation:
+        on: qm-docker-1
+        as: learner
+        run: |
+          cd ~/exam/label-printer
+          printf '%s\n' 'FROM alpine:3.22' 'COPY printer.sh /printer.sh' 'ENTRYPOINT /printer.sh' > Dockerfile
+          docker build -t label-printer:release .
+          docker rm -f label-printer 2>/dev/null || true
+          docker run -d --name label-printer label-printer:release
+    - id: rm-in-later-layer
+      description: Keeps one build stage and deletes the toolchain in a later RUN, which does not shrink the image.
+      feedback: "A deleting layer only hides the files from the final filesystem view; the layer that wrote them is still part of the image and still counted in its size. Use a separate build stage instead."
+      expectFail: [small-image, no-toolchain-layer]
+      mutation:
+        on: qm-docker-1
+        as: learner
+        run: |
+          cd ~/exam/label-printer
+          printf '%s\n' 'FROM alpine:3.22' 'COPY toolchain.sh /tmp/toolchain.sh' 'RUN sh /tmp/toolchain.sh' 'RUN rm -rf /opt/qm-toolchain' \
+            'COPY printer.sh /printer.sh' 'ENTRYPOINT ["/printer.sh"]' > Dockerfile
+          docker build -t label-printer:release .
+          docker rm -f label-printer 2>/dev/null || true
+          docker run -d --name label-printer label-printer:release

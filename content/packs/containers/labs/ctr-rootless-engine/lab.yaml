@@ -1,0 +1,179 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-rootless-engine
+  title: Run the encoder team's engine rootless
+  domain: containers
+  frameworks: [dca-legacy:security, docker-practitioner:security]
+  difficulty: hard
+  estimatedMinutes: 25
+  tags: [docker, security, rootless, systemd, linger]
+  version: 1
+spec:
+  description: |
+    On **`cl-encode-01`** (`ssh cl-encode-01`; you have `sudo`) the user **`encoder`**
+    exists but has no container engine of its own; it currently relies on the
+    system-wide (rootful) engine. Set up a **rootless** Docker engine for `encoder` and
+    run the preview service there:
+
+    1. Install and start a **rootless** engine as `encoder` (not the system engine).
+    2. Enable **linger** for `encoder` so its engine survives after the user logs out.
+    3. As `encoder`, run **`copperleaf/preview:1`** (already in the local engine, built
+       by the platform team) as a container named **`preview`**, published on
+       **`127.0.0.1:8080`** (container port 80).
+    4. Prove no **root-owned** dockerd process serves that container: the rootless
+       engine's `dockerd-rootless` process must run **as `encoder`**, and the system
+       engine must list no container named `preview`.
+  objectives:
+    - Set up rootless Docker for a non-root user
+    - Enable linger so the rootless engine survives logout
+    - Tell which engine (rootful or rootless) is serving a given container
+  params:
+    build:
+      type: int
+      min: 100
+      max: 999
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-encode-01
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-encode-01
+      timeoutSec: 420
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        id encoder >/dev/null 2>&1 || useradd -m -s /bin/bash encoder
+        loginctl disable-linger encoder 2>/dev/null || true
+        pkill -u encoder -f dockerd-rootless 2>/dev/null || true
+        rm -rf /home/encoder/.local/share/docker /run/user/"$(id -u encoder)"/docker.sock 2>/dev/null || true
+        d=$(mktemp -d); mkdir -p "$d/www"
+        echo "copperleaf preview build {{build}}" > "$d/www/index.html"
+        printf '%s\n' 'FROM busybox:1.37' 'COPY www /www' 'EXPOSE 80' 'CMD ["httpd", "-f", "-p", "80", "-h", "/www"]' > "$d/Dockerfile"
+        docker build -q -t copperleaf/preview:1 "$d" >/dev/null
+        rm -rf "$d"
+        docker save copperleaf/preview:1 -o /var/lib/cloudtrain-preview.tar
+        chmod 0644 /var/lib/cloudtrain-preview.tar
+        docker rm -f preview >/dev/null 2>&1 || true
+  checks:
+    - id: rootless-running
+      description: A rootless engine is running as encoder
+      type: shell
+      timeoutSec: 60
+      on: cl-encode-01
+      skills: [containers.runtime-security.rootless]
+      weight: 2.5
+      command: |
+        u=$(id -u encoder)
+        p=$(ps -eo user,args | awk -v u=encoder '$1==u && /dockerd-rootless/{print $1; exit}')
+        s=$(sudo -u encoder XDG_RUNTIME_DIR=/run/user/$u DOCKER_HOST=unix:///run/user/$u/docker.sock docker info --format json 2>/dev/null | jq -r '.SecurityOptions // [] | map(select(test("rootless"))) | length')
+        echo "${p:-none} rootless=${s:-0}"
+      expect: {match: exact, value: "encoder rootless=1"}
+    - id: linger-enabled
+      description: Linger is enabled for encoder
+      type: shell
+      timeoutSec: 60
+      on: cl-encode-01
+      skills: [containers.runtime-security.rootless]
+      weight: 1.5
+      command: loginctl show-user encoder --property=Linger 2>/dev/null | cut -d= -f2
+      expect: {match: exact, value: "yes"}
+    - id: preview-on-rootless
+      description: preview runs under the rootless engine and answers on 127.0.0.1:8080
+      type: shell
+      timeoutSec: 60
+      on: cl-encode-01
+      skills: [containers.runtime-security.rootless]
+      weight: 2.5
+      command: |
+        u=$(id -u encoder)
+        r=$(sudo -u encoder XDG_RUNTIME_DIR=/run/user/$u DOCKER_HOST=unix:///run/user/$u/docker.sock docker inspect preview 2>/dev/null | jq -r '.[0].State.Running // false')
+        c=$(curl -fsS --max-time 4 http://127.0.0.1:8080/ 2>/dev/null)
+        echo "$r $c"
+      expect: {match: exact, value: "true copperleaf preview build {{build}}"}
+    - id: no-rootful-preview
+      description: The system engine has no container named preview
+      type: shell
+      timeoutSec: 60
+      on: cl-encode-01
+      skills: [containers.runtime-security.rootless]
+      weight: 1.5
+      command: docker inspect preview >/dev/null 2>&1 && echo rootful || echo clean
+      expect: {match: exact, value: clean}
+  hints:
+    - title: Installing rootless support
+      body: "The image already ships `docker-ce-rootless-extras`; as `encoder`, `dockerd-rootless-setuptool.sh install` sets up the systemd user unit and env. It needs `XDG_RUNTIME_DIR` set, which a user session (or `loginctl enable-linger`) provides."
+      cost: 1
+    - title: Getting an image into the rootless store
+      body: "The rootless engine has its own separate image store; it cannot see the system engine's images. `docker load -i /var/lib/cloudtrain-preview.tar` as `encoder` against the rootless socket loads it in."
+      cost: 2
+    - title: Linger first
+      body: "`loginctl enable-linger encoder` before starting the user service, so `systemctl --user` for encoder keeps running without an active login session."
+      cost: 1
+  misconceptions:
+    - id: sudo-into-rootful
+      description: Just runs the container as encoder via sudo against the system engine, which is still rootful.
+      feedback: "Running `sudo -u encoder docker run ...` still talks to the system (rootful) engine through its socket; nothing becomes rootless. You need a separate dockerd-rootless process owned by encoder."
+      expectFail: [rootless-running]
+      mutation:
+        on: cl-encode-01
+        as: admin
+        run: |
+          docker load -i /var/lib/cloudtrain-preview.tar >/dev/null
+          sudo -u encoder docker run -d --name preview -p 127.0.0.1:8080:80 copperleaf/preview:1
+    - id: no-linger
+      description: Sets up rootless Docker correctly but never enables linger.
+      feedback: "Without linger, encoder's user systemd instance (and its rootless dockerd) stops when the last session for that user ends. loginctl enable-linger encoder keeps it running."
+      expectFail: [linger-enabled]
+      mutation:
+        on: cl-encode-01
+        as: admin
+        run: |
+          u=$(id -u encoder)
+          sudo -u encoder XDG_RUNTIME_DIR=/run/user/$u dockerd-rootless-setuptool.sh install --skip-iptables -f 2>&1 | tail -5 || true
+          sudo -u encoder XDG_RUNTIME_DIR=/run/user/$u systemctl --user start docker 2>/dev/null || true
+          sleep 3
+          sudo -u encoder XDG_RUNTIME_DIR=/run/user/$u DOCKER_HOST=unix:///run/user/$u/docker.sock docker load -i /var/lib/cloudtrain-preview.tar >/dev/null 2>&1 || true
+          sudo -u encoder XDG_RUNTIME_DIR=/run/user/$u DOCKER_HOST=unix:///run/user/$u/docker.sock docker run -d --name preview -p 127.0.0.1:8080:80 copperleaf/preview:1 2>/dev/null || true
+  solution:
+    explanation: |
+      Linger keeps encoder's user manager running without a login session; the rootless
+      setup tool installs a dockerd-rootless user service into that manager; the image is
+      loaded into the rootless engine's own store (separate from the system engine's) and
+      the container runs there.
+    steps:
+      - on: cl-encode-01
+        as: admin
+        run: |
+          loginctl enable-linger encoder
+          u=$(id -u encoder)
+          sudo -u encoder XDG_RUNTIME_DIR=/run/user/$u dockerd-rootless-setuptool.sh install --skip-iptables -f
+          sudo -u encoder XDG_RUNTIME_DIR=/run/user/$u systemctl --user enable --now docker
+          for i in $(seq 30); do sudo -u encoder XDG_RUNTIME_DIR=/run/user/$u DOCKER_HOST=unix:///run/user/$u/docker.sock docker info >/dev/null 2>&1 && break; sleep 2; done
+          sudo -u encoder XDG_RUNTIME_DIR=/run/user/$u DOCKER_HOST=unix:///run/user/$u/docker.sock docker load -i /var/lib/cloudtrain-preview.tar
+          sudo -u encoder XDG_RUNTIME_DIR=/run/user/$u DOCKER_HOST=unix:///run/user/$u/docker.sock docker run -d --name preview -p 127.0.0.1:8080:80 copperleaf/preview:1
+    alternatives:
+      - id: machinectl-shell
+        description: Do the setup from inside an encoder login shell started with machinectl instead of sudo -u.
+        steps:
+          - on: cl-encode-01
+            as: admin
+            run: |
+              loginctl enable-linger encoder
+              machinectl shell encoder@ /bin/bash -lc '
+                export XDG_RUNTIME_DIR=/run/user/$(id -u)
+                dockerd-rootless-setuptool.sh install --skip-iptables -f
+                systemctl --user enable --now docker
+                for i in $(seq 30); do docker info >/dev/null 2>&1 && break; sleep 2; done
+                docker load -i /var/lib/cloudtrain-preview.tar
+                docker run -d --name preview -p 127.0.0.1:8080:80 copperleaf/preview:1
+              '

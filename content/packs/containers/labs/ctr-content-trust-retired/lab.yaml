@@ -1,0 +1,195 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-content-trust-retired
+  title: Replace a retired content-trust pull with signature verification
+  domain: containers
+  frameworks: [dca-legacy:security, docker-practitioner:supply-chain]
+  difficulty: easy
+  estimatedMinutes: 10
+  tags: [docker, security, signing, migration, deploy-script]
+  version: 1
+spec:
+  description: |
+    On **`cl-deploy-01`** (`ssh cl-deploy-01`) the legacy deploy script
+    `~/deploy/release.sh` sets `DOCKER_CONTENT_TRUST=1` before pulling
+    **`localhost:5000/ad-insertion:3.1`**. The registry no longer serves the trust
+    metadata that mechanism needs, so every pull now fails.
+
+    1. Remove the `DOCKER_CONTENT_TRUST` setting from `release.sh`.
+    2. Add a verification step with **`cosign verify`** against the public key
+       `~/deploy/release.pub`, so the script only deploys a digest whose signature
+       verifies.
+    3. Run `~/deploy/release.sh` and confirm it deploys the signed digest.
+  objectives:
+    - Explain why Docker Content Trust and cosign verification are not interchangeable
+    - Replace a retired trust mechanism with explicit signature verification
+  params:
+    rel:
+      type: int
+      min: 100
+      max: 899
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-deploy-01
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-deploy-01
+      timeoutSec: 300
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        docker rm -f registry >/dev/null 2>&1 || true
+        rm -rf /srv/registry; install -d /srv/registry
+        docker run -d --name registry --restart always -p 127.0.0.1:5000:5000 -v /srv/registry:/var/lib/registry registry:3 >/dev/null
+        for i in $(seq 30); do curl -fs http://127.0.0.1:5000/v2/ >/dev/null && break; sleep 1; done
+        d=$(mktemp -d)
+        printf '%s\n' 'FROM busybox:1.37' 'RUN echo "ad-insertion 3.1 build {{rel}}" > /version' 'CMD ["cat", "/version"]' > "$d/Dockerfile"
+        docker build -q --provenance=false --sbom=false -t localhost:5000/ad-insertion:3.1 "$d" >/dev/null
+        docker push -q localhost:5000/ad-insertion:3.1 >/dev/null
+        rm -rf "$d"
+        s=/home/learner/deploy
+        install -d -o learner -g learner "$s"
+        if command -v cosign >/dev/null 2>&1; then
+          (cd "$s" && COSIGN_PASSWORD='' cosign generate-key-pair >/dev/null 2>&1)
+          mv "$s/cosign.key" "$s/release.key" 2>/dev/null || true
+          mv "$s/cosign.pub" "$s/release.pub" 2>/dev/null || true
+          d=$(curl -fsSI -H 'Accept: application/vnd.oci.image.manifest.v1+json' http://127.0.0.1:5000/v2/ad-insertion/manifests/3.1 | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}')
+          COSIGN_PASSWORD='' cosign sign --key "$s/release.key" --tlog-upload=false --allow-insecure-registry --yes "localhost:5000/ad-insertion@$d" >/dev/null 2>&1 || true
+        else
+          printf '%s\n' 'cosign is not installed on this host image, so no key pair or signature could be created.' > "$s/NOTE.txt"
+        fi
+        cat > "$s/release.sh" <<'SH'
+        #!/bin/sh
+        set -eu
+        cd "$(dirname "$0")"
+        export DOCKER_CONTENT_TRUST=1
+        docker pull localhost:5000/ad-insertion:3.1
+        echo "deployed localhost:5000/ad-insertion:3.1"
+        SH
+        chmod 0755 "$s/release.sh"
+        chown -R learner:learner "$s"
+  checks:
+    - id: trust-removed
+      description: release.sh no longer sets DOCKER_CONTENT_TRUST
+      type: shell
+      timeoutSec: 60
+      on: cl-deploy-01
+      skills: [containers.supply-chain.signing]
+      weight: 1.5
+      command: grep -c 'DOCKER_CONTENT_TRUST' /home/learner/deploy/release.sh 2>/dev/null || true
+      expect: {match: exact, value: "0"}
+    - id: cosign-verify-added
+      description: release.sh verifies the image with cosign before deploying
+      type: shell
+      timeoutSec: 60
+      on: cl-deploy-01
+      skills: [containers.supply-chain.signing]
+      weight: 2
+      command: grep -c 'cosign verify' /home/learner/deploy/release.sh 2>/dev/null || true
+      expect: {match: exact, value: "1"}
+    - id: deploy-succeeds
+      description: The updated script deploys the signed image
+      type: shell
+      timeoutSec: 60
+      on: cl-deploy-01
+      skills: [containers.supply-chain.signing]
+      weight: 2.5
+      command: ~/deploy/release.sh 2>&1 | tail -n 1
+      expect: {match: exact, value: "deployed localhost:5000/ad-insertion:3.1"}
+  hints:
+    - title: Two different mechanisms
+      body: "Docker Content Trust (Notary v1) signed tags in a separate trust server that this registry no longer runs. cosign signs a digest and stores the signature as a registry artifact; it needs no trust server, just the verify step in the script."
+      cost: 1
+    - title: Verify by digest
+      body: "Resolve the tag to its digest first (`docker inspect` after a pull, or the registry's Docker-Content-Digest header), then `cosign verify --key release.pub <ref>@<digest>`."
+      cost: 1
+  misconceptions:
+    - id: kept-content-trust
+      description: Keeps DOCKER_CONTENT_TRUST=1 alongside the new cosign check, so the pull still fails before verification ever runs.
+      feedback: "DOCKER_CONTENT_TRUST still tries to reach the retired trust server and fails the pull before the script gets anywhere near the cosign check. Remove it."
+      expectFail: [trust-removed, deploy-succeeds]
+      mutation:
+        on: cl-deploy-01
+        as: learner
+        run: |
+          cd ~/deploy
+          cat > release.sh <<'SH'
+          #!/bin/sh
+          set -eu
+          cd "$(dirname "$0")"
+          export DOCKER_CONTENT_TRUST=1
+          d=$(curl -fsSI -H 'Accept: application/vnd.oci.image.manifest.v1+json' http://127.0.0.1:5000/v2/ad-insertion/manifests/3.1 | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}')
+          cosign verify --key release.pub --insecure-ignore-tlog=true --allow-insecure-registry "localhost:5000/ad-insertion@$d"
+          docker pull localhost:5000/ad-insertion:3.1
+          echo "deployed localhost:5000/ad-insertion:3.1"
+          SH
+          chmod 0755 release.sh
+    - id: verify-wrong-key
+      description: Adds a verify step but points it at a key that is not the matching public key.
+      feedback: "Verification only means something against the key that matches the signer. Use the supplied release.pub, not an unrelated key."
+      expectFail: [deploy-succeeds]
+      mutation:
+        on: cl-deploy-01
+        as: learner
+        run: |
+          cd ~/deploy
+          cosign generate-key-pair --output-key-prefix wrong 2>/dev/null || true
+          cat > release.sh <<'SH'
+          #!/bin/sh
+          set -eu
+          cd "$(dirname "$0")"
+          d=$(curl -fsSI -H 'Accept: application/vnd.oci.image.manifest.v1+json' http://127.0.0.1:5000/v2/ad-insertion/manifests/3.1 | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}')
+          cosign verify --key wrong.pub --insecure-ignore-tlog=true --allow-insecure-registry "localhost:5000/ad-insertion@$d"
+          docker pull localhost:5000/ad-insertion:3.1
+          echo "deployed localhost:5000/ad-insertion:3.1"
+          SH
+          chmod 0755 release.sh
+  solution:
+    explanation: |
+      Docker Content Trust and cosign are unrelated mechanisms; dropping the retired
+      trust variable and adding an explicit cosign verification step against the
+      correct public key restores a working, signature-checked deploy.
+    steps:
+      - on: cl-deploy-01
+        as: learner
+        run: |
+          cd ~/deploy
+          cat > release.sh <<'SH'
+          #!/bin/sh
+          set -eu
+          cd "$(dirname "$0")"
+          d=$(curl -fsSI -H 'Accept: application/vnd.oci.image.manifest.v1+json' http://127.0.0.1:5000/v2/ad-insertion/manifests/3.1 | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}')
+          cosign verify --key release.pub --insecure-ignore-tlog=true --allow-insecure-registry "localhost:5000/ad-insertion@$d"
+          docker pull localhost:5000/ad-insertion:3.1
+          echo "deployed localhost:5000/ad-insertion:3.1"
+          SH
+          chmod 0755 release.sh
+          ./release.sh
+    alternatives:
+      - id: verify-by-tag
+        description: Verify against the tag reference instead of resolving the digest first (cosign resolves it internally).
+        steps:
+          - on: cl-deploy-01
+            as: learner
+            run: |
+              cd ~/deploy
+              cat > release.sh <<'SH'
+              #!/bin/sh
+              set -eu
+              cd "$(dirname "$0")"
+              cosign verify --key release.pub --insecure-ignore-tlog=true --allow-insecure-registry localhost:5000/ad-insertion:3.1
+              docker pull localhost:5000/ad-insertion:3.1
+              echo "deployed localhost:5000/ad-insertion:3.1"
+              SH
+              chmod 0755 release.sh
+              ./release.sh

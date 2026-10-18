@@ -1,0 +1,193 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-offline-mirror
+  title: Fix CI pulls by routing them through the platform mirror
+  domain: containers
+  frameworks: [docker-practitioner:registry, docker-practitioner:operations]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [docker, registry, mirror, daemon-json, offline]
+  version: 1
+spec:
+  description: |
+    Builds on the CI host **`cl-ci-01`** (`ssh cl-ci-01`; you are in the `docker` group
+    and have `sudo`) fail: the host cannot reach Docker Hub or `ghcr.io`. The platform
+    team runs a mirror registry on this host as **`registry.copperleaf.example:5000`**
+    (plain HTTP). It holds the Hub images under `library/` and the ghcr images under the
+    prefix `ghcr/`, for example `registry.copperleaf.example:5000/ghcr/copperleaf-media/subtitle-base:1.4`.
+
+    The pipeline in `~/pipeline/` has two build files, `api/Dockerfile` (a Hub base) and
+    `web/Dockerfile` (a ghcr base), and `build.sh`, which builds
+    `copperleaf/pipeline-api:ci` and `copperleaf/pipeline-web:ci` (release {{rel}}).
+
+    1. Configure the **engine** so Hub pulls go through the mirror (a registry mirror, and
+       the mirror host allowed over plain HTTP). Keep the engine's existing settings in
+       `/etc/docker/daemon.json`.
+    2. Rewrite the **ghcr.io references** in the build files to the mirror host.
+    3. Run `~/pipeline/build.sh` so both images build.
+  objectives:
+    - Configure a Hub mirror in the engine configuration
+    - Explain why a mirror does not cover other registries and rewrite those references
+    - Merge changes into daemon.json without losing existing settings
+  params:
+    rel:
+      type: int
+      min: 200
+      max: 899
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-ci-01
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-ci-01
+      timeoutSec: 420
+      run: |
+        set -eu
+        usermod -aG docker learner
+        grep -q ' registry.copperleaf.example' /etc/hosts || echo '127.0.0.1 registry.copperleaf.example' >> /etc/hosts
+        echo '{ "log-driver": "local", "log-opts": { "max-size": "10m" } }' > /etc/docker/daemon.json
+        systemctl restart docker
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        docker rm -f mirror >/dev/null 2>&1 || true
+        docker rmi -f copperleaf/pipeline-api:ci copperleaf/pipeline-web:ci >/dev/null 2>&1 || true
+        rm -rf /srv/mirror; install -d /srv/mirror
+        docker run -d --name mirror --restart always -p 127.0.0.1:5000:5000 -v /srv/mirror:/var/lib/registry registry:3 >/dev/null
+        for i in $(seq 30); do curl -fs http://127.0.0.1:5000/v2/ >/dev/null && break; sleep 1; done
+        d=$(mktemp -d)
+        printf '%s\n' 'FROM python:3.13-alpine' 'RUN echo "hub-python rel {{rel}}" > /etc/mirror-marker' > "$d/Dockerfile"
+        docker build -q --provenance=false --sbom=false -t localhost:5000/library/python:3.12-alpine "$d" >/dev/null
+        printf '%s\n' 'FROM alpine:3.22' 'RUN echo "ghcr-subtitle-base rel {{rel}}" > /etc/mirror-marker' > "$d/Dockerfile"
+        docker build -q --provenance=false --sbom=false -t localhost:5000/ghcr/copperleaf-media/subtitle-base:1.4 "$d" >/dev/null
+        docker push -q localhost:5000/library/python:3.12-alpine >/dev/null
+        docker push -q localhost:5000/ghcr/copperleaf-media/subtitle-base:1.4 >/dev/null
+        docker rmi localhost:5000/library/python:3.12-alpine localhost:5000/ghcr/copperleaf-media/subtitle-base:1.4 >/dev/null
+        rm -rf "$d"
+        p=/home/learner/pipeline
+        rm -rf "$p"; install -d "$p/api" "$p/web"
+        printf '%s\n' 'FROM python:3.12-alpine' 'RUN cat /etc/mirror-marker > /api-base' 'CMD ["cat", "/api-base"]' > "$p/api/Dockerfile"
+        printf '%s\n' 'FROM ghcr.io/copperleaf-media/subtitle-base:1.4' 'RUN cat /etc/mirror-marker > /web-base' 'CMD ["cat", "/web-base"]' > "$p/web/Dockerfile"
+        printf '%s\n' '#!/bin/sh' 'set -e' 'cd "$(dirname "$0")"' 'docker build -q -t copperleaf/pipeline-api:ci api' 'docker build -q -t copperleaf/pipeline-web:ci web' > "$p/build.sh"
+        chmod 0755 "$p/build.sh"; chown -R learner:learner "$p"
+  checks:
+    - id: engine-mirror
+      description: The engine lists the platform mirror as a Hub mirror and allows it over plain HTTP
+      type: shell
+      timeoutSec: 60
+      on: cl-ci-01
+      skills: [containers.registry.mirror, containers.operations.daemon-config]
+      weight: 2
+      command: |
+        docker info --format json 2>/dev/null | jq -r 'if ((.RegistryConfig.Mirrors // []) | any(test("registry.copperleaf.example:5000"))) and (.RegistryConfig.IndexConfigs["registry.copperleaf.example:5000"].Secure == false) then "mirror" else "none" end'
+      expect: {match: exact, value: mirror}
+    - id: daemon-json-merged
+      description: daemon.json is valid and keeps the existing log settings
+      type: shell
+      timeoutSec: 60
+      on: cl-ci-01
+      skills: [containers.operations.daemon-config]
+      weight: 1.5
+      command: |
+        jq -r '"\(."log-driver") \(."log-opts"."max-size")"' /etc/docker/daemon.json 2>/dev/null || echo invalid
+      expect: {match: exact, value: "local 10m"}
+    - id: ghcr-rewritten
+      description: No build file references ghcr.io, and the web base comes from the mirror's ghcr/ prefix
+      type: shell
+      timeoutSec: 60
+      on: cl-ci-01
+      skills: [containers.registry.mirror]
+      weight: 2
+      command: |
+        n=$(grep -rhi '^FROM' /home/learner/pipeline/api/Dockerfile /home/learner/pipeline/web/Dockerfile | grep -ci 'ghcr\.io')
+        w=$(grep -hi '^FROM' /home/learner/pipeline/web/Dockerfile | grep -c 'registry.copperleaf.example:5000/ghcr/copperleaf-media/subtitle-base:1.4')
+        echo "ghcr=$n mirror=$w"
+      expect: {match: exact, value: "ghcr=0 mirror=1"}
+    - id: images-built
+      description: Both pipeline images exist and carry the mirrored bases
+      type: shell
+      timeoutSec: 90
+      on: cl-ci-01
+      skills: [containers.registry.mirror]
+      weight: 3
+      command: |
+        a=$(docker run --rm copperleaf/pipeline-api:ci 2>/dev/null || echo none); w=$(docker run --rm copperleaf/pipeline-web:ci 2>/dev/null || echo none); echo "$a / $w"
+      expect: {match: exact, value: "hub-python rel {{rel}} / ghcr-subtitle-base rel {{rel}}"}
+  hints:
+    - title: Where the mirror setting lives
+      body: "`registry-mirrors` in `/etc/docker/daemon.json` takes a URL. A mirror on a plain-HTTP host also needs the host in `insecure-registries`. Merge the keys into the existing file (with `jq`) and restart the engine."
+      cost: 1
+    - title: Mirrors only cover Docker Hub
+      body: "A registry mirror is consulted for Docker Hub images only. A `FROM ghcr.io/...` line never goes through it; the build file has to name the mirror host and its `ghcr/` prefix."
+      cost: 2
+  misconceptions:
+    - id: overwrote-daemon-json
+      description: Replaces daemon.json with only the mirror keys, dropping the log settings.
+      feedback: "daemon.json is one file for the whole engine. Overwriting it silently removes the log driver and its limits. Merge the new keys into the existing JSON."
+      expectFail: [daemon-json-merged]
+      mutation:
+        on: cl-ci-01
+        as: admin
+        run: |
+          echo '{ "registry-mirrors": ["http://registry.copperleaf.example:5000"], "insecure-registries": ["registry.copperleaf.example:5000"] }' > /etc/docker/daemon.json
+          systemctl restart docker
+          for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+          cd /home/learner/pipeline
+          sed -i 's#ghcr.io/#registry.copperleaf.example:5000/ghcr/#' web/Dockerfile
+          runuser -u learner -- ./build.sh
+    - id: mirror-for-ghcr
+      description: Configures the Hub mirror correctly but leaves the ghcr.io reference unchanged.
+      feedback: "A registry mirror only applies to Docker Hub images. The ghcr.io base needs its reference rewritten to the mirror host and the ghcr/ prefix."
+      expectFail: [ghcr-rewritten, images-built]
+      mutation:
+        on: cl-ci-01
+        as: admin
+        run: |
+          jq '. + {"registry-mirrors": ["http://registry.copperleaf.example:5000"], "insecure-registries": ["registry.copperleaf.example:5000"]}' /etc/docker/daemon.json > /tmp/daemon.json.new
+          mv /tmp/daemon.json.new /etc/docker/daemon.json
+          systemctl restart docker
+          for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+          runuser -u learner -- /home/learner/pipeline/build.sh || true
+  solution:
+    explanation: |
+      Merge `registry-mirrors` and `insecure-registries` into daemon.json and restart the
+      engine, so the Hub base resolves through the mirror. The ghcr base is not a Hub
+      image, so its `FROM` is rewritten to the mirror host under `ghcr/`. Then build.
+    steps:
+      - on: cl-ci-01
+        as: learner
+        run: |
+          sudo sh -c 'jq ". + {\"registry-mirrors\": [\"http://registry.copperleaf.example:5000\"], \"insecure-registries\": [\"registry.copperleaf.example:5000\"]}" /etc/docker/daemon.json > /tmp/daemon.json.new && mv /tmp/daemon.json.new /etc/docker/daemon.json'
+          sudo systemctl restart docker
+          for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+          cd ~/pipeline
+          sed -i 's#ghcr.io/#registry.copperleaf.example:5000/ghcr/#' web/Dockerfile
+          ./build.sh
+    alternatives:
+      - id: edit-and-reload
+        description: Write the merged daemon.json with a here-document and rewrite the reference with a full-name substitution.
+        steps:
+          - on: cl-ci-01
+            as: learner
+            run: |
+              cat > /tmp/daemon.merged <<'JSON'
+              {
+                "log-driver": "local",
+                "log-opts": { "max-size": "10m" },
+                "registry-mirrors": ["http://registry.copperleaf.example:5000"],
+                "insecure-registries": ["registry.copperleaf.example:5000"]
+              }
+              JSON
+              sudo cp /tmp/daemon.merged /etc/docker/daemon.json
+              sudo systemctl restart docker
+              for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+              cd ~/pipeline
+              sed -i 's#^FROM ghcr.io/copperleaf-media/subtitle-base:1.4#FROM registry.copperleaf.example:5000/ghcr/copperleaf-media/subtitle-base:1.4#' web/Dockerfile
+              ./build.sh

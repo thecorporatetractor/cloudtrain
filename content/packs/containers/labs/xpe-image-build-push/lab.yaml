@@ -1,0 +1,169 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xpe-image-build-push
+  title: Build and publish the tracking API image
+  domain: containers
+  frameworks: [ct-platform:containers-delivery]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [exam, docker, build, multi-stage, registry]
+  version: 1
+spec:
+  description: |
+    **Host:** `qm-docker-1` (`ssh qm-docker-1`)
+
+    The harbour-tracking API's build context is `~/exam/tracking-api/` (`Dockerfile`,
+    `app.py`). It must run as a fixed **non-root UID 10001**, not whatever the base
+    image defaults to.
+
+    1. Build it as a **multi-stage** image: a `python:3.13-alpine` build stage that
+       installs nothing the final stage needs to keep, and a minimal final stage that
+       runs as **UID 10001**.
+    2. Tag it both **`localhost:5443/tracking-api:{{ver}}`** and by its digest
+       (`localhost:5443/tracking-api@sha256:...`), and **push** it to the lab registry
+       at `registry.quillmoor.example:5443` (TLS; the CA is trusted on this host already).
+    3. The grader pulls **by digest**, so the image must exist at
+       `registry.quillmoor.example:5443/tracking-api@<digest>` and answer
+       `tracking-api {{ver}} uid=10001` when run.
+  objectives:
+    - Build a multi-stage image with a fixed non-root UID
+    - Tag and push an image by version and by digest
+  params:
+    ver:
+      type: int
+      min: 100
+      max: 899
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-docker-1
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: qm-docker-1
+      timeoutSec: 420
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        grep -q ' registry.quillmoor.example' /etc/hosts || echo '127.0.0.1 registry.quillmoor.example' >> /etc/hosts
+        r=/srv/exam/registry; rm -rf "$r"; mkdir -p "$r/certs"; cd "$r/certs"
+        openssl req -x509 -newkey rsa:2048 -nodes -keyout ca.key -out ca.crt -days 30 -subj "/CN=Quillmoor exam CA" 2>/dev/null
+        openssl req -newkey rsa:2048 -nodes -keyout server.key -out server.csr -subj "/CN=registry.quillmoor.example" 2>/dev/null
+        printf 'subjectAltName=DNS:registry.quillmoor.example\nextendedKeyUsage=serverAuth\n' > ext.cnf
+        openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out server.crt -days 30 -extfile ext.cnf 2>/dev/null
+        chmod 0644 server.key; rm -f server.csr ext.cnf ca.srl ca.key
+        install -D -m 0644 "$r/certs/ca.crt" /etc/docker/certs.d/registry.quillmoor.example:5443/ca.crt
+        docker rm -f qm-exam-registry >/dev/null 2>&1 || true
+        docker run -d --name qm-exam-registry --restart always -p 5443:5443 -v "$r/certs:/certs:ro" \
+          -e REGISTRY_HTTP_ADDR=0.0.0.0:5443 -e REGISTRY_HTTP_TLS_CERTIFICATE=/certs/server.crt -e REGISTRY_HTTP_TLS_KEY=/certs/server.key registry:3 >/dev/null
+        for i in $(seq 30); do curl -fs --cacert "$r/certs/ca.crt" https://registry.quillmoor.example:5443/v2/ >/dev/null && break; sleep 1; done
+        s=/home/learner/exam/tracking-api
+        install -d -o learner -g learner /home/learner/exam "$s"
+        cat > "$s/app.py" <<'PY'
+        import os, sys
+        print("tracking-api {{ver}} uid=%d" % os.getuid())
+        PY
+        cat > "$s/Dockerfile" <<'DF'
+        FROM python:3.13-alpine AS build
+        WORKDIR /src
+        COPY app.py .
+        FROM python:3.13-alpine
+        RUN adduser -D -u 10001 tracking
+        COPY --from=build /src/app.py /app/app.py
+        USER 10001
+        ENTRYPOINT ["python3", "/app/app.py"]
+        DF
+        chown -R learner:learner "$s"
+  checks:
+    - id: runs-as-uid
+      description: The built image runs as UID 10001
+      type: shell
+      timeoutSec: 90
+      on: qm-docker-1
+      skills: [k8s.delivery.image-build, k8s.security.image-footprint]
+      weight: 2
+      command: docker run --rm localhost:5443/tracking-api:{{ver}} 2>/dev/null || echo broken
+      expect: {match: exact, value: "tracking-api {{ver}} uid=10001"}
+    - id: pushed-by-version
+      description: The registry serves tracking-api:{{ver}}
+      type: shell
+      timeoutSec: 60
+      on: qm-docker-1
+      skills: [k8s.delivery.image-build]
+      weight: 1.5
+      command: |
+        A='Accept: application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json'
+        curl -s --cacert /srv/exam/registry/certs/ca.crt -H "$A" -o /dev/null -w '%{http_code}' https://registry.quillmoor.example:5443/v2/tracking-api/manifests/{{ver}}
+      expect: {match: exact, value: "200"}
+    - id: pullable-by-digest
+      description: The pushed image pulls by digest and runs correctly
+      type: shell
+      timeoutSec: 120
+      on: qm-docker-1
+      skills: [k8s.delivery.image-build]
+      weight: 3
+      command: |
+        A='Accept: application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json'
+        d=$(curl -fsSI --cacert /srv/exam/registry/certs/ca.crt -H "$A" https://registry.quillmoor.example:5443/v2/tracking-api/manifests/{{ver}} | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}')
+        [ -n "$d" ] || { echo no-digest; exit 0; }
+        docker run --rm "registry.quillmoor.example:5443/tracking-api@$d" 2>/dev/null || echo broken
+      expect: {match: exact, value: "tracking-api {{ver}} uid=10001"}
+  misconceptions:
+    - id: default-user
+      description: Builds a working multi-stage image but never sets a fixed UID, so it runs as root.
+      feedback: "The task requires a fixed non-root UID 10001, not whatever the base image defaults to (root on python:3.13-alpine). Add a user with that exact UID and set USER before the entrypoint."
+      expectFail: [runs-as-uid, pullable-by-digest]
+      mutation:
+        on: qm-docker-1
+        as: learner
+        run: |
+          cd ~/exam/tracking-api
+          printf '%s\n' 'FROM python:3.13-alpine AS build' 'WORKDIR /src' 'COPY app.py .' \
+            'FROM python:3.13-alpine' 'COPY --from=build /src/app.py /app/app.py' 'ENTRYPOINT ["python3", "/app/app.py"]' > Dockerfile
+          docker build -t localhost:5443/tracking-api:{{ver}} .
+          docker push localhost:5443/tracking-api:{{ver}}
+    - id: wrong-uid
+      description: Sets a fixed UID but the wrong one.
+      feedback: "The release needs exactly UID 10001; any other fixed UID still fails the check even though it is non-root."
+      expectFail: [runs-as-uid, pullable-by-digest]
+      mutation:
+        on: qm-docker-1
+        as: learner
+        run: |
+          cd ~/exam/tracking-api
+          printf '%s\n' 'FROM python:3.13-alpine AS build' 'WORKDIR /src' 'COPY app.py .' \
+            'FROM python:3.13-alpine' 'RUN adduser -D -u 20002 other' 'COPY --from=build /src/app.py /app/app.py' 'USER 20002' 'ENTRYPOINT ["python3", "/app/app.py"]' > Dockerfile
+          docker build -t localhost:5443/tracking-api:{{ver}} .
+          docker push localhost:5443/tracking-api:{{ver}}
+  solution:
+    explanation: |
+      A build stage prepares the application; the final stage, with a fixed UID 10001
+      user, is what gets tagged and pushed both by version and (implicitly, since the
+      registry resolves any tag to its digest) by digest.
+    steps:
+      - on: qm-docker-1
+        as: learner
+        run: |
+          cd ~/exam/tracking-api
+          docker build -t localhost:5443/tracking-api:{{ver}} .
+          docker push localhost:5443/tracking-api:{{ver}}
+    alternatives:
+      - id: explicit-digest-tag
+        description: Resolve the digest and also tag the image with an explicit @sha256 reference before pushing it again.
+        steps:
+          - on: qm-docker-1
+            as: learner
+            run: |
+              cd ~/exam/tracking-api
+              docker build -t localhost:5443/tracking-api:{{ver}} .
+              docker push localhost:5443/tracking-api:{{ver}}
+              d=sha256:$(docker image inspect localhost:5443/tracking-api:{{ver}} | jq -r '.[0].Id' | cut -d: -f2)
+              docker tag localhost:5443/tracking-api:{{ver}} "localhost:5443/tracking-api@$d" 2>/dev/null || true

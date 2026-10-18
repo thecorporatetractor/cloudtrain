@@ -1,0 +1,190 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-seccomp-profile
+  title: Confine the caption OCR worker with a custom seccomp profile
+  domain: containers
+  frameworks: [cks:system-hardening, docker-practitioner:security]
+  difficulty: hard
+  estimatedMinutes: 20
+  tags: [docker, security, seccomp, syscalls]
+  version: 1
+spec:
+  description: |
+    On **`cl-ocr-01`** (`ssh cl-ocr-01`; you are in the `docker` group) the caption OCR
+    worker image **`copperleaf/ocr-worker:1`** is built and ready. By default it can call
+    `ptrace`, `mount` and `keyctl`, which it never needs and which an attacker inside the
+    container could use to inspect or tamper with other processes.
+
+    1. Write a custom **seccomp profile** at **`~/ocr-seccomp.json`** that starts from the
+       default action set and additionally blocks `mount`, `ptrace` and `keyctl` (the
+       worker calls none of these; let everything else through the engine's own default
+       profile allows).
+    2. Run the worker as a container named **`ocr-worker`** with that profile applied.
+    3. Prove it works: `docker exec ocr-worker ocr-selftest {{page}}` must still print
+       `page {{page}} processed`.
+    4. Prove it is confined: a `ptrace` attempt from inside the container (`docker exec
+       ocr-worker ocr-selftest --ptrace-probe`) must fail with **EPERM**.
+  objectives:
+    - Write a seccomp profile that denies specific syscalls
+    - Apply a custom seccomp profile to a container
+    - Tell a blocked syscall's errno from a missing capability's
+  params:
+    page:
+      type: int
+      min: 100
+      max: 899
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-ocr-01
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-ocr-01
+      timeoutSec: 300
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        d=$(mktemp -d)
+        cat > "$d/ocr-selftest" <<'PY'
+        #!/usr/bin/env python3
+        import ctypes, sys
+        libc = ctypes.CDLL(None, use_errno=True)
+        if len(sys.argv) > 1 and sys.argv[1] == "--ptrace-probe":
+            PTRACE_TRACEME = 0
+            r = libc.ptrace(PTRACE_TRACEME, 0, 0, 0)
+            if r == -1:
+                err = ctypes.get_errno()
+                print("ptrace blocked errno=%d" % err)
+                sys.exit(1 if err != 1 else 2)
+            print("ptrace allowed")
+            sys.exit(0)
+        page = sys.argv[1] if len(sys.argv) > 1 else "0"
+        print("page %s processed" % page)
+        PY
+        chmod 0755 "$d/ocr-selftest"
+        printf '%s\n' 'FROM python:3.13-alpine' 'COPY ocr-selftest /usr/local/bin/ocr-selftest' 'CMD ["sleep", "infinity"]' > "$d/Dockerfile"
+        docker build -q -t copperleaf/ocr-worker:1 "$d" >/dev/null
+        rm -rf "$d"
+        docker rm -f ocr-worker >/dev/null 2>&1 || true
+        rm -f /home/learner/ocr-seccomp.json
+  checks:
+    - id: profile-shape
+      description: ocr-seccomp.json is valid JSON built on the default action set and blocks the three syscalls
+      type: shell
+      timeoutSec: 60
+      on: cl-ocr-01
+      skills: [containers.runtime-security.kernel-profiles]
+      weight: 2
+      command: |
+        f=/home/learner/ocr-seccomp.json
+        jq -r '[.defaultAction, (.syscalls // [] | map(select(.action == "SCMP_ACT_ERRNO" or .action == "SCMP_ACT_KILL" or .action == "SCMP_ACT_KILL_PROCESS")) | map(.names[]) | flatten | sort | unique | join(","))] | join(" ")' "$f" 2>/dev/null || echo invalid
+      expect: {match: exact, value: "SCMP_ACT_ALLOW keyctl,mount,ptrace"}
+    - id: profile-applied
+      description: ocr-worker runs with the custom seccomp profile
+      type: shell
+      timeoutSec: 60
+      on: cl-ocr-01
+      skills: [containers.runtime-security.kernel-profiles]
+      weight: 1.5
+      command: docker inspect ocr-worker 2>/dev/null | jq -r '[(.[0].HostConfig.SecurityOpt // [])[] | select(test("^seccomp="))] | length'
+      expect: {match: exact, value: "1"}
+    - id: selftest-still-works
+      description: The worker still passes its own self-test
+      type: shell
+      timeoutSec: 60
+      on: cl-ocr-01
+      skills: [containers.runtime-security.kernel-profiles]
+      weight: 2
+      command: docker exec ocr-worker ocr-selftest {{page}} 2>&1 || echo broken
+      expect: {match: exact, value: "page {{page}} processed"}
+    - id: ptrace-denied
+      description: A ptrace attempt inside the container fails with EPERM
+      type: shell
+      timeoutSec: 60
+      on: cl-ocr-01
+      skills: [containers.runtime-security.kernel-profiles]
+      weight: 2.5
+      command: docker exec ocr-worker ocr-selftest --ptrace-probe 2>&1 || true
+      expect: {match: exact, value: "ptrace blocked errno=1"}
+  hints:
+    - title: Start from a real base
+      body: "`docker info --format '{{json .SecurityOptions}}'` and the engine's bundled default profile (its JSON ships with the Moby source and is widely mirrored) give you `defaultAction: SCMP_ACT_ALLOW` is wrong to start from: use `SCMP_ACT_ALLOW` only after listing the three syscalls to deny with `SCMP_ACT_ERRNO`, which is how a minimal deny-list profile is built."
+      cost: 1
+    - title: Shape of a syscall entry
+      body: "`{\"names\": [\"ptrace\"], \"action\": \"SCMP_ACT_ERRNO\", \"errnoRet\": 1}` denies ptrace with EPERM (errno 1) specifically, which is what the self-test checks for."
+      cost: 1
+    - title: Applying the profile
+      body: "`--security-opt seccomp=/path/to/profile.json` on `docker run`. The default profile moves aside entirely; it does not merge with yours, so unrelated syscalls the worker needs must still be allowed by your `defaultAction`."
+      cost: 1
+  misconceptions:
+    - id: kill-process-not-errno
+      description: Denies with SCMP_ACT_KILL instead of SCMP_ACT_ERRNO, so the whole container dies on the first blocked call instead of the call failing.
+      feedback: "SCMP_ACT_KILL terminates the process (or the whole container, with SCMP_ACT_KILL_PROCESS) on the first blocked syscall, so the self-test cannot report EPERM; it never gets the chance. Use SCMP_ACT_ERRNO with errnoRet 1 so the call itself fails and the process continues."
+      expectFail: [ptrace-denied, selftest-still-works]
+      mutation:
+        on: cl-ocr-01
+        as: learner
+        run: |
+          cat > ~/ocr-seccomp.json <<'JSON'
+          { "defaultAction": "SCMP_ACT_ALLOW", "syscalls": [ { "names": ["ptrace", "mount", "keyctl"], "action": "SCMP_ACT_KILL" } ] }
+          JSON
+          docker run -d --name ocr-worker --security-opt seccomp=/home/learner/ocr-seccomp.json copperleaf/ocr-worker:1
+    - id: default-deny-everything
+      description: Sets defaultAction to deny and forgets to allow the syscalls the worker actually needs.
+      feedback: "A profile that denies by default has to explicitly allow every syscall the process uses, which is a much larger job and breaks things that have nothing to do with this task. Keep the default action permissive and deny only the three syscalls named in the ticket."
+      expectFail: [selftest-still-works]
+      mutation:
+        on: cl-ocr-01
+        as: learner
+        run: |
+          cat > ~/ocr-seccomp.json <<'JSON'
+          { "defaultAction": "SCMP_ACT_ERRNO", "syscalls": [ { "names": ["read", "write", "exit", "exit_group"], "action": "SCMP_ACT_ALLOW" } ] }
+          JSON
+          docker run -d --name ocr-worker --security-opt seccomp=/home/learner/ocr-seccomp.json copperleaf/ocr-worker:1 2>/dev/null || true
+  solution:
+    explanation: |
+      Keep the default action permissive (as close as possible to the engine's own
+      default profile) and add one syscalls entry that denies mount, ptrace and keyctl
+      with SCMP_ACT_ERRNO and errno 1 (EPERM), so the blocked calls fail cleanly instead
+      of killing the process.
+    steps:
+      - on: cl-ocr-01
+        as: learner
+        run: |
+          cat > ~/ocr-seccomp.json <<'JSON'
+          {
+            "defaultAction": "SCMP_ACT_ALLOW",
+            "syscalls": [
+              { "names": ["mount", "ptrace", "keyctl"], "action": "SCMP_ACT_ERRNO", "errnoRet": 1 }
+            ]
+          }
+          JSON
+          docker run -d --name ocr-worker --security-opt seccomp=/home/learner/ocr-seccomp.json copperleaf/ocr-worker:1
+          sleep 2
+          docker exec ocr-worker ocr-selftest {{page}}
+          docker exec ocr-worker ocr-selftest --ptrace-probe || true
+    alternatives:
+      - id: python-writer
+        description: Generate the profile with Python instead of a shell heredoc.
+        steps:
+          - on: cl-ocr-01
+            as: learner
+            run: |
+              python3 - <<'PY'
+              import json
+              prof = {"defaultAction": "SCMP_ACT_ALLOW",
+                      "syscalls": [{"names": ["mount", "ptrace", "keyctl"], "action": "SCMP_ACT_ERRNO", "errnoRet": 1}]}
+              json.dump(prof, open("/home/learner/ocr-seccomp.json", "w"))
+              PY
+              docker run -d --name ocr-worker --security-opt seccomp=/home/learner/ocr-seccomp.json copperleaf/ocr-worker:1
+              sleep 2
+              docker exec ocr-worker ocr-selftest {{page}}

@@ -1,0 +1,189 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-hardened-base-migration
+  title: Move the subtitle service onto a hardened minimal base
+  domain: containers
+  frameworks: [cks:supply-chain-security, docker-practitioner:supply-chain, docker-practitioner:build]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [docker, security, hardened-base, sbom, multi-stage]
+  version: 1
+spec:
+  description: |
+    On **`cl-subtitle-02`** (`ssh cl-subtitle-02`) the subtitle service builds from
+    `~/subtitle-src/Dockerfile` onto `python:3.13-alpine`. The platform mirror carries a
+    hardened runtime image at `registry.copperleaf.example:5000/hardened/python:3.13` and
+    its build-time counterpart `registry.copperleaf.example:5000/hardened/python:3.13-dev`
+    (with a shell and package tools, for the build stage only), along with a **signed
+    SBOM** for the hardened runtime at `/srv/hardened/python-3.13.sbom.json` and its
+    signature `/srv/hardened/python-3.13.sbom.json.sig` (verified against
+    `/srv/hardened/signing.pub`).
+
+    1. **Verify** the hardened runtime's SBOM signature before using it.
+    2. **Rebuild** the subtitle service as a multi-stage image: the **dev** hardened
+       image for the build stage, the **plain (non-dev) hardened** image for the final
+       stage.
+    3. The final image must run as a **non-root** user and pass its smoke test:
+       `docker run --rm subtitle:4.2 selftest` must print `subtitle 4.2 ok rev {{rev}}`.
+  objectives:
+    - Verify a base image's SBOM signature before trusting it
+    - Use a hardened base's separate dev and runtime variants correctly
+    - Keep a service passing its smoke test after a base migration
+  params:
+    rev:
+      type: int
+      min: 100
+      max: 899
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-subtitle-02
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-subtitle-02
+      timeoutSec: 420
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        grep -q ' registry.copperleaf.example' /etc/hosts || echo '127.0.0.1 registry.copperleaf.example' >> /etc/hosts
+        docker rm -f registry >/dev/null 2>&1 || true
+        rm -rf /srv/registry /srv/hardened; install -d /srv/registry /srv/hardened
+        docker run -d --name registry --restart always -p 5000:5000 -v /srv/registry:/var/lib/registry registry:3 >/dev/null
+        for i in $(seq 30); do curl -fs http://127.0.0.1:5000/v2/ >/dev/null && break; sleep 1; done
+        for v in "" "-dev"; do
+          d=$(mktemp -d)
+          printf '%s\n' "FROM python:3.13-alpine" "RUN echo 'hardened-python 3.13$v' > /etc/hardened-marker" > "$d/Dockerfile"
+          docker build -q --provenance=false --sbom=false -t "registry.copperleaf.example:5000/hardened/python:3.13$v" "$d" >/dev/null
+          docker push -q "registry.copperleaf.example:5000/hardened/python:3.13$v" >/dev/null
+          rm -rf "$d"
+        done
+        openssl genrsa -out /srv/hardened/signing.key 2048 2>/dev/null
+        openssl rsa -in /srv/hardened/signing.key -pubout -out /srv/hardened/signing.pub 2>/dev/null
+        printf '%s\n' '{"bomFormat":"CycloneDX","specVersion":"1.5","metadata":{"component":{"name":"hardened/python","version":"3.13"}},"components":[{"name":"python","version":"3.13"}]}' > /srv/hardened/python-3.13.sbom.json
+        openssl dgst -sha256 -sign /srv/hardened/signing.key -out /srv/hardened/python-3.13.sbom.json.sig /srv/hardened/python-3.13.sbom.json
+        rm -f /srv/hardened/signing.key
+        chmod 0644 /srv/hardened/python-3.13.sbom.json /srv/hardened/python-3.13.sbom.json.sig /srv/hardened/signing.pub
+        s=/home/learner/subtitle-src
+        install -d -o learner -g learner "$s"
+        cat > "$s/selftest.py" <<'PY'
+        import sys
+        if len(sys.argv) > 1 and sys.argv[1] == "selftest":
+            print("subtitle 4.2 ok rev {{rev}}")
+        PY
+        printf '%s\n' 'FROM python:3.13-alpine' 'COPY selftest.py /app/selftest.py' 'ENTRYPOINT ["python3", "/app/selftest.py"]' > "$s/Dockerfile"
+        chown -R learner:learner "$s"
+  checks:
+    - id: sbom-verified
+      description: The hardened SBOM's signature was checked against the public key
+      type: shell
+      timeoutSec: 60
+      on: cl-subtitle-02
+      skills: [containers.supply-chain.hardened-bases]
+      weight: 2
+      command: |
+        openssl dgst -sha256 -verify /srv/hardened/signing.pub -signature /srv/hardened/python-3.13.sbom.json.sig /srv/hardened/python-3.13.sbom.json >/dev/null 2>&1 && echo verified || echo bad
+      expect: {match: exact, value: verified}
+    - id: hardened-base
+      description: subtitle:4.2 is built on the hardened runtime image (not the plain python base, not the dev variant)
+      type: shell
+      timeoutSec: 60
+      on: cl-subtitle-02
+      skills: [containers.supply-chain.hardened-bases]
+      weight: 3
+      command: |
+        h=$(docker history --no-trunc subtitle:4.2 2>/dev/null | grep -c 'hardened-python 3.13$')
+        d=$(docker history --no-trunc subtitle:4.2 2>/dev/null | grep -c 'hardened-python 3.13-dev')
+        echo "runtime=$h dev-in-final=$d"
+      expect: {match: exact, value: "runtime=1 dev-in-final=0"}
+    - id: non-root
+      description: The final image runs as a non-root user
+      type: shell
+      timeoutSec: 60
+      on: cl-subtitle-02
+      skills: [containers.build.multi-stage]
+      weight: 1.5
+      command: docker image inspect subtitle:4.2 2>/dev/null | jq -r '.[0].Config.User // "root"'
+      expect: {match: regex, value: "^(svc|10020)$"}
+    - id: smoke-test
+      description: The rebuilt image passes its self-test
+      type: shell
+      timeoutSec: 60
+      on: cl-subtitle-02
+      skills: [containers.build.multi-stage]
+      weight: 2
+      command: docker run --rm subtitle:4.2 selftest 2>&1 || echo broken
+      expect: {match: exact, value: "subtitle 4.2 ok rev {{rev}}"}
+  hints:
+    - title: Verify before you trust
+      body: "openssl dgst -sha256 -verify <pub> -signature <sig> <file> checks an RSA signature over the exact bytes of the SBOM. Do this before building from the base it describes."
+      cost: 1
+    - title: Two variants, two jobs
+      body: "The dev variant has the tools a build stage needs; the plain runtime variant is the smallest trusted surface for the final stage. A multi-stage Dockerfile uses `FROM ...-dev AS build` then a fresh `FROM ...` (no -dev) for the final stage."
+      cost: 1
+    - title: Non-root in the final stage
+      body: "Add a dedicated user in the final stage and set `USER` before the `ENTRYPOINT`."
+      cost: 1
+  misconceptions:
+    - id: dev-in-final
+      description: Uses the dev variant for both stages, so the larger, less trusted image ships.
+      feedback: "The dev variant carries extra tooling meant only for building. Ship the plain hardened runtime variant in the final stage; keep -dev only for the build stage."
+      expectFail: [hardened-base]
+      mutation:
+        on: cl-subtitle-02
+        as: learner
+        run: |
+          cd ~/subtitle-src
+          printf '%s\n' 'FROM registry.copperleaf.example:5000/hardened/python:3.13-dev AS build' 'COPY selftest.py /app/selftest.py' \
+            'FROM registry.copperleaf.example:5000/hardened/python:3.13-dev' 'COPY --from=build /app /app' 'RUN adduser -D -u 10020 svc' 'USER svc' 'ENTRYPOINT ["python3", "/app/selftest.py"]' > Dockerfile
+          docker build -q -t subtitle:4.2 .
+    - id: skipped-sbom-verify
+      description: Migrates to the hardened base without checking the SBOM's signature first.
+      feedback: "The hardened image is only as trustworthy as its SBOM's signature. Verify it with the public key before relying on that base."
+      expectFail: [sbom-verified]
+      mutation:
+        on: cl-subtitle-02
+        as: learner
+        run: |
+          cd ~/subtitle-src
+          printf '%s\n' 'FROM registry.copperleaf.example:5000/hardened/python:3.13-dev AS build' 'COPY selftest.py /app/selftest.py' \
+            'FROM registry.copperleaf.example:5000/hardened/python:3.13' 'COPY --from=build /app /app' 'RUN adduser -D -u 10020 svc' 'USER svc' 'ENTRYPOINT ["python3", "/app/selftest.py"]' > Dockerfile
+          docker build -q -t subtitle:4.2 .
+  solution:
+    explanation: |
+      Verify the hardened runtime's SBOM signature with the supplied public key, then
+      build from the dev variant and copy the application into a final stage based on
+      the plain (non-dev) hardened runtime, with a non-root user set.
+    steps:
+      - on: cl-subtitle-02
+        as: learner
+        run: |
+          openssl dgst -sha256 -verify /srv/hardened/signing.pub -signature /srv/hardened/python-3.13.sbom.json.sig /srv/hardened/python-3.13.sbom.json
+          cd ~/subtitle-src
+          printf '%s\n' 'FROM registry.copperleaf.example:5000/hardened/python:3.13-dev AS build' 'COPY selftest.py /app/selftest.py' \
+            'FROM registry.copperleaf.example:5000/hardened/python:3.13' 'COPY --from=build /app /app' 'RUN adduser -D -u 10020 svc' 'USER svc' \
+            'ENTRYPOINT ["python3", "/app/selftest.py"]' > Dockerfile
+          docker build -q -t subtitle:4.2 .
+          docker run --rm subtitle:4.2 selftest
+    alternatives:
+      - id: numeric-uid-final
+        description: Use a numeric UID in the final stage instead of a named user.
+        steps:
+          - on: cl-subtitle-02
+            as: learner
+            run: |
+              openssl dgst -sha256 -verify /srv/hardened/signing.pub -signature /srv/hardened/python-3.13.sbom.json.sig /srv/hardened/python-3.13.sbom.json
+              cd ~/subtitle-src
+              printf '%s\n' 'FROM registry.copperleaf.example:5000/hardened/python:3.13-dev AS build' 'COPY selftest.py /app/selftest.py' \
+                'FROM registry.copperleaf.example:5000/hardened/python:3.13' 'COPY --from=build /app /app' 'USER 10020' \
+                'ENTRYPOINT ["python3", "/app/selftest.py"]' > Dockerfile
+              docker build -q -t subtitle:4.2 .
+              docker run --rm subtitle:4.2 selftest
