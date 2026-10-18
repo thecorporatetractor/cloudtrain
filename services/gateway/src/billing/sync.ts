@@ -77,7 +77,12 @@ async function ensureProduct(stripe: StripeApi, site: SiteConfig, plan: SitePlan
   const name = `${site.brand.name} ${plan.name}`;
   const description = plan.description;
   const metadata = { ct_plan_id: plan.id, ct_kind: plan.kind, ct_per_seat: String(!!plan.perSeat) };
-  const found = (await stripe.products.search(`metadata['ct_plan_id']:'${plan.id}'`)).data.find((p) => p.active) ?? (await stripe.products.search(`metadata['ct_plan_id']:'${plan.id}'`)).data[0];
+  // Search is eventually consistent (a product created seconds ago may not be indexed yet), so a
+  // price that already carries one of the plan's lookup keys names the product first.
+  const keys = Object.values(plan.prices ?? {}).map((p) => p.lookupKey);
+  const viaPrice = keys.length ? (await stripe.prices.list({ lookup_keys: keys, limit: 10 })).data[0]?.product : undefined;
+  const searched = (await stripe.products.search(`metadata['ct_plan_id']:'${plan.id}'`)).data;
+  const found = (viaPrice ? await stripe.products.retrieve(viaPrice).catch(() => undefined) : undefined) ?? searched.find((p) => p.active) ?? searched[0];
   if (found) {
     if (found.name === name && (found.description ?? '') === description && found.active) {
       log({ plan: plan.id, action: 'product.ok', id: found.id });

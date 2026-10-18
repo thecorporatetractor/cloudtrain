@@ -136,6 +136,7 @@ export class StripeApi {
     search: (query: string) => this.request<StripeList<StripeProduct>>('GET', '/v1/products/search', { query, limit: 10 }),
     create: (p: { name: string; description?: string; metadata?: Record<string, string> }, idempotencyKey?: string) => this.request<StripeProduct>('POST', '/v1/products', p, { idempotencyKey }),
     update: (id: string, p: { name?: string; description?: string; metadata?: Record<string, string>; active?: boolean }) => this.request<StripeProduct>('POST', `/v1/products/${encodeURIComponent(id)}`, p),
+    retrieve: (id: string) => this.request<StripeProduct>('GET', `/v1/products/${encodeURIComponent(id)}`),
   };
   prices = {
     list: (p: { lookup_keys?: string[]; product?: string; active?: boolean; limit?: number }) => this.request<StripeList<StripePrice>>('GET', '/v1/prices', p),

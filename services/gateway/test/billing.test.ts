@@ -80,6 +80,10 @@ class FakeStripe {
       this.products.set(p.id, p);
       return remember(p);
     }
+    if (init.method === 'GET' && u.pathname.startsWith('/v1/products/')) {
+      const p = this.products.get(u.pathname.split('/').pop()!);
+      return p ? ok(p) : err(404, 'No such product');
+    }
     if (init.method === 'POST' && u.pathname.startsWith('/v1/products/')) {
       const p = this.products.get(u.pathname.split('/').pop()!)!;
       Object.assign(p, { name: body.name ?? p.name, description: body.description ?? p.description, active: body.active === undefined ? p.active : body.active === 'true' });
