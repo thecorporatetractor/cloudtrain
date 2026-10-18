@@ -282,10 +282,11 @@ export const eventHandlers = [
     sessionEvents.set(s.id, { id: e.id, title: e.title, ...(team ? { teamId: team.id, teamName: team.name } : {}), endsAt: e.endsAt, scoring: e.scoring });
     // Teammates already solved the first questions in the seeded live event.
     if (team) {
+      const board = scoreboard(e, true);
       for (const [entrant, qi, m, , by] of e.solves) {
         if (entrant !== team.id) continue;
         const first = e.solves.filter((x) => x[1] === qi).sort((a, b) => a[2] - b[2])[0]?.[0] === team.id;
-        stateOf(s.id).subs.push({ firstBlood: e.firstBlood && first, checkId: Q[qi]!.id, correct: true, points: Q[qi]!.points, answer: ['203.0.113.77', '48', 'cato', 'python-requests/2.25.0', 'refunds-q3.csv'][qi]!, at: iso(Date.parse(e.startsAt) + m * MIN), by: userRef(by) });
+        stateOf(s.id).subs.push({ firstBlood: e.firstBlood && first, checkId: Q[qi]!.id, correct: true, points: board.solves.find((x) => x.entrantId === team.id && x.questionNumber === qi + 1)?.points ?? Q[qi]!.points, answer: ['203.0.113.77', '48', 'cato', 'python-requests/2.25.0', 'refunds-q3.csv'][qi]!, at: iso(Date.parse(e.startsAt) + m * MIN), by: userRef(by) });
       }
     }
     return HttpResponse.json(s, { status: 201 });
