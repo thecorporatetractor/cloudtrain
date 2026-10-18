@@ -1,0 +1,221 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xct-run-rootless-user
+  title: "Run a rootless container as a specific unprivileged user"
+  domain: containers
+  frameworks: [ex188-aligned:run-containers]
+  difficulty: medium
+  estimatedMinutes: 8
+  tags: [exam, podman, rootless, user, userns]
+  version: 1
+spec:
+  description: |
+    **Host:** `cl-podman-01` (`ssh cl-podman-01`, then `sudo machinectl shell examuser@` to work as `examuser`)
+
+    As `examuser`, run `localhost/static-web` **rootless** as the container **`docs-web`**:
+
+    - publish container port 8080 on host port **8082**;
+    - the process inside must run as **UID 1001**;
+    - set the environment variable **`DOCS_REV={{rev}}`**.
+  objectives:
+    - "Run a rootless container with a chosen in-container UID"
+    - "Publish a port from a rootless container"
+  params:
+    rev:
+      type: int
+      min: 100
+      max: 999
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-podman-01
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+      - name: cl-registry-01
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 1, memoryMiB: 1024}
+        access: [ssh]
+  setup:
+    - on: cl-registry-01
+      timeoutSec: 600
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        R=registry.exam.example; d=/srv/registry
+        grep -q " $R\$" /etc/hosts || echo "127.0.0.1 $R" >> /etc/hosts
+        if [ ! -s $d/certs/ca.crt ]; then
+          rm -rf $d/certs; mkdir -p $d/certs $d/pub $d/data; cd $d/certs
+          openssl req -x509 -newkey rsa:2048 -nodes -keyout ca.key -out ca.crt -days 30 -subj "/CN=Copperleaf exam CA" 2>/dev/null
+          openssl req -newkey rsa:2048 -nodes -keyout server.key -out server.csr -subj "/CN=$R" 2>/dev/null
+          printf 'subjectAltName=DNS:%s,DNS:secure.exam.example,DNS:cl-registry-01\nextendedKeyUsage=serverAuth\n' "$R" > ext.cnf
+          openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out server.crt -days 30 -extfile ext.cnf 2>/dev/null
+          chmod 0644 server.key
+        fi
+        mkdir -p $d/pub $d/data
+        cp -f $d/certs/ca.crt $d/pub/ca.crt
+        install -D -m 0644 $d/certs/ca.crt /etc/docker/certs.d/$R:5443/ca.crt
+        docker inspect cl-registry >/dev/null 2>&1 || docker run -d --name cl-registry --restart always -p 5443:5443 \
+          -v $d/certs:/certs:ro -v $d/data:/var/lib/registry -e REGISTRY_HTTP_ADDR=0.0.0.0:5443 \
+          -e REGISTRY_HTTP_TLS_CERTIFICATE=/certs/server.crt -e REGISTRY_HTTP_TLS_KEY=/certs/server.key registry:3 >/dev/null
+        docker inspect cl-ca-share >/dev/null 2>&1 || docker run -d --name cl-ca-share --restart always -p 8099:8099 \
+          -v $d/pub:/pub:ro busybox:1.37 httpd -f -p 8099 -h /pub >/dev/null
+        for i in $(seq 30); do curl -s --cacert $d/certs/ca.crt -o /dev/null https://$R:5443/v2/ && break; sleep 1; done
+        A='Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json'
+        push_base() {  # <local image> <repo:tag>: republish a preloaded image as a single-platform manifest
+          curl -fsI --cacert $d/certs/ca.crt -H "$A" -o /dev/null "https://$R:5443/v2/${2%%:*}/manifests/${2#*:}" && return 0
+          printf 'FROM %s\n' "$1" | docker build -q -t "$R:5443/$2" - >/dev/null
+          docker push -q "$R:5443/$2" >/dev/null
+        }
+        push_base busybox:1.37 library/busybox:1.37
+        push_base alpine:3.22 library/alpine:3.22
+        push_base python:3.13-alpine library/python:3.13-alpine
+        push_base nginx:1.29-alpine library/nginx:1.29-alpine
+        push_base redis:7.4-alpine library/redis:7.4-alpine
+    - on: cl-podman-01
+      timeoutSec: 1200
+      run: |
+        set -eu
+        U=examuser; R=registry.exam.example
+        rpm -q podman buildah skopeo container-selinux systemd-container >/dev/null 2>&1 || dnf -y -q install podman buildah skopeo container-selinux systemd-container >/dev/null
+        id $U >/dev/null 2>&1 || useradd -m -u 2300 -s /bin/bash $U
+        systemctl start user@$(id -u $U).service
+        for i in $(seq 30); do [ -S /run/user/$(id -u $U)/bus ] && break; sleep 1; done
+        install -d -m 0755 /usr/local/lib/cloudtrain /srv/exam /var/lib/cloudtrain
+        cat > /usr/local/lib/cloudtrain/as-user <<'EOS'
+        #!/bin/sh
+        # run a command as an unprivileged user with a working user session bus
+        u=$1; shift
+        id=$(id -u "$u")
+        if [ ! -S /run/user/$id/bus ]; then
+          systemctl start user@$id.service
+          for i in $(seq 30); do [ -S /run/user/$id/bus ] && break; sleep 1; done
+        fi
+        cd /
+        exec runuser -u "$u" -- env HOME="$(getent passwd "$u" | cut -d: -f6)" XDG_RUNTIME_DIR=/run/user/$id DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$id/bus "$@"
+        EOS
+        chmod 0755 /usr/local/lib/cloudtrain/as-user
+        px() { /usr/local/lib/cloudtrain/as-user $U "$@"; }
+        ip=""
+        for i in $(seq 60); do ip=$(getent ahostsv4 cl-registry-01 | awk 'NR==1{print $1}'); [ -n "$ip" ] && break; sleep 2; done
+        [ -n "$ip" ]
+        sed -i "/ $R\$/d;/ secure.exam.example\$/d" /etc/hosts
+        echo "$ip $R" >> /etc/hosts
+        echo "$ip secure.exam.example" >> /etc/hosts
+        for i in $(seq 60); do curl -fs -o /srv/exam/registry-ca.crt http://$ip:8099/ca.crt && break; sleep 2; done
+        chmod 0644 /srv/exam/registry-ca.crt
+        install -D -m 0644 /srv/exam/registry-ca.crt /etc/containers/certs.d/$R:5443/ca.crt
+        for i in $(seq 30); do curl -s --cacert /srv/exam/registry-ca.crt -o /dev/null https://$R:5443/v2/ && break; sleep 1; done
+        pull() { for t in 1 2 3; do px podman pull -q "$R:5443/$1" >/dev/null 2>&1 && return 0; sleep 3; done; return 1; }
+        D=/home/$U/exam/xct-run-rootless
+        install -d -o $U -g $U /home/$U/exam $D
+        # static-web:latest is seeded only when absent (no VOLUME declared, so it never satisfies the volume task)
+        seed_static_web() {
+          px podman image exists localhost/static-web:latest && return 0
+          s=/var/lib/cloudtrain/seed/static-web; rm -rf $s; install -d -m 0755 $s
+          printf '%s\n' 'FROM registry.exam.example:5443/library/busybox:1.37' 'RUN mkdir -p /srv/www && echo docs-default > /srv/www/index.html' 'EXPOSE 8080' \
+            'CMD ["httpd", "-f", "-p", "8080", "-h", "/srv/www"]' > $s/Containerfile
+          px podman build -q -t localhost/static-web:latest $s >/dev/null
+        }
+        seed_static_web
+        px podman rm -f docs-web >/dev/null 2>&1 || true
+  checks:
+    - id: uid-inside
+      description: "PID 1 inside docs-web runs as UID 1001"
+      type: shell
+      timeoutSec: 120
+      on: cl-podman-01
+      skills: [containers.podman.rootless]
+      weight: 3
+      command: |
+        px() { /usr/local/lib/cloudtrain/as-user examuser "$@"; }
+        px podman start docs-web >/dev/null 2>&1 || true
+        sleep 2
+        px podman exec docs-web awk '/^Uid:/{print $2}' /proc/1/status 2>/dev/null || echo none
+      expect: {match: exact, value: "1001"}
+    - id: env-set
+      description: "DOCS_REV is set in the container"
+      type: shell
+      timeoutSec: 90
+      on: cl-podman-01
+      skills: [containers.podman.rootless]
+      weight: 1.5
+      command: |
+        px() { /usr/local/lib/cloudtrain/as-user examuser "$@"; }
+        px podman inspect docs-web 2>/dev/null | jq -r '(.[0].Config.Env | index("DOCS_REV={{rev}}")) != null' || true
+      expect: {match: exact, value: "true"}
+    - id: port-8082
+      description: "Container port 8080 is published on host port 8082 and answers"
+      type: shell
+      timeoutSec: 120
+      on: cl-podman-01
+      skills: [containers.podman.rootless]
+      weight: 2
+      command: |
+        px() { /usr/local/lib/cloudtrain/as-user examuser "$@"; }
+        px podman start docs-web >/dev/null 2>&1 || true
+        b=$(px podman inspect docs-web 2>/dev/null | jq -r '(.[0].HostConfig.PortBindings["8080/tcp"] // []) | map(.HostPort) | join(",")')
+        c=000
+        for i in $(seq 15); do c=$(curl -s -m 3 -o /dev/null -w '%{http_code}' http://127.0.0.1:8082/); [ "$c" != 000 ] && break; sleep 1; done
+        if [ "$b" = 8082 ] && [ "$c" != 000 ]; then echo serving; else echo "no:$b:$c"; fi
+      expect: {match: exact, value: "serving"}
+    - id: right-image
+      description: "The container runs localhost/static-web"
+      type: shell
+      timeoutSec: 90
+      on: cl-podman-01
+      skills: [containers.podman.rootless]
+      weight: 1
+      command: |
+        px() { /usr/local/lib/cloudtrain/as-user examuser "$@"; }
+        px podman inspect docs-web 2>/dev/null | jq -r '.[0].ImageName | split(":")[0]' || true
+      expect: {match: exact, value: "localhost/static-web"}
+  misconceptions:
+    - id: keep-id
+      description: "Uses --userns=keep-id, which maps examuser's own UID into the container."
+      feedback: "keep-id makes the process run as your host UID, not 1001. Use --user 1001, or keep-id with an explicit uid=1001."
+      expectFail: [uid-inside]
+      mutation:
+        on: cl-podman-01
+        as: admin
+        run: |
+          px() { /usr/local/lib/cloudtrain/as-user examuser "$@"; }
+          px podman run -d --name docs-web --userns=keep-id -e DOCS_REV={{rev}} -p 8082:8080 localhost/static-web >/dev/null
+    - id: root-inside
+      description: "Runs the image with its default user, root inside the user namespace."
+      feedback: "Rootless does not mean the process is non-root inside; root inside maps to examuser outside. Set the in-container user with --user 1001."
+      expectFail: [uid-inside]
+      mutation:
+        on: cl-podman-01
+        as: admin
+        run: |
+          px() { /usr/local/lib/cloudtrain/as-user examuser "$@"; }
+          px podman run -d --name docs-web -e DOCS_REV={{rev}} -p 8082:8080 localhost/static-web >/dev/null
+  solution:
+    explanation: |
+      --user 1001 sets the process UID inside the container; in a rootless container that UID maps to a subordinate UID on the host.
+    steps:
+      - on: cl-podman-01
+        as: learner
+        run: |
+          X() { sudo -u examuser -H env XDG_RUNTIME_DIR=/run/user/$(id -u examuser) DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u examuser)/bus "$@"; }
+          cd /
+          X podman run -d --name docs-web --user 1001 -e DOCS_REV={{rev}} -p 8082:8080 localhost/static-web
+    alternatives:
+      - id: keep-id-uid
+        description: "Use keep-id with an explicit uid."
+        steps:
+          - on: cl-podman-01
+            as: learner
+            run: |
+              X() { sudo -u examuser -H env XDG_RUNTIME_DIR=/run/user/$(id -u examuser) DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u examuser)/bus "$@"; }
+              cd /
+              X podman run -d --name docs-web --userns=keep-id:uid=1001,gid=1001 -e DOCS_REV={{rev}} -p 8082:8080 localhost/static-web

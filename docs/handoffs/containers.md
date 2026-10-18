@@ -238,6 +238,50 @@ Other image wishes already known: binfmt/arm64 bases, vulnerability DB and scann
 How to deploy a label-scoped manager for the testing round is in "How to resume" above:
 `SESSION_SELECTOR=labs.cloudtrain.dev/verify=containers`, one containers verify at a time.
 
+## Round 5, wave 2 (branch `content/containers-r5-w2`): Podman track and the whole Podman exam, 21 labs
+
+Written to the definition of done (status `built`, never run live: every lab is a KubeVirt VM pair, so the vm slot and `labctl verify` wait for the testing round).
+
+| Group | Labs |
+|---|---|
+| Exam tasks (16), so every `sim-containers-podman` pool is at 2x its draw (build 4/2, manage 4/2, run 4/2, multi-container 2/1, troubleshoot 2/1) and the exam is in the CI `labctl exam compile` list | `xct-build-media-containerfile`, `xct-build-entrypoint-cmd`, `xct-build-volume-selinux`, `xct-build-arbitrary-uid`, `xct-manage-registry-push`, `xct-manage-short-names`, `xct-manage-image-archive`, `xct-manage-container-state`, `xct-run-ports-env`, `xct-run-persistent-db`, `xct-run-quadlet-service`, `xct-run-rootless-user`, `xct-multi-pod-api-db`, `xct-multi-kube-play`, `xct-trouble-crashloop`, `xct-trouble-selinux-mount` |
+| Path ctr-podman-track, module ctr-podman-differences (3) | `ctr-podman-docker-differences`, `ctr-podman-rootless-basics`, `ctr-selinux-relabel` |
+| Module ctr-podman-services (2) | `ctr-podman-pod-kube-play`, `ctr-quadlet-reboot` |
+
+Both modules are courses in `pack.yaml` (`ctr-podman-differences`, `ctr-podman-services`). Titles lost their product names (Podman, Quadlet, Kubernetes); the path became "Daemonless containers for Docker users (optional)".
+
+### Runtime design
+
+`podman-vm:5` does not exist (the proposed image entry was removed from the curriculum). Every lab and task has three nodes:
+
+- `cl-podman-01`: `el-vm:10` (AlmaLinux 10.2, SELinux enforcing, 2 vCPU / 2 GiB). Setup runs `dnf -y install podman buildah skopeo container-selinux systemd-container` (offline, from the dnf-local mirror: Podman 5.8.2), creates the rootless user (`examuser` UID 2300 in the exam, `media` in the learning labs), installs the registry CA into `/etc/containers/certs.d/` and writes `/usr/local/lib/cloudtrain/as-user`, the helper the checks use to run `podman` as that user with `XDG_RUNTIME_DIR` and a session bus (`runuser` alone leaves neither). Learners use `sudo machinectl shell examuser@`.
+- `cl-registry-01`: `docker-vm:29` (1 vCPU / 1 GiB). Runs `registry:3` with TLS on 5443 (`registry.exam.example` in the exam, `registry.copperleaf.example` in the labs), republishes the preloaded busybox, alpine, python, nginx and redis images under `library/` (a `FROM`-only build per image, so each is a single-platform manifest), and serves the CA over plain HTTP on 8099 so the podman host can fetch it (public data). The podman host finds it with `getent ahostsv4 cl-registry-01`.
+- Setup order: registry step first. All sixteen exam tasks share byte-identical node blocks; the registry step is idempotent (CA, registry container and base images are created only if absent), so any draw of tasks can run its setups one after another on the same two hosts.
+
+Design decisions to know when verifying:
+
+- Working directories are `/home/examuser/exam/<task>` (not `/home/learner/exam`): the rootless user owns its workspace, and the home-directory SELinux label is what the SELinux tasks need.
+- The exam leaves lingering **off** for `examuser` (the Quadlet task is graded on the learner enabling it). Checks therefore start the user manager themselves (`as-user`) and run `podman start <name> || true` before probing, so everything except the Quadlet task grades configuration, not whether a container survived the reboot.
+- `xct-manage-registry-push` pushes to a second, authenticated registry `secure.exam.example:5444` (same CA, own container `cl-secure-registry`), so the shared registry on 5443 stays anonymous and the CA-trust task has a host:port nothing else touches. The curriculum one-liner says so.
+- `xct-run-quadlet-service` uses container `media-edge` on 18090 (the curriculum had `media-api` on 18080, which `xct-run-ports-env` owns). `xct-build-arbitrary-uid` uses a UID inside the rootless default range (parameterised 20000-60000, the curriculum's 1000650000 is unmappable for a rootless user).
+- Seeds are created only when absent and never satisfy the producing task: `localhost/media-api:1.0` runs as root from `/app` (seeded by ports-env, quadlet, registry-push), `localhost/static-web:latest` has no VOLUME (seeded by rootless-user).
+- PostgreSQL has no offline image: `xct-run-persistent-db` and `xct-multi-pod-api-db` use `redis:7.4-alpine` (noted in the curriculum).
+
+### Unconfirmed until the first live run
+
+- `ctr-podman-pod-kube-play`: `podman kube play` resolving secretKeyRef and secret volumes from a secret created by playing a Secret manifest; the check accepts the plain or base64 password in the stored Secret and requires the pod to answer authenticated.
+- `ctr-quadlet-reboot` / `xct-run-quadlet-service`: the Quadlet generator and a unit with `Restart=always` coming up at boot before the registry VM is reachable (the image is local in the exam task, pulled in the lab).
+- `xct-manage-image-archive`: `podman load` of an `oci-archive` restoring the tag (alternative path), and rootless `--root`/`vfs` loads in `/tmp`.
+- `xct-run-rootless-user` alternative `--userns=keep-id:uid=1001,gid=1001` running the process as 1001.
+- `docker build` of a `FROM`-only Dockerfile on docker-vm resolving the preloaded base offline (same assumption as the verified wave-1 labs).
+- `buildah config --cmd "--daily"` in the `xct-build-entrypoint-cmd` alternative.
+
+No image blockers for the labs themselves; wishlist for the next image work stays: a real `podman-vm:5` would remove the registry companion.
+
+### Verify queue additions
+
+Wave 2 once `el-vm:10` Podman is confirmed (boot one VM, `dnf install podman`, run a rootless container as a new user): the 5 learning labs first (they are the shortest to debug), then the exam tasks. Each verify is three VMs (workstation pod, el-vm, docker-vm) per seed; one containers verify at a time. The exam's reboot pass is not part of `labctl verify`.
+
 ## Open questions for the user
 
 - Drop the legacy Docker-cert overlay path (`dca-legacy` refs stay on the labs until

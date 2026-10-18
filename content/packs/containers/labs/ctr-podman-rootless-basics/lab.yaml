@@ -1,0 +1,229 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-podman-rootless-basics
+  title: "Run the catalogue API rootless"
+  domain: containers
+  frameworks: [ex188-aligned:run-containers]
+  difficulty: easy
+  estimatedMinutes: 15
+  tags: [podman, rootless, uid-map]
+  version: 1
+spec:
+  description: |
+    **Host:** `cl-podman-01` (`ssh cl-podman-01`, then `sudo machinectl shell media@` to work as the unprivileged user `media`)
+
+    The catalogue API image is `registry.copperleaf.example:5443/catalogue-api:2.3` (the registry is
+    already trusted). The account `media` was created for this host with its own UID.
+
+    As `media`, with no root involved:
+
+    1. Run the image as the container **`catalogue-api`**, publishing container port 8080 on host port
+       **8080**.
+    2. Find out which **host UID** root inside a container maps to, and write just that number to
+       `~/uid-map.txt`.
+  objectives:
+    - "Run a container as an unprivileged user"
+    - "Read the user-namespace mapping between container and host UIDs"
+  params:
+    uid:
+      type: int
+      min: 2300
+      max: 2399
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-podman-01
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+      - name: cl-registry-01
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 1, memoryMiB: 1024}
+        access: [ssh]
+  setup:
+    - on: cl-registry-01
+      timeoutSec: 600
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        R=registry.copperleaf.example; d=/srv/registry
+        grep -q " $R\$" /etc/hosts || echo "127.0.0.1 $R" >> /etc/hosts
+        if [ ! -s $d/certs/ca.crt ]; then
+          rm -rf $d/certs; mkdir -p $d/certs $d/pub $d/data; cd $d/certs
+          openssl req -x509 -newkey rsa:2048 -nodes -keyout ca.key -out ca.crt -days 30 -subj "/CN=Copperleaf CA" 2>/dev/null
+          openssl req -newkey rsa:2048 -nodes -keyout server.key -out server.csr -subj "/CN=$R" 2>/dev/null
+          printf 'subjectAltName=DNS:%s,DNS:cl-registry-01\nextendedKeyUsage=serverAuth\n' "$R" > ext.cnf
+          openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out server.crt -days 30 -extfile ext.cnf 2>/dev/null
+          chmod 0644 server.key
+        fi
+        mkdir -p $d/pub $d/data
+        cp -f $d/certs/ca.crt $d/pub/ca.crt
+        install -D -m 0644 $d/certs/ca.crt /etc/docker/certs.d/$R:5443/ca.crt
+        docker inspect cl-registry >/dev/null 2>&1 || docker run -d --name cl-registry --restart always -p 5443:5443 \
+          -v $d/certs:/certs:ro -v $d/data:/var/lib/registry -e REGISTRY_HTTP_ADDR=0.0.0.0:5443 \
+          -e REGISTRY_HTTP_TLS_CERTIFICATE=/certs/server.crt -e REGISTRY_HTTP_TLS_KEY=/certs/server.key registry:3 >/dev/null
+        docker inspect cl-ca-share >/dev/null 2>&1 || docker run -d --name cl-ca-share --restart always -p 8099:8099 \
+          -v $d/pub:/pub:ro busybox:1.37 httpd -f -p 8099 -h /pub >/dev/null
+        for i in $(seq 30); do curl -s --cacert $d/certs/ca.crt -o /dev/null https://$R:5443/v2/ && break; sleep 1; done
+        A='Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json'
+        push_base() {  # <local image> <repo:tag>: republish a preloaded image as a single-platform manifest
+          curl -fsI --cacert $d/certs/ca.crt -H "$A" -o /dev/null "https://$R:5443/v2/${2%%:*}/manifests/${2#*:}" && return 0
+          printf 'FROM %s\n' "$1" | docker build -q -t "$R:5443/$2" - >/dev/null
+          docker push -q "$R:5443/$2" >/dev/null
+        }
+        push_base busybox:1.37 library/busybox:1.37
+        push_base python:3.13-alpine library/python:3.13-alpine
+        push_base nginx:1.29-alpine library/nginx:1.29-alpine
+        push_base redis:7.4-alpine library/redis:7.4-alpine
+        printf 'FROM busybox:1.37\nRUN mkdir /www && echo "catalogue-api 2.3" > /www/index.html\nEXPOSE 8080\nCMD ["httpd", "-f", "-p", "8080", "-h", "/www"]\n' \
+          | docker build -q -t "$R:5443/catalogue-api:2.3" - >/dev/null
+        docker push -q "$R:5443/catalogue-api:2.3" >/dev/null
+    - on: cl-podman-01
+      timeoutSec: 1200
+      run: |
+        set -eu
+        U=media; R=registry.copperleaf.example
+        rpm -q podman buildah skopeo container-selinux systemd-container >/dev/null 2>&1 || dnf -y -q install podman buildah skopeo container-selinux systemd-container >/dev/null
+        id $U >/dev/null 2>&1 || useradd -m -u {{uid}} -s /bin/bash $U
+        loginctl enable-linger $U
+        systemctl start user@$(id -u $U).service
+        for i in $(seq 30); do [ -S /run/user/$(id -u $U)/bus ] && break; sleep 1; done
+        install -d -m 0755 /usr/local/lib/cloudtrain /srv/exam /var/lib/cloudtrain
+        cat > /usr/local/lib/cloudtrain/as-user <<'EOS'
+        #!/bin/sh
+        # run a command as an unprivileged user with a working user session bus
+        u=$1; shift
+        id=$(id -u "$u")
+        if [ ! -S /run/user/$id/bus ]; then
+          systemctl start user@$id.service
+          for i in $(seq 30); do [ -S /run/user/$id/bus ] && break; sleep 1; done
+        fi
+        cd /
+        exec runuser -u "$u" -- env HOME="$(getent passwd "$u" | cut -d: -f6)" XDG_RUNTIME_DIR=/run/user/$id DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$id/bus "$@"
+        EOS
+        chmod 0755 /usr/local/lib/cloudtrain/as-user
+        px() { /usr/local/lib/cloudtrain/as-user $U "$@"; }
+        ip=""
+        for i in $(seq 60); do ip=$(getent ahostsv4 cl-registry-01 | awk 'NR==1{print $1}'); [ -n "$ip" ] && break; sleep 2; done
+        [ -n "$ip" ]
+        sed -i "/ $R\$/d" /etc/hosts
+        echo "$ip $R" >> /etc/hosts
+        for i in $(seq 60); do curl -fs -o /srv/exam/registry-ca.crt http://$ip:8099/ca.crt && break; sleep 2; done
+        chmod 0644 /srv/exam/registry-ca.crt
+        install -D -m 0644 /srv/exam/registry-ca.crt /etc/containers/certs.d/$R:5443/ca.crt
+        for i in $(seq 30); do curl -s --cacert /srv/exam/registry-ca.crt -o /dev/null https://$R:5443/v2/ && break; sleep 1; done
+        pull() { for t in 1 2 3; do px podman pull -q "$R:5443/$1" >/dev/null 2>&1 && return 0; sleep 3; done; return 1; }
+        px podman rm -f catalogue-api >/dev/null 2>&1 || true
+        rm -f /home/$U/uid-map.txt
+        pull catalogue-api:2.3 2>/dev/null || true
+  checks:
+    - id: running-rootless
+      description: "catalogue-api runs in media's own container store"
+      type: shell
+      timeoutSec: 90
+      on: cl-podman-01
+      skills: [containers.podman.rootless]
+      weight: 2
+      command: |
+        px() { /usr/local/lib/cloudtrain/as-user media "$@"; }
+        px podman inspect catalogue-api 2>/dev/null | jq -r '.[0].State.Running' || echo none
+      expect: {match: exact, value: "true"}
+    - id: answers-8080
+      description: "The API answers on host port 8080"
+      type: shell
+      timeoutSec: 60
+      on: cl-podman-01
+      skills: [containers.podman.rootless]
+      weight: 1.5
+      command: |
+        curl -s -m 5 http://127.0.0.1:8080/ || echo none
+      expect: {match: exact, value: "catalogue-api 2.3"}
+    - id: owner-media
+      description: "The container's main process is owned by media on the host"
+      type: shell
+      timeoutSec: 90
+      on: cl-podman-01
+      skills: [containers.podman.rootless]
+      weight: 1
+      command: |
+        px() { /usr/local/lib/cloudtrain/as-user media "$@"; }
+        pid=$(px podman inspect catalogue-api 2>/dev/null | jq -r '.[0].State.Pid // 0')
+        [ "${pid:-0}" -gt 0 ] && ps -o user= -p "$pid" | tr -d ' ' || echo none
+      expect: {match: exact, value: "media"}
+    - id: uid-map-recorded
+      description: "~/uid-map.txt holds the host UID that container root maps to"
+      type: shell
+      timeoutSec: 90
+      on: cl-podman-01
+      skills: [containers.podman.rootless]
+      weight: 2
+      command: |
+        head -1 /home/media/uid-map.txt 2>/dev/null | tr -d ' \n' 
+      expect: {match: exact, value: "{{uid}}"}
+  hints:
+    - title: "Where to read the mapping"
+      body: "Inside any container, /proc/self/uid_map shows ranges as 'container-id host-id length'."
+      cost: 1
+    - title: "A throwaway look"
+      body: "Run a short-lived container and print the file: the first line is the one for container UID 0."
+      command: "podman run --rm registry.copperleaf.example:5443/catalogue-api:2.3 cat /proc/self/uid_map"
+      cost: 1
+    - title: "Which number"
+      body: "The second column of the line starting with 0 is the host UID root maps to. Compare it with id -u."
+      cost: 2
+  misconceptions:
+    - id: rootful-run
+      description: "Runs the container with root's Podman and records 0."
+      feedback: "Run it as media, not with sudo: root's containers are a different store with different mappings. The mapping for a rootless user maps container root to that user's own UID."
+      expectFail: [running-rootless, owner-media, uid-map-recorded]
+      mutation:
+        on: cl-podman-01
+        as: admin
+        run: |
+          podman run -d --name catalogue-api -p 8080:8080 registry.copperleaf.example:5443/catalogue-api:2.3 >/dev/null
+          echo 0 > /home/media/uid-map.txt
+    - id: subuid-start
+      description: "Records the start of media's subordinate UID range."
+      feedback: "The subordinate range in /etc/subuid maps container UIDs 1 and up. Container root (UID 0) maps to the user's own UID."
+      expectFail: [uid-map-recorded]
+      mutation:
+        on: cl-podman-01
+        as: admin
+        run: |
+          px() { /usr/local/lib/cloudtrain/as-user media "$@"; }
+
+          px podman run -d --name catalogue-api -p 8080:8080 registry.copperleaf.example:5443/catalogue-api:2.3 >/dev/null
+          grep '^media:' /etc/subuid | cut -d: -f2 > /home/media/uid-map.txt
+          chown media:media /home/media/uid-map.txt
+  solution:
+    explanation: |
+      A rootless container's user namespace maps container UID 0 to the invoking user's UID; the subordinate range maps the other UIDs.
+    steps:
+      - on: cl-podman-01
+        as: learner
+        run: |
+          X() { sudo -u media -H env XDG_RUNTIME_DIR=/run/user/$(id -u media) DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u media)/bus "$@"; }
+          cd /
+          X podman run -d --name catalogue-api -p 8080:8080 registry.copperleaf.example:5443/catalogue-api:2.3
+          X podman run --rm registry.copperleaf.example:5443/catalogue-api:2.3 cat /proc/self/uid_map
+          id -u media | X tee /home/media/uid-map.txt >/dev/null
+    alternatives:
+      - id: podman-unshare
+        description: "Read the mapping with podman unshare."
+        steps:
+          - on: cl-podman-01
+            as: learner
+            run: |
+              X() { sudo -u media -H env XDG_RUNTIME_DIR=/run/user/$(id -u media) DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u media)/bus "$@"; }
+              cd /
+              X podman run -d --name catalogue-api -p 8080:8080 registry.copperleaf.example:5443/catalogue-api:2.3
+              X podman unshare cat /proc/self/uid_map
+              X sh -c 'id -u > /home/media/uid-map.txt'
