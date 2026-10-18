@@ -1,0 +1,177 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xpe-host-disk-and-mount
+  title: Give the artefact cache its own volume
+  domain: linux
+  frameworks: [ct-platform:linux-foundation]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [exam, capstone, lvm, xfs, fstab, mounts, boot]
+  version: 1
+spec:
+  description: |
+    **Host:** `qm-build-2` (`ssh qm-build-2` from the workstation; you have `sudo`)
+
+    Build artefacts on `qm-build-2` pile up in the root filesystem. Quillmoor Logistics
+    wants them on their own volume. The spare disk **`/dev/disk/by-id/virtio-ct-data2`** is
+    empty. On it:
+
+    - create the volume group **`vgbuild`** and in it a **1 GiB logical volume `{{lv}}`**;
+    - format it **XFS**;
+    - mount it at **`/var/cache/artefacts`** with **`noexec`**, **by UUID in `/etc/fstab`**, so
+      that the mount is there after a reboot. It is also mounted now.
+
+    The grader restarts the host before it checks the persistent parts.
+  objectives:
+    - Build a volume group and logical volume on a spare disk
+    - Format and mount it persistently by UUID with restrictive options
+  params:
+    lv:
+      type: choice
+      values: [lvartefacts, lvcache, lvbuildcache]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-build-1
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["2Gi", "2Gi"]}
+        access: [ssh, console]
+      - name: qm-build-2
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["2Gi", "2Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: qm-build-2
+      timeoutSec: 300
+      run: |
+        set -eu
+        [ "$(readlink -f /dev/disk/by-id/virtio-ct-data1)" = /dev/vdc ]
+        [ "$(readlink -f /dev/disk/by-id/virtio-ct-data2)" = /dev/vdd ]
+        if ! command -v lvcreate >/dev/null 2>&1 || ! command -v mkfs.xfs >/dev/null 2>&1; then
+          # ubuntu-vm: cloud-init re-creates the online ubuntu.sources at first boot; keep apt offline (local repos only)
+          if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then mv /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list.d/ubuntu.sources.cloud-init; rm -rf /var/lib/apt/lists/*; fi
+          apt-get update -q >/dev/null
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -q lvm2 xfsprogs >/dev/null
+        fi
+        umount /var/cache/artefacts 2>/dev/null || true
+        sed -i '\#/var/cache/artefacts#d' /etc/fstab
+        vgremove -qff vgbuild 2>/dev/null || true
+        wipefs -a /dev/vdd >/dev/null
+        mkdir -p /var/cache/artefacts
+        systemctl daemon-reload
+  checks:
+    - id: lv
+      description: vgbuild/{{lv}} is 1 GiB and sits on the spare disk
+      type: shell
+      on: qm-build-2
+      skills: [linux.storage.lvm]
+      weight: 2
+      command: |
+        s=$(lvs --noheadings --units m --nosuffix -o lv_size vgbuild/{{lv}} 2>/dev/null | tr -d ' ' | cut -d. -f1)
+        p=$(for d in $(pvs --noheadings -o pv_name -S vg_name=vgbuild 2>/dev/null); do readlink -f $d; done | sort | paste -sd,)
+        echo "${s:-none} ${p:-none}"
+      expect: {match: exact, value: "1024 /dev/vdd"}
+    - id: xfs
+      description: The logical volume holds an XFS filesystem
+      type: shell
+      on: qm-build-2
+      skills: [linux.storage.filesystems]
+      weight: 1
+      command: blkid -s TYPE -o value /dev/vgbuild/{{lv}} 2>/dev/null || echo none
+      expect: {match: exact, value: xfs}
+    - id: mounted
+      description: It is mounted at /var/cache/artefacts with noexec
+      type: shell
+      on: qm-build-2
+      skills: [linux.storage.mounts]
+      weight: 2
+      command: |
+        s=$(findmnt -n -o SOURCE /var/cache/artefacts 2>/dev/null); o=$(findmnt -n -o OPTIONS /var/cache/artefacts 2>/dev/null)
+        case ",$o," in *,noexec,*) o=noexec;; *) o=exec;; esac
+        [ -n "$s" ] && [ "$(readlink -f "$s")" = "$(readlink -f /dev/vgbuild/{{lv}})" ] && echo "lv $o" || echo "other $o"
+      expect: {match: exact, value: "lv noexec"}
+    - id: fstab
+      description: /etc/fstab mounts it by UUID with noexec and passes findmnt --verify
+      type: shell
+      on: qm-build-2
+      skills: [linux.storage.mounts]
+      weight: 2
+      command: |
+        src=$(findmnt --fstab -n -o SOURCE --mountpoint /var/cache/artefacts 2>/dev/null | head -1)
+        opt=$(findmnt --fstab -n -o OPTIONS --mountpoint /var/cache/artefacts 2>/dev/null | head -1)
+        uuid=$(blkid -s UUID -o value /dev/vgbuild/{{lv}} 2>/dev/null)
+        [ -n "$uuid" ] && [ "$src" = "UUID=$uuid" ] || { echo "fstab-source=${src:-none}"; exit 0; }
+        case ",$opt," in *,noexec,*) ;; *) echo "fstab-options=${opt:-none}"; exit 0;; esac
+        if findmnt --verify --tab-file /etc/fstab 2>&1 | grep -Eq '[1-9][0-9]* (parse )?errors?'; then echo verify-errors; else echo persisted; fi
+      expect: {match: exact, value: persisted}
+  misconceptions:
+    - id: fstab-by-path
+      description: Mounts persistently, but through the device-mapper path instead of the UUID.
+      feedback: "The task asks for the UUID: device names can change, the UUID printed by blkid does not."
+      expectFail: [fstab]
+      mutation:
+        on: qm-build-2
+        as: learner
+        run: |
+          set -e
+          sudo pvcreate -q -y /dev/disk/by-id/virtio-ct-data2
+          sudo vgcreate -q vgbuild /dev/disk/by-id/virtio-ct-data2
+          sudo lvcreate -q -y -n {{lv}} -L 1G vgbuild
+          sudo mkfs.xfs -q /dev/vgbuild/{{lv}}
+          echo '/dev/mapper/vgbuild-{{lv}} /var/cache/artefacts xfs defaults,noexec 0 0' | sudo tee -a /etc/fstab >/dev/null
+          sudo systemctl daemon-reload
+          sudo mount /var/cache/artefacts
+    - id: no-noexec
+      description: Mounts by UUID without the noexec option.
+      feedback: "noexec has to be in the options field of the fstab line and in the live mount; check with findmnt -o OPTIONS."
+      expectFail: [mounted, fstab]
+      mutation:
+        on: qm-build-2
+        as: learner
+        run: |
+          set -e
+          sudo pvcreate -q -y /dev/disk/by-id/virtio-ct-data2
+          sudo vgcreate -q vgbuild /dev/disk/by-id/virtio-ct-data2
+          sudo lvcreate -q -y -n {{lv}} -L 1G vgbuild
+          sudo mkfs.xfs -q /dev/vgbuild/{{lv}}
+          echo "UUID=$(sudo blkid -s UUID -o value /dev/vgbuild/{{lv}}) /var/cache/artefacts xfs defaults 0 0" | sudo tee -a /etc/fstab >/dev/null
+          sudo systemctl daemon-reload
+          sudo mount /var/cache/artefacts
+  solution:
+    explanation: pvcreate, vgcreate and lvcreate -L 1G build the volume; mkfs.xfs formats it; blkid gives the UUID for an fstab line with defaults,noexec; mount reads that line so the live mount has the same options, and findmnt --verify validates the file.
+    steps:
+      - on: qm-build-2
+        as: learner
+        run: |
+          set -e
+          sudo pvcreate -y /dev/disk/by-id/virtio-ct-data2
+          sudo vgcreate vgbuild /dev/disk/by-id/virtio-ct-data2
+          sudo lvcreate -n {{lv}} -L 1G vgbuild
+          sudo mkfs.xfs /dev/vgbuild/{{lv}}
+          echo "UUID=$(sudo blkid -s UUID -o value /dev/vgbuild/{{lv}}) /var/cache/artefacts xfs defaults,noexec 0 0" | sudo tee -a /etc/fstab >/dev/null
+          sudo systemctl daemon-reload
+          sudo mount /var/cache/artefacts
+          sudo findmnt --verify
+    alternatives:
+      - id: extents
+        description: Size the volume in extents (256 x 4 MiB) and mount with mount -a.
+        steps:
+          - on: qm-build-2
+            as: learner
+            run: |
+              set -e
+              sudo pvcreate -y /dev/vdd
+              sudo vgcreate vgbuild /dev/vdd
+              sudo lvcreate -n {{lv}} -l 256 vgbuild
+              sudo mkfs.xfs /dev/vgbuild/{{lv}}
+              U=$(sudo blkid -s UUID -o value /dev/vgbuild/{{lv}})
+              printf 'UUID=%s /var/cache/artefacts xfs noexec 0 0\n' "$U" | sudo tee -a /etc/fstab >/dev/null
+              sudo systemctl daemon-reload
+              sudo mount -a

@@ -1,0 +1,210 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xpe-host-baseline-service
+  title: Bring a build host to the platform baseline
+  domain: linux
+  frameworks: [ct-platform:linux-foundation]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [exam, capstone, permissions, setgid, systemd, journald, boot]
+  version: 1
+spec:
+  description: |
+    **Host:** `qm-build-1` (`ssh qm-build-1` from the workstation; you have `sudo`)
+
+    Quillmoor Logistics' build hosts must meet the platform baseline before they take CI
+    work. On `qm-build-1`:
+
+    - the service account **`svc-ci`** owns **`/srv/ci`**, the group **`{{grp}}`** owns it
+      too, and files created there by any member of the group stay in that group
+      (**setgid**); group members can read and write, others have no access (mode `2770`);
+    - a systemd unit **`ci-agent.service`** runs `/opt/qm/bin/ci-agent` as `svc-ci`, **starts
+      at boot after the network is online**, and is running now;
+    - the **journal is persistent** across reboots.
+
+    The grader restarts the host before it checks the persistent parts, so configuration
+    must be on disk, not only in memory.
+  objectives:
+    - Set owner, group and the setgid bit for a shared directory
+    - Write, enable and order a systemd unit after the network is online
+    - Make the journal persistent
+  params:
+    grp:
+      type: choice
+      values: [ci-team, build-ops, qm-ci]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-build-1
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["2Gi", "2Gi"]}
+        access: [ssh, console]
+      - name: qm-build-2
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["2Gi", "2Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: qm-build-1
+      timeoutSec: 120
+      run: |
+        set -eu
+        systemctl disable --now ci-agent.service >/dev/null 2>&1 || true
+        rm -f /etc/systemd/system/ci-agent.service
+        systemctl daemon-reload
+        groupadd -f {{grp}}
+        getent group svc-ci >/dev/null || groupadd -r svc-ci
+        id svc-ci >/dev/null 2>&1 || useradd -r -M -d /srv/ci -s /usr/sbin/nologin -g svc-ci svc-ci
+        id ci-dev >/dev/null 2>&1 || useradd -m -s /bin/bash ci-dev
+        usermod -aG {{grp}} ci-dev
+        install -d -m 0755 -o root -g root /srv/ci
+        rm -rf /srv/ci/* /srv/ci/.p1 /srv/ci/.p2
+        install -d -m 0755 /opt/qm/bin
+        printf '%s\n' '#!/bin/sh' 'while :; do date +%s > /srv/ci/heartbeat; sleep 2; done' > /opt/qm/bin/ci-agent
+        chmod 0755 /opt/qm/bin/ci-agent
+        # the journal is volatile: a drop-in forces it, so editing journald.conf alone changes nothing
+        mkdir -p /etc/systemd/journald.conf.d
+        rm -f /etc/systemd/journald.conf.d/*.conf
+        printf '# Quillmoor build hosts: keep logs in memory\n[Journal]\nStorage=volatile\n' > /etc/systemd/journald.conf.d/10-qm-volatile.conf
+        rm -rf /var/log/journal
+        systemctl restart systemd-journald
+  checks:
+    - id: perms
+      description: /srv/ci is owned by svc-ci:{{grp}} with mode 2770
+      type: shell
+      on: qm-build-1
+      skills: [linux.files.permissions]
+      weight: 2
+      command: stat -c '%U:%G %a' /srv/ci
+      expect: {match: exact, value: "svc-ci:{{grp}} 2770"}
+    - id: group-sharing
+      description: Files made by svc-ci and by a group member stay in group {{grp}}
+      type: shell
+      on: qm-build-1
+      skills: [linux.files.permissions]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        su -s /bin/sh svc-ci -c 'touch /srv/ci/.p1' 2>/dev/null
+        su - ci-dev -c 'touch /srv/ci/.p2' 2>/dev/null
+        echo "$(stat -c %G /srv/ci/.p1 2>/dev/null || echo none) $(stat -c %G /srv/ci/.p2 2>/dev/null || echo none)"
+        rm -f /srv/ci/.p1 /srv/ci/.p2
+      expect: {match: exact, value: "{{grp}} {{grp}}"}
+    - id: unit-config
+      description: ci-agent.service runs as svc-ci, ordered after and wanting network-online.target
+      type: shell
+      on: qm-build-1
+      skills: [linux.systemd.unit-editing]
+      weight: 2
+      command: |
+        a=$(systemctl show -P After ci-agent.service); w=$(systemctl show -P Wants ci-agent.service)
+        u=$(systemctl show -P User ci-agent.service); x=$(systemctl show -P ExecStart ci-agent.service)
+        case "$a" in *network-online.target*) a=after;; *) a=no-after;; esac
+        case "$w" in *network-online.target*) w=wants;; *) w=no-wants;; esac
+        case "$x" in *path=/opt/qm/bin/ci-agent*) x=exec;; *) x=no-exec;; esac
+        echo "$a $w $u $x"
+      expect: {match: exact, value: "after wants svc-ci exec"}
+    - id: enabled-active
+      description: ci-agent.service is enabled for boot and running
+      type: shell
+      on: qm-build-1
+      skills: [linux.systemd.unit-editing]
+      weight: 2
+      command: echo "$(systemctl is-enabled ci-agent.service 2>/dev/null) $(systemctl is-active ci-agent.service 2>/dev/null)"
+      expect: {match: exact, value: "enabled active"}
+    - id: agent-writes
+      description: The agent writes its heartbeat into /srv/ci as svc-ci in group {{grp}}
+      type: shell
+      on: qm-build-1
+      skills: [linux.files.permissions]
+      weight: 1
+      timeoutSec: 20
+      command: |
+        sleep 3
+        age=$(( $(date +%s) - $(stat -c %Y /srv/ci/heartbeat 2>/dev/null || echo 0) ))
+        [ "$age" -lt 15 ] && echo "$(stat -c '%U:%G' /srv/ci/heartbeat)" || echo "stale"
+      expect: {match: exact, value: "svc-ci:{{grp}}"}
+    - id: journal-config
+      description: The effective journald configuration sets Storage=persistent
+      type: shell
+      on: qm-build-1
+      skills: [linux.systemd.journal]
+      weight: 2
+      command: |
+        systemd-analyze cat-config systemd/journald.conf 2>/dev/null | sed 's/[;#].*//' | awk -F= '$1 ~ /^[ \t]*Storage[ \t]*$/ {v=$2; gsub(/[ \t]/, "", v); last=v} END {print (last == "" ? "unset" : last)}'
+      expect: {match: exact, value: persistent}
+    - id: journal-dir
+      description: The persistent journal directory exists
+      type: shell
+      on: qm-build-1
+      skills: [linux.systemd.journal]
+      weight: 1
+      command: test -d /var/log/journal && echo present || echo absent
+      expect: {match: exact, value: present}
+  misconceptions:
+    - id: no-setgid
+      description: Sets owner and group with mode 770 but without the setgid bit.
+      feedback: "Without the setgid bit new files get the creator's primary group, so group members stop sharing. Use chmod 2770 (or g+s)."
+      expectFail: [perms, group-sharing, agent-writes]
+      mutation:
+        on: qm-build-1
+        as: learner
+        run: |
+          set -e
+          sudo chown svc-ci:{{grp}} /srv/ci; sudo chmod 770 /srv/ci
+          printf '[Unit]\nDescription=Quillmoor CI agent\nWants=network-online.target\nAfter=network-online.target\n[Service]\nUser=svc-ci\nExecStart=/opt/qm/bin/ci-agent\nRestart=on-failure\n[Install]\nWantedBy=multi-user.target\n' | sudo tee /etc/systemd/system/ci-agent.service >/dev/null
+          sudo systemctl daemon-reload; sudo systemctl enable --now ci-agent.service
+          printf '[Journal]\nStorage=persistent\n' | sudo tee /etc/systemd/journald.conf.d/20-persistent.conf >/dev/null
+          sudo systemctl restart systemd-journald
+          sleep 3
+    - id: journal-shadowed
+      description: Edits journald.conf, which the existing drop-in overrides.
+      feedback: "Drop-ins in /etc/systemd/journald.conf.d override journald.conf. Check systemd-analyze cat-config systemd/journald.conf for the effective value."
+      expectFail: [journal-config, journal-dir]
+      mutation:
+        on: qm-build-1
+        as: learner
+        run: |
+          set -e
+          sudo chown svc-ci:{{grp}} /srv/ci; sudo chmod 2770 /srv/ci
+          printf '[Unit]\nDescription=Quillmoor CI agent\nWants=network-online.target\nAfter=network-online.target\n[Service]\nUser=svc-ci\nExecStart=/opt/qm/bin/ci-agent\nRestart=on-failure\n[Install]\nWantedBy=multi-user.target\n' | sudo tee /etc/systemd/system/ci-agent.service >/dev/null
+          sudo systemctl daemon-reload; sudo systemctl enable --now ci-agent.service
+          sudo sed -i 's/^#\?Storage=.*/Storage=persistent/' /etc/systemd/journald.conf
+          sudo systemctl restart systemd-journald
+          sleep 3
+  solution:
+    explanation: chown and chmod 2770 give svc-ci and the group a shared setgid directory. A unit with Wants= and After=network-online.target, User=svc-ci and WantedBy=multi-user.target is enabled and started. The volatile drop-in must be replaced (or overridden by a later one) and journald restarted so that /var/log/journal exists.
+    steps:
+      - on: qm-build-1
+        as: learner
+        run: |
+          set -e
+          sudo chown svc-ci:{{grp}} /srv/ci
+          sudo chmod 2770 /srv/ci
+          printf '[Unit]\nDescription=Quillmoor CI agent\nWants=network-online.target\nAfter=network-online.target\n[Service]\nUser=svc-ci\nExecStart=/opt/qm/bin/ci-agent\nRestart=on-failure\n[Install]\nWantedBy=multi-user.target\n' | sudo tee /etc/systemd/system/ci-agent.service >/dev/null
+          sudo systemctl daemon-reload
+          sudo systemctl enable --now ci-agent.service
+          printf '[Journal]\nStorage=persistent\n' | sudo tee /etc/systemd/journald.conf.d/20-persistent.conf >/dev/null
+          sudo systemctl restart systemd-journald
+          systemd-analyze cat-config systemd/journald.conf | grep -i '^Storage'
+    alternatives:
+      - id: edit-existing-dropin
+        description: Symbolic modes for the directory, and the existing journald drop-in edited in place.
+        steps:
+          - on: qm-build-1
+            as: learner
+            run: |
+              set -e
+              sudo chown svc-ci:{{grp}} /srv/ci
+              sudo chmod u=rwx,g=rwxs,o= /srv/ci
+              printf '[Unit]\nDescription=Quillmoor CI agent\nWants=network-online.target\nAfter=network-online.target\n[Service]\nUser=svc-ci\nExecStart=/opt/qm/bin/ci-agent\n[Install]\nWantedBy=multi-user.target\n' | sudo tee /etc/systemd/system/ci-agent.service >/dev/null
+              sudo systemctl daemon-reload
+              sudo systemctl enable --now ci-agent.service
+              sudo sed -i 's/^Storage=.*/Storage=persistent/' /etc/systemd/journald.conf.d/10-qm-volatile.conf
+              sudo systemctl restart systemd-journald

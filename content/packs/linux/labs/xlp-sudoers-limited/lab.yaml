@@ -1,0 +1,119 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xlp-sudoers-limited
+  title: Grant one command via sudo
+  domain: linux
+  frameworks: [linuxplus:security]
+  difficulty: easy
+  estimatedMinutes: 4
+  tags: [exam, sudo, sudoers, least-privilege]
+  version: 1
+spec:
+  description: |
+    **Host:** `tr-lp-01` (a shell is open on it; you have `sudo`)
+
+    The operations clerk **`{{user}}`** needs to run **`{{cmd}}`** as root, and nothing
+    else, without being asked for a password. Grant exactly that in a **drop-in file
+    under `/etc/sudoers.d/`**, and validate it: a broken sudoers file locks everyone
+    out of `sudo`. Do not change `/etc/sudoers` itself.
+  objectives:
+    - Write a least-privilege sudoers drop-in
+    - Validate sudoers syntax before relying on it
+  params:
+    user:
+      type: choice
+      values: [ada, bram, cora]
+    cmd:
+      type: choice
+      values: [/usr/bin/tail, /usr/bin/head, /usr/bin/wc]
+  topology:
+    entry: tr-lp-01
+    nodes:
+      - name: tr-lp-01
+        driver: container
+        image: el-lab:10
+        access: [shell]
+        learnerSudo: true
+  setup:
+    - on: tr-lp-01
+      run: |
+        set -eu
+        echo 'learner ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/learner && chmod 0440 /etc/sudoers.d/learner
+        for u in ada bram cora; do id $u >/dev/null 2>&1 || useradd -m -s /bin/bash $u; done
+        rm -f /etc/sudoers.d/*-tr-clerk /etc/sudoers.d/tr-clerk*
+        visudo -cq
+  checks:
+    - id: rule
+      description: "{{user}} may run only {{cmd}} as root, without a password"
+      type: shell
+      on: tr-lp-01
+      skills: [linux.users.sudo]
+      weight: 2
+      command: |
+        sudo -l -U {{user}} 2>/dev/null | sed -n '/may run the following commands/,$p' | tail -n +2 \
+          | sed 's/^ *([^)]*) *//; s/^NOPASSWD: *//; s/ *$//' | paste -sd,
+      expect: {match: exact, value: "{{cmd}}"}
+    - id: works
+      description: "{{user}} can run {{cmd}} through sudo, but not another command such as id"
+      type: shell
+      on: tr-lp-01
+      skills: [linux.users.sudo]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        a=denied; b=allowed
+        su - {{user}} -c 'sudo -n {{cmd}} --version >/dev/null 2>&1' && a=ok
+        su - {{user}} -c 'sudo -n /usr/bin/id >/dev/null 2>&1' || b=denied
+        echo "$a $b"
+      expect: {match: exact, value: "ok denied"}
+    - id: dropin-valid
+      description: The grant lives in a drop-in under /etc/sudoers.d and all sudoers files are valid
+      type: shell
+      on: tr-lp-01
+      skills: [linux.users.sudo]
+      weight: 1
+      command: |
+        visudo -c >/dev/null 2>&1 || { echo invalid; exit 0; }
+        grep -qE '^[^#]*\b{{user}}\b' /etc/sudoers 2>/dev/null && { echo in-main-file; exit 0; }
+        grep -lE '^[^#]*\b{{user}}\b' /etc/sudoers.d/* 2>/dev/null | grep -qv '/etc/sudoers.d/learner$' && echo ok || echo no-dropin
+      expect: {match: exact, value: ok}
+  misconceptions:
+    - id: all-commands
+      description: Grants the clerk every command.
+      feedback: "ALL lets the clerk run anything as root. Name only the one command, by full path."
+      expectFail: [rule, works]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        run: |
+          echo '{{user}} ALL=(root) NOPASSWD: ALL' | sudo tee /etc/sudoers.d/50-tr-clerk >/dev/null && sudo chmod 0440 /etc/sudoers.d/50-tr-clerk
+    - id: broken-syntax
+      description: Writes the drop-in with a syntax error and never validates it.
+      feedback: "A syntax error disables sudo for everyone. Edit with visudo -f /etc/sudoers.d/NAME (or check with visudo -cf) before leaving it in place."
+      expectFail: [rule, works, dropin-valid]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        run: echo '{{user}} ALL=(root) NOPASSWD {{cmd}}' | sudo tee /etc/sudoers.d/50-tr-clerk >/dev/null && sudo chmod 0440 /etc/sudoers.d/50-tr-clerk
+  solution:
+    explanation: A single user rule with the full command path and the NOPASSWD tag in its own file under /etc/sudoers.d, mode 0440 and checked with visudo -c.
+    steps:
+      - on: tr-lp-01
+        as: learner
+        run: |
+          set -e
+          echo '{{user}} ALL=(root) NOPASSWD: {{cmd}}' | sudo tee /etc/sudoers.d/50-tr-clerk >/dev/null
+          sudo chmod 0440 /etc/sudoers.d/50-tr-clerk
+          sudo visudo -c
+    alternatives:
+      - id: cmnd-alias
+        description: Name the command in a Cmnd_Alias and grant the alias.
+        steps:
+          - on: tr-lp-01
+            as: learner
+            run: |
+              set -e
+              printf 'Cmnd_Alias CLERK_CMD = {{cmd}}\n{{user}} ALL=(root) NOPASSWD: CLERK_CMD\n' | sudo tee /etc/sudoers.d/50-tr-clerk >/dev/null
+              sudo chmod 0440 /etc/sudoers.d/50-tr-clerk
+              sudo visudo -c

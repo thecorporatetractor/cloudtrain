@@ -1,0 +1,151 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: fix-port-conflict
+  title: Fix a service that cannot bind its port
+  domain: linux
+  frameworks: [linuxplus:troubleshooting]
+  difficulty: easy
+  estimatedMinutes: 10
+  tags: [ports, ss, systemd, troubleshooting]
+  version: 1
+spec:
+  description: |
+    The passenger information API **`pis-api.service`** on **`tr-pis-01`** (`ssh tr-pis-01`;
+    you have `sudo`) will not start after the weekend maintenance. Its log says it
+    cannot use **TCP port {{port}}** because the address is already in use.
+
+    Find out which process holds the port and which service owns it. Stop that service and
+    **disable it** so that it does not come back, then start `pis-api` cleanly: it must
+    answer on `http://localhost:{{port}}/` and be enabled for boot.
+  objectives:
+    - Find the process listening on a port with ss
+    - Trace the process to its systemd unit
+    - Stop and disable the intruder, then start the intended service
+  params:
+    port:
+      type: choice
+      values: ["8080", "8081", "8090"]
+    stray:
+      type: choice
+      values: [pis-legacy, pis-mirror, pis-preview]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-pis-01
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536}
+        access: [ssh, console]
+  setup:
+    - on: tr-pis-01
+      timeoutSec: 90
+      run: |
+        set -eu
+        for u in pis-legacy pis-mirror pis-preview pis-api; do
+          systemctl disable --now $u.service >/dev/null 2>&1 || true
+          systemctl unmask $u.service >/dev/null 2>&1 || true
+          rm -f /etc/systemd/system/$u.service /usr/lib/systemd/system/$u.service
+        done
+        mkdir -p /srv/pis-api /srv/{{stray}}
+        echo "pis-api {{port}}" > /srv/pis-api/index.html
+        echo "{{stray}} old content" > /srv/{{stray}}/index.html
+        printf '[Unit]\nDescription=Tallowmere old passenger display feed ({{stray}})\n[Service]\nExecStart=/usr/bin/python3 -m http.server {{port}} --directory /srv/{{stray}}\nRestart=always\nRestartSec=2\n[Install]\nWantedBy=multi-user.target\n' > /usr/lib/systemd/system/{{stray}}.service
+        printf '[Unit]\nDescription=Tallowmere passenger information API\n[Service]\nExecStart=/usr/bin/python3 -m http.server {{port}} --directory /srv/pis-api\n[Install]\nWantedBy=multi-user.target\n' > /etc/systemd/system/pis-api.service
+        systemctl daemon-reload
+        systemctl enable --now {{stray}}.service >/dev/null 2>&1
+        sleep 1
+        systemctl enable pis-api.service >/dev/null 2>&1
+        systemctl start pis-api.service >/dev/null 2>&1 || true
+        sleep 1
+        [ "$(systemctl is-active pis-api.service)" != active ]
+  checks:
+    - id: api-serves
+      description: pis-api answers on port {{port}}
+      type: shell
+      on: tr-pis-01
+      skills: [linux.net.troubleshooting, linux.systemd.units]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        r=$(curl -4 -s -m 5 http://localhost:{{port}}/); echo "${r:-none}"
+      expect: {match: exact, value: "pis-api {{port}}"}
+    - id: api-unit
+      description: pis-api.service is running and enabled
+      type: shell
+      on: tr-pis-01
+      skills: [linux.systemd.units]
+      weight: 1
+      command: echo "$(systemctl is-active pis-api.service) $(systemctl is-enabled pis-api.service)"
+      expect: {match: exact, value: "active enabled"}
+    - id: stray-gone
+      description: "{{stray}}.service is stopped and will not start at boot"
+      type: shell
+      on: tr-pis-01
+      skills: [linux.systemd.units, linux.net.troubleshooting]
+      weight: 2
+      command: |
+        a=$(systemctl is-active {{stray}}.service 2>/dev/null); e=$(systemctl is-enabled {{stray}}.service 2>/dev/null)
+        case "$e" in disabled|masked|masked-runtime) e=off;; *) e=on;; esac
+        [ "$a" != active ] && [ "$a" != activating ] && echo "$e" | grep -q off && echo gone || echo "active=$a enabled=$e"
+      expect: {match: exact, value: gone}
+  hints:
+    - title: Who is listening
+      command: sudo ss -ltnp 'sport = :{{port}}'
+      body: "ss -ltnp lists listening TCP sockets with the owning process (name and PID)."
+      cost: 0
+    - title: From the process to the unit
+      command: systemctl status <PID>
+      body: "systemctl status accepts a PID and prints the unit the process belongs to; ps -o unit= -p PID or the cgroup line works as well."
+      cost: 1
+    - title: Stopping is not enough
+      body: "The old service has Restart=always and is enabled: stop it and disable it (systemctl disable --now), then start pis-api."
+      cost: 2
+  misconceptions:
+    - id: stop-only
+      description: Stops the old service but leaves it enabled.
+      feedback: "After a reboot the old service would start first and take the port again. Disable it as well (systemctl disable --now)."
+      expectFail: [stray-gone]
+      mutation:
+        on: tr-pis-01
+        as: learner
+        run: |
+          sudo systemctl stop {{stray}}.service
+          sudo systemctl start pis-api.service
+    - id: moves-the-api
+      description: Changes the port of pis-api instead of removing the intruder.
+      feedback: "Clients expect pis-api on port {{port}}. The conflict is caused by the old service that should not run at all."
+      expectFail: [api-serves, stray-gone]
+      mutation:
+        on: tr-pis-01
+        as: learner
+        run: |
+          sudo sed -i 's/http.server {{port}}/http.server 1{{port}}/' /etc/systemd/system/pis-api.service
+          sudo systemctl daemon-reload
+          sudo systemctl start pis-api.service
+  solution:
+    explanation: ss -ltnp shows a python process on the port that belongs to the old service unit. Disable and stop that unit, then start pis-api, which can now bind the port.
+    steps:
+      - on: tr-pis-01
+        as: learner
+        run: |
+          set -e
+          sudo ss -ltnp 'sport = :{{port}}'
+          journalctl -u pis-api --no-pager | tail -3
+          sudo systemctl disable --now {{stray}}.service
+          sudo systemctl start pis-api.service
+          curl -s http://localhost:{{port}}/
+    alternatives:
+      - id: mask
+        description: Mask the old service instead of disabling it.
+        steps:
+          - on: tr-pis-01
+            as: learner
+            run: |
+              set -e
+              sudo systemctl mask --now {{stray}}.service
+              sudo systemctl start pis-api.service

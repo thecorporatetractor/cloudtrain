@@ -1,0 +1,151 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xlp-fix-default-route
+  title: Restore connectivity to the outside subnet
+  domain: linux
+  frameworks: [linuxplus:troubleshooting]
+  difficulty: medium
+  estimatedMinutes: 5
+  tags: [exam, routing, ip-route, troubleshooting]
+  version: 1
+spec:
+  description: |
+    **Host:** `tr-lp-01` (`ssh tr-lp-01`, then `sudo -i`)
+
+    `tr-lp-01` can no longer reach the depot network **`10.91.{{o}}.0/24`**. Its router
+    for that network is **10.64.20.2** (reachable on the interface `v-rem`). Two
+    monitoring endpoints must answer on port 8080 again: **10.91.{{o}}.10** and
+    **10.91.{{o}}.200**. Find out why the traffic does not get through and fix the host's
+    routing. Do not change the host's default route or `eth0`: your SSH session depends on
+    them.
+  objectives:
+    - Read the routing table and ask the kernel for the path with ip route get
+    - Remove broken routes and add the correct one
+  params:
+    o:
+      type: choice
+      values: ["31", "32", "33"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-lp-01
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536}
+        access: [ssh, console]
+  setup:
+    - on: tr-lp-01
+      timeoutSec: 120
+      run: |
+        set -eu
+        install -d -m 0700 /var/lib/cloudtrain
+        ROLE=rem; NET=10.64.20
+        for u in tr-rem-10 tr-rem-200; do systemctl stop $u.service 2>/dev/null || true; systemctl reset-failed $u.service 2>/dev/null || true; done
+        ip netns del tr-$ROLE 2>/dev/null || true
+        ip link del v-$ROLE 2>/dev/null || true
+        ip netns add tr-$ROLE
+        ip link add v-$ROLE type veth peer name v-$ROLE-p
+        ip link set v-$ROLE-p netns tr-$ROLE
+        ip addr add $NET.1/24 dev v-$ROLE
+        ip link set v-$ROLE up
+        ip -n tr-$ROLE addr add $NET.2/24 dev v-$ROLE-p
+        ip -n tr-$ROLE link set v-$ROLE-p up
+        ip -n tr-$ROLE link set lo up
+        # the depot network lives on a dummy interface in the namespace
+        ip -n tr-$ROLE link add rem0 type dummy
+        ip -n tr-$ROLE addr add 10.91.{{o}}.10/24 dev rem0
+        ip -n tr-$ROLE addr add 10.91.{{o}}.200/24 dev rem0
+        ip -n tr-$ROLE link set rem0 up
+        for h in 10 200; do
+          mkdir -p /srv/tr-rem-$h; echo "rem-$h" > /srv/tr-rem-$h/index.html
+          systemd-run -q --unit tr-rem-$h --property=NetworkNamespacePath=/run/netns/tr-$ROLE --property=Restart=always \
+            /usr/bin/python3 -m http.server 8080 --bind 10.91.{{o}}.$h --directory /srv/tr-rem-$h
+        done
+        # the faults: a route through a gateway that does not exist, and a blackhole for one endpoint
+        ip route add 10.91.{{o}}.0/24 via 10.64.20.9 dev v-rem onlink
+        for o in 31 32 33; do ip route del blackhole 10.91.$o.200/32 2>/dev/null || true; done
+        ip route add blackhole 10.91.{{o}}.200/32
+        sleep 1
+  checks:
+    - id: reach-10
+      description: 10.91.{{o}}.10 answers on port 8080
+      type: shell
+      on: tr-lp-01
+      skills: [linux.net.ip-config, linux.net.troubleshooting]
+      weight: 2
+      timeoutSec: 20
+      command: |
+        r=$(curl -4 -s -m 5 http://10.91.{{o}}.10:8080/); echo "${r:-none}"
+      expect: {match: exact, value: rem-10}
+    - id: reach-200
+      description: 10.91.{{o}}.200 answers on port 8080
+      type: shell
+      on: tr-lp-01
+      skills: [linux.net.ip-config, linux.net.troubleshooting]
+      weight: 2
+      timeoutSec: 20
+      command: |
+        r=$(curl -4 -s -m 5 http://10.91.{{o}}.200:8080/); echo "${r:-none}"
+      expect: {match: exact, value: rem-200}
+    - id: path-via-router
+      description: The depot network is routed through 10.64.20.2 on v-rem
+      type: shell
+      on: tr-lp-01
+      skills: [linux.net.ip-config]
+      weight: 1
+      command: |
+        ip -4 route get 10.91.{{o}}.10 2>/dev/null | awk '{for (i = 1; i <= NF; i++) { if ($i == "via") v = $(i + 1); if ($i == "dev") d = $(i + 1) }} END {print v, d}'
+      expect: {match: exact, value: "10.64.20.2 v-rem"}
+    - id: default-kept
+      description: The default route still goes through eth0
+      type: shell
+      on: tr-lp-01
+      skills: [linux.net.ip-config]
+      weight: 1
+      command: ip -4 route show default | awk '{for (i = 1; i <= NF; i++) if ($i == "dev") print $(i + 1)}' | sort -u | paste -sd,
+      expect: {match: exact, value: eth0}
+  misconceptions:
+    - id: bad-gateway-only
+      description: Replaces the wrong gateway but forgets the blackhole route.
+      feedback: "ip route get 10.91.{{o}}.200 shows a blackhole entry that only matches that address; a more specific route wins over the /24."
+      expectFail: [reach-200]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        run: sudo ip route replace 10.91.{{o}}.0/24 via 10.64.20.2 dev v-rem
+    - id: blackhole-only
+      description: Removes the blackhole route but leaves the wrong gateway.
+      feedback: "The /24 route still points at 10.64.20.9, which nobody answers for; the gateway should be the router 10.64.20.2."
+      expectFail: [reach-10, reach-200, path-via-router]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        run: sudo ip route del blackhole 10.91.{{o}}.200/32
+  solution:
+    explanation: ip route get shows the path the kernel chooses. The /24 uses a gateway that does not exist, and the .200 address matches a blackhole route. Replace the gateway with the router 10.64.20.2 and delete the blackhole.
+    steps:
+      - on: tr-lp-01
+        as: learner
+        run: |
+          set -e
+          ip route get 10.91.{{o}}.200 || true
+          sudo ip route replace 10.91.{{o}}.0/24 via 10.64.20.2 dev v-rem
+          sudo ip route del blackhole 10.91.{{o}}.200/32
+          curl -s -m 5 http://10.91.{{o}}.10:8080/
+          curl -s -m 5 http://10.91.{{o}}.200:8080/
+    alternatives:
+      - id: delete-and-add
+        description: Delete both broken routes and add a fresh route to the subnet.
+        steps:
+          - on: tr-lp-01
+            as: learner
+            run: |
+              set -e
+              sudo ip route flush 10.91.{{o}}.0/24
+              sudo ip route flush 10.91.{{o}}.200/32
+              sudo ip route add 10.91.{{o}}.0/24 via 10.64.20.2 dev v-rem
