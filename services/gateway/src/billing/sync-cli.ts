@@ -30,8 +30,10 @@ async function main() {
 }
 
 main().catch((e: unknown) => {
-  // Stripe's error text and our own configuration messages; never a value from the environment.
-  const text = e instanceof StripeError ? `Stripe ${e.status} ${e.code ?? ''}: ${e.message}` : e instanceof Error ? e.message : 'stripe:sync failed';
-  console.error(text.replace(/[sr]k_(test|live)_[A-Za-z0-9]+/g, '[redacted]'));
+  // Fixed texts only: nothing read from the environment can end up in the output.
+  if (e instanceof StripeError) console.error(`stripe:sync failed: Stripe answered ${e.status}${e.code ? ` (${e.code})` : ''}`);
+  else if (e instanceof Error && /STRIPE_SECRET_KEY|STRIPE_MODE/.test(e.message)) console.error('stripe:sync refused: STRIPE_SECRET_KEY must be a test-mode key and STRIPE_MODE must be test');
+  else if (e instanceof Error && /site config/.test(e.message)) console.error('stripe:sync failed: the site configuration is invalid (run lab-verify for details)');
+  else console.error('stripe:sync failed');
   process.exit(1);
 });

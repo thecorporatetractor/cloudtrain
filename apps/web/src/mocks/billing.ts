@@ -42,8 +42,8 @@ const unauthenticated = () => HttpResponse.json({ error: 'Not signed in', code: 
 
 function summary(scope: BillingScope, orgId: string, userId: string | null): BillingSummary {
   const s = read();
-  const scope = scopeOf(orgId, userId);
-  const sub = s.subscriptions[scope];
+  const sk = scopeOf(orgId, userId);
+  const sub = s.subscriptions[sk];
   const active = sub && (sub.status === 'active' || sub.status === 'trialing' || sub.status === 'past_due');
   const plan = active ? planState(plans().find((p) => p.id === sub.planId), 'subscription', sub.updatedAt) : planState(freePlan(), 'default');
   return {
@@ -52,7 +52,7 @@ function summary(scope: BillingScope, orgId: string, userId: string | null): Bil
     scope,
     ...(plan ? { plan } : {}),
     ...(sub ? { subscription: stripLookup(sub) } : {}),
-    portalAvailable: !!s.customers[scope],
+    portalAvailable: !!s.customers[sk],
     plans: plans().filter((p) => (scope === 'org' ? p.kind === 'organisation' : p.kind === 'individual')),
     currency: site.plans?.currency ?? 'EUR',
     placeholder: !!(site.plans?.placeholder || plans().some((p) => p.placeholderPrices)),
@@ -70,11 +70,11 @@ function checkout(scope: BillingScope, orgId: string, userId: string | null, bod
   if (!price) return HttpResponse.json({ error: `${plan.name} has no ${interval} price`, code: 'invalid' }, { status: 422 });
   const seats = plan.perSeat ? Math.max(plan.minSeats ?? 1, body.seats ?? plan.minSeats ?? 1) : 1;
   const s = read();
-  const scope = scopeOf(orgId, userId);
+  const sk = scopeOf(orgId, userId);
   const now = new Date();
   const end = new Date(now.getTime() + (interval === 'yearly' ? 365 : 30) * 86_400_000);
-  s.customers[scope] = true;
-  s.subscriptions[scope] = { id: `sub_mock_${scope.slice(0, 6)}`, planId: plan.id, interval, seats, status: 'active', currentPeriodEnd: end.toISOString(), cancelAtPeriodEnd: false, updatedAt: now.toISOString(), priceRef: price.lookupKey };
+  s.customers[sk] = true;
+  s.subscriptions[sk] = { id: `sub_mock_${sk.slice(0, 6)}`, planId: plan.id, interval, seats, status: 'active', currentPeriodEnd: end.toISOString(), cancelAtPeriodEnd: false, updatedAt: now.toISOString(), priceRef: price.lookupKey };
   s.events.unshift(
     { id: `evt_${Date.now()}_a`, type: 'checkout.session.completed', receivedAt: now.toISOString(), processedAt: now.toISOString(), status: 'processed', summary: { plan: plan.id, seats, interval } },
     { id: `evt_${Date.now()}_b`, type: 'customer.subscription.created', receivedAt: now.toISOString(), processedAt: now.toISOString(), status: 'processed', summary: { plan: plan.id, status: 'active' } },
