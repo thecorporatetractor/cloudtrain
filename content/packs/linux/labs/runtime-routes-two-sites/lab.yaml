@@ -1,0 +1,185 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: runtime-routes-two-sites
+  title: Route between two depot networks with static routes
+  domain: linux
+  frameworks: [lfcs:networking, lpic2:networking]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [routing, ip-route, forwarding, namespaces]
+  version: 1
+spec:
+  description: |
+    Work on **`tr-net-01`** (`ssh tr-net-01`; you have `sudo`).
+
+    Three Tallowmere hosts are modelled as network namespaces on `tr-net-01`; run commands
+    on them with `sudo ip netns exec <host> <command>` (or `sudo ip -n <host> ...`):
+
+    | host | address | role |
+    |---|---|---|
+    | `depot-a` | 10.61.1.10/24 | depot A workstation |
+    | `gw` | 10.61.1.{{gwlast}}/24 and 10.61.2.{{gwlast}}/24 | gateway between the depots |
+    | `depot-b` | 10.61.2.10/24 | depot B timetable server |
+
+    The addresses are already configured, but `depot-a` cannot reach `depot-b`. Make the
+    two depot networks reach each other **through `gw`**, at runtime (no need to persist):
+
+    - `gw` must forward IPv4 packets;
+    - `depot-a` must reach **10.61.2.0/24** via the gateway, and `depot-b` must be able to
+      answer, so `depot-b` needs a route back to **10.61.1.0/24** via the gateway;
+    - `ping` between 10.61.1.10 and 10.61.2.10 works in both directions and `traceroute`
+      from `depot-a` to 10.61.2.10 shows the gateway as the first hop.
+
+    Do not change the addresses and do not touch `eth0` of `tr-net-01`.
+  objectives:
+    - Read the routing table of each host and find the missing routes
+    - Add static routes with ip route
+    - Enable IPv4 forwarding on a gateway
+    - Confirm the path with ping and traceroute
+  params:
+    gwlast:
+      type: choice
+      values: ["1", "254", "100"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-net-01
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["1Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-net-01
+      timeoutSec: 180
+      run: |
+        set -eu
+        install -d -m 0700 /var/lib/cloudtrain
+        if ! command -v traceroute >/dev/null 2>&1; then
+          if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then mv /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list.d/ubuntu.sources.cloud-init; rm -rf /var/lib/apt/lists/*; fi
+          apt-get update -q >/dev/null
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -q traceroute >/dev/null
+        fi
+        for n in depot-a gw depot-b; do ip netns del $n 2>/dev/null || true; ip netns add $n; ip -n $n link set lo up; done
+        # depot-a <-> gw
+        ip link del rr-a 2>/dev/null || true
+        ip link add rr-a type veth peer name rr-a-p
+        ip link set rr-a netns depot-a name eth0
+        ip link set rr-a-p netns gw name eth-a
+        ip -n depot-a addr add 10.61.1.10/24 dev eth0; ip -n depot-a link set eth0 up
+        ip -n gw addr add 10.61.1.{{gwlast}}/24 dev eth-a; ip -n gw link set eth-a up
+        # gw <-> depot-b
+        ip link del rr-b 2>/dev/null || true
+        ip link add rr-b type veth peer name rr-b-p
+        ip link set rr-b netns depot-b name eth0
+        ip link set rr-b-p netns gw name eth-b
+        ip -n depot-b addr add 10.61.2.10/24 dev eth0; ip -n depot-b link set eth0 up
+        ip -n gw addr add 10.61.2.{{gwlast}}/24 dev eth-b; ip -n gw link set eth-b up
+        ip netns exec gw sysctl -q -w net.ipv4.ip_forward=0
+        ip netns exec gw ping -c1 -W2 10.61.1.10 >/dev/null
+        ip netns exec gw ping -c1 -W2 10.61.2.10 >/dev/null
+  checks:
+    - id: forwarding
+      description: The gateway forwards IPv4 packets
+      type: shell
+      on: tr-net-01
+      skills: [net.routing.static, linux.net.ip-config]
+      weight: 1
+      command: ip netns exec gw sysctl -n net.ipv4.ip_forward
+      expect: {match: exact, value: "1"}
+    - id: a-to-b
+      description: depot-a reaches depot-b
+      type: shell
+      on: tr-net-01
+      skills: [linux.net.ip-config, net.routing.static]
+      weight: 2
+      timeoutSec: 30
+      command: ip netns exec depot-a ping -c2 -W2 10.61.2.10 >/dev/null 2>&1 && echo reachable || echo unreachable
+      expect: {match: exact, value: reachable}
+    - id: b-to-a
+      description: depot-b reaches depot-a
+      type: shell
+      on: tr-net-01
+      skills: [linux.net.ip-config, net.routing.static]
+      weight: 1.5
+      timeoutSec: 30
+      command: ip netns exec depot-b ping -c2 -W2 10.61.1.10 >/dev/null 2>&1 && echo reachable || echo unreachable
+      expect: {match: exact, value: reachable}
+    - id: path-via-gw
+      description: The path from depot-a to depot-b runs through the gateway
+      type: shell
+      on: tr-net-01
+      skills: [net.routing.static]
+      weight: 1.5
+      timeoutSec: 45
+      command: ip netns exec depot-a traceroute -n -q1 -w2 -m4 10.61.2.10 2>/dev/null | awk 'NR > 1 {print $2}' | paste -sd,
+      expect: {match: exact, value: "10.61.1.{{gwlast}},10.61.2.10"}
+    - id: addresses-kept
+      description: The depot addresses are unchanged
+      type: shell
+      on: tr-net-01
+      skills: [linux.net.ip-config]
+      weight: 0.5
+      command: |
+        a=$(ip -n depot-a -o -4 addr show dev eth0 | awk '{print $4}'); b=$(ip -n depot-b -o -4 addr show dev eth0 | awk '{print $4}')
+        echo "$a $b"
+      expect: {match: exact, value: "10.61.1.10/24 10.61.2.10/24"}
+  hints:
+    - title: Who needs what
+      body: "A packet only crosses a gateway if the sender has a route to the destination via it, the gateway forwards, and the receiver can route the reply back. Check ip route inside each namespace."
+      cost: 0
+    - title: Look at the table
+      command: sudo ip -n depot-a route
+      body: "depot-a only knows its own /24. Add the other depot with ip -n depot-a route add <prefix> via <gateway address on depot-a's side>."
+      cost: 1
+    - title: Turn the gateway on
+      command: sudo ip netns exec gw sysctl -w net.ipv4.ip_forward=1
+      body: "Forwarding is a per-namespace setting. Remember the return route on depot-b, or ping will time out even though the request arrives."
+      cost: 1
+  misconceptions:
+    - id: no-forwarding
+      description: Adds both routes but never enables forwarding on the gateway.
+      feedback: "The gateway receives the packets but drops them unless net.ipv4.ip_forward is 1 in its namespace."
+      expectFail: [forwarding, a-to-b, b-to-a, path-via-gw]
+      mutation:
+        on: tr-net-01
+        as: learner
+        run: |
+          sudo ip -n depot-a route add 10.61.2.0/24 via 10.61.1.{{gwlast}}
+          sudo ip -n depot-b route add 10.61.1.0/24 via 10.61.2.{{gwlast}}
+    - id: one-way-route
+      description: Routes depot-a to depot-b but forgets the way back.
+      feedback: "Ping needs a round trip: depot-b must also have a route to 10.61.1.0/24 via the gateway, otherwise its replies have nowhere to go."
+      expectFail: [a-to-b, b-to-a, path-via-gw]
+      mutation:
+        on: tr-net-01
+        as: learner
+        run: |
+          sudo ip netns exec gw sysctl -q -w net.ipv4.ip_forward=1
+          sudo ip -n depot-a route add 10.61.2.0/24 via 10.61.1.{{gwlast}}
+  solution:
+    explanation: Enable forwarding in the gateway namespace and add one route on each depot host through the gateway address on its own side.
+    steps:
+      - on: tr-net-01
+        as: learner
+        run: |
+          set -e
+          sudo ip netns exec gw sysctl -q -w net.ipv4.ip_forward=1
+          sudo ip -n depot-a route add 10.61.2.0/24 via 10.61.1.{{gwlast}}
+          sudo ip -n depot-b route add 10.61.1.0/24 via 10.61.2.{{gwlast}}
+          sudo ip netns exec depot-a ping -c2 -W2 10.61.2.10
+    alternatives:
+      - id: default-routes
+        description: Give each depot a default route via the gateway instead of a specific prefix route.
+        steps:
+          - on: tr-net-01
+            as: learner
+            run: |
+              set -e
+              sudo ip netns exec gw sysctl -q -w net.ipv4.ip_forward=1
+              sudo ip -n depot-a route add default via 10.61.1.{{gwlast}}
+              sudo ip -n depot-b route add default via 10.61.2.{{gwlast}}

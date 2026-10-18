@@ -1,0 +1,250 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: veth-netns-plumbing
+  title: Wire a namespace to the host network with veth and NAT
+  domain: linux
+  frameworks: []
+  difficulty: hard
+  estimatedMinutes: 25
+  tags: [namespaces, veth, nat, routing, networking]
+  version: 1
+spec:
+  description: |
+    Work on **`tr-net-01`** (`ssh tr-net-01`; you have `sudo`).
+
+    The Tallowmere depot tooling team wants an isolated sandbox for testing a new
+    timetable sync client. The sandbox is a **network namespace named `tt-sandbox`**
+    (run commands in it with `sudo ip netns exec tt-sandbox <command>`). Right now the
+    namespace does not exist.
+
+    The depot package mirror, **`mirror.tallowmere.test`**, is a host on the uplink network
+    **10.201.0.0/24**: it answers on **10.201.0.2, TCP 8080** and is reached from
+    `tr-net-01` through the interface **`tt-up`** (10.201.0.1). The mirror has **no
+    route back** to anything outside 10.201.0.0/24, exactly like a real upstream.
+
+    Build the sandbox network so that a client inside `tt-sandbox` can fetch
+    `http://10.201.0.2:8080/index.txt`:
+
+    - create the namespace `tt-sandbox` and connect it to `tr-net-01` with a **veth pair**;
+    - give the host end **10.200.0.1/24** and the namespace end **10.200.0.2/24**, both up;
+    - the namespace has a **default route** via 10.200.0.1;
+    - `tr-net-01` **forwards** packets between the two networks and **NATs** the sandbox
+      subnet **10.200.0.0/24** so the mirror sees the uplink address.
+
+    Do not touch `eth0`, the default route of `tr-net-01` or the interface `tt-up`.
+  objectives:
+    - Create a namespace and connect it to the host with a veth pair
+    - Address both ends and add a default route inside the namespace
+    - Enable forwarding and masquerade the sandbox subnet
+  params:
+    token:
+      type: int
+      min: 1000
+      max: 9999
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-net-01
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["1Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-net-01
+      timeoutSec: 120
+      run: |
+        set -eu
+        install -d -m 0700 /var/lib/cloudtrain
+        systemctl stop tr-mirror.service 2>/dev/null || true
+        for n in tt-sandbox tt-mirror; do ip netns del $n 2>/dev/null || true; done
+        for l in tt-host tt-up; do ip link del $l 2>/dev/null || true; done
+        nft delete table ip ttnat 2>/dev/null || true
+        sysctl -q -w net.ipv4.ip_forward=0
+        rm -f /etc/sysctl.d/*tt-sandbox*.conf
+        # the "upstream" mirror: a namespace behind tt-up with NO route back to 10.200.0.0/24
+        ip netns add tt-mirror
+        ip -n tt-mirror link set lo up
+        ip link add tt-up type veth peer name tt-up-p
+        ip link set tt-up-p netns tt-mirror
+        ip addr add 10.201.0.1/24 dev tt-up
+        ip link set tt-up up
+        ip -n tt-mirror addr add 10.201.0.2/24 dev tt-up-p
+        ip -n tt-mirror link set tt-up-p up
+        mkdir -p /srv/tt-mirror; echo "mirror {{token}}" > /srv/tt-mirror/index.txt
+        systemd-run -q --unit=tr-mirror --collect -p NetworkNamespacePath=/run/netns/tt-mirror /usr/bin/python3 -m http.server 8080 --directory /srv/tt-mirror
+        for i in $(seq 15); do curl -s -m 2 http://10.201.0.2:8080/index.txt | grep -q "mirror {{token}}" && break; sleep 1; done
+        curl -s -m 3 http://10.201.0.2:8080/index.txt | grep -q "mirror {{token}}"
+  checks:
+    - id: host-end
+      description: The host end of a veth pair carries 10.200.0.1/24
+      type: shell
+      on: tr-net-01
+      skills: [linux.internals.namespaces]
+      weight: 1
+      command: |
+        dev=$(ip -o -4 addr show scope global | awk '$4 == "10.200.0.1/24" {print $2; exit}')
+        [ -n "$dev" ] && ip -d link show "$dev" | grep -q veth && echo "veth $dev" | awk '{print $1}' || echo missing
+      expect: {match: exact, value: veth}
+    - id: sandbox-end
+      description: The namespace has exactly 10.200.0.2/24 on its veth end
+      type: shell
+      on: tr-net-01
+      skills: [linux.internals.namespaces]
+      weight: 1
+      command: ip -n tt-sandbox -o -4 addr show scope global 2>/dev/null | awk '{print $4}' | paste -sd,
+      expect: {match: exact, value: "10.200.0.2/24"}
+    - id: default-route
+      description: The namespace default route points at 10.200.0.1
+      type: shell
+      on: tr-net-01
+      skills: [linux.internals.namespaces, linux.net.nat-forwarding]
+      weight: 1
+      command: ip -n tt-sandbox -4 route show default 2>/dev/null | awk '{print $3; exit}'
+      expect: {match: exact, value: "10.200.0.1"}
+    - id: reaches-mirror
+      description: A client in the namespace fetches the file from the mirror
+      type: shell
+      on: tr-net-01
+      skills: [linux.internals.namespaces, linux.net.nat-forwarding]
+      weight: 2.5
+      timeoutSec: 30
+      command: ip netns exec tt-sandbox curl -4 -s -m 8 http://10.201.0.2:8080/index.txt 2>/dev/null || echo unreachable
+      expect: {match: exact, value: "mirror {{token}}"}
+    - id: nat-rule
+      description: A masquerade or source-NAT rule exists for the sandbox subnet
+      type: shell
+      on: tr-net-01
+      skills: [linux.net.nat-forwarding]
+      weight: 1.5
+      command: |
+        { nft list ruleset 2>/dev/null; iptables-save -t nat 2>/dev/null; } | grep -Ei 'masquerade|snat' | grep -q '10\.200\.0\.' && echo nat || echo none
+      expect: {match: exact, value: nat}
+    - id: host-untouched
+      description: The uplink interface and the default route are unchanged
+      type: shell
+      on: tr-net-01
+      skills: [linux.internals.namespaces]
+      weight: 0.5
+      command: |
+        a=$(ip -o -4 addr show dev tt-up | awk '{print $4}')
+        d=$(ip -4 route show default | awk '{for (i = 1; i <= NF; i++) if ($i == "dev") print $(i + 1)}' | sort -u | paste -sd,)
+        echo "$a $d"
+      expect: {match: exact, value: "10.201.0.1/24 eth0"}
+  hints:
+    - title: Two ends, two homes
+      body: "A veth pair is a virtual cable: create it on the host with ip link add ... type veth peer name ..., then move one end into the namespace with ip link set <end> netns tt-sandbox."
+      cost: 0
+    - title: Configure inside the namespace
+      command: sudo ip -n tt-sandbox addr add 10.200.0.2/24 dev <end>
+      body: "ip -n tt-sandbox runs one ip command inside the namespace. Bring the end and lo up there, then add the default route with ip -n tt-sandbox route add default via 10.200.0.1."
+      cost: 1
+    - title: Why the mirror says nothing
+      body: "The mirror has no route to 10.200.0.0/24. Packets must be forwarded (net.ipv4.ip_forward) and their source rewritten to the uplink address with a masquerade rule in the postrouting hook (nft or iptables)."
+      cost: 2
+  misconceptions:
+    - id: no-masquerade
+      description: Builds the veth, addresses and routes and enables forwarding, but forgets NAT.
+      feedback: "Forwarding alone is not enough: the mirror cannot answer 10.200.0.2 because it has no route to that subnet. Rewrite the source with a masquerade rule for 10.200.0.0/24."
+      expectFail: [reaches-mirror, nat-rule]
+      mutation:
+        on: tr-net-01
+        as: learner
+        run: |
+          set -e
+          sudo ip netns add tt-sandbox
+          sudo ip link add tt-host type veth peer name tt-sbx
+          sudo ip link set tt-sbx netns tt-sandbox
+          sudo ip addr add 10.200.0.1/24 dev tt-host
+          sudo ip link set tt-host up
+          sudo ip -n tt-sandbox addr add 10.200.0.2/24 dev tt-sbx
+          sudo ip -n tt-sandbox link set tt-sbx up
+          sudo ip -n tt-sandbox link set lo up
+          sudo ip -n tt-sandbox route add default via 10.200.0.1
+          sudo sysctl -q -w net.ipv4.ip_forward=1
+    - id: no-forwarding
+      description: Adds the masquerade rule but leaves IPv4 forwarding off.
+      feedback: "A masquerade rule only rewrites packets the host agrees to route. Turn on net.ipv4.ip_forward so packets may pass between the veth and tt-up."
+      expectFail: [reaches-mirror]
+      mutation:
+        on: tr-net-01
+        as: learner
+        run: |
+          set -e
+          sudo ip netns add tt-sandbox
+          sudo ip link add tt-host type veth peer name tt-sbx
+          sudo ip link set tt-sbx netns tt-sandbox
+          sudo ip addr add 10.200.0.1/24 dev tt-host
+          sudo ip link set tt-host up
+          sudo ip -n tt-sandbox addr add 10.200.0.2/24 dev tt-sbx
+          sudo ip -n tt-sandbox link set tt-sbx up
+          sudo ip -n tt-sandbox link set lo up
+          sudo ip -n tt-sandbox route add default via 10.200.0.1
+          sudo nft add table ip ttnat
+          sudo nft 'add chain ip ttnat post { type nat hook postrouting priority srcnat; }'
+          sudo nft add rule ip ttnat post ip saddr 10.200.0.0/24 masquerade
+    - id: no-default-route
+      description: Addresses both ends but never gives the namespace a default route.
+      feedback: "The namespace only knows its own /24. Without a default route via 10.200.0.1 it cannot send packets towards 10.201.0.2."
+      expectFail: [default-route, reaches-mirror]
+      mutation:
+        on: tr-net-01
+        as: learner
+        run: |
+          set -e
+          sudo ip netns add tt-sandbox
+          sudo ip link add tt-host type veth peer name tt-sbx
+          sudo ip link set tt-sbx netns tt-sandbox
+          sudo ip addr add 10.200.0.1/24 dev tt-host
+          sudo ip link set tt-host up
+          sudo ip -n tt-sandbox addr add 10.200.0.2/24 dev tt-sbx
+          sudo ip -n tt-sandbox link set tt-sbx up
+          sudo ip -n tt-sandbox link set lo up
+          sudo sysctl -q -w net.ipv4.ip_forward=1
+          sudo nft add table ip ttnat
+          sudo nft 'add chain ip ttnat post { type nat hook postrouting priority srcnat; }'
+          sudo nft add rule ip ttnat post ip saddr 10.200.0.0/24 masquerade
+  solution:
+    explanation: A veth pair joins the host and the namespace; each end gets an address, the namespace gets a default route via the host end, the host forwards, and a masquerade rule rewrites the sandbox subnet to the uplink address so the mirror can reply.
+    steps:
+      - on: tr-net-01
+        as: learner
+        run: |
+          set -e
+          sudo ip netns add tt-sandbox
+          sudo ip link add tt-host type veth peer name tt-sbx
+          sudo ip link set tt-sbx netns tt-sandbox
+          sudo ip addr add 10.200.0.1/24 dev tt-host
+          sudo ip link set tt-host up
+          sudo ip -n tt-sandbox addr add 10.200.0.2/24 dev tt-sbx
+          sudo ip -n tt-sandbox link set tt-sbx up
+          sudo ip -n tt-sandbox link set lo up
+          sudo ip -n tt-sandbox route add default via 10.200.0.1
+          sudo sysctl -q -w net.ipv4.ip_forward=1
+          sudo nft add table ip ttnat
+          sudo nft 'add chain ip ttnat post { type nat hook postrouting priority srcnat; }'
+          sudo nft add rule ip ttnat post ip saddr 10.200.0.0/24 masquerade
+          sudo ip netns exec tt-sandbox curl -4 -s -m 8 http://10.201.0.2:8080/index.txt
+    alternatives:
+      - id: iptables-masquerade
+        description: Use iptables (nft backend) for the masquerade rule instead of a native nftables table.
+        steps:
+          - on: tr-net-01
+            as: learner
+            run: |
+              set -e
+              sudo ip netns add tt-sandbox
+              sudo ip link add tt-host type veth peer name tt-sbx
+              sudo ip link set tt-sbx netns tt-sandbox
+              sudo ip addr add 10.200.0.1/24 dev tt-host
+              sudo ip link set tt-host up
+              sudo ip -n tt-sandbox addr add 10.200.0.2/24 dev tt-sbx
+              sudo ip -n tt-sandbox link set tt-sbx up
+              sudo ip -n tt-sandbox link set lo up
+              sudo ip -n tt-sandbox route add default via 10.200.0.1
+              sudo sysctl -q -w net.ipv4.ip_forward=1
+              sudo iptables -t nat -A POSTROUTING -s 10.200.0.0/24 -j MASQUERADE

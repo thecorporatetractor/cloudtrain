@@ -1,0 +1,232 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: bond-active-backup
+  title: Bond two links for the signalling uplink
+  domain: linux
+  frameworks: [lfcs:networking]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [bonding, networkmanager, nmcli, failover, persistence]
+  version: 1
+spec:
+  description: |
+    Work on **`tr-el-01`** (`ssh tr-el-01`; you have `sudo`), an Enterprise Linux host managed
+    by **NetworkManager**. Besides `eth0` (your management link, do not touch it) the host has
+    two spare uplinks to the signalling switch, **`eth1`** and **`eth2`**. The switch is the
+    namespace `tr-sw` (`sudo ip netns exec tr-sw ...`); its address is **10.40.3.1/24** and its
+    ports are `eth1p` and `eth2p`.
+
+    Bond the two uplinks for the signalling network:
+
+    - bond interface **`bond0`**, mode **active-backup**, link monitoring **every 100 ms**
+      (`miimon=100`), with `eth1` and `eth2` as its ports;
+    - IPv4 address **{{addr}}** on `bond0` (static, no DHCP; IPv6 off is fine);
+    - configured as saved NetworkManager connections so it **survives a reboot**, and active
+      now.
+
+    The grader fails the active port by downing its switch side (`ip netns exec tr-sw ip link
+    set eth1p down`, for instance) and expects `ping 10.40.3.1` through the bond to keep working
+    on the other port.
+  objectives:
+    - Create a bond with nmcli and add ports to it
+    - Choose active-backup and a link monitor so failures are detected
+    - Prove failover by failing the active port
+  params:
+    addr:
+      type: choice
+      values: ["10.40.3.10/24", "10.40.3.20/24", "10.40.3.30/24"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-el-01
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["1Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-el-01
+      timeoutSec: 150
+      run: |
+        set -eu
+        install -d -m 0700 /var/lib/cloudtrain
+        modprobe bonding 2>/dev/null || grep -q '/bonding.ko' /lib/modules/$(uname -r)/modules.builtin 2>/dev/null || { echo "kernel module 'bonding' is not available on this image: the bonding lab cannot run" >&2; exit 1; }
+        printf '[main]\nno-auto-default=*\n\n[device-tr-bond]\nmatch-device=interface-name:eth1;interface-name:eth2;interface-name:bond0\nmanaged=1\n' > /etc/NetworkManager/conf.d/20-tr-bond.conf
+        nmcli general reload conf >/dev/null 2>&1 || true
+        # start clean: no bond or port profiles, no devices
+        nmcli -t -f NAME,DEVICE con show | awk -F: '$1 ~ /^bond0/ || $2 ~ /^(eth1|eth2|bond0)$/ {print $1}' | while IFS= read -r c; do nmcli con delete "$c" >/dev/null 2>&1 || true; done
+        rm -f /etc/NetworkManager/system-connections/bond0*.nmconnection
+        nmcli con reload || true
+        ip link del bond0 2>/dev/null || true
+        for l in eth1 eth2; do ip link del $l 2>/dev/null || true; done
+        ip netns del tr-sw 2>/dev/null || true
+        ip netns add tr-sw; ip -n tr-sw link set lo up
+        ip -n tr-sw link add swbr type bridge
+        ip -n tr-sw addr add 10.40.3.1/24 dev swbr
+        ip -n tr-sw link set swbr up
+        for i in 1 2; do
+          ip link add eth$i type veth peer name eth${i}p
+          ip link set eth${i}p netns tr-sw
+          ip -n tr-sw link set eth${i}p master swbr
+          ip -n tr-sw link set eth${i}p up
+          ip link set eth$i up
+          nmcli device set eth$i managed yes >/dev/null 2>&1 || true
+        done
+        sleep 1
+        ip link show eth1 >/dev/null && ip link show eth2 >/dev/null
+  checks:
+    - id: bond-live
+      description: bond0 is an active-backup bond with a link monitor and eth1 and eth2 as ports
+      type: shell
+      on: tr-el-01
+      skills: [linux.net.bridges-bonds]
+      weight: 2
+      command: |
+        f=/proc/net/bonding/bond0
+        [ -r $f ] || { echo no-bond; exit 0; }
+        m=$(awk -F': ' '/^Bonding Mode/ {print $2}' $f); i=$(awk -F': ' '/^MII Polling Interval/ {print $2}' $f)
+        s=$(awk -F': ' '/^Slave Interface/ {print $2}' $f | sort | paste -sd,)
+        [ "$m" = "fault-tolerance (active-backup)" ] && [ "${i:-0}" -gt 0 ] && [ "$s" = eth1,eth2 ] && echo ok || echo "mode=$m miimon=$i ports=$s"
+      expect: {match: exact, value: ok}
+    - id: bond-address
+      description: bond0 carries {{addr}}
+      type: shell
+      on: tr-el-01
+      skills: [linux.net.persistent-config]
+      weight: 1
+      command: ip -o -4 addr show dev bond0 2>/dev/null | awk '{print $4}' | paste -sd,
+      expect: {match: exact, value: "{{addr}}"}
+    - id: failover
+      description: Pings through the bond continue after the active port fails
+      type: shell
+      on: tr-el-01
+      skills: [linux.net.bridges-bonds]
+      weight: 3
+      timeoutSec: 60
+      command: |
+        f=/proc/net/bonding/bond0
+        act=$(awk -F': ' '/^Currently Active Slave/ {print $2}' $f 2>/dev/null)
+        [ -n "$act" ] || { echo no-active; exit 0; }
+        ping -c2 -W2 -I bond0 10.40.3.1 >/dev/null 2>&1 || { echo down-before; exit 0; }
+        ip netns exec tr-sw ip link set ${act}p down
+        sleep 4
+        ok=$(ping -c3 -W2 -I bond0 10.40.3.1 >/dev/null 2>&1 && echo up || echo down)
+        new=$(awk -F': ' '/^Currently Active Slave/ {print $2}' $f)
+        ip netns exec tr-sw ip link set ${act}p up
+        sleep 3
+        echo "$ok switched=$([ "$new" != "$act" ] && echo yes || echo no)"
+      expect: {match: exact, value: "up switched=yes"}
+    - id: bond-persistent
+      description: NetworkManager has saved profiles for the bond and both ports
+      type: shell
+      on: tr-el-01
+      skills: [linux.net.persistent-config, linux.net.bridges-bonds]
+      weight: 2
+      command: |
+        python3 - <<'EOP'
+        import glob, re
+        bond, ports = None, []
+        for f in glob.glob("/etc/NetworkManager/system-connections/*.nmconnection"):
+            t = open(f).read()
+            if re.search(r"^type=bond\s*$", t, re.M):
+                bond = t
+            elif re.search(r"^slave-type=bond\s*$", t, re.M):
+                m = re.search(r"^interface-name=(\S+)", t, re.M)
+                if m:
+                    ports.append(m.group(1))
+        if not bond:
+            print("no-bond-profile"); raise SystemExit
+        mode = re.search(r"^mode=(\S+)", bond, re.M)
+        mii = re.search(r"^miimon=(\d+)", bond, re.M)
+        addr = re.search(r"^address1=(\S+)", bond, re.M)
+        ok = mode and mode.group(1) == "active-backup" and mii and int(mii.group(1)) > 0 and addr and addr.group(1).split(",")[0] == "{{addr}}" and sorted(ports) == ["eth1", "eth2"]
+        print("persistent" if ok else "incomplete mode=%s miimon=%s ports=%s" % (mode and mode.group(1), mii and mii.group(1), sorted(ports)))
+        EOP
+      expect: {match: exact, value: persistent}
+  hints:
+    - title: The bond profile
+      command: sudo nmcli con add type bond con-name bond0 ifname bond0 bond.options "mode=active-backup,miimon=100"
+      body: "bond.options carries the kernel bonding parameters. Without miimon (or arp monitoring) the kernel never notices a dead link and never fails over. Give the bond a manual IPv4 address with ipv4.method manual ipv4.addresses ..."
+      cost: 0
+    - title: Ports are connections too
+      command: sudo nmcli con add type ethernet slave-type bond master bond0 con-name bond0-eth1 ifname eth1
+      body: "Each port needs its own connection with master bond0. Activate the ports and then the bond (nmcli con up ...)."
+      cost: 1
+    - title: Test it yourself
+      command: sudo ip netns exec tr-sw ip link set eth1p down
+      body: "cat /proc/net/bonding/bond0 shows the Currently Active Slave. Down that port's switch side and ping 10.40.3.1 again; bring it back up afterwards."
+      cost: 1
+  misconceptions:
+    - id: no-link-monitor
+      description: Creates the bond with miimon=0, so link failures are never detected.
+      feedback: "The kernel only fails over when it detects the failure: set miimon=100 (or configure ARP monitoring)."
+      expectFail: [bond-live, failover, bond-persistent]
+      mutation:
+        on: tr-el-01
+        as: learner
+        timeoutSec: 90
+        run: |
+          set -e
+          sudo nmcli con add type bond con-name bond0 ifname bond0 bond.options "mode=active-backup,miimon=0" ipv4.method manual ipv4.addresses {{addr}} ipv6.method disabled
+          sudo nmcli con add type ethernet slave-type bond master bond0 con-name bond0-eth1 ifname eth1
+          sudo nmcli con add type ethernet slave-type bond master bond0 con-name bond0-eth2 ifname eth2
+          sudo nmcli con up bond0-eth1
+          sudo nmcli con up bond0-eth2
+          sudo nmcli con up bond0
+          sleep 3
+    - id: ip-link-only
+      description: Builds the bond with ip link, which is not saved anywhere.
+      feedback: "ip link bonds vanish at reboot. Create NetworkManager connections (nmcli con add type bond ...) so the configuration is saved."
+      expectFail: [bond-persistent]
+      mutation:
+        on: tr-el-01
+        as: learner
+        run: |
+          set -e
+          sudo ip link add bond0 type bond mode active-backup miimon 100
+          sudo ip link set eth1 down; sudo ip link set eth2 down
+          sudo ip link set eth1 master bond0; sudo ip link set eth2 master bond0
+          sudo ip addr add {{addr}} dev bond0
+          sudo ip link set bond0 up
+          sleep 3
+  solution:
+    explanation: A NetworkManager bond connection in active-backup mode with miimon=100 and a static address, plus one slave connection per port, gives a saved configuration that fails over when the kernel sees the active link go down.
+    steps:
+      - on: tr-el-01
+        as: learner
+        timeoutSec: 90
+        run: |
+          set -e
+          sudo nmcli con add type bond con-name bond0 ifname bond0 bond.options "mode=active-backup,miimon=100" ipv4.method manual ipv4.addresses {{addr}} ipv6.method disabled
+          sudo nmcli con add type ethernet slave-type bond master bond0 con-name bond0-eth1 ifname eth1
+          sudo nmcli con add type ethernet slave-type bond master bond0 con-name bond0-eth2 ifname eth2
+          sudo nmcli con up bond0-eth1
+          sudo nmcli con up bond0-eth2
+          sudo nmcli con up bond0
+          sleep 4
+          cat /proc/net/bonding/bond0
+          ping -c2 -W2 -I bond0 10.40.3.1
+    alternatives:
+      - id: keyfiles
+        description: Write the three NetworkManager keyfiles by hand and load them with nmcli con reload.
+        steps:
+          - on: tr-el-01
+            as: learner
+            timeoutSec: 90
+            run: |
+              set -e
+              D=/etc/NetworkManager/system-connections
+              printf '[connection]\nid=bond0\ntype=bond\ninterface-name=bond0\n\n[bond]\nmode=active-backup\nmiimon=100\n\n[ipv4]\naddress1={{addr}}\nmethod=manual\n\n[ipv6]\nmethod=disabled\n' | sudo tee $D/bond0.nmconnection >/dev/null
+              for i in 1 2; do
+                printf '[connection]\nid=bond0-eth%s\ntype=ethernet\ninterface-name=eth%s\nmaster=bond0\nslave-type=bond\n' $i $i | sudo tee $D/bond0-eth$i.nmconnection >/dev/null
+              done
+              sudo chmod 0600 $D/bond0.nmconnection $D/bond0-eth1.nmconnection $D/bond0-eth2.nmconnection
+              sudo nmcli con reload
+              sudo nmcli con up bond0-eth1
+              sudo nmcli con up bond0-eth2
+              sudo nmcli con up bond0
+              sleep 4

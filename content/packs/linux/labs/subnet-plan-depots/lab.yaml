@@ -1,0 +1,218 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: subnet-plan-depots
+  title: Plan depot subnets and verify them on live interfaces
+  domain: linux
+  frameworks: [lpic1:networking, linuxplus:system-management]
+  difficulty: easy
+  estimatedMinutes: 15
+  tags: [subnetting, ipv4, addressing, ip]
+  version: 1
+spec:
+  description: |
+    Work on **`tr-net-01`** (`ssh tr-net-01`; you have `sudo`).
+
+    Tallowmere Rail has been given the supernet **`{{base}}`** for its four depots. The
+    network team wants it split into **four equal subnets**, one per depot, in address
+    order (depot 1 gets the lowest).
+
+    1. Write the plan to **`~/answers/subnets.txt`**, one line per depot in the form
+       `depot-1 <network>/<prefix>` ... `depot-4 <network>/<prefix>`.
+    2. The spare interface **`eth1`** stands in for the uplink of depot 3. Give it the
+       **first usable host address of depot 3's subnet** with the right prefix length
+       (`ip addr add`). It is already up and has no address.
+
+    Do not touch `eth0`.
+  objectives:
+    - Split a /22 into four equal subnets and name their network addresses
+    - Work out the first usable host address of a subnet
+    - Assign an address to an interface with ip addr
+  params:
+    base:
+      type: choice
+      values: [10.60.0.0/22, 10.64.4.0/22, 172.20.8.0/22]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-net-01
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["1Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-net-01
+      timeoutSec: 90
+      run: |
+        set -eu
+        install -d -m 0700 /var/lib/cloudtrain
+        # eth1 is a veth end standing in for a second NIC; eth0 is never touched
+        for f in /etc/netplan/*.yaml; do
+          [ -f "$f" ] || continue
+          python3 - "$f" <<'EOT'
+        import sys, yaml
+        p = sys.argv[1]
+        d = yaml.safe_load(open(p)) or {}
+        e = (d.get("network") or {}).get("ethernets") or {}
+        if "eth1" in e:
+            del e["eth1"]
+            yaml.safe_dump(d, open(p, "w"))
+        EOT
+        done
+        rm -f /etc/netplan/*eth1*.yaml
+        ip link del eth1 2>/dev/null || true
+        ip link add eth1 type veth peer name eth1p
+        ip link set eth1p up
+        ip link set eth1 up
+        ip addr flush dev eth1
+        rm -rf /home/learner/answers; install -d -o learner -g learner -m 0755 /home/learner/answers
+  checks:
+    - id: plan
+      description: The plan lists the four correct subnets in order
+      type: shell
+      on: tr-net-01
+      skills: [net.addressing.ipv4-subnetting]
+      weight: 2
+      command: |
+        python3 - <<'EOP'
+        import ipaddress, re
+        base = ipaddress.ip_network("{{base}}")
+        want = [str(n) for n in base.subnets(new_prefix=base.prefixlen + 2)]
+        try:
+            lines = open("/home/learner/answers/subnets.txt").read().splitlines()
+        except OSError:
+            print("no-file"); raise SystemExit
+        got = []
+        for l in lines:
+            m = re.match(r"^\s*depot-([1-4])\s+(\d+\.\d+\.\d+\.\d+/\d+)\s*$", l)
+            if m:
+                got.append((int(m.group(1)), m.group(2)))
+        got.sort()
+        print("ok" if [g[0] for g in got] == [1, 2, 3, 4] and [g[1] for g in got] == want else "wrong")
+        EOP
+      expect: {match: exact, value: ok}
+    - id: eth1-address
+      description: eth1 carries the first host address of depot 3's subnet and is up
+      type: shell
+      on: tr-net-01
+      skills: [linux.net.ip-config, net.addressing.ipv4-subnetting]
+      weight: 2
+      command: |
+        python3 - <<'EOP'
+        import ipaddress, subprocess
+        base = ipaddress.ip_network("{{base}}")
+        net3 = list(base.subnets(new_prefix=base.prefixlen + 2))[2]
+        want = "%s/%d" % (next(net3.hosts()), net3.prefixlen)
+        out = subprocess.run(["ip", "-o", "-4", "addr", "show", "dev", "eth1", "scope", "global"], capture_output=True, text=True).stdout
+        got = sorted(l.split()[3] for l in out.splitlines())
+        up = "UP" in subprocess.run(["ip", "-br", "link", "show", "eth1"], capture_output=True, text=True).stdout.split()[1:]
+        print("ok" if got == [want] and up else "got=%s up=%s" % (",".join(got), up))
+        EOP
+      expect: {match: exact, value: ok}
+    - id: eth0-untouched
+      description: The default route still leaves through eth0
+      type: shell
+      on: tr-net-01
+      skills: [linux.net.ip-config]
+      weight: 0.5
+      command: ip route show default | awk '{for (i = 1; i <= NF; i++) if ($i == "dev") print $(i + 1)}' | sort -u | paste -sd,
+      expect: {match: exact, value: eth0}
+  hints:
+    - title: How many bits
+      body: "Four equal subnets need two more network bits: a /22 becomes four /24s. Their network addresses step by 256 in the third octet (or the bit pattern of your supernet)."
+      cost: 0
+    - title: First usable host
+      body: "The first address of a subnet is its network address and cannot be assigned to a host; the first usable host address is the network address plus one."
+      cost: 1
+    - title: Assign it
+      command: sudo ip addr add <address>/<prefix> dev eth1
+      body: "Use ip -br addr to check the result; the prefix length is that of the subnet, not of the supernet."
+      cost: 1
+  misconceptions:
+    - id: uses-supernet-prefix
+      description: Splits correctly but puts the host address on eth1 with the /22 prefix.
+      feedback: "The address belongs to depot 3's subnet, so it carries that subnet's prefix length (a /24 here), not the supernet's."
+      expectFail: [eth1-address]
+      mutation:
+        on: tr-net-01
+        as: learner
+        run: |
+          set -e
+          python3 - <<'EOP'
+          import ipaddress
+          base = ipaddress.ip_network("{{base}}")
+          subs = list(base.subnets(new_prefix=base.prefixlen + 2))
+          open("/home/learner/answers/subnets.txt", "w").write("".join("depot-%d %s\n" % (i + 1, s) for i, s in enumerate(subs)))
+          open("/tmp/tr-wrong-addr", "w").write("%s/%d" % (next(subs[2].hosts()), base.prefixlen))
+          EOP
+          sudo ip addr add "$(cat /tmp/tr-wrong-addr)" dev eth1
+    - id: network-address-assigned
+      description: Assigns the network address of depot 3 instead of the first usable host.
+      feedback: "The network address names the subnet itself; the first host you can assign is one above it."
+      expectFail: [eth1-address]
+      mutation:
+        on: tr-net-01
+        as: learner
+        run: |
+          set -e
+          python3 - <<'EOP'
+          import ipaddress
+          base = ipaddress.ip_network("{{base}}")
+          subs = list(base.subnets(new_prefix=base.prefixlen + 2))
+          open("/home/learner/answers/subnets.txt", "w").write("".join("depot-%d %s\n" % (i + 1, s) for i, s in enumerate(subs)))
+          open("/tmp/tr-wrong-addr", "w").write("%s/%d" % (subs[2].network_address, subs[2].prefixlen))
+          EOP
+          sudo ip addr add "$(cat /tmp/tr-wrong-addr)" dev eth1
+    - id: wrong-split
+      description: Splits the supernet into two halves instead of four subnets.
+      feedback: "Four equal subnets need two extra bits, so the prefix grows by two; listing /23s gives only two depots."
+      expectFail: [plan, eth1-address]
+      mutation:
+        on: tr-net-01
+        as: learner
+        run: |
+          python3 - <<'EOP'
+          import ipaddress
+          base = ipaddress.ip_network("{{base}}")
+          halves = list(base.subnets(new_prefix=base.prefixlen + 1))
+          open("/home/learner/answers/subnets.txt", "w").write("".join("depot-%d %s\n" % (i + 1, halves[i % 2]) for i in range(4)))
+          EOP
+  solution:
+    explanation: Adding two bits to the prefix turns the /22 into four /24 subnets in order; depot 3 is the third one, and its first usable host is the network address plus one, assigned with the subnet's own prefix length.
+    steps:
+      - on: tr-net-01
+        as: learner
+        run: |
+          set -e
+          python3 - <<'EOP'
+          import ipaddress, subprocess
+          base = ipaddress.ip_network("{{base}}")
+          subs = list(base.subnets(new_prefix=base.prefixlen + 2))
+          open("/home/learner/answers/subnets.txt", "w").write("".join("depot-%d %s\n" % (i + 1, s) for i, s in enumerate(subs)))
+          addr = "%s/%d" % (next(subs[2].hosts()), subs[2].prefixlen)
+          subprocess.run(["sudo", "ip", "addr", "add", addr, "dev", "eth1"], check=True)
+          EOP
+          ip -br addr show eth1
+    alternatives:
+      - id: netplan
+        description: Write the address with netplan instead of ip addr (persistent as a bonus).
+        steps:
+          - on: tr-net-01
+            as: learner
+            timeoutSec: 90
+            run: |
+              set -e
+              python3 - <<'EOP'
+              import ipaddress, subprocess
+              base = ipaddress.ip_network("{{base}}")
+              subs = list(base.subnets(new_prefix=base.prefixlen + 2))
+              open("/home/learner/answers/subnets.txt", "w").write("".join("depot-%d %s\n" % (i + 1, s) for i, s in enumerate(subs)))
+              addr = "%s/%d" % (next(subs[2].hosts()), subs[2].prefixlen)
+              subprocess.run(["sudo", "netplan", "set", "ethernets.eth1.addresses=[%s]" % addr], check=True)
+              EOP
+              sudo netplan apply
+              sleep 2

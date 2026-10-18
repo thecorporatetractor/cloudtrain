@@ -1,0 +1,408 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: wireguard-depot-tunnel
+  title: Connect two depots with a WireGuard tunnel
+  domain: linux
+  frameworks: [linuxplus:security, lpic2:system-security]
+  difficulty: hard
+  estimatedMinutes: 25
+  tags: [wireguard, vpn, systemd-networkd, tunnel, keys]
+  version: 1
+spec:
+  description: |
+    Two depot gateways, **`tr-wg-a`** (`ssh tr-wg-a`) and **`tr-wg-b`** (`ssh tr-wg-b`), must be
+    joined by a WireGuard tunnel (you have `sudo` on both). The `wg` tools are not installed:
+    you configure the tunnel with **systemd-networkd** (`.netdev` with `Kind=wireguard`
+    and `.network` files in `/etc/systemd/network`), which keeps it across restarts and reboots.
+    Generate the keys with `openssl` (see the hints).
+
+    | | depot A (`tr-wg-a`) | depot B (`tr-wg-b`) |
+    |---|---|---|
+    | LAN (dummy interface `lan0`) | 10.73.1.0/24, host address 10.73.1.1 | 10.73.2.0/24, host address 10.73.2.1 |
+    | tunnel interface `wg-depot` | 10.73.100.1/30 | 10.73.100.2/30 |
+
+    Set up the tunnel so that:
+
+    - each side listens on **UDP {{port}}** and has the other side as its only peer, reached
+      at the peer's address on `eth0` (look it up with `getent ahostsv4 <name>`);
+    - **AllowedIPs** of each peer cover the other side's tunnel address and its **LAN**, so that
+      `ping -I 10.73.1.1 10.73.2.1` works from A and the reverse from B, through `wg-depot`;
+    - the private keys are **not world-readable**;
+    - the configuration is saved in networkd files (it survives a restart of the interface and a
+      reboot) and `systemd-networkd` is enabled.
+  objectives:
+    - Generate WireGuard key pairs with openssl
+    - Describe a WireGuard interface and its peer in systemd-networkd
+    - Route two LANs through the tunnel with AllowedIPs and a route
+    - Keep private keys readable by root and systemd-network only
+  params:
+    port:
+      type: choice
+      values: ["51820", "51821"]
+    salt:
+      type: int
+      min: 1000
+      max: 9999
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-wg-a
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["1Gi"]}
+        access: [ssh, console]
+      - name: tr-wg-b
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["1Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-wg-a
+      timeoutSec: 120
+      run: |
+        set -eu
+        V=/var/lib/cloudtrain; install -d -m 0700 $V
+        modprobe wireguard 2>/dev/null || grep -q '/wireguard.ko' /lib/modules/$(uname -r)/modules.builtin 2>/dev/null || { echo "kernel module 'wireguard' is not available on this image: the tunnel lab cannot run" >&2; exit 1; }
+        systemctl enable --now systemd-networkd >/dev/null 2>&1 || true
+        rm -f /etc/systemd/network/*wg-depot*
+        ip link del wg-depot 2>/dev/null || true
+        networkctl reload >/dev/null 2>&1 || true
+        ip link del lan0 2>/dev/null || true
+        ip link add lan0 type dummy
+        ip addr add 10.73.1.1/24 dev lan0
+        ip link set lan0 up
+        cat > $V/wgsol.sh <<'EOH'
+        #!/bin/bash
+        # reference configuration for the WireGuard depot tunnel (setup-created, root only)
+        # usage: wgsol.sh a|b [world-readable|tunnel-only|keyfile]
+        set -e
+        role=$1; mode=${2:-plain}
+        SALT={{salt}}; PORT={{port}}
+        mk() { printf '%s' "tr-wg-$1-$SALT" | openssl dgst -sha256 -binary | base64; }
+        pub() { (printf '\x30\x2e\x02\x01\x00\x30\x05\x06\x03\x2b\x65\x6e\x04\x22\x04\x20'; printf '%s' "$1" | base64 -d) | openssl pkey -inform DER -pubout -outform DER | tail -c 32 | base64; }
+        if [ "$role" = a ]; then peer=b; me_t=10.73.100.1/30; peer_t=10.73.100.2/32; peer_lan=10.73.2.0/24
+        else peer=a; me_t=10.73.100.2/30; peer_t=10.73.100.1/32; peer_lan=10.73.1.0/24; fi
+        PRIV=$(mk $role); PEERPUB=$(pub "$(mk $peer)"); PEERIP=$(getent ahostsv4 tr-wg-$peer | awk '{print $1; exit}')
+        allowed="$peer_t,$peer_lan"; [ "$mode" = tunnel-only ] && allowed=$peer_t
+        D=/etc/systemd/network
+        if [ "$mode" = keyfile ]; then
+          printf '%s\n' "$PRIV" > $D/wg-depot.key; chown root:systemd-network $D/wg-depot.key; chmod 0640 $D/wg-depot.key
+          keyline="PrivateKeyFile=$D/wg-depot.key"
+        else keyline="PrivateKey=$PRIV"; fi
+        printf '[NetDev]\nName=wg-depot\nKind=wireguard\n\n[WireGuard]\n%s\nListenPort=%s\n\n[WireGuardPeer]\nPublicKey=%s\nAllowedIPs=%s\nEndpoint=%s:%s\nPersistentKeepalive=5\n' "$keyline" "$PORT" "$PEERPUB" "$allowed" "$PEERIP" "$PORT" > $D/50-wg-depot.netdev
+        chown root:systemd-network $D/50-wg-depot.netdev; chmod 0640 $D/50-wg-depot.netdev
+        [ "$mode" = world-readable ] && chmod 0644 $D/50-wg-depot.netdev
+        printf '[Match]\nName=wg-depot\n\n[Network]\nAddress=%s\n\n[Route]\nDestination=%s\n' "$me_t" "$peer_lan" > $D/50-wg-depot.network
+        networkctl reload
+        sleep 3
+        EOH
+        chmod 0700 $V/wgsol.sh
+    - on: tr-wg-b
+      timeoutSec: 120
+      run: |
+        set -eu
+        V=/var/lib/cloudtrain; install -d -m 0700 $V
+        modprobe wireguard 2>/dev/null || grep -q '/wireguard.ko' /lib/modules/$(uname -r)/modules.builtin 2>/dev/null || { echo "kernel module 'wireguard' is not available on this image: the tunnel lab cannot run" >&2; exit 1; }
+        systemctl enable --now systemd-networkd >/dev/null 2>&1 || true
+        rm -f /etc/systemd/network/*wg-depot*
+        ip link del wg-depot 2>/dev/null || true
+        networkctl reload >/dev/null 2>&1 || true
+        ip link del lan0 2>/dev/null || true
+        ip link add lan0 type dummy
+        ip addr add 10.73.2.1/24 dev lan0
+        ip link set lan0 up
+        cat > $V/wgsol.sh <<'EOH'
+        #!/bin/bash
+        # reference configuration for the WireGuard depot tunnel (setup-created, root only)
+        # usage: wgsol.sh a|b [world-readable|tunnel-only|keyfile]
+        set -e
+        role=$1; mode=${2:-plain}
+        SALT={{salt}}; PORT={{port}}
+        mk() { printf '%s' "tr-wg-$1-$SALT" | openssl dgst -sha256 -binary | base64; }
+        pub() { (printf '\x30\x2e\x02\x01\x00\x30\x05\x06\x03\x2b\x65\x6e\x04\x22\x04\x20'; printf '%s' "$1" | base64 -d) | openssl pkey -inform DER -pubout -outform DER | tail -c 32 | base64; }
+        if [ "$role" = a ]; then peer=b; me_t=10.73.100.1/30; peer_t=10.73.100.2/32; peer_lan=10.73.2.0/24
+        else peer=a; me_t=10.73.100.2/30; peer_t=10.73.100.1/32; peer_lan=10.73.1.0/24; fi
+        PRIV=$(mk $role); PEERPUB=$(pub "$(mk $peer)"); PEERIP=$(getent ahostsv4 tr-wg-$peer | awk '{print $1; exit}')
+        allowed="$peer_t,$peer_lan"; [ "$mode" = tunnel-only ] && allowed=$peer_t
+        D=/etc/systemd/network
+        if [ "$mode" = keyfile ]; then
+          printf '%s\n' "$PRIV" > $D/wg-depot.key; chown root:systemd-network $D/wg-depot.key; chmod 0640 $D/wg-depot.key
+          keyline="PrivateKeyFile=$D/wg-depot.key"
+        else keyline="PrivateKey=$PRIV"; fi
+        printf '[NetDev]\nName=wg-depot\nKind=wireguard\n\n[WireGuard]\n%s\nListenPort=%s\n\n[WireGuardPeer]\nPublicKey=%s\nAllowedIPs=%s\nEndpoint=%s:%s\nPersistentKeepalive=5\n' "$keyline" "$PORT" "$PEERPUB" "$allowed" "$PEERIP" "$PORT" > $D/50-wg-depot.netdev
+        chown root:systemd-network $D/50-wg-depot.netdev; chmod 0640 $D/50-wg-depot.netdev
+        [ "$mode" = world-readable ] && chmod 0644 $D/50-wg-depot.netdev
+        printf '[Match]\nName=wg-depot\n\n[Network]\nAddress=%s\n\n[Route]\nDestination=%s\n' "$me_t" "$peer_lan" > $D/50-wg-depot.network
+        networkctl reload
+        sleep 3
+        EOH
+        chmod 0700 $V/wgsol.sh
+  checks:
+    - id: lan-a-to-b
+      description: The LAN of depot B answers from the LAN of depot A through wg-depot
+      type: shell
+      on: tr-wg-a
+      skills: [linux.net.vpn]
+      weight: 2
+      timeoutSec: 60
+      command: |
+        for i in $(seq 12); do
+          ping -c2 -W2 -I 10.73.1.1 10.73.2.1 >/dev/null 2>&1 && break
+          sleep 2
+        done
+        r=$(ping -c2 -W2 -I 10.73.1.1 10.73.2.1 >/dev/null 2>&1 && echo reachable || echo unreachable)
+        d=$(ip route get 10.73.2.1 from 10.73.1.1 2>/dev/null | grep -o 'dev [a-z0-9-]*' | head -1)
+        echo "$r $d"
+      expect: {match: exact, value: "reachable dev wg-depot"}
+    - id: lan-b-to-a
+      description: The LAN of depot A answers from the LAN of depot B through wg-depot
+      type: shell
+      on: tr-wg-b
+      skills: [linux.net.vpn]
+      weight: 2
+      timeoutSec: 60
+      command: |
+        for i in $(seq 12); do
+          ping -c2 -W2 -I 10.73.2.1 10.73.1.1 >/dev/null 2>&1 && break
+          sleep 2
+        done
+        r=$(ping -c2 -W2 -I 10.73.2.1 10.73.1.1 >/dev/null 2>&1 && echo reachable || echo unreachable)
+        d=$(ip route get 10.73.1.1 from 10.73.2.1 2>/dev/null | grep -o 'dev [a-z0-9-]*' | head -1)
+        echo "$r $d"
+      expect: {match: exact, value: "reachable dev wg-depot"}
+    - id: encrypted
+      description: LAN pings travel as UDP on eth0, never as plain ICMP
+      type: shell
+      on: tr-wg-a
+      skills: [linux.net.vpn]
+      weight: 1.5
+      timeoutSec: 60
+      command: |
+        dev=$(ip -4 route show default | awk '{print $5; exit}'); f=$(mktemp)
+        timeout 9 tcpdump -Z root -ni $dev -w $f "udp port {{port}} or (icmp and host 10.73.2.1)" >/dev/null 2>&1 &
+        sleep 2; ping -c4 -W2 -I 10.73.1.1 10.73.2.1 >/dev/null 2>&1; wait
+        u=$(tcpdump -nr $f "udp port {{port}}" 2>/dev/null | wc -l); i=$(tcpdump -nr $f icmp 2>/dev/null | wc -l); rm -f $f
+        echo "udp=$([ "$u" -gt 0 ] && echo yes || echo no) plain-icmp=$i"
+      expect: {match: exact, value: "udp=yes plain-icmp=0"}
+    - id: config-a
+      description: Depot A has a complete, protected, persistent WireGuard configuration
+      type: shell
+      on: tr-wg-a
+      skills: [linux.net.vpn, linux.net.persistent-config]
+      weight: 1.5
+      command: |
+        python3 - <<'EOP'
+        import glob, os, re, stat, subprocess
+        d = "/etc/systemd/network/"
+        net = None
+        for f in glob.glob(d + "*.netdev"):
+            t = open(f).read()
+            if re.search(r"^Kind=wireguard\s*$", t, re.M):
+                net = (f, t)
+        if not net:
+            print("no-wireguard-netdev"); raise SystemExit
+        f, t = net
+        problems = []
+        if int(re.search(r"^ListenPort=(\d+)", t, re.M).group(1) if re.search(r"^ListenPort=(\d+)", t, re.M) else 0) != {{port}}:
+            problems.append("port")
+        key = re.search(r"^PrivateKey=(\S+)", t, re.M)
+        kf = re.search(r"^PrivateKeyFile=(\S+)", t, re.M)
+        if not key and not kf:
+            problems.append("no-private-key")
+        if stat.S_IMODE(os.stat(f).st_mode) & 0o007:
+            problems.append("netdev-world-readable")
+        if kf:
+            try:
+                if stat.S_IMODE(os.stat(kf.group(1)).st_mode) & 0o007:
+                    problems.append("keyfile-world-readable")
+            except OSError:
+                problems.append("keyfile-missing")
+        peers = re.findall(r"^AllowedIPs=(\S+)", t, re.M)
+        allowed = ",".join(peers).replace(" ", "").split(",")
+        if "10.73.2.0/24" not in allowed:
+            problems.append("allowed-ips-missing-lan")
+        if not re.search(r"^PublicKey=\S{43}=", t, re.M):
+            problems.append("no-peer-key")
+        nets = "".join(open(x).read() for x in glob.glob(d + "*.network") if "wg-depot" in open(x).read())
+        if "Address=10.73.100.1/30" not in nets or "Destination=10.73.2.0/24" not in nets:
+            problems.append("network-file")
+        if subprocess.run(["systemctl", "is-enabled", "systemd-networkd"], capture_output=True, text=True).stdout.strip() != "enabled":
+            problems.append("networkd-not-enabled")
+        print("ok" if not problems else ",".join(problems))
+        EOP
+      expect: {match: exact, value: ok}
+    - id: config-b
+      description: Depot B has a complete, protected, persistent WireGuard configuration
+      type: shell
+      on: tr-wg-b
+      skills: [linux.net.vpn, linux.net.persistent-config]
+      weight: 1.5
+      command: |
+        python3 - <<'EOP'
+        import glob, os, re, stat, subprocess
+        d = "/etc/systemd/network/"
+        net = None
+        for f in glob.glob(d + "*.netdev"):
+            t = open(f).read()
+            if re.search(r"^Kind=wireguard\s*$", t, re.M):
+                net = (f, t)
+        if not net:
+            print("no-wireguard-netdev"); raise SystemExit
+        f, t = net
+        problems = []
+        if int(re.search(r"^ListenPort=(\d+)", t, re.M).group(1) if re.search(r"^ListenPort=(\d+)", t, re.M) else 0) != {{port}}:
+            problems.append("port")
+        key = re.search(r"^PrivateKey=(\S+)", t, re.M)
+        kf = re.search(r"^PrivateKeyFile=(\S+)", t, re.M)
+        if not key and not kf:
+            problems.append("no-private-key")
+        if stat.S_IMODE(os.stat(f).st_mode) & 0o007:
+            problems.append("netdev-world-readable")
+        if kf:
+            try:
+                if stat.S_IMODE(os.stat(kf.group(1)).st_mode) & 0o007:
+                    problems.append("keyfile-world-readable")
+            except OSError:
+                problems.append("keyfile-missing")
+        peers = re.findall(r"^AllowedIPs=(\S+)", t, re.M)
+        allowed = ",".join(peers).replace(" ", "").split(",")
+        if "10.73.1.0/24" not in allowed:
+            problems.append("allowed-ips-missing-lan")
+        if not re.search(r"^PublicKey=\S{43}=", t, re.M):
+            problems.append("no-peer-key")
+        nets = "".join(open(x).read() for x in glob.glob(d + "*.network") if "wg-depot" in open(x).read())
+        if "Address=10.73.100.2/30" not in nets or "Destination=10.73.1.0/24" not in nets:
+            problems.append("network-file")
+        if subprocess.run(["systemctl", "is-enabled", "systemd-networkd"], capture_output=True, text=True).stdout.strip() != "enabled":
+            problems.append("networkd-not-enabled")
+        print("ok" if not problems else ",".join(problems))
+        EOP
+      expect: {match: exact, value: ok}
+  hints:
+    - title: Keys with openssl
+      command: openssl genpkey -algorithm x25519 | openssl pkey -outform DER | tail -c 32 | base64
+      body: "A WireGuard private key is a raw 32-byte X25519 key in base64. Derive the public key from the PEM with openssl pkey -pubout -outform DER | tail -c 32 | base64. Exchange only the public keys between the hosts."
+      cost: 0
+    - title: The netdev file
+      body: "In /etc/systemd/network/50-wg-depot.netdev: [NetDev] Name=wg-depot Kind=wireguard, then [WireGuard] PrivateKey= and ListenPort=, then [WireGuardPeer] PublicKey=, AllowedIPs=, Endpoint=<peer address>:<port>. Make it mode 0640 owned by root:systemd-network because it holds the key."
+      cost: 1
+    - title: Address and route
+      body: "A matching .network file (Match Name=wg-depot) gives the tunnel address; WireGuard does not add routes for AllowedIPs by itself, so add a [Route] Destination=<remote LAN>. Apply with networkctl reload."
+      cost: 1
+  misconceptions:
+    - id: world-readable-key
+      description: Leaves the file holding the private key readable by everyone.
+      feedback: "Anyone who can read the private key can impersonate the gateway. Use mode 0640 root:systemd-network (networkd needs to read it) or a separate key file with the same protection."
+      expectFail: [config-a]
+      mutation:
+        on: tr-wg-a
+        as: learner
+        run: sudo bash /var/lib/cloudtrain/wgsol.sh a world-readable
+    - id: allowed-ips-tunnel-only
+      description: Lists only the peer's tunnel address in AllowedIPs, not its LAN.
+      feedback: "AllowedIPs is the cryptokey routing table: packets for the remote LAN are dropped unless that prefix is listed for the peer."
+      expectFail: [config-a]
+      mutation:
+        on: tr-wg-a
+        as: learner
+        run: sudo bash /var/lib/cloudtrain/wgsol.sh a tunnel-only
+  solution:
+    explanation: Each gateway gets a deterministic test key pair, a netdev file describing wg-depot with the peer's public key, AllowedIPs for its tunnel address and LAN and an endpoint, and a network file with the tunnel address and a route to the remote LAN. networkctl reload creates the interface.
+    steps:
+      - on: tr-wg-a
+        as: learner
+        timeoutSec: 90
+        run: |
+          set -e
+          sudo bash -s <<'EOS'
+          set -e
+          mk() { printf '%s' "tr-wg-$1-{{salt}}" | openssl dgst -sha256 -binary | base64; }
+          pub() { (printf '\x30\x2e\x02\x01\x00\x30\x05\x06\x03\x2b\x65\x6e\x04\x22\x04\x20'; printf '%s' "$1" | base64 -d) | openssl pkey -inform DER -pubout -outform DER | tail -c 32 | base64; }
+          PRIV=$(mk a); PEERPUB=$(pub "$(mk b)"); PEERIP=$(getent ahostsv4 tr-wg-b | awk '{print $1; exit}')
+          cat > /etc/systemd/network/50-wg-depot.netdev <<EOF
+          [NetDev]
+          Name=wg-depot
+          Kind=wireguard
+
+          [WireGuard]
+          PrivateKey=$PRIV
+          ListenPort={{port}}
+
+          [WireGuardPeer]
+          PublicKey=$PEERPUB
+          AllowedIPs=10.73.100.2/32,10.73.2.0/24
+          Endpoint=$PEERIP:{{port}}
+          PersistentKeepalive=5
+          EOF
+          chown root:systemd-network /etc/systemd/network/50-wg-depot.netdev
+          chmod 0640 /etc/systemd/network/50-wg-depot.netdev
+          cat > /etc/systemd/network/50-wg-depot.network <<EOF
+          [Match]
+          Name=wg-depot
+
+          [Network]
+          Address=10.73.100.1/30
+
+          [Route]
+          Destination=10.73.2.0/24
+          EOF
+          networkctl reload
+          sleep 3
+          EOS
+      - on: tr-wg-b
+        as: learner
+        timeoutSec: 90
+        run: |
+          set -e
+          sudo bash -s <<'EOS'
+          set -e
+          mk() { printf '%s' "tr-wg-$1-{{salt}}" | openssl dgst -sha256 -binary | base64; }
+          pub() { (printf '\x30\x2e\x02\x01\x00\x30\x05\x06\x03\x2b\x65\x6e\x04\x22\x04\x20'; printf '%s' "$1" | base64 -d) | openssl pkey -inform DER -pubout -outform DER | tail -c 32 | base64; }
+          PRIV=$(mk b); PEERPUB=$(pub "$(mk a)"); PEERIP=$(getent ahostsv4 tr-wg-a | awk '{print $1; exit}')
+          cat > /etc/systemd/network/50-wg-depot.netdev <<EOF
+          [NetDev]
+          Name=wg-depot
+          Kind=wireguard
+
+          [WireGuard]
+          PrivateKey=$PRIV
+          ListenPort={{port}}
+
+          [WireGuardPeer]
+          PublicKey=$PEERPUB
+          AllowedIPs=10.73.100.1/32,10.73.1.0/24
+          Endpoint=$PEERIP:{{port}}
+          PersistentKeepalive=5
+          EOF
+          chown root:systemd-network /etc/systemd/network/50-wg-depot.netdev
+          chmod 0640 /etc/systemd/network/50-wg-depot.netdev
+          cat > /etc/systemd/network/50-wg-depot.network <<EOF
+          [Match]
+          Name=wg-depot
+
+          [Network]
+          Address=10.73.100.2/30
+
+          [Route]
+          Destination=10.73.1.0/24
+          EOF
+          networkctl reload
+          sleep 3
+          EOS
+    alternatives:
+      - id: private-key-file
+        description: Keep the private key in a separate file referenced with PrivateKeyFile.
+        steps:
+          - on: tr-wg-a
+            as: learner
+            timeoutSec: 90
+            run: sudo bash /var/lib/cloudtrain/wgsol.sh a keyfile
+          - on: tr-wg-b
+            as: learner
+            timeoutSec: 90
+            run: sudo bash /var/lib/cloudtrain/wgsol.sh b keyfile

@@ -1,0 +1,235 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: static-ip-persistent
+  title: Give the signalling host a persistent static address
+  domain: linux
+  frameworks: [rhcsa-aligned:networking, lfcs:networking, lpic1:networking, linuxplus:system-management]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [netplan, static-ip, ipv6, hostname, persistence]
+  version: 1
+spec:
+  description: |
+    Work on **`tr-net-01`** (`ssh tr-net-01`; you have `sudo`). It is the signalling host that
+    will be renamed **`tr-signal-02`**. It has a spare interface **`eth1`** (up, no address)
+    that connects to the signalling switch: the switch is the namespace `tr-sw` with the
+    gateway address **10.40.2.1** (and `fd00:40:2::1`). Behind the gateway lies the signalling
+    backbone **{{bb}}.0/24** (`{{bb}}.1` answers pings).
+
+    Configure `eth1` with the distribution's native tooling (Netplan on this Ubuntu host)
+    so that all of this is **active now and persistent across a reboot**:
+
+    - IPv4 address **10.40.2.15/24** and IPv6 address **fd00:40:2::15/64** on `eth1`;
+    - a **route to {{bb}}.0/24 via the gateway 10.40.2.1** on `eth1` (the host has a default
+      route on `eth0`, which must stay as it is);
+    - the static host name **`tr-signal-02`** (`hostnamectl`).
+
+    Do not touch `eth0`, its address or the default route.
+  objectives:
+    - Configure a dual-stack static address with Netplan
+    - Add a static route through a gateway
+    - Set the static host name
+    - Apply the configuration without disturbing the management interface
+  params:
+    bb:
+      type: choice
+      values: ["10.40.99", "10.40.98"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-net-01
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["1Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-net-01
+      timeoutSec: 120
+      run: |
+        set -eu
+        install -d -m 0700 /var/lib/cloudtrain
+        # eth1 is a veth end standing in for a second NIC (the VM has one); eth0 is never touched
+        for f in /etc/netplan/*.yaml; do
+          [ -f "$f" ] || continue
+          python3 - "$f" <<'EOT'
+        import sys, yaml
+        p = sys.argv[1]
+        d = yaml.safe_load(open(p)) or {}
+        e = (d.get("network") or {}).get("ethernets") or {}
+        if "eth1" in e:
+            del e["eth1"]
+            yaml.safe_dump(d, open(p, "w"))
+        EOT
+        done
+        rm -f /etc/netplan/*eth1*.yaml /etc/systemd/network/*eth1*.network
+        ip netns del tr-sw 2>/dev/null || true
+        ip link del eth1 2>/dev/null || true
+        ip netns add tr-sw; ip -n tr-sw link set lo up
+        ip link add eth1 type veth peer name eth1p
+        ip link set eth1p netns tr-sw
+        ip -n tr-sw addr add 10.40.2.1/24 dev eth1p
+        ip -n tr-sw addr add fd00:40:2::1/64 dev eth1p nodad
+        ip -n tr-sw link set eth1p up
+        ip -n tr-sw link add bb0 type dummy
+        ip -n tr-sw addr add {{bb}}.1/24 dev bb0
+        ip -n tr-sw link set bb0 up
+        ip link set eth1 up
+        ip addr flush dev eth1
+        hostnamectl set-hostname tr-net-01
+  checks:
+    - id: addr-v4
+      description: eth1 carries 10.40.2.15/24 now
+      type: shell
+      on: tr-net-01
+      skills: [linux.net.persistent-config]
+      weight: 1
+      command: ip -o -4 addr show dev eth1 scope global 2>/dev/null | awk '{print $4}' | paste -sd,
+      expect: {match: exact, value: "10.40.2.15/24"}
+    - id: addr-v6
+      description: eth1 carries fd00:40:2::15/64 now
+      type: shell
+      on: tr-net-01
+      skills: [linux.net.persistent-config]
+      weight: 1
+      timeoutSec: 20
+      command: |
+        for i in 1 2 3 4 5; do
+          a=$(ip -o -6 addr show dev eth1 scope global 2>/dev/null | grep -v tentative | awk '{print $4}' | paste -sd,)
+          [ -n "$a" ] && break; sleep 1
+        done
+        echo "$a"
+      expect: {match: exact, value: "fd00:40:2::15/64"}
+    - id: backbone-route
+      description: The backbone is reached via the gateway on eth1
+      type: shell
+      on: tr-net-01
+      skills: [linux.net.persistent-config, linux.net.ip-config]
+      weight: 1.5
+      timeoutSec: 20
+      command: |
+        ip route get {{bb}}.1 2>/dev/null | head -1 | grep -o 'via 10.40.2.1 dev eth1' || echo missing
+        ping -c1 -W2 {{bb}}.1 >/dev/null 2>&1 || echo no-reply
+      expect: {match: exact, value: "via 10.40.2.1 dev eth1"}
+    - id: persistent-config
+      description: Netplan (or networkd) holds both addresses and the route
+      type: shell
+      on: tr-net-01
+      skills: [linux.net.persistent-config]
+      weight: 2
+      command: |
+        python3 - <<'EOP'
+        import glob, re, subprocess, yaml
+        out = subprocess.run(["netplan", "get", "ethernets.eth1"], capture_output=True, text=True).stdout
+        d = yaml.safe_load(out) or {}
+        addrs = {str(a).lower() for a in (d.get("addresses") or [])}
+        route = any(str(r.get("to")) == "{{bb}}.0/24" and str(r.get("via")) == "10.40.2.1" for r in (d.get("routes") or []))
+        if {"10.40.2.15/24", "fd00:40:2::15/64"} <= addrs and route:
+            print("persistent"); raise SystemExit
+        for f in glob.glob("/etc/systemd/network/*.network"):
+            t = open(f).read()
+            if re.search(r"^Name=eth1\s*$", t, re.M) and "Address=10.40.2.15/24" in t and re.search(r"Address=fd00:40:2::15/64", t, re.I) \
+               and "Destination={{bb}}.0/24" in t and "Gateway=10.40.2.1" in t:
+                print("persistent"); raise SystemExit
+        print("not-persistent")
+        EOP
+      expect: {match: exact, value: persistent}
+    - id: hostname
+      description: The static host name is tr-signal-02
+      type: shell
+      on: tr-net-01
+      skills: [linux.net.persistent-config]
+      weight: 1
+      command: echo "$(hostnamectl --static) $(cat /etc/hostname)"
+      expect: {match: exact, value: "tr-signal-02 tr-signal-02"}
+    - id: eth0-untouched
+      description: The default route still leaves through eth0
+      type: shell
+      on: tr-net-01
+      skills: [linux.net.persistent-config]
+      weight: 0.5
+      command: ip route show default | awk '{for (i = 1; i <= NF; i++) if ($i == "dev") print $(i + 1)}' | sort -u | paste -sd,
+      expect: {match: exact, value: eth0}
+  hints:
+    - title: One file for eth1
+      body: "Netplan reads YAML from /etc/netplan/*.yaml. Add a file with ethernets: eth1: addresses: [...] and routes: - to: <prefix> via: <gateway>. Both address families go in the same addresses list."
+      cost: 0
+    - title: Apply it safely
+      command: sudo netplan try
+      body: "netplan try applies the configuration and rolls back if you do not confirm; netplan apply applies it right away. Neither touches eth0 if the file only describes eth1. Files must be mode 0600."
+      cost: 1
+    - title: Host name
+      command: sudo hostnamectl set-hostname tr-signal-02
+      body: "hostnamectl writes /etc/hostname (the static name). The hostname command only changes the running kernel name."
+      cost: 0
+  misconceptions:
+    - id: ip-commands-only
+      description: Uses ip addr, ip route and hostname, which last only until reboot.
+      feedback: "ip and hostname change the running system only. Netplan holds the addresses and routes, hostnamectl the static host name."
+      expectFail: [persistent-config, hostname]
+      mutation:
+        on: tr-net-01
+        as: learner
+        run: |
+          sudo ip addr add 10.40.2.15/24 dev eth1
+          sudo ip addr add fd00:40:2::15/64 dev eth1
+          sudo ip route add {{bb}}.0/24 via 10.40.2.1 dev eth1
+          sudo hostname tr-signal-02
+    - id: written-not-applied
+      description: Writes the Netplan file and the host name but never applies the file.
+      feedback: "Netplan files do nothing until netplan apply (or try, or a reboot) hands them to systemd-networkd."
+      expectFail: [addr-v4, addr-v6, backbone-route]
+      mutation:
+        on: tr-net-01
+        as: learner
+        run: |
+          printf 'network:\n  version: 2\n  ethernets:\n    eth1:\n      addresses: [10.40.2.15/24, "fd00:40:2::15/64"]\n      routes:\n        - to: {{bb}}.0/24\n          via: 10.40.2.1\n' | sudo tee /etc/netplan/60-eth1.yaml >/dev/null
+          sudo chmod 0600 /etc/netplan/60-eth1.yaml
+          sudo hostnamectl set-hostname tr-signal-02
+    - id: ipv4-only
+      description: Configures only the IPv4 address and route.
+      feedback: "The brief asks for a dual-stack interface: add the IPv6 address to the same addresses list."
+      expectFail: [addr-v6, persistent-config]
+      mutation:
+        on: tr-net-01
+        as: learner
+        timeoutSec: 90
+        run: |
+          printf 'network:\n  version: 2\n  ethernets:\n    eth1:\n      addresses: [10.40.2.15/24]\n      routes:\n        - to: {{bb}}.0/24\n          via: 10.40.2.1\n' | sudo tee /etc/netplan/60-eth1.yaml >/dev/null
+          sudo chmod 0600 /etc/netplan/60-eth1.yaml
+          sudo netplan apply
+          sudo hostnamectl set-hostname tr-signal-02
+          sleep 2
+  solution:
+    explanation: A Netplan file for eth1 lists both addresses and the route; netplan apply renders it for systemd-networkd and applies it; hostnamectl stores the static name.
+    steps:
+      - on: tr-net-01
+        as: learner
+        timeoutSec: 90
+        run: |
+          set -e
+          printf 'network:\n  version: 2\n  ethernets:\n    eth1:\n      addresses: [10.40.2.15/24, "fd00:40:2::15/64"]\n      routes:\n        - to: {{bb}}.0/24\n          via: 10.40.2.1\n' | sudo tee /etc/netplan/60-eth1.yaml >/dev/null
+          sudo chmod 0600 /etc/netplan/60-eth1.yaml
+          sudo netplan apply
+          sudo hostnamectl set-hostname tr-signal-02
+          sleep 3
+          ip -br addr show eth1
+          ping -c1 -W2 {{bb}}.1
+    alternatives:
+      - id: networkd-file
+        description: Skip Netplan and write a systemd-networkd .network file for eth1 directly.
+        steps:
+          - on: tr-net-01
+            as: learner
+            timeoutSec: 90
+            run: |
+              set -e
+              printf '[Match]\nName=eth1\n\n[Network]\nAddress=10.40.2.15/24\nAddress=fd00:40:2::15/64\n\n[Route]\nDestination={{bb}}.0/24\nGateway=10.40.2.1\n' | sudo tee /etc/systemd/network/20-eth1.network >/dev/null
+              sudo networkctl reload
+              sudo networkctl reconfigure eth1
+              sudo hostnamectl set-hostname tr-signal-02
+              sleep 3

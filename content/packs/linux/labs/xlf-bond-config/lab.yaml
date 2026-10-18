@@ -1,0 +1,197 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xlf-bond-config
+  title: Bond two interfaces in active-backup mode
+  domain: linux
+  frameworks: [lfcs:networking]
+  difficulty: hard
+  estimatedMinutes: 10
+  tags: [exam, bonding, netplan, failover]
+  version: 1
+spec:
+  description: |
+    **Host:** `tr-ops-01` (`ssh tr-ops-01`, then `sudo -i`)
+
+    The host has two spare interfaces, **`eth3`** and **`eth4`**, cabled to the signalling
+    switch (reachable at **10.40.7.1/24**). Create a **bond named `bond1`** from them with
+    **Netplan**:
+
+    - mode **active-backup**, link monitoring every **100 ms**;
+    - the IPv4 address **`{{addr}}`** on `bond1`;
+    - applied now and kept after a reboot.
+
+    The grader fails the active port and expects `ping 10.40.7.1` through the bond to keep
+    working. Do not touch `eth0` or the default route.
+  objectives:
+    - Define a bond of two interfaces in Netplan with the right mode and monitor
+  params:
+    addr:
+      type: choice
+      values: ["10.40.7.10/24", "10.40.7.20/24", "10.40.7.30/24"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-ops-01
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["2Gi", "1Gi", "2Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-ops-01
+      timeoutSec: 120
+      run: |
+        set -eu
+        modprobe bonding 2>/dev/null || grep -q '/bonding.ko' /lib/modules/$(uname -r)/modules.builtin 2>/dev/null || { echo "kernel module 'bonding' is not available on this image" >&2; exit 1; }
+        # two veth ends stand in for spare NICs, their peers sit in the switch namespace tr-bsw
+        ip link del bond1 2>/dev/null || true
+        for l in eth3 eth4; do ip link del $l 2>/dev/null || true; done
+        ip netns del tr-bsw 2>/dev/null || true
+        ip netns add tr-bsw; ip -n tr-bsw link set lo up
+        ip -n tr-bsw link add bsw0 type bridge
+        ip -n tr-bsw addr add 10.40.7.1/24 dev bsw0
+        ip -n tr-bsw link set bsw0 up
+        for i in 3 4; do
+          ip link add eth$i type veth peer name eth${i}p
+          ip link set eth${i}p netns tr-bsw
+          ip -n tr-bsw link set eth${i}p master bsw0
+          ip -n tr-bsw link set eth${i}p up
+          ip link set eth$i up
+        done
+        rm -f /etc/netplan/*bond*.yaml /etc/netplan/*eth3*.yaml
+        for f in /etc/netplan/*.yaml; do
+          [ -f "$f" ] || continue
+          python3 - "$f" <<'EOT'
+        import sys, yaml
+        p = sys.argv[1]
+        d = yaml.safe_load(open(p)) or {}
+        n = d.get("network") or {}
+        ch = False
+        for k in ("eth3", "eth4"):
+            if k in (n.get("ethernets") or {}):
+                del n["ethernets"][k]; ch = True
+        if "bond1" in (n.get("bonds") or {}):
+            del n["bonds"]["bond1"]; ch = True
+        if ch:
+            yaml.safe_dump(d, open(p, "w"))
+        EOT
+        done
+        ip -br link show eth3 | grep -q eth3 && ip -br link show eth4 | grep -q eth4
+  checks:
+    - id: bond-live
+      description: bond1 is an active-backup bond with a link monitor and eth3 and eth4 as ports
+      type: shell
+      on: tr-ops-01
+      skills: [linux.net.bridges-bonds]
+      weight: 2
+      command: |
+        f=/proc/net/bonding/bond1
+        [ -r $f ] || { echo no-bond; exit 0; }
+        m=$(awk -F': ' '/^Bonding Mode/ {print $2}' $f); i=$(awk -F': ' '/^MII Polling Interval/ {print $2}' $f)
+        s=$(awk -F': ' '/^Slave Interface/ {print $2}' $f | sort | paste -sd,)
+        [ "$m" = "fault-tolerance (active-backup)" ] && [ "${i:-0}" -gt 0 ] && [ "$s" = eth3,eth4 ] && echo ok || echo "mode=$m miimon=$i ports=$s"
+      expect: {match: exact, value: ok}
+    - id: bond-address
+      description: bond1 carries {{addr}}
+      type: shell
+      on: tr-ops-01
+      skills: [linux.net.persistent-config]
+      weight: 1
+      command: ip -o -4 addr show dev bond1 2>/dev/null | awk '{print $4}' | paste -sd,
+      expect: {match: exact, value: "{{addr}}"}
+    - id: failover
+      description: Pings through the bond continue after the active port fails
+      type: shell
+      on: tr-ops-01
+      skills: [linux.net.bridges-bonds]
+      weight: 3
+      timeoutSec: 60
+      command: |
+        f=/proc/net/bonding/bond1
+        act=$(awk -F': ' '/^Currently Active Slave/ {print $2}' $f 2>/dev/null)
+        [ -n "$act" ] || { echo no-active; exit 0; }
+        ping -c2 -W2 -I bond1 10.40.7.1 >/dev/null 2>&1 || { echo down-before; exit 0; }
+        ip netns exec tr-bsw ip link set ${act}p down
+        sleep 4
+        ok=$(ping -c3 -W2 -I bond1 10.40.7.1 >/dev/null 2>&1 && echo up || echo down)
+        new=$(awk -F': ' '/^Currently Active Slave/ {print $2}' $f)
+        ip netns exec tr-bsw ip link set ${act}p up
+        sleep 3
+        echo "$ok switched=$([ "$new" != "$act" ] && echo yes || echo no)"
+      expect: {match: exact, value: "up switched=yes"}
+    - id: netplan-config
+      description: Netplan defines bond1 with the right ports, mode, monitor and address
+      type: shell
+      on: tr-ops-01
+      skills: [linux.net.persistent-config, linux.net.bridges-bonds]
+      weight: 2
+      command: |
+        python3 - <<'EOP'
+        import subprocess, yaml
+        out = subprocess.run(["netplan", "get", "bonds.bond1"], capture_output=True, text=True).stdout
+        d = yaml.safe_load(out) or {}
+        p = d.get("parameters") or {}
+        mii = str(p.get("mii-monitor-interval", "0")).replace("ms", "").strip()
+        ok = sorted(d.get("interfaces") or []) == ["eth3", "eth4"] and p.get("mode") == "active-backup" and mii.isdigit() and int(mii) > 0 \
+             and "{{addr}}" in [str(a) for a in (d.get("addresses") or [])]
+        print("persistent" if ok else "incomplete")
+        EOP
+      expect: {match: exact, value: persistent}
+  misconceptions:
+    - id: no-monitor
+      description: Defines the bond without a link monitor, so a failed port is never detected.
+      feedback: "Without mii-monitor-interval (or ARP monitoring) the bond never notices the failure; set mii-monitor-interval: 100."
+      expectFail: [bond-live, failover, netplan-config]
+      mutation:
+        on: tr-ops-01
+        as: learner
+        timeoutSec: 90
+        run: |
+          printf 'network:\n  version: 2\n  ethernets:\n    eth3: {}\n    eth4: {}\n  bonds:\n    bond1:\n      interfaces: [eth3, eth4]\n      addresses: [{{addr}}]\n      parameters:\n        mode: active-backup\n' | sudo tee /etc/netplan/60-bond1.yaml >/dev/null
+          sudo chmod 0600 /etc/netplan/60-bond1.yaml
+          sudo netplan apply
+          sleep 3
+    - id: written-not-applied
+      description: Writes the bond into Netplan and never applies it.
+      feedback: "The file only takes effect after netplan apply (or a reboot); check /proc/net/bonding/bond1."
+      expectFail: [bond-live, bond-address, failover]
+      mutation:
+        on: tr-ops-01
+        as: learner
+        run: |
+          printf 'network:\n  version: 2\n  ethernets:\n    eth3: {}\n    eth4: {}\n  bonds:\n    bond1:\n      interfaces: [eth3, eth4]\n      addresses: [{{addr}}]\n      parameters:\n        mode: active-backup\n        mii-monitor-interval: 100\n' | sudo tee /etc/netplan/60-bond1.yaml >/dev/null
+          sudo chmod 0600 /etc/netplan/60-bond1.yaml
+  solution:
+    explanation: The member interfaces are declared as ethernets and listed under a bonds entry with mode active-backup and a monitor interval; netplan apply creates the bond and its address.
+    steps:
+      - on: tr-ops-01
+        as: learner
+        timeoutSec: 90
+        run: |
+          set -e
+          printf 'network:\n  version: 2\n  ethernets:\n    eth3: {}\n    eth4: {}\n  bonds:\n    bond1:\n      interfaces: [eth3, eth4]\n      addresses: [{{addr}}]\n      parameters:\n        mode: active-backup\n        mii-monitor-interval: 100\n' | sudo tee /etc/netplan/60-bond1.yaml >/dev/null
+          sudo chmod 0600 /etc/netplan/60-bond1.yaml
+          sudo netplan apply
+          sleep 4
+          cat /proc/net/bonding/bond1
+    alternatives:
+      - id: netplan-set
+        description: Build the same bond with netplan set instead of editing a file.
+        steps:
+          - on: tr-ops-01
+            as: learner
+            timeoutSec: 90
+            run: |
+              set -e
+              sudo netplan set 'ethernets.eth3={}'
+              sudo netplan set 'ethernets.eth4={}'
+              sudo netplan set 'bonds.bond1.interfaces=[eth3, eth4]'
+              sudo netplan set 'bonds.bond1.addresses=[{{addr}}]'
+              sudo netplan set 'bonds.bond1.parameters.mode=active-backup'
+              sudo netplan set 'bonds.bond1.parameters.mii-monitor-interval=100'
+              sudo netplan apply
+              sleep 4

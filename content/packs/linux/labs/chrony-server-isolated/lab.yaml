@@ -1,0 +1,235 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: chrony-server-isolated
+  title: Serve time to an isolated depot network
+  domain: linux
+  frameworks: [lfcs:networking, lpic1:essential-services]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [chrony, ntp, server, firewalld, allow]
+  version: 1
+spec:
+  description: |
+    The depot network has no internet access, so Tallowmere needs its own time server.
+
+    - **`tr-ntp-1`** (`ssh tr-ntp-1`; you have `sudo`) must become a chrony **server** that
+      uses its own clock as the reference: `local stratum {{stratum}}`.
+    - It must answer only the **depot client network**: the /24 that `tr-cl-01` sits in (see
+      `ip -4 addr` on `tr-cl-01`). Another host, the namespace `outsider` (10.99.1.2) on
+      `tr-ntp-1`, must **not** be served: use `allow` for the depot network instead of
+      `allow all`.
+    - The firewall on `tr-ntp-1` must let NTP in (`firewalld` service `ntp`), permanently.
+    - **`tr-cl-01`** (`ssh tr-cl-01`; you have `sudo`) must use `tr-ntp-1` as its time source
+      (it cannot reach any other) and report a synchronised clock: `chronyc tracking` shows
+      the server's stratum plus one and leap status Normal.
+
+    Everything must survive a reboot.
+  objectives:
+    - Turn chronyd into a server with a local reference and an allow list
+    - Open the NTP service in firewalld permanently
+    - Point a client at the server and verify synchronisation with chronyc
+  params:
+    stratum:
+      type: choice
+      values: ["8", "10"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-ntp-1
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536}
+        access: [ssh, console]
+      - name: tr-cl-01
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536}
+        access: [ssh, console]
+  setup:
+    - on: tr-ntp-1
+      timeoutSec: 150
+      run: |
+        set -eu
+        install -d -m 0700 /var/lib/cloudtrain
+        systemctl enable --now firewalld >/dev/null 2>&1 || true
+        firewall-cmd -q --permanent --remove-service=ntp 2>/dev/null || true
+        firewall-cmd -q --reload || true
+        sed -i '/^local /d;/^allow /d' /etc/chrony.conf
+        rm -f /etc/chrony.d/tr-*.conf
+        systemctl enable chronyd >/dev/null 2>&1 || true
+        systemctl restart chronyd
+        ip netns del outsider 2>/dev/null || true
+        ip link del out0 2>/dev/null || true
+        ip netns add outsider; ip -n outsider link set lo up
+        ip link add out0 type veth peer name out0p
+        ip link set out0p netns outsider
+        ip addr add 10.99.1.1/24 dev out0; ip link set out0 up
+        ip -n outsider addr add 10.99.1.2/24 dev out0p; ip -n outsider link set out0p up
+        command -v nmcli >/dev/null 2>&1 && nmcli device set out0 managed no >/dev/null 2>&1 || true
+        printf 'server 10.99.1.1 iburst\nmaxsamples 1\ncmdport 0\nport 0\npidfile /tmp/tr-outsider-chronyd.pid\n' > /var/lib/cloudtrain/outsider.conf
+    - on: tr-cl-01
+      timeoutSec: 90
+      run: |
+        set -eu
+        rm -f /etc/chrony.d/tr-*.conf
+        systemctl enable chronyd >/dev/null 2>&1 || true
+        systemctl restart chronyd
+  checks:
+    - id: client-synchronised
+      description: tr-cl-01 is synchronised to tr-ntp-1 and shows the right stratum
+      type: shell
+      on: tr-cl-01
+      skills: [linux.net.time-sync]
+      weight: 3
+      timeoutSec: 180
+      command: |
+        ip=$(getent ahostsv4 tr-ntp-1 | awk '{print $1; exit}')
+        for i in $(seq 50); do
+          s=$(chronyc -n sources 2>/dev/null | awk '/^\^\*/ {print $2}')
+          st=$(chronyc tracking 2>/dev/null | awk -F': *' '/^Stratum/ {print $2}')
+          lp=$(chronyc tracking 2>/dev/null | awk -F': *' '/^Leap status/ {print $2}')
+          [ "$s" = "$ip" ] && [ "$st" = "$(( {{stratum}} + 1 ))" ] && [ "$lp" = Normal ] && { echo synchronised; exit 0; }
+          sleep 3
+        done
+        echo "src=${s:-none} stratum=${st:-none} leap=${lp:-none}"
+      expect: {match: exact, value: synchronised}
+    - id: client-config
+      description: The client's chrony configuration names tr-ntp-1 and is enabled at boot
+      type: shell
+      on: tr-cl-01
+      skills: [linux.net.time-sync]
+      weight: 1
+      command: |
+        ip=$(getent ahostsv4 tr-ntp-1 | awk '{print $1; exit}')
+        cat /etc/chrony.conf /etc/chrony.d/*.conf 2>/dev/null | awk '$1 == "server" || $1 == "pool" {print $2}' | grep -Eqx "tr-ntp-1|$ip" \
+          && [ "$(systemctl is-enabled chronyd 2>/dev/null)" = enabled ] && echo configured || echo missing
+      expect: {match: exact, value: configured}
+    - id: server-local-stratum
+      description: tr-ntp-1 serves its local reference at the requested stratum
+      type: shell
+      on: tr-ntp-1
+      skills: [linux.net.time-sync]
+      weight: 1.5
+      timeoutSec: 90
+      command: |
+        for i in $(seq 25); do
+          st=$(chronyc tracking 2>/dev/null | awk -F': *' '/^Stratum/ {print $2}')
+          [ "$st" = "{{stratum}}" ] && { echo local-ok; exit 0; }
+          sleep 3
+        done
+        echo "stratum=${st:-none}"
+      expect: {match: exact, value: local-ok}
+    - id: outsider-refused
+      description: A host outside the depot network gets no time from tr-ntp-1
+      type: shell
+      on: tr-ntp-1
+      skills: [linux.net.time-sync]
+      weight: 2
+      timeoutSec: 60
+      command: |
+        out=$(ip netns exec outsider chronyd -Q -t 10 -f /var/lib/cloudtrain/outsider.conf 2>&1)
+        echo "$out" | grep -q 'System clock wrong' && echo served || echo refused
+      expect: {match: exact, value: refused}
+    - id: server-persistent
+      description: The server settings are saved and NTP is open permanently
+      type: shell
+      on: tr-ntp-1
+      skills: [linux.net.time-sync, linux.net.firewalld]
+      weight: 1.5
+      command: |
+        c=$(cat /etc/chrony.conf /etc/chrony.d/*.conf 2>/dev/null)
+        echo "$c" | grep -Eq '^local +stratum +{{stratum}}( |$)' && echo "$c" | grep -Eq '^allow +[0-9]' || { echo config-missing; exit 0; }
+        [ "$(systemctl is-enabled chronyd 2>/dev/null)" = enabled ] || { echo not-enabled; exit 0; }
+        { firewall-cmd --permanent --query-service=ntp 2>/dev/null; } | grep -qx yes && echo persistent || echo firewall-closed
+      expect: {match: exact, value: persistent}
+  hints:
+    - title: Server directives
+      body: "chrony serves time to the networks listed with allow, and local stratum N makes it act as a reference when it has no upstream source. Both go into /etc/chrony.conf; restart chronyd afterwards."
+      cost: 0
+    - title: Let NTP in
+      command: sudo firewall-cmd --permanent --add-service=ntp
+      body: "Enterprise Linux ships firewalld with a default zone that blocks UDP 123. Add the ntp service permanently and reload."
+      cost: 1
+    - title: The client side
+      body: "On tr-cl-01 add 'server tr-ntp-1 iburst' (and comment out the pool line), restart chronyd and watch chronyc sources and chronyc tracking. The client's stratum is the server's plus one."
+      cost: 1
+  misconceptions:
+    - id: allow-all
+      description: Serves everybody with allow all.
+      feedback: "allow all answers every network, including hosts that must not get time. Restrict allow to the depot client network."
+      expectFail: [outsider-refused]
+      mutation:
+        on: tr-ntp-1
+        as: learner
+        run: |
+          printf 'local stratum {{stratum}}\nallow all\n' | sudo tee -a /etc/chrony.conf >/dev/null
+          sudo firewall-cmd --permanent --add-service=ntp >/dev/null
+          sudo firewall-cmd --reload >/dev/null
+          sudo systemctl restart chronyd
+    - id: no-local-reference
+      description: Allows the client network but never gives the server a local reference.
+      feedback: "With no reachable upstream, chronyd is unsynchronised and its clients refuse it. local stratum N makes it a reference."
+      expectFail: [server-local-stratum, server-persistent]
+      mutation:
+        on: tr-ntp-1
+        as: learner
+        run: |
+          printf 'allow 10.0.0.0/8\n' | sudo tee -a /etc/chrony.conf >/dev/null
+          sudo firewall-cmd --permanent --add-service=ntp >/dev/null
+          sudo firewall-cmd --reload >/dev/null
+          sudo systemctl restart chronyd
+  solution:
+    explanation: The server gets a local reference and an allow line for the depot client network, with the ntp service opened in firewalld; the client gets a server line for tr-ntp-1. Both restart chronyd, and the client then reports the server's stratum plus one.
+    steps:
+      - on: tr-ntp-1
+        as: learner
+        timeoutSec: 90
+        run: |
+          set -e
+          cip=$(getent ahostsv4 tr-cl-01 | awk '{print $1; exit}')
+          printf 'local stratum {{stratum}}\nallow %s.0/24\n' "${cip%.*}" | sudo tee -a /etc/chrony.conf >/dev/null
+          sudo firewall-cmd --permanent --add-service=ntp
+          sudo firewall-cmd --reload
+          sudo systemctl restart chronyd
+          sleep 5
+          chronyc tracking
+      - on: tr-cl-01
+        as: learner
+        timeoutSec: 90
+        run: |
+          set -e
+          sudo sed -i 's/^pool /#pool /' /etc/chrony.conf
+          echo 'server tr-ntp-1 iburst' | sudo tee -a /etc/chrony.conf >/dev/null
+          sudo systemctl restart chronyd
+          sleep 15
+          chronyc sources
+    alternatives:
+      - id: dropin-files
+        description: Put the settings in /etc/chrony.d drop-ins instead of editing chrony.conf.
+        steps:
+          - on: tr-ntp-1
+            as: learner
+            timeoutSec: 90
+            run: |
+              set -e
+              cip=$(getent ahostsv4 tr-cl-01 | awk '{print $1; exit}')
+              grep -Eq '^(confdir|include) +/etc/chrony.d' /etc/chrony.conf || echo 'confdir /etc/chrony.d' | sudo tee -a /etc/chrony.conf >/dev/null
+              printf 'local stratum {{stratum}}\nallow %s.0/24\n' "${cip%.*}" | sudo tee /etc/chrony.d/depot-server.conf >/dev/null
+              sudo firewall-cmd --permanent --add-service=ntp
+              sudo firewall-cmd --reload
+              sudo systemctl restart chronyd
+              sleep 5
+          - on: tr-cl-01
+            as: learner
+            timeoutSec: 90
+            run: |
+              set -e
+              sudo sed -i 's/^pool /#pool /' /etc/chrony.conf
+              echo 'server tr-ntp-1 iburst' | sudo tee -a /etc/chrony.conf >/dev/null
+              sudo systemctl restart chronyd
+              sleep 15

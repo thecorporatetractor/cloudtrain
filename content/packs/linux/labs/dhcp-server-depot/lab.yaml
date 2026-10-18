@@ -1,0 +1,256 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: dhcp-server-depot
+  title: Serve DHCP to a new depot segment
+  domain: linux
+  frameworks: [lpic2:client-mgmt, linuxplus:services-users]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [dhcp, dnsmasq, services, reservations]
+  version: 1
+spec:
+  description: |
+    Work on **`tr-net-01`** (`ssh tr-net-01`; you have `sudo`), the gateway for a new depot
+    segment. The segment is the interface **`seg0`** (10.62.1.1/24); the machines on it are
+    modelled by the network namespace `depot-seg` (interface `seg0p`, no address). The ISC and
+    Kea servers are not available here: use **dnsmasq** as the DHCP server (it is installed
+    but not configured or enabled; it is also a DNS server, so keep it from fighting
+    `systemd-resolved` for port 53).
+
+    Configure dnsmasq so that, on `seg0` only:
+
+    - it hands out leases from **10.62.1.100 to 10.62.1.200**;
+    - clients receive the **gateway 10.62.1.1** and the **DNS server {{dns}}**;
+    - the depot printer with MAC **{{pmac}}** always gets the fixed address **{{pip}}**;
+    - the service is enabled and starts at boot.
+
+    Test it from the client side with the helper
+    `sudo ip netns exec depot-seg tr-dhcp-probe <mac>`: it sends a DHCP DISCOVER for that MAC
+    and prints the offer (`ip`, `router`, `dns`, `lease`). If you prefer a stock tool, install
+    `nmap` from the local mirror and run `nmap --script broadcast-dhcp-discover -e seg0p`
+    inside the namespace.
+  objectives:
+    - Configure dnsmasq as a DHCP server on one interface
+    - Set the router and DNS options and a lease range
+    - Reserve an address for a MAC address
+    - Test the server from a client on the segment
+  params:
+    dns:
+      type: choice
+      values: ["10.53.0.53", "10.53.1.10"]
+    pmac:
+      type: choice
+      values: ["02:54:52:00:00:10", "02:54:52:00:00:11"]
+    pip:
+      type: choice
+      values: ["10.62.1.50", "10.62.1.60"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-net-01
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["1Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-net-01
+      timeoutSec: 200
+      run: |
+        set -eu
+        V=/var/lib/cloudtrain; install -d -m 0700 $V
+        if ! dpkg -s dnsmasq >/dev/null 2>&1; then
+          if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then mv /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list.d/ubuntu.sources.cloud-init; rm -rf /var/lib/apt/lists/*; fi
+          apt-get update -q >/dev/null
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -q dnsmasq >/dev/null
+        fi
+        systemctl disable --now dnsmasq >/dev/null 2>&1 || true
+        systemctl reset-failed dnsmasq >/dev/null 2>&1 || true
+        rm -f /etc/dnsmasq.d/*.conf /var/lib/misc/dnsmasq.leases
+        ip netns del depot-seg 2>/dev/null || true
+        ip link del seg0 2>/dev/null || true
+        ip netns add depot-seg; ip -n depot-seg link set lo up
+        ip link add seg0 type veth peer name seg0p
+        ip link set seg0p netns depot-seg
+        ip addr add 10.62.1.1/24 dev seg0; ip link set seg0 up
+        ip -n depot-seg link set seg0p up
+        cat > $V/dhcp-probe.py <<'EOPY'
+        #!/usr/bin/python3
+        """Minimal DHCP client probe: sends a DISCOVER with the given MAC and prints the OFFER.
+        Run it inside the client namespace:  sudo ip netns exec depot-seg tr-dhcp-probe [mac]"""
+        import random, socket, struct, sys
+
+        mac = sys.argv[1] if len(sys.argv) > 1 else "02:00:00:aa:bb:01"
+        iface = sys.argv[2] if len(sys.argv) > 2 else "seg0p"
+        mb = bytes(int(x, 16) for x in mac.split(":"))
+        xid = random.getrandbits(32)
+        pkt = struct.pack("!BBBBIHH4s4s4s4s16s64s128s", 1, 1, 6, 0, xid, 0, 0x8000, b"", b"", b"", b"", mb, b"", b"")
+        pkt += b"\x63\x82\x53\x63" + bytes([53, 1, 1, 55, 4, 1, 3, 6, 51, 255])
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, iface.encode() + b"\0")
+        s.bind(("0.0.0.0", 68))
+        s.settimeout(4)
+        data = None
+        for _ in range(3):
+            s.sendto(pkt, ("255.255.255.255", 67))
+            try:
+                while True:
+                    d, _a = s.recvfrom(2048)
+                    if len(d) > 240 and d[0] == 2 and struct.unpack("!I", d[4:8])[0] == xid:
+                        data = d
+                        break
+                break
+            except socket.timeout:
+                continue
+        if not data:
+            print("no-offer")
+            sys.exit(1)
+        opts, i = {}, 240
+        while i < len(data) and data[i] != 255:
+            if data[i] == 0:
+                i += 1
+                continue
+            t, l = data[i], data[i + 1]
+            opts[t] = data[i + 2:i + 2 + l]
+            i += 2 + l
+        ip = socket.inet_ntoa(data[16:20])
+        router = ",".join(socket.inet_ntoa(opts[3][j:j + 4]) for j in range(0, len(opts.get(3, b"")), 4)) or "-"
+        dns = ",".join(socket.inet_ntoa(opts[6][j:j + 4]) for j in range(0, len(opts.get(6, b"")), 4)) or "-"
+        lease = struct.unpack("!I", opts[51])[0] if 51 in opts else 0
+        print("ip=%s router=%s dns=%s lease=%d" % (ip, router, dns, lease))
+        EOPY
+        install -m 0755 $V/dhcp-probe.py /usr/local/bin/tr-dhcp-probe
+  checks:
+    - id: pool-lease
+      description: A client gets an address from the pool with the gateway and DNS options
+      type: shell
+      on: tr-net-01
+      skills: [linux.services.dhcp-server]
+      weight: 2.5
+      timeoutSec: 60
+      command: |
+        o=$(ip netns exec depot-seg python3 /var/lib/cloudtrain/dhcp-probe.py 02:00:00:aa:bb:01 2>/dev/null || echo no-offer)
+        python3 - "$o" <<'EOP'
+        import re, sys
+        m = re.match(r"ip=(\S+) router=(\S+) dns=(\S+) lease=(\d+)", sys.argv[1])
+        if not m:
+            print(sys.argv[1]); raise SystemExit
+        ip, router, dns, lease = m.groups()
+        last = int(ip.split(".")[3]) if ip.startswith("10.62.1.") else -1
+        print("ok" if 100 <= last <= 200 and router == "10.62.1.1" and dns == "{{dns}}" and int(lease) > 0 else "ip=%s router=%s dns=%s" % (ip, router, dns))
+        EOP
+      expect: {match: exact, value: ok}
+    - id: printer-reservation
+      description: The printer's MAC always gets its fixed address
+      type: shell
+      on: tr-net-01
+      skills: [linux.services.dhcp-server]
+      weight: 2
+      timeoutSec: 60
+      command: ip netns exec depot-seg python3 /var/lib/cloudtrain/dhcp-probe.py {{pmac}} 2>/dev/null | grep -o '^ip=[0-9.]*' || echo no-offer
+      expect: {match: exact, value: "ip={{pip}}"}
+    - id: persistent
+      description: dnsmasq passes its syntax check, is enabled and has the range and the reservation
+      type: shell
+      on: tr-net-01
+      skills: [linux.services.dhcp-server]
+      weight: 1.5
+      command: |
+        [ "$(systemctl is-enabled dnsmasq 2>/dev/null)" = enabled ] || { echo not-enabled; exit 0; }
+        dnsmasq --test 2>&1 | grep -q 'syntax check OK' || { echo syntax; exit 0; }
+        c=$(cat /etc/dnsmasq.conf /etc/dnsmasq.d/* 2>/dev/null | grep -v '^[[:space:]]*#')
+        echo "$c" | grep -Eq '^dhcp-range=.*10\.62\.1\.100,10\.62\.1\.200' && echo "$c" | grep -Eqi '^dhcp-host=.*{{pmac}}' && echo persistent || echo incomplete
+      expect: {match: exact, value: persistent}
+    - id: only-segment
+      description: dnsmasq serves DHCP on seg0 only, not on eth0
+      type: shell
+      on: tr-net-01
+      skills: [linux.services.dhcp-server]
+      weight: 1
+      command: |
+        c=$(cat /etc/dnsmasq.conf /etc/dnsmasq.d/* 2>/dev/null | grep -v '^[[:space:]]*#')
+        echo "$c" | grep -Eq '^(interface|listen-address)=' && ! echo "$c" | grep -Eq '^interface=.*eth0' && echo scoped || echo unscoped
+      expect: {match: exact, value: scoped}
+  hints:
+    - title: Where the configuration goes
+      body: "dnsmasq reads /etc/dnsmasq.conf and every file in /etc/dnsmasq.d/ (the conf-dir line in the main file). A new file such as /etc/dnsmasq.d/depot.conf is the tidy place."
+      cost: 0
+    - title: The directives
+      command: dnsmasq --help | grep -i dhcp
+      body: "dhcp-range=<start>,<end>,<lease time>; dhcp-option=option:router,<ip> and dhcp-option=option:dns-server,<ip>; dhcp-host=<mac>,<ip> for a reservation; interface=seg0 limits it to one interface."
+      cost: 1
+    - title: Port 53 is taken
+      body: "systemd-resolved already listens on 127.0.0.53:53. Add bind-interfaces together with interface=seg0 (or port=0 if you do not want DNS from dnsmasq), check with dnsmasq --test and start the service."
+      cost: 1
+  misconceptions:
+    - id: no-reservation
+      description: Configures the pool and options but forgets the printer reservation.
+      feedback: "Without a dhcp-host line the printer gets whatever address is next in the pool; reserve its MAC."
+      expectFail: [printer-reservation, persistent]
+      mutation:
+        on: tr-net-01
+        as: learner
+        run: |
+          printf 'interface=seg0\nbind-interfaces\ndhcp-range=10.62.1.100,10.62.1.200,12h\ndhcp-option=option:router,10.62.1.1\ndhcp-option=option:dns-server,{{dns}}\n' | sudo tee /etc/dnsmasq.d/depot.conf >/dev/null
+          sudo systemctl enable dnsmasq >/dev/null 2>&1
+          sudo systemctl restart dnsmasq
+          sleep 2
+    - id: dns-option-missing
+      description: Leaves out the DNS server option.
+      feedback: "dnsmasq then advertises itself as the DNS server. Add dhcp-option=option:dns-server with the depot resolver."
+      expectFail: [pool-lease]
+      mutation:
+        on: tr-net-01
+        as: learner
+        run: |
+          printf 'interface=seg0\nbind-interfaces\ndhcp-range=10.62.1.100,10.62.1.200,12h\ndhcp-option=option:router,10.62.1.1\ndhcp-host={{pmac}},{{pip}}\n' | sudo tee /etc/dnsmasq.d/depot.conf >/dev/null
+          sudo systemctl enable dnsmasq >/dev/null 2>&1
+          sudo systemctl restart dnsmasq
+          sleep 2
+    - id: not-enabled
+      description: Starts dnsmasq by hand but never enables it.
+      feedback: "systemctl start lasts until reboot; enable the service so the depot segment keeps getting leases."
+      expectFail: [persistent]
+      mutation:
+        on: tr-net-01
+        as: learner
+        run: |
+          printf 'interface=seg0\nbind-interfaces\ndhcp-range=10.62.1.100,10.62.1.200,12h\ndhcp-option=option:router,10.62.1.1\ndhcp-option=option:dns-server,{{dns}}\ndhcp-host={{pmac}},{{pip}}\n' | sudo tee /etc/dnsmasq.d/depot.conf >/dev/null
+          sudo systemctl disable dnsmasq >/dev/null 2>&1
+          sudo systemctl restart dnsmasq
+          sleep 2
+  solution:
+    explanation: A dnsmasq drop-in scoped to seg0 defines the range, the router and DNS options and the MAC reservation; bind-interfaces keeps it off the resolver's port, and enabling the service makes it start at boot.
+    steps:
+      - on: tr-net-01
+        as: learner
+        timeoutSec: 90
+        run: |
+          set -e
+          printf 'interface=seg0\nbind-interfaces\ndhcp-range=10.62.1.100,10.62.1.200,12h\ndhcp-option=option:router,10.62.1.1\ndhcp-option=option:dns-server,{{dns}}\ndhcp-host={{pmac}},{{pip}}\n' | sudo tee /etc/dnsmasq.d/depot.conf >/dev/null
+          sudo dnsmasq --test
+          sudo systemctl enable dnsmasq
+          sudo systemctl restart dnsmasq
+          sleep 2
+          sudo ip netns exec depot-seg tr-dhcp-probe 02:00:00:aa:bb:01
+          sudo ip netns exec depot-seg tr-dhcp-probe {{pmac}}
+    alternatives:
+      - id: main-config
+        description: Put the same directives into /etc/dnsmasq.conf instead of a drop-in file.
+        steps:
+          - on: tr-net-01
+            as: learner
+            timeoutSec: 90
+            run: |
+              set -e
+              printf 'interface=seg0\nbind-interfaces\ndhcp-range=10.62.1.100,10.62.1.200,12h\ndhcp-option=option:router,10.62.1.1\ndhcp-option=option:dns-server,{{dns}}\ndhcp-host={{pmac}},{{pip}}\n' | sudo tee -a /etc/dnsmasq.conf >/dev/null
+              sudo dnsmasq --test
+              sudo systemctl enable dnsmasq
+              sudo systemctl restart dnsmasq
+              sleep 2

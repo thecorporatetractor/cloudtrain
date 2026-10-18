@@ -1,0 +1,328 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: nftables-from-scratch
+  title: Write an nftables ruleset for the ticket gateway from scratch
+  domain: linux
+  frameworks: [lfcs:networking, linuxplus:security, cks:system-hardening]
+  difficulty: hard
+  estimatedMinutes: 25
+  tags: [nftables, firewall, ct, logging, persistence]
+  version: 1
+spec:
+  description: |
+    Work on **`tr-net-01`** (`ssh tr-net-01`; you have `sudo`), the Tallowmere ticket gateway.
+    It has three network sides, two of them modelled as network namespaces
+    (`sudo ip netns exec <name> <command>`):
+
+    | side | interface on the gateway | network | test client |
+    |---|---|---|---|
+    | management | `eth0` | the lab management network (your ssh session) | - |
+    | ticket office ("ops") | `fw-ops` | 10.71.1.0/24 | namespace `ops` (10.71.1.2) |
+    | public | `fw-pub` | 10.71.2.0/24 | namespace `pax` (10.71.2.2) |
+
+    The gateway currently has an **empty** firewall (`/etc/nftables.conf` holds only the
+    default empty tables). Replace it with an nftables ruleset that:
+
+    - uses a table in the `inet` family with an `input` chain **policy drop**;
+    - accepts **established and related** traffic and everything on the loopback;
+    - accepts everything from the **management interface `eth0`** (do not cut off your own
+      session and the platform);
+    - accepts **SSH (TCP 22) only from the ops subnet 10.71.1.0/24**;
+    - accepts **HTTPS (TCP 443) from anywhere** (the gateway serves it on 443);
+    - **logs the packets it drops** with the prefix `tr-drop: `, rate limited to
+      **`{{rate}}`**, before they are dropped.
+
+    The ruleset must be active now and **loaded at boot** (the `nftables` service).
+  objectives:
+    - Write an nftables input chain with a default drop policy
+    - Allow established traffic, a subnet-only service and a public service
+    - Log dropped packets with a rate limit
+    - Load the ruleset at boot with the nftables service
+  params:
+    rate:
+      type: choice
+      values: ["5/minute", "10/minute"]
+    token:
+      type: int
+      min: 1000
+      max: 9999
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-net-01
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["1Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-net-01
+      timeoutSec: 150
+      run: |
+        set -eu
+        install -d -m 0700 /var/lib/cloudtrain
+        for u in tr-gw-443 tr-gw-8081 tr-pax-9000; do systemctl stop $u.service 2>/dev/null || true; done
+        systemctl disable --now nftables.service >/dev/null 2>&1 || true
+        nft flush ruleset
+        printf '#!/usr/sbin/nft -f\n\nflush ruleset\n\ntable inet filter {\n\tchain input {\n\t\ttype filter hook input priority filter;\n\t}\n\tchain forward {\n\t\ttype filter hook forward priority filter;\n\t}\n\tchain output {\n\t\ttype filter hook output priority filter;\n\t}\n}\n' > /etc/nftables.conf
+        for n in ops pax; do ip netns del $n 2>/dev/null || true; ip netns add $n; ip -n $n link set lo up; done
+        for l in fw-ops fw-pub; do ip link del $l 2>/dev/null || true; done
+        ip link add fw-ops type veth peer name eth0; ip link set eth0 netns ops
+        ip addr add 10.71.1.1/24 dev fw-ops; ip link set fw-ops up
+        ip -n ops addr add 10.71.1.2/24 dev eth0; ip -n ops link set eth0 up
+        ip link add fw-pub type veth peer name eth0; ip link set eth0 netns pax
+        ip addr add 10.71.2.1/24 dev fw-pub; ip link set fw-pub up
+        ip -n pax addr add 10.71.2.2/24 dev eth0; ip -n pax link set eth0 up
+        mkdir -p /srv/tr-gw-www /srv/tr-pax-www
+        echo "gw-{{token}}" > /srv/tr-gw-www/index.html; echo "pax-{{token}}" > /srv/tr-pax-www/index.html
+        systemd-run -q --unit=tr-gw-443 --collect /usr/bin/python3 -m http.server 443 --directory /srv/tr-gw-www
+        systemd-run -q --unit=tr-gw-8081 --collect /usr/bin/python3 -m http.server 8081 --directory /srv/tr-gw-www
+        systemd-run -q --unit=tr-pax-9000 --collect -p NetworkNamespacePath=/run/netns/pax /usr/bin/python3 -m http.server 9000 --directory /srv/tr-pax-www
+        for i in $(seq 15); do curl -s -m 2 http://10.71.1.1:443/ | grep -q "gw-{{token}}" && break; sleep 1; done
+        ip netns exec pax curl -s -m 3 http://10.71.2.1:8081/ | grep -q "gw-{{token}}"
+        curl -s -m 3 http://10.71.2.2:9000/ | grep -q "pax-{{token}}"
+  checks:
+    - id: ops-ssh
+      description: SSH answers from the ops subnet
+      type: shell
+      on: tr-net-01
+      skills: [linux.net.firewall]
+      weight: 1.5
+      timeoutSec: 20
+      command: timeout 8 ip netns exec ops bash -c 'exec 3<>/dev/tcp/10.71.1.1/22 && head -c 4 <&3' 2>/dev/null || echo closed
+      expect: {match: exact, value: "SSH-"}
+    - id: pub-ssh-blocked
+      description: SSH does not answer from the public network
+      type: shell
+      on: tr-net-01
+      skills: [linux.net.firewall]
+      weight: 1.5
+      timeoutSec: 20
+      command: |
+        r=$(timeout 6 ip netns exec pax bash -c 'exec 3<>/dev/tcp/10.71.2.1/22 && head -c 4 <&3' 2>/dev/null)
+        [ "$r" = "SSH-" ] && echo open || echo blocked
+      expect: {match: exact, value: blocked}
+    - id: log-limited
+      description: Dropped packets are logged with the prefix and the rate limit
+      type: shell
+      on: tr-net-01
+      skills: [linux.net.firewall]
+      weight: 1.5
+      timeoutSec: 60
+      command: |
+        nft list ruleset 2>/dev/null | grep -Eq 'limit rate {{rate}}' || { echo no-limit; exit 0; }
+        b=$(dmesg | grep -c 'tr-drop: ')
+        for i in 1 2 3 4 5 6 7 8; do
+          ip netns exec pax nc -z -w1 10.71.2.1 8082 >/dev/null 2>&1 || true
+          sleep 2
+          a=$(dmesg | grep -c 'tr-drop: ')
+          [ "$a" -gt "$b" ] && { echo logged; exit 0; }
+        done
+        echo no-log
+      expect: {match: exact, value: logged}
+    - id: https-any
+      description: HTTPS on 443 answers from both networks
+      type: shell
+      on: tr-net-01
+      skills: [linux.net.firewall]
+      weight: 1.5
+      timeoutSec: 30
+      command: |
+        a=$(ip netns exec ops curl -4 -s -m 5 http://10.71.1.1:443/)
+        b=$(ip netns exec pax curl -4 -s -m 5 http://10.71.2.1:443/)
+        echo "${a:-none} ${b:-none}"
+      expect: {match: exact, value: "gw-{{token}} gw-{{token}}"}
+    - id: rest-dropped
+      description: Other ports are dropped for both networks
+      type: shell
+      on: tr-net-01
+      skills: [linux.net.firewall]
+      weight: 1
+      timeoutSec: 30
+      command: |
+        a=$(ip netns exec ops curl -4 -s -m 3 http://10.71.1.1:8081/)
+        b=$(ip netns exec pax curl -4 -s -m 3 http://10.71.2.1:8081/)
+        [ -z "$a$b" ] && echo dropped || echo "open:$a$b"
+      expect: {match: exact, value: dropped}
+    - id: outbound-replies
+      description: Replies to connections the gateway opens come back in
+      type: shell
+      on: tr-net-01
+      skills: [linux.net.firewall]
+      weight: 1
+      timeoutSec: 20
+      command: curl -4 -s -m 6 http://10.71.2.2:9000/ || echo none
+      expect: {match: exact, value: "pax-{{token}}"}
+    - id: management-kept
+      description: The running ruleset accepts everything arriving on eth0
+      type: shell
+      on: tr-net-01
+      skills: [linux.net.firewall]
+      weight: 1
+      command: nft list ruleset 2>/dev/null | grep -Eq 'iif(name)? +"?eth0"? +accept' && echo kept || echo missing
+      expect: {match: exact, value: kept}
+    - id: persistent
+      description: The saved configuration loads cleanly and enables the nftables service
+      type: shell
+      on: tr-net-01
+      skills: [linux.net.firewall]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        [ "$(systemctl is-enabled nftables 2>/dev/null)" = enabled ] || { echo not-enabled; exit 0; }
+        nft -c -f /etc/nftables.conf >/dev/null 2>&1 || { echo invalid; exit 0; }
+        ip netns del trchk 2>/dev/null; ip netns add trchk
+        ip netns exec trchk nft -f /etc/nftables.conf >/dev/null 2>&1
+        r=$(ip netns exec trchk nft list ruleset 2>/dev/null)
+        ip netns del trchk 2>/dev/null
+        echo "$r" | grep -q 'policy drop' && echo "$r" | grep -Eq 'dport (22|\{[^}]*22[^}]*\})' && echo "$r" | grep -q '443' && echo "$r" | grep -Eq 'limit rate {{rate}}' && echo persistent || echo incomplete
+      expect: {match: exact, value: persistent}
+  hints:
+    - title: Skeleton
+      body: "One table inet with an input chain: type filter hook input priority 0; policy drop; Put the accepts first (ct state, iif lo, iifname eth0, then the services) and the log statement last so only dropped packets reach it."
+      cost: 0
+    - title: Log with a limit
+      command: 'limit rate 5/minute log prefix "tr-drop: "'
+      body: "A rule can combine limit and log; packets that exceed the rate simply skip the log statement and still hit the drop policy. Kernel messages appear in dmesg."
+      cost: 1
+    - title: Check before you load
+      command: sudo nft -c -f /etc/nftables.conf
+      body: "-c only checks the syntax. Keep your ssh session open until you have confirmed that eth0 is accepted, then enable the service so the file is loaded at boot."
+      cost: 1
+  misconceptions:
+    - id: ssh-open-to-all
+      description: Opens SSH to everybody instead of only the ops subnet.
+      feedback: "The brief limits SSH to 10.71.1.0/24 (plus management on eth0). Add ip saddr 10.71.1.0/24 to the rule."
+      expectFail: [pub-ssh-blocked]
+      mutation:
+        on: tr-net-01
+        as: learner
+        run: |
+          cat <<'EOF' | sudo tee /etc/nftables.conf >/dev/null
+          #!/usr/sbin/nft -f
+          flush ruleset
+          table inet filter {
+            chain input {
+              type filter hook input priority 0; policy drop;
+              ct state established,related accept
+              iif lo accept
+              iifname "eth0" accept
+              tcp dport 22 accept
+              tcp dport 443 accept
+              limit rate {{rate}} log prefix "tr-drop: "
+            }
+          }
+          EOF
+          sudo systemctl enable nftables >/dev/null 2>&1
+          sudo nft -f /etc/nftables.conf
+    - id: no-established
+      description: Forgets the established/related rule.
+      feedback: "Without ct state established,related, the replies to connections the gateway itself opens are dropped by the input policy."
+      expectFail: [outbound-replies]
+      mutation:
+        on: tr-net-01
+        as: learner
+        run: |
+          cat <<'EOF' | sudo tee /etc/nftables.conf >/dev/null
+          #!/usr/sbin/nft -f
+          flush ruleset
+          table inet filter {
+            chain input {
+              type filter hook input priority 0; policy drop;
+              iif lo accept
+              iifname "eth0" accept
+              ip saddr 10.71.1.0/24 tcp dport 22 accept
+              tcp dport 443 accept
+              limit rate {{rate}} log prefix "tr-drop: "
+            }
+          }
+          EOF
+          sudo systemctl enable nftables >/dev/null 2>&1
+          sudo nft -f /etc/nftables.conf
+    - id: unlimited-log
+      description: Logs every dropped packet without a rate limit.
+      feedback: "Unlimited logging lets a scan fill the log. Put limit rate in front of the log statement."
+      expectFail: [log-limited, persistent]
+      mutation:
+        on: tr-net-01
+        as: learner
+        run: |
+          cat <<'EOF' | sudo tee /etc/nftables.conf >/dev/null
+          #!/usr/sbin/nft -f
+          flush ruleset
+          table inet filter {
+            chain input {
+              type filter hook input priority 0; policy drop;
+              ct state established,related accept
+              iif lo accept
+              iifname "eth0" accept
+              ip saddr 10.71.1.0/24 tcp dport 22 accept
+              tcp dport 443 accept
+              log prefix "tr-drop: "
+            }
+          }
+          EOF
+          sudo systemctl enable nftables >/dev/null 2>&1
+          sudo nft -f /etc/nftables.conf
+  solution:
+    explanation: An inet table with a drop-policy input chain accepts established traffic, loopback and management, SSH only from the ops subnet and HTTPS from everywhere, then logs the rest with a rate limit before the policy drops it. Saving it in /etc/nftables.conf and enabling the nftables service loads it at boot.
+    steps:
+      - on: tr-net-01
+        as: learner
+        run: |
+          set -e
+          cat <<'EOF' | sudo tee /etc/nftables.conf >/dev/null
+          #!/usr/sbin/nft -f
+          flush ruleset
+          table inet filter {
+            chain input {
+              type filter hook input priority 0; policy drop;
+              ct state established,related accept
+              iif lo accept
+              iifname "eth0" accept
+              ip saddr 10.71.1.0/24 tcp dport 22 accept
+              tcp dport 443 accept
+              limit rate {{rate}} log prefix "tr-drop: "
+            }
+            chain forward {
+              type filter hook forward priority 0; policy drop;
+            }
+            chain output {
+              type filter hook output priority 0; policy accept;
+            }
+          }
+          EOF
+          sudo nft -c -f /etc/nftables.conf
+          sudo systemctl enable nftables
+          sudo nft -f /etc/nftables.conf
+          sudo nft list ruleset
+    alternatives:
+      - id: ruleset-via-include
+        description: Keep the stock /etc/nftables.conf and put the ruleset in an included file under /etc/nftables.d.
+        steps:
+          - on: tr-net-01
+            as: learner
+            run: |
+              set -e
+              sudo mkdir -p /etc/nftables.d
+              cat <<'EOF' | sudo tee /etc/nftables.d/gateway.nft >/dev/null
+              table inet gateway {
+                chain input {
+                  type filter hook input priority 0; policy drop;
+                  ct state established,related accept
+                  iif lo accept
+                  iifname "eth0" accept
+                  ip saddr 10.71.1.0/24 tcp dport 22 accept
+                  tcp dport 443 accept
+                  limit rate {{rate}} log prefix "tr-drop: "
+                }
+              }
+              EOF
+              echo 'include "/etc/nftables.d/*.nft"' | sudo tee -a /etc/nftables.conf >/dev/null
+              sudo nft -c -f /etc/nftables.conf
+              sudo systemctl enable nftables
+              sudo nft -f /etc/nftables.conf

@@ -1,0 +1,209 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: firewall-ticket-api
+  title: Open only the ticket API port to the station network
+  domain: linux
+  frameworks: [rhcsa-aligned:security, lfcs:networking, linuxplus:security]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [firewalld, firewall, rich-rules, zones, persistence]
+  version: 1
+spec:
+  description: |
+    Work on **`tr-el-01`** (`ssh tr-el-01`; you have `sudo`), an Enterprise Linux host running
+    **firewalld**. Two client networks are modelled as network namespaces on it
+    (`sudo ip netns exec <name> <command>`):
+
+    | network | client | cable end on tr-el-01 |
+    |---|---|---|
+    | station network 10.40.5.0/24 | namespace `station` (10.40.5.20) | `fw-stn` (10.40.5.1) |
+    | office network 10.40.6.0/24 | namespace `office` (10.40.6.20) | `fw-off` (10.40.6.1) |
+
+    The ticket API listens on **TCP 8443** and a second service on TCP {{other}}. Configure
+    firewalld so that:
+
+    - **TCP 8443 is allowed only from the station network 10.40.5.0/24**;
+    - **SSH is allowed from anywhere** (including both client networks);
+    - every other inbound connection is denied, including TCP {{other}} from the station;
+    - the configuration is **permanent** (it must survive a reload and a reboot) and active now.
+
+    Use a rich rule in the default zone, or a dedicated zone bound to the station source
+    address: either is fine. Do not change `eth0` or its zone.
+  objectives:
+    - Restrict a port to a source network with firewalld
+    - Keep SSH reachable and everything else denied
+    - Make runtime and permanent configuration agree
+  params:
+    token:
+      type: int
+      min: 1000
+      max: 9999
+    other:
+      type: choice
+      values: ["9000", "9100", "9200"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-el-01
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["1Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-el-01
+      timeoutSec: 150
+      run: |
+        set -eu
+        install -d -m 0700 /var/lib/cloudtrain
+        for u in tr-ticket-api tr-ticket-other; do systemctl stop $u.service 2>/dev/null || true; done
+        systemctl enable --now firewalld >/dev/null 2>&1
+        z=$(firewall-cmd --get-default-zone)
+        firewall-cmd -q --permanent --zone=$z --remove-port=8443/tcp 2>/dev/null || true
+        firewall-cmd -q --permanent --zone=$z --remove-port={{other}}/tcp 2>/dev/null || true
+        firewall-cmd --permanent --zone=$z --list-rich-rules 2>/dev/null | while IFS= read -r rr; do [ -n "$rr" ] && firewall-cmd -q --permanent --zone=$z --remove-rich-rule="$rr"; done
+        firewall-cmd -q --permanent --delete-zone=station 2>/dev/null || true
+        firewall-cmd -q --reload
+        for n in station office; do ip netns del $n 2>/dev/null || true; ip netns add $n; ip -n $n link set lo up; done
+        for l in fw-stn fw-off; do ip link del $l 2>/dev/null || true; done
+        mk() { # ns hostif hostaddr peeraddr
+          ip link add $2 type veth peer name eth0
+          ip link set eth0 netns $1
+          ip addr add $3 dev $2; ip link set $2 up
+          ip -n $1 addr add $4 dev eth0; ip -n $1 link set eth0 up
+          command -v nmcli >/dev/null 2>&1 && nmcli device set $2 managed no >/dev/null 2>&1 || true
+        }
+        mk station fw-stn 10.40.5.1/24 10.40.5.20/24
+        mk office fw-off 10.40.6.1/24 10.40.6.20/24
+        mkdir -p /srv/tr-ticket-api; echo "tickets {{token}}" > /srv/tr-ticket-api/index.html
+        systemd-run -q --unit=tr-ticket-api --collect /usr/bin/python3 -m http.server 8443 --directory /srv/tr-ticket-api
+        systemd-run -q --unit=tr-ticket-other --collect /usr/bin/python3 -m http.server {{other}} --directory /srv/tr-ticket-api
+        sleep 1
+        ! ip netns exec station curl -4 -s -m 3 http://10.40.5.1:8443/ >/dev/null
+  checks:
+    - id: station-api
+      description: The station network reaches the ticket API
+      type: shell
+      on: tr-el-01
+      skills: [linux.net.firewalld, linux.net.firewall]
+      weight: 2
+      timeoutSec: 30
+      command: ip netns exec station curl -4 -s -m 8 http://10.40.5.1:8443/ 2>/dev/null || echo unreachable
+      expect: {match: exact, value: "tickets {{token}}"}
+    - id: office-blocked
+      description: The office network cannot reach the ticket API
+      type: shell
+      on: tr-el-01
+      skills: [linux.net.firewalld, linux.net.firewall]
+      weight: 2
+      timeoutSec: 30
+      command: ip netns exec office curl -4 -s -m 5 http://10.40.6.1:8443/ 2>/dev/null | grep -q tickets && echo open || echo blocked
+      expect: {match: exact, value: blocked}
+    - id: ssh-everywhere
+      description: SSH answers from both client networks
+      type: shell
+      on: tr-el-01
+      skills: [linux.net.firewalld]
+      weight: 1.5
+      timeoutSec: 30
+      command: |
+        a=$(timeout 8 ip netns exec station bash -c 'exec 3<>/dev/tcp/10.40.5.1/22 && head -c 4 <&3' 2>/dev/null)
+        b=$(timeout 8 ip netns exec office bash -c 'exec 3<>/dev/tcp/10.40.6.1/22 && head -c 4 <&3' 2>/dev/null)
+        echo "${a:-closed} ${b:-closed}"
+      expect: {match: exact, value: "SSH- SSH-"}
+    - id: others-denied
+      description: Other ports are denied, even from the station network
+      type: shell
+      on: tr-el-01
+      skills: [linux.net.firewalld]
+      weight: 1
+      timeoutSec: 30
+      command: ip netns exec station curl -4 -s -m 5 http://10.40.5.1:{{other}}/ 2>/dev/null | grep -q tickets && echo open || echo denied
+      expect: {match: exact, value: denied}
+    - id: permanent
+      description: The permanent configuration restricts 8443 to the station network
+      type: shell
+      on: tr-el-01
+      skills: [linux.net.firewalld]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        firewall-cmd --permanent --list-all-zones 2>/dev/null | python3 -c '
+        import re, sys
+        zones, cur = {}, None
+        for line in sys.stdin.read().splitlines():
+            if line and not line.startswith(" "):
+                cur = line.split()[0]; zones[cur] = {"rich": [], "sources": "", "ports": "", "services": ""}
+            elif cur and line.strip().startswith("rule "):
+                zones[cur]["rich"].append(line.strip())
+            elif cur and ":" in line:
+                k, v = line.strip().split(":", 1)
+                if k in ("sources", "ports", "services"):
+                    zones[cur][k] = v.strip()
+        ok = False
+        for z, d in zones.items():
+            if any("10.40.5.0/24" in r and "8443" in r and "accept" in r for r in d["rich"]):
+                ok = True
+            if "10.40.5.0/24" in d["sources"].split() and "8443/tcp" in d["ports"].split():
+                ok = True
+        bad = [z for z, d in zones.items() if "8443/tcp" in d["ports"].split() and "10.40.5.0/24" not in d["sources"].split()]
+        print("persistent" if ok and not bad else "runtime-only" if not ok else "open-to-all")
+        '
+      expect: {match: exact, value: persistent}
+  hints:
+    - title: Source-restricted port
+      command: sudo firewall-cmd --permanent --add-rich-rule='rule family=ipv4 source address=10.40.5.0/24 port port=8443 protocol=tcp accept'
+      body: "A rich rule combines a source address with a port. Plain --add-port opens the port to everybody in the zone."
+      cost: 0
+    - title: Zones by source
+      body: "Alternatively create a zone, bind the station network to it with --add-source and allow the port (and ssh) there. Traffic from a source bound to a zone is handled by that zone instead of the default one."
+      cost: 1
+    - title: Runtime versus permanent
+      body: "Without --permanent a change is lost at reload. firewall-cmd --runtime-to-permanent copies the running state; --reload applies the permanent state."
+      cost: 1
+  misconceptions:
+    - id: runtime-only
+      description: Adds the rich rule without --permanent.
+      feedback: "Runtime changes disappear on reload and reboot; add --permanent (or run --runtime-to-permanent)."
+      expectFail: [permanent]
+      mutation:
+        on: tr-el-01
+        as: learner
+        run: sudo firewall-cmd --add-rich-rule='rule family=ipv4 source address=10.40.5.0/24 port port=8443 protocol=tcp accept'
+    - id: port-open-to-all
+      description: Opens TCP 8443 in the zone for every source.
+      feedback: "--add-port opens the port for all sources in the zone. The task allows only the station network: use a rich rule with the source address or a zone bound to it."
+      expectFail: [office-blocked, permanent]
+      mutation:
+        on: tr-el-01
+        as: learner
+        run: |
+          sudo firewall-cmd --permanent --add-port=8443/tcp
+          sudo firewall-cmd --reload
+  solution:
+    explanation: A permanent rich rule accepts TCP 8443 only from 10.40.5.0/24 in the default zone; the zone keeps ssh and denies the rest by default. A reload applies the permanent configuration to the running firewall.
+    steps:
+      - on: tr-el-01
+        as: learner
+        run: |
+          set -e
+          sudo firewall-cmd --permanent --add-rich-rule='rule family=ipv4 source address=10.40.5.0/24 port port=8443 protocol=tcp accept'
+          sudo firewall-cmd --reload
+          sudo firewall-cmd --list-all
+    alternatives:
+      - id: station-zone
+        description: A dedicated zone bound to the station source that allows 8443 and ssh.
+        steps:
+          - on: tr-el-01
+            as: learner
+            run: |
+              set -e
+              sudo firewall-cmd --permanent --new-zone=station
+              sudo firewall-cmd --permanent --zone=station --add-source=10.40.5.0/24
+              sudo firewall-cmd --permanent --zone=station --add-port=8443/tcp
+              sudo firewall-cmd --permanent --zone=station --add-service=ssh
+              sudo firewall-cmd --reload

@@ -1,0 +1,211 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: fix-routing-asymmetric
+  title: Fix replies that leave by the wrong interface
+  domain: linux
+  frameworks: [linuxplus:troubleshooting, lfcs:networking]
+  difficulty: hard
+  estimatedMinutes: 25
+  tags: [routing, policy-routing, netplan, troubleshooting, asymmetric]
+  version: 1
+spec:
+  description: |
+    Work on **`tr-net-01`** (`ssh tr-net-01`; you have `sudo`). The neighbouring hosts are
+    network namespaces on it (`sudo ip netns exec <name> <command>`).
+
+    `tr-net-01` is the signalling host. It has two uplinks:
+
+    | interface | address | neighbour |
+    |---|---|---|
+    | `eth1` | 10.66.1.5/24 | router `rtr-a` (10.66.1.1), a dead end that knows only its own subnet |
+    | `eth2` | 10.66.2.5/24 | router `rtr-b` (10.66.2.1), which also hosts the field client at **10.66.9.20** |
+
+    The host's routing table sends all traffic for the field network **10.66.9.0/24** out of
+    `eth1` (that is the route the backbone team configured). The field client reaches the
+    signalling service on the **second address**, `http://10.66.2.5:8085/`, but requests
+    time out: the request arrives on `eth2`, the reply leaves by `eth1` and dies at `rtr-a`.
+
+    Fix this with **policy routing** so that replies from `10.66.2.5` leave by `eth2` via
+    `10.66.2.1`, **persistently** (Netplan, or a systemd-networkd drop-in). Do not remove the
+    existing route for 10.66.9.0/24: traffic from `10.66.1.5` must keep using `eth1`.
+
+    Test from the client with
+    `sudo ip netns exec rtr-b curl --interface 10.66.9.20 -m 5 http://10.66.2.5:8085/`.
+    `eth0` and the default route of the host must not change.
+  objectives:
+    - Recognise an asymmetric path from a capture or from ip route get
+    - Add a routing table and a rule that selects it by source address
+    - Make the policy routing persistent in Netplan or systemd-networkd
+  params:
+    token:
+      type: int
+      min: 1000
+      max: 9999
+    table:
+      type: choice
+      values: ["102", "150", "210"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-net-01
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["1Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-net-01
+      timeoutSec: 150
+      run: |
+        set -eu
+        install -d -m 0700 /var/lib/cloudtrain
+        systemctl stop tr-signal-api.service 2>/dev/null || true
+        for n in rtr-a rtr-b; do ip netns del $n 2>/dev/null || true; ip netns add $n; ip -n $n link set lo up; done
+        for l in eth1 eth2; do ip link del $l 2>/dev/null || true; done
+        rm -f /etc/netplan/*signalling*.yaml /etc/netplan/60-eth*.yaml
+        ip rule del from 10.66.2.5 2>/dev/null || true
+        # eth1 <-> rtr-a (dead end), eth2 <-> rtr-b
+        ip link add eth1 type veth peer name eth1p
+        ip link set eth1p netns rtr-a
+        ip -n rtr-a addr add 10.66.1.1/24 dev eth1p; ip -n rtr-a link set eth1p up
+        ip link add eth2 type veth peer name eth2p
+        ip link set eth2p netns rtr-b
+        ip -n rtr-b addr add 10.66.2.1/24 dev eth2p; ip -n rtr-b link set eth2p up
+        ip -n rtr-b addr add 10.66.9.20/32 dev lo
+        ip addr add 10.66.1.5/24 dev eth1; ip link set eth1 up
+        ip addr add 10.66.2.5/24 dev eth2; ip link set eth2 up
+        ip route replace 10.66.9.0/24 via 10.66.1.1 dev eth1
+        sysctl -q -w net.ipv4.conf.all.rp_filter=2 net.ipv4.conf.eth1.rp_filter=2 net.ipv4.conf.eth2.rp_filter=2
+        # the configuration the backbone team left behind (reboot-graded: persistence is checked from config)
+        printf 'network:\n  version: 2\n  ethernets:\n    eth1:\n      addresses: [10.66.1.5/24]\n      routes:\n        - to: 10.66.9.0/24\n          via: 10.66.1.1\n    eth2:\n      addresses: [10.66.2.5/24]\n' > /etc/netplan/60-signalling.yaml
+        chmod 0600 /etc/netplan/60-signalling.yaml
+        netplan generate
+        mkdir -p /srv/tr-signal-api; echo "signalling {{token}}" > /srv/tr-signal-api/index.html
+        printf '[Unit]\nDescription=Tallowmere signalling API\n[Service]\nExecStart=/usr/bin/python3 -m http.server 8085 --directory /srv/tr-signal-api\nRestart=always\n[Install]\nWantedBy=multi-user.target\n' > /etc/systemd/system/tr-signal-api.service
+        systemctl daemon-reload; systemctl enable --now tr-signal-api.service >/dev/null 2>&1
+        sleep 1
+        # the fault is real: the reply is lost
+        ! ip netns exec rtr-b curl -4 -s -m 3 --interface 10.66.9.20 http://10.66.2.5:8085/ >/dev/null
+  checks:
+    - id: reaches
+      description: The field client gets an answer from the second address
+      type: shell
+      on: tr-net-01
+      skills: [linux.net.troubleshooting, linux.net.bridges-bonds]
+      weight: 2.5
+      timeoutSec: 30
+      command: ip netns exec rtr-b curl -4 -s -m 6 --interface 10.66.9.20 http://10.66.2.5:8085/ 2>/dev/null || echo timeout
+      expect: {match: exact, value: "signalling {{token}}"}
+    - id: reply-path
+      description: Replies from 10.66.2.5 to the field network leave by eth2
+      type: shell
+      on: tr-net-01
+      skills: [linux.net.troubleshooting]
+      weight: 1
+      command: ip route get 10.66.9.20 from 10.66.2.5 2>/dev/null | grep -o 'dev [a-z0-9]*' | head -1
+      expect: {match: exact, value: dev eth2}
+    - id: eth1-path-kept
+      description: Traffic from 10.66.1.5 still leaves by eth1
+      type: shell
+      on: tr-net-01
+      skills: [linux.net.troubleshooting]
+      weight: 1
+      command: ip route get 10.66.9.20 from 10.66.1.5 2>/dev/null | grep -o 'dev [a-z0-9]*' | head -1
+      expect: {match: exact, value: dev eth1}
+    - id: persistent
+      description: The policy routing is in the persistent network configuration
+      type: shell
+      on: tr-net-01
+      skills: [linux.net.persistent-config, linux.net.bridges-bonds]
+      weight: 2
+      command: |
+        python3 - <<'EOP'
+        import subprocess, yaml, glob, re
+        out = subprocess.run(["netplan", "get", "ethernets.eth2"], capture_output=True, text=True).stdout
+        d = yaml.safe_load(out) or {}
+        pol = [r for r in (d.get("routing-policy") or []) if str(r.get("from", "")).split("/")[0] == "10.66.2.5" and r.get("table") is not None]
+        tables = {str(r["table"]) for r in pol}
+        ok = any(str(r.get("table")) in tables and r.get("via") == "10.66.2.1" and r.get("to") in ("default", "0.0.0.0/0") for r in (d.get("routes") or []))
+        if pol and ok:
+            print("persistent"); raise SystemExit
+        txt = ""
+        for f in glob.glob("/etc/systemd/network/**/*", recursive=True):
+            try:
+                txt += open(f).read() + "\n"
+            except (OSError, IsADirectoryError):
+                pass
+        if re.search(r"From=10\.66\.2\.5", txt) and re.search(r"Gateway=10\.66\.2\.1", txt) and re.search(r"Table=", txt):
+            print("persistent"); raise SystemExit
+        print("runtime-only")
+        EOP
+      expect: {match: exact, value: persistent}
+    - id: eth0-untouched
+      description: The default route still leaves through eth0
+      type: shell
+      on: tr-net-01
+      skills: [linux.net.persistent-config]
+      weight: 0.5
+      command: ip route show default | awk '{for (i = 1; i <= NF; i++) if ($i == "dev") print $(i + 1)}' | sort -u | paste -sd,
+      expect: {match: exact, value: eth0}
+  hints:
+    - title: Follow the packets
+      command: sudo ip netns exec rtr-a tcpdump -ni eth1p
+      body: "Capture in rtr-a: the replies to 10.66.9.20 arrive there instead of at the client. ip route get 10.66.9.20 from 10.66.2.5 shows which interface the host picks for them."
+      cost: 0
+    - title: A second routing table
+      body: "The main table has one route for 10.66.9.0/24. Put a default route via 10.66.2.1 in a separate table and add a rule that uses that table only for packets whose source is 10.66.2.5 (ip rule add from ... table ...)."
+      cost: 1
+    - title: Make it stick
+      body: "In Netplan the route takes a table: key and the rule goes under routing-policy: (from: and table:). Put them under ethernets.eth2 in a new file in /etc/netplan, then netplan apply."
+      cost: 2
+  misconceptions:
+    - id: runtime-only
+      description: Fixes it with ip rule and ip route and never writes the configuration.
+      feedback: "ip rule and ip route changes vanish at the next boot (or netplan apply); describe the table, route and routing-policy in Netplan or a networkd drop-in."
+      expectFail: [persistent]
+      mutation:
+        on: tr-net-01
+        as: learner
+        run: |
+          sudo ip route add default via 10.66.2.1 dev eth2 table {{table}}
+          sudo ip rule add from 10.66.2.5 table {{table}}
+    - id: moves-shared-route
+      description: Points the 10.66.9.0/24 route at eth2 instead of using policy routing.
+      feedback: "That fixes the second address but now the first address (10.66.1.5) replies through the wrong interface. A rule by source address serves both."
+      expectFail: [eth1-path-kept, persistent]
+      mutation:
+        on: tr-net-01
+        as: learner
+        run: sudo ip route replace 10.66.9.0/24 via 10.66.2.1 dev eth2
+  solution:
+    explanation: A rule selects a dedicated table for packets sourced from 10.66.2.5; that table's default route goes via rtr-b on eth2. Netplan renders both from the eth2 stanza, so they survive reboots, and the main-table route used by 10.66.1.5 is untouched.
+    steps:
+      - on: tr-net-01
+        as: learner
+        timeoutSec: 90
+        run: |
+          set -e
+          printf 'network:\n  version: 2\n  ethernets:\n    eth2:\n      addresses: [10.66.2.5/24]\n      routes:\n        - to: default\n          via: 10.66.2.1\n          table: {{table}}\n      routing-policy:\n        - from: 10.66.2.5\n          table: {{table}}\n' | sudo tee /etc/netplan/61-eth2-policy.yaml >/dev/null
+          sudo chmod 0600 /etc/netplan/61-eth2-policy.yaml
+          sudo netplan apply
+          sleep 3
+          ip route get 10.66.9.20 from 10.66.2.5
+    alternatives:
+      - id: networkd-dropin
+        description: Add a systemd-networkd drop-in for the netplan-generated eth2 network instead of editing Netplan.
+        steps:
+          - on: tr-net-01
+            as: learner
+            timeoutSec: 90
+            run: |
+              set -e
+              sudo mkdir -p /etc/systemd/network/10-netplan-eth2.network.d
+              printf '[Network]\nAddress=10.66.2.5/24\n\n[RoutingPolicyRule]\nFrom=10.66.2.5\nTable={{table}}\n\n[Route]\nGateway=10.66.2.1\nTable={{table}}\n' | sudo tee /etc/systemd/network/10-netplan-eth2.network.d/policy.conf >/dev/null
+              sudo networkctl reload
+              sudo networkctl reconfigure eth2
+              sleep 3
+              sudo ip rule list | grep -q 10.66.2.5 || { sudo ip rule add from 10.66.2.5 table {{table}}; sudo ip route replace default via 10.66.2.1 dev eth2 table {{table}}; }

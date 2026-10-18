@@ -1,0 +1,159 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xlf-static-ip-netplan
+  title: Give the second interface a persistent dual-stack address
+  domain: linux
+  frameworks: [lfcs:networking]
+  difficulty: medium
+  estimatedMinutes: 8
+  tags: [exam, netplan, ipv6, persistence]
+  version: 1
+spec:
+  description: |
+    **Host:** `tr-ops-01` (`ssh tr-ops-01`, then `sudo -i`)
+
+    The host has a secondary interface **`eth1`** for the passenger-information network. It
+    has no address yet. Configure it with **Netplan** so that it carries the IPv4 address
+    **`{{a4}}`** and the IPv6 address **`{{a6}}`**, apply the configuration now, and make
+    sure it is the same after a reboot.
+
+    Do not touch `eth0`: its address and the default route must stay as they are.
+  objectives:
+    - Configure a dual-stack static address on a second interface in Netplan
+  params:
+    a4:
+      type: choice
+      values: [10.50.4.9/24, 10.60.8.17/24, 172.20.5.5/25]
+    a6:
+      type: choice
+      values: ["fd00:50:4::9/64", "fd00:60:8::17/64", "fd00:20:5::5/64"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-ops-01
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["2Gi", "1Gi", "2Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-ops-01
+      timeoutSec: 90
+      run: |
+        set -eu
+        # A veth pair stands in for a second NIC (the VM has one): eth1 is what the learner
+        # configures, eth1p is its always-up peer. eth0 and its Netplan file are never touched.
+        printf '[NetDev]\nName=eth1\nKind=veth\n\n[Peer]\nName=eth1p\n' > /etc/systemd/network/10-tr-eth1.netdev
+        printf '[Match]\nName=eth1p\n\n[Network]\nLinkLocalAddressing=no\nConfigureWithoutCarrier=yes\n\n[Link]\nRequiredForOnline=no\n' > /etc/systemd/network/10-tr-eth1p.network
+        networkctl reload >/dev/null 2>&1 || true
+        for i in $(seq 15); do ip link show eth1 >/dev/null 2>&1 && break; sleep 1; done
+        ip link show eth1 >/dev/null 2>&1 || ip link add eth1 type veth peer name eth1p
+        ip link set eth1p up
+        for f in /etc/netplan/*.yaml; do
+          [ -f "$f" ] || continue
+          python3 - "$f" <<'EOT'
+        import sys, yaml
+        p = sys.argv[1]
+        d = yaml.safe_load(open(p)) or {}
+        e = (d.get("network") or {}).get("ethernets") or {}
+        if "eth1" in e:
+            del e["eth1"]
+            yaml.safe_dump(d, open(p, "w"))
+        EOT
+        done
+        rm -f /etc/netplan/*eth1*.yaml /etc/netplan/70-netplan-set.yaml
+        ip addr flush dev eth1 || true
+        ip -br link show eth1 | grep -q eth1
+  checks:
+    - id: live-v4
+      description: eth1 carries {{a4}} now
+      type: shell
+      on: tr-ops-01
+      skills: [linux.net.persistent-config]
+      weight: 1
+      command: ip -o -4 addr show dev eth1 scope global 2>/dev/null | awk '{print $4}' | paste -sd,
+      expect: {match: exact, value: "{{a4}}"}
+    - id: live-v6
+      description: eth1 carries {{a6}} now
+      type: shell
+      on: tr-ops-01
+      skills: [linux.net.persistent-config]
+      weight: 1
+      timeoutSec: 20
+      command: |
+        for i in 1 2 3 4 5; do
+          a=$(ip -o -6 addr show dev eth1 scope global 2>/dev/null | grep -v tentative | awk '{print $4}' | paste -sd,)
+          [ -n "$a" ] && break; sleep 1
+        done
+        echo "$a"
+      expect: {match: exact, value: "{{a6}}"}
+    - id: netplan-config
+      description: Netplan configures both addresses for eth1
+      type: shell
+      on: tr-ops-01
+      skills: [linux.net.persistent-config]
+      weight: 2
+      command: netplan get ethernets.eth1.addresses 2>/dev/null | sed 's/^- *//' | tr -d "'\" " | sort | paste -sd,
+      expect: {match: exact, value: "{{a4}},{{a6}}"}
+    - id: eth0-untouched
+      description: The default route still leaves through eth0
+      type: shell
+      on: tr-ops-01
+      skills: [linux.net.persistent-config]
+      weight: 0.5
+      command: ip route show default | awk '{for (i = 1; i <= NF; i++) if ($i == "dev") print $(i + 1)}' | sort -u | paste -sd,
+      expect: {match: exact, value: eth0}
+  misconceptions:
+    - id: ip-addr-only
+      description: Adds the addresses with ip addr and never writes them to Netplan.
+      feedback: "ip addr add lasts until the interface is recreated or the host reboots; the addresses belong in a file under /etc/netplan, then netplan apply."
+      expectFail: [netplan-config]
+      mutation:
+        on: tr-ops-01
+        as: learner
+        run: |
+          sudo ip addr add {{a4}} dev eth1
+          sudo ip addr add {{a6}} dev eth1
+          sudo ip link set eth1 up
+    - id: ipv4-only
+      description: Configures only the IPv4 address in Netplan.
+      feedback: "The task asks for both address families: list the IPv6 address in the same addresses list."
+      expectFail: [live-v6, netplan-config]
+      mutation:
+        on: tr-ops-01
+        as: learner
+        timeoutSec: 90
+        run: |
+          printf 'network:\n  version: 2\n  ethernets:\n    eth1:\n      addresses: [{{a4}}]\n' | sudo tee /etc/netplan/60-eth1.yaml >/dev/null
+          sudo chmod 0600 /etc/netplan/60-eth1.yaml
+          sudo netplan apply
+          sleep 2
+  solution:
+    explanation: One Netplan file lists both addresses for eth1; netplan apply renders it for systemd-networkd and applies it, leaving eth0 alone.
+    steps:
+      - on: tr-ops-01
+        as: learner
+        timeoutSec: 90
+        run: |
+          set -e
+          printf 'network:\n  version: 2\n  ethernets:\n    eth1:\n      addresses: [{{a4}}, "{{a6}}"]\n' | sudo tee /etc/netplan/60-eth1.yaml >/dev/null
+          sudo chmod 0600 /etc/netplan/60-eth1.yaml
+          sudo netplan apply
+          sleep 3
+          ip -br addr show eth1
+    alternatives:
+      - id: netplan-set
+        description: Use netplan set instead of writing the file by hand.
+        steps:
+          - on: tr-ops-01
+            as: learner
+            timeoutSec: 90
+            run: |
+              set -e
+              sudo netplan set 'ethernets.eth1.addresses=[{{a4}}, "{{a6}}"]'
+              sudo netplan apply
+              sleep 3
