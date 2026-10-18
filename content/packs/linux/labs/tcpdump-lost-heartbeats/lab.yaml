@@ -30,7 +30,7 @@ spec:
        the heartbeats are visible** and save at least a few packets to
        **`~/answers/heartbeats.pcap`** (`-w`).
     2. Write the name of the hop that drops them to **`~/answers/drop.txt`**, as one word:
-       `tr-signal-03` (the sender never sends), `rtr` (the router drops them) or
+       `tr-signal-03` (the sender never puts them on the wire), `rtr` (the router drops them) or
        `collector` (they arrive here but are dropped before the service).
   objectives:
     - Capture packets with tcpdump using interface and port filters
@@ -39,7 +39,7 @@ spec:
   params:
     dropat:
       type: choice
-      values: [rtr, collector]
+      values: [tr-signal-03, rtr, collector]
   topology:
     entry: workstation
     nodes:
@@ -91,13 +91,25 @@ spec:
         n = 0
         while True:
             n += 1
-            s.sendto(("HB tr-signal-03 %d" % n).encode(), ("10.65.2.2", 5140))
+            try:
+                s.sendto(("HB tr-signal-03 %d" % n).encode(), ("10.65.2.2", 5140))
+            except OSError:
+                pass
             time.sleep(0.5)
         EOPY
         printf '[Unit]\nDescription=Tallowmere heartbeat collector\n[Service]\nExecStart=/usr/bin/python3 /usr/local/libexec/tr-collector.py\nRestart=always\n[Install]\nWantedBy=multi-user.target\n' > /etc/systemd/system/tr-collector.service
         printf '[Unit]\nDescription=Tallowmere heartbeat sender\n[Service]\nNetworkNamespacePath=/run/netns/tr-signal-03\nExecStart=/usr/bin/python3 /usr/local/libexec/tr-heartbeat-sender.py\nRestart=always\n[Install]\nWantedBy=multi-user.target\n' > /etc/systemd/system/tr-signal-sender.service
         # the fault, at the requested hop
-        if [ "{{dropat}}" = rtr ]; then
+        if [ "{{dropat}}" = tr-signal-03 ]; then
+          ip netns exec tr-signal-03 nft -f - <<'EONFT'
+        table inet trhb {
+          chain output {
+            type filter hook output priority 0; policy accept;
+            udp dport 5140 drop
+          }
+        }
+        EONFT
+        elif [ "{{dropat}}" = rtr ]; then
           ip netns exec rtr nft -f - <<'EONFT'
         table inet trhb {
           chain forward {
@@ -140,6 +152,11 @@ spec:
       skills: [linux.net.capture]
       weight: 1.5
       command: |
+        if [ "{{dropat}}" = tr-signal-03 ]; then
+          # the sender never emits the packets: the evidence is a valid, empty capture taken on the path
+          tcpdump -nr /home/learner/answers/heartbeats.pcap >/dev/null 2>&1 && echo captured || echo "no-capture"
+          exit 0
+        fi
         n=$(tcpdump -nr /home/learner/answers/heartbeats.pcap 'src host 10.65.1.2 and udp dst port 5140' 2>/dev/null | wc -l)
         [ "$n" -ge 3 ] && echo captured || echo "packets=$n"
       expect: {match: exact, value: captured}
@@ -168,8 +185,8 @@ spec:
       cost: 1
   misconceptions:
     - id: blames-sender
-      description: Concludes the sender is broken because the collector log is empty.
-      feedback: "An empty log only says the packets did not reach the service. The capture on r-in shows tr-signal-03 does send them."
+      description: Decides from the empty collector log alone, without comparing captures on both sides of each hop.
+      feedback: "An empty log only says the packets did not reach the service. Capture on both sides of each hop (r-in, r-out, sig-up) to see where they stop."
       expectFail: [hop]
       mutation:
         on: tr-net-01
@@ -177,7 +194,7 @@ spec:
         run: |
           sudo timeout 5 ip netns exec rtr tcpdump -Z root -ni r-in -w /home/learner/answers/heartbeats.pcap 'udp port 5140' >/dev/null 2>&1 || true
           sudo chown learner:learner /home/learner/answers/heartbeats.pcap
-          echo tr-signal-03 > /home/learner/answers/drop.txt
+          if [ "{{dropat}}" = tr-signal-03 ]; then echo collector; else echo tr-signal-03; fi > /home/learner/answers/drop.txt
     - id: no-capture-saved
       description: Guesses the right hop but never saves a capture of the heartbeats.
       feedback: "The task asks for evidence: capture the UDP 5140 packets with tcpdump -w on an interface where they are visible."
@@ -186,11 +203,13 @@ spec:
         on: tr-net-01
         as: learner
         run: |
-          sudo timeout 4 tcpdump -Z root -ni eth0 -w /home/learner/answers/heartbeats.pcap 'tcp port 22' >/dev/null 2>&1 || true
-          sudo chown learner:learner /home/learner/answers/heartbeats.pcap
+          if [ "{{dropat}}" != tr-signal-03 ]; then
+            sudo timeout 4 tcpdump -Z root -ni eth0 -w /home/learner/answers/heartbeats.pcap 'tcp port 22' >/dev/null 2>&1 || true
+            sudo chown learner:learner /home/learner/answers/heartbeats.pcap
+          fi
           echo "{{dropat}}" > /home/learner/answers/drop.txt
   solution:
-    explanation: Capturing on r-in shows the heartbeats leaving tr-signal-03 and reaching the router. Capturing on r-out tells the router apart from the collector - no packets there means the router drops them, packets there with an empty collector log means the host drops them.
+    explanation: Capturing on r-in shows whether the heartbeats leave tr-signal-03 at all (none there means the sender side drops them). Capturing on r-out tells the router apart from the collector - no packets there means the router drops them, packets there with an empty collector log means the host drops them.
     steps:
       - on: tr-net-01
         as: learner
@@ -199,6 +218,7 @@ spec:
           set -e
           sudo timeout 5 ip netns exec rtr tcpdump -Z root -ni r-in -w /home/learner/answers/heartbeats.pcap 'udp port 5140' >/dev/null 2>&1 || true
           sudo chown learner:learner /home/learner/answers/heartbeats.pcap
+          i=$(sudo timeout 4 ip netns exec rtr tcpdump -ni r-in -c1 'udp port 5140' 2>/dev/null | wc -l)
           n=$(sudo timeout 4 ip netns exec rtr tcpdump -ni r-out -c1 'udp port 5140' 2>/dev/null | wc -l)
-          if [ "$n" -eq 0 ]; then echo rtr; else echo collector; fi > /home/learner/answers/drop.txt
+          if [ "$i" -eq 0 ]; then echo tr-signal-03; elif [ "$n" -eq 0 ]; then echo rtr; else echo collector; fi > /home/learner/answers/drop.txt
           cat /home/learner/answers/drop.txt

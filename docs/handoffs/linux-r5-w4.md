@@ -1,10 +1,9 @@
 # Handoff: Linux round 5, wave 4 (networking on VMs: namespaces, firewalls, persistent interfaces, time)
 
 Branch `content/linux-r5-w4`, pack `content/packs/linux`. Source of truth for each lab's state
-is `status` / `notes` in `content/curriculum.yaml`. All 23 labs are `built`: written and
-written and checked with lab-verify --strict and the curriculum render; labctl validate, the
-content tests and `labctl exam compile --allow-missing sim-linux-sysadmin` are pending CI (no labctl
-binary or built lab-schema locally). None run live.
+is `status` / `notes` in `content/curriculum.yaml`. All 23 labs are `built`: written, with the curriculum render checked locally. lab-verify --strict,
+labctl validate, the content tests and `labctl exam compile --allow-missing sim-linux-sysadmin` are
+pending CI (no labctl binary or built lab-schema locally) and not yet confirmed. None run live.
 
 ## Labs
 
@@ -17,7 +16,7 @@ binary or built lab-schema locally). None run live.
 | time and services | chrony-timezone-depot (ubuntu-vm), chrony-server-isolated (two el-vm), wireguard-depot-tunnel (two ubuntu-vm), dhcp-server-depot (ubuntu-vm, dnsmasq) |
 
 sim-linux-sysadmin networking pool is now 8/8 (draw 4, so 2x); `labctl exam compile
---allow-missing sim-linux-sysadmin` passes. Three courses were added to the pack:
+--allow-missing sim-linux-sysadmin` is pending CI. Three courses were added to the pack:
 `lsn-netns-routing`, `lsn-firewalls`, `lsn-persistent-net`.
 
 ## Design notes
@@ -40,7 +39,7 @@ sim-linux-sysadmin networking pool is now 8/8 (draw 4, so 2x); `labctl exam comp
   `tr-gre.service` from `/etc/default/tr-gre`; persistence is that file (MTU <= 1376) or a saved nft
   MSS clamp. Needs `ip_gre`.
 - bridge-vlan-namespaces: all four hosts share one /24, only the PVIDs separate them. Needs `bridge`
-  and `8021q` (setup fails with a message otherwise).
+  (setup fails with a message otherwise).
 - nftables-from-scratch: management stays on `eth0` (`iifname "eth0" accept`), so the workstation
   and the platform are never cut off; persistence is graded by loading `/etc/nftables.conf` in a
   scratch namespace plus `systemctl is-enabled nftables`. The same scratch-namespace trick grades
@@ -76,7 +75,7 @@ sim-linux-sysadmin networking pool is now 8/8 (draw 4, so 2x); `labctl exam comp
   Add `linux-modules-extra-<kernel>` (noble) or `kernel-modules-extra` (el10) to `tools/mirrors/packages-*.txt`
   and rebuild the VM image, or confirm sch_netem.ko is already in /lib/modules of the image.
 - Kernel modules assumed present, with a clear setup failure otherwise: `ip_gre`, `bridge`,
-  `8021q`, `bonding`, `wireguard`, `sch_tbf`.
+  `bonding`, `wireguard`, `sch_tbf`.
 - Reboot-graded labs check persistence from configuration only, until verify can reboot.
 
 ## Not verified (risks for the testing round)
