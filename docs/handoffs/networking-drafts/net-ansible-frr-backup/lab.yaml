@@ -7,7 +7,7 @@ apiVersion: cloudtrain.dev/v3
 kind: Lab
 metadata:
   id: net-ansible-frr-backup
-  title: Back up every router configuration to Git with Ansible
+  title: Back up every router config to Git with Ansible
   domain: networking
   frameworks: [ccna:automation-programmability, ex457-aligned:config-backup]
   difficulty: medium
@@ -91,7 +91,7 @@ spec:
         su learner -c 'cd /home/learner && git init -q --bare -b main net-backups.git && git clone -q net-backups.git net-backups && cd net-backups && echo "Router configuration backups" > README.md && git add README.md && git -c user.name=setup -c user.email=setup@mv.example commit -q -m "Initial commit" && git push -q origin HEAD:main'
         cat > /var/lib/cloudtrain/count.sh <<'SH'
         #!/bin/sh
-        git --git-dir=/home/learner/net-backups.git rev-list --count main 2>/dev/null || echo 0
+        su learner -s /bin/sh -c 'git --git-dir=/home/learner/net-backups.git rev-list --count main' 2>/dev/null || echo 0
         SH
         chmod 755 /var/lib/cloudtrain/count.sh
   checks:
@@ -100,7 +100,7 @@ spec:
       type: shell
       on: mv-ansible
       command: |
-        git --git-dir=/home/learner/net-backups.git ls-tree -r --name-only main 2>/dev/null | grep '^backups/' | sort | tr '\n' ' '
+        su learner -s /bin/sh -c 'git --git-dir=/home/learner/net-backups.git ls-tree -r --name-only main' 2>/dev/null | grep '^backups/' | sort | tr '\n' ' '
       expect: { match: exact, value: "backups/mv-campus-north.cfg backups/mv-campus-south.cfg backups/mv-core-1.cfg " }
       skills: [net.automation.ansible-network]
       weight: 2
@@ -109,7 +109,7 @@ spec:
       type: shell
       on: mv-ansible
       command: |
-        for r in mv-campus-north mv-campus-south mv-core-1; do git --git-dir=/home/learner/net-backups.git show main:backups/$r.cfg 2>/dev/null | grep -c "^hostname $r\$"; done | tr '\n' ' '
+        for r in mv-campus-north mv-campus-south mv-core-1; do su learner -s /bin/sh -c "git --git-dir=/home/learner/net-backups.git cat-file blob main:backups/$r.cfg" 2>/dev/null | grep -c "^hostname $r\$"; done | tr '\n' ' '
       expect: { match: exact, value: "1 1 1 " }
       skills: [net.automation.ansible-network]
     - id: rerun-adds-nothing
@@ -144,7 +144,7 @@ spec:
         b=$(/var/lib/cloudtrain/count.sh)
         su learner -c 'cd /home/learner && ansible-playbook backup.yml' >/dev/null 2>&1 || { echo failed; exit 0; }
         a=$(/var/lib/cloudtrain/count.sh)
-        f=$(git --git-dir=/home/learner/net-backups.git show --name-only --format= main | tr '\n' ' ')
+        f=$(su learner -s /bin/sh -c 'git --git-dir=/home/learner/net-backups.git diff-tree --no-commit-id --name-only -r --no-textconv main' | tr '\n' ' ')
         [ "$a" = "$((b + 1))" ] && echo "$f" || echo "commits $b-$a"
       expect: { match: exact, value: "backups/mv-campus-north.cfg " }
       timeoutSec: 120
@@ -181,7 +181,7 @@ spec:
           EOF
           chown learner: /home/learner/backup.yml
           su learner -c 'cd /home/learner && ansible-playbook backup.yml'
-      expectFail: [rerun-adds-nothing]
+      expectFail: [rerun-adds-nothing, change-adds-one-commit]
       feedback: A volatile line in the file makes every run a change, so the history fills with commits that say nothing. Keep the file a pure copy of the device output.
     - id: single-file
       description: Appends every router's configuration to one file
@@ -209,7 +209,7 @@ spec:
           EOF
           chown learner: /home/learner/backup.yml
           su learner -c 'cd /home/learner && ansible-playbook backup.yml'
-      expectFail: [one-file-per-router, files-are-configs]
+      expectFail: [one-file-per-router, files-are-configs, change-adds-one-commit]
       feedback: One file per device keeps the history readable (a diff names the router that changed) and lets you restore a single device.
     - id: never-pushed
       description: Commits in the working clone but never pushes to the bare repository
@@ -234,7 +234,7 @@ spec:
           EOF
           chown learner: /home/learner/backup.yml
           su learner -c 'cd /home/learner && ansible-playbook backup.yml'
-      expectFail: [one-file-per-router, files-are-configs]
+      expectFail: [one-file-per-router, files-are-configs, change-adds-one-commit]
       feedback: The backup repository is the bare one; a commit that stays in the working clone is lost with the control node.
   solution:
     explanation: |
