@@ -96,10 +96,12 @@ test). It should be the same as the `docker stop` case plus host-prep reloading 
 | Profile | Cluster | Primary CNI | Kube-OVN | Orchestrator |
 |---|---|---|---|---|
 | `kubeovn-primary` (default) | `cloudtrain-dev` | Kube-OVN | primary | `--network-mode=primary` |
-| `managed-cni` | `cloudtrain-mcni` | Cilium (`deploy/cilium/values.yaml`), stands in for a managed cloud's CNI | non-primary behind Multus (`deploy/kube-ovn/values-secondary.yaml`) | needs the secondary network mode (implementation PR) |
+| `managed-cni` | `cloudtrain-mcni` | Cilium (`deploy/cilium/values.yaml`), stands in for a managed cloud's CNI | non-primary behind Multus (`deploy/kube-ovn/values-secondary.yaml`) | `--network-mode=secondary` |
 
 ```bash
 task dev:up KIND_PROFILE=managed-cni              # control plane + 2 workers (deploy/kind/cluster-managed-cni.yaml)
+task orchestrator:deploy KIND_PROFILE=managed-cni # adds --network-mode=secondary
+task lab:verify KIND_PROFILE=managed-cni -- <lab dir>
 task dev:down KIND_PROFILE=managed-cni            # deletes only cloudtrain-mcni
 ```
 

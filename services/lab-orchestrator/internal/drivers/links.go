@@ -36,6 +36,8 @@ type LinkReporter interface {
 // LinkNetwork is the PodNetwork on Kube-OVN + Multus (internal/network).
 type LinkNetwork struct {
 	Manager *network.Manager
+	// Options: network mode (primary/secondary) and segment MTU.
+	Options network.Options
 	// ToolsImage is the pullable nettools image for net-init and the link sidecar.
 	ToolsImage string
 	// DestroyWait bounds how long DestroyTopology waits for the network to
@@ -122,7 +124,7 @@ func (n *LinkNetwork) Plan(s *labsv1.LabSession, topo *labsv1.Topology) (*networ
 	if topo == nil {
 		return nil, fmt.Errorf("network: no topology: %w", ErrUnsupported)
 	}
-	p, err := network.Build(network.SessionOf(s), topo)
+	p, err := network.BuildWith(network.SessionOf(s), topo, n.Options)
 	if errors.Is(err, network.ErrInvalid) {
 		return nil, fmt.Errorf("%w: %w", ErrUnsupported, err)
 	}

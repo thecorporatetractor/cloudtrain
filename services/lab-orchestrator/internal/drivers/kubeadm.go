@@ -148,7 +148,7 @@ func (d *KubeadmDriver) Provision(ctx context.Context, ref NodeRef) (NodeState, 
 	if err != nil {
 		return NodeState{Phase: labsv1.NodeProvisioning, Message: err.Error()}, err
 	}
-	net := NewLabNet(ref.Session)
+	net := d.Session.labNet(ref.Session)
 	for i, m := range l.members {
 		h := l.hosts[m.Name]
 		ud, err := d.userdata(ref, l, m, pki, learnerPub, adminPub)

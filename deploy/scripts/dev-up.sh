@@ -55,6 +55,16 @@ for node in $(docker ps --filter "$NODE_FILTER" --format '{{.Names}}'); do
       || die "$node still lacks KVM/vhost-net/tun devices after restart"
   fi
 done
+# On hosts with DMI (EC2, most bare metal; WSL has none) kind bind-mounts files over
+# /sys/devices/virtual/dmi/id (a per-node product_uuid). /sys is then not "fully
+# visible", so runc cannot mount sysfs in a user namespace and every hostUsers:false
+# pod fails with "error mounting sysfs ... operation not permitted" (seen on the
+# verify VM, tools/verify-vm/tune.sh). Drop the overmounts; they come back when a
+# node container restarts, and dev:up drops them again.
+for node in $(docker ps --filter "$NODE_FILTER" --format '{{.Names}}'); do
+  docker exec "$node" sh -c 'while grep -q " /sys/devices/virtual/dmi/id/" /proc/self/mounts; do
+    umount "$(awk "\$2 ~ /^\/sys\/devices\/virtual\/dmi\/id\// {print \$2; exit}" /proc/self/mounts)" || break; done'
+done
 wait_for "API server of $CLUSTER_NAME" 180 k get --raw /readyz
 
 # --- 1b. Cilium (managed-cni: the primary CNI, standing in for the cloud's) ---

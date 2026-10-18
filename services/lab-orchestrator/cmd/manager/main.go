@@ -32,7 +32,8 @@ func main() {
 		catalogPaths, adminImageRef, helmBin, vclusterChart, vclusterValues string
 		sessionSelector, leaderElectionID, netToolsImage                    string
 		storageClass, vmDisks, userNamespaces, vclusterPodSecurity          string
-		ovnCentral, imageMirrors, imagePullSecrets                          string
+		ovnCentral, imageMirrors, imagePullSecrets, networkModeFlag         string
+		labMTU                                                              int
 		linkSysctls                                                         bool
 		linkRateMbps                                                        int
 		leaderElect, metricsSecure, persistentHome, vclusterPersistence     bool
@@ -68,6 +69,8 @@ func main() {
 	flag.BoolVar(&linkSysctls, "link-sysctls", true, "run wired lab pods (topology links) in a user namespace with writable network sysctls (ip_forward, rp_filter, accept_ra, proxy_arp, ping_group_range) when user namespaces are available (--user-namespaces); false = privileged net-init and read-only /proc/sys")
 	flag.IntVar(&linkRateMbps, "link-rate-mbps", 10, "rate limit of every lab link attachment in Mbit/s, each direction (Kube-OVN ingress_rate/egress_rate: OVS policing and an HTB queue on the host side of the port, out of the learner's reach), so a bridging loop cannot saturate the host; 0 = none")
 	flag.BoolVar(&allowLearnerSudo, "allow-learner-sudo", true, "allow labs whose entry node sets learnerSudo (the learner may escalate to root in that unprivileged container); false fails such sessions")
+	flag.StringVar(&networkModeFlag, "network-mode", string(network.ModePrimary), "how wired lab pods and lab VMs reach the session network (docs/any-kubernetes.md): primary (Kube-OVN is the cluster's primary CNI; eth0 placed with ovn.kubernetes.io/logical_switch) or secondary (another CNI owns eth0, Kube-OVN runs non-primary behind Multus; eth0 = a session segment as the Multus default network, VMs with multus.default)")
+	flag.IntVar(&labMTU, "lab-mtu", network.DefaultLinkMTU, "MTU of every session segment (Kube-OVN Subnet spec.mtu): lab links, management, lab and access subnets; lab content assumes 1400. 0 = Kube-OVN default (node MTU minus tunnel overhead)")
 	flag.StringVar(&storageClass, "storage-class", "", "StorageClass of learner homes, vcluster databases and VM disks; empty = cluster default")
 	opts := zap.Options{}
 	opts.BindFlags(flag.CommandLine)
@@ -171,6 +174,17 @@ func main() {
 		log.Error(nil, "--user-namespaces must be auto, true or false", "value", userNamespaces)
 		os.Exit(1)
 	}
+	netMode, err := network.ParseMode(networkModeFlag)
+	if err != nil {
+		log.Error(err, "invalid --network-mode")
+		os.Exit(1)
+	}
+	if labMTU != 0 && (labMTU < 576 || labMTU > 9000) {
+		log.Error(nil, "--lab-mtu must be 0 or 576-9000", "value", labMTU)
+		os.Exit(1)
+	}
+	netOpts := network.Options{Mode: netMode, MTU: labMTU}
+	log.Info("lab network", "mode", netMode, "segmentMTU", labMTU)
 	rt, err := drivers.NewRuntime(drivers.RuntimeOptions{
 		Client: mgr.GetClient(), Reader: mgr.GetAPIReader(), Scheme: scheme, Executor: executor,
 		Catalog: catalog, ImageRegistry: registry, ImageMirrors: mirrors, ImagePullSecrets: pullSecrets,
@@ -180,6 +194,7 @@ func main() {
 		PersistentHome:      persistentHome, VClusterPersistence: vclusterPersistence, StorageClass: storageClass,
 		VMDisks:        drivers.VMDiskOptions{Persistent: vmDisks == "persistent"},
 		UserNamespaces: useUserNS, DenyLearnerSudo: !allowLearnerSudo,
+		Network: netOpts,
 	})
 	if err != nil {
 		log.Error(err, "unable to build drivers")
@@ -193,6 +208,7 @@ func main() {
 	}
 	linkNet := &drivers.LinkNetwork{
 		Manager:        &network.Manager{Client: mgr.GetClient()},
+		Options:        netOpts,
 		ToolsImage:     rt.Container.ImageFor(toolsImage),
 		UserNamespaces: linkSysctls && useUserNS,
 		LinkRateMbps:   linkRateMbps,

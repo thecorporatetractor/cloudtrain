@@ -519,3 +519,90 @@ Method: `ip`, `ping -M do`, `arping`, `getent` and `nc` from the nettools
 image, run by `kubectl exec`. The spike cluster is reused for the `labctl
 verify` runs of the implementation (`--network-mode=secondary`) and deleted
 afterwards.
+
+## 9. Implementation: `--network-mode` (2026-10-18)
+
+The orchestrator has a network mode setting; one code path serves both kinds of
+cluster.
+
+| Setting | `primary` (default) | `secondary` |
+|---|---|---|
+| Clusters | Kube-OVN is the primary CNI: kind dev (`cloudtrain-dev`), verify VM, vCenter, bare metal | the cluster's CNI owns eth0, Kube-OVN non-primary behind Multus: AKS, EKS, GKE, `KIND_PROFILE=managed-cni` |
+| Wired lab pods (link ends, netdev) | eth0 via `ovn.kubernetes.io/logical_switch` (today) | mgmt subnet gets a provider and a NAD; `v1.multus-cni.io/default-network` + `<provider>.kubernetes.io/logical_switch` (`network/pod.go`) |
+| Lab VMs | `pod` network + bridge, `ovn.kubernetes.io/*` (today) | lab subnet gets a provider and NAD `ct-<hash>-lab`; `multus: {networkName, default: true}` + bridge, `<provider>.kubernetes.io/ip_address` (`drivers/labnet.go`, `kubevirt.go`) |
+| Link ends, access NAD, QoS, `layer2_forward`, vlan-passthru | unchanged | unchanged |
+| Entry node, lab peers (headless Service) | unchanged | eth0 on the cluster CNI, which enforces the entry and peer policies; `network_policy_for` of a wired entry lists the mgmt and access NADs instead of `ovn` |
+| Segment MTU | `--lab-mtu` (default 1400) sets `Subnet.spec.mtu` on every session subnet in both modes |
+
+Flags: `--network-mode`, `--lab-mtu`; `orchestrator-deploy.sh` takes
+`NETWORK_MODE` and `LAB_MTU` (`KIND_PROFILE=managed-cni` defaults to
+`secondary`). `labctl preflight` (network section, `--probe`) checks a cluster
+for either mode, using the orchestrator's own wiring code for the probe.
+
+### Pod Security and privileges
+
+- Session namespaces created by `labctl verify`/`labctl exam` and by
+  `task dev:gateway` get `enforce: privileged` (set explicitly, so a cluster
+  default of baseline does not reject lab pods) and `audit: baseline`
+  (`drivers.SessionNamespacePodSecurity`). The Helm chart must do the same for
+  its session namespace.
+- Reduced: `net-init` of wired pods that are not routers no longer runs
+  privileged without user namespaces. It gets NET_ADMIN/NET_RAW, and the pod
+  sets the safe sysctl `ping_group_range`. With user namespaces (the default
+  where supported) no wired pod is privileged.
+- Cannot be reduced without losing lab features: NET_ADMIN/NET_RAW on wired
+  nodes and the link sidecar (addresses, routes, tc, tcpdump); `procMount:
+  Unmasked` for writable network sysctls in user-namespaced pods; a privileged
+  `net-init` for router nodes without user namespaces (`ip_forward` and
+  per-interface `rp_filter` are unsafe sysctls, and the per-interface ones do
+  not exist yet when the sandbox is created); SYS_ADMIN for FRR; KubeVirt's
+  virt-launcher. So session namespaces stay `privileged`, and baseline is
+  audited only.
+
+### Verify results
+
+Secondary mode on the spike cluster (`ct-cni-spike`: Cilium primary,
+Kube-OVN non-primary, scoped manager `--network-mode=secondary`,
+`labctl verify --parallel 1`, ephemeral VM disks):
+
+| Lab | Kind | Result |
+|---|---|---|
+| `fix-ssh-key-perms` | container only | pass |
+| `xnt-json-neighbour-export` | netdev (FRR) with links | pass (base, mutations, alternatives; teardown clean) |
+| `etcd-snapshot-restore` | VM | pass (8/8 runs) |
+| `hostpath-mount-policy` | kubeadm cluster (`kubeadm:1.37-sec`) | pass (6/6 runs) |
+
+`labctl preflight --probe` on the same cluster passed every check (secondary
+mode detected, Cilium, conflist priority 90, MTU 1400 on eth0 and the link,
+1400-byte DF frames across workers on both, no route to the API service, 35
+platform and lab modules on both workers).
+
+Primary mode unchanged: on `cloudtrain-dev`, a test manager (namespace
+`ct-cni-test`, `labs.cloudtrain.dev/verify=cni-test`, deleted afterwards)
+passed `fix-ssh-key-perms` and `xnt-json-neighbour-export`, both passing in
+the batch results before.
+
+Found on the way: on hosts with DMI (the EC2 verify VM) kind bind-mounts files
+over `/sys/devices/virtual/dmi/id`, and then every `hostUsers: false` pod fails
+with `error mounting "sysfs" ... operation not permitted`. This is not related
+to the CNI. `tools/verify-vm/tune.sh` handled it for `cloudtrain-dev` only;
+`dev:up` now drops the overmounts for every profile.
+
+### Remaining gaps
+
+- Secondary mode is verified only on kind with Cilium. Calico, the AWS VPC CNI
+  (with `enableNetworkPolicy`), Azure CNI and GKE Dataplane V2 on a real
+  underlay (MTU, geneve UDP 6081 in the security groups) are next, through
+  tier 3 of section 6.
+- Secondary mode on a cluster where Kube-OVN is primary is not verified.
+  Preflight warns about it, so use `primary` there.
+- Lab CIDRs stay fixed at `192.168.99.0/24`, `192.168.100.0/24` and
+  `198.18.0.0/15`, because lab content names these addresses. Preflight fails
+  on any overlap with node, pod, service or Kube-OVN ranges, which means a
+  cloud VNet/VPC in `192.168.0.0/16` must avoid these two /24s.
+- The kubelet cannot reach wired pods and VMs, which have no address on the
+  cluster network, so lab pods must keep exec-only probes.
+- Pod Security for the gateway's own session namespace in a cluster install
+  belongs in the Helm chart, which does not exist yet.
+- Clabernetes is not built yet. Its VXLAN launchers would sit on the primary
+  network, independent of this mode.

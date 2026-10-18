@@ -44,6 +44,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	labsv1 "github.com/cloudtrain/cloudtrain/services/lab-orchestrator/api/v1alpha1"
+	"github.com/cloudtrain/cloudtrain/services/lab-orchestrator/internal/network"
 )
 
 const (
@@ -381,6 +382,22 @@ func (r *SessionRuntime) reader() client.Reader {
 	return r.Client
 }
 
+// labNet returns the session's network names in the runtime's network mode.
+func (r *SessionRuntime) labNet(s *labsv1.LabSession) LabNet {
+	if r == nil {
+		return NewLabNet(s)
+	}
+	return r.Network.LabNet(s)
+}
+
+// networkMode is the runtime's network mode (primary without a lab network).
+func (r *SessionRuntime) networkMode() network.Mode {
+	if r == nil || r.Network == nil || r.Network.Options.Mode == "" {
+		return network.ModePrimary
+	}
+	return r.Network.Options.Mode
+}
+
 // SSHSecretName is the session's SSH key Secret.
 func SSHSecretName(s *labsv1.LabSession) string { return "ct-" + SessionHash(s) + "-ssh" }
 
@@ -394,7 +411,7 @@ func (r *SessionRuntime) ProvisionTopology(ctx context.Context, ref SessionRef) 
 	topo := &ref.Template.Topology
 	if entry, err := EntryRef(NodeRef{Session: ref.Session, Template: ref.Template}); err == nil {
 		np := EntryNetworkPolicy(ref.Session, entry.Node.Name, VClusterReleases(ref.Session, topo))
-		if nets := EntryPolicyNetworks(ref.Session, topo, entry.Node.Name); nets != "" {
+		if nets := EntryPolicyNetworks(ref.Session, topo, entry.Node.Name, r.networkMode()); nets != "" {
 			np.Annotations = map[string]string{AnnotationNetworkPolicyFor: nets}
 		}
 		if err := setOwner(ref.Session, np, r.Client); err != nil {

@@ -118,9 +118,13 @@ type LinkPlan struct {
 // Plan is the network of one session.
 type Plan struct {
 	Session Session
+	// Options: network mode and segment MTU.
+	Options Options
 	VPC     string
-	Mgmt    Segment
-	Links   []LinkPlan
+	// Mgmt carries eth0 of wired nodes. In ModeSecondary it is a NAD segment
+	// too (the pods' Multus default network).
+	Mgmt  Segment
+	Links []LinkPlan
 	// Wired lists, sorted by topology order, the nodes that live on the
 	// session network: netdev nodes and every node with a link end.
 	Wired []string
@@ -173,14 +177,33 @@ func (p *Plan) FindEnd(node, iface string) (NodeEnd, bool) {
 // cannot help.
 var ErrInvalid = errors.New("invalid lab network")
 
-// Build plans the network of a session from its resolved topology.
+// Build plans the network of a session from its resolved topology in
+// ModePrimary with the CNI's default MTU.
 func Build(s Session, topo *labsv1.Topology) (*Plan, error) {
-	p := &Plan{Session: s, VPC: ClusterName(s, "vpc")}
-	p.Mgmt = Segment{
+	return BuildWith(s, topo, Options{Mode: ModePrimary})
+}
+
+// MgmtSegment is the management segment of a session in mode.
+func MgmtSegment(s Session, mode Mode) Segment {
+	seg := Segment{
 		Subnet:  ClusterName(s, "mgmt"),
 		CIDR:    MgmtCIDR,
 		Gateway: MgmtCIDR.Addr().Next(),
 	}
+	if mode == ModeSecondary {
+		seg.NAD = NamespacedName(s, "mgmt")
+		seg.Provider = ProviderOf(seg.NAD, s.Namespace)
+	}
+	return seg
+}
+
+// BuildWith plans the network of a session from its resolved topology.
+func BuildWith(s Session, topo *labsv1.Topology, o Options) (*Plan, error) {
+	if o.Mode == "" {
+		o.Mode = ModePrimary
+	}
+	p := &Plan{Session: s, Options: o, VPC: ClusterName(s, "vpc")}
+	p.Mgmt = MgmtSegment(s, o.Mode)
 	drv := map[string]labsv1.DriverName{}
 	for _, n := range topo.Nodes {
 		drv[n.Name] = n.Driver
@@ -289,7 +312,7 @@ func linkSegment(s Session, i int) Segment {
 		CIDR:     netip.PrefixFrom(addr, carrierBits),
 		Gateway:  addr.Next(),
 		NAD:      nad,
-		Provider: fmt.Sprintf("%s.%s.ovn", nad, s.Namespace),
+		Provider: ProviderOf(nad, s.Namespace),
 	}
 }
 

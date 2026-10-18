@@ -90,7 +90,37 @@ type VClusterDriver struct {
 const (
 	PodSecurityBaseline   = "baseline"
 	PodSecurityRestricted = "restricted"
+	// PodSecurityPrivileged is only ever used for session namespaces
+	// (SessionNamespacePodSecurity), never for vcluster host namespaces.
+	PodSecurityPrivileged = "privileged"
 )
+
+// SessionNamespacePodSecurity is the Pod Security admission labels of a
+// namespace that holds LabSessions (labctl verify/exam namespaces, the
+// gateway's cloudtrain-sessions). Enforce must be privileged, set
+// explicitly so a cluster-wide default (AKS deployment safeguards, an
+// AdmissionConfiguration defaulting to baseline, GKE Autopilot) does not
+// reject lab pods. What keeps them above baseline, and cannot be reduced
+// without losing lab features:
+//   - wired lab pods (topology links) and their link sidecar: NET_ADMIN and
+//     NET_RAW (addresses, routes, tc, tcpdump on lab links);
+//   - user-namespaced wired pods: procMount Unmasked (writable network
+//     sysctls; baseline allows it only for some versions with hostUsers: false);
+//   - net-init of router nodes without user namespaces: privileged
+//     (ip_forward and per-interface rp_filter are unsafe sysctls, and the
+//     per-interface ones do not exist yet when the sandbox is created);
+//   - FRR netdev nodes: SYS_ADMIN; KubeVirt virt-launcher pods of lab VMs.
+//
+// Audit records baseline violations, so a cluster's audit log shows which
+// lab pods need more than baseline.
+func SessionNamespacePodSecurity() map[string]string {
+	return map[string]string{
+		LabelPodSecurityEnforce:        PodSecurityPrivileged,
+		LabelPodSecurityEnforceVersion: "latest",
+		LabelPodSecurityAudit:          PodSecurityBaseline,
+		LabelPodSecurityAuditVersion:   "latest",
+	}
+}
 
 // Pod Security admission namespace labels.
 const (

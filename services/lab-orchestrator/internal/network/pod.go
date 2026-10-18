@@ -63,7 +63,9 @@ type PodOptions struct {
 }
 
 // DecoratePod wires node's pod into the session network: the primary
-// interface moves to the management segment of the session VPC, every link
+// interface moves to the management segment of the session VPC (ModePrimary:
+// the Kube-OVN logical_switch annotation; ModeSecondary: the segment's NAD
+// as the Multus default network), every link
 // end becomes a Multus attachment with its interface name, net-init
 // configures the interfaces, and the link sidecar is added. The node's own
 // container (containerName) gets NET_ADMIN and NET_RAW so labs can manage
@@ -78,7 +80,12 @@ func (p *Plan) DecoratePod(node string, pod *corev1.Pod, containerName string, o
 	if pod.Annotations == nil {
 		pod.Annotations = map[string]string{}
 	}
-	pod.Annotations[AnnotationLogicalSwitch] = p.Mgmt.Subnet
+	if p.Options.Mode == ModeSecondary {
+		pod.Annotations[AnnotationDefaultNetwork] = p.Session.Namespace + "/" + p.Mgmt.NAD
+		pod.Annotations[p.Mgmt.Provider+".kubernetes.io/logical_switch"] = p.Mgmt.Subnet
+	} else {
+		pod.Annotations[AnnotationLogicalSwitch] = p.Mgmt.Subnet
+	}
 	ends := p.EndsOf(node)
 	if len(ends) > 0 {
 		var nets []map[string]string
@@ -117,9 +124,17 @@ func (p *Plan) DecoratePod(node string, pod *corev1.Pod, containerName string, o
 		Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("5m"), corev1.ResourceMemory: resource.MustParse("8Mi")},
 		Limits:   corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("64Mi")},
 	}
-	// Privileged only to write the netns-scoped sysctls (/proc/sys is
-	// read-only otherwise); it exits before the node starts.
+	// Without a user namespace, /proc/sys is read-only in containers, so a
+	// router's net-init (ip_forward, rp_filter on every interface: unsafe
+	// sysctls, and the per-interface ones cannot be set at sandbox creation
+	// because the CNI interfaces do not exist yet) runs privileged; it exits
+	// before the node starts. Other nodes only need the safe sysctl
+	// ping_group_range, which the pod sets itself, and NET_ADMIN for ip/tc.
 	initSC := &corev1.SecurityContext{Privileged: ptr.To(true)}
+	if !o.UserNamespace && !o.Router {
+		initSC = &corev1.SecurityContext{Capabilities: &corev1.Capabilities{Add: []corev1.Capability{"NET_ADMIN", "NET_RAW"}}}
+		setPodSysctl(pod, "net.ipv4.ping_group_range", "0 65535")
+	}
 	if o.UserNamespace {
 		pod.Spec.HostUsers = ptr.To(false)
 		initSC = &corev1.SecurityContext{
@@ -148,6 +163,20 @@ func (p *Plan) DecoratePod(node string, pod *corev1.Pod, containerName string, o
 	})
 	pod.Spec.TerminationGracePeriodSeconds = ptr.To[int64](5)
 	return nil
+}
+
+// setPodSysctl sets a (safe, namespaced) sysctl on the pod.
+func setPodSysctl(pod *corev1.Pod, name, value string) {
+	if pod.Spec.SecurityContext == nil {
+		pod.Spec.SecurityContext = &corev1.PodSecurityContext{}
+	}
+	for i, sc := range pod.Spec.SecurityContext.Sysctls {
+		if sc.Name == name {
+			pod.Spec.SecurityContext.Sysctls[i].Value = value
+			return
+		}
+	}
+	pod.Spec.SecurityContext.Sysctls = append(pod.Spec.SecurityContext.Sysctls, corev1.Sysctl{Name: name, Value: value})
 }
 
 func appendCaps(have []corev1.Capability, add ...corev1.Capability) []corev1.Capability {

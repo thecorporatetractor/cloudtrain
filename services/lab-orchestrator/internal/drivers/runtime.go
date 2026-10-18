@@ -8,6 +8,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	labsv1 "github.com/cloudtrain/cloudtrain/services/lab-orchestrator/api/v1alpha1"
+	"github.com/cloudtrain/cloudtrain/services/lab-orchestrator/internal/network"
 )
 
 // RuntimeOptions configures the real lab runtime.
@@ -50,6 +51,10 @@ type RuntimeOptions struct {
 	UserNamespaces bool
 	// DenyLearnerSudo refuses labs whose entry node sets learnerSudo.
 	DenyLearnerSudo bool
+	// Network: network mode (Kube-OVN primary or non-primary behind
+	// Multus) and the MTU of session segments, for the VM lab network.
+	// The pod link network (LinkNetwork) takes the same options.
+	Network network.Options
 }
 
 // Runtime is the assembled driver set.
@@ -99,7 +104,7 @@ func NewRuntime(o RuntimeOptions) (*Runtime, error) {
 	}
 	session := &SessionRuntime{
 		Client: o.Client, Reader: o.Reader, Container: container,
-		Network: &LabNetwork{Client: o.Client, Reader: o.Reader},
+		Network: &LabNetwork{Client: o.Client, Reader: o.Reader, Options: o.Network},
 	}
 	vm := &VMDriver{Client: o.Client, Reader: o.Reader, Catalog: o.Catalog, Container: container, Session: session,
 		ImageRegistry: registry, Disks: disks}
