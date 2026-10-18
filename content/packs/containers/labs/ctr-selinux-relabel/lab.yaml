@@ -1,0 +1,250 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-selinux-relabel
+  title: "Clear an SELinux denial on a rootless bind mount"
+  domain: containers
+  frameworks: [ex188-aligned:troubleshoot, ex188-aligned:build-images]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [podman, selinux, bind-mount, label]
+  version: 1
+spec:
+  description: |
+    **Host:** `cl-podman-01` (`ssh cl-podman-01`, then `sudo machinectl shell media@` to work as the unprivileged user `media`)
+
+    The subtitle container **`subtitle-svc`** (run by `media`, published on host port **{{port}}**) is
+    meant to serve the caption files in `/srv/captions` (set {{n}}), but every request returns **403**.
+    SELinux is enforcing on this host and must stay enforcing.
+
+    Fix the mount so that `http://127.0.0.1:{{port}}/` serves the captions, `/srv/captions` carries the
+    correct container label, and `subtitle-svc` still mounts it at `/usr/share/nginx/html`.
+  objectives:
+    - "Recognise an SELinux denial on a bind mount"
+    - "Relabel a mount for a container without disabling SELinux"
+  params:
+    port:
+      type: int
+      min: 8100
+      max: 8199
+    n:
+      type: int
+      min: 100
+      max: 999
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-podman-01
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+      - name: cl-registry-01
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 1, memoryMiB: 1024}
+        access: [ssh]
+  setup:
+    - on: cl-registry-01
+      timeoutSec: 600
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        R=registry.copperleaf.example; d=/srv/registry
+        grep -q " $R\$" /etc/hosts || echo "127.0.0.1 $R" >> /etc/hosts
+        if [ ! -s $d/certs/ca.crt ]; then
+          rm -rf $d/certs; mkdir -p $d/certs $d/pub $d/data; cd $d/certs
+          openssl req -x509 -newkey rsa:2048 -nodes -keyout ca.key -out ca.crt -days 30 -subj "/CN=Copperleaf CA" 2>/dev/null
+          openssl req -newkey rsa:2048 -nodes -keyout server.key -out server.csr -subj "/CN=$R" 2>/dev/null
+          printf 'subjectAltName=DNS:%s,DNS:cl-registry-01\nextendedKeyUsage=serverAuth\n' "$R" > ext.cnf
+          openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out server.crt -days 30 -extfile ext.cnf 2>/dev/null
+          chmod 0644 server.key
+        fi
+        mkdir -p $d/pub $d/data
+        cp -f $d/certs/ca.crt $d/pub/ca.crt
+        install -D -m 0644 $d/certs/ca.crt /etc/docker/certs.d/$R:5443/ca.crt
+        docker inspect cl-registry >/dev/null 2>&1 || docker run -d --name cl-registry --restart always -p 5443:5443 \
+          -v $d/certs:/certs:ro -v $d/data:/var/lib/registry -e REGISTRY_HTTP_ADDR=0.0.0.0:5443 \
+          -e REGISTRY_HTTP_TLS_CERTIFICATE=/certs/server.crt -e REGISTRY_HTTP_TLS_KEY=/certs/server.key registry:3 >/dev/null
+        docker inspect cl-ca-share >/dev/null 2>&1 || docker run -d --name cl-ca-share --restart always -p 8099:8099 \
+          -v $d/pub:/pub:ro busybox:1.37 httpd -f -p 8099 -h /pub >/dev/null
+        for i in $(seq 30); do curl -s --cacert $d/certs/ca.crt -o /dev/null https://$R:5443/v2/ && break; sleep 1; done
+        A='Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json'
+        push_base() {  # <local image> <repo:tag>: republish a preloaded image as a single-platform manifest
+          curl -fsI --cacert $d/certs/ca.crt -H "$A" -o /dev/null "https://$R:5443/v2/${2%%:*}/manifests/${2#*:}" && return 0
+          printf 'FROM %s\n' "$1" | docker build -q -t "$R:5443/$2" - >/dev/null
+          docker push -q "$R:5443/$2" >/dev/null
+        }
+        push_base busybox:1.37 library/busybox:1.37
+        push_base python:3.13-alpine library/python:3.13-alpine
+        push_base nginx:1.29-alpine library/nginx:1.29-alpine
+        push_base redis:7.4-alpine library/redis:7.4-alpine
+    - on: cl-podman-01
+      timeoutSec: 1200
+      run: |
+        set -eu
+        U=media; R=registry.copperleaf.example
+        rpm -q podman buildah skopeo container-selinux systemd-container >/dev/null 2>&1 || dnf -y -q install podman buildah skopeo container-selinux systemd-container >/dev/null
+        id $U >/dev/null 2>&1 || useradd -m -u 2301 -s /bin/bash $U
+        loginctl enable-linger $U
+        systemctl start user@$(id -u $U).service
+        for i in $(seq 30); do [ -S /run/user/$(id -u $U)/bus ] && break; sleep 1; done
+        install -d -m 0755 /usr/local/lib/cloudtrain /srv/exam /var/lib/cloudtrain
+        cat > /usr/local/lib/cloudtrain/as-user <<'EOS'
+        #!/bin/sh
+        # run a command as an unprivileged user with a working user session bus
+        u=$1; shift
+        id=$(id -u "$u")
+        if [ ! -S /run/user/$id/bus ]; then
+          systemctl start user@$id.service
+          for i in $(seq 30); do [ -S /run/user/$id/bus ] && break; sleep 1; done
+        fi
+        cd /
+        exec runuser -u "$u" -- env HOME="$(getent passwd "$u" | cut -d: -f6)" XDG_RUNTIME_DIR=/run/user/$id DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$id/bus "$@"
+        EOS
+        chmod 0755 /usr/local/lib/cloudtrain/as-user
+        px() { /usr/local/lib/cloudtrain/as-user $U "$@"; }
+        ip=""
+        for i in $(seq 60); do ip=$(getent ahostsv4 cl-registry-01 | awk 'NR==1{print $1}'); [ -n "$ip" ] && break; sleep 2; done
+        [ -n "$ip" ]
+        sed -i "/ $R\$/d" /etc/hosts
+        echo "$ip $R" >> /etc/hosts
+        for i in $(seq 60); do curl -fs -o /srv/exam/registry-ca.crt http://$ip:8099/ca.crt && break; sleep 2; done
+        chmod 0644 /srv/exam/registry-ca.crt
+        install -D -m 0644 /srv/exam/registry-ca.crt /etc/containers/certs.d/$R:5443/ca.crt
+        for i in $(seq 30); do curl -s --cacert /srv/exam/registry-ca.crt -o /dev/null https://$R:5443/v2/ && break; sleep 1; done
+        pull() { for t in 1 2 3; do px podman pull -q "$R:5443/$1" >/dev/null 2>&1 && return 0; sleep 3; done; return 1; }
+        pull library/nginx:1.29-alpine
+        install -d -o $U -g $U /srv/captions
+        echo "captions {{n}}" > /srv/captions/index.html
+        chown -R $U:$U /srv/captions
+        restorecon -R /srv/captions
+        px podman rm -f subtitle-svc >/dev/null 2>&1 || true
+        px podman run -d --name subtitle-svc -p {{port}}:80 -v /srv/captions:/usr/share/nginx/html:ro $R:5443/library/nginx:1.29-alpine >/dev/null
+  checks:
+    - id: serving
+      description: "The captions are served on the published port"
+      type: shell
+      timeoutSec: 90
+      on: cl-podman-01
+      skills: [containers.storage.permissions]
+      weight: 3
+      command: |
+        r=no-answer
+        for i in $(seq 20); do o=$(curl -s -m 3 http://127.0.0.1:{{port}}/) && [ -n "$o" ] && { r=$(echo "$o" | head -1); break; }; sleep 1; done
+        echo "$r"
+      expect: {match: exact, value: "captions {{n}}"}
+    - id: labelled
+      description: "/srv/captions carries the container file label"
+      type: shell
+      timeoutSec: 90
+      on: cl-podman-01
+      skills: [containers.storage.permissions]
+      weight: 2
+      command: |
+        stat -c %C /srv/captions | cut -d: -f3
+      expect: {match: exact, value: "container_file_t"}
+    - id: enforcing
+      description: "SELinux is still enforcing"
+      type: shell
+      timeoutSec: 90
+      on: cl-podman-01
+      skills: [containers.storage.permissions]
+      weight: 1.5
+      command: |
+        getenforce
+      expect: {match: exact, value: "Enforcing"}
+    - id: mount-kept
+      description: "subtitle-svc still mounts /srv/captions at the web root"
+      type: shell
+      timeoutSec: 90
+      on: cl-podman-01
+      skills: [containers.storage.permissions]
+      weight: 1
+      command: |
+        px() { /usr/local/lib/cloudtrain/as-user media "$@"; }
+        px podman inspect subtitle-svc 2>/dev/null | jq -r '[.[0].Mounts[]? | select(.Destination == "/usr/share/nginx/html") | .Source] | .[0] // "none"' || echo none
+      expect: {match: exact, value: "/srv/captions"}
+  hints:
+    - title: "Read the labels"
+      body: "ls -Zd shows the SELinux context of a path. Compare /srv/captions with what a container is allowed to read (container_file_t)."
+      command: "ls -Zd /srv/captions"
+      cost: 1
+    - title: "Ask Podman to relabel"
+      body: "A volume option can relabel the source for the container: :Z gives it a private label, :z a shared one. The container has to be recreated to change the mount."
+      cost: 2
+    - title: "Or label the directory yourself"
+      body: "chcon -R -t container_file_t <dir> sets the type directly; restart the container afterwards. Making it permanent needs semanage fcontext."
+      cost: 2
+  misconceptions:
+    - id: permissive
+      description: "Sets SELinux to permissive."
+      feedback: "Permissive mode only logs the denial. Keep enforcing and label the mount."
+      expectFail: [labelled, enforcing]
+      mutation:
+        on: cl-podman-01
+        as: admin
+        run: |
+          px() { /usr/local/lib/cloudtrain/as-user media "$@"; }
+          setenforce 0
+          px podman restart subtitle-svc >/dev/null
+    - id: label-disable
+      description: "Recreates the container with label=disable."
+      feedback: "--security-opt label=disable turns off SELinux separation for the container. Relabel the mount instead."
+      expectFail: [labelled]
+      mutation:
+        on: cl-podman-01
+        as: admin
+        run: |
+          px() { /usr/local/lib/cloudtrain/as-user media "$@"; }
+
+          px podman rm -f subtitle-svc >/dev/null
+          px podman run -d --name subtitle-svc -p {{port}}:80 --security-opt label=disable -v /srv/captions:/usr/share/nginx/html:ro registry.copperleaf.example:5443/library/nginx:1.29-alpine >/dev/null
+    - id: chmod-only
+      description: "Opens the file permissions to everyone."
+      feedback: "The denial comes from the SELinux label, not the Unix permissions; chmod cannot change it."
+      expectFail: [serving, labelled]
+      mutation:
+        on: cl-podman-01
+        as: admin
+        run: |
+          px() { /usr/local/lib/cloudtrain/as-user media "$@"; }
+          chmod -R a+rwX /srv/captions
+          px podman restart subtitle-svc >/dev/null
+  solution:
+    explanation: |
+      /srv content is labelled var_t, which container processes cannot read. :Z relabels the source to a container-private container_file_t when the container is created.
+    steps:
+      - on: cl-podman-01
+        as: learner
+        run: |
+          X() { sudo -u media -H env XDG_RUNTIME_DIR=/run/user/$(id -u media) DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u media)/bus "$@"; }
+          cd /
+          X podman rm -f subtitle-svc
+          X podman run -d --name subtitle-svc -p {{port}}:80 -v /srv/captions:/usr/share/nginx/html:ro,Z registry.copperleaf.example:5443/library/nginx:1.29-alpine
+    alternatives:
+      - id: shared-label
+        description: "Use :z for a shared label."
+        steps:
+          - on: cl-podman-01
+            as: learner
+            run: |
+              X() { sudo -u media -H env XDG_RUNTIME_DIR=/run/user/$(id -u media) DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u media)/bus "$@"; }
+              cd /
+              X podman rm -f subtitle-svc
+              X podman run -d --name subtitle-svc -p {{port}}:80 -v /srv/captions:/usr/share/nginx/html:ro,z registry.copperleaf.example:5443/library/nginx:1.29-alpine
+      - id: chcon
+        description: "Label the directory with chcon and restart."
+        steps:
+          - on: cl-podman-01
+            as: learner
+            run: |
+              X() { sudo -u media -H env XDG_RUNTIME_DIR=/run/user/$(id -u media) DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u media)/bus "$@"; }
+              cd /
+              sudo chcon -R -t container_file_t /srv/captions
+              X podman restart subtitle-svc

@@ -1,0 +1,239 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xct-build-media-containerfile
+  title: "Build the media API image from a Containerfile"
+  domain: containers
+  frameworks: [ex188-aligned:build-images]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [exam, podman, build, containerfile, non-root]
+  version: 1
+spec:
+  description: |
+    **Host:** `cl-podman-01` (`ssh cl-podman-01`, then `sudo machinectl shell examuser@` to work as `examuser`)
+
+    The media API source is in `~/exam/xct-build-media`: `app.py` listens on port 8080 and reads
+    `build.txt` from the directory it runs in (build {{build}}). The registry
+    `registry.exam.example:5443` is already trusted by this host.
+
+    Write a **`Containerfile`** in that directory and build the image as
+    **`localhost/media-api:1.0`** (as `examuser`) so that:
+
+    - it is based on `registry.exam.example:5443/library/python:3.13-alpine` and starts `app.py`;
+    - `app.py` and `build.txt` are copied to **`/opt/media`**, which is the working directory;
+    - the process runs as **UID 1001**, not root;
+    - port **8080** is declared as exposed.
+  objectives:
+    - "Write a Containerfile with a working directory, a non-root user and an exposed port"
+    - "Build a tagged image rootless"
+  params:
+    build:
+      type: int
+      min: 3000
+      max: 3999
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-podman-01
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+      - name: cl-registry-01
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 1, memoryMiB: 1024}
+        access: [ssh]
+  setup:
+    - on: cl-registry-01
+      timeoutSec: 600
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        R=registry.exam.example; d=/srv/registry
+        grep -q " $R\$" /etc/hosts || echo "127.0.0.1 $R" >> /etc/hosts
+        if [ ! -s $d/certs/ca.crt ]; then
+          rm -rf $d/certs; mkdir -p $d/certs $d/pub $d/data; cd $d/certs
+          openssl req -x509 -newkey rsa:2048 -nodes -keyout ca.key -out ca.crt -days 30 -subj "/CN=Copperleaf exam CA" 2>/dev/null
+          openssl req -newkey rsa:2048 -nodes -keyout server.key -out server.csr -subj "/CN=$R" 2>/dev/null
+          printf 'subjectAltName=DNS:%s,DNS:secure.exam.example,DNS:cl-registry-01\nextendedKeyUsage=serverAuth\n' "$R" > ext.cnf
+          openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out server.crt -days 30 -extfile ext.cnf 2>/dev/null
+          chmod 0644 server.key
+        fi
+        mkdir -p $d/pub $d/data
+        cp -f $d/certs/ca.crt $d/pub/ca.crt
+        install -D -m 0644 $d/certs/ca.crt /etc/docker/certs.d/$R:5443/ca.crt
+        docker inspect cl-registry >/dev/null 2>&1 || docker run -d --name cl-registry --restart always -p 5443:5443 \
+          -v $d/certs:/certs:ro -v $d/data:/var/lib/registry -e REGISTRY_HTTP_ADDR=0.0.0.0:5443 \
+          -e REGISTRY_HTTP_TLS_CERTIFICATE=/certs/server.crt -e REGISTRY_HTTP_TLS_KEY=/certs/server.key registry:3 >/dev/null
+        docker inspect cl-ca-share >/dev/null 2>&1 || docker run -d --name cl-ca-share --restart always -p 8099:8099 \
+          -v $d/pub:/pub:ro busybox:1.37 httpd -f -p 8099 -h /pub >/dev/null
+        for i in $(seq 30); do curl -s --cacert $d/certs/ca.crt -o /dev/null https://$R:5443/v2/ && break; sleep 1; done
+        A='Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json'
+        push_base() {  # <local image> <repo:tag>: republish a preloaded image as a single-platform manifest
+          curl -fsI --cacert $d/certs/ca.crt -H "$A" -o /dev/null "https://$R:5443/v2/${2%%:*}/manifests/${2#*:}" && return 0
+          printf 'FROM %s\n' "$1" | docker build -q -t "$R:5443/$2" - >/dev/null
+          docker push -q "$R:5443/$2" >/dev/null
+        }
+        push_base busybox:1.37 library/busybox:1.37
+        push_base alpine:3.22 library/alpine:3.22
+        push_base python:3.13-alpine library/python:3.13-alpine
+        push_base nginx:1.29-alpine library/nginx:1.29-alpine
+        push_base redis:7.4-alpine library/redis:7.4-alpine
+    - on: cl-podman-01
+      timeoutSec: 1200
+      run: |
+        set -eu
+        U=examuser; R=registry.exam.example
+        rpm -q podman buildah skopeo container-selinux systemd-container >/dev/null 2>&1 || dnf -y -q install podman buildah skopeo container-selinux systemd-container >/dev/null
+        id $U >/dev/null 2>&1 || useradd -m -u 2300 -s /bin/bash $U
+        systemctl start user@$(id -u $U).service
+        for i in $(seq 30); do [ -S /run/user/$(id -u $U)/bus ] && break; sleep 1; done
+        install -d -m 0755 /usr/local/lib/cloudtrain /srv/exam /var/lib/cloudtrain
+        cat > /usr/local/lib/cloudtrain/as-user <<'EOS'
+        #!/bin/sh
+        # run a command as an unprivileged user with a working user session bus
+        u=$1; shift
+        id=$(id -u "$u")
+        if [ ! -S /run/user/$id/bus ]; then
+          systemctl start user@$id.service
+          for i in $(seq 30); do [ -S /run/user/$id/bus ] && break; sleep 1; done
+        fi
+        cd /
+        exec runuser -u "$u" -- env HOME="$(getent passwd "$u" | cut -d: -f6)" XDG_RUNTIME_DIR=/run/user/$id DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$id/bus "$@"
+        EOS
+        chmod 0755 /usr/local/lib/cloudtrain/as-user
+        px() { /usr/local/lib/cloudtrain/as-user $U "$@"; }
+        ip=""
+        for i in $(seq 60); do ip=$(getent ahostsv4 cl-registry-01 | awk 'NR==1{print $1}'); [ -n "$ip" ] && break; sleep 2; done
+        [ -n "$ip" ]
+        sed -i "/ $R\$/d;/ secure.exam.example\$/d" /etc/hosts
+        echo "$ip $R" >> /etc/hosts
+        echo "$ip secure.exam.example" >> /etc/hosts
+        for i in $(seq 60); do curl -fs -o /srv/exam/registry-ca.crt http://$ip:8099/ca.crt && break; sleep 2; done
+        chmod 0644 /srv/exam/registry-ca.crt
+        install -D -m 0644 /srv/exam/registry-ca.crt /etc/containers/certs.d/$R:5443/ca.crt
+        for i in $(seq 30); do curl -s --cacert /srv/exam/registry-ca.crt -o /dev/null https://$R:5443/v2/ && break; sleep 1; done
+        pull() { for t in 1 2 3; do px podman pull -q "$R:5443/$1" >/dev/null 2>&1 && return 0; sleep 3; done; return 1; }
+        D=/home/$U/exam/xct-build-media
+        install -d -o $U -g $U /home/$U/exam $D
+        cat > $D/app.py <<'EOP'
+        import os, http.server
+        here = os.path.dirname(os.path.abspath(__file__))
+        try:
+            build = open(os.path.join(here, "build.txt")).read().strip()
+        except OSError:
+            build = "seed"
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = ("media-api region=%s build=%s uid=%d\n" % (os.environ.get("MEDIA_REGION", "unset"), build, os.getuid())).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            def log_message(self, *a):
+                pass
+        http.server.HTTPServer(("0.0.0.0", 8080), H).serve_forever()
+        EOP
+        echo {{build}} > $D/build.txt
+        chown $U:$U $D/app.py $D/build.txt
+        pull library/python:3.13-alpine
+  checks:
+    - id: image-config
+      description: "localhost/media-api:1.0 runs as 1001 from /opt/media and exposes 8080"
+      type: shell
+      timeoutSec: 90
+      on: cl-podman-01
+      skills: [containers.build.dockerfile, containers.build.non-root]
+      weight: 2
+      command: |
+        px() { /usr/local/lib/cloudtrain/as-user examuser "$@"; }
+        px podman image inspect localhost/media-api:1.0 2>/dev/null | jq -r '.[0].Config | [(.User // ""), (.WorkingDir // ""), ((.ExposedPorts // {}) | keys | join(","))] | join(" ")' || true
+      expect: {match: exact, value: "1001 /opt/media 8080/tcp"}
+    - id: runs-as-1001
+      description: "The image starts the supplied app as UID 1001 with its build file"
+      type: shell
+      timeoutSec: 120
+      on: cl-podman-01
+      skills: [containers.build.non-root]
+      weight: 2
+      command: |
+        px() { /usr/local/lib/cloudtrain/as-user examuser "$@"; }
+        px podman rm -f chk-media-build >/dev/null 2>&1 || true
+        px podman run -d --name chk-media-build localhost/media-api:1.0 >/dev/null 2>&1 || { echo no-run; exit 0; }
+        r=no-answer
+        for i in $(seq 20); do o=$(px podman exec chk-media-build wget -qO- http://127.0.0.1:8080/ 2>/dev/null) && { r=$o; break; }; sleep 1; done
+        px podman rm -f chk-media-build >/dev/null 2>&1 || true
+        echo "$r"
+      expect: {match: exact, value: "media-api region=unset build={{build}} uid=1001"}
+  misconceptions:
+    - id: still-root
+      description: "Sets the working directory but never adds a USER instruction."
+      feedback: "Without USER the process runs as root inside the container. Add USER 1001 after the files are copied."
+      expectFail: [image-config, runs-as-1001]
+      mutation:
+        on: cl-podman-01
+        as: admin
+        run: |
+          px() { /usr/local/lib/cloudtrain/as-user examuser "$@"; }
+
+          D=/home/examuser/exam/xct-build-media
+          printf '%s\n' 'FROM registry.exam.example:5443/library/python:3.13-alpine' 'WORKDIR /opt/media' 'COPY app.py build.txt ./' 'EXPOSE 8080' 'CMD ["python", "app.py"]' > $D/Containerfile
+          chown examuser:examuser $D/Containerfile
+          px podman build -q -t localhost/media-api:1.0 $D >/dev/null
+    - id: wrong-dir
+      description: "Copies the app to /app and leaves the working directory at /."
+      feedback: "The service must run from /opt/media: copy the files there and set WORKDIR /opt/media."
+      expectFail: [image-config]
+      mutation:
+        on: cl-podman-01
+        as: admin
+        run: |
+          px() { /usr/local/lib/cloudtrain/as-user examuser "$@"; }
+
+          D=/home/examuser/exam/xct-build-media
+          printf '%s\n' 'FROM registry.exam.example:5443/library/python:3.13-alpine' 'COPY app.py build.txt /app/' 'EXPOSE 8080' 'USER 1001' 'CMD ["python", "/app/app.py"]' > $D/Containerfile
+          chown examuser:examuser $D/Containerfile
+          px podman build -q -t localhost/media-api:1.0 $D >/dev/null
+  solution:
+    explanation: |
+      A Containerfile copies the two files to /opt/media, sets WORKDIR, switches to USER 1001 and declares EXPOSE 8080; podman build -t tags it in examuser's own image store.
+    steps:
+      - on: cl-podman-01
+        as: learner
+        run: |
+          X() { sudo -u examuser -H env XDG_RUNTIME_DIR=/run/user/$(id -u examuser) DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u examuser)/bus "$@"; }
+          cd /
+          X sh -c 'cd ~/exam/xct-build-media && cat > Containerfile <<EOF
+          FROM registry.exam.example:5443/library/python:3.13-alpine
+          WORKDIR /opt/media
+          COPY app.py build.txt ./
+          EXPOSE 8080
+          USER 1001
+          CMD ["python", "app.py"]
+          EOF
+          podman build -t localhost/media-api:1.0 .'
+    alternatives:
+      - id: dockerfile-name
+        description: "Name the file Dockerfile; podman build finds it when no Containerfile exists."
+        steps:
+          - on: cl-podman-01
+            as: learner
+            run: |
+              X() { sudo -u examuser -H env XDG_RUNTIME_DIR=/run/user/$(id -u examuser) DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u examuser)/bus "$@"; }
+              cd /
+              X sh -c 'cd ~/exam/xct-build-media && cat > Dockerfile <<EOF
+              FROM registry.exam.example:5443/library/python:3.13-alpine
+              WORKDIR /opt/media
+              COPY app.py build.txt /opt/media/
+              EXPOSE 8080
+              USER 1001
+              CMD ["python", "/opt/media/app.py"]
+              EOF
+              podman build -t localhost/media-api:1.0 .'

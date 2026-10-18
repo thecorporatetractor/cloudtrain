@@ -1,0 +1,284 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-podman-docker-differences
+  title: "Move the catalogue routine to a daemonless host and note what changes"
+  domain: containers
+  frameworks: [ex188-aligned:manage-images]
+  difficulty: easy
+  estimatedMinutes: 20
+  tags: [podman, docker-parity, registries, socket]
+  version: 1
+spec:
+  description: |
+    **Host:** `cl-podman-01` (`ssh cl-podman-01`, then `sudo machinectl shell media@` to work as the unprivileged user `media`)
+
+    Copperleaf is moving the catalogue API's routine (`/srv/migration/docker-routine.txt`) from its
+    Docker host to this host, which has no daemon. The registry `registry.copperleaf.example:5443` is
+    already trusted and holds `catalogue-api` (build {{rel}}).
+
+    As `media`:
+
+    1. **Short names.** `podman pull catalogue-api` fails for `media`. Configure `media`'s own registries
+       settings (under `~/.config/containers`) so the short name pulls
+       `registry.copperleaf.example:5443/catalogue-api` without a prompt.
+    2. **API socket.** Tools written for Docker talk to a socket. Enable Podman's own API socket for
+       `media` so it answers a ping.
+    3. **Differences.** Record three facts that differ from the Docker host in `~/differences.yaml`, as
+       `key: value` lines:
+       - `unprivileged-port-start`: the lowest port a non-root process may bind on this host;
+       - `image-store`: the directory in which `media`'s images are stored;
+       - `api-socket`: the path of `media`'s API socket.
+  objectives:
+    - "Resolve short image names through a configured registry"
+    - "Serve Docker-compatible clients through the Podman socket"
+    - "Name what changes without a daemon: ports, per-user storage, per-user sockets"
+  params:
+    rel:
+      type: int
+      min: 4100
+      max: 4899
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-podman-01
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+      - name: cl-registry-01
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 1, memoryMiB: 1024}
+        access: [ssh]
+  setup:
+    - on: cl-registry-01
+      timeoutSec: 600
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        R=registry.copperleaf.example; d=/srv/registry
+        grep -q " $R\$" /etc/hosts || echo "127.0.0.1 $R" >> /etc/hosts
+        if [ ! -s $d/certs/ca.crt ]; then
+          rm -rf $d/certs; mkdir -p $d/certs $d/pub $d/data; cd $d/certs
+          openssl req -x509 -newkey rsa:2048 -nodes -keyout ca.key -out ca.crt -days 30 -subj "/CN=Copperleaf CA" 2>/dev/null
+          openssl req -newkey rsa:2048 -nodes -keyout server.key -out server.csr -subj "/CN=$R" 2>/dev/null
+          printf 'subjectAltName=DNS:%s,DNS:cl-registry-01\nextendedKeyUsage=serverAuth\n' "$R" > ext.cnf
+          openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out server.crt -days 30 -extfile ext.cnf 2>/dev/null
+          chmod 0644 server.key
+        fi
+        mkdir -p $d/pub $d/data
+        cp -f $d/certs/ca.crt $d/pub/ca.crt
+        install -D -m 0644 $d/certs/ca.crt /etc/docker/certs.d/$R:5443/ca.crt
+        docker inspect cl-registry >/dev/null 2>&1 || docker run -d --name cl-registry --restart always -p 5443:5443 \
+          -v $d/certs:/certs:ro -v $d/data:/var/lib/registry -e REGISTRY_HTTP_ADDR=0.0.0.0:5443 \
+          -e REGISTRY_HTTP_TLS_CERTIFICATE=/certs/server.crt -e REGISTRY_HTTP_TLS_KEY=/certs/server.key registry:3 >/dev/null
+        docker inspect cl-ca-share >/dev/null 2>&1 || docker run -d --name cl-ca-share --restart always -p 8099:8099 \
+          -v $d/pub:/pub:ro busybox:1.37 httpd -f -p 8099 -h /pub >/dev/null
+        for i in $(seq 30); do curl -s --cacert $d/certs/ca.crt -o /dev/null https://$R:5443/v2/ && break; sleep 1; done
+        A='Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json'
+        push_base() {  # <local image> <repo:tag>: republish a preloaded image as a single-platform manifest
+          curl -fsI --cacert $d/certs/ca.crt -H "$A" -o /dev/null "https://$R:5443/v2/${2%%:*}/manifests/${2#*:}" && return 0
+          printf 'FROM %s\n' "$1" | docker build -q -t "$R:5443/$2" - >/dev/null
+          docker push -q "$R:5443/$2" >/dev/null
+        }
+        push_base busybox:1.37 library/busybox:1.37
+        push_base python:3.13-alpine library/python:3.13-alpine
+        push_base nginx:1.29-alpine library/nginx:1.29-alpine
+        push_base redis:7.4-alpine library/redis:7.4-alpine
+        # catalogue-api build {{rel}} under two tags
+        printf 'FROM busybox:1.37\nCMD ["echo", "catalogue-api 2.3 build {{rel}}"]\n' | docker build -q -t "$R:5443/catalogue-api:2.3" - >/dev/null
+        docker tag "$R:5443/catalogue-api:2.3" "$R:5443/catalogue-api:latest"
+        docker push -q "$R:5443/catalogue-api:2.3" >/dev/null
+        docker push -q "$R:5443/catalogue-api:latest" >/dev/null
+    - on: cl-podman-01
+      timeoutSec: 1200
+      run: |
+        set -eu
+        U=media; R=registry.copperleaf.example
+        rpm -q podman buildah skopeo container-selinux systemd-container >/dev/null 2>&1 || dnf -y -q install podman buildah skopeo container-selinux systemd-container >/dev/null
+        id $U >/dev/null 2>&1 || useradd -m -u 2301 -s /bin/bash $U
+        loginctl enable-linger $U
+        systemctl start user@$(id -u $U).service
+        for i in $(seq 30); do [ -S /run/user/$(id -u $U)/bus ] && break; sleep 1; done
+        install -d -m 0755 /usr/local/lib/cloudtrain /srv/exam /var/lib/cloudtrain
+        cat > /usr/local/lib/cloudtrain/as-user <<'EOS'
+        #!/bin/sh
+        # run a command as an unprivileged user with a working user session bus
+        u=$1; shift
+        id=$(id -u "$u")
+        if [ ! -S /run/user/$id/bus ]; then
+          systemctl start user@$id.service
+          for i in $(seq 30); do [ -S /run/user/$id/bus ] && break; sleep 1; done
+        fi
+        cd /
+        exec runuser -u "$u" -- env HOME="$(getent passwd "$u" | cut -d: -f6)" XDG_RUNTIME_DIR=/run/user/$id DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$id/bus "$@"
+        EOS
+        chmod 0755 /usr/local/lib/cloudtrain/as-user
+        px() { /usr/local/lib/cloudtrain/as-user $U "$@"; }
+        ip=""
+        for i in $(seq 60); do ip=$(getent ahostsv4 cl-registry-01 | awk 'NR==1{print $1}'); [ -n "$ip" ] && break; sleep 2; done
+        [ -n "$ip" ]
+        sed -i "/ $R\$/d" /etc/hosts
+        echo "$ip $R" >> /etc/hosts
+        for i in $(seq 60); do curl -fs -o /srv/exam/registry-ca.crt http://$ip:8099/ca.crt && break; sleep 2; done
+        chmod 0644 /srv/exam/registry-ca.crt
+        install -D -m 0644 /srv/exam/registry-ca.crt /etc/containers/certs.d/$R:5443/ca.crt
+        for i in $(seq 30); do curl -s --cacert /srv/exam/registry-ca.crt -o /dev/null https://$R:5443/v2/ && break; sleep 1; done
+        pull() { for t in 1 2 3; do px podman pull -q "$R:5443/$1" >/dev/null 2>&1 && return 0; sleep 3; done; return 1; }
+        printf 'unqualified-search-registries = []\n' > /etc/containers/registries.conf.d/10-no-search.conf
+        rm -rf /home/$U/.config/containers /home/$U/differences.yaml
+        px podman rmi -f $R:5443/catalogue-api:2.3 $R:5443/catalogue-api:latest >/dev/null 2>&1 || true
+        install -d /srv/migration
+        cat > /srv/migration/docker-routine.txt <<'EOP'
+        # Catalogue API routine on the Docker host (cl-docker-01), as run by the nightly job
+        docker pull catalogue-api
+        docker run -d --name catalogue-api -p 80:8080 catalogue-api
+        docker -H unix:///var/run/docker.sock ps          # the monitoring agent talks to this socket
+        docker images                                     # every admin sees the same images
+        EOP
+        chmod 0644 /srv/migration/docker-routine.txt
+  checks:
+    - id: short-name-pulls
+      description: "podman pull catalogue-api works non-interactively for media and yields build {{rel}}"
+      type: shell
+      timeoutSec: 150
+      on: cl-podman-01
+      skills: [containers.podman.registries-conf]
+      weight: 3
+      command: |
+        px() { /usr/local/lib/cloudtrain/as-user media "$@"; }
+        px podman rmi -f registry.copperleaf.example:5443/catalogue-api:2.3 registry.copperleaf.example:5443/catalogue-api:latest >/dev/null 2>&1 || true
+        timeout 90 /usr/local/lib/cloudtrain/as-user media podman pull -q catalogue-api </dev/null >/dev/null 2>&1 || { echo pull-failed; exit 0; }
+        px podman run --rm registry.copperleaf.example:5443/catalogue-api:latest 2>/dev/null || echo not-run
+      expect: {match: exact, value: "catalogue-api 2.3 build {{rel}}"}
+    - id: user-api-socket
+      description: "media's Podman API socket answers a ping"
+      type: shell
+      timeoutSec: 90
+      on: cl-podman-01
+      skills: [containers.podman.docker-parity]
+      weight: 2
+      command: |
+        px() { /usr/local/lib/cloudtrain/as-user media "$@"; }
+        px true
+        curl -s -m 5 --unix-socket /run/user/$(id -u media)/podman/podman.sock http://d/_ping || echo no-socket
+      expect: {match: exact, value: "OK"}
+    - id: diff-port
+      description: "differences.yaml records the unprivileged port start"
+      type: shell
+      timeoutSec: 90
+      on: cl-podman-01
+      skills: [containers.podman.docker-parity]
+      weight: 1
+      command: |
+        v=$(sed -n 's/^unprivileged-port-start: *//p' /home/media/differences.yaml 2>/dev/null | head -1 | tr -d ' "')
+        [ -n "$v" ] && [ "$v" = "$(sysctl -n net.ipv4.ip_unprivileged_port_start)" ] && echo match || echo "no:$v"
+      expect: {match: exact, value: "match"}
+    - id: diff-store
+      description: "differences.yaml records media's image store directory"
+      type: shell
+      timeoutSec: 90
+      on: cl-podman-01
+      skills: [containers.podman.docker-parity]
+      weight: 1.5
+      command: |
+        px() { /usr/local/lib/cloudtrain/as-user media "$@"; }
+        v=$(sed -n 's/^image-store: *//p' /home/media/differences.yaml 2>/dev/null | head -1 | tr -d ' "')
+        w=$(px podman info --format json 2>/dev/null | jq -r '.store.graphRoot')
+        [ -n "$v" ] && [ "$v" = "$w" ] && echo match || echo "no:$v"
+      expect: {match: exact, value: "match"}
+    - id: diff-socket
+      description: "differences.yaml records media's API socket path"
+      type: shell
+      timeoutSec: 90
+      on: cl-podman-01
+      skills: [containers.podman.docker-parity]
+      weight: 1.5
+      command: |
+        v=$(sed -n 's/^api-socket: *//p' /home/media/differences.yaml 2>/dev/null | head -1 | tr -d ' "')
+        [ -n "$v" ] && [ "$v" = "/run/user/$(id -u media)/podman/podman.sock" ] && echo match || echo "no:$v"
+      expect: {match: exact, value: "match"}
+  hints:
+    - title: "Where do short names come from?"
+      body: "Podman consults the unqualified-search-registries list and the [aliases] table, in registries.conf and in drop-ins under registries.conf.d. For a rootless user the files under ~/.config/containers are read in addition to /etc/containers."
+      cost: 1
+    - title: "The socket"
+      body: "The user service unit is called podman.socket. Enable and start it in the user's manager: systemctl --user enable --now podman.socket. Its path follows XDG_RUNTIME_DIR."
+      command: "systemctl --user enable --now podman.socket"
+      cost: 1
+    - title: "Finding the facts"
+      body: "sysctl net.ipv4.ip_unprivileged_port_start; podman info --format json | jq -r .store.graphRoot; and the socket lives under /run/user/<uid>/podman/."
+      cost: 2
+  misconceptions:
+    - id: rootful-socket
+      description: "Enables the system-wide socket and records its path."
+      feedback: "/run/podman/podman.sock belongs to root's Podman. media is rootless: enable the user socket and record /run/user/<uid>/podman/podman.sock."
+      expectFail: [user-api-socket, diff-socket]
+      mutation:
+        on: cl-podman-01
+        as: admin
+        run: |
+          px() { /usr/local/lib/cloudtrain/as-user media "$@"; }
+
+          systemctl enable --now podman.socket
+          printf '%s\n' "unprivileged-port-start: $(sysctl -n net.ipv4.ip_unprivileged_port_start)" "image-store: $(px podman info --format json | jq -r .store.graphRoot)" "api-socket: /run/podman/podman.sock" > /home/media/differences.yaml
+          chown media:media /home/media/differences.yaml
+    - id: root-store
+      description: "Records root's storage directory."
+      feedback: "Images are per user. media's store is under its own home directory, not /var/lib/containers."
+      expectFail: [diff-store]
+      mutation:
+        on: cl-podman-01
+        as: admin
+        run: |
+          px() { /usr/local/lib/cloudtrain/as-user media "$@"; }
+
+          printf '%s\n' "unprivileged-port-start: $(sysctl -n net.ipv4.ip_unprivileged_port_start)" "image-store: /var/lib/containers/storage" "api-socket: /run/user/$(id -u media)/podman/podman.sock" > /home/media/differences.yaml
+          chown media:media /home/media/differences.yaml
+  solution:
+    explanation: |
+      Rootless Podman keeps images, containers and its API socket per user, and a non-root process cannot bind low ports. A search registry or an alias makes the short name resolve.
+    steps:
+      - on: cl-podman-01
+        as: learner
+        run: |
+          X() { sudo -u media -H env XDG_RUNTIME_DIR=/run/user/$(id -u media) DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u media)/bus "$@"; }
+          cd /
+          X install -d /home/media/.config/containers/registries.conf.d
+          X tee /home/media/.config/containers/registries.conf.d/10-copperleaf.conf >/dev/null <<'EOF'
+          unqualified-search-registries = ["registry.copperleaf.example:5443"]
+          EOF
+          X podman pull catalogue-api
+          X systemctl --user enable --now podman.socket
+          {
+            echo "unprivileged-port-start: $(sysctl -n net.ipv4.ip_unprivileged_port_start)"
+            echo "image-store: $(X podman info --format json | jq -r .store.graphRoot)"
+            echo "api-socket: /run/user/$(id -u media)/podman/podman.sock"
+          } | X tee /home/media/differences.yaml >/dev/null
+    alternatives:
+      - id: alias
+        description: "Use an alias instead of a search registry."
+        steps:
+          - on: cl-podman-01
+            as: learner
+            run: |
+              X() { sudo -u media -H env XDG_RUNTIME_DIR=/run/user/$(id -u media) DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u media)/bus "$@"; }
+              cd /
+              X install -d /home/media/.config/containers/registries.conf.d
+              X tee /home/media/.config/containers/registries.conf.d/10-catalogue.conf >/dev/null <<'EOF'
+              [aliases]
+              "catalogue-api" = "registry.copperleaf.example:5443/catalogue-api"
+              EOF
+              X podman pull catalogue-api
+              X systemctl --user enable --now podman.socket
+              {
+                echo "unprivileged-port-start: $(sysctl -n net.ipv4.ip_unprivileged_port_start)"
+                echo "image-store: $(X podman info --format json | jq -r .store.graphRoot)"
+                echo "api-socket: /run/user/$(id -u media)/podman/podman.sock"
+              } | X tee /home/media/differences.yaml >/dev/null
