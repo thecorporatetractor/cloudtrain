@@ -51,7 +51,7 @@ const EventManage = lazyRouteComponent(() => import('./routes/events/EventManage
 // hybrid (routes/site/Hybrid.tsx): the landing page or the public catalog for visitors.
 const PublicPath = lazyRouteComponent(() => import('./routes/site/PublicPath'), 'PublicPath');
 const PublicExam = lazyRouteComponent(() => import('./routes/site/PublicExam'), 'PublicExam');
-const Pricing = lazyRouteComponent(() => import('./routes/site/Pages'), 'Pricing');
+const Pricing = lazyRouteComponent(() => import('./routes/site/Pricing'), 'Pricing');
 const About = lazyRouteComponent(() => import('./routes/site/Pages'), 'About');
 const Faq = lazyRouteComponent(() => import('./routes/site/Pages'), 'Faq');
 const Contact = lazyRouteComponent(() => import('./routes/site/Pages'), 'Contact');

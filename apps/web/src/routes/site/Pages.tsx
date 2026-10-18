@@ -1,15 +1,14 @@
 import { Link } from '@tanstack/react-router';
-import { ArrowRight, Clock, Mail, Phone, ShieldCheck } from 'lucide-react';
+import { ArrowRight, Clock, Mail, Phone } from 'lucide-react';
 import type { ReactNode } from 'react';
 import { useSite } from '@/api/public';
 import type { SiteConfig, SiteLegalDocument } from '@/api/types';
 import { Badge, Card, PageSkeleton } from '@/components/ui';
-import { Cta } from './Landing';
 import { linkKey, Paragraphs, SiteAnchor, useDocumentTitle } from '@/site/util';
 
 /*
- * The small public pages: pricing (plans arrive with the next schema version),
- * about, FAQ, contact, terms and privacy. All copy is configuration
+ * The small public pages: about, FAQ, contact, terms and privacy (pricing has
+ * its own file). All copy is configuration
  * (content/site.yaml); the pages only lay it out.
  */
 
@@ -32,34 +31,6 @@ function SitePage({ title, eyebrow, lead, children, narrow }: { title: string; e
       </header>
       {children}
     </div>
-  );
-}
-
-/* ------------------------------------------------------------------ pricing */
-
-export function Pricing() {
-  const site = useSite().data;
-  const p = site?.pricing;
-  return (
-    <SitePage title={p?.headline ?? 'Pricing'} eyebrow="Pricing" lead={p?.intro}>
-      {site && !site.flags.showPricing && (
-        <Card className="site-pricing-soon">
-          <div className="stack" style={{ gap: 8 }}>
-            <Badge tone="warn">Not published yet</Badge>
-            <h2>Plans are being finalised</h2>
-            <p className="muted small" style={{ maxWidth: 520 }}>
-              Individual and organisation plans with lab hours, concurrent labs, environment tiers, exam simulations and events will be listed here. Until then, talk to us about a pilot.
-            </p>
-          </div>
-          {p?.contactCta && <Cta cta={p.contactCta} size="md" />}
-        </Card>
-      )}
-      {site?.legal.alignmentNotice && (
-        <p className="site-notice xs subtle" style={{ marginTop: 28 }}>
-          <ShieldCheck size={12} aria-hidden /> {site.legal.alignmentNotice}
-        </p>
-      )}
-    </SitePage>
   );
 }
 

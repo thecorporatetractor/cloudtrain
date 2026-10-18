@@ -59,11 +59,33 @@ export async function checkSite(file, ctx, findings) {
     if (img && img.startsWith("/") && !existsSync(path.join(ctx.repoRoot, "apps/web/public", img))) err(`/brand/${k}`, `'${img}' is not in apps/web/public`);
   }
 
+  // Plans: unique ids and lookup keys, one highlighted card at most, free means no price.
+  const plans = doc.plans?.items ?? [];
+  const planIds = new Set();
+  const lookupKeys = new Map();
+  for (const [i, pl] of plans.entries()) {
+    if (planIds.has(pl.id)) err(`/plans/items/${i}/id`, `duplicate plan id '${pl.id}'`);
+    planIds.add(pl.id);
+    for (const [interval, price] of Object.entries(pl.prices ?? {})) {
+      const seen = lookupKeys.get(price.lookupKey);
+      if (seen) err(`/plans/items/${i}/prices/${interval}/lookupKey`, `lookup key '${price.lookupKey}' is also used by ${seen}`);
+      lookupKeys.set(price.lookupKey, `${pl.id}/${interval}`);
+    }
+    if (pl.kind === "free" && pl.prices) err(`/plans/items/${i}/prices`, "a free plan has no prices");
+    if (pl.kind !== "free" && !pl.prices?.monthly && !pl.prices?.yearly) err(`/plans/items/${i}/prices`, "a paid plan needs a monthly or yearly price");
+    if (pl.perSeat && pl.kind !== "organisation") err(`/plans/items/${i}/perSeat`, "per-seat pricing is for organisation plans");
+    if (pl.minSeats && pl.maxSeats && pl.minSeats > pl.maxSeats) err(`/plans/items/${i}/minSeats`, "minSeats is above maxSeats");
+    if (pl.cta.action === "checkout" && pl.kind === "free") err(`/plans/items/${i}/cta`, "a free plan cannot check out");
+    if ((pl.placeholderPrices || doc.plans?.placeholder) && !doc.pricing?.placeholderNote) warn(`/plans/items/${i}`, "placeholder prices need pricing.placeholderNote so the page says so");
+  }
+  if (plans.filter((pl) => pl.highlight).length > 1) warn("/plans/items", "more than one highlighted plan");
+  if (doc.flags.showPricing && plans.length === 0) warn("/flags/showPricing", "pricing is shown but no plans are configured");
+
   if (!/not affiliated/i.test(doc.legal.alignmentNotice)) err("/legal/alignmentNotice", "the alignment notice must say the platform is not affiliated with the certifying bodies");
   for (const [k, legal] of Object.entries({ terms: doc.legal.terms, privacy: doc.legal.privacy })) {
     if (legal.placeholder && !legal.sections.some((s) => /placeholder|draft/i.test(s.title) || s.paragraphs.some((p) => /placeholder|draft/i.test(p)))) {
       warn(`/legal/${k}`, "a placeholder legal document should say so in its text");
     }
   }
-  return { brand: doc.brand.name, features: doc.features.length, faq: doc.faq.length };
+  return { brand: doc.brand.name, features: doc.features.length, faq: doc.faq.length, plans: plans.length };
 }

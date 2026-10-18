@@ -16,9 +16,13 @@ plans: plans and pricing come next, then Stripe in test mode behind a flag.
   `content/site.yaml` validated against `packages/lab-schema/schema/site.schema.json`
   (gateway refuses to start on an invalid file; `lab-verify --strict` checks it in CI).
   Deployments mount their own file: `CT_SITE_CONFIG`. Reference: `docs/website.md`.
-- **PR 2, plans and pricing:** `plans` in the Site schema (free, individual monthly/yearly,
-  organisation per seat; entitlements: lab hours per month, concurrent labs, environment
-  tiers, exam simulations, CTF events), the pricing page, `flags.showPricing: true`.
+- **PR 2, plans and pricing (merged):** `plans` in the Site schema (free, individual
+  monthly/yearly, organisation per seat; entitlements: lab hours per month, concurrent
+  labs, environment tiers, exam simulations, CTF events), the pricing page with interval
+  switch, entitlement comparison and plan FAQ, `flags.showPricing: true`,
+  `flags.checkoutEnabled: false` (paid calls to action lead to contact until PR 3 turns
+  Stripe on). Default plans Free, Pro and Team carry placeholder prices
+  (`plans.placeholder: true`, `pricing.placeholderNote`).
 - **PR 3, Stripe test mode:** `CT_BILLING_ENABLED` (default off), Checkout Sessions,
   Customer Portal, webhook with signature verification and idempotent handling, Postgres
   tables with RLS for customers, subscriptions, entitlements and billing events, account
