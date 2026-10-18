@@ -71,10 +71,19 @@ spec:
         metadata: {name: depot-portal, namespace: depot-ops}
         spec:
           replicas: 3
+          strategy:
+            type: RollingUpdate
+            rollingUpdate: {maxSurge: 3, maxUnavailable: 0}
           selector: {matchLabels: {app: depot-portal}}
           template:
             metadata: {labels: {app: depot-portal}}
             spec:
+              affinity:
+                nodeAffinity:
+                  requiredDuringSchedulingIgnoredDuringExecution:
+                    nodeSelectorTerms:
+                      - matchExpressions:
+                          - {key: node-role.kubernetes.io/control-plane, operator: DoesNotExist}
               topologySpreadConstraints:
                 - {maxSkew: 1, topologyKey: kubernetes.io/hostname, whenUnsatisfiable: DoNotSchedule, labelSelector: {matchLabels: {app: depot-portal}}}
               containers:
@@ -105,8 +114,8 @@ spec:
           containers:
             - {name: kiosk, image: "busybox:1.37", command: ["sleep", "1d"]}
     - on: qm-depot
-      timeoutSec: 150
-      run: kubectl -n depot-ops wait pod/bay-kiosk --for=condition=Ready --timeout=120s
+      timeoutSec: 330
+      run: kubectl -n depot-ops wait pod/bay-kiosk --for=condition=Ready --timeout=300s
   teardown:
     - on: qm-depot
       run: kubectl delete namespace depot-ops --ignore-not-found --wait=false
@@ -195,14 +204,14 @@ spec:
       mutation:
         on: workstation
         as: learner
-        timeoutSec: 300
+        timeoutSec: 600
         run: |
           kubectl config use-context qm-depot
           kubectl -n depot-ops patch deploy depot-portal --type=json -p '[
             {"op":"replace","path":"/spec/template/spec/topologySpreadConstraints/0/whenUnsatisfiable","value":"ScheduleAnyway"},
             {"op":"add","path":"/spec/template/spec/containers/0/startupProbe","value":{"httpGet":{"path":"/","port":80},"periodSeconds":2,"failureThreshold":30}}]'
           kubectl -n depot-ops patch svc depot-portal -p '{"spec":{"selector":{"app":"depot-portal"}}}'
-          kubectl -n depot-ops rollout status deploy/depot-portal --timeout=240s
+          kubectl -n depot-ops rollout status deploy/depot-portal --timeout=420s
     - id: drop-liveness
       description: Deletes the liveness probe to stop the restarts.
       feedback: Without liveness a hung portal is never restarted. Give it time to start (startupProbe or initialDelaySeconds) instead.
@@ -210,14 +219,14 @@ spec:
       mutation:
         on: workstation
         as: learner
-        timeoutSec: 400
+        timeoutSec: 700
         run: |
           kubectl config use-context qm-depot
           ssh depot-wk-2 'sudo systemctl enable --now kubelet'
           kubectl wait node/depot-wk-2 --for=condition=Ready --timeout=180s
           kubectl -n depot-ops patch deploy depot-portal --type=json -p '[{"op":"remove","path":"/spec/template/spec/containers/0/livenessProbe"}]'
           kubectl -n depot-ops patch svc depot-portal -p '{"spec":{"selector":{"app":"depot-portal"}}}'
-          kubectl -n depot-ops rollout status deploy/depot-portal --timeout=200s
+          kubectl -n depot-ops rollout status deploy/depot-portal --timeout=420s
     - id: start-without-enable
       description: Starts the kubelet on depot-wk-2 but leaves it disabled.
       feedback: The node recovers now but goes NotReady again after the next reboot. Use `systemctl enable --now`.
@@ -225,14 +234,14 @@ spec:
       mutation:
         on: workstation
         as: learner
-        timeoutSec: 400
+        timeoutSec: 700
         run: |
           kubectl config use-context qm-depot
           ssh depot-wk-2 'sudo systemctl start kubelet'
           kubectl wait node/depot-wk-2 --for=condition=Ready --timeout=180s
           kubectl -n depot-ops patch deploy depot-portal -p '{"spec":{"template":{"spec":{"containers":[{"name":"portal","startupProbe":{"httpGet":{"path":"/","port":80},"periodSeconds":2,"failureThreshold":30}}]}}}}'
           kubectl -n depot-ops patch svc depot-portal -p '{"spec":{"selector":{"app":"depot-portal"}}}'
-          kubectl -n depot-ops rollout status deploy/depot-portal --timeout=200s
+          kubectl -n depot-ops rollout status deploy/depot-portal --timeout=420s
     - id: service-only
       description: Fixes only the Service selector.
       feedback: Endpoints come only from ready Pods; with the node down and the probe killing containers, there are not enough of them.
@@ -257,25 +266,25 @@ spec:
     steps:
       - on: workstation
         as: learner
-        timeoutSec: 480
+        timeoutSec: 720
         run: |
           kubectl config use-context qm-depot
           ssh depot-wk-2 'sudo systemctl enable --now kubelet'
           kubectl wait node/depot-wk-2 --for=condition=Ready --timeout=180s
           kubectl -n depot-ops patch deploy depot-portal -p '{"spec":{"template":{"spec":{"containers":[{"name":"portal","startupProbe":{"httpGet":{"path":"/","port":80},"periodSeconds":2,"failureThreshold":30}}]}}}}'
           kubectl -n depot-ops patch svc depot-portal -p '{"spec":{"selector":{"app":"depot-portal"}}}'
-          kubectl -n depot-ops rollout status deploy/depot-portal --timeout=240s
+          kubectl -n depot-ops rollout status deploy/depot-portal --timeout=420s
     alternatives:
       - id: tune-liveness
         description: Give the liveness probe an initial delay and a higher failure threshold instead of a startup probe.
         steps:
           - on: workstation
             as: learner
-            timeoutSec: 480
+            timeoutSec: 720
             run: |
               kubectl config use-context qm-depot
               ssh depot-wk-2 'sudo systemctl enable kubelet && sudo systemctl start kubelet'
               kubectl wait node/depot-wk-2 --for=condition=Ready --timeout=180s
               kubectl -n depot-ops patch deploy depot-portal -p '{"spec":{"template":{"spec":{"containers":[{"name":"portal","livenessProbe":{"initialDelaySeconds":15,"periodSeconds":5,"failureThreshold":3}}]}}}}'
               kubectl -n depot-ops get svc depot-portal -o yaml | yq '.spec.selector.app = "depot-portal"' | kubectl apply -f -
-              kubectl -n depot-ops rollout status deploy/depot-portal --timeout=240s
+              kubectl -n depot-ops rollout status deploy/depot-portal --timeout=420s
