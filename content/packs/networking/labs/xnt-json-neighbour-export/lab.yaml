@@ -1,0 +1,209 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xnt-json-neighbour-export
+  title: Export OSPF neighbour state as JSON
+  domain: networking
+  frameworks: [ccna:automation-programmability]
+  difficulty: medium
+  estimatedMinutes: 10
+  tags: [exam, automation, json, jq, ospf, rest]
+  version: 1
+spec:
+  description: |
+    **Device:** `mv-automation-26` (shell; `curl`, `jq`, Python 3)
+
+    | Device | Address |
+    |---|---|
+    | `mv-automation-26` `eth1` | `10.{{octet}}.2.2/30` |
+    | `mv-core-26` (FRR) `eth3` | `10.{{octet}}.2.1/30`; `eth1`/`eth2` run OSPF area 0 to `mv-campus-north-26` and `mv-campus-south-26` |
+
+    `mv-core-26` publishes read-only vtysh output as JSON over HTTP:
+    `http://10.{{octet}}.2.1:8081/ospf.json` (`show ip ospf json`) and
+    `http://10.{{octet}}.2.1:8081/ospf-neighbor.json` (`show ip ospf neighbor json`).
+    From `mv-automation-26`, write **`/root/ospf-export.json`**, a JSON document with
+    exactly this shape, using `jq` or Python:
+
+    ```json
+    {
+      "site": "{{site}}",
+      "router_id": "<router ID of mv-core-26>",
+      "neighbors": [
+        {"router_id": "<neighbour router ID>", "address": "<neighbour interface address>", "interface": "<local interface name>", "state": "<state, e.g. Full>"}
+      ]
+    }
+    ```
+
+    One entry per OSPF neighbour, sorted by the neighbour's router ID. `interface`
+    is the interface name only (no address) and `state` is the state without the
+    role suffix (`Full`, not `Full/-`). The grader recomputes the content from the
+    live device.
+  objectives:
+    - Read device state as JSON from an API and transform it into a given schema with jq or Python
+  params:
+    octet: { type: int, min: 20, max: 90 }
+    site: { type: choice, values: [campus-core, district-core, dc-core] }
+  topology:
+    entry: workstation
+    nodes:
+      - { name: workstation, driver: container, image: jumphost:1, access: [shell] }
+      - { name: mv-automation-26, driver: container, image: netsvc:1, resources: { cpu: 0.1, memoryMiB: 64 }, access: [shell] }
+      - { name: mv-core-26, driver: netdev, image: frr:10 }
+      - { name: mv-campus-north-26, driver: netdev, image: frr:10 }
+      - { name: mv-campus-south-26, driver: netdev, image: frr:10 }
+    links:
+      - { a: "mv-core-26:eth1", b: "mv-campus-north-26:eth1", subnet: "10.{{octet}}.1.0/30" }
+      - { a: "mv-core-26:eth2", b: "mv-campus-south-26:eth1", subnet: "10.{{octet}}.1.4/30" }
+      - { a: "mv-core-26:eth3", b: "mv-automation-26:eth1", subnet: "10.{{octet}}.2.0/30" }
+  setup:
+    - on: mv-campus-north-26
+      config: |
+        interface eth1
+         ip address 10.{{octet}}.1.2/30
+         ip ospf area 0
+         ip ospf network point-to-point
+        router ospf
+         ospf router-id 10.255.{{octet}}.2
+    - on: mv-campus-south-26
+      config: |
+        interface eth1
+         ip address 10.{{octet}}.1.6/30
+         ip ospf area 0
+         ip ospf network point-to-point
+        router ospf
+         ospf router-id 10.255.{{octet}}.3
+    - on: mv-core-26
+      config: |
+        interface eth1
+         ip address 10.{{octet}}.1.1/30
+         ip ospf area 0
+         ip ospf network point-to-point
+        interface eth2
+         ip address 10.{{octet}}.1.5/30
+         ip ospf area 0
+         ip ospf network point-to-point
+        interface eth3
+         ip address 10.{{octet}}.2.1/30
+        router ospf
+         ospf router-id 10.255.{{octet}}.1
+    - on: mv-core-26
+      run: |
+        mkdir -p /var/lib/cloudtrain
+        cat > /var/lib/cloudtrain/vty-json.py <<'PY'
+        import http.server, subprocess
+        CMDS = {"/ospf.json": "show ip ospf json", "/ospf-neighbor.json": "show ip ospf neighbor json"}
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                c = CMDS.get(self.path)
+                if not c:
+                    self.send_error(404); return
+                out = subprocess.run(["vtysh", "-c", c], capture_output=True).stdout
+                self.send_response(200); self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(out))); self.end_headers(); self.wfile.write(out)
+            def log_message(self, *a): pass
+        http.server.ThreadingHTTPServer(("10.{{octet}}.2.1", 8081), H).serve_forever()
+        PY
+        setsid python3 /var/lib/cloudtrain/vty-json.py </dev/null >/dev/null 2>&1 &
+        for i in $(seq 60); do [ "$(vtysh -c 'show ip ospf neighbor' | grep -c Full)" = 2 ] && break; sleep 1; done
+        sleep 1
+    - on: mv-automation-26
+      run: |
+        # wait until the platform-addressed link to the core answers
+        for i in $(seq 20); do ping -c1 -W1 10.{{octet}}.2.1 >/dev/null 2>&1 && break; sleep 1; done
+  checks:
+    - id: export-neighbours
+      description: The export lists exactly the live OSPF neighbours with address, interface and state, sorted by router ID
+      type: shell
+      on: mv-automation-26
+      command: |
+        f=/root/ospf-export.json; [ -f "$f" ] || { echo nofile; exit 0; }
+        python3 - "$f" <<'PY'
+        import json, sys, urllib.request
+        base = "http://10.{{octet}}.2.1:8081"
+        live = json.load(urllib.request.urlopen(base + "/ospf-neighbor.json", timeout=5)).get("neighbors", {})
+        want = []
+        for rid, entries in live.items():
+            for n in entries:
+                want.append({"router_id": rid, "address": n.get("ifaceAddress", ""),
+                             "interface": n.get("ifaceName", "").split(":")[0],
+                             "state": n.get("nbrState", "").split("/")[0]})
+        want.sort(key=lambda e: e["router_id"])
+        try:
+            got = json.load(open(sys.argv[1])).get("neighbors")
+        except Exception as e:
+            print("invalid json"); sys.exit(0)
+        print("ok" if got == want and len(want) == 2 else "differs")
+        PY
+      expect: { match: exact, value: ok }
+      timeoutSec: 20
+      skills: [net.automation.apis]
+      weight: 2
+    - id: export-router
+      description: The export carries the core's own router ID and the site label
+      type: shell
+      on: mv-automation-26
+      command: |
+        f=/root/ospf-export.json; [ -f "$f" ] || { echo nofile; exit 0; }
+        python3 - "$f" <<'PY'
+        import json, sys, urllib.request
+        live = json.load(urllib.request.urlopen("http://10.{{octet}}.2.1:8081/ospf.json", timeout=5))
+        try:
+            d = json.load(open(sys.argv[1]))
+        except Exception:
+            print("invalid json"); sys.exit(0)
+        print("ok" if d.get("router_id") == live.get("routerId") and d.get("site") == "{{site}}" else "differs")
+        PY
+      expect: { match: exact, value: ok }
+      timeoutSec: 20
+      skills: [net.automation.apis]
+    - id: export-shape
+      description: The export is a JSON object with exactly the keys site, router_id and neighbors, and every neighbour has exactly four keys
+      type: shell
+      on: mv-automation-26
+      command: |
+        f=/root/ospf-export.json; [ -f "$f" ] || { echo nofile; exit 0; }
+        jq -e 'keys == ["neighbors","router_id","site"] and (.neighbors | all(keys == ["address","interface","router_id","state"]))' "$f" >/dev/null 2>&1 && echo ok || echo bad
+      expect: { match: exact, value: ok }
+      timeoutSec: 10
+      skills: [net.automation.apis]
+  misconceptions:
+    - id: raw-dump
+      description: Saves the raw vtysh JSON instead of transforming it into the requested schema
+      mutation:
+        on: mv-automation-26
+        run: curl -s http://10.{{octet}}.2.1:8081/ospf-neighbor.json > /root/ospf-export.json
+      expectFail: [export-neighbours, export-router, export-shape]
+    - id: role-suffix-kept
+      description: Builds the schema but keeps the role suffix on the state (Full/-)
+      mutation:
+        on: mv-automation-26
+        run: |
+          curl -s http://10.{{octet}}.2.1:8081/ospf-neighbor.json | jq '{site: "{{site}}", router_id: "x", neighbors: [.neighbors | to_entries[] | .key as $k | .value[] | {router_id: $k, address: .ifaceAddress, interface: (.ifaceName | split(":")[0]), state: .nbrState}] | sort_by(.router_id)}' > /root/ospf-export.json
+      expectFail: [export-neighbours, export-router]
+  solution:
+    explanation: |
+      Fetch both JSON documents, flatten the neighbours object (router ID -> list of
+      entries) into a list, strip the role suffix from the state and the address from the
+      interface name, sort by router ID and add the core's router ID and the site label.
+    steps:
+      - on: mv-automation-26
+        run: |
+          B=http://10.{{octet}}.2.1:8081
+          rid=$(curl -s $B/ospf.json | jq -r .routerId)
+          curl -s $B/ospf-neighbor.json | jq --arg rid "$rid" '{site: "{{site}}", router_id: $rid, neighbors: [.neighbors | to_entries[] | .key as $k | .value[] | {router_id: $k, address: .ifaceAddress, interface: (.ifaceName | split(":")[0]), state: (.nbrState | split("/")[0])}] | sort_by(.router_id)}' > /root/ospf-export.json
+    alternatives:
+      - id: python
+        description: The same transformation in Python
+        steps:
+          - on: mv-automation-26
+            run: |
+              python3 - <<'PY'
+              import json, urllib.request
+              B = "http://10.{{octet}}.2.1:8081"
+              rid = json.load(urllib.request.urlopen(B + "/ospf.json"))["routerId"]
+              nb = json.load(urllib.request.urlopen(B + "/ospf-neighbor.json"))["neighbors"]
+              out = [{"router_id": k, "address": n["ifaceAddress"], "interface": n["ifaceName"].split(":")[0], "state": n["nbrState"].split("/")[0]}
+                     for k, v in nb.items() for n in v]
+              out.sort(key=lambda e: e["router_id"])
+              json.dump({"site": "{{site}}", "router_id": rid, "neighbors": out}, open("/root/ospf-export.json", "w"), indent=2)
+              PY

@@ -1,0 +1,153 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xnt-rstp-root-choice
+  title: Make a chosen switch the spanning-tree root
+  domain: networking
+  frameworks: [ccna:network-access]
+  difficulty: medium
+  estimatedMinutes: 8
+  tags: [exam, stp, root-bridge, bridge-priority]
+  version: 1
+spec:
+  description: |
+    **Devices:** `mv-sw-dc-15`, `mv-sw-north-15`, `mv-sw-south-15` (Linux bridges `br0`, shell)
+
+    | Link | Ports |
+    |---|---|
+    | data centre - north | `mv-sw-dc-15:eth1` - `mv-sw-north-15:eth1` |
+    | data centre - south | `mv-sw-dc-15:eth2` - `mv-sw-south-15:eth1` |
+    | north - south (access link) | `mv-sw-north-15:eth2` - `mv-sw-south-15:eth2` |
+
+    Each switch has `br0` addressed `10.{{octet}}.15.N/24` (dc `.1`, north `.2`,
+    south `.3`) and runs spanning tree. All three have the default priority.
+    Set bridge priorities so that:
+
+    - `mv-sw-dc-15` is the **root bridge** with priority **{{prio}}**;
+    - `mv-sw-north-15` has the next lowest priority (it takes over if the
+      data-centre switch fails);
+    - with equal port costs, the **north - south access link** is the blocked
+      one, and the blocked port is on `mv-sw-south-15`.
+
+    Keep spanning tree on everywhere. The switches must still reach each other.
+    The kernel bridges settle in about 10 seconds after a change.
+  objectives:
+    - Set bridge priorities to place the root bridge and the blocked port
+  params:
+    octet: { type: int, min: 20, max: 90 }
+    prio: { type: choice, values: [4096, 8192, 12288] }
+  topology:
+    entry: workstation
+    nodes:
+      - { name: workstation, driver: container, image: jumphost:1, access: [shell] }
+      - { name: mv-sw-dc-15, driver: container, image: netsvc:1, resources: { cpu: 0.1, memoryMiB: 64 }, access: [shell] }
+      - { name: mv-sw-north-15, driver: container, image: netsvc:1, resources: { cpu: 0.1, memoryMiB: 64 }, access: [shell] }
+      - { name: mv-sw-south-15, driver: container, image: netsvc:1, resources: { cpu: 0.1, memoryMiB: 64 }, access: [shell] }
+    links:
+      - { a: "mv-sw-dc-15:eth1", b: "mv-sw-north-15:eth1" }
+      - { a: "mv-sw-dc-15:eth2", b: "mv-sw-south-15:eth1" }
+      - { a: "mv-sw-north-15:eth2", b: "mv-sw-south-15:eth2" }
+  setup:
+    - on: mv-sw-dc-15
+      run: &bridge |
+        ip link add br0 type bridge stp_state 1 forward_delay 400 hello_time 100 max_age 600 2>/dev/null || true
+        for p in eth1 eth2; do [ -e /sys/class/net/$p ] && ip link set $p master br0; done
+        # lab safety: cap every switch port so a learner-made loop cannot flood the platform
+        for p in eth1 eth2; do [ -e /sys/class/net/$p ] && tc qdisc replace dev $p root tbf rate 2mbit burst 32kb latency 100ms; done
+        ip link set br0 up
+        ip addr replace 10.{{octet}}.15.1/24 dev br0
+    - on: mv-sw-north-15
+      run: |
+        ip link add br0 type bridge stp_state 1 forward_delay 400 hello_time 100 max_age 600 2>/dev/null || true
+        for p in eth1 eth2; do [ -e /sys/class/net/$p ] && ip link set $p master br0; done
+        for p in eth1 eth2; do [ -e /sys/class/net/$p ] && tc qdisc replace dev $p root tbf rate 2mbit burst 32kb latency 100ms; done
+        ip link set br0 up
+        ip addr replace 10.{{octet}}.15.2/24 dev br0
+    - on: mv-sw-south-15
+      run: |
+        ip link add br0 type bridge stp_state 1 forward_delay 400 hello_time 100 max_age 600 2>/dev/null || true
+        for p in eth1 eth2; do [ -e /sys/class/net/$p ] && ip link set $p master br0; done
+        for p in eth1 eth2; do [ -e /sys/class/net/$p ] && tc qdisc replace dev $p root tbf rate 2mbit burst 32kb latency 100ms; done
+        ip link set br0 up
+        ip addr replace 10.{{octet}}.15.3/24 dev br0
+  checks:
+    - id: dc-is-root
+      description: mv-sw-dc-15 is the root bridge with the requested priority
+      type: shell
+      on: mv-sw-dc-15
+      command: |
+        b=/sys/class/net/br0/bridge
+        for i in $(seq 30); do
+          [ "$(cat $b/stp_state)" != 0 ] && [ "$(cat $b/root_id)" = "$(cat $b/bridge_id)" ] && [ "$(cat $b/priority)" = "{{prio}}" ] && { echo root; exit 0; }
+          sleep 1
+        done
+        echo "not-root prio=$(cat $b/priority)"
+      expect: { match: exact, value: root }
+      timeoutSec: 45
+      skills: [net.switching.stp]
+      weight: 2
+    - id: north-backup-root
+      description: mv-sw-north-15 has a priority between the root's and the default, and its root port is the link to the data-centre switch
+      type: shell
+      on: mv-sw-north-15
+      command: |
+        b=/sys/class/net/br0/bridge
+        for i in $(seq 30); do
+          me=$(cat $b/priority); root=$(( 0x$(cut -c1-4 $b/root_id) ))
+          [ "$(cat $b/stp_state)" != 0 ] && [ "$root" -lt "$me" ] && [ "$me" -lt 32768 ] && [ "$(cat $b/root_port)" = "$(printf '%d' $(cat /sys/class/net/br0/brif/eth1/port_no))" ] && { echo ok; exit 0; }
+          sleep 1
+        done
+        echo bad
+      expect: { match: exact, value: ok }
+      timeoutSec: 45
+      skills: [net.switching.stp]
+    - id: south-blocks-access-link
+      description: mv-sw-south-15 forwards on its data-centre link (root port) and blocks its port on the access link
+      type: shell
+      on: mv-sw-south-15
+      command: |
+        for i in $(seq 40); do
+          s="$(cat /sys/class/net/br0/brif/eth1/state) $(cat /sys/class/net/br0/brif/eth2/state)"
+          [ "$s" = "3 4" ] && break; sleep 1
+        done
+        echo "$s"
+      expect: { match: exact, value: "3 4" }
+      timeoutSec: 55
+      skills: [net.switching.stp]
+      weight: 2
+    - id: switches-reach
+      description: mv-sw-south-15 reaches the other two switches
+      type: shell
+      on: mv-sw-south-15
+      command: |
+        for i in $(seq 30); do
+          ping -c1 -W1 10.{{octet}}.15.1 >/dev/null 2>&1 && ping -c1 -W1 10.{{octet}}.15.2 >/dev/null 2>&1 && { echo ok; exit 0; }
+          sleep 1
+        done
+        echo lost
+      expect: { match: exact, value: ok }
+      timeoutSec: 45
+      skills: [net.switching.stp]
+  misconceptions:
+    - id: north-as-root
+      description: Lowers the priority of the north switch instead of the data-centre switch
+      mutation:
+        on: mv-sw-north-15
+        run: ip link set br0 type bridge priority {{prio}}
+      expectFail: [dc-is-root, north-backup-root]
+    - id: core-only
+      description: Sets only the data-centre switch priority and leaves both access switches tied at the default
+      mutation:
+        on: mv-sw-dc-15
+        run: ip link set br0 type bridge priority {{prio}}
+      expectFail: [north-backup-root]
+  solution:
+    explanation: |
+      Give the data-centre switch the requested (lowest) priority, north the next
+      lowest and leave south at the default. The data-centre switch becomes root,
+      both others use their data-centre link as root port, and on the north -
+      south link north's port is designated while south's port blocks.
+    steps:
+      - { on: mv-sw-dc-15, run: "ip link set br0 type bridge priority {{prio}}" }
+      - { on: mv-sw-north-15, run: "ip link set br0 type bridge priority 20480" }
+      - { on: mv-sw-south-15, run: "ip link set br0 type bridge priority 32768; sleep 15" }

@@ -114,3 +114,28 @@ bug is fixed, point `v.sh` at a labctl built with the one-line patch.
 
 Next: verify the 22 drafts in path order, then write the missing 15 pool tasks so
 retakes get a fresh draw (the exam itself now runs end to end: 100 % / 14.3 %).
+
+## Round 5 wave 2 (write-only, status built)
+
+- The seven security/VPN learning labs (`net-acl-grades-server` ... `net-fix-mtu-blackhole`)
+  already existed from wave 1; this wave corrected their curriculum `images` to `netsvc:1`
+  (Linux routers and firewalls are netsvc) and recorded the kernel risks.
+- 16 new `sim-net-associate` pool tasks (`xnt-ipv6-office-slaac` ... `xnt-snmpv3-only`) plus the
+  new `xnt-json-neighbour-export` (automation pool: 2 runnable tasks against a draw of 1;
+  `xnt-api-interface-desc` stays blocked on SR Linux). Pools now: fundamentals 6/6, access 6/6,
+  ip-connectivity 8/8, ip-services 4/4, security 4/4, automation 2 (+1 blocked).
+  `labctl exam compile --allow-missing sim-net-associate` passes; without the flag it fails only on
+  `xnt-api-interface-desc`.
+- The two `sim-platform-engineer` network tasks (`xpe-net-depot-route`, `xpe-net-edge-nat`, Quillmoor
+  `qm-*` estate). The harbour cluster nodes are VMs a netdev router cannot be wired to, so both use
+  netsvc stand-ins; persistence is checked (FRR `write memory` via `/etc/frr/*.conf`, nftables via
+  `/etc/nftables.nft` plus a boot-restore stand-in script).
+- Design notes: FRR cannot create VLAN subinterfaces (setup pre-creates them in
+  `xnt-inter-vlan-annex`); `xnt-route-preference-report` gives `mv-core-21` `access: [console, shell]`
+  (first netdev node with shell access); `xnt-json-neighbour-export` serves read-only vtysh JSON over
+  HTTP from a small python3 server on the core; `xnt-capture-dns-transport` compares the answer file
+  with a grader-owned pcap started in setup.
+- Verify queue (none run live this wave): every task above per-lab `labctl verify`; first-verify risks
+  are the WireGuard/IPsec kernel modules in the user-namespaced netns (net-wireguard-annex-tunnel,
+  net-ipsec-partner-tunnel, net-fix-mtu-blackhole, xnt-wireguard-annex), FRR JSON field names
+  (`state` DR/Backup/DROther, `ifaceName`), and `show ip route <dest> json` entry layout.

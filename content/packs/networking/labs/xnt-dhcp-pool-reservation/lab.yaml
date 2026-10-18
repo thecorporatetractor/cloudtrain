@@ -1,0 +1,180 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xnt-dhcp-pool-reservation
+  title: Add a DHCP pool with one reservation
+  domain: networking
+  frameworks: [ccna:ip-services]
+  difficulty: easy
+  estimatedMinutes: 8
+  tags: [exam, dhcp, dnsmasq, reservation]
+  version: 1
+spec:
+  description: |
+    **Device:** `dhcp-dc-22` (Linux, shell; dnsmasq and Kea installed)
+
+    | Interface | Segment | Address | State |
+    |---|---|---|---|
+    | `eth2` | staff `10.{{octet}}.20.0/24` (`staff-22`) | `10.{{octet}}.20.2` | served by dnsmasq (`/etc/dnsmasq.d/district.conf`), working |
+    | `eth1` | new guest VLAN `10.{{octet}}.60.0/24` (`kiosk-22` is on it) | `10.{{octet}}.60.2` | not served yet |
+
+    Serve the guest VLAN from `dhcp-dc-22` (dnsmasq or Kea) without breaking the
+    staff pool:
+
+    - pool `10.{{octet}}.60.100` - `10.{{octet}}.60.199`, mask `/24`;
+    - default gateway `10.{{octet}}.60.1` and DNS server `10.{{octet}}.0.53`
+      (the same DNS server is already handed to staff);
+    - the guest kiosk `kiosk-22` (MAC `02:4d:56:{{octet}}:60:01`) always gets the
+      fixed address **`10.{{octet}}.60.{{k}}`**, outside the pool.
+
+    The grader runs DHCP clients on the guest segment (with the kiosk's MAC and
+    with another MAC) and on `staff-22`.
+  objectives:
+    - Add a DHCP pool with router and DNS options to an existing server
+    - Reserve a fixed address for one MAC address
+  params:
+    octet: { type: int, min: 20, max: 90 }
+    k: { type: int, min: 10, max: 99 }
+  topology:
+    entry: workstation
+    nodes:
+      - { name: workstation, driver: container, image: jumphost:1, access: [shell] }
+      - { name: dhcp-dc-22, driver: container, image: netsvc:1, resources: { cpu: 0.2, memoryMiB: 96 }, access: [shell] }
+      - { name: kiosk-22, driver: container, image: nettools:1, resources: { cpu: 0.1, memoryMiB: 48 } }
+      - { name: staff-22, driver: container, image: nettools:1, resources: { cpu: 0.1, memoryMiB: 48 } }
+    links:
+      - { a: "dhcp-dc-22:eth1", b: "kiosk-22:eth1" }
+      - { a: "dhcp-dc-22:eth2", b: "staff-22:eth1" }
+  setup:
+    - on: dhcp-dc-22
+      run: |
+        ip addr replace 10.{{octet}}.60.2/24 dev eth1
+        ip addr replace 10.{{octet}}.20.2/24 dev eth2
+        mkdir -p /etc/dnsmasq.d /var/lib/misc
+        cat > /etc/dnsmasq.d/district.conf <<'EOC'
+        port=0
+        interface=eth2
+        dhcp-range=set:staff,10.{{octet}}.20.100,10.{{octet}}.20.199,255.255.255.0,12h
+        dhcp-option=tag:staff,option:router,10.{{octet}}.20.1
+        dhcp-option=option:dns-server,10.{{octet}}.0.53
+        EOC
+        dnsmasq -C /etc/dnsmasq.d/district.conf
+    - on: kiosk-22
+      run: |
+        ip link set eth1 down; ip link set eth1 address 02:4d:56:{{octet}}:60:01; ip link set eth1 up
+    - { on: kiosk-22, file: { path: /usr/local/bin/dhcp-probe, mode: "0755", source: assets/dhcp-probe } }
+    - { on: staff-22, file: { path: /usr/local/bin/dhcp-probe, mode: "0755", source: assets/dhcp-probe } }
+  checks:
+    - id: guest-pool
+      description: A device with another MAC on the guest segment gets a pool address with the guest gateway and the district DNS server
+      type: shell
+      on: kiosk-22
+      command: dhcp-probe eth1 02:4d:56:{{octet}}:60:99
+      expect: { match: regex, value: "^10\\.{{octet}}\\.60\\.1[0-9][0-9] 10\\.{{octet}}\\.60\\.1 10\\.{{octet}}\\.0\\.53$" }
+      timeoutSec: 30
+      skills: [net.services.dhcp]
+      weight: 2
+    - id: kiosk-reservation
+      description: The kiosk's MAC gets its reserved address with the guest gateway and DNS server
+      type: shell
+      on: kiosk-22
+      command: dhcp-probe eth1
+      expect: { match: exact, value: "10.{{octet}}.60.{{k}} 10.{{octet}}.60.1 10.{{octet}}.0.53" }
+      timeoutSec: 30
+      skills: [net.services.dhcp]
+      weight: 2
+    - id: staff-still-served
+      description: The staff pool still hands out its addresses
+      type: shell
+      on: staff-22
+      command: dhcp-probe eth1
+      expect: { match: regex, value: "^10\\.{{octet}}\\.20\\.1[0-9][0-9] 10\\.{{octet}}\\.20\\.1 10\\.{{octet}}\\.0\\.53$" }
+      timeoutSec: 30
+      skills: [net.services.dhcp]
+  misconceptions:
+    - id: server-as-gateway
+      description: Adds the guest pool but no router option, so clients get the DHCP server as gateway
+      mutation:
+        on: dhcp-dc-22
+        run: |
+          cat >> /etc/dnsmasq.d/district.conf <<'EOC'
+          interface=eth1
+          dhcp-range=set:guest,10.{{octet}}.60.100,10.{{octet}}.60.199,255.255.255.0,12h
+          dhcp-host=02:4d:56:{{octet}}:60:01,10.{{octet}}.60.{{k}}
+          EOC
+          pkill -x dnsmasq; sleep 1; dnsmasq -C /etc/dnsmasq.d/district.conf
+      expectFail: [guest-pool, kiosk-reservation]
+    - id: wrong-mac
+      description: Reserves the address for a mistyped MAC address
+      mutation:
+        on: dhcp-dc-22
+        run: |
+          cat >> /etc/dnsmasq.d/district.conf <<'EOC'
+          interface=eth1
+          dhcp-range=set:guest,10.{{octet}}.60.100,10.{{octet}}.60.199,255.255.255.0,12h
+          dhcp-option=tag:guest,option:router,10.{{octet}}.60.1
+          dhcp-host=02:4d:56:{{octet}}:06:01,10.{{octet}}.60.{{k}}
+          EOC
+          pkill -x dnsmasq; sleep 1; dnsmasq -C /etc/dnsmasq.d/district.conf
+      expectFail: [kiosk-reservation]
+    - id: replaced-staff-pool
+      description: Rewrites the whole configuration for the guest pool and drops the staff pool
+      mutation:
+        on: dhcp-dc-22
+        run: |
+          cat > /etc/dnsmasq.d/district.conf <<'EOC'
+          port=0
+          interface=eth1
+          dhcp-range=set:guest,10.{{octet}}.60.100,10.{{octet}}.60.199,255.255.255.0,12h
+          dhcp-option=tag:guest,option:router,10.{{octet}}.60.1
+          dhcp-option=option:dns-server,10.{{octet}}.0.53
+          dhcp-host=02:4d:56:{{octet}}:60:01,10.{{octet}}.60.{{k}}
+          EOC
+          pkill -x dnsmasq; sleep 1; dnsmasq -C /etc/dnsmasq.d/district.conf
+      expectFail: [staff-still-served]
+  solution:
+    explanation: |
+      Extend the dnsmasq configuration: listen on eth1 as well, add a tagged range and
+      router option for the guest pool, and a dhcp-host line binding the kiosk's MAC
+      to its fixed address; then restart dnsmasq.
+    steps:
+      - on: dhcp-dc-22
+        run: |
+          f=/etc/dnsmasq.d/district.conf
+          sed -i 's/^interface=eth2$/interface=eth1,eth2/' $f
+          cat >> $f <<'EOC'
+          dhcp-range=set:guest,10.{{octet}}.60.100,10.{{octet}}.60.199,255.255.255.0,12h
+          dhcp-option=tag:guest,option:router,10.{{octet}}.60.1
+          dhcp-host=02:4d:56:{{octet}}:60:01,10.{{octet}}.60.{{k}}
+          EOC
+          pkill -x dnsmasq; sleep 1; dnsmasq -C $f
+    alternatives:
+      - id: kea
+        description: Serve both segments with Kea DHCPv4 instead of dnsmasq
+        steps:
+          - on: dhcp-dc-22
+            run: |
+              O={{octet}}; pkill -x dnsmasq; sleep 1
+              mkdir -p /etc/kea /run/kea /var/lib/kea /var/log/kea
+              cat > /etc/kea/kea-dhcp4.conf <<EOC
+              {
+                "Dhcp4": {
+                  "interfaces-config": { "interfaces": [ "eth1", "eth2" ], "dhcp-socket-type": "raw" },
+                  "lease-database": { "type": "memfile", "persist": false },
+                  "valid-lifetime": 43200,
+                  "option-data": [ { "name": "domain-name-servers", "data": "10.$O.0.53" } ],
+                  "subnet4": [
+                    { "id": 1, "subnet": "10.$O.20.0/24", "interface": "eth2",
+                      "pools": [ { "pool": "10.$O.20.100 - 10.$O.20.199" } ],
+                      "option-data": [ { "name": "routers", "data": "10.$O.20.1" } ] },
+                    { "id": 2, "subnet": "10.$O.60.0/24", "interface": "eth1",
+                      "pools": [ { "pool": "10.$O.60.100 - 10.$O.60.199" } ],
+                      "option-data": [ { "name": "routers", "data": "10.$O.60.1" } ],
+                      "reservations": [ { "hw-address": "02:4d:56:{{octet}}:60:01", "ip-address": "10.$O.60.{{k}}" } ] }
+                  ]
+                }
+              }
+              EOC
+              setsid kea-dhcp4 -c /etc/kea/kea-dhcp4.conf </dev/null >/var/log/kea/kea.log 2>&1 &
+              sleep 3
+              pgrep -x kea-dhcp4 >/dev/null

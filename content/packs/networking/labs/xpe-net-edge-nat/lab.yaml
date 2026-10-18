@@ -1,0 +1,179 @@
+# Quillmoor Logistics (qm-*) estate task of the platform-engineer exam, not Marlow Valley.
+# The harbour cluster nodes are VMs that a container edge firewall cannot be wired to, so
+# `harbour-net-2` is a netsvc stand-in holding an address of the harbour node subnet.
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xpe-net-edge-nat
+  title: Give the harbour subnet controlled egress
+  domain: networking
+  frameworks: [ct-platform:networking-connectivity]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [exam, nat, nftables, firewall, persistence]
+  version: 1
+spec:
+  description: |
+    **Device:** `qm-edge-fw` (Linux edge router, shell; nftables)
+
+    | Interface | Network | Address | Host |
+    |---|---|---|---|
+    | `eth1` | harbour cluster node subnet `10.{{octet}}.10.0/24` | `10.{{octet}}.10.1` | `harbour-net-2` (`.11`) |
+    | `eth2` | Quillmoor office subnet `10.{{octet}}.20.0/24` | `10.{{octet}}.20.1` | `office-net-2` (`.11`) |
+    | `eth3` | upstream package-mirror network `198.51.100.0/24` | `198.51.100.{{up}}` | `mirror-net-1` (`198.51.100.50`, TCP {{port}}) |
+
+    The mirror knows a route back to every `10.{{octet}}.0.0/16` subnet, so only the
+    edge router decides who may use it. On `qm-edge-fw`:
+
+    - only the **harbour node subnet** may reach the mirror network, and it must
+      leave with source NAT: the mirror has to see the edge address
+      `198.51.100.{{up}}`;
+    - **forwarding from every other subnet to the mirror network is dropped**
+      (the office subnet must get no connection);
+    - return traffic of allowed connections keeps working.
+
+    The edge router is rebooted before grading, so **save the ruleset to
+    `/etc/nftables.nft`** (the node's boot service loads that file when the live
+    ruleset is empty; it must pass `nft -c`).
+  objectives:
+    - Configure source NAT and a forwarding policy that admits one subnet
+    - Persist the nftables ruleset across a reboot
+  params:
+    octet: { type: int, min: 20, max: 90 }
+    up: { type: int, min: 20, max: 250 }
+    port: { type: choice, values: [443, 8443, 3128] }
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - { name: qm-edge-fw, driver: container, image: netsvc:1, resources: { cpu: 0.2, memoryMiB: 96 }, access: [shell] }
+      - { name: harbour-net-2, driver: container, image: netsvc:1, resources: { cpu: 0.1, memoryMiB: 64 } }
+      - { name: office-net-2, driver: container, image: netsvc:1, resources: { cpu: 0.1, memoryMiB: 64 } }
+      - { name: mirror-net-1, driver: container, image: netsvc:1, resources: { cpu: 0.1, memoryMiB: 64 } }
+    links:
+      - { a: "qm-edge-fw:eth1", b: "harbour-net-2:eth1" }
+      - { a: "qm-edge-fw:eth2", b: "office-net-2:eth1" }
+      - { a: "qm-edge-fw:eth3", b: "mirror-net-1:eth1" }
+  setup:
+    - on: qm-edge-fw
+      run: |
+        echo 1 > /proc/sys/net/ipv4/ip_forward
+        ip addr replace 10.{{octet}}.10.1/24 dev eth1
+        ip addr replace 10.{{octet}}.20.1/24 dev eth2
+        ip addr replace 198.51.100.{{up}}/24 dev eth3
+        # boot service stand-in: load the saved ruleset when the live ruleset is empty
+        cat > /usr/local/sbin/restore-firewall <<'EOS'
+        #!/bin/sh
+        [ -n "$(nft list ruleset 2>/dev/null)" ] || { [ -s /etc/nftables.nft ] && nft -f /etc/nftables.nft; }
+        exit 0
+        EOS
+        chmod +x /usr/local/sbin/restore-firewall
+    - on: harbour-net-2
+      run: ip addr replace 10.{{octet}}.10.11/24 dev eth1 && ip route replace default via 10.{{octet}}.10.1
+    - on: office-net-2
+      run: ip addr replace 10.{{octet}}.20.11/24 dev eth1 && ip route replace default via 10.{{octet}}.20.1
+    - on: mirror-net-1
+      run: |
+        ip addr replace 198.51.100.50/24 dev eth1
+        ip route replace 10.{{octet}}.0.0/16 via 198.51.100.{{up}}
+        setsid ncat -l -k -p {{port}} --sh-exec 'echo "mirror saw $NCAT_REMOTE_ADDR"' </dev/null >/dev/null 2>&1 &
+        sleep 1
+  checks:
+    - id: boot-restore
+      description: (reboot stand-in) the boot service loads /etc/nftables.nft when the live ruleset is empty
+      type: shell
+      on: qm-edge-fw
+      command: restore-firewall; echo done
+      expect: { match: exact, value: done }
+      skills: [linux.net.firewall]
+      weight: 0
+    - id: harbour-egress-natted
+      description: The harbour node subnet reaches the mirror, which sees the edge address as the source
+      type: shell
+      on: harbour-net-2
+      command: |
+        for i in $(seq 8); do r=$(ncat -w3 198.51.100.50 {{port}} </dev/null 2>/dev/null); [ -n "$r" ] && break; sleep 1; done
+        echo "$r"
+      expect: { match: exact, value: "mirror saw 198.51.100.{{up}}" }
+      timeoutSec: 40
+      skills: [net.services.nat, linux.net.firewall]
+      weight: 3
+    - id: office-blocked
+      description: The office subnet gets no connection to the mirror network
+      type: shell
+      on: office-net-2
+      command: ncat -w3 198.51.100.50 {{port}} </dev/null >/dev/null 2>&1 && echo open || echo closed
+      expect: { match: exact, value: closed }
+      timeoutSec: 15
+      skills: [net.services.nat, linux.net.firewall]
+      weight: 2
+    - id: rules-saved
+      description: /etc/nftables.nft is a valid saved ruleset with source NAT and a drop for the other subnets
+      type: shell
+      on: qm-edge-fw
+      command: |
+        f=/etc/nftables.nft
+        [ -s "$f" ] || { echo missing; exit 0; }
+        nft -c -f "$f" >/dev/null 2>&1 || { echo invalid; exit 0; }
+        grep -Eq 'masquerade|snat' "$f" && grep -Eq 'drop' "$f" && echo saved || echo incomplete
+      expect: { match: exact, value: saved }
+      timeoutSec: 15
+      skills: [net.services.nat, linux.net.firewall]
+      weight: 2
+  misconceptions:
+    - id: not-saved
+      description: Builds a working ruleset but never writes it to /etc/nftables.nft
+      mutation:
+        on: qm-edge-fw
+        run: |
+          nft add table inet edge
+          nft 'add chain inet edge forward { type filter hook forward priority 0; policy accept; }'
+          nft add rule inet edge forward ct state established,related accept
+          nft add rule inet edge forward iifname eth1 oifname eth3 accept
+          nft add rule inet edge forward oifname eth3 drop
+          nft add table ip edgenat
+          nft 'add chain ip edgenat post { type nat hook postrouting priority 100; }'
+          nft add rule ip edgenat post ip saddr 10.{{octet}}.10.0/24 oifname eth3 masquerade
+      expectFail: [rules-saved]
+    - id: masquerade-everyone
+      description: NATs and forwards every subnet to the mirror and drops nothing
+      mutation:
+        on: qm-edge-fw
+        run: |
+          nft add table ip edgenat
+          nft 'add chain ip edgenat post { type nat hook postrouting priority 100; }'
+          nft add rule ip edgenat post oifname eth3 masquerade
+          nft list ruleset > /etc/nftables.nft
+      expectFail: [office-blocked, rules-saved]
+    - id: forward-without-nat
+      description: Allows the harbour subnet through but forgets the source NAT
+      mutation:
+        on: qm-edge-fw
+        run: |
+          nft add table inet edge
+          nft 'add chain inet edge forward { type filter hook forward priority 0; policy accept; }'
+          nft add rule inet edge forward iifname eth1 oifname eth3 accept
+          nft add rule inet edge forward oifname eth3 drop
+          nft list ruleset > /etc/nftables.nft
+      expectFail: [harbour-egress-natted, rules-saved]
+  solution:
+    explanation: |
+      A postrouting NAT rule for the harbour subnet leaving eth3, and a forward chain
+      that accepts return traffic and the harbour subnet towards eth3 and drops everything
+      else towards the mirror network; then the ruleset is saved with
+      `nft list ruleset > /etc/nftables.nft`.
+    steps:
+      - on: qm-edge-fw
+        run: |
+          nft add table inet edge
+          nft 'add chain inet edge forward { type filter hook forward priority 0; policy accept; }'
+          nft add rule inet edge forward ct state established,related accept
+          nft add rule inet edge forward ip saddr 10.{{octet}}.10.0/24 oifname eth3 accept
+          nft add rule inet edge forward oifname eth3 drop
+          nft add table ip edgenat
+          nft 'add chain ip edgenat post { type nat hook postrouting priority 100; }'
+          nft add rule ip edgenat post ip saddr 10.{{octet}}.10.0/24 oifname eth3 snat to 198.51.100.{{up}}
+          nft list ruleset > /etc/nftables.nft
