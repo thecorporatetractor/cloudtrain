@@ -59,10 +59,9 @@ spec:
         sed -i '/tr-ntp-1/d' /etc/hosts
         echo "10.72.1.2 tr-ntp-1 tr-ntp-1.tallowmere.test" >> /etc/hosts
         # the depot time server: a second chronyd, bound to the namespace address, serving its local clock
-        id _chrony >/dev/null 2>&1 && ch=_chrony || ch=chrony
-        install -d -m 0755 /etc/tr-ntp; install -d -o $ch -g $ch -m 0755 /var/lib/tr-ntp
-        printf 'bindaddress 10.72.1.2\nlocal stratum 8\nallow 10.72.1.0/24\ncmdport 0\npidfile /run/tr-ntp-chronyd.pid\ndriftfile /var/lib/tr-ntp/drift\n' > /etc/tr-ntp/chrony.conf
-        systemd-run -q --unit=tr-ntp-1 --collect -p NetworkNamespacePath=/run/netns/tr-ntp-1 /usr/sbin/chronyd -x -d -f /etc/tr-ntp/chrony.conf
+        # config lives under /etc/chrony so the enforced AppArmor profile for chronyd allows reading it
+        printf 'bindaddress 10.72.1.2\nlocal stratum 8\nallow 10.72.1.0/24\ncmdport 0\nbindcmdaddress /\npidfile /run/chrony/tr-ntp-1.pid\ndriftfile /var/lib/chrony/tr-ntp-1.drift\n' > /etc/chrony/tr-ntp-1.conf
+        systemd-run -q --unit=tr-ntp-1 --collect -p NetworkNamespacePath=/run/netns/tr-ntp-1 /usr/sbin/chronyd -x -d -f /etc/chrony/tr-ntp-1.conf
         # the host: default chrony, no depot source yet, UTC
         rm -f /etc/chrony/sources.d/*.sources /etc/chrony/conf.d/*.conf
         timedatectl set-timezone Etc/UTC
@@ -70,6 +69,16 @@ spec:
         systemctl restart chrony
         sleep 2
         systemctl is-active tr-ntp-1.service >/dev/null
+        # the depot server must answer NTP before setup finishes
+        python3 - <<'EOP'
+        import socket, sys
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(3)
+        try:
+            s.sendto(b"\x23" + b"\0" * 47, ("10.72.1.2", 123)); d = s.recv(512)
+            sys.exit(0 if len(d) >= 48 else 1)
+        except Exception as e:
+            print("tr-ntp-1 does not answer NTP: %s" % e); sys.exit(1)
+        EOP
   checks:
     - id: source-configured
       description: chrony is configured with tr-ntp-1 as a time source

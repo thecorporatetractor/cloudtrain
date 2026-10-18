@@ -59,28 +59,42 @@ spec:
         modprobe ip_gre 2>/dev/null || grep -q '/ip_gre.ko' /lib/modules/$(uname -r)/modules.builtin 2>/dev/null || { echo "kernel module 'ip_gre' is not available on this image: the GRE tunnel lab cannot run" >&2; exit 1; }
         systemctl stop tr-gre.service tr-timetable.service 2>/dev/null || true
         nft delete table inet trclamp 2>/dev/null || true
-        for n in isp depot-b; do ip netns del $n 2>/dev/null || true; ip netns add $n; ip -n $n link set lo up; done
+        for n in isp1 isp2 depot-b; do ip netns del $n 2>/dev/null || true; ip netns add $n; ip -n $n link set lo up; done
+        ip netns del isp 2>/dev/null || true
         ip link del tun-dep 2>/dev/null || true
         ip link del tr-up 2>/dev/null || true
-        # VM --(1500)-- isp --(1400)-- depot-b ; the ISP drops oversize packets and swallows its own ICMP errors
+        # VM --(1500)-- isp1 --(1400)-- isp2 --(1500)-- depot-b ; the ISP drops oversize packets and swallows its own ICMP errors.
+        # depot-b's own eth0 stays at 1500, so its stack cannot learn the narrow segment by itself.
         ip link add tr-up type veth peer name isp-a
-        ip link set isp-a netns isp
+        ip link set isp-a netns isp1
         ip addr add 10.69.1.1/24 dev tr-up; ip link set tr-up up
-        ip -n isp addr add 10.69.1.2/24 dev isp-a; ip -n isp link set isp-a up
+        ip -n isp1 addr add 10.69.1.2/24 dev isp-a; ip -n isp1 link set isp-a up
+        ip -n isp1 link add isp-m1 type veth peer name isp-m2
+        ip -n isp1 link set isp-m2 netns isp2
+        ip -n isp1 addr add 10.69.3.1/24 dev isp-m1; ip -n isp1 link set isp-m1 mtu 1400 up
+        ip -n isp2 addr add 10.69.3.2/24 dev isp-m2; ip -n isp2 link set isp-m2 mtu 1400 up
         ip link add isp-b type veth peer name eth0
-        ip link set isp-b netns isp; ip link set eth0 netns depot-b
-        ip -n isp addr add 10.69.2.1/24 dev isp-b; ip -n isp link set isp-b mtu 1400 up
-        ip -n depot-b addr add 10.69.2.2/24 dev eth0; ip -n depot-b link set eth0 mtu 1400 up
+        ip link set isp-b netns isp2; ip link set eth0 netns depot-b
+        ip -n isp2 addr add 10.69.2.1/24 dev isp-b; ip -n isp2 link set isp-b mtu 1500 up
+        ip -n depot-b addr add 10.69.2.2/24 dev eth0; ip -n depot-b link set eth0 mtu 1500 up
         ip -n depot-b route add default via 10.69.2.1
-        ip netns exec isp sysctl -q -w net.ipv4.ip_forward=1
-        ip netns exec isp nft -f - <<'EONFT'
+        ip -n isp1 route add 10.69.2.0/24 via 10.69.3.2
+        ip -n isp2 route add 10.69.1.0/24 via 10.69.3.1
+        for n in isp1 isp2; do
+          ip netns exec $n sysctl -q -w net.ipv4.ip_forward=1
+          ip netns exec $n nft -f - <<'EONFT'
         table inet isp {
           chain output {
             type filter hook output priority 0; policy accept;
             icmp type destination-unreachable drop
           }
+          chain forward {
+            type filter hook forward priority 0; policy accept;
+            icmp type destination-unreachable drop
+          }
         }
         EONFT
+        done
         ip route replace 10.69.2.0/24 via 10.69.1.2 dev tr-up
         # depot side of the tunnel (not ours): MTU 1500
         ip -n depot-b link add tun-dep type gre local 10.69.2.2 remote 10.69.1.1
@@ -105,6 +119,8 @@ spec:
         systemctl daemon-reload; systemctl enable --now tr-gre.service >/dev/null 2>&1
         for i in $(seq 10); do curl -s -m 2 http://172.31.69.2:8000/ >/dev/null && break; sleep 1; done
         curl -s -m 5 http://172.31.69.2:8000/ >/dev/null
+        # the black hole must be real: the small request works, the big download stalls
+        if curl -s -m 15 -o /dev/null http://172.31.69.2:8000/timetable.bin; then echo "setup error: the download completes on the start state" >&2; exit 1; fi
         echo $(( {{mib}} * 1048576 )) > $V/mtu.bytes
   checks:
     - id: download

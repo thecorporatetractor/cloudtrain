@@ -70,9 +70,10 @@ sim-linux-sysadmin networking pool is now 8/8 (draw 4, so 2x); `labctl exam comp
 - iperf-throughput-baseline: BLOCKED, iperf3 is in neither package list. Add `iperf3` to
   `tools/mirrors/packages-noble.txt` (and el10) and rebuild the VM image; setup fails with a clear
   message until then.
-- netem-impaired-link: needs `sch_netem`. Setup tries `linux-modules-extra-$(uname -r)` from the
-  local repo; if the module is still absent, move the lab to el-vm:10 (kernel-modules-extra) and
-  change images.
+- netem-impaired-link: BLOCKED, `sch_netem` ships in linux-modules-extra (Ubuntu) / kernel-modules-extra
+  (EL10) and neither package is in the mirror lists, so the apt/dnf fallback in setup cannot succeed.
+  Add `linux-modules-extra-<kernel>` (noble) or `kernel-modules-extra` (el10) to `tools/mirrors/packages-*.txt`
+  and rebuild the VM image, or confirm sch_netem.ko is already in /lib/modules of the image.
 - Kernel modules assumed present, with a clear setup failure otherwise: `ip_gre`, `bridge`,
   `8021q`, `bonding`, `wireguard`, `sch_tbf`.
 - Reboot-graded labs check persistence from configuration only, until verify can reboot.

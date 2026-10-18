@@ -23,6 +23,9 @@ spec:
     - IPv4 must stay on **DHCP** (`ipv4.method auto`) and the default route must not change;
     - the connection profile must be saved (survives a reboot) **and** active now.
 
+    Static IPv6 addresses need an `ipv6.method` that allows them (`auto`, `manual`, ...); the
+    profile is already set up that way.
+
     Careful: `nmcli connection up` re-activates the connection and can drop your ssh session for
     a few seconds; `nmcli device reapply eth0` applies the changed profile to the running
     interface more gently. If you lose the connection, use the node's console.
@@ -64,6 +67,14 @@ spec:
         ip -4 -o addr show dev "$dev" scope global | awk '$4 !~ /^10\.40\.9\./ {print $4; exit}' > $V/nm.addr
         ip -4 route show default | awk '{print $3; exit}' > $V/nm.gw
         [ "$(nmcli -g ipv4.method con show "$con")" = auto ]
+        # NetworkManager refuses static ipv6.addresses when ipv6.method is ignore, disabled or link-local
+        case "$(nmcli -g ipv6.method con show "$con")" in
+          ignore|disabled|link-local) nmcli con mod "$con" ipv6.method auto ;;
+        esac
+        case "$(nmcli -g ipv6.method con show "$con")" in
+          auto|dhcp|manual|shared) : ;;
+          *) echo "ipv6.method of $con does not allow static addresses" >&2; exit 1 ;;
+        esac
         test -s $V/nm.addr && test -s $V/nm.gw
   checks:
     - id: profile-addresses
@@ -123,7 +134,7 @@ spec:
       body: "A plus sign appends a value to a multi-valued property; without it nmcli replaces the list. Find the connection name with nmcli -g GENERAL.CONNECTION device show eth0."
       cost: 0
     - title: IPv6 and DNS
-      body: "The same +ipv6.addresses works for IPv6, and ipv4.dns takes the server (use +ipv4.dns to keep other servers). IPv6 can stay on its automatic method while carrying a static address."
+      body: "The same +ipv6.addresses works for IPv6, and ipv4.dns takes the server (use +ipv4.dns to keep other servers). IPv6 can stay on its automatic method while carrying a static address; NetworkManager rejects ipv6.addresses when ipv6.method is ignore, disabled or link-local."
       cost: 1
     - title: Apply without dropping the session
       command: sudo nmcli device reapply eth0

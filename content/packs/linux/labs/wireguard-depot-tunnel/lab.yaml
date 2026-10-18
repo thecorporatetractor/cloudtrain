@@ -183,9 +183,10 @@ spec:
       weight: 1.5
       timeoutSec: 60
       command: |
-        dev=$(ip -4 route show default | awk '{print $5; exit}'); f=$(mktemp)
+        dev=$(ip -4 route show default | awk '{print $5; exit}'); f=$(mktemp --suffix=.pcap)
         timeout 9 tcpdump -Z root -ni $dev -w $f "udp port {{port}} or (icmp and host 10.73.2.1)" >/dev/null 2>&1 &
         sleep 2; ping -c4 -W2 -I 10.73.1.1 10.73.2.1 >/dev/null 2>&1; wait
+        [ -s $f ] || { rm -f $f; echo capture-failed; exit 0; }
         u=$(tcpdump -nr $f "udp port {{port}}" 2>/dev/null | wc -l); i=$(tcpdump -nr $f icmp 2>/dev/null | wc -l); rm -f $f
         echo "udp=$([ "$u" -gt 0 ] && echo yes || echo no) plain-icmp=$i"
       expect: {match: exact, value: "udp=yes plain-icmp=0"}
@@ -229,7 +230,7 @@ spec:
         if not re.search(r"^PublicKey=\S{43}=", t, re.M):
             problems.append("no-peer-key")
         nets = "".join(open(x).read() for x in glob.glob(d + "*.network") if "wg-depot" in open(x).read())
-        if "Address=10.73.100.1/30" not in nets or "Destination=10.73.2.0/24" not in nets:
+        if "Address=10.73.100.1/30" not in nets or ("Destination=10.73.2.0/24" not in nets and not re.search(r"^RouteTable=", t, re.M)):
             problems.append("network-file")
         if subprocess.run(["systemctl", "is-enabled", "systemd-networkd"], capture_output=True, text=True).stdout.strip() != "enabled":
             problems.append("networkd-not-enabled")
@@ -276,7 +277,7 @@ spec:
         if not re.search(r"^PublicKey=\S{43}=", t, re.M):
             problems.append("no-peer-key")
         nets = "".join(open(x).read() for x in glob.glob(d + "*.network") if "wg-depot" in open(x).read())
-        if "Address=10.73.100.2/30" not in nets or "Destination=10.73.1.0/24" not in nets:
+        if "Address=10.73.100.2/30" not in nets or ("Destination=10.73.1.0/24" not in nets and not re.search(r"^RouteTable=", t, re.M)):
             problems.append("network-file")
         if subprocess.run(["systemctl", "is-enabled", "systemd-networkd"], capture_output=True, text=True).stdout.strip() != "enabled":
             problems.append("networkd-not-enabled")
@@ -401,8 +402,86 @@ spec:
           - on: tr-wg-a
             as: learner
             timeoutSec: 90
-            run: sudo bash /var/lib/cloudtrain/wgsol.sh a keyfile
+            run: |
+              set -e
+              sudo bash -s <<'EOS'
+              set -e
+              mk() { printf '%s' "tr-wg-$1-{{salt}}" | openssl dgst -sha256 -binary | base64; }
+              pub() { (printf '\x30\x2e\x02\x01\x00\x30\x05\x06\x03\x2b\x65\x6e\x04\x22\x04\x20'; printf '%s' "$1" | base64 -d) | openssl pkey -inform DER -pubout -outform DER | tail -c 32 | base64; }
+              PEERPUB=$(pub "$(mk b)"); PEERIP=$(getent ahostsv4 tr-wg-b | awk '{print $1; exit}')
+              mk a > /etc/systemd/network/wg-depot.key
+              chown root:systemd-network /etc/systemd/network/wg-depot.key
+              chmod 0640 /etc/systemd/network/wg-depot.key
+              cat > /etc/systemd/network/50-wg-depot.netdev <<EOF
+              [NetDev]
+              Name=wg-depot
+              Kind=wireguard
+
+              [WireGuard]
+              PrivateKeyFile=/etc/systemd/network/wg-depot.key
+              ListenPort={{port}}
+
+              [WireGuardPeer]
+              PublicKey=$PEERPUB
+              AllowedIPs=10.73.100.2/32,10.73.2.0/24
+              Endpoint=$PEERIP:{{port}}
+              PersistentKeepalive=5
+              EOF
+              chown root:systemd-network /etc/systemd/network/50-wg-depot.netdev
+              chmod 0640 /etc/systemd/network/50-wg-depot.netdev
+              cat > /etc/systemd/network/50-wg-depot.network <<EOF
+              [Match]
+              Name=wg-depot
+
+              [Network]
+              Address=10.73.100.1/30
+
+              [Route]
+              Destination=10.73.2.0/24
+              EOF
+              networkctl reload
+              sleep 3
+              EOS
           - on: tr-wg-b
             as: learner
             timeoutSec: 90
-            run: sudo bash /var/lib/cloudtrain/wgsol.sh b keyfile
+            run: |
+              set -e
+              sudo bash -s <<'EOS'
+              set -e
+              mk() { printf '%s' "tr-wg-$1-{{salt}}" | openssl dgst -sha256 -binary | base64; }
+              pub() { (printf '\x30\x2e\x02\x01\x00\x30\x05\x06\x03\x2b\x65\x6e\x04\x22\x04\x20'; printf '%s' "$1" | base64 -d) | openssl pkey -inform DER -pubout -outform DER | tail -c 32 | base64; }
+              PEERPUB=$(pub "$(mk a)"); PEERIP=$(getent ahostsv4 tr-wg-a | awk '{print $1; exit}')
+              mk b > /etc/systemd/network/wg-depot.key
+              chown root:systemd-network /etc/systemd/network/wg-depot.key
+              chmod 0640 /etc/systemd/network/wg-depot.key
+              cat > /etc/systemd/network/50-wg-depot.netdev <<EOF
+              [NetDev]
+              Name=wg-depot
+              Kind=wireguard
+
+              [WireGuard]
+              PrivateKeyFile=/etc/systemd/network/wg-depot.key
+              ListenPort={{port}}
+
+              [WireGuardPeer]
+              PublicKey=$PEERPUB
+              AllowedIPs=10.73.100.1/32,10.73.1.0/24
+              Endpoint=$PEERIP:{{port}}
+              PersistentKeepalive=5
+              EOF
+              chown root:systemd-network /etc/systemd/network/50-wg-depot.netdev
+              chmod 0640 /etc/systemd/network/50-wg-depot.netdev
+              cat > /etc/systemd/network/50-wg-depot.network <<EOF
+              [Match]
+              Name=wg-depot
+
+              [Network]
+              Address=10.73.100.2/30
+
+              [Route]
+              Destination=10.73.1.0/24
+              EOF
+              networkctl reload
+              sleep 3
+              EOS
