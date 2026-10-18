@@ -67,6 +67,10 @@ spec:
         apt-get install -y -q --allow-change-held-packages kubelet='1.37.1-*' kubectl='1.37.1-*' >/dev/null
         apt-mark hold kubeadm kubelet kubectl >/dev/null
         systemctl daemon-reload && systemctl restart kubelet
+        # the new kubelet recreates the static control-plane pods; wait for the API
+        export KUBECONFIG=/etc/kubernetes/admin.conf
+        for i in $(seq 1 90); do kubectl get --raw /readyz >/dev/null 2>&1 && break; sleep 2; done
+        kubectl get --raw /readyz >/dev/null
     - on: qm-harbour/harbour-wk-1
       run: apt-mark hold kubeadm kubelet kubectl
     - on: qm-harbour
@@ -144,7 +148,10 @@ spec:
           apt-get update -q
           apt-get install -y kubeadm='1.37.1-*'
           kubeadm upgrade node
+          # the kubelet package restarts the service on upgrade; block that so the old process keeps running
+          printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d && chmod +x /usr/sbin/policy-rc.d
           apt-get install -y kubelet='1.37.1-*' kubectl='1.37.1-*'
+          rm -f /usr/sbin/policy-rc.d
           apt-mark hold kubeadm kubelet kubectl
           EOS
           kubectl uncordon harbour-wk-1
