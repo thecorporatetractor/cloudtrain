@@ -16,7 +16,7 @@ import type { ExamDomain, ExamRules, RetakePolicy, ExamAvailability, ExamObjecti
 
 export type SiteTheme = 'dark' | 'light' | 'cream';
 
-export type SiteFeatureIcon = 'server' | 'shield' | 'graduation' | 'flag' | 'users' | 'network' | 'boxes' | 'terminal' | 'timer' | 'check' | 'sparkles' | 'chart' | 'lock' | 'cloud' | 'route' | 'eye';
+export type SiteFeatureIcon = 'server' | 'shield' | 'graduation' | 'flag' | 'users' | 'network' | 'boxes' | 'terminal' | 'timer' | 'check' | 'sparkles' | 'chart' | 'lock' | 'cloud' | 'route' | 'eye' | 'user' | 'building' | 'target' | 'layers';
 
 export interface SiteLink {
   label: string;
@@ -35,6 +35,37 @@ export interface SiteFeatureBlock {
   icon: SiteFeatureIcon;
   title: string;
   body: string;
+}
+
+/** A real product screenshot: dark image, optional light variant, alt text and intrinsic size. */
+export interface SiteFigure {
+  image: string;
+  imageLight?: string;
+  alt: string;
+  width?: number;
+  height?: number;
+}
+
+export interface SiteDifferentiator {
+  icon?: SiteFeatureIcon;
+  title: string;
+  body: string;
+  figure?: SiteFigure;
+}
+
+export interface SiteShowcaseItem {
+  title: string;
+  body: string;
+  why?: string;
+  figure: SiteFigure;
+}
+
+export interface SiteAudience {
+  icon?: SiteFeatureIcon;
+  title: string;
+  body: string;
+  points?: string[];
+  cta: SiteCta;
 }
 
 export interface SiteLegalSection {
@@ -123,13 +154,20 @@ export interface SiteConfig {
     primaryCta?: SiteCta;
     secondaryCta?: SiteCta;
     note?: string;
+    /** The product preview beside the headline. */
+    preview?: SiteFigure;
+    /** Short attributes after the live catalog figures. */
+    proof?: string[];
   };
   /** Domains shown on the landing page, in order. */
   highlightDomains: Domain[];
+  /** Secondary capability blocks (after the differentiators). */
   features: SiteFeatureBlock[];
-  howItWorks: { title: string; body: string }[];
-  screenshots?: { image: string; alt: string; caption?: string }[];
-  faq: { q: string; a: string; group?: string }[];
+  howItWorks: { title: string; body: string; icon?: SiteFeatureIcon }[];
+  differentiators?: SiteDifferentiator[];
+  showcase?: SiteShowcaseItem[];
+  audiences?: SiteAudience[];
+  faq: { q: string; a: string; group?: string; featured?: boolean }[];
   about: { title: string; paragraphs: string[]; facts?: { label: string; value: string }[] };
   contact: {
     title?: string;
@@ -172,6 +210,8 @@ export interface SiteConfig {
     faqGroup?: string;
   };
   plans?: SitePlans;
+  /** The closing call to action; the buttons default to the hero's. */
+  closing?: { title: string; body?: string; primaryCta?: SiteCta; secondaryCta?: SiteCta };
 }
 
 /* ================================================================ public catalog */

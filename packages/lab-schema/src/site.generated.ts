@@ -15,12 +15,37 @@ export type Href = string;
 export type Domain = "kubernetes" | "linux" | "containers" | "iac" | "automation" | "networking";
 /**
  * This interface was referenced by `Site`'s JSON-Schema
+ * via the `definition` "icon".
+ */
+export type Icon =
+  | "server"
+  | "shield"
+  | "graduation"
+  | "flag"
+  | "users"
+  | "network"
+  | "boxes"
+  | "terminal"
+  | "timer"
+  | "check"
+  | "sparkles"
+  | "chart"
+  | "lock"
+  | "cloud"
+  | "route"
+  | "eye"
+  | "user"
+  | "building"
+  | "target"
+  | "layers";
+/**
+ * This interface was referenced by `Site`'s JSON-Schema
  * via the `definition` "email".
  */
 export type Email = string;
 
 /**
- * Configuration of the public website served by the same web app as the platform (apps/web) and the gateway (`GET /api/public/site`). Brand, copy, feature blocks, FAQ, contact, footer, legal placeholders, highlighted domains, theme token overrides, feature flags and plans. The default lives in content/site.yaml; a deployment replaces it with its own file (CT_SITE_CONFIG, e.g. a ConfigMap mount) without a code change.
+ * Configuration of the public website served by the same web app as the platform (apps/web) and the gateway (`GET /api/public/site`). Brand, copy, differentiators, product showcase, audiences, feature blocks, FAQ, contact, footer, legal placeholders, highlighted domains, theme token overrides, feature flags and plans. The default lives in content/site.yaml; a deployment replaces it with its own file (CT_SITE_CONFIG, e.g. a ConfigMap mount) without a code change.
  */
 export interface Site {
   apiVersion: "cloudtrain.dev/v1";
@@ -58,6 +83,13 @@ export interface Site {
      * Small print under the buttons (e.g. no credit card, SSO for teams).
      */
     note?: string;
+    preview?: Figure;
+    /**
+     * Short attributes under the buttons, after the live catalog figures (e.g. `Graded on the end state`).
+     *
+     * @maxItems 4
+     */
+    proof?: [] | [string] | [string, string] | [string, string, string] | [string, string, string, string];
   };
   /**
    * Domains shown on the landing page, in this order. Each must exist in the catalog.
@@ -73,7 +105,7 @@ export interface Site {
     | [Domain, Domain, Domain, Domain, Domain]
     | [Domain, Domain, Domain, Domain, Domain, Domain];
   /**
-   * Value-proposition blocks on the landing page.
+   * Secondary capability blocks on the landing page (shown after the differentiators) and reused by other pages.
    *
    * @minItems 1
    * @maxItems 12
@@ -148,399 +180,500 @@ export interface Site {
         {
           title: string;
           body: string;
+          icon?: Icon;
         },
         {
           title: string;
           body: string;
+          icon?: Icon;
         }
       ]
     | [
         {
           title: string;
           body: string;
+          icon?: Icon;
         },
         {
           title: string;
           body: string;
+          icon?: Icon;
         },
         {
           title: string;
           body: string;
+          icon?: Icon;
         }
       ]
     | [
         {
           title: string;
           body: string;
+          icon?: Icon;
         },
         {
           title: string;
           body: string;
+          icon?: Icon;
         },
         {
           title: string;
           body: string;
+          icon?: Icon;
         },
         {
           title: string;
           body: string;
+          icon?: Icon;
         }
       ]
     | [
         {
           title: string;
           body: string;
+          icon?: Icon;
         },
         {
           title: string;
           body: string;
+          icon?: Icon;
         },
         {
           title: string;
           body: string;
+          icon?: Icon;
         },
         {
           title: string;
           body: string;
+          icon?: Icon;
         },
         {
           title: string;
           body: string;
+          icon?: Icon;
         }
       ]
     | [
         {
           title: string;
           body: string;
+          icon?: Icon;
         },
         {
           title: string;
           body: string;
+          icon?: Icon;
         },
         {
           title: string;
           body: string;
+          icon?: Icon;
         },
         {
           title: string;
           body: string;
+          icon?: Icon;
         },
         {
           title: string;
           body: string;
+          icon?: Icon;
         },
         {
           title: string;
           body: string;
+          icon?: Icon;
         }
       ];
   /**
-   * @maxItems 8
+   * What makes the platform different: a headline, a short explanation and an optional real screenshot each.
+   *
+   * @minItems 2
+   * @maxItems 4
    */
-  screenshots?:
-    | []
+  differentiators?:
     | [
         {
-          /**
-           * Absolute path served by the web app (the default `/site/<name>.png` files are copies of README screenshots kept by apps/web/scripts/readme-shots.mjs) or a URL.
-           */
-          image: string;
-          alt: string;
-          caption?: string;
+          icon?: Icon;
+          title: string;
+          body: string;
+          figure?: Figure1;
+        },
+        {
+          icon?: Icon;
+          title: string;
+          body: string;
+          figure?: Figure1;
         }
       ]
     | [
         {
-          /**
-           * Absolute path served by the web app (the default `/site/<name>.png` files are copies of README screenshots kept by apps/web/scripts/readme-shots.mjs) or a URL.
-           */
-          image: string;
-          alt: string;
-          caption?: string;
+          icon?: Icon;
+          title: string;
+          body: string;
+          figure?: Figure1;
         },
         {
-          /**
-           * Absolute path served by the web app (the default `/site/<name>.png` files are copies of README screenshots kept by apps/web/scripts/readme-shots.mjs) or a URL.
-           */
-          image: string;
-          alt: string;
-          caption?: string;
+          icon?: Icon;
+          title: string;
+          body: string;
+          figure?: Figure1;
+        },
+        {
+          icon?: Icon;
+          title: string;
+          body: string;
+          figure?: Figure1;
         }
       ]
     | [
         {
-          /**
-           * Absolute path served by the web app (the default `/site/<name>.png` files are copies of README screenshots kept by apps/web/scripts/readme-shots.mjs) or a URL.
-           */
-          image: string;
-          alt: string;
-          caption?: string;
+          icon?: Icon;
+          title: string;
+          body: string;
+          figure?: Figure1;
         },
         {
-          /**
-           * Absolute path served by the web app (the default `/site/<name>.png` files are copies of README screenshots kept by apps/web/scripts/readme-shots.mjs) or a URL.
-           */
-          image: string;
-          alt: string;
-          caption?: string;
+          icon?: Icon;
+          title: string;
+          body: string;
+          figure?: Figure1;
         },
         {
+          icon?: Icon;
+          title: string;
+          body: string;
+          figure?: Figure1;
+        },
+        {
+          icon?: Icon;
+          title: string;
+          body: string;
+          figure?: Figure1;
+        }
+      ];
+  /**
+   * Product views on the landing page, each a real screenshot with a title, what it shows and why it matters.
+   *
+   * @minItems 1
+   * @maxItems 6
+   */
+  showcase?:
+    | [
+        {
+          title: string;
+          body: string;
           /**
-           * Absolute path served by the web app (the default `/site/<name>.png` files are copies of README screenshots kept by apps/web/scripts/readme-shots.mjs) or a URL.
+           * One sentence on why the view matters.
            */
-          image: string;
-          alt: string;
-          caption?: string;
+          why?: string;
+          figure: Figure1;
         }
       ]
     | [
         {
+          title: string;
+          body: string;
           /**
-           * Absolute path served by the web app (the default `/site/<name>.png` files are copies of README screenshots kept by apps/web/scripts/readme-shots.mjs) or a URL.
+           * One sentence on why the view matters.
            */
-          image: string;
-          alt: string;
-          caption?: string;
+          why?: string;
+          figure: Figure1;
         },
         {
+          title: string;
+          body: string;
           /**
-           * Absolute path served by the web app (the default `/site/<name>.png` files are copies of README screenshots kept by apps/web/scripts/readme-shots.mjs) or a URL.
+           * One sentence on why the view matters.
            */
-          image: string;
-          alt: string;
-          caption?: string;
-        },
-        {
-          /**
-           * Absolute path served by the web app (the default `/site/<name>.png` files are copies of README screenshots kept by apps/web/scripts/readme-shots.mjs) or a URL.
-           */
-          image: string;
-          alt: string;
-          caption?: string;
-        },
-        {
-          /**
-           * Absolute path served by the web app (the default `/site/<name>.png` files are copies of README screenshots kept by apps/web/scripts/readme-shots.mjs) or a URL.
-           */
-          image: string;
-          alt: string;
-          caption?: string;
+          why?: string;
+          figure: Figure1;
         }
       ]
     | [
         {
+          title: string;
+          body: string;
           /**
-           * Absolute path served by the web app (the default `/site/<name>.png` files are copies of README screenshots kept by apps/web/scripts/readme-shots.mjs) or a URL.
+           * One sentence on why the view matters.
            */
-          image: string;
-          alt: string;
-          caption?: string;
+          why?: string;
+          figure: Figure1;
         },
         {
+          title: string;
+          body: string;
           /**
-           * Absolute path served by the web app (the default `/site/<name>.png` files are copies of README screenshots kept by apps/web/scripts/readme-shots.mjs) or a URL.
+           * One sentence on why the view matters.
            */
-          image: string;
-          alt: string;
-          caption?: string;
+          why?: string;
+          figure: Figure1;
         },
         {
+          title: string;
+          body: string;
           /**
-           * Absolute path served by the web app (the default `/site/<name>.png` files are copies of README screenshots kept by apps/web/scripts/readme-shots.mjs) or a URL.
+           * One sentence on why the view matters.
            */
-          image: string;
-          alt: string;
-          caption?: string;
-        },
-        {
-          /**
-           * Absolute path served by the web app (the default `/site/<name>.png` files are copies of README screenshots kept by apps/web/scripts/readme-shots.mjs) or a URL.
-           */
-          image: string;
-          alt: string;
-          caption?: string;
-        },
-        {
-          /**
-           * Absolute path served by the web app (the default `/site/<name>.png` files are copies of README screenshots kept by apps/web/scripts/readme-shots.mjs) or a URL.
-           */
-          image: string;
-          alt: string;
-          caption?: string;
+          why?: string;
+          figure: Figure1;
         }
       ]
     | [
         {
+          title: string;
+          body: string;
           /**
-           * Absolute path served by the web app (the default `/site/<name>.png` files are copies of README screenshots kept by apps/web/scripts/readme-shots.mjs) or a URL.
+           * One sentence on why the view matters.
            */
-          image: string;
-          alt: string;
-          caption?: string;
+          why?: string;
+          figure: Figure1;
         },
         {
+          title: string;
+          body: string;
           /**
-           * Absolute path served by the web app (the default `/site/<name>.png` files are copies of README screenshots kept by apps/web/scripts/readme-shots.mjs) or a URL.
+           * One sentence on why the view matters.
            */
-          image: string;
-          alt: string;
-          caption?: string;
+          why?: string;
+          figure: Figure1;
         },
         {
+          title: string;
+          body: string;
           /**
-           * Absolute path served by the web app (the default `/site/<name>.png` files are copies of README screenshots kept by apps/web/scripts/readme-shots.mjs) or a URL.
+           * One sentence on why the view matters.
            */
-          image: string;
-          alt: string;
-          caption?: string;
+          why?: string;
+          figure: Figure1;
         },
         {
+          title: string;
+          body: string;
           /**
-           * Absolute path served by the web app (the default `/site/<name>.png` files are copies of README screenshots kept by apps/web/scripts/readme-shots.mjs) or a URL.
+           * One sentence on why the view matters.
            */
-          image: string;
-          alt: string;
-          caption?: string;
-        },
-        {
-          /**
-           * Absolute path served by the web app (the default `/site/<name>.png` files are copies of README screenshots kept by apps/web/scripts/readme-shots.mjs) or a URL.
-           */
-          image: string;
-          alt: string;
-          caption?: string;
-        },
-        {
-          /**
-           * Absolute path served by the web app (the default `/site/<name>.png` files are copies of README screenshots kept by apps/web/scripts/readme-shots.mjs) or a URL.
-           */
-          image: string;
-          alt: string;
-          caption?: string;
+          why?: string;
+          figure: Figure1;
         }
       ]
     | [
         {
+          title: string;
+          body: string;
           /**
-           * Absolute path served by the web app (the default `/site/<name>.png` files are copies of README screenshots kept by apps/web/scripts/readme-shots.mjs) or a URL.
+           * One sentence on why the view matters.
            */
-          image: string;
-          alt: string;
-          caption?: string;
+          why?: string;
+          figure: Figure1;
         },
         {
+          title: string;
+          body: string;
           /**
-           * Absolute path served by the web app (the default `/site/<name>.png` files are copies of README screenshots kept by apps/web/scripts/readme-shots.mjs) or a URL.
+           * One sentence on why the view matters.
            */
-          image: string;
-          alt: string;
-          caption?: string;
+          why?: string;
+          figure: Figure1;
         },
         {
+          title: string;
+          body: string;
           /**
-           * Absolute path served by the web app (the default `/site/<name>.png` files are copies of README screenshots kept by apps/web/scripts/readme-shots.mjs) or a URL.
+           * One sentence on why the view matters.
            */
-          image: string;
-          alt: string;
-          caption?: string;
+          why?: string;
+          figure: Figure1;
         },
         {
+          title: string;
+          body: string;
           /**
-           * Absolute path served by the web app (the default `/site/<name>.png` files are copies of README screenshots kept by apps/web/scripts/readme-shots.mjs) or a URL.
+           * One sentence on why the view matters.
            */
-          image: string;
-          alt: string;
-          caption?: string;
+          why?: string;
+          figure: Figure1;
         },
         {
+          title: string;
+          body: string;
           /**
-           * Absolute path served by the web app (the default `/site/<name>.png` files are copies of README screenshots kept by apps/web/scripts/readme-shots.mjs) or a URL.
+           * One sentence on why the view matters.
            */
-          image: string;
-          alt: string;
-          caption?: string;
-        },
-        {
-          /**
-           * Absolute path served by the web app (the default `/site/<name>.png` files are copies of README screenshots kept by apps/web/scripts/readme-shots.mjs) or a URL.
-           */
-          image: string;
-          alt: string;
-          caption?: string;
-        },
-        {
-          /**
-           * Absolute path served by the web app (the default `/site/<name>.png` files are copies of README screenshots kept by apps/web/scripts/readme-shots.mjs) or a URL.
-           */
-          image: string;
-          alt: string;
-          caption?: string;
+          why?: string;
+          figure: Figure1;
         }
       ]
     | [
         {
+          title: string;
+          body: string;
           /**
-           * Absolute path served by the web app (the default `/site/<name>.png` files are copies of README screenshots kept by apps/web/scripts/readme-shots.mjs) or a URL.
+           * One sentence on why the view matters.
            */
-          image: string;
-          alt: string;
-          caption?: string;
+          why?: string;
+          figure: Figure1;
         },
         {
+          title: string;
+          body: string;
           /**
-           * Absolute path served by the web app (the default `/site/<name>.png` files are copies of README screenshots kept by apps/web/scripts/readme-shots.mjs) or a URL.
+           * One sentence on why the view matters.
            */
-          image: string;
-          alt: string;
-          caption?: string;
+          why?: string;
+          figure: Figure1;
         },
         {
+          title: string;
+          body: string;
           /**
-           * Absolute path served by the web app (the default `/site/<name>.png` files are copies of README screenshots kept by apps/web/scripts/readme-shots.mjs) or a URL.
+           * One sentence on why the view matters.
            */
-          image: string;
-          alt: string;
-          caption?: string;
+          why?: string;
+          figure: Figure1;
         },
         {
+          title: string;
+          body: string;
           /**
-           * Absolute path served by the web app (the default `/site/<name>.png` files are copies of README screenshots kept by apps/web/scripts/readme-shots.mjs) or a URL.
+           * One sentence on why the view matters.
            */
-          image: string;
-          alt: string;
-          caption?: string;
+          why?: string;
+          figure: Figure1;
         },
         {
+          title: string;
+          body: string;
           /**
-           * Absolute path served by the web app (the default `/site/<name>.png` files are copies of README screenshots kept by apps/web/scripts/readme-shots.mjs) or a URL.
+           * One sentence on why the view matters.
            */
-          image: string;
-          alt: string;
-          caption?: string;
+          why?: string;
+          figure: Figure1;
         },
         {
+          title: string;
+          body: string;
           /**
-           * Absolute path served by the web app (the default `/site/<name>.png` files are copies of README screenshots kept by apps/web/scripts/readme-shots.mjs) or a URL.
+           * One sentence on why the view matters.
            */
-          image: string;
-          alt: string;
-          caption?: string;
+          why?: string;
+          figure: Figure1;
+        }
+      ];
+  /**
+   * Who the platform is for, each with its own next step.
+   *
+   * @minItems 1
+   * @maxItems 4
+   */
+  audiences?:
+    | [
+        {
+          icon?: Icon;
+          title: string;
+          body: string;
+          /**
+           * @maxItems 4
+           */
+          points?: [] | [string] | [string, string] | [string, string, string] | [string, string, string, string];
+          cta: Cta;
+        }
+      ]
+    | [
+        {
+          icon?: Icon;
+          title: string;
+          body: string;
+          /**
+           * @maxItems 4
+           */
+          points?: [] | [string] | [string, string] | [string, string, string] | [string, string, string, string];
+          cta: Cta;
         },
         {
+          icon?: Icon;
+          title: string;
+          body: string;
           /**
-           * Absolute path served by the web app (the default `/site/<name>.png` files are copies of README screenshots kept by apps/web/scripts/readme-shots.mjs) or a URL.
+           * @maxItems 4
            */
-          image: string;
-          alt: string;
-          caption?: string;
+          points?: [] | [string] | [string, string] | [string, string, string] | [string, string, string, string];
+          cta: Cta;
+        }
+      ]
+    | [
+        {
+          icon?: Icon;
+          title: string;
+          body: string;
+          /**
+           * @maxItems 4
+           */
+          points?: [] | [string] | [string, string] | [string, string, string] | [string, string, string, string];
+          cta: Cta;
         },
         {
+          icon?: Icon;
+          title: string;
+          body: string;
           /**
-           * Absolute path served by the web app (the default `/site/<name>.png` files are copies of README screenshots kept by apps/web/scripts/readme-shots.mjs) or a URL.
+           * @maxItems 4
            */
-          image: string;
-          alt: string;
-          caption?: string;
+          points?: [] | [string] | [string, string] | [string, string, string] | [string, string, string, string];
+          cta: Cta;
+        },
+        {
+          icon?: Icon;
+          title: string;
+          body: string;
+          /**
+           * @maxItems 4
+           */
+          points?: [] | [string] | [string, string] | [string, string, string] | [string, string, string, string];
+          cta: Cta;
+        }
+      ]
+    | [
+        {
+          icon?: Icon;
+          title: string;
+          body: string;
+          /**
+           * @maxItems 4
+           */
+          points?: [] | [string] | [string, string] | [string, string, string] | [string, string, string, string];
+          cta: Cta;
+        },
+        {
+          icon?: Icon;
+          title: string;
+          body: string;
+          /**
+           * @maxItems 4
+           */
+          points?: [] | [string] | [string, string] | [string, string, string] | [string, string, string, string];
+          cta: Cta;
+        },
+        {
+          icon?: Icon;
+          title: string;
+          body: string;
+          /**
+           * @maxItems 4
+           */
+          points?: [] | [string] | [string, string] | [string, string, string] | [string, string, string, string];
+          cta: Cta;
+        },
+        {
+          icon?: Icon;
+          title: string;
+          body: string;
+          /**
+           * @maxItems 4
+           */
+          points?: [] | [string] | [string, string] | [string, string, string] | [string, string, string, string];
+          cta: Cta;
         }
       ];
   /**
@@ -555,6 +688,10 @@ export interface Site {
        * Optional heading the question is listed under.
        */
       group?: string;
+      /**
+       * Also shown in the landing page's trust section (at most six).
+       */
+      featured?: boolean;
     },
     ...{
       q: string;
@@ -563,6 +700,10 @@ export interface Site {
        * Optional heading the question is listed under.
        */
       group?: string;
+      /**
+       * Also shown in the landing page's trust section (at most six).
+       */
+      featured?: boolean;
     }[]
   ];
   about: {
@@ -1165,6 +1306,15 @@ export interface Site {
       | [Plan, Plan, Plan, Plan, Plan]
       | [Plan, Plan, Plan, Plan, Plan, Plan];
   };
+  /**
+   * The closing call to action on the landing page; the buttons default to the hero's.
+   */
+  closing?: {
+    title: string;
+    body?: string;
+    primaryCta?: Cta;
+    secondaryCta?: Cta;
+  };
 }
 /**
  * This interface was referenced by `Site`'s JSON-Schema
@@ -1173,6 +1323,22 @@ export interface Site {
 export interface Cta {
   label: string;
   to: Href;
+}
+/**
+ * The product preview beside the headline.
+ */
+export interface Figure {
+  /**
+   * Absolute path served by the web app (apps/web/public, e.g. `/site/workspace-dark.webp`, captured by apps/web/scripts/site-shots.mjs) or a URL.
+   */
+  image: string;
+  /**
+   * Variant shown in the light and cream themes; defaults to `image`.
+   */
+  imageLight?: string;
+  alt: string;
+  width?: number;
+  height?: number;
 }
 /**
  * This interface was referenced by `Site`'s JSON-Schema
@@ -1195,9 +1361,32 @@ export interface FeatureBlock {
     | "lock"
     | "cloud"
     | "route"
-    | "eye";
+    | "eye"
+    | "user"
+    | "building"
+    | "target"
+    | "layers";
   title: string;
   body: string;
+}
+/**
+ * A product screenshot: the dark-theme image, an optional light-theme variant (used for the light and cream themes), alt text and the intrinsic size (reserves the space before the image loads).
+ *
+ * This interface was referenced by `Site`'s JSON-Schema
+ * via the `definition` "figure".
+ */
+export interface Figure1 {
+  /**
+   * Absolute path served by the web app (apps/web/public, e.g. `/site/workspace-dark.webp`, captured by apps/web/scripts/site-shots.mjs) or a URL.
+   */
+  image: string;
+  /**
+   * Variant shown in the light and cream themes; defaults to `image`.
+   */
+  imageLight?: string;
+  alt: string;
+  width?: number;
+  height?: number;
 }
 /**
  * This interface was referenced by `Site`'s JSON-Schema

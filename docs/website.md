@@ -10,7 +10,7 @@ on it comes from one configuration file.
 
 | Route | Page | Signed in |
 |---|---|---|
-| `/` | Landing page: hero, highlighted domains with live counts, how a lab works, feature blocks, screenshots, closing call to action | The learner's Home |
+| `/` | Landing page: hero with a real product preview and the live catalog figures, the six domains with counts, how a lab works (`#how-it-works`), the three differentiators and the secondary capabilities, the product showcase, who the platform is for (`#teams`), featured questions, closing call to action | The learner's Home |
 | `/catalog` (+ `?domain=`, `?q=`, `?difficulty=`, `?maxMinutes=`, `?path=`) | Public read-only catalog: domains, paths, courses, labs and exam simulations from `content/` | The full catalog (same search params, so links keep working) |
 | `/catalog/paths/:id` | A path or course: sections, labs, alignment disclaimer, related paths | Same page, site layout, "Start lab" goes straight to the lab |
 | `/catalog/exams/:id` | An exam simulation: format, rules, objectives and weights, report contents, retake policy. Never the pool task ids | Same page, "Open in the app" |
@@ -57,8 +57,8 @@ A deployment replaces the file without a code change: mount its own (for example
 ConfigMap) and point the gateway at it with `CT_SITE_CONFIG=/etc/cloudtrain/site.yaml`.
 The gateway validates the file at startup and refuses to start when it is invalid, listing
 the schema issues. Logos, favicons and screenshots are URLs or absolute paths served by the
-web app (`apps/web/public/`); the four default screenshots in `apps/web/public/site/` are
-copies that `apps/web/scripts/readme-shots.mjs` refreshes.
+web app (`apps/web/public/`); the default screenshots in `apps/web/public/site/` are real
+mock-mode captures (dark and light, WebP) that `apps/web/scripts/site-shots.mjs` refreshes.
 
 ### Reference
 
@@ -73,11 +73,15 @@ copies that `apps/web/scripts/readme-shots.mjs` refreshes.
 | `hero.eyebrow`, `hero.title`, `hero.subtitle` | title, subtitle | Landing page hero |
 | `hero.primaryCta`, `hero.secondaryCta` | | `{ label, to }`; `to: /sign-in` becomes "Go to dashboard" for signed-in visitors |
 | `hero.note` | | Small print under the buttons |
+| `hero.preview` | | `{ image, imageLight?, alt, width?, height? }`: the product screenshot beside the headline (`imageLight` serves the light and cream themes; the size reserves the space) |
+| `hero.proof` | | Up to 4 short attributes shown after the live figures (labs, domains, exam simulations from the catalog API) |
 | `highlightDomains` | yes | 1 to 6 domain ids shown on the landing page, in order (`kubernetes`, `linux`, `containers`, `iac`, `automation`, `networking`) |
-| `features[]` | yes | `{ icon, title, body }`; icons: `server`, `shield`, `graduation`, `flag`, `users`, `network`, `boxes`, `terminal`, `timer`, `check`, `sparkles`, `chart`, `lock`, `cloud`, `route`, `eye` |
-| `howItWorks[]` | yes | 2 to 6 numbered steps `{ title, body }` |
-| `screenshots[]` | | `{ image, alt, caption? }`; `image` is an absolute path under `apps/web/public` or a URL |
-| `faq[]` | yes | `{ q, a, group? }`; grouped under `group` headings in order of first appearance |
+| `features[]` | yes | Secondary capabilities `{ icon, title, body }`, listed after the differentiators; icons: `server`, `shield`, `graduation`, `flag`, `users`, `network`, `boxes`, `terminal`, `timer`, `check`, `sparkles`, `chart`, `lock`, `cloud`, `route`, `eye`, `user`, `building`, `target`, `layers` |
+| `howItWorks[]` | yes | 2 to 6 numbered steps `{ title, body, icon? }` |
+| `differentiators[]` | | 2 to 4 blocks `{ icon?, title, body, figure? }`; `figure` is a screenshot like `hero.preview` |
+| `showcase[]` | | 1 to 6 product views `{ title, body, why?, figure }` |
+| `audiences[]` | | 1 to 4 pathways `{ icon?, title, body, points?[], cta }` |
+| `faq[]` | yes | `{ q, a, group?, featured? }`; grouped under `group` headings in order of first appearance; the first six `featured` questions also appear on the landing page |
 | `about.title`, `about.paragraphs[]`, `about.facts[]` | title, paragraphs | About page; facts are `{ label, value }` pairs in a side card |
 | `contact.*` | `email` | `title`, `intro`, `email`, `salesEmail`, `phone`, `address[]`, `hours`, `links[]` |
 | `footer.columns[]` | yes | `{ title, links: [{ label, to, external? }] }`; links to pages a flag turned off are hidden |
@@ -93,6 +97,7 @@ copies that `apps/web/scripts/readme-shots.mjs` refreshes.
 | `flags.checkoutEnabled` | | Self-service checkout for paid plans (needs the gateway's billing integration); off turns `checkout` calls to action into contact |
 | `pricing.headline`, `pricing.intro`, `pricing.placeholderNote`, `pricing.contactCta`, `pricing.faqGroup` | | Pricing page copy; `placeholderNote` is shown while any price is a placeholder; `faqGroup` names the FAQ group listed under the plans |
 | `plans` | | See below |
+| `closing.title`, `closing.body`, `closing.primaryCta`, `closing.secondaryCta` | | The closing call to action on the landing page; the buttons default to the hero's |
 
 ### Plans
 
@@ -120,8 +125,9 @@ plans have one, that per-seat pricing stays on organisation plans, and that plac
 prices come with `pricing.placeholderNote`.
 
 Internal links (`to` starting with `/`) must be website routes; `lab-verify --strict`
-(`tools/lab-verify/src/site.mjs`) checks that, the highlighted domains, the images and the
-alignment notice, and fails CI otherwise. Validate locally with
+(`tools/lab-verify/src/site.mjs`) checks that, the highlighted domains, every screenshot
+(`hero.preview`, `differentiators[].figure`, `showcase[].figure`) and the alignment notice,
+and fails CI otherwise. Validate locally with
 `node tools/lab-verify/bin/lab-verify.mjs --strict`.
 
 ## Content rules
@@ -138,4 +144,7 @@ cream), `site-menu-phone`, `catalog-public` (+ `-domain`, `-phone`, light and cr
 `catalog-path-public`, `catalog-exam-public`, `pricing` (+ `-yearly`, `-phone`, light and
 cream), `about`, `faq`, `contact`, `legal-terms` and `site-signed-in`; `readme-shots.mjs`
 adds `docs/images/landing.png`, `catalog-public.png`, `catalog-path-public.png` and
-`pricing.png` and refreshes `apps/web/public/site/`.
+`pricing.png`. `apps/web/scripts/site-shots.mjs` captures the screenshots the website itself
+shows (`apps/web/public/site/*.webp`: the workspace after a validation run, the topology and
+checks crops, skills, an exam report and the team dashboard, each in dark and light) and
+prints their sizes for `width`/`height`.

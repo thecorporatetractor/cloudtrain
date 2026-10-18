@@ -1,7 +1,8 @@
 // Checks content/site.yaml (the public website configuration). Shape comes from the
 // Site JSON Schema in @cloudtrain/lab-schema; this file checks what the schema cannot:
 // highlighted domains that have labs, internal links that point at website routes,
-// screenshots that exist, and the alignment notice wherever frameworks could be named.
+// screenshots (hero preview, differentiators, showcase) that exist, and the alignment
+// notice wherever frameworks could be named.
 import { readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import path from "node:path";
@@ -40,6 +41,9 @@ export async function checkSite(file, ctx, findings) {
     ...(doc.hero.primaryCta ? [["/hero/primaryCta", doc.hero.primaryCta.to]] : []),
     ...(doc.hero.secondaryCta ? [["/hero/secondaryCta", doc.hero.secondaryCta.to]] : []),
     ...(doc.pricing?.contactCta ? [["/pricing/contactCta", doc.pricing.contactCta.to]] : []),
+    ...(doc.closing?.primaryCta ? [["/closing/primaryCta", doc.closing.primaryCta.to]] : []),
+    ...(doc.closing?.secondaryCta ? [["/closing/secondaryCta", doc.closing.secondaryCta.to]] : []),
+    ...(doc.audiences ?? []).map((a, ai) => [`/audiences/${ai}/cta`, a.cta.to]),
     ...doc.footer.columns.flatMap((c, ci) => c.links.map((l, li) => [`/footer/columns/${ci}/links/${li}`, l.to])),
     ...(doc.contact.links ?? []).map((l, li) => [`/contact/links/${li}`, l.to]),
   ];
@@ -52,9 +56,18 @@ export async function checkSite(file, ctx, findings) {
   }
 
   // Absolute image paths are served from apps/web/public; URLs are not checked.
-  for (const [i, s] of (doc.screenshots ?? []).entries()) {
-    if (s.image.startsWith("/") && !existsSync(path.join(ctx.repoRoot, "apps/web/public", s.image))) err(`/screenshots/${i}/image`, `screenshot '${s.image}' is not in apps/web/public`);
+  const figures = [
+    ...(doc.hero.preview ? [["/hero/preview", doc.hero.preview]] : []),
+    ...(doc.differentiators ?? []).flatMap((d, i) => (d.figure ? [[`/differentiators/${i}/figure`, d.figure]] : [])),
+    ...(doc.showcase ?? []).map((s, i) => [`/showcase/${i}/figure`, s.figure]),
+  ];
+  for (const [p, f] of figures) {
+    for (const k of ["image", "imageLight"]) {
+      const img = f[k];
+      if (img && img.startsWith("/") && !existsSync(path.join(ctx.repoRoot, "apps/web/public", img))) err(`${p}/${k}`, `screenshot '${img}' is not in apps/web/public`);
+    }
   }
+  if ((doc.faq ?? []).filter((f) => f.featured).length > 6) warn("/faq", "more than six featured questions; the landing page shows the first six");
   for (const [k, img] of Object.entries({ logo: doc.brand.logo, logoDark: doc.brand.logoDark, favicon: doc.brand.favicon })) {
     if (img && img.startsWith("/") && !existsSync(path.join(ctx.repoRoot, "apps/web/public", img))) err(`/brand/${k}`, `'${img}' is not in apps/web/public`);
   }
