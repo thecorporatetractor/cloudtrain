@@ -312,7 +312,7 @@ State at the end of round 5. Everything below is `built` (static checks only: la
 | 1 | #58 | 23 (12 xcd tasks, 11 learning) | merged |
 | 2 | #63 | 21 (16 xct Podman tasks, 5 learning) | merged |
 | 3 | #87 | 23 (Compose, networking, storage), commit 397395c | merged |
-| 4 | #114 | 25 (registries, security, supply chain, 4 xpe tasks) | NOT merged: review round 3 not approved |
+| 4 | #114 | 25 (registries, security, supply chain, 4 xpe tasks) | merged (review findings below carried as follow-ups if not fixed in the PR) |
 
 Pools: sim-containers-docker and sim-containers-podman are at 2x their draw. The sim-platform-engineer containers-delivery pool is 4/2 once #114 merges.
 
@@ -359,6 +359,50 @@ Every containers lab is a `jumphost:1` workstation pod plus one `docker-vm:29` K
 - infra-blocked: `ctr-macvlan-encoder` (second NIC).
 - unconfirmed-behaviour, verify last: the remaining wave 1 and 3 items in the table above.
 - Exam reboot pass of `sim-containers-docker` and `sim-containers-podman` is not part of `labctl verify`.
+
+## Round 5, wave 4 (branch `content/containers-r5-w4`, PR #114): registries, security, supply chain, plus the sim-platform-engineer containers pool, 24 items
+
+All 24 marked `built` (never run live: every lab is a workstation plus one `docker-vm:29` VM). New courses in `pack.yaml`: `ctr-registry-run`, `ctr-registry-distribute`, `ctr-sec-runtime`, `ctr-sec-scan`, `ctr-sec-supply`.
+
+| Group | Labs |
+|---|---|
+| Registries (5) | `ctr-local-registry-tls`, `ctr-registry-gc`, `ctr-offline-mirror`, `ctr-skopeo-copy-airgap`, `ctr-oci-artifacts-referrers` |
+| Runtime least privilege / engine hardening (6) | `ctr-cap-drop-readonly`, `ctr-socket-escape`, `ctr-remote-engine-ssh`, `ctr-rootless-engine`, `ctr-seccomp-profile`, `ctr-cis-bench` |
+| Scanning, policy, hardened bases (5) | `ctr-scan-triage-vex`, `ctr-scout-policy`, `ctr-leaked-secret-history`, `ctr-hardened-base-migration`, `ctr-dhi-vex-reconcile` |
+| Attestations and signatures (5) | `ctr-sbom-provenance`, `ctr-content-trust-retired`, `ctr-cosign-sign-verify`, `ctr-notation-sign-verify`, `ctr-signed-only-gate` |
+| Exam tasks (4), sim-platform-engineer `ct-platform:containers-delivery` now 4/2 | `xpe-image-build-push`, `xpe-image-slim-fix`, `xpe-compose-local-stack`, `xpe-image-sign-verify` |
+
+### Recipes and substitutions
+
+- **Registry recipes** (`ctr-local-registry-tls`, `ctr-registry-gc`): `REGISTRY_STORAGE_DELETE_ENABLED=true`, then `registry garbage-collect /etc/distribution/config.yml` inside the container; measured with `du -sk`. `ctr-offline-mirror`: a local `registry:3` under `library/` plays the Hub mirror (`registry-mirrors` + `insecure-registries`, merged into `daemon.json` with `jq`); ghcr references are rewritten to `registry.copperleaf.example:5000/ghcr/...` since a mirror only covers Docker Hub. `ctr-skopeo-copy-airgap`: two `registry:3` containers on different ports, `skopeo copy --all --preserve-digests` to `oci-archive:` on `/srv/transfer`.
+- **OCI referrers** (`ctr-oci-artifacts-referrers`): no `oras` on the image, so the artifact manifest (empty config, one tar layer, `subject` pointing at the image manifest) is pushed with `curl` against the registry blob/manifest API, and `registry:3` (distribution 3.1.2) does NOT serve `GET /v2/<repo>/referrers/<digest>` (a local smoke test returned 404 even after a subject manifest was pushed; an earlier note claiming otherwise was wrong). The lab therefore uses the OCI tag-schema fallback: an image index listing the artifact is pushed under the tag `sha256-<hex>` of the subject digest and read back from there. Blob PUTs must send `Content-Type: application/octet-stream` (curl's form-urlencoded default makes distribution fail with `DIGEST_INVALID`). The cosign and xpe sign labs likewise find signatures by the `sha256-<hex>.sig` tag, not the referrers API.
+- **Least privilege** (`ctr-cap-drop-readonly`, `ctr-seccomp-profile`): `--cap-drop ALL --cap-add NET_BIND_SERVICE`, `--security-opt no-new-privileges`, `--read-only --tmpfs /tmp`; `Docker sets `net.ipv4.ip_unprivileged_port_start=0` inside containers, so `ctr-cap-drop-readonly` pins the sysctl to 1024 (the recreated run must keep it) to make `NET_BIND_SERVICE` matter. `ctr-seccomp-profile` ships a Copperleaf baseline profile (`/usr/share/copperleaf/seccomp-default.json`, allow-by-default plus a deny list; the engine's embedded default is not on disk) that the learner extends with errno rules for `mount`/`ptrace`/`keyctl`; the checks are behavioural (`ocr-selftest` ptrace, keyctl and add_key probes), so a profile that discards the baseline fails `baseline-kept`.
+- **Socket proxy** (`ctr-socket-escape`): reuses the wave-1 `copperleaf/socket-proxy:1` recipe (nginx allowlist for `GET /containers/json` and `/_ping`). Written as an explain-the-risk-then-remediate lab (name what a read-write socket mount is worth, then redeploy behind the proxy) rather than a step-by-step host-escape walkthrough, to keep the exercise appropriately scoped while covering the same `containers.runtime-security.daemon-socket` skill.
+- **Remote engine** (`ctr-remote-engine-ssh`): a systemd drop-in (`docker.service.d/listen.conf`) removes the TCP listener instead of editing the shipped unit; the whole lab runs on the VM because `jumphost:1` has no docker CLI or sudo and a dash `/bin/sh`: setup creates `learner`'s key pair, the learner appends the public key to `operator`'s `authorized_keys` with sudo, puts identity and host-key settings in `~/.ssh/config` and creates the context `ssh://operator@localhost`; the check runs `docker --context` as `learner`.
+- **Rootless engine** (`ctr-rootless-engine`): `loginctl enable-linger` (then wait for `/run/user/<uid>/bus`) + `dockerd-rootless-setuptool.sh install` as a systemd user unit, steps with `timeoutSec: 300`; the alternative uses `sudo -iu` (no `systemd-container`/`machinectl` on the image); the image is `docker load`ed into the rootless engine's separate store from a tarball, since it cannot see the rootful engine's images.
+- **Hardening audit** (`ctr-cis-bench`): no CIS benchmark tool on the image. Adapted into `/usr/local/bin/cl-docker-audit`, a Copperleaf script implementing five daemon/container checks (`live-restore`, `userland-proxy`, `icc`, privileged containers, `daemon.json` permissions); retitled without "CIS".
+- **Leaked secret** (`ctr-leaked-secret-history`): the mock key service is a `python http.server` systemd unit with a `/revoke/<key>` endpoint and a `/status/<key>` check.
+- **Hardened base + VEX, without cosign** (`ctr-hardened-base-migration`, `ctr-dhi-vex-reconcile`): the vendor SBOM/VEX for the hardened base is signed and verified with a plain `openssl dgst -sign`/`-verify` RSA signature instead of cosign, so both labs are fully writable today (not blocked) despite the wave notes flagging the hardened-base + signed-SBOM combination as needing cosign.
+- **SBOM/provenance** (`ctr-sbom-provenance`, BLOCKED): `docker buildx build --sbom=true --provenance=mode=max --push`; `--sbom=true` makes BuildKit pull `docker/buildkit-syft-scanner`, which the VM does not have and cannot fetch offline (mode=max provenance alone works). Provenance is checked via `.SLSA.buildConfig` only (so mode=min fails) and with `docker buildx imagetools inspect --format '{{json .Provenance}}'` (the space inside the template keeps the lab templater from treating it as a parameter) and the registry's attestation-manifest referrer.
+- **Scan labs without a scanner**: `ctr-scan-triage-vex` and `ctr-scout-policy` build their old and fixed bases in setup from the preloaded `alpine:3.22` as `copperleaf/pybase:1.0` / `:1.1` (marker `/etc/pybase-release`), since `python:3.11-alpine` is not preloaded; no fabricated scan report. Even with a scanner added, the offline DB must carry fixture advisories for `pybase:1.0` and the random `CVE-2024-<cve>`.
+- **xpe Quillmoor topology**: all four tasks share the k8s xpe tasks' `workstation` node (`jumphost:1`) byte for byte, plus a new node `qm-docker-1` (`docker-vm:29`, 2 vCPU/2 GiB), identical across the four. The lab registry is `registry:3` on `qm-docker-1` as `registry.quillmoor.example:5443` (TLS, a hosts entry on that VM only; the k8s tasks use the bare hostname as a non-pullable name, so this does not clash). `xpe-compose-local-stack` uses `redis:7.4-alpine` for the database, per the wave notes (no offline PostgreSQL) and sets `restart: unless-stopped` so the stack survives an engine restart and a reboot. To avoid collisions on the shared exam host each registry-using task has its own directory and repo (`~/exam/tracking-build` / `tracking-api-build`, `~/exam/tracking-sign` / `tracking-api-sign`), and all registry-using setups share one create-if-absent CA + registry block (never deleted) with a persistent data directory.
+
+### Blockers (written against the intended tools, marked built, blocker noted per lab in `curriculum.yaml`)
+
+| Lab | Blocker |
+|---|---|
+| `ctr-scan-triage-vex`, `ctr-scout-policy` | no trivy/grype/scout and no offline vulnerability database on `docker-vm:29` |
+| `ctr-content-trust-retired`, `ctr-cosign-sign-verify`, `xpe-image-sign-verify` | no `cosign` on `docker-vm:29` (setup writes a `NOTE.txt` in its place) |
+| `ctr-notation-sign-verify`, `ctr-signed-only-gate` | no `notation` CLI on `docker-vm:29` |
+| `ctr-sbom-provenance`, `ctr-signed-only-gate`, `xpe-image-sign-verify` | `--sbom=true` needs the `docker/buildkit-syft-scanner` image, not preloaded and not fetchable offline |
+
+Image wishlist for the next `docker-vm:29` rebuild (adds to the existing wave 1/2/3 wishlist): `trivy` or `grype` plus a mirrored offline vulnerability database (with fixture advisories for `copperleaf/pybase:1.0` and the random CVE ids; the scan labs need more than just a scanner), `cosign` (v2 CLI), `notation` CLI, and the `docker/buildkit-syft-scanner` image preloaded. `systemd-container` (machinectl) is not needed.
+
+### Verify queue additions
+
+Wave 4 after waves 1-3 (and wave 2 once `el-vm:10` Podman is confirmed): the writable-today registries and least-privilege/hardening labs first (shortest, fewest moving parts), then `ctr-leaked-secret-history`, `ctr-hardened-base-migration`, `ctr-dhi-vex-reconcile`; `ctr-sbom-provenance`, the cosign/notation-blocked labs and `xpe-image-sign-verify` wait for the image rebuild. First live runs should also confirm: BuildKit using `registry-mirrors` with the containerd store (`ctr-offline-mirror`), the notation `key add`/`policy import` syntax, and the v1 vs v0.2 provenance field in `ctr-sbom-provenance`. The three writable xpe tasks (`xpe-image-build-push`, `xpe-image-slim-fix`, `xpe-compose-local-stack`) verify as a set since they share `qm-docker-1`.
+
+`labctl exam compile --allow-missing sim-platform-engineer` still fails (pre-existing, confirmed present on `origin/main` before this wave): the iac/ansible xpe tasks' `workstation` node (`terraform-ws:1.15` / an ansible control image) differs from the k8s and containers xpe tasks' `workstation` node (`jumphost:1`). Not fixed in this PR (cross-domain node-sharing decision); flagged for whichever domain's wave reconciles the `sim-platform-engineer` shared nodes.
 
 ## Open questions for the user
 

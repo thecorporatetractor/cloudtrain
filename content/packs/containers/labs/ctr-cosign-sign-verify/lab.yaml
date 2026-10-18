@@ -1,0 +1,162 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-cosign-sign-verify
+  title: Sign the catalogue release by digest
+  domain: containers
+  frameworks: [docker-practitioner:supply-chain]
+  difficulty: hard
+  estimatedMinutes: 20
+  tags: [docker, cosign, signing, registry]
+  version: 1
+spec:
+  description: |
+    On **`cl-catalogue-06`** (`ssh cl-catalogue-06`) `catalogue-api:{{rel}}` is built and
+    pushed to `localhost:5000/catalogue-api:{{rel}}`. Copperleaf's release key pair is at
+    `~/release/release.key` / `~/release/release.pub` (empty password).
+
+    1. **Sign** the pushed image's **digest** (not the tag) with `release.key`.
+    2. **Verify** the signature with `release.pub` and save the output to
+       **`~/release/verify.txt`**.
+    3. The signature must be stored **in the registry next to that digest** (this registry
+       has no referrers API, so a cosign signature is found by its tag-schema name
+       `sha256-<hex>.sig`). `catalogue-api:{{rel}}-prev`, last release, must stay unsigned.
+  objectives:
+    - Sign an image digest with cosign
+    - Verify a signature against the matching public key
+    - Confirm the signature is stored in the registry for exactly that digest
+  params:
+    rel:
+      type: int
+      min: 100
+      max: 899
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-catalogue-06
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-catalogue-06
+      timeoutSec: 300
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        docker rm -f registry >/dev/null 2>&1 || true
+        rm -rf /srv/registry; install -d /srv/registry
+        docker run -d --name registry --restart always -p 127.0.0.1:5000:5000 -v /srv/registry:/var/lib/registry registry:3 >/dev/null
+        for i in $(seq 30); do curl -fs http://127.0.0.1:5000/v2/ >/dev/null && break; sleep 1; done
+        d=$(mktemp -d)
+        printf '%s\n' 'FROM busybox:1.37' 'RUN echo "catalogue-api {{rel}}" > /version' 'CMD ["cat", "/version"]' > "$d/Dockerfile"
+        docker build -q --provenance=false --sbom=false -t localhost:5000/catalogue-api:{{rel}} "$d" >/dev/null
+        docker push -q localhost:5000/catalogue-api:{{rel}} >/dev/null
+        printf '%s\n' 'FROM busybox:1.37' 'RUN echo "catalogue-api previous release" > /version' 'CMD ["cat", "/version"]' > "$d/Dockerfile"
+        docker build -q --provenance=false --sbom=false -t localhost:5000/catalogue-api:{{rel}}-prev "$d" >/dev/null
+        docker push -q localhost:5000/catalogue-api:{{rel}}-prev >/dev/null
+        rm -rf "$d"
+        s=/home/learner/release
+        install -d -o learner -g learner "$s"
+        if command -v cosign >/dev/null 2>&1; then
+          (cd "$s" && COSIGN_PASSWORD='' cosign generate-key-pair --output-key-prefix release >/dev/null 2>&1)
+        else
+          printf '%s\n' 'cosign is not installed on this host image, so no key pair could be created.' > "$s/NOTE.txt"
+        fi
+        chown -R learner:learner "$s"
+  checks:
+    - id: signature-exists
+      description: The image digest has a cosign signature stored in the registry (sha256-<hex>.sig)
+      type: shell
+      timeoutSec: 60
+      on: cl-catalogue-06
+      skills: [containers.supply-chain.signing]
+      weight: 3
+      command: |
+        A='Accept: application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json'
+        d=$(curl -fsSI -H "$A" http://127.0.0.1:5000/v2/catalogue-api/manifests/{{rel}} | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}')
+        [ -n "$d" ] || { echo no-image; exit 0; }
+        t=$(echo "$d" | sed 's/:/-/')
+        tagged=$(curl -s -o /dev/null -w '%{http_code}' -H "$A" "http://127.0.0.1:5000/v2/catalogue-api/manifests/$t.sig")
+        if [ "$tagged" = 200 ]; then echo found; else echo "tagged=$tagged"; fi
+      expect: {match: exact, value: found}
+    - id: signature-verifies
+      description: The signature verifies against release.pub
+      type: shell
+      timeoutSec: 90
+      on: cl-catalogue-06
+      skills: [containers.supply-chain.signing]
+      weight: 3
+      command: |
+        cosign verify --key /home/learner/release/release.pub --insecure-ignore-tlog=true --allow-insecure-registry localhost:5000/catalogue-api:{{rel}} >/dev/null 2>&1 && echo verified || echo not-verified
+      expect: {match: exact, value: verified}
+    - id: verification-recorded
+      description: verify.txt holds the successful verification output
+      type: shell
+      timeoutSec: 60
+      on: cl-catalogue-06
+      skills: [containers.supply-chain.signing]
+      weight: 1.5
+      command: grep -q 'docker-manifest-digest\|Verified OK' /home/learner/release/verify.txt 2>/dev/null && echo recorded || echo missing
+      expect: {match: exact, value: recorded}
+  hints:
+    - title: Sign the digest, not the moving tag
+      body: "Resolve the pushed tag to its digest (a HEAD request or `docker inspect` after a pull) and sign `repo@sha256:...`, not `repo:tag`, so the signature always names one exact manifest."
+      cost: 1
+    - title: No transparency log in a lab registry
+      body: "This plain-HTTP, no-login registry has no Rekor transparency log reachable; pass `--tlog-upload=false` when signing and `--insecure-ignore-tlog=true --allow-insecure-registry` when verifying."
+      cost: 1
+  misconceptions:
+    - id: signed-wrong-digest
+      description: Signs the previous release's digest (the tag it had open in another terminal) instead of the one just pushed.
+      feedback: "A signature names one exact digest. Resolve the digest of the image you just pushed ({{rel}}), and sign that one, not a neighbouring tag."
+      expectFail: [signature-exists, signature-verifies]
+      mutation:
+        on: cl-catalogue-06
+        as: learner
+        run: |
+          cd ~/release
+          d=$(curl -fsSI -H 'Accept: application/vnd.oci.image.manifest.v1+json' http://127.0.0.1:5000/v2/catalogue-api/manifests/{{rel}}-prev | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}')
+          COSIGN_PASSWORD='' cosign sign --key release.key --tlog-upload=false --allow-insecure-registry --yes "localhost:5000/catalogue-api@$d"
+          cosign verify --key release.pub --insecure-ignore-tlog=true --allow-insecure-registry "localhost:5000/catalogue-api@$d" > verify.txt 2>&1 || true
+    - id: verify-without-save
+      description: Verifies successfully but never saves the output.
+      feedback: "The task asks you to keep a record of the successful verification; redirect cosign verify's output into verify.txt."
+      expectFail: [verification-recorded]
+      mutation:
+        on: cl-catalogue-06
+        as: learner
+        run: |
+          cd ~/release
+          d=$(curl -fsSI -H 'Accept: application/vnd.oci.image.manifest.v1+json' http://127.0.0.1:5000/v2/catalogue-api/manifests/{{rel}} | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}')
+          COSIGN_PASSWORD='' cosign sign --key release.key --tlog-upload=false --allow-insecure-registry --yes "localhost:5000/catalogue-api@$d"
+          cosign verify --key release.pub --insecure-ignore-tlog=true --allow-insecure-registry "localhost:5000/catalogue-api@$d" >/dev/null
+  solution:
+    explanation: |
+      Resolve the pushed tag to its digest, sign that exact digest with the release key
+      (skipping the transparency log the lab registry cannot reach), then verify with
+      the public key and keep the output.
+    steps:
+      - on: cl-catalogue-06
+        as: learner
+        run: |
+          cd ~/release
+          d=$(curl -fsSI -H 'Accept: application/vnd.oci.image.manifest.v1+json' http://127.0.0.1:5000/v2/catalogue-api/manifests/{{rel}} | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}')
+          COSIGN_PASSWORD='' cosign sign --key release.key --tlog-upload=false --allow-insecure-registry --yes "localhost:5000/catalogue-api@$d"
+          cosign verify --key release.pub --insecure-ignore-tlog=true --allow-insecure-registry "localhost:5000/catalogue-api@$d" | tee verify.txt
+    alternatives:
+      - id: verify-by-tag
+        description: Verify against the tag afterward, which cosign resolves to the same signed digest.
+        steps:
+          - on: cl-catalogue-06
+            as: learner
+            run: |
+              cd ~/release
+              d=$(curl -fsSI -H 'Accept: application/vnd.oci.image.manifest.v1+json' http://127.0.0.1:5000/v2/catalogue-api/manifests/{{rel}} | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}')
+              COSIGN_PASSWORD='' cosign sign --key release.key --tlog-upload=false --allow-insecure-registry --yes "localhost:5000/catalogue-api@$d"
+              cosign verify --key release.pub --insecure-ignore-tlog=true --allow-insecure-registry localhost:5000/catalogue-api:{{rel}} | tee verify.txt

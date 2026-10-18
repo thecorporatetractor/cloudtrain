@@ -1,0 +1,162 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xpe-image-sign-verify
+  title: Sign the release image and attach its SBOM
+  domain: containers
+  frameworks: [ct-platform:containers-delivery]
+  difficulty: hard
+  estimatedMinutes: 20
+  tags: [exam, docker, cosign, sbom, registry]
+  version: 1
+spec:
+  description: |
+    **Host:** `qm-docker-1` (`ssh qm-docker-1`)
+
+    `tracking-api-sign:{{ver}}` is built and pushed to
+    `registry.quillmoor.example:5443/tracking-api-sign:{{ver}}`. The platform key pair is at
+    `~/exam/release-keys/platform.key` / `platform.pub` (empty password).
+
+    1. Build (or rebuild) the image with an **SBOM** attestation attached.
+    2. **Sign** the pushed digest with `platform.key`.
+    3. Leave both the SBOM (an attestation manifest inside the image index) and the
+       signature (stored next to the digest) in the lab registry, which has no referrers
+       API.
+    4. Verification with `platform.pub` must **succeed**.
+  objectives:
+    - Attach an SBOM attestation at build time
+    - Sign an image digest with the platform key pair
+    - Confirm both attestations are stored with the digest and verification succeeds
+  params:
+    ver:
+      type: int
+      min: 100
+      max: 899
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-docker-1
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: qm-docker-1
+      timeoutSec: 420
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        grep -q ' registry.quillmoor.example' /etc/hosts || echo '127.0.0.1 registry.quillmoor.example' >> /etc/hosts
+        r=/srv/exam/registry; mkdir -p "$r/certs" "$r/data"
+        if [ ! -f "$r/certs/server.crt" ]; then
+          cd "$r/certs"
+          openssl req -x509 -newkey rsa:2048 -nodes -keyout ca.key -out ca.crt -days 30 -subj "/CN=Quillmoor exam CA" 2>/dev/null
+          openssl req -newkey rsa:2048 -nodes -keyout server.key -out server.csr -subj "/CN=registry.quillmoor.example" 2>/dev/null
+          printf 'subjectAltName=DNS:registry.quillmoor.example\nextendedKeyUsage=serverAuth\n' > ext.cnf
+          openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out server.crt -days 30 -extfile ext.cnf 2>/dev/null
+          chmod 0644 server.key; rm -f server.csr ext.cnf ca.srl ca.key
+        fi
+        install -D -m 0644 "$r/certs/ca.crt" /etc/docker/certs.d/registry.quillmoor.example:5443/ca.crt
+        docker inspect qm-exam-registry >/dev/null 2>&1 || docker run -d --name qm-exam-registry --restart always -p 5443:5443 -v "$r/certs:/certs:ro" -v "$r/data:/var/lib/registry" \
+          -e REGISTRY_HTTP_ADDR=0.0.0.0:5443 -e REGISTRY_HTTP_TLS_CERTIFICATE=/certs/server.crt -e REGISTRY_HTTP_TLS_KEY=/certs/server.key registry:3 >/dev/null
+        docker start qm-exam-registry >/dev/null 2>&1 || true
+        for i in $(seq 30); do curl -fs --cacert "$r/certs/ca.crt" https://registry.quillmoor.example:5443/v2/ >/dev/null && break; sleep 1; done
+        s=/home/learner/exam/tracking-sign
+        rm -rf "$s"; install -d -o learner -g learner /home/learner/exam "$s"
+        printf '%s\n' 'FROM busybox:1.37' "RUN echo 'tracking-api {{ver}}' > /version" 'CMD ["cat", "/version"]' > "$s/Dockerfile"
+        chown -R learner:learner "$s"
+        docker build -q --provenance=false --sbom=false -t registry.quillmoor.example:5443/tracking-api-sign:{{ver}} "$s" >/dev/null
+        docker push -q registry.quillmoor.example:5443/tracking-api-sign:{{ver}} >/dev/null
+        k=/home/learner/exam/release-keys
+        install -d -o learner -g learner "$k"
+        if command -v cosign >/dev/null 2>&1; then
+          (cd "$k" && COSIGN_PASSWORD='' cosign generate-key-pair --output-key-prefix platform >/dev/null 2>&1)
+        else
+          printf '%s\n' 'cosign is not installed on this host image, so no key pair could be created.' > "$k/NOTE.txt"
+        fi
+        chown -R learner:learner "$k"
+  checks:
+    - id: sbom-attached
+      description: The pushed image carries an SBOM attestation
+      type: shell
+      timeoutSec: 60
+      on: qm-docker-1
+      skills: [k8s.security.sbom]
+      weight: 2.5
+      command: |
+        ca=/srv/exam/registry/certs/ca.crt
+        A='Accept: application/vnd.oci.image.index.v1+json,application/vnd.oci.image.manifest.v1+json'
+        idx=$(curl -fsS --cacert "$ca" -H "$A" https://registry.quillmoor.example:5443/v2/tracking-api-sign/manifests/{{ver}} 2>/dev/null) || { echo no-image; exit 0; }
+        att=$(echo "$idx" | jq -r '[(.manifests // [])[] | select(.annotations["vnd.docker.reference.type"] == "attestation-manifest") | .digest][0] // empty')
+        [ -n "$att" ] || { echo no-attestation; exit 0; }
+        curl -fsS --cacert "$ca" -H "$A" "https://registry.quillmoor.example:5443/v2/tracking-api-sign/manifests/$att" 2>/dev/null \
+          | jq -r 'if ([.layers[]? | .annotations["in-toto.io/predicate-type"] // ""] | any(test("spdx"))) then "spdx-sbom" else "no-sbom" end'
+      expect: {match: exact, value: spdx-sbom}
+    - id: signature-verifies
+      description: The release digest's signature verifies against platform.pub
+      type: shell
+      timeoutSec: 90
+      on: qm-docker-1
+      skills: [k8s.security.image-signing]
+      weight: 3.5
+      command: |
+        cosign verify --key /home/learner/exam/release-keys/platform.pub --insecure-ignore-tlog=true --allow-insecure-registry registry.quillmoor.example:5443/tracking-api-sign:{{ver}} >/dev/null 2>&1 && echo verified || echo not-verified
+      expect: {match: exact, value: verified}
+  solution:
+    explanation: |
+      Build with an SBOM attestation and push, resolve the exact pushed digest, and sign
+      it with the platform key so that verification with the matching public key
+      succeeds and both attestations are stored as referrers.
+    steps:
+      - on: qm-docker-1
+        as: learner
+        run: |
+          cd ~/exam/tracking-sign
+          docker buildx build --sbom=true --provenance=false --push -t registry.quillmoor.example:5443/tracking-api-sign:{{ver}} .
+          ca=/srv/exam/registry/certs/ca.crt
+          d=$(curl -fsSI --cacert "$ca" -H 'Accept: application/vnd.oci.image.manifest.v1+json,application/vnd.oci.image.index.v1+json' https://registry.quillmoor.example:5443/v2/tracking-api-sign/manifests/{{ver}} | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}')
+          cd ~/exam/release-keys
+          COSIGN_PASSWORD='' cosign sign --key platform.key --tlog-upload=false --allow-insecure-registry --yes "registry.quillmoor.example:5443/tracking-api-sign@$d"
+          cosign verify --key platform.pub --insecure-ignore-tlog=true --allow-insecure-registry registry.quillmoor.example:5443/tracking-api-sign:{{ver}}
+    alternatives:
+      - id: sign-then-check-referrers
+        description: Sign first, then independently confirm the SBOM attestation is present.
+        steps:
+          - on: qm-docker-1
+            as: learner
+            run: |
+              cd ~/exam/tracking-sign
+              docker buildx build --sbom=true --provenance=false --push -t registry.quillmoor.example:5443/tracking-api-sign:{{ver}} .
+              ca=/srv/exam/registry/certs/ca.crt
+              d=$(curl -fsSI --cacert "$ca" -H 'Accept: application/vnd.oci.image.manifest.v1+json,application/vnd.oci.image.index.v1+json' https://registry.quillmoor.example:5443/v2/tracking-api-sign/manifests/{{ver}} | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}')
+              cd ~/exam/release-keys
+              COSIGN_PASSWORD='' cosign sign --key platform.key --tlog-upload=false --allow-insecure-registry --yes "registry.quillmoor.example:5443/tracking-api-sign@$d"
+              cosign verify --key platform.pub --insecure-ignore-tlog=true --allow-insecure-registry "registry.quillmoor.example:5443/tracking-api-sign@$d"
+  misconceptions:
+    - id: signed-without-sbom
+      description: Signs the image but builds without the SBOM attestation.
+      feedback: "The task asks for both an SBOM and a signature. Build with --sbom=true so the attestation is attached before, or alongside, signing."
+      expectFail: [sbom-attached]
+      mutation:
+        on: qm-docker-1
+        as: learner
+        run: |
+          ca=/srv/exam/registry/certs/ca.crt
+          d=$(curl -fsSI --cacert "$ca" -H 'Accept: application/vnd.oci.image.manifest.v1+json,application/vnd.oci.image.index.v1+json' https://registry.quillmoor.example:5443/v2/tracking-api-sign/manifests/{{ver}} | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}')
+          cd ~/exam/release-keys
+          COSIGN_PASSWORD='' cosign sign --key platform.key --tlog-upload=false --allow-insecure-registry --yes "registry.quillmoor.example:5443/tracking-api-sign@$d"
+    - id: sbom-without-signing
+      description: Attaches the SBOM but never signs the digest.
+      feedback: "Without a signature there is nothing to verify with the platform's public key. Sign the exact pushed digest with platform.key."
+      expectFail: [signature-verifies]
+      mutation:
+        on: qm-docker-1
+        as: learner
+        run: |
+          cd ~/exam/tracking-sign
+          docker buildx build --sbom=true --provenance=false --push -t registry.quillmoor.example:5443/tracking-api-sign:{{ver}} .

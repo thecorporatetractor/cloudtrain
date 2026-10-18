@@ -1,0 +1,199 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-cis-bench
+  title: Fix the failing host-audit checks on the transcoder host
+  domain: containers
+  frameworks: [dca-legacy:security, docker-practitioner:security]
+  difficulty: hard
+  estimatedMinutes: 30
+  tags: [docker, security, audit, hardening, daemon-config]
+  version: 1
+spec:
+  description: |
+    Copperleaf's platform team ships `/usr/local/bin/cl-docker-audit`, a small benchmark
+    script that checks five engine- and container-hardening settings against their
+    hardening guide and exits non-zero per failing check. On **`cl-transcode-03`**
+    (`ssh cl-transcode-03`; you are in the `docker` group and have `sudo`), an audit
+    ticket lists five findings from the last run. Fix all five so a rerun of
+    `cl-docker-audit` reports every check as **PASS**:
+
+    1. The engine's **live restore** setting is off (containers should keep running
+       across a dockerd restart).
+    2. The engine's **userland proxy** is on (it should be disabled; the kernel-level
+       proxying is enough and the userland proxy is unneeded attack surface).
+    3. The container **`legacy-encoder`** runs with `--privileged`.
+    4. The container **`metrics-sidecar`** has its default **bridge** network's
+       inter-container communication enabled on the host (`icc` should be off at the
+       engine level).
+    5. `/etc/docker/daemon.json` is **world-writable**.
+
+    Containers `legacy-encoder` and `metrics-sidecar` must stay running after your fix.
+  objectives:
+    - Read and act on engine- and container-level hardening settings
+    - Tell daemon-level settings from per-container run flags
+    - Verify a fix with a repeatable audit script instead of ad-hoc commands
+  params:
+    findingId:
+      type: int
+      min: 10000
+      max: 99999
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-transcode-03
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-transcode-03
+      timeoutSec: 420
+      run: |
+        set -eu
+        usermod -aG docker learner
+        cat > /usr/local/bin/cl-docker-audit <<'SH'
+        #!/bin/sh
+        # Copperleaf engine and container hardening audit.
+        set -u
+        echo "ticket {{findingId}}"
+        fail=0
+        check() { if eval "$2"; then echo "PASS $1"; else echo "FAIL $1"; fail=1; fi; }
+        d() { jq -r "$1" /etc/docker/daemon.json 2>/dev/null; }
+        check "live-restore enabled"      '[ "$(d ".\"live-restore\"")" = "true" ] && [ "$(docker info --format json 2>/dev/null | jq -r ".LiveRestoreEnabled")" = "true" ]'
+        check "userland-proxy disabled"   '[ "$(d ".\"userland-proxy\"")" = "false" ]'
+        check "icc disabled on bridge"    '[ "$(d ".icc")" = "false" ]'
+        check "no privileged containers"  '[ "$(docker ps -aq | xargs -r docker inspect 2>/dev/null | jq -s "[.[][] | select(.HostConfig.Privileged == true)] | length")" = "0" ]'
+        check "daemon.json not world-writable" '[ -z "$(find /etc/docker/daemon.json -perm -o+w)" ]'
+        exit $fail
+        SH
+        chmod 0755 /usr/local/bin/cl-docker-audit
+        echo '{ "icc": true }' > /etc/docker/daemon.json
+        chmod 0666 /etc/docker/daemon.json
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        docker rm -f legacy-encoder metrics-sidecar >/dev/null 2>&1 || true
+        docker run -d --name legacy-encoder --privileged --restart unless-stopped busybox:1.37 sleep infinity >/dev/null
+        docker run -d --name metrics-sidecar --restart unless-stopped busybox:1.37 sleep infinity >/dev/null
+  checks:
+    - id: audit-passes
+      description: cl-docker-audit reports every check as PASS
+      type: shell
+      timeoutSec: 60
+      on: cl-transcode-03
+      skills: [containers.runtime-security.benchmark]
+      weight: 4
+      command: |
+        out=$(cl-docker-audit 2>&1); echo "$(echo "$out" | head -n 1) fails=$(echo "$out" | grep -c '^FAIL')"
+      expect: {match: exact, value: "ticket {{findingId}} fails=0"}
+    - id: live-restore-active
+      description: The running engine (not just the file) has live restore enabled
+      type: shell
+      timeoutSec: 60
+      on: cl-transcode-03
+      skills: [containers.runtime-security.benchmark]
+      weight: 1
+      command: docker info --format json 2>/dev/null | jq -r '.LiveRestoreEnabled'
+      expect: {match: exact, value: "true"}
+    - id: containers-still-up
+      description: Both containers are still running after the fix
+      type: shell
+      timeoutSec: 60
+      on: cl-transcode-03
+      skills: [containers.runtime-security.benchmark]
+      weight: 2
+      command: docker ps -a --filter name=legacy-encoder --filter name=metrics-sidecar --format json | jq -r 'select(.State == "running") | .Names' | sort | tr '\n' ' '
+      expect: {match: exact, value: "legacy-encoder metrics-sidecar "}
+    - id: not-privileged
+      description: legacy-encoder no longer runs privileged
+      type: shell
+      timeoutSec: 60
+      on: cl-transcode-03
+      skills: [containers.runtime-security.benchmark, containers.runtime-security.least-privilege]
+      weight: 1.5
+      command: docker inspect legacy-encoder 2>/dev/null | jq -r '.[0].HostConfig.Privileged'
+      expect: {match: exact, value: "false"}
+    - id: daemon-json-perms
+      description: daemon.json is no longer world-writable
+      type: shell
+      timeoutSec: 60
+      on: cl-transcode-03
+      skills: [containers.runtime-security.benchmark]
+      weight: 1
+      command: find /etc/docker/daemon.json -perm -o+w | grep -c . || true
+      expect: {match: exact, value: "0"}
+  hints:
+    - title: Engine settings live in one file
+      body: "live-restore, userland-proxy and icc are all keys of /etc/docker/daemon.json. Set them with jq (merge, do not overwrite) and `systemctl restart docker`."
+      cost: 1
+    - title: Privileged is a run-time flag, not restartable away
+      body: "There is no `docker update --privileged=false`; a privileged container has to be recreated without the flag. Keep its name, restart policy and command the same."
+      cost: 1
+    - title: File permissions
+      body: "`chmod 0644 /etc/docker/daemon.json` removes the world-write bit while keeping it readable by every client that needs it."
+      cost: 1
+  misconceptions:
+    - id: icc-on-network-not-daemon
+      description: Tries to disable ICC with a custom bridge network instead of the engine-wide default-bridge setting the ticket names.
+      feedback: "The finding is about the engine's default bridge (`icc` in daemon.json), which every unnamed container uses. A separate user-defined network's own options do not change that engine-wide default."
+      expectFail: [audit-passes]
+      mutation:
+        on: cl-transcode-03
+        as: admin
+        run: |
+          docker network create --opt com.docker.network.bridge.enable_icc=false clnet 2>/dev/null || true
+          jq '. + {"live-restore": true, "userland-proxy": false}' /etc/docker/daemon.json > /tmp/d.json && mv /tmp/d.json /etc/docker/daemon.json
+          chmod 0644 /etc/docker/daemon.json
+          systemctl restart docker
+          for i in $(seq 60); do docker info >/dev/null 2>&1 && break; sleep 2; done
+          docker rm -f legacy-encoder
+          docker run -d --name legacy-encoder --restart unless-stopped busybox:1.37 sleep infinity
+    - id: update-privileged-attempt
+      description: Tries docker update to remove privileged mode instead of recreating the container.
+      feedback: "Privileged mode is set at creation and cannot be changed on a running container with docker update. Remove and recreate it without --privileged."
+      expectFail: [not-privileged, audit-passes]
+      mutation:
+        on: cl-transcode-03
+        as: admin
+        run: |
+          jq '. + {"live-restore": true, "userland-proxy": false, "icc": false}' /etc/docker/daemon.json > /tmp/d.json && mv /tmp/d.json /etc/docker/daemon.json
+          chmod 0644 /etc/docker/daemon.json
+          systemctl restart docker
+          for i in $(seq 60); do docker info >/dev/null 2>&1 && break; sleep 2; done
+          docker update --restart unless-stopped legacy-encoder 2>/dev/null || true
+  solution:
+    explanation: |
+      Merge the three engine-wide settings into daemon.json and restart the engine,
+      recreate the privileged container without that flag, and tighten the
+      configuration file's permissions.
+    steps:
+      - on: cl-transcode-03
+        as: admin
+        run: |
+          jq '. + {"live-restore": true, "userland-proxy": false, "icc": false}' /etc/docker/daemon.json > /tmp/d.json
+          mv /tmp/d.json /etc/docker/daemon.json
+          chmod 0644 /etc/docker/daemon.json
+          systemctl restart docker
+          for i in $(seq 60); do docker info >/dev/null 2>&1 && break; sleep 2; done
+          docker rm -f legacy-encoder
+          docker run -d --name legacy-encoder --restart unless-stopped busybox:1.37 sleep infinity
+          cl-docker-audit
+    alternatives:
+      - id: edit-with-cat
+        description: Replace daemon.json with a here-document carrying all three settings in one write.
+        steps:
+          - on: cl-transcode-03
+            as: admin
+            run: |
+              cat > /etc/docker/daemon.json <<'JSON'
+              { "live-restore": true, "userland-proxy": false, "icc": false }
+              JSON
+              chmod 0644 /etc/docker/daemon.json
+              systemctl restart docker
+              for i in $(seq 60); do docker info >/dev/null 2>&1 && break; sleep 2; done
+              docker rm -f legacy-encoder
+              docker run -d --name legacy-encoder --restart unless-stopped busybox:1.37 sleep infinity
+              cl-docker-audit

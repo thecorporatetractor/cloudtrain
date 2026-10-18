@@ -1,0 +1,216 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-remote-engine-ssh
+  title: Retire the batch host's unauthenticated engine port
+  domain: containers
+  frameworks: [docker-practitioner:security, dca-legacy:security]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [docker, security, remote, ssh, context]
+  version: 1
+spec:
+  description: |
+    The batch host **`cl-batch-02`** (`ssh cl-batch-02`; you are in the `docker` group
+    and have `sudo`) listens on **TCP 2375**, unauthenticated and unencrypted, so
+    operators can run `docker -H tcp://cl-batch-02:2375 ...` from their laptops. The
+    account **`operator`** exists on the host, is in the `docker` group, and has an
+    empty `~/.ssh/authorized_keys`.
+
+    1. **Close port 2375**: the engine must no longer listen on any TCP socket.
+    2. Setup already generated an SSH key pair for `learner` (`~/.ssh/id_ed25519`). Install
+       the public key into `operator`'s `~/.ssh/authorized_keys` (you have `sudo`), put the
+       identity and host-key settings for `localhost` into `~/.ssh/config`, and create a docker
+       context named **`cl-batch-02`** as `learner` that reaches the engine over
+       **`ssh://operator@localhost`** (the engine is the one on this host, reached the way an
+       operator's laptop would reach it). `docker --context cl-batch-02 info` must succeed.
+    3. The engine on `cl-batch-02` must still serve local clients (the `docker` group)
+       exactly as before.
+  objectives:
+    - Remove an unauthenticated TCP listener from the engine
+    - Reach a remote engine over SSH with a docker context
+    - Keep the engine configuration as a drop-in instead of overwriting the unit
+  params:
+    tag:
+      type: int
+      min: 1000
+      max: 9999
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-batch-02
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-batch-02
+      timeoutSec: 300
+      run: |
+        set -eu
+        usermod -aG docker learner
+        id operator >/dev/null 2>&1 || useradd -m -s /bin/bash operator
+        usermod -aG docker operator
+        install -d -m 0700 -o operator -g operator /home/operator/.ssh
+        : > /home/operator/.ssh/authorized_keys
+        chmod 0600 /home/operator/.ssh/authorized_keys
+        chown operator:operator /home/operator/.ssh/authorized_keys
+        install -d /var/lib/cloudtrain
+        install -d -m 0700 -o learner -g learner /home/learner/.ssh
+        rm -f /home/learner/.ssh/config
+        runuser -u learner -- docker context rm -f cl-batch-02 >/dev/null 2>&1 || true
+        [ -f /home/learner/.ssh/id_ed25519 ] || runuser -u learner -- ssh-keygen -q -t ed25519 -N '' -f /home/learner/.ssh/id_ed25519
+        mkdir -p /etc/systemd/system/docker.service.d
+        cat > /etc/systemd/system/docker.service.d/listen.conf <<'UNIT'
+        [Service]
+        ExecStart=
+        ExecStart=/usr/bin/dockerd -H tcp://0.0.0.0:2375 -H unix:///var/run/docker.sock --containerd=/run/containerd/containerd.sock
+        UNIT
+        systemctl daemon-reload
+        systemctl restart docker
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        echo "batch host build {{tag}}" > /var/lib/cloudtrain/marker.txt
+  checks:
+    - id: port-closed
+      description: Nothing on the host listens on TCP 2375
+      type: shell
+      timeoutSec: 60
+      on: cl-batch-02
+      skills: [containers.operations.daemon-config]
+      weight: 2.5
+      command: ss -ltn 2>/dev/null | awk '{print $4}' | grep -c ':2375$' || true
+      expect: {match: exact, value: "0"}
+    - id: local-engine-ok
+      description: The engine still serves local clients over the Unix socket
+      type: shell
+      timeoutSec: 60
+      on: cl-batch-02
+      skills: [containers.operations.daemon-config]
+      weight: 1.5
+      command: runuser -u learner -- docker info --format json 2>/dev/null | jq -r '.ServerVersion // "down"' | grep -qE '^[0-9]' && echo up || echo down
+      expect: {match: exact, value: up}
+    - id: ssh-context-works
+      description: learner's cl-batch-02 context points at ssh://operator@localhost and reaches the engine
+      type: shell
+      timeoutSec: 90
+      on: cl-batch-02
+      skills: [containers.runtime-security.daemon-socket, containers.operations.daemon-config]
+      weight: 3
+      command: |
+        h=$(runuser -u learner -- env HOME=/home/learner docker context inspect cl-batch-02 --format json 2>/dev/null | jq -r '.[0].Endpoints.docker.Host // "none"')
+        v=$(runuser -u learner -- env HOME=/home/learner docker --context cl-batch-02 info --format json 2>/dev/null | jq -r '.ServerVersion // "none"')
+        case "$v" in [0-9]*) r=reachable ;; *) r=unreachable ;; esac
+        echo "$h $r"
+      expect: {match: exact, value: "ssh://operator@localhost reachable"}
+    - id: drop-in-not-overwrite
+      description: The engine unit was changed with a drop-in, not by replacing docker.service
+      type: shell
+      timeoutSec: 60
+      on: cl-batch-02
+      skills: [containers.operations.daemon-config]
+      weight: 1
+      command: |
+        f=$(find /etc/systemd/system/docker.service.d -name '*.conf' 2>/dev/null | wc -l)
+        o=$(test -f /etc/systemd/system/docker.service -o -f /lib/systemd/system/docker.service.orig && echo tampered || echo untouched)
+        echo "dropins=$f unit=$o"
+      expect: {match: exact, value: "dropins=1 unit=untouched"}
+  hints:
+    - title: Where the listener is set
+      body: "The packaged docker.service already starts dockerd with -H flags. A drop-in in /etc/systemd/system/docker.service.d/ with ExecStart= (empty) followed by a new ExecStart= line overrides it without touching the shipped unit file."
+      cost: 1
+    - title: SSH as the transport
+      body: "A context's host can be `ssh://user@host`; docker opens an SSH connection and runs a remote helper, no TCP listener needed on the far side."
+      cost: 1
+    - title: Key and host checking
+      body: "The docker CLI runs the plain `ssh` client, so settings go in `~/.ssh/config` (not in the context URL): a `Host localhost` block with `IdentityFile`, and `StrictHostKeyChecking no` (or accept the host key once with `ssh-keyscan localhost >> ~/.ssh/known_hosts`). Append the public key to `/home/operator/.ssh/authorized_keys` with `sudo tee -a`."
+      cost: 1
+  misconceptions:
+    - id: stopped-but-reopens
+      description: Kills dockerd once instead of changing the unit, so the port reopens on the next restart.
+      feedback: "Stopping the process by hand does not survive a restart. Change the systemd unit (a drop-in) so the engine never asks for the TCP listener again."
+      expectFail: [port-closed]
+      mutation:
+        on: cl-batch-02
+        as: admin
+        run: |
+          pkill -f 'tcp://0.0.0.0:2375' || true
+          sleep 2
+          systemctl restart docker
+          for i in $(seq 60); do docker info >/dev/null 2>&1 && break; sleep 2; done
+    - id: overwrote-unit-file
+      description: Edits the packaged docker.service directly instead of adding a drop-in.
+      feedback: "Editing the shipped unit file gets reverted by the next package upgrade and is harder to review. Use a drop-in under docker.service.d/ instead."
+      expectFail: [drop-in-not-overwrite]
+      mutation:
+        on: cl-batch-02
+        as: admin
+        run: |
+          rm -f /etc/systemd/system/docker.service.d/listen.conf
+          sed -i 's#^ExecStart=.*#ExecStart=/usr/bin/dockerd --containerd=/run/containerd/containerd.sock#' /lib/systemd/system/docker.service
+          cp /lib/systemd/system/docker.service /etc/systemd/system/docker.service
+          systemctl daemon-reload
+          systemctl restart docker
+          for i in $(seq 60); do docker info >/dev/null 2>&1 && break; sleep 2; done
+    - id: plain-tcp-context
+      description: Creates the context over plain TCP to the (still open) port instead of SSH.
+      feedback: "A plain tcp:// context does nothing for security: it is the same unauthenticated port the task asks you to close. Use an ssh:// context."
+      expectFail: [port-closed, ssh-context-works]
+      mutation:
+        on: cl-batch-02
+        as: learner
+        run: |
+          docker context rm -f cl-batch-02 >/dev/null 2>&1 || true
+          docker context create cl-batch-02 --docker "host=tcp://localhost:2375" >/dev/null
+  solution:
+    explanation: |
+      A systemd drop-in rewrites dockerd's ExecStart without the TCP listener, closing
+      2375 while keeping the Unix socket for local clients. The workstation reaches the
+      engine instead through an SSH-backed docker context (ssh://operator@localhost) using a key
+      installed for the operator account, with the ssh client settings in ~/.ssh/config.
+    steps:
+      - on: cl-batch-02
+        as: admin
+        run: |
+          mkdir -p /etc/systemd/system/docker.service.d
+          cat > /etc/systemd/system/docker.service.d/listen.conf <<'UNIT'
+          [Service]
+          ExecStart=
+          ExecStart=/usr/bin/dockerd -H unix:///var/run/docker.sock --containerd=/run/containerd/containerd.sock
+          UNIT
+          systemctl daemon-reload
+          systemctl restart docker
+          for i in $(seq 60); do docker info >/dev/null 2>&1 && break; sleep 2; done
+      - on: cl-batch-02
+        as: learner
+        run: |
+          sudo tee -a /home/operator/.ssh/authorized_keys < ~/.ssh/id_ed25519.pub >/dev/null
+          printf '%s\n' 'Host localhost' '  IdentityFile ~/.ssh/id_ed25519' '  IdentitiesOnly yes' '  StrictHostKeyChecking no' '  UserKnownHostsFile /dev/null' '  LogLevel ERROR' >> ~/.ssh/config
+          chmod 600 ~/.ssh/config
+          docker context create cl-batch-02 --docker host=ssh://operator@localhost
+          docker --context cl-batch-02 info >/dev/null
+    alternatives:
+      - id: use-context
+        description: Create the context then switch to it with `docker context use` instead of passing --context each time.
+        steps:
+          - on: cl-batch-02
+            as: admin
+            run: |
+              printf '%s\n' '[Service]' 'ExecStart=' 'ExecStart=/usr/bin/dockerd -H unix:///var/run/docker.sock --containerd=/run/containerd/containerd.sock' \
+                | install -D -m 0644 /dev/stdin /etc/systemd/system/docker.service.d/listen.conf
+              systemctl daemon-reload
+              systemctl restart docker
+              for i in $(seq 60); do docker info >/dev/null 2>&1 && break; sleep 2; done
+          - on: cl-batch-02
+            as: learner
+            run: |
+              sudo sh -c 'cat /home/learner/.ssh/id_ed25519.pub >> /home/operator/.ssh/authorized_keys'
+              ssh-keyscan -H localhost >> ~/.ssh/known_hosts 2>/dev/null
+              printf '%s\n' 'Host localhost' '  IdentityFile ~/.ssh/id_ed25519' >> ~/.ssh/config
+              chmod 600 ~/.ssh/config
+              docker context create cl-batch-02 --docker host=ssh://operator@localhost
+              docker context use cl-batch-02
+              docker info >/dev/null

@@ -1,0 +1,213 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-cap-drop-readonly
+  title: Run ad insertion with minimal privileges
+  domain: containers
+  frameworks: [dca-legacy:security, docker-practitioner:security]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [docker, security, capabilities, read-only, no-new-privileges]
+  version: 1
+spec:
+  description: |
+    The ad-insertion service runs on **`cl-ads-02`** (`ssh cl-ads-02`; you are in the
+    `docker` group) as the container **`ad-insertion`**, published on
+    `127.0.0.1:{{port}}`. It runs as root inside the container, with the engine's default
+    capabilities, a writable root filesystem and no further restrictions. The service
+    listens on port 80 in the container, accepts `GET /book?id=<id>` and keeps its
+    bookings in `/tmp`.
+
+    Recreate the container (same name, same image `copperleaf/ad-insertion:3`, still
+    published on `127.0.0.1:{{port}}`) so that it has:
+
+    - **all capabilities dropped except** the one that lets it bind port 80;
+    - **no-new-privileges**;
+    - a **read-only root filesystem**, with a **tmpfs on `/tmp`**.
+
+    Keep the container's existing `--sysctl net.ipv4.ip_unprivileged_port_start=1024`
+    (platform standard: low ports must need the capability). It must keep accepting
+    bookings.
+  objectives:
+    - Drop all capabilities and add back only what the process needs
+    - Combine a read-only root filesystem with a tmpfs for scratch space
+    - Set no-new-privileges
+  params:
+    port:
+      type: int
+      min: 8100
+      max: 8199
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-ads-02
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-ads-02
+      timeoutSec: 300
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        d=$(mktemp -d)
+        cat > "$d/ads.py" <<'PY'
+        import http.server, os, urllib.parse
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                u = urllib.parse.urlparse(self.path)
+                if u.path == "/book":
+                    ident = urllib.parse.parse_qs(u.query).get("id", ["x"])[0]
+                    try:
+                        with open("/tmp/bookings.log", "a") as f:
+                            f.write(ident + "\n")
+                        out = "booked " + ident
+                    except OSError as e:
+                        out = "cannot write: " + e.strerror
+                else:
+                    n = 0
+                    if os.path.exists("/tmp/bookings.log"):
+                        n = len(open("/tmp/bookings.log").read().split())
+                    out = "ad-insertion ready bookings=%d" % n
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write((out + "\n").encode())
+            def log_message(self, *a):
+                pass
+        http.server.ThreadingHTTPServer(("", 80), H).serve_forever()
+        PY
+        printf '%s\n' 'FROM python:3.13-alpine' 'COPY ads.py /app/ads.py' 'EXPOSE 80' 'CMD ["python3", "/app/ads.py"]' > "$d/Dockerfile"
+        docker build -q -t copperleaf/ad-insertion:3 "$d" >/dev/null
+        rm -rf "$d"
+        docker rm -f ad-insertion >/dev/null 2>&1 || true
+        docker run -d --name ad-insertion -p 127.0.0.1:{{port}}:80 --sysctl net.ipv4.ip_unprivileged_port_start=1024 copperleaf/ad-insertion:3 >/dev/null
+        for i in $(seq 20); do curl -fs http://127.0.0.1:{{port}}/ >/dev/null && break; sleep 1; done
+  checks:
+    - id: capabilities
+      description: All capabilities are dropped except NET_BIND_SERVICE, which is the only one the process holds
+      type: shell
+      timeoutSec: 60
+      on: cl-ads-02
+      skills: [containers.runtime-security.least-privilege]
+      weight: 3
+      command: |
+        c=$(docker inspect ad-insertion 2>/dev/null | jq -r '.[0].HostConfig | "\((.CapDrop // []) | map(ascii_upcase | ltrimstr("CAP_")) | sort | join(",")) \((.CapAdd // []) | map(ascii_upcase | ltrimstr("CAP_")) | sort | join(","))"')
+        eff=$(docker exec ad-insertion sh -c "awk '/^CapEff/ {print \$2}' /proc/1/status" 2>/dev/null || echo none)
+        echo "$c $eff"
+      expect: {match: exact, value: "ALL NET_BIND_SERVICE 0000000000000400"}
+    - id: no-new-privs
+      description: no-new-privileges is set
+      type: shell
+      timeoutSec: 60
+      on: cl-ads-02
+      skills: [containers.runtime-security.least-privilege]
+      weight: 2
+      command: docker inspect ad-insertion 2>/dev/null | jq -r '[(.[0].HostConfig.SecurityOpt // [])[] | select(test("no-new-privileges"))] | length > 0'
+      expect: {match: exact, value: "true"}
+    - id: read-only-root
+      description: The root filesystem is read-only and /tmp is a tmpfs
+      type: shell
+      timeoutSec: 60
+      on: cl-ads-02
+      skills: [containers.runtime-security.least-privilege]
+      weight: 3
+      command: |
+        c=$(docker inspect ad-insertion 2>/dev/null | jq -r '[(.[0].HostConfig.ReadonlyRootfs | tostring), ((((.[0].HostConfig.Tmpfs // {}) | has("/tmp")) or ([(.[0].HostConfig.Mounts // [])[] | select(.Type == "tmpfs" and .Target == "/tmp")] | length > 0)) | tostring)] | join(" ")')
+        w=$(docker exec ad-insertion sh -c 'touch /etc/x 2>/dev/null && echo writable || echo root-ro; touch /tmp/ok 2>/dev/null && echo tmp-rw || echo tmp-ro' 2>/dev/null | paste -sd' ' -)
+        echo "$c $w"
+      expect: {match: exact, value: "true true root-ro tmp-rw"}
+    - id: still-booking
+      description: The service accepts bookings through 127.0.0.1:PORT and counts them
+      type: shell
+      timeoutSec: 60
+      on: cl-ads-02
+      skills: [containers.runtime-security.least-privilege]
+      weight: 3
+      command: |
+        a=$(curl -fsS --max-time 5 "http://127.0.0.1:{{port}}/book?id=a{{port}}" 2>/dev/null || echo down)
+        curl -fsS --max-time 5 "http://127.0.0.1:{{port}}/book?id=b{{port}}" >/dev/null 2>&1
+        n=$(curl -fsS --max-time 5 http://127.0.0.1:{{port}}/ 2>/dev/null | sed -E 's/bookings=[0-9]+/bookings=N/')
+        echo "$a / $n"
+      expect: {match: exact, value: "booked a{{port}} / ad-insertion ready bookings=N"}
+    - id: bind-sysctl-kept
+      description: The container keeps the platform's unprivileged-port sysctl (1024)
+      type: shell
+      timeoutSec: 60
+      on: cl-ads-02
+      skills: [containers.runtime-security.least-privilege]
+      weight: 1
+      command: docker inspect ad-insertion 2>/dev/null | jq -r '.[0].HostConfig.Sysctls["net.ipv4.ip_unprivileged_port_start"] // "unset"'
+      expect: {match: exact, value: "1024"}
+  hints:
+    - title: The three flags
+      body: "`--cap-drop ALL --cap-add NET_BIND_SERVICE`, `--security-opt no-new-privileges` and `--read-only`. A read-only root needs somewhere to write: `--tmpfs /tmp`."
+      cost: 1
+    - title: Why the container exits or refuses to write
+      body: "With the sysctl keeping ports below 1024 privileged, a process that lacks NET_BIND_SERVICE cannot bind port 80 and exits at start. A read-only filesystem without a tmpfs makes `/tmp/bookings.log` fail. `docker logs ad-insertion` and a test booking show which one you hit."
+      cost: 1
+  misconceptions:
+    - id: forgot-bind-capability
+      description: Drops every capability including NET_BIND_SERVICE.
+      feedback: "Binding a port below 1024 needs CAP_NET_BIND_SERVICE even for root. Add exactly that capability back after dropping ALL."
+      expectFail: [capabilities, still-booking]
+      mutation:
+        on: cl-ads-02
+        as: learner
+        run: |
+          docker rm -f ad-insertion
+          docker run -d --name ad-insertion -p 127.0.0.1:{{port}}:80 --sysctl net.ipv4.ip_unprivileged_port_start=1024 --cap-drop ALL --security-opt no-new-privileges --read-only --tmpfs /tmp copperleaf/ad-insertion:3 || true
+          sleep 3
+    - id: read-only-without-tmpfs
+      description: Sets the read-only root but gives the service nowhere to write.
+      feedback: "The service writes bookings to /tmp. With a read-only root filesystem it needs a tmpfs (or a volume) mounted there."
+      expectFail: [read-only-root, still-booking]
+      mutation:
+        on: cl-ads-02
+        as: learner
+        run: |
+          docker rm -f ad-insertion
+          docker run -d --name ad-insertion -p 127.0.0.1:{{port}}:80 --sysctl net.ipv4.ip_unprivileged_port_start=1024 --cap-drop ALL --cap-add NET_BIND_SERVICE --security-opt no-new-privileges --read-only copperleaf/ad-insertion:3
+          sleep 3
+    - id: no-privilege-lock
+      description: Drops capabilities and the root filesystem write access but not setuid escalation.
+      feedback: "Without no-new-privileges a setuid binary inside the container can still raise privileges. Add --security-opt no-new-privileges."
+      expectFail: [no-new-privs]
+      mutation:
+        on: cl-ads-02
+        as: learner
+        run: |
+          docker rm -f ad-insertion
+          docker run -d --name ad-insertion -p 127.0.0.1:{{port}}:80 --sysctl net.ipv4.ip_unprivileged_port_start=1024 --cap-drop ALL --cap-add NET_BIND_SERVICE --read-only --tmpfs /tmp copperleaf/ad-insertion:3
+          sleep 3
+  solution:
+    explanation: |
+      Drop every capability and add back only NET_BIND_SERVICE, lock out privilege
+      escalation, make the root filesystem read-only and give the service a tmpfs for its
+      scratch directory.
+    steps:
+      - on: cl-ads-02
+        as: learner
+        run: |
+          docker rm -f ad-insertion
+          docker run -d --name ad-insertion -p 127.0.0.1:{{port}}:80 --sysctl net.ipv4.ip_unprivileged_port_start=1024 \
+            --cap-drop ALL --cap-add NET_BIND_SERVICE --security-opt no-new-privileges \
+            --read-only --tmpfs /tmp copperleaf/ad-insertion:3
+          sleep 3
+    alternatives:
+      - id: mount-flag
+        description: Use the --mount syntax for the scratch space and the long option names.
+        steps:
+          - on: cl-ads-02
+            as: learner
+            run: |
+              docker rm -f ad-insertion
+              docker run -d --name ad-insertion --publish 127.0.0.1:{{port}}:80 --sysctl net.ipv4.ip_unprivileged_port_start=1024 \
+                --cap-drop=ALL --cap-add=CAP_NET_BIND_SERVICE --security-opt=no-new-privileges:true \
+                --read-only --mount type=tmpfs,destination=/tmp copperleaf/ad-insertion:3
+              sleep 3

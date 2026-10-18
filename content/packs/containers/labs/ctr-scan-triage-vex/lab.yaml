@@ -1,0 +1,182 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-scan-triage-vex
+  title: Triage scanner findings for the catalogue API
+  domain: containers
+  frameworks: [docker-practitioner:supply-chain]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [docker, security, scanning, vex, supply-chain]
+  version: 1
+spec:
+  description: |
+    On **`cl-catalogue-03`** (`ssh cl-catalogue-03`) `catalogue-api:{{rel}}` is built from
+    `~/catalogue-api/Dockerfile` on the platform base `copperleaf/pybase:1.0` (which has
+    known fixable vulnerabilities), plus a
+    single non-exploitable finding `CVE-2024-{{cve}}` (the vulnerable code path is never
+    reached by this service). The offline vulnerability database is mirrored at
+    `/srv/scan-db`.
+
+    1. **Scan** `catalogue-api:{{rel}}` with `trivy` against the offline database and
+       save the JSON report to `~/scan-before.json`.
+    2. **Bump the base image** to the base named in `/srv/scan-db/fixed-base.txt` and
+       rebuild, so every **fixable critical** finding is gone. The rebuilt image must
+       carry that base's `/etc/pybase-release`.
+    3. Write a **VEX document** `~/catalogue-api.vex.json` (OpenVEX) that records
+       `CVE-2024-{{cve}}` as **`not_affected`** for this image, with a justification.
+    4. **Rescan** with the VEX document applied and save the JSON report to
+       `~/scan-after.json`: it must show **zero** critical findings (fixed or
+       VEX-justified).
+  objectives:
+    - Run an offline vulnerability scan and read its JSON report
+    - Fix findings by rebuilding on a patched base
+    - Record a non-exploitable finding in a VEX document the scanner honours
+  params:
+    rel:
+      type: int
+      min: 100
+      max: 899
+    cve:
+      type: int
+      min: 10000
+      max: 59999
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-catalogue-03
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-catalogue-03
+      timeoutSec: 300
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        install -d /srv/scan-db
+        echo "copperleaf/pybase:1.1" > /srv/scan-db/fixed-base.txt
+        chmod 0644 /srv/scan-db/fixed-base.txt
+        d=$(mktemp -d)
+        for v in 1.0 1.1; do
+          printf '%s\n' 'FROM alpine:3.22' "RUN echo '$v' > /etc/pybase-release" > "$d/Dockerfile"
+          docker build -q --provenance=false --sbom=false -t "copperleaf/pybase:$v" "$d" >/dev/null
+        done
+        rm -rf "$d"
+        s=/home/learner/catalogue-api
+        install -d -o learner -g learner "$s"
+        printf '%s\n' 'FROM copperleaf/pybase:1.0' 'RUN echo "catalogue-api {{rel}}" > /version' 'CMD ["cat", "/version"]' > "$s/Dockerfile"
+        chown -R learner:learner "$s"
+        docker build -q -t catalogue-api:{{rel}} "$s" >/dev/null
+        rm -f /home/learner/scan-before.json /home/learner/scan-after.json /home/learner/catalogue-api.vex.json
+  checks:
+    - id: scanned-before
+      description: scan-before.json is a trivy report for catalogue-api
+      type: shell
+      timeoutSec: 60
+      on: cl-catalogue-03
+      skills: [containers.supply-chain.scanning]
+      weight: 1.5
+      command: jq -r '.ArtifactName // "none"' /home/learner/scan-before.json 2>/dev/null | grep -q 'catalogue-api' && echo ok || echo missing
+      expect: {match: exact, value: ok}
+    - id: base-fixed
+      description: catalogue-api:{{rel}} is rebuilt on the fixed base
+      type: shell
+      timeoutSec: 60
+      on: cl-catalogue-03
+      skills: [containers.supply-chain.scanning]
+      weight: 2
+      command: docker run --rm --entrypoint cat catalogue-api:{{rel}} /etc/pybase-release 2>/dev/null || echo none
+      expect: {match: exact, value: "1.1"}
+    - id: vex-recorded
+      description: The VEX document records CVE-2024-{{cve}} as not_affected
+      type: shell
+      timeoutSec: 60
+      on: cl-catalogue-03
+      skills: [containers.supply-chain.scanning]
+      weight: 2
+      command: jq -r '.statements[]? | select(.vulnerability.name == "CVE-2024-{{cve}}") | .status' /home/learner/catalogue-api.vex.json 2>/dev/null || echo missing
+      expect: {match: exact, value: not_affected}
+    - id: clean-after
+      description: The post-fix, VEX-applied scan shows zero critical findings
+      type: shell
+      timeoutSec: 60
+      on: cl-catalogue-03
+      skills: [containers.supply-chain.scanning]
+      weight: 2.5
+      command: jq -r '[.Results[]?.Vulnerabilities[]? | select(.Severity == "CRITICAL")] | length' /home/learner/scan-after.json 2>/dev/null || echo missing
+      expect: {match: exact, value: "0"}
+  hints:
+    - title: Offline database
+      body: "Point trivy at the mirrored database directory instead of its default online update: `trivy image --skip-db-update --cache-dir /srv/scan-db ...`."
+      cost: 1
+    - title: Rebuilding fixes what a VEX statement cannot
+      body: "A VEX statement only excuses findings whose vulnerable code path is not reachable; every other fixable critical has to be fixed by moving to a patched base."
+      cost: 1
+    - title: OpenVEX shape
+      body: "A minimal OpenVEX document has `@context`, `@id`, `author`, `timestamp` and a `statements` array; each statement names a `vulnerability`, the affected `products` and a `status` (`not_affected` needs a `justification`)."
+      cost: 1
+  misconceptions:
+    - id: vex-instead-of-fix
+      description: Writes a VEX statement for every finding instead of fixing the fixable ones.
+      feedback: "A VEX statement says a finding does not apply; it is not a substitute for patching a vulnerability that is genuinely fixable by rebuilding on a newer base."
+      expectFail: [base-fixed]
+      mutation:
+        on: cl-catalogue-03
+        as: learner
+        run: |
+          jq -n --arg c "CVE-2024-{{cve}}" '{"@context": "https://openvex.dev/ns/v0.2.0", "@id": "urn:catalogue-api", "author": "copperleaf", "timestamp": "2026-01-01T00:00:00Z", "statements": [{"vulnerability": {"name": $c}, "products": [{"@id": "pkg:oci/catalogue-api@{{rel}}?repository_url=registry.copperleaf.example:5000", "subcomponents": []}], "status": "not_affected", "justification": "vulnerable_code_not_in_execute_path"}]}' > ~/catalogue-api.vex.json
+    - id: no-vex-for-non-exploitable
+      description: Fixes the fixable findings but never excuses the one genuinely non-exploitable finding, so it still shows up as a failure.
+      feedback: "A fixable critical should be patched; a non-exploitable one with no fix available should be recorded in a VEX document instead, or the rescan will keep flagging it with nothing you can rebuild away."
+      expectFail: [vex-recorded]
+      mutation:
+        on: cl-catalogue-03
+        as: learner
+        run: |
+          cd ~/catalogue-api
+          sed -i "s#^FROM .*#FROM $(cat /srv/scan-db/fixed-base.txt)#" Dockerfile
+          docker build -q -t catalogue-api:{{rel}} .
+  solution:
+    explanation: |
+      Scan first to see the baseline, rebuild on the patched base to remove every fixable
+      critical, record the one non-exploitable finding in an OpenVEX document, then
+      rescan with the VEX applied to confirm a clean result.
+    steps:
+      - on: cl-catalogue-03
+        as: learner
+        run: |
+          trivy image --skip-db-update --cache-dir /srv/scan-db --format json -o ~/scan-before.json catalogue-api:{{rel}}
+          cd ~/catalogue-api
+          sed -i "s/^FROM .*/FROM $(cat /srv/scan-db/fixed-base.txt)/" Dockerfile
+          docker build -q -t catalogue-api:{{rel}} .
+          jq -n --arg c "CVE-2024-{{cve}}" '{"@context": "https://openvex.dev/ns/v0.2.0", "@id": "urn:catalogue-api", "author": "copperleaf-security", "timestamp": "2026-01-01T00:00:00Z",
+            "statements": [{"vulnerability": {"name": $c}, "products": [{"@id": "pkg:oci/catalogue-api@{{rel}}?repository_url=registry.copperleaf.example:5000", "subcomponents": []}], "status": "not_affected", "justification": "vulnerable_code_not_in_execute_path"}]}' > ~/catalogue-api.vex.json
+          trivy image --skip-db-update --cache-dir /srv/scan-db --vex ~/catalogue-api.vex.json --format json -o ~/scan-after.json catalogue-api:{{rel}}
+    alternatives:
+      - id: env-config-python-vex
+        description: Configure trivy through environment variables, patch the base with a printf, and write the OpenVEX document with Python.
+        steps:
+          - on: cl-catalogue-03
+            as: learner
+            run: |
+              export TRIVY_SKIP_DB_UPDATE=true TRIVY_CACHE_DIR=/srv/scan-db TRIVY_FORMAT=json
+              trivy image -o ~/scan-before.json catalogue-api:{{rel}}
+              cd ~/catalogue-api
+              printf '%s\n' "FROM $(cat /srv/scan-db/fixed-base.txt)" 'RUN echo "catalogue-api {{rel}}" > /version' 'CMD ["cat", "/version"]' > Dockerfile
+              docker build -q -t catalogue-api:{{rel}} .
+              python3 - <<'PY'
+              import json
+              doc = {"@context": "https://openvex.dev/ns/v0.2.0", "@id": "urn:catalogue-api", "author": "copperleaf-security",
+                     "timestamp": "2026-01-01T00:00:00Z",
+                     "statements": [{"vulnerability": {"name": "CVE-2024-{{cve}}"}, "products": [{"@id": "pkg:oci/catalogue-api@{{rel}}?repository_url=registry.copperleaf.example:5000", "subcomponents": []}],
+                                     "status": "not_affected", "justification": "vulnerable_code_not_in_execute_path"}]}
+              json.dump(doc, open("/home/learner/catalogue-api.vex.json", "w"))
+              PY
+              trivy image --vex ~/catalogue-api.vex.json -o ~/scan-after.json catalogue-api:{{rel}}

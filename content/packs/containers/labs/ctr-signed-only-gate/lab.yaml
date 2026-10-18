@@ -1,0 +1,224 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-signed-only-gate
+  title: Build, attest, sign and prove unsigned images are refused
+  domain: containers
+  frameworks: [docker-practitioner:supply-chain]
+  difficulty: hard
+  estimatedMinutes: 30
+  tags: [docker, notation, sbom, signing, release-gate]
+  version: 1
+spec:
+  description: |
+    On **`cl-ads-03`** (`ssh cl-ads-03`) take the ad-insertion service through
+    Copperleaf's full release path as `learner`:
+
+    1. **Build** `~/ads-src/` as **`localhost:5000/ad-insertion:{{rel}}`** with an
+       **SBOM** attestation, and **push** it.
+    2. **Sign** the pushed digest with Notation. Issue a signing certificate chained to
+       `~/release/copperleaf-ca.crt` (key material and `leaf.ext` are in `~/release/`),
+       register it with Notation, add the CA to the trust store `copperleaf` and import a
+       trust policy that trusts only that store for the repository
+       `localhost:5000/ad-insertion` (`notation policy import`).
+    3. **Deploy**: `/usr/local/bin/cl-release-deploy <ref>` is the release gate; it runs
+       `notation verify` with the invoking user's Notation configuration and refuses
+       (non-zero exit, no deployment) any reference that is not signed by the trusted CA.
+       Run it against your signed image and confirm it deploys.
+    4. **Rebuild** the service with `--build-arg REBUILD=1` (simulating an unauthorized
+       rebuild), push it as **`localhost:5000/ad-insertion:{{rel}}-unsigned`** and do **not**
+       sign it. Show the gate **refuses** that unsigned image.
+  objectives:
+    - Chain a build, attestation, push and signature into one release
+    - Deploy through a gate that enforces signature verification
+    - Show the gate actually blocks an unsigned rebuild
+  params:
+    rel:
+      type: int
+      min: 100
+      max: 899
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-ads-03
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-ads-03
+      timeoutSec: 420
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        docker rm -f registry >/dev/null 2>&1 || true
+        rm -rf /srv/registry; install -d /srv/registry
+        docker run -d --name registry --restart always -p 127.0.0.1:5000:5000 -v /srv/registry:/var/lib/registry registry:3 >/dev/null
+        for i in $(seq 30); do curl -fs http://127.0.0.1:5000/v2/ >/dev/null && break; sleep 1; done
+        s=/home/learner/ads-src
+        rm -rf "$s" /home/learner/release /home/learner/.config/notation
+        install -d -o learner -g learner "$s"
+        printf '%s\n' 'FROM busybox:1.37' 'ARG REBUILD=0' "RUN echo 'ad-insertion {{rel}}' > /version && echo \"\$REBUILD\" > /rebuild" 'CMD ["cat", "/version"]' > "$s/Dockerfile"
+        chown -R learner:learner "$s"
+        r=/home/learner/release
+        install -d -o learner -g learner "$r"
+        openssl req -x509 -newkey rsa:2048 -nodes -keyout "$r/copperleaf-ca.key" -out "$r/copperleaf-ca.crt" -days 30 -subj "/CN=copperleaf test CA" 2>/dev/null
+        printf '%s\n' 'basicConstraints=CA:FALSE' 'keyUsage=critical,digitalSignature' 'extendedKeyUsage=codeSigning' > "$r/leaf.ext"
+        chown -R learner:learner "$r"
+        cat > /usr/local/bin/cl-release-deploy <<'SH'
+        #!/bin/sh
+        set -eu
+        ref=$1
+        if notation verify --insecure-registry "$ref" >/tmp/cl-gate.log 2>&1; then
+          echo "deployed $ref"
+        else
+          echo "refused (no valid signature): $ref"
+          exit 1
+        fi
+        SH
+        chmod 0755 /usr/local/bin/cl-release-deploy
+  checks:
+    - id: sbom-and-push
+      description: localhost:5000/ad-insertion:{{rel}} is pushed with an SBOM attestation
+      type: shell
+      timeoutSec: 60
+      on: cl-ads-03
+      skills: [containers.supply-chain.sbom-provenance]
+      weight: 2
+      command: |
+        A='Accept: application/vnd.oci.image.index.v1+json,application/vnd.oci.image.manifest.v1+json'
+        idx=$(curl -fsS -H "$A" http://127.0.0.1:5000/v2/ad-insertion/manifests/{{rel}} 2>/dev/null) || { echo no-image; exit 0; }
+        att=$(echo "$idx" | jq -r '[(.manifests // [])[] | select(.annotations["vnd.docker.reference.type"] == "attestation-manifest") | .digest][0] // empty')
+        [ -n "$att" ] && echo sbom-present || echo missing
+      expect: {match: exact, value: sbom-present}
+    - id: signed-deploy-succeeds
+      description: The release gate, run as learner, deploys the signed image
+      type: shell
+      timeoutSec: 90
+      on: cl-ads-03
+      skills: [containers.supply-chain.verify-gate, containers.supply-chain.signing]
+      weight: 3
+      command: runuser -u learner -- env HOME=/home/learner cl-release-deploy localhost:5000/ad-insertion:{{rel}} 2>&1 | tail -n 1
+      expect: {match: exact, value: "deployed localhost:5000/ad-insertion:{{rel}}"}
+    - id: unsigned-rebuild-refused
+      description: The pushed unsigned rebuild exists and the gate refuses it
+      type: shell
+      timeoutSec: 90
+      on: cl-ads-03
+      skills: [containers.supply-chain.verify-gate]
+      weight: 3
+      command: |
+        curl -fsS -o /dev/null -H 'Accept: application/vnd.oci.image.index.v1+json,application/vnd.oci.image.manifest.v1+json' http://127.0.0.1:5000/v2/ad-insertion/manifests/{{rel}}-unsigned 2>/dev/null || { echo missing; exit 0; }
+        runuser -u learner -- env HOME=/home/learner cl-release-deploy localhost:5000/ad-insertion:{{rel}}-unsigned 2>&1 | tail -n 1
+      expect: {match: exact, value: "refused (no valid signature): localhost:5000/ad-insertion:{{rel}}-unsigned"}
+  hints:
+    - title: One chain, four steps
+      body: "Build with --sbom=true --push, resolve the pushed digest, sign that digest with notation sign using a leaf certificate issued by copperleaf-ca (`openssl x509 -req -CA ... -extfile leaf.ext`, then `notation key add`), then import a trust policy that trusts only that CA before calling the gate."
+      cost: 1
+    - title: The gate is only as good as the policy
+      body: "cl-release-deploy calls notation verify, which reads the policy loaded by `notation policy import`; if none is imported, or it is too permissive, the gate's decision is meaningless. A scope is a full repository name such as localhost:5000/ad-insertion (or a lone `*`), not a prefix wildcard."
+      cost: 1
+    - title: Proving the negative
+      body: "Signatures belong to a digest. Build again with `--build-arg REBUILD=1` so the content differs, push it under the -unsigned tag and do not sign it: verification (and the gate) must fail for that tag."
+      cost: 1
+  misconceptions:
+    - id: gate-skips-verify
+      description: Signs the image but replaces the gate with a script that only checks the image exists.
+      feedback: "A gate that only checks the image is present deploys anything, signed or not. The gate's whole job is to call notation verify and refuse on failure."
+      expectFail: [unsigned-rebuild-refused]
+      mutation:
+        on: cl-ads-03
+        as: learner
+        timeoutSec: 300
+        run: |
+          cd ~/release
+          openssl req -new -newkey rsa:2048 -nodes -keyout leaf.key -out leaf.csr -subj "/CN=copperleaf release signer" 2>/dev/null
+          openssl x509 -req -in leaf.csr -CA copperleaf-ca.crt -CAkey copperleaf-ca.key -CAcreateserial -out leaf.crt -days 7 -extfile leaf.ext 2>/dev/null
+          cat leaf.crt copperleaf-ca.crt > chain.crt
+          notation key add copperleaf-release leaf.key chain.crt
+          notation cert add -t ca -s copperleaf copperleaf-ca.crt
+          jq -n '{"version": "1.0", "trustPolicies": [{"name": "copperleaf", "registryScopes": ["localhost:5000/ad-insertion"], "signatureVerification": {"level": "strict"}, "trustStores": ["ca:copperleaf"], "trustedIdentities": ["*"]}]}' > trustpolicy.json
+          notation policy import --force trustpolicy.json
+          cd ~/ads-src
+          docker buildx build --sbom=true --provenance=false --push -t localhost:5000/ad-insertion:{{rel}} .
+          d=$(curl -fsSI -H 'Accept: application/vnd.oci.image.manifest.v1+json,application/vnd.oci.image.index.v1+json' http://127.0.0.1:5000/v2/ad-insertion/manifests/{{rel}} | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}')
+          notation sign --signature-format cose --key copperleaf-release --insecure-registry "localhost:5000/ad-insertion@$d"
+          docker buildx build --sbom=true --provenance=false --build-arg REBUILD=1 --push -t localhost:5000/ad-insertion:{{rel}}-unsigned .
+          cat > /tmp/gate0.sh <<'SH'
+          #!/bin/sh
+          docker manifest inspect "$1" >/dev/null 2>&1 && echo "deployed $1" || { echo "refused: $1"; exit 1; }
+          SH
+          sudo install -m 0755 /tmp/gate0.sh /usr/local/bin/cl-release-deploy
+    - id: trust-policy-missing
+      description: Signs the image but never imports the trust policy the gate depends on.
+      feedback: "Without an imported trust policy, notation verify has nothing to check against and the gate cannot make a trusted decision for either the signed or the unsigned case."
+      expectFail: [signed-deploy-succeeds]
+      mutation:
+        on: cl-ads-03
+        as: learner
+        timeoutSec: 300
+        run: |
+          cd ~/release
+          openssl req -new -newkey rsa:2048 -nodes -keyout leaf.key -out leaf.csr -subj "/CN=copperleaf release signer" 2>/dev/null
+          openssl x509 -req -in leaf.csr -CA copperleaf-ca.crt -CAkey copperleaf-ca.key -CAcreateserial -out leaf.crt -days 7 -extfile leaf.ext 2>/dev/null
+          cat leaf.crt copperleaf-ca.crt > chain.crt
+          notation key add copperleaf-release leaf.key chain.crt
+          cd ~/ads-src
+          docker buildx build --sbom=true --provenance=false --push -t localhost:5000/ad-insertion:{{rel}} .
+          d=$(curl -fsSI -H 'Accept: application/vnd.oci.image.manifest.v1+json,application/vnd.oci.image.index.v1+json' http://127.0.0.1:5000/v2/ad-insertion/manifests/{{rel}} | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}')
+          notation sign --signature-format cose --key copperleaf-release --insecure-registry "localhost:5000/ad-insertion@$d"
+          docker buildx build --sbom=true --provenance=false --build-arg REBUILD=1 --push -t localhost:5000/ad-insertion:{{rel}}-unsigned .
+  solution:
+    explanation: |
+      Build with an SBOM attestation and push, sign the exact pushed digest with a
+      certificate chained to the Copperleaf CA, and import a trust policy scoped to this
+      repository and that CA. The gate then deploys the signed image but refuses an
+      unsigned rebuild that was pushed under its own tag.
+    steps:
+      - on: cl-ads-03
+        as: learner
+        timeoutSec: 300
+        run: |
+          cd ~/release
+          openssl req -new -newkey rsa:2048 -nodes -keyout leaf.key -out leaf.csr -subj "/CN=copperleaf release signer" 2>/dev/null
+          openssl x509 -req -in leaf.csr -CA copperleaf-ca.crt -CAkey copperleaf-ca.key -CAcreateserial -out leaf.crt -days 7 -extfile leaf.ext 2>/dev/null
+          cat leaf.crt copperleaf-ca.crt > chain.crt
+          notation key add copperleaf-release leaf.key chain.crt
+          notation cert add -t ca -s copperleaf copperleaf-ca.crt
+          jq -n '{"version": "1.0", "trustPolicies": [{"name": "copperleaf", "registryScopes": ["localhost:5000/ad-insertion"], "signatureVerification": {"level": "strict"}, "trustStores": ["ca:copperleaf"], "trustedIdentities": ["*"]}]}' > trustpolicy.json
+          notation policy import --force trustpolicy.json
+          cd ~/ads-src
+          docker buildx build --sbom=true --provenance=false --push -t localhost:5000/ad-insertion:{{rel}} .
+          d=$(curl -fsSI -H 'Accept: application/vnd.oci.image.manifest.v1+json,application/vnd.oci.image.index.v1+json' http://127.0.0.1:5000/v2/ad-insertion/manifests/{{rel}} | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}')
+          notation sign --signature-format cose --key copperleaf-release --insecure-registry "localhost:5000/ad-insertion@$d"
+          cl-release-deploy localhost:5000/ad-insertion:{{rel}}
+          docker buildx build --sbom=true --provenance=false --build-arg REBUILD=1 --push -t localhost:5000/ad-insertion:{{rel}}-unsigned .
+          cl-release-deploy localhost:5000/ad-insertion:{{rel}}-unsigned || true
+    alternatives:
+      - id: policy-before-signing
+        description: Import the trust store and policy first, then sign, and prove the refusal before the deploy.
+        steps:
+          - on: cl-ads-03
+            as: learner
+            timeoutSec: 300
+            run: |
+              cd ~/release
+              notation cert add -t ca -s copperleaf copperleaf-ca.crt
+              jq -n '{"version": "1.0", "trustPolicies": [{"name": "copperleaf", "registryScopes": ["localhost:5000/ad-insertion"], "signatureVerification": {"level": "strict"}, "trustStores": ["ca:copperleaf"], "trustedIdentities": ["*"]}]}' > trustpolicy.json
+              notation policy import --force trustpolicy.json
+              openssl req -new -newkey rsa:2048 -nodes -keyout leaf.key -out leaf.csr -subj "/CN=copperleaf release signer" 2>/dev/null
+              openssl x509 -req -in leaf.csr -CA copperleaf-ca.crt -CAkey copperleaf-ca.key -CAcreateserial -out leaf.crt -days 7 -extfile leaf.ext 2>/dev/null
+              cat leaf.crt copperleaf-ca.crt > chain.crt
+              notation key add copperleaf-release leaf.key chain.crt
+              cd ~/ads-src
+              docker buildx build --sbom=true --provenance=false --build-arg REBUILD=1 --push -t localhost:5000/ad-insertion:{{rel}}-unsigned .
+              cl-release-deploy localhost:5000/ad-insertion:{{rel}}-unsigned || true
+              docker buildx build --sbom=true --provenance=false --push -t localhost:5000/ad-insertion:{{rel}} .
+              d=$(curl -fsSI -H 'Accept: application/vnd.oci.image.manifest.v1+json,application/vnd.oci.image.index.v1+json' http://127.0.0.1:5000/v2/ad-insertion/manifests/{{rel}} | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}')
+              notation sign --signature-format cose --key copperleaf-release --insecure-registry "localhost:5000/ad-insertion@$d"
+              cl-release-deploy localhost:5000/ad-insertion:{{rel}}

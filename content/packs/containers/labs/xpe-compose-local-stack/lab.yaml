@@ -1,0 +1,270 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xpe-compose-local-stack
+  title: Run the tracking stack locally with health ordering
+  domain: containers
+  frameworks: [ct-platform:containers-delivery]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [exam, docker, compose, healthcheck, depends_on]
+  version: 1
+spec:
+  description: |
+    **Host:** `qm-docker-1` (`ssh qm-docker-1`)
+
+    `~/exam/tracking-stack/compose.yaml` (project `tracking`) must describe a stack with
+    a database service **`db`** and the API **`api`** (image `qm/tracking-api:1`,
+    already built; port 8000 in the container). The database image has no offline
+    PostgreSQL available, so **`redis:7.4-alpine`** stands in for it.
+
+    1. Give `db` a **health check** (`redis-cli ping` succeeds inside it).
+    2. Make `api` **start only after `db` reports healthy**.
+    3. Persist `db`'s data in a **named volume**.
+    4. Publish `api` on **`127.0.0.1:8080`** only (container port 8000), on no other
+       host address.
+
+    5. Both services must **restart automatically** (`restart: unless-stopped`), so the
+       stack comes back after an engine restart and after a reboot.
+
+    Bring the stack up from that file.
+  objectives:
+    - Add a health check and a health-conditioned dependency in Compose
+    - Persist service data in a named volume
+    - Publish a service on loopback only
+  params:
+    token:
+      type: int
+      min: 10000
+      max: 99999
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-docker-1
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: qm-docker-1
+      timeoutSec: 300
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        d=$(mktemp -d)
+        cat > "$d/api.py" <<'PY'
+        import http.server, os, socket, sys
+        host = os.environ.get("DB_HOST", "db")
+        try:
+            s = socket.create_connection((host, 6379), timeout=2); s.sendall(b"PING\r\n")
+            assert s.recv(16).startswith(b"+PONG")
+        except Exception as e:
+            print(f"database {host} not ready: {e}", flush=True); sys.exit(1)
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200); self.end_headers(); self.wfile.write(f"tracking api ok {os.environ.get('TOKEN', '-')}\n".encode())
+        print("tracking api listening on :8000", flush=True)
+        http.server.ThreadingHTTPServer(("", 8000), H).serve_forever()
+        PY
+        printf '%s\n' 'FROM python:3.13-alpine' 'COPY api.py /app/api.py' 'CMD ["python3", "/app/api.py"]' > "$d/Dockerfile"
+        docker build -q -t qm/tracking-api:1 "$d" >/dev/null
+        rm -rf "$d"
+        o=/home/learner/exam/tracking-stack
+        install -d -o learner -g learner /home/learner/exam "$o"
+        cat > "$o/compose.yaml" <<'YML'
+        name: tracking
+        services:
+          db:
+            image: redis:7.4-alpine
+          api:
+            image: qm/tracking-api:1
+            environment:
+              DB_HOST: db
+              TOKEN: "{{token}}"
+        YML
+        chown -R learner:learner "$o"
+  checks:
+    - id: restart-policy
+      description: Both services restart automatically (unless-stopped or always), so the stack survives an engine restart and a reboot
+      type: shell
+      timeoutSec: 60
+      on: qm-docker-1
+      skills: [k8s.workloads.probes]
+      weight: 1.5
+      command: |
+        cd /home/learner/exam/tracking-stack && docker compose config --format json 2>/dev/null | jq -r '[.services.db.restart, .services.api.restart] | map(select(. == "unless-stopped" or . == "always")) | length'
+      expect: {match: exact, value: "2"}
+    - id: health-condition
+      description: api depends on db with condition service_healthy, and db has a health check
+      type: shell
+      timeoutSec: 60
+      on: qm-docker-1
+      skills: [k8s.workloads.probes]
+      weight: 2
+      command: |
+        cd /home/learner/exam/tracking-stack && docker compose config --format json 2>/dev/null | jq -r '[.services.api.depends_on.db.condition // "none", (.services.db.healthcheck.test != null and (.services.db.healthcheck.disable // false | not) | tostring)] | join(" ")'
+      expect: {match: exact, value: "service_healthy true"}
+    - id: db-healthy-and-persisted
+      description: db is healthy and its data directory is a named volume
+      type: shell
+      timeoutSec: 60
+      on: qm-docker-1
+      skills: [k8s.workloads.probes]
+      weight: 2
+      command: |
+        c=$(docker ps -q --filter label=com.docker.compose.project=tracking --filter label=com.docker.compose.service=db | head -1)
+        for i in $(seq 15); do s=$(docker inspect "$c" 2>/dev/null | jq -r '.[0].State.Health.Status // "none"'); [ "$s" = healthy ] && break; sleep 2; done
+        v=$(docker inspect "$c" 2>/dev/null | jq -r '[(.[0].Mounts // [])[] | select(.Type == "volume") | select(.Name | test("^[0-9a-f]{64}$") | not)] | length')
+        echo "$s vols=$v"
+      expect: {match: exact, value: "healthy vols=1"}
+    - id: api-loopback-only
+      description: api answers on 127.0.0.1:8080 and is published nowhere else
+      type: shell
+      timeoutSec: 60
+      on: qm-docker-1
+      skills: [k8s.delivery.image-build]
+      weight: 2
+      command: |
+        c=$(docker ps -q --filter label=com.docker.compose.project=tracking --filter label=com.docker.compose.service=api | head -1)
+        b=$(docker inspect "$c" 2>/dev/null | jq -r '[.[0].HostConfig.PortBindings["8000/tcp"][]? | (.HostIp // "") + ":" + .HostPort] | join(",")')
+        r=$(curl -fsS --max-time 3 http://127.0.0.1:8080/ 2>/dev/null)
+        echo "$b $r"
+      expect: {match: exact, value: "127.0.0.1:8080 tracking api ok {{token}}"}
+  solution:
+    explanation: A healthcheck on db, the long depends_on form with service_healthy, a named volume for db's data and a loopback-only publish for api.
+    steps:
+      - on: qm-docker-1
+        as: learner
+        run: |
+          cd ~/exam/tracking-stack
+          cat > compose.yaml <<'YML'
+          name: tracking
+          services:
+            db:
+              image: redis:7.4-alpine
+              restart: unless-stopped
+              volumes:
+                - db-data:/data
+              healthcheck:
+                test: ["CMD", "redis-cli", "ping"]
+                interval: 2s
+                timeout: 2s
+                retries: 10
+            api:
+              image: qm/tracking-api:1
+              restart: unless-stopped
+              depends_on:
+                db:
+                  condition: service_healthy
+              ports:
+                - "127.0.0.1:8080:8000"
+              environment:
+                DB_HOST: db
+                TOKEN: "{{token}}"
+          volumes:
+            db-data:
+          YML
+          docker compose up -d --wait
+    alternatives:
+      - id: explicit-project-flag
+        description: Bring the stack up with an explicit -p flag instead of relying on the name field.
+        steps:
+          - on: qm-docker-1
+            as: learner
+            run: |
+              cd ~/exam/tracking-stack
+              cat > compose.yaml <<'YML'
+              services:
+                db:
+                  image: redis:7.4-alpine
+                  restart: unless-stopped
+                  volumes:
+                    - db-data:/data
+                  healthcheck:
+                    test: ["CMD", "redis-cli", "ping"]
+                    interval: 2s
+                    timeout: 2s
+                    retries: 10
+                api:
+                  image: qm/tracking-api:1
+                  restart: unless-stopped
+                  depends_on:
+                    db:
+                      condition: service_healthy
+                  ports:
+                    - "127.0.0.1:8080:8000"
+                  environment:
+                    DB_HOST: db
+                    TOKEN: "{{token}}"
+              volumes:
+                db-data:
+              YML
+              docker compose -p tracking up -d --wait
+  misconceptions:
+    - id: plain-depends-on
+      description: Uses a plain depends_on list, which waits only for db to start, not to answer.
+      feedback: "depends_on: [db] waits until the db container is started, not until Redis answers pings. Use the long form with condition: service_healthy and give db a healthcheck."
+      expectFail: [health-condition]
+      mutation:
+        on: qm-docker-1
+        as: learner
+        run: |
+          cd ~/exam/tracking-stack
+          cat > compose.yaml <<'YML'
+          name: tracking
+          services:
+            db:
+              image: redis:7.4-alpine
+              restart: unless-stopped
+              volumes: ["db-data:/data"]
+            api:
+              image: qm/tracking-api:1
+              restart: unless-stopped
+              depends_on: [db]
+              ports: ["127.0.0.1:8080:8000"]
+              environment:
+                DB_HOST: db
+                TOKEN: "{{token}}"
+          volumes:
+            db-data:
+          YML
+          docker compose up -d
+          sleep 8
+    - id: anonymous-volume
+      description: Mounts /data without naming the volume, so the data is not kept in a reusable named volume.
+      feedback: "An anonymous volume mount (just a container path with no name before the colon) is not a named volume the task asks for; declare it under the top-level volumes: key and reference that name."
+      expectFail: [db-healthy-and-persisted]
+      mutation:
+        on: qm-docker-1
+        as: learner
+        run: |
+          cd ~/exam/tracking-stack
+          cat > compose.yaml <<'YML'
+          name: tracking
+          services:
+            db:
+              image: redis:7.4-alpine
+              restart: unless-stopped
+              volumes: ["/data"]
+              healthcheck:
+                test: ["CMD", "redis-cli", "ping"]
+                interval: 2s
+                timeout: 2s
+                retries: 10
+            api:
+              image: qm/tracking-api:1
+              restart: unless-stopped
+              depends_on:
+                db:
+                  condition: service_healthy
+              ports: ["127.0.0.1:8080:8000"]
+              environment:
+                DB_HOST: db
+                TOKEN: "{{token}}"
+          YML
+          docker compose up -d --wait

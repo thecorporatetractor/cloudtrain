@@ -1,0 +1,208 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-dhi-vex-reconcile
+  title: Explain the findings a hardened base still reports
+  domain: containers
+  frameworks: [docker-practitioner:supply-chain]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [docker, security, vex, hardened-base, policy]
+  version: 1
+spec:
+  description: |
+    On **`cl-thumbnail-01`** (`ssh cl-thumbnail-01`) the thumbnailer runs from
+    `registry.copperleaf.example:5000/hardened/python:3.13`, the same hardened runtime
+    base used elsewhere. A scan of its config layer against `/srv/scan-db/findings.json`
+    (a stand-in for a scanner report) lists four CVE IDs (`CVE-2023-{{rel}}1` to `CVE-2023-{{rel}}4`). The base image's own vendor VEX
+    document is at `/srv/hardened/python-3.13.vex.json` (OpenVEX; signed with
+    `/srv/hardened/signing.pub`, same key as the SBOM): it marks three of the four
+    `not_affected` and is silent on the fourth.
+
+    1. **Verify** the base VEX document's signature with `openssl` and save its output to
+       **`~/vex-verified.txt`**.
+    2. **Reconcile**: for each of the four findings in `/srv/scan-db/findings.json`,
+       decide whether the base's VEX document covers it.
+    3. Write **`~/reconciled.json`**, a JSON object mapping each CVE ID to either
+       `"covered"` (the base VEX marks it `not_affected`) or `"needs-gate-fail"` (not
+       covered by the VEX, so the release gate must still fail on it).
+    4. Write **`/usr/local/bin/cl-release-gate`**, a script that takes an image
+       reference, reads `/srv/scan-db/findings.json` and the base VEX, and **exits
+       non-zero only if a finding is both present and not VEX-covered**. Run it against
+       the thumbnailer image and show it reports the correct single uncovered finding.
+  objectives:
+    - Verify a vendor VEX document's signature before trusting it
+    - Reconcile scanner findings against a base image's VEX statements
+    - Build a release gate that fails only on findings the VEX does not explain
+  params:
+    rel:
+      type: int
+      min: 100
+      max: 899
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-thumbnail-01
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-thumbnail-01
+      timeoutSec: 420
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        grep -q ' registry.copperleaf.example' /etc/hosts || echo '127.0.0.1 registry.copperleaf.example' >> /etc/hosts
+        [ -s /etc/docker/daemon.json ] || echo '{}' > /etc/docker/daemon.json
+        jq '.["insecure-registries"] = ((.["insecure-registries"] // []) + ["registry.copperleaf.example:5000"] | unique)' /etc/docker/daemon.json > /etc/docker/daemon.json.new && mv /etc/docker/daemon.json.new /etc/docker/daemon.json
+        systemctl restart docker
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        docker rm -f registry >/dev/null 2>&1 || true
+        rm -rf /srv/registry /srv/hardened /srv/scan-db; install -d /srv/registry /srv/hardened /srv/scan-db
+        docker run -d --name registry --restart always -p 5000:5000 -v /srv/registry:/var/lib/registry registry:3 >/dev/null
+        for i in $(seq 30); do curl -fs http://127.0.0.1:5000/v2/ >/dev/null && break; sleep 1; done
+        d=$(mktemp -d)
+        printf '%s\n' 'FROM python:3.13-alpine' "RUN echo 'thumbnailer {{rel}}' > /version" > "$d/Dockerfile"
+        docker build -q --provenance=false --sbom=false -t registry.copperleaf.example:5000/hardened/python:3.13 "$d" >/dev/null
+        docker push -q registry.copperleaf.example:5000/hardened/python:3.13 >/dev/null
+        rm -rf "$d"
+        base=sha256:1111111111111111111111111111111111111111111111111111111111111111
+        cves="CVE-2023-{{rel}}1 CVE-2023-{{rel}}2 CVE-2023-{{rel}}3 CVE-2023-{{rel}}4"
+        jq -n --arg b "$base" --argjson cves "$(printf '%s\n' $cves | jq -R . | jq -s .)" '{base: $b, cves: $cves}' > /srv/scan-db/findings.json
+        openssl genrsa -out /srv/hardened/signing.key 2048 2>/dev/null
+        openssl rsa -in /srv/hardened/signing.key -pubout -out /srv/hardened/signing.pub 2>/dev/null
+        jq -n '{"@context": "https://openvex.dev/ns/v0.2.0", "@id": "urn:hardened-python-3.13", "author": "upstream-vendor", "timestamp": "2026-01-01T00:00:00Z",
+          "statements": [
+            {"vulnerability": {"name": "CVE-2023-{{rel}}1"}, "products": [{"@id": "hardened/python:3.13"}], "status": "not_affected", "justification": "vulnerable_code_not_present"},
+            {"vulnerability": {"name": "CVE-2023-{{rel}}2"}, "products": [{"@id": "hardened/python:3.13"}], "status": "not_affected", "justification": "vulnerable_code_not_in_execute_path"},
+            {"vulnerability": {"name": "CVE-2023-{{rel}}3"}, "products": [{"@id": "hardened/python:3.13"}], "status": "not_affected", "justification": "component_not_present"}
+          ]}' > /srv/hardened/python-3.13.vex.json
+        openssl dgst -sha256 -sign /srv/hardened/signing.key -out /srv/hardened/python-3.13.vex.json.sig /srv/hardened/python-3.13.vex.json
+        rm -f /srv/hardened/signing.key
+        chmod 0644 /srv/hardened/python-3.13.vex.json /srv/hardened/python-3.13.vex.json.sig /srv/hardened/signing.pub /srv/scan-db/findings.json
+        rm -f /home/learner/reconciled.json /home/learner/vex-verified.txt /usr/local/bin/cl-release-gate
+  checks:
+    - id: vex-verified
+      description: The VEX signature is valid and the learner recorded the verification in ~/vex-verified.txt
+      type: shell
+      timeoutSec: 60
+      on: cl-thumbnail-01
+      skills: [containers.supply-chain.hardened-bases]
+      weight: 1.5
+      command: |
+        openssl dgst -sha256 -verify /srv/hardened/signing.pub -signature /srv/hardened/python-3.13.vex.json.sig /srv/hardened/python-3.13.vex.json >/dev/null 2>&1 || { echo bad; exit 0; }
+        grep -qx 'Verified OK' /home/learner/vex-verified.txt 2>/dev/null && echo verified || echo not-recorded
+      expect: {match: exact, value: verified}
+    - id: reconciled-correctly
+      description: reconciled.json marks exactly CVE-2023-{{rel}}4 as needs-gate-fail, the rest covered
+      type: shell
+      timeoutSec: 60
+      on: cl-thumbnail-01
+      skills: [containers.supply-chain.hardened-bases, containers.supply-chain.scanning]
+      weight: 3
+      command: |
+        jq -S '{"CVE-2023-{{rel}}1": .["CVE-2023-{{rel}}1"], "CVE-2023-{{rel}}2": .["CVE-2023-{{rel}}2"], "CVE-2023-{{rel}}3": .["CVE-2023-{{rel}}3"], "CVE-2023-{{rel}}4": .["CVE-2023-{{rel}}4"]}' /home/learner/reconciled.json 2>/dev/null
+      expect: {match: exact, value: "{\n  \"CVE-2023-{{rel}}1\": \"covered\",\n  \"CVE-2023-{{rel}}2\": \"covered\",\n  \"CVE-2023-{{rel}}3\": \"covered\",\n  \"CVE-2023-{{rel}}4\": \"needs-gate-fail\"\n}"}
+    - id: gate-fails-only-on-uncovered
+      description: cl-release-gate exits non-zero and names only the one uncovered CVE
+      type: shell
+      timeoutSec: 60
+      on: cl-thumbnail-01
+      skills: [containers.supply-chain.policy]
+      weight: 3
+      command: |
+        out=$(cl-release-gate registry.copperleaf.example:5000/hardened/python:3.13 2>&1); rc=$?
+        echo "rc=$rc out=$out" | tr -s ' '
+      expect: {match: exact, value: "rc=1 out=gate fail: CVE-2023-{{rel}}4"}
+  hints:
+    - title: One signature covers both documents
+      body: "The SBOM and the VEX for a base image are usually both signed by the same vendor key; verify the VEX exactly the way you verified the SBOM in the earlier task."
+      cost: 1
+    - title: Reconciling is set membership
+      body: "For each CVE in findings.json, a VEX statement with status not_affected for that vulnerability covers it. Anything left over needs the gate to fail."
+      cost: 1
+    - title: The gate is the reconciliation, automated
+      body: "Read both JSON files with jq, compute the uncovered set, and exit 1 (printing the uncovered IDs) only if that set is non-empty."
+      cost: 1
+  misconceptions:
+    - id: trust-base-blindly
+      description: Treats the hardened base as finding-free because it is hardened, without checking the VEX at all.
+      feedback: "A hardened base can still carry findings the vendor has not excused yet. The VEX document, not the base's reputation, decides what is covered."
+      expectFail: [reconciled-correctly, gate-fails-only-on-uncovered]
+      mutation:
+        on: cl-thumbnail-01
+        as: learner
+        run: |
+          jq -n '{"CVE-2023-{{rel}}1":"covered","CVE-2023-{{rel}}2":"covered","CVE-2023-{{rel}}3":"covered","CVE-2023-{{rel}}4":"covered"}' > ~/reconciled.json
+          printf '%s\n' '#!/bin/sh' 'exit 0' > /tmp/gate0.sh
+          sudo install -m 0755 /tmp/gate0.sh /usr/local/bin/cl-release-gate
+    - id: gate-fails-on-everything
+      description: Writes a gate that fails on any finding at all, ignoring the VEX entirely.
+      feedback: "That makes the gate useless for any hardened base: it would fail on findings the vendor has already explained as not applicable. The gate should fail only on findings the VEX does not cover."
+      expectFail: [gate-fails-only-on-uncovered]
+      mutation:
+        on: cl-thumbnail-01
+        as: learner
+        run: |
+          jq -n '{"CVE-2023-{{rel}}1":"needs-gate-fail","CVE-2023-{{rel}}2":"needs-gate-fail","CVE-2023-{{rel}}3":"needs-gate-fail","CVE-2023-{{rel}}4":"needs-gate-fail"}' > ~/reconciled.json
+          cat > /tmp/gate.sh <<'SH'
+          #!/bin/sh
+          cat /srv/scan-db/findings.json | jq -r '.cves[]'
+          exit 1
+          SH
+          sudo install -m 0755 /tmp/gate.sh /usr/local/bin/cl-release-gate
+  solution:
+    explanation: |
+      Verify the vendor VEX signature, then compute, per CVE, whether a not_affected
+      statement for it exists in that VEX; anything left over is what the gate must
+      still fail on. The gate script automates exactly that comparison.
+    steps:
+      - on: cl-thumbnail-01
+        as: learner
+        run: |
+          openssl dgst -sha256 -verify /srv/hardened/signing.pub -signature /srv/hardened/python-3.13.vex.json.sig /srv/hardened/python-3.13.vex.json | tee ~/vex-verified.txt
+          covered=$(jq -r '[.statements[] | select(.status == "not_affected") | .vulnerability.name]' /srv/hardened/python-3.13.vex.json)
+          jq -n --argjson covered "$covered" --argjson cves "$(jq '.cves' /srv/scan-db/findings.json)" \
+            'reduce $cves[] as $c ({}; . + {($c): (if ($covered | index($c)) then "covered" else "needs-gate-fail" end)})' > ~/reconciled.json
+          cat > /tmp/gate.sh <<'SH'
+          #!/bin/sh
+          set -eu
+          covered=$(jq -r '[.statements[] | select(.status == "not_affected") | .vulnerability.name]' /srv/hardened/python-3.13.vex.json)
+          uncovered=$(jq -r --argjson covered "$covered" '.cves[] as $c | select(($covered | index($c)) == null) | $c' /srv/scan-db/findings.json)
+          if [ -n "$uncovered" ]; then echo "gate fail: $uncovered"; exit 1; fi
+          echo "gate pass"
+          SH
+          sudo install -m 0755 /tmp/gate.sh /usr/local/bin/cl-release-gate
+          cl-release-gate registry.copperleaf.example:5000/hardened/python:3.13 || true
+    alternatives:
+      - id: python-reconcile
+        description: Do the reconciliation and the gate in Python instead of jq.
+        steps:
+          - on: cl-thumbnail-01
+            as: learner
+            run: |
+              openssl dgst -sha256 -verify /srv/hardened/signing.pub -signature /srv/hardened/python-3.13.vex.json.sig /srv/hardened/python-3.13.vex.json | tee ~/vex-verified.txt
+              python3 - <<'PY'
+              import json
+              vex = json.load(open("/srv/hardened/python-3.13.vex.json"))
+              covered = {s["vulnerability"]["name"] for s in vex["statements"] if s["status"] == "not_affected"}
+              findings = json.load(open("/srv/scan-db/findings.json"))["cves"]
+              out = {c: ("covered" if c in covered else "needs-gate-fail") for c in findings}
+              json.dump(out, open("/home/learner/reconciled.json", "w"))
+              PY
+              cat > /tmp/gate.sh <<'SH'
+              #!/bin/sh
+              set -eu
+              covered=$(jq -r '[.statements[] | select(.status == "not_affected") | .vulnerability.name]' /srv/hardened/python-3.13.vex.json)
+              uncovered=$(jq -r --argjson covered "$covered" '.cves[] as $c | select(($covered | index($c)) == null) | $c' /srv/scan-db/findings.json)
+              if [ -n "$uncovered" ]; then echo "gate fail: $uncovered"; exit 1; fi
+              echo "gate pass"
+              SH
+              sudo install -m 0755 /tmp/gate.sh /usr/local/bin/cl-release-gate
+              cl-release-gate registry.copperleaf.example:5000/hardened/python:3.13 || true
