@@ -371,6 +371,14 @@ export async function checkLab(labFile, skills, frameworkRefs, findings, ctx = {
 
   // Params: every {{ref}} declared; every declared param used.
   const used = referencedParams(doc);
+  // file.source assets are templated too (platform round 3), so their {{refs}} count.
+  const sources = [...(spec.setup ?? []), ...(spec.teardown ?? [])].map((a) => a?.file?.source).filter(Boolean);
+  for (const src of new Set(sources)) {
+    const f = path.join(path.dirname(labFile), src);
+    if (!existsSync(f)) continue;
+    const text = await readFile(f, "utf8").catch(() => "");
+    for (const m of text.matchAll(/\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}/g)) used.add(m[1]);
+  }
   const declared = new Set(Object.keys(spec.params ?? {}));
   for (const u of used) if (!declared.has(u)) findings.push({ level: "error", file: labFile, path: "/spec/params", message: `'{{${u}}}' is referenced but not declared` });
   for (const d of declared) if (!used.has(d)) findings.push({ level: "warn", file: labFile, path: `/spec/params/${d}`, message: "declared but never referenced" });

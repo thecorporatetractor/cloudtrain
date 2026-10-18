@@ -2166,8 +2166,6 @@ _CloudTrain internal assessment. It is not aligned to, affiliated with or endors
 | `podman-vm:5` | containerDisk | C | proposed | EL 10 VM with Podman 5, skopeo, buildah and Quadlet |
 | `oci-registry:3` | container | A/B | proposed | CNCF Distribution registry pod per learner (TLS and htpasswd configurable) |
 | `gitea:1` | container | A | proposed | In-lab Git server for Git workflow, module sources and Ansible content |
-| `moto:5` | container | A/V | proposed | Moto server mode as an offline AWS-shaped API (shape only, behaviour not enforced) |
-| `vcsim:1` | container | A/V | proposed | govmomi vcsim vSphere API simulator (inventory, folders, networks, resource pools) |
 | `s3-store:1` | container | A/V | spike | SeaweedFS S3 endpoint for remote state with use_lockfile (two-writer contention test pending) |
 | `ansible-ctl:2.21` | container | A | proposed | Ansible control node: ansible-core 2.21, ansible-navigator (EE disabled), ansible-lint, Molecule, code-server, git |
 | `ansible-node:1` | container | A | proposed | sshd managed-node pod with a sudo-enabled student user (no systemd) |
