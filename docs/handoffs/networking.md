@@ -153,7 +153,7 @@ retakes get a fresh draw (the exam itself now runs end to end: 100 % / 14.3 %).
   west has two LANs) plus a preconfigured core. Graded on: the template against the inventory, against
   a hidden second inventory (area 3, different interface counts), the saved files, OSPF Full on every
   adjacency (retry loop), learned LANs and loopbacks, passive LAN interfaces, reachability. The grader
-  logic (`/var/lib/cloudtrain/expect-conf.py`) and all three mutations were smoke-tested locally with
+  logic is inline in the three template checks (the hidden inventory exists only while template-generic runs) and all three mutations were smoke-tested locally with
   Python against a sandbox directory. Mutations: hard-coded per-router literals (caught only by the
   hidden inventory), loopback without `ip ospf area`, no passive conditional.
 - Drafts (status stays `proposed`) in `docs/handoffs/networking-drafts/`: `net-srlinux-vlan-trunk`,
