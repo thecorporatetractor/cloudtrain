@@ -23,6 +23,7 @@ RES=${RES:-/srv/ct-work/results}
 VMCFG=${VMCFG:-/srv/ct-work/vm-config}
 CTX=kind-cloudtrain-dev
 export CT_SLOTS_HEAVY=${CT_SLOTS_HEAVY:-1} CT_SLOTS_POD=${CT_SLOTS_POD:-4}
+export CT_SLOTS_ENV=${CT_SLOTS_ENV:-$CFG}   # tools/slots/run.sh re-reads the limits from it while waiting
 SESSION_LABEL=${SESSION_LABEL:-labs.cloudtrain.dev/verify=batch}
 ORCH_NS=${ORCH_NS:-ct-batch-system}
 RECONCILES=${RECONCILES:-64}
