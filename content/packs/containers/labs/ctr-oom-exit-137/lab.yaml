@@ -1,0 +1,180 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-oom-exit-137
+  title: Explain and stop the transcoder's exit 137
+  domain: containers
+  frameworks: [ex188-aligned:troubleshoot, docker-practitioner:operations, docker-practitioner:security]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [docker, oom, exit-codes, limits]
+  version: 1
+spec:
+  description: |
+    On the transcoder host `cl-transcode-03` (`ssh cl-transcode-03`; you are in the
+    `docker` group) the test job container **`transcoder`** (image
+    `copperleaf/transcoder:3`) keeps dying with exit code **137**. Each of its workers
+    stages {{per}} MiB of frames in memory, and the image starts 4 workers by default
+    (the `WORKERS` variable).
+
+    1. Prove from the container's state why it died: write the first 12 characters of
+       its container ID, its exit code and its OOMKilled flag, separated by single
+       spaces, to **`~/oom-evidence.txt`** (for example `0123456789ab 1 false`). Do this
+       before you remove the container.
+    2. Run the job again as a container named **`transcoder`** with a memory limit of
+       exactly **1 GiB** and **`WORKERS=2`**, so that the job completes (exit code 0).
+       Leave the finished container in place.
+  objectives:
+    - Read the exit code and the OOMKilled flag from docker inspect
+    - Tell an OOM kill from other causes of exit 137
+    - Size a memory limit together with the workload instead of only raising it
+  params:
+    per:
+      type: int
+      min: 300
+      max: 380
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-transcode-03
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-transcode-03
+      timeoutSec: 300
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        install -d -m 700 /var/lib/cloudtrain
+        d=$(mktemp -d)
+        cat > "$d/job.py" <<'PY'
+        import os, time
+        w = int(os.environ.get("WORKERS", "4"))
+        per = int(os.environ["PER_MB"])
+        print(f"transcode job starting workers={w}", flush=True)
+        held = []
+        for i in range(w):
+            b = bytearray(per * 1048576)
+            b[::4096] = b"\x01" * len(range(0, len(b), 4096))
+            held.append(b)
+            time.sleep(0.2)
+        time.sleep(2)
+        print(f"transcode job done workers={w} staged={w * per}MiB", flush=True)
+        PY
+        printf '%s\n' 'FROM python:3.13-alpine' 'COPY job.py /app/job.py' 'ENV PER_MB={{per}} WORKERS=4' \
+          'CMD ["python3", "/app/job.py"]' > "$d/Dockerfile"
+        docker build -q -t copperleaf/transcoder:3 "$d" >/dev/null
+        rm -rf "$d"
+        docker rm -f transcoder >/dev/null 2>&1 || true
+        docker run --name transcoder --memory 512m --memory-swap 512m copperleaf/transcoder:3 >/dev/null 2>&1 || true
+        docker inspect transcoder | jq -r '.[0].Id[0:12]' > /var/lib/cloudtrain/failed.id12
+        rm -f /home/learner/oom-evidence.txt
+  checks:
+    - id: evidence
+      description: oom-evidence.txt records the failed container's ID, exit code and OOMKilled flag
+      type: shell
+      timeoutSec: 60
+      on: cl-transcode-03
+      skills: [containers.operations.exit-codes]
+      weight: 2
+      command: |
+        want="$(cat /var/lib/cloudtrain/failed.id12) 137 true"
+        got=$(head -1 /home/learner/oom-evidence.txt 2>/dev/null | tr -s ' \t' '  ' | sed 's/^ //; s/ $//')
+        [ "$got" = "$want" ] && echo recorded || echo "mismatch"
+      expect: {match: exact, value: recorded}
+    - id: finished
+      description: transcoder ran with two workers and exited 0 without an OOM kill
+      type: shell
+      timeoutSec: 60
+      on: cl-transcode-03
+      skills: [containers.operations.exit-codes, containers.runtime-security.limits]
+      weight: 3
+      command: |
+        s=$(docker inspect transcoder 2>/dev/null | jq -r '.[0] | "\(.State.Status) \(.State.ExitCode) \(.State.OOMKilled) \(.Config.Env | index("WORKERS=2") != null)"')
+        if [ "$s" = "exited 0 false true" ] && docker logs transcoder 2>&1 | grep -qx "transcode job done workers=2 staged=$(( 2 * {{per}} ))MiB"; then echo finished; else echo "not-finished: $s"; fi
+      expect: {match: exact, value: finished}
+    - id: limit
+      description: transcoder has a memory limit of exactly 1 GiB
+      type: shell
+      timeoutSec: 60
+      on: cl-transcode-03
+      skills: [containers.runtime-security.limits]
+      weight: 2
+      command: docker inspect transcoder 2>/dev/null | jq -r '.[0].HostConfig.Memory'
+      expect: {match: exact, value: "1073741824"}
+  hints:
+    - title: Where the engine records the kill
+      body: "`docker inspect` has a State block with ExitCode and OOMKilled. 137 is 128 + 9 (SIGKILL), which the kernel OOM killer sends when a cgroup reaches its memory limit."
+      command: docker inspect transcoder | jq '.[0].State | {ExitCode, OOMKilled}'
+      cost: 1
+    - title: Memory is the workers times the frame buffer
+      body: "The job stages WORKERS x {{per}} MiB. Four workers need more than 1 GiB even with a bigger limit, so the number of workers has to come down as well."
+      cost: 1
+    - title: Setting both on a new container
+      body: "A running or exited container's environment cannot be changed. Remove it and run it again with `-m 1g` and `-e WORKERS=2`."
+      cost: 2
+  misconceptions:
+    - id: limit-only
+      description: Raises the memory limit to 1 GiB but keeps the four default workers.
+      feedback: "Four workers stage 4 x {{per}} MiB, more than 1 GiB, so the kernel kills the job again. Lower WORKERS to 2 as well."
+      expectFail: [finished]
+      mutation:
+        on: cl-transcode-03
+        as: learner
+        run: |
+          docker inspect transcoder | jq -r '.[0].Id[0:12]' | sed 's/$/ 137 true/' > ~/oom-evidence.txt
+          docker rm -f transcoder
+          docker run --name transcoder -m 1g copperleaf/transcoder:3 || true
+    - id: no-limit
+      description: Drops the memory limit and only lowers the workers.
+      feedback: "The job finishes, but a container with no limit can take the whole host. The task asks for a 1 GiB limit."
+      expectFail: [limit]
+      mutation:
+        on: cl-transcode-03
+        as: learner
+        run: |
+          docker inspect transcoder | jq -r '.[0].Id[0:12]' | sed 's/$/ 137 true/' > ~/oom-evidence.txt
+          docker rm -f transcoder
+          docker run --name transcoder -e WORKERS=2 copperleaf/transcoder:3
+    - id: guessed-cause
+      description: Writes a guess ("crashed") instead of reading the state.
+      feedback: "State.OOMKilled is true and ExitCode is 137: the container was OOM-killed at its 512 MiB limit, not crashed. Record what inspect says."
+      expectFail: [evidence]
+      mutation:
+        on: cl-transcode-03
+        as: learner
+        run: |
+          echo "crashed 1 false" > ~/oom-evidence.txt
+          docker rm -f transcoder
+          docker run --name transcoder -m 1g -e WORKERS=2 copperleaf/transcoder:3
+  solution:
+    explanation: |
+      `docker inspect` shows ExitCode 137 and OOMKilled true: the 512 MiB limit was
+      hit. Record that, then run the job again with a 1 GiB limit and two workers
+      (2 x {{per}} MiB fits in 1 GiB).
+    steps:
+      - on: cl-transcode-03
+        as: learner
+        run: |
+          docker inspect transcoder | jq -r '.[0] | "\(.Id[0:12]) \(.State.ExitCode) \(.State.OOMKilled)"' > ~/oom-evidence.txt
+          cat ~/oom-evidence.txt
+          docker rm transcoder
+          docker run --name transcoder -m 1g -e WORKERS=2 copperleaf/transcoder:3
+    alternatives:
+      - id: create-start
+        description: Create the container first, then start it attached.
+        steps:
+          - on: cl-transcode-03
+            as: learner
+            run: |
+              docker inspect transcoder | jq -r '.[0] | "\(.Id[0:12]) \(.State.ExitCode) \(.State.OOMKilled)"' > ~/oom-evidence.txt
+              docker rm transcoder
+              docker create --name transcoder --memory 1g --memory-swap 1g -e WORKERS=2 copperleaf/transcoder:3
+              docker start -a transcoder

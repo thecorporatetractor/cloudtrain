@@ -1,0 +1,379 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-swarm-stack
+  title: Deploy the ad-insertion stack with an overlay network and secrets
+  domain: containers
+  frameworks: [dca-legacy:orchestration]
+  difficulty: hard
+  estimatedMinutes: 25
+  tags: [swarm, stack, overlay, secrets, configs]
+  version: 1
+spec:
+  description: |
+    The playout swarm is up (`playout-1` manager; `playout-2` and `playout-3` workers;
+    `ssh playout-1`). Work on `playout-1` in `~/ads`, which holds an unfinished Compose
+    file `stack.yaml` for the ad-insertion service, the partner key `partner.key` and
+    the rules file `ad-rules.txt`. The image `playout-1:5000/ad-insertion:1` is in the
+    private registry (plain HTTP, allowed on all hosts).
+
+    Deploy the stack **named `ads`** so that:
+
+    - the service runs with 3 replicas on an **encrypted overlay network**
+      (`ads-net`);
+    - the partner key is a **swarm secret** (the service reads `/run/secrets/partner_key`);
+    - the rules file is a **swarm config** mounted at `/etc/copperleaf/ad-rules.txt`;
+    - the service is reachable through the **routing mesh on port 8088** on every node.
+
+    The service page reports the rules text and the size of the key it was given
+    (`keybytes={{keylen}}`).
+  objectives:
+    - Deploy a stack from a Compose file with docker stack deploy
+    - Encrypt an overlay network and use swarm secrets and configs
+    - Publish a service through the routing mesh
+  params:
+    rev:
+      type: int
+      min: 10
+      max: 99
+    keylen:
+      type: int
+      min: 24
+      max: 48
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: playout-1
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+      - name: playout-2
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+      - name: playout-3
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: playout-1
+      timeoutSec: 600
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        install -d -m 700 /var/lib/cloudtrain
+        docker swarm leave --force >/dev/null 2>&1 || true
+        docker ps -aq | xargs -r docker rm -f >/dev/null 2>&1 || true
+        f=/etc/docker/daemon.json
+        [ -s "$f" ] || echo '{}' > "$f"
+        jq '. + {"insecure-registries": ((."insecure-registries" // []) + ["playout-1:5000"] | unique)}' "$f" > "$f.new" && mv "$f.new" "$f"
+        systemctl restart docker
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        rm -rf /srv/registry; install -d /srv/registry
+        docker run -d --name registry --restart always -p 5000:5000 -v /srv/registry:/var/lib/registry registry:3 >/dev/null
+        for i in $(seq 30); do curl -fs http://127.0.0.1:5000/v2/ >/dev/null && break; sleep 1; done
+        d=$(mktemp -d)
+        cat > "$d/run.sh" <<'SH'
+        #!/bin/sh
+        mkdir -p /www
+        printf 'ad-insertion ok rules=%s keybytes=%s\n' "$(cat /etc/copperleaf/ad-rules.txt)" "$(wc -c < /run/secrets/partner_key | tr -d ' ')" > /www/index.html
+        exec httpd -f -p 8080 -h /www
+        SH
+        chmod 755 "$d/run.sh"
+        printf '%s\n' 'FROM busybox:1.37' 'COPY run.sh /run.sh' 'CMD ["/run.sh"]' > "$d/Dockerfile"
+        docker build -q -t playout-1:5000/ad-insertion:1 "$d" >/dev/null
+        docker push -q playout-1:5000/ad-insertion:1 >/dev/null
+        rm -rf "$d"
+        install -d -o learner -g learner /home/learner/ads
+        head -c {{keylen}} /dev/urandom | base64 -w0 | head -c {{keylen}} > /home/learner/ads/partner.key
+        printf 'block-list-v{{rev}}' > /home/learner/ads/ad-rules.txt
+        cat > /home/learner/ads/stack.yaml <<'YML'
+        services:
+          ads:
+            image: playout-1:5000/ad-insertion:1
+            deploy:
+              replicas: 3
+            ports:
+              - "8080:8080"
+            networks:
+              - ads-net
+        networks:
+          ads-net:
+            driver: overlay
+        YML
+        chown -R learner:learner /home/learner/ads
+        ip=$(hostname -I | awk '{print $1}')
+        docker swarm init --advertise-addr "$ip" >/dev/null
+        rm -rf /srv/tokens; install -d /srv/tokens
+        docker swarm join-token -q worker > /srv/tokens/worker
+        docker run -d --name tokensrv -p 8077:80 -v /srv/tokens:/usr/share/nginx/html:ro nginx:1.29-alpine >/dev/null
+    - on: playout-2
+      timeoutSec: 300
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        docker swarm leave --force >/dev/null 2>&1 || true
+        docker ps -aq | xargs -r docker rm -f >/dev/null 2>&1 || true
+        f=/etc/docker/daemon.json
+        [ -s "$f" ] || echo '{}' > "$f"
+        jq '. + {"insecure-registries": ((."insecure-registries" // []) + ["playout-1:5000"] | unique)}' "$f" > "$f.new" && mv "$f.new" "$f"
+        systemctl restart docker
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        ip=$(getent ahostsv4 playout-1 | awk '{print $1; exit}')
+        tok=$(curl -fsS --retry 15 --retry-connrefused --retry-delay 2 "http://$ip:8077/worker")
+        docker swarm join --token "$tok" "$ip:2377" >/dev/null
+    - on: playout-3
+      timeoutSec: 300
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        docker swarm leave --force >/dev/null 2>&1 || true
+        docker ps -aq | xargs -r docker rm -f >/dev/null 2>&1 || true
+        f=/etc/docker/daemon.json
+        [ -s "$f" ] || echo '{}' > "$f"
+        jq '. + {"insecure-registries": ((."insecure-registries" // []) + ["playout-1:5000"] | unique)}' "$f" > "$f.new" && mv "$f.new" "$f"
+        systemctl restart docker
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        ip=$(getent ahostsv4 playout-1 | awk '{print $1; exit}')
+        tok=$(curl -fsS --retry 15 --retry-connrefused --retry-delay 2 "http://$ip:8077/worker")
+        docker swarm join --token "$tok" "$ip:2377" >/dev/null
+    - on: playout-1
+      timeoutSec: 60
+      run: |
+        docker rm -f tokensrv >/dev/null 2>&1 || true
+        rm -rf /srv/tokens
+  checks:
+    - id: replicas
+      description: The ads service has 3 of 3 replicas running
+      type: shell
+      timeoutSec: 150
+      on: playout-1
+      skills: [containers.swarm.stacks]
+      weight: 2
+      command: |
+        r=none
+        for i in $(seq 40); do
+          r=$(docker service ls --filter label=com.docker.stack.namespace=ads --format json 2>/dev/null | jq -s -r 'map("\(.Name) \(.Replicas)") | join(",")')
+          [ "$r" = "ads_ads 3/3" ] && break; sleep 3
+        done
+        echo "$r"
+      expect: {match: exact, value: "ads_ads 3/3"}
+    - id: encrypted-overlay
+      description: The stack network is an encrypted swarm overlay
+      type: shell
+      timeoutSec: 60
+      on: playout-1
+      skills: [containers.swarm.stacks, containers.network.bridge-dns]
+      weight: 2
+      command: |
+        docker network inspect ads_ads-net 2>/dev/null | jq -r '.[0] | "\(.Driver) \(.Scope) \(.Options | has("encrypted"))"'
+      expect: {match: exact, value: "overlay swarm true"}
+    - id: secret-and-config
+      description: The service uses one swarm secret named partner_key and one swarm config
+      type: shell
+      timeoutSec: 60
+      on: playout-1
+      skills: [containers.swarm.stacks]
+      weight: 2
+      command: |
+        docker service inspect ads_ads 2>/dev/null | jq -r '.[0].Spec.TaskTemplate.ContainerSpec | "\(.Secrets | length) \(.Secrets[0].File.Name) \(.Configs | length) \(.Configs[0].File.Name)"'
+      expect: {match: exact, value: "1 partner_key 1 /etc/copperleaf/ad-rules.txt"}
+    - id: mesh-playout-1
+      description: Port 8088 on playout-1 serves the page with the rules and the key size
+      type: shell
+      timeoutSec: 120
+      on: playout-1
+      skills: [containers.swarm.stacks]
+      weight: 1
+      command: |
+        for i in $(seq 30); do r=$(curl -s --max-time 3 http://127.0.0.1:8088/ 2>/dev/null); case "$r" in ad-insertion*) break ;; esac; sleep 2; done; echo "$r"
+      expect: {match: exact, value: "ad-insertion ok rules=block-list-v{{rev}} keybytes={{keylen}}"}
+    - id: mesh-playout-2
+      description: Port 8088 on playout-2 serves the same page
+      type: shell
+      timeoutSec: 120
+      on: playout-2
+      skills: [containers.swarm.stacks]
+      weight: 1
+      command: |
+        for i in $(seq 30); do r=$(curl -s --max-time 3 http://127.0.0.1:8088/ 2>/dev/null); case "$r" in ad-insertion*) break ;; esac; sleep 2; done; echo "$r"
+      expect: {match: exact, value: "ad-insertion ok rules=block-list-v{{rev}} keybytes={{keylen}}"}
+    - id: mesh-playout-3
+      description: Port 8088 on playout-3 serves the same page
+      type: shell
+      timeoutSec: 120
+      on: playout-3
+      skills: [containers.swarm.stacks]
+      weight: 1
+      command: |
+        for i in $(seq 30); do r=$(curl -s --max-time 3 http://127.0.0.1:8088/ 2>/dev/null); case "$r" in ad-insertion*) break ;; esac; sleep 2; done; echo "$r"
+      expect: {match: exact, value: "ad-insertion ok rules=block-list-v{{rev}} keybytes={{keylen}}"}
+  hints:
+    - title: Finish the Compose file
+      body: "The file needs: ports `8088:8080`, `driver_opts: {encrypted: \"true\"}` on the network, a `secrets:` and a `configs:` section (each with `file:`) and references to them in the service; a config needs a `target` path."
+      cost: 1
+    - title: Deploy as a stack
+      body: "`docker stack deploy -c stack.yaml ads` creates the network `ads_ads-net`, the secret and the config and the service `ads_ads`; names are prefixed with the stack name."
+      cost: 1
+    - title: Look at the result
+      body: "`docker stack ps ads` shows where tasks run; `docker service logs ads_ads` and `curl http://127.0.0.1:8088/` show what the container sees."
+      cost: 1
+  misconceptions:
+    - id: plain-overlay
+      description: Deploys the overlay network without encryption.
+      feedback: "Overlay traffic between nodes is unencrypted unless the network is created with the encrypted driver option."
+      expectFail: [encrypted-overlay]
+      mutation:
+        on: playout-1
+        as: learner
+        run: |
+          cd ~/ads
+          cat > stack.yaml <<'YML'
+          services:
+            ads:
+              image: playout-1:5000/ad-insertion:1
+              deploy:
+                replicas: 3
+              ports:
+                - "8088:8080"
+              networks:
+                - ads-net
+              secrets:
+                - partner_key
+              configs:
+                - source: ad_rules
+                  target: /etc/copperleaf/ad-rules.txt
+          networks:
+            ads-net:
+              driver: overlay
+          secrets:
+            partner_key:
+              file: ./partner.key
+          configs:
+            ad_rules:
+              file: ./ad-rules.txt
+          YML
+          docker stack deploy -c stack.yaml ads
+    - id: container-port
+      description: Publishes the container port 8080 instead of 8088.
+      feedback: "The grader (and the routing mesh contract) use port 8088; map `8088:8080`."
+      expectFail: [mesh-playout-1, mesh-playout-2, mesh-playout-3]
+      mutation:
+        on: playout-1
+        as: learner
+        run: |
+          cd ~/ads
+          cat > stack.yaml <<'YML'
+          services:
+            ads:
+              image: playout-1:5000/ad-insertion:1
+              deploy:
+                replicas: 3
+              ports:
+                - "8080:8080"
+              networks:
+                - ads-net
+              secrets:
+                - partner_key
+              configs:
+                - source: ad_rules
+                  target: /etc/copperleaf/ad-rules.txt
+          networks:
+            ads-net:
+              driver: overlay
+              driver_opts:
+                encrypted: "true"
+          secrets:
+            partner_key:
+              file: ./partner.key
+          configs:
+            ad_rules:
+              file: ./ad-rules.txt
+          YML
+          docker stack deploy -c stack.yaml ads
+  solution:
+    explanation: |
+      Complete the Compose file (port 8088, encrypted network, secret and config from the
+      local files) and deploy it with `docker stack deploy` as the stack `ads`.
+    steps:
+      - on: playout-1
+        as: learner
+        run: |
+          cd ~/ads
+          cat > stack.yaml <<'YML'
+          services:
+            ads:
+              image: playout-1:5000/ad-insertion:1
+              deploy:
+                replicas: 3
+              ports:
+                - "8088:8080"
+              networks:
+                - ads-net
+              secrets:
+                - partner_key
+              configs:
+                - source: ad_rules
+                  target: /etc/copperleaf/ad-rules.txt
+          networks:
+            ads-net:
+              driver: overlay
+              driver_opts:
+                encrypted: "true"
+          secrets:
+            partner_key:
+              file: ./partner.key
+          configs:
+            ad_rules:
+              file: ./ad-rules.txt
+          YML
+          docker stack deploy -c stack.yaml ads
+          docker stack ps ads
+    alternatives:
+      - id: external-secret-and-config
+        description: Create the secret and the config by hand and reference them as external.
+        steps:
+          - on: playout-1
+            as: learner
+            run: |
+              cd ~/ads
+              docker secret create partner_key partner.key
+              docker config create ad_rules ad-rules.txt
+              cat > stack.yaml <<'YML'
+              services:
+                ads:
+                  image: playout-1:5000/ad-insertion:1
+                  deploy:
+                    replicas: 3
+                  ports:
+                    - "8088:8080"
+                  networks:
+                    - ads-net
+                  secrets:
+                    - partner_key
+                  configs:
+                    - source: ad_rules
+                      target: /etc/copperleaf/ad-rules.txt
+              networks:
+                ads-net:
+                  driver: overlay
+                  driver_opts:
+                    encrypted: "true"
+              secrets:
+                partner_key:
+                  external: true
+              configs:
+                ad_rules:
+                  external: true
+              YML
+              docker stack deploy -c stack.yaml ads

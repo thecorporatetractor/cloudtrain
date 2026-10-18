@@ -1,0 +1,179 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-runc-bundle
+  title: Run the subtitle service from a hand-made OCI bundle
+  domain: containers
+  frameworks: []
+  difficulty: hard
+  estimatedMinutes: 25
+  tags: [oci, runtime-spec, bundle, runc, internals]
+  version: 1
+spec:
+  description: |
+    On `cl-oci-01` (`ssh cl-oci-01`; you are in the `docker` group and have `sudo`) the
+    subtitle image `copperleaf/subtitle-svc:2` exists, but nothing runs it. Run it
+    without the engine, from an OCI runtime **bundle** that you make yourself:
+
+    1. Export the image's filesystem into **`~/bundle/rootfs`** (the image carries
+       `/etc/copperleaf/subtitle.conf`).
+    2. Generate **`~/bundle/config.json`** with the runtime's spec generator and edit
+       it: the hostname must be **`caption-box`**, the root filesystem **read-only**, no
+       terminal, and the process `sleep 3600`.
+    3. Start it **detached** with the OCI runtime as root under the container ID
+       **`caption-box`**, so that it appears in the runtime's own container list and
+       keeps running.
+
+    The release marker to find in the bundle is `rel={{rel}}`.
+  objectives:
+    - Assemble an OCI bundle from an image export
+    - Edit the runtime spec for hostname, root mount and process
+    - Start and list a container directly with the OCI runtime
+  params:
+    rel:
+      type: int
+      min: 100
+      max: 999
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-oci-01
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-oci-01
+      timeoutSec: 300
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        command -v runc >/dev/null
+        d=$(mktemp -d)
+        printf '%s\n' 'FROM busybox:1.37' 'RUN mkdir -p /etc/copperleaf && echo "rel={{rel}}" > /etc/copperleaf/subtitle.conf' \
+          'CMD ["sleep", "3600"]' > "$d/Dockerfile"
+        docker build -q -t copperleaf/subtitle-svc:2 "$d" >/dev/null
+        rm -rf "$d"
+        runc delete -f caption-box >/dev/null 2>&1 || true
+        rm -rf /home/learner/bundle
+  checks:
+    - id: listed-running
+      description: runc lists caption-box as running
+      type: shell
+      timeoutSec: 60
+      on: cl-oci-01
+      skills: [containers.internals.oci-bundle]
+      weight: 3
+      command: runc list -f json 2>/dev/null | jq -r '[.[] | select(.id == "caption-box") | .status] | first // "absent"'
+      expect: {match: exact, value: running}
+    - id: spec
+      description: The bundle's config.json has hostname caption-box, a read-only root and no terminal
+      type: shell
+      timeoutSec: 60
+      on: cl-oci-01
+      skills: [containers.internals.oci-bundle]
+      weight: 2
+      command: |
+        b=$(runc state caption-box 2>/dev/null | jq -r '.bundle')
+        jq -r '[.hostname, (.root.readonly | tostring), (.process.terminal | tostring)] | join(" ")' "$b/config.json" 2>/dev/null || echo unreadable
+      expect: {match: exact, value: "caption-box true false"}
+    - id: live
+      description: The running process has hostname caption-box, a read-only root and the image's files
+      type: shell
+      timeoutSec: 60
+      on: cl-oci-01
+      skills: [containers.internals.oci-bundle]
+      weight: 3
+      command: |
+        pid=$(runc state caption-box 2>/dev/null | jq -r '.pid')
+        [ -n "$pid" ] && [ "$pid" != null ] && [ "$pid" -gt 1 ] || { echo "not-running"; exit 0; }
+        h=$(nsenter -t "$pid" -u hostname)
+        if touch /proc/$pid/root/grader-probe 2>/dev/null; then rm -f /proc/$pid/root/grader-probe; ro=writable; else ro=read-only; fi
+        if grep -qx 'rel={{rel}}' /proc/$pid/root/etc/copperleaf/subtitle.conf 2>/dev/null; then r=from-image; else r=wrong-rootfs; fi
+        echo "$h $ro $r"
+      expect: {match: exact, value: "caption-box read-only from-image"}
+  hints:
+    - title: Export the filesystem
+      body: "`docker create` makes a stopped container from the image and `docker export` streams its filesystem as a tar. Extract it as root so ownership is kept: `docker export <id> | sudo tar -C ~/bundle/rootfs -xf -`."
+      cost: 1
+    - title: Generate and edit the spec
+      body: "`runc spec` writes a default config.json next to the rootfs. Edit it with jq: `.hostname`, `.root.readonly`, `.process.terminal` and `.process.args`. A terminal needs a console socket, so turn it off."
+      command: cd ~/bundle && runc spec
+      cost: 1
+    - title: Start it detached
+      body: "`sudo runc run -d caption-box` run from the bundle directory (or with `--bundle`) with stdin and output redirected away, e.g. `</dev/null >/dev/null 2>&1`. `sudo runc list` shows it."
+      cost: 2
+  misconceptions:
+    - id: default-hostname
+      description: Leaves the generated hostname (runc) in the spec.
+      feedback: "runc spec writes hostname `runc`. Set `.hostname` to caption-box in config.json before starting."
+      expectFail: [spec, live]
+      mutation:
+        on: cl-oci-01
+        as: learner
+        run: |
+          mkdir -p ~/bundle/rootfs && cd ~/bundle
+          id=$(docker create copperleaf/subtitle-svc:2)
+          docker export "$id" | sudo tar -C rootfs -xf -
+          docker rm "$id"
+          runc spec
+          jq '.process.terminal = false | .process.args = ["sleep", "3600"]' config.json > c.json && mv c.json config.json
+          sudo runc run -d caption-box </dev/null >/dev/null 2>&1
+    - id: writable-root
+      description: Sets the root filesystem writable.
+      feedback: "The task keeps the root read-only (`.root.readonly` true); a service that writes should get a volume instead."
+      expectFail: [spec, live]
+      mutation:
+        on: cl-oci-01
+        as: learner
+        run: |
+          mkdir -p ~/bundle/rootfs && cd ~/bundle
+          id=$(docker create copperleaf/subtitle-svc:2)
+          docker export "$id" | sudo tar -C rootfs -xf -
+          docker rm "$id"
+          runc spec
+          jq '.hostname = "caption-box" | .root.readonly = false | .process.terminal = false | .process.args = ["sleep", "3600"]' config.json > c.json && mv c.json config.json
+          sudo runc run -d caption-box </dev/null >/dev/null 2>&1
+  solution:
+    explanation: |
+      Export the image filesystem into rootfs, generate a default spec with `runc spec`,
+      set hostname, read-only root, no terminal and the process, then `runc run -d`.
+    steps:
+      - on: cl-oci-01
+        as: learner
+        run: |
+          mkdir -p ~/bundle/rootfs && cd ~/bundle
+          id=$(docker create copperleaf/subtitle-svc:2)
+          docker export "$id" | sudo tar -C rootfs -xf -
+          docker rm "$id"
+          runc spec
+          jq '.hostname = "caption-box" | .root.readonly = true | .process.terminal = false | .process.args = ["sleep", "3600"]' config.json > c.json && mv c.json config.json
+          sudo runc run -d caption-box </dev/null >/dev/null 2>&1
+          sudo runc list
+    alternatives:
+      - id: unprivileged-extract-python-edit
+        description: Extract the export as the learner user and edit the spec with python instead of jq.
+        steps:
+          - on: cl-oci-01
+            as: learner
+            run: |
+              mkdir -p ~/bundle/rootfs && cd ~/bundle
+              id=$(docker create copperleaf/subtitle-svc:2)
+              docker export "$id" | tar -C rootfs -xf -
+              docker rm "$id"
+              runc spec
+              python3 - <<'PY'
+              import json
+              c = json.load(open("config.json"))
+              c["hostname"] = "caption-box"
+              c["root"]["readonly"] = True
+              c["process"]["terminal"] = False
+              c["process"]["args"] = ["sleep", "3600"]
+              json.dump(c, open("config.json", "w"), indent=2)
+              PY
+              sudo runc run -d caption-box </dev/null >/dev/null 2>&1

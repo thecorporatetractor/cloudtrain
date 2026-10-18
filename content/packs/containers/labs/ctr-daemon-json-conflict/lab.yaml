@@ -1,0 +1,190 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-daemon-json-conflict
+  title: Bring a dead engine back after a daemon.json change
+  domain: containers
+  frameworks: [dca-legacy:install-config, docker-practitioner:operations]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [docker, daemon-json, systemd, drop-in]
+  version: 1
+spec:
+  description: |
+    On the packaging host `cl-pack-01` (`ssh cl-pack-01`; you have `sudo`) the Docker
+    engine no longer starts. Someone added a `hosts` entry to `/etc/docker/daemon.json`
+    so the engine would also listen on `tcp://127.0.0.1:2375`, but the `docker.service`
+    unit already passes `-H fd://` on its command line and the engine refuses to start
+    with the same directive in both places.
+
+    Bring the engine back so that it:
+
+    - starts and listens on the Unix socket **and** on `tcp://127.0.0.1:2375`;
+    - keeps every other setting of `daemon.json` (the `log-driver` and the
+      `default-address-pools` entry `10.{{net}}.0.0/16`), including the `hosts` entry;
+    - runs the container **`packager`** (restart policy `always`) again.
+
+    Fix it with a **systemd drop-in** that removes `-H` from the command line. Do not
+    edit the packaged unit file and do not delete the `hosts` entry.
+  objectives:
+    - Read why the engine failed from systemctl and journalctl
+    - Understand the conflict between command-line flags and daemon.json
+    - Override ExecStart with a drop-in (clear, then set again)
+  params:
+    net:
+      type: int
+      min: 150
+      max: 199
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-pack-01
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-pack-01
+      timeoutSec: 400
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        install -d -m 700 /var/lib/cloudtrain
+        rm -rf /etc/systemd/system/docker.service.d
+        docker rm -f packager >/dev/null 2>&1 || true
+        docker run -d --name packager --restart always busybox:1.37 sleep infinity >/dev/null
+        unit=$(systemctl show -p FragmentPath docker --value)
+        sha256sum "$unit" | cut -d' ' -f1 > /var/lib/cloudtrain/unit.sha256
+        echo "$unit" > /var/lib/cloudtrain/unit.path
+        f=/etc/docker/daemon.json
+        [ -s "$f" ] || echo '{}' > "$f"
+        jq '. + {"log-driver": "local", "default-address-pools": [{"base": "10.{{net}}.0.0/16", "size": 24}], "hosts": ["unix:///var/run/docker.sock", "tcp://127.0.0.1:2375"]}' "$f" > "$f.new" && mv "$f.new" "$f"
+        systemctl daemon-reload
+        systemctl restart docker || true
+        systemctl restart docker || true
+  checks:
+    - id: engine-up
+      description: The engine is running Engine 29 on the Unix socket
+      type: shell
+      timeoutSec: 90
+      on: cl-pack-01
+      skills: [containers.operations.daemon-config]
+      weight: 2
+      command: |
+        for i in $(seq 20); do docker -H unix:///var/run/docker.sock info >/dev/null 2>&1 && break; sleep 2; done
+        docker -H unix:///var/run/docker.sock info --format json 2>/dev/null | jq -r '.ServerVersion | split(".")[0]'
+      expect: {match: exact, value: "29"}
+    - id: tcp-listener
+      description: The engine answers on tcp://127.0.0.1:2375
+      type: shell
+      timeoutSec: 60
+      on: cl-pack-01
+      skills: [containers.operations.daemon-config]
+      weight: 2
+      command: curl -s --max-time 5 http://127.0.0.1:2375/_ping || echo no-answer
+      expect: {match: exact, value: "OK"}
+    - id: config-kept
+      description: log-driver, address pool and both hosts of daemon.json are in effect
+      type: shell
+      timeoutSec: 60
+      on: cl-pack-01
+      skills: [containers.operations.daemon-config]
+      weight: 2
+      command: |
+        i=$(docker info --format json 2>/dev/null | jq -r '[.LoggingDriver, .DefaultAddressPools[0].Base] | join(" ")')
+        h=$(jq -r '.hosts | length' /etc/docker/daemon.json 2>/dev/null || echo 0)
+        echo "$i hosts=$h"
+      expect: {match: exact, value: "local 10.{{net}}.0.0/16 hosts=2"}
+    - id: drop-in
+      description: The effective command line has no -H, via a drop-in; the packaged unit is untouched
+      type: shell
+      timeoutSec: 60
+      on: cl-pack-01
+      skills: [containers.operations.daemon-config]
+      weight: 2
+      command: |
+        es=$(systemctl show -p ExecStart --value docker 2>/dev/null)
+        case "$es" in *' -H '*|*'fd://'*) h=has-H ;; *) h=no-H ;; esac
+        if [ "$(sha256sum "$(cat /var/lib/cloudtrain/unit.path)" | cut -d' ' -f1)" = "$(cat /var/lib/cloudtrain/unit.sha256)" ]; then u=unit-intact; else u=unit-edited; fi
+        if ls /etc/systemd/system/docker.service.d/*.conf >/dev/null 2>&1; then d=drop-in; else d=no-drop-in; fi
+        echo "$h $u $d"
+      expect: {match: exact, value: "no-H unit-intact drop-in"}
+    - id: packager-running
+      description: packager is running again
+      type: shell
+      timeoutSec: 90
+      on: cl-pack-01
+      skills: [containers.operations.daemon-config, containers.operations.restart-health]
+      weight: 1
+      command: |
+        for i in $(seq 30); do [ "$(docker inspect packager 2>/dev/null | jq -r '.[0].State.Running')" = true ] && { echo running; exit 0; }; sleep 2; done; echo not-running
+      expect: {match: exact, value: running}
+  hints:
+    - title: Read the failure
+      body: "`systemctl status docker` and `journalctl -u docker -n 20` say which directive is given twice. The unit may also have hit its start limit; `systemctl reset-failed docker` clears that."
+      command: journalctl -u docker -n 20 --no-pager
+      cost: 1
+    - title: Overriding ExecStart
+      body: "A drop-in cannot edit one flag. It must first clear the list with an empty `ExecStart=` and then give the full command again, without -H. `systemctl cat docker` shows the original line."
+      cost: 1
+    - title: After writing the drop-in
+      body: "Run `systemctl daemon-reload` so systemd reads it, then `systemctl reset-failed docker` and `systemctl restart docker`."
+      cost: 2
+  misconceptions:
+    - id: remove-hosts
+      description: Deletes the hosts entry from daemon.json to get the engine back.
+      feedback: "That brings the engine back, but without the tcp listener the task asks for. Keep daemon.json and remove -H from the unit's command line instead."
+      expectFail: [tcp-listener, config-kept]
+      mutation:
+        on: cl-pack-01
+        as: learner
+        run: |
+          sudo sh -c 'jq "del(.hosts)" /etc/docker/daemon.json > /etc/docker/daemon.json.new && mv /etc/docker/daemon.json.new /etc/docker/daemon.json'
+          sudo systemctl reset-failed docker
+          sudo systemctl restart docker
+    - id: edit-unit
+      description: Edits the packaged unit file in place.
+      feedback: "A package upgrade overwrites /usr/lib/systemd/system/docker.service. Put the change in a drop-in under /etc/systemd/system/docker.service.d/."
+      expectFail: [drop-in]
+      mutation:
+        on: cl-pack-01
+        as: learner
+        run: |
+          sudo sed -i 's# -H fd://##' "$(systemctl show -p FragmentPath docker --value)"
+          sudo systemctl daemon-reload
+          sudo systemctl reset-failed docker
+          sudo systemctl restart docker
+  solution:
+    explanation: |
+      The unit passes `-H fd://` and daemon.json has `hosts`; the engine refuses both.
+      A drop-in clears `ExecStart` and sets it again without `-H`, so the hosts from
+      daemon.json are the only listeners.
+    steps:
+      - on: cl-pack-01
+        as: learner
+        run: |
+          journalctl -u docker -n 5 --no-pager || true
+          sudo install -d /etc/systemd/system/docker.service.d
+          printf '[Service]\nExecStart=\nExecStart=/usr/bin/dockerd --containerd=/run/containerd/containerd.sock\n' | sudo tee /etc/systemd/system/docker.service.d/override.conf >/dev/null
+          sudo systemctl daemon-reload
+          sudo systemctl reset-failed docker
+          sudo systemctl restart docker
+          docker info --format json | jq -r .ServerVersion
+    alternatives:
+      - id: other-file-name
+        description: Same drop-in under another file name, found by copying the original ExecStart line.
+        steps:
+          - on: cl-pack-01
+            as: learner
+            run: |
+              orig=$(systemctl show -p ExecStart --value docker | sed -n 's/.*argv\[\]=\([^;]*\) ;.*/\1/p' | sed 's# -H fd://##')
+              sudo install -d /etc/systemd/system/docker.service.d
+              printf '[Service]\nExecStart=\nExecStart=%s\n' "$orig" | sudo tee /etc/systemd/system/docker.service.d/10-no-h-flag.conf >/dev/null
+              sudo systemctl daemon-reload
+              sudo systemctl reset-failed docker
+              sudo systemctl restart docker

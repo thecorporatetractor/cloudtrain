@@ -1,0 +1,200 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-seccomp-legacy-binary
+  title: Restore a legacy caption encoder without going unconfined
+  domain: containers
+  frameworks: [docker-practitioner:security, docker-practitioner:operations]
+  difficulty: hard
+  estimatedMinutes: 20
+  tags: [docker, seccomp, security, syscalls]
+  version: 1
+spec:
+  description: |
+    On `cl-caption-01` (`ssh cl-caption-01`; you are in the `docker` group) the
+    security team set a tightened **daemon-wide seccomp profile**,
+    `/etc/copperleaf/seccomp/tight.json` (`seccomp-profile` in `/etc/docker/daemon.json`),
+    which denies a list of syscalls with `EPERM` for every container.
+
+    The legacy caption encoder (image `copperleaf/caption-encoder:1`, container
+    **`caption-encoder`**) calls the `personality` syscall at start-up to choose its
+    execution domain, so the tightened profile makes it exit with status 1. The
+    encoder must print `encoded {{jobs}} captions` and exit 0.
+
+    Create a **derived profile** that differs from the tightened one by allowing
+    `personality` and nothing else, and run **`caption-encoder`** with it (seccomp
+    enabled, no `unconfined`, no `--privileged`). Leave the daemon-wide profile as it
+    is: other containers on the host must keep the tight rules.
+  objectives:
+    - Read a container's seccomp profile settings from docker inspect
+    - Derive a custom profile from an existing one with a minimal change
+    - Apply a per-container profile without weakening the daemon default
+  params:
+    jobs:
+      type: int
+      min: 20
+      max: 90
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-caption-01
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-caption-01
+      timeoutSec: 400
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        install -d -m 700 /var/lib/cloudtrain
+        d=$(mktemp -d)
+        cat > "$d/encoder.py" <<'PY'
+        import ctypes, os, platform, sys
+        libc = ctypes.CDLL(None, use_errno=True)
+        nr = 135 if platform.machine() == "x86_64" else 92
+        libc.syscall.restype = ctypes.c_long
+        r = libc.syscall(ctypes.c_long(nr), ctypes.c_ulong(0xFFFFFFFF))
+        if r == -1:
+            print("caption-encoder: personality() failed, errno %d (operation not permitted)" % ctypes.get_errno(), flush=True)
+            sys.exit(1)
+        print("encoded %s captions" % os.environ["JOBS"], flush=True)
+        PY
+        printf '%s\n' 'FROM python:3.13-alpine' 'COPY encoder.py /app/encoder.py' 'ENV JOBS={{jobs}}' 'CMD ["python3", "/app/encoder.py"]' > "$d/Dockerfile"
+        docker build -q -t copperleaf/caption-encoder:1 "$d" >/dev/null
+        rm -rf "$d"
+        install -d /etc/copperleaf/seccomp
+        cat > /etc/copperleaf/seccomp/tight.json <<'JSON'
+        {
+          "defaultAction": "SCMP_ACT_ALLOW",
+          "syscalls": [
+            {
+              "names": ["personality", "kexec_load", "kexec_file_load", "init_module", "finit_module", "delete_module", "iopl", "ioperm", "swapon", "swapoff", "reboot", "userfaultfd", "perf_event_open", "open_by_handle_at", "acct", "settimeofday", "clock_settime"],
+              "action": "SCMP_ACT_ERRNO",
+              "errnoRet": 1
+            }
+          ]
+        }
+        JSON
+        chmod 644 /etc/copperleaf/seccomp/tight.json
+        sha256sum /etc/copperleaf/seccomp/tight.json | cut -d' ' -f1 > /var/lib/cloudtrain/tight.sha256
+        jq -r '[.syscalls[].names[] | select(. != "personality")] | unique | join(",")' /etc/copperleaf/seccomp/tight.json > /var/lib/cloudtrain/expected.denied
+        f=/etc/docker/daemon.json
+        [ -s "$f" ] || echo '{}' > "$f"
+        jq '. + {"seccomp-profile": "/etc/copperleaf/seccomp/tight.json"}' "$f" > "$f.new" && mv "$f.new" "$f"
+        systemctl restart docker
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        docker rm -f caption-encoder >/dev/null 2>&1 || true
+        docker run --name caption-encoder copperleaf/caption-encoder:1 >/dev/null 2>&1 || true
+  checks:
+    - id: encoder-ran
+      description: caption-encoder finished with exit 0 and printed its result
+      type: shell
+      timeoutSec: 60
+      on: cl-caption-01
+      skills: [containers.operations.exit-codes, containers.runtime-security.kernel-profiles]
+      weight: 2
+      command: |
+        s=$(docker inspect caption-encoder 2>/dev/null | jq -r '.[0].State | "\(.Status) \(.ExitCode)"')
+        if [ "$s" = "exited 0" ] && docker logs caption-encoder 2>&1 | grep -qx 'encoded {{jobs}} captions'; then echo ran; else echo "not-ran: $s"; fi
+      expect: {match: exact, value: ran}
+    - id: derived-profile
+      description: The container uses a seccomp profile that denies exactly the tight list minus personality
+      type: shell
+      timeoutSec: 60
+      on: cl-caption-01
+      skills: [containers.runtime-security.kernel-profiles]
+      weight: 3
+      command: |
+        p=$(docker inspect caption-encoder 2>/dev/null | jq -r '(.[0].HostConfig.SecurityOpt // []) | map(select(startswith("seccomp="))) | (.[0] // "seccomp=none") | sub("^seccomp="; "")')
+        case "$p" in none|unconfined|"") echo "no-profile"; exit 0 ;; esac
+        got=$(printf '%s' "$p" | jq -r 'if .defaultAction == "SCMP_ACT_ALLOW" then ([.syscalls[]? | select(.action == "SCMP_ACT_ERRNO" or .action == "SCMP_ACT_KILL" or .action == "SCMP_ACT_KILL_PROCESS" or .action == "SCMP_ACT_TRAP") | (.names // [.name])[]] | unique | join(",")) else "not-a-denylist" end' 2>/dev/null || echo unparsable)
+        if [ "$got" = "$(cat /var/lib/cloudtrain/expected.denied)" ]; then echo derived; else echo "different: $got"; fi
+      expect: {match: exact, value: derived}
+    - id: daemon-default-kept
+      description: The daemon-wide profile is unchanged and still configured
+      type: shell
+      timeoutSec: 60
+      on: cl-caption-01
+      skills: [containers.runtime-security.kernel-profiles]
+      weight: 2
+      command: |
+        c=$(jq -r '."seccomp-profile"' /etc/docker/daemon.json 2>/dev/null)
+        h=$(sha256sum /etc/copperleaf/seccomp/tight.json | cut -d' ' -f1)
+        if [ "$c" = /etc/copperleaf/seccomp/tight.json ] && [ "$h" = "$(cat /var/lib/cloudtrain/tight.sha256)" ]; then echo kept; else echo changed; fi
+      expect: {match: exact, value: kept}
+  hints:
+    - title: Find the blocked call
+      body: "The encoder's log names the failing call. The syscall list that is denied for every container is the daemon's seccomp profile, a JSON file."
+      command: docker logs caption-encoder
+      cost: 1
+    - title: Derive, do not rewrite
+      body: "Copy tight.json and remove only the personality entry from its list of denied names. jq can do it in one line. Do not switch the default action to allow-everything or drop the other entries."
+      cost: 1
+    - title: Per-container profile
+      body: "`docker run --security-opt seccomp=<file>` replaces the daemon-wide profile for that one container; docker inspect shows the profile under HostConfig.SecurityOpt."
+      cost: 2
+  misconceptions:
+    - id: unconfined
+      description: Runs the encoder with seccomp unconfined.
+      feedback: "unconfined removes every syscall filter, not just the one the encoder needs. Derive a profile that allows only personality."
+      expectFail: [derived-profile]
+      mutation:
+        on: cl-caption-01
+        as: learner
+        run: |
+          docker rm -f caption-encoder
+          docker run --name caption-encoder --security-opt seccomp=unconfined copperleaf/caption-encoder:1
+    - id: weaken-default
+      description: Edits the daemon-wide profile so every container may call personality.
+      feedback: "The tightened profile is the host-wide policy. Give the one legacy container its own derived profile and leave the default alone."
+      expectFail: [daemon-default-kept, derived-profile]
+      mutation:
+        on: cl-caption-01
+        as: learner
+        run: |
+          sudo sed -i 's/"personality", //' /etc/copperleaf/seccomp/tight.json
+          sudo systemctl restart docker
+          sleep 5
+          docker rm -f caption-encoder
+          docker run --name caption-encoder copperleaf/caption-encoder:1
+    - id: allow-everything
+      description: Supplies a profile that allows every syscall.
+      feedback: "A profile with the allow default and no deny entries is the same as running unconfined. Keep the other denied syscalls."
+      expectFail: [derived-profile]
+      mutation:
+        on: cl-caption-01
+        as: learner
+        run: |
+          echo '{"defaultAction": "SCMP_ACT_ALLOW"}' > ~/open.json
+          docker rm -f caption-encoder
+          docker run --name caption-encoder --security-opt seccomp=$HOME/open.json copperleaf/caption-encoder:1
+  solution:
+    explanation: |
+      The tight profile denies `personality`, which the encoder calls first. Copy the
+      profile without that one name and run just this container with it.
+    steps:
+      - on: cl-caption-01
+        as: learner
+        run: |
+          docker logs caption-encoder
+          jq '.syscalls[0].names |= map(select(. != "personality"))' /etc/copperleaf/seccomp/tight.json > ~/encoder-seccomp.json
+          docker rm caption-encoder
+          docker run --name caption-encoder --security-opt seccomp=$HOME/encoder-seccomp.json copperleaf/caption-encoder:1
+    alternatives:
+      - id: sed-copy
+        description: Derive the profile with sed and start the container in two steps.
+        steps:
+          - on: cl-caption-01
+            as: learner
+            run: |
+              sed 's/"personality", //' /etc/copperleaf/seccomp/tight.json > ~/encoder-seccomp.json
+              docker rm -f caption-encoder
+              docker create --name caption-encoder --security-opt seccomp=$HOME/encoder-seccomp.json copperleaf/caption-encoder:1
+              docker start -a caption-encoder

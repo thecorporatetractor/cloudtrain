@@ -1,0 +1,179 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-link-env-removed
+  title: Repair a legacy stack that relied on link environment variables
+  domain: containers
+  frameworks: [docker-practitioner:networking, docker-practitioner:operations]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [docker, links, dns, user-defined-network]
+  version: 1
+spec:
+  description: |
+    On `cl-rights-01` (`ssh cl-rights-01`; you are in the `docker` group) the nightly
+    rights report job **`rights-report`** (image `copperleaf/rights-report:1`) is
+    meant to read the title count from the database container **`rights-db`** and
+    write `/out/report.txt`, which is bind-mounted from `/srv/rights/out`.
+
+    The job was written for the old `--link rights-db:db` style, which handed it the
+    database address in environment variables such as `DB_PORT_5432_TCP_ADDR`. The
+    upgraded engine no longer provides that, and `/srv/rights/out/report.txt` now holds
+    an error. The report must say `titles={{titles}} via=rights-db`.
+
+    Rewire the stack so the job finds the database **by its name** on a
+    **user-defined network** (the job takes the name from `DB_HOST`), with no legacy
+    links. Keep the database container and its data (do not recreate `rights-db`); the
+    job container must be named **`rights-report`** again, finished with exit code 0,
+    and still write to `/srv/rights/out`.
+  objectives:
+    - Explain why link environment variables are a poor service-discovery mechanism
+    - Resolve containers by name on a user-defined bridge network
+    - Move a running container onto a second network without recreating it
+  params:
+    titles:
+      type: int
+      min: 40
+      max: 95
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-rights-01
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-rights-01
+      timeoutSec: 300
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        install -d -m 700 /var/lib/cloudtrain
+        d=$(mktemp -d)
+        cat > "$d/report.py" <<'PY'
+        import os, socket, sys
+        host = os.environ.get("DB_HOST") or os.environ.get("DB_PORT_5432_TCP_ADDR")
+        out = "/out/report.txt"
+        if not host:
+            open(out, "w").write("error: no database address (set DB_HOST)\n")
+            print("no database address; set DB_HOST")
+            sys.exit(2)
+        try:
+            s = socket.create_connection((host, 6379), 5)
+            s.sendall(b"*2\r\n$3\r\nGET\r\n$13\r\nrights:titles\r\n")
+            titles = s.recv(100).split(b"\r\n")[1].decode()
+        except Exception as e:
+            open(out, "w").write("error: cannot reach database %s: %s\n" % (host, e))
+            print("cannot reach database", host, e)
+            sys.exit(3)
+        open(out, "w").write("titles=%s via=%s\n" % (titles, host))
+        print("report written")
+        PY
+        printf '%s\n' 'FROM python:3.13-alpine' 'COPY report.py /app/report.py' 'CMD ["python3", "/app/report.py"]' > "$d/Dockerfile"
+        docker build -q -t copperleaf/rights-report:1 "$d" >/dev/null
+        rm -rf "$d"
+        docker rm -f rights-report rights-db >/dev/null 2>&1 || true
+        docker network rm rights-net >/dev/null 2>&1 || true
+        rm -rf /srv/rights; install -d /srv/rights/out
+        docker run -d --name rights-db redis:7.4-alpine >/dev/null
+        for i in $(seq 30); do docker exec rights-db redis-cli ping 2>/dev/null | grep -q PONG && break; sleep 1; done
+        docker exec rights-db redis-cli set rights:titles {{titles}} >/dev/null
+        docker run --name rights-report --link rights-db:db -v /srv/rights/out:/out copperleaf/rights-report:1 >/dev/null 2>&1 || true
+  checks:
+    - id: report
+      description: The report was written from the database found by name
+      type: shell
+      timeoutSec: 60
+      on: cl-rights-01
+      skills: [containers.network.bridge-dns, containers.operations.engine-upgrade]
+      weight: 3
+      command: cat /srv/rights/out/report.txt 2>/dev/null || echo missing
+      expect: {match: exact, value: "titles={{titles}} via=rights-db"}
+    - id: finished-without-links
+      description: rights-report exited 0, has no legacy links and shares a user-defined network with rights-db
+      type: shell
+      timeoutSec: 60
+      on: cl-rights-01
+      skills: [containers.network.bridge-dns]
+      weight: 2
+      command: |
+        docker inspect rights-report rights-db 2>/dev/null | jq -r '
+          (.[0].NetworkSettings.Networks | keys) as $a | (.[1].NetworkSettings.Networks | keys) as $b
+          | "\(.[0].State.Status) \(.[0].State.ExitCode) links=\((.[0].HostConfig.Links // []) | length) shared=\((($a - ($a - $b)) | map(select(. != "bridge")) | length) > 0)"'
+      expect: {match: exact, value: "exited 0 links=0 shared=true"}
+    - id: database-kept
+      description: rights-db is running and still holds the title count
+      type: shell
+      timeoutSec: 60
+      on: cl-rights-01
+      skills: [containers.network.bridge-dns]
+      weight: 1
+      command: |
+        [ "$(docker inspect rights-db 2>/dev/null | jq -r '.[0].State.Running')" = true ] && docker exec rights-db redis-cli get rights:titles
+      expect: {match: exact, value: "{{titles}}"}
+  hints:
+    - title: Read what the job says
+      body: "The container's logs and the report file tell you which setting the job wants. Check the logs of rights-report."
+      command: docker logs rights-report
+      cost: 1
+    - title: Names resolve on user-defined networks
+      body: "The default bridge has no name resolution; a user-defined bridge network resolves container names. `docker network connect` attaches a running container to another network."
+      cost: 1
+    - title: Rerun the job
+      body: "A finished container cannot be reconfigured. Remove rights-report and run it again on the network with `-e DB_HOST=rights-db` and the same bind mount."
+      cost: 2
+  misconceptions:
+    - id: link-alias
+      description: Keeps --link and passes the link alias as DB_HOST.
+      feedback: "--link is the legacy mechanism that only works on the default bridge. Put both containers on a user-defined network and use the container name."
+      expectFail: [report, finished-without-links]
+      mutation:
+        on: cl-rights-01
+        as: learner
+        run: |
+          docker rm -f rights-report
+          docker run --name rights-report --link rights-db:db -e DB_HOST=db -v /srv/rights/out:/out copperleaf/rights-report:1
+    - id: hardcoded-ip
+      description: Hard-codes the database container's current IP address.
+      feedback: "The address changes whenever the container is recreated. Resolve it by name on a user-defined network."
+      expectFail: [report, finished-without-links]
+      mutation:
+        on: cl-rights-01
+        as: learner
+        run: |
+          ip=$(docker inspect rights-db | jq -r '.[0].NetworkSettings.IPAddress')
+          docker rm -f rights-report
+          docker run --name rights-report -e DB_HOST=$ip -v /srv/rights/out:/out copperleaf/rights-report:1
+  solution:
+    explanation: |
+      Create a user-defined bridge network, attach the running database to it (its
+      name becomes resolvable there), and run the job on that network with the name in
+      DB_HOST.
+    steps:
+      - on: cl-rights-01
+        as: learner
+        run: |
+          docker logs rights-report
+          docker network create rights-net
+          docker network connect rights-net rights-db
+          docker rm rights-report
+          docker run --name rights-report --network rights-net -e DB_HOST=rights-db -v /srv/rights/out:/out copperleaf/rights-report:1
+          cat /srv/rights/out/report.txt
+    alternatives:
+      - id: alias
+        description: Give the database an alias on the new network and use the name rights-db through it.
+        steps:
+          - on: cl-rights-01
+            as: learner
+            run: |
+              docker network create rights-net
+              docker network connect --alias rights-db rights-net rights-db
+              docker rm -f rights-report
+              docker create --name rights-report --network rights-net -e DB_HOST=rights-db -v /srv/rights/out:/out copperleaf/rights-report:1
+              docker start -a rights-report

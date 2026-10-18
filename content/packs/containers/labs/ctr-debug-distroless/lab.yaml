@@ -1,0 +1,218 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-debug-distroless
+  title: Debug a shell-less catalogue API returning 500
+  domain: containers
+  frameworks: [ex188-aligned:troubleshoot, docker-practitioner:operations]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [docker, debug, distroless, namespaces, bind-mount]
+  version: 1
+spec:
+  description: |
+    On `cl-catalogue-02` (`ssh cl-catalogue-02`; you are in the `docker` group) the
+    catalogue API container **`catalogue-api`** (image `copperleaf/catalogue-api:5`,
+    published on `127.0.0.1:{{port}}`) runs on a shell-less image: `docker exec
+    catalogue-api sh` fails and there is no `cat`. `curl http://127.0.0.1:{{port}}/titles`
+    returns `500`.
+
+    1. Find out why. Attach a **debug container** that shares the process and network
+       namespaces of `catalogue-api` (the `busybox:1.37` image is available) and read the
+       evidence the service leaves inside its own filesystem. Copperleaf keeps service
+       configuration under `/srv/<service>` on the host.
+    2. Fix the **deployment**, not the image: recreate `catalogue-api` from the **same
+       image** so that `/titles` answers `200`, mounting the missing configuration
+       **read-only** from the host. Keep the name, the published loopback port and the
+       restart policy `unless-stopped`. Do not build another image and do not bake a
+       shell into it.
+  objectives:
+    - Attach an ephemeral debug container to the namespaces of a shell-less container
+    - Read another container's files through /proc/<pid>/root
+    - Correct the run configuration with a read-only bind mount
+  params:
+    port:
+      type: int
+      min: 8300
+      max: 8399
+    titles:
+      type: int
+      min: 200
+      max: 900
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-catalogue-02
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-catalogue-02
+      timeoutSec: 480
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        # copperleaf/pyruntime:1: a shell-less Python runtime (FROM scratch plus musl, libpython and the stdlib of python:3.13-alpine)
+        d=$(mktemp -d)
+        cat > "$d/Dockerfile" <<'DF'
+        FROM python:3.13-alpine AS src
+        FROM scratch
+        COPY --from=src /lib/ /lib/
+        COPY --from=src /usr/lib/ /usr/lib/
+        COPY --from=src /usr/local/lib/ /usr/local/lib/
+        COPY --from=src /usr/local/bin/python3.13 /usr/local/bin/python3
+        ENV LD_LIBRARY_PATH=/usr/local/lib PYTHONUNBUFFERED=1
+        ENTRYPOINT ["/usr/local/bin/python3"]
+        DF
+        docker build -q -t copperleaf/pyruntime:1 "$d" >/dev/null
+        rm -rf "$d"
+        d=$(mktemp -d)
+        cat > "$d/api.py" <<'PY'
+        import http.server, json, pathlib
+        CONF = pathlib.Path("/etc/copperleaf/catalogue/catalogue.json")
+        LOG = pathlib.Path("/var/log/catalogue/error.txt")
+        LOG.parent.mkdir(parents=True, exist_ok=True)
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path != "/titles":
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                try:
+                    n = json.loads(CONF.read_text())["titles"]
+                except FileNotFoundError:
+                    LOG.write_text("500: cannot open /etc/copperleaf/catalogue/catalogue.json: no such file\n")
+                    self.send_response(500)
+                    self.end_headers()
+                    self.wfile.write(b"internal error\n")
+                    return
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(("catalogue titles %s\n" % n).encode())
+            def log_message(self, *a):
+                pass
+        print("catalogue-api listening on :8000", flush=True)
+        http.server.ThreadingHTTPServer(("", 8000), H).serve_forever()
+        PY
+        printf '%s\n' 'FROM copperleaf/pyruntime:1' 'COPY api.py /opt/catalogue/api.py' 'CMD ["/opt/catalogue/api.py"]' > "$d/Dockerfile"
+        docker build -q -t copperleaf/catalogue-api:5 "$d" >/dev/null
+        rm -rf "$d"
+        rm -rf /srv/catalogue; install -d /srv/catalogue/conf /srv/catalogue/conf-old
+        echo '{"titles": {{titles}}}' > /srv/catalogue/conf/catalogue.json
+        echo '{"titles": '$(( {{titles}} - 1 ))'}' > /srv/catalogue/conf-old/catalogue.json
+        chmod -R a+rX /srv/catalogue
+        docker rm -f catalogue-api >/dev/null 2>&1 || true
+        docker run -d --name catalogue-api --restart unless-stopped -p 127.0.0.1:{{port}}:8000 copperleaf/catalogue-api:5 >/dev/null
+  checks:
+    - id: titles-200
+      description: /titles answers 200 with the title count from the host configuration
+      type: shell
+      timeoutSec: 60
+      on: cl-catalogue-02
+      skills: [containers.operations.debug-distroless]
+      weight: 3
+      command: |
+        r=down; for i in $(seq 15); do r=$(curl -s --max-time 3 -w ' %{http_code}' http://127.0.0.1:{{port}}/titles 2>/dev/null | tr -d '\n'); case "$r" in *' 200') break ;; esac; sleep 2; done; echo "$r"
+      expect: {match: exact, value: "catalogue titles {{titles}} 200"}
+    - id: same-shell-less-image
+      description: catalogue-api still runs copperleaf/catalogue-api:5 and has no shell
+      type: shell
+      timeoutSec: 60
+      on: cl-catalogue-02
+      skills: [containers.operations.debug-distroless]
+      weight: 2
+      command: |
+        img=$(docker inspect catalogue-api 2>/dev/null | jq -r '.[0].Config.Image + " priv=" + (.[0].HostConfig.Privileged | tostring)')
+        if docker exec catalogue-api sh -c true >/dev/null 2>&1; then sh=has-shell; else sh=no-shell; fi
+        echo "$img $sh"
+      expect: {match: exact, value: "copperleaf/catalogue-api:5 priv=false no-shell"}
+    - id: config-mount
+      description: The configuration is a read-only bind mount from /srv/catalogue/conf
+      type: shell
+      timeoutSec: 60
+      on: cl-catalogue-02
+      skills: [containers.operations.debug-distroless, containers.storage.mount-types]
+      weight: 2
+      command: |
+        docker inspect catalogue-api 2>/dev/null | jq -r '[.[0].Mounts[] | select(.Destination == "/etc/copperleaf/catalogue" or .Destination == "/etc/copperleaf/catalogue/catalogue.json") | select(.Type == "bind" and .RW == false and (.Source | startswith("/srv/catalogue/conf")) and (.Source | startswith("/srv/catalogue/conf-old") | not))] | length | if . == 1 then "ro-bind" else "missing" end'
+      expect: {match: exact, value: ro-bind}
+    - id: published-and-restarts
+      description: catalogue-api keeps the published loopback port and the restart policy
+      type: shell
+      timeoutSec: 60
+      on: cl-catalogue-02
+      skills: [containers.operations.restart-health]
+      weight: 1
+      command: |
+        docker inspect catalogue-api 2>/dev/null | jq -r '[([.[0].HostConfig.PortBindings["8000/tcp"][]? | (.HostIp // "") + ":" + .HostPort] | join(",")), .[0].HostConfig.RestartPolicy.Name] | join(" ")'
+      expect: {match: exact, value: "127.0.0.1:{{port}} unless-stopped"}
+  hints:
+    - title: Share the namespaces
+      body: "A debug container with `--pid container:catalogue-api --network container:catalogue-api` sees the API's processes and ports. The target's filesystem is reachable at /proc/<pid>/root."
+      command: docker run --rm -it --pid container:catalogue-api --network container:catalogue-api busybox:1.37 sh
+      cost: 1
+    - title: What the service wrote
+      body: "The service writes its last error under /var/log/catalogue. From the debug container, `cat /proc/1/root/var/log/catalogue/error.txt`. If you get permission denied, add `--cap-add SYS_PTRACE` to the debug container."
+      cost: 1
+    - title: Find the file on the host
+      body: "The error names a path inside the container. The host keeps Copperleaf's service configuration under /srv/catalogue; the current files are in conf, an older copy is in conf-old. Mount the right one read-only (`-v host:container:ro`)."
+      cost: 2
+  misconceptions:
+    - id: old-config
+      description: Mounts the stale conf-old directory.
+      feedback: "conf-old holds an older title count. The deployment uses /srv/catalogue/conf."
+      expectFail: [titles-200, config-mount]
+      mutation:
+        on: cl-catalogue-02
+        as: learner
+        run: |
+          docker rm -f catalogue-api
+          docker run -d --name catalogue-api --restart unless-stopped -p 127.0.0.1:{{port}}:8000 -v /srv/catalogue/conf-old:/etc/copperleaf/catalogue:ro copperleaf/catalogue-api:5
+    - id: read-write-mount
+      description: Mounts the configuration writable.
+      feedback: "The service only reads its configuration. Mount it read-only so a compromised service cannot rewrite it."
+      expectFail: [config-mount]
+      mutation:
+        on: cl-catalogue-02
+        as: learner
+        run: |
+          docker rm -f catalogue-api
+          docker run -d --name catalogue-api --restart unless-stopped -p 127.0.0.1:{{port}}:8000 -v /srv/catalogue/conf:/etc/copperleaf/catalogue copperleaf/catalogue-api:5
+    - id: no-restart-policy
+      description: Recreates the container but drops the published port settings and restart policy.
+      feedback: "Keep the loopback publish and --restart unless-stopped from the original run."
+      expectFail: [published-and-restarts]
+      mutation:
+        on: cl-catalogue-02
+        as: learner
+        run: |
+          docker rm -f catalogue-api
+          docker run -d --name catalogue-api -p {{port}}:8000 -v /srv/catalogue/conf:/etc/copperleaf/catalogue:ro copperleaf/catalogue-api:5
+  solution:
+    explanation: |
+      A debug container sharing the pid namespace reads the service's own error file
+      through /proc/1/root: the config file /etc/copperleaf/catalogue/catalogue.json is
+      missing. Recreate the container with /srv/catalogue/conf mounted read-only there.
+    steps:
+      - on: cl-catalogue-02
+        as: learner
+        run: |
+          docker run --rm --pid container:catalogue-api --network container:catalogue-api --cap-add SYS_PTRACE busybox:1.37 cat /proc/1/root/var/log/catalogue/error.txt
+          ls -R /srv/catalogue
+          docker rm -f catalogue-api
+          docker run -d --name catalogue-api --restart unless-stopped -p 127.0.0.1:{{port}}:8000 -v /srv/catalogue/conf:/etc/copperleaf/catalogue:ro copperleaf/catalogue-api:5
+    alternatives:
+      - id: file-mount
+        description: Mount only the single file, using --mount.
+        steps:
+          - on: cl-catalogue-02
+            as: learner
+            run: |
+              docker rm -f catalogue-api
+              docker run -d --name catalogue-api --restart unless-stopped -p 127.0.0.1:{{port}}:8000 --mount type=bind,source=/srv/catalogue/conf/catalogue.json,target=/etc/copperleaf/catalogue/catalogue.json,readonly copperleaf/catalogue-api:5

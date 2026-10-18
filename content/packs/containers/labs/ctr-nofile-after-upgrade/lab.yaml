@@ -1,0 +1,189 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-nofile-after-upgrade
+  title: Fix edge-cache 'too many open files' after an engine upgrade
+  domain: containers
+  frameworks: [docker-practitioner:operations]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [docker, ulimit, nofile, engine-upgrade]
+  version: 1
+spec:
+  description: |
+    On `cl-edge-01` (`ssh cl-edge-01`; you are in the `docker` group) the container
+    **`edge-cache`** (image `copperleaf/edge-cache:2`, listening on port {{port}}
+    inside the container, set by `LISTEN_PORT`) serves keep-alive connections. Since
+    the engine upgrade it stops accepting new connections after about a thousand
+    clients (`Too many open files`).
+
+    Recreate **`edge-cache`** from the same image with the same `LISTEN_PORT` and an
+    open-files limit of **65536** (soft and hard) so that the grader's test passes: a
+    python asyncio client on the host opens **5,000 simultaneous connections** to the
+    container and every one must be answered.
+  objectives:
+    - Recognise a file-descriptor limit as the cause of refused connections
+    - Set a per-container nofile ulimit
+    - Verify the limit through HostConfig.Ulimits and under load
+  params:
+    port:
+      type: int
+      min: 8100
+      max: 8199
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-edge-01
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-edge-01
+      timeoutSec: 300
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        install -d -m 700 /var/lib/cloudtrain
+        d=$(mktemp -d)
+        cat > "$d/cache.py" <<'PY'
+        import asyncio, os
+        port = int(os.environ["LISTEN_PORT"])
+        async def handle(r, w):
+            try:
+                while True:
+                    data = await r.read(16)
+                    if not data:
+                        break
+                    w.write(b"pong\n")
+                    await w.drain()
+            except Exception:
+                pass
+            finally:
+                w.close()
+        async def main():
+            srv = await asyncio.start_server(handle, "0.0.0.0", port, backlog=4096)
+            print("edge-cache listening", flush=True)
+            async with srv:
+                await srv.serve_forever()
+        asyncio.run(main())
+        PY
+        printf '%s\n' 'FROM python:3.13-alpine' 'COPY cache.py /app/cache.py' 'CMD ["python3", "/app/cache.py"]' > "$d/Dockerfile"
+        docker build -q -t copperleaf/edge-cache:2 "$d" >/dev/null
+        rm -rf "$d"
+        cat > /var/lib/cloudtrain/probe.py <<'PY'
+        import asyncio, resource, sys
+        ip, port, want = sys.argv[1], int(sys.argv[2]), 5000
+        resource.setrlimit(resource.RLIMIT_NOFILE, (20000, 20000))
+        async def one(sem, held):
+            async with sem:
+                try:
+                    r, w = await asyncio.wait_for(asyncio.open_connection(ip, port), 3)
+                    w.write(b"ping\n")
+                    await w.drain()
+                    line = await asyncio.wait_for(r.readline(), 3)
+                except Exception:
+                    return
+                if line == b"pong\n":
+                    held.append(w)
+        async def main():
+            sem, held = asyncio.Semaphore(500), []
+            await asyncio.gather(*[one(sem, held) for _ in range(want)])
+            print(len(held))
+            for w in held:
+                w.close()
+        asyncio.run(main())
+        PY
+        docker rm -f edge-cache >/dev/null 2>&1 || true
+        docker run -d --name edge-cache --ulimit nofile=1024:1024 -e LISTEN_PORT={{port}} copperleaf/edge-cache:2 >/dev/null
+  checks:
+    - id: ulimit
+      description: edge-cache has a nofile limit of 65536 (soft and hard)
+      type: shell
+      timeoutSec: 60
+      on: cl-edge-01
+      skills: [containers.operations.engine-upgrade]
+      weight: 2
+      command: |
+        docker inspect edge-cache 2>/dev/null | jq -r '(.[0].HostConfig.Ulimits // []) | map(select(.Name == "nofile")) | if length == 0 then "none" else "\(.[0].Soft) \(.[0].Hard)" end'
+      expect: {match: exact, value: "65536 65536"}
+    - id: same-service
+      description: edge-cache runs copperleaf/edge-cache:2 with its LISTEN_PORT and is running
+      type: shell
+      timeoutSec: 60
+      on: cl-edge-01
+      skills: [containers.operations.exit-codes]
+      weight: 1
+      command: |
+        docker inspect edge-cache 2>/dev/null | jq -r '[.[0].Config.Image, (.[0].Config.Env | index("LISTEN_PORT={{port}}") != null | tostring), .[0].State.Status] | join(" ")'
+      expect: {match: exact, value: "copperleaf/edge-cache:2 true running"}
+    - id: load
+      description: All 5,000 simultaneous connections are answered
+      type: shell
+      timeoutSec: 120
+      on: cl-edge-01
+      skills: [containers.operations.exit-codes, containers.operations.engine-upgrade]
+      weight: 3
+      command: |
+        ip=$(docker inspect edge-cache 2>/dev/null | jq -r '.[0].NetworkSettings.Networks | to_entries[0].value.IPAddress')
+        for i in $(seq 15); do (echo > /dev/tcp/$ip/{{port}}) 2>/dev/null && break; sleep 1; done
+        python3 /var/lib/cloudtrain/probe.py "$ip" {{port}}
+      expect: {match: exact, value: "5000"}
+  hints:
+    - title: What the client sees
+      body: "The listener is stuck in accept() with EMFILE: a process can hold only as many descriptors as its nofile limit. Compare the limit inside the container with the number of connections."
+      command: docker exec edge-cache sh -c 'ulimit -n'
+      cost: 1
+    - title: A limit belongs to the container
+      body: "`docker run --ulimit nofile=<soft>:<hard>` sets it for one container, and `docker inspect` shows it under HostConfig.Ulimits. An existing container cannot change it: recreate it with the same image and environment."
+      cost: 1
+    - title: Same service, new limit
+      body: "Keep the image and the LISTEN_PORT variable, and name the new container edge-cache again."
+      cost: 1
+  misconceptions:
+    - id: too-low
+      description: Raises the limit, but not enough for 5,000 connections.
+      feedback: "4096 descriptors cover fewer than 5,000 clients plus the listener. Set 65536."
+      expectFail: [ulimit, load]
+      mutation:
+        on: cl-edge-01
+        as: learner
+        run: |
+          docker rm -f edge-cache
+          docker run -d --name edge-cache --ulimit nofile=4096:4096 -e LISTEN_PORT={{port}} copperleaf/edge-cache:2
+    - id: host-limit
+      description: Raises a host-wide limit and restarts the container without changing its own limit.
+      feedback: "fs.file-max is the host's total; the container's own nofile ulimit is what stops accept(). Set --ulimit on the container."
+      expectFail: [ulimit, load]
+      mutation:
+        on: cl-edge-01
+        as: learner
+        run: |
+          sudo sysctl -w fs.file-max=2097152
+          docker restart edge-cache
+  solution:
+    explanation: |
+      The container was started with `--ulimit nofile=1024:1024`, so accept() fails once
+      about a thousand clients are connected. Recreate it with a 65536 limit.
+    steps:
+      - on: cl-edge-01
+        as: learner
+        run: |
+          docker exec edge-cache sh -c 'ulimit -n'
+          docker rm -f edge-cache
+          docker run -d --name edge-cache --ulimit nofile=65536:65536 -e LISTEN_PORT={{port}} copperleaf/edge-cache:2
+    alternatives:
+      - id: create-start
+        description: Create the container with the limit, then start it.
+        steps:
+          - on: cl-edge-01
+            as: learner
+            run: |
+              docker rm -f edge-cache
+              docker create --name edge-cache --ulimit nofile=65536 -e LISTEN_PORT={{port}} copperleaf/edge-cache:2
+              docker start edge-cache
