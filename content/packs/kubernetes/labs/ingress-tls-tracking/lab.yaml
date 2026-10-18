@@ -16,8 +16,8 @@ spec:
     addresses cross the network unencrypted.
 
     From your workstation, switch to context `qm-tracking`
-    (`kubectl config use-context qm-tracking`). The cluster runs the NGINX
-    Ingress controller (IngressClass `nginx`).
+    (`kubectl config use-context qm-tracking`). The cluster runs the Traefik
+    Ingress controller (default IngressClass `traefik`).
 
     The certificate and key issued for the site are in `~/certs/`
     (`track.crt`, `track.key`).
@@ -26,10 +26,14 @@ spec:
        from those files.
     2. Change the Ingress `tracking` in that namespace so it serves
        `track.quillmoor.example` over **HTTPS** with that certificate.
-    3. Plain HTTP requests must be **redirected** to HTTPS.
+    3. Plain HTTP requests must be **redirected** to HTTPS. Traefik redirects
+       with a Middleware (`traefik.io/v1alpha1`, kind `Middleware`) that the
+       Ingress names in its annotation
+       `traefik.ingress.kubernetes.io/router.middlewares`.
   objectives:
     - Create a kubernetes.io/tls Secret from PEM files
     - Add a tls section to an Ingress
+    - Redirect HTTP to HTTPS with a Traefik Middleware
     - Verify the served certificate and the HTTP to HTTPS redirect
   params:
     secret:
@@ -42,11 +46,9 @@ spec:
         driver: container
         image: jumphost:1
         access: [shell]
-      # Needs an Ingress controller (IngressClass nginx) in the kubeadm image;
-      # see the kubeadm extras work in the foundations stream.
       - name: qm-tracking
         driver: k8s-cluster
-        image: kubeadm:1.37
+        image: kubeadm:1.37-sec
         cluster:
           mode: kubeadm
           version: "v1.37.1"
@@ -55,17 +57,9 @@ spec:
             - {name: tracking-cp-1, role: control-plane, taints: ["node-role.kubernetes.io/control-plane:NoSchedule"]}
             - {name: tracking-wk-1, role: worker}
   setup:
-    - on: qm-tracking
-      timeoutSec: 200
-      run: |
-        # Prerequisite: an NGINX Ingress controller.
-        for i in $(seq 1 36); do
-          kubectl get ingressclass nginx >/dev/null 2>&1 && \
-            kubectl get svc -A -l app.kubernetes.io/component=controller,app.kubernetes.io/name=ingress-nginx -o name 2>/dev/null | grep -q . && exit 0
-          sleep 5
-        done
-        echo "prerequisite missing: no NGINX Ingress controller (IngressClass nginx) in this cluster image" >&2
-        exit 1
+    - on: qm-tracking/tracking-cp-1
+      timeoutSec: 400
+      run: /opt/cloudtrain/bin/addons-install ingress --wait
     - on: workstation
       run: |
         set -e
@@ -106,7 +100,7 @@ spec:
         kind: Ingress
         metadata: {name: tracking, namespace: parcel-tracking}
         spec:
-          ingressClassName: nginx
+          ingressClassName: traefik
           rules:
             - host: track.quillmoor.example
               http:
@@ -153,7 +147,7 @@ spec:
       timeoutSec: 40
       command: |
         export KUBECONFIG=/etc/kubernetes/admin.conf
-        ip=$(kubectl get svc -A -l app.kubernetes.io/component=controller,app.kubernetes.io/name=ingress-nginx -o jsonpath='{.items[0].spec.clusterIP}')
+        ip=$(kubectl -n traefik get svc traefik -o jsonpath='{.spec.clusterIP}')
         sub=$(echo | openssl s_client -connect $ip:443 -servername track.quillmoor.example 2>/dev/null | openssl x509 -noout -subject -nameopt RFC2253 2>/dev/null)
         body=$(curl -sk -m 5 --resolve track.quillmoor.example:443:$ip https://track.quillmoor.example/)
         echo "$sub body=$body"
@@ -167,7 +161,7 @@ spec:
       timeoutSec: 30
       command: |
         export KUBECONFIG=/etc/kubernetes/admin.conf
-        ip=$(kubectl get svc -A -l app.kubernetes.io/component=controller,app.kubernetes.io/name=ingress-nginx -o jsonpath='{.items[0].spec.clusterIP}')
+        ip=$(kubectl -n traefik get svc traefik -o jsonpath='{.spec.clusterIP}')
         curl -s -m 5 -o /dev/null -w '%{http_code} %{redirect_url}' --resolve track.quillmoor.example:80:$ip http://track.quillmoor.example/
       expect: {match: regex, value: "^30[178] https://track\\.quillmoor\\.example/?$"}
   hints:
@@ -179,12 +173,15 @@ spec:
       body: "`spec.tls` takes a list of `{hosts: [...], secretName: ...}`. The host must match the rule's host."
       cost: 2
     - title: Redirects
-      body: The NGINX controller redirects HTTP to HTTPS by itself for hosts that have TLS configured.
+      body: |
+        Create a Middleware with `spec.redirectScheme: {scheme: https, permanent: true}`
+        in namespace parcel-tracking, then annotate the Ingress with
+        `traefik.ingress.kubernetes.io/router.middlewares: parcel-tracking-<name>@kubernetescrd`.
       cost: 1
   misconceptions:
     - id: generic-secret
       description: Creates a generic Secret from the files.
-      feedback: The controller only uses kubernetes.io/tls Secrets with tls.crt and tls.key keys; it falls back to its fake certificate.
+      feedback: The controller only uses kubernetes.io/tls Secrets with tls.crt and tls.key keys; it falls back to its default self-signed certificate.
       expectFail: [tls-secret, https-serves-cert]
       mutation:
         on: workstation
@@ -206,8 +203,20 @@ spec:
           kubectl -n parcel-tracking create secret tls {{secret}} --cert $HOME/certs/track.crt --key $HOME/certs/track.key
           kubectl -n parcel-tracking patch ingress tracking --type=merge -p '{"spec":{"tls":[{"secretName":"{{secret}}"}]}}'
           sleep 10
+    - id: tls-without-redirect
+      description: Adds the certificate but no redirect.
+      feedback: Traefik keeps serving the Ingress on its HTTP entry point until a redirect Middleware is attached.
+      expectFail: [http-redirects]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-tracking
+          kubectl -n parcel-tracking create secret tls {{secret}} --cert $HOME/certs/track.crt --key $HOME/certs/track.key
+          kubectl -n parcel-tracking patch ingress tracking --type=merge -p '{"spec":{"tls":[{"hosts":["track.quillmoor.example"],"secretName":"{{secret}}"}]}}'
+          sleep 10
   solution:
-    explanation: Create the kubernetes.io/tls Secret and reference it with the host in spec.tls; NGINX then serves the certificate and redirects HTTP with 308.
+    explanation: Create the kubernetes.io/tls Secret and reference it with the host in spec.tls; Traefik then serves the certificate on its HTTPS entry point. A redirectScheme Middleware attached with the router.middlewares annotation turns plain HTTP requests into a permanent redirect.
     steps:
       - on: workstation
         as: learner
@@ -215,10 +224,18 @@ spec:
           kubectl config use-context qm-tracking
           kubectl -n parcel-tracking create secret tls {{secret}} --cert ~/certs/track.crt --key ~/certs/track.key
           kubectl -n parcel-tracking patch ingress tracking --type=merge -p '{"spec":{"tls":[{"hosts":["track.quillmoor.example"],"secretName":"{{secret}}"}]}}'
+          kubectl apply -f - <<'YAML'
+          apiVersion: traefik.io/v1alpha1
+          kind: Middleware
+          metadata: {name: https-redirect, namespace: parcel-tracking}
+          spec:
+            redirectScheme: {scheme: https, permanent: true}
+          YAML
+          kubectl -n parcel-tracking annotate ingress tracking traefik.ingress.kubernetes.io/router.middlewares=parcel-tracking-https-redirect@kubernetescrd
           sleep 10
     alternatives:
       - id: explicit-redirect
-        description: Re-apply the Ingress as YAML with an explicit force-ssl-redirect annotation.
+        description: Re-apply the Ingress and the Middleware as YAML in one go.
         steps:
           - on: workstation
             as: learner
@@ -226,15 +243,21 @@ spec:
               kubectl config use-context qm-tracking
               kubectl -n parcel-tracking create secret tls {{secret}} --cert ~/certs/track.crt --key ~/certs/track.key
               kubectl apply -f - <<'YAML'
+              apiVersion: traefik.io/v1alpha1
+              kind: Middleware
+              metadata: {name: to-https, namespace: parcel-tracking}
+              spec:
+                redirectScheme: {scheme: https, permanent: true}
+              ---
               apiVersion: networking.k8s.io/v1
               kind: Ingress
               metadata:
                 name: tracking
                 namespace: parcel-tracking
                 annotations:
-                  nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+                  traefik.ingress.kubernetes.io/router.middlewares: parcel-tracking-to-https@kubernetescrd
               spec:
-                ingressClassName: nginx
+                ingressClassName: traefik
                 tls:
                   - hosts: [track.quillmoor.example]
                     secretName: {{secret}}

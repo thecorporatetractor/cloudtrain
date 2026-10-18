@@ -33,7 +33,15 @@ catalog (drop them from the curriculum's `images` list).
 ## Next steps, in order
 
 1. Kata spike (tier B): run `tools/slots/run.sh vm -- bash tools/kata-spike/spike.sh` (see "Kata spike" below), then decide on kata-deploy on the shared worker.
-2. MetalLB in a Kube-OVN VPC: the assigned IP is not reachable from the tester pod. Options:
+2. MetalLB in a Kube-OVN VPC: the assigned IP is not reachable from the tester pod. Round 4
+   (kubeadm stream) findings: lab VM ports carry no OVN port security (`port_security: []`,
+   addresses `MAC IP`), and the entry NetworkPolicy allows 192.168.100.0/24, so neither
+   blocks it by design. The boot test ran a single, control-plane-only node; kubeadm labels
+   control planes `node.kubernetes.io/exclude-from-external-load-balancers`, and MetalLB's
+   speaker does not announce from such nodes, which alone explains the boot-test failure.
+   Lab clusters have workers, so `xka-loadbalancer-address` / `loadbalancer-kiosk-ip`
+   (curl from the workstation) are the proof to run; the round-4 attempt hit the post-init
+   crashloop under load before the pool was created. If it still fails with workers: Options:
    give the speaker's IP to the VM port (`ovn.kubernetes.io` allowed address pairs / port
    security off for lab VMs), or document NodePort/Ingress only for LoadBalancer labs.
 3. Switch the remaining add-on labs to `kubeadm:1.37-full`/`-sec` and verify them one at a

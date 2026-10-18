@@ -11,13 +11,18 @@ metadata:
   version: 1
 spec:
   description: |
-    Context: `qm-ledger` (`kubectl config use-context qm-ledger`).
+    Context: `qm-ledger` (`kubectl config use-context qm-ledger`). The cluster's
+    Ingress controller is Traefik (default IngressClass `traefik`). Namespace
+    `partner-portal` holds a Traefik Middleware `https-redirect` that redirects
+    requests to HTTPS; Traefik attaches Middlewares to an Ingress through the
+    annotation `traefik.ingress.kubernetes.io/router.middlewares`
+    (value `<namespace>-<name>@kubernetescrd`).
 
     1. Create a TLS Secret `portal-tls` in namespace `partner-portal` from
        `~/exam/portal.crt` and `~/exam/portal.key`.
     2. Make the existing Ingress `portal` serve `portal.quillmoor.example`
-       over HTTPS with that certificate. HTTP requests must not be served
-       (they must be redirected to HTTPS).
+       over HTTPS with that certificate.
+    3. HTTP requests must not be served: they must be redirected to HTTPS.
   objectives:
     - Add TLS to an Ingress
   topology:
@@ -30,7 +35,7 @@ spec:
       # Canonical sim-k8s-security cluster: every K-tier exam task shares it.
       - name: qm-ledger
         driver: k8s-cluster
-        image: kubeadm:1.37
+        image: kubeadm:1.37-sec
         access: [ssh]
         cluster:
           mode: kubeadm
@@ -41,16 +46,9 @@ spec:
             - {name: ledger-wk-1, role: worker}
             - {name: ledger-wk-2, role: worker}
   setup:
-    - on: qm-ledger
-      timeoutSec: 200
-      run: |
-        for i in $(seq 1 36); do
-          kubectl get ingressclass nginx >/dev/null 2>&1 && \
-            kubectl get svc -A -l app.kubernetes.io/component=controller,app.kubernetes.io/name=ingress-nginx -o name 2>/dev/null | grep -q . && exit 0
-          sleep 5
-        done
-        echo "prerequisite missing: no NGINX Ingress controller (IngressClass nginx) in this cluster image" >&2
-        exit 1
+    - on: qm-ledger/ledger-cp-1
+      timeoutSec: 400
+      run: /opt/cloudtrain/bin/addons-install ingress --wait
     - on: workstation
       run: |
         set -e
@@ -82,12 +80,21 @@ spec:
         kind: Ingress
         metadata: {name: portal, namespace: partner-portal}
         spec:
-          ingressClassName: nginx
+          ingressClassName: traefik
           rules:
             - host: portal.quillmoor.example
               http:
                 paths:
                   - {path: /, pathType: Prefix, backend: {service: {name: portal, port: {number: 80}}}}
+        ---
+        apiVersion: traefik.io/v1alpha1
+        kind: Middleware
+        metadata: {name: https-redirect, namespace: partner-portal}
+        spec:
+          redirectScheme: {scheme: https, permanent: true}
+    - on: qm-ledger
+      timeoutSec: 150
+      run: kubectl -n partner-portal wait pod portal --for=condition=Ready --timeout=140s
   teardown:
     - on: qm-ledger
       run: kubectl delete namespace partner-portal --ignore-not-found --wait=false
@@ -107,9 +114,11 @@ spec:
       timeoutSec: 40
       command: |
         export KUBECONFIG=/etc/kubernetes/admin.conf
-        ip=$(kubectl get svc -A -l app.kubernetes.io/component=controller,app.kubernetes.io/name=ingress-nginx -o jsonpath='{.items[0].spec.clusterIP}')
-        echo | openssl s_client -connect $ip:443 -servername portal.quillmoor.example 2>/dev/null | openssl x509 -noout -subject -nameopt RFC2253 2>/dev/null
-      expect: {match: exact, value: "subject=CN=portal.quillmoor.example,O=Quillmoor Logistics"}
+        ip=$(kubectl -n traefik get svc traefik -o jsonpath='{.spec.clusterIP}')
+        sub=$(echo | openssl s_client -connect $ip:443 -servername portal.quillmoor.example 2>/dev/null | openssl x509 -noout -subject -nameopt RFC2253 2>/dev/null)
+        body=$(curl -sk -m 5 --resolve portal.quillmoor.example:443:$ip https://portal.quillmoor.example/)
+        echo "$sub body=$body"
+      expect: {match: exact, value: "subject=CN=portal.quillmoor.example,O=Quillmoor Logistics body=partner portal"}
     - id: http-redirected
       description: Plain HTTP gets a redirect to HTTPS
       type: shell
@@ -118,9 +127,9 @@ spec:
       timeoutSec: 30
       command: |
         export KUBECONFIG=/etc/kubernetes/admin.conf
-        ip=$(kubectl get svc -A -l app.kubernetes.io/component=controller,app.kubernetes.io/name=ingress-nginx -o jsonpath='{.items[0].spec.clusterIP}')
-        curl -s -m 5 -o /dev/null -w '%{http_code}' --resolve portal.quillmoor.example:80:$ip http://portal.quillmoor.example/
-      expect: {match: regex, value: "^30[178]$"}
+        ip=$(kubectl -n traefik get svc traefik -o jsonpath='{.spec.clusterIP}')
+        curl -s -m 5 -o /dev/null -w '%{http_code} %{redirect_url}' --resolve portal.quillmoor.example:80:$ip http://portal.quillmoor.example/
+      expect: {match: regex, value: "^30[178] https://portal\\.quillmoor\\.example/?$"}
   misconceptions:
     - id: secret-other-namespace
       description: Creates the Secret in the default namespace.
@@ -132,17 +141,29 @@ spec:
         run: |
           kubectl config use-context qm-ledger
           kubectl -n default create secret tls portal-tls --cert ~/exam/portal.crt --key ~/exam/portal.key
+          kubectl -n partner-portal patch ingress portal --type=merge -p '{"metadata":{"annotations":{"traefik.ingress.kubernetes.io/router.middlewares":"partner-portal-https-redirect@kubernetescrd"}},"spec":{"tls":[{"hosts":["portal.quillmoor.example"],"secretName":"portal-tls"}]}}'
+          sleep 10
+    - id: no-redirect
+      description: Adds TLS but leaves plain HTTP served.
+      feedback: Traefik serves the HTTP entry point too until the redirect Middleware is attached to the Ingress.
+      expectFail: [http-redirected]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          kubectl config use-context qm-ledger
+          kubectl -n partner-portal create secret tls portal-tls --cert ~/exam/portal.crt --key ~/exam/portal.key
           kubectl -n partner-portal patch ingress portal --type=merge -p '{"spec":{"tls":[{"hosts":["portal.quillmoor.example"],"secretName":"portal-tls"}]}}'
           sleep 10
   solution:
-    explanation: kubectl create secret tls, then add spec.tls with the host and secretName.
+    explanation: kubectl create secret tls, add spec.tls with the host and secretName, and attach the https-redirect Middleware with the router.middlewares annotation.
     steps:
       - on: workstation
         as: learner
         run: |
           kubectl config use-context qm-ledger
           kubectl -n partner-portal create secret tls portal-tls --cert ~/exam/portal.crt --key ~/exam/portal.key
-          kubectl -n partner-portal patch ingress portal --type=merge -p '{"spec":{"tls":[{"hosts":["portal.quillmoor.example"],"secretName":"portal-tls"}]}}'
+          kubectl -n partner-portal patch ingress portal --type=merge -p '{"metadata":{"annotations":{"traefik.ingress.kubernetes.io/router.middlewares":"partner-portal-https-redirect@kubernetescrd"}},"spec":{"tls":[{"hosts":["portal.quillmoor.example"],"secretName":"portal-tls"}]}}'
           sleep 10
     alternatives:
       - id: yaml-secret
@@ -162,4 +183,5 @@ spec:
                 tls.key: $(base64 -w0 ~/exam/portal.key)
               YAML
               kubectl -n partner-portal patch ingress portal --type=json -p '[{"op":"add","path":"/spec/tls","value":[{"hosts":["portal.quillmoor.example"],"secretName":"portal-tls"}]}]'
+              kubectl -n partner-portal annotate ingress portal traefik.ingress.kubernetes.io/router.middlewares=partner-portal-https-redirect@kubernetescrd
               sleep 10

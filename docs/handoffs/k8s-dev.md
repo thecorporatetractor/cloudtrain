@@ -1,5 +1,56 @@
 # Handoff: k8s-dev stream (application-developer path + sim-k8s-developer exam)
 
+## Round 4 (2026-10-17/18, kubeadm stream, branch `content/kubeadm-round-4`)
+
+One agent for the kubeadm labs of k8s-admin, k8s-dev and k8s-sec. The machine was the
+bottleneck: the shared heavy slot (vm + build, no FIFO: waiters poll every 15 s) was won
+twice in ~7 h, and host load stayed at 40-220 from other agents' pod/VM/build work.
+
+**Image switch (all streams at once, so exam topologies stay identical):** every
+`xks-*` K task and every k8s-sec K learning lab now uses `kubeadm:1.37-sec`; every
+`xka-*`/`xpe-*`/`xkd-*` K task and every add-on learning lab uses `kubeadm:1.37-full`
+(curriculum `images` updated). Labs without add-ons keep `kubeadm:1.37`. `labctl exam
+compile` passes for sim-k8s-admin, -developer, -security.
+
+**Rewrites for what the full image actually ships:**
+- `falco-shell-in-container`, `xks-detection-rule-output`: Falco is the `falco`
+  DaemonSet (`addons-install falco --wait` in setup), alerts are JSON lines in the Falco
+  Pod's log, rules come from the node's `/etc/falco/rules.d` (hostPath), reload = delete
+  that node's Falco Pod. New misconception in both: rule written on the wrong node.
+  Checks read `kubectl -n falco logs` / match `output_fields`. **Not live-verified yet**
+  (the `falco -L` and "rules file named in the log" parts of `rule-loaded` are the
+  riskiest assumptions; check them on the first run).
+- `ingress-tls-tracking`, `xks-ingress-tls-secret`: Traefik instead of ingress-nginx
+  (`addons-install ingress`), redirect through a `traefik.io/v1alpha1` Middleware
+  (`redirectScheme`) attached with `traefik.ingress.kubernetes.io/router.middlewares`;
+  checks hit the `traefik/traefik` ClusterIP. New misconception: TLS without redirect.
+  Not live-verified yet (confirm that the redirect Middleware leaves HTTPS requests alone).
+- `xkd-ingress-path`: `addons-install ingress,lb` (the Ingress gets its address from
+  Traefik's LoadBalancer Service, so MetalLB is needed); `xkd-top-memory-report`:
+  `addons-install metrics-server`.
+
+**Still blocked (the full image has no such tool):** buildah (build-waybill-image,
+xkd-build-tag-image, waybill-image-slim-scan), Trivy + offline DB (sbom-dispatch-image,
+xks-sbom-spdx, xks-scan-pick-image), cosign + signed layouts (xks-signature-verify), a
+CSI driver with expansion (xka-expand-claim). These need a kubeadm-full rebuild
+(~30 min TCG in the heavy slot) with those packages.
+
+**Lab bugs fixed:** `xka-crd-custom-resource` (the "operator" loop never started:
+`pgrep -f /tmp/berth-operator.sh` matched the setup shell's own command line; now
+`pgrep -f "^sh /tmp/berth-[o]perator.sh"`; solution waits up to 180 s);
+`xka-helm-install-values`, `helm-shipment-events` (the jumphost ships Helm 4: `helm list
+-a` is an error, all statuses are listed by default).
+
+Verify helpers used: scratchpad `kr4/` (`v2.sh` batch per slot acquisition, `qrun.sh`
+queue, `podq.sh` pod slot, `setstatus.py`, `mark.sh`, `mkpool.py <exam>` copies the
+verified pool tasks into a dir for `labctl exam run --labs <dir> --allow-missing`).
+
+**k8s-dev in round 4: 33 -> 33 verified.** No vm-slot time went to the k8s-dev K labs.
+`xkd-ingress-path` and `xkd-top-memory-report` are unblocked on paper (`kubeadm:1.37-full` plus
+`addons-install` in setup); every xkd K task uses `kubeadm:1.37-full` (shared qm-yard).
+buildah is still missing (build-waybill-image, xkd-build-tag-image).
+
+
 Round 3 (2026-10-16/17, branch `content/k8s-dev-sec-round-3`, merged into main):
 every V-tier lab of the stream is live-verified under the vcluster Pod Security
 baseline; 33 of 42 owned labs are verified. The 9 left are kubeadm (K) labs: 5 wait

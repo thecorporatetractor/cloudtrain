@@ -73,6 +73,15 @@ Kata and the kubeadm proof under load:
 5. **Windows C: drive is nearly full** (~16 GB free on 2026-10-15). Docker's disk file is
    ~237 GB though Docker now holds ~80 GB; compact it (see "Machine" below).
 
+6. **kubeadm round 4 (2026-10-18).** All kubeadm labs of k8s-admin/-dev/-sec now use
+   the image their tooling needs (`kubeadm:1.37-full` for add-ons, `-sec` for every CKS lab;
+   exam topologies switched together). Falco labs rewritten for the DaemonSet, ingress-TLS
+   labs for Traefik. Only 2 K labs got verified: the heavy slot was won twice in ~7 h
+   (no FIFO) and at host load 25-50 three-node clusters still crashloop after init
+   (calico-node, controller-manager). MetalLB reachability from the workstation is still
+   unproven (see `docs/handoffs/foundations.md`). Exam runs for sim-k8s-security and
+   sim-k8s-admin still blocked on pool coverage (`docs/handoffs/k8s-sec.md`, `k8s-admin.md`).
+
 ## Where things are
 
 | Area | State | Detail |
@@ -91,9 +100,9 @@ Kata and the kubeadm proof under load:
 
 | Stream | Owned | Verified live | Written, not yet verified | Blocked / not started | Handoff |
 |---|---|---|---|---|---|
-| k8s-admin | 88 | 5 | 63 | 18 blocked on add-ons, 2 not written | `docs/handoffs/k8s-admin.md` |
-| k8s-dev | 42 | 33 (every V-tier lab; round 3, 2026-10-17); sim-k8s-developer exam run live: auto-solve 100 %, no-solve 14.5 % | 5 K-tier (vm slot) | 4 blocked (buildah, metrics-server, ingress) | `docs/handoffs/k8s-dev.md` |
-| k8s-sec | 51 | 12 (every V-tier lab; round 3) | 27 K-tier (vm slot) | 12 blocked on security tooling | `docs/handoffs/k8s-sec.md` |
+| k8s-admin | 88 | 16 (round 4, 2026-10-18: + all 11 V-tier exam tasks; no K lab yet) | 13 V + 57 K (add-on labs switched to `kubeadm:1.37-full`) | xka-expand-claim (no CSI expansion add-on), 2 not written; sim-k8s-admin pool: storage 0/2, troubleshooting 3/5, networking 1/3 | `docs/handoffs/k8s-admin.md` |
+| k8s-dev | 42 | 33 (every V-tier lab; round 3, 2026-10-17); sim-k8s-developer exam run live: auto-solve 100 %, no-solve 14.5 % | 7 K-tier (xkd K tasks on `kubeadm:1.37-full`; ingress and metrics-server labs unblocked in round 4, not yet verified) | 2 blocked on buildah | `docs/handoffs/k8s-dev.md` |
+| k8s-sec | 51 | 15 (round 4: + xks-dockerfile-hardening, xks-metadata-egress-block; gvisor-runtimeclass by foundations) | 31 K-tier on `kubeadm:1.37-sec` (Falco and Traefik rewrites included) | 5 blocked (buildah, Trivy, cosign); sim-k8s-security pool: cluster-setup 1/2, system-hardening 0/2, monitoring 1/3 | `docs/handoffs/k8s-sec.md` |
 | networking | 77 | 25 (net-fix-broadcast-storm in platform round 5; round 3, 2026-10-17: 9 learning labs incl. every VLAN/trunk/STP/LACP/VRRP lab, 15 sim-net-associate tasks = every objective's draw; exam compiles with `--allow-missing`; exam run live in platform round 5: auto-solve 100 %, no-solve 14.3 %, clean teardowns) | 22 drafts in `docs/handoffs/networking-drafts/` | 15 pool tasks, SR Linux/Ansible labs, security/VPN learning labs; `labctl verify` cannot exec steps on FRR nodes (see handoff) | `docs/handoffs/networking.md` |
 | linux (round 4) | 278 in curriculum | 53 (36 tier A incl. 14 root labs with learnerSudo; 17 sim-el-sysadmin tasks) | 20 sim-el-sysadmin + 30 sim-linux-sysadmin tasks, 14 tier B/C learning labs (built) | tier B/C beyond systemd/storage/SELinux/AppArmor, sim-linux-pro, mirror/server tier-A labs; image gaps (autofs, ubuntu-vm apt) | `docs/handoffs/linux-bc.md` |
 | original 11 K8s labs | 11 | 4+ | — | — | `content/packs/kubernetes` |

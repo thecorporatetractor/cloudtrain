@@ -1,5 +1,63 @@
 # Handoff: k8s-sec stream (cluster-security path + sim-k8s-security pool)
 
+## Round 4 (2026-10-17/18, kubeadm stream, branch `content/kubeadm-round-4`)
+
+One agent for the kubeadm labs of k8s-admin, k8s-dev and k8s-sec. The machine was the
+bottleneck: the shared heavy slot (vm + build, no FIFO: waiters poll every 15 s) was won
+twice in ~7 h, and host load stayed at 40-220 from other agents' pod/VM/build work.
+
+**Image switch (all streams at once, so exam topologies stay identical):** every
+`xks-*` K task and every k8s-sec K learning lab now uses `kubeadm:1.37-sec`; every
+`xka-*`/`xpe-*`/`xkd-*` K task and every add-on learning lab uses `kubeadm:1.37-full`
+(curriculum `images` updated). Labs without add-ons keep `kubeadm:1.37`. `labctl exam
+compile` passes for sim-k8s-admin, -developer, -security.
+
+**Rewrites for what the full image actually ships:**
+- `falco-shell-in-container`, `xks-detection-rule-output`: Falco is the `falco`
+  DaemonSet (`addons-install falco --wait` in setup), alerts are JSON lines in the Falco
+  Pod's log, rules come from the node's `/etc/falco/rules.d` (hostPath), reload = delete
+  that node's Falco Pod. New misconception in both: rule written on the wrong node.
+  Checks read `kubectl -n falco logs` / match `output_fields`. **Not live-verified yet**
+  (the `falco -L` and "rules file named in the log" parts of `rule-loaded` are the
+  riskiest assumptions; check them on the first run).
+- `ingress-tls-tracking`, `xks-ingress-tls-secret`: Traefik instead of ingress-nginx
+  (`addons-install ingress`), redirect through a `traefik.io/v1alpha1` Middleware
+  (`redirectScheme`) attached with `traefik.ingress.kubernetes.io/router.middlewares`;
+  checks hit the `traefik/traefik` ClusterIP. New misconception: TLS without redirect.
+  Not live-verified yet (confirm that the redirect Middleware leaves HTTPS requests alone).
+- `xkd-ingress-path`: `addons-install ingress,lb` (the Ingress gets its address from
+  Traefik's LoadBalancer Service, so MetalLB is needed); `xkd-top-memory-report`:
+  `addons-install metrics-server`.
+
+**Still blocked (the full image has no such tool):** buildah (build-waybill-image,
+xkd-build-tag-image, waybill-image-slim-scan), Trivy + offline DB (sbom-dispatch-image,
+xks-sbom-spdx, xks-scan-pick-image), cosign + signed layouts (xks-signature-verify), a
+CSI driver with expansion (xka-expand-claim). These need a kubeadm-full rebuild
+(~30 min TCG in the heavy slot) with those packages.
+
+**Lab bugs fixed:** `xka-crd-custom-resource` (the "operator" loop never started:
+`pgrep -f /tmp/berth-operator.sh` matched the setup shell's own command line; now
+`pgrep -f "^sh /tmp/berth-[o]perator.sh"`; solution waits up to 180 s);
+`xka-helm-install-values`, `helm-shipment-events` (the jumphost ships Helm 4: `helm list
+-a` is an error, all statuses are listed by default).
+
+Verify helpers used: scratchpad `kr4/` (`v2.sh` batch per slot acquisition, `qrun.sh`
+queue, `podq.sh` pod slot, `setstatus.py`, `mark.sh`, `mkpool.py <exam>` copies the
+verified pool tasks into a dir for `labctl exam run --labs <dir> --allow-missing`).
+
+**k8s-sec in round 4: 13 -> 15 verified** (`xks-dockerfile-hardening` 6/6 runs, workstation
+only; `xks-metadata-egress-block` 5/5 runs on `kubeadm:1.37-sec`, Ready in 376-638 s).
+`xks-default-deny-ns` ran first with `--parallel 2` (6 VMs): both sessions sat at 79 %
+CPU steal and never got Ready in 40 min, so it is still `built` (nothing wrong with the
+lab seen). sim-k8s-security pool coverage (verified / drawn): cluster-setup 1/2,
+cluster-hardening 2/2, system-hardening 0/2, microservice 3/3, supply-chain 3/3,
+monitoring 1/3, so the exam run is still blocked. Shortest path to it, one lab per vm
+slot at `--parallel 1`: xks-default-deny-ns, xks-apparmor-profile-pod,
+xks-seccomp-localhost, xks-audit-policy-secrets, xks-audit-log-reader (then
+`python3 kr4/mkpool.py sim-k8s-security` and `labctl exam run --labs <pool dir>
+--allow-missing --auto-solve` / `--no-solve`).
+
+
 Round 3 (2026-10-16/17, branch `content/k8s-dev-sec-round-3`, merged into main):
 every V-tier lab of the stream is now live-verified (12 of 51). Everything left is
 kubeadm (K tier, vm slot): 27 built and 12 blocked on security tooling. The
