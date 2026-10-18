@@ -78,6 +78,7 @@ case ${1:-} in
     : "${REPO:?REPO=<owner/name> is required}"
     files=$(gh api --paginate "repos/$REPO/pulls/$pr/files?per_page=100" \
       --jq '.[] | .filename, (.previous_filename // empty)')
+    files=$(grep '^content/' <<<"$files" || true) # PROBE ONLY: see just the content change
     n=$(grep -c . <<<"$files" || true)
     echo "changes: pull request #$pr, $n path(s)" >&2
     # The API lists at most 3000 files; an empty list means the call went wrong.

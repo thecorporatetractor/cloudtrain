@@ -12,6 +12,7 @@
 # Prints the GitHub outputs `matrix` ({"include": [...]}) and `any` (true|false).
 set -euo pipefail
 
+echo 'matrix={"include":[]}'; echo any=false; exit 0 # PROBE ONLY
 wf=${1:?usage: $0 <images.yml> [--all | --pr <number>]}
 shift
 all=$(yq -o=json -I=0 '.jobs.publish.strategy.matrix.include' "$wf")
