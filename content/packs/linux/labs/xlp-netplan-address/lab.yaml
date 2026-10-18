@@ -68,6 +68,9 @@ spec:
         rm -f /etc/netplan/*eth1*.yaml /etc/netplan/70-netplan-set.yaml
         ip addr flush dev eth1 || true
         ip -br link show eth1 | grep -q eth1
+        # remember which interface carries the default route (eth0 or a predictable name such as enp1s0)
+        ip route show default | awk '{for (i = 1; i <= NF; i++) if ($i == "dev") print $(i + 1)}' | sort -u | paste -sd, > /var/lib/tr-mgmt-if
+        [ -s /var/lib/tr-mgmt-if ]
   checks:
     - id: address-live
       description: eth1 carries {{addr}} now
@@ -83,16 +86,18 @@ spec:
       on: tr-lp-01
       skills: [linux.net.persistent-config]
       weight: 2
-      command: netplan get ethernets.eth1.addresses 2>/dev/null | tr -d ' \n-'
+      command: netplan get ethernets.eth1.addresses 2>/dev/null | tr -d " \n\"'-"
       expect: {match: exact, value: "{{addr}}"}
     - id: eth0-untouched
-      description: The default route still leaves through eth0
+      description: The default route still leaves through the management interface
       type: shell
       on: tr-lp-01
       skills: [linux.net.persistent-config]
       weight: 1
-      command: ip route show default | awk '{for (i = 1; i <= NF; i++) if ($i == "dev") print $(i + 1)}' | sort -u | paste -sd,
-      expect: {match: exact, value: eth0}
+      command: |
+        cur=$(ip route show default | awk '{for (i = 1; i <= NF; i++) if ($i == "dev") print $(i + 1)}' | sort -u | paste -sd,)
+        [ -n "$cur" ] && [ "$cur" = "$(cat /var/lib/tr-mgmt-if 2>/dev/null)" ] && echo ok
+      expect: {match: exact, value: ok}
   misconceptions:
     - id: ip-addr-only
       description: Adds the address with ip addr and never writes it to Netplan.
