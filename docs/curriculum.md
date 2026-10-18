@@ -1505,7 +1505,7 @@ _CloudTrain is not affiliated with or endorsed by CompTIA. Linux+ is a trademark
 
 | Task | Objective | Title | Difficulty | Min | Tier | Scenario |
 | --- | --- | --- | --- | --- | --- | --- |
-| `xlp-netplan-address` | linuxplus:system-management | Apply a persistent address to a second interface | medium | 5 | B | Change the secondary interface to the requested address through Netplan and apply it. |
+| `xlp-netplan-address` | linuxplus:system-management | Apply a persistent address to a second interface | medium | 5 | B | Give the secondary interface the requested address through Netplan, apply it now and keep it after a reboot. |
 | `xlp-lvm-raid-mount-opts` | linuxplus:system-management | Mount a volume with restrictive options | easy | 4 | B | Mount the given LV at the given path with noexec and nosuid, persistently. |
 | `xlp-backup-restore-tar` | linuxplus:system-management | Restore one directory from a backup archive | easy | 4 | A | Restore only the requested directory from the given archive to its original place with ownership intact. |
 | `xlp-fhs-locate-config` | linuxplus:system-management | Locate the files the auditor asks for | easy | 4 | A | Write the paths of the requested config, log and variable-data files of the given service to the answer file. |
