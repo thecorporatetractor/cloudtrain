@@ -46,6 +46,8 @@ export type Permission =
   | 'settings.manage'
   | 'quota.manage'
   | 'audit.read'
+  /** The organisation's plan and billing: see entitlements, start checkout, open the customer portal, read billing events. */
+  | 'billing.manage'
   | 'org.manage'
   | 'capacity.read'
   | 'support.access';
@@ -993,6 +995,10 @@ export type AuditAction =
   | 'platform.org_suspend'
   | 'platform.org_reactivate'
   | 'platform.org_delete'
+  | 'billing.checkout'
+  | 'billing.portal'
+  | 'billing.subscription'
+  | 'billing.webhook'
   | (string & {});
 
 export interface AuditEvent {

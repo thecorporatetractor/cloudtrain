@@ -19,6 +19,8 @@ import { registerAuthRoutes } from './routes/auth.js';
 import { registerDevImpersonation } from './routes/dev.js';
 import { registerPlatformRoutes } from './routes/platform.js';
 import { registerPublicRoutes } from './routes/public.js';
+import { registerBillingRoutes } from './billing/routes.js';
+import type { BillingService } from './billing/service.js';
 import type { SessionService } from './sessions/service.js';
 import { bridge, clampSize, send } from './terminal/bridge.js';
 import { TerminalHub } from './terminal/hub.js';
@@ -65,6 +67,8 @@ export interface AppDeps {
    * catalog from content/ and the exam catalog. Omitted = not served.
    */
   site?: { config: SiteConfig; exams?: ExamCatalog; ratePerMinute?: number };
+  /** Plans, entitlements and Stripe (test mode) under `/api/billing/*`; omitted = not served. */
+  billing?: BillingService;
 }
 
 /** Each readiness check must answer within this time, or the pod reports not ready. */
@@ -235,6 +239,8 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   /* --------------------------------- sessions -------------------------------- */
 
   app.post<{ Params: { id: string } }>('/api/labs/:id/sessions', run, async (req, reply) => {
+    // Entitlements are recorded, not enforced yet: this gate never refuses (src/billing/service.ts, assertLabStart).
+    await deps.billing?.assertLabStart(req.principal, req.params.id);
     const s = await sessions.start(req.principal, req.params.id);
     return reply.code(201).send(s);
   });
@@ -292,6 +298,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
 
   /* ---------------------------------- public --------------------------------- */
 
+  if (deps.billing) registerBillingRoutes(app, deps.billing);
   if (deps.site) registerPublicRoutes(app, { content, site: deps.site.config, ...(deps.site.exams ? { exams: deps.site.exams } : {}), ...(deps.site.ratePerMinute ? { ratePerMinute: deps.site.ratePerMinute } : {}) });
 
   /* ---------------------------------- exams ---------------------------------- */

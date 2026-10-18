@@ -23,6 +23,8 @@ import { KubeExamCluster } from './exams/kube.js';
 import { PgEvidenceSink, PgExamStore, PgTeamDirectory } from './exams/pg.js';
 import { ExamService } from './exams/service.js';
 import { loadSiteConfig } from './site/config.js';
+import { BillingService } from './billing/service.js';
+import { StripeApi, maskKey } from './billing/stripe.js';
 
 async function main() {
   const config = loadConfig();
@@ -87,6 +89,15 @@ async function main() {
   const events = new EventService(platform, sessions);
   const answers = new AnswerService(sessions, new PgAnswerStore(platform), { ratePerMinute: config.answerRatePerMinute, resolve: events.resolveScope });
 
+  // Billing (Stripe, test mode only, behind CT_BILLING_ENABLED): plans from the site configuration.
+  const billing = new BillingService({
+    db,
+    site,
+    ...(config.billing.enabled ? { stripe: new StripeApi(config.billing.secretKey), webhookSecret: config.billing.webhookSecret } : {}),
+    webUrl: config.webUrl,
+    log: { info: (o, m) => log?.info(o, m), warn: (o, m) => log?.warn(o, m) },
+  });
+
   const app = await buildApp({
     content,
     auth: new OidcAuthenticator(db, store, oidc),
@@ -105,6 +116,7 @@ async function main() {
     trustProxy: config.trustProxy,
     corsOrigins: config.corsOrigins,
     readiness: { postgres: () => sql`SELECT 1`.execute(db) },
+    billing,
   });
   log = app.log;
   for (const i of examCatalog.issues) app.log.warn({ file: i.file }, `exams skipped: ${i.message}`);
@@ -113,7 +125,9 @@ async function main() {
   for (const i of content.issues) app.log.warn({ file: i.file }, `lab skipped: ${i.message}`);
   app.log.info({ labs: content.labs.size, skills: content.skills.length, frameworks: content.frameworks.length, context: config.kubeContext, namespace: config.namespace, contentDir: config.contentDir }, 'content loaded');
   if (config.devImpersonate) app.log.warn({ publicUrl: config.publicUrl }, 'DEV ONLY: CT_DEV_IMPERSONATE=1, POST /api/dev/sign-in-as is enabled (loopback callers only)');
-  app.log.info({ file: config.siteConfigFile, brand: site.brand.name, flags: site.flags }, 'public website config loaded');
+  app.log.info({ file: config.siteConfigFile, brand: site.brand.name, flags: site.flags, plans: site.plans?.items.map((p) => p.id) ?? [] }, 'public website config loaded');
+  if (config.billing.enabled) app.log.info({ mode: 'test', key: maskKey(config.billing.secretKey), checkoutEnabled: !!site.flags.checkoutEnabled }, 'billing: Stripe TEST MODE on (CT_BILLING_ENABLED=1)');
+  else app.log.info({}, 'billing: off (CT_BILLING_ENABLED unset); plans are informational');
   app.log.info({ issuer: config.oidc.issuer, publicUrl: config.publicUrl, webUrl: config.webUrl, platformIdps: config.platformIdps, domainVerifyBypass: config.devDomainVerifyBypass }, 'auth: OIDC (BFF)');
 
   const sweep = config.sweepIntervalMs > 0 ? setInterval(() => void platform.sweep().catch((e: unknown) => app.log.warn({ err: e }, 'attempt sweep failed')), config.sweepIntervalMs) : undefined;

@@ -1,5 +1,6 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { isLiveKey, isTestKey } from './billing/stripe.js';
 
 /** Repository root, resolved from this file (src/ or dist/ under services/gateway). */
 export const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
@@ -80,10 +81,45 @@ export interface Config {
   /** Requests per minute one client address may make to `/api/public/*` (CT_PUBLIC_RATE_PER_MINUTE, default 120). */
   publicRatePerMinute: number;
   /**
+   * Stripe billing, TEST MODE ONLY in this version (CT_BILLING_ENABLED=1, STRIPE_MODE=test,
+   * STRIPE_SECRET_KEY=sk_test_..., STRIPE_WEBHOOK_SECRET=whsec_...). loadConfig refuses a
+   * live key, a mode other than test, or billing on without a test key and webhook secret.
+   * The key is never logged.
+   */
+  billing: BillingConfig;
+  /**
    * DEV ONLY: `POST /api/dev/sign-in-as` (CT_DEV_IMPERSONATE=1). loadConfig refuses
    * to return a config with it on in production or on a non-loopback URL.
    */
   devImpersonate: boolean;
+}
+
+export interface BillingConfig {
+  enabled: boolean;
+  mode: 'test';
+  secretKey: string;
+  webhookSecret: string;
+}
+
+/**
+ * CT_BILLING_ENABLED: '1' turns billing on, unset/''/'0' leaves it off, anything else is an
+ * error. A live Stripe key (sk_live_, rk_live_) is refused whether billing is on or off, and
+ * STRIPE_MODE must be `test`: this version never talks to a live account.
+ */
+export function billingConfig(env: NodeJS.ProcessEnv): BillingConfig {
+  const v = env.CT_BILLING_ENABLED;
+  const enabled = !(v === undefined || v === '' || v === '0');
+  if (enabled && v !== '1') throw new Error(`CT_BILLING_ENABLED must be 1 or 0 (got ${JSON.stringify(v)}); refusing to start`);
+  const mode = env.STRIPE_MODE ?? 'test';
+  if (mode !== 'test') throw new Error(`STRIPE_MODE=${mode} is not supported: this version runs Stripe in test mode only; refusing to start`);
+  const secretKey = env.STRIPE_SECRET_KEY ?? '';
+  if (isLiveKey(secretKey)) throw new Error('STRIPE_SECRET_KEY is a live key while STRIPE_MODE=test; refusing to start');
+  const webhookSecret = env.STRIPE_WEBHOOK_SECRET ?? '';
+  if (enabled) {
+    if (!isTestKey(secretKey)) throw new Error('CT_BILLING_ENABLED=1 needs STRIPE_SECRET_KEY set to a test-mode key (sk_test_...); refusing to start');
+    if (!webhookSecret.startsWith('whsec_')) throw new Error('CT_BILLING_ENABLED=1 needs STRIPE_WEBHOOK_SECRET (whsec_..., from `stripe listen` or the dashboard); refusing to start');
+  }
+  return { enabled, mode: 'test', secretKey: enabled ? secretKey : '', webhookSecret: enabled ? webhookSecret : '' };
 }
 
 const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]']);
@@ -225,5 +261,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     examSessionLabels: labels(env.CT_EXAM_SESSION_LABELS),
     ...(num(env.CT_EXAM_DURATION_MINUTES, 0) > 0 ? { examDurationMinutes: num(env.CT_EXAM_DURATION_MINUTES, 0) } : {}),
     devImpersonate,
+    billing: billingConfig(env),
   };
 }
