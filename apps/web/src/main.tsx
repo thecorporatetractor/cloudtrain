@@ -11,9 +11,11 @@ import './styles/shell.css';
 import './styles/pages.css';
 import './styles/workspace.css';
 import './styles/platform.css';
+import './styles/site.css';
 import { router } from './router';
 import { ThemeProvider } from './lib/theme';
 import { TooltipProvider } from './components/ui';
+import { SiteTheme } from './site/SiteTheme';
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -37,6 +39,7 @@ async function boot() {
       <QueryClientProvider client={queryClient}>
         <ThemeProvider>
           <TooltipProvider delayDuration={400} skipDelayDuration={200}>
+            <SiteTheme />
             <RouterProvider router={router} />
           </TooltipProvider>
         </ThemeProvider>

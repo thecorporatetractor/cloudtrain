@@ -15,6 +15,8 @@ import { TerminalHub } from '../src/terminal/hub.js';
 import { FakeCluster, FakeCompiler, realContent, repo } from './fakes.js';
 import type { FakeOidcProvider } from './fake-oidc.js';
 import { createTestDb, type TestDb } from './pg.js';
+import { loadSiteConfig } from '../src/site/config.js';
+import path from 'node:path';
 
 /** Test auth: the principal is loaded from the database for the user named in `x-test-user`. */
 export class HeaderAuthenticator implements Authenticator {
@@ -85,7 +87,9 @@ export async function harness(opts: { oidc?: FakeOidcProvider; auth?: (t: TestDb
   }
   const events = new EventService(ps, sessions);
   const answers = new AnswerService(sessions, new PgAnswerStore(ps), { ratePerMinute: opts.answerRatePerMinute ?? 20, resolve: events.resolveScope });
-  const app = await buildApp({ content, auth, sessions, cluster, platform: ps, hub, answers, events, clusterInfo: null, ...(oidc ? { oidc } : {}), ...(opts.devImpersonate ? { devImpersonate: true } : {}) });
+  // The public website routes are part of the surface (DAST scans them too).
+  const site = await loadSiteConfig(path.join(repo, 'content/site.yaml'));
+  const app = await buildApp({ content, auth, sessions, cluster, platform: ps, hub, answers, events, clusterInfo: null, site: { config: site }, ...(oidc ? { oidc } : {}), ...(opts.devImpersonate ? { devImpersonate: true } : {}) });
   return {
     t,
     app,

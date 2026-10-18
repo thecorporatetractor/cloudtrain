@@ -5,6 +5,7 @@ import YAML from "yaml";
 import { validateLab, referencedParams, secretParams } from "@cloudtrain/lab-schema";
 import { scanText } from "./denylist.mjs";
 import { checkCurriculum } from "./curriculum.mjs";
+import { checkSite } from "./site.mjs";
 
 /** @typedef {{ level: "error" | "warn" | "info", file: string, path?: string, message: string }} Finding */
 
@@ -544,6 +545,9 @@ export async function verifyContent(contentDir, opts = {}) {
   }
   // The curriculum (proposal and source of truth for paths and exams), when present.
   const curriculum = await checkCurriculum(path.join(contentDir, "curriculum.yaml"), { skills, frameworkRefs, catalog, packLabs }, findings);
+  // The public website configuration, when present.
+  const domainsWithLabs = new Set([...packLabs.values()].map((l) => l.domain).filter(Boolean));
+  const site = await checkSite(path.join(contentDir, "site.yaml"), { domainsWithLabs, repoRoot: path.resolve(contentDir, "..") }, findings);
   const denylistHits = await scanDenylist(contentDir);
-  return { skills: skills.size, frameworks: frameworkRefs.size, labs, curriculum, findings, denylistHits };
+  return { skills: skills.size, frameworks: frameworkRefs.size, labs, curriculum, site, findings, denylistHits };
 }

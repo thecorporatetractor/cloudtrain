@@ -3,7 +3,8 @@
 //   pnpm --filter web dev -- --port 5199 &
 //   node apps/web/scripts/readme-shots.mjs [--base http://localhost:5199] [--chromium /usr/bin/chromium]
 //
-// Output: docs/images/*.png at the repository root.
+// Output: docs/images/*.png at the repository root. The screenshots the public
+// website shows (content/site.yaml `screenshots`) are copied to apps/web/public/site/.
 //
 // Real mode (a VITE_API_MODE=real dev server in front of a gateway): pass a
 // Playwright storageState from deploy/scripts/dev-signin-as.mjs and an output
@@ -11,7 +12,7 @@
 // started, personas are ignored, the mock-fixture waitFor texts are best effort):
 //
 //   node apps/web/scripts/readme-shots.mjs --base http://localhost:5197 --storage /tmp/me.json --out /tmp/shots
-import { mkdir } from 'node:fs/promises';
+import { copyFile, mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright-core';
@@ -176,6 +177,10 @@ try {
     ['org_admin', '/admin/sso', 'Identity providers', 'admin-sso'],
     ['org_admin', '/admin/audit', 'Export CSV', 'audit-log'],
     ['none', '/sign-in', 'Sign in', 'sign-in'],
+    // The public website (signed out): landing page and read-only catalog.
+    ['none', '/', 'How a lab works', 'landing'],
+    ['none', '/catalog', 'Everything you can practise', 'catalog-public'],
+    ['none', '/catalog/paths/cks-readiness', 'Network policy and least privilege', 'catalog-path-public'],
   ];
   for (const [persona, url, waitFor, name] of views) {
     const s = await session('dark', persona);
@@ -192,6 +197,14 @@ try {
     await open(s.page, '/', 'Next best lab');
     await shot(s.page, `home-${theme}`);
     await s.ctx.close();
+  }
+  // Website screenshots (content/site.yaml `screenshots`, served from apps/web/public/site/).
+  if (!storage) {
+    const siteDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../public/site');
+    await mkdir(siteDir, { recursive: true });
+    for (const name of ['workspace', 'skills', 'exam-results', 'team']) {
+      await copyFile(path.join(out, `${name}.png`), path.join(siteDir, `${name}.png`)).catch((e) => console.log('note: site copy skipped', name, e.message));
+    }
   }
 } catch (e) {
   console.log('FAILED', e.message);

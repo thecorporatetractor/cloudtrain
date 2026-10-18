@@ -8,6 +8,15 @@ pnpm --filter web dev        # http://localhost:5173, mock API via MSW
 pnpm --filter web build      # typecheck + production bundle
 ```
 
+## Public website
+
+`/`, `/catalog` (and `/catalog/paths/:id`, `/catalog/exams/:id`), `/pricing`, `/about`,
+`/faq`, `/contact` and `/legal/*` render without a session in the site layout
+(`src/site/`, `src/routes/site/`); `/` and `/catalog` turn into Home and the full
+catalog once signed in. Copy, brand, footer, flags and theme token overrides come
+from `content/site.yaml` through `GET /api/public/site` (mock mode bundles the file).
+Reference: `docs/website.md`.
+
 ## API modes
 
 | Mode | How | What |

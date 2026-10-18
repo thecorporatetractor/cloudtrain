@@ -1,7 +1,7 @@
 import Fastify, { type FastifyInstance } from 'fastify';
 import cookie from '@fastify/cookie';
 import websocket from '@fastify/websocket';
-import type { Lab } from '@cloudtrain/api-types';
+import type { Lab, SiteConfig } from '@cloudtrain/api-types';
 import type { Authenticator } from './auth.js';
 import { can, forbidden } from './authz.js';
 import type { Content } from './content/load.js';
@@ -17,12 +17,14 @@ import type { PlatformService } from './platform/service.js';
 import { registerAuthRoutes } from './routes/auth.js';
 import { registerDevImpersonation } from './routes/dev.js';
 import { registerPlatformRoutes } from './routes/platform.js';
+import { registerPublicRoutes } from './routes/public.js';
 import type { SessionService } from './sessions/service.js';
 import { bridge, clampSize, send } from './terminal/bridge.js';
 import { TerminalHub } from './terminal/hub.js';
 import { planTerminal } from './terminal/target.js';
 import { registerExamRoutes } from './exams/routes.js';
 import type { ExamService } from './exams/service.js';
+import type { ExamCatalog } from './exams/catalog.js';
 import { registerAnswerRoutes } from './answers/routes.js';
 import type { AnswerService } from './answers/service.js';
 import { registerEventRoutes } from './events/routes.js';
@@ -48,6 +50,11 @@ export interface AppDeps {
   hub?: TerminalHub;
   /** DEV ONLY: `POST /api/dev/sign-in-as` (CT_DEV_IMPERSONATE=1; needs `platform` and `oidc`). Absent = not registered. */
   devImpersonate?: boolean;
+  /**
+   * The public website (`/api/public/*`, no sign-in): site configuration plus the read-only
+   * catalog from content/ and the exam catalog. Omitted = not served.
+   */
+  site?: { config: SiteConfig; exams?: ExamCatalog; ratePerMinute?: number };
 }
 
 /** onRoute hook: an /api route without `config.permission` or `config.public` is a startup error. */
@@ -217,6 +224,10 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   if (deps.events) registerEventRoutes(app, deps.events);
 
   if (ps) registerPlatformRoutes(app, ps, sessions, deps.clusterInfo ?? null);
+
+  /* ---------------------------------- public --------------------------------- */
+
+  if (deps.site) registerPublicRoutes(app, { content, site: deps.site.config, ...(deps.site.exams ? { exams: deps.site.exams } : {}), ...(deps.site.ratePerMinute ? { ratePerMinute: deps.site.ratePerMinute } : {}) });
 
   /* ---------------------------------- exams ---------------------------------- */
 

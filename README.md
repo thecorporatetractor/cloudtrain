@@ -77,6 +77,7 @@ When a learner is ready, they take a timed exam simulation built the same way.
 | ![Instructor board](docs/images/instructor-board.png) **Instructor**: live cohort board (phase, checks, time on task, "stuck" signal) | ![Observe](docs/images/observe.png) **Observe**: read-only shadow terminal, audited |
 | ![Admin SSO](docs/images/admin-sso.png) **Org admin**: SSO connections, domain verification, group-to-role mapping | ![Audit log](docs/images/audit-log.png) **Audit log**: every administrative action, filterable and exportable |
 | ![Sign in](docs/images/sign-in.png) **Sign-in**: identity-first, routes each email domain to its company's IdP | ![Scenario Studio](docs/images/studio.png) **Scenario Studio**: lab drafts and their verification gates |
+| ![Landing page](docs/images/landing.png) **Website**: the public landing page, served by the same app and configured from `content/site.yaml` | ![Public catalog](docs/images/catalog-public.png) **Public catalog**: paths, courses, labs and exam simulations, read-only until sign-in |
 
 Three themes: dark, light and cream ([light](docs/images/workspace-light.png), [cream](docs/images/workspace-cream.png)).
 
@@ -223,11 +224,11 @@ cd services/lab-orchestrator && go vet ./... && go test ./...
 
 | Path | What |
 |---|---|
-| `apps/web` | Web app (React, TanStack Router, xterm.js, React Flow); mock and real mode |
+| `apps/web` | Web app (React, TanStack Router, xterm.js, React Flow); mock and real mode; the public website (`docs/website.md`) |
 | `services/gateway` | Backend for the web app: OIDC sessions, authorisation, Postgres, catalog, labs, exams, terminal WebSocket |
 | `services/lab-orchestrator` | Kubernetes operator (Go), node drivers, grader, exam engine, `labctl` |
-| `packages/lab-schema`, `packages/api-types` | Lab and curriculum schemas; shared API types |
-| `content/` | Skill graph, framework mappings, curriculum, lab packs |
+| `packages/lab-schema`, `packages/api-types` | Lab, curriculum and site schemas; shared API types |
+| `content/` | Skill graph, framework mappings, curriculum, lab packs, website configuration (`site.yaml`) |
 | `tools/` | `lab-verify`, curriculum renderer, image builds, license inventory, slot limiter |
 | `deploy/` | Local stack: kind, KubeVirt, Kube-OVN, Multus, vcluster, compose deps |
 | `docs/` | [Architecture](docs/architecture.md), [platform identity](docs/platform-identity.md), [dev environment](docs/dev-environment.md), [curriculum](docs/curriculum.md), [handoff](docs/handoff.md), [research](docs/research/reports/) |

@@ -3,8 +3,7 @@ import type { Difficulty, Domain, FrameworkId } from './api/types';
 import { Shell } from './app/Shell';
 import { NotFound } from './app/NotFound';
 import { PageSkeleton } from './components/ui';
-import { Home } from './routes/Home';
-import { Catalog } from './routes/Catalog';
+import { CatalogIndex, RootIndex } from './routes/site/Hybrid';
 
 // Screens that pull in React Flow or xterm are loaded on demand so the other
 // pages do not download them (see vite.config.ts manualChunks). Role-specific
@@ -47,6 +46,16 @@ const Events = lazyRouteComponent(() => import('./routes/events/Events'), 'Event
 const EventDetail = lazyRouteComponent(() => import('./routes/events/EventDetail'), 'EventDetail');
 const EventScoreboard = lazyRouteComponent(() => import('./routes/events/EventScoreboard'), 'EventScoreboard');
 const EventManage = lazyRouteComponent(() => import('./routes/events/EventManage'), 'EventManage');
+// The public website (no sign-in): detail pages and the small pages. `/` and `/catalog` are
+// hybrid (routes/site/Hybrid.tsx): the landing page or the public catalog for visitors.
+const PublicPath = lazyRouteComponent(() => import('./routes/site/PublicPath'), 'PublicPath');
+const PublicExam = lazyRouteComponent(() => import('./routes/site/PublicExam'), 'PublicExam');
+const Pricing = lazyRouteComponent(() => import('./routes/site/Pages'), 'Pricing');
+const About = lazyRouteComponent(() => import('./routes/site/Pages'), 'About');
+const Faq = lazyRouteComponent(() => import('./routes/site/Pages'), 'Faq');
+const Contact = lazyRouteComponent(() => import('./routes/site/Pages'), 'Contact');
+const Terms = lazyRouteComponent(() => import('./routes/site/Pages'), 'Terms');
+const Privacy = lazyRouteComponent(() => import('./routes/site/Pages'), 'Privacy');
 
 function Pending() {
   return (
@@ -60,7 +69,18 @@ const str = (v: unknown): string | undefined => (typeof v === 'string' && v ? v 
 
 const rootRoute = createRootRoute({ component: Shell, notFoundComponent: NotFound });
 
-export const homeRoute = createRoute({ getParentRoute: () => rootRoute, path: '/', component: Home });
+export const homeRoute = createRoute({ getParentRoute: () => rootRoute, path: '/', component: RootIndex });
+
+/* ------------------------------------------------------------------ public website */
+
+export const publicPathRoute = createRoute({ getParentRoute: () => rootRoute, path: '/catalog/paths/$pathId', component: PublicPath });
+export const publicExamRoute = createRoute({ getParentRoute: () => rootRoute, path: '/catalog/exams/$examId', component: PublicExam });
+export const pricingRoute = createRoute({ getParentRoute: () => rootRoute, path: '/pricing', component: Pricing });
+export const aboutRoute = createRoute({ getParentRoute: () => rootRoute, path: '/about', component: About });
+export const faqRoute = createRoute({ getParentRoute: () => rootRoute, path: '/faq', component: Faq });
+export const contactRoute = createRoute({ getParentRoute: () => rootRoute, path: '/contact', component: Contact });
+export const termsRoute = createRoute({ getParentRoute: () => rootRoute, path: '/legal/terms', component: Terms });
+export const privacyRoute = createRoute({ getParentRoute: () => rootRoute, path: '/legal/privacy', component: Privacy });
 
 /* ------------------------------------------------------------------ auth */
 
@@ -104,7 +124,7 @@ export const catalogRoute = createRoute({
     if (typeof s.maxMinutes === 'number' && s.maxMinutes > 0) out.maxMinutes = s.maxMinutes;
     return out;
   },
-  component: Catalog,
+  component: CatalogIndex,
 });
 
 export const labRoute = createRoute({ getParentRoute: () => rootRoute, path: '/labs/$labId', component: LabOverview });
@@ -322,6 +342,14 @@ export const platformContentRoute = createRoute({ getParentRoute: () => platform
 const routeTree = rootRoute.addChildren([
   homeRoute,
   signInRoute,
+  publicPathRoute,
+  publicExamRoute,
+  pricingRoute,
+  aboutRoute,
+  faqRoute,
+  contactRoute,
+  termsRoute,
+  privacyRoute,
   catalogRoute,
   labRoute,
   workspaceRoute,

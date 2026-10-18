@@ -47,6 +47,10 @@ export interface ContentPack {
   title: string;
   domain: Domain;
   labIds: string[];
+  /** Courses of the pack (each is also served as a Path); only labs that loaded. */
+  courses: { id: string; title: string; description?: string; labIds: string[] }[];
+  /** Pack paths and the courses they concatenate, in order. */
+  paths: { id: string; courseIds: string[] }[];
 }
 
 /* ------------------------------ source shapes ------------------------------ */
@@ -337,6 +341,8 @@ export async function loadContent(contentDir: string, extraLabDirs: string[] = [
     title: p.metadata.title,
     domain: p.metadata.domain,
     labIds: Array.from(labs.values()).filter((l) => l.pack === p.metadata.id).map((l) => l.lab.metadata.id),
+    courses: (p.courses ?? []).map((c) => ({ id: c.id, title: c.title, ...(c.description ? { description: c.description } : {}), labIds: known(c.labs) })),
+    paths: (p.paths ?? []).map((pp) => ({ id: pp.id, courseIds: pp.courses.filter((id) => (p.courses ?? []).some((c) => c.id === id)) })),
   }));
 
   return { labs, skills, requires, competencies, frameworks, packs: contentPacks, paths, domains, summaries, issues };

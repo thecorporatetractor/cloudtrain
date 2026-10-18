@@ -28,3 +28,14 @@ const cts = await compile({ ...curriculum, title: "Curriculum" }, "Curriculum", 
 });
 await writeFile(new URL("src/curriculum.generated.ts", here), cts);
 console.log("wrote src/curriculum.generated.ts");
+
+const site = JSON.parse(await readFile(new URL("schema/site.schema.json", here), "utf8"));
+const sts = await compile({ ...site, title: "Site" }, "Site", {
+  bannerComment:
+    "/* eslint-disable */\n/**\n * GENERATED from schema/site.schema.json by scripts/gen-types.mjs. Do not edit by hand.\n */",
+  additionalProperties: false,
+  unreachableDefinitions: true,
+  style: { singleQuote: false },
+});
+await writeFile(new URL("src/site.generated.ts", here), sts);
+console.log("wrote src/site.generated.ts");
