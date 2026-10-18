@@ -88,10 +88,16 @@ spec:
       skills: [net.services.snmp]
       weight: 2
     - id: v3-requires-priv
-      description: The same user is refused without privacy (authNoPriv)
+      description: The existing user is denied access when it does not use privacy (authNoPriv)
       type: shell
       on: monitor-25
-      command: snmpget -v3 -l authNoPriv -u nms{{octet}} -a SHA -A "$(cat /root/snmp-auth.txt)" -On -Oqv -t 2 -r 0 10.{{octet}}.25.1 .1.3.6.1.2.1.1.5.0 >/dev/null 2>&1 && echo answered || echo refused
+      command: |
+        out=$(snmpget -v3 -l authNoPriv -u nms{{octet}} -a SHA -A "$(cat /root/snmp-auth.txt)" -On -Oqv -t 2 -r 0 10.{{octet}}.25.1 .1.3.6.1.2.1.1.5.0 2>&1)
+        case "$out" in
+          *authorizationError*|*"Authorization error"*|*noAccess*) echo refused ;;
+          *"Unknown user"*) echo "unknown user" ;;
+          *) echo "other: $(echo "$out" | head -1)" ;;
+        esac
       expect: { match: exact, value: refused }
       timeoutSec: 10
       skills: [net.services.snmp]
@@ -106,10 +112,16 @@ spec:
       skills: [net.services.snmp, net.security.device-hardening]
       weight: 2
     - id: other-host-refused
-      description: other-25 gets no answer, even with the correct SNMPv3 credentials
+      description: other-25 gets no answer at all (timeout), even with the correct SNMPv3 credentials
       type: shell
       on: other-25
-      command: snmpget -v3 -l authPriv -u nms{{octet}} -a SHA -A "$(cat /root/snmp-auth.txt)" -x AES -X "$(cat /root/snmp-priv.txt)" -On -Oqv -t 2 -r 0 10.{{octet}}.26.1 .1.3.6.1.2.1.1.5.0 >/dev/null 2>&1 && echo answered || echo silent
+      command: |
+        out=$(snmpget -v3 -l authPriv -u nms{{octet}} -a SHA -A "$(cat /root/snmp-auth.txt)" -x AES -X "$(cat /root/snmp-priv.txt)" -On -Oqv -t 2 -r 0 10.{{octet}}.26.1 .1.3.6.1.2.1.1.5.0 2>&1)
+        case "$out" in
+          *Timeout*) echo silent ;;
+          *"mv-edge-25"*) echo answered ;;
+          *) echo "other: $(echo "$out" | head -1)" ;;
+        esac
       expect: { match: exact, value: silent }
       timeoutSec: 10
       skills: [net.services.snmp, net.security.device-hardening]

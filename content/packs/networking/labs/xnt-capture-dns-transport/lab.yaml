@@ -94,8 +94,10 @@ spec:
       command: |
         f=/root/dns-transport.txt; [ -f "$f" ] || { echo nofile; exit 0; }
         got=$(sed -n 's/^transport: *\([A-Za-z]*\) *$/\1/p' "$f" | tr A-Z a-z)
-        # the protocol of the captured query packets (UDP queries show as "udp" payload lines, TCP as "Flags")
-        tcpdump -nn -r /var/lib/cloudtrain/dns-all.pcap "src host 10.{{octet}}.13.20 and dst port 53 and udp" 2>/dev/null | grep -q '{{name}}\.mv\.example' && real=udp || real=tcp
+        # the protocol of the captured query packets for the requested name; no such query at all is a failure
+        q() { tcpdump -nn -r /var/lib/cloudtrain/dns-all.pcap "src host 10.{{octet}}.13.20 and dst port 53 and $1" 2>/dev/null | grep -q '{{name}}\.mv\.example'; }
+        if q udp; then real=udp; elif q tcp; then real=tcp; else real=none; fi
+        [ "$real" != none ] || { echo "bad no query in capture"; exit 0; }
         [ "$got" = "$real" ] && echo ok || echo "bad $got"
       expect: { match: exact, value: ok }
       skills: [net.fundamentals.tcp-udp-ports]

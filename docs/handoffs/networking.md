@@ -128,14 +128,18 @@ retakes get a fresh draw (the exam itself now runs end to end: 100 % / 14.3 %).
   `xnt-api-interface-desc`.
 - The two `sim-platform-engineer` network tasks (`xpe-net-depot-route`, `xpe-net-edge-nat`, Quillmoor
   `qm-*` estate). The harbour cluster nodes are VMs a netdev router cannot be wired to, so both use
-  netsvc stand-ins; persistence is checked (FRR `write memory` via `/etc/frr/*.conf`, nftables via
-  `/etc/nftables.nft` plus a boot-restore stand-in script).
-- Design notes: FRR cannot create VLAN subinterfaces (setup pre-creates them in
-  `xnt-inter-vlan-annex`); `xnt-route-preference-report` gives `mv-core-21` `access: [console, shell]`
-  (first netdev node with shell access); `xnt-json-neighbour-export` serves read-only vtysh JSON over
+  netsvc stand-ins; persistence is checked (FRR `write memory`, parsed per interface stanza in
+  `/etc/frr/*.conf`; nftables: the weight-0 trigger runs `restore-firewall`, which flushes the live
+  ruleset and loads `/etc/nftables.nft`, so the functional checks grade the saved file).
+- Design notes: `xnt-inter-vlan-annex` uses a netsvc Linux router (the learner creates the 802.1Q
+  subinterfaces); `xnt-route-preference-report` keeps `mv-core-21` console-only (a netdev node gives the
+  learner vtysh only): the answer file lives on the netsvc host `noc-21`, the core serves
+  `show ip route <dest> json` read-only over HTTP, and params `rot`/`fad` permute which destination gets
+  the static /24, the static /23 and the floating static (AD 90 or 250); `xnt-json-neighbour-export` serves read-only vtysh JSON over
   HTTP from a small python3 server on the core; `xnt-capture-dns-transport` compares the answer file
   with a grader-owned pcap started in setup.
 - Verify queue (none run live this wave): every task above per-lab `labctl verify`; first-verify risks
   are the WireGuard/IPsec kernel modules in the user-namespaced netns (net-wireguard-annex-tunnel,
-  net-ipsec-partner-tunnel, net-fix-mtu-blackhole, xnt-wireguard-annex), FRR JSON field names
+  net-ipsec-partner-tunnel, xnt-wireguard-annex), `ip_gre` and 1400-byte frames on the pod network
+  (net-fix-mtu-blackhole, GRE tunnel, not WireGuard), FRR JSON field names
   (`state` DR/Backup/DROther, `ifaceName`), and `show ip route <dest> json` entry layout.

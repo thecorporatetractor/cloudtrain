@@ -142,9 +142,21 @@ spec:
       type: shell
       on: qm-edge-1
       command: |
-        c=$(cat /etc/frr/*.conf 2>/dev/null)
-        has() { printf '%s\n' "$c" | grep -Eq "$1"; }
-        has 'ospf router-id 10\.255\.{{octet}}\.1$' && has '(ip ospf area 0|network 10\.{{octet}}\.0\.0/30 area 0)' && has '(ip ospf passive|passive-interface eth1)' && echo saved || echo not-saved
+        cat /etc/frr/*.conf 2>/dev/null | awk '
+          /^interface /      { cur=$2; sec="if"; next }
+          /^router ospf/     { cur=""; sec="ospf"; next }
+          /^[a-z!]/          { cur=""; sec=""; next }
+          sec=="if"  && /^ ip ospf area 0$/ { area[cur]=1 }
+          sec=="if"  && /^ ip ospf passive$/ { pas[cur]=1 }
+          sec=="ospf" && /^ ospf router-id 10\.255\.{{octet}}\.1$/ { rid=1 }
+          sec=="ospf" && /^ network 10\.{{octet}}\.0\.0\/30 area 0(\.0\.0\.0)?$/ { net2=1 }
+          sec=="ospf" && /^ network 10\.{{octet}}\.10\.0\/24 area 0(\.0\.0\.0)?$/ { net1=1 }
+          sec=="ospf" && /^ passive-interface eth1$/ { pas["eth1"]=1 }
+          END {
+            ok2 = area["eth2"] || net2
+            ok1 = (area["eth1"] || net1) && pas["eth1"]
+            print (rid && ok1 && ok2) ? "saved" : "not-saved"
+          }'
       expect: { match: exact, value: saved }
       skills: [net.routing.ospf]
   misconceptions:

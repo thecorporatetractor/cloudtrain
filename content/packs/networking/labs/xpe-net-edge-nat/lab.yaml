@@ -33,14 +33,14 @@ spec:
     - return traffic of allowed connections keeps working.
 
     The edge router is rebooted before grading, so **save the ruleset to
-    `/etc/nftables.nft`** (the node's boot service loads that file when the live
-    ruleset is empty; it must pass `nft -c`).
+    `/etc/nftables.nft`** (the node's boot service, `restore-firewall`, flushes the live
+    ruleset and loads that file; it must pass `nft -c`).
   objectives:
     - Configure source NAT and a forwarding policy that admits one subnet
     - Persist the nftables ruleset across a reboot
   params:
     octet: { type: int, min: 20, max: 90 }
-    up: { type: int, min: 20, max: 250 }
+    up: { type: int, min: 60, max: 250 }
     port: { type: choice, values: [443, 8443, 3128] }
   topology:
     entry: workstation
@@ -64,10 +64,11 @@ spec:
         ip addr replace 10.{{octet}}.10.1/24 dev eth1
         ip addr replace 10.{{octet}}.20.1/24 dev eth2
         ip addr replace 198.51.100.{{up}}/24 dev eth3
-        # boot service stand-in: load the saved ruleset when the live ruleset is empty
+        # boot service stand-in: a reboot starts with an empty ruleset, then the saved file is loaded
         cat > /usr/local/sbin/restore-firewall <<'EOS'
         #!/bin/sh
-        [ -n "$(nft list ruleset 2>/dev/null)" ] || { [ -s /etc/nftables.nft ] && nft -f /etc/nftables.nft; }
+        nft flush ruleset
+        [ -s /etc/nftables.nft ] && nft -f /etc/nftables.nft
         exit 0
         EOS
         chmod +x /usr/local/sbin/restore-firewall
@@ -83,7 +84,7 @@ spec:
         sleep 1
   checks:
     - id: boot-restore
-      description: (reboot stand-in) the boot service loads /etc/nftables.nft when the live ruleset is empty
+      description: (reboot stand-in) the boot service flushes the live ruleset and loads /etc/nftables.nft, so the checks that follow grade the saved file
       type: shell
       on: qm-edge-fw
       command: restore-firewall; echo done
@@ -137,7 +138,7 @@ spec:
           nft add table ip edgenat
           nft 'add chain ip edgenat post { type nat hook postrouting priority 100; }'
           nft add rule ip edgenat post ip saddr 10.{{octet}}.10.0/24 oifname eth3 masquerade
-      expectFail: [rules-saved]
+      expectFail: [harbour-egress-natted, office-blocked, rules-saved]
     - id: masquerade-everyone
       description: NATs and forwards every subnet to the mirror and drops nothing
       mutation:
