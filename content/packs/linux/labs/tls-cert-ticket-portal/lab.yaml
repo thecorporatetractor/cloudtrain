@@ -1,0 +1,289 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: tls-cert-ticket-portal
+  title: Issue and install a certificate for the ticket portal
+  domain: linux
+  frameworks: [lfcs:essential-commands, linuxplus:security]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [openssl, tls, csr, san, certificates, ca]
+  version: 1
+spec:
+  description: |
+    The ticket portal on `tr-portal-01` listens on `https://tickets.tallowmere.test:8443`
+    (it resolves to this host) and currently shows a throwaway self-signed certificate that
+    no client trusts. A shell is open on this host and you have `sudo`.
+
+    Replace it with a certificate from the Tallowmere lab CA:
+
+    1. Create a new **private key** (RSA 2048 or better, or an EC key) and a **certificate
+       signing request** whose subject common name is `tickets.tallowmere.test` and whose
+       **subject alternative names** are exactly `tickets.tallowmere.test` and
+       `{{alt}}`.
+    2. Have the CA sign it: `sudo tr-ca-sign --csr FILE.csr --out FILE.crt` (the CA key
+       stays on the CA; the signer copies the request's SANs into the certificate).
+    3. Install the key and certificate as **`/etc/tr-portal/tls/portal.key`** (readable by
+       root only) and **`/etc/tr-portal/tls/portal.crt`**, then tell the portal to reload
+       them with `sudo tr-portal-ctl reload` (its log is `/var/log/tr-portal.log`).
+
+    The CA certificate is already trusted on this host
+    (`/usr/local/share/ca-certificates/tallowmere-lab-ca.crt`). When you are done,
+
+    ```
+    openssl s_client -connect tickets.tallowmere.test:8443 -verify_hostname tickets.tallowmere.test -verify_return_error </dev/null
+    ```
+
+    reports `Verification: OK`, and the same works with `{{alt}}` as the hostname.
+  objectives:
+    - Generate a private key and a CSR with subject alternative names
+    - Get a CSR signed by a CA and install the result with sane key permissions
+    - Verify a served certificate chain and hostname with openssl s_client
+  params:
+    alt:
+      type: choice
+      values: [portal.tallowmere.test, kiosk.tallowmere.test, mobile-tickets.tallowmere.test]
+  topology:
+    entry: tr-portal-01
+    nodes:
+      - name: tr-portal-01
+        driver: container
+        image: deb-lab:24.04
+        access: [shell]
+        learnerSudo: true
+  setup:
+    - on: tr-portal-01
+      timeoutSec: 120
+      run: |
+        set -eu
+        echo 'learner ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/learner && chmod 0440 /etc/sudoers.d/learner
+        V=/var/lib/cloudtrain; mkdir -p $V; chmod 0700 $V
+        # --- in-lab CA: key stays in /var/lib/cloudtrain/ca; the certificate is trusted system-wide
+        CA=$V/ca; rm -rf $CA; mkdir -p $CA; chmod 0700 $CA
+        openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -subj "/O=Tallowmere Rail/CN=Tallowmere Lab CA" \
+          -addext basicConstraints=critical,CA:TRUE -addext keyUsage=critical,keyCertSign,cRLSign \
+          -keyout $CA/ca.key -out $CA/ca.crt >/dev/null 2>&1
+        echo 1000 > $CA/serial
+        install -m 0644 $CA/ca.crt /usr/local/share/ca-certificates/tallowmere-lab-ca.crt
+        update-ca-certificates >/dev/null 2>&1
+        cat > /usr/sbin/tr-ca-sign <<'EOT'
+        #!/bin/sh
+        # tr-ca-sign --csr FILE --out FILE [--days N]: sign a request with the Tallowmere lab CA.
+        # Subject alternative names are copied from the request.
+        CA=/var/lib/cloudtrain/ca; days=365
+        while [ $# -gt 0 ]; do
+          case "$1" in --csr) csr=$2; shift 2 ;; --out) out=$2; shift 2 ;; --days) days=$2; shift 2 ;; *) echo "usage: tr-ca-sign --csr FILE --out FILE [--days N]" >&2; exit 2 ;; esac
+        done
+        [ -n "${csr:-}" ] && [ -n "${out:-}" ] || { echo "usage: tr-ca-sign --csr FILE --out FILE [--days N]" >&2; exit 2; }
+        [ "$(id -u)" = 0 ] || { echo "tr-ca-sign: run it with sudo" >&2; exit 1; }
+        openssl req -in "$csr" -noout -verify >/dev/null 2>&1 || { echo "tr-ca-sign: $csr is not a valid request" >&2; exit 1; }
+        printf 'basicConstraints=CA:FALSE\nkeyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n' > $CA/ext.cnf
+        openssl x509 -req -in "$csr" -CA $CA/ca.crt -CAkey $CA/ca.key -CAserial $CA/serial -days "$days" -copy_extensions copy -extfile $CA/ext.cnf -out "$out" 2>/dev/null \
+          && echo "tr-ca-sign: wrote $out" || { echo "tr-ca-sign: signing failed" >&2; exit 1; }
+        EOT
+        chmod 0755 /usr/sbin/tr-ca-sign
+        # --- names on the loopback (/etc/hosts is a bind mount: append in place)
+        for h in tickets.tallowmere.test {{alt}}; do grep -q " $h\$" /etc/hosts || echo "127.0.0.1 $h" >> /etc/hosts; done
+        # --- the portal: HTTPS on 127.0.0.1:8443, reloads its certificate on SIGHUP
+        mkdir -p /etc/tr-portal/tls /usr/local/lib/tr-portal; rm -f /etc/tr-portal/tls/portal.*
+        openssl req -x509 -newkey rsa:2048 -nodes -days 30 -subj "/CN=localhost" -keyout $V/portal-default.key -out $V/portal-default.crt >/dev/null 2>&1
+        cat > /usr/local/lib/tr-portal/portal.py <<'EOT'
+        #!/usr/bin/env python3
+        import http.server, os, signal, ssl, time
+        CERT, KEY = "/etc/tr-portal/tls/portal.crt", "/etc/tr-portal/tls/portal.key"
+        DEF = ("/var/lib/cloudtrain/portal-default.crt", "/var/lib/cloudtrain/portal-default.key")
+        LOG = "/var/log/tr-portal.log"
+        def log(msg):
+            with open(LOG, "a") as f:
+                f.write("%s %s\n" % (time.strftime("%F %T"), msg))
+        def make_ctx(cert, key):
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ctx.load_cert_chain(cert, key)
+            return ctx
+        state = {"ctx": make_ctx(*DEF)}
+        log("started with the default self-signed certificate")
+        def reload(*_):
+            try:
+                state["ctx"] = make_ctx(CERT, KEY)
+                log("reloaded %s" % CERT)
+            except Exception as e:
+                log("reload failed, keeping the previous certificate: %s" % e)
+        signal.signal(signal.SIGHUP, reload)
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200); self.send_header("Content-Type", "text/plain"); self.end_headers()
+                self.wfile.write(b"Tallowmere Rail ticket portal\n")
+            def log_message(self, *a):
+                pass
+        class S(http.server.ThreadingHTTPServer):
+            allow_reuse_address = True
+            def get_request(self):
+                s, a = self.socket.accept()
+                s.settimeout(10)
+                try:
+                    return state["ctx"].wrap_socket(s, server_side=True), a
+                except Exception:
+                    s.close(); raise OSError("handshake failed")
+        open("/run/tr-portal.pid", "w").write(str(os.getpid()))
+        S(("127.0.0.1", 8443), H).serve_forever()
+        EOT
+        cat > /usr/sbin/tr-portal-ctl <<'EOT'
+        #!/bin/sh
+        case "$1" in
+          reload) kill -HUP "$(cat /run/tr-portal.pid)" && echo "tr-portal: reload requested (see /var/log/tr-portal.log)" ;;
+          status) kill -0 "$(cat /run/tr-portal.pid 2>/dev/null)" 2>/dev/null && echo "tr-portal is running" || { echo "tr-portal is not running"; exit 3; } ;;
+          *) echo "usage: tr-portal-ctl reload|status" >&2; exit 2 ;;
+        esac
+        EOT
+        chmod 0755 /usr/sbin/tr-portal-ctl
+        : > /var/log/tr-portal.log; chmod 0644 /var/log/tr-portal.log
+        pkill -f '^python3 /usr/local/lib/tr-portal/portal.py' 2>/dev/null || true
+        sleep 1
+        (setsid nohup python3 /usr/local/lib/tr-portal/portal.py >/dev/null 2>&1 </dev/null &)
+        for i in $(seq 20); do (echo > /dev/tcp/127.0.0.1/8443) >/dev/null 2>&1 && break; sleep 0.5; done
+  checks:
+    - id: chain-verifies
+      description: The portal presents a certificate that verifies against the lab CA for tickets.tallowmere.test and for {{alt}}
+      type: shell
+      on: tr-portal-01
+      skills: [linux.security.tls-certificates]
+      weight: 2.5
+      timeoutSec: 40
+      command: |
+        cd /tmp; r=""
+        for h in tickets.tallowmere.test {{alt}}; do
+          o=$(openssl s_client -connect 127.0.0.1:8443 -servername $h -CAfile /usr/local/share/ca-certificates/tallowmere-lab-ca.crt -verify_hostname $h -verify_return_error </dev/null 2>&1)
+          printf '%s\n' "$o" | grep -q 'Verification: OK' && r="$r ok" || r="$r fail"
+        done
+        echo $r
+      expect: {match: exact, value: "ok ok"}
+    - id: served-sans
+      description: The served certificate has the common name tickets.tallowmere.test and exactly the two SANs
+      type: shell
+      on: tr-portal-01
+      skills: [linux.security.tls-certificates]
+      weight: 1.5
+      timeoutSec: 40
+      command: |
+        cd /tmp
+        c=$(openssl s_client -connect 127.0.0.1:8443 -servername tickets.tallowmere.test </dev/null 2>/dev/null | openssl x509 2>/dev/null) || true
+        [ -n "$c" ] || { echo no-cert; exit 0; }
+        cn=$(printf '%s\n' "$c" | openssl x509 -noout -subject -nameopt multiline 2>/dev/null | awk '$1 == "commonName" {print $3}')
+        sans=$(printf '%s\n' "$c" | openssl x509 -noout -ext subjectAltName 2>/dev/null | grep -o 'DNS:[^, ]*' | sort | tr '\n' ' ')
+        echo "$cn $sans"
+      expect: {match: exact, value: "tickets.tallowmere.test DNS:{{alt}} DNS:tickets.tallowmere.test "}
+    - id: key-installed-privately
+      description: portal.key is the key of the served certificate, is at least 2048 bits (or EC) and is not accessible to group or others
+      type: shell
+      on: tr-portal-01
+      skills: [linux.security.tls-certificates, linux.files.permissions]
+      weight: 1.5
+      timeoutSec: 30
+      command: |
+        K=/etc/tr-portal/tls/portal.key; C=/etc/tr-portal/tls/portal.crt
+        [ -f $K ] && [ -f $C ] || { echo missing; exit 0; }
+        [ -z "$(find $K -maxdepth 0 -perm /077)" ] && [ "$(stat -c %U $K)" = root ] || { echo "mode $(stat -c '%U %a' $K)"; exit 0; }
+        a=$(openssl x509 -in $C -noout -pubkey | openssl sha256); b=$(openssl pkey -in $K -pubout 2>/dev/null | openssl sha256)
+        [ "$a" = "$b" ] || { echo key-mismatch; exit 0; }
+        t=$(openssl pkey -in $K -noout -text 2>/dev/null)
+        bits=$(printf '%s\n' "$t" | head -1 | grep -o '[0-9][0-9]*' | head -1)
+        if printf '%s\n' "$t" | grep -q 'ASN1 OID'; then [ "${bits:-0}" -ge 256 ] && echo ok || echo "weak-ec ($bits)"
+        else [ "${bits:-0}" -ge 2048 ] && echo ok || echo "weak ($bits)"; fi
+      expect: {match: exact, value: ok}
+  hints:
+    - title: Key and request in one command
+      body: "`openssl req -new -newkey rsa:2048 -nodes -keyout portal.key -out portal.csr -subj '/CN=tickets.tallowmere.test' -addext 'subjectAltName=DNS:tickets.tallowmere.test,DNS:ALT'` (OpenSSL 3 reads `-addext`). `openssl req -in portal.csr -noout -text` shows what you asked for."
+      cost: 1
+    - title: Signing and installing
+      body: "`sudo tr-ca-sign --csr portal.csr --out portal.crt`, then `sudo install -m 0600 -o root portal.key /etc/tr-portal/tls/portal.key` and `sudo install -m 0644 portal.crt /etc/tr-portal/tls/portal.crt`. Reload with `sudo tr-portal-ctl reload`."
+      cost: 1
+    - title: When verification fails
+      body: "`openssl s_client ... </dev/null` prints `Verify return code` and the reason. `sudo cat /var/log/tr-portal.log` tells you whether the reload accepted your files (a certificate that does not match its key is refused)."
+      cost: 2
+  misconceptions:
+    - id: self-signed-replacement
+      description: Generates a new self-signed certificate instead of asking the CA to sign a request.
+      feedback: "Clients only trust certificates that chain to the CA. A self-signed certificate fails verification again; create a CSR and have `tr-ca-sign` sign it."
+      expectFail: [chain-verifies]
+      mutation:
+        on: tr-portal-01
+        as: learner
+        run: |
+          cd "$(mktemp -d)"
+          openssl req -x509 -newkey rsa:2048 -nodes -days 365 -subj '/CN=tickets.tallowmere.test' -addext 'subjectAltName=DNS:tickets.tallowmere.test,DNS:{{alt}}' -keyout portal.key -out portal.crt >/dev/null 2>&1
+          sudo install -m 0600 -o root portal.key /etc/tr-portal/tls/portal.key
+          sudo install -m 0644 portal.crt /etc/tr-portal/tls/portal.crt
+          sudo tr-portal-ctl reload >/dev/null
+    - id: one-name-only
+      description: Requests a certificate for the common name only, without the second SAN.
+      feedback: "The portal answers to two names and clients check the subject alternative names. Put both in the request with -addext subjectAltName=DNS:...,DNS:..."
+      expectFail: [chain-verifies, served-sans]
+      mutation:
+        on: tr-portal-01
+        as: learner
+        run: |
+          cd "$(mktemp -d)"
+          openssl req -new -newkey rsa:2048 -nodes -keyout portal.key -out portal.csr -subj '/CN=tickets.tallowmere.test' -addext 'subjectAltName=DNS:tickets.tallowmere.test' >/dev/null 2>&1
+          sudo tr-ca-sign --csr portal.csr --out portal.crt >/dev/null
+          sudo install -m 0600 -o root portal.key /etc/tr-portal/tls/portal.key
+          sudo install -m 0644 portal.crt /etc/tr-portal/tls/portal.crt
+          sudo tr-portal-ctl reload >/dev/null
+    - id: not-reloaded
+      description: Installs the right files but never tells the portal to reload them.
+      feedback: "The portal read its certificate at start-up. It only picks up new files when it is told to reload (SIGHUP, via tr-portal-ctl reload)."
+      expectFail: [chain-verifies, served-sans]
+      mutation:
+        on: tr-portal-01
+        as: learner
+        run: |
+          cd "$(mktemp -d)"
+          openssl req -new -newkey rsa:2048 -nodes -keyout portal.key -out portal.csr -subj '/CN=tickets.tallowmere.test' -addext 'subjectAltName=DNS:tickets.tallowmere.test,DNS:{{alt}}' >/dev/null 2>&1
+          sudo tr-ca-sign --csr portal.csr --out portal.crt >/dev/null
+          sudo install -m 0600 -o root portal.key /etc/tr-portal/tls/portal.key
+          sudo install -m 0644 portal.crt /etc/tr-portal/tls/portal.crt
+    - id: key-world-readable
+      description: Leaves the private key readable by everyone.
+      feedback: "Anyone who can read portal.key can impersonate the portal. Install it root-only (0600)."
+      expectFail: [key-installed-privately]
+      mutation:
+        on: tr-portal-01
+        as: learner
+        run: |
+          cd "$(mktemp -d)"
+          openssl req -new -newkey rsa:2048 -nodes -keyout portal.key -out portal.csr -subj '/CN=tickets.tallowmere.test' -addext 'subjectAltName=DNS:tickets.tallowmere.test,DNS:{{alt}}' >/dev/null 2>&1
+          sudo tr-ca-sign --csr portal.csr --out portal.crt >/dev/null
+          sudo install -m 0644 -o root portal.key /etc/tr-portal/tls/portal.key
+          sudo install -m 0644 portal.crt /etc/tr-portal/tls/portal.crt
+          sudo tr-portal-ctl reload >/dev/null
+  solution:
+    explanation: |
+      Generate a key and a CSR carrying both names as subject alternative names, have the lab
+      CA sign it, install the key root-only and the certificate next to it, and ask the portal
+      to reload. s_client then verifies the chain and both hostnames.
+    steps:
+      - on: tr-portal-01
+        as: learner
+        run: |
+          cd "$(mktemp -d)"
+          openssl req -new -newkey rsa:2048 -nodes -keyout portal.key -out portal.csr -subj '/CN=tickets.tallowmere.test' -addext 'subjectAltName=DNS:tickets.tallowmere.test,DNS:{{alt}}'
+          openssl req -in portal.csr -noout -text | grep -A1 'Alternative Name'
+          sudo tr-ca-sign --csr portal.csr --out portal.crt
+          sudo install -m 0600 -o root portal.key /etc/tr-portal/tls/portal.key
+          sudo install -m 0644 portal.crt /etc/tr-portal/tls/portal.crt
+          sudo tr-portal-ctl reload
+          sleep 1
+          openssl s_client -connect tickets.tallowmere.test:8443 -verify_hostname tickets.tallowmere.test -verify_return_error </dev/null 2>&1 | grep -E 'Verification|Verify return'
+    alternatives:
+      - id: ec-key-and-config-file
+        description: An EC key and the SANs given in a request configuration file instead of -addext.
+        steps:
+          - on: tr-portal-01
+            as: learner
+            run: |
+              cd "$(mktemp -d)"
+              printf '%s\n' '[req]' 'distinguished_name = dn' 'req_extensions = ext' 'prompt = no' '[dn]' 'CN = tickets.tallowmere.test' '[ext]' 'subjectAltName = @alt' '[alt]' 'DNS.1 = tickets.tallowmere.test' 'DNS.2 = {{alt}}' > req.cnf
+              openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -keyout portal.key -out portal.csr -config req.cnf
+              sudo tr-ca-sign --csr portal.csr --out portal.crt --days 90
+              sudo install -m 0600 -o root portal.key /etc/tr-portal/tls/portal.key
+              sudo install -m 0644 portal.crt /etc/tr-portal/tls/portal.crt
+              sudo tr-portal-ctl reload

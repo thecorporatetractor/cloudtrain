@@ -1,0 +1,304 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: fix-expired-cert
+  title: Restore the timetable API after its certificate expired
+  domain: linux
+  frameworks: [linuxplus:troubleshooting, lfcs:essential-commands]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [openssl, certificates, expiry, ca, reload]
+  version: 1
+spec:
+  description: |
+    Clients report a certificate **expiry** error from the timetable API on `tr-api-01`
+    (`https://timetable.tallowmere.test:8441`). Three API endpoints are served here by one
+    daemon, `tr-certd` (pid in `/run/tr-certd.pid`, log `/var/log/tr-certd.log`), and
+    their certificates live in `/etc/tr-certs/`; which service uses which file is in
+    `/etc/tr-certs/services.conf`. A shell is open on this host and you have `sudo`.
+
+    1. Find out **which** certificate is expired. Do not guess from file names; read the
+       dates (`openssl x509 -noout -dates`).
+    2. **Renew only that one** from the lab CA, **keeping its private key**: the original
+       request is next to it as `*.csr`, and
+       `sudo tr-ca-sign --csr FILE.csr --out FILE.crt --days 365` signs it. Back up what you
+       replace if you like.
+    3. Make the daemon use the new certificate **without a restart**: the other two APIs
+       must keep serving, and `tr-certd` must keep its process id. It reloads on
+       `sudo tr-certd-ctl reload`.
+
+    The CA certificate is trusted system-wide. Leave the other certificates alone, even the
+    one that is close to expiring: that renewal is a separate ticket.
+  objectives:
+    - Read certificate validity dates and check expiry with openssl
+    - Renew a certificate from its CSR so that the key stays the same
+    - Reload a daemon's certificate without restarting it
+  params:
+    slot:
+      type: choice
+      values: ["1", "2", "3"]
+  topology:
+    entry: tr-api-01
+    nodes:
+      - name: tr-api-01
+        driver: container
+        image: el-lab:10
+        access: [shell]
+        learnerSudo: true
+  setup:
+    - on: tr-api-01
+      timeoutSec: 120
+      run: |
+        set -eu
+        echo 'learner ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/learner && chmod 0440 /etc/sudoers.d/learner
+        V=/var/lib/cloudtrain; mkdir -p $V; chmod 0700 $V
+        # --- in-lab CA: key stays in /var/lib/cloudtrain/ca; the certificate is trusted system-wide
+        CA=$V/ca; rm -rf $CA; mkdir -p $CA; chmod 0700 $CA
+        openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -subj "/O=Tallowmere Rail/CN=Tallowmere Lab CA" \
+          -addext basicConstraints=critical,CA:TRUE -addext keyUsage=critical,keyCertSign,cRLSign \
+          -keyout $CA/ca.key -out $CA/ca.crt >/dev/null 2>&1
+        echo 1000 > $CA/serial
+        install -m 0644 $CA/ca.crt /etc/pki/ca-trust/source/anchors/tallowmere-lab-ca.crt
+        update-ca-trust extract >/dev/null 2>&1
+        cat > /usr/sbin/tr-ca-sign <<'EOT'
+        #!/bin/sh
+        # tr-ca-sign --csr FILE --out FILE [--days N]: sign a request with the Tallowmere lab CA.
+        # Subject alternative names are copied from the request.
+        CA=/var/lib/cloudtrain/ca; days=365
+        while [ $# -gt 0 ]; do
+          case "$1" in --csr) csr=$2; shift 2 ;; --out) out=$2; shift 2 ;; --days) days=$2; shift 2 ;; *) echo "usage: tr-ca-sign --csr FILE --out FILE [--days N]" >&2; exit 2 ;; esac
+        done
+        [ -n "${csr:-}" ] && [ -n "${out:-}" ] || { echo "usage: tr-ca-sign --csr FILE --out FILE [--days N]" >&2; exit 2; }
+        [ "$(id -u)" = 0 ] || { echo "tr-ca-sign: run it with sudo" >&2; exit 1; }
+        openssl req -in "$csr" -noout -verify >/dev/null 2>&1 || { echo "tr-ca-sign: $csr is not a valid request" >&2; exit 1; }
+        printf 'basicConstraints=CA:FALSE\nkeyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n' > $CA/ext.cnf
+        openssl x509 -req -in "$csr" -CA $CA/ca.crt -CAkey $CA/ca.key -CAserial $CA/serial -days "$days" -copy_extensions copy -extfile $CA/ext.cnf -out "$out" 2>/dev/null \
+          && echo "tr-ca-sign: wrote $out" || { echo "tr-ca-sign: signing failed" >&2; exit 1; }
+        EOT
+        chmod 0755 /usr/sbin/tr-ca-sign
+        # --- three API endpoints with their certificates; the timetable API uses edge-{{slot}}
+        for h in timetable fares pis; do grep -q " $h.tallowmere.test\$" /etc/hosts || echo "127.0.0.1 $h.tallowmere.test" >> /etc/hosts; done
+        rm -rf /etc/tr-certs; mkdir -p /etc/tr-certs; chmod 0755 /etc/tr-certs
+        # slot assignment: edge-{{slot}} serves timetable; the other two edges serve fares and pis
+        others=""; for s in fares pis; do others="$others $s"; done
+        set -- $others
+        for i in 1 2 3; do
+          if [ $i = {{slot}} ]; then svc=timetable; else svc=$1; shift; fi
+          e=/etc/tr-certs/edge-$i
+          openssl req -new -newkey rsa:2048 -nodes -keyout $e.key -out $e.csr -subj "/CN=$svc.tallowmere.test" -addext "subjectAltName=DNS:$svc.tallowmere.test" >/dev/null 2>&1
+          chmod 0600 $e.key
+          printf 'basicConstraints=CA:FALSE\nkeyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n' > $CA/ext.cnf
+          if [ $svc = timetable ]; then nb=$(date -u -d '-400 days' +%Y%m%d%H%M%SZ); na=$(date -u -d '-2 days' +%Y%m%d%H%M%SZ)
+          elif [ $svc = fares ]; then nb=$(date -u -d '-358 days' +%Y%m%d%H%M%SZ); na=$(date -u -d '+7 days' +%Y%m%d%H%M%SZ)
+          else nb=$(date -u -d '-30 days' +%Y%m%d%H%M%SZ); na=$(date -u -d '+335 days' +%Y%m%d%H%M%SZ); fi
+          openssl x509 -req -in $e.csr -CA $CA/ca.crt -CAkey $CA/ca.key -CAserial $CA/serial -not_before $nb -not_after $na -copy_extensions copy -extfile $CA/ext.cnf -out $e.crt >/dev/null 2>&1
+          case $svc in timetable) p=8441 ;; fares) p=8442 ;; pis) p=8443 ;; esac
+          echo "$svc $p $e.crt $e.key" >> /etc/tr-certs/services.conf.new
+        done
+        sort /etc/tr-certs/services.conf.new > /etc/tr-certs/services.conf; rm /etc/tr-certs/services.conf.new
+        sed -i '1i # service  port  certificate  key' /etc/tr-certs/services.conf
+        chmod 0644 /etc/tr-certs/*.crt /etc/tr-certs/*.csr /etc/tr-certs/services.conf
+        sha256sum /etc/tr-certs/edge-*.crt > $V/certs.sha256
+        # --- tr-certd: one TLS server per service, certificates reloaded on SIGHUP
+        mkdir -p /usr/local/lib/tr-certd
+        cat > /usr/local/lib/tr-certd/certd.py <<'EOT'
+        #!/usr/bin/env python3
+        import http.server, os, signal, ssl, threading, time
+        CONF, LOG = "/etc/tr-certs/services.conf", "/var/log/tr-certd.log"
+        def log(msg):
+            with open(LOG, "a") as f:
+                f.write("%s %s\n" % (time.strftime("%F %T"), msg))
+        def services():
+            for line in open(CONF):
+                p = line.split()
+                if len(p) == 4 and not line.lstrip().startswith("#"):
+                    yield p[0], int(p[1]), p[2], p[3]
+        def make_ctx(cert, key):
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ctx.load_cert_chain(cert, key)
+            return ctx
+        state = {}
+        def load(first=False):
+            for name, port, cert, key in services():
+                try:
+                    state.setdefault(port, {})["ctx"] = make_ctx(cert, key)
+                    log("%s: loaded %s" % (name, cert))
+                except Exception as e:
+                    log("%s: reload failed, keeping the previous certificate: %s" % (name, e))
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200); self.send_header("Content-Type", "text/plain"); self.end_headers()
+                self.wfile.write(b"Tallowmere Rail API\n")
+            def log_message(self, *a):
+                pass
+        def serve(port):
+            class S(http.server.ThreadingHTTPServer):
+                allow_reuse_address = True
+                def get_request(self):
+                    s, a = self.socket.accept()
+                    s.settimeout(10)
+                    try:
+                        return state[port]["ctx"].wrap_socket(s, server_side=True), a
+                    except Exception:
+                        s.close(); raise OSError("handshake failed")
+            S(("127.0.0.1", port), Handler).serve_forever()
+        load()
+        signal.signal(signal.SIGHUP, lambda *_: load())
+        open("/run/tr-certd.pid", "w").write(str(os.getpid()))
+        for _, port, _, _ in services():
+            threading.Thread(target=serve, args=(port,), daemon=True).start()
+        while True:
+            time.sleep(3600)
+        EOT
+        cat > /usr/sbin/tr-certd-ctl <<'EOT'
+        #!/bin/sh
+        start() { (setsid nohup python3 /usr/local/lib/tr-certd/certd.py >/dev/null 2>&1 </dev/null &); for i in $(seq 20); do (echo > /dev/tcp/127.0.0.1/8441) >/dev/null 2>&1 && break; sleep 0.5; done; }
+        case "$1" in
+          reload) kill -HUP "$(cat /run/tr-certd.pid)" && echo "tr-certd: reload requested (see /var/log/tr-certd.log)" ;;
+          restart) pkill -f '^python3 /usr/local/lib/tr-certd/certd.py'; sleep 1; start; echo "tr-certd: restarted" ;;
+          status) kill -0 "$(cat /run/tr-certd.pid 2>/dev/null)" 2>/dev/null && echo "tr-certd is running" || { echo "tr-certd is not running"; exit 3; } ;;
+          *) echo "usage: tr-certd-ctl reload|restart|status" >&2; exit 2 ;;
+        esac
+        EOT
+        chmod 0755 /usr/sbin/tr-certd-ctl
+        : > /var/log/tr-certd.log; chmod 0644 /var/log/tr-certd.log
+        pkill -f '^python3 /usr/local/lib/tr-certd/certd.py' 2>/dev/null || true
+        sleep 1
+        /usr/sbin/tr-certd-ctl restart >/dev/null
+        cp /run/tr-certd.pid $V/certd.pid
+  checks:
+    - id: timetable-serves-valid-cert
+      description: The timetable API presents a certificate that verifies (chain, hostname and dates) against the lab CA
+      type: shell
+      on: tr-api-01
+      skills: [linux.security.tls-certificates]
+      weight: 2.5
+      timeoutSec: 30
+      command: |
+        cd /tmp
+        openssl s_client -connect 127.0.0.1:8441 -servername timetable.tallowmere.test -CAfile /etc/pki/ca-trust/source/anchors/tallowmere-lab-ca.crt -verify_hostname timetable.tallowmere.test -verify_return_error </dev/null 2>&1 | grep -q 'Verification: OK' && echo ok || echo rejected
+      expect: {match: exact, value: ok}
+    - id: no-restart
+      description: tr-certd was reloaded, not restarted (same process id) and all three APIs answer
+      type: shell
+      on: tr-api-01
+      skills: [linux.security.tls-certificates, linux.processes.signals]
+      weight: 1.5
+      timeoutSec: 30
+      command: |
+        cd /tmp
+        [ "$(cat /run/tr-certd.pid 2>/dev/null)" = "$(cat /var/lib/cloudtrain/certd.pid)" ] && kill -0 "$(cat /run/tr-certd.pid)" 2>/dev/null && p=same-pid || p=restarted
+        up=0; for port in 8441 8442 8443; do openssl s_client -connect 127.0.0.1:$port </dev/null 2>/dev/null | grep -q 'BEGIN CERTIFICATE' && up=$((up + 1)); done
+        echo "$p up=$up"
+      expect: {match: exact, value: "same-pid up=3"}
+    - id: only-the-expired-renewed
+      description: The other two certificates are untouched and the renewed one keeps its private key, its names and a year of validity
+      type: shell
+      on: tr-api-01
+      skills: [linux.security.tls-certificates]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        cd /etc/tr-certs; t=$(awk '$1 == "timetable" {print $3}' services.conf); k=$(awk '$1 == "timetable" {print $4}' services.conf)
+        r=""
+        for f in edge-1.crt edge-2.crt edge-3.crt; do
+          [ "/etc/tr-certs/$f" = "$t" ] && continue
+          grep -q "  /etc/tr-certs/$f\$" /var/lib/cloudtrain/certs.sha256 && [ "$(sha256sum /etc/tr-certs/$f | cut -d' ' -f1)" = "$(grep "  /etc/tr-certs/$f\$" /var/lib/cloudtrain/certs.sha256 | cut -d' ' -f1)" ] || r="$r changed:$f"
+        done
+        [ "$(openssl x509 -in $t -noout -pubkey | openssl sha256)" = "$(openssl pkey -in $k -pubout | openssl sha256)" ] || r="$r key-changed"
+        openssl x509 -in $t -noout -checkend $((300 * 86400)) >/dev/null || r="$r short-validity"
+        openssl x509 -in $t -noout -ext subjectAltName 2>/dev/null | grep -q 'DNS:timetable.tallowmere.test' || r="$r san-lost"
+        echo "ok$r"
+      expect: {match: exact, value: ok}
+  hints:
+    - title: Which one is it
+      body: "`for f in /etc/tr-certs/*.crt; do echo $f; openssl x509 -in $f -noout -enddate -subject; done`, and `openssl x509 -in FILE -noout -checkend 0` (exit status 1 when expired). `cat /etc/tr-certs/services.conf` says which file the timetable service uses."
+      cost: 1
+    - title: Renew with the same key
+      body: "The request `edge-N.csr` was made from the existing key, so signing it again gives a new certificate for the same key: `sudo tr-ca-sign --csr /etc/tr-certs/edge-N.csr --out /tmp/edge-N.crt --days 365`, then copy it over `edge-N.crt`."
+      cost: 1
+    - title: Reload, not restart
+      body: "`sudo tr-certd-ctl reload` sends SIGHUP; the daemon re-reads every certificate and key and keeps serving the old one if the new pair does not load (check /var/log/tr-certd.log)."
+      cost: 1
+  misconceptions:
+    - id: renew-the-wrong-one
+      description: Renews the certificate that is close to expiring instead of the expired one.
+      feedback: "One certificate has 7 days left, but it is still valid. The timetable API's certificate is the expired one; find it by its dates and by services.conf, not by what looks urgent."
+      expectFail: [timetable-serves-valid-cert, only-the-expired-renewed]
+      mutation:
+        on: tr-api-01
+        as: learner
+        run: |
+          f=$(awk '$1 == "fares" {print $3}' /etc/tr-certs/services.conf)
+          sudo tr-ca-sign --csr "${f%.crt}.csr" --out /tmp/new.crt --days 365 >/dev/null
+          sudo install -m 0644 /tmp/new.crt "$f"
+          sudo tr-certd-ctl reload >/dev/null
+    - id: restart-instead-of-reload
+      description: Renews the right certificate but restarts the daemon instead of reloading it.
+      feedback: "A restart drops every connection to all three APIs. The daemon reloads its certificates on SIGHUP, which keeps the process and the other services untouched."
+      expectFail: [no-restart]
+      mutation:
+        on: tr-api-01
+        as: learner
+        run: |
+          f=$(awk '$1 == "timetable" {print $3}' /etc/tr-certs/services.conf)
+          sudo tr-ca-sign --csr "${f%.crt}.csr" --out /tmp/new.crt --days 365 >/dev/null
+          sudo install -m 0644 /tmp/new.crt "$f"
+          sudo tr-certd-ctl restart >/dev/null
+    - id: new-key-not-installed
+      description: Signs a request made with a brand new key but only replaces the certificate.
+      feedback: "A certificate only works with the key it was issued for. The daemon refused the mismatched pair (see its log) and kept serving the expired certificate. Either keep the old key or replace both files."
+      expectFail: [timetable-serves-valid-cert, only-the-expired-renewed]
+      mutation:
+        on: tr-api-01
+        as: learner
+        run: |
+          f=$(awk '$1 == "timetable" {print $3}' /etc/tr-certs/services.conf)
+          cd "$(mktemp -d)"
+          openssl req -new -newkey rsa:2048 -nodes -keyout n.key -out n.csr -subj /CN=timetable.tallowmere.test -addext subjectAltName=DNS:timetable.tallowmere.test >/dev/null 2>&1
+          sudo tr-ca-sign --csr n.csr --out n.crt --days 365 >/dev/null
+          sudo install -m 0644 n.crt "$f"
+          sudo tr-certd-ctl reload >/dev/null
+    - id: not-reloaded
+      description: Installs the renewed certificate and never reloads the daemon.
+      feedback: "The daemon loaded its certificates at start-up; the file on disk is not what clients see until it is reloaded."
+      expectFail: [timetable-serves-valid-cert]
+      mutation:
+        on: tr-api-01
+        as: learner
+        run: |
+          f=$(awk '$1 == "timetable" {print $3}' /etc/tr-certs/services.conf)
+          sudo tr-ca-sign --csr "${f%.crt}.csr" --out /tmp/new.crt --days 365 >/dev/null
+          sudo install -m 0644 /tmp/new.crt "$f"
+  solution:
+    explanation: |
+      services.conf says which edge-N certificate the timetable service uses; its notAfter
+      date is in the past. Signing the stored CSR gives a new certificate for the same key,
+      installing it over the old file and sending SIGHUP makes the daemon serve it without
+      dropping the other services.
+    steps:
+      - on: tr-api-01
+        as: learner
+        run: |
+          cat /etc/tr-certs/services.conf
+          for f in /etc/tr-certs/*.crt; do echo "$f: $(openssl x509 -in $f -noout -enddate)"; done
+          f=$(awk '$1 == "timetable" {print $3}' /etc/tr-certs/services.conf)
+          sudo cp "$f" "$f.expired"
+          sudo tr-ca-sign --csr "${f%.crt}.csr" --out /tmp/new.crt --days 365
+          sudo install -m 0644 /tmp/new.crt "$f"
+          sudo tr-certd-ctl reload
+          sleep 1
+          openssl s_client -connect timetable.tallowmere.test:8441 -verify_hostname timetable.tallowmere.test -verify_return_error </dev/null 2>&1 | grep -E 'Verification|Verify return'
+    alternatives:
+      - id: fresh-request-same-key
+        description: Build a new request from the existing key instead of reusing the stored CSR, and keep the backup in /root.
+        steps:
+          - on: tr-api-01
+            as: learner
+            run: |
+              f=$(awk '$1 == "timetable" {print $3}' /etc/tr-certs/services.conf); k=$(awk '$1 == "timetable" {print $4}' /etc/tr-certs/services.conf)
+              sudo cp -p "$f" /root/timetable-expired.crt
+              sudo openssl req -new -key "$k" -subj /CN=timetable.tallowmere.test -addext subjectAltName=DNS:timetable.tallowmere.test -out /tmp/renew.csr
+              sudo tr-ca-sign --csr /tmp/renew.csr --out /tmp/renew.crt --days 400
+              sudo install -m 0644 /tmp/renew.crt "$f"
+              sudo kill -HUP "$(cat /run/tr-certd.pid)"

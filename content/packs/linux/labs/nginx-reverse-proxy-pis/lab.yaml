@@ -1,0 +1,243 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: nginx-reverse-proxy-pis
+  title: Put the passenger-info app behind a reverse proxy
+  domain: linux
+  frameworks: [lfcs:networking, linuxplus:services-users]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [nginx, reverse-proxy, upstream, failover, load-balancing]
+  version: 1
+spec:
+  description: |
+    The passenger-information (PIS) app on `tr-pis-01` runs as two instances, listening on
+    `127.0.0.1:8081` and `127.0.0.1:8082`. Staff should reach it as
+    **`http://pis.tallowmere.test/`** (port 80, this host). nginx is installed and running
+    with its stock configuration; there is no systemd, so `sudo nginx -t` checks a
+    configuration and `sudo nginx -s reload` applies it. A shell is open on this host and you
+    have `sudo`.
+
+    Configure nginx as a reverse proxy so that:
+
+    1. requests for `pis.tallowmere.test` on port 80 are **spread over both instances**
+       (round robin);
+    2. the app sees the **original `Host` header** (`pis.tallowmere.test`) and an
+       **`X-Forwarded-For`** header with the client address (`/echo` on the app prints what
+       it received);
+    3. if one instance stops, nobody sees an error: requests keep being answered by the
+       other one, and spread over both again when it is back.
+
+    Put your configuration in `/etc/nginx/conf.d/` or `sites-enabled`. The configuration
+    must pass `nginx -t` and be loaded in the running nginx.
+  objectives:
+    - Define an upstream group and proxy a server name to it
+    - Pass the original Host and client address to the backend
+    - Understand passive failover in nginx's upstream module
+    - Test and reload nginx without dropping connections
+  params:
+    nameA:
+      type: choice
+      values: [pis-alpha, pis-brent]
+    nameB:
+      type: choice
+      values: [pis-delta, pis-ember]
+  topology:
+    entry: tr-pis-01
+    nodes:
+      - name: tr-pis-01
+        driver: container
+        image: deb-lab:24.04
+        access: [shell]
+        learnerSudo: true
+  setup:
+    - on: tr-pis-01
+      timeoutSec: 240
+      run: |
+        set -eu
+        echo 'learner ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/learner && chmod 0440 /etc/sudoers.d/learner
+        dpkg -s nginx >/dev/null 2>&1 || { apt-get update -q >/dev/null; DEBIAN_FRONTEND=noninteractive apt-get install -y -q nginx >/dev/null; }
+        V=/var/lib/cloudtrain; mkdir -p $V; chmod 0700 $V
+        grep -q ' pis.tallowmere.test$' /etc/hosts || echo '127.0.0.1 pis.tallowmere.test' >> /etc/hosts
+        # --- two tiny app backends on the loopback (shared helper, copied between labs)
+        mkdir -p /usr/local/lib/tr-backends /run/tr-backends
+        cat > /usr/local/lib/tr-backends/backend.py <<'EOT'
+        #!/usr/bin/env python3
+        import http.server, os, sys
+        PORT, NAME = int(sys.argv[1]), sys.argv[2]
+        SICK = "/run/tr-backends/%d.sick" % PORT
+        class H(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.0"
+            def do_GET(self):
+                if os.path.exists(SICK):
+                    code, body = 503, "unavailable\n"
+                elif self.path == "/health":
+                    code, body = 200, "ok\n"
+                elif self.path == "/echo":
+                    code, body = 200, "host=%s\nxff=%s\n" % (self.headers.get("Host"), self.headers.get("X-Forwarded-For"))
+                else:
+                    code, body = 200, NAME + "\n"
+                self.send_response(code); self.send_header("Content-Type", "text/plain"); self.send_header("Content-Length", str(len(body))); self.end_headers()
+                self.wfile.write(body.encode())
+            def log_message(self, *a):
+                pass
+        class S(http.server.ThreadingHTTPServer):
+            allow_reuse_address = True
+        S(("127.0.0.1", PORT), H).serve_forever()
+        EOT
+        printf '8081 {{nameA}}\n8082 {{nameB}}\n' > $V/backends.map
+        cat > $V/backend-ctl <<'EOT'
+        #!/bin/sh
+        # backend-ctl start|stop|sick|heal PORT (grader helper)
+        p=$2; n=$(awk -v p=$p '$1 == p {print $2}' /var/lib/cloudtrain/backends.map)
+        case "$1" in
+          stop) pkill -f "^python3 /usr/local/lib/tr-backends/backend.py $p " || true ;;
+          start) pgrep -f "^python3 /usr/local/lib/tr-backends/backend.py $p " >/dev/null || (setsid nohup python3 /usr/local/lib/tr-backends/backend.py $p $n >/dev/null 2>&1 </dev/null &) ;;
+          sick) touch /run/tr-backends/$p.sick ;;
+          heal) rm -f /run/tr-backends/$p.sick ;;
+        esac
+        EOT
+        chmod 0700 $V/backend-ctl
+        rm -f /run/tr-backends/*.sick
+        for p in 8081 8082; do $V/backend-ctl stop $p; done
+        sleep 1
+        for p in 8081 8082; do $V/backend-ctl start $p; done
+        for i in $(seq 20); do curl -sf -o /dev/null http://127.0.0.1:8081/health && curl -sf -o /dev/null http://127.0.0.1:8082/health && break; sleep 0.5; done
+        # --- nginx with the stock configuration
+        rm -f /etc/nginx/conf.d/*.conf /etc/nginx/sites-enabled/pis* /etc/nginx/sites-available/pis*
+        # one worker: upstream round-robin and failure state are per worker process
+        sed -i 's/^worker_processes.*/worker_processes 1;/' /etc/nginx/nginx.conf
+        pgrep -x nginx >/dev/null && nginx -s reload || nginx
+        for i in $(seq 20); do curl -sf -o /dev/null http://127.0.0.1/ && break; sleep 0.5; done
+  checks:
+    - id: config-loaded
+      description: The configuration passes nginx -t and nginx is running
+      type: shell
+      on: tr-pis-01
+      skills: [linux.services.web-proxy]
+      command: |
+        nginx -t >/dev/null 2>&1 && t=valid || t=invalid
+        pgrep -x nginx >/dev/null && p=running || p=stopped
+        echo "$t $p"
+      expect: {match: exact, value: "valid running"}
+    - id: balances-both
+      description: Requests for pis.tallowmere.test are answered by both instances in turn
+      type: shell
+      on: tr-pis-01
+      skills: [linux.services.web-proxy]
+      weight: 2
+      timeoutSec: 40
+      command: |
+        cd /tmp
+        for i in $(seq 12); do curl -s --max-time 5 http://pis.tallowmere.test/; done | sort | uniq -c | awk '{printf "%s:%s ", $2, $1}'
+      expect: {match: exact, value: "{{nameA}}:6 {{nameB}}:6 "}
+    - id: original-host-and-xff
+      description: The backend receives the Host header pis.tallowmere.test and an X-Forwarded-For header
+      type: shell
+      on: tr-pis-01
+      skills: [linux.services.web-proxy]
+      weight: 1.5
+      timeoutSec: 20
+      command: |
+        cd /tmp; o=$(curl -s --max-time 5 http://pis.tallowmere.test/echo)
+        h=$(printf '%s\n' "$o" | sed -n 's/^host=//p'); x=$(printf '%s\n' "$o" | sed -n 's/^xff=//p')
+        [ "$x" != None ] && [ -n "$x" ] && xs=xff || xs=no-xff
+        echo "$h $xs"
+      expect: {match: exact, value: "pis.tallowmere.test xff"}
+    - id: failover
+      description: With one instance stopped, every request is still answered (by the other one); with both back, both answer again
+      type: shell
+      on: tr-pis-01
+      skills: [linux.services.web-proxy]
+      weight: 2.5
+      timeoutSec: 150
+      command: |
+        cd /tmp; C=/var/lib/cloudtrain/backend-ctl; r=""
+        for victim in 8081 8082; do
+          $C stop $victim; sleep 1
+          bad=0; for i in $(seq 12); do code=$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' http://pis.tallowmere.test/); [ "$code" = 200 ] || bad=$((bad + 1)); done
+          $C start $victim; sleep 11
+          r="$r $victim:bad=$bad"
+        done
+        n=$(for i in $(seq 12); do curl -s --max-time 5 http://pis.tallowmere.test/; done | sort -u | wc -l)
+        echo "$r both=$n"
+      expect: {match: exact, value: "8081:bad=0 8082:bad=0 both=2"}
+  hints:
+    - title: Upstream and server blocks
+      body: "In a file under /etc/nginx/conf.d/ (ending in .conf): `upstream NAME { server 127.0.0.1:8081; server 127.0.0.1:8082; }` and `server { listen 80; server_name pis.tallowmere.test; location / { proxy_pass http://NAME; } }`."
+      cost: 1
+    - title: Headers
+      body: "nginx sets Host to the upstream group name unless you say otherwise: `proxy_set_header Host $host;` and `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`."
+      cost: 1
+    - title: Failover
+      body: "Servers in an upstream group are tried in turn; on a connection error nginx passes the request to the next one (`proxy_next_upstream`, default `error timeout`) and stops sending to the failed one for `fail_timeout`. Do not mark a server `backup` unless you want it idle until the others are down."
+      cost: 2
+    - title: Apply
+      body: "`sudo nginx -t && sudo nginx -s reload`. A bad file leaves the old configuration running."
+      cost: 1
+  misconceptions:
+    - id: host-header-lost
+      description: Proxies correctly but does not pass the original Host header.
+      feedback: "Without proxy_set_header Host $host; the backend receives the upstream group's name as Host, and name-based apps behind the proxy break."
+      expectFail: [original-host-and-xff]
+      mutation:
+        on: tr-pis-01
+        as: learner
+        run: |
+          printf '%s\n' 'upstream pis_app {' '  server 127.0.0.1:8081;' '  server 127.0.0.1:8082;' '}' 'server {' '  listen 80;' '  server_name pis.tallowmere.test;' '  location / {' '    proxy_pass http://pis_app;' '    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;' '  }' '}' | sudo tee /etc/nginx/conf.d/pis.conf >/dev/null
+          sudo nginx -t 2>/dev/null && sudo nginx -s reload; sleep 1
+    - id: backup-means-failover
+      description: Marks the second instance as backup, so it only works when the first is down.
+      feedback: "A backup server receives no traffic while the others are up, so the app is no longer balanced over both instances. Plain servers in the group already fail over."
+      expectFail: [balances-both, failover]
+      mutation:
+        on: tr-pis-01
+        as: learner
+        run: |
+          printf '%s\n' 'upstream pis_app {' '  server 127.0.0.1:8081;' '  server 127.0.0.1:8082 backup;' '}' 'server {' '  listen 80;' '  server_name pis.tallowmere.test;' '  location / {' '    proxy_pass http://pis_app;' '    proxy_set_header Host $host;' '    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;' '  }' '}' | sudo tee /etc/nginx/conf.d/pis.conf >/dev/null
+          sudo nginx -t 2>/dev/null && sudo nginx -s reload; sleep 1
+    - id: one-instance-only
+      description: Proxies to only one of the two instances.
+      feedback: "Both instances have to be in the upstream group, otherwise nothing is spread and stopping the one you listed takes the site down."
+      expectFail: [balances-both, failover]
+      mutation:
+        on: tr-pis-01
+        as: learner
+        run: |
+          printf '%s\n' 'server {' '  listen 80;' '  server_name pis.tallowmere.test;' '  location / {' '    proxy_pass http://127.0.0.1:8081;' '    proxy_set_header Host $host;' '    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;' '  }' '}' | sudo tee /etc/nginx/conf.d/pis.conf >/dev/null
+          sudo nginx -t 2>/dev/null && sudo nginx -s reload; sleep 1
+    - id: not-reloaded
+      description: Writes a good configuration but never reloads nginx.
+      feedback: "nginx serves what it loaded at start-up. Test with `nginx -t` and apply with `nginx -s reload`."
+      expectFail: [balances-both, original-host-and-xff, failover]
+      mutation:
+        on: tr-pis-01
+        as: learner
+        run: |
+          printf '%s\n' 'upstream pis_app {' '  server 127.0.0.1:8081;' '  server 127.0.0.1:8082;' '}' 'server {' '  listen 80;' '  server_name pis.tallowmere.test;' '  location / {' '    proxy_pass http://pis_app;' '    proxy_set_header Host $host;' '    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;' '  }' '}' | sudo tee /etc/nginx/conf.d/pis.conf >/dev/null
+  solution:
+    explanation: |
+      An upstream group with both instances, a server block for the name that proxies to the
+      group and passes Host and X-Forwarded-For, then nginx -t and a reload. Failover is the
+      default behaviour of an upstream group (proxy_next_upstream error timeout).
+    steps:
+      - on: tr-pis-01
+        as: learner
+        run: |
+          printf '%s\n' 'upstream pis_app {' '  server 127.0.0.1:8081;' '  server 127.0.0.1:8082;' '}' 'server {' '  listen 80;' '  server_name pis.tallowmere.test;' '  location / {' '    proxy_pass http://pis_app;' '    proxy_set_header Host $host;' '    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;' '  }' '}' | sudo tee /etc/nginx/conf.d/pis.conf >/dev/null
+          sudo nginx -t
+          sudo nginx -s reload
+          sleep 1
+          for i in 1 2 3 4; do curl -s http://pis.tallowmere.test/; done
+    alternatives:
+      - id: sites-available-with-tuning
+        description: A sites-available file enabled with a symlink, with explicit weights and failure thresholds.
+        steps:
+          - on: tr-pis-01
+            as: learner
+            run: |
+              printf '%s\n' 'upstream pis_app {' '  server 127.0.0.1:8081 weight=1 max_fails=1 fail_timeout=5s;' '  server 127.0.0.1:8082 weight=1 max_fails=1 fail_timeout=5s;' '}' 'server {' '  listen 80;' '  server_name pis.tallowmere.test;' '  location / {' '    proxy_pass http://pis_app;' '    proxy_http_version 1.1;' '    proxy_next_upstream error timeout http_502 http_503;' '    proxy_set_header Host $host;' '    proxy_set_header X-Real-IP $remote_addr;' '    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;' '  }' '}' | sudo tee /etc/nginx/sites-available/pis >/dev/null
+              sudo ln -sf /etc/nginx/sites-available/pis /etc/nginx/sites-enabled/pis
+              sudo nginx -t
+              sudo nginx -s reload
+              sleep 1

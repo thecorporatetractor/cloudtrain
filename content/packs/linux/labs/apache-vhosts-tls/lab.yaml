@@ -1,0 +1,322 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: apache-vhosts-tls
+  title: Host two sites on one Apache server with TLS
+  domain: linux
+  frameworks: [lpic2:http]
+  difficulty: medium
+  estimatedMinutes: 25
+  tags: [apache, httpd, virtualhost, tls, redirect, ssl]
+  version: 1
+spec:
+  description: |
+    The web team on `tr-web-01` wants two Tallowmere Rail sites on one Apache server
+    (`httpd` and `mod_ssl` are installed). There is no systemd here: `sudo httpd -t`
+    checks the configuration and `sudo httpd -k graceful` reloads it. A shell is open on
+    this host and you have `sudo`.
+    Both names resolve to this host.
+
+    | Site | Document root |
+    |---|---|
+    | `timetable.tallowmere.test` | `/srv/www/timetable` |
+    | `fares.tallowmere.test` | `/srv/www/fares` |
+
+    Configure them as **name-based virtual hosts** in `/etc/httpd/conf.d/`:
+
+    1. On **port 443** each site has its **own certificate** (common name and SAN equal to
+       the site name) signed by the lab CA: make a key and CSR per site and sign it with
+       `sudo tr-ca-sign --csr FILE.csr --out FILE.crt`. Private keys must not be readable
+       by group or others.
+    2. On **port 80** each site answers with a **permanent redirect to the same path on
+       HTTPS** of the same site.
+    3. Each site serves its own content (`index.html`, and `schedule.html` for the
+       timetable); the document roots are outside `/var/www`, so Apache must be allowed to
+       serve them.
+    4. The configuration passes `httpd -t`, and Apache is running with it
+       loaded (graceful reload).
+
+    The CA certificate is trusted system-wide
+    (`/etc/pki/ca-trust/source/anchors/tallowmere-lab-ca.crt`). Check with
+    `curl --cacert ... https://timetable.tallowmere.test/`.
+  objectives:
+    - Write name-based virtual hosts for HTTP and HTTPS
+    - Issue per-site certificates from a CA and wire them into mod_ssl
+    - Redirect HTTP to HTTPS and allow access to a document root
+    - Validate and gracefully reload Apache
+  params:
+    tag:
+      type: choice
+      values: [spring, autumn, winter]
+  topology:
+    entry: tr-web-01
+    nodes:
+      - name: tr-web-01
+        driver: container
+        image: el-lab:10
+        access: [shell]
+        learnerSudo: true
+  setup:
+    - on: tr-web-01
+      timeoutSec: 300
+      run: |
+        set -eu
+        echo 'learner ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/learner && chmod 0440 /etc/sudoers.d/learner
+        rpm -q httpd mod_ssl >/dev/null 2>&1 || dnf install -y -q httpd mod_ssl >/dev/null
+        V=/var/lib/cloudtrain; mkdir -p $V; chmod 0700 $V
+        # --- in-lab CA: key stays in /var/lib/cloudtrain/ca; the certificate is trusted system-wide
+        CA=$V/ca; rm -rf $CA; mkdir -p $CA; chmod 0700 $CA
+        openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -subj "/O=Tallowmere Rail/CN=Tallowmere Lab CA" \
+          -addext basicConstraints=critical,CA:TRUE -addext keyUsage=critical,keyCertSign,cRLSign \
+          -keyout $CA/ca.key -out $CA/ca.crt >/dev/null 2>&1
+        echo 1000 > $CA/serial
+        install -m 0644 $CA/ca.crt /etc/pki/ca-trust/source/anchors/tallowmere-lab-ca.crt
+        update-ca-trust extract >/dev/null 2>&1
+        cat > /usr/sbin/tr-ca-sign <<'EOT'
+        #!/bin/sh
+        # tr-ca-sign --csr FILE --out FILE [--days N]: sign a request with the Tallowmere lab CA.
+        # Subject alternative names are copied from the request.
+        CA=/var/lib/cloudtrain/ca; days=365
+        while [ $# -gt 0 ]; do
+          case "$1" in --csr) csr=$2; shift 2 ;; --out) out=$2; shift 2 ;; --days) days=$2; shift 2 ;; *) echo "usage: tr-ca-sign --csr FILE --out FILE [--days N]" >&2; exit 2 ;; esac
+        done
+        [ -n "${csr:-}" ] && [ -n "${out:-}" ] || { echo "usage: tr-ca-sign --csr FILE --out FILE [--days N]" >&2; exit 2; }
+        [ "$(id -u)" = 0 ] || { echo "tr-ca-sign: run it with sudo" >&2; exit 1; }
+        openssl req -in "$csr" -noout -verify >/dev/null 2>&1 || { echo "tr-ca-sign: $csr is not a valid request" >&2; exit 1; }
+        printf 'basicConstraints=CA:FALSE\nkeyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n' > $CA/ext.cnf
+        openssl x509 -req -in "$csr" -CA $CA/ca.crt -CAkey $CA/ca.key -CAserial $CA/serial -days "$days" -copy_extensions copy -extfile $CA/ext.cnf -out "$out" 2>/dev/null \
+          && echo "tr-ca-sign: wrote $out" || { echo "tr-ca-sign: signing failed" >&2; exit 1; }
+        EOT
+        chmod 0755 /usr/sbin/tr-ca-sign
+        # --- names and content
+        for h in timetable fares; do grep -q " $h.tallowmere.test\$" /etc/hosts || echo "127.0.0.1 $h.tallowmere.test" >> /etc/hosts; done
+        rm -rf /srv/www; mkdir -p /srv/www/timetable /srv/www/fares
+        echo "timetable-{{tag}}" > /srv/www/timetable/index.html
+        echo "timetable-{{tag}}-schedule" > /srv/www/timetable/schedule.html
+        echo "fares-{{tag}}" > /srv/www/fares/index.html
+        chmod -R a+rX /srv/www
+        rm -f /etc/httpd/conf.d/tr-*.conf /etc/pki/tls/certs/timetable.* /etc/pki/tls/certs/fares.* /etc/pki/tls/private/timetable.* /etc/pki/tls/private/fares.*
+        # --- Apache with the stock configuration: localhost certificate for the default TLS host, no systemd
+        [ -s /etc/pki/tls/certs/localhost.crt ] || /usr/libexec/httpd-ssl-gencerts >/dev/null 2>&1 || true
+        sed -i 's/^#ServerName.*/ServerName tr-web-01/' /etc/httpd/conf/httpd.conf
+        pkill -x httpd 2>/dev/null || true; sleep 1
+        /usr/sbin/httpd -k start >/dev/null 2>&1
+        for i in $(seq 20); do curl -s -o /dev/null http://127.0.0.1/ && break; sleep 0.5; done
+  checks:
+    - id: config-loaded
+      description: The configuration passes configtest and Apache is running
+      type: shell
+      on: tr-web-01
+      skills: [linux.services.web-proxy]
+      command: |
+        httpd -t 2>&1 | grep -q 'Syntax OK' && s=syntax-ok || s=syntax-error
+        pgrep -x httpd >/dev/null && p=running || p=stopped
+        echo "$s $p"
+      expect: {match: exact, value: "syntax-ok running"}
+    - id: sites-over-https
+      description: Both sites answer on 443 with their own content, each with a certificate that verifies for its name
+      type: shell
+      on: tr-web-01
+      skills: [linux.services.web-proxy, linux.services.local-ca]
+      weight: 2.5
+      timeoutSec: 40
+      command: |
+        cd /tmp; CAF=/etc/pki/ca-trust/source/anchors/tallowmere-lab-ca.crt; r=""
+        for h in timetable fares; do
+          body=$(curl -s --max-time 8 --cacert $CAF https://$h.tallowmere.test/ 2>/dev/null | tr -d '\n')
+          r="$r $h:${body:-none}"
+        done
+        a=$(openssl s_client -connect 127.0.0.1:443 -servername timetable.tallowmere.test </dev/null 2>/dev/null | openssl x509 -noout -fingerprint 2>/dev/null)
+        b=$(openssl s_client -connect 127.0.0.1:443 -servername fares.tallowmere.test </dev/null 2>/dev/null | openssl x509 -noout -fingerprint 2>/dev/null)
+        [ -n "$a" ] && [ "$a" != "$b" ] && r="$r distinct" || r="$r same-cert"
+        echo $r
+      expect: {match: exact, value: "timetable:timetable-{{tag}} fares:fares-{{tag}} distinct"}
+    - id: timetable-page
+      description: The timetable site also serves schedule.html over HTTPS
+      type: shell
+      on: tr-web-01
+      skills: [linux.services.web-proxy]
+      timeoutSec: 20
+      command: curl -s --max-time 8 --cacert /etc/pki/ca-trust/source/anchors/tallowmere-lab-ca.crt https://timetable.tallowmere.test/schedule.html 2>/dev/null | tr -d '\n'
+      expect: {match: exact, value: "timetable-{{tag}}-schedule"}
+    - id: http-redirects
+      description: On port 80 each site redirects permanently to the same path on HTTPS of the same site
+      type: shell
+      on: tr-web-01
+      skills: [linux.services.web-proxy]
+      weight: 1.5
+      timeoutSec: 30
+      command: |
+        cd /tmp; r=""
+        for h in timetable fares; do
+          o=$(curl -s --max-time 8 -o /dev/null -w '%{http_code} %{redirect_url}' http://$h.tallowmere.test/schedule.html 2>/dev/null)
+          c=${o%% *}; u=${o#* }
+          case "$c" in 301|308) [ "$u" = "https://$h.tallowmere.test/schedule.html" ] && r="$r ok" || r="$r wrong-target($u)" ;; *) r="$r no-redirect($c)" ;; esac
+        done
+        echo $r
+      expect: {match: exact, value: "ok ok"}
+    - id: keys-private
+      description: The private keys named in the site configuration are not accessible to group or others
+      type: shell
+      on: tr-web-01
+      skills: [linux.services.local-ca, linux.files.permissions]
+      command: |
+        ks=$(grep -hE '^[[:space:]]*SSLCertificateKeyFile' /etc/httpd/conf.d/*.conf /etc/httpd/conf/*.conf 2>/dev/null | grep -v localhost.key | awk '{print $2}' | sort -u)
+        [ -n "$ks" ] || { echo no-site-keys; exit 0; }
+        bad=""; for k in $ks; do [ -f "$k" ] || { bad="$bad missing:$k"; continue; }; [ -z "$(find $k -maxdepth 0 -perm /077)" ] || bad="$bad open:$k"; done
+        echo "ok$bad"
+      expect: {match: exact, value: ok}
+  hints:
+    - title: One certificate per site
+      body: "`openssl req -new -newkey rsa:2048 -nodes -keyout /etc/pki/tls/private/NAME.key -out /tmp/NAME.csr -subj /CN=NAME.tallowmere.test -addext subjectAltName=DNS:NAME.tallowmere.test`, sign with `sudo tr-ca-sign`, and `chmod 600` the key (use sudo for /etc/pki/tls/private)."
+      cost: 1
+    - title: Shape of the config
+      body: "Two `<VirtualHost *:80>` blocks (ServerName plus `Redirect permanent / https://NAME/`) and two `<VirtualHost *:443>` blocks (ServerName, DocumentRoot, `SSLEngine on`, `SSLCertificateFile`, `SSLCertificateKeyFile`). mod_ssl's own ssl.conf already defines `Listen 443`."
+      cost: 1
+    - title: 403 Forbidden
+      body: "Apache's default configuration denies access to the whole filesystem except the directories it allows explicitly. Add `<Directory \"/srv/www\"> Require all granted </Directory>` and read `/var/log/httpd/error_log` when you get a 403."
+      cost: 2
+    - title: Apply it
+      body: "`sudo httpd -t` then `sudo httpd -k graceful`. A syntax error in a graceful reload leaves the old configuration running."
+      cost: 1
+  misconceptions:
+    - id: one-certificate-for-both
+      description: Uses the timetable certificate for both sites.
+      feedback: "Clients check that the certificate names the host they asked for. The fares site needs a certificate for fares.tallowmere.test of its own."
+      expectFail: [sites-over-https]
+      mutation:
+        on: tr-web-01
+        as: learner
+        run: |
+          bash <<'EOS'
+          set -e
+          cd "$(mktemp -d)"
+          openssl req -new -newkey rsa:2048 -nodes -keyout timetable.key -out timetable.csr -subj /CN=timetable.tallowmere.test -addext subjectAltName=DNS:timetable.tallowmere.test >/dev/null 2>&1
+          sudo tr-ca-sign --csr timetable.csr --out timetable.crt >/dev/null
+          sudo install -m 0600 timetable.key /etc/pki/tls/private/timetable.key; sudo install -m 0644 timetable.crt /etc/pki/tls/certs/timetable.crt
+          for h in timetable fares; do
+            printf '%s\n' "<VirtualHost *:80>" "  ServerName $h.tallowmere.test" "  Redirect permanent / https://$h.tallowmere.test/" "</VirtualHost>" \
+              "<VirtualHost *:443>" "  ServerName $h.tallowmere.test" "  DocumentRoot /srv/www/$h" "  SSLEngine on" "  SSLCertificateFile /etc/pki/tls/certs/timetable.crt" "  SSLCertificateKeyFile /etc/pki/tls/private/timetable.key" "</VirtualHost>"
+          done | sudo tee /etc/httpd/conf.d/tr-sites.conf >/dev/null
+          printf '<Directory "/srv/www">\n  Require all granted\n</Directory>\n' | sudo tee -a /etc/httpd/conf.d/tr-sites.conf >/dev/null
+          sudo httpd -k graceful >/dev/null 2>&1; sleep 2
+          EOS
+    - id: redirect-to-wrong-site
+      description: Copies the timetable redirect into the fares host, which then redirects to the timetable site.
+      feedback: "Each plain-HTTP host must send visitors to HTTPS on its own name. Check the Redirect line of the fares block."
+      expectFail: [http-redirects]
+      mutation:
+        on: tr-web-01
+        as: learner
+        run: |
+          bash <<'EOS'
+          set -e
+          cd "$(mktemp -d)"
+          for h in timetable fares; do
+            openssl req -new -newkey rsa:2048 -nodes -keyout $h.key -out $h.csr -subj /CN=$h.tallowmere.test -addext subjectAltName=DNS:$h.tallowmere.test >/dev/null 2>&1
+            sudo tr-ca-sign --csr $h.csr --out $h.crt >/dev/null
+            sudo install -m 0600 $h.key /etc/pki/tls/private/$h.key; sudo install -m 0644 $h.crt /etc/pki/tls/certs/$h.crt
+          done
+          for h in timetable fares; do
+            printf '%s\n' "<VirtualHost *:80>" "  ServerName $h.tallowmere.test" "  Redirect permanent / https://timetable.tallowmere.test/" "</VirtualHost>" \
+              "<VirtualHost *:443>" "  ServerName $h.tallowmere.test" "  DocumentRoot /srv/www/$h" "  SSLEngine on" "  SSLCertificateFile /etc/pki/tls/certs/$h.crt" "  SSLCertificateKeyFile /etc/pki/tls/private/$h.key" "</VirtualHost>"
+          done | sudo tee /etc/httpd/conf.d/tr-sites.conf >/dev/null
+          printf '<Directory "/srv/www">\n  Require all granted\n</Directory>\n' | sudo tee -a /etc/httpd/conf.d/tr-sites.conf >/dev/null
+          sudo httpd -k graceful >/dev/null 2>&1; sleep 2
+          EOS
+    - id: docroot-not-allowed
+      description: Configures everything but forgets to allow Apache to serve /srv/www, so every page is 403.
+      feedback: "Apache denies directories it has not been told to serve. A 403 with 'client denied by server configuration' in the error log means a missing `<Directory>` block with `Require all granted`."
+      expectFail: [sites-over-https, timetable-page]
+      mutation:
+        on: tr-web-01
+        as: learner
+        run: |
+          bash <<'EOS'
+          set -e
+          cd "$(mktemp -d)"
+          for h in timetable fares; do
+            openssl req -new -newkey rsa:2048 -nodes -keyout $h.key -out $h.csr -subj /CN=$h.tallowmere.test -addext subjectAltName=DNS:$h.tallowmere.test >/dev/null 2>&1
+            sudo tr-ca-sign --csr $h.csr --out $h.crt >/dev/null
+            sudo install -m 0600 $h.key /etc/pki/tls/private/$h.key; sudo install -m 0644 $h.crt /etc/pki/tls/certs/$h.crt
+          done
+          for h in timetable fares; do
+            printf '%s\n' "<VirtualHost *:80>" "  ServerName $h.tallowmere.test" "  Redirect permanent / https://$h.tallowmere.test/" "</VirtualHost>" \
+              "<VirtualHost *:443>" "  ServerName $h.tallowmere.test" "  DocumentRoot /srv/www/$h" "  SSLEngine on" "  SSLCertificateFile /etc/pki/tls/certs/$h.crt" "  SSLCertificateKeyFile /etc/pki/tls/private/$h.key" "</VirtualHost>"
+          done | sudo tee /etc/httpd/conf.d/tr-sites.conf >/dev/null
+          sudo httpd -k graceful >/dev/null 2>&1; sleep 2
+          EOS
+    - id: not-reloaded
+      description: Writes the whole configuration but never reloads Apache.
+      feedback: "Apache keeps running with the configuration it loaded. Run configtest and then a graceful reload to apply the new files."
+      expectFail: [sites-over-https, http-redirects]
+      mutation:
+        on: tr-web-01
+        as: learner
+        run: |
+          bash <<'EOS'
+          set -e
+          cd "$(mktemp -d)"
+          for h in timetable fares; do
+            openssl req -new -newkey rsa:2048 -nodes -keyout $h.key -out $h.csr -subj /CN=$h.tallowmere.test -addext subjectAltName=DNS:$h.tallowmere.test >/dev/null 2>&1
+            sudo tr-ca-sign --csr $h.csr --out $h.crt >/dev/null
+            sudo install -m 0600 $h.key /etc/pki/tls/private/$h.key; sudo install -m 0644 $h.crt /etc/pki/tls/certs/$h.crt
+          done
+          for h in timetable fares; do
+            printf '%s\n' "<VirtualHost *:80>" "  ServerName $h.tallowmere.test" "  Redirect permanent / https://$h.tallowmere.test/" "</VirtualHost>" \
+              "<VirtualHost *:443>" "  ServerName $h.tallowmere.test" "  DocumentRoot /srv/www/$h" "  SSLEngine on" "  SSLCertificateFile /etc/pki/tls/certs/$h.crt" "  SSLCertificateKeyFile /etc/pki/tls/private/$h.key" "</VirtualHost>"
+          done | sudo tee /etc/httpd/conf.d/tr-sites.conf >/dev/null
+          printf '<Directory "/srv/www">\n  Require all granted\n</Directory>\n' | sudo tee -a /etc/httpd/conf.d/tr-sites.conf >/dev/null
+          EOS
+  solution:
+    explanation: |
+      A key, CSR and CA-signed certificate per site; a conf.d file with a port-80 block that
+      redirects permanently to the same host on HTTPS and a port-443 block per site with
+      SSLEngine and its own key pair; a Directory block that grants access to /srv/www; then
+      configtest and a graceful reload.
+    steps:
+      - on: tr-web-01
+        as: learner
+        timeoutSec: 120
+        run: |
+          bash <<'EOS'
+          set -e
+          cd "$(mktemp -d)"
+          for h in timetable fares; do
+            openssl req -new -newkey rsa:2048 -nodes -keyout $h.key -out $h.csr -subj /CN=$h.tallowmere.test -addext subjectAltName=DNS:$h.tallowmere.test >/dev/null 2>&1
+            sudo tr-ca-sign --csr $h.csr --out $h.crt
+            sudo install -m 0600 $h.key /etc/pki/tls/private/$h.key; sudo install -m 0644 $h.crt /etc/pki/tls/certs/$h.crt
+          done
+          for h in timetable fares; do
+            printf '%s\n' "<VirtualHost *:80>" "  ServerName $h.tallowmere.test" "  Redirect permanent / https://$h.tallowmere.test/" "</VirtualHost>" \
+              "<VirtualHost *:443>" "  ServerName $h.tallowmere.test" "  DocumentRoot /srv/www/$h" "  SSLEngine on" "  SSLCertificateFile /etc/pki/tls/certs/$h.crt" "  SSLCertificateKeyFile /etc/pki/tls/private/$h.key" "</VirtualHost>"
+          done | sudo tee /etc/httpd/conf.d/tr-sites.conf >/dev/null
+          printf '<Directory "/srv/www">\n  Require all granted\n</Directory>\n' | sudo tee -a /etc/httpd/conf.d/tr-sites.conf >/dev/null
+          sudo httpd -t
+          sudo httpd -k graceful
+          sleep 2
+          curl -s https://timetable.tallowmere.test/ || true
+          EOS
+    alternatives:
+      - id: file-per-site-with-rewrite
+        description: One conf.d file per site, and mod_rewrite for the HTTP to HTTPS redirect.
+        steps:
+          - on: tr-web-01
+            as: learner
+            timeoutSec: 120
+            run: |
+              bash <<'EOS'
+              set -e
+              cd "$(mktemp -d)"
+              printf '<Directory "/srv/www">\n  Require all granted\n</Directory>\n' | sudo tee /etc/httpd/conf.d/tr-docroot.conf >/dev/null
+              for h in timetable fares; do
+                openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -keyout $h.key -out $h.csr -subj /CN=$h.tallowmere.test -addext subjectAltName=DNS:$h.tallowmere.test >/dev/null 2>&1
+                sudo tr-ca-sign --csr $h.csr --out $h.crt
+                sudo install -m 0600 $h.key /etc/pki/tls/private/$h.key; sudo install -m 0644 $h.crt /etc/pki/tls/certs/$h.crt
+                printf '%s\n' "<VirtualHost *:80>" "  ServerName $h.tallowmere.test" "  RewriteEngine On" "  RewriteRule ^/(.*)\$ https://%{SERVER_NAME}/\$1 [R=301,L]" "</VirtualHost>" \
+                  "<VirtualHost *:443>" "  ServerName $h.tallowmere.test" "  DocumentRoot /srv/www/$h" "  SSLEngine on" "  SSLCertificateFile /etc/pki/tls/certs/$h.crt" "  SSLCertificateKeyFile /etc/pki/tls/private/$h.key" "</VirtualHost>" | sudo tee /etc/httpd/conf.d/tr-$h.conf >/dev/null
+              done
+              sudo httpd -t
+              sudo httpd -k graceful
+              sleep 2
+              EOS
