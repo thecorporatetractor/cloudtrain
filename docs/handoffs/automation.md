@@ -1,4 +1,4 @@
-# Handoff: automation stream (wave 2, Ansible)
+# Handoff: automation stream (wave 3, Ansible)
 
 Branch `content/automation-wave2`. Pack `content/packs/automation`, image `tools/images/ansible`.
 Started 2026-10-17 (round 4). Scoped manager used for verification: `ct-auto4-system`,
@@ -14,6 +14,7 @@ The source of truth is each lab's `status`/`notes` in `content/curriculum.yaml`.
 | Path `ansible-fundamentals`, tier-B labs (`ov-conditionals-os-family`, `ov-handlers-web-reload`, `ov-template-claims-vhost`) | 0 | 0 | 3 (need VMs, see Next steps) |
 | Exam `sim-el-automation` pool (32 pooled tasks) | 34 written (15 passed a live exam run; 19 written in round 5 wave 1, never run live; 2 of those blocked and held out of the pools) | 0 per-task | 0 |
 | Capstone tasks `xpe-ansible-node-agents`, `xpe-ansible-ssh-hardening` (pool of `sim-platform-engineer`) | 2 (round 5 wave 1, never run live) | 0 | 0 |
+| Round 5 wave 3: 12 VM learning labs (incl. the 3 tier-B fundamentals labs) + 9 blocked (network, EE, EDA, timesync) written in PR #126 (unmerged, none live) | 21 | 0 | 0 |
 | Paths `el-automation-engineer`, `automation-engineering-practices`, `automation-content-developer`, `automation-controller-operations`, `network-automation`, `event-driven-automation` | 23 written in PR #84 (unmerged, 22 runnable, 1 blocked), none live | 0 | 26 |
 
 Verified learning labs (path order): ov-first-inventory, ov-bootstrap-automation-user,
@@ -225,6 +226,53 @@ vs the site param. The tags lab does not depend on the mirror (it removes the pr
 Verify queue (all pod slot; no VM, kubeadm, netdev or Kata needs): 22 runnable labs above,
 after the majors are fixed, from origin/main by the batch runner. Kata-blocked: none. Image-blocked:
 ov-devcontainer-workflow (code-server + web proxy).
+
+## Round 5, wave 3 (write-only, PR #126 NOT merged)
+
+PR #126 (`content/automation-r5-w3`, head 7502eb7): 21 labs, all `built` (none verified, none
+run live): 12 runnable VM labs, 9 blocked (setup stops with a clear "blocked:" message; the
+blocker is in each lab's curriculum notes). None of the labs exist on PR #84's branch. Static
+gates pass (lab-verify --strict 0 errors and warnings, render --check clean); the three
+required GitHub checks (including the go labs job) were still running at review time, none
+failed. Round-3 review verdict: not approved until two majors are fixed.
+
+Majors to fix before merge:
+
+| Lab | Major |
+|---|---|
+| ov-net-parse-neighbors | the failures-ignored mutation is not caught: with `ignore_errors` Ansible still prints `failed:`/`fatal: [host]` lines, and the `reported` check reads failed hosts from those lines instead of the PLAY RECAP, so its expectFail fails at live verify |
+| ov-net-config-backup-restore | security: the backup-commit check runs git as root with `safe.directory=*` on the learner-owned bare repo; a repo-configured `gpg.program` runs under `log.showSignature` during `git log --format=%s`, so the learner can run code as root on ov-ctl. Run the check as the learner or drop root and `safe.directory=*` |
+
+Minors: rsync install guard in the EE setup, two gaps in what the async lab grades, the EDA lab
+has no playbook-run check (not noted in the curriculum), os-family file mode, template lab's
+template file pick.
+
+Runnable VM labs (el-vm:10 fleets with `ansible-ctl:2.21`; conditionals-os-family also uses
+ubuntu-vm:24.04): ov-conditionals-os-family, ov-handlers-web-reload, ov-template-claims-vhost,
+ov-block-rescue-db-maintenance, ov-role-claims-web, ov-automate-repos-packages,
+ov-automate-users-aging, ov-automate-lvm-storage, ov-automate-web-firewall-selinux,
+ov-automate-cron-timers, ov-reboot-persistence-fix, ov-async-patching. This also builds the 3
+tier-B fundamentals labs listed in Next steps 2.
+
+Blockers per lab:
+
+| Lab | Blocker |
+|---|---|
+| ov-system-role-timesync | `fedora.linux_system_roles` not installed in `ansible-ctl:2.21` (or the Ansible mirror); setup stops with a blocked message |
+| ov-execution-environment-build | no Podman VM image with a mirrored EE base image (`localhost/ov-ee-base:1`) and registry image (`localhost/ov-registry:3`); `oci-registry:3` and `galaxy-ng:4` are pod images; the `additional_build_files` flow is untested |
+| ov-net-inventory-facts, ov-net-ospf-branch-config, ov-net-branch-template-role, ov-net-parse-neighbors | `frr:10` has no openssh-server, sudo, python3 or automation account (image rebuild), or a frr `network_cli` collection in the Ansible mirror |
+| ov-net-srlinux-interfaces | same `frr:10` gap; `srlinux:25` is not in the catalog, so the FRR-only VLAN fallback was written |
+| ov-net-config-backup-restore | same `frr:10` gap; the Git repo is a bare repo on ov-ctl (no gitea) |
+| ov-eda-webhook-rulebook | `ansible-rulebook` and a JDK are not in `ansible-ctl:2.21`; setup stops with a blocked message |
+
+## Verify queue (testing round, grouped by slot kind)
+
+- **vm slot** (el-vm:10; runnable after PR #126 merges): the 12 VM labs above. Needing reboots: ov-reboot-persistence-fix, ov-async-patching (boot-id). Also: `sim-el-automation` exam runs and per-task verify of the 19 xan + 2 xpe tasks (four VMs per session, one at a time).
+- **pod slot**: the 22 runnable labs of PR #84 (not merged; fix its 4 majors and conflicts first).
+- **netdev**, **kubeadm**, **Kata**: none.
+- **image-blocked**: ov-devcontainer-workflow (code-server + web proxy, PR #84); ov-system-role-timesync and the xan roles timesync/selinux tasks (`fedora.linux_system_roles`); ov-execution-environment-build (EE/registry images); the 6 `ov-net-*` labs (frr:10 SSH/python3/account, SR Linux image); ov-eda-webhook-rulebook (ansible-rulebook + JDK).
+
+Unmerged PRs: #84 (wave 2, 23 pod labs), #126 (wave 3, 21 labs, two majors).
 
 ## Next steps
 
