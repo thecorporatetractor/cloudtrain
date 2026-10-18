@@ -1,0 +1,175 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: help-pages-offline
+  title: Answer configuration questions from the offline manuals
+  domain: linux
+  frameworks: [rhcsa-aligned:essential-tools, lpic1:gnu-commands]
+  difficulty: easy
+  estimatedMinutes: 10
+  tags: [man, help, apropos, documentation]
+  version: 1
+spec:
+  description: |
+    The terminal at `depot-3` has no internet access, and the depot lead needs five
+    answers before the night shift. A shell is already open on this host. Use only what
+    is installed here: manual pages, `--help` output, `apropos`/`man -k` and
+    `/usr/share/doc`.
+
+    Write your answers to **`~/answers/manuals.txt`**, one per line, in the form
+    `NUMBER: answer` (for example `1: 7`):
+
+    1. In which manual **section number** is the file format of **`/etc/{{conf}}`**
+       described?
+    2. Which option of **`ss`** shows only *listening* sockets? Give the option exactly as
+       you would type it (for example `-x` or `--example`).
+    3. Which test of **`find`** matches files by their modification time in
+       **minutes** (not days)? Give it as typed, with the leading dash.
+    4. Which option of **`sort`** compares *human-readable sizes* such as `2K` and `1G`?
+    5. Which command has a section 1 manual page described as "**{{kw}}**"?
+       (Find it with `apropos` / `man -k`.)
+
+    Short or long option names are both fine for questions 2 and 4.
+  objectives:
+    - Pick the right manual section for a file format
+    - Find an option in a man page or --help output
+    - Locate a command from its description with apropos
+  params:
+    conf:
+      type: choice
+      values: [fstab, group]
+    kw:
+      type: choice
+      values: ["print or control the kernel ring buffer", "show or set the system's host name"]
+  topology:
+    entry: depot-3
+    nodes:
+      - name: depot-3
+        driver: container
+        image: el-lab:10
+        access: [shell]
+  setup:
+    - on: depot-3
+      run: |
+        set -eu
+        mandb -q >/dev/null 2>&1 || true
+        install -d -o learner -g learner /home/learner/answers
+        rm -f /home/learner/answers/manuals.txt
+  checks:
+    - id: q1-section
+      description: "Question 1: the manual section of /etc/{{conf}}"
+      type: shell
+      on: depot-3
+      skills: [linux.shell.help-docs]
+      command: |
+        a() { sed -n "s/^[[:space:]]*$1[[:space:]]*[:.)][[:space:]]*//p" /home/learner/answers/manuals.txt 2>/dev/null | head -1 | sed 's/[[:space:]]*$//'; }
+        man -w 5 {{conf}} >/dev/null 2>&1 || { echo no-reference; exit 0; }
+        [ "$(a 1)" = 5 ] && echo ok || echo wrong
+      expect: {match: exact, value: ok}
+    - id: q2-listening
+      description: "Question 2: the ss option for listening sockets"
+      type: shell
+      on: depot-3
+      skills: [linux.shell.help-docs]
+      command: |
+        a() { sed -n "s/^[[:space:]]*$1[[:space:]]*[:.)][[:space:]]*//p" /home/learner/answers/manuals.txt 2>/dev/null | head -1 | sed 's/[[:space:]]*$//'; }
+        ss --help 2>&1 | grep -q -- '-l, --listening' || { echo no-reference; exit 0; }
+        case "$(a 2)" in -l|--listening) echo ok ;; *) echo wrong ;; esac
+      expect: {match: exact, value: ok}
+    - id: q3-minutes
+      description: "Question 3: the find test for modification time in minutes"
+      type: shell
+      on: depot-3
+      skills: [linux.shell.help-docs]
+      command: |
+        a() { sed -n "s/^[[:space:]]*$1[[:space:]]*[:.)][[:space:]]*//p" /home/learner/answers/manuals.txt 2>/dev/null | head -1 | sed 's/[[:space:]]*$//'; }
+        t=$(mktemp); find "$t" -mmin -1 | grep -q . || { echo no-reference; exit 0; }; rm -f "$t"
+        [ "$(a 3)" = -mmin ] && echo ok || echo wrong
+      expect: {match: exact, value: ok}
+    - id: q4-human-sort
+      description: "Question 4: the sort option for human-readable numbers"
+      type: shell
+      on: depot-3
+      skills: [linux.shell.help-docs]
+      command: |
+        a() { sed -n "s/^[[:space:]]*$1[[:space:]]*[:.)][[:space:]]*//p" /home/learner/answers/manuals.txt 2>/dev/null | head -1 | sed 's/[[:space:]]*$//'; }
+        [ "$(printf '2K\n1G\n3M\n' | sort -h | tr '\n' ' ')" = "2K 3M 1G " ] || { echo no-reference; exit 0; }
+        case "$(a 4)" in -h|--human-numeric-sort) echo ok ;; *) echo wrong ;; esac
+      expect: {match: exact, value: ok}
+    - id: q5-apropos
+      description: "Question 5: the command found from its description"
+      type: shell
+      on: depot-3
+      skills: [linux.shell.help-docs]
+      command: |
+        a() { sed -n "s/^[[:space:]]*$1[[:space:]]*[:.)][[:space:]]*//p" /home/learner/answers/manuals.txt 2>/dev/null | head -1 | sed 's/[[:space:]]*$//'; }
+        case "{{kw}}" in *ring*) w=dmesg ;; *host*) w=hostname ;; esac
+        man -f "$w" 2>/dev/null | grep -q "^$w (1) .*{{kw}}" || { echo no-reference; exit 0; }
+        [ "$(a 5)" = "$w" ] && echo ok || echo wrong
+      expect: {match: exact, value: ok}
+  hints:
+    - title: Sections of the manual
+      body: "`man man` lists the sections. Section 1 is commands, 5 is file formats and configuration files. `man -f NAME` (whatis) shows every section in which NAME has a page."
+      cost: 1
+    - title: Looking up an option
+      body: "`ss --help` is short; `man ss` is complete. Inside man, `/pattern` searches and `n` jumps to the next match."
+      cost: 1
+    - title: Searching by description
+      body: "`apropos phrase` (same as `man -k phrase`) searches page names and one-line descriptions. Pipe through `grep '(1)'` to keep only section 1."
+      cost: 1
+  misconceptions:
+    - id: command-section
+      description: Answers question 1 with the section for commands.
+      feedback: "Section 1 holds commands. The layout of a configuration file such as /etc/fstab is documented in section 5; `man -f NAME` shows which sections exist."
+      expectFail: [q1-section]
+      mutation:
+        on: depot-3
+        as: learner
+        run: |
+          printf '%s\n' '1: 1' '2: -l' '3: -mmin' '4: -h' > ~/answers/manuals.txt
+          case "{{kw}}" in *ring*) echo '5: dmesg' ;; *) echo '5: hostname' ;; esac >> ~/answers/manuals.txt
+    - id: days-not-minutes
+      description: Uses -mtime, which counts days, for question 3.
+      feedback: "-mtime counts in 24-hour units. The minute-based tests are -mmin, -amin and -cmin; see the TESTS section of `man find`."
+      expectFail: [q3-minutes]
+      mutation:
+        on: depot-3
+        as: learner
+        run: |
+          printf '%s\n' '1: 5' '2: --listening' '3: -mtime' '4: --human-numeric-sort' > ~/answers/manuals.txt
+          case "{{kw}}" in *ring*) echo '5: dmesg' ;; *) echo '5: hostname' ;; esac >> ~/answers/manuals.txt
+    - id: wrong-sort-flag
+      description: Gives -H for human-readable sorting and -a for listening sockets.
+      feedback: "Options are case sensitive and not always mnemonic. Check them in `sort --help` and `ss --help` rather than guessing."
+      expectFail: [q2-listening, q4-human-sort]
+      mutation:
+        on: depot-3
+        as: learner
+        run: |
+          printf '%s\n' '1: 5' '2: -a' '3: -mmin' '4: -H' > ~/answers/manuals.txt
+          case "{{kw}}" in *ring*) echo '5: dmesg' ;; *) echo '5: hostname' ;; esac >> ~/answers/manuals.txt
+  solution:
+    explanation: |
+      Section 5 holds file formats (`man -f` shows it); `ss --help` documents -l/--listening;
+      the TESTS section of man find lists -mmin; `sort --help` shows -h/--human-numeric-sort;
+      `apropos` finds the command from its description.
+    steps:
+      - on: depot-3
+        as: learner
+        run: |
+          man -f {{conf}}
+          ss --help 2>&1 | grep -i listening
+          man find | grep -n -e '-mmin' | head -2
+          sort --help | grep -i human
+          apropos -s 1 "{{kw}}"
+          printf '%s\n' '1: 5' '2: -l' '3: -mmin' '4: -h' > ~/answers/manuals.txt
+          case "{{kw}}" in *ring*) echo '5: dmesg' ;; *) echo '5: hostname' ;; esac >> ~/answers/manuals.txt
+    alternatives:
+      - id: long-options
+        description: Long option names and a different line style.
+        steps:
+          - on: depot-3
+            as: learner
+            run: |
+              printf '%s\n' '1) 5' '2) --listening' '3) -mmin' '4) --human-numeric-sort' > ~/answers/manuals.txt
+              case "{{kw}}" in *ring*) echo '5) dmesg' ;; *) echo '5) hostname' ;; esac >> ~/answers/manuals.txt

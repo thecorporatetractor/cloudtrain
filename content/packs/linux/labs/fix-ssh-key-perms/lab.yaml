@@ -1,0 +1,192 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: fix-ssh-key-perms
+  title: Fix key login that falls back to password
+  domain: linux
+  frameworks: [linuxplus:troubleshooting]
+  difficulty: easy
+  estimatedMinutes: 10
+  tags: [ssh, sshd, permissions, ownership, StrictModes, troubleshooting]
+  version: 1
+spec:
+  description: |
+    On `tr-jump-1`, the shared account **`ops`** is meant to accept your key: your public
+    key is already in its `authorized_keys`. But
+
+    ```
+    ssh ops@localhost
+    ```
+
+    asks for a password instead of logging you in with your key. A shell is open on this
+    host and you have `sudo`; sshd listens on `localhost` port 22 and logs to
+    `/var/log/sshd.log` (there is no systemd here: `sudo service ssh restart|status`).
+
+    Find out why the key is ignored and fix it, so that:
+
+    - `ssh ops@localhost` logs in with your key, without a password prompt;
+    - sshd keeps **StrictModes** enabled (that check exists to protect the account);
+    - the key stays in `ops`' `authorized_keys`, and `ops` owns its home directory and the
+      whole `.ssh` tree, with no group or world write access anywhere on the path.
+
+    The account password for `ops` is `{{password}}`; do not rely on it.
+  objectives:
+    - Read sshd's log to see why a key was refused
+    - Know the ownership and mode rules for ~, ~/.ssh and authorized_keys
+    - Fix permissions without weakening the server's checks
+  params:
+    fault:
+      type: choice
+      values: [open-home, root-ssh-dir, foreign-keyfile]
+    password:
+      type: choice
+      values: [Points-Heater-58, Junction-Box-12, Coupler-Pin-63]
+  topology:
+    entry: tr-jump-1
+    nodes:
+      - name: tr-jump-1
+        driver: container
+        image: deb-lab:24.04
+        access: [shell]
+        learnerSudo: true
+  setup:
+    - on: tr-jump-1
+      run: |
+        set -eu
+        echo 'learner ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/learner && chmod 0440 /etc/sudoers.d/learner
+        id ops >/dev/null 2>&1 || useradd -m -s /bin/bash ops
+        echo "ops:{{password}}" | chpasswd
+        mkdir -p /var/lib/cloudtrain && chmod 0700 /var/lib/cloudtrain
+        # sshd on the loopback, logging to a file (no syslog daemon in the pod).
+        ssh-keygen -A >/dev/null
+        mkdir -p /run/sshd /etc/ssh/sshd_config.d
+        printf '# Tallowmere Rail: listen on the loopback only on lab hosts\nListenAddress 127.0.0.1\nPasswordAuthentication yes\n' > /etc/ssh/sshd_config.d/10-lab.conf
+        sed -i 's/^#\?StrictModes.*/StrictModes yes/' /etc/ssh/sshd_config
+        printf 'SSHD_OPTS="-E /var/log/sshd.log"\n' > /etc/default/ssh
+        : > /var/log/sshd.log; chmod 0644 /var/log/sshd.log
+        # The ops account: the learner's key, installed with the planted faults.
+        H=/home/ops
+        rm -rf $H/.ssh; mkdir $H/.ssh
+        cat /home/learner/.ssh/id_ed25519.pub > $H/.ssh/authorized_keys
+        cp $H/.ssh/authorized_keys /var/lib/cloudtrain/ops-authorized-keys
+        chown -R ops:ops $H; chmod 0750 $H; chmod 0700 $H/.ssh; chmod 0600 $H/.ssh/authorized_keys
+        case "{{fault}}" in
+          open-home)       chmod 0777 $H; chmod 0666 $H/.ssh/authorized_keys ;;
+          root-ssh-dir)    chown -R root:root $H/.ssh ;;
+          foreign-keyfile) chmod 0770 $H/.ssh; chown learner:learner $H/.ssh/authorized_keys; chmod 0644 $H/.ssh/authorized_keys ;;
+        esac
+        service ssh stop >/dev/null 2>&1 || true
+        service ssh start >/dev/null
+        touch /home/learner/.ssh/known_hosts
+        echo "localhost,127.0.0.1,tr-jump-1 $(cut -d' ' -f1,2 /etc/ssh/ssh_host_ed25519_key.pub)" >> /home/learner/.ssh/known_hosts
+        chown learner:learner /home/learner/.ssh/known_hosts
+  checks:
+    - id: key-login
+      description: The learner's key logs in to ops@localhost without a password
+      type: shell
+      on: tr-jump-1
+      skills: [linux.remote.ssh]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        cd /tmp; runuser -u learner -- sh -c 'cd && ssh -o BatchMode=yes -o PasswordAuthentication=no -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 ops@127.0.0.1 id -un' </dev/null 2>/dev/null || echo refused
+      expect: {match: exact, value: ops}
+    - id: strict-modes-kept
+      description: sshd still has StrictModes enabled and the server is running
+      type: shell
+      on: tr-jump-1
+      skills: [linux.services.sshd]
+      command: |
+        s=$(sshd -T 2>/dev/null | awk '$1 == "strictmodes" {print $2}'); pgrep -x sshd >/dev/null && p=up || p=down
+        echo "strictmodes=$s $p"
+      expect: {match: exact, value: "strictmodes=yes up"}
+    - id: ownership-and-modes
+      description: ops owns its home and .ssh tree, and nothing on the path is writable by group or others
+      type: shell
+      on: tr-jump-1
+      skills: [linux.files.permissions, linux.remote.ssh]
+      weight: 1.5
+      command: |
+        bad=""
+        for p in /home/ops /home/ops/.ssh /home/ops/.ssh/authorized_keys; do
+          [ "$(stat -c %U $p 2>/dev/null)" = ops ] || bad="$bad owner:$p"
+          [ -z "$(find $p -maxdepth 0 -perm /022 2>/dev/null)" ] || bad="$bad mode:$p"
+        done
+        [ -z "$bad" ] && echo ok || echo "$bad"
+      expect: {match: exact, value: ok}
+    - id: key-still-authorized
+      description: The learner's public key is still the one authorized for ops
+      type: shell
+      on: tr-jump-1
+      skills: [linux.remote.ssh]
+      command: |
+        grep -qxF "$(cat /var/lib/cloudtrain/ops-authorized-keys)" /home/ops/.ssh/authorized_keys 2>/dev/null && echo present || echo missing
+      expect: {match: exact, value: present}
+  hints:
+    - title: Read the server's side
+      body: "`sudo tail /var/log/sshd.log` after a failed attempt (`ssh -v ops@localhost` shows the client side). sshd says why it refused a key file, naming the offending path."
+      cost: 1
+    - title: The rules
+      body: "With StrictModes, sshd requires the account's home directory, ~/.ssh and authorized_keys to be owned by the user (or root) and not writable by group or others. `man sshd_config` (StrictModes) has the details; `namei -l /home/ops/.ssh/authorized_keys` shows owner and mode of every component."
+      cost: 1
+    - title: Fix, do not disable
+      body: "Turning StrictModes off hides the problem. `sudo chown -R ops:ops /home/ops`, `chmod 700 ~/.ssh`, `chmod 600 ~/.ssh/authorized_keys`, and remove group/other write from the home directory."
+      cost: 2
+  misconceptions:
+    - id: world-writable
+      description: Opens everything up with chmod 777, hoping that stops the permission errors.
+      feedback: "More permissions are the problem, not the cure: sshd refuses key files that group or others can write. The home, .ssh and authorized_keys must be tightened, not opened."
+      expectFail: [key-login, ownership-and-modes]
+      mutation:
+        on: tr-jump-1
+        as: learner
+        run: |
+          sudo chmod -R 0777 /home/ops
+    - id: strictmodes-off
+      description: Switches StrictModes off so that the bad permissions no longer matter.
+      feedback: "StrictModes protects the account from other users who could plant their own keys. Fix the ownership and modes instead of disabling the check."
+      expectFail: [strict-modes-kept, ownership-and-modes]
+      mutation:
+        on: tr-jump-1
+        as: learner
+        run: |
+          sudo sed -i 's/^StrictModes.*/StrictModes no/' /etc/ssh/sshd_config
+          sudo service ssh restart >/dev/null; sleep 1
+    - id: home-only
+      description: Fixes the home directory mode but leaves the .ssh tree as it was.
+      feedback: "sshd checks every component: the home directory, ~/.ssh and authorized_keys. Check them all with `namei -l`."
+      expectFail: [key-login, ownership-and-modes]
+      mutation:
+        on: tr-jump-1
+        as: learner
+        run: |
+          sudo chmod 0755 /home/ops
+  solution:
+    explanation: |
+      The sshd log names the path it refuses ("Authentication refused: bad ownership or
+      modes"). Whatever the planted fault, the end state is the same: ops owns the home
+      directory and the .ssh tree, ~/.ssh is 0700, authorized_keys 0600 and the home has
+      no group or world write.
+    steps:
+      - on: tr-jump-1
+        as: learner
+        run: |
+          sudo tail -n 5 /var/log/sshd.log || true
+          sudo chown -R ops:ops /home/ops
+          sudo chmod go-w /home/ops
+          sudo chmod 0700 /home/ops/.ssh
+          sudo chmod 0600 /home/ops/.ssh/authorized_keys
+          ssh -o BatchMode=yes ops@localhost id -un
+    alternatives:
+      - id: rebuild-ssh-dir
+        description: Throw the .ssh tree away and rebuild it as ops.
+        steps:
+          - on: tr-jump-1
+            as: learner
+            run: |
+              sudo chown ops:ops /home/ops
+              sudo chmod 0750 /home/ops
+              sudo rm -rf /home/ops/.ssh
+              sudo -u ops mkdir -m 0700 /home/ops/.ssh
+              sudo -u ops sh -c 'cat > /home/ops/.ssh/authorized_keys' < ~/.ssh/id_ed25519.pub
+              sudo chmod 0600 /home/ops/.ssh/authorized_keys

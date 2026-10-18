@@ -1,0 +1,216 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: aide-integrity-baseline
+  title: Baseline and check file integrity on the signalling host
+  domain: linux
+  frameworks: [linuxplus:security]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [aide, integrity, file-integrity, baseline, security]
+  version: 1
+spec:
+  description: |
+    Security wants a file-integrity baseline for the signalling host `tr-signal-03`. A
+    shell is open on this host and you have `sudo`; the AIDE package is installed.
+
+    1. Configure AIDE to cover **only `/etc` and `/usr/bin`** (keep the default rule set
+       `NORMAL` for them) and create the baseline database as
+       **`/var/lib/aide/aide.db.gz`**. Do all configuration work before you initialise:
+       the baseline must reflect the system as it is now.
+    2. Only **after** the baseline exists, open the signalling team's change window by
+       running **`sudo tr-change-window`** once. It makes the usual maintenance changes.
+    3. Run an AIDE check and report exactly what changed in
+       **`~/answers/changes.txt`**, one line per file, as `KIND PATH` where `KIND` is
+       `added`, `removed` or `changed` (a changed attribute such as permissions counts as
+       changed). Report files only, not directories.
+
+    A baseline taken after the change window cannot show the changes, and a scope wider
+    than asked is wrong.
+  objectives:
+    - Limit AIDE's scope to chosen directories with rule lines in aide.conf
+    - Initialise the database and put it in place so checks can use it
+    - Read an AIDE report's added, removed and changed sections
+  params:
+    unit:
+      type: choice
+      values: [interlocking, relay-timing]
+    legacy:
+      type: choice
+      values: [legacy.conf, spare.conf]
+  topology:
+    entry: tr-signal-03
+    nodes:
+      - name: tr-signal-03
+        driver: container
+        image: el-lab:10
+        access: [shell]
+        learnerSudo: true
+  setup:
+    - on: tr-signal-03
+      timeoutSec: 240
+      run: |
+        set -eu
+        echo 'learner ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/learner && chmod 0440 /etc/sudoers.d/learner
+        rpm -q aide >/dev/null 2>&1 || dnf install -y -q aide >/dev/null
+        V=/var/lib/cloudtrain; mkdir -p $V; chmod 0700 $V; rm -f $V/window.done $V/changes.truth
+        rm -f /var/lib/aide/aide.db.gz /var/lib/aide/aide.db.new.gz /usr/bin/tr-newtool
+        rm -rf /etc/tr-signal; mkdir -p /etc/tr-signal
+        for f in interlocking relay-timing points track-circuits legacy spare lamp-proving signal-aspects; do
+          printf '# Tallowmere signalling %s\nversion=1\n' $f > /etc/tr-signal/$f.conf
+        done
+        chmod 0644 /etc/tr-signal/*.conf
+        # The change window: the maintenance team's changes, applied when the learner runs it.
+        cat > /usr/sbin/tr-change-window <<'EOT'
+        #!/bin/sh
+        V=/var/lib/cloudtrain
+        [ "$(id -u)" = 0 ] || { echo "tr-change-window: run it with sudo" >&2; exit 1; }
+        [ -e $V/window.done ] && { echo "The change window has already closed."; exit 0; }
+        echo "Change window open: applying maintenance changes..."
+        echo '# retuned in the change window' >> /etc/tr-signal/{{unit}}.conf
+        chmod 0666 /etc/tr-signal/points.conf
+        printf '#!/bin/sh\necho tr-newtool\n' > /usr/bin/tr-newtool; chmod 0755 /usr/bin/tr-newtool
+        rm -f /etc/tr-signal/{{legacy}}
+        printf '%s\n' 'changed /etc/tr-signal/{{unit}}.conf' 'changed /etc/tr-signal/points.conf' 'added /usr/bin/tr-newtool' 'removed /etc/tr-signal/{{legacy}}' | sort > $V/changes.truth
+        date +%s > $V/window.done
+        echo "Change window closed."
+        EOT
+        chmod 0755 /usr/sbin/tr-change-window
+        install -d -o learner -g learner /home/learner/answers
+        rm -f /home/learner/answers/changes.txt
+  checks:
+    - id: baseline-database
+      description: /var/lib/aide/aide.db.gz exists, covers only /etc and /usr/bin, and was taken before the change window
+      type: shell
+      on: tr-signal-03
+      skills: [linux.security.integrity]
+      weight: 2
+      timeoutSec: 60
+      command: |
+        db=/var/lib/aide/aide.db.gz
+        [ -s $db ] || { echo no-database; exit 0; }
+        t=$(zcat $db 2>/dev/null | awk '/^\// {print $1}')
+        [ -n "$t" ] || { echo unreadable; exit 0; }
+        printf '%s\n' "$t" | grep -qx '/etc/tr-signal/points.conf' || { echo missing-etc; exit 0; }
+        [ "$(printf '%s\n' "$t" | grep -c '^/usr/bin/')" -ge 20 ] || { echo missing-usr-bin; exit 0; }
+        [ -z "$(printf '%s\n' "$t" | grep -vE '^/(etc|usr/bin)(/|$)' | head -1)" ] || { echo too-wide; exit 0; }
+        printf '%s\n' "$t" | grep -qx '/etc/tr-signal/{{legacy}}' || { echo taken-after-window; exit 0; }
+        printf '%s\n' "$t" | grep -qx '/usr/bin/tr-newtool' && { echo taken-after-window; exit 0; }
+        echo ok
+      expect: {match: exact, value: ok}
+    - id: window-ran
+      description: The change window was run (once, by the learner)
+      type: shell
+      on: tr-signal-03
+      skills: [linux.security.integrity]
+      weight: 0.5
+      command: test -s /var/lib/cloudtrain/changes.truth && echo ran || echo not-run
+      expect: {match: exact, value: ran}
+    - id: report-exact
+      description: ~/answers/changes.txt lists exactly the files the change window added, removed and changed
+      type: shell
+      on: tr-signal-03
+      skills: [linux.security.integrity]
+      weight: 2
+      command: |
+        [ -s /var/lib/cloudtrain/changes.truth ] || { echo window-not-run; exit 0; }
+        got=$(awk 'NF >= 2 {print tolower($1), $2}' /home/learner/answers/changes.txt 2>/dev/null | while read k p; do [ -d "$p" ] || echo "$k $p"; done | sort -u)
+        [ "$got" = "$(cat /var/lib/cloudtrain/changes.truth)" ] && echo match || echo differs
+      expect: {match: exact, value: match}
+  hints:
+    - title: Scope in aide.conf
+      body: "Each rule line is `PATH RULE`, for example `/etc NORMAL`. Lines starting with `!` exclude paths. Remove or comment the default rule lines, add yours, and check the file with `sudo aide --config-check`."
+      cost: 1
+    - title: Initialise and activate
+      body: "`sudo aide --init` writes `/var/lib/aide/aide.db.new.gz`. A check reads `aide.db.gz`, so the new database must be moved or copied to that name before `sudo aide --check`."
+      cost: 1
+    - title: Reading the report
+      body: "The check prints `Added entries`, `Removed entries` and `Changed entries` sections with one path per line; the detailed section below says what changed. A changed directory (for example /usr/bin) is just a side effect of files appearing in it."
+      cost: 1
+  misconceptions:
+    - id: init-after-window
+      description: Runs the change window first and initialises the database afterwards.
+      feedback: "A baseline must come first: AIDE compares the filesystem with the database, so a database made after the changes treats them as normal and reports nothing."
+      expectFail: [baseline-database, report-exact]
+      mutation:
+        on: tr-signal-03
+        as: learner
+        timeoutSec: 240
+        run: |
+          sudo sed -i -e '/^\/[^ ]*[[:space:]]/d' -e '/^!\//d' /etc/aide.conf
+          printf '/etc NORMAL\n/usr/bin NORMAL\n' | sudo tee -a /etc/aide.conf >/dev/null
+          sudo tr-change-window >/dev/null
+          sudo aide --init >/dev/null 2>&1; sudo mv /var/lib/aide/aide.db.new.gz /var/lib/aide/aide.db.gz
+          : > ~/answers/changes.txt
+    - id: database-not-activated
+      description: Initialises the database but never moves the new file into place.
+      feedback: "`aide --init` writes aide.db.new.gz; AIDE reads aide.db.gz (database_in). Move the new database over before checking."
+      expectFail: [baseline-database, report-exact]
+      mutation:
+        on: tr-signal-03
+        as: learner
+        timeoutSec: 240
+        run: |
+          sudo sed -i -e '/^\/[^ ]*[[:space:]]/d' -e '/^!\//d' /etc/aide.conf
+          printf '/etc NORMAL\n/usr/bin NORMAL\n' | sudo tee -a /etc/aide.conf >/dev/null
+          sudo aide --init >/dev/null 2>&1
+          sudo tr-change-window >/dev/null
+    - id: whole-system-scope
+      description: Uses the default configuration, which covers /usr, /boot and more.
+      feedback: "The task asked for /etc and /usr/bin only. The default config scans most of the system, which is slow, noisy and not what security asked for."
+      expectFail: [baseline-database]
+      mutation:
+        on: tr-signal-03
+        as: learner
+        timeoutSec: 420
+        run: |
+          sudo aide --init >/dev/null 2>&1; sudo mv /var/lib/aide/aide.db.new.gz /var/lib/aide/aide.db.gz
+          sudo tr-change-window >/dev/null
+          printf '%s\n' 'changed /etc/tr-signal/{{unit}}.conf' 'changed /etc/tr-signal/points.conf' 'added /usr/bin/tr-newtool' 'removed /etc/tr-signal/{{legacy}}' > ~/answers/changes.txt
+    - id: partial-report
+      description: Reports only the files with new content and misses the permission change and the removal.
+      feedback: "AIDE also tracks attributes (a mode change) and deleted files. Read the Changed and Removed sections as well as Added."
+      expectFail: [report-exact]
+      mutation:
+        on: tr-signal-03
+        as: learner
+        timeoutSec: 240
+        run: |
+          sudo sed -i -e '/^\/[^ ]*[[:space:]]/d' -e '/^!\//d' /etc/aide.conf
+          printf '/etc NORMAL\n/usr/bin NORMAL\n' | sudo tee -a /etc/aide.conf >/dev/null
+          sudo aide --init >/dev/null 2>&1; sudo mv /var/lib/aide/aide.db.new.gz /var/lib/aide/aide.db.gz
+          sudo tr-change-window >/dev/null
+          printf '%s\n' 'changed /etc/tr-signal/{{unit}}.conf' 'added /usr/bin/tr-newtool' > ~/answers/changes.txt
+  solution:
+    explanation: |
+      Replace the rule lines of /etc/aide.conf with `/etc NORMAL` and `/usr/bin NORMAL`,
+      initialise, and move aide.db.new.gz to aide.db.gz. Then run the change window and
+      `aide --check`; its Added, Removed and Changed sections (files only) give the report.
+    steps:
+      - on: tr-signal-03
+        as: learner
+        timeoutSec: 300
+        run: |
+          sudo sed -i -e '/^\/[^ ]*[[:space:]]/d' -e '/^!\//d' /etc/aide.conf
+          printf '/etc NORMAL\n/usr/bin NORMAL\n' | sudo tee -a /etc/aide.conf >/dev/null
+          sudo aide --config-check
+          sudo aide --init >/dev/null 2>&1
+          sudo mv /var/lib/aide/aide.db.new.gz /var/lib/aide/aide.db.gz
+          sudo tr-change-window
+          sudo aide --check > /tmp/aide.out 2>&1 || true
+          awk '/^Added entries:$/ {k="added"} /^Removed entries:$/ {k="removed"} /^Changed entries:$/ {k="changed"} /^Detailed information/ {k=""} k && /^[fdl][-+ =<>][^:]*: \// {print k, $NF}' /tmp/aide.out | while read k p; do [ -d "$p" ] || echo "$k $p"; done > ~/answers/changes.txt
+          cat ~/answers/changes.txt
+    alternatives:
+      - id: separate-config-file
+        description: Keep the distribution aide.conf and run AIDE with a small config of its own, using the default database paths.
+        steps:
+          - on: tr-signal-03
+            as: learner
+            timeoutSec: 300
+            run: |
+              printf '%s\n' 'database_in=file:/var/lib/aide/aide.db.gz' 'database_out=file:/var/lib/aide/aide.db.new.gz' 'gzip_dbout=yes' 'report_url=stdout' 'NORMAL = R+sha512-m-c' '/etc NORMAL' '/usr/bin NORMAL' | sudo tee /root/aide-tr.conf >/dev/null
+              sudo aide -c /root/aide-tr.conf --init >/dev/null 2>&1
+              sudo cp /var/lib/aide/aide.db.new.gz /var/lib/aide/aide.db.gz
+              sudo tr-change-window
+              sudo aide -c /root/aide-tr.conf --check > /tmp/aide.out 2>&1 || true
+              awk '/^Added entries:$/ {k="added"} /^Removed entries:$/ {k="removed"} /^Changed entries:$/ {k="changed"} /^Detailed information/ {k=""} k && /^[fdl][-+ =<>][^:]*: \// {print k, $NF}' /tmp/aide.out | while read k p; do [ -d "$p" ] || echo "$k $p"; done > ~/answers/changes.txt

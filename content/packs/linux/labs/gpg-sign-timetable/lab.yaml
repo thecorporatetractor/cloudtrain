@@ -1,0 +1,201 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: gpg-sign-timetable
+  title: Sign and verify the published timetable
+  domain: linux
+  frameworks: [lpic1:security, linuxplus:security]
+  difficulty: easy
+  estimatedMinutes: 15
+  tags: [gpg, signatures, keys, integrity]
+  version: 1
+spec:
+  description: |
+    You work for the Tallowmere Rail timetable office on `tr-timetable-04`. A shell is
+    open on this host; GnuPG is installed. The host has no internet access and no key
+    server, so keys travel as files.
+
+    1. **Create a signing key** for the office: user ID
+       `Tallowmere Timetable Office <timetable@tallowmere.example>`, an ed25519 key that can
+       sign, valid at least a year, with **no passphrase** (this is a batch signing key).
+    2. **Publish a detached signature** for `~/publish/timetable-2027.pdf` as
+       `~/publish/timetable-2027.pdf.sig`. The PDF itself must stay byte-for-byte as it is.
+    3. A colleague at the Brimley depot sent two notes in `~/shared/`: `notes-a.txt` and
+       `notes-b.txt`, each with a detached signature (`.sig`), and the public key
+       `colleague.pub.asc`. **Import that key** and verify both. Write the name of the
+       file whose signature is **good** to `~/answers/verified.txt` (just the file name).
+  objectives:
+    - Generate a signing key non-interactively
+    - Create and verify a detached signature
+    - Import a public key from a file and verify with it
+    - Tell a good signature from one over modified data
+  params:
+    good:
+      type: choice
+      values: [notes-a.txt, notes-b.txt]
+  topology:
+    entry: tr-timetable-04
+    nodes:
+      - name: tr-timetable-04
+        driver: container
+        image: deb-lab:24.04
+        access: [shell]
+  setup:
+    - on: tr-timetable-04
+      timeoutSec: 240
+      run: |
+        set -eu
+        apt-get update -q >/dev/null
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -q gnupg >/dev/null
+        V=/var/lib/cloudtrain; mkdir -p $V; chmod 0700 $V
+        L=/home/learner
+        rm -rf $L/.gnupg $L/publish $L/shared
+        install -d -o learner -g learner $L/publish $L/shared $L/answers
+        rm -f $L/answers/verified.txt
+        printf '%%PDF-1.4\n%% Tallowmere Rail timetable 2027 (lab copy)\nWeekday service: TR101 06:10, TR102 06:40, TR103 07:20\n%%%%EOF\n' > $L/publish/timetable-2027.pdf
+        sha256sum $L/publish/timetable-2027.pdf | cut -d' ' -f1 > $V/pdf.sha256
+        # The colleague's key lives in a throwaway keyring.
+        G=$(mktemp -d); chmod 0700 $G
+        gpg --batch --homedir $G --pinentry-mode loopback --passphrase '' --quick-gen-key 'Brimley Timetable <brimley-tt@tallowmere.example>' ed25519 sign never >/dev/null 2>&1
+        gpg --batch --homedir $G --list-keys --with-colons | awk -F: '$1 == "fpr" {print $10; exit}' > $V/colleague.fpr
+        gpg --batch --homedir $G --armor --export > $L/shared/colleague.pub.asc
+        printf 'Brimley depot: platform 2 closed for resurfacing on 14 June.\n' > $L/shared/notes-a.txt
+        printf 'Brimley depot: sidings 4 and 5 hold the spare units.\n' > $L/shared/notes-b.txt
+        for f in notes-a.txt notes-b.txt; do
+          gpg --batch --homedir $G --pinentry-mode loopback --passphrase '' --detach-sign --armor -o $L/shared/$f.sig $L/shared/$f >/dev/null 2>&1
+        done
+        bad=notes-b.txt; [ "{{good}}" = notes-b.txt ] && bad=notes-a.txt
+        printf 'Edited after signing: please ignore the earlier text.\n' >> $L/shared/$bad
+        gpgconf --homedir $G --kill all 2>/dev/null || true; rm -rf $G
+        chown -R learner:learner $L/publish $L/shared $L/answers
+  checks:
+    - id: signing-key
+      description: The keyring holds a secret ed25519 key for Tallowmere Timetable Office <timetable@tallowmere.example> that can sign and has not expired
+      type: shell
+      on: tr-timetable-04
+      skills: [linux.security.crypto]
+      weight: 1.5
+      timeoutSec: 30
+      command: |
+        cd /tmp; g() { runuser -u learner -- env HOME=/home/learner gpg --batch "$@" 2>/dev/null; }
+        t=$(g --list-secret-keys --with-colons 'Tallowmere Timetable Office <timetable@tallowmere.example>')
+        s=$(printf '%s\n' "$t" | awk -F: '$1 == "sec" && $2 !~ /[erni]/ && $12 ~ /[sS]/ && $17 == "ed25519" {print "sign"; exit}')
+        u=$(printf '%s\n' "$t" | grep -c '^uid:.*Tallowmere Timetable Office <timetable@tallowmere.example>')
+        exp=$(printf '%s\n' "$t" | awk -F: '$1 == "sec" {print $7; exit}')
+        now=$(date +%s)
+        if [ -n "$exp" ] && [ "$exp" -lt $((now + 31536000 - 86400)) ]; then echo "short-validity"; exit 0; fi
+        [ "$s" = sign ] && [ "$u" -ge 1 ] && echo key-ok || echo "no-key"
+      expect: {match: exact, value: key-ok}
+    - id: detached-signature
+      description: ~/publish/timetable-2027.pdf.sig is a valid detached signature of the unchanged PDF made with the office key
+      type: shell
+      on: tr-timetable-04
+      skills: [linux.security.crypto]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        cd /tmp; g() { runuser -u learner -- env HOME=/home/learner gpg --batch "$@" 2>/dev/null; }
+        P=/home/learner/publish
+        [ "$(sha256sum $P/timetable-2027.pdf 2>/dev/null | cut -d' ' -f1)" = "$(cat /var/lib/cloudtrain/pdf.sha256)" ] || { echo pdf-changed; exit 0; }
+        fpr=$(g --list-secret-keys --with-colons 'timetable@tallowmere.example' | awk -F: '$1 == "fpr" {print $10; exit}')
+        [ -n "$fpr" ] || { echo no-key; exit 0; }
+        st=$(g --status-fd 1 --verify $P/timetable-2027.pdf.sig $P/timetable-2027.pdf)
+        printf '%s\n' "$st" | grep -q '^\[GNUPG:\] GOODSIG' || { echo not-valid; exit 0; }
+        printf '%s\n' "$st" | awk -v f="$fpr" '$2 == "VALIDSIG" && ($3 == f || $12 == f) {ok = 1} END {exit !ok}' && echo good || echo wrong-key
+      expect: {match: exact, value: good}
+    - id: colleague-key-imported
+      description: The colleague's public key is in the keyring
+      type: shell
+      on: tr-timetable-04
+      skills: [linux.security.crypto]
+      timeoutSec: 30
+      command: |
+        cd /tmp; runuser -u learner -- env HOME=/home/learner gpg --batch --list-keys --with-colons 2>/dev/null | awk -F: '$1 == "fpr" {print $10}' | grep -qx "$(cat /var/lib/cloudtrain/colleague.fpr)" && echo imported || echo missing
+      expect: {match: exact, value: imported}
+    - id: verdict
+      description: ~/answers/verified.txt names the file whose signature is good
+      type: shell
+      on: tr-timetable-04
+      skills: [linux.security.crypto]
+      weight: 1.5
+      command: |
+        [ "$(tr -d '[:space:]' < /home/learner/answers/verified.txt 2>/dev/null)" = "{{good}}" ] && echo correct || echo wrong
+      expect: {match: exact, value: correct}
+  hints:
+    - title: Key without prompts
+      body: "`gpg --batch --pinentry-mode loopback --passphrase '' --quick-generate-key 'Name <mail>' ed25519 sign 1y` creates a passphrase-less signing key; this host has no pinentry program for an interactive prompt."
+      cost: 1
+    - title: Detached signatures
+      body: "`gpg --detach-sign -o FILE.sig FILE` writes only the signature (add `--armor` for text). `gpg --sign` would wrap the data in the output instead, and `gpg --verify FILE.sig FILE` needs both files."
+      cost: 1
+    - title: Importing and verifying
+      body: "`gpg --import colleague.pub.asc`, then `gpg --verify notes-a.txt.sig notes-a.txt`. `Good signature` is the one to look for; `BAD signature` means the data changed after it was signed. The exit status is non-zero for a bad one."
+      cost: 1
+  misconceptions:
+    - id: attached-signature
+      description: Creates an attached signature (--sign) and names it .sig.
+      feedback: "`gpg --sign` produces a signed copy of the data, which cannot be checked with `gpg --verify file.sig file` as a detached signature. Use --detach-sign."
+      expectFail: [detached-signature]
+      mutation:
+        on: tr-timetable-04
+        as: learner
+        run: |
+          gpg --batch --pinentry-mode loopback --passphrase '' --quick-generate-key 'Tallowmere Timetable Office <timetable@tallowmere.example>' ed25519 sign 1y >/dev/null 2>&1
+          gpg --batch --pinentry-mode loopback --passphrase '' --sign -o ~/publish/timetable-2027.pdf.sig ~/publish/timetable-2027.pdf >/dev/null 2>&1
+          gpg --batch --import ~/shared/colleague.pub.asc >/dev/null 2>&1
+          printf '%s\n' '{{good}}' > ~/answers/verified.txt
+    - id: edited-after-signing
+      description: Signs the PDF and then edits it, so the signature no longer matches.
+      feedback: "A signature covers the exact bytes it was made over. Any change afterwards, even a trailing newline, makes it fail. Sign last."
+      expectFail: [detached-signature]
+      mutation:
+        on: tr-timetable-04
+        as: learner
+        run: |
+          gpg --batch --pinentry-mode loopback --passphrase '' --quick-generate-key 'Tallowmere Timetable Office <timetable@tallowmere.example>' ed25519 sign 1y >/dev/null 2>&1
+          gpg --batch --pinentry-mode loopback --passphrase '' --detach-sign -o ~/publish/timetable-2027.pdf.sig ~/publish/timetable-2027.pdf >/dev/null 2>&1
+          echo 'Amended: last train 23:55' >> ~/publish/timetable-2027.pdf
+          gpg --batch --import ~/shared/colleague.pub.asc >/dev/null 2>&1
+          printf '%s\n' '{{good}}' > ~/answers/verified.txt
+    - id: trusted-without-verifying
+      description: Imports the colleague's key but names the wrong file as verified.
+      feedback: "Importing a key does not verify anything. Run `gpg --verify` on each pair and read the result: one of the two files was changed after it was signed."
+      expectFail: [verdict]
+      mutation:
+        on: tr-timetable-04
+        as: learner
+        run: |
+          gpg --batch --pinentry-mode loopback --passphrase '' --quick-generate-key 'Tallowmere Timetable Office <timetable@tallowmere.example>' ed25519 sign 1y >/dev/null 2>&1
+          gpg --batch --pinentry-mode loopback --passphrase '' --detach-sign -o ~/publish/timetable-2027.pdf.sig ~/publish/timetable-2027.pdf >/dev/null 2>&1
+          gpg --batch --import ~/shared/colleague.pub.asc >/dev/null 2>&1
+          if [ '{{good}}' = notes-a.txt ]; then echo notes-b.txt; else echo notes-a.txt; fi > ~/answers/verified.txt
+  solution:
+    explanation: |
+      Generate the key in batch mode without a passphrase, make a detached signature with it
+      and verify both of the colleague's files after importing the key: the one that reports
+      "Good signature" is the answer, the other was edited after signing.
+    steps:
+      - on: tr-timetable-04
+        as: learner
+        run: |
+          gpg --batch --pinentry-mode loopback --passphrase '' --quick-generate-key 'Tallowmere Timetable Office <timetable@tallowmere.example>' ed25519 sign 1y
+          gpg --batch --detach-sign --armor -o ~/publish/timetable-2027.pdf.sig ~/publish/timetable-2027.pdf
+          gpg --verify ~/publish/timetable-2027.pdf.sig ~/publish/timetable-2027.pdf
+          gpg --import ~/shared/colleague.pub.asc
+          for f in notes-a.txt notes-b.txt; do
+            if gpg --verify ~/shared/$f.sig ~/shared/$f 2>/dev/null; then echo "$f" > ~/answers/verified.txt; fi
+          done
+          cat ~/answers/verified.txt
+    alternatives:
+      - id: binary-signature-and-status-fd
+        description: A binary detached signature and a machine-readable verification with --status-fd.
+        steps:
+          - on: tr-timetable-04
+            as: learner
+            run: |
+              gpg --batch --pinentry-mode loopback --passphrase '' --quick-generate-key 'Tallowmere Timetable Office <timetable@tallowmere.example>' ed25519 sign 2y
+              gpg --batch --detach-sign -o ~/publish/timetable-2027.pdf.sig ~/publish/timetable-2027.pdf
+              gpg --batch --import < ~/shared/colleague.pub.asc
+              for f in notes-a.txt notes-b.txt; do
+                gpg --batch --status-fd 1 --verify ~/shared/$f.sig ~/shared/$f 2>/dev/null | grep -q 'GOODSIG' && printf '%s\n' "$f" > ~/answers/verified.txt
+              done

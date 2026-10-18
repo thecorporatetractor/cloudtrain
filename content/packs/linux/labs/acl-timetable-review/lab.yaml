@@ -1,0 +1,188 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: acl-timetable-review
+  title: Give reviewers access with ACLs instead of new groups
+  domain: linux
+  frameworks: [lfcs:users-groups, linuxplus:security]
+  difficulty: medium
+  estimatedMinutes: 12
+  tags: [acl, setfacl, getfacl, default-acl, permissions]
+  version: 1
+spec:
+  description: |
+    On `tr-timetable-03` the timetable office keeps draft timetables in
+    **`/srv/timetable/drafts`**: owner `ttoffice`, group `ttoffice`, mode `0750`, files
+    `0640`. Two more people now need access, and the office does not want to put them in
+    its group. A shell is open on this host and you have `sudo`.
+
+    - **`{{reviewer}}`** must be able to **read** everything in the directory (and list it),
+      but not change anything.
+    - **`{{planner}}`** must be able to **read and write** the existing drafts and create
+      new ones.
+    - Both rights must also apply to **files and directories created in the directory
+      later** (by `ttoffice` or anyone else), without anyone running a command again.
+
+    Use **ACLs**. Leave the owner, owning-group and "other" entries as they are (`other`
+    gets nothing), do not add anyone to `ttoffice`, and do not use `chmod` to widen access.
+    Everyone else, like the account `guest`, must stay locked out.
+
+    Test as the users with `sudo -u {{reviewer}} ...` and `sudo -u {{planner}} ...`, and
+    inspect with `getfacl`.
+  objectives:
+    - Grant per-user access with setfacl instead of groups or chmod
+    - Set default ACLs so new files and directories inherit access
+    - Read an ACL and its mask with getfacl
+  params:
+    reviewer:
+      type: choice
+      values: [ewan, mira, sofia]
+    planner:
+      type: choice
+      values: [tamsin, hana, piet]
+  topology:
+    entry: tr-timetable-03
+    nodes:
+      - name: tr-timetable-03
+        driver: container
+        image: el-lab:10
+        access: [shell]
+        learnerSudo: true
+  setup:
+    - on: tr-timetable-03
+      run: |
+        set -eu
+        echo 'learner ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/learner && chmod 0440 /etc/sudoers.d/learner
+        for u in ttoffice {{reviewer}} {{planner}} guest; do id $u >/dev/null 2>&1 || useradd -m $u; done
+        gpasswd -d {{reviewer}} ttoffice >/dev/null 2>&1 || true
+        gpasswd -d {{planner}} ttoffice >/dev/null 2>&1 || true
+        rm -rf /srv/timetable; mkdir -p /srv/timetable/drafts
+        chmod 0755 /srv/timetable
+        printf 'train,dep\nTR101,06:10\nTR102,06:40\n' > /srv/timetable/drafts/winter-2027.csv
+        printf 'train,dep\nTR201,07:05\n' > /srv/timetable/drafts/summer-2027.csv
+        mkdir /srv/timetable/drafts/regional; printf 'train,dep\nTR301,08:15\n' > /srv/timetable/drafts/regional/north.csv
+        chown -R ttoffice:ttoffice /srv/timetable/drafts
+        chmod 0750 /srv/timetable/drafts /srv/timetable/drafts/regional
+        chmod 0640 /srv/timetable/drafts/*.csv /srv/timetable/drafts/regional/north.csv
+        setfacl -b -R /srv/timetable/drafts
+        # Grader copy of the starting entries.
+        mkdir -p /var/lib/cloudtrain && chmod 0700 /var/lib/cloudtrain
+  checks:
+    - id: reviewer-read-only
+      description: "{{reviewer}} can list and read the drafts, including the subdirectory, and cannot change or create anything"
+      type: shell
+      on: tr-timetable-03
+      skills: [linux.files.acls]
+      weight: 1.5
+      timeoutSec: 30
+      command: |
+        cd /tmp; d=/srv/timetable/drafts; r=""
+        runuser -u {{reviewer}} -- ls $d >/dev/null 2>&1 && r="$r list" || r="$r nolist"
+        runuser -u {{reviewer}} -- cat $d/winter-2027.csv $d/regional/north.csv >/dev/null 2>&1 && r="$r read" || r="$r noread"
+        runuser -u {{reviewer}} -- sh -c "echo x >> $d/winter-2027.csv" >/dev/null 2>&1 && r="$r writes" || r="$r nowrite"
+        runuser -u {{reviewer}} -- sh -c "echo x > $d/rev-new.csv" >/dev/null 2>&1 && r="$r creates" || r="$r nocreate"
+        rm -f $d/rev-new.csv; echo $r
+      expect: {match: exact, value: "list read nowrite nocreate"}
+    - id: planner-read-write
+      description: "{{planner}} can read and append to the existing drafts and create a new draft"
+      type: shell
+      on: tr-timetable-03
+      skills: [linux.files.acls]
+      weight: 1.5
+      timeoutSec: 30
+      command: |
+        cd /tmp; d=/srv/timetable/drafts; r=""
+        runuser -u {{planner}} -- cat $d/summer-2027.csv >/dev/null 2>&1 && r="$r read" || r="$r noread"
+        cp $d/summer-2027.csv /tmp/.s27; runuser -u {{planner}} -- sh -c "echo 'TR202,09:00' >> $d/summer-2027.csv" >/dev/null 2>&1 && r="$r append" || r="$r noappend"
+        cat /tmp/.s27 > $d/summer-2027.csv; rm -f /tmp/.s27
+        runuser -u {{planner}} -- sh -c "echo 'train,dep' > $d/pl-new.csv" >/dev/null 2>&1 && r="$r create" || r="$r nocreate"
+        rm -f $d/pl-new.csv; echo $r
+      expect: {match: exact, value: "read append create"}
+    - id: inherited-access
+      description: A file and a directory created later by ttoffice are readable by the reviewer and writable by the planner
+      type: shell
+      on: tr-timetable-03
+      skills: [linux.files.acls]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        cd /tmp; d=/srv/timetable/drafts; r=""
+        runuser -u ttoffice -- sh -c "echo 'train,dep' > $d/later.csv; mkdir $d/later-dir; echo y > $d/later-dir/f.csv"
+        runuser -u {{reviewer}} -- cat $d/later.csv $d/later-dir/f.csv >/dev/null 2>&1 && r="$r rev-read" || r="$r rev-noread"
+        runuser -u {{planner}} -- sh -c "echo z >> $d/later.csv && echo z >> $d/later-dir/f.csv && echo n > $d/later-dir/new.csv" >/dev/null 2>&1 && r="$r pl-write" || r="$r pl-nowrite"
+        runuser -u {{reviewer}} -- sh -c "echo z >> $d/later.csv" >/dev/null 2>&1 && r="$r rev-writes" || r="$r rev-nowrite"
+        rm -rf $d/later.csv $d/later-dir; echo $r
+      expect: {match: exact, value: "rev-read pl-write rev-nowrite"}
+    - id: base-untouched
+      description: Owner, owning group and other entries are unchanged, nobody joined ttoffice, and guest is still locked out
+      type: shell
+      on: tr-timetable-03
+      skills: [linux.files.acls, linux.files.permissions]
+      timeoutSec: 30
+      command: |
+        d=/srv/timetable/drafts; r=""
+        [ "$(getfacl -p -c $d 2>/dev/null | grep -E '^(user::|group::|other::)' | tr '\n' ' ')" = "user::rwx group::r-x other::--- " ] && r="$r dir-base" || r="$r dir-changed"
+        [ "$(getfacl -p -c $d/winter-2027.csv 2>/dev/null | grep -E '^(user::|group::|other::)' | tr '\n' ' ')" = "user::rw- group::r-- other::--- " ] && r="$r file-base" || r="$r file-changed"
+        [ "$(getent group ttoffice | cut -d: -f4)" = "" ] && r="$r group-clean" || r="$r group-changed"
+        runuser -u guest -- cat $d/winter-2027.csv >/dev/null 2>&1 && r="$r guest-reads" || r="$r guest-denied"
+        echo $r
+      expect: {match: exact, value: "dir-base file-base group-clean guest-denied"}
+  hints:
+    - title: Two kinds of entries
+      body: "`setfacl -m u:NAME:rwx PATH` changes the access ACL of existing objects; `setfacl -d -m u:NAME:rwx DIR` (or `d:u:NAME:rwx`) sets the default ACL that new objects inherit. `-R` recurses."
+      cost: 1
+    - title: Capital X
+      body: "`X` grants execute only on directories (and files that already have it), so one entry like `u:NAME:rX` fits both files and directories."
+      cost: 1
+    - title: The mask
+      body: "`getfacl` shows a `mask::` entry: the most any named user or group can have. setfacl recalculates it when you add entries, which is why `ls -l` shows group bits that differ from the owning group's entry."
+      cost: 1
+  misconceptions:
+    - id: no-default-acl
+      description: Sets the ACLs on what exists today but not the default ACL.
+      feedback: "An access ACL only covers the objects that exist now. New files get their permissions from the directory's default ACL (`setfacl -d`)."
+      expectFail: [inherited-access]
+      mutation:
+        on: tr-timetable-03
+        as: learner
+        run: |
+          sudo setfacl -R -m u:{{reviewer}}:rX,u:{{planner}}:rwX /srv/timetable/drafts
+    - id: chmod-instead
+      description: Opens the tree with chmod for everyone.
+      feedback: "chmod o+rx lets every account read the drafts, including guest, and cannot give one person write access. ACLs name the people who get access."
+      expectFail: [base-untouched, reviewer-read-only]
+      mutation:
+        on: tr-timetable-03
+        as: learner
+        run: |
+          sudo chmod -R o+rwX /srv/timetable/drafts
+    - id: join-the-group
+      description: Adds both people to ttoffice and gives the group write access.
+      feedback: "Group membership gives both of them the same rights (the reviewer could now edit drafts) and changes who is in the office's group. ACL entries are per user."
+      expectFail: [base-untouched, reviewer-read-only]
+      mutation:
+        on: tr-timetable-03
+        as: learner
+        run: |
+          sudo usermod -aG ttoffice {{reviewer}}; sudo usermod -aG ttoffice {{planner}}
+          sudo chmod -R g+w /srv/timetable/drafts; sudo chmod g+s /srv/timetable/drafts
+  solution:
+    explanation: |
+      One recursive setfacl for the entries on the existing tree and one with -d for the
+      default entries on the directories, so files and directories created later inherit
+      them. `rX` for the reviewer and `rwX` for the planner.
+    steps:
+      - on: tr-timetable-03
+        as: learner
+        run: |
+          sudo setfacl -R -m u:{{reviewer}}:rX,u:{{planner}}:rwX /srv/timetable/drafts
+          sudo setfacl -R -d -m u:{{reviewer}}:rX,u:{{planner}}:rwX /srv/timetable/drafts
+          getfacl /srv/timetable/drafts
+    alternatives:
+      - id: single-command
+        description: "Access and default entries in one command, using the d: prefix."
+        steps:
+          - on: tr-timetable-03
+            as: learner
+            run: |
+              sudo setfacl -R -m u:{{reviewer}}:rX,d:u:{{reviewer}}:rX,u:{{planner}}:rwX,d:u:{{planner}}:rwX /srv/timetable/drafts
