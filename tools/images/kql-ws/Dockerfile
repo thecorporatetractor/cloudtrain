@@ -50,7 +50,7 @@ RUN cd kusto-loco && if [[ $RUN_TESTS == 1 ]]; then \
 # hadolint ignore=SC2086
 RUN cd kusto-loco && dotnet publish applications/lokql/lokql.csproj -c Release -r linux-x64 --self-contained \
       -p:PublishSingleFile=false -p:PublishReadyToRun=true $KQL_BUILD_PROPS -o /out/lokql \
- && ! ls /out/lokql | grep -qiE '^Kusto\.(Data|Cloud)' \
+ && ! compgen -G '/out/lokql/Kusto.Data*' && ! compgen -G '/out/lokql/Kusto.Cloud*' \
  && rm -f /out/lokql/*.pdb
 # Licence notices of everything published: KustoLoco, Kusto.Language, every NuGet package
 # in lokql's dependency graph (licence files from the package, or its declared licence).
