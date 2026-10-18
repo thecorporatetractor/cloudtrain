@@ -587,6 +587,95 @@ Status and measurements: `docs/handoffs/foundations.md`.
   layered on kubeadm:1.37): `/opt/cloudtrain/bin/addons-install <list> [--wait] [--pool a-b]`
   after `kubeadm init` + `cni-install`; see the catalog comment for the add-on list.
 
+## Remote verify VM
+
+A cloud VM runs the verify batches unattended (AWS r8i.8xlarge Spot: 32 vCPU, 247 GiB,
+Ubuntu 24.04, nested KVM; root disk 50 GB, data volume 512 GB xfs on `/var/lib/docker`
+that survives stop/start). It holds no secrets: no `~/.config/cloudtrain/*.env`, no GitHub
+token, no cloud or Entra credentials; everything it pulls is public. The scripts and
+configs are in `tools/verify-vm/`; on the VM they are copied to `/srv/ct-work/vm-config/`.
+
+Setup (as `ubuntu`):
+
+1. Work directory on the volume: `/var/lib/docker` is mode 0710, so bind-mount
+   `/var/lib/docker/ct-work` to `/srv/ct-work` (fstab, `bind,nofail,x-systemd.requires-mounts-for=/var/lib/docker`).
+2. **Move `/var/lib/containerd` onto the volume.** Docker 29 with the containerd image store
+   keeps images and container layers there, not under `/var/lib/docker`; the 50 GB root disk
+   was full within minutes of the first image builds. Stop docker and containerd, rsync
+   to `/var/lib/docker/ct-containerd`, bind-mount it on `/var/lib/containerd` (fstab) and add a
+   containerd drop-in with `RequiresMountsFor=/var/lib/containerd /var/lib/docker`.
+3. `tools/verify-vm/toolchain.sh`: Go 1.27.2 (sha256 from go.dev), Node 22.23.1 (SHASUMS256),
+   pnpm 9.15.9, kubectl v1.37.1 (dl.k8s.io sha256), helm v4.3.0 (sha256 from `versions.env`),
+   tmux, rsync, sysstat and **bzip2** (`build.sh kubeadm-full` unpacks the gVisor tarball on
+   the host; WSL had it). Then `deploy/scripts/install-tools.sh` (kind, task, vcluster,
+   virtctl, jq, yq).
+4. Clone the public repo to `/srv/ct-work/cloudtrain` (follows `origin/main`), rsync
+   `tools/images/.cache/mirror` from a machine that has it, `pnpm install --frozen-lockfile`,
+   `pnpm --filter @cloudtrain/lab-schema build`, build `labctl`.
+5. **Docker Hub rate limit.** Anonymous pulls from AWS addresses get `429 Too Many Requests`
+   within minutes. Use `mirror.gcr.io` everywhere (same names and digests): `/etc/docker/daemon.json`
+   `{"registry-mirrors": ["https://mirror.gcr.io"]}`, `DOCKERIO_MIRROR=mirror.gcr.io` for
+   `build.sh` and `mirrors-up.sh` (zot syncs from it), and a containerd hosts file in the kind
+   nodes (`tools/verify-vm/certs.d`, mounted by the kind config).
+6. Cluster: `KIND_CONFIG=tools/verify-vm/kind-cluster.yaml KUBE_OVN_EXTRA_VALUES=tools/verify-vm/kube-ovn-values.yaml task dev:up`,
+   then `tools/verify-vm/tune.sh`. Differences from the reference cluster: three workers (VMs
+   and pods spread over them), `maxPods: 300`, parallel image pulls (kubelet 10,
+   containerd 10), higher API server / controller-manager / scheduler limits, kubelet
+   `systemReserved` so the workers together schedule about 216 GiB, Kube-OVN CPU limits
+   raised (the chart's 1-CPU limit on `kube-ovn-cni` throttles CNI calls under bursts, see
+   known gap 9) and `OVN_NORTHD_N_THREADS: 4`, KubeVirt/CDI client rate limits raised. The
+   batch manager runs with `--max-concurrent-reconciles=64` and a 6 GiB memory limit.
+7. **User-namespace pods fail on EC2 without `tune.sh`.** kind bind-mounts files over
+   `/sys/devices/virtual/dmi/id/` (a per-node `product_uuid`) when the host has DMI; WSL has
+   none. With those overmounts `/sys` is not "fully visible", runc cannot mount sysfs in a
+   user namespace, and every `hostUsers: false` pod (tier A) stays in `ContainerCreating` with
+   `error mounting "sysfs" ... operation not permitted`. `tune.sh` unmounts them; they come back
+   whenever a node container restarts, so the runner runs `tune.sh` every cycle.
+8. Images: `tools/verify-vm/build-images.sh` builds every VM image in parallel with
+   `GUESTFS_KVM=1` (nested KVM in libguestfs is stable here, unlike WSL) after one sequential
+   pre-warm step (shared downloads and the builder image are written non-atomically), pulls
+   the GHCR images (jumphost, frr, nettools, netsvc, ansible-ctl, iac-ws-tofu) and retags them,
+   and runs `mirrors-up.sh`. moto is a multi-arch image that `kind load` cannot import; pull it
+   in the nodes with `ctr images pull` by digest and tag it. Times on this VM (parallel,
+   KVM): builder image + downloads 206 s, etcd-host 187 s, docker-vm 221 s, el-lab + deb-lab
+   220 s, el-vm 280 s, kubeadm-node 324 s, ubuntu-vm 330 s, kubeadm-full 367 s (after
+   kubeadm-node), kubeadm-upgrade 396 s, mirrors 126 s; iac-ws-terraform built in the first
+   wave in under 6 minutes. Don't restart Docker while `kind load` runs: an interrupted import
+   leaves a complete-looking image whose unpacked layers are missing (the mirror pod served empty
+   directories until the image was removed from the nodes and loaded again).
+
+Batch runner (`tools/verify-vm/ct-batch.sh`, systemd `ct-batch.service`, no LLM): each cycle
+pulls `origin/main`, rebuilds `labctl`, redeploys the scoped manager (`ct-batch-system`,
+selector `labs.cloudtrain.dev/verify=batch`) when the platform changed, and runs `labctl verify`
+through `tools/slots/run.sh` for every `status: built` lab and exam task (tier K, C and B labs in
+the heavy slot, the rest in the pod slot). A lab starts only when every catalog image it uses
+is in the kind nodes; a ref missing from the catalog is recorded as `blocked`. Then it runs
+`labctl exam run --auto-solve` (seed 1) and `--no-solve` (seed 2) for each exam whose drawn
+tasks all pass. It skips a lab that passed with the same lab tree and platform, re-runs a
+failure when either changed, and a run cut by a stop or reboot simply runs again. Results on
+the volume under `/srv/ct-work/results/`: `status.json` (one line, every minute),
+`summary.tsv`, `labs/<id>.json` (status, failing step, timing, log tail), `logs/<id>.log`,
+`reports/<id>.json` (labctl's report), `exams/<exam>-<mode>.json`, `runner.log`.
+`ct-batch.sh list` shows what the next cycle would run; `ct-batch.sh once id,...` re-runs
+labs. `ct-metrics.service` samples CPU, steal, load and memory every 10 s
+(`results/metrics/<date>.tsv`); `ct-autoscale.service` moves `CT_SLOTS_HEAVY`/`CT_SLOTS_POD` in
+`runner.env` every 150 s: up by 3 / 8 while CPU is under 80 % and more than 40 GiB is free
+and the limit is in use, down on steal over 3 %, CPU over 95 %, under 20 GiB free, a Kube-OVN
+CNI call older than 15 minutes, or two recent timeout failures.
+
+Measured on the VM: idle with the platform up, about 2 % CPU, load 2.5-3.5, 9 GiB used, no
+steal. A calibration smoke run (one 3-node kubeadm lab, an el-vm and a docker-vm lab, a netdev
+lab and six pod labs at once) peaked at 66 % CPU, load 19, 30 GiB, steal 0, with iowait up to
+10 % on the original gp3 volume (6000 IOPS, 250 MB/s). The first half hour of the batch
+(heavy 4 -> 9, pod 12 -> 20): CPU 54 % on average, 84 % peak, load up to 49, 44 GiB used,
+steal 0.
+
+Gotchas: the instance is Spot (stops on interruption) and a CloudWatch alarm stops it after
+6 h under 5 % CPU, so an idle runner lets it stop; after a start, the units bring the cluster
+back (`dev:up` + `tune.sh`) and the runner continues. Labs whose pods land on different
+workers can behave differently from the single-worker reference cluster; check placement
+first when a lab passes locally and fails here.
+
 ## Known gaps and problems hit (with the fix in place)
 
 1. **Only the kind worker runs VMs.** The control-plane node is tainted, so virt-handler

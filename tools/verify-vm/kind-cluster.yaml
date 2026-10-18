@@ -1,0 +1,71 @@
+# kind config for the remote verify VM (32 vCPU, 247 GiB): same as deploy/kind/cluster.yaml
+# plus three workers, docker.io through mirror.gcr.io (Docker Hub rate-limits anonymous pulls
+# from AWS addresses), more pods per node, parallel image pulls and higher API limits.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+networking:
+  disableDefaultCNI: true
+  podSubnet: 10.16.0.0/16
+  serviceSubnet: 10.96.0.0/12
+containerdConfigPatches:
+  - |-
+    [plugins."io.containerd.cri.v1.images"]
+      max_concurrent_downloads = 10
+    [plugins."io.containerd.cri.v1.images".registry]
+      config_path = "/etc/containerd/certs.d"
+    [plugins."io.containerd.transfer.v1.local"]
+      max_concurrent_downloads = 10
+kubeadmConfigPatches:
+  - |
+    kind: ClusterConfiguration
+    apiServer:
+      extraArgs:
+        - { name: max-requests-inflight, value: "1600" }
+        - { name: max-mutating-requests-inflight, value: "800" }
+    controllerManager:
+      extraArgs:
+        - { name: kube-api-qps, value: "200" }
+        - { name: kube-api-burst, value: "400" }
+        - { name: concurrent-deployment-syncs, value: "20" }
+        - { name: concurrent-replicaset-syncs, value: "20" }
+        - { name: concurrent-statefulset-syncs, value: "20" }
+        - { name: concurrent-namespace-syncs, value: "40" }
+        - { name: concurrent-gc-syncs, value: "60" }
+    scheduler:
+      extraArgs:
+        - { name: kube-api-qps, value: "200" }
+        - { name: kube-api-burst, value: "400" }
+  - |
+    kind: KubeletConfiguration
+    maxPods: 300
+    serializeImagePulls: false
+    maxParallelImagePulls: 10
+    kubeAPIQPS: 100
+    kubeAPIBurst: 200
+    # every kind node sees the whole host; reserve so the workers together
+    # schedule about 216 GiB and eviction kicks in before the host runs out
+    systemReserved:
+      memory: 175Gi
+    evictionHard:
+      memory.available: 4Gi
+      nodefs.available: 5%
+      imagefs.available: 5%
+nodes:
+  - role: control-plane
+    labels:
+      kube-ovn/role: master
+    extraMounts:
+      - { hostPath: /dev/kvm, containerPath: /dev/kvm }
+      - { hostPath: /srv/ct-work/vm-config/certs.d, containerPath: /etc/containerd/certs.d, readOnly: true }
+  - role: worker
+    extraMounts:
+      - { hostPath: /dev/kvm, containerPath: /dev/kvm }
+      - { hostPath: /srv/ct-work/vm-config/certs.d, containerPath: /etc/containerd/certs.d, readOnly: true }
+  - role: worker
+    extraMounts:
+      - { hostPath: /dev/kvm, containerPath: /dev/kvm }
+      - { hostPath: /srv/ct-work/vm-config/certs.d, containerPath: /etc/containerd/certs.d, readOnly: true }
+  - role: worker
+    extraMounts:
+      - { hostPath: /dev/kvm, containerPath: /dev/kvm }
+      - { hostPath: /srv/ct-work/vm-config/certs.d, containerPath: /etc/containerd/certs.d, readOnly: true }
