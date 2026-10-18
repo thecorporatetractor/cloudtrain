@@ -1,0 +1,327 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: thecorporatetractor <marco@azarguard.com>
+Date: Sun, 18 Oct 2026 17:41:32 +0300
+Subject: [PATCH 05/16] core: term semantics for has, has_any, has_all; add
+ hasprefix/hassuffix
+
+has and its variants were substring matches, so 'PowerShell.exe' has 'shell'
+was true where Kusto says false, and detections returned extra rows. They now
+match whole terms (runs of letters and digits); a needle spanning several
+terms ('198.51.100.', 'North America') must start and end on term boundaries
+where it starts or ends with an alphanumeric character. Adds hasprefix,
+hassuffix and their _cs and negated forms. Three existing tests asserted the
+substring behaviour and now assert Kusto's.
+
+Tokenizer edge cases (Unicode categories, very short terms) may still differ
+from Kusto.
+---
+ .../Evaluation/BuiltIns/BuiltInOperators.cs   |  9 +++
+ .../BuiltIns/Operators/ContainsCsFunction.cs  |  2 +-
+ .../BuiltIns/Operators/ContainsFunction.cs    |  2 +-
+ .../Operators/HasPrefixSuffixFunctions.cs     | 52 ++++++++++++++++
+ .../BuiltIns/Operators/InOperatorCore.cs      |  4 +-
+ .../Operators/NotContainsCsFunction.cs        |  2 +-
+ .../BuiltIns/Operators/NotContainsFunction.cs |  2 +-
+ .../BuiltIns/Operators/TermMatch.cs           | 50 ++++++++++++++++
+ test/BasicTests/SimpleFunctionTests.cs        |  9 ++-
+ test/BasicTests/TermOperatorTests.cs          | 59 +++++++++++++++++++
+ 10 files changed, 182 insertions(+), 9 deletions(-)
+ create mode 100644 libraries/KustoLoco.Core/Evaluation/BuiltIns/Operators/HasPrefixSuffixFunctions.cs
+ create mode 100644 libraries/KustoLoco.Core/Evaluation/BuiltIns/Operators/TermMatch.cs
+ create mode 100644 test/BasicTests/TermOperatorTests.cs
+
+diff --git a/libraries/KustoLoco.Core/Evaluation/BuiltIns/BuiltInOperators.cs b/libraries/KustoLoco.Core/Evaluation/BuiltIns/BuiltInOperators.cs
+index aa035611..bab9e352 100644
+--- a/libraries/KustoLoco.Core/Evaluation/BuiltIns/BuiltInOperators.cs
++++ b/libraries/KustoLoco.Core/Evaluation/BuiltIns/BuiltInOperators.cs
+@@ -134,6 +134,15 @@ internal static class BuiltInOperators
+         NotEndsWithCsFunction.Register(operators);
+ 
+         MatchRegexFunction.Register(operators);
++
++        HasPrefixFunction.Register(operators);
++        NotHasPrefixFunction.Register(operators);
++        HasPrefixCsFunction.Register(operators);
++        NotHasPrefixCsFunction.Register(operators);
++        HasSuffixFunction.Register(operators);
++        NotHasSuffixFunction.Register(operators);
++        HasSuffixCsFunction.Register(operators);
++        NotHasSuffixCsFunction.Register(operators);
+     }
+ 
+     public static ScalarOverloadInfo GetOverload(OperatorSymbol symbol,
+diff --git a/libraries/KustoLoco.Core/Evaluation/BuiltIns/Operators/ContainsCsFunction.cs b/libraries/KustoLoco.Core/Evaluation/BuiltIns/Operators/ContainsCsFunction.cs
+index c597be2f..c3d5cf34 100644
+--- a/libraries/KustoLoco.Core/Evaluation/BuiltIns/Operators/ContainsCsFunction.cs
++++ b/libraries/KustoLoco.Core/Evaluation/BuiltIns/Operators/ContainsCsFunction.cs
+@@ -13,5 +13,5 @@ internal partial class ContainsCsFunction
+ [KustoImplementation(Keyword = "Operators.HasCs")]
+ internal partial class HasCsFunction
+ {
+-    private static bool Impl(string a, string b) => a.Contains(b, StringComparison.InvariantCulture);
++    private static bool Impl(string a, string b) => TermMatch.Has(a, b, StringComparison.InvariantCulture);
+ }
+diff --git a/libraries/KustoLoco.Core/Evaluation/BuiltIns/Operators/ContainsFunction.cs b/libraries/KustoLoco.Core/Evaluation/BuiltIns/Operators/ContainsFunction.cs
+index 20c00fc7..e53af2d7 100644
+--- a/libraries/KustoLoco.Core/Evaluation/BuiltIns/Operators/ContainsFunction.cs
++++ b/libraries/KustoLoco.Core/Evaluation/BuiltIns/Operators/ContainsFunction.cs
+@@ -13,6 +13,6 @@ internal partial class ContainsFunction
+ [KustoImplementation(Keyword = "Operators.Has")]
+ internal partial class HasFunction
+ {
+-    private static bool Impl(string a, string b) => a.Contains(b, StringComparison.InvariantCultureIgnoreCase);
++    private static bool Impl(string a, string b) => TermMatch.Has(a, b, StringComparison.InvariantCultureIgnoreCase);
+ }
+ 
+diff --git a/libraries/KustoLoco.Core/Evaluation/BuiltIns/Operators/HasPrefixSuffixFunctions.cs b/libraries/KustoLoco.Core/Evaluation/BuiltIns/Operators/HasPrefixSuffixFunctions.cs
+new file mode 100644
+index 00000000..534303a4
+--- /dev/null
++++ b/libraries/KustoLoco.Core/Evaluation/BuiltIns/Operators/HasPrefixSuffixFunctions.cs
+@@ -0,0 +1,52 @@
++﻿using System;
++
++// ReSharper disable PartialTypeWithSinglePart
++namespace KustoLoco.Core.Evaluation.BuiltIns.Impl;
++
++[KustoImplementation(Keyword = "Operators.HasPrefix")]
++internal partial class HasPrefixFunction
++{
++    private static bool Impl(string a, string b) => TermMatch.HasPrefix(a, b, StringComparison.InvariantCultureIgnoreCase);
++}
++
++[KustoImplementation(Keyword = "Operators.NotHasPrefix")]
++internal partial class NotHasPrefixFunction
++{
++    private static bool Impl(string a, string b) => !TermMatch.HasPrefix(a, b, StringComparison.InvariantCultureIgnoreCase);
++}
++
++[KustoImplementation(Keyword = "Operators.HasPrefixCs")]
++internal partial class HasPrefixCsFunction
++{
++    private static bool Impl(string a, string b) => TermMatch.HasPrefix(a, b, StringComparison.InvariantCulture);
++}
++
++[KustoImplementation(Keyword = "Operators.NotHasPrefixCs")]
++internal partial class NotHasPrefixCsFunction
++{
++    private static bool Impl(string a, string b) => !TermMatch.HasPrefix(a, b, StringComparison.InvariantCulture);
++}
++
++[KustoImplementation(Keyword = "Operators.HasSuffix")]
++internal partial class HasSuffixFunction
++{
++    private static bool Impl(string a, string b) => TermMatch.HasSuffix(a, b, StringComparison.InvariantCultureIgnoreCase);
++}
++
++[KustoImplementation(Keyword = "Operators.NotHasSuffix")]
++internal partial class NotHasSuffixFunction
++{
++    private static bool Impl(string a, string b) => !TermMatch.HasSuffix(a, b, StringComparison.InvariantCultureIgnoreCase);
++}
++
++[KustoImplementation(Keyword = "Operators.HasSuffixCs")]
++internal partial class HasSuffixCsFunction
++{
++    private static bool Impl(string a, string b) => TermMatch.HasSuffix(a, b, StringComparison.InvariantCulture);
++}
++
++[KustoImplementation(Keyword = "Operators.NotHasSuffixCs")]
++internal partial class NotHasSuffixCsFunction
++{
++    private static bool Impl(string a, string b) => !TermMatch.HasSuffix(a, b, StringComparison.InvariantCulture);
++}
+diff --git a/libraries/KustoLoco.Core/Evaluation/BuiltIns/Operators/InOperatorCore.cs b/libraries/KustoLoco.Core/Evaluation/BuiltIns/Operators/InOperatorCore.cs
+index 855e9531..bcfa198a 100644
+--- a/libraries/KustoLoco.Core/Evaluation/BuiltIns/Operators/InOperatorCore.cs
++++ b/libraries/KustoLoco.Core/Evaluation/BuiltIns/Operators/InOperatorCore.cs
+@@ -43,10 +43,10 @@ public static class InOperatorCore
+                 allAny == AllAny.Any
+                     ? equals == EqualsContains.Equals
+                         ? context.LastStringArray.Any(x => a.Equals(x, comparison))
+-                        : context.LastStringArray.Any(x => a.Contains(x, comparison))
++                        : context.LastStringArray.Any(x => TermMatch.Has(a, x, comparison))
+                     : equals == EqualsContains.Equals
+                         ? context.LastStringArray.All(x => a.Equals(x, comparison))
+-                        : context.LastStringArray.All(x => a.Contains(x, comparison))
++                        : context.LastStringArray.All(x => TermMatch.Has(a, x, comparison))
+                 ;
+             return context.LastResult;
+         }
+diff --git a/libraries/KustoLoco.Core/Evaluation/BuiltIns/Operators/NotContainsCsFunction.cs b/libraries/KustoLoco.Core/Evaluation/BuiltIns/Operators/NotContainsCsFunction.cs
+index 1ea03ece..325289a4 100644
+--- a/libraries/KustoLoco.Core/Evaluation/BuiltIns/Operators/NotContainsCsFunction.cs
++++ b/libraries/KustoLoco.Core/Evaluation/BuiltIns/Operators/NotContainsCsFunction.cs
+@@ -13,5 +13,5 @@ internal partial class NotContainsCsFunction
+ [KustoImplementation(Keyword = "Operators.NotHasCs")]
+ internal partial class NotHasCsFunction
+ {
+-    private static bool Impl(string a, string b) => !a.Contains(b, StringComparison.InvariantCulture);
++    private static bool Impl(string a, string b) => !TermMatch.Has(a, b, StringComparison.InvariantCulture);
+ }
+diff --git a/libraries/KustoLoco.Core/Evaluation/BuiltIns/Operators/NotContainsFunction.cs b/libraries/KustoLoco.Core/Evaluation/BuiltIns/Operators/NotContainsFunction.cs
+index 03c3c906..00019e77 100644
+--- a/libraries/KustoLoco.Core/Evaluation/BuiltIns/Operators/NotContainsFunction.cs
++++ b/libraries/KustoLoco.Core/Evaluation/BuiltIns/Operators/NotContainsFunction.cs
+@@ -13,5 +13,5 @@ internal partial class NotContainsFunction
+ [KustoImplementation(Keyword = "Operators.NotHas")]
+ internal partial class NotHasFunction
+ {
+-    private static bool Impl(string a, string b) => !a.Contains(b, StringComparison.InvariantCultureIgnoreCase);
++    private static bool Impl(string a, string b) => !TermMatch.Has(a, b, StringComparison.InvariantCultureIgnoreCase);
+ }
+diff --git a/libraries/KustoLoco.Core/Evaluation/BuiltIns/Operators/TermMatch.cs b/libraries/KustoLoco.Core/Evaluation/BuiltIns/Operators/TermMatch.cs
+new file mode 100644
+index 00000000..08198c90
+--- /dev/null
++++ b/libraries/KustoLoco.Core/Evaluation/BuiltIns/Operators/TermMatch.cs
+@@ -0,0 +1,50 @@
++﻿using System;
++
++namespace KustoLoco.Core.Evaluation.BuiltIns.Impl;
++
++/// <summary>
++///     Kusto's term semantics for has / hasprefix / hassuffix and their variants.
++/// </summary>
++/// <remarks>
++///     Kusto splits strings into terms, runs of alphanumeric characters, and these operators
++///     match terms rather than substrings: "PowerShell.exe" has "shell" is false, has "exe"
++///     is true. A needle may span several terms ("198.51.100." or "North America"); then only
++///     its ends must sit on term boundaries, and only where the needle itself starts or ends
++///     with an alphanumeric character. This follows the documented behaviour; edge cases of
++///     Kusto's tokenizer (e.g. Unicode categories) may differ.
++/// </remarks>
++internal static class TermMatch
++{
++    private static bool IsTermChar(char c) => char.IsLetterOrDigit(c);
++
++    /// <summary>needle occurs in text starting and ending on term boundaries</summary>
++    public static bool Has(string text, string needle, StringComparison comparison) =>
++        Find(text, needle, comparison, true, true);
++
++    /// <summary>needle occurs at the start of a term</summary>
++    public static bool HasPrefix(string text, string needle, StringComparison comparison) =>
++        Find(text, needle, comparison, true, false);
++
++    /// <summary>needle occurs at the end of a term</summary>
++    public static bool HasSuffix(string text, string needle, StringComparison comparison) =>
++        Find(text, needle, comparison, false, true);
++
++    private static bool Find(string text, string needle, StringComparison comparison, bool atStart, bool atEnd)
++    {
++        if (needle.Length == 0)
++            return true;
++        var checkStart = atStart && IsTermChar(needle[0]);
++        var checkEnd = atEnd && IsTermChar(needle[^1]);
++        for (var i = text.IndexOf(needle, comparison); i >= 0; i = text.IndexOf(needle, i + 1, comparison))
++        {
++            var end = i + needle.Length;
++            if (checkStart && i > 0 && IsTermChar(text[i - 1]))
++                continue;
++            if (checkEnd && end < text.Length && IsTermChar(text[end]))
++                continue;
++            return true;
++        }
++
++        return false;
++    }
++}
+diff --git a/test/BasicTests/SimpleFunctionTests.cs b/test/BasicTests/SimpleFunctionTests.cs
+index 6126d232..9c8188cb 100644
+--- a/test/BasicTests/SimpleFunctionTests.cs
++++ b/test/BasicTests/SimpleFunctionTests.cs
+@@ -1071,7 +1071,8 @@ print toscalar(letters | summarize mx=min(bitmap));";
+                      | where A has_any('aA','b') | count
+                     """;
+         var result = await LastLineOfResult(query);
+-        result.Should().Be("2");
++        // Kusto matches whole terms: only "B" has the term 'b'; "AAA" does not have the term 'aA'
++        result.Should().Be("1");
+     }
+ 
+     [TestMethod]
+@@ -1086,7 +1087,8 @@ print toscalar(letters | summarize mx=min(bitmap));";
+                      | where A has_all('aA','b') | count
+                     """;
+         var result = await LastLineOfResult(query);
+-        result.Should().Be("1");
++        // Kusto matches whole terms: no row has both the term 'aA' and the term 'b'
++        result.Should().Be("0");
+     }
+ 
+     [TestMethod]
+@@ -1101,7 +1103,8 @@ print toscalar(letters | summarize mx=min(bitmap));";
+                      | where A has('aA') | count
+                     """;
+         var result = await LastLineOfResult(query);
+-        result.Should().Be("2");
++        // Kusto matches whole terms: 'aA' is a substring of "AAA" and "BAAAaa" but not a term
++        result.Should().Be("0");
+     }
+ 
+     [TestMethod]
+diff --git a/test/BasicTests/TermOperatorTests.cs b/test/BasicTests/TermOperatorTests.cs
+new file mode 100644
+index 00000000..9df07dc1
+--- /dev/null
++++ b/test/BasicTests/TermOperatorTests.cs
+@@ -0,0 +1,59 @@
++﻿using AwesomeAssertions;
++
++namespace BasicTests;
++
++/// <summary>
++///     has, !has, has_any, has_all, hasprefix, hassuffix match whole terms, as in Kusto
++/// </summary>
++[TestClass]
++public class TermOperatorTests : TestMethods
++{
++    private async Task<string> Count(string predicate) =>
++        await LastLineOfResult($"datatable(s:string)['PowerShell.exe -enc AAA', 'C:\\\\Windows\\\\cmd.exe', 'src 198.51.100.97 port 22'] | where {predicate} | count");
++
++    [TestMethod]
++    public async Task HasMatchesWholeTermsOnly()
++    {
++        (await Count("s has 'shell'")).Should().Be("0");
++        (await Count("s has 'powershell'")).Should().Be("1");
++        (await Count("s has 'exe'")).Should().Be("2");
++        (await Count("s !has 'shell'")).Should().Be("3");
++    }
++
++    [TestMethod]
++    public async Task HasCaseSensitivity()
++    {
++        (await Count("s has_cs 'PowerShell'")).Should().Be("1");
++        (await Count("s has_cs 'powershell'")).Should().Be("0");
++        (await Count("s !has_cs 'powershell'")).Should().Be("3");
++    }
++
++    [TestMethod]
++    public async Task NeedleSpanningSeveralTerms()
++    {
++        (await Count("s has '198.51.100.'")).Should().Be("1");
++        (await Count("s has '98.51.100'")).Should().Be("0");
++        (await Count("s has 'port 22'")).Should().Be("1");
++    }
++
++    [TestMethod]
++    public async Task HasAnyAndHasAllUseTerms()
++    {
++        (await Count("s has_any ('shell', 'cmd')")).Should().Be("1");
++        (await Count("s has_all ('src', 'port')")).Should().Be("1");
++        (await Count("s has_all ('src', 'por')")).Should().Be("0");
++    }
++
++    [TestMethod]
++    public async Task HasPrefixAndHasSuffix()
++    {
++        (await Count("s hasprefix 'Power'")).Should().Be("1");
++        (await Count("s hasprefix 'Shell'")).Should().Be("0");
++        (await Count("s hassuffix 'shell'")).Should().Be("1");
++        (await Count("s hassuffix 'Power'")).Should().Be("0");
++        (await Count("s !hasprefix 'win'")).Should().Be("2");
++        (await Count("s hasprefix_cs 'power'")).Should().Be("0");
++        (await Count("s hassuffix_cs 'Shell'")).Should().Be("1");
++        (await Count("s !hassuffix_cs 'Shell'")).Should().Be("2");
++    }
++}

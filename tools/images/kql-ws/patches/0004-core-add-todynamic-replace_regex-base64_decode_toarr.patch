@@ -1,0 +1,403 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: thecorporatetractor <marco@azarguard.com>
+Date: Sun, 18 Oct 2026 17:41:32 +0300
+Subject: [PATCH 04/16] core: add todynamic, replace_regex,
+ base64_decode_toarray, column_ifexists
+
+Functions that security queries use and that were missing or broken:
+- todynamic(): synonym of parse_json() for strings.
+- replace_regex() and the older replace(): .NET regex with Kusto's \0..\9
+  back-references in the rewrite pattern; an invalid regex or a timeout (1 s)
+  returns the source unchanged.
+- base64_decode_toarray(), unicode_codepoints_to_string() and
+  unicode_codepoints_from_string(): decode UTF-16 payloads such as
+  PowerShell -EncodedCommand.
+- column_ifexists(name, default): resolved when the query is translated, as
+  in Kusto (the column if the input has it, else the default). It was a stub
+  that threw for every input.
+- hourofday(): Kusto declares it int; the long implementation never matched
+  the signature, so every call failed.
+---
+ .../BuiltIns/BuiltInScalarFunctions.cs        |  6 ++
+ .../Base64DecodeToArrayFunction.cs            | 26 ++++++
+ .../ScalarFunctions/GetHourOfDayFunction.cs   |  3 +-
+ .../ScalarFunctions/ReplaceRegexFunction.cs   | 50 +++++++++++
+ .../ScalarFunctions/ToDynamicFunction.cs      | 28 ++++++
+ .../UnicodeCodepointsFunctions.cs             | 65 ++++++++++++++
+ .../Translation/IRTranslator.Expressions.cs   | 22 +++++
+ test/BasicTests/ScalarCompatibilityTests.cs   | 88 +++++++++++++++++++
+ 8 files changed, 287 insertions(+), 1 deletion(-)
+ create mode 100644 libraries/KustoLoco.Core/Evaluation/BuiltIns/ScalarFunctions/Base64DecodeToArrayFunction.cs
+ create mode 100644 libraries/KustoLoco.Core/Evaluation/BuiltIns/ScalarFunctions/ReplaceRegexFunction.cs
+ create mode 100644 libraries/KustoLoco.Core/Evaluation/BuiltIns/ScalarFunctions/ToDynamicFunction.cs
+ create mode 100644 libraries/KustoLoco.Core/Evaluation/BuiltIns/ScalarFunctions/UnicodeCodepointsFunctions.cs
+ create mode 100644 test/BasicTests/ScalarCompatibilityTests.cs
+
+diff --git a/libraries/KustoLoco.Core/Evaluation/BuiltIns/BuiltInScalarFunctions.cs b/libraries/KustoLoco.Core/Evaluation/BuiltIns/BuiltInScalarFunctions.cs
+index bf947277..806040f9 100644
+--- a/libraries/KustoLoco.Core/Evaluation/BuiltIns/BuiltInScalarFunctions.cs
++++ b/libraries/KustoLoco.Core/Evaluation/BuiltIns/BuiltInScalarFunctions.cs
+@@ -237,10 +237,15 @@ internal static class BuiltInScalarFunctions
+         ToLowerFunction.Register(Functions);
+         ToUpperFunction.Register(Functions);
+         ReplaceStringFunction.Register(Functions);
++        ReplaceRegexFunction.Register(Functions);
++        ReplaceFunction.Register(Functions);
+         SubstringFunction.Register(Functions);
+         ArrayRotateLeftFunction.Register(Functions);
+         ArrayRotateRightFunction.Register(Functions);
+         Base64Decode.Register(Functions);
++        Base64DecodeToArrayFunction.Register(Functions);
++        UnicodeCodepointsToStringFunction.Register(Functions);
++        UnicodeCodepointsFromStringFunction.Register(Functions);
+         Base64Encode.Register(Functions);
+         BinaryAnd.Register(Functions);
+         BinaryOr.Register(Functions);
+@@ -311,6 +316,7 @@ internal static class BuiltInScalarFunctions
+         UrlEncodeComponentFunction.Register(Functions);
+         ExtractFunction.Register(Functions);
+         ParseJsonFunction.Register(Functions);
++        ToDynamicFunction.Register(Functions);
+         ArraySortAscFunction.Register(Functions);
+         ArraySortDescFunction.Register(Functions);
+         ArrayLengthFunction.Register(Functions);
+diff --git a/libraries/KustoLoco.Core/Evaluation/BuiltIns/ScalarFunctions/Base64DecodeToArrayFunction.cs b/libraries/KustoLoco.Core/Evaluation/BuiltIns/ScalarFunctions/Base64DecodeToArrayFunction.cs
+new file mode 100644
+index 00000000..b0a059ba
+--- /dev/null
++++ b/libraries/KustoLoco.Core/Evaluation/BuiltIns/ScalarFunctions/Base64DecodeToArrayFunction.cs
+@@ -0,0 +1,26 @@
++﻿using System;
++using System.Linq;
++using System.Text.Json.Nodes;
++
++namespace KustoLoco.Core.Evaluation.BuiltIns.Impl;
++
++/// <summary>
++///     base64_decode_toarray(): the decoded bytes as a dynamic array of longs; null for
++///     input that is not valid base64. Used with unicode_codepoints_to_string() or to decode
++///     UTF-16 payloads such as PowerShell -EncodedCommand.
++/// </summary>
++[KustoImplementation(Keyword = "Functions.Base64DecodeToArray")]
++internal partial class Base64DecodeToArrayFunction
++{
++    private static JsonNode? Impl(string base64)
++    {
++        try
++        {
++            return new JsonArray(Convert.FromBase64String(base64).Select(b => (JsonNode?)JsonValue.Create((long)b)).ToArray());
++        }
++        catch (FormatException)
++        {
++            return null;
++        }
++    }
++}
+diff --git a/libraries/KustoLoco.Core/Evaluation/BuiltIns/ScalarFunctions/GetHourOfDayFunction.cs b/libraries/KustoLoco.Core/Evaluation/BuiltIns/ScalarFunctions/GetHourOfDayFunction.cs
+index 7c277c22..640bffa4 100644
+--- a/libraries/KustoLoco.Core/Evaluation/BuiltIns/ScalarFunctions/GetHourOfDayFunction.cs
++++ b/libraries/KustoLoco.Core/Evaluation/BuiltIns/ScalarFunctions/GetHourOfDayFunction.cs
+@@ -6,5 +6,6 @@ namespace KustoLoco.Core.Evaluation.BuiltIns.Impl;
+ [KustoImplementation(Keyword = "Functions.HourOfDay")]
+ internal partial class GetHourOfDayFunction
+ {
+-    private static long Impl(DateTime date) => date.Hour;
++    // Kusto declares hourofday() as int; a long Impl never matched the signature
++    private static int Impl(DateTime date) => date.Hour;
+ }
+\ No newline at end of file
+diff --git a/libraries/KustoLoco.Core/Evaluation/BuiltIns/ScalarFunctions/ReplaceRegexFunction.cs b/libraries/KustoLoco.Core/Evaluation/BuiltIns/ScalarFunctions/ReplaceRegexFunction.cs
+new file mode 100644
+index 00000000..8d601748
+--- /dev/null
++++ b/libraries/KustoLoco.Core/Evaluation/BuiltIns/ScalarFunctions/ReplaceRegexFunction.cs
+@@ -0,0 +1,50 @@
++﻿using System;
++using System.Text.RegularExpressions;
++
++namespace KustoLoco.Core.Evaluation.BuiltIns.Impl;
++
++/// <summary>
++///     replace_regex(source, lookup_regex, rewrite_pattern): rewrite_pattern refers to capture
++///     groups as \0..\9 (Kusto syntax), translated to .NET's ${n}. An invalid regex or a
++///     timeout returns the source unchanged.
++/// </summary>
++[KustoImplementation(Keyword = "Functions.ReplaceRegex")]
++internal partial class ReplaceRegexFunction
++{
++    private static string Impl(string source, string lookup, string rewrite) =>
++        RegexReplace.Replace(source, lookup, rewrite);
++}
++
++/// <summary>
++///     replace() is the older name of replace_regex() with the same arguments
++/// </summary>
++[KustoImplementation(Keyword = "Functions.Replace")]
++internal partial class ReplaceFunction
++{
++    private static string Impl(string lookup, string rewrite, string source) =>
++        RegexReplace.Replace(source, lookup, rewrite);
++}
++
++internal static class RegexReplace
++{
++    private static readonly Regex Backref = new(@"\\(\d)", RegexOptions.Compiled);
++    private static readonly TimeSpan Timeout = TimeSpan.FromSeconds(1);
++
++    internal static string Replace(string source, string lookup, string rewrite)
++    {
++        // escape '$' (special in .NET replacements), then \n -> ${n}
++        var dotnetRewrite = Backref.Replace(rewrite.Replace("$", "$$"), m => "${" + m.Groups[1].Value + "}");
++        try
++        {
++            return Regex.Replace(source, lookup, dotnetRewrite, RegexOptions.CultureInvariant, Timeout);
++        }
++        catch (ArgumentException)
++        {
++            return source;
++        }
++        catch (RegexMatchTimeoutException)
++        {
++            return source;
++        }
++    }
++}
+diff --git a/libraries/KustoLoco.Core/Evaluation/BuiltIns/ScalarFunctions/ToDynamicFunction.cs b/libraries/KustoLoco.Core/Evaluation/BuiltIns/ScalarFunctions/ToDynamicFunction.cs
+new file mode 100644
+index 00000000..dbf6ff6d
+--- /dev/null
++++ b/libraries/KustoLoco.Core/Evaluation/BuiltIns/ScalarFunctions/ToDynamicFunction.cs
+@@ -0,0 +1,28 @@
++﻿using System.Text.Json;
++using System.Text.Json.Nodes;
++
++namespace KustoLoco.Core.Evaluation.BuiltIns.Impl;
++
++/// <summary>
++///     todynamic() is a synonym of parse_json(). The source generator inlines Impl bodies,
++///     so parse_json's logic is repeated here rather than called. Kusto declares the
++///     argument as string, so a dynamic argument arrives as its JSON text.
++/// </summary>
++[KustoImplementation(Keyword = "Functions.ToDynamic_")]
++public partial class ToDynamicFunction
++{
++    JsonNode? StringImpl(string input)
++    {
++        if (string.IsNullOrEmpty(input))
++            return null;
++        try
++        {
++            return JsonNode.Parse(input);
++        }
++        catch (JsonException)
++        {
++            // not JSON: a dynamic value holding the original string, as parse_json does
++            return JsonValue.Create(input);
++        }
++    }
++}
+diff --git a/libraries/KustoLoco.Core/Evaluation/BuiltIns/ScalarFunctions/UnicodeCodepointsFunctions.cs b/libraries/KustoLoco.Core/Evaluation/BuiltIns/ScalarFunctions/UnicodeCodepointsFunctions.cs
+new file mode 100644
+index 00000000..4273c1d1
+--- /dev/null
++++ b/libraries/KustoLoco.Core/Evaluation/BuiltIns/ScalarFunctions/UnicodeCodepointsFunctions.cs
+@@ -0,0 +1,65 @@
++﻿using System.Linq;
++using System.Text;
++using System.Text.Json.Nodes;
++
++namespace KustoLoco.Core.Evaluation.BuiltIns.Impl;
++
++/// <summary>
++///     unicode_codepoints_to_string(dynamic array of code points); null if any element is not
++///     a valid code point
++/// </summary>
++[KustoImplementation(Keyword = "Functions.UnicodeCodepointsToString")]
++internal partial class UnicodeCodepointsToStringFunction
++{
++    private static string Impl(JsonNode codepoints)
++    {
++        if (codepoints is not JsonArray array)
++            return string.Empty;
++        var sb = new StringBuilder(array.Count);
++        foreach (var item in array)
++        {
++            if (!CodepointSupport.TryGetCodepoint(item, out var cp))
++                return string.Empty;
++            if (cp is < 0 or > 0x10FFFF or >= 0xD800 and <= 0xDFFF)
++                return string.Empty;
++            sb.Append(char.ConvertFromUtf32((int)cp));
++        }
++
++        return sb.ToString();
++    }
++}
++
++internal static class CodepointSupport
++{
++    internal static bool TryGetCodepoint(JsonNode? item, out long cp)
++    {
++        cp = 0;
++        if (item is not JsonValue v)
++            return false;
++        if (v.TryGetValue<long>(out cp))
++            return true;
++        if (v.TryGetValue<int>(out var i))
++        {
++            cp = i;
++            return true;
++        }
++
++        if (v.TryGetValue<double>(out var d) && d == System.Math.Floor(d))
++        {
++            cp = (long)d;
++            return true;
++        }
++
++        return false;
++    }
++}
++
++/// <summary>
++///     unicode_codepoints_from_string(string): dynamic array of the string's code points
++/// </summary>
++[KustoImplementation(Keyword = "Functions.UnicodeCodepointsFromString")]
++internal partial class UnicodeCodepointsFromStringFunction
++{
++    private static JsonNode Impl(string s) =>
++        new JsonArray(s.EnumerateRunes().Select(r => (JsonNode?)JsonValue.Create((long)r.Value)).ToArray());
++}
+diff --git a/libraries/KustoLoco.Core/InternalRepresentation/Translation/IRTranslator.Expressions.cs b/libraries/KustoLoco.Core/InternalRepresentation/Translation/IRTranslator.Expressions.cs
+index 75309216..9819f629 100644
+--- a/libraries/KustoLoco.Core/InternalRepresentation/Translation/IRTranslator.Expressions.cs
++++ b/libraries/KustoLoco.Core/InternalRepresentation/Translation/IRTranslator.Expressions.cs
+@@ -148,6 +148,26 @@ internal partial class IRTranslator : DefaultSyntaxVisitor<IRNode>
+         return new IRLiteralExpressionNode(node.LiteralValue, node.ResultType);
+     }
+ 
++    /// <summary>
++    ///     column_ifexists(name, default): the column when the input has one of that name,
++    ///     otherwise the default. Like Kusto, this is decided when the query is translated.
++    /// </summary>
++    private IRNode TranslateColumnIfExists(FunctionCallExpression node)
++    {
++        var args = node.ArgumentList.Expressions;
++        if (args.Count != 2 || args[0].Element is not LiteralExpression { LiteralValue: string name })
++            throw new InvalidOperationException("column_ifexists requires a constant column name and a default value");
++        var index = _rowScope == TableSymbol.Empty
++            ? -1
++            : _rowScope.Members.FirstIndex(m => m is ColumnSymbol && m.Name == name);
++        var result = index >= 0
++            ? new IRRowScopeNameReferenceNode(_rowScope.Members[index], ((ColumnSymbol)_rowScope.Members[index]).Type, index)
++            : (IRExpressionNode)args[1].Element.Accept(this);
++        return result.ResultType.Simplify() == node.ResultType.Simplify()
++            ? result
++            : new IRCastExpressionNode(result, node.ResultType);
++    }
++
+     public override IRNode VisitDynamicExpression(DynamicExpression node)
+     {
+         var literalValue = (string)node.LiteralValue;
+@@ -289,6 +309,8 @@ internal partial class IRTranslator : DefaultSyntaxVisitor<IRNode>
+     {
+         var signature = node.ReferencedSignature;
+         var returnType = node.ResultType;
++        if (signature.Symbol == Functions.ColumnIfExists || signature.Symbol == Functions.ColumnIfExists_Deprecated)
++            return TranslateColumnIfExists(node);
+ 
+         var arguments = new Expression[node.ArgumentList.Expressions.Count];
+         var irArguments = new IRExpressionNode[arguments.Length];
+diff --git a/test/BasicTests/ScalarCompatibilityTests.cs b/test/BasicTests/ScalarCompatibilityTests.cs
+new file mode 100644
+index 00000000..453d5bdf
+--- /dev/null
++++ b/test/BasicTests/ScalarCompatibilityTests.cs
+@@ -0,0 +1,88 @@
++﻿using AwesomeAssertions;
++
++namespace BasicTests;
++
++/// <summary>
++///     Scalar functions common in security queries that were missing or mis-typed
++/// </summary>
++[TestClass]
++public class ScalarCompatibilityTests : TestMethods
++{
++    [TestMethod]
++    public async Task HourOfDay()
++    {
++        var result = await LastLineOfResult("print h=hourofday(datetime(2026-10-18T13:05:00Z))");
++        result.Should().Be("13");
++    }
++
++    [TestMethod]
++    public async Task ToDynamicIsParseJson()
++    {
++        var result = await LastLineOfResult("print d=todynamic('{\"a\":[1,2,3]}') | project n=array_length(d.a)");
++        result.Should().Be("3");
++    }
++
++    [TestMethod]
++    public async Task ReplaceRegexWithBackReferences()
++    {
++        var result = await LastLineOfResult(@"print s=replace_regex('user=alice id=7', @'user=(\w+) id=(\d+)', @'\2:\1 costs $5')");
++        result.Should().Be("7:alice costs $5");
++    }
++
++    [TestMethod]
++    public async Task ReplaceLegacyArgumentOrder()
++    {
++        var result = await LastLineOfResult(@"print s=replace(@'\d', 'x', 'a1b22')");
++        result.Should().Be("axbxx");
++    }
++
++    [TestMethod]
++    public async Task Base64DecodeToArrayAndCodepoints()
++    {
++        // "hi" encoded as UTF-16LE, the form PowerShell -EncodedCommand uses
++        var result = await LastLineOfResult(
++            "print a=base64_decode_toarray('aABpAA==') " +
++            "| extend s=unicode_codepoints_to_string(a) " +
++            "| project n=array_length(a), len=strlen(s), text=replace_regex(s, @'\\x00', '')");
++        result.Should().Be("4,4,hi");
++    }
++
++    [TestMethod]
++    public async Task CodepointsRoundTrip()
++    {
++        var result = await LastLineOfResult("print s=unicode_codepoints_to_string(unicode_codepoints_from_string('Kql'))");
++        result.Should().Be("Kql");
++    }
++
++    [TestMethod]
++    public async Task InvalidBase64IsNull()
++    {
++        var result = await LastLineOfResult("print a=base64_decode_toarray('not base64!') | extend e=isnull(a)");
++        result.Should().EndWith("True");
++    }
++
++    [TestMethod]
++    public async Task ColumnIfExistsPicksTheColumn()
++    {
++        var result = await ResultAsString(
++            "datatable(ClientIP:string)['10.0.0.1'] | extend ip=column_ifexists('ClientIP', 'none') | project ip");
++        result.Should().Be("10.0.0.1");
++    }
++
++    [TestMethod]
++    public async Task ColumnIfExistsFallsBackToTheDefault()
++    {
++        var result = await ResultAsString(
++            "datatable(Other:string)['x'] | extend ip=column_ifexists('ClientIP', 'none') | project ip");
++        result.Should().Be("none");
++    }
++
++    [TestMethod]
++    public async Task ColumnIfExistsAcrossAFuzzyUnion()
++    {
++        var query = "union isfuzzy=true (datatable(IPAddress:string)['1.1.1.1']), (datatable(ClientIP:string)['2.2.2.2']) " +
++                    "| extend ip=coalesce(column_ifexists('IPAddress', ''), column_ifexists('ClientIP', '')) | project ip | order by ip asc";
++        var result = await ResultAsString(query);
++        result.Should().Be("1.1.1.1,2.2.2.2");
++    }
++}

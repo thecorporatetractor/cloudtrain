@@ -1,0 +1,231 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: thecorporatetractor <marco@azarguard.com>
+Date: Sun, 18 Oct 2026 16:11:00 +0300
+Subject: [PATCH 09/16] core: make-series infers from/to when omitted
+
+'make-series n=count() on TimeGenerated step 1h' (no from/to) failed with
+"make-series requires an explicit 'from'". As in ADX, an omitted 'from' is
+the first bin holding data, bin(min(axis), step), and an omitted 'to'
+(exclusive) is just past the last one, bin(max(axis), step) + step. The range
+comes from the whole input, so every 'by' group shares one axis. Bins align to
+zero (0 ticks for datetime/timespan) like bin(). Either bound may be given on
+its own; an input with no axis values yields no rows.
+---
+ ...TreeEvaluator.QueryOperators.MakeSeries.cs | 64 +++++++++++++++++--
+ .../IRMakeSeriesOperatorNode.cs               | 18 +++---
+ .../Translation/IRTranslator.MakeSeries.cs    | 10 +--
+ test/BasicTests/MakeSeriesOperatorTests.cs    | 41 ++++++++++++
+ 4 files changed, 115 insertions(+), 18 deletions(-)
+
+diff --git a/libraries/KustoLoco.Core/Evaluation/TreeEvaluator.QueryOperators.MakeSeries.cs b/libraries/KustoLoco.Core/Evaluation/TreeEvaluator.QueryOperators.MakeSeries.cs
+index 6c40c622..16ce1c5a 100644
+--- a/libraries/KustoLoco.Core/Evaluation/TreeEvaluator.QueryOperators.MakeSeries.cs
++++ b/libraries/KustoLoco.Core/Evaluation/TreeEvaluator.QueryOperators.MakeSeries.cs
+@@ -26,10 +26,15 @@ internal partial class TreeEvaluator
+         var rowCount = chunk.RowCount;
+         var chunkContext = context with { Chunk = chunk };
+ 
+-        // Range: from / to / step are constant scalars.
+-        var fromVal = ((ScalarResult)node.From.Accept(this, chunkContext)).Value;
+-        var toVal = ((ScalarResult)node.To.Accept(this, chunkContext)).Value;
++        // Range: from / to / step are constant scalars. The axis is evaluated first because an omitted 'from' / 'to'
++        // comes from the data.
++        var axisColumn = ((ColumnarResult)node.Axis.Accept(this, chunkContext)).Column;
+         var stepVal = ((ScalarResult)node.Step.Accept(this, chunkContext)).Value;
++        var fromVal = node.From is null ? null : ((ScalarResult)node.From.Accept(this, chunkContext)).Value;
++        var toVal = node.To is null ? null : ((ScalarResult)node.To.Accept(this, chunkContext)).Value;
++        if (node.From is null || node.To is null)
++            (fromVal, toVal) = InferSeriesRange(axisColumn, rowCount, stepVal, node.From is null ? null : fromVal,
++                node.To is null ? null : toVal);
+ 
+         // KQL make-series bins the axis into [from, to) buckets of width step (bin_at semantics): 'to' is
+         // NON-inclusive and the number of points is the count of start + i*step values strictly below 'to'. Temporal
+@@ -65,8 +70,7 @@ internal partial class TreeEvaluator
+         }
+         if (binCount < 0) binCount = 0;
+ 
+-        // Axis + by-columns evaluated columnar over the whole chunk.
+-        var axisColumn = ((ColumnarResult)node.Axis.Accept(this, chunkContext)).Column;
++        // By-columns evaluated columnar over the whole chunk.
+         var byColumns = node.ByColumns
+             .Select(b => ((ColumnarResult)b.Accept(this, chunkContext)).Column)
+             .ToArray();
+@@ -154,6 +158,56 @@ internal partial class TreeEvaluator
+         return TabularResult.CreateUnvisualized(new InMemoryTableSource(resultSchema, outColumns));
+     }
+ 
++    /// <summary>
++    ///     ADX semantics for an omitted range: 'from' is the first bin that holds data, bin(min(axis), step), and 'to'
++    ///     (exclusive) is just past the last one, bin(max(axis), step) + step. Bins align to zero (0 ticks for
++    ///     datetime/timespan), as bin() does. Explicit bounds are kept. With no non-null axis values the range is
++    ///     empty, so no series rows are produced.
++    /// </summary>
++    private static (object? from, object? to) InferSeriesRange(BaseColumn axis, int rowCount, object? stepVal,
++        object? explicitFrom, object? explicitTo)
++    {
++        object? min = null, max = null;
++        for (var r = 0; r < rowCount; r++)
++        {
++            var v = axis.GetRawDataValue(r);
++            if (v is null) continue;
++            if (min is null || Comparer<object>.Default.Compare(v, min) < 0) min = v;
++            if (max is null || Comparer<object>.Default.Compare(v, max) > 0) max = v;
++        }
++
++        if (min is null || max is null)
++            return (explicitFrom ?? 0.0, explicitFrom ?? 0.0); // empty range: zero bins
++
++        switch (min)
++        {
++            case DateTime dmin:
++            {
++                var step = ToTicks(stepVal);
++                if (step <= 0) return (explicitFrom ?? dmin, explicitTo ?? dmin);
++                var lo = dmin.Ticks / step * step;
++                var hi = ((DateTime)max).Ticks / step * step + step;
++                return (explicitFrom ?? new DateTime(lo, DateTimeKind.Utc), explicitTo ?? new DateTime(hi, DateTimeKind.Utc));
++            }
++            case TimeSpan tmin:
++            {
++                var step = ToTicks(stepVal);
++                if (step <= 0) return (explicitFrom ?? tmin, explicitTo ?? tmin);
++                var lo = (long)Math.Floor((double)tmin.Ticks / step) * step;
++                var hi = (long)Math.Floor((double)((TimeSpan)max).Ticks / step) * step + step;
++                return (explicitFrom ?? new TimeSpan(lo), explicitTo ?? new TimeSpan(hi));
++            }
++            default:
++            {
++                var step = ToDouble(stepVal);
++                var dmin = ToDouble(min);
++                var dmax = ToDouble(max);
++                if (step <= 0) return (explicitFrom ?? dmin, explicitTo ?? dmax);
++                return (explicitFrom ?? Math.Floor(dmin / step) * step, explicitTo ?? Math.Floor(dmax / step) * step + step);
++            }
++        }
++    }
++
+     private static long ToTicks(object? v) => v switch
+     {
+         // A datetime is compared and binned on the UTC instant it denotes: a local-kind value carries an offset
+diff --git a/libraries/KustoLoco.Core/InternalRepresentation/Nodes/Expressions/QueryOperators/IRMakeSeriesOperatorNode.cs b/libraries/KustoLoco.Core/InternalRepresentation/Nodes/Expressions/QueryOperators/IRMakeSeriesOperatorNode.cs
+index 51696dfc..723f306b 100644
+--- a/libraries/KustoLoco.Core/InternalRepresentation/Nodes/Expressions/QueryOperators/IRMakeSeriesOperatorNode.cs
++++ b/libraries/KustoLoco.Core/InternalRepresentation/Nodes/Expressions/QueryOperators/IRMakeSeriesOperatorNode.cs
+@@ -17,8 +17,8 @@ internal class IRMakeSeriesOperatorNode : IRQueryOperatorNode
+         List<object?> defaults,
+         List<bool> defaultProvided,
+         IRExpressionNode axis,
+-        IRExpressionNode from,
+-        IRExpressionNode to,
++        IRExpressionNode? from,
++        IRExpressionNode? to,
+         IRExpressionNode step,
+         List<IRExpressionNode> byColumns,
+         bool stopInclusive,
+@@ -30,16 +30,16 @@ internal class IRMakeSeriesOperatorNode : IRQueryOperatorNode
+         DefaultProvided = defaultProvided ?? throw new ArgumentNullException(nameof(defaultProvided));
+         StopInclusive = stopInclusive;
+         Axis = axis ?? throw new ArgumentNullException(nameof(axis));
+-        From = from ?? throw new ArgumentNullException(nameof(from));
+-        To = to ?? throw new ArgumentNullException(nameof(to));
++        From = from;
++        To = to;
+         Step = step ?? throw new ArgumentNullException(nameof(step));
+         ByColumns = byColumns ?? throw new ArgumentNullException(nameof(byColumns));
+ 
+         _children = new List<IRNode>();
+         _children.AddRange(aggregations);
+         _children.Add(axis);
+-        _children.Add(from);
+-        _children.Add(to);
++        if (from != null) _children.Add(from);
++        if (to != null) _children.Add(to);
+         _children.Add(step);
+         _children.AddRange(byColumns);
+     }
+@@ -52,8 +52,10 @@ internal class IRMakeSeriesOperatorNode : IRQueryOperatorNode
+     // typed 0) from an explicit 'default=<null>' (fills with null, e.g. for the series_fill_* interpolation functions).
+     public List<bool> DefaultProvided { get; }
+     public IRExpressionNode Axis { get; }
+-    public IRExpressionNode From { get; }
+-    public IRExpressionNode To { get; }
++    // From/To are null when the query omits them: the evaluator then uses the first/last bin that holds data
++    // (bin(min(Axis), Step) and bin(max(Axis), Step) + Step), as ADX does.
++    public IRExpressionNode? From { get; }
++    public IRExpressionNode? To { get; }
+     public IRExpressionNode Step { get; }
+     public List<IRExpressionNode> ByColumns { get; }
+     // The alternate 'in range(start, stop, step)' syntax has an INCLUSIVE stop (unlike 'from .. to ..' where 'to' is
+diff --git a/libraries/KustoLoco.Core/InternalRepresentation/Translation/IRTranslator.MakeSeries.cs b/libraries/KustoLoco.Core/InternalRepresentation/Translation/IRTranslator.MakeSeries.cs
+index 1c7c5614..365b5b41 100644
+--- a/libraries/KustoLoco.Core/InternalRepresentation/Translation/IRTranslator.MakeSeries.cs
++++ b/libraries/KustoLoco.Core/InternalRepresentation/Translation/IRTranslator.MakeSeries.cs
+@@ -29,13 +29,13 @@ internal partial class IRTranslator
+ 
+         var axis = (IRExpressionNode)node.OnClause.Expression.Accept(this);
+ 
+-        IRExpressionNode from, to, step;
++        IRExpressionNode? from, to;
++        IRExpressionNode step;
+         if (node.RangeClause is MakeSeriesFromToStepClause fts)
+         {
+-            from = (IRExpressionNode)(fts.MakeSeriesFromClause?.Expression
+-                ?? throw new NotImplementedException("make-series requires an explicit 'from'")).Accept(this);
+-            to = (IRExpressionNode)(fts.MakeSeriesToClause?.Expression
+-                ?? throw new NotImplementedException("make-series requires an explicit 'to'")).Accept(this);
++            // 'from' and 'to' are optional: when omitted, the evaluator derives them from the data.
++            from = (IRExpressionNode?)fts.MakeSeriesFromClause?.Expression.Accept(this);
++            to = (IRExpressionNode?)fts.MakeSeriesToClause?.Expression.Accept(this);
+             step = (IRExpressionNode)(fts.MakeSeriesStepClause?.Expression
+                 ?? throw new NotImplementedException("make-series requires an explicit 'step'")).Accept(this);
+         }
+diff --git a/test/BasicTests/MakeSeriesOperatorTests.cs b/test/BasicTests/MakeSeriesOperatorTests.cs
+index 3d59e5b3..3ac5c366 100644
+--- a/test/BasicTests/MakeSeriesOperatorTests.cs
++++ b/test/BasicTests/MakeSeriesOperatorTests.cs
+@@ -103,4 +103,45 @@ public class MakeSeriesOperatorTests : TestMethods
+         var result = await SquashedLastLineOfResult(query);
+         result.Should().Contain("[2,1]");
+     }
++
++    [TestMethod]
++    public async Task MakeSeries_OmittedFromTo_UsesTheBinsThatHoldData()
++    {
++        // With no 'from'/'to', ADX starts at bin(min(axis), step) and ends just past bin(max(axis), step): the
++        // first and last bins are the ones holding the earliest and latest rows.
++        var q = "datatable(t:datetime, v:long)[datetime(2026-10-01T10:20:00Z),1, datetime(2026-10-01T10:50:00Z),1, " +
++                "datetime(2026-10-01T13:05:00Z),1] | make-series n=count() on t step 1h";
++        var result = await Result(q);
++        var row = result.GetRow(0).ToArray();
++        Squash(row[0]?.ToString() ?? "").Should().Be("[2,0,0,1]");
++        var axis = row[1]?.ToString() ?? "";
++        axis.Should().Contain("2026-10-01T10:00:00.0000000Z").And.Contain("2026-10-01T13:00:00.0000000Z")
++            .And.NotContain("2026-10-01T14:00");
++    }
++
++    [TestMethod]
++    public async Task MakeSeries_OmittedFromTo_WithBy_SharesOneAxis()
++    {
++        // The range comes from the whole input, so every group's series has the same length and axis.
++        var q = "datatable(t:datetime, k:string)[datetime(2026-10-01T00:10:00Z),'a', datetime(2026-10-01T02:10:00Z),'b'] " +
++                "| make-series n=count() default=0 on t step 1h by k | order by k asc";
++        var result = await ResultAsString(q, ";");
++        Squash(result).Should().Contain("a,[1,0,0]").And.Contain("b,[0,0,1]");
++    }
++
++    [TestMethod]
++    public async Task MakeSeries_OnlyFromGiven_EndsAfterTheLastData()
++    {
++        var q = "datatable(x:long, v:long)[3,1, 7,1] | make-series n=count() on x from 0 step 2";
++        var result = await Result(q);
++        Squash(result.GetRow(0)[0]?.ToString() ?? "").Should().Be("[0,1,0,1]");
++    }
++
++    [TestMethod]
++    public async Task MakeSeries_OmittedRange_EmptyInput_NoRows()
++    {
++        var q = "datatable(t:datetime, v:long)[] | make-series n=count() on t step 1h";
++        var result = await Result(q);
++        result.RowCount.Should().Be(0);
++    }
+ }

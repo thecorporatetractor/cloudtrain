@@ -4,7 +4,7 @@
 # Usage: load.sh [name...]     default: all
 #   kubeadm-node | kubeadm-upgrade | etcd-host   containerDisks -> nodes that run VMs
 #   jumphost, linux-pod-el, linux-pod-deb, mirror,
-#   iac-ws-terraform, iac-ws-tofu, ansible-ctl   -> every node
+#   iac-ws-terraform, iac-ws-tofu, ansible-ctl, kql-ws -> every node
 #   el-vm | ubuntu-vm | docker-vm                containerDisks -> nodes that run VMs
 #   workloads                                    lab workload images (tools/images/lock/
 #                                                workloads.lock) -> every node, for
@@ -90,6 +90,8 @@ for t in "${targets[@]}"; do
                      load_docker_image "${IAC_WS_IMAGE_REPO}:1.15-tofu" $ALL_NODES ;;
     ansible-ctl)     # shellcheck disable=SC2086
                      load_docker_image "$ANSIBLE_CTL_IMAGE" $ALL_NODES ;;
-    *) die "unknown image '$t' (kubeadm-node | kubeadm-upgrade | kubeadm-full | etcd-host | jumphost | workloads | linux-pod-el | linux-pod-deb | el-vm | ubuntu-vm | docker-vm | mirror | iac-ws-terraform | iac-ws-tofu | ansible-ctl)" ;;
+    kql-ws)          # shellcheck disable=SC2086
+                     load_docker_image "$KQL_WS_IMAGE" $ALL_NODES ;;
+    *) die "unknown image '$t' (kubeadm-node | kubeadm-upgrade | kubeadm-full | etcd-host | jumphost | workloads | linux-pod-el | linux-pod-deb | el-vm | ubuntu-vm | docker-vm | mirror | iac-ws-terraform | iac-ws-tofu | ansible-ctl | kql-ws)" ;;
   esac
 done

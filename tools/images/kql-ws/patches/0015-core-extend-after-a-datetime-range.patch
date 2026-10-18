@@ -1,0 +1,65 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: thecorporatetractor <marco@azarguard.com>
+Date: Sun, 18 Oct 2026 18:04:19 +0300
+Subject: [PATCH 15/16] core: extend after a datetime range
+
+The range translator replaced the result column with a new datetime column
+symbol whenever the range was over datetimes, to work around the binder
+reporting an unknown type. When the binder does type the column as datetime,
+later operators (extend, project) refer to the binder's symbol, which the
+range result no longer contains, and failed with 'referencedColumnIndex'.
+Replace the symbol only when the binder did not type it as datetime.
+---
+ .../Translation/IRTranslator.Range.cs         |  6 ++++-
+ test/BasicTests/RangeDateTimeTests.cs         | 25 +++++++++++++++++++
+ 2 files changed, 30 insertions(+), 1 deletion(-)
+ create mode 100644 test/BasicTests/RangeDateTimeTests.cs
+
+diff --git a/libraries/KustoLoco.Core/InternalRepresentation/Translation/IRTranslator.Range.cs b/libraries/KustoLoco.Core/InternalRepresentation/Translation/IRTranslator.Range.cs
+index 64c2276c..4b1e51ce 100644
+--- a/libraries/KustoLoco.Core/InternalRepresentation/Translation/IRTranslator.Range.cs
++++ b/libraries/KustoLoco.Core/InternalRepresentation/Translation/IRTranslator.Range.cs
+@@ -23,7 +23,11 @@ internal partial class IRTranslator
+         //for some reason the parser thinks datetime ranges have 
+         //resultkind unknown
+ 
+-        if (irFromExpression.ResultType.Name == ScalarTypes.DateTime.Name)
++        // Only then: replacing a column the binder did type as datetime leaves later
++        // operators referring to a symbol the range result no longer has (extend after a
++        // datetime range failed with 'referencedColumnIndex').
++        if (irFromExpression.ResultType.Name == ScalarTypes.DateTime.Name &&
++            ((TableSymbol)node.ResultType).Columns.First().Type != ScalarTypes.DateTime)
+         {
+             var colName = ((TableSymbol)node.ResultType).Columns.First().Name;
+             resultType = new TableSymbol("", new ColumnSymbol(colName, ScalarTypes.DateTime));
+diff --git a/test/BasicTests/RangeDateTimeTests.cs b/test/BasicTests/RangeDateTimeTests.cs
+new file mode 100644
+index 00000000..235c40f3
+--- /dev/null
++++ b/test/BasicTests/RangeDateTimeTests.cs
+@@ -0,0 +1,25 @@
++﻿using AwesomeAssertions;
++
++namespace BasicTests;
++
++[TestClass]
++public class RangeDateTimeTests : TestMethods
++{
++    [TestMethod]
++    public async Task ExtendAfterADateTimeRange()
++    {
++        var result = await LastLineOfResult(
++            "range t from datetime(2026-10-01) to datetime(2026-10-02) step 1h | extend h = hourofday(t) | summarize count(), max(h)");
++        result.Should().Be("25,23");
++    }
++
++    [TestMethod]
++    public async Task MakeSeriesOverADateTimeRange()
++    {
++        var result = await LastLineOfResult(
++            "range t from datetime(2026-10-01) to datetime(2026-10-02) step 1h | extend n = iff(hourofday(t) == 15, 40, 3) " +
++            "| make-series c=sum(n) default=0 on t step 1h | extend (f, s, b) = series_decompose_anomalies(c) " +
++            "| mv-expand t to typeof(datetime), f to typeof(int) | where f == 1 | project h=hourofday(t)");
++        result.Should().Be("15");
++    }
++}

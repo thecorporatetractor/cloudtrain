@@ -1,0 +1,671 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: thecorporatetractor <marco@azarguard.com>
+Date: Sun, 18 Oct 2026 17:42:02 +0300
+Subject: [PATCH 14/16] core: add evaluate bag_unpack
+
+evaluate bag_unpack(Column [, OutputColumnPrefix] [, columnsConflict])
+[: (schema)]
+
+One output column per bag property, named OutputColumnPrefix + key, after the
+input's other columns; the source column is removed. Without a schema the
+unpacked columns are dynamic (as in Kusto) and ordered by first appearance
+of their key across rows. With a schema clause the output is exactly the
+listed columns: input columns by name, the rest from the bag property
+(prefix stripped) converted to the declared type; missing ones are null.
+columnsConflict: 'error' (default) fails when a key matches an existing
+column, 'replace_source' takes the bag value where the bag has the key,
+'keep_source' keeps the input value.
+
+The output schema depends on the data, which Kusto.Language cannot know: it
+types the operator as its input minus the bag column and later references
+to unpacked columns as unknown. So before translation BabyKustoEngine runs
+a discovery query for each bag_unpack without a schema (the pipe's input,
+after the statements before it, projected to the bag's keys), rewrites the
+query text with an explicit schema clause and parses it again. Everything
+after the plugin then binds against real columns.
+
+The evaluate dispatch moves to IRTranslator.Evaluate.cs (a switch over the
+plugin name); ipv4_lookup/ipv6_lookup are unchanged.
+
+Limits: the input is evaluated twice (discovery + query); the input must be
+self-contained (no parameters of an enclosing user-defined function);
+Kusto.Language binds only two positional arguments, so ignoredProperties
+cannot be passed (the evaluator supports it if a later Kusto.Language does);
+the bag argument must be a column (Kusto's rule), e.g. extend b =
+parse_json(s) | evaluate bag_unpack(b).
+---
+ libraries/KustoLoco.Core/BabyKustoEngine.cs   |  51 ++++--
+ .../TreeEvaluator.QueryOperators.BagUnpack.cs | 103 +++++++++++
+ .../DefaultIRNodeVisitor.cs                   |   3 +
+ .../InternalRepresentation/IRNodeVisitor.cs   |   1 +
+ .../QueryOperators/IRBagUnpackOperatorNode.cs |  53 ++++++
+ .../Translation/BagUnpackSchema.cs            | 161 ++++++++++++++++++
+ .../Translation/IRTranslator.BagUnpack.cs     |  31 ++++
+ .../Translation/IRTranslator.Evaluate.cs      |  22 +++
+ .../Translation/IRTranslator.IpLookup.cs      |   7 +-
+ test/BasicTests/BagUnpackTests.cs             |  94 ++++++++++
+ 10 files changed, 509 insertions(+), 17 deletions(-)
+ create mode 100644 libraries/KustoLoco.Core/Evaluation/TreeEvaluator.QueryOperators.BagUnpack.cs
+ create mode 100644 libraries/KustoLoco.Core/InternalRepresentation/Nodes/Expressions/QueryOperators/IRBagUnpackOperatorNode.cs
+ create mode 100644 libraries/KustoLoco.Core/InternalRepresentation/Translation/BagUnpackSchema.cs
+ create mode 100644 libraries/KustoLoco.Core/InternalRepresentation/Translation/IRTranslator.BagUnpack.cs
+ create mode 100644 libraries/KustoLoco.Core/InternalRepresentation/Translation/IRTranslator.Evaluate.cs
+ create mode 100644 test/BasicTests/BagUnpackTests.cs
+
+diff --git a/libraries/KustoLoco.Core/BabyKustoEngine.cs b/libraries/KustoLoco.Core/BabyKustoEngine.cs
+index ed4eaf00..9bce48e2 100644
+--- a/libraries/KustoLoco.Core/BabyKustoEngine.cs
++++ b/libraries/KustoLoco.Core/BabyKustoEngine.cs
+@@ -130,6 +130,34 @@ public class BabyKustoEngine
+         var visualizer = new IrNodeVisualizer(_console);
+         visualizer.DumpKustoTree(code, dumpKustoTree);
+ 
++        ThrowOnDiagnostics(code, query);
++
++        // evaluate bag_unpack without an output schema: discover the columns from the data and
++        // rewrite the query with an explicit schema (see BagUnpackSchema)
++        for (var pass = 0; BagUnpackSchema.FirstUnresolved(code) is { } unresolved; pass++)
++        {
++            if (pass >= 32)
++                throw new InvalidOperationException("bag_unpack: too many nested schema discoveries");
++            query = BagUnpackSchema.Rewrite(query, unresolved, q => FirstColumnValues(Evaluate(tables, q)));
++            code = Parse(tables, query);
++            ThrowOnDiagnostics(code, query);
++        }
++
++        var irVisitor = new IRTranslator(GetAllFunctions(), code.Globals);
++
++        var ir = code.Syntax.Accept(irVisitor);
++
++        visualizer.DumpIRTree(ir, dumpIRTree);
++
++        var scope = new LocalScope();
++        foreach (var table in tables) scope.AddSymbol(table.Type, TabularResult.CreateUnvisualized(table));
++
++        var result = BabyKustoEvaluator.Evaluate(ir, scope, _providers);
++        return result;
++    }
++
++    private static void ThrowOnDiagnostics(KustoCode code, string query)
++    {
+         // Warnings that only describe a legal, well-defined behaviour do not stop the query:
+         // KS205 = a union isfuzzy=true name that resolves to no table (it is skipped).
+         var diagnostics = code.GetDiagnostics()
+@@ -162,19 +190,18 @@ public class BabyKustoEngine
+                    ">>>" + query.Substring(diag.Start, diag.Length) +
+                    "<<<" + query.Substring(diag.End);
+         }
++    }
+ 
+-
+-        var irVisitor = new IRTranslator(GetAllFunctions(), code.Globals);
+-
+-        var ir = code.Syntax.Accept(irVisitor);
+-
+-        visualizer.DumpIRTree(ir, dumpIRTree);
+-
+-        var scope = new LocalScope();
+-        foreach (var table in tables) scope.AddSymbol(table.Type, TabularResult.CreateUnvisualized(table));
+-
+-        var result = BabyKustoEvaluator.Evaluate(ir, scope, _providers);
+-        return result;
++    private static IReadOnlyList<string> FirstColumnValues(EvaluationResult result)
++    {
++        var values = new List<string>();
++        if (result is not TabularResult tabular)
++            return values;
++        foreach (var chunk in tabular.Value.GetData())
++            for (var i = 0; i < chunk.RowCount; i++)
++                if (chunk.Columns[0].GetRawDataValue(i) is { } v)
++                    values.Add(v.ToString()!);
++        return values;
+     }
+ 
+     private static readonly HashSet<string> IgnoredWarnings = ["KS205"];
+diff --git a/libraries/KustoLoco.Core/Evaluation/TreeEvaluator.QueryOperators.BagUnpack.cs b/libraries/KustoLoco.Core/Evaluation/TreeEvaluator.QueryOperators.BagUnpack.cs
+new file mode 100644
+index 00000000..97570fde
+--- /dev/null
++++ b/libraries/KustoLoco.Core/Evaluation/TreeEvaluator.QueryOperators.BagUnpack.cs
+@@ -0,0 +1,103 @@
++//
++// Licensed under the MIT License.
++
++using System;
++using System.Globalization;
++using System.Linq;
++using System.Text.Json.Nodes;
++using Kusto.Language.Symbols;
++using KustoLoco.Core.DataSource;
++using KustoLoco.Core.InternalRepresentation.Nodes.Expressions.QueryOperators;
++using KustoLoco.Core.Util;
++
++namespace KustoLoco.Core.Evaluation;
++
++internal partial class TreeEvaluator
++{
++    public override EvaluationResult VisitBagUnpackOperator(IRBagUnpackOperatorNode node, EvaluationContext context)
++    {
++        var source = context.Left.Value;
++        var sourceSchema = source.Type;
++        var resultSchema = (TableSymbol)node.ResultType;
++        var chunk = ChunkHelpers.Reassemble(source.GetData().ToArray());
++        var bags = ((ColumnarResult)node.Bag.Accept(this, context with { Chunk = chunk })).Column;
++
++        // per output column: the input column of that name (never the bag column itself unless the schema
++        // lists it) and the bag property it may come from
++        var plan = resultSchema.Columns.Select(c =>
++        {
++            var inputIdx = IndexOf(sourceSchema, c.Name);
++            var key = c.Name.StartsWith(node.Prefix, StringComparison.Ordinal)
++                ? c.Name.Substring(node.Prefix.Length)
++                : null;
++            if (key != null && node.IgnoredProperties.Contains(key))
++                key = null;
++            return (InputIdx: inputIdx, Key: key, c.Type);
++        }).ToArray();
++
++        var builders = ColumnHelpers.CreateBuildersForTable(resultSchema);
++        for (var row = 0; row < chunk.RowCount; row++)
++        {
++            var bag = bags.GetRawDataValue(row) as JsonObject;
++            for (var col = 0; col < plan.Length; col++)
++            {
++                var (inputIdx, key, type) = plan[col];
++                var inBag = key != null && bag != null && bag.ContainsKey(key);
++                object? value;
++                if (inputIdx >= 0 && inBag && !string.Equals(resultSchema.Columns[col].Name, node.SourceColumn))
++                {
++                    value = node.Conflict switch
++                    {
++                        BagUnpackConflict.ReplaceSource => ConvertBagValue(bag![key!], type),
++                        BagUnpackConflict.KeepSource => chunk.Columns[inputIdx].GetRawDataValue(row),
++                        _ => throw new InvalidOperationException(
++                            $"bag_unpack: property '{key}' conflicts with the existing column " +
++                            $"'{resultSchema.Columns[col].Name}' (use columnsConflict)")
++                    };
++                }
++                else if (inputIdx >= 0)
++                    value = chunk.Columns[inputIdx].GetRawDataValue(row);
++                else
++                    value = inBag ? ConvertBagValue(bag![key!], type) : null;
++
++                builders[col].Add(value);
++            }
++        }
++
++        var columns = builders.Select(b => b.ToColumn()).ToArray();
++        return TabularResult.CreateWithVisualisation(new InMemoryTableSource(resultSchema, columns),
++            context.Left.VisualizationState);
++    }
++
++    /// <summary>A bag property as a value of the output column's type (null when it does not convert).</summary>
++    private static object? ConvertBagValue(JsonNode? value, TypeSymbol type)
++    {
++        if (value == null)
++            return null;
++        if (type == ScalarTypes.Dynamic)
++            return value.DeepClone();
++        var text = value is JsonValue v && v.TryGetValue<string>(out var s) ? s : value.ToJsonString();
++        var inv = CultureInfo.InvariantCulture;
++        if (type == ScalarTypes.String)
++            return text;
++        if (type == ScalarTypes.Long)
++            return long.TryParse(text, NumberStyles.Integer, inv, out var l) ? l
++                : double.TryParse(text, NumberStyles.Float, inv, out var dl) ? (long)dl : null;
++        if (type == ScalarTypes.Int)
++            return int.TryParse(text, NumberStyles.Integer, inv, out var i) ? i : null;
++        if (type == ScalarTypes.Real)
++            return double.TryParse(text, NumberStyles.Float, inv, out var d) ? d : null;
++        if (type == ScalarTypes.Decimal)
++            return decimal.TryParse(text, NumberStyles.Float, inv, out var m) ? m : null;
++        if (type == ScalarTypes.Bool)
++            return bool.TryParse(text, out var b) ? b : null;
++        if (type == ScalarTypes.DateTime)
++            return DateTime.TryParse(text, inv, DateTimeStyles.AdjustToUniversal | DateTimeStyles.AssumeUniversal,
++                out var t) ? t : null;
++        if (type == ScalarTypes.TimeSpan)
++            return TimeSpan.TryParse(text, inv, out var ts) ? ts : null;
++        if (type == ScalarTypes.Guid)
++            return Guid.TryParse(text, out var g) ? g : null;
++        return null;
++    }
++}
+diff --git a/libraries/KustoLoco.Core/InternalRepresentation/DefaultIRNodeVisitor.cs b/libraries/KustoLoco.Core/InternalRepresentation/DefaultIRNodeVisitor.cs
+index fb1119e5..b299cda4 100644
+--- a/libraries/KustoLoco.Core/InternalRepresentation/DefaultIRNodeVisitor.cs
++++ b/libraries/KustoLoco.Core/InternalRepresentation/DefaultIRNodeVisitor.cs
+@@ -144,4 +144,7 @@ internal abstract class DefaultIRNodeVisitor<TResult, TContext> : IRNodeVisitor<
+     public override TResult VisitIpLookupOperator(IRIpLookupOperatorNode node, TContext context) =>
+         DefaultVisit(node, context);
+ 
++    public override TResult VisitBagUnpackOperator(IRBagUnpackOperatorNode node, TContext context) =>
++        DefaultVisit(node, context);
++
+ }
+diff --git a/libraries/KustoLoco.Core/InternalRepresentation/IRNodeVisitor.cs b/libraries/KustoLoco.Core/InternalRepresentation/IRNodeVisitor.cs
+index 0c8fa95b..c7aee549 100644
+--- a/libraries/KustoLoco.Core/InternalRepresentation/IRNodeVisitor.cs
++++ b/libraries/KustoLoco.Core/InternalRepresentation/IRNodeVisitor.cs
+@@ -54,5 +54,6 @@ internal abstract class IRNodeVisitor<TResult, TContext>
+     public abstract TResult VisitExternalDataExpression(IRExternalDataExpression node, TContext context);
+     public abstract TResult VisitMakeSeriesOperator(IRMakeSeriesOperatorNode node, TContext context);
+     public abstract TResult VisitIpLookupOperator(IRIpLookupOperatorNode node, TContext context);
++    public abstract TResult VisitBagUnpackOperator(IRBagUnpackOperatorNode node, TContext context);
+ 
+ }
+diff --git a/libraries/KustoLoco.Core/InternalRepresentation/Nodes/Expressions/QueryOperators/IRBagUnpackOperatorNode.cs b/libraries/KustoLoco.Core/InternalRepresentation/Nodes/Expressions/QueryOperators/IRBagUnpackOperatorNode.cs
+new file mode 100644
+index 00000000..21445117
+--- /dev/null
++++ b/libraries/KustoLoco.Core/InternalRepresentation/Nodes/Expressions/QueryOperators/IRBagUnpackOperatorNode.cs
+@@ -0,0 +1,53 @@
++//
++// Licensed under the MIT License.
++
++using System;
++using System.Collections.Generic;
++using Kusto.Language.Symbols;
++
++namespace KustoLoco.Core.InternalRepresentation.Nodes.Expressions.QueryOperators;
++
++internal enum BagUnpackConflict
++{
++    Error,
++    ReplaceSource,
++    KeepSource
++}
++
++// evaluate bag_unpack(Column [, OutputColumnPrefix] [, columnsConflict] [, ignoredProperties]) : (schema)
++// The output schema (ResultType) is always explicit by the time it reaches the IR: either written by the user or
++// discovered from the data before translation (see BagUnpackSchema). Each output column is filled from the input
++// column of the same name, or from the bag property named (column name minus prefix).
++internal class IRBagUnpackOperatorNode : IRQueryOperatorNode
++{
++    public IRBagUnpackOperatorNode(IRExpressionNode bag, string? sourceColumn, string prefix,
++        BagUnpackConflict conflict, IReadOnlySet<string> ignoredProperties, TypeSymbol resultType)
++        : base(resultType)
++    {
++        Bag = bag ?? throw new ArgumentNullException(nameof(bag));
++        SourceColumn = sourceColumn;
++        Prefix = prefix;
++        Conflict = conflict;
++        IgnoredProperties = ignoredProperties;
++    }
++
++    public IRExpressionNode Bag { get; }
++
++    /// The input column holding the bag (null when the bag is an expression); it is not copied to the output
++    /// unless the output schema lists it.
++    public string? SourceColumn { get; }
++
++    public string Prefix { get; }
++    public BagUnpackConflict Conflict { get; }
++    public IReadOnlySet<string> IgnoredProperties { get; }
++
++    public override int ChildCount => 1;
++
++    public override IRNode GetChild(int index) =>
++        index == 0 ? Bag : throw new ArgumentOutOfRangeException(nameof(index));
++
++    public override TResult Accept<TResult, TContext>(IRNodeVisitor<TResult, TContext> visitor, TContext context)
++        => visitor.VisitBagUnpackOperator(this, context);
++
++    public override string ToString() => $"BagUnpackOperator: {SchemaDisplay.GetText(ResultType)}";
++}
+diff --git a/libraries/KustoLoco.Core/InternalRepresentation/Translation/BagUnpackSchema.cs b/libraries/KustoLoco.Core/InternalRepresentation/Translation/BagUnpackSchema.cs
+new file mode 100644
+index 00000000..115f0642
+--- /dev/null
++++ b/libraries/KustoLoco.Core/InternalRepresentation/Translation/BagUnpackSchema.cs
+@@ -0,0 +1,161 @@
++//
++// Licensed under the MIT License.
++
++using System;
++using System.Collections.Generic;
++using System.Linq;
++using System.Text;
++using System.Text.Json;
++using System.Text.Json.Nodes;
++using Kusto.Language;
++using Kusto.Language.Symbols;
++using Kusto.Language.Syntax;
++using KustoLoco.Core.InternalRepresentation.Nodes.Expressions.QueryOperators;
++
++namespace KustoLoco.Core.InternalRepresentation;
++
++/// <summary>The arguments of bag_unpack(Column [, OutputColumnPrefix] [, columnsConflict] [, ignoredProperties]).</summary>
++internal record BagUnpackArguments(
++    Expression Bag,
++    string Prefix,
++    BagUnpackConflict Conflict,
++    IReadOnlySet<string> IgnoredProperties)
++{
++    public static bool IsBagUnpack(EvaluateOperator node) =>
++        string.Equals(node.FunctionCall.Name.SimpleName, "bag_unpack", StringComparison.OrdinalIgnoreCase);
++
++    public static BagUnpackArguments Parse(FunctionCallExpression call)
++    {
++        var args = call.ArgumentList.Expressions.Select(e => e.Element).ToArray();
++        if (args.Length == 0)
++            throw new InvalidOperationException("bag_unpack requires the column to unpack");
++        var prefix = "";
++        var conflict = BagUnpackConflict.Error;
++        var ignored = new HashSet<string>();
++        var positional = 0;
++        foreach (var arg in args.Skip(1))
++        {
++            var (name, value) = arg is SimpleNamedExpression named
++                ? (named.Name.SimpleName.ToLowerInvariant(), named.Expression)
++                : (positional++ switch { 0 => "outputcolumnprefix", 1 => "columnsconflict", _ => "ignoredproperties" }, arg);
++            switch (name)
++            {
++                case "outputcolumnprefix":
++                    prefix = value.ConstantValue as string ?? value.LiteralValue as string ?? "";
++                    break;
++                case "columnsconflict":
++                    conflict = (value.ConstantValue as string ?? value.LiteralValue as string) switch
++                    {
++                        "replace_source" => BagUnpackConflict.ReplaceSource,
++                        "keep_source" => BagUnpackConflict.KeepSource,
++                        "error" or null => BagUnpackConflict.Error,
++                        var other => throw new InvalidOperationException(
++                            $"bag_unpack: unknown columnsConflict '{other}' (error, replace_source, keep_source)")
++                    };
++                    break;
++                case "ignoredproperties":
++                    foreach (var p in ParseStringArray(value))
++                        ignored.Add(p);
++                    break;
++                default:
++                    throw new InvalidOperationException($"bag_unpack: unknown argument '{name}'");
++            }
++        }
++
++        return new BagUnpackArguments(args[0], prefix, conflict, ignored);
++    }
++
++    private static IEnumerable<string> ParseStringArray(Expression e)
++    {
++        var text = e is DynamicExpression d ? d.LiteralValue as string ?? "" : e.ToString().Trim();
++        JsonNode? node;
++        try
++        {
++            node = JsonNode.Parse(text);
++        }
++        catch (JsonException)
++        {
++            // Kusto accepts single-quoted strings in dynamic literals
++            node = JsonNode.Parse(text.Replace('\'', '"'));
++        }
++
++        return node is JsonArray a ? a.Select(x => x?.ToString() ?? "") : [];
++    }
++}
++
++/// <summary>
++///     Schema discovery for `evaluate bag_unpack` without an output schema.
++/// </summary>
++/// <remarks>
++///     The plugin's output columns depend on the data (one per bag key), which Kusto.Language cannot know: it
++///     types the operator as its input minus the bag column and types later references to unpacked columns as
++///     `unknown`. Before translation, every bag_unpack without a schema clause is therefore resolved: its input
++///     (the pipe's left side, with the statements before it) is run with the bag column projected, the keys are
++///     collected in order of first appearance, and the query text is rewritten with an explicit schema clause
++///     `: (input columns..., prefix+key:dynamic, ...)`. The rewritten query is parsed again, so everything after
++///     the plugin binds against real columns. Unpacked columns are dynamic, as in Kusto.
++///     Limits: the input must be expressible on its own (it cannot reference parameters of an enclosing
++///     user-defined function); the input is evaluated twice.
++/// </remarks>
++internal static class BagUnpackSchema
++{
++    public static EvaluateOperator? FirstUnresolved(KustoCode code) =>
++        code.Syntax.GetDescendants<EvaluateOperator>(e => e.Schema == null && BagUnpackArguments.IsBagUnpack(e))
++            .FirstOrDefault();
++
++    /// <param name="runKeys">runs a discovery query and returns the values of its single string column</param>
++    public static string Rewrite(string query, EvaluateOperator node, Func<string, IReadOnlyList<string>> runKeys)
++    {
++        if (node.Parent is not PipeExpression pipe || pipe.Operator != node)
++            throw new InvalidOperationException("evaluate bag_unpack must be applied to a piped input");
++        var args = BagUnpackArguments.Parse(node.FunctionCall);
++
++        // statements before the one containing the plugin (let definitions the input may use)
++        var statement = node.GetFirstAncestor<Statement>(_ => true);
++        var block = node.GetFirstAncestor<QueryBlock>(_ => true);
++        var prior = new StringBuilder();
++        if (block != null && statement != null)
++            foreach (var s in block.Statements.Select(se => se.Element))
++            {
++                if (s == statement)
++                    break;
++                prior.Append(s.ToString(IncludeTrivia.Minimal)).Append(";\n");
++            }
++
++        var discovery =
++            $"{prior}{pipe.Expression.ToString(IncludeTrivia.Minimal)}\n" +
++            $"| project __kl_bag = {args.Bag.ToString(IncludeTrivia.Minimal)}\n" +
++            "| serialize __kl_row = row_number()\n" +
++            "| mv-expand __kl_key = bag_keys(__kl_bag) to typeof(string)\n" +
++            "| where isnotempty(__kl_key)\n" +
++            "| summarize __kl_first = min(__kl_row) by __kl_key\n" +
++            "| order by __kl_first asc\n" +
++            "| project __kl_key";
++        var keys = runKeys(discovery);
++
++        // the plugin's input columns (Kusto.Language already removed the bag column)
++        var inputColumns = ((TableSymbol)node.FunctionCall.ResultType).Columns.ToList();
++        var names = inputColumns.Select(c => c.Name).ToHashSet();
++        var columns = inputColumns.Select(c => (c.Name, Type: c.Type.Name)).ToList();
++        foreach (var key in keys.Where(k => !args.IgnoredProperties.Contains(k)))
++        {
++            var name = args.Prefix + key;
++            if (names.Contains(name))
++            {
++                if (args.Conflict == BagUnpackConflict.Error)
++                    throw new InvalidOperationException(
++                        $"bag_unpack: property '{key}' conflicts with the existing column '{name}' " +
++                        "(use columnsConflict='replace_source' or 'keep_source', or an OutputColumnPrefix)");
++                continue; // the existing column stays where it is; the evaluator picks the value
++            }
++
++            names.Add(name);
++            columns.Add((name, "dynamic"));
++        }
++
++        var schema = " : (" + string.Join(", ",
++            columns.Select(c => $"['{c.Name.Replace("\\", "\\\\").Replace("'", "\\'")}']:{c.Type}")) + ")";
++        var at = node.FunctionCall.End;
++        return query.Substring(0, at) + schema + query.Substring(at);
++    }
++}
+diff --git a/libraries/KustoLoco.Core/InternalRepresentation/Translation/IRTranslator.BagUnpack.cs b/libraries/KustoLoco.Core/InternalRepresentation/Translation/IRTranslator.BagUnpack.cs
+new file mode 100644
+index 00000000..309bde42
+--- /dev/null
++++ b/libraries/KustoLoco.Core/InternalRepresentation/Translation/IRTranslator.BagUnpack.cs
+@@ -0,0 +1,31 @@
++//
++// Licensed under the MIT License.
++
++using System;
++using Kusto.Language.Syntax;
++using KustoLoco.Core.InternalRepresentation.Nodes.Expressions;
++using KustoLoco.Core.InternalRepresentation.Nodes.Expressions.QueryOperators;
++
++namespace KustoLoco.Core.InternalRepresentation;
++
++internal partial class IRTranslator
++{
++    /// <summary>
++    ///     evaluate bag_unpack(Column [, OutputColumnPrefix] [, columnsConflict] [, ignoredProperties]) : (schema)
++    /// </summary>
++    /// <remarks>
++    ///     The schema clause is required here: a query without one has been rewritten with the discovered
++    ///     schema before translation (BagUnpackSchema), so node.ResultType is the real output schema.
++    /// </remarks>
++    private IRNode TranslateBagUnpack(EvaluateOperator node)
++    {
++        if (node.Schema == null)
++            throw new InvalidOperationException(
++                "bag_unpack: the output schema was not resolved (run the query through KustoQueryContext)");
++        var args = BagUnpackArguments.Parse(node.FunctionCall);
++        var bag = (IRExpressionNode)args.Bag.Accept(this);
++        var sourceColumn = args.Bag is NameReference nr ? nr.SimpleName : null;
++        return new IRBagUnpackOperatorNode(bag, sourceColumn, args.Prefix, args.Conflict, args.IgnoredProperties,
++            node.ResultType);
++    }
++}
+diff --git a/libraries/KustoLoco.Core/InternalRepresentation/Translation/IRTranslator.Evaluate.cs b/libraries/KustoLoco.Core/InternalRepresentation/Translation/IRTranslator.Evaluate.cs
+new file mode 100644
+index 00000000..c72ad47b
+--- /dev/null
++++ b/libraries/KustoLoco.Core/InternalRepresentation/Translation/IRTranslator.Evaluate.cs
+@@ -0,0 +1,22 @@
++//
++// Licensed under the MIT License.
++
++using System;
++using Kusto.Language.Syntax;
++
++namespace KustoLoco.Core.InternalRepresentation;
++
++internal partial class IRTranslator
++{
++    /// <summary>Dispatches `evaluate plugin(...)` to the plugin's translation.</summary>
++    public override IRNode VisitEvaluateOperator(EvaluateOperator node)
++    {
++        var pluginName = node.FunctionCall.Name.SimpleName;
++        return pluginName.ToLowerInvariant() switch
++        {
++            "ipv4_lookup" or "ipv6_lookup" => TranslateIpLookup(node, pluginName),
++            "bag_unpack" => TranslateBagUnpack(node),
++            _ => throw new NotImplementedException($"evaluate plugin '{pluginName}' is not supported.")
++        };
++    }
++}
+diff --git a/libraries/KustoLoco.Core/InternalRepresentation/Translation/IRTranslator.IpLookup.cs b/libraries/KustoLoco.Core/InternalRepresentation/Translation/IRTranslator.IpLookup.cs
+index 1cbdb69d..c386cef0 100644
+--- a/libraries/KustoLoco.Core/InternalRepresentation/Translation/IRTranslator.IpLookup.cs
++++ b/libraries/KustoLoco.Core/InternalRepresentation/Translation/IRTranslator.IpLookup.cs
+@@ -1,4 +1,4 @@
+-//
++﻿//
+ // Licensed under the MIT License.
+ 
+ using System;
+@@ -11,12 +11,9 @@ namespace KustoLoco.Core.InternalRepresentation;
+ 
+ internal partial class IRTranslator
+ {
+-    public override IRNode VisitEvaluateOperator(EvaluateOperator node)
++    private IRNode TranslateIpLookup(EvaluateOperator node, string pluginName)
+     {
+-        var pluginName = node.FunctionCall.Name.SimpleName;
+         var isIpv6 = string.Equals(pluginName, "ipv6_lookup", StringComparison.OrdinalIgnoreCase);
+-        if (!isIpv6 && !string.Equals(pluginName, "ipv4_lookup", StringComparison.OrdinalIgnoreCase))
+-            throw new NotImplementedException($"evaluate plugin '{pluginName}' is not supported.");
+ 
+         // ipv4_lookup / ipv6_lookup (LookupTable, SourceIpKey, IpLookupKey [, ExtraKey1 .. ExtraKeyN]
+         // [, return_unmatched]) — identical argument shapes, so one translation serves both.
+diff --git a/test/BasicTests/BagUnpackTests.cs b/test/BasicTests/BagUnpackTests.cs
+new file mode 100644
+index 00000000..8c6d65d0
+--- /dev/null
++++ b/test/BasicTests/BagUnpackTests.cs
+@@ -0,0 +1,94 @@
++using AwesomeAssertions;
++
++namespace BasicTests;
++
++[TestClass]
++public class BagUnpackTests : TestMethods
++{
++    private const string Data =
++        "datatable(id:long, d:dynamic)[" +
++        "1, dynamic({\"os\":\"Windows 11\",\"browser\":\"Edge\"}), " +
++        "2, dynamic({\"os\":\"MacOs\",\"compliant\":true}), " +
++        "3, dynamic(null)]";
++
++    [TestMethod]
++    public async Task KeysFromAllRows_InOrderOfFirstAppearance()
++    {
++        var result = await Result(Data + " | evaluate bag_unpack(d)");
++        result.Error.Should().BeEmpty();
++        string.Join(",", result.ColumnNames()).Should().Be("id,os,browser,compliant");
++        var rows = await ResultAsString(Data + " | evaluate bag_unpack(d)", ";");
++        rows.Should().Be("1,Windows 11,Edge,<null>;2,MacOs,<null>,true;3,<null>,<null>,<null>");
++    }
++
++    [TestMethod]
++    public async Task UnpackedColumnsAreUsableDownstream()
++    {
++        var result = await ResultAsString(
++            Data + " | evaluate bag_unpack(d) | where tostring(os) startswith 'Win' | project id, browser");
++        result.Should().Be("1,Edge");
++    }
++
++    [TestMethod]
++    public async Task Prefix()
++    {
++        var result = await Result(Data + " | evaluate bag_unpack(d, 'dev_') | project id, dev_os");
++        result.Error.Should().BeEmpty();
++        (await ResultAsString(Data + " | evaluate bag_unpack(d, 'dev_') | project id, dev_os", ";"))
++            .Should().Be("1,Windows 11;2,MacOs;3,<null>");
++    }
++
++    private const string Conflicting =
++        "datatable(os:string, d:dynamic)['input', dynamic({\"os\":\"bag\",\"x\":1}), 'only', dynamic({\"x\":2})]";
++
++    [TestMethod]
++    public async Task Conflict_ErrorByDefault()
++    {
++        var result = await Result(Conflicting + " | evaluate bag_unpack(d)");
++        result.Error.Should().Contain("conflicts");
++    }
++
++    [TestMethod]
++    public async Task Conflict_ReplaceSource()
++    {
++        var result = await ResultAsString(
++            Conflicting + " | evaluate bag_unpack(d, columnsConflict='replace_source') | project os, x", ";");
++        result.Should().Be("bag,1;only,2");
++    }
++
++    [TestMethod]
++    public async Task Conflict_KeepSource()
++    {
++        var result = await ResultAsString(
++            Conflicting + " | evaluate bag_unpack(d, columnsConflict='keep_source') | project os, x", ";");
++        result.Should().Be("input,1;only,2");
++    }
++
++    [TestMethod]
++    public async Task TypedSchema()
++    {
++        var query = "datatable(id:long, d:dynamic)[1, dynamic({\"n\":\"42\",\"name\":\"a\",\"extra\":1})]" +
++                    " | evaluate bag_unpack(d) : (id:long, name:string, n:long, absent:string)";
++        var result = await Result(query);
++        result.Error.Should().BeEmpty();
++        string.Join(",", result.ColumnNames()).Should().Be("id,name,n,absent");
++        (await ResultAsString(query + " | extend twice = n * 2", ";")).Should().Be("1,a,42,,84");
++    }
++
++    [TestMethod]
++    public async Task InputAfterLetStatements()
++    {
++        var query = "let t = " + Data + "; t | where id < 3 | evaluate bag_unpack(d) | summarize count() by tostring(os)";
++        var result = await Result(query);
++        result.Error.Should().BeEmpty();
++        result.RowCount.Should().Be(2);
++    }
++
++    [TestMethod]
++    public async Task ParsedJsonExpression()
++    {
++        // Kusto requires a column, so a parsed string is extended first
++        var query = "datatable(s:string)['{\"k\":\"v\"}'] | extend b = parse_json(s) | evaluate bag_unpack(b)";
++        (await ResultAsString(query)).Should().Be("{\"k\":\"v\"},v");
++    }
++}
