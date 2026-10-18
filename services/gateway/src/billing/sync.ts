@@ -23,7 +23,7 @@ export interface SyncOptions {
   log?: (line: string) => void;
 }
 
-const toStripeInterval = (i: 'monthly' | 'yearly') => (i === 'monthly' ? 'month' : 'year');
+const toStripeInterval = (i: 'monthly' | 'yearly'): 'month' | 'year' => (i === 'monthly' ? 'month' : 'year');
 
 export async function syncPlans(stripe: StripeApi, site: SiteConfig, opts: SyncOptions = {}): Promise<SyncAction[]> {
   const plans = site.plans;

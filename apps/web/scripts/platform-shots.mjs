@@ -135,7 +135,7 @@ const VIEWS = [
   ['exams', 'learner', '/exams', 'Exam simulations'],
   // Billing (Stripe test mode in the mock): the person's plan, then after a mock checkout; the org admin's plan with seats.
   ['account-billing', 'learner', '/account/billing', 'Plans for you'],
-  ['account-billing-subscribed', 'learner', '/account/billing', 'Plans for you', async (p) => (await p.getByRole('button', { name: 'Subscribe to Pro' }).click(), await p.getByText('Checkout complete').waitFor(), await p.getByText('Subscribed').waitFor(), await p.waitForTimeout(400))],
+  ['account-billing-subscribed', 'learner', '/account/billing', 'Plans for you', async (p) => (await p.getByRole('button', { name: 'Subscribe to Pro' }).click(), await p.getByText('Checkout complete').first().waitFor(), await p.getByText('Subscribed').first().waitFor(), await p.waitForTimeout(400))],
   ['admin-billing', 'org_admin', '/admin/billing', 'Organisation plans'],
   ['account-billing-phone', 'learner', '/account/billing', 'Plans for you', undefined, PHONE],
   ['dev-signin-banner', 'learner_impersonated', '/', 'Assignments due', async (p) => p.getByText('Dev sign-in as').waitFor()],
