@@ -52,17 +52,17 @@ if [[ -n $remote ]]; then
   # The remote clone is ours only if it carries the marker; never reuse another agent's directory.
   # shellcheck disable=SC2029 # expand locally on purpose
   ssh "$remote" "set -e
-    if [ -d '$dir' ] && [ ! -f '$dir/.run-local' ]; then echo 'run-local: $dir exists and is not a run-local clone; pass --slug' >&2; exit 3; fi
-    if [ ! -d '$dir/.git' ]; then git clone -q '$url' '$dir' && touch '$dir/.run-local'; fi
+    if [ -d '$dir' ] && [ ! -f '$dir/.git/run-local' ]; then echo 'run-local: $dir exists and is not a run-local clone; pass --slug' >&2; exit 3; fi
+    if [ ! -d '$dir/.git' ]; then git clone -q '$url' '$dir' && touch '$dir/.git/run-local'; fi
     cd '$dir' && git fetch -q origin main" || exit 2
   if [[ $mb != "$head" ]]; then
     git bundle create -q "$tmp/branch.bundle" HEAD "^$mb" || exit 2
-    rsync -q "$tmp/branch.bundle" "$remote:$dir/.run-local.bundle" || exit 2
+    rsync -q "$tmp/branch.bundle" "$remote:$dir/.git/run-local.bundle" || exit 2
     # shellcheck disable=SC2029
-    ssh "$remote" "cd '$dir' && git fetch -q .run-local.bundle +HEAD:refs/run-local/head && rm -f .run-local.bundle" || exit 2
+    ssh "$remote" "cd '$dir' && git fetch -q .git/run-local.bundle +HEAD:refs/run-local/head && rm -f .git/run-local.bundle" || exit 2
   fi
   # shellcheck disable=SC2029
-  ssh "$remote" "cd '$dir' && git checkout -qf --detach '$head' && git clean -qfd -e node_modules -e .run-local -e bin" || exit 2
+  ssh "$remote" "cd '$dir' && git checkout -qf --detach '$head' && git clean -qfd -e node_modules -e bin" || exit 2
   # Uncommitted work: modified and untracked files are copied, deleted files removed.
   git ls-files -z -m -o --exclude-standard >"$tmp/changed"
   git ls-files -z -d >"$tmp/deleted"
