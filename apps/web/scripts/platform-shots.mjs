@@ -103,7 +103,9 @@ const VIEWS = [
   ['catalog-public-phone', 'none', '/catalog', 'Everything you can practise', undefined, PHONE],
   ['catalog-path-public', 'none', '/catalog/paths/cks-readiness', 'Network policy and least privilege'],
   ['catalog-exam-public', 'none', '/catalog/exams/sim-k8s-admin', 'Objectives and weights'],
-  ['pricing', 'none', '/pricing', 'Plans are being finalised'],
+  ['pricing', 'none', '/pricing', 'Compare entitlements'],
+  ['pricing-yearly', 'none', '/pricing', 'Compare entitlements', async (p) => p.getByRole('radio', { name: 'Yearly' }).click()],
+  ['pricing-phone', 'none', '/pricing', 'Compare entitlements', undefined, PHONE],
   ['about', 'none', '/about', 'Why CloudTrain exists'],
   ['faq', 'none', '/faq', 'Frequently asked questions', async (p) => p.locator('details').first().click()],
   ['contact', 'none', '/contact', 'Talk to us'],
@@ -193,11 +195,16 @@ try {
   }
   if (!storage) {
     for (const theme of ['light', 'cream']) {
-      for (const [name, persona, url, waitFor] of [VIEWS.find((v) => v[0] === 'landing'), VIEWS.find((v) => v[0] === 'catalog-public'), VIEWS.find((v) => v[0] === 'sign-in'), VIEWS.find((v) => v[0] === 'team-dashboard'), VIEWS.find((v) => v[0] === 'cohort-board'), VIEWS.find((v) => v[0] === 'admin-users'), VIEWS.find((v) => v[0] === 'admin-sso')]) {
+      for (const [name, persona, url, waitFor] of [VIEWS.find((v) => v[0] === 'landing'), VIEWS.find((v) => v[0] === 'catalog-public'), VIEWS.find((v) => v[0] === 'pricing'), VIEWS.find((v) => v[0] === 'sign-in'), VIEWS.find((v) => v[0] === 'team-dashboard'), VIEWS.find((v) => v[0] === 'cohort-board'), VIEWS.find((v) => v[0] === 'admin-users'), VIEWS.find((v) => v[0] === 'admin-sso')]) {
         if (only?.length && !only.includes(name)) continue;
         const { ctx, page } = await session(theme, persona);
-        await open(page, url, waitFor);
-        await shot(page, `${name}-${theme}`);
+        try {
+          await open(page, url, waitFor);
+          await shot(page, `${name}-${theme}`);
+        } catch (e) {
+          console.log('FAILED', `${name}-${theme}`, e.message.split('\n')[0]);
+          failed = true;
+        }
         await ctx.close();
       }
     }

@@ -14,7 +14,7 @@ on it comes from one configuration file.
 | `/catalog` (+ `?domain=`, `?q=`, `?difficulty=`, `?maxMinutes=`, `?path=`) | Public read-only catalog: domains, paths, courses, labs and exam simulations from `content/` | The full catalog (same search params, so links keep working) |
 | `/catalog/paths/:id` | A path or course: sections, labs, alignment disclaimer, related paths | Same page, site layout, "Start lab" goes straight to the lab |
 | `/catalog/exams/:id` | An exam simulation: format, rules, objectives and weights, report contents, retake policy. Never the pool task ids | Same page, "Open in the app" |
-| `/pricing` | Pricing (plans arrive with the next schema version; until then the configured note and contact call to action) | Same |
+| `/pricing` | Pricing: the configured plans as cards with a monthly/yearly switch, an entitlement comparison, the placeholder note, the plan FAQ group and the alignment notice | Same; plan calls to action go to the billing pages |
 | `/about`, `/faq`, `/contact` | Configured copy | Same |
 | `/legal/terms`, `/legal/privacy` | Legal placeholders, marked as such until reviewed | Same |
 | `/sign-in` | Identity-first sign-in (unchanged) | Redirects to `returnTo` |
@@ -90,7 +90,34 @@ copies that `apps/web/scripts/readme-shots.mjs` refreshes.
 | `flags.showCatalog` | yes | Public catalog (off: visitors are asked to sign in) |
 | `flags.signupEnabled` | yes | Self-service sign-up (off: calls to action lead to sign-in or contact) |
 | `flags.showContactForm` | | Contact form (needs a backend; off shows the details only) |
-| `pricing.headline`, `pricing.intro`, `pricing.placeholderNote`, `pricing.contactCta` | | Pricing page copy while plans are placeholders |
+| `flags.checkoutEnabled` | | Self-service checkout for paid plans (needs the gateway's billing integration); off turns `checkout` calls to action into contact |
+| `pricing.headline`, `pricing.intro`, `pricing.placeholderNote`, `pricing.contactCta`, `pricing.faqGroup` | | Pricing page copy; `placeholderNote` is shown while any price is a placeholder; `faqGroup` names the FAQ group listed under the plans |
+| `plans` | | See below |
+
+### Plans
+
+Plans are data: the pricing page, the billing pages and the Stripe sync read them from
+here. Three shapes are supported, and the default file ships one of each with
+placeholder prices: `free`, `pro` (individual, monthly or yearly) and `team`
+(organisation, per seat).
+
+| Key | Required | Meaning |
+|---|---|---|
+| `plans.currency` | yes | ISO 4217 code; every `amount` is in its minor unit (cents) |
+| `plans.placeholder` | | Every price is a placeholder, not an offer (the page shows `pricing.placeholderNote`) |
+| `plans.taxNote`, `plans.billingNote` | | Small print under the cards |
+| `plans.items[].id`, `name`, `kind`, `description` | yes | `kind`: `free` (no price), `individual` (one person), `organisation` (per seat) |
+| `plans.items[].badge`, `highlight` | | Card label; at most one highlighted plan |
+| `plans.items[].prices.monthly`, `.yearly` | paid plans | `{ amount, lookupKey }`; the lookup key names the Stripe Price (`stripe:sync` creates or updates it) and must be unique |
+| `plans.items[].perSeat`, `minSeats`, `maxSeats` | | Organisation plans: price per seat and the allowed seat range |
+| `plans.items[].placeholderPrices` | | This plan's prices are placeholders |
+| `plans.items[].entitlements` | yes | `labHoursPerMonth` (integer or `unlimited`), `concurrentLabs`, `envTiers` (subset of `A B C K V N`), `examSimulationsPerMonth` (integer or `unlimited`), `ctfEvents` (boolean). Recorded and shown; not enforced yet |
+| `plans.items[].includes[]` | yes | Marketing bullets |
+| `plans.items[].cta` | yes | `{ label, action, to? }`; `signin` (sign in, or "Go to dashboard"), `checkout` (subscribe; contact while `flags.checkoutEnabled` is off), `contact` (`to`, default `/contact`) |
+
+`lab-verify` checks unique plan ids and lookup keys, that free plans have no price and paid
+plans have one, that per-seat pricing stays on organisation plans, and that placeholder
+prices come with `pricing.placeholderNote`.
 
 Internal links (`to` starting with `/`) must be website routes; `lab-verify --strict`
 (`tools/lab-verify/src/site.mjs`) checks that, the highlighted domains, the images and the
@@ -108,6 +135,7 @@ footer repeats `legal.alignmentNotice` on every page.
 
 `apps/web/scripts/platform-shots.mjs` captures `landing` (+ `-phone`, `-tablet`, light and
 cream), `site-menu-phone`, `catalog-public` (+ `-domain`, `-phone`, light and cream),
-`catalog-path-public`, `catalog-exam-public`, `pricing`, `about`, `faq`, `contact`,
-`legal-terms` and `site-signed-in`; `readme-shots.mjs` adds `docs/images/landing.png`,
-`catalog-public.png` and `catalog-path-public.png` and refreshes `apps/web/public/site/`.
+`catalog-path-public`, `catalog-exam-public`, `pricing` (+ `-yearly`, `-phone`, light and
+cream), `about`, `faq`, `contact`, `legal-terms` and `site-signed-in`; `readme-shots.mjs`
+adds `docs/images/landing.png`, `catalog-public.png`, `catalog-path-public.png` and
+`pricing.png` and refreshes `apps/web/public/site/`.

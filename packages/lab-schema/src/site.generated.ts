@@ -1115,9 +1115,13 @@ export interface Site {
      * Contact form on the contact page (needs a backend); off shows the contact details only.
      */
     showContactForm?: boolean;
+    /**
+     * Self-service checkout for paid plans (needs the gateway's billing integration, CT_BILLING_ENABLED). Off: paid-plan calls to action lead to contact.
+     */
+    checkoutEnabled?: boolean;
   };
   /**
-   * Pricing page copy. Plans arrive in a later schema version.
+   * Pricing page copy around the plans.
    */
   pricing?: {
     headline?: string;
@@ -1127,6 +1131,39 @@ export interface Site {
      */
     placeholderNote?: string;
     contactCta?: Cta;
+    /**
+     * FAQ group shown under the plans (entries of `faq` with this `group`).
+     */
+    faqGroup?: string;
+  };
+  /**
+   * Plans shown on the pricing page and used by billing (Stripe Products and Prices are created from them by lookup key). Three shapes: free, individual (monthly/yearly) and organisation (per seat).
+   */
+  plans?: {
+    /**
+     * ISO 4217 code; amounts are in the currency's minor unit (cents).
+     */
+    currency: string;
+    /**
+     * Every price is a placeholder, not an offer; the page says so.
+     */
+    placeholder?: boolean;
+    /**
+     * E.g. 'Prices exclude VAT.'
+     */
+    taxNote?: string;
+    billingNote?: string;
+    /**
+     * @minItems 1
+     * @maxItems 6
+     */
+    items:
+      | [Plan]
+      | [Plan, Plan]
+      | [Plan, Plan, Plan]
+      | [Plan, Plan, Plan, Plan]
+      | [Plan, Plan, Plan, Plan, Plan]
+      | [Plan, Plan, Plan, Plan, Plan, Plan];
   };
 }
 /**
@@ -1509,4 +1546,115 @@ export interface LegalDocument {
  */
 export interface TokenMap {
   [k: string]: string;
+}
+/**
+ * This interface was referenced by `Site`'s JSON-Schema
+ * via the `definition` "plan".
+ */
+export interface Plan {
+  id: string;
+  name: string;
+  /**
+   * free: no price; individual: one person, monthly or yearly; organisation: per seat, monthly or yearly.
+   */
+  kind: "free" | "individual" | "organisation";
+  description: string;
+  /**
+   * Small label on the card, e.g. 'Most popular'.
+   */
+  badge?: string;
+  /**
+   * Emphasised card (at most one plan).
+   */
+  highlight?: boolean;
+  /**
+   * Required for paid plans; absent for free.
+   */
+  prices?: {
+    monthly?: Price;
+    yearly?: Price;
+  };
+  /**
+   * Organisation plans: the price is per seat and the buyer picks a seat count.
+   */
+  perSeat?: boolean;
+  minSeats?: number;
+  maxSeats?: number;
+  /**
+   * This plan's prices are placeholders (also implied by `plans.placeholder`).
+   */
+  placeholderPrices?: boolean;
+  entitlements: Entitlements;
+  /**
+   * Marketing bullets under the entitlements.
+   *
+   * @maxItems 10
+   */
+  includes:
+    | []
+    | [string]
+    | [string, string]
+    | [string, string, string]
+    | [string, string, string, string]
+    | [string, string, string, string, string]
+    | [string, string, string, string, string, string]
+    | [string, string, string, string, string, string, string]
+    | [string, string, string, string, string, string, string, string]
+    | [string, string, string, string, string, string, string, string, string]
+    | [string, string, string, string, string, string, string, string, string, string];
+  cta: {
+    label: string;
+    /**
+     * signin: sign in or go to the dashboard; checkout: subscribe (falls back to contact while flags.checkoutEnabled is off); contact: the contact page or `to`.
+     */
+    action: "signin" | "checkout" | "contact";
+    /**
+     * Target for `contact` (default /contact).
+     */
+    to?: string;
+  };
+}
+/**
+ * This interface was referenced by `Site`'s JSON-Schema
+ * via the `definition` "price".
+ */
+export interface Price {
+  /**
+   * Minor units (cents) per interval, per seat for per-seat plans.
+   */
+  amount: number;
+  /**
+   * Stripe Price lookup key; unique across plans. `stripe:sync` creates or updates the Price behind it.
+   */
+  lookupKey: string;
+}
+/**
+ * What a plan allows. Recorded and displayed; enforcement comes later.
+ *
+ * This interface was referenced by `Site`'s JSON-Schema
+ * via the `definition` "entitlements".
+ */
+export interface Entitlements {
+  /**
+   * Lab session hours per month (per learner).
+   */
+  labHoursPerMonth: number | "unlimited";
+  /**
+   * Lab sessions a learner may run at once.
+   */
+  concurrentLabs: number;
+  /**
+   * Environment tiers the plan may start (curriculum envTiers: A pod, B Kata pod, C VM, K kubeadm cluster, V virtual cluster, N netdev).
+   *
+   * @minItems 1
+   */
+  envTiers: ["A" | "B" | "C" | "K" | "V" | "N", ...("A" | "B" | "C" | "K" | "V" | "N")[]];
+  /**
+   * Exam simulation attempts per month (per learner).
+   */
+  examSimulationsPerMonth: number | "unlimited";
+  /**
+   * May join (and, for organisations, run) CTF events.
+   */
+  ctfEvents: boolean;
 }

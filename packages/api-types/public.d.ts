@@ -51,6 +51,57 @@ export interface SiteLegalDocument {
   sections: SiteLegalSection[];
 }
 
+/* ---------------------------------------------------------------- plans */
+
+/** Environment tiers of the curriculum (`envTiers`): A pod, B Kata pod, C VM, K kubeadm cluster, V virtual cluster, N netdev. */
+export type EnvTier = 'A' | 'B' | 'C' | 'K' | 'V' | 'N';
+
+export type PlanKind = 'free' | 'individual' | 'organisation';
+export type PlanInterval = 'monthly' | 'yearly';
+
+/** What a plan allows. Recorded and displayed; not enforced yet. */
+export interface PlanEntitlements {
+  labHoursPerMonth: number | 'unlimited';
+  concurrentLabs: number;
+  envTiers: EnvTier[];
+  examSimulationsPerMonth: number | 'unlimited';
+  ctfEvents: boolean;
+}
+
+export interface PlanPrice {
+  /** Minor units (cents) per interval, per seat for per-seat plans. */
+  amount: number;
+  /** Stripe Price lookup key, unique across plans. */
+  lookupKey: string;
+}
+
+export interface SitePlan {
+  id: string;
+  name: string;
+  kind: PlanKind;
+  description: string;
+  badge?: string;
+  highlight?: boolean;
+  /** Absent for free plans. */
+  prices?: { monthly?: PlanPrice; yearly?: PlanPrice };
+  perSeat?: boolean;
+  minSeats?: number;
+  maxSeats?: number;
+  placeholderPrices?: boolean;
+  entitlements: PlanEntitlements;
+  includes: string[];
+  cta: { label: string; action: 'signin' | 'checkout' | 'contact'; to?: string };
+}
+
+export interface SitePlans {
+  /** ISO 4217. */
+  currency: string;
+  placeholder?: boolean;
+  taxNote?: string;
+  billingNote?: string;
+  items: SitePlan[];
+}
+
 /** CSS custom property overrides: `--token` -> value. */
 export type SiteTokenMap = Record<string, string>;
 
@@ -109,13 +160,18 @@ export interface SiteConfig {
     showCatalog: boolean;
     signupEnabled: boolean;
     showContactForm?: boolean;
+    /** Self-service checkout for paid plans (needs the gateway's billing integration). */
+    checkoutEnabled?: boolean;
   };
   pricing?: {
     headline?: string;
     intro?: string;
     placeholderNote?: string;
     contactCta?: SiteCta;
+    /** FAQ group listed under the plans. */
+    faqGroup?: string;
   };
+  plans?: SitePlans;
 }
 
 /* ================================================================ public catalog */
