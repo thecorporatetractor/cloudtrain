@@ -106,11 +106,11 @@ spec:
         file=""
         for dg in $(echo "$m" | jq -r '.layers[]?.digest'); do
           b=$(curl -fsS "$R/blobs/$dg" 2>/dev/null) || continue
-          echo "$b" | grep -q '^services:' && { file="$b"; break; }
+          echo "$b" | grep -qE '^(services|name):' && file=$(printf '%s\n%s' "$file" "$b")
         done
         [ -n "$file" ] || { echo no-compose-layer; exit 0; }
-        got=$(echo "$file" | grep -E '^[[:space:]]+image:' | grep -oE 'sha256:[0-9a-f]{64}' | sort | paste -sd, -)
-        want=$(cat /var/lib/cloudtrain/caption-review.digest /var/lib/cloudtrain/caption-queue.digest | sort | paste -sd, -)
+        got=$(echo "$file" | grep -E '^[[:space:]]+image:' | grep -oE 'sha256:[0-9a-f]{64}' | sort -u | paste -sd, -)
+        want=$(cat /var/lib/cloudtrain/caption-review.digest /var/lib/cloudtrain/caption-queue.digest | sort -u | paste -sd, -)
         if [ "$got" = "$want" ]; then echo pinned; else echo "images-not-pinned-to-registry-digests"; fi
       expect: {match: exact, value: pinned}
     - id: qa-from-registry
@@ -157,8 +157,8 @@ spec:
       expect: {match: exact, value: "0"}
   hints:
     - title: Publish
-      body: "`docker compose publish <registry>/<repo>:<tag>` pushes the project's Compose file as an OCI artifact. Add `--resolve-image-digests` to rewrite every `image:` to `name@sha256:...`, and `-y` to skip the confirmation."
-      command: cd ~/caption-review && docker compose publish --resolve-image-digests -y localhost:5000/stacks/caption-review:1.0
+      body: "`docker compose publish <registry>/<repo>:<tag>` pushes the project's Compose file as an OCI artifact; the local registry speaks plain HTTP, so add `--insecure-registry localhost:5000`. Add `--resolve-image-digests` to rewrite every `image:` to `name@sha256:...`, and `-y` to skip the confirmation."
+      command: cd ~/caption-review && docker compose publish --insecure-registry localhost:5000 --resolve-image-digests -y localhost:5000/stacks/caption-review:1.0
       cost: 2
     - title: Run from the registry
       body: "Compose accepts an `oci://` reference wherever it accepts a file: `docker compose -f oci://localhost:5000/stacks/caption-review:1.0 -p caption-qa up -d`. Do it from a directory without Compose files."
@@ -176,7 +176,7 @@ spec:
         as: learner
         run: |
           cd ~/caption-review
-          docker compose publish -y localhost:5000/stacks/caption-review:1.0
+          docker compose publish --insecure-registry localhost:5000 -y localhost:5000/stacks/caption-review:1.0
           cd /tmp
           docker compose -f oci://localhost:5000/stacks/caption-review:1.0 -p caption-qa up -d
     - id: run-from-local-files
@@ -188,7 +188,7 @@ spec:
         as: learner
         run: |
           cd ~/caption-review
-          docker compose publish --resolve-image-digests -y localhost:5000/stacks/caption-review:1.0
+          docker compose publish --insecure-registry localhost:5000 --resolve-image-digests -y localhost:5000/stacks/caption-review:1.0
           docker compose -p caption-qa up -d
   solution:
     explanation: |
@@ -201,7 +201,7 @@ spec:
         as: learner
         run: |
           cd ~/caption-review
-          docker compose publish --resolve-image-digests -y localhost:5000/stacks/caption-review:1.0
+          docker compose publish --insecure-registry localhost:5000 --resolve-image-digests -y localhost:5000/stacks/caption-review:1.0
           cd /tmp
           docker compose -f oci://localhost:5000/stacks/caption-review:1.0 -p caption-qa up -d
           docker compose -p caption-qa ps
@@ -218,6 +218,6 @@ spec:
                 dg=$(curl -fsSI -H "$A" "http://localhost:5000/v2/$r/manifests/1.0" | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}')
                 sed -i "s|localhost:5000/$r:1.0|localhost:5000/$r@$dg|" compose.yaml
               done
-              docker compose publish -y localhost:5000/stacks/caption-review:1.0
+              docker compose publish --insecure-registry localhost:5000 -y localhost:5000/stacks/caption-review:1.0
               cd "$(mktemp -d)"
               docker compose -f oci://localhost:5000/stacks/caption-review:1.0 -p caption-qa up -d
