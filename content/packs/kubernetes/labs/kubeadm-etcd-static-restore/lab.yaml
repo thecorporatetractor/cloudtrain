@@ -111,6 +111,8 @@ spec:
           snapshot save /var/backups/etcd/yard-nightly.db >/dev/null
         sha256sum /var/backups/etcd/yard-nightly.db | cut -d' ' -f1 > /var/lib/cloudtrain/snapshot.sha256
         chmod 0600 /var/backups/etcd/yard-nightly.db
+        # evidence the incident team wants to inspect; a wipe-and-restore into /var/lib/etcd loses it
+        echo incident-evidence > /var/lib/etcd/incident-evidence
     # The incident: a namespace created after the backup, then the bulk delete.
     - on: qm-yard
       timeoutSec: 200
@@ -169,7 +171,7 @@ spec:
       skills: [k8s.cluster.etcd-restore]
       weight: 0.5
       command: |
-        echo "$([ -d /var/lib/etcd/member/wal ] && echo old-dir-kept || echo old-dir-gone) \
+        echo "$([ -d /var/lib/etcd/member/wal ] && [ -f /var/lib/etcd/incident-evidence ] && echo old-dir-kept || echo old-dir-gone) \
         $([ "$(sha256sum /var/backups/etcd/yard-nightly.db | cut -d' ' -f1)" = "$(cat /var/lib/cloudtrain/snapshot.sha256)" ] && echo snapshot-intact || echo snapshot-changed)"
       expect: {match: exact, value: old-dir-kept snapshot-intact}
     - id: etcd-healthy
@@ -193,7 +195,7 @@ spec:
       command: ssh yard-cp-1 'sudo grep -n -A2 "hostPath" /etc/kubernetes/manifests/etcd.yaml'
       cost: 2
     - title: Let the kubelet do the restart
-      body: The kubelet watches /etc/kubernetes/manifests. Saving the changed manifest makes it recreate the etcd Pod; the API server reconnects on its own after a minute or two.
+      body: The kubelet watches /etc/kubernetes/manifests. Saving the changed manifest makes it recreate the etcd Pod. The API server keeps serving its cached pre-restore state, so once etcd runs on the restored data, restart kube-apiserver too (for example `sudo crictl stop` its container; the kubelet recreates it).
       cost: 1
     - title: Mind the editor
       body: Do not leave backup copies of the manifest (e.g. etcd.yaml.bak) inside /etc/kubernetes/manifests; the kubelet would try to run them too. Keep backups elsewhere.
@@ -244,6 +246,13 @@ spec:
           rm -rf /var/lib/etcd
           etcdutl snapshot restore /var/backups/etcd/yard-nightly.db --data-dir /var/lib/etcd
           mv /root/etcd.yaml /etc/kubernetes/manifests/etcd.yaml
+          # etcd now runs on the restored data; the API server keeps its pre-restore cache until it restarts.
+          for i in $(seq 1 60); do
+            c=$(crictl ps --name '^etcd$' -q | head -1)
+            if [ -n "$c" ] && crictl inspect "$c" | grep -q '/var/lib/etcd'; then break; fi
+            sleep 3
+          done
+          crictl stop $(crictl ps --name '^kube-apiserver$' -q) >/dev/null
           EOS
           for i in $(seq 1 60); do kubectl get ns yard-ops >/dev/null 2>&1 && break; sleep 5; done
           kubectl -n yard-ops rollout status deploy/crane-dispatcher --timeout=150s
@@ -253,8 +262,9 @@ spec:
       snapshot. The etcd static Pod mounts its data from the `etcd-data`
       hostPath volume, so changing that path in
       /etc/kubernetes/manifests/etcd.yaml makes the kubelet restart etcd on
-      the restored data. The API server reconnects and serves the state of
-      the snapshot: the deleted namespaces return with their original UIDs,
+      the restored data. The API server caches the pre-restore state, so it is
+      restarted too (its static Pod container is stopped and the kubelet
+      recreates it); it then serves the state of the snapshot: the deleted namespaces return with their original UIDs,
       and the namespace created after the backup is gone.
     steps:
       - on: workstation
@@ -267,6 +277,13 @@ spec:
           etcdutl snapshot restore /var/backups/etcd/yard-nightly.db --data-dir {{dir}}
           sed -i 's#path: /var/lib/etcd$#path: {{dir}}#' /etc/kubernetes/manifests/etcd.yaml
           grep -n 'path: {{dir}}' /etc/kubernetes/manifests/etcd.yaml
+          # etcd now runs on the restored data; the API server keeps its pre-restore cache until it restarts.
+          for i in $(seq 1 60); do
+            c=$(crictl ps --name '^etcd$' -q | head -1)
+            if [ -n "$c" ] && crictl inspect "$c" | grep -q '{{dir}}'; then break; fi
+            sleep 3
+          done
+          crictl stop $(crictl ps --name '^kube-apiserver$' -q) >/dev/null
           EOS
           for i in $(seq 1 60); do kubectl get ns yard-ops >/dev/null 2>&1 && break; sleep 5; done
           kubectl -n yard-ops rollout status deploy/crane-dispatcher --timeout=200s
@@ -286,6 +303,13 @@ spec:
                 --name yard-cp-1 --initial-cluster yard-cp-1=https://$ip:2380 --initial-advertise-peer-urls https://$ip:2380
               cp /etc/kubernetes/manifests/etcd.yaml /root/etcd.yaml.before-restore
               sed -i 's#/var/lib/etcd\b#{{dir}}#g' /etc/kubernetes/manifests/etcd.yaml
+              # etcd now runs on the restored data; the API server keeps its pre-restore cache until it restarts.
+              for i in $(seq 1 60); do
+                c=$(crictl ps --name '^etcd$' -q | head -1)
+                if [ -n "$c" ] && crictl inspect "$c" | grep -q '{{dir}}'; then break; fi
+                sleep 3
+              done
+              crictl stop $(crictl ps --name '^kube-apiserver$' -q) >/dev/null
               EOS
               for i in $(seq 1 60); do kubectl get ns yard-ops >/dev/null 2>&1 && break; sleep 5; done
               kubectl -n yard-ops rollout status deploy/crane-dispatcher --timeout=200s
