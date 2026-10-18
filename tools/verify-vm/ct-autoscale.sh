@@ -3,14 +3,14 @@
 # host metrics (ct-metrics.sh) and move CT_SLOTS_HEAVY and CT_SLOTS_POD in runner.env:
 #   up    (heavy +STEP_HEAVY, pod +STEP_POD, when that limit is in use) when CPU busy < CPU_HIGH, MemAvailable > MEM_MIN_GIB, steal < STEAL_MAX and no warning sign
 #   down  when CPU busy > CPU_MAX, steal > STEAL_MAX, MemAvailable < MEM_LOW_GIB, a Kube-OVN CNI
-#         DEL/ADD older than 15 min (docs/dev-environment.md known gap 9) or >= 2 recent timeout failures
+#         DEL/ADD older than 15 min, load average over LOAD_MAX (3 x 32 vCPU) (docs/dev-environment.md known gap 9) or >= 2 recent timeout failures
 # Decisions: /srv/ct-work/results/state/autoscale.log
 set -uo pipefail
 CFG=${CT_BATCH_ENV:-/srv/ct-work/vm-config/runner.env}
 RES=/srv/ct-work/results; LOG=$RES/state/autoscale.log
 INTERVAL=${INTERVAL:-150} MIN=${MIN:-2} MAX=${MAX:-40} POD_MIN=${POD_MIN:-4} POD_MAX=${POD_MAX:-64}
 STEP_HEAVY=${STEP_HEAVY:-3} STEP_POD=${STEP_POD:-8}
-CPU_HIGH=${CPU_HIGH:-80} CPU_MAX=${CPU_MAX:-95} STEAL_MAX=${STEAL_MAX:-3} MEM_MIN_GIB=${MEM_MIN_GIB:-40} MEM_LOW_GIB=${MEM_LOW_GIB:-20}
+CPU_HIGH=${CPU_HIGH:-80} CPU_MAX=${CPU_MAX:-95} STEAL_MAX=${STEAL_MAX:-3} MEM_MIN_GIB=${MEM_MIN_GIB:-40} MEM_LOW_GIB=${MEM_LOW_GIB:-20} LOAD_MAX=${LOAD_MAX:-96}
 mkdir -p "$RES/state"
 get() { grep -E "^$1=" "$CFG" | tail -1 | cut -d= -f2; }
 set_heavy() { sed -i "s/^CT_SLOTS_HEAVY=.*/CT_SLOTS_HEAVY=$1/" "$CFG"; }
@@ -26,8 +26,8 @@ while sleep "$INTERVAL"; do
   done
   tmo=$(find "$RES/labs" -name '*.json' -newermt "-$((2 * INTERVAL)) sec" -exec jq -r 'select(.status != "pass") | .failingStep' {} + 2>/dev/null | grep -ciE 'timed out|timeout|deadline|not ready' || true)
   h=$(get CT_SLOTS_HEAVY); p=$(get CT_SLOTS_POD); new=$h newp=$p why=hold
-  if ((stall > 0)) || awk -v a="$steal" -v b="$STEAL_MAX" 'BEGIN{exit !(a > b)}' || ((cpu > CPU_MAX || mem < MEM_LOW_GIB || tmo >= 2)); then
-    ((h > MIN)) && new=$((h - 1)); ((p > POD_MIN)) && newp=$((p - 2)); why=down
+  if ((stall > 0)) || awk -v a="$steal" -v b="$STEAL_MAX" 'BEGIN{exit !(a > b)}' || awk -v a="$load" -v b="$LOAD_MAX" 'BEGIN{exit !(a > b)}' || ((cpu > CPU_MAX || mem < MEM_LOW_GIB || tmo >= 2)); then
+    new=$((h - 2)); ((new < MIN)) && new=$MIN; ((p > POD_MIN)) && newp=$((p - 4)); why=down
   elif ((cpu < CPU_HIGH && mem > MEM_MIN_GIB)); then
     # raise a limit only when it is in use (otherwise the queue, not the limit, is the cap)
     rv=$(pgrep -fc 'tools/slots/run.sh vm' || true); rp=$(pgrep -fc 'tools/slots/run.sh pod' || true)

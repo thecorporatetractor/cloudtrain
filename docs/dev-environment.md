@@ -660,7 +660,7 @@ the volume under `/srv/ct-work/results/`: `status.json` (one line, every minute)
 labs. `ct-metrics.service` samples CPU, steal, load and memory every 10 s
 (`results/metrics/<date>.tsv`); `ct-autoscale.service` moves `CT_SLOTS_HEAVY`/`CT_SLOTS_POD` in
 `runner.env` every 150 s: up by 3 / 8 while CPU is under 80 % and more than 40 GiB is free
-and the limit is in use, down on steal over 3 %, CPU over 95 %, under 20 GiB free, a Kube-OVN
+and the limit is in use, down (heavy -2, pod -4) on steal over 3 %, CPU over 95 %, load over 96, under 20 GiB free, a Kube-OVN
 CNI call older than 15 minutes, or two recent timeout failures.
 
 Measured on the VM: idle with the platform up, about 2 % CPU, load 2.5-3.5, 9 GiB used, no
