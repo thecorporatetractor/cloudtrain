@@ -10,7 +10,13 @@
 #   REGISTRY_AUTH=htpasswd REGISTRY_AUTH_HTPASSWD_REALM REGISTRY_AUTH_HTPASSWD_PATH
 FROM registry:3@sha256:ddf754342cfc8acc51a56d5d0ab6af06826461864460636d8bd5c546dab2a7b8
 RUN apk upgrade --no-cache \
+ && mkdir -p /var/lib/registry && chown 65532:65532 /var/lib/registry \
  && printf 'cloudtrain/oci-registry:3 distribution=3.1.2\n' > /etc/cloudtrain-release
 COPY config.yml /etc/distribution/config.yml
 EXPOSE 5000
 VOLUME /var/lib/registry
+# Non-root (65532). Mounted volumes need fsGroup 65532 or an owner change. Kubernetes
+# probes (tcpSocket/httpGet :5000/v2/) replace an image HEALTHCHECK, which cannot know
+# whether a lab enabled TLS.
+HEALTHCHECK NONE
+USER 65532:65532
