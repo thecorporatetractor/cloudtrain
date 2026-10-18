@@ -133,13 +133,15 @@ spec:
         SH
       expect: { match: exact, value: msg-ok fixed }
     - id: main-untouched
-      description: The branch main still points at its original commit
+      description: Branch hotfix was pushed and the branch main still points at its original commit
       type: shell
       on: control
       skills: [automation.devworkflow.git]
       command: |
         ct-ansible run /home/learner bash -s <<'SH'
-        [ "$(git --git-dir=/home/learner/git/hotfix.git rev-parse main)" = "$(cat /var/tmp/.ct-hotfix-main)" ] && echo unchanged || echo moved
+        g="git --git-dir=/home/learner/git/hotfix.git"
+        [ "$($g rev-parse -q --verify refs/heads/hotfix)" != "$(cat /var/tmp/.ct-hotfix-base)" ] || { echo hotfix-not-pushed; exit 0; }
+        [ "$($g rev-parse main)" = "$(cat /var/tmp/.ct-hotfix-main)" ] && echo unchanged || echo moved
         SH
       expect: { match: exact, value: unchanged }
     - id: clone-state
@@ -165,15 +167,18 @@ spec:
       weight: 2
       command: cat /etc/ov-hotfix 2>/dev/null || echo missing
       expect: { match: exact, value: "hotfix {{marker}}" }
-    - id: marker-node2
-      description: node2 has no marker file
+    - id: marker-others
+      description: node1 has the marker file and node2, node3 and node4 have none
       type: shell
-      on: node2
+      on: control
       skills: [automation.quality.debugging]
-      command: &no-marker '[ -e /etc/ov-hotfix ] && echo present || echo absent'
-      expect: { match: exact, value: absent }
-    - { id: marker-node3, description: "node3 has no marker file", type: shell, on: node3, skills: [automation.quality.debugging], command: *no-marker, expect: { match: exact, value: absent } }
-    - { id: marker-node4, description: "node4 has no marker file", type: shell, on: node4, skills: [automation.quality.debugging], command: *no-marker, expect: { match: exact, value: absent } }
+      timeoutSec: 120
+      command: |
+        r() { ct-ansible run /home/learner ssh -o BatchMode=yes -o ConnectTimeout=10 devops@$1 'cat /etc/ov-hotfix 2>/dev/null || echo absent' 2>/dev/null; }
+        [ "$(r node1)" = "hotfix {{marker}}" ] || { echo node1-missing; exit 0; }
+        n=0; for h in node2 node3 node4; do [ "$(r $h)" = absent ] || n=$((n+1)); done
+        [ $n = 0 ] && echo ok || echo "present=$n"
+      expect: { match: exact, value: ok }
   exam:
     rerun:
       - on: control

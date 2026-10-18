@@ -102,6 +102,13 @@ spec:
         EOF
         printf '[defaults]\ninventory = inventory.yml\nremote_user = devops\n' > $p/ansible.cfg
         chown -R learner:learner $p
+        kh=/home/learner/.ssh/known_hosts
+        if ! grep -q '^\[node4\]:2202' $kh 2>/dev/null; then
+          ip=$(getent ahostsv4 node4 | awk 'NR==1{print $1}')
+          k=$(grep -E '^node4[, ]' $kh | head -1 | cut -d' ' -f2-)
+          [ -n "$k" ] && echo "[node4]:2202,[$ip]:2202 $k" >> $kh
+          chown learner:learner $kh
+        fi
   checks:
     - id: ping-all
       description: ansible all -m ping answers from all four hosts
@@ -139,7 +146,7 @@ spec:
         g = lambda n: sorted(d.get(n, {}).get("hosts", []))
         hv = d["_meta"]["hostvars"]
         plain = all(not any(k.startswith("ansible_") for k in hv.get(h, {})) for h in ("node1", "node2", "node3"))
-        ok = g("dev") == ["node1"] and g("test") == ["node2"] and g("prod") == ["node3"] and g("balancers") == ["legacy-api"] and d.get("webservers", {}).get("children") == ["prod"] and plain
+        ok = hv.get("legacy-api", {}).get("ansible_port") in (2202, "2202") and g("dev") == ["node1"] and g("test") == ["node2"] and g("prod") == ["node3"] and g("balancers") == ["legacy-api"] and d.get("webservers", {}).get("children") == ["prod"] and plain
         print("ok" if ok else "changed")' || echo no-inventory
       expect: { match: exact, value: ok }
     - id: node-unchanged
@@ -148,6 +155,7 @@ spec:
       on: node4
       skills: [automation.inventory.connection-vars]
       command: |
+        journalctl -u sshd --no-pager 2>/dev/null | grep -q 'Accepted publickey for {{legacyuser}} ' || { echo no-login; exit 0; }
         sha256sum -c /var/tmp/.ct-overrides-sha >/dev/null 2>&1 && s=unchanged || s=modified
         echo "$s $(ss -ltn | grep -oE ':(22|2202) ' | sort -u | wc -l)"
       expect: { match: exact, value: "unchanged 2" }

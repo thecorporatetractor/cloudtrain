@@ -12,7 +12,7 @@ The source of truth is each lab's `status`/`notes` in `content/curriculum.yaml`.
 |---|---|---|---|
 | Path `ansible-fundamentals`, tier-A labs (9 of 12) | 9 | **9** | 0 |
 | Path `ansible-fundamentals`, tier-B labs (`ov-conditionals-os-family`, `ov-handlers-web-reload`, `ov-template-claims-vhost`) | 0 | 0 | 3 (need VMs, see Next steps) |
-| Exam `sim-el-automation` pool (34 tasks) | 34 (15 passed a live exam run; 19 written in round 5 wave 1, never run live; 2 of those blocked) | 0 per-task | 0 |
+| Exam `sim-el-automation` pool (32 pooled tasks) | 34 written (15 passed a live exam run; 19 written in round 5 wave 1, never run live; 2 of those blocked and held out of the pools) | 0 per-task | 0 |
 | Capstone tasks `xpe-ansible-node-agents`, `xpe-ansible-ssh-hardening` (pool of `sim-platform-engineer`) | 2 (round 5 wave 1, never run live) | 0 | 0 |
 | Paths `el-automation-engineer`, `automation-engineering-practices`, `automation-content-developer`, `automation-controller-operations`, `network-automation`, `event-driven-automation` | 0 | 0 | 49 |
 
@@ -152,9 +152,13 @@ Apache/MIT/BSD; same treatment. The inventory header now says so.
 
 PR `content/automation-r5-w1`: the 19 remaining `xan-*` exam tasks and the 2 `xpe-ansible-*`
 capstone tasks, all `built`, none run live (no heavy slot this round). `sim-el-automation` now
-compiles without `--allow-missing` (34 tasks against 30 needed) and is on the CI compile list.
+compiles without `--allow-missing` (32 pooled tasks (34 written) against 30 needed) and is on the CI compile list.
 Pools: baseline 2/2, core 4/4, inventory 2/2, nodes 2/2, run 2/2, git 2/2, errors 4/4,
-roles 6/6 (2 blocked), sys 8/8, tpl 2/2.
+roles 4/4 (timesync and selinux written but held out, blocked), sys 8/8, tpl 2/2.
+
+Shared gate change: `tools/lab-verify/src/curriculum.mjs` now lets an exam task whose notes start with
+`blocked:` sit in no exam pool (all other exam tasks must still be pooled); other domain owners may use this
+for blocked exam tasks.
 
 Conventions (see each lab's notes in `content/curriculum.yaml`): all 34 tasks share the four
 VMs, so every setup is idempotent (`/var/tmp/.ct-<task>-seeded`), the node's local repo, sshd

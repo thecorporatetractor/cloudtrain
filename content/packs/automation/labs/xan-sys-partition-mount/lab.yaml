@@ -124,18 +124,21 @@ spec:
         u=$(blkid -s UUID -o value "$p" 2>/dev/null)
         [ -n "$u" ] && grep -Eq "^UUID=$u[[:space:]]+/mnt/{{mp}}[[:space:]]+xfs[[:space:]]" /etc/fstab && echo by-uuid || echo not-by-uuid
       expect: { match: exact, value: by-uuid }
-    - id: node1-clean
-      description: node1 has no partition on the second data disk and no mount for it
+    - id: others-clean
+      description: node2 has the partition and node1, node3 and node4 have no partition on the second data disk and no mount for it
       type: shell
-      on: node1
+      on: control
       skills: [automation.modules.storage]
-      command: &clean |
-        n=$(ls /dev/disk/by-id/virtio-ct-data2-part* 2>/dev/null | wc -l)
-        findmnt -n /mnt/{{mp}} >/dev/null 2>&1 && m=mount || m=no-mount
-        echo "parts=$n $m"
-      expect: { match: exact, value: "parts=0 no-mount" }
-    - { id: node3-clean, description: "node3 has no partition on the second data disk and no mount for it", type: shell, on: node3, skills: [automation.modules.storage], command: *clean, expect: { match: exact, value: "parts=0 no-mount" } }
-    - { id: node4-clean, description: "node4 has no partition on the second data disk and no mount for it", type: shell, on: node4, skills: [automation.modules.storage], command: *clean, expect: { match: exact, value: "parts=0 no-mount" } }
+      timeoutSec: 120
+      command: |
+        r() { ct-ansible run /home/learner ssh -o BatchMode=yes -o ConnectTimeout=10 devops@$1 "$2" 2>/dev/null; }
+        [ "$(r node2 'ls /dev/disk/by-id/virtio-ct-data2-part* 2>/dev/null | wc -l')" = 1 ] || { echo node2-not-done; exit 0; }
+        n=0
+        for h in node1 node3 node4; do
+          [ "$(r $h 'n=$(ls /dev/disk/by-id/virtio-ct-data2-part* 2>/dev/null | wc -l); findmnt -n /mnt/{{mp}} >/dev/null 2>&1 && m=mount || m=no-mount; echo "parts=$n $m"')" = "parts=0 no-mount" ] || n=$((n+1))
+        done
+        [ $n = 0 ] && echo ok || echo "dirty=$n"
+      expect: { match: exact, value: ok }
   exam:
     rerun:
       - on: control

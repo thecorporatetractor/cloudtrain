@@ -107,15 +107,18 @@ spec:
       skills: [automation.content.templates]
       command: echo "$(stat -c '%U %a' /etc/myhosts 2>/dev/null) $(head -n 1 /etc/myhosts 2>/dev/null)"
       expect: { match: exact, value: "root 644 # Orrin and Vale estate hosts - {{site}}" }
-    - id: node2-absent
-      description: node2 has no /etc/myhosts
+    - id: others-absent
+      description: node1 has /etc/myhosts and node2, node3 and node4 have none
       type: shell
-      on: node2
+      on: control
       skills: [automation.content.templates]
-      command: &absent '[ -e /etc/myhosts ] && echo present || echo absent'
-      expect: { match: exact, value: absent }
-    - { id: node3-absent, description: "node3 has no /etc/myhosts", type: shell, on: node3, skills: [automation.content.templates], command: *absent, expect: { match: exact, value: absent } }
-    - { id: node4-absent, description: "node4 has no /etc/myhosts", type: shell, on: node4, skills: [automation.content.templates], command: *absent, expect: { match: exact, value: absent } }
+      timeoutSec: 120
+      command: |
+        r() { ct-ansible run /home/learner ssh -o BatchMode=yes -o ConnectTimeout=10 devops@$1 '[ -e /etc/myhosts ] && echo present || echo absent' 2>/dev/null; }
+        [ "$(r node1)" = present ] || { echo node1-missing; exit 0; }
+        n=0; for h in node2 node3 node4; do [ "$(r $h)" = absent ] || n=$((n+1)); done
+        [ $n = 0 ] && echo ok || echo "present=$n"
+      expect: { match: exact, value: ok }
     - id: uses-template
       description: hosts.yml renders the file with the template module from a template that reads host variables
       type: shell

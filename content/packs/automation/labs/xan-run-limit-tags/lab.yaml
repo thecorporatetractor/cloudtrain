@@ -129,19 +129,19 @@ spec:
         getent group ovreport{{tag}} >/dev/null && g=group || g=no-group
         echo "$n $m $g"
       expect: { match: exact, value: notice no-marker no-group }
-    - id: node1-untouched
-      description: node1 was not touched by the run
+    - id: others-untouched
+      description: node2 has the login notice and node1, node3 and node4 were not touched by the run
       type: shell
-      on: node1
+      on: control
       skills: [automation.content.tags]
-      command: &untouched |
-        [ -f /etc/ov-motd ] && n=notice || n=no-notice
-        [ -e /etc/ov-site-marker ] && m=marker || m=no-marker
-        getent group ovreport{{tag}} >/dev/null && g=group || g=no-group
-        echo "$n $m $g"
-      expect: { match: exact, value: no-notice no-marker no-group }
-    - { id: node3-untouched, description: "node3 was not touched by the run", type: shell, on: node3, skills: [automation.content.tags], command: *untouched, expect: { match: exact, value: no-notice no-marker no-group } }
-    - { id: node4-untouched, description: "node4 was not touched by the run", type: shell, on: node4, skills: [automation.content.tags], command: *untouched, expect: { match: exact, value: no-notice no-marker no-group } }
+      weight: 2
+      timeoutSec: 120
+      command: |
+        r() { ct-ansible run /home/learner ssh -o BatchMode=yes -o ConnectTimeout=10 devops@$1 'test -f /etc/ov-motd && echo notice || echo no-notice; test -e /etc/ov-site-marker && echo marker || echo no-marker; getent group ovreport{{tag}} >/dev/null && echo group || echo no-group' 2>/dev/null | paste -sd' '; }
+        [ "$(r node2)" = "notice no-marker no-group" ] || { echo node2-not-done; exit 0; }
+        n=0; for h in node1 node3 node4; do [ "$(r $h)" = "no-notice no-marker no-group" ] || n=$((n+1)); done
+        [ $n = 0 ] && echo ok || echo "touched=$n"
+      expect: { match: exact, value: ok }
     - id: navigator-artifact
       description: A navigator artifact exists that records only the tagged task and only the test host
       type: shell
@@ -169,7 +169,7 @@ spec:
     - id: tags-only
       description: Selects the tag but forgets to limit the hosts.
       feedback: A tag selects tasks, not hosts; the run must also be limited to the test group.
-      expectFail: [node1-untouched, node3-untouched, node4-untouched]
+      expectFail: [others-untouched]
       mutation:
         on: control
         as: learner

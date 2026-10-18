@@ -140,16 +140,19 @@ spec:
         }
         echo "$(chk {{u1}} {{base}}51 ovstaff 'Pw1-{{pa}}') $(chk {{u2}} {{base}}52 'ovaudit ovstaff' 'Pw2-{{pb}}')"
       expect: { match: exact, value: "{{u1}}:ok {{u2}}:ok" }
-    - id: node1-clean
-      description: node1 has none of the accounts
+    - id: others-clean
+      description: The accounts exist on node3 and on none of the other nodes
       type: shell
-      on: node1
+      on: control
       skills: [automation.modules.users]
-      command: &none |
-        n=0; for u in {{u1}} {{u2}}; do id $u >/dev/null 2>&1 && n=$((n+1)); done; echo "users=$n"
-      expect: { match: exact, value: users=0 }
-    - { id: node2-clean, description: "node2 has none of the accounts", type: shell, on: node2, skills: [automation.modules.users], command: *none, expect: { match: exact, value: users=0 } }
-    - { id: node4-clean, description: "node4 has none of the accounts", type: shell, on: node4, skills: [automation.modules.users], command: *none, expect: { match: exact, value: users=0 } }
+      weight: 2
+      timeoutSec: 120
+      command: |
+        r() { ct-ansible run /home/learner ssh -o BatchMode=yes -o ConnectTimeout=10 devops@$1 "$2" 2>/dev/null; }
+        [ "$(r node3 'id {{u1}} >/dev/null 2>&1 && id {{u2}} >/dev/null 2>&1 && echo yes')" = yes ] || { echo not-on-node3; exit 0; }
+        n=0; for h in node1 node2 node4; do [ "$(r $h 'n=0; for u in {{u1}} {{u2}}; do id $u >/dev/null 2>&1 && n=$((n+1)); done; echo $n')" = 0 ] || n=$((n+1)); done
+        [ $n = 0 ] && echo ok || echo "others=$n"
+      expect: { match: exact, value: ok }
     - id: vault-hygiene
       description: The supplied files are unchanged and still encrypted, and no clear-text password appears in your files
       type: shell
@@ -158,6 +161,7 @@ spec:
       weight: 2
       command: |
         d=/home/learner/exam/vaultusers
+        [ -f $d/vaultusers.yml ] || { echo no-playbook; exit 0; }
         (cd $d && sha256sum -c /var/tmp/.ct-vaultusers-sha >/dev/null 2>&1) || { echo supplied-files-changed; exit 0; }
         head -c 14 $d/secrets.yml | grep -q '^$ANSIBLE_VAULT' || { echo not-encrypted; exit 0; }
         grep -rlsE 'Pw[12]-({{pa}}|{{pb}})' $d --exclude=secrets.yml | grep -q . && echo leaked || echo ok
@@ -202,7 +206,7 @@ spec:
     - id: all-hosts
       description: Creates the accounts on every group instead of prod only.
       feedback: The accounts belong on the prod hosts only.
-      expectFail: [node1-clean, node2-clean, node4-clean]
+      expectFail: [others-clean]
       mutation:
         on: control
         as: learner
