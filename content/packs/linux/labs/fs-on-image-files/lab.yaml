@@ -115,6 +115,9 @@ spec:
         e=$(e2fsck -fn "$img?offset=$off1" >/dev/null 2>&1 && echo clean || echo damaged)
         feat=$(dumpe2fs -h "$img?offset=$off1" 2>/dev/null | awk -F: '/^Filesystem features/ {print $2}')
         case "$feat" in *extent*) ;; *) e="not-ext4" ;; esac
+        hdr=$(dumpe2fs -h "$img?offset=$off1" 2>/dev/null)
+        bc=$(printf '%s\n' "$hdr" | awk -F: '/^Block count/ {print $2+0}'); bs=$(printf '%s\n' "$hdr" | awk -F: '/^Block size/ {print $2+0}')
+        [ "$(( ${bc:-0} * ${bs:-0} ))" -gt $(($2 * 512)) ] && e=overflows
         en=$(debugfs -R "ls -p /" "$img?offset=$off1" 2>/dev/null | grep -c 'timetable-[0-9]*\.dat')
         t=$(mktemp); dd if=$img of=$t bs=512 skip=$3 count=$4 status=none
         magic=$(xfs_db -r -c "sb 0" -c "p magicnum" $t 2>/dev/null | awk '{print $3}')
@@ -218,6 +221,25 @@ spec:
           eb=$(dumpe2fs -h "disk.img?offset=$((2048 * 512))" 2>/dev/null | awk -F: '/^Block count/ {print $2+0}')
           xi=$(xfs_db -r -c "sb 0" -c "p icount" xfs.img | awk '{print $3}'); xb=$(xfs_db -r -c "sb 0" -c "p dblocks" xfs.img | awk '{print $3}')
           printf 'ext4 inodes_used=%s blocks_used=%s\nxfs inodes_used=%s blocks_used=%s\n' $ei $eb $xi $xb > fs.txt
+          EOS
+    - id: mke2fs-no-size
+      description: Builds the ext4 with the right offset but without a size, so the filesystem runs on across the second partition.
+      feedback: "Without a BLOCKS argument mke2fs sizes the filesystem to the rest of the file from the offset, so it overlaps partition 2. Give it the partition's size in filesystem blocks."
+      expectFail: [filesystems-filled]
+      mutation:
+        on: tr-store-01
+        as: learner
+        run: |
+          bash <<'EOS'
+          set -e
+          cd ~/lab-fs
+          truncate -s 640M disk.img
+          printf 'label: gpt\nstart=2048, size=409600\nstart=411648, size=675840\n' | sfdisk -q disk.img >/dev/null
+          mke2fs -q -t ext4 -b 4096 -d ext4-content -E offset=$((2048 * 512)) -F disk.img
+          { echo /dev/null; echo "0 0"; echo "d--755 0 0"; for f in xfs-content/*; do echo "$(basename $f) ---644 0 0 $PWD/$f"; done; echo '$'; } > xfs.proto
+          mkfs.xfs -q -f -d file,name=xfs.img,size=320m -p xfs.proto
+          dd if=xfs.img of=disk.img bs=512 seek=411648 conv=notrunc status=none
+          echo "ext4 inodes_used=0 blocks_used=0" > fs.txt
           EOS
   solution:
     explanation: |

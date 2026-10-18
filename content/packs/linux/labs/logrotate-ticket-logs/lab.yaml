@@ -105,6 +105,10 @@ spec:
         printf '%s\n' "$o" | grep -q 'after 1 days (14 rotations)' || { echo "not-daily-14"; exit 0; }
         printf '%s\n' "$o" | grep -q 'compressing log with' || { echo "no-compress"; exit 0; }
         grep -qE '^[[:space:]]*(copytruncate|dateext)' $f && { echo "copytruncate-or-dateext"; exit 0; }
+        printf '%s\n' "$o" | grep -q 'empty log files are not rotated' || { echo "rotates-empty"; exit 0; }
+        sed 's#{{logdir}}#/nonexistent-lr-dir#g' $f > /tmp/lr-missing.conf
+        logrotate -d -s /tmp/lr-check2.state /tmp/lr-missing.conf 2>&1 | grep -qi 'error' && { echo "fails-on-missing"; rm -f /tmp/lr-missing.conf; exit 0; }
+        rm -f /tmp/lr-missing.conf
         echo ok
       expect: {match: exact, value: ok}
     - id: forced-rotation
@@ -190,6 +194,15 @@ spec:
         as: learner
         run: |
           printf '%s\n' '{{logdir}}/*.log {' '    daily' '    rotate 14' '    missingok' '    notifempty' '    sharedscripts' '    postrotate' '        kill -HUP "$(cat /run/tr-ticket/api.pid)"' '    endscript' '}' | sudo tee /etc/logrotate.d/tr-ticket >/dev/null
+    - id: no-missingok-notifempty
+      description: Signals the API correctly but leaves out missingok and notifempty.
+      feedback: "The policy must not fail when a log is missing (`missingok`) and must not rotate an empty log (`notifempty`)."
+      expectFail: [policy-parses]
+      mutation:
+        on: tr-ticket-02
+        as: learner
+        run: |
+          printf '%s\n' '{{logdir}}/*.log {' '    daily' '    rotate 14' '    compress' '    sharedscripts' '    postrotate' '        kill -HUP "$(cat /run/tr-ticket/api.pid)"' '    endscript' '}' | sudo tee /etc/logrotate.d/tr-ticket >/dev/null
   solution:
     explanation: |
       One stanza for both logs: daily, rotate 14, compress, missingok, notifempty, and a

@@ -9,12 +9,20 @@ is `status` / `notes` in `content/curriculum.yaml`.
 
 | Group | Labs | Status |
 |---|---|---|
-| Mirror, packages, docs | packages-install-from-mirror, help-pages-offline, python-venv-fleet-report | verified live |
+| Mirror, packages | packages-install-from-mirror, python-venv-fleet-report | verified live |
+| Mirror, packages, docs | help-pages-offline | built (changed after its live verify; re-verify) |
 | Mirror, packages | package-repo-pinning, dnf-local-repo | built (docker preflight passes) |
-| Files, keys, scheduling | acl-timetable-review, setgid-shared-planning, fix-ssh-key-perms, strace-config-not-found, gpg-sign-timetable, fix-cron-silent-failure, signal-box-levels-3 | verified live |
-| Integrity, logs, certificates | aide-integrity-baseline, logrotate-ticket-logs, tls-cert-ticket-portal, fix-expired-cert | verified live |
-| Web and network services | apache-vhosts-tls | verified live |
+| Files, keys, scheduling | setgid-shared-planning, gpg-sign-timetable | verified live |
+| Files, keys, scheduling | acl-timetable-review, fix-ssh-key-perms, strace-config-not-found, fix-cron-silent-failure, signal-box-levels-3 | built (changed after live verify; re-verify) |
+| Integrity, logs, certificates | tls-cert-ticket-portal, fix-expired-cert | verified live |
+| Integrity, logs, certificates | aide-integrity-baseline, logrotate-ticket-logs | built (changed after live verify; re-verify) |
+| Web and network services | apache-vhosts-tls | built (not-started gate added after live verify; re-verify) |
 | Web and network services | nginx-reverse-proxy-pis, haproxy-ticket-backends, bind-authoritative-zone, unbound-caching-forwarder, postfix-relay-alerts, postgres-backup-restore, fs-on-image-files | built (docker preflight passes) |
+
+Verify queue for the remote runner: help-pages-offline, signal-box-levels-3, fix-cron-silent-failure,
+fix-ssh-key-perms, strace-config-not-found, acl-timetable-review, aide-integrity-baseline,
+logrotate-ticket-logs, apache-vhosts-tls, plus the nine built labs below (dnf-local-repo now has a
+`pkg` param, fs-on-image-files and signal-box-levels-3 have new mutations).
 
 "Verified live" means a full `labctl verify` (2 seeds, every mutation and alternative) passed on
 a pod slot with a scoped manager before the "no live testing on this machine" rule of

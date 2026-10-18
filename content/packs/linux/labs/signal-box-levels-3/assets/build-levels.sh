@@ -83,12 +83,14 @@ cat > /usr/local/sbin/sb-dispatch <<'EOT'
 for d in /home/*/signalbox/level15; do
   [ -d "$d" ] && [ -e "$d/request" ] || continue
   who=$(stat -c %U "$d")
-  if [ "$(tr -d '[:space:]' < "$d/request" 2>/dev/null)" != "$(cat /var/lib/cloudtrain/sb14.token)" ]; then
-    printf 'Wrong request: it must hold the password you used to unlock level 15.\n' > "$d/reply.txt"
-    chown "$who" "$d/reply.txt"; chmod 0644 "$d/reply.txt"; rm -f "$d/request"; continue
+  # never follow links: all reads and writes happen as the owning user
+  if [ -L "$d/request" ] || [ -L "$d/reply.txt" ]; then rm -f "$d/request"; continue; fi
+  got=$(runuser -u "$who" -- cat "$d/request" 2>/dev/null | tr -d '[:space:]')
+  if [ "$got" != "$(cat /var/lib/cloudtrain/sb14.token)" ]; then
+    printf 'Wrong request: it must hold the password you used to unlock level 15.\n' | runuser -u "$who" -- sh -c 'cat > "$1"' _ "$d/reply.txt"
+    rm -f "$d/request"; continue
   fi
-  printf 'The final token is %s\n' "$(cat /var/lib/cloudtrain/sb15.token)" > "$d/reply.txt"
-  chown "$who" "$d/reply.txt"; chmod 0644 "$d/reply.txt"
+  printf 'The final token is %s\n' "$(cat /var/lib/cloudtrain/sb15.token)" | runuser -u "$who" -- sh -c 'cat > "$1"' _ "$d/reply.txt"
   rm -f "$d/request"
 done
 EOT
