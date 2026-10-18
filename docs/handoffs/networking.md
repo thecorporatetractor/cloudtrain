@@ -143,3 +143,53 @@ retakes get a fresh draw (the exam itself now runs end to end: 100 % / 14.3 %).
   net-ipsec-partner-tunnel, xnt-wireguard-annex), `ip_gre` and 1400-byte frames on the pod network
   (net-fix-mtu-blackhole, GRE tunnel, not WireGuard), FRR JSON field names
   (`state` DR/Backup/DROther, `ifaceName`), and `show ip route <dest> json` entry layout.
+
+## Round 5 wave 3 (write-only)
+
+- `net-jinja-render-frr` is built (status `built`, not yet verified). Host switched from
+  `ansible-ctl:2.21` to `netsvc:1` (curriculum images updated), the same pattern as
+  `xnt-render-config-from-yaml`: a Python Jinja2 `render TEMPLATE DATA ROUTER` helper, trim_blocks and
+  lstrip_blocks on, configs pasted into the FRR consoles. Three campus routers (north, south, west;
+  west has two LANs) plus a preconfigured core. Graded on: the template against the inventory, against
+  a hidden second inventory (area 3, different interface counts), the saved files, OSPF Full on every
+  adjacency (retry loop), learned LANs and loopbacks, passive LAN interfaces, reachability. The grader
+  logic (`/var/lib/cloudtrain/expect-conf.py`) and all three mutations were smoke-tested locally with
+  Python against a sandbox directory. Mutations: hard-coded per-router literals (caught only by the
+  hidden inventory), loopback without `ip ospf area`, no passive conditional.
+- Drafts (status stays `proposed`) in `docs/handoffs/networking-drafts/`: `net-srlinux-vlan-trunk`,
+  `net-jsonrpc-read-state`, `net-jsonrpc-config-change`, `net-gnmi-interface-counters`,
+  `xnt-api-interface-desc`, `net-ansible-frr-backup`. All pass `labctl validate`; none has run. They
+  use `driver: netdev, image: srlinux:25`, drive the switch with `sr_cli < file` in setup and JSON-RPC
+  over plain HTTP (`http://<switch>/jsonrpc`, so no TLS profile or key material is needed; gNMI
+  generates a self-signed pair at run time). Nothing was replaced by a Linux-bridge fallback.
+
+### Counts after wave 3
+
+Networking labs in the curriculum: 78 (see `docs/curriculum.md`). verified 25 (3 learn, 5 do,
+2 fix, 15 exam), built 47, proposed 6 (the SR Linux set of five and net-ansible-frr-backup). sim-net-associate
+pools: fundamentals 6/6, access 6/6, ip-connectivity 8/8, ip-services 4/4, security 4/4, automation 2 runnable
+(`xnt-render-config-from-yaml`, `xnt-json-neighbour-export`) + `xnt-api-interface-desc` blocked, against a draw of 1.
+`labctl exam compile --allow-missing sim-net-associate` passes; without the flag it fails only on
+`xnt-api-interface-desc`. `sim-platform-engineer` does not compile on main (shared `workstation` node differs
+between the xpe-iac-* tasks and others; not ours).
+
+### Blockers
+
+| Lab(s) | Blocker | Needed |
+|---|---|---|
+| net-srlinux-vlan-trunk, net-jsonrpc-read-state, net-jsonrpc-config-change, net-gnmi-interface-counters, xnt-api-interface-desc | `srlinux:25` is a spike (not in `deploy/images/catalog.yaml`, so lab-verify would error), no `netdev: srlinux` driver family (the drafts use `run:` with `sr_cli`), hosted-training EULA decision pending | image + catalog entry + driver family + EULA sign-off |
+| net-gnmi-interface-counters (additionally) | `gnmic` is in no image | add gnmic to an image the collector runs |
+| net-ansible-frr-backup | `frr:10` has no sshd; `ansible-ctl:2.21` has no `ansible.netcommon` / `frr.frr` collections; `gitea:1` is not in the catalog (the design uses a local bare repo) | sshd on frr (image rebuild) or the collections mirrored into ansible-ctl |
+| net-wireguard-annex-tunnel, net-ipsec-partner-tunnel, xnt-wireguard-annex | host kernel wireguard/xfrm modules inside the user-namespaced netns | first-verify risk, not a blocker |
+| xpe-net-depot-route, xpe-net-edge-nat | harbour cluster nodes are VMs; netsvc stand-ins are used for the nodes and the Ingress | none, by design |
+| shipment-operator-crd (k8s-admin) | operator simulated by an admin-container loop (no operator image in `workloadImages`) | optional controller image |
+
+### Verify queue (path order)
+
+1. The wave-1 drafts first (the 22 labs from `net-subnet-east-campus` to `net-qos-voice-priority`) and the
+   wave-2 security/VPN labs, then `net-jinja-render-frr`.
+2. Pool tasks, so retakes draw fresh tasks: the 16 wave-2 `xnt-*` tasks plus `xnt-json-neighbour-export`, then
+   `xpe-net-depot-route` and `xpe-net-edge-nat`.
+3. A full `labctl exam run --allow-missing --auto-solve` and `--no-solve` of `sim-net-associate`.
+First-verify risks for `net-jinja-render-frr`: OSPF DR election on the broadcast links takes ~40 s (checks
+retry up to 100 s), and `ip ospf passive` is read from `show running-config`.

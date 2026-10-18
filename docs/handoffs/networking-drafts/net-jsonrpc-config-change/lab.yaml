@@ -1,0 +1,210 @@
+# BLOCKED DRAFT (status proposed): needs srlinux:25 (no catalog entry, no `netdev: srlinux` family,
+# hosted-training EULA pending). Written against the intended design; nothing here has run.
+# First-verify risks: sr_cli reading stdin, JSON-RPC set semantics (default datastore commits at once),
+# SR Linux boot time.
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: net-jsonrpc-config-change
+  title: Change interface settings through the API
+  domain: networking
+  frameworks: [ccna:automation-programmability]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [json-rpc, api, yaml, idempotent, srlinux]
+  version: 1
+spec:
+  description: |
+    **Devices:** `mv-api-host` (shell, `curl`, `jq`, Python with PyYAML), `mv-sw-annex-1`
+
+    The annex switch has four access ports, `ethernet-1/1` to `ethernet-1/4`. The change request
+    `/root/changes/annex-ports.yaml` on `mv-api-host` lists, per port, the description and the
+    admin-state to apply. The switch API is `http://mv-sw-annex-1/jsonrpc` (user `admin`,
+    password `annex-{{octet}}-api`); a `set` request looks like
+
+        {"jsonrpc": "2.0", "id": 1, "method": "set",
+         "params": {"commands": [{"action": "update", "path": "/interface[name=ethernet-1/1]/description", "value": "text"}]}}
+
+    1. Write `/root/apply-changes.sh`, an executable script that reads the change request and
+       applies it through the API (not the switch CLI). Running it twice must leave the same
+       state.
+    2. Run it. Ports not named in the change request, and the sub-interface settings of the ports
+       that are, must stay as they were.
+  objectives:
+    - Apply a configuration change with a JSON-RPC set request
+    - Use `update` rather than `replace` so sibling configuration survives
+    - Drive the change from a YAML file and keep it repeatable
+  params:
+    octet: { type: int, min: 20, max: 90 }
+    room: { type: int, min: 100, max: 199 }
+  topology:
+    entry: workstation
+    nodes:
+      - { name: workstation, driver: container, image: jumphost:1, access: [shell] }
+      - { name: mv-api-host, driver: container, image: netsvc:1, resources: { cpu: 0.2, memoryMiB: 96 }, access: [shell] }
+      - { name: mv-sw-annex-1, driver: netdev, image: srlinux:25, access: [console] }
+    links: []
+  setup:
+    - on: mv-sw-annex-1
+      run: |
+        for i in $(seq 120); do sr_cli 'info from state / system json-rpc-server' >/dev/null 2>&1 && break; sleep 2; done
+        cat > /tmp/base.cli <<'CLI'
+        enter candidate
+        set / system json-rpc-server admin-state enable
+        set / system json-rpc-server network-instance mgmt http admin-state enable
+        set / system aaa authentication admin-user password annex-{{octet}}-api
+        set / interface ethernet-1/1 admin-state enable
+        set / interface ethernet-1/1 description unused
+        set / interface ethernet-1/1 subinterface 0 type bridged
+        set / interface ethernet-1/2 admin-state enable
+        set / interface ethernet-1/2 description unused
+        set / interface ethernet-1/2 subinterface 0 type bridged
+        set / interface ethernet-1/3 admin-state enable
+        set / interface ethernet-1/3 description unused
+        set / interface ethernet-1/3 subinterface 0 type bridged
+        set / interface ethernet-1/4 admin-state enable
+        set / interface ethernet-1/4 description unused
+        set / interface ethernet-1/4 subinterface 0 type bridged
+        set / interface ethernet-1/5 admin-state enable
+        set / interface ethernet-1/5 description do-not-touch
+        commit now
+        CLI
+        sr_cli < /tmp/base.cli
+    - on: mv-api-host
+      run: |
+        mkdir -p /root/changes /var/lib/cloudtrain
+        cat > /root/changes/annex-ports.yaml <<'YML'
+        changes:
+          - { port: ethernet-1/1, description: room-{{room}}-teacher, admin_state: enable }
+          - { port: ethernet-1/2, description: room-{{room}}-printer, admin_state: enable }
+          - { port: ethernet-1/3, description: room-{{room}}-spare, admin_state: disable }
+          - { port: ethernet-1/4, description: room-{{room}}-camera, admin_state: enable }
+        YML
+        cat > /var/lib/cloudtrain/live.sh <<'SH'
+        #!/bin/sh
+        # live.sh PATH: print the state value at /interface[name=PORT]/LEAF given as "PORT LEAF"
+        curl -s -u admin:annex-{{octet}}-api http://mv-sw-annex-1/jsonrpc -d '{"jsonrpc":"2.0","id":1,"method":"get","params":{"commands":[{"path":"/interface[name='$1']/'$2'","datastore":"state"}]}}' | jq -r '.result[0] | if type == "array" then length else . end'
+        SH
+        chmod 755 /var/lib/cloudtrain/live.sh
+  checks:
+    - id: script-uses-api
+      description: apply-changes.sh exists, is executable and talks to the JSON-RPC endpoint
+      type: shell
+      on: mv-api-host
+      command: |
+        [ -x /root/apply-changes.sh ] && grep -q jsonrpc /root/apply-changes.sh && ! grep -q sr_cli /root/apply-changes.sh && echo ok || echo no
+      expect: { match: exact, value: ok }
+      skills: [net.automation.json-rpc]
+    - id: descriptions-set
+      description: The four ports carry the requested descriptions
+      type: shell
+      on: mv-api-host
+      command: |
+        for i in $(seq 20); do
+          r=$(for n in 1 2 3 4; do /var/lib/cloudtrain/live.sh ethernet-1/$n description; done | tr '\n' ' ')
+          [ "$r" = "room-{{room}}-teacher room-{{room}}-printer room-{{room}}-spare room-{{room}}-camera " ] && { echo ok; exit 0; }
+          sleep 1
+        done
+        echo "$r"
+      expect: { match: exact, value: ok }
+      timeoutSec: 40
+      skills: [net.automation.json-rpc]
+      weight: 2
+    - id: admin-states
+      description: Ports 1, 2 and 4 are enabled and port 3 is disabled
+      type: shell
+      on: mv-api-host
+      command: |
+        for n in 1 2 3 4; do /var/lib/cloudtrain/live.sh ethernet-1/$n admin-state; done | tr '\n' ' '
+      expect: { match: exact, value: "enable enable disable enable " }
+      skills: [net.automation.json-rpc]
+      weight: 2
+    - id: untouched-config-kept
+      description: ethernet-1/5 keeps its description and every access port keeps its bridged sub-interface
+      type: shell
+      on: mv-api-host
+      command: |
+        d=$(/var/lib/cloudtrain/live.sh ethernet-1/5 description)
+        s=$(for n in 1 2 3 4; do curl -s -u admin:annex-{{octet}}-api http://mv-sw-annex-1/jsonrpc -d '{"jsonrpc":"2.0","id":1,"method":"get","params":{"commands":[{"path":"/interface[name=ethernet-1/'$n']/subinterface[index=0]/type","datastore":"running"}]}}' | jq -r '.result[0]'; done | tr '\n' ' ')
+        echo "$d $s"
+      expect: { match: exact, value: "do-not-touch bridged bridged bridged bridged " }
+      skills: [net.automation.json-rpc]
+    - id: script-repeatable
+      description: Running apply-changes.sh again succeeds and changes nothing
+      type: shell
+      on: mv-api-host
+      command: |
+        [ -x /root/apply-changes.sh ] || { echo missing; exit 0; }
+        /root/apply-changes.sh >/dev/null 2>&1 || { echo failed; exit 0; }
+        for n in 1 2 3 4; do /var/lib/cloudtrain/live.sh ethernet-1/$n description; done | tr '\n' ' '
+      expect: { match: exact, value: "room-{{room}}-teacher room-{{room}}-printer room-{{room}}-spare room-{{room}}-camera " }
+      timeoutSec: 60
+      skills: [net.automation.json-rpc]
+  hints:
+    - title: update, not replace
+      body: "`update` merges the value into the existing node; `replace` swaps the whole node and removes every sibling the request does not mention. For one leaf both work, for a whole interface only `update` is safe."
+      cost: 1
+    - title: Reading the YAML
+      body: "Python is on the host: `python3 -c 'import yaml,json,sys; print(json.dumps(yaml.safe_load(open(sys.argv[1]))))' file | jq -c '.changes[]'` gives one JSON object per port to loop over."
+      cost: 1
+  misconceptions:
+    - id: descriptions-only
+      description: Applies the descriptions and forgets the admin-state column
+      mutation:
+        on: mv-api-host
+        run: |
+          cat > /root/apply-changes.sh <<'SH'
+          #!/bin/sh
+          python3 -c 'import yaml,json; [print(json.dumps(c)) for c in yaml.safe_load(open("/root/changes/annex-ports.yaml"))["changes"]]' | while read -r c; do
+            p=$(echo "$c" | jq -r .port); d=$(echo "$c" | jq -r .description)
+            curl -s -u admin:annex-{{octet}}-api http://mv-sw-annex-1/jsonrpc -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"set\",\"params\":{\"commands\":[{\"action\":\"update\",\"path\":\"/interface[name=$p]/description\",\"value\":\"$d\"}]}}" >/dev/null
+          done
+          SH
+          chmod 755 /root/apply-changes.sh; /root/apply-changes.sh
+      expectFail: [admin-states]
+      feedback: The change request has two columns per port; a port that was meant to be shut stays in service if only the description is applied.
+    - id: replace-whole-interface
+      description: Uses replace on the whole interface node, which wipes the sub-interface and any other setting
+      mutation:
+        on: mv-api-host
+        run: |
+          cat > /root/apply-changes.sh <<'SH'
+          #!/bin/sh
+          python3 -c 'import yaml,json; [print(json.dumps(c)) for c in yaml.safe_load(open("/root/changes/annex-ports.yaml"))["changes"]]' | while read -r c; do
+            p=$(echo "$c" | jq -r .port); d=$(echo "$c" | jq -r .description); a=$(echo "$c" | jq -r .admin_state)
+            curl -s -u admin:annex-{{octet}}-api http://mv-sw-annex-1/jsonrpc -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"set\",\"params\":{\"commands\":[{\"action\":\"replace\",\"path\":\"/interface[name=$p]\",\"value\":{\"description\":\"$d\",\"admin-state\":\"$a\"}}]}}" >/dev/null
+          done
+          SH
+          chmod 755 /root/apply-changes.sh; /root/apply-changes.sh
+      expectFail: [untouched-config-kept]
+      feedback: "`replace` on the interface node swaps the whole subtree, so the bridged sub-interface disappears. Address the leaves, or use `update`."
+    - id: candidate-never-committed
+      description: Writes into the candidate datastore and never commits
+      mutation:
+        on: mv-api-host
+        run: |
+          cat > /root/apply-changes.sh <<'SH'
+          #!/bin/sh
+          python3 -c 'import yaml,json; [print(json.dumps(c)) for c in yaml.safe_load(open("/root/changes/annex-ports.yaml"))["changes"]]' | while read -r c; do
+            p=$(echo "$c" | jq -r .port); d=$(echo "$c" | jq -r .description); a=$(echo "$c" | jq -r .admin_state)
+            curl -s -u admin:annex-{{octet}}-api http://mv-sw-annex-1/jsonrpc -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"set\",\"params\":{\"datastore\":\"candidate\",\"commands\":[{\"action\":\"update\",\"path\":\"/interface[name=$p]/description\",\"value\":\"$d\"},{\"action\":\"update\",\"path\":\"/interface[name=$p]/admin-state\",\"value\":\"$a\"}]}}" >/dev/null
+          done
+          SH
+          chmod 755 /root/apply-changes.sh; /root/apply-changes.sh
+      expectFail: [descriptions-set, admin-states]
+      feedback: A candidate edit is not the running configuration until a commit; the switch keeps its old state.
+  solution:
+    explanation: |
+      Write a script that turns each YAML entry into one `set`/`update` request for the two leaves of
+      the port, run it, and run it again to show it is repeatable.
+    steps:
+      - on: mv-api-host
+        run: |
+          cat > /root/apply-changes.sh <<'SH'
+          #!/bin/sh
+          python3 -c 'import yaml,json; [print(json.dumps(c)) for c in yaml.safe_load(open("/root/changes/annex-ports.yaml"))["changes"]]' | while read -r c; do
+            p=$(echo "$c" | jq -r .port); d=$(echo "$c" | jq -r .description); a=$(echo "$c" | jq -r .admin_state)
+            curl -s -u admin:annex-{{octet}}-api http://mv-sw-annex-1/jsonrpc -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"set\",\"params\":{\"commands\":[{\"action\":\"update\",\"path\":\"/interface[name=$p]/description\",\"value\":\"$d\"},{\"action\":\"update\",\"path\":\"/interface[name=$p]/admin-state\",\"value\":\"$a\"}]}}" >/dev/null
+          done
+          SH
+          chmod 755 /root/apply-changes.sh; /root/apply-changes.sh; /root/apply-changes.sh

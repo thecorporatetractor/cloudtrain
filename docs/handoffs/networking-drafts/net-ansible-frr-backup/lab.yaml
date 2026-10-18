@@ -1,0 +1,305 @@
+# BLOCKED DRAFT (status proposed): frr:10 has no sshd (image rebuild needed) and ansible-ctl:2.21 ships no
+# ansible.netcommon / frr.frr collections, so Ansible cannot reach FRR routers. The curriculum names
+# gitea:1, which is not in deploy/images/catalog.yaml; this design uses a local bare repository on the
+# control node instead. Nothing here has run. Needs: sshd (and a login for learner) on frr:10, plus
+# ansible.netcommon and frr.frr mirrored into /usr/share/ansible/collections of ansible-ctl.
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: net-ansible-frr-backup
+  title: Back up every router configuration to Git with Ansible
+  domain: networking
+  frameworks: [ccna:automation-programmability]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [ansible, git, backup, idempotent, frr, network_cli]
+  version: 1
+spec:
+  description: |
+    **Devices:** `mv-ansible` (control node, user `learner`), routers `mv-core-1`,
+    `mv-campus-north` and `mv-campus-south`
+
+    Nobody can say what the district routers were running last month. On `mv-ansible`, as `learner`,
+    you have:
+
+    - `~/inventory.yml`: group `routers` with the three routers (reachable over the connection
+      plugin `ansible.netcommon.network_cli`, network OS `frr.frr.frr`, user `learner`);
+    - `~/net-backups.git`: an empty-ish bare repository (branch `main`, one README commit) and a
+      working clone `~/net-backups`.
+
+    Write `~/backup.yml` so that one run:
+
+    1. reads the running configuration (`show running-config`) of every router in `routers`;
+    2. stores it as `backups/<router>.cfg` in `~/net-backups`, one file per router;
+    3. commits and pushes to `~/net-backups.git` **only if** at least one file changed. A second
+       run with no router change must not add a commit, and a change to one router must add exactly
+       one commit that touches only that router's file.
+
+    Run it once so the repository holds the first backup.
+  objectives:
+    - Pull device configuration with a network_cli command module
+    - Store one artefact per device and version it in Git
+    - Make a backup playbook idempotent, with no volatile content in the files
+  params:
+    octet: { type: int, min: 20, max: 90 }
+  topology:
+    entry: workstation
+    nodes:
+      - { name: workstation, driver: container, image: jumphost:1, access: [shell] }
+      - { name: mv-ansible, driver: container, image: ansible-ctl:2.21, resources: { cpu: 0.3, memoryMiB: 192 }, access: [shell] }
+      - { name: mv-core-1, driver: netdev, image: frr:10, access: [console] }
+      - { name: mv-campus-north, driver: netdev, image: frr:10, access: [console] }
+      - { name: mv-campus-south, driver: netdev, image: frr:10, access: [console] }
+    links:
+      - { a: "mv-ansible:eth1", b: "mv-core-1:eth1", subnet: "10.{{octet}}.51.0/30" }
+      - { a: "mv-ansible:eth2", b: "mv-campus-north:eth1", subnet: "10.{{octet}}.52.0/30" }
+      - { a: "mv-ansible:eth3", b: "mv-campus-south:eth1", subnet: "10.{{octet}}.53.0/30" }
+  setup:
+    - on: mv-core-1
+      config: |
+        interface lo
+         ip address 10.255.{{octet}}.1/32
+    - on: mv-campus-north
+      config: |
+        interface lo
+         ip address 10.255.{{octet}}.2/32
+    - on: mv-campus-south
+      config: |
+        interface lo
+         ip address 10.255.{{octet}}.3/32
+    - on: mv-ansible
+      run: |
+        mkdir -p /var/lib/cloudtrain
+        cat > /home/learner/inventory.yml <<'YML'
+        all:
+          children:
+            routers:
+              hosts:
+                mv-core-1: { ansible_host: 10.{{octet}}.51.2 }
+                mv-campus-north: { ansible_host: 10.{{octet}}.52.2 }
+                mv-campus-south: { ansible_host: 10.{{octet}}.53.2 }
+              vars:
+                ansible_connection: ansible.netcommon.network_cli
+                ansible_network_os: frr.frr.frr
+                ansible_user: learner
+        YML
+        printf '[defaults]\ninventory = /home/learner/inventory.yml\nhost_key_checking = False\n' > /home/learner/ansible.cfg
+        chown learner: /home/learner/inventory.yml /home/learner/ansible.cfg
+        su learner -c 'cd /home/learner && git init -q --bare -b main net-backups.git && git clone -q net-backups.git net-backups && cd net-backups && echo "Router configuration backups" > README.md && git add README.md && git -c user.name=setup -c user.email=setup@mv.example commit -q -m "Initial commit" && git push -q origin HEAD:main'
+        cat > /var/lib/cloudtrain/count.sh <<'SH'
+        #!/bin/sh
+        git --git-dir=/home/learner/net-backups.git rev-list --count main 2>/dev/null || echo 0
+        SH
+        chmod 755 /var/lib/cloudtrain/count.sh
+  checks:
+    - id: one-file-per-router
+      description: The pushed repository holds exactly one backup file per router
+      type: shell
+      on: mv-ansible
+      command: |
+        git --git-dir=/home/learner/net-backups.git ls-tree -r --name-only main 2>/dev/null | grep '^backups/' | sort | tr '\n' ' '
+      expect: { match: exact, value: "backups/mv-campus-north.cfg backups/mv-campus-south.cfg backups/mv-core-1.cfg " }
+      skills: [net.automation.ansible-network]
+      weight: 2
+    - id: files-are-configs
+      description: Each file is that router's running configuration
+      type: shell
+      on: mv-ansible
+      command: |
+        for r in mv-campus-north mv-campus-south mv-core-1; do git --git-dir=/home/learner/net-backups.git show main:backups/$r.cfg 2>/dev/null | grep -c "^hostname $r\$"; done | tr '\n' ' '
+      expect: { match: exact, value: "1 1 1 " }
+      skills: [net.automation.ansible-network]
+    - id: rerun-adds-nothing
+      description: A second run without any router change adds no commit
+      type: shell
+      on: mv-ansible
+      command: |
+        [ -f /home/learner/backup.yml ] || { echo missing; exit 0; }
+        b=$(/var/lib/cloudtrain/count.sh)
+        su learner -c 'cd /home/learner && ansible-playbook backup.yml' >/dev/null 2>&1 || { echo failed; exit 0; }
+        a=$(/var/lib/cloudtrain/count.sh)
+        [ "$a" = "$b" ] && echo same || echo "$b-$a"
+      expect: { match: exact, value: same }
+      timeoutSec: 120
+      skills: [net.automation.ansible-network]
+      weight: 2
+    - id: trigger-router-change
+      description: (trigger, weight 0) change the running configuration of mv-campus-north
+      type: shell
+      on: mv-campus-north
+      command: |
+        vtysh -c 'configure terminal' -c 'interface lo' -c "description backup-test-$(date +%s)" >/dev/null 2>&1; echo done
+      expect: { match: exact, value: done }
+      skills: [net.automation.ansible-network]
+      weight: 0
+    - id: change-adds-one-commit
+      description: After a router changed, one run adds exactly one commit, touching only that router's file
+      type: shell
+      on: mv-ansible
+      command: |
+        [ -f /home/learner/backup.yml ] || { echo missing; exit 0; }
+        b=$(/var/lib/cloudtrain/count.sh)
+        su learner -c 'cd /home/learner && ansible-playbook backup.yml' >/dev/null 2>&1 || { echo failed; exit 0; }
+        a=$(/var/lib/cloudtrain/count.sh)
+        f=$(git --git-dir=/home/learner/net-backups.git show --name-only --format= main | tr '\n' ' ')
+        [ "$a" = "$((b + 1))" ] && echo "$f" || echo "commits $b-$a"
+      expect: { match: exact, value: "backups/mv-campus-north.cfg " }
+      timeoutSec: 120
+      skills: [net.automation.ansible-network]
+      weight: 2
+  hints:
+    - title: Fetching the configuration
+      body: "`ansible.netcommon.cli_command` with `command: show running-config` returns the text in `stdout`. Register it and write it with `ansible.builtin.copy` and `delegate_to: localhost`."
+      cost: 1
+    - title: Commit only on change
+      body: "After `git add`, `git diff --cached --quiet` exits 0 when nothing is staged. Commit and push only in the other case, and keep anything that changes on every run (dates, run ids) out of the files."
+      cost: 1
+  misconceptions:
+    - id: timestamp-in-file
+      description: Puts a generation timestamp into every backup file, so each run looks like a change
+      mutation:
+        on: mv-ansible
+        run: |
+          cat <<'EOF' | sed -e 's/@{/{''{/g' -e 's/}@/}''}/g' > /home/learner/backup.yml
+          - hosts: routers
+            gather_facts: false
+            tasks:
+              - ansible.netcommon.cli_command: { command: show running-config }
+                register: cfg
+              - ansible.builtin.copy:
+                  content: "! backed up @{ lookup('pipe', 'date +%s') }@\n@{ cfg.stdout }@\n"
+                  dest: /home/learner/net-backups/backups/@{ inventory_hostname }@.cfg
+                delegate_to: localhost
+          - hosts: localhost
+            gather_facts: false
+            tasks:
+              - ansible.builtin.shell: |
+                  cd /home/learner/net-backups && git add backups && git diff --cached --quiet || { git -c user.name=ansible -c user.email=a@mv.example commit -q -m backup && git push -q origin HEAD:main; }
+          EOF
+          chown learner: /home/learner/backup.yml
+          su learner -c 'cd /home/learner && ansible-playbook backup.yml'
+      expectFail: [rerun-adds-nothing]
+      feedback: A volatile line in the file makes every run a change, so the history fills with commits that say nothing. Keep the file a pure copy of the device output.
+    - id: single-file
+      description: Appends every router's configuration to one file
+      mutation:
+        on: mv-ansible
+        run: |
+          cat <<'EOF' | sed -e 's/@{/{''{/g' -e 's/}@/}''}/g' > /home/learner/backup.yml
+          - hosts: routers
+            gather_facts: false
+            serial: 1
+            tasks:
+              - ansible.netcommon.cli_command: { command: show running-config }
+                register: cfg
+              - ansible.builtin.blockinfile:
+                  path: /home/learner/net-backups/backups/all.cfg
+                  create: true
+                  marker: "! @{ inventory_hostname }@ {mark}"
+                  block: "@{ cfg.stdout }@"
+                delegate_to: localhost
+          - hosts: localhost
+            gather_facts: false
+            tasks:
+              - ansible.builtin.shell: |
+                  cd /home/learner/net-backups && git add backups && git diff --cached --quiet || { git -c user.name=ansible -c user.email=a@mv.example commit -q -m backup && git push -q origin HEAD:main; }
+          EOF
+          chown learner: /home/learner/backup.yml
+          su learner -c 'cd /home/learner && ansible-playbook backup.yml'
+      expectFail: [one-file-per-router, files-are-configs]
+      feedback: One file per device keeps the history readable (a diff names the router that changed) and lets you restore a single device.
+    - id: never-pushed
+      description: Commits in the working clone but never pushes to the bare repository
+      mutation:
+        on: mv-ansible
+        run: |
+          cat <<'EOF' | sed -e 's/@{/{''{/g' -e 's/}@/}''}/g' > /home/learner/backup.yml
+          - hosts: routers
+            gather_facts: false
+            tasks:
+              - ansible.netcommon.cli_command: { command: show running-config }
+                register: cfg
+              - ansible.builtin.copy:
+                  content: "@{ cfg.stdout }@\n"
+                  dest: /home/learner/net-backups/backups/@{ inventory_hostname }@.cfg
+                delegate_to: localhost
+          - hosts: localhost
+            gather_facts: false
+            tasks:
+              - ansible.builtin.shell: |
+                  cd /home/learner/net-backups && git add backups && git diff --cached --quiet || git -c user.name=ansible -c user.email=a@mv.example commit -q -m backup
+          EOF
+          chown learner: /home/learner/backup.yml
+          su learner -c 'cd /home/learner && ansible-playbook backup.yml'
+      expectFail: [one-file-per-router, files-are-configs]
+      feedback: The backup repository is the bare one; a commit that stays in the working clone is lost with the control node.
+  solution:
+    explanation: |
+      Fetch `show running-config` with `cli_command`, copy it to `backups/<router>.cfg` on localhost,
+      then stage, and commit and push only when the staged diff is not empty.
+    steps:
+      - on: mv-ansible
+        run: |
+          cat <<'EOF' | sed -e 's/@{/{''{/g' -e 's/}@/}''}/g' > /home/learner/backup.yml
+          - hosts: routers
+            gather_facts: false
+            tasks:
+              - name: Read the running configuration
+                ansible.netcommon.cli_command:
+                  command: show running-config
+                register: cfg
+              - name: Store one file per router
+                ansible.builtin.copy:
+                  content: "@{ cfg.stdout }@\n"
+                  dest: /home/learner/net-backups/backups/@{ inventory_hostname }@.cfg
+                  mode: "0644"
+                delegate_to: localhost
+          - hosts: localhost
+            gather_facts: false
+            tasks:
+              - name: Commit and push only when a file changed
+                ansible.builtin.shell: |
+                  cd /home/learner/net-backups
+                  git add backups
+                  git diff --cached --quiet && exit 0
+                  git -c user.name=ansible -c user.email=ansible@mv.example commit -q -m "Router configuration backup"
+                  git push -q origin HEAD:main
+                  echo committed
+                register: c
+                changed_when: "'committed' in c.stdout"
+          EOF
+          chown learner: /home/learner/backup.yml
+          su learner -c 'cd /home/learner && ansible-playbook backup.yml'
+    alternatives:
+      - id: with-git-module
+        description: Stage, test and commit with separate ansible.builtin.command tasks and a when condition instead of one shell block
+        steps:
+          - on: mv-ansible
+            run: |
+              cat <<'EOF' | sed -e 's/@{/{''{/g' -e 's/}@/}''}/g' > /home/learner/backup.yml
+              - hosts: routers
+                gather_facts: false
+                tasks:
+                  - ansible.netcommon.cli_command: { command: show running-config }
+                    register: cfg
+                  - ansible.builtin.copy:
+                      content: "@{ cfg.stdout }@\n"
+                      dest: /home/learner/net-backups/backups/@{ inventory_hostname }@.cfg
+                    delegate_to: localhost
+              - hosts: localhost
+                gather_facts: false
+                tasks:
+                  - ansible.builtin.command: git add backups
+                    args: { chdir: /home/learner/net-backups }
+                    changed_when: false
+                  - ansible.builtin.command: git diff --cached --quiet
+                    args: { chdir: /home/learner/net-backups }
+                    register: staged
+                    failed_when: staged.rc > 1
+                    changed_when: false
+                  - ansible.builtin.shell: git -c user.name=ansible -c user.email=a@mv.example commit -q -m backup && git push -q origin HEAD:main
+                    args: { chdir: /home/learner/net-backups }
+                    when: staged.rc == 1
+              EOF
+              chown learner: /home/learner/backup.yml
+              su learner -c 'cd /home/learner && ansible-playbook backup.yml'

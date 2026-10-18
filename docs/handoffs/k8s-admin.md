@@ -133,12 +133,15 @@ merged, either the add-ons land in `kubeadm:1.37` or these labs (and their curri
 `images`, owned by the curriculum) must switch to `kubeadm:1.37-full`; for exam tasks
 every task sharing that cluster must switch together (identical node definitions).
 
-### Proposed (not authored)
+### Proposed note, resolved (round 5 wave 1, networking stream)
 
-- distroless-invoice-debug: needs a distroless (shell-less) application image in
-  `workloadImages`; nothing in the catalog qualifies.
-- shipment-operator-crd: the learner installs an operator; needs an operator image (e.g.
-  a kubectl-based controller image) in `workloadImages`.
+- distroless-invoice-debug: authored and verified live. No distroless image is needed: the
+  renderer Pod runs a shell-less workload and the learner debugs it with an ephemeral container
+  (`--profile=baseline`); use is recorded by an admin-container audit loop.
+- shipment-operator-crd: authored and verified live. The operator is simulated by an
+  admin-container reconcile loop (gated on the CRD being Established, the operator Deployment
+  Available and its ServiceAccount allowed to create Deployments). A real controller image in
+  `workloadImages` is still a catalog gap; swap the loop for it when one exists.
 
 ## In flight at pause
 

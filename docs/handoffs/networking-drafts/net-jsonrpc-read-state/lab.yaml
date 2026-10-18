@@ -1,0 +1,157 @@
+# BLOCKED DRAFT (status proposed): needs srlinux:25 (no catalog entry, no `netdev: srlinux` family,
+# hosted-training EULA pending). Written against the intended design; nothing here has run.
+# First-verify risks: sr_cli reading commands from stdin, the SR Linux boot time (setup waits for the
+# management server), JSON-RPC over plain HTTP (chosen so no TLS profile or key material is needed).
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: net-jsonrpc-read-state
+  title: Read switch state through a JSON-RPC API
+  domain: networking
+  frameworks: [ccna:automation-programmability]
+  difficulty: easy
+  estimatedMinutes: 15
+  tags: [json-rpc, api, curl, jq, srlinux]
+  version: 1
+spec:
+  description: |
+    **Devices:** `mv-api-host` (shell, `curl` and `jq`), `mv-sw-annex-1` (network OS switch)
+
+    The annex switch `mv-sw-annex-1` exposes a JSON-RPC API at `http://mv-sw-annex-1/jsonrpc`
+    (user `admin`, password `annex-{{octet}}-api`). Requests are HTTP POSTs with a JSON-RPC 2.0
+    body. A read looks like this:
+
+        {"jsonrpc": "2.0", "id": 1, "method": "get",
+         "params": {"commands": [{"path": "/interface[name=ethernet-1/1]/oper-state", "datastore": "state"}]}}
+
+    The reply carries one entry of `result` per command.
+
+    1. From `mv-api-host`, query the API (not the switch CLI) for the operational state and the
+       description of `ethernet-1/1` to `ethernet-1/4`.
+    2. Write `/root/interfaces.json`: one JSON object whose keys are the interface names and whose
+       values are objects with `oper_state` and `description`, for example
+       `{"ethernet-1/1": {"oper_state": "up", "description": "..."}, ...}`. The grader re-reads the
+       live switch and compares.
+  objectives:
+    - Send an authenticated JSON-RPC get request with curl
+    - Pick fields out of a JSON-RPC reply with jq and write a structured file
+    - Tell operational state from configured (admin) state
+  params:
+    octet: { type: int, min: 20, max: 90 }
+    rack: { type: int, min: 1, max: 9 }
+  topology:
+    entry: workstation
+    nodes:
+      - { name: workstation, driver: container, image: jumphost:1, access: [shell] }
+      - { name: mv-api-host, driver: container, image: netsvc:1, resources: { cpu: 0.2, memoryMiB: 96 }, access: [shell] }
+      - { name: mv-sw-annex-1, driver: netdev, image: srlinux:25, access: [console] }
+      - { name: annex-host-1, driver: container, image: nettools:1, resources: { cpu: 0.1, memoryMiB: 48 } }
+      - { name: annex-host-2, driver: container, image: nettools:1, resources: { cpu: 0.1, memoryMiB: 48 } }
+    links:
+      - { a: "mv-sw-annex-1:e1-1", b: "annex-host-1:eth1" }
+      - { a: "mv-sw-annex-1:e1-2", b: "annex-host-2:eth1" }
+  setup:
+    - on: mv-sw-annex-1
+      run: |
+        for i in $(seq 120); do sr_cli 'info from state / system json-rpc-server' >/dev/null 2>&1 && break; sleep 2; done
+        cat > /tmp/base.cli <<'CLI'
+        enter candidate
+        set / system json-rpc-server admin-state enable
+        set / system json-rpc-server network-instance mgmt http admin-state enable
+        set / system aaa authentication admin-user password annex-{{octet}}-api
+        set / interface ethernet-1/1 admin-state enable
+        set / interface ethernet-1/1 description rack{{rack}}-port-1-teachers
+        set / interface ethernet-1/2 admin-state enable
+        set / interface ethernet-1/2 description rack{{rack}}-port-2-printer
+        set / interface ethernet-1/3 admin-state enable
+        set / interface ethernet-1/3 description rack{{rack}}-port-3-spare
+        set / interface ethernet-1/4 admin-state disable
+        set / interface ethernet-1/4 description rack{{rack}}-port-4-retired
+        commit now
+        CLI
+        sr_cli < /tmp/base.cli
+    - on: annex-host-1
+      run: ip link set eth1 up
+    - on: annex-host-2
+      run: ip link set eth1 up
+    - on: mv-api-host
+      run: |
+        mkdir -p /var/lib/cloudtrain
+        cat > /var/lib/cloudtrain/live.sh <<'SH'
+        #!/bin/sh
+        # prints the expected interfaces.json from the live switch
+        out='{}'
+        for n in 1 2 3 4; do
+          q() { curl -s -u admin:annex-{{octet}}-api http://mv-sw-annex-1/jsonrpc -d '{"jsonrpc":"2.0","id":1,"method":"get","params":{"commands":[{"path":"/interface[name=ethernet-1/'$n']/'$1'","datastore":"state"}]}}' | jq -r '.result[0]'; }
+          out=$(echo "$out" | jq -c --arg k "ethernet-1/$n" --arg s "$(q oper-state)" --arg d "$(q description)" '. + {($k): {oper_state: $s, description: $d}}')
+        done
+        echo "$out" | jq -S .
+        SH
+        chmod 755 /var/lib/cloudtrain/live.sh
+  checks:
+    - id: file-is-json
+      description: /root/interfaces.json is a JSON object with the four interfaces
+      type: shell
+      on: mv-api-host
+      command: |
+        jq -r 'keys | join(" ")' /root/interfaces.json 2>/dev/null || echo invalid
+      expect: { match: exact, value: "ethernet-1/1 ethernet-1/2 ethernet-1/3 ethernet-1/4" }
+      skills: [net.automation.json-rpc]
+    - id: matches-live-state
+      description: The file equals the live oper-state and description of every interface
+      type: shell
+      on: mv-api-host
+      command: |
+        [ -f /root/interfaces.json ] || { echo missing; exit 0; }
+        jq -S . /root/interfaces.json > /tmp/.got 2>/dev/null
+        /var/lib/cloudtrain/live.sh > /tmp/.want
+        cmp -s /tmp/.got /tmp/.want && echo same || echo differs; rm -f /tmp/.got /tmp/.want
+      expect: { match: exact, value: same }
+      skills: [net.automation.apis, net.automation.json-rpc]
+      weight: 2
+    - id: retired-port-down
+      description: The file reports the retired port ethernet-1/4 as down and the others as listed by the switch
+      type: shell
+      on: mv-api-host
+      command: |
+        jq -r '."ethernet-1/4".oper_state + " " + ."ethernet-1/4".description' /root/interfaces.json 2>/dev/null || echo invalid
+      expect: { match: exact, value: "down rack{{rack}}-port-4-retired" }
+      skills: [net.automation.json-rpc]
+  hints:
+    - title: One request per path
+      body: "POST the body with `curl -s -u admin:PASSWORD http://mv-sw-annex-1/jsonrpc -d '...'`. The `datastore` for live values is `state`; `running` shows only what is configured."
+      cost: 1
+    - title: Extracting the answer
+      body: "The value of the first command is `.result[0]`. Build the object with `jq -n --arg ...` or loop over the four ports and merge with `jq -s add`."
+      cost: 1
+  misconceptions:
+    - id: admin-instead-of-oper
+      description: Reports the configured admin-state instead of the operational state
+      mutation:
+        on: mv-api-host
+        run: |
+          out='{}'
+          for n in 1 2 3 4; do
+            q() { curl -s -u admin:annex-{{octet}}-api http://mv-sw-annex-1/jsonrpc -d '{"jsonrpc":"2.0","id":1,"method":"get","params":{"commands":[{"path":"/interface[name=ethernet-1/'$n']/'$1'","datastore":"state"}]}}' | jq -r '.result[0]'; }
+            s=$(q admin-state); [ "$s" = enable ] && s=up || s=down
+            out=$(echo "$out" | jq -c --arg k "ethernet-1/$n" --arg s "$s" --arg d "$(q description)" '. + {($k): {oper_state: $s, description: $d}}')
+          done
+          echo "$out" | jq . > /root/interfaces.json
+      expectFail: [matches-live-state]
+      feedback: "`admin-state` is what an operator asked for; `oper-state` is what the interface is doing. An enabled port with no cable is admin up and oper down."
+    - id: extra-interfaces
+      description: Dumps every interface of the switch, management and system ones included
+      mutation:
+        on: mv-api-host
+        run: |
+          curl -s -u admin:annex-{{octet}}-api http://mv-sw-annex-1/jsonrpc -d '{"jsonrpc":"2.0","id":1,"method":"get","params":{"commands":[{"path":"/interface","datastore":"state"}]}}' | jq '.result[0]' > /root/interfaces.json
+      expectFail: [file-is-json, matches-live-state]
+      feedback: The file format asks for the four annex ports with exactly two fields each; reshape the reply rather than saving it whole.
+  solution:
+    explanation: |
+      Loop over the four ports, read `oper-state` and `description` from the state datastore with a
+      JSON-RPC get, and assemble the object with jq.
+    steps:
+      - on: mv-api-host
+        run: |
+          /var/lib/cloudtrain/live.sh > /root/interfaces.json
