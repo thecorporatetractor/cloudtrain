@@ -593,7 +593,12 @@ A cloud VM runs the verify batches unattended (AWS r8i.8xlarge Spot: 32 vCPU, 24
 Ubuntu 24.04, nested KVM; root disk 50 GB, data volume 512 GB xfs on `/var/lib/docker`
 that survives stop/start). It holds no secrets: no `~/.config/cloudtrain/*.env`, no GitHub
 token, no cloud or Entra credentials; everything it pulls is public. The scripts and
-configs are in `tools/verify-vm/`; on the VM they are copied to `/srv/ct-work/vm-config/`.
+configs are in `tools/verify-vm/`; on the VM they are copied to `/srv/ct-work/vm-config/`
+by `tools/verify-vm/install.sh`, which also installs the systemd units with their drop-ins
+(`systemd/`, e.g. the damped autoscaler limits in `ct-autoscale.service.d/90-damp.conf`) and the
+sshd drop-in `sshd/90-ct-sessions.conf` (`MaxSessions 100`, `MaxStartups 100:30:300`: many
+agents and verifies reach the VM over ssh at once and the defaults refuse them). It keeps an
+existing `runner.env` (the autoscaler rewrites its slot limits).
 
 Setup (as `ubuntu`):
 
@@ -661,7 +666,18 @@ labs. `ct-metrics.service` samples CPU, steal, load and memory every 10 s
 (`results/metrics/<date>.tsv`); `ct-autoscale.service` moves `CT_SLOTS_HEAVY`/`CT_SLOTS_POD` in
 `runner.env` every 150 s: up by 3 / 8 while CPU is under 80 % and more than 40 GiB is free
 and the limit is in use, down (heavy -2, pod -4) on steal over 3 %, CPU over 95 %, load over 96, under 20 GiB free, a Kube-OVN
-CNI call older than 15 minutes, or two recent timeout failures.
+CNI call older than 15 minutes, or two recent timeout failures. The installed drop-in damps
+this to `MAX=18 STEP_HEAVY=3 STEP_POD=6 INTERVAL=240 LOAD_MAX=90 CPU_HIGH=75`. "In use" counts
+every `tools/slots/run.sh` job on the host, the runner's and the fix-verify clones' under
+`/srv/ct-work/fix/` (they share the slot locks), and the log shows both (`jobs heavy
+running/all (sessions) ... fix running/all`). A job's weight is its `--parallel`: the load
+overshoot came from fix verifies with `--parallel 3` on top of the batch, so the heavy limit
+does not rise while the sessions in heavy slots reach `VM_SESSIONS_MAX` (3 x MAX), and no limit
+rises while the 1-minute load is over `LOAD_MAX` (the window average lags such a burst). Fix
+verifies run like the runner: `tools/slots/run.sh <slot> -- labctl verify ... --grade-timeout 15m`
+with `runner.env` sourced, so they get the current limits. The runner passes
+`--grade-timeout "${GRADE_TIMEOUT:-15m}"` (labctl's 5 m default cut grading rounds short on a
+loaded host).
 
 Measured on the VM: idle with the platform up, about 2 % CPU, load 2.5-3.5, 9 GiB used, no
 steal. A calibration smoke run (one 3-node kubeadm lab, an el-vm and a docker-vm lab, a netdev
