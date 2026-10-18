@@ -404,6 +404,54 @@ Wave 4 after waves 1-3 (and wave 2 once `el-vm:10` Podman is confirmed): the wri
 
 `labctl exam compile --allow-missing sim-platform-engineer` still fails (pre-existing, confirmed present on `origin/main` before this wave): the iac/ansible xpe tasks' `workstation` node (`terraform-ws:1.15` / an ansible control image) differs from the k8s and containers xpe tasks' `workstation` node (`jumphost:1`). Not fixed in this PR (cross-domain node-sharing decision); flagged for whichever domain's wave reconciles the `sim-platform-engineer` shared nodes.
 
+## Round 5, wave 5 (branch `content/containers-r5-w5`): troubleshooting, delivery, internals, swarm, 19 labs
+
+All 19 are `built` (static checks only; lab-verify --strict, render --check, schema/content tests on CI). This completes the writing of the 79 proposed learning labs once wave 4 (#114) merges. No exam pools were touched (no exam tasks in this wave); the pool state is unchanged.
+
+| Module (course id) | Labs | Host(s) |
+|---|---|---|
+| `ctr-ops-failures` | `ctr-oom-exit-137`, `ctr-nofile-after-upgrade`, `ctr-link-env-removed`, `ctr-seccomp-legacy-binary`, `ctr-api-version-floor`, `ctr-events-flapping`, `ctr-debug-distroless` | one `docker-vm:29` each (`cl-transcode-03`, `cl-edge-01`, `cl-rights-01`, `cl-caption-01`, `cl-ci-01`, `cl-batch-02`, `cl-catalogue-02`) |
+| `ctr-ops-host` | `ctr-log-rotation`, `ctr-restart-policy`, `ctr-daemon-json-conflict`, `ctr-engine-upgrade` (blocked) | `cl-ingest-01`, `cl-subtitle-01`, `cl-pack-01`, `cl-transcode-06` |
+| `ctr-ops-delivery` | `ctr-ci-rootless-buildkit` (blocked), `ctr-release-pipeline-capstone` (blocked) | `cl-ci-02`, `cl-release-01` |
+| `ctr-internals-runtime` | `ctr-runtime-stack-trace`, `ctr-runc-bundle`, `ctr-image-layout-on-disk` | `cl-transcode-04`, `cl-oci-01`, `cl-transcode-05` |
+| `ctr-swarm-all` | `ctr-swarm-init-quorum`, `ctr-swarm-services`, `ctr-swarm-stack` | three `docker-vm:29` (`playout-1..3`, 2 GiB each: heavy) |
+
+### Adaptations and design notes
+
+- `ctr-seccomp-legacy-binary` is adapted: there is no 32-bit binary on docker-vm. The daemon-wide `seccomp-profile` (`/etc/copperleaf/seccomp/tight.json`, an allow-by-default denylist merged into daemon.json with jq) blocks `personality`, which a python ctypes encoder calls first. The learner derives a profile that differs only by allowing `personality`. The grader compares the denied-name set in `HostConfig.SecurityOpt` with the expected one and checks the daemon default stays untouched. The curriculum title and oneLine were changed accordingly.
+- `ctr-link-env-removed` grades name resolution on a user-defined network and an empty `HostConfig.Links`, not the absence of the env vars, so it holds whether or not 29.9 still injects them (`DOCKER_KEEP_DEPRECATED_LEGACY_LINKS_ENV_VARS` unconfirmed). Redis stands in for PostgreSQL.
+- `ctr-api-version-floor` reads `MinAPIVersion` from `docker version --format json` and pins the CI client 6 to 12 minors below it (the engine really refuses it). Any pin in the original range passes; the engine floor must stay unchanged.
+- `ctr-restart-policy` has a behavioural check: it crashes the worker through a control file, restarts dockerd, stops the container and restarts dockerd again (about two minutes).
+- `ctr-daemon-json-conflict` leaves the engine dead in setup (`hosts` in daemon.json plus `-H fd://`); the fix is a drop-in that clears and re-adds `ExecStart` without `-H`.
+- `ctr-runtime-stack-trace` and `ctr-runc-bundle` retitled without runc; `runc` and `ctr` come from containerd.io.
+- Swarm labs: the VMs find each other with `getent ahostsv4`; setup configures `insecure-registries` for `playout-1:5000` on all three, runs `registry:3` on `playout-1`, pushes `catalogue-api` 2.3 and 2.4 (labs 2) and `ad-insertion:1` (lab 3), and joins workers through a temporary token endpoint on `playout-1:8077` that is removed at the end of setup. Checks run `docker node ls` and `docker service ps` with `--format json | jq` on `playout-1`. Mutations and solutions that span hosts run on the workstation and use `ssh playout-N`.
+- Not written as exam tasks: none in this wave.
+
+### Blockers and the next docker-vm image wishlist
+
+| Lab | Blocker |
+|---|---|
+| `ctr-engine-upgrade` | needs a docker-vm variant that boots on Engine 28 with the Engine 29 packages staged as a local apt repo in `/srv/apt/engine-29`; setup refuses otherwise |
+| `ctr-ci-rootless-buildkit` | needs `moby/buildkit:rootless`, `cosign`, `trivy` and an offline trivy database; the BuildKit builder cannot use the engine image store and the host is offline, so setup pushes busybox:1.37 to the lab registry and the Dockerfile builds FROM it (written that way); Gitea is not used (`GITEA_IMAGE` is not on docker-vm), the CI job is a plain script |
+| `ctr-release-pipeline-capstone` | needs `cosign`, `moby/buildkit:v0.23.2` exactly (builder pinned with `--driver-opt image=`; base image served from the lab registry, as in `ctr-buildx-cache-export`) (docker-container builder for the registry cache) and the `buildkit-syft-scanner` image; the arm64 side is `FROM scratch` content (no binfmt) |
+| swarm labs | unconfirmed: the Kube-OVN VPC passes 2377/tcp, 7946/tcp+udp and 4789/udp between lab VMs, and ESP plus kernel `xfrm`/`esp4`/`xt_u32` for the encrypted overlay in `ctr-swarm-stack` (the grader only needs the routing mesh, so the check still passes if encryption is not enforced); 3 VMs x 2 GiB per lab |
+
+Image wishlist for the next docker-vm rebuild (all containers waves): `cosign` v2, `notation`, `trivy` plus an offline vulnerability DB (or grype/scout), `moby/buildkit:v0.23.2` and `moby/buildkit:rootless`, the `buildkit-syft-scanner` image, `golang:1.25-alpine`, distroless bases, binfmt/arm64 bases, a variant with Engine 28 and Engine 29 staged in a local apt repo, and the gitea image.
+
+### Unconfirmed until the first live run
+
+- `ctr-oom-exit-137`, `ctr-events-flapping`: the python / `/dev/shm` allocators really hit the cgroup limit and the exit is 137 with OOMKilled true; `docker events` replays the die and oom events after setup.
+- `ctr-nofile-after-upgrade`: all 5,000 probe connections are answered with 65536 and fewer than 5,000 with 1024.
+- `ctr-seccomp-legacy-binary`: inspect shows `seccomp=<profile json>` for a file profile, and a daemon-level denylist profile applies as written.
+- `ctr-debug-distroless`: `/proc/1/root` readable from the debug container (the hint adds `--cap-add SYS_PTRACE`).
+- `ctr-daemon-json-conflict`: docker.socket after `-H fd://` is dropped; start-limit needs `reset-failed`.
+- `ctr-image-layout-on-disk`: `docker save` emits an OCI layout with `index.json` on Engine 29.
+- `labctl validate` was not run: the prebuilt labctl in the main checkout predates the containers domain; CI builds a current one.
+
+### Verify queue additions
+
+Wave 5 after waves 1 to 4: `ctr-oom-exit-137`, `ctr-nofile-after-upgrade`, `ctr-link-env-removed`, `ctr-api-version-floor`, `ctr-debug-distroless`, `ctr-log-rotation`, `ctr-restart-policy`, `ctr-events-flapping`, `ctr-seccomp-legacy-binary`, `ctr-daemon-json-conflict`, `ctr-runtime-stack-trace`, `ctr-runc-bundle`, `ctr-image-layout-on-disk`; then the three swarm labs (one at a time, three VMs each); the three blocked labs (`ctr-engine-upgrade`, `ctr-ci-rootless-buildkit`, `ctr-release-pipeline-capstone`) after the image rebuild.
+
 ## Open questions for the user
 
 - Drop the legacy Docker-cert overlay path (`dca-legacy` refs stay on the labs until
@@ -434,3 +482,5 @@ One lab verify is 6-8 fresh VMs (two seeds, mutations, alternatives): 9-21 min w
 `--parallel 2` (VM ready in about 110 s on a quiet machine, 350-520 s under load).
 Under heavy machine load (load average around 100) WSL restarted once during a verify
 batch; run one containers verify job at a time.
+
+Wave 5 follow-ups: (1) `ctr-engine-upgrade` keeps a container alive through a major upgrade with live-restore, which Docker supports only for patch upgrades; build the image variant as 29.a to 29.b, or confirm 28 to 29 on the first live run, and drop the containerd.io upgrade from the solution if it breaks the restore. (2) `ctr-swarm-services` and `ctr-swarm-stack` serve the worker join token over plain HTTP on playout-1:8077 (container `tokensrv`) until the last setup step removes it; if an earlier worker step fails under `set -e`, the endpoint stays up for the lifetime of the lab VMs (lab network only, accepted window). (3) `ctr-ci-rootless-buildkit` and `ctr-release-pipeline-capstone` are tier B and run on docker-vm:29 until the Kata dockerd:29 image exists.

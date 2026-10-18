@@ -1,0 +1,172 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-runtime-stack-trace
+  title: Trace the transcoder container down to its host process
+  domain: containers
+  frameworks: []
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [docker, containerd, shim, internals, cgroups]
+  version: 1
+spec:
+  description: |
+    On `cl-transcode-04` (`ssh cl-transcode-04`; you have `sudo` and are in the `docker`
+    group) the container **`transcoder-{{job}}`** is running. The engine only talks to
+    containerd, which runs the container through a shim and a low-level runtime.
+
+    Map the container down the stack and write four identifiers to
+    **`~/runtime-chain.txt`**, one `key=value` per line:
+
+    - `container=` the full 64-character container ID from the engine;
+    - `shim=` the host PID of the container's **shim** process (the parent of the
+      container's main process);
+    - `init=` the host PID of the container's main process, as containerd's task list
+      in the `moby` namespace reports it;
+    - `cgroup=` the cgroup path of that process (the part after `0::` in
+      `/proc/<pid>/cgroup`).
+
+    Do not restart or recreate the container.
+  objectives:
+    - Follow a container from the engine through containerd's moby namespace to a host PID
+    - Identify the shim as the parent of the container process
+    - Find the cgroup that limits the container
+  params:
+    job:
+      type: int
+      min: 100
+      max: 999
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-transcode-04
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-transcode-04
+      timeoutSec: 240
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        command -v ctr >/dev/null
+        docker ps -aq --filter name='^transcoder-' | xargs -r docker rm -f >/dev/null 2>&1 || true
+        docker run -d --name transcoder-{{job}} --restart unless-stopped busybox:1.37 sleep infinity >/dev/null
+        rm -f /home/learner/runtime-chain.txt
+  checks:
+    - id: container-init
+      description: The full container ID and the init PID match the engine and containerd
+      type: shell
+      timeoutSec: 60
+      on: cl-transcode-04
+      skills: [containers.internals.runtime-stack]
+      weight: 3
+      command: |
+        c=transcoder-{{job}}
+        id=$(docker inspect $c 2>/dev/null | jq -r '.[0].Id')
+        pid=$(docker inspect $c 2>/dev/null | jq -r '.[0].State.Pid')
+        tpid=$(ctr -n moby task ls 2>/dev/null | awk -v id="$id" '$1 == id {print $2}')
+        [ -n "$pid" ] && [ "$pid" = "$tpid" ] || { echo "no-task"; exit 0; }
+        f=/home/learner/runtime-chain.txt
+        [ -L $f ] && { echo symlink; exit 0; }
+        if [ "$(sed -n 's/^container=//p' $f 2>/dev/null | tr -d ' ')" = "$id" ] && [ "$(sed -n 's/^init=//p' $f 2>/dev/null | tr -d ' ')" = "$pid" ]; then echo mapped; else echo mismatch; fi
+      expect: {match: exact, value: mapped}
+    - id: shim
+      description: shim= is the PID of the container's shim process
+      type: shell
+      timeoutSec: 60
+      on: cl-transcode-04
+      skills: [containers.internals.runtime-stack]
+      weight: 2
+      command: |
+        pid=$(docker inspect transcoder-{{job}} 2>/dev/null | jq -r '.[0].State.Pid')
+        shim=$(ps -o ppid= -p "$pid" | tr -d ' ')
+        comm=$(basename "$(readlink /proc/$shim/exe)")
+        [ -L /home/learner/runtime-chain.txt ] && { echo symlink; exit 0; }
+        got=$(sed -n 's/^shim=//p' /home/learner/runtime-chain.txt 2>/dev/null | tr -d ' ')
+        if [ "$got" = "$shim" ]; then echo "$comm"; else echo "wrong: $got"; fi
+      expect: {match: exact, value: containerd-shim-runc-v2}
+    - id: cgroup
+      description: cgroup= is the container's cgroup path
+      type: shell
+      timeoutSec: 60
+      on: cl-transcode-04
+      skills: [containers.internals.runtime-stack]
+      weight: 2
+      command: |
+        pid=$(docker inspect transcoder-{{job}} 2>/dev/null | jq -r '.[0].State.Pid')
+        cg=$(sed -n 's/^0:://p' /proc/$pid/cgroup)
+        [ -L /home/learner/runtime-chain.txt ] && { echo symlink; exit 0; }
+        got=$(sed -n 's/^cgroup=//p' /home/learner/runtime-chain.txt 2>/dev/null | tr -d ' ')
+        [ -n "$cg" ] && [ "$got" = "$cg" ] && echo matches || echo "wrong: $got"
+      expect: {match: exact, value: matches}
+  hints:
+    - title: Engine to containerd
+      body: "Docker keeps its containers in containerd's `moby` namespace, and the task ID is the container ID. `sudo ctr -n moby task ls` lists task IDs with their host PIDs."
+      command: sudo ctr -n moby task ls
+      cost: 1
+    - title: Who is the shim
+      body: "The shim is the parent of the container's main process. `ps -o ppid= -p <pid>` shows the parent PID and `ps -p <ppid> -o args=` its command line (comm is cut to 15 characters)."
+      cost: 1
+    - title: The cgroup
+      body: "`cat /proc/<pid>/cgroup` prints one line on cgroup v2 starting with `0::`. Keep the path after it."
+      cost: 1
+  misconceptions:
+    - id: short-id-and-parent
+      description: Uses the 12-character short ID and records the shim as the container's own PID.
+      feedback: "container= takes the full 64-character ID, and the shim is the parent of the container's process, not the process itself."
+      expectFail: [container-init, shim]
+      mutation:
+        on: cl-transcode-04
+        as: learner
+        run: |
+          c=transcoder-{{job}}
+          pid=$(docker inspect $c | jq -r '.[0].State.Pid')
+          printf 'container=%s\nshim=%s\ninit=%s\ncgroup=%s\n' "$(docker inspect $c | jq -r '.[0].Id[0:12]')" "$pid" "$pid" "$(sed -n 's/^0:://p' /proc/$pid/cgroup)" > ~/runtime-chain.txt
+    - id: wrong-cgroup
+      description: Records the cgroup of the shell instead of the container.
+      feedback: "Read /proc/<container pid>/cgroup, not /proc/self/cgroup."
+      expectFail: [cgroup]
+      mutation:
+        on: cl-transcode-04
+        as: learner
+        run: |
+          c=transcoder-{{job}}
+          pid=$(docker inspect $c | jq -r '.[0].State.Pid')
+          printf 'container=%s\nshim=%s\ninit=%s\ncgroup=%s\n' "$(docker inspect $c | jq -r '.[0].Id')" "$(ps -o ppid= -p $pid | tr -d ' ')" "$pid" "$(sed -n 's/^0:://p' /proc/self/cgroup)" > ~/runtime-chain.txt
+  solution:
+    explanation: |
+      The engine ID is the containerd task ID in the moby namespace; `ctr task ls` gives
+      its host PID, whose parent is the shim; the cgroup is in /proc/<pid>/cgroup.
+    steps:
+      - on: cl-transcode-04
+        as: learner
+        run: |
+          c=transcoder-{{job}}
+          id=$(docker inspect $c | jq -r '.[0].Id')
+          sudo ctr -n moby task ls
+          pid=$(sudo ctr -n moby task ls | awk -v id="$id" '$1 == id {print $2}')
+          shim=$(ps -o ppid= -p "$pid" | tr -d ' ')
+          ps -o pid,comm -p "$shim"
+          cg=$(sed -n 's/^0:://p' /proc/$pid/cgroup)
+          printf 'container=%s\nshim=%s\ninit=%s\ncgroup=%s\n' "$id" "$shim" "$pid" "$cg" > ~/runtime-chain.txt
+          cat ~/runtime-chain.txt
+    alternatives:
+      - id: from-inspect-and-forest
+        description: Take the PID from docker inspect and find the shim in the process tree.
+        steps:
+          - on: cl-transcode-04
+            as: learner
+            run: |
+              c=transcoder-{{job}}
+              id=$(docker inspect $c | jq -r '.[0].Id')
+              pid=$(docker inspect $c | jq -r '.[0].State.Pid')
+              ps -ef --forest | grep -B1 "sleep infinity" | head -4
+              shim=$(awk '{print $4}' /proc/$pid/stat)
+              printf 'container=%s\nshim=%s\ninit=%s\ncgroup=%s\n' "$id" "$shim" "$pid" "$(grep '^0::' /proc/$pid/cgroup | cut -c4-)" > ~/runtime-chain.txt

@@ -1,0 +1,176 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-events-flapping
+  title: Find the flapping container from the engine's event stream
+  domain: containers
+  frameworks: [docker-practitioner:operations]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [docker, events, restart, oom]
+  version: 1
+spec:
+  description: |
+    On the batch host `cl-batch-02` (`ssh cl-batch-02`; you are in the `docker` group)
+    forty containers named `batch-01` to `batch-40` run with restart policies. One of
+    them is **flapping**: it is killed and restarted again and again, and the dashboards
+    miss it because each restart is quick. Another one restarted a single time and has
+    been stable since.
+
+    Find the flapping container from the engine's events and record it in
+    **`~/flapping.json`** as a JSON object with these keys:
+
+    - `container`: its name
+    - `exitCode`: the exit code of its last death (a number)
+    - `oomKilled`: `true` or `false`, from the engine's events
+    - `memoryLimitMiB`: its memory limit in MiB (a number)
+    - `restarts`: how many times it has restarted so far (a number, at least 2; it
+      must not be more than the engine's own count)
+
+    Do not remove or recreate any of the forty containers.
+  objectives:
+    - Read the engine event stream with filters and a time window
+    - Tell a flapping container from one that restarted once
+    - Connect exit code, OOM events and the memory limit
+  params:
+    flap:
+      type: int
+      min: 11
+      max: 38
+    lim:
+      type: int
+      min: 40
+      max: 56
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-batch-02
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-batch-02
+      timeoutSec: 600
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        install -d -m 700 /var/lib/cloudtrain
+        docker ps -aq --filter name='^batch-' | xargs -r docker rm -f >/dev/null 2>&1 || true
+        rm -f /home/learner/flapping.json
+        f=$(printf 'batch-%02d' {{flap}})
+        dc=$(printf 'batch-%02d' $(( {{flap}} + 1 )))
+        for n in $(seq -w 1 40); do
+          name="batch-$n"
+          if [ "$name" = "$f" ]; then
+            docker run -d --name "$name" --restart always --memory {{lim}}m --memory-swap {{lim}}m --shm-size 256m busybox:1.37 \
+              sh -c 'sleep 15; exec dd if=/dev/zero of=/dev/shm/blob bs=1M count=200 2>/dev/null' >/dev/null
+          elif [ "$name" = "$dc" ]; then
+            docker run -d --name "$name" --restart always busybox:1.37 \
+              sh -c 'if [ -e /tmp/seen ]; then exec sleep infinity; else touch /tmp/seen; exit 1; fi' >/dev/null
+          else
+            docker run -d --name "$name" --restart unless-stopped busybox:1.37 sleep infinity >/dev/null
+          fi
+        done
+  checks:
+    - id: identity
+      description: flapping.json names the flapping container with its exit code, OOM flag and memory limit
+      type: shell
+      timeoutSec: 60
+      on: cl-batch-02
+      skills: [containers.operations.restart-health, containers.operations.exit-codes]
+      weight: 3
+      command: |
+        want="batch-$(printf '%02d' {{flap}}) 137 true {{lim}}"
+        [ -L /home/learner/flapping.json ] && { echo symlink; exit 0; }
+        got=$(jq -r '[.container, .exitCode, .oomKilled, .memoryLimitMiB] | map(tostring) | join(" ")' /home/learner/flapping.json 2>/dev/null || echo unreadable)
+        [ "$got" = "$want" ] && echo recorded || echo "mismatch: $got"
+      expect: {match: exact, value: recorded}
+    - id: restart-count
+      description: The recorded restart count is plausible against the engine's own count
+      type: shell
+      timeoutSec: 60
+      on: cl-batch-02
+      skills: [containers.operations.restart-health]
+      weight: 2
+      command: |
+        [ -L /home/learner/flapping.json ] && { echo symlink; exit 0; }
+        r=$(jq -r '.restarts' /home/learner/flapping.json 2>/dev/null || echo x)
+        live=$(docker inspect "batch-$(printf '%02d' {{flap}})" 2>/dev/null | jq -r '.[0].RestartCount')
+        case "$r" in ''|*[!0-9]*) echo "not-a-number"; exit 0 ;; esac
+        if [ "$r" -ge 2 ] && [ "$r" -le "$live" ]; then echo plausible; else echo "r=$r live=$live"; fi
+      expect: {match: exact, value: plausible}
+    - id: fleet-intact
+      description: All forty batch containers still exist
+      type: shell
+      timeoutSec: 60
+      on: cl-batch-02
+      skills: [containers.operations.restart-health]
+      weight: 1
+      command: docker ps -aq --filter name='^batch-' | wc -l
+      expect: {match: exact, value: "40"}
+  hints:
+    - title: Events carry the story
+      body: "`docker events` can replay a time window with --since and --until, and filters by event type (die, oom, restart). With --format json, jq can count them per container."
+      command: docker events --since 5m --until "$(date +%s)" --filter event=oom --format json | jq -r '.Actor.Attributes.name'
+      cost: 1
+    - title: Count, then read
+      body: "Count the oom or die events per container name; the flapper has many, the one-time restart has one. The die event's attributes include exitCode."
+      cost: 1
+    - title: The limit and the restarts
+      body: "The memory limit and RestartCount are in docker inspect (HostConfig.Memory is in bytes)."
+      cost: 1
+  misconceptions:
+    - id: restarted-once
+      description: Records the container that restarted once instead of the flapper.
+      feedback: "One restart in the past is not flapping. Count events per container: the flapper dies again and again with an OOM kill."
+      expectFail: [identity]
+      mutation:
+        on: cl-batch-02
+        as: learner
+        run: |
+          jq -n --arg c "batch-$(printf '%02d' $(( {{flap}} + 1 )))" '{container: $c, exitCode: 1, oomKilled: false, memoryLimitMiB: 0, restarts: 1}' > ~/flapping.json
+    - id: wrong-reason
+      description: Names the flapper but calls the death a plain crash.
+      feedback: "Exit code 137 together with an oom event means the kernel killed it at its memory limit, not that the program crashed."
+      expectFail: [identity]
+      mutation:
+        on: cl-batch-02
+        as: learner
+        timeoutSec: 180
+        run: |
+          sleep 45
+          n="batch-$(printf '%02d' {{flap}})"
+          jq -n --arg c "$n" --argjson r "$(docker inspect "$n" | jq '.[0].RestartCount')" '{container: $c, exitCode: 1, oomKilled: false, memoryLimitMiB: 0, restarts: $r}' > ~/flapping.json
+  solution:
+    explanation: |
+      Replay the last minutes of events, count the oom events per container, then read
+      the exit code from its die event and the limit and restart count from inspect.
+    steps:
+      - on: cl-batch-02
+        as: learner
+        timeoutSec: 180
+        run: |
+          sleep 60
+          until=$(date +%s)
+          f=$(docker events --since 10m --until "$until" --filter event=oom --format json | jq -r '.Actor.Attributes.name' | sort | uniq -c | sort -rn | awk 'NR==1 {print $2}')
+          ec=$(docker events --since 10m --until "$until" --filter event=die --filter container="$f" --format json | jq -r '.Actor.Attributes.exitCode' | tail -1)
+          docker inspect "$f" | jq --arg c "$f" --argjson ec "$ec" '.[0] | {container: $c, exitCode: $ec, oomKilled: true, memoryLimitMiB: (.HostConfig.Memory / 1048576), restarts: .RestartCount}' > ~/flapping.json
+          cat ~/flapping.json
+    alternatives:
+      - id: by-restart-count
+        description: Find the highest RestartCount with inspect, then confirm the cause from the events.
+        steps:
+          - on: cl-batch-02
+            as: learner
+            timeoutSec: 180
+            run: |
+              sleep 60
+              f=$(docker ps -aq | xargs docker inspect | jq -r 'sort_by(-.RestartCount) | .[0].Name | ltrimstr("/")')
+              docker events --since 10m --until "$(date +%s)" --filter container="$f" --filter event=oom | head -3
+              docker inspect "$f" | jq --arg c "$f" '.[0] | {container: $c, exitCode: 137, oomKilled: true, memoryLimitMiB: (.HostConfig.Memory / 1048576), restarts: .RestartCount}' > ~/flapping.json

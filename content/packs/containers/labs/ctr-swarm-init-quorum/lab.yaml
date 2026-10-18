@@ -1,0 +1,188 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-swarm-init-quorum
+  title: Build a three-manager swarm and drain one manager
+  domain: containers
+  frameworks: [dca-legacy:orchestration]
+  difficulty: medium
+  estimatedMinutes: 25
+  tags: [swarm, managers, quorum, drain]
+  version: 1
+spec:
+  description: |
+    The playout team has three Docker hosts, **`playout-1`**, **`playout-2`** and
+    **`playout-3`** (`ssh playout-1` and so on from the workstation; you are in the
+    `docker` group on each). They are not clustered yet. Ports 2377/tcp, 7946/tcp and
+    udp, and 4789/udp are open between them.
+
+    1. Create a swarm with **all three hosts as managers** (initialise it on `playout-1`).
+    2. Put **`playout-2` into maintenance**: set its availability so that the scheduler
+       places **no tasks** on it. The swarm must keep its quorum (all three managers
+       reachable).
+
+    The grader checks the node list on `playout-1`, then deploys a short-lived
+    service with {{probe}} replicas of `busybox:1.37` and requires that none of its tasks
+    lands on `playout-2`.
+  objectives:
+    - Initialise a swarm and join managers with the manager token
+    - Understand manager quorum and an odd number of managers
+    - Drain a node and tell drain from pause
+  params:
+    probe:
+      type: int
+      min: 4
+      max: 9
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: playout-1
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+      - name: playout-2
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+      - name: playout-3
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: playout-1
+      timeoutSec: 240
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        docker swarm leave --force >/dev/null 2>&1 || true
+        docker ps -aq | xargs -r docker rm -f >/dev/null 2>&1 || true
+    - on: playout-2
+      timeoutSec: 240
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        docker swarm leave --force >/dev/null 2>&1 || true
+        docker ps -aq | xargs -r docker rm -f >/dev/null 2>&1 || true
+    - on: playout-3
+      timeoutSec: 240
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        docker swarm leave --force >/dev/null 2>&1 || true
+        docker ps -aq | xargs -r docker rm -f >/dev/null 2>&1 || true
+  checks:
+    - id: roles
+      description: All three nodes are ready managers and only playout-2 is drained
+      type: shell
+      timeoutSec: 60
+      on: playout-1
+      skills: [containers.swarm.cluster]
+      weight: 3
+      command: |
+        docker node ls --format json 2>/dev/null | jq -s -r 'sort_by(.Hostname) | map("\(.Hostname):\(.Availability | ascii_downcase):\(if (.ManagerStatus == "Leader" or .ManagerStatus == "Reachable") then "manager" else "worker" end):\(.Status | ascii_downcase)") | join(" ")'
+      expect: {match: exact, value: "playout-1:active:manager:ready playout-2:drain:manager:ready playout-3:active:manager:ready"}
+    - id: cluster-size
+      description: The swarm reports three nodes of which three are managers
+      type: shell
+      timeoutSec: 60
+      on: playout-1
+      skills: [containers.swarm.cluster]
+      weight: 1
+      command: docker info --format json 2>/dev/null | jq -r '.Swarm | "\(.Nodes) \(.Managers)"'
+      expect: {match: exact, value: "3 3"}
+    - id: drained-no-tasks
+      description: A probe service with {{probe}} replicas runs entirely off playout-2
+      type: shell
+      timeoutSec: 150
+      on: playout-1
+      skills: [containers.swarm.cluster]
+      weight: 3
+      command: |
+        docker service rm drain-probe >/dev/null 2>&1 || true
+        docker service create --name drain-probe --replicas {{probe}} busybox:1.37 sleep 600 >/dev/null 2>&1 || { echo "cannot-create-service"; exit 0; }
+        t='[]'
+        for i in $(seq 40); do
+          t=$(docker service ps drain-probe --filter desired-state=running --format json 2>/dev/null | jq -s '[.[] | select(.CurrentState | startswith("Running"))]')
+          [ "$(echo "$t" | jq length)" -ge {{probe}} ] && break; sleep 2
+        done
+        n=$(echo "$t" | jq length); on2=$(echo "$t" | jq '[.[] | select(.Node == "playout-2")] | length')
+        docker service rm drain-probe >/dev/null 2>&1 || true
+        if [ "$n" -eq {{probe}} ] && [ "$on2" -eq 0 ]; then echo drained; else echo "running=$n on-playout-2=$on2"; fi
+      expect: {match: exact, value: drained}
+  hints:
+    - title: Initialise, then join with the manager token
+      body: "`docker swarm init --advertise-addr <ip>` on playout-1 prints join commands. `docker swarm join-token manager` shows the command for managers; run it on playout-2 and playout-3. Use the address of playout-1 (`hostname -I`) as the advertise address."
+      cost: 1
+    - title: Why three
+      body: "Raft needs a majority of managers. Three managers tolerate one failure; two tolerate none. Do not leave the other two as workers."
+      cost: 1
+    - title: Drain, not pause
+      body: "`docker node update --availability drain playout-2` moves tasks away and stops new ones. `pause` only stops new ones. Run it on any manager."
+      cost: 1
+  misconceptions:
+    - id: workers-only
+      description: Joins playout-2 and playout-3 with the worker token.
+      feedback: "Workers do not take part in Raft. Use `docker swarm join-token manager` so all three hosts are managers and the swarm tolerates losing one."
+      expectFail: [roles, cluster-size]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          ip=$(ssh playout-1 "hostname -I | awk '{print \$1}'")
+          ssh playout-1 "docker swarm init --advertise-addr $ip" >/dev/null
+          wt=$(ssh playout-1 docker swarm join-token -q worker)
+          for n in playout-2 playout-3; do ssh $n "docker swarm join --token $wt $ip:2377"; done
+          ssh playout-1 docker node update --availability drain playout-2
+    - id: pause-instead
+      description: Pauses playout-2 instead of draining it.
+      feedback: "Pause only stops new tasks from being scheduled; tasks already on the node keep running. Drain is the maintenance setting."
+      expectFail: [roles]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          ip=$(ssh playout-1 "hostname -I | awk '{print \$1}'")
+          ssh playout-1 "docker swarm init --advertise-addr $ip" >/dev/null
+          mt=$(ssh playout-1 docker swarm join-token -q manager)
+          for n in playout-2 playout-3; do ssh $n "docker swarm join --token $mt $ip:2377"; done
+          ssh playout-1 docker node update --availability pause playout-2
+  solution:
+    explanation: |
+      Initialise on playout-1, join the other two with the manager token, then drain
+      playout-2 from any manager.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          ip=$(ssh playout-1 "hostname -I | awk '{print \$1}'")
+          ssh playout-1 "docker swarm init --advertise-addr $ip"
+          mt=$(ssh playout-1 docker swarm join-token -q manager)
+          for n in playout-2 playout-3; do ssh $n "docker swarm join --token $mt $ip:2377"; done
+          ssh playout-1 docker node update --availability drain playout-2
+          ssh playout-1 docker node ls
+    alternatives:
+      - id: drain-from-another-manager
+        description: Drain playout-2 from playout-3 instead of from the node that initialised the swarm.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 300
+            run: |
+              ip=$(ssh playout-1 "hostname -I | awk '{print \$1}'")
+              ssh playout-1 "docker swarm init --advertise-addr $ip" >/dev/null
+              mt=$(ssh playout-1 docker swarm join-token -q manager)
+              for n in playout-2 playout-3; do ssh $n "docker swarm join --token $mt $ip:2377"; done
+              ssh playout-3 docker node update --availability drain playout-2

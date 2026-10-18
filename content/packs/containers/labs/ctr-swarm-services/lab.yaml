@@ -1,0 +1,266 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-swarm-services
+  title: Place catalogue replicas and a global log agent on the swarm
+  domain: containers
+  frameworks: [dca-legacy:orchestration]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [swarm, services, placement, rolling-update]
+  version: 1
+spec:
+  description: |
+    The playout swarm is up: `playout-1` is the manager and `playout-2`, `playout-3` are
+    workers (`ssh playout-1`; you are in the `docker` group on each host). A private
+    registry on `playout-1:5000` (plain HTTP, allowed on all three) holds
+    `catalogue-api` versions `2.3` and `2.4` and `log-shipper:1`.
+
+    On `playout-1`:
+
+    1. Label **`playout-2` and `playout-3` with `tier=edge`**.
+    2. Create the service **`catalogue-api`** from `playout-1:5000/catalogue-api:2.3` with
+       **four replicas that run only on nodes labelled `tier=edge`**, published through
+       the routing mesh on port **{{port}}** (container port 80).
+    3. Create the service **`log-shipper`** (`playout-1:5000/log-shipper:1`) as a
+       **global** service, so every node runs one.
+    4. **Roll `catalogue-api` to `2.4`** with a rolling update that replaces one task
+       at a time, so that at least three replicas are running at every moment.
+  objectives:
+    - Place tasks with node labels and placement constraints
+    - Choose between replicated and global services
+    - Run a controlled rolling update
+  params:
+    port:
+      type: int
+      min: 8500
+      max: 8599
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: playout-1
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+      - name: playout-2
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+      - name: playout-3
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: playout-1
+      timeoutSec: 600
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        install -d -m 700 /var/lib/cloudtrain
+        docker swarm leave --force >/dev/null 2>&1 || true
+        docker ps -aq | xargs -r docker rm -f >/dev/null 2>&1 || true
+        f=/etc/docker/daemon.json
+        [ -s "$f" ] || echo '{}' > "$f"
+        jq '. + {"insecure-registries": ((."insecure-registries" // []) + ["playout-1:5000"] | unique)}' "$f" > "$f.new" && mv "$f.new" "$f"
+        systemctl restart docker
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        rm -rf /srv/registry; install -d /srv/registry
+        docker run -d --name registry --restart always -p 5000:5000 -v /srv/registry:/var/lib/registry registry:3 >/dev/null
+        for i in $(seq 30); do curl -fs http://127.0.0.1:5000/v2/ >/dev/null && break; sleep 1; done
+        d=$(mktemp -d)
+        for v in 2.3 2.4; do
+          printf '%s\n' 'FROM nginx:1.29-alpine' "RUN echo 'catalogue-api $v on {{port}}' > /usr/share/nginx/html/index.html" > "$d/Dockerfile"
+          docker build -q -t playout-1:5000/catalogue-api:$v "$d" >/dev/null
+          docker push -q playout-1:5000/catalogue-api:$v >/dev/null
+        done
+        printf '%s\n' 'FROM busybox:1.37' 'CMD ["sh", "-c", "while :; do echo shipping; sleep 5; done"]' > "$d/Dockerfile"
+        docker build -q -t playout-1:5000/log-shipper:1 "$d" >/dev/null
+        docker push -q playout-1:5000/log-shipper:1 >/dev/null
+        rm -rf "$d"
+        echo {{port}} > /var/lib/cloudtrain/port
+        ip=$(hostname -I | awk '{print $1}')
+        docker swarm init --advertise-addr "$ip" >/dev/null
+        rm -rf /srv/tokens; install -d /srv/tokens
+        docker swarm join-token -q worker > /srv/tokens/worker
+        docker run -d --name tokensrv -p 8077:80 -v /srv/tokens:/usr/share/nginx/html:ro nginx:1.29-alpine >/dev/null
+    - on: playout-2
+      timeoutSec: 300
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        docker swarm leave --force >/dev/null 2>&1 || true
+        docker ps -aq | xargs -r docker rm -f >/dev/null 2>&1 || true
+        f=/etc/docker/daemon.json
+        [ -s "$f" ] || echo '{}' > "$f"
+        jq '. + {"insecure-registries": ((."insecure-registries" // []) + ["playout-1:5000"] | unique)}' "$f" > "$f.new" && mv "$f.new" "$f"
+        systemctl restart docker
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        ip=$(getent ahostsv4 playout-1 | awk '{print $1; exit}')
+        tok=$(curl -fsS --retry 15 --retry-connrefused --retry-delay 2 "http://$ip:8077/worker")
+        docker swarm join --token "$tok" "$ip:2377" >/dev/null
+    - on: playout-3
+      timeoutSec: 300
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        docker swarm leave --force >/dev/null 2>&1 || true
+        docker ps -aq | xargs -r docker rm -f >/dev/null 2>&1 || true
+        f=/etc/docker/daemon.json
+        [ -s "$f" ] || echo '{}' > "$f"
+        jq '. + {"insecure-registries": ((."insecure-registries" // []) + ["playout-1:5000"] | unique)}' "$f" > "$f.new" && mv "$f.new" "$f"
+        systemctl restart docker
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        ip=$(getent ahostsv4 playout-1 | awk '{print $1; exit}')
+        tok=$(curl -fsS --retry 15 --retry-connrefused --retry-delay 2 "http://$ip:8077/worker")
+        docker swarm join --token "$tok" "$ip:2377" >/dev/null
+    - on: playout-1
+      timeoutSec: 60
+      run: |
+        docker rm -f tokensrv >/dev/null 2>&1 || true
+        rm -rf /srv/tokens
+  checks:
+    - id: placement
+      description: Four catalogue-api tasks run, all on the nodes labelled tier=edge (playout-2, playout-3)
+      type: shell
+      timeoutSec: 150
+      on: playout-1
+      skills: [containers.swarm.services]
+      weight: 3
+      command: |
+        t='[]'
+        for i in $(seq 40); do
+          t=$(docker service ps catalogue-api --filter desired-state=running --format json 2>/dev/null | jq -s '[.[] | select(.CurrentState | startswith("Running"))]')
+          [ "$(echo "$t" | jq length)" = 4 ] && break; sleep 2
+        done
+        edge=$(docker node ls -q | xargs docker node inspect 2>/dev/null | jq -r '[.[] | select(.Spec.Labels.tier == "edge") | .Description.Hostname] | sort | join(",")')
+        echo "$edge | $(echo "$t" | jq -r '[.[].Node] | unique | join(",")') | $(echo "$t" | jq length)"
+      expect: {match: exact, value: "playout-2,playout-3 | playout-2,playout-3 | 4"}
+    - id: rolled
+      description: Every running task uses catalogue-api:2.4 and the service reports a completed update with one task at a time
+      type: shell
+      timeoutSec: 60
+      on: playout-1
+      skills: [containers.swarm.services]
+      weight: 3
+      command: |
+        imgs=$(docker service ps catalogue-api --filter desired-state=running --format json 2>/dev/null | jq -s -r 'length > 0 and ([.[].Image | test("^playout-1:5000/catalogue-api:2\\.4(@sha256:[0-9a-f]{64})?$")] | all) | tostring')
+        st=$(docker service inspect catalogue-api 2>/dev/null | jq -r '.[0] | "\(.UpdateStatus.State) \(.Spec.UpdateConfig.Parallelism)"')
+        echo "$imgs $st"
+      expect: {match: exact, value: "true completed 1"}
+    - id: mesh
+      description: The routing mesh serves 2.4 on the published port
+      type: shell
+      timeoutSec: 60
+      on: playout-1
+      skills: [containers.swarm.services]
+      weight: 1
+      command: |
+        for i in $(seq 15); do r=$(curl -s --max-time 3 http://127.0.0.1:{{port}}/ 2>/dev/null); [ -n "$r" ] && break; sleep 2; done; echo "$r"
+      expect: {match: exact, value: "catalogue-api 2.4 on {{port}}"}
+    - id: shipper-global
+      description: log-shipper is a global service running on all three nodes
+      type: shell
+      timeoutSec: 150
+      on: playout-1
+      skills: [containers.swarm.services]
+      weight: 2
+      command: |
+        m=$(docker service inspect log-shipper 2>/dev/null | jq -r '.[0].Spec.Mode | keys[0]')
+        n=0
+        for i in $(seq 40); do
+          n=$(docker service ps log-shipper --filter desired-state=running --format json 2>/dev/null | jq -s '[.[] | select(.CurrentState | startswith("Running")) | .Node] | unique | length')
+          [ "$n" = 3 ] && break; sleep 2
+        done
+        echo "$m $n"
+      expect: {match: exact, value: "Global 3"}
+  hints:
+    - title: Labels and constraints
+      body: "`docker node update --label-add tier=edge <node>` labels a node. `--constraint node.labels.tier==edge` on `docker service create` restricts the tasks to labelled nodes."
+      cost: 1
+    - title: Global versus replicated
+      body: "`--mode global` runs exactly one task per node, including managers, and takes no --replicas."
+      cost: 1
+    - title: A rolling update
+      body: "`docker service update --image <new> --update-parallelism 1 catalogue-api` replaces one task at a time; with four replicas that keeps three running. `--update-order start-first` would even keep four."
+      cost: 1
+  misconceptions:
+    - id: no-constraint
+      description: Creates catalogue-api without the placement constraint.
+      feedback: "Without `--constraint node.labels.tier==edge` the scheduler also uses playout-1, which is not an edge node."
+      expectFail: [placement]
+      mutation:
+        on: playout-1
+        as: learner
+        timeoutSec: 300
+        run: |
+          docker node update --label-add tier=edge playout-2
+          docker node update --label-add tier=edge playout-3
+          docker service create --name catalogue-api --replicas 4 --publish {{port}}:80 playout-1:5000/catalogue-api:2.3
+          docker service create --name log-shipper --mode global playout-1:5000/log-shipper:1
+          docker service update --image playout-1:5000/catalogue-api:2.4 catalogue-api
+    - id: replicated-shipper
+      description: Runs log-shipper as a replicated service with three replicas.
+      feedback: "Three replicas can land two on one node and none on another. A global service guarantees one per node, including new nodes."
+      expectFail: [shipper-global]
+      mutation:
+        on: playout-1
+        as: learner
+        timeoutSec: 300
+        run: |
+          docker node update --label-add tier=edge playout-2
+          docker node update --label-add tier=edge playout-3
+          docker service create --name catalogue-api --replicas 4 --constraint node.labels.tier==edge --publish {{port}}:80 playout-1:5000/catalogue-api:2.3
+          docker service create --name log-shipper --replicas 3 playout-1:5000/log-shipper:1
+          docker service update --image playout-1:5000/catalogue-api:2.4 catalogue-api
+    - id: all-at-once
+      description: Updates every replica at the same time.
+      feedback: "Parallelism 0 replaces all tasks at once. With --update-parallelism 1 at most one of four tasks is down at any time."
+      expectFail: [rolled]
+      mutation:
+        on: playout-1
+        as: learner
+        timeoutSec: 300
+        run: |
+          docker node update --label-add tier=edge playout-2
+          docker node update --label-add tier=edge playout-3
+          docker service create --name catalogue-api --replicas 4 --constraint node.labels.tier==edge --publish {{port}}:80 playout-1:5000/catalogue-api:2.3
+          docker service create --name log-shipper --mode global playout-1:5000/log-shipper:1
+          docker service update --update-parallelism 0 --image playout-1:5000/catalogue-api:2.4 catalogue-api
+  solution:
+    explanation: |
+      Label the two edge nodes, create the replicated service with the placement
+      constraint and the global shipper, then update the image with a parallelism of one.
+    steps:
+      - on: playout-1
+        as: learner
+        timeoutSec: 300
+        run: |
+          docker node update --label-add tier=edge playout-2
+          docker node update --label-add tier=edge playout-3
+          docker service create --name catalogue-api --replicas 4 --constraint node.labels.tier==edge --publish {{port}}:80 playout-1:5000/catalogue-api:2.3
+          docker service create --name log-shipper --mode global playout-1:5000/log-shipper:1
+          docker service update --image playout-1:5000/catalogue-api:2.4 --update-parallelism 1 catalogue-api
+          docker service ps catalogue-api
+    alternatives:
+      - id: start-first
+        description: Start the replacement before stopping the old task, so all four replicas stay up.
+        steps:
+          - on: playout-1
+            as: learner
+            timeoutSec: 300
+            run: |
+              docker node update --label-add tier=edge playout-2
+              docker node update --label-add tier=edge playout-3
+              docker service create --name log-shipper --mode global playout-1:5000/log-shipper:1
+              docker service create --name catalogue-api --mode replicated --replicas 4 --constraint 'node.labels.tier == edge' --publish published={{port}},target=80 playout-1:5000/catalogue-api:2.3
+              docker service update --image playout-1:5000/catalogue-api:2.4 --update-parallelism 1 --update-order start-first catalogue-api

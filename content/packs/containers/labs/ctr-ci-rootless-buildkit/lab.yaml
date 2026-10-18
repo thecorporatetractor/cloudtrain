@@ -1,0 +1,244 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-ci-rootless-buildkit
+  title: Replace the privileged CI builder with a rootless image builder
+  domain: containers
+  frameworks: [docker-practitioner:operations]
+  difficulty: hard
+  estimatedMinutes: 25
+  tags: [ci, rootless, supply-chain, scan, sign]
+  version: 1
+spec:
+  description: |
+    On the CI host `cl-ci-02` (`ssh cl-ci-02`; you are in the `docker` group and have
+    `sudo`) Copperleaf's job `/srv/ci/pipeline.sh` builds the thumbnailer from
+    `/srv/ci/thumbnailer` through a **privileged** Docker-in-Docker sidecar
+    (`ci-dind`). The security team wants that sidecar gone.
+
+    Rewrite `/srv/ci/pipeline.sh` (you own it) so that, with **no privileged container**
+    anywhere, the job:
+
+    1. builds the image with a **rootless BuildKit** builder container (the image
+       `moby/buildkit:rootless` is staged on the host), passing
+       `--build-arg REV={{rev}}` so that the image label `org.opencontainers.image.revision`
+       is `{{rev}}`;
+    2. pushes it to `127.0.0.1:{{port}}/thumbnailer:ci`;
+    3. scans the pushed image with the local scanner (`trivy`, offline database) and
+       writes the JSON report to `/srv/ci/out/scan.json`;
+    4. signs the pushed image **digest** with the CI key
+       (`/etc/copperleaf/ci/cosign.key`, empty password; public key `cosign.pub`).
+
+    The script must print `pipeline ok` as its last line and be repeatable. Remove the
+    `ci-dind` container.
+  objectives:
+    - Run a rootless image builder as an unprivileged container
+    - Chain build, push, scan and sign in one repeatable CI script
+    - Remove privileged containers from a CI host
+  params:
+    port:
+      type: int
+      min: 5100
+      max: 5199
+    rev:
+      type: int
+      min: 1000
+      max: 9999
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-ci-02
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-ci-02
+      timeoutSec: 600
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        for need in cosign trivy; do command -v "$need" >/dev/null || { echo "this lab needs $need on the host image (not built yet)" >&2; exit 1; }; done
+        docker image inspect moby/buildkit:rootless >/dev/null 2>&1 || { echo "this lab needs moby/buildkit:rootless preloaded on the host image (not built yet)" >&2; exit 1; }
+        test -d /var/lib/trivy || { echo "this lab needs an offline trivy database in /var/lib/trivy (not built yet)" >&2; exit 1; }
+        docker rm -f ci-registry ci-dind ci-builder >/dev/null 2>&1 || true
+        rm -rf /srv/ci /srv/ci-registry; install -d /srv/ci-registry
+        install -d -o learner -g learner /srv/ci /srv/ci/thumbnailer /srv/ci/out /etc/copperleaf/ci
+        rm -rf /srv/ci/trivy-cache; cp -a /var/lib/trivy /srv/ci/trivy-cache; chown -R learner:learner /srv/ci/trivy-cache
+        docker run -d --name ci-registry --restart always -p 127.0.0.1:{{port}}:5000 -v /srv/ci-registry:/var/lib/registry registry:3 >/dev/null
+        for i in $(seq 30); do curl -fs http://127.0.0.1:{{port}}/v2/ >/dev/null && break; sleep 1; done
+        # the builder container has no access to the engine image store and the host is offline:
+        # the base image is served from the lab registry
+        docker tag busybox:1.37 127.0.0.1:{{port}}/busybox:1.37
+        docker push -q 127.0.0.1:{{port}}/busybox:1.37 >/dev/null
+        printf '[registry."127.0.0.1:{{port}}"]\n  http = true\n  insecure = true\n' > /srv/ci/buildkitd.toml
+        printf '%s\n' 'FROM 127.0.0.1:{{port}}/busybox:1.37' 'ARG REV=0' 'LABEL org.opencontainers.image.revision=$REV' \
+          'RUN echo thumbnailer > /thumbnailer' 'CMD ["cat", "/thumbnailer"]' > /srv/ci/thumbnailer/Dockerfile
+        (cd /etc/copperleaf/ci && COSIGN_PASSWORD='' cosign generate-key-pair >/dev/null 2>&1)
+        chown -R learner:learner /etc/copperleaf/ci
+        cat > /srv/ci/pipeline.sh <<'SH'
+        #!/bin/sh
+        # Old job: builds through a privileged docker-in-docker sidecar.
+        set -eu
+        docker rm -f ci-dind >/dev/null 2>&1 || true
+        docker run -d --name ci-dind --privileged busybox:1.37 sleep infinity
+        echo "build via ci-dind (privileged) ... not implemented"
+        exit 1
+        SH
+        chown learner:learner /srv/ci/pipeline.sh; chmod 755 /srv/ci/pipeline.sh
+        docker run -d --name ci-dind --privileged busybox:1.37 sleep infinity >/dev/null
+  checks:
+    - id: pipeline-reruns
+      description: The pipeline runs end to end as learner and prints pipeline ok
+      type: shell
+      timeoutSec: 480
+      on: cl-ci-02
+      skills: [containers.operations.ci-pipeline]
+      weight: 3
+      command: |
+        su -s /bin/sh learner -c '/srv/ci/pipeline.sh' 2>&1 | tail -1
+      expect: {match: exact, value: pipeline ok}
+    - id: nothing-privileged
+      description: No container is privileged and ci-dind is gone
+      type: shell
+      timeoutSec: 60
+      on: cl-ci-02
+      skills: [containers.operations.ci-pipeline]
+      weight: 2
+      command: |
+        docker ps -aq | xargs -r docker inspect | jq -r '[.[] | select(.HostConfig.Privileged == true or .Name == "/ci-dind")] | length'
+      expect: {match: exact, value: "0"}
+    - id: pushed-with-revision
+      description: thumbnailer:ci is in the registry and labelled with the revision
+      type: shell
+      timeoutSec: 60
+      on: cl-ci-02
+      skills: [containers.operations.ci-pipeline]
+      weight: 2
+      command: |
+        A='Accept: application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json'
+        cfg=$(curl -fs -H "$A" http://127.0.0.1:{{port}}/v2/thumbnailer/manifests/ci | jq -r '.config.digest')
+        curl -fs "http://127.0.0.1:{{port}}/v2/thumbnailer/blobs/$cfg" | jq -r '.config.Labels["org.opencontainers.image.revision"]'
+      expect: {match: exact, value: "{{rev}}"}
+    - id: scanned
+      description: scan.json is a scanner report of the pushed image without critical findings
+      type: shell
+      timeoutSec: 60
+      on: cl-ci-02
+      skills: [containers.operations.ci-pipeline]
+      weight: 1
+      command: |
+        jq -r '[.ArtifactName, ([.Results[]?.Vulnerabilities[]? | select(.Severity == "CRITICAL")] | length | tostring)] | join(" ")' /srv/ci/out/scan.json 2>/dev/null | sed 's#^[^ ]*thumbnailer[^ ]* #thumbnailer #'
+      expect: {match: exact, value: "thumbnailer 0"}
+    - id: signed-by-digest
+      description: The pushed digest has a valid signature from the CI key
+      type: shell
+      timeoutSec: 90
+      on: cl-ci-02
+      skills: [containers.operations.ci-pipeline]
+      weight: 3
+      command: |
+        A='Accept: application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json'
+        d=$(curl -fsI -H "$A" http://127.0.0.1:{{port}}/v2/thumbnailer/manifests/ci | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}')
+        cosign verify --key /etc/copperleaf/ci/cosign.pub --insecure-ignore-tlog=true --allow-insecure-registry "127.0.0.1:{{port}}/thumbnailer@$d" >/dev/null 2>&1 && echo verified || echo not-verified
+      expect: {match: exact, value: verified}
+    - id: rootless-builder-used
+      description: The script uses the rootless builder image and no privileged flag
+      type: shell
+      timeoutSec: 60
+      on: cl-ci-02
+      skills: [containers.operations.ci-pipeline]
+      weight: 1
+      command: |
+        if grep -q 'moby/buildkit:rootless' /srv/ci/pipeline.sh && ! grep -q -e '--privileged' /srv/ci/pipeline.sh; then echo rootless; else echo "other-builder"; fi
+      expect: {match: exact, value: rootless}
+  hints:
+    - title: Running the rootless builder
+      body: "`moby/buildkit:rootless` runs as an unprivileged user. It needs `--security-opt seccomp=unconfined --security-opt apparmor=unconfined` for its user namespaces and `BUILDKITD_FLAGS=--oci-worker-no-process-sandbox`; run `buildctl-daemonless.sh build ...` inside it with the context mounted read-only. None of this is --privileged."
+      cost: 1
+    - title: Pushing to the local registry
+      body: "Tell the builder to push with `--output type=image,name=127.0.0.1:{{port}}/thumbnailer:ci,push=true,registry.insecure=true`. Use `--network host` for the builder container so it can reach the loopback registry. The base image `FROM 127.0.0.1:{{port}}/busybox:1.37` comes from that registry as well (the host is offline); `/srv/ci/buildkitd.toml` marks it as plain HTTP (`BUILDKITD_FLAGS=--config=...`)."
+      cost: 1
+    - title: Scan and sign the digest
+      body: "Resolve the digest of the pushed tag (a HEAD request on the manifest), then `trivy image --offline-scan --skip-db-update --format json -o /srv/ci/out/scan.json` and `cosign sign --key ... --tlog-upload=false --allow-insecure-registry` on `repo@sha256:...`."
+      cost: 2
+  misconceptions:
+    - id: daemon-build-keep-dind
+      description: Builds with the host daemon and leaves the privileged sidecar running.
+      feedback: "The sidecar is the problem to remove, and building on the host daemon replaces it with the daemon's own root-level build instead of an unprivileged builder."
+      expectFail: [nothing-privileged, rootless-builder-used]
+      mutation:
+        on: cl-ci-02
+        as: learner
+        run: |
+          printf '%s\n' '#!/bin/sh' 'set -eu' 'docker build --build-arg REV={{rev}} -t 127.0.0.1:{{port}}/thumbnailer:ci /srv/ci/thumbnailer' 'docker push 127.0.0.1:{{port}}/thumbnailer:ci' 'echo pipeline ok' > /srv/ci/pipeline.sh
+    - id: unsigned
+      description: Builds and pushes but never signs.
+      feedback: "The job ends with a signature over the pushed digest. Without it a signed-only gate would refuse the image."
+      expectFail: [signed-by-digest]
+      mutation:
+        on: cl-ci-02
+        as: learner
+        run: |
+          docker rm -f ci-dind
+          printf '%s\n' '#!/bin/sh' 'set -eu' 'docker build --build-arg REV={{rev}} -t 127.0.0.1:{{port}}/thumbnailer:ci /srv/ci/thumbnailer' 'docker push 127.0.0.1:{{port}}/thumbnailer:ci' 'echo pipeline ok' > /srv/ci/pipeline.sh
+  solution:
+    explanation: |
+      Run `moby/buildkit:rootless` as an unprivileged container to build and push, scan
+      the pushed digest with trivy, sign that digest with cosign, and remove ci-dind.
+    steps:
+      - on: cl-ci-02
+        as: learner
+        timeoutSec: 480
+        run: |
+          docker rm -f ci-dind
+          cat > /srv/ci/pipeline.sh <<'SH'
+          #!/bin/sh
+          set -eu
+          REG=127.0.0.1:{{port}}
+          docker rm -f ci-builder >/dev/null 2>&1 || true
+          docker run --rm --name ci-builder --network host \
+            --security-opt seccomp=unconfined --security-opt apparmor=unconfined \
+            -e BUILDKITD_FLAGS='--oci-worker-no-process-sandbox --config=/etc/buildkit/buildkitd.toml' \
+            -v /srv/ci/buildkitd.toml:/etc/buildkit/buildkitd.toml:ro -v /srv/ci/thumbnailer:/ctx:ro --entrypoint buildctl-daemonless.sh moby/buildkit:rootless \
+            build --frontend dockerfile.v0 --local context=/ctx --local dockerfile=/ctx \
+            --opt build-arg:REV={{rev}} --output type=image,name=$REG/thumbnailer:ci,push=true,registry.insecure=true
+          A='Accept: application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json'
+          d=$(curl -fsI -H "$A" http://$REG/v2/thumbnailer/manifests/ci | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}')
+          trivy image --offline-scan --skip-db-update --cache-dir /srv/ci/trivy-cache --insecure --format json -o /srv/ci/out/scan.json "$REG/thumbnailer@$d"
+          COSIGN_PASSWORD='' cosign sign --key /etc/copperleaf/ci/cosign.key --tlog-upload=false --allow-insecure-registry --yes "$REG/thumbnailer@$d"
+          echo "pipeline ok"
+          SH
+          /srv/ci/pipeline.sh
+    alternatives:
+      - id: registry-output-sign-first
+        description: Push with the registry exporter, sign the digest, then scan it.
+        steps:
+          - on: cl-ci-02
+            as: learner
+            timeoutSec: 480
+            run: |
+              docker rm -f ci-dind
+              cat > /srv/ci/pipeline.sh <<'SH'
+              #!/bin/sh
+              set -eu
+              REG=127.0.0.1:{{port}}
+              docker run --rm --network host \
+                --security-opt seccomp=unconfined --security-opt apparmor=unconfined \
+                -e BUILDKITD_FLAGS='--oci-worker-no-process-sandbox --config=/etc/buildkit/buildkitd.toml' \
+                -v /srv/ci/buildkitd.toml:/etc/buildkit/buildkitd.toml:ro -v /srv/ci/thumbnailer:/ctx:ro \
+                --entrypoint buildctl-daemonless.sh moby/buildkit:rootless \
+                build --frontend dockerfile.v0 --local context=/ctx --local dockerfile=/ctx \
+                --opt build-arg:REV={{rev}} --output type=registry,ref=$REG/thumbnailer:ci,registry.insecure=true
+              A='Accept: application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json'
+              d=$(curl -fsI -H "$A" http://$REG/v2/thumbnailer/manifests/ci | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}')
+              COSIGN_PASSWORD='' cosign sign --key /etc/copperleaf/ci/cosign.key --tlog-upload=false --allow-insecure-registry --yes "$REG/thumbnailer@$d"
+              trivy image --offline-scan --skip-db-update --cache-dir /srv/ci/trivy-cache --insecure --format json -o /srv/ci/out/scan.json "$REG/thumbnailer@$d"
+              echo "pipeline ok"
+              SH
+              /srv/ci/pipeline.sh

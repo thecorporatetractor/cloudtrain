@@ -1,0 +1,175 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-api-version-floor
+  title: Fix the CI deploy client the upgraded engine refuses
+  domain: containers
+  frameworks: [docker-practitioner:operations]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [docker, api-version, engine-upgrade, ci]
+  version: 1
+spec:
+  description: |
+    On the build host `cl-ci-01` (`ssh cl-ci-01`; you are in the `docker` group) the CI
+    deploy job `/srv/ci/deploy.sh` publishes a canary on `127.0.0.1:{{canary}}`. After the
+    move to Engine 29 it fails with a *client version is too old* error. The job takes
+    its settings from `/etc/copperleaf/ci/deploy.env` (you may edit that file).
+
+    Find out which API versions the engine accepts and move the pinned client to a
+    supported one, so that `/srv/ci/deploy.sh` succeeds and the canary answers on
+    `http://127.0.0.1:{{canary}}`. Do **not** lower the engine's minimum API version
+    (no `DOCKER_MIN_API_VERSION` on the daemon): the security team wants the floor kept.
+  objectives:
+    - Read the engine's supported API range from docker version
+    - Read a client version pin from a CI environment file
+    - Fix the client instead of weakening the engine
+  params:
+    canary:
+      type: int
+      min: 8200
+      max: 8299
+    back:
+      type: int
+      min: 6
+      max: 12
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-ci-01
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-ci-01
+      timeoutSec: 240
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        install -d -m 700 /var/lib/cloudtrain
+        min=$(docker version --format json | jq -r '.Server.MinAPIVersion')
+        echo "$min" > /var/lib/cloudtrain/min.version
+        old=$(( ${min#1.} - {{back}} ))
+        install -d -o learner -g learner /etc/copperleaf/ci
+        echo "DOCKER_API_VERSION=1.$old" > /etc/copperleaf/ci/deploy.env
+        chown learner:learner /etc/copperleaf/ci/deploy.env
+        install -d /srv/ci
+        cat > /srv/ci/deploy.sh <<'SH'
+        #!/bin/sh
+        set -eu
+        . /etc/copperleaf/ci/deploy.env
+        export DOCKER_API_VERSION
+        docker rm -f deploy-canary >/dev/null 2>&1 || true
+        docker run -d --name deploy-canary -p 127.0.0.1:{{canary}}:80 nginx:1.29-alpine >/dev/null
+        echo "deploy ok api=$DOCKER_API_VERSION"
+        SH
+        chmod 755 /srv/ci/deploy.sh
+        docker rm -f deploy-canary >/dev/null 2>&1 || true
+  checks:
+    - id: deploy-passes
+      description: /srv/ci/deploy.sh succeeds
+      type: shell
+      timeoutSec: 90
+      on: cl-ci-01
+      skills: [containers.operations.engine-upgrade]
+      weight: 3
+      command: |
+        out=$(su -s /bin/sh learner -c /srv/ci/deploy.sh 2>&1 | tail -1)
+        echo "${out% api=*}"
+      expect: {match: exact, value: deploy ok}
+    - id: canary-answers
+      description: The canary answers on the published port
+      type: shell
+      timeoutSec: 60
+      on: cl-ci-01
+      skills: [containers.operations.engine-upgrade]
+      weight: 1
+      command: |
+        r=000; for i in $(seq 15); do r=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 http://127.0.0.1:{{canary}}/ 2>/dev/null || true); [ "$r" = 200 ] && break; sleep 1; done; echo "$r"
+      expect: {match: exact, value: "200"}
+    - id: pin-in-range
+      description: The pinned client version is within the engine's original supported range
+      type: shell
+      timeoutSec: 60
+      on: cl-ci-01
+      skills: [containers.operations.engine-upgrade]
+      weight: 2
+      command: |
+        v=$(sed -n 's/^DOCKER_API_VERSION=//p' /etc/copperleaf/ci/deploy.env | tail -1 | tr -d '"\047 ')
+        min=$(cat /var/lib/cloudtrain/min.version)
+        max=$(docker version --format json | jq -r '.Server.ApiVersion')
+        awk -v v="$v" -v a="$min" -v b="$max" 'BEGIN { split(v, x, "."); split(a, y, "."); split(b, z, ".");
+          if (v ~ /^1\.[0-9]+$/ && x[2] + 0 >= y[2] + 0 && x[2] + 0 <= z[2] + 0) print "in-range"; else print "out-of-range" }'
+      expect: {match: exact, value: in-range}
+    - id: floor-unchanged
+      description: The engine's minimum API version was not lowered
+      type: shell
+      timeoutSec: 60
+      on: cl-ci-01
+      skills: [containers.operations.engine-upgrade]
+      weight: 2
+      command: |
+        [ "$(docker version --format json | jq -r '.Server.MinAPIVersion')" = "$(cat /var/lib/cloudtrain/min.version)" ] && echo unchanged || echo lowered
+      expect: {match: exact, value: unchanged}
+  hints:
+    - title: The error names the floor
+      body: "Run the deploy script and read the message: it says which API version the client asked for and the minimum the engine supports."
+      command: /srv/ci/deploy.sh
+      cost: 1
+    - title: The supported range
+      body: "`docker version --format json` has the server's ApiVersion (highest) and MinAPIVersion (lowest). A client may pin anything between the two (the pin must stay in place)."
+      command: docker version --format json | jq '.Server | {ApiVersion, MinAPIVersion}'
+      cost: 1
+    - title: Where the pin lives
+      body: "The job exports DOCKER_API_VERSION from /etc/copperleaf/ci/deploy.env. Change the value there."
+      cost: 1
+  misconceptions:
+    - id: lower-the-floor
+      description: Lowers the engine's minimum API version so the old pin works.
+      feedback: "That weakens the engine for every client. The pin is the outdated part; move the client to a supported version."
+      expectFail: [floor-unchanged, pin-in-range]
+      mutation:
+        on: cl-ci-01
+        as: learner
+        run: |
+          sudo install -d /etc/systemd/system/docker.service.d
+          printf '[Service]\nEnvironment=DOCKER_MIN_API_VERSION=1.24\n' | sudo tee /etc/systemd/system/docker.service.d/min-api.conf >/dev/null
+          sudo systemctl daemon-reload
+          sudo systemctl restart docker
+          sleep 5
+          /srv/ci/deploy.sh
+    - id: too-new
+      description: Pins a version newer than the engine knows.
+      feedback: "The engine rejects clients that are too new as well. Choose a version between MinAPIVersion and ApiVersion."
+      expectFail: [deploy-passes, pin-in-range]
+      mutation:
+        on: cl-ci-01
+        as: learner
+        run: echo 'DOCKER_API_VERSION=1.99' > /etc/copperleaf/ci/deploy.env
+  solution:
+    explanation: |
+      `docker version` shows the engine's supported API range. The pin in deploy.env is
+      below the floor; set it to the engine's current API version (or any version in the range).
+    steps:
+      - on: cl-ci-01
+        as: learner
+        run: |
+          /srv/ci/deploy.sh || true
+          docker version --format json | jq '.Server | {ApiVersion, MinAPIVersion}'
+          echo "DOCKER_API_VERSION=$(docker version --format json | jq -r '.Server.ApiVersion')" > /etc/copperleaf/ci/deploy.env
+          /srv/ci/deploy.sh
+    alternatives:
+      - id: pin-the-floor
+        description: Pin exactly the engine's minimum supported version.
+        steps:
+          - on: cl-ci-01
+            as: learner
+            run: |
+              echo "DOCKER_API_VERSION=$(docker version --format json | jq -r '.Server.MinAPIVersion')" > /etc/copperleaf/ci/deploy.env
+              /srv/ci/deploy.sh

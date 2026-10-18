@@ -1,0 +1,200 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-image-layout-on-disk
+  title: Find the layer that deleted Copperleaf's signing keys
+  domain: containers
+  frameworks: []
+  difficulty: hard
+  estimatedMinutes: 20
+  tags: [oci, image-layout, layers, whiteout, internals]
+  version: 1
+spec:
+  description: |
+    On `cl-transcode-05` (`ssh cl-transcode-05`; you are in the `docker` group) the image
+    `copperleaf/transcoder:7.1` (release {{rel}}) was built by a pipeline that first
+    wrote the signing keys into `/etc/copperleaf/keys` and later removed them again.
+    The keys are gone from the final filesystem, but the layer that holds them is still
+    shipped.
+
+    1. Save the image and unpack it into **`~/layout`** as an OCI image layout
+       (`oci-layout`, `index.json`, `blobs/`).
+    2. Walk index, manifest and layers by hand and find the layer whose **whiteout**
+       deletes `/etc/copperleaf/keys` (a `.wh.keys` entry in `etc/copperleaf/`).
+    3. Write that layer's digest, as it appears in the manifest (`sha256:` and 64 hex
+       characters), as the only line of **`~/whiteout-layer.txt`**.
+  objectives:
+    - Unpack an image into an OCI layout and read index.json, manifests and configs
+    - Follow digests through blobs/sha256
+    - Recognise whiteout entries in a layer tar
+  params:
+    rel:
+      type: int
+      min: 100
+      max: 999
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-transcode-05
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-transcode-05
+      timeoutSec: 400
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        install -d -m 700 /var/lib/cloudtrain
+        d=$(mktemp -d)
+        cat > "$d/Dockerfile" <<'DF'
+        FROM busybox:1.37
+        RUN mkdir -p /etc/copperleaf/keys && echo "signing-key-{{rel}}" > /etc/copperleaf/keys/signing.pem
+        RUN echo "transcoder 7.1" > /etc/copperleaf/release
+        RUN rm -rf /etc/copperleaf/keys
+        RUN echo "{{rel}}" > /opt-release
+        DF
+        docker build -q --provenance=false --sbom=false -t copperleaf/transcoder:7.1 "$d" >/dev/null
+        rm -rf "$d"
+        cat > /var/lib/cloudtrain/wh.py <<'PY'
+        import json, os, sys, tarfile
+        root = sys.argv[1]
+        def blob(d):
+            return os.path.join(root, "blobs", d.replace(":", "/"))
+        def walk(m):
+            if "manifests" in m:
+                for e in m["manifests"]:
+                    if e.get("annotations", {}).get("vnd.docker.reference.type") == "attestation-manifest":
+                        continue
+                    r = walk(json.load(open(blob(e["digest"]))))
+                    if r:
+                        return r
+                return None
+            for l in m.get("layers", []):
+                try:
+                    with tarfile.open(blob(l["digest"]), "r:*") as t:
+                        for n in t.getnames():
+                            if os.path.basename(n) == ".wh.keys" and "etc/copperleaf" in n:
+                                return l["digest"]
+                except (tarfile.TarError, OSError):
+                    pass
+            return None
+        print(walk(json.load(open(os.path.join(root, "index.json")))) or "none")
+        PY
+        t=$(mktemp -d)
+        docker save copperleaf/transcoder:7.1 | tar -x -C "$t"
+        python3 /var/lib/cloudtrain/wh.py "$t" > /var/lib/cloudtrain/whiteout.digest
+        rm -rf "$t"
+        grep -qE '^sha256:[0-9a-f]{64}$' /var/lib/cloudtrain/whiteout.digest
+        rm -rf /home/learner/layout /home/learner/whiteout-layer.txt
+  checks:
+    - id: layout-unpacked
+      description: ~/layout is an OCI layout of the image in which the whiteout layer can be found
+      type: shell
+      timeoutSec: 90
+      on: cl-transcode-05
+      skills: [containers.internals.image-layout]
+      weight: 2
+      command: |
+        l=/home/learner/layout
+        [ "$(jq -r '.imageLayoutVersion' $l/oci-layout 2>/dev/null)" = 1.0.0 ] && [ -d $l/blobs/sha256 ] && jq -e '.manifests | length > 0' $l/index.json >/dev/null 2>&1 || { echo "not-a-layout"; exit 0; }
+        [ "$(python3 /var/lib/cloudtrain/wh.py $l)" = "$(cat /var/lib/cloudtrain/whiteout.digest)" ] && echo layout-ok || echo "wrong-image"
+      expect: {match: exact, value: layout-ok}
+    - id: whiteout-digest
+      description: whiteout-layer.txt holds the digest of the layer with the whiteout
+      type: shell
+      timeoutSec: 60
+      on: cl-transcode-05
+      skills: [containers.internals.image-layout]
+      weight: 4
+      command: |
+        [ -L /home/learner/whiteout-layer.txt ] && { echo symlink; exit 0; }
+        got=$(cat /home/learner/whiteout-layer.txt 2>/dev/null | tr -d ' \r\n')
+        [ "$got" = "$(cat /var/lib/cloudtrain/whiteout.digest)" ] && echo found || echo "wrong: $got"
+      expect: {match: exact, value: found}
+    - id: single-line
+      description: whiteout-layer.txt is a single sha256 line
+      type: shell
+      timeoutSec: 60
+      on: cl-transcode-05
+      skills: [containers.internals.image-layout]
+      weight: 1
+      command: |
+        f=/home/learner/whiteout-layer.txt
+        [ -L $f ] && { echo symlink; exit 0; }
+        if [ "$(wc -l < $f 2>/dev/null)" -eq 1 ] && grep -qE '^sha256:[0-9a-f]{64}$' $f; then echo well-formed; else echo malformed; fi
+      expect: {match: exact, value: well-formed}
+  hints:
+    - title: Unpack the image
+      body: "`docker save` writes a tar that is an OCI image layout on this engine: `oci-layout`, `index.json` and `blobs/sha256/<hex>`. Extract it with tar into ~/layout."
+      command: mkdir -p ~/layout && docker save copperleaf/transcoder:7.1 | tar -x -C ~/layout
+      cost: 1
+    - title: Follow the digests
+      body: "index.json points at a manifest blob; the manifest lists the layer blobs in order and the config. Each digest `sha256:<hex>` is the file blobs/sha256/<hex>."
+      command: jq . ~/layout/index.json
+      cost: 1
+    - title: Whiteouts
+      body: "A file deleted in a later layer is recorded in that layer's tar as an empty entry named `.wh.<name>`. List each layer with `tar -tf` and look for `.wh.keys`."
+      cost: 2
+  misconceptions:
+    - id: first-layer
+      description: Records the first layer, where the keys were written.
+      feedback: "The first layer that contains the keys holds the files, not the deletion. The whiteout is in the later layer that ran rm."
+      expectFail: [whiteout-digest]
+      mutation:
+        on: cl-transcode-05
+        as: learner
+        run: |
+          mkdir -p ~/layout && docker save copperleaf/transcoder:7.1 | tar -x -C ~/layout
+          cd ~/layout/blobs/sha256
+          for f in *; do
+            if jq -e '.layers' "$f" >/dev/null 2>&1; then jq -r '.layers[0].digest' "$f"; fi
+          done | head -1 > ~/whiteout-layer.txt
+    - id: manifest-digest
+      description: Records the manifest digest from index.json.
+      feedback: "index.json names the manifest. The layers are listed inside the manifest, and the whiteout is in one of them."
+      expectFail: [whiteout-digest]
+      mutation:
+        on: cl-transcode-05
+        as: learner
+        run: |
+          mkdir -p ~/layout && docker save copperleaf/transcoder:7.1 | tar -x -C ~/layout
+          jq -r '.manifests[0].digest' ~/layout/index.json > ~/whiteout-layer.txt
+  solution:
+    explanation: |
+      Unpack `docker save` output, list each layer of the image manifest and pick the one
+      that contains a `.wh.keys` entry.
+    steps:
+      - on: cl-transcode-05
+        as: learner
+        run: |
+          mkdir -p ~/layout && docker save copperleaf/transcoder:7.1 | tar -x -C ~/layout
+          cd ~/layout
+          jq . index.json
+          for f in blobs/sha256/*; do
+            if jq -e '.layers' "$f" >/dev/null 2>&1; then
+              for l in $(jq -r '.layers[].digest' "$f"); do
+                if tar -tf "blobs/sha256/${l#sha256:}" 2>/dev/null | grep -q '\.wh\.keys$'; then echo "$l"; fi
+              done
+            fi
+          done | head -1 > ~/whiteout-layer.txt
+          cat ~/whiteout-layer.txt
+    alternatives:
+      - id: by-config-order
+        description: Pick the image manifest first, then test only its layers.
+        steps:
+          - on: cl-transcode-05
+            as: learner
+            run: |
+              mkdir -p ~/layout && docker save copperleaf/transcoder:7.1 | tar -x -C ~/layout
+              cd ~/layout
+              m=$(for f in blobs/sha256/*; do jq -e '.layers' "$f" >/dev/null 2>&1 && echo "$f"; done | head -1)
+              for l in $(jq -r '.layers[].digest' "$m"); do
+                tar -tf "blobs/sha256/${l#sha256:}" 2>/dev/null | grep -q '\.wh\.keys$' && echo "$l"
+              done | head -1 > ~/whiteout-layer.txt

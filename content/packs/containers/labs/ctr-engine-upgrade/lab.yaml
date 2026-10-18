@@ -1,0 +1,159 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-engine-upgrade
+  title: Upgrade the transcoder host engine with running jobs
+  domain: containers
+  frameworks: [dca-legacy:install-config, docker-practitioner:operations]
+  difficulty: hard
+  estimatedMinutes: 30
+  tags: [docker, engine-upgrade, live-restore, apt]
+  version: 1
+spec:
+  description: |
+    The transcoder host `cl-transcode-06` (`ssh cl-transcode-06`; you have `sudo`) still
+    runs Docker Engine 28. A long-running container, **`transcode-long`** (restart
+    policy `unless-stopped`, serving a status page, job {{job}}), must not be
+    interrupted. Engine 29 is available from the local package mirror
+    (`/etc/apt/sources.list.d/copperleaf-engine.list`, already configured).
+
+    Upgrade the engine to **29** from that mirror, with **live-restore** enabled in
+    `/etc/docker/daemon.json` (merge the key; keep every other setting), so that
+    `transcode-long` keeps running **through the upgrade**: the same container, never
+    restarted, still serving its page.
+  objectives:
+    - Enable live-restore without restarting the engine
+    - Upgrade the engine packages from a local mirror
+    - Prove that a container survived an engine upgrade
+  params:
+    job:
+      type: int
+      min: 1000
+      max: 9999
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-transcode-06
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-transcode-06
+      timeoutSec: 600
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        install -d -m 700 /var/lib/cloudtrain
+        v=$(docker version --format json | jq -r '.Server.Version')
+        case "$v" in
+          28.*) ;;
+          *) echo "this lab needs a docker-vm variant that boots on Engine 28 with Engine 29 staged as a local apt repo in /srv/apt/engine-29 (not built yet)" >&2; exit 1 ;;
+        esac
+        test -s /srv/apt/engine-29/Packages.gz
+        echo 'deb [trusted=yes] file:/srv/apt/engine-29 ./' > /etc/apt/sources.list.d/copperleaf-engine.list
+        apt-mark unhold docker-ce docker-ce-cli containerd.io >/dev/null 2>&1 || true
+        apt-get update -qq -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/copperleaf-engine.list -o Dir::Etc::sourceparts=- >/dev/null
+        f=/etc/docker/daemon.json
+        [ -s "$f" ] || echo '{}' > "$f"
+        jq 'del(."live-restore")' "$f" > "$f.new" && mv "$f.new" "$f"
+        docker rm -f transcode-long >/dev/null 2>&1 || true
+        docker run -d --name transcode-long --restart unless-stopped nginx:1.29-alpine >/dev/null
+        docker exec transcode-long sh -c 'echo "job {{job}}" > /usr/share/nginx/html/index.html'
+        docker inspect transcode-long | jq -r '.[0] | "\(.Id) \(.State.StartedAt)"' > /var/lib/cloudtrain/long.start
+  checks:
+    - id: engine-29
+      description: The engine reports version 29
+      type: shell
+      timeoutSec: 90
+      on: cl-transcode-06
+      skills: [containers.operations.engine-upgrade]
+      weight: 3
+      command: |
+        for i in $(seq 20); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        docker version --format json 2>/dev/null | jq -r '.Server.Version | split(".")[0]'
+      expect: {match: exact, value: "29"}
+    - id: live-restore
+      description: live-restore is set in daemon.json and active in the engine
+      type: shell
+      timeoutSec: 60
+      on: cl-transcode-06
+      skills: [containers.operations.daemon-config]
+      weight: 2
+      command: |
+        echo "$(jq -r '."live-restore"' /etc/docker/daemon.json 2>/dev/null) $(docker info --format json 2>/dev/null | jq -r '.LiveRestoreEnabled')"
+      expect: {match: exact, value: "true true"}
+    - id: survived
+      description: transcode-long is the same container, never restarted, and still serves its page
+      type: shell
+      timeoutSec: 60
+      on: cl-transcode-06
+      skills: [containers.operations.engine-upgrade]
+      weight: 4
+      command: |
+        now=$(docker inspect transcode-long 2>/dev/null | jq -r '.[0] | "\(.Id) \(.State.StartedAt)"')
+        [ "$now" = "$(cat /var/lib/cloudtrain/long.start)" ] || { echo "restarted-or-replaced"; exit 0; }
+        ip=$(docker inspect transcode-long | jq -r '[.[0].NetworkSettings.Networks[].IPAddress] | first')
+        curl -s --max-time 5 "http://$ip/" || echo no-answer
+      expect: {match: exact, value: "job {{job}}"}
+  hints:
+    - title: Enable live-restore first
+      body: "With live-restore the containers keep running while dockerd is stopped or replaced. Set `\"live-restore\": true` in daemon.json (merge it with jq) and apply it with `sudo systemctl reload docker`, which does not restart the engine."
+      cost: 1
+    - title: Check before upgrading
+      body: "`docker info --format json | jq .LiveRestoreEnabled` must say true before you touch the packages."
+      cost: 1
+    - title: Install from the mirror
+      body: "The package postinstall restarts the engine; with live-restore on, containers survive it. `apt-cache policy docker-ce` shows the candidate from the local mirror."
+      cost: 2
+  misconceptions:
+    - id: upgrade-first
+      description: Upgrades the packages without enabling live-restore.
+      feedback: "The upgrade restarts the engine, and without live-restore the engine stops every container with it. Enable live-restore and verify it before upgrading."
+      expectFail: [survived, live-restore]
+      mutation:
+        on: cl-transcode-06
+        as: learner
+        run: sudo apt-get install -y docker-ce docker-ce-cli
+    - id: config-only
+      description: Enables live-restore but never upgrades.
+      feedback: "The container is safe, but the engine is still on version 28."
+      expectFail: [engine-29]
+      mutation:
+        on: cl-transcode-06
+        as: learner
+        run: |
+          sudo sh -c 'jq ". + {\"live-restore\": true}" /etc/docker/daemon.json > /etc/docker/daemon.json.new && mv /etc/docker/daemon.json.new /etc/docker/daemon.json'
+          sudo systemctl reload docker
+  solution:
+    explanation: |
+      Merge `live-restore: true` into daemon.json and reload (no restart), confirm it in
+      `docker info`, then install Engine 29 from the local mirror.
+    steps:
+      - on: cl-transcode-06
+        as: learner
+        timeoutSec: 300
+        run: |
+          sudo sh -c 'jq ". + {\"live-restore\": true}" /etc/docker/daemon.json > /etc/docker/daemon.json.new && mv /etc/docker/daemon.json.new /etc/docker/daemon.json'
+          sudo systemctl reload docker
+          sleep 3
+          docker info --format json | jq .LiveRestoreEnabled
+          sudo apt-get install -y docker-ce docker-ce-cli containerd.io
+          docker version --format json | jq -r .Server.Version
+    alternatives:
+      - id: sighup-reload
+        description: Reload with SIGHUP instead of systemctl.
+        steps:
+          - on: cl-transcode-06
+            as: learner
+            timeoutSec: 300
+            run: |
+              sudo sh -c 'jq ". + {\"live-restore\": true}" /etc/docker/daemon.json > /etc/docker/daemon.json.new && mv /etc/docker/daemon.json.new /etc/docker/daemon.json'
+              sudo kill -HUP "$(pidof dockerd)"
+              sleep 3
+              sudo apt-get install -y --only-upgrade docker-ce docker-ce-cli

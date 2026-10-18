@@ -1,0 +1,172 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ctr-restart-policy
+  title: Keep the subtitle worker running but respect manual stops
+  domain: containers
+  frameworks: [ex188-aligned:run-containers, docker-practitioner:operations]
+  difficulty: easy
+  estimatedMinutes: 10
+  tags: [docker, restart-policy, availability]
+  version: 1
+spec:
+  description: |
+    On `cl-subtitle-01` (`ssh cl-subtitle-01`; you are in the `docker` group) the
+    container **`subtitle-worker`** (image `copperleaf/subtitle-worker:1`, published on
+    `127.0.0.1:{{port}}`) has no restart policy: when it crashes it stays down, and
+    after an engine restart it is gone until somebody starts it.
+
+    Configure it so that it
+    - **restarts after a crash**,
+    - **comes back after an engine restart or a reboot**, and
+    - **stays down after an operator stops it by hand**, even across an engine restart.
+
+    The grader will crash the worker (it exits 1 when the file `/srv/subtitle/ctl/crash`
+    appears), restart the engine, stop the container by hand and restart the engine
+    again, checking after each step. Keep the same container: name, image, port and the
+    `/ctl` mount.
+  objectives:
+    - Compare the restart policies no, on-failure, always and unless-stopped
+    - Change the policy of an existing container
+    - Predict what happens after a crash, an engine restart and a manual stop
+  params:
+    port:
+      type: int
+      min: 8400
+      max: 8499
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: cl-subtitle-01
+        driver: vm
+        image: docker-vm:29
+        resources: {cpu: 2, memoryMiB: 2048}
+        access: [ssh]
+  setup:
+    - on: cl-subtitle-01
+      timeoutSec: 300
+      run: |
+        set -eu
+        usermod -aG docker learner
+        for i in $(seq 90); do docker info >/dev/null 2>&1 && break; sleep 2; done
+        d=$(mktemp -d)
+        cat > "$d/worker.py" <<'PY'
+        import http.server, os, signal, threading, time
+        signal.signal(signal.SIGTERM, lambda *a: os._exit(0))
+        def watch():
+            while True:
+                if os.path.exists("/ctl/crash"):
+                    os.remove("/ctl/crash")
+                    os._exit(1)
+                time.sleep(0.5)
+        threading.Thread(target=watch, daemon=True).start()
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"subtitle-worker ok\n")
+            def log_message(self, *a):
+                pass
+        http.server.ThreadingHTTPServer(("", 8000), H).serve_forever()
+        PY
+        printf '%s\n' 'FROM python:3.13-alpine' 'COPY worker.py /app/worker.py' 'CMD ["python3", "/app/worker.py"]' > "$d/Dockerfile"
+        docker build -q -t copperleaf/subtitle-worker:1 "$d" >/dev/null
+        rm -rf "$d"
+        rm -rf /srv/subtitle; install -d /srv/subtitle/ctl
+        docker rm -f subtitle-worker >/dev/null 2>&1 || true
+        docker run -d --name subtitle-worker -p 127.0.0.1:{{port}}:8000 -v /srv/subtitle/ctl:/ctl copperleaf/subtitle-worker:1 >/dev/null
+  checks:
+    - id: policy
+      description: subtitle-worker has the restart policy unless-stopped
+      type: shell
+      timeoutSec: 60
+      on: cl-subtitle-01
+      skills: [containers.operations.restart-health]
+      weight: 2
+      command: docker inspect subtitle-worker 2>/dev/null | jq -r '.[0].HostConfig.RestartPolicy.Name'
+      expect: {match: exact, value: unless-stopped}
+    - id: behaviour
+      description: It restarts after a crash and an engine restart, and stays down after a manual stop
+      type: shell
+      timeoutSec: 300
+      on: cl-subtitle-01
+      skills: [containers.operations.restart-health]
+      weight: 3
+      command: |
+        c=subtitle-worker
+        up() { for i in $(seq 20); do [ "$(docker inspect $c 2>/dev/null | jq -r '.[0].State.Running')" = true ] && curl -sf --max-time 2 http://127.0.0.1:{{port}}/ >/dev/null && return 0; sleep 2; done; return 1; }
+        engine() { systemctl restart docker; for i in $(seq 60); do docker info >/dev/null 2>&1 && return 0; sleep 2; done; return 1; }
+        docker start $c >/dev/null 2>&1 || true
+        fin() { docker start $c >/dev/null 2>&1 || true; echo "$1"; exit 0; }
+        up || fin not-running-at-start
+        n0=$(docker inspect $c | jq '.[0].RestartCount')
+        touch /srv/subtitle/ctl/crash
+        sleep 3
+        up || fin no-restart-after-crash
+        n1=$(docker inspect $c | jq '.[0].RestartCount')
+        [ "$n1" -gt "$n0" ] || fin no-restart-after-crash
+        engine
+        sleep 5
+        up || fin down-after-engine-restart
+        docker stop $c >/dev/null
+        engine
+        sleep 10
+        if [ "$(docker inspect $c | jq -r '.[0].State.Running')" = true ]; then fin restarted-after-manual-stop; fi
+        docker start $c >/dev/null
+        up && echo behaves || echo "does-not-start-again"
+      expect: {match: exact, value: behaves}
+    - id: same-container
+      description: subtitle-worker keeps its image, port and /ctl mount
+      type: shell
+      timeoutSec: 60
+      on: cl-subtitle-01
+      skills: [containers.operations.restart-health]
+      weight: 1
+      command: |
+        docker inspect subtitle-worker 2>/dev/null | jq -r '[.[0].Config.Image, ([.[0].HostConfig.PortBindings["8000/tcp"][]? | (.HostIp // "") + ":" + .HostPort] | join(",")), ([.[0].Mounts[] | select(.Destination == "/ctl") | .Source] | join(","))] | join(" ")'
+      expect: {match: exact, value: "copperleaf/subtitle-worker:1 127.0.0.1:{{port}} /srv/subtitle/ctl"}
+  hints:
+    - title: The four policies
+      body: "no never restarts; on-failure restarts only after a non-zero exit (and not after an engine restart); always restarts in every case, a manual stop included, once the engine restarts; unless-stopped is like always but remembers a manual stop."
+      cost: 1
+    - title: Change it in place
+      body: "`docker update --restart <policy> <container>` changes the policy of an existing container without recreating it."
+      cost: 1
+  misconceptions:
+    - id: always
+      description: Uses restart policy always.
+      feedback: "With always, a container you stopped by hand starts again at the next engine restart or reboot. unless-stopped remembers the manual stop."
+      expectFail: [policy, behaviour]
+      mutation:
+        on: cl-subtitle-01
+        as: learner
+        run: docker update --restart always subtitle-worker
+    - id: on-failure
+      description: Uses restart policy on-failure.
+      feedback: "on-failure reacts to a non-zero exit, so the crash is covered, but a container is not restarted when the engine restarts or the host reboots."
+      expectFail: [policy, behaviour]
+      mutation:
+        on: cl-subtitle-01
+        as: learner
+        run: docker update --restart on-failure subtitle-worker
+  solution:
+    explanation: "`docker update --restart unless-stopped subtitle-worker` changes the policy in place."
+    steps:
+      - on: cl-subtitle-01
+        as: learner
+        run: |
+          docker update --restart unless-stopped subtitle-worker
+          docker start subtitle-worker
+    alternatives:
+      - id: recreate
+        description: Recreate the container with the policy.
+        steps:
+          - on: cl-subtitle-01
+            as: learner
+            run: |
+              docker rm -f subtitle-worker
+              docker run -d --name subtitle-worker --restart unless-stopped -p 127.0.0.1:{{port}}:8000 -v /srv/subtitle/ctl:/ctl copperleaf/subtitle-worker:1
