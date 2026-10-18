@@ -67,6 +67,15 @@ spec:
         set -e
         apt-mark hold kubeadm kubelet kubectl
         mkdir -p /var/lib/cloudtrain /opt/cloudtrain/bin
+        # Change-window policy: package installs must not restart the kubelet on
+        # their own; the learner restarts it explicitly (otherwise the kubelet
+        # package's postinst restarts it and "forgot to restart" cannot happen).
+        cat > /usr/sbin/policy-rc.d <<'SH'
+        #!/bin/sh
+        [ "$1" = kubelet ] && exit 101
+        exit 0
+        SH
+        chmod 0755 /usr/sbin/policy-rc.d
         rm -f /var/lib/cloudtrain/cordoned-at
         # Durable cordon evidence for was-cordoned (Events expire after the
         # apiserver's --event-ttl). The watcher polls the node and records the
@@ -132,7 +141,7 @@ spec:
     - on: qm-ledger/ledger-cp-1
       run: |
         systemctl disable --now cloudtrain-cordon-watch.service 2>/dev/null || true
-        rm -f /etc/systemd/system/cloudtrain-cordon-watch.service /opt/cloudtrain/bin/cordon-watch /var/lib/cloudtrain/cordoned-at
+        rm -f /usr/sbin/policy-rc.d /etc/systemd/system/cloudtrain-cordon-watch.service /opt/cloudtrain/bin/cordon-watch /var/lib/cloudtrain/cordoned-at
         systemctl daemon-reload
   checks:
     - id: context
@@ -412,10 +421,15 @@ spec:
           systemctl restart kubelet
           EOS
           kubectl uncordon ledger-cp-1
+          # The apiserver restarts when the kubelet comes back; wait for it to settle.
+          for i in $(seq 1 90); do kubectl get --raw /readyz >/dev/null 2>&1 && break; sleep 5; done
+          kubectl wait --for=condition=Ready node/ledger-cp-1 --timeout=300s
+          kubectl -n kube-system rollout status deploy/coredns --timeout=300s
+          kubectl -n ledger rollout status deploy/ledger-reconciler --timeout=300s
           kubectl get nodes
     alternatives:
       - id: allow-change-held
-        description: Install over the hold with --allow-change-held-packages instead of unhold/hold; the holds stay in place.
+        description: Install over the hold with --allow-change-held-packages instead of unhold first (apt clears the hold on install, so hold the packages again afterwards).
         steps:
           - on: workstation
             as: learner
@@ -430,6 +444,12 @@ spec:
               apt-get install -y --allow-change-held-packages kubeadm='1.37.1-*'
               kubeadm upgrade apply -y v1.37.1
               apt-get install -y --allow-change-held-packages kubelet='1.37.1-*' kubectl='1.37.1-*'
+              apt-mark hold kubeadm kubelet kubectl
               systemctl daemon-reload && systemctl restart kubelet
               EOS
               kubectl uncordon ledger-cp-1
+              # The apiserver restarts when the kubelet comes back; wait for it to settle.
+              for i in $(seq 1 90); do kubectl get --raw /readyz >/dev/null 2>&1 && break; sleep 5; done
+              kubectl wait --for=condition=Ready node/ledger-cp-1 --timeout=300s
+              kubectl -n kube-system rollout status deploy/coredns --timeout=300s
+              kubectl -n ledger rollout status deploy/ledger-reconciler --timeout=300s
