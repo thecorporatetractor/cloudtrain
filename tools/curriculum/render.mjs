@@ -1,12 +1,14 @@
 #!/usr/bin/env node
-// Renders content/curriculum.yaml into docs/curriculum.md and the curriculum
-// table of README.md (between the curriculum-table markers).
+// Renders content/curriculum.yaml into docs/curriculum.md, the curriculum
+// table of README.md (between the curriculum-table markers) and one
+// content/frameworks/<id>.yaml per curriculum framework (see frameworks.mjs).
 //   node tools/curriculum/render.mjs [--check]
-// --check exits 1 when either is out of date (for CI).
-import { readFileSync, writeFileSync, existsSync } from "node:fs";
+// --check exits 1 when any of them is out of date (for CI).
+import { readFileSync, writeFileSync, existsSync, readdirSync, unlinkSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
+import { GENERATED_FROM, renderFrameworks } from "./frameworks.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 // yaml is a dependency of tools/lab-verify; resolve it from there so this script needs no install of its own.
@@ -194,7 +196,7 @@ push("## Appendix: proposed images", "");
 push(table(["Ref", "Kind", "Tier", "Status", "Description"], (doc.images ?? []).map((i) => [code(i.ref), i.kind, i.tier, i.status ?? "proposed", i.description])), "");
 push("## Appendix: alignment frameworks declared here", "");
 push(
-  "Frameworks with a file in `content/frameworks/` (cka, ckad, cks, lfcs, ccna) are not repeated. Weights marked *cloudtrain* are CloudTrain estimates where the body publishes none.",
+  "Hand-written frameworks in `content/frameworks/` (cka, ckad, cks, lfcs, ccna) are not repeated. Each framework below is generated into `content/frameworks/<id>.yaml` with its objectives mapped to the skills of the labs that reference them. Weights marked *cloudtrain* are CloudTrain estimates where the body publishes none.",
   "",
   table(["Framework", "Title", "Body", "Weights", "Objectives"], (doc.frameworks ?? []).map((f) => [code(f.id), f.title, f.body ?? "", f.weightsSource ?? "", f.objectives.map((o) => (o.weight !== undefined ? `${o.id} (${o.weight})` : o.id)).join(", ")])),
   "",
@@ -218,9 +220,33 @@ if (a < 0 || b < a) {
 }
 const readmeText = readmeCurrent.slice(0, a + START.length) + "\n" + readmeTable + "\n" + readmeCurrent.slice(b);
 
+// ---------------------------------------------------------------- framework files
+const fwDir = path.join(root, "content/frameworks");
+const fwFiles = renderFrameworks(doc, YAML);
+// Generated files whose framework left the curriculum are removed (hand-written files never carry the marker).
+const orphans = readdirSync(fwDir).filter((n) => n.endsWith(".yaml") && !fwFiles.has(n) && YAML.parse(readFileSync(path.join(fwDir, n), "utf8"))?.generatedFrom === GENERATED_FROM);
+for (const name of fwFiles.keys()) {
+  const file = path.join(fwDir, name);
+  if (existsSync(file) && YAML.parse(readFileSync(file, "utf8"))?.generatedFrom !== GENERATED_FROM) {
+    console.error(`content/frameworks/${name} is hand-written; drop framework ${name.replace(/\.yaml$/, "")} from content/curriculum.yaml frameworks`);
+    process.exit(1);
+  }
+}
+
 if (process.argv.includes("--check")) {
   const current = existsSync(out) ? readFileSync(out, "utf8") : "";
   let stale = false;
+  for (const [name, body] of fwFiles) {
+    const file = path.join(fwDir, name);
+    if (!existsSync(file) || readFileSync(file, "utf8") !== body) {
+      console.error(`content/frameworks/${name} is out of date; run node tools/curriculum/render.mjs`);
+      stale = true;
+    }
+  }
+  for (const name of orphans) {
+    console.error(`content/frameworks/${name} was generated for a framework no longer in the curriculum; run node tools/curriculum/render.mjs`);
+    stale = true;
+  }
   if (current !== text) {
     console.error("docs/curriculum.md is out of date; run node tools/curriculum/render.mjs");
     stale = true;
@@ -230,9 +256,12 @@ if (process.argv.includes("--check")) {
     stale = true;
   }
   if (stale) process.exit(1);
-  console.log("docs/curriculum.md and the README curriculum table are up to date");
+  console.log(`docs/curriculum.md, the README curriculum table and ${fwFiles.size} generated framework files are up to date`);
 } else {
   writeFileSync(out, text);
   writeFileSync(readme, readmeText);
+  for (const [name, body] of fwFiles) writeFileSync(path.join(fwDir, name), body);
+  for (const name of orphans) unlinkSync(path.join(fwDir, name));
+  console.log(`wrote ${fwFiles.size} framework files to content/frameworks${orphans.length ? ` (removed ${orphans.join(", ")})` : ""}`);
   console.log(`wrote ${path.relative(process.cwd(), out)} (${labs.length} labs, ${(doc.paths ?? []).length} paths, ${exams.length} exams) and the README curriculum table`);
 }

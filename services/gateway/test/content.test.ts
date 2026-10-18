@@ -35,15 +35,52 @@ describe('content loader (real content/)', () => {
 
   it('maps frameworks: ids prefixed per objective, weights summing to 1', async () => {
     const c = await realContent();
-    expect(c.frameworks.map((f) => f.id).sort()).toEqual(['ccna', 'cka', 'ckad', 'cks', 'lfcs']);
+    expect(c.frameworks.map((f) => f.id)).toEqual(expect.arrayContaining(['ccna', 'cka', 'ckad', 'cks', 'lfcs']));
     const cka = c.frameworks.find((f) => f.id === 'cka')!;
     expect(cka.name).toBe('CKA');
     expect(cka.fullName).toBe('Certified Kubernetes Administrator');
+    expect(cka).toMatchObject({ domain: 'kubernetes', group: 'Kubernetes', vendor: 'CNCF / Linux Foundation' });
+    expect(cka.disclaimer).toMatch(/not affiliated with or endorsed by/);
     expect(cka.domains.find((d) => d.id === 'cka:troubleshooting')?.weight).toBeCloseTo(0.3);
     expect(cka.domains.reduce((a, d) => a + d.weight, 0)).toBeCloseTo(1);
     // lab metadata.frameworks reference these ids
     const drain = c.summaries.find((l) => l.id === 'drain-yard-worker')!;
     for (const f of drain.frameworks ?? []) expect(cka.domains.some((d) => d.id === f)).toBe(true);
+  });
+
+  it('serves every curriculum framework (generated files), grouped by domain with coverage', async () => {
+    const c = await realContent();
+    const { parse } = await import('yaml');
+    const { readFile } = await import('node:fs/promises');
+    const curriculum = parse(await readFile(path.join(repo, 'content/curriculum.yaml'), 'utf8')) as { frameworks: { id: string; objectives: unknown[] }[] };
+    const ids = new Set(c.frameworks.map((f) => f.id));
+    for (const f of curriculum.frameworks) expect(ids.has(f.id), f.id).toBe(true);
+    expect(c.frameworks.length).toBeGreaterThanOrEqual(5 + curriculum.frameworks.length);
+    // Ordered by group (content domain order, cross-domain last as Platform), then name.
+    const groups = c.frameworks.map((f) => f.group);
+    expect(groups.filter((g, i) => g !== groups[i - 1])).toEqual([...new Set(groups)]);
+    expect(groups.at(-1)).toBe('Platform');
+    expect(c.frameworks.find((f) => f.id === 'ct-platform')).toMatchObject({ name: 'Platform Capstone', group: 'Platform', vendor: 'CloudTrain' });
+    expect(c.frameworks.find((f) => f.id === 'ct-platform')?.domain).toBeUndefined();
+    expect(c.frameworks.find((f) => f.id === 'ct-platform')?.disclaimer).toBeUndefined();
+    // Exam codes stay out of learner-facing names; parenthesised codes leave the full name.
+    const rhce = c.frameworks.find((f) => f.id === 'ex294-aligned')!;
+    expect(rhce).toMatchObject({ name: 'RHCE', domain: 'automation', group: 'Automation' });
+    expect(rhce.fullName).not.toMatch(/EX294/);
+    const rhcsa = c.frameworks.find((f) => f.id === 'rhcsa-aligned')!;
+    expect(rhcsa.disclaimer).toMatch(/not affiliated with or endorsed by Red Hat, Inc\./);
+    // Weights still sum to 1; frameworks without published weights count objectives equally.
+    for (const f of c.frameworks) expect(f.domains.reduce((a, d) => a + d.weight, 0), f.id).toBeCloseTo(1);
+    const lpic1 = c.frameworks.find((f) => f.id === 'lpic1')!;
+    expect(new Set(lpic1.domains.map((d) => d.weight)).size).toBe(1);
+    // Objectives keep only skills of the loaded graph; coverage is a share of objectives.
+    const known = new Set(c.skills.map((s) => s.id));
+    for (const f of c.frameworks) {
+      expect(f.coverage).toBeGreaterThanOrEqual(0);
+      expect(f.coverage).toBeLessThanOrEqual(1);
+      for (const d of f.domains) for (const s of d.skillIds) expect(known.has(s), `${d.id}: ${s}`).toBe(true);
+    }
+    expect(c.frameworks.find((f) => f.id === 'tf-associate')!.coverage).toBe(1);
   });
 
   it('loads every framework file, so tags of a known framework resolve to its domains', async () => {

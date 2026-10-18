@@ -8,7 +8,9 @@ import { RequireAccess } from '@/app/access';
 import { initials } from '@/app/Shell';
 import { useShell } from '@/app/shell-context';
 import { DifficultyBadge, DomainIcon } from '@/components/domain';
+import { FrameworkIcon } from '@/components/framework-picker';
 import { Badge, Button, Card, Checkbox, ErrorState, Field, Input, PageSkeleton, Segmented, Select, Textarea } from '@/components/ui';
+import { coverageInProgress, matchesFramework } from '@/lib/frameworks';
 import { cn, formatDate, formatMinutes } from '@/lib/utils';
 import { assignRoute } from '@/router';
 import { useSelectedTeam } from './Team';
@@ -54,7 +56,7 @@ function AssignScreen() {
     const needle = q.toLowerCase().trim();
     if (kind === 'lab') return (catalog.data?.labs ?? []).filter((l) => !needle || `${l.title} ${l.tags?.join(' ')} ${l.domain}`.toLowerCase().includes(needle)).map((l) => ({ id: l.id, title: l.title, meta: <span className="row xs subtle" style={{ gap: 8 }}><DomainIcon domain={l.domain} size={11} /> <DifficultyBadge difficulty={l.difficulty} compact /> {formatMinutes(l.estimatedMinutes)}</span> }));
     if (kind === 'path') return (catalog.data?.paths ?? []).filter((p) => !needle || `${p.title} ${p.domain}`.toLowerCase().includes(needle)).map((p) => ({ id: p.id, title: p.title, meta: <span className="row xs subtle" style={{ gap: 8 }}><DomainIcon domain={p.domain} size={11} /> {p.labIds.length} labs · {formatMinutes(p.estimatedMinutes)}</span> }));
-    return (skills.data?.frameworks ?? []).filter((f) => !needle || `${f.name} ${f.fullName}`.toLowerCase().includes(needle)).map((f) => ({ id: f.id, title: `${f.name} readiness`, meta: <span className="xs subtle">{f.fullName} · {f.vendor}</span> }));
+    return (skills.data?.frameworks ?? []).filter((f) => matchesFramework(f, needle)).map((f) => ({ id: f.id, title: `${f.name} readiness`, meta: <span className="row xs subtle" style={{ gap: 8 }}><FrameworkIcon framework={f} size={11} /> {f.group} · {f.fullName}{f.vendor ? ` · ${f.vendor}` : ''}{coverageInProgress(f) ? ' · coverage in progress' : ''}</span> }));
   }, [kind, q, catalog.data, skills.data]);
 
   const chosen = items.find((i) => i.id === itemId);

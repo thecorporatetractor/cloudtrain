@@ -7,8 +7,9 @@ import type { AtRiskItem, DashboardMember, TeamDashboard } from '@/api/types';
 import { RequireAccess } from '@/app/access';
 import { initials } from '@/app/Shell';
 import { useShell } from '@/app/shell-context';
-import { Bar, Columns, HeatCell } from '@/components/charts';
+import { Columns, HeatCell } from '@/components/charts';
 import { DomainIcon } from '@/components/domain';
+import { FrameworkReadinessList } from '@/components/framework-picker';
 import { AssignmentStateBadge, DueDate, ItemLink } from '@/components/platform';
 import { Badge, Button, Card, EmptyState, ErrorState, PageSkeleton, Select, Stat, Tooltip } from '@/components/ui';
 import { cn, formatMinutes, pct } from '@/lib/utils';
@@ -130,23 +131,22 @@ function TeamScreen() {
                   <h2>Framework readiness</h2>
                   <span className="subtle xs">team mean · members ≥ 70%</span>
                 </div>
-                <ul className="domain-readiness" style={{ padding: '14px 20px 16px' }}>
-                  {d.frameworks.map((f) => (
-                    <li key={f.frameworkId} className="stack" style={{ gap: 5 }}>
-                      <div className="row-between small">
-                        <span>
-                          {f.name}
-                          <span className="subtle xs">
-                            {' '}
-                            · {f.ready} of {f.members} ready
-                          </span>
+                <FrameworkReadinessList
+                  rows={d.frameworks.map((f) => ({
+                    id: f.frameworkId,
+                    readiness: f.readiness,
+                    tone: f.readiness < 0.45 ? 'neutral' : 'accent',
+                    label: (
+                      <span>
+                        {f.name}
+                        <span className="subtle xs">
+                          {' '}
+                          · {f.ready} of {f.members} ready
                         </span>
-                        <span className="tnum">{pct(f.readiness)}</span>
-                      </div>
-                      <Bar value={f.readiness} tone={f.readiness < 0.45 ? 'neutral' : 'accent'} thin />
-                    </li>
-                  ))}
-                </ul>
+                      </span>
+                    ),
+                  }))}
+                />
               </Card>
               <Card className="card-flush">
                 <div className="card-head">

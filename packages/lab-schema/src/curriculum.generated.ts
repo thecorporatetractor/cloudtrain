@@ -10,14 +10,14 @@
 export type Id = string;
 /**
  * This interface was referenced by `Curriculum`'s JSON-Schema
- * via the `definition` "imageRef".
- */
-export type ImageRef = string;
-/**
- * This interface was referenced by `Curriculum`'s JSON-Schema
  * via the `definition` "domain".
  */
 export type Domain = "kubernetes" | "linux" | "containers" | "iac" | "automation" | "networking";
+/**
+ * This interface was referenced by `Curriculum`'s JSON-Schema
+ * via the `definition` "imageRef".
+ */
+export type ImageRef = string;
 /**
  * This interface was referenced by `Curriculum`'s JSON-Schema
  * via the `definition` "frameworkRef".
@@ -58,11 +58,19 @@ export interface Curriculum {
     };
   };
   /**
-   * Alignment targets that do not (yet) have a file in content/frameworks. Objective refs '<id>:<objective>' resolve against these or content/frameworks/*.yaml.
+   * Alignment targets authored here (not by hand in content/frameworks). tools/curriculum/render.mjs generates content/frameworks/<id>.yaml from each, mapping objectives to the skills of the labs that reference them. Objective refs '<id>:<objective>' resolve against these or content/frameworks/*.yaml.
    */
   frameworks: {
     id: Id;
     title: string;
+    /**
+     * Short learner-facing name for pickers and badges (e.g. RHCSA). Never an exam code. Defaults to an acronym in parentheses in the title, else the id.
+     */
+    shortName?: string;
+    /**
+     * Domain the framework is grouped under in the UI; cross-domain frameworks group as Platform. Defaults to the domain of most labs that reference it.
+     */
+    domain?: Domain | "cross-domain";
     /**
      * Certifying body, or 'CloudTrain' for internal frameworks.
      */

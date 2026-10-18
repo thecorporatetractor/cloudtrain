@@ -2,7 +2,7 @@ import { readdir, readFile, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { parse } from 'yaml';
 import { validateLab, type Lab as SourceLab } from '@cloudtrain/lab-schema';
-import type { Domain, DomainInfo, Framework, FrameworkId, LabSummary, Path, Skill } from '@cloudtrain/api-types';
+import type { Domain, DomainInfo, Framework, LabSummary, Path, Skill } from '@cloudtrain/api-types';
 
 /** A lab.yaml from content/ (or an extra lab directory), validated against the v3 schema. */
 export interface ContentLab {
@@ -56,12 +56,18 @@ interface SkillGraphDoc {
   domains: { id: string; title: string; competencies: { id: string; title: string; skills: { id: string; title: string; requires?: string[] }[] }[] }[];
 }
 
+/** content/frameworks/<id>.yaml: hand-written, or generated from content/curriculum.yaml (`generatedFrom`). */
 interface FrameworkDoc {
   kind: 'Framework';
   id: string;
   title: string;
+  shortName?: string;
   issuer?: string;
-  objectives: { id: string; title: string; weight: number; skills?: string[] }[];
+  /** Content domain, or `cross-domain`. */
+  domain?: string;
+  disclaimer?: string;
+  /** Weights are optional where the certifying body publishes none. */
+  objectives: { id: string; title: string; weight?: number; skills?: string[] }[];
 }
 
 interface PackDoc {
@@ -84,7 +90,8 @@ const DOMAIN_OF: Record<string, Domain> = {
 };
 /** Always listed; the wave-2 domains appear once they have labs. */
 const CORE_DOMAINS: readonly Domain[] = ['kubernetes', 'linux', 'networking'];
-const FRAMEWORK_IDS: readonly FrameworkId[] = ['cka', 'ckad', 'cks', 'lfcs', 'ccna'];
+/** Picker group of frameworks that span domains (framework `domain: cross-domain`). */
+const CROSS_DOMAIN_GROUP = 'Platform';
 
 const DOMAIN_INFO: Record<Domain, { name: string; tagline: string }> = {
   kubernetes: { name: 'Kubernetes', tagline: 'Real kubeadm and virtual clusters, from etcd to admission.' },
@@ -167,19 +174,47 @@ export function addCurriculumSkills(
   }
 }
 
-/** Objective weights are published percentages; the API uses fractions of 1 that sum to 1. */
-export function toFramework(doc: FrameworkDoc): Framework | null {
-  const id = doc.id as FrameworkId;
-  if (!FRAMEWORK_IDS.includes(id)) return null;
-  const total = doc.objectives.reduce((a, o) => a + o.weight, 0) || 1;
-  const short = /\(([^)]+)\)\s*$/.exec(doc.title)?.[1]?.split(/\s+/)[0] ?? id.toUpperCase();
+/**
+ * Objective weights are percentages; the API uses fractions of 1 that sum to 1. Without
+ * weights (the body publishes none) objectives count equally. Parenthesised codes leave the
+ * full name ("Certified Kubernetes Administrator (CKA)" -> "Certified Kubernetes Administrator").
+ * `coverage` is filled in by `finishFrameworks` once the labs are loaded.
+ */
+export function toFramework(doc: FrameworkDoc): Framework {
+  const id = doc.id;
+  const total = doc.objectives.reduce((a, o) => a + (o.weight ?? 0), 0);
+  const weightOf = (w: number | undefined) => (total > 0 ? (w ?? 0) / total : 1 / doc.objectives.length);
+  const short = doc.shortName ?? /\(([^)]+)\)\s*$/.exec(doc.title)?.[1]?.split(/\s+/)[0] ?? id.toUpperCase();
+  const domain = doc.domain ? DOMAIN_OF[doc.domain] : undefined;
   return {
     id,
     name: short,
-    fullName: doc.title.replace(/\s*\([^)]*\)\s*$/, ''),
+    fullName: doc.title.replace(/\s*\([^)]*\)/g, '').replace(/\s+/g, ' ').trim(),
     vendor: doc.issuer ?? '',
-    domains: doc.objectives.map((o) => ({ id: `${id}:${o.id}`, name: o.title, weight: o.weight / total, skillIds: o.skills ?? [] })),
+    ...(domain ? { domain } : {}),
+    group: domain ? DOMAIN_INFO[domain].name : CROSS_DOMAIN_GROUP,
+    coverage: 0,
+    ...(doc.disclaimer ? { disclaimer: doc.disclaimer } : {}),
+    domains: doc.objectives.map((o) => ({ id: `${id}:${o.id}`, name: o.title, weight: weightOf(o.weight), skillIds: o.skills ?? [] })),
   };
+}
+
+/**
+ * Keeps only objective skills of the loaded skill graph (generated frameworks list the skills of
+ * proposed labs too), sets `coverage` from the loaded labs (an objective is covered when a lab
+ * is tagged with it or trains one of its skills) and orders frameworks by group, then name.
+ */
+export function finishFrameworks(frameworks: Framework[], skills: Skill[], labs: Pick<LabSummary, 'frameworks' | 'skillIds'>[]): Framework[] {
+  const known = new Set(skills.map((s) => s.id));
+  const trained = new Set(labs.flatMap((l) => l.skillIds));
+  const tagged = new Set(labs.flatMap((l) => l.frameworks ?? []));
+  const order = [...(Object.keys(DOMAIN_INFO) as Domain[]).map((d) => DOMAIN_INFO[d].name), CROSS_DOMAIN_GROUP];
+  for (const f of frameworks) {
+    for (const d of f.domains) d.skillIds = d.skillIds.filter((id) => known.has(id));
+    const covered = f.domains.filter((d) => tagged.has(d.id) || d.skillIds.some((id) => trained.has(id))).length;
+    f.coverage = f.domains.length ? Math.round((covered / f.domains.length) * 100) / 100 : 0;
+  }
+  return frameworks.sort((a, b) => order.indexOf(a.group) - order.indexOf(b.group) || a.name.localeCompare(b.name));
 }
 
 function labSkills(lab: SourceLab): string[] {
@@ -219,8 +254,7 @@ export async function loadContent(contentDir: string, extraLabDirs: string[] = [
   const fwDir = path.join(contentDir, 'frameworks');
   if (await exists(fwDir)) {
     for (const f of (await readdir(fwDir)).filter((n) => /\.ya?ml$/.test(n)).sort()) {
-      const fw = toFramework(await readYaml<FrameworkDoc>(path.join(fwDir, f)));
-      if (fw) frameworks.push(fw);
+      frameworks.push(toFramework(await readYaml<FrameworkDoc>(path.join(fwDir, f))));
     }
   }
 
@@ -261,7 +295,7 @@ export async function loadContent(contentDir: string, extraLabDirs: string[] = [
     for (const p of pack.paths ?? []) {
       const parts = p.courses.map((id) => courses.find((c) => c.id === id)).filter((c): c is NonNullable<typeof c> => !!c);
       const labIds = known(parts.flatMap((c) => c.labs));
-      const framework = FRAMEWORK_IDS.includes(p.framework as FrameworkId) ? (p.framework as FrameworkId) : undefined;
+      const framework = frameworks.some((f) => f.id === p.framework) ? p.framework : undefined;
       paths.push({
         id: p.id,
         title: p.title,
@@ -284,6 +318,8 @@ export async function loadContent(contentDir: string, extraLabDirs: string[] = [
       completion: 'new',
     };
   });
+
+  finishFrameworks(frameworks, skills, summaries);
 
   const domains: DomainInfo[] = (Object.keys(DOMAIN_INFO) as Domain[])
     .map((id) => ({

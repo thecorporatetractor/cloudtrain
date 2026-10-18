@@ -2172,7 +2172,7 @@ _CloudTrain internal assessment. It is not aligned to, affiliated with or endors
 
 ## Appendix: alignment frameworks declared here
 
-Frameworks with a file in `content/frameworks/` (cka, ckad, cks, lfcs, ccna) are not repeated. Weights marked *cloudtrain* are CloudTrain estimates where the body publishes none.
+Hand-written frameworks in `content/frameworks/` (cka, ckad, cks, lfcs, ccna) are not repeated. Each framework below is generated into `content/frameworks/<id>.yaml` with its objectives mapped to the skills of the labs that reference them. Weights marked *cloudtrain* are CloudTrain estimates where the body publishes none.
 
 | Framework | Title | Body | Weights | Objectives |
 | --- | --- | --- | --- | --- |

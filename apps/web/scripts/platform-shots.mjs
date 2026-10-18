@@ -95,6 +95,7 @@ const VIEWS = [
   ['team-assignments', 'manager', '/team/assignments?team=t-platrel', 'Assignments'],
   ['team-assignment-detail', 'manager', '/team/assignments?team=t-platrel', 'Assignments', async (p) => (await p.locator('tr.row-link').first().click(), await p.getByText('People').waitFor())],
   ['team-exams', 'manager', '/team/exams?team=t-platrel', 'Exam readiness'],
+  ['skills-framework-picker', 'manager', '/skills', 'Skills', async (p) => (await p.getByRole('button', { name: /^Framework:/ }).click(), await p.getByRole('combobox').waitFor(), await p.waitForTimeout(200))],
   ['cohorts', 'instructor', '/cohorts', 'Cohorts'],
   ['cohort-board', 'instructor', '/cohorts/c-cks-q4', 'Live board'],
   ['cohort-terminate', 'instructor', '/cohorts/c-cks-q4', 'Live board', async (p) => (await p.getByRole('button', { name: /Session actions for Lena/ }).click(), await p.getByText('Terminate').click(), await p.getByText('Terminate Lena').waitFor())],

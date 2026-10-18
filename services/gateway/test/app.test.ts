@@ -34,7 +34,9 @@ describe('HTTP API', () => {
     expect(lab.body).not.toMatch(/"solution"|"expect"|"misconceptions"/);
     expect((await app.inject('/api/labs/nope')).json()).toEqual({ error: 'Lab not found', code: 'not_found' });
     const skills = (await app.inject('/api/skills')).json();
-    expect(skills.frameworks).toHaveLength(5);
+    expect(skills.frameworks).toHaveLength(content.frameworks.length);
+    expect(skills.frameworks.length).toBeGreaterThan(5);
+    expect(skills.frameworks[0]).toMatchObject({ group: expect.any(String), coverage: expect.any(Number) });
     expect(skills.states.length).toBe(skills.skills.length);
     expect((await app.inject('/api/me')).json()).toMatchObject({ id: 'alice', name: 'Alice', role: 'learner' });
     const home = (await app.inject('/api/home')).json();

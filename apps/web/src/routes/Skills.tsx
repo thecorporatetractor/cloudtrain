@@ -5,7 +5,8 @@ import { useCatalog, useSkills } from '@/api/client';
 import type { FrameworkId, Skill, SkillState } from '@/api/types';
 import { HeatCell, Ring } from '@/components/charts';
 import { DifficultyBadge } from '@/components/domain';
-import { Badge, Card, EmptyState, ErrorState, PageSkeleton, Segmented, Stat } from '@/components/ui';
+import { FrameworkPicker } from '@/components/framework-picker';
+import { Badge, Card, EmptyState, ErrorState, PageSkeleton, Stat } from '@/components/ui';
 import { skillsRoute } from '@/router';
 import { domainReadiness, frameworkReadiness } from '@/lib/readiness';
 import { formatMinutes, pct, relativeTime } from '@/lib/utils';
@@ -17,8 +18,20 @@ export function Skills() {
   const catalog = useCatalog();
 
   const data = skills.data;
-  const framework = data?.frameworks.find((f) => f.id === search.framework);
+  // An unknown id in the URL (a framework that left the content) falls back to the first one.
+  const framework = data?.frameworks.find((f) => f.id === search.framework) ?? data?.frameworks[0];
   const stateOf = useMemo(() => new Map(data?.states.map((s) => [s.skillId, s]) ?? []), [data]);
+  // Readiness of every framework for the picker; null until a skill of it has results.
+  const readinessById = useMemo(
+    () =>
+      new Map<FrameworkId, number | null>(
+        (data?.frameworks ?? []).map((f) => {
+          const r = frameworkReadiness(f, stateOf);
+          return [f.id, r.practised > 0 ? r.readiness : null];
+        }),
+      ),
+    [data, stateOf],
+  );
   const skillOf = useMemo(() => new Map(data?.skills.map((s) => [s.id, s]) ?? []), [data]);
 
   // The same selector Home uses for its goal forecast, so the two screens agree.
@@ -62,8 +75,13 @@ export function Skills() {
             {member ? `${member.name} (${member.title}): how well they know` : 'How well you know'} each skill, estimated from graded lab results. Darker is stronger; a dashed outline means there is little evidence yet.
           </p>
         </div>
-        <Segmented<FrameworkId> label="Framework" value={search.framework} onChange={(v) => void navigate({ search: (prev) => ({ framework: v, ...(prev.member ? { member: prev.member } : {}) }) })} options={data.frameworks.map((f) => ({ value: f.id, label: f.name, title: f.fullName }))} />
+        <FrameworkPicker frameworks={data.frameworks} value={framework?.id} readiness={readinessById} onChange={(v) => void navigate({ search: (prev) => ({ framework: v, ...(prev.member ? { member: prev.member } : {}) }) })} />
       </header>
+      {framework && framework.coverage < 1 && (
+        <p className="small subtle" style={{ marginTop: -8, marginBottom: 16 }}>
+          Coverage in progress: published labs reach {pct(framework.coverage)} of this framework's objectives so far; the rest show no skills yet.
+        </p>
+      )}
 
       {framework && summary && (
         <div className="skills-layout">
@@ -114,6 +132,7 @@ export function Skills() {
                         </div>
                       </div>
                       <div className="heat-cells">
+                        {!d.skillIds.some((id) => skillOf.has(id) && stateOf.has(id)) && <span className="xs subtle" style={{ gridColumn: '1 / -1', alignSelf: 'center' }}>No labs for this objective yet.</span>}
                         {d.skillIds.map((id) => {
                           const sk = skillOf.get(id);
                           const st = stateOf.get(id);
@@ -131,6 +150,7 @@ export function Skills() {
                 })}
               </div>
             </Card>
+            {framework.disclaimer && <p className="xs subtle">{framework.disclaimer}</p>}
           </div>
 
           <aside className="skills-aside">

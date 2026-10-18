@@ -17,7 +17,12 @@ export type Domain = 'kubernetes' | 'linux' | 'containers' | 'iac' | 'automation
 export type Difficulty = 'easy' | 'medium' | 'hard';
 export type NodeDriver = 'container' | 'vm' | 'k8s-cluster' | 'netdev';
 export type AccessKind = 'shell' | 'ssh' | 'console' | 'web' | 'rdp';
-export type FrameworkId = 'cka' | 'ckad' | 'cks' | 'lfcs' | 'ccna';
+/**
+ * Framework id: a content/frameworks/<id>.yaml file (hand-written, or generated from the
+ * curriculum's `frameworks`), e.g. `cka`, `rhcsa-aligned`, `tf-associate`. Open-ended: the
+ * set grows with the curriculum, so clients must not hard-code it.
+ */
+export type FrameworkId = string;
 
 export interface LabMetadata {
   id: string;
@@ -164,9 +169,22 @@ export interface FrameworkDomain {
 
 export interface Framework {
   id: FrameworkId;
+  /** Short name for pickers and badges (CKA, RHCSA, Terraform Associate). */
   name: string;
   fullName: string;
+  /** Certifying body, or CloudTrain for its own frameworks. */
   vendor: string;
+  /** Content domain the framework belongs to; absent for cross-domain frameworks. */
+  domain?: Domain;
+  /**
+   * Picker group label from content ("Kubernetes", "Infrastructure as code", "Platform" for
+   * cross-domain). The list arrives ordered by group, then name.
+   */
+  group: string;
+  /** Share of objectives (0..1) that at least one published lab targets; below 1, labs are still being built. */
+  coverage: number;
+  /** Alignment disclaimer (not affiliated, no certification conferred); absent for CloudTrain's own frameworks. */
+  disclaimer?: string;
   domains: FrameworkDomain[];
 }
 

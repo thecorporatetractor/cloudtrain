@@ -57,7 +57,7 @@ export function ItemLink({ item, className }: { item: AssignmentItem; className?
       </Link>
     );
   return (
-    <Link to="/skills" search={{ framework: item.id as 'cks' }} className={className}>
+    <Link to="/skills" search={{ framework: item.id }} className={className}>
       {title}
     </Link>
   );
