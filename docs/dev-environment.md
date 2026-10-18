@@ -598,7 +598,14 @@ by `tools/verify-vm/install.sh`, which also installs the systemd units with thei
 (`systemd/`, e.g. the damped autoscaler limits in `ct-autoscale.service.d/90-damp.conf`) and the
 sshd drop-in `sshd/90-ct-sessions.conf` (`MaxSessions 100`, `MaxStartups 100:30:300`: many
 agents and verifies reach the VM over ssh at once and the defaults refuse them). It keeps an
-existing `runner.env` (the autoscaler rewrites its slot limits).
+existing `runner.env` (the autoscaler rewrites its slot limits), and writes the lab kernel
+modules (`deploy/scripts/lab-kernel-modules.txt`: GRE/IPIP/SIT/VXLAN/WireGuard tunnels, IPsec
+ESP/AH/xfrm, 8021q, bonding, dummy, veth, tc qdiscs, conntrack/NAT) to
+`/etc/modules-load.d/cloudtrain-labs.conf`; `tune.sh` loads any that are missing. kind nodes share
+the host kernel, so without them labs fail with e.g. `add tunnel "gre0" failed: No such device`
+(net-fix-mtu-blackhole) or never get an IPsec SA (net-ipsec-partner-tunnel). Locally,
+`task dev:up` (host-prep) loads missing ones and warns about any the kernel cannot load
+(WSL2 kernels lack some).
 
 Setup (as `ubuntu`):
 

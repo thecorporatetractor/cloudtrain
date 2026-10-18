@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Install the verify VM's runner config from this checkout (idempotent; run as ubuntu with sudo):
 # scripts and configs to /srv/ct-work/vm-config/ (runner.env only if missing: ct-autoscale.sh
-# rewrites its slot limits), systemd units and drop-ins, the sshd drop-in; then reload.
+# rewrites its slot limits), systemd units and drop-ins, the sshd drop-in, the lab kernel modules
+# (/etc/modules-load.d/cloudtrain-labs.conf from deploy/scripts/lab-kernel-modules.txt); then reload.
 # Restart the units yourself to pick up a changed unit: ct-batch.service uses KillMode=process,
 # so a restart leaves running verifies alone.
 set -euo pipefail
@@ -18,6 +19,8 @@ for d in "$src"/systemd/*.service.d; do
   sudo install -d -m 0755 "/etc/systemd/system/$(basename "$d")"
   sudo install -m 0644 "$d"/*.conf "/etc/systemd/system/$(basename "$d")/"
 done
+grep -vE '^\s*(#|$)' "$src/../../deploy/scripts/lab-kernel-modules.txt" | sudo tee /etc/modules-load.d/cloudtrain-labs.conf >/dev/null
+sudo systemctl restart systemd-modules-load.service
 sudo install -m 0644 "$src"/sshd/*.conf /etc/ssh/sshd_config.d/
 sudo sshd -t && sudo systemctl reload ssh
 sudo systemctl daemon-reload

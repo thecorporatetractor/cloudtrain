@@ -2,6 +2,11 @@
 # VM-only cluster tuning on top of `task dev:up` (merge patches survive dev:up's client-side apply).
 set -euo pipefail
 K="kubectl --context kind-cloudtrain-dev"
+# Lab kernel modules (kind nodes share the host kernel; install.sh persists them in
+# /etc/modules-load.d/cloudtrain-labs.conf): load any that are missing, e.g. after a kernel update.
+mods=$(grep -vE '^\s*(#|$)' "${REPO:-/srv/ct-work/cloudtrain}/deploy/scripts/lab-kernel-modules.txt" 2>/dev/null || grep -vE '^\s*(#|$)' /etc/modules-load.d/cloudtrain-labs.conf 2>/dev/null || true)
+# shellcheck disable=SC2086
+[[ -n $mods ]] && { sudo -n modprobe -a $mods || echo "tune.sh: some lab kernel modules failed to load" >&2; }
 rl='{"restClient":{"rateLimiter":{"tokenBucketRateLimiter":{"qps":200,"burst":400}}}}'
 $K -n kubevirt patch kv kubevirt --type merge -p "{\"spec\":{\"configuration\":{\"controllerConfiguration\":$rl,\"handlerConfiguration\":$rl,\"webhookConfiguration\":$rl}}}"
 $K patch cdi cdi --type merge -p '{"spec":{"config":{"podResourceRequirements":{"limits":{"cpu":"2","memory":"2Gi"},"requests":{"cpu":"100m","memory":"60M"}}}}}'
