@@ -3453,7 +3453,7 @@ export const fixtureTasks: Record<string, FixtureTask> = {
   "difficulty": "hard"
  },
  "xlp-fix-time-skew": {
-  "title": "Fix certificate errors caused by clock skew",
+  "title": "Fix a skewed host clock",
   "oneLine": "TLS clients fail on this host; find the clock problem and make time synchronise with the lab server.",
   "minutes": 5,
   "skills": [

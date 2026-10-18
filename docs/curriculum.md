@@ -1544,7 +1544,7 @@ _CloudTrain is not affiliated with or endorsed by CompTIA. Linux+ is a trademark
 | `xlp-fix-high-load` | linuxplus:troubleshooting | Bring load back to normal | medium | 6 | B | Find the cause of the high load average and stop it without killing the protected service. |
 | `xlp-fix-permission-denied` | linuxplus:troubleshooting | Fix a permission-denied error for an app user | easy | 4 | A | Let the given application user read its config again with the minimum permission change. |
 | `xlp-fix-oom-service` | linuxplus:troubleshooting | Stop a service from being OOM-killed | hard | 8 | B | Identify why the given service is repeatedly OOM-killed and change the limit or culprit so it stays up. |
-| `xlp-fix-time-skew` | linuxplus:troubleshooting | Fix certificate errors caused by clock skew | medium | 5 | B | TLS clients fail on this host; find the clock problem and make time synchronise with the lab server. |
+| `xlp-fix-time-skew` | linuxplus:troubleshooting | Fix a skewed host clock | medium | 5 | B | TLS clients fail on this host; find the clock problem and make time synchronise with the lab server. |
 
 </details>
 
