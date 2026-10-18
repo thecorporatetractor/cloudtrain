@@ -15,6 +15,17 @@ install -m 0755 "$here/cloudtrain-init" /usr/local/sbin/cloudtrain-init
 if [ "$family" = deb ]; then userdel -r ubuntu 2>/dev/null || true; fi
 useradd -m -u 1000 -U -s /bin/bash -c "CloudTrain learner" learner
 usermod -L learner
+# EL ships /etc/shadow as mode 000 and unix_chkpwd as plain setuid-root; in the unprivileged
+# user-namespace pod the helper cannot override the file mode, so pam_unix account checks fail
+# for non-root callers (sudo: "PAM account management error"). Use the Debian scheme instead:
+# group shadow reads /etc/shadow and unix_chkpwd runs setgid shadow.
+if [ "$family" = el ]; then
+  getent group shadow >/dev/null || groupadd -r shadow
+  chgrp shadow /etc/shadow
+  chmod 0640 /etc/shadow
+  chgrp shadow /usr/sbin/unix_chkpwd
+  chmod 2755 /usr/sbin/unix_chkpwd
+fi
 install -m 0644 "$here/bashrc" /etc/cloudtrain/bashrc 2>/dev/null || { mkdir -p /etc/cloudtrain; install -m 0644 "$here/bashrc" /etc/cloudtrain/bashrc; }
 for f in /etc/skel/.bashrc /home/learner/.bashrc /root/.bashrc; do
   echo '[ -f /etc/cloudtrain/bashrc ] && . /etc/cloudtrain/bashrc' >> "$f"
