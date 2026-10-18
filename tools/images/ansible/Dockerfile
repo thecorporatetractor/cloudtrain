@@ -29,6 +29,8 @@ RUN test -n "$UBUNTU_APT_SNAPSHOT" \
 
 # Python tools in one venv, wheels only, every file hash-checked (pip --require-hashes).
 COPY requirements.lock /opt/ansible/requirements.lock
+# The wrapper scripts must contain a literal $PATH (expanded when they run).
+# hadolint ignore=SC2016
 RUN python3 -m venv /opt/ansible \
  && /opt/ansible/bin/pip install --no-cache-dir --no-deps --only-binary=:all: --require-hashes \
       -r /opt/ansible/requirements.lock \
@@ -72,6 +74,7 @@ ENV ANSIBLE_FORCE_COLOR=0 PY_COLORS=0
 # A lab workstation that only sleeps: Kubernetes ignores image health checks, the pod is
 # ready when it runs.
 HEALTHCHECK NONE
-USER learner
+# uid of learner (created above)
+USER 1000
 WORKDIR /home/learner
 CMD ["sleep", "infinity"]
