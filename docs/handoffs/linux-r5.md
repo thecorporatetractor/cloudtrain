@@ -35,6 +35,15 @@ that still assumed sim-linux-pro was coming-soon.
   (xlp-fix-unit-start, xlp-fix-oom-service), tracer-running check in xpe-incident-disk-pressure,
   port verified in xlp-fix-permission-denied app-reads. Open; touches lab hashes, so those labs
   need a re-verify after it merges.
+- Open verify-VM follow-ups touching Linux labs (state 2026-10-19): fix PRs #177 (xlp-netplan-address,
+  in this round's queue), #176 (xel-kernel-arg), #178 (xel-scp-remote-copy, blocked), #168
+  (xlf-kill-memory-hog), #167 (xlf-lvm-grow-fs); PR #179 marks 27 Linux labs verified at their
+  current hash. After #179 and #177 land, the queue below shrinks accordingly; trust `status` in
+  `content/curriculum.yaml`.
+- PR #143 status update: wave 4 built 23 networking VM labs; its merge state is DIRTY (needs a
+  rebase onto main, then re-render). 2 of the 23 are blocked: iperf-throughput-baseline (iperf3 not
+  in the mirrors: add it to `tools/mirrors/packages-*.txt` and rebuild the VM image) and
+  netem-impaired-link (sch_netem blocker is in its curriculum notes). Still unmerged, so not queued.
 - PR #114 (containers) and PR #84 (automation) belong to other domains and were not touched.
 
 ## VM verify results since the wave 3 merge
