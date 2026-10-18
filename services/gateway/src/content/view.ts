@@ -1,5 +1,6 @@
 import { secretParams, type Lab as SourceLab } from '@cloudtrain/lab-schema';
-import type { Lab, LabCheck, LabHint } from '@cloudtrain/api-types';
+import type { Lab, LabCheck, LabHint, LabQuestion } from '@cloudtrain/api-types';
+import { labQuestions } from '../answers/questions.js';
 
 /**
  * The learner's view of a lab. Only what the task panel and overview need:
@@ -17,6 +18,9 @@ export function learnerLab(src: SourceLab): Lab {
     ...(c.on ? { on: c.on } : {}),
   }));
   const hints: LabHint[] = (src.spec.hints ?? []).map((h) => ({ title: '', body: '', cost: h.cost ?? 1, redacted: true }));
+  const sequential = src.spec.questionOrder === 'sequential';
+  // Prompts of later questions in a sequential lab only appear once they open (GET /sessions/:id/questions).
+  const questions: LabQuestion[] = labQuestions(src).map((q, i) => (sequential && i > 0 ? { ...q, prompt: '' } : q));
   return {
     apiVersion: 'cloudtrain.dev/v3',
     kind: 'Lab',
@@ -27,6 +31,7 @@ export function learnerLab(src: SourceLab): Lab {
       topology: structuredClone(src.spec.topology),
       checks,
       hints,
+      ...(questions.length ? { questions, questionOrder: sequential ? 'sequential' : 'free' } : {}),
     },
   };
 }

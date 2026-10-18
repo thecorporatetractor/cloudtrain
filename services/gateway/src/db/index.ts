@@ -5,6 +5,7 @@ import * as m0001 from './migrations/0001_platform.js';
 import * as m0002 from './migrations/0002_invitation_lookup.js';
 import * as m0003 from './migrations/0003_exams.js';
 import * as m0004 from './migrations/0004_learner_goals.js';
+import * as m0005 from './migrations/0005_ctf_answers.js';
 import type { DB } from './schema.js';
 
 export type Db = Kysely<DB>;
@@ -45,7 +46,7 @@ export function migrationProvider(appRole: string): MigrationProvider {
     up: (db) => mod.up(db, appRole),
     down: (db) => mod.down(db),
   });
-  return { getMigrations: async () => ({ '0001_platform': bind(m0001), '0002_invitation_lookup': bind(m0002), '0003_exams': bind(m0003), '0004_learner_goals': bind(m0004) }) };
+  return { getMigrations: async () => ({ '0001_platform': bind(m0001), '0002_invitation_lookup': bind(m0002), '0003_exams': bind(m0003), '0004_learner_goals': bind(m0004), '0005_ctf_answers': bind(m0005) }) };
 }
 
 /** Applies pending migrations; run as the schema owner. */

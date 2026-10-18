@@ -163,3 +163,23 @@ both seeds. Wrong answers need no extra session.
 - [ ] `solution.answers` derives each answer like a learner would (commands as the learner).
 - [ ] At least one wrong-answer misconception per question that has a plausible trap.
 - [ ] `labctl validate` and `node tools/lab-verify/bin/lab-verify.mjs --strict` pass; mark `built`; live `labctl verify` runs on the verify VM.
+
+## What the learner sees
+
+![The questions panel of a CTF lab: solved, open and locked questions, a revealed hint and the points total](images/ctf-questions.png)
+
+The lab view lists the questions in a **Questions** panel above the checks
+(`apps/web/src/components/workspace/QuestionsPanel.tsx`): an answer box per
+question, Submit (Enter), correct or not with the attempts left, hints behind
+a confirmation that states their cost, and the points total. Locked questions
+show no prompt. A lab with only answer checks has no Validate button.
+
+Grading happens in the gateway (`services/gateway/src/answers`), never in the
+browser: `POST /api/sessions/:id/questions/:checkId/answer` resolves the
+expected value from the session (secret params, `status.computedAnswers`),
+matches, stores the submission in Postgres under row-level security, writes
+an `answer.submit` audit row (without the answer text) and rate-limits each
+learner (`CT_ANSWER_RATE_PER_MINUTE`, default 10). Solved and closed questions
+become skill evidence; the attempt in History shows points and questions
+solved, and Skills shows the learner's CTF points (best attempt per lab).
+API: `docs/api/platform.md` ("Learner").

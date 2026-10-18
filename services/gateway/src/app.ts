@@ -23,6 +23,8 @@ import { TerminalHub } from './terminal/hub.js';
 import { planTerminal } from './terminal/target.js';
 import { registerExamRoutes } from './exams/routes.js';
 import type { ExamService } from './exams/service.js';
+import { registerAnswerRoutes } from './answers/routes.js';
+import type { AnswerService } from './answers/service.js';
 
 export interface AppDeps {
   content: Content;
@@ -31,6 +33,8 @@ export interface AppDeps {
   cluster: LabCluster;
   /** Exam simulations (`/api/exams/*`); omitted = not served. */
   exams?: ExamService;
+  /** Questions of CTF labs (`/api/sessions/:id/questions*`); omitted = not served. */
+  answers?: AnswerService;
   logger?: boolean | { level: string };
   /** Postgres-backed platform (identity, persistence, admin). Without it the gateway serves labs/sessions with sample learner data. */
   platform?: PlatformService;
@@ -105,7 +109,11 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   app.setNotFoundHandler((_req, reply) => reply.code(404).send({ error: 'Not found', code: 'not_found' }));
 
   app.setErrorHandler((err: unknown, req, reply) => {
-    if (err instanceof HttpError) return reply.code(err.status).send(err.body());
+    if (err instanceof HttpError) {
+      const retry = err.extra.details?.retryAfterSeconds;
+      if (err.status === 429 && typeof retry === 'number') reply.header('retry-after', String(retry));
+      return reply.code(err.status).send(err.body());
+    }
     const e = err as { statusCode?: number; message?: string };
     if (e.statusCode && e.statusCode < 500) return reply.code(e.statusCode).send({ error: e.message ?? 'Bad request' });
     req.log.error({ err }, 'request failed');
@@ -200,6 +208,8 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     const tap = hub.addLearner(id, socket);
     void bridge(socket, cluster, planned, { cols: clampSize(req.query.cols, 120, 1000), rows: clampSize(req.query.rows, 32, 500) }, req.log, tap);
   });
+
+  if (deps.answers) registerAnswerRoutes(app, deps.answers);
 
   if (ps) registerPlatformRoutes(app, ps, sessions, deps.clusterInfo ?? null);
 

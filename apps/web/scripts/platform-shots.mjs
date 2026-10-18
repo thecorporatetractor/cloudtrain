@@ -72,6 +72,23 @@ async function shot(page, name) {
   console.log('saved', `${name}.png`);
 }
 
+/** CTF lab: one wrong and one right answer, a computed number, a revealed hint on question 3 (mock answers). */
+async function ctfSteps(page, hint = true) {
+  const answer = async (n, text) => {
+    await page.getByLabel(`Answer to question ${n}`).fill(text);
+    await page.getByLabel(`Answer to question ${n}`).press('Enter');
+    await page.waitForTimeout(700);
+  };
+  await answer(1, '198.51.100.4');
+  await answer(1, '203.0.113.77');
+  await answer(2, '48');
+  if (hint) {
+    await page.getByRole('button', { name: 'Reveal · −30' }).click();
+    await page.getByRole('button', { name: 'Reveal for 30 points' }).click();
+    await page.waitForTimeout(700);
+  }
+}
+
 /** [name, persona, url, waitFor, extra steps, viewport (default 1440 x 900)] */
 const PHONE = { width: 390, height: 844 };
 const TABLET = { width: 768, height: 1024 };
@@ -85,6 +102,11 @@ const VIEWS = [
   ['assignments', 'learner', '/assignments', 'My assignments'],
   ['history', 'learner', '/history', 'History'],
   ['history-attempt', 'learner', '/history', 'History', async (p) => (await p.locator('tr.row-link').first().click(), await p.getByText('Checks').first().waitFor())],
+  ['history-ctf-attempt', 'learner', '/history', 'CTF points', async (p) => (await p.locator('tr.row-link', { hasText: '(CTF)' }).first().click(), await p.getByText('Questions').first().waitFor())],
+  ['skills-learner', 'learner', '/skills?framework=lfcs', 'CTF points'],
+  ['ctf-questions', 'learner', '/labs/quill-ctf-gateway-breach/work', 'Questions', ctfSteps],
+  ['ctf-hint-confirm', 'learner', '/labs/quill-ctf-gateway-breach/work', 'Questions', async (p) => (await ctfSteps(p, false), await p.getByRole('button', { name: 'Reveal · −30' }).click(), await p.getByText('Reveal hint 1?').waitFor())],
+  ['ctf-questions-phone', 'learner', '/labs/quill-ctf-gateway-breach/work', 'Questions', ctfSteps, PHONE],
   ['exams', 'learner', '/exams', 'Exam simulations'],
   ['dev-signin-banner', 'learner_impersonated', '/', 'Assignments due', async (p) => p.getByText('Dev sign-in as').waitFor()],
   ['user-menu', 'manager', '/', 'Next best lab', async (p) => (await p.getByRole('button', { name: 'Account menu' }).click(), await p.getByText('Organisation').waitFor())],

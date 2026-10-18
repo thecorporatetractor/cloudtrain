@@ -41,7 +41,11 @@ function HistoryScreen() {
     const seconds = items.reduce((s, a) => s + a.practiceS, 0);
     const scored = items.filter((a) => a.outcome !== 'abandoned' && a.validations > 0);
     const avg = scored.length ? Math.round(scored.reduce((s, a) => s + a.score, 0) / scored.length) : undefined;
-    return { attempts: items.length, graded: scored.length, passed, seconds, avg };
+    // CTF points: the best attempt per lab, so retrying a lab never counts twice (as on Skills).
+    const best = new Map<string, number>();
+    for (const a of items) if (a.points) best.set(a.labId, Math.max(best.get(a.labId) ?? 0, a.points.earned));
+    const ctfPoints = best.size ? [...best.values()].reduce((s, n) => s + n, 0) : undefined;
+    return { attempts: items.length, graded: scored.length, passed, seconds, avg, ctfPoints, ctfLabs: best.size };
   }, [all.data]);
 
   const labsSeen = useMemo(() => Array.from(new Map((all.data?.items ?? []).map((a) => [a.labId, a.labTitle])).entries()), [all.data]);
@@ -59,6 +63,7 @@ function HistoryScreen() {
           <Stat label="Passed" value={totals.graded ? totals.passed : '—'} hint={totals.graded ? `of ${totals.graded} graded` : 'no graded attempts yet'} />
           <Stat label="Practice" value={totals.graded ? minutesLabel(totals.seconds) : '—'} hint={totals.graded ? 'until your last Validate' : 'counts once you validate'} />
           <Stat label="Avg score" value={totals.avg ?? '—'} hint={totals.avg === undefined ? 'no data yet' : 'graded attempts'} />
+          {totals.ctfPoints !== undefined && <Stat label="CTF points" value={totals.ctfPoints} hint={`best of ${totals.ctfLabs} CTF lab${totals.ctfLabs === 1 ? '' : 's'}`} />}
         </div>
       </header>
 
@@ -127,7 +132,14 @@ function HistoryScreen() {
                       <OutcomeBadge outcome={a.outcome} />
                     </td>
                     <td className="tnum small">{a.outcome === 'abandoned' || a.validations === 0 ? '—' : a.score}</td>
-                    <td className="small tnum">{a.validations === 0 ? '—' : `${a.checksPassed}/${a.checksTotal}`}</td>
+                    <td className="small tnum">
+                      {a.validations === 0 ? '—' : `${a.checksPassed}/${a.checksTotal}`}
+                      {a.points && (
+                        <div className="xs subtle" title="Questions solved and points earned">
+                          {a.points.solved}/{a.points.total} questions · {a.points.earned} pts
+                        </div>
+                      )}
+                    </td>
                     <td className="small tnum" title={`Environment open ${formatDuration(a.durationS)}`}>
                       {a.practiceS ? formatDuration(a.practiceS) : <span className="subtle">not validated</span>}
                     </td>
@@ -159,6 +171,12 @@ function AttemptDrawer({ id, onClose, fallback }: { id: string | undefined; onCl
             <Stat label="Checks" value={a.validations === 0 ? '—' : `${a.checksPassed}/${a.checksTotal}`} hint={a.validations === 0 ? `${a.checksTotal} to check` : undefined} />
             <Stat label="Practice" value={a.practiceS ? formatDuration(a.practiceS) : '—'} hint={`${a.validations} validate${a.validations === 1 ? '' : 's'} · ${a.hintsUsed} hint${a.hintsUsed === 1 ? '' : 's'} · environment open ${formatDuration(a.durationS)}`} />
           </div>
+          {a.points && (
+            <div className="grid-3">
+              <Stat label="CTF points" value={a.points.earned} hint={`of ${a.points.possible}`} />
+              <Stat label="Questions" value={`${a.points.solved}/${a.points.total}`} hint="solved" />
+            </div>
+          )}
           <div>
             <div className="task-h">Checks</div>
             {q.isPending ? (

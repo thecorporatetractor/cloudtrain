@@ -3,10 +3,11 @@ import type { CheckResult, LabSession, LearnerGoals, StudioDraft, UpdateLearnerG
 import { domains, labById, labSummaries, paths } from './fixtures/labs';
 import { frameworks, skillStates, skills } from './fixtures/skills';
 import { COLD_START_USER, coldHomeData, homeData, withGoals } from './fixtures/home';
-import { myAssignments, personById, skillStatesOf, teamSeedById, userRef } from './fixtures/platform';
+import { ctfTotalsOf, myAssignments, personById, skillStatesOf, teamSeedById, userRef } from './fixtures/platform';
 import { drafts as seedDrafts, freshGates, specFromPrompt } from './fixtures/studio';
 import { allPlatformHandlers, currentSession, currentUser, mockNotices } from './platformHandlers';
 import { examHandlers } from './examHandlers';
+import { ctfHandlers } from './ctf';
 
 /* ------------------------------------------------------------------ */
 /* In-memory state (resets on reload)                                  */
@@ -241,7 +242,8 @@ const coreHandlers = [
       return HttpResponse.json({ skills, states: skillStatesOf(memberId), frameworks, member: { id: member.id, name: member.name, title: member.title } });
     }
     // The signed-in learner keeps the sample model's states (Home, Skills and Team agree on them).
-    return HttpResponse.json({ skills, states: self && self !== 'u-ingrid' ? skillStatesOf(self) : skillStates, frameworks });
+    const ctf = self ? ctfTotalsOf(self) : undefined;
+    return HttpResponse.json({ skills, states: self && self !== 'u-ingrid' ? skillStatesOf(self) : skillStates, frameworks, ...(ctf ? { ctf } : {}) });
   }),
 
 ];
@@ -301,4 +303,4 @@ export const sampleOnlyHandlers = [
   }),
 ];
 
-export const handlers = [...allPlatformHandlers, ...coreHandlers, ...examHandlers, ...sampleOnlyHandlers];
+export const handlers = [...allPlatformHandlers, ...coreHandlers, ...ctfHandlers, ...examHandlers, ...sampleOnlyHandlers];

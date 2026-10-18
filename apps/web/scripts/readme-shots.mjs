@@ -84,6 +84,23 @@ async function settled(page) {
   await page.waitForTimeout(800);
 }
 
+/** Answers the mock CTF lab's first questions: one wrong and one right answer, a computed number, then a hint on question 3. */
+async function answerCtf(page) {
+  const answer = async (n, text) => {
+    await page.getByLabel(`Answer to question ${n}`).fill(text);
+    await page.getByLabel(`Answer to question ${n}`).press('Enter');
+    await page.waitForTimeout(700);
+  };
+  await answer(1, '198.51.100.4');
+  await answer(1, '203.0.113.77');
+  await answer(2, '48');
+  await page.getByRole('button', { name: 'Reveal · −30' }).click();
+  await page.getByRole('button', { name: 'Reveal for 30 points' }).click();
+  await page.waitForTimeout(700);
+  await page.getByLabel('Answer to question 3').fill('bram');
+  await page.waitForTimeout(300);
+}
+
 async function shot(page, name) {
   await page.screenshot({ path: path.join(out, `${name}.png`) });
   console.log('saved', `${name}.png`);
@@ -95,7 +112,7 @@ try {
     await browser.close();
     process.exit(failed ? 1 : 0);
   }
-  const { ctx, page } = await session('dark');
+  let { ctx, page } = await session('dark');
 
   await open(page, '/', 'Next best lab');
   await shot(page, 'home');
@@ -120,6 +137,18 @@ try {
 
   await open(page, '/skills', 'Skills');
   await shot(page, 'skills');
+  await ctx.close();
+
+  // CTF lab: the questions panel after a few answers (learner).
+  {
+    const s = await session('dark', 'learner');
+    await open(s.page, '/labs/quill-ctf-gateway-breach/work', 'Questions');
+    await settled(s.page);
+    await answerCtf(s.page);
+    await shot(s.page, 'ctf-questions');
+    await s.ctx.close();
+  }
+  ({ ctx, page } = await session('dark'));
 
   await open(page, '/team', 'Members × competencies');
   await shot(page, 'team');

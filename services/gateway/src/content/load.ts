@@ -311,10 +311,12 @@ export async function loadContent(contentDir: string, extraLabDirs: string[] = [
 
   const summaries: LabSummary[] = Array.from(labs.values()).map(({ lab }) => {
     const pathId = paths.find((p) => p.labIds.includes(lab.metadata.id))?.id;
+    const questionCount = lab.spec.checks.filter((c) => c.type === 'answer').length;
     return {
       ...lab.metadata,
       skillIds: labSkills(lab),
       ...(pathId ? { pathId } : {}),
+      ...(questionCount ? { questionCount } : {}),
       completion: 'new',
     };
   });

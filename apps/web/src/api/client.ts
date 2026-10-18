@@ -10,6 +10,9 @@ import type {
   Me,
   Path,
   Permission,
+  CtfTotals,
+  QuestionsView,
+  SubmitAnswerResponse,
   Skill,
   SkillState,
   StudioDraft,
@@ -78,6 +81,8 @@ export interface SkillsData {
   frameworks: Framework[];
   /** Present when the states belong to another team member (manager view). */
   member?: { id: string; name: string; title: string };
+  /** Personal CTF points (best attempt per CTF lab); absent before the first CTF answer. */
+  ctf?: CtfTotals;
 }
 
 export const queries = {
@@ -109,6 +114,14 @@ export const queries = {
         return 5000;
       },
     }),
+  questions: (sessionId: string | undefined, enabled = true) =>
+    queryOptions({
+      queryKey: ['questions', sessionId],
+      queryFn: () => request<QuestionsView>(`/api/sessions/${sessionId}/questions`),
+      enabled: !!sessionId && enabled,
+      // In a team event teammates solve questions too: poll for their progress.
+      refetchInterval: (q) => (q.state.data?.event?.teamId ? 10_000 : false),
+    }),
   skills: (member?: string) =>
     queryOptions({
       queryKey: member ? ['skills', member] : ['skills'],
@@ -135,6 +148,23 @@ export const useCatalog = () => useQuery(queries.catalog());
 export const useLab = (id: string) => useQuery(queries.lab(id));
 export const useSession = (id: string | undefined) => useQuery(queries.session(id));
 export const useSkills = (member?: string) => useQuery(queries.skills(member));
+export const useQuestions = (sessionId: string | undefined, enabled = true) => useQuery(queries.questions(sessionId, enabled));
+
+export function useSubmitAnswer(sessionId: string | undefined) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ checkId, answer }: { checkId: string; answer: string }) => post<SubmitAnswerResponse>(`/api/sessions/${sessionId}/questions/${encodeURIComponent(checkId)}/answer`, { answer }),
+    onSuccess: (r) => qc.setQueryData(['questions', sessionId], r.view),
+  });
+}
+
+export function useRevealQuestionHint(sessionId: string | undefined) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ checkId, index }: { checkId: string; index: number }) => post<QuestionsView>(`/api/sessions/${sessionId}/questions/${encodeURIComponent(checkId)}/hints/${index}`),
+    onSuccess: (v) => qc.setQueryData(['questions', sessionId], v),
+  });
+}
 export const useDrafts = () => useQuery(queries.drafts());
 export const useDraft = (id: string) => useQuery(queries.draft(id));
 

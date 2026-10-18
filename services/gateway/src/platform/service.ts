@@ -4,6 +4,7 @@ import type {
   AttemptDetail,
   AttemptOutcome,
   AttemptQuery,
+  CtfTotals,
   AssignmentItem,
   AssignmentTarget,
   HomeData,
@@ -444,8 +445,26 @@ export class PlatformService implements SessionHooks {
         memberRef = { id: u.id, name: u.name, title: u.title ?? '' };
       }
       const states: SkillState[] = skillStates(this.content, await this.states(tx, who), this.now());
-      return { skills: this.content.skills, states, frameworks: this.content.frameworks, ...(memberRef ? { member: memberRef } : {}) };
+      const ctf = await this.ctfTotals(tx, who);
+      return { skills: this.content.skills, states, frameworks: this.content.frameworks, ...(ctf.labs ? { ctf } : {}), ...(memberRef ? { member: memberRef } : {}) };
     });
+  }
+
+  /** Personal CTF points: the best attempt per CTF lab, so retrying a lab never counts its points twice. */
+  async ctfTotals(tx: Tx, userId: string): Promise<CtfTotals> {
+    const rows = await tx
+      .selectFrom('lab_attempts')
+      .select(['lab_id', 'points_earned', 'questions_solved'])
+      .where('user_id', '=', userId)
+      .where('questions_total', '>', 0)
+      .execute();
+    const best = new Map<string, { points: number; solved: number }>();
+    for (const r of rows) {
+      const b = best.get(r.lab_id);
+      if (!b || r.points_earned > b.points) best.set(r.lab_id, { points: r.points_earned, solved: r.questions_solved });
+    }
+    const vals = [...best.values()];
+    return { points: vals.reduce((n, v) => n + v.points, 0), solved: vals.reduce((n, v) => n + v.solved, 0), labs: best.size };
   }
 
   itemOf(kind: 'lab' | 'path' | 'framework', id: string, labIds: string[]): AssignmentItem {
@@ -546,6 +565,7 @@ export class PlatformService implements SessionHooks {
       practiceS: practiceSeconds(r),
       checksPassed: r.checks_passed,
       checksTotal: r.checks_total,
+      ...(r.questions_total > 0 ? { points: { earned: r.points_earned, possible: r.points_possible, solved: r.questions_solved, total: r.questions_total } } : {}),
     };
   }
 

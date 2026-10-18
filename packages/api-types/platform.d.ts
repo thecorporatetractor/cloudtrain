@@ -76,7 +76,11 @@ export type ErrorCode =
   | 'quota_exceeded'
   | 'org_suspended'
   | 'deactivated'
-  | 'upstream';
+  | 'upstream'
+  /** 429: too many answers in a short time (`details.retryAfterSeconds`). */
+  | 'rate_limited'
+  /** 500: the lab itself cannot grade a question right now. */
+  | 'lab_error';
 
 /** Error body for every non-2xx answer. `error` is a human-readable sentence. */
 export interface ApiError {
@@ -518,6 +522,8 @@ export interface Attempt {
   practiceS: number;
   checksPassed: number;
   checksTotal: number;
+  /** CTF labs: points and questions of this attempt (questions answered in the lab view). */
+  points?: { earned: number; possible: number; solved: number; total: number };
 }
 
 /** `GET /attempts/:id`: the attempt with the full per-run check history. */
@@ -949,6 +955,8 @@ export type AuditAction =
   | 'exam.submit'
   | 'exam.void'
   | 'exam.retake_grant'
+  | 'answer.submit'
+  | 'answer.hint'
   | 'cohort.create'
   | 'cohort.update'
   | 'cohort.member_add'
