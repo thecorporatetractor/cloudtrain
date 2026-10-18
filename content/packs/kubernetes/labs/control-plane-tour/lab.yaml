@@ -117,8 +117,8 @@ spec:
       body: The command list in each manifest holds the flags; `kubectl -n kube-system get pod <name> -o yaml` shows the same.
       cost: 1
     - title: The kubelet's flags
-      body: kubeadm writes extra kubelet flags into `/var/lib/kubelet/kubeadm-flags.env`, which the unit's drop-in passes to the kubelet. `ps` shows the running command line.
-      command: ssh yard-cp-1 'cat /var/lib/kubelet/kubeadm-flags.env; ps -o args= -C kubelet'
+      body: kubeadm writes extra kubelet flags into `/var/lib/kubelet/kubeadm-flags.env`, which the unit's drop-in passes to the kubelet, and the rest into `/var/lib/kubelet/config.yaml`. `ps` shows the running command line.
+      command: ssh yard-cp-1 'sudo cat /var/lib/kubelet/kubeadm-flags.env /var/lib/kubelet/config.yaml; ps -o args= -C kubelet'
       cost: 2
   misconceptions:
     - id: kubelet-as-static-pod
@@ -175,7 +175,7 @@ spec:
       scheduler as static Pods from `/etc/kubernetes/manifests`; their flags
       are in each manifest's command. The kubelet (which starts those Pods)
       and containerd are systemd services; the kubelet's runtime endpoint
-      comes from `/var/lib/kubelet/kubeadm-flags.env`.
+      comes from the kubelet's flags (`/var/lib/kubelet/kubeadm-flags.env`) or its config file (`/var/lib/kubelet/config.yaml`).
     steps:
       - on: workstation
         as: learner
@@ -187,6 +187,6 @@ spec:
             echo "kube-apiserver static-pod /etc/kubernetes/manifests/kube-apiserver.yaml $(flag kube-apiserver --etcd-servers)"
             echo "kube-controller-manager static-pod /etc/kubernetes/manifests/kube-controller-manager.yaml $(flag kube-controller-manager --cluster-cidr)"
             echo "kube-scheduler static-pod /etc/kubernetes/manifests/kube-scheduler.yaml $(flag kube-scheduler --kubeconfig)"
-            echo "kubelet systemd $(ssh yard-cp-1 'systemctl show -p FragmentPath --value kubelet') $(ssh yard-cp-1 "ps -o args= -C kubelet" | grep -o -- '--container-runtime-endpoint=[^ ]*')"
+            echo "kubelet systemd $(ssh yard-cp-1 'systemctl show -p FragmentPath --value kubelet') --container-runtime-endpoint=$(ssh yard-cp-1 "ps -o args= -C kubelet; sudo cat /var/lib/kubelet/kubeadm-flags.env /var/lib/kubelet/config.yaml" | grep -oE -- '(--container-runtime-endpoint=|containerRuntimeEndpoint: *)[^ ]*' | head -1 | sed -E 's/^[^=:]*[=:] *//')"
           } > ~/reports/{{report}}
           cat ~/reports/{{report}}
