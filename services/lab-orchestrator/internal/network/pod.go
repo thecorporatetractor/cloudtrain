@@ -176,7 +176,15 @@ func (p *Plan) InitScript(node string, router bool) string {
 	var b strings.Builder
 	if router {
 		b.WriteString("sysctl -qw net.ipv4.ip_forward=1 net.ipv6.conf.all.forwarding=1\n")
+		// The kernel uses max(all, <dev>) for rp_filter, and interfaces
+		// that exist already (eth0 and the Multus link ends, attached before
+		// net-init runs) copied the host's default when they were created
+		// (Ubuntu hosts: 2, loose). A loose check still drops a packet
+		// whose source has no route at all, which is how a router without a
+		// route back (regional-gw learning no inside prefixes) must still
+		// forward, so turn it off on every interface, not only all/default.
 		b.WriteString("sysctl -qw net.ipv4.conf.all.rp_filter=0 net.ipv4.conf.default.rp_filter=0\n")
+		b.WriteString("for f in /proc/sys/net/ipv4/conf/*/rp_filter; do echo 0 > \"$f\"; done\n")
 	}
 	// Unprivileged ICMP sockets, so the learner (no NET_RAW: no_new_privs
 	// ignores ping's file capabilities) can ping across lab links. 0-65535
