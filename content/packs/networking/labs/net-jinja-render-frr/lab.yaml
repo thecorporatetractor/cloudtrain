@@ -123,51 +123,6 @@ spec:
           '{# TODO: one interface block per entry of router.interfaces; the loopback is not in OSPF yet #}' \
           'router ospf' ' ospf router-id @{ router.router_id }@' 'exit' \
           | sed -e 's/@{/{''{/g' -e 's/}@/}''}/g' > /root/district/router.j2
-        cat > /var/lib/cloudtrain/other.yaml <<'YML'
-        ospf_area: 3
-        routers:
-          - hostname: mv-test-a
-            router_id: 192.0.2.1
-            loopback: 192.0.2.1/32
-            interfaces:
-              - { name: eth7, description: test uplink, address: 198.51.100.1/30, passive: false }
-              - { name: lan4, description: test lan four, address: 172.16.4.1/24, passive: true }
-              - { name: lan5, description: test lan five, address: 172.16.5.1/24, passive: true }
-              - { name: eth8, description: test second uplink, address: 198.51.100.5/30, passive: false }
-          - hostname: mv-test-b
-            router_id: 192.0.2.2
-            loopback: 192.0.2.2/32
-            interfaces:
-              - { name: lan9, description: lonely lan, address: 172.16.9.1/24, passive: true }
-        YML
-        cat > /var/lib/cloudtrain/expect-conf.py <<'PY'
-        import os, subprocess, sys, yaml
-        def want(d, r):
-            a = str(d["ospf_area"])
-            w = ["hostname " + r["hostname"], "interface lo", "ip address " + r["loopback"], "ip ospf area " + a, "exit"]
-            for i in r["interfaces"]:
-                w += ["interface " + i["name"], "description " + i["description"], "ip address " + i["address"], "ip ospf area " + a]
-                if i.get("passive"):
-                    w.append("ip ospf passive")
-                w.append("exit")
-            return w + ["router ospf", "ospf router-id " + r["router_id"], "exit"]
-        def norm(t):
-            return [l.strip() for l in t.splitlines() if l.strip() and not l.strip().startswith("!")]
-        mode = sys.argv[1]
-        f = "/var/lib/cloudtrain/other.yaml" if mode == "gen" else "/root/district/district.yaml"
-        d = yaml.safe_load(open(f))
-        bad = []
-        for r in d["routers"]:
-            if mode == "files":
-                p = "/root/district/out/%s.conf" % r["hostname"]
-                got = norm(open(p).read()) if os.path.isfile(p) else None
-            else:
-                x = subprocess.run(["render", "/root/district/router.j2", f, r["hostname"]], capture_output=True, text=True)
-                got = norm(x.stdout) if x.returncode == 0 else None
-            if got != want(d, r):
-                bad.append(r["hostname"])
-        print("match" if not bad else "differs " + " ".join(bad))
-        PY
     - on: mv-campus-north
       run: ip link add lan1 type dummy 2>/dev/null; ip link set lan1 up
     - on: mv-campus-south
@@ -195,7 +150,39 @@ spec:
       description: router.j2 renders every router of district.yaml into the specified configuration
       type: shell
       on: mv-automation-1
-      command: python3 /var/lib/cloudtrain/expect-conf.py inv
+      command: |
+        python3 - inv <<'PY'
+        import os, subprocess, sys, yaml
+        def want(d, r):
+            a = str(d["ospf_area"])
+            w = ["hostname " + r["hostname"], "interface lo", "ip address " + r["loopback"], "ip ospf area " + a, "exit"]
+            for i in r["interfaces"]:
+                w += ["interface " + i["name"], "description " + i["description"], "ip address " + i["address"], "ip ospf area " + a]
+                if i.get("passive"):
+                    w.append("ip ospf passive")
+                w.append("exit")
+            return w + ["router ospf", "ospf router-id " + r["router_id"], "exit"]
+        def norm(t):
+            return [l.strip() for l in t.splitlines() if l.strip() and not l.strip().startswith("!")]
+        mode = sys.argv[1]
+        if mode == "gen":
+            open("/tmp/.gen-inv.yaml", "w").write('ospf_area: 3\nrouters:\n  - hostname: mv-test-a\n    router_id: 192.0.2.1\n    loopback: 192.0.2.1/32\n    interfaces:\n      - { name: eth7, description: test uplink, address: 198.51.100.1/30, passive: false }\n      - { name: lan4, description: test lan four, address: 172.16.4.1/24, passive: true }\n      - { name: lan5, description: test lan five, address: 172.16.5.1/24, passive: true }\n      - { name: eth8, description: test second uplink, address: 198.51.100.5/30, passive: false }\n  - hostname: mv-test-b\n    router_id: 192.0.2.2\n    loopback: 192.0.2.2/32\n    interfaces:\n      - { name: lan9, description: lonely lan, address: 172.16.9.1/24, passive: true }\n')
+        f = "/tmp/.gen-inv.yaml" if mode == "gen" else "/root/district/district.yaml"
+        d = yaml.safe_load(open(f))
+        bad = []
+        for r in d["routers"]:
+            if mode == "files":
+                p = "/root/district/out/%s.conf" % r["hostname"]
+                got = norm(open(p).read()) if os.path.isfile(p) else None
+            else:
+                x = subprocess.run(["render", "/root/district/router.j2", f, r["hostname"]], capture_output=True, text=True)
+                got = norm(x.stdout) if x.returncode == 0 else None
+            if got != want(d, r):
+                bad.append(r["hostname"])
+        print("match" if not bad else "differs " + " ".join(bad))
+        if mode == "gen":
+            os.remove("/tmp/.gen-inv.yaml")
+        PY
       expect: { match: exact, value: match }
       skills: [net.automation.config-templates]
       weight: 2
@@ -203,7 +190,39 @@ spec:
       description: router.j2 also renders a second inventory correctly (nothing hard-coded)
       type: shell
       on: mv-automation-1
-      command: python3 /var/lib/cloudtrain/expect-conf.py gen
+      command: |
+        python3 - gen <<'PY'
+        import os, subprocess, sys, yaml
+        def want(d, r):
+            a = str(d["ospf_area"])
+            w = ["hostname " + r["hostname"], "interface lo", "ip address " + r["loopback"], "ip ospf area " + a, "exit"]
+            for i in r["interfaces"]:
+                w += ["interface " + i["name"], "description " + i["description"], "ip address " + i["address"], "ip ospf area " + a]
+                if i.get("passive"):
+                    w.append("ip ospf passive")
+                w.append("exit")
+            return w + ["router ospf", "ospf router-id " + r["router_id"], "exit"]
+        def norm(t):
+            return [l.strip() for l in t.splitlines() if l.strip() and not l.strip().startswith("!")]
+        mode = sys.argv[1]
+        if mode == "gen":
+            open("/tmp/.gen-inv.yaml", "w").write('ospf_area: 3\nrouters:\n  - hostname: mv-test-a\n    router_id: 192.0.2.1\n    loopback: 192.0.2.1/32\n    interfaces:\n      - { name: eth7, description: test uplink, address: 198.51.100.1/30, passive: false }\n      - { name: lan4, description: test lan four, address: 172.16.4.1/24, passive: true }\n      - { name: lan5, description: test lan five, address: 172.16.5.1/24, passive: true }\n      - { name: eth8, description: test second uplink, address: 198.51.100.5/30, passive: false }\n  - hostname: mv-test-b\n    router_id: 192.0.2.2\n    loopback: 192.0.2.2/32\n    interfaces:\n      - { name: lan9, description: lonely lan, address: 172.16.9.1/24, passive: true }\n')
+        f = "/tmp/.gen-inv.yaml" if mode == "gen" else "/root/district/district.yaml"
+        d = yaml.safe_load(open(f))
+        bad = []
+        for r in d["routers"]:
+            if mode == "files":
+                p = "/root/district/out/%s.conf" % r["hostname"]
+                got = norm(open(p).read()) if os.path.isfile(p) else None
+            else:
+                x = subprocess.run(["render", "/root/district/router.j2", f, r["hostname"]], capture_output=True, text=True)
+                got = norm(x.stdout) if x.returncode == 0 else None
+            if got != want(d, r):
+                bad.append(r["hostname"])
+        print("match" if not bad else "differs " + " ".join(bad))
+        if mode == "gen":
+            os.remove("/tmp/.gen-inv.yaml")
+        PY
       expect: { match: exact, value: match }
       skills: [net.automation.config-templates]
       weight: 2
@@ -211,7 +230,39 @@ spec:
       description: /root/district/out holds the rendered configuration of all three routers
       type: shell
       on: mv-automation-1
-      command: python3 /var/lib/cloudtrain/expect-conf.py files
+      command: |
+        python3 - files <<'PY'
+        import os, subprocess, sys, yaml
+        def want(d, r):
+            a = str(d["ospf_area"])
+            w = ["hostname " + r["hostname"], "interface lo", "ip address " + r["loopback"], "ip ospf area " + a, "exit"]
+            for i in r["interfaces"]:
+                w += ["interface " + i["name"], "description " + i["description"], "ip address " + i["address"], "ip ospf area " + a]
+                if i.get("passive"):
+                    w.append("ip ospf passive")
+                w.append("exit")
+            return w + ["router ospf", "ospf router-id " + r["router_id"], "exit"]
+        def norm(t):
+            return [l.strip() for l in t.splitlines() if l.strip() and not l.strip().startswith("!")]
+        mode = sys.argv[1]
+        if mode == "gen":
+            open("/tmp/.gen-inv.yaml", "w").write('ospf_area: 3\nrouters:\n  - hostname: mv-test-a\n    router_id: 192.0.2.1\n    loopback: 192.0.2.1/32\n    interfaces:\n      - { name: eth7, description: test uplink, address: 198.51.100.1/30, passive: false }\n      - { name: lan4, description: test lan four, address: 172.16.4.1/24, passive: true }\n      - { name: lan5, description: test lan five, address: 172.16.5.1/24, passive: true }\n      - { name: eth8, description: test second uplink, address: 198.51.100.5/30, passive: false }\n  - hostname: mv-test-b\n    router_id: 192.0.2.2\n    loopback: 192.0.2.2/32\n    interfaces:\n      - { name: lan9, description: lonely lan, address: 172.16.9.1/24, passive: true }\n')
+        f = "/tmp/.gen-inv.yaml" if mode == "gen" else "/root/district/district.yaml"
+        d = yaml.safe_load(open(f))
+        bad = []
+        for r in d["routers"]:
+            if mode == "files":
+                p = "/root/district/out/%s.conf" % r["hostname"]
+                got = norm(open(p).read()) if os.path.isfile(p) else None
+            else:
+                x = subprocess.run(["render", "/root/district/router.j2", f, r["hostname"]], capture_output=True, text=True)
+                got = norm(x.stdout) if x.returncode == 0 else None
+            if got != want(d, r):
+                bad.append(r["hostname"])
+        print("match" if not bad else "differs " + " ".join(bad))
+        if mode == "gen":
+            os.remove("/tmp/.gen-inv.yaml")
+        PY
       expect: { match: exact, value: match }
       skills: [net.automation.config-templates]
     - id: ospf-full

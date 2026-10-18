@@ -52,16 +52,11 @@ spec:
       run: |
         for i in $(seq 120); do sr_cli 'info from state / system gnmi-server' >/dev/null 2>&1 && break; sleep 2; done
         openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj "/CN=mv-sw-annex-1" -keyout /tmp/gnmi.key -out /tmp/gnmi.crt 2>/dev/null
-        cat > /tmp/base.cli <<CLI
+        cat > /tmp/base.cli <<'CLI'
         enter candidate
         set / system aaa authentication admin-user password annex-{{octet}}-api
         set / system json-rpc-server admin-state enable
         set / system json-rpc-server network-instance mgmt http admin-state enable
-        set / system tls server-profile lab-gnmi certificate "$(cat /tmp/gnmi.crt)"
-        set / system tls server-profile lab-gnmi key "$(cat /tmp/gnmi.key)"
-        set / system gnmi-server admin-state enable
-        set / system gnmi-server network-instance mgmt admin-state enable
-        set / system gnmi-server network-instance mgmt tls-profile lab-gnmi
         set / interface ethernet-1/49 admin-state enable
         set / interface ethernet-1/49 subinterface 0 type bridged
         set / interface ethernet-1/49 subinterface 0 vlan encap untagged
@@ -75,15 +70,26 @@ spec:
         commit now
         CLI
         sr_cli < /tmp/base.cli
-        rm -f /tmp/gnmi.key
+        # the multi-line PEM goes in through a JSON-RPC set (jq quotes it), not through the CLI
+        jq -n --rawfile c /tmp/gnmi.crt --rawfile k /tmp/gnmi.key '{jsonrpc:"2.0",id:1,method:"set",params:{commands:[{action:"update",path:"/system/tls/server-profile[name=lab-gnmi]",value:{certificate:$c,key:$k}}]}}' \
+          | curl -s -u admin:annex-{{octet}}-api http://localhost/jsonrpc -d @- >/dev/null
+        cat > /tmp/gnmi.cli <<'CLI'
+        enter candidate
+        set / system gnmi-server admin-state enable
+        set / system gnmi-server network-instance mgmt admin-state enable
+        set / system gnmi-server network-instance mgmt tls-profile lab-gnmi
+        commit now
+        CLI
+        sr_cli < /tmp/gnmi.cli
+        rm -f /tmp/gnmi.key /tmp/gnmi.crt /tmp/base.cli /tmp/gnmi.cli
     - on: uplink-a
       run: |
         ip link set eth1 up; ip addr replace 10.{{octet}}.70.1/24 dev eth1
-        ( sleep 40; head -c 2000000 /dev/zero | nc -u -w1 10.{{octet}}.70.2 9000 ) </dev/null >/dev/null 2>&1 &
+        ( for i in $(seq 150); do ping -c1 -W1 10.{{octet}}.70.2 >/dev/null 2>&1 && break; sleep 2; done; head -c 2000000 /dev/zero | nc -u -w1 10.{{octet}}.70.2 9000 ) </dev/null >/dev/null 2>&1 &
     - on: uplink-b
       run: |
         ip link set eth1 up; ip addr replace 10.{{octet}}.70.2/24 dev eth1
-        ( sleep 45; head -c 400000 /dev/zero | nc -u -w1 10.{{octet}}.70.1 9000 ) </dev/null >/dev/null 2>&1 &
+        ( for i in $(seq 150); do ping -c1 -W1 10.{{octet}}.70.1 >/dev/null 2>&1 && break; sleep 2; done; sleep 5; head -c 400000 /dev/zero | nc -u -w1 10.{{octet}}.70.1 9000 ) </dev/null >/dev/null 2>&1 &
     - on: mv-collector
       run: |
         mkdir -p /var/lib/cloudtrain

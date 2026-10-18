@@ -74,20 +74,6 @@ spec:
       run: ip link set eth1 up
     - on: annex-host-2
       run: ip link set eth1 up
-    - on: mv-api-host
-      run: |
-        mkdir -p /var/lib/cloudtrain
-        cat > /var/lib/cloudtrain/live.sh <<'SH'
-        #!/bin/sh
-        # prints the expected interfaces.json from the live switch
-        out='{}'
-        for n in 1 2 3 4; do
-          q() { curl -s -u admin:annex-{{octet}}-api http://mv-sw-annex-1/jsonrpc -d '{"jsonrpc":"2.0","id":1,"method":"get","params":{"commands":[{"path":"/interface[name=ethernet-1/'$n']/'$1'","datastore":"state"}]}}' | jq -r '.result[0]'; }
-          out=$(echo "$out" | jq -c --arg k "ethernet-1/$n" --arg s "$(q oper-state)" --arg d "$(q description)" '. + {($k): {oper_state: $s, description: $d}}')
-        done
-        echo "$out" | jq -S .
-        SH
-        chmod 755 /var/lib/cloudtrain/live.sh
   checks:
     - id: file-is-json
       description: /root/interfaces.json is a JSON object with the four interfaces
@@ -104,7 +90,12 @@ spec:
       command: |
         [ -f /root/interfaces.json ] || { echo missing; exit 0; }
         jq -S . /root/interfaces.json > /tmp/.got 2>/dev/null
-        /var/lib/cloudtrain/live.sh > /tmp/.want
+        out='{}'
+        for n in 1 2 3 4; do
+          q() { curl -s -u admin:annex-{{octet}}-api http://mv-sw-annex-1/jsonrpc -d '{"jsonrpc":"2.0","id":1,"method":"get","params":{"commands":[{"path":"/interface[name=ethernet-1/'$n']/'$1'","datastore":"state"}]}}' | jq -r '.result[0]'; }
+          out=$(echo "$out" | jq -c --arg k "ethernet-1/$n" --arg s "$(q oper-state)" --arg d "$(q description)" '. + {($k): {oper_state: $s, description: $d}}')
+        done
+        echo "$out" | jq -S . > /tmp/.want
         cmp -s /tmp/.got /tmp/.want && echo same || echo differs; rm -f /tmp/.got /tmp/.want
       expect: { match: exact, value: same }
       skills: [net.automation.apis, net.automation.json-rpc]
@@ -154,4 +145,9 @@ spec:
     steps:
       - on: mv-api-host
         run: |
-          /var/lib/cloudtrain/live.sh > /root/interfaces.json
+          out='{}'
+          for n in 1 2 3 4; do
+            q() { curl -s -u admin:annex-{{octet}}-api http://mv-sw-annex-1/jsonrpc -d '{"jsonrpc":"2.0","id":1,"method":"get","params":{"commands":[{"path":"/interface[name=ethernet-1/'$n']/'$1'","datastore":"state"}]}}' | jq -r '.result[0]'; }
+            out=$(echo "$out" | jq -c --arg k "ethernet-1/$n" --arg s "$(q oper-state)" --arg d "$(q description)" '. + {($k): {oper_state: $s, description: $d}}')
+          done
+          echo "$out" | jq -S . > /root/interfaces.json

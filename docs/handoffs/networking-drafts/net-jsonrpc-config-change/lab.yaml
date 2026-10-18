@@ -178,8 +178,8 @@ spec:
           chmod 755 /root/apply-changes.sh; /root/apply-changes.sh
       expectFail: [untouched-config-kept]
       feedback: "`replace` on the interface node swaps the whole subtree, so the bridged sub-interface disappears. Address the leaves, or use `update`."
-    - id: candidate-never-committed
-      description: Writes into the candidate datastore and never commits
+    - id: validate-instead-of-set
+      description: Sends the changes with the validate method, which checks the request but never applies it
       mutation:
         on: mv-api-host
         run: |
@@ -187,12 +187,12 @@ spec:
           #!/bin/sh
           python3 -c 'import yaml,json; [print(json.dumps(c)) for c in yaml.safe_load(open("/root/changes/annex-ports.yaml"))["changes"]]' | while read -r c; do
             p=$(echo "$c" | jq -r .port); d=$(echo "$c" | jq -r .description); a=$(echo "$c" | jq -r .admin_state)
-            curl -s -u admin:annex-{{octet}}-api http://mv-sw-annex-1/jsonrpc -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"set\",\"params\":{\"datastore\":\"candidate\",\"commands\":[{\"action\":\"update\",\"path\":\"/interface[name=$p]/description\",\"value\":\"$d\"},{\"action\":\"update\",\"path\":\"/interface[name=$p]/admin-state\",\"value\":\"$a\"}]}}" >/dev/null
+            curl -s -u admin:annex-{{octet}}-api http://mv-sw-annex-1/jsonrpc -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"validate\",\"params\":{\"commands\":[{\"action\":\"update\",\"path\":\"/interface[name=$p]/description\",\"value\":\"$d\"},{\"action\":\"update\",\"path\":\"/interface[name=$p]/admin-state\",\"value\":\"$a\"}]}}" >/dev/null
           done
           SH
           chmod 755 /root/apply-changes.sh; /root/apply-changes.sh
       expectFail: [descriptions-set, admin-states]
-      feedback: A candidate edit is not the running configuration until a commit; the switch keeps its old state.
+      feedback: "`validate` only checks a request against the schema and returns success; nothing is applied. Use `set` (which commits by itself on SR Linux) to change the switch."
   solution:
     explanation: |
       Write a script that turns each YAML entry into one `set`/`update` request for the two leaves of
