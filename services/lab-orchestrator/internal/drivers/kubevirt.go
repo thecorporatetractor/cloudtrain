@@ -89,7 +89,9 @@ const MaxExtraDisks = 6
 // ExtraDiskName is the volume (and, when persistent, DataVolume suffix) of data disk i (1-based).
 func ExtraDiskName(i int) string { return fmt.Sprintf("data%d", i) }
 
-// buildVM renders a KubeVirt VirtualMachine on the lab subnet.
+// buildVM renders a KubeVirt VirtualMachine on the lab subnet: eth0 (bridge
+// binding) on the pod network placed on the lab subnet (network mode
+// primary) or on the lab NAD as the Multus default network (secondary).
 func buildVM(s *labsv1.LabSession, net LabNet, v vmSpec) *unstructured.Unstructured {
 	vm := newObj(GVKVirtualMachine, s.Namespace, v.Name)
 	vm.SetLabels(v.Labels)
@@ -171,11 +173,8 @@ func buildVM(s *labsv1.LabSession, net LabNet, v vmSpec) *unstructured.Unstructu
 		"runStrategy": "Always",
 		"template": map[string]any{
 			"metadata": map[string]any{
-				"labels": tplLabels,
-				"annotations": map[string]any{
-					"ovn.kubernetes.io/logical_switch": net.LabSubnet(),
-					"ovn.kubernetes.io/ip_address":     v.IP,
-				},
+				"labels":      tplLabels,
+				"annotations": net.VMNetworkAnnotations(v.IP),
 			},
 			"spec": map[string]any{
 				"hostname": v.Hostname,
@@ -189,7 +188,7 @@ func buildVM(s *labsv1.LabSession, net LabNet, v vmSpec) *unstructured.Unstructu
 						"rng":        map[string]any{},
 					},
 				},
-				"networks": []any{map[string]any{"name": "default", "pod": map[string]any{}}},
+				"networks": net.VMNetworks(),
 				"volumes":  volumes,
 			},
 		},

@@ -617,10 +617,19 @@ func allPassed(g *GradeReport) bool {
 	return len(g.Checks) > 0
 }
 
+// sessionNamespaceLabels adds the Pod Security labels of a session
+// namespace (drivers.SessionNamespacePodSecurity) to labels.
+func sessionNamespaceLabels(labels map[string]string) map[string]string {
+	for k, v := range drivers.SessionNamespacePodSecurity() {
+		labels[k] = v
+	}
+	return labels
+}
+
 func (v *verifier) create(ctx context.Context, r runSpec, ns string) (*labsv1.LabSession, error) {
-	err := v.c.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns, Labels: map[string]string{
+	err := v.c.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns, Labels: sessionNamespaceLabels(map[string]string{
 		verifyLabel: "true", "labs.cloudtrain.dev/lab-id": r.lab.tpl.Spec.Source.ID,
-	}}})
+	})}})
 	if err != nil {
 		return nil, err
 	}

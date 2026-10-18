@@ -84,16 +84,20 @@ func (m *Manager) Objects(p *Plan) []*unstructured.Unstructured {
 	vpc := newObj(VpcGVK, "", p.VPC, m.labels(s, "vpc"))
 	vpc.Object["spec"] = map[string]any{}
 	out = append(out, vpc, m.subnet(p, p.Mgmt, "mgmt", nil))
+	if p.Mgmt.NAD != "" {
+		out = append(out, m.nad(p, p.Mgmt, "mgmt"))
+	}
 	for i := range p.Links {
 		l := &p.Links[i]
-		out = append(out, m.subnet(p, l.Segment, l.ID, l.Impair))
-		nad := newObj(NADGVK, s.Namespace, l.Segment.NAD, m.labels(s, l.ID))
-		nad.Object["spec"] = map[string]any{
-			"config": fmt.Sprintf(`{"cniVersion":"0.3.1","type":"kube-ovn","server_socket":"/run/openvswitch/kube-ovn-daemon.sock","provider":%q}`, l.Segment.Provider),
-		}
-		out = append(out, nad)
+		out = append(out, m.subnet(p, l.Segment, l.ID, l.Impair), m.nad(p, l.Segment, l.ID))
 	}
 	return out
+}
+
+func (m *Manager) nad(p *Plan, seg Segment, id string) *unstructured.Unstructured {
+	nad := newObj(NADGVK, p.Session.Namespace, seg.NAD, m.labels(p.Session, id))
+	nad.Object["spec"] = map[string]any{"config": NADConfig(seg.Provider)}
+	return nad
 }
 
 func (m *Manager) subnet(p *Plan, seg Segment, id string, _ *labsv1.LinkImpairment) *unstructured.Unstructured {
@@ -107,6 +111,9 @@ func (m *Manager) subnet(p *Plan, seg Segment, id string, _ *labsv1.LinkImpairme
 	}
 	if seg.Provider != "" {
 		spec["provider"] = seg.Provider
+	}
+	if p.Options.MTU > 0 {
+		spec["mtu"] = int64(p.Options.MTU)
 	}
 	o.Object["spec"] = spec
 	return o
@@ -242,8 +249,9 @@ func (m *Manager) Delete(ctx context.Context, s Session) (bool, error) {
 			return false, err
 		}
 		mgmt := ClusterName(s, "mgmt")
+		secondary := MgmtSegment(s, ModeSecondary)
 		for _, p := range pods.Items {
-			if p.Annotations[AnnotationLogicalSwitch] == mgmt {
+			if p.Annotations[AnnotationLogicalSwitch] == mgmt || p.Annotations[secondary.Provider+".kubernetes.io/logical_switch"] == mgmt {
 				return false, nil // a wired pod is still terminating
 			}
 		}

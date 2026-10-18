@@ -7,6 +7,10 @@ package drivers
 //	 ├─ subnet ct-<hash>-lab     192.168.100.0/24  VM hosts .10, .11, ... in topology order
 //	 └─ subnet ct-<hash>-access  192.168.99.0/24   entry node .5 (Multus NAD, provider ct-<hash>-access.<ns>.ovn)
 //
+// In network mode secondary (Kube-OVN not the primary CNI) the lab subnet is
+// a NAD segment too (NAD ct-<hash>-lab, provider ct-<hash>-lab.<ns>.ovn), and
+// VMs take it as their Multus default network (KubeVirt multus.default).
+//
 // Every session gets its own VPC, so all sessions use the same private IPs.
 // This file is self-contained on purpose: it is expected to move onto the
 // shared internal/network package (per-link segments) later.
@@ -31,6 +35,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	labsv1 "github.com/cloudtrain/cloudtrain/services/lab-orchestrator/api/v1alpha1"
+	"github.com/cloudtrain/cloudtrain/services/lab-orchestrator/internal/network"
 )
 
 // Lab network addressing (identical in every session).
@@ -101,6 +106,8 @@ func SessionHash(s *labsv1.LabSession) string {
 type LabNet struct {
 	Namespace string
 	Hash      string
+	// Options: network mode and segment MTU (zero value: primary, CNI MTU).
+	Options network.Options
 }
 
 // NewLabNet returns the network names of a session.
@@ -114,7 +121,42 @@ func (n LabNet) AccessSubnet() string { return "ct-" + n.Hash + "-access" }
 func (n LabNet) NAD() string          { return "ct-" + n.Hash + "-access" }
 
 // Provider is the Kube-OVN provider of the access attachment.
-func (n LabNet) Provider() string { return n.NAD() + "." + n.Namespace + ".ovn" }
+func (n LabNet) Provider() string { return network.ProviderOf(n.NAD(), n.Namespace) }
+
+// Secondary reports network mode secondary.
+func (n LabNet) Secondary() bool { return n.Options.Mode == network.ModeSecondary }
+
+// LabNAD is the NAD of the lab subnet (network mode secondary only): the
+// Multus default network of the session's VMs.
+func (n LabNet) LabNAD() string { return "ct-" + n.Hash + "-lab" }
+
+// LabProvider is the Kube-OVN provider of the lab subnet in mode secondary.
+func (n LabNet) LabProvider() string { return network.ProviderOf(n.LabNAD(), n.Namespace) }
+
+// VMNetworkAnnotations are the pod-template annotations that put a VM's
+// eth0 on the lab subnet with a fixed IP.
+func (n LabNet) VMNetworkAnnotations(ip string) map[string]any {
+	prefix := "ovn"
+	if n.Secondary() {
+		prefix = n.LabProvider()
+	}
+	return map[string]any{
+		prefix + ".kubernetes.io/logical_switch": n.LabSubnet(),
+		prefix + ".kubernetes.io/ip_address":     ip,
+	}
+}
+
+// VMNetworks is the networks stanza of a lab VM: the pod network (Kube-OVN
+// primary) or the lab NAD as the Multus default network (secondary). Both
+// pair with one bridge-bound interface "default".
+func (n LabNet) VMNetworks() []any {
+	if n.Secondary() {
+		return []any{map[string]any{"name": "default", "multus": map[string]any{
+			"networkName": n.Namespace + "/" + n.LabNAD(), "default": true,
+		}}}
+	}
+	return []any{map[string]any{"name": "default", "pod": map[string]any{}}}
+}
 
 // SessionLabels are set on every object created for a session.
 func SessionLabels(s *labsv1.LabSession) map[string]string {
@@ -141,6 +183,17 @@ type LabNetwork struct {
 	Client client.Client
 	// Reader is an uncached reader (cluster-scoped and unlabelled objects).
 	Reader client.Reader
+	// Options: network mode and segment MTU.
+	Options network.Options
+}
+
+// LabNet returns the session's network names in this network's mode.
+func (l *LabNetwork) LabNet(s *labsv1.LabSession) LabNet {
+	n := NewLabNet(s)
+	if l != nil {
+		n.Options = l.Options
+	}
+	return n
 }
 
 func (l *LabNetwork) reader() client.Reader {
@@ -190,37 +243,51 @@ func setOwner(s *labsv1.LabSession, obj client.Object, c client.Client) error {
 // Ensure creates the VPC, subnets, NAD and the entry isolation policy.
 // ready is true once both subnets report Ready.
 func (l *LabNetwork) Ensure(ctx context.Context, s *labsv1.LabSession) (bool, error) {
-	n := NewLabNet(s)
+	n := l.LabNet(s)
 	labels := SessionLabels(s)
 
 	vpc := newObj(GVKVpc, "", n.VPC())
 	vpc.SetLabels(labels)
 	_ = unstructured.SetNestedMap(vpc.Object, map[string]any{}, "spec")
 
-	lab := newObj(GVKSubnet, "", n.LabSubnet())
-	lab.SetLabels(labels)
-	_ = unstructured.SetNestedMap(lab.Object, map[string]any{
+	labSpec := map[string]any{
 		"vpc": n.VPC(), "protocol": "IPv4", "cidrBlock": LabCIDR, "gateway": LabGateway,
 		"excludeIps": []any{"192.168.100.1..192.168.100.9"},
-	}, "spec")
+	}
+	if n.Secondary() {
+		labSpec["provider"] = n.LabProvider()
+	}
+	accSpec := map[string]any{
+		"vpc": n.VPC(), "protocol": "IPv4", "cidrBlock": AccessCIDR, "gateway": AccessGateway,
+		"provider": n.Provider(),
+	}
+	if mtu := n.Options.MTU; mtu > 0 {
+		labSpec["mtu"], accSpec["mtu"] = int64(mtu), int64(mtu)
+	}
+	lab := newObj(GVKSubnet, "", n.LabSubnet())
+	lab.SetLabels(labels)
+	_ = unstructured.SetNestedMap(lab.Object, labSpec, "spec")
 
 	acc := newObj(GVKSubnet, "", n.AccessSubnet())
 	acc.SetLabels(labels)
-	_ = unstructured.SetNestedMap(acc.Object, map[string]any{
-		"vpc": n.VPC(), "protocol": "IPv4", "cidrBlock": AccessCIDR, "gateway": AccessGateway,
-		"provider": n.Provider(),
-	}, "spec")
+	_ = unstructured.SetNestedMap(acc.Object, accSpec, "spec")
 
-	nad := newObj(GVKNAD, s.Namespace, n.NAD())
-	nad.SetLabels(labels)
-	_ = unstructured.SetNestedField(nad.Object,
-		fmt.Sprintf(`{"cniVersion":"0.3.1","type":"kube-ovn","server_socket":"/run/openvswitch/kube-ovn-daemon.sock","provider":%q}`, n.Provider()),
-		"spec", "config")
-	if err := setOwner(s, nad, l.Client); err != nil {
-		return false, err
+	objs := []client.Object{vpc, lab, acc}
+	nads := [][2]string{{n.NAD(), n.Provider()}}
+	if n.Secondary() {
+		nads = append(nads, [2]string{n.LabNAD(), n.LabProvider()})
+	}
+	for _, d := range nads {
+		nad := newObj(GVKNAD, s.Namespace, d[0])
+		nad.SetLabels(labels)
+		_ = unstructured.SetNestedField(nad.Object, network.NADConfig(d[1]), "spec", "config")
+		if err := setOwner(s, nad, l.Client); err != nil {
+			return false, err
+		}
+		objs = append(objs, nad)
 	}
 
-	for _, obj := range []client.Object{vpc, lab, acc, nad} {
+	for _, obj := range objs {
 		if err := ensure(ctx, l.Client, l.reader(), s, obj); err != nil {
 			return false, fmt.Errorf("lab network %s: %w", obj.GetName(), err)
 		}
@@ -245,6 +312,7 @@ func (l *LabNetwork) Destroy(ctx context.Context, s *labsv1.LabSession) error {
 	pending := false
 	for _, obj := range []*unstructured.Unstructured{
 		newObj(GVKNAD, s.Namespace, n.NAD()),
+		newObj(GVKNAD, s.Namespace, n.LabNAD()), // mode secondary only; absent otherwise
 		newObj(GVKSubnet, "", n.AccessSubnet()),
 		newObj(GVKSubnet, "", n.LabSubnet()),
 		newObj(GVKVpc, "", n.VPC()),
@@ -391,7 +459,12 @@ const AnnotationNetworkPolicyFor = "ovn.kubernetes.io/network_policy_for"
 // session VPC, which has no route out, so they need no policy; the primary
 // interface and the access attachment (when the topology has VM hosts)
 // keep it.
-func EntryPolicyNetworks(s *labsv1.LabSession, topo *labsv1.Topology, entry string) string {
+//
+// In network mode secondary the entry's eth0 belongs to the cluster's CNI,
+// which enforces the policy there on its own; Kube-OVN only sees the access
+// attachment, and for a wired entry also its eth0 on the management segment
+// (a NAD then), so those two are listed instead of "ovn".
+func EntryPolicyNetworks(s *labsv1.LabSession, topo *labsv1.Topology, entry string, mode network.Mode) string {
 	if topo == nil || entry == "" {
 		return ""
 	}
@@ -405,6 +478,9 @@ func EntryPolicyNetworks(s *labsv1.LabSession, topo *labsv1.Topology, entry stri
 		return ""
 	}
 	nets := []string{"ovn"}
+	if mode == network.ModeSecondary {
+		nets = []string{s.Namespace + "/" + network.MgmtSegment(network.SessionOf(s), mode).NAD}
+	}
 	if NeedsLabNetwork(topo) {
 		nets = append(nets, s.Namespace+"/"+NewLabNet(s).NAD())
 	}

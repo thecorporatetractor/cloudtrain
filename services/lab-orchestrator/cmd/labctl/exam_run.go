@@ -273,9 +273,9 @@ func retakeDisjoint(spec *labsv1.ExamTemplateSpec, attempts []ExamAttemptReport)
 }
 
 func (x *examRunner) setup(ctx context.Context, ns string) error {
-	err := x.v.c.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns, Labels: map[string]string{
+	err := x.v.c.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns, Labels: sessionNamespaceLabels(map[string]string{
 		verifyLabel: "true", labsv1.LabelExamID: x.c.Exam.Spec.Source.ID,
-	}}})
+	})}})
 	if err != nil {
 		return err
 	}

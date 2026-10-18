@@ -138,13 +138,30 @@ instead of privileged mode, and the node container also gets `procMount:
 Unmasked`: root in the node can change the pod's network sysctls (`ip_forward`,
 `rp_filter`, `accept_ra`, `proxy_arp`), while host-wide sysctls stay read-only
 because the user namespace does not own them. Without user namespaces
-`net-init` is privileged and `/proc/sys` is read-only in the node.
-`net-init` also sets `ping_group_range` so the learner can ping without NET_RAW; on router
-(netdev) pods it enables forwarding, turns `rp_filter` off and sets `ignore_routes_with_linkdown`
+`/proc/sys` is read-only in the node, and `net-init` is privileged only on
+router nodes (netdev: `ip_forward` and per-interface `rp_filter` are unsafe
+sysctls); on other wired nodes it has NET_ADMIN/NET_RAW and the pod sets the
+safe sysctl `ping_group_range` itself, so the learner can ping without NET_RAW
+(with user namespaces `net-init` sets it). On router
+(netdev) pods `net-init` enables forwarding, turns `rp_filter` off and sets `ignore_routes_with_linkdown`
 on every interface (and the default for new ones), so a connected route of an interface without
 carrier is not used, and `arp_ignore=1`, so ARP is answered only for addresses of the receiving
 interface, as on a real router (a VRRP backup's protodown macvlan holds the virtual address). Unwired nodes
 (e.g. a jumphost without links) are untouched.
+
+**Network modes** (`--network-mode`, docs/any-kubernetes.md):
+
+| | `primary` (default; Kube-OVN is the primary CNI: kind, vCenter, bare metal) | `secondary` (another CNI owns eth0, Kube-OVN non-primary behind Multus: AKS, EKS, GKE, `KIND_PROFILE=managed-cni`) |
+|---|---|---|
+| wired pod eth0 | `ovn.kubernetes.io/logical_switch=<mgmt subnet>` | mgmt subnet gets provider `<nad>.<ns>.ovn` and a NAD `<session>-mgmt-<hash>`; pod gets `v1.multus-cni.io/default-network: <ns>/<nad>` + `<provider>.kubernetes.io/logical_switch` |
+| VM eth0 (bridge binding) | `pod` network, `ovn.kubernetes.io/logical_switch` + `ip_address` | lab subnet gets provider and NAD `ct-<hash>-lab`; `networks: [{name: default, multus: {networkName: <ns>/ct-<hash>-lab, default: true}}]`, `<provider>.kubernetes.io/logical_switch` + `ip_address` |
+| link ends, access attachment, QoS, `layer2_forward`, vlan-passthru | unchanged | unchanged |
+| entry node, lab peers | eth0 on Kube-OVN, policies by Kube-OVN | eth0 on the cluster CNI, which enforces the entry and peer policies there; Kube-OVN still enforces the entry policy on the access attachment (`network_policy_for` lists the mgmt and access NADs for a wired entry) |
+
+Either way the eth0 of wired pods and VMs stays inside the isolated session
+VPC. `--lab-mtu` (default 1400) sets `spec.mtu` on every session subnet, so
+lab links are 1400 bytes whatever the node MTU (underlay >= 1500 needed for
+geneve). `labctl preflight` checks a cluster for either mode.
 
 **Links are pure L2.** Kube-OVN needs a CIDR, gateway and IP per port, so each
 link segment uses a carrier `/28` from `198.18.0.0/16`; `net-init` flushes the
@@ -283,6 +300,7 @@ Kubernetes authn/authz when set), `--watch-namespace`, `--leader-elect`,
 `--vcluster-chart`, `--vcluster-values`, `--vcluster-pod-security`
 (`baseline`|`restricted`; `privileged` is refused), `--session-selector`,
 `--leader-election-id`, `--net-tools-image` (default `nettools:1`), `--ovn-central`,
+`--network-mode` (`primary`|`secondary`, see "Network modes"), `--lab-mtu` (default 1400; 0 = Kube-OVN default),
 `--link-rate-mbps` (default 10, per link attachment and direction; 0 = none), `--link-sysctls`
 (default true: wired pods in a user namespace with writable network sysctls),
 `--persistent-home`, `--vcluster-persistence`, `--allow-learner-sudo` (default true;
@@ -566,6 +584,25 @@ the teardown check), `--quick` (only the first-seed base run), `--catalog`
 (unknown image refs fail the lab before anything is created),
 `--ready-timeout`, `--grade-timeout`, `--teardown-timeout`.
 
+### labctl preflight
+
+Checks that a cluster can run labs. The network section (more sections, e.g.
+KVM and storage, are planned in docs/any-kubernetes.md section 5): Multus and
+the NAD API; Kube-OVN version, components and mode, against `--network-mode`
+(`auto` derives it); in secondary mode the primary CNI and its NetworkPolicy
+engine, and Kube-OVN's conflist priority (Multus must keep the primary CNI as
+the cluster network); node, pod, service and Kube-OVN ranges against the lab
+ranges. `--probe` builds a throwaway session network with the orchestrator's
+own code in a `ct-preflight-*` namespace: two wired pods on two nodes, segment
+MTU, 1400-byte frames with DF on a link and on eth0, no route to the API
+service, and the platform and lab kernel modules on those nodes (hostPath
+`/lib/modules`, read-only). PASS/WARN/FAIL with a fix per check, `--json`,
+exit 1 on any FAIL.
+
+```sh
+bin/labctl preflight --context kind-cloudtrain-mcni --probe
+```
+
 ## Deployment
 
 `task orchestrator:deploy` builds `services/lab-orchestrator/Dockerfile`
@@ -576,7 +613,8 @@ loads it into kind, applies `config/default` (CRDs, ClusterRole, Deployment in
 the catalog, e.g. to alias refs locally), `ORCH_NAMESPACE` (separate instance
 with its own binding and leader-election lease), `SESSION_SELECTOR` (manager
 `--session-selector`: only matching LabSessions), `SKIP_CRDS=1`,
-`LOAD_LAB_IMAGES=0`. The ClusterRole is broad by necessity (VMs, VPCs,
+`LOAD_LAB_IMAGES=0`, `NETWORK_MODE` (`--network-mode`; `secondary` by default
+with `KIND_PROFILE=managed-cni`), `LAB_MTU` (`--lab-mtu`). The ClusterRole is broad by necessity (VMs, VPCs,
 vcluster's Roles via `escalate`/`bind`).
 
 ## Make targets

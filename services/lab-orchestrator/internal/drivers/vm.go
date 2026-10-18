@@ -96,7 +96,7 @@ func (d *VMDriver) Provision(ctx context.Context, ref NodeRef) (NodeState, error
 	if err != nil {
 		return fail(err)
 	}
-	vm := buildVM(ref.Session, NewLabNet(ref.Session), vmSpec{
+	vm := buildVM(ref.Session, d.Session.labNet(ref.Session), vmSpec{
 		Name: ref.ResourceName(), Hostname: h.Name, IP: h.IP, Image: d.image(img.Image), PullSecret: d.Container.vmPullSecret(),
 		Cores: cores, MemMiB: mem, CISecret: sec, Labels: vmLabels(ref, ""),
 		Disk: d.Disks, DiskSize: img.DiskSize, ExtraDisks: extra,
