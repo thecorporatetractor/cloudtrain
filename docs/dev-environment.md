@@ -89,6 +89,25 @@ drift .4 → .2 and OVN DB reset); and a node with `/dev/vhost-net` removed (res
 83 s). **Not tested:** a real `wsl --shutdown` cycle (it would kill the session running the
 test). It should be the same as the `docker stop` case plus host-prep reloading modules.
 
+### Cluster profiles (`KIND_PROFILE`)
+
+`task dev:up` builds one of two cluster flavours ([any-kubernetes.md](any-kubernetes.md)):
+
+| Profile | Cluster | Primary CNI | Kube-OVN | Orchestrator |
+|---|---|---|---|---|
+| `kubeovn-primary` (default) | `cloudtrain-dev` | Kube-OVN | primary | `--network-mode=primary` |
+| `managed-cni` | `cloudtrain-mcni` | Cilium (`deploy/cilium/values.yaml`), stands in for a managed cloud's CNI | non-primary behind Multus (`deploy/kube-ovn/values-secondary.yaml`) | needs the secondary network mode (implementation PR) |
+
+```bash
+task dev:up KIND_PROFILE=managed-cni              # control plane + 2 workers (deploy/kind/cluster-managed-cni.yaml)
+task dev:down KIND_PROFILE=managed-cni            # deletes only cloudtrain-mcni
+```
+
+`CT_CLUSTER_NAME` overrides the cluster name of either profile (the remote verify VM
+uses it with `KIND_CONFIG=tools/verify-vm/kind-managed-cni.yaml` for a throwaway
+cluster next to the batch runner's). The two profiles are separate clusters, so a
+`managed-cni` cluster never touches `cloudtrain-dev`.
+
 ## What `lab:demo` builds
 
 ```
