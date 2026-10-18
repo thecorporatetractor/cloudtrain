@@ -19,7 +19,7 @@ spec:
     listens on `localhost:5000`, and `~/buildkitd.toml` lets a builder container use it
     over plain HTTP.
 
-    1. Create a **docker-container** buildx builder (use `--driver-opt network=host` and
+    1. Create a **docker-container** buildx builder (use `--driver-opt network=host --driver-opt image=moby/buildkit:v0.23.2` and
        `--buildkitd-config ~/buildkitd.toml`) and build the `runtime` target as
        `copperleaf/transcoder:2.0`, exporting the cache to the registry at
        **`localhost:5000/cache/transcoder:buildcache`** with **`mode=max`**, so the
@@ -59,12 +59,14 @@ spec:
         docker rm -f registry >/dev/null 2>&1 || true
         docker run -d --name registry --restart always -p 127.0.0.1:5000:5000 registry:3 >/dev/null
         for i in $(seq 30); do curl -fs http://127.0.0.1:5000/v2/ >/dev/null && break; sleep 1; done
+        docker tag alpine:3.22 localhost:5000/library/alpine:3.22
+        docker push localhost:5000/library/alpine:3.22 >/dev/null
         s=/home/learner/transcoder-ci
         rm -rf "$s"; install -d "$s/src"
         printf '%s\n' 'libframe 2.4' 'libmux 1.9' > "$s/deps.txt"
         printf '%s\n' '#!/bin/sh' 'echo "transcoder 2.0 rev {{rev}}"' > "$s/src/transcoder.sh"
         cat > "$s/Dockerfile" <<'DF'
-        FROM alpine:3.22 AS build
+        FROM localhost:5000/library/alpine:3.22 AS build
         WORKDIR /src
         COPY deps.txt .
         RUN head -c 20971520 /dev/urandom > /deps.bin && cp deps.txt /deps.lst
@@ -74,7 +76,7 @@ spec:
         FROM scratch AS dist
         COPY --from=build /transcoder /transcoder
 
-        FROM alpine:3.22 AS runtime
+        FROM localhost:5000/library/alpine:3.22 AS runtime
         COPY --from=build /transcoder /usr/local/bin/transcoder
         ENTRYPOINT ["transcoder"]
         DF
@@ -120,11 +122,14 @@ spec:
       weight: 3
       command: |
         b=ct-verify-$$
-        runuser -u learner -- docker buildx create --name "$b" --driver docker-container --driver-opt network=host --buildkitd-config /home/learner/buildkitd.toml >/dev/null 2>&1 || { echo no-builder; exit 0; }
-        out=$(cd /home/learner/transcoder-ci && runuser -u learner -- docker buildx build --builder "$b" --target runtime --progress plain --cache-from type=registry,ref=localhost:5000/cache/transcoder:buildcache . 2>&1)
+        runuser -u learner -- docker buildx create --name "$b" --driver docker-container --driver-opt network=host --driver-opt image=moby/buildkit:v0.23.2 --buildkitd-config /home/learner/buildkitd.toml >/dev/null 2>&1 || { echo no-builder; exit 0; }
+        d=$(mktemp -d)
+        out=$(cd /home/learner/transcoder-ci && runuser -u learner -- docker buildx build --builder "$b" --target dist --output type=local,dest=$d --progress plain --cache-from type=registry,ref=localhost:5000/cache/transcoder:buildcache . 2>&1)
         runuser -u learner -- docker buildx rm "$b" >/dev/null 2>&1
-        n=$(echo "$out" | grep -c ' CACHED' || true)
-        [ "$n" -ge 3 ] && echo reused || echo "cached-steps-$n"
+        rm -rf "$d"
+        # the dependency step must be reported CACHED (same vertex number), which needs the build stage cache (mode=max)
+        n=$(echo "$out" | grep -E '^#[0-9]+ \[build [0-9]+/[0-9]+\] RUN head -c 20971520' | head -1 | sed -E 's/^#([0-9]+) .*/\1/')
+        [ -n "$n" ] && echo "$out" | grep -qE "^#$n CACHED" && echo reused || echo "dependency-step-not-cached"
       expect: {match: exact, value: reused}
     - id: dist-exported
       description: dist/transcoder is the compiled program
@@ -139,7 +144,7 @@ spec:
       expect: {match: exact, value: "transcoder 2.0 rev {{rev}}"}
   hints:
     - title: A builder that can export cache
-      body: "The default builder cannot be chosen freely; create one with `docker buildx create --name ci-1 --driver docker-container --driver-opt network=host --buildkitd-config ~/buildkitd.toml --use`. Check it with `docker buildx inspect --bootstrap`."
+      body: "The default builder cannot be chosen freely; create one with `docker buildx create --name ci-1 --driver docker-container --driver-opt network=host --driver-opt image=moby/buildkit:v0.23.2 --buildkitd-config ~/buildkitd.toml --use`. Check it with `docker buildx inspect --bootstrap`."
       cost: 1
     - title: Export and import
       body: "`--cache-to type=registry,ref=<ref>,mode=max` writes the cache after a build; `--cache-from type=registry,ref=<ref>` reads it. `mode=min` (the default) only keeps layers of the final image."
@@ -157,7 +162,7 @@ spec:
         as: learner
         run: |
           cd ~/transcoder-ci
-          docker buildx create --name ci-1 --driver docker-container --driver-opt network=host --buildkitd-config ~/buildkitd.toml --use
+          docker buildx create --name ci-1 --driver docker-container --driver-opt network=host --driver-opt image=moby/buildkit:v0.23.2 --buildkitd-config ~/buildkitd.toml --use
           docker buildx build --builder ci-1 --target runtime -t copperleaf/transcoder:2.0 --cache-to type=registry,ref=localhost:5000/cache/transcoder:buildcache --load .
           docker buildx build --builder ci-1 --target dist --output type=local,dest=dist .
     - id: no-registry-cache
@@ -169,7 +174,7 @@ spec:
         as: learner
         run: |
           cd ~/transcoder-ci
-          docker buildx create --name ci-1 --driver docker-container --driver-opt network=host --buildkitd-config ~/buildkitd.toml --use
+          docker buildx create --name ci-1 --driver docker-container --driver-opt network=host --driver-opt image=moby/buildkit:v0.23.2 --buildkitd-config ~/buildkitd.toml --use
           docker buildx build --builder ci-1 --target runtime -t copperleaf/transcoder:2.0 --load .
           docker buildx build --builder ci-1 --target dist --output type=local,dest=dist .
     - id: no-dist
@@ -181,7 +186,7 @@ spec:
         as: learner
         run: |
           cd ~/transcoder-ci
-          docker buildx create --name ci-1 --driver docker-container --driver-opt network=host --buildkitd-config ~/buildkitd.toml --use
+          docker buildx create --name ci-1 --driver docker-container --driver-opt network=host --driver-opt image=moby/buildkit:v0.23.2 --buildkitd-config ~/buildkitd.toml --use
           docker buildx build --builder ci-1 --target runtime -t copperleaf/transcoder:2.0 --cache-to type=registry,ref=localhost:5000/cache/transcoder:buildcache,mode=max --load .
   solution:
     explanation: |
@@ -194,10 +199,10 @@ spec:
         run: |
           cd ~/transcoder-ci
           REF=localhost:5000/cache/transcoder:buildcache
-          docker buildx create --name ci-1 --driver docker-container --driver-opt network=host --buildkitd-config ~/buildkitd.toml
+          docker buildx create --name ci-1 --driver docker-container --driver-opt network=host --driver-opt image=moby/buildkit:v0.23.2 --buildkitd-config ~/buildkitd.toml
           docker buildx build --builder ci-1 --target runtime -t copperleaf/transcoder:2.0 --cache-to type=registry,ref=$REF,mode=max --load .
           docker buildx rm ci-1
-          docker buildx create --name ci-2 --driver docker-container --driver-opt network=host --buildkitd-config ~/buildkitd.toml
+          docker buildx create --name ci-2 --driver docker-container --driver-opt network=host --driver-opt image=moby/buildkit:v0.23.2 --buildkitd-config ~/buildkitd.toml
           docker buildx build --builder ci-2 --target runtime --cache-from type=registry,ref=$REF -t copperleaf/transcoder:2.0 --load .
           docker buildx build --builder ci-2 --target dist --cache-from type=registry,ref=$REF --output type=local,dest=dist .
     alternatives:
@@ -209,6 +214,6 @@ spec:
             run: |
               cd ~/transcoder-ci
               REF=localhost:5000/cache/transcoder:buildcache
-              docker buildx create --name ci-1 --driver docker-container --driver-opt network=host --buildkitd-config ~/buildkitd.toml --use
+              docker buildx create --name ci-1 --driver docker-container --driver-opt network=host --driver-opt image=moby/buildkit:v0.23.2 --buildkitd-config ~/buildkitd.toml --use
               docker buildx build --target runtime -t copperleaf/transcoder:2.0 --cache-to type=registry,ref=$REF,mode=max,image-manifest=true,oci-mediatypes=true --load .
               docker buildx build --target dist --cache-from type=registry,ref=$REF --output type=local,dest=dist .

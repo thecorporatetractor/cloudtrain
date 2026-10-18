@@ -216,7 +216,7 @@ multi-platform images" (titles carry no product names).
 
 | Lab | Blocker | Needed in the next docker-vm rebuild |
 |---|---|---|
-| `ctr-buildx-cache-export` | the docker-container driver needs the moby/buildkit image | preload `moby/buildkit` |
+| `ctr-buildx-cache-export` | the docker-container driver needs the moby/buildkit image | preload `moby/buildkit:v0.23.2` exactly (the lab pins it with `--driver-opt image=`); the lab's setup pushes alpine:3.22 to the local registry because the builder cannot see dockerd's images |
 | `xcd-build-multistage-nonroot` | no Go toolchain image offline | preload `golang:1.25-alpine` |
 | `xcd-supply-sbom-sign` | no cosign, no docker/buildkit-syft-scanner image; setup writes NOTE.txt instead of keys without cosign, keep the task out of a live draw until then | install `cosign` (v2 flags assumed), preload `docker/buildkit-syft-scanner` |
 | `ctr-reproducible-build` | `rewrite-timestamps=true` was not honoured by the docker driver in a local test (Engine 27.5, BuildKit 0.18); the lab uses a fixed-mtime tar overlay instead; unconfirmed: offline `FROM tag@digest` resolution on 29.9 | none, confirm at verify |
