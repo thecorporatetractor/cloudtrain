@@ -4,7 +4,7 @@ import { stateOf } from './ctf';
 import { labById } from './fixtures/labs';
 import { userRef } from './fixtures/platform';
 import { currentSession } from './platformHandlers';
-import { newSession, sessionEvents } from './sessionStore';
+import { newSession, randomSuffix, sessionEvents } from './sessionStore';
 
 /*
  * Mock CTF events (mock mode only): a live team event with a seeded
@@ -204,7 +204,7 @@ export const eventHandlers = [
     if (!canManage()) return forbidden();
     const body = (await request.json()) as CreateCtfEventRequest;
     if (!body.title?.trim() || !body.labIds?.length) return HttpResponse.json({ error: 'The event is not valid.', code: 'invalid', details: { ...(!body.title?.trim() ? { title: 'A title is required.' } : {}), ...(!body.labIds?.length ? { labIds: 'Pick at least one CTF lab.' } : {}) } }, { status: 422 });
-    const e: MockEvent = { ...body, id: `ev-${Math.random().toString(36).slice(2, 8)}`, createdBy: mine(), teams: [], participants: new Map(), solves: [] };
+    const e: MockEvent = { ...body, id: `ev-${randomSuffix(6)}`, createdBy: mine(), teams: [], participants: new Map(), solves: [] };
     EVENTS = [e, ...EVENTS];
     return HttpResponse.json(detail(e), { status: 201 });
   }),
@@ -234,7 +234,7 @@ export const eventHandlers = [
     let teamId: string | undefined;
     if (e.mode === 'team' && body.teamName) {
       if (e.teams.some((t) => t.name.toLowerCase() === body.teamName!.trim().toLowerCase())) return conflict(`A team called ${body.teamName} already exists.`);
-      teamId = `tm-${Math.random().toString(36).slice(2, 7)}`;
+      teamId = `tm-${randomSuffix(5)}`;
       e.teams.push({ id: teamId, name: body.teamName.trim(), members: [] });
     } else if (e.mode === 'team' && body.teamId) teamId = body.teamId;
     const team = e.teams.find((t) => t.id === teamId);
@@ -257,7 +257,7 @@ export const eventHandlers = [
     const e = find(String(params.id));
     if (!e) return notFound();
     const { name } = (await request.json()) as { name: string };
-    e.teams.push({ id: `tm-${Math.random().toString(36).slice(2, 7)}`, name, members: [] });
+    e.teams.push({ id: `tm-${randomSuffix(5)}`, name, members: [] });
     return HttpResponse.json(detail(e));
   }),
   http.put('/api/events/:id/teams/:teamId/members', async ({ params, request }) => {

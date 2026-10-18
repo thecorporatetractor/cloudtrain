@@ -5,12 +5,15 @@ import { labById } from './fixtures/labs';
 export const sessions = new Map<string, LabSession>();
 
 /** Event sessions: session id -> the event context the questions panel shows. */
+/** Short random id suffix (lowercase hex). */
+export const randomSuffix = (n = 6) => Array.from(crypto.getRandomValues(new Uint8Array(Math.ceil(n / 2))), (b) => b.toString(16).padStart(2, '0')).join('').slice(0, n);
+
 export const sessionEvents = new Map<string, NonNullable<QuestionsView['event']>>();
 
 export function newSession(labId: string): LabSession {
   const lab = labById.get(labId);
   if (!lab) throw new Error('unknown lab');
-  const id = `sess-${labId}-${Math.random().toString(36).slice(2, 8)}`;
+  const id = `sess-${labId}-${randomSuffix(6)}`;
   const session: LabSession = {
     id,
     labId,
