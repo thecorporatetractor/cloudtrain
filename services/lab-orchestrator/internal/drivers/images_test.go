@@ -91,15 +91,18 @@ images: {}
 }
 
 func TestPublishName(t *testing.T) {
-	for in, want := range map[CatalogImage]string{
-		{Image: "cloudtrain/jumphost:1"}:                            "jumphost",
-		{Image: "cloudtrain/kubeadm-node:v1.37.1"}:                  "kubeadm-node",
-		{Image: "ghcr.io/a/b/c@sha256:00"}:                          "c",
-		{Image: "cloudtrain/iac-ws:1.15", PublishAs: "iac-ws-tofu"}: "iac-ws-tofu",
-		{Image: "busybox"}:                                          "busybox",
+	for _, tc := range []struct {
+		img  CatalogImage
+		want string
+	}{
+		{CatalogImage{Image: "cloudtrain/jumphost:1"}, "jumphost"},
+		{CatalogImage{Image: "cloudtrain/kubeadm-node:v1.37.1"}, "kubeadm-node"},
+		{CatalogImage{Image: "ghcr.io/a/b/c@sha256:00"}, "c"},
+		{CatalogImage{Image: "cloudtrain/iac-ws:1.15", PublishAs: "iac-ws-tofu"}, "iac-ws-tofu"},
+		{CatalogImage{Image: "busybox"}, "busybox"},
 	} {
-		if got := in.PublishName(); got != want {
-			t.Errorf("%+v: %q, want %q", in, got, want)
+		if got := tc.img.PublishName(); got != tc.want {
+			t.Errorf("%+v: %q, want %q", tc.img, got, tc.want)
 		}
 	}
 }
