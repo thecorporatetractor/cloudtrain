@@ -45,7 +45,10 @@ type RuntimeOptions struct {
 	PersistentHome      bool
 	VClusterPersistence bool
 	VMDisks             VMDiskOptions
-	StorageClass        string
+	// StorageClass is the default class of all of them; HomeStorageClass
+	// (homes and vcluster databases) and VMDisks.StorageClass override it.
+	StorageClass     string
+	HomeStorageClass string
 	// UserNamespaces: run catalog images marked userNamespace with pod
 	// hostUsers: false (resolve with DetectUserNamespaces).
 	UserNamespaces bool
@@ -55,6 +58,13 @@ type RuntimeOptions struct {
 	// Multus) and the MTU of session segments, for the VM lab network.
 	// The pod link network (LinkNetwork) takes the same options.
 	Network network.Options
+}
+
+func firstNonEmpty(a, b string) string {
+	if a != "" {
+		return a
+	}
+	return b
 }
 
 // Runtime is the assembled driver set.
@@ -88,7 +98,7 @@ func NewRuntime(o RuntimeOptions) (*Runtime, error) {
 		Client: o.Client, Reader: o.Reader, Scheme: o.Scheme, ImageRegistry: registry,
 		ImageMirrors: mirrors, ImagePullSecrets: secrets,
 		RuntimeClassName: o.RuntimeClassName, Executor: o.Executor, Catalog: o.Catalog,
-		PersistentHome: o.PersistentHome, HomeStorageClass: o.StorageClass,
+		PersistentHome: o.PersistentHome, HomeStorageClass: firstNonEmpty(o.HomeStorageClass, o.StorageClass),
 		UserNamespaces: o.UserNamespaces, DenyLearnerSudo: o.DenyLearnerSudo,
 	}
 	disks := o.VMDisks
@@ -110,7 +120,7 @@ func NewRuntime(o RuntimeOptions) (*Runtime, error) {
 		ImageRegistry: registry, Disks: disks}
 	cluster := &ClusterDriver{
 		Virtual: &VClusterDriver{Client: o.Client, Reader: o.Reader, Container: container, Helm: o.Helm,
-			Chart: o.VClusterChart, ValuesFile: o.VClusterValues, Persistent: o.VClusterPersistence, StorageClass: o.StorageClass,
+			Chart: o.VClusterChart, ValuesFile: o.VClusterValues, Persistent: o.VClusterPersistence, StorageClass: firstNonEmpty(o.HomeStorageClass, o.StorageClass),
 			PodSecurity: o.VClusterPodSecurity},
 		Kubeadm: &KubeadmDriver{Client: o.Client, Reader: o.Reader, Catalog: o.Catalog, Container: container,
 			Session: session, ImageRegistry: registry, Disks: disks},

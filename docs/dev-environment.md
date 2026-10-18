@@ -110,6 +110,14 @@ uses it with `KIND_CONFIG=tools/verify-vm/kind-managed-cni.yaml` for a throwaway
 cluster next to the batch runner's). The two profiles are separate clusters, so a
 `managed-cni` cluster never touches `cloudtrain-dev`.
 
+### Storage on kind
+
+kind's default class is `standard` (local-path). Storage settings are all optional: with
+none set, homes, vcluster databases and VM disks use the cluster default class, and `dev:up`
+sets CDI scratch space to `standard` (`DEV_STORAGE_CLASS=` empty uses the default class).
+To try another class: `STORAGE_CLASS=<name> task dev:orchestrator`. The manager's startup
+preflight logs a warning when no default class exists. Details: [storage.md](storage.md).
+
 ## What `lab:demo` builds
 
 ```
@@ -803,7 +811,7 @@ first when a lab passes locally and fails here.
 | kind node IPs from Docker, drift after restart | Static node IPs (DHCP reservations or IPAM), so the drift handling is not needed. Kube-OVN `MASTER_NODES` uses 3 control-plane nodes (raft). |
 | Geneve overlay over the Docker bridge | Geneve over the vSphere port group: MTU ≥ 1600 on the vDS/NSX segment (or lower the Kube-OVN MTU), and allow UDP 6081 between workers. Promiscuous mode/forged transmits are NOT needed for overlay. They are needed only if labs use underlay/VLAN subnets bridged to physical networks. |
 | `kind load` of the containerDisk | Internal OCI registry (Harbor) for `cloudtrain/kubeadm-node` and the jumphost. Pre-pull or a warm pool on the workers, or a CDI DataVolume golden PVC on a CSI class with fast clone (vSphere CSI does not CSI-clone across datastores; consider a local-NVMe class such as TopoLVM for fast clones). |
-| local-path storage | vSphere CSI or local-NVMe for VM disks. The vcluster etcd and SQLite PVCs also need a real StorageClass. |
+| local-path storage | vSphere CSI or local-NVMe for VM disks. The vcluster etcd and SQLite PVCs also need a real StorageClass. Set `STORAGE_CLASS` (and optionally `VM_DISK_VOLUME_MODE`) when deploying the orchestrator; nothing else is class-specific, see [storage.md](storage.md). |
 | One worker runs all VMs | Size workers for about 4.3 GiB scheduled per 2-node lab plus about 280 MiB overhead per VMI. Use dedicated "virt" workers (label + KubeVirt nodePlacement). Reserve memory for nested-virt EPT overhead. Do not overcommit memory on the ESXi host under nested guests. |
 | No egress for labs | `VpcNatGateway` per lab VPC (or a shared one) with an allow-list egress proxy, plus DNS. |
 | Optional later | vSphere Instant Clone provider for `vm` nodes (see architecture.md), which avoids nested virt for Linux-admin labs. |

@@ -148,7 +148,9 @@ log "installing CDI $CDI_VERSION"
 fetch_pinned "https://github.com/kubevirt/containerized-data-importer/releases/download/${CDI_VERSION}/cdi-operator.yaml" \
   "$CDI_OPERATOR_SHA256" "$MANIFEST_CACHE/cdi-operator-${CDI_VERSION}.yaml"
 k apply -f "$MANIFEST_CACHE/cdi-operator-${CDI_VERSION}.yaml" >/dev/null
-k apply -f "$REPO_ROOT/deploy/kubevirt/cdi-cr.yaml" >/dev/null
+# kind's class is "standard" (local-path); DEV_STORAGE_CLASS overrides it, "" = cluster default.
+DEV_STORAGE_CLASS=${DEV_STORAGE_CLASS-standard} yq '(select(strenv(DEV_STORAGE_CLASS) != "") | .spec.config.scratchSpaceStorageClass) = strenv(DEV_STORAGE_CLASS)' \
+  "$REPO_ROOT/deploy/kubevirt/cdi-cr.yaml" | k apply -f - >/dev/null
 wait_for "CDI Available" 600 k wait cdi/cdi --for=condition=Available --timeout=5s
 
 # --- 6. Prove KVM (not emulation) with a throwaway VMI -----------------------

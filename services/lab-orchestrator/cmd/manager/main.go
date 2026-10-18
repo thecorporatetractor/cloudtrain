@@ -28,18 +28,19 @@ import (
 
 func main() {
 	var (
-		metricsAddr, probeAddr, registry, runtimeClass, watchNamespace      string
-		catalogPaths, adminImageRef, helmBin, vclusterChart, vclusterValues string
-		sessionSelector, leaderElectionID, netToolsImage                    string
-		storageClass, vmDisks, userNamespaces, vclusterPodSecurity          string
-		ovnCentral, imageMirrors, imagePullSecrets, networkModeFlag         string
-		labMTU                                                              int
-		linkSysctls                                                         bool
-		linkRateMbps                                                        int
-		leaderElect, metricsSecure, persistentHome, vclusterPersistence     bool
-		allowLearnerSudo                                                    bool
-		concurrency                                                         int
-		provisionTimeout                                                    time.Duration
+		metricsAddr, probeAddr, registry, runtimeClass, watchNamespace                                            string
+		catalogPaths, adminImageRef, helmBin, vclusterChart, vclusterValues                                       string
+		sessionSelector, leaderElectionID, netToolsImage                                                          string
+		storageClass, homeStorageClass, vmDiskStorageClass, vmDiskVolumeMode, vmDiskAccessModes, storagePreflight string
+		vmDisks, userNamespaces, vclusterPodSecurity                                                              string
+		ovnCentral, imageMirrors, imagePullSecrets, networkModeFlag                                               string
+		labMTU                                                                                                    int
+		linkSysctls                                                                                               bool
+		linkRateMbps                                                                                              int
+		leaderElect, metricsSecure, persistentHome, vclusterPersistence                                           bool
+		allowLearnerSudo                                                                                          bool
+		concurrency                                                                                               int
+		provisionTimeout                                                                                          time.Duration
 	)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "metrics endpoint address (e.g. :8443); \"0\" disables metrics")
 	flag.BoolVar(&metricsSecure, "metrics-secure", true, "serve metrics over HTTPS with Kubernetes authn/authz")
@@ -72,6 +73,11 @@ func main() {
 	flag.StringVar(&networkModeFlag, "network-mode", string(network.ModePrimary), "how wired lab pods and lab VMs reach the session network (docs/any-kubernetes.md): primary (Kube-OVN is the cluster's primary CNI; eth0 placed with ovn.kubernetes.io/logical_switch) or secondary (another CNI owns eth0, Kube-OVN runs non-primary behind Multus; eth0 = a session segment as the Multus default network, VMs with multus.default)")
 	flag.IntVar(&labMTU, "lab-mtu", network.DefaultLinkMTU, "MTU of every session segment (Kube-OVN Subnet spec.mtu): lab links, management, lab and access subnets; lab content assumes 1400. 0 = Kube-OVN default (node MTU minus tunnel overhead)")
 	flag.StringVar(&storageClass, "storage-class", "", "StorageClass of learner homes, vcluster databases and VM disks; empty = cluster default")
+	flag.StringVar(&homeStorageClass, "home-storage-class", "", "StorageClass of learner homes and vcluster databases; empty = --storage-class")
+	flag.StringVar(&vmDiskStorageClass, "vm-disk-storage-class", "", "StorageClass of VM disks; empty = --storage-class")
+	flag.StringVar(&vmDiskVolumeMode, "vm-disk-volume-mode", "", "volumeMode of VM disks: Block, Filesystem, or empty = the class's CDI StorageProfile decides")
+	flag.StringVar(&vmDiskAccessModes, "vm-disk-access-modes", "ReadWriteOnce", "comma separated accessModes of VM disks (ReadWriteOnce suits every class)")
+	flag.StringVar(&storagePreflight, "storage-preflight", "warn", "startup check that the configured (or a default) StorageClass exists: warn (log), strict (exit on a missing configured class) or off")
 	opts := zap.Options{}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
@@ -156,6 +162,38 @@ func main() {
 		log.Error(nil, "--vm-disks must be persistent or ephemeral", "value", vmDisks)
 		os.Exit(1)
 	}
+	if !drivers.ValidVolumeMode(vmDiskVolumeMode) || !drivers.ValidAccessModes(drivers.SplitList(vmDiskAccessModes)) {
+		log.Error(nil, "invalid --vm-disk-volume-mode or --vm-disk-access-modes", "volumeMode", vmDiskVolumeMode, "accessModes", vmDiskAccessModes)
+		os.Exit(1)
+	}
+	if storagePreflight != "warn" && storagePreflight != "strict" && storagePreflight != "off" {
+		log.Error(nil, "--storage-preflight must be warn, strict or off", "value", storagePreflight)
+		os.Exit(1)
+	}
+	if storagePreflight != "off" {
+		direct, err := client.New(cfg, client.Options{Scheme: scheme})
+		if err != nil {
+			log.Error(err, "unable to create client for the storage preflight")
+			os.Exit(1)
+		}
+		want := map[string]string{}
+		if persistentHome || vclusterPersistence {
+			want["homes and vcluster databases"] = firstNonEmpty(homeStorageClass, storageClass)
+		}
+		if vmDisks == "persistent" {
+			want["VM disks"] = firstNonEmpty(vmDiskStorageClass, storageClass)
+		}
+		pctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		findings := drivers.CheckStorage(pctx, direct, want)
+		cancel()
+		for _, f := range findings {
+			if f.Fatal && storagePreflight == "strict" {
+				log.Error(nil, f.Message)
+				os.Exit(1)
+			}
+			log.Info("storage preflight: " + f.Message)
+		}
+	}
 	useUserNS := false
 	switch userNamespaces {
 	case "true":
@@ -191,8 +229,9 @@ func main() {
 		RuntimeClassName: runtimeClass, AdminImageRef: adminImageRef,
 		Helm: drivers.ExecHelm{Binary: helmBin}, VClusterChart: vclusterChart, VClusterValues: vclusterValues,
 		VClusterPodSecurity: vclusterPodSecurity,
-		PersistentHome:      persistentHome, VClusterPersistence: vclusterPersistence, StorageClass: storageClass,
-		VMDisks:        drivers.VMDiskOptions{Persistent: vmDisks == "persistent"},
+		PersistentHome:      persistentHome, VClusterPersistence: vclusterPersistence, StorageClass: storageClass, HomeStorageClass: homeStorageClass,
+		VMDisks: drivers.VMDiskOptions{Persistent: vmDisks == "persistent", StorageClass: vmDiskStorageClass,
+			VolumeMode: vmDiskVolumeMode, AccessModes: drivers.SplitList(vmDiskAccessModes)},
 		UserNamespaces: useUserNS, DenyLearnerSudo: !allowLearnerSudo,
 		Network: netOpts,
 	})
@@ -265,4 +304,11 @@ func main() {
 		log.Error(err, "manager exited")
 		os.Exit(1)
 	}
+}
+
+func firstNonEmpty(a, b string) string {
+	if a != "" {
+		return a
+	}
+	return b
 }
