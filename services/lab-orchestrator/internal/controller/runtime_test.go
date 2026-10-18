@@ -8,6 +8,7 @@ import (
 
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	labsv1 "github.com/cloudtrain/cloudtrain/services/lab-orchestrator/api/v1alpha1"
 	"github.com/cloudtrain/cloudtrain/services/lab-orchestrator/internal/drivers"
@@ -46,6 +47,34 @@ func TestGradingPublishesValidation(t *testing.T) {
 	h.reconcile()
 	if h.cont.execCalls != calls {
 		t.Error("graded again without a new request")
+	}
+}
+
+// A reconcile that reads a stale cached session (validation still Running
+// for the request) must not grade again when the API server already has the
+// result: checks with side effects (a failover check) would run twice.
+func TestGradingNotRepeatedOnStaleCache(t *testing.T) {
+	stale := session(func(s *labsv1.LabSession) {
+		s.Spec.ValidateRequest = 2
+		s.Status.Validation = &labsv1.ValidationStatus{ObservedRequest: 2, Phase: labsv1.ValidationRunning}
+	})
+	h := newHarness(t, gradedTemplate(), stale)
+	fresh := stale.DeepCopy()
+	fresh.Status.Validation.Phase = labsv1.ValidationComplete
+	h.r.Reader = fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(fresh).
+		WithStatusSubresource(&labsv1.LabSession{}).Build()
+	h.reconcile()
+	calls := h.cont.execCalls
+	h.reconcile()
+	if v := h.get().Status.Validation; h.cont.execCalls != calls || v.Phase != labsv1.ValidationRunning || len(v.Checks) != 0 {
+		t.Fatalf("graded again from a stale cache: %d -> %d exec calls, %+v", calls, h.cont.execCalls, v)
+	}
+	// The API server still says Running: a truly interrupted run is regraded.
+	h.r.Reader = fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(stale.DeepCopy()).
+		WithStatusSubresource(&labsv1.LabSession{}).Build()
+	h.reconcile()
+	if v := h.get().Status.Validation; h.cont.execCalls == calls || v.Phase != labsv1.ValidationComplete {
+		t.Fatalf("interrupted run not regraded: %d exec calls, %+v", h.cont.execCalls, v)
 	}
 }
 

@@ -185,6 +185,21 @@ func (p *Plan) InitScript(node string, router bool) string {
 		// forward, so turn it off on every interface, not only all/default.
 		b.WriteString("sysctl -qw net.ipv4.conf.all.rp_filter=0 net.ipv4.conf.default.rp_filter=0\n")
 		b.WriteString("for f in /proc/sys/net/ipv4/conf/*/rp_filter; do echo 0 > \"$f\"; done\n")
+		// A router does not use the connected route of an interface without
+		// carrier; Linux does unless ignore_routes_with_linkdown is set (per
+		// device, new devices copy default). Without it a VRRP backup, whose
+		// protodown macvlan still holds the virtual subnet, sends replies
+		// arriving over an ECMP return path into that dead interface (the
+		// neighbour stays FAILED) and the LAN loses them.
+		b.WriteString("sysctl -qw net.ipv4.conf.all.ignore_routes_with_linkdown=1 net.ipv4.conf.default.ignore_routes_with_linkdown=1\n")
+		b.WriteString("sysctl -qw net.ipv6.conf.all.ignore_routes_with_linkdown=1 net.ipv6.conf.default.ignore_routes_with_linkdown=1 || true\n")
+		b.WriteString("for f in /proc/sys/net/ipv4/conf/*/ignore_routes_with_linkdown /proc/sys/net/ipv6/conf/*/ignore_routes_with_linkdown; do echo 1 > \"$f\" 2>/dev/null || true; done\n")
+		// A router answers ARP only for addresses of the receiving
+		// interface; Linux answers for any local address (arp_ignore uses
+		// max(all, <dev>)). Otherwise a router holding a VRRP virtual
+		// address on a protodown macvlan, VRRP not even configured, answers
+		// for it on its LAN port and takes over as gateway.
+		b.WriteString("sysctl -qw net.ipv4.conf.all.arp_ignore=1 net.ipv4.conf.default.arp_ignore=1\n")
 	}
 	// Unprivileged ICMP sockets, so the learner (no NET_RAW: no_new_privs
 	// ignores ping's file capabilities) can ping across lab links. 0-65535

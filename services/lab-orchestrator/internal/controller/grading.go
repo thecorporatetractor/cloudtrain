@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	labsv1 "github.com/cloudtrain/cloudtrain/services/lab-orchestrator/api/v1alpha1"
@@ -22,6 +23,30 @@ func gradingRequested(s *labsv1.LabSession) bool {
 	}
 	v := s.Status.Validation
 	return v == nil || v.ObservedRequest != req || v.Phase == labsv1.ValidationRunning
+}
+
+// gradingStillRequested confirms a grading request against the API server
+// (r.Reader, uncached). The reconcile queued by grade's own "Running" status
+// write can read the session from a cache that has not seen the "Complete"
+// result yet; gradingRequested then takes it for an interrupted run and every
+// check runs a second time. Checks with side effects break on that rerun (a
+// failover check shuts a router's interface, and the rerun of the checks
+// before it sees the backup already master), and a loaded host makes the
+// cache lag long enough for it. Without a Reader, or when the read fails,
+// the cached object decides.
+func (r *LabSessionReconciler) gradingStillRequested(ctx context.Context, s *labsv1.LabSession) bool {
+	if r.Reader == nil {
+		return true
+	}
+	fresh := &labsv1.LabSession{}
+	if err := r.Reader.Get(ctx, client.ObjectKeyFromObject(s), fresh); err != nil {
+		return true
+	}
+	if fresh.Spec.ValidateRequest != s.Spec.ValidateRequest || !gradingRequested(fresh) {
+		logf.FromContext(ctx).Info("grading request already answered; cache is behind", "request", s.Spec.ValidateRequest)
+		return false
+	}
+	return true
 }
 
 // rejectGrading answers a pending grading request with phase Failed.
