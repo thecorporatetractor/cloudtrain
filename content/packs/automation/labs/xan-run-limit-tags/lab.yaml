@@ -1,0 +1,199 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xan-run-limit-tags
+  title: Run part of a playbook against part of the fleet
+  domain: automation
+  frameworks: [ex294-aligned:run-content]
+  difficulty: easy
+  estimatedMinutes: 8
+  tags: [exam, ansible, tags, limit, navigator]
+  version: 1
+spec:
+  description: |
+    **Exam environment.** You work as `learner` on the control node `control`. The
+    managed nodes are `node1` (group `dev`), `node2` (`test`), `node3` (`prod`, also in
+    `webservers`) and `node4` (`balancers`), all Enterprise Linux 10; the account
+    `devops` on every node accepts your SSH key and may use sudo without a password.
+    Packages come from each node's local repository. Every playbook you write is run
+    again by the grader (it must report no changes), then every node is rebooted before
+    the final checks.
+
+    The playbook **`site.yml`** in **`/home/learner/exam/limit`** (inventory, `ansible.cfg`
+    and a ready `ansible-navigator.yml` are there) applies the Orrin and Vale site
+    baseline to all hosts; its tasks carry tags. Do not edit it.
+
+    Run **only the tasks tagged `motd`**, against **only the `test` group**. First preview
+    what would run with `ansible-playbook` (`--list-tasks`, `--list-hosts`), then do the
+    real run with **`ansible-navigator`** from the project directory so that a playbook
+    artifact is saved. Every other host and every other task must be left untouched.
+  objectives:
+    - Select tasks with tags and hosts with a limit
+    - Run a playbook through ansible-navigator and keep its artifact
+  params:
+    site:
+      type: choice
+      values: [Leeds, Bristol, Cardiff, York]
+    tag:
+      type: int
+      min: 100
+      max: 999
+  topology:
+    entry: control
+    nodes:
+      - { name: control, driver: container, image: ansible-ctl:2.21, access: [shell] }
+      - { name: node1, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node2, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node3, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node4, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+  setup:
+    - on: node1
+      timeoutSec: 120
+      run: &exam-node |
+        set -eu
+        id devops >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Exam automation" devops
+        install -d -m 0700 -o devops -g devops /home/devops/.ssh
+        install -m 0600 -o devops -g devops /home/learner/.ssh/authorized_keys /home/devops/.ssh/authorized_keys
+        printf 'devops ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/devops
+        chmod 0440 /etc/sudoers.d/devops
+    - { on: node2, timeoutSec: 120, run: *exam-node }
+    - { on: node3, timeoutSec: 120, run: *exam-node }
+    - { on: node4, timeoutSec: 120, run: *exam-node }
+    - on: control
+      run: |
+        set -eu
+        p=/home/learner/exam/limit
+        install -d -o learner -g learner /home/learner/exam $p $p/artifacts
+        cat > $p/inventory.yml <<'EOF'
+        dev:
+          hosts:
+            node1:
+        test:
+          hosts:
+            node2:
+        prod:
+          hosts:
+            node3:
+        balancers:
+          hosts:
+            node4:
+        webservers:
+          children:
+            prod:
+        EOF
+        printf '[defaults]\ninventory = inventory.yml\nremote_user = devops\n' > $p/ansible.cfg
+        cat > $p/ansible-navigator.yml <<'EOF'
+        ---
+        ansible-navigator:
+          execution-environment:
+            enabled: false
+          mode: stdout
+          playbook-artifact:
+            enable: true
+            save-as: /home/learner/exam/limit/artifacts/{playbook_name}-artifact-{time_stamp}.json
+        EOF
+        cat > $p/site.yml <<'EOF'
+        - name: Orrin and Vale site baseline
+          hosts: all
+          become: true
+          gather_facts: false
+          tasks:
+            - name: Login notice
+              ansible.builtin.copy:
+                dest: /etc/ov-motd
+                content: "Orrin and Vale - {{site}} - authorised use only\n"
+                mode: "0644"
+              tags: [motd]
+            - name: Site marker
+              ansible.builtin.copy:
+                dest: /etc/ov-site-marker
+                content: "managed\n"
+                mode: "0644"
+              tags: [marker]
+            - name: Reporting group
+              ansible.builtin.group:
+                name: ovreport{{tag}}
+              tags: [accounts]
+        EOF
+        chown -R learner:learner $p
+  checks:
+    - id: test-node
+      description: node2 has the login notice and shows no trace of the other tasks
+      type: shell
+      on: node2
+      skills: [automation.content.tags]
+      weight: 2
+      command: |
+        [ -f /etc/ov-motd ] && n=notice || n=no-notice
+        [ -e /etc/ov-site-marker ] && m=marker || m=no-marker
+        getent group ovreport{{tag}} >/dev/null && g=group || g=no-group
+        echo "$n $m $g"
+      expect: { match: exact, value: notice no-marker no-group }
+    - id: node1-untouched
+      description: node1 was not touched by the run
+      type: shell
+      on: node1
+      skills: [automation.content.tags]
+      command: &untouched |
+        [ -f /etc/ov-motd ] && n=notice || n=no-notice
+        [ -e /etc/ov-site-marker ] && m=marker || m=no-marker
+        getent group ovreport{{tag}} >/dev/null && g=group || g=no-group
+        echo "$n $m $g"
+      expect: { match: exact, value: no-notice no-marker no-group }
+    - { id: node3-untouched, description: "node3 was not touched by the run", type: shell, on: node3, skills: [automation.content.tags], command: *untouched, expect: { match: exact, value: no-notice no-marker no-group } }
+    - { id: node4-untouched, description: "node4 was not touched by the run", type: shell, on: node4, skills: [automation.content.tags], command: *untouched, expect: { match: exact, value: no-notice no-marker no-group } }
+    - id: navigator-artifact
+      description: A navigator artifact exists that records only the tagged task and only the test host
+      type: shell
+      on: control
+      skills: [automation.devworkflow.navigator]
+      weight: 2
+      command: |
+        for f in /home/learner/exam/limit/artifacts/*.json; do
+          [ -f "$f" ] || continue
+          t=$(jq -r '[.plays[].tasks[].task] | unique | join(",")' "$f" 2>/dev/null)
+          h=$(jq -r '[.plays[].tasks[].host] | unique | join(",")' "$f" 2>/dev/null)
+          [ "$t" = "Login notice" ] && [ "$h" = "node2" ] && { echo ok; exit 0; }
+        done
+        echo none
+      expect: { match: exact, value: ok }
+  exam:
+    rerun:
+      - on: control
+        timeoutSec: 600
+        run: |
+          r=$(ct-ansible recap /home/learner/exam/limit site.yml --tags motd --limit test)
+          echo "$r"
+          [ "$r" = "changed=0 failed=0 unreachable=0" ]
+  misconceptions:
+    - id: tags-only
+      description: Selects the tag but forgets to limit the hosts.
+      feedback: A tag selects tasks, not hosts; the run must also be limited to the test group.
+      expectFail: [node1-untouched, node3-untouched, node4-untouched]
+      mutation:
+        on: control
+        as: learner
+        timeoutSec: 300
+        run: cd ~/exam/limit && ansible-playbook site.yml --tags motd
+    - id: limit-only
+      description: Limits the hosts but runs every task.
+      feedback: The limit chooses hosts; without the tag every task of the playbook ran on node2.
+      expectFail: [test-node]
+      mutation:
+        on: control
+        as: learner
+        timeoutSec: 300
+        run: cd ~/exam/limit && ansible-playbook site.yml --limit test
+  solution:
+    explanation: |
+      --list-tasks and --list-hosts preview the selection; the same --tags and --limit options
+      are accepted by ansible-navigator run, which saves the artifact.
+    steps:
+      - on: control
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/exam/limit
+          ansible-playbook site.yml --tags motd --limit test --list-tasks --list-hosts
+          ansible-navigator run site.yml --tags motd --limit test </dev/null

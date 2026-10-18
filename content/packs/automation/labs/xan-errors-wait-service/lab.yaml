@@ -1,0 +1,251 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xan-errors-wait-service
+  title: Wait for a slow service before continuing
+  domain: automation
+  frameworks: [ex294-aligned:plays-errors]
+  difficulty: medium
+  estimatedMinutes: 10
+  tags: [exam, ansible, retries, until, services]
+  version: 1
+spec:
+  description: |
+    **Exam environment.** You work as `learner` on the control node `control`. The
+    managed nodes are `node1` (group `dev`), `node2` (`test`), `node3` (`prod`, also in
+    `webservers`) and `node4` (`balancers`), all Enterprise Linux 10; the account
+    `devops` on every node accepts your SSH key and may use sudo without a password.
+    Packages come from each node's local repository. Every playbook you write is run
+    again by the grader (it must report no changes), then every node is rebooted before
+    the final checks.
+
+    The prod host runs a small status service as the systemd unit **`ov-slowapi`**. It is
+    installed but stopped, and it needs a while to start listening on port **`{{port}}`**;
+    its status URL is `http://node3:{{port}}/status`. The page
+    **`/home/learner/exam/wait/dashboard.html`** (supplied; do not edit it) belongs on that
+    service and may only be deployed once the service answers.
+
+    Write the playbook **`/home/learner/exam/wait/wait.yml`** (the directory has an
+    inventory and an `ansible.cfg` with the remote user `devops`) that, on the **prod**
+    group:
+
+    1. starts `ov-slowapi` and enables it at boot;
+    2. **retries** the status URL with the `uri` module until it returns HTTP **200**, with
+       **at most 10 retries and 5 seconds between them**;
+    3. only then copies `dashboard.html` to **`/srv/ov-slow/dashboard.html`**.
+
+    Run it. A second run must report no changes.
+  objectives:
+    - Retry a task until a condition holds, with a retry limit and delay
+    - Order a deployment after a service is ready
+  params:
+    port:
+      type: int
+      min: 8830
+      max: 8839
+    warmup:
+      type: int
+      min: 18
+      max: 32
+    site:
+      type: choice
+      values: [Leeds, Bristol, Cardiff, York]
+  topology:
+    entry: control
+    nodes:
+      - { name: control, driver: container, image: ansible-ctl:2.21, access: [shell] }
+      - { name: node1, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node2, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node3, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node4, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+  setup:
+    - on: node1
+      timeoutSec: 120
+      run: &exam-node |
+        set -eu
+        id devops >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Exam automation" devops
+        install -d -m 0700 -o devops -g devops /home/devops/.ssh
+        install -m 0600 -o devops -g devops /home/learner/.ssh/authorized_keys /home/devops/.ssh/authorized_keys
+        printf 'devops ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/devops
+        chmod 0440 /etc/sudoers.d/devops
+    - { on: node2, timeoutSec: 120, run: *exam-node }
+    - { on: node3, timeoutSec: 120, run: *exam-node }
+    - { on: node4, timeoutSec: 120, run: *exam-node }
+    - on: node3
+      timeoutSec: 120
+      run: |
+        set -eu
+        [ -f /var/tmp/.ct-wait-seeded ] && exit 0
+        install -d /srv/ov-slow
+        printf 'ready\n' > /srv/ov-slow/status
+        cat > /etc/systemd/system/ov-slowapi.service <<'UNIT'
+        [Unit]
+        Description=Orrin and Vale slow status service
+        After=network-online.target
+        [Service]
+        ExecStart=/bin/sh -c 'sleep {{warmup}}; exec /usr/bin/python3 -m http.server {{port}} --directory /srv/ov-slow'
+        Restart=on-failure
+        [Install]
+        WantedBy=multi-user.target
+        UNIT
+        systemctl daemon-reload
+        firewall-cmd -q --permanent --add-port={{port}}/tcp; firewall-cmd -q --reload
+        touch /var/tmp/.ct-wait-seeded
+    - on: control
+      run: |
+        set -eu
+        p=/home/learner/exam/wait
+        install -d -o learner -g learner /home/learner/exam $p
+        cat > $p/inventory.yml <<'EOF'
+        dev:
+          hosts:
+            node1:
+        test:
+          hosts:
+            node2:
+        prod:
+          hosts:
+            node3:
+        balancers:
+          hosts:
+            node4:
+        webservers:
+          children:
+            prod:
+        EOF
+        printf '[defaults]\ninventory = inventory.yml\nremote_user = devops\n' > $p/ansible.cfg
+        printf '<h1>Orrin and Vale status board - {{site}}</h1>\n' > $p/dashboard.html
+        chown -R learner:learner $p
+        (cd $p && sha256sum dashboard.html > /var/tmp/.ct-wait-sha)
+        chmod 0444 /var/tmp/.ct-wait-sha
+  checks:
+    - id: page-served
+      description: The service answers on its status URL and serves the supplied dashboard page
+      type: shell
+      on: control
+      skills: [automation.control-flow.retries]
+      weight: 2
+      command: |
+        d=/home/learner/exam/wait
+        (cd $d && sha256sum -c /var/tmp/.ct-wait-sha >/dev/null 2>&1) || { echo supplied-file-changed; exit 0; }
+        [ "$(curl -s -m 8 -o /dev/null -w '%{http_code}' http://node3:{{port}}/status)" = 200 ] || { echo no-status; exit 0; }
+        [ "$(curl -s -m 8 http://node3:{{port}}/dashboard.html)" = "$(cat $d/dashboard.html)" ] && echo ok || echo no-page
+      expect: { match: exact, value: ok }
+    - id: unit-state
+      description: ov-slowapi is running and enabled at boot on node3
+      type: shell
+      on: node3
+      skills: [automation.modules.packages-services]
+      command: echo "$(systemctl is-active ov-slowapi) $(systemctl is-enabled ov-slowapi)"
+      expect: { match: exact, value: active enabled }
+    - id: retry-logic
+      description: wait.yml retries a uri task with until, at most 10 retries and a 5 second delay, before the page is copied
+      type: shell
+      on: control
+      skills: [automation.control-flow.retries]
+      weight: 2
+      command: |
+        /opt/ansible/bin/python3 - /home/learner/exam/wait/wait.yml <<'PY' 2>/dev/null || echo no-playbook
+        import sys, json, yaml
+        plays = yaml.safe_load(open(sys.argv[1])) or []
+        tasks = [t for p in plays for t in (p.get("tasks") or []) if isinstance(t, dict)]
+        w = [i for i, t in enumerate(tasks) if "until" in t and any(k in t for k in ("uri", "ansible.builtin.uri"))]
+        if not w:
+            print("no-until-uri"); sys.exit()
+        t = tasks[w[0]]
+        try:
+            ok = 1 <= int(t.get("retries", 3)) <= 10 and int(t.get("delay", 5)) == 5
+        except (TypeError, ValueError):
+            ok = False
+        later = any("dashboard" in json.dumps(x) for x in tasks[w[0] + 1:])
+        print("ok" if ok and later else "limits-or-order")
+        PY
+      expect: { match: exact, value: ok }
+  exam:
+    rerun:
+      - on: control
+        timeoutSec: 600
+        run: |
+          r=$(ct-ansible recap /home/learner/exam/wait wait.yml)
+          echo "$r"
+          [ "$r" = "changed=0 failed=0 unreachable=0" ]
+  misconceptions:
+    - id: fixed-pause
+      description: Sleeps for a fixed time instead of retrying until the service answers.
+      feedback: A fixed pause guesses how long the start takes; retry the status check until it succeeds, with a limit.
+      expectFail: [retry-logic]
+      mutation:
+        on: control
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/exam/wait
+          cat > wait.yml <<'EOF'
+          - hosts: prod
+            become: true
+            tasks:
+              - ansible.builtin.service: { name: ov-slowapi, state: started, enabled: true }
+              - ansible.builtin.pause: { seconds: 45 }
+              - ansible.builtin.copy: { src: dashboard.html, dest: /srv/ov-slow/dashboard.html }
+          EOF
+          ansible-playbook wait.yml
+    - id: retries-without-until
+      description: Sets retries and delay but no until condition, so nothing is retried.
+      feedback: retries and delay only apply together with an until condition on the registered result.
+      expectFail: [retry-logic]
+      mutation:
+        on: control
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/exam/wait
+          cat > wait.yml <<'EOF'
+          - hosts: prod
+            become: true
+            tasks:
+              - ansible.builtin.service: { name: ov-slowapi, state: started, enabled: true }
+              - ansible.builtin.uri: { url: "http://node3:{{port}}/status", status_code: 200 }
+                retries: 10
+                delay: 5
+              - ansible.builtin.copy: { src: dashboard.html, dest: /srv/ov-slow/dashboard.html }
+          EOF
+          ansible-playbook wait.yml || ansible-playbook wait.yml
+  solution:
+    explanation: |
+      The uri task registers its result and repeats until the status is 200, up to 10 retries
+      5 seconds apart; the copy comes after it in the task list, so it runs only when the service answers.
+    steps:
+      - on: control
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/exam/wait
+          cat > wait.yml <<'EOF'
+          - name: Slow status service
+            hosts: prod
+            become: true
+            tasks:
+              - name: Start the service
+                ansible.builtin.service:
+                  name: ov-slowapi
+                  state: started
+                  enabled: true
+              - name: Wait for the status URL
+                ansible.builtin.uri:
+                  url: "http://node3:{{port}}/status"
+                  status_code: 200
+                register: status
+                until: status.status == 200
+                retries: 10
+                delay: 5
+                changed_when: false
+              - name: Dashboard page
+                ansible.builtin.copy:
+                  src: dashboard.html
+                  dest: /srv/ov-slow/dashboard.html
+                  mode: "0644"
+          EOF
+          ansible-playbook wait.yml

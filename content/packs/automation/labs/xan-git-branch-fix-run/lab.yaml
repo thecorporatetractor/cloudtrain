@@ -1,0 +1,241 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xan-git-branch-fix-run
+  title: Fix a playbook on another branch and run it
+  domain: automation
+  frameworks: [ex294-aligned:git-devworkflow]
+  difficulty: medium
+  estimatedMinutes: 12
+  tags: [exam, ansible, git, branches, debugging]
+  version: 1
+spec:
+  description: |
+    **Exam environment.** You work as `learner` on the control node `control`. The
+    managed nodes are `node1` (group `dev`), `node2` (`test`), `node3` (`prod`, also in
+    `webservers`) and `node4` (`balancers`), all Enterprise Linux 10; the account
+    `devops` on every node accepts your SSH key and may use sudo without a password.
+    Packages come from each node's local repository. Every playbook you write is run
+    again by the grader (it must report no changes), then every node is rebooted before
+    the final checks.
+
+    The hotfix repository is **`/home/learner/git/hotfix.git`** (a bare repository on the
+    control node). Its branch **`hotfix`** holds a project with an inventory, an
+    `ansible.cfg` and the playbook `hotfix.yml`, which currently fails.
+
+    1. Clone the repository to **`/home/learner/exam/hotfix/repo`** and work on the branch
+       **`hotfix`**.
+    2. Find and fix the broken task in `hotfix.yml`.
+    3. Commit the fix with the message **`Fix the marker task - OV-{{ticket}}`** and push
+       the branch `hotfix` back to the repository. Leave `main` as it is.
+    4. Run the playbook from the clone so that its end state exists on the dev hosts.
+  objectives:
+    - Work on a branch of a shared repository and push a fix
+    - Debug a failing task and run the corrected playbook
+  params:
+    ticket:
+      type: int
+      min: 1000
+      max: 9999
+    marker:
+      type: int
+      min: 100
+      max: 999
+  topology:
+    entry: control
+    nodes:
+      - { name: control, driver: container, image: ansible-ctl:2.21, access: [shell] }
+      - { name: node1, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node2, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node3, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node4, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+  setup:
+    - on: node1
+      timeoutSec: 120
+      run: &exam-node |
+        set -eu
+        id devops >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Exam automation" devops
+        install -d -m 0700 -o devops -g devops /home/devops/.ssh
+        install -m 0600 -o devops -g devops /home/learner/.ssh/authorized_keys /home/devops/.ssh/authorized_keys
+        printf 'devops ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/devops
+        chmod 0440 /etc/sudoers.d/devops
+    - { on: node2, timeoutSec: 120, run: *exam-node }
+    - { on: node3, timeoutSec: 120, run: *exam-node }
+    - { on: node4, timeoutSec: 120, run: *exam-node }
+    - on: control
+      run: |
+        set -eu
+        export HOME=/root
+        install -d -o learner -g learner /home/learner/git /home/learner/exam /home/learner/exam/hotfix
+        if [ ! -d /home/learner/git/hotfix.git ]; then
+        git init -q --bare -b main /home/learner/git/hotfix.git
+        t=$(mktemp -d); p=$t; git -C $t init -q -b main
+        printf '# Orrin and Vale hotfix project\n' > $t/README.md
+        git -C $t add README.md
+        git -C $t -c user.name=examiner -c user.email=examiner@orrinvale.example commit -q -m "Initial commit"
+        git -C $t rev-parse HEAD > /var/tmp/.ct-hotfix-main
+        git -C $t switch -q -c hotfix
+        cat > $p/inventory.yml <<'EOF'
+        dev:
+          hosts:
+            node1:
+        test:
+          hosts:
+            node2:
+        prod:
+          hosts:
+            node3:
+        balancers:
+          hosts:
+            node4:
+        webservers:
+          children:
+            prod:
+        EOF
+        printf '[defaults]\ninventory = inventory.yml\nremote_user = devops\n' > $t/ansible.cfg
+        cat > $t/hotfix.yml <<'EOF'
+        - name: Apply the hotfix marker
+          hosts: dev
+          become: true
+          tasks:
+            - name: Hotfix marker file
+              ansible.builtin.copy:
+                destination: /etc/ov-hotfix
+                content: "hotfix {{marker}}\n"
+                mode: "0644"
+        EOF
+        git -C $t add -A
+        git -C $t -c user.name=examiner -c user.email=examiner@orrinvale.example commit -q -m "Add the hotfix playbook"
+        git -C $t rev-parse HEAD > /var/tmp/.ct-hotfix-base
+        git -C $t push -q /home/learner/git/hotfix.git main hotfix
+        chmod 0444 /var/tmp/.ct-hotfix-main /var/tmp/.ct-hotfix-base
+        rm -rf $t
+        fi
+        chown -R learner:learner /home/learner/git /home/learner/exam/hotfix
+  checks:
+    - id: branch-pushed
+      description: Branch hotfix carries a new commit on top of the original history with the required message and a repaired task
+      type: shell
+      on: control
+      skills: [automation.devworkflow.git]
+      weight: 2
+      command: |
+        ct-ansible run /home/learner bash -s <<'SH'
+        g="git --git-dir=/home/learner/git/hotfix.git"
+        base=$(cat /var/tmp/.ct-hotfix-base)
+        $g rev-parse -q --verify refs/heads/hotfix >/dev/null || { echo no-branch; exit 0; }
+        tip=$($g rev-parse hotfix)
+        [ "$tip" != "$base" ] || { echo not-pushed; exit 0; }
+        $g merge-base --is-ancestor $base $tip || { echo history-rewritten; exit 0; }
+        [ "$($g log -1 --format=%s hotfix)" = "Fix the marker task - OV-{{ticket}}" ] && m=msg-ok || m=msg-differs
+        $g show hotfix:hotfix.yml | grep -qE '^[[:space:]]*destination:' && f=still-broken || f=fixed
+        echo "$m $f"
+        SH
+      expect: { match: exact, value: msg-ok fixed }
+    - id: main-untouched
+      description: The branch main still points at its original commit
+      type: shell
+      on: control
+      skills: [automation.devworkflow.git]
+      command: |
+        ct-ansible run /home/learner bash -s <<'SH'
+        [ "$(git --git-dir=/home/learner/git/hotfix.git rev-parse main)" = "$(cat /var/tmp/.ct-hotfix-main)" ] && echo unchanged || echo moved
+        SH
+      expect: { match: exact, value: unchanged }
+    - id: clone-state
+      description: The clone is on branch hotfix, has nothing uncommitted and matches the pushed branch
+      type: shell
+      on: control
+      skills: [automation.devworkflow.git]
+      command: |
+        c=/home/learner/exam/hotfix/repo
+        [ -d $c/.git ] || { echo no-clone; exit 0; }
+        ct-ansible run $c bash -s <<'SH'
+        b=$(git rev-parse --abbrev-ref HEAD)
+        [ "$(git status --porcelain | wc -l)" = 0 ] && s=clean || s=dirty
+        [ "$(git rev-parse HEAD)" = "$(git --git-dir=/home/learner/git/hotfix.git rev-parse hotfix)" ] && y=synced || y=unsynced
+        echo "$b $s $y"
+        SH
+      expect: { match: exact, value: hotfix clean synced }
+    - id: marker-node1
+      description: node1 has the marker file the playbook creates
+      type: shell
+      on: node1
+      skills: [automation.quality.debugging]
+      weight: 2
+      command: cat /etc/ov-hotfix 2>/dev/null || echo missing
+      expect: { match: exact, value: "hotfix {{marker}}" }
+    - id: marker-node2
+      description: node2 has no marker file
+      type: shell
+      on: node2
+      skills: [automation.quality.debugging]
+      command: &no-marker '[ -e /etc/ov-hotfix ] && echo present || echo absent'
+      expect: { match: exact, value: absent }
+    - { id: marker-node3, description: "node3 has no marker file", type: shell, on: node3, skills: [automation.quality.debugging], command: *no-marker, expect: { match: exact, value: absent } }
+    - { id: marker-node4, description: "node4 has no marker file", type: shell, on: node4, skills: [automation.quality.debugging], command: *no-marker, expect: { match: exact, value: absent } }
+  exam:
+    rerun:
+      - on: control
+        timeoutSec: 600
+        run: |
+          r=$(ct-ansible recap /home/learner/exam/hotfix/repo hotfix.yml)
+          echo "$r"
+          [ "$r" = "changed=0 failed=0 unreachable=0" ]
+  misconceptions:
+    - id: never-pushed
+      description: Fixes and commits locally, runs the playbook, but never pushes the branch.
+      feedback: The fix exists only in the clone; push the branch hotfix back to the repository.
+      expectFail: [branch-pushed, clone-state]
+      mutation:
+        on: control
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          rm -rf ~/exam/hotfix/repo
+          git clone -q ~/git/hotfix.git ~/exam/hotfix/repo
+          cd ~/exam/hotfix/repo
+          git config user.name learner && git config user.email learner@orrinvale.example
+          git switch -q hotfix
+          sed -i 's/destination:/dest:/' hotfix.yml
+          git commit -qam "Fix the marker task - OV-{{ticket}}"
+          ansible-playbook hotfix.yml
+    - id: pushed-to-main
+      description: Pushes the fixed branch over main.
+      feedback: Only the branch hotfix receives the fix; main must stay untouched.
+      expectFail: [main-untouched]
+      mutation:
+        on: control
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          rm -rf ~/exam/hotfix/repo
+          git clone -q ~/git/hotfix.git ~/exam/hotfix/repo
+          cd ~/exam/hotfix/repo
+          git config user.name learner && git config user.email learner@orrinvale.example
+          git switch -q hotfix
+          sed -i 's/destination:/dest:/' hotfix.yml
+          git commit -qam "Fix the marker task - OV-{{ticket}}"
+          git push -q origin hotfix:main
+          ansible-playbook hotfix.yml
+  solution:
+    explanation: |
+      Running the playbook shows the module rejecting the parameter destination; the copy
+      module calls it dest. Commit on hotfix, push the branch and run the playbook from the clone.
+    steps:
+      - on: control
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          rm -rf ~/exam/hotfix/repo
+          git clone -q ~/git/hotfix.git ~/exam/hotfix/repo
+          cd ~/exam/hotfix/repo
+          git config user.name learner && git config user.email learner@orrinvale.example
+          git switch -q hotfix
+          sed -i 's/destination:/dest:/' hotfix.yml
+          git commit -qam "Fix the marker task - OV-{{ticket}}"
+          git push -q origin hotfix
+          ansible-playbook hotfix.yml

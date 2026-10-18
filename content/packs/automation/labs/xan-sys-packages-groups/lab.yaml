@@ -1,0 +1,273 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xan-sys-packages-groups
+  title: Install packages and package groups by host group
+  domain: automation
+  frameworks: [ex294-aligned:automate-system-tasks]
+  difficulty: easy
+  estimatedMinutes: 10
+  tags: [exam, ansible, packages, groups, updates]
+  version: 1
+spec:
+  description: |
+    **Exam environment.** You work as `learner` on the control node `control`. The
+    managed nodes are `node1` (group `dev`), `node2` (`test`), `node3` (`prod`, also in
+    `webservers`) and `node4` (`balancers`), all Enterprise Linux 10; the account
+    `devops` on every node accepts your SSH key and may use sudo without a password.
+    Packages come from each node's local repository. Every playbook you write is run
+    again by the grader (it must report no changes), then every node is rebooted before
+    the final checks.
+
+    Every node has a local repository with a package group named
+    **`Development Tools`** next to the usual packages. An update is waiting for the dev host.
+
+    Write the playbook **`/home/learner/exam/packages/packages.yml`** (the directory has an
+    inventory and an `ansible.cfg` with the remote user `devops`) that:
+
+    - installs **`mariadb-server`** and **`httpd`** on the **dev**, **test** and **prod**
+      hosts;
+    - installs the package **group `Development Tools`** on the **dev** hosts **only**;
+    - updates **every** installed package on the **dev** hosts to the latest version the
+      repositories offer.
+
+    Run it. A second run must report no changes.
+  objectives:
+    - Install packages and package groups on selected host groups
+    - Update all packages on a host group
+  params:
+    site:
+      type: choice
+      values: [Leeds, Bristol, Cardiff, York]
+  topology:
+    entry: control
+    nodes:
+      - { name: control, driver: container, image: ansible-ctl:2.21, access: [shell] }
+      - { name: node1, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node2, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node3, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node4, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+  setup:
+    - on: node1
+      timeoutSec: 120
+      run: &exam-node |
+        set -eu
+        id devops >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Exam automation" devops
+        install -d -m 0700 -o devops -g devops /home/devops/.ssh
+        install -m 0600 -o devops -g devops /home/learner/.ssh/authorized_keys /home/devops/.ssh/authorized_keys
+        printf 'devops ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/devops
+        chmod 0440 /etc/sudoers.d/devops
+    - { on: node2, timeoutSec: 120, run: *exam-node }
+    - { on: node3, timeoutSec: 120, run: *exam-node }
+    - { on: node4, timeoutSec: 120, run: *exam-node }
+    - on: node1
+      timeoutSec: 900
+      run: &groups |
+        set -eu
+        [ -f /var/tmp/.ct-packages-seeded ] && exit 0
+        dnf -y -q install createrepo_c >/dev/null
+        mkdir -p /opt/ov-groups
+        cat > /opt/ov-comps.xml <<'XML'
+        <?xml version="1.0" encoding="UTF-8"?>
+        <comps>
+          <group>
+            <id>development</id>
+            <name>Development Tools</name>
+            <description>Compilers and build tools for {{site}}</description>
+            <default>false</default>
+            <uservisible>true</uservisible>
+            <packagelist>
+              <packagereq type="mandatory">gcc</packagereq>
+              <packagereq type="mandatory">make</packagereq>
+              <packagereq type="default">git</packagereq>
+              <packagereq type="default">patch</packagereq>
+            </packagelist>
+          </group>
+        </comps>
+        XML
+        case "$(hostname)" in
+        node1*)
+          dnf -y -q install rpm-build >/dev/null
+          b=$(mktemp -d)
+          for v in 1.0 2.0; do
+            cat > $b/p$v.spec <<SPEC
+        Name: ov-probe
+        Version: $v
+        Release: 1
+        Summary: Orrin and Vale update probe
+        License: MIT
+        BuildArch: noarch
+        %description
+        Marker package for the update task.
+        %install
+        install -d %{buildroot}/usr/share/ov-probe
+        echo $v > %{buildroot}/usr/share/ov-probe/version
+        %files
+        /usr/share/ov-probe/version
+        SPEC
+            rpmbuild -bb --define "_topdir $b/top" $b/p$v.spec >/dev/null 2>&1
+          done
+          rpm -i $b/top/RPMS/noarch/ov-probe-1.0-1.noarch.rpm
+          cp $b/top/RPMS/noarch/ov-probe-2.0-1.noarch.rpm /opt/ov-groups/
+          rm -rf $b ;;
+        esac
+        createrepo_c -q -g /opt/ov-comps.xml /opt/ov-groups
+        printf '[ov-groups]\nname=Orrin and Vale package groups\nbaseurl=file:///opt/ov-groups\nenabled=1\ngpgcheck=0\n' > /etc/yum.repos.d/ov-groups.repo
+        dnf -q makecache >/dev/null 2>&1 || true
+        touch /var/tmp/.ct-packages-seeded
+    - { on: node2, timeoutSec: 900, run: *groups }
+    - { on: node3, timeoutSec: 900, run: *groups }
+    - { on: node4, timeoutSec: 900, run: *groups }
+    - on: control
+      run: |
+        set -eu
+        p=/home/learner/exam/packages
+        install -d -o learner -g learner /home/learner/exam $p
+        cat > $p/inventory.yml <<'EOF'
+        dev:
+          hosts:
+            node1:
+        test:
+          hosts:
+            node2:
+        prod:
+          hosts:
+            node3:
+        balancers:
+          hosts:
+            node4:
+        webservers:
+          children:
+            prod:
+        EOF
+        printf '[defaults]\ninventory = inventory.yml\nremote_user = devops\n' > $p/ansible.cfg
+        chown -R learner:learner $p
+  checks:
+    - id: dev-packages
+      description: node1 has the database server, the web server and the whole Development Tools group installed as a group
+      type: shell
+      on: node1
+      skills: [automation.modules.packages-services]
+      weight: 2
+      command: |
+        for p in mariadb-server httpd gcc make git patch; do rpm -q $p >/dev/null 2>&1 || { echo "missing $p"; exit 0; }; done
+        dnf -q group list --installed 2>/dev/null | grep -q 'Development Tools' && echo ok || echo "not-installed-as-group"
+      expect: { match: exact, value: ok }
+    - id: dev-updated
+      description: node1 has no pending updates left
+      type: shell
+      on: node1
+      skills: [automation.modules.packages-services]
+      weight: 2
+      timeoutSec: 120
+      command: |
+        dnf -q check-update >/dev/null 2>&1; rc=$?
+        echo "$(rpm -q --qf '%{VERSION}' ov-probe) $rc"
+      expect: { match: exact, value: "2.0 0" }
+    - id: node2-state
+      description: node2 has the database server and the web server, and the Development Tools group is not installed
+      type: shell
+      on: node2
+      skills: [automation.modules.packages-services]
+      weight: 2
+      command: &no-group |
+        for p in mariadb-server httpd; do rpm -q $p >/dev/null 2>&1 || { echo "missing $p"; exit 0; }; done
+        dnf -q group list --installed 2>/dev/null | grep -q 'Development Tools' && echo group-present || echo ok
+      expect: { match: exact, value: ok }
+    - { id: node3-state, description: "node3 has the database server and the web server and the Development Tools group is not installed", type: shell, on: node3, skills: [automation.modules.packages-services], weight: 2, command: *no-group, expect: { match: exact, value: ok } }
+    - id: node4-untouched
+      description: node4 has neither the database server nor the Development Tools group
+      type: shell
+      on: node4
+      skills: [automation.modules.packages-services]
+      command: |
+        rpm -q mariadb-server >/dev/null 2>&1 && m=mariadb || m=no-mariadb
+        dnf -q group list --installed 2>/dev/null | grep -q 'Development Tools' && g=group || g=no-group
+        echo "$m $g"
+      expect: { match: exact, value: no-mariadb no-group }
+  exam:
+    rerun:
+      - on: control
+        timeoutSec: 900
+        run: |
+          r=$(ct-ansible recap /home/learner/exam/packages packages.yml)
+          echo "$r"
+          [ "$r" = "changed=0 failed=0 unreachable=0" ]
+  misconceptions:
+    - id: group-everywhere
+      description: Installs the Development Tools group on every host.
+      feedback: The group belongs on the dev hosts only; limit that task to the dev group.
+      expectFail: [node2-state, node3-state]
+      mutation:
+        on: control
+        as: learner
+        timeoutSec: 900
+        run: |
+          set -e
+          cd ~/exam/packages
+          cat > packages.yml <<'EOF'
+          - hosts: dev:test:prod
+            become: true
+            tasks:
+              - ansible.builtin.dnf: { name: [mariadb-server, httpd, "@Development Tools"], state: present }
+              - ansible.builtin.dnf: { name: "*", state: latest }
+          EOF
+          ansible-playbook packages.yml
+    - id: no-update
+      description: Installs everything requested but never updates the installed packages.
+      feedback: The dev hosts also need all installed packages brought to the latest version.
+      expectFail: [dev-updated]
+      mutation:
+        on: control
+        as: learner
+        timeoutSec: 900
+        run: |
+          set -e
+          cd ~/exam/packages
+          cat > packages.yml <<'EOF'
+          - hosts: dev:test:prod
+            become: true
+            tasks:
+              - ansible.builtin.dnf: { name: [mariadb-server, httpd], state: present }
+          - hosts: dev
+            become: true
+            tasks:
+              - ansible.builtin.dnf: { name: "@Development Tools", state: present }
+          EOF
+          ansible-playbook packages.yml
+  solution:
+    explanation: |
+      One play installs the two packages on dev, test and prod; a second play for dev installs the
+      group with the @ prefix and updates everything with name "*" and state latest.
+    steps:
+      - on: control
+        as: learner
+        timeoutSec: 900
+        run: |
+          set -e
+          cd ~/exam/packages
+          cat > packages.yml <<'EOF'
+          - name: Database and web server
+            hosts: dev:test:prod
+            become: true
+            tasks:
+              - name: Packages
+                ansible.builtin.dnf:
+                  name:
+                    - mariadb-server
+                    - httpd
+                  state: present
+          - name: Development hosts
+            hosts: dev
+            become: true
+            tasks:
+              - name: Development Tools group
+                ansible.builtin.dnf:
+                  name: "@Development Tools"
+                  state: present
+              - name: Update everything
+                ansible.builtin.dnf:
+                  name: "*"
+                  state: latest
+          EOF
+          ansible-playbook packages.yml

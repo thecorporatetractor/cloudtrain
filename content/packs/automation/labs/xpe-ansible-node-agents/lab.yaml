@@ -1,0 +1,261 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xpe-ansible-node-agents
+  title: Roll the node agent out to the build fleet
+  domain: automation
+  frameworks: [ct-platform:config-automation]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [exam, capstone, ansible, apt, systemd, handlers, idempotency]
+  version: 1
+spec:
+  description: |
+    **Directory:** `~/exam/node-agents` · **Hosts:** `qm-build-1`, `qm-build-2` (group `builders`)
+
+    Quillmoor Logistics runs a small telemetry agent on its build hosts. You work as
+    `learner` on the workstation; the account `devops` on both hosts accepts your SSH key
+    and may use sudo without a password. Both hosts carry a local apt repository with the
+    package **`qm-node-agent`**. Every playbook you write is run again by the grader (it
+    must report no changes, and must not restart the agent).
+
+    The project directory has an inventory (group `builders`, with the variables
+    `agent_endpoint` and `agent_interval`) and an `ansible.cfg` with the remote user
+    `devops`. Write the playbook **`node-agents.yml`** that, on the **builders** group:
+
+    - refreshes the apt cache and installs **`qm-node-agent`** from the local repository;
+    - renders **`/etc/qm-node-agent/agent.conf`** (root, mode `0644`) from a template,
+      with exactly these three lines, taken from the inventory:
+
+      ```
+      endpoint=<agent_endpoint>
+      interval=<agent_interval>
+      node=<the inventory host name>
+      ```
+
+    - starts the service **`qm-node-agent`** and enables it at boot; the service refuses to
+      start until the configuration file exists;
+    - restarts the service **through a handler**, so that it restarts only when the
+      configuration really changed.
+
+    Run it.
+  objectives:
+    - Install a package from a local apt repository and template its configuration from inventory variables
+    - Restart a service only when its configuration changes
+  params:
+    port:
+      type: choice
+      values: ["8443", "9443"]
+    interval:
+      type: int
+      min: 10
+      max: 60
+  topology:
+    entry: workstation
+    nodes:
+      - { name: workstation, driver: container, image: ansible-ctl:2.21, access: [shell] }
+      - { name: qm-build-1, driver: vm, image: ubuntu-vm:24.04, resources: { cpu: 1, memoryMiB: 1280 }, access: [ssh] }
+      - { name: qm-build-2, driver: vm, image: ubuntu-vm:24.04, resources: { cpu: 1, memoryMiB: 1280 }, access: [ssh] }
+  setup:
+    - on: qm-build-1
+      timeoutSec: 600
+      run: &qm-host |
+        set -eu
+        id devops >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Exam automation" devops
+        install -d -m 0700 -o devops -g devops /home/devops/.ssh
+        install -m 0600 -o devops -g devops /home/learner/.ssh/authorized_keys /home/devops/.ssh/authorized_keys
+        printf 'devops ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/devops
+        chmod 0440 /etc/sudoers.d/devops
+        [ -f /var/tmp/.ct-qmagent-seeded ] && exit 0
+        # ubuntu-vm: cloud-init re-creates the online ubuntu.sources at first boot; keep apt offline (local repos only)
+        if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then mv /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list.d/ubuntu.sources.cloud-init; rm -rf /var/lib/apt/lists/*; fi
+        apt-get update -q >/dev/null
+        apt-get install -y -q --no-install-recommends dpkg-dev >/dev/null
+        d=$(mktemp -d)/qm-node-agent_1.0
+        mkdir -p $d/DEBIAN $d/usr/bin $d/usr/lib/systemd/system
+        printf '#!/bin/sh\nwhile true; do date +%%s > /run/qm-node-agent.beat; sleep 5; done\n' > $d/usr/bin/qm-node-agent
+        chmod 0755 $d/usr/bin/qm-node-agent
+        printf '[Unit]\nDescription=Quillmoor node agent\nConditionPathExists=/etc/qm-node-agent/agent.conf\n[Service]\nExecStart=/usr/bin/qm-node-agent\nRestart=on-failure\n[Install]\nWantedBy=multi-user.target\n' > $d/usr/lib/systemd/system/qm-node-agent.service
+        printf 'Package: qm-node-agent\nVersion: 1.0\nArchitecture: all\nMaintainer: Quillmoor Platform <platform@quillmoor.example>\nDescription: Quillmoor node telemetry agent\n' > $d/DEBIAN/control
+        mkdir -p /opt/qm-repo
+        dpkg-deb -b --root-owner-group $d /opt/qm-repo/qm-node-agent_1.0_all.deb >/dev/null
+        (cd /opt/qm-repo && dpkg-scanpackages . /dev/null > Packages 2>/dev/null && gzip -kf Packages)
+        echo 'deb [trusted=yes] file:/opt/qm-repo ./' > /etc/apt/sources.list.d/qm-local.list
+        apt-get update -q >/dev/null
+        touch /var/tmp/.ct-qmagent-seeded
+    - { on: qm-build-2, timeoutSec: 600, run: *qm-host }
+    - on: workstation
+      run: |
+        set -eu
+        p=/home/learner/exam/node-agents
+        install -d -o learner -g learner /home/learner/exam $p
+        cat > $p/inventory.yml <<'EOF'
+        builders:
+          hosts:
+            qm-build-1:
+            qm-build-2:
+          vars:
+            agent_endpoint: https://telemetry.quillmoor.example:{{port}}
+            agent_interval: {{interval}}
+        EOF
+        printf '[defaults]\ninventory = inventory.yml\nremote_user = devops\n' > $p/ansible.cfg
+        chown -R learner:learner $p
+  checks:
+    - id: config-build-1
+      description: qm-build-1 has the agent configuration with the three required lines taken from the inventory
+      type: shell
+      on: qm-build-1
+      skills: [automation.content.templates, linux.packages.apt]
+      weight: 2
+      command: |
+        echo "$(stat -c '%U %a' /etc/qm-node-agent/agent.conf 2>/dev/null) $(paste -sd';' /etc/qm-node-agent/agent.conf 2>/dev/null)"
+      expect: { match: exact, value: "root 644 endpoint=https://telemetry.quillmoor.example:{{port}};interval={{interval}};node=qm-build-1" }
+    - id: config-build-2
+      description: qm-build-2 has the agent configuration with the three required lines taken from the inventory
+      type: shell
+      on: qm-build-2
+      skills: [automation.content.templates, linux.packages.apt]
+      weight: 2
+      command: |
+        echo "$(stat -c '%U %a' /etc/qm-node-agent/agent.conf 2>/dev/null) $(paste -sd';' /etc/qm-node-agent/agent.conf 2>/dev/null)"
+      expect: { match: exact, value: "root 644 endpoint=https://telemetry.quillmoor.example:{{port}};interval={{interval}};node=qm-build-2" }
+    - id: service-build-1
+      description: qm-build-1 has the package installed and the agent running and enabled
+      type: shell
+      on: qm-build-1
+      skills: [linux.systemd.units]
+      weight: 2
+      command: &agent-svc |
+        echo "$(dpkg-query -W -f '${db:Status-Status}' qm-node-agent 2>/dev/null || echo missing) $(systemctl is-active qm-node-agent) $(systemctl is-enabled qm-node-agent)"
+      expect: { match: exact, value: installed active enabled }
+    - { id: service-build-2, description: "qm-build-2 has the package installed and the agent running and enabled", type: shell, on: qm-build-2, skills: [linux.systemd.units], weight: 2, command: *agent-svc, expect: { match: exact, value: installed active enabled } }
+    - id: uses-handler
+      description: node-agents.yml restarts the agent from a handler that a task notifies
+      type: shell
+      on: workstation
+      skills: [automation.control-flow.handlers]
+      command: |
+        /opt/ansible/bin/python3 - /home/learner/exam/node-agents/node-agents.yml <<'PY' 2>/dev/null || echo no-playbook
+        import sys, yaml
+        plays = yaml.safe_load(open(sys.argv[1])) or []
+        def notifies(tasks):
+            for t in tasks or []:
+                if isinstance(t, dict) and (t.get("notify") or any(notifies(t.get(k)) for k in ("block", "rescue", "always"))):
+                    return True
+            return False
+        print("ok" if any(p.get("handlers") and notifies(p.get("tasks")) for p in plays) else "no-handler")
+        PY
+      expect: { match: exact, value: ok }
+  exam:
+    rerun:
+      - on: workstation
+        timeoutSec: 600
+        run: |
+          pids() { for h in qm-build-1 qm-build-2; do ct-ansible run /home/learner/exam/node-agents ssh -o BatchMode=yes devops@$h systemctl show -p MainPID --value qm-node-agent; done | tr '\n' ' '; }
+          before=$(pids)
+          r=$(ct-ansible recap /home/learner/exam/node-agents node-agents.yml)
+          after=$(pids)
+          stable=no; [ -n "$(echo $before)" ] && [ "$before" = "$after" ] && stable=yes
+          echo "$r pid-stable=$stable"
+          [ "$r" = "changed=0 failed=0 unreachable=0" ] && [ "$stable" = yes ]
+  misconceptions:
+    - id: restart-task
+      description: Restarts the agent with an ordinary task on every run instead of a handler.
+      feedback: A restart task always restarts and always reports a change; a handler runs only when the notifying task changed something.
+      expectFail: [uses-handler]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/exam/node-agents
+          mkdir -p templates
+          printf 'endpoint={{ agent_endpoint }}\ninterval={{ agent_interval }}\nnode={{ inventory_hostname }}\n' > templates/agent.conf.j2
+          cat > node-agents.yml <<'EOF'
+          - hosts: builders
+            become: true
+            tasks:
+              - ansible.builtin.apt: { name: qm-node-agent, state: present, update_cache: true }
+              - ansible.builtin.file: { path: /etc/qm-node-agent, state: directory }
+              - ansible.builtin.template: { src: agent.conf.j2, dest: /etc/qm-node-agent/agent.conf, mode: "0644" }
+              - ansible.builtin.service: { name: qm-node-agent, state: restarted, enabled: true }
+          EOF
+          ansible-playbook node-agents.yml
+    - id: missing-interval
+      description: Renders the configuration without the interval line.
+      feedback: The file needs all three lines, and every value must come from the inventory variables.
+      expectFail: [config-build-1, config-build-2]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/exam/node-agents
+          mkdir -p templates
+          printf 'endpoint={{ agent_endpoint }}\nnode={{ inventory_hostname }}\n' > templates/agent.conf.j2
+          cat > node-agents.yml <<'EOF'
+          - hosts: builders
+            become: true
+            tasks:
+              - ansible.builtin.apt: { name: qm-node-agent, state: present, update_cache: true }
+              - ansible.builtin.file: { path: /etc/qm-node-agent, state: directory }
+              - ansible.builtin.template: { src: agent.conf.j2, dest: /etc/qm-node-agent/agent.conf, mode: "0644" }
+                notify: Restart agent
+              - ansible.builtin.service: { name: qm-node-agent, state: started, enabled: true }
+            handlers:
+              - name: Restart agent
+                ansible.builtin.service: { name: qm-node-agent, state: restarted }
+          EOF
+          ansible-playbook node-agents.yml
+  solution:
+    explanation: |
+      The apt task installs from the local repository, the template task renders the three lines
+      from inventory variables and notifies the handler, and the service is started and enabled.
+      The unit only starts once the configuration exists, so the directory and file come first.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/exam/node-agents
+          mkdir -p templates
+          printf 'endpoint={{ agent_endpoint }}\ninterval={{ agent_interval }}\nnode={{ inventory_hostname }}\n' > templates/agent.conf.j2
+          cat > node-agents.yml <<'EOF'
+          - name: Node agent on the build fleet
+            hosts: builders
+            become: true
+            tasks:
+              - name: Agent package
+                ansible.builtin.apt:
+                  name: qm-node-agent
+                  state: present
+                  update_cache: true
+                  cache_valid_time: 3600
+              - name: Agent configuration directory
+                ansible.builtin.file:
+                  path: /etc/qm-node-agent
+                  state: directory
+                  mode: "0755"
+              - name: Agent configuration
+                ansible.builtin.template:
+                  src: agent.conf.j2
+                  dest: /etc/qm-node-agent/agent.conf
+                  owner: root
+                  group: root
+                  mode: "0644"
+                notify: Restart agent
+              - name: Agent running and enabled
+                ansible.builtin.service:
+                  name: qm-node-agent
+                  state: started
+                  enabled: true
+            handlers:
+              - name: Restart agent
+                ansible.builtin.service:
+                  name: qm-node-agent
+                  state: restarted
+          EOF
+          ansible-playbook node-agents.yml

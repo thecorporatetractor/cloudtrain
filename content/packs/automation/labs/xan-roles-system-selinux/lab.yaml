@@ -1,0 +1,218 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xan-roles-system-selinux
+  title: Set the SELinux state with the platform's supported role
+  domain: automation
+  frameworks: [ex294-aligned:roles-collections]
+  difficulty: medium
+  estimatedMinutes: 12
+  tags: [exam, ansible, roles, collections, selinux]
+  version: 1
+spec:
+  description: |
+    **Exam environment.** You work as `learner` on the control node `control`. The
+    managed nodes are `node1` (group `dev`), `node2` (`test`), `node3` (`prod`, also in
+    `webservers`) and `node4` (`balancers`), all Enterprise Linux 10; the account
+    `devops` on every node accepts your SSH key and may use sudo without a password.
+    Packages come from each node's local repository. Every playbook you write is run
+    again by the grader (it must report no changes), then every node is rebooted before
+    the final checks.
+
+    The collection `fedora.linux_system_roles` is installed on the control node and
+    provides the **`selinux`** role.
+
+    Write the playbook **`/home/learner/exam/selinux/selinux.yml`** (the directory has an
+    inventory and an `ansible.cfg` with the remote user `devops`) that uses that role on
+    **all** nodes so that:
+
+    - SELinux is in **enforcing** mode with the **targeted** policy, now and after a reboot;
+    - the boolean **`httpd_can_network_connect`** is **on**, persistently;
+    - the file context rule that labels **`/srv/{{dir}}(/.*)?`** as **`httpd_sys_content_t`**
+      exists, and the directory **`/srv/{{dir}}`** carries that label.
+
+    The directory exists already. Run the playbook; a second run must report no changes.
+  objectives:
+    - Use a system role from an installed collection to manage SELinux
+    - Set mode, booleans and file contexts persistently through one role
+  params:
+    dir:
+      type: choice
+      values: [portal, intake, claims-docs, quotes]
+  topology:
+    entry: control
+    nodes:
+      - { name: control, driver: container, image: ansible-ctl:2.21, access: [shell] }
+      - { name: node1, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node2, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node3, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node4, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+  setup:
+    - on: node1
+      timeoutSec: 120
+      run: &exam-node |
+        set -eu
+        id devops >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Exam automation" devops
+        install -d -m 0700 -o devops -g devops /home/devops/.ssh
+        install -m 0600 -o devops -g devops /home/learner/.ssh/authorized_keys /home/devops/.ssh/authorized_keys
+        printf 'devops ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/devops
+        chmod 0440 /etc/sudoers.d/devops
+    - { on: node2, timeoutSec: 120, run: *exam-node }
+    - { on: node3, timeoutSec: 120, run: *exam-node }
+    - { on: node4, timeoutSec: 120, run: *exam-node }
+    - on: control
+      run: |
+        set -eu
+        c=/usr/share/ansible/collections/ansible_collections/fedora/linux_system_roles
+        [ -d "$c" ] || { echo "fedora.linux_system_roles is not installed on this control node; this task cannot run in this image" >&2; exit 1; }
+        p=/home/learner/exam/selinux
+        install -d -o learner -g learner /home/learner/exam $p
+        cat > $p/inventory.yml <<'EOF'
+        dev:
+          hosts:
+            node1:
+        test:
+          hosts:
+            node2:
+        prod:
+          hosts:
+            node3:
+        balancers:
+          hosts:
+            node4:
+        webservers:
+          children:
+            prod:
+        EOF
+        printf '[defaults]\ninventory = inventory.yml\nremote_user = devops\n' > $p/ansible.cfg
+        chown -R learner:learner $p
+    - on: node1
+      timeoutSec: 120
+      run: &srvdir |
+        set -eu
+        [ -f /var/tmp/.ct-selinux-seeded ] && exit 0
+        rpm -q policycoreutils-python-utils >/dev/null 2>&1 || dnf -y -q install policycoreutils-python-utils >/dev/null
+        install -d /srv/{{dir}}
+        touch /var/tmp/.ct-selinux-seeded
+    - { on: node2, timeoutSec: 120, run: *srvdir }
+    - { on: node3, timeoutSec: 120, run: *srvdir }
+    - { on: node4, timeoutSec: 120, run: *srvdir }
+  checks:
+    - id: state-node1
+      description: node1 is enforcing with the targeted policy in the configuration too, the boolean is on persistently and the directory carries the web content label through a file context rule
+      type: shell
+      on: node1
+      skills: [automation.reuse.system-roles, automation.modules.firewall-selinux]
+      weight: 2
+      command: &se-state |
+        a=$(getenforce)
+        c=$(grep -E '^SELINUX=' /etc/selinux/config | cut -d= -f2)
+        t=$(grep -E '^SELINUXTYPE=' /etc/selinux/config | cut -d= -f2)
+        b=$(semanage boolean -l 2>/dev/null | awk '$1 == "httpd_can_network_connect" {print $2 $3 $4}')
+        r=$(semanage fcontext -l -C 2>/dev/null | grep -c '^/srv/{{dir}}(/\.\*)?[[:space:]].*httpd_sys_content_t')
+        l=$(ls -dZ /srv/{{dir}} | grep -c httpd_sys_content_t)
+        echo "$a $c $t $b rules=$r label=$l"
+      expect: { match: exact, value: "Enforcing enforcing targeted (on,on) rules=1 label=1" }
+    - { id: state-node2, description: "node2 is enforcing with the targeted policy in the configuration too and has the boolean and the file context set", type: shell, on: node2, skills: [automation.reuse.system-roles, automation.modules.firewall-selinux], weight: 2, command: *se-state, expect: { match: exact, value: "Enforcing enforcing targeted (on,on) rules=1 label=1" } }
+    - { id: state-node3, description: "node3 is enforcing with the targeted policy in the configuration too and has the boolean and the file context set", type: shell, on: node3, skills: [automation.reuse.system-roles, automation.modules.firewall-selinux], weight: 2, command: *se-state, expect: { match: exact, value: "Enforcing enforcing targeted (on,on) rules=1 label=1" } }
+    - { id: state-node4, description: "node4 is enforcing with the targeted policy in the configuration too and has the boolean and the file context set", type: shell, on: node4, skills: [automation.reuse.system-roles, automation.modules.firewall-selinux], weight: 2, command: *se-state, expect: { match: exact, value: "Enforcing enforcing targeted (on,on) rules=1 label=1" } }
+    - id: uses-role
+      description: selinux.yml uses the selinux role from the collection
+      type: shell
+      on: control
+      skills: [automation.reuse.system-roles]
+      command: |
+        /opt/ansible/bin/python3 - /home/learner/exam/selinux/selinux.yml <<'PY' 2>/dev/null || echo no-playbook
+        import sys, yaml
+        plays = yaml.safe_load(open(sys.argv[1])) or []
+        def uses(p):
+            for r in (p.get("roles") or []):
+                n = r if isinstance(r, str) else str(r.get("role", r.get("name", "")))
+                if n.endswith("selinux"): return True
+            return any(isinstance(t, dict) and "selinux" in str(t.get("include_role", t.get("ansible.builtin.include_role", ""))) for t in (p.get("tasks") or []))
+        print("ok" if any(uses(p) for p in plays) else "no-role")
+        PY
+      expect: { match: exact, value: ok }
+  exam:
+    rerun:
+      - on: control
+        timeoutSec: 600
+        run: |
+          r=$(ct-ansible recap /home/learner/exam/selinux selinux.yml)
+          echo "$r"
+          [ "$r" = "changed=0 failed=0 unreachable=0" ]
+  misconceptions:
+    - id: runtime-boolean
+      description: Uses plain modules to set the boolean without persistence and never writes the file context rule.
+      feedback: Booleans and file contexts must be persistent, and a label alone, without a rule, is lost by a relabel.
+      expectFail: [state-node1, state-node2, state-node3, state-node4]
+      mutation:
+        on: control
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/exam/selinux
+          cat > selinux.yml <<'EOF'
+          - hosts: all
+            become: true
+            tasks:
+              - ansible.posix.seboolean: { name: httpd_can_network_connect, state: true }
+              - ansible.builtin.command: chcon -t httpd_sys_content_t /srv/{{dir}}
+          EOF
+          ansible-playbook selinux.yml
+    - id: no-fcontext
+      description: Sets mode and boolean with the role but leaves out the file context entry.
+      feedback: The role's selinux_fcontexts variable carries the rule; the directory also needs restoring so it takes the label.
+      expectFail: [state-node1, state-node2, state-node3, state-node4]
+      mutation:
+        on: control
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/exam/selinux
+          cat > selinux.yml <<'EOF'
+          - hosts: all
+            become: true
+            vars:
+              selinux_policy: targeted
+              selinux_state: enforcing
+              selinux_booleans:
+                - { name: httpd_can_network_connect, state: true, persistent: true }
+            roles:
+              - fedora.linux_system_roles.selinux
+          EOF
+          ansible-playbook selinux.yml
+  solution:
+    explanation: |
+      The selinux role takes selinux_state, selinux_policy, selinux_booleans and selinux_fcontexts;
+      selinux_restore_dirs relabels the directory so the new rule takes effect on it at once.
+    steps:
+      - on: control
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/exam/selinux
+          cat > selinux.yml <<'EOF'
+          - name: SELinux baseline
+            hosts: all
+            become: true
+            vars:
+              selinux_policy: targeted
+              selinux_state: enforcing
+              selinux_booleans:
+                - name: httpd_can_network_connect
+                  state: true
+                  persistent: true
+              selinux_fcontexts:
+                - target: "/srv/{{dir}}(/.*)?"
+                  setype: httpd_sys_content_t
+                  state: present
+              selinux_restore_dirs:
+                - /srv/{{dir}}
+            roles:
+              - fedora.linux_system_roles.selinux
+          EOF
+          ansible-playbook selinux.yml

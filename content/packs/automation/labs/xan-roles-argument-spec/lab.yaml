@@ -1,0 +1,268 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xan-roles-argument-spec
+  title: Reject invalid input to a role
+  domain: automation
+  frameworks: [ex294-aligned:roles-collections]
+  difficulty: medium
+  estimatedMinutes: 10
+  tags: [exam, ansible, roles, argument-specs, validation]
+  version: 1
+spec:
+  description: |
+    **Exam environment.** You work as `learner` on the control node `control`. The
+    managed nodes are `node1` (group `dev`), `node2` (`test`), `node3` (`prod`, also in
+    `webservers`) and `node4` (`balancers`), all Enterprise Linux 10; the account
+    `devops` on every node accepts your SSH key and may use sudo without a password.
+    Packages come from each node's local repository. Every playbook you write is run
+    again by the grader (it must report no changes), then every node is rebooted before
+    the final checks.
+
+    In **`/home/learner/exam/argspec`** (inventory, `ansible.cfg` with the remote user
+    `devops` and the role path) the role **`report`** is installed under `roles/`. It writes
+    a small report file on a host, but it accepts any input.
+
+    1. Give the role an **argument specification** (`meta/argument_specs.yml`, entry point
+       `main`) that **requires** two variables: **`report_dir`**, a path, and
+       **`report_level`**, a string that must be either **`brief`** or **`full`**. A run with
+       a missing or invalid value must fail in the argument validation, before any task of
+       the role runs.
+    2. Write the playbook **`report.yml`** that applies the role to the **dev** group with
+       `report_dir` set to **`/var/lib/ov-report-{{tag}}`** and `report_level` set to
+       **`{{level}}`**, and run it.
+
+    A second run must report no changes.
+  objectives:
+    - Describe a role's inputs in an argument specification
+    - See invalid input rejected before the role's tasks run
+  params:
+    tag:
+      type: int
+      min: 100
+      max: 999
+    level:
+      type: choice
+      values: [brief, full]
+  topology:
+    entry: control
+    nodes:
+      - { name: control, driver: container, image: ansible-ctl:2.21, access: [shell] }
+      - { name: node1, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node2, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node3, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node4, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+  setup:
+    - on: node1
+      timeoutSec: 120
+      run: &exam-node |
+        set -eu
+        id devops >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Exam automation" devops
+        install -d -m 0700 -o devops -g devops /home/devops/.ssh
+        install -m 0600 -o devops -g devops /home/learner/.ssh/authorized_keys /home/devops/.ssh/authorized_keys
+        printf 'devops ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/devops
+        chmod 0440 /etc/sudoers.d/devops
+    - { on: node2, timeoutSec: 120, run: *exam-node }
+    - { on: node3, timeoutSec: 120, run: *exam-node }
+    - { on: node4, timeoutSec: 120, run: *exam-node }
+    - on: control
+      run: |
+        set -eu
+        p=/home/learner/exam/argspec
+        r=$p/roles/report
+        install -d -o learner -g learner /home/learner/exam $p
+        install -d $r/tasks $r/meta
+        cat > $p/inventory.yml <<'EOF'
+        dev:
+          hosts:
+            node1:
+        test:
+          hosts:
+            node2:
+        prod:
+          hosts:
+            node3:
+        balancers:
+          hosts:
+            node4:
+        webservers:
+          children:
+            prod:
+        EOF
+        printf '[defaults]\ninventory = inventory.yml\nremote_user = devops\nroles_path = /home/learner/exam/argspec/roles\n' > $p/ansible.cfg
+        cat > $r/tasks/main.yml <<'EOF'
+        ---
+        - name: Report directory
+          ansible.builtin.file:
+            path: "{{ report_dir }}"
+            state: directory
+            mode: "0755"
+        - name: Report file
+          ansible.builtin.copy:
+            dest: "{{ report_dir }}/report.txt"
+            content: |
+              level={{ report_level }}
+              host={{ inventory_hostname }}
+            mode: "0644"
+        EOF
+        printf -- '---\ngalaxy_info:\n  author: Orrin and Vale platform team\n  description: Writes a host report\n  license: MIT\n  min_ansible_version: "2.16"\n  platforms: [{name: EL, versions: ["10"]}]\ndependencies: []\n' > $r/meta/main.yml
+        chown -R learner:learner $p
+  checks:
+    - id: spec-valid
+      description: The role has an argument specification for main that requires report_dir as a path and report_level restricted to two values
+      type: shell
+      on: control
+      skills: [automation.reuse.argument-specs]
+      weight: 2
+      command: |
+        f=/home/learner/exam/argspec/roles/report/meta/argument_specs.yml
+        [ -f $f ] || f=/home/learner/exam/argspec/roles/report/meta/argument_specs.yaml
+        [ -f $f ] || { echo missing; exit 0; }
+        /opt/ansible/bin/python3 - $f <<'PY' 2>/dev/null || echo unreadable
+        import sys, yaml
+        o = ((yaml.safe_load(open(sys.argv[1])) or {}).get("argument_specs", {}).get("main", {}) or {}).get("options", {}) or {}
+        d, l = o.get("report_dir", {}), o.get("report_level", {})
+        ok = d.get("type") == "path" and d.get("required") is True and l.get("type") == "str" and l.get("required") is True and sorted(l.get("choices", [])) == ["brief", "full"]
+        print("ok" if ok else "wrong-spec")
+        PY
+      expect: { match: exact, value: ok }
+    - id: spec-behaviour
+      description: Invalid or missing input stops the run at the argument validation without running any task, and valid input is accepted
+      type: shell
+      on: control
+      skills: [automation.reuse.argument-specs]
+      weight: 3
+      timeoutSec: 150
+      command: |
+        d=/home/learner/exam/argspec
+        t=$(mktemp -d /tmp/ct-argspec.XXXXXX); chmod 0755 $t
+        try() { # level dir
+          { printf -- '- hosts: localhost\n  connection: local\n  gather_facts: false\n  roles:\n    - role: report\n      vars:\n'
+            [ -n "$2" ] && printf '        report_dir: %s\n' "$2"
+            [ -n "$1" ] && printf '        report_level: %s\n' "$1"; } > $t/p.yml
+          ct-ansible run $d env ANSIBLE_NOCOLOR=1 ansible-playbook $t/p.yml 2>&1
+        }
+        rm -rf /tmp/ct-argspec-out /tmp/ct-argspec-ok
+        out=$(try verbose /tmp/ct-argspec-out); rc=$?
+        if [ $rc -ne 0 ] && echo "$out" | grep -q 'Validating arguments' && [ ! -e /tmp/ct-argspec-out ]; then a=rejects-level; else a=accepts-level; fi
+        out=$(try brief ""); rc=$?
+        if [ $rc -ne 0 ] && echo "$out" | grep -qi 'missing required arguments'; then b=requires-dir; else b=optional-dir; fi
+        out=$(try full /tmp/ct-argspec-ok); rc=$?
+        if [ $rc -eq 0 ] && [ -f /tmp/ct-argspec-ok/report.txt ]; then c=accepts-valid; else c=rejects-valid; fi
+        rm -rf $t /tmp/ct-argspec-out /tmp/ct-argspec-ok
+        echo "$a $b $c"
+      expect: { match: exact, value: rejects-level requires-dir accepts-valid }
+    - id: dev-report
+      description: node1 has the report file written by the role with the requested level
+      type: shell
+      on: node1
+      skills: [automation.reuse.roles]
+      command: head -n 1 /var/lib/ov-report-{{tag}}/report.txt 2>/dev/null || echo missing
+      expect: { match: exact, value: "level={{level}}" }
+    - id: playbook-shape
+      description: report.yml applies the role to the dev group with both variables
+      type: shell
+      on: control
+      skills: [automation.reuse.roles]
+      command: |
+        /opt/ansible/bin/python3 - /home/learner/exam/argspec/report.yml <<'PY' 2>/dev/null || echo no-playbook
+        import sys, yaml
+        plays = yaml.safe_load(open(sys.argv[1])) or []
+        def has_role(p):
+            for r in p.get("roles", []) or []:
+                if isinstance(r, str):
+                    if r == "report": return True
+                elif r.get("role", r.get("name")) == "report":
+                    return True
+            return False
+        ok = any(p.get("hosts") == "dev" and has_role(p) for p in plays)
+        print("ok" if ok else "no-play")
+        PY
+      expect: { match: exact, value: ok }
+  exam:
+    rerun:
+      - on: control
+        timeoutSec: 600
+        run: |
+          r=$(ct-ansible recap /home/learner/exam/argspec report.yml)
+          echo "$r"
+          [ "$r" = "changed=0 failed=0 unreachable=0" ]
+  misconceptions:
+    - id: free-level
+      description: Declares the variables but allows any value for the level.
+      feedback: report_level must be limited to its two allowed values with choices in the specification.
+      expectFail: [spec-valid, spec-behaviour]
+      mutation:
+        on: control
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/exam/argspec
+          cat > roles/report/meta/argument_specs.yml <<'EOF'
+          argument_specs:
+            main:
+              options:
+                report_dir: { type: path, required: true }
+                report_level: { type: str, required: true }
+          EOF
+          printf -- '- hosts: dev\n  become: true\n  roles:\n    - role: report\n      vars: { report_dir: /var/lib/ov-report-{{tag}}, report_level: {{level}} }\n' > report.yml
+          ansible-playbook report.yml
+    - id: optional-dir
+      description: Lists the variables with choices but does not mark report_dir as required.
+      feedback: A missing report_dir must be rejected by the specification itself, so mark it required.
+      expectFail: [spec-valid, spec-behaviour]
+      mutation:
+        on: control
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/exam/argspec
+          cat > roles/report/meta/argument_specs.yml <<'EOF'
+          argument_specs:
+            main:
+              options:
+                report_dir: { type: path }
+                report_level: { type: str, required: true, choices: [brief, full] }
+          EOF
+          printf -- '- hosts: dev\n  become: true\n  roles:\n    - role: report\n      vars: { report_dir: /var/lib/ov-report-{{tag}}, report_level: {{level}} }\n' > report.yml
+          ansible-playbook report.yml
+  solution:
+    explanation: |
+      argument_specs.yml under the role's meta directory describes the entry point main; Ansible
+      validates the role's inputs against it before the first task, so a bad level or a missing
+      directory stops the play with a clear message.
+    steps:
+      - on: control
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/exam/argspec
+          cat > roles/report/meta/argument_specs.yml <<'EOF'
+          ---
+          argument_specs:
+            main:
+              short_description: Write a host report
+              options:
+                report_dir:
+                  type: path
+                  required: true
+                  description: Directory that receives report.txt.
+                report_level:
+                  type: str
+                  required: true
+                  choices: [brief, full]
+                  description: How much the report contains.
+          EOF
+          cat > report.yml <<'EOF'
+          - name: Reports on the dev hosts
+            hosts: dev
+            become: true
+            roles:
+              - role: report
+                report_dir: /var/lib/ov-report-{{tag}}
+                report_level: {{level}}
+          EOF
+          ansible-playbook report.yml

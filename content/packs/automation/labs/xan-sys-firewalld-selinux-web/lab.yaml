@@ -1,0 +1,270 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xan-sys-firewalld-selinux-web
+  title: Publish web content from a custom directory with SELinux enforcing
+  domain: automation
+  frameworks: [ex294-aligned:automate-system-tasks]
+  difficulty: hard
+  estimatedMinutes: 20
+  tags: [exam, ansible, selinux, firewalld, httpd, permissions]
+  version: 1
+spec:
+  description: |
+    **Exam environment.** You work as `learner` on the control node `control`. The
+    managed nodes are `node1` (group `dev`), `node2` (`test`), `node3` (`prod`, also in
+    `webservers`) and `node4` (`balancers`), all Enterprise Linux 10; the account
+    `devops` on every node accepts your SSH key and may use sudo without a password.
+    Packages come from each node's local repository. Every playbook you write is run
+    again by the grader (it must report no changes), then every node is rebooted before
+    the final checks.
+
+    The web team wants to publish content from **`/webdev`** on the **dev** hosts. In
+    **`/home/learner/exam/webdev`** (inventory and an `ansible.cfg` with the remote user
+    `devops`) the page **`index.html`** is supplied; do not edit it.
+
+    Write the playbook **`/home/learner/exam/webdev/webdev.yml`** that, on the **dev** group:
+
+    - installs **httpd**, starts it and enables it at boot;
+    - creates the group **`webdev`** with GID **`{{gid}}`**, and the directory **`/webdev`**
+      owned by `root` and group `webdev`, writable by the group, where **new files inherit
+      the group** (setgid);
+    - gives `/webdev` and everything below it the SELinux type **`httpd_sys_content_t`**,
+      **persistently** (a relabel must keep it), with SELinux staying in enforcing mode;
+    - copies `index.html` to `/webdev/index.html` and makes it available at
+      **`http://node1/webdev/`** through a **symbolic link** in the document root
+      (`/var/www/html/webdev`);
+    - opens the **http** service in firewalld, permanently and immediately.
+
+    Run it. A second run must report no changes.
+  objectives:
+    - Label custom content directories persistently for SELinux
+    - Manage group-owned setgid directories and firewall rules for a web service
+  params:
+    gid:
+      type: int
+      min: 5100
+      max: 5199
+    site:
+      type: choice
+      values: [Leeds, Bristol, Cardiff, York]
+  topology:
+    entry: control
+    nodes:
+      - { name: control, driver: container, image: ansible-ctl:2.21, access: [shell] }
+      - { name: node1, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node2, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node3, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node4, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+  setup:
+    - on: node1
+      timeoutSec: 120
+      run: &exam-node |
+        set -eu
+        id devops >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Exam automation" devops
+        install -d -m 0700 -o devops -g devops /home/devops/.ssh
+        install -m 0600 -o devops -g devops /home/learner/.ssh/authorized_keys /home/devops/.ssh/authorized_keys
+        printf 'devops ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/devops
+        chmod 0440 /etc/sudoers.d/devops
+    - { on: node2, timeoutSec: 120, run: *exam-node }
+    - { on: node3, timeoutSec: 120, run: *exam-node }
+    - { on: node4, timeoutSec: 120, run: *exam-node }
+    - on: node1
+      timeoutSec: 240
+      run: |
+        set -eu
+        rpm -q policycoreutils-python-utils >/dev/null 2>&1 || dnf -y -q install policycoreutils-python-utils >/dev/null
+    - on: control
+      run: |
+        set -eu
+        p=/home/learner/exam/webdev
+        install -d -o learner -g learner /home/learner/exam $p
+        cat > $p/inventory.yml <<'EOF'
+        dev:
+          hosts:
+            node1:
+        test:
+          hosts:
+            node2:
+        prod:
+          hosts:
+            node3:
+        balancers:
+          hosts:
+            node4:
+        webservers:
+          children:
+            prod:
+        EOF
+        printf '[defaults]\ninventory = inventory.yml\nremote_user = devops\n' > $p/ansible.cfg
+        printf 'Orrin and Vale web team - {{site}}\n' > $p/index.html
+        chown -R learner:learner $p
+        (cd $p && sha256sum index.html > /var/tmp/.ct-webdev-sha)
+        chmod 0444 /var/tmp/.ct-webdev-sha
+  checks:
+    - id: served
+      description: http://node1/webdev/ serves the supplied page
+      type: shell
+      on: control
+      skills: [automation.modules.firewall-selinux]
+      weight: 3
+      command: |
+        d=/home/learner/exam/webdev
+        (cd $d && sha256sum -c /var/tmp/.ct-webdev-sha >/dev/null 2>&1) || { echo supplied-file-changed; exit 0; }
+        [ "$(curl -s -m 8 http://node1/webdev/)" = "$(cat $d/index.html)" ] && echo ok || echo differs
+      expect: { match: exact, value: ok }
+    - id: selinux
+      description: SELinux is enforcing, /webdev has a persistent file context rule and nothing below it needs a relabel
+      type: shell
+      on: node1
+      skills: [automation.modules.firewall-selinux]
+      weight: 2
+      command: |
+        r=$(semanage fcontext -l -C 2>/dev/null | grep -c '^/webdev(/\.\*)?[[:space:]].*httpd_sys_content_t')
+        n=$(restorecon -R -n -v /webdev 2>/dev/null | wc -l)
+        l=$(ls -dZ /webdev 2>/dev/null | grep -c httpd_sys_content_t)
+        echo "$(getenforce) rule=$r relabel-needed=$n label=$l"
+      expect: { match: exact, value: "Enforcing rule=1 relabel-needed=0 label=1" }
+    - id: directory
+      description: The group webdev has the required GID and /webdev is owned by root and that group with group write and setgid
+      type: shell
+      on: node1
+      skills: [automation.modules.files]
+      weight: 2
+      command: |
+        echo "$(getent group webdev | cut -d: -f3) $(stat -c '%U %G %a' /webdev 2>/dev/null)"
+      expect: { match: exact, value: "{{gid}} root webdev 2775" }
+    - id: link-service
+      description: The document root links to /webdev, httpd runs and is enabled, and http is permanently open in firewalld
+      type: shell
+      on: node1
+      skills: [automation.modules.firewall-selinux, automation.modules.packages-services]
+      command: |
+        [ "$(readlink /var/www/html/webdev)" = /webdev ] && l=link || l=no-link
+        firewall-cmd --permanent --list-services | tr ' ' '\n' | grep -qx http && f=http-open || f=http-closed
+        echo "$l $(systemctl is-active httpd) $(systemctl is-enabled httpd) $f"
+      expect: { match: exact, value: link active enabled http-open }
+  exam:
+    rerun:
+      - on: control
+        timeoutSec: 600
+        run: |
+          r=$(ct-ansible recap /home/learner/exam/webdev webdev.yml)
+          echo "$r"
+          [ "$r" = "changed=0 failed=0 unreachable=0" ]
+  misconceptions:
+    - id: chcon-only
+      description: Labels the directory once with chcon and never writes a file context rule.
+      feedback: A chcon label is lost at the next relabel; the context needs a persistent rule (semanage fcontext) and a restore.
+      expectFail: [selinux]
+      mutation:
+        on: control
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/exam/webdev
+          cat > webdev.yml <<'EOF'
+          - hosts: dev
+            become: true
+            tasks:
+              - ansible.builtin.dnf: { name: httpd, state: present }
+              - ansible.builtin.group: { name: webdev, gid: "{{gid}}" }
+              - ansible.builtin.file: { path: /webdev, state: directory, owner: root, group: webdev, mode: "2775", setype: httpd_sys_content_t }
+              - ansible.builtin.copy: { src: index.html, dest: /webdev/index.html }
+              - ansible.builtin.file: { src: /webdev, dest: /var/www/html/webdev, state: link }
+              - ansible.builtin.service: { name: httpd, state: started, enabled: true }
+              - ansible.posix.firewalld: { service: http, state: enabled, permanent: true, immediate: true }
+          EOF
+          ansible-playbook webdev.yml
+    - id: no-setgid
+      description: Sets the group and group write but leaves out the setgid bit.
+      feedback: Without the setgid bit new files do not inherit the webdev group; the directory mode needs the leading 2.
+      expectFail: [directory]
+      mutation:
+        on: control
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/exam/webdev
+          cat > webdev.yml <<'EOF'
+          - hosts: dev
+            become: true
+            tasks:
+              - ansible.builtin.dnf: { name: httpd, state: present }
+              - ansible.builtin.group: { name: webdev, gid: "{{gid}}" }
+              - ansible.builtin.file: { path: /webdev, state: directory, owner: root, group: webdev, mode: "0775" }
+              - community.general.sefcontext: { target: "/webdev(/.*)?", setype: httpd_sys_content_t, state: present }
+              - ansible.builtin.command: restorecon -R /webdev
+              - ansible.builtin.copy: { src: index.html, dest: /webdev/index.html }
+              - ansible.builtin.file: { src: /webdev, dest: /var/www/html/webdev, state: link }
+              - ansible.builtin.service: { name: httpd, state: started, enabled: true }
+              - ansible.posix.firewalld: { service: http, state: enabled, permanent: true, immediate: true }
+          EOF
+          ansible-playbook webdev.yml
+  solution:
+    explanation: |
+      sefcontext stores the rule in the policy and restorecon applies it (reported as a change
+      only when it relabels something); file with mode 2775 sets setgid; a state: link file
+      task publishes the directory in the document root.
+    steps:
+      - on: control
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/exam/webdev
+          cat > webdev.yml <<'EOF'
+          - name: Web content from /webdev
+            hosts: dev
+            become: true
+            tasks:
+              - name: httpd package
+                ansible.builtin.dnf:
+                  name: httpd
+                  state: present
+              - name: webdev group
+                ansible.builtin.group:
+                  name: webdev
+                  gid: "{{gid}}"
+              - name: Content directory
+                ansible.builtin.file:
+                  path: /webdev
+                  state: directory
+                  owner: root
+                  group: webdev
+                  mode: "2775"
+              - name: Persistent web content label
+                community.general.sefcontext:
+                  target: "/webdev(/.*)?"
+                  setype: httpd_sys_content_t
+                  state: present
+              - name: Apply the label
+                ansible.builtin.command: restorecon -R -v /webdev
+                register: restore
+                changed_when: "'Relabeled' in restore.stdout"
+              - name: Index page
+                ansible.builtin.copy:
+                  src: index.html
+                  dest: /webdev/index.html
+                  group: webdev
+                  mode: "0664"
+              - name: Link in the document root
+                ansible.builtin.file:
+                  src: /webdev
+                  dest: /var/www/html/webdev
+                  state: link
+              - name: httpd running and enabled
+                ansible.builtin.service:
+                  name: httpd
+                  state: started
+                  enabled: true
+              - name: http open in firewalld
+                ansible.posix.firewalld:
+                  service: http
+                  state: enabled
+                  permanent: true
+                  immediate: true
+          EOF
+          ansible-playbook webdev.yml

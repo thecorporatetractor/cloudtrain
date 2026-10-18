@@ -1,0 +1,265 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xan-sys-vault-users
+  title: Create users with vaulted password hashes
+  domain: automation
+  frameworks: [ex294-aligned:automate-system-tasks]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [exam, ansible, vault, users, password-hash]
+  version: 1
+spec:
+  description: |
+    **Exam environment.** You work as `learner` on the control node `control`. The
+    managed nodes are `node1` (group `dev`), `node2` (`test`), `node3` (`prod`, also in
+    `webservers`) and `node4` (`balancers`), all Enterprise Linux 10; the account
+    `devops` on every node accepts your SSH key and may use sudo without a password.
+    Packages come from each node's local repository. Every playbook you write is run
+    again by the grader (it must report no changes), then every node is rebooted before
+    the final checks.
+
+    In **`/home/learner/exam/vaultusers`** (inventory and an `ansible.cfg` with the remote
+    user `devops`) three files are supplied; do not edit them: **`user_list.yml`** (the
+    accounts with `username`, `uid` and `groups`), **`secrets.yml`** (Ansible Vault
+    encrypted; it holds each account's clear-text password in the dictionary
+    `ov_passwords`, keyed by user name) and the password file **`vault-pass.txt`** that
+    opens it.
+
+    Write the playbook **`/home/learner/exam/vaultusers/vaultusers.yml`** that, on the
+    **prod** group only:
+
+    - creates the groups the accounts need;
+    - creates every account of the list with its UID and its supplementary groups;
+    - sets each account's password from the vaulted file as a **SHA-512 hash** (never the clear
+      text), so that repeated runs report no changes.
+
+    Make the playbook find the vault password on its own (the grader runs it with the same
+    password file), run it, and keep clear-text passwords out of every file you write.
+  objectives:
+    - Read secrets from a vault-encrypted variable file with a password file
+    - Create accounts with SHA-512 password hashes and given group memberships
+  params:
+    u1:
+      type: choice
+      values: [mirela, nadir, oriel]
+    u2:
+      type: choice
+      values: [pavo, quill, rurik]
+    base:
+      type: int
+      min: 81
+      max: 89
+    vp:
+      type: int
+      min: 10000
+      max: 99999
+    pa:
+      type: int
+      min: 100000
+      max: 999999
+    pb:
+      type: int
+      min: 100000
+      max: 999999
+  topology:
+    entry: control
+    nodes:
+      - { name: control, driver: container, image: ansible-ctl:2.21, access: [shell] }
+      - { name: node1, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node2, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node3, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node4, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+  setup:
+    - on: node1
+      timeoutSec: 120
+      run: &exam-node |
+        set -eu
+        id devops >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Exam automation" devops
+        install -d -m 0700 -o devops -g devops /home/devops/.ssh
+        install -m 0600 -o devops -g devops /home/learner/.ssh/authorized_keys /home/devops/.ssh/authorized_keys
+        printf 'devops ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/devops
+        chmod 0440 /etc/sudoers.d/devops
+    - { on: node2, timeoutSec: 120, run: *exam-node }
+    - { on: node3, timeoutSec: 120, run: *exam-node }
+    - { on: node4, timeoutSec: 120, run: *exam-node }
+    - on: control
+      run: |
+        set -eu
+        p=/home/learner/exam/vaultusers
+        install -d -o learner -g learner /home/learner/exam $p
+        cat > $p/inventory.yml <<'EOF'
+        dev:
+          hosts:
+            node1:
+        test:
+          hosts:
+            node2:
+        prod:
+          hosts:
+            node3:
+        balancers:
+          hosts:
+            node4:
+        webservers:
+          children:
+            prod:
+        EOF
+        printf '[defaults]\ninventory = inventory.yml\nremote_user = devops\n' > $p/ansible.cfg
+        cat > $p/user_list.yml <<'EOF'
+        users:
+          - username: {{u1}}
+            uid: {{base}}51
+            groups: [ovstaff]
+          - username: {{u2}}
+            uid: {{base}}52
+            groups: [ovaudit, ovstaff]
+        EOF
+        printf 'Vault-{{vp}}\n' > $p/vault-pass.txt
+        chmod 0600 $p/vault-pass.txt
+        printf 'ov_passwords:\n  {{u1}}: "Pw1-{{pa}}"\n  {{u2}}: "Pw2-{{pb}}"\n' > $p/secrets.yml
+        ansible-vault encrypt --vault-password-file $p/vault-pass.txt $p/secrets.yml >/dev/null
+        chown -R learner:learner $p
+        (cd $p && sha256sum user_list.yml secrets.yml vault-pass.txt > /var/tmp/.ct-vaultusers-sha)
+        chmod 0444 /var/tmp/.ct-vaultusers-sha
+  checks:
+    - id: users-node3
+      description: node3 has both accounts with their UIDs and groups, and their passwords are SHA-512 hashes of the vaulted passwords
+      type: shell
+      on: node3
+      skills: [automation.modules.users, automation.content.vault]
+      weight: 3
+      command: |
+        chk() { # user uid groups password
+          [ "$(id -u $1 2>/dev/null)" = "$2" ] || { echo "$1:uid"; return; }
+          [ "$(id -nG $1 | tr ' ' '\n' | sort | tr '\n' ' ')" = "$3 " ] || { echo "$1:groups"; return; }
+          h=$(getent shadow $1 | cut -d: -f2)
+          [ "${h:0:3}" = '$6$' ] || { echo "$1:not-sha512"; return; }
+          s=$(echo "$h" | cut -d'$' -f3)
+          [ "$(openssl passwd -6 -salt "$s" "$4")" = "$h" ] && echo "$1:ok" || echo "$1:password"
+        }
+        echo "$(chk {{u1}} {{base}}51 ovstaff 'Pw1-{{pa}}') $(chk {{u2}} {{base}}52 'ovaudit ovstaff' 'Pw2-{{pb}}')"
+      expect: { match: exact, value: "{{u1}}:ok {{u2}}:ok" }
+    - id: node1-clean
+      description: node1 has none of the accounts
+      type: shell
+      on: node1
+      skills: [automation.modules.users]
+      command: &none |
+        n=0; for u in {{u1}} {{u2}}; do id $u >/dev/null 2>&1 && n=$((n+1)); done; echo "users=$n"
+      expect: { match: exact, value: users=0 }
+    - { id: node2-clean, description: "node2 has none of the accounts", type: shell, on: node2, skills: [automation.modules.users], command: *none, expect: { match: exact, value: users=0 } }
+    - { id: node4-clean, description: "node4 has none of the accounts", type: shell, on: node4, skills: [automation.modules.users], command: *none, expect: { match: exact, value: users=0 } }
+    - id: vault-hygiene
+      description: The supplied files are unchanged and still encrypted, and no clear-text password appears in your files
+      type: shell
+      on: control
+      skills: [automation.content.vault]
+      weight: 2
+      command: |
+        d=/home/learner/exam/vaultusers
+        (cd $d && sha256sum -c /var/tmp/.ct-vaultusers-sha >/dev/null 2>&1) || { echo supplied-files-changed; exit 0; }
+        head -c 14 $d/secrets.yml | grep -q '^$ANSIBLE_VAULT' || { echo not-encrypted; exit 0; }
+        grep -rlsE 'Pw[12]-({{pa}}|{{pb}})' $d --exclude=secrets.yml | grep -q . && echo leaked || echo ok
+      expect: { match: exact, value: ok }
+  exam:
+    rerun:
+      - on: control
+        timeoutSec: 600
+        run: |
+          r=$(ct-ansible recap /home/learner/exam/vaultusers vaultusers.yml --vault-password-file /home/learner/exam/vaultusers/vault-pass.txt)
+          echo "$r"
+          [ "$r" = "changed=0 failed=0 unreachable=0" ]
+  misconceptions:
+    - id: clear-text
+      description: Passes the clear-text password to the user module without hashing it.
+      feedback: The user module expects a hash; a clear-text value ends up unhashed in the shadow file.
+      expectFail: [users-node3]
+      mutation:
+        on: control
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/exam/vaultusers
+          cat > vaultusers.yml <<'EOF'
+          - hosts: prod
+            become: true
+            vars_files: [user_list.yml, secrets.yml]
+            tasks:
+              - ansible.builtin.group: { name: "{{ item }}" }
+                loop: [ovstaff, ovaudit]
+              - ansible.builtin.user:
+                  name: "{{ item.username }}"
+                  uid: "{{ item.uid }}"
+                  groups: "{{ item.groups }}"
+                  append: true
+                  password: "{{ ov_passwords[item.username] }}"
+                loop: "{{ users }}"
+                no_log: true
+          EOF
+          ansible-playbook vaultusers.yml --vault-password-file vault-pass.txt
+    - id: all-hosts
+      description: Creates the accounts on every group instead of prod only.
+      feedback: The accounts belong on the prod hosts only.
+      expectFail: [node1-clean, node2-clean, node4-clean]
+      mutation:
+        on: control
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/exam/vaultusers
+          cat > vaultusers.yml <<'EOF'
+          - hosts: all
+            become: true
+            vars_files: [user_list.yml, secrets.yml]
+            tasks:
+              - ansible.builtin.group: { name: "{{ item }}" }
+                loop: [ovstaff, ovaudit]
+              - ansible.builtin.user:
+                  name: "{{ item.username }}"
+                  uid: "{{ item.uid }}"
+                  groups: "{{ item.groups }}"
+                  append: true
+                  password: "{{ ov_passwords[item.username] | password_hash('sha512', 'ovsalt') }}"
+                loop: "{{ users }}"
+                no_log: true
+          EOF
+          ansible-playbook vaultusers.yml --vault-password-file vault-pass.txt || ansible-playbook vaultusers.yml --vault-password-file vault-pass.txt
+  solution:
+    explanation: |
+      vars_files loads the plain list and the vaulted secrets (the password file is given in
+      ansible.cfg); password_hash with a fixed salt turns each clear-text password into the same
+      SHA-512 hash on every run, so the user task reports no change the second time.
+    steps:
+      - on: control
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/exam/vaultusers
+          printf '[defaults]\ninventory = inventory.yml\nremote_user = devops\nvault_password_file = vault-pass.txt\n' > ansible.cfg
+          cat > vaultusers.yml <<'EOF'
+          - name: Accounts with vaulted passwords
+            hosts: prod
+            become: true
+            vars_files:
+              - user_list.yml
+              - secrets.yml
+            tasks:
+              - name: Groups
+                ansible.builtin.group:
+                  name: "{{ item }}"
+                loop: "{{ users | map(attribute='groups') | flatten | unique }}"
+              - name: Accounts
+                ansible.builtin.user:
+                  name: "{{ item.username }}"
+                  uid: "{{ item.uid }}"
+                  groups: "{{ item.groups }}"
+                  append: true
+                  password: "{{ ov_passwords[item.username] | password_hash('sha512', 'ovsalt') }}"
+                loop: "{{ users }}"
+                no_log: true
+          EOF
+          ansible-playbook vaultusers.yml || ansible-playbook vaultusers.yml

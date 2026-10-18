@@ -1,0 +1,231 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xan-core-adhoc-repos
+  title: Configure package repositories on every node with one script
+  domain: automation
+  frameworks: [ex294-aligned:core-components]
+  difficulty: medium
+  estimatedMinutes: 12
+  tags: [exam, ansible, ad-hoc, repositories, gpg]
+  version: 1
+spec:
+  description: |
+    **Exam environment.** You work as `learner` on the control node `control`. The
+    managed nodes are `node1` (group `dev`), `node2` (`test`), `node3` (`prod`, also in
+    `webservers`) and `node4` (`balancers`), all Enterprise Linux 10; the account
+    `devops` on every node accepts your SSH key and may use sudo without a password.
+    Packages come from each node's local repository. Every playbook you write is run
+    again by the grader (it must report no changes), then every node is rebooted before
+    the final checks.
+
+    A package server on `node4` publishes two repositories over HTTP on port
+    **`{{port}}`**: `http://node4:{{port}}/BaseOS` and `http://node4:{{port}}/AppStream`.
+    Packages are signed with the key `/etc/pki/rpm-gpg/RPM-GPG-KEY-AlmaLinux-10`, present on
+    every node.
+
+    Write the executable shell script **`/home/learner/exam/repos/repos.sh`** (the
+    directory has an inventory and an `ansible.cfg` with the remote user `devops`) that
+    uses **only ad-hoc `ansible` commands** (no playbook) to configure, on **every** node,
+    two repositories with the ids **`ov-baseos`** and **`ov-appstream`**: enabled, pointing at
+    the two URLs above, with **GPG checking on** and the key above as `gpgkey`. Leave the
+    repositories that are already configured alone.
+
+    Run the script. It must run cleanly more than once; the grader runs it twice.
+  objectives:
+    - Run configuration changes as ad-hoc commands from a script
+    - Manage package repositories with GPG checking
+  params:
+    port:
+      type: int
+      min: 8800
+      max: 8809
+  topology:
+    entry: control
+    nodes:
+      - { name: control, driver: container, image: ansible-ctl:2.21, access: [shell] }
+      - { name: node1, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node2, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node3, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node4, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+  setup:
+    - on: node1
+      timeoutSec: 120
+      run: &exam-node |
+        set -eu
+        id devops >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Exam automation" devops
+        install -d -m 0700 -o devops -g devops /home/devops/.ssh
+        install -m 0600 -o devops -g devops /home/learner/.ssh/authorized_keys /home/devops/.ssh/authorized_keys
+        printf 'devops ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/devops
+        chmod 0440 /etc/sudoers.d/devops
+    - { on: node2, timeoutSec: 120, run: *exam-node }
+    - { on: node3, timeoutSec: 120, run: *exam-node }
+    - { on: node4, timeoutSec: 120, run: *exam-node }
+    - on: node4
+      timeoutSec: 180
+      run: |
+        set -eu
+        [ -f /var/tmp/.ct-repos-seeded ] && exit 0
+        mkdir -p /srv/ov-repo
+        ln -sfn /opt/cloudtrain/repo/el10 /srv/ov-repo/BaseOS
+        ln -sfn /opt/cloudtrain/repo/el10 /srv/ov-repo/AppStream
+        cat > /etc/systemd/system/ov-pkg-server.service <<'UNIT'
+        [Unit]
+        Description=Orrin and Vale package server
+        After=network-online.target
+        [Service]
+        ExecStart=/usr/bin/python3 -m http.server {{port}} --directory /srv/ov-repo
+        Restart=always
+        [Install]
+        WantedBy=multi-user.target
+        UNIT
+        systemctl daemon-reload; systemctl enable --now ov-pkg-server
+        firewall-cmd -q --permanent --add-port={{port}}/tcp; firewall-cmd -q --reload
+        for i in $(seq 30); do curl -sf -o /dev/null http://127.0.0.1:{{port}}/BaseOS/repodata/repomd.xml && break; sleep 1; done
+        touch /var/tmp/.ct-repos-seeded
+    - on: control
+      run: |
+        set -eu
+        p=/home/learner/exam/repos
+        install -d -o learner -g learner /home/learner/exam $p
+        cat > $p/inventory.yml <<'EOF'
+        dev:
+          hosts:
+            node1:
+        test:
+          hosts:
+            node2:
+        prod:
+          hosts:
+            node3:
+        balancers:
+          hosts:
+            node4:
+        webservers:
+          children:
+            prod:
+        EOF
+        printf '[defaults]\ninventory = inventory.yml\nremote_user = devops\n' > $p/ansible.cfg
+        chown -R learner:learner $p
+  checks:
+    - id: repos-node1
+      description: node1 has both new repositories enabled with GPG checking and a key, and its other repositories are still there
+      type: shell
+      on: node1
+      skills: [automation.modules.packages-services]
+      weight: 2
+      command: &repo-conf |
+        /usr/bin/python3 - <<'PY'
+        import configparser, glob
+        want = {"ov-baseos": "http://node4:{{port}}/BaseOS", "ov-appstream": "http://node4:{{port}}/AppStream"}
+        found, other = {}, 0
+        for f in glob.glob("/etc/yum.repos.d/*.repo"):
+            c = configparser.ConfigParser(interpolation=None, strict=False)
+            try:
+                c.read(f)
+            except Exception:
+                continue
+            for s in c.sections():
+                if s in want:
+                    t = lambda k, d="0": str(c.get(s, k, fallback=d)).strip().lower() in ("1", "yes", "true", "on")
+                    if t("enabled", "1") and t("gpgcheck") and c.get(s, "gpgkey", fallback="").strip() and c.get(s, "baseurl", fallback="").strip().rstrip("/") == want[s]:
+                        found[s] = 1
+                else:
+                    other += 1
+        print("ok" if len(found) == 2 and other >= 1 else "found=%s other=%d" % (",".join(sorted(found)), other))
+        PY
+      expect: { match: exact, value: ok }
+    - { id: repos-node2, description: "node2 has both new repositories enabled with GPG checking and a key, and its other repositories are still there", type: shell, on: node2, skills: [automation.modules.packages-services], weight: 2, command: *repo-conf, expect: { match: exact, value: ok } }
+    - { id: repos-node3, description: "node3 has both new repositories enabled with GPG checking and a key, and its other repositories are still there", type: shell, on: node3, skills: [automation.modules.packages-services], weight: 2, command: *repo-conf, expect: { match: exact, value: ok } }
+    - { id: repos-node4, description: "node4 has both new repositories enabled with GPG checking and a key, and its other repositories are still there", type: shell, on: node4, skills: [automation.modules.packages-services], weight: 2, command: *repo-conf, expect: { match: exact, value: ok } }
+    - id: repos-work
+      description: dnf can read the package metadata of both new repositories on node1
+      type: shell
+      on: node1
+      skills: [automation.modules.packages-services]
+      timeoutSec: 150
+      command: |
+        for r in ov-baseos ov-appstream; do
+          timeout 70 dnf -q --disablerepo='*' --enablerepo=$r repoquery tree 2>/dev/null | grep -q '^tree-' || { echo "$r-broken"; exit 0; }
+        done
+        echo works
+      expect: { match: exact, value: works }
+    - id: script-adhoc
+      description: repos.sh exists and uses ad-hoc ansible commands only
+      type: shell
+      on: control
+      skills: [automation.foundations.adhoc]
+      command: |
+        f=/home/learner/exam/repos/repos.sh
+        [ -f $f ] || { echo missing; exit 0; }
+        grep -Eq 'ansible-playbook|ansible-navigator' $f && { echo uses-playbook; exit 0; }
+        grep -Eq '(^|[;&|[:space:]])ansible[[:space:]]+[^ ]+' $f && echo ok || echo no-adhoc
+      expect: { match: exact, value: ok }
+  exam:
+    rerun:
+      - on: control
+        timeoutSec: 600
+        run: |
+          for i in 1 2; do
+            ct-ansible run /home/learner/exam/repos bash ./repos.sh >/dev/null 2>&1 || { echo "run $i failed"; exit 1; }
+          done
+          echo clean
+  misconceptions:
+    - id: gpg-off
+      description: Configures both repositories with GPG checking switched off.
+      feedback: The repositories must check signatures; gpgcheck needs to be on and the key named.
+      expectFail: [repos-node1, repos-node2, repos-node3, repos-node4]
+      mutation:
+        on: control
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/exam/repos
+          cat > repos.sh <<'EOF'
+          #!/bin/bash
+          cd "$(dirname "$0")"
+          for r in baseos:BaseOS appstream:AppStream; do
+            ansible all -b -m ansible.builtin.yum_repository -a "name=ov-${r%%:*} description=${r%%:*} baseurl=http://node4:{{port}}/${r##*:} gpgcheck=no enabled=yes"
+          done
+          EOF
+          chmod +x repos.sh && ./repos.sh
+    - id: playbook-wrapper
+      description: Writes the repositories into a playbook and calls it from the script.
+      feedback: The script may only use ad-hoc ansible commands; a playbook is a different tool.
+      expectFail: [script-adhoc]
+      mutation:
+        on: control
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/exam/repos
+          cat > repos.yml <<'EOF'
+          - hosts: all
+            become: true
+            tasks:
+              - ansible.builtin.yum_repository: { name: ov-baseos, description: baseos, baseurl: "http://node4:{{port}}/BaseOS", gpgcheck: true, gpgkey: file:///etc/pki/rpm-gpg/RPM-GPG-KEY-AlmaLinux-10 }
+              - ansible.builtin.yum_repository: { name: ov-appstream, description: appstream, baseurl: "http://node4:{{port}}/AppStream", gpgcheck: true, gpgkey: file:///etc/pki/rpm-gpg/RPM-GPG-KEY-AlmaLinux-10 }
+          EOF
+          printf '#!/bin/bash\ncd "$(dirname "$0")"\nansible-playbook repos.yml\n' > repos.sh
+          chmod +x repos.sh && ./repos.sh
+  solution:
+    explanation: |
+      The yum_repository module is idempotent, so one ad-hoc call per repository with
+      become, the URL, gpgcheck and gpgkey can be repeated safely.
+    steps:
+      - on: control
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/exam/repos
+          cat > repos.sh <<'EOF'
+          #!/bin/bash
+          cd "$(dirname "$0")"
+          for r in baseos:BaseOS appstream:AppStream; do
+            ansible all -b -m ansible.builtin.yum_repository -a "name=ov-${r%%:*} description=${r%%:*} baseurl=http://node4:{{port}}/${r##*:} gpgcheck=yes gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-AlmaLinux-10 enabled=yes"
+          done
+          EOF
+          chmod +x repos.sh && ./repos.sh
