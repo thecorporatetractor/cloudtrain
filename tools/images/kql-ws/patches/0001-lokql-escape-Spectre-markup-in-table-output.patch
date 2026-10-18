@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: thecorporatetractor <marco@azarguard.com>
+Date: Sun, 18 Oct 2026 16:06:35 +0300
+Subject: [PATCH 01/15] lokql: escape Spectre markup in table output
+
+Column names and cell values were passed to Spectre.Console as markup, so any
+value containing '[' (a dynamic array such as [1,2], a bracketed log message)
+threw 'malformed markup tag' while rendering. The exception skipped the result
+history push, so a following .save or .materialize silently used the previous
+result. Escape names and cells with Markup.Escape.
+---
+ applications/lokql/SixelRenderingSurface.cs | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/applications/lokql/SixelRenderingSurface.cs b/applications/lokql/SixelRenderingSurface.cs
+index 9ff0be64..03e1ee44 100644
+--- a/applications/lokql/SixelRenderingSurface.cs
++++ b/applications/lokql/SixelRenderingSurface.cs
+@@ -39,7 +39,9 @@ internal class SixelRenderingSurface(KustoSettingsProvider settings)
+         var table = new Table();
+ 
+         // Add columns with header names
+-        foreach (var column in queryResult.ColumnDefinitions()) table.AddColumn(column.Name);
++        // Names and cells are data, not Spectre markup: escape them, or a value such as
++        // "[1,2]" throws while rendering and the result is lost.
++        foreach (var column in queryResult.ColumnDefinitions()) table.AddColumn(Markup.Escape(column.Name));
+         var maxRows = settings.GetIntOr(MaxRowsSetting, DefaultRows);
+         // Add rows.  Note that cells could contain nulls in the general case
+         foreach (var row in queryResult.EnumerateRows().Take(maxRows))
+@@ -60,7 +62,7 @@ internal class SixelRenderingSurface(KustoSettingsProvider settings)
+         // Helper function to convert a cell to a string, handling nulls
+         string CellToString(object? cell)
+         {
+-            return cell?.ToString() ?? "<null>";
++            return Markup.Escape(cell?.ToString() ?? "<null>");
+         }
+     }
+ }

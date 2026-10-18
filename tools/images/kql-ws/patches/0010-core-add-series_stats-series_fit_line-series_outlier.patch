@@ -1,0 +1,784 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: thecorporatetractor <marco@azarguard.com>
+Date: Sun, 18 Oct 2026 16:20:25 +0300
+Subject: [PATCH 10/15] core: add series_stats, series_fit_line,
+ series_outliers, series_decompose(_anomalies)
+
+New functions on dynamic-array series (make-series output):
+- series_stats (tuple: min, min_idx, max, max_idx, avg, variance, stdev) and
+  series_stats_dynamic (the same as a bag); variance is the sample variance.
+- series_fit_line (tuple: rsquare, slope, variance, rvariance, interception,
+  line_fit) and series_fit_line_dynamic; least squares over x = 0..n-1.
+- series_outliers(series [, kind, ignore_val, min_percentile, max_percentile]):
+  Tukey-fence score per point ('ctukey' p10/p90 by default, 'tukey' p25/p75).
+- series_decompose(series [, seasonality, trend, test_points]) -> (baseline,
+  seasonal, trend, residual), trend 'avg' | 'linefit' | 'none'.
+- series_decompose_anomalies(series [, threshold, seasonality, trend,
+  test_points, method]) -> (ad_flag, ad_score, baseline): the residual of the
+  decomposition scored with series_outliers; |score| > threshold (default 1.5)
+  flags +1/-1.
+
+Tuple results: Kusto types these calls as tuples (extend (a, b) = f(s), or
+bare extend f(s) with generated column names). A tuple call now translates to
+an IRTupleScalarCallNode holding one scalar call per tuple column, which
+extend, project and print expand into columns. The functions are evaluated row
+by row from raw argument values (RowwiseScalarFunctionImpl).
+
+Approximations: seasonality = -1 detects the period from the autocorrelation
+of the detrended series (shortest local maximum within 90 % of the best lag,
+accepted above 0.3), not ADX's periodogram; the seasonal component is the
+per-phase median. Clear anomalies get the same flags as ADX; scores and
+baselines are close, not identical. series_stats ignores non-finite values
+whatever ignore_nonfinite says. seasonality_threshold is not supported.
+---
+ .../Infra/RowwiseScalarFunctionImpl.cs        |  66 +++++
+ .../BuiltIns/ScalarFunctions/SeriesMath.cs    | 246 ++++++++++++++++++
+ .../Evaluation/BuiltIns/SeriesFunctions.cs    | 106 ++++++++
+ .../Expressions/IRTupleScalarCallNode.cs      |  33 +++
+ .../Translation/IRTranslator.Expressions.cs   |  29 +++
+ .../Translation/IRTranslator.Print.cs         |   2 +-
+ .../Translation/IRTranslator.Project.cs       |  48 +++-
+ test/BasicTests/SeriesFunctionTests.cs        | 116 +++++++++
+ 8 files changed, 638 insertions(+), 8 deletions(-)
+ create mode 100644 libraries/KustoLoco.Core/Evaluation/BuiltIns/Infra/RowwiseScalarFunctionImpl.cs
+ create mode 100644 libraries/KustoLoco.Core/Evaluation/BuiltIns/ScalarFunctions/SeriesMath.cs
+ create mode 100644 libraries/KustoLoco.Core/Evaluation/BuiltIns/SeriesFunctions.cs
+ create mode 100644 libraries/KustoLoco.Core/InternalRepresentation/Nodes/Expressions/IRTupleScalarCallNode.cs
+ create mode 100644 test/BasicTests/SeriesFunctionTests.cs
+
+diff --git a/libraries/KustoLoco.Core/Evaluation/BuiltIns/Infra/RowwiseScalarFunctionImpl.cs b/libraries/KustoLoco.Core/Evaluation/BuiltIns/Infra/RowwiseScalarFunctionImpl.cs
+new file mode 100644
+index 00000000..1181c59f
+--- /dev/null
++++ b/libraries/KustoLoco.Core/Evaluation/BuiltIns/Infra/RowwiseScalarFunctionImpl.cs
+@@ -0,0 +1,66 @@
++//
++// Licensed under the MIT License.
++
++using System;
++using System.Text.Json.Nodes;
++using Kusto.Language.Symbols;
++using KustoLoco.Core.DataSource;
++using KustoLoco.Core.Extensions;
++using KustoLoco.Core.Util;
++
++namespace KustoLoco.Core.Evaluation.BuiltIns;
++
++/// <summary>
++///     A scalar function evaluated row by row over raw argument values. Used for functions whose arguments are
++///     mostly dynamic and optional (the series_* family), where generated typed overloads would add nothing.
++///     The computed value is converted to <see cref="ResultType" /> (real, long, int, bool, string or dynamic).
++/// </summary>
++internal sealed class RowwiseScalarFunctionImpl(Func<object?[], object?> compute, TypeSymbol resultType)
++    : IScalarFunctionImpl
++{
++    public TypeSymbol ResultType { get; } = resultType;
++
++    public ScalarResult InvokeScalar(ScalarResult[] arguments)
++    {
++        var values = new object?[arguments.Length];
++        for (var i = 0; i < arguments.Length; i++) values[i] = arguments[i].Value;
++        return new ScalarResult(ResultType, Convert(compute(values), ResultType));
++    }
++
++    public ColumnarResult InvokeColumnar(ColumnarResult[] arguments)
++    {
++        var rows = arguments.Length == 0 ? 0 : arguments[0].Column.RowCount;
++        var builder = ColumnHelpers.CreateBuilder(ResultType);
++        var values = new object?[arguments.Length];
++        for (var r = 0; r < rows; r++)
++        {
++            for (var i = 0; i < arguments.Length; i++) values[i] = arguments[i].Column.GetRawDataValue(r);
++            builder.Add(Convert(compute(values), ResultType));
++        }
++        return new ColumnarResult(builder.ToColumn());
++    }
++
++    public static object? Convert(object? value, TypeSymbol type)
++    {
++        if (value is null) return null;
++        var t = type.Simplify();
++        if (t == ScalarTypes.Real)
++            return value switch { double d => double.IsFinite(d) ? d : null, _ => System.Convert.ToDouble(value) };
++        if (t == ScalarTypes.Long) return System.Convert.ToInt64(value);
++        if (t == ScalarTypes.Int) return System.Convert.ToInt32(value);
++        if (t == ScalarTypes.Bool) return System.Convert.ToBoolean(value);
++        if (t == ScalarTypes.String) return value.ToString();
++        if (t == ScalarTypes.Dynamic)
++            return value switch
++            {
++                JsonNode n => n,
++                double d => double.IsFinite(d) ? JsonValue.Create(d) : null,
++                long l => JsonValue.Create(l),
++                int i => JsonValue.Create(i),
++                string s => JsonValue.Create(s),
++                bool b => JsonValue.Create(b),
++                _ => JsonValue.Create(value.ToString())
++            };
++        return value;
++    }
++}
+diff --git a/libraries/KustoLoco.Core/Evaluation/BuiltIns/ScalarFunctions/SeriesMath.cs b/libraries/KustoLoco.Core/Evaluation/BuiltIns/ScalarFunctions/SeriesMath.cs
+new file mode 100644
+index 00000000..06ba6099
+--- /dev/null
++++ b/libraries/KustoLoco.Core/Evaluation/BuiltIns/ScalarFunctions/SeriesMath.cs
+@@ -0,0 +1,246 @@
++//
++// Licensed under the MIT License.
++
++using System;
++using System.Collections.Generic;
++using System.Linq;
++using System.Text.Json.Nodes;
++
++namespace KustoLoco.Core.Evaluation.BuiltIns.Impl;
++
++/// <summary>
++///     Numerical core of the series_* functions (series_stats, series_fit_line, series_outliers,
++///     series_decompose, series_decompose_anomalies). Series arrive as dynamic arrays; non-numeric or null elements
++///     are treated as missing (NaN) the way ADX ignores them in statistics.
++/// </summary>
++/// <remarks>
++///     The algorithms follow the ADX documentation: Tukey fences on the 10th/90th percentiles for outliers, a
++///     seasonal + trend baseline for decomposition, and anomalies flagged where the residual's outlier score exceeds
++///     the threshold. Seasonality auto-detection (seasonality = -1) uses the autocorrelation of the detrended series
++///     instead of ADX's periodogram, so scores are close to but not identical with ADX; clear anomalies get the same
++///     flags.
++/// </remarks>
++internal static class SeriesMath
++{
++    public static double[] ToSeries(JsonNode? node)
++    {
++        if (node is not JsonArray arr) return [];
++        var result = new double[arr.Count];
++        for (var i = 0; i < arr.Count; i++)
++            result[i] = arr[i] is JsonValue v && TryNumber(v, out var d) ? d : double.NaN;
++        return result;
++    }
++
++    private static bool TryNumber(JsonValue v, out double d)
++    {
++        if (v.TryGetValue(out d)) return true;
++        if (v.TryGetValue(out long l)) { d = l; return true; }
++        if (v.TryGetValue(out int i)) { d = i; return true; }
++        if (v.TryGetValue(out decimal m)) { d = (double)m; return true; }
++        if (v.TryGetValue(out bool b)) { d = b ? 1 : 0; return true; }
++        d = double.NaN;
++        return false;
++    }
++
++    public static JsonArray ToJson(IEnumerable<double> values) =>
++        new(values.Select(v => double.IsFinite(v) ? JsonValue.Create(v) : (JsonNode?)null).ToArray());
++
++    public static JsonArray ToJson(IEnumerable<int> values) =>
++        new(values.Select(v => (JsonNode?)JsonValue.Create(v)).ToArray());
++
++    // ---------------------------------------------------------------- series_stats
++    public record Stats(double Min, int MinIdx, double Max, int MaxIdx, double Avg, double Variance, double Stdev);
++
++    public static Stats ComputeStats(double[] s, bool ignoreNonFinite = false)
++    {
++        var finite = s.Select((v, i) => (v, i)).Where(p => double.IsFinite(p.v)).ToArray();
++        if (finite.Length == 0) return new Stats(double.NaN, -1, double.NaN, -1, double.NaN, double.NaN, double.NaN);
++        var min = finite.MinBy(p => p.v);
++        var max = finite.MaxBy(p => p.v);
++        var avg = finite.Average(p => p.v);
++        // sample variance, as ADX (n-1 in the denominator; 0 for a single point)
++        var variance = finite.Length > 1 ? finite.Sum(p => (p.v - avg) * (p.v - avg)) / (finite.Length - 1) : 0;
++        return new Stats(min.v, min.i, max.v, max.i, avg, variance, Math.Sqrt(variance));
++    }
++
++    public static JsonObject StatsToBag(Stats st) => new()
++    {
++        ["min"] = Num(st.Min), ["min_idx"] = st.MinIdx, ["max"] = Num(st.Max), ["max_idx"] = st.MaxIdx,
++        ["avg"] = Num(st.Avg), ["variance"] = Num(st.Variance), ["stdev"] = Num(st.Stdev)
++    };
++
++    public static JsonNode? Num(double v) => double.IsFinite(v) ? JsonValue.Create(v) : null;
++
++    // ---------------------------------------------------------------- series_fit_line
++    public record Line(double RSquare, double Slope, double Variance, double RVariance, double Interception, double[] Fit);
++
++    /// <summary>Least-squares line over x = 0..n-1 (missing points are skipped, as ADX does).</summary>
++    public static Line FitLine(double[] s)
++    {
++        var pts = s.Select((v, i) => (x: (double)i, y: v)).Where(p => double.IsFinite(p.y)).ToArray();
++        var n = pts.Length;
++        if (n == 0) return new Line(double.NaN, double.NaN, double.NaN, double.NaN, double.NaN, s.Select(_ => double.NaN).ToArray());
++        var mx = pts.Average(p => p.x);
++        var my = pts.Average(p => p.y);
++        var sxx = pts.Sum(p => (p.x - mx) * (p.x - mx));
++        var sxy = pts.Sum(p => (p.x - mx) * (p.y - my));
++        var slope = sxx == 0 ? 0 : sxy / sxx;
++        var icept = my - slope * mx;
++        var fit = Enumerable.Range(0, s.Length).Select(i => icept + slope * i).ToArray();
++        var variance = n > 1 ? pts.Sum(p => (p.y - my) * (p.y - my)) / (n - 1) : 0;
++        var rvariance = n > 1 ? pts.Sum(p => Math.Pow(p.y - (icept + slope * p.x), 2)) / (n - 1) : 0;
++        var rsquare = variance == 0 ? 1 : 1 - rvariance / variance;
++        return new Line(rsquare, slope, variance, rvariance, icept, fit);
++    }
++
++    // ---------------------------------------------------------------- series_outliers
++    /// <summary>
++    ///     Tukey-fence outlier score per point (ADX 'ctukey'): with p10/p90 the percentiles and IQR = p90 - p10,
++    ///     a point above p90 scores (x - p90) / IQR, below p10 scores (x - p10) / IQR, inside scores 0. ADX's
++    ///     'tukey' kind uses p25/p75. Points equal to ignoreVal (or missing) score 0.
++    /// </summary>
++    public static double[] Outliers(double[] s, string kind = "ctukey", double? ignoreVal = null,
++        double minPercentile = 10, double maxPercentile = 90)
++    {
++        if (string.Equals(kind, "tukey", StringComparison.OrdinalIgnoreCase))
++        {
++            minPercentile = 25;
++            maxPercentile = 75;
++        }
++        var vals = s.Where(v => double.IsFinite(v) && (ignoreVal is null || v != ignoreVal)).OrderBy(v => v).ToArray();
++        if (vals.Length == 0) return s.Select(_ => 0.0).ToArray();
++        var lo = Percentile(vals, minPercentile);
++        var hi = Percentile(vals, maxPercentile);
++        var iqr = hi - lo;
++        if (iqr <= 0)
++        {
++            // A flat series has no spread: fall back to a scale that makes any departure from it stand out.
++            var mad = vals.Select(v => Math.Abs(v - lo)).Where(d => d > 0).DefaultIfEmpty(0).Min();
++            iqr = mad > 0 ? mad / 10 : 1;
++            iqr = Math.Max(iqr, 1e-9);
++        }
++        return s.Select(v =>
++        {
++            if (!double.IsFinite(v) || (ignoreVal is not null && v == ignoreVal)) return 0.0;
++            if (v > hi) return (v - hi) / iqr;
++            if (v < lo) return (v - lo) / iqr;
++            return 0.0;
++        }).ToArray();
++    }
++
++    /// <summary>Percentile by linear interpolation between closest ranks (input sorted ascending).</summary>
++    public static double Percentile(double[] sorted, double p)
++    {
++        if (sorted.Length == 1) return sorted[0];
++        var rank = p / 100.0 * (sorted.Length - 1);
++        var lo = (int)Math.Floor(rank);
++        var hi = (int)Math.Ceiling(rank);
++        return sorted[lo] + (sorted[hi] - sorted[lo]) * (rank - lo);
++    }
++
++    // ---------------------------------------------------------------- series_decompose
++    public record Decomposition(double[] Baseline, double[] Seasonal, double[] Trend, double[] Residual);
++
++    /// <param name="seasonality">-1 = detect, 0 = none, n = period length in points</param>
++    /// <param name="trend">'avg' (constant mean), 'linefit' (least squares line) or 'none'</param>
++    /// <param name="testPoints">trailing points excluded from the fit (forecast region)</param>
++    public static Decomposition Decompose(double[] s, int seasonality = -1, string trend = "avg", int testPoints = 0)
++    {
++        var n = s.Length;
++        var train = Math.Max(0, n - Math.Max(0, testPoints));
++        var fill = FillMissing(s);
++
++        double[] trendArr;
++        switch (trend.ToLowerInvariant())
++        {
++            case "linefit":
++            {
++                var l = FitLine(fill.Take(train).ToArray());
++                trendArr = Enumerable.Range(0, n).Select(i => l.Interception + l.Slope * i).ToArray();
++                break;
++            }
++            case "none":
++                trendArr = new double[n];
++                break;
++            default:
++            {
++                var avg = train > 0 ? fill.Take(train).Average() : 0;
++                trendArr = Enumerable.Repeat(avg, n).ToArray();
++                break;
++            }
++        }
++
++        var detrended = fill.Select((v, i) => v - trendArr[i]).ToArray();
++        var period = seasonality < 0 ? DetectPeriod(detrended.Take(train).ToArray()) : seasonality;
++        var seasonal = new double[n];
++        if (period >= 2 && train >= 2 * period)
++        {
++            // seasonal component = median of each phase over the training part (robust to the anomalies we look for)
++            var phase = new double[period];
++            for (var p = 0; p < period; p++)
++            {
++                var values = new List<double>();
++                for (var i = p; i < train; i += period) values.Add(detrended[i]);
++                values.Sort();
++                phase[p] = values.Count == 0 ? 0 : Percentile(values.ToArray(), 50);
++            }
++            for (var i = 0; i < n; i++) seasonal[i] = phase[i % period];
++        }
++
++        var baseline = trendArr.Select((t, i) => t + seasonal[i]).ToArray();
++        var residual = s.Select((v, i) => double.IsFinite(v) ? v - baseline[i] : double.NaN).ToArray();
++        return new Decomposition(baseline, seasonal, trendArr, residual);
++    }
++
++    /// <summary>
++    ///     Period detection: autocorrelation r(lag) of the detrended series for lag 2..n/2; the period is the shortest
++    ///     lag that is a local maximum of r and within 90 % of the strongest correlation, provided that is clearly
++    ///     positive (> 0.3). Multiples of the true period correlate almost as well, hence "shortest". Returns 0 when
++    ///     no period stands out.
++    /// </summary>
++    public static int DetectPeriod(double[] x)
++    {
++        var n = x.Length;
++        if (n < 8) return 0;
++        var mean = x.Average();
++        var denom = x.Sum(v => (v - mean) * (v - mean));
++        if (denom <= 0) return 0;
++        var maxLag = n / 2;
++        var r = new double[maxLag + 2];
++        for (var lag = 1; lag <= maxLag + 1 && lag < n; lag++)
++        {
++            double num = 0;
++            for (var i = 0; i + lag < n; i++) num += (x[i] - mean) * (x[i + lag] - mean);
++            r[lag] = num / denom;
++        }
++        var rmax = Enumerable.Range(2, maxLag - 1).Select(l => r[l]).DefaultIfEmpty(0).Max();
++        if (rmax <= 0.3) return 0;
++        for (var lag = 2; lag <= maxLag; lag++)
++            if (r[lag] >= r[lag - 1] && r[lag] >= r[lag + 1] && r[lag] >= 0.9 * rmax)
++                return lag;
++        return 0;
++    }
++
++    private static double[] FillMissing(double[] s)
++    {
++        var finite = s.Where(double.IsFinite).ToArray();
++        var avg = finite.Length > 0 ? finite.Average() : 0;
++        return s.Select(v => double.IsFinite(v) ? v : avg).ToArray();
++    }
++
++    // ---------------------------------------------------------------- series_decompose_anomalies
++    public record Anomalies(int[] Flags, double[] Scores, double[] Baseline);
++
++    /// <summary>
++    ///     Decompose, then score the residual with Tukey fences (ctukey: p10/p90; tukey: p25/p75); a point whose
++    ///     |score| exceeds threshold is flagged +1 (above the baseline) or -1 (below).
++    /// </summary>
++    public static Anomalies DecomposeAnomalies(double[] s, double threshold = 1.5, int seasonality = -1,
++        string trend = "avg", int testPoints = 0, string method = "ctukey")
++    {
++        var d = Decompose(s, seasonality, trend, testPoints);
++        var scores = Outliers(d.Residual, method);
++        var flags = scores.Select(v => v > threshold ? 1 : v < -threshold ? -1 : 0).ToArray();
++        return new Anomalies(flags, scores, d.Baseline);
++    }
++}
+diff --git a/libraries/KustoLoco.Core/Evaluation/BuiltIns/SeriesFunctions.cs b/libraries/KustoLoco.Core/Evaluation/BuiltIns/SeriesFunctions.cs
+new file mode 100644
+index 00000000..ef76dbdd
+--- /dev/null
++++ b/libraries/KustoLoco.Core/Evaluation/BuiltIns/SeriesFunctions.cs
+@@ -0,0 +1,106 @@
++//
++// Licensed under the MIT License.
++
++using System;
++using System.Collections.Generic;
++using System.Globalization;
++using System.Linq;
++using System.Text.Json.Nodes;
++using Kusto.Language;
++using Kusto.Language.Symbols;
++using KustoLoco.Core.Evaluation.BuiltIns.Impl;
++
++namespace KustoLoco.Core.Evaluation.BuiltIns;
++
++/// <summary>
++///     The series_* analysis functions: series_stats, series_stats_dynamic, series_fit_line,
++///     series_fit_line_dynamic, series_outliers, series_decompose, series_decompose_anomalies.
++/// </summary>
++/// <remarks>
++///     Several of these return a tuple in Kusto (<c>extend (flag, score, baseline) = series_decompose_anomalies(s)</c>).
++///     Each function is a <see cref="Compute" /> from the raw argument values (missing optional arguments are simply
++///     absent) to the tuple's values in column order; non-tuple functions return a single value. The translator
++///     (IRTranslator.VisitFunctionCallExpression) turns a tuple-returning call into one scalar call per tuple column.
++/// </remarks>
++internal static class SeriesFunctions
++{
++    public delegate object?[] Compute(object?[] args);
++
++    internal static readonly Dictionary<FunctionSymbol, Compute> Functions = new()
++    {
++        [Kusto.Language.Functions.SeriesStats] = a => StatsValues(SeriesMath.ComputeStats(Series(a), Bool(a, 1))),
++        [Kusto.Language.Functions.SeriesStatsDynamic] = a => [SeriesMath.StatsToBag(SeriesMath.ComputeStats(Series(a), Bool(a, 1)))],
++        [Kusto.Language.Functions.SeriesFitLine] = a => LineValues(SeriesMath.FitLine(Series(a))),
++        [Kusto.Language.Functions.SeriesFitLineDynamic] = a =>
++        {
++            var l = SeriesMath.FitLine(Series(a));
++            return
++            [
++                new JsonObject
++                {
++                    ["rsquare"] = SeriesMath.Num(l.RSquare), ["slope"] = SeriesMath.Num(l.Slope),
++                    ["variance"] = SeriesMath.Num(l.Variance), ["rvariance"] = SeriesMath.Num(l.RVariance),
++                    ["interception"] = SeriesMath.Num(l.Interception), ["line_fit"] = SeriesMath.ToJson(l.Fit)
++                }
++            ];
++        },
++        [Kusto.Language.Functions.SeriesOutliers] = a =>
++        [
++            SeriesMath.ToJson(SeriesMath.Outliers(Series(a), Str(a, 1, "ctukey"), NullableReal(a, 2),
++                Real(a, 3, 10), Real(a, 4, 90)))
++        ],
++        [Kusto.Language.Functions.SeriesDecompose] = a =>
++        {
++            var d = SeriesMath.Decompose(Series(a), Int(a, 1, -1), Str(a, 2, "avg"), Int(a, 3, 0));
++            return
++            [
++                SeriesMath.ToJson(d.Baseline), SeriesMath.ToJson(d.Seasonal), SeriesMath.ToJson(d.Trend),
++                SeriesMath.ToJson(d.Residual)
++            ];
++        },
++        [Kusto.Language.Functions.SeriesDecomposeAnomalies] = a =>
++        {
++            var r = SeriesMath.DecomposeAnomalies(Series(a), Real(a, 1, 1.5), Int(a, 2, -1), Str(a, 3, "avg"),
++                Int(a, 4, 0), Str(a, 5, "ctukey"));
++            return [SeriesMath.ToJson(r.Flags), SeriesMath.ToJson(r.Scores), SeriesMath.ToJson(r.Baseline)];
++        },
++    };
++
++    private static object?[] StatsValues(SeriesMath.Stats s) =>
++        [Nan(s.Min), s.MinIdx < 0 ? null : s.MinIdx, Nan(s.Max), s.MaxIdx < 0 ? null : s.MaxIdx, Nan(s.Avg),
++            Nan(s.Variance), Nan(s.Stdev)];
++
++    private static object?[] LineValues(SeriesMath.Line l) =>
++        [Nan(l.RSquare), Nan(l.Slope), Nan(l.Variance), Nan(l.RVariance), Nan(l.Interception), SeriesMath.ToJson(l.Fit)];
++
++    private static object? Nan(double d) => double.IsFinite(d) ? d : null;
++
++    private static double[] Series(object?[] a) => SeriesMath.ToSeries(a.Length > 0 ? a[0] as JsonNode : null);
++
++    // Optional arguments: absent, null, or the literal default are all "use the default".
++    private static object? Raw(object?[] a, int i)
++    {
++        var v = i < a.Length ? a[i] : null;
++        return v is JsonValue j ? j.GetValue<object>() : v;
++    }
++
++    private static double Real(object?[] a, int i, double def) =>
++        Raw(a, i) is { } v && v is not string ? Convert.ToDouble(v, CultureInfo.InvariantCulture) : def;
++
++    private static double? NullableReal(object?[] a, int i) =>
++        Raw(a, i) is { } v && v is not string ? Convert.ToDouble(v, CultureInfo.InvariantCulture) : null;
++
++    private static int Int(object?[] a, int i, int def) =>
++        Raw(a, i) is { } v && v is not string ? Convert.ToInt32(v, CultureInfo.InvariantCulture) : def;
++
++    private static bool Bool(object?[] a, int i) => Raw(a, i) is bool b && b;
++
++    private static string Str(object?[] a, int i, string def) =>
++        Raw(a, i) is string s && s.Length > 0 ? s : def;
++
++    /// <summary>Builds the scalar overload that computes tuple element <paramref name="index" />.</summary>
++    internal static ScalarOverloadInfo ElementOverload(Compute compute, int index, TypeSymbol elementType,
++        IEnumerable<TypeSymbol> argumentTypes) =>
++        new(new RowwiseScalarFunctionImpl(args => compute(args)[index], elementType), elementType,
++            argumentTypes.ToArray());
++}
+diff --git a/libraries/KustoLoco.Core/InternalRepresentation/Nodes/Expressions/IRTupleScalarCallNode.cs b/libraries/KustoLoco.Core/InternalRepresentation/Nodes/Expressions/IRTupleScalarCallNode.cs
+new file mode 100644
+index 00000000..a30b175b
+--- /dev/null
++++ b/libraries/KustoLoco.Core/InternalRepresentation/Nodes/Expressions/IRTupleScalarCallNode.cs
+@@ -0,0 +1,33 @@
++//
++// Licensed under the MIT License.
++
++using System;
++using System.Collections.Generic;
++using Kusto.Language.Symbols;
++
++namespace KustoLoco.Core.InternalRepresentation.Nodes.Expressions;
++
++/// <summary>
++///     A call to a scalar function that returns a tuple, e.g. <c>series_fit_line(s)</c> or
++///     <c>series_decompose_anomalies(s)</c>. It is never evaluated as a whole: extend, project and print replace it
++///     with its <see cref="Elements" />, one scalar call per tuple column, in column order.
++/// </summary>
++internal class IRTupleScalarCallNode : IRExpressionNode
++{
++    public IRTupleScalarCallNode(TupleSymbol tuple, IReadOnlyList<IRExpressionNode> elements, string functionName)
++        : base(tuple, elements.Count > 0 ? elements[0].ResultKind : EvaluatedExpressionKind.Scalar)
++    {
++        Elements = elements;
++        FunctionName = functionName;
++    }
++
++    public IReadOnlyList<IRExpressionNode> Elements { get; }
++    public string FunctionName { get; }
++
++    public override int ChildCount => Elements.Count;
++    public override IRNode GetChild(int index) => Elements[index];
++
++    public override TResult Accept<TResult, TContext>(IRNodeVisitor<TResult, TContext> visitor, TContext context)
++        => throw new NotSupportedException(
++            $"{FunctionName}() returns several columns; use it directly in extend, project or print, e.g. extend (a, b) = {FunctionName}(...)");
++}
+diff --git a/libraries/KustoLoco.Core/InternalRepresentation/Translation/IRTranslator.Expressions.cs b/libraries/KustoLoco.Core/InternalRepresentation/Translation/IRTranslator.Expressions.cs
+index 9819f629..0a82c4d9 100644
+--- a/libraries/KustoLoco.Core/InternalRepresentation/Translation/IRTranslator.Expressions.cs
++++ b/libraries/KustoLoco.Core/InternalRepresentation/Translation/IRTranslator.Expressions.cs
+@@ -305,6 +305,32 @@ internal partial class IRTranslator : DefaultSyntaxVisitor<IRNode>
+         return new IRUnaryExpressionNode(signature, overloadInfo, irExpression, node.ResultType);
+     }
+ 
++    /// <summary>
++    ///     Functions in <see cref="SeriesFunctions" /> are evaluated row by row from raw argument values. A tuple
++    ///     result becomes an <see cref="IRTupleScalarCallNode" /> holding one call per tuple column (arguments are
++    ///     translated afresh for each, so no IR node is shared); extend/project/print expand it into columns.
++    /// </summary>
++    private IRNode TranslateRowwiseFunctionCall(FunctionCallExpression node, Signature signature,
++        IReadOnlyList<Parameter> parameters, IRExpressionNode[] irArguments, SeriesFunctions.Compute compute)
++    {
++        IRExpressionNode[] TranslateArguments() =>
++            node.ArgumentList.Expressions.Select(a => (IRExpressionNode)a.Element.Accept(this)).ToArray();
++
++        var argumentTypes = irArguments.Select(a => a.ResultType).ToArray();
++        if (node.ResultType is TupleSymbol tuple)
++        {
++            var elements = tuple.Columns.Select((column, i) =>
++                (IRExpressionNode)new IRBuiltInScalarFunctionCallNode(signature,
++                    SeriesFunctions.ElementOverload(compute, i, column.Type, argumentTypes), parameters,
++                    IRListNode.From(i == 0 ? irArguments : TranslateArguments()), column.Type)).ToArray();
++            return new IRTupleScalarCallNode(tuple, elements, signature.Symbol.Name);
++        }
++
++        return new IRBuiltInScalarFunctionCallNode(signature,
++            SeriesFunctions.ElementOverload(compute, 0, node.ResultType, argumentTypes), parameters,
++            IRListNode.From(irArguments), node.ResultType);
++    }
++
+     public override IRNode VisitFunctionCallExpression(FunctionCallExpression node)
+     {
+         var signature = node.ReferencedSignature;
+@@ -368,6 +394,9 @@ internal partial class IRTranslator : DefaultSyntaxVisitor<IRNode>
+             parameters = BuildPackAllParameters(irArguments.Length);
+         }
+ 
++        if (SeriesFunctions.Functions.TryGetValue(functionSymbol, out var seriesCompute))
++            return TranslateRowwiseFunctionCall(node, signature, parameters, irArguments, seriesCompute);
++
+         if (FunctionFinder.TryGetOverload(_functions, functionSymbol, returnType, irArguments, parameters,
+                 out var functionOverload))
+         {
+diff --git a/libraries/KustoLoco.Core/InternalRepresentation/Translation/IRTranslator.Print.cs b/libraries/KustoLoco.Core/InternalRepresentation/Translation/IRTranslator.Print.cs
+index 583fd882..2731ec41 100644
+--- a/libraries/KustoLoco.Core/InternalRepresentation/Translation/IRTranslator.Print.cs
++++ b/libraries/KustoLoco.Core/InternalRepresentation/Translation/IRTranslator.Print.cs
+@@ -13,7 +13,7 @@ internal partial class IRTranslator
+     public override IRNode VisitPrintOperator(PrintOperator node)
+     {
+         var irExpressions = node.Expressions
+-            .Select(expression => (IRExpressionNode)expression.Element.Accept(this))
++            .SelectMany(expression => ExpandTuple(expression.Element))
+             .ToArray();
+ 
+         return new IRPrintOperatorNode(IRListNode.From(irExpressions), node.ResultType);
+diff --git a/libraries/KustoLoco.Core/InternalRepresentation/Translation/IRTranslator.Project.cs b/libraries/KustoLoco.Core/InternalRepresentation/Translation/IRTranslator.Project.cs
+index 88c4715a..3e22f1e1 100644
+--- a/libraries/KustoLoco.Core/InternalRepresentation/Translation/IRTranslator.Project.cs
++++ b/libraries/KustoLoco.Core/InternalRepresentation/Translation/IRTranslator.Project.cs
+@@ -4,6 +4,7 @@
+ using System;
+ using System.Collections.Generic;
+ using System.Diagnostics;
++using System.Linq;
+ using Kusto.Language.Symbols;
+ using Kusto.Language.Syntax;
+ using Kusto.Language.Utils;
+@@ -18,13 +19,11 @@ internal partial class IRTranslator
+     public override IRNode VisitProjectOperator(ProjectOperator node)
+     {
+         var columns = new List<IROutputColumnNode>();
+-        for (var i = 0; i < node.Expressions.Count; i++)
+-        {
+-            var symbol = (ColumnSymbol)node.ResultType.Members[i];
+-            var expression = node.Expressions[i].Element;
+-            var irExpression = (IRExpressionNode)expression.Accept(this);
+-            columns.Add(new IROutputColumnNode(symbol, irExpression));
+-        }
++        // A tuple-returning call yields several result columns, so walk the result members separately.
++        var member = 0;
++        foreach (var element in node.Expressions)
++            foreach (var irExpression in ExpandTuple(element.Element))
++                columns.Add(new IROutputColumnNode((ColumnSymbol)node.ResultType.Members[member++], irExpression));
+ 
+         return new IRProjectOperatorNode(IRListNode.From(columns), node.ResultType, false);
+     }
+@@ -110,7 +109,28 @@ internal partial class IRTranslator
+         foreach (var element in expressions)
+         {
+             var expression = element.Element;
++            if (expression is CompoundNamedExpression compound)
++            {
++                // extend (a, b, ...) = tuple_function(...): one pending column per name, in order
++                var parts = ExpandTuple(compound);
++                for (var n = 0; n < parts.Count; n++)
++                {
++                    var node = pendingExpressions.AddLast(parts[n]);
++                    if (n < compound.Names.Names.Count &&
++                        compound.Names.Names[n].Element.ReferencedSymbol is ColumnSymbol named)
++                        namedExtendedColumns[named] = node;
++                }
++                continue;
++            }
++
+             var irExpression = (IRExpressionNode)expression.Accept(this);
++            if (irExpression is IRTupleScalarCallNode tupleCall)
++            {
++                // unnamed tuple call: Kusto names the columns itself; they are the trailing new columns
++                foreach (var part in tupleCall.Elements) pendingExpressions.AddLast(part);
++                continue;
++            }
++
+             var linkedListNode = pendingExpressions.AddLast(irExpression);
+ 
+             if (expression is SimpleNamedExpression simpleNamedExpression)
+@@ -153,4 +173,18 @@ internal partial class IRTranslator
+ 
+         return new IRProjectOperatorNode(IRListNode.From(columns), resultType,requiresSerialization);
+     }
++
++    /// <summary>
++    ///     The IR expressions an extend/project/print element contributes: one, or one per column for a call to a
++    ///     tuple-returning function (written bare or as <c>(a, b) = f(...)</c>).
++    /// </summary>
++    private List<IRExpressionNode> ExpandTuple(Expression expression)
++    {
++        var inner = expression is CompoundNamedExpression compound ? compound.Expression : expression;
++        var ir = (IRExpressionNode)inner.Accept(this);
++        if (ir is IRTupleScalarCallNode tuple) return tuple.Elements.ToList();
++        if (expression is CompoundNamedExpression)
++            throw new NotSupportedException("(a, b, ...) = expression requires a function that returns a tuple");
++        return [ir];
++    }
+ }
+diff --git a/test/BasicTests/SeriesFunctionTests.cs b/test/BasicTests/SeriesFunctionTests.cs
+new file mode 100644
+index 00000000..6ba065e1
+--- /dev/null
++++ b/test/BasicTests/SeriesFunctionTests.cs
+@@ -0,0 +1,116 @@
++using System.Linq;
++using AwesomeAssertions;
++
++namespace BasicTests;
++
++[TestClass]
++public class SeriesFunctionTests : TestMethods
++{
++    private static string Flat(int n, int spikeAt, int spike) =>
++        "dynamic([" + string.Join(",", Enumerable.Range(0, n).Select(i => i == spikeAt ? spike : 10)) + "])";
++
++    [TestMethod]
++    public async Task SeriesStats_Tuple()
++    {
++        var query = "print s=dynamic([1,2,3,4]) | extend (mn, mni, mx, mxi, a, v, sd) = series_stats(s) " +
++                    "| project mn, mni, mx, mxi, a, v";
++        var result = await ResultAsString(query);
++        result.Should().Be("1,0,4,3,2.5,1.6666666666666667");
++    }
++
++    [TestMethod]
++    public async Task SeriesStatsDynamic_Bag()
++    {
++        var query = "print s=dynamic([1,2,3,4]) | extend b = series_stats_dynamic(s) | project mx=b.max, a=b.avg";
++        var result = await ResultAsString(query);
++        result.Should().Be("4,2.5");
++    }
++
++    [TestMethod]
++    public async Task SeriesFitLine_PerfectLine()
++    {
++        var query = "print s=dynamic([1,3,5,7,9]) " +
++                    "| extend (rsquare, slope, variance, rvariance, interception, line_fit) = series_fit_line(s) " +
++                    "| project rsquare, slope, interception";
++        var result = await ResultAsString(query);
++        result.Should().Be("1,2,1");
++    }
++
++    [TestMethod]
++    public async Task SeriesFitLine_UnnamedColumns()
++    {
++        // Without names Kusto names the tuple columns itself (series_fit_line_s_rsquare, ...).
++        var query = "print s=dynamic([0,1,2]) | extend series_fit_line(s)";
++        var result = await Result(query);
++        result.ColumnDefinitions().Select(c => c.Name).Should().Contain("series_fit_line_s_slope");
++        result.ColumnCount.Should().Be(7);
++    }
++
++    [TestMethod]
++    public async Task SeriesOutliers_FlagsTheSpike()
++    {
++        var query = $"print s={Flat(20, 7, 100)} | extend o = series_outliers(s) " +
++                    "| mv-expand with_itemindex=i o to typeof(real) | where o > 1.5 | project i";
++        var result = await ResultAsString(query, ";");
++        result.Should().Be("7");
++    }
++
++    [TestMethod]
++    public async Task SeriesDecomposeAnomalies_FlatSeriesWithOneSpike()
++    {
++        var query = $"print s={Flat(48, 30, 80)} " +
++                    "| extend (flag, score, baseline) = series_decompose_anomalies(s) " +
++                    "| mv-expand with_itemindex=i flag to typeof(int) | where flag != 0 | project i, flag";
++        var result = await ResultAsString(query, ";");
++        result.Should().Be("30,1");
++    }
++
++    [TestMethod]
++    public async Task SeriesDecomposeAnomalies_DailySeasonality()
++    {
++        // 7 days of hourly points with a daily cycle (busy 08-18h) and one spike at hour 100 (a quiet hour): the
++        // seasonal baseline absorbs the cycle, so only the spike is flagged.
++        var values = Enumerable.Range(0, 168).Select(i =>
++        {
++            var h = i % 24;
++            var v = h is >= 8 and <= 18 ? 50 : 10;
++            return i == 100 ? v + 60 : v;
++        });
++        var series = "dynamic([" + string.Join(",", values) + "])";
++        var query = $"print s={series} | extend (flag, score, baseline) = series_decompose_anomalies(s, 1.5, -1, 'avg') " +
++                    "| mv-expand with_itemindex=i flag to typeof(int) | where flag != 0 | project i";
++        var result = await ResultAsString(query, ";");
++        result.Should().Be("100");
++    }
++
++    [TestMethod]
++    public async Task SeriesDecompose_SeasonalComponent()
++    {
++        var series = "dynamic([" + string.Join(",", Enumerable.Range(0, 40).Select(i => i % 4 == 0 ? 20 : 0)) + "])";
++        var query = $"print s={series} | extend (baseline, seasonal, trend, residual) = series_decompose(s) " +
++                    "| project r = series_stats_dynamic(residual).max, b0 = todouble(baseline[0]), b1 = todouble(baseline[1])";
++        var result = await ResultAsString(query);
++        result.Should().Be("0,20,0");
++    }
++
++    [TestMethod]
++    public async Task SeriesDecomposeAnomalies_AfterMakeSeries()
++    {
++        // The SOC idiom: make-series per hour, then flag the hour with the burst.
++        var rows = string.Join(",", Enumerable.Range(0, 24).SelectMany(h =>
++            Enumerable.Range(0, h == 15 ? 40 : 2).Select(_ => $"datetime(2026-10-01T{h:00}:10:00Z)")));
++        var query = $"datatable(t:datetime)[{rows}] | make-series n=count() on t step 1h " +
++                    "| extend (a, s, b) = series_decompose_anomalies(n) " +
++                    "| mv-expand with_itemindex=i a to typeof(int) | where a == 1 | project i";
++        var result = await ResultAsString(query, ";");
++        result.Should().Be("15");
++    }
++
++    [TestMethod]
++    public async Task TupleFunction_InProject()
++    {
++        var query = "print s=dynamic([2,4,6]) | project (r2, slope, v, rv, ic, lf) = series_fit_line(s) | project slope";
++        var result = await ResultAsString(query);
++        result.Should().Be("2");
++    }
++}

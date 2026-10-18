@@ -1,0 +1,260 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: thecorporatetractor <marco@azarguard.com>
+Date: Sun, 18 Oct 2026 17:41:32 +0300
+Subject: [PATCH 06/15] core: add stdev, variance and their p/if forms
+
+stdev, stdevif, stdevp, variance, varianceif, variancep and variancepif over
+int, long and real. Sample statistics divide by n-1 (0 for one value),
+population ones by n; no values gives null. Accumulated as count, sum and sum
+of squares per chunk (NumericAggregate.SumOfSquares), so results combine
+across chunks. Beaconing detections need stdev(gap)/avg(gap).
+---
+ .../BuiltIns/Aggregates/NumericAggregate.cs   |   4 +
+ .../BuiltIns/Aggregates/VarianceAggregates.cs | 154 ++++++++++++++++++
+ .../Evaluation/BuiltIns/BuiltInAggregates.cs  |   7 +
+ test/BasicTests/VarianceAggregateTests.cs     |  43 +++++
+ 4 files changed, 208 insertions(+)
+ create mode 100644 libraries/KustoLoco.Core/Evaluation/BuiltIns/Aggregates/VarianceAggregates.cs
+ create mode 100644 test/BasicTests/VarianceAggregateTests.cs
+
+diff --git a/libraries/KustoLoco.Core/Evaluation/BuiltIns/Aggregates/NumericAggregate.cs b/libraries/KustoLoco.Core/Evaluation/BuiltIns/Aggregates/NumericAggregate.cs
+index 8668f38a..6b49d679 100644
+--- a/libraries/KustoLoco.Core/Evaluation/BuiltIns/Aggregates/NumericAggregate.cs
++++ b/libraries/KustoLoco.Core/Evaluation/BuiltIns/Aggregates/NumericAggregate.cs
+@@ -19,5 +19,9 @@ public class NumericAggregate
+     /// used for aggregations for decimals
+     /// </summary>
+     public decimal DecimalValue;
++    /// <summary>
++    /// sum of squared values, for variance and standard deviation
++    /// </summary>
++    public double SumOfSquares;
+ }
+ 
+diff --git a/libraries/KustoLoco.Core/Evaluation/BuiltIns/Aggregates/VarianceAggregates.cs b/libraries/KustoLoco.Core/Evaluation/BuiltIns/Aggregates/VarianceAggregates.cs
+new file mode 100644
+index 00000000..9acd29cb
+--- /dev/null
++++ b/libraries/KustoLoco.Core/Evaluation/BuiltIns/Aggregates/VarianceAggregates.cs
+@@ -0,0 +1,154 @@
++﻿using System;
++using System.Collections.Concurrent;
++using System.Linq;
++
++// ReSharper disable PartialTypeWithSinglePart
++namespace KustoLoco.Core.Evaluation.BuiltIns.Impl;
++
++/// <summary>
++///     Shared accumulation for stdev/variance and their population (p) and conditional (if)
++///     forms. Sample statistics divide by n-1 (0 for a single value), population ones by n;
++///     no values gives null.
++/// </summary>
++internal static class VarianceSupport
++{
++    internal static double Add(NumericAggregate context, double value)
++    {
++        context.Count++;
++        context.DoubleValue += value;
++        context.SumOfSquares += value * value;
++        return 0;
++    }
++
++    internal static double? Variance(ConcurrentBag<NumericAggregate> contexts, bool population)
++    {
++        var n = contexts.Sum(c => (long)c.Count);
++        if (n == 0)
++            return null;
++        var sum = contexts.Sum(c => c.DoubleValue);
++        var sumSquares = contexts.Sum(c => c.SumOfSquares);
++        var mean = sum / n;
++        var squaredDeviations = Math.Max(0, sumSquares - n * mean * mean);
++        if (population)
++            return squaredDeviations / n;
++        return n == 1 ? 0 : squaredDeviations / (n - 1);
++    }
++
++    internal static double? Stdev(ConcurrentBag<NumericAggregate> contexts, bool population)
++    {
++        var v = Variance(contexts, population);
++        return v is null ? null : Math.Sqrt(v.Value);
++    }
++}
++
++[KustoImplementation(Keyword = "Aggregates.Stdev")]
++internal partial class StdevAggregate
++{
++    internal static double IntImpl(NumericAggregate context, int n) => VarianceSupport.Add(context, n);
++
++    internal static double? IntImplFinish(ConcurrentBag<NumericAggregate> contexts) => VarianceSupport.Stdev(contexts, false);
++
++    internal static double LongImpl(NumericAggregate context, long n) => VarianceSupport.Add(context, n);
++
++    internal static double? LongImplFinish(ConcurrentBag<NumericAggregate> contexts) => VarianceSupport.Stdev(contexts, false);
++
++    internal static double DoubleImpl(NumericAggregate context, double n) => VarianceSupport.Add(context, n);
++
++    internal static double? DoubleImplFinish(ConcurrentBag<NumericAggregate> contexts) => VarianceSupport.Stdev(contexts, false);
++}
++
++[KustoImplementation(Keyword = "Aggregates.StdevIf")]
++internal partial class StdevIfAggregate
++{
++    internal static double IntImpl(NumericAggregate context, int n, bool t) => t ? VarianceSupport.Add(context, n) : 0;
++
++    internal static double? IntImplFinish(ConcurrentBag<NumericAggregate> contexts) => VarianceSupport.Stdev(contexts, false);
++
++    internal static double LongImpl(NumericAggregate context, long n, bool t) => t ? VarianceSupport.Add(context, n) : 0;
++
++    internal static double? LongImplFinish(ConcurrentBag<NumericAggregate> contexts) => VarianceSupport.Stdev(contexts, false);
++
++    internal static double DoubleImpl(NumericAggregate context, double n, bool t) => t ? VarianceSupport.Add(context, n) : 0;
++
++    internal static double? DoubleImplFinish(ConcurrentBag<NumericAggregate> contexts) => VarianceSupport.Stdev(contexts, false);
++}
++
++[KustoImplementation(Keyword = "Aggregates.Stdevp")]
++internal partial class StdevpAggregate
++{
++    internal static double IntImpl(NumericAggregate context, int n) => VarianceSupport.Add(context, n);
++
++    internal static double? IntImplFinish(ConcurrentBag<NumericAggregate> contexts) => VarianceSupport.Stdev(contexts, true);
++
++    internal static double LongImpl(NumericAggregate context, long n) => VarianceSupport.Add(context, n);
++
++    internal static double? LongImplFinish(ConcurrentBag<NumericAggregate> contexts) => VarianceSupport.Stdev(contexts, true);
++
++    internal static double DoubleImpl(NumericAggregate context, double n) => VarianceSupport.Add(context, n);
++
++    internal static double? DoubleImplFinish(ConcurrentBag<NumericAggregate> contexts) => VarianceSupport.Stdev(contexts, true);
++}
++
++[KustoImplementation(Keyword = "Aggregates.Variance")]
++internal partial class VarianceAggregate
++{
++    internal static double IntImpl(NumericAggregate context, int n) => VarianceSupport.Add(context, n);
++
++    internal static double? IntImplFinish(ConcurrentBag<NumericAggregate> contexts) => VarianceSupport.Variance(contexts, false);
++
++    internal static double LongImpl(NumericAggregate context, long n) => VarianceSupport.Add(context, n);
++
++    internal static double? LongImplFinish(ConcurrentBag<NumericAggregate> contexts) => VarianceSupport.Variance(contexts, false);
++
++    internal static double DoubleImpl(NumericAggregate context, double n) => VarianceSupport.Add(context, n);
++
++    internal static double? DoubleImplFinish(ConcurrentBag<NumericAggregate> contexts) => VarianceSupport.Variance(contexts, false);
++}
++
++[KustoImplementation(Keyword = "Aggregates.VarianceIf")]
++internal partial class VarianceIfAggregate
++{
++    internal static double IntImpl(NumericAggregate context, int n, bool t) => t ? VarianceSupport.Add(context, n) : 0;
++
++    internal static double? IntImplFinish(ConcurrentBag<NumericAggregate> contexts) => VarianceSupport.Variance(contexts, false);
++
++    internal static double LongImpl(NumericAggregate context, long n, bool t) => t ? VarianceSupport.Add(context, n) : 0;
++
++    internal static double? LongImplFinish(ConcurrentBag<NumericAggregate> contexts) => VarianceSupport.Variance(contexts, false);
++
++    internal static double DoubleImpl(NumericAggregate context, double n, bool t) => t ? VarianceSupport.Add(context, n) : 0;
++
++    internal static double? DoubleImplFinish(ConcurrentBag<NumericAggregate> contexts) => VarianceSupport.Variance(contexts, false);
++}
++
++[KustoImplementation(Keyword = "Aggregates.Variancep")]
++internal partial class VariancepAggregate
++{
++    internal static double IntImpl(NumericAggregate context, int n) => VarianceSupport.Add(context, n);
++
++    internal static double? IntImplFinish(ConcurrentBag<NumericAggregate> contexts) => VarianceSupport.Variance(contexts, true);
++
++    internal static double LongImpl(NumericAggregate context, long n) => VarianceSupport.Add(context, n);
++
++    internal static double? LongImplFinish(ConcurrentBag<NumericAggregate> contexts) => VarianceSupport.Variance(contexts, true);
++
++    internal static double DoubleImpl(NumericAggregate context, double n) => VarianceSupport.Add(context, n);
++
++    internal static double? DoubleImplFinish(ConcurrentBag<NumericAggregate> contexts) => VarianceSupport.Variance(contexts, true);
++}
++
++[KustoImplementation(Keyword = "Aggregates.VariancepIf")]
++internal partial class VariancepIfAggregate
++{
++    internal static double IntImpl(NumericAggregate context, int n, bool t) => t ? VarianceSupport.Add(context, n) : 0;
++
++    internal static double? IntImplFinish(ConcurrentBag<NumericAggregate> contexts) => VarianceSupport.Variance(contexts, true);
++
++    internal static double LongImpl(NumericAggregate context, long n, bool t) => t ? VarianceSupport.Add(context, n) : 0;
++
++    internal static double? LongImplFinish(ConcurrentBag<NumericAggregate> contexts) => VarianceSupport.Variance(contexts, true);
++
++    internal static double DoubleImpl(NumericAggregate context, double n, bool t) => t ? VarianceSupport.Add(context, n) : 0;
++
++    internal static double? DoubleImplFinish(ConcurrentBag<NumericAggregate> contexts) => VarianceSupport.Variance(contexts, true);
++}
+diff --git a/libraries/KustoLoco.Core/Evaluation/BuiltIns/BuiltInAggregates.cs b/libraries/KustoLoco.Core/Evaluation/BuiltIns/BuiltInAggregates.cs
+index 729f7995..b88614d3 100644
+--- a/libraries/KustoLoco.Core/Evaluation/BuiltIns/BuiltInAggregates.cs
++++ b/libraries/KustoLoco.Core/Evaluation/BuiltIns/BuiltInAggregates.cs
+@@ -107,6 +107,13 @@ internal static class BuiltInAggregates
+ 
+         AvgAggregate.Register(Aggregates);
+         AvgIfAggregate.Register(Aggregates);
++        StdevAggregate.Register(Aggregates);
++        StdevIfAggregate.Register(Aggregates);
++        StdevpAggregate.Register(Aggregates);
++        VarianceAggregate.Register(Aggregates);
++        VarianceIfAggregate.Register(Aggregates);
++        VariancepAggregate.Register(Aggregates);
++        VariancepIfAggregate.Register(Aggregates);
+         SumAggregate.Register(Aggregates);
+         SumIfAggregate.Register(Aggregates);
+         MinAggregate.Register(Aggregates);
+diff --git a/test/BasicTests/VarianceAggregateTests.cs b/test/BasicTests/VarianceAggregateTests.cs
+new file mode 100644
+index 00000000..48098784
+--- /dev/null
++++ b/test/BasicTests/VarianceAggregateTests.cs
+@@ -0,0 +1,43 @@
++﻿using AwesomeAssertions;
++
++namespace BasicTests;
++
++[TestClass]
++public class VarianceAggregateTests : TestMethods
++{
++    // 2,4,4,4,5,5,7,9: mean 5, squared deviations 32 -> population variance 4, sample 32/7
++    private const string Data = "datatable(v:long, k:string)[2,'a',4,'a',4,'b',4,'b',5,'a',5,'b',7,'a',9,'b']";
++
++    [TestMethod]
++    public async Task PopulationAndSample()
++    {
++        var result = await LastLineOfResult(
++            $"{Data} | summarize vp=variancep(v), sp=stdevp(v), vs=round(variance(v), 6), ss=round(stdev(v), 6)");
++        result.Should().Be("4,2,4.571429,2.13809");
++    }
++
++    [TestMethod]
++    public async Task ConditionalForms()
++    {
++        // k == 'a': 2,4,5,7 -> mean 4.5, squared deviations 13 -> sample variance 13/3
++        var result = await LastLineOfResult(
++            $"{Data} | summarize vi=round(varianceif(v, k == 'a'), 6), si=round(stdevif(v, k == 'a'), 6), vpi=variancepif(v, k == 'a')");
++        result.Should().Be("4.333333,2.081666,3.25");
++    }
++
++    [TestMethod]
++    public async Task SingleValueAndReals()
++    {
++        var result = await LastLineOfResult("datatable(r:real)[1.5] | summarize s=stdev(r), p=stdevp(r)");
++        result.Should().Be("0,0");
++    }
++
++    [TestMethod]
++    public async Task ByGroupForBeaconRegularity()
++    {
++        var result = await ResultAsString(
++            "datatable(h:string, gap:int)['c2',300,'c2',301,'c2',299,'web',5,'web',900,'web',40] " +
++            "| summarize cv=round(stdev(gap)/avg(gap), 3) by h | order by h asc");
++        result.Should().Be("c2,0.003,web,1.609");
++    }
++}

@@ -1,0 +1,265 @@
+#!/usr/bin/env python3
+"""ct-kql: run KQL non-interactively for lab checks (and scripts).
+
+  ct-kql query   [OPTS] (QUERY | -f FILE)              the result (--format json|csv|table, default json)
+  ct-kql scalar  [OPTS] (QUERY | -f FILE)              first column of the first row ("" if no rows)
+  ct-kql count   [OPTS] (QUERY | -f FILE)              number of rows
+  ct-kql compare [OPTS] [--ordered] [--columns] (QUERY | -f FILE) EXPECTED_QUERY
+                                                       "match", or "mismatch: <why>"
+  ct-kql answer KEY [--answers FILE]                   a value from the generator's answers
+OPTS: --data DIR (repeatable; default $KQL_DATA or the lab dataset), --sample (also the
+      Azure Sentinel sample tables as Sample_<Table>), --timeout SECONDS (default 25)
+
+A query that fails prints "error: <message>" on stdout and exits 1, so a check that
+expects a value fails with a readable reason. Query text comes from the argument or a file
+(one query per file; blank lines are ignored, `//` comments are fine). lokql commands
+(lines starting with ".") are refused: they can run programs and write files.
+
+Run as root (lab checks), every query runs as the learner and files named with -f are read
+as the learner, so a query can never read what the learner cannot (e.g. the answers).
+compare: same rows (as multisets; --ordered for order too) and the same column count;
+column names are ignored unless --columns. Values compare as JSON, numbers with a 1e-9
+relative tolerance.
+"""
+import json
+import math
+import os
+import pwd
+import shutil
+import subprocess
+import sys
+import tempfile
+
+LOKQL = os.environ.get("KQL_LOKQL", "/opt/cloudtrain/kql/lokql/lokql")
+LOAD = os.environ.get("KQL_LOAD", "/usr/local/bin/kql-load")
+LAB_DATA = "/srv/kql/lab"
+DEMO_DATA = "/opt/cloudtrain/kql/datasets/demo"
+SAMPLE_DATA = "/opt/cloudtrain/kql/datasets/sentinel-sample"
+ANSWERS = "/var/lib/cloudtrain/kql/answers.json"
+LEARNER = "learner"
+
+
+class Failed(Exception):
+    pass
+
+
+def as_learner(cmd):
+    """Prefix to run cmd as the learner when we are root (lab checks run as root)."""
+    if os.geteuid() == 0:
+        return ["runuser", "-u", LEARNER, "--", "env", "-i", "HOME=/home/learner", "USER=learner",
+                "PATH=/usr/local/bin:/usr/bin:/bin", "DOTNET_CLI_TELEMETRY_OPTOUT=1", "TERM=dumb", *cmd]
+    return cmd
+
+
+def default_datasets():
+    env = os.environ.get("KQL_DATA")
+    if env:
+        return [d for d in env.split(":") if d]
+    return [LAB_DATA if os.path.isfile(os.path.join(LAB_DATA, "schema.json")) else DEMO_DATA]
+
+
+def read_query_file(path):
+    r = subprocess.run(as_learner(["cat", "--", path]), capture_output=True, text=True)
+    if r.returncode != 0:
+        raise Failed(f"cannot read {path}")
+    return r.stdout
+
+
+def clean(query):
+    lines = []
+    for line in query.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        if s.startswith("."):
+            raise Failed("lokql commands (lines starting with '.') are not allowed in a query")
+        if s.startswith("#"):
+            continue  # lokql comment syntax; drop rather than let it split the block
+        lines.append(line.rstrip())
+    if not lines:
+        raise Failed("empty query")
+    return "\n".join(lines)
+
+
+def run(queries, datasets, sample, fmt, timeout):
+    """Run queries in one lokql process; return one parsed result (or Failed) per query."""
+    tmp = tempfile.mkdtemp(prefix="ct-kql.")
+    try:
+        if os.geteuid() == 0:
+            uid = pwd.getpwnam(LEARNER).pw_uid
+            os.chown(tmp, uid, uid)
+        load = []
+        for d in datasets:
+            load.append(subprocess.run([LOAD, d], capture_output=True, text=True, check=True).stdout)
+        if sample:
+            load.append(subprocess.run([LOAD, SAMPLE_DATA, "--prefix", "Sample_"], capture_output=True,
+                                       text=True, check=True).stdout)
+        script = "\n".join(load) + "\n"
+        outs = []
+        for i, q in enumerate(queries):
+            out = os.path.join(tmp, f"r{i}.{fmt}")
+            outs.append(out)
+            script += f".echo ct-kql-begin-{i}\n\n{q}\n\n.save {out}\n\n.echo ct-kql-end-{i}\n\n"
+        path = os.path.join(tmp, "run.lokql")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(script)
+        os.chmod(path, 0o644)
+        try:
+            r = subprocess.run(as_learner([LOKQL, "run", "--quiet", "-f", path]), capture_output=True,
+                               text=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            raise Failed(f"timed out after {timeout}s")
+        log = (r.stdout + r.stderr).splitlines()
+        results = []
+        for out in outs:
+            if os.path.exists(out):
+                with open(out, encoding="utf-8") as f:
+                    results.append(json.load(f) if fmt == "json" else f.read())
+            else:
+                msg = next((l.strip() for l in log if l.strip() and not l.startswith(("Query error", "---"))),
+                           "query failed")
+                results.append(Failed(msg))
+        return results
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def cell(v):
+    if v is None:
+        return ""
+    if isinstance(v, bool):
+        return str(v).lower()
+    return json.dumps(v, ensure_ascii=False) if isinstance(v, (dict, list)) else str(v)
+
+
+def text_table(rows, width=60):
+    if not rows:
+        return "(no rows)"
+    cols = list(rows[0].keys())
+    data = [[cell(r.get(c))[:width] for c in cols] for r in rows]
+    w = [max([len(c)] + [len(d[i]) for d in data]) for i, c in enumerate(cols)]
+
+    def line(vals):
+        return "  ".join(v.ljust(w[i]) for i, v in enumerate(vals)).rstrip()
+
+    return "\n".join([line(cols), line(["-" * x for x in w])] + [line(d) for d in data] + [f"({len(rows)} rows)"])
+
+
+def same(a, b):
+    if isinstance(a, bool) or isinstance(b, bool):
+        return a == b
+    if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+        return a == b or math.isclose(a, b, rel_tol=1e-9, abs_tol=1e-12)
+    if isinstance(a, list) and isinstance(b, list):
+        return len(a) == len(b) and all(same(x, y) for x, y in zip(a, b))
+    if isinstance(a, dict) and isinstance(b, dict):
+        return a.keys() == b.keys() and all(same(a[k], b[k]) for k in a)
+    return a == b
+
+
+def compare(got, want, ordered, columns):
+    if not got and not want:
+        return "match"
+    gcols, wcols = (list(got[0].keys()) if got else []), (list(want[0].keys()) if want else [])
+    if got and want and len(gcols) != len(wcols):
+        return f"mismatch: {len(gcols)} columns, expected {len(wcols)}"
+    if columns and got and want and gcols != wcols:
+        return f"mismatch: columns {gcols}, expected {wcols}"
+    if len(got) != len(want):
+        return f"mismatch: {len(got)} rows, expected {len(want)}"
+    g = [list(r.values()) for r in got]
+    w = [list(r.values()) for r in want]
+    if ordered:
+        for i, (x, y) in enumerate(zip(g, w)):
+            if not same(x, y):
+                return f"mismatch: row {i + 1} differs"
+        return "match"
+    remaining = list(w)
+    for x in g:
+        for j, y in enumerate(remaining):
+            if same(x, y):
+                del remaining[j]
+                break
+        else:
+            return "mismatch: different rows"
+    return "match"
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__)
+        return 0 if argv else 2
+    cmd, args = argv[0], argv[1:]
+    if cmd == "answer":
+        path = ANSWERS
+        if "--answers" in args:
+            path = args[args.index("--answers") + 1]
+            args = [a for a in args if a not in ("--answers", path)]
+        if len(args) != 1:
+            raise Failed("usage: ct-kql answer KEY [--answers FILE]")
+        with open(path, encoding="utf-8") as f:
+            value = json.load(f).get(args[0])
+        if value is None:
+            raise Failed(f"no answer named {args[0]}")
+        print(value if not isinstance(value, (dict, list)) else json.dumps(value))
+        return 0
+    if cmd not in ("query", "scalar", "count", "compare"):
+        raise Failed(f"unknown command {cmd} (query|scalar|count|compare|answer)")
+    datasets, sample, fmt, timeout, ordered, columns, files, texts = [], False, "json", 25, False, False, [], []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--data":
+            datasets.append(args[i + 1]); i += 2; continue
+        if a == "--sample":
+            sample = True
+        elif a == "--format":
+            fmt = args[i + 1]; i += 1
+            if fmt not in ("json", "csv", "table"):
+                raise Failed("--format json|csv|table")
+        elif a == "--timeout":
+            timeout = int(args[i + 1]); i += 1
+        elif a == "--ordered":
+            ordered = True
+        elif a == "--columns":
+            columns = True
+        elif a == "-f":
+            files.append(args[i + 1]); i += 1
+            texts.append(None)
+        else:
+            texts.append(a)
+        i += 1
+    queries = [clean(read_query_file(files.pop(0)) if t is None else t) for t in texts]
+    want = 2 if cmd == "compare" else 1
+    if len(queries) != want:
+        raise Failed(f"{cmd} takes {want} quer{'ies' if want > 1 else 'y'}")
+    table = fmt == "table"
+    if cmd != "query" or table:
+        fmt = "json"
+    results = run(queries, datasets or default_datasets(), sample, fmt, timeout)
+    for r in results:
+        if isinstance(r, Failed):
+            raise r
+    if cmd == "query" and table:
+        print(text_table(results[0]))
+    elif cmd == "query":
+        out = results[0]
+        print(json.dumps(out, ensure_ascii=False) if fmt == "json" else out, end="" if fmt == "csv" else "\n")
+    elif cmd == "count":
+        print(len(results[0]))
+    elif cmd == "scalar":
+        rows = results[0]
+        v = next(iter(rows[0].values())) if rows and rows[0] else ""
+        print("" if v is None else (json.dumps(v) if isinstance(v, (dict, list)) else
+                                    str(v).lower() if isinstance(v, bool) else v))
+    else:
+        print(compare(results[0], results[1], ordered, columns))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except Failed as e:
+        print(f"error: {e}")
+        sys.exit(1)

@@ -1,0 +1,328 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: thecorporatetractor <marco@azarguard.com>
+Date: Sun, 18 Oct 2026 16:28:16 +0300
+Subject: [PATCH 11/15] core: typed mv-expand converts datetime/timespan
+ elements; todatetime(dynamic)
+
+'mv-expand TimeGenerated to typeof(datetime)' on a make-series axis gave null:
+the axis holds ISO strings, and the typed conversion only accepted a value
+already stored as DateTime, returning the raw JSON node (written as null) for
+anything else. The standard anomaly idiom
+  make-series ... | extend (flag, score, baseline) = series_decompose_anomalies(n)
+  | mv-expand TimeGenerated to typeof(datetime), n to typeof(long), flag to typeof(int)
+therefore lost its timestamps.
+
+Typed expansion is now a conversion, like the to*() functions: an element may
+be held as the target CLR type, as a JSON string (ISO datetime, "01:30:00",
+"7") or as a JSON number (a timespan number is ticks, as make-series stores a
+timespan axis). Datetimes come out UTC. A value that cannot be converted is
+null, never the raw node.
+
+todatetime() and totimespan() also accept dynamic (an expanded axis element)
+and their own type, so an untyped mv-expand followed by todatetime() works.
+---
+ .../ScalarFunctions/JsonArrayHelper.cs        | 163 ++++++++++++++----
+ .../ScalarFunctions/ToTimespanFunction.cs     |   5 +
+ .../ScalarFunctions/todatetimefunction.cs     |   6 +
+ test/BasicTests/MakeSeriesOperatorTests.cs    |  60 +++++++
+ 4 files changed, 199 insertions(+), 35 deletions(-)
+
+diff --git a/libraries/KustoLoco.Core/Evaluation/BuiltIns/ScalarFunctions/JsonArrayHelper.cs b/libraries/KustoLoco.Core/Evaluation/BuiltIns/ScalarFunctions/JsonArrayHelper.cs
+index 43a1c03d..1a341423 100644
+--- a/libraries/KustoLoco.Core/Evaluation/BuiltIns/ScalarFunctions/JsonArrayHelper.cs
++++ b/libraries/KustoLoco.Core/Evaluation/BuiltIns/ScalarFunctions/JsonArrayHelper.cs
+@@ -1,5 +1,6 @@
+ ﻿using System;
+ using System.Collections.Generic;
++using System.Globalization;
+ using System.Linq;
+ using System.Text.Json;
+ using System.Text.Json.Nodes;
+@@ -129,46 +130,138 @@ internal static class JsonArrayHelper
+         if (node == null)
+             return null;
+ 
+-        // Handle different target types
+-        if (targetType == ScalarTypes.String)
+-            return node.ToString();
+-
+-        if (targetType == ScalarTypes.Long)
+-            if (node is JsonValue jsonValue && jsonValue.TryGetValue<long>(out var longValue))
+-                return longValue;
+-
+-        if (targetType == ScalarTypes.Int)
+-            if (node is JsonValue jsonValue && jsonValue.TryGetValue<int>(out var intValue))
+-                return intValue;
+-
+-        if (targetType == ScalarTypes.Real)
+-            if (node is JsonValue jsonValue && jsonValue.TryGetValue<double>(out var doubleValue))
+-                return doubleValue;
+-        if (targetType == ScalarTypes.Decimal)
+-            if (node is JsonValue jsonValue && jsonValue.TryGetValue<decimal>(out var decimalValue))
+-                return decimalValue;
+-
+-        if (targetType == ScalarTypes.Bool)
+-            if (node is JsonValue jsonValue && jsonValue.TryGetValue<bool>(out var boolValue))
+-                return boolValue;
+-        if (targetType == ScalarTypes.Guid)
+-            if (node is JsonValue jsonValue && jsonValue.TryGetValue<Guid>(out var guidValue))
+-                return guidValue;
+-
+-        if (targetType == ScalarTypes.DateTime)
+-            if (node is JsonValue jsonValue && jsonValue.TryGetValue<DateTime>(out var dateTimeValue))
+-                return dateTimeValue;
+-
+-        if (targetType == ScalarTypes.TimeSpan)
+-            if (node is JsonValue jsonValue && jsonValue.TryGetValue<TimeSpan>(out var timespanValue))
+-                return timespanValue;
+-
+         if (targetType == ScalarTypes.Dynamic) return node;
+ 
+-        // Default: return the node as-is
++        if (targetType == ScalarTypes.String)
++            return node is JsonValue sv && TryGetPrimitive(sv) is string str ? str : node.ToString();
++
++        // Typed expansion is a conversion, like tolong()/todatetime(): the element may be held as the target CLR type
++        // (a JsonValue created in-process, e.g. by make-series), as a JSON string (an ISO datetime, "01:00:00") or as a
++        // JSON number. A value that cannot be converted becomes null, never the raw node.
++        if (node is not JsonValue value) return null;
++        var primitive = TryGetPrimitive(value);
++        if (primitive is null) return null;
++        try
++        {
++            if (targetType == ScalarTypes.Long) return ToLong(primitive);
++            if (targetType == ScalarTypes.Int) return ToLong(primitive) is { } l ? (int)l : null;
++            if (targetType == ScalarTypes.Real) return ToDouble(primitive);
++            if (targetType == ScalarTypes.Decimal)
++                return primitive switch
++                {
++                    string s => decimal.TryParse(s, NumberStyles.Float, CultureInfo.InvariantCulture, out var m) ? m : null,
++                    bool => null,
++                    DateTime or TimeSpan => null,
++                    _ => Convert.ToDecimal(primitive, CultureInfo.InvariantCulture)
++                };
++            if (targetType == ScalarTypes.Bool)
++                return primitive switch
++                {
++                    bool bo => bo,
++                    string s => bool.TryParse(s, out var bv) ? bv : null,
++                    DateTime or TimeSpan => null,
++                    _ => Convert.ToDouble(primitive, CultureInfo.InvariantCulture) != 0
++                };
++            if (targetType == ScalarTypes.Guid)
++                return primitive switch
++                {
++                    Guid g => g,
++                    string s => Guid.TryParse(s, out var gv) ? gv : null,
++                    _ => null
++                };
++            if (targetType == ScalarTypes.DateTime) return ToDateTime(primitive);
++            if (targetType == ScalarTypes.TimeSpan) return ToTimeSpan(primitive);
++        }
++        catch (Exception e) when (e is FormatException or InvalidCastException or OverflowException)
++        {
++            return null;
++        }
++
+         return node;
+     }
+ 
++    /// <summary>
++    ///     The CLR value behind a JsonValue, whether it wraps a parsed JsonElement or an in-process value.
++    /// </summary>
++    private static object? TryGetPrimitive(JsonValue value)
++    {
++        if (value.TryGetValue<JsonElement>(out var element))
++            return element.ValueKind switch
++            {
++                JsonValueKind.String => element.GetString(),
++                JsonValueKind.True => true,
++                JsonValueKind.False => false,
++                JsonValueKind.Number => element.TryGetInt64(out var l) ? l : element.GetDouble(),
++                _ => null
++            };
++        if (value.TryGetValue<string>(out var s)) return s;
++        if (value.TryGetValue<DateTime>(out var dt)) return dt;
++        if (value.TryGetValue<TimeSpan>(out var ts)) return ts;
++        if (value.TryGetValue<bool>(out var b)) return b;
++        if (value.TryGetValue<long>(out var lv)) return lv;
++        if (value.TryGetValue<int>(out var iv)) return (long)iv;
++        if (value.TryGetValue<double>(out var d)) return d;
++        if (value.TryGetValue<decimal>(out var m)) return m;
++        if (value.TryGetValue<Guid>(out var g)) return g;
++        return value.ToString();
++    }
++
++    private static long? ToLong(object v) => v switch
++    {
++        long l => l,
++        double d => double.IsFinite(d) ? (long)d : null,
++        decimal m => (long)m,
++        bool b => b ? 1 : 0,
++        string s => long.TryParse(s, NumberStyles.Integer, CultureInfo.InvariantCulture, out var l)
++            ? l
++            : double.TryParse(s, NumberStyles.Float, CultureInfo.InvariantCulture, out var d) && double.IsFinite(d)
++                ? (long)d
++                : null,
++        _ => null
++    };
++
++    private static double? ToDouble(object v) => v switch
++    {
++        long l => l,
++        double d => d,
++        decimal m => (double)m,
++        bool b => b ? 1 : 0,
++        string s => double.TryParse(s, NumberStyles.Float, CultureInfo.InvariantCulture, out var d) ? d : null,
++        _ => null
++    };
++
++    private static DateTime? ToDateTime(object v) => v switch
++    {
++        DateTime dt => dt.Kind == DateTimeKind.Local ? dt.ToUniversalTime() : DateTime.SpecifyKind(dt, DateTimeKind.Utc),
++        string s => DateTime.TryParse(s, CultureInfo.InvariantCulture,
++            DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out var r)
++            ? r
++            : null,
++        _ => null
++    };
++
++    // A timespan held as a number is in ticks (make-series stores a timespan axis that way).
++    private static TimeSpan? ToTimeSpan(object v) => v switch
++    {
++        TimeSpan ts => ts,
++        long l => new TimeSpan(l),
++        double d => double.IsFinite(d) ? new TimeSpan((long)d) : null,
++        string s => TimeSpan.TryParse(s, CultureInfo.InvariantCulture, out var r) ? r : null,
++        _ => null
++    };
++
++    /// <summary>
++    ///     Converts a dynamic value to datetime the way todatetime() does (null when it is not a datetime).
++    /// </summary>
++    public static DateTime? DynamicToDateTime(JsonNode? node) =>
++        ConvertJsonNodeToValueOfTargetType(node, ScalarTypes.DateTime) as DateTime?;
++
++    /// <summary>
++    ///     Converts a dynamic value to timespan the way totimespan() does (null when it is not a timespan).
++    /// </summary>
++    public static TimeSpan? DynamicToTimeSpan(JsonNode? node) =>
++        ConvertJsonNodeToValueOfTargetType(node, ScalarTypes.TimeSpan) as TimeSpan?;
++
+     /// <summary>
+     ///     Convert a possible JsonArray to an object array of values of the target type.
+     /// </summary>
+diff --git a/libraries/KustoLoco.Core/Evaluation/BuiltIns/ScalarFunctions/ToTimespanFunction.cs b/libraries/KustoLoco.Core/Evaluation/BuiltIns/ScalarFunctions/ToTimespanFunction.cs
+index 5a6e4489..d85ae46d 100644
+--- a/libraries/KustoLoco.Core/Evaluation/BuiltIns/ScalarFunctions/ToTimespanFunction.cs
++++ b/libraries/KustoLoco.Core/Evaluation/BuiltIns/ScalarFunctions/ToTimespanFunction.cs
+@@ -1,5 +1,6 @@
+ ﻿using System;
+ using System.Globalization;
++using System.Text.Json.Nodes;
+ 
+ // ReSharper disable PartialTypeWithSinglePart
+ namespace KustoLoco.Core.Evaluation.BuiltIns.Impl;
+@@ -11,4 +12,8 @@ internal partial class ToTimespanFunction
+         => TimeSpan.TryParse(input, CultureInfo.InvariantCulture, out var result)
+                ? result
+                : null;
++
++    private static TimeSpan TimeSpanImpl(TimeSpan input) => input;
++
++    private static TimeSpan? JsonImpl(JsonNode input) => JsonArrayHelper.DynamicToTimeSpan(input);
+ }
+diff --git a/libraries/KustoLoco.Core/Evaluation/BuiltIns/ScalarFunctions/todatetimefunction.cs b/libraries/KustoLoco.Core/Evaluation/BuiltIns/ScalarFunctions/todatetimefunction.cs
+index 832d08f4..2ad03d3d 100644
+--- a/libraries/KustoLoco.Core/Evaluation/BuiltIns/ScalarFunctions/todatetimefunction.cs
++++ b/libraries/KustoLoco.Core/Evaluation/BuiltIns/ScalarFunctions/todatetimefunction.cs
+@@ -1,5 +1,6 @@
+ ﻿using System;
+ using System.Globalization;
++using System.Text.Json.Nodes;
+ 
+ // ReSharper disable PartialTypeWithSinglePart
+ 
+@@ -13,4 +14,9 @@ internal partial class ToDateTimeFunction
+         DateTime.TryParse(input, CultureInfo.GetCultureInfo("en-GB"),
+             DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal,
+             out var result) ? result : null;
++
++    private static DateTime DateTimeImpl(DateTime input) => input;
++
++    // dynamic input: an ISO string or a datetime element (mv-expand of a make-series axis), as in ADX
++    private static DateTime? JsonImpl(JsonNode input) => JsonArrayHelper.DynamicToDateTime(input);
+ }
+diff --git a/test/BasicTests/MakeSeriesOperatorTests.cs b/test/BasicTests/MakeSeriesOperatorTests.cs
+index 3ac5c366..7cfdb741 100644
+--- a/test/BasicTests/MakeSeriesOperatorTests.cs
++++ b/test/BasicTests/MakeSeriesOperatorTests.cs
+@@ -1,3 +1,4 @@
++using System;
+ using System.Linq;
+ using AwesomeAssertions;
+ 
+@@ -144,4 +145,63 @@ public class MakeSeriesOperatorTests : TestMethods
+         var result = await Result(q);
+         result.RowCount.Should().Be(0);
+     }
++
++    private static string HourlyBurst() =>
++        "datatable(TimeGenerated:datetime)[" + string.Join(",", Enumerable.Range(0, 24).SelectMany(h =>
++            Enumerable.Range(0, h == 15 ? 40 : 2).Select(_ => $"datetime(2026-10-01T{h:00}:10:00Z)"))) + "]";
++
++    [TestMethod]
++    public async Task MakeSeries_AnomalyIdiom_EndToEnd()
++    {
++        // The standard SOC idiom: series per hour, anomalies, then back to one row per point with typed columns.
++        var q = HourlyBurst() +
++                " | make-series n=count() default=0 on TimeGenerated step 1h" +
++                " | extend (flag, score, baseline) = series_decompose_anomalies(n)" +
++                " | mv-expand TimeGenerated to typeof(datetime), n to typeof(long), flag to typeof(int)" +
++                " | where flag == 1 | project TimeGenerated, n";
++        var result = await Result(q);
++        result.RowCount.Should().Be(1);
++        var row = result.GetRow(0);
++        row[0].Should().Be(new DateTime(2026, 10, 1, 15, 0, 0, DateTimeKind.Utc));
++        row[1].Should().Be(40L);
++        result.ColumnDefinitions()[0].UnderlyingType.Should().Be(typeof(DateTime));
++    }
++
++    [TestMethod]
++    public async Task MakeSeries_AxisUntypedMvExpand_ThenToDateTime()
++    {
++        var q = HourlyBurst() +
++                " | make-series n=count() default=0 on TimeGenerated step 1h" +
++                " | mv-expand TimeGenerated, n | extend t = todatetime(TimeGenerated), c = tolong(n)" +
++                " | where c == 40 | project t";
++        var result = await Result(q);
++        result.RowCount.Should().Be(1);
++        result.GetRow(0)[0].Should().Be(new DateTime(2026, 10, 1, 15, 0, 0, DateTimeKind.Utc));
++    }
++
++    [TestMethod]
++    public async Task MakeSeries_TimeSpanAxis_MvExpandToTimeSpan()
++    {
++        var q = "datatable(d:timespan, v:long)[0h,1, 1h,1, 1h,1] | make-series n=count() on d from 0h to 3h step 1h" +
++                " | mv-expand d to typeof(timespan), n to typeof(long) | where n == 2 | project d";
++        var result = await Result(q);
++        result.RowCount.Should().Be(1);
++        result.GetRow(0)[0].Should().Be(TimeSpan.FromHours(1));
++    }
++
++    [TestMethod]
++    public async Task MvExpand_TypedConversion_FromParsedJson()
++    {
++        // Elements of parsed JSON: ISO strings to datetime, "01:30:00" to timespan, numeric strings to long;
++        // what cannot be converted is null.
++        var q = "print d = parse_json('{\"t\":[\"2026-10-01T10:00:00Z\"],\"s\":[\"01:30:00\"],\"n\":[\"7\",\"x\"]}')" +
++                " | project t=d.t, s=d.s, n=d.n" +
++                " | mv-expand t to typeof(datetime), s to typeof(timespan), n to typeof(long)";
++        var result = await Result(q);
++        result.RowCount.Should().Be(2);
++        result.GetRow(0)[0].Should().Be(new DateTime(2026, 10, 1, 10, 0, 0, DateTimeKind.Utc));
++        result.GetRow(0)[1].Should().Be(TimeSpan.FromMinutes(90));
++        result.GetRow(0)[2].Should().Be(7L);
++        result.GetRow(1)[2].Should().BeNull();
++    }
+ }

@@ -1,0 +1,161 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: thecorporatetractor <marco@azarguard.com>
+Date: Sun, 18 Oct 2026 17:48:15 +0300
+Subject: [PATCH 15/15] build: licence-clean profile (Kusto.Language from
+ source, no Azure connectors)
+
+Two opt-in MSBuild properties for builds that redistribute lokql:
+
+- KustoLanguageProject=<path to Kusto.Language.csproj> makes KustoLoco.Core
+  reference Kusto.Language built from github.com/microsoft/Kusto-Query-Language
+  (Apache-2.0) instead of the Microsoft.Azure.Kusto.Language NuGet package,
+  which ships under the Azure Data Explorer SDK licence terms.
+- LokqlAzureConnectors=false leaves out the commands that query Azure
+  (.adx, .loganalytics, .appinsights, .arg, .defender), AppInsightsSupport and
+  with it Microsoft.Azure.Kusto.Data and Kusto.Cloud.Platform(.Msal), which
+  ship under the same terms.
+
+Defaults are unchanged. LoadGeoCommand and LoadUserAgentCommand used an
+extension method from Kusto.Cloud.Platform.Utils for a case-insensitive
+comparison; they use string.Equals now.
+---
+ libraries/KustoLoco.Core/KustoLoco.Core.csproj      |  6 +++++-
+ libraries/lokql-engine/Commands/CommandProcessor.cs |  6 ++++++
+ libraries/lokql-engine/Commands/LoadGeoCommand.cs   |  3 +--
+ .../lokql-engine/Commands/LoadUserAgentCommand.cs   |  3 +--
+ libraries/lokql-engine/lokql-engine.csproj          | 13 ++++++++++++-
+ test/LokqlEngineTests/BlockInterpolationTests.cs    |  1 -
+ 6 files changed, 25 insertions(+), 7 deletions(-)
+
+diff --git a/libraries/KustoLoco.Core/KustoLoco.Core.csproj b/libraries/KustoLoco.Core/KustoLoco.Core.csproj
+index 1a919b55..3f139ccb 100644
+--- a/libraries/KustoLoco.Core/KustoLoco.Core.csproj
++++ b/libraries/KustoLoco.Core/KustoLoco.Core.csproj
+@@ -34,7 +34,11 @@
+     <PackageReference Include="CommunityToolkit.HighPerformance" />
+     <PackageReference Include="Fastenshtein" />
+     <PackageReference Include="geohash-dotnet" />
+-    <PackageReference Include="Microsoft.Azure.Kusto.Language" />
++    <!-- KustoLanguageProject=<path to Kusto.Language.csproj>: build against Kusto.Language
++         compiled from source (github.com/microsoft/Kusto-Query-Language, Apache-2.0) instead
++         of the Microsoft.Azure.Kusto.Language package (Azure Data Explorer SDK licence terms) -->
++    <PackageReference Include="Microsoft.Azure.Kusto.Language" Condition="'$(KustoLanguageProject)' == ''" />
++    <ProjectReference Include="$(KustoLanguageProject)" Condition="'$(KustoLanguageProject)' != ''" />
+     <PackageReference Include="NotNullStrings" />
+     <PackageReference Include="System.Linq.Async" />
+     <PackageReference Include="T-Digest.NET" />
+diff --git a/libraries/lokql-engine/Commands/CommandProcessor.cs b/libraries/lokql-engine/Commands/CommandProcessor.cs
+index 660ac4e5..93c65f35 100644
+--- a/libraries/lokql-engine/Commands/CommandProcessor.cs
++++ b/libraries/lokql-engine/Commands/CommandProcessor.cs
+@@ -62,7 +62,9 @@ public class CommandProcessor : ICommandProcessor
+                 .WithAdditionalCommand<SleepCommand.Options>(SleepCommand.RunAsync)
+                 .WithAdditionalCommand<CopilotCommand.Options>(CopilotCommand.RunAsync)
+                 .WithAdditionalCommand<GetEventLogCommand.Options>(GetEventLogCommand.RunAsync)
++#if !NO_AZURE_CONNECTORS
+                 .WithAdditionalCommand<AdxCommand.Options>(AdxCommand.RunAsync)
++#endif
+                 .WithAdditionalCommand<PivotColumnsToRowsCommand.Options>(PivotColumnsToRowsCommand.RunAsync)
+                 .WithAdditionalCommand<SetCommand.Options>(SetCommand.RunAsync)
+                 .WithAdditionalCommand<ChangeDirectoryCommand.Options>(ChangeDirectoryCommand.RunAsync)
+@@ -78,10 +80,12 @@ public class CommandProcessor : ICommandProcessor
+                 .WithAdditionalCommand<ListFilesCommand.Options>(ListFilesCommand.RunAsync)
+                 .WithAdditionalCommand<MaterializeCommand.Options>(MaterializeCommand.RunAsync)
+                 .WithAdditionalCommand<SynTableCommand.Options>(SynTableCommand.RunAsync)
++#if !NO_AZURE_CONNECTORS
+                 .WithAdditionalCommand<AppInsightsCommand.Options>(AppInsightsCommand.RunAsync)
+                 .WithAdditionalCommand<ArgCommand.Options>(ArgCommand.RunAsync)
+                 .WithAdditionalCommand<LogAnalyticsCommand.Options>(LogAnalyticsCommand.RunAsync)
+                 .WithAdditionalCommand<DefenderCommand.Options>(DefenderCommand.RunAsync)
++#endif
+                 .WithAdditionalCommand<EchoCommand.Options>(EchoCommand.RunAsync)
+                 .WithAdditionalCommand<PivotRowsToColumnsCommand.Options>(PivotRowsToColumnsCommand.RunAsync)
+                 .WithAdditionalCommand<SetScalarCommand.Options>(SetScalarCommand.RunAsync)
+@@ -91,7 +95,9 @@ public class CommandProcessor : ICommandProcessor
+                 .WithAdditionalCommand<ExecCommand.Options>(ExecCommand.RunAsync)
+             ;
+ 
++#if !NO_AZURE_CONNECTORS
+         AppInsightsCommand.RegisterSchema(cp);
++#endif
+         return cp;
+     }
+ 
+diff --git a/libraries/lokql-engine/Commands/LoadGeoCommand.cs b/libraries/lokql-engine/Commands/LoadGeoCommand.cs
+index ce48b8d3..cfe3b3de 100644
+--- a/libraries/lokql-engine/Commands/LoadGeoCommand.cs
++++ b/libraries/lokql-engine/Commands/LoadGeoCommand.cs
+@@ -1,6 +1,5 @@
+ ﻿using System.Reflection.Metadata;
+ using CommandLine;
+-using Kusto.Cloud.Platform.Utils;
+ using KustoLoco.Core;
+ using KustoLoco.Geo;
+ using KustoLoco.PluginSupport;
+@@ -25,7 +24,7 @@ public static class LoadGeoCommand
+         {
+             var queryContext = context.QueryContext;
+             console.Info($"Loading {wanted}... this may take some time");
+-            var p = wanted.EqualsOrdinalIgnoreCase(DefaultDb)
++            var p = string.Equals(wanted, DefaultDb, StringComparison.OrdinalIgnoreCase)
+                 ? DbIpGeoProvider.Default
+                 : DbIpGeoProvider.FromFile(o.FileName);
+             queryContext.AddProvider<IGeoIpProvider>(p);
+diff --git a/libraries/lokql-engine/Commands/LoadUserAgentCommand.cs b/libraries/lokql-engine/Commands/LoadUserAgentCommand.cs
+index fdac9705..28dd9410 100644
+--- a/libraries/lokql-engine/Commands/LoadUserAgentCommand.cs
++++ b/libraries/lokql-engine/Commands/LoadUserAgentCommand.cs
+@@ -1,5 +1,4 @@
+ ﻿using CommandLine;
+-using Kusto.Cloud.Platform.Utils;
+ using KustoLoco.Core;
+ using KustoLoco.Geo;
+ using KustoLoco.PluginSupport;
+@@ -25,7 +24,7 @@ public static class LoadUserAgentCommand
+         {
+             var queryContext = context.QueryContext;
+             console.Info($"Loading {wanted}...");
+-            var p = wanted.EqualsOrdinalIgnoreCase(DefaultDb)
++            var p = string.Equals(wanted, DefaultDb, StringComparison.OrdinalIgnoreCase)
+                 ? UapUserAgentParser.Default
+                 : UapUserAgentParser.FromFile(o.FileName);
+             queryContext.AddProvider<IUserAgentParser>(p);
+diff --git a/libraries/lokql-engine/lokql-engine.csproj b/libraries/lokql-engine/lokql-engine.csproj
+index 8722b955..aaaedb2a 100644
+--- a/libraries/lokql-engine/lokql-engine.csproj
++++ b/libraries/lokql-engine/lokql-engine.csproj
+@@ -21,7 +21,7 @@
+ 
+   <ItemGroup>
+     <PackageReference Include="Avalonia" />
+-    <ProjectReference Include="..\AppInsightsSupport\AppInsightsSupport.csproj" />
++    <ProjectReference Include="..\AppInsightsSupport\AppInsightsSupport.csproj" Condition="'$(LokqlAzureConnectors)' != 'false'" />
+     <ProjectReference Include="..\CopilotSupport\CopilotSupport.csproj" />
+     <ProjectReference Include="..\FileFormats\FileFormats.csproj" />
+     <ProjectReference Include="..\KustoLoco.Geo\KustoLoco.Geo.csproj" />
+@@ -30,4 +30,15 @@
+     <ProjectReference Include="..\Rendering\Rendering.csproj" />
+   </ItemGroup>
+ 
++  <!-- LokqlAzureConnectors=false leaves out the commands that query Azure services (.adx,
++       .loganalytics, .appinsights, .arg, .defender) and with them AppInsightsSupport and the
++       Microsoft.Azure.Kusto.Data / Kusto.Cloud.Platform packages, for builds that must not
++       redistribute those packages. -->
++  <PropertyGroup Condition="'$(LokqlAzureConnectors)' == 'false'">
++    <DefineConstants>$(DefineConstants);NO_AZURE_CONNECTORS</DefineConstants>
++  </PropertyGroup>
++  <ItemGroup Condition="'$(LokqlAzureConnectors)' == 'false'">
++    <Compile Remove="Commands\AdxCommand.cs;Commands\AppInsightsCommand.cs;Commands\ArgCommand.cs;Commands\LogAnalyticsCommand.cs;Commands\DefenderCommand.cs" />
++  </ItemGroup>
++
+ </Project>
+diff --git a/test/LokqlEngineTests/BlockInterpolationTests.cs b/test/LokqlEngineTests/BlockInterpolationTests.cs
+index 7996dcb7..58a1c9b1 100644
+--- a/test/LokqlEngineTests/BlockInterpolationTests.cs
++++ b/test/LokqlEngineTests/BlockInterpolationTests.cs
+@@ -1,5 +1,4 @@
+ using AwesomeAssertions;
+-using Kusto.Data;
+ using KustoLoco.Core.Settings;
+ using Lokql.Engine;
+ 

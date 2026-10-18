@@ -1,0 +1,441 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: thecorporatetractor <marco@azarguard.com>
+Date: Sun, 18 Oct 2026 16:23:12 +0300
+Subject: [PATCH 13/15] core: add the search operator
+
+search [kind=case_sensitive|case_insensitive] [in (T1, T2*, ...)] Predicate
+and the piped form T | search Predicate.
+
+Translated to existing IR: a union (with the $table source column) of one
+filter per table, or a filter on the piped input. For each table the
+predicate is rewritten into ordinary KQL and bound against that table's
+schema:
+- a bare string term matches if any string column, or dynamic column via
+  tostring(), has it (has / has_cs);
+- Col:"term" applies the same test to one column;
+- wildcards follow Kusto's mapping, implemented as regexes: "abc*" word
+  prefix, "*abc" word suffix, "*abc*" substring, "a*c" \ba.*c\b;
+- and / or / parentheses / not() combine terms;
+- any other predicate (Col == "x", N > 1) is kept as written and is false
+  for a table that lacks one of its columns.
+Terms are case-insensitive unless kind=case_sensitive. Without in (...)
+every table of the database is searched.
+
+The IRTranslator now receives the query's GlobalState (needed to bind the
+rewritten predicate). Limits: the predicate cannot reference let-bound
+scalars, in (...) takes database tables only (not let-bound tabular
+expressions), and the piped form names rows by the input table only when
+the input is a plain table reference (otherwise union_arg0).
+---
+ libraries/KustoLoco.Core/BabyKustoEngine.cs   |   2 +-
+ .../Translation/IRTranslator.Expressions.cs   |   2 +-
+ .../Translation/IRTranslator.Search.cs        | 199 ++++++++++++++++++
+ .../Translation/IRTranslator.cs               |  11 +-
+ test/BasicTests/SearchOperatorTests.cs        | 137 ++++++++++++
+ 5 files changed, 348 insertions(+), 3 deletions(-)
+ create mode 100644 libraries/KustoLoco.Core/InternalRepresentation/Translation/IRTranslator.Search.cs
+ create mode 100644 test/BasicTests/SearchOperatorTests.cs
+
+diff --git a/libraries/KustoLoco.Core/BabyKustoEngine.cs b/libraries/KustoLoco.Core/BabyKustoEngine.cs
+index 71c58632..ed4eaf00 100644
+--- a/libraries/KustoLoco.Core/BabyKustoEngine.cs
++++ b/libraries/KustoLoco.Core/BabyKustoEngine.cs
+@@ -164,7 +164,7 @@ public class BabyKustoEngine
+         }
+ 
+ 
+-        var irVisitor = new IRTranslator(GetAllFunctions());
++        var irVisitor = new IRTranslator(GetAllFunctions(), code.Globals);
+ 
+         var ir = code.Syntax.Accept(irVisitor);
+ 
+diff --git a/libraries/KustoLoco.Core/InternalRepresentation/Translation/IRTranslator.Expressions.cs b/libraries/KustoLoco.Core/InternalRepresentation/Translation/IRTranslator.Expressions.cs
+index 0a82c4d9..bcd8e752 100644
+--- a/libraries/KustoLoco.Core/InternalRepresentation/Translation/IRTranslator.Expressions.cs
++++ b/libraries/KustoLoco.Core/InternalRepresentation/Translation/IRTranslator.Expressions.cs
+@@ -369,7 +369,7 @@ internal partial class IRTranslator : DefaultSyntaxVisitor<IRNode>
+ 
+             IRFunctionBodyNode irFunctionBody;
+             {
+-                var nestedTranslator = new IRTranslator(_functions);
++                var nestedTranslator = new IRTranslator(_functions, _globals);
+                 for (var i = 0; i < arguments.Length; i++)
+                 {
+                     // NOTE: For now we only support type coercions for scalars. Bad things may happen for tabular inputs, oh well...
+diff --git a/libraries/KustoLoco.Core/InternalRepresentation/Translation/IRTranslator.Search.cs b/libraries/KustoLoco.Core/InternalRepresentation/Translation/IRTranslator.Search.cs
+new file mode 100644
+index 00000000..3d9402e2
+--- /dev/null
++++ b/libraries/KustoLoco.Core/InternalRepresentation/Translation/IRTranslator.Search.cs
+@@ -0,0 +1,199 @@
++//
++// Licensed under the MIT License.
++
++using System;
++using System.Collections.Generic;
++using System.Linq;
++using System.Text;
++using System.Text.RegularExpressions;
++using Kusto.Language;
++using Kusto.Language.Symbols;
++using Kusto.Language.Syntax;
++using KustoLoco.Core.InternalRepresentation.Nodes.Expressions;
++using KustoLoco.Core.InternalRepresentation.Nodes.Expressions.QueryOperators;
++
++namespace KustoLoco.Core.InternalRepresentation;
++
++internal partial class IRTranslator
++{
++    private const string SearchInput = "__kustoloco_search_input";
++
++    /// <summary>
++    ///     search [kind=case_sensitive|case_insensitive] [in (T1, T2*, ...)] Predicate
++    ///     T | search Predicate
++    /// </summary>
++    /// <remarks>
++    ///     Translated to a union (with a $table source column) of one filter per table, so no new
++    ///     evaluator is needed. For each table the predicate is rewritten into ordinary KQL and
++    ///     bound against that table's schema:
++    ///     <list type="bullet">
++    ///         <item>a bare string term matches if any string column (or dynamic column, via tostring) has it;</item>
++    ///         <item>Col:"term" applies the same test to one column;</item>
++    ///         <item>
++    ///             wildcards: "abc*" = word prefix, "*abc" = word suffix, "*abc*" = substring,
++    ///             "a*c" = regex \ba.*c\b (Kusto's documented mapping);
++    ///         </item>
++    ///         <item>and / or / not() combine terms; any other predicate (Col == "x", Col > 5) is kept
++    ///         as written and is false for a table that lacks one of its columns.</item>
++    ///     </list>
++    ///     Terms are case-insensitive unless kind=case_sensitive. Limits: the rewritten predicate is
++    ///     bound against the query's global state, so a predicate that references a let-bound
++    ///     scalar is not supported; `search in (...)` tables are taken from the global state too
++    ///     (database tables, not let-bound tabular expressions).
++    /// </remarks>
++    public override IRNode VisitSearchOperator(SearchOperator node)
++    {
++        if (_globals == null)
++            throw new NotImplementedException("search requires the query's global state");
++        var caseSensitive = string.Equals(ParameterText(node.Parameters, "kind"), "case_sensitive",
++            StringComparison.OrdinalIgnoreCase);
++        var resultType = (TableSymbol)node.ResultType;
++        var sourceColumn = resultType.Columns.FirstOrDefault()?.Name ?? "$table";
++
++        // Piped form: filter the input; the union then adds the source column.
++        // T | search ...: the search is the pipe's operator (not merely the left side of one)
++        if (node.Parent is PipeExpression pipe && pipe.Operator == node)
++        {
++            var leftName = pipe.Expression is NameReference { ReferencedSymbol: TableSymbol t } ? t.Name : null;
++            var filter = SearchFilter(_rowScope, node.Condition, caseSensitive);
++            return new IRUnionOperatorNode(IRListNode.From(Array.Empty<IRExpressionNode>()), resultType,
++                sourceColumn, [], filter, leftName);
++        }
++
++        var tables = new List<TableSymbol>();
++        if (node.InClause != null)
++        {
++            foreach (var e in node.InClause.Expressions.Select(se => se.Element))
++            {
++                switch (e.ReferencedSymbol)
++                {
++                    case GroupSymbol g:
++                        tables.AddRange(g.Members.OfType<TableSymbol>());
++                        break;
++                    case TableSymbol t:
++                        tables.Add(t);
++                        break;
++                    default:
++                        throw new NotImplementedException($"search in (...): '{e.ToString().Trim()}' is not a table");
++                }
++            }
++        }
++        else
++        {
++            tables.AddRange(_globals.Database.Tables);
++        }
++
++        var expressions = new List<IRExpressionNode>();
++        var names = new List<string?>();
++        foreach (var table in tables.Distinct())
++        {
++            var filter = SearchFilter(table, node.Condition, caseSensitive);
++            expressions.Add(new IRPipeExpressionNode(new IRNameReferenceNode(table, table), filter, table));
++            names.Add(table.Name);
++        }
++
++        return new IRUnionOperatorNode(IRListNode.From(expressions.ToArray()), resultType, sourceColumn,
++            names.ToArray(), null);
++    }
++
++    /// <summary>The search predicate as a where-filter over one table's schema.</summary>
++    private IRFilterOperatorNode SearchFilter(TableSymbol table, Expression condition, bool caseSensitive)
++    {
++        var columns = table.Columns.ToArray();
++        var text = SearchPredicateText(condition, columns, caseSensitive);
++        var input = new TableSymbol(SearchInput, columns.Select(c => new ColumnSymbol(c.Name, c.Type)));
++        var globals = _globals!.WithDatabase(
++            new DatabaseSymbol(_globals.Database.Name, _globals.Database.Members.Append(input).ToArray()));
++        var code = KustoCode.ParseAndAnalyze($"{SearchInput} | where {text}", globals);
++        var errors = code.GetDiagnostics().Where(d => d.Severity == DiagnosticSeverity.Error).ToArray();
++        if (errors.Length > 0)
++            throw new InvalidOperationException(
++                $"search: could not bind the rewritten predicate '{text}': {errors[0].Message}");
++        var filterNode = code.Syntax.GetDescendants<FilterOperator>(_ => true).Single();
++        var oldRowScope = _rowScope;
++        _rowScope = table;
++        try
++        {
++            return (IRFilterOperatorNode)filterNode.Accept(this);
++        }
++        finally
++        {
++            _rowScope = oldRowScope;
++        }
++    }
++
++    private static string SearchPredicateText(Expression e, ColumnSymbol[] columns, bool cs)
++    {
++        switch (e)
++        {
++            case LiteralExpression { LiteralValue: string term }:
++                return AnyColumnMatches(term, columns, cs);
++            case ParenthesizedExpression p:
++                return $"({SearchPredicateText(p.Expression, columns, cs)})";
++            case BinaryExpression b when b.Kind == SyntaxKind.AndExpression:
++                return $"({SearchPredicateText(b.Left, columns, cs)} and {SearchPredicateText(b.Right, columns, cs)})";
++            case BinaryExpression b when b.Kind == SyntaxKind.OrExpression:
++                return $"({SearchPredicateText(b.Left, columns, cs)} or {SearchPredicateText(b.Right, columns, cs)})";
++            case BinaryExpression b when b.Kind == SyntaxKind.SearchExpression:
++            {
++                // Col:"term"
++                var name = (b.Left as NameReference)?.SimpleName;
++                var column = columns.FirstOrDefault(c => c.Name == name);
++                return column == null || b.Right is not LiteralExpression { LiteralValue: string t }
++                    ? "false"
++                    : ColumnMatches(column, t, cs);
++            }
++            case FunctionCallExpression f when f.Name.SimpleName == "not" && f.ArgumentList.Expressions.Count == 1:
++                return $"not({SearchPredicateText(f.ArgumentList.Expressions[0].Element, columns, cs)})";
++            default:
++            {
++                var names = columns.Select(c => c.Name).ToHashSet();
++                var missing = e.GetDescendants<NameReference>(_ => true)
++                    .Any(n => n.ReferencedSymbol is ColumnSymbol && !names.Contains(n.SimpleName));
++                return missing ? "false" : $"({e.ToString(IncludeTrivia.Minimal)})";
++            }
++        }
++    }
++
++    private static string AnyColumnMatches(string term, ColumnSymbol[] columns, bool cs)
++    {
++        var tests = columns
++            .Where(c => c.Type == ScalarTypes.String || c.Type == ScalarTypes.Dynamic)
++            .Select(c => ColumnMatches(c, term, cs))
++            .ToArray();
++        return tests.Length == 0 ? "false" : "(" + string.Join(" or ", tests) + ")";
++    }
++
++    private static string ColumnMatches(ColumnSymbol column, string term, bool cs)
++    {
++        var col = $"['{column.Name.Replace("'", "\\'")}']";
++        if (column.Type != ScalarTypes.String)
++            col = $"tostring({col})";
++        if (!term.Contains('*'))
++            return $"{col} {(cs ? "has_cs" : "has")} {Quote(term)}";
++        // Wildcards follow Kusto's mapping: abc* -> word prefix, *abc -> word suffix,
++        // *abc* -> substring, a*c -> \ba.*c\b. Implemented with regexes (the engine has no hasprefix).
++        var core = term.Trim('*');
++        var startsStar = term.StartsWith('*');
++        var endsStar = term.EndsWith('*');
++        var body = string.Join(".*", core.Split('*').Select(Regex.Escape));
++        var pattern = (startsStar, endsStar) switch
++        {
++            (true, true) => body,
++            (false, true) => $@"\b{body}",
++            (true, false) => $@"{body}\b",
++            _ => $@"\b{body}\b"
++        };
++        if (!cs)
++            pattern = "(?i)" + pattern;
++        return $"{col} matches regex {Quote(pattern)}";
++    }
++
++    private static string Quote(string s)
++    {
++        var sb = new StringBuilder("@\"");
++        sb.Append(s.Replace("\"", "\"\""));
++        sb.Append('"');
++        return sb.ToString();
++    }
++}
+diff --git a/libraries/KustoLoco.Core/InternalRepresentation/Translation/IRTranslator.cs b/libraries/KustoLoco.Core/InternalRepresentation/Translation/IRTranslator.cs
+index 0c6da51d..ced47f57 100644
+--- a/libraries/KustoLoco.Core/InternalRepresentation/Translation/IRTranslator.cs
++++ b/libraries/KustoLoco.Core/InternalRepresentation/Translation/IRTranslator.cs
+@@ -5,6 +5,7 @@ using System;
+ using System.Collections.Generic;
+ using KustoLoco.Core.Evaluation.BuiltIns;
+ using KustoLoco.Core.Util;
++using Kusto.Language;
+ using Kusto.Language.Symbols;
+ using Kusto.Language.Syntax;
+ using KustoLoco.Core.InternalRepresentation.Nodes.Expressions;
+@@ -22,7 +23,15 @@ internal partial class IRTranslator : DefaultSyntaxVisitor<IRNode>
+     private readonly Dictionary<string, EvaluatedExpressionKind> _inScopeSymbolInfos = new();
+     private TableSymbol _rowScope = TableSymbol.Empty;
+ 
+-    public IRTranslator(Dictionary<FunctionSymbol, ScalarFunctionInfo> functions) => _functions = functions;
++    // The query's global state (tables, functions). Only needed by operators that bind text of
++    // their own, such as search; null when the caller does not provide it.
++    private readonly GlobalState? _globals;
++
++    public IRTranslator(Dictionary<FunctionSymbol, ScalarFunctionInfo> functions, GlobalState? globals = null)
++    {
++        _functions = functions;
++        _globals = globals;
++    }
+ 
+     private void SetInScopeSymbolInfo(string name, EvaluatedExpressionKind resultKind)
+     {
+diff --git a/test/BasicTests/SearchOperatorTests.cs b/test/BasicTests/SearchOperatorTests.cs
+new file mode 100644
+index 00000000..e48040c0
+--- /dev/null
++++ b/test/BasicTests/SearchOperatorTests.cs
+@@ -0,0 +1,137 @@
++using AwesomeAssertions;
++using KustoLoco.Core;
++using NotNullStrings;
++
++namespace BasicTests;
++
++[TestClass]
++public class SearchOperatorTests : TestMethods
++{
++    public record SignRow(string UserPrincipalName, string IPAddress, long N);
++
++    public record NetRow(string DeviceName, string RemoteIP, string RemoteUrl);
++
++    public record AuditRow(string OperationName, string Target);
++
++    private static KustoQueryContext SocContext()
++    {
++        var context = CreateContext();
++        context.CopyDataIntoTable("SigninLogs", new[]
++        {
++            new SignRow("ada@corp.example", "198.51.100.7", 1),
++            new SignRow("bram@corp.example", "10.0.0.5", 2)
++        });
++        context.CopyDataIntoTable("DeviceNetworkEvents", new[]
++        {
++            new NetRow("pc1", "198.51.100.7", "cdn-x.example.org"),
++            new NetRow("pc2", "192.0.2.1", "intranet.corp.example")
++        });
++        context.CopyDataIntoTable("AuditLogs", new[] { new AuditRow("Add member to role", "svc-sync01") });
++        return context;
++    }
++
++    private static async Task<string> Run(KustoQueryContext context, string query)
++    {
++        var result = await context.RunQuery(query);
++        result.Error.Should().BeEmpty();
++        return result.EnumerateRows()
++            .Select(r => string.Join(",", r.Select(KustoFormatter.ObjectToKustoString)))
++            .JoinString(";");
++    }
++
++    [TestMethod]
++    public async Task BareTerm_SearchesEveryTable()
++    {
++        var result = await Run(SocContext(),
++            "search \"198.51.100.7\" | summarize n=count() by $table | order by $table asc");
++        result.Should().Be("DeviceNetworkEvents,1;SigninLogs,1");
++    }
++
++    [TestMethod]
++    public async Task BareTerm_IsCaseInsensitiveByDefault()
++    {
++        var result = await Run(SocContext(), "search \"ADD\" | project $table");
++        result.Should().Be("AuditLogs");
++    }
++
++    [TestMethod]
++    public async Task KindCaseSensitive()
++    {
++        var result = await Run(SocContext(), "search kind=case_sensitive \"ADD\" | count");
++        result.Should().Be("0");
++    }
++
++    [TestMethod]
++    public async Task InClause_LimitsTables()
++    {
++        var result = await Run(SocContext(), "search in (SigninLogs) \"198.51.100.7\" | project $table, UserPrincipalName");
++        result.Should().Be("SigninLogs,ada@corp.example");
++    }
++
++    [TestMethod]
++    public async Task InClause_Wildcard()
++    {
++        var result = await Run(SocContext(), "search in (Device*) \"pc2\" | project $table, DeviceName");
++        result.Should().Be("DeviceNetworkEvents,pc2");
++    }
++
++    [TestMethod]
++    public async Task ColumnScopedTerm()
++    {
++        // only the RemoteUrl column is searched, so the IP in SigninLogs does not match
++        var result = await Run(SocContext(), "search RemoteUrl:\"example\" | count");
++        result.Should().Be("2");
++    }
++
++    [TestMethod]
++    public async Task ColumnPredicate_FalseForTablesWithoutTheColumn()
++    {
++        var result = await Run(SocContext(), "search IPAddress == \"10.0.0.5\" | project $table, UserPrincipalName");
++        result.Should().Be("SigninLogs,bram@corp.example");
++    }
++
++    [TestMethod]
++    public async Task AndOfTerms()
++    {
++        var result = await Run(SocContext(), "search \"198.51.100.7\" and \"pc1\" | project $table");
++        result.Should().Be("DeviceNetworkEvents");
++    }
++
++    [TestMethod]
++    public async Task OrAndNot()
++    {
++        var result = await Run(SocContext(),
++            "search (\"ada\" or \"bram\" or \"pc1\") and not(UserPrincipalName:\"bram\") and not(DeviceName == \"pc1\") | project UserPrincipalName");
++        result.Should().Be("ada@corp.example");
++    }
++
++    [TestMethod]
++    public async Task Wildcards()
++    {
++        (await Run(SocContext(), "search \"intra*\" | count")).Should().Be("1");
++        (await Run(SocContext(), "search \"*sync01\" | count")).Should().Be("1");
++        (await Run(SocContext(), "search \"*-syn*\" | count")).Should().Be("1");
++        (await Run(SocContext(), "search \"cdn*org\" | count")).Should().Be("1");
++    }
++
++    [TestMethod]
++    public async Task Piped()
++    {
++        var result = await Run(SocContext(), "SigninLogs | search \"bram\" | project $table, UserPrincipalName");
++        result.Should().Be("SigninLogs,bram@corp.example");
++    }
++
++    [TestMethod]
++    public async Task PipedAfterOperators()
++    {
++        var result = await Run(SocContext(), "SigninLogs | where N > 0 | search \"ada\" | count");
++        result.Should().Be("1");
++    }
++
++    [TestMethod]
++    public async Task NumericPredicate()
++    {
++        var result = await Run(SocContext(), "search N > 1 | project UserPrincipalName");
++        result.Should().Be("bram@corp.example");
++    }
++}

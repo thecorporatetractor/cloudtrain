@@ -1,0 +1,218 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: thecorporatetractor <marco@azarguard.com>
+Date: Sun, 18 Oct 2026 17:41:16 +0300
+Subject: [PATCH 03/15] core: accept Kusto dynamic literal syntax
+
+dynamic(['a', 'b']) and dynamic({'k': 'v'}) are valid Kusto and common in
+published queries (watchlists, ipv4_is_in_any_range ranges), but only strict
+JSON was accepted. When a literal is not JSON, rewrite single-quoted, double-
+quoted and verbatim (@'...') strings into JSON strings, resolving Kusto
+escapes, and parse again (trailing commas allowed). Strict JSON takes the old
+path unchanged.
+---
+ .../Translation/IRTranslator.Expressions.cs   | 11 +++
+ .../Util/KustoDynamicLiteral.cs               | 84 +++++++++++++++++++
+ test/BasicTests/DynamicLiteralTests.cs        | 47 +++++++++++
+ test/CoreTests/DynamicTests.cs                | 16 ++--
+ 4 files changed, 151 insertions(+), 7 deletions(-)
+ create mode 100644 libraries/KustoLoco.Core/Util/KustoDynamicLiteral.cs
+ create mode 100644 test/BasicTests/DynamicLiteralTests.cs
+
+diff --git a/libraries/KustoLoco.Core/InternalRepresentation/Translation/IRTranslator.Expressions.cs b/libraries/KustoLoco.Core/InternalRepresentation/Translation/IRTranslator.Expressions.cs
+index 006a25fe..75309216 100644
+--- a/libraries/KustoLoco.Core/InternalRepresentation/Translation/IRTranslator.Expressions.cs
++++ b/libraries/KustoLoco.Core/InternalRepresentation/Translation/IRTranslator.Expressions.cs
+@@ -157,6 +157,17 @@ internal partial class IRTranslator : DefaultSyntaxVisitor<IRNode>
+             return new IRLiteralExpressionNode(parsedValue, node.ResultType);
+         }
+         catch (JsonException)
++        {
++            // Kusto syntax that is not JSON, e.g. single-quoted strings: dynamic(['a','b'])
++        }
++
++        try
++        {
++            var parsedValue = JsonNode.Parse(KustoDynamicLiteral.ToJson(literalValue), null,
++                new JsonDocumentOptions { AllowTrailingCommas = true });
++            return new IRLiteralExpressionNode(parsedValue, node.ResultType);
++        }
++        catch (JsonException)
+         {
+             throw new InvalidOperationException(
+                 $"A literal dynamic expression was provided that is valid in Kusto but doesn't conform to the stricter JSON parser used by KustoLoco. Please rewrite the literal expression to be properly formatted JSON (invalid input: \"{literalValue}\")");
+diff --git a/libraries/KustoLoco.Core/Util/KustoDynamicLiteral.cs b/libraries/KustoLoco.Core/Util/KustoDynamicLiteral.cs
+new file mode 100644
+index 00000000..718d5ed8
+--- /dev/null
++++ b/libraries/KustoLoco.Core/Util/KustoDynamicLiteral.cs
+@@ -0,0 +1,84 @@
++﻿//
++// Licensed under the MIT License.
++
++using System;
++using System.Globalization;
++using System.Text;
++using System.Text.Json;
++
++namespace KustoLoco.Core.Util;
++
++/// <summary>
++///     Kusto accepts dynamic literals that are not strict JSON, most often single-quoted
++///     strings: <c>dynamic(['a', 'b'])</c>, <c>dynamic({'k': 'v'})</c>. This rewrites such
++///     text into JSON that System.Text.Json can parse.
++/// </summary>
++/// <remarks>
++///     Single-quoted, double-quoted and verbatim (<c>@'...'</c>, <c>@"..."</c>) strings become
++///     JSON strings with the Kusto escapes resolved (\n \t \r \\ \' \" \uXXXX); everything
++///     outside strings is copied unchanged.
++/// </remarks>
++public static class KustoDynamicLiteral
++{
++    public static string ToJson(string text)
++    {
++        var sb = new StringBuilder(text.Length);
++        for (var i = 0; i < text.Length; i++)
++        {
++            var c = text[i];
++            var verbatim = c == '@' && i + 1 < text.Length && text[i + 1] is '\'' or '"';
++            if (verbatim)
++                c = text[++i];
++            if (c is not ('\'' or '"'))
++            {
++                sb.Append(c);
++                continue;
++            }
++
++            var quote = c;
++            var value = new StringBuilder();
++            for (i++; i < text.Length; i++)
++            {
++                var d = text[i];
++                if (d == quote)
++                {
++                    // a doubled quote inside a verbatim string is one quote character
++                    if (verbatim && i + 1 < text.Length && text[i + 1] == quote)
++                    {
++                        value.Append(quote);
++                        i++;
++                        continue;
++                    }
++
++                    break;
++                }
++
++                if (!verbatim && d == '\\' && i + 1 < text.Length)
++                {
++                    var e = text[++i];
++                    switch (e)
++                    {
++                        case 'n': value.Append('\n'); break;
++                        case 't': value.Append('\t'); break;
++                        case 'r': value.Append('\r'); break;
++                        case 'u' when i + 4 < text.Length &&
++                                      int.TryParse(text.AsSpan(i + 1, 4), NumberStyles.HexNumber,
++                                          CultureInfo.InvariantCulture, out var cp):
++                            value.Append((char)cp);
++                            i += 4;
++                            break;
++                        default: value.Append(e); break;
++                    }
++
++                    continue;
++                }
++
++                value.Append(d);
++            }
++
++            sb.Append(JsonSerializer.Serialize(value.ToString()));
++        }
++
++        return sb.ToString();
++    }
++}
+diff --git a/test/BasicTests/DynamicLiteralTests.cs b/test/BasicTests/DynamicLiteralTests.cs
+new file mode 100644
+index 00000000..75326d70
+--- /dev/null
++++ b/test/BasicTests/DynamicLiteralTests.cs
+@@ -0,0 +1,47 @@
++﻿using AwesomeAssertions;
++
++namespace BasicTests;
++
++/// <summary>
++///     Dynamic literals written the way Kusto (and most published queries) write them
++/// </summary>
++[TestClass]
++public class DynamicLiteralTests : TestMethods
++{
++    [TestMethod]
++    public async Task SingleQuotedStringsInAnArray()
++    {
++        var result = await SquashedLastLineOfResult("print d=dynamic(['a', 'b c']) | extend n=array_length(d), s=tostring(d[1])");
++        result.Should().Contain("2,bc");
++    }
++
++    [TestMethod]
++    public async Task SingleQuotedKeysAndValues()
++    {
++        var result = await LastLineOfResult("print d=dynamic({'k': 'v', 'n': 1}) | project v=tostring(d.k), n=tolong(d.n)");
++        result.Should().Be("v,1");
++    }
++
++    [TestMethod]
++    public async Task EscapesAndEmbeddedQuotes()
++    {
++        var result = await LastLineOfResult(@"print d=dynamic(['it\'s', ""say \""hi\"""", @'C:\temp']) | project a=tostring(d[0]), b=tostring(d[1]), c=tostring(d[2])");
++        result.Should().Be(@"it's,say ""hi"",C:\temp");
++    }
++
++    [TestMethod]
++    public async Task UsedWithInOperatorAndIpRanges()
++    {
++        var query = "datatable(ip:string)['10.0.0.5', '172.16.0.1'] " +
++                    "| where ipv4_is_in_any_range(ip, dynamic(['10.0.0.0/24', '192.168.0.0/16']))";
++        var result = await ResultAsString(query);
++        result.Should().Be("10.0.0.5");
++    }
++
++    [TestMethod]
++    public async Task StrictJsonStillWorks()
++    {
++        var result = await LastLineOfResult("print d=dynamic({\"a\":[1,2,3]}) | project n=array_length(d.a)");
++        result.Should().Be("3");
++    }
++}
+diff --git a/test/CoreTests/DynamicTests.cs b/test/CoreTests/DynamicTests.cs
+index cb82901b..4316f1e2 100644
+--- a/test/CoreTests/DynamicTests.cs
++++ b/test/CoreTests/DynamicTests.cs
+@@ -117,19 +117,21 @@ a:dynamic; b:dynamic
+     }
+ 
+     [Fact]
+-    public void DynamicLiteral_LooseJson_Explodes()
++    public void DynamicLiteral_LooseJson()
+     {
+-        // Arrange
++        // Arrange: single-quoted strings are valid Kusto, not valid JSON
+         var query = @"
+ print a=dynamic({'a':1})
+ ";
+ 
+-        // Act & Assert
+-        var func = () => Test(query, expectedOutput: "whatever");
++        var expected = @"
++a:dynamic
++------------------
++{""a"":1}
++";
+ 
+-        // This test exercises a BabyKusto limitation, at least confirm we are consistently failing
+-        func.Should().ThrowExactly<InvalidOperationException>().Which.Message.Should().Be(
+-            "A literal dynamic expression was provided that is valid in Kusto but doesn't conform to the stricter JSON parser used by KustoLoco. Please rewrite the literal expression to be properly formatted JSON (invalid input: \"{'a':1}\")");
++        // Act & Assert
++        Test(query, expected);
+     }
+ 
+     [Fact]

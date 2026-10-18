@@ -1,0 +1,379 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: thecorporatetractor <marco@azarguard.com>
+Date: Sun, 18 Oct 2026 16:13:54 +0300
+Subject: [PATCH 02/15] lokql: make scripted runs trustworthy
+
+Running lokql non-interactively (lokql run -f script, CI, graders) could
+report success and save the wrong data:
+
+- A query result was pushed to the history only after rendering it, so a
+  rendering failure (a chart on a console with no terminal, see below) left
+  the previous result as the last one; a following .save wrote that instead.
+  Push first, and report a rendering failure as an error.
+- Charts are rendered as sixel graphics, which queries the terminal and
+  throws when output is redirected. Show the chart's data as a table then.
+- .materialize of a failed query replaced the table with an empty one; it
+  now refuses with an error.
+- A failed .load was only a warning; it is an error now.
+- lokql run and convert exit with code 1 when any error was reported. Errors
+  are counted by wrapping the explorer's console (ErrorCount), so commands
+  and plugins are covered without signature changes.
+- Table cells use KustoFormatter.ObjectToKustoString (culture-invariant,
+  ISO 8601 datetimes) instead of the current culture's ToString().
+- .echo printed only its first word; it prints the whole text.
+- Explorer: fix a missing string interpolation in the script load error.
+---
+ applications/lokql/CmdConvert.cs              |  3 +
+ applications/lokql/CmdRun.cs                  |  3 +
+ applications/lokql/Explorer.cs                |  5 +-
+ applications/lokql/SixelRenderingSurface.cs   |  7 +-
+ .../lokql-engine/Commands/EchoCommand.cs      |  4 +-
+ .../lokql-engine/Commands/LoadCommand.cs      |  2 +-
+ .../Commands/MaterializeCommand.cs            | 12 ++-
+ .../lokql-engine/ErrorCountingConsole.cs      | 43 +++++++++++
+ .../lokql-engine/InteractiveTableExplorer.cs  | 29 +++++++-
+ .../LokqlEngineTests/ScriptRobustnessTests.cs | 74 +++++++++++++++++++
+ 10 files changed, 171 insertions(+), 11 deletions(-)
+ create mode 100644 libraries/lokql-engine/ErrorCountingConsole.cs
+ create mode 100644 test/LokqlEngineTests/ScriptRobustnessTests.cs
+
+diff --git a/applications/lokql/CmdConvert.cs b/applications/lokql/CmdConvert.cs
+index fbfa125b..49843997 100644
+--- a/applications/lokql/CmdConvert.cs
++++ b/applications/lokql/CmdConvert.cs
+@@ -16,6 +16,9 @@ internal class CmdConvert
+         await explorer.RunInput($".load \"{options.In}\"");
+         await explorer.RunInput($".save \"{options.Out}\"");
+         explorer.Close();
++        // Non-interactive use (scripts, CI, graders) needs to know a query failed.
++        if (explorer.ErrorCount > 0)
++            Environment.ExitCode = 1;
+     }
+ 
+     [Verb("convert",  HelpText = "Converts a data file into another format ")]
+diff --git a/applications/lokql/CmdRun.cs b/applications/lokql/CmdRun.cs
+index 769b8664..9829fabc 100644
+--- a/applications/lokql/CmdRun.cs
++++ b/applications/lokql/CmdRun.cs
+@@ -16,6 +16,9 @@ internal class CmdRun
+        
+ 
+         explorer.Close();
++        // Non-interactive use (scripts, CI, graders) needs to know a query failed.
++        if (explorer.ErrorCount > 0)
++            Environment.ExitCode = 1;
+     }
+ 
+     [Verb("run", true, HelpText = "runs scripts and/or commands")]
+diff --git a/applications/lokql/Explorer.cs b/applications/lokql/Explorer.cs
+index 2628f0a0..61395d13 100644
+--- a/applications/lokql/Explorer.cs
++++ b/applications/lokql/Explorer.cs
+@@ -42,13 +42,16 @@ public class Explorer
+             }
+             catch (IOException)
+             {
+-                r.Error("Unable to load script '{f}'");
++                r.Error($"Unable to load script '{f}'");
+             }
+         return r;
+     }
+ 
+     public void Close() => _console.RestoreColors();
+ 
++    /// <summary>Errors reported by the queries and commands run so far.</summary>
++    public int ErrorCount => _explorer.ErrorCount;
++
+     public async Task RunInput(string block) => await _explorer.RunInput(block);
+ 
+     public async Task RunInteractive()
+diff --git a/applications/lokql/SixelRenderingSurface.cs b/applications/lokql/SixelRenderingSurface.cs
+index 03e1ee44..4fc45e30 100644
+--- a/applications/lokql/SixelRenderingSurface.cs
++++ b/applications/lokql/SixelRenderingSurface.cs
+@@ -17,7 +17,9 @@ internal class SixelRenderingSurface(KustoSettingsProvider settings)
+         if (result.Error.IsNotBlank())
+             return;
+ 
+-        if (result.IsChart)
++        // Sixel output queries the terminal; without one (output redirected to a file or
++        // a pipe) show the chart's data as a table instead.
++        if (result.IsChart && !Console.IsOutputRedirected)
+         {
+             var str = ScottPlotKustoResultRenderer.RenderToSixelWithPad(result,
+                 settings, 3);
+@@ -62,7 +64,8 @@ internal class SixelRenderingSurface(KustoSettingsProvider settings)
+         // Helper function to convert a cell to a string, handling nulls
+         string CellToString(object? cell)
+         {
+-            return Markup.Escape(cell?.ToString() ?? "<null>");
++            // culture-invariant, ISO 8601 datetimes, the same text as the other front ends
++            return Markup.Escape(KustoFormatter.ObjectToKustoString(cell));
+         }
+     }
+ }
+diff --git a/libraries/lokql-engine/Commands/EchoCommand.cs b/libraries/lokql-engine/Commands/EchoCommand.cs
+index 419da6d5..81041ac0 100644
+--- a/libraries/lokql-engine/Commands/EchoCommand.cs
++++ b/libraries/lokql-engine/Commands/EchoCommand.cs
+@@ -12,7 +12,7 @@ public static class EchoCommand
+     {
+         var console = context.Console;
+ 
+-        console.Info(o.Text);
++        console.Info(string.Join(" ", o.Text));
+         return Task.CompletedTask;
+     }
+ 
+@@ -26,6 +26,6 @@ Examples:
+     internal class Options
+     {
+         [Value(0, Required = true)]
+-        public string Text { get; set; } = string.Empty;
++        public IEnumerable<string> Text { get; set; } = [];
+     }
+ }
+diff --git a/libraries/lokql-engine/Commands/LoadCommand.cs b/libraries/lokql-engine/Commands/LoadCommand.cs
+index 95ac0744..e440105d 100644
+--- a/libraries/lokql-engine/Commands/LoadCommand.cs
++++ b/libraries/lokql-engine/Commands/LoadCommand.cs
+@@ -40,7 +40,7 @@ public static class LoadCommand
+         exp.Settings.Pop();
+         if (!success)
+         {
+-            exp.Warn($"Unable to load '{o.File}'");
++            exp.Error($"Unable to load '{o.File}'");
+         }
+         else
+         {
+diff --git a/libraries/lokql-engine/Commands/MaterializeCommand.cs b/libraries/lokql-engine/Commands/MaterializeCommand.cs
+index 598ffee2..dd909425 100644
+--- a/libraries/lokql-engine/Commands/MaterializeCommand.cs
++++ b/libraries/lokql-engine/Commands/MaterializeCommand.cs
+@@ -1,5 +1,6 @@
+ ﻿using CommandLine;
+ using KustoLoco.PluginSupport;
++using NotNullStrings;
+ 
+ namespace Lokql.Engine.Commands;
+ 
+@@ -10,7 +11,16 @@ public static class MaterializeCommand
+         var console = context.Console;
+         var queryContext = context.QueryContext;
+         var history = context.History;
+-        queryContext.MaterializeResultAsTable(history.Fetch(o.ResultName), o.As);
++        var result = history.Fetch(o.ResultName);
++        if (result.Error.IsNotBlank())
++        {
++            // a failed query has no rows or columns: materializing it would silently
++            // replace the table with an empty one
++            console.Error($"Not materializing '{o.As}': the query failed");
++            return Task.CompletedTask;
++        }
++
++        queryContext.MaterializeResultAsTable(result, o.As);
+         console.Info($"Table {NameEscaper.EscapeIfNecessary(o.As)} now available");
+         return Task.CompletedTask;
+     }
+diff --git a/libraries/lokql-engine/ErrorCountingConsole.cs b/libraries/lokql-engine/ErrorCountingConsole.cs
+new file mode 100644
+index 00000000..7908b44c
+--- /dev/null
++++ b/libraries/lokql-engine/ErrorCountingConsole.cs
+@@ -0,0 +1,43 @@
++﻿using KustoLoco.Core.Console;
++
++namespace Lokql.Engine;
++
++/// <summary>
++///     Passes everything through to another console and counts the errors written to it
++/// </summary>
++internal sealed class ErrorCountingConsole(IKustoConsole inner) : IKustoConsole
++{
++    public int Errors { get; private set; }
++
++    public int WindowWidth => inner.WindowWidth;
++
++    public ConsoleColor ForegroundColor
++    {
++        get => inner.ForegroundColor;
++        set => inner.ForegroundColor = value;
++    }
++
++    public void Write(string s) => inner.Write(s);
++
++    public void WriteLine(string s) => inner.WriteLine(s);
++
++    public string ReadLine() => inner.ReadLine();
++
++    public void Info(string s) => inner.Info(s);
++
++    public void Warn(string s) => inner.Warn(s);
++
++    public void Error(string s)
++    {
++        Errors++;
++        inner.Error(s);
++    }
++
++    public void Progress(string s) => inner.Progress(s);
++
++    public void ShowProgress(string s) => inner.ShowProgress(s);
++
++    public void CompleteProgress(string s) => inner.CompleteProgress(s);
++
++    public void RestoreColors() => inner.RestoreColors();
++}
+diff --git a/libraries/lokql-engine/InteractiveTableExplorer.cs b/libraries/lokql-engine/InteractiveTableExplorer.cs
+index 081b1a2a..883b741c 100644
+--- a/libraries/lokql-engine/InteractiveTableExplorer.cs
++++ b/libraries/lokql-engine/InteractiveTableExplorer.cs
+@@ -42,12 +42,12 @@ public class InteractiveTableExplorer
+         CommandProcessor commandProcessor, IResultRenderingSurface renderingSurface,
+         Dictionary<FunctionSymbol, ScalarFunctionInfo> additionalFunctions)
+     {
+-        _outputConsole = outputConsole;
++        _outputConsole = new ErrorCountingConsole(outputConsole);
+         Settings = settings;
+         _commandProcessor = commandProcessor;
+         _renderingSurface = renderingSurface;
+         _formatter = new NullFormatter();
+-        _context = KustoQueryContext.CreateWithDebug(outputConsole, settings);
++        _context = KustoQueryContext.CreateWithDebug(_outputConsole, settings);
+         _context.AddFunctions(additionalFunctions);
+         _loader = new StandardFormatAdaptor(settings, _outputConsole);
+         _context.SetTableLoader(_loader);
+@@ -78,6 +78,13 @@ public class InteractiveTableExplorer
+     }
+ 
+ 
++    /// <summary>
++    ///     Number of errors reported so far (queries, commands, rendering: anything written
++    ///     with IKustoConsole.Error), so that script runners can fail instead of reporting
++    ///     success.
++    /// </summary>
++    public int ErrorCount => (_outputConsole as ErrorCountingConsole)?.Errors ?? 0;
++
+     public IReportTarget ActiveReport { get; private set; } = new HtmlReport(string.Empty);
+ 
+     public IResultRenderingSurface GetRenderingSurface() => _renderingSurface;
+@@ -188,8 +195,18 @@ public class InteractiveTableExplorer
+             }
+ 
+             var result = await GetCurrentContext().RunQuery(query);
+-            await _renderingSurface.RenderToDisplay(result);
++            // Record the result before rendering it: a rendering failure (e.g. a chart on a
++            // console without a terminal) must not leave the previous result as the "last"
++            // one for a following .save or .materialize.
+             _resultHistory.Push(result);
++            try
++            {
++                await _renderingSurface.RenderToDisplay(result);
++            }
++            catch (Exception ex)
++            {
++                ShowError($"Unable to render the result: {ex.Message}");
++            }
+ 
+             DisplayResultsToConsole(result);
+         }
+@@ -211,7 +228,6 @@ public class InteractiveTableExplorer
+     /// </summary>
+     private void ShowError(string message)
+     {
+-        
+         _outputConsole.Error(message);
+     }
+ 
+@@ -240,6 +256,11 @@ public class InteractiveTableExplorer
+     /// </summary>
+     public void Warn(string s) => _outputConsole.Warn(s);
+ 
++    /// <summary>
++    /// Report an error to the console; counted in <see cref="ErrorCount"/>
++    /// </summary>
++    public void Error(string s) => ShowError(s);
++
+     #endregion
+ 
+     /// <summary>
+diff --git a/test/LokqlEngineTests/ScriptRobustnessTests.cs b/test/LokqlEngineTests/ScriptRobustnessTests.cs
+new file mode 100644
+index 00000000..383f98fe
+--- /dev/null
++++ b/test/LokqlEngineTests/ScriptRobustnessTests.cs
+@@ -0,0 +1,74 @@
++﻿using AwesomeAssertions;
++using Kusto.Language.Symbols;
++using KustoLoco.Core;
++using KustoLoco.Core.Console;
++using KustoLoco.Core.Evaluation.BuiltIns;
++using KustoLoco.Core.Settings;
++using Lokql.Engine;
++using Lokql.Engine.Commands;
++
++namespace LokqlEngineTests;
++
++/// <summary>
++///     Non-interactive use (scripts, CI, graders) must be able to trust the last result
++///     and know when something failed.
++/// </summary>
++[TestClass]
++public class ScriptRobustnessTests
++{
++    private static InteractiveTableExplorer CreateExplorer(IResultRenderingSurface surface)
++    {
++        var settings = new KustoSettingsProvider();
++        return new InteractiveTableExplorer(new NullConsole(), settings, CommandProcessor.Default(),
++            surface, new Dictionary<FunctionSymbol, ScalarFunctionInfo>());
++    }
++
++    [TestMethod]
++    public async Task FailedQueryIsCounted()
++    {
++        var explorer = CreateExplorer(new NullResultRenderingSurface());
++        await explorer.RunInput("print x=1");
++        explorer.ErrorCount.Should().Be(0);
++        await explorer.RunInput("print y=nosuchfunction(1)");
++        explorer.ErrorCount.Should().Be(1);
++    }
++
++    [TestMethod]
++    public async Task RenderingFailureKeepsTheResultAndIsCounted()
++    {
++        var explorer = CreateExplorer(new ThrowingSurface());
++        await explorer.RunInput("print x=1");
++        await explorer.RunInput("print x=2");
++        explorer.ErrorCount.Should().Be(2);
++        // the last result is the second query's, not the first one's
++        explorer._resultHistory.MostRecent.Get(0, 0).Should().Be(2L);
++    }
++
++    [TestMethod]
++    public async Task MaterializeRefusesAFailedQuery()
++    {
++        var explorer = CreateExplorer(new NullResultRenderingSurface());
++        await explorer.RunInput("datatable(a:long)[1,2,3]");
++        await explorer.RunInput(".materialize T");
++        await explorer.RunInput("T | extend b=nosuchfunction(a)");
++        await explorer.RunInput(".materialize T");
++        explorer.ErrorCount.Should().Be(2);
++        var result = await explorer.GetCurrentContext().RunQuery("T | count");
++        result.Get(0, 0).Should().Be(3L);
++    }
++
++    [TestMethod]
++    public async Task FailedLoadIsAnError()
++    {
++        var explorer = CreateExplorer(new NullResultRenderingSurface());
++        await explorer.RunInput($".load {Path.Combine(Path.GetTempPath(), Guid.NewGuid() + ".csv")}");
++        explorer.ErrorCount.Should().Be(1);
++    }
++
++    private sealed class ThrowingSurface : IResultRenderingSurface
++    {
++        public Task RenderToDisplay(KustoQueryResult result) => throw new InvalidOperationException("no terminal");
++
++        public byte[] RenderToImage(KustoQueryResult result, double pWidth, double pHeight) => [];
++    }
++}

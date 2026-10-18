@@ -1,0 +1,553 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: thecorporatetractor <marco@azarguard.com>
+Date: Sun, 18 Oct 2026 16:15:20 +0300
+Subject: [PATCH 08/15] core: add the parse operator
+
+parse [kind=simple|regex|relaxed] [flags=imsU] Expr with [*] "const" Col[:type] ... [*]
+
+The pattern is compiled once per operator into a .NET regex (1 s match timeout)
+with one named group per capture, anchored at the start of the text unless the
+pattern begins with '*'. simple and relaxed match string constants literally;
+regex uses them as regex fragments. Captures are lazy (".*?" for strings,
+digit/number/bool shapes for typed captures) except a capture that ends the
+pattern, which takes the rest of the text. Typed captures: string, int, long,
+real, decimal, bool, datetime, timespan, guid, dynamic.
+
+Every input row is kept. A row that does not match, or (simple, regex) whose
+capture does not convert to its type, gets empty strings / nulls in the new
+columns; relaxed nulls only the capture that failed to convert. Non-string
+source expressions are converted to text first (dynamic: the string value or
+its JSON).
+
+Not done: parse-where, parse-kv.
+---
+ .../TreeEvaluator.QueryOperators.Parse.cs     | 179 ++++++++++++++++++
+ .../DefaultIRNodeVisitor.cs                   |   3 +
+ .../InternalRepresentation/IRNodeVisitor.cs   |   1 +
+ .../QueryOperators/IRParseOperatorNode.cs     |  46 +++++
+ .../Translation/IRTranslator.Parse.cs         | 124 ++++++++++++
+ test/BasicTests/ParseOperatorTests.cs         | 119 ++++++++++++
+ 6 files changed, 472 insertions(+)
+ create mode 100644 libraries/KustoLoco.Core/Evaluation/TreeEvaluator.QueryOperators.Parse.cs
+ create mode 100644 libraries/KustoLoco.Core/InternalRepresentation/Nodes/Expressions/QueryOperators/IRParseOperatorNode.cs
+ create mode 100644 libraries/KustoLoco.Core/InternalRepresentation/Translation/IRTranslator.Parse.cs
+ create mode 100644 test/BasicTests/ParseOperatorTests.cs
+
+diff --git a/libraries/KustoLoco.Core/Evaluation/TreeEvaluator.QueryOperators.Parse.cs b/libraries/KustoLoco.Core/Evaluation/TreeEvaluator.QueryOperators.Parse.cs
+new file mode 100644
+index 00000000..039992e8
+--- /dev/null
++++ b/libraries/KustoLoco.Core/Evaluation/TreeEvaluator.QueryOperators.Parse.cs
+@@ -0,0 +1,179 @@
++//
++// Licensed under the MIT License.
++
++using System;
++using System.Collections.Generic;
++using System.Globalization;
++using System.Linq;
++using System.Text.Json;
++using System.Text.Json.Nodes;
++using System.Text.RegularExpressions;
++using Kusto.Language.Symbols;
++using KustoLoco.Core.DataSource;
++using KustoLoco.Core.DataSource.Columns;
++using KustoLoco.Core.InternalRepresentation.Nodes.Expressions.QueryOperators;
++using KustoLoco.Core.Util;
++
++namespace KustoLoco.Core.Evaluation;
++
++internal partial class TreeEvaluator
++{
++    public override EvaluationResult VisitParseOperator(IRParseOperatorNode node, EvaluationContext context)
++    {
++        var result = new ParseResultTable(this, context.Left.Value, context, node);
++        return TabularResult.CreateWithVisualisation(result, context.Left.VisualizationState);
++    }
++
++    /// <summary>
++    ///     Adds one column per capture. Every input row is kept: a row whose text does not match
++    ///     gets empty strings / nulls in the new columns (as in Kusto).
++    /// </summary>
++    private class ParseResultTable : DerivedTableSourceBase<NoContext>
++    {
++        private readonly EvaluationContext _context;
++        private readonly IRParseOperatorNode _node;
++        private readonly TreeEvaluator _owner;
++
++        public ParseResultTable(TreeEvaluator owner, ITableSource input, EvaluationContext context,
++            IRParseOperatorNode node)
++            : base(input)
++        {
++            _owner = owner;
++            _context = context;
++            _node = node;
++            Type = (TableSymbol)node.ResultType;
++        }
++
++        public override TableSymbol Type { get; }
++
++        protected override (NoContext NewContext, ITableChunk NewChunk, bool ShouldBreak) ProcessChunk(NoContext _,
++            ITableChunk chunk)
++        {
++            var chunkContext = _context with { Chunk = chunk };
++            var evaluated = _node.Expression.Accept(_owner, chunkContext);
++            var rowCount = chunk.RowCount;
++            Func<int, object?> valueAt = evaluated switch
++            {
++                ColumnarResult c => c.Column.GetRawDataValue,
++                ScalarResult s => _ => s.Value,
++                _ => throw new InvalidOperationException("parse requires a scalar or columnar expression")
++            };
++
++            var captures = _node.Captures;
++            var builders = captures
++                .Select(c => NullableSetBuilderLocator.GetFixedNullableSetBuilderForType(
++                    TypeMapping.UnderlyingTypeForSymbol(c.Type), rowCount))
++                .ToArray();
++            var values = new object?[captures.Count];
++
++            for (var row = 0; row < rowCount; row++)
++            {
++                var matched = TryMatch(AsText(valueAt(row)), values);
++                for (var i = 0; i < captures.Count; i++)
++                    builders[i].Add(matched ? values[i] : EmptyValue(captures[i].Type));
++            }
++
++            var captureIndex = captures.Select((c, i) => (c.Name, i)).ToDictionary(t => t.Name, t => t.i);
++            var inputIndex = new Dictionary<string, int>();
++            for (var i = 0; i < Source.Type.Columns.Count; i++)
++                inputIndex[Source.Type.Columns[i].Name] = i;
++
++            var outputColumns = new BaseColumn[Type.Columns.Count];
++            for (var i = 0; i < Type.Columns.Count; i++)
++            {
++                var name = Type.Columns[i].Name;
++                if (captureIndex.TryGetValue(name, out var ci))
++                    outputColumns[i] = ColumnFactory.CreateFromDataSet(builders[ci].ToINullableSet());
++                else if (inputIndex.TryGetValue(name, out var ii))
++                    outputColumns[i] = chunk.Columns[ii];
++                else
++                    throw new InvalidOperationException($"parse: column '{name}' not found");
++            }
++
++            return (default, new TableChunk(this, outputColumns), false);
++        }
++
++        private bool TryMatch(string? text, object?[] values)
++        {
++            if (text is null)
++                return false;
++            Match m;
++            try
++            {
++                m = _node.Regex.Match(text);
++            }
++            catch (RegexMatchTimeoutException)
++            {
++                return false;
++            }
++
++            if (!m.Success)
++                return false;
++            for (var i = 0; i < _node.Captures.Count; i++)
++            {
++                var raw = m.Groups[$"c{i}"].Value;
++                if (TryConvert(raw, _node.Captures[i].Type, out var v))
++                    values[i] = v;
++                else if (_node.Relaxed)
++                    values[i] = null;
++                else
++                    return false;
++            }
++
++            return true;
++        }
++
++        private static string? AsText(object? value) =>
++            value switch
++            {
++                null => null,
++                string s => s,
++                JsonValue jv when jv.TryGetValue<string>(out var s) => s,
++                JsonNode jn => jn.ToJsonString(),
++                IFormattable f => f.ToString(null, CultureInfo.InvariantCulture),
++                _ => value.ToString()
++            };
++
++        private static object? EmptyValue(TypeSymbol type) => type == ScalarTypes.String ? string.Empty : null;
++
++        private static bool TryConvert(string raw, TypeSymbol type, out object? value)
++        {
++            value = null;
++            var inv = CultureInfo.InvariantCulture;
++            if (type == ScalarTypes.String)
++            {
++                value = raw;
++                return true;
++            }
++
++            if (raw.Length == 0)
++                return false;
++            if (type == ScalarTypes.Long && long.TryParse(raw, NumberStyles.Integer, inv, out var l)) value = l;
++            else if (type == ScalarTypes.Int && int.TryParse(raw, NumberStyles.Integer, inv, out var n)) value = n;
++            else if (type == ScalarTypes.Real && double.TryParse(raw, NumberStyles.Float, inv, out var d)) value = d;
++            else if (type == ScalarTypes.Decimal && decimal.TryParse(raw, NumberStyles.Float, inv, out var m)) value = m;
++            else if (type == ScalarTypes.Bool)
++            {
++                if (raw is "1" or "0") value = raw == "1";
++                else if (bool.TryParse(raw, out var b)) value = b;
++            }
++            else if (type == ScalarTypes.DateTime && DateTime.TryParse(raw, inv,
++                         DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out var dt)) value = dt;
++            else if (type == ScalarTypes.TimeSpan && TimeSpan.TryParse(raw, inv, out var ts)) value = ts;
++            else if (type == ScalarTypes.Guid && Guid.TryParse(raw, out var g)) value = g;
++            else if (type == ScalarTypes.Dynamic)
++            {
++                try
++                {
++                    value = JsonNode.Parse(raw);
++                }
++                catch (JsonException)
++                {
++                    value = JsonValue.Create(raw);
++                }
++            }
++
++            return value != null;
++        }
++    }
++}
+diff --git a/libraries/KustoLoco.Core/InternalRepresentation/DefaultIRNodeVisitor.cs b/libraries/KustoLoco.Core/InternalRepresentation/DefaultIRNodeVisitor.cs
+index 4837a90c..fb1119e5 100644
+--- a/libraries/KustoLoco.Core/InternalRepresentation/DefaultIRNodeVisitor.cs
++++ b/libraries/KustoLoco.Core/InternalRepresentation/DefaultIRNodeVisitor.cs
+@@ -132,6 +132,9 @@ internal abstract class DefaultIRNodeVisitor<TResult, TContext> : IRNodeVisitor<
+     public override TResult VisitMvApplyOperator(IRMvApplyOperatorNode node, TContext context) =>
+         DefaultVisit(node, context);
+ 
++    public override TResult VisitParseOperator(IRParseOperatorNode node, TContext context) =>
++        DefaultVisit(node, context);
++
+     public override TResult VisitExternalDataExpression(IRExternalDataExpression node, TContext context) =>
+         DefaultVisit(node, context);
+ 
+diff --git a/libraries/KustoLoco.Core/InternalRepresentation/IRNodeVisitor.cs b/libraries/KustoLoco.Core/InternalRepresentation/IRNodeVisitor.cs
+index 41dc22ee..0c8fa95b 100644
+--- a/libraries/KustoLoco.Core/InternalRepresentation/IRNodeVisitor.cs
++++ b/libraries/KustoLoco.Core/InternalRepresentation/IRNodeVisitor.cs
+@@ -50,6 +50,7 @@ internal abstract class IRNodeVisitor<TResult, TContext>
+     public abstract TResult VisitStarExpression(IRStarExpression node, TContext context);
+     public abstract TResult VisitMvExpandOperator(IRMvExpandOperatorNode node, TContext context);
+     public abstract TResult VisitMvApplyOperator(IRMvApplyOperatorNode node, TContext context);
++    public abstract TResult VisitParseOperator(IRParseOperatorNode node, TContext context);
+     public abstract TResult VisitExternalDataExpression(IRExternalDataExpression node, TContext context);
+     public abstract TResult VisitMakeSeriesOperator(IRMakeSeriesOperatorNode node, TContext context);
+     public abstract TResult VisitIpLookupOperator(IRIpLookupOperatorNode node, TContext context);
+diff --git a/libraries/KustoLoco.Core/InternalRepresentation/Nodes/Expressions/QueryOperators/IRParseOperatorNode.cs b/libraries/KustoLoco.Core/InternalRepresentation/Nodes/Expressions/QueryOperators/IRParseOperatorNode.cs
+new file mode 100644
+index 00000000..eef5b19e
+--- /dev/null
++++ b/libraries/KustoLoco.Core/InternalRepresentation/Nodes/Expressions/QueryOperators/IRParseOperatorNode.cs
+@@ -0,0 +1,46 @@
++//
++// Licensed under the MIT License.
++
++using System;
++using System.Collections.Generic;
++using System.Text.RegularExpressions;
++using Kusto.Language.Symbols;
++
++namespace KustoLoco.Core.InternalRepresentation.Nodes.Expressions.QueryOperators;
++
++/// <summary>
++///     parse [kind=simple|regex|relaxed] [flags=...] Expression with Pattern
++/// </summary>
++/// <remarks>
++///     The pattern is compiled once into a .NET regex with one group per capture column.
++///     Captures are in pattern order; each has the KQL type it was declared with.
++/// </remarks>
++internal class IRParseOperatorNode : IRQueryOperatorNode
++{
++    public IRParseOperatorNode(IRExpressionNode expression, Regex regex, List<ColumnSymbol> captures, bool relaxed,
++        TypeSymbol resultType)
++        : base(resultType)
++    {
++        Expression = expression ?? throw new ArgumentNullException(nameof(expression));
++        Regex = regex;
++        Captures = captures;
++        Relaxed = relaxed;
++    }
++
++    public IRExpressionNode Expression { get; }
++    public Regex Regex { get; }
++    public List<ColumnSymbol> Captures { get; }
++
++    /// <summary>relaxed: a capture that does not convert to its type becomes null instead of failing the match</summary>
++    public bool Relaxed { get; }
++
++    public override int ChildCount => 1;
++
++    public override IRNode GetChild(int index) =>
++        index == 0 ? Expression : throw new ArgumentOutOfRangeException(nameof(index));
++
++    public override TResult Accept<TResult, TContext>(IRNodeVisitor<TResult, TContext> visitor, TContext context)
++        => visitor.VisitParseOperator(this, context);
++
++    public override string ToString() => $"ParseOperator: {Regex} -> {SchemaDisplay.GetText(ResultType)}";
++}
+diff --git a/libraries/KustoLoco.Core/InternalRepresentation/Translation/IRTranslator.Parse.cs b/libraries/KustoLoco.Core/InternalRepresentation/Translation/IRTranslator.Parse.cs
+new file mode 100644
+index 00000000..627dadf1
+--- /dev/null
++++ b/libraries/KustoLoco.Core/InternalRepresentation/Translation/IRTranslator.Parse.cs
+@@ -0,0 +1,124 @@
++//
++// Licensed under the MIT License.
++
++using System;
++using System.Collections.Generic;
++using System.Linq;
++using System.Text;
++using System.Text.RegularExpressions;
++using Kusto.Language.Symbols;
++using Kusto.Language.Syntax;
++using KustoLoco.Core.InternalRepresentation.Nodes.Expressions;
++using KustoLoco.Core.InternalRepresentation.Nodes.Expressions.QueryOperators;
++
++namespace KustoLoco.Core.InternalRepresentation;
++
++internal partial class IRTranslator
++{
++    private static readonly TimeSpan ParseRegexTimeout = TimeSpan.FromSeconds(1);
++
++    /// <summary>
++    ///     parse [kind=simple|regex|relaxed] [flags=imsU] Expression with [*] "const" Col[:type] ... [*]
++    /// </summary>
++    /// <remarks>
++    ///     The pattern becomes one regex, anchored at the start unless it begins with '*'.
++    ///     simple/relaxed: string constants match literally. regex: constants are regex fragments.
++    ///     A capture is lazy (".*?" for strings, a type-shaped regex for numbers and bools) except a
++    ///     capture that ends the pattern, which takes the rest of the input.
++    /// </remarks>
++    public override IRNode VisitParseOperator(ParseOperator node)
++    {
++        var kind = "simple";
++        var flags = string.Empty;
++        foreach (var p in node.Parameters)
++        {
++            var value = p.Expression.ToString().Trim().Trim('"', '\'');
++            if (string.Equals(p.Name.SimpleName, "kind", StringComparison.OrdinalIgnoreCase))
++                kind = value.ToLowerInvariant();
++            else if (string.Equals(p.Name.SimpleName, "flags", StringComparison.OrdinalIgnoreCase))
++                flags = value;
++        }
++
++        if (kind is not ("simple" or "regex" or "relaxed"))
++            throw new NotImplementedException($"parse kind={kind} is not supported");
++
++        var isRegex = kind == "regex";
++        var ungreedy = flags.Contains('U');
++        var resultType = (TableSymbol)node.ResultType;
++        var captures = new List<ColumnSymbol>();
++        var sb = new StringBuilder();
++        var elements = node.Patterns.ToList();
++        if (elements.Count == 0 || elements[0] is not StarExpression)
++            sb.Append('^');
++
++        for (var i = 0; i < elements.Count; i++)
++        {
++            var element = elements[i];
++            var isLast = i == elements.Count - 1;
++            switch (element)
++            {
++                case StarExpression:
++                    sb.Append(isLast ? "(?:.*)" : "(?:.*?)");
++                    break;
++                case LiteralExpression literal:
++                    var text = literal.LiteralValue?.ToString() ?? string.Empty;
++                    sb.Append(isRegex ? $"(?:{text})" : Regex.Escape(text));
++                    break;
++                case CompoundStringLiteralExpression compound:
++                    var joined = string.Concat(compound.Tokens.Select(t => t.Text.Trim('"', '\'')));
++                    sb.Append(isRegex ? $"(?:{joined})" : Regex.Escape(joined));
++                    break;
++                default:
++                    var name = CaptureName(element)
++                               ?? throw new NotImplementedException(
++                                   $"parse pattern element '{element}' is not supported");
++                    var column = resultType.Columns.First(c => c.Name == name);
++                    captures.Add(column);
++                    sb.Append($"(?<c{captures.Count - 1}>{CaptureRegex(column.Type, isLast, kind, ungreedy)})");
++                    break;
++            }
++        }
++
++        var options = RegexOptions.CultureInvariant | RegexOptions.Compiled;
++        if (flags.Contains('i')) options |= RegexOptions.IgnoreCase;
++        if (flags.Contains('m')) options |= RegexOptions.Multiline;
++        if (flags.Contains('s')) options |= RegexOptions.Singleline;
++        var regex = new Regex(sb.ToString(), options, ParseRegexTimeout);
++
++        var expression = (IRExpressionNode)node.Expression.Accept(this);
++        return new IRParseOperatorNode(expression, regex, captures, kind == "relaxed", node.ResultType);
++    }
++
++    private static string? CaptureName(SyntaxNode element) =>
++        element switch
++        {
++            NameAndTypeDeclaration nt => nt.Name.SimpleName,
++            NameDeclaration nd => nd.SimpleName,
++            NameReference nr => nr.SimpleName,
++            _ => null
++        };
++
++    private static string CaptureRegex(TypeSymbol type, bool isLast, string kind, bool ungreedy)
++    {
++        var lazy = ungreedy ? "" : "?";
++        if (isLast)
++            return type == ScalarTypes.String || type == ScalarTypes.Dynamic || kind == "relaxed"
++                ? ".*"
++                : TypedCapture(type) ?? ".*";
++
++        if (kind == "relaxed")
++            return $".*{lazy}";
++        return TypedCapture(type) ?? $".*{lazy}";
++    }
++
++    private static string? TypedCapture(TypeSymbol type)
++    {
++        if (type == ScalarTypes.Long || type == ScalarTypes.Int)
++            return @"[-+]?\d+";
++        if (type == ScalarTypes.Real || type == ScalarTypes.Decimal)
++            return @"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?";
++        if (type == ScalarTypes.Bool)
++            return @"(?i:true|false|1|0)";
++        return null;
++    }
++}
+diff --git a/test/BasicTests/ParseOperatorTests.cs b/test/BasicTests/ParseOperatorTests.cs
+new file mode 100644
+index 00000000..9e8a9080
+--- /dev/null
++++ b/test/BasicTests/ParseOperatorTests.cs
+@@ -0,0 +1,119 @@
++using AwesomeAssertions;
++
++namespace BasicTests;
++
++[TestClass]
++public class ParseOperatorTests : TestMethods
++{
++    private const string Sshd =
++        "datatable(Msg:string)['Failed password for invalid user admin from 192.0.2.5 port 2222 ssh2']";
++
++    [TestMethod]
++    public async Task Parse_SimpleWithTypedCapture()
++    {
++        var query = Sshd +
++                    " | parse Msg with 'Failed password for invalid user ' User ' from ' SrcIP ' port ' Port:int ' ssh2'" +
++                    " | project User, SrcIP, Port, P2 = Port + 1";
++        var result = await ResultAsString(query);
++        result.Should().Be("admin,192.0.2.5,2222,2223");
++    }
++
++    [TestMethod]
++    public async Task Parse_TypedCaptureHasDeclaredType()
++    {
++        var query = Sshd +  " | parse Msg with * 'port ' Port:long ' ' * | getschema | where ColumnName == 'Port' | project ColumnType";
++        var result = await ResultAsString(query);
++        result.Should().Be("long");
++    }
++
++    [TestMethod]
++    public async Task Parse_NonMatchingRowIsKeptWithEmptyColumns()
++    {
++        var query = "datatable(Msg:string)['user=bob id=7', 'no match here']" +
++                    " | parse Msg with 'user=' Name ' id=' Id:long" +
++                    " | project Msg, Name, IdIsNull = isnull(Id)";
++        var result = await ResultAsString(query, ";");
++        result.Should().Be("user=bob id=7,bob,False;no match here,,True");
++    }
++
++    [TestMethod]
++    public async Task Parse_LeadingStarSkipsPrefix()
++    {
++        var query = Sshd + " | parse Msg with * 'user ' User ' from ' * | project User";
++        var result = await ResultAsString(query);
++        result.Should().Be("admin");
++    }
++
++    [TestMethod]
++    public async Task Parse_WithoutLeadingStarIsAnchoredAtStart()
++    {
++        var query = Sshd + " | parse Msg with 'user ' User ' from ' * | project Empty = isempty(User)";
++        var result = await ResultAsString(query);
++        result.Should().Be("True");
++    }
++
++    [TestMethod]
++    public async Task Parse_LastCaptureTakesTheRest()
++    {
++        var query = "datatable(Msg:string)['k=a b c'] | parse Msg with 'k=' Rest | project Rest";
++        var result = await ResultAsString(query);
++        result.Should().Be("a b c");
++    }
++
++    [TestMethod]
++    public async Task Parse_KindRegex()
++    {
++        var query = Sshd +
++                    @" | parse kind=regex Msg with * @'for (invalid user )?' User @'\s+from\s+' SrcIP @'\s+port\s+' Port:int" +
++                    " | project User, SrcIP, Port";
++        var result = await ResultAsString(query);
++        result.Should().Be("admin,192.0.2.5,2222");
++    }
++
++    [TestMethod]
++    public async Task Parse_KindRegexIgnoreCaseFlag()
++    {
++        var query = "datatable(Msg:string)['USER=Ann'] | parse kind=regex flags=i Msg with 'user=' Name | project Name";
++        var result = await ResultAsString(query);
++        result.Should().Be("Ann");
++    }
++
++    [TestMethod]
++    public async Task Parse_RelaxedBadIntBecomesNull()
++    {
++        var query = "datatable(Msg:string)['id=abc name=zed']" +
++                    " | parse kind=relaxed Msg with 'id=' Id:int ' name=' Name" +
++                    " | project IdIsNull = isnull(Id), Name";
++        var result = await ResultAsString(query);
++        result.Should().Be("True,zed");
++    }
++
++    [TestMethod]
++    public async Task Parse_SimpleBadIntFailsTheMatch()
++    {
++        var query = "datatable(Msg:string)['id=abc name=zed']" +
++                    " | parse Msg with 'id=' Id:int ' name=' Name" +
++                    " | project IdIsNull = isnull(Id), Name";
++        var result = await ResultAsString(query);
++        result.Should().Be("True,");
++    }
++
++    [TestMethod]
++    public async Task Parse_OnDynamicMemberViaTostring()
++    {
++        var query = "datatable(d:dynamic)[dynamic({\"msg\":\"src=10.0.0.1 dst=10.0.0.2\"})]" +
++                    " | parse tostring(d.msg) with 'src=' Src ' dst=' Dst | project Src, Dst";
++        var result = await ResultAsString(query);
++        result.Should().Be("10.0.0.1,10.0.0.2");
++    }
++
++    [TestMethod]
++    public async Task Parse_KeepsExistingColumnsAndFeedsSummarize()
++    {
++        var query = "datatable(Host:string, Msg:string)['a','from 1.1.1.1 port 1','a','from 1.1.1.1 port 2','b','from 2.2.2.2 port 3']" +
++                    " | parse Msg with 'from ' Ip ' port ' Port:long" +
++                    " | summarize n=count(), p=sum(Port) by Host, Ip | order by Host asc";
++        var result = await ResultAsString(query, ";");
++        result.Should().Be("a,1.1.1.1,2,3;b,2.2.2.2,1,3");
++    }
++}

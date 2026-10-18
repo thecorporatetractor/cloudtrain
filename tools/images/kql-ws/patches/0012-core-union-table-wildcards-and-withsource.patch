@@ -1,0 +1,411 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: thecorporatetractor <marco@azarguard.com>
+Date: Sun, 18 Oct 2026 16:22:57 +0300
+Subject: [PATCH 12/15] core: union table wildcards and withsource
+
+- Wildcarded table names (union Device*) failed with "Name group is not in
+  scope": Kusto.Language binds them to a GroupSymbol of the matching tables.
+  Each member now becomes its own union input.
+- withsource=Col produced an empty column. Every input now carries its source
+  name: the table name for a table reference (wildcard members included),
+  union_arg<position> for any other expression (a subquery, or the piped
+  input), as Kusto does.
+- kind=inner: Kusto.Language reports the outer schema, so the common columns
+  (same name and type in every input, plus the withsource column) are
+  selected in the translator; the evaluator drops the other columns instead
+  of failing.
+- isfuzzy=true: a name that resolves to no table is skipped. Kusto.Language
+  reports it as warning KS205, which no longer aborts the query.
+- IRUnionOperatorNode can also apply an operator to the piped input before
+  the union (used by search in the next commit).
+
+Limit: withsource values are bare table names (no database prefix).
+---
+ libraries/KustoLoco.Core/BabyKustoEngine.cs   |  10 +-
+ .../TreeEvaluator.QueryOperators.Union.cs     |  43 +++++---
+ .../QueryOperators/IRUnionOperatorNode.cs     |  24 ++++-
+ .../Translation/IRTranslator.Union.cs         |  80 +++++++++++++-
+ test/BasicTests/UnionOperatorTests.cs         | 102 ++++++++++++++++++
+ 5 files changed, 237 insertions(+), 22 deletions(-)
+ create mode 100644 test/BasicTests/UnionOperatorTests.cs
+
+diff --git a/libraries/KustoLoco.Core/BabyKustoEngine.cs b/libraries/KustoLoco.Core/BabyKustoEngine.cs
+index aee75293..71c58632 100644
+--- a/libraries/KustoLoco.Core/BabyKustoEngine.cs
++++ b/libraries/KustoLoco.Core/BabyKustoEngine.cs
+@@ -130,8 +130,12 @@ public class BabyKustoEngine
+         var visualizer = new IrNodeVisualizer(_console);
+         visualizer.DumpKustoTree(code, dumpKustoTree);
+ 
+-        var diagnostics = code.GetDiagnostics();
+-        if (diagnostics.Count > 0)
++        // Warnings that only describe a legal, well-defined behaviour do not stop the query:
++        // KS205 = a union isfuzzy=true name that resolves to no table (it is skipped).
++        var diagnostics = code.GetDiagnostics()
++            .Where(d => !(d.Severity == DiagnosticSeverity.Warning && IgnoredWarnings.Contains(d.Code)))
++            .ToArray();
++        if (diagnostics.Length > 0)
+         {
+             var sb = new StringBuilder();
+             sb.AppendLine("Query error(s):");
+@@ -173,6 +177,8 @@ public class BabyKustoEngine
+         return result;
+     }
+ 
++    private static readonly HashSet<string> IgnoredWarnings = ["KS205"];
++
+     private static class CoreSettings
+     {
+         private const string prefix = "core";
+diff --git a/libraries/KustoLoco.Core/Evaluation/TreeEvaluator.QueryOperators.Union.cs b/libraries/KustoLoco.Core/Evaluation/TreeEvaluator.QueryOperators.Union.cs
+index 4011811e..0616f615 100644
+--- a/libraries/KustoLoco.Core/Evaluation/TreeEvaluator.QueryOperators.Union.cs
++++ b/libraries/KustoLoco.Core/Evaluation/TreeEvaluator.QueryOperators.Union.cs
+@@ -21,11 +21,18 @@ internal partial class TreeEvaluator
+     {
+         var tables =
+             new List<ITableSource>((context.Left != TabularResult.Empty ? 1 : 0) + node.Expressions.ChildCount);
++        var names = new List<string>();
+         var visualizationState = VisualizationState.Empty;
++        var offset = 0;
+         if (context.Left != TabularResult.Empty)
+         {
+-            tables.Add(context.Left.Value);
++            var left = context.Left;
++            if (node.LeftOperator != null)
++                left = (TabularResult)node.LeftOperator.Accept(this, context);
++            tables.Add(left.Value);
++            names.Add(node.LeftSourceName ?? "union_arg0");
+             visualizationState = context.Left.VisualizationState;
++            offset = 1;
+         }
+ 
+         for (var i = 0; i < node.Expressions.ChildCount; i++)
+@@ -35,6 +42,7 @@ internal partial class TreeEvaluator
+             MyDebug.Assert(expressionResult != EvaluationResult.Null);
+             var tableResult = (TabularResult)expressionResult;
+             tables.Add(tableResult.Value);
++            names.Add((i < node.SourceNames.Length ? node.SourceNames[i] : null) ?? $"union_arg{i + offset}");
+ 
+             if (tableResult.VisualizationState != VisualizationState.Empty)
+             {
+@@ -42,7 +50,11 @@ internal partial class TreeEvaluator
+             }
+         }
+ 
+-        var result = new UnionResultTable(tables, (TableSymbol)node.ResultType);
++        var resultType = (TableSymbol)node.ResultType;
++        var sourceIndex = node.SourceColumn == null
++            ? -1
++            : resultType.Columns.ToList().FindIndex(c => c.Name == node.SourceColumn);
++        var result = new UnionResultTable(tables, names, sourceIndex, resultType);
+         return TabularResult.CreateWithVisualisation(result, visualizationState);
+     }
+ 
+@@ -51,10 +63,15 @@ internal partial class TreeEvaluator
+         //TODO HERE - we should not be keying on ColumnSymbol, but on the original column name/type
+         private readonly ColumnSymbolLookup _columnMappings = new();
+         private readonly List<ITableSource> _tables;
++        private readonly List<string> _names;
++        private readonly int _sourceIndex;
+ 
+-        public UnionResultTable(List<ITableSource> tables, TableSymbol resultType)
++        public UnionResultTable(List<ITableSource> tables, List<string> names, int sourceIndex,
++            TableSymbol resultType)
+         {
+             _tables = tables;
++            _names = names;
++            _sourceIndex = sourceIndex;
+             Type = resultType;
+ 
+ 
+@@ -75,16 +92,16 @@ internal partial class TreeEvaluator
+ 
+         public IEnumerable<ITableChunk> GetData()
+         {
+-            foreach (var table in _tables)
++            for (var t = 0; t < _tables.Count; t++)
+             {
+-                foreach (var chunk in table.GetData())
++                foreach (var chunk in _tables[t].GetData())
+                 {
+-                    yield return ProcessChunk(table, chunk);
++                    yield return ProcessChunk(_tables[t], _names[t], chunk);
+                 }
+             }
+         }
+ 
+-        private TableChunk ProcessChunk(ITableSource table, ITableChunk chunk)
++        private TableChunk ProcessChunk(ITableSource table, string sourceName, ITableChunk chunk)
+         {
+             var columns = Enumerable.Range(0, Type.Columns.Count).Select(
+                     _ => NullColumn.Instance)
+@@ -93,16 +110,14 @@ internal partial class TreeEvaluator
+             for (var i = 0; i < chunk.Columns.Length; i++)
+             {
+                 var symbol = (ColumnSymbol)table.Type.Members[i];
+-                if (!_columnMappings.TryGetValue(symbol, out var destinationColumnIndex))
+-                {
+-                    throw new InvalidOperationException(
+-                        $"Couldn't find source column to match to output column {SchemaDisplay.GetText(symbol)}");
+-                }
+-
+-                columns[destinationColumnIndex] = chunk.Columns[i];
++                // kind=inner drops the columns that are not in every input
++                if (_columnMappings.TryGetValue(symbol, out var destinationColumnIndex))
++                    columns[destinationColumnIndex] = chunk.Columns[i];
+             }
+ 
+             var rowCount = chunk.RowCount;
++            if (_sourceIndex >= 0)
++                columns[_sourceIndex] = ColumnHelpers.CreateFromScalar(sourceName, ScalarTypes.String, rowCount);
+             for (var i = 0; i < columns.Length; i++)
+             {
+                 if (columns[i] == NullColumn.Instance)
+diff --git a/libraries/KustoLoco.Core/InternalRepresentation/Nodes/Expressions/QueryOperators/IRUnionOperatorNode.cs b/libraries/KustoLoco.Core/InternalRepresentation/Nodes/Expressions/QueryOperators/IRUnionOperatorNode.cs
+index c1c443c8..df37034b 100644
+--- a/libraries/KustoLoco.Core/InternalRepresentation/Nodes/Expressions/QueryOperators/IRUnionOperatorNode.cs
++++ b/libraries/KustoLoco.Core/InternalRepresentation/Nodes/Expressions/QueryOperators/IRUnionOperatorNode.cs
+@@ -9,10 +9,32 @@ namespace KustoLoco.Core.InternalRepresentation.Nodes.Expressions.QueryOperators
+ internal class IRUnionOperatorNode : IRQueryOperatorNode
+ {
+     public IRUnionOperatorNode(IRListNode<IRExpressionNode> expressions, TypeSymbol resultType)
+-        : base(resultType) =>
++        : this(expressions, resultType, null, [], null)
++    {
++    }
++
++    /// <param name="sourceColumn">withsource column name (null: none)</param>
++    /// <param name="sourceNames">
++    ///     per expression, the value of the withsource column: the table name, or null for an
++    ///     expression that is not a table reference (named union_arg{position} as Kusto does)
++    /// </param>
++    /// <param name="leftOperator">optional operator applied to the piped input before the union (used by search)</param>
++    public IRUnionOperatorNode(IRListNode<IRExpressionNode> expressions, TypeSymbol resultType,
++        string? sourceColumn, string?[] sourceNames, IRQueryOperatorNode? leftOperator, string? leftSourceName = null)
++        : base(resultType)
++    {
+         Expressions = expressions ?? throw new ArgumentNullException(nameof(expressions));
++        SourceColumn = sourceColumn;
++        SourceNames = sourceNames;
++        LeftOperator = leftOperator;
++        LeftSourceName = leftSourceName;
++    }
+ 
+     public IRListNode<IRExpressionNode> Expressions { get; }
++    public string? SourceColumn { get; }
++    public string?[] SourceNames { get; }
++    public IRQueryOperatorNode? LeftOperator { get; }
++    public string? LeftSourceName { get; }
+ 
+     public override int ChildCount => 1;
+ 
+diff --git a/libraries/KustoLoco.Core/InternalRepresentation/Translation/IRTranslator.Union.cs b/libraries/KustoLoco.Core/InternalRepresentation/Translation/IRTranslator.Union.cs
+index 56c42118..7575f835 100644
+--- a/libraries/KustoLoco.Core/InternalRepresentation/Translation/IRTranslator.Union.cs
++++ b/libraries/KustoLoco.Core/InternalRepresentation/Translation/IRTranslator.Union.cs
+@@ -1,7 +1,10 @@
+ ﻿//
+ // Licensed under the MIT License.
+ 
++using System;
++using System.Collections.Generic;
+ using System.Linq;
++using Kusto.Language.Symbols;
+ using Kusto.Language.Syntax;
+ using KustoLoco.Core.InternalRepresentation.Nodes.Expressions;
+ using KustoLoco.Core.InternalRepresentation.Nodes.Expressions.QueryOperators;
+@@ -10,12 +13,79 @@ namespace KustoLoco.Core.InternalRepresentation;
+ 
+ internal partial class IRTranslator
+ {
++    /// <summary>
++    ///     union [kind=inner|outer] [withsource=Col] [isfuzzy=true] T1, T2*, (subquery) ...
++    /// </summary>
++    /// <remarks>
++    ///     Kusto.Language resolves a wildcarded name (Device*) to a GroupSymbol of the matching
++    ///     tables and computes the result schema (the withsource column first; for kind=inner it
++    ///     still reports every column, so the common ones are selected here). Here each group member becomes its own input,
++    ///     and every input remembers its source name for the withsource column: the table name,
++    ///     or union_arg{position} for anything that is not a plain table reference. With
++    ///     isfuzzy=true a name that resolves to nothing is skipped (Kusto reports it as a
++    ///     warning, KS205).
++    /// </remarks>
+     public override IRNode VisitUnionOperator(UnionOperator node)
+     {
+-        var expressions = node.Expressions
+-            .Select(expression => (IRExpressionNode)expression.Element.Accept(this))
+-            .ToArray();
++        var sourceColumn = ParameterText(node.Parameters, "withsource")
++                           ?? ParameterText(node.Parameters, "source");
++        var expressions = new List<IRExpressionNode>();
++        var names = new List<string?>();
++        foreach (var element in node.Expressions)
++        {
++            var expression = element.Element;
++            switch (expression.ReferencedSymbol)
++            {
++                case GroupSymbol group:
++                    foreach (var table in group.Members.OfType<TableSymbol>())
++                    {
++                        expressions.Add(new IRNameReferenceNode(table, table));
++                        names.Add(table.Name);
++                    }
+ 
+-        return new IRUnionOperatorNode(IRListNode.From(expressions), node.ResultType);
++                    break;
++                case TableSymbol table when expression is NameReference:
++                    expressions.Add((IRExpressionNode)expression.Accept(this));
++                    names.Add(table.Name);
++                    break;
++                case null when expression is NameReference:
++                    // unresolved name: only legal with isfuzzy=true (otherwise binding failed earlier)
++                    break;
++                default:
++                    expressions.Add((IRExpressionNode)expression.Accept(this));
++                    names.Add(null);
++                    break;
++            }
++        }
++
++        var resultType = (TableSymbol)node.ResultType;
++        if (string.Equals(ParameterText(node.Parameters, "kind"), "inner", StringComparison.OrdinalIgnoreCase))
++        {
++            // Kusto.Language reports the outer schema for kind=inner too; keep only the columns
++            // (name and type) present in every input, plus the withsource column.
++            var inputs = expressions.Select(e => e.ResultType).OfType<TableSymbol>().ToList();
++            if (node.Parent is PipeExpression pipe && pipe.Operator == node)
++                inputs.Add(_rowScope);
++            resultType = new TableSymbol(resultType.Columns.Where(c =>
++                c.Name == sourceColumn ||
++                inputs.All(t => t.Columns.Any(x => x.Name == c.Name && x.Type == c.Type))));
++        }
++
++        return new IRUnionOperatorNode(IRListNode.From(expressions.ToArray()), resultType,
++            sourceColumn, names.ToArray(), null);
++    }
++
++    /// <summary>The value of a named operator parameter (withsource=X -> "X"), or null.</summary>
++    private static string? ParameterText(SyntaxList<NamedParameter> parameters, string name)
++    {
++        var parameter = parameters
++            .FirstOrDefault(p => string.Equals(p.Name.SimpleName, name, StringComparison.OrdinalIgnoreCase));
++        return parameter?.Expression switch
++        {
++            null => null,
++            NameDeclaration declaration => declaration.SimpleName,
++            NameReference reference => reference.SimpleName,
++            var e => e.ToString().Trim()
++        };
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/test/BasicTests/UnionOperatorTests.cs b/test/BasicTests/UnionOperatorTests.cs
+new file mode 100644
+index 00000000..4599aba2
+--- /dev/null
++++ b/test/BasicTests/UnionOperatorTests.cs
+@@ -0,0 +1,102 @@
++using AwesomeAssertions;
++using KustoLoco.Core;
++using NotNullStrings;
++
++namespace BasicTests;
++
++[TestClass]
++public class UnionOperatorTests : TestMethods
++{
++    public record ProcRow(string DeviceName, string FileName);
++
++    public record NetRow(string DeviceName, string RemoteIP);
++
++    public record SignRow(string UserPrincipalName, string IPAddress);
++
++    private static KustoQueryContext SocContext()
++    {
++        var context = CreateContext();
++        context.CopyDataIntoTable("DeviceProcessEvents",
++            new[] { new ProcRow("pc1", "a.exe"), new ProcRow("pc2", "b.exe") });
++        context.CopyDataIntoTable("DeviceNetworkEvents", new[] { new NetRow("pc1", "10.0.0.1") });
++        context.CopyDataIntoTable("SigninLogs", new[] { new SignRow("u@x", "10.0.0.1") });
++        return context;
++    }
++
++    private static async Task<string> Run(KustoQueryContext context, string query)
++    {
++        var result = await context.RunQuery(query);
++        result.Error.Should().BeEmpty();
++        return result.EnumerateRows()
++            .Select(r => string.Join(",", r.Select(KustoFormatter.ObjectToKustoString)))
++            .JoinString(";");
++    }
++
++    [TestMethod]
++    public async Task Wildcard_ExpandsToMatchingTables()
++    {
++        var result = await Run(SocContext(), "union Device* | count");
++        result.Should().Be("3");
++    }
++
++    [TestMethod]
++    public async Task Wildcard_WithSource_NamesEachRowsTable()
++    {
++        var result = await Run(SocContext(),
++            "union withsource=SourceTable Device* | summarize n=count() by SourceTable | order by SourceTable asc");
++        result.Should().Be("DeviceNetworkEvents,1;DeviceProcessEvents,2");
++    }
++
++    [TestMethod]
++    public async Task WithSource_ExplicitTables()
++    {
++        var result = await Run(SocContext(),
++            "union withsource=T SigninLogs, DeviceNetworkEvents | summarize n=count() by T | order by T asc");
++        result.Should().Be("DeviceNetworkEvents,1;SigninLogs,1");
++    }
++
++    [TestMethod]
++    public async Task WithSource_SubqueryIsNamedUnionArg()
++    {
++        var result = await Run(SocContext(),
++            "union withsource=T (SigninLogs | where IPAddress == '10.0.0.1'), DeviceNetworkEvents | project T | order by T asc");
++        result.Should().Be("DeviceNetworkEvents;union_arg0");
++    }
++
++    [TestMethod]
++    public async Task WithSource_PipedFormNamesTheLeftInput()
++    {
++        var result = await Run(SocContext(),
++            "SigninLogs | union withsource=T DeviceNetworkEvents | project T | order by T asc");
++        result.Should().Be("DeviceNetworkEvents;union_arg0");
++    }
++
++    [TestMethod]
++    public async Task KindInner_KeepsOnlyCommonColumns()
++    {
++        var result = await Run(SocContext(),
++            "union kind=inner DeviceProcessEvents, DeviceNetworkEvents | getschema | project ColumnName");
++        result.Should().Be("DeviceName");
++    }
++
++    [TestMethod]
++    public async Task KindInner_ReturnsAllRows()
++    {
++        var result = await Run(SocContext(), "union kind=inner DeviceProcessEvents, DeviceNetworkEvents | count");
++        result.Should().Be("3");
++    }
++
++    [TestMethod]
++    public async Task IsFuzzy_IgnoresMissingTables()
++    {
++        var result = await Run(SocContext(), "union isfuzzy=true SigninLogs, NoSuchTable | count");
++        result.Should().Be("1");
++    }
++
++    [TestMethod]
++    public async Task Wildcard_MixedWithExplicitTable()
++    {
++        var result = await Run(SocContext(), "union withsource=T Device*, SigninLogs | distinct T | count");
++        result.Should().Be("3");
++    }
++}

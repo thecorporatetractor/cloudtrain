@@ -1,0 +1,270 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: thecorporatetractor <marco@azarguard.com>
+Date: Sun, 18 Oct 2026 17:41:32 +0300
+Subject: [PATCH 07/15] lokql: --quiet startup; .save writes empty results and
+ refuses failed ones
+
+- --quiet (run, explore, convert): only errors are printed while the data
+  files, commands and scripts given on the command line run; explore turns
+  output back on at the prompt. Loading a dataset no longer floods the
+  screen, and scripted runs print nothing but errors.
+- .save of an empty result writes an empty file (JSON [] or a CSV header)
+  instead of warning 'No rows to save'; .save after a failed query is an
+  error and writes nothing. A script can now tell 'ran, no rows' from
+  'failed' by whether the file exists.
+---
+ applications/lokql/CmdConvert.cs              |  2 +-
+ applications/lokql/CmdExplore.cs              |  3 +-
+ applications/lokql/CmdRun.cs                  |  2 +-
+ applications/lokql/CommonOptions.cs           |  4 +++
+ applications/lokql/Explorer.cs                | 22 +++++++++---
+ applications/lokql/QuietConsole.cs            | 34 +++++++++++++++++++
+ applications/lokql/SixelRenderingSurface.cs   |  5 ++-
+ .../lokql-engine/StandardFormatAdaptor.cs     | 14 ++++++--
+ .../LokqlEngineTests/ScriptRobustnessTests.cs | 29 ++++++++++++++++
+ 9 files changed, 103 insertions(+), 12 deletions(-)
+ create mode 100644 applications/lokql/QuietConsole.cs
+
+diff --git a/applications/lokql/CmdConvert.cs b/applications/lokql/CmdConvert.cs
+index 49843997..c7a6e650 100644
+--- a/applications/lokql/CmdConvert.cs
++++ b/applications/lokql/CmdConvert.cs
+@@ -12,7 +12,7 @@ internal class CmdConvert
+     public static async Task RunAsync(Options options)
+     {
+         var explorer = await Explorer.Create(options.Data, options.Args, options.Load,
+-            options.Commands, options.Scripts);
++            options.Commands, options.Scripts, options.Quiet);
+         await explorer.RunInput($".load \"{options.In}\"");
+         await explorer.RunInput($".save \"{options.Out}\"");
+         explorer.Close();
+diff --git a/applications/lokql/CmdExplore.cs b/applications/lokql/CmdExplore.cs
+index e934ae0b..0e39dca1 100644
+--- a/applications/lokql/CmdExplore.cs
++++ b/applications/lokql/CmdExplore.cs
+@@ -12,7 +12,8 @@ internal class CmdExplore
+     public static async Task RunAsync(Options options)
+     {
+         var explorer = await Explorer.Create(options.Data, options.Args, options.Load,
+-            options.Commands, ((CommonOptions)options).Scripts);
++            options.Commands, ((CommonOptions)options).Scripts, options.Quiet);
++        explorer.SetQuiet(false);
+         await explorer.RunInteractive();
+         explorer.Close();
+     }
+diff --git a/applications/lokql/CmdRun.cs b/applications/lokql/CmdRun.cs
+index 9829fabc..78f1ef04 100644
+--- a/applications/lokql/CmdRun.cs
++++ b/applications/lokql/CmdRun.cs
+@@ -12,7 +12,7 @@ internal class CmdRun
+     public static async Task RunAsync(Options options)
+     {
+         var explorer = await Explorer.Create(options.Data, options.Args,options.Load,
+-            options.Commands,options.Scripts);
++            options.Commands,options.Scripts, options.Quiet);
+        
+ 
+         explorer.Close();
+diff --git a/applications/lokql/CommonOptions.cs b/applications/lokql/CommonOptions.cs
+index 697f9787..96e9a250 100644
+--- a/applications/lokql/CommonOptions.cs
++++ b/applications/lokql/CommonOptions.cs
+@@ -16,4 +16,8 @@ public class CommonOptions
+     [Option('l', HelpText = "Loads data files")]
+     public IEnumerable<string> Load { get; set; } = [];
+ 
++    [Option('q', "quiet",
++        HelpText = "Print only errors while the data files, commands and scripts run (explore: until the prompt)")]
++    public bool Quiet { get; set; }
++
+ }
+diff --git a/applications/lokql/Explorer.cs b/applications/lokql/Explorer.cs
+index 61395d13..8ebedb4e 100644
+--- a/applications/lokql/Explorer.cs
++++ b/applications/lokql/Explorer.cs
+@@ -5,29 +5,32 @@ using Lokql.Engine;
+ 
+ public class Explorer
+ {
+-    private readonly IKustoConsole _console;
++    private readonly QuietConsole _console;
+     private readonly InteractiveTableExplorer _explorer;
++    private readonly SixelRenderingSurface _renderer;
+ 
+     private Explorer(string dataFolder, IEnumerable<string> args)
+     {
+-        _console = new SystemConsole();
++        _console = new QuietConsole();
+         var settings = new KustoSettingsProvider();
+        
+         settings.Set(StandardFormatAdaptor.Settings.KustoDataPath.Name, dataFolder);
+         foreach (var (i, a) in args.Index()) settings.Set($"arg{i}", a);
+ 
+         var processor = CommandProcessorProvider.GetCommandProcessor();
+-        var renderer = new SixelRenderingSurface(settings);
+-        _explorer = new InteractiveTableExplorer(_console, settings, processor, renderer, []);
++        _renderer = new SixelRenderingSurface(settings);
++        _explorer = new InteractiveTableExplorer(_console, settings, processor, _renderer, []);
+       
+     }
+ 
+     public static async Task<Explorer> Create(string dataFolder, IEnumerable<string> args,
+         IEnumerable<string> dataFiles,
+         IEnumerable<string> commands,
+-        IEnumerable<string> scripts)
++        IEnumerable<string> scripts,
++        bool quiet = false)
+     {
+         var r = new Explorer(dataFolder, args);
++        r.SetQuiet(quiet);
+         foreach (var datafile in dataFiles)
+         {
+             await r.RunInput($".load \"{datafile}\"");
+@@ -49,6 +52,15 @@ public class Explorer
+ 
+     public void Close() => _console.RestoreColors();
+ 
++    /// <summary>
++    ///     While quiet, only errors are printed (no results, tables, charts or progress)
++    /// </summary>
++    public void SetQuiet(bool quiet)
++    {
++        _console.Quiet = quiet;
++        _renderer.Quiet = quiet;
++    }
++
+     /// <summary>Errors reported by the queries and commands run so far.</summary>
+     public int ErrorCount => _explorer.ErrorCount;
+ 
+diff --git a/applications/lokql/QuietConsole.cs b/applications/lokql/QuietConsole.cs
+new file mode 100644
+index 00000000..010093c5
+--- /dev/null
++++ b/applications/lokql/QuietConsole.cs
+@@ -0,0 +1,34 @@
++﻿using KustoLoco.Core.Console;
++
++/// <summary>
++///     The system console with a switch that silences everything except errors
++/// </summary>
++internal sealed class QuietConsole : IKustoConsole
++{
++    private readonly SystemConsole _inner = new();
++
++    public bool Quiet { get; set; }
++
++    public int WindowWidth => _inner.WindowWidth;
++
++    public ConsoleColor ForegroundColor
++    {
++        get => _inner.ForegroundColor;
++        set => _inner.ForegroundColor = value;
++    }
++
++    public void Write(string s)
++    {
++        if (!Quiet)
++            _inner.Write(s);
++    }
++
++    public void WriteLine(string s) => Write(s + Environment.NewLine);
++
++    public string ReadLine() => _inner.ReadLine();
++
++    // errors are always shown, bypassing the switch
++    public void Error(string s) => ((IKustoConsole)_inner).Error(s);
++
++    public void RestoreColors() => _inner.RestoreColors();
++}
+diff --git a/applications/lokql/SixelRenderingSurface.cs b/applications/lokql/SixelRenderingSurface.cs
+index 4fc45e30..384e503d 100644
+--- a/applications/lokql/SixelRenderingSurface.cs
++++ b/applications/lokql/SixelRenderingSurface.cs
+@@ -11,10 +11,13 @@ internal class SixelRenderingSurface(KustoSettingsProvider settings)
+     private const string MaxRowsSetting = "table.maxrows";
+     private const int DefaultRows = 100;
+ 
++    /// <summary>When set, nothing is rendered (see lokql --quiet)</summary>
++    public bool Quiet { get; set; }
++
+     public async Task RenderToDisplay(KustoQueryResult result)
+     {
+         await Task.CompletedTask;
+-        if (result.Error.IsNotBlank())
++        if (Quiet || result.Error.IsNotBlank())
+             return;
+ 
+         // Sixel output queries the terminal; without one (output redirected to a file or
+diff --git a/libraries/lokql-engine/StandardFormatAdaptor.cs b/libraries/lokql-engine/StandardFormatAdaptor.cs
+index f628ccf8..8b4a713b 100644
+--- a/libraries/lokql-engine/StandardFormatAdaptor.cs
++++ b/libraries/lokql-engine/StandardFormatAdaptor.cs
+@@ -52,9 +52,17 @@ public class StandardFormatAdaptor : ITableAdaptor
+ 
+     public async Task<bool> SaveResult(KustoQueryResult result, string path)
+     {
+-        if (result.RowCount == 0)
++        // A failed query has nothing to save; an empty result is still a result (an empty
++        // JSON array, a CSV header): the file then tells a script the query ran.
++        if (result.Error.IsNotBlank())
+         {
+-            _console.Warn("No rows to save");
++            _console.Error($"Not saving to {path}: the query failed");
++            return false;
++        }
++
++        if (result.ColumnCount == 0)
++        {
++            _console.Warn("No result to save");
+             return false;
+         }
+ 
+@@ -75,7 +83,7 @@ public class StandardFormatAdaptor : ITableAdaptor
+             }
+         }
+ 
+-        _console.Info($"Unable to save result to {path}");
++        _console.Error($"Unable to save result to {path}");
+         return false;
+     }
+ 
+diff --git a/test/LokqlEngineTests/ScriptRobustnessTests.cs b/test/LokqlEngineTests/ScriptRobustnessTests.cs
+index 383f98fe..5473c2c4 100644
+--- a/test/LokqlEngineTests/ScriptRobustnessTests.cs
++++ b/test/LokqlEngineTests/ScriptRobustnessTests.cs
+@@ -65,6 +65,35 @@ public class ScriptRobustnessTests
+         explorer.ErrorCount.Should().Be(1);
+     }
+ 
++    [TestMethod]
++    public async Task SavingAnEmptyResultWritesAFile()
++    {
++        var explorer = CreateExplorer(new NullResultRenderingSurface());
++        var file = Path.Combine(Path.GetTempPath(), Guid.NewGuid() + ".json");
++        try
++        {
++            await explorer.RunInput("datatable(a:long)[1] | where a > 5");
++            await explorer.RunInput($".save {file}");
++            explorer.ErrorCount.Should().Be(0);
++            File.ReadAllText(file).Trim().Should().Be("[]");
++        }
++        finally
++        {
++            File.Delete(file);
++        }
++    }
++
++    [TestMethod]
++    public async Task SavingAFailedQueryIsAnErrorAndWritesNothing()
++    {
++        var explorer = CreateExplorer(new NullResultRenderingSurface());
++        var file = Path.Combine(Path.GetTempPath(), Guid.NewGuid() + ".csv");
++        await explorer.RunInput("print x=nosuchfunction(1)");
++        await explorer.RunInput($".save {file}");
++        explorer.ErrorCount.Should().Be(2);
++        File.Exists(file).Should().BeFalse();
++    }
++
+     private sealed class ThrowingSurface : IResultRenderingSurface
+     {
+         public Task RenderToDisplay(KustoQueryResult result) => throw new InvalidOperationException("no terminal");

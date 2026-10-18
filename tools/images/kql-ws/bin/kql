@@ -1,0 +1,56 @@
+#!/bin/bash
+# kql: the KQL workstation shell (KustoLoco lokql) with the lab's tables loaded.
+#
+#   kql                    interactive session (KQL> prompt; .help lists the commands)
+#   kql -c 'QUERY'         run one query, print the result as a table, exit
+#   kql -f FILE            the same for a query in a file
+#   kql --tables           list the tables and their row counts
+#   kql --sample           also load the Azure Sentinel sample tables as Sample_<Table>
+#   kql --data DIR         load this dataset instead (repeatable)
+#
+# Datasets: $KQL_DATA (colon-separated), else the lab's /srv/kql/lab, else the built-in
+# demo dataset. At the prompt, save a result with `.save ~/result.csv`.
+set -euo pipefail
+LOKQL=/opt/cloudtrain/kql/lokql/lokql
+LAB=/srv/kql/lab DEMO=/opt/cloudtrain/kql/datasets/demo SAMPLE=/opt/cloudtrain/kql/datasets/sentinel-sample
+datasets=() sample=0 mode=interactive query="" file=""
+while (($#)); do
+  case $1 in
+    --data) datasets+=("$2"); shift ;;
+    --sample) sample=1 ;;
+    --tables) mode=tables ;;
+    -c) mode=query; query=$2; shift ;;
+    -f) mode=file; file=$2; shift ;;
+    -h|--help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "kql: unknown argument $1 (kql --help)" >&2; exit 2 ;;
+  esac
+  shift
+done
+if ((${#datasets[@]} == 0)); then
+  if [[ -n ${KQL_DATA:-} ]]; then IFS=: read -ra datasets <<<"$KQL_DATA"
+  elif [[ -f $LAB/schema.json ]]; then datasets=("$LAB")
+  else datasets=("$DEMO")
+  fi
+fi
+((sample)) && all=("${datasets[@]}" "$SAMPLE") || all=("${datasets[@]}")
+case $mode in
+  interactive)
+    tmp=$(mktemp -d "${TMPDIR:-/tmp}/kql.XXXXXX"); trap 'rm -rf "$tmp"' EXIT
+    { for d in "${datasets[@]}"; do kql-load "$d"; done
+      if ((sample)); then kql-load "$SAMPLE" --prefix Sample_; fi
+      printf '.set table.maxrows 50\n\n'
+    } >"$tmp/load.lokql"
+    echo "Loading ${all[*]} ..."
+    "$LOKQL" explore --quiet -f "$tmp/load.lokql" ;;
+  tables)
+    python3 -c 'import json, sys
+for d in sys.argv[1:]:
+    for n, t in json.load(open(d + "/schema.json"))["tables"].items():
+        print(f"{n:24} {t.get(\"rows\", \"?\"):>8} rows   {d}")' "${all[@]}" ;;
+  query|file)
+    args=()
+    for d in "${datasets[@]}"; do args+=(--data "$d"); done
+    if ((sample)); then args+=(--sample); fi
+    if [[ $mode == query ]]; then exec ct-kql query --format table "${args[@]}" "$query"; fi
+    exec ct-kql query --format table "${args[@]}" -f "$file" ;;
+esac
