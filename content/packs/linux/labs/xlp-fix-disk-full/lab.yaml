@@ -1,0 +1,143 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xlp-fix-disk-full
+  title: Restore writes on a full filesystem
+  domain: linux
+  frameworks: [linuxplus:troubleshooting]
+  difficulty: medium
+  estimatedMinutes: 5
+  tags: [exam, disk, df, du, troubleshooting]
+  version: 1
+spec:
+  description: |
+    **Host:** `tr-lp-01` (`ssh tr-lp-01`, then `sudo -i`)
+
+    The gate-controller log writer `tr-logwriter.service` has stopped writing: its
+    log directory **`{{mnt}}`** is a separate filesystem and it is full. Free enough space
+    there so the service writes again and at least **100 MiB** stay available. The
+    **`audit/`** directory in that filesystem holds compliance records: do not delete or
+    change anything in it. Leave the service running.
+  objectives:
+    - Find what fills a filesystem with df and du
+    - Free space safely without touching protected data
+  params:
+    mnt:
+      type: choice
+      values: [/var/log/tr-gate, /var/log/tr-fares]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-lp-01
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["512Mi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-lp-01
+      timeoutSec: 180
+      run: |
+        set -eu
+        [ "$(readlink -f /dev/disk/by-id/virtio-ct-data1)" = /dev/vdc ]
+        V=/var/lib/cloudtrain; install -d -m 0700 $V
+        systemctl stop tr-logwriter.service 2>/dev/null || true
+        umount {{mnt}} 2>/dev/null || true
+        sed -i '\#/var/log/tr-#d' /etc/fstab
+        wipefs -a /dev/vdc >/dev/null
+        mkfs.ext4 -q -m 0 -L tr-logs /dev/vdc
+        mkdir -p {{mnt}}
+        echo "LABEL=tr-logs {{mnt}} ext4 defaults,nofail 0 2" >> /etc/fstab
+        systemctl daemon-reload; mount {{mnt}}
+        mkdir -p {{mnt}}/audit {{mnt}}/archive {{mnt}}/spool
+        for i in 1 2 3 4; do head -c 28M /dev/urandom > {{mnt}}/audit/records-$i.dat; done
+        for i in 1 2 3 4 5 6 7 8; do head -c 20M /dev/urandom > {{mnt}}/archive/gate-2026-0$i.log; done
+        for i in 1 2 3 4 5 6; do head -c 3M /dev/urandom > {{mnt}}/spool/render-$i.tmp; done
+        (cd {{mnt}}/audit && sha256sum *) > $V/audit.sha
+        echo "{{mnt}}" > $V/logmnt
+        # the writer
+        printf '#!/bin/sh\nwhile :; do date +%%s >> {{mnt}}/gate.log 2>/dev/null; sleep 1; done\n' > /usr/local/bin/tr-logwriter
+        chmod 0755 /usr/local/bin/tr-logwriter
+        printf '[Unit]\nDescription=Tallowmere gate log writer\n[Service]\nExecStart=/usr/local/bin/tr-logwriter\nRestart=always\n[Install]\nWantedBy=multi-user.target\n' > /etc/systemd/system/tr-logwriter.service
+        systemctl daemon-reload; systemctl enable tr-logwriter.service >/dev/null 2>&1
+        # fill the rest with the current log
+        dd if=/dev/zero bs=1M >> {{mnt}}/gate.log 2>/dev/null || true
+        sync
+        systemctl start tr-logwriter.service
+        [ "$(df -B1M --output=avail {{mnt}} | tail -1 | tr -d ' ')" -lt 5 ]
+  checks:
+    - id: headroom
+      description: At least 100 MiB are free on the filesystem
+      type: shell
+      on: tr-lp-01
+      skills: [linux.storage.space-analysis]
+      weight: 2
+      command: |
+        m=$(cat /var/lib/cloudtrain/logmnt)
+        a=$(df -B1M --output=avail $m | tail -1 | tr -d ' ')
+        [ "${a:-0}" -ge 100 ] && echo ok || echo "avail=$a"
+      expect: {match: exact, value: ok}
+    - id: writing
+      description: The log writer is running and writing again
+      type: shell
+      on: tr-lp-01
+      skills: [linux.storage.space-analysis]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        m=$(cat /var/lib/cloudtrain/logmnt)
+        [ "$(systemctl is-active tr-logwriter.service)" = active ] || { echo inactive; exit 0; }
+        a=$(stat -c %s $m/gate.log 2>/dev/null || echo 0); sleep 4; b=$(stat -c %s $m/gate.log 2>/dev/null || echo 0)
+        [ "$b" -gt "$a" ] && echo writing || echo stalled
+      expect: {match: exact, value: writing}
+    - id: protected
+      description: The audit records are unchanged
+      type: shell
+      on: tr-lp-01
+      skills: [linux.storage.space-analysis]
+      weight: 2
+      command: |
+        m=$(cat /var/lib/cloudtrain/logmnt)
+        cd $m/audit 2>/dev/null && sha256sum -c --quiet /var/lib/cloudtrain/audit.sha >/dev/null 2>&1 && [ "$(ls | wc -l)" = 4 ] && echo intact || echo damaged
+      expect: {match: exact, value: intact}
+  misconceptions:
+    - id: deletes-audit
+      description: Removes the audit records to get space.
+      feedback: "audit/ is protected compliance data. Look at du -sh per directory: the archive and the oversized current log hold far more."
+      expectFail: [protected]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        run: sudo rm -f {{mnt}}/audit/*
+    - id: too-little
+      description: Deletes a couple of temporary files that free only a few MiB.
+      feedback: "6 MiB of spool files are not enough headroom. Check where the space really is with du -sh {{mnt}}/*."
+      expectFail: [headroom]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        run: sudo rm -f {{mnt}}/spool/render-1.tmp {{mnt}}/spool/render-2.tmp
+  solution:
+    explanation: df shows the filesystem at 100 percent; du -sh on its top level shows the oversized current log and eight archived logs. Truncating the current log (the service keeps its file handle) and/or removing archives frees the space without touching audit/.
+    steps:
+      - on: tr-lp-01
+        as: learner
+        run: |
+          set -e
+          df -h {{mnt}}
+          sudo du -sh {{mnt}}/* | sort -h
+          sudo truncate -s 0 {{mnt}}/gate.log
+          sudo rm -f {{mnt}}/archive/gate-2026-0[1-4].log
+          df -h {{mnt}}
+    alternatives:
+      - id: archive-only
+        description: Leave the current log alone and remove the archived logs and spool files.
+        steps:
+          - on: tr-lp-01
+            as: learner
+            run: |
+              set -e
+              sudo rm -f {{mnt}}/archive/*.log {{mnt}}/spool/*.tmp

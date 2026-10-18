@@ -1,0 +1,145 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xlp-fix-oom-service
+  title: Stop a service from being OOM-killed
+  domain: linux
+  frameworks: [linuxplus:troubleshooting]
+  difficulty: hard
+  estimatedMinutes: 8
+  tags: [exam, memory, oom, cgroups, systemd, troubleshooting]
+  version: 1
+spec:
+  description: |
+    **Host:** `tr-lp-01` (`ssh tr-lp-01`, then `sudo -i`)
+
+    The fare cache `tr-fare-cache.service` keeps dying and restarting. Find out why and
+    change the **limit or the configuration** so that the service stays up. It is
+    configured through `/etc/tr/fare-cache.env` (`CACHE_MB` is the size of the cache it
+    loads) and the cache must still hold **at least 48 MB** to be useful. Do not remove
+    the memory limit altogether: set a sensible one (the host has 1.5 GiB in total).
+  objectives:
+    - Recognise a cgroup out-of-memory kill in the journal
+    - Fix the limit or the workload and keep the service stable
+  params:
+    want:
+      type: choice
+      values: ["88", "96", "104"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-lp-01
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536}
+        access: [ssh, console]
+  setup:
+    - on: tr-lp-01
+      timeoutSec: 90
+      run: |
+        set -eu
+        install -d -m 0755 /etc/tr
+        printf 'CACHE_MB={{want}}\n' > /etc/tr/fare-cache.env
+        cat > /usr/local/bin/tr-fare-cache <<'EOPY'
+        #!/usr/bin/python3
+        import os, time
+        n = int(os.environ.get("CACHE_MB", "16")) << 20
+        buf = bytearray(n)
+        for i in range(0, n, 4096):
+            buf[i] = 1
+        print("fare cache loaded %d MB" % (n >> 20), flush=True)
+        while True:
+            time.sleep(5)
+        EOPY
+        chmod 0755 /usr/local/bin/tr-fare-cache
+        systemctl disable --now tr-fare-cache.service >/dev/null 2>&1 || true
+        rm -rf /etc/systemd/system/tr-fare-cache.service.d
+        printf '[Unit]\nDescription=Tallowmere fare cache\n[Service]\nEnvironmentFile=/etc/tr/fare-cache.env\nExecStart=/usr/local/bin/tr-fare-cache\nMemoryMax=64M\nMemorySwapMax=0\nRestart=always\nRestartSec=2\n[Install]\nWantedBy=multi-user.target\n' > /etc/systemd/system/tr-fare-cache.service
+        systemctl daemon-reload
+        systemctl enable --now tr-fare-cache.service >/dev/null 2>&1 || true
+        sleep 6
+        [ "$(systemctl show -P NRestarts tr-fare-cache.service)" -ge 1 ]
+  checks:
+    - id: stable
+      description: The service is active and no longer restarting
+      type: shell
+      on: tr-lp-01
+      skills: [linux.performance.memory]
+      weight: 3
+      timeoutSec: 40
+      command: |
+        a=$(systemctl show -P NRestarts tr-fare-cache.service); sleep 9; b=$(systemctl show -P NRestarts tr-fare-cache.service)
+        [ "$(systemctl is-active tr-fare-cache.service)" = active ] && [ "$a" = "$b" ] && echo stable || echo "restarts=$a/$b"
+      expect: {match: exact, value: stable}
+    - id: cache-size
+      description: The running service holds at least 48 MB of cache
+      type: shell
+      on: tr-lp-01
+      skills: [linux.performance.memory]
+      weight: 2
+      command: |
+        p=$(systemctl show -P MainPID tr-fare-cache.service)
+        r=$([ "${p:-0}" != 0 ] && awk '/^VmRSS/ {print $2}' /proc/$p/status)
+        [ "${r:-0}" -ge 49152 ] && echo ok || echo "rss_kb=${r:-0}"
+      expect: {match: exact, value: ok}
+    - id: limit
+      description: A finite memory limit is still in place
+      type: shell
+      on: tr-lp-01
+      skills: [linux.performance.memory]
+      weight: 1.5
+      command: |
+        m=$(systemctl show -P MemoryMax tr-fare-cache.service)
+        case "$m" in ''|*[!0-9]*) echo "limit=$m";; *) [ "$m" -le 419430400 ] && echo finite || echo "limit=$m";; esac
+      expect: {match: exact, value: finite}
+  misconceptions:
+    - id: limit-removed
+      description: Removes the memory limit entirely.
+      feedback: "MemoryMax=infinity stops the kills but also removes the protection for the other services. Raise the limit to a value that fits the cache."
+      expectFail: [limit]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        run: |
+          sudo mkdir -p /etc/systemd/system/tr-fare-cache.service.d
+          printf '[Service]\nMemoryMax=infinity\n' | sudo tee /etc/systemd/system/tr-fare-cache.service.d/nolimit.conf >/dev/null
+          sudo systemctl daemon-reload
+          sudo systemctl restart tr-fare-cache.service
+          sleep 3
+    - id: cache-shrunk
+      description: Shrinks the cache far below what the service needs.
+      feedback: "The service stays up, but with a tiny cache it is useless: the task says it must hold at least 48 MB."
+      expectFail: [cache-size]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        run: |
+          sudo sed -i 's/^CACHE_MB=.*/CACHE_MB=8/' /etc/tr/fare-cache.env
+          sudo systemctl restart tr-fare-cache.service
+          sleep 3
+  solution:
+    explanation: "journalctl -u tr-fare-cache shows 'Failed with result oom-kill': the unit's MemoryMax=64M is smaller than the {{want}} MB cache plus the interpreter. Raise the limit in a drop-in (or reduce CACHE_MB to a value that fits and is still at least 48), reload and restart."
+    steps:
+      - on: tr-lp-01
+        as: learner
+        run: |
+          set -e
+          journalctl -u tr-fare-cache --no-pager | tail -5
+          sudo mkdir -p /etc/systemd/system/tr-fare-cache.service.d
+          printf '[Service]\nMemoryMax=256M\n' | sudo tee /etc/systemd/system/tr-fare-cache.service.d/limit.conf >/dev/null
+          sudo systemctl daemon-reload
+          sudo systemctl restart tr-fare-cache.service
+    alternatives:
+      - id: smaller-cache
+        description: Keep the limit and shrink the cache to a size that fits and still satisfies the minimum.
+        steps:
+          - on: tr-lp-01
+            as: learner
+            run: |
+              set -e
+              sudo sed -i 's/^CACHE_MB=.*/CACHE_MB=48/' /etc/tr/fare-cache.env
+              sudo systemctl restart tr-fare-cache.service

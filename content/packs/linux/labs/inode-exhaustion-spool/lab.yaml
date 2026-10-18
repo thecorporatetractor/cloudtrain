@@ -1,0 +1,209 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: inode-exhaustion-spool
+  title: Recover a filesystem that is out of inodes
+  domain: linux
+  frameworks: [linuxplus:troubleshooting, lfcs:essential-commands]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [inodes, df, tmpfiles, troubleshooting]
+  version: 1
+spec:
+  description: |
+    The ticket spool **`/var/spool/tr-tickets`** on **`tr-tkt-01`** (`ssh tr-tkt-01`; you
+    have `sudo`) is a small filesystem of its own. The booking service now fails with
+    **"No space left on device"**, yet `df -h` shows the spool nearly empty.
+
+    1. Find out why and find the directory that holds the huge number of tiny files.
+    2. Clean that directory. The **`queue/`** directory holds tickets that are still waiting
+       to be printed and must not be touched.
+    3. Add a **tmpfiles.d** rule in `/etc/tmpfiles.d/` so that files in that directory
+       older than **{{age}}** are removed automatically in future.
+  objectives:
+    - Recognise inode exhaustion with df -i
+    - Locate and remove a directory full of tiny files
+    - Keep it small with a systemd-tmpfiles age rule
+  params:
+    junk:
+      type: choice
+      values: [renders, thumbs, previews]
+    age:
+      type: choice
+      values: [1d, 12h, 2d]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-tkt-01
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["512Mi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-tkt-01
+      timeoutSec: 180
+      run: |
+        set -eu
+        [ "$(readlink -f /dev/disk/by-id/virtio-ct-data1)" = /dev/vdc ]
+        V=/var/lib/cloudtrain; install -d -m 0700 $V
+        umount /var/spool/tr-tickets 2>/dev/null || true
+        sed -i '\#/var/spool/tr-tickets#d' /etc/fstab
+        rm -f /etc/tmpfiles.d/tr-*.conf
+        wipefs -a /dev/vdc >/dev/null
+        # very few inodes: a few thousand tiny files exhaust them long before the blocks
+        mkfs.ext4 -q -N 4096 -L tr-spool /dev/vdc
+        mkdir -p /var/spool/tr-tickets
+        echo "LABEL=tr-spool /var/spool/tr-tickets ext4 defaults,nofail 0 2" >> /etc/fstab
+        systemctl daemon-reload; mount /var/spool/tr-tickets
+        mkdir -p /var/spool/tr-tickets/queue /var/spool/tr-tickets/{{junk}}
+        for i in $(seq 1 60); do echo "ticket $i waiting" > /var/spool/tr-tickets/queue/ticket-$i.json; done
+        (cd /var/spool/tr-tickets/queue && sha256sum * | sort -k2) > $V/queue.sha
+        python3 - <<'EOS'
+        import os
+        d = "/var/spool/tr-tickets/{{junk}}"
+        i = 0
+        while True:
+            try:
+                with open("%s/r%06d.tmp" % (d, i), "w") as f:
+                    f.write("x")
+            except OSError:
+                break
+            i += 1
+        EOS
+        sync
+        [ "$(df --output=ipcent /var/spool/tr-tickets | tail -1 | tr -dc 0-9)" -ge 99 ]
+  checks:
+    - id: inodes-free
+      description: The spool has plenty of free inodes again
+      type: shell
+      on: tr-tkt-01
+      skills: [linux.storage.space-analysis]
+      weight: 2
+      command: |
+        p=$(df --output=ipcent /var/spool/tr-tickets | tail -1 | tr -dc 0-9)
+        [ "$p" -le 50 ] && echo ok || echo "inodes_used=$p"
+      expect: {match: exact, value: ok}
+    - id: can-create
+      description: New files can be created in the spool
+      type: shell
+      on: tr-tkt-01
+      skills: [linux.storage.space-analysis]
+      weight: 1
+      command: |
+        touch /var/spool/tr-tickets/queue/.probe 2>/dev/null && rm -f /var/spool/tr-tickets/queue/.probe && echo ok || echo failed
+      expect: {match: exact, value: ok}
+    - id: queue-intact
+      description: The queued tickets are untouched
+      type: shell
+      on: tr-tkt-01
+      skills: [linux.storage.space-analysis]
+      weight: 2
+      command: |
+        cd /var/spool/tr-tickets/queue 2>/dev/null && [ "$( (sha256sum * | sort -k2) 2>/dev/null)" = "$(cat /var/lib/cloudtrain/queue.sha)" ] && echo intact || echo damaged
+      expect: {match: exact, value: intact}
+    - id: tmpfiles-rule
+      description: A tmpfiles.d rule removes files in {{junk}}/ older than {{age}}
+      type: shell
+      on: tr-tkt-01
+      skills: [linux.storage.space-analysis]
+      weight: 3
+      command: |
+        python3 - <<'EOS'
+        import fnmatch, glob, re
+        unit = {"us": 1e-6, "ms": 1e-3, "s": 1, "sec": 1, "second": 1, "seconds": 1, "m": 60, "min": 60, "minute": 60, "minutes": 60,
+                "h": 3600, "hr": 3600, "hour": 3600, "hours": 3600, "d": 86400, "day": 86400, "days": 86400, "w": 604800, "week": 604800, "weeks": 604800}
+        def secs(a):
+            if a in ("", "-", "0"):
+                return None
+            parts = re.findall(r"(\d+)([a-z]*)", a)
+            if not parts or "".join(n + u for n, u in parts) != a:
+                return None
+            return sum(int(n) * unit.get(u or "s", 0) for n, u in parts)
+        want = secs("{{age}}")
+        target = "/var/spool/tr-tickets/{{junk}}"
+        res = "missing"
+        for f in sorted(glob.glob("/etc/tmpfiles.d/*.conf")):
+            for line in open(f):
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                w = line.split(None, 6)
+                if len(w) < 2 or w[0].rstrip("!+-=~") not in ("d", "D", "e", "q", "Q"):
+                    continue
+                path = w[1].rstrip("/")
+                if not (path == target or fnmatch.fnmatch(target + "/x", path) or path == target + "/*"):
+                    continue
+                age = w[5] if len(w) > 5 else "-"
+                a = secs(age)
+                if a is None:
+                    res = "no-age"
+                elif a == want:
+                    res = "ok"
+                    break
+                else:
+                    res = "wrong-age"
+            if res == "ok":
+                break
+        print(res)
+        EOS
+      expect: {match: exact, value: ok}
+  hints:
+    - title: Blocks are not the only limit
+      command: df -h /var/spool/tr-tickets; df -i /var/spool/tr-tickets
+      body: "Every file needs an inode, and this filesystem was made with only a few thousand. df -i shows IUse% at 100 while df -h shows almost nothing used."
+      cost: 0
+    - title: Count files per directory
+      command: sudo find /var/spool/tr-tickets -xdev -type f | cut -d/ -f1-5 | sort | uniq -c | sort -rn
+      body: "One directory has thousands of files and the others have a few dozen. rm with a glob may hit the argument limit on a big directory: find ... -delete does not."
+      cost: 1
+    - title: tmpfiles.d syntax
+      command: man tmpfiles.d
+      body: "A line is: Type Path Mode User Group Age Argument. Type e (adjust and clean an existing directory) or d (create and clean) with an Age such as 1d makes systemd-tmpfiles-clean.timer remove older files."
+      cost: 2
+  misconceptions:
+    - id: cleans-the-queue
+      description: Empties queue/ because it is the visible directory with the most recent files.
+      feedback: "queue/ only holds 60 tickets that still need printing. Count files per directory first: the thousands are elsewhere."
+      expectFail: [inodes-free, queue-intact]
+      mutation:
+        on: tr-tkt-01
+        as: learner
+        run: |
+          sudo rm -f /var/spool/tr-tickets/queue/*
+          echo 'e /var/spool/tr-tickets/{{junk}} 0755 root root {{age}}' | sudo tee /etc/tmpfiles.d/tr-tickets.conf >/dev/null
+    - id: rule-without-age
+      description: Cleans the directory and writes a tmpfiles.d line without an age.
+      feedback: "Without the Age field systemd-tmpfiles never removes old files; it only creates the directory. Put the age ({{age}}) in the sixth field."
+      expectFail: [tmpfiles-rule]
+      mutation:
+        on: tr-tkt-01
+        as: learner
+        run: |
+          sudo find /var/spool/tr-tickets/{{junk}} -type f -delete
+          echo 'd /var/spool/tr-tickets/{{junk}} 0755 root root -' | sudo tee /etc/tmpfiles.d/tr-tickets.conf >/dev/null
+  solution:
+    explanation: df -i shows 100 percent of the inodes used while the blocks are nearly free. The directory with thousands of files is cleaned with find -delete (the queue stays), and an e or d line with the age in the sixth field makes systemd-tmpfiles-clean remove old files in future.
+    steps:
+      - on: tr-tkt-01
+        as: learner
+        run: |
+          set -e
+          df -i /var/spool/tr-tickets
+          sudo find /var/spool/tr-tickets -xdev -type f | cut -d/ -f1-5 | sort | uniq -c | sort -rn | head -3
+          sudo find /var/spool/tr-tickets/{{junk}} -type f -delete
+          echo 'e /var/spool/tr-tickets/{{junk}} 0755 root root {{age}}' | sudo tee /etc/tmpfiles.d/tr-tickets.conf >/dev/null
+          df -i /var/spool/tr-tickets
+    alternatives:
+      - id: d-rule-and-rm
+        description: Remove the directory contents with rm and use a d line with the age.
+        steps:
+          - on: tr-tkt-01
+            as: learner
+            run: |
+              set -e
+              sudo sh -c 'rm -f /var/spool/tr-tickets/{{junk}}/*'
+              echo 'd /var/spool/tr-tickets/{{junk}} 0755 root root {{age}} -' | sudo tee /etc/tmpfiles.d/tr-spool.conf >/dev/null

@@ -1,0 +1,137 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xlp-checksum-verify
+  title: Identify the tampered download
+  domain: linux
+  frameworks: [linuxplus:security]
+  difficulty: easy
+  estimatedMinutes: 4
+  tags: [exam, checksum, gpg, signature, integrity]
+  version: 1
+spec:
+  description: |
+    **Host:** `tr-lp-01` (a shell is open on it; the downloads are in `~/downloads`)
+
+    The timetable office published four files in **`~/downloads`**, together with a
+    signed checksum list (`SHA256SUMS`, detached signature `SHA256SUMS.asc`) and the
+    office's public key (`release-key.asc`).
+
+    First make sure the checksum list itself is genuine (its signature must verify
+    against the published key), then check the downloads against it. Write the **file
+    name** of the one download that fails the check to **`~/answer.txt`**. Do not change
+    any of the downloads or the checksum list.
+  objectives:
+    - Verify a detached GPG signature with an imported public key
+    - Check files against a SHA-256 list
+  params:
+    bad:
+      type: choice
+      values: [tt-timetable.csv, tt-fares.csv, tt-stations.json]
+  topology:
+    entry: tr-lp-01
+    nodes:
+      - name: tr-lp-01
+        driver: container
+        image: deb-lab:24.04
+        access: [shell]
+  setup:
+    - on: tr-lp-01
+      timeoutSec: 240
+      run: |
+        set -eu
+        command -v gpg >/dev/null 2>&1 || { apt-get update -q >/dev/null; DEBIAN_FRONTEND=noninteractive apt-get install -y -q gnupg >/dev/null; }
+        V=/var/lib/cloudtrain; install -d -m 0700 $V
+        L=/home/learner; D=$L/downloads
+        rm -rf $D $L/.gnupg $L/answer.txt
+        install -d -o learner -g learner $D
+        printf 'TR101,06:10\nTR102,06:40\nTR103,07:20\n' > $D/tt-timetable.csv
+        printf 'zone1,2.40\nzone2,3.80\nzone3,5.10\n' > $D/tt-fares.csv
+        printf '{"stations":["Tallowmere Central","Brimley","Ostwick"]}\n' > $D/tt-stations.json
+        printf 'depot-north,12\ndepot-south,9\n' > $D/tt-depots.csv
+        G=$(mktemp -d); chmod 0700 $G
+        gpg --batch --homedir $G --pinentry-mode loopback --passphrase '' --quick-gen-key 'Tallowmere Timetable Office <timetable@tallowmere.example>' ed25519 sign never >/dev/null 2>&1
+        gpg --batch --homedir $G --armor --export > $D/release-key.asc
+        (cd $D && sha256sum tt-*.csv tt-*.json > SHA256SUMS)
+        gpg --batch --homedir $G --pinentry-mode loopback --passphrase '' --detach-sign --armor -o $D/SHA256SUMS.asc $D/SHA256SUMS >/dev/null 2>&1
+        gpgconf --homedir $G --kill all 2>/dev/null || true; rm -rf $G
+        printf 'edited after publication\n' >> $D/{{bad}}
+        chown -R learner:learner $D
+        cp $D/release-key.asc $V/xlp-ck.pub
+        cp $D/SHA256SUMS $V/xlp-ck.sums; cp $D/SHA256SUMS.asc $V/xlp-ck.sig
+        (cd $D && sha256sum tt-*.csv tt-*.json) > $V/xlp-ck.files
+  checks:
+    - id: answer
+      description: ~/answer.txt names the download that fails its checksum
+      type: shell
+      on: tr-lp-01
+      skills: [linux.security.crypto]
+      weight: 2
+      command: tr -d ' \t\r\n' < /home/learner/answer.txt 2>/dev/null || echo none
+      expect: {match: exact, value: "{{bad}}"}
+    - id: list-genuine
+      description: The checksum list is unchanged and its signature still verifies against the published key
+      type: shell
+      on: tr-lp-01
+      skills: [linux.security.crypto]
+      weight: 1.5
+      timeoutSec: 30
+      command: |
+        V=/var/lib/cloudtrain; D=/home/learner/downloads
+        cmp -s $D/SHA256SUMS $V/xlp-ck.sums || { echo list-changed; exit 0; }
+        G=$(mktemp -d); chmod 0700 $G
+        gpg --batch --homedir $G --import $V/xlp-ck.pub >/dev/null 2>&1
+        r=bad; gpg --batch --homedir $G --verify $V/xlp-ck.sig $V/xlp-ck.sums >/dev/null 2>&1 && r=genuine
+        gpgconf --homedir $G --kill all 2>/dev/null || true; rm -rf $G
+        echo $r
+      expect: {match: exact, value: genuine}
+    - id: files-untouched
+      description: The downloads were not modified
+      type: shell
+      on: tr-lp-01
+      skills: [linux.security.crypto]
+      weight: 0.5
+      command: cd /home/learner/downloads 2>/dev/null && sha256sum tt-*.csv tt-*.json 2>/dev/null | cmp -s - /var/lib/cloudtrain/xlp-ck.files && echo untouched || echo modified
+      expect: {match: exact, value: untouched}
+  misconceptions:
+    - id: wrong-file
+      description: Names a file without running the check.
+      feedback: "Run sha256sum -c SHA256SUMS in the download directory; the line that says FAILED names the file."
+      expectFail: [answer]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        run: echo tt-depots.csv > ~/answer.txt
+    - id: regenerated-list
+      description: Rebuilds the checksum list from the files as they are.
+      feedback: "A list rebuilt from the current files always matches them, and it is no longer the signed one. Verify against the published list."
+      expectFail: [answer, list-genuine]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        run: |
+          cd ~/downloads && sha256sum tt-*.csv tt-*.json > SHA256SUMS
+          echo none > ~/answer.txt
+  solution:
+    explanation: Import the office's public key, verify the detached signature on SHA256SUMS, then let sha256sum -c report the file whose hash differs.
+    steps:
+      - on: tr-lp-01
+        as: learner
+        run: |
+          cd ~/downloads
+          gpg --batch --import release-key.asc
+          gpg --verify SHA256SUMS.asc SHA256SUMS
+          sha256sum -c SHA256SUMS 2>&1 | sed -n 's/: FAILED$//p' > ~/answer.txt
+          cat ~/answer.txt
+    alternatives:
+      - id: quiet-check
+        description: Use a temporary keyring and the --quiet flag.
+        steps:
+          - on: tr-lp-01
+            as: learner
+            run: |
+              cd ~/downloads
+              g=$(mktemp -d); chmod 0700 $g
+              gpg --batch --homedir $g --import release-key.asc
+              gpg --batch --homedir $g --verify SHA256SUMS.asc SHA256SUMS
+              sha256sum -c --quiet SHA256SUMS 2>&1 | grep FAILED | cut -d: -f1 | head -1 > ~/answer.txt

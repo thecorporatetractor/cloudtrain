@@ -1,0 +1,147 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xlp-fix-high-load
+  title: Bring load back to normal
+  domain: linux
+  frameworks: [linuxplus:troubleshooting]
+  difficulty: medium
+  estimatedMinutes: 6
+  tags: [exam, performance, load, systemd, troubleshooting]
+  version: 1
+spec:
+  description: |
+    **Host:** `tr-lp-01` (`ssh tr-lp-01`, then `sudo -i`)
+
+    The load average on `tr-lp-01` has been above 2 since the last timetable import and
+    the host feels slow. Find the cause and stop it **for good** (it must not come back
+    by itself or at the next boot). The ledger service **`tr-ledger.service`** is
+    protected: it must keep running, and it must not be restarted or killed.
+  objectives:
+    - Find the busiest processes and the service that owns them
+    - Stop a runaway service permanently without touching the protected one
+  params:
+    unit:
+      type: choice
+      values: [tr-reindex, tr-rebuild, tr-recalc]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-lp-01
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536}
+        access: [ssh, console]
+  setup:
+    - on: tr-lp-01
+      timeoutSec: 90
+      run: |
+        set -eu
+        V=/var/lib/cloudtrain; install -d -m 0700 $V
+        for u in tr-reindex tr-rebuild tr-recalc; do
+          systemctl disable --now $u.service >/dev/null 2>&1 || true
+          systemctl unmask $u.service >/dev/null 2>&1 || true
+          rm -f /etc/systemd/system/$u.service
+        done
+        printf '%s\n' '#!/bin/sh' 'while :; do sleep 5; done' > /usr/local/bin/tr-ledger-run
+        printf '%s\n' '#!/bin/bash' 'while :; do :; done' > /usr/local/bin/tr-batch-worker
+        chmod 0755 /usr/local/bin/tr-ledger-run /usr/local/bin/tr-batch-worker
+        printf '[Unit]\nDescription=Tallowmere ledger service\n[Service]\nExecStart=/usr/local/bin/tr-ledger-run\n[Install]\nWantedBy=multi-user.target\n' > /etc/systemd/system/tr-ledger.service
+        # the runaway: two busy workers under a unit that restarts them
+        printf '[Unit]\nDescription=Tallowmere timetable import job\n[Service]\nExecStart=/bin/sh -c "/usr/local/bin/tr-batch-worker & exec /usr/local/bin/tr-batch-worker"\nRestart=always\nRestartSec=2\n[Install]\nWantedBy=multi-user.target\n' > /etc/systemd/system/{{unit}}.service
+        systemctl daemon-reload
+        systemctl enable --now tr-ledger.service {{unit}}.service >/dev/null 2>&1
+        sleep 1
+        systemctl show -P MainPID tr-ledger.service > $V/ledger.pid
+  checks:
+    - id: calm
+      description: The CPU is mostly idle again
+      type: shell
+      on: tr-lp-01
+      skills: [linux.performance.use-method]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        i=$(vmstat 1 5 | tail -n 3 | awk '{s += $15} END {printf "%d", s / NR}')
+        [ "$i" -ge 70 ] && echo calm || echo "idle=$i"
+      expect: {match: exact, value: calm}
+    - id: culprit-stopped
+      description: The runaway job has no running processes
+      type: shell
+      on: tr-lp-01
+      skills: [linux.performance.use-method]
+      weight: 1.5
+      command: |
+        n=$(pgrep -fc '^/bin/bash /usr/local/bin/tr-batch-worker' || true)
+        [ "${n:-0}" = 0 ] && [ "$(systemctl is-active {{unit}}.service)" != active ] && echo stopped || echo "running=$n"
+      expect: {match: exact, value: stopped}
+    - id: stays-off
+      description: The runaway job is disabled or masked
+      type: shell
+      on: tr-lp-01
+      skills: [linux.performance.use-method]
+      weight: 1
+      command: |
+        case "$(systemctl is-enabled {{unit}}.service 2>/dev/null)" in disabled|masked|masked-runtime|static) echo off;; *) echo on;; esac
+      expect: {match: exact, value: off}
+    - id: ledger-untouched
+      description: tr-ledger.service is still the same running process
+      type: shell
+      on: tr-lp-01
+      skills: [linux.performance.use-method]
+      weight: 2
+      command: |
+        p=$(systemctl show -P MainPID tr-ledger.service)
+        [ "$(systemctl is-active tr-ledger.service)" = active ] && [ "$p" = "$(cat /var/lib/cloudtrain/ledger.pid)" ] && echo untouched || echo "pid=$p"
+      expect: {match: exact, value: untouched}
+  misconceptions:
+    - id: kill-workers
+      description: Kills the busy processes but leaves the unit that respawns them.
+      feedback: "The unit restarts its workers every two seconds. Find the owning unit with systemctl status or ps -o cgroup and stop and disable that."
+      expectFail: [calm, culprit-stopped, stays-off]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        run: |
+          sudo pkill -f '^/bin/bash /usr/local/bin/tr-batch-worker' || true
+          sleep 5
+    - id: stop-only
+      description: Stops the unit but leaves it enabled.
+      feedback: "systemctl stop lasts until the next boot; disable (or mask) the unit so it does not come back."
+      expectFail: [stays-off]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        run: sudo systemctl stop {{unit}}.service
+    - id: stops-ledger-too
+      description: Stops every service that looked busy, including the ledger.
+      feedback: "tr-ledger.service is protected and was almost idle; the CPU was being burned by the import job."
+      expectFail: [ledger-untouched]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        run: sudo systemctl disable --now {{unit}}.service tr-ledger.service
+  solution:
+    explanation: top or ps -eo pid,pcpu,cgroup --sort=-pcpu shows two tr-batch-worker processes at 100 percent, both in the cgroup of the import job unit. The unit has Restart=always, so killing the processes does nothing; stop and disable the unit.
+    steps:
+      - on: tr-lp-01
+        as: learner
+        run: |
+          set -e
+          ps -eo pid,pcpu,cgroup,args --sort=-pcpu | head -5
+          sudo systemctl disable --now {{unit}}.service
+          uptime
+    alternatives:
+      - id: mask
+        description: Mask the unit instead of disabling it.
+        steps:
+          - on: tr-lp-01
+            as: learner
+            run: |
+              set -e
+              sudo systemctl stop {{unit}}.service
+              sudo systemctl mask {{unit}}.service

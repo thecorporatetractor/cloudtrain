@@ -1,0 +1,120 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xlp-fix-permission-denied
+  title: Fix a permission-denied error for an app user
+  domain: linux
+  frameworks: [linuxplus:troubleshooting]
+  difficulty: easy
+  estimatedMinutes: 4
+  tags: [exam, permissions, acl, troubleshooting]
+  version: 1
+spec:
+  description: |
+    **Host:** `tr-lp-01` (a shell is open on it; you have `sudo`)
+
+    The application account **`{{app}}`** fails at start with "Permission denied" when it
+    reads its configuration file **`/etc/tr-{{app}}/app.conf`**.
+
+    Let `{{app}}` read that file again with the **smallest permission change** that does
+    the job: no other user may gain access, the file must not become world-readable, and
+    its content must stay as it is.
+  objectives:
+    - Trace a permission-denied error to the file mode, owner and group
+    - Grant one account read access without opening the file to everyone
+  params:
+    app:
+      type: choice
+      values: [pisfeed, farebot, ttapi]
+    port:
+      type: int
+      min: 8100
+      max: 8199
+  topology:
+    entry: tr-lp-01
+    nodes:
+      - name: tr-lp-01
+        driver: container
+        image: el-lab:10
+        access: [shell]
+        learnerSudo: true
+  setup:
+    - on: tr-lp-01
+      run: |
+        set -eu
+        echo 'learner ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/learner && chmod 0440 /etc/sudoers.d/learner
+        V=/var/lib/cloudtrain; install -d -m 0700 $V
+        for u in pisfeed farebot ttapi visitor; do id $u >/dev/null 2>&1 || useradd -m -s /bin/bash $u; done
+        d=/etc/tr-{{app}}
+        rm -rf /etc/tr-pisfeed /etc/tr-farebot /etc/tr-ttapi
+        mkdir -p $d; chown root:root $d; chmod 0755 $d
+        printf 'endpoint=https://pis.tallowmere.test/{{app}}\nport={{port}}\n' > $d/app.conf
+        chown root:root $d/app.conf; chmod 0600 $d/app.conf
+        sha256sum $d/app.conf | cut -d' ' -f1 > $V/xlp-perm.sha
+  checks:
+    - id: app-reads
+      description: "{{app}} can read /etc/tr-{{app}}/app.conf"
+      type: shell
+      on: tr-lp-01
+      skills: [linux.files.permissions]
+      weight: 2
+      command: su -s /bin/sh {{app}} -c 'head -1 /etc/tr-{{app}}/app.conf' 2>/dev/null || echo denied
+      expect: {match: exact, value: "endpoint=https://pis.tallowmere.test/{{app}}"}
+    - id: others-denied
+      description: Another account (visitor) still cannot read the file
+      type: shell
+      on: tr-lp-01
+      skills: [linux.files.permissions]
+      weight: 2
+      command: su -s /bin/sh visitor -c 'cat /etc/tr-{{app}}/app.conf' >/dev/null 2>&1 && echo readable || echo denied
+      expect: {match: exact, value: denied}
+    - id: not-world
+      description: The file has no permissions for others and the content is unchanged
+      type: shell
+      on: tr-lp-01
+      skills: [linux.files.permissions]
+      weight: 1
+      command: |
+        m=$(stat -c %a /etc/tr-{{app}}/app.conf)
+        [ "${m#${m%?}}" = 0 ] && [ "$(sha256sum /etc/tr-{{app}}/app.conf | cut -d' ' -f1)" = "$(cat /var/lib/cloudtrain/xlp-perm.sha)" ] && echo closed || echo "mode=$m"
+      expect: {match: exact, value: closed}
+  misconceptions:
+    - id: world-readable
+      description: Makes the file readable by everyone.
+      feedback: "chmod 644 opens the file to every account on the host. Grant {{app}} alone: its own group (chgrp + 640), or an ACL entry."
+      expectFail: [others-denied, not-world]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        run: sudo chmod 0644 /etc/tr-{{app}}/app.conf
+    - id: directory-only
+      description: Changes the directory mode, which was never the problem.
+      feedback: "The directory is already traversable; the file itself is mode 600 owned by root. Check ls -l on the file, not only on the directory."
+      expectFail: [app-reads]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        run: sudo chmod 0755 /etc/tr-{{app}}
+  solution:
+    explanation: The file is mode 0600 owned by root, so only root can read it. Giving it to the application's group and mode 0640 lets exactly that account in.
+    steps:
+      - on: tr-lp-01
+        as: learner
+        run: |
+          set -e
+          ls -l /etc/tr-{{app}}/app.conf
+          sudo chgrp {{app}} /etc/tr-{{app}}/app.conf
+          sudo chmod 0640 /etc/tr-{{app}}/app.conf
+    alternatives:
+      - id: acl-entry
+        description: Add a read ACL entry for the account.
+        steps:
+          - on: tr-lp-01
+            as: learner
+            run: sudo setfacl -m u:{{app}}:r /etc/tr-{{app}}/app.conf
+      - id: chown-owner
+        description: Make the application the owner with mode 0600.
+        steps:
+          - on: tr-lp-01
+            as: learner
+            run: sudo chown {{app}}:{{app}} /etc/tr-{{app}}/app.conf

@@ -1,0 +1,155 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xlp-faillock-policy
+  title: Lock accounts after repeated failures
+  domain: linux
+  frameworks: [linuxplus:security]
+  difficulty: medium
+  estimatedMinutes: 6
+  tags: [exam, pam, faillock, authselect, hardening]
+  version: 1
+spec:
+  description: |
+    **Host:** `tr-lp-01` (`ssh tr-lp-01`, then `sudo -i`)
+
+    Tallowmere's security baseline says that an account must be **locked after {{deny}}
+    consecutive failed password attempts**. This Enterprise Linux host does not enforce
+    that yet. Configure the authentication stack with the distribution's own tooling
+    (`authselect`) so that password logins, including `su`, use `pam_faillock` and the
+    threshold is **{{deny}}** failures. Do not lock any account yourself while testing
+    (the test account `tr-probe` is meant for the grader).
+  objectives:
+    - Enable account lockout in the PAM stack through authselect
+    - Set the failure threshold in faillock.conf
+  params:
+    deny:
+      type: choice
+      values: ["4", "5", "6"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-lp-01
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536}
+        access: [ssh, console]
+  setup:
+    - on: tr-lp-01
+      timeoutSec: 120
+      run: |
+        set -eu
+        V=/var/lib/cloudtrain; install -d -m 0700 $V
+        authselect select local --force >/dev/null
+        authselect disable-feature with-faillock >/dev/null 2>&1 || true
+        sed -i -E 's/^[[:space:]]*(deny|unlock_time|fail_interval)[[:space:]]*=.*/# \1 default/' /etc/security/faillock.conf
+        id tr-probe >/dev/null 2>&1 || useradd -m -s /bin/bash tr-probe
+        id tr-caller >/dev/null 2>&1 || useradd -m -s /bin/bash tr-caller
+        [ -f $V/probe.pw ] || head -c 12 /dev/urandom | base64 | tr -d '/+=' > $V/probe.pw
+        echo "tr-probe:$(cat $V/probe.pw)" | chpasswd
+        faillock --user tr-probe --reset
+        cat > $V/tryauth.py <<'EOPY'
+        import os, pty, pwd, select, sys, time
+        user, pw, caller = sys.argv[1:4]
+        pid, fd = pty.fork()
+        if pid == 0:
+            p = pwd.getpwnam(caller)
+            os.setgroups([]); os.setgid(p.pw_gid); os.setuid(p.pw_uid)
+            os.environ["HOME"] = p.pw_dir
+            os.execv("/usr/bin/su", ["su", user, "-c", "true"])
+        buf = b""; sent = False; end = time.time() + 15
+        while time.time() < end:
+            r, _, _ = select.select([fd], [], [], 0.5)
+            if r:
+                try:
+                    d = os.read(fd, 1024)
+                except OSError:
+                    d = b""
+                if d:
+                    buf += d
+                    if not sent and b"assword" in buf:
+                        os.write(fd, (pw + "\n").encode()); sent = True
+            done, st = os.waitpid(pid, os.WNOHANG)
+            if done:
+                sys.exit(0 if os.WIFEXITED(st) and os.WEXITSTATUS(st) == 0 else 1)
+        os.kill(pid, 9); os.waitpid(pid, 0); sys.exit(2)
+        EOPY
+        chmod 0600 $V/tryauth.py
+  checks:
+    - id: feature
+      description: The authselect profile has the faillock feature enabled
+      type: shell
+      on: tr-lp-01
+      skills: [linux.security.auth-hardening]
+      weight: 1.5
+      command: authselect current --raw 2>/dev/null | grep -qw with-faillock && echo enabled || echo disabled
+      expect: {match: exact, value: enabled}
+    - id: deny-value
+      description: faillock.conf sets the threshold to {{deny}}
+      type: shell
+      on: tr-lp-01
+      skills: [linux.security.auth-hardening]
+      weight: 1.5
+      command: |
+        sed 's/#.*//' /etc/security/faillock.conf | awk -F= '$1 ~ /^[ \t]*deny[ \t]*$/ {v=$2; gsub(/[ \t]/, "", v); last=v} END {print (last == "" ? "unset" : last)}'
+      expect: {match: exact, value: "{{deny}}"}
+    - id: lock-behaviour
+      description: An account is locked after exactly {{deny}} failed attempts
+      type: shell
+      on: tr-lp-01
+      skills: [linux.security.auth-hardening]
+      weight: 3
+      timeoutSec: 240
+      command: |
+        H=/var/lib/cloudtrain; pw=$(cat $H/probe.pw)
+        faillock --user tr-probe --reset
+        for i in $(seq $(( {{deny}} - 1 ))); do python3 $H/tryauth.py tr-probe "wrong-$i" tr-caller >/dev/null 2>&1; done
+        python3 $H/tryauth.py tr-probe "$pw" tr-caller >/dev/null 2>&1 && a=ok || a=locked
+        faillock --user tr-probe --reset
+        for i in $(seq {{deny}}); do python3 $H/tryauth.py tr-probe "wrong-$i" tr-caller >/dev/null 2>&1; done
+        python3 $H/tryauth.py tr-probe "$pw" tr-caller >/dev/null 2>&1 && b=accepted || b=locked
+        faillock --user tr-probe --reset
+        echo "$a $b"
+      expect: {match: exact, value: "ok locked"}
+  misconceptions:
+    - id: conf-only
+      description: Sets the threshold in faillock.conf but never enables the feature.
+      feedback: "faillock.conf is only read by pam_faillock, and the PAM stack does not call it until the with-faillock feature is enabled with authselect."
+      expectFail: [feature, lock-behaviour]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        run: echo 'deny = {{deny}}' | sudo tee -a /etc/security/faillock.conf >/dev/null
+    - id: feature-only
+      description: Enables the feature and leaves the default threshold.
+      feedback: "The default threshold is 3 failures. The task asks for {{deny}}: set deny in /etc/security/faillock.conf."
+      expectFail: [deny-value, lock-behaviour]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        run: sudo authselect enable-feature with-faillock
+  solution:
+    explanation: authselect enable-feature with-faillock writes the pam_faillock lines into the system-auth and password-auth stacks; the threshold comes from the deny option in /etc/security/faillock.conf.
+    steps:
+      - on: tr-lp-01
+        as: learner
+        run: |
+          set -e
+          sudo authselect enable-feature with-faillock
+          echo 'deny = {{deny}}' | sudo tee -a /etc/security/faillock.conf >/dev/null
+          authselect current
+    alternatives:
+      - id: select-profile
+        description: Select the profile again with the feature, and edit the existing option line.
+        steps:
+          - on: tr-lp-01
+            as: learner
+            run: |
+              set -e
+              sudo authselect select local with-faillock --force
+              sudo sed -i -E 's/^#? ?deny.*/deny = {{deny}}/' /etc/security/faillock.conf
+              grep -E '^deny' /etc/security/faillock.conf

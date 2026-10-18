@@ -1,0 +1,200 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xpe-incident-disk-pressure
+  title: Clear disk pressure on a build host and prevent recurrence
+  domain: linux
+  frameworks: [ct-platform:incident-response]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [exam, capstone, incident, disk, logrotate, journalctl]
+  version: 1
+spec:
+  description: |
+    **Host:** `qm-build-1` (`ssh qm-build-1` from the workstation; you have `sudo`)
+
+    Incident: `qm-build-1` rejects new CI jobs because the log volume **`/var/log/ci`** (its
+    own filesystem on a data disk) is full. As the on-call engineer:
+
+    1. **Free the space** held by the runaway logs. The directory `/var/log/ci/audit` holds
+       compliance records and must not be touched. Leave the CI services running.
+    2. **Prevent a recurrence**: add a logrotate policy for `/var/log/ci/tracer.log` that
+       rotates **daily**, keeps **{{days}}** rotations and **compresses** them.
+    3. **Record the cause** in `/home/learner/incident/disk.txt`: the name of the file that
+       grew, the systemd unit that writes it and the setting that makes it so verbose.
+  objectives:
+    - Find which file and which unit fill a filesystem
+    - Free space safely, including space held by an open file
+    - Write a logrotate policy and a short incident note
+  params:
+    days:
+      type: choice
+      values: ["7", "10", "14"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: qm-build-1
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["2Gi", "2Gi"]}
+        access: [ssh, console]
+      - name: qm-build-2
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["2Gi", "2Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: qm-build-1
+      timeoutSec: 300
+      run: |
+        set -eu
+        [ "$(readlink -f /dev/disk/by-id/virtio-ct-data1)" = /dev/vdc ]
+        V=/var/lib/cloudtrain; install -d -m 0700 $V
+        systemctl stop qm-tracer.service 2>/dev/null || true
+        umount /var/log/ci 2>/dev/null || true
+        sed -i '\#/var/log/ci#d' /etc/fstab
+        rm -f /etc/logrotate.d/qm-* /etc/logrotate.d/ci-*
+        wipefs -a /dev/vdc >/dev/null
+        mkfs.ext4 -q -m 0 -L qm-ci-logs /dev/vdc
+        mkdir -p /var/log/ci
+        echo 'LABEL=qm-ci-logs /var/log/ci ext4 defaults,nofail 0 2' >> /etc/fstab
+        systemctl daemon-reload; mount /var/log/ci
+        mkdir -p /var/log/ci/audit
+        for i in 1 2 3; do head -c 8M /dev/urandom > /var/log/ci/audit/records-$i.dat; done
+        (cd /var/log/ci/audit && sha256sum *) > $V/ci-audit.sha
+        for i in 1 2 3; do fallocate -l 200M /var/log/ci/tracer.log.$i; done
+        a=$(df -B1 --output=avail /var/log/ci | tail -1 | tr -d ' ')
+        fallocate -l $(( a - 4194304 )) /var/log/ci/tracer.log
+        dd if=/dev/zero bs=64K >> /var/log/ci/tracer.log 2>/dev/null || true
+        # the writer: debug tracing is switched on in the unit
+        printf '%s\n' '#!/bin/sh' 'echo "qm-tracer: debug tracing enabled (QM_TRACE=${QM_TRACE}), writing /var/log/ci/tracer.log"' 'while :; do head -c 16384 /dev/zero | tr "\000" "x" >> /var/log/ci/tracer.log 2>/dev/null; echo >> /var/log/ci/tracer.log 2>/dev/null; sleep 1; done' > /usr/local/bin/qm-tracer
+        chmod 0755 /usr/local/bin/qm-tracer
+        printf '[Unit]\nDescription=Quillmoor build tracer\n[Service]\nEnvironment=QM_TRACE=1\nExecStart=/usr/local/bin/qm-tracer\nRestart=always\n[Install]\nWantedBy=multi-user.target\n' > /etc/systemd/system/qm-tracer.service
+        systemctl daemon-reload; systemctl enable --now qm-tracer.service >/dev/null 2>&1
+        install -d -m 0755 -o learner -g learner /home/learner/incident
+        rm -f /home/learner/incident/disk.txt
+        sync
+        [ "$(df --output=pcent /var/log/ci | tail -1 | tr -dc 0-9)" -ge 99 ]
+  checks:
+    - id: space
+      description: The log volume is below 50 percent used
+      type: shell
+      on: qm-build-1
+      skills: [linux.shell.text-processing]
+      weight: 3
+      command: |
+        p=$(df --output=pcent /var/log/ci | tail -1 | tr -dc 0-9)
+        [ "$p" -lt 50 ] && echo ok || echo "used=$p"
+      expect: {match: exact, value: ok}
+    - id: audit-intact
+      description: The audit records are untouched
+      type: shell
+      on: qm-build-1
+      skills: [linux.shell.text-processing]
+      weight: 2
+      command: |
+        cd /var/log/ci/audit 2>/dev/null && sha256sum -c --quiet /var/lib/cloudtrain/ci-audit.sha >/dev/null 2>&1 && [ "$(ls | wc -l)" = 3 ] && echo intact || echo damaged
+      expect: {match: exact, value: intact}
+    - id: logrotate
+      description: A valid logrotate policy rotates tracer.log daily, keeping {{days}}, compressed
+      type: shell
+      on: qm-build-1
+      skills: [linux.shell.text-processing]
+      weight: 3
+      command: |
+        python3 - <<'EOS'
+        import fnmatch, glob, re, subprocess
+        target = "/var/log/ci/tracer.log"
+        res = "missing"
+        for f in ["/etc/logrotate.conf"] + sorted(glob.glob("/etc/logrotate.d/*")):
+            try:
+                txt = re.sub(r"#.*", "", open(f).read())
+            except OSError:
+                continue
+            for m in re.finditer(r"([^{}]+)\{([^{}]*)\}", txt):
+                pats = [p.strip('"') for p in m.group(1).split()]
+                if not any(fnmatch.fnmatch(target, p) for p in pats):
+                    continue
+                words = [l.split() for l in m.group(2).splitlines() if l.strip()]
+                have = {w[0]: w[1:] for w in words}
+                ok = "daily" in have and have.get("rotate") == ["{{days}}"] and "compress" in have and "nocompress" not in have
+                if not ok:
+                    res = "wrong-policy"
+                    continue
+                r = subprocess.run(["logrotate", "-d", f], capture_output=True)
+                res = "ok" if r.returncode == 0 else "invalid-config"
+                if res == "ok":
+                    break
+            if res == "ok":
+                break
+        print(res)
+        EOS
+      expect: {match: exact, value: ok}
+    - id: cause
+      description: disk.txt names the file, the unit and the verbose setting
+      type: shell
+      on: qm-build-1
+      skills: [linux.systemd.journal]
+      weight: 2
+      command: |
+        f=/home/learner/incident/disk.txt
+        [ -s $f ] || { echo empty; exit 0; }
+        a=$(grep -ci 'tracer\.log' $f); b=$(grep -ci 'qm-tracer' $f); c=$(grep -ciE 'QM_TRACE|debug' $f)
+        [ "$a" -ge 1 ] && [ "$b" -ge 1 ] && [ "$c" -ge 1 ] && echo ok || echo "file=$a unit=$b setting=$c"
+      expect: {match: exact, value: ok}
+  misconceptions:
+    - id: deleted-open-file
+      description: Removes the log files with rm while the tracer still has the current one open.
+      feedback: "rm unlinks the name but the tracer keeps the file open, so its blocks stay allocated (see df against du, or ls -l /proc/PID/fd). Truncate the file or restart the unit."
+      expectFail: [space]
+      mutation:
+        on: qm-build-1
+        as: learner
+        run: |
+          set -e
+          sudo rm -f /var/log/ci/tracer.log /var/log/ci/tracer.log.1 /var/log/ci/tracer.log.2 /var/log/ci/tracer.log.3
+          printf '/var/log/ci/tracer.log {\n    daily\n    rotate {{days}}\n    compress\n    missingok\n    copytruncate\n}\n' | sudo tee /etc/logrotate.d/qm-tracer >/dev/null
+          printf 'File: tracer.log\nUnit: qm-tracer.service\nCause: debug tracing, QM_TRACE=1 in the unit\n' > /home/learner/incident/disk.txt
+    - id: weekly-uncompressed
+      description: Frees the space but writes a weekly policy without compression.
+      feedback: "The task asks for daily rotation, the stated number of rotations and compression: daily, rotate N and compress in the stanza."
+      expectFail: [logrotate]
+      mutation:
+        on: qm-build-1
+        as: learner
+        run: |
+          set -e
+          sudo truncate -s 0 /var/log/ci/tracer.log
+          sudo rm -f /var/log/ci/tracer.log.1 /var/log/ci/tracer.log.2 /var/log/ci/tracer.log.3
+          printf '/var/log/ci/tracer.log {\n    weekly\n    rotate 4\n    copytruncate\n}\n' | sudo tee /etc/logrotate.d/qm-tracer >/dev/null
+          printf 'File: tracer.log\nUnit: qm-tracer.service\nCause: debug tracing, QM_TRACE=1 in the unit\n' > /home/learner/incident/disk.txt
+  solution:
+    explanation: df shows the volume full and du -sh /var/log/ci/* shows tracer.log and three old copies. journalctl -u qm-tracer shows debug tracing switched on by QM_TRACE=1. Truncate the live log (the unit keeps it open), delete the old copies, write a logrotate stanza with daily, rotate N, compress and copytruncate, and note the cause.
+    steps:
+      - on: qm-build-1
+        as: learner
+        run: |
+          set -e
+          df -h /var/log/ci; sudo du -sh /var/log/ci/* | sort -h
+          journalctl -u qm-tracer --no-pager | head -3
+          sudo truncate -s 0 /var/log/ci/tracer.log
+          sudo rm -f /var/log/ci/tracer.log.1 /var/log/ci/tracer.log.2 /var/log/ci/tracer.log.3
+          printf '/var/log/ci/tracer.log {\n    daily\n    rotate {{days}}\n    compress\n    missingok\n    copytruncate\n}\n' | sudo tee /etc/logrotate.d/qm-tracer >/dev/null
+          sudo logrotate -d /etc/logrotate.d/qm-tracer
+          printf 'File: tracer.log\nUnit: qm-tracer.service\nCause: debug tracing, QM_TRACE=1 in the unit\n' > /home/learner/incident/disk.txt
+    alternatives:
+      - id: restart-after-rm
+        description: Delete the files and restart the unit so it releases the deleted log; logrotate in the main configuration style.
+        steps:
+          - on: qm-build-1
+            as: learner
+            run: |
+              set -e
+              sudo rm -f /var/log/ci/tracer.log /var/log/ci/tracer.log.1 /var/log/ci/tracer.log.2 /var/log/ci/tracer.log.3
+              sudo systemctl restart qm-tracer.service
+              printf '/var/log/ci/*.log {\n    daily\n    rotate {{days}}\n    compress\n    delaycompress\n    missingok\n    notifempty\n    copytruncate\n}\n' | sudo tee /etc/logrotate.d/ci-logs >/dev/null
+              printf 'File: tracer.log, written by qm-tracer.service, verbose because of debug tracing (QM_TRACE=1)\n' > /home/learner/incident/disk.txt

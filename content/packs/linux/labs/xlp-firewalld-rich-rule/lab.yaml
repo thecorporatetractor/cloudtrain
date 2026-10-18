@@ -1,0 +1,176 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xlp-firewalld-rich-rule
+  title: Open a port for one subnet only
+  domain: linux
+  frameworks: [linuxplus:security]
+  difficulty: medium
+  estimatedMinutes: 5
+  tags: [exam, firewall, firewalld, rich-rule]
+  version: 1
+spec:
+  description: |
+    **Host:** `tr-lp-01` (`ssh tr-lp-01`, then `sudo -i`)
+
+    The ticketing reporting service on `tr-lp-01` listens on **TCP {{port}}** and is blocked
+    by the firewall (`firewalld` is running). Allow it **only from the subnet `{{net}}`**
+    with a **rich rule**, and make the rule **permanent**. The port must stay closed for
+    every other source, and SSH must keep working. Two test clients sit on
+    `10.64.13.0/24` and `10.64.14.0/24`.
+  objectives:
+    - Write a firewalld rich rule restricted to a source subnet
+    - Apply it to the running firewall and the permanent configuration
+  params:
+    port:
+      type: choice
+      values: ["8443", "9090", "7443"]
+    net:
+      type: choice
+      values: ["10.64.13.0/24", "10.64.14.0/24"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-lp-01
+        driver: vm
+        image: el-vm:10
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["1Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-lp-01
+      timeoutSec: 180
+      run: |
+        set -eu
+        install -d -m 0700 /var/lib/cloudtrain
+        systemctl enable --now firewalld >/dev/null 2>&1
+        rm -f /etc/firewalld/zones/*.xml
+        firewall-cmd --complete-reload >/dev/null
+        mkdir -p /srv/tr-report; echo "report-{{port}}" > /srv/tr-report/index.html
+        printf '[Unit]\nDescription=Tallowmere reporting service\n[Service]\nExecStart=/usr/bin/python3 -m http.server {{port}} --directory /srv/tr-report\nRestart=always\n[Install]\nWantedBy=multi-user.target\n' > /etc/systemd/system/tr-report.service
+        systemctl daemon-reload; systemctl enable --now tr-report.service >/dev/null 2>&1
+        # two client hosts in network namespaces, each on its own /24 (eth0 is untouched)
+        for ROLE in fwa:10.64.13 fwb:10.64.14; do
+          R=${ROLE%%:*}; NET=${ROLE##*:}
+          ip netns del tr-$R 2>/dev/null || true
+          ip link del v-$R 2>/dev/null || true
+          ip netns add tr-$R
+          ip link add v-$R type veth peer name v-$R-p
+          ip link set v-$R-p netns tr-$R
+          ip addr add $NET.1/24 dev v-$R
+          ip link set v-$R up
+          ip -n tr-$R addr add $NET.2/24 dev v-$R-p
+          ip -n tr-$R link set v-$R-p up
+          ip -n tr-$R link set lo up
+        done
+        # the starting state: port closed for everybody
+        for ROLE in fwa:10.64.13 fwb:10.64.14; do
+          R=${ROLE%%:*}; NET=${ROLE##*:}
+          ip netns exec tr-$R curl -4 -s -m 3 http://$NET.1:{{port}}/ >/dev/null 2>&1 && exit 1
+        done
+        true
+  checks:
+    - id: from-subnet
+      description: A client inside {{net}} reaches port {{port}}
+      type: shell
+      on: tr-lp-01
+      skills: [linux.net.firewalld]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        case "{{net}}" in 10.64.13.0/24) r=fwa; n=10.64.13;; *) r=fwb; n=10.64.14;; esac
+        out=$(ip netns exec tr-$r curl -4 -s -m 5 http://$n.1:{{port}}/)
+        echo "${out:-none}"
+      expect: {match: exact, value: "report-{{port}}"}
+    - id: other-subnet
+      description: A client outside the subnet is still blocked
+      type: shell
+      on: tr-lp-01
+      skills: [linux.net.firewalld]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        case "{{net}}" in 10.64.13.0/24) r=fwb; n=10.64.14;; *) r=fwa; n=10.64.13;; esac
+        out=$(ip netns exec tr-$r curl -4 -s -m 4 http://$n.1:{{port}}/)
+        [ -z "$out" ] && echo blocked || echo "open:$out"
+      expect: {match: exact, value: blocked}
+    - id: permanent
+      description: The permanent configuration allows port {{port}} from {{net}} and nowhere else
+      type: shell
+      on: tr-lp-01
+      skills: [linux.net.firewalld]
+      weight: 2
+      command: |
+        python3 - <<'EOS'
+        import glob, xml.etree.ElementTree as ET
+        net, port = "{{net}}", "{{port}}"
+        rich = False; wide = False
+        for f in glob.glob("/etc/firewalld/zones/*.xml"):
+            z = ET.parse(f).getroot()
+            sources = [s.get("address") for s in z.findall("source")]
+            zports = [(p.get("port"), p.get("protocol")) for p in z.findall("port")]
+            if (port, "tcp") in zports:
+                if sources == [net]:
+                    rich = True
+                else:
+                    wide = True
+            for r in z.findall("rule"):
+                s = r.find("source"); p = r.find("port")
+                if p is not None and p.get("port") == port and p.get("protocol") == "tcp" and r.find("accept") is not None and r.find("reject") is None and r.find("drop") is None:
+                    if s is not None and s.get("address") == net and s.get("invert") != "True":
+                        rich = True
+                    else:
+                        wide = True
+        print("ok" if rich and not wide else ("too-wide" if wide else "missing"))
+        EOS
+      expect: {match: exact, value: ok}
+    - id: ssh-kept
+      description: SSH is still allowed
+      type: shell
+      on: tr-lp-01
+      skills: [linux.net.firewalld]
+      weight: 0.5
+      command: firewall-cmd --permanent --query-service=ssh || true
+      expect: {match: exact, value: "yes"}
+  misconceptions:
+    - id: opens-for-all
+      description: Opens the port in the zone instead of restricting it to the subnet.
+      feedback: "--add-port opens the port for every source. A rich rule with a source address limits it to the subnet."
+      expectFail: [other-subnet, permanent]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        run: |
+          sudo firewall-cmd -q --permanent --add-port={{port}}/tcp
+          sudo firewall-cmd -q --reload
+    - id: runtime-only
+      description: Adds the rich rule without --permanent.
+      feedback: "Without --permanent the rule exists only in the running firewall and is gone after a reload or reboot."
+      expectFail: [permanent]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        run: sudo firewall-cmd -q --add-rich-rule='rule family="ipv4" source address="{{net}}" port port="{{port}}" protocol="tcp" accept'
+  solution:
+    explanation: A rich rule with a source address and a port element, added with --permanent and loaded into the running firewall with --reload.
+    steps:
+      - on: tr-lp-01
+        as: learner
+        run: |
+          set -e
+          sudo firewall-cmd --permanent --add-rich-rule='rule family="ipv4" source address="{{net}}" port port="{{port}}" protocol="tcp" accept'
+          sudo firewall-cmd --reload
+          sudo firewall-cmd --list-rich-rules
+    alternatives:
+      - id: runtime-then-runtime-to-permanent
+        description: Add the rule at runtime first, then save the running configuration.
+        steps:
+          - on: tr-lp-01
+            as: learner
+            run: |
+              set -e
+              sudo firewall-cmd --add-rich-rule='rule family="ipv4" source address="{{net}}" port port="{{port}}" protocol="tcp" accept'
+              sudo firewall-cmd --runtime-to-permanent

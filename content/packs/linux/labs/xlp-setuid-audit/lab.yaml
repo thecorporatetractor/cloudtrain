@@ -1,0 +1,115 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xlp-setuid-audit
+  title: Remove an unexpected setuid bit
+  domain: linux
+  frameworks: [linuxplus:security]
+  difficulty: medium
+  estimatedMinutes: 5
+  tags: [exam, setuid, audit, find, permissions]
+  version: 1
+spec:
+  description: |
+    **Host:** `tr-lp-01` (a shell is open on it; you have `sudo`)
+
+    The security office keeps the list of setuid files this host is allowed to have in
+    **`/etc/tr-audit/approved-suid.txt`**. One setuid file on the host is **not** on that
+    list. Find it and **remove its setuid bit**.
+
+    Leave the file itself in place, and do not touch the setuid bit of any file on the
+    list.
+  objectives:
+    - Enumerate setuid files with find
+    - Compare them with an approved list and clear one bit
+  params:
+    rogue:
+      type: choice
+      values: [/usr/local/bin/tr-fare-sync, /opt/tr-tools/bin/pis-sync, /srv/tr/bin/badge-reset]
+  topology:
+    entry: tr-lp-01
+    nodes:
+      - name: tr-lp-01
+        driver: container
+        image: el-lab:10
+        access: [shell]
+        learnerSudo: true
+  setup:
+    - on: tr-lp-01
+      run: |
+        set -eu
+        echo 'learner ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/learner && chmod 0440 /etc/sudoers.d/learner
+        V=/var/lib/cloudtrain; install -d -m 0700 $V
+        # a legitimate custom setuid helper that is on the approved list
+        mkdir -p /usr/local/sbin /usr/local/bin /opt/tr-tools/bin /srv/tr/bin /etc/tr-audit
+        cp "$(readlink -f /usr/bin/true)" /usr/local/sbin/tr-badge-print
+        chown root:root /usr/local/sbin/tr-badge-print; chmod 4755 /usr/local/sbin/tr-badge-print
+        for r in /usr/local/bin/tr-fare-sync /opt/tr-tools/bin/pis-sync /srv/tr/bin/badge-reset; do rm -f $r; done
+        find / -xdev -type f -perm -4000 2>/dev/null | sort > /etc/tr-audit/approved-suid.txt
+        chmod 0644 /etc/tr-audit/approved-suid.txt
+        cp /etc/tr-audit/approved-suid.txt $V/xlp-suid.approved
+        # the unexpected one, planted after the list was written
+        cp "$(readlink -f /usr/bin/true)" {{rogue}}
+        chown root:root {{rogue}}; chmod 4755 {{rogue}}
+        sha256sum {{rogue}} | cut -d' ' -f1 > $V/xlp-suid.sha
+  checks:
+    - id: rogue-cleared
+      description: The unexpected file is still there but no longer setuid
+      type: shell
+      on: tr-lp-01
+      skills: [linux.security.privilege-audit]
+      weight: 2
+      command: if [ -f {{rogue}} ] && [ ! -u {{rogue}} ]; then echo cleared; elif [ ! -e {{rogue}} ]; then echo deleted; else echo still-setuid; fi
+      expect: {match: exact, value: cleared}
+    - id: file-kept
+      description: The file's content is unchanged and it is still executable
+      type: shell
+      on: tr-lp-01
+      skills: [linux.security.privilege-audit]
+      weight: 0.5
+      command: |
+        [ -x {{rogue}} ] && [ "$(sha256sum {{rogue}} 2>/dev/null | cut -d' ' -f1)" = "$(cat /var/lib/cloudtrain/xlp-suid.sha)" ] && echo kept || echo changed
+      expect: {match: exact, value: kept}
+    - id: approved-intact
+      description: Every file on the approved list is still setuid and no other file is
+      type: shell
+      on: tr-lp-01
+      skills: [linux.security.privilege-audit]
+      weight: 1.5
+      command: |
+        find / -xdev -type f -perm -4000 2>/dev/null | sort | cmp -s - /var/lib/cloudtrain/xlp-suid.approved && echo intact || echo changed
+      expect: {match: exact, value: intact}
+  misconceptions:
+    - id: deletes-file
+      description: Deletes the unexpected file instead of clearing its bit.
+      feedback: "The task asks for the setuid bit to be removed; the file may be needed by a job. chmod u-s FILE does exactly that."
+      expectFail: [rogue-cleared, file-kept]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        run: sudo rm -f {{rogue}}
+    - id: wrong-file
+      description: Clears the bit on an approved file and leaves the unexpected one.
+      feedback: "Compare the find output with the approved list line by line; the badge printer is on the list, the other file is not."
+      expectFail: [rogue-cleared, approved-intact]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        run: sudo chmod u-s /usr/local/sbin/tr-badge-print
+  solution:
+    explanation: find lists every setuid regular file on the root filesystem; comparing that with the approved list leaves one extra path, and chmod u-s clears only its bit.
+    steps:
+      - on: tr-lp-01
+        as: learner
+        run: |
+          set -e
+          sudo find / -xdev -type f -perm -4000 2>/dev/null | sort > /tmp/now.txt
+          comm -13 /etc/tr-audit/approved-suid.txt /tmp/now.txt
+          sudo chmod u-s {{rogue}}
+    alternatives:
+      - id: numeric-mode
+        description: Set the mode numerically.
+        steps:
+          - on: tr-lp-01
+            as: learner
+            run: sudo chmod 0755 {{rogue}}

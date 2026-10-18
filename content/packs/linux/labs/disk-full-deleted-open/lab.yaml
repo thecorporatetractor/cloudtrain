@@ -1,0 +1,175 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: disk-full-deleted-open
+  title: Free space held by a deleted log file
+  domain: linux
+  frameworks: [lfcs:essential-commands, linuxplus:troubleshooting]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [disk-space, lsof, proc, deleted-files, troubleshooting]
+  version: 1
+spec:
+  description: |
+    Every night the signalling log volume **`{{mnt}}`** on **`tr-sig-01`** (`ssh tr-sig-01`;
+    you have `sudo`) fills up. The on-call engineer deleted the big `signal.log` this
+    morning, but `df` still shows the volume nearly full, and `du` cannot find where the
+    space went.
+
+    The signalling logger **`tr-signal-logger.service`** is safety critical and must keep
+    running **without a restart**. Get at least **350 MiB** free on `{{mnt}}` again, and
+    make sure no process still holds a large deleted file there.
+  objectives:
+    - Explain why df and du disagree
+    - Find processes that hold deleted files open under /proc
+    - Release the space without restarting the service
+  params:
+    mnt:
+      type: choice
+      values: [/var/log/tr-signal, /var/log/tr-interlock]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-sig-01
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["512Mi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-sig-01
+      timeoutSec: 180
+      run: |
+        set -eu
+        [ "$(readlink -f /dev/disk/by-id/virtio-ct-data1)" = /dev/vdc ]
+        V=/var/lib/cloudtrain; install -d -m 0700 $V
+        systemctl stop tr-signal-logger.service 2>/dev/null || true
+        umount {{mnt}} 2>/dev/null || true
+        sed -i '\#/var/log/tr-#d' /etc/fstab
+        wipefs -a /dev/vdc >/dev/null
+        mkfs.ext4 -q -m 0 -L tr-sig-logs /dev/vdc
+        mkdir -p {{mnt}}
+        echo "LABEL=tr-sig-logs {{mnt}} ext4 defaults,nofail 0 2" >> /etc/fstab
+        systemctl daemon-reload; mount {{mnt}}
+        mkdir -p {{mnt}}/rotated
+        for i in 1 2 3 4 5; do head -c 4M /dev/urandom > {{mnt}}/rotated/signal.log.$i; done
+        install -d -m 0755 /usr/local/libexec
+        cat > /usr/local/libexec/tr-signal-logger.py <<'EOPY'
+        import os, signal, time
+        path = os.environ["LOGFILE"]
+        reopen = [False]
+        def hup(*a):
+            reopen[0] = True
+        signal.signal(signal.SIGHUP, hup)
+        f = open(path, "a")
+        n = 0
+        while True:
+            if reopen[0]:
+                f.close()
+                f = open(path, "a")
+                reopen[0] = False
+            n += 1
+            f.write("signal heartbeat %d\n" % n)
+            f.flush()
+            time.sleep(1)
+        EOPY
+        printf '[Unit]\nDescription=Tallowmere signalling logger\n[Service]\nEnvironment=LOGFILE={{mnt}}/signal.log\nExecStart=/usr/bin/python3 /usr/local/libexec/tr-signal-logger.py\nRestart=always\n[Install]\nWantedBy=multi-user.target\n' > /etc/systemd/system/tr-signal-logger.service
+        systemctl daemon-reload; systemctl enable --now tr-signal-logger.service >/dev/null 2>&1
+        sleep 2
+        # the nightly growth, then the well-meant delete while the logger still has the file open
+        dd if=/dev/zero bs=1M count=385 >> {{mnt}}/signal.log 2>/dev/null
+        rm -f {{mnt}}/signal.log
+        sync
+        systemctl show -P MainPID tr-signal-logger.service > $V/logger.pid
+        echo "{{mnt}}" > $V/logmnt
+        [ "$(df -B1M --output=avail {{mnt}} | tail -1 | tr -d ' ')" -lt 120 ]
+  checks:
+    - id: space
+      description: At least 350 MiB are free on the log volume
+      type: shell
+      on: tr-sig-01
+      skills: [linux.storage.space-analysis]
+      weight: 2
+      command: |
+        a=$(df -B1M --output=avail $(cat /var/lib/cloudtrain/logmnt) | tail -1 | tr -d ' ')
+        [ "${a:-0}" -ge 350 ] && echo ok || echo "avail=$a"
+      expect: {match: exact, value: ok}
+    - id: same-service
+      description: The logger is the same process as before, still running
+      type: shell
+      on: tr-sig-01
+      skills: [linux.processes.management]
+      weight: 2
+      command: |
+        p=$(systemctl show -P MainPID tr-signal-logger.service)
+        [ "$(systemctl is-active tr-signal-logger.service)" = active ] && [ "$p" = "$(cat /var/lib/cloudtrain/logger.pid)" ] && echo same || echo "pid=$p"
+      expect: {match: exact, value: same}
+    - id: no-deleted-holder
+      description: No process holds a large deleted file on the volume
+      type: shell
+      on: tr-sig-01
+      skills: [linux.storage.space-analysis, linux.processes.management]
+      weight: 1.5
+      command: |
+        m=$(cat /var/lib/cloudtrain/logmnt); held=0
+        for l in /proc/[0-9]*/fd/*; do
+          t=$(readlink "$l" 2>/dev/null) || continue
+          case "$t" in "$m"/*" (deleted)") s=$(stat -L -c %s "$l" 2>/dev/null || echo 0); [ "$s" -gt 10485760 ] && held=$((held + 1));; esac
+        done
+        [ "$held" = 0 ] && echo none || echo "held=$held"
+      expect: {match: exact, value: none}
+  hints:
+    - title: df and du disagree
+      body: "du adds up the files you can see; df counts every allocated block. A file that was deleted while a process still has it open keeps its blocks until the process closes it."
+      cost: 0
+    - title: Find the holder
+      command: sudo ls -l /proc/$(systemctl show -P MainPID tr-signal-logger)/fd
+      body: "Look for a descriptor pointing at a path ending in (deleted). lsof +L1 lists such files too, if it is installed."
+      cost: 1
+    - title: Two ways to let go
+      body: "Truncating the descriptor itself (: | sudo tee /proc/PID/fd/N, or truncate -s 0) empties the file. This logger also reopens its log when it gets SIGHUP: systemctl kill -s HUP tr-signal-logger."
+      cost: 2
+  misconceptions:
+    - id: restarts-logger
+      description: Restarts the logger to release the file.
+      feedback: "A restart does release the space, but this service is safety critical and must not be interrupted. Truncate the deleted file through /proc, or send SIGHUP so it reopens its log."
+      expectFail: [same-service]
+      mutation:
+        on: tr-sig-01
+        as: learner
+        run: sudo systemctl restart tr-signal-logger.service
+    - id: deletes-rotated
+      description: Deletes the rotated logs that are visible.
+      feedback: "The rotated logs hold only a few MiB. The space is held by the deleted signal.log that the logger still has open."
+      expectFail: [space, no-deleted-holder]
+      mutation:
+        on: tr-sig-01
+        as: learner
+        run: sudo rm -f {{mnt}}/rotated/*
+  solution:
+    explanation: The logger still has the deleted signal.log open, so its 385 MiB stay allocated. Truncating it through /proc/PID/fd/N, or signalling the logger to reopen its log, releases them without a restart.
+    steps:
+      - on: tr-sig-01
+        as: learner
+        run: |
+          set -e
+          df -h {{mnt}}
+          P=$(systemctl show -P MainPID tr-signal-logger.service)
+          sudo ls -l /proc/$P/fd | grep deleted
+          F=$(sudo ls -l /proc/$P/fd | awk '/deleted/ {print $9}' | head -1)
+          sudo truncate -s 0 /proc/$P/fd/$F
+          df -h {{mnt}}
+    alternatives:
+      - id: sighup
+        description: Ask the logger to reopen its log; the old file is closed and its space is released.
+        steps:
+          - on: tr-sig-01
+            as: learner
+            run: |
+              set -e
+              sudo systemctl kill -s HUP tr-signal-logger.service
+              sleep 2
+              df -h {{mnt}}

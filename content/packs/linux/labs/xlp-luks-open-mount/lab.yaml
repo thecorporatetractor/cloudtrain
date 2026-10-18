@@ -1,0 +1,141 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xlp-luks-open-mount
+  title: Open and mount an encrypted volume
+  domain: linux
+  frameworks: [linuxplus:security]
+  difficulty: medium
+  estimatedMinutes: 5
+  tags: [exam, luks, cryptsetup, encryption]
+  version: 1
+spec:
+  description: |
+    **Host:** `tr-lp-01` (`ssh tr-lp-01`, then `sudo -i`)
+
+    The disk **`/dev/disk/by-id/virtio-ct-data1`** holds an encrypted LUKS volume with the
+    fare-audit exports. Its key file is **`/root/keys/{{keyfile}}`**. Unlock the volume
+    under the device-mapper name **`{{name}}`** and mount it at **`{{mnt}}`**, so that the
+    exports are readable there. Do not reformat the disk.
+  objectives:
+    - Unlock a LUKS volume with a key file
+    - Mount the opened device and confirm the data
+  params:
+    name:
+      type: choice
+      values: [auditvol, farevault, sigvault]
+    mnt:
+      type: choice
+      values: [/mnt/audit, /mnt/vault, /srv/secure]
+    keyfile:
+      type: choice
+      values: [audit.key, fare.key]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-lp-01
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["1Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-lp-01
+      timeoutSec: 240
+      run: |
+        set -eu
+        [ "$(readlink -f /dev/disk/by-id/virtio-ct-data1)" = /dev/vdc ]
+        if ! command -v cryptsetup >/dev/null 2>&1; then
+          if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then mv /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list.d/ubuntu.sources.cloud-init; rm -rf /var/lib/apt/lists/*; fi
+          apt-get update -q >/dev/null
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -q cryptsetup-bin >/dev/null
+        fi
+        V=/var/lib/cloudtrain; install -d -m 0700 $V
+        umount {{mnt}} 2>/dev/null || true
+        cryptsetup close {{name}} 2>/dev/null || true
+        rm -rf /root/keys; install -d -m 0700 /root/keys
+        head -c 64 /dev/urandom > /root/keys/{{keyfile}}; chmod 0400 /root/keys/{{keyfile}}
+        # a decoy key that does not fit
+        head -c 64 /dev/urandom > /root/keys/old-archive.key; chmod 0400 /root/keys/old-archive.key
+        wipefs -a /dev/vdc >/dev/null
+        cryptsetup luksFormat --batch-mode --type luks2 --pbkdf pbkdf2 --pbkdf-force-iterations 1000 --key-file /root/keys/{{keyfile}} /dev/vdc
+        cryptsetup open --key-file /root/keys/{{keyfile}} /dev/vdc ct-seed
+        mkfs.ext4 -q -L fare-audit /dev/mapper/ct-seed
+        mkdir -p /run/ct-seed; mount /dev/mapper/ct-seed /run/ct-seed
+        seq 1 400 | sed 's/^/fare-audit export row /' > /run/ct-seed/exports-2026.csv
+        sha256sum /run/ct-seed/exports-2026.csv | cut -d' ' -f1 > $V/luks.sha
+        umount /run/ct-seed; rmdir /run/ct-seed
+        cryptsetup close ct-seed
+        mkdir -p {{mnt}}
+  checks:
+    - id: unlocked
+      description: The volume is unlocked as {{name}} on the encrypted disk
+      type: shell
+      on: tr-lp-01
+      skills: [linux.storage.luks]
+      weight: 2
+      command: |
+        d=$(cryptsetup status {{name}} 2>/dev/null | awk '$1 == "device:" {print $2}')
+        t=$(cryptsetup status {{name}} 2>/dev/null | awk '$1 == "type:" {print $2}')
+        echo "$(readlink -f "$d" 2>/dev/null) $t"
+      expect: {match: exact, value: "/dev/vdc LUKS2"}
+    - id: mounted
+      description: The opened device is mounted at {{mnt}}
+      type: shell
+      on: tr-lp-01
+      skills: [linux.storage.luks]
+      weight: 2
+      command: findmnt -n -o SOURCE,FSTYPE {{mnt}} 2>/dev/null | awk '{print $1, $2}' || true
+      expect: {match: exact, value: "/dev/mapper/{{name}} ext4"}
+    - id: data
+      description: The exports are readable and unchanged
+      type: shell
+      on: tr-lp-01
+      skills: [linux.storage.luks]
+      weight: 1
+      command: |
+        [ "$(sha256sum {{mnt}}/exports-2026.csv 2>/dev/null | cut -d' ' -f1)" = "$(cat /var/lib/cloudtrain/luks.sha)" ] && echo intact || echo missing
+      expect: {match: exact, value: intact}
+  misconceptions:
+    - id: unlocked-not-mounted
+      description: Opens the volume but never mounts it.
+      feedback: "cryptsetup open only creates /dev/mapper/{{name}}. The filesystem inside still has to be mounted."
+      expectFail: [mounted, data]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        run: sudo cryptsetup open --key-file /root/keys/{{keyfile}} /dev/disk/by-id/virtio-ct-data1 {{name}}
+    - id: wrong-name
+      description: Opens the volume under a different mapper name.
+      feedback: "The task fixes the device-mapper name; open the volume as {{name}} so that /dev/mapper/{{name}} exists."
+      expectFail: [unlocked, mounted]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        run: |
+          sudo cryptsetup open --key-file /root/keys/{{keyfile}} /dev/vdc tr-wrong
+          sudo mount /dev/mapper/tr-wrong {{mnt}}
+  solution:
+    explanation: cryptsetup open takes the key file with --key-file and creates /dev/mapper/NAME; the ext4 filesystem inside is then mounted like any other device.
+    steps:
+      - on: tr-lp-01
+        as: learner
+        run: |
+          set -e
+          sudo cryptsetup open --key-file /root/keys/{{keyfile}} /dev/disk/by-id/virtio-ct-data1 {{name}}
+          sudo mount /dev/mapper/{{name}} {{mnt}}
+          ls {{mnt}}
+    alternatives:
+      - id: luksopen-alias
+        description: The luksOpen alias with the type spelled out, then a mount by label.
+        steps:
+          - on: tr-lp-01
+            as: learner
+            run: |
+              set -e
+              sudo cryptsetup luksOpen --type luks2 -d /root/keys/{{keyfile}} /dev/vdc {{name}}
+              sudo udevadm settle
+              sudo mount -L fare-audit {{mnt}}

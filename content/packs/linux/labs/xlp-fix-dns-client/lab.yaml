@@ -1,0 +1,151 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xlp-fix-dns-client
+  title: Restore name resolution
+  domain: linux
+  frameworks: [linuxplus:troubleshooting]
+  difficulty: easy
+  estimatedMinutes: 4
+  tags: [exam, dns, resolv.conf, nsswitch, troubleshooting]
+  version: 1
+spec:
+  description: |
+    **Host:** `tr-lp-01` (a shell is open on it; you have `sudo`)
+
+    Applications on this host can no longer resolve the internal name
+    **`{{name}}.tallowmere.test`**, and the short name **`{{name}}`** fails too. The
+    site resolver is healthy: it runs on this host and answers on **127.0.0.53** for the
+    domain `tallowmere.test` (`dig @127.0.0.53 {{name}}.tallowmere.test` works).
+
+    Fix the host's **resolver configuration** so that both names resolve through DNS the
+    way applications resolve them (`getent`). Do not pin the addresses in `/etc/hosts`.
+
+    `/etc/resolv.conf` and `/etc/hosts` are bind-mounted into this host: edit them in
+    place (an editor or `sudo tee`); tools that replace the file, such as `sed -i`, fail
+    with "Device or resource busy".
+  objectives:
+    - Read the hosts line of nsswitch.conf and the resolver settings
+    - Restore DNS lookups for full and short names
+  params:
+    net:
+      type: int
+      min: 16
+      max: 99
+    name:
+      type: choice
+      values: [dispatch-db, tkt-api, sig-gw]
+  topology:
+    entry: tr-lp-01
+    nodes:
+      - name: tr-lp-01
+        driver: container
+        image: el-lab:10
+        access: [shell]
+        learnerSudo: true
+  setup:
+    - on: tr-lp-01
+      file: {path: /usr/local/libexec/tr-resolver, source: assets/tr-resolver.py, mode: "0755"}
+    - on: tr-lp-01
+      run: |
+        set -eu
+        echo 'learner ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/learner && chmod 0440 /etc/sudoers.d/learner
+        mkdir -p /etc/tr-resolver
+        cat > /etc/tr-resolver/zone.txt <<'EOT'
+        # tallowmere.test, dispatch site
+        dispatch-db.tallowmere.test 10.40.{{net}}.21
+        tkt-api.tallowmere.test 10.41.{{net}}.30
+        sig-gw.tallowmere.test 10.42.{{net}}.7
+        EOT
+        pgrep -f '^/usr/bin/python3 /usr/local/libexec/tr-resolver' >/dev/null || \
+          nohup /usr/bin/python3 /usr/local/libexec/tr-resolver 127.0.0.53 >/dev/null 2>&1 &
+        sleep 1
+        # The broken state (files are bind mounts: rewrite in place).
+        cat /etc/nsswitch.conf > /var/tmp/.nsswitch.tmp
+        sed 's/^hosts:.*/hosts:      files myhostname/' /var/tmp/.nsswitch.tmp > /etc/nsswitch.conf
+        rm -f /var/tmp/.nsswitch.tmp
+        printf '%s\n' '# written by the old provisioning job' 'search tallowmere.local' 'nameserver 127.0.0.35' 'options timeout:1 attempts:1' > /etc/resolv.conf
+        grep -v -e dispatch -e tkt-api -e sig-gw /etc/hosts > /var/tmp/.hosts.tmp || true
+        cat /var/tmp/.hosts.tmp > /etc/hosts; rm -f /var/tmp/.hosts.tmp
+  checks:
+    - id: full-name
+      description: "{{name}}.tallowmere.test resolves for applications"
+      type: shell
+      on: tr-lp-01
+      skills: [linux.net.name-resolution]
+      weight: 2
+      timeoutSec: 20
+      command: |
+        got=$(su -s /bin/sh learner -c 'getent ahostsv4 {{name}}.tallowmere.test' | awk 'NR==1 {print $1}')
+        case "{{name}}" in dispatch-db) want=10.40.{{net}}.21;; tkt-api) want=10.41.{{net}}.30;; *) want=10.42.{{net}}.7;; esac
+        [ "$got" = "$want" ] && echo ok || echo "got=$got"
+      expect: {match: exact, value: ok}
+    - id: short-name
+      description: The short name {{name}} resolves in the internal domain
+      type: shell
+      on: tr-lp-01
+      skills: [linux.net.name-resolution]
+      weight: 2
+      timeoutSec: 20
+      command: |
+        a=$(su -s /bin/sh learner -c 'getent ahostsv4 {{name}}' | awk 'NR==1 {print $1}')
+        b=$(su -s /bin/sh learner -c 'getent ahostsv4 {{name}}.tallowmere.test' | awk 'NR==1 {print $1}')
+        [ -n "$a" ] && [ "$a" = "$b" ] && echo same || echo "short=$a"
+      expect: {match: exact, value: same}
+    - id: through-dns
+      description: The names are not pinned in /etc/hosts
+      type: shell
+      on: tr-lp-01
+      skills: [linux.net.name-resolution]
+      weight: 1
+      command: grep -v '^[[:space:]]*#' /etc/hosts | grep -Eq 'dispatch-|tkt-api|sig-gw|10\.4[012]\.' && echo pinned || echo dns
+      expect: {match: exact, value: dns}
+  misconceptions:
+    - id: pins-hosts
+      description: Adds the addresses to /etc/hosts instead of fixing the resolver.
+      feedback: "It works until an address changes. Fix nsswitch.conf and resolv.conf so that the names come from DNS."
+      expectFail: [through-dns]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        run: |
+          printf '%s\n' '10.40.{{net}}.21 dispatch-db.tallowmere.test dispatch-db' '10.41.{{net}}.30 tkt-api.tallowmere.test tkt-api' '10.42.{{net}}.7 sig-gw.tallowmere.test sig-gw' | sudo tee -a /etc/hosts >/dev/null
+    - id: nsswitch-only
+      description: Restores dns in nsswitch.conf but leaves resolv.conf alone.
+      feedback: "With dns back in the hosts line, glibc asks the nameserver in /etc/resolv.conf, which still points at the wrong address."
+      expectFail: [full-name, short-name]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        run: |
+          sudo sh -c "sed 's/^hosts:.*/hosts:      files dns myhostname/' /etc/nsswitch.conf > /tmp/ns && cat /tmp/ns > /etc/nsswitch.conf"
+    - id: no-search
+      description: Fixes lookups of full names but not the search domain.
+      feedback: "Short names get the domains of the search line appended; it still lists the old tallowmere.local."
+      expectFail: [short-name]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        run: |
+          sudo sh -c "sed 's/^hosts:.*/hosts:      files dns myhostname/' /etc/nsswitch.conf > /tmp/ns && cat /tmp/ns > /etc/nsswitch.conf"
+          printf '%s\n' 'search tallowmere.local' 'nameserver 127.0.0.53' | sudo tee /etc/resolv.conf >/dev/null
+  solution:
+    explanation: The hosts line of nsswitch.conf must list dns after files, and resolv.conf needs the real nameserver and the tallowmere.test search domain.
+    steps:
+      - on: tr-lp-01
+        as: learner
+        run: |
+          set -e
+          sudo sh -c "sed 's/^hosts:.*/hosts:      files dns myhostname/' /etc/nsswitch.conf > /tmp/ns && cat /tmp/ns > /etc/nsswitch.conf && rm -f /tmp/ns"
+          printf '%s\n' 'search tallowmere.test' 'nameserver 127.0.0.53' | sudo tee /etc/resolv.conf >/dev/null
+          getent hosts {{name}}
+    alternatives:
+      - id: domain-line
+        description: A domain line instead of search, and the nameserver edited in place.
+        steps:
+          - on: tr-lp-01
+            as: learner
+            run: |
+              set -e
+              sudo sh -c "sed 's/^hosts:.*/hosts: files dns/' /etc/nsswitch.conf > /tmp/ns && cat /tmp/ns > /etc/nsswitch.conf && rm -f /tmp/ns"
+              sudo sh -c "sed 's/127.0.0.35/127.0.0.53/; s/^search .*/domain tallowmere.test/' /etc/resolv.conf > /tmp/rc && cat /tmp/rc > /etc/resolv.conf && rm -f /tmp/rc"

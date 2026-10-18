@@ -1,0 +1,147 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xlp-fix-unit-start
+  title: Make a failing unit start
+  domain: linux
+  frameworks: [linuxplus:troubleshooting]
+  difficulty: medium
+  estimatedMinutes: 6
+  tags: [exam, systemd, journalctl, troubleshooting]
+  version: 1
+spec:
+  description: |
+    **Host:** `tr-lp-01` (`ssh tr-lp-01`, then `sudo -i`)
+
+    After a deployment the unit **`{{unit}}.service`** no longer stays up: `systemctl start
+    {{unit}}` fails. Find out why from systemd and the journal and fix the unit **and what
+    it depends on** so that the service **starts and stays active**, as the unprivileged
+    account `tr-sync` that the unit already names. Do not change the program itself
+    (`/opt/tr-sync/bin/sync.sh`).
+  objectives:
+    - Read the failure reason from systemctl status and the journal
+    - Correct unit settings and reload systemd
+  params:
+    unit:
+      type: choice
+      values: [tr-fare-sync, tr-timetable-sync, tr-pis-sync]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-lp-01
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536}
+        access: [ssh, console]
+  setup:
+    - on: tr-lp-01
+      timeoutSec: 90
+      run: |
+        set -eu
+        V=/var/lib/cloudtrain; install -d -m 0700 $V
+        id tr-sync >/dev/null 2>&1 || useradd -r -M -d /var/lib/tr-sync -s /usr/sbin/nologin tr-sync
+        install -d -m 0755 /opt/tr-sync/bin
+        printf '%s\n' '#!/bin/sh' 'if [ -z "${TR_REGION:-}" ]; then echo "TR_REGION is not set" >&2; exit 3; fi' 'echo "sync started region=$TR_REGION in $(pwd)"' 'while :; do date +%s > "$(pwd)/last-sync"; sleep 2; done' > /opt/tr-sync/bin/sync.sh
+        chmod 0755 /opt/tr-sync/bin/sync.sh
+        install -d -m 0755 -o tr-sync -g tr-sync /var/lib/tr-sync
+        install -d -m 0755 /etc/tr
+        printf 'TR_REGION=north-line\n' > /etc/tr/sync.env
+        echo "TR_REGION=north-line" > $V/region
+        systemctl disable --now {{unit}}.service >/dev/null 2>&1 || true
+        rm -rf /etc/systemd/system/{{unit}}.service /etc/systemd/system/{{unit}}.service.d
+        # three faults: wrong ExecStart path, wrong EnvironmentFile name, wrong WorkingDirectory
+        printf '%s\n' '[Unit]' 'Description=Tallowmere synchronisation job {{unit}}' 'After=network.target' '' '[Service]' 'User=tr-sync' 'WorkingDirectory=/var/lib/tr-synk' 'EnvironmentFile=/etc/tr/sync.conf' 'ExecStart=/opt/tr-sync/sync.sh' 'Restart=on-failure' 'RestartSec=2' '' '[Install]' 'WantedBy=multi-user.target' > /etc/systemd/system/{{unit}}.service
+        systemctl daemon-reload
+        systemctl start {{unit}}.service >/dev/null 2>&1 || true
+  checks:
+    - id: active
+      description: "{{unit}}.service is active"
+      type: shell
+      on: tr-lp-01
+      skills: [linux.systemd.unit-editing, linux.systemd.journal]
+      weight: 2
+      command: systemctl is-active {{unit}}.service || true
+      expect: {match: exact, value: active}
+    - id: stays-up
+      description: The service keeps running without restarting
+      type: shell
+      on: tr-lp-01
+      skills: [linux.systemd.unit-editing]
+      weight: 2
+      timeoutSec: 40
+      command: |
+        a=$(systemctl show -P MainPID {{unit}}.service); sleep 6; b=$(systemctl show -P MainPID {{unit}}.service)
+        [ "${a:-0}" != 0 ] && [ "$a" = "$b" ] && [ "$(systemctl is-active {{unit}}.service)" = active ] && echo stable || echo "pid=$a/$b"
+      expect: {match: exact, value: stable}
+    - id: as-service-account
+      description: It runs as tr-sync with the region from the environment file
+      type: shell
+      on: tr-lp-01
+      skills: [linux.systemd.unit-editing]
+      weight: 2
+      command: |
+        p=$(systemctl show -P MainPID {{unit}}.service)
+        [ "${p:-0}" != 0 ] || { echo "not running"; exit 0; }
+        u=$(ps -o user= -p $p | tr -d ' ')
+        r=$(tr '\0' '\n' < /proc/$p/environ 2>/dev/null | grep '^TR_REGION=')
+        [ "$r" = "$(cat /var/lib/cloudtrain/region)" ] && echo "$u ok" || echo "$u env=${r:-unset}"
+      expect: {match: exact, value: "tr-sync ok"}
+    - id: program-unchanged
+      description: The program itself was not edited
+      type: shell
+      on: tr-lp-01
+      skills: [linux.systemd.unit-editing]
+      weight: 0.5
+      command: grep -c 'TR_REGION is not set' /opt/tr-sync/bin/sync.sh
+      expect: {match: exact, value: "1"}
+  misconceptions:
+    - id: manual-run
+      description: Starts the script by hand instead of fixing the unit.
+      feedback: "A script started from a shell is not the service: it is not supervised by systemd and the unit stays failed. Fix the unit file and start the unit."
+      expectFail: [active, stays-up, as-service-account]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        run: |
+          sudo systemctl stop {{unit}}.service || true
+          sudo sh -c 'cd /var/lib/tr-sync && TR_REGION=north-line nohup /opt/tr-sync/bin/sync.sh >/dev/null 2>&1 &'
+    - id: hardcoded-region
+      description: Replaces the environment file with a hard-coded value.
+      feedback: "The region belongs in /etc/tr/sync.env, which the unit should load; a value typed into the unit drifts from the real configuration."
+      expectFail: [as-service-account]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        run: |
+          sudo sed -i 's#^EnvironmentFile=.*#Environment=TR_REGION=south-line#; s#^WorkingDirectory=.*#WorkingDirectory=/var/lib/tr-sync#; s#^ExecStart=.*#ExecStart=/opt/tr-sync/bin/sync.sh#' /etc/systemd/system/{{unit}}.service
+          sudo systemctl daemon-reload
+          sudo systemctl restart {{unit}}.service || true
+  solution:
+    explanation: The journal shows one failure at a time. First the EnvironmentFile /etc/tr/sync.conf does not exist, then the working directory /var/lib/tr-synk does not exist (status 200/CHDIR), then the ExecStart path is wrong (status 203/EXEC). Correct all three, reload systemd and restart.
+    steps:
+      - on: tr-lp-01
+        as: learner
+        run: |
+          set -e
+          systemctl status --no-pager {{unit}}.service || true
+          sudo sed -i 's#^WorkingDirectory=.*#WorkingDirectory=/var/lib/tr-sync#; s#^ExecStart=.*#ExecStart=/opt/tr-sync/bin/sync.sh#; s#^EnvironmentFile=.*#EnvironmentFile=/etc/tr/sync.env#' /etc/systemd/system/{{unit}}.service
+          sudo systemctl daemon-reload
+          sudo systemctl restart {{unit}}.service
+          sleep 2
+          systemctl is-active {{unit}}.service
+    alternatives:
+      - id: dropin
+        description: Leave the unit and override the three settings in a drop-in.
+        steps:
+          - on: tr-lp-01
+            as: learner
+            run: |
+              set -e
+              sudo mkdir -p /etc/systemd/system/{{unit}}.service.d
+              printf '[Service]\nWorkingDirectory=/var/lib/tr-sync\nEnvironmentFile=\nEnvironmentFile=/etc/tr/sync.env\nExecStart=\nExecStart=/opt/tr-sync/bin/sync.sh\n' | sudo tee /etc/systemd/system/{{unit}}.service.d/fix.conf >/dev/null
+              sudo systemctl daemon-reload
+              sudo systemctl restart {{unit}}.service

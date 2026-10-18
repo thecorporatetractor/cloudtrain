@@ -1,0 +1,175 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xlp-ssh-disable-root
+  title: Disable root and password SSH logins
+  domain: linux
+  frameworks: [linuxplus:security]
+  difficulty: easy
+  estimatedMinutes: 4
+  tags: [exam, sshd, hardening, drop-in]
+  version: 1
+spec:
+  description: |
+    **Host:** `tr-lp-01` (a shell is open on it; you have `sudo`; there is no systemd, so
+    `sudo service ssh reload` manages sshd, which listens on `127.0.0.1` port 22)
+
+    Harden the SSH server of `tr-lp-01`:
+
+    - **root** must not be able to log in over SSH at all, with a password or a key;
+    - **password authentication** must be refused for everyone (user **`{{user}}`** has
+      the password `{{password}}` for testing);
+    - key login for **`{{user}}`** must keep working.
+
+    The change must be live in the running server. Mind that this host was built from a
+    cloud image.
+  objectives:
+    - Find the effective sshd configuration, including drop-ins
+    - Disable root and password logins without breaking key login
+  params:
+    user:
+      type: choice
+      values: [ada, bram, cora]
+    password:
+      type: choice
+      values: [Junction-Box-12, Points-Heater-58]
+  topology:
+    entry: tr-lp-01
+    nodes:
+      - name: tr-lp-01
+        driver: container
+        image: deb-lab:24.04
+        access: [shell]
+        learnerSudo: true
+  setup:
+    - on: tr-lp-01
+      timeoutSec: 90
+      run: |
+        set -eu
+        echo 'learner ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/learner && chmod 0440 /etc/sudoers.d/learner
+        id {{user}} >/dev/null 2>&1 || useradd -m -s /bin/bash {{user}}
+        echo "{{user}}:{{password}}" | chpasswd
+        mkdir -p /var/lib/cloudtrain && chmod 0700 /var/lib/cloudtrain
+        k=/var/lib/cloudtrain/probe; [ -f $k ] || ssh-keygen -q -t ed25519 -N '' -C probe -f $k
+        for u in {{user}} root; do
+          h=$(getent passwd $u | cut -d: -f6); install -d -m 0700 -o $u -g $u $h/.ssh
+          cp $k.pub $h/.ssh/authorized_keys; chown $u:$u $h/.ssh/authorized_keys; chmod 0600 $h/.ssh/authorized_keys
+        done
+        ssh-keygen -A >/dev/null
+        mkdir -p /run/sshd /etc/ssh/sshd_config.d
+        rm -f /etc/ssh/sshd_config.d/*.conf
+        printf 'ListenAddress 127.0.0.1\n' > /etc/ssh/sshd_config.d/10-listen.conf
+        printf 'PasswordAuthentication yes\n' > /etc/ssh/sshd_config.d/50-cloud-init.conf
+        printf '# kept for the old monitoring job\nPermitRootLogin yes\n' > /etc/ssh/sshd_config.d/60-tr-legacy.conf
+        sed -i 's/^#\?PermitRootLogin.*/#PermitRootLogin prohibit-password/; s/^#\?PasswordAuthentication.*/#PasswordAuthentication yes/; s/^#\?KbdInteractiveAuthentication.*/KbdInteractiveAuthentication no/' /etc/ssh/sshd_config
+        service ssh stop >/dev/null 2>&1 || true
+        service ssh start >/dev/null
+        sleep 1
+  checks:
+    - id: effective-config
+      description: "The effective sshd configuration (sshd -T) refuses passwords and root and allows keys"
+      type: shell
+      on: tr-lp-01
+      skills: [linux.security.ssh-hardening]
+      weight: 1
+      command: |
+        t=$(sshd -T 2>/dev/null) || { echo "config error"; exit 0; }
+        printf '%s\n' "$t" | awk '
+          $1 == "passwordauthentication" {p = $2} $1 == "kbdinteractiveauthentication" {k = $2}
+          $1 == "permitrootlogin" {r = $2} $1 == "pubkeyauthentication" {u = $2}
+          END {print "password=" p, "kbd=" k, "root=" r, "pubkey=" u}'
+      expect: {match: exact, value: "password=no kbd=no root=no pubkey=yes"}
+    - id: no-passwords
+      description: The running server refuses a password login for {{user}}
+      type: shell
+      on: tr-lp-01
+      skills: [linux.security.ssh-hardening]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        cd /tmp; a=/var/lib/cloudtrain/askpass; printf '#!/bin/sh\necho {{password}}\n' > $a; chmod 0700 $a
+        SSH_ASKPASS=$a SSH_ASKPASS_REQUIRE=force DISPLAY=none setsid -w ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+          -o PubkeyAuthentication=no -o ConnectTimeout=5 -o NumberOfPasswordPrompts=1 {{user}}@127.0.0.1 true </dev/null >/dev/null 2>&1 && echo accepted || echo refused
+      expect: {match: exact, value: refused}
+    - id: no-root
+      description: The running server refuses root, even with an authorized key
+      type: shell
+      on: tr-lp-01
+      skills: [linux.security.ssh-hardening]
+      weight: 2
+      timeoutSec: 30
+      command: cd /tmp && ssh -i /var/lib/cloudtrain/probe -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 root@127.0.0.1 true </dev/null >/dev/null 2>&1 && echo accepted || echo refused
+      expect: {match: exact, value: refused}
+    - id: user-key
+      description: "{{user}} still logs in with a key"
+      type: shell
+      on: tr-lp-01
+      skills: [linux.security.ssh-hardening]
+      weight: 1.5
+      timeoutSec: 30
+      command: cd /tmp && ssh -i /var/lib/cloudtrain/probe -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 {{user}}@127.0.0.1 id -un </dev/null 2>/dev/null || echo refused
+      expect: {match: exact, value: "{{user}}"}
+  misconceptions:
+    - id: main-file-only
+      description: Edits only /etc/ssh/sshd_config, so the drop-ins still win.
+      feedback: "sshd_config.d/*.conf is read first and the first value wins. Check the effective values with sshd -T and change the drop-ins, or add an earlier one."
+      expectFail: [effective-config, no-passwords, no-root]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        run: |
+          printf 'PasswordAuthentication no\nPermitRootLogin no\n' | sudo tee -a /etc/ssh/sshd_config >/dev/null
+          sudo sshd -t && sudo service ssh reload
+    - id: prohibit-password
+      description: Sets root to prohibit-password, which still allows root keys.
+      feedback: "prohibit-password only blocks root passwords; root keys still work. Use PermitRootLogin no."
+      expectFail: [effective-config, no-root]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        run: |
+          printf 'PasswordAuthentication no\nPermitRootLogin prohibit-password\n' | sudo tee /etc/ssh/sshd_config.d/01-hardening.conf >/dev/null
+          sudo sshd -t && sudo service ssh reload
+    - id: no-reload
+      description: Writes the right configuration but never reloads sshd.
+      feedback: "The running server keeps its old settings until it is reloaded."
+      expectFail: [no-passwords, no-root]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        run: printf 'PasswordAuthentication no\nPermitRootLogin no\n' | sudo tee /etc/ssh/sshd_config.d/01-hardening.conf >/dev/null
+    - id: keys-off
+      description: Turns off public-key authentication as well.
+      feedback: "Only passwords and root should go; the user must still log in with a key (PubkeyAuthentication yes)."
+      expectFail: [effective-config, user-key]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        run: |
+          printf 'PasswordAuthentication no\nPermitRootLogin no\nPubkeyAuthentication no\n' | sudo tee /etc/ssh/sshd_config.d/01-hardening.conf >/dev/null
+          sudo sshd -t && sudo service ssh reload
+  solution:
+    explanation: A drop-in that sorts before 50-cloud-init.conf and 60-tr-legacy.conf (the first value wins) sets both keywords; sshd -t validates it and a reload applies it.
+    steps:
+      - on: tr-lp-01
+        as: learner
+        run: |
+          set -e
+          printf 'PasswordAuthentication no\nPermitRootLogin no\n' | sudo tee /etc/ssh/sshd_config.d/01-hardening.conf >/dev/null
+          sudo sshd -t
+          sudo service ssh reload
+          sleep 1
+          sudo sshd -T | grep -Ei '^(passwordauthentication|permitrootlogin) '
+    alternatives:
+      - id: edit-dropins
+        description: Edit the two existing drop-ins instead of adding one.
+        steps:
+          - on: tr-lp-01
+            as: learner
+            run: |
+              set -e
+              sudo sed -i 's/^PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config.d/50-cloud-init.conf
+              sudo sed -i 's/^PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config.d/60-tr-legacy.conf
+              sudo sshd -t
+              sudo service ssh reload
+              sleep 1

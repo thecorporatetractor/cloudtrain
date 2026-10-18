@@ -1,0 +1,175 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xlp-ufw-rules
+  title: Allow two services and deny the rest
+  domain: linux
+  frameworks: [linuxplus:security]
+  difficulty: easy
+  estimatedMinutes: 4
+  tags: [exam, firewall, ufw, nftables]
+  version: 1
+spec:
+  description: |
+    **Host:** `tr-lp-01` (`ssh tr-lp-01`, then `sudo -i`)
+
+    Three internal web services run on `tr-lp-01`. Two of them are meant for the
+    station network: **TCP {{p1}}** and **TCP {{p2}}**. Configure the host firewall (Ubuntu's
+    `ufw`) so that:
+
+    - TCP {{p1}} and TCP {{p2}} are accepted from anywhere;
+    - **SSH stays reachable** (do not lock yourself out);
+    - every other inbound connection is denied;
+    - the firewall is **active and starts at boot**.
+
+    A test client sits on the same network as the host and will probe the ports.
+  objectives:
+    - Allow named services through a host firewall
+    - Keep SSH open and deny the rest by default
+    - Make the firewall persistent
+  params:
+    p1:
+      type: choice
+      values: ["8101", "8102", "8103"]
+    p2:
+      type: choice
+      values: ["8201", "8202", "8203"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: jumphost:1
+        access: [shell]
+      - name: tr-lp-01
+        driver: vm
+        image: ubuntu-vm:24.04
+        resources: {cpu: 2, memoryMiB: 1536, disks: ["1Gi"]}
+        access: [ssh, console]
+  setup:
+    - on: tr-lp-01
+      timeoutSec: 240
+      run: |
+        set -eu
+        if ! command -v ufw >/dev/null 2>&1; then
+          if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then mv /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list.d/ubuntu.sources.cloud-init; rm -rf /var/lib/apt/lists/*; fi
+          apt-get update -q >/dev/null
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -q ufw >/dev/null
+        fi
+        ufw --force reset >/dev/null 2>&1 || true
+        # three tiny web services; the third is not one of the requested services
+        for s in a:{{p1}} b:{{p2}} x:8301 y:8302; do
+          n=${s%%:*}; p=${s##*:}
+          mkdir -p /srv/tr-svc-$n; echo "svc-$p" > /srv/tr-svc-$n/index.html
+          printf '[Unit]\nDescription=Tallowmere internal service %s\n[Service]\nExecStart=/usr/bin/python3 -m http.server %s --directory /srv/tr-svc-%s\nRestart=always\n[Install]\nWantedBy=multi-user.target\n' $n $p $n > /etc/systemd/system/tr-svc-$n.service
+        done
+        systemctl daemon-reload
+        systemctl enable --now tr-svc-a tr-svc-b tr-svc-x tr-svc-y >/dev/null 2>&1
+        # a "client host" in a network namespace on 10.64.11.0/24 (eth0 and the default route are untouched)
+        ROLE=cl; NET=10.64.11
+        ip netns del tr-$ROLE 2>/dev/null || true
+        ip link del v-$ROLE 2>/dev/null || true
+        ip netns add tr-$ROLE
+        ip link add v-$ROLE type veth peer name v-$ROLE-p
+        ip link set v-$ROLE-p netns tr-$ROLE
+        ip addr add $NET.1/24 dev v-$ROLE
+        ip link set v-$ROLE up
+        ip -n tr-$ROLE addr add $NET.2/24 dev v-$ROLE-p
+        ip -n tr-$ROLE link set v-$ROLE-p up
+        ip -n tr-$ROLE link set lo up
+        for i in $(seq 20); do curl -s -m 2 -o /dev/null http://10.64.11.1:{{p1}}/ && break; sleep 1; done
+  checks:
+    - id: reach-both
+      description: The two requested services answer from the client network
+      type: shell
+      on: tr-lp-01
+      skills: [linux.net.firewall]
+      weight: 2
+      timeoutSec: 40
+      command: |
+        a=$(ip netns exec tr-cl curl -4 -s -m 5 http://10.64.11.1:{{p1}}/)
+        b=$(ip netns exec tr-cl curl -4 -s -m 5 http://10.64.11.1:{{p2}}/)
+        echo "${a:-none} ${b:-none}"
+      expect: {match: exact, value: "svc-{{p1}} svc-{{p2}}"}
+    - id: blocked
+      description: The other services are not reachable from the client network
+      type: shell
+      on: tr-lp-01
+      skills: [linux.net.firewall]
+      weight: 2
+      timeoutSec: 40
+      command: |
+        x=$(ip netns exec tr-cl curl -4 -s -m 4 http://10.64.11.1:8301/)
+        y=$(ip netns exec tr-cl curl -4 -s -m 4 http://10.64.11.1:8302/)
+        [ -z "$x$y" ] && echo blocked || echo "open:$x$y"
+      expect: {match: exact, value: blocked}
+    - id: ssh-kept
+      description: SSH still answers on port 22
+      type: shell
+      on: tr-lp-01
+      skills: [linux.net.firewall]
+      weight: 1
+      timeoutSec: 20
+      command: |
+        timeout 8 ip netns exec tr-cl bash -c 'exec 3<>/dev/tcp/10.64.11.1/22 && head -c 4 <&3' 2>/dev/null || echo closed
+      expect: {match: exact, value: SSH-}
+    - id: persistent
+      description: The firewall rules are loaded at boot
+      type: shell
+      on: tr-lp-01
+      skills: [linux.net.firewall]
+      weight: 1.5
+      command: |
+        if [ "$(systemctl is-enabled ufw 2>/dev/null)" = enabled ] && grep -q '^ENABLED=yes' /etc/ufw/ufw.conf \
+           && grep -Eq -- 'dport {{p1}}( |$)' /etc/ufw/user.rules && grep -Eq -- 'dport {{p2}}( |$)' /etc/ufw/user.rules; then echo persistent
+        elif [ "$(systemctl is-enabled nftables 2>/dev/null)" = enabled ] && nft -c -f /etc/nftables.conf >/dev/null 2>&1 \
+           && grep -q '{{p1}}' /etc/nftables.conf && grep -q '{{p2}}' /etc/nftables.conf; then echo persistent
+        else echo runtime-only; fi
+      expect: {match: exact, value: persistent}
+  misconceptions:
+    - id: rules-not-enabled
+      description: Adds the allow rules but never turns the firewall on.
+      feedback: "ufw stores rules while it is inactive but filters nothing until you run ufw enable; check ufw status."
+      expectFail: [blocked, persistent]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        run: |
+          sudo ufw allow 22/tcp >/dev/null
+          sudo ufw allow {{p1}}/tcp >/dev/null
+          sudo ufw allow {{p2}}/tcp >/dev/null
+    - id: one-service-missed
+      description: Enables the firewall with SSH and only the first service allowed.
+      feedback: "Both requested ports must be allowed: the default policy denies whatever has no rule."
+      expectFail: [reach-both, persistent]
+      mutation:
+        on: tr-lp-01
+        as: learner
+        run: |
+          sudo ufw allow 22/tcp >/dev/null
+          sudo ufw allow {{p1}}/tcp >/dev/null
+          sudo ufw --force enable >/dev/null
+  solution:
+    explanation: With ufw the default incoming policy is deny. Allow SSH first so the session survives, allow the two ports, then enable the firewall; enabling also makes it start at boot.
+    steps:
+      - on: tr-lp-01
+        as: learner
+        run: |
+          set -e
+          sudo ufw allow 22/tcp
+          sudo ufw allow {{p1}}/tcp
+          sudo ufw allow {{p2}}/tcp
+          sudo ufw --force enable
+          sudo ufw status verbose
+    alternatives:
+      - id: nftables
+        description: A dedicated nftables ruleset with a drop policy, loaded by the nftables service.
+        steps:
+          - on: tr-lp-01
+            as: learner
+            run: |
+              set -e
+              printf '%s\n' '#!/usr/sbin/nft -f' 'table inet tr_lp' 'delete table inet tr_lp' 'table inet tr_lp {' '  chain input {' '    type filter hook input priority 0; policy drop;' '    ct state established,related accept' '    iif lo accept' '    udp sport 67 udp dport 68 accept' '    icmp type echo-request accept' '    tcp dport { 22, {{p1}}, {{p2}} } accept' '  }' '}' | sudo tee /etc/nftables.conf >/dev/null
+              sudo nft -c -f /etc/nftables.conf
+              sudo systemctl enable nftables
+              sudo nft -f /etc/nftables.conf
