@@ -97,7 +97,7 @@ func (d *VMDriver) Provision(ctx context.Context, ref NodeRef) (NodeState, error
 		return fail(err)
 	}
 	vm := buildVM(ref.Session, NewLabNet(ref.Session), vmSpec{
-		Name: ref.ResourceName(), Hostname: h.Name, IP: h.IP, Image: imageWithRegistry(d.ImageRegistry, img.Image),
+		Name: ref.ResourceName(), Hostname: h.Name, IP: h.IP, Image: d.image(img.Image), PullSecret: d.Container.vmPullSecret(),
 		Cores: cores, MemMiB: mem, CISecret: sec, Labels: vmLabels(ref, ""),
 		Disk: d.Disks, DiskSize: img.DiskSize, ExtraDisks: extra,
 	})
@@ -303,7 +303,11 @@ func extraDisks(r *labsv1.NodeResources) ([]string, error) {
 	return out, nil
 }
 
-// imageWithRegistry prefixes an unqualified image with registry.
-func imageWithRegistry(registry, image string) string {
-	return (&ContainerDriver{ImageRegistry: registry}).ImageFor(image)
+// image resolves a containerDisk like the container driver resolves pod
+// images (registry prefix and mirrors); without one, ImageRegistry only.
+func (d *VMDriver) image(image string) string {
+	if d.Container != nil {
+		return d.Container.ImageFor(image)
+	}
+	return ResolveImage(d.ImageRegistry, nil, image)
 }

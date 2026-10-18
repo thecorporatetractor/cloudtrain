@@ -14,11 +14,16 @@ import (
 type RuntimeOptions struct {
 	Client client.Client
 	// Reader is an uncached reader (mgr.GetAPIReader()).
-	Reader        client.Reader
-	Scheme        *runtime.Scheme
-	Executor      PodExecutor
-	Catalog       *ImageCatalog
-	ImageRegistry string
+	Reader   client.Reader
+	Scheme   *runtime.Scheme
+	Executor PodExecutor
+	Catalog  *ImageCatalog
+	// ImageRegistry prefixes unqualified catalog images; empty = the
+	// catalog's registry. ImageMirrors and ImagePullSecrets are added to the
+	// catalog's (see ImageCatalog).
+	ImageRegistry    string
+	ImageMirrors     []RegistryMirror
+	ImagePullSecrets []string
 	// RuntimeClassName for container nodes (e.g. "kata").
 	RuntimeClassName string
 	// AdminImageRef is the catalog ref of the entry node's admin sidecar
@@ -62,8 +67,21 @@ func NewRuntime(o RuntimeOptions) (*Runtime, error) {
 	if adminRef == "" {
 		adminRef = "jumphost:1"
 	}
+	registry, mirrors, secrets := o.ImageRegistry, o.ImageMirrors, o.ImagePullSecrets
+	if o.Catalog != nil {
+		if registry == "" {
+			registry = o.Catalog.Registry
+		}
+		mirrors = MergeMirrors(o.Catalog.Mirrors, mirrors)
+		for _, s := range o.Catalog.ImagePullSecrets {
+			if !containsString(secrets, s) {
+				secrets = append(secrets, s)
+			}
+		}
+	}
 	container := &ContainerDriver{
-		Client: o.Client, Reader: o.Reader, Scheme: o.Scheme, ImageRegistry: o.ImageRegistry,
+		Client: o.Client, Reader: o.Reader, Scheme: o.Scheme, ImageRegistry: registry,
+		ImageMirrors: mirrors, ImagePullSecrets: secrets,
 		RuntimeClassName: o.RuntimeClassName, Executor: o.Executor, Catalog: o.Catalog,
 		PersistentHome: o.PersistentHome, HomeStorageClass: o.StorageClass,
 		UserNamespaces: o.UserNamespaces, DenyLearnerSudo: o.DenyLearnerSudo,
@@ -84,13 +102,13 @@ func NewRuntime(o RuntimeOptions) (*Runtime, error) {
 		Network: &LabNetwork{Client: o.Client, Reader: o.Reader},
 	}
 	vm := &VMDriver{Client: o.Client, Reader: o.Reader, Catalog: o.Catalog, Container: container, Session: session,
-		ImageRegistry: o.ImageRegistry, Disks: disks}
+		ImageRegistry: registry, Disks: disks}
 	cluster := &ClusterDriver{
 		Virtual: &VClusterDriver{Client: o.Client, Reader: o.Reader, Container: container, Helm: o.Helm,
 			Chart: o.VClusterChart, ValuesFile: o.VClusterValues, Persistent: o.VClusterPersistence, StorageClass: o.StorageClass,
 			PodSecurity: o.VClusterPodSecurity},
 		Kubeadm: &KubeadmDriver{Client: o.Client, Reader: o.Reader, Catalog: o.Catalog, Container: container,
-			Session: session, ImageRegistry: o.ImageRegistry, Disks: disks},
+			Session: session, ImageRegistry: registry, Disks: disks},
 	}
 	// The real netdev driver, not the stub: labctl verify and exam runs exec
 	// solution/mistake steps on FRR nodes through it, like the manager.

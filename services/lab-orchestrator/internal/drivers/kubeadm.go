@@ -161,7 +161,7 @@ func (d *KubeadmDriver) Provision(ctx context.Context, ref NodeRef) (NodeState, 
 		}
 		cores, mem := memberResources(ref.Node, m)
 		vm := buildVM(ref.Session, net, vmSpec{
-			Name: l.vms[i], Hostname: m.Name, IP: h.IP, Image: imageWithRegistry(d.ImageRegistry, img.Image),
+			Name: l.vms[i], Hostname: m.Name, IP: h.IP, Image: d.image(img.Image), PullSecret: d.Container.vmPullSecret(),
 			Cores: cores, MemMiB: mem, CISecret: ci, Labels: vmLabels(ref, m.Name),
 			Disk: d.Disks, DiskSize: img.DiskSize,
 		})
@@ -746,4 +746,13 @@ func sortedKeys(m map[string]string) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// image resolves a golden containerDisk (registry prefix and mirrors, as for
+// pod images).
+func (d *KubeadmDriver) image(image string) string {
+	if d.Container != nil {
+		return d.Container.ImageFor(image)
+	}
+	return ResolveImage(d.ImageRegistry, nil, image)
 }

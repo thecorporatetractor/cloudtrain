@@ -65,6 +65,11 @@ type ContainerDriver struct {
 	// ImageRegistry prefixes catalog image refs without a registry
 	// ("jumphost:1" -> "<ImageRegistry>/jumphost:1").
 	ImageRegistry string
+	// ImageMirrors rewrite the registry of resolved images (see ResolveImage).
+	ImageMirrors []RegistryMirror
+	// ImagePullSecrets name Secrets in the session namespace for pulling lab
+	// images (pods; the first one for ephemeral VM containerDisks).
+	ImagePullSecrets []string
 	// RuntimeClassName, e.g. "kata"; empty uses the cluster default.
 	RuntimeClassName string
 	// ClusterDomain for Service DNS names (default "cluster.local").
@@ -147,16 +152,28 @@ func (d *ContainerDriver) conflict(ref NodeRef, obj client.Object) error {
 		obj, obj.GetNamespace(), obj.GetName(), ref.Session.Name, ref.Node.Name, ErrConflict)
 }
 
-// ImageFor resolves a catalog image ref to a pullable image.
+// ImageFor resolves a catalog image to a pullable image: the registry
+// prefix for unqualified refs, then the registry mirrors.
 func (d *ContainerDriver) ImageFor(ref string) string {
-	if d.ImageRegistry == "" {
-		return ref
+	return ResolveImage(d.ImageRegistry, d.ImageMirrors, ref)
+}
+
+// pullSecrets is the pod's imagePullSecrets (nil when none are configured).
+func (d *ContainerDriver) pullSecrets() []corev1.LocalObjectReference {
+	var out []corev1.LocalObjectReference
+	for _, s := range d.ImagePullSecrets {
+		out = append(out, corev1.LocalObjectReference{Name: s})
 	}
-	first, _, hasSlash := strings.Cut(ref, "/")
-	if hasSlash && (strings.ContainsAny(first, ".:") || first == "localhost") {
-		return ref // already fully qualified
+	return out
+}
+
+// vmPullSecret is the Secret KubeVirt pulls ephemeral containerDisks with
+// (it takes one); empty when none is configured.
+func (d *ContainerDriver) vmPullSecret() string {
+	if d == nil || len(d.ImagePullSecrets) == 0 {
+		return ""
 	}
-	return strings.TrimSuffix(d.ImageRegistry, "/") + "/" + ref
+	return d.ImagePullSecrets[0]
 }
 
 // servicePorts lists the Service ports for a node's access points. Every
@@ -190,6 +207,7 @@ func (d *ContainerDriver) BuildPod(ref NodeRef) *corev1.Pod {
 			RestartPolicy:                corev1.RestartPolicyAlways,
 			AutomountServiceAccountToken: ptr.To(false),
 			EnableServiceLinks:           ptr.To(false),
+			ImagePullSecrets:             d.pullSecrets(),
 			Containers: []corev1.Container{{
 				Name:      ContainerName,
 				Image:     d.ImageFor(d.catalogImage(n.Image)),

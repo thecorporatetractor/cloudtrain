@@ -63,10 +63,14 @@ type vmSpec struct {
 	Hostname string
 	IP       string
 	Image    string // containerDisk image
-	Cores    int64
-	MemMiB   int64
-	CISecret string // Secret with key "userdata"
-	Labels   map[string]string
+	// PullSecret for the ephemeral containerDisk (KubeVirt imagePullSecret).
+	// Persistent disks are imported with CDI pullMethod node: the node's
+	// container runtime pulls, with node-level registry credentials.
+	PullSecret string
+	Cores      int64
+	MemMiB     int64
+	CISecret   string // Secret with key "userdata"
+	Labels     map[string]string
 	// Disk: persistent root disk (DataVolume) instead of the containerDisk.
 	Disk VMDiskOptions
 	// DiskSize overrides Disk.Size (catalog diskSize).
@@ -94,7 +98,11 @@ func buildVM(s *labsv1.LabSession, net LabNet, v vmSpec) *unstructured.Unstructu
 		tplLabels[k] = val
 	}
 	mem := fmt.Sprintf("%dMi", v.MemMiB)
-	root := map[string]any{"name": "root", "containerDisk": map[string]any{"image": v.Image, "imagePullPolicy": "IfNotPresent"}}
+	cd := map[string]any{"image": v.Image, "imagePullPolicy": "IfNotPresent"}
+	if v.PullSecret != "" {
+		cd["imagePullSecret"] = v.PullSecret
+	}
+	root := map[string]any{"name": "root", "containerDisk": cd}
 	var dvTemplates []any
 	if v.Disk.Persistent {
 		size := v.DiskSize

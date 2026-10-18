@@ -4,6 +4,7 @@
 //	labctl validate [--schema FILE] <dir>...
 //	labctl verify [--context C] [--parallel N] [--only ID] [--keep] <lab dir|lab.yaml>...
 //	labctl exam compile|draw|run [flags] <exam-id>
+//	labctl catalog check|publishable|overlay [flags]
 package main
 
 import (
@@ -30,6 +31,7 @@ Usage:
   labctl validate [flags] <dir>...    validate every lab.yaml under the directories
   labctl verify [flags] <lab>...      run the verifier cycle on a live cluster (see docs/k8s-readiness.md)
   labctl exam compile|draw|run ...    exam simulations (see 'labctl exam help')
+  labctl catalog check|publishable|overlay ...  image catalog release tooling (see 'labctl catalog help')
 
 Run 'labctl <command> -h' for command flags.
 `
@@ -52,6 +54,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return cmdVerify(args[1:], stdout, stderr)
 	case "exam":
 		return cmdExam(args[1:], stdout, stderr)
+	case "catalog":
+		return cmdCatalog(args[1:], stdout, stderr)
 	case "-h", "--help", "help":
 		fmt.Fprint(stdout, usage)
 		return 0
