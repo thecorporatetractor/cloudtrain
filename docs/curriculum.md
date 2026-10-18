@@ -18,9 +18,10 @@ Legend. **Type**: learn = guided first exposure, do = complete a task, fix = rep
 | Infrastructure as code with Terraform | 5 | 54 | 45 | 2 | 99 | 0 | 0 | A 53, B 1, V 45 | 21 |
 | Configuration management and automation | 7 | 61 | 36 | 1 | 9 | 36 | 52 | A 39, B 7, C 45, N 6 | 26 |
 | Network administration | 4 | 45 | 33 | 1 | 65 | 7 | 6 | N 78 | 15 |
-| **Total** | 43 | 500 | 380 | 13 | 418 | 314 | 148 | A 175, B 150, C 235, K 112, V 124, N 84 | 162 |
+| Security operations | 3 | 42 | 25 | 1 | 0 | 0 | 67 | A 61, C 4, K 2 | 22 |
+| **Total** | 46 | 542 | 405 | 14 | 418 | 314 | 215 | A 236, B 150, C 239, K 114, V 124, N 84 | 183 |
 
-Cross-domain exams: Platform engineer practical capstone. Exam tasks are counted under the domain of each task. Learning labs by type: learn 47, do 356, fix 83, hack 13, ctf 1. New skills proposed: 201.
+Cross-domain exams: Platform engineer practical capstone. Exam tasks are counted under the domain of each task. Learning labs by type: learn 53, do 374, fix 87, hack 19, ctf 9. New skills proposed: 236.
 
 ## Kubernetes
 
@@ -1136,6 +1137,107 @@ _CloudTrain is not affiliated with or endorsed by Cisco Systems, Inc. or Red Hat
 | `net-jinja-render-frr` | Generate router configs from YAML with Jinja2 | do | medium | 25 | N | verified | ccna:automation-programmability, ex457-aligned:network-roles-templates | Write a Jinja2 template that renders FRR interface and OSPF configuration for the three campus routers from a district YAML inventory, apply the output and prove all adjacencies come up. |
 | `net-ansible-frr-backup` | Back up every router config to Git with Ansible | do | medium | 20 | N | proposed | ccna:automation-programmability, ex457-aligned:config-backup | Write a playbook that pulls the running configuration of every district FRR router into a Git repository, one file per router, and commits only when a configuration changed. |
 
+## Security operations
+
+Work a security operations centre shift: query security logs, triage alerts, investigate incidents, write and tune detection rules, hunt for threats and respond, in an open-source KQL query workspace over seeded synthetic cloud identity, cloud activity, endpoint, DNS, Linux and Kubernetes telemetry. Hack-then-detect labs generate the evidence live on Linux and Kubernetes lab nodes; CTF investigations grade answers to per-seed questions, solo or as timed events with a scoreboard.
+
+Fictional organisation: **Brackenford Water** (A fictional regional water utility with two treatment works (tw1 Brackenford, tw2 Ashby Mill), fourteen pumping stations, a SCADA historian, a customer billing portal, a contact centre and a head office. Users are firstname.lastname@brackenford.example with admin accounts adm-<initials>@brackenford.example and service principals sp-<app>; the cloud tenant is bfw-prod (subscriptions bfw-prod-core and bfw-dev), key vaults kv-bfw-<app>, resource groups rg-bfw-<app>. Hosts are bfw-<site>-<role><nn> (bfw-hq-ws014, bfw-tw1-hist01, bfw-hq-dc01, bfw-ps07-rtu01, bfw-dmz-web02); Kubernetes clusters bfw-k8s-<env> with namespaces per service (billing, meter-ingest, portal). Internal addresses are 10.40.<site>.0/24 (hq 10.40.1.0/24, tw1 10.40.11.0/24, tw2 10.40.12.0/24, dmz 10.40.200.0/24); external and attacker addresses come only from the documentation ranges 192.0.2.0/24, 198.51.100.0/24 and 203.0.113.0/24, and external domains use .example and .test.).
+
+The query engine is KustoLoco (MIT), an open-source KQL implementation; the Microsoft Kusto emulator and Splunk are not used for licence reasons, and real Microsoft Sentinel follows once an Azure sandbox offering exists. The kql-ws:1 image ships KustoLoco v1.4.9 with CloudTrain patches (docs/handoffs/soc.md): bag_unpack, make-series, search, stdev and union wildcards work; top-nested, evaluate pivot/autocluster/basket, percentiles() (use percentile()), row_cumsum, parse-kv, series_periods_*, ingestion_time() and gettype remain unsupported. Labs teach the core analyst subset and every lab that needs or works around a missing operator says so in its notes. Labs grade with ct-kql (saved queries and rules) and CTF answers with ct-kql answer KEY; data comes from ct-loggen per session seed. ct-loggen today generates SigninLogs, AuditLogs, AzureActivity, OfficeActivity, SecurityEvent, DeviceProcessEvents, DeviceNetworkEvents, CommonSecurityLog, Syslog, IdentityInfo and IpGeo with one scenario (identity-compromise); labs that need DnsEvents, DeviceFileEvents, KubeAudit or key vault diagnostics, or another scenario, say so in their notes. CTF labs (type ctf) use the CTF engine that has landed (answer checks with per-seed expected values, points, hints that cost points, sequential unlock, event mode and scoreboard). Every xsoc exam task and lab above that needs a table or scenario ct-loggen lacks says so in its notes; a lab or exam is not marked built while its data does not exist. Data sources: our own seeded synthetic data first, then Azure-Sentinel sample data (MIT), splunk/attack_data (Apache-2.0), the CC0 security dataset series v1-v3 (never under its original name) and EVTX-ATTACK-SAMPLES (GPL-3.0, kept as separate data files with its licence notice). CloudTrain is not affiliated with or endorsed by Microsoft, Splunk or The MITRE Corporation.
+
+**Licensing.** KustoLoco is MIT. Sample datasets keep their licence notices in THIRD_PARTY_LICENSES.md: Azure-Sentinel samples MIT, splunk/attack_data Apache-2.0, the security dataset series v1-v3 CC0 (its original name and branding are not used), EVTX-ATTACK-SAMPLES GPL-3.0 (shipped as unmodified data files with the licence; confirm the GPL position for hosted use before external launch). Not legal advice.
+
+Competencies: `secops.logs` (new), `secops.query` (new), `secops.investigation` (new), `secops.detection` (new), `secops.hunting` (new), `secops.ir` (new), `secops.cloud-identity` (new), `secops.endpoint` (new).
+
+### Paths (3)
+
+| Path | Title | Level | Hours | Labs | Prerequisites | Aligns to | Audience |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `soc-query-foundations` | Security log querying foundations | beginner | 4 | 16 | - | ct-soc-analyst | New SOC analysts and engineers moving into security operations |
+| `soc-detection-engineering` | Detection engineering | intermediate | 8 | 18 | `soc-query-foundations` | sc200-aligned, ct-soc-analyst, attack-tactics | SOC analysts writing and maintaining detection rules |
+| `soc-investigations` | Incident investigations | intermediate | 8 | 8 | `soc-query-foundations` | sc200-aligned, ct-soc-analyst, attack-tactics | SOC analysts practising end-to-end investigations, solo or in timed team events |
+
+<details><summary><b>Security log querying foundations</b>: modules</summary>
+
+- **Tables, filters and shaping**: `soc-first-query`, `soc-filter-signins`, `soc-shape-results`, `soc-string-matching`, `soc-fix-time-filter`
+- **Aggregation and time**: `soc-summarize-counts`, `soc-bin-timeline`, `soc-distinct-and-latest`, `soc-time-windows`, `soc-let-and-functions`
+- **Joins and parsing**: `soc-join-identity-activity`, `soc-union-sources`, `soc-parse-syslog`, `soc-dynamic-fields`, `soc-fix-join-explosion`
+- **Visualisation**: `soc-render-charts`
+
+_Maps to CloudTrain's own SOC analyst L1/L2 framework, which is not a vendor certification; completing this path confers no certification._
+
+</details>
+
+<details><summary><b>Detection engineering</b>: modules</summary>
+
+- **Identity detections**: `soc-detect-bruteforce-success`, `soc-detect-impossible-travel`, `soc-detect-mfa-fatigue`, `soc-detect-privileged-role`
+- **Endpoint and network detections**: `soc-detect-rare-process`, `soc-detect-encoded-script`, `soc-detect-dns-tunnelling`, `soc-detect-beaconing`
+- **Rules, tuning and repair**: `soc-tune-false-positives`, `soc-saved-detection-rule`, `soc-fix-noisy-rule`, `soc-fix-silent-rule`
+- **Hack then detect**: `soc-hd-ssh-guessing`, `soc-hd-sudo-misuse`, `soc-hd-scheduled-persistence`, `soc-hd-k8s-token-secrets`, `soc-hd-k8s-privileged-exec`, `soc-hd-dns-exfil`
+
+_CloudTrain is not affiliated with or endorsed by Microsoft Corporation. SC-200, Microsoft Sentinel and Microsoft Defender are trademarks of Microsoft Corporation. This path covers objectives aligned to that exam; completing it confers no certification._
+
+</details>
+
+<details><summary><b>Incident investigations</b>: modules</summary>
+
+- **Identity and cloud incidents**: `ctf-push-fatigue-forwarding`, `ctf-cloud-role-vault`, `ctf-insider-departure`
+- **Host and network incidents**: `ctf-night-shift-intrusion`, `ctf-beacon-hunt`, `ctf-ransomware-precursor`
+- **Platform and dataset incidents**: `ctf-cluster-breach-audit`, `ctf-web-defacement-dataset`
+
+_CloudTrain is not affiliated with or endorsed by Microsoft Corporation. SC-200, Microsoft Sentinel and Microsoft Defender are trademarks of Microsoft Corporation. This path covers objectives aligned to that exam; completing it confers no certification._
+
+CTF investigations: answer-check questions with points and costed hints; the same labs run as timed team or individual events with a scoreboard.
+
+</details>
+
+### Labs (42)
+
+| Lab | Title | Type | Difficulty | Min | Tier | Status | Frameworks | Scenario |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `soc-first-query` | First look at the security tables | learn | easy | 10 | A | proposed | ct-soc-analyst:l1-log-query, sc200-aligned:secops-environment | On a quiet morning shift at Brackenford Water, list the tables in the workspace, read the schema of SigninLogs and take a sample of rows, then answer which table holds the billing portal's sign-ins. |
+| `soc-filter-signins` | Filter sign-ins to the ones that matter | learn | easy | 12 | A | proposed | ct-soc-analyst:l1-log-query | Filter the last day of SigninLogs to failed sign-ins for the contact-centre users and save the query as failed-contact-centre that returns exactly the expected rows. |
+| `soc-shape-results` | Shape, sort and limit results | learn | easy | 12 | A | proposed | ct-soc-analyst:l1-log-query | Produce a tidy list of the twenty most recent admin sign-ins with only time, user, app, address and result columns, a computed hour-of-day column, sorted newest first. |
+| `soc-string-matching` | Match strings without missing or over-matching | do | easy | 15 | A | proposed | ct-soc-analyst:l1-log-query | Find every process command line on bfw-hq workstations that references the billing share, choosing between has, contains and regex so the saved query matches all true rows and no near misses. |
+| `soc-summarize-counts` | Count and group events | learn | easy | 12 | A | proposed | ct-soc-analyst:l1-log-query, ct-soc-analyst:l1-triage | Count failed sign-ins per user and per application over the last week and report the three users with the most failures. |
+| `soc-bin-timeline` | Events over time in buckets | do | easy | 15 | A | proposed | ct-soc-analyst:l1-log-query | Bucket the treatment works' VPN sign-ins into 15-minute bins and identify the bin where volume spiked during the night of the planned outage. |
+| `soc-distinct-and-latest` | Distinct counts and the latest record per entity | do | medium | 18 | A | proposed | ct-soc-analyst:l1-log-query, sc200-aligned:threat-hunting | For every Brackenford user, report how many distinct addresses they signed in from this week and the details of their latest sign-in, using dcount and arg_max. |
+| `soc-time-windows` | Time windows, lookbacks and time zones | learn | medium | 15 | A | proposed | ct-soc-analyst:l1-log-query | The night-shift lead reports a suspicious event at 02:10 local time; convert that to UTC, query a 30-minute window around it across three tables and explain the ingestion delay you see. |
+| `soc-let-and-functions` | Reuse logic with let and saved functions | do | medium | 20 | A | proposed | ct-soc-analyst:l1-log-query, sc200-aligned:secops-environment | Turn the repeated list of Brackenford admin accounts and the standard lookback into let statements, then save a function AdminSignins(lookback) that other analysts can call. |
+| `soc-join-identity-activity` | Correlate tables with joins | learn | medium | 20 | A | proposed | ct-soc-analyst:l2-investigation | Join sign-ins to directory audit events by user and time window to show which admin changes were made from which sign-in session, choosing the join kind that keeps unmatched sign-ins. |
+| `soc-union-sources` | Search across sources with union | do | medium | 15 | A | proposed | ct-soc-analyst:l1-log-query, ct-soc-analyst:l2-investigation | One address from the 203.0.113.0/24 range appears in an alert; union the sign-in, network and DNS tables to list every event involving it with a source-table column. |
+| `soc-parse-syslog` | Extract fields from raw log lines | do | medium | 20 | A | proposed | ct-soc-analyst:l1-log-query | Raw sshd lines from bfw-tw1-jump01 land in Syslog unparsed; extract user, source address, port and outcome with parse and extract and save the result as a function SshAuth. |
+| `soc-dynamic-fields` | Work with nested JSON fields | do | medium | 20 | A | proposed | ct-soc-analyst:l1-log-query, sc200-aligned:secops-environment | Directory audit events keep the target and modified properties as nested JSON; use parse_json, dynamic paths and mv-expand to list every role name and target user changed this week. |
+| `soc-render-charts` | Visualise security data | do | easy | 15 | A | proposed | ct-soc-analyst:l1-escalation | Build a timechart of failed versus successful sign-ins and a column chart of alerts by severity for the morning handover pack, saved as two named queries. |
+| `soc-detect-bruteforce-success` | Detect repeated failures followed by a success | do | medium | 25 | A | proposed | sc200-aligned:protections-detections, ct-soc-analyst:l2-detection-engineering, attack-tactics:credential-access | Write a query that flags any Brackenford account with at least the given number of failed sign-ins followed by a success from the same address within the window, matching the seeded incidents and nothing else. |
+| `soc-detect-impossible-travel` | Detect sign-ins too far apart to be real | do | hard | 30 | A | proposed | sc200-aligned:protections-detections, ct-soc-analyst:l2-detection-engineering, attack-tactics:initial-access | Find users whose consecutive sign-ins come from locations whose distance divided by time exceeds a plausible travel speed, excluding the corporate VPN egress addresses. |
+| `soc-detect-mfa-fatigue` | Detect push-approval fatigue | do | medium | 25 | A | proposed | sc200-aligned:protections-detections, ct-soc-analyst:l2-detection-engineering, attack-tactics:credential-access | Flag users who received many MFA push denials or timeouts in a short window followed by an approval, and identify the contact-centre user it happened to. |
+| `soc-detect-privileged-role` | Detect a new privileged role assignment | do | medium | 20 | A | proposed | sc200-aligned:protections-detections, ct-soc-analyst:l2-detection-engineering, attack-tactics:privilege-escalation, attack-tactics:persistence | Alert on any assignment of a privileged directory role or subscription Owner in bfw-prod made outside the change window or by an account that is not a member of the identity-admins watchlist. |
+| `soc-detect-rare-process` | Detect rare processes across the fleet | do | medium | 25 | A | proposed | sc200-aligned:threat-hunting, ct-soc-analyst:l2-hunting, attack-tactics:execution | Stack process names and signers across Brackenford workstations over 14 days and report processes seen on fewer than three hosts that first appeared in the last day. |
+| `soc-detect-encoded-script` | Detect suspicious encoded script command lines | do | medium | 25 | A | proposed | sc200-aligned:protections-detections, ct-soc-analyst:l2-detection-engineering, attack-tactics:execution, attack-tactics:defense-evasion | Find script-host executions with encoded or obfuscated command lines, decode them with base64_decode_tostring and report the host and the decoded download address. |
+| `soc-detect-dns-tunnelling` | Detect data hidden in DNS queries | do | hard | 30 | A | proposed | sc200-aligned:threat-hunting, ct-soc-analyst:l2-detection-engineering, attack-tactics:exfiltration, attack-tactics:command-and-control | Find hosts sending unusually many long, high-variety subdomain queries to one parent domain and name the parent domain and the treatment-works host involved. |
+| `soc-detect-beaconing` | Detect periodic callback traffic | do | hard | 35 | A | proposed | sc200-aligned:threat-hunting, ct-soc-analyst:l2-hunting, attack-tactics:command-and-control | Measure the interval and its spread between connections from each host to each external destination and report the host and destination with a regular callback pattern. |
+| `soc-tune-false-positives` | Tune a noisy detection | do | medium | 25 | A | proposed | sc200-aligned:protections-detections, ct-soc-analyst:l2-detection-engineering, ct-soc-analyst:l1-triage | The brute-force rule fires every night on the meter-ingest service account and the pen-test range; add a watchlist table and narrower conditions so those alerts stop while every seeded true positive still fires. |
+| `soc-saved-detection-rule` | Write a scheduled detection rule | do | medium | 30 | A | proposed | sc200-aligned:protections-detections, ct-soc-analyst:l2-detection-engineering | Save the MFA fatigue query as a scheduled rule with frequency, lookback, threshold, severity, entity mapping and tactic tags, and show it raises exactly the expected alerts over the test data. |
+| `soc-fix-time-filter` | Fix a query that misses recent events | fix | easy | 15 | A | proposed | ct-soc-analyst:l1-log-query | A colleague's failed-sign-in query returns nothing for last night; repair its time filter and field choice so it returns the expected events. |
+| `soc-fix-join-explosion` | Fix a join that multiplies rows | fix | medium | 20 | A | proposed | ct-soc-analyst:l2-investigation | The handover report joining sign-ins to audit events times out and shows thousands of duplicate rows; fix the join keys, pre-aggregation and join kind so it returns one row per session. |
+| `soc-fix-noisy-rule` | Fix a rare-process rule that floods the queue | fix | medium | 25 | A | proposed | sc200-aligned:protections-detections, ct-soc-analyst:l2-detection-engineering | The rare-process rule raises hundreds of alerts after the patch rollout; repair its baseline window and grouping so it alerts only on the two seeded suspicious binaries. |
+| `soc-fix-silent-rule` | Fix a rule that never fires | fix | medium | 20 | A | proposed | sc200-aligned:protections-detections, ct-soc-analyst:l2-detection-engineering | The privileged-role rule has not fired in months although the test data contains an assignment; find the case-sensitive comparison and wrong field type that silence it and repair the rule. |
+| `soc-hd-ssh-guessing` | Generate and detect SSH password guessing | hack | medium | 35 | C | proposed | sc200-aligned:protections-detections, ct-soc-analyst:l2-detection-engineering, attack-tactics:credential-access | Run the provided password-guessing simulator against the bfw-tw1-jump01 lab host, then write a detection over the shipped sshd auth events that names the source address and the account it finally logged in to. |
+| `soc-hd-sudo-misuse` | Generate and detect sudo privilege misuse | hack | medium | 35 | C | proposed | sc200-aligned:protections-detections, ct-soc-analyst:l2-detection-engineering, attack-tactics:privilege-escalation | Use the over-broad sudo rule planted on bfw-hq-ops02 to gain a root shell, then write a detection over the shipped auditd execve records that flags root shells started through that rule. |
+| `soc-hd-scheduled-persistence` | Generate and detect scheduled-task persistence | hack | medium | 30 | C | proposed | sc200-aligned:protections-detections, ct-soc-analyst:l2-detection-engineering, attack-tactics:persistence | Add a canary cron entry and systemd timer on bfw-tw2-hist01, then save a rule over auditd file-watch events that alerts on new persistence entries by anyone outside the ops group. |
+| `soc-hd-k8s-token-secrets` | Generate and detect secret reads with a leaked token | hack | hard | 40 | K | proposed | sc200-aligned:protections-detections, ct-soc-analyst:l2-detection-engineering, attack-tactics:credential-access, attack-tactics:discovery | Use the ServiceAccount token left in the bfw-k8s-prod billing namespace to list Secrets, then write a detection over the shipped Kubernetes audit log that flags secret list or get calls by ServiceAccounts outside their namespace. |
+| `soc-hd-k8s-privileged-exec` | Generate and detect a privileged pod and exec | hack | hard | 40 | K | proposed | sc200-aligned:protections-detections, ct-soc-analyst:l2-detection-engineering, attack-tactics:privilege-escalation, attack-tactics:execution | With the over-privileged portal deployer account, start a privileged pod and exec into it, then write a correlation detection over the audit log for privileged pod creation followed by exec by the same user. |
+| `soc-hd-dns-exfil` | Generate and detect DNS exfiltration | hack | hard | 40 | C | proposed | sc200-aligned:threat-hunting, ct-soc-analyst:l2-detection-engineering, attack-tactics:exfiltration | Run the provided DNS exfiltration simulator to send a canary file from bfw-tw1-hist01 through the lab resolver, then write a detection over the shipped resolver logs that names the host and the receiving domain. |
+| `ctf-night-shift-intrusion` | Night-shift intrusion and quiet data loss | ctf | medium | 60 | A | proposed | sc200-aligned:incident-response, ct-soc-analyst:l2-investigation, attack-tactics:initial-access, attack-tactics:exfiltration | An overnight alert on the bfw-tw1 jump host starts an investigation: find the guessed account, the source address, the first command run, the staged file and the domain its contents left through in DNS queries. |
+| `ctf-push-fatigue-forwarding` | Push fatigue to a mailbox forwarding rule | ctf | medium | 50 | A | proposed | sc200-aligned:incident-response, ct-soc-analyst:l2-investigation, attack-tactics:credential-access, attack-tactics:collection | A billing clerk approved a push at 03:12; trace the denial burst, the approving sign-in's address and device, the inbox rule created afterwards, its forwarding address and how many messages it moved. |
+| `ctf-ransomware-precursor` | Ransomware precursor across the head office | ctf | hard | 90 | A | proposed | sc200-aligned:incident-response, ct-soc-analyst:l2-investigation, ct-soc-analyst:l2-incident-response, attack-tactics:lateral-movement, attack-tactics:discovery, attack-tactics:impact | Before anything was encrypted, someone moved from a phished workstation to the file server; find the initial host, the reused credential, each lateral hop, the backup deletion attempt and the host to isolate first. |
+| `ctf-insider-departure` | Data taken before a resignation | ctf | medium | 50 | A | proposed | sc200-aligned:incident-response, ct-soc-analyst:l2-investigation, attack-tactics:collection, attack-tactics:exfiltration | An engineer leaving for a competitor may have taken network drawings; establish the baseline, then find the bulk downloads, the personal address mail went to, the USB-style archive and the total volume taken. |
+| `ctf-cloud-role-vault` | Role assignment abuse and vault secret reads | ctf | hard | 60 | A | proposed | sc200-aligned:incident-response, ct-soc-analyst:l2-investigation, attack-tactics:privilege-escalation, attack-tactics:credential-access | A service principal in bfw-dev gained Owner on rg-bfw-billing; find who granted it, from where, which key vault secrets it read, the first use of a read secret elsewhere and the assignment to remove. |
+| `ctf-cluster-breach-audit` | Cluster breach told by the audit log | ctf | hard | 60 | A | proposed | sc200-aligned:incident-response, ct-soc-analyst:l2-investigation, attack-tactics:initial-access, attack-tactics:privilege-escalation, attack-tactics:credential-access | Using only the bfw-k8s-prod audit log, find the exposed workload, the stolen ServiceAccount, the RBAC binding the intruder created, the Secrets read and the image of the pod they left running. |
+| `ctf-beacon-hunt` | Hunt for a quiet beacon | ctf | medium | 45 | A | proposed | sc200-aligned:threat-hunting, ct-soc-analyst:l2-hunting, attack-tactics:command-and-control | Threat intelligence says a water utility peer was hit by low-and-slow callbacks; hunt Brackenford's network telemetry for the host, process, destination, interval and jitter of a beacon. |
+| `ctf-web-defacement-dataset` | Web server defacement from a public dataset | ctf | hard | 90 | A | proposed | sc200-aligned:incident-response, ct-soc-analyst:l2-investigation, attack-tactics:reconnaissance, attack-tactics:initial-access, attack-tactics:impact | Investigate a defaced public web server in a converted public dataset: find the scanner, the vulnerable application, the brute-forced login, the uploaded file and the defacement source. |
+
 ## Exam simulations
 
 | Exam | Title | Aligns to | Format | Duration | Pass mark | Tasks | Pool | Environment | Reboot before grade | Tier |
@@ -1153,6 +1255,7 @@ _CloudTrain is not affiliated with or endorsed by Cisco Systems, Inc. or Red Hat
 | `sim-el-automation` | Enterprise Linux automation practical exam simulation | ex294-aligned | practical | 240 min | 70% | 15 | 32 | shared | yes | C |
 | `sim-net-associate` | Associate network engineer practical exam simulation | ccna | practical-simulation | 120 min | 80% | 15 | 31 | shared | no | N |
 | `sim-platform-engineer` | Platform engineer practical capstone | ct-platform | practical | 240 min | 70% | 10 | 20 | shared | yes | K |
+| `sim-soc-analyst` | Security operations analyst practical exam simulation | sc200-aligned | practical-simulation | 120 min | 70% | 12 | 25 | shared | no | A |
 
 ### Kubernetes administrator practical exam simulation
 
@@ -1944,9 +2047,64 @@ _CloudTrain internal assessment. It is not aligned to, affiliated with or endors
 
 </details>
 
+### Security operations analyst practical exam simulation
+
+Aligns to: Microsoft Security Operations Analyst (SC-200) objective themes.
+
+**Simulation note.** The real exam is mostly multiple choice and case studies in the Microsoft portals. CloudTrain does not reproduce its question format or portals: it simulates the objectives as hands-on query, rule and investigation tasks in an open-source KQL workspace over synthetic data, graded on saved queries, rules and submitted answers. Portal configuration objectives are covered by quizzes outside this simulation.
+
+**Duration** 120 min. **Pass mark** 70% (A CloudTrain setting chosen to echo the published scaled score of 700 (a scaled score is not a linear percentage); CloudTrain scores in percent of weighted checks and may recalibrate from pilot data.). **Tasks** 12, environment shared, tier A.
+
+| Objective | Weight | Tasks | Pool |
+| --- | --- | --- | --- |
+| sc200-aligned:secops-environment | 25% | 3 | 6 |
+| sc200-aligned:protections-detections | 20% | 2 | 5 |
+| sc200-aligned:incident-response | 30% | 4 | 8 |
+| sc200-aligned:threat-hunting | 25% | 3 | 6 |
+
+**Rules.** Hints: none. Timer: one timer across all tasks. Tasks in any order. Flag for review. Reboot before grading: no. Docs: offline KQL language reference and the workspace table schemas only. Partial credit: per-check. all tasks share one seeded workspace; answers and saved rules are graded against that session's seed. The exam cannot be marked built while its draw includes tasks whose tables or scenarios (DnsEvents, KubeAudit, key vault diagnostics, the TimeReceived column) do not exist in ct-loggen; either build them or remove those tasks from the pools
+
+**Retakes.** 1 free retake(s); 24 h cooldown; at most 3 attempts per 30 days; every attempt draws fresh tasks and parameters. a retake draws different tasks and a new data seed
+
+**Score report.** Breakdown by objective, task, skill; expected values are never shown. weighted score and pass/fail against the pass mark; per-objective percent; per-task pass/fail with learner-safe check messages; time used per task; skill evidence fed to the learner model; recommended labs for the weakest objectives.
+
+_CloudTrain is not affiliated with or endorsed by Microsoft Corporation. SC-200 is a trademark of Microsoft Corporation. This exam simulation covers objectives aligned to that exam; passing it confers no certification._
+
+<details><summary>Task pool (25 tasks)</summary>
+
+| Task | Objective | Title | Difficulty | Min | Tier | Scenario |
+| --- | --- | --- | --- | --- | --- | --- |
+| `xsoc-table-for-question` | sc200-aligned:secops-environment | Pick the table that answers a question | easy | 5 | A | For each of three questions from the shift lead, save a query against the one table that answers it and return the requested value. |
+| `xsoc-saved-function` | sc200-aligned:secops-environment | Save a reusable parser function | medium | 10 | A | Save a function that parses the raw firewall Syslog lines into source, destination, port and action columns with the given name and parameters. |
+| `xsoc-watchlist-table` | sc200-aligned:secops-environment | Create an allowlist table and use it | medium | 8 | A | Create the scanner-allowlist table from the provided addresses and make the given query exclude them. |
+| `xsoc-ingestion-delay` | sc200-aligned:secops-environment | Measure ingestion delay per source | medium | 8 | A | Report the 95th percentile ingestion delay per table over the last day with percentile() and name the slowest source. |
+| `xsoc-schema-dynamic-field` | sc200-aligned:secops-environment | Extract a nested field for reporting | medium | 8 | A | Return the initiating app and target resource of every audit event of the given type using dynamic paths. |
+| `xsoc-data-gap` | sc200-aligned:secops-environment | Find a gap in a data source | medium | 8 | A | Find the hour in the last week when the given source sent no events and report its start time. |
+| `xsoc-threshold-rule` | sc200-aligned:protections-detections | Save a threshold detection rule | medium | 12 | A | Save a scheduled rule for the given failure threshold and window with the required entity mapping and severity. |
+| `xsoc-correlation-rule` | sc200-aligned:protections-detections | Save a sequence detection rule | hard | 15 | A | Save a rule that raises when the given action follows a new sign-in location for the same user within the window. |
+| `xsoc-tune-rule` | sc200-aligned:protections-detections | Tune a rule without losing true positives | medium | 12 | A | Change the provided rule so the listed benign alerts no longer fire and every seeded true positive still does. |
+| `xsoc-repair-rule` | sc200-aligned:protections-detections | Repair a broken detection rule | medium | 10 | A | The provided rule returns no rows on data that contains the behaviour; repair it so it returns the expected alerts. |
+| `xsoc-role-assignment-rule` | sc200-aligned:protections-detections | Detect privileged role assignments | medium | 10 | A | Save a rule that alerts on assignments of the listed privileged roles by anyone not in the admin table. |
+| `xsoc-triage-alert` | sc200-aligned:incident-response | Triage an alert as true or false positive | easy | 8 | A | Decide whether the given alert is a true or false positive and submit the evidence value that proves it. |
+| `xsoc-first-malicious-signin` | sc200-aligned:incident-response | Find the first malicious sign-in | medium | 10 | A | Submit the time and address of the first attacker-controlled sign-in for the compromised account. |
+| `xsoc-scope-hosts` | sc200-aligned:incident-response | Scope the hosts an intruder touched | medium | 12 | A | Submit every host the given account logged on to from the attacker's foothold, in order. |
+| `xsoc-process-chain` | sc200-aligned:incident-response | Trace a process chain to its origin | medium | 10 | A | Starting from the alerting process, submit its grandparent process and the file that launched it. |
+| `xsoc-mailbox-rule` | sc200-aligned:incident-response | Find the forwarding rule and its target | medium | 10 | A | Submit the name and forwarding address of the inbox rule created after the compromise. |
+| `xsoc-vault-reads` | sc200-aligned:incident-response | List the secrets read after an escalation | hard | 12 | A | Submit the key vault secrets the principal read after its role assignment, and the assignment id to remove. |
+| `xsoc-containment-choice` | sc200-aligned:incident-response | Choose the containment action | medium | 8 | A | From the evidence, submit the account to disable and the host to isolate first. |
+| `xsoc-k8s-audit-actor` | sc200-aligned:incident-response | Name the actor in a cluster audit trail | hard | 12 | A | Submit the identity and source address that created the rogue RBAC binding and the Secrets it read. |
+| `xsoc-hunt-rare-process` | sc200-aligned:threat-hunting | Hunt for a first-seen process | medium | 10 | A | Submit the process seen on the fewest hosts that first appeared in the hunt window, and its host. |
+| `xsoc-hunt-beacon` | sc200-aligned:threat-hunting | Hunt for a periodic callback | hard | 15 | A | Submit the host, destination and approximate interval of the regular callback pattern. |
+| `xsoc-hunt-dns-tunnel` | sc200-aligned:threat-hunting | Hunt for data in DNS queries | hard | 12 | A | Submit the parent domain and host responsible for the high-variety long subdomain queries. |
+| `xsoc-hunt-encoded-script` | sc200-aligned:threat-hunting | Hunt for encoded script execution | medium | 10 | A | Submit the host and decoded download address of the encoded script command. |
+| `xsoc-hunt-impossible-travel` | sc200-aligned:threat-hunting | Hunt for implausible travel | hard | 12 | A | Submit the user whose consecutive sign-ins imply an implausible travel speed and the two countries involved. |
+| `xsoc-hunt-new-admin-tool` | sc200-aligned:threat-hunting | Hunt for a new remote admin tool | medium | 10 | A | Test the hypothesis that a remote admin tool was installed this week and submit its name and first host. |
+
+</details>
+
 ## Appendix: proposed new skills
 
-201 skills to merge into `content/skills.yaml` after approval.
+236 skills to merge into `content/skills.yaml` after approval.
 
 <details><summary>New skills</summary>
 
@@ -2153,6 +2311,41 @@ _CloudTrain internal assessment. It is not aligned to, affiliated with or endors
 | `automation.network.config-templates` | Render device configurations from Jinja2 templates and push them | automation.network | automation.network.connections, automation.content.templates |
 | `automation.network.backup-facts` | Gather network facts and back up and restore device configurations | automation.network | automation.network.connections |
 | `automation.network.parsing` | Parse device CLI output into structured data and assert on it | automation.network | automation.network.connections, automation.data.filters |
+| `secops.logs.sources` | Identify log sources, tables and their schemas, and pick the right one for a question | secops.logs |  |
+| `secops.logs.fields-time` | Read normalised event fields, timestamps in UTC and ingestion delay | secops.logs | secops.logs.sources |
+| `secops.logs.linux-auth` | Interpret sshd authentication, sudo and auditd records shipped from Linux hosts | secops.logs | secops.logs.fields-time, linux.security.audit |
+| `secops.logs.k8s-audit` | Interpret Kubernetes audit events: verb, resource, user, source address and response code | secops.logs | secops.logs.fields-time, k8s.security.audit-logging |
+| `secops.query.filter-project` | Filter and shape rows with where, project, extend, take and sort | secops.query | secops.logs.sources |
+| `secops.query.string-match` | Match strings with has, contains, startswith, in~ and regular expressions, knowing their case and term semantics | secops.query | secops.query.filter-project |
+| `secops.query.aggregate` | Aggregate with summarize, count, dcount, make_set, arg_max and bin | secops.query | secops.query.filter-project |
+| `secops.query.time` | Bound queries in time with ago, between, datetime arithmetic and lookback windows | secops.query | secops.query.filter-project, secops.logs.fields-time |
+| `secops.query.let-functions` | Factor queries with let statements, scalar and tabular functions and saved functions | secops.query | secops.query.aggregate |
+| `secops.query.joins` | Correlate tables with join kinds and union, controlling row explosion | secops.query | secops.query.aggregate |
+| `secops.query.parse-dynamic` | Extract fields with parse, extract and parse_json, and expand dynamic arrays with mv-expand | secops.query | secops.query.filter-project |
+| `secops.query.render` | Visualise results with render timechart, columnchart, barchart and piechart | secops.query | secops.query.aggregate |
+| `secops.investigation.triage` | Triage an alert: confirm the evidence, rate severity and decide true or false positive | secops.investigation | secops.query.aggregate |
+| `secops.investigation.timeline` | Build an incident timeline across sources ordered by event time | secops.investigation | secops.query.joins, secops.query.time |
+| `secops.investigation.entity-pivot` | Pivot between users, hosts, IPs, processes and resources to find related activity | secops.investigation | secops.query.joins |
+| `secops.investigation.scoping` | Scope an incident: affected identities, hosts, data and time window | secops.investigation | secops.investigation.entity-pivot |
+| `secops.detection.threshold` | Write threshold detections over a time window | secops.detection | secops.query.aggregate, secops.query.time |
+| `secops.detection.correlation` | Write multi-step correlation detections (A then B by the same entity within a window) | secops.detection | secops.detection.threshold, secops.query.joins |
+| `secops.detection.tuning` | Tune false positives with allowlists, watchlist tables and narrower conditions without losing true positives | secops.detection | secops.detection.threshold, secops.query.let-functions |
+| `secops.detection.rule-authoring` | Author a scheduled detection rule: query, frequency, lookback, threshold, severity, entity mapping and tactic tags | secops.detection | secops.detection.threshold |
+| `secops.detection.testing` | Test a detection against known-good and known-bad data and measure its alert volume | secops.detection | secops.detection.rule-authoring |
+| `secops.hunting.hypothesis` | Run a hypothesis-driven hunt and record findings and gaps | secops.hunting | secops.query.aggregate |
+| `secops.hunting.rare-events` | Find rare and first-seen events by stacking and baselining | secops.hunting | secops.query.aggregate, secops.query.time |
+| `secops.hunting.beaconing` | Detect periodic command-and-control beacons from connection timing and volume | secops.hunting | secops.hunting.rare-events, secops.endpoint.network |
+| `secops.ir.containment` | Choose containment actions (disable account, revoke sessions, isolate host, rotate secret) from the evidence | secops.ir | secops.investigation.scoping |
+| `secops.ir.reporting` | Write an incident report: timeline, indicators, impact, root cause and recommendations | secops.ir | secops.investigation.timeline |
+| `secops.cloud-identity.signins` | Analyse sign-in logs: result codes, locations, devices, MFA details and conditional access outcomes | secops.cloud-identity | secops.query.aggregate |
+| `secops.cloud-identity.mfa-abuse` | Recognise MFA fatigue and token or session abuse in sign-in data | secops.cloud-identity | secops.cloud-identity.signins |
+| `secops.cloud-identity.roles` | Track privileged role and RBAC assignments in directory audit and cloud activity logs | secops.cloud-identity | secops.query.parse-dynamic |
+| `secops.cloud-identity.cloud-activity` | Analyse cloud control-plane and data-plane activity such as key vault secret reads | secops.cloud-identity | secops.cloud-identity.roles |
+| `secops.cloud-identity.mailbox` | Investigate mailbox rules, forwarding and mail access in office activity logs | secops.cloud-identity | secops.cloud-identity.signins |
+| `secops.endpoint.process` | Analyse process creation telemetry: parent-child chains, command lines and signers | secops.endpoint | secops.query.string-match |
+| `secops.endpoint.script-logging` | Analyse script-host and PowerShell logging, including encoded command lines | secops.endpoint | secops.endpoint.process, secops.query.parse-dynamic |
+| `secops.endpoint.network` | Analyse endpoint network and DNS telemetry: destinations, ports, query names and volumes | secops.endpoint | secops.query.aggregate |
+| `secops.endpoint.windows-events` | Interpret Windows security event ids for logon, account and service activity | secops.endpoint | secops.logs.fields-time |
 
 </details>
 
@@ -2191,4 +2384,7 @@ Hand-written frameworks in `content/frameworks/` (cka, ckad, cks, lfcs, ccna) ar
 | `dca-legacy` | Docker Certified Associate (blueprint v1.4, 2020) domains, legacy | Mirantis, Inc. | published | orchestration (25), images-registry (20), install-config (15), networking (15), security (15), storage (10) |
 | `docker-practitioner` | Docker practitioner practical blueprint (CloudTrain-defined) | CloudTrain | cloudtrain | build (18), registry (8), compose (15), networking (15), storage (8), security (10), supply-chain (10), operations (16) |
 | `ct-platform` | CloudTrain platform engineer capstone | CloudTrain | cloudtrain | linux-foundation (10), containers-delivery (15), iac-provisioning (15), config-automation (15), kubernetes-operations (20), networking-connectivity (10), security-hardening (10), incident-response (5) |
+| `sc200-aligned` | Microsoft Security Operations Analyst (SC-200) objective themes | Microsoft Corporation | cloudtrain | secops-environment (25), protections-detections (20), incident-response (30), threat-hunting (25) |
+| `ct-soc-analyst` | CloudTrain SOC analyst L1/L2 | CloudTrain | cloudtrain | l1-log-query (20), l1-triage (20), l1-escalation (10), l2-investigation (20), l2-detection-engineering (15), l2-hunting (10), l2-incident-response (5) |
+| `attack-tactics` | MITRE ATT&CK Enterprise tactics (coverage tagging) | The MITRE Corporation | none | reconnaissance, resource-development, initial-access, execution, persistence, privilege-escalation, defense-evasion, credential-access, discovery, lateral-movement, collection, command-and-control, exfiltration, impact |
 
