@@ -25,19 +25,23 @@ RUN test -n "$UBUNTU_APT_SNAPSHOT" \
       iproute2 iputils-ping dnsutils netcat-openbsd tmux \
  && rm -rf /var/lib/apt/lists/*
 
+# helm: Helm 4 behind a wrapper that defaults install/upgrade to client-side apply
+# (helm-wrapper.sh says why: vcluster owns the fields of every virtual Service).
+COPY --chmod=0755 helm-wrapper.sh /usr/local/bin/helm
 RUN set -eu; cd /tmp \
  && curl -fsSLo /usr/local/bin/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl" \
  && echo "$(curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl.sha256")  /usr/local/bin/kubectl" | sha256sum -c - \
  && curl -fsSLo helm.tgz "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz" \
  && echo "${HELM_TARBALL_SHA256}  helm.tgz" | sha256sum -c - \
- && tar -xzf helm.tgz --strip-components=1 -C /usr/local/bin linux-amd64/helm \
+ && install -d -m 0755 /usr/local/lib/cloudtrain \
+ && tar -xzf helm.tgz --strip-components=1 -C /usr/local/lib/cloudtrain linux-amd64/helm \
  && curl -fsSLo etcd.tgz "https://github.com/etcd-io/etcd/releases/download/${ETCD_VERSION}/etcd-${ETCD_VERSION}-linux-amd64.tar.gz" \
  && echo "${ETCD_TARBALL_SHA256}  etcd.tgz" | sha256sum -c - \
  && tar -xzf etcd.tgz --strip-components=1 -C /usr/local/bin "etcd-${ETCD_VERSION}-linux-amd64/etcdctl" "etcd-${ETCD_VERSION}-linux-amd64/etcdutl" \
  && curl -fsSLo /usr/local/bin/yq "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64" \
  && echo "${YQ_BINARY_SHA256}  /usr/local/bin/yq" | sha256sum -c - \
  && rm -f helm.tgz etcd.tgz \
- && chmod 0755 /usr/local/bin/* \
+ && chmod 0755 /usr/local/bin/* /usr/local/lib/cloudtrain/helm \
  && C=/usr/share/bash-completion/completions \
  && kubectl completion bash > "$C/kubectl" && helm completion bash > "$C/helm" \
  && etcdctl completion bash > "$C/etcdctl" && yq shell-completion bash > "$C/yq" \
