@@ -66,7 +66,8 @@ jobs:
         run: bash .github/scripts/changes.sh --pr "$PR" >> "$GITHUB_OUTPUT"
 
   # Runs when `changes` was skipped (not a PR) or failed (fail-safe), or when the
-  # target changed. The one-entry matrix keeps the shared steps.
+  # target changed. No matrix (GitHub would append its values to the check name):
+  # the target comes from the job's env and the steps are a shared anchor.
   zap-gateway:
     name: zap (gateway)
     needs: changes
@@ -75,9 +76,6 @@ jobs:
     timeout-minutes: 75
     permissions:
       contents: read
-    strategy:
-      matrix:
-        target: [gateway]
     services: &zap-services
       postgres:
         image: postgres:18.6-alpine@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873
@@ -86,8 +84,8 @@ jobs:
         ports: ['5432:5432']
         options: >-
           --health-cmd "pg_isready -U postgres" --health-interval 3s --health-timeout 3s --health-retries 30
-    env: &zap-env
-      TARGET: ${{ matrix.target }}
+    env:
+      TARGET: gateway
       CT_TEST_DATABASE_URL: postgres://cloudtrain_owner:owner-dev-only@127.0.0.1:5432/cloudtrain
     steps: &zap-steps
       - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
@@ -106,7 +104,7 @@ jobs:
         run: docker pull -q "$ZAP_IMAGE"
 
       - name: Start the gateway DAST target
-        if: matrix.target == 'gateway'
+        if: env.TARGET == 'gateway'
         env:
           PGPASSWORD: postgres-ci-only
         run: |
@@ -117,7 +115,7 @@ jobs:
           for _ in $(seq 1 60); do curl -fs http://127.0.0.1:8787/api/health >/dev/null && exit 0; sleep 1; done
           cat "$RUNNER_TEMP/target.log"; exit 1
       - name: Start the web DAST target (mock mode, vite preview)
-        if: matrix.target == 'web'
+        if: env.TARGET == 'web'
         run: |
           pnpm --filter web build
           cd apps/web
@@ -141,7 +139,7 @@ jobs:
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
-          name: zap-${{ matrix.target }}-${{ env.MODE }}
+          name: zap-${{ env.TARGET }}-${{ env.MODE }}
           path: zap-run/out/
           retention-days: 30
       # ZAP findings are URLs, which code scanning rejects (it only accepts file
@@ -167,9 +165,8 @@ jobs:
     timeout-minutes: 75
     permissions:
       contents: read
-    strategy:
-      matrix:
-        target: [web]
     services: *zap-services
-    env: *zap-env
+    env:
+      TARGET: web
+      CT_TEST_DATABASE_URL: postgres://cloudtrain_owner:owner-dev-only@127.0.0.1:5432/cloudtrain
     steps: *zap-steps

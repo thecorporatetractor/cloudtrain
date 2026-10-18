@@ -153,8 +153,10 @@ Make these jobs **required status checks** on `main`. Their check names are exac
 The repository ruleset ("Branch Protection") requires exactly these. On a PR their jobs
 are skipped when the change does not need them (see "What runs when"); a skipped job
 satisfies its required check. Keep their names literal: CodeQL and ZAP are one job per
-language/target rather than a matrix, because a matrix job skipped by `if:` reports
-under its unexpanded name and would leave the required check waiting.
+language/target (the language or target in the job's `env`, the steps shared through a
+YAML anchor) rather than a matrix. GitHub appends matrix values to a literal job name
+(`analyze (go) (go, manual)`), and a matrix job skipped by `if:` reports under its
+unexpanded name, so either way the required check would never resolve.
 
 Some checks block when they run but must **not** be required:
 - `images`, `iac` and `sbom` are path-filtered on PRs at the workflow level, and a

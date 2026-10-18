@@ -48,7 +48,9 @@ jobs:
         run: bash .github/scripts/changes.sh --pr "$PR" >> "$GITHUB_OUTPUT"
 
   # Each job runs when `changes` was skipped (not a PR) or failed (fail-safe), or
-  # when its language's files changed. The one-entry matrix keeps the shared steps.
+  # when its language's files changed. No matrix: GitHub would append the matrix
+  # values to the check name (and a skipped matrix job reports the unexpanded name),
+  # so the language comes from the job's env and the steps are a shared anchor.
   analyze-js:
     name: analyze (javascript-typescript)
     needs: changes
@@ -59,11 +61,9 @@ jobs:
       actions: read
       contents: read
       security-events: write
-    strategy:
-      matrix:
-        include:
-          - language: javascript-typescript
-            build-mode: none
+    env:
+      LANGUAGE: javascript-typescript
+      BUILD_MODE: none
     steps: &codeql-steps
       - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
         with:
@@ -71,15 +71,15 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - if: matrix.language == 'go'
+      - if: env.LANGUAGE == 'go'
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: services/lab-orchestrator/go.mod
           cache: false
       - uses: github/codeql-action/init@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
         with:
-          languages: ${{ matrix.language }}
-          build-mode: ${{ matrix.build-mode }}
+          languages: ${{ env.LANGUAGE }}
+          build-mode: ${{ env.BUILD_MODE }}
           queries: security-extended
           config: |
             paths-ignore:
@@ -87,13 +87,13 @@ jobs:
               - '**/dist/**'
               - 'apps/web/public/mockServiceWorker.js'
               - '**/*.generated.ts'
-      - if: matrix.language == 'go'
+      - if: env.LANGUAGE == 'go'
         name: Build (go)
         working-directory: services/lab-orchestrator
         run: go build ./...
       - uses: github/codeql-action/analyze@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
         with:
-          category: /language:${{ matrix.language }}
+          category: /language:${{ env.LANGUAGE }}
 
   analyze-go:
     name: analyze (go)
@@ -102,11 +102,9 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     permissions: *codeql-permissions
-    strategy:
-      matrix:
-        include:
-          - language: go
-            build-mode: manual
+    env:
+      LANGUAGE: go
+      BUILD_MODE: manual
     steps: *codeql-steps
 
   analyze-actions:
@@ -116,9 +114,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     permissions: *codeql-permissions
-    strategy:
-      matrix:
-        include:
-          - language: actions
-            build-mode: none
+    env:
+      LANGUAGE: actions
+      BUILD_MODE: none
     steps: *codeql-steps
