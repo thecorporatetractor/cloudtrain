@@ -1,0 +1,154 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xan-sys-archive-fetch
+  title: Archive configuration and fetch it to the control node
+  domain: automation
+  frameworks: [ex294-aligned:automate-system-tasks]
+  difficulty: easy
+  estimatedMinutes: 8
+  tags: [exam, ansible, archive, fetch]
+  version: 1
+spec:
+  description: |
+    **Exam environment.** You work as `learner` on the control node `control`. The
+    managed nodes are `node1` (group `dev`), `node2` (`test`), `node3` (`prod`, also in
+    `webservers`) and `node4` (`balancers`), all Enterprise Linux 10; the account
+    `devops` on every node accepts your SSH key and may use sudo without a password.
+    Packages come from each node's local repository. Every playbook you write is run
+    again by the grader (it must report no changes), then every node is rebooted before
+    the final checks.
+
+    Write **`/home/learner/exam/backup/backup.yml`** that, on the **webservers**, archives
+    the directory **`/etc/httpd`** into a **bzip2**-compressed tarball named after the
+    host (`<inventory host name>.tar.bz2`) and fetches each archive into
+    **`/home/learner/exam/backups/`** on the control node, directly in that directory (no
+    per-host subdirectories). Run it.
+  objectives:
+    - Create archives on managed nodes
+    - Copy files from managed nodes to the control node
+  topology:
+    entry: control
+    nodes:
+      - { name: control, driver: container, image: ansible-ctl:2.21, access: [shell] }
+      - { name: node1, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node2, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node3, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node4, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+  setup:
+    - on: node1
+      timeoutSec: 120
+      run: &exam-node |
+        set -eu
+        id devops >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Exam automation" devops
+        install -d -m 0700 -o devops -g devops /home/devops/.ssh
+        install -m 0600 -o devops -g devops /home/learner/.ssh/authorized_keys /home/devops/.ssh/authorized_keys
+        printf 'devops ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/devops
+        chmod 0440 /etc/sudoers.d/devops
+    - { on: node2, timeoutSec: 120, run: *exam-node }
+    - { on: node3, timeoutSec: 120, run: *exam-node }
+    - { on: node4, timeoutSec: 120, run: *exam-node }
+    - on: node3
+      timeoutSec: 600
+      run: |
+        set -eu
+        [ -d /etc/httpd/conf ] || dnf -y -q install httpd >/dev/null
+    - on: control
+      run: |
+        set -eu
+        p=/home/learner/exam/backup
+        install -d -o learner -g learner /home/learner/exam $p
+        cat > $p/inventory.yml <<'EOF'
+        dev:
+          hosts:
+            node1:
+        test:
+          hosts:
+            node2:
+        prod:
+          hosts:
+            node3:
+        balancers:
+          hosts:
+            node4:
+        webservers:
+          children:
+            prod:
+        EOF
+        printf '[defaults]\ninventory = inventory.yml\nremote_user = devops\n' > $p/ansible.cfg
+        chown -R learner:learner $p
+  checks:
+    - id: archive
+      description: backups/node3.tar.bz2 is a bzip2 tarball of /etc/httpd
+      type: shell
+      on: control
+      skills: [automation.modules.files]
+      weight: 2
+      command: |
+        f=/home/learner/exam/backups/node3.tar.bz2
+        [ -f $f ] || { echo missing; exit 0; }
+        [ "$(head -c 3 $f)" = BZh ] || { echo not-bzip2; exit 0; }
+        tar -tjf $f 2>/dev/null | sed 's#^/##' | grep -qE '^(etc/)?httpd/conf/httpd\.conf$' && echo ok || echo wrong-content
+      expect: { match: exact, value: ok }
+    - id: only-webservers
+      description: backups/ holds only the webservers' archive, directly in the directory
+      type: shell
+      on: control
+      skills: [automation.modules.files]
+      command: cd /home/learner/exam/backups 2>/dev/null && find . -mindepth 1 | sort | tr '\n' ' ' | sed 's/ $//' || echo missing
+      expect: { match: exact, value: ./node3.tar.bz2 }
+  exam:
+    rerun:
+      - on: control
+        timeoutSec: 600
+        run: |
+          r=$(ct-ansible recap /home/learner/exam/backup backup.yml)
+          echo "$r"
+          [ "$r" = "changed=0 failed=0 unreachable=0" ]
+  misconceptions:
+    - id: not-flat
+      description: Fetches without flat, so each archive lands under host/path subdirectories.
+      feedback: fetch keeps the remote path below a host directory unless flat is set (with dest ending in a slash).
+      expectFail: [archive, only-webservers]
+      mutation:
+        on: control
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/exam/backup
+          cat > backup.yml <<'EOF'
+          - hosts: webservers
+            become: true
+            tasks:
+              - community.general.archive: { path: /etc/httpd, dest: "/tmp/{{ inventory_hostname }}.tar.bz2", format: bz2 }
+              - ansible.builtin.fetch: { src: "/tmp/{{ inventory_hostname }}.tar.bz2", dest: /home/learner/exam/backups/ }
+          EOF
+          ansible-playbook backup.yml
+  solution:
+    explanation: community.general.archive with format bz2, then fetch with flat true into a directory path ending in a slash.
+    steps:
+      - on: control
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/exam/backup
+          cat > backup.yml <<'EOF'
+          - name: Back up the web server configuration
+            hosts: webservers
+            become: true
+            tasks:
+              - name: Archive /etc/httpd
+                community.general.archive:
+                  path: /etc/httpd
+                  dest: "/tmp/{{ inventory_hostname }}.tar.bz2"
+                  format: bz2
+                  mode: "0600"
+              - name: Fetch it
+                ansible.builtin.fetch:
+                  src: "/tmp/{{ inventory_hostname }}.tar.bz2"
+                  dest: /home/learner/exam/backups/
+                  flat: true
+          EOF
+          ansible-playbook backup.yml

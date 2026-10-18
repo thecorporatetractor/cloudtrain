@@ -1,0 +1,331 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ov-loop-adjuster-accounts
+  title: Create claims adjuster accounts from a data file
+  domain: automation
+  frameworks: [ex294-aligned:core-components, ex294-aligned:automate-system-tasks]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [ansible, loops, conditionals, user, group, vars_files]
+  version: 1
+spec:
+  description: |
+    HR exported the claims adjusters to
+    **`/home/learner/claims-automation/vars/adjusters.yml`** on `ov-ctl`: a list
+    `adjusters` with each person's `name`, `uid`, `team` and an `active` flag.
+
+    Write the playbook **`/home/learner/claims-automation/adjusters-sync.yml`** that,
+    on the claims **web** nodes only (`claims_web`), reads that file and:
+
+    - creates every **active** adjuster with exactly the given UID, and with a
+      **supplementary** group named after the team (create the group if it is
+      missing; the user's primary group stays the default);
+    - removes the account of every adjuster marked **inactive**, if it exists, together
+      with the home directory.
+
+    Do not change the data file. Run your playbook; the grader runs it again and expects
+    no changes. Nothing on `ov-db-1` or `ov-quote-api1` changes.
+  objectives:
+    - Load a data file with vars_files
+    - Loop over a list of dictionaries
+    - Filter loop items with when, or with a Jinja filter
+    - Manage users and groups idempotently
+  params:
+    bootpw:
+      type: int
+      min: 100000
+      max: 999999
+    base:
+      type: int
+      min: 41
+      max: 59
+    newteam:
+      type: choice
+      values: [liability, fraud, marine]
+  topology:
+    entry: ov-ctl
+    nodes:
+      - { name: ov-ctl, driver: container, image: ansible-ctl:2.21, access: [shell] }
+      - { name: ov-claims-web1, driver: container, image: el-lab:10, resources: { cpu: 0.2, memoryMiB: 256 } }
+      - { name: ov-claims-web2, driver: container, image: el-lab:10, resources: { cpu: 0.2, memoryMiB: 256 } }
+      - { name: ov-db-1, driver: container, image: el-lab:10, resources: { cpu: 0.2, memoryMiB: 256 } }
+      - { name: ov-quote-api1, driver: container, image: deb-lab:24.04, resources: { cpu: 0.2, memoryMiB: 256 } }
+    links:
+      - { a: "ov-ctl:eth1", b: "ov-claims-web1:eth1" }
+      - { a: "ov-ctl:eth2", b: "ov-claims-web2:eth1" }
+      - { a: "ov-ctl:eth3", b: "ov-db-1:eth1" }
+      - { a: "ov-ctl:eth4", b: "ov-quote-api1:eth1" }
+  setup:
+    - on: ov-claims-web1
+      run: &ov-node |
+        set -eu
+        case $(hostname) in
+          ov-claims-web1) a=11 ;; ov-claims-web2) a=12 ;; ov-db-1) a=21 ;; ov-quote-api1) a=31 ;;
+          *) echo "unknown host $(hostname)" >&2; exit 1 ;;
+        esac
+        ip link set eth1 up
+        ip addr replace 10.70.0.$a/24 dev eth1
+        id ovauto >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Orrin and Vale automation" ovauto
+        echo 'ovauto:Ov-boot-{{bootpw}}' | chpasswd
+        printf 'ovauto ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/ovauto
+        chmod 0440 /etc/sudoers.d/ovauto
+        ssh-keygen -A >/dev/null 2>&1
+        mkdir -p /run/sshd
+        pgrep -x sshd >/dev/null || /usr/sbin/sshd
+        case $(hostname) in
+          ov-claims-web*)
+            for g in motor property; do getent group $g >/dev/null || groupadd $g; done
+            id rfenwick >/dev/null 2>&1 || useradd -m -u {{base}}07 -G motor rfenwick
+            id tmarsh >/dev/null 2>&1 || useradd -m -u {{base}}08 -G property tmarsh ;;
+        esac
+    - { on: ov-claims-web2, run: *ov-node }
+    - { on: ov-db-1, run: *ov-node }
+    - { on: ov-quote-api1, run: *ov-node }
+    - on: ov-ctl
+      timeoutSec: 240
+      run: |
+        set -eu
+        ct-fleet-net 10.70.0.10/24 ov-claims-web1=10.70.0.11 ov-claims-web2=10.70.0.12 ov-db-1=10.70.0.21 ov-quote-api1=10.70.0.31
+        ct-ansible pushkey --seal ovauto Ov-boot-{{bootpw}} ov-claims-web1 ov-claims-web2 ov-db-1 ov-quote-api1
+        p=/home/learner/claims-automation
+        install -d -o learner -g learner $p
+        cat > $p/inventory.yml <<'EOF'
+        claims:
+          children:
+            claims_web:
+              hosts:
+                ov-claims-web1:
+                ov-claims-web2:
+            claims_db:
+              hosts:
+                ov-db-1:
+        quoting:
+          hosts:
+            ov-quote-api1:
+        EOF
+        printf '[defaults]\ninventory = inventory.yml\nremote_user = ovauto\n' > $p/ansible.cfg
+        chown learner:learner $p/inventory.yml $p/ansible.cfg
+    - on: ov-ctl
+      run: |
+        set -eu
+        install -d -o learner -g learner /home/learner/claims-automation/vars
+        cat > /home/learner/claims-automation/vars/adjusters.yml <<'EOF'
+        # HR export, claims adjusters (do not edit by hand)
+        adjusters:
+          - { name: aokafor,  uid: {{base}}01, team: motor,     active: true }
+          - { name: bmarlow,  uid: {{base}}02, team: property,  active: true }
+          - { name: cveitch,  uid: {{base}}03, team: {{newteam}}, active: true }
+          - { name: dquayle,  uid: {{base}}04, team: motor,     active: true }
+          - { name: rfenwick, uid: {{base}}07, team: motor,     active: false }
+          - { name: tmarsh,   uid: {{base}}08, team: property,  active: false }
+          - { name: wyarrow,  uid: {{base}}09, team: {{newteam}}, active: false }
+        EOF
+        chown learner:learner /home/learner/claims-automation/vars/adjusters.yml
+        sha256sum /home/learner/claims-automation/vars/adjusters.yml > /var/tmp/.ct-adjusters.sum
+  checks:
+    - id: accounts-web1
+      description: "ov-claims-web1: active adjusters exist with their UIDs and team groups, inactive ones are gone"
+      type: shell
+      on: ov-claims-web1
+      skills: [automation.control-flow.loops, automation.modules.users]
+      weight: 2
+      command: &accounts |
+        r=""
+        for u in aokafor:{{base}}01:motor bmarlow:{{base}}02:property cveitch:{{base}}03:{{newteam}} dquayle:{{base}}04:motor; do
+          n=${u%%:*}; rest=${u#*:}; uid=${rest%%:*}; team=${rest#*:}
+          [ "$(id -u $n 2>/dev/null)" = "$uid" ] || { r="$r $n:uid"; continue; }
+          id -nG $n | tr ' ' '\n' | grep -qx "$team" || r="$r $n:group"
+          [ "$(id -gn $n)" != "$team" ] || r="$r $n:primary"
+        done
+        for n in rfenwick tmarsh wyarrow; do
+          id $n >/dev/null 2>&1 && r="$r $n:present"
+          [ -e /home/$n ] && r="$r $n:home"
+        done
+        echo "${r:-ok}"
+      expect: { match: exact, value: ok }
+    - { id: accounts-web2, description: "ov-claims-web2: active adjusters exist with their UIDs and team groups, inactive ones are gone", type: shell, on: ov-claims-web2, skills: [automation.control-flow.loops, automation.modules.users], weight: 2, command: *accounts, expect: { match: exact, value: ok } }
+    - id: db-untouched
+      description: No adjuster account was created on ov-db-1 or ov-quote-api1
+      type: shell
+      on: ov-db-1
+      skills: [automation.control-flow.conditionals]
+      command: &none |
+        n=0; for u in aokafor bmarlow cveitch dquayle; do id $u >/dev/null 2>&1 && n=$((n+1)); done; echo "adjusters=$n"
+      expect: { match: exact, value: adjusters=0 }
+    - { id: quote-untouched, description: No adjuster account was created on ov-quote-api1, type: shell, on: ov-quote-api1, skills: [automation.control-flow.conditionals], command: *none, expect: { match: exact, value: adjusters=0 } }
+    - id: rerun-no-changes
+      description: adjusters-sync.yml runs again without changes, and the data file is unchanged
+      type: shell
+      on: ov-ctl
+      skills: [automation.control-flow.loops]
+      weight: 2
+      timeoutSec: 240
+      command: |
+        sha256sum -c --quiet /var/tmp/.ct-adjusters.sum >/dev/null 2>&1 || { echo data-edited; exit 0; }
+        ct-ansible recap /home/learner/claims-automation adjusters-sync.yml
+      expect: { match: exact, value: "changed=0 failed=0 unreachable=0" }
+  hints:
+    - title: Reading the data
+      body: "`vars_files: [vars/adjusters.yml]` in the play makes the list `adjusters` available. `loop: \"{{ adjusters }}\"` then runs a task once per entry, with the entry in `item`."
+      cost: 1
+    - title: Filtering entries
+      body: |
+        `when: item.active` skips the inactive entries of a loop (and `when: not
+        item.active` the active ones). Another way is to filter the list itself, for
+        example `adjusters | selectattr('active')`.
+      cost: 1
+    - title: Groups that may not exist
+      body: |
+        `ansible.builtin.group` creates a group; loop it over the teams of the active
+        adjusters. In `ansible.builtin.user`, `groups:` sets supplementary groups (with
+        `append: true` to keep others) while `group:` would change the primary group.
+        `state: absent` with `remove: true` deletes the home directory too.
+      cost: 2
+  misconceptions:
+    - id: primary-group
+      description: Uses group instead of groups, so the team becomes the primary group.
+      feedback: group sets the primary group. The team must be a supplementary group (groups).
+      expectFail: [accounts-web1, accounts-web2]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 240
+        run: |
+          cd ~/claims-automation
+          cat > adjusters-sync.yml <<'EOF'
+          - hosts: claims_web
+            become: true
+            vars_files: [vars/adjusters.yml]
+            tasks:
+              - ansible.builtin.group: { name: "{{ item.team }}" }
+                loop: "{{ adjusters | selectattr('active') }}"
+              - ansible.builtin.user: { name: "{{ item.name }}", uid: "{{ item.uid }}", group: "{{ item.team }}" }
+                loop: "{{ adjusters | selectattr('active') }}"
+              - ansible.builtin.user: { name: "{{ item.name }}", state: absent, remove: true }
+                loop: "{{ adjusters | rejectattr('active') }}"
+          EOF
+          ansible-playbook adjusters-sync.yml || ansible-playbook adjusters-sync.yml || true
+    - id: keep-leavers
+      description: Creates the active adjusters but never removes the inactive ones.
+      feedback: The inactive adjusters still have accounts on the web nodes. Remove them in the same playbook.
+      expectFail: [accounts-web1, accounts-web2]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 240
+        run: |
+          set -e
+          cd ~/claims-automation
+          cat > adjusters-sync.yml <<'EOF'
+          - hosts: claims_web
+            become: true
+            vars_files: [vars/adjusters.yml]
+            tasks:
+              - ansible.builtin.group: { name: "{{ item.team }}" }
+                loop: "{{ adjusters | selectattr('active') }}"
+              - ansible.builtin.user: { name: "{{ item.name }}", uid: "{{ item.uid }}", groups: "{{ item.team }}", append: true }
+                loop: "{{ adjusters | selectattr('active') }}"
+          EOF
+          ansible-playbook adjusters-sync.yml || ansible-playbook adjusters-sync.yml
+    - id: all-claims-hosts
+      description: Targets the whole claims group, so the database node gets the adjusters too.
+      feedback: The adjusters work on the web portal only. Target claims_web.
+      expectFail: [db-untouched]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 240
+        run: |
+          set -e
+          cd ~/claims-automation
+          cat > adjusters-sync.yml <<'EOF'
+          - hosts: claims
+            become: true
+            vars_files: [vars/adjusters.yml]
+            tasks:
+              - ansible.builtin.group: { name: "{{ item.team }}" }
+                loop: "{{ adjusters | selectattr('active') }}"
+              - ansible.builtin.user: { name: "{{ item.name }}", uid: "{{ item.uid }}", groups: "{{ item.team }}", append: true }
+                loop: "{{ adjusters | selectattr('active') }}"
+              - ansible.builtin.user: { name: "{{ item.name }}", state: absent, remove: true }
+                loop: "{{ adjusters | rejectattr('active') }}"
+          EOF
+          ansible-playbook adjusters-sync.yml || ansible-playbook adjusters-sync.yml
+  solution:
+    explanation: |
+      One play for `claims_web` loads the export with `vars_files`. A `group` task loops
+      over the active entries to create each team, a `user` task creates the active
+      adjusters with `uid` and `groups` (supplementary, `append: true`), and a second
+      `user` task with `when: not item.active` removes the leavers with their homes.
+      Every module checks the current state first, so the re-run reports no changes.
+    steps:
+      - on: ov-ctl
+        as: learner
+        timeoutSec: 240
+        run: |
+          set -e
+          cd ~/claims-automation
+          cat > adjusters-sync.yml <<'EOF'
+          - name: Claims adjuster accounts
+            hosts: claims_web
+            become: true
+            vars_files:
+              - vars/adjusters.yml
+            tasks:
+              - name: Team groups
+                ansible.builtin.group:
+                  name: "{{ item.team }}"
+                loop: "{{ adjusters }}"
+                when: item.active
+              - name: Active adjusters
+                ansible.builtin.user:
+                  name: "{{ item.name }}"
+                  uid: "{{ item.uid }}"
+                  groups: "{{ item.team }}"
+                  append: true
+                loop: "{{ adjusters }}"
+                when: item.active
+              - name: Leavers
+                ansible.builtin.user:
+                  name: "{{ item.name }}"
+                  state: absent
+                  remove: true
+                loop: "{{ adjusters }}"
+                when: not item.active
+          EOF
+          ansible-playbook adjusters-sync.yml || ansible-playbook adjusters-sync.yml
+    alternatives:
+      - id: filters-and-label
+        description: Filters with selectattr and rejectattr instead of when, with loop_control labels.
+        steps:
+          - on: ov-ctl
+            as: learner
+            timeoutSec: 240
+            run: |
+              set -e
+              cd ~/claims-automation
+              cat > adjusters-sync.yml <<'EOF'
+              - hosts: claims_web
+                become: true
+                vars_files: [vars/adjusters.yml]
+                tasks:
+                  - ansible.builtin.group:
+                      name: "{{ item }}"
+                    loop: "{{ adjusters | selectattr('active') | map(attribute='team') | unique }}"
+                  - ansible.builtin.user:
+                      name: "{{ item.name }}"
+                      uid: "{{ item.uid }}"
+                      groups: ["{{ item.team }}"]
+                    loop: "{{ adjusters | selectattr('active') }}"
+                    loop_control:
+                      label: "{{ item.name }}"
+                  - ansible.builtin.user:
+                      name: "{{ item.name }}"
+                      state: absent
+                      remove: true
+                    loop: "{{ adjusters | rejectattr('active') }}"
+                    loop_control:
+                      label: "{{ item.name }}"
+              EOF
+              ansible-playbook adjusters-sync.yml || ansible-playbook adjusters-sync.yml

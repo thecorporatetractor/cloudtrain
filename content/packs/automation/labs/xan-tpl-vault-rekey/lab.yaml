@@ -1,0 +1,133 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xan-tpl-vault-rekey
+  title: Create and rekey an encrypted variables file
+  domain: automation
+  frameworks: [ex294-aligned:templates-vault]
+  difficulty: easy
+  estimatedMinutes: 8
+  tags: [exam, ansible, vault, encryption]
+  version: 1
+spec:
+  description: |
+    **Exam environment.** You work as `learner` on the control node `control`. The
+    managed nodes are `node1` (group `dev`), `node2` (`test`), `node3` (`prod`, also in
+    `webservers`) and `node4` (`balancers`), all Enterprise Linux 10; the account
+    `devops` on every node accepts your SSH key and may use sudo without a password.
+    Packages come from each node's local repository. Every playbook you write is run
+    again by the grader (it must report no changes), then every node is rebooted before
+    the final checks.
+
+    In **`/home/learner/exam/vault`**:
+
+    1. create **`locker.yml`**, encrypted with Ansible Vault using the password
+       **`{{first}}-Tide`**, holding these two variables:
+
+       ```
+       pw_developer: Imadev-{{dev}}
+       pw_manager: Imamgr-{{mgr}}
+       ```
+
+    2. then **rekey** it to the new password stored in **`secret.txt`** (already there),
+       so that the content is unchanged and the old password no longer opens it.
+  objectives:
+    - Encrypt a variables file with Ansible Vault
+    - Rekey a vault file with a password file
+  params:
+    first:
+      type: choice
+      values: [Harbour, Lantern, Meadow, Quarry]
+    dev:
+      type: int
+      min: 100
+      max: 999
+    mgr:
+      type: int
+      min: 100
+      max: 999
+    second:
+      type: int
+      min: 10000
+      max: 99999
+  topology:
+    entry: control
+    nodes:
+      - { name: control, driver: container, image: ansible-ctl:2.21, access: [shell] }
+      - { name: node1, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node2, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node3, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node4, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+  setup:
+    - on: node1
+      timeoutSec: 120
+      run: &exam-node |
+        set -eu
+        id devops >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Exam automation" devops
+        install -d -m 0700 -o devops -g devops /home/devops/.ssh
+        install -m 0600 -o devops -g devops /home/learner/.ssh/authorized_keys /home/devops/.ssh/authorized_keys
+        printf 'devops ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/devops
+        chmod 0440 /etc/sudoers.d/devops
+    - { on: node2, timeoutSec: 120, run: *exam-node }
+    - { on: node3, timeoutSec: 120, run: *exam-node }
+    - { on: node4, timeoutSec: 120, run: *exam-node }
+    - on: control
+      run: |
+        set -eu
+        install -d -o learner -g learner /home/learner/exam /home/learner/exam/vault
+        printf 'Rekeyed-{{second}}\n' > /home/learner/exam/vault/secret.txt
+        chown learner:learner /home/learner/exam/vault/secret.txt
+        chmod 0600 /home/learner/exam/vault/secret.txt
+  checks:
+    - id: opens-with-new
+      description: locker.yml is vault-encrypted and opens with secret.txt, holding exactly the two variables
+      type: shell
+      on: control
+      skills: [automation.content.vault]
+      weight: 2
+      timeoutSec: 60
+      command: |
+        cd /home/learner/exam/vault 2>/dev/null && [ -f locker.yml ] || { echo missing; exit 0; }
+        head -c 14 locker.yml | grep -q '^$ANSIBLE_VAULT' || { echo not-encrypted; exit 0; }
+        ct-ansible run . ansible-vault view --vault-password-file secret.txt locker.yml 2>/dev/null \
+          | /opt/ansible/bin/python3 -c 'import sys, yaml; d = yaml.safe_load(sys.stdin); print(sorted(d.items()) == [("pw_developer", "Imadev-{{dev}}"), ("pw_manager", "Imamgr-{{mgr}}")] and "content-ok" or "content-differs")' 2>/dev/null || echo cannot-open
+      expect: { match: exact, value: content-ok }
+    - id: old-password-refused
+      description: The first password no longer opens locker.yml
+      type: shell
+      on: control
+      skills: [automation.content.vault]
+      timeoutSec: 60
+      command: |
+        cd /home/learner/exam/vault 2>/dev/null && [ -f locker.yml ] || { echo missing; exit 0; }
+        f=$(mktemp); printf '%s\n' '{{first}}-Tide' > $f; chmod 0644 $f
+        ct-ansible run . ansible-vault view --vault-password-file $f locker.yml >/dev/null 2>&1 && r=still-opens || r=refused
+        rm -f $f; echo $r
+      expect: { match: exact, value: refused }
+  misconceptions:
+    - id: not-rekeyed
+      description: Encrypts the file with the first password and stops there.
+      feedback: The file must be rekeyed to the password in secret.txt.
+      expectFail: [opens-with-new, old-password-refused]
+      mutation:
+        on: control
+        as: learner
+        run: |
+          cd ~/exam/vault
+          printf 'pw_developer: Imadev-{{dev}}\npw_manager: Imamgr-{{mgr}}\n' > locker.yml
+          printf '%s\n' '{{first}}-Tide' > /tmp/p1
+          ansible-vault encrypt --vault-password-file /tmp/p1 locker.yml
+  solution:
+    explanation: ansible-vault create (or encrypt) with the first password, then ansible-vault rekey with --new-vault-password-file secret.txt.
+    steps:
+      - on: control
+        as: learner
+        timeoutSec: 120
+        run: |
+          set -e
+          cd ~/exam/vault
+          printf '%s\n' '{{first}}-Tide' > /tmp/p1
+          printf 'pw_developer: Imadev-{{dev}}\npw_manager: Imamgr-{{mgr}}\n' > locker.yml
+          ansible-vault encrypt --vault-password-file /tmp/p1 locker.yml
+          ansible-vault rekey --vault-password-file /tmp/p1 --new-vault-password-file secret.txt locker.yml
+          rm -f /tmp/p1

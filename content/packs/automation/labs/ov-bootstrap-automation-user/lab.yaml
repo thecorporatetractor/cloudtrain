@@ -1,0 +1,266 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ov-bootstrap-automation-user
+  title: Bootstrap managed nodes for key-based automation
+  domain: automation
+  frameworks: [ex294-aligned:managed-nodes]
+  difficulty: easy
+  estimatedMinutes: 15
+  tags: [ansible, bootstrap, ssh-keys, sudo, become, password-login]
+  version: 1
+spec:
+  description: |
+    Three branch-office gateways have just been installed: `ov-branch-lon-gw`,
+    `ov-branch-man-gw` and `ov-branch-lds-gw`. They know nothing about Ansible yet. The
+    only way in is the installer account **`ovsetup`** with the one-time password
+    **`Ov-setup-{{setuppw}}`**; `ovsetup` may use sudo, which asks for the same password.
+
+    The inventory `~/branch-bootstrap/inventory.yml` already lists the three gateways.
+    Using Ansible from `ov-ctl` (with `ovsetup` and its password just for this run), prepare
+    every gateway for normal, key-only automation:
+
+    1. a user **`ovauto`** exists, with **no password** of its own (key-only);
+    2. `ovauto` accepts your control-node key `~/.ssh/id_ed25519.pub`;
+    3. `ovauto` may run any command as root through sudo **without a password**, granted by
+       a drop-in file in `/etc/sudoers.d/` (leave `/etc/sudoers` itself untouched), with
+       mode `0440` and valid sudoers syntax.
+
+    When you are done, `ssh ovauto@ov-branch-lon-gw sudo -n id -u` must print `0` without
+    any password prompt, on every gateway.
+  objectives:
+    - Run Ansible with a password login and a sudo password
+    - Create a user and install an SSH public key with modules
+    - Grant passwordless sudo through a validated drop-in file
+  params:
+    setuppw:
+      type: int
+      min: 100000
+      max: 999999
+  topology:
+    entry: ov-ctl
+    nodes:
+      - { name: ov-ctl, driver: container, image: ansible-ctl:2.21, access: [shell] }
+      - { name: ov-branch-lon-gw, driver: container, image: deb-lab:24.04, resources: { cpu: 0.2, memoryMiB: 256 } }
+      - { name: ov-branch-man-gw, driver: container, image: el-lab:10, resources: { cpu: 0.2, memoryMiB: 256 } }
+      - { name: ov-branch-lds-gw, driver: container, image: el-lab:10, resources: { cpu: 0.2, memoryMiB: 256 } }
+    links:
+      - { a: "ov-ctl:eth1", b: "ov-branch-lon-gw:eth1" }
+      - { a: "ov-ctl:eth2", b: "ov-branch-man-gw:eth1" }
+      - { a: "ov-ctl:eth3", b: "ov-branch-lds-gw:eth1" }
+  setup:
+    - on: ov-branch-lon-gw
+      run: &ov-branch |
+        set -eu
+        case $(hostname) in
+          ov-branch-lon-gw) a=41 ;; ov-branch-man-gw) a=42 ;; ov-branch-lds-gw) a=43 ;;
+          *) echo "unknown host $(hostname)" >&2; exit 1 ;;
+        esac
+        ip link set eth1 up
+        ip addr replace 10.70.0.$a/24 dev eth1
+        id ovsetup >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Installer account" ovsetup
+        echo 'ovsetup:Ov-setup-{{setuppw}}' | chpasswd
+        printf 'ovsetup ALL=(ALL) ALL\n' > /etc/sudoers.d/00-ovsetup
+        chmod 0440 /etc/sudoers.d/00-ovsetup
+        sha256sum /etc/sudoers | cut -d' ' -f1 > /var/tmp/.ct-sudoers.sum
+        ssh-keygen -A >/dev/null 2>&1
+        mkdir -p /run/sshd
+        pgrep -x sshd >/dev/null || /usr/sbin/sshd -o PasswordAuthentication=yes
+    - { on: ov-branch-man-gw, run: *ov-branch }
+    - { on: ov-branch-lds-gw, run: *ov-branch }
+    - on: ov-ctl
+      timeoutSec: 240
+      run: |
+        set -eu
+        ct-fleet-net 10.70.0.10/24 ov-branch-lon-gw=10.70.0.41 ov-branch-man-gw=10.70.0.42 ov-branch-lds-gw=10.70.0.43
+        install -d -o learner -g learner /home/learner/branch-bootstrap
+        cat > /home/learner/branch-bootstrap/inventory.yml <<'EOF'
+        branches:
+          hosts:
+            ov-branch-lon-gw:
+            ov-branch-man-gw:
+            ov-branch-lds-gw:
+        EOF
+        chown learner:learner /home/learner/branch-bootstrap/inventory.yml
+  checks:
+    - id: ovauto-key
+      description: ovauto accepts the control node's key on every gateway
+      type: shell
+      on: ov-ctl
+      skills: [automation.inventory.bootstrap]
+      weight: 2
+      timeoutSec: 60
+      command: |
+        r=""
+        for h in ov-branch-lon-gw ov-branch-man-gw ov-branch-lds-gw; do
+          ct-ansible run /home/learner ssh -o BatchMode=yes -o PasswordAuthentication=no -o ConnectTimeout=5 ovauto@$h true >/dev/null 2>&1 && r="$r key" || r="$r no-key"
+        done
+        echo $r
+      expect: { match: exact, value: "key key key" }
+    - id: passwordless-sudo
+      description: ovauto runs commands as root through sudo without a password
+      type: shell
+      on: ov-ctl
+      skills: [automation.inventory.bootstrap]
+      weight: 2
+      timeoutSec: 90
+      command: |
+        r=""
+        for h in ov-branch-lon-gw ov-branch-man-gw ov-branch-lds-gw; do
+          u=$(ct-ansible run /home/learner ssh -o BatchMode=yes -o PasswordAuthentication=no -o ConnectTimeout=5 ovauto@$h 'sudo -n id -u' 2>/dev/null)
+          r="$r ${u:-fail}"
+        done
+        echo $r
+      expect: { match: exact, value: "0 0 0" }
+    - id: account-lon
+      description: "On ov-branch-lon-gw: ovauto has no password, the rule is a valid 0440 drop-in, /etc/sudoers is unchanged"
+      type: shell
+      on: ov-branch-lon-gw
+      skills: [automation.modules.users, automation.inventory.bootstrap]
+      command: &account |
+        getent passwd ovauto >/dev/null || { echo no-user; exit 0; }
+        case $(getent shadow ovauto | cut -d: -f2) in '$'*) pw=password ;; *) pw=key-only ;; esac
+        f=$(grep -lE '^[[:space:]]*ovauto[[:space:]].*NOPASSWD' /etc/sudoers.d/* 2>/dev/null | head -1)
+        if [ -n "$f" ]; then m=$(stat -c %a "$f"); else m=no-dropin; fi
+        visudo -cq >/dev/null 2>&1 && v=valid || v=invalid
+        [ "$(sha256sum /etc/sudoers | cut -d' ' -f1)" = "$(cat /var/tmp/.ct-sudoers.sum)" ] && s=sudoers-kept || s=sudoers-edited
+        echo "$pw $m $v $s"
+      expect: { match: exact, value: "key-only 440 valid sudoers-kept" }
+    - { id: account-man, description: "On ov-branch-man-gw: ovauto has no password, the rule is a valid 0440 drop-in, /etc/sudoers is unchanged", type: shell, on: ov-branch-man-gw, skills: [automation.modules.users, automation.inventory.bootstrap], command: *account, expect: { match: exact, value: "key-only 440 valid sudoers-kept" } }
+    - { id: account-lds, description: "On ov-branch-lds-gw: ovauto has no password, the rule is a valid 0440 drop-in, /etc/sudoers is unchanged", type: shell, on: ov-branch-lds-gw, skills: [automation.modules.users, automation.inventory.bootstrap], command: *account, expect: { match: exact, value: "key-only 440 valid sudoers-kept" } }
+  hints:
+    - title: Logging in with a password, once
+      body: |
+        `-k` (`--ask-pass`) makes Ansible ask for the SSH password and `-K`
+        (`--ask-become-pass`) for the sudo password. `-u ovsetup` picks the account for this
+        run. Password logins need `sshpass`, which is installed.
+      command: cd ~/branch-bootstrap && ansible -i inventory.yml branches -u ovsetup -k -K -b -m ansible.builtin.command -a id
+      cost: 1
+    - title: Modules for the three steps
+      body: |
+        `ansible.builtin.user` creates the account (leave `password` unset), the
+        `ansible.posix.authorized_key` module installs a key (read yours with
+        `lookup('file', '~/.ssh/id_ed25519.pub')`), and `ansible.builtin.copy` writes the
+        drop-in with `mode` and a `validate: /usr/sbin/visudo -cf %s` so a broken rule
+        never lands.
+      cost: 2
+    - title: Proving it
+      body: Run the same ad-hoc command again as ovauto with -b and no -k or -K; it must succeed on all three gateways.
+      command: cd ~/branch-bootstrap && ansible -i inventory.yml branches -u ovauto -b -m ansible.builtin.command -a id
+      cost: 1
+  misconceptions:
+    - id: edit-main-sudoers
+      description: Appends the rule to /etc/sudoers instead of a drop-in file.
+      feedback: Editing /etc/sudoers itself is what the drop-in directory avoids; a later package update or a typo there can lock out every admin. Put the rule in /etc/sudoers.d/.
+      expectFail: [account-lon, account-man, account-lds]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 240
+        run: |
+          set -e
+          cd ~/branch-bootstrap
+          cat > bad.yml <<'EOF'
+          - hosts: branches
+            become: true
+            tasks:
+              - ansible.builtin.user: { name: ovauto, shell: /bin/bash }
+              - ansible.posix.authorized_key: { user: ovauto, key: "{{ lookup('file', '~/.ssh/id_ed25519.pub') }}" }
+              - ansible.builtin.lineinfile: { path: /etc/sudoers, line: "ovauto ALL=(ALL) NOPASSWD: ALL", validate: "/usr/sbin/visudo -cf %s" }
+          EOF
+          ansible-playbook -i inventory.yml bad.yml -u ovsetup -e ansible_password=Ov-setup-{{setuppw}} -e ansible_become_password=Ov-setup-{{setuppw}}
+    - id: sudo-with-password
+      description: Grants sudo but forgets NOPASSWD, so every later play would need a sudo password.
+      feedback: Key-only automation cannot answer a sudo prompt. The rule needs NOPASSWD.
+      expectFail: [passwordless-sudo, account-lon, account-man, account-lds]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 240
+        run: |
+          set -e
+          cd ~/branch-bootstrap
+          cat > bad.yml <<'EOF'
+          - hosts: branches
+            become: true
+            tasks:
+              - ansible.builtin.user: { name: ovauto, shell: /bin/bash }
+              - ansible.posix.authorized_key: { user: ovauto, key: "{{ lookup('file', '~/.ssh/id_ed25519.pub') }}" }
+              - ansible.builtin.copy: { dest: /etc/sudoers.d/ovauto, content: "ovauto ALL=(ALL) ALL\n", mode: "0440", validate: "/usr/sbin/visudo -cf %s" }
+          EOF
+          ansible-playbook -i inventory.yml bad.yml -u ovsetup -e ansible_password=Ov-setup-{{setuppw}} -e ansible_become_password=Ov-setup-{{setuppw}}
+    - id: key-for-installer
+      description: Installs the key for ovsetup instead of ovauto.
+      feedback: The key must open the ovauto account; the installer account is temporary.
+      expectFail: [ovauto-key, passwordless-sudo]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 240
+        run: |
+          set -e
+          cd ~/branch-bootstrap
+          cat > bad.yml <<'EOF'
+          - hosts: branches
+            become: true
+            tasks:
+              - ansible.builtin.user: { name: ovauto, shell: /bin/bash }
+              - ansible.posix.authorized_key: { user: ovsetup, key: "{{ lookup('file', '~/.ssh/id_ed25519.pub') }}" }
+              - ansible.builtin.copy: { dest: /etc/sudoers.d/ovauto, content: "ovauto ALL=(ALL) NOPASSWD: ALL\n", mode: "0440", validate: "/usr/sbin/visudo -cf %s" }
+          EOF
+          ansible-playbook -i inventory.yml bad.yml -u ovsetup -e ansible_password=Ov-setup-{{setuppw}} -e ansible_become_password=Ov-setup-{{setuppw}}
+  solution:
+    explanation: |
+      One play logs in as ovsetup with its password (`-k -K`, or the two connection
+      variables for a non-interactive run), escalates with sudo and uses three modules:
+      `user` for ovauto without a password, `authorized_key` for the control node's key,
+      and `copy` for `/etc/sudoers.d/ovauto` with mode 0440 and `visudo -cf %s` as the
+      validator. From then on plays connect as ovauto with the key and `become` needs no
+      password.
+    steps:
+      - on: ov-ctl
+        as: learner
+        timeoutSec: 240
+        run: |
+          set -e
+          cd ~/branch-bootstrap
+          cat > bootstrap.yml <<'EOF'
+          - name: Prepare branch gateways for key-only automation
+            hosts: branches
+            become: true
+            tasks:
+              - name: Automation account without a password
+                ansible.builtin.user:
+                  name: ovauto
+                  shell: /bin/bash
+              - name: Control node key for ovauto
+                ansible.posix.authorized_key:
+                  user: ovauto
+                  key: "{{ lookup('file', '~/.ssh/id_ed25519.pub') }}"
+              - name: Passwordless sudo for ovauto
+                ansible.builtin.copy:
+                  dest: /etc/sudoers.d/ovauto
+                  content: "ovauto ALL=(ALL) NOPASSWD: ALL\n"
+                  owner: root
+                  group: root
+                  mode: "0440"
+                  validate: /usr/sbin/visudo -cf %s
+          EOF
+          ansible-playbook -i inventory.yml bootstrap.yml -u ovsetup \
+            -e ansible_password=Ov-setup-{{setuppw}} -e ansible_become_password=Ov-setup-{{setuppw}}
+          ansible -i inventory.yml branches -u ovauto -b -m ansible.builtin.command -a 'id -u'
+    alternatives:
+      - id: adhoc
+        description: Three ad-hoc commands with -k and -K instead of a playbook.
+        steps:
+          - on: ov-ctl
+            as: learner
+            timeoutSec: 240
+            run: |
+              set -e
+              cd ~/branch-bootstrap
+              e="-u ovsetup -b -e ansible_password=Ov-setup-{{setuppw}} -e ansible_become_password=Ov-setup-{{setuppw}}"
+              ansible -i inventory.yml branches $e -m ansible.builtin.user -a 'name=ovauto shell=/bin/bash'
+              ansible -i inventory.yml branches $e -m ansible.posix.authorized_key -a "user=ovauto key='$(cat ~/.ssh/id_ed25519.pub)'"
+              ansible -i inventory.yml branches $e -m ansible.builtin.copy \
+                -a 'dest=/etc/sudoers.d/90-ovauto content="ovauto ALL=(ALL) NOPASSWD: ALL\n" mode=0440 validate="/usr/sbin/visudo -cf %s"'

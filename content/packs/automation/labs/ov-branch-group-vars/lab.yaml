@@ -1,0 +1,258 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ov-branch-group-vars
+  title: Resolve conflicting branch-office settings with group variables
+  domain: automation
+  frameworks: [ex294-aligned:core-components]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [ansible, variables, group_vars, host_vars, precedence]
+  version: 1
+spec:
+  description: |
+    The branch gateways send web traffic through a proxy, and the proxy depends on the
+    branch:
+
+    | Host(s) | Proxy |
+    |---|---|
+    | every branch gateway, by default | `10.40.0.{{defp}}` |
+    | the London branch (group `branch_lon`) | `10.40.0.{{lonp}}` |
+    | `ov-branch-test1`, a London test gateway | `10.40.0.{{testp}}` |
+
+    The project **`/home/learner/branch-proxy`** on `ov-ctl` has the inventory and the
+    playbook `proxy.yml`, which writes `/etc/ov/proxy.conf` from the variable
+    **`ov_proxy`**. Nobody has set that variable yet, so the playbook fails.
+
+    Define `ov_proxy` in **`group_vars/` and `host_vars/` files** of the project so that
+    `ansible-playbook proxy.yml`, with no extra variables, writes the right proxy on every
+    gateway. Do not change `inventory.yml` or `proxy.yml`. Run the playbook; the grader
+    runs it again and expects no changes.
+  objectives:
+    - Place variables in group_vars and host_vars next to the inventory
+    - Predict which value wins between all, a parent group, a child group and a host
+    - Keep data out of playbooks and inventories
+  params:
+    bootpw:
+      type: int
+      min: 100000
+      max: 999999
+    defp:
+      type: int
+      min: 1
+      max: 9
+    lonp:
+      type: int
+      min: 10
+      max: 49
+    testp:
+      type: int
+      min: 50
+      max: 99
+  topology:
+    entry: ov-ctl
+    nodes:
+      - { name: ov-ctl, driver: container, image: ansible-ctl:2.21, access: [shell] }
+      - { name: ov-branch-lon-gw, driver: container, image: deb-lab:24.04, resources: { cpu: 0.2, memoryMiB: 256 } }
+      - { name: ov-branch-test1, driver: container, image: el-lab:10, resources: { cpu: 0.2, memoryMiB: 256 } }
+      - { name: ov-branch-man-gw, driver: container, image: el-lab:10, resources: { cpu: 0.2, memoryMiB: 256 } }
+      - { name: ov-branch-lds-gw, driver: container, image: el-lab:10, resources: { cpu: 0.2, memoryMiB: 256 } }
+    links:
+      - { a: "ov-ctl:eth1", b: "ov-branch-lon-gw:eth1" }
+      - { a: "ov-ctl:eth2", b: "ov-branch-test1:eth1" }
+      - { a: "ov-ctl:eth3", b: "ov-branch-man-gw:eth1" }
+      - { a: "ov-ctl:eth4", b: "ov-branch-lds-gw:eth1" }
+  setup:
+    - on: ov-branch-lon-gw
+      run: &ov-node |
+        set -eu
+        case $(hostname) in
+          ov-branch-lon-gw) a=41 ;; ov-branch-man-gw) a=42 ;; ov-branch-lds-gw) a=43 ;; ov-branch-test1) a=44 ;;
+          *) echo "unknown host $(hostname)" >&2; exit 1 ;;
+        esac
+        ip link set eth1 up
+        ip addr replace 10.70.0.$a/24 dev eth1
+        id ovauto >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Orrin and Vale automation" ovauto
+        echo 'ovauto:Ov-boot-{{bootpw}}' | chpasswd
+        printf 'ovauto ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/ovauto
+        chmod 0440 /etc/sudoers.d/ovauto
+        ssh-keygen -A >/dev/null 2>&1
+        mkdir -p /run/sshd
+        pgrep -x sshd >/dev/null || /usr/sbin/sshd
+        install -d -m 0755 /etc/ov
+    - { on: ov-branch-test1, run: *ov-node }
+    - { on: ov-branch-man-gw, run: *ov-node }
+    - { on: ov-branch-lds-gw, run: *ov-node }
+    - on: ov-ctl
+      timeoutSec: 240
+      run: |
+        set -eu
+        ct-fleet-net 10.70.0.10/24 ov-branch-lon-gw=10.70.0.41 ov-branch-man-gw=10.70.0.42 ov-branch-lds-gw=10.70.0.43 ov-branch-test1=10.70.0.44
+        ct-ansible pushkey --seal ovauto Ov-boot-{{bootpw}} ov-branch-lon-gw ov-branch-man-gw ov-branch-lds-gw ov-branch-test1
+        p=/home/learner/branch-proxy
+        install -d -o learner -g learner $p
+        cat > $p/inventory.yml <<'EOF'
+        branches:
+          children:
+            branch_lon:
+              hosts:
+                ov-branch-lon-gw:
+                ov-branch-test1:
+            branch_north:
+              hosts:
+                ov-branch-man-gw:
+                ov-branch-lds-gw:
+        EOF
+        cat > $p/proxy.yml <<'EOF'
+        - name: Branch proxy settings
+          hosts: branches
+          become: true
+          tasks:
+            - name: Proxy configuration
+              ansible.builtin.copy:
+                dest: /etc/ov/proxy.conf
+                content: "proxy=http://{{ ov_proxy }}:3128\n"
+                mode: "0644"
+        EOF
+        printf '[defaults]\ninventory = inventory.yml\nremote_user = ovauto\n' > $p/ansible.cfg
+        chown learner:learner $p/inventory.yml $p/proxy.yml $p/ansible.cfg
+        sha256sum $p/inventory.yml $p/proxy.yml > /var/tmp/.ct-proxy.sum
+  checks:
+    - id: proxy-lon-gw
+      description: ov-branch-lon-gw uses the London proxy
+      type: shell
+      on: ov-branch-lon-gw
+      skills: [automation.data.variables]
+      command: &proxy cat /etc/ov/proxy.conf 2>/dev/null || echo missing
+      expect: { match: exact, value: "proxy=http://10.40.0.{{lonp}}:3128" }
+    - { id: proxy-test1, description: ov-branch-test1 uses its own test proxy, type: shell, on: ov-branch-test1, skills: [automation.data.variables], weight: 1.5, command: *proxy, expect: { match: exact, value: "proxy=http://10.40.0.{{testp}}:3128" } }
+    - { id: proxy-man-gw, description: ov-branch-man-gw uses the default proxy, type: shell, on: ov-branch-man-gw, skills: [automation.data.variables], command: *proxy, expect: { match: exact, value: "proxy=http://10.40.0.{{defp}}:3128" } }
+    - { id: proxy-lds-gw, description: ov-branch-lds-gw uses the default proxy, type: shell, on: ov-branch-lds-gw, skills: [automation.data.variables], command: *proxy, expect: { match: exact, value: "proxy=http://10.40.0.{{defp}}:3128" } }
+    - id: vars-in-var-files
+      description: inventory.yml and proxy.yml are unchanged, and ov_proxy is set in group_vars and host_vars files
+      type: shell
+      on: ov-ctl
+      skills: [automation.data.variables]
+      weight: 1.5
+      command: |
+        p=/home/learner/branch-proxy
+        sha256sum -c --quiet /var/tmp/.ct-proxy.sum >/dev/null 2>&1 && f=project-kept || f=project-edited
+        g=$(grep -rlE '^[[:space:]]*ov_proxy[[:space:]]*:' $p/group_vars 2>/dev/null | wc -l)
+        h=$(grep -rlE '^[[:space:]]*ov_proxy[[:space:]]*:' $p/host_vars 2>/dev/null | wc -l)
+        echo "$f group_vars=$([ "$g" -gt 0 ] && echo yes || echo no) host_vars=$([ "$h" -gt 0 ] && echo yes || echo no)"
+      expect: { match: exact, value: "project-kept group_vars=yes host_vars=yes" }
+    - id: rerun-no-changes
+      description: proxy.yml runs again with no extra variables and reports no changes
+      type: shell
+      on: ov-ctl
+      skills: [automation.data.variables]
+      weight: 2
+      timeoutSec: 180
+      command: ct-ansible recap /home/learner/branch-proxy proxy.yml
+      expect: { match: exact, value: "changed=0 failed=0 unreachable=0" }
+  hints:
+    - title: Where Ansible looks
+      body: |
+        Next to the inventory (and next to the playbook) Ansible reads
+        `group_vars/<group>.yml` (or a directory `group_vars/<group>/`) and
+        `host_vars/<host>.yml`. `group_vars/all.yml` applies to every host.
+      cost: 1
+    - title: Who wins
+      body: |
+        A host variable beats a group variable; a child group beats its parent group;
+        any group beats `all`. Check the result per host before running the play.
+      command: cd ~/branch-proxy && ansible-inventory --host ov-branch-test1
+      cost: 1
+    - title: No -e
+      body: Extra variables (-e) beat everything, so a single -e would give every gateway the same proxy, and the next normal run would undo it.
+      cost: 1
+  misconceptions:
+    - id: london-on-parent
+      description: Sets the London proxy on the parent group branches instead of branch_lon.
+      feedback: branches contains every gateway, so the north branches get the London proxy too. Set it on branch_lon.
+      expectFail: [proxy-man-gw, proxy-lds-gw]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 180
+        run: |
+          set -e
+          cd ~/branch-proxy && mkdir -p group_vars host_vars
+          echo 'ov_proxy: 10.40.0.{{defp}}' > group_vars/all.yml
+          echo 'ov_proxy: 10.40.0.{{lonp}}' > group_vars/branches.yml
+          echo 'ov_proxy: 10.40.0.{{testp}}' > host_vars/ov-branch-test1.yml
+          ansible-playbook proxy.yml
+    - id: values-in-inventory
+      description: Puts the three values into inventory.yml as group and host variables.
+      feedback: It works, but the data now lives in the inventory the network team owns. Keep it in group_vars and host_vars files.
+      expectFail: [vars-in-var-files]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 180
+        run: |
+          set -e
+          cd ~/branch-proxy
+          cat > inventory.yml <<'EOF'
+          branches:
+            vars:
+              ov_proxy: 10.40.0.{{defp}}
+            children:
+              branch_lon:
+                vars:
+                  ov_proxy: 10.40.0.{{lonp}}
+                hosts:
+                  ov-branch-lon-gw:
+                  ov-branch-test1:
+                    ov_proxy: 10.40.0.{{testp}}
+              branch_north:
+                hosts:
+                  ov-branch-man-gw:
+                  ov-branch-lds-gw:
+          EOF
+          ansible-playbook proxy.yml
+    - id: extra-vars
+      description: Runs the playbook once per proxy with -e and --limit instead of defining the variables.
+      feedback: The hosts look right, but nothing in the project knows the values; the next plain run fails. Put them in variable files.
+      expectFail: [vars-in-var-files, rerun-no-changes]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 240
+        run: |
+          set -e
+          cd ~/branch-proxy
+          ansible-playbook proxy.yml -e ov_proxy=10.40.0.{{defp}} --limit branch_north
+          ansible-playbook proxy.yml -e ov_proxy=10.40.0.{{lonp}} --limit ov-branch-lon-gw
+          ansible-playbook proxy.yml -e ov_proxy=10.40.0.{{testp}} --limit ov-branch-test1
+  solution:
+    explanation: |
+      `group_vars/all.yml` carries the default, `group_vars/branch_lon.yml` the London
+      value (a child group beats `all`) and `host_vars/ov-branch-test1.yml` the test
+      gateway's value (a host beats every group). The playbook then resolves `ov_proxy`
+      per host with no extra variables, and the second run changes nothing.
+    steps:
+      - on: ov-ctl
+        as: learner
+        timeoutSec: 180
+        run: |
+          set -e
+          cd ~/branch-proxy && mkdir -p group_vars host_vars
+          echo 'ov_proxy: 10.40.0.{{defp}}' > group_vars/all.yml
+          echo 'ov_proxy: 10.40.0.{{lonp}}' > group_vars/branch_lon.yml
+          echo 'ov_proxy: 10.40.0.{{testp}}' > host_vars/ov-branch-test1.yml
+          ansible-playbook proxy.yml
+    alternatives:
+      - id: directories
+        description: group_vars as directories, the default on the parent group branches.
+        steps:
+          - on: ov-ctl
+            as: learner
+            timeoutSec: 180
+            run: |
+              set -e
+              cd ~/branch-proxy && mkdir -p group_vars/branches group_vars/branch_lon host_vars/ov-branch-test1
+              printf -- '---\nov_proxy: "10.40.0.{{defp}}"\n' > group_vars/branches/proxy.yml
+              printf -- '---\nov_proxy: "10.40.0.{{lonp}}"\n' > group_vars/branch_lon/proxy.yml
+              printf -- '---\nov_proxy: "10.40.0.{{testp}}"\n' > host_vars/ov-branch-test1/proxy.yml
+              ansible-playbook proxy.yml

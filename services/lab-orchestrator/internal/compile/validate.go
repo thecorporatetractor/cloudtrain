@@ -17,6 +17,16 @@ var (
 	placeholderRe = regexp.MustCompile(`\{\{\s*([^{}\s]*)\s*\}\}`)
 )
 
+// literalPlaceholder reports whether the placeholder match m (name = its
+// captured name) is literal text rather than a param reference: written with
+// inner whitespace ("{{ name }}", the Jinja/Ansible style) and not naming a
+// declared param. "{{name}}" without whitespace is always a param reference,
+// so a typo there still fails validation; "{{ name }}" naming a declared
+// param is substituted like before.
+func literalPlaceholder(m, name string, declared func(string) bool) bool {
+	return m != "{{"+name+"}}" && !declared(name)
+}
+
 // validateSemantics checks cross references the JSON schema cannot express.
 func validateSemantics(s *labsv1.LabTemplateSpec) []Issue {
 	var issues []Issue
@@ -244,9 +254,14 @@ func validateSemantics(s *labsv1.LabTemplateSpec) []Issue {
 		}
 	}
 
-	// Placeholders must reference declared params.
+	// Placeholders must reference declared params ("{{ name }}" with inner
+	// whitespace and an undeclared name is literal Jinja, see literalPlaceholder).
+	declared := func(n string) bool { _, ok := s.Params[n]; return ok }
 	for _, ref := range placeholderRefs(s) {
-		if _, ok := s.Params[ref.name]; !ok {
+		if literalPlaceholder(ref.match, ref.name, declared) {
+			continue
+		}
+		if !declared(ref.name) {
 			add(ref.path, "undefined param {{%s}}", ref.name)
 		}
 	}
@@ -264,14 +279,14 @@ func hasClusterMember(c *labsv1.ClusterSpec, name string) bool {
 	return false
 }
 
-type placeholderRef struct{ path, name string }
+type placeholderRef struct{ path, name, match string }
 
 // placeholderRefs lists every {{name}} in the spec outside source and params.
 func placeholderRefs(s *labsv1.LabTemplateSpec) []placeholderRef {
 	var refs []placeholderRef
 	_, _ = walkStrings(s, func(path, v string) string {
 		for _, m := range placeholderRe.FindAllStringSubmatch(v, -1) {
-			refs = append(refs, placeholderRef{path: path, name: m[1]})
+			refs = append(refs, placeholderRef{path: path, name: m[1], match: m[0]})
 		}
 		return v
 	})

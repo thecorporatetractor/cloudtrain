@@ -1,0 +1,174 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xan-core-facts-hwreport
+  title: Write a hardware report from facts
+  domain: automation
+  frameworks: [ex294-aligned:core-components]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [exam, ansible, facts, templates]
+  version: 1
+spec:
+  description: |
+    **Exam environment.** You work as `learner` on the control node `control`. The
+    managed nodes are `node1` (group `dev`), `node2` (`test`), `node3` (`prod`, also in
+    `webservers`) and `node4` (`balancers`), all Enterprise Linux 10; the account
+    `devops` on every node accepts your SSH key and may use sudo without a password.
+    Packages come from each node's local repository. Every playbook you write is run
+    again by the grader (it must report no changes), then every node is rebooted before
+    the final checks.
+
+    Write **`/home/learner/exam/hwreport/hwreport.yml`** that creates **`/root/hwreport.txt`**
+    on every managed node with exactly these four lines, filled from Ansible facts:
+
+    ```
+    HOST=<inventory host name>
+    MEMORY=<total memory in MiB>
+    BIOS=<BIOS version>
+    DISK_{{disk}}=<size of disk {{disk}} as Ansible reports it, e.g. 2.00 GB>
+    ```
+
+    Write **`NONE`** for any value a host does not have. Run the playbook.
+  objectives:
+    - Read hardware facts
+    - Fall back to a default for missing facts
+  params:
+    disk:
+      type: choice
+      values: [vdb, vdc, vde, vdf]
+  topology:
+    entry: control
+    nodes:
+      - { name: control, driver: container, image: ansible-ctl:2.21, access: [shell] }
+      - { name: node1, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node2, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node3, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node4, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+  setup:
+    - on: node1
+      timeoutSec: 120
+      run: &exam-node |
+        set -eu
+        id devops >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Exam automation" devops
+        install -d -m 0700 -o devops -g devops /home/devops/.ssh
+        install -m 0600 -o devops -g devops /home/learner/.ssh/authorized_keys /home/devops/.ssh/authorized_keys
+        printf 'devops ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/devops
+        chmod 0440 /etc/sudoers.d/devops
+    - { on: node2, timeoutSec: 120, run: *exam-node }
+    - { on: node3, timeoutSec: 120, run: *exam-node }
+    - { on: node4, timeoutSec: 120, run: *exam-node }
+    - on: control
+      run: |
+        set -eu
+        p=/home/learner/exam/hwreport
+        install -d -o learner -g learner /home/learner/exam $p
+        cat > $p/inventory.yml <<'EOF'
+        dev:
+          hosts:
+            node1:
+        test:
+          hosts:
+            node2:
+        prod:
+          hosts:
+            node3:
+        balancers:
+          hosts:
+            node4:
+        webservers:
+          children:
+            prod:
+        EOF
+        printf '[defaults]\ninventory = inventory.yml\nremote_user = devops\n' > $p/ansible.cfg
+        chown -R learner:learner $p
+  checks:
+    - id: report-node1
+      description: /root/hwreport.txt on node1 matches the node's facts
+      type: shell
+      on: node1
+      skills: [automation.data.facts]
+      command: &report |
+        python3 - <<'PY'
+        import os, socket
+        def human(n):
+            for s in ["Bytes", "KB", "MB", "GB", "TB"]:
+                if n < 1024 or s == "TB":
+                    return "%.2f %s" % (n, s) if s != "Bytes" else "%.2f Bytes" % n
+                n /= 1024.0
+        mem = int(open("/proc/meminfo").read().split("MemTotal:")[1].split()[0]) // 1024
+        try:
+            bios = open("/sys/class/dmi/id/bios_version").read().strip() or "NONE"
+        except OSError:
+            bios = "NONE"
+        dev = "/sys/block/{{disk}}/size"
+        size = human(int(open(dev).read()) * 512) if os.path.exists(dev) else "NONE"
+        want = "HOST=%s\nMEMORY=%d\nBIOS=%s\nDISK_{{disk}}=%s" % (socket.gethostname().split(".")[0], mem, bios, size)
+        try:
+            got = open("/root/hwreport.txt").read().strip("\n")
+        except OSError:
+            print("missing"); raise SystemExit
+        print("match" if got == want else "differs")
+        PY
+      expect: { match: exact, value: match }
+    - { id: report-node2, description: /root/hwreport.txt on node2 matches the node's facts, type: shell, on: node2, skills: [automation.data.facts], command: *report, expect: { match: exact, value: match } }
+    - { id: report-node3, description: /root/hwreport.txt on node3 matches the node's facts, type: shell, on: node3, skills: [automation.data.facts], command: *report, expect: { match: exact, value: match } }
+    - { id: report-node4, description: /root/hwreport.txt on node4 matches the node's facts, type: shell, on: node4, skills: [automation.data.facts], command: *report, expect: { match: exact, value: match } }
+  exam:
+    rerun:
+      - on: control
+        timeoutSec: 600
+        run: |
+          r=$(ct-ansible recap /home/learner/exam/hwreport hwreport.yml)
+          echo "$r"
+          [ "$r" = "changed=0 failed=0 unreachable=0" ]
+  misconceptions:
+    - id: free-memory
+      description: Reports free memory (ansible_memfree_mb) instead of total memory.
+      feedback: MEMORY is the total memory, ansible_memtotal_mb.
+      expectFail: [report-node1, report-node2, report-node3, report-node4]
+      mutation:
+        on: control
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/exam/hwreport
+          cat > hwreport.yml <<'EOF'
+          - hosts: all
+            become: true
+            tasks:
+              - ansible.builtin.copy:
+                  dest: /root/hwreport.txt
+                  content: |
+                    HOST={{ inventory_hostname }}
+                    MEMORY={{ ansible_memfree_mb }}
+                    BIOS={{ ansible_bios_version | default('NONE', true) }}
+                    DISK_{{disk}}={{ ansible_devices['{{disk}}'].size if '{{disk}}' in ansible_devices else 'NONE' }}
+          EOF
+          ansible-playbook hwreport.yml
+  solution:
+    explanation: A copy (or template) with content built from ansible_memtotal_mb, ansible_bios_version and ansible_devices, with default('NONE') for missing keys.
+    steps:
+      - on: control
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/exam/hwreport
+          cat > hwreport.yml <<'EOF'
+          - name: Hardware report
+            hosts: all
+            become: true
+            tasks:
+              - name: /root/hwreport.txt
+                ansible.builtin.copy:
+                  dest: /root/hwreport.txt
+                  mode: "0644"
+                  content: |
+                    HOST={{ inventory_hostname }}
+                    MEMORY={{ ansible_memtotal_mb | default('NONE') }}
+                    BIOS={{ ansible_bios_version | default('NONE', true) }}
+                    DISK_{{disk}}={{ ansible_devices['{{disk}}'].size | default('NONE') if '{{disk}}' in ansible_devices else 'NONE' }}
+          EOF
+          ansible-playbook hwreport.yml

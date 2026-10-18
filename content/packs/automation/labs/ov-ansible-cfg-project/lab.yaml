@@ -1,0 +1,238 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ov-ansible-cfg-project
+  title: Set project defaults for the claims automation repository
+  domain: automation
+  frameworks: [ex294-aligned:config-inventory]
+  difficulty: easy
+  estimatedMinutes: 10
+  tags: [ansible, ansible-cfg, configuration, precedence, become]
+  version: 1
+spec:
+  description: |
+    Everyone on the claims team runs Ansible from the repository
+    `/home/learner/claims-automation` on `ov-ctl`, and everyone types the same options:
+    `-i inventory.yml -u ovauto -b`. Make the project self-contained instead.
+
+    Write **`/home/learner/claims-automation/ansible.cfg`** so that, when Ansible runs from
+    that directory, it uses:
+
+    | Setting | Value |
+    |---|---|
+    | inventory | the project's `inventory.yml` |
+    | remote user | `ovauto` |
+    | privilege escalation | on by default (become) |
+    | roles path | the project's `roles` directory |
+    | collections path | the project's `collections` directory |
+
+    `ansible-config dump --only-changed`, run in the project directory, must show exactly
+    these five settings and no others (besides `CONFIG_FILE`, the file it read). A
+    colleague's old `~/.ansible.cfg` is in your home directory; leave it where it is.
+
+    Then, from the project directory and with no options other than the module and its
+    argument, `ansible all -m ansible.builtin.command -a 'id -u'` must print `0` for all
+    four hosts.
+  objectives:
+    - Configure a project with ansible.cfg
+    - Know which configuration file Ansible reads, and that only one is read
+    - Inspect the effective configuration with ansible-config
+  params:
+    bootpw:
+      type: int
+      min: 100000
+      max: 999999
+    forks:
+      type: choice
+      values: ["15", "25", "40"]
+  topology:
+    entry: ov-ctl
+    nodes:
+      - { name: ov-ctl, driver: container, image: ansible-ctl:2.21, access: [shell] }
+      - { name: ov-claims-web1, driver: container, image: el-lab:10, resources: { cpu: 0.2, memoryMiB: 256 } }
+      - { name: ov-claims-web2, driver: container, image: el-lab:10, resources: { cpu: 0.2, memoryMiB: 256 } }
+      - { name: ov-db-1, driver: container, image: el-lab:10, resources: { cpu: 0.2, memoryMiB: 256 } }
+      - { name: ov-quote-api1, driver: container, image: deb-lab:24.04, resources: { cpu: 0.2, memoryMiB: 256 } }
+    links:
+      - { a: "ov-ctl:eth1", b: "ov-claims-web1:eth1" }
+      - { a: "ov-ctl:eth2", b: "ov-claims-web2:eth1" }
+      - { a: "ov-ctl:eth3", b: "ov-db-1:eth1" }
+      - { a: "ov-ctl:eth4", b: "ov-quote-api1:eth1" }
+  setup:
+    - on: ov-claims-web1
+      run: &ov-node |
+        set -eu
+        case $(hostname) in
+          ov-claims-web1) a=11 ;; ov-claims-web2) a=12 ;; ov-db-1) a=21 ;; ov-quote-api1) a=31 ;;
+          *) echo "unknown host $(hostname)" >&2; exit 1 ;;
+        esac
+        ip link set eth1 up
+        ip addr replace 10.70.0.$a/24 dev eth1
+        id ovauto >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Orrin and Vale automation" ovauto
+        echo 'ovauto:Ov-boot-{{bootpw}}' | chpasswd
+        printf 'ovauto ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/ovauto
+        chmod 0440 /etc/sudoers.d/ovauto
+        ssh-keygen -A >/dev/null 2>&1
+        mkdir -p /run/sshd
+        pgrep -x sshd >/dev/null || /usr/sbin/sshd
+    - { on: ov-claims-web2, run: *ov-node }
+    - { on: ov-db-1, run: *ov-node }
+    - { on: ov-quote-api1, run: *ov-node }
+    - on: ov-ctl
+      timeoutSec: 240
+      run: |
+        set -eu
+        ct-fleet-net 10.70.0.10/24 ov-claims-web1=10.70.0.11 ov-claims-web2=10.70.0.12 ov-db-1=10.70.0.21 ov-quote-api1=10.70.0.31
+        ct-ansible pushkey --seal ovauto Ov-boot-{{bootpw}} ov-claims-web1 ov-claims-web2 ov-db-1 ov-quote-api1
+        p=/home/learner/claims-automation
+        install -d -o learner -g learner $p $p/roles $p/collections
+        cat > $p/inventory.yml <<'EOF'
+        claims:
+          children:
+            claims_web:
+              hosts:
+                ov-claims-web1:
+                ov-claims-web2:
+            claims_db:
+              hosts:
+                ov-db-1:
+        quoting:
+          hosts:
+            ov-quote-api1:
+        EOF
+        printf '[defaults]\n# copied from the old jump host, 2019\nforks = {{forks}}\nremote_user = learner\n' > /home/learner/.ansible.cfg
+        chown learner:learner $p/inventory.yml /home/learner/.ansible.cfg
+  checks:
+    - id: project-config-read
+      description: Ansible run in the project directory reads the project's ansible.cfg
+      type: shell
+      on: ov-ctl
+      skills: [automation.foundations.config]
+      timeoutSec: 60
+      command: |
+        ct-ansible run /home/learner/claims-automation ansible-config dump --only-changed --format json 2>/dev/null \
+          | jq -r '.[] | select(.name? == "CONFIG_FILE") | .value' 2>/dev/null || echo unreadable
+      expect: { match: exact, value: /home/learner/claims-automation/ansible.cfg }
+    - id: settings-values
+      description: The five settings have the required values
+      type: shell
+      on: ov-ctl
+      skills: [automation.foundations.config]
+      weight: 2
+      timeoutSec: 60
+      command: |
+        p=/home/learner/claims-automation
+        ct-ansible run $p ansible-config dump --only-changed --format json 2>/dev/null | jq -r --arg p "$p" '
+          def v(n): (map(select(.name? == n)) | .[0].value);
+          def has(n; x): ((v(n) // []) | if type == "array" then index(x) != null else . == x end);
+          "inventory=" + (if has("DEFAULT_HOST_LIST"; $p + "/inventory.yml") then "ok" else "no" end)
+          + " user=" + (if v("DEFAULT_REMOTE_USER") == "ovauto" then "ok" else "no" end)
+          + " become=" + (if v("DEFAULT_BECOME") == true then "ok" else "no" end)
+          + " roles=" + (if has("DEFAULT_ROLES_PATH"; $p + "/roles") then "ok" else "no" end)
+          + " collections=" + (if has("COLLECTIONS_PATHS"; $p + "/collections") then "ok" else "no" end)' 2>/dev/null || echo unreadable
+      expect: { match: exact, value: "inventory=ok user=ok become=ok roles=ok collections=ok" }
+    - id: only-these-settings
+      description: No other setting is changed from its default
+      type: shell
+      on: ov-ctl
+      skills: [automation.foundations.config]
+      timeoutSec: 60
+      command: |
+        ct-ansible run /home/learner/claims-automation ansible-config dump --only-changed --format json 2>/dev/null \
+          | jq -r '[.[] | select(.name? and .name != "CONFIG_FILE") | .name] | sort | join(",")' 2>/dev/null || echo unreadable
+      expect: { match: exact, value: "COLLECTIONS_PATHS,DEFAULT_BECOME,DEFAULT_HOST_LIST,DEFAULT_REMOTE_USER,DEFAULT_ROLES_PATH" }
+    - id: runs-as-root
+      description: A bare ad-hoc command from the project runs as root on all four hosts
+      type: shell
+      on: ov-ctl
+      skills: [automation.foundations.config, automation.foundations.adhoc]
+      weight: 2
+      timeoutSec: 120
+      command: |
+        n=$(ct-ansible run /home/learner/claims-automation ansible all -m ansible.builtin.command -a 'id -u' -o 2>/dev/null | grep -cE '\(stdout\) 0$')
+        echo "root-on=$n"
+      expect: { match: exact, value: "root-on=4" }
+  hints:
+    - title: Which file does Ansible read?
+      body: |
+        Ansible reads the first of `$ANSIBLE_CONFIG`, `./ansible.cfg` (the current
+        directory), `~/.ansible.cfg` and `/etc/ansible/ansible.cfg`, and only that one:
+        files are not merged. `ansible --version` prints the file in use.
+      command: cd ~/claims-automation && ansible --version | grep 'config file'
+      cost: 1
+    - title: Section and key names
+      body: |
+        `inventory`, `remote_user`, `roles_path` and `collections_path` live in
+        `[defaults]`; `become` lives in `[privilege_escalation]`. `ansible-config list`
+        documents every key and its section. Relative paths are resolved from the
+        directory of the configuration file.
+      cost: 2
+    - title: Compare with the defaults
+      body: "`ansible-config dump --only-changed` lists only what differs from the built-in defaults, with the file each value came from."
+      command: cd ~/claims-automation && ansible-config dump --only-changed
+      cost: 1
+  misconceptions:
+    - id: home-config
+      description: Puts the settings into ~/.ansible.cfg instead of the project.
+      feedback: That works only for your account and only while no ansible.cfg sits in the current directory. The project must carry its own ansible.cfg.
+      expectFail: [project-config-read]
+      mutation:
+        on: ov-ctl
+        as: learner
+        run: |
+          printf '[defaults]\ninventory = /home/learner/claims-automation/inventory.yml\nremote_user = ovauto\nroles_path = /home/learner/claims-automation/roles\ncollections_path = /home/learner/claims-automation/collections\n[privilege_escalation]\nbecome = true\n' > ~/.ansible.cfg
+    - id: become-in-defaults
+      description: Writes become = true in the [defaults] section, where Ansible ignores it.
+      feedback: become belongs to [privilege_escalation]; in [defaults] it is not a valid key, so plays still run unprivileged.
+      expectFail: [settings-values, runs-as-root]
+      mutation:
+        on: ov-ctl
+        as: learner
+        run: |
+          printf '[defaults]\ninventory = inventory.yml\nremote_user = ovauto\nroles_path = roles\ncollections_path = collections\nbecome = true\n' > ~/claims-automation/ansible.cfg
+    - id: kept-old-settings
+      description: Copies the old file and adds to it, so the stale forks setting comes along.
+      feedback: The old forks value is now a project setting nobody asked for. Keep the project file to the five agreed settings.
+      expectFail: [only-these-settings]
+      mutation:
+        on: ov-ctl
+        as: learner
+        run: |
+          { echo '[defaults]'; echo 'forks = {{forks}}'; printf 'inventory = inventory.yml\nremote_user = ovauto\nroles_path = roles\ncollections_path = collections\n[privilege_escalation]\nbecome = true\n'; } > ~/claims-automation/ansible.cfg
+  solution:
+    explanation: |
+      The project file needs `[defaults]` with `inventory`, `remote_user`, `roles_path`
+      and `collections_path`, and `[privilege_escalation]` with `become = true`. Because
+      `./ansible.cfg` comes before `~/.ansible.cfg`, the old file is simply not read from
+      the project directory, so its `forks` and `remote_user` do not leak in.
+    steps:
+      - on: ov-ctl
+        as: learner
+        timeoutSec: 120
+        run: |
+          set -e
+          cd ~/claims-automation
+          cat > ansible.cfg <<'EOF'
+          [defaults]
+          inventory = /home/learner/claims-automation/inventory.yml
+          remote_user = ovauto
+          roles_path = /home/learner/claims-automation/roles
+          collections_path = /home/learner/claims-automation/collections
+
+          [privilege_escalation]
+          become = true
+          EOF
+          ansible-config dump --only-changed
+          ansible all -m ansible.builtin.command -a 'id -u'
+    alternatives:
+      - id: relative-paths
+        description: Paths relative to the configuration file, and an explicit become flag spelled True.
+        steps:
+          - on: ov-ctl
+            as: learner
+            timeoutSec: 120
+            run: |
+              set -e
+              cd ~/claims-automation
+              printf '[defaults]\ninventory = ./inventory.yml\nremote_user = ovauto\nroles_path = ./roles\ncollections_path = ./collections\n\n[privilege_escalation]\nbecome = True\n' > ansible.cfg
+              ansible all -m ansible.builtin.command -a 'id -u'

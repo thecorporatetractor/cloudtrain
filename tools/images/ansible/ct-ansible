@@ -1,0 +1,59 @@
+#!/bin/bash
+# ct-ansible: grading and setup helper for Ansible labs. Checks run as root; every command
+# here runs as the learner with the learner's login environment (HOME, ~/.ssh), the same way
+# the platform runs learner actions.
+#
+#   ct-ansible recap DIR PLAYBOOK [ARGS...]  run ansible-playbook in DIR, print the PLAY RECAP
+#                                           totals "changed=N failed=N unreachable=N", or "error"
+#                                           when the run produced no recap (syntax error, no file)
+#   ct-ansible run DIR CMD...                any command in DIR as the learner (exit code passed through)
+#   ct-ansible pushkey [--seal] USER PASSWORD HOST...
+#                                           install the learner's ~/.ssh/id_ed25519.pub into
+#                                           USER@HOST's authorized_keys with a password login
+#                                           (sshpass + ssh-copy-id), for lab setup; --seal then
+#                                           removes USER's password (key-only from then on;
+#                                           needs passwordless sudo for USER on HOST)
+set -uo pipefail
+learner() {
+  if [[ $(id -u) == 0 ]]; then
+    runuser -u learner -- env -i HOME=/home/learner USER=learner LOGNAME=learner SHELL=/bin/bash \
+      PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin TERM=dumb LANG=C.UTF-8 LC_ALL=C.UTF-8 "$@"
+  else
+    "$@"
+  fi
+}
+cmd=${1:-}
+case $cmd in
+  recap)
+    dir=${2:-}; pb=${3:-}
+    [[ -n $dir && -n $pb ]] || { echo "usage: ct-ansible recap DIR PLAYBOOK [ARGS...]" >&2; exit 2; }
+    shift 3
+    [[ -d $dir ]] || { echo error; exit 0; }
+    out=$(learner bash -c 'cd "$1" && shift && ANSIBLE_NOCOLOR=1 ANSIBLE_STDOUT_CALLBACK=ansible.builtin.default ANSIBLE_RETRY_FILES_ENABLED=0 ansible-playbook "$@" 2>&1' ct-ansible "$dir" "$pb" "$@")
+    awk '/^PLAY RECAP/ {r=1; next}
+         r && /:/ { for (i = 1; i <= NF; i++) { split($i, kv, "="); if (kv[1] == "changed") c += kv[2]; if (kv[1] == "failed") f += kv[2]; if (kv[1] == "unreachable") u += kv[2] } n++ }
+         END { if (n) printf "changed=%d failed=%d unreachable=%d\n", c, f, u; else print "error" }' <<<"$out" ;;
+  run)
+    dir=${2:-}
+    [[ -n $dir ]] || { echo "usage: ct-ansible run DIR CMD..." >&2; exit 2; }
+    shift 2
+    learner bash -c 'cd "$1" && shift && "$@"' ct-ansible "$dir" "$@" ;;
+  pushkey)
+    shift; seal=0
+    [[ ${1:-} == --seal ]] && { seal=1; shift; }
+    user=${1:-}; pass=${2:-}
+    [[ -n $user && -n $pass && $# -ge 3 ]] || { echo "usage: ct-ansible pushkey [--seal] USER PASSWORD HOST..." >&2; exit 2; }
+    shift 2
+    rc=0
+    for h in "$@"; do
+      if ! learner env SSHPASS="$pass" sshpass -e ssh-copy-id -f -i /home/learner/.ssh/id_ed25519.pub \
+        -o StrictHostKeyChecking=yes -o PreferredAuthentications=password -o PubkeyAuthentication=no \
+        "$user@$h" >/dev/null 2>&1; then echo "pushkey: $user@$h failed" >&2; rc=1; continue; fi
+      if ((seal)); then
+        learner ssh -o BatchMode=yes "$user@$h" "sudo -n usermod -p '*' $user" >/dev/null 2>&1 \
+          || { echo "pushkey: sealing $user@$h failed" >&2; rc=1; }
+      fi
+    done
+    exit $rc ;;
+  *) echo "usage: ct-ansible recap|run|pushkey ..." >&2; exit 2 ;;
+esac

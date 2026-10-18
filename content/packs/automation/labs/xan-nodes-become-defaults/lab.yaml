@@ -1,0 +1,160 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xan-nodes-become-defaults
+  title: Set privilege escalation defaults for the project
+  domain: automation
+  frameworks: [ex294-aligned:managed-nodes]
+  difficulty: medium
+  estimatedMinutes: 10
+  tags: [exam, ansible, become, ansible-cfg, group_vars]
+  version: 1
+spec:
+  description: |
+    **Exam environment.** You work as `learner` on the control node `control`. The
+    managed nodes are `node1` (group `dev`), `node2` (`test`), `node3` (`prod`, also in
+    `webservers`) and `node4` (`balancers`), all Enterprise Linux 10; the account
+    `devops` on every node accepts your SSH key and may use sudo without a password.
+    Packages come from each node's local repository. Every playbook you write is run
+    again by the grader (it must report no changes), then every node is rebooted before
+    the final checks.
+
+    The project **`/home/learner/exam/become`** has an inventory with an extra group
+    **`reporting`** (`node2`). Configure the project so that:
+
+    - plays and ad-hoc commands escalate to **root with sudo by default**, never prompting
+      for a password;
+    - hosts in the **`reporting`** group always run **unprivileged** (as `devops`), even
+      though the default is to escalate.
+
+    Then write **`whoami.yml`** in the project that runs `whoami` on every node and saves
+    its output in **`/var/tmp/exam-whoami.txt`** on that node, and run it.
+  objectives:
+    - Configure privilege escalation defaults
+    - Override them for a group with a behavioural inventory variable
+  topology:
+    entry: control
+    nodes:
+      - { name: control, driver: container, image: ansible-ctl:2.21, access: [shell] }
+      - { name: node1, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node2, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node3, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node4, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+  setup:
+    - on: node1
+      timeoutSec: 120
+      run: &exam-node |
+        set -eu
+        id devops >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Exam automation" devops
+        install -d -m 0700 -o devops -g devops /home/devops/.ssh
+        install -m 0600 -o devops -g devops /home/learner/.ssh/authorized_keys /home/devops/.ssh/authorized_keys
+        printf 'devops ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/devops
+        chmod 0440 /etc/sudoers.d/devops
+    - { on: node2, timeoutSec: 120, run: *exam-node }
+    - { on: node3, timeoutSec: 120, run: *exam-node }
+    - { on: node4, timeoutSec: 120, run: *exam-node }
+    - on: control
+      run: |
+        set -eu
+        p=/home/learner/exam/become
+        install -d -o learner -g learner /home/learner/exam $p
+        cat > $p/inventory.yml <<'EOF'
+        dev:
+          hosts:
+            node1:
+        test:
+          hosts:
+            node2:
+        prod:
+          hosts:
+            node3:
+        balancers:
+          hosts:
+            node4:
+        webservers:
+          children:
+            prod:
+        EOF
+        printf '[defaults]\ninventory = inventory.yml\nremote_user = devops\n' > $p/ansible.cfg
+        printf 'reporting:\n  hosts:\n    node2:\n' >> $p/inventory.yml
+        chown -R learner:learner $p
+  checks:
+    - id: adhoc-defaults
+      description: A bare ad-hoc whoami from the project runs as root everywhere except on the reporting host
+      type: shell
+      on: control
+      skills: [automation.inventory.bootstrap]
+      weight: 2
+      timeoutSec: 120
+      command: |
+        ct-ansible run /home/learner/exam/become ansible all -m ansible.builtin.command -a whoami -o 2>/dev/null \
+          | sed -nE 's/^(node[0-9]) \| CHANGED.*\(stdout\) (.*)$/\1=\2/p' | sort | tr '\n' ' ' | sed 's/ $//'
+      expect: { match: exact, value: "node1=root node2=devops node3=root node4=root" }
+    - id: whoami-node1
+      description: /var/tmp/exam-whoami.txt on node1 says root
+      type: shell
+      on: node1
+      skills: [automation.inventory.bootstrap]
+      command: &who cat /var/tmp/exam-whoami.txt 2>/dev/null || echo missing
+      expect: { match: exact, value: root }
+    - { id: whoami-node2, description: /var/tmp/exam-whoami.txt on node2 says devops, type: shell, on: node2, skills: [automation.inventory.bootstrap], command: *who, expect: { match: exact, value: devops } }
+    - { id: whoami-node3, description: /var/tmp/exam-whoami.txt on node3 says root, type: shell, on: node3, skills: [automation.inventory.bootstrap], command: *who, expect: { match: exact, value: root } }
+  exam:
+    rerun:
+      - on: control
+        timeoutSec: 600
+        run: |
+          r=$(ct-ansible recap /home/learner/exam/become whoami.yml)
+          echo "$r"
+          [ "$r" = "changed=0 failed=0 unreachable=0" ]
+  misconceptions:
+    - id: become-everywhere
+      description: Turns become on for everyone and forgets the reporting exception.
+      feedback: The reporting group must run unprivileged; set ansible_become false for it.
+      expectFail: [adhoc-defaults, whoami-node2]
+      mutation:
+        on: control
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/exam/become
+          printf '[defaults]\ninventory = inventory.yml\nremote_user = devops\n[privilege_escalation]\nbecome = true\nbecome_method = sudo\nbecome_user = root\nbecome_ask_pass = false\n' > ansible.cfg
+          cat > whoami.yml <<'EOF'
+          - hosts: all
+            tasks:
+              - ansible.builtin.command: whoami
+                register: who
+                changed_when: false
+              - ansible.builtin.copy: { dest: /var/tmp/exam-whoami.txt, content: "{{ who.stdout }}" }
+          EOF
+          ansible-playbook whoami.yml
+  solution:
+    explanation: |
+      [privilege_escalation] in ansible.cfg turns become on with sudo, root and no prompt;
+      group_vars/reporting.yml sets ansible_become false, which beats the configuration
+      default for those hosts.
+    steps:
+      - on: control
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/exam/become
+          printf '[defaults]\ninventory = inventory.yml\nremote_user = devops\n\n[privilege_escalation]\nbecome = true\nbecome_method = sudo\nbecome_user = root\nbecome_ask_pass = false\n' > ansible.cfg
+          mkdir -p group_vars && echo 'ansible_become: false' > group_vars/reporting.yml
+          cat > whoami.yml <<'EOF'
+          - name: Who runs the tasks
+            hosts: all
+            tasks:
+              - name: whoami
+                ansible.builtin.command: whoami
+                register: who
+                changed_when: false
+              - name: Save it
+                ansible.builtin.copy:
+                  dest: /var/tmp/exam-whoami.txt
+                  content: "{{ who.stdout }}"
+                  mode: "0644"
+          EOF
+          ansible-playbook whoami.yml

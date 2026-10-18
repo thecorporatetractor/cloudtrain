@@ -1,0 +1,178 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xan-sys-cron-at
+  title: Schedule a recurring and a one-off job
+  domain: automation
+  frameworks: [ex294-aligned:automate-system-tasks]
+  difficulty: easy
+  estimatedMinutes: 10
+  tags: [exam, ansible, cron, at]
+  version: 1
+spec:
+  description: |
+    **Exam environment.** You work as `learner` on the control node `control`. The
+    managed nodes are `node1` (group `dev`), `node2` (`test`), `node3` (`prod`, also in
+    `webservers`) and `node4` (`balancers`), all Enterprise Linux 10; the account
+    `devops` on every node accepts your SSH key and may use sudo without a password.
+    Packages come from each node's local repository. Every playbook you write is run
+    again by the grader (it must report no changes), then every node is rebooted before
+    the final checks.
+
+    Write **`/home/learner/exam/schedule/schedule.yml`** that, on the **dev** hosts:
+
+    - installs a cron job for the user **`{{cuser}}`** (it exists) that runs
+      `logger "EXAM heartbeat {{beat}}"` **every two minutes**; re-running the playbook must
+      not add a second entry;
+    - schedules a one-off **at** job, run by root **30 minutes** from now, that runs
+      `touch /var/tmp/exam-at-marker`; re-running must not queue a second one.
+
+    The cron job and the queued at job must still be there after a reboot. Run the playbook.
+  objectives:
+    - Manage cron entries idempotently
+    - Queue one-off jobs with at
+  params:
+    cuser:
+      type: choice
+      values: [natasha, harry, sarah]
+    beat:
+      type: int
+      min: 10
+      max: 99
+  topology:
+    entry: control
+    nodes:
+      - { name: control, driver: container, image: ansible-ctl:2.21, access: [shell] }
+      - { name: node1, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node2, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node3, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node4, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+  setup:
+    - on: node1
+      timeoutSec: 120
+      run: &exam-node |
+        set -eu
+        id devops >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Exam automation" devops
+        install -d -m 0700 -o devops -g devops /home/devops/.ssh
+        install -m 0600 -o devops -g devops /home/learner/.ssh/authorized_keys /home/devops/.ssh/authorized_keys
+        printf 'devops ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/devops
+        chmod 0440 /etc/sudoers.d/devops
+    - { on: node2, timeoutSec: 120, run: *exam-node }
+    - { on: node3, timeoutSec: 120, run: *exam-node }
+    - { on: node4, timeoutSec: 120, run: *exam-node }
+    - on: node1
+      timeoutSec: 120
+      run: id {{cuser}} >/dev/null 2>&1 || useradd -m {{cuser}}
+    - on: control
+      run: |
+        set -eu
+        p=/home/learner/exam/schedule
+        install -d -o learner -g learner /home/learner/exam $p
+        cat > $p/inventory.yml <<'EOF'
+        dev:
+          hosts:
+            node1:
+        test:
+          hosts:
+            node2:
+        prod:
+          hosts:
+            node3:
+        balancers:
+          hosts:
+            node4:
+        webservers:
+          children:
+            prod:
+        EOF
+        printf '[defaults]\ninventory = inventory.yml\nremote_user = devops\n' > $p/ansible.cfg
+        chown -R learner:learner $p
+  checks:
+    - id: cron-entry
+      description: "{{cuser}} has exactly one every-two-minutes heartbeat entry on node1"
+      type: shell
+      on: node1
+      skills: [automation.modules.scheduling]
+      weight: 2
+      command: |
+        n=$(crontab -l -u {{cuser}} 2>/dev/null | grep -v '^#' | grep -cE '^\*/2[[:space:]]+\*[[:space:]]+\*[[:space:]]+\*[[:space:]]+\*[[:space:]]+logger "EXAM heartbeat {{beat}}"$')
+        echo "entries=$n"
+      expect: { match: exact, value: entries=1 }
+    - id: at-job
+      description: Exactly one queued at job on node1 touches the marker file
+      type: shell
+      on: node1
+      skills: [automation.modules.scheduling]
+      weight: 2
+      command: |
+        command -v atq >/dev/null || { echo no-at; exit 0; }
+        n=0; for j in $(atq 2>/dev/null | awk '{print $1}'); do at -c $j 2>/dev/null | grep -q 'touch /var/tmp/exam-at-marker' && n=$((n+1)); done
+        systemctl is-enabled atd >/dev/null 2>&1 && e=atd-enabled || e=atd-disabled
+        echo "jobs=$n $e"
+      expect: { match: exact, value: jobs=1 atd-enabled }
+  exam:
+    rerun:
+      - on: control
+        timeoutSec: 600
+        run: |
+          r=$(ct-ansible recap /home/learner/exam/schedule schedule.yml)
+          echo "$r"
+          [ "$r" = "changed=0 failed=0 unreachable=0" ]
+  misconceptions:
+    - id: shell-cron
+      description: Appends the entry with a shell pipe into crontab, which duplicates it on every run.
+      feedback: The cron module keeps one named entry; a shell append adds one per run.
+      expectFail: [cron-entry]
+      mutation:
+        on: control
+        as: learner
+        timeoutSec: 600
+        run: |
+          cd ~/exam/schedule
+          cat > schedule.yml <<'EOF'
+          - hosts: dev
+            become: true
+            tasks:
+              - ansible.builtin.shell: (crontab -l -u {{cuser}} 2>/dev/null; echo '*/2 * * * * logger "EXAM heartbeat {{beat}}"') | crontab -u {{cuser}} -
+              - ansible.builtin.dnf: { name: at, state: present }
+              - ansible.builtin.service: { name: atd, state: started, enabled: true }
+              - ansible.posix.at: { command: touch /var/tmp/exam-at-marker, count: 30, units: minutes, unique: true }
+          EOF
+          ansible-playbook schedule.yml && ansible-playbook schedule.yml
+  solution:
+    explanation: ansible.builtin.cron with a name and minute */2 for the user; at needs the at package and atd enabled; ansible.posix.at with unique true queues it once.
+    steps:
+      - on: control
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/exam/schedule
+          cat > schedule.yml <<'EOF'
+          - name: Scheduled jobs on dev
+            hosts: dev
+            become: true
+            tasks:
+              - name: Heartbeat every two minutes
+                ansible.builtin.cron:
+                  name: exam heartbeat
+                  user: "{{cuser}}"
+                  minute: "*/2"
+                  job: logger "EXAM heartbeat {{beat}}"
+              - name: at is installed
+                ansible.builtin.dnf:
+                  name: at
+                  state: present
+              - name: atd runs at boot
+                ansible.builtin.service:
+                  name: atd
+                  state: started
+                  enabled: true
+              - name: One-off marker in 30 minutes
+                ansible.posix.at:
+                  command: touch /var/tmp/exam-at-marker
+                  count: 30
+                  units: minutes
+                  unique: true
+          EOF
+          ansible-playbook schedule.yml

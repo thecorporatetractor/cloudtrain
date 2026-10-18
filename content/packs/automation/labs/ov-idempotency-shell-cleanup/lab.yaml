@@ -1,0 +1,337 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ov-idempotency-shell-cleanup
+  title: Make a noisy playbook idempotent
+  domain: automation
+  frameworks: [ex294-aligned:core-components]
+  difficulty: medium
+  estimatedMinutes: 25
+  tags: [ansible, idempotency, shell, lineinfile, file, user, changed_when]
+  version: 1
+spec:
+  description: |
+    The legacy playbook **`/home/learner/claims-automation/hardening.yml`** has been applied
+    to the whole fleet. It does its job, but it shells out for everything, so every run
+    reports every task as `changed` on every host. Nobody can tell a real change from noise
+    any more, and change reviews have stopped reading the output.
+
+    Rewrite `hardening.yml` **in place** so that:
+
+    - the end state on every host stays exactly what the legacy playbook produces today
+      (files, contents, owners, modes, the `ovaudit` account), and
+    - a run against hosts that are already hardened reports **`changed=0`** (the grader
+      runs your playbook again).
+
+    Prefer modules over `shell`/`command`. Where a command is unavoidable, make it report a
+    change only when it really changed something. Do not make tasks lie: a task that
+    modifies something on every run is still not idempotent, whatever it reports.
+  objectives:
+    - Recognise why shell and command tasks are never idempotent by themselves
+    - Replace shell tasks with copy, lineinfile, user and file
+    - Use creates, changed_when and file time preservation correctly
+  params:
+    bootpw:
+      type: int
+      min: 100000
+      max: 999999
+  topology:
+    entry: ov-ctl
+    nodes:
+      - { name: ov-ctl, driver: container, image: ansible-ctl:2.21, access: [shell] }
+      - { name: ov-claims-web1, driver: container, image: el-lab:10, resources: { cpu: 0.2, memoryMiB: 256 } }
+      - { name: ov-claims-web2, driver: container, image: el-lab:10, resources: { cpu: 0.2, memoryMiB: 256 } }
+      - { name: ov-db-1, driver: container, image: el-lab:10, resources: { cpu: 0.2, memoryMiB: 256 } }
+      - { name: ov-quote-api1, driver: container, image: deb-lab:24.04, resources: { cpu: 0.2, memoryMiB: 256 } }
+    links:
+      - { a: "ov-ctl:eth1", b: "ov-claims-web1:eth1" }
+      - { a: "ov-ctl:eth2", b: "ov-claims-web2:eth1" }
+      - { a: "ov-ctl:eth3", b: "ov-db-1:eth1" }
+      - { a: "ov-ctl:eth4", b: "ov-quote-api1:eth1" }
+  setup:
+    - on: ov-claims-web1
+      run: &ov-node |
+        set -eu
+        case $(hostname) in
+          ov-claims-web1) a=11 ;; ov-claims-web2) a=12 ;; ov-db-1) a=21 ;; ov-quote-api1) a=31 ;;
+          *) echo "unknown host $(hostname)" >&2; exit 1 ;;
+        esac
+        ip link set eth1 up
+        ip addr replace 10.70.0.$a/24 dev eth1
+        id ovauto >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Orrin and Vale automation" ovauto
+        echo 'ovauto:Ov-boot-{{bootpw}}' | chpasswd
+        printf 'ovauto ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/ovauto
+        chmod 0440 /etc/sudoers.d/ovauto
+        ssh-keygen -A >/dev/null 2>&1
+        mkdir -p /run/sshd
+        pgrep -x sshd >/dev/null || /usr/sbin/sshd
+        install -d -m 0755 /etc/sysctl.d /etc/profile.d
+    - { on: ov-claims-web2, run: *ov-node }
+    - { on: ov-db-1, run: *ov-node }
+    - { on: ov-quote-api1, run: *ov-node }
+    - on: ov-ctl
+      timeoutSec: 240
+      run: |
+        set -eu
+        ct-fleet-net 10.70.0.10/24 ov-claims-web1=10.70.0.11 ov-claims-web2=10.70.0.12 ov-db-1=10.70.0.21 ov-quote-api1=10.70.0.31
+        ct-ansible pushkey --seal ovauto Ov-boot-{{bootpw}} ov-claims-web1 ov-claims-web2 ov-db-1 ov-quote-api1
+        p=/home/learner/claims-automation
+        install -d -o learner -g learner $p
+        cat > $p/inventory.yml <<'EOF'
+        claims:
+          children:
+            claims_web:
+              hosts:
+                ov-claims-web1:
+                ov-claims-web2:
+            claims_db:
+              hosts:
+                ov-db-1:
+        quoting:
+          hosts:
+            ov-quote-api1:
+        EOF
+        printf '[defaults]\ninventory = inventory.yml\nremote_user = ovauto\n' > $p/ansible.cfg
+        chown learner:learner $p/inventory.yml $p/ansible.cfg
+    - on: ov-ctl
+      file: { path: /home/learner/claims-automation/hardening.yml, source: assets/hardening.yml, mode: "0644" }
+    - { on: ov-ctl, run: chown learner:learner /home/learner/claims-automation/hardening.yml }
+    - on: ov-ctl
+      as: learner
+      timeoutSec: 300
+      run: |
+        set -e
+        cd ~/claims-automation
+        ansible-playbook hardening.yml >/dev/null
+  checks:
+    - id: state-web1
+      description: ov-claims-web1 is still hardened exactly as before
+      type: shell
+      on: ov-claims-web1
+      skills: [automation.modules.files]
+      command: &hardened |
+        r=""
+        [ "$(cat /etc/sysctl.d/90-ov-hardening.conf 2>/dev/null)" = "net.ipv4.conf.all.accept_redirects = 0" ] || r="$r sysctl"
+        [ "$(grep -cE '^[[:space:]]*PermitRootLogin[[:space:]]' /etc/ssh/sshd_config)" = 1 ] && grep -qE '^PermitRootLogin no$' /etc/ssh/sshd_config || r="$r sshd"
+        u=$(getent passwd ovaudit) || r="$r user"
+        if [ -n "$u" ]; then [ "$(echo "$u" | cut -d: -f3)" -lt 1000 ] && case $(echo "$u" | cut -d: -f7) in */nologin) true ;; *) false ;; esac || r="$r user"; fi
+        [ "$(stat -c '%U %G %a' /var/log/ov-audit 2>/dev/null)" = "ovaudit root 750" ] || r="$r logdir"
+        [ "$(cat /etc/issue.net 2>/dev/null)" = "Orrin & Vale Insurance: authorised use only" ] || r="$r issue"
+        [ "$(grep -c '^umask 027$' /etc/profile.d/ov.sh 2>/dev/null)" = 1 ] || r="$r umask"
+        [ "$(stat -c %a /etc/crontab 2>/dev/null)" = 600 ] || r="$r crontab"
+        [ -f /etc/ov/hardened ] || r="$r marker"
+        echo "${r:-hardened}"
+      expect: { match: exact, value: hardened }
+    - { id: state-web2, description: ov-claims-web2 is still hardened exactly as before, type: shell, on: ov-claims-web2, skills: [automation.modules.files], command: *hardened, expect: { match: exact, value: hardened } }
+    - { id: state-db1, description: ov-db-1 is still hardened exactly as before, type: shell, on: ov-db-1, skills: [automation.modules.files], command: *hardened, expect: { match: exact, value: hardened } }
+    - { id: state-quote1, description: ov-quote-api1 is still hardened exactly as before, type: shell, on: ov-quote-api1, skills: [automation.modules.files], command: *hardened, expect: { match: exact, value: hardened } }
+    - id: rerun-no-changes
+      description: hardening.yml runs cleanly again and reports no changes
+      type: shell
+      on: ov-ctl
+      skills: [automation.modules.avoid-shell]
+      weight: 3
+      timeoutSec: 300
+      command: ct-ansible recap /home/learner/claims-automation hardening.yml
+      expect: { match: exact, value: "changed=0 failed=0 unreachable=0" }
+  hints:
+    - title: Find the noisy tasks
+      body: Run the playbook and look at which tasks say changed. With --diff, the modules that really change files show what they changed; shell tasks show nothing, they just always say changed.
+      command: cd ~/claims-automation && ansible-playbook hardening.yml --diff
+      cost: 1
+    - title: A module for each job
+      body: |
+        Whole files: `ansible.builtin.copy` with `content`. One line in a file:
+        `ansible.builtin.lineinfile` (with `regexp` to replace a commented line). Accounts:
+        `ansible.builtin.user` (`system`, `shell`, `create_home`). Directories, modes and
+        owners: `ansible.builtin.file`.
+      cost: 2
+    - title: Touching without changing
+      body: "`file: state=touch` updates the timestamps, which is a change on every run. Keep the times with `access_time: preserve` and `modification_time: preserve`, so only a missing file counts as a change."
+      cost: 2
+  misconceptions:
+    - id: legacy-kept
+      description: Leaves the legacy shell tasks in place.
+      feedback: Every shell task still reports changed on every run.
+      expectFail: [rerun-no-changes]
+      mutation:
+        on: ov-ctl
+        as: learner
+        run: "true"
+    - id: lying-changed-when
+      description: Silences the tasks with changed_when false but keeps an unguarded append, which adds a line on every run.
+      feedback: changed_when only changes what Ansible reports. An echo >> without a guard still appends a line each run, so the file drifts while the report says nothing changed.
+      expectFail: [state-web1, state-web2, state-db1, state-quote1]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/claims-automation
+          sed -i "s/grep -q '^umask 027' \/etc\/profile.d\/ov.sh || echo/echo/" hardening.yml
+          sed -i 's/^\(      ansible.builtin.\(shell\|command\): .*\)$/\1\n      changed_when: false/' hardening.yml
+          ansible-playbook hardening.yml >/dev/null
+    - id: touch-every-run
+      description: Replaces the marker task with file state=touch without preserving the times.
+      feedback: state=touch sets new timestamps on every run, which Ansible rightly reports as a change.
+      expectFail: [rerun-no-changes]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/claims-automation
+          cat > hardening.yml <<'EOF'
+          - name: Baseline hardening
+            hosts: all
+            become: true
+            tasks:
+              - name: Ignore ICMP redirects
+                ansible.builtin.copy:
+                  dest: /etc/sysctl.d/90-ov-hardening.conf
+                  content: "net.ipv4.conf.all.accept_redirects = 0\n"
+                  mode: "0644"
+              - name: No root logins over SSH
+                ansible.builtin.lineinfile:
+                  path: /etc/ssh/sshd_config
+                  regexp: '^#?PermitRootLogin'
+                  line: PermitRootLogin no
+              - name: Audit service account
+                ansible.builtin.user:
+                  name: ovaudit
+                  system: true
+                  create_home: false
+                  shell: /sbin/nologin
+              - name: Audit log directory
+                ansible.builtin.file:
+                  path: /var/log/ov-audit
+                  state: directory
+                  owner: ovaudit
+                  group: root
+                  mode: "0750"
+              - name: Network login banner
+                ansible.builtin.copy:
+                  dest: /etc/issue.net
+                  content: "Orrin & Vale Insurance: authorised use only\n"
+              - name: Restrictive default umask
+                ansible.builtin.lineinfile:
+                  path: /etc/profile.d/ov.sh
+                  line: umask 027
+                  create: true
+              - name: Protect the system crontab
+                ansible.builtin.file:
+                  path: /etc/crontab
+                  mode: "0600"
+              - name: Configuration directory
+                ansible.builtin.file:
+                  path: /etc/ov
+                  state: directory
+              - name: Mark the host as hardened
+                ansible.builtin.file:
+                  path: /etc/ov/hardened
+                  state: touch
+                  access_time: preserve
+                  modification_time: preserve
+          EOF
+          sed -i 's/^\( *\)access_time: preserve$/\1# times: new on every run/; /modification_time: preserve/d' hardening.yml
+          ansible-playbook hardening.yml >/dev/null
+  solution:
+    explanation: |
+      Each shell task maps to a module that compares desired and current state: `copy`
+      for the two whole files, `lineinfile` for the sshd setting (its `regexp` also
+      matches the commented default) and the umask line, `user` for the system account,
+      `file` for the directory, the crontab mode and the marker, whose `state: touch`
+      keeps the existing times so it only changes when the file is missing.
+    steps:
+      - on: ov-ctl
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/claims-automation
+          cat > hardening.yml <<'EOF'
+          - name: Baseline hardening
+            hosts: all
+            become: true
+            tasks:
+              - name: Ignore ICMP redirects
+                ansible.builtin.copy:
+                  dest: /etc/sysctl.d/90-ov-hardening.conf
+                  content: "net.ipv4.conf.all.accept_redirects = 0\n"
+                  mode: "0644"
+              - name: No root logins over SSH
+                ansible.builtin.lineinfile:
+                  path: /etc/ssh/sshd_config
+                  regexp: '^#?PermitRootLogin'
+                  line: PermitRootLogin no
+              - name: Audit service account
+                ansible.builtin.user:
+                  name: ovaudit
+                  system: true
+                  create_home: false
+                  shell: /sbin/nologin
+              - name: Audit log directory
+                ansible.builtin.file:
+                  path: /var/log/ov-audit
+                  state: directory
+                  owner: ovaudit
+                  group: root
+                  mode: "0750"
+              - name: Network login banner
+                ansible.builtin.copy:
+                  dest: /etc/issue.net
+                  content: "Orrin & Vale Insurance: authorised use only\n"
+              - name: Restrictive default umask
+                ansible.builtin.lineinfile:
+                  path: /etc/profile.d/ov.sh
+                  line: umask 027
+                  create: true
+              - name: Protect the system crontab
+                ansible.builtin.file:
+                  path: /etc/crontab
+                  mode: "0600"
+              - name: Configuration directory
+                ansible.builtin.file:
+                  path: /etc/ov
+                  state: directory
+              - name: Mark the host as hardened
+                ansible.builtin.file:
+                  path: /etc/ov/hardened
+                  state: touch
+                  access_time: preserve
+                  modification_time: preserve
+          EOF
+          ansible-playbook hardening.yml
+    alternatives:
+      - id: guarded-commands
+        description: Keeps commands where they are simple but guards them with creates and changed_when on a real test.
+        steps:
+          - on: ov-ctl
+            as: learner
+            timeoutSec: 300
+            run: |
+              set -e
+              cd ~/claims-automation
+              cat > hardening.yml <<'EOF'
+              - hosts: all
+                become: true
+                tasks:
+                  - ansible.builtin.copy: { dest: /etc/sysctl.d/90-ov-hardening.conf, content: "net.ipv4.conf.all.accept_redirects = 0\n", mode: "0644" }
+                  - ansible.builtin.lineinfile: { path: /etc/ssh/sshd_config, regexp: '^#?PermitRootLogin', line: PermitRootLogin no }
+                  - ansible.builtin.command: useradd -r -M -s /sbin/nologin ovaudit
+                    register: add
+                    changed_when: add.rc == 0
+                    failed_when: add.rc not in [0, 9]
+                  - ansible.builtin.file: { path: /var/log/ov-audit, state: directory, owner: ovaudit, group: root, mode: "0750" }
+                  - ansible.builtin.copy: { dest: /etc/issue.net, content: "Orrin & Vale Insurance: authorised use only\n" }
+                  - ansible.builtin.shell: grep -q '^umask 027' /etc/profile.d/ov.sh || { echo 'umask 027' >> /etc/profile.d/ov.sh; echo appended; }
+                    register: um
+                    changed_when: "'appended' in um.stdout"
+                  - ansible.builtin.file: { path: /etc/crontab, mode: "0600" }
+                  - ansible.builtin.command: touch /etc/ov/hardened
+                    args:
+                      creates: /etc/ov/hardened
+              EOF
+              ansible-playbook hardening.yml

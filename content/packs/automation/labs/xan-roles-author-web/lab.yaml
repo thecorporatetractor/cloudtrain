@@ -1,0 +1,196 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xan-roles-author-web
+  title: Write a web role driven by defaults
+  domain: automation
+  frameworks: [ex294-aligned:roles-collections]
+  difficulty: medium
+  estimatedMinutes: 18
+  tags: [exam, ansible, roles, templates, httpd, firewalld]
+  version: 1
+spec:
+  description: |
+    **Exam environment.** You work as `learner` on the control node `control`. The
+    managed nodes are `node1` (group `dev`), `node2` (`test`), `node3` (`prod`, also in
+    `webservers`) and `node4` (`balancers`), all Enterprise Linux 10; the account
+    `devops` on every node accepts your SSH key and may use sudo without a password.
+    Packages come from each node's local repository. Every playbook you write is run
+    again by the grader (it must report no changes), then every node is rebooted before
+    the final checks.
+
+    In **`/home/learner/exam/webrole`** create the role **`webpage`** under `roles/`
+    that:
+
+    - installs **httpd**, starts it and enables it at boot;
+    - opens the **http** service in firewalld, permanently and immediately;
+    - renders **`/var/www/html/index.html`** from a template, containing exactly the line
+      `Welcome to <the host's FQDN> on <its default IPv4 address>`.
+
+    Write **`webpage.yml`** in the project that applies the role to the **webservers**
+    group, and run it. From the control node, `curl http://node3/` must return the page.
+  objectives:
+    - Structure a role with tasks, handlers, templates and defaults
+    - Manage packages, services and firewall rules
+  topology:
+    entry: control
+    nodes:
+      - { name: control, driver: container, image: ansible-ctl:2.21, access: [shell] }
+      - { name: node1, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node2, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node3, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node4, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+  setup:
+    - on: node1
+      timeoutSec: 120
+      run: &exam-node |
+        set -eu
+        id devops >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Exam automation" devops
+        install -d -m 0700 -o devops -g devops /home/devops/.ssh
+        install -m 0600 -o devops -g devops /home/learner/.ssh/authorized_keys /home/devops/.ssh/authorized_keys
+        printf 'devops ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/devops
+        chmod 0440 /etc/sudoers.d/devops
+    - { on: node2, timeoutSec: 120, run: *exam-node }
+    - { on: node3, timeoutSec: 120, run: *exam-node }
+    - { on: node4, timeoutSec: 120, run: *exam-node }
+    - on: control
+      run: |
+        set -eu
+        p=/home/learner/exam/webrole
+        install -d -o learner -g learner /home/learner/exam $p
+        cat > $p/inventory.yml <<'EOF'
+        dev:
+          hosts:
+            node1:
+        test:
+          hosts:
+            node2:
+        prod:
+          hosts:
+            node3:
+        balancers:
+          hosts:
+            node4:
+        webservers:
+          children:
+            prod:
+        EOF
+        printf '[defaults]\ninventory = inventory.yml\nremote_user = devops\nroles_path = /home/learner/exam/webrole/roles\n' > $p/ansible.cfg
+        chown -R learner:learner $p
+  checks:
+    - id: page
+      description: http://node3/ serves the page with node3's FQDN and IPv4 address
+      type: shell
+      on: control
+      skills: [automation.content.templates]
+      weight: 2
+      timeoutSec: 120
+      command: |
+        want=$(ct-ansible run /home/learner/exam/webrole env ANSIBLE_LOAD_CALLBACK_PLUGINS=1 ANSIBLE_STDOUT_CALLBACK=ansible.posix.json \
+          ansible node3 -m ansible.builtin.setup -a 'filter=ansible_fqdn,ansible_default_ipv4' 2>/dev/null \
+          | jq -r '.plays[0].tasks[0].hosts.node3.ansible_facts | "Welcome to " + .ansible_fqdn + " on " + .ansible_default_ipv4.address')
+        got=$(curl -s -m 5 http://node3/)
+        [ -n "$want" ] && [ "$got" = "$want" ] && echo page-ok || echo "page-differs"
+      expect: { match: exact, value: page-ok }
+    - id: service
+      description: httpd is running and enabled at boot on node3
+      type: shell
+      on: node3
+      skills: [automation.modules.packages-services]
+      command: echo "$(systemctl is-active httpd) $(systemctl is-enabled httpd)"
+      expect: { match: exact, value: active enabled }
+    - id: firewall
+      description: http is open in firewalld at runtime and permanently on node3
+      type: shell
+      on: node3
+      skills: [automation.modules.packages-services]
+      command: |
+        firewall-cmd --list-services | tr ' ' '\n' | grep -qx http && r=runtime || r=no-runtime
+        firewall-cmd --permanent --list-services | tr ' ' '\n' | grep -qx http && p=permanent || p=no-permanent
+        echo "$r $p"
+      expect: { match: exact, value: runtime permanent }
+    - id: role-structure
+      description: The role webpage has tasks and a template, and webpage.yml applies it to webservers
+      type: shell
+      on: control
+      skills: [automation.reuse.roles]
+      command: |
+        p=/home/learner/exam/webrole
+        [ -f $p/roles/webpage/tasks/main.yml ] && ls $p/roles/webpage/templates/* >/dev/null 2>&1 && t=role || t=no-role
+        /opt/ansible/bin/python3 - $p/webpage.yml <<'PY' 2>/dev/null || echo no-playbook
+        import sys, yaml
+        plays = yaml.safe_load(open(sys.argv[1])) or []
+        ok = any(p.get("hosts") == "webservers" and any((r if isinstance(r, str) else r.get("role", r.get("name"))) == "webpage" for r in p.get("roles", [])) for p in plays)
+        print("play" if ok else "no-play")
+        PY
+        echo $t
+      expect: { match: regex, value: "^play\\s+role$" }
+  exam:
+    rerun:
+      - on: control
+        timeoutSec: 600
+        run: |
+          r=$(ct-ansible recap /home/learner/exam/webrole webpage.yml)
+          echo "$r"
+          [ "$r" = "changed=0 failed=0 unreachable=0" ]
+  misconceptions:
+    - id: runtime-firewall
+      description: Opens http in firewalld only at runtime, so the reboot closes it.
+      feedback: A firewalld rule needs permanent (and immediate) to survive a reboot.
+      expectFail: [firewall]
+      mutation:
+        on: control
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/exam/webrole
+          mkdir -p roles/webpage/tasks roles/webpage/templates roles/webpage/handlers
+          printf 'Welcome to {{ ansible_fqdn }} on {{ ansible_default_ipv4.address }}\n' > roles/webpage/templates/index.html.j2
+          cat > roles/webpage/tasks/main.yml <<'EOF'
+          - ansible.builtin.dnf: { name: httpd, state: present }
+          - ansible.builtin.service: { name: httpd, state: started, enabled: true }
+          - ansible.posix.firewalld: { service: http, state: enabled, immediate: true, permanent: false }
+          - ansible.builtin.template: { src: index.html.j2, dest: /var/www/html/index.html, mode: "0644" }
+          EOF
+          printf -- '- hosts: webservers\n  become: true\n  roles:\n    - webpage\n' > webpage.yml
+          ansible-playbook webpage.yml
+  solution:
+    explanation: |
+      The role's tasks install httpd, enable and start it, open http with
+      ansible.posix.firewalld (permanent and immediate) and render the template from
+      ansible_fqdn and ansible_default_ipv4.address.
+    steps:
+      - on: control
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/exam/webrole
+          ansible-galaxy role init --init-path roles webpage >/dev/null
+          printf 'Welcome to {{ ansible_fqdn }} on {{ ansible_default_ipv4.address }}\n' > roles/webpage/templates/index.html.j2
+          cat > roles/webpage/tasks/main.yml <<'EOF'
+          ---
+          - name: httpd package
+            ansible.builtin.dnf:
+              name: httpd
+              state: present
+          - name: httpd running and enabled
+            ansible.builtin.service:
+              name: httpd
+              state: started
+              enabled: true
+          - name: http open in firewalld
+            ansible.posix.firewalld:
+              service: http
+              state: enabled
+              permanent: true
+              immediate: true
+          - name: Index page
+            ansible.builtin.template:
+              src: index.html.j2
+              dest: /var/www/html/index.html
+              mode: "0644"
+          EOF
+          printf -- '- name: Web servers\n  hosts: webservers\n  become: true\n  roles:\n    - webpage\n' > webpage.yml
+          ansible-playbook webpage.yml

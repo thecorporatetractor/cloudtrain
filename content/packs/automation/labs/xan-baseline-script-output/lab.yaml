@@ -1,0 +1,92 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xan-baseline-script-output
+  title: Run a provided script and capture its result
+  domain: automation
+  frameworks: [ex294-aligned:rhcsa-baseline]
+  difficulty: easy
+  estimatedMinutes: 6
+  tags: [exam, ansible, shell, redirection]
+  version: 1
+spec:
+  description: |
+    **Exam environment.** You work as `learner` on the control node `control`. The
+    managed nodes are `node1` (group `dev`), `node2` (`test`), `node3` (`prod`, also in
+    `webservers`) and `node4` (`balancers`), all Enterprise Linux 10; the account
+    `devops` on every node accepts your SSH key and may use sudo without a password.
+    Packages come from each node's local repository. Every playbook you write is run
+    again by the grader (it must report no changes), then every node is rebooted before
+    the final checks.
+
+    The operations team ships the script **`/usr/local/bin/exam-role`** on the control
+    node. Run it with the argument **`{{site}}`** and save **only the last line** it
+    prints on standard output to **`/home/learner/exam/baseline/role.txt`**.
+  objectives:
+    - Run a script with an argument and keep part of its output
+  params:
+    site:
+      type: choice
+      values: [leeds, bristol, cardiff, york]
+    code:
+      type: int
+      min: 100
+      max: 999
+  topology:
+    entry: control
+    nodes:
+      - { name: control, driver: container, image: ansible-ctl:2.21, access: [shell] }
+      - { name: node1, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node2, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node3, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node4, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+  setup:
+    - on: node1
+      timeoutSec: 120
+      run: &exam-node |
+        set -eu
+        id devops >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Exam automation" devops
+        install -d -m 0700 -o devops -g devops /home/devops/.ssh
+        install -m 0600 -o devops -g devops /home/learner/.ssh/authorized_keys /home/devops/.ssh/authorized_keys
+        printf 'devops ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/devops
+        chmod 0440 /etc/sudoers.d/devops
+    - { on: node2, timeoutSec: 120, run: *exam-node }
+    - { on: node3, timeoutSec: 120, run: *exam-node }
+    - { on: node4, timeoutSec: 120, run: *exam-node }
+    - on: control
+      run: |
+        set -eu
+        install -d -o learner -g learner /home/learner/exam /home/learner/exam/baseline
+        cat > /usr/local/bin/exam-role <<'EOF'
+        #!/bin/sh
+        [ -n "${1:-}" ] || { echo "usage: exam-role SITE" >&2; exit 2; }
+        echo "exam-role 1.4: resolving the role of site $1"
+        echo "checking inventory ... ok" >&2
+        echo "site=$1"
+        echo "tier=gold"
+        echo "role=$1-gateway-{{code}}"
+        EOF
+        chmod 0755 /usr/local/bin/exam-role
+  checks:
+    - id: role-file
+      description: role.txt holds exactly the last line the script prints for the site
+      type: shell
+      on: control
+      skills: [linux.shell.redirection]
+      command: cat /home/learner/exam/baseline/role.txt 2>/dev/null || echo missing
+      expect: { match: exact, value: "role={{site}}-gateway-{{code}}" }
+  misconceptions:
+    - id: whole-output
+      description: Saves the whole output instead of the last line.
+      feedback: Only the last line belongs in role.txt; tail -n 1 keeps it.
+      expectFail: [role-file]
+      mutation:
+        on: control
+        as: learner
+        run: exam-role {{site}} > ~/exam/baseline/role.txt
+  solution:
+    explanation: The script prints four lines on stdout and one on stderr; tail -n 1 keeps the last stdout line.
+    steps:
+      - on: control
+        as: learner
+        run: exam-role {{site}} 2>/dev/null | tail -n 1 > ~/exam/baseline/role.txt

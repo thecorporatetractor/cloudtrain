@@ -1,0 +1,168 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xan-roles-requirements
+  title: Install roles and a collection from the exam share
+  domain: automation
+  frameworks: [ex294-aligned:roles-collections]
+  difficulty: easy
+  estimatedMinutes: 8
+  tags: [exam, ansible, roles, collections, galaxy]
+  version: 1
+spec:
+  description: |
+    **Exam environment.** You work as `learner` on the control node `control`. The
+    managed nodes are `node1` (group `dev`), `node2` (`test`), `node3` (`prod`, also in
+    `webservers`) and `node4` (`balancers`), all Enterprise Linux 10; the account
+    `devops` on every node accepts your SSH key and may use sudo without a password.
+    Packages come from each node's local repository. Every playbook you write is run
+    again by the grader (it must report no changes), then every node is rebooted before
+    the final checks.
+
+    The exam file share `/srv/exam-share/` on the control node holds two role archives,
+    `balancer.tar.gz` and `phpinfo.tar.gz`, and the collection archive
+    `exam-tools-1.0.0.tar.gz`.
+
+    Write **`/home/learner/exam/requirements/requirements.yml`** listing the roles under
+    the names **`balancer`** and **`phpinfo`** and the collection, and install everything
+    with `ansible-galaxy` into the project's roles and collections paths (the project's
+    `ansible.cfg` sets them to `roles/` and `collections/` in the project directory).
+  objectives:
+    - Write a requirements file for roles and collections
+    - Install content offline from local archives
+  topology:
+    entry: control
+    nodes:
+      - { name: control, driver: container, image: ansible-ctl:2.21, access: [shell] }
+      - { name: node1, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node2, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node3, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+      - { name: node4, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi", "1Gi"] }, access: [ssh] }
+  setup:
+    - on: node1
+      timeoutSec: 120
+      run: &exam-node |
+        set -eu
+        id devops >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Exam automation" devops
+        install -d -m 0700 -o devops -g devops /home/devops/.ssh
+        install -m 0600 -o devops -g devops /home/learner/.ssh/authorized_keys /home/devops/.ssh/authorized_keys
+        printf 'devops ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/devops
+        chmod 0440 /etc/sudoers.d/devops
+    - { on: node2, timeoutSec: 120, run: *exam-node }
+    - { on: node3, timeoutSec: 120, run: *exam-node }
+    - { on: node4, timeoutSec: 120, run: *exam-node }
+    - on: control
+      run: |
+        set -eu
+        p=/home/learner/exam/requirements
+        install -d -o learner -g learner /home/learner/exam $p
+        cat > $p/inventory.yml <<'EOF'
+        dev:
+          hosts:
+            node1:
+        test:
+          hosts:
+            node2:
+        prod:
+          hosts:
+            node3:
+        balancers:
+          hosts:
+            node4:
+        webservers:
+          children:
+            prod:
+        EOF
+        printf '[defaults]\ninventory = inventory.yml\nremote_user = devops\nroles_path = /home/learner/exam/requirements/roles\ncollections_path = /home/learner/exam/requirements/collections\n' > $p/ansible.cfg
+        chown -R learner:learner $p
+    - on: control
+      timeoutSec: 180
+      run: |
+        set -eu
+        s=/srv/exam-share
+        [ -f $s/exam-tools-1.0.0.tar.gz ] && exit 0
+        install -d -m 0755 $s
+        t=$(mktemp -d); cd $t
+        for r in balancer phpinfo; do
+          ansible-galaxy role init $r >/dev/null
+          printf -- '- name: %s role\n  ansible.builtin.debug:\n    msg: role %s\n' "$r" "$r" > $r/tasks/main.yml
+          tar -czf $s/$r.tar.gz $r
+        done
+        ansible-galaxy collection init exam.tools --init-path $t/c >/dev/null
+        ansible-galaxy collection build $t/c/exam/tools --output-path $s >/dev/null
+        chmod -R a+rX $s; cd /; rm -rf $t
+  checks:
+    - id: requirements-file
+      description: requirements.yml lists the roles balancer and phpinfo and the collection archive
+      type: shell
+      on: control
+      skills: [automation.reuse.collections]
+      command: |
+        f=/home/learner/exam/requirements/requirements.yml
+        [ -f $f ] || { echo missing; exit 0; }
+        /opt/ansible/bin/python3 - $f <<'PY'
+        import sys, yaml
+        d = yaml.safe_load(open(sys.argv[1])) or {}
+        roles = d.get("roles", []) if isinstance(d, dict) else d
+        names = sorted(str(r.get("name", "")) for r in roles if isinstance(r, dict))
+        cols = [str(c.get("name", c) if isinstance(c, dict) else c) for c in (d.get("collections", []) if isinstance(d, dict) else [])]
+        print("roles=%s collection=%s" % (",".join(names), "yes" if any("exam-tools-1.0.0" in c or c == "exam.tools" for c in cols) else "no"))
+        PY
+      expect: { match: exact, value: "roles=balancer,phpinfo collection=yes" }
+    - id: roles-installed
+      description: Both roles are installed in the project's roles path under their names
+      type: shell
+      on: control
+      skills: [automation.reuse.roles]
+      weight: 2
+      command: |
+        p=/home/learner/exam/requirements
+        r=""; for n in balancer phpinfo; do [ -f $p/roles/$n/tasks/main.yml ] && grep -q "role $n" $p/roles/$n/tasks/main.yml && r="$r $n"; done
+        echo "installed:${r}"
+      expect: { match: exact, value: "installed: balancer phpinfo" }
+    - id: collection-installed
+      description: exam.tools 1.0.0 is installed in the project's collections path
+      type: shell
+      on: control
+      skills: [automation.reuse.collections]
+      weight: 2
+      command: |
+        m=/home/learner/exam/requirements/collections/ansible_collections/exam/tools/MANIFEST.json
+        jq -r '.collection_info | .namespace + "." + .name + " " + .version' $m 2>/dev/null || echo missing
+      expect: { match: exact, value: exam.tools 1.0.0 }
+  misconceptions:
+    - id: default-paths
+      description: Installs into the default paths under ~/.ansible instead of the project paths.
+      feedback: Run ansible-galaxy from the project directory (or pass -p) so the project's roles and collections paths are used.
+      expectFail: [roles-installed, collection-installed]
+      mutation:
+        on: control
+        as: learner
+        timeoutSec: 180
+        run: |
+          set -e
+          cd ~/exam/requirements
+          printf 'roles:\n  - src: file:///srv/exam-share/balancer.tar.gz\n    name: balancer\n  - src: file:///srv/exam-share/phpinfo.tar.gz\n    name: phpinfo\ncollections:\n  - name: /srv/exam-share/exam-tools-1.0.0.tar.gz\n    type: file\n' > requirements.yml
+          cd ~ && ansible-galaxy role install -r ~/exam/requirements/requirements.yml -p ~/.ansible/roles
+          ansible-galaxy collection install -r ~/exam/requirements/requirements.yml -p ~/.ansible/collections
+  solution:
+    explanation: Roles take src file:// URLs with a name; the collection is a type file entry. ansible-galaxy install -r, run in the project, honours roles_path and collections_path.
+    steps:
+      - on: control
+        as: learner
+        timeoutSec: 180
+        run: |
+          set -e
+          cd ~/exam/requirements
+          cat > requirements.yml <<'EOF'
+          ---
+          roles:
+            - src: file:///srv/exam-share/balancer.tar.gz
+              name: balancer
+            - src: file:///srv/exam-share/phpinfo.tar.gz
+              name: phpinfo
+          collections:
+            - name: /srv/exam-share/exam-tools-1.0.0.tar.gz
+              type: file
+          EOF
+          ansible-galaxy install -r requirements.yml

@@ -1,0 +1,32 @@
+#!/bin/bash
+# ct-fleet-net: lab setup helper (root) on the Ansible control node. Joins every topology
+# link interface (eth1, eth2, ...; one link per managed node) into the bridge br0, so the
+# control node and all managed nodes share one lab LAN, gives br0 the control node's
+# address, publishes the fleet's names in /etc/hosts and waits for each node's sshd, whose
+# host keys go to /etc/ssh/ssh_known_hosts (so ssh and Ansible verify them).
+#
+#   ct-fleet-net ADDR/PREFIX NAME=IP...      e.g. ct-fleet-net 10.70.0.10/24 ov-web1=10.70.0.11
+# Idempotent; WAIT (seconds, default 90) bounds the wait per node for sshd.
+set -euo pipefail
+addr=${1:?usage: ct-fleet-net ADDR/PREFIX NAME=IP...}; shift
+ip link show br0 >/dev/null 2>&1 || ip link add br0 type bridge
+ip link set br0 up
+for i in $(ip -o link show | awk -F': ' '{print $2}' | sed 's/@.*//' | grep -E '^eth[1-9][0-9]*$'); do
+  ip link set "$i" master br0
+  ip link set "$i" up
+done
+ip addr replace "$addr" dev br0
+hosts_block=""
+for kv in "$@"; do hosts_block+="${kv#*=} ${kv%%=*}"$'\n'; done
+tmp=$(mktemp)
+{ sed '/# ct-fleet begin/,/# ct-fleet end/d' /etc/hosts; printf '# ct-fleet begin\n%s# ct-fleet end\n' "$hosts_block"; } > "$tmp"
+cat "$tmp" > /etc/hosts; rm -f "$tmp"
+kh=/etc/ssh/ssh_known_hosts; touch "$kh"; chmod 0644 "$kh"
+for kv in "$@"; do
+  name=${kv%%=*} ip=${kv#*=}
+  for _ in $(seq 1 "${WAIT:-90}"); do nc -z -w1 "$ip" 22 2>/dev/null && break; sleep 1; done
+  keys=$(ssh-keyscan -T 5 "$ip" 2>/dev/null | grep -v '^#' || true)
+  [[ -n $keys ]] || { echo "ct-fleet-net: no ssh host key from $name ($ip)" >&2; exit 1; }
+  sed -i "/^$name,/d; /^$ip /d" "$kh"
+  awk -v n="$name" -v a="$ip" '{ $1 = n "," a; print }' <<<"$keys" >> "$kh"
+done

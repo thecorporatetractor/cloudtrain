@@ -1,0 +1,217 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ov-check-diff-preview
+  title: Preview a risky change with check and diff mode
+  domain: automation
+  frameworks: [ex294-aligned:run-content]
+  difficulty: easy
+  estimatedMinutes: 10
+  tags: [ansible, check-mode, diff, change-management, sudoers]
+  version: 1
+spec:
+  description: |
+    Tonight's change window applies **`/home/learner/claims-automation/sudoers.yml`**, which
+    tightens the `ov-ops` sudo rule and the sudo policy file on the whole fleet. The change
+    board wants to know beforehand which files it would actually change on which host:
+    some hosts were already fixed by hand.
+
+    **Without changing any host**, find out and write the answer to
+    **`/home/learner/change/preview.txt`**: one line per file that the playbook *would*
+    change, in the form `<host>:<path>` (for example
+    `ov-claims-web1:/etc/ov/sudo-policy.conf`), sorted, nothing else. A host that would
+    not change at all has no line.
+
+    Do not edit `sudoers.yml`, and do not run it for real: the change window is tonight.
+  objectives:
+    - Run a playbook in check mode
+    - Read per-file diffs with diff mode
+    - Turn a dry run into a change preview
+  params:
+    bootpw:
+      type: int
+      min: 100000
+      max: 999999
+    okops:
+      type: choice
+      values: [ov-claims-web1, ov-claims-web2, ov-db-1, ov-quote-api1]
+    okpol:
+      type: choice
+      values: [ov-claims-web2, ov-db-1]
+  topology:
+    entry: ov-ctl
+    nodes:
+      - { name: ov-ctl, driver: container, image: ansible-ctl:2.21, access: [shell] }
+      - { name: ov-claims-web1, driver: container, image: el-lab:10, resources: { cpu: 0.2, memoryMiB: 256 } }
+      - { name: ov-claims-web2, driver: container, image: el-lab:10, resources: { cpu: 0.2, memoryMiB: 256 } }
+      - { name: ov-db-1, driver: container, image: el-lab:10, resources: { cpu: 0.2, memoryMiB: 256 } }
+      - { name: ov-quote-api1, driver: container, image: deb-lab:24.04, resources: { cpu: 0.2, memoryMiB: 256 } }
+    links:
+      - { a: "ov-ctl:eth1", b: "ov-claims-web1:eth1" }
+      - { a: "ov-ctl:eth2", b: "ov-claims-web2:eth1" }
+      - { a: "ov-ctl:eth3", b: "ov-db-1:eth1" }
+      - { a: "ov-ctl:eth4", b: "ov-quote-api1:eth1" }
+  setup:
+    - on: ov-claims-web1
+      run: &ov-node |
+        set -eu
+        case $(hostname) in
+          ov-claims-web1) a=11 ;; ov-claims-web2) a=12 ;; ov-db-1) a=21 ;; ov-quote-api1) a=31 ;;
+          *) echo "unknown host $(hostname)" >&2; exit 1 ;;
+        esac
+        ip link set eth1 up
+        ip addr replace 10.70.0.$a/24 dev eth1
+        id ovauto >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Orrin and Vale automation" ovauto
+        echo 'ovauto:Ov-boot-{{bootpw}}' | chpasswd
+        printf 'ovauto ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/ovauto
+        chmod 0440 /etc/sudoers.d/ovauto
+        ssh-keygen -A >/dev/null 2>&1
+        mkdir -p /run/sshd
+        pgrep -x sshd >/dev/null || /usr/sbin/sshd
+        install -d /etc/ov
+        if [ "$(hostname)" = "{{okops}}" ]; then
+          printf '%s\n' '%ov-ops ALL=(root) /usr/bin/systemctl restart ov-claims' > /etc/sudoers.d/ov-ops
+        else
+          printf '%s\n' '%ov-ops ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/ov-ops
+        fi
+        chmod 0440 /etc/sudoers.d/ov-ops
+        if [ "$(hostname)" = "{{okpol}}" ]; then
+          printf '%s\n' 'owner=claims-ops' 'timestamp_timeout=5' > /etc/ov/sudo-policy.conf
+        else
+          printf '%s\n' 'owner=claims-ops' 'timestamp_timeout=60' > /etc/ov/sudo-policy.conf
+        fi
+        sha256sum /etc/sudoers.d/ov-ops /etc/ov/sudo-policy.conf > /var/tmp/.ct-preview.sum
+    - { on: ov-claims-web2, run: *ov-node }
+    - { on: ov-db-1, run: *ov-node }
+    - { on: ov-quote-api1, run: *ov-node }
+    - on: ov-ctl
+      timeoutSec: 240
+      run: |
+        set -eu
+        ct-fleet-net 10.70.0.10/24 ov-claims-web1=10.70.0.11 ov-claims-web2=10.70.0.12 ov-db-1=10.70.0.21 ov-quote-api1=10.70.0.31
+        ct-ansible pushkey --seal ovauto Ov-boot-{{bootpw}} ov-claims-web1 ov-claims-web2 ov-db-1 ov-quote-api1
+        p=/home/learner/claims-automation
+        install -d -o learner -g learner $p
+        cat > $p/inventory.yml <<'EOF'
+        claims:
+          children:
+            claims_web:
+              hosts:
+                ov-claims-web1:
+                ov-claims-web2:
+            claims_db:
+              hosts:
+                ov-db-1:
+        quoting:
+          hosts:
+            ov-quote-api1:
+        EOF
+        printf '[defaults]\ninventory = inventory.yml\nremote_user = ovauto\n' > $p/ansible.cfg
+        chown learner:learner $p/inventory.yml $p/ansible.cfg
+    - on: ov-ctl
+      run: |
+        set -eu
+        install -d -o learner -g learner /home/learner/change
+        cat > /home/learner/claims-automation/sudoers.yml <<'EOF'
+        - name: Tighten operator sudo rights
+          hosts: all
+          become: true
+          tasks:
+            - name: ov-ops may only restart the claims service
+              ansible.builtin.copy:
+                dest: /etc/sudoers.d/ov-ops
+                content: "%ov-ops ALL=(root) /usr/bin/systemctl restart ov-claims\n"
+                mode: "0440"
+                validate: /usr/sbin/visudo -cf %s
+            - name: Short sudo credential cache
+              ansible.builtin.lineinfile:
+                path: /etc/ov/sudo-policy.conf
+                regexp: '^timestamp_timeout='
+                line: timestamp_timeout=5
+        EOF
+        chown learner:learner /home/learner/claims-automation/sudoers.yml
+  checks:
+    - id: preview-content
+      description: preview.txt lists exactly the files the playbook would change, as host:path, sorted
+      type: shell
+      on: ov-ctl
+      skills: [automation.devworkflow.check-diff]
+      weight: 3
+      command: |
+        f=/home/learner/change/preview.txt
+        [ -f "$f" ] || { echo missing; exit 0; }
+        want=$(for h in ov-claims-web1 ov-claims-web2 ov-db-1 ov-quote-api1; do
+          [ "$h" = "{{okops}}" ] || echo "$h:/etc/sudoers.d/ov-ops"
+          [ "$h" = "{{okpol}}" ] || echo "$h:/etc/ov/sudo-policy.conf"
+        done | sort)
+        [ "$(grep -v '^[[:space:]]*$' "$f")" = "$want" ] && echo exact || echo differs
+      expect: { match: exact, value: exact }
+    - id: playbook-untouched
+      description: sudoers.yml is unchanged
+      type: shell
+      on: ov-ctl
+      skills: [automation.devworkflow.check-diff]
+      command: grep -c 'timestamp_timeout=5\|restart ov-claims' /home/learner/claims-automation/sudoers.yml
+      expect: { match: exact, value: "2" }
+    - id: web1-unchanged
+      description: Nothing changed on ov-claims-web1
+      type: shell
+      on: ov-claims-web1
+      skills: [automation.devworkflow.check-diff]
+      command: &unchanged sha256sum -c --quiet /var/tmp/.ct-preview.sum >/dev/null 2>&1 && echo unchanged || echo changed
+      expect: { match: exact, value: unchanged }
+    - { id: web2-unchanged, description: Nothing changed on ov-claims-web2, type: shell, on: ov-claims-web2, skills: [automation.devworkflow.check-diff], command: *unchanged, expect: { match: exact, value: unchanged } }
+    - { id: db1-unchanged, description: Nothing changed on ov-db-1, type: shell, on: ov-db-1, skills: [automation.devworkflow.check-diff], command: *unchanged, expect: { match: exact, value: unchanged } }
+    - { id: quote1-unchanged, description: Nothing changed on ov-quote-api1, type: shell, on: ov-quote-api1, skills: [automation.devworkflow.check-diff], command: *unchanged, expect: { match: exact, value: unchanged } }
+  hints:
+    - title: A dry run
+      body: "`--check` runs every task in check mode: modules report what they would change but change nothing. `--diff` adds the before/after of each file."
+      command: cd ~/claims-automation && ansible-playbook sudoers.yml --check --diff
+      cost: 1
+    - title: Reading the output
+      body: Each task prints `changed:` or `ok:` per host; under a changed file task the diff header names the file. A task reported `ok` on a host would not change that host.
+      cost: 1
+  misconceptions:
+    - id: ran-for-real
+      description: Runs the playbook without check mode to see what changes.
+      feedback: That applies the change hours before the window. --check (with --diff) shows the same answer without touching any host.
+      expectFail: [web1-unchanged, web2-unchanged, db1-unchanged, quote1-unchanged]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 180
+        run: |
+          cd ~/claims-automation
+          ansible-playbook sudoers.yml >/dev/null || true
+          for h in ov-claims-web1 ov-claims-web2 ov-db-1 ov-quote-api1; do
+            [ "$h" = "{{okops}}" ] || echo "$h:/etc/sudoers.d/ov-ops"
+            [ "$h" = "{{okpol}}" ] || echo "$h:/etc/ov/sudo-policy.conf"
+          done | sort > ~/change/preview.txt
+    - id: every-file
+      description: Lists both files for every host without checking which would change.
+      feedback: Some hosts were fixed by hand; check mode reports them as ok. Only list the files reported as changed.
+      expectFail: [preview-content]
+      mutation:
+        on: ov-ctl
+        as: learner
+        run: |
+          for h in ov-claims-web1 ov-claims-web2 ov-db-1 ov-quote-api1; do echo "$h:/etc/ov/sudo-policy.conf"; echo "$h:/etc/sudoers.d/ov-ops"; done | sort > ~/change/preview.txt
+  solution:
+    explanation: |
+      `ansible-playbook sudoers.yml --check --diff` reports per task and host whether it
+      would change, and the diff shows which file. The hosts fixed by hand report `ok`
+      for that task. Writing one `host:path` line per `changed` result and sorting gives
+      the preview.
+    steps:
+      - on: ov-ctl
+        as: learner
+        timeoutSec: 180
+        run: |
+          set -e
+          cd ~/claims-automation
+          ANSIBLE_NOCOLOR=1 ansible-playbook sudoers.yml --check --diff | tee /tmp/preview.out
+          awk '/^TASK \[/ { t = $0 }
+               /^changed: \[/ { h = $2; gsub(/[\[\]]/, "", h)
+                 if (t ~ /restart the claims service/) print h ":/etc/sudoers.d/ov-ops"
+                 if (t ~ /credential cache/) print h ":/etc/ov/sudo-policy.conf" }' /tmp/preview.out | sort > ~/change/preview.txt
+          cat ~/change/preview.txt
