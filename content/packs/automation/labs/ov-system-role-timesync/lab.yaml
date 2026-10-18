@@ -1,0 +1,306 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ov-system-role-timesync
+  title: "Configure time sync on all hosts with a packaged system role"
+  domain: automation
+  frameworks: [ex294-aligned:roles-collections, ex294-aligned:automate-system-tasks]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [ansible, system-roles, chrony, time, tier-c, blocked]
+  version: 1
+spec:
+  description: |
+    Auditors flagged clock drift. The estate has two in-lab time servers, `ov-ntp-1` and `ov-ntp-2`
+    (group `ntp_servers`); the other hosts, such as `ov-claims-web1`, still use an old corporate pool.
+    The collection `fedora.linux_system_roles` is installed on the control node and provides the **`timesync`** role.
+
+    Write **`/home/learner/claims-automation/timesync.yml`** (inventory and `ansible.cfg` are in that directory) that
+    uses that role on every host **except the time servers** so that each of them:
+
+    - has **`ov-ntp-1`** and **`ov-ntp-2`** as its **only** time sources, each with **`iburst`** and a **`minpoll`** of **{{mp}}**;
+    - runs `chronyd` and has it enabled at boot, and `chronyc sources` shows both servers.
+
+    Run it; the grader runs it again and expects no changes.
+  objectives:
+    - "Apply a packaged system role by overriding its variables"
+    - "Replace the time sources of a fleet declaratively"
+  params:
+    mp:
+      type: int
+      min: 4
+      max: 6
+  topology:
+    entry: ov-ctl
+    nodes:
+      - { name: ov-ctl, driver: container, image: ansible-ctl:2.21, access: [shell] }
+      - { name: ov-claims-web1, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280 }, access: [ssh] }
+      - { name: ov-ntp-1, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280 }, access: [ssh] }
+      - { name: ov-ntp-2, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280 }, access: [ssh] }
+  setup:
+    - on: ov-claims-web1
+      timeoutSec: 120
+      run: &ov-vm |
+        set -eu
+        id ovauto >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Orrin and Vale automation" ovauto
+        install -d -m 0700 -o ovauto -g ovauto /home/ovauto/.ssh
+        install -m 0600 -o ovauto -g ovauto /home/learner/.ssh/authorized_keys /home/ovauto/.ssh/authorized_keys
+        printf 'ovauto ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/ovauto
+        chmod 0440 /etc/sudoers.d/ovauto
+    - { on: ov-ntp-1, timeoutSec: 120, run: *ov-vm }
+    - { on: ov-ntp-2, timeoutSec: 120, run: *ov-vm }
+    - on: ov-ntp-1
+      timeoutSec: 180
+      run: |
+        set -eu
+        [ -f /var/tmp/.ct-timesync-seeded ] && exit 0
+        install -d /etc/chrony.d
+        grep -qE '^(confdir|include)[[:space:]]' /etc/chrony.conf || echo 'confdir /etc/chrony.d' >> /etc/chrony.conf
+        printf 'allow\nlocal stratum 10\n' > /etc/chrony.d/ov-server.conf
+        systemctl enable chronyd >/dev/null 2>&1; systemctl restart chronyd
+        firewall-cmd -q --permanent --add-service=ntp; firewall-cmd -q --reload
+        touch /var/tmp/.ct-timesync-seeded
+    - on: ov-ntp-2
+      timeoutSec: 180
+      run: |
+        set -eu
+        [ -f /var/tmp/.ct-timesync-seeded ] && exit 0
+        install -d /etc/chrony.d
+        grep -qE '^(confdir|include)[[:space:]]' /etc/chrony.conf || echo 'confdir /etc/chrony.d' >> /etc/chrony.conf
+        printf 'allow\nlocal stratum 10\n' > /etc/chrony.d/ov-server.conf
+        systemctl enable chronyd >/dev/null 2>&1; systemctl restart chronyd
+        firewall-cmd -q --permanent --add-service=ntp; firewall-cmd -q --reload
+        touch /var/tmp/.ct-timesync-seeded
+    - on: ov-claims-web1
+      timeoutSec: 120
+      run: |
+        set -eu
+        [ -f /var/tmp/.ct-timesync-seeded ] && exit 0
+        grep -q '^pool ntp.orrinvale.example' /etc/chrony.conf || sed -i '1i pool ntp.orrinvale.example iburst' /etc/chrony.conf
+        systemctl enable chronyd >/dev/null 2>&1; systemctl restart chronyd
+        touch /var/tmp/.ct-timesync-seeded
+    - on: ov-ctl
+      run: |
+        set -eu
+        p=/home/learner/claims-automation
+        install -d -o learner -g learner $p
+        cat > $p/inventory.yml <<'EOF'
+        claims:
+          children:
+            claims_web:
+              hosts:
+                ov-claims-web1:
+        ntp_servers:
+          hosts:
+            ov-ntp-1:
+            ov-ntp-2:
+        EOF
+        printf '[defaults]\ninventory = inventory.yml\nremote_user = ovauto\n' > $p/ansible.cfg
+        c=/usr/share/ansible/collections/ansible_collections/fedora/linux_system_roles
+        [ -d "$c" ] || { echo "blocked: fedora.linux_system_roles is not installed on this control node; this lab cannot run in this image" >&2; exit 1; }
+        chown -R learner:learner $p
+  checks:
+    - id: sources-web1
+      description: "ov-claims-web1 uses only the two in-lab time servers with the required options, and chronyd runs and starts at boot"
+      type: shell
+      on: ov-claims-web1
+      skills: [automation.reuse.system-roles]
+      weight: 2
+      command: |
+        cat /etc/chrony.conf /etc/chrony.d/*.conf 2>/dev/null | grep -E '^(server|pool|peer)[[:space:]]' > /tmp/.ct-src
+        n=$(wc -l < /tmp/.ct-src)
+        c=$(grep -E '^server[[:space:]]+ov-ntp-[12]([[:space:]]|$)' /tmp/.ct-src | grep -w iburst | grep -cE 'minpoll[[:space:]]+{{mp}}([[:space:]]|$)')
+        rm -f /tmp/.ct-src
+        echo "sources=$n options=$c $(systemctl is-active chronyd) $(systemctl is-enabled chronyd)"
+      expect: { match: exact, value: "sources=2 options=2 active enabled" }
+    - id: listed-web1
+      description: "chronyc on ov-claims-web1 lists both time servers as sources"
+      type: shell
+      on: ov-claims-web1
+      skills: [automation.reuse.system-roles]
+      weight: 1
+      command: |
+        n=0
+        for h in ov-ntp-1 ov-ntp-2; do
+          a=$(getent ahostsv4 $h | awk 'NR==1{print $1}')
+          [ -n "$a" ] && chronyc -n sources 2>/dev/null | awk '$1 ~ /^\^/ {print $2}' | grep -qx "$a" && n=$((n+1))
+        done
+        echo $n
+      expect: { match: exact, value: "2" }
+    - id: server-untouched-1
+      description: "The time server ov-ntp-1 is still configured to serve the lab network"
+      type: shell
+      on: ov-ntp-1
+      skills: [automation.reuse.system-roles]
+      command: &srv |
+        grep -qE '^allow' /etc/chrony.d/ov-server.conf && systemctl is-active chronyd || echo changed
+      expect: { match: exact, value: "active" }
+    - { id: server-untouched-2, description: "The time server ov-ntp-2 is still configured to serve the lab network", type: shell, on: ov-ntp-2, skills: [automation.reuse.system-roles], command: *srv, expect: { match: exact, value: "active" } }
+    - id: uses-role
+      description: "timesync.yml applies a system role named timesync from the installed collection"
+      type: shell
+      on: ov-ctl
+      skills: [automation.reuse.system-roles]
+      command: |
+        /opt/ansible/bin/python3 - /home/learner/claims-automation/timesync.yml <<'PY' 2>/dev/null || echo no-playbook
+        import sys, yaml
+        plays = yaml.safe_load(open(sys.argv[1])) or []
+        def uses(p):
+            for r in (p.get("roles") or []):
+                n = r if isinstance(r, str) else str(r.get("role", r.get("name", "")))
+                if n.endswith("timesync"): return True
+            for t in (p.get("tasks") or []):
+                if isinstance(t, dict) and any(k in t for k in ("include_role", "import_role", "ansible.builtin.include_role", "ansible.builtin.import_role")):
+                    return "timesync" in str(t)
+            return False
+        print("ok" if any(uses(p) for p in plays) else "no-role")
+        PY
+      expect: { match: exact, value: "ok" }
+    - id: rerun-no-changes
+      description: "timesync.yml runs again without changes"
+      type: shell
+      on: ov-ctl
+      skills: [automation.reuse.system-roles]
+      weight: 2
+      timeoutSec: 600
+      command: |
+        ct-ansible recap /home/learner/claims-automation timesync.yml
+      expect: { match: exact, value: "changed=0 failed=0 unreachable=0" }
+  hints:
+    - title: "Finding the role"
+      body: |
+        `ansible-galaxy collection list` shows the installed collections; `ansible-doc -t role --list` lists their roles. System roles are called with their fully qualified name, for example in `roles:` of the play.
+      cost: 1
+    - title: "The role's variables"
+      body: |
+        `timesync_ntp_servers` is a list; each entry takes a `hostname` and options such as `iburst` and `minpoll`. The role replaces the previous sources.
+      cost: 1
+    - title: "Who gets the role"
+      body: |
+        The two time servers are in the group `ntp_servers`. Only the other hosts need the role.
+      cost: 1
+  misconceptions:
+    - id: pool-kept
+      description: "Adds the servers with line edits and leaves the old corporate pool in place."
+      feedback: "The two in-lab servers must be the only sources; the old pool line has to go."
+      expectFail: [sources-web1, uses-role]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/claims-automation
+          cat > timesync.yml <<'EOF'
+          - hosts: all:!ntp_servers
+            become: true
+            tasks:
+              - ansible.builtin.lineinfile: { path: /etc/chrony.conf, line: "server ov-ntp-1 iburst minpoll {{mp}}", insertafter: BOF }
+              - ansible.builtin.lineinfile: { path: /etc/chrony.conf, line: "server ov-ntp-2 iburst minpoll {{mp}}", insertafter: BOF }
+              - ansible.builtin.service: { name: chronyd, state: restarted, enabled: true }
+          EOF
+          ansible-playbook timesync.yml
+    - id: no-options
+      description: "Names the servers without the polling options."
+      feedback: "Each source needs iburst and the minpoll value; the role takes them as keys of every server entry."
+      expectFail: [sources-web1]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/claims-automation
+          cat > timesync.yml <<'EOF'
+          - name: Time synchronisation
+            hosts: all:!ntp_servers
+            become: true
+            vars:
+              timesync_ntp_servers:
+                - hostname: ov-ntp-1
+                - hostname: ov-ntp-2
+            roles:
+              - fedora.linux_system_roles.timesync
+          EOF
+          ansible-playbook timesync.yml
+    - id: one-server
+      description: "Configures only the first server."
+      feedback: "Auditors want both in-lab servers as sources."
+      expectFail: [sources-web1, listed-web1]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/claims-automation
+          cat > timesync.yml <<'EOF'
+          - name: Time synchronisation
+            hosts: all:!ntp_servers
+            become: true
+            vars:
+              timesync_ntp_servers:
+                - hostname: ov-ntp-1
+                  iburst: true
+                  minpoll: {{mp}}
+            roles:
+              - fedora.linux_system_roles.timesync
+          EOF
+          ansible-playbook timesync.yml
+  solution:
+    explanation: |
+      The `timesync` role from `fedora.linux_system_roles` is applied to every host outside `ntp_servers`, with
+      `timesync_ntp_servers` listing both servers and their `iburst` and `minpoll` options. The role replaces the old
+      pool, starts chronyd and enables it, and only rewrites the configuration when it differs, so a second run
+      reports no changes.
+    steps:
+      - on: ov-ctl
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/claims-automation
+          cat > timesync.yml <<'EOF'
+          - name: Time synchronisation
+            hosts: all:!ntp_servers
+            become: true
+            vars:
+              timesync_ntp_servers:
+                - hostname: ov-ntp-1
+                  iburst: true
+                  minpoll: {{mp}}
+                - hostname: ov-ntp-2
+                  iburst: true
+                  minpoll: {{mp}}
+            roles:
+              - fedora.linux_system_roles.timesync
+          EOF
+          ansible-playbook timesync.yml
+    alternatives:
+      - id: include-role
+        description: "Includes the role from a task instead of listing it under roles."
+        steps:
+          - on: ov-ctl
+            as: learner
+            timeoutSec: 600
+            run: |
+              set -e
+              cd ~/claims-automation
+              cat > timesync.yml <<'EOF'
+              - name: Time synchronisation
+                hosts: all:!ntp_servers
+                become: true
+                vars:
+                  timesync_ntp_servers:
+                    - hostname: ov-ntp-1
+                      iburst: true
+                      minpoll: {{mp}}
+                    - hostname: ov-ntp-2
+                      iburst: true
+                      minpoll: {{mp}}
+                tasks:
+                  - name: Time sources
+                    ansible.builtin.include_role:
+                      name: fedora.linux_system_roles.timesync
+              EOF
+              ansible-playbook timesync.yml

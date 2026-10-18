@@ -1,0 +1,349 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ov-reboot-persistence-fix
+  title: "Make runtime-only changes survive a reboot"
+  domain: automation
+  frameworks: [ex294-aligned:automate-system-tasks]
+  difficulty: medium
+  estimatedMinutes: 25
+  tags: [ansible, sysctl, firewalld, systemd, persistence, tier-c]
+  version: 1
+spec:
+  description: |
+    Last week's playbook **`/home/learner/claims-automation/harden.yml`** (inventory and `ansible.cfg` are in that
+    directory) was meant to apply three settings on the claims web nodes, but every one of them is lost at the next reboot:
+
+    - the kernel parameter `vm.swappiness` should be **{{swap}}**;
+    - TCP port **{{fwport}}** should be open in firewalld;
+    - the default boot target should be **`multi-user.target`** (the nodes boot to the graphical target).
+
+    Fix the playbook so that all three are in effect now **and** persistent, run it, and do not leave tasks that report a
+    change on every run. The grader checks the running state and the on-disk configuration that a reboot would restore,
+    then runs the playbook again and expects no changes.
+  objectives:
+    - "Tell runtime changes from persistent changes"
+    - "Persist sysctl, firewall and boot-target settings with modules"
+  params:
+    swap:
+      type: int
+      min: 5
+      max: 25
+    fwport:
+      type: choice
+      values: [7443, 7444, 7480]
+  topology:
+    entry: ov-ctl
+    nodes:
+      - { name: ov-ctl, driver: container, image: ansible-ctl:2.21, access: [shell] }
+      - { name: ov-claims-web1, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280 }, access: [ssh] }
+      - { name: ov-claims-web2, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280 }, access: [ssh] }
+  setup:
+    - on: ov-claims-web1
+      timeoutSec: 120
+      run: &ov-vm |
+        set -eu
+        id ovauto >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Orrin and Vale automation" ovauto
+        install -d -m 0700 -o ovauto -g ovauto /home/ovauto/.ssh
+        install -m 0600 -o ovauto -g ovauto /home/learner/.ssh/authorized_keys /home/ovauto/.ssh/authorized_keys
+        printf 'ovauto ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/ovauto
+        chmod 0440 /etc/sudoers.d/ovauto
+    - { on: ov-claims-web2, timeoutSec: 120, run: *ov-vm }
+    - on: ov-claims-web1
+      timeoutSec: 120
+      run: |
+        set -eu
+        [ -f /var/tmp/.ct-reboot-seeded ] && exit 0
+        systemctl set-default graphical.target >/dev/null 2>&1
+        sysctl -w vm.swappiness=60 >/dev/null
+        touch /var/tmp/.ct-reboot-seeded
+    - on: ov-claims-web2
+      timeoutSec: 120
+      run: |
+        set -eu
+        [ -f /var/tmp/.ct-reboot-seeded ] && exit 0
+        systemctl set-default graphical.target >/dev/null 2>&1
+        sysctl -w vm.swappiness=60 >/dev/null
+        touch /var/tmp/.ct-reboot-seeded
+    - on: ov-ctl
+      run: |
+        set -eu
+        p=/home/learner/claims-automation
+        install -d -o learner -g learner $p
+        cat > $p/inventory.yml <<'EOF'
+        claims:
+          children:
+            claims_web:
+              hosts:
+                ov-claims-web1:
+                ov-claims-web2:
+        EOF
+        printf '[defaults]\ninventory = inventory.yml\nremote_user = ovauto\n' > $p/ansible.cfg
+        cat > $p/harden.yml <<'EOF'
+        - name: Runtime hardening
+          hosts: claims_web
+          become: true
+          tasks:
+            - name: Swappiness
+              ansible.builtin.command: sysctl -w vm.swappiness={{swap}}
+            - name: Open the status port
+              ansible.posix.firewalld:
+                port: "{{fwport}}/tcp"
+                state: enabled
+                immediate: true
+                permanent: false
+            - name: Console target
+              ansible.builtin.command: systemctl isolate multi-user.target
+        EOF
+        chown -R learner:learner $p
+  checks:
+    - id: sysctl-web1
+      description: "The kernel parameter on ov-claims-web1 has the required value now and in a sysctl configuration file"
+      type: shell
+      on: ov-claims-web1
+      skills: [automation.modules.boot-kernel, automation.modules.firewall-selinux]
+      weight: 2
+      command: &sysc |
+        r=$(sysctl -n vm.swappiness)
+        grep -rqsE '^[[:space:]]*vm\.swappiness[[:space:]]*=[[:space:]]*{{swap}}[[:space:]]*$' /etc/sysctl.conf /etc/sysctl.d/ && f=persistent || f=runtime-only
+        echo "$r $f"
+      expect: { match: exact, value: "{{swap}} persistent" }
+    - { id: sysctl-web2, description: "The kernel parameter on ov-claims-web2 has the required value now and in a sysctl configuration file", type: shell, on: ov-claims-web2, skills: [automation.modules.boot-kernel, automation.modules.firewall-selinux], weight: 2, command: *sysc, expect: { match: exact, value: "{{swap}} persistent" } }
+    - id: firewall-web1
+      description: "The status port on ov-claims-web1 is open in the running firewall and in the permanent configuration"
+      type: shell
+      on: ov-claims-web1
+      skills: [automation.modules.boot-kernel, automation.modules.firewall-selinux]
+      weight: 2
+      command: &fw |
+        firewall-cmd --list-ports | tr ' ' '\n' | grep -qx '{{fwport}}/tcp' && a=live || a=not-live
+        firewall-cmd --permanent --list-ports | tr ' ' '\n' | grep -qx '{{fwport}}/tcp' && b=permanent || b=not-permanent
+        echo "$a $b"
+      expect: { match: exact, value: "live permanent" }
+    - { id: firewall-web2, description: "The status port on ov-claims-web2 is open in the running firewall and in the permanent configuration", type: shell, on: ov-claims-web2, skills: [automation.modules.boot-kernel, automation.modules.firewall-selinux], weight: 2, command: *fw, expect: { match: exact, value: "live permanent" } }
+    - id: target-web1
+      description: "The default boot target of ov-claims-web1 is the multi-user target"
+      type: shell
+      on: ov-claims-web1
+      skills: [automation.modules.boot-kernel, automation.modules.firewall-selinux]
+      weight: 1.5
+      command: &tgt |
+        systemctl get-default
+      expect: { match: exact, value: "multi-user.target" }
+    - { id: target-web2, description: "The default boot target of ov-claims-web2 is the multi-user target", type: shell, on: ov-claims-web2, skills: [automation.modules.boot-kernel, automation.modules.firewall-selinux], weight: 1.5, command: *tgt, expect: { match: exact, value: "multi-user.target" } }
+    - id: rerun-no-changes
+      description: "harden.yml runs again without changes"
+      type: shell
+      on: ov-ctl
+      skills: [automation.modules.boot-kernel, automation.modules.firewall-selinux]
+      weight: 2
+      timeoutSec: 600
+      command: |
+        ct-ansible recap /home/learner/claims-automation harden.yml
+      expect: { match: exact, value: "changed=0 failed=0 unreachable=0" }
+  hints:
+    - title: "What survives a reboot?"
+      body: |
+        Only what is written to disk. `sysctl -w`, a firewalld rule without `permanent`, and `systemctl isolate` change the running system only. Compare what each task of the supplied playbook does with what the checks look at.
+      cost: 1
+    - title: "Modules that do both"
+      body: |
+        `ansible.posix.sysctl` writes a file (give it `sysctl_file`) and, with `sysctl_set: true`, applies the value as well. `ansible.posix.firewalld` takes `permanent` and `immediate` separately; you need both.
+      cost: 1
+    - title: "The default target"
+      body: |
+        `systemctl get-default` shows it and `systemctl set-default multi-user.target` changes it. Run the second only when the first reports something else, so a re-run changes nothing.
+      cost: 1
+  misconceptions:
+    - id: file-only
+      description: "Writes the sysctl file but never applies the value to the running kernel."
+      feedback: "The value must be in effect now as well as after the next boot."
+      expectFail: [sysctl-web1, sysctl-web2]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/claims-automation
+          cat > harden.yml <<'EOF'
+          - name: Persistent hardening
+            hosts: claims_web
+            become: true
+            tasks:
+              - name: Swappiness
+                ansible.posix.sysctl:
+                  name: vm.swappiness
+                  value: "{{swap}}"
+                  sysctl_file: /etc/sysctl.d/90-ov.conf
+                  sysctl_set: false
+                  reload: false
+                  state: present
+              - name: Open the status port
+                ansible.posix.firewalld:
+                  port: "{{fwport}}/tcp"
+                  state: enabled
+                  immediate: true
+                  permanent: true
+              - name: Current default target
+                ansible.builtin.command: systemctl get-default
+                register: target
+                changed_when: false
+              - name: multi-user as default target
+                ansible.builtin.command: systemctl set-default multi-user.target
+                when: target.stdout != 'multi-user.target'
+          EOF
+          ansible-playbook harden.yml
+    - id: permanent-only
+      description: "Makes the firewall rule permanent but does not open it in the running firewall."
+      feedback: "A permanent rule only applies after a reload or reboot; also set immediate."
+      expectFail: [firewall-web1, firewall-web2]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/claims-automation
+          cat > harden.yml <<'EOF'
+          - name: Persistent hardening
+            hosts: claims_web
+            become: true
+            tasks:
+              - name: Swappiness
+                ansible.posix.sysctl:
+                  name: vm.swappiness
+                  value: "{{swap}}"
+                  sysctl_file: /etc/sysctl.d/90-ov.conf
+                  sysctl_set: true
+                  reload: true
+                  state: present
+              - name: Open the status port
+                ansible.posix.firewalld:
+                  port: "{{fwport}}/tcp"
+                  state: enabled
+                  immediate: false
+                  permanent: true
+              - name: Current default target
+                ansible.builtin.command: systemctl get-default
+                register: target
+                changed_when: false
+              - name: multi-user as default target
+                ansible.builtin.command: systemctl set-default multi-user.target
+                when: target.stdout != 'multi-user.target'
+          EOF
+          ansible-playbook harden.yml
+    - id: isolate-again
+      description: "Leaves the target change as a runtime isolate."
+      feedback: "Isolating a target does not change the default; the next boot would use the old one."
+      expectFail: [target-web1, target-web2]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/claims-automation
+          cat > harden.yml <<'EOF'
+          - name: Persistent hardening
+            hosts: claims_web
+            become: true
+            tasks:
+              - name: Swappiness
+                ansible.posix.sysctl:
+                  name: vm.swappiness
+                  value: "{{swap}}"
+                  sysctl_file: /etc/sysctl.d/90-ov.conf
+                  sysctl_set: true
+                  reload: true
+                  state: present
+              - name: Open the status port
+                ansible.posix.firewalld:
+                  port: "{{fwport}}/tcp"
+                  state: enabled
+                  immediate: true
+                  permanent: true
+              - name: Console target
+                ansible.builtin.command: systemctl isolate multi-user.target
+                changed_when: false
+          EOF
+          ansible-playbook harden.yml
+  solution:
+    explanation: |
+      Each runtime-only task is replaced by a persistent one: the sysctl module writes a drop-in file and applies the
+      value, firewalld gets `permanent: true` together with `immediate: true`, and the default target is set with
+      `set-default` only when it differs. The grader checks the on-disk state as well as the running state, which is what
+      a reboot would restore, and the second run changes nothing.
+    steps:
+      - on: ov-ctl
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/claims-automation
+          cat > harden.yml <<'EOF'
+          - name: Persistent hardening
+            hosts: claims_web
+            become: true
+            tasks:
+              - name: Swappiness
+                ansible.posix.sysctl:
+                  name: vm.swappiness
+                  value: "{{swap}}"
+                  sysctl_file: /etc/sysctl.d/90-ov.conf
+                  sysctl_set: true
+                  reload: true
+                  state: present
+              - name: Open the status port
+                ansible.posix.firewalld:
+                  port: "{{fwport}}/tcp"
+                  state: enabled
+                  immediate: true
+                  permanent: true
+              - name: Current default target
+                ansible.builtin.command: systemctl get-default
+                register: target
+                changed_when: false
+              - name: multi-user as default target
+                ansible.builtin.command: systemctl set-default multi-user.target
+                when: target.stdout != 'multi-user.target'
+          EOF
+          ansible-playbook harden.yml
+    alternatives:
+      - id: drop-in-and-link
+        description: "Writes the sysctl drop-in with copy and a handler, and sets the default target by linking default.target."
+        steps:
+          - on: ov-ctl
+            as: learner
+            timeoutSec: 600
+            run: |
+              set -e
+              cd ~/claims-automation
+              cat > harden.yml <<'EOF'
+              - name: Persistent hardening
+                hosts: claims_web
+                become: true
+                tasks:
+                  - name: Swappiness drop-in
+                    ansible.builtin.copy:
+                      dest: /etc/sysctl.d/90-ov.conf
+                      content: "vm.swappiness = {{swap}}\n"
+                      mode: "0644"
+                    notify: Apply sysctl
+                  - name: Open the status port
+                    ansible.posix.firewalld:
+                      port: "{{fwport}}/tcp"
+                      state: enabled
+                      immediate: true
+                      permanent: true
+                  - name: multi-user as default target
+                    ansible.builtin.file:
+                      src: /usr/lib/systemd/system/multi-user.target
+                      dest: /etc/systemd/system/default.target
+                      state: link
+                      force: true
+                handlers:
+                  - name: Apply sysctl
+                    ansible.builtin.command: sysctl --system
+              EOF
+              ansible-playbook harden.yml

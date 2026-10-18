@@ -1,0 +1,403 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ov-automate-repos-packages
+  title: "Point the fleet at the internal package mirrors"
+  domain: automation
+  frameworks: [ex294-aligned:automate-system-tasks, rhcsa-aligned:software]
+  difficulty: easy
+  estimatedMinutes: 20
+  tags: [ansible, dnf, repositories, packages, tier-c]
+  version: 1
+spec:
+  description: |
+    The claims web nodes have no package repositories configured. The in-lab package mirror runs on `ov-db-1`
+    (port {{mport}}):
+
+    - BaseOS: `http://ov-db-1:{{mport}}/el10/BaseOS`
+    - AppStream: `http://ov-db-1:{{mport}}/el10/AppStream`
+
+    Write **`/home/learner/claims-automation/repos.yml`** (inventory and `ansible.cfg` are in that directory) that, on the
+    **`claims_web`** hosts:
+
+    - configures both repositories, **enabled** and with **signature checking** on (the key is
+      `/etc/pki/rpm-gpg/RPM-GPG-KEY-AlmaLinux-10`); no other repository is used;
+    - makes sure the claims toolset is installed: **httpd**, **mod_ssl** and **{{extra}}**;
+    - makes sure the legacy **telnet** package is absent.
+
+    Run it; the grader runs it again and expects no changes.
+  objectives:
+    - "Define package repositories with the right trust settings"
+    - "Install and remove packages idempotently"
+  params:
+    mport:
+      type: choice
+      values: [8800, 8810, 8820]
+    extra:
+      type: choice
+      values: [mariadb-server, haproxy, squid]
+  topology:
+    entry: ov-ctl
+    nodes:
+      - { name: ov-ctl, driver: container, image: ansible-ctl:2.21, access: [shell] }
+      - { name: ov-db-1, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280 }, access: [ssh] }
+      - { name: ov-claims-web1, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280 }, access: [ssh] }
+      - { name: ov-claims-web2, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280 }, access: [ssh] }
+  setup:
+    - on: ov-db-1
+      timeoutSec: 120
+      run: &ov-vm |
+        set -eu
+        id ovauto >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Orrin and Vale automation" ovauto
+        install -d -m 0700 -o ovauto -g ovauto /home/ovauto/.ssh
+        install -m 0600 -o ovauto -g ovauto /home/learner/.ssh/authorized_keys /home/ovauto/.ssh/authorized_keys
+        printf 'ovauto ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/ovauto
+        chmod 0440 /etc/sudoers.d/ovauto
+    - { on: ov-claims-web1, timeoutSec: 120, run: *ov-vm }
+    - { on: ov-claims-web2, timeoutSec: 120, run: *ov-vm }
+    - on: ov-db-1
+      timeoutSec: 180
+      run: |
+        set -eu
+        [ -f /var/tmp/.ct-mirror-seeded ] && exit 0
+        mkdir -p /srv/mirror/el10
+        ln -sfn /opt/cloudtrain/repo/el10 /srv/mirror/el10/BaseOS
+        ln -sfn /opt/cloudtrain/repo/el10 /srv/mirror/el10/AppStream
+        cat > /etc/systemd/system/ov-mirror.service <<'UNIT'
+        [Unit]
+        Description=Orrin and Vale package mirror
+        After=network-online.target
+        [Service]
+        ExecStart=/usr/bin/python3 -m http.server {{mport}} --directory /srv/mirror
+        Restart=always
+        [Install]
+        WantedBy=multi-user.target
+        UNIT
+        systemctl daemon-reload
+        systemctl enable --now ov-mirror
+        firewall-cmd -q --permanent --add-port={{mport}}/tcp; firewall-cmd -q --reload
+        touch /var/tmp/.ct-mirror-seeded
+    - on: ov-claims-web1
+      timeoutSec: 300
+      run: |
+        set -eu
+        [ -f /var/tmp/.ct-repos-seeded ] && exit 0
+        rpm -q telnet >/dev/null 2>&1 || dnf -y -q install telnet >/dev/null
+        mkdir -p /root/repos.disabled
+        for f in /etc/yum.repos.d/*.repo; do [ -e "$f" ] && mv "$f" /root/repos.disabled/; done
+        dnf clean all >/dev/null 2>&1 || true
+        for i in $(seq 40); do curl -sf -o /dev/null http://ov-db-1:{{mport}}/el10/BaseOS/repodata/repomd.xml && break; sleep 2; done
+        touch /var/tmp/.ct-repos-seeded
+    - on: ov-claims-web2
+      timeoutSec: 300
+      run: |
+        set -eu
+        [ -f /var/tmp/.ct-repos-seeded ] && exit 0
+        rpm -q telnet >/dev/null 2>&1 || dnf -y -q install telnet >/dev/null
+        mkdir -p /root/repos.disabled
+        for f in /etc/yum.repos.d/*.repo; do [ -e "$f" ] && mv "$f" /root/repos.disabled/; done
+        dnf clean all >/dev/null 2>&1 || true
+        for i in $(seq 40); do curl -sf -o /dev/null http://ov-db-1:{{mport}}/el10/BaseOS/repodata/repomd.xml && break; sleep 2; done
+        touch /var/tmp/.ct-repos-seeded
+    - on: ov-ctl
+      run: |
+        set -eu
+        p=/home/learner/claims-automation
+        install -d -o learner -g learner $p
+        cat > $p/inventory.yml <<'EOF'
+        claims:
+          children:
+            claims_web:
+              hosts:
+                ov-claims-web1:
+                ov-claims-web2:
+            claims_db:
+              hosts:
+                ov-db-1:
+        EOF
+        printf '[defaults]\ninventory = inventory.yml\nremote_user = ovauto\n' > $p/ansible.cfg
+
+        chown -R learner:learner $p
+  checks:
+    - id: repos-web1
+      description: "ov-claims-web1 has exactly the two mirror repositories configured, enabled and with signature checking"
+      type: shell
+      on: ov-claims-web1
+      skills: [automation.modules.packages-services]
+      weight: 2
+      command: &repos |
+        python3 - <<'PY'
+        import configparser, glob
+        def truthy(v): return str(v).strip().lower() in ("1", "yes", "true", "on")
+        main = configparser.ConfigParser(interpolation=None, strict=False)
+        main.read("/etc/dnf/dnf.conf")
+        dflt = main.get("main", "gpgcheck", fallback="0")
+        want = {"http://ov-db-1:{{mport}}/el10/BaseOS", "http://ov-db-1:{{mport}}/el10/AppStream"}
+        found = set()
+        n = 0
+        for f in glob.glob("/etc/yum.repos.d/*.repo"):
+            c = configparser.ConfigParser(interpolation=None, strict=False)
+            try:
+                c.read(f)
+            except Exception:
+                continue
+            for s in c.sections():
+                if not truthy(c.get(s, "enabled", fallback="1")):
+                    continue
+                n += 1
+                gpg = truthy(c.get(s, "gpgcheck", fallback=dflt))
+                for u in c.get(s, "baseurl", fallback="").split():
+                    u = u.rstrip("/")
+                    if u in want and gpg:
+                        found.add(u)
+        print("both" if found == want and n == 2 else "enabled-repos=%d" % n if found == want else "found=" + ",".join(sorted(found)))
+        PY
+      expect: { match: exact, value: "both" }
+    - { id: repos-web2, description: "ov-claims-web2 has exactly the two mirror repositories configured, enabled and with signature checking", type: shell, on: ov-claims-web2, skills: [automation.modules.packages-services], weight: 2, command: *repos, expect: { match: exact, value: "both" } }
+    - id: pkgs-web1
+      description: "ov-claims-web1 has the claims toolset installed and the legacy telnet client removed"
+      type: shell
+      on: ov-claims-web1
+      skills: [automation.modules.packages-services]
+      weight: 2
+      command: &pkgs |
+        r=""
+        for p in httpd mod_ssl {{extra}}; do rpm -q $p >/dev/null 2>&1 || r="$r missing:$p"; done
+        rpm -q telnet >/dev/null 2>&1 && r="$r telnet-present"
+        echo "${r:-ok}"
+      expect: { match: exact, value: "ok" }
+    - { id: pkgs-web2, description: "ov-claims-web2 has the claims toolset installed and the legacy telnet client removed", type: shell, on: ov-claims-web2, skills: [automation.modules.packages-services], weight: 2, command: *pkgs, expect: { match: exact, value: "ok" } }
+    - id: works-web1
+      description: "dnf on ov-claims-web1 can use the mirror"
+      type: shell
+      on: ov-claims-web1
+      skills: [automation.modules.packages-services]
+      timeoutSec: 120
+      command: |
+        timeout 100 dnf -q --refresh repoquery tree 2>/dev/null | grep -q '^tree-' && echo works || echo broken
+      expect: { match: exact, value: "works" }
+    - id: rerun-no-changes
+      description: "repos.yml runs again without changes"
+      type: shell
+      on: ov-ctl
+      skills: [automation.modules.packages-services]
+      weight: 2
+      timeoutSec: 600
+      command: |
+        ct-ansible recap /home/learner/claims-automation repos.yml
+      expect: { match: exact, value: "changed=0 failed=0 unreachable=0" }
+  hints:
+    - title: "A repository is a module"
+      body: |
+        `ansible.builtin.yum_repository` writes a file in `/etc/yum.repos.d`. It takes `baseurl`, `enabled`, `gpgcheck` and `gpgkey`; one task with a `loop` can create both repositories.
+      cost: 1
+    - title: "Packages and their opposite"
+      body: |
+        `ansible.builtin.dnf` with `state: present` installs, with `state: absent` removes. A list of names goes into one task.
+      cost: 1
+    - title: "Only the web nodes"
+      body: |
+        The mirror itself runs on `ov-db-1`; the playbook targets the `claims_web` group.
+      cost: 1
+  misconceptions:
+    - id: gpg-off
+      description: "Configures the mirrors with signature checking switched off."
+      feedback: "The repositories must verify package signatures: gpgcheck on, with the key file."
+      expectFail: [repos-web1, repos-web2]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/claims-automation
+          cat > repos.yml <<'EOF'
+          - name: Internal package mirrors
+            hosts: claims_web
+            become: true
+            tasks:
+              - name: Mirror repositories
+                ansible.builtin.yum_repository:
+                  name: "{{ item }}"
+                  description: "Orrin and Vale {{ item }}"
+                  baseurl: "http://ov-db-1:{{mport}}/el10/{{ item }}"
+                  enabled: true
+                  gpgcheck: false
+                  gpgkey: file:///etc/pki/rpm-gpg/RPM-GPG-KEY-AlmaLinux-10
+                loop:
+                  - BaseOS
+                  - AppStream
+              - name: Claims toolset
+                ansible.builtin.dnf:
+                  name:
+                    - httpd
+                    - mod_ssl
+                    - {{extra}}
+                  state: present
+              - name: Legacy telnet client removed
+                ansible.builtin.dnf:
+                  name: telnet
+                  state: absent
+          EOF
+          ansible-playbook repos.yml
+    - id: repo-disabled
+      description: "Defines the repositories but leaves them disabled."
+      feedback: "A disabled repository is not used; both mirrors must be enabled."
+      expectFail: [repos-web1, repos-web2, pkgs-web1, pkgs-web2]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/claims-automation
+          cat > repos.yml <<'EOF'
+          - name: Internal package mirrors
+            hosts: claims_web
+            become: true
+            tasks:
+              - name: Mirror repositories
+                ansible.builtin.yum_repository:
+                  name: "{{ item }}"
+                  description: "Orrin and Vale {{ item }}"
+                  baseurl: "http://ov-db-1:{{mport}}/el10/{{ item }}"
+                  enabled: false
+                  gpgcheck: true
+                  gpgkey: file:///etc/pki/rpm-gpg/RPM-GPG-KEY-AlmaLinux-10
+                loop:
+                  - BaseOS
+                  - AppStream
+              - name: Claims toolset
+                ansible.builtin.dnf:
+                  name:
+                    - httpd
+                    - mod_ssl
+                    - {{extra}}
+                  state: present
+              - name: Legacy telnet client removed
+                ansible.builtin.dnf:
+                  name: telnet
+                  state: absent
+          EOF
+          ansible-playbook repos.yml || true
+    - id: telnet-stays
+      description: "Installs the toolset but forgets to remove the legacy telnet client."
+      feedback: "The play must also make sure telnet is absent."
+      expectFail: [pkgs-web1, pkgs-web2]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/claims-automation
+          cat > repos.yml <<'EOF'
+          - name: Internal package mirrors
+            hosts: claims_web
+            become: true
+            tasks:
+              - name: Mirror repositories
+                ansible.builtin.yum_repository:
+                  name: "{{ item }}"
+                  description: "Orrin and Vale {{ item }}"
+                  baseurl: "http://ov-db-1:{{mport}}/el10/{{ item }}"
+                  enabled: true
+                  gpgcheck: true
+                  gpgkey: file:///etc/pki/rpm-gpg/RPM-GPG-KEY-AlmaLinux-10
+                loop:
+                  - BaseOS
+                  - AppStream
+              - name: Claims toolset
+                ansible.builtin.dnf:
+                  name:
+                    - httpd
+                    - mod_ssl
+                    - {{extra}}
+                  state: present
+          EOF
+          ansible-playbook repos.yml
+  solution:
+    explanation: |
+      One `yum_repository` task with a loop defines BaseOS and AppStream from the in-lab mirror with `gpgcheck` and the
+      key file; the `dnf` task installs the toolset (httpd, mod_ssl and one more server package) and a second `dnf`
+      task with `state: absent` removes telnet. Both modules compare the current state first, so a second run changes
+      nothing.
+    steps:
+      - on: ov-ctl
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/claims-automation
+          cat > repos.yml <<'EOF'
+          - name: Internal package mirrors
+            hosts: claims_web
+            become: true
+            tasks:
+              - name: Mirror repositories
+                ansible.builtin.yum_repository:
+                  name: "{{ item }}"
+                  description: "Orrin and Vale {{ item }}"
+                  baseurl: "http://ov-db-1:{{mport}}/el10/{{ item }}"
+                  enabled: true
+                  gpgcheck: true
+                  gpgkey: file:///etc/pki/rpm-gpg/RPM-GPG-KEY-AlmaLinux-10
+                loop:
+                  - BaseOS
+                  - AppStream
+              - name: Claims toolset
+                ansible.builtin.dnf:
+                  name:
+                    - httpd
+                    - mod_ssl
+                    - {{extra}}
+                  state: present
+              - name: Legacy telnet client removed
+                ansible.builtin.dnf:
+                  name: telnet
+                  state: absent
+          EOF
+          ansible-playbook repos.yml
+    alternatives:
+      - id: repo-file-copy
+        description: "Writes one .repo file with the copy module and uses the generic package module."
+        steps:
+          - on: ov-ctl
+            as: learner
+            timeoutSec: 600
+            run: |
+              set -e
+              cd ~/claims-automation
+              cat > repos.yml <<'EOF'
+              - name: Internal package mirrors
+                hosts: claims_web
+                become: true
+                tasks:
+                  - name: Mirror repository file
+                    ansible.builtin.copy:
+                      dest: /etc/yum.repos.d/ov-mirror.repo
+                      mode: "0644"
+                      content: |
+                        [BaseOS]
+                        name=Orrin and Vale BaseOS
+                        baseurl=http://ov-db-1:{{mport}}/el10/BaseOS
+                        enabled=1
+                        gpgcheck=1
+                        gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-AlmaLinux-10
+
+                        [AppStream]
+                        name=Orrin and Vale AppStream
+                        baseurl=http://ov-db-1:{{mport}}/el10/AppStream
+                        enabled=1
+                        gpgcheck=1
+                        gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-AlmaLinux-10
+                  - name: Claims toolset
+                    ansible.builtin.package:
+                      name: ["httpd", "mod_ssl", "{{extra}}"]
+                      state: present
+                  - name: Legacy telnet client removed
+                    ansible.builtin.package:
+                      name: telnet
+                      state: absent
+              EOF
+              ansible-playbook repos.yml

@@ -1,0 +1,411 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ov-net-srlinux-interfaces
+  title: "Configure VLAN subinterfaces on the aggregation router from a data file"
+  domain: automation
+  frameworks: [ex457-aligned:netcommon-modules]
+  difficulty: medium
+  estimatedMinutes: 30
+  tags: [ansible, network, frr, vlan, data-driven, tier-n, blocked]
+  version: 1
+spec:
+  description: |
+    The aggregation router `ov-branch-lon-gw` carries the claims and branch VLANs on its trunk interface `eth1`.
+    The VLAN data is in `vars/vlans.yml` in `/home/learner/net` (id, address and description of each VLAN); the inventory
+    (group `aggregation`) and `ansible.cfg` are in the project.
+
+    Write **`vlans.yml`** (and any template it needs) that, from that data file only:
+
+    - creates an 802.1Q subinterface `eth1.<id>` for each VLAN;
+    - gives each subinterface the **address and description** from the file in the FRR configuration;
+    - **commits** the result so it is in the saved FRR configuration as well as the running one.
+
+    Run it; the grader runs it again and expects no changes.
+  objectives:
+    - "Drive interface configuration from a data file"
+    - "Configure VLAN subinterfaces on a router"
+    - "Commit device configuration"
+  params:
+    bootpw:
+      type: int
+      min: 100000
+      max: 999999
+    octet:
+      type: int
+      min: 20
+      max: 90
+    vid1:
+      type: int
+      min: 110
+      max: 130
+    vid2:
+      type: int
+      min: 140
+      max: 160
+  topology:
+    entry: ov-ctl
+    nodes:
+      - { name: ov-ctl, driver: container, image: ansible-ctl:2.21, access: [shell] }
+      - { name: ov-branch-lon-gw, driver: netdev, image: frr:10, access: [console] }
+      - { name: ov-branch-man-gw, driver: netdev, image: frr:10, access: [console] }
+    links:
+      - { a: "ov-ctl:eth1", b: "ov-branch-lon-gw:eth3" }
+      - { a: "ov-branch-lon-gw:eth1", b: "ov-branch-man-gw:eth1" }
+  setup:
+    - on: ov-branch-lon-gw
+      timeoutSec: 120
+      run: &ov-router |
+        set -eu
+        case $(hostname) in
+          ov-branch-lon-gw) a=21 ;; ov-branch-man-gw) a=22 ;; ov-branch-lds-gw) a=23 ;;
+          *) echo "unknown host $(hostname)" >&2; exit 1 ;;
+        esac
+        ip link set eth3 up
+        ip addr replace 10.70.0.$a/24 dev eth3
+        for c in sshd useradd chpasswd sudo python3; do
+          command -v $c >/dev/null 2>&1 || { echo "blocked: this frr image has no $c; routers need openssh-server, sudo, python3 and an automation account (image rebuild)" >&2; exit 1; }
+        done
+        id ovauto >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Orrin and Vale automation" ovauto
+        echo 'ovauto:Ov-boot-{{bootpw}}' | chpasswd
+        printf 'ovauto ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/ovauto
+        chmod 0440 /etc/sudoers.d/ovauto
+        ssh-keygen -A >/dev/null 2>&1
+        mkdir -p /run/sshd
+        pgrep -x sshd >/dev/null || /usr/sbin/sshd
+    - on: ov-branch-man-gw
+      timeoutSec: 60
+      run: |
+        # trunk peer: keeps the kernel link behind ov-branch-lon-gw eth1 up so the VLAN subinterfaces can come up
+        ip link set eth1 up
+    - on: ov-ctl
+      timeoutSec: 300
+      run: |
+        set -eu
+        ct-fleet-net 10.70.0.10/24 ov-branch-lon-gw=10.70.0.21
+        ct-ansible pushkey --seal ovauto Ov-boot-{{bootpw}} ov-branch-lon-gw
+        p=/home/learner/net
+        install -d -o learner -g learner $p
+        cat > $p/inventory.yml <<'EOF'
+        aggregation:
+          hosts:
+            ov-branch-lon-gw:
+          vars:
+            ansible_connection: ssh
+            ansible_network_os: frr
+            ansible_python_interpreter: /usr/bin/python3
+        EOF
+        printf '[defaults]\ninventory = inventory.yml\nremote_user = ovauto\n\n[privilege_escalation]\nbecome = True\n' > $p/ansible.cfg
+        install -d -o learner -g learner $p/vars
+        cat > $p/vars/vlans.yml <<'EOF'
+        vlans:
+          - { name: claims, id: {{vid1}}, address: 10.{{octet}}.{{vid1}}.1/24, description: Claims office LAN }
+          - { name: branch, id: {{vid2}}, address: 10.{{octet}}.{{vid2}}.1/24, description: Branch uplink }
+        EOF
+        chown -R learner:learner $p
+  checks:
+    - id: vlan-interfaces
+      description: "ov-branch-lon-gw has 802.1Q subinterfaces of its trunk for the claims and branch VLANs"
+      type: shell
+      on: ov-branch-lon-gw
+      skills: [automation.network.connections, automation.network.resource-config]
+      weight: 2
+      command: |
+        r=""
+        for v in {{vid1}} {{vid2}}; do
+          ip -d link show eth1.$v 2>/dev/null | grep -q "vlan protocol 802.1Q id $v" || r="$r eth1.$v"
+        done
+        echo "${r:-ok}"
+      expect: { match: exact, value: "ok" }
+    - id: frr-running
+      description: "The running FRR configuration has both subinterfaces with the descriptions and addresses from the data file"
+      type: shell
+      on: ov-branch-lon-gw
+      skills: [automation.network.connections, automation.network.resource-config]
+      weight: 2
+      command: |
+        r=""
+        for e in {{vid1}}:Claims_office_LAN {{vid2}}:Branch_uplink; do
+          v=${e%%:*}; d=$(echo ${e#*:} | tr _ ' ')
+          blk=$(vtysh -c 'show running-config' | awk -v i="interface eth1.$v" '$0==i{f=1;next} /^[^ ]/{f=0} f')
+          echo "$blk" | grep -qxF " description $d" || r="$r eth1.$v:description"
+          echo "$blk" | grep -qxF " ip address 10.{{octet}}.$v.1/24" || r="$r eth1.$v:address"
+        done
+        echo "${r:-ok}"
+      expect: { match: exact, value: "ok" }
+    - id: frr-saved
+      description: "The saved FRR configuration file has the same subinterface settings (committed)"
+      type: shell
+      on: ov-branch-lon-gw
+      skills: [automation.network.connections, automation.network.resource-config]
+      weight: 2
+      command: |
+        r=""
+        for e in {{vid1}}:Claims_office_LAN {{vid2}}:Branch_uplink; do
+          v=${e%%:*}; d=$(echo ${e#*:} | tr _ ' ')
+          blk=$(cat /etc/frr/frr.conf | awk -v i="interface eth1.$v" '$0==i{f=1;next} /^[^ ]/{f=0} f')
+          echo "$blk" | grep -qxF " description $d" || r="$r eth1.$v:description"
+          echo "$blk" | grep -qxF " ip address 10.{{octet}}.$v.1/24" || r="$r eth1.$v:address"
+        done
+        echo "${r:-ok}"
+      expect: { match: exact, value: "ok" }
+    - id: rerun-no-changes
+      description: "vlans.yml runs again without changes"
+      type: shell
+      on: ov-ctl
+      skills: [automation.network.connections, automation.network.resource-config]
+      weight: 2
+      timeoutSec: 240
+      command: |
+        ct-ansible recap /home/learner/net vlans.yml
+      expect: { match: exact, value: "changed=0 failed=0 unreachable=0" }
+  hints:
+    - title: "Two layers"
+      body: |
+        A VLAN subinterface exists in the Linux kernel first (`ip link add link eth1 name eth1.<id> type vlan id <id>`), and only then can FRR configure it. The command module's `creates:` (a path such as `/sys/class/net/eth1.<id>`) makes the creation idempotent.
+      cost: 1
+    - title: "Data from the YAML file"
+      body: |
+        `vars_files: [vars/vlans.yml]` brings the list `vlans` into the play. One template can loop over it and write the FRR `interface` blocks; one `loop:` creates the kernel interfaces.
+      cost: 1
+    - title: "Commit"
+      body: |
+        Applying a file with `vtysh -f` changes the running configuration only. `vtysh -c 'write memory'` saves it to `/etc/frr/frr.conf`. Run both from a handler so an unchanged run does nothing.
+      cost: 2
+  misconceptions:
+    - id: no-descriptions
+      description: "Creates the subinterfaces and addresses but leaves out the descriptions from the data file."
+      feedback: "The descriptions in the data file are part of the configuration."
+      expectFail: [frr-running, frr-saved]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/net
+          mkdir -p templates
+          cat > templates/vlans.conf.j2 <<'EOF'
+          {% for v in vlans %}
+          interface eth1.{{ v.id }}
+           ip address {{ v.address }}
+          !
+          {% endfor %}
+          EOF
+          cat > vlans.yml <<'EOF'
+          - name: VLAN subinterfaces on the aggregation router
+            hosts: aggregation
+            become: true
+            gather_facts: false
+            vars_files:
+              - vars/vlans.yml
+            tasks:
+              - name: Kernel VLAN subinterfaces
+                ansible.builtin.command: ip link add link eth1 name eth1.{{ item.id }} type vlan id {{ item.id }}
+                args:
+                  creates: /sys/class/net/eth1.{{ item.id }}
+                loop: "{{ vlans }}"
+              - name: Subinterfaces up
+                ansible.builtin.command: ip link set eth1.{{ item.id }} up
+                changed_when: false
+                loop: "{{ vlans }}"
+              - name: FRR configuration for the subinterfaces
+                ansible.builtin.template:
+                  src: vlans.conf.j2
+                  dest: /etc/frr/ov-vlans.conf
+                  mode: "0640"
+                notify: Apply and save
+            handlers:
+              - name: Apply and save
+                ansible.builtin.shell: vtysh -f /etc/frr/ov-vlans.conf && vtysh -c 'write memory'
+          EOF
+          ansible-playbook vlans.yml
+    - id: not-committed
+      description: "Applies the configuration but never saves it."
+      feedback: "A change that is not written to the configuration file is lost at the next restart; commit it."
+      expectFail: [frr-saved]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/net
+          mkdir -p templates
+          cat > templates/vlans.conf.j2 <<'EOF'
+          {% for v in vlans %}
+          interface eth1.{{ v.id }}
+           description {{ v.description }}
+           ip address {{ v.address }}
+          !
+          {% endfor %}
+          EOF
+          cat > vlans.yml <<'EOF'
+          - name: VLAN subinterfaces on the aggregation router
+            hosts: aggregation
+            become: true
+            gather_facts: false
+            vars_files:
+              - vars/vlans.yml
+            tasks:
+              - name: Kernel VLAN subinterfaces
+                ansible.builtin.command: ip link add link eth1 name eth1.{{ item.id }} type vlan id {{ item.id }}
+                args:
+                  creates: /sys/class/net/eth1.{{ item.id }}
+                loop: "{{ vlans }}"
+              - name: Subinterfaces up
+                ansible.builtin.command: ip link set eth1.{{ item.id }} up
+                changed_when: false
+                loop: "{{ vlans }}"
+              - name: FRR configuration for the subinterfaces
+                ansible.builtin.template:
+                  src: vlans.conf.j2
+                  dest: /etc/frr/ov-vlans.conf
+                  mode: "0640"
+                notify: Apply and save
+            handlers:
+              - name: Apply and save
+                ansible.builtin.shell: vtysh -f /etc/frr/ov-vlans.conf
+          EOF
+          ansible-playbook vlans.yml
+    - id: link-add-every-run
+      description: "Creates the kernel interfaces with a plain command that runs every time."
+      feedback: "The creation must be guarded so a second run changes nothing."
+      expectFail: [rerun-no-changes]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/net
+          mkdir -p templates
+          cat > templates/vlans.conf.j2 <<'EOF'
+          {% for v in vlans %}
+          interface eth1.{{ v.id }}
+           description {{ v.description }}
+           ip address {{ v.address }}
+          !
+          {% endfor %}
+          EOF
+          cat > vlans.yml <<'EOF'
+          - name: VLAN subinterfaces on the aggregation router
+            hosts: aggregation
+            become: true
+            gather_facts: false
+            vars_files:
+              - vars/vlans.yml
+            tasks:
+              - name: Kernel VLAN subinterfaces
+                ansible.builtin.command: ip link add link eth1 name eth1.{{ item.id }} type vlan id {{ item.id }}
+                failed_when: false
+                loop: "{{ vlans }}"
+              - name: Subinterfaces up
+                ansible.builtin.command: ip link set eth1.{{ item.id }} up
+                changed_when: false
+                loop: "{{ vlans }}"
+              - name: FRR configuration for the subinterfaces
+                ansible.builtin.template:
+                  src: vlans.conf.j2
+                  dest: /etc/frr/ov-vlans.conf
+                  mode: "0640"
+                notify: Apply and save
+            handlers:
+              - name: Apply and save
+                ansible.builtin.shell: vtysh -f /etc/frr/ov-vlans.conf && vtysh -c 'write memory'
+          EOF
+          ansible-playbook vlans.yml
+          ansible-playbook vlans.yml || true
+  solution:
+    explanation: |
+      A loop creates the kernel VLAN subinterfaces on the trunk interface, guarded with `creates` so it is idempotent. A
+      template renders the FRR `interface` blocks (description and address) from the data file into a file on the device,
+      and a handler applies it with `vtysh -f` and saves the result with `write memory`. On the second run nothing
+      changes, so the handler does not fire.
+    steps:
+      - on: ov-ctl
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/net
+          mkdir -p templates
+          cat > templates/vlans.conf.j2 <<'EOF'
+          {% for v in vlans %}
+          interface eth1.{{ v.id }}
+           description {{ v.description }}
+           ip address {{ v.address }}
+          !
+          {% endfor %}
+          EOF
+          cat > vlans.yml <<'EOF'
+          - name: VLAN subinterfaces on the aggregation router
+            hosts: aggregation
+            become: true
+            gather_facts: false
+            vars_files:
+              - vars/vlans.yml
+            tasks:
+              - name: Kernel VLAN subinterfaces
+                ansible.builtin.command: ip link add link eth1 name eth1.{{ item.id }} type vlan id {{ item.id }}
+                args:
+                  creates: /sys/class/net/eth1.{{ item.id }}
+                loop: "{{ vlans }}"
+              - name: Subinterfaces up
+                ansible.builtin.command: ip link set eth1.{{ item.id }} up
+                changed_when: false
+                loop: "{{ vlans }}"
+              - name: FRR configuration for the subinterfaces
+                ansible.builtin.template:
+                  src: vlans.conf.j2
+                  dest: /etc/frr/ov-vlans.conf
+                  mode: "0640"
+                notify: Apply and save
+            handlers:
+              - name: Apply and save
+                ansible.builtin.shell: vtysh -f /etc/frr/ov-vlans.conf && vtysh -c 'write memory'
+          EOF
+          ansible-playbook vlans.yml
+    alternatives:
+      - id: vtysh-commands
+        description: "Compares the running configuration and applies each subinterface with vtysh commands."
+        steps:
+          - on: ov-ctl
+            as: learner
+            timeoutSec: 300
+            run: |
+              set -e
+              cd ~/net
+              cat > vlans.yml <<'EOF'
+              - name: VLAN subinterfaces on the aggregation router
+                hosts: aggregation
+                become: true
+                gather_facts: false
+                vars_files:
+                  - vars/vlans.yml
+                tasks:
+                  - name: Kernel VLAN subinterfaces
+                    ansible.builtin.command: ip link add link eth1 name eth1.{{ item.id }} type vlan id {{ item.id }}
+                    args:
+                      creates: /sys/class/net/eth1.{{ item.id }}
+                    loop: "{{ vlans }}"
+                  - name: Subinterfaces up
+                    ansible.builtin.command: ip link set eth1.{{ item.id }} up
+                    changed_when: false
+                    loop: "{{ vlans }}"
+                  - name: Running configuration
+                    ansible.builtin.command: vtysh -c 'show running-config'
+                    register: running
+                    changed_when: false
+                  - name: Subinterface settings
+                    ansible.builtin.command: >-
+                      vtysh -c 'configure terminal' -c 'interface eth1.{{ item.id }}'
+                      -c 'description {{ item.description }}' -c 'ip address {{ item.address }}'
+                    when: ('description ' ~ item.description) not in running.stdout or item.address not in running.stdout
+                    loop: "{{ vlans }}"
+                    register: applied
+                  - name: Save the configuration
+                    ansible.builtin.command: vtysh -c 'write memory'
+                    when: applied.changed
+              EOF
+              ansible-playbook vlans.yml

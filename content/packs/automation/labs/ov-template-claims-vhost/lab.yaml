@@ -1,0 +1,409 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ov-template-claims-vhost
+  title: "Render the claims portal virtual host from a template"
+  domain: automation
+  frameworks: [ex294-aligned:templates-vault]
+  difficulty: medium
+  estimatedMinutes: 25
+  tags: [ansible, templates, jinja2, nginx, tier-b]
+  version: 1
+spec:
+  description: |
+    Each claims web node needs a portal virtual host in **`/etc/nginx/conf.d/claims.conf`**. The inventory in
+    `/home/learner/claims-automation` knows the web nodes (`claims_web`), the quote API hosts (group `quoting`)
+    and the canary web nodes (group `canary`); `group_vars/all.yml` has the domain and the quote API port.
+
+    Write one Jinja2 template in `templates/` and the playbook **`vhost.yml`** (hosts: `claims_web`) that renders,
+    on every web node:
+
+    - an `upstream quote_api` block with one `server <host>:<port>;` line for **every host in `quoting`**, in inventory
+      order, so adding a host to the inventory is enough;
+    - a `server` block that listens on 80, has `server_name <inventory name>.<domain>;`, proxies `/` to the upstream
+      and, **only on hosts in group `canary`**, also contains a `location /maintenance` block that returns 503;
+    - no blank line at the end of the file (it ends with a single newline after the last closing brace).
+
+    Run it; the grader runs it again and expects no changes.
+  objectives:
+    - "Render a file from a Jinja2 template"
+    - "Use inventory groups inside a template"
+    - "Control whitespace in rendered files"
+  params:
+    apiport:
+      type: int
+      min: 8100
+      max: 8199
+    canary:
+      type: choice
+      values: [ov-claims-web1, ov-claims-web2]
+  topology:
+    entry: ov-ctl
+    nodes:
+      - { name: ov-ctl, driver: container, image: ansible-ctl:2.21, access: [shell] }
+      - { name: ov-claims-web1, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280 }, access: [ssh] }
+      - { name: ov-claims-web2, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280 }, access: [ssh] }
+  setup:
+    - on: ov-claims-web1
+      timeoutSec: 120
+      run: &ov-vm |
+        set -eu
+        id ovauto >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Orrin and Vale automation" ovauto
+        install -d -m 0700 -o ovauto -g ovauto /home/ovauto/.ssh
+        install -m 0600 -o ovauto -g ovauto /home/learner/.ssh/authorized_keys /home/ovauto/.ssh/authorized_keys
+        printf 'ovauto ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/ovauto
+        chmod 0440 /etc/sudoers.d/ovauto
+    - { on: ov-claims-web2, timeoutSec: 120, run: *ov-vm }
+    - on: ov-claims-web1
+      timeoutSec: 300
+      run: |
+        set -eu
+        rpm -q nginx >/dev/null 2>&1 || dnf -y -q install nginx >/dev/null
+        install -d /etc/nginx/conf.d
+    - on: ov-claims-web2
+      timeoutSec: 300
+      run: |
+        set -eu
+        rpm -q nginx >/dev/null 2>&1 || dnf -y -q install nginx >/dev/null
+        install -d /etc/nginx/conf.d
+    - on: ov-ctl
+      run: |
+        set -eu
+        p=/home/learner/claims-automation
+        install -d -o learner -g learner $p
+        cat > $p/inventory.yml <<'EOF'
+        claims:
+          children:
+            claims_web:
+              hosts:
+                ov-claims-web1:
+                ov-claims-web2:
+        quoting:
+          hosts:
+            ov-quote-api1:
+            ov-quote-api2:
+        canary:
+          hosts:
+            {{canary}}:
+        EOF
+        printf '[defaults]\ninventory = inventory.yml\nremote_user = ovauto\n' > $p/ansible.cfg
+        install -d -o learner -g learner $p/group_vars
+        printf 'claims_domain: orrinvale.example\nquote_api_port: {{apiport}}\n' > $p/group_vars/all.yml
+        chown -R learner:learner $p
+  checks:
+    - id: vhost-web1
+      description: "ov-claims-web1 has its virtual host: own server name, upstream hosts from the inventory in order, the maintenance block only if it is in the canary group, a clean file ending"
+      type: shell
+      on: ov-claims-web1
+      skills: [automation.content.templates, automation.data.facts]
+      weight: 2
+      command: |
+        f=/etc/nginx/conf.d/claims.conf
+        [ -f $f ] || { echo missing; exit 0; }
+        r=""
+        [ "$(grep -cE '^[[:space:]]*server_name ov-claims-web1\.orrinvale\.example;[[:space:]]*$' $f)" = 1 ] || r="$r server_name"
+        [ "$(grep -E '^[[:space:]]*server ov-quote-api[0-9]+:{{apiport}};' $f | sed 's/^[[:space:]]*server //; s/:.*//' | paste -sd,)" = ov-quote-api1,ov-quote-api2 ] || r="$r upstream"
+        if [ "{{canary}}" = ov-claims-web1 ]; then
+          grep -qE 'location[[:space:]]+/maintenance' $f && grep -q 'return 503' $f || r="$r no-maintenance"
+        else
+          ! grep -q 'maintenance' $f || r="$r maintenance"
+        fi
+        grep -qE '^[[:space:]]*listen 80;' $f || r="$r listen"
+        grep -qE 'proxy_pass http://quote_api;' $f || r="$r proxy"
+        [ "$(tail -c1 $f | od -An -tx1 | tr -d ' ')" = 0a ] || r="$r no-final-newline"
+        [ -n "$(tail -n1 $f | tr -d '[:space:]')" ] || r="$r trailing-blank"
+        echo "${r:-ok}"
+      expect: { match: exact, value: "ok" }
+    - id: vhost-web2
+      description: "ov-claims-web2 has its virtual host: own server name, upstream hosts from the inventory in order, the maintenance block only if it is in the canary group, a clean file ending"
+      type: shell
+      on: ov-claims-web2
+      skills: [automation.content.templates, automation.data.facts]
+      weight: 2
+      command: |
+        f=/etc/nginx/conf.d/claims.conf
+        [ -f $f ] || { echo missing; exit 0; }
+        r=""
+        [ "$(grep -cE '^[[:space:]]*server_name ov-claims-web2\.orrinvale\.example;[[:space:]]*$' $f)" = 1 ] || r="$r server_name"
+        [ "$(grep -E '^[[:space:]]*server ov-quote-api[0-9]+:{{apiport}};' $f | sed 's/^[[:space:]]*server //; s/:.*//' | paste -sd,)" = ov-quote-api1,ov-quote-api2 ] || r="$r upstream"
+        if [ "{{canary}}" = ov-claims-web2 ]; then
+          grep -qE 'location[[:space:]]+/maintenance' $f && grep -q 'return 503' $f || r="$r no-maintenance"
+        else
+          ! grep -q 'maintenance' $f || r="$r maintenance"
+        fi
+        grep -qE '^[[:space:]]*listen 80;' $f || r="$r listen"
+        grep -qE 'proxy_pass http://quote_api;' $f || r="$r proxy"
+        [ "$(tail -c1 $f | od -An -tx1 | tr -d ' ')" = 0a ] || r="$r no-final-newline"
+        [ -n "$(tail -n1 $f | tr -d '[:space:]')" ] || r="$r trailing-blank"
+        echo "${r:-ok}"
+      expect: { match: exact, value: "ok" }
+    - id: template-source
+      description: "The virtual host comes from one Jinja2 template in the project that reads the inventory groups, applied with the template module"
+      type: shell
+      on: ov-ctl
+      skills: [automation.content.templates, automation.data.facts]
+      command: |
+        d=/home/learner/claims-automation
+        t=$(ls $d/templates/*.j2 2>/dev/null | head -1)
+        [ -n "$t" ] || { echo no-template; exit 0; }
+        grep -Eq "groups(\[|\.)['\"]?quoting" $t || { echo no-inventory-lookup; exit 0; }
+        grep -q 'canary' $t || { echo no-canary-test; exit 0; }
+        grep -Eq '(ansible\.builtin\.)?template:' $d/vhost.yml 2>/dev/null && echo ok || echo no-template-module
+      expect: { match: exact, value: "ok" }
+    - id: rerun-no-changes
+      description: "vhost.yml runs again without changes"
+      type: shell
+      on: ov-ctl
+      skills: [automation.content.templates]
+      weight: 2
+      timeoutSec: 600
+      command: |
+        ct-ansible recap /home/learner/claims-automation vhost.yml
+      expect: { match: exact, value: "changed=0 failed=0 unreachable=0" }
+  hints:
+    - title: "Inventory groups in a template"
+      body: |
+        The magic variable `groups` maps every inventory group to its host names, so `{% for h in groups['quoting'] %}` walks the quote API hosts. `inventory_hostname in groups['canary']` tells whether the current host is in a group.
+      cost: 1
+    - title: "Where blank lines come from"
+      body: |
+        Jinja keeps the newline after a `{% ... %}` tag unless the template module's `trim_blocks` (on by default) removes it; a file that ends with an empty line has an extra newline at the end of the template.
+      cost: 1
+    - title: "The server name"
+      body: |
+        `inventory_hostname` is the host's name in the inventory. The domain is a variable in `group_vars/all.yml`.
+      cost: 1
+  misconceptions:
+    - id: literal-upstreams
+      description: "Types the upstream hosts into the template."
+      feedback: "The upstream list must come from the inventory group, so a new quote API host appears without editing the template."
+      expectFail: [template-source]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/claims-automation
+          mkdir -p templates
+          cat > templates/claims-vhost.conf.j2 <<'EOF'
+          upstream quote_api {
+              server ov-quote-api1:{{ quote_api_port }};
+              server ov-quote-api2:{{ quote_api_port }};
+          }
+
+          server {
+              listen 80;
+              server_name {{ inventory_hostname }}.{{ claims_domain }};
+          {% if inventory_hostname in groups['canary'] %}
+              location /maintenance {
+                  return 503;
+              }
+          {% endif %}
+              location / {
+                  proxy_pass http://quote_api;
+              }
+          }
+          EOF
+          cat > vhost.yml <<'EOF'
+          - name: Claims portal virtual host
+            hosts: claims_web
+            become: true
+            tasks:
+              - name: Virtual host
+                ansible.builtin.template:
+                  src: claims-vhost.conf.j2
+                  dest: /etc/nginx/conf.d/claims.conf
+                  owner: root
+                  group: root
+                  mode: "0644"
+          EOF
+          ansible-playbook vhost.yml
+    - id: inverted-canary
+      description: "Puts the maintenance block on every host except the canary ones."
+      feedback: "The maintenance block belongs only to hosts in group canary."
+      expectFail: [vhost-web1, vhost-web2]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/claims-automation
+          mkdir -p templates
+          cat > templates/claims-vhost.conf.j2 <<'EOF'
+          upstream quote_api {
+          {% for h in groups['quoting'] %}
+              server {{ h }}:{{ quote_api_port }};
+          {% endfor %}
+          }
+
+          server {
+              listen 80;
+              server_name {{ inventory_hostname }}.{{ claims_domain }};
+          {% if inventory_hostname not in groups['canary'] %}
+              location /maintenance {
+                  return 503;
+              }
+          {% endif %}
+              location / {
+                  proxy_pass http://quote_api;
+              }
+          }
+          EOF
+          cat > vhost.yml <<'EOF'
+          - name: Claims portal virtual host
+            hosts: claims_web
+            become: true
+            tasks:
+              - name: Virtual host
+                ansible.builtin.template:
+                  src: claims-vhost.conf.j2
+                  dest: /etc/nginx/conf.d/claims.conf
+                  owner: root
+                  group: root
+                  mode: "0644"
+          EOF
+          ansible-playbook vhost.yml
+    - id: trailing-blank-line
+      description: "Leaves an empty line at the end of the template."
+      feedback: "The rendered file must end after its last closing brace, with no blank line."
+      expectFail: [vhost-web1, vhost-web2]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/claims-automation
+          mkdir -p templates
+          cat > templates/claims-vhost.conf.j2 <<'EOF'
+          upstream quote_api {
+          {% for h in groups['quoting'] %}
+              server {{ h }}:{{ quote_api_port }};
+          {% endfor %}
+          }
+
+          server {
+              listen 80;
+              server_name {{ inventory_hostname }}.{{ claims_domain }};
+          {% if inventory_hostname in groups['canary'] %}
+              location /maintenance {
+                  return 503;
+              }
+          {% endif %}
+              location / {
+                  proxy_pass http://quote_api;
+              }
+          }
+
+          EOF
+          cat > vhost.yml <<'EOF'
+          - name: Claims portal virtual host
+            hosts: claims_web
+            become: true
+            tasks:
+              - name: Virtual host
+                ansible.builtin.template:
+                  src: claims-vhost.conf.j2
+                  dest: /etc/nginx/conf.d/claims.conf
+                  owner: root
+                  group: root
+                  mode: "0644"
+          EOF
+          ansible-playbook vhost.yml
+  solution:
+    explanation: |
+      The template loops over `groups['quoting']` for the upstream servers, builds the server name from
+      `inventory_hostname` and the domain variable, and emits the maintenance location only when the host is
+      in `groups['canary']`. The template ends right after the last brace, so the rendered file has no blank
+      line at the end. The template module only rewrites the file when its content differs.
+    steps:
+      - on: ov-ctl
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/claims-automation
+          mkdir -p templates
+          cat > templates/claims-vhost.conf.j2 <<'EOF'
+          upstream quote_api {
+          {% for h in groups['quoting'] %}
+              server {{ h }}:{{ quote_api_port }};
+          {% endfor %}
+          }
+
+          server {
+              listen 80;
+              server_name {{ inventory_hostname }}.{{ claims_domain }};
+          {% if inventory_hostname in groups['canary'] %}
+              location /maintenance {
+                  return 503;
+              }
+          {% endif %}
+              location / {
+                  proxy_pass http://quote_api;
+              }
+          }
+          EOF
+          cat > vhost.yml <<'EOF'
+          - name: Claims portal virtual host
+            hosts: claims_web
+            become: true
+            tasks:
+              - name: Virtual host
+                ansible.builtin.template:
+                  src: claims-vhost.conf.j2
+                  dest: /etc/nginx/conf.d/claims.conf
+                  owner: root
+                  group: root
+                  mode: "0644"
+          EOF
+          ansible-playbook vhost.yml
+    alternatives:
+      - id: lstrip-blocks
+        description: "Indents the control tags and lets the template module strip them with lstrip_blocks."
+        steps:
+          - on: ov-ctl
+            as: learner
+            timeoutSec: 600
+            run: |
+              set -e
+              cd ~/claims-automation
+              mkdir -p templates
+              cat > templates/claims-vhost.conf.j2 <<'EOF'
+              upstream quote_api {
+                  {% for h in groups['quoting'] %}
+                  server {{ h }}:{{ quote_api_port }};
+                  {% endfor %}
+              }
+
+              server {
+                  listen 80;
+                  server_name {{ inventory_hostname }}.{{ claims_domain }};
+                  {% if inventory_hostname in groups['canary'] %}
+                  location /maintenance {
+                      return 503;
+                  }
+                  {% endif %}
+                  location / {
+                      proxy_pass http://quote_api;
+                  }
+              }
+              EOF
+              cat > vhost.yml <<'EOF'
+              - name: Claims portal virtual host
+                hosts: claims_web
+                become: true
+                tasks:
+                  - name: Virtual host
+                    ansible.builtin.template:
+                      src: claims-vhost.conf.j2
+                      dest: /etc/nginx/conf.d/claims.conf
+                      owner: root
+                      group: root
+                      mode: "0644"
+                      lstrip_blocks: true
+                      trim_blocks: true
+              EOF
+              ansible-playbook vhost.yml

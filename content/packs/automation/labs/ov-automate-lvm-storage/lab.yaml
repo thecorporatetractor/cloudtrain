@@ -1,0 +1,369 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ov-automate-lvm-storage
+  title: "Provision the claims document volume on database nodes"
+  domain: automation
+  frameworks: [ex294-aligned:automate-system-tasks, ex294-aligned:plays-errors]
+  difficulty: hard
+  estimatedMinutes: 35
+  tags: [ansible, lvm, storage, xfs, fstab, tier-c]
+  version: 1
+spec:
+  description: |
+    The claims database nodes `ov-db-1` and `ov-db-2` are members of the group `claims_db`. Only `ov-db-1` has a second
+    disk; data disks are addressed by serial number, here `/dev/disk/by-id/virtio-ct-data1`.
+
+    Write **`/home/learner/claims-automation/lvm-claims.yml`** (inventory and `ansible.cfg` are in that directory) that, on
+    every `claims_db` host **that has the disk**:
+
+    - creates the volume group **`vg_claims`** on that disk;
+    - creates the logical volume **`lv_docs`** of **{{size}} MiB** in it;
+    - puts an **xfs** filesystem on it and mounts it at **`/srv/{{mnt}}`**, persistently (it must come back after a reboot).
+
+    On hosts **without** the disk the play must print a clear message and **not fail**; such hosts get nothing else.
+    Run it; the grader runs it again and expects no changes.
+  objectives:
+    - "Build a volume group, logical volume, filesystem and persistent mount with modules"
+    - "Skip hosts that lack a resource without failing the play"
+  params:
+    size:
+      type: choice
+      values: [1200, 1500, 1800]
+    mnt:
+      type: choice
+      values: [claims-docs, claims-scans, claims-forms]
+  topology:
+    entry: ov-ctl
+    nodes:
+      - { name: ov-ctl, driver: container, image: ansible-ctl:2.21, access: [shell] }
+      - { name: ov-db-1, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280, disks: ["2Gi"] }, access: [ssh] }
+      - { name: ov-db-2, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280 }, access: [ssh] }
+  setup:
+    - on: ov-db-1
+      timeoutSec: 120
+      run: &ov-vm |
+        set -eu
+        id ovauto >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Orrin and Vale automation" ovauto
+        install -d -m 0700 -o ovauto -g ovauto /home/ovauto/.ssh
+        install -m 0600 -o ovauto -g ovauto /home/learner/.ssh/authorized_keys /home/ovauto/.ssh/authorized_keys
+        printf 'ovauto ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/ovauto
+        chmod 0440 /etc/sudoers.d/ovauto
+    - { on: ov-db-2, timeoutSec: 120, run: *ov-vm }
+    - on: ov-db-1
+      timeoutSec: 120
+      run: |
+        set -eu
+        [ -f /var/tmp/.ct-lvm-seeded ] && exit 0
+        d=/dev/disk/by-id/virtio-ct-data1
+        [ -e $d ] || { echo "data disk $d is not present" >&2; exit 1; }
+        wipefs -a $d >/dev/null 2>&1 || true
+        touch /var/tmp/.ct-lvm-seeded
+    - on: ov-ctl
+      run: |
+        set -eu
+        p=/home/learner/claims-automation
+        install -d -o learner -g learner $p
+        cat > $p/inventory.yml <<'EOF'
+        claims:
+          children:
+            claims_db:
+              hosts:
+                ov-db-1:
+                ov-db-2:
+        EOF
+        printf '[defaults]\ninventory = inventory.yml\nremote_user = ovauto\n' > $p/ansible.cfg
+
+        chown -R learner:learner $p
+  checks:
+    - id: lv-db1
+      description: "ov-db-1 has the claims volume group with a logical volume of the required size, an xfs filesystem mounted at the required directory and listed in fstab"
+      type: shell
+      on: ov-db-1
+      skills: [automation.modules.storage, automation.control-flow.conditionals]
+      weight: 3
+      command: |
+        s=$(lvs --noheadings --nosuffix --units m -o lv_size vg_claims/lv_docs 2>/dev/null | awk '{printf "%d", $1}')
+        t=$(blkid -o value -s TYPE /dev/vg_claims/lv_docs 2>/dev/null)
+        m=$(findmnt -n -o FSTYPE,TARGET /srv/{{mnt}} 2>/dev/null | tr -s ' ' ' ')
+        f=$(findmnt --fstab -n -o TARGET /srv/{{mnt}} 2>/dev/null)
+        echo "${s:-none} ${t:-nofs} ${m:-unmounted} fstab=${f:-none}"
+      expect: { match: exact, value: "{{size}} xfs xfs /srv/{{mnt}} fstab=/srv/{{mnt}}" }
+    - id: nodisk-db2
+      description: "ov-db-2 has no second disk, so it gets no volume group and no mount"
+      type: shell
+      on: ov-db-2
+      skills: [automation.control-flow.error-handling]
+      weight: 1
+      command: |
+        vgs vg_claims >/dev/null 2>&1 && v=vg-created || v=no-vg
+        findmnt -n /srv/{{mnt}} >/dev/null 2>&1 && m=mounted || m=no-mount
+        echo "$v $m"
+      expect: { match: exact, value: "no-vg no-mount" }
+    - id: message-for-missing-disk
+      description: "lvm-claims.yml prints a message for hosts without the second disk"
+      type: shell
+      on: ov-ctl
+      skills: [automation.control-flow.error-handling]
+      weight: 0.5
+      command: |
+        f=/home/learner/claims-automation/lvm-claims.yml
+        [ -f $f ] || { echo no-playbook; exit 0; }
+        grep -Eq '(ansible\.builtin\.)?debug:' $f && echo ok || echo no-message
+      expect: { match: exact, value: "ok" }
+    - id: rerun-no-changes
+      description: "lvm-claims.yml runs again without changes"
+      type: shell
+      on: ov-ctl
+      skills: [automation.modules.storage, automation.control-flow.conditionals]
+      weight: 2
+      timeoutSec: 600
+      command: |
+        ct-ansible recap /home/learner/claims-automation lvm-claims.yml
+      expect: { match: exact, value: "changed=0 failed=0 unreachable=0" }
+  hints:
+    - title: "Is the disk there?"
+      body: |
+        `ansible.builtin.stat` on `/dev/disk/by-id/virtio-ct-data1` registers whether the link exists on each host; a later `when:` (or a block with one `when:`) acts on that result. A `debug` task with the opposite condition prints the message.
+      cost: 1
+    - title: "The storage stack"
+      body: |
+        Four steps in this order: `community.general.lvg` (volume group on the disk), `community.general.lvol` (logical volume), `community.general.filesystem` (xfs) and `ansible.posix.mount` with `state: mounted`, which also writes `/etc/fstab`.
+      cost: 1
+    - title: "Sizes"
+      body: |
+        `lvol` takes `size` in MiB when you give a plain number. `stat` returns the disk's real device path in `lnk_source` when you stat a by-id symlink; `lvg` wants that path in `pvs`.
+      cost: 2
+  misconceptions:
+    - id: no-guard
+      description: "Provisions every host and lets the host without a disk fail the play."
+      feedback: "Hosts without the second disk must print a message and carry on; check for the disk first."
+      expectFail: [rerun-no-changes, message-for-missing-disk]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 900
+        run: |
+          set -e
+          cd ~/claims-automation
+          cat > lvm-claims.yml <<'EOF'
+          - name: Claims document volume
+            hosts: claims_db
+            become: true
+            tasks:
+              - name: Volume group
+                community.general.lvg:
+                  vg: vg_claims
+                  pvs: /dev/disk/by-id/virtio-ct-data1
+              - name: Logical volume
+                community.general.lvol:
+                  vg: vg_claims
+                  lv: lv_docs
+                  size: "{{size}}"
+              - name: Filesystem
+                community.general.filesystem:
+                  fstype: xfs
+                  dev: /dev/vg_claims/lv_docs
+              - name: Mount
+                ansible.posix.mount:
+                  path: /srv/{{mnt}}
+                  src: /dev/vg_claims/lv_docs
+                  fstype: xfs
+                  state: mounted
+          EOF
+          ansible-playbook lvm-claims.yml || true
+    - id: mount-without-fstab
+      description: "Mounts the volume with an ephemeral mount that is not recorded in fstab."
+      feedback: "The mount has to be persistent: the fstab entry is what brings it back after a reboot."
+      expectFail: [lv-db1]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 900
+        run: |
+          set -e
+          cd ~/claims-automation
+          cat > lvm-claims.yml <<'EOF'
+          - name: Claims document volume
+            hosts: claims_db
+            become: true
+            tasks:
+              - name: Second disk present
+                ansible.builtin.stat:
+                  path: /dev/disk/by-id/virtio-ct-data1
+                register: data_disk
+              - name: No second disk
+                ansible.builtin.debug:
+                  msg: "{{ inventory_hostname }} has no second disk, nothing to provision"
+                when: not data_disk.stat.exists
+              - name: Claims volume
+                when: data_disk.stat.exists
+                block:
+                  - name: Volume group
+                    community.general.lvg:
+                      vg: vg_claims
+                      pvs: "{{ data_disk.stat.lnk_source }}"
+                  - name: Logical volume
+                    community.general.lvol:
+                      vg: vg_claims
+                      lv: lv_docs
+                      size: "{{size}}"
+                  - name: Filesystem
+                    community.general.filesystem:
+                      fstype: xfs
+                      dev: /dev/vg_claims/lv_docs
+                  - name: Mount
+                    ansible.posix.mount:
+                      path: /srv/{{mnt}}
+                      src: /dev/vg_claims/lv_docs
+                      fstype: xfs
+                      state: ephemeral
+          EOF
+          ansible-playbook lvm-claims.yml
+    - id: percent-of-vg
+      description: "Sizes the volume as a percentage of the volume group."
+      feedback: "The volume must have exactly the requested size in MiB, not a share of the group."
+      expectFail: [lv-db1]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 900
+        run: |
+          set -e
+          cd ~/claims-automation
+          cat > lvm-claims.yml <<'EOF'
+          - name: Claims document volume
+            hosts: claims_db
+            become: true
+            tasks:
+              - name: Second disk present
+                ansible.builtin.stat:
+                  path: /dev/disk/by-id/virtio-ct-data1
+                register: data_disk
+              - name: No second disk
+                ansible.builtin.debug:
+                  msg: "{{ inventory_hostname }} has no second disk, nothing to provision"
+                when: not data_disk.stat.exists
+              - name: Claims volume
+                when: data_disk.stat.exists
+                block:
+                  - name: Volume group
+                    community.general.lvg:
+                      vg: vg_claims
+                      pvs: "{{ data_disk.stat.lnk_source }}"
+                  - name: Logical volume
+                    community.general.lvol:
+                      vg: vg_claims
+                      lv: lv_docs
+                      size: "70%VG"
+                  - name: Filesystem
+                    community.general.filesystem:
+                      fstype: xfs
+                      dev: /dev/vg_claims/lv_docs
+                  - name: Mount
+                    ansible.posix.mount:
+                      path: /srv/{{mnt}}
+                      src: /dev/vg_claims/lv_docs
+                      fstype: xfs
+                      state: mounted
+          EOF
+          ansible-playbook lvm-claims.yml
+  solution:
+    explanation: |
+      `stat` finds out whether the second disk exists. Where it does, a block creates the volume group on the disk's real
+      device path, the logical volume with the requested size in MiB, the xfs filesystem and a persistent mount
+      (which also writes fstab). Where it does not, a `debug` task prints a clear message and the play carries on without
+      failing. Every module is idempotent, so the second run reports no changes.
+    steps:
+      - on: ov-ctl
+        as: learner
+        timeoutSec: 900
+        run: |
+          set -e
+          cd ~/claims-automation
+          cat > lvm-claims.yml <<'EOF'
+          - name: Claims document volume
+            hosts: claims_db
+            become: true
+            tasks:
+              - name: Second disk present
+                ansible.builtin.stat:
+                  path: /dev/disk/by-id/virtio-ct-data1
+                register: data_disk
+              - name: No second disk
+                ansible.builtin.debug:
+                  msg: "{{ inventory_hostname }} has no second disk, nothing to provision"
+                when: not data_disk.stat.exists
+              - name: Claims volume
+                when: data_disk.stat.exists
+                block:
+                  - name: Volume group
+                    community.general.lvg:
+                      vg: vg_claims
+                      pvs: "{{ data_disk.stat.lnk_source }}"
+                  - name: Logical volume
+                    community.general.lvol:
+                      vg: vg_claims
+                      lv: lv_docs
+                      size: "{{size}}"
+                  - name: Filesystem
+                    community.general.filesystem:
+                      fstype: xfs
+                      dev: /dev/vg_claims/lv_docs
+                  - name: Mount
+                    ansible.posix.mount:
+                      path: /srv/{{mnt}}
+                      src: /dev/vg_claims/lv_docs
+                      fstype: xfs
+                      state: mounted
+          EOF
+          ansible-playbook lvm-claims.yml
+    alternatives:
+      - id: readlink-guard
+        description: "Resolves the disk with readlink and acts on its return code."
+        steps:
+          - on: ov-ctl
+            as: learner
+            timeoutSec: 900
+            run: |
+              set -e
+              cd ~/claims-automation
+              cat > lvm-claims.yml <<'EOF'
+              - name: Claims document volume
+                hosts: claims_db
+                become: true
+                tasks:
+                  - name: Resolve the second disk
+                    ansible.builtin.command: readlink -e /dev/disk/by-id/virtio-ct-data1
+                    register: disk
+                    changed_when: false
+                    failed_when: false
+                  - name: No second disk
+                    ansible.builtin.debug:
+                      msg: "No second disk on {{ inventory_hostname }}"
+                    when: disk.rc != 0
+                  - name: Volume group
+                    community.general.lvg:
+                      vg: vg_claims
+                      pvs: "{{ disk.stdout }}"
+                    when: disk.rc == 0
+                  - name: Logical volume
+                    community.general.lvol:
+                      vg: vg_claims
+                      lv: lv_docs
+                      size: "{{size}}m"
+                    when: disk.rc == 0
+                  - name: Filesystem
+                    community.general.filesystem:
+                      fstype: xfs
+                      dev: /dev/vg_claims/lv_docs
+                    when: disk.rc == 0
+                  - name: Mount
+                    ansible.posix.mount:
+                      path: /srv/{{mnt}}
+                      src: /dev/vg_claims/lv_docs
+                      fstype: xfs
+                      state: mounted
+                    when: disk.rc == 0
+              EOF
+              ansible-playbook lvm-claims.yml

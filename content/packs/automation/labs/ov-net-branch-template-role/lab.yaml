@@ -1,0 +1,508 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ov-net-branch-template-role
+  title: "Generate branch router configs from a role"
+  domain: automation
+  frameworks: [ex457-aligned:network-roles-templates]
+  difficulty: hard
+  estimatedMinutes: 40
+  tags: [ansible, network, frr, roles, templates, tier-n, blocked]
+  version: 1
+spec:
+  description: |
+    The branch routers are configured by hand today. Their data is in `/home/learner/net`: `host_vars/<router>.yml` (router id,
+    loopback, links), `group_vars/branch_routers.yml` (the OSPF area and the syslog facility) and the inventory with
+    `ansible.cfg`.
+
+    Write the role **`branch_gateway`** under `roles/` and a minimal **`site.yml`** (no tasks of its own) so that, for every
+    router, the role renders the **interfaces, OSPF and syslog configuration** (`log syslog informational` and the
+    facility from the group variable) from one Jinja2 template and loads it. The role may contain no router names or
+    addresses: adding a new branch must be one host_vars file and one run. All adjacencies must be Full and every router
+    must have learned the other loopbacks.
+
+    Run it; the grader runs it again and expects no changes.
+  objectives:
+    - "Write a role that renders device configuration from a template"
+    - "Keep device data out of the role"
+    - "Load configuration only when it changed"
+  params:
+    bootpw:
+      type: int
+      min: 100000
+      max: 999999
+    octet:
+      type: int
+      min: 20
+      max: 90
+    fac:
+      type: int
+      min: 0
+      max: 7
+  topology:
+    entry: ov-ctl
+    nodes:
+      - { name: ov-ctl, driver: container, image: ansible-ctl:2.21, access: [shell] }
+      - { name: ov-branch-lon-gw, driver: netdev, image: frr:10, access: [console] }
+      - { name: ov-branch-man-gw, driver: netdev, image: frr:10, access: [console] }
+      - { name: ov-branch-lds-gw, driver: netdev, image: frr:10, access: [console] }
+    links:
+      - { a: "ov-ctl:eth1", b: "ov-branch-lon-gw:eth3" }
+      - { a: "ov-ctl:eth2", b: "ov-branch-man-gw:eth3" }
+      - { a: "ov-ctl:eth3", b: "ov-branch-lds-gw:eth3" }
+      - { a: "ov-branch-lon-gw:eth1", b: "ov-branch-man-gw:eth1" }
+      - { a: "ov-branch-lon-gw:eth2", b: "ov-branch-lds-gw:eth1" }
+  setup:
+    - on: ov-branch-lon-gw
+      timeoutSec: 120
+      run: &ov-router |
+        set -eu
+        case $(hostname) in
+          ov-branch-lon-gw) a=21 ;; ov-branch-man-gw) a=22 ;; ov-branch-lds-gw) a=23 ;;
+          *) echo "unknown host $(hostname)" >&2; exit 1 ;;
+        esac
+        ip link set eth3 up
+        ip addr replace 10.70.0.$a/24 dev eth3
+        for c in sshd useradd chpasswd sudo python3; do
+          command -v $c >/dev/null 2>&1 || { echo "blocked: this frr image has no $c; routers need openssh-server, sudo, python3 and an automation account (image rebuild)" >&2; exit 1; }
+        done
+        id ovauto >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Orrin and Vale automation" ovauto
+        echo 'ovauto:Ov-boot-{{bootpw}}' | chpasswd
+        printf 'ovauto ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/ovauto
+        chmod 0440 /etc/sudoers.d/ovauto
+        ssh-keygen -A >/dev/null 2>&1
+        mkdir -p /run/sshd
+        pgrep -x sshd >/dev/null || /usr/sbin/sshd
+    - { on: ov-branch-man-gw, timeoutSec: 120, run: *ov-router }
+    - { on: ov-branch-lds-gw, timeoutSec: 120, run: *ov-router }
+    - on: ov-ctl
+      timeoutSec: 300
+      run: |
+        set -eu
+        ct-fleet-net 10.70.0.10/24 ov-branch-lon-gw=10.70.0.21 ov-branch-man-gw=10.70.0.22 ov-branch-lds-gw=10.70.0.23
+        ct-ansible pushkey --seal ovauto Ov-boot-{{bootpw}} ov-branch-lon-gw ov-branch-man-gw ov-branch-lds-gw
+        p=/home/learner/net
+        install -d -o learner -g learner $p
+        cat > $p/inventory.yml <<'EOF'
+        branch_routers:
+          hosts:
+            ov-branch-lon-gw:
+            ov-branch-man-gw:
+            ov-branch-lds-gw:
+          vars:
+            ansible_connection: ssh
+            ansible_network_os: frr
+            ansible_python_interpreter: /usr/bin/python3
+        EOF
+        printf '[defaults]\ninventory = inventory.yml\nremote_user = ovauto\n\n[privilege_escalation]\nbecome = True\n' > $p/ansible.cfg
+        install -d -o learner -g learner $p/host_vars $p/group_vars
+        printf 'ospf_area: 0\nsyslog_facility: local{{fac}}\n' > $p/group_vars/branch_routers.yml
+        cat > $p/host_vars/ov-branch-lon-gw.yml <<'EOF'
+        router_id: 10.255.{{octet}}.1
+        loopback: 10.255.{{octet}}.1/32
+        links:
+          - { ifname: eth1, address: 10.{{octet}}.1.1/30 }
+          - { ifname: eth2, address: 10.{{octet}}.2.1/30 }
+        EOF
+        cat > $p/host_vars/ov-branch-man-gw.yml <<'EOF'
+        router_id: 10.255.{{octet}}.2
+        loopback: 10.255.{{octet}}.2/32
+        links:
+          - { ifname: eth1, address: 10.{{octet}}.1.2/30 }
+        EOF
+        cat > $p/host_vars/ov-branch-lds-gw.yml <<'EOF'
+        router_id: 10.255.{{octet}}.3
+        loopback: 10.255.{{octet}}.3/32
+        links:
+          - { ifname: eth1, address: 10.{{octet}}.2.2/30 }
+        EOF
+        chown -R learner:learner $p
+  checks:
+    - id: gw-lon
+      description: "ov-branch-lon-gw has both adjacencies Full, has learned both other loopbacks and sends logs to syslog with the required facility"
+      type: shell
+      on: ov-branch-lon-gw
+      skills: [automation.network.config-templates, automation.reuse.roles]
+      weight: 2
+      timeoutSec: 110
+      command: |
+        for i in $(seq 90); do
+          n=$(vtysh -c 'show ip ospf neighbor' 2>/dev/null | grep -c Full)
+          l=$(vtysh -c 'show ip route ospf' 2>/dev/null | grep -cE '^O>\* 10\.255\.{{octet}}\.[123]/32')
+          [ "$n" = 2 ] && [ "$l" = 2 ] && break; sleep 1
+        done
+        s=$(vtysh -c 'show running-config' 2>/dev/null | grep -cE '^log (syslog informational|facility local{{fac}})$')
+        echo "full=$n loopbacks=$l syslog=$s"
+      expect: { match: exact, value: "full=2 loopbacks=2 syslog=2" }
+    - id: gw-man
+      description: "ov-branch-man-gw has its adjacency Full, has learned both other loopbacks and sends logs to syslog with the required facility"
+      type: shell
+      on: ov-branch-man-gw
+      skills: [automation.network.config-templates, automation.reuse.roles]
+      weight: 2
+      timeoutSec: 110
+      command: &gw1 |
+        for i in $(seq 90); do
+          n=$(vtysh -c 'show ip ospf neighbor' 2>/dev/null | grep -c Full)
+          l=$(vtysh -c 'show ip route ospf' 2>/dev/null | grep -cE '^O>\* 10\.255\.{{octet}}\.[123]/32')
+          [ "$n" = 1 ] && [ "$l" = 2 ] && break; sleep 1
+        done
+        s=$(vtysh -c 'show running-config' 2>/dev/null | grep -cE '^log (syslog informational|facility local{{fac}})$')
+        echo "full=$n loopbacks=$l syslog=$s"
+      expect: { match: exact, value: "full=1 loopbacks=2 syslog=2" }
+    - { id: gw-lds, description: "ov-branch-lds-gw has its adjacency Full, has learned both other loopbacks and sends logs to syslog with the required facility", type: shell, on: ov-branch-lds-gw, skills: [automation.network.config-templates, automation.reuse.roles], weight: 2, timeoutSec: 110, command: *gw1, expect: { match: exact, value: "full=1 loopbacks=2 syslog=2" } }
+    - id: structure
+      description: "The role branch_gateway has tasks, a handler and a template, contains no device-specific data, and site.yml only applies the role"
+      type: shell
+      on: ov-ctl
+      skills: [automation.network.config-templates, automation.reuse.roles]
+      weight: 2
+      command: |
+        /opt/ansible/bin/python3 - <<'PY' 2>/dev/null || echo no-project
+        import os, re, yaml
+        p = '/home/learner/net/'
+        r = p + 'roles/branch_gateway/'
+        bad = []
+        for f in ('tasks/main.yml', 'handlers/main.yml'):
+            if not os.path.exists(r + f): bad.append('missing-' + f.split('/')[0])
+        t = r + 'templates'
+        if not (os.path.isdir(t) and any(n.endswith('.j2') for n in os.listdir(t))): bad.append('no-template')
+        text = ''
+        for d, _, fs in os.walk(r):
+            for f in fs:
+                text += open(os.path.join(d, f)).read()
+        if re.search(r'ov-branch-|10\.255\.|10\.\d+\.\d+\.\d+', text): bad.append('hard-coded-device-data')
+        try:
+            lines = [l for l in open(p + 'site.yml').read().splitlines() if l.strip() and not l.strip().startswith('#') and l.strip() != '---']
+            pl = yaml.safe_load(open(p + 'site.yml')) or []
+            if len(lines) > 8 or 'branch_gateway' not in str(pl[0].get('roles')) or pl[0].get('tasks'): bad.append('site-not-minimal')
+        except Exception:
+            bad.append('no-site')
+        print('ok' if not bad else ','.join(bad))
+        PY
+      expect: { match: exact, value: "ok" }
+    - id: rerun-no-changes
+      description: "site.yml runs again without changes"
+      type: shell
+      on: ov-ctl
+      skills: [automation.network.config-templates, automation.reuse.roles]
+      weight: 2
+      timeoutSec: 240
+      command: |
+        ct-ansible recap /home/learner/net site.yml
+      expect: { match: exact, value: "changed=0 failed=0 unreachable=0" }
+  hints:
+    - title: "Everything device-specific is a variable"
+      body: |
+        The template must not know a single router name or address: router id, loopback, links, area and syslog settings all come from host or group variables, with sane defaults in `defaults/main.yml`. A new branch then needs only a new `host_vars` file.
+      cost: 1
+    - title: "Role skeleton"
+      body: |
+        A role has `tasks/main.yml`, `handlers/main.yml`, `templates/` and `defaults/main.yml` under `roles/branch_gateway/`. Load the rendered file into FRR (`vtysh -b`) from the handler that the template task notifies.
+      cost: 1
+    - title: "Syslog in FRR"
+      body: |
+        `log syslog informational` sends messages at that level and above to syslog; `log facility local<N>` picks the facility. Both go to the top of the configuration. The group variable `syslog_facility` already holds the facility to use.
+      cost: 2
+  misconceptions:
+    - id: router-names-in-template
+      description: "Special-cases a router by name inside the template."
+      feedback: "A role must not contain device names or addresses; the data belongs in host_vars."
+      expectFail: [structure]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/net
+          mkdir -p roles/branch_gateway/tasks roles/branch_gateway/handlers roles/branch_gateway/templates roles/branch_gateway/defaults
+          cat > roles/branch_gateway/templates/frr.conf.j2 <<'EOF'
+          frr defaults traditional
+          service integrated-vtysh-config
+          log syslog {{ syslog_level }}
+          log facility {{ syslog_facility }}
+          !
+          interface lo
+           ip address {{ loopback }}
+           ip ospf area {{ ospf_area }}
+          !
+          {% for l in links %}
+          interface {{ l.ifname }}
+           ip address {{ l.address }}
+           ip ospf area {{ ospf_area }}
+           ip ospf network point-to-point
+          !
+          {% endfor %}
+          router ospf
+          {% if inventory_hostname == 'ov-branch-lon-gw' %}
+           ospf router-id 10.255.{{octet}}.1
+          {% else %}
+           ospf router-id {{ router_id }}
+          {% endif %}
+          !
+          EOF
+          cat > roles/branch_gateway/tasks/main.yml <<'EOF'
+          - name: FRR configuration from host variables
+            ansible.builtin.template:
+              src: frr.conf.j2
+              dest: /etc/frr/frr.conf
+              owner: frr
+              group: frr
+              mode: "0640"
+            notify: Load FRR configuration
+          EOF
+          cat > roles/branch_gateway/handlers/main.yml <<'EOF'
+          - name: Load FRR configuration
+            ansible.builtin.command: vtysh -b
+          EOF
+          cat > roles/branch_gateway/defaults/main.yml <<'EOF'
+          ospf_area: 0
+          syslog_level: informational
+          EOF
+          cat > site.yml <<'EOF'
+          - hosts: branch_routers
+            become: true
+            gather_facts: false
+            roles:
+              - branch_gateway
+          EOF
+          ansible-playbook site.yml
+    - id: no-syslog
+      description: "Renders interfaces and OSPF but leaves out the syslog settings."
+      feedback: "The role must configure syslog (level and facility) on every router too."
+      expectFail: [gw-lon, gw-man, gw-lds]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/net
+          mkdir -p roles/branch_gateway/tasks roles/branch_gateway/handlers roles/branch_gateway/templates roles/branch_gateway/defaults
+          cat > roles/branch_gateway/templates/frr.conf.j2 <<'EOF'
+          frr defaults traditional
+          service integrated-vtysh-config
+          !
+          interface lo
+           ip address {{ loopback }}
+           ip ospf area {{ ospf_area }}
+          !
+          {% for l in links %}
+          interface {{ l.ifname }}
+           ip address {{ l.address }}
+           ip ospf area {{ ospf_area }}
+           ip ospf network point-to-point
+          !
+          {% endfor %}
+          router ospf
+           ospf router-id {{ router_id }}
+          !
+          EOF
+          cat > roles/branch_gateway/tasks/main.yml <<'EOF'
+          - name: FRR configuration from host variables
+            ansible.builtin.template:
+              src: frr.conf.j2
+              dest: /etc/frr/frr.conf
+              owner: frr
+              group: frr
+              mode: "0640"
+            notify: Load FRR configuration
+          EOF
+          cat > roles/branch_gateway/handlers/main.yml <<'EOF'
+          - name: Load FRR configuration
+            ansible.builtin.command: vtysh -b
+          EOF
+          cat > roles/branch_gateway/defaults/main.yml <<'EOF'
+          ospf_area: 0
+          syslog_level: informational
+          EOF
+          cat > site.yml <<'EOF'
+          - hosts: branch_routers
+            become: true
+            gather_facts: false
+            roles:
+              - branch_gateway
+          EOF
+          ansible-playbook site.yml
+    - id: load-every-run
+      description: "Loads the configuration with an ordinary task on every run."
+      feedback: "Load the configuration from a handler so that an unchanged run reports no change."
+      expectFail: [rerun-no-changes]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/net
+          mkdir -p roles/branch_gateway/tasks roles/branch_gateway/handlers roles/branch_gateway/templates roles/branch_gateway/defaults
+          cat > roles/branch_gateway/templates/frr.conf.j2 <<'EOF'
+          frr defaults traditional
+          service integrated-vtysh-config
+          log syslog {{ syslog_level }}
+          log facility {{ syslog_facility }}
+          !
+          interface lo
+           ip address {{ loopback }}
+           ip ospf area {{ ospf_area }}
+          !
+          {% for l in links %}
+          interface {{ l.ifname }}
+           ip address {{ l.address }}
+           ip ospf area {{ ospf_area }}
+           ip ospf network point-to-point
+          !
+          {% endfor %}
+          router ospf
+           ospf router-id {{ router_id }}
+          !
+          EOF
+          cat > roles/branch_gateway/tasks/main.yml <<'EOF'
+          - name: FRR configuration from host variables
+            ansible.builtin.template:
+              src: frr.conf.j2
+              dest: /etc/frr/frr.conf
+              owner: frr
+              group: frr
+              mode: "0640"
+
+          - name: Load FRR configuration
+            ansible.builtin.command: vtysh -b
+          EOF
+          cat > roles/branch_gateway/handlers/main.yml <<'EOF'
+          - name: Unused
+            ansible.builtin.debug:
+              msg: unused
+          EOF
+          cat > roles/branch_gateway/defaults/main.yml <<'EOF'
+          ospf_area: 0
+          syslog_level: informational
+          EOF
+          cat > site.yml <<'EOF'
+          - hosts: branch_routers
+            become: true
+            gather_facts: false
+            roles:
+              - branch_gateway
+          EOF
+          ansible-playbook site.yml
+  solution:
+    explanation: |
+      The role `branch_gateway` holds one template that turns host and group variables into the router's FRR configuration
+      (logging, loopback, links, OSPF), a task that installs it and a handler that loads it with `vtysh -b`. Defaults cover
+      the area and the log level. `site.yml` only names the group and the role, so a new branch is one host_vars file. The
+      template task reports no change on the second run, so the handler never fires.
+    steps:
+      - on: ov-ctl
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/net
+          mkdir -p roles/branch_gateway/tasks roles/branch_gateway/handlers roles/branch_gateway/templates roles/branch_gateway/defaults
+          cat > roles/branch_gateway/templates/frr.conf.j2 <<'EOF'
+          frr defaults traditional
+          service integrated-vtysh-config
+          log syslog {{ syslog_level }}
+          log facility {{ syslog_facility }}
+          !
+          interface lo
+           ip address {{ loopback }}
+           ip ospf area {{ ospf_area }}
+          !
+          {% for l in links %}
+          interface {{ l.ifname }}
+           ip address {{ l.address }}
+           ip ospf area {{ ospf_area }}
+           ip ospf network point-to-point
+          !
+          {% endfor %}
+          router ospf
+           ospf router-id {{ router_id }}
+          !
+          EOF
+          cat > roles/branch_gateway/tasks/main.yml <<'EOF'
+          - name: FRR configuration from host variables
+            ansible.builtin.template:
+              src: frr.conf.j2
+              dest: /etc/frr/frr.conf
+              owner: frr
+              group: frr
+              mode: "0640"
+            notify: Load FRR configuration
+          EOF
+          cat > roles/branch_gateway/handlers/main.yml <<'EOF'
+          - name: Load FRR configuration
+            ansible.builtin.command: vtysh -b
+          EOF
+          cat > roles/branch_gateway/defaults/main.yml <<'EOF'
+          ospf_area: 0
+          syslog_level: informational
+          EOF
+          cat > site.yml <<'EOF'
+          - hosts: branch_routers
+            become: true
+            gather_facts: false
+            roles:
+              - branch_gateway
+          EOF
+          ansible-playbook site.yml
+    alternatives:
+      - id: vtysh-f
+        description: "Loads the rendered file with vtysh -f from the handler."
+        steps:
+          - on: ov-ctl
+            as: learner
+            timeoutSec: 300
+            run: |
+              set -e
+              cd ~/net
+              mkdir -p roles/branch_gateway/tasks roles/branch_gateway/handlers roles/branch_gateway/templates roles/branch_gateway/defaults
+              cat > roles/branch_gateway/templates/frr.conf.j2 <<'EOF'
+              frr defaults traditional
+              service integrated-vtysh-config
+              log syslog {{ syslog_level }}
+              log facility {{ syslog_facility }}
+              !
+              interface lo
+               ip address {{ loopback }}
+               ip ospf area {{ ospf_area }}
+              !
+              {% for l in links %}
+              interface {{ l.ifname }}
+               ip address {{ l.address }}
+               ip ospf area {{ ospf_area }}
+               ip ospf network point-to-point
+              !
+              {% endfor %}
+              router ospf
+               ospf router-id {{ router_id }}
+              !
+              EOF
+              cat > roles/branch_gateway/tasks/main.yml <<'EOF'
+              - name: FRR configuration from host variables
+                ansible.builtin.template:
+                  src: frr.conf.j2
+                  dest: /etc/frr/frr.conf
+                  owner: frr
+                  group: frr
+                  mode: "0640"
+                notify: Load FRR configuration
+              EOF
+              cat > roles/branch_gateway/handlers/main.yml <<'EOF'
+              - name: Load FRR configuration
+                ansible.builtin.command: vtysh -f /etc/frr/frr.conf
+              EOF
+              cat > roles/branch_gateway/defaults/main.yml <<'EOF'
+              ospf_area: 0
+              syslog_level: informational
+              EOF
+              cat > site.yml <<'EOF'
+              - hosts: branch_routers
+                become: true
+                gather_facts: false
+                roles:
+                  - branch_gateway
+              EOF
+              ansible-playbook site.yml

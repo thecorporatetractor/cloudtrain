@@ -1,0 +1,413 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ov-net-ospf-branch-config
+  title: "Bring up OSPF on the branch routers from variables"
+  domain: automation
+  frameworks: [ex457-aligned:netcommon-modules, ex457-aligned:variables-facts]
+  difficulty: medium
+  estimatedMinutes: 30
+  tags: [ansible, network, frr, ospf, templates, tier-n, blocked]
+  version: 1
+spec:
+  description: |
+    The three branch routers `ov-branch-lon-gw` (hub), `ov-branch-man-gw` and `ov-branch-lds-gw` have no routing
+    configuration yet. Their addressing is in `host_vars/<router>.yml` in `/home/learner/net`: router id, loopback, area
+    and the point-to-point links. The inventory and `ansible.cfg` are in the project (`branch_routers`).
+
+    Write **`ospf.yml`** (and any template it needs) that configures every router from those variables - loopback, link
+    addresses and single-area OSPF - so that every router has its adjacencies Full and has learned **every other router's
+    loopback** through OSPF. Adding another router must need only another host_vars file.
+
+    Run it; the grader runs it again and expects no changes.
+  objectives:
+    - "Drive device configuration from host variables"
+    - "Render FRR configuration with a template"
+    - "Apply device changes idempotently"
+  params:
+    bootpw:
+      type: int
+      min: 100000
+      max: 999999
+    octet:
+      type: int
+      min: 20
+      max: 90
+  topology:
+    entry: ov-ctl
+    nodes:
+      - { name: ov-ctl, driver: container, image: ansible-ctl:2.21, access: [shell] }
+      - { name: ov-branch-lon-gw, driver: netdev, image: frr:10, access: [console] }
+      - { name: ov-branch-man-gw, driver: netdev, image: frr:10, access: [console] }
+      - { name: ov-branch-lds-gw, driver: netdev, image: frr:10, access: [console] }
+    links:
+      - { a: "ov-ctl:eth1", b: "ov-branch-lon-gw:eth3" }
+      - { a: "ov-ctl:eth2", b: "ov-branch-man-gw:eth3" }
+      - { a: "ov-ctl:eth3", b: "ov-branch-lds-gw:eth3" }
+      - { a: "ov-branch-lon-gw:eth1", b: "ov-branch-man-gw:eth1" }
+      - { a: "ov-branch-lon-gw:eth2", b: "ov-branch-lds-gw:eth1" }
+  setup:
+    - on: ov-branch-lon-gw
+      timeoutSec: 120
+      run: &ov-router |
+        set -eu
+        case $(hostname) in
+          ov-branch-lon-gw) a=21 ;; ov-branch-man-gw) a=22 ;; ov-branch-lds-gw) a=23 ;;
+          *) echo "unknown host $(hostname)" >&2; exit 1 ;;
+        esac
+        ip link set eth3 up
+        ip addr replace 10.70.0.$a/24 dev eth3
+        for c in sshd useradd chpasswd sudo python3; do
+          command -v $c >/dev/null 2>&1 || { echo "blocked: this frr image has no $c; routers need openssh-server, sudo, python3 and an automation account (image rebuild)" >&2; exit 1; }
+        done
+        id ovauto >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Orrin and Vale automation" ovauto
+        echo 'ovauto:Ov-boot-{{bootpw}}' | chpasswd
+        printf 'ovauto ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/ovauto
+        chmod 0440 /etc/sudoers.d/ovauto
+        ssh-keygen -A >/dev/null 2>&1
+        mkdir -p /run/sshd
+        pgrep -x sshd >/dev/null || /usr/sbin/sshd
+    - { on: ov-branch-man-gw, timeoutSec: 120, run: *ov-router }
+    - { on: ov-branch-lds-gw, timeoutSec: 120, run: *ov-router }
+    - on: ov-ctl
+      timeoutSec: 300
+      run: |
+        set -eu
+        ct-fleet-net 10.70.0.10/24 ov-branch-lon-gw=10.70.0.21 ov-branch-man-gw=10.70.0.22 ov-branch-lds-gw=10.70.0.23
+        ct-ansible pushkey --seal ovauto Ov-boot-{{bootpw}} ov-branch-lon-gw ov-branch-man-gw ov-branch-lds-gw
+        p=/home/learner/net
+        install -d -o learner -g learner $p
+        cat > $p/inventory.yml <<'EOF'
+        branch_routers:
+          hosts:
+            ov-branch-lon-gw:
+            ov-branch-man-gw:
+            ov-branch-lds-gw:
+          vars:
+            ansible_connection: ssh
+            ansible_network_os: frr
+            ansible_python_interpreter: /usr/bin/python3
+        EOF
+        printf '[defaults]\ninventory = inventory.yml\nremote_user = ovauto\n\n[privilege_escalation]\nbecome = True\n' > $p/ansible.cfg
+        install -d -o learner -g learner $p/host_vars
+        cat > $p/host_vars/ov-branch-lon-gw.yml <<'EOF'
+        router_id: 10.255.{{octet}}.1
+        loopback: 10.255.{{octet}}.1/32
+        ospf_area: 0
+        links:
+          - { ifname: eth1, address: 10.{{octet}}.1.1/30 }
+          - { ifname: eth2, address: 10.{{octet}}.2.1/30 }
+        EOF
+        cat > $p/host_vars/ov-branch-man-gw.yml <<'EOF'
+        router_id: 10.255.{{octet}}.2
+        loopback: 10.255.{{octet}}.2/32
+        ospf_area: 0
+        links:
+          - { ifname: eth1, address: 10.{{octet}}.1.2/30 }
+        EOF
+        cat > $p/host_vars/ov-branch-lds-gw.yml <<'EOF'
+        router_id: 10.255.{{octet}}.3
+        loopback: 10.255.{{octet}}.3/32
+        ospf_area: 0
+        links:
+          - { ifname: eth1, address: 10.{{octet}}.2.2/30 }
+        EOF
+        chown -R learner:learner $p
+  checks:
+    - id: ospf-lon
+      description: "ov-branch-lon-gw has both of its adjacencies Full and has learned both other loopbacks through OSPF"
+      type: shell
+      on: ov-branch-lon-gw
+      skills: [automation.network.resource-config, automation.data.variables]
+      weight: 2
+      timeoutSec: 110
+      command: |
+        for i in $(seq 90); do
+          n=$(vtysh -c 'show ip ospf neighbor' 2>/dev/null | grep -c Full)
+          l=$(vtysh -c 'show ip route ospf' 2>/dev/null | grep -cE '^O>\* 10\.255\.{{octet}}\.[123]/32')
+          [ "$n" = 2 ] && [ "$l" = 2 ] && break; sleep 1
+        done
+        echo "full=$n loopbacks=$l"
+      expect: { match: exact, value: "full=2 loopbacks=2" }
+    - id: ospf-man
+      description: "ov-branch-man-gw has its adjacency Full and has learned both other loopbacks through OSPF"
+      type: shell
+      on: ov-branch-man-gw
+      skills: [automation.network.resource-config, automation.data.variables]
+      weight: 2
+      timeoutSec: 110
+      command: &ospf1 |
+        for i in $(seq 90); do
+          n=$(vtysh -c 'show ip ospf neighbor' 2>/dev/null | grep -c Full)
+          l=$(vtysh -c 'show ip route ospf' 2>/dev/null | grep -cE '^O>\* 10\.255\.{{octet}}\.[123]/32')
+          [ "$n" = 1 ] && [ "$l" = 2 ] && break; sleep 1
+        done
+        echo "full=$n loopbacks=$l"
+      expect: { match: exact, value: "full=1 loopbacks=2" }
+    - { id: ospf-lds, description: "ov-branch-lds-gw has its adjacency Full and has learned both other loopbacks through OSPF", type: shell, on: ov-branch-lds-gw, skills: [automation.network.resource-config, automation.data.variables], weight: 2, timeoutSec: 110, command: *ospf1, expect: { match: exact, value: "full=1 loopbacks=2" } }
+    - id: rerun-no-changes
+      description: "ospf.yml runs again without changes"
+      type: shell
+      on: ov-ctl
+      skills: [automation.network.resource-config, automation.data.variables]
+      weight: 2
+      timeoutSec: 240
+      command: |
+        ct-ansible recap /home/learner/net ospf.yml
+      expect: { match: exact, value: "changed=0 failed=0 unreachable=0" }
+  hints:
+    - title: "Data in, configuration out"
+      body: |
+        Each router has a `host_vars/<router>.yml` with its router id, loopback and links. A Jinja2 template can loop over `links` and turn those values into FRR configuration text.
+      cost: 1
+    - title: "Idempotence for devices"
+      body: |
+        `ansible.builtin.template` only reports a change when the rendered file differs from the one on the device. Load the file into FRR from a handler, so the load runs only after a change. `vtysh -b` loads the boot configuration `/etc/frr/frr.conf`.
+      cost: 2
+    - title: "Same area, point-to-point"
+      body: |
+        All interfaces belong to OSPF area 0. FRR enables OSPF on an interface with `ip ospf area 0` under the interface; set `ip ospf network point-to-point` on the router links so the adjacencies form quickly.
+      cost: 1
+  misconceptions:
+    - id: loopbacks-only
+      description: "Renders the loopbacks and OSPF but forgets the link interfaces."
+      feedback: "OSPF only runs on interfaces that carry the area statement; the links have to be rendered from host_vars too."
+      expectFail: [ospf-lon, ospf-man, ospf-lds]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/net
+          mkdir -p templates
+          cat > templates/frr.conf.j2 <<'EOF'
+          frr defaults traditional
+          service integrated-vtysh-config
+          !
+          interface lo
+           ip address {{ loopback }}
+           ip ospf area {{ ospf_area }}
+          !
+          router ospf
+           ospf router-id {{ router_id }}
+          !
+          EOF
+          cat > ospf.yml <<'EOF'
+          - name: OSPF on the branch routers
+            hosts: branch_routers
+            become: true
+            gather_facts: false
+            tasks:
+              - name: FRR configuration from host variables
+                ansible.builtin.template:
+                  src: frr.conf.j2
+                  dest: /etc/frr/frr.conf
+                  owner: frr
+                  group: frr
+                  mode: "0640"
+                notify: Load FRR configuration
+            handlers:
+              - name: Load FRR configuration
+                ansible.builtin.command: vtysh -b
+          EOF
+          ansible-playbook ospf.yml
+    - id: one-router-id
+      description: "Hard-codes one router id for every router."
+      feedback: "Each router needs its own router id, taken from its host variables; duplicates stop the adjacencies."
+      expectFail: [ospf-lon, ospf-man, ospf-lds]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/net
+          mkdir -p templates
+          cat > templates/frr.conf.j2 <<'EOF'
+          frr defaults traditional
+          service integrated-vtysh-config
+          !
+          interface lo
+           ip address {{ loopback }}
+           ip ospf area {{ ospf_area }}
+          !
+          {% for l in links %}
+          interface {{ l.ifname }}
+           ip address {{ l.address }}
+           ip ospf area {{ ospf_area }}
+           ip ospf network point-to-point
+          !
+          {% endfor %}
+          router ospf
+           ospf router-id 10.255.{{octet}}.1
+          !
+          EOF
+          cat > ospf.yml <<'EOF'
+          - name: OSPF on the branch routers
+            hosts: branch_routers
+            become: true
+            gather_facts: false
+            tasks:
+              - name: FRR configuration from host variables
+                ansible.builtin.template:
+                  src: frr.conf.j2
+                  dest: /etc/frr/frr.conf
+                  owner: frr
+                  group: frr
+                  mode: "0640"
+                notify: Load FRR configuration
+            handlers:
+              - name: Load FRR configuration
+                ansible.builtin.command: vtysh -b
+          EOF
+          ansible-playbook ospf.yml
+    - id: always-load
+      description: "Loads the configuration with a plain task on every run."
+      feedback: "A command task reports a change on every run; load the configuration from a handler so an unchanged run does nothing."
+      expectFail: [rerun-no-changes]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/net
+          mkdir -p templates
+          cat > templates/frr.conf.j2 <<'EOF'
+          frr defaults traditional
+          service integrated-vtysh-config
+          !
+          interface lo
+           ip address {{ loopback }}
+           ip ospf area {{ ospf_area }}
+          !
+          {% for l in links %}
+          interface {{ l.ifname }}
+           ip address {{ l.address }}
+           ip ospf area {{ ospf_area }}
+           ip ospf network point-to-point
+          !
+          {% endfor %}
+          router ospf
+           ospf router-id {{ router_id }}
+          !
+          EOF
+          cat > ospf.yml <<'EOF'
+          - name: OSPF on the branch routers
+            hosts: branch_routers
+            become: true
+            gather_facts: false
+            tasks:
+              - name: FRR configuration from host variables
+                ansible.builtin.template:
+                  src: frr.conf.j2
+                  dest: /etc/frr/frr.conf
+                  owner: frr
+                  group: frr
+                  mode: "0640"
+              - name: Load FRR configuration
+                ansible.builtin.command: vtysh -b
+          EOF
+          ansible-playbook ospf.yml
+  solution:
+    explanation: |
+      One template renders the full FRR configuration from the host variables: the loopback, one block per link with the area
+      and network type, and the router id. The template task replaces `/etc/frr/frr.conf` only when the result differs and
+      notifies a handler that loads it with `vtysh -b`. Adding a router is one host_vars file; an unchanged run
+      reports no changes.
+    steps:
+      - on: ov-ctl
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/net
+          mkdir -p templates
+          cat > templates/frr.conf.j2 <<'EOF'
+          frr defaults traditional
+          service integrated-vtysh-config
+          !
+          interface lo
+           ip address {{ loopback }}
+           ip ospf area {{ ospf_area }}
+          !
+          {% for l in links %}
+          interface {{ l.ifname }}
+           ip address {{ l.address }}
+           ip ospf area {{ ospf_area }}
+           ip ospf network point-to-point
+          !
+          {% endfor %}
+          router ospf
+           ospf router-id {{ router_id }}
+          !
+          EOF
+          cat > ospf.yml <<'EOF'
+          - name: OSPF on the branch routers
+            hosts: branch_routers
+            become: true
+            gather_facts: false
+            tasks:
+              - name: FRR configuration from host variables
+                ansible.builtin.template:
+                  src: frr.conf.j2
+                  dest: /etc/frr/frr.conf
+                  owner: frr
+                  group: frr
+                  mode: "0640"
+                notify: Load FRR configuration
+            handlers:
+              - name: Load FRR configuration
+                ansible.builtin.command: vtysh -b
+          EOF
+          ansible-playbook ospf.yml
+    alternatives:
+      - id: vtysh-f
+        description: "Loads the file with vtysh -f instead of the boot option."
+        steps:
+          - on: ov-ctl
+            as: learner
+            timeoutSec: 300
+            run: |
+              set -e
+              cd ~/net
+              mkdir -p templates
+              cat > templates/frr.conf.j2 <<'EOF'
+              frr defaults traditional
+              service integrated-vtysh-config
+              !
+              interface lo
+               ip address {{ loopback }}
+               ip ospf area {{ ospf_area }}
+              !
+              {% for l in links %}
+              interface {{ l.ifname }}
+               ip address {{ l.address }}
+               ip ospf area {{ ospf_area }}
+               ip ospf network point-to-point
+              !
+              {% endfor %}
+              router ospf
+               ospf router-id {{ router_id }}
+              !
+              EOF
+              cat > ospf.yml <<'EOF'
+              - name: OSPF on the branch routers
+                hosts: branch_routers
+                become: true
+                gather_facts: false
+                tasks:
+                  - name: FRR configuration from host variables
+                    ansible.builtin.template:
+                      src: frr.conf.j2
+                      dest: /etc/frr/frr.conf
+                      owner: frr
+                      group: frr
+                      mode: "0640"
+                    notify: Load FRR configuration
+                handlers:
+                  - name: Load FRR configuration
+                    ansible.builtin.command: vtysh -f /etc/frr/frr.conf
+              EOF
+              ansible-playbook ospf.yml

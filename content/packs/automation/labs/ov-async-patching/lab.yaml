@@ -1,0 +1,479 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ov-async-patching
+  title: "Patch database nodes in parallel without SSH timeouts"
+  domain: automation
+  frameworks: []
+  difficulty: hard
+  estimatedMinutes: 40
+  tags: [ansible, async, reboot, patching, tier-c]
+  version: 1
+spec:
+  description: |
+    The full update on the database nodes `ov-db-1` and `ov-db-2` (group `claims_db`) runs for a few minutes: the command is
+    `/usr/local/sbin/ov-patch`. It records its run in `/var/lib/ov-patch/`, and on hosts that need a reboot afterwards it
+    creates `/run/reboot-required`. The kernel boot id at provisioning time is kept in `/etc/ov/provisioned-boot-id`.
+
+    Write **`/home/learner/patching/patch.yml`** (inventory and `ansible.cfg` are in that directory) that:
+
+    - runs the update on both nodes **at the same time, asynchronously**, without holding an SSH session open, and
+      waits for it to finish;
+    - **reboots only the hosts that asked for it**, and waits for them to come back;
+    - writes **`/home/learner/patching/result.json`** on the control node: a JSON object with one key per host, each
+      holding `"patched": true` and `"rebooted": true` or `false` (whether that host really rebooted during the run);
+    - runs the update only once per host: a second run of the playbook must not patch, reboot or change anything.
+
+    Run it (it takes a few minutes); the grader runs it again and expects no changes.
+  objectives:
+    - "Run long tasks asynchronously and poll for completion"
+    - "Reboot hosts conditionally and wait for them"
+    - "Collect per-host results on the control node"
+  params:
+    secs:
+      type: choice
+      values: [120, 150, 180]
+    rebootnode:
+      type: choice
+      values: [ov-db-1, ov-db-2]
+  topology:
+    entry: ov-ctl
+    nodes:
+      - { name: ov-ctl, driver: container, image: ansible-ctl:2.21, access: [shell] }
+      - { name: ov-db-1, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280 }, access: [ssh] }
+      - { name: ov-db-2, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280 }, access: [ssh] }
+  setup:
+    - on: ov-db-1
+      timeoutSec: 120
+      run: &ov-vm |
+        set -eu
+        id ovauto >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Orrin and Vale automation" ovauto
+        install -d -m 0700 -o ovauto -g ovauto /home/ovauto/.ssh
+        install -m 0600 -o ovauto -g ovauto /home/learner/.ssh/authorized_keys /home/ovauto/.ssh/authorized_keys
+        printf 'ovauto ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/ovauto
+        chmod 0440 /etc/sudoers.d/ovauto
+    - { on: ov-db-2, timeoutSec: 120, run: *ov-vm }
+    - on: ov-db-1
+      timeoutSec: 180
+      run: |
+        set -eu
+        [ -f /var/tmp/.ct-patch-seeded ] && exit 0
+        install -d /etc/ov /var/lib/ov-patch
+        cat /proc/sys/kernel/random/boot_id > /etc/ov/provisioned-boot-id
+        cat > /usr/local/sbin/ov-patch <<'EOS'
+        #!/bin/sh
+        # Simulated full update: takes a while, records the run and asks for a reboot on hosts with a new kernel.
+        mkdir -p /var/lib/ov-patch
+        echo "$(date +%s) start" >> /var/lib/ov-patch/runs.log
+        sleep {{secs}}
+        echo '{"patched": true}' > /var/lib/ov-patch/last.json
+        [ -e /etc/ov/needs-reboot ] && touch /run/reboot-required
+        echo "$(date +%s) done" >> /var/lib/ov-patch/runs.log
+        EOS
+        chmod 0755 /usr/local/sbin/ov-patch
+        [ "{{rebootnode}}" = ov-db-1 ] && touch /etc/ov/needs-reboot || true
+        touch /var/tmp/.ct-patch-seeded
+    - on: ov-db-2
+      timeoutSec: 180
+      run: |
+        set -eu
+        [ -f /var/tmp/.ct-patch-seeded ] && exit 0
+        install -d /etc/ov /var/lib/ov-patch
+        cat /proc/sys/kernel/random/boot_id > /etc/ov/provisioned-boot-id
+        cat > /usr/local/sbin/ov-patch <<'EOS'
+        #!/bin/sh
+        # Simulated full update: takes a while, records the run and asks for a reboot on hosts with a new kernel.
+        mkdir -p /var/lib/ov-patch
+        echo "$(date +%s) start" >> /var/lib/ov-patch/runs.log
+        sleep {{secs}}
+        echo '{"patched": true}' > /var/lib/ov-patch/last.json
+        [ -e /etc/ov/needs-reboot ] && touch /run/reboot-required
+        echo "$(date +%s) done" >> /var/lib/ov-patch/runs.log
+        EOS
+        chmod 0755 /usr/local/sbin/ov-patch
+        [ "{{rebootnode}}" = ov-db-2 ] && touch /etc/ov/needs-reboot || true
+        touch /var/tmp/.ct-patch-seeded
+    - on: ov-ctl
+      run: |
+        set -eu
+        p=/home/learner/patching
+        install -d -o learner -g learner $p
+        cat > $p/inventory.yml <<'EOF'
+        claims:
+          children:
+            claims_db:
+              hosts:
+                ov-db-1:
+                ov-db-2:
+        EOF
+        printf '[defaults]\ninventory = inventory.yml\nremote_user = ovauto\n' > $p/ansible.cfg
+        install -d -o learner -g learner $p
+        chown -R learner:learner $p
+  checks:
+    - id: patched-db1
+      description: "ov-db-1 ran the update exactly once and it finished"
+      type: shell
+      on: ov-db-1
+      skills: [automation.advanced.async, automation.data.register]
+      weight: 2
+      command: &done |
+        awk '/start/{s++} /done/{d++} END{print s+0, d+0}' /var/lib/ov-patch/runs.log 2>/dev/null | tr '\n' ' '; [ -s /var/lib/ov-patch/last.json ] && echo recorded || echo missing
+      expect: { match: exact, value: "1 1 recorded" }
+    - { id: patched-db2, description: "ov-db-2 ran the update exactly once and it finished", type: shell, on: ov-db-2, skills: [automation.advanced.async, automation.data.register], weight: 2, command: *done, expect: { match: exact, value: "1 1 recorded" } }
+    - id: reboots
+      description: "Only the hosts that asked for it were rebooted, and no reboot request is pending"
+      type: shell
+      on: ov-ctl
+      skills: [automation.advanced.async, automation.data.register]
+      weight: 3
+      timeoutSec: 120
+      command: |
+        d=/home/learner/patching
+        r=""; p=""
+        for h in ov-db-1 ov-db-2; do
+          s=$(ct-ansible run $d ssh $h 'cmp -s /proc/sys/kernel/random/boot_id /etc/ov/provisioned-boot-id && echo same || echo new')
+          [ "$s" = new ] && r="$r$h,"
+          ct-ansible run $d ssh $h 'test -e /run/reboot-required' && p="$p$h,"
+        done
+        echo "rebooted=${r%,} pending=${p:-none}"
+      expect: { match: exact, value: "rebooted={{rebootnode}} pending=none" }
+    - id: result-json
+      description: "result.json lists every database host with its patch and reboot outcome"
+      type: shell
+      on: ov-ctl
+      skills: [automation.advanced.async, automation.data.register]
+      weight: 2
+      command: |
+        /opt/ansible/bin/python3 - <<'PY' 2>/dev/null || echo no-file
+        import json
+        try:
+            d = json.load(open('/home/learner/patching/result.json'))
+        except Exception:
+            print('unreadable'); raise SystemExit
+        bad = []
+        for h in ('ov-db-1', 'ov-db-2'):
+            e = d.get(h)
+            if not isinstance(e, dict): bad.append(h + ':missing'); continue
+            if e.get('patched') is not True: bad.append(h + ':patched')
+            if e.get('rebooted') is not (h == '{{rebootnode}}'): bad.append(h + ':rebooted')
+        print('ok' if not bad and len(d) == 2 else (' '.join(bad) or 'extra-hosts'))
+        PY
+      expect: { match: exact, value: "ok" }
+    - id: async-used
+      description: "patch.yml starts the update as an asynchronous task"
+      type: shell
+      on: ov-ctl
+      skills: [automation.advanced.async]
+      command: |
+        /opt/ansible/bin/python3 - /home/learner/patching/patch.yml <<'PY' 2>/dev/null || echo no-playbook
+        import sys, yaml
+        plays = yaml.safe_load(open(sys.argv[1])) or []
+        n = sum(1 for p in plays for t in (p.get('tasks') or []) if isinstance(t, dict) and t.get('async'))
+        print('ok' if n else 'no-async')
+        PY
+      expect: { match: exact, value: "ok" }
+    - id: rerun-no-changes
+      description: "patch.yml runs again without changes"
+      type: shell
+      on: ov-ctl
+      skills: [automation.advanced.async, automation.data.register]
+      weight: 2
+      timeoutSec: 600
+      command: |
+        ct-ansible recap /home/learner/patching patch.yml
+      expect: { match: exact, value: "changed=0 failed=0 unreachable=0" }
+  hints:
+    - title: "Do not wait inside the SSH session"
+      body: |
+        `async: 900` lets a task run in the background on the node for up to 900 seconds; `poll: 0` returns at once, and `register` keeps the job id. A later `ansible.builtin.async_status` task with `until: ....finished`, `retries` and `delay` waits for it.
+      cost: 1
+    - title: "Reboot only when asked"
+      body: |
+        The update script creates `/run/reboot-required` on hosts that need a reboot. `stat` it, register the result and put `when: <result>.stat.exists` on `ansible.builtin.reboot`. The marker disappears with the reboot.
+      cost: 2
+    - title: "Per-host results on the control node"
+      body: |
+        `hostvars[host].fact_name` reads a fact another host set (`set_fact`). A play on `localhost` with `connection: local` can build one dictionary over `groups['claims_db']` and write it with `to_nice_json`. Whether a host rebooted can be read from the kernel boot id compared with `/etc/ov/provisioned-boot-id`.
+      cost: 2
+  misconceptions:
+    - id: reboot-all
+      description: "Reboots every host after the update."
+      feedback: "Only hosts with a pending reboot request should be rebooted; check for the marker first."
+      expectFail: [reboots, result-json]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 1500
+        run: |
+          set -e
+          cd ~/patching
+          cat > patch.yml <<'EOF'
+          - name: Patch database nodes
+            hosts: claims_db
+            become: true
+            tasks:
+              - name: Already patched
+                ansible.builtin.stat:
+                  path: /var/lib/ov-patch/last.json
+                register: patched
+              - name: Start the update
+                ansible.builtin.command: /usr/local/sbin/ov-patch
+                async: 900
+                poll: 0
+                register: update_job
+                when: not patched.stat.exists
+              - name: Wait for the update
+                ansible.builtin.async_status:
+                  jid: "{{ update_job.ansible_job_id }}"
+                register: update_result
+                until: update_result.finished
+                retries: 90
+                delay: 10
+                when: not patched.stat.exists
+              - name: Reboot required
+                ansible.builtin.stat:
+                  path: /run/reboot-required
+                register: reboot_flag
+              - name: Reboot
+                ansible.builtin.reboot:
+                  reboot_timeout: 600
+              - name: Boot id comparison
+                ansible.builtin.shell: cmp -s /proc/sys/kernel/random/boot_id /etc/ov/provisioned-boot-id && echo false || echo true
+                register: boot_changed
+                changed_when: false
+              - name: Remember the outcome
+                ansible.builtin.set_fact:
+                  ov_rebooted: "{{ boot_changed.stdout | trim }}"
+          - name: Record the results
+            hosts: localhost
+            connection: local
+            gather_facts: false
+            tasks:
+              - name: Collect
+                ansible.builtin.set_fact:
+                  patch_result: "{{ patch_result | default({}) | combine({item: {'patched': true, 'rebooted': hostvars[item].ov_rebooted | bool}}) }}"
+                loop: "{{ groups['claims_db'] }}"
+              - name: result.json
+                ansible.builtin.copy:
+                  dest: /home/learner/patching/result.json
+                  content: "{{ patch_result | to_nice_json }}\n"
+                  mode: "0644"
+          EOF
+          ansible-playbook patch.yml
+    - id: fire-and-forget
+      description: "Starts the update in the background and never waits for it."
+      feedback: "The play must wait for the job to finish before it reports or reboots; poll its status."
+      expectFail: [patched-db1, patched-db2]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 900
+        run: |
+          set -e
+          cd ~/patching
+          cat > patch.yml <<'EOF'
+          - name: Patch database nodes
+            hosts: claims_db
+            become: true
+            tasks:
+              - name: Already patched
+                ansible.builtin.stat:
+                  path: /var/lib/ov-patch/last.json
+                register: patched
+              - name: Start the update
+                ansible.builtin.command: /usr/local/sbin/ov-patch
+                async: 900
+                poll: 0
+                register: update_job
+                when: not patched.stat.exists
+              - name: Reboot required
+                ansible.builtin.stat:
+                  path: /run/reboot-required
+                register: reboot_flag
+              - name: Reboot
+                ansible.builtin.reboot:
+                  reboot_timeout: 600
+                when: reboot_flag.stat.exists
+              - name: Boot id comparison
+                ansible.builtin.shell: cmp -s /proc/sys/kernel/random/boot_id /etc/ov/provisioned-boot-id && echo false || echo true
+                register: boot_changed
+                changed_when: false
+              - name: Remember the outcome
+                ansible.builtin.set_fact:
+                  ov_rebooted: "{{ boot_changed.stdout | trim }}"
+          EOF
+          ansible-playbook patch.yml
+    - id: no-record
+      description: "Patches and reboots correctly but writes no result file."
+      feedback: "The outcome per host belongs in result.json on the control node."
+      expectFail: [result-json]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 1500
+        run: |
+          set -e
+          cd ~/patching
+          cat > patch.yml <<'EOF'
+          - name: Patch database nodes
+            hosts: claims_db
+            become: true
+            tasks:
+              - name: Already patched
+                ansible.builtin.stat:
+                  path: /var/lib/ov-patch/last.json
+                register: patched
+              - name: Start the update
+                ansible.builtin.command: /usr/local/sbin/ov-patch
+                async: 900
+                poll: 0
+                register: update_job
+                when: not patched.stat.exists
+              - name: Wait for the update
+                ansible.builtin.async_status:
+                  jid: "{{ update_job.ansible_job_id }}"
+                register: update_result
+                until: update_result.finished
+                retries: 90
+                delay: 10
+                when: not patched.stat.exists
+              - name: Reboot required
+                ansible.builtin.stat:
+                  path: /run/reboot-required
+                register: reboot_flag
+              - name: Reboot
+                ansible.builtin.reboot:
+                  reboot_timeout: 600
+                when: reboot_flag.stat.exists
+              - name: Boot id comparison
+                ansible.builtin.shell: cmp -s /proc/sys/kernel/random/boot_id /etc/ov/provisioned-boot-id && echo false || echo true
+                register: boot_changed
+                changed_when: false
+              - name: Remember the outcome
+                ansible.builtin.set_fact:
+                  ov_rebooted: "{{ boot_changed.stdout | trim }}"
+          EOF
+          ansible-playbook patch.yml
+  solution:
+    explanation: |
+      The update is started with `async` and `poll: 0`, so the SSH session is not held open, and `async_status` with
+      `until` waits for each host. A `stat` of `/run/reboot-required` decides, per host, whether the `reboot` module runs.
+      Each host remembers whether its boot id changed, and a final play on the control node assembles one dictionary
+      and writes `result.json`. A guard on the update's result file keeps the second run from patching again, so it
+      reports no changes.
+    steps:
+      - on: ov-ctl
+        as: learner
+        timeoutSec: 1500
+        run: |
+          set -e
+          cd ~/patching
+          cat > patch.yml <<'EOF'
+          - name: Patch database nodes
+            hosts: claims_db
+            become: true
+            tasks:
+              - name: Already patched
+                ansible.builtin.stat:
+                  path: /var/lib/ov-patch/last.json
+                register: patched
+              - name: Start the update
+                ansible.builtin.command: /usr/local/sbin/ov-patch
+                async: 900
+                poll: 0
+                register: update_job
+                when: not patched.stat.exists
+              - name: Wait for the update
+                ansible.builtin.async_status:
+                  jid: "{{ update_job.ansible_job_id }}"
+                register: update_result
+                until: update_result.finished
+                retries: 90
+                delay: 10
+                when: not patched.stat.exists
+              - name: Reboot required
+                ansible.builtin.stat:
+                  path: /run/reboot-required
+                register: reboot_flag
+              - name: Reboot
+                ansible.builtin.reboot:
+                  reboot_timeout: 600
+                when: reboot_flag.stat.exists
+              - name: Boot id comparison
+                ansible.builtin.shell: cmp -s /proc/sys/kernel/random/boot_id /etc/ov/provisioned-boot-id && echo false || echo true
+                register: boot_changed
+                changed_when: false
+              - name: Remember the outcome
+                ansible.builtin.set_fact:
+                  ov_rebooted: "{{ boot_changed.stdout | trim }}"
+          - name: Record the results
+            hosts: localhost
+            connection: local
+            gather_facts: false
+            tasks:
+              - name: Collect
+                ansible.builtin.set_fact:
+                  patch_result: "{{ patch_result | default({}) | combine({item: {'patched': true, 'rebooted': hostvars[item].ov_rebooted | bool}}) }}"
+                loop: "{{ groups['claims_db'] }}"
+              - name: result.json
+                ansible.builtin.copy:
+                  dest: /home/learner/patching/result.json
+                  content: "{{ patch_result | to_nice_json }}\n"
+                  mode: "0644"
+          EOF
+          ansible-playbook patch.yml
+    alternatives:
+      - id: poll-in-task
+        description: "Lets the task poll by itself (async with a positive poll) instead of a separate status task."
+        steps:
+          - on: ov-ctl
+            as: learner
+            timeoutSec: 1500
+            run: |
+              set -e
+              cd ~/patching
+              cat > patch.yml <<'EOF'
+              - name: Patch database nodes
+                hosts: claims_db
+                become: true
+                tasks:
+                  - name: Already patched
+                    ansible.builtin.stat:
+                      path: /var/lib/ov-patch/last.json
+                    register: patched
+                  - name: Run the update
+                    ansible.builtin.command: /usr/local/sbin/ov-patch
+                    async: 900
+                    poll: 15
+                    when: not patched.stat.exists
+                  - name: Reboot required
+                    ansible.builtin.stat:
+                      path: /run/reboot-required
+                    register: reboot_flag
+                  - name: Reboot
+                    ansible.builtin.reboot:
+                      reboot_timeout: 600
+                    when: reboot_flag.stat.exists
+                  - name: Boot id comparison
+                    ansible.builtin.shell: cmp -s /proc/sys/kernel/random/boot_id /etc/ov/provisioned-boot-id && echo false || echo true
+                    register: boot_changed
+                    changed_when: false
+                  - name: Remember the outcome
+                    ansible.builtin.set_fact:
+                      ov_rebooted: "{{ boot_changed.stdout | trim }}"
+              - name: Record the results
+                hosts: localhost
+                connection: local
+                gather_facts: false
+                tasks:
+                  - name: Collect
+                    ansible.builtin.set_fact:
+                      patch_result: "{{ patch_result | default({}) | combine({item: {'patched': true, 'rebooted': hostvars[item].ov_rebooted | bool}}) }}"
+                    loop: "{{ groups['claims_db'] }}"
+                  - name: result.json
+                    ansible.builtin.copy:
+                      dest: /home/learner/patching/result.json
+                      content: "{{ patch_result | to_nice_json }}\n"
+                      mode: "0644"
+              EOF
+              ansible-playbook patch.yml

@@ -11,10 +11,10 @@ The source of truth is each lab's `status`/`notes` in `content/curriculum.yaml`.
 | Set | Authored | Verified live | Not started |
 |---|---|---|---|
 | Path `ansible-fundamentals`, tier-A labs (9 of 12) | 9 | **9** | 0 |
-| Path `ansible-fundamentals`, tier-B labs (`ov-conditionals-os-family`, `ov-handlers-web-reload`, `ov-template-claims-vhost`) | 0 | 0 | 3 (need VMs, see Next steps) |
+| Path `ansible-fundamentals`, tier-B labs (`ov-conditionals-os-family`, `ov-handlers-web-reload`, `ov-template-claims-vhost`) | 3 (round 5 wave 3, VM fleets, never run live) | 0 | 0 |
 | Exam `sim-el-automation` pool (32 pooled tasks) | 34 written (15 passed a live exam run; 19 written in round 5 wave 1, never run live; 2 of those blocked and held out of the pools) | 0 per-task | 0 |
 | Capstone tasks `xpe-ansible-node-agents`, `xpe-ansible-ssh-hardening` (pool of `sim-platform-engineer`) | 2 (round 5 wave 1, never run live) | 0 | 0 |
-| Round 5 wave 3: 12 VM learning labs (incl. the 3 tier-B fundamentals labs) + 9 blocked (network, EE, EDA, timesync) written in PR #126 (unmerged, none live) | 21 | 0 | 0 |
+| Round 5 wave 3: 12 VM learning labs (incl. the 3 tier-B fundamentals labs) + 9 blocked (network, EE, EDA, timesync) written in PR #126 (none live) | 21 | 0 | 0 |
 | Paths `el-automation-engineer`, `automation-engineering-practices`, `automation-content-developer`, `automation-controller-operations`, `network-automation`, `event-driven-automation` | 23 written in PR #84 (unmerged, 22 runnable, 1 blocked), none live | 0 | 26 |
 
 Verified learning labs (path order): ov-first-inventory, ov-bootstrap-automation-user,
@@ -227,30 +227,53 @@ Verify queue (all pod slot; no VM, kubeadm, netdev or Kata needs): 22 runnable l
 after the majors are fixed, from origin/main by the batch runner. Kata-blocked: none. Image-blocked:
 ov-devcontainer-workflow (code-server + web proxy).
 
-## Round 5, wave 3 (write-only, PR #126 NOT merged)
+## Round 5, wave 3 (write-only, PR #126)
 
-PR #126 (`content/automation-r5-w3`, head 1aef53b): 21 labs, all `built` (none verified, none
-run live): 12 runnable VM labs, 9 blocked (setup stops with a clear "blocked:" message; the
-blocker is in each lab's curriculum notes). None of the labs exist on PR #84's branch. Static
-review of head 1aef53b (all 21 labs, curriculum, pack.yaml): not approved, two majors remain
-(below). `render --check` passes; `lab-verify --strict` could not run in the reviewer's checkout
-(stale local lab-schema build), so CI decides. CI checks were still pending at review time.
-Round-3 fixes confirmed: the backup-restore git reads now run as learner (the earlier root
-`safe.directory=*` security finding is gone), the srlinux trunk peer, the EE rsync install and
-the EDA `set -eu` after the blocked guard.
+PR #126 (`content/automation-r5-w3`): 21 labs, all `built` (none verified, none run live): 12
+runnable VM labs, 9 blocked (setup stops with a clear "blocked:" message; the blocker is in each
+lab's curriculum notes). None of the labs exist on PR #84's branch. `pack.yaml` gained one course
+per path module of these labs (course ids differ from the ones PR #84 adds; merge them module by
+module when both land). Round-3 fixes confirmed by the static review of head 1aef53b: the
+backup-restore git reads run as learner (no root `safe.directory=*`), the srlinux trunk peer, the
+EE rsync install and the EDA `set -eu` after the blocked guard.
 
-Majors to fix before merge:
+Review majors and minors of head 1aef53b, fixed before merge:
 
-| Lab | Major |
-|---|---|
-| ov-net-parse-neighbors | the `reported` check scrapes `fatal:`/`failed: [host]` lines, which Ansible prints even for ignored failures, so the failures-ignored mutation is not caught and a learner using `ignore_errors` passes. Read the failing hosts from PLAY RECAP |
-| ov-block-rescue-db-maintenance | a playbook that only appends a `status=rolled-back` line passes every check: service and schema already pass at start and nothing proves the migration or block/rescue/always ran. Have ov-schema-apply record each call and add a check on the service restart timestamp or a structure check |
+| Lab | Finding | Fix |
+|---|---|---|
+| ov-net-parse-neighbors (major) | `reported` scraped `fatal:`/`failed: [host]` lines, which Ansible prints for ignored failures too, so `ignore_errors` passed | `reported` removes the JSON files, runs the playbook, reads every host's PLAY RECAP line (`failed>=1 ignored=0` for the two routers with the broken adjacency, `failed=0` for the healthy one), checks the failure message of each failing router names its missing neighbour, and compares the regenerated JSON files with `show ip ospf neighbor json` read from each router; the parsed-* checks compare the normalised id-to-state map with the topology instead of searching substrings |
+| ov-block-rescue-db-maintenance (major) | a playbook that only appended `status=rolled-back` passed every check | `ov-schema-apply` records every call (content hash, service state, exit code) in a root-owned ledger; `rerun-safe` runs the playbook and requires a new failing call on the migration content made while `ov-policy` was stopped, the previous schema back byte for byte, the service active and enabled with a new systemd InvocationID, and exactly one new `status=rolled-back` line written after the failed call; `block-structure` requires block + rescue + always with the status line in always; new misconception `marker-only` (only appends the line) |
+| ov-net-inventory-facts (minor) | files had to drop changing fields for the re-run, nothing said so and hint 2 pointed the other way | description and hint 2 now say to keep only stable fields (state, addresses, prefixes, protocols) and drop uptimes and counters |
+| ov-net-ospf-branch-config (minor) | "adding a router needs only another host_vars file" was not graded | new check `data-driven`: nothing in the project outside `host_vars/` and the inventory names a router or holds its addresses |
+| ov-system-role-timesync (minor) | the uses-role scan stopped at the first `include_role` task | the scan walks `pre_tasks`, `tasks`, `post_tasks` and nested blocks and matches the role name of every include/import |
 
-Minors: ov-net-inventory-facts (files must drop changing fields such as uptimes and counters to
-pass the re-run, but neither the description nor the hints say so, and hint 2 points the other
-way); ov-net-ospf-branch-config (the "only another host_vars file" requirement is not graded);
-ov-system-role-timesync (the uses-role scan stops at the first `include_role` task, so a play
-that includes another role first is graded as not using timesync).
+VM fleets (ov-ctl has no links; VMs come wired; setup makes `ovauto` with the learner's
+authorized_keys and a NOPASSWD drop-in; ansible.cfg remote_user ovauto):
+
+| Lab | Fleet | Notes |
+|---|---|---|
+| ov-conditionals-os-family | web1 + db-1 (el-vm), quote-api1 (ubuntu-vm) | audit package removed in setup; decommissioning tag is a local fact |
+| ov-handlers-web-reload | web1, web2 | nginx master PID recorded in setup; static check of validate/notify/reload |
+| ov-template-claims-vhost | web1, web2 | quote hosts and canary group only in the inventory |
+| ov-block-rescue-db-maintenance | db-1 | `ov-policy` unit and `ov-schema-apply` created in setup |
+| ov-role-claims-web | web1, web2 | `roles/ov_firewall` written in setup, hash-guarded |
+| ov-system-role-timesync | web1 + ov-ntp-1/2 | BLOCKED, no fedora.linux_system_roles |
+| ov-automate-repos-packages | web1, web2 + db-1 (mirror) | php replaced by a param package |
+| ov-automate-users-aging | web1, web2 | vault file made in setup; hashes via openssl |
+| ov-automate-lvm-storage | db-1 (disk), db-2 | graded on fstab, no reboot |
+| ov-automate-web-firewall-selinux | quote-api1 + web1 | port outside http_port_t |
+| ov-automate-cron-timers | db-1, db-2 + web1 | cron service stopped in setup |
+| ov-reboot-persistence-fix | web1, web2 | persistent vs running state |
+| ov-async-patching | db-1, db-2 | `ov-patch` sleeps; boot-id graded; longest lab |
+| ov-execution-environment-build | ov-ee-1 (podman) | BLOCKED, see below |
+
+Network labs (frr:10 routers linked to ov-ctl on eth3, bridged by `ct-fleet-net`; OSPF between
+routers on eth1/eth2): ov-net-inventory-facts, ov-net-ospf-branch-config,
+ov-net-srlinux-interfaces (FRR-only fallback: VLAN subinterfaces on ov-branch-lon-gw),
+ov-net-branch-template-role, ov-net-parse-neighbors (the grader runs the playbook itself and
+reads who fails), ov-net-config-backup-restore (bare Git repo on ov-ctl, bad change injected on
+lon, restore must use the commit before it). EDA: ov-eda-webhook-rulebook on the standard pod
+fleet (3 el-lab pods).
 
 Runnable VM labs (el-vm:10 fleets with `ansible-ctl:2.21`; conditionals-os-family also uses
 ubuntu-vm:24.04): ov-conditionals-os-family, ov-handlers-web-reload, ov-template-claims-vhost,
@@ -264,20 +287,26 @@ Blockers per lab:
 | Lab | Blocker |
 |---|---|
 | ov-system-role-timesync | `fedora.linux_system_roles` not installed in `ansible-ctl:2.21` (or the Ansible mirror); setup stops with a blocked message |
-| ov-execution-environment-build | no Podman VM image with a mirrored EE base image (`localhost/ov-ee-base:1`) and registry image (`localhost/ov-registry:3`); `oci-registry:3` and `galaxy-ng:4` are pod images; the `additional_build_files` flow is untested |
+| ov-execution-environment-build | no Podman VM image with a mirrored EE base image (`localhost/ov-ee-base:1`) and registry image (`localhost/ov-registry:3`); `oci-registry:3` and `galaxy-ng:4` are pod images; the `additional_build_files` flow is untested; the base image must ship community.general |
 | ov-net-inventory-facts, ov-net-ospf-branch-config, ov-net-branch-template-role, ov-net-parse-neighbors | `frr:10` has no openssh-server, sudo, python3 or automation account (image rebuild), or a frr `network_cli` collection in the Ansible mirror |
 | ov-net-srlinux-interfaces | same `frr:10` gap; `srlinux:25` is not in the catalog, so the FRR-only VLAN fallback was written |
 | ov-net-config-backup-restore | same `frr:10` gap; the Git repo is a bare repo on ov-ctl (no gitea) |
-| ov-eda-webhook-rulebook | `ansible-rulebook` and a JDK are not in `ansible-ctl:2.21`; setup stops with a blocked message |
+| ov-eda-webhook-rulebook | `ansible-rulebook`, a JDK and the `ansible.eda` collection are not in `ansible-ctl:2.21` / the collection mirror; setup stops with a blocked message; no recap check (rulebook lab, documented exception) |
+
+Untested assumptions to check first in the testing round: VM hostnames equal node names (not
+used by the VM labs); `community.general.seport`/`sefcontext` need `policycoreutils-python-utils`
+(installed in setup); `ansible.posix.mount state: ephemeral` in a misconception; FRR `vtysh -b` and
+`vtysh -f` merge semantics for the template and restore labs; `ansible.eda.webhook` accepts any
+POST path (`/events`).
 
 ## Verify queue (testing round, grouped by slot kind)
 
-- **vm slot** (el-vm:10; runnable after PR #126 merges): the 12 VM labs above. Needing reboots: ov-reboot-persistence-fix, ov-async-patching (boot-id). Also: `sim-el-automation` exam runs and per-task verify of the 19 xan + 2 xpe tasks (four VMs per session, one at a time).
+- **vm slot** (el-vm:10): the 12 VM labs above. Needing reboots: ov-reboot-persistence-fix, ov-async-patching (boot-id). Also: `sim-el-automation` exam runs and per-task verify of the 19 xan + 2 xpe tasks (four VMs per session, one at a time).
 - **pod slot**: the 22 runnable labs of PR #84 (not merged; fix its 4 majors and conflicts first).
 - **netdev**, **kubeadm**, **Kata**: none.
 - **image-blocked**: ov-devcontainer-workflow (code-server + web proxy, PR #84); ov-system-role-timesync and the xan roles timesync/selinux tasks (`fedora.linux_system_roles`); ov-execution-environment-build (EE/registry images); the 6 `ov-net-*` labs (frr:10 SSH/python3/account, SR Linux image); ov-eda-webhook-rulebook (ansible-rulebook + JDK).
 
-Unmerged PRs: #84 (wave 2, 23 pod labs), #126 (wave 3, 21 labs, not approved: two majors, three minors).
+Unmerged PRs: #84 (wave 2, 23 pod labs).
 
 ## Next steps
 

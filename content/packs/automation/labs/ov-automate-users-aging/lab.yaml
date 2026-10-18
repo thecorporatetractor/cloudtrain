@@ -1,0 +1,414 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ov-automate-users-aging
+  title: "Enforce password aging for claims staff accounts"
+  domain: automation
+  frameworks: [ex294-aligned:automate-system-tasks, ex294-aligned:templates-vault]
+  difficulty: medium
+  estimatedMinutes: 25
+  tags: [ansible, users, vault, sudo, password-aging, tier-c]
+  version: 1
+spec:
+  description: |
+    HR keeps the claims staff in the encrypted data file **`vars/staff.vault.yml`** of
+    `/home/learner/claims-automation` (the vault password file is set in `ansible.cfg`): a list `staff_members` with each
+    person's `name`, `uid` and a ready-made password `hash`.
+
+    Write **`staff-accounts.yml`** that, on the **`claims_web`** hosts:
+
+    - creates the group **`claims_staff`** and every member with exactly the given UID, the group `claims_staff` as a
+      supplementary group and the given password hash;
+    - gives each member a **maximum password age of {{maxage}} days** and a **warning period of {{warn}} days**;
+    - lets the group `claims_staff` run `systemctl restart httpd` as root through sudo, **and nothing else**.
+
+    Keep the data file encrypted and do not copy the hashes anywhere else. Run it; the grader runs it again and expects
+    no changes.
+  objectives:
+    - "Create users and groups with modules"
+    - "Use vaulted data safely"
+    - "Set password aging and a scoped sudo rule"
+  params:
+    vpw:
+      type: int
+      min: 100000
+      max: 999999
+    ubase:
+      type: int
+      min: 41
+      max: 59
+    maxage:
+      type: choice
+      values: [60, 90, 120]
+    warn:
+      type: choice
+      values: [5, 7, 10]
+  topology:
+    entry: ov-ctl
+    nodes:
+      - { name: ov-ctl, driver: container, image: ansible-ctl:2.21, access: [shell] }
+      - { name: ov-claims-web1, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280 }, access: [ssh] }
+      - { name: ov-claims-web2, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280 }, access: [ssh] }
+  setup:
+    - on: ov-claims-web1
+      timeoutSec: 120
+      run: &ov-vm |
+        set -eu
+        id ovauto >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Orrin and Vale automation" ovauto
+        install -d -m 0700 -o ovauto -g ovauto /home/ovauto/.ssh
+        install -m 0600 -o ovauto -g ovauto /home/learner/.ssh/authorized_keys /home/ovauto/.ssh/authorized_keys
+        printf 'ovauto ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/ovauto
+        chmod 0440 /etc/sudoers.d/ovauto
+    - { on: ov-claims-web2, timeoutSec: 120, run: *ov-vm }
+    - on: ov-claims-web1
+      timeoutSec: 120
+      run: |
+        set -eu
+        [ -f /var/tmp/.ct-staff-seeded ] && exit 0
+        n=1
+        for u in hlindqvist pnakamura tosei; do
+          openssl passwd -6 -salt ovsalt$n "Ov-stf-{{vpw}}-$u" > /var/tmp/.ct-hash-$u
+          n=$((n+1))
+        done
+        touch /var/tmp/.ct-staff-seeded
+    - on: ov-claims-web2
+      timeoutSec: 120
+      run: |
+        set -eu
+        [ -f /var/tmp/.ct-staff-seeded ] && exit 0
+        n=1
+        for u in hlindqvist pnakamura tosei; do
+          openssl passwd -6 -salt ovsalt$n "Ov-stf-{{vpw}}-$u" > /var/tmp/.ct-hash-$u
+          n=$((n+1))
+        done
+        touch /var/tmp/.ct-staff-seeded
+    - on: ov-ctl
+      run: |
+        set -eu
+        p=/home/learner/claims-automation
+        install -d -o learner -g learner $p
+        cat > $p/inventory.yml <<'EOF'
+        claims:
+          children:
+            claims_web:
+              hosts:
+                ov-claims-web1:
+                ov-claims-web2:
+        EOF
+        printf '[defaults]\ninventory = inventory.yml\nremote_user = ovauto\nvault_password_file = .vault_pass\n' > $p/ansible.cfg
+        install -d -o learner -g learner $p/vars
+        printf 'Ov-vault-{{vpw}}\n' > $p/.vault_pass
+        chmod 0600 $p/.vault_pass
+        n=1
+        {
+          echo "staff_members:"
+          for u in hlindqvist pnakamura tosei; do
+            echo "  - { name: $u, uid: {{ubase}}0$n, hash: \"$(openssl passwd -6 -salt ovsalt$n "Ov-stf-{{vpw}}-$u")\" }"
+            n=$((n+1))
+          done
+        } > $p/vars/staff.vault.yml
+        chown -R learner:learner $p
+        ct-ansible run $p ansible-vault encrypt vars/staff.vault.yml >/dev/null
+        chown -R learner:learner $p
+  checks:
+    - id: accounts-web1
+      description: "ov-claims-web1 has the staff accounts with their UIDs, the claims_staff group and the hashed passwords from the vault"
+      type: shell
+      on: ov-claims-web1
+      skills: [automation.modules.users, automation.content.vault]
+      weight: 2
+      command: &acct |
+        r=""
+        for e in hlindqvist:1 pnakamura:2 tosei:3; do
+          n=${e%%:*}; s=${e#*:}
+          [ "$(id -u $n 2>/dev/null)" = "{{ubase}}0$s" ] || { r="$r $n:uid"; continue; }
+          id -nG $n | tr ' ' '\n' | grep -qx claims_staff || r="$r $n:group"
+          [ "$(getent shadow $n | cut -d: -f2)" = "$(cat /var/tmp/.ct-hash-$n 2>/dev/null)" ] || r="$r $n:password"
+        done
+        getent group claims_staff >/dev/null || r="$r no-group"
+        echo "${r:-ok}"
+      expect: { match: exact, value: "ok" }
+    - { id: accounts-web2, description: "ov-claims-web2 has the staff accounts with their UIDs, the claims_staff group and the hashed passwords from the vault", type: shell, on: ov-claims-web2, skills: [automation.modules.users, automation.content.vault], weight: 2, command: *acct, expect: { match: exact, value: "ok" } }
+    - id: aging-web1
+      description: "Every staff account on ov-claims-web1 has the required maximum password age and warning period"
+      type: shell
+      on: ov-claims-web1
+      skills: [automation.modules.users]
+      weight: 2
+      command: &aging |
+        r=""
+        for n in hlindqvist pnakamura tosei; do
+          [ "$(getent shadow $n 2>/dev/null | cut -d: -f5,6)" = "{{maxage}}:{{warn}}" ] || r="$r $n"
+        done
+        echo "${r:-ok}"
+      expect: { match: exact, value: "ok" }
+    - { id: aging-web2, description: "Every staff account on ov-claims-web2 has the required maximum password age and warning period", type: shell, on: ov-claims-web2, skills: [automation.modules.users], weight: 2, command: *aging, expect: { match: exact, value: "ok" } }
+    - id: sudo-web1
+      description: "The claims_staff group on ov-claims-web1 may restart httpd through sudo and nothing wider; the sudoers files are valid"
+      type: shell
+      on: ov-claims-web1
+      skills: [automation.modules.users]
+      weight: 2
+      command: &sudo |
+        o=$(sudo -l -U hlindqvist 2>/dev/null)
+        echo "$o" | grep -q 'systemctl restart httpd' && a=restart || a=no-restart
+        echo "$o" | grep -Eq '(^|[[:space:]])ALL[[:space:]]*$' && b=too-wide || b=scoped
+        visudo -c >/dev/null 2>&1 && v=valid || v=invalid
+        echo "$a $b $v"
+      expect: { match: exact, value: "restart scoped valid" }
+    - { id: sudo-web2, description: "The claims_staff group on ov-claims-web2 may restart httpd through sudo and nothing wider; the sudoers files are valid", type: shell, on: ov-claims-web2, skills: [automation.modules.users], weight: 2, command: *sudo, expect: { match: exact, value: "restart scoped valid" } }
+    - id: vault-intact
+      description: "The staff data file is still encrypted and no password hash appears in any other file of the project"
+      type: shell
+      on: ov-ctl
+      skills: [automation.content.vault]
+      weight: 2
+      command: |
+        d=/home/learner/claims-automation
+        head -1 $d/vars/staff.vault.yml 2>/dev/null | grep -q '^\$ANSIBLE_VAULT;' || { echo vault-file-not-encrypted; exit 0; }
+        if grep -rqsF '$6$' $d --exclude=staff.vault.yml --exclude-dir=.git --exclude-dir=.ansible; then echo hash-outside-vault; else echo ok; fi
+      expect: { match: exact, value: "ok" }
+    - id: rerun-no-changes
+      description: "staff-accounts.yml runs again without changes"
+      type: shell
+      on: ov-ctl
+      skills: [automation.modules.users, automation.content.vault]
+      weight: 2
+      timeoutSec: 600
+      command: |
+        ct-ansible recap /home/learner/claims-automation staff-accounts.yml
+      expect: { match: exact, value: "changed=0 failed=0 unreachable=0" }
+  hints:
+    - title: "Read the vaulted data"
+      body: |
+        `ansible-vault view vars/staff.vault.yml` prints the list `staff_members` (the vault password file is already set in `ansible.cfg`). In the play, `vars_files: [vars/staff.vault.yml]` decrypts it on the fly.
+      cost: 1
+    - title: "Aging belongs to the account"
+      body: |
+        The `ansible.builtin.user` module has `password_expire_max` and `password_expire_warn` (maximum age and warning days) next to `password`, `uid` and `groups`. Use `append: true` so existing groups are kept.
+      cost: 1
+    - title: "A safe sudo rule"
+      body: |
+        Put the rule in its own file under `/etc/sudoers.d/` and let the module validate it with `visudo -cf %s` before it is installed. A group is written with a leading `%`.
+      cost: 2
+  misconceptions:
+    - id: hash-in-playbook
+      description: "Pastes a password hash into the playbook instead of reading it from the vaulted file."
+      feedback: "The hashes live in the encrypted data file; they must not appear in any other project file."
+      expectFail: [vault-intact]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/claims-automation
+          h=$(openssl passwd -6 -salt ovsalt1 "Ov-stf-{{vpw}}-hlindqvist")
+          cat > staff-accounts.yml <<EOF
+          - hosts: claims_web
+            become: true
+            vars_files: [vars/staff.vault.yml]
+            tasks:
+              - ansible.builtin.group: { name: claims_staff }
+              - ansible.builtin.user:
+                  name: hlindqvist
+                  uid: {{ubase}}01
+                  groups: claims_staff
+                  append: true
+                  password: "$h"
+                  password_expire_max: {{maxage}}
+                  password_expire_warn: {{warn}}
+                loop: "{{ staff_members }}"
+                when: false
+          EOF
+          cat >> staff-accounts.yml <<'EOF'
+              - ansible.builtin.user:
+                  name: "{{ item.name }}"
+                  uid: "{{ item.uid }}"
+                  groups: claims_staff
+                  append: true
+                  password: "{{ item.hash }}"
+                  password_expire_max: {{maxage}}
+                  password_expire_warn: {{warn}}
+                loop: "{{ staff_members }}"
+              - ansible.builtin.copy:
+                  dest: /etc/sudoers.d/claims-staff
+                  content: "%claims_staff ALL=(root) NOPASSWD: /usr/bin/systemctl restart httpd\n"
+                  mode: "0440"
+                  validate: /usr/sbin/visudo -cf %s
+          EOF
+          ansible-playbook staff-accounts.yml
+    - id: sudo-everything
+      description: "Gives the group unrestricted sudo."
+      feedback: "The group may restart httpd only; do not grant ALL."
+      expectFail: [sudo-web1, sudo-web2]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/claims-automation
+          cat > staff-accounts.yml <<'EOF'
+          - name: Claims staff accounts
+            hosts: claims_web
+            become: true
+            vars_files:
+              - vars/staff.vault.yml
+            tasks:
+              - name: claims_staff group
+                ansible.builtin.group:
+                  name: claims_staff
+              - name: Staff accounts
+                ansible.builtin.user:
+                  name: "{{ item.name }}"
+                  uid: "{{ item.uid }}"
+                  groups: claims_staff
+                  append: true
+                  password: "{{ item.hash }}"
+                  password_expire_max: {{maxage}}
+                  password_expire_warn: {{warn}}
+                loop: "{{ staff_members }}"
+                loop_control:
+                  label: "{{ item.name }}"
+                no_log: true
+              - name: Sudo rule for restarting httpd
+                ansible.builtin.copy:
+                  dest: /etc/sudoers.d/claims-staff
+                  content: "%claims_staff ALL=(ALL) NOPASSWD: ALL\n"
+                  mode: "0440"
+                  validate: /usr/sbin/visudo -cf %s
+          EOF
+          ansible-playbook staff-accounts.yml
+    - id: login-defs-only
+      description: "Sets the maximum age only in the defaults for new accounts."
+      feedback: "Aging has to be set on each existing account; /etc/login.defs only affects accounts created later."
+      expectFail: [aging-web1, aging-web2]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/claims-automation
+          cat > staff-accounts.yml <<'EOF'
+          - name: Claims staff accounts
+            hosts: claims_web
+            become: true
+            vars_files:
+              - vars/staff.vault.yml
+            tasks:
+              - name: claims_staff group
+                ansible.builtin.group:
+                  name: claims_staff
+              - name: Staff accounts
+                ansible.builtin.user:
+                  name: "{{ item.name }}"
+                  uid: "{{ item.uid }}"
+                  groups: claims_staff
+                  append: true
+                  password: "{{ item.hash }}"
+                loop: "{{ staff_members }}"
+                loop_control:
+                  label: "{{ item.name }}"
+                no_log: true
+              - name: Aging defaults
+                ansible.builtin.lineinfile:
+                  path: /etc/login.defs
+                  regexp: '^PASS_MAX_DAYS'
+                  line: PASS_MAX_DAYS {{maxage}}
+              - name: Sudo rule for restarting httpd
+                ansible.builtin.copy:
+                  dest: /etc/sudoers.d/claims-staff
+                  content: "%claims_staff ALL=(root) NOPASSWD: /usr/bin/systemctl restart httpd\n"
+                  mode: "0440"
+                  validate: /usr/sbin/visudo -cf %s
+          EOF
+          ansible-playbook staff-accounts.yml
+  solution:
+    explanation: |
+      The play loads the vaulted list with `vars_files`, creates the group, and loops the `user` module over the
+      members with their UID, the supplementary group, the hash and `password_expire_max` / `password_expire_warn`.
+      The sudo rule is a validated drop-in for the group with one command. The data file is never decrypted on disk
+      and the loop output is hidden with `no_log`. All modules compare state first, so the second run is quiet.
+    steps:
+      - on: ov-ctl
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/claims-automation
+          cat > staff-accounts.yml <<'EOF'
+          - name: Claims staff accounts
+            hosts: claims_web
+            become: true
+            vars_files:
+              - vars/staff.vault.yml
+            tasks:
+              - name: claims_staff group
+                ansible.builtin.group:
+                  name: claims_staff
+              - name: Staff accounts
+                ansible.builtin.user:
+                  name: "{{ item.name }}"
+                  uid: "{{ item.uid }}"
+                  groups: claims_staff
+                  append: true
+                  password: "{{ item.hash }}"
+                  password_expire_max: {{maxage}}
+                  password_expire_warn: {{warn}}
+                loop: "{{ staff_members }}"
+                loop_control:
+                  label: "{{ item.name }}"
+                no_log: true
+              - name: Sudo rule for restarting httpd
+                ansible.builtin.copy:
+                  dest: /etc/sudoers.d/claims-staff
+                  content: "%claims_staff ALL=(root) NOPASSWD: /usr/bin/systemctl restart httpd\n"
+                  mode: "0440"
+                  validate: /usr/sbin/visudo -cf %s
+          EOF
+          ansible-playbook staff-accounts.yml
+    alternatives:
+      - id: sudoers-module
+        description: "Uses the community.general.sudoers module for the sudo rule."
+        steps:
+          - on: ov-ctl
+            as: learner
+            timeoutSec: 600
+            run: |
+              set -e
+              cd ~/claims-automation
+              cat > staff-accounts.yml <<'EOF'
+              - name: Claims staff accounts
+                hosts: claims_web
+                become: true
+                vars_files:
+                  - vars/staff.vault.yml
+                tasks:
+                  - name: claims_staff group
+                    ansible.builtin.group:
+                      name: claims_staff
+                  - name: Staff accounts
+                    ansible.builtin.user:
+                      name: "{{ item.name }}"
+                      uid: "{{ item.uid }}"
+                      groups: claims_staff
+                      append: true
+                      password: "{{ item.hash }}"
+                      password_expire_max: {{maxage}}
+                      password_expire_warn: {{warn}}
+                    loop: "{{ staff_members }}"
+                    loop_control:
+                      label: "{{ item.name }}"
+                    no_log: true
+                  - name: Sudo rule for restarting httpd
+                    community.general.sudoers:
+                      name: claims-staff
+                      group: claims_staff
+                      runas: root
+                      commands: /usr/bin/systemctl restart httpd
+                      nopassword: true
+                      validation: required
+              EOF
+              ansible-playbook staff-accounts.yml

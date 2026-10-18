@@ -1,0 +1,457 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ov-block-rescue-db-maintenance
+  title: "Roll back a failed policy database maintenance step"
+  domain: automation
+  frameworks: [ex294-aligned:plays-errors]
+  difficulty: medium
+  estimatedMinutes: 25
+  tags: [ansible, block, rescue, error-handling, systemd, tier-b]
+  version: 1
+spec:
+  description: |
+    The policy database node `ov-db-1` runs the policy service (`ov-policy`). Tonight's maintenance must stop the
+    service, replace the schema file `/etc/ov/policy/schema.sql` with the new one from
+    `/home/learner/policy-db/migrations/schema-next.sql`, apply it with `/usr/local/sbin/ov-schema-apply` (which
+    exits non-zero when the file contains an error) and start the service again.
+
+    Write **`/home/learner/policy-db/maintenance.yml`** (inventory and `ansible.cfg` are in that directory) so that
+    any failure of the migration:
+
+    - puts the **previous schema file back**, byte for byte;
+    - leaves the **policy service running**;
+    - does not stop the play with a failure for the host;
+
+    and so that every run, successful or not, appends one line to **`/var/log/ov-maint.log`** on the node. The line
+    ends with `status=ok` after a successful migration and with `status=rolled-back` after a rollback.
+
+    Do not edit the migration file. Run the playbook once; the grader runs it again.
+  objectives:
+    - "Group tasks with block, rescue and always"
+    - "Restore a previous state after a failed change"
+    - "Record the outcome of a run on the managed node"
+  params:
+    ver:
+      type: int
+      min: 2
+      max: 8
+    badline:
+      type: int
+      min: 3
+      max: 9
+  topology:
+    entry: ov-ctl
+    nodes:
+      - { name: ov-ctl, driver: container, image: ansible-ctl:2.21, access: [shell] }
+      - { name: ov-db-1, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280 }, access: [ssh] }
+  setup:
+    - on: ov-db-1
+      timeoutSec: 120
+      run: &ov-vm |
+        set -eu
+        id ovauto >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Orrin and Vale automation" ovauto
+        install -d -m 0700 -o ovauto -g ovauto /home/ovauto/.ssh
+        install -m 0600 -o ovauto -g ovauto /home/learner/.ssh/authorized_keys /home/ovauto/.ssh/authorized_keys
+        printf 'ovauto ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/ovauto
+        chmod 0440 /etc/sudoers.d/ovauto
+    - on: ov-db-1
+      timeoutSec: 240
+      run: |
+        set -eu
+        [ -f /var/tmp/.ct-policy-seeded ] && exit 0
+        install -d /etc/ov/policy
+        cat > /usr/local/sbin/ov-policy-svc <<'EOS'
+        #!/bin/sh
+        while true; do date +%s > /run/ov-policy.beat; sleep 5; done
+        EOS
+        cat > /usr/local/sbin/ov-schema-apply <<'EOS'
+        #!/bin/sh
+        n=$(grep -n 'SYNTAX ERROR' "$1" | head -1 | cut -d: -f1)
+        if [ -n "$n" ]; then echo "ov-schema-apply: syntax error at line $n" >&2; exit 1; fi
+        echo "schema applied: $(head -1 "$1")"
+        EOS
+        chmod 0755 /usr/local/sbin/ov-policy-svc /usr/local/sbin/ov-schema-apply
+        cat > /etc/systemd/system/ov-policy.service <<'UNIT'
+        [Unit]
+        Description=Orrin and Vale policy service
+        [Service]
+        ExecStart=/usr/local/sbin/ov-policy-svc
+        Restart=on-failure
+        [Install]
+        WantedBy=multi-user.target
+        UNIT
+        systemctl daemon-reload
+        systemctl enable --now ov-policy
+        printf -- '-- ov policy schema v{{ver}}\nCREATE TABLE policy (id integer, holder text);\nCREATE TABLE endorsement (id integer, policy_id integer);\n' > /etc/ov/policy/schema.sql
+        sha256sum < /etc/ov/policy/schema.sql | cut -d' ' -f1 > /var/tmp/.ct-schema-orig
+        rm -f /var/log/ov-maint.log
+        touch /var/tmp/.ct-policy-seeded
+    - on: ov-ctl
+      run: |
+        set -eu
+        p=/home/learner/policy-db
+        install -d -o learner -g learner $p
+        cat > $p/inventory.yml <<'EOF'
+        claims_db:
+          hosts:
+            ov-db-1:
+        EOF
+        printf '[defaults]\ninventory = inventory.yml\nremote_user = ovauto\n' > $p/ansible.cfg
+        install -d -o learner -g learner $p/migrations
+        { echo "-- ov policy schema v{{ver}}b"; for i in 2 3 4 5 6 7 8 9; do if [ $i -eq {{badline}} ]; then echo "ALTER TABLE policy ADD COLUMN SYNTAX ERROR;"; else echo "CREATE INDEX ix_$i ON policy (id);"; fi; done; } > $p/migrations/schema-next.sql
+        sha256sum $p/migrations/schema-next.sql > /var/tmp/.ct-migration.sum
+        chown -R learner:learner $p
+  checks:
+    - id: service-db
+      description: "The policy service on ov-db-1 is running and still enabled after the maintenance"
+      type: shell
+      on: ov-db-1
+      skills: [automation.control-flow.error-handling, automation.data.register]
+      weight: 2
+      command: |
+        echo "$(systemctl is-active ov-policy) $(systemctl is-enabled ov-policy)"
+      expect: { match: exact, value: "active enabled" }
+    - id: schema-db
+      description: "The schema file on ov-db-1 is the previous version again"
+      type: shell
+      on: ov-db-1
+      skills: [automation.control-flow.error-handling, automation.data.register]
+      weight: 2
+      command: |
+        [ "$(sha256sum < /etc/ov/policy/schema.sql | cut -d' ' -f1)" = "$(cat /var/tmp/.ct-schema-orig)" ] && echo restored || echo changed
+      expect: { match: exact, value: "restored" }
+    - id: log-db
+      description: "The last line of /var/log/ov-maint.log reports the outcome of the run"
+      type: shell
+      on: ov-db-1
+      skills: [automation.control-flow.error-handling, automation.data.register]
+      weight: 2
+      command: |
+        tail -n1 /var/log/ov-maint.log 2>/dev/null | grep -Eo 'status=[a-z-]+' || echo no-status
+      expect: { match: exact, value: "status=rolled-back" }
+    - id: rerun-safe
+      description: "maintenance.yml can be run again: it does not fail, and adds exactly one line to the log; the supplied migration file is unchanged"
+      type: shell
+      on: ov-ctl
+      skills: [automation.control-flow.error-handling, automation.data.register]
+      weight: 2
+      timeoutSec: 600
+      command: |
+        d=/home/learner/policy-db
+        sha256sum -c --quiet /var/tmp/.ct-migration.sum >/dev/null 2>&1 || { echo migration-edited; exit 0; }
+        n0=$(ct-ansible run $d ssh ov-db-1 'wc -l < /var/log/ov-maint.log' 2>/dev/null)
+        r=$(ct-ansible recap $d maintenance.yml)
+        n1=$(ct-ansible run $d ssh ov-db-1 'wc -l < /var/log/ov-maint.log' 2>/dev/null)
+        case $r in *"failed=0 unreachable=0") ;; *) echo "$r"; exit 0 ;; esac
+        [ $(( ${n1:-0} - ${n0:-0} )) -eq 1 ] && echo ok || echo "log-lines-added=$(( ${n1:-0} - ${n0:-0} ))"
+      expect: { match: exact, value: "ok" }
+  hints:
+    - title: "Where a rescue goes"
+      body: |
+        A `block:` groups tasks; when one fails, the tasks under `rescue:` of the same block run, and the play continues afterwards (the host is not marked failed). `always:` runs whether the block succeeded or not.
+      cost: 1
+    - title: "Keep something to roll back to"
+      body: |
+        Copy the current schema aside before you replace it. `ansible.builtin.copy` with `remote_src: true` copies a file that is already on the managed node.
+      cost: 1
+    - title: "Writing the status line"
+      body: |
+        `ansible_date_time.iso8601` is a gathered fact. A variable you set in the rescue section (`set_fact`) is visible in the `always:` section.
+      cost: 2
+  misconceptions:
+    - id: service-left-down
+      description: "Restores the schema in the rescue section but starts the service only on the success path."
+      feedback: "The service must run again whatever happened; start it where it always runs."
+      expectFail: [service-db]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/policy-db
+          cat > maintenance.yml <<'EOF'
+          - name: Policy database maintenance
+            hosts: claims_db
+            become: true
+            vars:
+              maint_status: ok
+            tasks:
+              - name: Schema migration with rollback
+                block:
+                  - name: Stop the policy service
+                    ansible.builtin.service:
+                      name: ov-policy
+                      state: stopped
+                  - name: Keep the current schema
+                    ansible.builtin.copy:
+                      src: /etc/ov/policy/schema.sql
+                      dest: /etc/ov/policy/schema.sql.bak
+                      remote_src: true
+                      mode: "0644"
+                  - name: Install the new schema
+                    ansible.builtin.copy:
+                      src: migrations/schema-next.sql
+                      dest: /etc/ov/policy/schema.sql
+                      mode: "0644"
+                  - name: Apply the schema
+                    ansible.builtin.command: /usr/local/sbin/ov-schema-apply /etc/ov/policy/schema.sql
+                    changed_when: true
+                rescue:
+                  - name: Restore the previous schema
+                    ansible.builtin.copy:
+                      src: /etc/ov/policy/schema.sql.bak
+                      dest: /etc/ov/policy/schema.sql
+                      remote_src: true
+                      mode: "0644"
+                  - name: Remember the failure
+                    ansible.builtin.set_fact:
+                      maint_status: rolled-back
+                always:
+                  - name: Status line
+                    ansible.builtin.lineinfile:
+                      path: /var/log/ov-maint.log
+                      line: "{{ ansible_date_time.iso8601 }} host={{ inventory_hostname }} status={{ maint_status }}"
+                      create: true
+                      mode: "0644"
+          EOF
+          ansible-playbook maintenance.yml
+    - id: log-only-on-success
+      description: "Writes the status line as the last task of the block."
+      feedback: "A task at the end of the block never runs when an earlier task fails; use the always section."
+      expectFail: [log-db, rerun-safe]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/policy-db
+          cat > maintenance.yml <<'EOF'
+          - name: Policy database maintenance
+            hosts: claims_db
+            become: true
+            vars:
+              maint_status: ok
+            tasks:
+              - name: Schema migration with rollback
+                block:
+                  - name: Stop the policy service
+                    ansible.builtin.service:
+                      name: ov-policy
+                      state: stopped
+                  - name: Keep the current schema
+                    ansible.builtin.copy:
+                      src: /etc/ov/policy/schema.sql
+                      dest: /etc/ov/policy/schema.sql.bak
+                      remote_src: true
+                      mode: "0644"
+                  - name: Install the new schema
+                    ansible.builtin.copy:
+                      src: migrations/schema-next.sql
+                      dest: /etc/ov/policy/schema.sql
+                      mode: "0644"
+                  - name: Apply the schema
+                    ansible.builtin.command: /usr/local/sbin/ov-schema-apply /etc/ov/policy/schema.sql
+                    changed_when: true
+                  - name: Status line
+                    ansible.builtin.lineinfile:
+                      path: /var/log/ov-maint.log
+                      line: "{{ ansible_date_time.iso8601 }} host={{ inventory_hostname }} status={{ maint_status }}"
+                      create: true
+                      mode: "0644"
+                rescue:
+                  - name: Restore the previous schema
+                    ansible.builtin.copy:
+                      src: /etc/ov/policy/schema.sql.bak
+                      dest: /etc/ov/policy/schema.sql
+                      remote_src: true
+                      mode: "0644"
+                  - name: Remember the failure
+                    ansible.builtin.set_fact:
+                      maint_status: rolled-back
+                always:
+                  - name: Policy service running
+                    ansible.builtin.service:
+                      name: ov-policy
+                      state: started
+          EOF
+          ansible-playbook maintenance.yml
+    - id: ignore-the-error
+      description: "Ignores the failed migration instead of restoring the previous schema."
+      feedback: "Ignoring the error leaves the broken schema installed; restore the previous file in a rescue section."
+      expectFail: [schema-db]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/policy-db
+          cat > maintenance.yml <<'EOF'
+          - name: Policy database maintenance
+            hosts: claims_db
+            become: true
+            vars:
+              maint_status: ok
+            tasks:
+              - name: Schema migration with rollback
+                block:
+                  - name: Stop the policy service
+                    ansible.builtin.service:
+                      name: ov-policy
+                      state: stopped
+                  - name: Keep the current schema
+                    ansible.builtin.copy:
+                      src: /etc/ov/policy/schema.sql
+                      dest: /etc/ov/policy/schema.sql.bak
+                      remote_src: true
+                      mode: "0644"
+                  - name: Install the new schema
+                    ansible.builtin.copy:
+                      src: migrations/schema-next.sql
+                      dest: /etc/ov/policy/schema.sql
+                      mode: "0644"
+                  - name: Apply the schema
+                    ansible.builtin.command: /usr/local/sbin/ov-schema-apply /etc/ov/policy/schema.sql
+                    changed_when: true
+                    ignore_errors: true
+                always:
+                  - name: Policy service running
+                    ansible.builtin.service:
+                      name: ov-policy
+                      state: started
+                  - name: Status line
+                    ansible.builtin.lineinfile:
+                      path: /var/log/ov-maint.log
+                      line: "{{ ansible_date_time.iso8601 }} host={{ inventory_hostname }} status={{ maint_status }}"
+                      create: true
+                      mode: "0644"
+          EOF
+          ansible-playbook maintenance.yml
+  solution:
+    explanation: |
+      The block stops the service, keeps a copy of the current schema and installs and applies the new
+      file. When `ov-schema-apply` fails, the rescue section puts the copy back and records the failure
+      in a variable. The always section starts the service again and appends the status line, so the
+      node ends up serviceable with a log entry whatever happened. The host is not marked failed because
+      the rescue succeeded.
+    steps:
+      - on: ov-ctl
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/policy-db
+          cat > maintenance.yml <<'EOF'
+          - name: Policy database maintenance
+            hosts: claims_db
+            become: true
+            vars:
+              maint_status: ok
+            tasks:
+              - name: Schema migration with rollback
+                block:
+                  - name: Stop the policy service
+                    ansible.builtin.service:
+                      name: ov-policy
+                      state: stopped
+                  - name: Keep the current schema
+                    ansible.builtin.copy:
+                      src: /etc/ov/policy/schema.sql
+                      dest: /etc/ov/policy/schema.sql.bak
+                      remote_src: true
+                      mode: "0644"
+                  - name: Install the new schema
+                    ansible.builtin.copy:
+                      src: migrations/schema-next.sql
+                      dest: /etc/ov/policy/schema.sql
+                      mode: "0644"
+                  - name: Apply the schema
+                    ansible.builtin.command: /usr/local/sbin/ov-schema-apply /etc/ov/policy/schema.sql
+                    changed_when: true
+                rescue:
+                  - name: Restore the previous schema
+                    ansible.builtin.copy:
+                      src: /etc/ov/policy/schema.sql.bak
+                      dest: /etc/ov/policy/schema.sql
+                      remote_src: true
+                      mode: "0644"
+                  - name: Remember the failure
+                    ansible.builtin.set_fact:
+                      maint_status: rolled-back
+                always:
+                  - name: Policy service running
+                    ansible.builtin.service:
+                      name: ov-policy
+                      state: started
+                  - name: Status line
+                    ansible.builtin.lineinfile:
+                      path: /var/log/ov-maint.log
+                      line: "{{ ansible_date_time.iso8601 }} host={{ inventory_hostname }} status={{ maint_status }}"
+                      create: true
+                      mode: "0644"
+          EOF
+          ansible-playbook maintenance.yml
+    alternatives:
+      - id: validate-on-copy
+        description: "Lets the copy module run the schema checker on the staged file before it replaces the live schema."
+        steps:
+          - on: ov-ctl
+            as: learner
+            timeoutSec: 600
+            run: |
+              set -e
+              cd ~/policy-db
+              cat > maintenance.yml <<'EOF'
+              - name: Policy database maintenance
+                hosts: claims_db
+                become: true
+                vars:
+                  maint_status: ok
+                tasks:
+                  - name: Schema migration with rollback
+                    block:
+                      - name: Stop the policy service
+                        ansible.builtin.service:
+                          name: ov-policy
+                          state: stopped
+                      - name: Keep the current schema
+                        ansible.builtin.copy:
+                          src: /etc/ov/policy/schema.sql
+                          dest: /etc/ov/policy/schema.sql.bak
+                          remote_src: true
+                          mode: "0644"
+                      - name: Install the new schema
+                        ansible.builtin.copy:
+                          src: migrations/schema-next.sql
+                          dest: /etc/ov/policy/schema.sql
+                          mode: "0644"
+                          validate: /usr/local/sbin/ov-schema-apply %s
+                      - name: Apply the schema
+                        ansible.builtin.command: /usr/local/sbin/ov-schema-apply /etc/ov/policy/schema.sql
+                        changed_when: true
+                    rescue:
+                      - name: Restore the previous schema
+                        ansible.builtin.copy:
+                          src: /etc/ov/policy/schema.sql.bak
+                          dest: /etc/ov/policy/schema.sql
+                          remote_src: true
+                          mode: "0644"
+                      - name: Remember the failure
+                        ansible.builtin.set_fact:
+                          maint_status: rolled-back
+                    always:
+                      - name: Policy service running
+                        ansible.builtin.service:
+                          name: ov-policy
+                          state: started
+                      - name: Status line
+                        ansible.builtin.lineinfile:
+                          path: /var/log/ov-maint.log
+                          line: "{{ ansible_date_time.iso8601 }} host={{ inventory_hostname }} status={{ maint_status }}"
+                          create: true
+                          mode: "0644"
+              EOF
+              ansible-playbook maintenance.yml

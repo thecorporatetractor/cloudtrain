@@ -1,0 +1,332 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: ov-conditionals-os-family
+  title: "Install the audit agent on a mixed Enterprise Linux and Debian fleet"
+  domain: automation
+  frameworks: [ex294-aligned:core-components]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [ansible, conditionals, facts, ubuntu, tier-b]
+  version: 1
+spec:
+  description: |
+    Head-office hosts run Enterprise Linux and the branch-facing quoting host runs a Debian-family OS.
+    Security wants the audit agent on every live host, but one host is being decommissioned.
+    Its local facts (`/etc/ansible/facts.d/ov.fact`) say so.
+
+    Write **`/home/learner/claims-automation/audit-agent.yml`** (inventory and `ansible.cfg` are in that
+    directory; the remote user is `ovauto`) so that, on **all** hosts that are **not** tagged
+    `decommissioning`:
+
+    - the audit package for the host's OS family is installed (the package is not called the same on both families);
+    - the audit service is running and enabled at boot;
+    - `/etc/ov/audit-agent.conf` exists with mode `0644` and exactly two lines:
+      `family=<the host's OS family as Ansible reports it>` and `retain_days={{days}}`.
+
+    Hosts tagged `decommissioning` must get nothing: no package, no file. Run the playbook; the grader runs it
+    again and expects no changes.
+  objectives:
+    - "Use facts to branch on the OS family"
+    - "Read a custom fact to skip tagged hosts"
+    - "Install the package that fits each family"
+  params:
+    days:
+      type: int
+      min: 30
+      max: 90
+  topology:
+    entry: ov-ctl
+    nodes:
+      - { name: ov-ctl, driver: container, image: ansible-ctl:2.21, access: [shell] }
+      - { name: ov-claims-web1, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280 }, access: [ssh] }
+      - { name: ov-db-1, driver: vm, image: el-vm:10, resources: { cpu: 1, memoryMiB: 1280 }, access: [ssh] }
+      - { name: ov-quote-api1, driver: vm, image: ubuntu-vm:24.04, resources: { cpu: 1, memoryMiB: 1280 }, access: [ssh] }
+  setup:
+    - on: ov-claims-web1
+      timeoutSec: 120
+      run: &ov-vm |
+        set -eu
+        id ovauto >/dev/null 2>&1 || useradd -m -s /bin/bash -c "Orrin and Vale automation" ovauto
+        install -d -m 0700 -o ovauto -g ovauto /home/ovauto/.ssh
+        install -m 0600 -o ovauto -g ovauto /home/learner/.ssh/authorized_keys /home/ovauto/.ssh/authorized_keys
+        printf 'ovauto ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/ovauto
+        chmod 0440 /etc/sudoers.d/ovauto
+    - { on: ov-db-1, timeoutSec: 120, run: *ov-vm }
+    - { on: ov-quote-api1, timeoutSec: 120, run: *ov-vm }
+    - on: ov-claims-web1
+      timeoutSec: 240
+      run: |
+        set -eu
+        [ -f /var/tmp/.ct-audit-seeded ] && exit 0
+        service auditd stop >/dev/null 2>&1 || auditctl --signal stop >/dev/null 2>&1 || true
+        systemctl disable --now auditd >/dev/null 2>&1 || true
+        dnf -y -q remove audit >/dev/null 2>&1 || true
+        install -d /etc/ansible/facts.d
+        printf '[node]\nlifecycle=%s\n' active > /etc/ansible/facts.d/ov.fact
+        chmod 0644 /etc/ansible/facts.d/ov.fact
+        touch /var/tmp/.ct-audit-seeded
+    - on: ov-db-1
+      timeoutSec: 240
+      run: |
+        set -eu
+        [ -f /var/tmp/.ct-audit-seeded ] && exit 0
+        service auditd stop >/dev/null 2>&1 || auditctl --signal stop >/dev/null 2>&1 || true
+        systemctl disable --now auditd >/dev/null 2>&1 || true
+        dnf -y -q remove audit >/dev/null 2>&1 || true
+        install -d /etc/ansible/facts.d
+        printf '[node]\nlifecycle=%s\n' decommissioning > /etc/ansible/facts.d/ov.fact
+        chmod 0644 /etc/ansible/facts.d/ov.fact
+        touch /var/tmp/.ct-audit-seeded
+    - on: ov-quote-api1
+      timeoutSec: 300
+      run: |
+        # ubuntu-vm: cloud-init re-creates the online ubuntu.sources at first boot; keep apt offline (local repos only)
+        if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then mv /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list.d/ubuntu.sources.cloud-init; rm -rf /var/lib/apt/lists/*; fi
+        apt-get update -q >/dev/null
+        [ -f /var/tmp/.ct-audit-seeded ] && exit 0
+        service auditd stop >/dev/null 2>&1 || auditctl --signal stop >/dev/null 2>&1 || true
+        systemctl disable --now auditd >/dev/null 2>&1 || true
+        DEBIAN_FRONTEND=noninteractive apt-get remove -y -q auditd >/dev/null 2>&1 || true
+        install -d /etc/ansible/facts.d
+        printf '[node]\nlifecycle=active\n' > /etc/ansible/facts.d/ov.fact
+        chmod 0644 /etc/ansible/facts.d/ov.fact
+        touch /var/tmp/.ct-audit-seeded
+    - on: ov-ctl
+      run: |
+        set -eu
+        p=/home/learner/claims-automation
+        install -d -o learner -g learner $p
+        cat > $p/inventory.yml <<'EOF'
+        claims:
+          children:
+            claims_web:
+              hosts:
+                ov-claims-web1:
+            claims_db:
+              hosts:
+                ov-db-1:
+        quoting:
+          hosts:
+            ov-quote-api1:
+        EOF
+        printf '[defaults]\ninventory = inventory.yml\nremote_user = ovauto\n' > $p/ansible.cfg
+
+        chown -R learner:learner $p
+  checks:
+    - id: agent-web1
+      description: "ov-claims-web1 has its audit package installed, the service running and enabled, and the agent file naming its OS family and retention"
+      type: shell
+      on: ov-claims-web1
+      skills: [automation.control-flow.conditionals, automation.modules.packages-services]
+      weight: 2
+      command: |
+        echo "$(rpm -q audit >/dev/null 2>&1 && echo audit || echo none) $(systemctl is-active auditd) $(systemctl is-enabled auditd) $(paste -sd, /etc/ov/audit-agent.conf 2>/dev/null)"
+      expect: { match: exact, value: "audit active enabled family=RedHat,retain_days={{days}}" }
+    - id: agent-quote
+      description: "ov-quote-api1 has its audit package installed, the service running and enabled, and the agent file naming its OS family and retention"
+      type: shell
+      on: ov-quote-api1
+      skills: [automation.control-flow.conditionals, automation.data.facts]
+      weight: 2
+      command: |
+        echo "$(dpkg-query -W -f '${db:Status-Status}' auditd 2>/dev/null || echo missing) $(systemctl is-active auditd) $(systemctl is-enabled auditd) $(paste -sd, /etc/ov/audit-agent.conf 2>/dev/null)"
+      expect: { match: exact, value: "installed active enabled family=Debian,retain_days={{days}}" }
+    - id: decom-untouched
+      description: "The host tagged decommissioning in its facts gets no audit agent and no agent file"
+      type: shell
+      on: ov-db-1
+      skills: [automation.control-flow.conditionals, automation.data.facts]
+      weight: 2
+      command: |
+        echo "$(rpm -q audit >/dev/null 2>&1 && echo audit-installed || echo skipped) $([ -e /etc/ov/audit-agent.conf ] && echo conf || echo noconf)"
+      expect: { match: exact, value: "skipped noconf" }
+    - id: rerun-no-changes
+      description: "audit-agent.yml runs again without changes"
+      type: shell
+      on: ov-ctl
+      skills: [automation.control-flow.conditionals]
+      weight: 2
+      timeoutSec: 600
+      command: |
+        ct-ansible recap /home/learner/claims-automation audit-agent.yml
+      expect: { match: exact, value: "changed=0 failed=0 unreachable=0" }
+  hints:
+    - title: "Which family is it?"
+      body: |
+        Gathered facts tell you the OS family of each host (`ansible_facts.os_family` is `RedHat` or `Debian`). A `when:` on a task runs it only where the condition holds, so the package tasks can be split by family.
+      cost: 1
+    - title: "Read the host's own tag"
+      body: |
+        Custom facts placed in `/etc/ansible/facts.d/*.fact` on a host appear under `ansible_local`. Look at what `ansible -m setup -a 'filter=ansible_local' all` returns, then skip the tagged hosts with a `when:` (or put the work in a `block:` with one condition).
+      cost: 1
+    - title: "Different package names"
+      body: |
+        The Enterprise Linux package is not called the same as the Debian one. `ansible.builtin.dnf` and `ansible.builtin.apt` are separate modules; `ansible.builtin.package` needs the right name per host.
+      cost: 2
+  misconceptions:
+    - id: one-package-manager
+      description: "Installs the agent with the Enterprise Linux package module on every host."
+      feedback: "The quoting host is a Debian-family host; dnf cannot install there. Choose the module (or package name) by OS family."
+      expectFail: [agent-quote]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/claims-automation
+          cat > audit-agent.yml <<'EOF'
+          - hosts: all
+            become: true
+            tasks:
+              - ansible.builtin.dnf: { name: audit, state: present }
+                when: ansible_local.ov.node.lifecycle | default('active') != 'decommissioning'
+              - ansible.builtin.file: { path: /etc/ov, state: directory }
+                when: ansible_local.ov.node.lifecycle | default('active') != 'decommissioning'
+              - ansible.builtin.copy:
+                  dest: /etc/ov/audit-agent.conf
+                  content: "family={{ ansible_facts.os_family }}\nretain_days={{days}}\n"
+                when: ansible_local.ov.node.lifecycle | default('active') != 'decommissioning'
+              - ansible.builtin.service: { name: auditd, state: started, enabled: true }
+                when: ansible_local.ov.node.lifecycle | default('active') != 'decommissioning'
+          EOF
+          ansible-playbook audit-agent.yml || true
+    - id: distribution-name
+      description: "Tests the distribution name Debian, which Ubuntu does not report."
+      feedback: "Ubuntu reports itself as Ubuntu; test the OS family (Debian) rather than a single distribution name."
+      expectFail: [agent-quote]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/claims-automation
+          cat > audit-agent.yml <<'EOF'
+          - hosts: all
+            become: true
+            tasks:
+              - ansible.builtin.dnf: { name: audit, state: present }
+                when: ansible_distribution in ['AlmaLinux', 'RedHat', 'CentOS'] and ansible_local.ov.node.lifecycle | default('active') != 'decommissioning'
+              - ansible.builtin.apt: { name: auditd, state: present }
+                when: ansible_distribution == 'Debian'
+              - ansible.builtin.service: { name: auditd, state: started, enabled: true }
+                when: ansible_local.ov.node.lifecycle | default('active') != 'decommissioning'
+              - ansible.builtin.file: { path: /etc/ov, state: directory }
+                when: ansible_local.ov.node.lifecycle | default('active') != 'decommissioning'
+              - ansible.builtin.copy:
+                  dest: /etc/ov/audit-agent.conf
+                  content: "family={{ ansible_facts.os_family }}\nretain_days={{days}}\n"
+                when: ansible_local.ov.node.lifecycle | default('active') != 'decommissioning'
+          EOF
+          ansible-playbook audit-agent.yml || true
+    - id: ignore-lifecycle
+      description: "Installs on every host, including the one whose facts say it is being decommissioned."
+      feedback: "Hosts tagged decommissioning in their local facts must be skipped."
+      expectFail: [decom-untouched]
+      mutation:
+        on: ov-ctl
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/claims-automation
+          cat > audit-agent.yml <<'EOF'
+          - hosts: all
+            become: true
+            tasks:
+              - ansible.builtin.dnf: { name: audit, state: present }
+                when: ansible_facts.os_family == 'RedHat'
+              - ansible.builtin.apt: { name: auditd, state: present }
+                when: ansible_facts.os_family == 'Debian'
+              - ansible.builtin.service: { name: auditd, state: started, enabled: true }
+              - ansible.builtin.file: { path: /etc/ov, state: directory }
+              - ansible.builtin.copy:
+                  dest: /etc/ov/audit-agent.conf
+                  content: "family={{ ansible_facts.os_family }}\nretain_days={{days}}\n"
+          EOF
+          ansible-playbook audit-agent.yml || true
+  solution:
+    explanation: |
+      The play gathers facts as usual; local facts from `/etc/ansible/facts.d/ov.fact` show up as
+      `ansible_local.ov`. A `block` with one `when` skips the decommissioning host; inside it, the
+      `dnf` task runs on the RedHat family and the `apt` task on the Debian family, the shared service
+      name is handled by one `service` task and the agent file records `ansible_facts.os_family`.
+      Every module checks state first, so the second run reports no changes.
+    steps:
+      - on: ov-ctl
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/claims-automation
+          cat > audit-agent.yml <<'EOF'
+          - name: Audit agent per OS family
+            hosts: all
+            become: true
+            tasks:
+              - name: Agent on active hosts only
+                when: ansible_local.ov.node.lifecycle | default('active') != 'decommissioning'
+                block:
+                  - name: Audit package (Enterprise Linux)
+                    ansible.builtin.dnf:
+                      name: audit
+                      state: present
+                    when: ansible_facts.os_family == 'RedHat'
+                  - name: Audit package (Debian family)
+                    ansible.builtin.apt:
+                      name: auditd
+                      state: present
+                    when: ansible_facts.os_family == 'Debian'
+                  - name: Audit service
+                    ansible.builtin.service:
+                      name: auditd
+                      state: started
+                      enabled: true
+                  - name: Agent directory
+                    ansible.builtin.file:
+                      path: /etc/ov
+                      state: directory
+                      mode: "0755"
+                  - name: Agent file
+                    ansible.builtin.copy:
+                      dest: /etc/ov/audit-agent.conf
+                      content: |
+                        family={{ ansible_facts.os_family }}
+                        retain_days={{days}}
+                      mode: "0644"
+          EOF
+          ansible-playbook audit-agent.yml
+    alternatives:
+      - id: package-map
+        description: "Selects the package name from a dictionary keyed by OS family and uses the generic package module."
+        steps:
+          - on: ov-ctl
+            as: learner
+            timeoutSec: 600
+            run: |
+              set -e
+              cd ~/claims-automation
+              cat > audit-agent.yml <<'EOF'
+              - hosts: all
+                tasks:
+                  - ansible.builtin.group_by:
+                      key: "{{ 'decommissioned' if ansible_local.ov.node.lifecycle | default('active') == 'decommissioning' else 'live' }}"
+                    changed_when: false
+              - hosts: live
+                become: true
+                vars:
+                  audit_pkg: { RedHat: audit, Debian: auditd }
+                tasks:
+                  - ansible.builtin.package:
+                      name: "{{ audit_pkg[ansible_facts.os_family] }}"
+                      state: present
+                  - ansible.builtin.service: { name: auditd, state: started, enabled: true }
+                  - ansible.builtin.file: { path: /etc/ov, state: directory, mode: "0755" }
+                  - ansible.builtin.copy:
+                      dest: /etc/ov/audit-agent.conf
+                      content: "family={{ ansible_facts.os_family }}\nretain_days={{days}}\n"
+                      mode: "0644"
+              EOF
+              ansible-playbook audit-agent.yml
