@@ -60,6 +60,8 @@ spec:
         G=$b/gpg; mkdir -m 0700 $G
         gpg --batch --homedir $G --pinentry-mode loopback --passphrase '' --quick-gen-key 'Tallowmere Vendor <vendor@tallowmere.example>' ed25519 sign never >/dev/null 2>&1
         gpg --batch --homedir $G --armor --export > $R/tallowmere-vendor.asc
+        mkdir -p /var/lib/cloudtrain; chmod 0700 /var/lib/cloudtrain
+        gpg --batch --homedir $G --with-colons --list-keys | awk -F: '/^fpr/ {print $10; exit}' > /var/lib/cloudtrain/vendor.fpr
         gpg --batch --homedir $G --clearsign -o InRelease Release >/dev/null 2>&1
         gpg --batch --homedir $G -abs -o Release.gpg Release >/dev/null 2>&1
         gpgconf --homedir $G --kill all 2>/dev/null || true
@@ -100,7 +102,32 @@ spec:
         if grep -rsiqE 'trusted(=|: *)yes|allow-insecure|AllowInsecureRepositories|AllowUnauthenticated' /etc/apt/sources.list /etc/apt/sources.list.d /etc/apt/apt.conf.d; then echo insecure; exit 0; fi
         timeout 60 apt-get update 2>&1 | grep -qiE 'NO_PUBKEY|not signed|insecure|not been verified' && { echo unverified; exit 0; }
         apt-cache policy tr-agent 2>/dev/null | grep -q 'http://tr-vendor:8802' || { echo no-source; exit 0; }
-        grep -rhsE 'signed-by|Signed-By' /etc/apt/sources.list.d | grep -qi vendor && echo signed || echo no-signed-by
+        python3 - <<'PY'
+        import glob, re, subprocess
+        fpr = open('/var/lib/cloudtrain/vendor.fpr').read().strip()
+        keys = []
+        for f in ['/etc/apt/sources.list'] + glob.glob('/etc/apt/sources.list.d/*'):
+            try:
+                t = open(f).read()
+            except OSError:
+                continue
+            if f.endswith('.sources'):
+                for st in re.split(r'\n\s*\n', t):
+                    if 'tr-vendor:8802' in st:
+                        keys += re.findall(r'(?im)^signed-by:\s*(\S+)', st)
+            else:
+                for ln in t.splitlines():
+                    if 'tr-vendor:8802' in ln and not ln.lstrip().startswith('#'):
+                        keys += re.findall(r'(?i)signed-by=([^\]\s]+)', ln)
+        for k in keys:
+            try:
+                o = subprocess.run(['gpg', '--batch', '--show-keys', '--with-colons', k], capture_output=True, text=True).stdout
+            except OSError:
+                continue
+            if fpr and fpr in o:
+                print('signed'); raise SystemExit
+        print('no-signed-by')
+        PY
       expect: {match: exact, value: signed}
   hints:
     - title: Key and source

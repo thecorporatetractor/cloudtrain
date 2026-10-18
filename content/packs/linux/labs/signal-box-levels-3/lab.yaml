@@ -62,14 +62,18 @@ spec:
       on: tr-signalbox-03
       skills: [linux.remote.ssh]
       weight: 0.5
-      command: test -f /home/learner/signalbox/level13/README && echo yes || echo no
+      command: |
+        want=$(printf 'sb-%s-%s' {{key}} 1013 | sha256sum | cut -c1-24)
+        [ "$(sed -n 's/^gate-ref: //p' /home/learner/signalbox/level13/README 2>/dev/null)" = "$want" ] && echo yes || echo no
       expect: {match: exact, value: "yes"}
     - id: reached-level-15
       description: Levels 14 and 15 are unlocked
       type: shell
       on: tr-signalbox-03
       skills: [linux.net.troubleshooting]
-      command: test -f /home/learner/signalbox/level15/README && echo yes || echo no
+      command: |
+        want=$(printf 'sb-%s-%s' {{key}} 1015 | sha256sum | cut -c1-24)
+        [ "$(sed -n 's/^gate-ref: //p' /home/learner/signalbox/level15/README 2>/dev/null)" = "$want" ] && echo yes || echo no
       expect: {match: exact, value: "yes"}
     - id: final-token
       description: ~/answers/signal-box-3.txt holds the final token
@@ -139,12 +143,24 @@ spec:
           q=$( (echo "$p"; sleep 1) | nc 127.0.0.1 30013 | awk '{print $NF}' | tail -1); sb-unlock 14 "$q"
           (echo "$q"; sleep 1) | nc -w 3 127.0.0.1 30014 > /dev/null || true
           EOS
+    - id: touch-request-only
+      description: Skips levels 11 to 14 and just leaves an empty request for the dispatcher.
+      feedback: "The dispatcher answers only a request that holds the password which unlocks level 15, so there is no shortcut around the earlier levels."
+      expectFail: [final-token, reached-level-15]
+      mutation:
+        on: tr-signalbox-03
+        as: learner
+        run: |
+          mkdir -p ~/signalbox/level15 && touch ~/signalbox/level15/request ~/signalbox/level15/README
+          sleep 70
+          awk '{print $NF}' ~/signalbox/level15/reply.txt > ~/answers/signal-box-3.txt 2>/dev/null || true
   solution:
     explanation: |
       Level 11: fix the key's mode and run `cat` over ssh. Level 12: sftp on port 2222.
       Level 13: nc to the plain relay. Level 14: openssl s_client to the TLS relay.
       Level 15: the cron entry runs /usr/local/sbin/sb-dispatch, which answers a
-      `request` file left in ~/signalbox/level15 on its next run.
+      `request` file left in ~/signalbox/level15 on its next run, but only when the file
+      holds the password that unlocked level 15.
     steps:
       - on: tr-signalbox-03
         timeoutSec: 180
@@ -162,7 +178,7 @@ spec:
           q=$( (echo "$p"; sleep 1) | nc 127.0.0.1 30013 | awk '{print $NF}' | tail -1); sb-unlock 14 "$q"
           r=$( (echo "$q"; sleep 1) | openssl s_client -quiet -connect 127.0.0.1:30014 2>/dev/null | awk '{print $NF}' | tail -1); sb-unlock 15 "$r"
           cat /etc/cron.d/sb-dispatch /usr/local/sbin/sb-dispatch
-          touch level15/request
+          echo "$r" > level15/request
           for i in $(seq 90); do [ -s level15/reply.txt ] && break; sleep 2; done
           awk '{print $NF}' level15/reply.txt > ~/answers/signal-box-3.txt
           cat ~/answers/signal-box-3.txt
@@ -194,7 +210,7 @@ spec:
               PY
               )
               sb-unlock 15 "$r"
-              touch level15/request
+              echo "$r" > level15/request
               until [ -s level15/reply.txt ]; do sleep 3; done
               grep -o '[0-9a-f]\{24\}' level15/reply.txt > ~/answers/signal-box-3.txt
               EOS

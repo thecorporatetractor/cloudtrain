@@ -61,6 +61,7 @@ pack 12 "$d"
 # Level 13: a plain-text service.
 d=$w/13; mkdir -p "$d"
 printf 'Signal box, level 13.\nA relay on 127.0.0.1 port 30013 hands out the password for level 14 to anyone\nwho sends it the password they used to unlock THIS level. It speaks plain text:\ntalk to it with nc.\nUnlock: sb-unlock 14 PASSWORD\n' > "$d/README"
+printf 'gate-ref: %s\n' "$(tok 1013)" >> "$d/README"
 pack 13 "$d"
 
 # Level 14: the same relay behind TLS.
@@ -70,16 +71,22 @@ pack 14 "$d"
 
 # Level 15: a scheduled job delivers the final token.
 d=$w/15; mkdir -p "$d"
-printf 'Signal box, level 15 (the last of this set).\nThe final token is delivered by the dispatcher, a job cron runs every minute.\nWork out from its cron entry and script how to ask for it, wait for the next\nrun and write the token (just the token) to ~/answers/signal-box-3.txt\n' > "$d/README"
+printf 'Signal box, level 15 (the last of this set).\nThe final token is delivered by the dispatcher, a job cron runs every minute.\nWork out from its cron entry and script how to ask for it, wait for the next\nrun and write the token (just the token) to ~/answers/signal-box-3.txt\nThe dispatcher only answers a request that proves you got here: the request file\nmust hold the password you used to unlock this level.\n' > "$d/README"
+printf 'gate-ref: %s\n' "$(tok 1015)" >> "$d/README"
 pack 15 "$d"
-tok 15 > $V/sb15.token; chmod 0600 $V/sb15.token
+tok 15 > $V/sb15.token; tok 14 > $V/sb14.token; chmod 0600 $V/sb15.token $V/sb14.token
 cat > /usr/local/sbin/sb-dispatch <<'EOT'
 #!/bin/sh
 # Signal box dispatcher. Delivers the final-level report to every user who has left a
-# file named `request` in ~/signalbox/level15, then removes the request.
+# file named `request` in ~/signalbox/level15 that holds the level 15 unlock password,
+# then removes the request.
 for d in /home/*/signalbox/level15; do
   [ -d "$d" ] && [ -e "$d/request" ] || continue
   who=$(stat -c %U "$d")
+  if [ "$(tr -d '[:space:]' < "$d/request" 2>/dev/null)" != "$(cat /var/lib/cloudtrain/sb14.token)" ]; then
+    printf 'Wrong request: it must hold the password you used to unlock level 15.\n' > "$d/reply.txt"
+    chown "$who" "$d/reply.txt"; chmod 0644 "$d/reply.txt"; rm -f "$d/request"; continue
+  fi
   printf 'The final token is %s\n' "$(cat /var/lib/cloudtrain/sb15.token)" > "$d/reply.txt"
   chown "$who" "$d/reply.txt"; chmod 0644 "$d/reply.txt"
   rm -f "$d/request"
