@@ -98,3 +98,8 @@ iperf-throughput-baseline (blocked), nftables-from-scratch, nat-port-redirect-ga
 firewall-ticket-api, fix-firewall-blocks-app, firewalld-zones-el, static-ip-persistent, nmcli-bond-el,
 bond-active-backup, xlf-static-ip-netplan, xlf-bond-config, chrony-timezone-depot,
 chrony-server-isolated, wireguard-depot-tunnel, dhcp-server-depot.
+
+## Review follow-ups
+- nmcli-bond-el: setup now switches an eth0 profile with ipv6.method ignore/disabled/link-local to auto. Confirm the el-vm:10 default ipv6.method on the first remote verify and record it here.
+- chrony-server-isolated: server-persistent only grades that an allow line exists; allow-all expectFail is [outsider-refused].
+- wireguard-depot-tunnel: mutations are a single action, so tr-wg-b cannot be configured too; expectFail stays [config-a] (listed checks fail, others may too).
