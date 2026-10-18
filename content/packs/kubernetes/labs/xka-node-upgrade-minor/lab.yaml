@@ -67,10 +67,18 @@ spec:
         apt-get install -y -q --allow-change-held-packages kubelet='1.37.1-*' kubectl='1.37.1-*' >/dev/null
         apt-mark hold kubeadm kubelet kubectl >/dev/null
         systemctl daemon-reload && systemctl restart kubelet
-        # the new kubelet recreates the static control-plane pods; wait for the API
+        # The new kubelet recreates the static control-plane pods a few seconds after it
+        # starts, while the old API server container still answers. Wait for the API to
+        # stay up through that restart (50 s of consecutive successes) before going on.
         export KUBECONFIG=/etc/kubernetes/admin.conf
-        for i in $(seq 1 90); do kubectl get --raw /readyz >/dev/null 2>&1 && break; sleep 2; done
-        kubectl get --raw /readyz >/dev/null
+        sleep 15
+        ok=0
+        for i in $(seq 1 100); do
+          if kubectl get --raw /readyz >/dev/null 2>&1; then ok=$((ok+1)); else ok=0; fi
+          [ "$ok" -ge 25 ] && exit 0
+          sleep 2
+        done
+        echo "API server did not become stably ready" >&2; exit 1
     - on: qm-harbour/harbour-wk-1
       run: apt-mark hold kubeadm kubelet kubectl
     - on: qm-harbour
