@@ -23,7 +23,9 @@ Kata and the kubeadm proof under load:
    Also in round 5: headless Entra sign-in for local end-to-end tests
    (`deploy/scripts/entra-login.mjs`, #42), `net-fix-broadcast-storm` verified (#44),
    the `sim-net-associate` exam run live (100 % / 14.3 %), and a Kube-OVN CNI hang under
-   heavy load with its recovery (`docs/dev-environment.md`, known gap 9).
+   heavy load with its recovery (`docs/dev-environment.md`, known gap 9). Kata spike:
+   prepared (`tools/kata-spike/spike.sh`, throwaway kind cluster), not run because the
+   heavy slot was queued for hours; see `docs/handoffs/foundations.md`.
 
 0. **Round 4.** Kubernetes checks (k8s-query, k8s-can-i, k8s-context) default to a
    20 s timeout (was 5 s). Every vcluster gets the ValidatingAdmissionPolicy
