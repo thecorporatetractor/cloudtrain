@@ -482,3 +482,5 @@ One lab verify is 6-8 fresh VMs (two seeds, mutations, alternatives): 9-21 min w
 `--parallel 2` (VM ready in about 110 s on a quiet machine, 350-520 s under load).
 Under heavy machine load (load average around 100) WSL restarted once during a verify
 batch; run one containers verify job at a time.
+
+Wave 5 follow-ups: (1) `ctr-engine-upgrade` keeps a container alive through a major upgrade with live-restore, which Docker supports only for patch upgrades; build the image variant as 29.a to 29.b, or confirm 28 to 29 on the first live run, and drop the containerd.io upgrade from the solution if it breaks the restore. (2) `ctr-swarm-services` and `ctr-swarm-stack` serve the worker join token over plain HTTP on playout-1:8077 (container `tokensrv`) until the last setup step removes it; if an earlier worker step fails under `set -e`, the endpoint stays up for the lifetime of the lab VMs (lab network only, accepted window). (3) `ctr-ci-rootless-buildkit` and `ctr-release-pipeline-capstone` are tier B and run on docker-vm:29 until the Kata dockerd:29 image exists.

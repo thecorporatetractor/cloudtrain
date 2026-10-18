@@ -69,6 +69,7 @@ spec:
         docker rm -f ci-registry ci-dind ci-builder >/dev/null 2>&1 || true
         rm -rf /srv/ci /srv/ci-registry; install -d /srv/ci-registry
         install -d -o learner -g learner /srv/ci /srv/ci/thumbnailer /srv/ci/out /etc/copperleaf/ci
+        rm -rf /srv/ci/trivy-cache; cp -a /var/lib/trivy /srv/ci/trivy-cache; chown -R learner:learner /srv/ci/trivy-cache
         docker run -d --name ci-registry --restart always -p 127.0.0.1:{{port}}:5000 -v /srv/ci-registry:/var/lib/registry registry:3 >/dev/null
         for i in $(seq 30); do curl -fs http://127.0.0.1:{{port}}/v2/ >/dev/null && break; sleep 1; done
         # the builder container has no access to the engine image store and the host is offline:
@@ -209,7 +210,7 @@ spec:
             --opt build-arg:REV={{rev}} --output type=image,name=$REG/thumbnailer:ci,push=true,registry.insecure=true
           A='Accept: application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json'
           d=$(curl -fsI -H "$A" http://$REG/v2/thumbnailer/manifests/ci | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}')
-          trivy image --offline-scan --skip-db-update --cache-dir /var/lib/trivy --insecure --format json -o /srv/ci/out/scan.json "$REG/thumbnailer@$d"
+          trivy image --offline-scan --skip-db-update --cache-dir /srv/ci/trivy-cache --insecure --format json -o /srv/ci/out/scan.json "$REG/thumbnailer@$d"
           COSIGN_PASSWORD='' cosign sign --key /etc/copperleaf/ci/cosign.key --tlog-upload=false --allow-insecure-registry --yes "$REG/thumbnailer@$d"
           echo "pipeline ok"
           SH
@@ -237,7 +238,7 @@ spec:
               A='Accept: application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json'
               d=$(curl -fsI -H "$A" http://$REG/v2/thumbnailer/manifests/ci | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}')
               COSIGN_PASSWORD='' cosign sign --key /etc/copperleaf/ci/cosign.key --tlog-upload=false --allow-insecure-registry --yes "$REG/thumbnailer@$d"
-              trivy image --offline-scan --skip-db-update --cache-dir /var/lib/trivy --insecure --format json -o /srv/ci/out/scan.json "$REG/thumbnailer@$d"
+              trivy image --offline-scan --skip-db-update --cache-dir /srv/ci/trivy-cache --insecure --format json -o /srv/ci/out/scan.json "$REG/thumbnailer@$d"
               echo "pipeline ok"
               SH
               /srv/ci/pipeline.sh
