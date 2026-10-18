@@ -313,12 +313,13 @@ State at the end of round 5. Everything below is `built` (static checks only: la
 | 2 | #63 | 21 (16 xct Podman tasks, 5 learning) | merged |
 | 3 | #87 | 23 (Compose, networking, storage), commit 397395c | merged |
 | 4 | #114 | 25 (registries, security, supply chain, 4 xpe tasks) | merged (review findings below carried as follow-ups if not fixed in the PR) |
+| 5 | #124 | 19 (troubleshooting, delivery, internals, three-VM swarm), commit 1f147c3 | merged |
 
 Pools: sim-containers-docker and sim-containers-podman are at 2x their draw. The sim-platform-engineer containers-delivery pool is 4/2 once #114 merges.
 
-### Unmerged: PR #114 (wave 4)
+### Unmerged PRs: none (final state, round 5 closed)
 
-Static gates pass (lab-verify --strict 0 errors, 0 warnings); the open review findings are content bugs to fix before merge:
+Waves 1 to 5 (#58, #63, #87, #114, #124) are all merged; no containers PR is open. Total written in round 5: 111 labs/tasks (23 + 21 + 23 + 25 + 19), all `built`, none run live; verified live is still the original 24. All 79 proposed learning labs are now written. The review findings on wave 4 (#114) below were not confirmed fixed before merge: treat them as content bugs to fix first in the testing round (the verify will catch most of them):
 
 - Blocker: `xpe-image-slim-fix` exec-form check uses `test("sh$")`, which matches the solution's own `ENTRYPOINT ["/printer.sh"]`; solution and alternative both fail.
 - Major: `xpe-image-build-push` reads the digest with `buildx imagetools` against a registry whose CA is trusted only in `/etc/docker/certs.d`; imagetools likely ignores that, so `digest.txt` is empty.
@@ -344,6 +345,10 @@ Static gates pass (lab-verify --strict 0 errors, 0 warnings); the open review fi
 | `ctr-scan-triage-vex`, `ctr-scout-policy` | 4 | no trivy/grype/scout, no offline vulnerability DB |
 | `ctr-cosign-sign-verify`, `ctr-content-trust-retired`, `xpe-image-sign-verify` | 4 | no cosign on docker-vm:29 (handoff pins cosign v2) |
 | `ctr-notation-sign-verify`, `ctr-signed-only-gate` | 4 | no notation CLI on docker-vm:29 |
+| `ctr-engine-upgrade` | 5 | needs a docker-vm variant that boots on Engine 28 with Engine 29 packages staged in a local apt repo (`/srv/apt/engine-29`); setup refuses otherwise |
+| `ctr-ci-rootless-buildkit` | 5 | needs `moby/buildkit:rootless`, cosign, trivy and an offline trivy DB on docker-vm |
+| `ctr-release-pipeline-capstone` | 5 | needs cosign, `moby/buildkit` (docker-container builder) and the buildkit-syft-scanner image; arm64 side is `FROM scratch` (no binfmt) |
+| `ctr-swarm-init-quorum`, `ctr-swarm-services`, `ctr-swarm-stack` | 5 | not image-blocked; unconfirmed that the Kube-OVN VPC passes 2377/tcp, 7946/tcp+udp, 4789/udp (and ESP/xfrm for the encrypted overlay, not needed by the grader); 3 VMs x 2 GiB each |
 | wave 2 labs | 2 | unconfirmed items listed in the wave 2 section (kube play secrets, Quadlet at boot, oci-archive load, keep-id) |
 
 ### Verify queue by slot kind
@@ -351,11 +356,12 @@ Static gates pass (lab-verify --strict 0 errors, 0 warnings); the open review fi
 Every containers lab is a `jumphost:1` workstation pod plus one `docker-vm:29` KubeVirt VM (wave 2: `el-vm:10` plus a `docker-vm:29` registry VM), so the whole domain uses the vm slot, one `labctl verify` at a time. No kubeadm or netdev labs.
 
 - pod: none.
-- vm, ready to verify: wave 1 minus 5 blocked (18 labs; xcd tasks first, then learning labs), wave 2 (21; learning labs first, after confirming Podman on `el-vm:10`), wave 3 minus the 5 blocked (18; Compose labs first, then storage and basic networking, then namespace firewall labs and `ctr-net-mtu-hang`), wave 4 after #114 is fixed and merged (18 of 25 not image-blocked).
+- vm, ready to verify (one `labctl verify` at a time): wave 1 minus 5 blocked (18; xcd tasks first, then learning labs), wave 2 (21; learning labs first, after confirming Podman on `el-vm:10`), wave 3 minus the 5 blocked (18; Compose labs first, then storage and basic networking, then namespace firewall labs and `ctr-net-mtu-hang`), wave 4 (18 of 25 not image-blocked; fix the review findings above first), wave 5 single-VM labs (13: `ctr-oom-exit-137`, `ctr-nofile-after-upgrade`, `ctr-link-env-removed`, `ctr-api-version-floor`, `ctr-debug-distroless`, `ctr-log-rotation`, `ctr-restart-policy`, `ctr-events-flapping`, `ctr-seccomp-legacy-binary`, `ctr-daemon-json-conflict`, `ctr-runtime-stack-trace`, `ctr-runc-bundle`, `ctr-image-layout-on-disk`).
+- vm, multi-VM (heavy, 3 x 2 GiB, run alone, VPC ports unconfirmed): `ctr-swarm-init-quorum`, `ctr-swarm-services`, `ctr-swarm-stack`.
 - kubeadm: none.
 - netdev: none.
-- Kata-blocked: none individually. The tier-B Kata `dockerd:29` variants are not built, so every lab runs as tier C (VM) only.
-- image-blocked (verify only after the docker-vm rebuild or tool install): `ctr-buildx-cache-export`, `xcd-build-multistage-nonroot`, `xcd-supply-sbom-sign`, `ctr-scan-triage-vex`, `ctr-scout-policy`, `ctr-cosign-sign-verify`, `ctr-content-trust-retired`, `xpe-image-sign-verify`, `ctr-notation-sign-verify`, `ctr-signed-only-gate`.
+- Kata-blocked: none individually. The tier-B Kata `dockerd:29` variants are not built, so every lab runs as tier C (VM) only (`ctr-ci-rootless-buildkit` and `ctr-release-pipeline-capstone` are tier B).
+- image-blocked (verify only after the docker-vm rebuild or tool install): `ctr-buildx-cache-export`, `xcd-build-multistage-nonroot`, `xcd-supply-sbom-sign`, `ctr-scan-triage-vex`, `ctr-scout-policy`, `ctr-cosign-sign-verify`, `ctr-content-trust-retired`, `xpe-image-sign-verify`, `ctr-notation-sign-verify`, `ctr-signed-only-gate`, `ctr-engine-upgrade` (Engine 28 variant), `ctr-ci-rootless-buildkit`, `ctr-release-pipeline-capstone`.
 - infra-blocked: `ctr-macvlan-encoder` (second NIC).
 - unconfirmed-behaviour, verify last: the remaining wave 1 and 3 items in the table above.
 - Exam reboot pass of `sim-containers-docker` and `sim-containers-podman` is not part of `labctl verify`.
@@ -402,7 +408,7 @@ Image wishlist for the next `docker-vm:29` rebuild (adds to the existing wave 1/
 
 Wave 4 after waves 1-3 (and wave 2 once `el-vm:10` Podman is confirmed): the writable-today registries and least-privilege/hardening labs first (shortest, fewest moving parts), then `ctr-leaked-secret-history`, `ctr-hardened-base-migration`, `ctr-dhi-vex-reconcile`; `ctr-sbom-provenance`, the cosign/notation-blocked labs and `xpe-image-sign-verify` wait for the image rebuild. First live runs should also confirm: BuildKit using `registry-mirrors` with the containerd store (`ctr-offline-mirror`), the notation `key add`/`policy import` syntax, and the v1 vs v0.2 provenance field in `ctr-sbom-provenance`. The three writable xpe tasks (`xpe-image-build-push`, `xpe-image-slim-fix`, `xpe-compose-local-stack`) verify as a set since they share `qm-docker-1`.
 
-`labctl exam compile --allow-missing sim-platform-engineer` still fails (pre-existing, confirmed present on `origin/main` before this wave): the iac/ansible xpe tasks' `workstation` node (`terraform-ws:1.15` / an ansible control image) differs from the k8s and containers xpe tasks' `workstation` node (`jumphost:1`). Not fixed in this PR (cross-domain node-sharing decision); flagged for whichever domain's wave reconciles the `sim-platform-engineer` shared nodes.
+`labctl exam compile --allow-missing sim-platform-engineer` still fails (pre-existing, confirmed present on `origin/main` before this wave): the iac/ansible xpe tasks' `workstation` node (`terraform-ws:1.15` / an ansible control image) differs from the k8s and containers xpe tasks' `workstation` node (`jumphost:1`). Not fixed in round 5 (cross-domain node-sharing decision); flagged for whichever domain's wave reconciles the `sim-platform-engineer` shared nodes.
 
 ## Round 5, wave 5 (branch `content/containers-r5-w5`): troubleshooting, delivery, internals, swarm, 19 labs
 
