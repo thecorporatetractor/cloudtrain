@@ -1,7 +1,7 @@
 import { Link, useNavigate } from '@tanstack/react-router';
 import { ArrowRight, Clock, Search, SlidersHorizontal, X } from 'lucide-react';
 import { useMemo } from 'react';
-import { useCatalog } from '@/api/client';
+import { useCatalog, useSkills } from '@/api/client';
 import type { Difficulty, Domain } from '@/api/types';
 import { Bar } from '@/components/charts';
 import { DomainIcon, LabRow, domainLabel } from '@/components/domain';
@@ -16,6 +16,8 @@ export function Catalog() {
   const search = catalogRoute.useSearch();
   const navigate = useNavigate({ from: catalogRoute.fullPath });
   const catalog = useCatalog();
+  // Framework short names for path badges ("RHCSA", not the id "rhcsa-aligned").
+  const frameworks = useSkills().data?.frameworks;
 
   const set = (patch: Partial<typeof search>) => void navigate({ search: (prev) => clean({ ...prev, ...patch }), replace: true });
 
@@ -113,7 +115,7 @@ export function Catalog() {
                   <span className="row xs subtle" style={{ gap: 6 }}>
                     <DomainIcon domain={p.domain} size={12} /> {domainLabel[p.domain]}
                   </span>
-                  {p.framework && <Badge tone="outline">{p.framework.toUpperCase()}</Badge>}
+                  {p.framework && <Badge tone="outline">{frameworks?.find((f) => f.id === p.framework)?.name ?? p.framework.toUpperCase()}</Badge>}
                 </div>
                 <h3 style={{ marginTop: 10 }}>{p.title}</h3>
                 <p className="small muted" style={{ marginTop: 4, flex: 1 }}>

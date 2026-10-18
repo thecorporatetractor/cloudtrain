@@ -36,7 +36,8 @@ const competencyByPrefix: Record<string, string> = {
   'net.svc': 'c.net.l3',
   'net.sec': 'c.net.sec',
 };
-const competencyOf = (skillId: string) => competencyByPrefix[skillId.split('.').slice(0, 2).join('.')] ?? 'c.k8s.arch';
+/** Skills outside the team heatmap's competencies (containers, IaC, automation) roll up into none. */
+const competencyOf = (skillId: string): string | undefined => competencyByPrefix[skillId.split('.').slice(0, 2).join('.')];
 
 const round2 = (v: number) => Math.round(v * 100) / 100;
 const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
@@ -44,7 +45,8 @@ const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v
 /** Per-skill states for a member, spread around their competency score (deterministic per member). */
 function statesFromCompetencies(memberId: string, byCompetency: Record<string, number>): SkillState[] {
   return skills.map((s) => {
-    const base = byCompetency[competencyOf(s.id)] ?? 0.3;
+    const c = competencyOf(s.id);
+    const base = (c ? byCompetency[c] : undefined) ?? 0.3;
     const r = seeded(`${memberId}:${s.id}`);
     const mu = clamp(base + (r - 0.5) * 0.24, 0.05, 0.97);
     const sigma = round2(0.1 + seeded(`${memberId}:${s.id}:sig`) * 0.2);
@@ -66,6 +68,7 @@ function competenciesFromStates(states: SkillState[]): Record<string, number> {
   const sums = new Map<string, { total: number; n: number }>();
   for (const st of states) {
     const c = competencyOf(st.skillId);
+    if (!c) continue;
     const cur = sums.get(c) ?? { total: 0, n: 0 };
     sums.set(c, { total: cur.total + st.mu, n: cur.n + 1 });
   }

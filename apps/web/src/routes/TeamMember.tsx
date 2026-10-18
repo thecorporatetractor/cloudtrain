@@ -4,8 +4,8 @@ import { useSkills } from '@/api/client';
 import { useMember, useTeamDashboard } from '@/api/platform';
 import { RequireAccess } from '@/app/access';
 import { initials } from '@/app/Shell';
-import { Bar, HeatCell } from '@/components/charts';
-import { DomainIcon } from '@/components/domain';
+import { HeatCell } from '@/components/charts';
+import { FrameworkIcon, FrameworkReadinessList } from '@/components/framework-picker';
 import { AssignmentStateBadge, DueDate, ItemLink, OutcomeBadge, When, itemKindLabel } from '@/components/platform';
 import { Badge, Card, EmptyState, ErrorState, PageSkeleton, Stat, TableWrap } from '@/components/ui';
 import { formatDuration, formatMinutes, pct } from '@/lib/utils';
@@ -45,6 +45,8 @@ function MemberScreen() {
   const d = q.data;
   const competencies = dash.data?.competencies ?? [];
   const frameworks = skills.data?.frameworks ?? [];
+  // Highest readiness first: the set grows with the curriculum, so the stat row shows the top two.
+  const top = [...frameworks].sort((a, b) => (d.readiness[b.id] ?? 0) - (d.readiness[a.id] ?? 0));
   const passed = d.attempts.filter((a) => a.outcome === 'passed').length;
 
   return (
@@ -66,7 +68,7 @@ function MemberScreen() {
           </div>
         </div>
         <div className="row" style={{ gap: 8 }}>
-          <Link to="/skills" search={{ framework: 'cks', member: d.user.id }} className="btn btn-secondary btn-md">
+          <Link to="/skills" search={{ framework: top[0]?.id ?? 'cks', member: d.user.id }} className="btn btn-secondary btn-md">
             Skills <ArrowRight size={13} />
           </Link>
           <Link to="/team/assign" search={{ team: d.team.id, user: d.user.id }} className="btn btn-primary btn-md">
@@ -80,7 +82,7 @@ function MemberScreen() {
         <Stat label="This month" value={formatMinutes(d.minutesThisMonth)} hint="practice" />
         <Stat label="Attempts" value={d.attempts.length} hint={`${passed} passed`} />
         <Stat label="Assignments" value={d.assignments.filter((a) => a.status !== 'completed').length} hint={`${d.assignments.filter((a) => a.status === 'overdue').length} overdue`} tone={d.assignments.some((a) => a.status === 'overdue') ? 'warn' : undefined} />
-        {frameworks.slice(0, 2).map((f) => (
+        {top.slice(0, 2).map((f) => (
           <Stat key={f.id} label={`${f.name} ready`} value={pct(d.readiness[f.id] ?? 0)} />
         ))}
       </div>
@@ -108,20 +110,18 @@ function MemberScreen() {
             <div className="card-head">
               <h2>Framework readiness</h2>
             </div>
-            <ul className="domain-readiness" style={{ padding: '14px 20px 16px' }}>
-              {frameworks.map((f) => (
-                <li key={f.id} className="stack" style={{ gap: 5 }}>
-                  <div className="row-between small">
-                    <span className="row" style={{ gap: 6 }}>
-                      <DomainIcon domain={f.id === 'ccna' ? 'networking' : f.id === 'lfcs' ? 'linux' : 'kubernetes'} size={12} /> {f.name}
-                      <span className="subtle xs">{f.fullName}</span>
-                    </span>
-                    <span className="tnum">{pct(d.readiness[f.id] ?? 0)}</span>
-                  </div>
-                  <Bar value={d.readiness[f.id] ?? 0} thin />
-                </li>
-              ))}
-            </ul>
+            <FrameworkReadinessList
+              rows={frameworks.map((f) => ({
+                id: f.id,
+                readiness: d.readiness[f.id] ?? 0,
+                label: (
+                  <span className="row" style={{ gap: 6, minWidth: 0 }}>
+                    <FrameworkIcon framework={f} size={12} /> {f.name}
+                    <span className="subtle xs truncate">{f.fullName}</span>
+                  </span>
+                ),
+              }))}
+            />
           </Card>
         </div>
 

@@ -13,6 +13,9 @@ const fw: Framework = {
   name: 'CKA',
   fullName: 'Certified Kubernetes Administrator',
   vendor: 'CNCF',
+  domain: 'kubernetes',
+  group: 'Kubernetes',
+  coverage: 1,
   domains: [
     { id: 'cka:storage', name: 'Storage', weight: 0.1, skillIds: ['s.pv', 's.pvc'] },
     { id: 'cka:troubleshooting', name: 'Troubleshooting', weight: 0.5, skillIds: ['t.logs', 't.nodes'] },

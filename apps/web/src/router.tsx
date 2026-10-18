@@ -121,12 +121,13 @@ export interface SkillsSearch {
   /** Another team member's skills (managers and admins). */
   member?: string;
 }
-const FRAMEWORKS: FrameworkId[] = ['cka', 'ckad', 'cks', 'lfcs', 'ccna'];
+/** Framework ids are content slugs (the set grows with the curriculum); Skills falls back when one is unknown. */
+const FRAMEWORK_ID = /^[a-z0-9][a-z0-9-]{0,63}$/;
 export const skillsRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: '/skills',
   validateSearch: (s: Record<string, unknown>): SkillsSearch => ({
-    framework: FRAMEWORKS.includes(s.framework as FrameworkId) ? (s.framework as FrameworkId) : 'cks',
+    framework: typeof s.framework === 'string' && FRAMEWORK_ID.test(s.framework) ? s.framework : 'cks',
     ...(typeof s.skill === 'string' && s.skill ? { skill: s.skill } : {}),
     ...(typeof s.member === 'string' && s.member ? { member: s.member } : {}),
   }),

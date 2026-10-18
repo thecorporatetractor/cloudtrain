@@ -75,7 +75,9 @@ export async function checkSkills(contentDir, findings) {
 }
 
 /**
- * Loads content/frameworks/*.yaml; returns Map of 'fw:objective' ref -> Set of skill ids.
+ * Loads the hand-written content/frameworks/*.yaml; returns Map of 'fw:objective' ref -> Set of skill ids.
+ * Files generated from content/curriculum.yaml (`generatedFrom`) are skipped: their objectives
+ * resolve as curriculum-declared frameworks.
  * Topics are either plain strings or `{id, title, skills}`; structured topics must only
  * use skills the objective lists, and every objective skill should belong to a topic.
  */
@@ -88,6 +90,9 @@ export async function checkFrameworks(contentDir, skills, findings) {
     const doc = await loadYaml(file, findings);
     if (!doc) continue;
     if (doc.id !== path.basename(name, ".yaml")) findings.push({ level: "error", file, message: `framework id '${doc.id}' must match file name` });
+    // Generated from a content/curriculum.yaml framework (tools/curriculum/render.mjs): the curriculum
+    // entry is validated as the source, and `render.mjs --check` keeps this file in step with it.
+    if (doc.generatedFrom === "content/curriculum.yaml") continue;
     for (const o of doc.objectives ?? []) {
       const ref = `${doc.id}:${o.id}`;
       if (refs.has(ref)) findings.push({ level: "error", file, path: o.id, message: `duplicate objective '${ref}'` });
