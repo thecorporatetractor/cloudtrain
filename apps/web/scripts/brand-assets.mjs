@@ -5,11 +5,14 @@
 //
 // --import strips the C2PA <metadata> manifest and the fixed width/height (the viewBox stays), and adds
 // a <title> with role="img" so the files are accessible on their own. Path data is copied verbatim.
-// The raster step needs sharp (devDependency of apps/web) and writes, next to the SVGs:
+// The raster step is dev-only and shells out to a renderer on PATH, rsvg-convert (librsvg2-bin) or
+// resvg; no npm dependency. It writes, next to the SVGs:
 //   favicon.svg (mark, follows prefers-color-scheme), ../favicon.ico (16/32/48),
 //   apple-touch-icon.png (180), icon-192.png, icon-512.png, icon-maskable-192.png, icon-maskable-512.png,
 //   og-image.png (1200x630), github-social-preview.png (1280x640), github-avatar.png (1024).
-import { mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
+import { execFileSync } from 'node:child_process';
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -137,9 +140,33 @@ function ico(pngs) {
   return Buffer.concat([header, ...pngs.map((p) => p.png)]);
 }
 
+/** Which renderer is on PATH. */
+function renderer() {
+  for (const bin of ['rsvg-convert', 'resvg']) {
+    try {
+      execFileSync(bin, ['--version'], { stdio: 'ignore' });
+      return bin;
+    } catch {
+      /* try the next one */
+    }
+  }
+  throw new Error('no SVG renderer on PATH: install librsvg2-bin (rsvg-convert) or resvg');
+}
+
 async function rasterise() {
-  const { default: sharp } = await import('sharp');
-  const png = (svg) => sharp(Buffer.from(svg)).png({ compressionLevel: 9 }).toBuffer();
+  const bin = renderer();
+  const tmp = await mkdtemp(path.join(os.tmpdir(), 'ct-brand-'));
+  let n = 0;
+  /** Renders an SVG string (with width/height attributes) to a PNG buffer at that pixel size. */
+  const png = async (svg) => {
+    const [w, h] = [/width="(\d+)"/, /height="(\d+)"/].map((re) => svg.match(re)[1]);
+    const src = path.join(tmp, `${++n}.svg`);
+    const out = path.join(tmp, `${n}.png`);
+    await writeFile(src, svg);
+    if (bin === 'rsvg-convert') execFileSync(bin, ['-w', w, '-h', h, '-f', 'png', '-o', out, src], { stdio: 'inherit' });
+    else execFileSync(bin, ['-w', w, '-h', h, src, out], { stdio: 'inherit' });
+    return readFile(out);
+  };
   const mark = await readMark();
   const horizontalWhite = await readLockup('cloudtrain-horizontal-white');
   const write = async (rel, buf) => {
@@ -160,6 +187,7 @@ async function rasterise() {
   }
   await write('brand/og-image.png', await png(cardSvg(horizontalWhite, 1200, 630, 720)));
   await write('brand/github-social-preview.png', await png(cardSvg(horizontalWhite, 1280, 640, 780)));
+  await rm(tmp, { recursive: true, force: true });
 }
 
 const from = arg('import', '');

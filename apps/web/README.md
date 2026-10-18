@@ -67,7 +67,7 @@ listed in `docs/api-requests.md`.
 | Path | What |
 |---|---|
 | `src/styles/tokens.css` | Design tokens. One neutral ramp, one accent, four muted status colours. Themes: `dark` (default), `light`, `cream`, switched with `<html data-theme>` and persisted in `localStorage`. The `--brand-*` tokens pick the white or dark logo per theme. |
-| `public/brand/`, `src/components/brand.tsx` | The CloudTrain logo (mark, wordmark, horizontal and stacked lockups, app icons; dark and white) served at `/brand/`, plus the favicons, PWA icons, `manifest.webmanifest` and social images built from them by `scripts/brand-assets.mjs` (`pnpm --filter web brand`). The components draw the same paths inline in `currentColor`. |
+| `public/brand/`, `src/components/brand.tsx` | The CloudTrain logo (mark, wordmark, horizontal and stacked lockups, app icons; dark and white) served at `/brand/`, plus the favicons, PWA icons, `manifest.webmanifest` and social images built from them by `scripts/brand-assets.mjs` (`pnpm --filter web brand`; needs `rsvg-convert` from librsvg2-bin, or `resvg`, on PATH). The components draw the same paths inline in `currentColor`. |
 | `src/components/ui` | Button, Badge, Card, Meter, Kbd, Dialog, Dropdown, Tooltip, Segmented, Stat, empty/error/skeleton states; `forms.tsx` adds Field, Input, Select, Checkbox, Switch, ChipSelect, ConfirmDialog, Drawer, Pager, TabNav, Toolbar, table helpers. |
 | `src/components/platform.tsx` | Assignment/outcome/phase badges, due dates, user cells and other bits shared by the role areas. |
 | `src/components/workspace` | Lab workspace parts: task panel, terminal area (tabs + split panes), xterm wrapper, topology canvas, timer, read-only observe terminal. |
