@@ -1,0 +1,163 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xiv-provider-alias-regions
+  title: Deploy a replica bucket in a second region
+  domain: iac
+  frameworks: [tf-advanced:providers]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [exam, terraform, providers, alias, modules, aws-shaped]
+  version: 1
+spec:
+  description: |
+    **Directory:** `~/exam/quote-archive` · **Endpoint:** the AWS-shaped API on
+    `http://moto:5000`
+
+    The quote archive stack (applied) creates bucket
+    `sm-quote-archive-{{suffix}}` in **eu-west-2** through the local module
+    `modules/archive` (`module "primary"`). Disaster recovery needs a replica
+    bucket in **eu-west-1**:
+
+    - add a second AWS provider configuration with **alias `dr`** for
+      region `eu-west-1` (same endpoint settings as the default one);
+    - create the replica by calling **the same module** again as
+      **`module "replica"`** with bucket name `sm-quote-archive-dr-{{suffix}}`,
+      passing it the `dr` provider. Do not edit the module.
+
+    The primary bucket must stay where it is. Apply; the following plan must
+    be empty.
+  objectives:
+    - Configure an aliased provider for a second region
+    - Pass a provider configuration into a module call
+  params:
+    suffix:
+      type: choice
+      values: [p2, m6, t9]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+      - name: moto
+        driver: container
+        image: moto:5
+  setup:
+    - on: moto
+      file: {path: /root/ct-xiv-par-buckets.py, source: assets/moto-buckets.py, mode: "0600"}
+    - on: moto
+      timeoutSec: 120
+      run: for i in $(seq 1 60); do curl -s -o /dev/null http://localhost:5000/ && break; sleep 2; done
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xiv-provider-alias-regions/stack/providers.tf, source: assets/stack/providers.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xiv-provider-alias-regions/stack/main.tf, source: assets/stack/main.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xiv-provider-alias-regions/stack/modules/archive/main.tf, source: assets/stack/modules/archive/main.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xiv-provider-alias-regions/seed.sh, source: assets/seed.sh, mode: "0755"}
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/exam
+    - on: workstation
+      as: learner
+      timeoutSec: 300
+      run: /var/tmp/ct-seed/xiv-provider-alias-regions/seed.sh xiv-provider-alias-regions quote-archive apply
+  checks:
+    - id: regions
+      description: The replica bucket is in eu-west-1 and the primary is still in eu-west-2
+      type: shell
+      on: moto
+      skills: [iac.language.provider-config, iac.targets.aws-api]
+      weight: 3
+      timeoutSec: 60
+      command: python3 /root/ct-xiv-par-buckets.py
+      expect: {match: exact, value: "sm-quote-archive-dr-{{suffix}}=eu-west-1 sm-quote-archive-{{suffix}}=eu-west-2"}
+    - id: module-calls
+      description: Both buckets come from the archive module (module.primary and module.replica)
+      type: shell
+      on: workstation
+      skills: [iac.modules.provider-passing]
+      weight: 2
+      timeoutSec: 90
+      command: |
+        ct-iac state /home/learner/exam/quote-archive | jq -r '[.values.root_module.child_modules[]? | "\(.address):\([.resources[]? | select(.mode == "managed") | .values.bucket] | join(","))"] | sort | join(" ")' 2>/dev/null
+      expect: {match: exact, value: "module.primary:sm-quote-archive-{{suffix}} module.replica:sm-quote-archive-dr-{{suffix}}"}
+    - id: alias-passed
+      description: An aws provider with alias dr for eu-west-1 is passed to module.replica
+      type: shell
+      on: workstation
+      skills: [iac.modules.provider-passing]
+      weight: 1
+      timeoutSec: 150
+      command: |
+        ct-iac planjson /home/learner/exam/quote-archive | jq -r '
+          .configuration as $c
+          | "alias=\([$c.provider_config[]? | select(.alias == "dr") | .expressions.region.constant_value] | join(",")) replica_uses=\($c.root_module.module_calls.replica.module.resources[0].provider_config_key // "none")"' 2>/dev/null
+      expect: {match: regex, value: '^alias=eu-west-1 replica_uses=(aws\.dr|replica:aws)$'}
+    - id: converged
+      description: A new plan of ~/exam/quote-archive reports no changes
+      type: shell
+      on: workstation
+      skills: [iac.language.provider-config]
+      weight: 1
+      timeoutSec: 150
+      command: ct-iac plan /home/learner/exam/quote-archive
+      expect: {match: exact, value: no-changes}
+  misconceptions:
+    - id: no-providers-map
+      description: Calls the module again without passing the dr provider.
+      feedback: A module call without providers inherits the default aws provider, so the replica lands in eu-west-2. Pass providers = { aws = aws.dr }.
+      expectFail: [regions, alias-passed]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 400
+        run: |
+          cd ~/exam/quote-archive
+          printf '\nmodule "replica" {\n  source = "./modules/archive"\n  name   = "sm-quote-archive-dr-{{suffix}}"\n}\n' >> main.tf
+          iac init -input=false -no-color >/dev/null
+          iac apply -auto-approve -input=false -no-color
+    - id: root-resource
+      description: Creates the replica as a root resource with provider = aws.dr instead of reusing the module.
+      feedback: The bucket lands in the right region, but it bypasses the archive module, so the two copies drift apart. Call the module with providers = { aws = aws.dr }.
+      expectFail: [module-calls, alias-passed]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 400
+        run: |
+          cd ~/exam/quote-archive
+          python3 - <<'PY'
+          s = open("providers.tf").read()
+          blk = s[s.index('provider "aws" {'):]
+          dr = blk.replace('provider "aws" {', 'provider "aws" {\n  alias                       = "dr"', 1).replace('region                      = "eu-west-2"', 'region                      = "eu-west-1"')
+          open("providers.tf", "a").write("\n" + dr)
+          PY
+          printf '\nresource "aws_s3_bucket" "replica" {\n  provider = aws.dr\n  bucket   = "sm-quote-archive-dr-{{suffix}}"\n}\n' >> main.tf
+          iac apply -auto-approve -input=false -no-color
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 400
+        run: |
+          set -e
+          cd ~/exam/quote-archive
+          python3 - <<'PY'
+          s = open("providers.tf").read()
+          blk = s[s.index('provider "aws" {'):]
+          dr = blk.replace('provider "aws" {', 'provider "aws" {\n  alias                       = "dr"', 1).replace('region                      = "eu-west-2"', 'region                      = "eu-west-1"')
+          open("providers.tf", "a").write("\n" + dr)
+          PY
+          cat >> main.tf <<'HCL'
+
+          module "replica" {
+            source    = "./modules/archive"
+            name      = "sm-quote-archive-dr-{{suffix}}"
+            providers = { aws = aws.dr }
+          }
+          HCL
+          iac init -input=false -no-color >/dev/null
+          iac apply -auto-approve -input=false -no-color

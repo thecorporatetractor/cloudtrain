@@ -1,0 +1,178 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: iac-incident-stale-lock
+  title: Release a stale state lock left by a crashed job
+  domain: iac
+  frameworks: [tf-associate:state]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [terraform, state, locking, force-unlock, incident]
+  version: 1
+spec:
+  description: |
+    Read **`~/incidents/INC-2291.md`** first. Both stacks below keep their state in
+    bucket `saltmarsh-state` on the workstation's S3 store with lockfile locking
+    (`use_lockfile = true`, lock objects `<key>.tflock`).
+
+    - `~/stacks/trading`: every plan fails with *Error acquiring the state
+      lock*. The CI job that took the lock was killed; MR !77 (a new position
+      limit) is already in the configuration but was never applied.
+    - `~/stacks/settlement`: an engineer's apply is **running** and waiting for
+      her approval. Its lock is live and must stay exactly as it is.
+
+    1. Confirm from the lock information that the trading lock's holder is no
+       longer running (compare with the processes on the workstation).
+    2. Release **exactly that lock**, by its ID, with `terraform force-unlock`.
+    3. Complete the pending apply of the trading stack, with locking on.
+
+    The trading desk's identity (`random_pet.desk`) must not change. Afterwards a
+    trading plan reports no changes.
+  objectives:
+    - Read lock information and decide whether a lock is stale
+    - Release one specific lock with force-unlock
+    - Leave live locks of other runs untouched
+  params:
+    limit1:
+      type: choice
+      values: ["400", "450"]
+    limit2:
+      type: choice
+      values: ["600", "650", "700"]
+    slimit1:
+      type: choice
+      values: ["120", "140"]
+    slimit2:
+      type: choice
+      values: ["180", "200"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+  setup:
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/backend.tf.tmpl, source: assets/backend.tf.tmpl, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/main.tf.tmpl, source: assets/main.tf.tmpl, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/INC-2291.md, source: assets/INC-2291.md, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/seed.sh, source: assets/seed.sh, mode: "0755"}
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/stacks
+    - on: workstation
+      as: learner
+      timeoutSec: 300
+      run: /var/tmp/ct-seed/seed.sh
+  checks:
+    - id: stale-lock-released
+      description: The trading lock object is gone
+      type: shell
+      on: workstation
+      skills: [iac.state.locking]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        ct-s3 ensure >/dev/null 2>&1
+        ct-s3 api GET '/saltmarsh-state?list-type=2&prefix=trading/' | grep -q 'terraform.tfstate.tflock' && echo locked || echo released
+      expect: {match: exact, value: released}
+    - id: live-lock-kept
+      description: The settlement lock is still in place with its original lock ID
+      type: shell
+      on: workstation
+      skills: [iac.state.locking, iac.operations.state-recovery]
+      weight: 2.5
+      timeoutSec: 30
+      command: |
+        ct-s3 ensure >/dev/null 2>&1
+        now=$(ct-s3 api GET '/saltmarsh-state/settlement/terraform.tfstate.tflock' | jq -r '.ID // empty' 2>/dev/null)
+        [ -n "$now" ] && [ "$now" = "$(cat /home/learner/.local/share/ct-lab/live.id)" ] && echo kept || echo "lock: ${now:-none}"
+      expect: {match: exact, value: kept}
+    - id: settlement-untouched
+      description: The settlement change was not applied by anyone else
+      type: shell
+      on: workstation
+      skills: [iac.state.locking]
+      weight: 1
+      command: sed -n 's/^max_position_mw=//p' /home/learner/settlement/limits.conf 2>/dev/null || echo missing
+      expect: {match: exact, value: "{{slimit1}}"}
+    - id: pending-applied
+      description: MR !77 is applied - trading's limits.conf has the new limit and the desk kept its name
+      type: shell
+      on: workstation
+      skills: [iac.operations.state-recovery]
+      weight: 2
+      timeoutSec: 60
+      command: |
+        pet=$(ct-iac state /home/learner/stacks/trading | jq -r '[.values.root_module.resources[]? | select(.type == "random_pet") | .values.id][0] // "none"' 2>/dev/null)
+        f=$(cat /home/learner/trading/limits.conf 2>/dev/null | tr '\n' ' ')
+        [ "$f" = "desk=$pet max_position_mw={{limit2}} " ] && [ "$pet" = "$(cat /home/learner/.local/share/ct-lab/desk.id 2>/dev/null)" ] && echo applied || echo "file: $f state pet: $pet"
+      expect: {match: exact, value: applied}
+    - id: converged
+      description: A new plan of ~/stacks/trading reports no changes
+      type: shell
+      on: workstation
+      skills: [iac.foundations.workflow]
+      weight: 1
+      timeoutSec: 120
+      command: ct-iac plan /home/learner/stacks/trading
+      expect: {match: exact, value: no-changes}
+  hints:
+    - title: Who holds the lock
+      body: The error of a plan prints the lock's ID, Who, Operation and Created time. `ps -ef` shows which terraform runs are alive; only the settlement apply is.
+      command: cd ~/stacks/trading && terraform plan -lock-timeout=0s; ps -ef | grep -v grep | grep apply
+      cost: 1
+    - title: force-unlock
+      body: '`terraform force-unlock <ID>` (run in the stack directory) deletes the lock only if the ID matches. It asks for confirmation; `-force` skips the question.'
+      cost: 1
+    - title: Not -lock=false
+      body: Applying with -lock=false ignores the lock but leaves the stale lock in the bucket, and drops the protection for everyone else during your run.
+      cost: 2
+  misconceptions:
+    - id: unlock-everything
+      description: Force-unlocks the settlement stack too.
+      feedback: The settlement lock belongs to a running apply. Deleting it lets a second run write that state concurrently. Release only the lock whose holder is gone.
+      expectFail: [live-lock-kept]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          for k in trading settlement; do
+            cd ~/stacks/$k
+            id=$(iac plan -no-color -lock-timeout=0s 2>&1 | awk '/^ *ID:/{print $2; exit}')
+            iac force-unlock -force "$id"
+          done
+          cd ~/stacks/trading && iac apply -auto-approve -input=false -no-color
+    - id: lock-false
+      description: Applies trading with -lock=false instead of releasing the lock.
+      feedback: -lock=false skips locking for this run only; the stale lock stays and blocks every other run. Release it with force-unlock and apply with locking.
+      expectFail: [stale-lock-released]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          cd ~/stacks/trading && iac apply -auto-approve -input=false -no-color -lock=false
+  solution:
+    explanation: |
+      The trading lock's holder (the job's terraform process) no longer exists, so
+      nothing will ever release it. `force-unlock` with that exact ID deletes the
+      `trading/terraform.tfstate.tflock` object; the settlement lock is a different
+      object and stays. The pending apply then takes and releases a fresh lock.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/stacks/trading
+          out=$(iac plan -no-color -lock-timeout=0s 2>&1 || true)
+          printf '%s\n' "$out" | sed -n '/Lock Info/,/Created/p'
+          ps -ef | grep -v grep | grep ' apply' || true
+          id=$(printf '%s\n' "$out" | awk '/^ *ID:/{print $2; exit}')
+          iac force-unlock -force "$id"
+          iac apply -auto-approve -input=false -no-color

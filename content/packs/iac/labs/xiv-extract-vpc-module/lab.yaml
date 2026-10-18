@@ -1,0 +1,154 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xiv-extract-vpc-module
+  title: Extract a network module without destroying anything
+  domain: iac
+  frameworks: [tf-advanced:modules]
+  difficulty: hard
+  estimatedMinutes: 25
+  tags: [exam, terraform, modules, moved, refactoring, aws-shaped]
+  version: 1
+spec:
+  description: |
+    **Directory:** `~/exam/order-network` · **Endpoint:** the AWS-shaped API on
+    `http://moto:5000` (the provider block is ready)
+
+    The order-routing stack (applied) declares its VPC, two private subnets,
+    the private route table and both route table associations next to the
+    `order_router` instance. Move **all six network resources** into a local
+    module **`modules/network`**, called once as **`module "network"`**, so
+    the root module keeps only the instance (which must use a subnet from the
+    module's outputs).
+
+    Nothing may be destroyed or recreated: the VPC, subnets, route table and
+    instance keep their ids. Apply; the following plan must be empty.
+  objectives:
+    - Extract resources into a module with moved blocks
+    - Wire root resources to module outputs
+  params:
+    net: {type: int, min: 80, max: 89}
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+      - name: moto
+        driver: container
+        image: moto:5
+  setup:
+    - on: moto
+      file: {path: /root/ct-xiv-evm-net.py, source: assets/moto-net.py, mode: "0600"}
+    - on: moto
+      timeoutSec: 120
+      run: for i in $(seq 1 60); do curl -s -o /dev/null http://localhost:5000/ && break; sleep 2; done
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xiv-extract-vpc-module/stack/providers.tf, source: assets/stack/providers.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xiv-extract-vpc-module/stack/main.tf, source: assets/stack/main.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xiv-extract-vpc-module/seed.sh, source: assets/seed.sh, mode: "0755"}
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/exam
+    - on: workstation
+      as: learner
+      timeoutSec: 400
+      run: /var/tmp/ct-seed/xiv-extract-vpc-module/seed.sh xiv-extract-vpc-module order-network apply
+    - on: moto
+      timeoutSec: 60
+      run: python3 /root/ct-xiv-evm-net.py record
+  checks:
+    - id: in-module
+      description: The six network resources live in module.network and the root keeps only the instance
+      type: shell
+      on: workstation
+      skills: [iac.modules.refactor]
+      weight: 3
+      timeoutSec: 90
+      command: |
+        ct-iac state /home/learner/exam/order-network | jq -r '
+          "root=\([.values.root_module.resources[]? | select(.mode == "managed") | .type] | sort | join(",")) network=\([.values.root_module.child_modules[]? | select(.address == "module.network") | .resources[]? | select(.mode == "managed") | .type] | length)"' 2>/dev/null
+      expect: {match: exact, value: root=aws_instance network=6}
+    - id: ids-kept
+      description: The VPC, subnets, route table and instance keep their ids
+      type: shell
+      on: moto
+      skills: [iac.modules.refactor]
+      weight: 1.5
+      timeoutSec: 60
+      command: python3 /root/ct-xiv-evm-net.py check
+      expect: {match: exact, value: same=5/5}
+    - id: converged
+      description: A new plan of ~/exam/order-network reports no changes
+      type: shell
+      on: workstation
+      skills: [iac.modules.refactor]
+      weight: 1
+      timeoutSec: 150
+      command: ct-iac plan /home/learner/exam/order-network
+      expect: {match: exact, value: no-changes}
+  misconceptions:
+    - id: no-moved
+      description: Moves the blocks into the module without moved blocks.
+      feedback: To Terraform module.network.aws_vpc.order_net is a new resource. Without moved blocks the network is destroyed and rebuilt, and every id changes.
+      expectFail: [ids-kept]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 600
+        run: |
+          cd ~/exam/order-network
+          mkdir -p modules/network
+          python3 - <<'PY'
+          import re
+          s = open("main.tf").read()
+          net = re.findall(r'(resource "aws_(?:vpc|subnet|route_table|route_table_association)" .*?\n\}\n)', s, flags=re.S)
+          rest = s
+          for b in net:
+              rest = rest.replace(b, "")
+          m = "\n".join(net)
+          m = m.replace('"10.{{net}}.0.0/16"', "var.cidr").replace('"10.{{net}}.0.0/20"', "cidrsubnet(var.cidr, 4, 0)").replace('"10.{{net}}.16.0/20"', "cidrsubnet(var.cidr, 4, 1)")
+          m = 'variable "cidr" {\n  type = string\n}\n\n' + m + '\noutput "private_subnet_ids" {\n  value = { a = aws_subnet.private_a.id, b = aws_subnet.private_b.id }\n}\n'
+          open("modules/network/main.tf", "w").write(m)
+          rest = rest.replace("aws_subnet.private_a.id", 'module.network.private_subnet_ids["a"]')
+          rest = 'module "network" {\n  source = "./modules/network"\n  cidr   = "10.{{net}}.0.0/16"\n}\n\n' + rest.strip() + "\n"
+          for t, n in [] and [("aws_vpc", "order_net"), ("aws_subnet", "private_a"), ("aws_subnet", "private_b"), ("aws_route_table", "private"),
+                       ("aws_route_table_association", "private_a"), ("aws_route_table_association", "private_b")]:
+              rest += "\nmoved {\n  from = %s.%s\n  to   = module.network.%s.%s\n}\n" % (t, n, t, n)
+          open("main.tf", "w").write(rest)
+          PY
+          iac init -input=false -no-color >/dev/null
+          iac plan -input=false -no-color
+          iac apply -auto-approve -input=false -no-color || iac apply -auto-approve -input=false -no-color || true
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/exam/order-network
+          mkdir -p modules/network
+          python3 - <<'PY'
+          import re
+          s = open("main.tf").read()
+          net = re.findall(r'(resource "aws_(?:vpc|subnet|route_table|route_table_association)" .*?\n\}\n)', s, flags=re.S)
+          rest = s
+          for b in net:
+              rest = rest.replace(b, "")
+          m = "\n".join(net)
+          m = m.replace('"10.{{net}}.0.0/16"', "var.cidr").replace('"10.{{net}}.0.0/20"', "cidrsubnet(var.cidr, 4, 0)").replace('"10.{{net}}.16.0/20"', "cidrsubnet(var.cidr, 4, 1)")
+          m = 'variable "cidr" {\n  type = string\n}\n\n' + m + '\noutput "private_subnet_ids" {\n  value = { a = aws_subnet.private_a.id, b = aws_subnet.private_b.id }\n}\n'
+          open("modules/network/main.tf", "w").write(m)
+          rest = rest.replace("aws_subnet.private_a.id", 'module.network.private_subnet_ids["a"]')
+          rest = 'module "network" {\n  source = "./modules/network"\n  cidr   = "10.{{net}}.0.0/16"\n}\n\n' + rest.strip() + "\n"
+          for t, n in [("aws_vpc", "order_net"), ("aws_subnet", "private_a"), ("aws_subnet", "private_b"), ("aws_route_table", "private"),
+                       ("aws_route_table_association", "private_a"), ("aws_route_table_association", "private_b")]:
+              rest += "\nmoved {\n  from = %s.%s\n  to   = module.network.%s.%s\n}\n" % (t, n, t, n)
+          open("main.tf", "w").write(rest)
+          PY
+          iac init -input=false -no-color >/dev/null
+          iac plan -input=false -no-color
+          iac apply -auto-approve -input=false -no-color

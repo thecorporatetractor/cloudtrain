@@ -1,0 +1,220 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xiv-subnets-from-map
+  title: Derive subnets and routes from a zone map
+  domain: iac
+  frameworks: [tf-advanced:dynamic-config]
+  difficulty: hard
+  estimatedMinutes: 25
+  tags: [exam, terraform, cidrsubnet, for_each, moved, aws-shaped]
+  version: 1
+spec:
+  description: |
+    **Directory:** `~/exam/market-subnets` · **Endpoint:** the AWS-shaped API on
+    `http://moto:5000` (the provider block is ready)
+
+    The market-data network (applied) has three hard-coded subnets and three
+    route table associations. Replace them with **one `aws_subnet` and one
+    `aws_route_table_association` resource, each with `for_each`**, driven by
+    `var.zones` (zone => subnet number):
+
+    - every subnet's range is **computed with `cidrsubnet`** from
+      `var.vpc_cidr` as a /20 using the zone's number (no literal subnet
+      ranges in the code);
+    - instances are keyed by zone name, e.g. `aws_subnet.<name>["eu-west-2a"]`;
+    - the existing subnets and associations must **stay in place** (same
+      subnet ids, still routed through the private route table).
+
+    Apply; the following plan must be empty.
+  objectives:
+    - Compute address ranges with cidrsubnet
+    - Replace hard-coded resources with for_each over a map without recreating them
+  params:
+    net: {type: int, min: 50, max: 59}
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+      - name: moto
+        driver: container
+        image: moto:5
+  setup:
+    - on: moto
+      file: {path: /root/ct-xiv-sfm-baseline.py, source: assets/moto-baseline.py, mode: "0600"}
+    - on: moto
+      file: {path: /root/ct-xiv-sfm-check.py, source: assets/moto-check.py, mode: "0600"}
+    - on: moto
+      timeoutSec: 120
+      run: for i in $(seq 1 60); do curl -s -o /dev/null http://localhost:5000/ && break; sleep 2; done
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xiv-subnets-from-map/stack/providers.tf, source: assets/stack/providers.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xiv-subnets-from-map/stack/variables.tf, source: assets/stack/variables.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xiv-subnets-from-map/stack/main.tf, source: assets/stack/main.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xiv-subnets-from-map/seed.sh, source: assets/seed.sh, mode: "0755"}
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/exam
+    - on: workstation
+      as: learner
+      timeoutSec: 300
+      run: /var/tmp/ct-seed/xiv-subnets-from-map/seed.sh xiv-subnets-from-map market-subnets apply
+    - on: moto
+      timeoutSec: 60
+      run: python3 /root/ct-xiv-sfm-baseline.py
+  checks:
+    - id: subnets-kept
+      description: The three subnets are the originals with their /20 ranges, all routed through the private table
+      type: shell
+      on: moto
+      skills: [iac.language.repetition, iac.targets.aws-api]
+      weight: 3
+      timeoutSec: 60
+      command: python3 /root/ct-xiv-sfm-check.py
+      expect: {match: exact, value: "eu-west-2a=same:10.{{net}}.0.0/20:routed eu-west-2b=same:10.{{net}}.16.0/20:routed eu-west-2c=same:10.{{net}}.32.0/20:routed"}
+    - id: keyed-by-zone
+      description: Subnets and associations are for_each instances keyed by zone
+      type: shell
+      on: workstation
+      skills: [iac.language.repetition]
+      weight: 2
+      timeoutSec: 90
+      command: |
+        ct-iac state /home/learner/exam/market-subnets | jq -r '
+          [.values.root_module.resources[]? | select(.mode == "managed" and (.type == "aws_subnet" or .type == "aws_route_table_association"))]
+          | group_by(.type) | map("\(.[0].type)=\([.[] | .address | sub("\\[.*$"; "")] | unique | length):\([.[] | .index // "-"] | sort | join(","))") | join(" ")' 2>/dev/null
+      expect: {match: exact, value: "aws_route_table_association=1:eu-west-2a,eu-west-2b,eu-west-2c aws_subnet=1:eu-west-2a,eu-west-2b,eu-west-2c"}
+    - id: computed-ranges
+      description: Subnet ranges are computed with cidrsubnet, not written as literals
+      type: shell
+      on: workstation
+      skills: [iac.language.functions]
+      weight: 2
+      command: |
+        c=$(cat /home/learner/exam/market-subnets/*.tf 2>/dev/null | sed 's/#.*//')
+        f=$(printf '%s\n' "$c" | grep -c 'cidrsubnet(')
+        l=$(printf '%s\n' "$c" | grep -cE '"10\.{{net}}\.(0|16|32)\.0/20"')
+        echo "cidrsubnet=$([ "$f" -ge 1 ] && echo yes || echo no) literals=$l"
+      expect: {match: exact, value: cidrsubnet=yes literals=0}
+    - id: converged
+      description: A new plan of ~/exam/market-subnets reports no changes
+      type: shell
+      on: workstation
+      skills: [iac.language.repetition]
+      weight: 1
+      timeoutSec: 150
+      command: ct-iac plan /home/learner/exam/market-subnets
+      expect: {match: exact, value: no-changes}
+  misconceptions:
+    - id: no-moved
+      description: Switches to for_each without moved blocks.
+      feedback: New instance keys are new addresses, so every subnet would be destroyed and recreated with a new id. Add moved blocks from aws_subnet.a to aws_subnet.<name>["eu-west-2a"] (and the others, and the associations).
+      expectFail: [subnets-kept]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 500
+        run: |
+          cd ~/exam/market-subnets
+          python3 - <<'PY'
+          import re
+          p = "main.tf"; s = open(p).read()
+          s = re.sub(r'resource "aws_subnet" "[abc]" \{.*?\n\}\n\n?', '', s, flags=re.S)
+          s = re.sub(r'resource "aws_route_table_association" "[abc]" \{.*?\n\}\n\n?', '', s, flags=re.S)
+          s = s.rstrip() + '''
+
+          resource "aws_subnet" "zone" {
+            for_each          = var.zones
+            vpc_id            = aws_vpc.market.id
+            availability_zone = each.key
+            cidr_block        = cidrsubnet(var.vpc_cidr, 4, each.value)
+            tags              = { Name = "market-data-${each.key}" }
+          }
+
+          resource "aws_route_table_association" "zone" {
+            for_each       = aws_subnet.zone
+            subnet_id      = each.value.id
+            route_table_id = aws_route_table.private.id
+          }
+          '''
+          open(p, "w").write(s)
+          PY
+          iac apply -auto-approve -input=false -no-color || iac apply -auto-approve -input=false -no-color || true
+    - id: literal-map
+      description: Keys the subnets by zone but keeps the ranges as literals in a lookup map.
+      feedback: Literal ranges have to be recalculated by hand whenever the VPC range or a zone changes. Compute them with cidrsubnet(var.vpc_cidr, 4, each.value).
+      expectFail: [computed-ranges]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 500
+        run: |
+          cd ~/exam/market-subnets
+          python3 - <<'PY'
+          import re
+          p = "main.tf"; s = open(p).read()
+          s = re.sub(r'resource "aws_subnet" "[abc]" \{.*?\n\}\n\n?', '', s, flags=re.S)
+          s = re.sub(r'resource "aws_route_table_association" "[abc]" \{.*?\n\}\n\n?', '', s, flags=re.S)
+          s = s.rstrip() + '''
+
+          resource "aws_subnet" "zone" {
+            for_each          = var.zones
+            vpc_id            = aws_vpc.market.id
+            availability_zone = each.key
+            cidr_block        = { "eu-west-2a" = "10.{{net}}.0.0/20", "eu-west-2b" = "10.{{net}}.16.0/20", "eu-west-2c" = "10.{{net}}.32.0/20" }[each.key]
+            tags              = { Name = "market-data-${each.key}" }
+          }
+
+          resource "aws_route_table_association" "zone" {
+            for_each       = aws_subnet.zone
+            subnet_id      = each.value.id
+            route_table_id = aws_route_table.private.id
+          }
+          '''
+          for k, z in (("a", "eu-west-2a"), ("b", "eu-west-2b"), ("c", "eu-west-2c")):
+              for t in ("aws_subnet", "aws_route_table_association"):
+                  s += '\nmoved {\n  from = %s.%s\n  to   = %s.zone["%s"]\n}\n' % (t, k, t, z)
+          open(p, "w").write(s)
+          PY
+          iac apply -auto-approve -input=false -no-color
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 500
+        run: |
+          set -e
+          cd ~/exam/market-subnets
+          python3 - <<'PY'
+          import re
+          p = "main.tf"; s = open(p).read()
+          s = re.sub(r'resource "aws_subnet" "[abc]" \{.*?\n\}\n\n?', '', s, flags=re.S)
+          s = re.sub(r'resource "aws_route_table_association" "[abc]" \{.*?\n\}\n\n?', '', s, flags=re.S)
+          s = s.rstrip() + '''
+
+          resource "aws_subnet" "zone" {
+            for_each          = var.zones
+            vpc_id            = aws_vpc.market.id
+            availability_zone = each.key
+            cidr_block        = cidrsubnet(var.vpc_cidr, 4, each.value)
+            tags              = { Name = "market-data-${each.key}" }
+          }
+
+          resource "aws_route_table_association" "zone" {
+            for_each       = aws_subnet.zone
+            subnet_id      = each.value.id
+            route_table_id = aws_route_table.private.id
+          }
+          '''
+          for k, z in (("a", "eu-west-2a"), ("b", "eu-west-2b"), ("c", "eu-west-2c")):
+              for t in ("aws_subnet", "aws_route_table_association"):
+                  s += '\nmoved {\n  from = %s.%s\n  to   = %s.zone["%s"]\n}\n' % (t, k, t, z)
+          open(p, "w").write(s)
+          PY
+          iac plan -input=false -no-color
+          iac apply -auto-approve -input=false -no-color

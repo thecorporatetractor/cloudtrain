@@ -1,0 +1,275 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: iac-helm-release-values
+  title: Release a dashboard chart with templated values
+  domain: iac
+  frameworks: [tf-associate:configuration]
+  difficulty: medium
+  estimatedMinutes: 25
+  tags: [terraform, helm, templatefile, values]
+  version: 1
+spec:
+  description: |
+    The SCADA team packages its dashboard as the Helm chart **`scada-dashboard`**
+    in the workstation's offline chart repository **`~/charts`** (a directory
+    with `index.yaml` and the packaged `.tgz`; read the chart's documented
+    values with `helm show values ~/charts/scada-dashboard-1.4.0.tgz`).
+
+    In `~/stacks/farm-dash` (initialised, `helm` provider pinned to `sm-grid`),
+    `var.title` and the per-farm map `var.farms` are set in
+    `terraform.tfvars`. Add a `helm_release`:
+
+    1. release **`farm-dash`** of chart version **1.4.0** in namespace
+       **`scada`** (let the release create the namespace);
+    2. its values come from a **template file** in the stack directory
+       rendered with **`templatefile`** from `var.title` and `var.farms`:
+       the chart's `title`, **`replicas: 2`**, and one `farms` entry per map
+       entry (mind the chart's field names: `name`, `turbines`,
+       `capacityMw`);
+    3. apply and make sure the release reaches **`deployed`** with both
+       dashboard replicas ready.
+
+    Adding a farm to `var.farms` must need no other change. Afterwards a plan
+    reports no changes.
+  objectives:
+    - Install a chart from an offline repository with helm_release
+    - Render chart values from a variable map with templatefile
+    - Confirm a release is deployed and its workload ready
+  params:
+    region:
+      type: choice
+      values: [offshore, north-sea, coastal]
+    gt: {type: int, min: 30, max: 60}
+    gc: {type: int, min: 400, max: 700}
+    rt: {type: int, min: 20, max: 45}
+    rc: {type: int, min: 250, max: 500}
+    st: {type: int, min: 12, max: 28}
+    sc: {type: int, min: 150, max: 300}
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+      - name: sm-grid
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: sm-grid
+  setup:
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/chart/Chart.yaml, source: assets/chart/Chart.yaml, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/chart/values.yaml, source: assets/chart/values.yaml, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/chart/values.schema.json, source: assets/chart/values.schema.json, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/chart/templates/configmap.yaml, source: assets/chart/templates/configmap.yaml, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/chart/templates/deployment.yaml, source: assets/chart/templates/deployment.yaml, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/stack/providers.tf, source: assets/stack/providers.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/stack/variables.tf, source: assets/stack/variables.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/stack/terraform.tfvars, source: assets/stack/terraform.tfvars, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/stack/main.tf, source: assets/stack/main.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/seed.sh, source: assets/seed.sh, mode: "0755"}
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/stacks
+    - on: workstation
+      as: learner
+      timeoutSec: 180
+      run: /var/tmp/ct-seed/seed.sh
+  teardown:
+    - on: sm-grid
+      run: |
+        helm -n scada uninstall farm-dash >/dev/null 2>&1 || true
+        kubectl delete namespace scada --ignore-not-found --wait=false
+  checks:
+    - id: release-deployed
+      description: Release farm-dash of scada-dashboard 1.4.0 is deployed in namespace scada with 2 ready replicas
+      type: shell
+      on: sm-grid
+      skills: [iac.targets.kubernetes-helm]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        s=$(helm -n scada list -o json 2>/dev/null | jq -r '.[] | select(.name == "farm-dash") | "\(.status) \(.chart)"')
+        r=$(kubectl -n scada get deployment farm-dash -o jsonpath='{.status.readyReplicas}' 2>/dev/null)
+        echo "${s:-missing} ready=${r:-0}"
+      expect: {match: exact, value: deployed scada-dashboard-1.4.0 ready=2}
+    - id: panels
+      description: The dashboard shows the configured title and one panel per farm with its figures
+      type: shell
+      on: sm-grid
+      skills: [iac.targets.kubernetes-helm, iac.language.functions]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        t=$(kubectl -n scada get configmap farm-dash-panels -o jsonpath='{.data.title}' 2>/dev/null)
+        p=$(kubectl -n scada get configmap farm-dash-panels -o jsonpath='{.data.panels\.txt}' 2>/dev/null | sed 's/^ *//' | grep . | sort | tr '\n' ';')
+        echo "title=$t panels=$p"
+      expect: {match: exact, value: "title=Saltmarsh {{region}} SCADA panels=gullhaven turbines={{gt}} capacity_mw={{gc}};redmoor turbines={{rt}} capacity_mw={{rc}};skerrow turbines={{st}} capacity_mw={{sc}};"}
+    - id: from-template
+      description: The values come from a template file rendered with templatefile
+      type: shell
+      on: workstation
+      skills: [iac.language.functions]
+      weight: 1
+      command: |
+        d=/home/learner/stacks/farm-dash
+        t=$(cat $d/*.tf 2>/dev/null | grep -c 'templatefile(')
+        f=$(find $d -path $d/.terraform -prune -o -type f ! -name '*.tf' ! -name '*.tfvars' ! -name '*.tfstate*' ! -name '.terraform.lock.hcl' ! -name '.ct-seeded' -print | xargs -r grep -l 'capacityMw' 2>/dev/null | wc -l)
+        [ "$t" -ge 1 ] && [ "$f" -ge 1 ] && echo yes || echo "templatefile=$t templates=$f"
+      expect: {match: exact, value: "yes"}
+    - id: data-driven
+      description: Adding a farm to var.farms only updates the release in place
+      type: shell
+      on: workstation
+      skills: [iac.language.functions]
+      weight: 1.5
+      timeoutSec: 150
+      command: |
+        tmp=$(runuser -u learner -- mktemp -d /tmp/ct-helm.XXXXXX)
+        runuser -u learner -- cp -a /home/learner/stacks/farm-dash/. "$tmp/"
+        printf '\nfarms = {\n  gullhaven = { turbines = {{gt}}, capacity_mw = {{gc}} }\n  redmoor = { turbines = {{rt}}, capacity_mw = {{rc}} }\n  skerrow = { turbines = {{st}}, capacity_mw = {{sc}} }\n  fenwick = { turbines = 11, capacity_mw = 44 }\n}\n' > "$tmp/ct-more.tfvars"
+        chown learner:learner "$tmp/ct-more.tfvars"
+        ct-iac planjson "$tmp" -var-file=ct-more.tfvars | jq -r '[.resource_changes[]? | select(.change.actions != ["no-op"] and .change.actions != ["read"]) | "\(.type):\(.change.actions | join("+")):\(((.change.after.values // [""])[0] // "") | test("fenwick"))"] | join(" ")' 2>/dev/null || echo error
+        rm -rf "$tmp"
+      expect: {match: exact, value: "helm_release:update:true"}
+    - id: converged
+      description: A new plan of ~/stacks/farm-dash reports no changes
+      type: shell
+      on: workstation
+      skills: [iac.foundations.workflow]
+      weight: 1
+      timeoutSec: 120
+      command: ct-iac plan /home/learner/stacks/farm-dash
+      expect: {match: exact, value: no-changes}
+  hints:
+    - title: Chart from a file repository
+      body: A packaged chart can be installed straight from its file, e.g. `chart = pathexpand("~/charts/scada-dashboard-1.4.0.tgz")`. Set `create_namespace = true`.
+      command: helm show values ~/charts/scada-dashboard-1.4.0.tgz
+      cost: 1
+    - title: A values template
+      body: |
+        `values = [templatefile("${path.module}/values.yaml.tftpl", { title = var.title, farms = var.farms })]`.
+        In the template, `%{ for name, f in farms ~}` loops over the map; write `capacityMw: ${f.capacity_mw}`.
+      cost: 1
+    - title: The chart rejects my values
+      body: The chart ships a values schema. Unknown keys (such as capacity_mw) or missing ones fail the install; `helm template` with your rendered values shows the error quickly.
+      cost: 1
+  misconceptions:
+    - id: literal-values
+      description: Pastes the values as a literal YAML block instead of rendering them from var.farms.
+      feedback: Literal values must be edited by hand for every new farm. Render them from var.farms with templatefile so the map is the only thing to change.
+      expectFail: [from-template, data-driven]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 450
+        run: |
+          cd ~/stacks/farm-dash
+          cat >> main.tf <<'HCL'
+          resource "helm_release" "farm_dash" {
+            name             = "farm-dash"
+            chart            = pathexpand("~/charts/scada-dashboard-1.4.0.tgz")
+            namespace        = "scada"
+            create_namespace = true
+            values = [<<-YAML
+              title: Saltmarsh {{region}} SCADA
+              replicas: 2
+              farms:
+                - {name: gullhaven, turbines: {{gt}}, capacityMw: {{gc}}}
+                - {name: redmoor, turbines: {{rt}}, capacityMw: {{rc}}}
+                - {name: skerrow, turbines: {{st}}, capacityMw: {{sc}}}
+              YAML
+            ]
+          }
+          HCL
+          iac apply -auto-approve -input=false -no-color
+    - id: tfvars-field-names
+      description: Passes the farm objects through unchanged, so the chart receives capacity_mw.
+      feedback: The chart's schema expects capacityMw and rejects unknown keys, so the install fails. Map the fields in the template.
+      expectFail: [release-deployed, panels]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 450
+        run: |
+          cd ~/stacks/farm-dash
+          printf '%s\n' 'title: ${jsonencode(title)}' 'replicas: 2' 'farms: ${jsonencode([for name, f in farms : merge(f, { name = name })])}' > values.yaml.tftpl
+          cat >> main.tf <<'HCL'
+          resource "helm_release" "farm_dash" {
+            name             = "farm-dash"
+            chart            = pathexpand("~/charts/scada-dashboard-1.4.0.tgz")
+            namespace        = "scada"
+            create_namespace = true
+            values           = [templatefile("${path.module}/values.yaml.tftpl", { title = var.title, farms = var.farms })]
+          }
+          HCL
+          iac apply -auto-approve -input=false -no-color || true
+  solution:
+    explanation: |
+      `helm_release` installs the packaged chart from the file repository, and
+      `values` takes a list of YAML documents. `templatefile` renders the values
+      file from the variables: a `for` directive emits one `farms` entry per map
+      entry and maps `capacity_mw` to the chart's `capacityMw`. Adding a farm to
+      the map changes the rendered values, so the release is upgraded in place.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 450
+        run: |
+          set -e
+          cd ~/stacks/farm-dash
+          cat > values.yaml.tftpl <<'TPL'
+          title: ${jsonencode(title)}
+          replicas: 2
+          farms:
+          %{ for name, f in farms ~}
+            - name: ${name}
+              turbines: ${f.turbines}
+              capacityMw: ${f.capacity_mw}
+          %{ endfor ~}
+          TPL
+          cat >> main.tf <<'HCL'
+          resource "helm_release" "farm_dash" {
+            name             = "farm-dash"
+            chart            = pathexpand("~/charts/scada-dashboard-1.4.0.tgz")
+            namespace        = "scada"
+            create_namespace = true
+            values = [templatefile("${path.module}/values.yaml.tftpl", {
+              title = var.title
+              farms = var.farms
+            })]
+          }
+          HCL
+          iac apply -auto-approve -input=false -no-color
+    alternatives:
+      - id: yamlencode-template
+        description: A template that renders the whole document with yamlencode.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 450
+            run: |
+              set -e
+              cd ~/stacks/farm-dash
+              printf '%s\n' '${yamlencode({ title = title, replicas = 2, farms = [for name, f in farms : { name = name, turbines = f.turbines, capacityMw = f.capacity_mw }] })}' > dashboard-values.tftpl
+              cat >> main.tf <<'HCL'
+              resource "helm_release" "dash" {
+                name             = "farm-dash"
+                chart            = "/home/learner/charts/scada-dashboard-1.4.0.tgz"
+                namespace        = "scada"
+                create_namespace = true
+                values           = [templatefile("${path.module}/dashboard-values.tftpl", { title = var.title, farms = var.farms })]
+              }
+              HCL
+              iac apply -auto-approve -input=false -no-color

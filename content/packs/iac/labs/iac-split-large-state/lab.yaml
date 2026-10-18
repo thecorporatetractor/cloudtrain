@@ -1,0 +1,230 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: iac-split-large-state
+  title: Split a large state into network and workload stacks
+  domain: iac
+  frameworks: [tf-professional:operations]
+  difficulty: hard
+  estimatedMinutes: 40
+  tags: [terraform, state, refactoring, import, removed, aws-shaped]
+  version: 1
+spec:
+  description: |
+    `~/stacks/grid-telemetry` (applied, local state, AWS-shaped endpoint
+    `http://moto:5000`) holds about **200 objects**: the network (`network.tf`:
+    a VPC, 40 subnets, 40 security groups) and the workload (`workload.tf`:
+    60 archive buckets with their manifests). Every plan refreshes all of
+    them, and the network team cannot change a subnet without touching the
+    workload's state.
+
+    Split it:
+
+    - **`~/stacks/grid-network`** (new, local state) manages the VPC, subnets
+      and security groups, adopted with **`import` blocks**;
+    - **`~/stacks/grid-telemetry`** keeps only the workload; the network
+      leaves its state through **`removed` blocks** that do not destroy
+      anything.
+
+    **No object may be destroyed or recreated.** Both stacks must plan with no
+    changes at the end.
+  objectives:
+    - Split a state between root modules with removed and import blocks
+    - Adopt many objects with for_each import blocks
+    - Verify a refactor end to end without recreating anything
+  params:
+    suffix:
+      type: choice
+      values: [a1, b4, c9]
+    flush: {type: int, min: 15, max: 90}
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+      - name: moto
+        driver: container
+        image: moto:5
+  setup:
+    - on: moto
+      file: {path: /root/ct-sls-ids.py, source: assets/moto-ids.py, mode: "0600"}
+    - on: moto
+      timeoutSec: 120
+      run: for i in $(seq 1 60); do curl -s -o /dev/null http://localhost:5000/ && break; sleep 2; done
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/iac-split-large-state/stack/providers.tf, source: assets/stack/providers.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/iac-split-large-state/stack/network.tf, source: assets/stack/network.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/iac-split-large-state/stack/workload.tf, source: assets/stack/workload.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/iac-split-large-state/seed.sh, source: assets/seed.sh, mode: "0755"}
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/stacks
+    - on: workstation
+      as: learner
+      timeoutSec: 900
+      run: /var/tmp/ct-seed/iac-split-large-state/seed.sh
+    - on: moto
+      timeoutSec: 120
+      run: python3 /root/ct-sls-ids.py record
+  checks:
+    - id: network-stack
+      description: grid-network manages the VPC, the 40 subnets and the 40 security groups, and nothing else
+      type: shell
+      on: workstation
+      skills: [iac.operations.state-splitting]
+      weight: 2
+      timeoutSec: 120
+      command: |
+        ct-iac state /home/learner/stacks/grid-network | jq -r '[.values.root_module.resources[]? | select(.mode == "managed") | .type] | group_by(.) | map("\(.[0])=\(length)") | join(" ")' 2>/dev/null
+      expect: {match: exact, value: aws_security_group=40 aws_subnet=40 aws_vpc=1}
+    - id: workload-stack
+      description: grid-telemetry keeps only the 60 buckets and their manifests
+      type: shell
+      on: workstation
+      skills: [iac.operations.state-splitting]
+      weight: 2
+      timeoutSec: 120
+      command: |
+        ct-iac state /home/learner/stacks/grid-telemetry | jq -r '[.values.root_module.resources[]? | select(.mode == "managed") | .type] | group_by(.) | map("\(.[0])=\(length)") | join(" ")' 2>/dev/null
+      expect: {match: exact, value: aws_s3_bucket=60 aws_s3_object=60}
+    - id: nothing-recreated
+      description: Every network object and archive bucket is the original, with no duplicates
+      type: shell
+      on: moto
+      skills: [iac.operations.state-splitting]
+      weight: 3
+      timeoutSec: 120
+      command: python3 /root/ct-sls-ids.py check
+      expect: {match: exact, value: network=81/81 extra_network=0 buckets=60/60}
+    - id: blocks
+      description: The split is declared with removed blocks in grid-telemetry and import blocks in grid-network
+      type: shell
+      on: workstation
+      skills: [iac.operations.state-splitting]
+      weight: 0.5
+      command: |
+        r=$(cat /home/learner/stacks/grid-telemetry/*.tf 2>/dev/null | grep -cE '^[[:space:]]*removed[[:space:]]*\{')
+        i=$(cat /home/learner/stacks/grid-network/*.tf 2>/dev/null | grep -cE '^[[:space:]]*import[[:space:]]*\{')
+        echo "removed=$([ "$r" -ge 1 ] && echo yes || echo no) import=$([ "$i" -ge 1 ] && echo yes || echo no)"
+      expect: {match: exact, value: removed=yes import=yes}
+    - id: converged
+      description: Both stacks plan with no changes
+      type: shell
+      on: workstation
+      skills: [iac.foundations.workflow]
+      weight: 1
+      timeoutSec: 400
+      command: echo "network=$(ct-iac plan /home/learner/stacks/grid-network) workload=$(ct-iac plan /home/learner/stacks/grid-telemetry)"
+      expect: {match: exact, value: network=no-changes workload=no-changes}
+  hints:
+    - title: Order of operations
+      body: Collect the network ids from the current state first (`terraform show -json` and jq), then remove the network from grid-telemetry with removed blocks, then import into grid-network. Review each plan for destroys before you apply.
+      cost: 1
+    - title: removed for a whole for_each resource
+      body: '`removed { from = aws_subnet.segment  lifecycle { destroy = false } }` forgets every instance of the resource at once.'
+      cost: 1
+    - title: Importing 80 objects
+      body: |
+        An import block takes for_each:
+        ```hcl
+        import {
+          for_each = local.subnet_ids   # { seg00 = "subnet-...", ... }
+          to       = aws_subnet.segment[each.key]
+          id       = each.value
+        }
+        ```
+        Generate the map from the old state with jq instead of typing it.
+      cost: 2
+  misconceptions:
+    - id: move-without-removed
+      description: Moves network.tf to the new stack without removed blocks.
+      feedback: Configuration missing from grid-telemetry is planned for destroy, so its apply deleted the whole network and the new stack built a fresh one with new ids. Use removed blocks with destroy = false, then import.
+      expectFail: [nothing-recreated, blocks]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 1200
+        run: |
+          old=~/stacks/grid-telemetry; new=~/stacks/grid-network
+          mkdir -p $new
+          cp $old/providers.tf $new/
+          mv $old/network.tf $new/network.tf
+          cd $old
+          iac apply -auto-approve -input=false -no-color -parallelism=20 || true
+          cd $new
+          iac init -input=false -no-color
+          iac apply -auto-approve -input=false -no-color -parallelism=20 || true
+  solution:
+    explanation: |
+      removed blocks with destroy = false drop the network from grid-telemetry's
+      state while leaving the objects alone; for_each import blocks in the new
+      grid-network stack adopt the same ids (collected from the old state with
+      jq). Each state now holds only its own layer, and no object changed.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 1200
+        run: |
+          set -e
+          old=~/stacks/grid-telemetry; new=~/stacks/grid-network
+          mkdir -p $new
+          cp $old/providers.tf $new/
+          mv $old/network.tf $new/network.tf
+          cd $old
+          iac show -json | jq -r '
+            [.values.root_module.resources[] | select(.mode == "managed")] as $r
+            | "locals {",
+              "  vpc_id = \"\([$r[] | select(.type == "aws_vpc")][0].values.id)\"",
+              "  subnet_ids = {", ([$r[] | select(.type == "aws_subnet")] | map("    \(.index) = \"\(.values.id)\"")[]), "  }",
+              "  sg_ids = {", ([$r[] | select(.type == "aws_security_group")] | map("    \(.index) = \"\(.values.id)\"")[]), "  }",
+              "}"' > $new/import-ids.tf
+          cat >> $new/import-ids.tf <<'HCL'
+
+          import {
+            to = aws_vpc.grid
+            id = local.vpc_id
+          }
+
+          import {
+            for_each = local.subnet_ids
+            to       = aws_subnet.segment[each.key]
+            id       = each.value
+          }
+
+          import {
+            for_each = local.sg_ids
+            to       = aws_security_group.segment[each.key]
+            id       = each.value
+          }
+          HCL
+          cat > $old/split.tf <<'HCL'
+          # The network moved to ~/stacks/grid-network; forget it here without destroying it.
+          removed {
+            from = aws_vpc.grid
+            lifecycle {
+              destroy = false
+            }
+          }
+
+          removed {
+            from = aws_subnet.segment
+            lifecycle {
+              destroy = false
+            }
+          }
+
+          removed {
+            from = aws_security_group.segment
+            lifecycle {
+              destroy = false
+            }
+          }
+          HCL
+          iac apply -auto-approve -input=false -no-color -parallelism=20
+          cd $new
+          iac init -input=false -no-color
+          iac apply -auto-approve -input=false -no-color -parallelism=20

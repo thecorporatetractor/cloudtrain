@@ -1,0 +1,145 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xiv-reconcile-sg-drift
+  title: Reconcile a drifted security group
+  domain: iac
+  frameworks: [tf-advanced:lifecycle-import-drift]
+  difficulty: hard
+  estimatedMinutes: 20
+  tags: [exam, terraform, drift, security-groups, aws-shaped]
+  version: 1
+spec:
+  description: |
+    **Directory:** `~/exam/sg-drift` · **Endpoint:** the AWS-shaped API on
+    `http://moto:5000` (the provider block is ready)
+
+    During last week's outage engineers edited the trading desk's security
+    group **`trading-desk`** by hand. `~/exam/sg-drift/CHANGE.md` lists the one
+    change that change control approved.
+
+    Restore the group to the approved rule set: the rules in the
+    configuration **plus the approved change** (same port, source range and
+    description), and none of the other hand-made rules. The group itself
+    must not be replaced.
+
+    Apply; the following plan must be empty.
+  objectives:
+    - Read drift in a plan and decide what to keep
+    - Codify an approved out-of-band change and remove the rest
+  params:
+    chg: {type: int, min: 4100, max: 4999}
+    rdp:
+      type: choice
+      values: ["3389", "5900", "8080"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+      - name: moto
+        driver: container
+        image: moto:5
+  setup:
+    - on: moto
+      file: {path: /root/ct-xiv-sg-drift.py, source: assets/moto-drift.py, mode: "0600"}
+    - on: moto
+      file: {path: /root/ct-xiv-sg-check.py, source: assets/moto-check.py, mode: "0600"}
+    - on: moto
+      timeoutSec: 120
+      run: for i in $(seq 1 60); do curl -s -o /dev/null http://localhost:5000/ && break; sleep 2; done
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xiv-reconcile-sg-drift/stack/providers.tf, source: assets/stack/providers.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xiv-reconcile-sg-drift/stack/main.tf, source: assets/stack/main.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xiv-reconcile-sg-drift/stack/CHANGE.md, source: assets/CHANGE.md, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xiv-reconcile-sg-drift/seed.sh, source: assets/seed.sh, mode: "0755"}
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/exam
+    - on: workstation
+      as: learner
+      timeoutSec: 300
+      run: /var/tmp/ct-seed/xiv-reconcile-sg-drift/seed.sh xiv-reconcile-sg-drift sg-drift apply
+    - on: moto
+      timeoutSec: 60
+      run: python3 /root/ct-xiv-sg-drift.py
+  checks:
+    - id: approved-rules
+      description: trading-desk is the original group and has exactly the approved ingress rules
+      type: shell
+      on: moto
+      skills: [iac.state.drift]
+      weight: 3
+      timeoutSec: 60
+      command: python3 /root/ct-xiv-sg-check.py
+      expect: {match: exact, value: "same 22-22/tcp:10.40.250.0/24,443-443/tcp:10.40.0.0/16,8443-8443/tcp:10.40.16.0/20"}
+    - id: change-in-code
+      description: The approved rule is in the configuration with its change-control description
+      type: shell
+      on: workstation
+      skills: [iac.state.drift]
+      weight: 1.5
+      timeoutSec: 90
+      command: |
+        ct-iac state /home/learner/exam/sg-drift | jq -r '[.values.root_module.resources[]? | select(.type == "aws_security_group") | .values.ingress[]? | select(.from_port == 8443) | "\(.description)|\(.cidr_blocks | join(","))"] | join(" ")' 2>/dev/null
+      expect: {match: exact, value: "Pricing feed (CHG-{{chg}})|10.40.16.0/20"}
+    - id: converged
+      description: A new plan of ~/exam/sg-drift reports no changes
+      type: shell
+      on: workstation
+      skills: [iac.state.drift]
+      weight: 1.5
+      timeoutSec: 150
+      command: ct-iac plan /home/learner/exam/sg-drift
+      expect: {match: exact, value: no-changes}
+  misconceptions:
+    - id: revert-everything
+      description: Applies the configuration as it is, which also removes the approved rule.
+      feedback: Applying unchanged code reverts every hand edit, including the one change control approved. Add that rule to the configuration first.
+      expectFail: [approved-rules, change-in-code]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 400
+        run: |
+          cd ~/exam/sg-drift
+          iac apply -auto-approve -input=false -no-color
+    - id: accept-all-drift
+      description: Copies every live rule into the configuration.
+      feedback: A refresh shows what is there, not what is allowed. Only CHG-{{chg}} was approved; the open {{rdp}} and 5432 rules must go.
+      expectFail: [approved-rules]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 400
+        run: |
+          cd ~/exam/sg-drift
+          python3 - <<'PY'
+          p = "main.tf"; s = open(p).read()
+          add = ""
+          for port, cidr, desc in [(8443, "10.40.16.0/20", "Pricing feed (CHG-{{chg}})"), ({{rdp}}, "0.0.0.0/0", "temp access"), (5432, "0.0.0.0/0", "db debug")]:
+              add += '  ingress {\n    description = "%s"\n    from_port   = %d\n    to_port     = %d\n    protocol    = "tcp"\n    cidr_blocks = ["%s"]\n  }\n\n' % (desc, port, port, cidr)
+          s = s.replace("  egress {", add + "  egress {", 1)
+          open(p, "w").write(s)
+          PY
+          iac apply -auto-approve -input=false -no-color
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 400
+        run: |
+          set -e
+          cd ~/exam/sg-drift
+          iac plan -input=false -no-color
+          python3 - <<'PY'
+          p = "main.tf"; s = open(p).read()
+          rule = '  ingress {\n    description = "Pricing feed (CHG-{{chg}})"\n    from_port   = 8443\n    to_port     = 8443\n    protocol    = "tcp"\n    cidr_blocks = ["10.40.16.0/20"]\n  }\n\n'
+          s = s.replace("  egress {", rule + "  egress {", 1)
+          open(p, "w").write(s)
+          PY
+          iac apply -auto-approve -input=false -no-color

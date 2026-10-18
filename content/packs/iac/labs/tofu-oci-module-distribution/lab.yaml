@@ -1,0 +1,259 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: tofu-oci-module-distribution
+  title: Publish modules and mirror providers through OCI
+  domain: iac
+  frameworks: [opentofu:oci-distribution]
+  difficulty: hard
+  estimatedMinutes: 30
+  tags: [opentofu, oci, modules, provider-mirror, oras]
+  version: 1
+spec:
+  description: |
+    Saltmarsh now distributes IaC artefacts through its OCI registry (on this
+    workstation: `ct-oci status`, **`https://localhost:5000`**, no login). The
+    platform team has already mirrored the providers there under
+    `localhost:5000/opentofu-providers/<namespace>/<type>`. The inland stack in
+    `~/stacks/inland` (applied with `tofu`) still uses a vendored copy of
+    `farm-base` 1.4.0.
+
+    1. Publish release **2.0.0** of `farm-base` (source in `~/modules/farm-base`)
+       as an **OpenTofu module package**: a zip of the module directory pushed
+       with `oras` to **`localhost:5000/saltmarsh-modules/farm-base:v2.0.0`**
+       with the module-package artifact type.
+    2. Switch the inland stack's module call to that package with an
+       **`oci://`** source pinned to the tag, and delete the vendored copy.
+    3. Configure OpenTofu (`~/.tofurc`) to install providers from the registry
+       with an **`oci_mirror`** block for `registry.opentofu.org/hashicorp/*`,
+       and **no other installation method**: no direct downloads and no
+       filesystem mirror.
+    4. Re-initialise the stack so its providers really come from the OCI mirror
+       (not from a cached copy). The lock file only holds the `h1:` checksum
+       recorded from the old mirror, which OpenTofu cannot match against a zip
+       package: refresh it so it records the package's `zh:` checksum too, and
+       make sure the `h1:` checksum is still the one recorded before (same
+       provider build). Review the plan (only the farm file's content may
+       change) and apply.
+
+    Finish with a `tofu plan` that reports no changes.
+  objectives:
+    - Package and push a module to an OCI registry with oras
+    - Consume a module through an oci:// source
+    - Install providers from an OCI mirror with direct installation disabled
+  params:
+    farm:
+      type: choice
+      values: [fenwick, larkholt]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+  setup:
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/vendor/main.tf, source: assets/vendor/main.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/farm-base-2.0.0/main.tf, source: assets/farm-base-2.0.0/main.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/farm-base-2.0.0/CHANGELOG.md, source: assets/farm-base-2.0.0/CHANGELOG.md, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/publish-providers.sh, source: assets/publish-providers.sh, mode: "0755"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/seed.sh, source: assets/seed.sh, mode: "0755"}
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/stacks
+    - on: workstation
+      as: learner
+      timeoutSec: 300
+      run: /var/tmp/ct-seed/seed.sh
+  checks:
+    - id: module-package
+      description: localhost:5000/saltmarsh-modules/farm-base:v2.0.0 is an OpenTofu module package with the 2.0.0 code at the zip's root
+      type: shell
+      on: workstation
+      skills: [iac.opentofu.oci-distribution]
+      weight: 2
+      timeoutSec: 60
+      command: |
+        ct-oci ensure >/dev/null 2>&1
+        ref=localhost:5000/saltmarsh-modules/farm-base:v2.0.0
+        m=$(oras manifest fetch --plain-http=false "$ref" 2>/dev/null) || { echo missing; exit 0; }
+        t=$(printf '%s' "$m" | jq -r '.artifactType // "none"')
+        l=$(printf '%s' "$m" | jq -r '[.layers[].mediaType] | join(",")')
+        tmp=$(mktemp -d); oras pull --plain-http=false -o "$tmp" "$ref" >/dev/null 2>&1
+        z=$(find "$tmp" -type f | head -1)
+        c=$(python3 -c 'import sys,zipfile; n=zipfile.ZipFile(sys.argv[1]).namelist(); print("root" if "main.tf" in n else "nested")' "$z" 2>/dev/null || echo unreadable)
+        s=$(python3 -c 'import sys,zipfile; print("2.0.0" if b"schema=2" in zipfile.ZipFile(sys.argv[1]).read("main.tf") else "other")' "$z" 2>/dev/null || echo unreadable)
+        rm -rf "$tmp"
+        echo "type=$t layers=$l main_tf=$c release=$s"
+      expect: {match: exact, value: type=application/vnd.opentofu.modulepkg layers=archive/zip main_tf=root release=2.0.0}
+    - id: oci-source
+      description: The inland stack installs module farm from oci://localhost:5000/saltmarsh-modules/farm-base at tag v2.0.0
+      type: shell
+      on: workstation
+      skills: [iac.opentofu.oci-distribution]
+      weight: 2
+      command: jq -r '[.Modules[]? | select(.Key == "farm") | .Source][0] // "none"' /home/learner/stacks/inland/.terraform/modules/modules.json 2>/dev/null || echo none
+      expect: {match: regex, value: '^oci://localhost:5000/saltmarsh-modules/farm-base\?tag=v2\.0\.0$'}
+    - id: no-vendor-copy
+      description: The vendored copy is gone
+      type: shell
+      on: workstation
+      skills: [iac.opentofu.oci-distribution]
+      weight: 0.5
+      command: test -e /home/learner/stacks/inland/vendor && echo present || echo gone
+      expect: {match: exact, value: gone}
+    - id: cli-config
+      description: ~/.tofurc installs hashicorp providers only through an oci_mirror on localhost:5000
+      type: shell
+      on: workstation
+      skills: [iac.opentofu.oci-distribution]
+      weight: 1.5
+      command: |
+        f=/home/learner/.tofurc
+        [ -f $f ] || { echo missing; exit 0; }
+        c=$(grep -v '^[[:space:]]*#' $f)
+        o=$(printf '%s\n' "$c" | grep -c 'oci_mirror')
+        r=$(printf '%s\n' "$c" | grep -cE 'repository_template[[:space:]]*=[[:space:]]*"localhost:5000/opentofu-providers/\$\{namespace\}/\$\{type\}"')
+        fs=$(printf '%s\n' "$c" | grep -cE 'filesystem_mirror|network_mirror')
+        d=$(printf '%s\n' "$c" | grep -cE '^[[:space:]]*direct[[:space:]]*\{')
+        echo "oci_mirror=$o template=$r other_mirrors=$fs direct=$d"
+      expect: {match: exact, value: oci_mirror=1 template=1 other_mirrors=0 direct=0}
+    - id: providers-from-oci
+      description: The stack's local provider was installed from the OCI mirror (unpacked package, not a link into the image's mirror)
+      type: shell
+      on: workstation
+      skills: [iac.opentofu.oci-distribution]
+      weight: 1.5
+      command: |
+        p=$(ls -d /home/learner/stacks/inland/.terraform/providers/registry.opentofu.org/hashicorp/local/*/linux_amd64 2>/dev/null | head -1)
+        if [ -z "$p" ]; then echo missing; elif [ -L "$p" ]; then echo "linked to $(readlink "$p" | cut -d/ -f1-4)"; elif ls "$p"/terraform-provider-local* >/dev/null 2>&1; then echo unpacked; else echo empty; fi
+      expect: {match: exact, value: unpacked}
+    - id: lock-refreshed
+      description: The lock file records the package's zh checksum and the same h1 checksum as before
+      type: shell
+      on: workstation
+      skills: [iac.opentofu.oci-distribution]
+      weight: 1
+      command: |
+        f=/home/learner/stacks/inland/.terraform.lock.hcl
+        h=$(cat /home/learner/stacks/inland/.ct-seeded 2>/dev/null)
+        grep -q "\"$h\"" $f 2>/dev/null && o=same || o=different
+        z=$(grep -c '"zh:' $f 2>/dev/null)
+        echo "h1=$o zh=$z"
+      expect: {match: regex, value: '^h1=same zh=[1-9]$'}
+    - id: farm-file
+      description: The farm's file has the 2.0.0 content
+      type: shell
+      on: workstation
+      skills: [iac.opentofu.oci-distribution]
+      weight: 1
+      command: tr '\n' ' ' < /home/learner/inland/{{farm}}.conf 2>/dev/null || echo missing
+      expect: {match: exact, value: "farm={{farm}} quota=standard schema=2 "}
+    - id: converged
+      description: A tofu plan of ~/stacks/inland reports no changes
+      type: shell
+      on: workstation
+      skills: [iac.foundations.workflow]
+      weight: 1
+      timeoutSec: 120
+      command: |
+        ct-iac run /home/learner/stacks/inland sh -c 'tofu plan -lock=false -input=false -no-color -detailed-exitcode >/dev/null 2>&1'
+        case $? in 0) echo no-changes ;; 2) echo changes ;; *) echo error ;; esac
+      expect: {match: exact, value: no-changes}
+  hints:
+    - title: Building the package
+      body: 'There is no `zip` binary; Python has one: `cd ~/modules/farm-base && python3 -m zipfile -c ~/farm-base-2.0.0.zip main.tf CHANGELOG.md`. The files must sit at the root of the archive.'
+      cost: 1
+    - title: Pushing with oras
+      body: |
+        ```shell
+        oras push --plain-http=false --artifact-type=application/vnd.opentofu.modulepkg \
+          localhost:5000/saltmarsh-modules/farm-base:v2.0.0 farm-base-2.0.0.zip:archive/zip
+        ```
+        oras talks plain HTTP to `localhost` unless told otherwise; this registry is HTTPS only.
+      cost: 2
+    - title: The OCI mirror
+      body: |
+        ```hcl
+        provider_installation {
+          oci_mirror {
+            repository_template = "localhost:5000/opentofu-providers/${namespace}/${type}"
+            include             = ["registry.opentofu.org/hashicorp/*"]
+          }
+        }
+        ```
+        When `~/.tofurc` exists, tofu reads it instead of `~/.terraformrc`. A
+        `provider_installation` block without `direct {}` disables direct downloads.
+        `tofu init -upgrade` alone may keep the cached provider; remove
+        `.terraform/providers` first.
+      cost: 2
+    - title: Checksum mismatch
+      body: The lock file's only checksum (h1) was computed from the unpacked mirror. Move the lock file aside, run `tofu init`, and compare the new h1 line with the old one before you trust the package; the new file also gets the zip's zh checksum.
+      cost: 2
+  misconceptions:
+    - id: generic-artifact
+      description: Pushes the zip without the module-package artifact type.
+      feedback: OpenTofu only installs an OCI artifact whose manifest has artifactType application/vnd.opentofu.modulepkg and one archive/zip layer. Push again with --artifact-type.
+      expectFail: [module-package, oci-source]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          cd ~/modules/farm-base && python3 -m zipfile -c ~/farm-base-2.0.0.zip main.tf CHANGELOG.md
+          cd ~ && oras push --plain-http=false localhost:5000/saltmarsh-modules/farm-base:v2.0.0 farm-base-2.0.0.zip:archive/zip
+          cd ~/stacks/inland && rm -rf vendor
+          printf 'module "farm" {\n  source = "oci://localhost:5000/saltmarsh-modules/farm-base?tag=v2.0.0"\n  farm   = "{{farm}}"\n}\n' > main.tf
+          tofu init -input=false -no-color || true
+          tofu apply -auto-approve -input=false -no-color || true
+    - id: image-mirror
+      description: Switches the module but keeps installing providers from the image's filesystem mirror.
+      feedback: The providers must come from the OCI registry. Configure an oci_mirror in ~/.tofurc with no other installation method, and re-initialise with the provider cache removed.
+      expectFail: [cli-config, providers-from-oci]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          cd ~/modules/farm-base && python3 -m zipfile -c ~/farm-base-2.0.0.zip main.tf CHANGELOG.md
+          cd ~ && oras push --plain-http=false --artifact-type=application/vnd.opentofu.modulepkg localhost:5000/saltmarsh-modules/farm-base:v2.0.0 farm-base-2.0.0.zip:archive/zip
+          cd ~/stacks/inland && rm -rf vendor
+          printf 'module "farm" {\n  source = "oci://localhost:5000/saltmarsh-modules/farm-base?tag=v2.0.0"\n  farm   = "{{farm}}"\n}\n' > main.tf
+          printf 'provider_installation {\n  filesystem_mirror {\n    path = "/opt/cloudtrain/providers"\n  }\n}\n' > ~/.tofurc
+          tofu init -input=false -no-color
+          tofu apply -auto-approve -input=false -no-color
+  solution:
+    explanation: |
+      An OpenTofu module package is an OCI image manifest with artifactType
+      `application/vnd.opentofu.modulepkg` and a single `archive/zip` layer holding
+      the module at its root; `oras push` builds it. `oci://<registry>/<repo>?tag=`
+      pins the release. Providers come from the registry through `oci_mirror`; with
+      no `direct {}` and no other mirror in `provider_installation`, nothing else is
+      tried. Removing `.terraform/providers` forces a fresh install from the mirror,
+      which unpacks the package into the working directory.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/modules/farm-base && python3 -m zipfile -c ~/farm-base-2.0.0.zip main.tf CHANGELOG.md
+          cd ~ && oras push --plain-http=false --artifact-type=application/vnd.opentofu.modulepkg \
+            localhost:5000/saltmarsh-modules/farm-base:v2.0.0 farm-base-2.0.0.zip:archive/zip
+          cat > ~/.tofurc <<'HCL'
+          provider_installation {
+            oci_mirror {
+              repository_template = "localhost:5000/opentofu-providers/${namespace}/${type}"
+              include             = ["registry.opentofu.org/hashicorp/*"]
+            }
+          }
+          HCL
+          cd ~/stacks/inland && rm -rf vendor .terraform/providers && mv .terraform.lock.hcl ~/inland-lock.before
+          printf 'module "farm" {\n  source = "oci://localhost:5000/saltmarsh-modules/farm-base?tag=v2.0.0"\n  farm   = "{{farm}}"\n}\n' > main.tf
+          tofu init -input=false -no-color
+          tofu plan -input=false -no-color
+          tofu apply -auto-approve -input=false -no-color

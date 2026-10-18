@@ -1,0 +1,270 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: iac-scheduled-drift-check
+  title: Schedule a nightly drift check
+  domain: iac
+  frameworks: [tf-professional:operations]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [terraform, drift, systemd, timers, detailed-exitcode]
+  version: 1
+spec:
+  description: |
+    Nobody notices when someone edits the inland objects by hand. Schedule a
+    nightly drift check of `~/stacks/inland` (applied on `sm-grid`):
+
+    1. A script runs a **plan with `-detailed-exitcode`** (never an apply) and
+       writes one word to **`~/drift/inland.status`**: `clean` (exit 0),
+       `drifted` (exit 2) or `error` (anything else).
+    2. A systemd **user** service `~/.config/systemd/user/inland-drift.service`
+       runs the script (`Type=oneshot`), and a timer
+       **`inland-drift.timer`** fires it **every night** between 00:00 and
+       05:59 (persistent across downtime), installed into `timers.target` and
+       **enabled**.
+
+    This workstation is a container without a running systemd, so the timer
+    cannot fire here: the grader checks the units with `systemd-analyze`,
+    then runs the service's `ExecStart` itself the way the timer would, with
+    and without drift.
+  objectives:
+    - Detect drift from plan's detailed exit code
+    - Schedule a job with a systemd service and timer
+  params:
+    turbines: {type: int, min: 12, max: 30}
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+      - name: sm-grid
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: sm-grid
+  setup:
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/main.tf, source: assets/main.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/seed.sh, source: assets/seed.sh, mode: "0755"}
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/stacks
+    - on: workstation
+      as: learner
+      timeoutSec: 240
+      run: /var/tmp/ct-seed/seed.sh
+  teardown:
+    - on: sm-grid
+      run: kubectl delete namespace inland --ignore-not-found --wait=false
+  checks:
+    - id: units-valid
+      description: systemd-analyze accepts the service and the timer
+      type: shell
+      on: workstation
+      skills: [iac.collaboration.drift-detection]
+      weight: 1
+      timeoutSec: 60
+      command: |
+        d=/home/learner/.config/systemd/user
+        [ -f $d/inland-drift.service ] && [ -f $d/inland-drift.timer ] || { echo missing; exit 0; }
+        runuser -u learner -- env -i HOME=/home/learner PATH=/usr/local/bin:/usr/bin:/bin XDG_RUNTIME_DIR=/tmp \
+          systemd-analyze --user --man=no verify $d/inland-drift.service $d/inland-drift.timer >/tmp/ct-sa.log 2>&1 \
+          && echo valid || { echo invalid; tail -3 /tmp/ct-sa.log; }
+      expect: {match: exact, value: valid}
+    - id: timer-schedule
+      description: The timer fires the service nightly, persistently, and is enabled in timers.target
+      type: shell
+      on: workstation
+      skills: [iac.collaboration.drift-detection]
+      weight: 2
+      timeoutSec: 60
+      command: |
+        d=/home/learner/.config/systemd/user; t=$d/inland-drift.timer
+        oc=$(sed -n 's/^OnCalendar=//p' $t 2>/dev/null | head -1)
+        n=$(systemd-analyze calendar "$oc" 2>/dev/null | sed -n 's/.*Normalized form: //p')
+        echo "$n" | grep -qE '^\*-\*-\* 0[0-5]:[0-9]{2}:[0-9]{2}$' && night=yes || night="no($n)"
+        u=$(sed -n 's/^Unit=//p' $t 2>/dev/null | head -1); [ -z "$u" ] && u=inland-drift.service
+        p=$(sed -n 's/^Persistent=//p' $t 2>/dev/null | head -1)
+        w=$(sed -n 's/^WantedBy=//p' $t 2>/dev/null | head -1)
+        [ -e $d/timers.target.wants/inland-drift.timer ] && e=yes || e=no
+        echo "nightly=$night unit=$u persistent=$p wantedby=$w enabled=$e"
+      expect: {match: exact, value: nightly=yes unit=inland-drift.service persistent=true wantedby=timers.target enabled=yes}
+    - id: fires-correctly
+      description: Fired like the timer would, the service writes clean, then drifted after a hand edit, then error when plan fails
+      type: shell
+      on: workstation
+      skills: [iac.collaboration.drift-detection]
+      weight: 4
+      timeoutSec: 300
+      command: |
+        svc=/home/learner/.config/systemd/user/inland-drift.service
+        cmd=$(sed -n 's/^ExecStart=[-@:+!]*//p' $svc 2>/dev/null | head -1 | sed 's|%h|/home/learner|g')
+        wd=$(sed -n 's/^WorkingDirectory=[-]*//p' $svc 2>/dev/null | head -1 | sed 's|%h|/home/learner|g; s|^~|/home/learner|')
+        [ -n "$cmd" ] || { echo "no ExecStart"; exit 0; }
+        st=/home/learner/drift/inland.status
+        fire() { rm -f $st; ct-iac run "${wd:-/home/learner}" env "$@" sh -c "$cmd" >/dev/null 2>&1; r=$(tr -d '[:space:]' < $st 2>/dev/null); echo "${r:-none}"; }
+        k() { runuser -u learner -- env HOME=/home/learner kubectl --context sm-grid -n inland "$@" >/dev/null 2>&1; }
+        a=$(fire CT=1)
+        k patch configmap inland-sites --type merge -p '{"data":{"turbines":"999"}}'
+        b=$(fire CT=1)
+        k patch configmap inland-sites --type merge -p '{"data":{"turbines":"{{turbines}}"}}'
+        c=$(fire TF_CLI_ARGS_plan=-var=ct_undeclared=1)
+        fire CT=1 >/dev/null
+        echo "$a $b $c"
+      expect: {match: exact, value: clean drifted error}
+  hints:
+    - title: Exit codes
+      body: With `-detailed-exitcode`, plan exits 0 for no changes, 2 for changes and 1 for errors. Without it, drift exits 0 too.
+      cost: 1
+    - title: The units
+      body: |
+        Service: `[Service]` with `Type=oneshot` and `ExecStart=%h/bin/<script>` (`%h` is the home directory).
+        Timer: `[Timer]` with `OnCalendar=*-*-* 02:30:00` and `Persistent=true`, and `[Install]` `WantedBy=timers.target`.
+        Check the expression with `systemd-analyze calendar '*-*-* 02:30:00'`.
+      cost: 2
+    - title: Enabling without a running systemd
+      body: Enabling a unit only creates the symlink its [Install] section asks for, e.g. `ln -s ../inland-drift.timer ~/.config/systemd/user/timers.target.wants/inland-drift.timer`.
+      cost: 1
+  misconceptions:
+    - id: exit-status-only
+      description: Treats any successful plan as clean.
+      feedback: A plan that finds drift still succeeds (exit 0) unless you pass -detailed-exitcode, so drift is reported as clean. Map exit 2 to drifted.
+      expectFail: [fires-correctly]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          mkdir -p ~/bin ~/drift ~/.config/systemd/user/timers.target.wants
+          cat > ~/bin/inland-drift-check <<'SH'
+          #!/bin/sh
+          mkdir -p "$HOME/drift"
+          cd "$HOME/stacks/inland"
+          if iac plan -input=false -no-color > "$HOME/drift/inland.log" 2>&1; then s=clean; else s=error; fi
+          echo "$s" > "$HOME/drift/inland.status"
+          SH
+          chmod 0755 ~/bin/inland-drift-check
+          cat > ~/.config/systemd/user/inland-drift.service <<'UNIT'
+          [Unit]
+          Description=Drift check of the inland stack
+
+          [Service]
+          Type=oneshot
+          ExecStart=%h/bin/inland-drift-check
+          UNIT
+          cat > ~/.config/systemd/user/inland-drift.timer <<'UNIT'
+          [Unit]
+          Description=Nightly drift check of the inland stack
+
+          [Timer]
+          OnCalendar=*-*-* 02:30:00
+          Persistent=true
+          Unit=inland-drift.service
+
+          [Install]
+          WantedBy=timers.target
+          UNIT
+          ln -sfn ../inland-drift.timer ~/.config/systemd/user/timers.target.wants/inland-drift.timer
+          ~/bin/inland-drift-check; cat ~/drift/inland.status
+    - id: hourly-not-enabled
+      description: Schedules the check hourly and never enables the timer.
+      feedback: The check must run once a night, and a timer that is not enabled never starts after a reboot. Use a nightly OnCalendar and enable it into timers.target.
+      expectFail: [timer-schedule]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          mkdir -p ~/bin ~/drift ~/.config/systemd/user/timers.target.wants
+          cat > ~/bin/inland-drift-check <<'SH'
+          #!/bin/sh
+          # Nightly drift check: plan only, never apply. 0 = clean, 2 = drifted, anything else = error.
+          mkdir -p "$HOME/drift"
+          cd "$HOME/stacks/inland" || { echo error > "$HOME/drift/inland.status"; exit 1; }
+          iac plan -input=false -no-color -detailed-exitcode > "$HOME/drift/inland.log" 2>&1
+          case $? in
+            0) s=clean ;;
+            2) s=drifted ;;
+            *) s=error ;;
+          esac
+          echo "$s" > "$HOME/drift/inland.status"
+          SH
+          chmod 0755 ~/bin/inland-drift-check
+          cat > ~/.config/systemd/user/inland-drift.service <<'UNIT'
+          [Unit]
+          Description=Drift check of the inland stack
+
+          [Service]
+          Type=oneshot
+          ExecStart=%h/bin/inland-drift-check
+          UNIT
+          cat > ~/.config/systemd/user/inland-drift.timer <<'UNIT'
+          [Unit]
+          Description=Nightly drift check of the inland stack
+
+          [Timer]
+          OnCalendar=hourly
+          Persistent=true
+          Unit=inland-drift.service
+
+          [Install]
+          WantedBy=timers.target
+          UNIT
+          ~/bin/inland-drift-check; cat ~/drift/inland.status
+  solution:
+    explanation: |
+      plan -detailed-exitcode turns the comparison into an exit code (0 clean, 2
+      drifted, 1 error) that a script can map to a status word. The oneshot user
+      service runs that script; the timer's OnCalendar fires it nightly,
+      Persistent=true catches up a run missed while the host was down, and enabling
+      it links it into timers.target so it starts with the user's systemd. On a real
+      host, `systemctl --user enable --now inland-drift.timer` and `loginctl
+      enable-linger` make it run without a login session.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          mkdir -p ~/bin ~/drift ~/.config/systemd/user/timers.target.wants
+          cat > ~/bin/inland-drift-check <<'SH'
+          #!/bin/sh
+          # Nightly drift check: plan only, never apply. 0 = clean, 2 = drifted, anything else = error.
+          mkdir -p "$HOME/drift"
+          cd "$HOME/stacks/inland" || { echo error > "$HOME/drift/inland.status"; exit 1; }
+          iac plan -input=false -no-color -detailed-exitcode > "$HOME/drift/inland.log" 2>&1
+          case $? in
+            0) s=clean ;;
+            2) s=drifted ;;
+            *) s=error ;;
+          esac
+          echo "$s" > "$HOME/drift/inland.status"
+          SH
+          chmod 0755 ~/bin/inland-drift-check
+          cat > ~/.config/systemd/user/inland-drift.service <<'UNIT'
+          [Unit]
+          Description=Drift check of the inland stack
+
+          [Service]
+          Type=oneshot
+          ExecStart=%h/bin/inland-drift-check
+          UNIT
+          cat > ~/.config/systemd/user/inland-drift.timer <<'UNIT'
+          [Unit]
+          Description=Nightly drift check of the inland stack
+
+          [Timer]
+          OnCalendar=*-*-* 02:30:00
+          Persistent=true
+          Unit=inland-drift.service
+
+          [Install]
+          WantedBy=timers.target
+          UNIT
+          ln -sfn ../inland-drift.timer ~/.config/systemd/user/timers.target.wants/inland-drift.timer
+          ~/bin/inland-drift-check; cat ~/drift/inland.status

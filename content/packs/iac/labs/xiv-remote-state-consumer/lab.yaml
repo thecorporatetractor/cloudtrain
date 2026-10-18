@@ -1,0 +1,178 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xiv-remote-state-consumer
+  title: Consume another team's outputs from remote state
+  domain: iac
+  frameworks: [tf-advanced:collaboration]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [exam, terraform, remote-state, s3-backend, aws-shaped]
+  version: 1
+spec:
+  description: |
+    **Directories:** `~/exam/network`, `~/exam/pricing` · **Endpoint:** the
+    AWS-shaped API on `http://moto:5000`; state in the workstation's S3 store
+
+    Both stacks are applied and keep their state in bucket `sm-tfstate` of the
+    workstation's S3 store (`network/terraform.tfstate` and
+    `pricing/terraform.tfstate`; the backend blocks show the connection
+    settings). The pricing stack pasted the network team's subnet id and feeds
+    bucket name in as **literals**.
+
+    Make the pricing stack read both values from the **network stack's
+    state** with a `terraform_remote_state` data source instead. The pricing
+    configuration must not contain the subnet id or the bucket name any more,
+    and nothing may be recreated. Both stacks must plan empty afterwards.
+  objectives:
+    - Read another stack's outputs through a remote state data source
+    - Remove copied identifiers from configuration
+  params:
+    suffix:
+      type: choice
+      values: [q3, w8, z5]
+    interval: {type: int, min: 15, max: 120}
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+      - name: moto
+        driver: container
+        image: moto:5
+  setup:
+    - on: moto
+      file: {path: /root/ct-moto-ids.py, source: assets/moto-ids.py, mode: "0600"}
+    - on: moto
+      timeoutSec: 120
+      run: for i in $(seq 1 60); do curl -s -o /dev/null http://localhost:5000/ && break; sleep 2; done
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xiv-remote-state-consumer/network/providers.tf, source: assets/network/providers.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xiv-remote-state-consumer/network/main.tf, source: assets/network/main.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xiv-remote-state-consumer/pricing/providers.tf, source: assets/pricing/providers.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xiv-remote-state-consumer/pricing/main.tf, source: assets/pricing/main.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xiv-remote-state-consumer/seed.sh, source: assets/seed.sh, mode: "0755"}
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/exam
+    - on: workstation
+      as: learner
+      timeoutSec: 400
+      run: /var/tmp/ct-seed/xiv-remote-state-consumer/seed.sh
+    - on: moto
+      timeoutSec: 60
+      run: python3 /root/ct-moto-ids.py record pricing-engine
+  checks:
+    - id: reads-remote-state
+      description: The pricing stack reads the network stack's S3 state through terraform_remote_state
+      type: shell
+      on: workstation
+      skills: [iac.state.sharing]
+      weight: 2
+      timeoutSec: 150
+      command: |
+        ct-iac planjson /home/learner/exam/pricing | jq -r '[.prior_state.values.root_module.resources[]? | select(.mode == "data" and .type == "terraform_remote_state") | "\(.values.backend):\(.values.config.bucket):\(.values.config.key)"] | unique | join(" ")' 2>/dev/null
+      expect: {match: exact, value: "s3:sm-tfstate:network/terraform.tfstate"}
+    - id: no-literals
+      description: The pricing configuration no longer contains the subnet id or the bucket name
+      type: shell
+      on: workstation
+      skills: [iac.state.sharing]
+      weight: 2
+      command: |
+        c=$(cat /home/learner/exam/pricing/*.tf 2>/dev/null | sed 's/#.*//')
+        s=$(printf '%s\n' "$c" | grep -cE '"subnet-[0-9a-f]+"')
+        b=$(printf '%s\n' "$c" | grep -c '"sm-pricing-feeds-{{suffix}}"')
+        echo "subnet_literals=$s bucket_literals=$b"
+      expect: {match: exact, value: subnet_literals=0 bucket_literals=0}
+    - id: instance-kept
+      description: The pricing engine instance is the original
+      type: shell
+      on: moto
+      skills: [iac.state.sharing]
+      weight: 1
+      timeoutSec: 60
+      command: python3 /root/ct-moto-ids.py check pricing-engine
+      expect: {match: exact, value: pricing-engine=same}
+    - id: converged
+      description: Both stacks plan with no changes
+      type: shell
+      on: workstation
+      skills: [iac.state.sharing]
+      weight: 2
+      timeoutSec: 240
+      command: echo "network=$(ct-iac plan /home/learner/exam/network) pricing=$(ct-iac plan /home/learner/exam/pricing)"
+      expect: {match: exact, value: network=no-changes pricing=no-changes}
+  misconceptions:
+    - id: declared-not-used
+      description: Adds the data source but keeps the literals.
+      feedback: Declaring terraform_remote_state is not enough; reference data.terraform_remote_state.<name>.outputs.pricing_subnet_id and .feeds_bucket where the literals were.
+      expectFail: [no-literals]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          cd ~/exam/pricing
+          cat > network.tf <<'HCL'
+          data "terraform_remote_state" "network" {
+            backend = "s3"
+            config = {
+              bucket                      = "sm-tfstate"
+              key                         = "network/terraform.tfstate"
+              region                      = "us-east-1"
+              endpoints                   = { s3 = "http://127.0.0.1:8333" }
+              use_path_style              = true
+              skip_credentials_validation = true
+              skip_region_validation      = true
+              skip_requesting_account_id  = true
+              skip_metadata_api_check     = true
+            }
+          }
+          HCL
+          iac apply -auto-approve -input=false -no-color
+    - id: local-copy
+      description: Pulls the network state into a local file and reads that instead.
+      feedback: A pulled copy goes stale the next time the network team applies. Read the live state from the S3 backend.
+      expectFail: [reads-remote-state]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          cd ~/exam/network && iac state pull > ../pricing/network.tfstate
+          cd ~/exam/pricing
+          printf 'data "terraform_remote_state" "network" {\n  backend = "local"\n  config = {\n    path = "${path.module}/network.tfstate"\n  }\n}\n' > network.tf
+          sed -i -E 's/subnet_id     = "subnet-[0-9a-f]+"/subnet_id     = data.terraform_remote_state.network.outputs.pricing_subnet_id/; s/bucket  = "sm-pricing-feeds-[a-z0-9]+"/bucket  = data.terraform_remote_state.network.outputs.feeds_bucket/' main.tf
+          iac apply -auto-approve -input=false -no-color
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/exam/pricing
+          cat > network.tf <<'HCL'
+          data "terraform_remote_state" "network" {
+            backend = "s3"
+            config = {
+              bucket                      = "sm-tfstate"
+              key                         = "network/terraform.tfstate"
+              region                      = "us-east-1"
+              endpoints                   = { s3 = "http://127.0.0.1:8333" }
+              use_path_style              = true
+              skip_credentials_validation = true
+              skip_region_validation      = true
+              skip_requesting_account_id  = true
+              skip_metadata_api_check     = true
+            }
+          }
+          HCL
+          sed -i -E 's/subnet_id     = "subnet-[0-9a-f]+"/subnet_id     = data.terraform_remote_state.network.outputs.pricing_subnet_id/; s/bucket  = "sm-pricing-feeds-[a-z0-9]+"/bucket  = data.terraform_remote_state.network.outputs.feeds_bucket/' main.tf
+          iac apply -auto-approve -input=false -no-color

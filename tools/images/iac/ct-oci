@@ -1,0 +1,43 @@
+#!/bin/bash
+# ct-oci: an OCI registry (CNCF distribution, Apache-2.0) inside the learner's pod for
+# OpenTofu OCI module and provider-mirror labs. HTTPS on 127.0.0.1:5000 (host name
+# localhost) with a lab certificate whose CA the image trusts system-wide
+# (/etc/cloudtrain/oci-tls); no authentication. Data in ~/.local/share/ct-oci survives
+# hibernation. Not a security boundary: anyone in the pod may push.
+#
+#   ct-oci start    start it now and on every later `ensure`
+#   ct-oci ensure   start it if it was started before and is down
+#   ct-oci status   up | down
+set -uo pipefail
+PORT=5000
+H=/home/learner
+DATA=$H/.local/share/ct-oci
+FLAG=$H/.config/ct-oci/enabled
+if [[ $(id -u) == 0 ]]; then
+  exec runuser -u learner -- env -i HOME=$H USER=learner LOGNAME=learner \
+    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin "$0" "$@"
+fi
+up() { curl -s -o /dev/null --max-time 2 "https://localhost:$PORT/v2/"; }
+start() {
+  up && return 0
+  mkdir -p "$DATA/data"
+  cat > "$DATA/config.yml" <<YML
+version: 0.1
+log: {level: warn}
+storage:
+  filesystem: {rootdirectory: $DATA/data}
+  delete: {enabled: true}
+http:
+  addr: 127.0.0.1:$PORT
+  tls: {certificate: /etc/cloudtrain/oci-tls/tls.crt, key: /etc/cloudtrain/oci-tls/tls.key}
+YML
+  OTEL_TRACES_EXPORTER=none setsid nohup registry serve "$DATA/config.yml" >"$DATA/registry.log" 2>&1 </dev/null &
+  for _ in $(seq 1 60); do up && return 0; sleep 1; done
+  echo "ct-oci: registry did not come up, see $DATA/registry.log" >&2; return 1
+}
+case ${1:-} in
+  start) mkdir -p "$(dirname "$FLAG")"; start && touch "$FLAG" ;;
+  ensure) [[ -e $FLAG ]] || exit 0; start ;;
+  status) up && echo up || echo down ;;
+  *) echo "usage: ct-oci start|ensure|status" >&2; exit 2 ;;
+esac

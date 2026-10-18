@@ -1,0 +1,176 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xiv-module-upgrade-git
+  title: Upgrade a shared module across a breaking release
+  domain: iac
+  frameworks: [tf-advanced:modules]
+  difficulty: hard
+  estimatedMinutes: 25
+  tags: [exam, terraform, modules, git, moved, upgrades]
+  version: 1
+spec:
+  description: |
+    **Directory:** `~/exam/farm-upgrade` · **Cluster:** `sm-grid`
+
+    The stack (applied) calls module `farm-base` from the internal Git
+    repository `git::file:///home/learner/git/farm-base.git`, pinned to
+    `v1.4.0`. Upgrade the call to release **`v2.0.0`** (read its
+    `CHANGELOG.md` in the repository): adapt the call to the renamed inputs
+    and keep the existing ConfigMap and ServiceAccount in namespace
+    `farm-upgrade` — **nothing may be destroyed or recreated**.
+
+    Apply; the following plan must be empty.
+  objectives:
+    - Upgrade a Git-sourced module to a new major release
+    - Absorb renamed module resources with moved blocks in the caller
+  params:
+    turbines: {type: int, min: 20, max: 60}
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+      - name: sm-grid
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: sm-grid
+  setup:
+    - on: sm-grid
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata:
+          name: farm-upgrade
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xiv-module-upgrade-git/make-repo.sh, source: assets/make-repo.sh, mode: "0755"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xiv-module-upgrade-git/stack/providers.tf, source: assets/stack/providers.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xiv-module-upgrade-git/stack/main.tf, source: assets/stack/main.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xiv-module-upgrade-git/seed.sh, source: assets/seed.sh, mode: "0755"}
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/exam
+    - on: workstation
+      as: learner
+      timeoutSec: 60
+      run: /var/tmp/ct-seed/xiv-module-upgrade-git/make-repo.sh
+    - on: workstation
+      as: learner
+      timeoutSec: 240
+      run: /var/tmp/ct-seed/xiv-module-upgrade-git/seed.sh xiv-module-upgrade-git farm-upgrade apply
+    - on: sm-grid
+      run: |
+        set -eu
+        kubectl -n kube-system get configmap ct-xiv-mug >/dev/null 2>&1 && exit 0
+        kubectl -n kube-system create configmap ct-xiv-mug \
+          --from-literal=cm=$(kubectl -n farm-upgrade get configmap farm-gullhaven -o jsonpath='{.metadata.uid}') \
+          --from-literal=sa=$(kubectl -n farm-upgrade get serviceaccount gullhaven-agent -o jsonpath='{.metadata.uid}')
+  teardown:
+    - on: sm-grid
+      run: kubectl delete namespace farm-upgrade --ignore-not-found --wait=false
+  checks:
+    - id: on-v2
+      description: The module is installed from the Git repository at tag v2.0.0
+      type: shell
+      on: workstation
+      skills: [iac.modules.sources]
+      weight: 2
+      command: jq -r '[.Modules[]? | select(.Key == "gullhaven") | .Source][0] // "none"' /home/learner/exam/farm-upgrade/.terraform/modules/modules.json 2>/dev/null || echo none
+      expect: {match: regex, value: '^git::file:///home/learner/git/farm-base\.git\?ref=v2\.0\.0$'}
+    - id: objects-kept
+      description: The ConfigMap and the ServiceAccount are the original objects, with the turbine count
+      type: shell
+      on: sm-grid
+      skills: [iac.state.refactor]
+      weight: 1.5
+      timeoutSec: 30
+      command: |
+        b() { kubectl -n kube-system get configmap ct-xiv-mug -o jsonpath="{.data.$1}"; }
+        c=$(kubectl -n farm-upgrade get configmap farm-gullhaven -o jsonpath='{.metadata.uid}' 2>/dev/null)
+        s=$(kubectl -n farm-upgrade get serviceaccount gullhaven-agent -o jsonpath='{.metadata.uid}' 2>/dev/null)
+        t=$(kubectl -n farm-upgrade get configmap farm-gullhaven -o jsonpath='{.data.turbines}' 2>/dev/null)
+        [ -n "$c" ] && [ "$c" = "$(b cm)" ] && c=same || c=new
+        [ -n "$s" ] && [ "$s" = "$(b sa)" ] && s=same || s=new
+        echo "configmap=$c serviceaccount=$s turbines=$t"
+      expect: {match: exact, value: "configmap=same serviceaccount=same turbines={{turbines}}"}
+    - id: v2-addresses
+      description: The state uses the v2 resource addresses
+      type: shell
+      on: workstation
+      skills: [iac.state.refactor]
+      weight: 3
+      timeoutSec: 60
+      command: |
+        ct-iac state /home/learner/exam/farm-upgrade | jq -r '[.values.root_module.child_modules[]?.resources[]? | select(.mode == "managed") | .address] | sort | join(" ")' 2>/dev/null
+      expect: {match: exact, value: module.gullhaven.kubernetes_config_map_v1.farm module.gullhaven.kubernetes_service_account_v1.agent}
+    - id: converged
+      description: A new plan of ~/exam/farm-upgrade reports no changes
+      type: shell
+      on: workstation
+      skills: [iac.foundations.workflow]
+      weight: 1
+      timeoutSec: 120
+      command: ct-iac plan /home/learner/exam/farm-upgrade
+      expect: {match: exact, value: no-changes}
+  misconceptions:
+    - id: inputs-only
+      description: Renames the inputs and upgrades, without moved blocks.
+      feedback: Release 2.0.0 renamed the module's resources and ships no moved blocks, so the plan replaces both objects. Add moved blocks in your stack from module.gullhaven.kubernetes_config_map_v1.settings to module.gullhaven.kubernetes_config_map_v1.farm (and the ServiceAccount).
+      expectFail: [objects-kept]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          cd ~/exam/farm-upgrade
+          printf 'module "gullhaven" {\n  source    = "git::file:///home/learner/git/farm-base.git?ref=v2.0.0"\n  farm      = "gullhaven"\n  turbines  = {{turbines}}\n  namespace = "farm-upgrade"\n}\n' > main.tf
+          iac init -upgrade -input=false -no-color >/dev/null
+          iac apply -auto-approve -input=false -no-color || iac apply -auto-approve -input=false -no-color || true
+    - id: unpinned
+      description: Drops the ref so the call tracks the default branch.
+      feedback: Without ?ref= the module follows main, and the next commit there changes your infrastructure. Pin the release tag v2.0.0.
+      expectFail: [on-v2]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          cd ~/exam/farm-upgrade
+          printf 'module "gullhaven" {\n  source    = "git::file:///home/learner/git/farm-base.git"\n  farm      = "gullhaven"\n  turbines  = {{turbines}}\n  namespace = "farm-upgrade"\n}\n\nmoved {\n  from = module.gullhaven.kubernetes_config_map_v1.settings\n  to   = module.gullhaven.kubernetes_config_map_v1.farm\n}\n\nmoved {\n  from = module.gullhaven.kubernetes_service_account_v1.sa\n  to   = module.gullhaven.kubernetes_service_account_v1.agent\n}\n' > main.tf
+          iac init -upgrade -input=false -no-color >/dev/null
+          iac apply -auto-approve -input=false -no-color
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/exam/farm-upgrade
+          git -C ~/git/farm-base.git show v2.0.0:CHANGELOG.md
+          cat > main.tf <<'HCL'
+          module "gullhaven" {
+            source    = "git::file:///home/learner/git/farm-base.git?ref=v2.0.0"
+            farm      = "gullhaven"
+            turbines  = {{turbines}}
+            namespace = "farm-upgrade"
+          }
+
+          moved {
+            from = module.gullhaven.kubernetes_config_map_v1.settings
+            to   = module.gullhaven.kubernetes_config_map_v1.farm
+          }
+
+          moved {
+            from = module.gullhaven.kubernetes_service_account_v1.sa
+            to   = module.gullhaven.kubernetes_service_account_v1.agent
+          }
+          HCL
+          iac init -upgrade -input=false -no-color >/dev/null
+          iac apply -auto-approve -input=false -no-color

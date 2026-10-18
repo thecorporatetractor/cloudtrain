@@ -1,0 +1,8 @@
+#!/bin/sh
+# Seeds and applies ~/stacks/test-fleet once (a recreated pod must not overwrite the learner's work).
+set -eu
+d=$HOME/stacks/test-fleet
+[ -e "$d/.ct-seeded" ] && exit 0
+mkdir -p "$d" && cp /var/tmp/ct-seed/iac-provider-actions/stack/*.tf "$d/"
+cd "$d" && iac init -input=false -no-color >/dev/null && iac apply -auto-approve -input=false -no-color >/dev/null
+touch .ct-seeded

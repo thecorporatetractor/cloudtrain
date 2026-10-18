@@ -1,0 +1,184 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: tofu-early-evaluation-backend
+  title: Key backends and module versions off variables
+  domain: iac
+  frameworks: [opentofu:early-evaluation]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [opentofu, early-evaluation, backends, s3, modules, git]
+  version: 1
+spec:
+  description: |
+    `~/stacks/farm` is meant to be one configuration for every offshore farm,
+    but its `s3` backend is hard-wired to the key `farms/terraform.tfstate` and
+    its `farm-base` module call to release `v1.1.0`, so every farm would share
+    one state and one module release. Each farm's settings are in
+    `farms/<farm>.tfvars` (`farm` and `farm_base_ref`). The module lives in
+    the internal Git repository `git::file:///home/learner/git/farm-base.git`
+    (tags are releases); the bucket `saltmarsh-state` is on the workstation's
+    S3 store (`ct-s3 status`).
+
+    With OpenTofu's **early evaluation** (`tofu`; Terraform 1.15 rejects
+    variables in these places):
+
+    1. Derive the backend key from the farm: **`farms/<farm>/terraform.tfstate`**,
+       using `var.farm` in the `backend` block.
+    2. Derive the module release from **`var.farm_base_ref`** in the module's
+       `source` address.
+    3. Initialise and apply the stack once for **gullhaven** and once for
+       **redmoor** (each with its own `.tfvars`), so the bucket holds two
+       separate state objects and each farm runs its own module release.
+
+    Nothing may be left in the old shared key.
+  objectives:
+    - Use variables in backend configuration and module sources (early evaluation)
+    - Run one configuration against several state objects
+    - Pin a module release per environment
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+  setup:
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/main.tf, source: assets/main.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/make-repo.sh, source: assets/make-repo.sh, mode: "0755"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/seed.sh, source: assets/seed.sh, mode: "0755"}
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/stacks
+    - on: workstation
+      as: learner
+      timeoutSec: 240
+      run: /var/tmp/ct-seed/seed.sh
+  checks:
+    - id: two-states
+      description: The bucket holds farms/gullhaven and farms/redmoor state objects, each for its own farm and module release
+      type: shell
+      on: workstation
+      skills: [iac.opentofu.early-evaluation]
+      weight: 3
+      timeoutSec: 60
+      command: |
+        ct-s3 ensure >/dev/null 2>&1
+        for f in gullhaven redmoor; do
+          c=$(ct-s3 api GET "/saltmarsh-state/farms/$f/terraform.tfstate" | jq -r '[.resources[]? | select(.type == "local_file") | .instances[0].attributes.content | rtrimstr("\n") | gsub("\n"; ",")][0] // "none"' 2>/dev/null)
+          printf '%s=%s ' "$f" "${c:-none}"
+        done
+      expect: {match: exact, value: "gullhaven=farm=gullhaven,module=1.2.0 redmoor=farm=redmoor,module=1.1.0 "}
+    - id: shared-key-unused
+      description: Nothing is stored under the old shared key
+      type: shell
+      on: workstation
+      skills: [iac.opentofu.early-evaluation]
+      weight: 1
+      timeoutSec: 30
+      command: |
+        ct-s3 ensure >/dev/null 2>&1
+        ct-s3 api GET '/saltmarsh-state?list-type=2&prefix=farms/' | grep -o '<Key>[^<]*' | sed 's/<Key>//' | grep -vE '^farms/(gullhaven|redmoor)/terraform\.tfstate$' | tr '\n' ' ' | grep . || echo clean
+      expect: {match: exact, value: clean}
+    - id: variables-in-code
+      description: The backend key uses var.farm and the module source uses var.farm_base_ref
+      type: shell
+      on: workstation
+      skills: [iac.opentofu.early-evaluation]
+      weight: 1.5
+      command: |
+        c=$(cat /home/learner/stacks/farm/*.tf 2>/dev/null)
+        k=$(printf '%s\n' "$c" | grep -cE '^[[:space:]]*key[[:space:]]*=.*\$\{var\.farm\}')
+        s=$(printf '%s\n' "$c" | grep -cE '^[[:space:]]*source[[:space:]]*=.*\$\{var\.farm_base_ref\}')
+        echo "key=$k source=$s"
+      expect: {match: exact, value: key=1 source=1}
+    - id: farm-files
+      description: Each farm's file comes from its own module release
+      type: shell
+      on: workstation
+      skills: [iac.opentofu.early-evaluation]
+      weight: 1
+      command: |
+        for f in gullhaven redmoor; do printf '%s:%s ' "$f" "$(sed -n 's/^module=//p' /home/learner/farms/$f.conf 2>/dev/null)"; done
+      expect: {match: exact, value: "gullhaven:1.2.0 redmoor:1.1.0 "}
+    - id: converged
+      description: Planned per farm, both state objects report no changes
+      type: shell
+      on: workstation
+      skills: [iac.foundations.workflow]
+      weight: 1
+      timeoutSec: 240
+      command: |
+        tmp=$(runuser -u learner -- mktemp -d /tmp/ct-tofu-ee.XXXXXX)
+        runuser -u learner -- sh -c "cd /home/learner/stacks/farm && tar --exclude=./.terraform -cf - . | tar -xf - -C $tmp"
+        r=""
+        for f in gullhaven redmoor; do
+          ct-iac run "$tmp" sh -c "tofu init -reconfigure -input=false -no-color -var-file=farms/$f.tfvars >/dev/null 2>&1 && tofu plan -lock=false -input=false -no-color -detailed-exitcode -var-file=farms/$f.tfvars >/dev/null 2>&1"
+          case $? in 0) r="$r $f=no-changes" ;; 2) r="$r $f=changes" ;; *) r="$r $f=error" ;; esac
+        done
+        rm -rf "$tmp"; echo $r
+      expect: {match: exact, value: gullhaven=no-changes redmoor=no-changes}
+  hints:
+    - title: Early evaluation
+      body: OpenTofu evaluates variables and locals that are known at init in the backend block and in module sources. Give the value at init, for example `tofu init -var-file=farms/gullhaven.tfvars`.
+      cost: 1
+    - title: Switching farms
+      body: Changing the farm changes the backend key, so re-initialise with `tofu init -reconfigure -var-file=farms/redmoor.tfvars` (not -migrate-state, which would copy gullhaven's state over), then apply with the same var file.
+      cost: 2
+    - title: Variables in a source address
+      body: '`source = "git::file:///home/learner/git/farm-base.git?ref=${var.farm_base_ref}"`'
+      cost: 2
+  misconceptions:
+    - id: shared-key
+      description: Keeps the hard-coded key and applies both farms into it.
+      feedback: One key means one state. The second farm's apply plans to replace the first farm's objects. Put var.farm into the key so each farm has its own state object.
+      expectFail: [two-states, shared-key-unused, variables-in-code]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          cd ~/stacks/farm
+          sed -i 's|?ref=v1.1.0"|?ref=${var.farm_base_ref}"|' main.tf
+          for f in gullhaven redmoor; do
+            tofu init -reconfigure -input=false -no-color -var-file=farms/$f.tfvars >/dev/null
+            tofu apply -auto-approve -input=false -no-color -var-file=farms/$f.tfvars || true
+          done
+    - id: one-release
+      description: Keys the backend per farm but keeps the module pinned to one release.
+      feedback: A literal ref gives every farm the same module release. Use var.farm_base_ref in the source so each farm's tfvars picks its release.
+      expectFail: [two-states, variables-in-code, farm-files]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          cd ~/stacks/farm
+          sed -i 's|key *= "farms/terraform.tfstate"|key = "farms/${var.farm}/terraform.tfstate"|; s|?ref=v1.1.0"|?ref=v1.2.0"|' main.tf
+          for f in gullhaven redmoor; do
+            tofu init -reconfigure -input=false -no-color -var-file=farms/$f.tfvars >/dev/null
+            tofu apply -auto-approve -input=false -no-color -var-file=farms/$f.tfvars
+          done
+  solution:
+    explanation: |
+      OpenTofu evaluates variables (and locals built from them) that are known at
+      init time in the backend block and in module source addresses. With the key
+      `farms/${var.farm}/terraform.tfstate` and the source ref
+      `${var.farm_base_ref}`, `tofu init -reconfigure -var-file=farms/<farm>.tfvars`
+      points the working directory at that farm's state object and fetches that
+      farm's module release; apply with the same var file.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/stacks/farm
+          sed -i 's|key *= "farms/terraform.tfstate"|key = "farms/${var.farm}/terraform.tfstate"|; s|?ref=v1.1.0"|?ref=${var.farm_base_ref}"|' main.tf
+          tofu fmt >/dev/null
+          for f in gullhaven redmoor; do
+            tofu init -reconfigure -input=false -no-color -var-file=farms/$f.tfvars >/dev/null
+            tofu apply -auto-approve -input=false -no-color -var-file=farms/$f.tfvars
+          done

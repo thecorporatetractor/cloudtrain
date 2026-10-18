@@ -1,0 +1,195 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xiv-adopt-workloads-generated
+  title: Adopt running workloads with generated config
+  domain: iac
+  frameworks: [tf-advanced:lifecycle-import-drift]
+  difficulty: hard
+  estimatedMinutes: 20
+  tags: [exam, terraform, import, generate-config]
+  version: 1
+spec:
+  description: |
+    **Directory:** `~/exam/forecast-adopt` · **Cluster:** `sm-grid`
+
+    The forecast engine was deployed by hand: Deployment **`forecast-engine`**
+    and Service **`forecast-engine`** in namespace **`forecast-ops`**. Adopt
+    both into the stack with **`import` blocks** (generating the configuration
+    is the quick way), then clean the result before you apply:
+
+    - the resource blocks live in **`forecast.tf`**; no file may still carry
+      the `__generated__` marker comment;
+    - no argument may be set to `null` (delete such lines), and anything the
+      provider rejects must be fixed (generated configuration is a draft, not
+      always valid);
+    - the objects must not be recreated, and the Deployment keeps its replica
+      count and image.
+
+    Apply; the following plan must be empty.
+  objectives:
+    - Generate configuration for imported objects
+    - Turn generated configuration into maintainable code
+  params:
+    replicas: {type: int, min: 2, max: 3}
+    port:
+      type: choice
+      values: ["8080", "8088", "9000"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+      - name: sm-grid
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: sm-grid
+  setup:
+    - on: sm-grid
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata:
+          name: forecast-ops
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: forecast-engine
+          namespace: forecast-ops
+          labels: {app: forecast-engine, saltmarsh.example/team: forecasting}
+        spec:
+          replicas: {{replicas}}
+          selector:
+            matchLabels: {app: forecast-engine}
+          template:
+            metadata:
+              labels: {app: forecast-engine}
+            spec:
+              containers:
+                - name: engine
+                  image: httpd:2.4-alpine
+                  ports:
+                    - containerPort: 80
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: forecast-engine
+          namespace: forecast-ops
+          labels: {app: forecast-engine}
+        spec:
+          selector: {app: forecast-engine}
+          ports:
+            - name: http
+              port: {{port}}
+              targetPort: 80
+    - on: sm-grid
+      run: |
+        set -eu
+        kubectl -n kube-system get configmap ct-xiv-adopt >/dev/null 2>&1 && exit 0
+        kubectl -n kube-system create configmap ct-xiv-adopt \
+          --from-literal=deploy=$(kubectl -n forecast-ops get deployment forecast-engine -o jsonpath='{.metadata.uid}') \
+          --from-literal=svc=$(kubectl -n forecast-ops get service forecast-engine -o jsonpath='{.metadata.uid}')
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xiv-adopt-workloads-generated/stack/providers.tf, source: assets/stack/providers.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xiv-adopt-workloads-generated/seed.sh, source: assets/seed.sh, mode: "0755"}
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/exam
+    - on: workstation
+      as: learner
+      timeoutSec: 120
+      run: /var/tmp/ct-seed/xiv-adopt-workloads-generated/seed.sh xiv-adopt-workloads-generated forecast-adopt init
+  teardown:
+    - on: sm-grid
+      run: kubectl delete namespace forecast-ops --ignore-not-found --wait=false
+  checks:
+    - id: in-state
+      description: The Deployment and the Service are managed in the stack's state
+      type: shell
+      on: workstation
+      skills: [iac.state.import]
+      weight: 2
+      timeoutSec: 60
+      command: |
+        ct-iac state /home/learner/exam/forecast-adopt | jq -r '[.values.root_module.resources[]? | select(.mode == "managed") | "\(.type | sub("_v1$"; "")):\(.values.metadata[0].name)"] | sort | join(" ")' 2>/dev/null
+      expect: {match: exact, value: "kubernetes_deployment:forecast-engine kubernetes_service:forecast-engine"}
+    - id: objects-kept
+      description: Both objects are the originals and the Deployment keeps replicas and image
+      type: shell
+      on: sm-grid
+      skills: [iac.state.import]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        b() { kubectl -n kube-system get configmap ct-xiv-adopt -o jsonpath="{.data.$1}"; }
+        d=$(kubectl -n forecast-ops get deployment forecast-engine -o jsonpath='{.metadata.uid}' 2>/dev/null)
+        s=$(kubectl -n forecast-ops get service forecast-engine -o jsonpath='{.metadata.uid}' 2>/dev/null)
+        [ -n "$d" ] && [ "$d" = "$(b deploy)" ] && d=same || d=new
+        [ -n "$s" ] && [ "$s" = "$(b svc)" ] && s=same || s=new
+        spec=$(kubectl -n forecast-ops get deployment forecast-engine -o jsonpath='{.spec.replicas}:{.spec.template.spec.containers[0].image}' 2>/dev/null)
+        echo "deployment=$d service=$s spec=$spec"
+      expect: {match: exact, value: "deployment=same service=same spec={{replicas}}:httpd:2.4-alpine"}
+    - id: cleaned
+      description: The resources are in forecast.tf, with no generated marker and no null arguments
+      type: shell
+      on: workstation
+      skills: [iac.state.import]
+      weight: 2
+      command: |
+        d=/home/learner/exam/forecast-adopt
+        r=$(grep -cE '^[[:space:]]*resource[[:space:]]+"kubernetes_(deployment|service)(_v1)?"' $d/forecast.tf 2>/dev/null || echo 0)
+        g=$(cat $d/*.tf 2>/dev/null | grep -c '__generated__')
+        n=$(cat $d/*.tf 2>/dev/null | grep -cE '=[[:space:]]*null[[:space:]]*$')
+        echo "resources_in_forecast_tf=$r generated_markers=$g null_args=$n"
+      expect: {match: exact, value: resources_in_forecast_tf=2 generated_markers=0 null_args=0}
+    - id: import-blocks
+      description: The adoption is declared with import blocks
+      type: shell
+      on: workstation
+      skills: [iac.state.import]
+      weight: 0.5
+      command: cat /home/learner/exam/forecast-adopt/*.tf 2>/dev/null | grep -cE '^[[:space:]]*import[[:space:]]*\{' || true
+      expect: {match: regex, value: '^[2-9]$'}
+    - id: converged
+      description: A new plan of ~/exam/forecast-adopt reports no changes
+      type: shell
+      on: workstation
+      skills: [iac.state.import]
+      weight: 1.5
+      timeoutSec: 120
+      command: ct-iac plan /home/learner/exam/forecast-adopt
+      expect: {match: exact, value: no-changes}
+  misconceptions:
+    - id: generated-as-is
+      description: Applies the generated file without cleaning it.
+      feedback: Generated configuration is a starting point, here not even a valid one (zero values such as host_port = 0 or active_deadline_seconds = 0 are rejected). Move it into forecast.tf, drop the marker comment, every argument set to null and the invalid zeros, then plan again.
+      expectFail: [in-state, cleaned, converged]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          cd ~/exam/forecast-adopt
+          printf 'import {\n  to = kubernetes_deployment_v1.forecast\n  id = "forecast-ops/forecast-engine"\n}\n\nimport {\n  to = kubernetes_service_v1.forecast\n  id = "forecast-ops/forecast-engine"\n}\n' > imports.tf
+          iac plan -input=false -no-color -generate-config-out=generated.tf >/dev/null || true
+          iac apply -auto-approve -input=false -no-color || true
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/exam/forecast-adopt
+          printf 'import {\n  to = kubernetes_deployment_v1.forecast\n  id = "forecast-ops/forecast-engine"\n}\n\nimport {\n  to = kubernetes_service_v1.forecast\n  id = "forecast-ops/forecast-engine"\n}\n' > imports.tf
+          iac plan -input=false -no-color -generate-config-out=generated.tf >/dev/null || true
+          grep -v '__generated__' generated.tf | grep -vE '=[[:space:]]*null[[:space:]]*$' | grep -vE '^[[:space:]]*[a-z_]+[[:space:]]*=[[:space:]]*0[[:space:]]*$' > forecast.tf
+          rm generated.tf
+          iac fmt forecast.tf >/dev/null
+          iac apply -auto-approve -input=false -no-color

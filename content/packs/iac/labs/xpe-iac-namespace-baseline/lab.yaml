@@ -1,0 +1,375 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xpe-iac-namespace-baseline
+  title: Provision tenant namespaces with a reusable module
+  domain: iac
+  frameworks: [ct-platform:iac-provisioning]
+  difficulty: hard
+  estimatedMinutes: 25
+  tags: [exam, capstone, terraform, modules, for_each, s3-backend, resourcequota, networkpolicy]
+  version: 1
+spec:
+  description: |
+    **Directory:** `~/exam/tenant-baseline` · **Cluster:** `qm-tenants`
+
+    Quillmoor's platform team onboards tenant teams with Terraform. The stack
+    has a provider block and `local.teams` (the three teams and their quotas).
+
+    1. Write a local module **`modules/tenant`** that creates, for one team:
+       - namespace **`tenant-<team>`** labelled `quillmoor.example/team=<team>`;
+       - a ResourceQuota **`baseline`** with hard limits `requests.cpu`,
+         `requests.memory` and `pods` from the team's values;
+       - a NetworkPolicy **`default-deny`** that selects every Pod and denies
+         all ingress and egress.
+    2. Call it **once with `for_each`** over `local.teams`.
+    3. Keep state in the workstation's S3 store with locking: bucket
+       **`qm-tfstate`** (exists), key **`tenants/terraform.tfstate`**,
+       `use_lockfile = true`, and these connection settings:
+
+       ```hcl
+       region                      = "us-east-1"
+       endpoints                   = { s3 = "http://127.0.0.1:8333" }
+       use_path_style              = true
+       skip_credentials_validation = true
+       skip_region_validation      = true
+       skip_requesting_account_id  = true
+       skip_metadata_api_check     = true
+       ```
+
+    Apply; the following plan must report no changes and no state file may be
+    left in the directory.
+  objectives:
+    - Write a reusable module and instantiate it with for_each
+    - Baseline tenant namespaces with quotas and default-deny policies
+    - Keep state in an S3 backend with lock-file locking
+  params:
+    dcpu:
+      type: choice
+      values: ["4", "6"]
+    dmem: {type: int, min: 6, max: 12}
+    fcpu:
+      type: choice
+      values: ["3", "5"]
+    fpods: {type: int, min: 15, max: 40}
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+      - name: qm-tenants
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: qm-tenants
+  setup:
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xpe-iac-namespace-baseline/stack/providers.tf, source: assets/stack/providers.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xpe-iac-namespace-baseline/stack/teams.tf, source: assets/stack/teams.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xpe-iac-namespace-baseline/prepare.sh, source: assets/prepare.sh, mode: "0755"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xpe-iac-namespace-baseline/seed.sh, source: assets/seed.sh, mode: "0755"}
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/exam
+    - on: workstation
+      as: learner
+      timeoutSec: 180
+      run: /var/tmp/ct-seed/xpe-iac-namespace-baseline/prepare.sh
+    - on: workstation
+      as: learner
+      timeoutSec: 60
+      run: /var/tmp/ct-seed/xpe-iac-namespace-baseline/seed.sh xpe-iac-namespace-baseline tenant-baseline none
+  teardown:
+    - on: qm-tenants
+      run: kubectl delete namespace tenant-dispatch tenant-customs tenant-fleet --ignore-not-found --wait=false
+  checks:
+    - id: quotas
+      description: Each tenant namespace has the baseline quota with the team's values
+      type: shell
+      on: qm-tenants
+      skills: [k8s.workloads.quotas-limitranges]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        for t in dispatch customs fleet; do
+          q=$(kubectl -n tenant-$t get resourcequota baseline -o jsonpath='{.spec.hard.requests\.cpu}/{.spec.hard.requests\.memory}/{.spec.hard.pods}' 2>/dev/null)
+          l=$(kubectl get namespace tenant-$t -o jsonpath='{.metadata.labels.quillmoor\.example/team}' 2>/dev/null)
+          printf '%s=%s[%s] ' "$t" "${q:-none}" "${l:-nolabel}"
+        done
+      expect: {match: exact, value: "dispatch={{dcpu}}/{{dmem}}Gi/20[dispatch] customs=2/4Gi/10[customs] fleet={{fcpu}}/8Gi/{{fpods}}[fleet] "}
+    - id: default-deny
+      description: Each tenant namespace has a default-deny policy for all Pods, ingress and egress
+      type: shell
+      on: qm-tenants
+      skills: [k8s.security.netpol-default-deny]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        for t in dispatch customs fleet; do
+          kubectl -n tenant-$t get networkpolicy default-deny -o json 2>/dev/null | jq -r --arg t "$t" '
+            "\($t)=" + (if ((.spec.podSelector // {}) | (.matchLabels // {} | length) == 0 and (.matchExpressions // [] | length) == 0)
+              and ((.spec.policyTypes // []) | sort) == ["Egress", "Ingress"]
+              and ((.spec.ingress // []) | length) == 0 and ((.spec.egress // []) | length) == 0
+              then "deny" else "open" end)' || true
+        done | tr '\n' ' '
+      expect: {match: exact, value: "dispatch=deny customs=deny fleet=deny "}
+    - id: module-for-each
+      description: The resources come from modules/tenant called once with for_each
+      type: shell
+      on: workstation
+      skills: [iac.modules.authoring]
+      weight: 2
+      timeoutSec: 60
+      command: |
+        d=/home/learner/exam/tenant-baseline
+        m=$(cat $d/*.tf 2>/dev/null | grep -cE '^[[:space:]]*module[[:space:]]+"')
+        a=$(ct-iac state $d | jq -r '[.values.root_module.child_modules[]? | "\(.address)=\([.resources[]? | select(.mode == "managed")] | length)"] | sort | join(" ")' 2>/dev/null)
+        r=$(ct-iac state $d | jq '[.values.root_module.resources[]? | select(.mode == "managed")] | length' 2>/dev/null)
+        echo "module_blocks=$m root=${r:-?} $a"
+      expect: {match: regex, value: '^module_blocks=1 root=0 module\.[a-z_]+\["customs"\]=3 module\.[a-z_]+\["dispatch"\]=3 module\.[a-z_]+\["fleet"\]=3$'}
+    - id: s3-state
+      description: State lives in qm-tfstate/tenants/terraform.tfstate with use_lockfile, and no local state remains
+      type: shell
+      on: workstation
+      skills: [iac.state.locking]
+      weight: 2
+      timeoutSec: 60
+      command: |
+        d=/home/learner/exam/tenant-baseline
+        b=$(jq -r '"\(.backend.type):\(.backend.config.bucket):\(.backend.config.key):\(.backend.config.use_lockfile)"' $d/.terraform/terraform.tfstate 2>/dev/null)
+        ct-s3 ensure >/dev/null 2>&1
+        n=$(ct-s3 api GET '/qm-tfstate/tenants/terraform.tfstate' 2>/dev/null | jq '[.resources[]? | select(.mode == "managed") | .instances | length] | add // 0' 2>/dev/null)
+        l=$(ls $d/terraform.tfstate $d/terraform.tfstate.backup 2>/dev/null | wc -l)
+        echo "backend=${b:-none} remote_instances=${n:-0} local_files=$l"
+      expect: {match: exact, value: "backend=s3:qm-tfstate:tenants/terraform.tfstate:true remote_instances=9 local_files=0"}
+    - id: converged
+      description: A new plan of ~/exam/tenant-baseline reports no changes
+      type: shell
+      on: workstation
+      skills: [iac.modules.authoring]
+      weight: 1
+      timeoutSec: 120
+      command: ct-iac plan /home/learner/exam/tenant-baseline
+      expect: {match: exact, value: no-changes}
+  misconceptions:
+    - id: ingress-only-deny
+      description: The default-deny policy only lists Ingress, so egress stays open.
+      feedback: A policy that names only Ingress leaves egress unrestricted. Set policy_types = ["Ingress", "Egress"] with no rules.
+      expectFail: [default-deny]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 400
+        run: |
+          set -e
+          cd ~/exam/tenant-baseline
+          mkdir -p modules/tenant
+          cat > modules/tenant/main.tf <<'HCL'
+          variable "team" {
+            type = string
+          }
+
+          variable "quota" {
+            type = object({ cpu = string, memory = string, pods = number })
+          }
+
+          resource "kubernetes_namespace_v1" "this" {
+            metadata {
+              name   = "tenant-${var.team}"
+              labels = { "quillmoor.example/team" = var.team }
+            }
+          }
+
+          resource "kubernetes_resource_quota_v1" "baseline" {
+            metadata {
+              name      = "baseline"
+              namespace = kubernetes_namespace_v1.this.metadata[0].name
+            }
+            spec {
+              hard = {
+                "requests.cpu"    = var.quota.cpu
+                "requests.memory" = var.quota.memory
+                pods              = tostring(var.quota.pods)
+              }
+            }
+          }
+
+          resource "kubernetes_network_policy_v1" "default_deny" {
+            metadata {
+              name      = "default-deny"
+              namespace = kubernetes_namespace_v1.this.metadata[0].name
+            }
+            spec {
+              pod_selector {}
+              policy_types = ["Ingress"]
+            }
+          }
+          HCL
+          cat > main.tf <<'HCL'
+          terraform {
+            backend "s3" {
+              bucket                      = "qm-tfstate"
+              key                         = "tenants/terraform.tfstate"
+              use_lockfile                = true
+              region                      = "us-east-1"
+              endpoints                   = { s3 = "http://127.0.0.1:8333" }
+              use_path_style              = true
+              skip_credentials_validation = true
+              skip_region_validation      = true
+              skip_requesting_account_id  = true
+              skip_metadata_api_check     = true
+            }
+          }
+
+          module "tenant" {
+            source   = "./modules/tenant"
+            for_each = local.teams
+            team     = each.key
+            quota    = each.value
+          }
+          HCL
+          iac init -input=false -no-color >/dev/null
+          iac apply -auto-approve -input=false -no-color
+    - id: local-state
+      description: Builds everything right but keeps local state.
+      feedback: Without the S3 backend the state stays on this workstation and nobody else can lock or read it. Add the backend block and run init (with -migrate-state if you applied first).
+      expectFail: [s3-state]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 400
+        run: |
+          set -e
+          cd ~/exam/tenant-baseline
+          mkdir -p modules/tenant
+          cat > modules/tenant/main.tf <<'HCL'
+          variable "team" {
+            type = string
+          }
+
+          variable "quota" {
+            type = object({ cpu = string, memory = string, pods = number })
+          }
+
+          resource "kubernetes_namespace_v1" "this" {
+            metadata {
+              name   = "tenant-${var.team}"
+              labels = { "quillmoor.example/team" = var.team }
+            }
+          }
+
+          resource "kubernetes_resource_quota_v1" "baseline" {
+            metadata {
+              name      = "baseline"
+              namespace = kubernetes_namespace_v1.this.metadata[0].name
+            }
+            spec {
+              hard = {
+                "requests.cpu"    = var.quota.cpu
+                "requests.memory" = var.quota.memory
+                pods              = tostring(var.quota.pods)
+              }
+            }
+          }
+
+          resource "kubernetes_network_policy_v1" "default_deny" {
+            metadata {
+              name      = "default-deny"
+              namespace = kubernetes_namespace_v1.this.metadata[0].name
+            }
+            spec {
+              pod_selector {}
+              policy_types = ["Ingress", "Egress"]
+            }
+          }
+          HCL
+          cat > main.tf <<'HCL'
+          module "tenant" {
+            source   = "./modules/tenant"
+            for_each = local.teams
+            team     = each.key
+            quota    = each.value
+          }
+          HCL
+          iac init -input=false -no-color >/dev/null
+          iac apply -auto-approve -input=false -no-color
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 400
+        run: |
+          set -e
+          cd ~/exam/tenant-baseline
+          mkdir -p modules/tenant
+          cat > modules/tenant/main.tf <<'HCL'
+          variable "team" {
+            type = string
+          }
+
+          variable "quota" {
+            type = object({ cpu = string, memory = string, pods = number })
+          }
+
+          resource "kubernetes_namespace_v1" "this" {
+            metadata {
+              name   = "tenant-${var.team}"
+              labels = { "quillmoor.example/team" = var.team }
+            }
+          }
+
+          resource "kubernetes_resource_quota_v1" "baseline" {
+            metadata {
+              name      = "baseline"
+              namespace = kubernetes_namespace_v1.this.metadata[0].name
+            }
+            spec {
+              hard = {
+                "requests.cpu"    = var.quota.cpu
+                "requests.memory" = var.quota.memory
+                pods              = tostring(var.quota.pods)
+              }
+            }
+          }
+
+          resource "kubernetes_network_policy_v1" "default_deny" {
+            metadata {
+              name      = "default-deny"
+              namespace = kubernetes_namespace_v1.this.metadata[0].name
+            }
+            spec {
+              pod_selector {}
+              policy_types = ["Ingress", "Egress"]
+            }
+          }
+          HCL
+          cat > main.tf <<'HCL'
+          terraform {
+            backend "s3" {
+              bucket                      = "qm-tfstate"
+              key                         = "tenants/terraform.tfstate"
+              use_lockfile                = true
+              region                      = "us-east-1"
+              endpoints                   = { s3 = "http://127.0.0.1:8333" }
+              use_path_style              = true
+              skip_credentials_validation = true
+              skip_region_validation      = true
+              skip_requesting_account_id  = true
+              skip_metadata_api_check     = true
+            }
+          }
+
+          module "tenant" {
+            source   = "./modules/tenant"
+            for_each = local.teams
+            team     = each.key
+            quota    = each.value
+          }
+          HCL
+          iac init -input=false -no-color >/dev/null
+          iac apply -auto-approve -input=false -no-color

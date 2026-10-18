@@ -1,0 +1,490 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: tofu-state-encryption-pbkdf2
+  title: Encrypt state and plans, then rotate the key
+  domain: iac
+  frameworks: [opentofu:encryption]
+  difficulty: hard
+  estimatedMinutes: 35
+  tags: [opentofu, state-encryption, pbkdf2, key-rotation, s3]
+  version: 1
+spec:
+  description: |
+    The trading stack in `~/stacks/trading` (OpenTofu, S3 backend
+    `saltmarsh-state`, key `trading/terraform.tfstate`) keeps the pricing API
+    key in **plaintext state**. Turn on OpenTofu's state and plan encryption
+    (`tofu`; Terraform has no equivalent), in two stages, without replacing
+    any resource:
+
+    1. **Passphrase.** Encrypt state and plans with an `aes_gcm` method keyed
+       by a **`pbkdf2`** key provider whose passphrase is read from
+       `~/.config/saltmarsh/trading.passphrase` (never paste it into code).
+       Migrate the existing plaintext state with an `unencrypted` **fallback**,
+       apply, then remove the fallback.
+    2. **Rotate** to the desk's key agent `~/bin/sm-keyagent`, an OpenTofu
+       **`external`** key provider. Keep the passphrase method only as the
+       fallback that lets OpenTofu read the current state once, apply, then
+       remove the passphrase key provider and every fallback so only the
+       agent's key is configured.
+    3. Prove the rotation: try to read the current state with a configuration
+       that only knows the **old passphrase** (for example a copy of the stack
+       in a scratch directory) and save that attempt's full output in
+       **`~/reports/old-passphrase.txt`**. Finally save an encrypted plan as
+       **`~/reports/trading.tfplan`** (`tofu plan -out=...`).
+
+    Finish with a `tofu plan` that reports no changes.
+  objectives:
+    - Encrypt OpenTofu state and plan files with a pbkdf2 key provider
+    - Migrate plaintext state with a fallback method
+    - Rotate keys to an external key provider and retire the old key
+  params:
+    pass:
+      type: choice
+      values: [tidal-ledger-cobalt-71, offshore-quarter-amber-38, gull-spread-hedge-wire-55]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+  setup:
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/main.tf, source: assets/main.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/sm-keyagent, source: assets/sm-keyagent, mode: "0755"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/seed.sh, source: assets/seed.sh, mode: "0755"}
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/stacks
+    - on: workstation
+      as: learner
+      timeoutSec: 240
+      run: /var/tmp/ct-seed/seed.sh
+  checks:
+    - id: state-encrypted
+      description: The state object in the bucket is encrypted
+      type: shell
+      on: workstation
+      skills: [iac.opentofu.encryption]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        ct-s3 ensure >/dev/null 2>&1
+        ct-s3 api GET '/saltmarsh-state/trading/terraform.tfstate' | jq -r 'if (.encrypted_data // "") != "" and (has("resources") | not) then "encrypted" else "plaintext" end' 2>/dev/null || echo unreadable
+      expect: {match: exact, value: encrypted}
+    - id: agent-key
+      description: The current state is encrypted with the external key agent's key only
+      type: shell
+      on: workstation
+      skills: [iac.opentofu.encryption]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        ct-s3 ensure >/dev/null 2>&1
+        ct-s3 api GET '/saltmarsh-state/trading/terraform.tfstate' | jq -r '(.meta // {}) | keys | join(",")' 2>/dev/null || echo none
+      expect: {match: regex, value: '^key_provider\.external\.[A-Za-z0-9_-]+$'}
+    - id: old-passphrase-refused
+      description: A configuration that only knows the old passphrase cannot read the current state
+      type: shell
+      on: workstation
+      skills: [iac.opentofu.encryption]
+      weight: 1.5
+      timeoutSec: 150
+      command: |
+        tmp=$(runuser -u learner -- mktemp -d /tmp/ct-tofu-enc.XXXXXX)
+        runuser -u learner -- cp /var/tmp/ct-seed/main.tf "$tmp/main.tf"
+        runuser -u learner -- sh -c "cat > $tmp/enc.tf" <<'HCL'
+        terraform {
+          encryption {
+            key_provider "pbkdf2" "passphrase" {
+              passphrase = trimspace(file("/home/learner/.config/saltmarsh/trading.passphrase"))
+            }
+            method "aes_gcm" "passphrase" {
+              keys = key_provider.pbkdf2.passphrase
+            }
+            state {
+              method = method.aes_gcm.passphrase
+            }
+            plan {
+              method = method.aes_gcm.passphrase
+            }
+          }
+        }
+        HCL
+        ct-iac run "$tmp" sh -c 'tofu init -input=false -no-color >/dev/null 2>&1 && tofu show -json -no-color >/dev/null 2>&1' && r=readable || r=refused
+        rm -rf "$tmp"; echo $r
+      expect: {match: exact, value: refused}
+    - id: proof-saved
+      description: ~/reports/old-passphrase.txt shows the failed decryption with the old passphrase
+      type: shell
+      on: workstation
+      skills: [iac.opentofu.encryption]
+      weight: 1
+      command: grep -qiE 'decrypt' /home/learner/reports/old-passphrase.txt 2>/dev/null && echo proven || echo missing
+      expect: {match: exact, value: proven}
+    - id: only-agent-configured
+      description: The configuration keeps no fallback, no unencrypted method and no passphrase key provider
+      type: shell
+      on: workstation
+      skills: [iac.opentofu.encryption]
+      weight: 1.5
+      command: |
+        c=$(cat /home/learner/stacks/trading/*.tf 2>/dev/null)
+        f=$(printf '%s\n' "$c" | grep -cE '^[[:space:]]*fallback[[:space:]]*\{')
+        u=$(printf '%s\n' "$c" | grep -cE '"unencrypted"')
+        p=$(printf '%s\n' "$c" | grep -cE 'key_provider[[:space:]]+"pbkdf2"')
+        x=$(printf '%s\n' "$c" | grep -cE 'key_provider[[:space:]]+"external"')
+        l=$(printf '%s\n' "$c" | grep -c '{{pass}}')
+        echo "fallback=$f unencrypted=$u pbkdf2=$p external=$x literal_passphrase=$l"
+      expect: {match: exact, value: fallback=0 unencrypted=0 pbkdf2=0 external=1 literal_passphrase=0}
+    - id: plan-encrypted
+      description: ~/reports/trading.tfplan is a plan encrypted with the agent's key
+      type: shell
+      on: workstation
+      skills: [iac.opentofu.encryption]
+      weight: 1
+      command: |
+        f=/home/learner/reports/trading.tfplan
+        [ -s $f ] || { echo missing; exit 0; }
+        head -c 2 $f | grep -q PK && { echo plaintext; exit 0; }
+        jq -r '(.meta // {}) | keys | join(",")' $f 2>/dev/null || echo unreadable
+      expect: {match: regex, value: '^key_provider\.external\.[A-Za-z0-9_-]+$'}
+    - id: nothing-replaced
+      description: The trading desk keeps its original pet name (nothing was replaced)
+      type: shell
+      on: workstation
+      skills: [iac.opentofu.encryption]
+      weight: 1
+      timeoutSec: 90
+      command: |
+        p=$(ct-iac run /home/learner/stacks/trading sh -c 'tofu show -json -no-color 2>/dev/null' | jq -r '.values.root_module.resources[]? | select(.type == "random_pet") | .values.id' 2>/dev/null)
+        [ -n "$p" ] && [ "$p" = "$(cat /home/learner/stacks/trading/.ct-seeded 2>/dev/null)" ] && echo same || echo "pet=${p:-unreadable}"
+      expect: {match: exact, value: same}
+    - id: converged
+      description: A new tofu plan of ~/stacks/trading reports no changes
+      type: shell
+      on: workstation
+      skills: [iac.foundations.workflow]
+      weight: 1
+      timeoutSec: 120
+      command: |
+        ct-iac run /home/learner/stacks/trading sh -c 'tofu plan -lock=false -input=false -no-color -detailed-exitcode >/dev/null 2>&1'
+        case $? in 0) echo no-changes ;; 2) echo changes ;; *) echo error ;; esac
+      expect: {match: exact, value: no-changes}
+  hints:
+    - title: The encryption block
+      body: |
+        It lives in the `terraform {}` block (any .tf file):
+        ```hcl
+        terraform {
+          encryption {
+            key_provider "pbkdf2" "passphrase" {
+              passphrase = trimspace(file("/home/learner/.config/saltmarsh/trading.passphrase"))
+            }
+            method "aes_gcm" "passphrase" {
+              keys = key_provider.pbkdf2.passphrase
+            }
+            method "unencrypted" "migrate" {}
+            state {
+              method = method.aes_gcm.passphrase
+              fallback {
+                method = method.unencrypted.migrate
+              }
+            }
+          }
+        }
+        ```
+        Add a `plan {}` block the same way. `tofu apply` then writes the state encrypted.
+      cost: 2
+    - title: External key provider
+      body: '`key_provider "external" "agent" { command = ["/home/learner/bin/sm-keyagent"] }` and a second `aes_gcm` method using it. Make it the state method and the passphrase method its fallback for one apply.'
+      cost: 1
+    - title: Reading with the old passphrase only
+      body: Copy main.tf into an empty directory, add an encryption block with only the pbkdf2 provider and its method (no fallback), and run `tofu init` and `tofu show` there, saving the output with `> ~/reports/old-passphrase.txt 2>&1`.
+      cost: 1
+  misconceptions:
+    - id: no-fallback
+      description: Turns on encryption without an unencrypted fallback.
+      feedback: The existing state is plaintext. Without `fallback { method = method.unencrypted.migrate }` OpenTofu refuses to read it, so nothing gets encrypted.
+      expectFail: [state-encrypted, agent-key]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          cd ~/stacks/trading
+          cat > enc.tf <<'HCL'
+          terraform {
+            encryption {
+              key_provider "pbkdf2" "passphrase" {
+                passphrase = trimspace(file("/home/learner/.config/saltmarsh/trading.passphrase"))
+              }
+              method "aes_gcm" "passphrase" {
+                keys = key_provider.pbkdf2.passphrase
+              }
+              state {
+                method = method.aes_gcm.passphrase
+              }
+              plan {
+                method = method.aes_gcm.passphrase
+              }
+            }
+          }
+          HCL
+          tofu apply -auto-approve -input=false -no-color || true
+    - id: passphrase-only
+      description: Stops after the passphrase stage and never rotates.
+      feedback: The passphrase still decrypts the state, so the rotation never happened. Add the external key provider, make it the state and plan method with the passphrase as a one-time fallback, apply, then remove the passphrase.
+      expectFail: [agent-key, old-passphrase-refused, only-agent-configured, plan-encrypted]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          cd ~/stacks/trading
+          cat > enc.tf <<'HCL'
+          terraform {
+            encryption {
+              key_provider "pbkdf2" "passphrase" {
+                passphrase = trimspace(file("/home/learner/.config/saltmarsh/trading.passphrase"))
+              }
+              method "aes_gcm" "passphrase" {
+                keys = key_provider.pbkdf2.passphrase
+              }
+              method "unencrypted" "migrate" {}
+              state {
+                method = method.aes_gcm.passphrase
+                fallback {
+                  method = method.unencrypted.migrate
+                }
+              }
+              plan {
+                method = method.aes_gcm.passphrase
+                fallback {
+                  method = method.unencrypted.migrate
+                }
+              }
+            }
+          }
+          HCL
+          tofu apply -auto-approve -input=false -no-color
+          cat > enc.tf <<'HCL'
+          terraform {
+            encryption {
+              key_provider "pbkdf2" "passphrase" {
+                passphrase = trimspace(file("/home/learner/.config/saltmarsh/trading.passphrase"))
+              }
+              method "aes_gcm" "passphrase" {
+                keys = key_provider.pbkdf2.passphrase
+              }
+              state {
+                method = method.aes_gcm.passphrase
+              }
+              plan {
+                method = method.aes_gcm.passphrase
+              }
+            }
+          }
+          HCL
+          tofu plan -input=false -no-color -out=/home/learner/reports/trading.tfplan
+    - id: fallback-left
+      description: Rotates to the agent but leaves the passphrase fallback configured.
+      feedback: A fallback that stays in the configuration keeps the old key in use for reading. Remove the passphrase provider and every fallback once the state is rewritten.
+      expectFail: [only-agent-configured]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 400
+        run: |
+          cd ~/stacks/trading
+          cat > enc.tf <<'HCL'
+          terraform {
+            encryption {
+              key_provider "pbkdf2" "passphrase" {
+                passphrase = trimspace(file("/home/learner/.config/saltmarsh/trading.passphrase"))
+              }
+              method "aes_gcm" "passphrase" {
+                keys = key_provider.pbkdf2.passphrase
+              }
+              method "unencrypted" "migrate" {}
+              state {
+                method = method.aes_gcm.passphrase
+                fallback {
+                  method = method.unencrypted.migrate
+                }
+              }
+              plan {
+                method = method.aes_gcm.passphrase
+                fallback {
+                  method = method.unencrypted.migrate
+                }
+              }
+            }
+          }
+          HCL
+          tofu apply -auto-approve -input=false -no-color
+          cat > enc.tf <<'HCL'
+          terraform {
+            encryption {
+              key_provider "pbkdf2" "passphrase" {
+                passphrase = trimspace(file("/home/learner/.config/saltmarsh/trading.passphrase"))
+              }
+              key_provider "external" "agent" {
+                command = ["/home/learner/bin/sm-keyagent"]
+              }
+              method "aes_gcm" "passphrase" {
+                keys = key_provider.pbkdf2.passphrase
+              }
+              method "aes_gcm" "agent" {
+                keys = key_provider.external.agent
+              }
+              state {
+                method = method.aes_gcm.agent
+                fallback {
+                  method = method.aes_gcm.passphrase
+                }
+              }
+              plan {
+                method = method.aes_gcm.agent
+              }
+            }
+          }
+          HCL
+          tofu apply -auto-approve -input=false -no-color
+          tofu plan -input=false -no-color -out=/home/learner/reports/trading.tfplan
+          mkdir -p ~/scratch/oldkey && cp main.tf ~/scratch/oldkey/
+          cat > ~/scratch/oldkey/enc.tf <<'HCL'
+          terraform {
+            encryption {
+              key_provider "pbkdf2" "passphrase" {
+                passphrase = trimspace(file("/home/learner/.config/saltmarsh/trading.passphrase"))
+              }
+              method "aes_gcm" "passphrase" {
+                keys = key_provider.pbkdf2.passphrase
+              }
+              state {
+                method = method.aes_gcm.passphrase
+              }
+              plan {
+                method = method.aes_gcm.passphrase
+              }
+            }
+          }
+          HCL
+          cd ~/scratch/oldkey && { tofu init -input=false -no-color && tofu show -no-color; } > ~/reports/old-passphrase.txt 2>&1 || true
+  solution:
+    explanation: |
+      An `encryption` block with a `pbkdf2` key provider and an `aes_gcm` method
+      encrypts everything OpenTofu writes; the `unencrypted` fallback lets it read
+      the plaintext state once, and the next apply writes it encrypted. Rotation
+      works the same way: the new `external` key provider becomes the method and
+      the old passphrase method the fallback, one apply rewrites the state with the
+      agent's key, and removing the passphrase provider retires it. `enforced =
+      true` makes OpenTofu refuse to write unencrypted data even if someone adds an
+      unencrypted method later. Note that the bucket's older object versions still
+      hold the plaintext and passphrase-encrypted states; a real rotation deletes
+      them too.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 400
+        run: |
+          set -e
+          cd ~/stacks/trading
+          cat > enc.tf <<'HCL'
+          terraform {
+            encryption {
+              key_provider "pbkdf2" "passphrase" {
+                passphrase = trimspace(file("/home/learner/.config/saltmarsh/trading.passphrase"))
+              }
+              method "aes_gcm" "passphrase" {
+                keys = key_provider.pbkdf2.passphrase
+              }
+              method "unencrypted" "migrate" {}
+              state {
+                method = method.aes_gcm.passphrase
+                fallback {
+                  method = method.unencrypted.migrate
+                }
+              }
+              plan {
+                method = method.aes_gcm.passphrase
+                fallback {
+                  method = method.unencrypted.migrate
+                }
+              }
+            }
+          }
+          HCL
+          tofu apply -auto-approve -input=false -no-color
+          cat > enc.tf <<'HCL'
+          terraform {
+            encryption {
+              key_provider "pbkdf2" "passphrase" {
+                passphrase = trimspace(file("/home/learner/.config/saltmarsh/trading.passphrase"))
+              }
+              key_provider "external" "agent" {
+                command = ["/home/learner/bin/sm-keyagent"]
+              }
+              method "aes_gcm" "passphrase" {
+                keys = key_provider.pbkdf2.passphrase
+              }
+              method "aes_gcm" "agent" {
+                keys = key_provider.external.agent
+              }
+              state {
+                method = method.aes_gcm.agent
+                fallback {
+                  method = method.aes_gcm.passphrase
+                }
+              }
+              plan {
+                method = method.aes_gcm.agent
+              }
+            }
+          }
+          HCL
+          tofu apply -auto-approve -input=false -no-color
+          cat > enc.tf <<'HCL'
+          terraform {
+            encryption {
+              key_provider "external" "agent" {
+                command = ["/home/learner/bin/sm-keyagent"]
+              }
+              method "aes_gcm" "agent" {
+                keys = key_provider.external.agent
+              }
+              state {
+                method   = method.aes_gcm.agent
+                enforced = true
+              }
+              plan {
+                method   = method.aes_gcm.agent
+                enforced = true
+              }
+            }
+          }
+          HCL
+          tofu plan -input=false -no-color -out=/home/learner/reports/trading.tfplan
+          mkdir -p ~/scratch/oldkey && cp main.tf ~/scratch/oldkey/
+          cat > ~/scratch/oldkey/enc.tf <<'HCL'
+          terraform {
+            encryption {
+              key_provider "pbkdf2" "passphrase" {
+                passphrase = trimspace(file("/home/learner/.config/saltmarsh/trading.passphrase"))
+              }
+              method "aes_gcm" "passphrase" {
+                keys = key_provider.pbkdf2.passphrase
+              }
+              state {
+                method = method.aes_gcm.passphrase
+              }
+              plan {
+                method = method.aes_gcm.passphrase
+              }
+            }
+          }
+          HCL
+          cd ~/scratch/oldkey && { tofu init -input=false -no-color && tofu show -no-color; } > ~/reports/old-passphrase.txt 2>&1 || true

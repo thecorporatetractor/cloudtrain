@@ -1,0 +1,196 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: iac-provider-actions
+  title: Stop the test fleet with a provider action after each change
+  domain: iac
+  frameworks: [tf-professional:operations]
+  difficulty: medium
+  estimatedMinutes: 25
+  tags: [terraform, actions, lifecycle, aws-shaped, terraform-only]
+  version: 1
+spec:
+  description: |
+    The trading desk's test fleet in `~/stacks/test-fleet` (three instances
+    on the AWS-shaped endpoint `http://moto:5000`) is updated with every new
+    build (`var.build` ends up in a tag). Between test runs the instances must
+    be **stopped** to save cost, and today someone forgets every time.
+
+    1. Declare a **provider action** of type `aws_ec2_stop_instance` that
+       stops a fleet instance (one action instance per fleet member).
+    2. **Trigger** it from the instances' lifecycle **after every update**,
+       so each updated instance is stopped by the same apply.
+    3. The fleet is running right now: **invoke** the action from the CLI for
+       every instance once, so all three end up stopped.
+
+    A plan afterwards reports no changes. (Actions need Terraform 1.14 or
+    later; the endpoint's provider implements the stop action.)
+  objectives:
+    - Declare a provider action and trigger it from a resource lifecycle
+    - Invoke an action on demand from the CLI
+  params:
+    build:
+      type: choice
+      values: [b2041, b2107, b2163]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+      - name: moto
+        driver: container
+        image: moto:5
+  setup:
+    - on: moto
+      file: {path: /root/ct-pa-fleet.py, source: assets/moto-fleet.py, mode: "0600"}
+    - on: moto
+      timeoutSec: 120
+      run: for i in $(seq 1 60); do curl -s -o /dev/null http://localhost:5000/ && break; sleep 2; done
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/iac-provider-actions/stack/providers.tf, source: assets/stack/providers.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/iac-provider-actions/stack/main.tf, source: assets/stack/main.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/iac-provider-actions/seed.sh, source: assets/seed.sh, mode: "0755"}
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/stacks
+    - on: workstation
+      as: learner
+      timeoutSec: 300
+      run: /var/tmp/ct-seed/iac-provider-actions/seed.sh
+  checks:
+    - id: stopped
+      description: All three test instances are stopped
+      type: shell
+      on: moto
+      skills: [iac.operations.actions, iac.targets.aws-api]
+      weight: 3
+      timeoutSec: 60
+      command: python3 /root/ct-pa-fleet.py
+      expect: {match: exact, value: latency=stopped replay=stopped soak=stopped}
+    - id: triggered
+      description: Updating the fleet plans one stop action per updated instance, triggered by that instance
+      type: shell
+      on: workstation
+      skills: [iac.operations.actions]
+      weight: 3
+      timeoutSec: 300
+      command: |
+        ct-iac planjson /home/learner/stacks/test-fleet -var build=ct-grader | jq -r '[.action_invocations[]?] as $a
+          | "invocations=\($a | length) stop=\([$a[] | select(.address | startswith("action.aws_ec2_stop_instance."))] | length) triggers=\([$a[] | .lifecycle_action_trigger.triggering_resource_address // empty | select(startswith("aws_instance.test["))] | unique | length)"' 2>/dev/null
+      expect: {match: exact, value: invocations=3 stop=3 triggers=3}
+    - id: converged
+      description: A new plan of ~/stacks/test-fleet reports no changes
+      type: shell
+      on: workstation
+      skills: [iac.foundations.workflow]
+      weight: 1
+      timeoutSec: 300
+      command: ct-iac plan /home/learner/stacks/test-fleet
+      expect: {match: exact, value: no-changes}
+  hints:
+    - title: An action block
+      body: |
+        ```hcl
+        action "aws_ec2_stop_instance" "stop" {
+          for_each = var.fleet
+          config {
+            instance_id = aws_instance.test[each.key].id
+          }
+        }
+        ```
+      cost: 1
+    - title: The trigger
+      body: 'Inside the resource: `lifecycle { action_trigger { events = [after_update]  actions = [action.aws_ec2_stop_instance.stop[each.key]] } }`. A plan with `-var build=x` lists the planned action invocations.'
+      cost: 2
+    - title: Invoking from the CLI
+      body: '`terraform apply -invoke=''action.aws_ec2_stop_instance.stop["soak"]''` runs one action instance without changing resources; repeat for each instance.'
+      cost: 1
+  misconceptions:
+    - id: invoke-only
+      description: Declares and invokes the action but never wires a trigger.
+      feedback: The fleet is stopped today, but the next build's apply will leave it running again. Add a lifecycle action_trigger on after_update.
+      expectFail: [triggered]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/stacks/test-fleet
+          cat > actions.tf <<'HCL'
+          action "aws_ec2_stop_instance" "stop" {
+            for_each = var.fleet
+            config {
+              instance_id = aws_instance.test[each.key].id
+            }
+          }
+          HCL
+          for n in replay latency soak; do
+            iac apply -auto-approve -input=false -no-color -invoke="action.aws_ec2_stop_instance.stop[\"$n\"]"
+          done
+    - id: after-create
+      description: Triggers the action after create instead of after update.
+      feedback: The fleet is created once and updated with every build; after_create never fires again. Use events = [after_update].
+      expectFail: [triggered]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/stacks/test-fleet
+          cat > actions.tf <<'HCL'
+          action "aws_ec2_stop_instance" "stop" {
+            for_each = var.fleet
+            config {
+              instance_id = aws_instance.test[each.key].id
+            }
+          }
+          HCL
+          python3 - <<'PY'
+          p = "main.tf"; s = open(p).read()
+          old = '  tags          = { Name = "trading-test-${each.key}", build = var.build, team = "trading" }\n}\n'
+          new = '  tags          = { Name = "trading-test-${each.key}", build = var.build, team = "trading" }\n\n  lifecycle {\n    action_trigger {\n      events  = [after_create]\n      actions = [action.aws_ec2_stop_instance.stop[each.key]]\n    }\n  }\n}\n'
+          assert old in s
+          open(p, "w").write(s.replace(old, new))
+          PY
+          iac apply -auto-approve -input=false -no-color
+          for n in replay latency soak; do
+            iac apply -auto-approve -input=false -no-color -invoke="action.aws_ec2_stop_instance.stop[\"$n\"]"
+          done
+  solution:
+    explanation: |
+      An action is a provider operation that is not a resource: it has no state,
+      it just runs. action_trigger in a resource's lifecycle plans it whenever
+      the resource is created or updated (here after_update), so the same apply
+      that rolls out a build stops the instance. -invoke runs an action on its
+      own, for the instances that are already running.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/stacks/test-fleet
+          cat > actions.tf <<'HCL'
+          action "aws_ec2_stop_instance" "stop" {
+            for_each = var.fleet
+            config {
+              instance_id = aws_instance.test[each.key].id
+            }
+          }
+          HCL
+          python3 - <<'PY'
+          p = "main.tf"; s = open(p).read()
+          old = '  tags          = { Name = "trading-test-${each.key}", build = var.build, team = "trading" }\n}\n'
+          new = '  tags          = { Name = "trading-test-${each.key}", build = var.build, team = "trading" }\n\n  lifecycle {\n    action_trigger {\n      events  = [after_update]\n      actions = [action.aws_ec2_stop_instance.stop[each.key]]\n    }\n  }\n}\n'
+          assert old in s
+          open(p, "w").write(s.replace(old, new))
+          PY
+          iac apply -auto-approve -input=false -no-color
+          for n in replay latency soak; do
+            iac apply -auto-approve -input=false -no-color -invoke="action.aws_ec2_stop_instance.stop[\"$n\"]"
+          done

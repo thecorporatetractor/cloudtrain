@@ -1,0 +1,319 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xiv-conditional-env-resources
+  title: Create resources only where the environment needs them
+  domain: iac
+  frameworks: [tf-advanced:dynamic-config]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [exam, terraform, conditionals, count, modules]
+  version: 1
+spec:
+  description: |
+    **Directory:** `~/exam/telemetry-envs` · **Cluster:** `sm-grid`
+
+    The stack (applied) calls the module `modules/telemetry` once per
+    environment (`staging`, `prod`); each call manages namespace
+    `telemetry-<env>` and the `telemetry-api` Deployment. Extend **the module**
+    (not the root) so that, driven only by `var.env`:
+
+    - **staging** also gets a Deployment **`debug-dashboard`** (image
+      `caddy:2-alpine`, label `app=debug-dashboard`, 1 replica) and a ClusterIP
+      Service **`debug-dashboard`** on port 80 selecting it;
+    - **prod** also gets a PodDisruptionBudget **`telemetry-api`** with
+      `min_available = 1` selecting `app=telemetry-api`;
+    - neither environment gets the other's extras.
+
+    Each extra is declared once in the module. Apply; the following plan must
+    be empty.
+  objectives:
+    - Create resources conditionally with count or for_each
+    - Keep environment differences in data, not duplicated code
+  params:
+    prodr: {type: int, min: 2, max: 3}
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+      - name: sm-grid
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: sm-grid
+  setup:
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xiv-conditional-env-resources/stack/providers.tf, source: assets/stack/providers.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xiv-conditional-env-resources/stack/main.tf, source: assets/stack/main.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xiv-conditional-env-resources/stack/modules/telemetry/main.tf, source: assets/stack/modules/telemetry/main.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xiv-conditional-env-resources/seed.sh, source: assets/seed.sh, mode: "0755"}
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/exam
+    - on: workstation
+      as: learner
+      timeoutSec: 240
+      run: /var/tmp/ct-seed/xiv-conditional-env-resources/seed.sh xiv-conditional-env-resources telemetry-envs apply
+  teardown:
+    - on: sm-grid
+      run: kubectl delete namespace telemetry-staging telemetry-prod --ignore-not-found --wait=false
+  checks:
+    - id: staging-extras
+      description: telemetry-staging has the debug dashboard Deployment and Service, and no PodDisruptionBudget
+      type: shell
+      on: sm-grid
+      skills: [iac.language.expressions]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        n=telemetry-staging
+        d=$(kubectl -n $n get deployment debug-dashboard -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null)
+        s=$(kubectl -n $n get service debug-dashboard -o jsonpath='{.spec.type}:{.spec.ports[0].port}:{.spec.selector.app}' 2>/dev/null)
+        p=$(kubectl -n $n get pdb -o name 2>/dev/null | wc -l)
+        echo "dashboard=${d:-none} service=${s:-none} pdbs=$p"
+      expect: {match: exact, value: "dashboard=caddy:2-alpine service=ClusterIP:80:debug-dashboard pdbs=0"}
+    - id: prod-extras
+      description: telemetry-prod has the PodDisruptionBudget and no debug dashboard
+      type: shell
+      on: sm-grid
+      skills: [iac.language.expressions]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        n=telemetry-prod
+        p=$(kubectl -n $n get pdb telemetry-api -o jsonpath='{.spec.minAvailable}:{.spec.selector.matchLabels.app}' 2>/dev/null)
+        d=$(kubectl -n $n get deployment,service -o name 2>/dev/null | grep -c debug-dashboard)
+        r=$(kubectl -n $n get deployment telemetry-api -o jsonpath='{.spec.replicas}' 2>/dev/null)
+        echo "pdb=${p:-none} dashboard_objects=$d api_replicas=$r"
+      expect: {match: exact, value: "pdb=1:telemetry-api dashboard_objects=0 api_replicas={{prodr}}"}
+    - id: declared-once
+      description: The extras are declared once, inside modules/telemetry, and the root has no resources
+      type: shell
+      on: workstation
+      skills: [iac.language.repetition]
+      weight: 2
+      timeoutSec: 60
+      command: |
+        d=/home/learner/exam/telemetry-envs
+        m=$(cat $d/modules/telemetry/*.tf 2>/dev/null)
+        dep=$(printf '%s\n' "$m" | grep -cE '^[[:space:]]*resource[[:space:]]+"kubernetes_deployment(_v1)?"')
+        pdb=$(printf '%s\n' "$m" | grep -cE '^[[:space:]]*resource[[:space:]]+"kubernetes_pod_disruption_budget(_v1)?"')
+        root=$(ct-iac state $d | jq '[.values.root_module.resources[]? | select(.mode == "managed")] | length' 2>/dev/null)
+        echo "module_deployments=$dep module_pdbs=$pdb root_resources=${root:-?}"
+      expect: {match: exact, value: "module_deployments=2 module_pdbs=1 root_resources=0"}
+    - id: api-kept
+      description: Both telemetry-api Deployments are still managed by the module calls
+      type: shell
+      on: workstation
+      skills: [iac.language.repetition]
+      weight: 1
+      timeoutSec: 60
+      command: |
+        ct-iac state /home/learner/exam/telemetry-envs | jq -r '[.values.root_module.child_modules[]? | .resources[]? | select(.mode == "managed") | .address] | sort | map(select(test("deployment_v1.api$"))) | join(" ")' 2>/dev/null
+      expect: {match: exact, value: module.prod.kubernetes_deployment_v1.api module.staging.kubernetes_deployment_v1.api}
+    - id: converged
+      description: A new plan of ~/exam/telemetry-envs reports no changes
+      type: shell
+      on: workstation
+      skills: [iac.foundations.workflow]
+      weight: 1
+      timeoutSec: 120
+      command: ct-iac plan /home/learner/exam/telemetry-envs
+      expect: {match: exact, value: no-changes}
+  misconceptions:
+    - id: extras-in-root
+      description: Adds the extras in the root module, pointing at each environment's namespace.
+      feedback: 'Root-level copies per environment duplicate the module''s job. Put the extras in modules/telemetry and switch them on with count = var.env == "staging" ? 1 : 0.'
+      expectFail: [declared-once]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          cd ~/exam/telemetry-envs
+          cat > extras.tf <<'HCL'
+          resource "kubernetes_deployment_v1" "dashboard" {
+            metadata {
+              name      = "debug-dashboard"
+              namespace = "telemetry-staging"
+            }
+            spec {
+              replicas = 1
+              selector {
+                match_labels = { app = "debug-dashboard" }
+              }
+              template {
+                metadata {
+                  labels = { app = "debug-dashboard" }
+                }
+                spec {
+                  container {
+                    name  = "dashboard"
+                    image = "caddy:2-alpine"
+                  }
+                }
+              }
+            }
+            wait_for_rollout = false
+          }
+
+          resource "kubernetes_service_v1" "dashboard" {
+            metadata {
+              name      = "debug-dashboard"
+              namespace = "telemetry-staging"
+            }
+            spec {
+              selector = { app = "debug-dashboard" }
+              port {
+                port = 80
+              }
+            }
+          }
+
+          resource "kubernetes_pod_disruption_budget_v1" "api" {
+            metadata {
+              name      = "telemetry-api"
+              namespace = "telemetry-prod"
+            }
+            spec {
+              min_available = "1"
+              selector {
+                match_labels = { app = "telemetry-api" }
+              }
+            }
+          }
+          HCL
+          iac apply -auto-approve -input=false -no-color
+    - id: both-everywhere
+      description: Adds the extras to the module without conditions.
+      feedback: Unconditional resources in the module land in every environment. Gate each extra on var.env with count (or for_each over a set that is empty elsewhere).
+      expectFail: [staging-extras, prod-extras]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          cd ~/exam/telemetry-envs
+          cat > modules/telemetry/extras.tf <<'HCL'
+          resource "kubernetes_deployment_v1" "dashboard" {
+            metadata {
+              name      = "debug-dashboard"
+              namespace = kubernetes_namespace_v1.this.metadata[0].name
+            }
+            spec {
+              replicas = 1
+              selector {
+                match_labels = { app = "debug-dashboard" }
+              }
+              template {
+                metadata {
+                  labels = { app = "debug-dashboard" }
+                }
+                spec {
+                  container {
+                    name  = "dashboard"
+                    image = "caddy:2-alpine"
+                  }
+                }
+              }
+            }
+            wait_for_rollout = false
+          }
+
+          resource "kubernetes_service_v1" "dashboard" {
+            metadata {
+              name      = "debug-dashboard"
+              namespace = kubernetes_namespace_v1.this.metadata[0].name
+            }
+            spec {
+              selector = { app = "debug-dashboard" }
+              port {
+                port = 80
+              }
+            }
+          }
+
+          resource "kubernetes_pod_disruption_budget_v1" "api" {
+            metadata {
+              name      = "telemetry-api"
+              namespace = kubernetes_namespace_v1.this.metadata[0].name
+            }
+            spec {
+              min_available = "1"
+              selector {
+                match_labels = { app = "telemetry-api" }
+              }
+            }
+          }
+          HCL
+          iac apply -auto-approve -input=false -no-color
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/exam/telemetry-envs
+          cat > modules/telemetry/extras.tf <<'HCL'
+          resource "kubernetes_deployment_v1" "dashboard" {
+            count = var.env == "staging" ? 1 : 0
+            metadata {
+              name      = "debug-dashboard"
+              namespace = kubernetes_namespace_v1.this.metadata[0].name
+            }
+            spec {
+              replicas = 1
+              selector {
+                match_labels = { app = "debug-dashboard" }
+              }
+              template {
+                metadata {
+                  labels = { app = "debug-dashboard" }
+                }
+                spec {
+                  container {
+                    name  = "dashboard"
+                    image = "caddy:2-alpine"
+                  }
+                }
+              }
+            }
+            wait_for_rollout = false
+          }
+
+          resource "kubernetes_service_v1" "dashboard" {
+            count = var.env == "staging" ? 1 : 0
+            metadata {
+              name      = "debug-dashboard"
+              namespace = kubernetes_namespace_v1.this.metadata[0].name
+            }
+            spec {
+              selector = { app = "debug-dashboard" }
+              port {
+                port = 80
+              }
+            }
+          }
+
+          resource "kubernetes_pod_disruption_budget_v1" "api" {
+            count = var.env == "prod" ? 1 : 0
+            metadata {
+              name      = "telemetry-api"
+              namespace = kubernetes_namespace_v1.this.metadata[0].name
+            }
+            spec {
+              min_available = "1"
+              selector {
+                match_labels = { app = "telemetry-api" }
+              }
+            }
+          }
+          HCL
+          iac apply -auto-approve -input=false -no-color

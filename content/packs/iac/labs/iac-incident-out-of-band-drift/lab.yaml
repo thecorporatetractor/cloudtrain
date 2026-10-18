@@ -1,0 +1,257 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: iac-incident-out-of-band-drift
+  title: Reconcile security group rules edited outside code
+  domain: iac
+  frameworks: [tf-advanced:lifecycle-import-drift]
+  difficulty: hard
+  estimatedMinutes: 30
+  tags: [terraform, incident, drift, import, security-groups, aws-shaped]
+  version: 1
+spec:
+  description: |
+    During last week's outage three ingress rules were added by hand to the
+    trading desk's security group `trading-desk-app` (AWS-shaped endpoint
+    `http://moto:5000`). The stack in `~/stacks/trading-desk` manages the
+    group's rules as **separate rule resources**, so a plan shows nothing:
+    Terraform only manages rules that are in its state.
+    `~/stacks/trading-desk/INCIDENT.md` says which rule change control
+    approved.
+
+    1. **Import** the approved rule into the stack (as an
+       `aws_vpc_security_group_ingress_rule` with the description from the
+       incident note). It must stay the same rule, not be deleted and
+       recreated.
+    2. **Remove** the two unapproved rules, through Terraform.
+
+    Finish with a converged plan and a group that holds exactly the HTTPS
+    rule, the approved rule and the egress rule. There is no cloud CLI on the
+    workstation: the AWS provider's data sources can tell you rule ids.
+  objectives:
+    - Find unmanaged objects with data sources
+    - Adopt an approved out-of-band change with an import block
+    - Remove unapproved out-of-band changes through Terraform
+  params:
+    port:
+      type: choice
+      values: ["8443", "9443", "7443"]
+    chg: {type: int, min: 5000, max: 5999}
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+      - name: moto
+        driver: container
+        image: moto:5
+  setup:
+    - on: moto
+      file: {path: /root/ct-oob-drift.py, source: assets/moto-drift.py, mode: "0600"}
+    - on: moto
+      file: {path: /root/ct-oob-check.py, source: assets/moto-check.py, mode: "0600"}
+    - on: moto
+      timeoutSec: 120
+      run: for i in $(seq 1 60); do curl -s -o /dev/null http://localhost:5000/ && break; sleep 2; done
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/iac-incident-out-of-band-drift/stack/providers.tf, source: assets/stack/providers.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/iac-incident-out-of-band-drift/stack/main.tf, source: assets/stack/main.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/iac-incident-out-of-band-drift/INCIDENT.md, source: assets/INCIDENT.md, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/iac-incident-out-of-band-drift/seed.sh, source: assets/seed.sh, mode: "0755"}
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/stacks
+    - on: workstation
+      as: learner
+      timeoutSec: 300
+      run: /var/tmp/ct-seed/iac-incident-out-of-band-drift/seed.sh
+    - on: moto
+      timeoutSec: 60
+      run: python3 /root/ct-oob-drift.py
+  checks:
+    - id: live-rules
+      description: The group holds exactly the HTTPS rule and the approved rule, which is the original one
+      type: shell
+      on: moto
+      skills: [iac.state.drift, iac.state.import, iac.targets.aws-api]
+      weight: 3
+      timeoutSec: 60
+      command: python3 /root/ct-oob-check.py
+      expect: {match: exact, value: "approved=original ingress=443:10.47.0.0/16,{{port}}:10.47.32.0/20"}
+    - id: in-state
+      description: The approved rule is managed in state with its change-control description
+      type: shell
+      on: workstation
+      skills: [iac.state.import]
+      weight: 2
+      timeoutSec: 90
+      command: |
+        ct-iac state /home/learner/stacks/trading-desk | jq -r '[.values.root_module.resources[]? | select(.type == "aws_vpc_security_group_ingress_rule") | "\(.values.from_port):\(.values.description)"] | sort | join(" ")' 2>/dev/null
+      expect: {match: exact, value: "443:HTTPS from the trading VPC {{port}}:Market data feed (CHG-{{chg}})"}
+    - id: converged
+      description: A new plan of ~/stacks/trading-desk reports no changes
+      type: shell
+      on: workstation
+      skills: [iac.foundations.workflow]
+      weight: 1
+      timeoutSec: 150
+      command: ct-iac plan /home/learner/stacks/trading-desk
+      expect: {match: exact, value: no-changes}
+  hints:
+    - title: Find the rule ids
+      body: '`data "aws_vpc_security_group_rules"` with a `group-id` filter lists every rule id of the group; `data "aws_vpc_security_group_rule"` (singular) shows one rule''s port, protocol and source. Put them in a temporary file and print them with an output or `terraform console`.'
+      cost: 1
+    - title: Import by rule id
+      body: 'An `import { to = aws_vpc_security_group_ingress_rule.market_data  id = "sgr-..." }` block plus a resource block that matches the live rule adopts it without touching it.'
+      cost: 1
+    - title: Removing what you do not own
+      body: Terraform can only delete what is in its state. Import the two unapproved rules as well, apply, then delete their blocks and apply again (or use a targeted destroy). Review the plan before each apply.
+      cost: 2
+  misconceptions:
+    - id: approved-only
+      description: Imports the approved rule and leaves the two unapproved rules in place.
+      feedback: The rules nobody approved are still open, and Terraform cannot see them because they are not in state. Adopt them too, then delete them through Terraform.
+      expectFail: [live-rules]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/stacks/trading-desk
+          # Find the hand-made rules: every ingress rule id of the group, with port and source.
+          cat > lookup.tf <<'HCL'
+          data "aws_vpc_security_group_rules" "desk" {
+            filter {
+              name   = "group-id"
+              values = [aws_security_group.desk.id]
+            }
+          }
+
+          data "aws_vpc_security_group_rule" "each" {
+            for_each               = toset(data.aws_vpc_security_group_rules.desk.ids)
+            security_group_rule_id = each.value
+          }
+
+          output "rules" {
+            value = { for id, r in data.aws_vpc_security_group_rule.each : id => "${r.is_egress ? "egress" : "ingress"} ${r.from_port} ${r.cidr_ipv4}" }
+          }
+          HCL
+          iac apply -auto-approve -input=false -no-color >/dev/null
+          ids=$(iac output -json rules)
+          approved=$(echo "$ids" | jq -r 'to_entries[] | select(.value == "ingress {{port}} 10.47.32.0/20") | .key')
+          rdp=$(echo "$ids" | jq -r 'to_entries[] | select(.value == "ingress 3389 0.0.0.0/0") | .key')
+          debug=$(echo "$ids" | jq -r 'to_entries[] | select(.value == "ingress 9229 10.0.0.0/8") | .key')
+          rm lookup.tf
+          cat > adopt.tf <<HCL
+          import {
+            to = aws_vpc_security_group_ingress_rule.market_data
+            id = "$approved"
+          }
+
+          resource "aws_vpc_security_group_ingress_rule" "market_data" {
+            security_group_id = aws_security_group.desk.id
+            description       = "Market data feed (CHG-{{chg}})"
+            ip_protocol       = "tcp"
+            from_port         = {{port}}
+            to_port           = {{port}}
+            cidr_ipv4         = "10.47.32.0/20"
+          }
+
+          HCL
+          iac apply -auto-approve -input=false -no-color
+  solution:
+    explanation: |
+      Separate rule resources make Terraform blind to rules it does not manage.
+      Data sources list the group's rule ids; an import block adopts the approved
+      rule as it is. The unapproved rules are imported too, so that removing their
+      blocks lets Terraform delete them; afterwards the state and the group agree.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/stacks/trading-desk
+          # Find the hand-made rules: every ingress rule id of the group, with port and source.
+          cat > lookup.tf <<'HCL'
+          data "aws_vpc_security_group_rules" "desk" {
+            filter {
+              name   = "group-id"
+              values = [aws_security_group.desk.id]
+            }
+          }
+
+          data "aws_vpc_security_group_rule" "each" {
+            for_each               = toset(data.aws_vpc_security_group_rules.desk.ids)
+            security_group_rule_id = each.value
+          }
+
+          output "rules" {
+            value = { for id, r in data.aws_vpc_security_group_rule.each : id => "${r.is_egress ? "egress" : "ingress"} ${r.from_port} ${r.cidr_ipv4}" }
+          }
+          HCL
+          iac apply -auto-approve -input=false -no-color >/dev/null
+          ids=$(iac output -json rules)
+          approved=$(echo "$ids" | jq -r 'to_entries[] | select(.value == "ingress {{port}} 10.47.32.0/20") | .key')
+          rdp=$(echo "$ids" | jq -r 'to_entries[] | select(.value == "ingress 3389 0.0.0.0/0") | .key')
+          debug=$(echo "$ids" | jq -r 'to_entries[] | select(.value == "ingress 9229 10.0.0.0/8") | .key')
+          rm lookup.tf
+          cat > adopt.tf <<HCL
+          import {
+            to = aws_vpc_security_group_ingress_rule.market_data
+            id = "$approved"
+          }
+
+          resource "aws_vpc_security_group_ingress_rule" "market_data" {
+            security_group_id = aws_security_group.desk.id
+            description       = "Market data feed (CHG-{{chg}})"
+            ip_protocol       = "tcp"
+            from_port         = {{port}}
+            to_port           = {{port}}
+            cidr_ipv4         = "10.47.32.0/20"
+          }
+
+          import {
+            to = aws_vpc_security_group_ingress_rule.rdp
+            id = "$rdp"
+          }
+
+          resource "aws_vpc_security_group_ingress_rule" "rdp" {
+            security_group_id = aws_security_group.desk.id
+            description       = "vendor remote session"
+            ip_protocol       = "tcp"
+            from_port         = 3389
+            to_port           = 3389
+            cidr_ipv4         = "0.0.0.0/0"
+          }
+
+          import {
+            to = aws_vpc_security_group_ingress_rule.debug
+            id = "$debug"
+          }
+
+          resource "aws_vpc_security_group_ingress_rule" "debug" {
+            security_group_id = aws_security_group.desk.id
+            description       = "node debugger"
+            ip_protocol       = "tcp"
+            from_port         = 9229
+            to_port           = 9229
+            cidr_ipv4         = "10.0.0.0/8"
+          }
+          HCL
+          iac apply -auto-approve -input=false -no-color
+          # Adopted; now drop the two unapproved rules from the configuration so the next apply deletes them.
+          python3 - <<'PY'
+          import re
+          s = open("adopt.tf").read()
+          for n in ("rdp", "debug"):
+              s = re.sub(r'import \{\n  to = aws_vpc_security_group_ingress_rule\.%s\n.*?\n\}\n\n' % n, '', s, flags=re.S)
+              s = re.sub(r'resource "aws_vpc_security_group_ingress_rule" "%s" \{.*?\n\}\n\n?' % n, '', s, flags=re.S)
+          open("adopt.tf", "w").write(s)
+          PY
+          iac apply -auto-approve -input=false -no-color

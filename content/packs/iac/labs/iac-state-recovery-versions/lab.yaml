@@ -1,0 +1,175 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: iac-state-recovery-versions
+  title: Recover a state file overwritten by a bad push
+  domain: iac
+  frameworks: [tf-professional:operations]
+  difficulty: hard
+  estimatedMinutes: 30
+  tags: [terraform, state, recovery, s3, versioning, incident]
+  version: 1
+spec:
+  description: |
+    The inland stack `~/stacks/inland` keeps its state at
+    `inland/terraform.tfstate` in bucket `saltmarsh-state` on the workstation's S3
+    store (`ct-s3`, **object versioning on**). It manages a telemetry gateway
+    name and a SCADA config file for each inland farm, `fenwick` and `larkholt`.
+
+    This morning someone ran `terraform state push -force` with an **old copy**
+    of the state from their laptop. Since then the plan wants to *create*
+    larkholt's gateway and config - which would give larkholt a new gateway
+    name and break its SCADA link.
+
+    1. List the object versions of the state file and find the version that
+       was current **before** the bad push (look inside the versions: the
+       serial alone does not tell them apart). Write its **version ID** to
+       **`~/reports/restored-version.txt`**.
+    2. Make that state current again - through Terraform or the S3 API - without
+       deleting any version from the bucket's history.
+    3. Prove the plan converges with **no changes**: nothing may be created or
+       recreated, and both farms keep their gateway names.
+
+    `ct-s3 api METHOD PATH` sends signed requests to the store, for example
+    `ct-s3 api GET '/saltmarsh-state?versions&prefix=inland/'` or
+    `ct-s3 api GET '/saltmarsh-state/inland/terraform.tfstate?versionId=<id>'`.
+  objectives:
+    - Use backend object versions to recover a state file
+    - Compare state versions by content, lineage and serial
+    - Restore state without recreating infrastructure
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+  setup:
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/main.tf, source: assets/main.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/seed.sh, source: assets/seed.sh, mode: "0755"}
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/stacks
+    - on: workstation
+      as: learner
+      timeoutSec: 300
+      run: /var/tmp/ct-seed/seed.sh
+  checks:
+    - id: right-version
+      description: ~/reports/restored-version.txt names the version that was current before the bad push
+      type: shell
+      on: workstation
+      skills: [iac.operations.state-recovery]
+      weight: 1.5
+      command: |
+        got=$(tr -d ' \n\r' < /home/learner/reports/restored-version.txt 2>/dev/null)
+        [ -n "$got" ] && [ "$got" = "$(cat /home/learner/.local/share/ct-lab/good.version)" ] && echo right || echo "wrong: ${got:-none}"
+      expect: {match: exact, value: right}
+    - id: state-restored
+      description: The current state holds both farms with their original gateway names
+      type: shell
+      on: workstation
+      skills: [iac.operations.state-recovery]
+      weight: 3
+      timeoutSec: 60
+      command: |
+        ct-s3 ensure >/dev/null 2>&1
+        now=$(ct-s3 api GET '/saltmarsh-state/inland/terraform.tfstate' | jq -r '[.resources[]? | select(.type == "random_pet") | .instances[] | .attributes.id] | sort | join(" ")' 2>/dev/null)
+        [ -n "$now" ] && [ "$now" = "$(cat /home/learner/.local/share/ct-lab/pets)" ] && echo restored || echo "state pets: ${now:-none}"
+      expect: {match: exact, value: restored}
+    - id: configs-intact
+      description: Both SCADA configs still name their original gateways
+      type: shell
+      on: workstation
+      skills: [iac.operations.state-recovery]
+      weight: 1.5
+      command: |
+        g=$(cat /home/learner/inland/fenwick.conf /home/learner/inland/larkholt.conf 2>/dev/null | sed -n 's/^gateway=//p' | sort | tr '\n' ' ')
+        [ "$g" = "$(cat /home/learner/.local/share/ct-lab/pets) " ] && echo intact || echo "gateways: $g"
+      expect: {match: exact, value: intact}
+    - id: history-kept
+      description: The bucket still holds every earlier version of the state file
+      type: shell
+      on: workstation
+      skills: [iac.operations.state-recovery]
+      weight: 1
+      timeoutSec: 30
+      command: |
+        ct-s3 ensure >/dev/null 2>&1
+        l=$(ct-s3 api GET '/saltmarsh-state?versions&prefix=inland/terraform.tfstate')
+        n=$(printf '%s' "$l" | grep -o '<Key>inland/terraform.tfstate</Key>' | wc -l)
+        printf '%s' "$l" | grep -q "$(cat /home/learner/.local/share/ct-lab/good.version)" && g=yes || g=no
+        [ "$n" -ge 4 ] && [ $g = yes ] && echo kept || echo "versions=$n good=$g"
+      expect: {match: exact, value: kept}
+    - id: converged
+      description: A new plan of ~/stacks/inland reports no changes
+      type: shell
+      on: workstation
+      skills: [iac.foundations.workflow]
+      weight: 1
+      timeoutSec: 120
+      command: ct-iac plan /home/learner/stacks/inland
+      expect: {match: exact, value: no-changes}
+  hints:
+    - title: Versions of one key
+      body: The listing has one `<Version>` per write, newest first, with `<IsLatest>true</IsLatest>` on the current one. Download each candidate with `?versionId=` and compare with jq.
+      command: "ct-s3 api GET '/saltmarsh-state?versions&prefix=inland/terraform.tfstate' | grep -o '<VersionId>[^<]*'"
+      cost: 1
+    - title: What to compare
+      body: '`jq "{serial, lineage, keys: [.resources[].instances[].index_key]}"` on each version. The forced push kept the lineage and the serial number, but not larkholt.'
+      cost: 1
+    - title: Putting it back
+      body: '`terraform state push` refuses a state whose serial equals the current one but differs in content; you have checked it, so `-force` is justified here. Never apply before the plan is empty.'
+      cost: 2
+  misconceptions:
+    - id: apply-over-it
+      description: Applies the stack as it is to "fix" the plan.
+      feedback: The apply creates a new gateway name for larkholt and rewrites its config, breaking the SCADA link. Recover the state from the version history instead.
+      expectFail: [right-version, state-restored, configs-intact]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: cd ~/stacks/inland && iac apply -auto-approve -input=false -no-color
+    - id: oldest-version
+      description: Restores the oldest version instead of the one before the push.
+      feedback: The oldest version predates larkholt. Compare the versions' content and restore the newest one that is not the bad push.
+      expectFail: [right-version, state-restored, converged]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          cd ~/stacks/inland
+          v=$(ct-s3 api GET '/saltmarsh-state?versions&prefix=inland/terraform.tfstate' | grep -o '<Key>inland/terraform.tfstate</Key><VersionId>[^<]*' | sed 's/.*<VersionId>//' | tail -1)
+          echo "$v" > ~/reports/restored-version.txt
+          ct-s3 api GET "/saltmarsh-state/inland/terraform.tfstate?versionId=$v" -o /tmp/old.tfstate
+          iac state push -force /tmp/old.tfstate
+  solution:
+    explanation: |
+      Versioning kept every write of the state object. The latest version is the
+      forced push (fenwick only); among the older ones, the newest that lists
+      larkholt is the state that was current before the push. Pushing it back with
+      `state push -force` (same lineage, same serial, so -force is needed) makes it
+      current as a new version; the history stays, and the plan is empty because
+      the real files and names never changed.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/stacks/inland
+          list=$(ct-s3 api GET '/saltmarsh-state?versions&prefix=inland/terraform.tfstate' | grep -o '<Key>inland/terraform.tfstate</Key><VersionId>[^<]*' | sed 's/.*<VersionId>//')
+          good=""
+          for v in $(printf '%s\n' "$list" | tail -n +2); do
+            ct-s3 api GET "/saltmarsh-state/inland/terraform.tfstate?versionId=$v" -o /tmp/v.tfstate
+            echo "$v $(jq -c '{serial, keys: [.resources[].instances[].index_key]}' /tmp/v.tfstate)"
+            if [ -z "$good" ] && jq -e '[.resources[].instances[].index_key] | index("larkholt")' /tmp/v.tfstate >/dev/null; then
+              good=$v; cp /tmp/v.tfstate /tmp/good.tfstate
+            fi
+          done
+          echo "$good" > ~/reports/restored-version.txt
+          iac state push -force /tmp/good.tfstate
+          iac plan -input=false -no-color -detailed-exitcode

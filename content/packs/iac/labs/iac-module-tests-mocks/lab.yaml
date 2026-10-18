@@ -1,0 +1,292 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: iac-module-tests-mocks
+  title: Test a module with plan and apply runs and mocks
+  domain: iac
+  frameworks: [tf-professional:module-contracts-testing]
+  difficulty: medium
+  estimatedMinutes: 30
+  tags: [terraform, testing, terraform-test, mocks, modules]
+  version: 1
+spec:
+  description: |
+    The platform team's module **`farm-base`** (`~/modules/farm-base`,
+    initialised) creates a namespace and a ResourceQuota sized from a farm's
+    turbine count (the sizing rule is in `main.tf`), and writes a quota summary
+    file with the `local` provider. It has no tests, and there is no cluster to
+    test against.
+
+    Write **`tests/farm-base.tftest.hcl`** so that `terraform test` (run from
+    the module directory) passes, with:
+
+    1. a **mocked `kubernetes` provider** (`mock_provider`), so no run needs a
+       cluster;
+    2. a **plan run** that checks the quota maths for one turbine count:
+       `requests.cpu`, `requests.memory` and `pods`;
+    3. a **plan run** that proves an out-of-range turbine count (0 or more than
+       80) is **rejected** by the input validation;
+    4. one **apply run** that really writes the summary file (use a relative
+       `summary_dir`, for example `test-out`) and checks its content.
+
+    Do not change the module itself. The grader also runs your tests against
+    copies of the module with a seeded bug and expects them to fail.
+  objectives:
+    - Write terraform test files with plan and apply runs
+    - Replace a provider with mock_provider in tests
+    - Test input validation with expect_failures
+  params:
+    cpu:
+      type: choice
+      values: ["200", "250", "300"]
+    mem:
+      type: choice
+      values: ["96", "128", "192"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+  setup:
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/module/versions.tf, source: assets/module/versions.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/module/variables.tf, source: assets/module/variables.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/module/main.tf, source: assets/module/main.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/module/outputs.tf, source: assets/module/outputs.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/module/README.md, source: assets/module/README.md, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/seed.sh, source: assets/seed.sh, mode: "0755"}
+    - on: workstation
+      run: install -d -m 0700 /var/tmp/ct-grade
+    - on: workstation
+      file: {path: /var/tmp/ct-grade/run-tests.sh, source: assets/run-tests.sh, mode: "0700"}
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/modules
+    - on: workstation
+      as: learner
+      timeoutSec: 120
+      run: /var/tmp/ct-seed/seed.sh
+  checks:
+    - id: tests-pass
+      description: terraform test passes on the module with at least three runs
+      type: shell
+      on: workstation
+      skills: [iac.quality.testing]
+      weight: 2
+      timeoutSec: 240
+      command: /var/tmp/ct-grade/run-tests.sh as-is
+      expect: {match: regex, value: '^pass runs=([3-9]|[1-9][0-9])$'}
+    - id: test-structure
+      description: The test file mocks kubernetes and has plan runs, an expect_failures run and an apply run
+      type: shell
+      on: workstation
+      skills: [iac.quality.testing]
+      weight: 1.5
+      command: |
+        f=/home/learner/modules/farm-base/tests/farm-base.tftest.hcl
+        [ -f $f ] || { echo missing; exit 0; }
+        mock=$(grep -cE '^[[:space:]]*mock_provider[[:space:]]+"kubernetes"' $f)
+        runs=$(grep -cE '^[[:space:]]*run[[:space:]]+"' $f)
+        plans=$(grep -cE '^[[:space:]]*command[[:space:]]*=[[:space:]]*plan' $f)
+        ef=$(grep -cE '^[[:space:]]*expect_failures[[:space:]]*=' $f)
+        [ "$mock" -ge 1 ] && [ "$plans" -ge 2 ] && [ "$ef" -ge 1 ] && [ "$runs" -gt "$plans" ] && echo ok || echo "mock=$mock runs=$runs plan_runs=$plans expect_failures=$ef"
+      expect: {match: exact, value: ok}
+    - id: catches-maths-bug
+      description: The tests fail on a module copy whose memory sizing is wrong
+      type: shell
+      on: workstation
+      skills: [iac.quality.testing]
+      weight: 2
+      timeoutSec: 240
+      command: /var/tmp/ct-grade/run-tests.sh maths
+      expect: {match: exact, value: fail}
+    - id: catches-validation-bug
+      description: The tests fail on a module copy that accepts any turbine count
+      type: shell
+      on: workstation
+      skills: [iac.quality.testing]
+      weight: 2
+      timeoutSec: 240
+      command: /var/tmp/ct-grade/run-tests.sh validation
+      expect: {match: exact, value: fail}
+    - id: module-unchanged
+      description: The module's own files are unchanged
+      type: shell
+      on: workstation
+      skills: [iac.quality.testing]
+      weight: 0.5
+      command: |
+        cd /home/learner/modules/farm-base 2>/dev/null || { echo missing; exit 0; }
+        for f in main.tf variables.tf outputs.tf versions.tf; do cmp -s $f /var/tmp/ct-seed/module/$f || echo -n "$f "; done; echo end
+      expect: {match: exact, value: end}
+  hints:
+    - title: Shape of a test file
+      body: |
+        ```hcl
+        mock_provider "kubernetes" {}
+
+        variables {
+          farm        = "gullhaven"
+          turbines    = 10
+          summary_dir = "test-out"
+        }
+
+        run "quota_maths" {
+          command = plan
+          assert {
+            condition     = kubernetes_resource_quota_v1.farm.spec[0].hard["pods"] == "12"
+            error_message = "pods must be turbines + 2"
+          }
+        }
+        ```
+      cost: 1
+    - title: Testing a rejection
+      body: A run with `variables { turbines = 0 }` and `expect_failures = [var.turbines]` passes only when the validation rejects the value.
+      cost: 1
+    - title: The apply run
+      body: A run without `command = plan` applies for real (mocked providers still fake their part); `file(local_file.summary.filename)` reads what the local provider wrote. The test destroys everything afterwards.
+      cost: 1
+  misconceptions:
+    - id: happy-path-only
+      description: Tests only the quota maths, with no rejected-input run.
+      feedback: Without a run that expects the validation to fail, a module that silently accepts 0 or 500 turbines still passes. Add a run with expect_failures = [var.turbines].
+      expectFail: [test-structure, catches-validation-bug]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          cd ~/modules/farm-base && mkdir -p tests
+          cat > tests/farm-base.tftest.hcl <<'HCL'
+          mock_provider "kubernetes" {}
+
+          variables {
+            farm        = "gullhaven"
+            turbines    = 10
+            summary_dir = "test-out"
+          }
+
+          run "quota_maths" {
+            command = plan
+            assert {
+              condition     = kubernetes_resource_quota_v1.farm.spec[0].hard["requests.memory"] == "${10 * {{mem}}}Mi"
+              error_message = "memory sizing is wrong"
+            }
+          }
+
+          run "writes_summary" {
+            assert {
+              condition     = file(local_file.summary.filename) == "cpu=${10 * {{cpu}}}m memory=${10 * {{mem}}}Mi pods=12\n"
+              error_message = "summary content is wrong"
+            }
+          }
+          HCL
+    - id: no-mock
+      description: Writes the runs against the real kubernetes provider.
+      feedback: There is no cluster in the test environment, so the apply run cannot create the namespace. Replace the provider with mock_provider "kubernetes" and keep local real.
+      expectFail: [tests-pass, test-structure]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          cd ~/modules/farm-base && mkdir -p tests
+          cat > tests/farm-base.tftest.hcl <<'HCL'
+          variables {
+            farm        = "gullhaven"
+            turbines    = 10
+            summary_dir = "test-out"
+          }
+
+          run "quota_maths" {
+            command = plan
+            assert {
+              condition     = kubernetes_resource_quota_v1.farm.spec[0].hard["pods"] == "12"
+              error_message = "pods must be turbines + 2"
+            }
+          }
+
+          run "rejects_zero" {
+            command = plan
+            variables {
+              turbines = 0
+            }
+            expect_failures = [var.turbines]
+          }
+
+          run "writes_summary" {
+            assert {
+              condition     = fileexists(local_file.summary.filename)
+              error_message = "summary missing"
+            }
+          }
+          HCL
+  solution:
+    explanation: |
+      `mock_provider "kubernetes"` replaces the provider in every run, so plans and
+      the apply run never touch a cluster, while `local` stays real and the apply
+      run writes the summary file. Plan runs assert on planned attribute values
+      (the quota maths); a run with `expect_failures = [var.turbines]` passes only
+      if the validation rejects the input. Seeded bugs in the sizing or the
+      validation therefore make the suite fail.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 240
+        run: |
+          set -e
+          cd ~/modules/farm-base && mkdir -p tests
+          cat > tests/farm-base.tftest.hcl <<'HCL'
+          mock_provider "kubernetes" {}
+
+          variables {
+            farm        = "gullhaven"
+            turbines    = 10
+            summary_dir = "test-out"
+          }
+
+          run "quota_maths" {
+            command = plan
+
+            assert {
+              condition     = kubernetes_resource_quota_v1.farm.spec[0].hard["requests.cpu"] == "${10 * {{cpu}}}m"
+              error_message = "CPU must be {{cpu}}m per turbine"
+            }
+            assert {
+              condition     = kubernetes_resource_quota_v1.farm.spec[0].hard["requests.memory"] == "${10 * {{mem}}}Mi"
+              error_message = "memory must be {{mem}}Mi per turbine"
+            }
+            assert {
+              condition     = kubernetes_resource_quota_v1.farm.spec[0].hard["pods"] == "12"
+              error_message = "pods must be turbines + 2"
+            }
+          }
+
+          run "rejects_zero_turbines" {
+            command = plan
+            variables {
+              turbines = 0
+            }
+            expect_failures = [var.turbines]
+          }
+
+          run "rejects_too_many_turbines" {
+            command = plan
+            variables {
+              turbines = 81
+            }
+            expect_failures = [var.turbines]
+          }
+
+          run "writes_summary" {
+            assert {
+              condition     = file(local_file.summary.filename) == "cpu=${10 * {{cpu}}}m memory=${10 * {{mem}}}Mi pods=12\n"
+              error_message = "summary file content is wrong"
+            }
+          }
+          HCL
+          iac test -no-color

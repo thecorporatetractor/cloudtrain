@@ -1,0 +1,200 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xiv-templated-configmaps
+  title: Render per-farm configuration from templates
+  domain: iac
+  frameworks: [tf-advanced:dynamic-config]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [exam, terraform, templatefile, for_each]
+  version: 1
+spec:
+  description: |
+    **Directory:** `~/exam/farm-settings` · **Cluster:** `sm-grid`
+
+    The stack declares a `farms` map (values in `terraform.tfvars`). Publish one
+    ConfigMap per farm in namespace **`farm-settings`** (it exists):
+
+    - name **`farm-<key>`**, one data key **`farm.ini`** with exactly these
+      lines (no trailing blank line):
+
+      ```
+      [farm]
+      name = <key>
+      turbines = <turbines>
+      capacity_mw = <capacity_mw>
+      site = offshore      (or: site = inland, from the offshore flag)
+      ```
+
+    - the text must come from a **template file** in the stack directory,
+      rendered with `templatefile`;
+    - one resource block for all farms: adding a farm must need **only a new
+      map entry** in `terraform.tfvars`.
+
+    Apply; the following plan must be empty.
+  objectives:
+    - Render file content from a template with templatefile
+    - Create one object per map entry with for_each
+  params:
+    gt: {type: int, min: 30, max: 60}
+    gc: {type: int, min: 400, max: 700}
+    rt: {type: int, min: 20, max: 45}
+    rc: {type: int, min: 250, max: 500}
+    ft: {type: int, min: 8, max: 19}
+    fc: {type: int, min: 30, max: 90}
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+      - name: sm-grid
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: sm-grid
+  setup:
+    - on: sm-grid
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata:
+          name: farm-settings
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xiv-templated-configmaps/stack/providers.tf, source: assets/stack/providers.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xiv-templated-configmaps/stack/variables.tf, source: assets/stack/variables.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xiv-templated-configmaps/stack/terraform.tfvars, source: assets/stack/terraform.tfvars, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xiv-templated-configmaps/stack/main.tf, source: assets/stack/main.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xiv-templated-configmaps/seed.sh, source: assets/seed.sh, mode: "0755"}
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/exam
+    - on: workstation
+      as: learner
+      timeoutSec: 120
+      run: /var/tmp/ct-seed/xiv-templated-configmaps/seed.sh xiv-templated-configmaps farm-settings init
+  teardown:
+    - on: sm-grid
+      run: kubectl delete namespace farm-settings --ignore-not-found --wait=false
+  checks:
+    - id: rendered
+      description: farm-gullhaven, farm-redmoor and farm-fenwick hold the required farm.ini
+      type: shell
+      on: sm-grid
+      skills: [iac.language.functions]
+      weight: 3
+      timeoutSec: 30
+      command: |
+        r=""
+        for f in gullhaven:{{gt}}:{{gc}}:offshore redmoor:{{rt}}:{{rc}}:offshore fenwick:{{ft}}:{{fc}}:inland; do
+          set -- $(echo "$f" | tr : ' '); n=$1 t=$2 c=$3 s=$4
+          want=$(printf '[farm]\nname = %s\nturbines = %s\ncapacity_mw = %s\nsite = %s' "$n" "$t" "$c" "$s")
+          got=$(kubectl -n farm-settings get configmap "farm-$n" -o jsonpath='{.data.farm\.ini}' 2>/dev/null)
+          [ "$got" = "$want" ] && r="$r $n=ok" || r="$r $n=wrong"
+        done
+        echo $r
+      expect: {match: exact, value: gullhaven=ok redmoor=ok fenwick=ok}
+    - id: from-template
+      description: The content is rendered by templatefile from a template file in the stack
+      type: shell
+      on: workstation
+      skills: [iac.language.functions]
+      weight: 1
+      command: |
+        d=/home/learner/exam/farm-settings
+        t=$(cat $d/*.tf 2>/dev/null | grep -c 'templatefile(')
+        f=$(find $d -path $d/.terraform -prune -o -type f ! -name '*.tf' ! -name '*.tfvars' ! -name '*.tfstate*' ! -name '.terraform.lock.hcl' ! -name '.ct-seeded' -print | xargs -r grep -l 'capacity_mw' 2>/dev/null | wc -l)
+        [ "$t" -ge 1 ] && [ "$f" -ge 1 ] && echo yes || echo "templatefile=$t templates=$f"
+      expect: {match: exact, value: "yes"}
+    - id: one-block
+      description: Adding a farm to the map plans exactly one new ConfigMap and nothing else
+      type: shell
+      on: workstation
+      skills: [iac.language.repetition]
+      weight: 2
+      timeoutSec: 150
+      command: |
+        tmp=$(runuser -u learner -- mktemp -d /tmp/ct-xiv-tpl.XXXXXX)
+        runuser -u learner -- cp -a /home/learner/exam/farm-settings/. "$tmp/"
+        printf '\nfarms = {\n  gullhaven = { turbines = {{gt}}, capacity_mw = {{gc}}, offshore = true }\n  redmoor = { turbines = {{rt}}, capacity_mw = {{rc}}, offshore = true }\n  fenwick = { turbines = {{ft}}, capacity_mw = {{fc}}, offshore = false }\n  larkholt = { turbines = 7, capacity_mw = 21, offshore = false }\n}\n' > "$tmp/ct-more.tfvars"
+        chown learner:learner "$tmp/ct-more.tfvars"
+        ct-iac planjson "$tmp" -var-file=ct-more.tfvars | jq -r '[.resource_changes[]? | select(.change.actions != ["no-op"] and .change.actions != ["read"]) | "\(.type):\(.change.actions | join("+")):\(.change.after.metadata[0].name // "")"] | join(" ")' 2>/dev/null || echo error
+        rm -rf "$tmp"
+      expect: {match: regex, value: '^kubernetes_config_map(_v1)?:create:farm-larkholt$'}
+    - id: converged
+      description: A new plan of ~/exam/farm-settings reports no changes
+      type: shell
+      on: workstation
+      skills: [iac.foundations.workflow]
+      weight: 1
+      timeoutSec: 120
+      command: ct-iac plan /home/learner/exam/farm-settings
+      expect: {match: exact, value: no-changes}
+  misconceptions:
+    - id: one-block-per-farm
+      description: Writes three ConfigMap resources with inline text.
+      feedback: Hand-written blocks per farm do not grow with the map, and the text is not templated. Use for_each over var.farms and templatefile.
+      expectFail: [from-template, one-block]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          cd ~/exam/farm-settings
+          for f in gullhaven:{{gt}}:{{gc}}:offshore redmoor:{{rt}}:{{rc}}:offshore fenwick:{{ft}}:{{fc}}:inland; do
+            set -- $(echo "$f" | tr : ' '); n=$1 t=$2 c=$3 s=$4
+            printf 'resource "kubernetes_config_map_v1" "%s" {\n  metadata {\n    name      = "farm-%s"\n    namespace = "farm-settings"\n  }\n  data = {\n    "farm.ini" = "[farm]\\nname = %s\\nturbines = %s\\ncapacity_mw = %s\\nsite = %s"\n  }\n}\n' "$n" "$n" "$n" "$t" "$c" "$s" >> main.tf
+          done
+          iac apply -auto-approve -input=false -no-color
+    - id: offshore-raw
+      description: Renders the offshore flag as true/false instead of the site word.
+      feedback: The required line is site = offshore or site = inland. Use a conditional in the template (or pass the word in).
+      expectFail: [rendered]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          cd ~/exam/farm-settings
+          printf '[farm]\nname = ${name}\nturbines = ${turbines}\ncapacity_mw = ${capacity_mw}\nsite = ${offshore}' > farm.ini.tftpl
+          cat >> main.tf <<'HCL'
+          resource "kubernetes_config_map_v1" "farm" {
+            for_each = var.farms
+            metadata {
+              name      = "farm-${each.key}"
+              namespace = "farm-settings"
+            }
+            data = {
+              "farm.ini" = templatefile("${path.module}/farm.ini.tftpl", merge(each.value, { name = each.key }))
+            }
+          }
+          HCL
+          iac apply -auto-approve -input=false -no-color
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/exam/farm-settings
+          printf '[farm]\nname = ${name}\nturbines = ${turbines}\ncapacity_mw = ${capacity_mw}\nsite = %%{ if offshore }offshore%%{ else }inland%%{ endif }' > farm.ini.tftpl
+          cat >> main.tf <<'HCL'
+          resource "kubernetes_config_map_v1" "farm" {
+            for_each = var.farms
+            metadata {
+              name      = "farm-${each.key}"
+              namespace = "farm-settings"
+            }
+            data = {
+              "farm.ini" = templatefile("${path.module}/farm.ini.tftpl", merge(each.value, { name = each.key }))
+            }
+          }
+          HCL
+          iac apply -auto-approve -input=false -no-color

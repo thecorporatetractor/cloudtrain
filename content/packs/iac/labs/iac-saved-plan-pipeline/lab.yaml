@@ -1,0 +1,259 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: iac-saved-plan-pipeline
+  title: Gate applies on an approved saved plan
+  domain: iac
+  frameworks: [tf-professional:policy-ci]
+  difficulty: medium
+  estimatedMinutes: 30
+  tags: [terraform, saved-plans, pipelines, approvals, ci]
+  version: 1
+spec:
+  description: |
+    The trading desk's CI runs **`pipeline.sh`** from the `main` branch of the
+    Git repository **`~/git/trading-pipeline.git`** (your working copy is
+    `~/src/trading-pipeline`). Today `apply` re-plans and applies with
+    `-auto-approve`, so what gets applied is not what anyone reviewed. State
+    lives in the workstation's S3 store, with locking.
+
+    Change `pipeline.sh` to this contract, then **commit and push** it to
+    `main`. For a stack directory `DIR`, its artifacts go to
+    `~/artifacts/<basename of DIR>/`:
+
+    - **`pipeline.sh plan DIR`** saves the plan with `plan -out` as
+      **`tfplan`** and its readable form (`terraform show`) as
+      **`tfplan.txt`**, and exits 0.
+    - **`pipeline.sh apply DIR`** applies **only that saved `tfplan`**, and
+      only when **`approved`** exists and its first word is the **sha256** of
+      `tfplan` (as printed by `sha256sum`). Otherwise it changes nothing and
+      exits non-zero. It never plans anew; a **stale** saved plan (state
+      moved on after the plan) must fail with a non-zero exit, too.
+
+    Then put the pending change of `~/stacks/trading-limits` (its
+    `terraform.tfvars` raises `max_position_mw` to {{limit}}) through your
+    pipeline: plan, approve the saved plan by writing its hash, apply.
+  objectives:
+    - Separate plan and apply with saved plan files
+    - Tie an approval to the exact plan that was reviewed
+    - Rely on stale-plan detection instead of re-planning at apply time
+  params:
+    old: {type: int, min: 200, max: 350}
+    limit:
+      type: choice
+      values: ["420", "480", "540"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+  setup:
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/stack/main.tf, source: assets/stack/main.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/pipeline.sh, source: assets/pipeline.sh, mode: "0755"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/seed.sh, source: assets/seed.sh, mode: "0755"}
+    - on: workstation
+      run: install -d -m 0755 /var/tmp/ct-grade
+    - on: workstation
+      file: {path: /var/tmp/ct-grade/fixture/main.tf, source: assets/fixture/main.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-grade/grade-pipeline.sh, source: assets/grade-pipeline.sh, mode: "0700"}
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/stacks
+    - on: workstation
+      as: learner
+      timeoutSec: 240
+      run: /var/tmp/ct-seed/seed.sh
+  checks:
+    - id: pushed
+      description: main of the pipeline repository has a pipeline.sh that saves plans
+      type: shell
+      on: workstation
+      skills: [iac.collaboration.saved-plans]
+      weight: 0.5
+      command: |
+        git --git-dir=/home/learner/git/trading-pipeline.git show main:pipeline.sh 2>/dev/null | grep -q -- '-out' && echo yes || echo no
+      expect: {match: exact, value: "yes"}
+    - id: applies-approved
+      description: An approved saved plan is applied (and plan writes tfplan and tfplan.txt)
+      type: shell
+      on: workstation
+      skills: [iac.collaboration.saved-plans]
+      weight: 2
+      timeoutSec: 240
+      command: /var/tmp/ct-grade/grade-pipeline.sh approved
+      expect: {match: exact, value: applied}
+    - id: refuses-unapproved
+      description: apply without an approval file changes nothing and exits non-zero
+      type: shell
+      on: workstation
+      skills: [iac.collaboration.saved-plans]
+      weight: 1.5
+      timeoutSec: 240
+      command: /var/tmp/ct-grade/grade-pipeline.sh unapproved
+      expect: {match: exact, value: refused}
+    - id: refuses-wrong-hash
+      description: An approval for a different plan is refused
+      type: shell
+      on: workstation
+      skills: [iac.collaboration.saved-plans]
+      weight: 1.5
+      timeoutSec: 240
+      command: /var/tmp/ct-grade/grade-pipeline.sh wronghash
+      expect: {match: exact, value: refused}
+    - id: refuses-stale
+      description: An approved plan made stale by a later state change is refused
+      type: shell
+      on: workstation
+      skills: [iac.collaboration.saved-plans]
+      weight: 2
+      timeoutSec: 240
+      command: /var/tmp/ct-grade/grade-pipeline.sh stale
+      expect: {match: exact, value: refused}
+    - id: change-shipped
+      description: The trading limits change went through an approved saved plan
+      type: shell
+      on: workstation
+      skills: [iac.collaboration.saved-plans]
+      weight: 1.5
+      timeoutSec: 30
+      command: |
+        a=/home/learner/artifacts/trading-limits
+        v=$(grep -o 'max_position_mw=[0-9]*' /home/learner/trading/limits.conf 2>/dev/null)
+        [ -s $a/tfplan ] && [ "$(cut -d' ' -f1 $a/approved 2>/dev/null)" = "$(sha256sum $a/tfplan | cut -d' ' -f1)" ] && p=approved || p=none
+        echo "$v plan=$p"
+      expect: {match: exact, value: "max_position_mw={{limit}} plan=approved"}
+    - id: converged
+      description: A new plan of ~/stacks/trading-limits reports no changes
+      type: shell
+      on: workstation
+      skills: [iac.foundations.workflow]
+      weight: 1
+      timeoutSec: 120
+      command: ct-iac plan /home/learner/stacks/trading-limits
+      expect: {match: exact, value: no-changes}
+  hints:
+    - title: Saved plans
+      body: '`terraform plan -out=FILE` writes a binary plan; `terraform apply FILE` applies exactly it, without asking and without re-planning. `terraform show FILE` prints it for reviewers.'
+      cost: 1
+    - title: Binding the approval
+      body: Compare `$(sha256sum "$art/tfplan" | cut -d' ' -f1)` with the first word of `$art/approved` and exit non-zero on a mismatch before calling terraform.
+      cost: 1
+    - title: Stale plans
+      body: Terraform refuses a saved plan whose state has changed since it was made ("Saved plan is stale"). Let that error fail the job; never fall back to a fresh apply.
+      cost: 2
+    - title: The runner reads main
+      body: Commit and push your change; the working copy alone does not count.
+      command: cd ~/src/trading-pipeline && git status && git log --oneline origin/main
+      cost: 1
+  misconceptions:
+    - id: approval-by-existence
+      description: Applies the saved plan whenever an approved file exists, whatever it contains.
+      feedback: An approval must name the plan it approves. Compare the file's hash with the approval; otherwise an old approval waves through any new plan.
+      expectFail: [refuses-wrong-hash]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          cd ~/src/trading-pipeline
+          cat > pipeline.sh <<'SH'
+          #!/bin/bash
+          set -euo pipefail
+          cmd=${1:?}; dir=$(cd "${2:?}" && pwd)
+          art=$HOME/artifacts/$(basename "$dir"); mkdir -p "$art"
+          cd "$dir"
+          case $cmd in
+            plan) terraform plan -input=false -no-color -out="$art/tfplan"; terraform show -no-color "$art/tfplan" > "$art/tfplan.txt" ;;
+            apply) [ -f "$art/approved" ] || exit 3; terraform apply -input=false -no-color "$art/tfplan" ;;
+          esac
+          SH
+          git commit -qam "pipeline: saved plans" && git push -q origin main
+          ./pipeline.sh plan ~/stacks/trading-limits >/dev/null
+          sha256sum ~/artifacts/trading-limits/tfplan > ~/artifacts/trading-limits/approved
+          ./pipeline.sh apply ~/stacks/trading-limits >/dev/null
+    - id: replan-on-apply
+      description: Checks the approval, then runs a fresh apply -auto-approve instead of applying the saved plan.
+      feedback: A fresh apply applies whatever the code and state say now, not the reviewed plan, and it hides a stale plan. Apply the saved file itself.
+      expectFail: [refuses-stale]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          cd ~/src/trading-pipeline
+          cat > pipeline.sh <<'SH'
+          #!/bin/bash
+          set -euo pipefail
+          cmd=${1:?}; dir=$(cd "${2:?}" && pwd)
+          art=$HOME/artifacts/$(basename "$dir"); mkdir -p "$art"
+          cd "$dir"
+          case $cmd in
+            plan) terraform plan -input=false -no-color -out="$art/tfplan"; terraform show -no-color "$art/tfplan" > "$art/tfplan.txt" ;;
+            apply)
+              [ "$(cut -d' ' -f1 "$art/approved" 2>/dev/null)" = "$(sha256sum "$art/tfplan" | cut -d' ' -f1)" ] || exit 3
+              terraform apply -input=false -no-color -auto-approve ;;
+          esac
+          SH
+          git commit -qam "pipeline: approvals" && git push -q origin main
+          ./pipeline.sh plan ~/stacks/trading-limits >/dev/null
+          sha256sum ~/artifacts/trading-limits/tfplan > ~/artifacts/trading-limits/approved
+          ./pipeline.sh apply ~/stacks/trading-limits >/dev/null
+    - id: not-pushed
+      description: Fixes the script in the working copy and applies the change, but never pushes.
+      feedback: The CI runner uses main of the Git repository. Commit and push, or the old pipeline keeps running.
+      expectFail: [pushed, refuses-unapproved, applies-approved]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          cd ~/stacks/trading-limits
+          terraform apply -input=false -no-color -auto-approve >/dev/null
+  solution:
+    explanation: |
+      `plan -out` freezes what reviewers see; `apply tfplan` applies exactly that
+      file and fails if the state changed since (stale plan). Hashing the plan
+      file ties the approval to one plan, so a missing or mismatched approval
+      stops the job before Terraform runs.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/src/trading-pipeline
+          cat > pipeline.sh <<'SH'
+          #!/bin/bash
+          # Saltmarsh trading-desk pipeline. The CI runner calls it from the main branch:
+          #   pipeline.sh plan  STACK_DIR   save tfplan + tfplan.txt in ~/artifacts/<stack>/
+          #   pipeline.sh apply STACK_DIR   apply that tfplan if ~/artifacts/<stack>/approved names its sha256
+          set -euo pipefail
+          cmd=${1:?usage: pipeline.sh plan|apply STACK_DIR}
+          dir=$(cd "${2:?usage: pipeline.sh plan|apply STACK_DIR}" && pwd)
+          art=$HOME/artifacts/$(basename "$dir")
+          mkdir -p "$art"
+          cd "$dir"
+          case $cmd in
+            plan)
+              rm -f "$art/approved"
+              terraform plan -input=false -no-color -out="$art/tfplan"
+              terraform show -no-color "$art/tfplan" > "$art/tfplan.txt" ;;
+            apply)
+              [ -s "$art/tfplan" ] || { echo "no saved plan in $art" >&2; exit 3; }
+              want=$(sha256sum "$art/tfplan" | cut -d' ' -f1)
+              got=$(cut -d' ' -f1 "$art/approved" 2>/dev/null || true)
+              [ "$got" = "$want" ] || { echo "saved plan is not approved" >&2; exit 3; }
+              terraform apply -input=false -no-color "$art/tfplan" ;;
+            *) echo "unknown command $cmd" >&2; exit 2 ;;
+          esac
+          SH
+          git commit -qam "pipeline: apply only approved saved plans"
+          git push -q origin main
+          ./pipeline.sh plan ~/stacks/trading-limits
+          sha256sum ~/artifacts/trading-limits/tfplan > ~/artifacts/trading-limits/approved
+          ./pipeline.sh apply ~/stacks/trading-limits

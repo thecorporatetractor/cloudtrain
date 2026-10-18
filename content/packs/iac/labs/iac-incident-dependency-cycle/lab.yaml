@@ -1,0 +1,191 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: iac-incident-dependency-cycle
+  title: Break a dependency cycle introduced by a refactor
+  domain: iac
+  frameworks: [tf-professional:operations]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [terraform, troubleshooting, dependencies, graph, depends_on]
+  version: 1
+spec:
+  description: |
+    Since refactor MR !412 was merged, the forecast stack in `~/stacks/forecast`
+    (target `sm-grid`, never applied since) fails before it plans anything.
+
+    1. Find the dependency loop. Use `terraform validate` or `terraform graph`
+       (the DOT output shows every edge) and write the **addresses of the
+       resources in the loop**, one per line, to **`~/reports/cycle.txt`**.
+    2. Break the loop at the edge that is wrong, and only there:
+       - the ConfigMap `forecast-endpoints` must keep carrying the Service's
+         real **cluster IP** (`FORECAST_PUBLIC_URL=http://<cluster IP>:<port>`);
+       - the API Deployment must keep loading that ConfigMap with `env_from`;
+       - the Deployment's ordering after the ResourceQuota is required (Pods
+         count against it) and must stay.
+    3. Apply the stack. Afterwards a plan reports no changes.
+  objectives:
+    - Read a cycle error and the dependency graph
+    - Tell implicit references from explicit depends_on edges
+    - Remove a superfluous depends_on without losing real ordering
+  params:
+    port:
+      type: choice
+      values: ["8080", "8081", "9080"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+      - name: sm-grid
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: sm-grid
+  setup:
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/main.tf, source: assets/main.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/seed.sh, source: assets/seed.sh, mode: "0755"}
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/stacks
+    - on: workstation
+      as: learner
+      timeoutSec: 180
+      run: /var/tmp/ct-seed/seed.sh
+  teardown:
+    - on: sm-grid
+      run: kubectl delete namespace forecast --ignore-not-found --wait=false
+  checks:
+    - id: cycle-report
+      description: ~/reports/cycle.txt names the Service, the ConfigMap and the Deployment in the loop
+      type: shell
+      on: workstation
+      skills: [iac.operations.troubleshooting]
+      weight: 1.5
+      command: |
+        f=/home/learner/reports/cycle.txt
+        r=""
+        for a in kubernetes_service_v1.api kubernetes_config_map_v1.endpoints kubernetes_deployment_v1.api; do
+          grep -qF "$a" "$f" 2>/dev/null && r="$r $a=yes" || r="$r $a=no"
+        done
+        q=$(grep -c 'kubernetes_resource_quota_v1\|kubernetes_namespace_v1' "$f" 2>/dev/null || true)
+        echo $r others=${q:-0}
+      expect: {match: exact, value: kubernetes_service_v1.api=yes kubernetes_config_map_v1.endpoints=yes kubernetes_deployment_v1.api=yes others=0}
+    - id: applied
+      description: All five objects are in the state of ~/stacks/forecast
+      type: shell
+      on: workstation
+      skills: [iac.operations.troubleshooting]
+      weight: 1.5
+      timeoutSec: 60
+      command: |
+        ct-iac state /home/learner/stacks/forecast | jq -r '[.values.root_module.resources[]? | select(.mode == "managed") | .address] | sort | join(" ")' 2>/dev/null
+      expect: {match: exact, value: kubernetes_config_map_v1.endpoints kubernetes_deployment_v1.api kubernetes_namespace_v1.forecast kubernetes_resource_quota_v1.forecast kubernetes_service_v1.api}
+    - id: real-cluster-ip
+      description: forecast-endpoints carries the Service's live cluster IP and port
+      type: shell
+      on: sm-grid
+      skills: [iac.language.dependencies]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        ip=$(kubectl -n forecast get service forecast-api -o jsonpath='{.spec.clusterIP}' 2>/dev/null)
+        url=$(kubectl -n forecast get configmap forecast-endpoints -o jsonpath='{.data.FORECAST_PUBLIC_URL}' 2>/dev/null)
+        [ -n "$ip" ] && [ "$url" = "http://$ip:{{port}}" ] && echo match || echo "url=${url:-none} ip=${ip:-none}"
+      expect: {match: exact, value: match}
+    - id: deployment-wired
+      description: The forecast-api Deployment loads forecast-endpoints with envFrom
+      type: k8s-query
+      skills: [iac.language.dependencies]
+      weight: 1
+      query: {cluster: sm-grid, resource: deployment, name: forecast-api, namespace: forecast, jsonpath: "{.spec.template.spec.containers[0].envFrom[0].configMapRef.name}"}
+      expect: {match: exact, value: forecast-endpoints}
+    - id: quota-ordering-kept
+      description: The only depends_on left is the Deployment's edge to the ResourceQuota
+      type: shell
+      on: workstation
+      skills: [iac.language.dependencies]
+      weight: 1.5
+      command: |
+        c=$(cat /home/learner/stacks/forecast/*.tf 2>/dev/null | grep -E '^[[:space:]]*depends_on[[:space:]]*=')
+        n=$(printf '%s' "$c" | grep -c . || true)
+        q=$(printf '%s' "$c" | grep -c 'kubernetes_resource_quota_v1.forecast' || true)
+        echo "depends_on=$n quota=$q"
+      expect: {match: exact, value: depends_on=1 quota=1}
+    - id: converged
+      description: A new plan of ~/stacks/forecast reports no changes
+      type: shell
+      on: workstation
+      skills: [iac.foundations.workflow]
+      weight: 1
+      timeoutSec: 120
+      command: ct-iac plan /home/learner/stacks/forecast
+      expect: {match: exact, value: no-changes}
+  hints:
+    - title: Read the error
+      body: '`terraform validate` names every vertex of the loop after "Error: Cycle:". In `terraform graph` output, each `"a" -> "b"` line means a waits for b.'
+      command: cd ~/stacks/forecast && terraform validate; terraform graph | grep -- '->'
+      cost: 1
+    - title: Which edge is wrong
+      body: Two of the three edges are references that carry data (the cluster IP into the ConfigMap, the ConfigMap name into the Deployment). The third is an explicit depends_on that only orders things, and a Service does not need its Pods to exist.
+      cost: 2
+  misconceptions:
+    - id: drop-every-depends-on
+      description: Deletes every depends_on in the stack, including the quota ordering.
+      feedback: Only the Service's depends_on closes the loop. The Deployment's depends_on on the ResourceQuota is real ordering (Pods count against the quota) and must stay.
+      expectFail: [quota-ordering-kept]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          cd ~/stacks/forecast
+          printf 'kubernetes_service_v1.api\nkubernetes_config_map_v1.endpoints\nkubernetes_deployment_v1.api\n' > ~/reports/cycle.txt
+          sed -i '/depends_on/d' main.tf
+          iac apply -auto-approve -input=false -no-color
+    - id: cut-the-env
+      description: Breaks the loop by removing env_from from the Deployment.
+      feedback: The API needs its public URL from the ConfigMap, so that reference is a real dependency. Remove the Service's depends_on on the Deployment instead.
+      expectFail: [deployment-wired, quota-ordering-kept]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          cd ~/stacks/forecast
+          printf 'kubernetes_service_v1.api\nkubernetes_config_map_v1.endpoints\nkubernetes_deployment_v1.api\n' > ~/reports/cycle.txt
+          python3 - <<'PY'
+          import re
+          p = "main.tf"; s = open(p).read()
+          s = re.sub(r'\n *env_from \{.*?\n *\}\n *\}\n', '\n', s, flags=re.S)
+          open(p, "w").write(s)
+          PY
+          iac apply -auto-approve -input=false -no-color
+  solution:
+    explanation: |
+      `validate` reports `Cycle: kubernetes_service_v1.api, kubernetes_deployment_v1.api,
+      kubernetes_config_map_v1.endpoints`. The ConfigMap references the Service's cluster
+      IP and the Deployment references the ConfigMap; both are data flowing along the
+      edge. The Service's `depends_on = [kubernetes_deployment_v1.api]` adds the closing
+      edge for no reason: a Service may exist before its Pods. Removing it gives the
+      order Service -> ConfigMap -> Deployment, after the quota.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/stacks/forecast
+          iac validate -no-color 2>&1 | grep -o 'kubernetes_[a-z0-9_]*\.[a-z0-9_]*' | sort -u > ~/reports/cycle.txt || true
+          cat ~/reports/cycle.txt
+          python3 - <<'PY'
+          p = "main.tf"; s = open(p).read()
+          s = s.replace('\n  # Refactor MR !412: "publish the Service only once the API is deployed".\n  depends_on = [kubernetes_deployment_v1.api]\n', '\n')
+          open(p, "w").write(s)
+          PY
+          iac validate -no-color
+          iac apply -auto-approve -input=false -no-color

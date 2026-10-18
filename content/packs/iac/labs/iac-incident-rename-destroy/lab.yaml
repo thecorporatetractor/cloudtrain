@@ -1,0 +1,207 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: iac-incident-rename-destroy
+  title: Stop a rename from destroying a database volume
+  domain: iac
+  frameworks: [tf-associate:state]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [terraform, moved, refactoring, change-review, prevent_destroy]
+  version: 1
+spec:
+  description: |
+    The working copy of `~/stacks/trading-db` (on `sm-grid`) contains merge
+    request !93, not yet applied: it renames the trading database's
+    PersistentVolumeClaim resource from `kubernetes_persistent_volume_claim_v1.db`
+    to `kubernetes_persistent_volume_claim_v1.ledger_data`. Review its plan:
+    Terraform wants to **destroy the claim `trading-ledger`** (and with it the
+    ledger data) and create an empty one.
+
+    1. Keep the rename, but add a **`moved` block** so the plan shows a move
+       and no destroy, then apply. The claim must stay the same object.
+    2. Make sure no later change can delete the claim by accident: add
+       **`lifecycle { prevent_destroy = true }`** to it.
+
+    Afterwards a plan reports no changes.
+  objectives:
+    - Spot a destroy hidden in a refactoring plan
+    - Rename a resource address with a moved block
+    - Guard stateful resources with prevent_destroy
+  params:
+    size:
+      type: choice
+      values: [1Gi, 2Gi, 5Gi]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+      - name: sm-grid
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: sm-grid
+  setup:
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/main.tf, source: assets/main.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/seed.sh, source: assets/seed.sh, mode: "0755"}
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/stacks
+    - on: workstation
+      as: learner
+      timeoutSec: 240
+      run: /var/tmp/ct-seed/seed.sh
+    - on: sm-grid
+      run: |
+        set -eu
+        kubectl -n kube-system get configmap ct-baseline-uids >/dev/null 2>&1 && exit 0
+        kubectl -n kube-system create configmap ct-baseline-uids \
+          --from-literal=pvc=$(kubectl -n trading-desk get pvc trading-ledger -o jsonpath='{.metadata.uid}')
+  teardown:
+    - on: sm-grid
+      run: kubectl delete namespace trading-desk --ignore-not-found --wait=false
+  checks:
+    - id: claim-kept
+      description: The claim trading-ledger is the original object with its size
+      type: shell
+      on: sm-grid
+      skills: [iac.state.refactor]
+      weight: 3
+      timeoutSec: 30
+      command: |
+        u=$(kubectl -n trading-desk get pvc trading-ledger -o jsonpath='{.metadata.uid}' 2>/dev/null)
+        s=$(kubectl -n trading-desk get pvc trading-ledger -o jsonpath='{.spec.resources.requests.storage}' 2>/dev/null)
+        [ -n "$u" ] && [ "$u" = "$(kubectl -n kube-system get configmap ct-baseline-uids -o jsonpath='{.data.pvc}')" ] && o=same || o=new
+        echo "claim=$o size=$s"
+      expect: {match: exact, value: "claim=same size={{size}}"}
+    - id: renamed-address
+      description: The state tracks the claim at kubernetes_persistent_volume_claim_v1.ledger_data
+      type: shell
+      on: workstation
+      skills: [iac.state.refactor]
+      weight: 1.5
+      timeoutSec: 60
+      command: |
+        ct-iac state /home/learner/stacks/trading-db | jq -r '[.values.root_module.resources[]? | select(.type == "kubernetes_persistent_volume_claim_v1") | .address] | join(" ")' 2>/dev/null
+      expect: {match: exact, value: kubernetes_persistent_volume_claim_v1.ledger_data}
+    - id: moved-block
+      description: The rename is recorded in a moved block from .db to .ledger_data
+      type: shell
+      on: workstation
+      skills: [iac.state.refactor]
+      weight: 1
+      command: |
+        cat /home/learner/stacks/trading-db/*.tf 2>/dev/null | tr -s ' \t\n' ' ' | grep -qE 'moved \{ from = kubernetes_persistent_volume_claim_v1\.db to = kubernetes_persistent_volume_claim_v1\.ledger_data \}' && echo yes || echo no
+      expect: {match: exact, value: "yes"}
+    - id: destroy-guarded
+      description: A plan that would destroy the claim is refused by prevent_destroy
+      type: shell
+      on: workstation
+      skills: [iac.collaboration.change-review]
+      weight: 1.5
+      timeoutSec: 150
+      command: |
+        out=$(ct-iac run /home/learner/stacks/trading-db iac plan -destroy -input=false -lock=false -no-color 2>&1)
+        printf '%s' "$out" | grep -q 'prevent_destroy' && echo refused || echo allowed
+      expect: {match: exact, value: refused}
+    - id: converged
+      description: A new plan of ~/stacks/trading-db reports no changes
+      type: shell
+      on: workstation
+      skills: [iac.foundations.workflow]
+      weight: 1
+      timeoutSec: 120
+      command: ct-iac plan /home/learner/stacks/trading-db
+      expect: {match: exact, value: no-changes}
+  hints:
+    - title: Read the plan
+      body: A rename without a moved block shows as `.db will be destroyed` plus `.ledger_data will be created`. With the moved block it shows `has moved to`.
+      command: cd ~/stacks/trading-db && terraform plan
+      cost: 1
+    - title: moved
+      body: |
+        ```hcl
+        moved {
+          from = kubernetes_persistent_volume_claim_v1.db
+          to   = kubernetes_persistent_volume_claim_v1.ledger_data
+        }
+        ```
+      cost: 1
+    - title: prevent_destroy
+      body: Add `lifecycle { prevent_destroy = true }` inside the claim's resource block. Any plan that would destroy it (a destroy, a replace, a rename without moved) then fails.
+      cost: 1
+  misconceptions:
+    - id: apply-as-is
+      description: Applies the merge request as it is.
+      feedback: Without a moved block the old address is destroyed and a new, empty claim is created - the ledger data is gone. Always read a refactoring plan for destroys.
+      expectFail: [claim-kept, moved-block]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 400
+        run: |
+          cd ~/stacks/trading-db
+          python3 - <<'PY'
+          p = "main.tf"; s = open(p).read()
+          s = s.replace("  wait_until_bound = false\n", "  wait_until_bound = false\n  lifecycle {\n    prevent_destroy = true\n  }\n", 1)
+          open(p, "w").write(s)
+          PY
+          # The new claim has the old one's name and races its deletion; the rerun finishes.
+          iac apply -auto-approve -input=false -no-color || iac apply -auto-approve -input=false -no-color || true
+    - id: state-mv-only
+      description: Moves the state entry by hand with terraform state mv and skips the moved block.
+      feedback: state mv fixes only this state copy and leaves the merge request dangerous for every other environment. Put the rename in a moved block.
+      expectFail: [moved-block]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          cd ~/stacks/trading-db
+          python3 - <<'PY'
+          p = "main.tf"; s = open(p).read()
+          s = s.replace("  wait_until_bound = false\n", "  wait_until_bound = false\n  lifecycle {\n    prevent_destroy = true\n  }\n", 1)
+          open(p, "w").write(s)
+          PY
+          iac state mv -no-color kubernetes_persistent_volume_claim_v1.db kubernetes_persistent_volume_claim_v1.ledger_data
+          iac apply -auto-approve -input=false -no-color
+    - id: no-guard
+      description: Adds the moved block but no prevent_destroy.
+      feedback: The moved block fixes this rename; prevent_destroy is what stops the next accident. Add it to the claim's lifecycle.
+      expectFail: [destroy-guarded]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          cd ~/stacks/trading-db
+          printf 'moved {\n  from = kubernetes_persistent_volume_claim_v1.db\n  to   = kubernetes_persistent_volume_claim_v1.ledger_data\n}\n' > moved.tf
+          iac apply -auto-approve -input=false -no-color
+  solution:
+    explanation: |
+      The moved block tells Terraform that the object at `.db` is now at
+      `.ledger_data`, so the plan moves the state entry and the claim (with its
+      volume) stays. With `prevent_destroy`, any future plan that would delete it -
+      a destroy, a forced replacement or another rename without moved - fails
+      instead of reaching the data.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/stacks/trading-db
+          iac plan -input=false -no-color | grep -E 'destroyed|created' || true
+          printf 'moved {\n  from = kubernetes_persistent_volume_claim_v1.db\n  to   = kubernetes_persistent_volume_claim_v1.ledger_data\n}\n' > moved.tf
+          python3 - <<'PY'
+          p = "main.tf"; s = open(p).read()
+          s = s.replace("  wait_until_bound = false\n", "  wait_until_bound = false\n\n  lifecycle {\n    prevent_destroy = true\n  }\n", 1)
+          open(p, "w").write(s)
+          PY
+          iac plan -input=false -no-color
+          iac apply -auto-approve -input=false -no-color

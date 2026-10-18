@@ -1,0 +1,487 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xiv-split-workload-module
+  title: Split workload resources into a module
+  domain: iac
+  frameworks: [tf-advanced:modules]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [exam, terraform, modules, moved, refactoring]
+  version: 1
+spec:
+  description: |
+    **Directory:** `~/exam/forecast-workload` · **Cluster:** `sm-grid`
+
+    The stack (applied) declares the forecast service's Deployment, Service and
+    HorizontalPodAutoscaler (namespace `forecast-svc`) directly in the root
+    module. Move them into a local module **`modules/workload`** called once
+    as **`module "forecast"`**:
+
+    - the module takes **one input variable `workload`** with an explicit
+      **`object({...})` type** that covers at least the name, image, replica
+      count, service port and maximum replicas;
+    - the root module keeps no Kubernetes resources of its own;
+    - the Deployment, Service and HPA must stay the **same objects** (no
+      destroy, no recreate) with today's settings.
+
+    Apply; the following plan must be empty.
+  objectives:
+    - Extract resources into a module with a typed input contract
+    - Preserve every object with moved blocks
+  params:
+    replicas: {type: int, min: 2, max: 3}
+    maxr: {type: int, min: 5, max: 9}
+    port:
+      type: choice
+      values: ["8080", "8081", "9090"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+      - name: sm-grid
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: sm-grid
+  setup:
+    - on: sm-grid
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata:
+          name: forecast-svc
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xiv-split-workload-module/stack/providers.tf, source: assets/stack/providers.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xiv-split-workload-module/stack/main.tf, source: assets/stack/main.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xiv-split-workload-module/seed.sh, source: assets/seed.sh, mode: "0755"}
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/exam
+    - on: workstation
+      as: learner
+      timeoutSec: 240
+      run: /var/tmp/ct-seed/xiv-split-workload-module/seed.sh xiv-split-workload-module forecast-workload apply
+    - on: sm-grid
+      run: |
+        set -eu
+        kubectl -n kube-system get configmap ct-xiv-swm >/dev/null 2>&1 && exit 0
+        kubectl -n kube-system create configmap ct-xiv-swm \
+          --from-literal=deploy=$(kubectl -n forecast-svc get deployment forecast -o jsonpath='{.metadata.uid}') \
+          --from-literal=svc=$(kubectl -n forecast-svc get service forecast -o jsonpath='{.metadata.uid}') \
+          --from-literal=hpa=$(kubectl -n forecast-svc get hpa forecast -o jsonpath='{.metadata.uid}')
+  teardown:
+    - on: sm-grid
+      run: kubectl delete namespace forecast-svc --ignore-not-found --wait=false
+  checks:
+    - id: objects-kept
+      description: The Deployment, Service and HPA are the original objects
+      type: shell
+      on: sm-grid
+      skills: [iac.modules.refactor]
+      weight: 1.5
+      timeoutSec: 30
+      command: |
+        b() { kubectl -n kube-system get configmap ct-xiv-swm -o jsonpath="{.data.$1}"; }
+        r=""
+        for k in deploy:deployment svc:service hpa:hpa; do
+          u=$(kubectl -n forecast-svc get ${k#*:} forecast -o jsonpath='{.metadata.uid}' 2>/dev/null)
+          [ -n "$u" ] && [ "$u" = "$(b ${k%%:*})" ] && r="$r ${k%%:*}=same" || r="$r ${k%%:*}=new"
+        done
+        echo $r
+      expect: {match: exact, value: deploy=same svc=same hpa=same}
+    - id: settings-kept
+      description: Replicas, service port and HPA bounds are unchanged
+      type: shell
+      on: sm-grid
+      skills: [iac.modules.refactor]
+      weight: 0.5
+      timeoutSec: 30
+      command: |
+        d=$(kubectl -n forecast-svc get deployment forecast -o jsonpath='{.spec.replicas}' 2>/dev/null)
+        p=$(kubectl -n forecast-svc get service forecast -o jsonpath='{.spec.ports[0].port}' 2>/dev/null)
+        h=$(kubectl -n forecast-svc get hpa forecast -o jsonpath='{.spec.minReplicas}-{.spec.maxReplicas}' 2>/dev/null)
+        echo "replicas=$d port=$p hpa=$h"
+      expect: {match: exact, value: "replicas={{replicas}} port={{port}} hpa={{replicas}}-{{maxr}}"}
+    - id: in-module
+      description: The three resources live in module.forecast and the root has none
+      type: shell
+      on: workstation
+      skills: [iac.modules.refactor]
+      weight: 3
+      timeoutSec: 60
+      command: |
+        ct-iac state /home/learner/exam/forecast-workload | jq -r '"root=\([.values.root_module.resources[]? | select(.mode == "managed")] | length) module=\([.values.root_module.child_modules[]? | select(.address == "module.forecast") | .resources[]? | select(.mode == "managed") | .type] | sort | join(","))"' 2>/dev/null
+      expect: {match: exact, value: "root=0 module=kubernetes_deployment_v1,kubernetes_horizontal_pod_autoscaler_v2,kubernetes_service_v1"}
+    - id: typed-contract
+      description: modules/workload takes a variable workload with an object type
+      type: shell
+      on: workstation
+      skills: [iac.modules.authoring]
+      weight: 2
+      command: |
+        cat /home/learner/exam/forecast-workload/modules/workload/*.tf 2>/dev/null | tr -d '\n' | grep -qE 'variable[[:space:]]+"workload"[[:space:]]*\{[^}]*type[[:space:]]*=[[:space:]]*object\(' && echo yes || echo no
+      expect: {match: exact, value: "yes"}
+    - id: converged
+      description: A new plan of ~/exam/forecast-workload reports no changes
+      type: shell
+      on: workstation
+      skills: [iac.foundations.workflow]
+      weight: 1
+      timeoutSec: 120
+      command: ct-iac plan /home/learner/exam/forecast-workload
+      expect: {match: exact, value: no-changes}
+  misconceptions:
+    - id: no-moved
+      description: Moves the blocks into the module without moved blocks.
+      feedback: Resources at new addresses are new resources. Add moved blocks from kubernetes_deployment_v1.forecast to module.forecast.kubernetes_deployment_v1.this (and the other two).
+      expectFail: [objects-kept]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          cd ~/exam/forecast-workload
+          mkdir -p modules/workload
+          cat > modules/workload/variables.tf <<'HCL'
+          variable "workload" {
+            type = object({
+              name         = string
+              namespace    = string
+              image        = string
+              replicas     = number
+              port         = number
+              max_replicas = number
+            })
+          }
+          HCL
+          cat > modules/workload/main.tf <<'HCL'
+          resource "kubernetes_deployment_v1" "this" {
+            metadata {
+              name      = var.workload.name
+              namespace = var.workload.namespace
+              labels    = { app = var.workload.name }
+            }
+            spec {
+              replicas = var.workload.replicas
+              selector {
+                match_labels = { app = var.workload.name }
+              }
+              template {
+                metadata {
+                  labels = { app = var.workload.name }
+                }
+                spec {
+                  container {
+                    name  = var.workload.name
+                    image = var.workload.image
+                    port {
+                      container_port = 80
+                    }
+                  }
+                }
+              }
+            }
+            wait_for_rollout = false
+          }
+
+          resource "kubernetes_service_v1" "this" {
+            metadata {
+              name      = var.workload.name
+              namespace = var.workload.namespace
+            }
+            spec {
+              selector = { app = var.workload.name }
+              port {
+                port        = var.workload.port
+                target_port = 80
+              }
+            }
+          }
+
+          resource "kubernetes_horizontal_pod_autoscaler_v2" "this" {
+            metadata {
+              name      = var.workload.name
+              namespace = var.workload.namespace
+            }
+            spec {
+              min_replicas = var.workload.replicas
+              max_replicas = var.workload.max_replicas
+              scale_target_ref {
+                api_version = "apps/v1"
+                kind        = "Deployment"
+                name        = kubernetes_deployment_v1.this.metadata[0].name
+              }
+              metric {
+                type = "Resource"
+                resource {
+                  name = "cpu"
+                  target {
+                    type                = "Utilization"
+                    average_utilization = 70
+                  }
+                }
+              }
+            }
+          }
+          HCL
+          cat > main.tf <<'HCL'
+          module "forecast" {
+            source = "./modules/workload"
+            workload = {
+              name         = "forecast"
+              namespace    = "forecast-svc"
+              image        = "httpd:2.4-alpine"
+              replicas     = {{replicas}}
+              port         = {{port}}
+              max_replicas = {{maxr}}
+            }
+          }
+
+
+
+          HCL
+          iac init -input=false -no-color >/dev/null
+          iac apply -auto-approve -input=false -no-color || iac apply -auto-approve -input=false -no-color || true
+    - id: untyped
+      description: Declares the module input without a type.
+      feedback: An untyped variable accepts anything; the contract is the object type, which documents the fields and rejects wrong input at plan time.
+      expectFail: [typed-contract]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          cd ~/exam/forecast-workload
+          mkdir -p modules/workload
+          cat > modules/workload/variables.tf <<'HCL'
+          variable "workload" {
+            description = "name, namespace, image, replicas, port, max_replicas"
+          }
+          HCL
+          cat > modules/workload/main.tf <<'HCL'
+          resource "kubernetes_deployment_v1" "this" {
+            metadata {
+              name      = var.workload.name
+              namespace = var.workload.namespace
+              labels    = { app = var.workload.name }
+            }
+            spec {
+              replicas = var.workload.replicas
+              selector {
+                match_labels = { app = var.workload.name }
+              }
+              template {
+                metadata {
+                  labels = { app = var.workload.name }
+                }
+                spec {
+                  container {
+                    name  = var.workload.name
+                    image = var.workload.image
+                    port {
+                      container_port = 80
+                    }
+                  }
+                }
+              }
+            }
+            wait_for_rollout = false
+          }
+
+          resource "kubernetes_service_v1" "this" {
+            metadata {
+              name      = var.workload.name
+              namespace = var.workload.namespace
+            }
+            spec {
+              selector = { app = var.workload.name }
+              port {
+                port        = var.workload.port
+                target_port = 80
+              }
+            }
+          }
+
+          resource "kubernetes_horizontal_pod_autoscaler_v2" "this" {
+            metadata {
+              name      = var.workload.name
+              namespace = var.workload.namespace
+            }
+            spec {
+              min_replicas = var.workload.replicas
+              max_replicas = var.workload.max_replicas
+              scale_target_ref {
+                api_version = "apps/v1"
+                kind        = "Deployment"
+                name        = kubernetes_deployment_v1.this.metadata[0].name
+              }
+              metric {
+                type = "Resource"
+                resource {
+                  name = "cpu"
+                  target {
+                    type                = "Utilization"
+                    average_utilization = 70
+                  }
+                }
+              }
+            }
+          }
+          HCL
+          cat > main.tf <<'HCL'
+          module "forecast" {
+            source = "./modules/workload"
+            workload = {
+              name         = "forecast"
+              namespace    = "forecast-svc"
+              image        = "httpd:2.4-alpine"
+              replicas     = {{replicas}}
+              port         = {{port}}
+              max_replicas = {{maxr}}
+            }
+          }
+
+          moved {
+            from = kubernetes_deployment_v1.forecast
+            to   = module.forecast.kubernetes_deployment_v1.this
+          }
+
+          moved {
+            from = kubernetes_service_v1.forecast
+            to   = module.forecast.kubernetes_service_v1.this
+          }
+
+          moved {
+            from = kubernetes_horizontal_pod_autoscaler_v2.forecast
+            to   = module.forecast.kubernetes_horizontal_pod_autoscaler_v2.this
+          }
+          HCL
+          iac init -input=false -no-color >/dev/null
+          iac apply -auto-approve -input=false -no-color
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/exam/forecast-workload
+          mkdir -p modules/workload
+          cat > modules/workload/variables.tf <<'HCL'
+          variable "workload" {
+            type = object({
+              name         = string
+              namespace    = string
+              image        = string
+              replicas     = number
+              port         = number
+              max_replicas = number
+            })
+          }
+          HCL
+          cat > modules/workload/main.tf <<'HCL'
+          resource "kubernetes_deployment_v1" "this" {
+            metadata {
+              name      = var.workload.name
+              namespace = var.workload.namespace
+              labels    = { app = var.workload.name }
+            }
+            spec {
+              replicas = var.workload.replicas
+              selector {
+                match_labels = { app = var.workload.name }
+              }
+              template {
+                metadata {
+                  labels = { app = var.workload.name }
+                }
+                spec {
+                  container {
+                    name  = var.workload.name
+                    image = var.workload.image
+                    port {
+                      container_port = 80
+                    }
+                  }
+                }
+              }
+            }
+            wait_for_rollout = false
+          }
+
+          resource "kubernetes_service_v1" "this" {
+            metadata {
+              name      = var.workload.name
+              namespace = var.workload.namespace
+            }
+            spec {
+              selector = { app = var.workload.name }
+              port {
+                port        = var.workload.port
+                target_port = 80
+              }
+            }
+          }
+
+          resource "kubernetes_horizontal_pod_autoscaler_v2" "this" {
+            metadata {
+              name      = var.workload.name
+              namespace = var.workload.namespace
+            }
+            spec {
+              min_replicas = var.workload.replicas
+              max_replicas = var.workload.max_replicas
+              scale_target_ref {
+                api_version = "apps/v1"
+                kind        = "Deployment"
+                name        = kubernetes_deployment_v1.this.metadata[0].name
+              }
+              metric {
+                type = "Resource"
+                resource {
+                  name = "cpu"
+                  target {
+                    type                = "Utilization"
+                    average_utilization = 70
+                  }
+                }
+              }
+            }
+          }
+          HCL
+          cat > main.tf <<'HCL'
+          module "forecast" {
+            source = "./modules/workload"
+            workload = {
+              name         = "forecast"
+              namespace    = "forecast-svc"
+              image        = "httpd:2.4-alpine"
+              replicas     = {{replicas}}
+              port         = {{port}}
+              max_replicas = {{maxr}}
+            }
+          }
+
+          moved {
+            from = kubernetes_deployment_v1.forecast
+            to   = module.forecast.kubernetes_deployment_v1.this
+          }
+
+          moved {
+            from = kubernetes_service_v1.forecast
+            to   = module.forecast.kubernetes_service_v1.this
+          }
+
+          moved {
+            from = kubernetes_horizontal_pod_autoscaler_v2.forecast
+            to   = module.forecast.kubernetes_horizontal_pod_autoscaler_v2.this
+          }
+          HCL
+          iac init -input=false -no-color >/dev/null
+          iac apply -auto-approve -input=false -no-color

@@ -1,0 +1,253 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: iac-module-provider-passing
+  title: Pass aliased providers into a module
+  domain: iac
+  frameworks: [tf-associate:modules, tf-advanced:providers]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [terraform, modules, providers, alias, multi-cluster]
+  version: 1
+spec:
+  description: |
+    The module `farm-base` (`~/stacks/farm-fleet/modules/farm-base`) creates
+    namespace `farms` and one ConfigMap `farm-<name>` per farm. It must now
+    serve both Saltmarsh clusters: **offshore** farms on **`sm-north-sea`**,
+    **inland** farms on **`sm-inland`** (both contexts are in your
+    kubeconfig). The stack in `~/stacks/farm-fleet` (initialised, nothing
+    applied) calls it once, and the module still carries a provider block that
+    pins it to `sm-north-sea`.
+
+    1. Make the module **provider-agnostic**: it declares which provider it
+       needs, but configures none.
+    2. In the root module, configure aliased `kubernetes` providers for both
+       clusters and **pass them through each module call's `providers`
+       map**.
+    3. Keep the `offshore` call (gullhaven, redmoor, skerrow on sm-north-sea)
+       and add a call **`inland`** with region `inland` for the farms named in
+       the TODO comment, on sm-inland.
+
+    Apply; afterwards a plan reports no changes.
+  objectives:
+    - Keep provider configuration out of reusable modules
+    - Pass provider instances into module calls with the providers map
+  params:
+    gt: {type: int, min: 30, max: 60}
+    rt: {type: int, min: 20, max: 45}
+    st: {type: int, min: 12, max: 28}
+    ft: {type: int, min: 6, max: 14}
+    lt: {type: int, min: 4, max: 11}
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+      - name: sm-north-sea
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: sm-north-sea
+      - name: sm-inland
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: sm-inland
+  setup:
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/stack/main.tf, source: assets/stack/main.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/stack/modules/farm-base/main.tf, source: assets/stack/modules/farm-base/main.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/seed.sh, source: assets/seed.sh, mode: "0755"}
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/stacks
+    - on: workstation
+      as: learner
+      timeoutSec: 120
+      run: /var/tmp/ct-seed/seed.sh
+  teardown:
+    - on: sm-north-sea
+      run: kubectl delete namespace farms --ignore-not-found --wait=false
+    - on: sm-inland
+      run: kubectl delete namespace farms --ignore-not-found --wait=false
+  checks:
+    - id: north-sea-farms
+      description: sm-north-sea holds exactly the offshore farms, with their turbine counts
+      type: shell
+      on: sm-north-sea
+      skills: [iac.modules.provider-passing]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        r=$(kubectl -n farms get namespace farms -o jsonpath='{.metadata.labels.saltmarsh\.example/region}' 2>/dev/null)
+        f=$(kubectl -n farms get configmap -o json 2>/dev/null | jq -r '[.items[] | select(.metadata.name | startswith("farm-")) | "\(.metadata.name)=\(.data.turbines)"] | sort | join(",")')
+        echo "region=${r:-none} farms=$f"
+      expect: {match: exact, value: "region=offshore farms=farm-gullhaven={{gt}},farm-redmoor={{rt}},farm-skerrow={{st}}"}
+    - id: inland-farms
+      description: sm-inland holds exactly the inland farms, with their turbine counts
+      type: shell
+      on: sm-inland
+      skills: [iac.modules.provider-passing]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        r=$(kubectl get namespace farms -o jsonpath='{.metadata.labels.saltmarsh\.example/region}' 2>/dev/null)
+        f=$(kubectl -n farms get configmap -o json 2>/dev/null | jq -r '[.items[] | select(.metadata.name | startswith("farm-")) | "\(.metadata.name)=\(.data.turbines)"] | sort | join(",")')
+        echo "region=${r:-none} farms=$f"
+      expect: {match: exact, value: "region=inland farms=farm-fenwick={{ft}},farm-larkholt={{lt}}"}
+    - id: module-unconfigured
+      description: modules/farm-base declares the kubernetes provider but has no provider block
+      type: shell
+      on: workstation
+      skills: [iac.modules.provider-passing]
+      weight: 1.5
+      command: |
+        m=$(cat /home/learner/stacks/farm-fleet/modules/farm-base/*.tf 2>/dev/null)
+        p=$(printf '%s\n' "$m" | grep -cE '^[[:space:]]*provider[[:space:]]+"')
+        r=$(printf '%s\n' "$m" | grep -c 'hashicorp/kubernetes')
+        echo "provider_blocks=$p declares_kubernetes=$([ "$r" -ge 1 ] && echo yes || echo no)"
+      expect: {match: exact, value: provider_blocks=0 declares_kubernetes=yes}
+    - id: providers-passed
+      description: Each module call's objects belong to an aliased provider instance passed in from the root
+      type: shell
+      on: workstation
+      skills: [iac.modules.provider-passing]
+      weight: 1.5
+      command: |
+        f=/home/learner/stacks/farm-fleet/terraform.tfstate
+        for m in offshore inland; do
+          p=$(jq -r --arg m "module.$m" '[.resources[]? | select(.module == $m) | .provider] | unique | join(",")' $f 2>/dev/null)
+          case $p in 'provider["'*'/hashicorp/kubernetes"].'*) echo -n "$m=passed " ;; '') echo -n "$m=none " ;; *) echo -n "$m=other " ;; esac
+        done
+      expect: {match: exact, value: "offshore=passed inland=passed "}
+    - id: converged
+      description: A new plan of ~/stacks/farm-fleet reports no changes
+      type: shell
+      on: workstation
+      skills: [iac.foundations.workflow]
+      weight: 1
+      timeoutSec: 120
+      command: ct-iac plan /home/learner/stacks/farm-fleet
+      expect: {match: exact, value: no-changes}
+  hints:
+    - title: Modules inherit or receive providers
+      body: A module with its own provider block can only ever talk to that cluster (and cannot use for_each or count). Delete the block; keep `required_providers` so the module says what it needs.
+      cost: 1
+    - title: The providers map
+      body: |
+        ```hcl
+        module "inland" {
+          source    = "./modules/farm-base"
+          providers = { kubernetes = kubernetes.inland }
+          ...
+        }
+        ```
+        The key is the provider name inside the module, the value an instance from the root.
+      cost: 1
+    - title: Check where things landed
+      body: Ask each cluster which farms it holds.
+      command: kubectl --context sm-inland -n farms get configmaps
+      cost: 1
+  misconceptions:
+    - id: provider-left-in-module
+      description: Leaves the provider block in the module and just adds a second call.
+      feedback: A provider block inside the module wins over nothing being passed, so both calls create their farms on sm-north-sea. Remove it and pass providers from the root.
+      expectFail: [inland-farms, module-unconfigured, providers-passed]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          cd ~/stacks/farm-fleet
+          printf '\nmodule "inland" {\n  source = "./modules/farm-base"\n  region = "inland"\n  farms  = { fenwick = {{ft}}, larkholt = {{lt}} }\n}\n' >> main.tf
+          iac init -input=false -no-color >/dev/null
+          iac apply -auto-approve -input=false -no-color || true
+    - id: swapped-instances
+      description: Passes the inland provider to the offshore call and the other way round.
+      feedback: The providers map decides where a call's objects go. offshore must get the sm-north-sea instance, inland the sm-inland one.
+      expectFail: [north-sea-farms, inland-farms]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          cd ~/stacks/farm-fleet
+          sed -i '/^provider "kubernetes" {/,/^}/d; /^# Copied in/d' modules/farm-base/main.tf
+          cat > main.tf <<'HCL'
+          provider "kubernetes" {
+            alias          = "north_sea"
+            config_path    = "~/.kube/config"
+            config_context = "sm-north-sea"
+          }
+
+          provider "kubernetes" {
+            alias          = "inland"
+            config_path    = "~/.kube/config"
+            config_context = "sm-inland"
+          }
+
+          module "offshore" {
+            source    = "./modules/farm-base"
+            providers = { kubernetes = kubernetes.inland }
+            region    = "offshore"
+            farms     = { gullhaven = {{gt}}, redmoor = {{rt}}, skerrow = {{st}} }
+          }
+
+          module "inland" {
+            source    = "./modules/farm-base"
+            providers = { kubernetes = kubernetes.north_sea }
+            region    = "inland"
+            farms     = { fenwick = {{ft}}, larkholt = {{lt}} }
+          }
+          HCL
+          iac init -input=false -no-color >/dev/null
+          iac apply -auto-approve -input=false -no-color
+  solution:
+    explanation: |
+      A reusable module declares its provider requirements and leaves the
+      configuration to the caller. The root configures one aliased instance per
+      cluster and maps the module's `kubernetes` provider to an instance in each
+      call's `providers` argument, so the same module code lands on whichever
+      cluster the caller chooses.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/stacks/farm-fleet
+          sed -i '/^provider "kubernetes" {/,/^}/d; /^# Copied in/d' modules/farm-base/main.tf
+          cat > main.tf <<'HCL'
+          provider "kubernetes" {
+            alias          = "north_sea"
+            config_path    = "~/.kube/config"
+            config_context = "sm-north-sea"
+          }
+
+          provider "kubernetes" {
+            alias          = "inland"
+            config_path    = "~/.kube/config"
+            config_context = "sm-inland"
+          }
+
+          module "offshore" {
+            source    = "./modules/farm-base"
+            providers = { kubernetes = kubernetes.north_sea }
+            region    = "offshore"
+            farms     = { gullhaven = {{gt}}, redmoor = {{rt}}, skerrow = {{st}} }
+          }
+
+          module "inland" {
+            source    = "./modules/farm-base"
+            providers = { kubernetes = kubernetes.inland }
+            region    = "inland"
+            farms     = { fenwick = {{ft}}, larkholt = {{lt}} }
+          }
+          HCL
+          iac init -input=false -no-color >/dev/null
+          iac apply -auto-approve -input=false -no-color

@@ -1,0 +1,246 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: iac-vcsim-inventory
+  title: Build vSphere folders and resource pools per wind farm
+  domain: iac
+  frameworks: [tf-associate:configuration]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [terraform, vsphere, data-sources, for_each, simulator]
+  version: 1
+spec:
+  description: |
+    Saltmarsh's farm controllers run as VMs on vSphere. This workstation runs a
+    **simulated vCenter** (`https://127.0.0.1:8989/sdk`, see `ct-vcsim status`)
+    with datacenter **`dc-saltmarsh`** and cluster **`farm-compute`**. The
+    simulator models the inventory only (no guest operations or clones).
+
+    The stack `~/stacks/vsphere-farms` (initialised) configures the `vsphere`
+    provider and sets `var.farms` in `terraform.tfvars`. For **each farm** in
+    the map, create:
+
+    1. a VM folder **`farm-<name>`** at the top of the datacenter's VM folder;
+    2. a resource pool **`rp-<name>`** directly under the cluster's root
+       resource pool, with **custom CPU shares** set to the farm's
+       `cpu_shares`.
+
+    Look up the datacenter and the cluster with **data sources** (no
+    hard-coded object IDs), and write one resource block per kind for all
+    farms. The simulator reports `scale_descendants_shares = "disabled"` on
+    resource pools; set that argument too so the plan converges. Apply;
+    afterwards a plan reports no changes.
+  objectives:
+    - Look up existing vSphere objects with data sources
+    - Create one object per map entry with for_each
+    - Configure resource pool CPU shares
+  params:
+    gs: {type: int, min: 3000, max: 6000}
+    rs: {type: int, min: 1500, max: 2999}
+    fs: {type: int, min: 500, max: 1499}
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+  setup:
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/vcsim.py, source: assets/vcsim.py, mode: "0755"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/stack/providers.tf, source: assets/stack/providers.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/stack/variables.tf, source: assets/stack/variables.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/stack/terraform.tfvars, source: assets/stack/terraform.tfvars, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/stack/main.tf, source: assets/stack/main.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/seed.sh, source: assets/seed.sh, mode: "0755"}
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/stacks
+    - on: workstation
+      as: learner
+      timeoutSec: 180
+      run: /var/tmp/ct-seed/seed.sh
+  checks:
+    - id: folders
+      description: dc-saltmarsh has a VM folder farm-<name> for gullhaven, redmoor and fenwick
+      type: shell
+      on: workstation
+      skills: [iac.targets.vsphere-api, iac.language.repetition]
+      weight: 2
+      timeoutSec: 60
+      command: |
+        for f in gullhaven redmoor fenwick; do
+          m=$(runuser -u learner -- python3 /var/tmp/ct-seed/vcsim.py moid "dc-saltmarsh/vm/farm-$f" 2>/dev/null)
+          case $m in group-*) echo -n "$f=folder " ;; *) echo -n "$f=missing " ;; esac
+        done
+      expect: {match: exact, value: "gullhaven=folder redmoor=folder fenwick=folder "}
+    - id: pools
+      description: farm-compute has resource pools rp-<name> with the farms' custom CPU shares
+      type: shell
+      on: workstation
+      skills: [iac.targets.vsphere-api, iac.language.repetition]
+      weight: 3
+      timeoutSec: 60
+      command: |
+        for f in gullhaven redmoor fenwick; do
+          echo -n "$f=$(runuser -u learner -- python3 /var/tmp/ct-seed/vcsim.py shares "dc-saltmarsh/host/farm-compute/Resources/rp-$f" 2>/dev/null) "
+        done
+      expect: {match: exact, value: "gullhaven=custom:{{gs}} redmoor=custom:{{rs}} fenwick=custom:{{fs}} "}
+    - id: data-sources
+      description: Folders and pools reference the datacenter and cluster data sources, not literal IDs
+      type: shell
+      on: workstation
+      skills: [iac.targets.vsphere-api]
+      weight: 2
+      timeoutSec: 120
+      command: |
+        ct-iac planjson /home/learner/stacks/vsphere-farms | jq -r '
+          [.configuration.root_module.resources[]?] as $r
+          | ([$r[] | select(.type == "vsphere_folder") | .expressions.datacenter_id.references // [] | .[]] | map(select(startswith("data.vsphere_datacenter."))) | length > 0) as $f
+          | ([$r[] | select(.type == "vsphere_resource_pool") | .expressions.parent_resource_pool_id.references // [] | .[]] | map(select(startswith("data.vsphere_compute_cluster."))) | length > 0) as $p
+          | "folders=\($f) pools=\($p)"' 2>/dev/null
+      expect: {match: exact, value: folders=true pools=true}
+    - id: one-block-each
+      description: One folder block and one resource pool block cover every farm
+      type: shell
+      on: workstation
+      skills: [iac.language.repetition]
+      weight: 1
+      command: |
+        c=$(cat /home/learner/stacks/vsphere-farms/*.tf 2>/dev/null)
+        f=$(printf '%s\n' "$c" | grep -cE '^[[:space:]]*resource[[:space:]]+"vsphere_folder"')
+        p=$(printf '%s\n' "$c" | grep -cE '^[[:space:]]*resource[[:space:]]+"vsphere_resource_pool"')
+        echo "folder_blocks=$f pool_blocks=$p"
+      expect: {match: exact, value: folder_blocks=1 pool_blocks=1}
+    - id: converged
+      description: A new plan of ~/stacks/vsphere-farms reports no changes
+      type: shell
+      on: workstation
+      skills: [iac.foundations.workflow]
+      weight: 1
+      timeoutSec: 120
+      command: ct-iac plan /home/learner/stacks/vsphere-farms
+      expect: {match: exact, value: no-changes}
+  hints:
+    - title: Looking up the estate
+      body: |
+        `data "vsphere_datacenter" "dc" { name = "dc-saltmarsh" }` and
+        `data "vsphere_compute_cluster" "farm" { name = "farm-compute"  datacenter_id = data.vsphere_datacenter.dc.id }`.
+        The cluster's root pool is `data.vsphere_compute_cluster.farm.resource_pool_id`.
+      cost: 1
+    - title: Folders
+      body: '`vsphere_folder` takes a `path` relative to the datacenter''s folder of that `type`; `type = "vm"` and `path = "farm-${each.key}"` put it at the top of the VM folder.'
+      cost: 1
+    - title: Shares only count when custom
+      body: '`cpu_shares` is used only with `cpu_share_level = "custom"`; the named levels (low, normal, high) fix the number themselves.'
+      cost: 1
+  misconceptions:
+    - id: hard-coded-ids
+      description: Copies the datacenter and root pool IDs from the simulator into the configuration.
+      feedback: Object IDs differ between vCenters and change on rebuilds. Look them up with the vsphere_datacenter and vsphere_compute_cluster data sources.
+      expectFail: [data-sources]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          cd ~/stacks/vsphere-farms
+          dc=$(python3 /var/tmp/ct-seed/vcsim.py moid dc-saltmarsh)
+          rp=$(python3 /var/tmp/ct-seed/vcsim.py moid dc-saltmarsh/host/farm-compute/Resources)
+          cat >> main.tf <<HCL
+          resource "vsphere_folder" "farm" {
+            for_each      = var.farms
+            path          = "farm-\${each.key}"
+            type          = "vm"
+            datacenter_id = "$dc"
+          }
+
+          resource "vsphere_resource_pool" "farm" {
+            for_each                 = var.farms
+            name                     = "rp-\${each.key}"
+            parent_resource_pool_id  = "$rp"
+            cpu_share_level          = "custom"
+            cpu_shares               = each.value.cpu_shares
+            scale_descendants_shares = "disabled"
+          }
+          HCL
+          iac apply -auto-approve -input=false -no-color
+    - id: shares-without-custom
+      description: Sets cpu_shares but leaves the share level at its default.
+      feedback: With a named share level vSphere ignores the number you set. Use cpu_share_level = "custom".
+      expectFail: [pools]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          cd ~/stacks/vsphere-farms
+          cat >> main.tf <<'HCL'
+          data "vsphere_datacenter" "dc" {
+            name = "dc-saltmarsh"
+          }
+
+          data "vsphere_compute_cluster" "farm" {
+            name          = "farm-compute"
+            datacenter_id = data.vsphere_datacenter.dc.id
+          }
+
+          resource "vsphere_folder" "farm" {
+            for_each      = var.farms
+            path          = "farm-${each.key}"
+            type          = "vm"
+            datacenter_id = data.vsphere_datacenter.dc.id
+          }
+
+          resource "vsphere_resource_pool" "farm" {
+            for_each                 = var.farms
+            name                     = "rp-${each.key}"
+            parent_resource_pool_id  = data.vsphere_compute_cluster.farm.resource_pool_id
+            scale_descendants_shares = "disabled"
+          }
+          HCL
+          iac apply -auto-approve -input=false -no-color || true
+  solution:
+    explanation: |
+      Data sources resolve `dc-saltmarsh` and `farm-compute` to their managed
+      object IDs at plan time, so the configuration works on any vCenter with the
+      same names. `for_each` over `var.farms` creates one folder and one pool per
+      farm, and the pool's shares apply because the level is `custom`.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/stacks/vsphere-farms
+          cat >> main.tf <<'HCL'
+          data "vsphere_datacenter" "dc" {
+            name = "dc-saltmarsh"
+          }
+
+          data "vsphere_compute_cluster" "farm" {
+            name          = "farm-compute"
+            datacenter_id = data.vsphere_datacenter.dc.id
+          }
+
+          resource "vsphere_folder" "farm" {
+            for_each      = var.farms
+            path          = "farm-${each.key}"
+            type          = "vm"
+            datacenter_id = data.vsphere_datacenter.dc.id
+          }
+
+          resource "vsphere_resource_pool" "farm" {
+            for_each                 = var.farms
+            name                     = "rp-${each.key}"
+            parent_resource_pool_id  = data.vsphere_compute_cluster.farm.resource_pool_id
+            cpu_share_level          = "custom"
+            cpu_shares               = each.value.cpu_shares
+            scale_descendants_shares = "disabled"
+          }
+          HCL
+          iac apply -auto-approve -input=false -no-color

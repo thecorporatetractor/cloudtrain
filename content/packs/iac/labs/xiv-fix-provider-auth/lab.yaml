@@ -1,0 +1,184 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xiv-fix-provider-auth
+  title: Repair a broken provider configuration
+  domain: iac
+  frameworks: [tf-advanced:providers]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [exam, terraform, providers, troubleshooting, debug-logs]
+  version: 1
+spec:
+  description: |
+    **Directory:** `~/exam/inland-auth` · **Cluster:** `sm-grid`
+
+    Since the CI migration the inland stack fails on every plan. It has a
+    pending change (ConfigMap `farm-fenwick`) that must go out.
+
+    1. Capture a **debug log** of a failing plan in
+       **`~/exam/inland-auth/auth-debug.log`** (the provider's own log lines
+       must be in it) and find the cause.
+    2. Fix the provider configuration so the stack authenticates through the
+       workstation's kubeconfig context **`sm-grid`**. The `.tf` files must not
+       contain any static credential (no `token`, `password`, `client_key` or
+       `client_certificate` arguments).
+    3. Apply; the following plan must be empty.
+  objectives:
+    - Read provider debug logs to find an authentication failure
+    - Configure a provider from the kubeconfig instead of static secrets
+  params:
+    lt: {type: int, min: 6, max: 14}
+    ft: {type: int, min: 15, max: 30}
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+      - name: sm-grid
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: sm-grid
+  setup:
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xiv-fix-provider-auth/stack/providers.tf, source: assets/stack/providers.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xiv-fix-provider-auth/stack/main.tf, source: assets/stack/main.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xiv-fix-provider-auth/seed.sh, source: assets/seed.sh, mode: "0755"}
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/exam
+    - on: workstation
+      as: learner
+      timeoutSec: 240
+      run: /var/tmp/ct-seed/xiv-fix-provider-auth/seed.sh
+  teardown:
+    - on: sm-grid
+      run: kubectl delete namespace inland-ops --ignore-not-found --wait=false
+  checks:
+    - id: debug-log
+      description: auth-debug.log holds provider debug output of the failing request
+      type: shell
+      on: workstation
+      skills: [iac.operations.troubleshooting]
+      weight: 1
+      command: |
+        f=/home/learner/exam/inland-auth/auth-debug.log
+        [ -s "$f" ] || { echo missing; exit 0; }
+        grep -qE '\[(DEBUG|TRACE)\]' "$f" && grep -qiE 'unauthorized|401' "$f" && echo captured || echo "no provider auth failure in the log"
+      expect: {match: exact, value: captured}
+    - id: no-static-secrets
+      description: The configuration holds no static credentials and uses the sm-grid kubeconfig context
+      type: shell
+      on: workstation
+      skills: [iac.language.provider-config]
+      weight: 2
+      command: |
+        c=$(cat /home/learner/exam/inland-auth/*.tf 2>/dev/null | sed 's/#.*//')
+        s=$(printf '%s\n' "$c" | grep -cE '^[[:space:]]*(token|password|client_key|client_certificate|username)[[:space:]]*=')
+        x=$(printf '%s\n' "$c" | grep -cE '^[[:space:]]*config_context[[:space:]]*=[[:space:]]*"sm-grid"')
+        echo "static=$s context=$x"
+      expect: {match: exact, value: static=0 context=1}
+    - id: change-applied
+      description: farm-fenwick exists with its turbine count and farm-larkholt is untouched
+      type: shell
+      on: sm-grid
+      skills: [iac.operations.troubleshooting]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        f=$(kubectl -n inland-ops get configmap farm-fenwick -o jsonpath='{.data.turbines}' 2>/dev/null)
+        l=$(kubectl -n inland-ops get configmap farm-larkholt -o jsonpath='{.data.turbines}' 2>/dev/null)
+        echo "fenwick=${f:-none} larkholt=${l:-none}"
+      expect: {match: exact, value: "fenwick={{ft}} larkholt={{lt}}"}
+    - id: in-state
+      description: The state manages the namespace and both ConfigMaps
+      type: shell
+      on: workstation
+      skills: [iac.language.provider-config]
+      weight: 1
+      timeoutSec: 60
+      command: |
+        ct-iac state /home/learner/exam/inland-auth | jq -r '[.values.root_module.resources[]? | select(.mode == "managed") | .address] | sort | join(" ")' 2>/dev/null
+      expect: {match: exact, value: kubernetes_config_map_v1.fenwick kubernetes_config_map_v1.larkholt kubernetes_namespace_v1.inland}
+    - id: converged
+      description: A new plan of ~/exam/inland-auth reports no changes
+      type: shell
+      on: workstation
+      skills: [iac.foundations.workflow]
+      weight: 1
+      timeoutSec: 120
+      command: ct-iac plan /home/learner/exam/inland-auth
+      expect: {match: exact, value: no-changes}
+  misconceptions:
+    - id: env-token
+      description: Keeps the token-based provider and moves the token into a variable default.
+      feedback: A variable default is still a static secret in code, and this token is revoked anyway. Point the provider at the kubeconfig (config_path and config_context = "sm-grid").
+      expectFail: [no-static-secrets, change-applied, in-state, converged]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          cd ~/exam/inland-auth
+          TF_LOG=DEBUG iac plan -input=false -no-color > auth-debug.log 2>&1 || true
+          sed -i 's/token    = "sm-ci-inland-7f3c2a9e41d84b6c"/token    = var.ci_token/' providers.tf
+          printf 'variable "ci_token" {\n  type      = string\n  sensitive = true\n  default   = "sm-ci-inland-7f3c2a9e41d84b6c"\n}\n' > variables.tf
+          iac apply -auto-approve -input=false -no-color || true
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/exam/inland-auth
+          TF_LOG=DEBUG iac plan -input=false -no-color > auth-debug.log 2>&1 || true
+          grep -iE 'unauthorized|401' auth-debug.log | head -3
+          cat > providers.tf <<'HCL'
+          terraform {
+            required_providers {
+              kubernetes = {
+                source  = "hashicorp/kubernetes"
+                version = "~> 3.3.0"
+              }
+            }
+          }
+
+          provider "kubernetes" {
+            config_path    = "~/.kube/config"
+            config_context = "sm-grid"
+          }
+          HCL
+          iac apply -auto-approve -input=false -no-color
+    alternatives:
+      - id: tf-log-path
+        description: Capture the log with TF_LOG_PATH instead of redirecting stderr.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 300
+            run: |
+              set -e
+              cd ~/exam/inland-auth
+              TF_LOG=TRACE TF_LOG_PATH=$PWD/auth-debug.log iac plan -input=false -no-color >/dev/null 2>&1 || true
+              cat > providers.tf <<'HCL'
+              terraform {
+                required_providers {
+                  kubernetes = {
+                    source  = "hashicorp/kubernetes"
+                    version = "~> 3.3.0"
+                  }
+                }
+              }
+
+              provider "kubernetes" {
+                config_path    = "~/.kube/config"
+                config_context = "sm-grid"
+              }
+              HCL
+              iac apply -auto-approve -input=false -no-color

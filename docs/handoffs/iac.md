@@ -1,8 +1,9 @@
 # Handoff: iac stream (wave 2, Terraform-first)
 
-Batch 1 merged as #28 (image + iac-foundations path), batch 2 (sim-iac-associate pool +
-this handoff) on branch `content/iac-wave2-exams`. Pack `content/packs/iac`, image
-`tools/images/iac`. Worked 2026-10-16/17.
+Round 1: #28 (image + iac-foundations path) and #31 (sim-iac-associate pool), 2026-10-16/17.
+Round 2 (branch `content/iac-round-2`, 2026-10-17/18): the other four learning paths, the
+sim-iac-advanced pool, the two IaC capstone tasks and image round 2. Pack
+`content/packs/iac`, image `tools/images/iac`.
 
 ## Status
 
@@ -12,8 +13,15 @@ The source of truth is each lab's `status`/`notes` in `content/curriculum.yaml`.
 |---|---|---|---|
 | Path `iac-foundations` (23 labs) | 23 | **23** | 0 |
 | Exam `sim-iac-associate` pool (25 tasks) | 25 | **25** | 0 |
-| Paths `iac-practitioner`, `iac-advanced-scenarios`, `iac-platform-scale`, `opentofu-differences` (31 more learning labs) | 0 | 0 | 31 |
-| Exam `sim-iac-advanced` IaC tasks (18) and the two `xpe-iac-*` capstone tasks | 0 | 0 | 18 + 2 |
+| Paths `iac-practitioner`, `iac-advanced-scenarios`, `iac-platform-scale`, `opentofu-differences` (31 learning labs) | 31 | **31** | 0 |
+| Exam `sim-iac-advanced` pool (18 tasks) | 18 | **18** | 0 |
+| Capstone tasks `xpe-iac-namespace-baseline`, `xpe-iac-import-drift` | 2 | **2** (standalone) | 0 |
+
+All 99 IaC labs in the curriculum are `verified`. sim-iac-advanced compiles (added to the
+CI compile step) and ran live on a shared workstation + `sm-grid` + `moto` environment:
+`--auto-solve --attempts 2` scored 100 % twice with disjoint draws (all 18 tasks drawn),
+`--no-solve` scored 27.8 % (fail), environments released, teardown clean. The capstone tasks verify standalone but do not compile into
+sim-platform-engineer yet (open question below).
 
 Every verified lab passed `labctl verify` (two seeds, every misconception mutation, every
 alternative, clean teardown). `sim-iac-associate` compiles (now in the CI compile step) and
@@ -29,7 +37,29 @@ iac-drift-refresh-only, iac-workspaces-vs-dirs, iac-first-module,
 iac-module-sources-versions, iac-custom-conditions, iac-secrets-out-of-state,
 iac-ephemeral-resources, iac-write-only-rotation, iac-hosted-platform-concepts.
 
-Adaptations recorded in the curriculum notes: no Git server (bare repos on the workstation),
+Round 2 labs (path order): iac-helm-release-values, iac-provider-aliases-two-clusters,
+iac-moto-vpc-subnets, iac-vcsim-inventory, iac-remote-state-sharing,
+iac-module-provider-passing, iac-module-tests-mocks, iac-opa-plan-policy,
+iac-saved-plan-pipeline, iac-dynamic-credentials, iac-scheduled-drift-check,
+iac-risky-change-review, iac-provider-upgrade-campaign, iac-core-version-upgrade,
+iac-provider-auth-logs, iac-incident-unsatisfiable-constraint, iac-query-bulk-import,
+iac-provider-actions, iac-stacks-concepts, iac-incident-out-of-band-drift,
+iac-split-monolith-modules, iac-split-large-state, iac-incident-dependency-cycle,
+iac-incident-stale-lock, iac-incident-rename-destroy, iac-state-recovery-versions,
+tofu-cli-differences, tofu-early-evaluation-backend, tofu-state-encryption-pbkdf2,
+tofu-oci-module-distribution, tofu-migrate-from-terraform.
+
+Terraform-only (do not work on the OpenTofu flavour): iac-core-version-upgrade (staged
+Terraform 1.9 is BUSL, Terraform flavour only), iac-query-bulk-import (`terraform query`),
+iac-provider-actions (actions). iac-stacks-concepts is a concept lab (no HCP account).
+Round 2 adaptations (curriculum notes): AWS-shaped labs and tasks use a separate `moto`
+lab peer node (`moto:5`); state stores stay in-pod (`ct-s3`), Git servers stay bare repos,
+the vCenter simulator (`ct-vcsim`) and the OCI registry (`ct-oci`) run in the workstation;
+iac-scheduled-drift-check (tier B in the curriculum) grades systemd user units with
+`systemd-analyze` and runs the unit's ExecStart (no systemd as PID 1), status file in
+`~/drift/`.
+
+Round 1 adaptations recorded in the curriculum notes: no Git server (bare repos on the workstation),
 no s3-store/moto nodes (in-pod `ct-s3`), iac-ephemeral-resources and iac-write-only-rotation
 use the cluster instead of an AWS-shaped secrets store (the latter moved to tier V),
 xia-debug-log-file writes to `~/exam/debug/` instead of `/var/log/iac`.
@@ -46,6 +76,9 @@ xia-debug-log-file writes to `~/exam/debug/` instead of `/var/log/iac`.
 | OpenTofu | 1.11.14 (sha256 pinned) | MPL-2.0 |
 | Provider mirror `/opt/cloudtrain/providers` | `providers.txt` -> `providers.lock` (sha256 per zip, from HashiCorp's GPG-verified SHA256SUMS via `lock-providers.sh`): kubernetes 3.3.0, helm 3.3.0, random 3.9.1/3.8.1/3.7.2, local 2.9.1, null 3.3.2, tls 4.4.1, time 0.14.2, http 3.6.2; linux_amd64 unpacked (init symlinks it), linux_arm64 zips for kubernetes and random | MPL-2.0 |
 | SeaweedFS `weed` 4.47 (`ct-s3`) | sha256 pinned (upstream ships md5 only) | Apache-2.0 |
+| Round 2: staged `terraform-1.9` (1.9.8, Terraform flavour only) and `terraform-1.5` (1.5.7, both; LICENSE from the v1.5.7 tag, sha256 pinned) under `/opt/cloudtrain/terraform/<v>/` | `deploy/versions.env` | BUSL-1.1 / MPL-2.0 |
+| Round 2 providers: kubernetes 2.38.0 (upgrade labs), aws 6.67.0 (~790 MB unpacked), vsphere 2.12.0 (newest on releases.hashicorp.com) | `providers.lock` | MPL-2.0 |
+| Round 2 tools: conftest 0.70.1, vcsim (govmomi 0.56.0, `ct-vcsim`), oras 1.3.4, CNCF registry 3.1.2 (`ct-oci`), openssl, systemd (for `systemd-analyze` only) | sha256 from each release's checksums | Apache-2.0 / LGPL (systemd) |
 | kubectl, helm, yq | from `deploy/versions.env` (same as the jumphost) | Apache-2.0 / MIT |
 
 Helpers in the image:
@@ -63,7 +96,14 @@ Helpers in the image:
 - `~/.terraformrc` (learner, root, skel): filesystem mirror only, no direct installs,
   `disable_checkpoint`. Both CLIs read it.
 
-Sizes (uncompressed): `cloudtrain/iac-ws:1.15-terraform` 1.57 GB, `cloudtrain/iac-ws:1.15-tofu` 1.41 GB.
+- `ct-vcsim start [ARGS]|ensure|status` (round 2): vcsim on https://127.0.0.1:8989/sdk
+  (user saltmarsh / saltmarsh-lab, self-signed). Inventory is in memory: after a pod
+  restart `ensure` brings back an empty simulator, so labs re-run their init.
+- `ct-oci start|ensure|status` (round 2): distribution registry on https://localhost:5000
+  with a lab CA generated at build time and trusted system-wide (OpenTofu talks HTTPS
+  only); `oras` needs `--plain-http=false` for localhost. Data in `~/.local/share/ct-oci`.
+
+Sizes (uncompressed, round 1): `cloudtrain/iac-ws:1.15-terraform` 1.57 GB, `cloudtrain/iac-ws:1.15-tofu` 1.41 GB.
 
 ### Terraform / OpenTofu swap
 
@@ -126,6 +166,32 @@ only). Re-check dates 2027-01-31.
 
 ## Platform findings
 
+Round 2:
+
+- **Moto as a lab peer works** (platform round 5, #41): `moto:5` (`motoserver/moto:5.2.3`)
+  runs its own entrypoint; the workstation reaches `http://moto:5000`. Setup and checks
+  run boto3 on the moto node (`on: moto`, python3 in the image), so baselines (ids,
+  creation dates) live there. AWS provider 6.67 against Moto: VPC/subnet/SG/instance/S3/
+  DynamoDB work; `terraform query` (list resource `aws_instance`) and the
+  `aws_ec2_stop_instance` action work; generated config needs cleaning (conflicting
+  arguments); Moto drops bucket tags given at create in a second region (avoid them).
+  Exam tasks sharing one Moto must use unique Name tags.
+- **kubernetes provider 2.38 -> 3.3:** only `kubernetes_namespace` -> `_v1` supports
+  `moved`; every other type fails with "Move Resource State Not Supported" and needs
+  `removed` (destroy = false) + `import`. 3.3 rejects null label values.
+- **Generated Kubernetes config is invalid as is:** `-generate-config-out` for a
+  Deployment emits `host_port = 0` and `active_deadline_seconds = 0`, which the provider
+  rejects (xiv-adopt-workloads-generated grades the cleanup).
+- **Image builds:** `cmd | head -1` under `pipefail` can fail with SIGPIPE (exit 141);
+  one build was lost to it. The heavy slot queue (kubeadm, automation, builds) meant the
+  round-2 image waited about 4 hours for its slot; queue image builds early.
+- **lab-verify** now counts params referenced in templated `file.source` assets
+  (they were reported as unused and failed `--strict`).
+- The image's awk is mawk; Kubernetes vcluster workloads are slow to schedule under
+  load (15 min "pod pending" timeouts happened at load 120+).
+
+Round 1:
+
 1. **Fixed in platform round 5: container nodes reach each other by name.** Every
    container node without links is a lab peer: `s3store`, `git` or `moto` resolve
    inside the session and the peer NetworkPolicy allows any port between the session's
@@ -155,19 +221,16 @@ only). Re-check dates 2027-01-31.
 
 ## Next steps
 
-1. Remaining learning paths, in order: `iac-practitioner` (helm values, provider aliases,
-   module provider passing, module tests with mocks, conftest policy, saved-plan pipeline,
-   dynamic credentials, drift timer, risky-change review, upgrade campaigns, query/actions,
-   Stacks concepts), then `iac-platform-scale` incident drills, `opentofu-differences`.
-2. Image additions those need: Terraform 1.9 and 1.5.7 staged (upgrade/migration labs),
-   kubernetes provider 2.38 in the mirror (major-upgrade lab), conftest, the aws provider
-   (large: ~600 MB unpacked) for AWS-shaped labs. Pin each like the rest.
-3. AWS-shaped targets (moto:5, sim-iac-advanced pool, iac-moto-vpc-subnets): a separate
-   `moto` container node now works (finding 1); the image still has to be built.
-4. `tofu-*` labs (state encryption, early evaluation, OCI distribution, migration) need
-   the Terraform flavour with tofu alongside, which the image already has.
-5. Promote the `iac.*` newSkills into `content/skills.yaml` once the wave settles.
-6. Rebuild/rescan the image monthly; the scanner ignores expire 2027-01-31.
+1. Capstone: decide the shared workstation of sim-platform-engineer (open question), then
+   compile and run that exam once the other domains' pools exist.
+2. OpenTofu flavour: round 2 labs were verified on the Terraform flavour only (tofu-*
+   labs call `tofu`, present in both). Re-run a sample on `ct-iactofu-system` with the
+   overlay, as round 1 did; the three Terraform-only labs are listed above.
+3. The Terraform 1.16 / OpenTofu 1.13 move stays deferred (decision 2026-10-17); it now
+   means re-verifying 99 labs.
+4. Promote the `iac.*` newSkills into `content/skills.yaml` once the wave settles.
+5. Rebuild/rescan the image monthly; the scanner ignores expire 2027-01-31. The image is
+   now ~2.9 GB (aws provider); if that hurts, split an `-aws` flavour.
 
 How to resume:
 
@@ -186,17 +249,16 @@ tools/slots/run.sh pod -- services/lab-orchestrator/bin/labctl verify --context 
 
 ## Open questions (user)
 
-- **Terraform for external customers:** labs and images are ready for either binary;
-  confirm the plan that external tenants get the OpenTofu flavour (overlay) until IBM
-  confirms hosted use of Terraform in writing.
-- **Publishing the Terraform image:** `images.yml` publishes the Terraform flavour to GHCR on
-  push to main (private while the repo is private). BUSL-1.1 permits redistribution with the
-  licence text (included). Publish it publicly, switch CI to the OpenTofu flavour, or exclude
-  it from publishing before the repo goes public?
-- **`terraform` shim in the OpenTofu flavour:** statements say `terraform`; the tofu image
-  makes `terraform` run tofu (with a one-line notice). Keep the shim, or show `tofu` in
-  statements for OpenTofu tenants?
-- **Versions:** curriculum says Terraform 1.15 and OpenTofu 1.11; current releases are 1.16.6
-  and 1.13.1. Stay, or move the image (and the curriculum text) forward?
+- **Capstone workstation (new):** sim-platform-engineer's tasks share one entry node
+  `workstation` (`jumphost:1`, no Terraform). The two IaC capstone tasks need
+  `terraform-ws:1.15`, so the exam compile reports "node workstation is defined
+  differently". Options: add terraform/tofu and the mirror to the jumphost, make
+  `terraform-ws:1.15` the capstone workstation (it has kubectl/helm, but not the
+  jumphost's ssh/etcd tooling), or give IaC tasks a second shell node with its own
+  kubeconfig. Needs a cross-stream decision; the tasks are verified standalone.
+
+- Decided 2026-10-17 (see `docs/handoff.md`): external tenants get the OpenTofu flavour;
+  public CI publishes only `iac-ws-tofu`; the `terraform` shim stays; the 1.16 / 1.13
+  version move is deferred.
 - **Product names in titles** (already open): this pack keeps Terraform/OpenTofu out of
   lab titles and uses them in statements.

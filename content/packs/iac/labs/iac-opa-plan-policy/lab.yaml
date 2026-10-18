@@ -1,0 +1,300 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: iac-opa-plan-policy
+  title: Block non-compliant plans with policy on plan JSON
+  domain: iac
+  frameworks: [tf-professional:policy-ci]
+  difficulty: hard
+  estimatedMinutes: 30
+  tags: [terraform, policy, conftest, rego, plan-json, ci, aws-shaped]
+  version: 1
+spec:
+  description: |
+    The trading-data stack in `~/stacks/trading-data` (on the AWS-shaped
+    endpoint `http://moto:5000`) is applied by its pipeline script
+    `ci/plan.sh`: plan to a file, export it as JSON, apply the saved plan.
+    Merge request !142 (`mr-142.tf`, not applied yet) would publish a bucket
+    to the world and start an instance nobody pays for.
+
+    Saltmarsh's rules, to enforce with **Conftest** policies (Rego, `package
+    main`, `deny` rules) in `~/stacks/trading-data/policy/`, evaluated on the
+    **plan JSON**:
+
+    1. no resource that is created or updated may lack a **`cost-centre`
+       tag** (any resource type that has a `tags` attribute);
+    2. no bucket may be public: an `aws_s3_bucket_public_access_block` with
+       any of its four settings off, or a public `aws_s3_bucket_acl`, fails.
+
+    Wire the check into `ci/plan.sh` so that a plan that breaks a rule is
+    **refused before anything is applied** (the script exits non-zero), while
+    a compliant plan still goes through. Do not apply merge request !142.
+  objectives:
+    - Write policy as code against the plan JSON format
+    - Gate a pipeline on policy results before apply
+  params:
+    suffix:
+      type: choice
+      values: [k1, n5, x7]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+      - name: moto
+        driver: container
+        image: moto:5
+  setup:
+    - on: moto
+      file: {path: /root/ct-opa-mr.py, source: assets/moto-mr.py, mode: "0600"}
+    - on: moto
+      timeoutSec: 120
+      run: for i in $(seq 1 60); do curl -s -o /dev/null http://localhost:5000/ && break; sleep 2; done
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/iac-opa-plan-policy/stack/providers.tf, source: assets/stack/providers.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/iac-opa-plan-policy/stack/main.tf, source: assets/stack/main.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/iac-opa-plan-policy/stack/ci/plan.sh, source: assets/stack/ci/plan.sh, mode: "0755"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/iac-opa-plan-policy/mr-142.tf, source: assets/mr-142.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/iac-opa-plan-policy/fixtures/providers.tf, source: assets/fixtures/providers.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/iac-opa-plan-policy/fixtures/good.tf, source: assets/fixtures/good.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/iac-opa-plan-policy/fixtures/public.tf, source: assets/fixtures/public.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/iac-opa-plan-policy/fixtures/untagged.tf, source: assets/fixtures/untagged.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/iac-opa-plan-policy/fixtures.sh, source: assets/fixtures.sh, mode: "0755"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/iac-opa-plan-policy/seed.sh, source: assets/seed.sh, mode: "0755"}
+    - on: workstation
+      file: {path: /usr/local/lib/cloudtrain/ct-opa-gate-test, source: assets/gate-test.sh, mode: "0700"}
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/stacks
+    - on: workstation
+      as: learner
+      timeoutSec: 300
+      run: /var/tmp/ct-seed/iac-opa-plan-policy/seed.sh
+    - on: workstation
+      as: learner
+      timeoutSec: 300
+      run: /var/tmp/ct-seed/iac-opa-plan-policy/fixtures.sh
+  checks:
+    - id: gate
+      description: ci/plan.sh refuses merge request !142 before apply and still applies a compliant plan
+      type: shell
+      on: workstation
+      skills: [iac.quality.policy]
+      weight: 3
+      timeoutSec: 300
+      command: sh /usr/local/lib/cloudtrain/ct-opa-gate-test
+      expect: {match: exact, value: mr142=refused clean=applied}
+    - id: rules
+      description: The policies pass a compliant plan and fail a public bucket and an untagged VPC
+      type: shell
+      on: workstation
+      skills: [iac.quality.policy, iac.state.inspection]
+      weight: 3
+      timeoutSec: 60
+      command: |
+        p=/home/learner/stacks/trading-data/policy
+        for c in good public untagged; do
+          runuser -u learner -- conftest test --no-color --policy "$p" /home/learner/.cache/ct-opa/$c.json >/dev/null 2>&1
+          printf '%s=%s ' $c $?
+        done
+      expect: {match: exact, value: "good=0 public=1 untagged=1 "}
+    - id: not-applied
+      description: Nothing from merge request !142 reached the endpoint
+      type: shell
+      on: moto
+      skills: [iac.quality.policy]
+      weight: 1
+      timeoutSec: 60
+      command: python3 /root/ct-opa-mr.py
+      expect: {match: exact, value: public_buckets=0 backtest=0}
+  hints:
+    - title: What conftest sees
+      body: '`terraform show -json ci/tfplan` gives the plan JSON. Each entry of `resource_changes` has `address`, `type`, `change.actions` and `change.after` (the planned attributes). `jq ''.resource_changes[] | {address, type, after: .change.after.tags}'' ci/plan.json` is a good look.'
+      cost: 1
+    - title: A deny rule
+      body: |
+        ```rego
+        package main
+        import rego.v1
+
+        deny contains msg if {
+          some rc in input.resource_changes
+          "create" in rc.change.actions
+          "tags" in object.keys(rc.change.after)
+          not rc.change.after.tags["cost-centre"]
+          msg := sprintf("%s has no cost-centre tag", [rc.address])
+        }
+        ```
+      cost: 2
+    - title: Wiring the gate
+      body: '`conftest test --policy policy ci/plan.json` exits 1 when a deny rule fires. The script runs with `set -e`, so placing it between `show -json` and `apply` stops the pipeline.'
+      cost: 1
+  misconceptions:
+    - id: not-wired
+      description: Writes the policies but leaves ci/plan.sh unchanged.
+      feedback: A policy nobody runs refuses nothing; the pipeline applied the merge request. Call conftest in ci/plan.sh between show -json and apply.
+      expectFail: [gate]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/stacks/trading-data
+          mkdir -p policy
+          cat > policy/plan.rego <<'REGO'
+          package main
+
+          import rego.v1
+
+          changing(rc) if {
+          	some a in rc.change.actions
+          	a in {"create", "update"}
+          }
+
+          deny contains msg if {
+          	some rc in input.resource_changes
+          	changing(rc)
+          	"tags" in object.keys(rc.change.after)
+          	not rc.change.after.tags["cost-centre"]
+          	msg := sprintf("%s has no cost-centre tag", [rc.address])
+          }
+
+          deny contains msg if {
+          	some rc in input.resource_changes
+          	rc.type == "aws_s3_bucket_public_access_block"
+          	changing(rc)
+          	some k in ["block_public_acls", "block_public_policy", "ignore_public_acls", "restrict_public_buckets"]
+          	rc.change.after[k] == false
+          	msg := sprintf("%s leaves %s off: buckets must not be public", [rc.address, k])
+          }
+
+          deny contains msg if {
+          	some rc in input.resource_changes
+          	rc.type == "aws_s3_bucket_acl"
+          	changing(rc)
+          	startswith(rc.change.after.acl, "public-")
+          	msg := sprintf("%s grants a public ACL", [rc.address])
+          }
+          REGO
+    - id: instances-only
+      description: Checks the cost-centre tag only on instances.
+      feedback: The rule covers every resource type with tags, not just instances; an untagged VPC or bucket must fail too. Test for the tags attribute instead of a type.
+      expectFail: [rules]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/stacks/trading-data
+          mkdir -p policy
+          cat > policy/plan.rego <<'REGO'
+          package main
+
+          import rego.v1
+
+          changing(rc) if {
+          	some a in rc.change.actions
+          	a in {"create", "update"}
+          }
+
+          deny contains msg if {
+          	some rc in input.resource_changes
+          	rc.type == "aws_instance"
+          	changing(rc)
+          	"tags" in object.keys(rc.change.after)
+          	not rc.change.after.tags["cost-centre"]
+          	msg := sprintf("%s has no cost-centre tag", [rc.address])
+          }
+
+          deny contains msg if {
+          	some rc in input.resource_changes
+          	rc.type == "aws_s3_bucket_public_access_block"
+          	changing(rc)
+          	some k in ["block_public_acls", "block_public_policy", "ignore_public_acls", "restrict_public_buckets"]
+          	rc.change.after[k] == false
+          	msg := sprintf("%s leaves %s off: buckets must not be public", [rc.address, k])
+          }
+
+          deny contains msg if {
+          	some rc in input.resource_changes
+          	rc.type == "aws_s3_bucket_acl"
+          	changing(rc)
+          	startswith(rc.change.after.acl, "public-")
+          	msg := sprintf("%s grants a public ACL", [rc.address])
+          }
+          REGO
+          python3 - <<'PY'
+          p = "ci/plan.sh"; s = open(p).read()
+          s = s.replace("# TODO(platform): policy gate on ci/plan.json before anything is applied.\n",
+                        "conftest test --no-color --policy policy ci/plan.json\n")
+          open(p, "w").write(s)
+          PY
+  solution:
+    explanation: |
+      Conftest evaluates Rego against the plan JSON, where every resource
+      change carries its planned attributes in change.after. One rule denies
+      created or updated resources whose tags lack cost-centre, others deny
+      public access blocks with a setting off and public ACLs. Running conftest
+      in ci/plan.sh after show -json and before apply (with set -e) turns any
+      deny into a refused pipeline; a compliant plan passes and is applied.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/stacks/trading-data
+          mkdir -p policy
+          cat > policy/plan.rego <<'REGO'
+          package main
+
+          import rego.v1
+
+          changing(rc) if {
+          	some a in rc.change.actions
+          	a in {"create", "update"}
+          }
+
+          deny contains msg if {
+          	some rc in input.resource_changes
+          	changing(rc)
+          	"tags" in object.keys(rc.change.after)
+          	not rc.change.after.tags["cost-centre"]
+          	msg := sprintf("%s has no cost-centre tag", [rc.address])
+          }
+
+          deny contains msg if {
+          	some rc in input.resource_changes
+          	rc.type == "aws_s3_bucket_public_access_block"
+          	changing(rc)
+          	some k in ["block_public_acls", "block_public_policy", "ignore_public_acls", "restrict_public_buckets"]
+          	rc.change.after[k] == false
+          	msg := sprintf("%s leaves %s off: buckets must not be public", [rc.address, k])
+          }
+
+          deny contains msg if {
+          	some rc in input.resource_changes
+          	rc.type == "aws_s3_bucket_acl"
+          	changing(rc)
+          	startswith(rc.change.after.acl, "public-")
+          	msg := sprintf("%s grants a public ACL", [rc.address])
+          }
+          REGO
+          python3 - <<'PY'
+          p = "ci/plan.sh"; s = open(p).read()
+          s = s.replace("# TODO(platform): policy gate on ci/plan.json before anything is applied.\n",
+                        "conftest test --no-color --policy policy ci/plan.json\n")
+          open(p, "w").write(s)
+          PY

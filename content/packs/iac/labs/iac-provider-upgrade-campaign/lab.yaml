@@ -1,0 +1,256 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: iac-provider-upgrade-campaign
+  title: Upgrade a provider major version across four stacks
+  domain: iac
+  frameworks: [tf-professional:upgrades, tf-advanced:providers]
+  difficulty: hard
+  estimatedMinutes: 35
+  tags: [terraform, provider-upgrades, kubernetes-provider, moved, import, lock-file]
+  version: 1
+spec:
+  description: |
+    Four Saltmarsh root modules in `~/stacks` (`farm-gullhaven`,
+    `farm-redmoor`, `grid-ingest`, `forecast`, all applied on `sm-grid`) still
+    pin the **kubernetes provider 2.38**. Move all four to the **3.3 series**
+    (`~> 3.3.0`):
+
+    1. Raise the constraint and refresh each **lock file** to 3.3.0.
+    2. Clear what 3.x reports: the plan must show **no deprecation warnings**,
+       so every resource uses the versioned (`_v1`) resource types. Read the
+       provider's changelog notes below before you rename anything.
+    3. Every existing object must stay the **same object** (no destroy, no
+       recreate), with its current labels and data.
+
+    Finish with an empty plan in all four stacks.
+
+    Changelog notes (kubernetes provider): *3.0.0: the unversioned resources
+    (`kubernetes_namespace`, `kubernetes_config_map`, ...) are deprecated, use
+    the `_v1` resources. 3.3.0: `kubernetes_namespace_v1` was migrated to the
+    plugin framework and supports `moved` blocks from `kubernetes_namespace`;
+    it now rejects `null` values inside `metadata.labels` and
+    `metadata.annotations`.*
+  objectives:
+    - Plan and run a provider major upgrade across several root modules
+    - Migrate deprecated resource types without recreating objects
+    - Refresh dependency lock files and verify empty plans
+  params:
+    gt: {type: int, min: 30, max: 60}
+    batch: {type: int, min: 10, max: 60}
+    pods: {type: int, min: 8, max: 20}
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+      - name: sm-grid
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: sm-grid
+  setup:
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/farm-gullhaven.tf, source: assets/farm-gullhaven.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/farm-redmoor.tf, source: assets/farm-redmoor.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/grid-ingest.tf, source: assets/grid-ingest.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/forecast.tf, source: assets/forecast.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/seed.sh, source: assets/seed.sh, mode: "0755"}
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/stacks
+    - on: workstation
+      as: learner
+      timeoutSec: 480
+      run: /var/tmp/ct-seed/seed.sh
+    - on: sm-grid
+      run: |
+        set -eu
+        kubectl -n kube-system get configmap ct-upgrade-uids >/dev/null 2>&1 && exit 0
+        u() { kubectl "$@" -o jsonpath='{.metadata.uid}'; }
+        kubectl -n kube-system create configmap ct-upgrade-uids \
+          --from-literal=ns-gullhaven=$(u get namespace farm-gullhaven) \
+          --from-literal=ns-redmoor=$(u get namespace farm-redmoor) \
+          --from-literal=ns-ingest=$(u get namespace grid-ingest) \
+          --from-literal=ns-forecast=$(u get namespace forecast) \
+          --from-literal=cm-turbines=$(u -n farm-gullhaven get configmap turbines) \
+          --from-literal=sa-scada=$(u -n farm-redmoor get serviceaccount scada-agent) \
+          --from-literal=cm-pipeline=$(u -n grid-ingest get configmap pipeline) \
+          --from-literal=quota=$(u -n forecast get resourcequota forecast-quota)
+  teardown:
+    - on: sm-grid
+      run: kubectl delete namespace farm-gullhaven farm-redmoor grid-ingest forecast --ignore-not-found --wait=false
+  checks:
+    - id: locks-refreshed
+      description: Each stack's lock file records kubernetes 3.3.0
+      type: shell
+      on: workstation
+      skills: [iac.operations.upgrades]
+      weight: 1.5
+      command: |
+        for s in farm-gullhaven farm-redmoor grid-ingest forecast; do
+          v=$(sed -n '/^provider "registry\.\(terraform\.io\|opentofu\.org\)\/hashicorp\/kubernetes"/,/^}/s/^ *version *= *"\(.*\)"/\1/p' /home/learner/stacks/$s/.terraform.lock.hcl 2>/dev/null)
+          echo -n "$s=${v:-none} "
+        done
+      expect: {match: exact, value: "farm-gullhaven=3.3.0 farm-redmoor=3.3.0 grid-ingest=3.3.0 forecast=3.3.0 "}
+    - id: versioned-types
+      description: No stack manages an unversioned (deprecated) resource type any more
+      type: shell
+      on: workstation
+      skills: [iac.operations.upgrades]
+      weight: 2
+      timeoutSec: 120
+      command: |
+        n=0
+        for s in farm-gullhaven farm-redmoor grid-ingest forecast; do
+          c=$(ct-iac state /home/learner/stacks/$s | jq '[.values.root_module.resources[]? | select(.mode == "managed" and (.type | test("_v[0-9]+$") | not))] | length' 2>/dev/null)
+          n=$((n + ${c:-99}))
+        done
+        echo "unversioned=$n"
+      expect: {match: exact, value: unversioned=0}
+    - id: no-warnings
+      description: Plans of all four stacks report no deprecation warnings
+      type: shell
+      on: workstation
+      skills: [iac.operations.upgrades]
+      weight: 1.5
+      timeoutSec: 240
+      command: |
+        w=0
+        for s in farm-gullhaven farm-redmoor grid-ingest forecast; do
+          c=$(ct-iac run /home/learner/stacks/$s iac plan -input=false -lock=false -no-color 2>&1 | grep -c 'Deprecated')
+          w=$((w + c))
+        done
+        echo "deprecation-lines=$w"
+      expect: {match: exact, value: deprecation-lines=0}
+    - id: objects-kept
+      description: All eight objects are the originals with their labels and data
+      type: shell
+      on: sm-grid
+      skills: [iac.operations.upgrades]
+      weight: 3
+      timeoutSec: 60
+      command: |
+        b() { kubectl -n kube-system get configmap ct-upgrade-uids -o jsonpath="{.data.$1}"; }
+        u() { kubectl "$@" -o jsonpath='{.metadata.uid}' 2>/dev/null; }
+        same=0
+        [ "$(u get namespace farm-gullhaven)" = "$(b ns-gullhaven)" ] && same=$((same+1))
+        [ "$(u get namespace farm-redmoor)" = "$(b ns-redmoor)" ] && same=$((same+1))
+        [ "$(u get namespace grid-ingest)" = "$(b ns-ingest)" ] && same=$((same+1))
+        [ "$(u get namespace forecast)" = "$(b ns-forecast)" ] && same=$((same+1))
+        [ "$(u -n farm-gullhaven get configmap turbines)" = "$(b cm-turbines)" ] && same=$((same+1))
+        [ "$(u -n farm-redmoor get serviceaccount scada-agent)" = "$(b sa-scada)" ] && same=$((same+1))
+        [ "$(u -n grid-ingest get configmap pipeline)" = "$(b cm-pipeline)" ] && same=$((same+1))
+        [ "$(u -n forecast get resourcequota forecast-quota)" = "$(b quota)" ] && same=$((same+1))
+        d="$(kubectl -n farm-gullhaven get configmap turbines -o jsonpath='{.data.count}' 2>/dev/null)/$(kubectl -n grid-ingest get configmap pipeline -o jsonpath='{.data.batch_seconds}' 2>/dev/null)/$(kubectl -n forecast get resourcequota forecast-quota -o jsonpath='{.spec.hard.pods}' 2>/dev/null)"
+        l="$(kubectl get namespace farm-gullhaven -o jsonpath='{.metadata.labels.saltmarsh\.example/farm}' 2>/dev/null)/$(kubectl get namespace grid-ingest -o jsonpath='{.metadata.labels.saltmarsh\.example/area}' 2>/dev/null)"
+        echo "same=$same data=$d labels=$l"
+      expect: {match: exact, value: "same=8 data={{gt}}/{{batch}}/{{pods}} labels=gullhaven/grid"}
+    - id: converged
+      description: New plans of all four stacks report no changes
+      type: shell
+      on: workstation
+      skills: [iac.foundations.workflow]
+      weight: 1
+      timeoutSec: 240
+      command: |
+        for s in farm-gullhaven farm-redmoor grid-ingest forecast; do echo -n "$(ct-iac plan /home/learner/stacks/$s) "; done
+      expect: {match: exact, value: "no-changes no-changes no-changes no-changes "}
+  hints:
+    - title: Start with one stack
+      body: Raise the constraint, run `terraform init -upgrade` (this rewrites the lock file) and read the plan's warnings. Repeat for the others once the first is clean.
+      cost: 1
+    - title: Namespaces versus the rest
+      body: |
+        `kubernetes_namespace_v1` accepts `moved { from = kubernetes_namespace.x  to = kubernetes_namespace_v1.x }`.
+        The other `_v1` types do not support moves across types ("Move Resource State Not Supported"): hand them over with a
+        `removed` block (`lifecycle { destroy = false }`) for the old address plus an `import` block for the new one.
+      cost: 2
+    - title: Optional labels
+      body: 'A label that is sometimes unset must be left out rather than set to null, e.g. `labels = merge({ ... }, var.owner == null ? {} : { "saltmarsh.example/owner" = var.owner })`.'
+      cost: 1
+  misconceptions:
+    - id: bump-only
+      description: Raises the constraint and refreshes the locks but keeps the deprecated types.
+      feedback: 3.x still runs the unversioned resources but warns on every plan, and they will be removed in a later major. Migrate them to the _v1 types now, while 3.3 can still read both.
+      expectFail: [versioned-types, no-warnings]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 600
+        run: |
+          for s in farm-gullhaven farm-redmoor grid-ingest forecast; do
+            cd ~/stacks/$s
+            sed -i 's/"~> 2.38.0"/"~> 3.3.0"/' main.tf
+            iac init -upgrade -input=false -no-color >/dev/null
+            iac apply -auto-approve -input=false -no-color
+          done
+    - id: rename-without-moves
+      description: Renames the types and drops the optional labels, without moved, removed or import blocks.
+      feedback: A new resource type at a new address is a new object to Terraform, so it destroys the namespace and everything in it. Use moved for namespaces and removed plus import for the other types.
+      expectFail: [objects-kept]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 900
+        run: |
+          for s in farm-gullhaven farm-redmoor grid-ingest forecast; do
+            cd ~/stacks/$s
+            sed -i -E 's/"~> 2.38.0"/"~> 3.3.0"/; s/resource "(kubernetes_namespace|kubernetes_config_map|kubernetes_service_account|kubernetes_resource_quota)" /resource "\1_v1" /; s/(kubernetes_namespace)\.([a-z]+)\./\1_v1.\2./g' main.tf
+            sed -i -E 's/^( +)"saltmarsh.example\/(owner|tier)" = var\.(owner|tier)$/\1# label left out/' main.tf
+            iac init -upgrade -input=false -no-color >/dev/null
+            # Recreated objects race their own destroys; the rerun finishes.
+            iac apply -auto-approve -input=false -no-color || iac apply -auto-approve -input=false -no-color || true
+          done
+  solution:
+    explanation: |
+      init -upgrade selects kubernetes 3.3.0 and rewrites each lock file. The
+      deprecation warnings come from the unversioned resource types. A namespace can
+      move to kubernetes_namespace_v1 with a moved block (3.3 implements the
+      cross-type move); the other _v1 types cannot, so each old address gets a
+      removed block with destroy = false (state only) and the new address an import
+      block for the same object. Optional labels are merged in only when set,
+      because 3.3 rejects null label values. Every object keeps its UID and the
+      plans end empty.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 900
+        run: |
+          set -e
+          python3 - <<'PY'
+          import os, re
+          ids = {
+              "farm-gullhaven": {"kubernetes_config_map.turbines": "farm-gullhaven/turbines"},
+              "farm-redmoor": {"kubernetes_service_account.scada": "farm-redmoor/scada-agent"},
+              "grid-ingest": {},
+              "forecast": {"kubernetes_resource_quota.forecast": "forecast/forecast-quota"},
+          }
+          for stack, imports in ids.items():
+              p = os.path.expanduser(f"~/stacks/{stack}/main.tf"); s = open(p).read()
+              s = s.replace('"~> 2.38.0"', '"~> 3.3.0"')
+              extra = ""
+              for t, n in re.findall(r'resource "(kubernetes_[a-z_]+?)" "([a-z_]+)"', s):
+                  if re.search(r'_v[0-9]$', t):
+                      continue
+                  s = s.replace(f'resource "{t}" "{n}"', f'resource "{t}_v1" "{n}"').replace(f'{t}.{n}.', f'{t}_v1.{n}.')
+                  if t == "kubernetes_namespace":
+                      extra += f'\nmoved {{\n  from = {t}.{n}\n  to   = {t}_v1.{n}\n}}\n'
+                  else:
+                      extra += f'\nremoved {{\n  from = {t}.{n}\n  lifecycle {{\n    destroy = false\n  }}\n}}\n\nimport {{\n  to = {t}_v1.{n}\n  id = "{imports[t + "." + n]}"\n}}\n'
+              # 3.3 rejects null label values: add optional labels only when set.
+              s = re.sub(r'labels = \{\n(\s+"saltmarsh\.example/[a-z]+" += "[a-z]+")\n\s+("saltmarsh\.example/[a-z]+") += var\.([a-z]+)\n\s+\}',
+                         lambda m: 'labels = merge({\n' + m.group(1) + '\n    }, var.' + m.group(3) + ' == null ? {} : { ' + m.group(2) + ' = var.' + m.group(3) + ' })', s)
+              open(p, "w").write(s + extra)
+          PY
+          for s in farm-gullhaven farm-redmoor grid-ingest forecast; do
+            cd ~/stacks/$s
+            iac init -upgrade -input=false -no-color >/dev/null
+            iac apply -auto-approve -input=false -no-color
+          done
