@@ -3,6 +3,10 @@
 #   tools/slots/run.sh vm    -- labctl verify ...   # anything that boots lab VMs
 #   tools/slots/run.sh build -- bash tools/images/build.sh ...  # VM image builds
 #   tools/slots/run.sh pod   -- labctl verify ...   # pod/vcluster-only labs (4 slots)
+# Slot counts (defaults are sized for the WSL reference machine; raise them on a bigger host):
+#   CT_SLOTS_HEAVY  vm + build jobs at once (default 1)
+#   CT_SLOTS_POD    pod jobs at once (default 4)
+# Every caller sharing a machine must use the same values.
 # vm and build share ONE "heavy" slot: at load 80+ kubeadm VMs lost 64-85% of their CPU
 # and never came up (foundations round 3), so one VM job or one image build runs at a time.
 # Waits until a slot is free. Two Docker/WSL crashes on this machine came from
@@ -10,7 +14,8 @@
 set -euo pipefail
 kind=${1:?usage: run.sh vm|build|pod -- command...}; shift
 [[ ${1:-} == -- ]] && shift
-case $kind in vm | build) lock=heavy n=1 ;; pod) lock=pod n=4 ;; *) echo "unknown slot kind $kind" >&2; exit 2 ;; esac
+case $kind in vm | build) lock=heavy n=${CT_SLOTS_HEAVY:-1} ;; pod) lock=pod n=${CT_SLOTS_POD:-4} ;; *) echo "unknown slot kind $kind" >&2; exit 2 ;; esac
+[[ $n =~ ^[1-9][0-9]*$ ]] || { echo "slot count for $lock must be a positive integer (got '$n')" >&2; exit 2; }
 dir=/tmp/cloudtrain-slots; mkdir -p "$dir"
 while :; do
   for i in $(seq 1 "$n"); do

@@ -1,10 +1,16 @@
 #!/usr/bin/env bash
 # Bring up the CloudTrain local runtime: kind + Kube-OVN + Multus + KubeVirt (KVM) + CDI.
 # Idempotent: re-running converges an existing cluster.
+# Host overrides (default: the reference machine's files):
+#   KIND_CONFIG=<file>            kind cluster config, used only when the cluster is created
+#   KUBE_OVN_EXTRA_VALUES=<file>  extra Helm values merged over deploy/kube-ovn/values.yaml
 source "$(dirname "$0")/lib.sh"
 for t in docker kind kubectl helm virtctl jq yq curl; do need "$t"; done
 
 T0=$SECONDS
+for f in ${KIND_CONFIG:+"$KIND_CONFIG"} ${KUBE_OVN_EXTRA_VALUES:+"$KUBE_OVN_EXTRA_VALUES"}; do
+  [[ -f $f ]] || die "override file not found: $f"
+done
 "$REPO_ROOT/deploy/scripts/host-prep.sh"
 
 # --- 1. kind cluster ---------------------------------------------------------
@@ -27,7 +33,7 @@ else
   # user's previous context back (every call here uses --context explicitly).
   prev_ctx=$(kubectl config current-context 2>/dev/null || true)
   kind create cluster --name "$CLUSTER_NAME" --image "$KIND_NODE_IMAGE" \
-    --config "$REPO_ROOT/deploy/kind/cluster.yaml" --wait 0s
+    --config "${KIND_CONFIG:-$REPO_ROOT/deploy/kind/cluster.yaml}" --wait 0s
   if [[ -n $prev_ctx ]]; then kubectl config use-context "$prev_ctx" >/dev/null; fi
 fi
 # Every node must have the KVM/virtio-net device nodes as character devices.
@@ -69,7 +75,7 @@ helm repo add kubeovn https://kubeovn.github.io/kube-ovn/ >/dev/null 2>&1 || tru
 helm repo update kubeovn >/dev/null
 helm --kube-context "$KUBECONTEXT" upgrade --install kube-ovn kubeovn/kube-ovn \
   --version "$KUBE_OVN_CHART_VERSION" --namespace kube-system \
-  -f "$REPO_ROOT/deploy/kube-ovn/values.yaml" \
+  -f "$REPO_ROOT/deploy/kube-ovn/values.yaml" ${KUBE_OVN_EXTRA_VALUES:+-f "$KUBE_OVN_EXTRA_VALUES"} \
   --set MASTER_NODES="$CP_IP" --wait --timeout 10m
 if [[ ${RESTART_OVN:-0} == 1 ]]; then
   k -n kube-system rollout restart deploy/ovn-central deploy/kube-ovn-controller ds/ovs-ovn ds/kube-ovn-cni >/dev/null
