@@ -8,12 +8,21 @@ pnpm --filter web dev        # http://localhost:5173, mock API via MSW
 pnpm --filter web build      # typecheck + production bundle
 ```
 
+## Public website
+
+`/`, `/catalog` (and `/catalog/paths/:id`, `/catalog/exams/:id`), `/pricing`, `/about`,
+`/faq`, `/contact` and `/legal/*` render without a session in the site layout
+(`src/site/`, `src/routes/site/`); `/` and `/catalog` turn into Home and the full
+catalog once signed in. Copy, brand, footer, flags and theme token overrides come
+from `content/site.yaml` through `GET /api/public/site` (mock mode bundles the file).
+Reference: `docs/website.md`.
+
 ## API modes
 
 | Mode | How | What |
 |---|---|---|
-| mock (default) | `pnpm --filter web dev` or `task dev:web:mock` | Everything runs in the browser (MSW); no backend or cluster. Two fictional organisations with people in every role; a **persona switcher** in the navigation footer signs you in as any of them. |
-| real | `VITE_API_MODE=real`, i.e. `task dev:web` | Vite proxies `/api`, including the terminal and observe WebSockets, to `services/gateway` (`CT_GATEWAY_URL`, default `http://127.0.0.1:8787`). Identity, assignments, teams, cohorts, admin and platform calls go to the gateway endpoints in `docs/api/platform.md`; Home and skill states are the gateway's learner model; only Scenario Studio stays in MSW (no backend yet). |
+| mock (default) | `pnpm --filter web dev` or `task dev:web:mock` | Everything runs in the browser (MSW); no backend or cluster. A first visit is signed out and shows the public website; the landing page offers the sample personas, and a **persona switcher** in the navigation footer switches between them (two fictional organisations with people in every role). |
+| real | `VITE_API_MODE=real`, i.e. `task dev:web` | Vite proxies `/api`, including the terminal and observe WebSockets, to `services/gateway` (`CT_GATEWAY_URL`, default `http://127.0.0.1:8787`). Identity, assignments, teams, cohorts, admin and platform calls go to the gateway endpoints in `docs/api/platform.md`; Home and skill states are the gateway's learner model; only Scenario Studio stays in MSW (no backend yet), whose worker registers when a Studio route first loads, so no service worker sits in front of the website. |
 
 Real mode needs the stack: `task dev:orchestrator`, `task dev:gateway`, `task dev:web`
 (see `services/gateway/README.md`). In the workspace the terminals wait behind an

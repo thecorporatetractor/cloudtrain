@@ -44,7 +44,6 @@ import type {
 import { labById, labSummaries, paths } from './fixtures/labs';
 import { frameworks } from './fixtures/skills';
 import {
-  DEFAULT_PERSONA,
   ORG_ACME,
   ORG_QUILLMOOR,
   assignedUsers,
@@ -112,8 +111,8 @@ function readSession(): MockSession | null {
   } catch {
     /* ignore */
   }
-  const p = personas.find((x) => x.id === DEFAULT_PERSONA)!;
-  return { userId: p.userId, orgId: p.orgId };
+  // First visit: signed out, so the public website shows (the landing page offers the sample personas).
+  return null;
 }
 function writeSession(s: MockSession | null) {
   try {

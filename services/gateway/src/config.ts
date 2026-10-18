@@ -56,6 +56,10 @@ export interface Config {
   examDurationMinutes?: number;
   /** CTF answers one learner may submit per minute (CT_ANSWER_RATE_PER_MINUTE, default 10). */
   answerRatePerMinute: number;
+  /** Public website configuration (CT_SITE_CONFIG, default content/site.yaml; a deployment mounts its own). */
+  siteConfigFile: string;
+  /** Requests per minute one client address may make to `/api/public/*` (CT_PUBLIC_RATE_PER_MINUTE, default 120). */
+  publicRatePerMinute: number;
   /**
    * DEV ONLY: `POST /api/dev/sign-in-as` (CT_DEV_IMPERSONATE=1). loadConfig refuses
    * to return a config with it on in production or on a non-loopback URL.
@@ -131,6 +135,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     labctl: fromRoot(env.CT_LABCTL ?? 'services/lab-orchestrator/bin/labctl'),
     validateTimeoutMs: num(env.CT_VALIDATE_TIMEOUT_MS, 60_000),
     answerRatePerMinute: Math.max(1, num(env.CT_ANSWER_RATE_PER_MINUTE, 10)),
+    siteConfigFile: fromRoot(env.CT_SITE_CONFIG ?? 'content/site.yaml'),
+    publicRatePerMinute: Math.max(1, num(env.CT_PUBLIC_RATE_PER_MINUTE, 120)),
     ...(ttl > 0 ? { sessionTtlMinutes: ttl } : {}),
     logLevel: env.CT_LOG_LEVEL ?? 'info',
     databaseUrl: env.CT_DATABASE_URL ?? 'postgres://cloudtrain_app:app-dev-only@127.0.0.1:55432/cloudtrain',

@@ -2,9 +2,11 @@ import { createRequire } from "node:module";
 import { Ajv2020, type ErrorObject } from "ajv/dist/2020.js";
 import type { Lab } from "./types.generated.js";
 import type { Curriculum } from "./curriculum.generated.js";
+import type { Site } from "./site.generated.js";
 
 export type * from "./types.generated.js";
 export type { Curriculum } from "./curriculum.generated.js";
+export type { Site } from "./site.generated.js";
 
 const require = createRequire(import.meta.url);
 
@@ -13,6 +15,9 @@ export const labSchema: Record<string, unknown> = require("../schema/lab.schema.
 
 /** The raw JSON Schema (draft 2020-12) for the `cloudtrain.dev/v1` Curriculum document. */
 export const curriculumSchema: Record<string, unknown> = require("../schema/curriculum.schema.json");
+
+/** The raw JSON Schema (draft 2020-12) for the `cloudtrain.dev/v1` Site document (public website configuration). */
+export const siteSchema: Record<string, unknown> = require("../schema/site.schema.json");
 
 export const LAB_API_VERSION = "cloudtrain.dev/v3" as const;
 
@@ -30,6 +35,17 @@ export interface ValidationResult {
 const ajv = new Ajv2020({ allErrors: true, strict: false, useDefaults: false });
 const compiled = ajv.compile<Lab>(labSchema);
 const compiledCurriculum = ajv.compile<Curriculum>(curriculumSchema);
+const compiledSite = ajv.compile<Site>(siteSchema);
+
+function unique(issues: ValidationIssue[]): ValidationIssue[] {
+  const seen = new Set<string>();
+  return issues.filter((i) => {
+    const k = `${i.path}|${i.message}`;
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+}
 
 function toIssue(e: ErrorObject): ValidationIssue {
   let message = e.message ?? "invalid";
@@ -73,6 +89,15 @@ export function validateCurriculum(doc: unknown): ValidationResult {
       return true;
     }),
   };
+}
+
+/**
+ * Validates a parsed site configuration (content/site.yaml or a deployment's CT_SITE_CONFIG)
+ * against the Site schema. Shape only; tools/lab-verify cross-checks the highlighted domains.
+ */
+export function validateSite(doc: unknown): ValidationResult {
+  const valid = compiledSite(doc) as boolean;
+  return { valid, issues: valid ? [] : unique((compiledSite.errors ?? []).map(toIssue)) };
 }
 
 /** Type guard form of {@link validateLab}. */

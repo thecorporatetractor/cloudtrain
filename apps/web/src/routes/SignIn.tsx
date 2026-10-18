@@ -1,9 +1,11 @@
-import { useNavigate } from '@tanstack/react-router';
+import { Link, useNavigate } from '@tanstack/react-router';
 import { ArrowLeft, ArrowRight, Building2, KeyRound, LogOut, ShieldCheck, TimerOff } from 'lucide-react';
 import { useEffect, useState, type FormEvent } from 'react';
 import { ApiError, useMe } from '@/api/client';
 import { isRealApi } from '@/api/mode';
+import { useSite } from '@/api/public';
 import { useDiscover, useMockLogin } from '@/api/platform';
+import { BrandMark, useBrandName } from '@/components/brand';
 import { Button, Field, Input } from '@/components/ui';
 import { signInRoute } from '@/router';
 
@@ -17,6 +19,8 @@ export function SignIn() {
   const search = signInRoute.useSearch();
   const navigate = useNavigate();
   const me = useMe();
+  const brand = useBrandName();
+  const tagline = useSite().data?.brand.tagline ?? 'Hands-on labs on real infrastructure';
   const [email, setEmail] = useState('');
   const [submitted, setSubmitted] = useState('');
   const [password, setPassword] = useState('');
@@ -72,15 +76,10 @@ export function SignIn() {
   return (
     <div className="signin">
       <div className="signin-panel">
-        <div className="signin-brand">
-          <span className="brand-mark" aria-hidden>
-            <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
-              <path d="M3 12.5h9.2a3.3 3.3 0 0 0 .4-6.57A4.6 4.6 0 0 0 4 7.6 2.5 2.5 0 0 0 3 12.5Z" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round" />
-              <path d="M6.5 15.5h5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
-            </svg>
-          </span>
-          <span className="brand-name">CloudTrain</span>
-        </div>
+        <Link to="/" className="signin-brand" aria-label={`${brand} home`}>
+          <BrandMark />
+          <span className="brand-name">{brand}</span>
+        </Link>
 
         {search.reason === 'expired' && (
           <div className="signin-notice" role="status">
@@ -200,7 +199,12 @@ export function SignIn() {
           </form>
         )}
       </div>
-      <p className="signin-foot xs subtle">Hands-on labs on real infrastructure · CloudTrain by AzarGuard</p>
+      <p className="signin-foot xs subtle">
+        {tagline} ·{' '}
+        <Link to="/" className="link-quiet">
+          Back to the website
+        </Link>
+      </p>
     </div>
   );
 }

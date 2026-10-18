@@ -93,6 +93,22 @@ async function ctfSteps(page, hint = true) {
 const PHONE = { width: 390, height: 844 };
 const TABLET = { width: 768, height: 1024 };
 const VIEWS = [
+  // The public website (signed out), then the same header once signed in.
+  ['landing', 'none', '/', 'How a lab works'],
+  ['landing-phone', 'none', '/', 'How a lab works', undefined, PHONE],
+  ['landing-tablet', 'none', '/', 'How a lab works', undefined, TABLET],
+  ['site-menu-phone', 'none', '/', 'How a lab works', async (p) => (await p.getByRole('button', { name: 'Open menu' }).click(), await p.getByRole('dialog').waitFor()), PHONE],
+  ['catalog-public', 'none', '/catalog', 'Everything you can practise'],
+  ['catalog-public-domain', 'none', '/catalog?domain=kubernetes', 'Kubernetes'],
+  ['catalog-public-phone', 'none', '/catalog', 'Everything you can practise', undefined, PHONE],
+  ['catalog-path-public', 'none', '/catalog/paths/cks-readiness', 'Network policy and least privilege'],
+  ['catalog-exam-public', 'none', '/catalog/exams/sim-k8s-admin', 'Objectives and weights'],
+  ['pricing', 'none', '/pricing', 'Plans are being finalised'],
+  ['about', 'none', '/about', 'Why CloudTrain exists'],
+  ['faq', 'none', '/faq', 'Frequently asked questions', async (p) => p.locator('details').first().click()],
+  ['contact', 'none', '/contact', 'Talk to us'],
+  ['legal-terms', 'none', '/legal/terms', 'Terms of service'],
+  ['site-signed-in', 'learner', '/about', 'Go to dashboard'],
   ['sign-in', 'none', '/sign-in', 'Sign in'],
   ['sign-in-sso', 'none', '/sign-in', 'Sign in', async (p) => (await p.getByLabel('Work email').fill('lena.varga@quillmoor.example'), await p.getByRole('button', { name: 'Continue' }).click(), await p.getByText('Continue with').waitFor())],
   ['sign-in-password', 'none', '/sign-in', 'Sign in', async (p) => (await p.getByLabel('Work email').fill('june.park@acmefreight.example'), await p.getByRole('button', { name: 'Continue' }).click(), await p.getByLabel('Password').waitFor())],
@@ -175,9 +191,10 @@ try {
     }
     await ctx.close();
   }
-  if (!only?.length && !storage) {
+  if (!storage) {
     for (const theme of ['light', 'cream']) {
-      for (const [name, persona, url, waitFor] of [VIEWS[0], VIEWS.find((v) => v[0] === 'team-dashboard'), VIEWS.find((v) => v[0] === 'cohort-board'), VIEWS.find((v) => v[0] === 'admin-users'), VIEWS.find((v) => v[0] === 'admin-sso')]) {
+      for (const [name, persona, url, waitFor] of [VIEWS.find((v) => v[0] === 'landing'), VIEWS.find((v) => v[0] === 'catalog-public'), VIEWS.find((v) => v[0] === 'sign-in'), VIEWS.find((v) => v[0] === 'team-dashboard'), VIEWS.find((v) => v[0] === 'cohort-board'), VIEWS.find((v) => v[0] === 'admin-users'), VIEWS.find((v) => v[0] === 'admin-sso')]) {
+        if (only?.length && !only.includes(name)) continue;
         const { ctx, page } = await session(theme, persona);
         await open(page, url, waitFor);
         await shot(page, `${name}-${theme}`);
@@ -186,6 +203,7 @@ try {
     }
     // Tables at 1280px.
     for (const [name, persona, url, waitFor] of [VIEWS.find((v) => v[0] === 'team-dashboard'), VIEWS.find((v) => v[0] === 'cohort-board'), VIEWS.find((v) => v[0] === 'admin-audit')]) {
+      if (only?.length && !only.includes(name)) continue;
       const { ctx, page } = await session('dark', persona, 1280);
       await open(page, url, waitFor);
       await shot(page, `${name}-dark-1280`);

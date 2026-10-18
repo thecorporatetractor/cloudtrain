@@ -96,6 +96,8 @@ export const queries = {
       },
       staleTime: 5 * 60_000,
       retry: (count, err) => !(err instanceof ApiError && (err.status === 401 || err.status === 403)) && count < 1,
+      // A visitor's 401 is a stable answer: every component mounting useMe() must not refetch it.
+      retryOnMount: false,
     }),
   home: () => queryOptions({ queryKey: ['home'], queryFn: () => request<HomeData>('/api/home') }),
   catalog: () => queryOptions({ queryKey: ['catalog'], queryFn: () => request<CatalogData>('/api/catalog'), staleTime: 60_000 }),

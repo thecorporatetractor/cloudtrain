@@ -38,6 +38,19 @@ Types: [`packages/api-types/platform.d.ts`](../../packages/api-types/platform.d.
 | `GET /me` | | `Me` | signed in | |
 | `POST /me/org` | `SwitchOrgRequest` | `Me` | membership in that org (or platform_admin) | `org.switch` |
 
+## Public website (no session)
+
+Served from `content/` and the site configuration only (`docs/website.md`); never from
+the database. `ETag` + `Cache-Control: public, max-age=300`; 429 `rate_limited` with
+`Retry-After` beyond `CT_PUBLIC_RATE_PER_MINUTE` requests per minute per client address.
+
+| Method + path | Response | Permission |
+|---|---|---|
+| `GET /public/site` | `SiteConfig` (validated `content/site.yaml` or `CT_SITE_CONFIG`) | public |
+| `GET /public/catalog` | `PublicCatalog` (domains with counts, paths and courses, labs, exam simulations without pool ids, frameworks, skill names) | public |
+| `GET /public/paths/:id` | `PublicPathDetail` (sections, labs in order, related paths); 404 unknown | public |
+| `GET /public/exams/:id` | `PublicExamDetail` (objectives with weights and pool sizes, rules, report contents); 404 unknown | public |
+
 ## Learner
 
 | Method + path | Request | Response | Permission |

@@ -22,6 +22,7 @@ import { LabctlExamCompiler } from './exams/compile.js';
 import { KubeExamCluster } from './exams/kube.js';
 import { PgEvidenceSink, PgExamStore, PgTeamDirectory } from './exams/pg.js';
 import { ExamService } from './exams/service.js';
+import { loadSiteConfig } from './site/config.js';
 
 async function main() {
   const config = loadConfig();
@@ -32,6 +33,7 @@ async function main() {
     if (!v) throw new Error(`${k} must be set`);
   }
   const content = await loadContent(config.contentDir, config.extraLabDirs);
+  const site = await loadSiteConfig(config.siteConfigFile);
   const compiler = new LabctlCompiler(config.labctl);
   await compiler.check();
   const kc = kubeConfigFor(config.kubeContext);
@@ -99,6 +101,7 @@ async function main() {
     events,
     logger: { level: config.logLevel },
     devImpersonate: config.devImpersonate,
+    site: { config: site, exams: examCatalog, ratePerMinute: config.publicRatePerMinute },
   });
   log = app.log;
   for (const i of examCatalog.issues) app.log.warn({ file: i.file }, `exams skipped: ${i.message}`);
@@ -107,6 +110,7 @@ async function main() {
   for (const i of content.issues) app.log.warn({ file: i.file }, `lab skipped: ${i.message}`);
   app.log.info({ labs: content.labs.size, skills: content.skills.length, frameworks: content.frameworks.length, context: config.kubeContext, namespace: config.namespace }, 'content loaded');
   if (config.devImpersonate) app.log.warn({ publicUrl: config.publicUrl }, 'DEV ONLY: CT_DEV_IMPERSONATE=1, POST /api/dev/sign-in-as is enabled (loopback callers only)');
+  app.log.info({ file: config.siteConfigFile, brand: site.brand.name, flags: site.flags }, 'public website config loaded');
   app.log.info({ issuer: config.oidc.issuer, publicUrl: config.publicUrl, webUrl: config.webUrl, platformIdps: config.platformIdps, domainVerifyBypass: config.devDomainVerifyBypass }, 'auth: OIDC (BFF)');
 
   const sweep = config.sweepIntervalMs > 0 ? setInterval(() => void platform.sweep().catch((e: unknown) => app.log.warn({ err: e }, 'attempt sweep failed')), config.sweepIntervalMs) : undefined;

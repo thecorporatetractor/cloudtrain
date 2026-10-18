@@ -458,3 +458,7 @@ export interface TeamData {
 // ---- Exam simulations (exam engine stream) ----
 
 export * from './exam.js';
+
+// ---- Public website (read-only, no sign-in) ----
+
+export * from './public.js';

@@ -12,7 +12,9 @@ import { COMPACT_NAV_QUERY, useMediaQuery } from '@/lib/media';
 import { THEMES, useTheme, type Theme } from '@/lib/theme';
 import { cn } from '@/lib/utils';
 import { canAccess } from './access';
-import { AuthGate, isPublicPath } from './auth';
+import { AuthGate, isHybridPath, isPublicPath, isSitePath } from './auth';
+import { BrandMark, useBrandName } from '@/components/brand';
+import { SiteLayout } from '@/site/SiteLayout';
 import { CommandPalette } from './CommandPalette';
 import { PersonaSwitcher } from './PersonaSwitcher';
 import { ShellProvider, useShell } from './shell-context';
@@ -86,7 +88,10 @@ function ShellInner() {
   const { theme, setTheme, cycle } = useTheme();
   const me = useMe();
   const inWorkspace = /^\/labs\/[^/]+\/work$/.test(pathname) || /\/observe\/[^/]+$/.test(pathname) || /^\/exams\/attempts\/[^/]+$/.test(pathname);
-  const publicPage = isPublicPath(pathname);
+  // Sign-in has no chrome; the website pages (and `/`, `/catalog` for visitors) use the site layout.
+  const sitePage = isSitePath(pathname) || (isHybridPath(pathname) && !me.isSuccess);
+  const publicPage = isPublicPath(pathname) || sitePage;
+  const brand = useBrandName();
   // Phones and tablets: the sidebar becomes a drawer behind a menu button in a top bar.
   const compact = useMediaQuery(COMPACT_NAV_QUERY);
   const [drawerOpen, setDrawerOpen] = useState(false);
@@ -113,6 +118,16 @@ function ShellInner() {
   ];
   useHotkeys(hotkeys, !publicPage);
 
+  if (sitePage) {
+    return (
+      <div className="shell shell-public shell-site">
+        <SiteLayout>
+          <Outlet />
+        </SiteLayout>
+        <Toasts />
+      </div>
+    );
+  }
   if (publicPage) {
     return (
       <div className="shell shell-public">
@@ -140,9 +155,9 @@ function ShellInner() {
             <button ref={menuButton} type="button" className="topbar-btn" onClick={() => setDrawerOpen(true)} aria-label="Open navigation" aria-expanded={drawerOpen} aria-controls="nav-drawer" aria-haspopup="dialog">
               <Menu size={18} />
             </button>
-            <Link to="/" className="brand" aria-label="CloudTrain home">
+            <Link to="/" className="brand" aria-label={`${brand} home`}>
               <BrandMark />
-              <span className="brand-name">CloudTrain</span>
+              <span className="brand-name">{brand}</span>
             </Link>
             <button type="button" className="topbar-btn" style={{ marginLeft: 'auto' }} onClick={() => shell.setPaletteOpen(true)} aria-label="Search and commands">
               <Search size={17} />
@@ -190,28 +205,18 @@ function ShellInner() {
   );
 }
 
-function BrandMark() {
-  return (
-    <span className="brand-mark" aria-hidden>
-      <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
-        <path d="M3 12.5h9.2a3.3 3.3 0 0 0 .4-6.57A4.6 4.6 0 0 0 4 7.6 2.5 2.5 0 0 0 3 12.5Z" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round" />
-        <path d="M6.5 15.5h5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
-      </svg>
-    </span>
-  );
-}
-
 /** The sidebar: a column beside the page on wide screens, the content of the drawer on phones and tablets. */
 function NavPanel({ mode, inDrawer, inWorkspace, pathname, sections, principal, theme, setTheme, onClose }: { mode: 'full' | 'rail'; inDrawer: boolean; inWorkspace: boolean; pathname: string; sections: NavSection[]; principal: Me | undefined; theme: Theme; setTheme: (t: Theme) => void; onClose: () => void }) {
   const shell = useShell();
+  const brand = useBrandName();
   // In the drawer, menus open upward: there is no room to the right on a phone.
   const menuSide = inDrawer ? 'top' : 'right';
   return (
     <nav className="nav" aria-label="Primary">
       <div className="nav-brand">
-        <Link to="/" className="brand" aria-label="CloudTrain home">
+        <Link to="/" className="brand" aria-label={`${brand} home`}>
           <BrandMark />
-          {mode === 'full' && <span className="brand-name">CloudTrain</span>}
+          {mode === 'full' && <span className="brand-name">{brand}</span>}
         </Link>
         {inDrawer ? (
           <DialogPrimitive.Close asChild>

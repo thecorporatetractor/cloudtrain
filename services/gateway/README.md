@@ -80,6 +80,8 @@ CT_EXTRA_LAB_DIRS=services/gateway/test/fixtures/labs task dev:gateway
 | `CT_DEV_DOMAIN_VERIFY_BYPASS` | off (`task dev:gateway`: `1`) | accept domain verification without the DNS TXT record; ignored with `NODE_ENV=production` |
 | `CT_DEV_IMPERSONATE` | off (`task dev:gateway`: `1`) | DEV ONLY: `POST /api/dev/sign-in-as` for agents; refused at startup with `NODE_ENV=production` or a non-localhost `CT_PUBLIC_URL`/`CT_WEB_URL` (docs/dev-environment.md, "Signing in as a real user") |
 | `CT_SWEEP_INTERVAL_MS` | `60000` | closes attempts whose LabSession expired or vanished |
+| `CT_SITE_CONFIG` | `content/site.yaml` | public website configuration (`cloudtrain.dev/v1 Site`, `docs/website.md`); a deployment mounts its own file here. Invalid = refuses to start |
+| `CT_PUBLIC_RATE_PER_MINUTE` | `120` | requests per minute one client address may make to `/api/public/*` (429 + `Retry-After` beyond) |
 
 Relative paths are relative to the repository root.
 
@@ -97,6 +99,7 @@ in `src/authz.ts`).
 | Method + path | |
 |---|---|
 | `GET /health` | no auth; lab count and content issues |
+| `GET /public/site`, `GET /public/catalog`, `GET /public/paths/:id`, `GET /public/exams/:id` | no auth: the website's configuration and the read-only catalog (paths, courses, labs, exam simulations, frameworks) from content/ only, never from the database (no progress, visibility, attempts or exam pool ids). `ETag` + `Cache-Control: public, max-age=300`, rate-limited per client address (`src/routes/public.ts`) |
 | `GET /me` | `Me`: user, active org, memberships, roles, permissions + scoped grants, teams, cohorts, CSRF token |
 | `GET /home` | real recommendations, goal forecast, activity, mastery and assignments due (`source: empty` before any history) |
 | `GET /catalog` | domains, paths (pack courses + pack paths), lab summaries; filtered by the org's content visibility, pinned paths first, per-learner completion |
