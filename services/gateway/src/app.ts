@@ -1,4 +1,4 @@
-import Fastify, { type FastifyInstance } from 'fastify';
+import Fastify, { type FastifyInstance, type FastifyServerOptions } from 'fastify';
 import cookie from '@fastify/cookie';
 import websocket from '@fastify/websocket';
 import type { Lab, SiteConfig } from '@cloudtrain/api-types';
@@ -106,7 +106,8 @@ const UNSAFE = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   const { content, auth, sessions, cluster, platform: ps } = deps;
   const hub = deps.hub ?? new TerminalHub();
-  const app = Fastify({ logger: deps.logger ?? false, trustProxy: deps.trustProxy ?? '127.0.0.1' });
+  const options: FastifyServerOptions = { logger: deps.logger ?? false, trustProxy: deps.trustProxy ?? '127.0.0.1' };
+  const app: FastifyInstance = Fastify(options);
   // Fail at startup, not at request time: every /api route must declare a permission or be public.
   app.addHook('onRoute', requireDeclaredPermission);
   // Every response is per-user API data or a download: never sniffed, never cached.

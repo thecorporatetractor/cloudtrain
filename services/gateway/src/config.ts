@@ -7,15 +7,15 @@ export const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)
 /** Sentinel for CT_KUBE_CONTEXT: use the pod's ServiceAccount instead of a kubeconfig context. */
 export const IN_CLUSTER = 'in-cluster';
 
-/** Fastify `trustProxy`: true (any hop), a hop count, or a comma-separated list of addresses/CIDRs. */
-export type TrustProxy = boolean | number | string;
+/** Fastify `trustProxy`: true (any peer) or a comma-separated list of proxy addresses/CIDRs. */
+export type TrustProxy = boolean | string;
 
 export interface Config {
   host: string;
   port: number;
   /**
-   * Proxies whose X-Forwarded-* headers are trusted (CT_TRUST_PROXY): `true`, a hop
-   * count (`1` behind one Ingress/Gateway), or addresses/CIDRs. Default loopback
+   * Proxies whose X-Forwarded-* headers are trusted (CT_TRUST_PROXY): `true` or the
+   * addresses/CIDRs of the Ingress/Gateway pods (e.g. the pod CIDR). Default loopback
    * (the Vite dev proxy).
    */
   trustProxy: TrustProxy;
@@ -119,15 +119,16 @@ export function devImpersonationEnabled(env: NodeJS.ProcessEnv, publicUrl: strin
 }
 
 /**
- * CT_TRUST_PROXY: unset = loopback only, `true`/`false`, a hop count, or a comma-separated
- * list of addresses/CIDRs.
+ * CT_TRUST_PROXY: unset = loopback only, `true`/`false`, or a comma-separated list of
+ * addresses/CIDRs. Hop counts are refused: Fastify ignores X-Forwarded-* with them
+ * (it cannot validate the immediate peer).
  */
 export function trustProxyFrom(v: string | undefined): TrustProxy {
   const t = (v ?? '').trim();
   if (t === '') return '127.0.0.1';
   if (t === 'true') return true;
   if (t === 'false') return false;
-  if (/^\d+$/.test(t)) return Number(t);
+  if (/^\d+$/.test(t)) throw new Error(`CT_TRUST_PROXY=${t}: hop counts are not supported; list the proxies' addresses or CIDRs (e.g. 10.0.0.0/8)`);
   return t
     .split(',')
     .map((s) => s.trim())

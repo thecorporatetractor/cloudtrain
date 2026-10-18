@@ -21,8 +21,8 @@ describe('deployable configuration', () => {
   });
 
   it('takes bind address, port, paths and proxy trust from the environment (container image)', () => {
-    const c = loadConfig({ CT_HOST: '0.0.0.0', CT_PORT: '8080', CT_CONTENT_DIR: '/opt/cloudtrain/content', CT_LABCTL: '/usr/local/bin/labctl', CT_TRUST_PROXY: '1' });
-    expect(c).toMatchObject({ host: '0.0.0.0', port: 8080, contentDir: '/opt/cloudtrain/content', labctl: '/usr/local/bin/labctl', trustProxy: 1 });
+    const c = loadConfig({ CT_HOST: '0.0.0.0', CT_PORT: '8080', CT_CONTENT_DIR: '/opt/cloudtrain/content', CT_LABCTL: '/usr/local/bin/labctl', CT_TRUST_PROXY: '10.0.0.0/8' });
+    expect(c).toMatchObject({ host: '0.0.0.0', port: 8080, contentDir: '/opt/cloudtrain/content', labctl: '/usr/local/bin/labctl', trustProxy: '10.0.0.0/8' });
     // The curriculum follows the content directory unless set on its own.
     expect(c.curriculumFile).toBe('/opt/cloudtrain/content/curriculum.yaml');
     expect(loadConfig({ CT_CONTENT_DIR: '/c', CT_CURRICULUM_FILE: '/x/cur.yaml' }).curriculumFile).toBe('/x/cur.yaml');
@@ -64,7 +64,7 @@ describe('deployable configuration', () => {
     expect(trustProxyFrom('')).toBe('127.0.0.1');
     expect(trustProxyFrom('true')).toBe(true);
     expect(trustProxyFrom('false')).toBe(false);
-    expect(trustProxyFrom('2')).toBe(2);
+    expect(() => trustProxyFrom('2')).toThrow(/hop counts are not supported/);
     expect(trustProxyFrom(' 10.0.0.0/8, 192.168.0.0/16 ')).toBe('10.0.0.0/8,192.168.0.0/16');
   });
 });
@@ -80,7 +80,7 @@ describe('probes', () => {
     const content = await realContent();
     const cluster = new FakeCluster();
     const sessions = new SessionService(content, cluster, new FakeCompiler(), { validateTimeoutMs: 200, pollMs: 20 });
-    app = await buildApp({ content, auth: new DevAuthenticator(alice), sessions, cluster, trustProxy: 1, ...(readiness ? { readiness } : {}), ...(corsOrigins ? { corsOrigins } : {}) });
+    app = await buildApp({ content, auth: new DevAuthenticator(alice), sessions, cluster, trustProxy: '10.0.0.0/8', ...(readiness ? { readiness } : {}), ...(corsOrigins ? { corsOrigins } : {}) });
     return app;
   }
 
@@ -104,11 +104,12 @@ describe('probes', () => {
     expect(r).toEqual({ ok: false, checks: { slow: 'timed out after 20 ms' } });
   });
 
-  it('takes the client address from X-Forwarded-For behind one trusted proxy', async () => {
+  it('takes the client address from X-Forwarded-For only from a trusted proxy', async () => {
     const a = await make();
-    a.get('/whoami', async (req) => ({ ip: req.ip, protocol: req.protocol, host: req.hostname }));
-    const r = await a.inject({ url: '/whoami', remoteAddress: '10.244.0.7', headers: { 'x-forwarded-for': '203.0.113.9', 'x-forwarded-proto': 'https', 'x-forwarded-host': 'labs.example.com' } });
-    expect(r.json()).toMatchObject({ ip: '203.0.113.9', protocol: 'https' });
+    a.get('/whoami', async (req) => ({ ip: req.ip, protocol: req.protocol }));
+    const fwd = { 'x-forwarded-for': '203.0.113.9', 'x-forwarded-proto': 'https' };
+    expect((await a.inject({ url: '/whoami', remoteAddress: '10.244.0.7', headers: fwd })).json()).toEqual({ ip: '203.0.113.9', protocol: 'https' });
+    expect((await a.inject({ url: '/whoami', remoteAddress: '198.51.100.4', headers: fwd })).json()).toEqual({ ip: '198.51.100.4', protocol: 'http' });
   });
 
   it('sends no CORS headers unless an origin is allowed', async () => {
