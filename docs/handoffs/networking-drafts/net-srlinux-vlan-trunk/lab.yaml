@@ -1,0 +1,217 @@
+# BLOCKED DRAFT (status proposed): needs srlinux:25 (no catalog entry, no `netdev: srlinux` family,
+# hosted-training EULA pending). Nothing here has run. Not replaced by a Linux-bridge variant on purpose:
+# net-vlan-access-ports and net-trunk-two-switches already cover that.
+# First-verify risks: sr_cli stdin, boot time, SR Linux MAC learning on veth links, `vlan encap` syntax, `vlan-tagging true` needed on every port that carries a `vlan encap` (set on the access ports too; drop it there if SR Linux rejects it).
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: net-srlinux-vlan-trunk
+  title: Build access and trunk ports on a network OS switch
+  domain: networking
+  frameworks: [ccna:network-access]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [vlan, trunk, access-port, srlinux, bridged]
+  version: 1
+spec:
+  description: |
+    **Devices:** `mv-sw-annex-1` (network OS switch, console), `annex-host-30`, `annex-host-20`
+    and `annex-uplink` (shell)
+
+    The new annex switch `mv-sw-annex-1` has an empty configuration apart from enabled ports. It must
+    do what the Linux switches in the other buildings do:
+
+    | Port | Role | VLAN |
+    |---|---|---|
+    | ethernet-1/1 | access, untagged, `annex-host-30` | 30 |
+    | ethernet-1/2 | access, untagged, `annex-host-20` | 20 |
+    | ethernet-1/3 | trunk to `annex-uplink`, tagged | 20 and 30 |
+
+    On this switch each VLAN is a bridged network instance (`mac-vrf`) that contains the access
+    sub-interface and the matching tagged sub-interface of the trunk. Create `vlan20` and `vlan30`
+    that way, with sub-interfaces of `type bridged`, `vlan encap untagged` on the access ports and
+    `vlan encap single-tagged vlan-id N` on the trunk (the trunk port needs `vlan-tagging true`),
+    and commit.
+
+    `annex-uplink` already has tagged interfaces `eth1.20` (10.{{octet}}.20.2/24) and `eth1.30`
+    (10.{{octet}}.30.2/24). `annex-host-30` is 10.{{octet}}.30.10/24 and `annex-host-20` is
+    10.{{octet}}.20.10/24. Each host must reach `annex-uplink` on its own VLAN and must not reach the
+    other VLAN's address.
+  objectives:
+    - Create bridged sub-interfaces with untagged and single-tagged encapsulation
+    - Join the sub-interfaces of one VLAN in a mac-vrf network instance
+    - Prove VLAN isolation across the trunk
+  params:
+    octet: { type: int, min: 20, max: 90 }
+  topology:
+    entry: workstation
+    nodes:
+      - { name: workstation, driver: container, image: jumphost:1, access: [shell] }
+      - { name: mv-sw-annex-1, driver: netdev, image: srlinux:25, access: [console] }
+      - { name: annex-host-30, driver: container, image: nettools:1, resources: { cpu: 0.1, memoryMiB: 48 }, access: [shell] }
+      - { name: annex-host-20, driver: container, image: nettools:1, resources: { cpu: 0.1, memoryMiB: 48 }, access: [shell] }
+      - { name: annex-uplink, driver: container, image: netsvc:1, resources: { cpu: 0.2, memoryMiB: 96 }, access: [shell] }
+    links:
+      - { a: "mv-sw-annex-1:e1-1", b: "annex-host-30:eth1" }
+      - { a: "mv-sw-annex-1:e1-2", b: "annex-host-20:eth1" }
+      - { a: "mv-sw-annex-1:e1-3", b: "annex-uplink:eth1" }
+  setup:
+    - on: mv-sw-annex-1
+      run: |
+        for i in $(seq 120); do sr_cli 'info from state / system' >/dev/null 2>&1 && break; sleep 2; done
+        cat > /tmp/base.cli <<'CLI'
+        enter candidate
+        set / interface ethernet-1/1 admin-state enable
+        set / interface ethernet-1/2 admin-state enable
+        set / interface ethernet-1/3 admin-state enable
+        commit now
+        CLI
+        sr_cli < /tmp/base.cli
+    - on: annex-host-30
+      run: ip link set eth1 up; ip addr replace 10.{{octet}}.30.10/24 dev eth1
+    - on: annex-host-20
+      run: ip link set eth1 up; ip addr replace 10.{{octet}}.20.10/24 dev eth1
+    - on: annex-uplink
+      run: |
+        ip link set eth1 up
+        for v in 20 30; do ip link add link eth1 name eth1.$v type vlan id $v 2>/dev/null; ip addr replace 10.{{octet}}.$v.2/24 dev eth1.$v; ip link set eth1.$v up; done
+  checks:
+    - id: vlan30-reachable
+      description: annex-host-30 reaches annex-uplink on VLAN 30
+      type: shell
+      on: annex-host-30
+      command: |
+        for i in $(seq 30); do ping -c1 -W1 10.{{octet}}.30.2 >/dev/null 2>&1 && { echo ok; exit 0; }; sleep 1; done; echo lost
+      expect: { match: exact, value: ok }
+      timeoutSec: 60
+      skills: [net.switching.vlans, net.switching.trunking]
+      weight: 2
+    - id: vlan20-reachable
+      description: annex-host-20 reaches annex-uplink on VLAN 20
+      type: shell
+      on: annex-host-20
+      command: |
+        for i in $(seq 30); do ping -c1 -W1 10.{{octet}}.20.2 >/dev/null 2>&1 && { echo ok; exit 0; }; sleep 1; done; echo lost
+      expect: { match: exact, value: ok }
+      timeoutSec: 60
+      skills: [net.switching.vlans, net.switching.trunking]
+      weight: 2
+    - id: vlans-isolated
+      description: A host cannot reach the other VLAN's address on annex-uplink at layer 2 (a temporary VLAN 20 address is added during the check)
+      type: shell
+      on: annex-host-30
+      command: |
+        ping -c1 -W1 10.{{octet}}.30.2 >/dev/null 2>&1 || { echo not-up; exit 0; }
+        ip addr add 10.{{octet}}.20.99/24 dev eth1 2>/dev/null
+        ping -c3 -W1 -I 10.{{octet}}.20.99 10.{{octet}}.20.2 >/dev/null 2>&1 && r=leaked || r=isolated
+        ip addr del 10.{{octet}}.20.99/24 dev eth1 2>/dev/null
+        echo $r
+      expect: { match: exact, value: isolated }
+      skills: [net.switching.vlans]
+    - id: access-ports-untagged
+      description: The access sub-interfaces are untagged and bridged, the trunk sub-interfaces are single-tagged 20 and 30
+      type: shell
+      on: mv-sw-annex-1
+      command: |
+        a=$(sr_cli -d 'info from running / interface ethernet-1/1 subinterface 0 vlan encap' 2>/dev/null | grep -c untagged)
+        b=$(sr_cli -d 'info from running / interface ethernet-1/2 subinterface 0 vlan encap' 2>/dev/null | grep -c untagged)
+        t=$(sr_cli -d 'info from running / interface ethernet-1/3 subinterface * vlan encap' 2>/dev/null | grep -c 'single-tagged')
+        echo "$a$b$t"
+      expect: { match: exact, value: "112" }
+      skills: [net.switching.vlans, net.switching.trunking]
+  hints:
+    - title: Order of the pieces
+      body: "Interface first (`vlan-tagging true` on the trunk, one sub-interface per VLAN with `type bridged` and its `vlan encap`), then a `mac-vrf` network instance per VLAN that lists the sub-interfaces as `interface ethernet-1/N.INDEX`. Enter the changes with `enter candidate` and finish with `commit now`."
+      cost: 1
+    - title: Sub-interface index
+      body: "Use index 0 for an untagged sub-interface and the VLAN id as the index of a tagged one (ethernet-1/3.20 and ethernet-1/3.30), so the names read like the design."
+      cost: 1
+  misconceptions:
+    - id: one-instance-for-both
+      description: Puts both VLANs into a single mac-vrf, which merges the broadcast domains
+      mutation:
+        on: mv-sw-annex-1
+        run: |
+          cat > /tmp/m.cli <<'CLI'
+          enter candidate
+          set / interface ethernet-1/1 subinterface 0 type bridged
+          set / interface ethernet-1/1 vlan-tagging true
+          set / interface ethernet-1/1 subinterface 0 vlan encap untagged
+          set / interface ethernet-1/2 subinterface 0 type bridged
+          set / interface ethernet-1/2 vlan-tagging true
+          set / interface ethernet-1/2 subinterface 0 vlan encap untagged
+          set / interface ethernet-1/3 vlan-tagging true
+          set / interface ethernet-1/3 subinterface 20 type bridged
+          set / interface ethernet-1/3 subinterface 20 vlan encap single-tagged vlan-id 20
+          set / interface ethernet-1/3 subinterface 30 type bridged
+          set / interface ethernet-1/3 subinterface 30 vlan encap single-tagged vlan-id 30
+          set / network-instance campus type mac-vrf
+          set / network-instance campus admin-state enable
+          set / network-instance campus interface ethernet-1/1.0
+          set / network-instance campus interface ethernet-1/2.0
+          set / network-instance campus interface ethernet-1/3.20
+          set / network-instance campus interface ethernet-1/3.30
+          commit now
+          CLI
+          sr_cli < /tmp/m.cli
+      expectFail: [vlans-isolated]
+      feedback: A mac-vrf is one broadcast domain. VLAN 20 and VLAN 30 only stay apart when each has its own instance.
+    - id: untagged-trunk
+      description: Leaves the trunk untagged so the VLAN tags never reach annex-uplink
+      mutation:
+        on: mv-sw-annex-1
+        run: |
+          cat > /tmp/m.cli <<'CLI'
+          enter candidate
+          set / interface ethernet-1/1 subinterface 0 type bridged
+          set / interface ethernet-1/1 vlan-tagging true
+          set / interface ethernet-1/1 subinterface 0 vlan encap untagged
+          set / interface ethernet-1/2 subinterface 0 type bridged
+          set / interface ethernet-1/2 vlan-tagging true
+          set / interface ethernet-1/2 subinterface 0 vlan encap untagged
+          set / interface ethernet-1/3 subinterface 0 type bridged
+          set / interface ethernet-1/3 vlan-tagging true
+          set / interface ethernet-1/3 subinterface 0 vlan encap untagged
+          set / network-instance vlan30 type mac-vrf
+          set / network-instance vlan30 admin-state enable
+          set / network-instance vlan30 interface ethernet-1/1.0
+          set / network-instance vlan30 interface ethernet-1/3.0
+          set / network-instance vlan20 type mac-vrf
+          set / network-instance vlan20 admin-state enable
+          set / network-instance vlan20 interface ethernet-1/2.0
+          commit now
+          CLI
+          sr_cli < /tmp/m.cli
+      expectFail: [vlan30-reachable, vlan20-reachable, vlans-isolated, access-ports-untagged]
+      feedback: The far side expects 802.1Q tags on eth1.20 and eth1.30. A trunk needs `vlan-tagging true` and one single-tagged sub-interface per VLAN.
+  solution:
+    explanation: |
+      Untagged bridged sub-interfaces on the two access ports, a tagged trunk with one bridged
+      sub-interface per VLAN, and one mac-vrf per VLAN joining the matching pair.
+    steps:
+      - on: mv-sw-annex-1
+        run: |
+          cat > /tmp/s.cli <<'CLI'
+          enter candidate
+          set / interface ethernet-1/1 subinterface 0 type bridged
+          set / interface ethernet-1/1 vlan-tagging true
+          set / interface ethernet-1/1 subinterface 0 vlan encap untagged
+          set / interface ethernet-1/2 subinterface 0 type bridged
+          set / interface ethernet-1/2 vlan-tagging true
+          set / interface ethernet-1/2 subinterface 0 vlan encap untagged
+          set / interface ethernet-1/3 vlan-tagging true
+          set / interface ethernet-1/3 subinterface 20 type bridged
+          set / interface ethernet-1/3 subinterface 20 vlan encap single-tagged vlan-id 20
+          set / interface ethernet-1/3 subinterface 30 type bridged
+          set / interface ethernet-1/3 subinterface 30 vlan encap single-tagged vlan-id 30
+          set / network-instance vlan30 type mac-vrf
+          set / network-instance vlan30 admin-state enable
+          set / network-instance vlan30 interface ethernet-1/1.0
+          set / network-instance vlan30 interface ethernet-1/3.30
+          set / network-instance vlan20 type mac-vrf
+          set / network-instance vlan20 admin-state enable
+          set / network-instance vlan20 interface ethernet-1/2.0
+          set / network-instance vlan20 interface ethernet-1/3.20
+          commit now
+          CLI
+          sr_cli < /tmp/s.cli

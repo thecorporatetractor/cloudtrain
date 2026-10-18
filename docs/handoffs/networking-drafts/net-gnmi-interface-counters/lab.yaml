@@ -1,0 +1,180 @@
+# BLOCKED DRAFT (status proposed): needs srlinux:25 (no catalog entry, no `netdev: srlinux` family,
+# hosted-training EULA pending) AND `gnmic`, which no catalog image ships (mv-collector must run an image
+# with gnmic installed; netsvc:1 would need it added). Nothing here has run.
+# First-verify risks: SR Linux gNMI TLS profile (setup generates a self-signed pair at run time, nothing
+# is committed), sr_cli stdin, boot time, UDP traffic generator through the bridged instance.
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: net-gnmi-interface-counters
+  title: Collect interface counters over gNMI
+  domain: networking
+  frameworks: [ccna:automation-programmability]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [gnmi, yang, telemetry, gnmic, srlinux]
+  version: 1
+spec:
+  description: |
+    **Devices:** `mv-collector` (shell, `gnmic` and `jq`), `mv-sw-annex-1` (network OS switch)
+
+    The annex switch has two uplinks, `ethernet-1/49` and `ethernet-1/50`. Its gNMI server listens
+    on `mv-sw-annex-1:57400` (user `admin`, password `annex-{{octet}}-api`, self-signed certificate:
+    use `--skip-verify`). Counters live in the YANG tree below each interface, for example
+    `/interface[name=ethernet-1/49]/statistics/in-octets`.
+
+    1. From `mv-collector`, use `gnmic` to read `in-octets` of both uplinks (a `get`, or a `subscribe`
+       with `--mode once`).
+    2. Write `/root/uplink-octets.txt` with one line per uplink: the interface name, a space and the
+       value, for example `ethernet-1/49 123456`.
+
+    Traffic stopped a while ago, so the counters are stable; the grader reads them again from the
+    device.
+  objectives:
+    - Address operational data by YANG path
+    - Read a counter with gNMI get or a one-shot subscription
+    - Tell inbound from outbound octets
+  params:
+    octet: { type: int, min: 20, max: 90 }
+  topology:
+    entry: workstation
+    nodes:
+      - { name: workstation, driver: container, image: jumphost:1, access: [shell] }
+      - { name: mv-collector, driver: container, image: netsvc:1, resources: { cpu: 0.2, memoryMiB: 96 }, access: [shell] }
+      - { name: mv-sw-annex-1, driver: netdev, image: srlinux:25, access: [console] }
+      - { name: uplink-a, driver: container, image: nettools:1, resources: { cpu: 0.1, memoryMiB: 48 } }
+      - { name: uplink-b, driver: container, image: nettools:1, resources: { cpu: 0.1, memoryMiB: 48 } }
+    links:
+      - { a: "mv-sw-annex-1:e1-49", b: "uplink-a:eth1" }
+      - { a: "mv-sw-annex-1:e1-50", b: "uplink-b:eth1" }
+  setup:
+    - on: mv-sw-annex-1
+      run: |
+        for i in $(seq 120); do sr_cli 'info from state / system gnmi-server' >/dev/null 2>&1 && break; sleep 2; done
+        openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj "/CN=mv-sw-annex-1" -keyout /tmp/gnmi.key -out /tmp/gnmi.crt 2>/dev/null
+        cat > /tmp/base.cli <<'CLI'
+        enter candidate
+        set / system aaa authentication admin-user password annex-{{octet}}-api
+        set / system json-rpc-server admin-state enable
+        set / system json-rpc-server network-instance mgmt http admin-state enable
+        set / interface ethernet-1/49 admin-state enable
+        set / interface ethernet-1/49 subinterface 0 type bridged
+        set / interface ethernet-1/49 vlan-tagging true
+        set / interface ethernet-1/49 subinterface 0 vlan encap untagged
+        set / interface ethernet-1/50 admin-state enable
+        set / interface ethernet-1/50 subinterface 0 type bridged
+        set / interface ethernet-1/50 vlan-tagging true
+        set / interface ethernet-1/50 subinterface 0 vlan encap untagged
+        set / network-instance uplinks type mac-vrf
+        set / network-instance uplinks admin-state enable
+        set / network-instance uplinks interface ethernet-1/49.0
+        set / network-instance uplinks interface ethernet-1/50.0
+        commit now
+        CLI
+        sr_cli < /tmp/base.cli
+        # the multi-line PEM goes in through a JSON-RPC set (jq quotes it), not through the CLI
+        jq -n --rawfile c /tmp/gnmi.crt --rawfile k /tmp/gnmi.key '{jsonrpc:"2.0",id:1,method:"set",params:{commands:[{action:"update",path:"/system/tls/server-profile[name=lab-gnmi]",value:{certificate:$c,key:$k}}]}}' \
+          | curl -s -u admin:annex-{{octet}}-api http://localhost/jsonrpc -d @- >/dev/null
+        cat > /tmp/gnmi.cli <<'CLI'
+        enter candidate
+        set / system gnmi-server admin-state enable
+        set / system gnmi-server network-instance mgmt admin-state enable
+        set / system gnmi-server network-instance mgmt tls-profile lab-gnmi
+        commit now
+        CLI
+        sr_cli < /tmp/gnmi.cli
+        rm -f /tmp/gnmi.key /tmp/gnmi.crt /tmp/base.cli /tmp/gnmi.cli
+    - on: uplink-a
+      run: |
+        ip link set eth1 up; ip addr replace 10.{{octet}}.70.1/24 dev eth1
+        setsid nc -lu -p 9000 </dev/null >/dev/null 2>&1 &
+        setsid sh -c 'for i in $(seq 150); do ping -c1 -W1 10.{{octet}}.70.2 >/dev/null 2>&1 && break; sleep 2; done; head -c 2000000 /dev/zero | nc -u -w1 10.{{octet}}.70.2 9000' </dev/null >/dev/null 2>&1 &
+    - on: uplink-b
+      run: |
+        ip link set eth1 up; ip addr replace 10.{{octet}}.70.2/24 dev eth1
+        setsid nc -lu -p 9000 </dev/null >/dev/null 2>&1 &
+        setsid sh -c 'for i in $(seq 150); do ping -c1 -W1 10.{{octet}}.70.1 >/dev/null 2>&1 && break; sleep 2; done; sleep 5; head -c 400000 /dev/zero | nc -u -w1 10.{{octet}}.70.1 9000' </dev/null >/dev/null 2>&1 &
+    - on: mv-collector
+      run: |
+        mkdir -p /var/lib/cloudtrain
+        cat > /var/lib/cloudtrain/live.sh <<'SH'
+        #!/bin/sh
+        # live.sh PORT LEAF: value of /interface[name=PORT]/statistics/LEAF from the switch (JSON-RPC, independent of gnmic)
+        curl -s -u admin:annex-{{octet}}-api http://mv-sw-annex-1/jsonrpc -d '{"jsonrpc":"2.0","id":1,"method":"get","params":{"commands":[{"path":"/interface[name='$1']/statistics/'$2'","datastore":"state"}]}}' | jq -r '.result[0]'
+        SH
+        chmod 755 /var/lib/cloudtrain/live.sh
+  checks:
+    - id: file-format
+      description: uplink-octets.txt has exactly one numeric line for each uplink
+      type: shell
+      on: mv-collector
+      command: |
+        awk 'NF==2 && $2 ~ /^[0-9]+$/ {print $1}' /root/uplink-octets.txt 2>/dev/null | sort | tr '\n' ' '
+      expect: { match: exact, value: "ethernet-1/49 ethernet-1/50 " }
+      skills: [net.automation.netconf-gnmi]
+    - id: uplink-49-in-octets
+      description: The value for ethernet-1/49 is that port's in-octets (within 20000 octets of the device)
+      type: shell
+      on: mv-collector
+      command: |
+        for i in $(seq 20); do
+          v=$(awk '$1=="ethernet-1/49"{print $2}' /root/uplink-octets.txt 2>/dev/null); l=$(/var/lib/cloudtrain/live.sh ethernet-1/49 in-octets)
+          [ -n "$v" ] && [ "$l" -ge "$v" ] 2>/dev/null && [ $((l - v)) -le 20000 ] && [ "$v" -ge 1500000 ] && { echo ok; exit 0; }
+          sleep 2
+        done
+        echo "file=$v live=$l"
+      expect: { match: exact, value: ok }
+      timeoutSec: 60
+      skills: [net.automation.netconf-gnmi]
+      weight: 2
+    - id: uplink-50-in-octets
+      description: The value for ethernet-1/50 is that port's in-octets (within 20000 octets of the device)
+      type: shell
+      on: mv-collector
+      command: |
+        for i in $(seq 20); do
+          v=$(awk '$1=="ethernet-1/50"{print $2}' /root/uplink-octets.txt 2>/dev/null); l=$(/var/lib/cloudtrain/live.sh ethernet-1/50 in-octets)
+          [ -n "$v" ] && [ "$l" -ge "$v" ] 2>/dev/null && [ $((l - v)) -le 20000 ] && [ "$v" -ge 300000 ] && { echo ok; exit 0; }
+          sleep 2
+        done
+        echo "file=$v live=$l"
+      expect: { match: exact, value: ok }
+      timeoutSec: 60
+      skills: [net.automation.netconf-gnmi]
+      weight: 2
+  hints:
+    - title: Path and encoding
+      body: "`gnmic -a mv-sw-annex-1:57400 -u admin -p PASSWORD --skip-verify -e json_ietf get --path '/interface[name=ethernet-1/49]/statistics/in-octets'` prints a JSON notification; `jq` can pull the value out of it."
+      cost: 1
+    - title: In or out
+      body: "`in-octets` counts what the switch received on that port, `out-octets` what it sent. The two uplinks carried different amounts in each direction."
+      cost: 1
+  misconceptions:
+    - id: out-octets-read
+      description: Reads out-octets instead of in-octets
+      mutation:
+        on: mv-collector
+        run: |
+          for p in ethernet-1/49 ethernet-1/50; do echo "$p $(/var/lib/cloudtrain/live.sh $p out-octets)"; done > /root/uplink-octets.txt
+      expectFail: [uplink-49-in-octets, uplink-50-in-octets]
+      feedback: Octets received (in) and sent (out) differ on a port that carried a one-sided transfer; the task asks for the received counter.
+    - id: uplinks-swapped
+      description: Pairs each value with the wrong interface name
+      mutation:
+        on: mv-collector
+        run: |
+          printf 'ethernet-1/49 %s\nethernet-1/50 %s\n' "$(/var/lib/cloudtrain/live.sh ethernet-1/50 in-octets)" "$(/var/lib/cloudtrain/live.sh ethernet-1/49 in-octets)" > /root/uplink-octets.txt
+      expectFail: [uplink-49-in-octets, uplink-50-in-octets]
+      feedback: The YANG list key `name=` selects the interface; check which key each reading came from before labelling it.
+  solution:
+    explanation: |
+      `gnmic get` (or a one-shot subscribe) on the in-octets path of both uplinks, then print
+      `name value` per line.
+    steps:
+      - on: mv-collector
+        run: |
+          for i in $(seq 90); do [ "$(/var/lib/cloudtrain/live.sh ethernet-1/50 in-octets)" -ge 300000 ] 2>/dev/null && break; sleep 2; done
+          for p in ethernet-1/49 ethernet-1/50; do
+            v=$(gnmic -a mv-sw-annex-1:57400 -u admin -p annex-{{octet}}-api --skip-verify -e json_ietf get --path "/interface[name=$p]/statistics/in-octets" --format json | jq -r '.[0].updates[0].values | to_entries[0].value')
+            echo "$p $v"
+          done > /root/uplink-octets.txt

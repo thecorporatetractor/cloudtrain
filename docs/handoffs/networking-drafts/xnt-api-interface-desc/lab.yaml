@@ -1,0 +1,140 @@
+# BLOCKED DRAFT (status proposed): needs srlinux:25 (no catalog entry, no `netdev: srlinux` family,
+# hosted-training EULA pending). Exam task of sim-net-associate (automation pool); nothing here has run.
+# First-verify risks: sr_cli stdin, boot time, JSON-RPC set default datastore.
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xnt-api-interface-desc
+  title: Set interface descriptions through a device API
+  domain: networking
+  frameworks: [ccna:automation-programmability]
+  difficulty: medium
+  estimatedMinutes: 10
+  tags: [exam, json-rpc, api, yaml]
+  version: 1
+spec:
+  description: |
+    **Devices:** `mv-api-host` (shell, `curl`, `jq`, Python with PyYAML), `mv-sw-annex-2` (switch API)
+
+    The switch API is `http://mv-sw-annex-2/jsonrpc` (user `admin`, password `annex-{{octet}}-api`).
+    `/root/descriptions.yaml` on `mv-api-host` maps three ports to descriptions.
+
+    1. Using the JSON-RPC API (not the switch CLI), set those descriptions on the three ports so
+       they are part of the running configuration.
+    2. Read the description of `ethernet-1/{{port}}` back through the API and save the **complete
+       JSON-RPC response** to `/root/response.json`.
+  objectives:
+    - Apply configuration with a JSON-RPC set request
+    - Read a value back and keep the raw API response
+  params:
+    octet: { type: int, min: 20, max: 90 }
+    port: { type: choice, values: ["2", "3", "4"] }
+    room: { type: int, min: 100, max: 199 }
+  topology:
+    entry: workstation
+    nodes:
+      - { name: workstation, driver: container, image: jumphost:1, access: [shell] }
+      - { name: mv-api-host, driver: container, image: netsvc:1, resources: { cpu: 0.2, memoryMiB: 96 }, access: [shell] }
+      - { name: mv-sw-annex-2, driver: netdev, image: srlinux:25, access: [console] }
+    links: []
+  setup:
+    - on: mv-sw-annex-2
+      run: |
+        for i in $(seq 120); do sr_cli 'info from state / system json-rpc-server' >/dev/null 2>&1 && break; sleep 2; done
+        cat > /tmp/base.cli <<'CLI'
+        enter candidate
+        set / system json-rpc-server admin-state enable
+        set / system json-rpc-server network-instance mgmt http admin-state enable
+        set / system aaa authentication admin-user password annex-{{octet}}-api
+        set / interface ethernet-1/1 admin-state enable
+        set / interface ethernet-1/2 admin-state enable
+        set / interface ethernet-1/3 admin-state enable
+        set / interface ethernet-1/4 admin-state enable
+        commit now
+        CLI
+        sr_cli < /tmp/base.cli
+    - on: mv-api-host
+      run: |
+        mkdir -p /var/lib/cloudtrain
+        cat > /root/descriptions.yaml <<'YML'
+        descriptions:
+          ethernet-1/2: room-{{room}}-printer
+          ethernet-1/3: room-{{room}}-camera
+          ethernet-1/4: room-{{room}}-teacher
+        YML
+        cat > /var/lib/cloudtrain/live.sh <<'SH'
+        #!/bin/sh
+        # live.sh DATASTORE PORT: description of PORT in DATASTORE, empty when unset
+        curl -s -u admin:annex-{{octet}}-api http://mv-sw-annex-2/jsonrpc -d '{"jsonrpc":"2.0","id":1,"method":"get","params":{"commands":[{"path":"/interface[name='$2']/description","datastore":"'$1'"}]}}' | jq -r '.result[0] // empty'
+        SH
+        chmod 755 /var/lib/cloudtrain/live.sh
+  checks:
+    - id: running-descriptions
+      description: The three ports carry the requested descriptions in the running configuration
+      type: shell
+      on: mv-api-host
+      command: |
+        for i in $(seq 20); do
+          r=$(for n in 2 3 4; do /var/lib/cloudtrain/live.sh running ethernet-1/$n; done | tr '\n' ' ')
+          [ "$r" = "room-{{room}}-printer room-{{room}}-camera room-{{room}}-teacher " ] && { echo ok; exit 0; }
+          sleep 1
+        done
+        echo "$r"
+      expect: { match: exact, value: ok }
+      timeoutSec: 40
+      skills: [net.automation.json-rpc]
+      weight: 2
+    - id: port-one-untouched
+      description: ethernet-1/1 has no description
+      type: shell
+      on: mv-api-host
+      command: "[ -z \"$(/var/lib/cloudtrain/live.sh running ethernet-1/1)\" ] && echo ok || echo changed"
+      expect: { match: exact, value: ok }
+      skills: [net.automation.json-rpc]
+      weight: 0.5
+    - id: response-saved
+      description: response.json is the JSON-RPC response carrying the description of the named port
+      type: shell
+      on: mv-api-host
+      command: |
+        jq -r 'select(.jsonrpc == "2.0") | .result[0]' /root/response.json 2>/dev/null || echo invalid
+      expect: { match: regex, value: "^room-{{room}}-(printer|camera|teacher)$" }
+      skills: [net.automation.json-rpc]
+    - id: response-right-port
+      description: The saved response is for the port named in the task
+      type: shell
+      on: mv-api-host
+      command: |
+        w=$(python3 -c 'import yaml; print(yaml.safe_load(open("/root/descriptions.yaml"))["descriptions"]["ethernet-1/{{port}}"])')
+        [ "$(jq -r '.result[0]' /root/response.json 2>/dev/null)" = "$w" ] && echo ok || echo wrong
+      expect: { match: exact, value: ok }
+      skills: [net.automation.json-rpc]
+  misconceptions:
+    - id: validate-instead-of-set
+      description: Sends the descriptions with the validate method, which checks them but never applies them
+      mutation:
+        on: mv-api-host
+        run: |
+          python3 -c 'import yaml; [print(k, v) for k, v in yaml.safe_load(open("/root/descriptions.yaml"))["descriptions"].items()]' | while read -r p d; do
+            curl -s -u admin:annex-{{octet}}-api http://mv-sw-annex-2/jsonrpc -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"validate\",\"params\":{\"commands\":[{\"action\":\"update\",\"path\":\"/interface[name=$p]/description\",\"value\":\"$d\"}]}}" >/dev/null
+          done
+          curl -s -u admin:annex-{{octet}}-api http://mv-sw-annex-2/jsonrpc -d '{"jsonrpc":"2.0","id":1,"method":"get","params":{"commands":[{"path":"/interface[name=ethernet-1/{{port}}]/description","datastore":"running"}]}}' > /root/response.json
+      expectFail: [running-descriptions, response-saved, response-right-port]
+    - id: wrong-port-response
+      description: Saves the response for ethernet-1/1 instead of the named port
+      mutation:
+        on: mv-api-host
+        run: |
+          curl -s -u admin:annex-{{octet}}-api http://mv-sw-annex-2/jsonrpc -d '{"jsonrpc":"2.0","id":1,"method":"get","params":{"commands":[{"path":"/interface[name=ethernet-1/1]/description","datastore":"running"}]}}' > /root/response.json
+      expectFail: [response-saved, response-right-port]
+  solution:
+    explanation: |
+      One `set`/`update` request per port, then a `get` on the named port with the reply saved
+      untouched.
+    steps:
+      - on: mv-api-host
+        run: |
+          python3 -c 'import yaml; [print(k, v) for k, v in yaml.safe_load(open("/root/descriptions.yaml"))["descriptions"].items()]' | while read -r p d; do
+            curl -s -u admin:annex-{{octet}}-api http://mv-sw-annex-2/jsonrpc -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"set\",\"params\":{\"commands\":[{\"action\":\"update\",\"path\":\"/interface[name=$p]/description\",\"value\":\"$d\"}]}}" >/dev/null
+          done
+          curl -s -u admin:annex-{{octet}}-api http://mv-sw-annex-2/jsonrpc -d '{"jsonrpc":"2.0","id":1,"method":"get","params":{"commands":[{"path":"/interface[name=ethernet-1/{{port}}]/description","datastore":"running"}]}}' > /root/response.json

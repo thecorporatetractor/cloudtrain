@@ -1,0 +1,487 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: net-jinja-render-frr
+  title: Generate router configs from YAML with Jinja2
+  domain: networking
+  frameworks: [ccna:automation-programmability, ex457-aligned:network-roles-templates]
+  difficulty: medium
+  estimatedMinutes: 25
+  tags: [jinja2, yaml, config-generation, ospf, frr]
+  version: 1
+spec:
+  description: |
+    Marlow Valley is adding three campus routers to the district core. Their
+    interface and OSPF configuration is identical in shape, so instead of typing
+    it three times the network team keeps the facts in one YAML inventory and
+    renders the configuration from a template.
+
+    On `mv-automation-1` (shell) the directory `/root/district/` holds:
+
+    - `district.yaml`: `ospf_area` plus a list of `routers`, each with `hostname`,
+      `router_id`, `loopback` and a list of `interfaces` (`name`, `description`,
+      `address` and a `passive` flag that is set on every interface);
+    - `router.j2`: an unfinished Jinja2 template. It renders the hostname, the
+      loopback address and the `router ospf` section, but no interfaces yet and
+      the loopback is not in OSPF;
+    - `render TEMPLATE DATA ROUTER`: prints the template rendered with the data
+      file and the `routers` entry whose hostname is ROUTER (available in the
+      template as `router`; `trim_blocks` and `lstrip_blocks` are on).
+
+    The core router `mv-core-1` already runs OSPF with the three campus routers
+    `mv-campus-north`, `mv-campus-south` and `mv-campus-west` (FRR consoles) as
+    neighbours-to-be; the campus routers have no addresses yet.
+
+    1. Complete `router.j2` so that every router renders exactly this
+       configuration (blank lines are ignored):
+
+           hostname NAME
+           interface lo
+            ip address LOOPBACK
+            ip ospf area AREA
+           exit
+           interface IFNAME            <- one block per entry of router.interfaces, in order
+            description DESCRIPTION
+            ip address ADDRESS
+            ip ospf area AREA
+            ip ospf passive            <- only when the interface has passive: true
+           exit
+           router ospf
+            ospf router-id ROUTER_ID
+           exit
+
+       The template must not hard-code any value from `district.yaml`: it is also
+       graded against a second inventory.
+    2. Save the three renderings as `/root/district/out/<hostname>.conf`.
+    3. Paste each file into the console of its router in configuration mode and
+       prove that every OSPF adjacency with `mv-core-1` comes up and the core
+       learns the campus LANs and loopbacks.
+  objectives:
+    - Drive a configuration template from structured data with a Jinja2 loop and a conditional
+    - Apply generated configuration to FRR routers and verify OSPF adjacencies
+  params:
+    octet: { type: int, min: 20, max: 90 }
+    northnet: { type: int, min: 10, max: 19 }
+    southnet: { type: int, min: 30, max: 39 }
+    westnet: { type: int, min: 50, max: 59 }
+  topology:
+    entry: workstation
+    nodes:
+      - { name: workstation, driver: container, image: jumphost:1, access: [shell] }
+      - { name: mv-automation-1, driver: container, image: netsvc:1, resources: { cpu: 0.2, memoryMiB: 96 }, access: [shell] }
+      - { name: mv-core-1, driver: netdev, image: frr:10, access: [console] }
+      - { name: mv-campus-north, driver: netdev, image: frr:10, access: [console] }
+      - { name: mv-campus-south, driver: netdev, image: frr:10, access: [console] }
+      - { name: mv-campus-west, driver: netdev, image: frr:10, access: [console] }
+    links:
+      - { a: "mv-core-1:eth1", b: "mv-campus-north:eth1" }
+      - { a: "mv-core-1:eth2", b: "mv-campus-south:eth1" }
+      - { a: "mv-core-1:eth3", b: "mv-campus-west:eth1" }
+  setup:
+    - on: mv-automation-1
+      run: |
+        mkdir -p /root/district/out /var/lib/cloudtrain
+        cat > /usr/local/bin/render <<'PY'
+        #!/usr/bin/env python3
+        """render TEMPLATE DATA ROUTER: print TEMPLATE rendered with the YAML file DATA and its routers entry ROUTER."""
+        import os, sys, yaml, jinja2
+        if len(sys.argv) != 4:
+            sys.exit("usage: render TEMPLATE DATA ROUTER")
+        data = yaml.safe_load(open(sys.argv[2]))
+        found = [r for r in data["routers"] if r["hostname"] == sys.argv[3]]
+        if not found:
+            sys.exit("render: no router named " + sys.argv[3])
+        env = jinja2.Environment(loader=jinja2.FileSystemLoader("/"), trim_blocks=True, lstrip_blocks=True,
+                                 undefined=jinja2.StrictUndefined, keep_trailing_newline=True)
+        print(env.get_template(os.path.abspath(sys.argv[1])).render(router=found[0], **data), end="")
+        PY
+        chmod 755 /usr/local/bin/render
+        cat > /root/district/district.yaml <<'YML'
+        ospf_area: 0
+        routers:
+          - hostname: mv-campus-north
+            router_id: 10.255.{{octet}}.2
+            loopback: 10.255.{{octet}}.2/32
+            interfaces:
+              - { name: eth1, description: uplink to mv-core-1, address: 10.{{octet}}.0.2/30, passive: false }
+              - { name: lan1, description: north classrooms, address: 10.{{octet}}.{{northnet}}.1/24, passive: true }
+          - hostname: mv-campus-south
+            router_id: 10.255.{{octet}}.3
+            loopback: 10.255.{{octet}}.3/32
+            interfaces:
+              - { name: eth1, description: uplink to mv-core-1, address: 10.{{octet}}.0.6/30, passive: false }
+              - { name: lan1, description: south classrooms, address: 10.{{octet}}.{{southnet}}.1/24, passive: true }
+          - hostname: mv-campus-west
+            router_id: 10.255.{{octet}}.4
+            loopback: 10.255.{{octet}}.4/32
+            interfaces:
+              - { name: eth1, description: uplink to mv-core-1, address: 10.{{octet}}.0.10/30, passive: false }
+              - { name: lan1, description: west library, address: 10.{{octet}}.{{westnet}}.1/24, passive: true }
+              - { name: lan2, description: west workshops, address: 10.{{octet}}.99.1/24, passive: true }
+        YML
+        printf '%s\n' 'hostname @{ router.hostname }@' 'interface lo' ' ip address @{ router.loopback }@' 'exit' \
+          '{# TODO: one interface block per entry of router.interfaces; the loopback is not in OSPF yet #}' \
+          'router ospf' ' ospf router-id @{ router.router_id }@' 'exit' \
+          | sed -e 's/@{/{''{/g' -e 's/}@/}''}/g' > /root/district/router.j2
+    - on: mv-campus-north
+      run: ip link add lan1 type dummy 2>/dev/null; ip link set lan1 up
+    - on: mv-campus-south
+      run: ip link add lan1 type dummy 2>/dev/null; ip link set lan1 up
+    - on: mv-campus-west
+      run: for i in lan1 lan2; do ip link add $i type dummy 2>/dev/null; ip link set $i up; done
+    - on: mv-core-1
+      config: |
+        interface lo
+         ip address 10.255.{{octet}}.1/32
+         ip ospf area 0
+        interface eth1
+         ip address 10.{{octet}}.0.1/30
+         ip ospf area 0
+        interface eth2
+         ip address 10.{{octet}}.0.5/30
+         ip ospf area 0
+        interface eth3
+         ip address 10.{{octet}}.0.9/30
+         ip ospf area 0
+        router ospf
+         ospf router-id 10.255.{{octet}}.1
+  checks:
+    - id: template-inventory
+      description: router.j2 renders every router of district.yaml into the specified configuration
+      type: shell
+      on: mv-automation-1
+      command: |
+        python3 - inv <<'PY'
+        import os, subprocess, sys, yaml
+        def want(d, r):
+            a = str(d["ospf_area"])
+            w = ["hostname " + r["hostname"], "interface lo", "ip address " + r["loopback"], "ip ospf area " + a, "exit"]
+            for i in r["interfaces"]:
+                w += ["interface " + i["name"], "description " + i["description"], "ip address " + i["address"], "ip ospf area " + a]
+                if i.get("passive"):
+                    w.append("ip ospf passive")
+                w.append("exit")
+            return w + ["router ospf", "ospf router-id " + r["router_id"], "exit"]
+        def norm(t):
+            return [l.strip() for l in t.splitlines() if l.strip() and not l.strip().startswith("!")]
+        mode = sys.argv[1]
+        if mode == "gen":
+            open("/tmp/.gen-inv.yaml", "w").write('ospf_area: 3\nrouters:\n  - hostname: mv-test-a\n    router_id: 192.0.2.1\n    loopback: 192.0.2.1/32\n    interfaces:\n      - { name: eth7, description: test uplink, address: 198.51.100.1/30, passive: false }\n      - { name: lan4, description: test lan four, address: 172.16.4.1/24, passive: true }\n      - { name: lan5, description: test lan five, address: 172.16.5.1/24, passive: true }\n      - { name: eth8, description: test second uplink, address: 198.51.100.5/30, passive: false }\n  - hostname: mv-test-b\n    router_id: 192.0.2.2\n    loopback: 192.0.2.2/32\n    interfaces:\n      - { name: lan9, description: lonely lan, address: 172.16.9.1/24, passive: true }\n')
+        f = "/tmp/.gen-inv.yaml" if mode == "gen" else "/root/district/district.yaml"
+        d = yaml.safe_load(open(f))
+        bad = []
+        for r in d["routers"]:
+            if mode == "files":
+                p = "/root/district/out/%s.conf" % r["hostname"]
+                got = norm(open(p).read()) if os.path.isfile(p) else None
+            else:
+                x = subprocess.run(["render", "/root/district/router.j2", f, r["hostname"]], capture_output=True, text=True)
+                got = norm(x.stdout) if x.returncode == 0 else None
+            if got != want(d, r):
+                bad.append(r["hostname"])
+        print("match" if not bad else "differs " + " ".join(bad))
+        if mode == "gen":
+            os.remove("/tmp/.gen-inv.yaml")
+        PY
+      expect: { match: exact, value: match }
+      skills: [net.automation.config-templates]
+      weight: 2
+    - id: template-generic
+      description: router.j2 also renders a second inventory correctly (nothing hard-coded)
+      type: shell
+      on: mv-automation-1
+      command: |
+        python3 - gen <<'PY'
+        import os, subprocess, sys, yaml
+        def want(d, r):
+            a = str(d["ospf_area"])
+            w = ["hostname " + r["hostname"], "interface lo", "ip address " + r["loopback"], "ip ospf area " + a, "exit"]
+            for i in r["interfaces"]:
+                w += ["interface " + i["name"], "description " + i["description"], "ip address " + i["address"], "ip ospf area " + a]
+                if i.get("passive"):
+                    w.append("ip ospf passive")
+                w.append("exit")
+            return w + ["router ospf", "ospf router-id " + r["router_id"], "exit"]
+        def norm(t):
+            return [l.strip() for l in t.splitlines() if l.strip() and not l.strip().startswith("!")]
+        mode = sys.argv[1]
+        if mode == "gen":
+            open("/tmp/.gen-inv.yaml", "w").write('ospf_area: 3\nrouters:\n  - hostname: mv-test-a\n    router_id: 192.0.2.1\n    loopback: 192.0.2.1/32\n    interfaces:\n      - { name: eth7, description: test uplink, address: 198.51.100.1/30, passive: false }\n      - { name: lan4, description: test lan four, address: 172.16.4.1/24, passive: true }\n      - { name: lan5, description: test lan five, address: 172.16.5.1/24, passive: true }\n      - { name: eth8, description: test second uplink, address: 198.51.100.5/30, passive: false }\n  - hostname: mv-test-b\n    router_id: 192.0.2.2\n    loopback: 192.0.2.2/32\n    interfaces:\n      - { name: lan9, description: lonely lan, address: 172.16.9.1/24, passive: true }\n')
+        f = "/tmp/.gen-inv.yaml" if mode == "gen" else "/root/district/district.yaml"
+        d = yaml.safe_load(open(f))
+        bad = []
+        for r in d["routers"]:
+            if mode == "files":
+                p = "/root/district/out/%s.conf" % r["hostname"]
+                got = norm(open(p).read()) if os.path.isfile(p) else None
+            else:
+                x = subprocess.run(["render", "/root/district/router.j2", f, r["hostname"]], capture_output=True, text=True)
+                got = norm(x.stdout) if x.returncode == 0 else None
+            if got != want(d, r):
+                bad.append(r["hostname"])
+        print("match" if not bad else "differs " + " ".join(bad))
+        if mode == "gen":
+            os.remove("/tmp/.gen-inv.yaml")
+        PY
+      expect: { match: exact, value: match }
+      skills: [net.automation.config-templates]
+      weight: 2
+    - id: configs-saved
+      description: /root/district/out holds the rendered configuration of all three routers
+      type: shell
+      on: mv-automation-1
+      command: |
+        python3 - files <<'PY'
+        import os, subprocess, sys, yaml
+        def want(d, r):
+            a = str(d["ospf_area"])
+            w = ["hostname " + r["hostname"], "interface lo", "ip address " + r["loopback"], "ip ospf area " + a, "exit"]
+            for i in r["interfaces"]:
+                w += ["interface " + i["name"], "description " + i["description"], "ip address " + i["address"], "ip ospf area " + a]
+                if i.get("passive"):
+                    w.append("ip ospf passive")
+                w.append("exit")
+            return w + ["router ospf", "ospf router-id " + r["router_id"], "exit"]
+        def norm(t):
+            return [l.strip() for l in t.splitlines() if l.strip() and not l.strip().startswith("!")]
+        mode = sys.argv[1]
+        if mode == "gen":
+            open("/tmp/.gen-inv.yaml", "w").write('ospf_area: 3\nrouters:\n  - hostname: mv-test-a\n    router_id: 192.0.2.1\n    loopback: 192.0.2.1/32\n    interfaces:\n      - { name: eth7, description: test uplink, address: 198.51.100.1/30, passive: false }\n      - { name: lan4, description: test lan four, address: 172.16.4.1/24, passive: true }\n      - { name: lan5, description: test lan five, address: 172.16.5.1/24, passive: true }\n      - { name: eth8, description: test second uplink, address: 198.51.100.5/30, passive: false }\n  - hostname: mv-test-b\n    router_id: 192.0.2.2\n    loopback: 192.0.2.2/32\n    interfaces:\n      - { name: lan9, description: lonely lan, address: 172.16.9.1/24, passive: true }\n')
+        f = "/tmp/.gen-inv.yaml" if mode == "gen" else "/root/district/district.yaml"
+        d = yaml.safe_load(open(f))
+        bad = []
+        for r in d["routers"]:
+            if mode == "files":
+                p = "/root/district/out/%s.conf" % r["hostname"]
+                got = norm(open(p).read()) if os.path.isfile(p) else None
+            else:
+                x = subprocess.run(["render", "/root/district/router.j2", f, r["hostname"]], capture_output=True, text=True)
+                got = norm(x.stdout) if x.returncode == 0 else None
+            if got != want(d, r):
+                bad.append(r["hostname"])
+        print("match" if not bad else "differs " + " ".join(bad))
+        if mode == "gen":
+            os.remove("/tmp/.gen-inv.yaml")
+        PY
+      expect: { match: exact, value: match }
+      skills: [net.automation.config-templates]
+    - id: ospf-full
+      description: mv-core-1 has Full OSPF adjacencies with the three campus routers
+      type: shell
+      on: mv-core-1
+      command: |
+        for i in $(seq 100); do [ "$(vtysh -c 'show ip ospf neighbor' | grep -c Full)" = 3 ] && break; sleep 1; done
+        vtysh -c 'show ip ospf neighbor' | awk '/Full/{print $1}' | sort | tr '\n' ' '
+      expect: { match: exact, value: "10.255.{{octet}}.2 10.255.{{octet}}.3 10.255.{{octet}}.4 " }
+      timeoutSec: 150
+      skills: [net.routing.ospf]
+      weight: 2
+    - id: routes-learned
+      description: mv-core-1 learns all four campus LANs and the three campus loopbacks through OSPF
+      type: shell
+      on: mv-core-1
+      command: |
+        for t in $(seq 60); do
+          r=$(vtysh -c 'show ip route ospf'); miss=
+          for p in 10.{{octet}}.{{northnet}}.0/24 10.{{octet}}.{{southnet}}.0/24 10.{{octet}}.{{westnet}}.0/24 10.{{octet}}.99.0/24 10.255.{{octet}}.2/32 10.255.{{octet}}.3/32 10.255.{{octet}}.4/32; do
+            echo "$r" | grep -q "^O>\* $p" || miss="$miss $p"
+          done
+          [ -z "$miss" ] && { echo ok; exit 0; }
+          sleep 1
+        done
+        echo "missing$miss"
+      expect: { match: exact, value: ok }
+      timeoutSec: 90
+      skills: [net.routing.ospf, net.automation.config-templates]
+      weight: 2
+    - id: lans-passive-north
+      description: The LAN interface of mv-campus-north is OSPF-passive and its uplink is not
+      type: shell
+      on: mv-campus-north
+      command: |
+        c=$(vtysh -c 'show running-config'); l=$(echo "$c" | sed -n '/^interface lan1$/,/^exit/p' | grep -c '^ ip ospf passive'); u=$(echo "$c" | sed -n '/^interface eth1$/,/^exit/p' | grep -c '^ ip ospf passive'); echo "$l$u"
+      expect: { match: exact, value: "10" }
+      skills: [net.routing.ospf, net.automation.config-templates]
+      weight: 0.5
+    - id: lans-passive-south
+      description: The LAN interface of mv-campus-south is OSPF-passive and its uplink is not
+      type: shell
+      on: mv-campus-south
+      command: |
+        c=$(vtysh -c 'show running-config'); l=$(echo "$c" | sed -n '/^interface lan1$/,/^exit/p' | grep -c '^ ip ospf passive'); u=$(echo "$c" | sed -n '/^interface eth1$/,/^exit/p' | grep -c '^ ip ospf passive'); echo "$l$u"
+      expect: { match: exact, value: "10" }
+      skills: [net.routing.ospf, net.automation.config-templates]
+      weight: 0.5
+    - id: lans-passive-west
+      description: Both LAN interfaces of mv-campus-west are OSPF-passive and its uplink is not
+      type: shell
+      on: mv-campus-west
+      command: |
+        c=$(vtysh -c 'show running-config'); n=0; for i in lan1 lan2; do n=$((n + $(echo "$c" | sed -n "/^interface $i\$/,/^exit/p" | grep -c '^ ip ospf passive'))); done; u=$(echo "$c" | sed -n '/^interface eth1$/,/^exit/p' | grep -c '^ ip ospf passive'); echo "$n$u"
+      expect: { match: exact, value: "20" }
+      skills: [net.routing.ospf, net.automation.config-templates]
+      weight: 0.5
+    - id: campus-reachable
+      description: mv-core-1 reaches every campus loopback and LAN gateway from its own loopback
+      type: shell
+      on: mv-core-1
+      command: |
+        for t in $(seq 10); do
+          r=ok
+          for a in 10.255.{{octet}}.2 10.255.{{octet}}.3 10.255.{{octet}}.4 10.{{octet}}.{{northnet}}.1 10.{{octet}}.{{southnet}}.1 10.{{octet}}.{{westnet}}.1 10.{{octet}}.99.1; do
+            ping -c1 -W1 -I 10.255.{{octet}}.1 $a >/dev/null 2>&1 || r=fail
+          done
+          [ $r = ok ] && { echo ok; exit 0; }
+          sleep 1
+        done
+        echo fail
+      expect: { match: exact, value: ok }
+      timeoutSec: 90
+      skills: [net.routing.ospf]
+  hints:
+    - title: Loop and condition
+      body: "Inside the template, `{% for i in router.interfaces %}` ... `{% endfor %}` repeats a block per interface, and `{% if i.passive %}` ... `{% endif %}` wraps a line that only some interfaces get. Render one router with `render router.j2 district.yaml mv-campus-north` and compare with the block layout in the task."
+      cost: 1
+    - title: What FRR needs to advertise a loopback
+      body: "An interface only takes part in OSPF when it has `ip ospf area <id>`. That includes `lo`. Take the area from `ospf_area` instead of typing 0, and add `ip ospf passive` for interfaces that have users but no routers."
+      cost: 1
+  misconceptions:
+    - id: hard-coded-values
+      description: Turns today's inventory values into literal text, one branch per router, instead of reading the data
+      mutation:
+        on: mv-automation-1
+        run: |
+          cd /root/district
+          python3 - <<'PY'
+          import yaml
+          T = lambda s: "{" + "% " + s + " %" + "}"
+          d = yaml.safe_load(open("district.yaml"))
+          o = []
+          for n, r in enumerate(d["routers"]):
+              o.append(T(("if" if n == 0 else "elif") + ' router.hostname == "%s"' % r["hostname"]))
+              o += ["hostname " + r["hostname"], "interface lo", " ip address " + r["loopback"], " ip ospf area 0", "exit"]
+              for i in r["interfaces"]:
+                  o += ["interface " + i["name"], " description " + i["description"], " ip address " + i["address"], " ip ospf area 0"]
+                  if i["passive"]:
+                      o.append(" ip ospf passive")
+                  o.append("exit")
+              o += ["router ospf", " ospf router-id " + r["router_id"], "exit"]
+          o.append(T("endif"))
+          open("router.j2", "w").write("\n".join(o) + "\n")
+          PY
+          for r in mv-campus-north mv-campus-south mv-campus-west; do render router.j2 district.yaml $r > out/$r.conf; done
+      expectFail: [template-generic]
+      feedback: A template that only repeats today's values works for today's inventory and for nothing else. Loop over `router.interfaces` and read every value from the data.
+    - id: loopback-outside-ospf
+      description: Completes the interface loop but leaves the loopback without an OSPF area
+      mutation:
+        on: mv-automation-1
+        run: |
+          cd /root/district
+          printf '%s\n' 'hostname @{ router.hostname }@' 'interface lo' ' ip address @{ router.loopback }@' 'exit' \
+            '{% for i in router.interfaces %}' 'interface @{ i.name }@' ' description @{ i.description }@' ' ip address @{ i.address }@' \
+            ' ip ospf area @{ ospf_area }@' '{% if i.passive %}' ' ip ospf passive' '{% endif %}' 'exit' '{% endfor %}' \
+            'router ospf' ' ospf router-id @{ router.router_id }@' 'exit' \
+            | sed -e 's/@{/{''{/g' -e 's/}@/}''}/g' > router.j2
+          for r in mv-campus-north mv-campus-south mv-campus-west; do render router.j2 district.yaml $r > out/$r.conf; done
+      expectFail: [template-inventory, template-generic, configs-saved]
+      feedback: FRR only advertises a loopback when `ip ospf area` is set on `lo` too. Without it the router ID is unreachable and the core never learns the /32.
+    - id: every-lan-active
+      description: Forgets the conditional so every interface, including the user LANs, sends OSPF hellos
+      mutation:
+        on: mv-automation-1
+        run: |
+          cd /root/district
+          printf '%s\n' 'hostname @{ router.hostname }@' 'interface lo' ' ip address @{ router.loopback }@' ' ip ospf area @{ ospf_area }@' 'exit' \
+            '{% for i in router.interfaces %}' 'interface @{ i.name }@' ' description @{ i.description }@' ' ip address @{ i.address }@' \
+            ' ip ospf area @{ ospf_area }@' 'exit' '{% endfor %}' \
+            'router ospf' ' ospf router-id @{ router.router_id }@' 'exit' \
+            | sed -e 's/@{/{''{/g' -e 's/}@/}''}/g' > router.j2
+          for r in mv-campus-north mv-campus-south mv-campus-west; do render router.j2 district.yaml $r > out/$r.conf; done
+      expectFail: [template-inventory, template-generic, configs-saved]
+      feedback: Passive interfaces still advertise their subnet but stop sending hellos onto the LAN, so a classroom host cannot become a neighbour. Make the line conditional on the passive flag.
+  solution:
+    explanation: |
+      Replace the TODO comment with a loop over `router.interfaces` that renders the
+      four or five lines per entry (the passive line inside an `if`), add
+      the OSPF area line to the loopback block, render the three routers into
+      `out/`, then paste each file into the matching console.
+    steps:
+      - on: mv-automation-1
+        run: |
+          cd /root/district
+          printf '%s\n' 'hostname @{ router.hostname }@' 'interface lo' ' ip address @{ router.loopback }@' ' ip ospf area @{ ospf_area }@' 'exit' \
+            '{% for i in router.interfaces %}' 'interface @{ i.name }@' ' description @{ i.description }@' ' ip address @{ i.address }@' \
+            ' ip ospf area @{ ospf_area }@' '{% if i.passive %}' ' ip ospf passive' '{% endif %}' 'exit' '{% endfor %}' \
+            'router ospf' ' ospf router-id @{ router.router_id }@' 'exit' \
+            | sed -e 's/@{/{''{/g' -e 's/}@/}''}/g' > router.j2
+          for r in mv-campus-north mv-campus-south mv-campus-west; do render router.j2 district.yaml $r > out/$r.conf; done
+      - on: mv-campus-north
+        config: |
+          hostname mv-campus-north
+          interface lo
+           ip address 10.255.{{octet}}.2/32
+           ip ospf area 0
+          exit
+          interface eth1
+           description uplink to mv-core-1
+           ip address 10.{{octet}}.0.2/30
+           ip ospf area 0
+          exit
+          interface lan1
+           description north classrooms
+           ip address 10.{{octet}}.{{northnet}}.1/24
+           ip ospf area 0
+           ip ospf passive
+          exit
+          router ospf
+           ospf router-id 10.255.{{octet}}.2
+          exit
+      - on: mv-campus-south
+        config: |
+          hostname mv-campus-south
+          interface lo
+           ip address 10.255.{{octet}}.3/32
+           ip ospf area 0
+          exit
+          interface eth1
+           description uplink to mv-core-1
+           ip address 10.{{octet}}.0.6/30
+           ip ospf area 0
+          exit
+          interface lan1
+           description south classrooms
+           ip address 10.{{octet}}.{{southnet}}.1/24
+           ip ospf area 0
+           ip ospf passive
+          exit
+          router ospf
+           ospf router-id 10.255.{{octet}}.3
+          exit
+      - on: mv-campus-west
+        config: |
+          hostname mv-campus-west
+          interface lo
+           ip address 10.255.{{octet}}.4/32
+           ip ospf area 0
+          exit
+          interface eth1
+           description uplink to mv-core-1
+           ip address 10.{{octet}}.0.10/30
+           ip ospf area 0
+          exit
+          interface lan1
+           description west library
+           ip address 10.{{octet}}.{{westnet}}.1/24
+           ip ospf area 0
+           ip ospf passive
+          exit
+          interface lan2
+           description west workshops
+           ip address 10.{{octet}}.99.1/24
+           ip ospf area 0
+           ip ospf passive
+          exit
+          router ospf
+           ospf router-id 10.255.{{octet}}.4
+          exit

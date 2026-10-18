@@ -17,8 +17,8 @@ Legend. **Type**: learn = guided first exposure, do = complete a task, fix = rep
 | Containers with Docker | 11 | 91 | 44 | 2 | 24 | 44 | 67 | B 71, C 64 | 28 |
 | Infrastructure as code with Terraform | 5 | 54 | 45 | 2 | 99 | 0 | 0 | A 53, B 1, V 45 | 21 |
 | Configuration management and automation | 7 | 61 | 36 | 1 | 9 | 36 | 52 | A 39, B 7, C 45, N 6 | 26 |
-| Network administration | 4 | 45 | 33 | 1 | 25 | 46 | 7 | N 78 | 15 |
-| **Total** | 43 | 500 | 380 | 13 | 280 | 314 | 286 | A 177, B 148, C 235, K 112, V 124, N 84 | 162 |
+| Network administration | 4 | 45 | 33 | 1 | 25 | 47 | 6 | N 78 | 15 |
+| **Total** | 43 | 500 | 380 | 13 | 280 | 315 | 285 | A 177, B 148, C 235, K 112, V 124, N 84 | 162 |
 
 Cross-domain exams: Platform engineer practical capstone. Exam tasks are counted under the domain of each task. Learning labs by type: learn 47, do 356, fix 83, hack 13, ctf 1. New skills proposed: 201.
 
@@ -1133,7 +1133,7 @@ _CloudTrain is not affiliated with or endorsed by Cisco Systems, Inc. or Red Hat
 | `net-jsonrpc-read-state` | Read switch state through a JSON-RPC API | learn | easy | 15 | N | proposed | ccna:automation-programmability | Query the annex SR Linux switch's JSON-RPC API with curl and jq and write the oper-state and description of every interface to a JSON file in the format the grader specifies. |
 | `net-jsonrpc-config-change` | Change interface settings through the API | do | medium | 20 | N | proposed | ccna:automation-programmability, ex457-aligned:netcommon-modules | Use the switch's JSON-RPC API, not its CLI, to set descriptions and admin state on four annex access ports from a YAML change request, and commit the change. |
 | `net-gnmi-interface-counters` | Collect interface counters over gNMI | do | medium | 20 | N | proposed | ccna:automation-programmability | Subscribe to the uplink counters of the annex switch with gNMI using YANG paths and save the in-octets value of each uplink to a file that the grader checks against the device. |
-| `net-jinja-render-frr` | Generate router configs from YAML with Jinja2 | do | medium | 25 | N | proposed | ccna:automation-programmability, ex457-aligned:network-roles-templates | Write a Jinja2 template that renders FRR interface and OSPF configuration for the three campus routers from a district YAML inventory, apply the output and prove all adjacencies come up. |
+| `net-jinja-render-frr` | Generate router configs from YAML with Jinja2 | do | medium | 25 | N | built | ccna:automation-programmability, ex457-aligned:network-roles-templates | Write a Jinja2 template that renders FRR interface and OSPF configuration for the three campus routers from a district YAML inventory, apply the output and prove all adjacencies come up. |
 | `net-ansible-frr-backup` | Back up every router config to Git with Ansible | do | medium | 20 | N | proposed | ccna:automation-programmability, ex457-aligned:config-backup | Write a playbook that pulls the running configuration of every district FRR router into a Git repository, one file per router, and commits only when a configuration changed. |
 
 ## Exam simulations
