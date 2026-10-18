@@ -36,6 +36,8 @@ type fakeDriver struct {
 	provErr  map[string]error
 	instance map[string]string // per node InstanceID
 	execExit int
+	// stdout, when set, answers every exec with this output.
+	stdout func(req drivers.ExecRequest) string
 	// execErr fails the exec call with this (0-based) index.
 	execErrAt  int
 	execErr    error
@@ -91,7 +93,11 @@ func (f *fakeDriver) Exec(_ context.Context, _ drivers.NodeRef, req drivers.Exec
 		return drivers.ExecResult{}, f.execErr
 	}
 	f.execs = append(f.execs, req)
-	return drivers.ExecResult{ExitCode: f.execExit, Stderr: "boom"}, nil
+	out := ""
+	if f.stdout != nil {
+		out = f.stdout(req)
+	}
+	return drivers.ExecResult{ExitCode: f.execExit, Stdout: out, Stderr: "boom"}, nil
 }
 
 func (f *fakeDriver) Connect(_ context.Context, ref drivers.NodeRef, a labsv1.AccessType) (labsv1.Endpoint, error) {

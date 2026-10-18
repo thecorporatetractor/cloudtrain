@@ -5,6 +5,7 @@ import type { Tx } from '../db/index.js';
 import type { CohortRow } from '../db/schema.js';
 import { badRequest, HttpError, notFound } from '../errors.js';
 import type { LabSession } from '../kube/types.js';
+import { endStateChecks } from '../content/view.js';
 import { endAttempt } from '../learner/learning.js';
 import { labIdOf, phaseOf, resultsOf, revealedHints } from '../sessions/map.js';
 import type { SessionService } from '../sessions/service.js';
@@ -193,7 +194,7 @@ export function boardSession(ps: PlatformService, ls: LabSession, attempt: { hin
   const lab = ps.content.labs.get(labId)?.lab;
   const results = lab ? resultsOf(ls, lab) : [];
   const passed = results.filter((r) => r.status === 'pass').length;
-  const total = lab?.spec.checks.length ?? 0;
+  const total = lab ? endStateChecks(lab).length : 0;
   const started = ls.metadata.creationTimestamp ?? ps.now().toISOString();
   const minutes = Math.max(0, Math.round((ps.now().getTime() - Date.parse(started)) / MIN));
   const hints = Math.max(revealedHints(ls).length, attempt?.hints_used ?? 0);

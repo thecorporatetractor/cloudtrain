@@ -498,6 +498,20 @@ to `Ready`). A request on a Failed or Expired session is answered with phase
 - `message` is learner-safe (`passed`, `not satisfied yet`, `the check timed
   out`, `the check could not run`); it never contains expected values.
   `output` (truncated to 2 KiB) is for authors only.
+- **Answer checks** (`type: answer`, CTF questions) are never run by the
+  grader: `status.validation` holds end-state checks only and the score is
+  theirs. The gateway grades submitted answers (`docs/ctf-authoring.md`). For
+  an `answer.compute` check the reconciler runs the command as admin on
+  `compute.on` (default: the entry node) right after setup and stores its
+  stdout (one trailing newline stripped) in `status.computedAnswers[<check
+  id>]`; a non-zero exit, empty output or more than 4 KiB fails setup. Values
+  are recomputed after a reset or a replaced node, and a claimant mirrors its
+  pooled session's values. `status.computedAnswers` is platform-only: the
+  gateway never sends it, nor any `secret: true` param, to the browser.
+  `internal/answer` holds the matchers (`exact`, `number`, `regex`, `any-of`
+  with case and whitespace normalisation); the gateway's TypeScript port runs
+  the same vectors (`packages/lab-schema/testdata/answer-matchers.json`).
+  Exam tasks may not contain answer checks (`labctl exam compile` refuses them).
 
 ## labctl
 
@@ -525,6 +539,16 @@ is deleted and the namespace must hold nothing but `kube-root-ca.crt` and the
 `default` ServiceAccount, with no VPC/subnet of the session and no vcluster
 ClusterRole left. JSON reports go to `deploy/.results/verify/<lab>.json`, a
 summary table to stdout; exit 1 on any failure.
+
+Labs with answer checks: in both base runs, after the solution steps, the
+verifier submits every `solution.answers` entry (a templated string, or the
+trimmed stdout of a command run as the learner by default) and requires it to
+be accepted, submits an empty answer that must be rejected, and submits every
+misconception's `answers` (wrong answers) and requires each `expectFail`
+check to reject them, all against the session's own expected values (no extra
+session per wrong answer). Reports list the submitted answers, never the
+expected ones. An answer check that expects the same value for both seeds is
+a warning (learners could share it).
 
 ```sh
 task lab:verify -- ../../content/packs/kubernetes/labs/scale-berth-planner

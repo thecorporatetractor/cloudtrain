@@ -478,6 +478,23 @@ func (r *LabSessionReconciler) reconcileNodes(ctx context.Context, s *labsv1.Lab
 			fmt.Sprintf("%d setup action(s) completed", len(tpl.spec.Setup)))
 	}
 
+	// Expected answers computed from the session (answer.compute) once setup
+	// is done; recomputed after a reset or a replaced node (rearmSetup).
+	if !answersComputed(s, tpl.spec) {
+		vals, err := ComputeAnswers(ctx, &NodeExecutor{Drivers: r.Drivers, Session: s, Template: tpl.spec}, tpl.spec)
+		if err != nil {
+			if drivers.IsPermanent(err) || errors.Is(err, errActionFailed) {
+				r.setCondition(s, labsv1.ConditionSetupComplete, metav1.ConditionFalse, ReasonSetupFailed, err.Error())
+				return r.fail(s, ReasonSetupFailed, err.Error()), nil
+			}
+			return ctrl.Result{}, err
+		}
+		st.ComputedAnswers = vals
+		if err := save(ctx); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
 	// Endpoints for every declared access point.
 	var eps []labsv1.Endpoint
 	for _, n := range tpl.spec.Topology.Nodes {
@@ -535,6 +552,7 @@ func setupStarted(s *labsv1.LabSession) bool {
 func (r *LabSessionReconciler) rearmSetup(s *labsv1.LabSession, reason, msg string) {
 	s.Status.SetupProgress = 0
 	s.Status.Endpoints = nil
+	s.Status.ComputedAnswers = nil
 	r.setCondition(s, labsv1.ConditionSetupComplete, metav1.ConditionFalse, reason, msg)
 	r.setCondition(s, labsv1.ConditionReady, metav1.ConditionFalse, reason, msg)
 	if s.Status.Phase != labsv1.SessionGrading {

@@ -3,6 +3,7 @@ import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { sql } from 'kysely';
 import type { Content } from '../content/load.js';
+import { endStateChecks } from '../content/view.js';
 import { endAttempt, recordRun, startAttempt } from '../learner/learning.js';
 import { expectedSuccess, DIFFICULTY } from '../learner/model.js';
 import { mapSsoClaims } from '../platform/identity.js';
@@ -198,7 +199,7 @@ export async function seed(db: Db, content: Content, people: PeopleDoc, now = ne
           await startAttempt(tx, { orgId, userId: id, lab, sessionName, startedAt: started });
           for (let r = 1; r <= runs; r++) {
             const at = new Date(started.getTime() + (minutes * 60_000 * r) / runs);
-            const checks = lab.spec.checks.map((c) => {
+            const checks = endStateChecks(lab).map((c) => {
               const passed = passedSoFar.has(c.id) || rand() < expectedSuccess(ability + 0.08 * (r - 1), d);
               if (passed) passedSoFar.add(c.id);
               return { id: c.id, passed, weight: c.weight ?? 1, skills: [...c.skills] };

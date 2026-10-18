@@ -186,6 +186,11 @@ type LabSessionStatus struct {
 	// ResolvedParams are the param values derived from spec.seed.
 	// +optional
 	ResolvedParams map[string]string `json:"resolvedParams,omitempty"`
+	// ComputedAnswers are the expected values of answer checks with
+	// answer.compute (by check id), computed right after setup. Platform
+	// only: the gateway grades with them and never sends them to learners.
+	// +optional
+	ComputedAnswers map[string]string `json:"computedAnswers,omitempty"`
 	// +optional
 	Nodes []NodeStatus `json:"nodes,omitempty"`
 	// Endpoints for access points of the session's nodes.

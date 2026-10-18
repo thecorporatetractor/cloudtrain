@@ -44,6 +44,13 @@ const (
 	DefaultCheckWeight        = "1"
 	DefaultHintCost           = 1
 	DefaultLabVersion         = 1
+	// Answer check defaults (lab.schema.json $defs/answer).
+	DefaultAnswerPoints          = 100
+	DefaultAnswerHintCost        = 10
+	DefaultAnswerWhitespace      = labsv1.WhitespaceCollapse
+	DefaultComputeTimeoutSec     = 30
+	DefaultAnswerInputTimeoutSec = 60
+	DefaultQuestionOrder         = "free"
 )
 
 // Options tune compilation.
@@ -217,7 +224,7 @@ func convert(src *sourceLab) *labsv1.LabTemplateSpec {
 		Topology:    convertTopology(s.Topology),
 		Setup:       convertActions(s.Setup),
 		Teardown:    convertActions(s.Teardown),
-		Solution:    labsv1.Solution{Explanation: s.Solution.Explanation, Steps: convertActions(s.Solution.Steps)},
+		Solution:    labsv1.Solution{Explanation: s.Solution.Explanation, Steps: convertActions(s.Solution.Steps), Answers: convertAnswerInputs(s.Solution.Answers)},
 	}
 	if s.Exam != nil {
 		out.Exam = &labsv1.ExamTaskSpec{Rerun: convertActions(s.Exam.Rerun)}
@@ -230,7 +237,7 @@ func convert(src *sourceLab) *labsv1.LabTemplateSpec {
 	if len(s.Params) > 0 {
 		out.Params = make(map[string]labsv1.ParamSpec, len(s.Params))
 		for name, p := range s.Params {
-			ps := labsv1.ParamSpec{Type: labsv1.ParamType(p.Type), Min: p.Min, Max: p.Max, Prefix: p.Prefix}
+			ps := labsv1.ParamSpec{Type: labsv1.ParamType(p.Type), Min: p.Min, Max: p.Max, Prefix: p.Prefix, Secret: p.Secret}
 			for _, v := range p.Values {
 				ps.Values = append(ps.Values, stringify(v))
 			}
@@ -244,6 +251,14 @@ func convert(src *sourceLab) *labsv1.LabTemplateSpec {
 	for _, c := range s.Checks {
 		out.Checks = append(out.Checks, convertCheck(c))
 	}
+	if HasAnswerChecks(out) {
+		out.QuestionOrder = s.QuestionOrder
+		if out.QuestionOrder == "" {
+			out.QuestionOrder = DefaultQuestionOrder
+		}
+	} else if s.QuestionOrder != "" {
+		out.QuestionOrder = s.QuestionOrder
+	}
 	for _, h := range s.Hints {
 		cost := int32(DefaultHintCost)
 		if h.Cost != nil {
@@ -252,7 +267,7 @@ func convert(src *sourceLab) *labsv1.LabTemplateSpec {
 		out.Hints = append(out.Hints, labsv1.Hint{Title: h.Title, Body: h.Body, Command: h.Command, Cost: cost})
 	}
 	for _, mc := range s.Misconceptions {
-		o := labsv1.Misconception{ID: mc.ID, Description: mc.Description, ExpectFail: mc.ExpectFail, Feedback: mc.Feedback}
+		o := labsv1.Misconception{ID: mc.ID, Description: mc.Description, ExpectFail: mc.ExpectFail, Feedback: mc.Feedback, Answers: convertAnswerInputs(mc.Answers)}
 		if mc.Mutation != nil {
 			a := convertAction(*mc.Mutation)
 			o.Mutation = &a
@@ -448,5 +463,80 @@ func convertCheck(c sourceCheck) labsv1.Check {
 	if e := c.Expect; e != nil {
 		out.Expect = &labsv1.Expectation{Match: labsv1.MatchType(e.Match), Value: e.Value}
 	}
+	if a := c.Answer; a != nil {
+		out.Answer = convertAnswer(a)
+		// Answer checks never run on a node through the grader.
+		out.TimeoutSec = 0
+	}
 	return out
+}
+
+func convertAnswer(a *sourceAnswer) *labsv1.AnswerSpec {
+	out := &labsv1.AnswerSpec{
+		Match: labsv1.AnswerMatch(a.Match), Value: a.Value, Values: a.Values,
+		CaseSensitive: a.CaseSensitive, Whitespace: labsv1.AnswerWhitespace(a.Whitespace),
+		Points: DefaultAnswerPoints, Placeholder: a.Placeholder,
+	}
+	if out.Whitespace == "" {
+		out.Whitespace = DefaultAnswerWhitespace
+	}
+	if a.Tolerance != nil && *a.Tolerance > 0 {
+		out.Tolerance = formatFloat(*a.Tolerance)
+	}
+	if a.Points != nil {
+		out.Points = *a.Points
+	}
+	if a.MaxAttempts != nil {
+		out.MaxAttempts = *a.MaxAttempts
+	}
+	if a.Penalty != nil {
+		out.Penalty = *a.Penalty
+	}
+	if c := a.Compute; c != nil {
+		out.Compute = &labsv1.AnswerCompute{On: c.On, Command: c.Command, TimeoutSec: DefaultComputeTimeoutSec}
+		if c.TimeoutSec != nil {
+			out.Compute.TimeoutSec = *c.TimeoutSec
+		}
+	}
+	for _, h := range a.Hints {
+		cost := int32(DefaultAnswerHintCost)
+		if h.Cost != nil {
+			cost = *h.Cost
+		}
+		out.Hints = append(out.Hints, labsv1.AnswerHint{Body: h.Body, Cost: cost})
+	}
+	return out
+}
+
+func convertAnswerInputs(in map[string]sourceAnswerInput) map[string]labsv1.AnswerInput {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]labsv1.AnswerInput, len(in))
+	for id, a := range in {
+		if a.Value != nil {
+			v := *a.Value
+			out[id] = labsv1.AnswerInput{Value: &v}
+			continue
+		}
+		ai := labsv1.AnswerInput{On: a.On, As: labsv1.ActionUser(a.As), Command: a.Command, TimeoutSec: DefaultAnswerInputTimeoutSec}
+		if ai.As == "" {
+			ai.As = labsv1.ActionAsLearner
+		}
+		if a.TimeoutSec != nil {
+			ai.TimeoutSec = *a.TimeoutSec
+		}
+		out[id] = ai
+	}
+	return out
+}
+
+// HasAnswerChecks reports whether a lab has at least one answer check.
+func HasAnswerChecks(s *labsv1.LabTemplateSpec) bool {
+	for _, c := range s.Checks {
+		if c.Type == labsv1.CheckTypeAnswer {
+			return true
+		}
+	}
+	return false
 }

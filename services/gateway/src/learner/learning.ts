@@ -2,6 +2,7 @@ import type { Lab as SourceLab } from '@cloudtrain/lab-schema';
 import type { AttemptOutcomeDb } from '../db/schema.js';
 import type { Tx } from '../db/index.js';
 import { DIFFICULTY, prior, update, type SkillBelief } from './model.js';
+import { endStateChecks } from '../content/view.js';
 
 /*
  * Persistence of learning (docs/platform-identity.md): every graded validate
@@ -54,7 +55,7 @@ export async function startAttempt(tx: Tx, a: { orgId: string; userId: string; l
       difficulty: a.lab.metadata.difficulty,
       session_name: a.sessionName,
       started_at: a.startedAt,
-      checks_total: a.lab.spec.checks.length,
+      checks_total: endStateChecks(a.lab).length,
     })
     .onConflict((oc) => oc.column('session_name').doNothing())
     .returning('id')
@@ -127,14 +128,14 @@ export async function recordRun(tx: Tx, r: RunInput): Promise<RunResult> {
   }
 
   const passed = checks.filter((c) => c.passed).length;
-  const allPassed = checks.length > 0 && passed === r.lab.spec.checks.length;
+  const allPassed = checks.length > 0 && passed === endStateChecks(r.lab).length;
   await tx
     .updateTable('lab_attempts')
     .set({
       validations: run,
       score: Math.max(attempt.score, Math.round(r.score)),
       checks_passed: Math.max(attempt.checks_passed, passed),
-      checks_total: r.lab.spec.checks.length,
+      checks_total: endStateChecks(r.lab).length,
       hints_used: Math.max(attempt.hints_used, r.hintsUsed),
       duration_s: Math.max(0, Math.round((r.at.getTime() - attempt.started_at.getTime()) / 1000)),
       ...(allPassed ? { outcome: 'passed' as const } : {}),

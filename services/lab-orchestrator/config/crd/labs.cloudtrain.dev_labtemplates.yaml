@@ -63,6 +63,99 @@ spec:
                 items:
                   description: Check is a typed, skill-tagged grading check.
                   properties:
+                    answer:
+                      description: Answer is set on answer checks only.
+                      properties:
+                        caseSensitive:
+                          type: boolean
+                        compute:
+                          description: |-
+                            Compute derives the expected value from the session after setup; the
+                            result is kept in the session's status.computedAnswers.
+                          properties:
+                            command:
+                              type: string
+                            "on":
+                              description: 'On is the node (default: the entry node).'
+                              type: string
+                            timeoutSec:
+                              format: int32
+                              type: integer
+                          required:
+                          - command
+                          type: object
+                        hints:
+                          items:
+                            description: AnswerHint is a question hint with a point
+                              cost.
+                            properties:
+                              body:
+                                type: string
+                              cost:
+                                format: int32
+                                type: integer
+                            required:
+                            - body
+                            type: object
+                          type: array
+                        match:
+                          description: AnswerMatch is how a submitted answer is compared
+                            with the expected one.
+                          enum:
+                          - exact
+                          - number
+                          - regex
+                          - any-of
+                          type: string
+                        maxAttempts:
+                          description: |-
+                            MaxAttempts is the number of wrong answers allowed before the question
+                            closes; 0 = unlimited.
+                          format: int32
+                          type: integer
+                        penalty:
+                          description: Penalty is taken off the award for every wrong
+                            answer.
+                          format: int32
+                          type: integer
+                        placeholder:
+                          type: string
+                        points:
+                          description: Points for a correct answer (compiler default
+                            100).
+                          format: int32
+                          minimum: 0
+                          type: integer
+                        tolerance:
+                          description: |-
+                            Tolerance is the largest accepted absolute difference of a number
+                            answer, as a decimal string.
+                          pattern: ^[0-9]+(\.[0-9]+)?$
+                          type: string
+                        value:
+                          description: |-
+                            Value is the expected value (exact, number) or pattern (regex), with
+                            {{params}} resolved per session.
+                          type: string
+                        values:
+                          description: Values are the accepted values of an any-of
+                            answer.
+                          items:
+                            type: string
+                          type: array
+                        whitespace:
+                          description: Whitespace normalisation (compiler default
+                            "collapse").
+                          enum:
+                          - trim
+                          - collapse
+                          - remove
+                          - none
+                          type: string
+                      required:
+                      - match
+                      - points
+                      type: object
                     command:
                       type: string
                     description:
@@ -133,6 +226,7 @@ spec:
                       - reachability
                       - device-cmd
                       - http
+                      - answer
                       type: string
                     weight:
                       description: Weight is a decimal, default "1".
@@ -231,11 +325,39 @@ spec:
                   description: Misconception is a plausible wrong approach, also used
                     as a mutation test.
                   properties:
+                    answers:
+                      additionalProperties:
+                        description: |-
+                          AnswerInput is an answer the verifier submits: a literal Value, or the
+                          trimmed stdout of Command run on a node.
+                        properties:
+                          as:
+                            description: ActionUser is the identity an action runs
+                              as.
+                            enum:
+                            - learner
+                            - admin
+                            type: string
+                          command:
+                            type: string
+                          "on":
+                            type: string
+                          timeoutSec:
+                            format: int32
+                            type: integer
+                          value:
+                            type: string
+                        type: object
+                      description: |-
+                        Answers are wrong answers for answer checks (by check id), used
+                        instead of Mutation.
+                      type: object
                     description:
                       type: string
                     expectFail:
-                      description: ExpectFail lists the check ids that must fail after
-                        Mutation.
+                      description: |-
+                        ExpectFail lists the check ids that must fail after Mutation, or
+                        reject the answer given in Answers.
                       items:
                         type: string
                       type: array
@@ -313,6 +435,11 @@ spec:
                       type: integer
                     prefix:
                       type: string
+                    secret:
+                      description: |-
+                        Secret params are never sent to the learner's browser (answer checks
+                        reference them for their expected values).
+                      type: boolean
                     type:
                       description: ParamType is the kind of a randomised parameter.
                       enum:
@@ -329,6 +456,14 @@ spec:
                   - type
                   type: object
                 type: object
+              questionOrder:
+                description: |-
+                  QuestionOrder is how answer checks unlock: free (default) or
+                  sequential (a question opens once the one before is solved or closed).
+                enum:
+                - free
+                - sequential
+                type: string
               setup:
                 items:
                   description: Action runs on a node. Exactly one of run/apply/file/config
@@ -447,9 +582,36 @@ spec:
                       - steps
                       type: object
                     type: array
+                  answers:
+                    additionalProperties:
+                      description: |-
+                        AnswerInput is an answer the verifier submits: a literal Value, or the
+                        trimmed stdout of Command run on a node.
+                      properties:
+                        as:
+                          description: ActionUser is the identity an action runs as.
+                          enum:
+                          - learner
+                          - admin
+                          type: string
+                        command:
+                          type: string
+                        "on":
+                          type: string
+                        timeoutSec:
+                          format: int32
+                          type: integer
+                        value:
+                          type: string
+                      type: object
+                    description: Answers are the correct answers of the answer checks
+                      (by check id).
+                    type: object
                   explanation:
                     type: string
                   steps:
+                    description: Steps solve the end-state checks (at least one of
+                      Steps and Answers).
                     items:
                       description: Action runs on a node. Exactly one of run/apply/file/config
                         is set.
@@ -496,10 +658,7 @@ spec:
                         rule: '(has(self.run) ? 1 : 0) + (has(self.apply) ? 1 : 0)
                           + (has(self.file) ? 1 : 0) + (has(self.config) ? 1 : 0)
                           == 1'
-                    minItems: 1
                     type: array
-                required:
-                - steps
                 type: object
               source:
                 description: LabSource identifies the lab.yaml a template was compiled

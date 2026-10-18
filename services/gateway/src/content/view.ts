@@ -1,4 +1,4 @@
-import type { Lab as SourceLab } from '@cloudtrain/lab-schema';
+import { secretParams, type Lab as SourceLab } from '@cloudtrain/lab-schema';
 import type { Lab, LabCheck, LabHint } from '@cloudtrain/api-types';
 
 /**
@@ -8,7 +8,7 @@ import type { Lab, LabCheck, LabHint } from '@cloudtrain/api-types';
  * the hint is revealed on a session (see SessionService.revealHint).
  */
 export function learnerLab(src: SourceLab): Lab {
-  const checks: LabCheck[] = src.spec.checks.map((c) => ({
+  const checks: LabCheck[] = endStateChecks(src).map((c) => ({
     id: c.id,
     description: c.description,
     skills: [...c.skills],
@@ -29,6 +29,19 @@ export function learnerLab(src: SourceLab): Lab {
       hints,
     },
   };
+}
+
+/** The checks graded on end state (Validate); answer checks (questions) are graded on submitted answers. */
+export function endStateChecks(src: SourceLab): SourceLab['spec']['checks'][number][] {
+  return src.spec.checks.filter((c) => c.type !== 'answer');
+}
+
+/** Resolved params a learner may see: every param except the secret ones (answers depend on those). */
+export function learnerParams(src: SourceLab, params: Record<string, string> | undefined): Record<string, string> | undefined {
+  if (!params) return undefined;
+  const secret = secretParams(src);
+  if (!secret.size) return params;
+  return Object.fromEntries(Object.entries(params).filter(([k]) => !secret.has(k)));
 }
 
 const PARAM = /\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}/g;

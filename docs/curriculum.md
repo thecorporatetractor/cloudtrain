@@ -13,14 +13,14 @@ Legend. **Type**: learn = guided first exposure, do = complete a task, fix = rep
 | Domain | Paths | Learning labs | Exam tasks | Exams | Verified | Built | Proposed | Tier mix (all labs) | Learning hours |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | Kubernetes | 5 | 89 | 103 | 3 | 70 | 122 | 0 | C 1, K 112, V 79 | 25 |
-| Linux administration | 11 | 159 | 119 | 3 | 53 | 65 | 160 | A 84, B 69, C 125 | 48 |
+| Linux administration | 11 | 160 | 119 | 3 | 53 | 66 | 160 | A 85, B 69, C 125 | 48 |
 | Containers with Docker | 11 | 91 | 44 | 2 | 24 | 44 | 67 | B 71, C 64 | 28 |
 | Infrastructure as code with Terraform | 5 | 54 | 45 | 2 | 99 | 0 | 0 | A 53, B 1, V 45 | 21 |
 | Configuration management and automation | 7 | 61 | 36 | 1 | 9 | 36 | 52 | A 39, B 7, C 45, N 6 | 26 |
 | Network administration | 4 | 45 | 33 | 1 | 25 | 46 | 7 | N 78 | 15 |
-| **Total** | 43 | 499 | 380 | 13 | 280 | 313 | 286 | A 176, B 148, C 235, K 112, V 124, N 84 | 161 |
+| **Total** | 43 | 500 | 380 | 13 | 280 | 314 | 286 | A 177, B 148, C 235, K 112, V 124, N 84 | 162 |
 
-Cross-domain exams: Platform engineer practical capstone. Exam tasks are counted under the domain of each task. Learning labs by type: learn 47, do 356, fix 83, hack 13. New skills proposed: 201.
+Cross-domain exams: Platform engineer practical capstone. Exam tasks are counted under the domain of each task. Learning labs by type: learn 47, do 356, fix 83, hack 13, ctf 1. New skills proposed: 201.
 
 ## Kubernetes
 
@@ -200,7 +200,7 @@ Competencies: `linux.shell`, `linux.files`, `linux.users`, `linux.identity`, `li
 | Path | Title | Level | Hours | Labs | Prerequisites | Aligns to | Audience |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `linux-foundations` | Linux foundations | beginner | 6 | 20 | - | lpic1, linuxplus | Anyone new to Linux; prerequisite for every other Linux, container, automation and IaC path |
-| `linux-scripting` | Shell scripting and everyday automation | beginner | 4 | 10 | `linux-foundations` | lpic1, rhcsa-aligned, linuxplus | Administrators and developers who repeat tasks by hand |
+| `linux-scripting` | Shell scripting and everyday automation | beginner | 4 | 11 | `linux-foundations` | lpic1, rhcsa-aligned, linuxplus | Administrators and developers who repeat tasks by hand |
 | `linux-sysadmin` | Linux system administration (distribution-neutral) | intermediate | 14 | 41 | `linux-foundations` | lfcs, lpic1, linuxplus | Administrators running mixed Debian-family and Enterprise Linux fleets |
 | `enterprise-linux` | Enterprise Linux administration | intermediate | 14 | 31 | `linux-foundations` | rhcsa-aligned | Administrators of Enterprise Linux estates; reboot-graded throughout |
 | `linux-networking` | Networking for Linux administrators | intermediate | 8 | 21 | `linux-foundations` | lfcs, lpic1, lpic2, linuxplus | Administrators who own host networking, gateways and firewalls |
@@ -229,6 +229,7 @@ _CloudTrain is not affiliated with or endorsed by the Linux Professional Institu
 - **Writing scripts**: `script-first-delay-summary`, `script-loops-depot-checks`, `script-positional-user-tool`, `awk-fare-report`
 - **Scheduling and its pitfalls**: `cron-nightly-fares-export`, `fix-cron-silent-failure`, `fix-crlf-script`
 - **Robust scripts, Git and Python**: `robust-script-rotation-tool`, `git-timetable-repo`, `python-venv-fleet-report`
+- **Investigation challenge (CTF)**: `ctf-ticket-gate-breach`
 
 _CloudTrain is not affiliated with or endorsed by the Linux Professional Institute, Red Hat, Inc. or CompTIA. LPIC-1, RHCSA and Linux+ are trademarks of their respective owners. This path covers objectives aligned to those exams; completing it confers no certification._
 
@@ -354,7 +355,7 @@ _CloudTrain is not affiliated with or endorsed by Red Hat, Inc. or CompTIA, Inc.
 
 </details>
 
-### Labs (159)
+### Labs (160)
 
 | Lab | Title | Type | Difficulty | Min | Tier | Status | Frameworks | Scenario |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -363,6 +364,7 @@ _CloudTrain is not affiliated with or endorsed by Red Hat, Inc. or CompTIA, Inc.
 | `file-ops-roster-cleanup` | Reorganise the crew roster directory with globbing | do | easy | 10 | A | verified | lpic1:gnu-commands, rhcsa-aligned:essential-tools | Move every 2026 crew roster under ~/rosters into per-month directories (2026-01 ... 2026-12) using globs and brace expansion, deleting only the *.bak copies. |
 | `links-shared-timetable` | Publish the current timetable with links | do | easy | 8 | A | verified | lpic1:devices-filesystems, rhcsa-aligned:essential-tools | Make /srv/timetable/current a symbolic link to the approved draft and create a hard link archive copy, so both survive a rename of the draft directory as the grader checks inode and target. |
 | `streams-delay-report` | Split delay-feed output and errors into separate files | do | easy | 8 | A | verified | lpic1:gnu-commands, rhcsa-aligned:essential-tools, linuxplus:system-management | Run the delay-feed collector so its stdout lands in /var/tmp/delays.log, its errors in delays.err, and a copy of stdout scrolls on screen via tee. |
+| `ctf-ticket-gate-breach` | Investigate a break-in on the ticket gateway (CTF) | ctf | easy | 20 | A | built | lpic1:gnu-commands, linuxplus:automation-scripting | From the seeded ticket gateway log, find the address behind a password-spraying attack, its failed attempts, the account it got into, its tool and the file it exported, then block it. |
 | `text-filters-ticket-sales` | Rank stations by ticket sales from a CSV export | do | easy | 12 | A | verified | lpic1:gnu-commands, linuxplus:automation-scripting | From the ticketing export sales.csv, write the five stations with the highest weekend revenue, sorted descending, to ~/answers/top5.txt using cut, sort, uniq and head. |
 | `vim-fix-signal-config` | Edit a signalling config file in vim without breaking it | learn | easy | 10 | A | verified | lpic1:gnu-commands, rhcsa-aligned:essential-tools | Change three parameters in /etc/tr-signal/interlock.conf with vim, keeping its comments and file mode intact; the grader diffs everything except the three lines. |
 | `regex-extract-train-ids` | Extract malformed train IDs with regular expressions | do | medium | 15 | A | verified | lpic1:gnu-commands, rhcsa-aligned:essential-tools, linuxplus:automation-scripting | Use grep -E and sed to list every train ID in the dispatch log that breaks the two-letters-four-digits rule and write a corrected copy of the log to ~/dispatch-fixed.log. |

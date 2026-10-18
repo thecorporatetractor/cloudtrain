@@ -20,7 +20,7 @@ const doc = YAML.parse(readFileSync(src, "utf8"));
 
 const DOMAIN_ORDER = ["kubernetes", "linux", "containers", "iac", "automation", "networking"];
 const TIERS = ["A", "B", "C", "K", "V", "N"];
-const TYPES = ["learn", "do", "fix", "hack"];
+const TYPES = ["learn", "do", "fix", "hack", "ctf"];
 const cell = (v) => String(v ?? "").replace(/\|/g, "\\|").replace(/\n+/g, " ").trim();
 const row = (cells) => `| ${cells.map(cell).join(" | ")} |`;
 const table = (head, rows) => [row(head), row(head.map(() => "---")), ...rows.map(row)].join("\n");

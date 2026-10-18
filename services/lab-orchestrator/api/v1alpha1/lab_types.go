@@ -95,6 +95,10 @@ type ParamSpec struct {
 	// Default value, rendered as a string.
 	// +optional
 	Default *string `json:"default,omitempty"`
+	// Secret params are never sent to the learner's browser (answer checks
+	// reference them for their expected values).
+	// +optional
+	Secret bool `json:"secret,omitempty"`
 }
 
 // Topology is the graph of nodes and links of a lab.
@@ -240,8 +244,12 @@ type FileAction struct {
 }
 
 // CheckType is the kind of a grading check.
-// +kubebuilder:validation:Enum=shell;k8s-query;k8s-can-i;k8s-context;file;service-state;reachability;device-cmd;http
+// +kubebuilder:validation:Enum=shell;k8s-query;k8s-can-i;k8s-context;file;service-state;reachability;device-cmd;http;answer
 type CheckType string
+
+// CheckTypeAnswer is a question the learner answers in the lab view. The
+// platform grades the submitted answer; the grader never runs it on a node.
+const CheckTypeAnswer CheckType = "answer"
 
 // Check is a typed, skill-tagged grading check.
 type Check struct {
@@ -266,6 +274,104 @@ type Check struct {
 	Port *int32 `json:"port,omitempty"`
 	// +optional
 	Expect *Expectation `json:"expect,omitempty"`
+	// +optional
+	TimeoutSec int32 `json:"timeoutSec,omitempty"`
+	// Answer is set on answer checks only.
+	// +optional
+	Answer *AnswerSpec `json:"answer,omitempty"`
+}
+
+// AnswerMatch is how a submitted answer is compared with the expected one.
+// +kubebuilder:validation:Enum=exact;number;regex;any-of
+type AnswerMatch string
+
+const (
+	AnswerExact  AnswerMatch = "exact"
+	AnswerNumber AnswerMatch = "number"
+	AnswerRegex  AnswerMatch = "regex"
+	AnswerAnyOf  AnswerMatch = "any-of"
+)
+
+// AnswerWhitespace is the whitespace normalisation applied before matching.
+// +kubebuilder:validation:Enum=trim;collapse;remove;none
+type AnswerWhitespace string
+
+const (
+	WhitespaceTrim     AnswerWhitespace = "trim"
+	WhitespaceCollapse AnswerWhitespace = "collapse"
+	WhitespaceRemove   AnswerWhitespace = "remove"
+	WhitespaceNone     AnswerWhitespace = "none"
+)
+
+// AnswerSpec is the grading side of an answer check. Exactly one of Value,
+// Values and Compute is set. Expected values never leave the platform.
+type AnswerSpec struct {
+	Match AnswerMatch `json:"match"`
+	// Value is the expected value (exact, number) or pattern (regex), with
+	// {{params}} resolved per session.
+	// +optional
+	Value *string `json:"value,omitempty"`
+	// Values are the accepted values of an any-of answer.
+	// +optional
+	Values []string `json:"values,omitempty"`
+	// Compute derives the expected value from the session after setup; the
+	// result is kept in the session's status.computedAnswers.
+	// +optional
+	Compute *AnswerCompute `json:"compute,omitempty"`
+	// +optional
+	CaseSensitive bool `json:"caseSensitive,omitempty"`
+	// Whitespace normalisation (compiler default "collapse").
+	// +optional
+	Whitespace AnswerWhitespace `json:"whitespace,omitempty"`
+	// Tolerance is the largest accepted absolute difference of a number
+	// answer, as a decimal string.
+	// +optional
+	// +kubebuilder:validation:Pattern=`^[0-9]+(\.[0-9]+)?$`
+	Tolerance string `json:"tolerance,omitempty"`
+	// Points for a correct answer (compiler default 100).
+	// +kubebuilder:validation:Minimum=0
+	Points int32 `json:"points"`
+	// MaxAttempts is the number of wrong answers allowed before the question
+	// closes; 0 = unlimited.
+	// +optional
+	MaxAttempts int32 `json:"maxAttempts,omitempty"`
+	// Penalty is taken off the award for every wrong answer.
+	// +optional
+	Penalty int32 `json:"penalty,omitempty"`
+	// +optional
+	Placeholder string `json:"placeholder,omitempty"`
+	// +optional
+	Hints []AnswerHint `json:"hints,omitempty"`
+}
+
+// AnswerCompute runs a command on a lab node to derive an expected answer.
+type AnswerCompute struct {
+	// On is the node (default: the entry node).
+	// +optional
+	On      string `json:"on,omitempty"`
+	Command string `json:"command"`
+	// +optional
+	TimeoutSec int32 `json:"timeoutSec,omitempty"`
+}
+
+// AnswerHint is a question hint with a point cost.
+type AnswerHint struct {
+	Body string `json:"body"`
+	// +optional
+	Cost int32 `json:"cost,omitempty"`
+}
+
+// AnswerInput is an answer the verifier submits: a literal Value, or the
+// trimmed stdout of Command run on a node.
+type AnswerInput struct {
+	// +optional
+	Value *string `json:"value,omitempty"`
+	// +optional
+	On string `json:"on,omitempty"`
+	// +optional
+	As ActionUser `json:"as,omitempty"`
+	// +optional
+	Command string `json:"command,omitempty"`
 	// +optional
 	TimeoutSec int32 `json:"timeoutSec,omitempty"`
 }
@@ -314,7 +420,12 @@ type Misconception struct {
 	Description string `json:"description"`
 	// +optional
 	Mutation *Action `json:"mutation,omitempty"`
-	// ExpectFail lists the check ids that must fail after Mutation.
+	// Answers are wrong answers for answer checks (by check id), used
+	// instead of Mutation.
+	// +optional
+	Answers map[string]AnswerInput `json:"answers,omitempty"`
+	// ExpectFail lists the check ids that must fail after Mutation, or
+	// reject the answer given in Answers.
 	// +optional
 	ExpectFail []string `json:"expectFail,omitempty"`
 	// +optional
@@ -325,8 +436,12 @@ type Misconception struct {
 type Solution struct {
 	// +optional
 	Explanation string `json:"explanation,omitempty"`
-	// +kubebuilder:validation:MinItems=1
-	Steps []Action `json:"steps"`
+	// Steps solve the end-state checks (at least one of Steps and Answers).
+	// +optional
+	Steps []Action `json:"steps,omitempty"`
+	// Answers are the correct answers of the answer checks (by check id).
+	// +optional
+	Answers map[string]AnswerInput `json:"answers,omitempty"`
 	// Alternatives are other valid solutions; each must pass every check.
 	// +optional
 	Alternatives []SolutionAlternative `json:"alternatives,omitempty"`
