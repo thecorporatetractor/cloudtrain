@@ -12,7 +12,7 @@ test namespaces are deleted. Round 3 results are in "Round 3" below; the table i
 | Tier A, EL | `el-lab:10` | `cloudtrain/el-lab:10` (955 MB) | **built + smoke-tested** in a `hostUsers: false` pod (Ready in 9-11 s; uid_map `0 1256194048 65536`; tini PID 1 reaps zombies; learner has no sudo; man pages; sshd and strace work). Loaded into both kind nodes. Not yet run through the orchestrator end to end. |
 | Tier A, Debian | `deb-lab:24.04` | `cloudtrain/deb-lab:24.04` (896 MB) | **verified**: built from the local noble mirror (the apt exit 100 was man-db's postinst: the minimized base diverts `/usr/bin/man`; the Dockerfile now removes the diversion like `unminimize`). `text-filters-ticket-sales` switched to it and passed a live `labctl verify` (9/9 runs: 2 base, 5 mutations, 2 alternatives, Ready in 30-41 s). `task mirror:test` uses it for apt/pip from the mirror. |
 | Tier A driver support | (catalog field `userNamespace: true`) | lab-orchestrator | **unit-tested**: `hostUsers: false` when every schedulable node reports `runtimeHandlers[].features.userNamespaces` for the runtime handler (`--user-namespaces=auto`, default), not for pods with privileged containers (topology links); annotation `labs.cloudtrain.dev/user-namespace` records why. kind 1.36.4 / containerd 2.3.4 / runc 1.4.3 / kernel 6.18 supports it (UserNamespacesSupport GA), idmapped local-path PVCs keep uid 1000 on the node. |
-| Tier B (Kata) | none | none | **not started** (round 3 used the time on kubeadm-full and the gVisor fix). Preconditions unchanged: the kind worker has `/dev/kvm` (nested) and `/dev/vhost-vsock`; kata-deploy 4.2.0 is ~1.7 GB compressed, Docker has the room now. Fallback until then: tier-B labs run as tier-C VMs. |
+| Tier B (Kata) | none | none | **spike prepared, not run** (platform round 5, 2026-10-18; see "Kata spike" below). Preconditions checked: nested KVM on (`kvm_intel nested=Y`), `/dev/kvm` in both kind nodes and `/dev/vhost-vsock` in the worker; kata-deploy 4.2.0 chart reachable. Not run because the shared heavy slot had VM verifies queued for up to 4 h. Fallback until then: tier-B labs run as tier-C VMs. |
 | Tier C, EL | `el-vm:10` | `cloudtrain/el-vm:10` (1.78 GB) | **verified**: TCG build 1148 s; boot-test PASSED (432 s): two blank data disks by serial, LVM over both + XFS, mdadm, SELinux Enforcing, firewalld active, offline `dnf install httpd` from the local repo, man pages. |
 | Tier C, Ubuntu | `ubuntu-vm:24.04` | `cloudtrain/ubuntu-vm:24.04` (1.82 GB) | **verified**: TCG build 1312 s (first attempt failed: `qemu-guest-agent` was not in the noble mirror; added to `packages-noble.txt`). Boot test PASSED in 520 s (ssh 110 s): two data disks by serial, LVM + XFS, AppArmor enabled, offline `apt-get update` + `apt-get install nginx` from the local signed repo, nftables/ufw. No lab uses it yet. |
 | vm driver extra disks | topology `resources.disks: ["2Gi", ...]` | lab-orchestrator | **unit-tested** + the same VM shape boot-tested on el-vm. emptyDisk (ephemeral) / blank DataVolume (persistent), serial `ct-dataN`. |
@@ -32,7 +32,7 @@ catalog (drop them from the curriculum's `images` list).
 
 ## Next steps, in order
 
-1. Kata spike (tier B): kata-deploy with RuntimeClass `kata` on the kind worker.
+1. Kata spike (tier B): run `tools/slots/run.sh vm -- bash tools/kata-spike/spike.sh` (see "Kata spike" below), then decide on kata-deploy on the shared worker.
 2. MetalLB in a Kube-OVN VPC: the assigned IP is not reachable from the tester pod. Options:
    give the speaker's IP to the VM port (`ovn.kubernetes.io` allowed address pairs / port
    security off for lab VMs), or document NodePort/Ingress only for LoadBalancer labs.
@@ -102,3 +102,40 @@ catalog (drop them from the curriculum's `images` list).
 `cd .worktrees/b-foundations && git pull`, check C: (`powershell.exe -NoProfile -Command
 "[int]((Get-PSDrive C).Free/1GB)"`, stop under 15 GB), `task dev:up` (heals certs), then
 the steps above. `docs/dev-environment.md` "Lab runtime tiers" documents the pieces.
+
+## Kata spike (tier B), platform round 5
+
+Question: can Kata Containers run in this kind + KubeVirt dev setup (WSL2 -> Docker
+Desktop -> kind node container -> QEMU/KVM guest)? Status 2026-10-18: **prepared, not
+run**. The heavy slot (`tools/slots/run.sh vm|build`, one job) had five VM verifies
+queued, the oldest for over 4 hours, so the spike was not forced.
+
+What is known without running it:
+
+- Nested virtualisation is on: `/sys/module/kvm_intel/parameters/nested` = `Y`, the
+  host CPU exposes `vmx`, `/dev/kvm` is present in both kind nodes and KubeVirt
+  already runs KVM guests on the worker (`devices.kubevirt.io/kvm`). A Kata QEMU guest is
+  the same kind of nested guest as a KubeVirt VM, so it should start; boot time and
+  CPU steal under load are the open questions (kubeadm VMs lost 64-85 % CPU at load 80+).
+- `/dev/vhost-vsock` (Kata's agent channel) is mounted in `cloudtrain-dev-worker`; the
+  WSL distro itself has none, the Docker Desktop VM does. `/dev/vhost-net` exists too
+  (keep the warning in `docs/dev-environment.md` about bind-mounting it for kind).
+- kata-deploy 4.2.0 is a Helm chart (`oci://ghcr.io/kata-containers/kata-deploy-charts/kata-deploy`);
+  `shims.disableAll: true` + `shims.qemu.enabled: true` installs only `kata-qemu`.
+  The chart's DaemonSet rewrites containerd's config on every node it runs on and
+  restarts containerd, which is why the spike does **not** install it on the shared
+  `cloudtrain-dev` worker: running pods normally survive a containerd restart, but
+  other agents' verifies are mid-flight there most of the time.
+
+How to run it (about 15-30 min, one heavy slot): `tools/slots/run.sh vm -- bash
+tools/kata-spike/spike.sh`. It creates a throwaway single-node kind cluster
+`kata-spike` (same kindest/node image, `/dev/kvm`, `/dev/vhost-vsock`, `/dev/vhost-net`
+mounted; own kubeconfig in a temp dir, so `~/.kube/config` and its current context are
+untouched), installs kata-deploy with only the QEMU shim, runs a busybox pod with
+`runtimeClassName: kata-qemu` that prints the guest kernel, CPU and memory, records the
+timings and the QEMU process, and deletes the cluster. Success = the pod reaches
+`Succeeded` and `uname -r` differs from the host kernel. Next if it works: measure pod
+start time and memory overhead under the usual load, then decide whether
+`--runtime-class kata` for tier-B labs belongs on the shared worker (planned containerd
+restart, announced to other agents) or only in production.
+
