@@ -101,8 +101,8 @@ trivy --version
 # --- base images in buildah's storage (by digest, named as the labs reference them) ---
 while read -r ref name; do
   [ -n "$ref" ] || continue
-  src=$ref
-  if [ -n "${DOCKERIO_MIRROR:-}" ] && [ "${ref%%/*}" = docker.io ]; then src=$DOCKERIO_MIRROR/${ref#docker.io/}; fi
+  tagged=${ref%@*}; src=${tagged%:*}@${ref#*@}   # <name>:<tag>@<digest> -> pull <name>@<digest>
+  if [ -n "${DOCKERIO_MIRROR:-}" ] && [ "${src%%/*}" = docker.io ]; then src=$DOCKERIO_MIRROR/${src#docker.io/}; fi
   for try in 1 2 3; do
     id=$(buildah pull -q --platform linux/amd64 "docker://$src") && break
     [ "$try" = 3 ] && { echo "buildah pull failed: $src"; exit 1; }; sleep 5
