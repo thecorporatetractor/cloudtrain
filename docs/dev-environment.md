@@ -671,7 +671,9 @@ the volume under `/srv/ct-work/results/`: `status.json` (one line, every minute)
 `summary.tsv`, `labs/<id>.json` (status, failing step, timing, log tail), `logs/<id>.log`,
 `reports/<id>.json` (labctl's report), `exams/<exam>-<mode>.json`, `runner.log`.
 `ct-batch.sh list` shows what the next cycle would run; `ct-batch.sh once id,...` re-runs
-labs. `ct-metrics.service` samples CPU, steal, load and memory every 10 s
+labs. While the loop runs (it holds the runner lock), `once id,...` appends the ids to
+`state/requeue` instead and exits; the loop starts them, forced, while it dispatches, and wakes
+from its cycle sleep for them. `ct-metrics.service` samples CPU, steal, load and memory every 10 s
 (`results/metrics/<date>.tsv`); `ct-autoscale.service` moves `CT_SLOTS_HEAVY`/`CT_SLOTS_POD` in
 `runner.env` every 150 s: up by 3 / 8 while CPU is under 80 % and more than 40 GiB is free
 and the limit is in use, down (heavy -2, pod -4) on steal over 3 %, CPU over 95 %, load over 96, under 20 GiB free, a Kube-OVN
