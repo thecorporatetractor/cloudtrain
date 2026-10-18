@@ -294,6 +294,14 @@ the TLS flags. The etcd-snapshot-restore lab replaces the unit and PKI with its 
 (`provision-etcd.sh` tears them down first); `task image:test` runs that lab's provision
 script and solution on the image.
 
+**Persistent root disks.** With `--vm-disks persistent` (the manager default) every VM root disk is a CDI
+DataVolume imported from the containerDisk. Its size is the catalog `diskSize`, or
+`DefaultVMDiskSize` (12Gi, for the 10 GiB images) when the entry has none. CDI keeps 6 % for
+filesystem overhead, so a disk smaller than the image's virtual size plus that fails the import
+with "A larger PVC is required". The catalog therefore sizes disks at virtual size x 1.15: 12Gi
+for the kubeadm:1.37 and 1.36 images, 14Gi for kubeadm:1.37-full/-sec and docker-vm:29 (12 GiB).
+`build.sh` refuses to build an image whose catalog `diskSize` is below that.
+
 All VM images share the same conventions: Ubuntu cloud image with cloud-init and sshd,
 **no users or keys baked in** (the runtime injects `learner` with passwordless sudo,
 root's authorized_keys and the ssh host key through cloud-init), apt timers and snapd

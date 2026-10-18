@@ -73,6 +73,13 @@ esac
 # --- 0. catalog contract: the catalog must name exactly what this build produces ---
 cat_get() { yq -r ".images[\"$REF\"].$1 // \"\"" "$CATALOG"; }
 [[ $(cat_get image) == "$TAG" ]] || die "catalog $REF.image is '$(cat_get image)', this build produces '$TAG'"
+# Persistent VM disks are CDI imports of this image: the catalog diskSize (default 12Gi, the
+# orchestrator's DefaultVMDiskSize) must hold the virtual size (DISK_SIZE, GiB) plus CDI's
+# filesystem overhead (6 %) with headroom, i.e. at least DISK_SIZE x 1.15 rounded up, else
+# the import fails with "A larger PVC is required".
+min_disk=$(( (${DISK_SIZE%G} * 115 + 99) / 100 )); have_disk=$(cat_get diskSize); have_disk=${have_disk:-12Gi}
+[[ $have_disk =~ ^([0-9]+)Gi$ ]] || die "catalog $REF.diskSize '$have_disk' must be <n>Gi"
+(( BASH_REMATCH[1] >= min_disk )) || die "catalog $REF.diskSize is $have_disk; the image is $DISK_SIZE, set at least ${min_disk}Gi"
 if [[ $GUEST == kubeadm || $GUEST == kubeadm-addons ]]; then
   [[ $(cat_get kubernetesVersion) == "$K8S_VERSION" ]] \
     || die "catalog $REF.kubernetesVersion is '$(cat_get kubernetesVersion)', expected $K8S_VERSION"
