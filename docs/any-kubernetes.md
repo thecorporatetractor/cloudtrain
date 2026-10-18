@@ -163,7 +163,7 @@ needed, **D** = dev-only (fine for kind, must not leak into the product).
 6. Lab kernel modules loaded on the host by Docker (`host-prep.sh`, `lab-kernel-modules.txt`).
 7. RBAC with `bind`/`escalate` on cluster roles, cluster-wide `pods/exec` and secrets (`role.yaml`).
 8. Privileged `net-init` / `procMount: Unmasked` with no Pod Security labels on session namespaces (`network/pod.go:122-131`).
-9. Storage class `standard` for CDI scratch and `Filesystem` VM disks (`kubevirt/cdi-cr.yaml:33`, `drivers/kubevirt.go:108,145`; fixed on `feat/storage-agnostic`).
+9. Storage class `standard` for CDI scratch and `Filesystem` VM disks (`kubevirt/cdi-cr.yaml:33`, `drivers/kubevirt.go:108,145`; fixed, see [storage.md](storage.md)).
 10. Lab content assumes 1400-byte link MTU and fixed `192.168.99/100.0/24` lab CIDRs (`net-fix-mtu-blackhole`, `labnet.go:37-44`).
 
 ## 2. CNI design
@@ -324,11 +324,11 @@ The orchestrator already auto-detects support per runtime handler [V].
 
 ## 4. Storage-class independence (for the storage agent to cross-check)
 
-The `feat/storage-agnostic` branch (`docs/storage.md`, `internal/drivers/storage.go`)
+Storage independence (`docs/storage.md`, `internal/drivers/storage.go`)
 covers most of this. Requirements from this design:
 
 1. No class name in code, CRs, content or charts: `deploy/kubevirt/cdi-cr.yaml:33`
-   (`scratchSpaceStorageClass: standard`) moves to dev-up only (done on the branch).
+   (`scratchSpaceStorageClass: standard`) moves to dev-up only (done).
 2. VM disks: volume mode from the CDI StorageProfile by default, `Block` where the
    class supports it (Azure Disk, EBS, PD), `Filesystem` on vSphere CSI (done:
    `--vm-disk-volume-mode`).
