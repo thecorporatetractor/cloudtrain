@@ -1,0 +1,300 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: bind-authoritative-zone
+  title: Serve the tallowmere.test zone authoritatively
+  domain: linux
+  frameworks: [lpic2:dns]
+  difficulty: medium
+  estimatedMinutes: 25
+  tags: [bind, named, dns, zone, reverse-zone, dig, rndc]
+  version: 1
+spec:
+  description: |
+    Ticket **TKT-2217** (`~/ticket.txt` on `tr-dns-01`) asks the platform team to publish
+    the internal zone **`tallowmere.test`** and its reverse zone with BIND. A shell is open
+    on this host and you have `sudo`; BIND (`named`) is installed with its stock
+    configuration but not running. There is no systemd: start it with
+    `sudo named -u named` and manage it with `sudo rndc reload` / `sudo rndc status`.
+
+    The name server is `ns.tallowmere.test`, which resolves to this host (**127.0.0.1**).
+    Your job:
+
+    1. Create the **forward zone** and the **reverse zone** (the `in-addr.arpa` zone of
+       `{{net}}.0/24`) from the records in the ticket, as primary zones in
+       `/etc/named.conf` with their files in `/var/named/`.
+    2. Make `named` **authoritative only**: it must not recurse for other names, so it
+       cannot be used as an open resolver.
+    3. Zone files must pass `named-checkzone`, the configuration `named-checkconf -z`,
+       and `named` must be running with them loaded.
+    4. Verify from a client: `dig @127.0.0.1 tickets.tallowmere.test` and `dig -x ...`.
+  objectives:
+    - Declare primary zones in named.conf and write zone files with SOA, NS and records
+    - Write a reverse zone with PTR records for the right in-addr.arpa name
+    - Run named without systemd and reload with rndc
+    - Validate with named-checkconf, named-checkzone and dig
+  params:
+    net:
+      type: choice
+      values: ["10.20.0", "10.30.0"]
+    serial:
+      type: choice
+      values: ["2027010101", "2027020301"]
+  topology:
+    entry: tr-dns-01
+    nodes:
+      - name: tr-dns-01
+        driver: container
+        image: el-lab:10
+        access: [shell]
+        learnerSudo: true
+  setup:
+    - on: tr-dns-01
+      timeoutSec: 300
+      run: |
+        set -eu
+        echo 'learner ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/learner && chmod 0440 /etc/sudoers.d/learner
+        rpm -q bind bind-utils >/dev/null 2>&1 || dnf install -y -q bind bind-utils >/dev/null
+        V=/var/lib/cloudtrain; mkdir -p $V; chmod 0700 $V
+        grep -q ' ns.tallowmere.test' /etc/hosts || echo '127.0.0.1 ns.tallowmere.test ns' >> /etc/hosts
+        pkill -x named 2>/dev/null || true
+        rm -f /var/named/tallowmere* /var/named/*.rev /var/named/*in-addr* /var/named/*.zone
+        if [ -f /etc/named.conf.dist ]; then cp /etc/named.conf.dist /etc/named.conf; else cp /etc/named.conf /etc/named.conf.dist; fi
+        [ -f /etc/rndc.key ] || rndc-confgen -a -u named >/dev/null 2>&1
+        mkdir -p /run/named /var/named/data /var/named/dynamic; chown named:named /run/named /var/named/data /var/named/dynamic
+        cat > /home/learner/ticket.txt <<'EOT'
+        TKT-2217  Publish the internal zone tallowmere.test
+
+        Zone data
+          SOA   primary ns.tallowmere.test., contact hostmaster.tallowmere.test.
+                serial {{serial}}, refresh 3600, retry 900, expire 604800, negative TTL 300
+          Default TTL 3600
+          NS    ns.tallowmere.test.
+          A     ns         {{net}}.2
+          A     tickets    {{net}}.21
+          A     timetable  {{net}}.22
+          A     pis        {{net}}.23
+          A     tr-mail-1  {{net}}.25
+          CNAME www        -> tickets
+          MX    10 tr-mail-1
+          TXT   "v=spf1 mx -all"            (at the zone apex)
+
+        Reverse zone: the in-addr.arpa zone of {{net}}.0/24, with PTR records
+        for .2 .21 .22 .23 .25 pointing to the matching names above.
+
+        Server
+          Answers on 127.0.0.1 (ns.tallowmere.test). Authoritative only: no recursion.
+        EOT
+        chown learner:learner /home/learner/ticket.txt
+        cat > $V/forward.exp <<'EOT'
+        tickets.tallowmere.test A {{net}}.21
+        timetable.tallowmere.test A {{net}}.22
+        pis.tallowmere.test A {{net}}.23
+        tr-mail-1.tallowmere.test A {{net}}.25
+        ns.tallowmere.test A {{net}}.2
+        www.tallowmere.test CNAME tickets.tallowmere.test.
+        tallowmere.test MX 10 tr-mail-1.tallowmere.test.
+        tallowmere.test NS ns.tallowmere.test.
+        tallowmere.test TXT "v=spf1 mx -all"
+        tallowmere.test SOA ns.tallowmere.test. hostmaster.tallowmere.test. {{serial}} 3600 900 604800 300
+        EOT
+        cat > $V/reverse.exp <<'EOT'
+        {{net}}.2 ns.tallowmere.test.
+        {{net}}.21 tickets.tallowmere.test.
+        {{net}}.22 timetable.tallowmere.test.
+        {{net}}.23 pis.tallowmere.test.
+        {{net}}.25 tr-mail-1.tallowmere.test.
+        EOT
+  checks:
+    - id: config-valid
+      description: named-checkconf -z loads both new zones without errors and named is running
+      type: shell
+      on: tr-dns-01
+      skills: [linux.services.dns-server]
+      weight: 1.5
+      timeoutSec: 30
+      command: |
+        o=$(named-checkconf -z /etc/named.conf 2>&1); rc=$?
+        [ $rc -eq 0 ] || { echo "checkconf-failed"; exit 0; }
+        rev=$(echo {{net}} | awk -F. '{print $3"."$2"."$1}').in-addr.arpa
+        printf '%s\n' "$o" | grep -q "zone tallowmere.test/IN: loaded serial" || { echo no-forward-zone; exit 0; }
+        printf '%s\n' "$o" | grep -q "zone $rev/IN: loaded serial" || { echo no-reverse-zone; exit 0; }
+        pgrep -x named >/dev/null && echo ok || echo not-running
+      expect: {match: exact, value: ok}
+    - id: forward-records
+      description: dig against 127.0.0.1 returns every forward record and the SOA exactly as in the ticket
+      type: shell
+      on: tr-dns-01
+      skills: [linux.services.dns-server]
+      weight: 2
+      timeoutSec: 60
+      command: |
+        ok=0; n=0; bad=""
+        while read q t a; do
+          [ -n "$q" ] || continue
+          n=$((n + 1)); got=$(dig +short +time=2 +tries=1 @127.0.0.1 $q $t 2>/dev/null | sort | tr '\n' ' ' | sed 's/ $//')
+          [ "$got" = "$a" ] && ok=$((ok + 1)) || bad="$bad $q/$t"
+        done < /var/lib/cloudtrain/forward.exp
+        echo "$ok/$n${bad:+ wrong:$bad}"
+      expect: {match: exact, value: "10/10"}
+    - id: reverse-records
+      description: Reverse lookups of the five addresses return the right names
+      type: shell
+      on: tr-dns-01
+      skills: [linux.services.dns-server]
+      weight: 1.5
+      timeoutSec: 40
+      command: |
+        ok=0; n=0; bad=""
+        while read ip a; do
+          [ -n "$ip" ] || continue
+          n=$((n + 1)); got=$(dig +short +time=2 +tries=1 @127.0.0.1 -x $ip 2>/dev/null | sort | tr '\n' ' ' | sed 's/ $//')
+          [ "$got" = "$a" ] && ok=$((ok + 1)) || bad="$bad $ip"
+        done < /var/lib/cloudtrain/reverse.exp
+        echo "$ok/$n${bad:+ wrong:$bad}"
+      expect: {match: exact, value: "5/5"}
+    - id: authoritative-only
+      description: Answers for the zone carry the aa flag and no ra flag, and names outside it are refused
+      type: shell
+      on: tr-dns-01
+      skills: [linux.services.dns-server]
+      weight: 1.5
+      timeoutSec: 30
+      command: |
+        f=$(dig +noall +comments +time=2 +tries=1 @127.0.0.1 tickets.tallowmere.test A 2>/dev/null | grep -o 'flags:[^;]*')
+        case " $f " in *" aa "*) a=aa ;; *) a=no-aa ;; esac
+        case " $f " in *" ra "*) r=ra ;; *) r=no-ra ;; esac
+        s=$(dig +noall +comments +time=2 +tries=1 @127.0.0.1 example.org A 2>/dev/null | grep -o 'status: [A-Z]*' | cut -d' ' -f2)
+        echo "$a $r ${s:-none}"
+      expect: {match: exact, value: "aa no-ra REFUSED"}
+  hints:
+    - title: Zone stanzas
+      body: "In /etc/named.conf: `zone \"tallowmere.test\" IN { type primary; file \"tallowmere.test.zone\"; };` and the same for the reverse name. Relative file names are looked up in the `directory` (/var/named). For `{{net}}.0/24` the reverse zone name is the first three octets reversed plus `.in-addr.arpa`."
+      cost: 1
+    - title: Zone file basics
+      body: "Start with `$TTL`, then `@ IN SOA ns.tallowmere.test. hostmaster.tallowmere.test. ( serial refresh retry expire negative )`. Names ending in a dot are absolute; without the dot the zone name is appended (a common source of `ns.tallowmere.test.tallowmere.test`). In a reverse zone the owner is the last octet: `21 IN PTR tickets.tallowmere.test.`"
+      cost: 1
+    - title: Recursion and permissions
+      body: "The stock options block has `recursion yes;`: change it to `recursion no;`. Zone files must be readable by the `named` user (group `named` on /var/named files is the usual way). Check with `sudo named-checkconf -z`, then start `sudo named -u named` (or `sudo rndc reload` when it already runs)."
+      cost: 1
+  misconceptions:
+    - id: no-reverse-zone
+      description: Publishes only the forward zone.
+      feedback: "PTR records live in the reverse zone (in-addr.arpa), a separate zone with its own file and its own named.conf stanza."
+      expectFail: [config-valid, reverse-records]
+      mutation:
+        on: tr-dns-01
+        as: learner
+        run: |
+          bash <<'EOS'
+          set -e
+          sudo sed -i 's/recursion yes;/recursion no;/' /etc/named.conf
+          printf '%s\n' '$TTL 3600' '@ IN SOA ns.tallowmere.test. hostmaster.tallowmere.test. ( {{serial}} 3600 900 604800 300 )' '@ IN NS ns.tallowmere.test.' 'ns IN A {{net}}.2' 'tickets IN A {{net}}.21' 'timetable IN A {{net}}.22' 'pis IN A {{net}}.23' 'tr-mail-1 IN A {{net}}.25' 'www IN CNAME tickets' '@ IN MX 10 tr-mail-1' '@ IN TXT "v=spf1 mx -all"' | sudo tee /var/named/tallowmere.test.zone >/dev/null
+          sudo chgrp named /var/named/tallowmere.test.zone
+          printf '%s\n' 'zone "tallowmere.test" IN { type primary; file "tallowmere.test.zone"; };' | sudo tee -a /etc/named.conf >/dev/null
+          sudo named -u named
+          sleep 2
+          EOS
+    - id: missing-trailing-dots
+      description: Writes the NS, MX and CNAME targets without a trailing dot.
+      feedback: "Without the final dot a name is relative: `ns.tallowmere.test` in the zone tallowmere.test becomes `ns.tallowmere.test.tallowmere.test.`. named-checkzone reports the targets as having no address records."
+      expectFail: [config-valid, forward-records]
+      mutation:
+        on: tr-dns-01
+        as: learner
+        run: |
+          bash <<'EOS'
+          set -e
+          R=$(echo {{net}} | awk -F. '{print $3"."$2"."$1}')
+          sudo sed -i 's/recursion yes;/recursion no;/' /etc/named.conf
+          printf '%s\n' '$TTL 3600' '@ IN SOA ns.tallowmere.test hostmaster.tallowmere.test ( {{serial}} 3600 900 604800 300 )' '@ IN NS ns.tallowmere.test' 'ns IN A {{net}}.2' 'tickets IN A {{net}}.21' 'timetable IN A {{net}}.22' 'pis IN A {{net}}.23' 'tr-mail-1 IN A {{net}}.25' 'www IN CNAME tickets.tallowmere.test' '@ IN MX 10 tr-mail-1.tallowmere.test' '@ IN TXT "v=spf1 mx -all"' | sudo tee /var/named/tallowmere.test.zone >/dev/null
+          printf '%s\n' '$TTL 3600' '@ IN SOA ns.tallowmere.test. hostmaster.tallowmere.test. ( {{serial}} 3600 900 604800 300 )' '@ IN NS ns.tallowmere.test.' '2 IN PTR ns.tallowmere.test.' '21 IN PTR tickets.tallowmere.test.' '22 IN PTR timetable.tallowmere.test.' '23 IN PTR pis.tallowmere.test.' '25 IN PTR tr-mail-1.tallowmere.test.' | sudo tee /var/named/$R.rev >/dev/null
+          sudo chgrp named /var/named/tallowmere.test.zone /var/named/$R.rev
+          printf '%s\n' 'zone "tallowmere.test" IN { type primary; file "tallowmere.test.zone"; };' "zone \"$R.in-addr.arpa\" IN { type primary; file \"$R.rev\"; };" | sudo tee -a /etc/named.conf >/dev/null
+          sudo named -u named
+          sleep 2
+          EOS
+    - id: recursion-left-on
+      description: Gets the zones right but leaves the stock recursion setting, so the server answers for any name.
+      feedback: "An authoritative-only server must not recurse: it would act as an open resolver. Set `recursion no;` in the options block."
+      expectFail: [authoritative-only]
+      mutation:
+        on: tr-dns-01
+        as: learner
+        run: |
+          bash <<'EOS'
+          set -e
+          R=$(echo {{net}} | awk -F. '{print $3"."$2"."$1}')
+                    printf '%s\n' '$TTL 3600' '@ IN SOA ns.tallowmere.test. hostmaster.tallowmere.test. ( {{serial}} 3600 900 604800 300 )' '@ IN NS ns.tallowmere.test.' 'ns IN A {{net}}.2' 'tickets IN A {{net}}.21' 'timetable IN A {{net}}.22' 'pis IN A {{net}}.23' 'tr-mail-1 IN A {{net}}.25' 'www IN CNAME tickets' '@ IN MX 10 tr-mail-1' '@ IN TXT "v=spf1 mx -all"' | sudo tee /var/named/tallowmere.test.zone >/dev/null
+          printf '%s\n' '$TTL 3600' '@ IN SOA ns.tallowmere.test. hostmaster.tallowmere.test. ( {{serial}} 3600 900 604800 300 )' '@ IN NS ns.tallowmere.test.' '2 IN PTR ns.tallowmere.test.' '21 IN PTR tickets.tallowmere.test.' '22 IN PTR timetable.tallowmere.test.' '23 IN PTR pis.tallowmere.test.' '25 IN PTR tr-mail-1.tallowmere.test.' | sudo tee /var/named/$R.rev >/dev/null
+          sudo chgrp named /var/named/tallowmere.test.zone /var/named/$R.rev
+          printf '%s\n' 'zone "tallowmere.test" IN { type primary; file "tallowmere.test.zone"; };' "zone \"$R.in-addr.arpa\" IN { type primary; file \"$R.rev\"; };" | sudo tee -a /etc/named.conf >/dev/null
+          sudo named -u named
+          sleep 2
+          EOS
+    - id: zone-file-not-readable
+      description: Writes the zone files with mode 0600 owned by root, so named cannot read them.
+      feedback: "named runs as the user named. A zone file only root can read fails to load (permission denied in named's log) and the zone is not served. Give the file to group named."
+      expectFail: [forward-records, reverse-records]
+      mutation:
+        on: tr-dns-01
+        as: learner
+        run: |
+          bash <<'EOS'
+          set -e
+          R=$(echo {{net}} | awk -F. '{print $3"."$2"."$1}')
+          sudo sed -i 's/recursion yes;/recursion no;/' /etc/named.conf
+          printf '%s\n' '$TTL 3600' '@ IN SOA ns.tallowmere.test. hostmaster.tallowmere.test. ( {{serial}} 3600 900 604800 300 )' '@ IN NS ns.tallowmere.test.' 'ns IN A {{net}}.2' 'tickets IN A {{net}}.21' 'timetable IN A {{net}}.22' 'pis IN A {{net}}.23' 'tr-mail-1 IN A {{net}}.25' 'www IN CNAME tickets' '@ IN MX 10 tr-mail-1' '@ IN TXT "v=spf1 mx -all"' | sudo install -m 0600 /dev/stdin /var/named/tallowmere.test.zone
+          printf '%s\n' '$TTL 3600' '@ IN SOA ns.tallowmere.test. hostmaster.tallowmere.test. ( {{serial}} 3600 900 604800 300 )' '@ IN NS ns.tallowmere.test.' '2 IN PTR ns.tallowmere.test.' '21 IN PTR tickets.tallowmere.test.' '22 IN PTR timetable.tallowmere.test.' '23 IN PTR pis.tallowmere.test.' '25 IN PTR tr-mail-1.tallowmere.test.' | sudo install -m 0600 /dev/stdin /var/named/$R.rev
+          printf '%s\n' 'zone "tallowmere.test" IN { type primary; file "tallowmere.test.zone"; };' "zone \"$R.in-addr.arpa\" IN { type primary; file \"$R.rev\"; };" | sudo tee -a /etc/named.conf >/dev/null
+          sudo named -u named
+          sleep 2
+          EOS
+  solution:
+    explanation: |
+      Two primary zones in named.conf (forward and reverse) with files in /var/named readable
+      by named; recursion off; named-checkconf -z and
+      named-checkzone to validate; named started (or rndc reload).
+    steps:
+      - on: tr-dns-01
+        as: learner
+        timeoutSec: 90
+        run: |
+          bash <<'EOS'
+          set -e
+          R=$(echo {{net}} | awk -F. '{print $3"."$2"."$1}')
+          sudo sed -i 's/recursion yes;/recursion no;/' /etc/named.conf
+          printf '%s\n' '$TTL 3600' '@ IN SOA ns.tallowmere.test. hostmaster.tallowmere.test. ( {{serial}} 3600 900 604800 300 )' '@ IN NS ns.tallowmere.test.' 'ns IN A {{net}}.2' 'tickets IN A {{net}}.21' 'timetable IN A {{net}}.22' 'pis IN A {{net}}.23' 'tr-mail-1 IN A {{net}}.25' 'www IN CNAME tickets' '@ IN MX 10 tr-mail-1' '@ IN TXT "v=spf1 mx -all"' | sudo tee /var/named/tallowmere.test.zone >/dev/null
+          printf '%s\n' '$TTL 3600' '@ IN SOA ns.tallowmere.test. hostmaster.tallowmere.test. ( {{serial}} 3600 900 604800 300 )' '@ IN NS ns.tallowmere.test.' '2 IN PTR ns.tallowmere.test.' '21 IN PTR tickets.tallowmere.test.' '22 IN PTR timetable.tallowmere.test.' '23 IN PTR pis.tallowmere.test.' '25 IN PTR tr-mail-1.tallowmere.test.' | sudo tee /var/named/$R.rev >/dev/null
+          sudo chgrp named /var/named/tallowmere.test.zone /var/named/$R.rev
+          printf '%s\n' 'zone "tallowmere.test" IN { type primary; file "tallowmere.test.zone"; };' "zone \"$R.in-addr.arpa\" IN { type primary; file \"$R.rev\"; };" | sudo tee -a /etc/named.conf >/dev/null
+          sudo named-checkzone tallowmere.test /var/named/tallowmere.test.zone
+          sudo named-checkzone $R.in-addr.arpa /var/named/$R.rev
+          sudo named-checkconf -z
+          pgrep -x named >/dev/null && sudo rndc reload || sudo named -u named
+          sleep 2
+          dig +short @127.0.0.1 tickets.tallowmere.test
+          EOS
+    alternatives:
+      - id: include-file-and-rndc-reload
+        description: Keep the zone stanzas in their own included file, use $ORIGIN-relative PTR names with the full reverse zone name and reload with rndc.
+        steps:
+          - on: tr-dns-01
+            as: learner
+            timeoutSec: 90
+            run: |
+              bash <<'EOS'
+              set -e
+              R=$(echo {{net}} | awk -F. '{print $3"."$2"."$1}')
+              sudo sed -i 's/recursion yes;/recursion no;/' /etc/named.conf
+              sudo named -u named
+              sleep 1
+              { echo '$TTL 1h'; echo '$ORIGIN tallowmere.test.'; echo "@ IN SOA ns hostmaster ( {{serial}} 1h 15m 1w 5m )"; echo '  IN NS ns'; echo "ns IN A {{net}}.2"; echo "tickets IN A {{net}}.21"; echo "timetable IN A {{net}}.22"; echo "pis IN A {{net}}.23"; echo "tr-mail-1 IN A {{net}}.25"; echo "www IN CNAME tickets"; echo "@ IN MX 10 tr-mail-1"; echo '@ IN TXT "v=spf1 mx -all"'; } | sudo tee /var/named/db.tallowmere.test >/dev/null
+              { echo '$TTL 1h'; echo "\$ORIGIN $R.in-addr.arpa."; echo "@ IN SOA ns.tallowmere.test. hostmaster.tallowmere.test. ( {{serial}} 1h 15m 1w 5m )"; echo '  IN NS ns.tallowmere.test.'; for p in "2 ns" "21 tickets" "22 timetable" "23 pis" "25 tr-mail-1"; do set -- $p; echo "$1 IN PTR $2.tallowmere.test."; done; } | sudo tee /var/named/db.$R >/dev/null
+              sudo chgrp named /var/named/db.tallowmere.test /var/named/db.$R
+              printf '%s\n' 'zone "tallowmere.test" { type primary; file "db.tallowmere.test"; };' "zone \"$R.in-addr.arpa\" { type primary; file \"db.$R\"; };" | sudo tee /etc/named.tr-zones >/dev/null
+              echo 'include "/etc/named.tr-zones";' | sudo tee -a /etc/named.conf >/dev/null
+              sudo named-checkconf -z
+              sudo rndc reconfig
+              sleep 2
+              EOS

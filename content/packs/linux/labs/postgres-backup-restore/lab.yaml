@@ -1,0 +1,237 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: postgres-backup-restore
+  title: Back up and restore the fares database
+  domain: linux
+  frameworks: []
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [postgresql, pg_dump, pg_restore, backup, restore]
+  version: 1
+spec:
+  description: |
+    The fares database `fares` on `tr-db-01` (PostgreSQL 16, cluster `16/main`, running; there
+    is no systemd, so `sudo pg_ctlcluster 16 main start|stop|restart|status`) is about to get
+    a schema change, and the DBA wants a tested restore path first. A shell is open on this
+    host and you have `sudo`; administer the database as the `postgres` user
+    (`sudo -u postgres psql fares`). This is a restore drill:
+
+    1. Count the rows of every table in `fares` (`fares`, `fare_zones`, `concessions`)
+       and write the **backup report** to `~/answers/backup-report.txt`, one line per table:
+       `TABLE COUNT`.
+    2. Take a **logical backup of the whole `fares` database** into
+       **`/var/backups/fares/`** (any file name; custom format or plain SQL), schema **and**
+       data.
+    3. As instructed in the change ticket, **drop the table `{{tbl}}`**.
+    4. **Restore** it from the backup so that `{{tbl}}` has its rows, its primary key and its
+       contents back, and the **other tables are untouched** (no duplicated rows): every
+       count must equal the one in the backup report.
+  objectives:
+    - Take a logical backup with pg_dump (custom or plain format)
+    - Restore a single table from a dump with pg_restore without touching the rest
+    - Verify a restore with row counts
+  params:
+    tbl:
+      type: choice
+      values: [fare_zones, concessions]
+    rows:
+      type: choice
+      values: ["120", "240"]
+  topology:
+    entry: tr-db-01
+    nodes:
+      - name: tr-db-01
+        driver: container
+        image: deb-lab:24.04
+        access: [shell]
+        learnerSudo: true
+  setup:
+    - on: tr-db-01
+      timeoutSec: 400
+      run: |
+        set -eu
+        echo 'learner ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/learner && chmod 0440 /etc/sudoers.d/learner
+        dpkg -s postgresql >/dev/null 2>&1 || { apt-get update -q >/dev/null; DEBIAN_FRONTEND=noninteractive apt-get install -y -q postgresql >/dev/null; }
+        V=/var/lib/cloudtrain; mkdir -p $V; chmod 0700 $V
+        pg_lsclusters | grep -q '^16 *main' || pg_createcluster 16 main >/dev/null
+        pg_ctlcluster 16 main status >/dev/null 2>&1 || pg_ctlcluster 16 main start
+        for i in $(seq 30); do pg_isready -q && break; sleep 1; done
+        P() { runuser -u postgres -- psql -X -At -v ON_ERROR_STOP=1 "$@"; }
+        P -d postgres -c "DROP DATABASE IF EXISTS fares" >/dev/null
+        P -d postgres -c "CREATE DATABASE fares" >/dev/null
+        P -d fares >/dev/null <<'EOT'
+        CREATE TABLE fares (id serial PRIMARY KEY, route text NOT NULL, class text NOT NULL, price numeric(6,2) NOT NULL);
+        INSERT INTO fares (route, class, price)
+          SELECT 'TR' || lpad(g::text, 3, '0'), CASE WHEN g % 3 = 0 THEN 'first' ELSE 'standard' END, round((2 + (g * 37 % 90) / 4.0)::numeric, 2) FROM generate_series(1, {{rows}}) g;
+        CREATE TABLE fare_zones (id serial PRIMARY KEY, zone text NOT NULL, surcharge numeric(5,2) NOT NULL);
+        INSERT INTO fare_zones (zone, surcharge) SELECT 'zone-' || g, round((g * 0.35)::numeric, 2) FROM generate_series(1, 18) g;
+        CREATE TABLE concessions (id serial PRIMARY KEY, name text NOT NULL, discount int NOT NULL);
+        INSERT INTO concessions (name, discount) SELECT 'concession-' || g, 5 * g FROM generate_series(1, 9) g;
+        EOT
+        {
+          for t in fares fare_zones concessions; do echo "$t $(P -d fares -c "SELECT count(*) FROM $t")"; done
+        } > $V/pg.counts
+        echo "$(P -d fares -c "SELECT md5(string_agg(t::text, '|' ORDER BY id)) FROM {{tbl}} t")" > $V/pg.md5
+        echo "$(P -d fares -c "SELECT '{{tbl}}'::regclass::oid")" > $V/pg.oid
+        install -d -o postgres -g postgres -m 0750 /var/backups/fares
+        rm -f /var/backups/fares/*
+        install -d -o learner -g learner /home/learner/answers
+        rm -f /home/learner/answers/backup-report.txt
+  checks:
+    - id: backup-covers-database
+      description: A logical backup of the whole database exists in /var/backups/fares (schema and the data of all three tables)
+      type: shell
+      on: tr-db-01
+      skills: [linux.services.database-backup]
+      weight: 2
+      timeoutSec: 60
+      command: |
+        d=/var/backups/fares; f=$(ls -t $d/* 2>/dev/null | head -1)
+        [ -n "$f" ] || { echo no-backup; exit 0; }
+        n=0
+        if pg_restore -l "$f" >/dev/null 2>&1; then
+          l=$(pg_restore -l "$f" 2>/dev/null)
+          for t in fares fare_zones concessions; do printf '%s\n' "$l" | grep -q "TABLE DATA public $t " && n=$((n + 1)); done
+          printf '%s\n' "$l" | grep -q "TABLE public {{tbl}} " || { echo "no-schema"; exit 0; }
+        elif [ -f "$f" ]; then
+          c=$(zcat -f "$f" 2>/dev/null)
+          for t in fares fare_zones concessions; do printf '%s\n' "$c" | grep -qE "^(COPY public\.$t |INSERT INTO public\.$t )" && n=$((n + 1)); done
+          printf '%s\n' "$c" | grep -q "CREATE TABLE public.{{tbl}} " || { echo "no-schema"; exit 0; }
+        fi
+        [ $n -eq 3 ] && echo ok || echo "data-for-$n-of-3-tables"
+      expect: {match: exact, value: ok}
+    - id: table-restored
+      description: "{{tbl}} was dropped and restored (new object, same contents, primary key back) and every table has its original row count"
+      type: shell
+      on: tr-db-01
+      skills: [linux.services.database-backup]
+      weight: 3
+      timeoutSec: 60
+      command: |
+        V=/var/lib/cloudtrain; P() { runuser -u postgres -- psql -X -At -d fares "$@" 2>/dev/null; }
+        r=""
+        while read t c; do [ "$(P -c "SELECT count(*) FROM $t")" = "$c" ] && r="$r $t=ok" || r="$r $t=wrong($(P -c "SELECT count(*) FROM $t"))"; done < $V/pg.counts
+        [ "$(P -c "SELECT md5(string_agg(t::text, '|' ORDER BY id)) FROM {{tbl}} t")" = "$(cat $V/pg.md5)" ] && r="$r content=ok" || r="$r content=wrong"
+        [ "$(P -c "SELECT '{{tbl}}'::regclass::oid")" != "$(cat $V/pg.oid)" ] && r="$r recreated" || r="$r never-dropped"
+        [ "$(P -c "SELECT count(*) FROM pg_indexes WHERE tablename = '{{tbl}}' AND indexdef ILIKE '%UNIQUE%'")" = 1 ] && r="$r pk" || r="$r no-pk"
+        echo $r
+      expect: {match: exact, value: "fares=ok fare_zones=ok concessions=ok content=ok recreated pk"}
+    - id: backup-report
+      description: ~/answers/backup-report.txt lists each table with the row count it had at backup time
+      type: shell
+      on: tr-db-01
+      skills: [linux.services.database-backup]
+      weight: 1
+      command: |
+        got=$(awk 'NF >= 2 {print $1, $2}' /home/learner/answers/backup-report.txt 2>/dev/null | sort)
+        [ "$got" = "$(sort /var/lib/cloudtrain/pg.counts)" ] && echo ok || echo differs
+      expect: {match: exact, value: ok}
+  hints:
+    - title: Backup formats
+      body: "`sudo -u postgres pg_dump -Fc fares -f /var/backups/fares/fares.dump` writes the custom format (restore with pg_restore, selectively); plain `pg_dump fares > file.sql` is restored with psql. Both include schema and data by default."
+      cost: 1
+    - title: Restore only what is gone
+      body: "`pg_restore -l DUMP` lists the contents; `pg_restore -d fares -t TABLE DUMP` restores that one table (schema, data and indexes). Restoring the whole dump into a populated database appends the rows again to every table that still exists."
+      cost: 1
+    - title: Counting
+      body: "`sudo -u postgres psql fares -Atc 'SELECT count(*) FROM fares'`. Take the counts before the drop and write them out; compare again after the restore."
+      cost: 1
+  misconceptions:
+    - id: full-restore-into-populated-db
+      description: Restores the whole dump without dropping anything else, which appends every other table's rows a second time.
+      feedback: "pg_restore does not replace existing tables: it reports 'already exists' for their definitions but still loads their data again. Restore just the dropped table (-t), or use --clean --if-exists for the whole database."
+      expectFail: [table-restored]
+      mutation:
+        on: tr-db-01
+        as: learner
+        run: |
+          bash <<'EOS'
+          set -e
+          P() { sudo -u postgres psql -X -At -d fares "$@"; }
+          for t in fares fare_zones concessions; do echo "$t $(P -c "SELECT count(*) FROM $t")"; done > ~/answers/backup-report.txt
+          sudo -u postgres pg_dump -Fc fares -f /var/backups/fares/fares.dump
+          P -c "DROP TABLE {{tbl}}"
+          sudo -u postgres pg_restore -d fares /var/backups/fares/fares.dump >/dev/null 2>&1 || true
+          EOS
+    - id: backup-after-drop
+      description: Drops the table first and takes the backup afterwards.
+      feedback: "A backup taken after the drop does not contain the table, so there is nothing to restore it from. Back up first, then drop."
+      expectFail: [backup-covers-database, table-restored]
+      mutation:
+        on: tr-db-01
+        as: learner
+        run: |
+          bash <<'EOS'
+          set -e
+          P() { sudo -u postgres psql -X -At -d fares "$@"; }
+          for t in fares fare_zones concessions; do echo "$t $(P -c "SELECT count(*) FROM $t")"; done > ~/answers/backup-report.txt
+          P -c "DROP TABLE {{tbl}}"
+          sudo -u postgres pg_dump -Fc fares -f /var/backups/fares/fares.dump
+          EOS
+    - id: schema-only-backup
+      description: Takes the backup with --schema-only, so the restored table is empty.
+      feedback: "`pg_dump -s` saves definitions only. The restore recreates {{tbl}} without any rows. Take the dump with data (the default)."
+      expectFail: [backup-covers-database, table-restored]
+      mutation:
+        on: tr-db-01
+        as: learner
+        run: |
+          bash <<'EOS'
+          set -e
+          P() { sudo -u postgres psql -X -At -d fares "$@"; }
+          for t in fares fare_zones concessions; do echo "$t $(P -c "SELECT count(*) FROM $t")"; done > ~/answers/backup-report.txt
+          sudo -u postgres pg_dump -s -Fc fares -f /var/backups/fares/fares-schema.dump
+          P -c "DROP TABLE {{tbl}}"
+          sudo -u postgres pg_restore -d fares -t {{tbl}} /var/backups/fares/fares-schema.dump
+          EOS
+    - id: never-dropped
+      description: Takes a backup and restores nothing because the table is still there (the drop was skipped).
+      feedback: "The drill includes dropping the table; a restore that was never needed proves nothing about the backup."
+      expectFail: [table-restored]
+      mutation:
+        on: tr-db-01
+        as: learner
+        run: |
+          bash <<'EOS'
+          set -e
+          P() { sudo -u postgres psql -X -At -d fares "$@"; }
+          for t in fares fare_zones concessions; do echo "$t $(P -c "SELECT count(*) FROM $t")"; done > ~/answers/backup-report.txt
+          sudo -u postgres pg_dump -Fc fares -f /var/backups/fares/fares.dump
+          EOS
+  solution:
+    explanation: |
+      Record the counts, take a custom-format dump of the whole database, drop the table and
+      restore only that table with pg_restore -t (schema, data and its primary key), then
+      compare the counts with the report.
+    steps:
+      - on: tr-db-01
+        as: learner
+        timeoutSec: 90
+        run: |
+          bash <<'EOS'
+          set -e
+          P() { sudo -u postgres psql -X -At -d fares "$@"; }
+          for t in fares fare_zones concessions; do echo "$t $(P -c "SELECT count(*) FROM $t")"; done | tee ~/answers/backup-report.txt
+          sudo -u postgres pg_dump -Fc fares -f /var/backups/fares/fares-$(date +%F).dump
+          sudo -u postgres pg_restore -l /var/backups/fares/fares-$(date +%F).dump | grep 'TABLE DATA'
+          P -c "DROP TABLE {{tbl}}"
+          sudo -u postgres pg_restore -d fares -t {{tbl}} /var/backups/fares/fares-$(date +%F).dump
+          for t in fares fare_zones concessions; do echo "$t $(P -c "SELECT count(*) FROM $t")"; done
+          EOS
+    alternatives:
+      - id: plain-sql-and-clean-restore
+        description: A plain SQL dump with --clean --if-exists, restored in full with psql.
+        steps:
+          - on: tr-db-01
+            as: learner
+            timeoutSec: 90
+            run: |
+              bash <<'EOS'
+              set -e
+              P() { sudo -u postgres psql -X -At -d fares "$@"; }
+              P -c "SELECT 'fares', count(*) FROM fares UNION ALL SELECT 'fare_zones', count(*) FROM fare_zones UNION ALL SELECT 'concessions', count(*) FROM concessions" | tr '|' ' ' > ~/answers/backup-report.txt
+              sudo -u postgres pg_dump --clean --if-exists fares -f /var/backups/fares/fares.sql
+              P -c "DROP TABLE {{tbl}}"
+              sudo -u postgres psql -X -q -d fares -f /var/backups/fares/fares.sql >/dev/null
+              EOS
