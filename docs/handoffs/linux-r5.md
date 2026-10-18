@@ -1,4 +1,4 @@
-# Handoff: Linux round 5 (summary, state after the wave 3 merge)
+# Handoff: Linux round 5 (summary, state as of 2026-10-19)
 
 Per-wave detail stays in `linux-r5-w1.md`, `linux-r5-w2.md` and `linux-r5-w3.md`. The source of truth
 for each lab's state is `status` / `notes` in `content/curriculum.yaml`. Nothing in round 5 was run
@@ -18,20 +18,33 @@ sim-linux-pro is complete: all five pools hold at least 2x their draw and the ex
 without `--allow-missing` (it is in the CI compile step). Wave 3 also fixed the gateway exam test
 that still assumed sim-linux-pro was coming-soon.
 
-## Unmerged PRs
+## Unmerged PRs (round 5 is still open: wave 4 and a wave 3 follow-up)
 
 - PR #143 (`content/linux-r5-w4`, 23 networking labs on VMs, handoff `docs/handoffs/linux-r5-w4.md`
-  on that branch): not merged. Review round 3 (HEAD 643025f) is not approved: two major mutation
-  issues remain, both in two-VM labs. In wireguard-depot-tunnel the mutations configure only
-  tr-wg-a and never tr-wg-b; in chrony-server-isolated the mutations change only the server and
-  never point tr-cl-01 at it. In both, more checks fail than the expectFail lists name. Four minor
-  findings: fix-firewall-blocks-app (persistence check does not test accept-before-drop order in the
-  saved file), nftables-from-scratch (persistence check does not require the SSH restriction or the
-  eth0 accept), fix-routing-asymmetric (networkd drop-in alternative has a runtime fallback that can
-  hide a broken drop-in), iperf-throughput-baseline (mtu-one-side mutation fails one check and does
-  not match its description). Static gates pass (lab-verify --strict 0 errors, render --check clean).
-  The 23 labs are not on main; do not queue them until it merges.
+  on that branch): open, no approval recorded, last pushed 2026-10-18 21:29 UTC (after review
+  round 3 at 643025f; its later commits are review fixes and a curriculum re-render, not yet
+  re-reviewed). The round 3 findings to confirm closed: two major mutation issues in two-VM labs
+  (wireguard-depot-tunnel mutates only tr-wg-a, chrony-server-isolated mutates only the server;
+  in both, more checks fail than the expectFail lists name) and four minor ones
+  (fix-firewall-blocks-app and nftables-from-scratch persistence checks, fix-routing-asymmetric
+  networkd drop-in fallback, iperf-throughput-baseline mtu-one-side mutation). The 23 labs are not
+  on main; do not queue them for verify until it merges.
+- PR #161 (`content/linux-r5-w3-minor`): follow-up to wave 3 (#122). Exact-address hosts pin check
+  and two misconceptions in xlp-fix-dns-client, StartLimitIntervalSec=0 on the broken units
+  (xlp-fix-unit-start, xlp-fix-oom-service), tracer-running check in xpe-incident-disk-pressure,
+  port verified in xlp-fix-permission-denied app-reads. Open; touches lab hashes, so those labs
+  need a re-verify after it merges.
 - PR #114 (containers) and PR #84 (automation) belong to other domains and were not touched.
+
+## VM verify results since the wave 3 merge
+
+The verify VM found three real lab bugs, each fixed on main (fix PRs #130, #132, #133, and the
+`passes live verify` commits for the same labs): postfix-relay-alerts, signal-box-levels-3 and
+xlp-sed-bulk-edit (setup used `$sp600` / `$sp3` under `set -u`; now `${sp}600` / `${sp}3`). The
+batch commit d84ac94 marked 30 Linux labs verified in total. All 34 round-5 labs on main are
+still `built` in `content/curriculum.yaml`: wave 3 has had no full pass recorded at the current lab
+hash, and the three fixed labs changed hash, so they need a new pass. Those 34 are the verify
+queue below.
 
 ## Blockers per lab
 
