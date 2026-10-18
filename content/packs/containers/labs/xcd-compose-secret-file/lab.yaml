@@ -15,13 +15,13 @@ spec:
 
     `~/exam/payments/compose.yaml` (project `payments`) runs a Redis database `db` and the
     payments API `api`, and passes the database password to both as the environment
-    variable `DB_PASSWORD`. The password (`Ledger-{{pw}}`) is in `~/exam/payments/secrets/db_password.txt`.
+    variable `DB_PASSWORD`. The password (`Ledger-{{pw}}`) is in `~/exam/payments/secrets/db_credential.txt`.
 
     Change the stack so that both services receive the password as a **file-based Compose
-    secret** named **`db_password`** (mounted at `/run/secrets/db_password`):
+    secret** named **`db_credential`** (mounted at `/run/secrets/db_credential`):
 
     - `db` starts Redis with the password read from that file;
-    - `api` reads it through `DB_PASSWORD_FILE=/run/secrets/db_password`;
+    - `api` reads it through `DB_PASSWORD_FILE=/run/secrets/db_credential`;
     - the password appears in **no container environment, no `docker inspect` output, no
       `docker compose config` output and not in `compose.yaml`**;
     - both services restart automatically, and `api` still answers `200` on
@@ -90,7 +90,7 @@ spec:
         rm -rf "$d"
         s=/home/learner/exam/payments
         rm -rf "$s"; install -d -o learner -g learner /home/learner/exam "$s" "$s/secrets"
-        printf '%s\n' 'Ledger-{{pw}}' > "$s/secrets/db_password.txt"
+        printf '%s\n' 'Ledger-{{pw}}' > "$s/secrets/db_credential.txt"
         cat > "$s/compose.yaml" <<'YML2'
         name: payments
         services:
@@ -110,7 +110,7 @@ spec:
         chown -R learner:learner "$s"
   checks:
     - id: secret-attached
-      description: The compose project defines a file secret db_password and attaches it to db and api
+      description: The compose project defines a file secret db_credential and attaches it to db and api
       type: shell
       timeoutSec: 60
       on: cl-docker-01
@@ -118,9 +118,9 @@ spec:
       weight: 2.5
       command: |
         cd /home/learner/exam/payments && docker compose config --format json 2>/dev/null | jq -r '
-          ((.secrets.db_password.file // "") | endswith("secrets/db_password.txt") | tostring) + " db:" +
-          (((.services.db.secrets // []) | map(.source) | index("db_password") != null) | tostring) + " api:" +
-          (((.services.api.secrets // []) | map(.source) | index("db_password") != null) | tostring)' 2>/dev/null || echo none
+          ((.secrets.db_credential.file // "") | endswith("secrets/db_credential.txt") | tostring) + " db:" +
+          (((.services.db.secrets // []) | map(.source) | index("db_credential") != null) | tostring) + " api:" +
+          (((.services.api.secrets // []) | map(.source) | index("db_credential") != null) | tostring)' 2>/dev/null || echo none
       expect: {match: exact, value: "true db:true api:true"}
     - id: password-hidden
       description: The password is in no container inspect output, compose config output or compose.yaml
@@ -177,20 +177,20 @@ spec:
               command: ["sh", "-c", "exec redis-server --requirepass \"$$DB_PASSWORD\""]
               environment:
                 DB_PASSWORD: Ledger-{{pw}}
-              secrets: [db_password]
+              secrets: [db_credential]
             api:
               image: copperleaf/payments-api:1
               restart: unless-stopped
               environment:
                 DB_HOST: db
-                DB_PASSWORD_FILE: /run/secrets/db_password
+                DB_PASSWORD_FILE: /run/secrets/db_credential
                 DB_PASSWORD: Ledger-{{pw}}
-              secrets: [db_password]
+              secrets: [db_credential]
               ports:
                 - "127.0.0.1:8086:8000"
           secrets:
-            db_password:
-              file: ./secrets/db_password.txt
+            db_credential:
+              file: ./secrets/db_credential.txt
           YML2
           docker compose up -d
     - id: api-only
@@ -216,13 +216,13 @@ spec:
               restart: unless-stopped
               environment:
                 DB_HOST: db
-                DB_PASSWORD_FILE: /run/secrets/db_password
-              secrets: [db_password]
+                DB_PASSWORD_FILE: /run/secrets/db_credential
+              secrets: [db_credential]
               ports:
                 - "127.0.0.1:8086:8000"
           secrets:
-            db_password:
-              file: ./secrets/db_password.txt
+            db_credential:
+              file: ./secrets/db_credential.txt
           YML2
           docker compose up -d
     - id: bind-mount
@@ -240,25 +240,25 @@ spec:
             db:
               image: redis:7.4-alpine
               restart: unless-stopped
-              command: ["sh", "-c", "exec redis-server --requirepass \"$$(cat /run/secrets/db_password)\""]
+              command: ["sh", "-c", "exec redis-server --requirepass \"$$(cat /run/secrets/db_credential)\""]
               volumes:
-                - ./secrets/db_password.txt:/run/secrets/db_password:ro
+                - ./secrets/db_credential.txt:/run/secrets/db_credential:ro
             api:
               image: copperleaf/payments-api:1
               restart: unless-stopped
               environment:
                 DB_HOST: db
-                DB_PASSWORD_FILE: /run/secrets/db_password
+                DB_PASSWORD_FILE: /run/secrets/db_credential
               volumes:
-                - ./secrets/db_password.txt:/run/secrets/db_password:ro
+                - ./secrets/db_credential.txt:/run/secrets/db_credential:ro
               ports:
                 - "127.0.0.1:8086:8000"
           YML2
           docker compose up -d
   solution:
     explanation: |
-      A top-level `secrets:` entry with `file:` plus `secrets: [db_password]` on both
-      services mounts the file at `/run/secrets/db_password`. Redis reads it with
+      A top-level `secrets:` entry with `file:` plus `secrets: [db_credential]` on both
+      services mounts the file at `/run/secrets/db_credential`. Redis reads it with
       `$(cat ...)` in its command (`$$` keeps Compose from interpolating it), and the api
       gets only the path in `DB_PASSWORD_FILE`.
     steps:
@@ -272,20 +272,20 @@ spec:
             db:
               image: redis:7.4-alpine
               restart: unless-stopped
-              command: ["sh", "-c", "exec redis-server --requirepass \"$$(cat /run/secrets/db_password)\""]
-              secrets: [db_password]
+              command: ["sh", "-c", "exec redis-server --requirepass \"$$(cat /run/secrets/db_credential)\""]
+              secrets: [db_credential]
             api:
               image: copperleaf/payments-api:1
               restart: unless-stopped
               environment:
                 DB_HOST: db
-                DB_PASSWORD_FILE: /run/secrets/db_password
-              secrets: [db_password]
+                DB_PASSWORD_FILE: /run/secrets/db_credential
+              secrets: [db_credential]
               ports:
                 - "127.0.0.1:8086:8000"
           secrets:
-            db_password:
-              file: ./secrets/db_password.txt
+            db_credential:
+              file: ./secrets/db_credential.txt
           YML2
           docker compose up -d --force-recreate
     alternatives:
@@ -302,25 +302,25 @@ spec:
                 db:
                   image: redis:7.4-alpine
                   restart: always
-                  command: ["sh", "-c", "exec redis-server --requirepass \"$$(cat /run/secrets/db_password)\""]
+                  command: ["sh", "-c", "exec redis-server --requirepass \"$$(cat /run/secrets/db_credential)\""]
                   secrets:
-                    - source: db_password
-                      target: db_password
+                    - source: db_credential
+                      target: db_credential
                       mode: 0444
                 api:
                   image: copperleaf/payments-api:1
                   restart: always
                   environment:
                     DB_HOST: db
-                    DB_PASSWORD_FILE: /run/secrets/db_password
+                    DB_PASSWORD_FILE: /run/secrets/db_credential
                   secrets:
-                    - source: db_password
-                      target: db_password
+                    - source: db_credential
+                      target: db_credential
                       mode: 0444
                   ports:
                     - "127.0.0.1:8086:8000"
               secrets:
-                db_password:
-                  file: ./secrets/db_password.txt
+                db_credential:
+                  file: ./secrets/db_credential.txt
               YML2
               docker compose up -d --force-recreate
