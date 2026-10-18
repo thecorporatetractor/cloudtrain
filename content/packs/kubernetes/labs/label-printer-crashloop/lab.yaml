@@ -245,10 +245,14 @@ spec:
       mutation:
         on: workstation
         as: learner
-        timeoutSec: 150
+        timeoutSec: 300
         run: |
           kubectl config use-context qm-depot
-          { kubectl -n label-printing logs deploy/label-printer --previous | grep '^ERROR'; echo CrashLoopBackOff; } > ~/reports/label-printer.txt
+          for i in $(seq 1 40); do
+            line=$(kubectl -n label-printing logs deploy/label-printer --previous 2>/dev/null | grep '^ERROR') && break
+            sleep 5
+          done
+          printf '%s\nCrashLoopBackOff\n' "$line" > ~/reports/label-printer.txt
           kubectl -n label-printing patch deployment label-printer --type=json \
             -p '[{"op":"replace","path":"/spec/template/spec/containers/0/args","value":["--queue={{queue}}","--dpi=300"]}]'
           kubectl -n label-printing rollout status deploy/label-printer --timeout=120s
@@ -262,12 +266,16 @@ spec:
     steps:
       - on: workstation
         as: learner
-        timeoutSec: 150
+        timeoutSec: 300
         run: |
           kubectl config use-context qm-depot
           pod=$(kubectl -n label-printing get pod -l app=label-printer -o jsonpath='{.items[0].metadata.name}')
-          { kubectl -n label-printing get pod "$pod" -o jsonpath='{.status.phase} {.status.containerStatuses[0].restartCount} ' | tr '\n' '|'; kubectl -n label-printing logs "$pod" --previous 2>&1 | tr '\n' '|'; echo; } > ~/reports/label-printer.txt # DIAG
-          kubectl -n label-printing events --for "pod/$pod" --types=Warning -o jsonpath='{.items[-1].reason}{"\n"}' >> ~/reports/label-printer.txt
+          # the previous instance's log can be briefly unreadable while the kubelet recreates the container: retry
+          for i in $(seq 1 40); do
+            kubectl -n label-printing logs "$pod" --previous 2>/dev/null | grep '^ERROR' > ~/reports/label-printer.txt && break
+            sleep 5
+          done
+          kubectl -n label-printing events --for "pod/$pod" --types=Warning -o jsonpath='{.items[*].reason}' | tr ' ' '\n' | grep -x BackOff | head -1 >> ~/reports/label-printer.txt
           kubectl -n label-printing patch deployment label-printer --type=json \
             -p '[{"op":"replace","path":"/spec/template/spec/containers/0/args","value":["--queue={{queue}}","--dpi=300"]}]'
           kubectl -n label-printing rollout status deploy/label-printer --timeout=120s
@@ -277,11 +285,14 @@ spec:
         steps:
           - on: workstation
             as: learner
-            timeoutSec: 150
+            timeoutSec: 300
             run: |
               kubectl config use-context qm-depot
-              line=$(kubectl -n label-printing logs deploy/label-printer -p | grep ERROR)
-              reason=$(kubectl -n label-printing describe pod -l app=label-printer | awk '/Warning/ {print $2; exit}')
+              for i in $(seq 1 40); do
+                line=$(kubectl -n label-printing logs deploy/label-printer -p 2>/dev/null | grep ERROR) && break
+                sleep 5
+              done
+              reason=$(kubectl -n label-printing describe pod -l app=label-printer | awk '$1 == "Warning" && $2 == "BackOff" {print $2; exit}')
               printf '%s\n%s\n' "$line" "$reason" > ~/reports/label-printer.txt
               kubectl -n label-printing get deployment label-printer -o yaml \
                 | yq '.spec.template.spec.containers[0].args = ["--queue={{queue}}", "--dpi=300"]' | kubectl apply -f -
