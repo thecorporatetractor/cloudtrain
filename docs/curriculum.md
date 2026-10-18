@@ -1726,7 +1726,7 @@ Aligns to: HashiCorp Terraform Authoring and Operations (Advanced) lab exam them
 | tf-advanced:modules | 20% | 2 | 4 |
 | tf-advanced:providers | 20% | 2 | 4 |
 
-**Rules.** Hints: none. Timer: one timer across all tasks. Tasks in any order. Flag for review. Reboot before grading: no. Docs: offline Terraform and provider documentation and the offline module registry only; no general web access. Partial credit: per-check. Terraform 1.15 CLI. Multi-task scenarios on one pre-provisioned workstation with a vcluster, Moto and the S3 state store; each task graded on configuration, state read from the backend by a read-only grader, live target truth and plan -detailed-exitcode convergence.
+**Rules.** Hints: none. Timer: one timer across all tasks. Tasks in any order. Flag for review. Reboot before grading: no. Docs: offline Terraform and provider documentation and the offline module registry only; no general web access. Partial credit: per-check. Terraform 1.15 CLI. Multi-task scenarios on one pre-provisioned workstation with a vcluster, a Moto node and the in-workstation S3 state store; each task graded on configuration, state read from the backend by a read-only grader, live target truth and plan -detailed-exitcode convergence.
 
 **Retakes.** 1 free retake(s); 72 h cooldown; at most 2 attempts per 30 days; every attempt draws fresh tasks and parameters. a retake draws different scenarios and new parameters
 
