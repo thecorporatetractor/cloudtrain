@@ -33,17 +33,21 @@ catalog (drop them from the curriculum's `images` list).
 ## Next steps, in order
 
 1. Kata spike (tier B): run `tools/slots/run.sh vm -- bash tools/kata-spike/spike.sh` (see "Kata spike" below), then decide on kata-deploy on the shared worker.
-2. MetalLB in a Kube-OVN VPC: the assigned IP is not reachable from the tester pod. Round 4
-   (kubeadm stream) findings: lab VM ports carry no OVN port security (`port_security: []`,
-   addresses `MAC IP`), and the entry NetworkPolicy allows 192.168.100.0/24, so neither
-   blocks it by design. The boot test ran a single, control-plane-only node; kubeadm labels
-   control planes `node.kubernetes.io/exclude-from-external-load-balancers`, and MetalLB's
-   speaker does not announce from such nodes, which alone explains the boot-test failure.
-   Lab clusters have workers, so `xka-loadbalancer-address` / `loadbalancer-kiosk-ip`
-   (curl from the workstation) are the proof to run; the round-4 attempt hit the post-init
-   crashloop under load before the pool was created. If it still fails with workers: Options:
-   give the speaker's IP to the VM port (`ovn.kubernetes.io` allowed address pairs / port
-   security off for lab VMs), or document NodePort/Ingress only for LoadBalancer labs.
+2. MetalLB in a Kube-OVN VPC: **resolved, not a network problem** (remote verify VM,
+   2026-10-18). With workers the address is reachable from the workstation: the speaker
+   on the worker answers ARP and sends a gratuitous ARP, the VPC router learns the binding
+   (SB `MAC_Binding` 192.168.100.20x -> the worker VM's MAC) and forwards to the VM;
+   port security, `unknown` addresses and allowed-address pairs play no part. What failed
+   is a race: the speaker announces as soon as the controller assigns the address, and
+   kube-proxy on the announcing node programs the address about a second later (longer under load). A SYN in
+   that window is not DNATed; the node forwards it on-link (the pool is in its own
+   192.168.100.0/24), ARPs for the address in vain and its conntrack entry stays without
+   NAT, so the SYN retransmits of that connection never reach a Pod and curl fails after
+   ~3 s with "Couldn't connect" (exit 7). A new connection a moment later works. The
+   `loadbalancer-kiosk-ip` solution curled once right after the IP appeared; it now
+   retries with new connections, and the reachability checks (also
+   `xka-loadbalancer-address`) retry three times. Learners see the same thing: the first
+   curl right after EXTERNAL-IP appears may fail once.
 3. Switch the remaining add-on labs to `kubeadm:1.37-full`/`-sec` and verify them one at a
    time (k8s streams own them). Labs must run `addons-install <list> --wait` in their setup:
    the kubeadm driver does not call it. `falco-shell-in-container` expects a systemd `falco`
