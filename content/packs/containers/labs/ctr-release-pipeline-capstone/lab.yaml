@@ -182,7 +182,15 @@ spec:
       mutation:
         on: cl-release-01
         as: learner
+        timeoutSec: 480
         run: |
+          cd /srv/release/src
+          docker buildx create --name relbuilder --driver docker-container --driver-opt network=host,image=moby/buildkit:v0.23.2 --config /srv/release/buildkitd.toml --use
+          docker buildx build --platform linux/amd64,linux/arm64 --sbom=true --provenance=mode=max \
+            --cache-to type=registry,ref=127.0.0.1:{{port}}/catalogue-api:buildcache,mode=max,registry.insecure=true \
+            -t 127.0.0.1:{{port}}/catalogue-api:5.0.0 --push .
+          d=$(docker buildx imagetools inspect 127.0.0.1:{{port}}/catalogue-api:5.0.0 --format '{{json .Manifest}}' | jq -r '.digest')
+          (cd ~/release && COSIGN_PASSWORD='' cosign sign --key release.key --tlog-upload=false --allow-insecure-registry --yes "127.0.0.1:{{port}}/catalogue-api@$d")
           printf 'services:\n  api:\n    image: 127.0.0.1:{{port}}/catalogue-api:5.0.0\n    ports: ["127.0.0.1:8088:8080"]\n' > /srv/release/compose.yaml
           cd /srv/release && docker compose -p catalogue up -d
     - id: no-gate
@@ -192,9 +200,25 @@ spec:
       mutation:
         on: cl-release-01
         as: learner
+        timeoutSec: 480
         run: |
-          printf '%s\n' '#!/bin/sh' 'set -eu' 'cd /srv/release' 'docker compose -p catalogue up -d' > /srv/release/deploy.sh
+          cd /srv/release/src
+          docker buildx create --name relbuilder --driver docker-container --driver-opt network=host,image=moby/buildkit:v0.23.2 --config /srv/release/buildkitd.toml --use
+          docker buildx build --platform linux/amd64,linux/arm64 --sbom=true --provenance=mode=max \
+            --cache-to type=registry,ref=127.0.0.1:{{port}}/catalogue-api:buildcache,mode=max,registry.insecure=true \
+            -t 127.0.0.1:{{port}}/catalogue-api:5.0.0 --push .
+          d=$(docker buildx imagetools inspect 127.0.0.1:{{port}}/catalogue-api:5.0.0 --format '{{json .Manifest}}' | jq -r '.digest')
+          (cd ~/release && COSIGN_PASSWORD='' cosign sign --key release.key --tlog-upload=false --allow-insecure-registry --yes "127.0.0.1:{{port}}/catalogue-api@$d")
+          cat > /srv/release/deploy.sh <<'SH'
+          #!/bin/sh
+          set -eu
+          v=$1
+          d=$(docker buildx imagetools inspect 127.0.0.1:{{port}}/catalogue-api:$v --format '{{json .Manifest}}' | jq -r '.digest')
+          printf 'services:\n  api:\n    image: 127.0.0.1:{{port}}/catalogue-api@%s\n    ports: ["127.0.0.1:8088:8080"]\n' "$d" > /srv/release/compose.yaml
+          cd /srv/release && docker compose -p catalogue up -d
+          SH
           chmod 755 /srv/release/deploy.sh
+          /srv/release/deploy.sh 5.0.0
   solution:
     explanation: |
       Build with a docker-container builder (multi-platform, registry cache, SBOM and
