@@ -245,3 +245,67 @@ jobs:
           name: sbom-published-${{ matrix.name }}
           path: sbom-${{ matrix.name }}.*.json
           retention-days: 90
+      - name: Record the pushed digest (for the release catalog overlay)
+        env:
+          NAME: ${{ matrix.name }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: mkdir -p digests && printf '%s\n' "$DIGEST" > "digests/$NAME"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: digest-${{ matrix.name }}
+          path: digests/${{ matrix.name }}
+          retention-days: 90
+
+  # The release catalog overlay: every publishable catalog ref (deploy/images/catalog.yaml
+  # plus the OpenTofu overlay: Terraform is never published) mapped to
+  # ghcr.io/<repo>/<name>@<digest> of this run. Workflow artifact on every push; attached
+  # to the GitHub release on v* tags. Clusters merge it over the catalog (Helm value
+  # orchestrator.catalog.releaseOverlay) and, when they pull from their own registry,
+  # rewrite the registry with orchestrator.images.mirrors (docs/deploy.md).
+  catalog-overlay:
+    name: catalog overlay
+    needs: publish
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write # attach the overlay to the release (v* tags)
+    steps:
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: services/lab-orchestrator/go.mod
+          cache: false # a publishing workflow: no cache that a PR could poison
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: digest-*
+          path: digests
+          merge-multiple: true
+      - name: Generate the overlay
+        env:
+          REPO: ${{ github.repository }}
+        run: |
+          cd services/lab-orchestrator && GOWORK=off go build -o ../../labctl ./cmd/labctl && cd ../..
+          ./labctl catalog check --catalog deploy/images/catalog.yaml,deploy/images/overlays/iac-opentofu.yaml --workflow .github/workflows/images.yml
+          ./labctl catalog overlay --allow-missing \
+            --catalog deploy/images/catalog.yaml,deploy/images/overlays/iac-opentofu.yaml \
+            --registry "ghcr.io/${REPO,,}" --digests digests > catalog-release.yaml
+          cat catalog-release.yaml
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: catalog-release
+          path: catalog-release.yaml
+          retention-days: 90
+      - name: Attach to the release (v* tags)
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --draft --verify-tag --title "$TAG" --notes "CloudTrain $TAG"
+          gh release upload "$TAG" catalog-release.yaml --clobber

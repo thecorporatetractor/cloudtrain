@@ -14,6 +14,17 @@
 # tools/images/build.sh refuses to build an image whose entry here disagrees with them.
 # Optional informational fields (consumers may ignore them): kubernetesVersion,
 # stagedUpgrades, etcdVersion, kubectlVersion.
+#
+# Publishing (docs/deploy.md, "Images and registries"): `publishable: true` lets CI
+# push the image to GHCR (.github/workflows/images.yml) under `publishName` (default:
+# the image's last path component, cloudtrain/jumphost:1 -> jumphost) and lets the
+# release overlay point the ref at ghcr.io/<owner>/<repo>/<name>@<digest>. Omitted or
+# false = never published (license-restricted or upstream images); `labctl catalog
+# check` fails CI when the workflow publishes such an image. Containers are published
+# today; containerDisks need a KVM builder (planned, docs/deploy.md).
+# Top-level `registry`, `mirrors` and `imagePullSecrets` (all optional) configure
+# where the orchestrator pulls from; the manager's --image-registry, --image-mirror
+# and --image-pull-secrets flags (Helm values) add to or override them.
 apiVersion: cloudtrain.dev/v1
 kind: ImageCatalog
 images:
@@ -25,6 +36,7 @@ images:
     kind: container
     image: cloudtrain/jumphost:1
     kubectlVersion: v1.37.1
+    publishable: true
   # kubeadm nodes: `/opt/cloudtrain/bin/cni-install <podCIDR>` installs Calico (enforces
   # NetworkPolicy) from the sha256-recorded /opt/cloudtrain/manifests/calico.yaml; all
   # control-plane, Calico and workload images preloaded; curl installed. No users or
@@ -33,6 +45,8 @@ images:
     kind: containerDisk
     image: cloudtrain/kubeadm-node:v1.37.1
     kubernetesVersion: v1.37.1
+    publishable: true
+    publishName: kubeadm-node-v1.37
   # Upgrade labs start one minor behind and have the target release staged
   # offline: signed flat apt repos /opt/k8s-apt/v1.36/ and /opt/k8s-apt/v1.37/;
   # /etc/apt/sources.list.d/kubernetes.list points at v1.36 (the learner switches the
@@ -43,6 +57,8 @@ images:
     image: cloudtrain/kubeadm-node:v1.36-upgrade
     kubernetesVersion: v1.36.5
     stagedUpgrades: [v1.37.1]
+    publishable: true
+    publishName: kubeadm-node-v1.36-upgrade
   # etcd/etcdctl/etcdutl in /usr/local/bin, openssl, etcd.service with mutual TLS on
   # 127.0.0.1:2379 (per-VM PKI in /etc/qm-etcd/pki), system user `etcd`. Ubuntu cloud
   # image with cloud-init + sshd; no users or keys baked in.
@@ -50,15 +66,18 @@ images:
     kind: containerDisk
     image: cloudtrain/etcd-host:3.6
     etcdVersion: v3.6.15
+    publishable: true
   # netdev ---------------------------------------------------------------
   # Network-lab images, built by tools/images/netdev/build.sh (task image:netdev).
   frr:10:
     kind: container
     image: cloudtrain/frr:10       # FRRouting 10.7.1 (quay.io/frrouting/frr by digest); ospfd, ospf6d, bgpd, bfdd
     netdev: frr                    # device family: config via vtysh, show commands via vtysh -c
+    publishable: true
   nettools:1:
     kind: container
     image: cloudtrain/nettools:1   # iproute2, ping, traceroute, tcpdump, iperf3; also the link sidecar
+    publishable: true
   # Linux services host and Linux router/firewall/switch for network labs: dnsmasq,
   # Kea DHCPv4, BIND + dig, chrony, rsyslog, net-snmp, OpenSSH, nftables/iptables,
   # WireGuard, strongSwan, bridge/bond/VLAN tooling, tc, python3 + Jinja2/PyYAML.
@@ -66,6 +85,7 @@ images:
   netsvc:1:
     kind: container
     image: cloudtrain/netsvc:1
+    publishable: true
   # In-lab OCI registry: CNCF Distribution 3.1.2 (thin layer on registry:3, by digest;
   # tools/images/oci-registry). Plain HTTP on :5000, no auth, anonymous push/pull, deletes
   # enabled, data in /var/lib/registry (runs as uid 65532; volumes need fsGroup 65532). Labs switch on TLS or htpasswd through the upstream
@@ -73,6 +93,7 @@ images:
   oci-registry:3:
     kind: container
     image: cloudtrain/oci-registry:3
+    publishable: true
   # kubeadm:1.37 plus add-ons for the K8s curriculum, layered on that image (build.sh
   # kubeadm-full). Post-init hook: `/opt/cloudtrain/bin/addons-install <list> [--wait]
   # [--pool a-b]` with metrics-server, gateway-api, traefik (IngressClass + GatewayClass
@@ -88,12 +109,16 @@ images:
     kubernetesVersion: v1.37.1
     tier: K
     addons: [metrics-server, gateway-api, traefik, metallb, local-path, falco]
+    publishable: true
+    publishName: kubeadm-node-v1.37-full
   kubeadm:1.37-sec:                    # same image, the curriculum's CKS ref
     kind: containerDisk
     image: cloudtrain/kubeadm-node:v1.37.1-full
     kubernetesVersion: v1.37.1
     tier: K
     addons: [metrics-server, gateway-api, traefik, metallb, local-path, falco]
+    publishable: true
+    publishName: kubeadm-node-v1.37-full
   # linux (foundations stream) ------------------------------------------------
   # Tier A: unprivileged learner pods (tools/images/build-linux-pod.sh, task image:build:linux-pod).
   # userNamespace: the container driver runs them with pod hostUsers: false when every
@@ -109,12 +134,14 @@ images:
     tier: A
     userNamespace: true
     mirrors: [dnf, pypi]
+    publishable: true
   deb-lab:24.04:
     kind: container
     image: cloudtrain/deb-lab:24.04    # Ubuntu 24.04 userland, unminimized
     tier: A
     userNamespace: true
     mirrors: [apt, pypi]
+    publishable: true
   # Tier C: KubeVirt VMs for Linux labs (tools/images/build.sh el-vm|ubuntu-vm). Each carries
   # the mirror snapshot as a LOCAL repo (/opt/cloudtrain/repo/<el10|noble>), the only enabled
   # package source, so dnf/apt work offline in an isolated lab VPC. Extra blank disks come
@@ -126,11 +153,13 @@ images:
     image: cloudtrain/el-vm:10         # AlmaLinux 10.2 GenericCloud; SELinux enforcing, firewalld, auditd
     tier: C
     mirrors: [dnf-local]
+    publishable: true
   ubuntu-vm:24.04:
     kind: containerDisk
     image: cloudtrain/ubuntu-vm:24.04  # Ubuntu 24.04 cloud image; AppArmor, nftables/ufw, auditd
     tier: C
     mirrors: [apt-local]
+    publishable: true
   # iac (wave 2) --------------------------------------------------------------
   # IaC learner workstation (tools/images/iac, build-iac-ws.sh): Terraform 1.15 as the
   # primary CLI with OpenTofu 1.11 alongside, kubectl, helm, jq/yq, git; user `learner`
@@ -145,6 +174,7 @@ images:
     kind: container
     image: cloudtrain/iac-ws:1.15-terraform
     tier: A
+    publishable: false   # Terraform is BUSL-1.1: never published; only the OpenTofu flavour is (overlays/iac-opentofu.yaml)
   # AWS-shaped API for IaC labs (Moto server, Apache-2.0, upstream image; digest below):
   # a lab peer node named `moto`, reached from the workstation as http://moto:5000.
   # Emulates the API shape, not AWS behaviour; state lives in memory (a restarted pod
@@ -153,6 +183,7 @@ images:
     kind: container
     image: motoserver/moto:5.2.3   # sha256:91fd602a21f49cf9eb82fdf474015a3c131d40104c8297ea6a2ca920708ae32c
     tier: A
+    publishable: false   # upstream image from docker.io (clusters mirror it with --image-mirror docker.io=...)
   # containers (containers-content stream) ------------------------------------
   # Tier C Docker host (tools/images/build.sh docker-vm): Ubuntu 24.04 cloud image with
   # Docker Engine 29 (containerd image store), buildx, compose, rootless extras (uidmap,
@@ -167,6 +198,7 @@ images:
     kind: containerDisk
     image: cloudtrain/docker-vm:29
     tier: C
+    publishable: true
   # automation (automation-content stream) -------------------------------------
   # Ansible control node (tools/images/ansible, build-ansible-ctl.sh): ansible-core 2.21,
   # ansible-navigator (labs run it with execution environments disabled: no container
@@ -181,6 +213,7 @@ images:
     kind: container
     image: cloudtrain/ansible-ctl:2.21
     tier: A
+    publishable: true
   # security operations (soc stream) ------------------------------------------
   # KQL workstation (tools/images/kql-ws, build-kql-ws.sh): KustoLoco lokql (MIT; patched,
   # Kusto.Language built from Apache-2.0 source) as `kql` with the lab's tables loaded from
@@ -193,6 +226,7 @@ images:
     kind: container
     image: cloudtrain/kql-ws:1
     tier: A
+    publishable: true
 workloadImages:
   - busybox:1.37
   - httpd:2.4-alpine

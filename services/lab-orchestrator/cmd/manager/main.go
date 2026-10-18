@@ -32,7 +32,7 @@ func main() {
 		catalogPaths, adminImageRef, helmBin, vclusterChart, vclusterValues string
 		sessionSelector, leaderElectionID, netToolsImage                    string
 		storageClass, vmDisks, userNamespaces, vclusterPodSecurity          string
-		ovnCentral                                                          string
+		ovnCentral, imageMirrors, imagePullSecrets                          string
 		linkSysctls                                                         bool
 		linkRateMbps                                                        int
 		leaderElect, metricsSecure, persistentHome, vclusterPersistence     bool
@@ -47,7 +47,9 @@ func main() {
 	flag.DurationVar(&provisionTimeout, "provision-timeout", controller.DefaultProvisionTimeout, "fail sessions whose nodes are not ready within this time")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "health probe address")
 	flag.BoolVar(&leaderElect, "leader-elect", false, "enable leader election")
-	flag.StringVar(&registry, "image-registry", "", "registry prefix for catalog images (e.g. registry.cloudtrain.local/images)")
+	flag.StringVar(&registry, "image-registry", "", "registry prefix for unqualified catalog images (e.g. registry.cloudtrain.local/images); empty = the catalog's registry")
+	flag.StringVar(&imageMirrors, "image-mirror", "", "registry rewrites for resolved lab images, from=to comma separated (e.g. ghcr.io/acme/cloudtrain=acme.azurecr.io/cloudtrain,docker.io=mirror.gcr.io); added to the catalog's mirrors")
+	flag.StringVar(&imagePullSecrets, "image-pull-secrets", "", "Secrets in the session namespace that lab pods (and ephemeral VM containerDisks: the first one) pull with, comma separated; added to the catalog's imagePullSecrets")
 	flag.StringVar(&netToolsImage, "net-tools-image", "nettools:1", "catalog image for link init/sidecar containers (iproute2, tc, tcpdump)")
 	flag.StringVar(&runtimeClass, "runtime-class", "", "RuntimeClass for container nodes (e.g. kata); empty = cluster default")
 	flag.StringVar(&catalogPaths, "image-catalog", "/etc/cloudtrain/catalog", "image catalog files or directories, comma separated; later ones override earlier ones")
@@ -132,6 +134,17 @@ func main() {
 		log.Error(err, "unable to load image catalog")
 		os.Exit(1)
 	}
+	mirrors, err := drivers.ParseRegistryMirrors(imageMirrors)
+	if err != nil {
+		log.Error(err, "invalid --image-mirror")
+		os.Exit(1)
+	}
+	var pullSecrets []string
+	for _, s := range strings.Split(imagePullSecrets, ",") {
+		if s = strings.TrimSpace(s); s != "" {
+			pullSecrets = append(pullSecrets, s)
+		}
+	}
 	if !drivers.ValidPodSecurity(vclusterPodSecurity) {
 		log.Error(nil, "--vcluster-pod-security must be baseline or restricted", "value", vclusterPodSecurity)
 		os.Exit(1)
@@ -160,7 +173,8 @@ func main() {
 	}
 	rt, err := drivers.NewRuntime(drivers.RuntimeOptions{
 		Client: mgr.GetClient(), Reader: mgr.GetAPIReader(), Scheme: scheme, Executor: executor,
-		Catalog: catalog, ImageRegistry: registry, RuntimeClassName: runtimeClass, AdminImageRef: adminImageRef,
+		Catalog: catalog, ImageRegistry: registry, ImageMirrors: mirrors, ImagePullSecrets: pullSecrets,
+		RuntimeClassName: runtimeClass, AdminImageRef: adminImageRef,
 		Helm: drivers.ExecHelm{Binary: helmBin}, VClusterChart: vclusterChart, VClusterValues: vclusterValues,
 		VClusterPodSecurity: vclusterPodSecurity,
 		PersistentHome:      persistentHome, VClusterPersistence: vclusterPersistence, StorageClass: storageClass,

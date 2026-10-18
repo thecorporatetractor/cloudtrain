@@ -43,15 +43,34 @@ type CatalogImage struct {
 	// Addons lists the add-ons /opt/cloudtrain/bin/addons-install can install
 	// on a kubeadm image (informational).
 	Addons []string `json:"addons,omitempty"`
+	// Publishable allows CI to publish the image to the public registry
+	// (GHCR, .github/workflows/images.yml) and a release overlay to point at
+	// it. Omitted = never published: license-restricted images (the
+	// Terraform workstation, BUSL-1.1) and upstream images stay false.
+	// `labctl catalog check` fails CI when the workflow publishes a name that
+	// is not publishable here.
+	Publishable bool `json:"publishable,omitempty"`
+	// PublishAs is the published repository name when it differs from the
+	// image's last path component (see PublishName).
+	PublishAs string `json:"publishName,omitempty"`
 }
 
 // ImageCatalog maps the image refs used in lab.yaml (topology.nodes[].image)
 // to runtime artifacts (deploy/images/catalog.yaml, kind ImageCatalog).
 type ImageCatalog struct {
-	APIVersion     string                  `json:"apiVersion,omitempty"`
-	Kind           string                  `json:"kind,omitempty"`
-	Images         map[string]CatalogImage `json:"images"`
-	WorkloadImages []string                `json:"workloadImages,omitempty"`
+	APIVersion string `json:"apiVersion,omitempty"`
+	Kind       string `json:"kind,omitempty"`
+	// Registry prefixes unqualified catalog images (the manager's
+	// --image-registry overrides it); a later file's non-empty value wins.
+	Registry string `json:"registry,omitempty"`
+	// Mirrors rewrite image registries (see RegistryMirror); the manager's
+	// --image-mirror entries are added. Merged by From, later files win.
+	Mirrors []RegistryMirror `json:"mirrors,omitempty"`
+	// ImagePullSecrets are Secrets in the session namespace that lab pods and
+	// VMs pull with (the manager's --image-pull-secrets are added).
+	ImagePullSecrets []string                `json:"imagePullSecrets,omitempty"`
+	Images           map[string]CatalogImage `json:"images"`
+	WorkloadImages   []string                `json:"workloadImages,omitempty"`
 }
 
 // ParseCatalog parses one catalog document.
@@ -62,6 +81,11 @@ func ParseCatalog(data []byte) (*ImageCatalog, error) {
 	}
 	if c.Kind != "" && c.Kind != "ImageCatalog" {
 		return nil, fmt.Errorf("parse image catalog: kind %q, want ImageCatalog", c.Kind)
+	}
+	for _, m := range c.Mirrors {
+		if err := m.validate(); err != nil {
+			return nil, fmt.Errorf("image catalog: %w", err)
+		}
 	}
 	for ref, img := range c.Images {
 		if img.Image == "" {
@@ -137,6 +161,33 @@ func (c *ImageCatalog) Merge(o *ImageCatalog) {
 			c.WorkloadImages = append(c.WorkloadImages, w)
 		}
 	}
+	if o.Registry != "" {
+		c.Registry = o.Registry
+	}
+	c.Mirrors = MergeMirrors(c.Mirrors, o.Mirrors)
+	for _, s := range o.ImagePullSecrets {
+		if !containsString(c.ImagePullSecrets, s) {
+			c.ImagePullSecrets = append(c.ImagePullSecrets, s)
+		}
+	}
+}
+
+// MergeMirrors adds the mirrors of b to a; an entry of b replaces the one of
+// a with the same From.
+func MergeMirrors(a, b []RegistryMirror) []RegistryMirror {
+	out := append([]RegistryMirror(nil), a...)
+	for _, m := range b {
+		replaced := false
+		for i := range out {
+			if strings.TrimSuffix(out[i].From, "/") == strings.TrimSuffix(m.From, "/") {
+				out[i], replaced = m, true
+			}
+		}
+		if !replaced {
+			out = append(out, m)
+		}
+	}
+	return out
 }
 
 // Resolve returns the catalog entry for ref and checks its kind. An unknown
