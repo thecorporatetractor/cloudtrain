@@ -635,7 +635,9 @@ Setup (as `ubuntu`):
    containerd 10), higher API server / controller-manager / scheduler limits, kubelet
    `systemReserved` so the workers together schedule about 216 GiB, Kube-OVN CPU limits
    raised (the chart's 1-CPU limit on `kube-ovn-cni` throttles CNI calls under bursts, see
-   known gap 9) and `OVN_NORTHD_N_THREADS: 4`, KubeVirt/CDI client rate limits raised. The
+   known gap 9), local-path-provisioner with `--worker-threads 32 --kube-client-qps 100
+   --kube-client-burst 200` (at its defaults, 4 workers and QPS 5, PVC binding was the
+   throughput limit: 19 PVCs Pending, VM labs idle at 17 % CPU) and `OVN_NORTHD_N_THREADS: 4`, KubeVirt/CDI client rate limits raised. The
    batch manager runs with `--max-concurrent-reconciles=64` and a 6 GiB memory limit.
 7. **User-namespace pods fail on EC2 without `tune.sh`.** kind bind-mounts files over
    `/sys/devices/virtual/dmi/id/` (a per-node `product_uuid`) when the host has DMI; WSL has
