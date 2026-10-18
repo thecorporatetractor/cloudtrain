@@ -181,10 +181,10 @@ export const membersOfTeam = (teamId: string) => people.filter((p) => p.status !
 
 const ROLE_PERMS: Record<Role, Permission[]> = {
   learner: ['lab.run', 'progress.read.self'],
-  manager: ['progress.read.team', 'assignment.manage', 'report.export'],
-  instructor: ['progress.read.team', 'assignment.manage', 'report.export', 'session.observe', 'session.control', 'cohort.manage'],
+  manager: ['progress.read.team', 'assignment.manage', 'report.export', 'event.manage'],
+  instructor: ['progress.read.team', 'assignment.manage', 'report.export', 'session.observe', 'session.control', 'cohort.manage', 'event.manage'],
   author: ['studio.author', 'content.publish'],
-  org_admin: ['progress.read.team', 'assignment.manage', 'report.export', 'session.observe', 'session.control', 'cohort.manage', 'studio.author', 'content.publish', 'content.visibility', 'user.manage', 'team.manage', 'role.assign', 'sso.manage', 'settings.manage', 'quota.manage', 'audit.read'],
+  org_admin: ['progress.read.team', 'assignment.manage', 'report.export', 'session.observe', 'session.control', 'cohort.manage', 'event.manage', 'studio.author', 'content.publish', 'content.visibility', 'user.manage', 'team.manage', 'role.assign', 'sso.manage', 'settings.manage', 'quota.manage', 'audit.read'],
   platform_admin: ['org.manage', 'capacity.read', 'support.access'],
 };
 const ALL_PERMS = Array.from(new Set(Object.values(ROLE_PERMS).flat()));
@@ -204,7 +204,7 @@ export function grantsFor(roles: Role[], managed: string[], cohorts: string[]): 
     if (org) return { permission, scope: 'org' };
     if (['session.observe', 'session.control', 'cohort.manage'].includes(permission)) return { permission, scope: permission === 'cohort.manage' ? 'own' : 'cohort', cohortIds: cohorts };
     if (permission === 'content.publish') return { permission, scope: 'pilot' };
-    if (permission === 'studio.author') return { permission, scope: 'org' };
+    if (permission === 'studio.author' || permission === 'event.manage') return { permission, scope: 'org' };
     if (roles.includes('instructor') && !roles.includes('manager')) return { permission, scope: 'cohort', cohortIds: cohorts };
     return { permission, scope: 'team', teamIds: managed };
   });

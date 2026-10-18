@@ -10,6 +10,7 @@ import { PlatformService } from '../src/platform/service.js';
 import { SessionService } from '../src/sessions/service.js';
 import { AnswerService } from '../src/answers/service.js';
 import { PgAnswerStore } from '../src/answers/store.js';
+import { EventService } from '../src/events/service.js';
 import { TerminalHub } from '../src/terminal/hub.js';
 import { FakeCluster, FakeCompiler, realContent, repo } from './fakes.js';
 import type { FakeOidcProvider } from './fake-oidc.js';
@@ -34,6 +35,7 @@ export interface Harness {
   ps: PlatformService;
   sessions: SessionService;
   answers: AnswerService;
+  events: EventService;
   cluster: FakeCluster;
   mailer: MemoryMailer;
   hub: TerminalHub;
@@ -81,14 +83,16 @@ export async function harness(opts: { oidc?: FakeOidcProvider; auth?: (t: TestDb
     auth = new OidcAuthenticator(t.db, store, client);
     oidc = { client, store };
   }
-  const answers = new AnswerService(sessions, new PgAnswerStore(ps), { ratePerMinute: opts.answerRatePerMinute ?? 20 });
-  const app = await buildApp({ content, auth, sessions, cluster, platform: ps, hub, answers, clusterInfo: null, ...(oidc ? { oidc } : {}), ...(opts.devImpersonate ? { devImpersonate: true } : {}) });
+  const events = new EventService(ps, sessions);
+  const answers = new AnswerService(sessions, new PgAnswerStore(ps), { ratePerMinute: opts.answerRatePerMinute ?? 20, resolve: events.resolveScope });
+  const app = await buildApp({ content, auth, sessions, cluster, platform: ps, hub, answers, events, clusterInfo: null, ...(oidc ? { oidc } : {}), ...(opts.devImpersonate ? { devImpersonate: true } : {}) });
   return {
     t,
     app,
     ps,
     sessions,
     answers,
+    events,
     cluster,
     mailer,
     hub,

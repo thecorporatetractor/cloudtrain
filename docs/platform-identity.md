@@ -42,6 +42,7 @@ the web only hides UI, it never enforces.
 | `session.observe` (shadow terminal) | | | cohort | | org |
 | `session.control` (extend/reset/terminate) | | | cohort | | org |
 | `cohort.manage` | | | own | | org |
+| `event.manage` (CTF events: create, teams, live scoreboard, export) | | org | org | | org |
 | `studio.author` | | | | ✓ | ✓ |
 | `content.publish` (pilot/published in org) | | | | pilot | ✓ |
 | `content.visibility` | | | | | ✓ |

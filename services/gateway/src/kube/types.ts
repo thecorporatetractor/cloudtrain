@@ -119,5 +119,8 @@ export const LABEL_LAB = 'labs.cloudtrain.dev/lab-id';
 export const LABEL_LEARNER = 'cloudtrain.dev/learner';
 export const LABEL_ORG = 'cloudtrain.dev/org';
 export const LABEL_MANAGED_BY = 'app.kubernetes.io/managed-by';
+/** CTF event sessions: the event id, and the team id in team events (answers count for that scope). */
+export const LABEL_CTF_EVENT = 'cloudtrain.dev/ctf-event';
+export const LABEL_CTF_TEAM = 'cloudtrain.dev/ctf-team';
 export const MANAGED_BY = 'cloudtrain-gateway';
 export const ANNOTATION_HINTS = 'cloudtrain.dev/revealed-hints';

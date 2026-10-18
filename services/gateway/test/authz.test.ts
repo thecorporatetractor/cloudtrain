@@ -16,6 +16,7 @@ const TABLE: Record<Permission, Record<OrgRole, string>> = {
   'session.observe': { learner: '', manager: '', instructor: 'cohort', author: '', org_admin: 'org' },
   'session.control': { learner: '', manager: '', instructor: 'cohort', author: '', org_admin: 'org' },
   'cohort.manage': { learner: '', manager: '', instructor: 'own', author: '', org_admin: 'org' },
+  'event.manage': { learner: '', manager: 'org', instructor: 'org', author: '', org_admin: 'org' },
   'studio.author': { learner: '', manager: '', instructor: '', author: 'org', org_admin: 'org' },
   'content.publish': { learner: '', manager: '', instructor: '', author: 'pilot', org_admin: 'org' },
   'content.visibility': { learner: '', manager: '', instructor: '', author: '', org_admin: 'org' },
