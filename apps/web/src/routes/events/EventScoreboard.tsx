@@ -67,7 +67,7 @@ export function ScoreboardView({ board, heading = true }: { board: CtfScoreboard
             <SolvesFeed solves={board.solves} />
           </Card>
           <Card className="card-flush">
-            <div className="table-wrap">
+            <div className="table-wrap table-compact">
               <table className="table">
                 <caption className="sr-only">Questions: value now, solves and first blood</caption>
                 <thead>

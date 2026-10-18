@@ -49,7 +49,7 @@ export function ScoreTable({ board, compact }: { board: CtfScoreboard; compact?:
   if (!board.rows.length) return <EmptyState icon={<Trophy size={20} />} title="No entrants yet" description="Teams and players appear here once they join." />;
   const team = board.mode === 'team';
   return (
-    <div className="table-wrap">
+    <div className="table-wrap table-compact">
       <table className="table score-table">
         <caption className="sr-only">
           {board.title} scoreboard{board.frozen ? ', frozen' : ''}: rank, {team ? 'team' : 'player'}, points, solves, last solve
