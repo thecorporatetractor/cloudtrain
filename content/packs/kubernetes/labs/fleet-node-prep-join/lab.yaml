@@ -192,7 +192,7 @@ spec:
       mutation:
         on: workstation
         as: learner
-        timeoutSec: 300
+        timeoutSec: 600
         run: |
           kubectl config use-context qm-fleet
           cmd=$(ssh fleet-cp-1 'sudo kubeadm token create --print-join-command')
@@ -202,7 +202,8 @@ spec:
             sudo swapoff -a; sudo sed -i '/[[:space:]]swap[[:space:]]/d' /etc/fstab
             sudo sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml; sudo systemctl restart containerd
             sudo $cmd"
-          kubectl --context qm-fleet wait node/fleet-wk-3 --for=condition=Ready --timeout=180s
+          for i in $(seq 1 90); do kubectl --context qm-fleet get node fleet-wk-3 >/dev/null 2>&1 && break; sleep 2; done
+          kubectl --context qm-fleet wait node/fleet-wk-3 --for=condition=Ready --timeout=300s
     - id: swapoff-only
       description: Runs swapoff -a but leaves the swap entry in /etc/fstab.
       feedback: The fstab entry turns swap on again at the next boot, and the kubelet refuses to start with swap enabled.
@@ -210,7 +211,7 @@ spec:
       mutation:
         on: workstation
         as: learner
-        timeoutSec: 300
+        timeoutSec: 600
         run: |
           kubectl config use-context qm-fleet
           cmd=$(ssh fleet-cp-1 'sudo kubeadm token create --print-join-command')
@@ -221,7 +222,8 @@ spec:
             sudo swapoff -a
             sudo sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml; sudo systemctl restart containerd
             sudo $cmd"
-          kubectl --context qm-fleet wait node/fleet-wk-3 --for=condition=Ready --timeout=180s
+          for i in $(seq 1 90); do kubectl --context qm-fleet get node fleet-wk-3 >/dev/null 2>&1 && break; sleep 2; done
+          kubectl --context qm-fleet wait node/fleet-wk-3 --for=condition=Ready --timeout=300s
     - id: early-sysctl-file
       description: Writes the sysctls into a file that sorts before the host's own file, which sets ip_forward back to 0.
       feedback: The host already sets net.ipv4.ip_forward = 0 in /etc/sysctl.d/60-host-defaults.conf. A file named 10-k8s.conf is read first and overridden.
@@ -229,7 +231,7 @@ spec:
       mutation:
         on: workstation
         as: learner
-        timeoutSec: 300
+        timeoutSec: 600
         run: |
           kubectl config use-context qm-fleet
           cmd=$(ssh fleet-cp-1 'sudo kubeadm token create --print-join-command')
@@ -240,7 +242,8 @@ spec:
             sudo swapoff -a; sudo sed -i '/[[:space:]]swap[[:space:]]/d' /etc/fstab
             sudo sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml; sudo systemctl restart containerd
             sudo $cmd"
-          kubectl --context qm-fleet wait node/fleet-wk-3 --for=condition=Ready --timeout=180s
+          for i in $(seq 1 90); do kubectl --context qm-fleet get node fleet-wk-3 >/dev/null 2>&1 && break; sleep 2; done
+          kubectl --context qm-fleet wait node/fleet-wk-3 --for=condition=Ready --timeout=300s
   solution:
     explanation: |
       Modules go to /etc/modules-load.d, sysctls to a late file in
@@ -254,7 +257,7 @@ spec:
     steps:
       - on: workstation
         as: learner
-        timeoutSec: 360
+        timeoutSec: 600
         run: |
           kubectl config use-context qm-fleet
           ssh fleet-wk-3 'set -e
@@ -268,5 +271,9 @@ spec:
             sudo systemctl restart containerd'
           cmd=$(ssh fleet-cp-1 'sudo kubeadm token create --print-join-command')
           ssh fleet-wk-3 "sudo $cmd"
-          kubectl wait node/fleet-wk-3 --for=condition=Ready --timeout=240s
-          kubectl -n kube-system wait pod -l k8s-app=calico-node --field-selector spec.nodeName=fleet-wk-3 --for=condition=Ready --timeout=180s
+          for i in $(seq 1 90); do kubectl get node fleet-wk-3 >/dev/null 2>&1 && break; sleep 2; done
+          kubectl wait node/fleet-wk-3 --for=condition=Ready --timeout=300s
+          for i in $(seq 1 90); do kubectl -n kube-system get pod -l k8s-app=calico-node --field-selector spec.nodeName=fleet-wk-3 -o name 2>/dev/null | grep -q . && break; sleep 2; done
+          kubectl -n kube-system wait pod -l k8s-app=calico-node --field-selector spec.nodeName=fleet-wk-3 --for=condition=Ready --timeout=300s
+          for i in $(seq 1 90); do kubectl -n kube-system get pod -l k8s-app=kube-proxy --field-selector spec.nodeName=fleet-wk-3 -o name 2>/dev/null | grep -q . && break; sleep 2; done
+          kubectl -n kube-system wait pod -l k8s-app=kube-proxy --field-selector spec.nodeName=fleet-wk-3 --for=condition=Ready --timeout=300s
