@@ -1,6 +1,8 @@
 import { http, HttpResponse, delay } from 'msw';
 import type { LabQuestion, Question, QuestionsView, SubmitAnswerResponse, UserRef } from '@/api/types';
 import { labById } from './fixtures/labs';
+import { sessionEvents } from './sessionStore';
+import { userRef } from './fixtures/platform';
 
 /*
  * Mock questions engine (MSW). Mirrors services/gateway/src/answers in
@@ -40,6 +42,9 @@ const MOCK: Record<string, Record<string, MockQuestion>> = {
 };
 
 interface Sub {
+  /** Who answered (a teammate in event sessions). */
+  by?: UserRef;
+  firstBlood?: boolean;
   checkId: string;
   correct: boolean;
   points: number;
@@ -47,7 +52,7 @@ interface Sub {
   at: string;
 }
 const state = new Map<string, { subs: Sub[]; reveals: Map<string, number[]> }>();
-const stateOf = (sessionId: string) => {
+export const stateOf = (sessionId: string) => {
   let s = state.get(sessionId);
   if (!s) state.set(sessionId, (s = { subs: [], reveals: new Map() }));
   return s;
@@ -82,11 +87,23 @@ function view(sessionId: string, labId: string, me?: UserRef): QuestionsView {
       hints: d.hintCosts.map((cost, index) => ({ index, cost, revealed: revealed.includes(index) && !locked, ...(revealed.includes(index) && !locked ? { body: m.hints[index] ?? '' } : {}) })),
       hintCost,
       available: qstate === 'open' || qstate === 'locked' ? available : 0,
-      ...(solved ? { awarded: solved.points, solvedAt: solved.at, answer: solved.answer, ...(me ? { solvedBy: me } : {}) } : {}),
+      ...(solved ? { awarded: solved.points, solvedAt: solved.at, answer: solved.answer, ...((solved.by ?? me) ? { solvedBy: solved.by ?? me } : {}), ...(solved.firstBlood ? { firstBlood: true } : {}) } : {}),
     };
   });
   const possible = questions.reduce((n, q) => n + q.points, 0);
-  return { sessionId, labId, order: sequential ? 'sequential' : 'free', questions, earned: questions.reduce((n, q) => n + (q.awarded ?? 0), 0), possible, solved: questions.filter((q) => q.state === 'solved').length, total: questions.length };
+  const event = sessionEvents.get(sessionId);
+  return { sessionId, labId, ...(event ? { event } : {}), order: sequential ? 'sequential' : 'free', questions, earned: questions.reduce((n, q) => n + (q.awarded ?? 0), 0), possible, solved: questions.filter((q) => q.state === 'solved').length, total: questions.length };
+}
+
+/** The signed-in mock user (team events show who solved what). */
+function me(): UserRef | undefined {
+  try {
+    const raw = localStorage.getItem('ct.mock.session');
+    const id = raw && raw !== 'none' ? (JSON.parse(raw) as { userId?: string }).userId : undefined;
+    return id ? userRef(id) : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 const err = (status: number, error: string, code: string) => HttpResponse.json({ error, code }, { status });
@@ -96,7 +113,8 @@ export const ctfHandlers = [
     await delay(120);
     const labId = labOfSession(String(params.id));
     if (!labId || !MOCK[labId]) return err(404, 'Questions not found', 'not_found');
-    return HttpResponse.json(view(String(params.id), labId));
+    const ev = sessionEvents.get(String(params.id));
+    return HttpResponse.json(view(String(params.id), labId, ev?.teamId ? me() : undefined));
   }),
 
   http.post('/api/sessions/:id/questions/:checkId/answer', async ({ params, request }) => {
@@ -113,7 +131,7 @@ export const ctfHandlers = [
     if (before.state === 'solved') return err(409, 'This question is already solved.', 'conflict');
     if (before.state === 'closed') return err(409, 'No attempts left for this question.', 'conflict');
     const correct = MOCK[labId]![checkId]!.accept(answer);
-    stateOf(id).subs.push({ checkId, correct, points: correct ? before.available : 0, answer, at: new Date().toISOString() });
+    stateOf(id).subs.push({ checkId, correct, points: correct ? before.available : 0, answer, at: new Date().toISOString(), ...(sessionEvents.get(id)?.teamId ? { by: me() } : {}) });
     const v = view(id, labId);
     const q = v.questions.find((x) => x.id === checkId)!;
     const message = correct

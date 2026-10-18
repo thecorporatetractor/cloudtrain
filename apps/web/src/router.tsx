@@ -43,6 +43,10 @@ const PlatformContent = lazyRouteComponent(() => import('./routes/platform/Conte
 const ExamDetail = lazyRouteComponent(() => import('./routes/exams/ExamDetail'), 'ExamDetail');
 const ExamWorkspace = lazyRouteComponent(() => import('./routes/exams/ExamWorkspace'), 'ExamWorkspace');
 const ExamResults = lazyRouteComponent(() => import('./routes/exams/ExamResults'), 'ExamResults');
+const Events = lazyRouteComponent(() => import('./routes/events/Events'), 'Events');
+const EventDetail = lazyRouteComponent(() => import('./routes/events/EventDetail'), 'EventDetail');
+const EventScoreboard = lazyRouteComponent(() => import('./routes/events/EventScoreboard'), 'EventScoreboard');
+const EventManage = lazyRouteComponent(() => import('./routes/events/EventManage'), 'EventManage');
 
 function Pending() {
   return (
@@ -165,6 +169,10 @@ export const examsRoute = createRoute({
   component: Exams,
 });
 export const examDetailRoute = createRoute({ getParentRoute: () => rootRoute, path: '/exams/$examId', component: ExamDetail });
+export const eventsRoute = createRoute({ getParentRoute: () => rootRoute, path: '/events', component: Events });
+export const eventRoute = createRoute({ getParentRoute: () => rootRoute, path: '/events/$eventId', component: EventDetail });
+export const eventScoreboardRoute = createRoute({ getParentRoute: () => rootRoute, path: '/events/$eventId/scoreboard', component: EventScoreboard });
+export const eventManageRoute = createRoute({ getParentRoute: () => rootRoute, path: '/events/$eventId/manage', component: EventManage });
 export const examAttemptRoute = createRoute({ getParentRoute: () => rootRoute, path: '/exams/attempts/$attemptId', component: ExamWorkspace });
 export const examResultsRoute = createRoute({ getParentRoute: () => rootRoute, path: '/exams/attempts/$attemptId/results', component: ExamResults });
 
@@ -324,6 +332,10 @@ const routeTree = rootRoute.addChildren([
   examDetailRoute,
   examAttemptRoute,
   examResultsRoute,
+  eventsRoute,
+  eventRoute,
+  eventScoreboardRoute,
+  eventManageRoute,
   studioRoute,
   studioDraftRoute,
   teamRoute,

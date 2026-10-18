@@ -129,10 +129,20 @@ export class SessionService {
     return t.metadata.name;
   }
 
-  async start(principal: Principal, labId: string): Promise<WebSession> {
+  /**
+   * Starts a session. `opts` (CTF events): a fixed seed (teammates get the
+   * same data and answers), extra labels, and an absolute end that caps the
+   * TTL (the event's end).
+   */
+  async start(principal: Principal, labId: string, opts: { seed?: number; labels?: Record<string, string>; endsAt?: Date } = {}): Promise<WebSession> {
     const lab = this.lab(labId);
     const gate = this.hooks ? await this.hooks.beforeStart(principal, lab) : {};
     const ttl = gate.ttlMinutes ?? this.opts.sessionTtlMinutes;
+    let expiresAt: string | undefined;
+    if (opts.endsAt) {
+      const cap = ttl ? Math.min(this.now() + ttl * 60_000, opts.endsAt.getTime()) : opts.endsAt.getTime();
+      expiresAt = new Date(cap).toISOString().replace(/\.\d{3}Z$/, 'Z');
+    }
     const templateName = await this.ensureTemplate(lab);
     const ls: LabSession = {
       apiVersion: LABS_API_VERSION,
@@ -144,13 +154,14 @@ export class SessionService {
           [LABEL_LEARNER]: labelValue(principal.sub),
           [LABEL_ORG]: labelValue(principal.orgId),
           [LABEL_MANAGED_BY]: MANAGED_BY,
+          ...(opts.labels ?? {}),
         },
       },
       spec: {
         templateRef: { name: templateName },
         learner: { id: principal.sub, org: principal.orgId },
-        seed: randomInt(1, 2 ** 31 - 1),
-        ...(ttl ? { ttl: `${ttl}m` } : {}),
+        seed: opts.seed ?? randomInt(1, 2 ** 31 - 1),
+        ...(expiresAt ? { expiresAt } : ttl ? { ttl: `${ttl}m` } : {}),
       },
     };
     const created = await this.cluster.createSession(ls);

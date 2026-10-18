@@ -22,6 +22,8 @@ export const ROUTE_ACCESS: Record<string, RouteAccess> = {
   '/assignments': { any: ['progress.read.self'], label: 'My assignments' },
   '/history': { any: ['progress.read.self'], label: 'History' },
   '/exams': { any: ['lab.run'], label: 'Exams' },
+  '/events': { any: ['lab.run'], label: 'CTF events' },
+  '/events/manage': { any: ['event.manage'], label: 'Manage CTF event' },
   '/team': { any: ['progress.read.team'], when: (me) => me.managedTeams.length > 0, label: 'Team dashboard' },
   '/cohorts': { any: ['cohort.manage'], label: 'Cohorts' },
   '/studio': { any: ['studio.author'], label: 'Scenario Studio' },

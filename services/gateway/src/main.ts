@@ -3,6 +3,7 @@ import { sql } from 'kysely';
 import { buildApp } from './app.js';
 import { AnswerService } from './answers/service.js';
 import { PgAnswerStore } from './answers/store.js';
+import { EventService } from './events/service.js';
 import { loadConfig } from './config.js';
 import { loadContent } from './content/load.js';
 import { createDb } from './db/index.js';
@@ -80,7 +81,9 @@ async function main() {
   );
 
   // CTF questions: submissions and hint reveals in Postgres (RLS, audited, rate-limited).
-  const answers = new AnswerService(sessions, new PgAnswerStore(platform), { ratePerMinute: config.answerRatePerMinute });
+  // CTF events: event sessions answer for their team (or entrant), with the event's scoring.
+  const events = new EventService(platform, sessions);
+  const answers = new AnswerService(sessions, new PgAnswerStore(platform), { ratePerMinute: config.answerRatePerMinute, resolve: events.resolveScope });
 
   const app = await buildApp({
     content,
@@ -93,6 +96,7 @@ async function main() {
     hub: new TerminalHub(),
     exams,
     answers,
+    events,
     logger: { level: config.logLevel },
     devImpersonate: config.devImpersonate,
   });

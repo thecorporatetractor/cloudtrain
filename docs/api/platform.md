@@ -58,6 +58,8 @@ Types: [`packages/api-types/platform.d.ts`](../../packages/api-types/platform.d.
 | `GET /attempts/mine?lab=&outcome=&from=&to=&cursor=&limit=` | `AttemptQuery` | `Page<Attempt>` (`points` on CTF attempts) | `progress.read.self` |
 | `GET /attempts/:id` | | `AttemptDetail` | `progress.read.self` (own) or `progress.read.team` (team/cohort/org of the attempt's user) |
 
+CTF events (`/events*`, join, play, scoreboard; manage with `event.manage`): see [`docs/ctf-events.md`](../ctf-events.md#api).
+
 ## Manager
 
 | Method + path | Request | Response | Permission | Audit |

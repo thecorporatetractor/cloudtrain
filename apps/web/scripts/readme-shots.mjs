@@ -146,6 +146,8 @@ try {
     await settled(s.page);
     await answerCtf(s.page);
     await shot(s.page, 'ctf-questions');
+    await open(s.page, '/events/ev-depot-night/scoreboard', 'Solve timeline');
+    await shot(s.page, 'ctf-scoreboard');
     await s.ctx.close();
   }
   ({ ctx, page } = await session('dark'));

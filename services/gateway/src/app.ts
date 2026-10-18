@@ -25,6 +25,8 @@ import { registerExamRoutes } from './exams/routes.js';
 import type { ExamService } from './exams/service.js';
 import { registerAnswerRoutes } from './answers/routes.js';
 import type { AnswerService } from './answers/service.js';
+import { registerEventRoutes } from './events/routes.js';
+import type { EventService } from './events/service.js';
 
 export interface AppDeps {
   content: Content;
@@ -35,6 +37,8 @@ export interface AppDeps {
   exams?: ExamService;
   /** Questions of CTF labs (`/api/sessions/:id/questions*`); omitted = not served. */
   answers?: AnswerService;
+  /** CTF events (`/api/events*`; needs the platform database); omitted = not served. */
+  events?: EventService;
   logger?: boolean | { level: string };
   /** Postgres-backed platform (identity, persistence, admin). Without it the gateway serves labs/sessions with sample learner data. */
   platform?: PlatformService;
@@ -210,6 +214,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   });
 
   if (deps.answers) registerAnswerRoutes(app, deps.answers);
+  if (deps.events) registerEventRoutes(app, deps.events);
 
   if (ps) registerPlatformRoutes(app, ps, sessions, deps.clusterInfo ?? null);
 

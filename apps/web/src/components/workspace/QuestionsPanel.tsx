@@ -143,6 +143,7 @@ export function QuestionsPanel({ sessionId, ready }: Props) {
           {v.event.title}
           {v.event.teamName ? ` · team ${v.event.teamName}: answers count for the whole team` : ''}
           {v.event.scoring === 'dynamic' ? ' · points drop as more teams solve a question' : ''}
+          {` · ends ${new Date(v.event.endsAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`}
         </p>
       )}
       {v.order === 'sequential' && <p className="xs subtle questions-order">Questions open one after another.</p>}

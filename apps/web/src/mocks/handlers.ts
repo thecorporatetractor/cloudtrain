@@ -8,12 +8,13 @@ import { drafts as seedDrafts, freshGates, specFromPrompt } from './fixtures/stu
 import { allPlatformHandlers, currentSession, currentUser, mockNotices } from './platformHandlers';
 import { examHandlers } from './examHandlers';
 import { ctfHandlers } from './ctf';
+import { eventHandlers } from './events';
+import { newSession, sessions } from './sessionStore';
 
 /* ------------------------------------------------------------------ */
 /* In-memory state (resets on reload)                                  */
 /* ------------------------------------------------------------------ */
 
-const sessions = new Map<string, LabSession>();
 const drafts: StudioDraft[] = structuredClone(seedDrafts);
 const verifyStarted = new Map<string, number>();
 /** Learner goals per user (PUT /api/me/goals); kept in localStorage like the persona, so a reload keeps them. */
@@ -37,30 +38,6 @@ function saveGoals() {
 const NO_GOALS: LearnerGoals = { targetDate: null, weeklyTargetMinutes: null, updatedAt: null };
 
 const latency = () => delay(180 + Math.random() * 260);
-
-function newSession(labId: string): LabSession {
-  const lab = labById.get(labId);
-  if (!lab) throw new Error('unknown lab');
-  const id = `sess-${labId}-${Math.random().toString(36).slice(2, 8)}`;
-  const session: LabSession = {
-    id,
-    labId,
-    startedAt: new Date().toISOString(),
-    deadlineMinutes: lab.metadata.estimatedMinutes * 2,
-    nodes: lab.spec.topology.nodes.map((n, i) => ({ name: n.name, status: i === 0 ? 'ready' : 'provisioning', ip: `10.${40 + i}.0.${10 + i}` })),
-    results: lab.spec.checks.map((c) => ({ checkId: c.id, status: 'pending' })),
-    revealedHints: [],
-    score: 0,
-    validations: 0,
-    status: 'running',
-  };
-  sessions.set(id, session);
-  // nodes come up over a few seconds
-  session.nodes.forEach((n, i) => {
-    if (n.status === 'provisioning') setTimeout(() => (n.status = 'ready'), 1500 + i * 1400);
-  });
-  return session;
-}
 
 function scoreOf(session: LabSession): number {
   const lab = labById.get(session.labId)!;
@@ -303,4 +280,4 @@ export const sampleOnlyHandlers = [
   }),
 ];
 
-export const handlers = [...allPlatformHandlers, ...coreHandlers, ...ctfHandlers, ...examHandlers, ...sampleOnlyHandlers];
+export const handlers = [...allPlatformHandlers, ...coreHandlers, ...ctfHandlers, ...eventHandlers, ...examHandlers, ...sampleOnlyHandlers];

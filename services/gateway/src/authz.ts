@@ -17,6 +17,7 @@ export const ALL_PERMISSIONS: readonly Permission[] = [
   'session.observe',
   'session.control',
   'cohort.manage',
+  'event.manage',
   'studio.author',
   'content.publish',
   'content.visibility',
@@ -38,7 +39,7 @@ const PLATFORM_ONLY: readonly Permission[] = ['org.manage', 'capacity.read', 'su
 /** Role -> permission -> scope. A role not listed for a permission does not hold it. */
 export const MATRIX: Record<OrgRole, Partial<Record<Permission, PermissionScope>>> = {
   learner: { 'lab.run': 'self', 'progress.read.self': 'self' },
-  manager: { 'lab.run': 'self', 'progress.read.self': 'self', 'progress.read.team': 'team', 'assignment.manage': 'team', 'report.export': 'team' },
+  manager: { 'lab.run': 'self', 'progress.read.self': 'self', 'progress.read.team': 'team', 'assignment.manage': 'team', 'report.export': 'team', 'event.manage': 'org' },
   instructor: {
     'lab.run': 'self',
     'progress.read.self': 'self',
@@ -48,6 +49,7 @@ export const MATRIX: Record<OrgRole, Partial<Record<Permission, PermissionScope>
     'session.observe': 'cohort',
     'session.control': 'cohort',
     'cohort.manage': 'own',
+    'event.manage': 'org',
   },
   author: { 'lab.run': 'self', 'progress.read.self': 'self', 'studio.author': 'org', 'content.publish': 'pilot' },
   org_admin: Object.fromEntries(

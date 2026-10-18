@@ -1,7 +1,7 @@
 import { Link, Outlet, useNavigate, useRouterState } from '@tanstack/react-router';
 import * as DialogPrimitive from '@radix-ui/react-dialog';
 import { useEffect, useRef, useState, type ReactNode } from 'react';
-import { BookOpen, Building2, Check, ChevronLeft, ChevronRight, ClipboardList, FlaskConical, GraduationCap, HelpCircle, History, Home as HomeIcon, Keyboard, LogOut, Menu, Moon, Palette, Presentation, Search, Server, Settings, Shield, Sun, Sunset, UserCheck, Users, UserCog, Waypoints, X } from 'lucide-react';
+import { BookOpen, Building2, Flag, Check, ChevronLeft, ChevronRight, ClipboardList, FlaskConical, GraduationCap, HelpCircle, History, Home as HomeIcon, Keyboard, LogOut, Menu, Moon, Palette, Presentation, Search, Server, Settings, Shield, Sun, Sunset, UserCheck, Users, UserCog, Waypoints, X } from 'lucide-react';
 import { useMe } from '@/api/client';
 import { useLogout, useSwitchOrg } from '@/api/platform';
 import { isRealApi } from '@/api/mode';
@@ -57,6 +57,7 @@ export const NAV: NavSection[] = [
       { to: '/assignments', label: 'My assignments', icon: <ClipboardList size={16} />, keys: 'g m', link: (p) => <Link to="/assignments" {...p} /> },
       { to: '/history', label: 'History', icon: <History size={16} />, keys: 'g y', link: (p) => <Link to="/history" {...p} /> },
       { to: '/exams', label: 'Exams', icon: <GraduationCap size={16} />, keys: 'g e', link: (p) => <Link to="/exams" search={{}} {...p} /> },
+      { to: '/events', label: 'CTF events', icon: <Flag size={16} />, keys: 'g v', link: (p) => <Link to="/events" {...p} /> },
     ],
   },
   {

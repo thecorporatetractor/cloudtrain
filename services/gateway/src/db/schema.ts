@@ -188,6 +188,45 @@ export interface AnswerSubmissionsTable {
   submitted_at: DefaultedTime;
 }
 
+export interface CtfEventsTable {
+  id: Generated<string>;
+  org_id: string;
+  title: string;
+  description: string | null;
+  lab_ids: string[];
+  starts_at: Timestamp;
+  ends_at: Timestamp;
+  mode: 'solo' | 'team';
+  team_size_max: Generated<number>;
+  team_formation: Generated<'self' | 'manager'>;
+  scoring: 'static' | 'dynamic';
+  dynamic_min_pct: Generated<number>;
+  dynamic_decay: Generated<number>;
+  first_blood: Generated<boolean>;
+  freeze_minutes: Generated<number>;
+  published: Generated<boolean>;
+  created_by: string | null;
+  created_at: CreatedAt;
+  updated_at: DefaultedTime;
+}
+
+export interface CtfEventTeamsTable {
+  id: Generated<string>;
+  org_id: string;
+  event_id: string;
+  name: string;
+  created_by: string | null;
+  created_at: CreatedAt;
+}
+
+export interface CtfEventParticipantsTable {
+  org_id: string;
+  event_id: string;
+  user_id: string;
+  team_id: string | null;
+  joined_at: DefaultedTime;
+}
+
 export interface AnswerHintRevealsTable {
   org_id: string;
   scope_key: string;
@@ -423,7 +462,12 @@ export interface DB {
   learner_goals: LearnerGoalsTable;
   answer_submissions: AnswerSubmissionsTable;
   answer_hint_reveals: AnswerHintRevealsTable;
+  ctf_events: CtfEventsTable;
+  ctf_event_teams: CtfEventTeamsTable;
+  ctf_event_participants: CtfEventParticipantsTable;
 }
+
+export type CtfEventRow = Selectable<CtfEventsTable>;
 
 export type OrgRow = Selectable<OrgsTable>;
 export type UserRow = Selectable<UsersTable>;
