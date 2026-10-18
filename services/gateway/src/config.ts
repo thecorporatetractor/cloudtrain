@@ -4,14 +4,33 @@ import { fileURLToPath } from 'node:url';
 /** Repository root, resolved from this file (src/ or dist/ under services/gateway). */
 export const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
 
+/** Sentinel for CT_KUBE_CONTEXT: use the pod's ServiceAccount instead of a kubeconfig context. */
+export const IN_CLUSTER = 'in-cluster';
+
+/** Fastify `trustProxy`: true (any hop), a hop count, or a comma-separated list of addresses/CIDRs. */
+export type TrustProxy = boolean | number | string;
+
 export interface Config {
   host: string;
   port: number;
+  /**
+   * Proxies whose X-Forwarded-* headers are trusted (CT_TRUST_PROXY): `true`, a hop
+   * count (`1` behind one Ingress/Gateway), or addresses/CIDRs. Default loopback
+   * (the Vite dev proxy).
+   */
+  trustProxy: TrustProxy;
+  /** Web origins allowed to call /api cross-origin with cookies (CT_CORS_ORIGINS, comma-separated); empty = off. */
+  corsOrigins: string[];
   /** Directory holding skills.yaml, frameworks/ and packs/. */
   contentDir: string;
   /** Extra lab directories (each containing <lab>/lab.yaml) served alongside the packs, e.g. test fixtures. */
   extraLabDirs: string[];
-  /** kubeconfig context to use. Only the in-memory KubeConfig is switched; the file is never written. */
+  /**
+   * kubeconfig context to use. Only the in-memory KubeConfig is switched; the file is
+   * never written. `in-cluster` (IN_CLUSTER) uses the pod's ServiceAccount token; it is
+   * the default when the gateway runs in a pod (KUBERNETES_SERVICE_HOST set) and
+   * CT_KUBE_CONTEXT is unset.
+   */
   kubeContext: string;
   /** Namespace for LabTemplates and LabSessions. */
   namespace: string;
@@ -56,7 +75,7 @@ export interface Config {
   examDurationMinutes?: number;
   /** CTF answers one learner may submit per minute (CT_ANSWER_RATE_PER_MINUTE, default 10). */
   answerRatePerMinute: number;
-  /** Public website configuration (CT_SITE_CONFIG, default content/site.yaml; a deployment mounts its own). */
+  /** Public website configuration (CT_SITE_CONFIG, default <CT_CONTENT_DIR>/site.yaml; a deployment mounts its own). */
   siteConfigFile: string;
   /** Requests per minute one client address may make to `/api/public/*` (CT_PUBLIC_RATE_PER_MINUTE, default 120). */
   publicRatePerMinute: number;
@@ -99,8 +118,22 @@ export function devImpersonationEnabled(env: NodeJS.ProcessEnv, publicUrl: strin
   return true;
 }
 
-/** Relative paths in settings are relative to the repository root (pnpm runs the gateway from its package dir). */
-const fromRoot = (p: string) => path.resolve(repoRoot, p);
+/**
+ * CT_TRUST_PROXY: unset = loopback only, `true`/`false`, a hop count, or a comma-separated
+ * list of addresses/CIDRs.
+ */
+export function trustProxyFrom(v: string | undefined): TrustProxy {
+  const t = (v ?? '').trim();
+  if (t === '') return '127.0.0.1';
+  if (t === 'true') return true;
+  if (t === 'false') return false;
+  if (/^\d+$/.test(t)) return Number(t);
+  return t
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .join(',');
+}
 
 function num(v: string | undefined, d: number): number {
   const n = v === undefined || v === '' ? NaN : Number(v);
@@ -116,7 +149,28 @@ function labels(v: string | undefined): Record<string, string> {
   return out;
 }
 
+/** CT_CORS_ORIGINS: comma-separated http(s) origins; anything else (paths, wildcards) is an error. */
+export function corsOriginsFrom(v: string | undefined): string[] {
+  const out: string[] = [];
+  for (const raw of (v ?? '').split(',').map((s) => s.trim()).filter(Boolean)) {
+    let u: URL;
+    try {
+      u = new URL(raw);
+    } catch {
+      throw new Error(`CT_CORS_ORIGINS: ${JSON.stringify(raw)} is not an origin (e.g. https://labs.example.com)`);
+    }
+    if ((u.protocol !== 'http:' && u.protocol !== 'https:') || u.origin !== raw.replace(/\/$/, '')) throw new Error(`CT_CORS_ORIGINS: ${JSON.stringify(raw)} is not an origin (scheme://host[:port], no path)`);
+    out.push(u.origin);
+  }
+  return out;
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
+  // Relative paths in settings are relative to CT_BASE_DIR, else the repository root
+  // (pnpm runs the gateway from its package dir). The container image sets absolute paths.
+  const base = env.CT_BASE_DIR ? path.resolve(env.CT_BASE_DIR) : repoRoot;
+  const fromRoot = (p: string) => path.resolve(base, p);
+  const contentDir = fromRoot(env.CT_CONTENT_DIR ?? 'content');
   const list = (v: string | undefined) => (v ?? '').split(path.delimiter).map((s) => s.trim()).filter(Boolean);
   const ttl = num(env.CT_SESSION_TTL_MINUTES, 0);
   const prod = env.NODE_ENV === 'production';
@@ -128,14 +182,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   return {
     host: env.CT_HOST ?? '127.0.0.1',
     port: num(env.CT_PORT, 8787),
-    contentDir: fromRoot(env.CT_CONTENT_DIR ?? 'content'),
+    trustProxy: trustProxyFrom(env.CT_TRUST_PROXY),
+    corsOrigins: corsOriginsFrom(env.CT_CORS_ORIGINS),
+    contentDir,
     extraLabDirs: list(env.CT_EXTRA_LAB_DIRS).map(fromRoot),
-    kubeContext: env.CT_KUBE_CONTEXT ?? 'kind-cloudtrain-dev',
+    kubeContext: env.CT_KUBE_CONTEXT || (env.KUBERNETES_SERVICE_HOST ? IN_CLUSTER : 'kind-cloudtrain-dev'),
     namespace: env.CT_NAMESPACE ?? 'cloudtrain-sessions',
     labctl: fromRoot(env.CT_LABCTL ?? 'services/lab-orchestrator/bin/labctl'),
     validateTimeoutMs: num(env.CT_VALIDATE_TIMEOUT_MS, 60_000),
     answerRatePerMinute: Math.max(1, num(env.CT_ANSWER_RATE_PER_MINUTE, 10)),
-    siteConfigFile: fromRoot(env.CT_SITE_CONFIG ?? 'content/site.yaml'),
+    siteConfigFile: env.CT_SITE_CONFIG ? fromRoot(env.CT_SITE_CONFIG) : path.join(contentDir, 'site.yaml'),
     publicRatePerMinute: Math.max(1, num(env.CT_PUBLIC_RATE_PER_MINUTE, 120)),
     ...(ttl > 0 ? { sessionTtlMinutes: ttl } : {}),
     logLevel: env.CT_LOG_LEVEL ?? 'info',
@@ -163,7 +219,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     platformIdps: (env.CT_PLATFORM_IDPS ?? 'azarguard-entra').split(',').map((s) => s.trim()).filter(Boolean),
     devDomainVerifyBypass: !prod && env.CT_DEV_DOMAIN_VERIFY_BYPASS === '1',
     sweepIntervalMs: num(env.CT_SWEEP_INTERVAL_MS, 60_000),
-    curriculumFile: fromRoot(env.CT_CURRICULUM_FILE ?? 'content/curriculum.yaml'),
+    curriculumFile: env.CT_CURRICULUM_FILE ? fromRoot(env.CT_CURRICULUM_FILE) : path.join(contentDir, 'curriculum.yaml'),
     extraExamFiles: list(env.CT_EXTRA_EXAM_FILES).map(fromRoot),
     examSessionLabels: labels(env.CT_EXAM_SESSION_LABELS),
     ...(num(env.CT_EXAM_DURATION_MINUTES, 0) > 0 ? { examDurationMinutes: num(env.CT_EXAM_DURATION_MINUTES, 0) } : {}),

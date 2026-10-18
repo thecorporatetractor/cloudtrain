@@ -8,6 +8,7 @@ import { useDiscover, useMockLogin } from '@/api/platform';
 import { BrandMark, useBrandName } from '@/components/brand';
 import { Button, Field, Input } from '@/components/ui';
 import { signInRoute } from '@/router';
+import { apiUrl } from '@/lib/runtimeConfig';
 
 /**
  * Identity-first sign-in. Step 1 asks for the email; the gateway's discovery
@@ -46,7 +47,7 @@ export function SignIn() {
     if (!d) return;
     setRedirecting(true);
     if (isRealApi) {
-      window.location.assign(`${d.loginUrl}${d.loginUrl.includes('?') ? '&' : '?'}returnTo=${encodeURIComponent(returnTo)}`);
+      window.location.assign(`${apiUrl(d.loginUrl)}${d.loginUrl.includes('?') ? '&' : '?'}returnTo=${encodeURIComponent(returnTo)}`);
       return;
     }
     // Mock: the IdP round-trip is simulated.
@@ -58,7 +59,7 @@ export function SignIn() {
     const d = discover.data;
     if (!d) return;
     if (isRealApi) {
-      window.location.assign(`${d.loginUrl}&returnTo=${encodeURIComponent(returnTo)}`);
+      window.location.assign(`${apiUrl(d.loginUrl)}&returnTo=${encodeURIComponent(returnTo)}`);
       return;
     }
     login.mutate({ email: d.email, password }, { onSuccess: () => void navigate({ to: returnTo as '/', replace: true }) });

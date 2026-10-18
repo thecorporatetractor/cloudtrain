@@ -1,4 +1,5 @@
 import type { IDisposable, Terminal } from '@xterm/xterm';
+import { wsUrl } from './runtimeConfig';
 
 /**
  * A real shell in the lab: xterm.js <-> WebSocket <-> services/gateway <-> exec in the
@@ -41,14 +42,13 @@ export class RemoteShell {
     if (this.disposed) return;
     const { sessionId, node, entry, url } = this.opts;
     const q = new URLSearchParams({ cols: String(this.term.cols), rows: String(this.term.rows) });
-    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
     let path: string;
     if (url) path = url(q);
     else {
       if (!entry) q.set('node', node);
       path = `/api/sessions/${encodeURIComponent(sessionId)}/terminal?${q}`;
     }
-    const ws = new WebSocket(`${proto}://${location.host}${path}`);
+    const ws = new WebSocket(wsUrl(path, location));
     ws.binaryType = 'arraybuffer';
     this.ws = ws;
     this.live = true;

@@ -1,14 +1,22 @@
 import { ApiException, CustomObjectsApi, Exec, KubeConfig, PatchStrategy, setHeaderOptions, type V1Status } from '@kubernetes/client-node';
+import { IN_CLUSTER } from '../config.js';
 import { ConflictError, type ExecHandle, type ExecStreams, type ExecTarget, type LabCluster } from './cluster.js';
 import { LABS_GROUP, LABS_VERSION, type LabSession, type LabTemplate } from './types.js';
 
 /**
  * Loads the default kubeconfig ($KUBECONFIG or ~/.kube/config) and selects
  * `context` on the in-memory copy only. The file, and with it every other
- * tool's current-context, is never modified.
+ * tool's current-context, is never modified. `in-cluster` uses the pod's
+ * ServiceAccount (token and CA under /var/run/secrets/kubernetes.io/serviceaccount,
+ * API server from KUBERNETES_SERVICE_HOST/PORT) and never reads a kubeconfig.
  */
 export function kubeConfigFor(context: string): KubeConfig {
   const kc = new KubeConfig();
+  if (context === IN_CLUSTER) {
+    if (!process.env.KUBERNETES_SERVICE_HOST) throw new Error(`CT_KUBE_CONTEXT=${IN_CLUSTER} needs to run in a pod (KUBERNETES_SERVICE_HOST is not set)`);
+    kc.loadFromCluster();
+    return kc;
+  }
   kc.loadFromDefault();
   if (!kc.getContextObject(context)) {
     const known = kc.getContexts().map((c) => c.name).join(', ');
