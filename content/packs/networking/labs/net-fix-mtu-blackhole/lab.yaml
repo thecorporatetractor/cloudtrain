@@ -108,7 +108,8 @@ spec:
         mkdir -p /var/lib/cloudtrain; echo 0 > /var/lib/cloudtrain/last-size
         setsid ncat -l -k -p 5001 --sh-exec 'wc -c > /var/lib/cloudtrain/last-size' </dev/null >/dev/null 2>&1 &
         setsid ncat -l -k -p 5002 --sh-exec 'echo small' </dev/null >/dev/null 2>&1 &
-        setsid ncat -l -k -p 5003 --sh-exec 'head -c 262144 /dev/zero' </dev/null >/dev/null 2>&1 &
+        # the trailing sleep keeps ncat from closing the socket before the last bytes are flushed
+        setsid ncat -l -k -p 5003 --sh-exec 'head -c 262144 /dev/zero; sleep 1' </dev/null >/dev/null 2>&1 &
         sleep 1
     - { on: annex-pc, run: "ip link set eth1 mtu 1400 && ip addr replace 10.{{octet}}.60.10/24 dev eth1 && ip route replace default via 10.{{octet}}.60.1" }
   checks:
@@ -136,7 +137,8 @@ spec:
       type: shell
       on: annex-pc
       command: |
-        head -c 262144 /dev/zero | timeout 15 ncat -i 6 10.{{octet}}.1.10 5001 >/dev/null 2>&1
+        # keep stdin open briefly after the data so ncat does not tear the socket down mid-flush
+        { head -c 262144 /dev/zero; sleep 2; } | timeout 15 ncat -i 6 10.{{octet}}.1.10 5001 >/dev/null 2>&1
         sleep 1
         echo requested
       expect: { match: exact, value: requested }
