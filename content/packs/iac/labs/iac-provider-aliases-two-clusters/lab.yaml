@@ -1,0 +1,274 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: iac-provider-aliases-two-clusters
+  title: Deploy to two clusters with aliased providers
+  domain: iac
+  frameworks: [tf-associate:configuration, tf-advanced:providers]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [terraform, providers, alias, multi-cluster]
+  version: 1
+spec:
+  description: |
+    Saltmarsh runs two clusters: **`sm-north-sea`** (offshore farms) and
+    **`sm-inland`** (inland farms). Both contexts are in your kubeconfig, and
+    both clusters have a namespace **`operations`**.
+
+    The stack in `~/stacks/farm-status` (initialised, nothing applied) holds
+    the farm status settings in `local.farm_status` but no provider
+    configuration and no resources yet.
+
+    1. Configure **two aliased `kubernetes` providers**, `north_sea` and
+       `inland`, each pinned to its cluster's context.
+    2. Deploy the ConfigMap **`farm-status`** with exactly the data in
+       `local.farm_status` into namespace `operations` on **both** clusters,
+       one resource per cluster, each using the right provider.
+
+    Apply; afterwards a plan reports no changes.
+  objectives:
+    - Configure several instances of one provider with alias
+    - Select a provider instance per resource with the provider argument
+  params:
+    interval: {type: int, min: 15, max: 90}
+    contact:
+      type: choice
+      values: [grid-duty, ops-oncall, control-room]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+      - name: sm-north-sea
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: sm-north-sea
+      - name: sm-inland
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: sm-inland
+  setup:
+    - on: sm-north-sea
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata:
+          name: operations
+    - on: sm-inland
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata:
+          name: operations
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/stack/versions.tf, source: assets/stack/versions.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/stack/main.tf, source: assets/stack/main.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/seed.sh, source: assets/seed.sh, mode: "0755"}
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/stacks
+    - on: workstation
+      as: learner
+      timeoutSec: 120
+      run: /var/tmp/ct-seed/seed.sh
+  teardown:
+    - on: sm-north-sea
+      run: kubectl delete namespace operations --ignore-not-found --wait=false
+    - on: sm-inland
+      run: kubectl delete namespace operations --ignore-not-found --wait=false
+  checks:
+    - id: north-sea-status
+      description: farm-status in operations on sm-north-sea holds the settings
+      type: shell
+      on: sm-north-sea
+      skills: [iac.targets.kubernetes-helm]
+      weight: 2
+      timeoutSec: 30
+      command: kubectl -n operations get configmap farm-status -o json 2>/dev/null | jq -cS '.data // {}' || echo missing
+      expect: {match: exact, value: '{"escalation_contact":"{{contact}}@saltmarsh.example","reporting_interval":"{{interval}}s","schema":"3"}'}
+    - id: inland-status
+      description: farm-status in operations on sm-inland holds the settings
+      type: shell
+      on: sm-inland
+      skills: [iac.targets.kubernetes-helm]
+      weight: 2
+      timeoutSec: 30
+      command: kubectl -n operations get configmap farm-status -o json 2>/dev/null | jq -cS '.data // {}' || echo missing
+      expect: {match: exact, value: '{"escalation_contact":"{{contact}}@saltmarsh.example","reporting_interval":"{{interval}}s","schema":"3"}'}
+    - id: aliased-providers
+      description: The configuration has kubernetes providers aliased north_sea and inland, pinned to their contexts
+      type: shell
+      on: workstation
+      skills: [iac.language.provider-config]
+      weight: 2
+      timeoutSec: 120
+      command: |
+        ct-iac planjson /home/learner/stacks/farm-status | jq -r '[.configuration.provider_config | to_entries[] | .value | select(.name == "kubernetes" and .alias != null) | "\(.alias)=\(.expressions.config_context.constant_value // "?")"] | sort | join(" ")' 2>/dev/null
+      expect: {match: exact, value: inland=sm-inland north_sea=sm-north-sea}
+    - id: one-per-provider
+      description: Each cluster's ConfigMap is a separate resource bound to its aliased provider
+      type: shell
+      on: workstation
+      skills: [iac.language.provider-config]
+      weight: 1
+      timeoutSec: 120
+      command: |
+        ct-iac planjson /home/learner/stacks/farm-status | jq -r '[.configuration.root_module.resources[]? | select(.mode == "managed" and (.type | test("^kubernetes_config_map"))) | .provider_config_key | split(".") | last] | sort | join(" ")' 2>/dev/null
+      expect: {match: exact, value: inland north_sea}
+    - id: converged
+      description: A new plan of ~/stacks/farm-status reports no changes
+      type: shell
+      on: workstation
+      skills: [iac.foundations.workflow]
+      weight: 1
+      timeoutSec: 120
+      command: ct-iac plan /home/learner/stacks/farm-status
+      expect: {match: exact, value: no-changes}
+  hints:
+    - title: Two provider blocks
+      body: |
+        ```hcl
+        provider "kubernetes" {
+          alias          = "north_sea"
+          config_path    = "~/.kube/config"
+          config_context = "sm-north-sea"
+        }
+        ```
+        and a second block for `inland`.
+      cost: 1
+    - title: Choosing the instance
+      body: A resource uses the default (unaliased) provider unless it says `provider = kubernetes.inland`. Write one ConfigMap resource per cluster.
+      cost: 1
+    - title: Which cluster did it land on?
+      body: Ask each cluster directly.
+      command: kubectl --context sm-inland -n operations get configmap farm-status -o yaml
+      cost: 1
+  misconceptions:
+    - id: same-provider-twice
+      description: Declares both aliases but points both ConfigMaps at the north_sea provider.
+      feedback: Each resource picks its provider with `provider = kubernetes.<alias>`. Both resources used north_sea, so sm-inland has no ConfigMap (and the second resource collided with the first).
+      expectFail: [inland-status, one-per-provider]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          cd ~/stacks/farm-status
+          cat > providers.tf <<'HCL'
+          provider "kubernetes" {
+            alias          = "north_sea"
+            config_path    = "~/.kube/config"
+            config_context = "sm-north-sea"
+          }
+
+          provider "kubernetes" {
+            alias          = "inland"
+            config_path    = "~/.kube/config"
+            config_context = "sm-inland"
+          }
+          HCL
+          cat > status.tf <<'HCL'
+          resource "kubernetes_config_map_v1" "north_sea" {
+            provider = kubernetes.north_sea
+            metadata {
+              name      = "farm-status"
+              namespace = "operations"
+            }
+            data = local.farm_status
+          }
+
+          resource "kubernetes_config_map_v1" "inland" {
+            provider = kubernetes.north_sea
+            metadata {
+              name      = "farm-status"
+              namespace = "operations"
+            }
+            data = local.farm_status
+          }
+          HCL
+          iac apply -auto-approve -input=false -no-color || true
+    - id: context-switching
+      description: Uses one unaliased provider and applies twice, switching the context in between.
+      feedback: A configuration must describe both clusters at once. With one provider, the second apply moves the ConfigMap rather than adding one, and the state only knows one cluster. Use two aliased providers.
+      expectFail: [aliased-providers, one-per-provider]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          cd ~/stacks/farm-status
+          cat > providers.tf <<'HCL'
+          variable "context" {
+            type    = string
+            default = "sm-north-sea"
+          }
+
+          provider "kubernetes" {
+            config_path    = "~/.kube/config"
+            config_context = var.context
+          }
+          HCL
+          cat > status.tf <<'HCL'
+          resource "kubernetes_config_map_v1" "status" {
+            metadata {
+              name      = "farm-status"
+              namespace = "operations"
+            }
+            data = local.farm_status
+          }
+          HCL
+          iac apply -auto-approve -input=false -no-color
+          iac apply -auto-approve -input=false -no-color -var context=sm-inland || true
+  solution:
+    explanation: |
+      Each `provider "kubernetes"` block with an `alias` is a separate provider
+      instance with its own context. Resources choose an instance with the
+      `provider` meta-argument, so one configuration manages a ConfigMap on each
+      cluster, and the state records which instance owns which object.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/stacks/farm-status
+          cat > providers.tf <<'HCL'
+          provider "kubernetes" {
+            alias          = "north_sea"
+            config_path    = "~/.kube/config"
+            config_context = "sm-north-sea"
+          }
+
+          provider "kubernetes" {
+            alias          = "inland"
+            config_path    = "~/.kube/config"
+            config_context = "sm-inland"
+          }
+          HCL
+          cat > status.tf <<'HCL'
+          resource "kubernetes_config_map_v1" "north_sea" {
+            provider = kubernetes.north_sea
+            metadata {
+              name      = "farm-status"
+              namespace = "operations"
+            }
+            data = local.farm_status
+          }
+
+          resource "kubernetes_config_map_v1" "inland" {
+            provider = kubernetes.inland
+            metadata {
+              name      = "farm-status"
+              namespace = "operations"
+            }
+            data = local.farm_status
+          }
+          HCL
+          iac apply -auto-approve -input=false -no-color

@@ -1,0 +1,174 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: iac-risky-change-review
+  title: Flag the dangerous changes in four saved plans
+  domain: iac
+  frameworks: [tf-professional:risky-changes]
+  difficulty: medium
+  estimatedMinutes: 15
+  tags: [terraform, plan-review, plan-json, change-review, jq]
+  version: 1
+spec:
+  description: |
+    Four merge requests are waiting for approval. Their pipelines saved each
+    plan as JSON (`terraform show -json`) in **`~/reviews/mr-<n>.plan.json`**.
+    Saltmarsh's review rule: a human must sign off every change that
+    **destroys or replaces a stateful resource**. Stateful types are:
+
+    `aws_db_instance`, `aws_dynamodb_table`, `aws_ebs_volume`, `aws_s3_bucket`,
+    `kubernetes_persistent_volume_claim_v1`, `kubernetes_stateful_set_v1`
+
+    Write **`~/reviews/review.json`** listing exactly those changes, across all
+    four plans:
+
+    ```json
+    {"findings": [
+      {"plan": "mr-412", "address": "<resource address>", "action": "delete"}
+    ]}
+    ```
+
+    - `plan` is the file name without `.plan.json`;
+    - `address` is the full resource address as the plan records it (module
+      path and instance key included);
+    - `action` is **`delete`** for a plain destroy and **`replace`** for any
+      destroy-and-create (either order).
+
+    Data sources, in-place updates, creates, no-ops and resources that are only
+    removed from state (`forget`) are not findings. Order does not matter.
+  objectives:
+    - Read resource changes from a plan's JSON representation
+    - Tell destroys and replacements apart from updates and forgets
+    - Produce a machine-readable review of risky changes
+  params:
+    farm:
+      type: choice
+      values: [gullhaven, redmoor, skerrow]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+  setup:
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/reviews
+    - on: workstation
+      file: {path: /home/learner/reviews/mr-412.plan.json, source: assets/mr-412.plan.json, mode: "0644"}
+    - on: workstation
+      file: {path: /home/learner/reviews/mr-415.plan.json, source: assets/mr-415.plan.json, mode: "0644"}
+    - on: workstation
+      file: {path: /home/learner/reviews/mr-418.plan.json, source: assets/mr-418.plan.json, mode: "0644"}
+    - on: workstation
+      file: {path: /home/learner/reviews/mr-421.plan.json, source: assets/mr-421.plan.json, mode: "0644"}
+  checks:
+    - id: review-file
+      description: ~/reviews/review.json is valid JSON with a findings list
+      type: shell
+      on: workstation
+      skills: [iac.collaboration.change-review]
+      weight: 0.5
+      command: jq -e '.findings | type == "array"' /home/learner/reviews/review.json >/dev/null 2>&1 && echo valid || echo invalid
+      expect: {match: exact, value: valid}
+    - id: all-found
+      description: Every destroy or replacement of a stateful resource is listed with the right action
+      type: shell
+      on: workstation
+      skills: [iac.collaboration.change-review]
+      weight: 3
+      command: |
+        jq -r '
+          ["mr-412|module.archive[\"{{farm}}\"].aws_s3_bucket.this|replace",
+           "mr-415|kubernetes_persistent_volume_claim_v1.historian|replace",
+           "mr-418|aws_db_instance.trading_replica|delete",
+           "mr-421|kubernetes_stateful_set_v1.scada_buffer[\"{{farm}}\"]|delete",
+           "mr-421|aws_ebs_volume.scratch[0]|replace"] as $want
+          | [.findings[]? | "\(.plan)|\(.address)|\(.action)"] as $got
+          | "found=\([$want[] | select(. as $w | $got | index($w))] | length)/5"' /home/learner/reviews/review.json 2>/dev/null || echo found=0/5
+      expect: {match: exact, value: found=5/5}
+    - id: no-false-alarms
+      description: Nothing else is listed (no updates, creates, forgets, data sources or stateless resources)
+      type: shell
+      on: workstation
+      skills: [iac.collaboration.change-review]
+      weight: 2
+      command: |
+        jq -r '
+          ["mr-412|module.archive[\"{{farm}}\"].aws_s3_bucket.this",
+           "mr-415|kubernetes_persistent_volume_claim_v1.historian",
+           "mr-418|aws_db_instance.trading_replica",
+           "mr-421|kubernetes_stateful_set_v1.scada_buffer[\"{{farm}}\"]",
+           "mr-421|aws_ebs_volume.scratch[0]"] as $want
+          | [.findings[]? | "\(.plan)|\(.address)" | select(. as $g | $want | index($g) | not)] | unique
+          | "extra=\(length)\(if length > 0 then " " + join(",") else "" end)"' /home/learner/reviews/review.json 2>/dev/null || echo extra=unreadable
+      expect: {match: exact, value: extra=0}
+  hints:
+    - title: Where the actions are
+      body: Each entry of `resource_changes` has `address`, `type`, `mode` and `change.actions`. A replacement shows two actions, `["delete","create"]` or `["create","delete"]`.
+      command: jq -r '.resource_changes[] | "\(.change.actions | join(",")) \(.address)"' ~/reviews/mr-412.plan.json
+      cost: 1
+    - title: Filter, then shape
+      body: |
+        Select managed resources of the stateful types whose actions contain
+        `"delete"`, then map them to `{plan, address, action}`. `jq -s` can merge
+        the per-file results into one list.
+      cost: 2
+  misconceptions:
+    - id: deletes-only
+      description: Lists only plain deletes and misses replacements.
+      feedback: A replacement destroys the object too; for a bucket or a volume claim the data goes with it. Count ["delete","create"] and ["create","delete"] as replace.
+      expectFail: [all-found]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          cd ~/reviews
+          s='["aws_db_instance","aws_dynamodb_table","aws_ebs_volume","aws_s3_bucket","kubernetes_persistent_volume_claim_v1","kubernetes_stateful_set_v1"]'
+          for f in mr-*.plan.json; do
+            jq --arg p "${f%.plan.json}" --argjson s "$s" '[.resource_changes[] | select(.mode == "managed" and (.type as $t | $s | index($t)) and .change.actions == ["delete"]) | {plan: $p, address, action: "delete"}]' "$f"
+          done | jq -s '{findings: add}' > review.json
+    - id: every-destroy
+      description: Lists every destroy or replacement, stateful or not.
+      feedback: Replacing a Deployment, an instance or a parameter group loses no data. The rule is about stateful types; flag only those.
+      expectFail: [no-false-alarms]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          cd ~/reviews
+          for f in mr-*.plan.json; do
+            jq --arg p "${f%.plan.json}" '[.resource_changes[] | select(.mode == "managed" and (.change.actions | index("delete"))) | {plan: $p, address, action: (if .change.actions == ["delete"] then "delete" else "replace" end)}]' "$f"
+          done | jq -s '{findings: add}' > review.json
+    - id: forget-is-destroy
+      description: Treats a removed-from-state resource (forget) as a destroy.
+      feedback: forget only drops the object from state (a removed block with destroy = false); the table stays. It needs no destroy sign-off.
+      expectFail: [no-false-alarms]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          cd ~/reviews
+          s='["aws_db_instance","aws_dynamodb_table","aws_ebs_volume","aws_s3_bucket","kubernetes_persistent_volume_claim_v1","kubernetes_stateful_set_v1"]'
+          for f in mr-*.plan.json; do
+            jq --arg p "${f%.plan.json}" --argjson s "$s" '[.resource_changes[] | select(.mode == "managed" and (.type as $t | $s | index($t)) and ((.change.actions | index("delete")) or (.change.actions | index("forget")))) | {plan: $p, address, action: (if .change.actions == ["delete"] or .change.actions == ["forget"] then "delete" else "replace" end)}]' "$f"
+          done | jq -s '{findings: add}' > review.json
+  solution:
+    explanation: |
+      In plan JSON every planned change is a `resource_changes` entry. Destroys
+      contain the action `delete`: alone for a destroy, together with `create` for a
+      replacement (create first when create_before_destroy is set). Filtering on
+      managed resources of the stateful types and on `delete` gives exactly the
+      changes that lose data; `update`, `create`, `no-op`, `read` (data sources)
+      and `forget` (removed from state only) do not.
+    steps:
+      - on: workstation
+        as: learner
+        run: |
+          set -e
+          cd ~/reviews
+          s='["aws_db_instance","aws_dynamodb_table","aws_ebs_volume","aws_s3_bucket","kubernetes_persistent_volume_claim_v1","kubernetes_stateful_set_v1"]'
+          for f in mr-*.plan.json; do
+            jq --arg p "${f%.plan.json}" --argjson s "$s" '[.resource_changes[] | select(.mode == "managed" and (.type as $t | $s | index($t)) and (.change.actions | index("delete"))) | {plan: $p, address, action: (if .change.actions == ["delete"] then "delete" else "replace" end)}]' "$f"
+          done | jq -s '{findings: add}' > review.json
+          cat review.json

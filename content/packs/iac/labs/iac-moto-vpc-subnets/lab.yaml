@@ -1,0 +1,188 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: iac-moto-vpc-subnets
+  title: Carve a VPC into zone subnets with cidrsubnet
+  domain: iac
+  frameworks: [tf-associate:configuration, tf-advanced:dynamic-config]
+  difficulty: medium
+  estimatedMinutes: 25
+  tags: [terraform, aws-shaped, cidrsubnet, for_each, networking]
+  version: 1
+spec:
+  description: |
+    The trading desk needs its own network on Saltmarsh's **AWS-shaped
+    endpoint** (`http://moto:5000`, a Moto server: it emulates the API shape
+    of the real cloud, not its behaviour, and costs nothing). The stack in
+    `~/stacks/trading-network` has the provider block and two variables,
+    `vpc_cidr` (`10.40.0.0/16`) and `zones` (a list of availability zones).
+
+    Write the configuration:
+
+    1. a VPC with range `var.vpc_cidr`, tagged `Name = "trading"`;
+    2. **one private /20 subnet per zone** in `var.zones`: the first zone
+       gets the first /20 of the VPC, the second zone the next one, and so
+       on. **Compute the ranges with `cidrsubnet`**, do not write them out;
+    3. tag each subnet `zone = <its zone>` (and a `Name` of your choice).
+
+    Apply. Adding a zone to the list later must add exactly one subnet and
+    change nothing else, and a plan afterwards reports no changes.
+  objectives:
+    - Compute subnet ranges with cidrsubnet
+    - Create one resource per list element with for_each and stable keys
+    - Provision against an AWS-shaped API from an offline workstation
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+      - name: moto
+        driver: container
+        image: moto:5
+  setup:
+    - on: moto
+      file: {path: /root/ct-mvs-net.py, source: assets/moto-net.py, mode: "0600"}
+    - on: moto
+      timeoutSec: 120
+      run: for i in $(seq 1 60); do curl -s -o /dev/null http://localhost:5000/ && break; sleep 2; done
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/iac-moto-vpc-subnets/stack/providers.tf, source: assets/stack/providers.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/iac-moto-vpc-subnets/stack/variables.tf, source: assets/stack/variables.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/iac-moto-vpc-subnets/stack/main.tf, source: assets/stack/main.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/iac-moto-vpc-subnets/seed.sh, source: assets/seed.sh, mode: "0755"}
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/stacks
+    - on: workstation
+      as: learner
+      timeoutSec: 180
+      run: /var/tmp/ct-seed/iac-moto-vpc-subnets/seed.sh
+  checks:
+    - id: network
+      description: The trading VPC has one /20 per zone, in list order, each tagged with its zone
+      type: shell
+      on: moto
+      skills: [iac.targets.aws-api, iac.language.functions]
+      weight: 3
+      timeoutSec: 60
+      command: python3 /root/ct-mvs-net.py
+      expect: {match: exact, value: "vpc=1 10.40.0.0/20:eu-west-2a:eu-west-2a 10.40.16.0/20:eu-west-2b:eu-west-2b 10.40.32.0/20:eu-west-2c:eu-west-2c"}
+    - id: computed
+      description: The subnet ranges are computed with cidrsubnet, not written out
+      type: shell
+      on: workstation
+      skills: [iac.language.functions]
+      weight: 2
+      command: |
+        c=$(cat /home/learner/stacks/trading-network/*.tf 2>/dev/null | sed 's/#.*//')
+        f=$(printf '%s\n' "$c" | grep -c 'cidrsubnet(')
+        l=$(printf '%s\n' "$c" | grep -cE '"10\.40\.(0|16|32)\.0/20"')
+        echo "cidrsubnet=$([ "$f" -ge 1 ] && echo yes || echo no) literals=$l"
+      expect: {match: exact, value: cidrsubnet=yes literals=0}
+    - id: follows-list
+      description: Adding a fourth zone plans exactly one new subnet (10.40.48.0/20) and nothing else
+      type: shell
+      on: workstation
+      skills: [iac.language.functions]
+      weight: 2
+      timeoutSec: 150
+      command: |
+        ct-iac planjson /home/learner/stacks/trading-network -var 'zones=["eu-west-2a","eu-west-2b","eu-west-2c","eu-west-2d"]' | jq -r '[.resource_changes[]? | select(.change.actions != ["no-op"] and .change.actions != ["read"]) | "\(.type):\(.change.actions | join("+")):\(.change.after.cidr_block // "-")"] | join(" ")' 2>/dev/null
+      expect: {match: exact, value: "aws_subnet:create:10.40.48.0/20"}
+    - id: converged
+      description: A new plan of ~/stacks/trading-network reports no changes
+      type: shell
+      on: workstation
+      skills: [iac.foundations.workflow]
+      weight: 1
+      timeoutSec: 150
+      command: ct-iac plan /home/learner/stacks/trading-network
+      expect: {match: exact, value: no-changes}
+  hints:
+    - title: cidrsubnet
+      body: '`cidrsubnet("10.40.0.0/16", 4, 2)` adds 4 bits to the prefix (/16 -> /20) and returns the third /20: `10.40.32.0/20`. Try it in `terraform console`.'
+      command: echo 'cidrsubnet("10.40.0.0/16", 4, 2)' | terraform console
+      cost: 1
+    - title: Index and key at once
+      body: '`for_each = { for i, z in var.zones : z => i }` keys each subnet by its zone and gives you its position as `each.value` for the netnum.'
+      cost: 2
+  misconceptions:
+    - id: hard-coded
+      description: Writes the three subnets out with literal ranges.
+      feedback: Literal ranges have to be recalculated by hand for every new zone or a different VPC range, and a new zone in the list creates nothing. Compute them with cidrsubnet over var.zones.
+      expectFail: [computed, follows-list]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 400
+        run: |
+          cd ~/stacks/trading-network
+          printf 'resource "aws_vpc" "trading" {\n  cidr_block = var.vpc_cidr\n  tags       = { Name = "trading" }\n}\n' >> main.tf
+          n=0
+          for z in a b c; do
+            printf '\nresource "aws_subnet" "%s" {\n  vpc_id            = aws_vpc.trading.id\n  availability_zone = "eu-west-2%s"\n  cidr_block        = "10.40.%s.0/20"\n  tags              = { zone = "eu-west-2%s" }\n}\n' $z $z $n $z >> main.tf
+            n=$((n+16))
+          done
+          iac apply -auto-approve -input=false -no-color
+    - id: wrong-newbits
+      description: Uses 8 new bits, which yields /24 subnets.
+      feedback: newbits is the number of bits added to the VPC prefix. From /16 to /20 is 4 bits; 8 bits gives /24.
+      expectFail: [network, follows-list]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 400
+        run: |
+          cd ~/stacks/trading-network
+          cat >> main.tf <<'HCL'
+          resource "aws_vpc" "trading" {
+            cidr_block = var.vpc_cidr
+            tags       = { Name = "trading" }
+          }
+
+          resource "aws_subnet" "private" {
+            for_each          = { for i, z in var.zones : z => i }
+            vpc_id            = aws_vpc.trading.id
+            availability_zone = each.key
+            cidr_block        = cidrsubnet(var.vpc_cidr, 8, each.value)
+            tags              = { zone = each.key }
+          }
+          HCL
+          iac apply -auto-approve -input=false -no-color
+  solution:
+    explanation: |
+      cidrsubnet(prefix, newbits, netnum) carves the VPC range: 4 new bits turn
+      the /16 into /20s, and the zone's position in the list is the netnum. A
+      for_each keyed by zone keeps each subnet at a stable address, so adding a
+      zone adds one subnet. The endpoint is a Moto server: it accepts the same
+      API calls as the cloud service but does not enforce its behaviour.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 400
+        run: |
+          set -e
+          cd ~/stacks/trading-network
+          cat >> main.tf <<'HCL'
+          resource "aws_vpc" "trading" {
+            cidr_block = var.vpc_cidr
+            tags       = { Name = "trading" }
+          }
+
+          resource "aws_subnet" "private" {
+            for_each          = { for i, z in var.zones : z => i }
+            vpc_id            = aws_vpc.trading.id
+            availability_zone = each.key
+            cidr_block        = cidrsubnet(var.vpc_cidr, 4, each.value)
+            tags              = { Name = "trading-private-${each.key}", zone = each.key }
+          }
+
+          output "subnet_ids" {
+            value = { for z, s in aws_subnet.private : z => s.id }
+          }
+          HCL
+          iac apply -auto-approve -input=false -no-color

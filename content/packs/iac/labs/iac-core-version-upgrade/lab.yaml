@@ -1,0 +1,223 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: iac-core-version-upgrade
+  title: Upgrade the trading stacks to the current core release
+  domain: iac
+  frameworks: [tf-professional:upgrades]
+  difficulty: hard
+  estimatedMinutes: 35
+  tags: [terraform, upgrades, required-version, s3-backend, state-locking, lock-file, terraform-only]
+  version: 1
+spec:
+  description: |
+    The trading desk's four root modules in `~/trading/` (`pricing`, `risk`,
+    `settlement`, `reporting`) were last run with **Terraform 1.9**
+    (`terraform-1.9` is still on the workstation). Their state lives in the
+    workstation's S3 store (bucket `sm-trading-tfstate`) and is locked through
+    a **DynamoDB table** on the AWS-shaped endpoint. Move all four to the
+    workstation's Terraform 1.15 (`terraform`):
+
+    1. require the **1.15** release line (`required_version`), so that 1.9 can
+       no longer run them;
+    2. replace the deprecated **DynamoDB locking** with **S3 lock files**
+       (`use_lockfile`) and drop the DynamoDB endpoint;
+    3. move the random provider to the 1.15 baseline **`~> 3.9.0`** and
+       refresh each **lock file**;
+    4. leave no deprecation warning in `init` or `plan`.
+
+    The resources must not change: every stack's plan is empty at the end,
+    and the services keep their names.
+  objectives:
+    - Raise the core version constraint across several root modules
+    - Migrate state locking from DynamoDB to S3 lock files
+    - Refresh dependency lock files after an upgrade
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+      - name: moto
+        driver: container
+        image: moto:5
+  setup:
+    - on: moto
+      file: {path: /root/ct-cvu-table.py, source: assets/moto-table.py, mode: "0600"}
+    - on: moto
+      timeoutSec: 120
+      run: |
+        for i in $(seq 1 60); do curl -s -o /dev/null http://localhost:5000/ && break; sleep 2; done
+        python3 /root/ct-cvu-table.py
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/iac-core-version-upgrade/stacks/pricing.tf, source: assets/stacks/pricing.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/iac-core-version-upgrade/stacks/risk.tf, source: assets/stacks/risk.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/iac-core-version-upgrade/stacks/settlement.tf, source: assets/stacks/settlement.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/iac-core-version-upgrade/stacks/reporting.tf, source: assets/stacks/reporting.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/iac-core-version-upgrade/seed.sh, source: assets/seed.sh, mode: "0755"}
+    - on: workstation
+      as: learner
+      timeoutSec: 600
+      run: /var/tmp/ct-seed/iac-core-version-upgrade/seed.sh
+  checks:
+    - id: core-constraint
+      description: All four stacks plan under 1.15 and are refused by Terraform 1.9
+      type: shell
+      on: workstation
+      skills: [iac.operations.upgrades]
+      weight: 2
+      timeoutSec: 240
+      command: |
+        for st in pricing risk settlement reporting; do
+          d=/home/learner/trading/$st
+          t=$(runuser -u learner -- mktemp -d /tmp/ct-cvu.XXXXXX); runuser -u learner -- cp $d/*.tf "$t/" 2>/dev/null
+          old=$(ct-iac run "$t" terraform-1.9 init -backend=false -input=false -no-color 2>&1 | grep -q 'Unsupported Terraform Core version' && echo refused || echo accepted)
+          rm -rf "$t"
+          printf '%s=%s ' $st $old
+        done
+      expect: {match: exact, value: "pricing=refused risk=refused settlement=refused reporting=refused "}
+    - id: lockfile-backend
+      description: Every stack uses S3 lock files and no DynamoDB table or endpoint
+      type: shell
+      on: workstation
+      skills: [iac.state.locking]
+      weight: 2
+      command: |
+        for st in pricing risk settlement reporting; do
+          jq -r --arg st $st '.backend.config as $c | "\($st)=lockfile:\($c.use_lockfile // false),dynamodb:\(if ($c.dynamodb_table // "") != "" or ($c.endpoints.dynamodb // "") != "" then "yes" else "no" end)"' /home/learner/trading/$st/.terraform/terraform.tfstate 2>/dev/null || printf '%s=uninitialised' $st
+          printf ' '
+        done | tr '\n' ' ' | tr -s ' '
+      expect: {match: exact, value: "pricing=lockfile:true,dynamodb:no risk=lockfile:true,dynamodb:no settlement=lockfile:true,dynamodb:no reporting=lockfile:true,dynamodb:no "}
+    - id: lock-files
+      description: Every lock file records random 3.9.1 under ~> 3.9.0
+      type: shell
+      on: workstation
+      skills: [iac.operations.upgrades]
+      weight: 1.5
+      command: |
+        for st in pricing risk settlement reporting; do
+          f=/home/learner/trading/$st/.terraform.lock.hcl
+          v=$(awk '/provider ".*\/hashicorp\/random"/{p=1} p && /version *=/{gsub(/[" ]/,""); sub("version=",""); print; exit}' $f 2>/dev/null)
+          c=$(awk '/provider ".*\/hashicorp\/random"/{p=1} p && /constraints *=/{gsub(/"/,""); sub(/.*= */,""); print; exit}' $f 2>/dev/null)
+          printf '%s=%s(%s) ' $st "${v:-none}" "${c:-none}"
+        done
+      expect: {match: exact, value: "pricing=3.9.1(~> 3.9.0) risk=3.9.1(~> 3.9.0) settlement=3.9.1(~> 3.9.0) reporting=3.9.1(~> 3.9.0) "}
+    - id: no-deprecations
+      description: init and plan print no deprecation warning in any stack
+      type: shell
+      on: workstation
+      skills: [iac.operations.upgrades]
+      weight: 1.5
+      timeoutSec: 300
+      command: |
+        n=0
+        for st in pricing risk settlement reporting; do
+          t=$(runuser -u learner -- mktemp -d /tmp/ct-cvu.XXXXXX); runuser -u learner -- cp -a /home/learner/trading/$st/. "$t/"
+          c=$(ct-iac run "$t" sh -c 'iac init -input=false -no-color 2>&1; iac plan -lock=false -input=false -no-color 2>&1' | grep -ciE 'deprecated')
+          n=$((n + c)); rm -rf "$t"
+        done
+        echo "deprecations=$n"
+      expect: {match: exact, value: deprecations=0}
+    - id: unchanged
+      description: Every stack plans with no changes and keeps its service name
+      type: shell
+      on: workstation
+      skills: [iac.operations.upgrades]
+      weight: 2
+      timeoutSec: 400
+      command: |
+        for st in pricing risk settlement reporting; do
+          p=$(ct-iac plan /home/learner/trading/$st)
+          s=$(ct-iac state /home/learner/trading/$st | jq -r '.values.outputs.service.value // "none"' 2>/dev/null)
+          [ "$s" = "$(cat /home/learner/.cache/ct-cvu/$st 2>/dev/null)" ] && k=kept || k=changed
+          printf '%s=%s,%s ' $st $p $k
+        done
+      expect: {match: exact, value: "pricing=no-changes,kept risk=no-changes,kept settlement=no-changes,kept reporting=no-changes,kept "}
+  hints:
+    - title: One stack first
+      body: Do pricing end to end, check its plan, then repeat the same edits for the other three. `terraform init` must run again after a backend or constraint change.
+      cost: 1
+    - title: Locking without DynamoDB
+      body: Since 1.11 the S3 backend can lock with a lock file next to the state (`use_lockfile = true`); `dynamodb_table` is deprecated. Remove it and the `dynamodb` endpoint, add `use_lockfile`, and run `terraform init -reconfigure` (the state stays where it is).
+      cost: 1
+    - title: Refreshing the lock file
+      body: After raising the provider constraint, `terraform init -upgrade` picks the newest allowed version from the mirror and rewrites `.terraform.lock.hcl`.
+      cost: 1
+  misconceptions:
+    - id: keep-dynamodb
+      description: Raises the versions but keeps the DynamoDB lock table.
+      feedback: dynamodb_table still works in 1.15 but is deprecated and will go; the backend prints a warning on every init. Switch to use_lockfile and drop the DynamoDB settings.
+      expectFail: [lockfile-backend, no-deprecations]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 900
+        run: |
+          set -e
+          for st in pricing risk settlement reporting; do
+            cd ~/trading/$st
+            python3 - <<'PY'
+          import re
+          p = "main.tf"; s = open(p).read()
+          s = s.replace('required_version = "~> 1.9.0"', 'required_version = "~> 1.15.0"')
+          s = s.replace('version = "~> 3.7.0"', 'version = "~> 3.9.0"')
+          open(p, "w").write(s)
+          PY
+            iac init -reconfigure -upgrade -input=false -no-color
+            iac apply -refresh-only -auto-approve -input=false -no-color
+          done
+    - id: stale-lock-file
+      description: Raises the core version and fixes the backend but keeps the old provider constraint and lock file.
+      feedback: The lock file still pins random 3.7.2. Raise the constraint to ~> 3.9.0 and run init -upgrade so the lock file records 3.9.1.
+      expectFail: [lock-files]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 900
+        run: |
+          set -e
+          for st in pricing risk settlement reporting; do
+            cd ~/trading/$st
+            python3 - <<'PY'
+          import re
+          p = "main.tf"; s = open(p).read()
+          s = s.replace('required_version = "~> 1.9.0"', 'required_version = "~> 1.15.0"')
+          s = re.sub(r'\n\s*dynamodb_table\s*=\s*"[^"]+"', '\n    use_lockfile                = true', s)
+          s = s.replace(', dynamodb = "http://moto:5000"', '')
+          open(p, "w").write(s)
+          PY
+            iac init -reconfigure -input=false -no-color
+            iac apply -refresh-only -auto-approve -input=false -no-color
+          done
+  solution:
+    explanation: |
+      required_version = "~> 1.15.0" makes 1.9 refuse the stacks. The S3 backend's
+      native lock file (use_lockfile, GA since 1.11) replaces the DynamoDB table;
+      init -reconfigure re-initialises the backend in place because bucket and key
+      do not change. Raising the random constraint and init -upgrade refresh the
+      lock file. Nothing in the resources changes, so every plan is empty.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 900
+        run: |
+          set -e
+          for st in pricing risk settlement reporting; do
+            cd ~/trading/$st
+            python3 - <<'PY'
+          import re
+          p = "main.tf"; s = open(p).read()
+          s = s.replace('required_version = "~> 1.9.0"', 'required_version = "~> 1.15.0"')
+          s = s.replace('version = "~> 3.7.0"', 'version = "~> 3.9.0"')
+          s = re.sub(r'\n\s*dynamodb_table\s*=\s*"[^"]+"', '\n    use_lockfile                = true', s)
+          s = s.replace(', dynamodb = "http://moto:5000"', '')
+          open(p, "w").write(s)
+          PY
+            iac init -reconfigure -upgrade -input=false -no-color
+            iac apply -refresh-only -auto-approve -input=false -no-color
+          done

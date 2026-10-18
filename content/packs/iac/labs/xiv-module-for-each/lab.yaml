@@ -1,0 +1,210 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xiv-module-for-each
+  title: Instantiate a module per farm
+  domain: iac
+  frameworks: [tf-advanced:modules]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [exam, terraform, modules, for_each, moved]
+  version: 1
+spec:
+  description: |
+    **Directory:** `~/exam/fleet-agents` · **Cluster:** `sm-grid`
+
+    The stack (applied) calls the local module `modules/farm-base` three times
+    with copy-pasted blocks, one per farm. Replace them with **one module call
+    using `for_each`** over a map keyed by farm name (`gullhaven`, `redmoor`,
+    `skerrow`) that carries each farm's turbine count, so the instances are
+    `module.farm["<name>"]`.
+
+    No object may be destroyed or recreated: the existing ConfigMaps and
+    ServiceAccounts in namespace `fleet-agents` must stay the same objects.
+    Keep the `agents` output (a list of the three ServiceAccount names, any
+    order). Apply; the following plan must be empty.
+  objectives:
+    - Replace repeated module calls with module for_each
+    - Move module instances in state with moved blocks
+  params:
+    gt: {type: int, min: 30, max: 60}
+    rt: {type: int, min: 20, max: 45}
+    st: {type: int, min: 12, max: 28}
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+      - name: sm-grid
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: sm-grid
+  setup:
+    - on: sm-grid
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata:
+          name: fleet-agents
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xiv-module-for-each/stack/providers.tf, source: assets/stack/providers.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xiv-module-for-each/stack/main.tf, source: assets/stack/main.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xiv-module-for-each/stack/modules/farm-base/main.tf, source: assets/stack/modules/farm-base/main.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xiv-module-for-each/seed.sh, source: assets/seed.sh, mode: "0755"}
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/exam
+    - on: workstation
+      as: learner
+      timeoutSec: 240
+      run: /var/tmp/ct-seed/xiv-module-for-each/seed.sh xiv-module-for-each fleet-agents apply
+    - on: sm-grid
+      run: |
+        set -eu
+        kubectl -n kube-system get configmap ct-xiv-mfe >/dev/null 2>&1 && exit 0
+        args=""
+        for f in gullhaven redmoor skerrow; do
+          args="$args --from-literal=cm-$f=$(kubectl -n fleet-agents get configmap farm-$f -o jsonpath='{.metadata.uid}')"
+          args="$args --from-literal=sa-$f=$(kubectl -n fleet-agents get serviceaccount $f-agent -o jsonpath='{.metadata.uid}')"
+        done
+        kubectl -n kube-system create configmap ct-xiv-mfe $args
+  teardown:
+    - on: sm-grid
+      run: kubectl delete namespace fleet-agents --ignore-not-found --wait=false
+  checks:
+    - id: objects-kept
+      description: The six farm objects are the original ones, with their turbine counts
+      type: shell
+      on: sm-grid
+      skills: [iac.state.refactor]
+      weight: 1.5
+      timeoutSec: 30
+      command: |
+        b() { kubectl -n kube-system get configmap ct-xiv-mfe -o jsonpath="{.data.$1}"; }
+        same=0
+        for f in gullhaven redmoor skerrow; do
+          [ "$(kubectl -n fleet-agents get configmap farm-$f -o jsonpath='{.metadata.uid}' 2>/dev/null)" = "$(b cm-$f)" ] && same=$((same+1))
+          [ "$(kubectl -n fleet-agents get serviceaccount $f-agent -o jsonpath='{.metadata.uid}' 2>/dev/null)" = "$(b sa-$f)" ] && same=$((same+1))
+        done
+        t=$(for f in gullhaven redmoor skerrow; do kubectl -n fleet-agents get configmap farm-$f -o jsonpath='{.data.turbines}' 2>/dev/null; echo -n ' '; done)
+        echo "same=$same turbines=$t"
+      expect: {match: exact, value: "same=6 turbines={{gt}} {{rt}} {{st}} "}
+    - id: for-each-addresses
+      description: The state holds module.farm["gullhaven"], ["redmoor"] and ["skerrow"] only
+      type: shell
+      on: workstation
+      skills: [iac.modules.authoring]
+      weight: 3
+      timeoutSec: 60
+      command: |
+        ct-iac state /home/learner/exam/fleet-agents | jq -r '[.values.root_module.child_modules[]?.address] | sort | join(" ")' 2>/dev/null
+      expect: {match: exact, value: 'module.farm["gullhaven"] module.farm["redmoor"] module.farm["skerrow"]'}
+    - id: one-call
+      description: The root module has a single module block that uses for_each
+      type: shell
+      on: workstation
+      skills: [iac.modules.authoring]
+      weight: 2
+      command: |
+        c=$(cat /home/learner/exam/fleet-agents/*.tf 2>/dev/null)
+        m=$(printf '%s\n' "$c" | grep -cE '^[[:space:]]*module[[:space:]]+"')
+        f=$(printf '%s\n' "$c" | grep -cE '^[[:space:]]*for_each[[:space:]]*=')
+        [ "$m" = 1 ] && [ "$f" -ge 1 ] && echo yes || echo "module_blocks=$m for_each=$f"
+      expect: {match: exact, value: "yes"}
+    - id: agents-output
+      description: The agents output lists the three ServiceAccounts
+      type: shell
+      on: workstation
+      skills: [iac.modules.authoring]
+      weight: 0.5
+      timeoutSec: 60
+      command: |
+        ct-iac state /home/learner/exam/fleet-agents | jq -r '.values.outputs.agents.value // [] | [.[]] | sort | join(" ")' 2>/dev/null
+      expect: {match: exact, value: gullhaven-agent redmoor-agent skerrow-agent}
+    - id: converged
+      description: A new plan of ~/exam/fleet-agents reports no changes
+      type: shell
+      on: workstation
+      skills: [iac.foundations.workflow]
+      weight: 1
+      timeoutSec: 120
+      command: ct-iac plan /home/learner/exam/fleet-agents
+      expect: {match: exact, value: no-changes}
+  misconceptions:
+    - id: no-moved
+      description: Switches to for_each without moved blocks.
+      feedback: New instance keys are new addresses. Without moved blocks from module.gullhaven to module.farm["gullhaven"] (and so on), every object is destroyed and recreated.
+      expectFail: [objects-kept]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          cd ~/exam/fleet-agents
+          cat > main.tf <<'HCL'
+          locals {
+            farms = { gullhaven = {{gt}}, redmoor = {{rt}}, skerrow = {{st}} }
+          }
+
+          module "farm" {
+            source    = "./modules/farm-base"
+            for_each  = local.farms
+            farm      = each.key
+            turbines  = each.value
+            namespace = "fleet-agents"
+          }
+
+          output "agents" {
+            value = [for m in module.farm : m.service_account]
+          }
+          HCL
+          iac init -input=false -no-color >/dev/null
+          iac apply -auto-approve -input=false -no-color || iac apply -auto-approve -input=false -no-color || true
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/exam/fleet-agents
+          cat > main.tf <<'HCL'
+          locals {
+            farms = { gullhaven = {{gt}}, redmoor = {{rt}}, skerrow = {{st}} }
+          }
+
+          module "farm" {
+            source    = "./modules/farm-base"
+            for_each  = local.farms
+            farm      = each.key
+            turbines  = each.value
+            namespace = "fleet-agents"
+          }
+
+          moved {
+            from = module.gullhaven
+            to   = module.farm["gullhaven"]
+          }
+
+          moved {
+            from = module.redmoor
+            to   = module.farm["redmoor"]
+          }
+
+          moved {
+            from = module.skerrow
+            to   = module.farm["skerrow"]
+          }
+
+          output "agents" {
+            value = [for m in module.farm : m.service_account]
+          }
+          HCL
+          iac init -input=false -no-color >/dev/null
+          iac apply -auto-approve -input=false -no-color

@@ -1,0 +1,266 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xiv-dynamic-ingress-rules
+  title: Generate ingress rules from a service catalogue
+  domain: iac
+  frameworks: [tf-advanced:dynamic-config]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [exam, terraform, dynamic-blocks, networkpolicy]
+  version: 1
+spec:
+  description: |
+    **Directory:** `~/exam/telemetry-mesh` · **Cluster:** `sm-grid`
+
+    `var.services` (values in `terraform.tfvars`) is the telemetry service
+    catalogue: each service's port and the apps allowed to call it. For every
+    service create a NetworkPolicy **`allow-<service>`** in namespace
+    **`telemetry-mesh`** (it exists) that:
+
+    - selects the Pods labelled `app=<service>` and has policy type `Ingress`;
+    - admits, on the service's TCP port, traffic from Pods labelled
+      `app=<client>` for each client in `allowed_from`, and nothing else.
+
+    Generate the ingress rules with **`dynamic` blocks**, so that changing a
+    service's `allowed_from` list changes only that service's policy. Apply;
+    the following plan must be empty.
+  objectives:
+    - Generate nested blocks from a collection with dynamic
+    - Model allow-lists as data, not hand-written rules
+  params:
+    cport:
+      type: choice
+      values: ["4317", "4318", "55680"]
+    console:
+      type: choice
+      values: [ops-console, shift-console, watch-console]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+      - name: sm-grid
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: sm-grid
+  setup:
+    - on: sm-grid
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata:
+          name: telemetry-mesh
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xiv-dynamic-ingress-rules/stack/providers.tf, source: assets/stack/providers.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xiv-dynamic-ingress-rules/stack/variables.tf, source: assets/stack/variables.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xiv-dynamic-ingress-rules/stack/terraform.tfvars, source: assets/stack/terraform.tfvars, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xiv-dynamic-ingress-rules/stack/main.tf, source: assets/stack/main.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xiv-dynamic-ingress-rules/seed.sh, source: assets/seed.sh, mode: "0755"}
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/exam
+    - on: workstation
+      as: learner
+      timeoutSec: 120
+      run: /var/tmp/ct-seed/xiv-dynamic-ingress-rules/seed.sh xiv-dynamic-ingress-rules telemetry-mesh init
+  teardown:
+    - on: sm-grid
+      run: kubectl delete namespace telemetry-mesh --ignore-not-found --wait=false
+  checks:
+    - id: policies
+      description: allow-collector, allow-historian and allow-alerting admit exactly the catalogued clients on the service port
+      type: shell
+      on: sm-grid
+      skills: [iac.language.dynamic-blocks]
+      weight: 3
+      timeoutSec: 30
+      command: |
+        for s in collector historian alerting; do
+          kubectl -n telemetry-mesh get networkpolicy "allow-$s" -o json 2>/dev/null | jq -r --arg s "$s" '
+            "\($s)[\(.spec.podSelector.matchLabels.app // "-")|\(.spec.policyTypes | join(","))]=" +
+            ([.spec.ingress[]? as $r | $r.from[]? as $f | $r.ports[]? | "\($f.podSelector.matchLabels.app // "?"):\(.port)/\(.protocol // "TCP")"] | unique | join(","))' \
+            || echo "$s=missing"
+        done | tr '\n' ' '
+      expect: {match: exact, value: "collector[collector|Ingress]=edge-gateway:{{cport}}/TCP,ingest:{{cport}}/TCP historian[historian|Ingress]=collector:5432/TCP alerting[alerting|Ingress]=collector:9093/TCP,historian:9093/TCP,{{console}}:9093/TCP "}
+    - id: only-three
+      description: The namespace holds no other NetworkPolicies
+      type: k8s-query
+      skills: [iac.language.dynamic-blocks]
+      weight: 0.5
+      query: {cluster: sm-grid, resource: networkpolicies, namespace: telemetry-mesh, jsonpath: "{.items[*].metadata.name}"}
+      expect: {match: regex, value: '^(allow-[a-z]+ ){2}allow-[a-z]+$'}
+    - id: dynamic-used
+      description: The rules are generated with dynamic blocks
+      type: shell
+      on: workstation
+      skills: [iac.language.dynamic-blocks]
+      weight: 1
+      command: cat /home/learner/exam/telemetry-mesh/*.tf 2>/dev/null | grep -cE '^[[:space:]]*dynamic[[:space:]]+"(ingress|from)"' || true
+      expect: {match: regex, value: '^[1-9][0-9]*$'}
+    - id: data-driven
+      description: Adding a client to historian's allow-list updates only allow-historian
+      type: shell
+      on: workstation
+      skills: [iac.language.dynamic-blocks]
+      weight: 2
+      timeoutSec: 150
+      command: |
+        tmp=$(runuser -u learner -- mktemp -d /tmp/ct-xiv-dyn.XXXXXX)
+        runuser -u learner -- cp -a /home/learner/exam/telemetry-mesh/. "$tmp/"
+        printf '\nservices = {\n  collector = { port = {{cport}}, allowed_from = ["ingest", "edge-gateway"] }\n  historian = { port = 5432, allowed_from = ["collector", "reporting"] }\n  alerting = { port = 9093, allowed_from = ["collector", "historian", "{{console}}"] }\n}\n' > "$tmp/ct-more.tfvars"
+        chown learner:learner "$tmp/ct-more.tfvars"
+        ct-iac planjson "$tmp" -var-file=ct-more.tfvars | jq -r '[.resource_changes[]? | select(.change.actions != ["no-op"] and .change.actions != ["read"]) | "\(.change.actions | join("+")):\(.change.after.metadata[0].name // .change.before.metadata[0].name // "")"] | join(" ")' 2>/dev/null || echo error
+        rm -rf "$tmp"
+      expect: {match: exact, value: "update:allow-historian"}
+    - id: converged
+      description: A new plan of ~/exam/telemetry-mesh reports no changes
+      type: shell
+      on: workstation
+      skills: [iac.foundations.workflow]
+      weight: 1
+      timeoutSec: 120
+      command: ct-iac plan /home/learner/exam/telemetry-mesh
+      expect: {match: exact, value: no-changes}
+  misconceptions:
+    - id: hand-written
+      description: Writes the three policies by hand with literal rules.
+      feedback: Literal rules drift from the catalogue. Iterate over var.services with for_each and generate the ingress rules from allowed_from with a dynamic block.
+      expectFail: [dynamic-used, data-driven]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          cd ~/exam/telemetry-mesh
+          w() { # name port clients...
+            n=$1 p=$2; shift 2
+            printf 'resource "kubernetes_network_policy_v1" "%s" {\n  metadata {\n    name      = "allow-%s"\n    namespace = "telemetry-mesh"\n  }\n  spec {\n    pod_selector {\n      match_labels = { app = "%s" }\n    }\n    policy_types = ["Ingress"]\n' "$n" "$n" "$n"
+            for c in "$@"; do
+              printf '    ingress {\n      from {\n        pod_selector {\n          match_labels = { app = "%s" }\n        }\n      }\n      ports {\n        port     = "%s"\n        protocol = "TCP"\n      }\n    }\n' "$c" "$p"
+            done
+            printf '  }\n}\n'
+          }
+          { w collector {{cport}} ingest edge-gateway; w historian 5432 collector; w alerting 9093 collector historian {{console}}; } >> main.tf
+          iac apply -auto-approve -input=false -no-color
+    - id: any-port
+      description: Generates the from rules but leaves out the port.
+      feedback: Without ports, a rule admits the clients on every port. Add a ports block with the service's port to each rule.
+      expectFail: [policies]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          cd ~/exam/telemetry-mesh
+          cat >> main.tf <<'HCL'
+          resource "kubernetes_network_policy_v1" "allow" {
+            for_each = var.services
+            metadata {
+              name      = "allow-${each.key}"
+              namespace = "telemetry-mesh"
+            }
+            spec {
+              pod_selector {
+                match_labels = { app = each.key }
+              }
+              policy_types = ["Ingress"]
+              dynamic "ingress" {
+                for_each = each.value.allowed_from
+                content {
+                  from {
+                    pod_selector {
+                      match_labels = { app = ingress.value }
+                    }
+                  }
+                }
+              }
+            }
+          }
+          HCL
+          iac apply -auto-approve -input=false -no-color
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/exam/telemetry-mesh
+          cat >> main.tf <<'HCL'
+          resource "kubernetes_network_policy_v1" "allow" {
+            for_each = var.services
+            metadata {
+              name      = "allow-${each.key}"
+              namespace = "telemetry-mesh"
+            }
+            spec {
+              pod_selector {
+                match_labels = { app = each.key }
+              }
+              policy_types = ["Ingress"]
+              dynamic "ingress" {
+                for_each = each.value.allowed_from
+                content {
+                  from {
+                    pod_selector {
+                      match_labels = { app = ingress.value }
+                    }
+                  }
+                  ports {
+                    port     = tostring(each.value.port)
+                    protocol = "TCP"
+                  }
+                }
+              }
+            }
+          }
+          HCL
+          iac apply -auto-approve -input=false -no-color
+    alternatives:
+      - id: one-rule-many-from
+        description: One ingress rule per service with a dynamic from block per client.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 300
+            run: |
+              set -e
+              cd ~/exam/telemetry-mesh
+              cat >> main.tf <<'HCL'
+              resource "kubernetes_network_policy_v1" "allow" {
+                for_each = var.services
+                metadata {
+                  name      = "allow-${each.key}"
+                  namespace = "telemetry-mesh"
+                }
+                spec {
+                  pod_selector {
+                    match_labels = { app = each.key }
+                  }
+                  policy_types = ["Ingress"]
+                  ingress {
+                    dynamic "from" {
+                      for_each = each.value.allowed_from
+                      content {
+                        pod_selector {
+                          match_labels = { app = from.value }
+                        }
+                      }
+                    }
+                    ports {
+                      port     = tostring(each.value.port)
+                      protocol = "TCP"
+                    }
+                  }
+                }
+              }
+              HCL
+              iac apply -auto-approve -input=false -no-color

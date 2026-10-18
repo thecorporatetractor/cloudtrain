@@ -1,0 +1,239 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xiv-provider-major-upgrade
+  title: Complete a forced provider major upgrade
+  domain: iac
+  frameworks: [tf-advanced:providers]
+  difficulty: hard
+  estimatedMinutes: 25
+  tags: [exam, terraform, providers, upgrades, lock-file]
+  version: 1
+spec:
+  description: |
+    **Directory:** `~/exam/edge-upgrade` · **Cluster:** `sm-grid`
+
+    The edge telemetry stack (applied) still runs kubernetes provider **2.38**.
+    Move it to the **3.3** release line (constraint `~> 3.3.0`, available in the
+    offline mirror):
+
+    - the lock file must record **3.3.0**;
+    - replace the resource types 3.x deprecates with their `_v1` successors,
+      so a plan prints **no deprecation warnings**;
+    - fix whatever 3.3 now rejects in the configuration (the `on-call` label
+      stays optional: it is set only when `var.on_call` is set);
+    - namespace `telemetry-edge` and ConfigMap `edge-collector` must stay the
+      **same objects**.
+
+    Apply; the following plan must be empty.
+  objectives:
+    - Upgrade a provider across a major release with a refreshed lock file
+    - Migrate deprecated resource types without recreating objects
+  params:
+    flush: {type: int, min: 15, max: 90}
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+      - name: sm-grid
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: sm-grid
+  setup:
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xiv-provider-major-upgrade/stack/providers.tf, source: assets/stack/providers.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xiv-provider-major-upgrade/stack/main.tf, source: assets/stack/main.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xiv-provider-major-upgrade/seed.sh, source: assets/seed.sh, mode: "0755"}
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/exam
+    - on: workstation
+      as: learner
+      timeoutSec: 240
+      run: /var/tmp/ct-seed/xiv-provider-major-upgrade/seed.sh xiv-provider-major-upgrade edge-upgrade apply
+    - on: sm-grid
+      run: |
+        set -eu
+        kubectl -n kube-system get configmap ct-xiv-pmu >/dev/null 2>&1 && exit 0
+        kubectl -n kube-system create configmap ct-xiv-pmu \
+          --from-literal=ns=$(kubectl get namespace telemetry-edge -o jsonpath='{.metadata.uid}') \
+          --from-literal=cm=$(kubectl -n telemetry-edge get configmap edge-collector -o jsonpath='{.metadata.uid}')
+  teardown:
+    - on: sm-grid
+      run: kubectl delete namespace telemetry-edge --ignore-not-found --wait=false
+  checks:
+    - id: lock-3-3
+      description: The lock file pins kubernetes 3.3.0 under a ~> 3.3.0 constraint
+      type: shell
+      on: workstation
+      skills: [iac.operations.upgrades]
+      weight: 2
+      command: |
+        f=/home/learner/exam/edge-upgrade/.terraform.lock.hcl
+        v=$(awk '/provider ".*\/hashicorp\/kubernetes"/{p=1} p && /version *=/{gsub(/[" ]/,"",$0); sub("version=","",$0); print; exit}' "$f" 2>/dev/null)
+        c=$(awk '/provider ".*\/hashicorp\/kubernetes"/{p=1} p && /constraints *=/{gsub(/"/,"",$0); sub(/.*= */,"",$0); print; exit}' "$f" 2>/dev/null)
+        echo "version=${v:-none} constraints=${c:-none}"
+      expect: {match: exact, value: "version=3.3.0 constraints=~> 3.3.0"}
+    - id: v1-types
+      description: The state holds only kubernetes_namespace_v1 and kubernetes_config_map_v1
+      type: shell
+      on: workstation
+      skills: [iac.operations.upgrades]
+      weight: 3
+      timeoutSec: 60
+      command: |
+        ct-iac state /home/learner/exam/edge-upgrade | jq -r '[.values.root_module.resources[]? | select(.mode == "managed") | .type] | sort | join(" ")' 2>/dev/null
+      expect: {match: exact, value: kubernetes_config_map_v1 kubernetes_namespace_v1}
+    - id: objects-kept
+      description: The namespace and the ConfigMap are the original objects
+      type: shell
+      on: sm-grid
+      skills: [iac.operations.upgrades]
+      weight: 1.5
+      timeoutSec: 30
+      command: |
+        b() { kubectl -n kube-system get configmap ct-xiv-pmu -o jsonpath="{.data.$1}"; }
+        n=$(kubectl get namespace telemetry-edge -o jsonpath='{.metadata.uid}' 2>/dev/null)
+        c=$(kubectl -n telemetry-edge get configmap edge-collector -o jsonpath='{.metadata.uid}' 2>/dev/null)
+        f=$(kubectl -n telemetry-edge get configmap edge-collector -o jsonpath='{.data.flush_seconds}' 2>/dev/null)
+        [ -n "$n" ] && [ "$n" = "$(b ns)" ] && n=same || n=new
+        [ -n "$c" ] && [ "$c" = "$(b cm)" ] && c=same || c=new
+        echo "namespace=$n configmap=$c flush=$f"
+      expect: {match: exact, value: "namespace=same configmap=same flush={{flush}}"}
+    - id: optional-label
+      description: Setting on_call adds only the on-call label; leaving it unset plans no changes
+      type: shell
+      on: workstation
+      skills: [iac.operations.upgrades]
+      weight: 1.5
+      timeoutSec: 150
+      command: |
+        d=/home/learner/exam/edge-upgrade
+        a=$(ct-iac plan $d)
+        b=$(ct-iac planjson $d -var on_call=ines | jq -r '[.resource_changes[]? | select(.change.actions == ["update"]) | .change.after.metadata[0].labels["saltmarsh.example/on-call"] // "none"] | join(",")' 2>/dev/null)
+        echo "unset=$a set=${b:-none}"
+      expect: {match: exact, value: unset=no-changes set=ines}
+    - id: no-warnings
+      description: A plan prints no deprecation warnings
+      type: shell
+      on: workstation
+      skills: [iac.operations.upgrades]
+      weight: 1
+      timeoutSec: 120
+      command: |
+        ct-iac run /home/learner/exam/edge-upgrade iac plan -input=false -lock=false -no-color 2>&1 | grep -ciE 'deprecat' || true
+      expect: {match: exact, value: "0"}
+  misconceptions:
+    - id: rename-without-move
+      description: Renames the types to _v1 without moving state, so both objects are replaced.
+      feedback: A new resource type is a new resource. Use moved blocks (supported from kubernetes_namespace to kubernetes_namespace_v1 in 3.3) or removed plus import blocks, so the objects stay.
+      expectFail: [objects-kept]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          cd ~/exam/edge-upgrade
+          sed -i 's/~> 2.38.0/~> 3.3.0/' providers.tf
+          sed -i 's/"kubernetes_namespace" "telemetry"/"kubernetes_namespace_v1" "telemetry"/; s/"kubernetes_config_map" "collector"/"kubernetes_config_map_v1" "collector"/; s/kubernetes_namespace\.telemetry/kubernetes_namespace_v1.telemetry/' main.tf
+          python3 - <<'PY'
+          p = "main.tf"; s = open(p).read()
+          s = s.replace('''    labels = {
+                "saltmarsh.example/team"    = "grid-telemetry"
+                "saltmarsh.example/on-call" = var.on_call
+              }''', '''    labels = merge({ "saltmarsh.example/team" = "grid-telemetry" },
+                var.on_call == null ? {} : { "saltmarsh.example/on-call" = var.on_call })''')
+          open(p, "w").write(s)
+          PY
+          iac init -upgrade -input=false -no-color >/dev/null
+          iac apply -auto-approve -input=false -no-color || iac apply -auto-approve -input=false -no-color || true
+    - id: constraint-only
+      description: Raises the constraint and refreshes the lock file but keeps the deprecated types.
+      feedback: 3.x still runs the deprecated types but warns on every plan, and they are on their way out. Move each to its _v1 type.
+      expectFail: [v1-types, no-warnings]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          cd ~/exam/edge-upgrade
+          sed -i 's/~> 2.38.0/~> 3.3.0/' providers.tf
+          python3 - <<'PY'
+          p = "main.tf"; s = open(p).read()
+          s = s.replace('''    labels = {
+                "saltmarsh.example/team"    = "grid-telemetry"
+                "saltmarsh.example/on-call" = var.on_call
+              }''', '''    labels = merge({ "saltmarsh.example/team" = "grid-telemetry" },
+                var.on_call == null ? {} : { "saltmarsh.example/on-call" = var.on_call })''')
+          open(p, "w").write(s)
+          PY
+          iac init -upgrade -input=false -no-color >/dev/null
+          iac apply -auto-approve -input=false -no-color || true
+  solution:
+    explanation: |
+      Raise the constraint and run `init -upgrade` so the lock file records 3.3.0.
+      3.3 rejects null label values, so build the labels with merge() and add the
+      on-call label only when it is set. kubernetes_namespace moves to
+      kubernetes_namespace_v1 with a moved block (3.3 supports that move); the
+      ConfigMap is re-adopted under its _v1 type with removed (destroy = false)
+      plus import, which keeps the object.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/exam/edge-upgrade
+          sed -i 's/~> 2.38.0/~> 3.3.0/' providers.tf
+          cat > main.tf <<'HCL'
+          variable "on_call" {
+            description = "On-call rota label; unset outside the storm season."
+            type        = string
+            default     = null
+          }
+
+          resource "kubernetes_namespace_v1" "telemetry" {
+            metadata {
+              name = "telemetry-edge"
+              labels = merge(
+                { "saltmarsh.example/team" = "grid-telemetry" },
+                var.on_call == null ? {} : { "saltmarsh.example/on-call" = var.on_call },
+              )
+            }
+          }
+
+          moved {
+            from = kubernetes_namespace.telemetry
+            to   = kubernetes_namespace_v1.telemetry
+          }
+
+          resource "kubernetes_config_map_v1" "collector" {
+            metadata {
+              name      = "edge-collector"
+              namespace = kubernetes_namespace_v1.telemetry.metadata[0].name
+            }
+            data = {
+              flush_seconds = "{{flush}}"
+            }
+          }
+
+          removed {
+            from = kubernetes_config_map.collector
+            lifecycle {
+              destroy = false
+            }
+          }
+
+          import {
+            to = kubernetes_config_map_v1.collector
+            id = "telemetry-edge/edge-collector"
+          }
+          HCL
+          iac init -upgrade -input=false -no-color >/dev/null
+          iac apply -auto-approve -input=false -no-color

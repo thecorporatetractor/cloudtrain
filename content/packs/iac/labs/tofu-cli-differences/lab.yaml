@@ -1,0 +1,690 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: tofu-cli-differences
+  title: Run one estate under both CLIs and catalogue the differences
+  domain: iac
+  frameworks: [opentofu:provider-iteration, opentofu:enabled-exclude]
+  difficulty: easy
+  estimatedMinutes: 25
+  tags: [opentofu, provider-for-each, enabled, exclude, migration]
+  version: 1
+spec:
+  description: |
+    The inland stack in `~/stacks/inland` (applied, local state, on `sm-grid`)
+    keeps one aliased kubernetes provider per farm and switches the hub's
+    maintenance ConfigMap with a `count` toggle. Saltmarsh wants to know what
+    the OpenTofu binary on this workstation (`tofu`) would let it simplify.
+    Work on a **copy**, so the original stack stays exactly as it is:
+
+    1. Copy the stack, including its state file, to **`~/stacks/inland-tofu`**
+       (leave out `.terraform`) and initialise the copy with `tofu`.
+    2. In the copy, replace the three aliased provider blocks with **one
+       `kubernetes` provider block that uses `for_each`** over the farms
+       (`fenwick`, `larkholt`, `hub`), and the three farm-status ConfigMaps
+       with **one resource using `for_each`**, each instance on its own farm's
+       provider instance. No object may be recreated.
+    3. Replace the `count` toggle on the maintenance ConfigMap with the
+       **`enabled`** meta-argument (in its `lifecycle` block).
+    4. `terraform.tfvars` already holds Friday's dashboard upgrade, which must
+       **not** roll out today. Apply everything else with **`tofu apply
+       -exclude=...`**, so the dashboard Deployment stays on its current image
+       and is the only change left pending.
+    5. Record in **`~/reports/differences.yaml`** which binary accepts each
+       feature, Terraform 1.15 versus OpenTofu 1.11, in exactly this shape
+       (`true` or `false` for each):
+
+       ```yaml
+       provider_for_each:
+         terraform: ...
+         tofu: ...
+       lifecycle_enabled:
+         terraform: ...
+         tofu: ...
+       exclude_flag:
+         terraform: ...
+         tofu: ...
+       ```
+  objectives:
+    - Run an existing Terraform stack under OpenTofu on a copy of its state
+    - Iterate provider configurations with for_each
+    - Use the enabled meta-argument and -exclude
+    - Know which features lock a configuration to OpenTofu
+  params:
+    ft: {type: int, min: 8, max: 19}
+    lt: {type: int, min: 6, max: 15}
+    window:
+      type: choice
+      values: ["sat 02:00-04:00", "sun 01:00-03:00", "wed 22:00-23:30"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+      - name: sm-grid
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: sm-grid
+  setup:
+    - on: sm-grid
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: inland-fenwick}
+        ---
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: inland-larkholt}
+        ---
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: inland-hub}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/main.tf, source: assets/main.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/seed.sh, source: assets/seed.sh, mode: "0755"}
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/stacks
+    - on: workstation
+      as: learner
+      timeoutSec: 240
+      run: /var/tmp/ct-seed/seed.sh
+    - on: sm-grid
+      run: |
+        set -eu
+        kubectl -n kube-system get configmap ct-baseline-uids >/dev/null 2>&1 && exit 0
+        u() { kubectl -n "$1" get "$2" "$3" -o jsonpath='{.metadata.uid}'; }
+        kubectl -n kube-system create configmap ct-baseline-uids \
+          --from-literal=fenwick=$(u inland-fenwick configmap farm-status) \
+          --from-literal=larkholt=$(u inland-larkholt configmap farm-status) \
+          --from-literal=hub=$(u inland-hub configmap farm-status) \
+          --from-literal=maintenance=$(u inland-hub configmap maintenance-window) \
+          --from-literal=dashboard=$(u inland-hub deployment inland-dashboard)
+  teardown:
+    - on: sm-grid
+      run: kubectl delete namespace inland-fenwick inland-larkholt inland-hub --ignore-not-found --wait=false
+  checks:
+    - id: original-untouched
+      description: ~/stacks/inland and its state file are exactly as seeded
+      type: shell
+      on: workstation
+      skills: [iac.opentofu.provider-iteration]
+      weight: 1
+      command: |
+        d=/home/learner/stacks/inland
+        [ "$(sha256sum $d/terraform.tfstate 2>/dev/null | cut -d' ' -f1)" = "$(cat $d/.ct-seeded 2>/dev/null)" ] && s=same || s=changed
+        a=$(grep -c 'alias' $d/main.tf 2>/dev/null)
+        echo "state=$s aliases=$a"
+      expect: {match: exact, value: state=same aliases=3}
+    - id: provider-for-each
+      description: The copy's state has one ConfigMap per farm, each on its own provider instance
+      type: shell
+      on: workstation
+      skills: [iac.opentofu.provider-iteration]
+      weight: 2.5
+      command: |
+        f=/home/learner/stacks/inland-tofu/terraform.tfstate
+        jq -r '[.resources[]? | select(.mode == "managed" and .type == "kubernetes_config_map_v1") | .name as $n | .instances[] |
+          "\($n)[\(.index_key // "-")]@\(.provider | capture("\\](?<p>.*)$").p)"] | sort | join(" ")' $f 2>/dev/null || echo none
+      expect: {match: regex, value: '^farm\[fenwick\]@\.[a-z_]+\["fenwick"\] farm\[hub\]@\.[a-z_]+\["hub"\] farm\[larkholt\]@\.[a-z_]+\["larkholt"\] maintenance\[-\]@\.[a-z_]+\["hub"\]$'}
+    - id: one-provider-block
+      description: The copy has one for_each kubernetes provider block and uses enabled instead of count
+      type: shell
+      on: workstation
+      skills: [iac.opentofu.provider-iteration, iac.opentofu.enabled-exclude]
+      weight: 1
+      command: |
+        c=$(cat /home/learner/stacks/inland-tofu/*.tf 2>/dev/null | tr -s ' \t' ' ')
+        p=$(printf '%s\n' "$c" | grep -c '^ *provider "kubernetes"')
+        fe=$(printf '%s\n' "$c" | tr '\n' ' ' | grep -oE 'provider "kubernetes" \{[^}]*for_each' | wc -l)
+        en=$(printf '%s\n' "$c" | grep -cE '^ *enabled *=')
+        ct=$(printf '%s\n' "$c" | grep -cE '^ *count *=')
+        echo "provider_blocks=$p for_each=$fe enabled=$en count=$ct"
+      expect: {match: exact, value: provider_blocks=1 for_each=1 enabled=1 count=0}
+    - id: objects-kept
+      description: The farm ConfigMaps, the maintenance window and the dashboard are the original objects
+      type: shell
+      on: sm-grid
+      skills: [iac.opentofu.provider-iteration]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        b() { kubectl -n kube-system get configmap ct-baseline-uids -o jsonpath="{.data.$1}"; }
+        n=0
+        for x in fenwick:inland-fenwick:configmap:farm-status larkholt:inland-larkholt:configmap:farm-status hub:inland-hub:configmap:farm-status maintenance:inland-hub:configmap:maintenance-window dashboard:inland-hub:deployment:inland-dashboard; do
+          set -- $(echo "$x" | tr : ' ')
+          [ "$(kubectl -n $2 get $3 $4 -o jsonpath='{.metadata.uid}' 2>/dev/null)" = "$(b $1)" ] && n=$((n+1))
+        done
+        w=$(kubectl -n inland-hub get configmap maintenance-window -o jsonpath='{.data.window}' 2>/dev/null)
+        echo "kept=$n window=$w"
+      expect: {match: exact, value: "kept=5 window={{window}}"}
+    - id: dashboard-held
+      description: The dashboard still runs its current image
+      type: k8s-query
+      skills: [iac.opentofu.enabled-exclude]
+      weight: 1
+      query: {cluster: sm-grid, resource: deployment, name: inland-dashboard, namespace: inland-hub, jsonpath: "{.spec.template.spec.containers[0].image}"}
+      expect: {match: exact, value: "httpd:2.4-alpine"}
+    - id: only-dashboard-pending
+      description: A tofu plan of the copy has exactly one pending change, the dashboard image
+      type: shell
+      on: workstation
+      skills: [iac.opentofu.enabled-exclude]
+      weight: 1.5
+      timeoutSec: 150
+      command: |
+        ct-iac run /home/learner/stacks/inland-tofu sh -c 'f=$(mktemp) && tofu plan -lock=false -input=false -no-color -out="$f" >/dev/null 2>&1 && tofu show -json "$f"; rm -f "$f"' |
+          jq -r '[.resource_changes[]? | select(.change.actions != ["no-op"] and .change.actions != ["read"]) | "\(.change.actions | join("+")):\(.address)"] | join(" ")' 2>/dev/null || echo error
+      expect: {match: exact, value: "update:kubernetes_deployment_v1.dashboard"}
+    - id: differences
+      description: ~/reports/differences.yaml records which binary accepts each feature
+      type: shell
+      on: workstation
+      skills: [iac.opentofu.provider-iteration, iac.opentofu.enabled-exclude]
+      weight: 1.5
+      command: |
+        yq -o json '.' /home/learner/reports/differences.yaml 2>/dev/null | jq -r '[("provider_for_each","lifecycle_enabled","exclude_flag") as $k | "\($k)=\(.[$k].terraform):\(.[$k].tofu)"] | join(" ")' 2>/dev/null || echo unreadable
+      expect: {match: exact, value: "provider_for_each=false:true lifecycle_enabled=false:true exclude_flag=false:true"}
+  hints:
+    - title: Copy without the working directory
+      body: '`cp -a ~/stacks/inland ~/stacks/inland-tofu && rm -rf ~/stacks/inland-tofu/.terraform`, then `tofu init` in the copy. tofu reads the Terraform state file as it is.'
+      cost: 1
+    - title: Provider for_each
+      body: |
+        ```hcl
+        provider "kubernetes" {
+          alias          = "farm"
+          for_each       = local.farms
+          config_path    = "~/.kube/config"
+          config_context = each.value.context
+        }
+        ```
+        A resource then picks `provider = kubernetes.farm[each.key]`. Move each old
+        resource to its instance with a `moved` block (`kubernetes_config_map_v1.fenwick`
+        to `kubernetes_config_map_v1.farm["fenwick"]`), and keep the maintenance
+        ConfigMap on `kubernetes.farm["hub"]`.
+      cost: 2
+    - title: enabled and -exclude
+      body: '`lifecycle { enabled = var.maintenance }` replaces the count toggle (tofu moves `[0]` itself). `tofu apply -exclude=kubernetes_deployment_v1.dashboard` applies everything except that resource.'
+      cost: 1
+    - title: What Terraform accepts
+      body: Terraform 1.15 rejects for_each in provider blocks as a reserved argument, does not know enabled in lifecycle, and has no -exclude flag (only -target).
+      cost: 2
+  misconceptions:
+    - id: no-exclude
+      description: Applies the copy without -exclude, so the dashboard upgrade rolls out.
+      feedback: A plain apply takes every pending change, including Friday's dashboard image. -exclude=kubernetes_deployment_v1.dashboard leaves just that resource out.
+      expectFail: [dashboard-held, only-dashboard-pending]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          cp -a ~/stacks/inland ~/stacks/inland-tofu && rm -rf ~/stacks/inland-tofu/.terraform ~/stacks/inland-tofu/.ct-seeded
+          cat > ~/stacks/inland-tofu/main.tf <<'HCL'
+          terraform {
+            required_providers {
+              kubernetes = {
+                source  = "hashicorp/kubernetes"
+                version = "~> 3.3.0"
+              }
+            }
+          }
+
+          locals {
+            farms = {
+              fenwick  = { context = "sm-grid", turbines = "{{ft}}" }
+              larkholt = { context = "sm-grid", turbines = "{{lt}}" }
+              hub      = { context = "sm-grid", turbines = "0" }
+            }
+          }
+
+          provider "kubernetes" {
+            alias          = "farm"
+            for_each       = local.farms
+            config_path    = "~/.kube/config"
+            config_context = each.value.context
+          }
+
+          variable "maintenance" {
+            description = "Publish the maintenance-window ConfigMap on the hub."
+            type        = bool
+            default     = true
+          }
+
+          variable "dashboard_image" {
+            type = string
+          }
+
+          resource "kubernetes_config_map_v1" "farm" {
+            for_each = local.farms
+            provider = kubernetes.farm[each.key]
+            metadata {
+              name      = "farm-status"
+              namespace = "inland-${each.key}"
+            }
+            data = {
+              farm     = each.key
+              turbines = each.value.turbines
+            }
+          }
+
+          moved {
+            from = kubernetes_config_map_v1.fenwick
+            to   = kubernetes_config_map_v1.farm["fenwick"]
+          }
+
+          moved {
+            from = kubernetes_config_map_v1.larkholt
+            to   = kubernetes_config_map_v1.farm["larkholt"]
+          }
+
+          moved {
+            from = kubernetes_config_map_v1.hub
+            to   = kubernetes_config_map_v1.farm["hub"]
+          }
+
+          resource "kubernetes_config_map_v1" "maintenance" {
+            provider = kubernetes.farm["hub"]
+            metadata {
+              name      = "maintenance-window"
+              namespace = "inland-hub"
+            }
+            data = {
+              window = "{{window}}"
+            }
+            lifecycle {
+              enabled = var.maintenance
+            }
+          }
+
+          resource "kubernetes_deployment_v1" "dashboard" {
+            provider = kubernetes.farm["hub"]
+            metadata {
+              name      = "inland-dashboard"
+              namespace = "inland-hub"
+            }
+            spec {
+              replicas = 1
+              selector {
+                match_labels = { app = "inland-dashboard" }
+              }
+              template {
+                metadata {
+                  labels = { app = "inland-dashboard" }
+                }
+                spec {
+                  container {
+                    name  = "dashboard"
+                    image = var.dashboard_image
+                  }
+                }
+              }
+            }
+            wait_for_rollout = false
+          }
+          HCL
+          printf 'provider_for_each:\n  terraform: false\n  tofu: true\nlifecycle_enabled:\n  terraform: false\n  tofu: true\nexclude_flag:\n  terraform: false\n  tofu: true\n' > ~/reports/differences.yaml
+          cd ~/stacks/inland-tofu && tofu init -input=false -no-color >/dev/null
+          cd ~/stacks/inland-tofu && tofu apply -auto-approve -input=false -no-color
+    - id: in-place
+      description: Makes the OpenTofu changes in the original stack instead of a copy.
+      feedback: The point was to try OpenTofu on a copy of the state. Changing ~/stacks/inland rewrites its state for OpenTofu-only features, so Terraform can no longer run it.
+      expectFail: [original-untouched, provider-for-each, one-provider-block, only-dashboard-pending]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          cd ~/stacks/inland && rm -rf .terraform
+          cat > main.tf <<'HCL'
+          terraform {
+            required_providers {
+              kubernetes = {
+                source  = "hashicorp/kubernetes"
+                version = "~> 3.3.0"
+              }
+            }
+          }
+
+          locals {
+            farms = {
+              fenwick  = { context = "sm-grid", turbines = "{{ft}}" }
+              larkholt = { context = "sm-grid", turbines = "{{lt}}" }
+              hub      = { context = "sm-grid", turbines = "0" }
+            }
+          }
+
+          provider "kubernetes" {
+            alias          = "farm"
+            for_each       = local.farms
+            config_path    = "~/.kube/config"
+            config_context = each.value.context
+          }
+
+          variable "maintenance" {
+            description = "Publish the maintenance-window ConfigMap on the hub."
+            type        = bool
+            default     = true
+          }
+
+          variable "dashboard_image" {
+            type = string
+          }
+
+          resource "kubernetes_config_map_v1" "farm" {
+            for_each = local.farms
+            provider = kubernetes.farm[each.key]
+            metadata {
+              name      = "farm-status"
+              namespace = "inland-${each.key}"
+            }
+            data = {
+              farm     = each.key
+              turbines = each.value.turbines
+            }
+          }
+
+          moved {
+            from = kubernetes_config_map_v1.fenwick
+            to   = kubernetes_config_map_v1.farm["fenwick"]
+          }
+
+          moved {
+            from = kubernetes_config_map_v1.larkholt
+            to   = kubernetes_config_map_v1.farm["larkholt"]
+          }
+
+          moved {
+            from = kubernetes_config_map_v1.hub
+            to   = kubernetes_config_map_v1.farm["hub"]
+          }
+
+          resource "kubernetes_config_map_v1" "maintenance" {
+            provider = kubernetes.farm["hub"]
+            metadata {
+              name      = "maintenance-window"
+              namespace = "inland-hub"
+            }
+            data = {
+              window = "{{window}}"
+            }
+            lifecycle {
+              enabled = var.maintenance
+            }
+          }
+
+          resource "kubernetes_deployment_v1" "dashboard" {
+            provider = kubernetes.farm["hub"]
+            metadata {
+              name      = "inland-dashboard"
+              namespace = "inland-hub"
+            }
+            spec {
+              replicas = 1
+              selector {
+                match_labels = { app = "inland-dashboard" }
+              }
+              template {
+                metadata {
+                  labels = { app = "inland-dashboard" }
+                }
+                spec {
+                  container {
+                    name  = "dashboard"
+                    image = var.dashboard_image
+                  }
+                }
+              }
+            }
+            wait_for_rollout = false
+          }
+          HCL
+          tofu init -input=false -no-color >/dev/null
+          tofu apply -auto-approve -input=false -no-color -exclude=kubernetes_deployment_v1.dashboard
+    - id: terraform-has-exclude
+      description: Records -exclude as available in Terraform.
+      feedback: Terraform 1.15 has only -target; -exclude is OpenTofu-only (try `terraform plan -exclude=x`).
+      expectFail: [differences]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          cp -a ~/stacks/inland ~/stacks/inland-tofu && rm -rf ~/stacks/inland-tofu/.terraform ~/stacks/inland-tofu/.ct-seeded
+          cat > ~/stacks/inland-tofu/main.tf <<'HCL'
+          terraform {
+            required_providers {
+              kubernetes = {
+                source  = "hashicorp/kubernetes"
+                version = "~> 3.3.0"
+              }
+            }
+          }
+
+          locals {
+            farms = {
+              fenwick  = { context = "sm-grid", turbines = "{{ft}}" }
+              larkholt = { context = "sm-grid", turbines = "{{lt}}" }
+              hub      = { context = "sm-grid", turbines = "0" }
+            }
+          }
+
+          provider "kubernetes" {
+            alias          = "farm"
+            for_each       = local.farms
+            config_path    = "~/.kube/config"
+            config_context = each.value.context
+          }
+
+          variable "maintenance" {
+            description = "Publish the maintenance-window ConfigMap on the hub."
+            type        = bool
+            default     = true
+          }
+
+          variable "dashboard_image" {
+            type = string
+          }
+
+          resource "kubernetes_config_map_v1" "farm" {
+            for_each = local.farms
+            provider = kubernetes.farm[each.key]
+            metadata {
+              name      = "farm-status"
+              namespace = "inland-${each.key}"
+            }
+            data = {
+              farm     = each.key
+              turbines = each.value.turbines
+            }
+          }
+
+          moved {
+            from = kubernetes_config_map_v1.fenwick
+            to   = kubernetes_config_map_v1.farm["fenwick"]
+          }
+
+          moved {
+            from = kubernetes_config_map_v1.larkholt
+            to   = kubernetes_config_map_v1.farm["larkholt"]
+          }
+
+          moved {
+            from = kubernetes_config_map_v1.hub
+            to   = kubernetes_config_map_v1.farm["hub"]
+          }
+
+          resource "kubernetes_config_map_v1" "maintenance" {
+            provider = kubernetes.farm["hub"]
+            metadata {
+              name      = "maintenance-window"
+              namespace = "inland-hub"
+            }
+            data = {
+              window = "{{window}}"
+            }
+            lifecycle {
+              enabled = var.maintenance
+            }
+          }
+
+          resource "kubernetes_deployment_v1" "dashboard" {
+            provider = kubernetes.farm["hub"]
+            metadata {
+              name      = "inland-dashboard"
+              namespace = "inland-hub"
+            }
+            spec {
+              replicas = 1
+              selector {
+                match_labels = { app = "inland-dashboard" }
+              }
+              template {
+                metadata {
+                  labels = { app = "inland-dashboard" }
+                }
+                spec {
+                  container {
+                    name  = "dashboard"
+                    image = var.dashboard_image
+                  }
+                }
+              }
+            }
+            wait_for_rollout = false
+          }
+          HCL
+          printf 'provider_for_each:\n  terraform: false\n  tofu: true\nlifecycle_enabled:\n  terraform: false\n  tofu: true\nexclude_flag:\n  terraform: false\n  tofu: true\n' > ~/reports/differences.yaml
+          cd ~/stacks/inland-tofu && tofu init -input=false -no-color >/dev/null
+          cd ~/stacks/inland-tofu && tofu apply -auto-approve -input=false -no-color -exclude=kubernetes_deployment_v1.dashboard
+          sed -i '/^exclude_flag:/,/^  tofu/ s/terraform: false/terraform: true/' ~/reports/differences.yaml
+  solution:
+    explanation: |
+      tofu reads the Terraform state as it is, so a copy of the stack can be planned
+      with OpenTofu without touching the original. A provider block with for_each
+      creates one provider instance per farm; moved blocks hand each old resource to
+      its for_each instance, and the state records the instance-level provider
+      (`...kubernetes.farm["fenwick"]`). `lifecycle { enabled = ... }` replaces the
+      count toggle and tofu moves `[0]` to the bare address itself. `-exclude` is
+      the inverse of `-target`. Terraform 1.15 has none of the three, so the copy is
+      now OpenTofu-only.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cp -a ~/stacks/inland ~/stacks/inland-tofu && rm -rf ~/stacks/inland-tofu/.terraform ~/stacks/inland-tofu/.ct-seeded
+          cat > ~/stacks/inland-tofu/main.tf <<'HCL'
+          terraform {
+            required_providers {
+              kubernetes = {
+                source  = "hashicorp/kubernetes"
+                version = "~> 3.3.0"
+              }
+            }
+          }
+
+          locals {
+            farms = {
+              fenwick  = { context = "sm-grid", turbines = "{{ft}}" }
+              larkholt = { context = "sm-grid", turbines = "{{lt}}" }
+              hub      = { context = "sm-grid", turbines = "0" }
+            }
+          }
+
+          provider "kubernetes" {
+            alias          = "farm"
+            for_each       = local.farms
+            config_path    = "~/.kube/config"
+            config_context = each.value.context
+          }
+
+          variable "maintenance" {
+            description = "Publish the maintenance-window ConfigMap on the hub."
+            type        = bool
+            default     = true
+          }
+
+          variable "dashboard_image" {
+            type = string
+          }
+
+          resource "kubernetes_config_map_v1" "farm" {
+            for_each = local.farms
+            provider = kubernetes.farm[each.key]
+            metadata {
+              name      = "farm-status"
+              namespace = "inland-${each.key}"
+            }
+            data = {
+              farm     = each.key
+              turbines = each.value.turbines
+            }
+          }
+
+          moved {
+            from = kubernetes_config_map_v1.fenwick
+            to   = kubernetes_config_map_v1.farm["fenwick"]
+          }
+
+          moved {
+            from = kubernetes_config_map_v1.larkholt
+            to   = kubernetes_config_map_v1.farm["larkholt"]
+          }
+
+          moved {
+            from = kubernetes_config_map_v1.hub
+            to   = kubernetes_config_map_v1.farm["hub"]
+          }
+
+          resource "kubernetes_config_map_v1" "maintenance" {
+            provider = kubernetes.farm["hub"]
+            metadata {
+              name      = "maintenance-window"
+              namespace = "inland-hub"
+            }
+            data = {
+              window = "{{window}}"
+            }
+            lifecycle {
+              enabled = var.maintenance
+            }
+          }
+
+          resource "kubernetes_deployment_v1" "dashboard" {
+            provider = kubernetes.farm["hub"]
+            metadata {
+              name      = "inland-dashboard"
+              namespace = "inland-hub"
+            }
+            spec {
+              replicas = 1
+              selector {
+                match_labels = { app = "inland-dashboard" }
+              }
+              template {
+                metadata {
+                  labels = { app = "inland-dashboard" }
+                }
+                spec {
+                  container {
+                    name  = "dashboard"
+                    image = var.dashboard_image
+                  }
+                }
+              }
+            }
+            wait_for_rollout = false
+          }
+          HCL
+          printf 'provider_for_each:\n  terraform: false\n  tofu: true\nlifecycle_enabled:\n  terraform: false\n  tofu: true\nexclude_flag:\n  terraform: false\n  tofu: true\n' > ~/reports/differences.yaml
+          cd ~/stacks/inland-tofu && tofu init -input=false -no-color >/dev/null
+          cd ~/stacks/inland-tofu
+          tofu plan -input=false -no-color -exclude=kubernetes_deployment_v1.dashboard
+          tofu apply -auto-approve -input=false -no-color -exclude=kubernetes_deployment_v1.dashboard

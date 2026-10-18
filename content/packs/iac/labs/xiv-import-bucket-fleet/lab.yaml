@@ -1,0 +1,172 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xiv-import-bucket-fleet
+  title: Adopt an unmanaged bucket fleet
+  domain: iac
+  frameworks: [tf-advanced:lifecycle-import-drift]
+  difficulty: hard
+  estimatedMinutes: 25
+  tags: [exam, terraform, import, for_each, aws-shaped]
+  version: 1
+spec:
+  description: |
+    **Directory:** `~/exam/archive-fleet` · **Endpoint:** the AWS-shaped API on
+    `http://moto:5000` (the provider block is ready)
+
+    Six telemetry archive buckets, **`sm-telemetry-archive-2019`** to
+    **`sm-telemetry-archive-2024`**, were created by hand and carry two tags
+    each. Bring all six under management:
+
+    - **one** `aws_s3_bucket` resource block with **`for_each`** over
+      `var.archive_years` (instances keyed by year);
+    - adopt the buckets with **`import` blocks**; they must not be recreated,
+      and their tags must stay as they are.
+
+    Apply; the following plan must be empty. (The endpoint emulates the API
+    shape of the real service, not its behaviour.)
+  objectives:
+    - Import a fleet of existing objects into one for_each resource
+    - Keep live attributes by declaring them before the apply
+  params:
+    retention:
+      type: choice
+      values: [7y, 10y, 15y]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+      - name: moto
+        driver: container
+        image: moto:5
+  setup:
+    - on: moto
+      file: {path: /root/ct-xiv-ibf-seed.py, source: assets/moto-seed.py, mode: "0600"}
+    - on: moto
+      file: {path: /root/ct-xiv-ibf-check.py, source: assets/moto-check.py, mode: "0600"}
+    - on: moto
+      timeoutSec: 120
+      run: |
+        for i in $(seq 1 60); do curl -s -o /dev/null http://localhost:5000/ && break; sleep 2; done
+        python3 /root/ct-xiv-ibf-seed.py
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xiv-import-bucket-fleet/stack/providers.tf, source: assets/stack/providers.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xiv-import-bucket-fleet/stack/variables.tf, source: assets/stack/variables.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xiv-import-bucket-fleet/stack/main.tf, source: assets/stack/main.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xiv-import-bucket-fleet/seed.sh, source: assets/seed.sh, mode: "0755"}
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/exam
+    - on: workstation
+      as: learner
+      timeoutSec: 180
+      run: /var/tmp/ct-seed/xiv-import-bucket-fleet/seed.sh xiv-import-bucket-fleet archive-fleet init
+  checks:
+    - id: buckets-kept
+      description: The six archive buckets are the originals and keep their tags
+      type: shell
+      on: moto
+      skills: [iac.state.import, iac.targets.aws-api]
+      weight: 3
+      timeoutSec: 60
+      command: python3 /root/ct-xiv-ibf-check.py
+      expect: {match: exact, value: same=6 tagged=6 extra=0}
+    - id: one-for-each
+      description: The state holds aws_s3_bucket instances keyed 2019 to 2024 from one resource block
+      type: shell
+      on: workstation
+      skills: [iac.language.repetition]
+      weight: 2
+      timeoutSec: 90
+      command: |
+        ct-iac state /home/learner/exam/archive-fleet | jq -r '
+          [.values.root_module.resources[]? | select(.mode == "managed" and .type == "aws_s3_bucket")] as $r
+          | "blocks=\([$r[] | .address | sub("\\[.*$"; "")] | unique | length) keys=\([$r[] | .index | tostring] | sort | join(","))"' 2>/dev/null
+      expect: {match: exact, value: "blocks=1 keys=2019,2020,2021,2022,2023,2024"}
+    - id: import-blocks
+      description: The adoption is declared with import blocks
+      type: shell
+      on: workstation
+      skills: [iac.state.import]
+      weight: 0.5
+      command: cat /home/learner/exam/archive-fleet/*.tf 2>/dev/null | grep -cE '^[[:space:]]*import[[:space:]]*\{' || true
+      expect: {match: regex, value: '^[1-9][0-9]*$'}
+    - id: converged
+      description: A new plan of ~/exam/archive-fleet reports no changes
+      type: shell
+      on: workstation
+      skills: [iac.state.import]
+      weight: 1.5
+      timeoutSec: 150
+      command: ct-iac plan /home/learner/exam/archive-fleet
+      expect: {match: exact, value: no-changes}
+  misconceptions:
+    - id: tags-dropped
+      description: Imports the buckets with a resource block that declares no tags.
+      feedback: After the import the configuration is the truth, so the apply strips every tag it does not declare. Declare the tags (or generate the configuration and fold it into the for_each block).
+      expectFail: [buckets-kept]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 400
+        run: |
+          cd ~/exam/archive-fleet
+          cat > main.tf <<'HCL'
+          import {
+            for_each = var.archive_years
+            to       = aws_s3_bucket.archive[each.key]
+            id       = "sm-telemetry-archive-${each.key}"
+          }
+
+          resource "aws_s3_bucket" "archive" {
+            for_each = var.archive_years
+            bucket   = "sm-telemetry-archive-${each.key}"
+          }
+          HCL
+          iac apply -auto-approve -input=false -no-color
+    - id: six-blocks
+      description: Writes six separate bucket resources.
+      feedback: Six copies drift apart and do not follow var.archive_years. Use one resource with for_each, and an import block with for_each to match.
+      expectFail: [one-for-each]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 400
+        run: |
+          cd ~/exam/archive-fleet
+          : > main.tf
+          for y in 2019 2020 2021 2022 2023 2024; do
+            printf 'import {\n  to = aws_s3_bucket.archive_%s\n  id = "sm-telemetry-archive-%s"\n}\n\nresource "aws_s3_bucket" "archive_%s" {\n  bucket = "sm-telemetry-archive-%s"\n  tags = {\n    "saltmarsh.example/retention" = "{{retention}}"\n    "saltmarsh.example/data"      = "telemetry"\n  }\n}\n\n' $y $y $y $y >> main.tf
+          done
+          iac apply -auto-approve -input=false -no-color
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 400
+        run: |
+          set -e
+          cd ~/exam/archive-fleet
+          cat > main.tf <<'HCL'
+          import {
+            for_each = var.archive_years
+            to       = aws_s3_bucket.archive[each.key]
+            id       = "sm-telemetry-archive-${each.key}"
+          }
+
+          resource "aws_s3_bucket" "archive" {
+            for_each = var.archive_years
+            bucket   = "sm-telemetry-archive-${each.key}"
+            tags = {
+              "saltmarsh.example/retention" = "{{retention}}"
+              "saltmarsh.example/data"      = "telemetry"
+            }
+          }
+          HCL
+          iac plan -input=false -no-color
+          iac apply -auto-approve -input=false -no-color

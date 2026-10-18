@@ -1,0 +1,312 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: iac-dynamic-credentials
+  title: Swap a static cluster token for short-lived credentials
+  domain: iac
+  frameworks: [tf-professional:credentials-secrets]
+  difficulty: hard
+  estimatedMinutes: 30
+  tags: [terraform, credentials, exec-plugin, serviceaccount-tokens, kubernetes-provider]
+  version: 1
+spec:
+  description: |
+    The telemetry stack in `~/stacks/telemetry-deploy` (applied on `sm-grid`)
+    deploys as the least-privileged ServiceAccount **`telemetry-deployer`**
+    (namespace `telemetry`). Its provider authenticates with a **never-expiring
+    token** that someone copied out of the legacy token Secret
+    `telemetry-deployer-legacy` into `deployer.auto.tfvars`. Security wants it
+    gone:
+
+    1. Make the provider obtain a **short-lived token for
+       `telemetry-deployer` on every run** (for example an `exec` block that
+       runs `kubectl create token ... --duration=10m` and prints an
+       `ExecCredential`). The stack must keep deploying as `telemetry-deployer`,
+       not with your own admin credentials.
+    2. Remove the static token from the configuration and from every file in
+       the stack directory.
+    3. **Revoke** the old token by deleting the Secret
+       `telemetry-deployer-legacy`.
+    4. Prove the new credentials work: change `retention_days` in the
+       `telemetry-settings` ConfigMap to **`{{retention}}`** and apply (after the
+       revocation). A plan afterwards reports no changes.
+  objectives:
+    - Replace static provider credentials with short-lived ones obtained per run
+    - Revoke a long-lived ServiceAccount token without breaking the pipeline
+    - Keep the stack on its least-privileged identity
+  params:
+    retention:
+      type: choice
+      values: ["14", "30", "90"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+      - name: sm-grid
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: sm-grid
+  setup:
+    - on: sm-grid
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: telemetry}
+        ---
+        apiVersion: v1
+        kind: ServiceAccount
+        metadata: {name: telemetry-deployer, namespace: telemetry}
+        ---
+        apiVersion: v1
+        kind: Secret
+        type: kubernetes.io/service-account-token
+        metadata:
+          name: telemetry-deployer-legacy
+          namespace: telemetry
+          annotations: {kubernetes.io/service-account.name: telemetry-deployer}
+        ---
+        apiVersion: rbac.authorization.k8s.io/v1
+        kind: Role
+        metadata: {name: telemetry-deployer, namespace: telemetry}
+        rules:
+          - apiGroups: [""]
+            resources: [configmaps]
+            verbs: [get, list, watch, create, update, patch, delete]
+        ---
+        apiVersion: rbac.authorization.k8s.io/v1
+        kind: RoleBinding
+        metadata: {name: telemetry-deployer, namespace: telemetry}
+        roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: telemetry-deployer}
+        subjects:
+          - {kind: ServiceAccount, name: telemetry-deployer, namespace: telemetry}
+    - on: sm-grid
+      timeoutSec: 60
+      run: |
+        kubectl -n kube-system get configmap ct-dyncred >/dev/null 2>&1 && exit 0
+        for i in $(seq 1 30); do
+          [ -n "$(kubectl -n telemetry get secret telemetry-deployer-legacy -o jsonpath='{.data.token}')" ] && exit 0; sleep 2
+        done
+        echo "token secret not populated" >&2; exit 1
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/main.tf, source: assets/main.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/seed.sh, source: assets/seed.sh, mode: "0755"}
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/stacks
+    - on: workstation
+      as: learner
+      timeoutSec: 240
+      run: /var/tmp/ct-seed/seed.sh
+    - on: sm-grid
+      run: |
+        kubectl -n kube-system get configmap ct-dyncred >/dev/null 2>&1 && exit 0
+        kubectl -n kube-system create configmap ct-dyncred \
+          --from-literal=uid=$(kubectl -n telemetry get configmap telemetry-settings -o jsonpath='{.metadata.uid}')
+  teardown:
+    - on: sm-grid
+      run: kubectl delete namespace telemetry --ignore-not-found --wait=false
+  checks:
+    - id: change-applied
+      description: telemetry-settings carries the new retention and is still the same object
+      type: shell
+      on: sm-grid
+      skills: [iac.collaboration.dynamic-credentials]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        u=$(kubectl -n telemetry get configmap telemetry-settings -o jsonpath='{.metadata.uid}' 2>/dev/null)
+        r=$(kubectl -n telemetry get configmap telemetry-settings -o jsonpath='{.data.retention_days}' 2>/dev/null)
+        [ -n "$u" ] && [ "$u" = "$(kubectl -n kube-system get configmap ct-dyncred -o jsonpath='{.data.uid}')" ] && o=same || o=new
+        echo "object=$o retention=$r"
+      expect: {match: exact, value: "object=same retention={{retention}}"}
+    - id: legacy-revoked
+      description: The legacy token Secret is deleted and no other token Secret exists for the deployer
+      type: shell
+      on: sm-grid
+      skills: [iac.collaboration.dynamic-credentials]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        kubectl -n telemetry get secrets -o json | jq -r '[.items[] | select(.type == "kubernetes.io/service-account-token")] | length'
+      expect: {match: exact, value: "0"}
+    - id: no-static-token
+      description: No file in the stack directory holds a token and no provider takes one from a variable
+      type: shell
+      on: workstation
+      skills: [iac.collaboration.dynamic-credentials]
+      weight: 2
+      command: |
+        d=/home/learner/stacks/telemetry-deploy
+        j=$(grep -rl 'eyJhbGci' $d --exclude-dir=.terraform 2>/dev/null | wc -l)
+        v=$(cat $d/*.tf 2>/dev/null | grep -cE '^[[:space:]]*token[[:space:]]*=[[:space:]]*var\.')
+        echo "files-with-token=$j token-from-variable=$v"
+      expect: {match: exact, value: files-with-token=0 token-from-variable=0}
+    - id: short-lived
+      description: The provider requests a token for telemetry-deployer on every run
+      type: shell
+      on: workstation
+      skills: [iac.collaboration.dynamic-credentials, iac.language.provider-config]
+      weight: 2
+      command: |
+        d=/home/learner/stacks/telemetry-deploy
+        all=$(find $d -path $d/.terraform -prune -o -type f ! -name '*.tfstate*' -print | xargs cat 2>/dev/null)
+        tf=$(cat $d/*.tf 2>/dev/null)
+        cfg=$(cat $d/*.tf 2>/dev/null | grep -vE '^[[:space:]]*#' | grep -cE 'config_(path|context)[[:space:]]*=')
+        if printf '%s\n' "$tf" | grep -qE '^[[:space:]]*exec[[:space:]]*\{' && printf '%s\n' "$all" | grep -q 'create token' && printf '%s\n' "$all" | grep -q 'telemetry-deployer'; then m=exec
+        elif printf '%s\n' "$tf" | grep -qE 'ephemeral[[:space:]]+"kubernetes_token_request(_v1)?"' && printf '%s\n' "$tf" | grep -q 'telemetry-deployer'; then m=ephemeral
+        else m=none; fi
+        # exec plugins and ephemeral token requests are fine; a provider on the admin kubeconfig alone is not.
+        [ "$m" = none ] && echo "method=none admin-config=$cfg" || echo "method=short-lived"
+      expect: {match: exact, value: method=short-lived}
+    - id: converged
+      description: A new plan of ~/stacks/telemetry-deploy reports no changes
+      type: shell
+      on: workstation
+      skills: [iac.foundations.workflow]
+      timeoutSec: 120
+      command: ct-iac plan /home/learner/stacks/telemetry-deploy
+      expect: {match: exact, value: no-changes}
+  hints:
+    - title: What an exec plugin prints
+      body: |
+        The provider runs the command and reads JSON like
+        `{"apiVersion":"client.authentication.k8s.io/v1","kind":"ExecCredential","status":{"token":"..."}}`
+        from its standard output. `kubectl create token` prints the bare token, so
+        wrap it, for example with `jq -R`.
+      cost: 1
+    - title: The provider block
+      body: |
+        ```hcl
+        provider "kubernetes" {
+          host                   = var.host
+          cluster_ca_certificate = base64decode(var.ca_b64)
+          exec {
+            api_version = "client.authentication.k8s.io/v1"
+            command     = "${path.module}/bin/deployer-token"
+          }
+        }
+        ```
+      cost: 2
+    - title: Revoking
+      body: Deleting a legacy token Secret invalidates its token at once. Apply after the deletion to prove nothing still depends on it.
+      command: kubectl -n telemetry delete secret telemetry-deployer-legacy
+      cost: 1
+  misconceptions:
+    - id: admin-kubeconfig
+      description: Points the provider at the admin kubeconfig instead of the deployer.
+      feedback: Your kubeconfig is a cluster admin. The stack must keep its least privilege; use your kubeconfig only to mint a short-lived token for telemetry-deployer.
+      expectFail: [short-lived]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          cd ~/stacks/telemetry-deploy
+          rm -f deployer.auto.tfvars
+          python3 - <<'PY'
+          import re
+          p = "main.tf"; s = open(p).read()
+          s = re.sub(r'variable "deployer_token" \{.*?\n\}\n', '', s, flags=re.S)
+          s = re.sub(r'provider "kubernetes" \{.*?\n\}\n', 'provider "kubernetes" {\n  config_path    = "~/.kube/config"\n  config_context = "sm-grid"\n}\n', s, flags=re.S)
+          s = s.replace('retention_days = "7"', 'retention_days = "{{retention}}"')
+          open(p, "w").write(s)
+          PY
+          kubectl --context sm-grid -n telemetry delete secret telemetry-deployer-legacy --ignore-not-found
+          iac apply -auto-approve -input=false -no-color
+    - id: never-revoked
+      description: Switches to short-lived tokens but leaves the legacy Secret in place.
+      feedback: Until the Secret is deleted its token still works for anyone who copied it. Delete telemetry-deployer-legacy.
+      expectFail: [legacy-revoked]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          cd ~/stacks/telemetry-deploy
+          mkdir -p bin
+          printf '#!/bin/sh\nkubectl --context sm-grid -n telemetry create token telemetry-deployer --duration=10m | jq -Rc %s\n' "'{apiVersion: \"client.authentication.k8s.io/v1\", kind: \"ExecCredential\", status: {token: .}}'" > bin/deployer-token
+          chmod +x bin/deployer-token
+          rm -f deployer.auto.tfvars
+          python3 - <<'PY'
+          import re
+          p = "main.tf"; s = open(p).read()
+          s = re.sub(r'variable "deployer_token" \{.*?\n\}\n', '', s, flags=re.S)
+          s = s.replace('  token                  = var.deployer_token\n', '  exec {\n    api_version = "client.authentication.k8s.io/v1"\n    command     = "${path.module}/bin/deployer-token"\n  }\n')
+          s = s.replace('retention_days = "7"', 'retention_days = "{{retention}}"')
+          open(p, "w").write(s)
+          PY
+          iac apply -auto-approve -input=false -no-color
+  solution:
+    explanation: |
+      An exec plugin makes the provider ask for credentials every time it starts: the
+      script uses your kubeconfig only to call the TokenRequest API for
+      telemetry-deployer and prints the 10-minute token as an ExecCredential, so
+      no token is ever written to a file and the stack still acts as the deployer.
+      Deleting the token Secret revokes the old token; the apply after it proves the
+      pipeline no longer needs it.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/stacks/telemetry-deploy
+          mkdir -p bin
+          printf '#!/bin/sh\nkubectl --context sm-grid -n telemetry create token telemetry-deployer --duration=10m | jq -Rc %s\n' "'{apiVersion: \"client.authentication.k8s.io/v1\", kind: \"ExecCredential\", status: {token: .}}'" > bin/deployer-token
+          chmod +x bin/deployer-token
+          ./bin/deployer-token | jq -e .status.token >/dev/null
+          rm -f deployer.auto.tfvars
+          python3 - <<'PY'
+          import re
+          p = "main.tf"; s = open(p).read()
+          s = re.sub(r'variable "deployer_token" \{.*?\n\}\n', '', s, flags=re.S)
+          s = s.replace('  token                  = var.deployer_token\n', '  exec {\n    api_version = "client.authentication.k8s.io/v1"\n    command     = "${path.module}/bin/deployer-token"\n  }\n')
+          s = s.replace('retention_days = "7"', 'retention_days = "{{retention}}"')
+          open(p, "w").write(s)
+          PY
+          kubectl --context sm-grid -n telemetry delete secret telemetry-deployer-legacy
+          iac apply -auto-approve -input=false -no-color
+    alternatives:
+      - id: ephemeral-token-request
+        description: Mint the token with an ephemeral kubernetes_token_request_v1 through a platform provider.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 300
+            run: |
+              set -e
+              cd ~/stacks/telemetry-deploy
+              rm -f deployer.auto.tfvars
+              python3 - <<'PY'
+              import re
+              p = "main.tf"; s = open(p).read()
+              s = re.sub(r'variable "deployer_token" \{.*?\n\}\n', '', s, flags=re.S)
+              s = s.replace('  token                  = var.deployer_token\n', '  token                  = ephemeral.kubernetes_token_request_v1.deployer.token\n')
+              s = s.replace('retention_days = "7"', 'retention_days = "{{retention}}"')
+              s += '''
+              provider "kubernetes" {
+                alias          = "platform"
+                config_path    = "~/.kube/config"
+                config_context = "sm-grid"
+              }
+
+              ephemeral "kubernetes_token_request_v1" "deployer" {
+                provider = kubernetes.platform
+                metadata {
+                  name      = "telemetry-deployer"
+                  namespace = "telemetry"
+                }
+                spec {
+                  expiration_seconds = 600
+                }
+              }
+              '''.replace('\n              ', '\n')
+              open(p, "w").write(s)
+              PY
+              kubectl --context sm-grid -n telemetry delete secret telemetry-deployer-legacy
+              iac apply -auto-approve -input=false -no-color

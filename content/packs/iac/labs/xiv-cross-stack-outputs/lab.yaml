@@ -1,0 +1,226 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xiv-cross-stack-outputs
+  title: Publish a stable output contract for other stacks
+  domain: iac
+  frameworks: [tf-advanced:collaboration]
+  difficulty: hard
+  estimatedMinutes: 25
+  tags: [exam, terraform, outputs, remote-state, contracts, aws-shaped]
+  version: 1
+spec:
+  description: |
+    **Directories:** `~/exam/core-network`, `~/exam/quotes`, `~/exam/archive` ·
+    **Endpoint:** the AWS-shaped API on `http://moto:5000`; state in the
+    workstation's S3 store (bucket `sm-tfstate`)
+
+    The core network stack publishes three loose outputs (`vpc_id`,
+    `app_subnet`, `data_subnet`) that the quotes and archive stacks read
+    through remote state. Replace them with **one versioned output object**,
+    exactly:
+
+    ```hcl
+    output "network" {
+      value = {
+        schema_version = 1
+        vpc_id         = <the VPC id>
+        subnet_ids     = { app = <app subnet id>, data = <data subnet id> }
+      }
+    }
+    ```
+
+    Remove the three old outputs, and update **both consumers** to read the
+    contract. Nothing may be recreated; all three stacks must plan empty.
+  objectives:
+    - Design a versioned output contract for other stacks
+    - Migrate consumers without disrupting their resources
+  params:
+    net: {type: int, min: 70, max: 79}
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+      - name: moto
+        driver: container
+        image: moto:5
+  setup:
+    - on: moto
+      file: {path: /root/ct-moto-ids.py, source: assets/moto-ids.py, mode: "0600"}
+    - on: moto
+      timeoutSec: 120
+      run: for i in $(seq 1 60); do curl -s -o /dev/null http://localhost:5000/ && break; sleep 2; done
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xiv-cross-stack-outputs/core-network/providers.tf, source: assets/core-network/providers.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xiv-cross-stack-outputs/core-network/main.tf, source: assets/core-network/main.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xiv-cross-stack-outputs/quotes/providers.tf, source: assets/quotes/providers.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xiv-cross-stack-outputs/quotes/main.tf, source: assets/quotes/main.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xiv-cross-stack-outputs/archive/providers.tf, source: assets/archive/providers.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xiv-cross-stack-outputs/archive/main.tf, source: assets/archive/main.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xiv-cross-stack-outputs/seed.sh, source: assets/seed.sh, mode: "0755"}
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/exam
+    - on: workstation
+      as: learner
+      timeoutSec: 500
+      run: /var/tmp/ct-seed/xiv-cross-stack-outputs/seed.sh
+    - on: moto
+      timeoutSec: 60
+      run: python3 /root/ct-moto-ids.py record quotes-api quote-archive
+  checks:
+    - id: contract
+      description: core-network publishes only the network object with schema_version 1 and the app and data subnets
+      type: shell
+      on: workstation
+      skills: [iac.language.outputs-locals]
+      weight: 3
+      timeoutSec: 90
+      command: |
+        ct-iac state /home/learner/exam/core-network | jq -r '.values.outputs // {} | . as $o
+          | "keys=\(keys | join(",")) version=\($o.network.value.schema_version // "none") subnets=\(($o.network.value.subnet_ids // {}) | keys | join(",")) vpc=\(if ($o.network.value.vpc_id // "" | startswith("vpc-")) then "ok" else "none" end)"' 2>/dev/null
+      expect: {match: exact, value: "keys=network version=1 subnets=app,data vpc=ok"}
+    - id: consumers-migrated
+      description: quotes and archive read the network object and none of the old outputs
+      type: shell
+      on: workstation
+      skills: [iac.state.sharing]
+      weight: 2
+      command: |
+        for d in quotes archive; do
+          c=$(cat /home/learner/exam/$d/*.tf 2>/dev/null | sed 's/#.*//')
+          n=$(printf '%s\n' "$c" | grep -c 'outputs\.network\.')
+          o=$(printf '%s\n' "$c" | grep -cE 'outputs\.(vpc_id|app_subnet|data_subnet)')
+          printf '%s=%s ' "$d" "$([ "$n" -ge 1 ] && [ "$o" = 0 ] && echo contract || echo "new=$n old=$o")"
+        done
+      expect: {match: exact, value: "quotes=contract archive=contract "}
+    - id: instances-kept
+      description: The quotes and archive instances are the originals
+      type: shell
+      on: moto
+      skills: [iac.state.sharing]
+      weight: 1
+      timeoutSec: 60
+      command: python3 /root/ct-moto-ids.py check quotes-api quote-archive
+      expect: {match: exact, value: quotes-api=same quote-archive=same}
+    - id: converged
+      description: All three stacks plan with no changes
+      type: shell
+      on: workstation
+      skills: [iac.state.sharing]
+      weight: 2
+      timeoutSec: 360
+      command: |
+        for d in core-network quotes archive; do printf '%s=%s ' $d "$(ct-iac plan /home/learner/exam/$d)"; done
+      expect: {match: exact, value: "core-network=no-changes quotes=no-changes archive=no-changes "}
+  misconceptions:
+    - id: producer-only
+      description: Changes the network stack's outputs and leaves the consumers alone.
+      feedback: Removing outputs breaks every stack that reads them. Update the consumers to the new object in the same change (or publish both for a transition, then remove the old ones).
+      expectFail: [consumers-migrated, converged]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/exam/core-network
+          python3 - <<'PY'
+          import re
+          p = "main.tf"; s = open(p).read()
+          s = re.sub(r'\noutput "[a-z_]+" \{\n  value = [^\n]+\n\}\n', '\n', s)
+          s = s.rstrip() + '''
+
+          output "network" {
+            description = "Network contract for consumer stacks. Bump schema_version on breaking changes."
+            value = {
+              schema_version = 1
+              vpc_id         = aws_vpc.core.id
+              subnet_ids = {
+                app  = aws_subnet.app.id
+                data = aws_subnet.data.id
+              }
+            }
+          }
+          '''
+          open(p, "w").write(s)
+          PY
+          iac apply -auto-approve -input=false -no-color >/dev/null
+    - id: old-outputs-kept
+      description: Adds the network object but keeps the three loose outputs.
+      feedback: Keeping the loose outputs leaves two contracts to maintain and consumers keep using the old ones. Remove them once the consumers read the object.
+      expectFail: [contract]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/exam/core-network
+          python3 - <<'PY'
+          import re
+          p = "main.tf"; s = open(p).read()
+          s = s.rstrip() + '''
+
+          output "network" {
+            description = "Network contract for consumer stacks. Bump schema_version on breaking changes."
+            value = {
+              schema_version = 1
+              vpc_id         = aws_vpc.core.id
+              subnet_ids = {
+                app  = aws_subnet.app.id
+                data = aws_subnet.data.id
+              }
+            }
+          }
+          '''
+          open(p, "w").write(s)
+          PY
+          iac apply -auto-approve -input=false -no-color >/dev/null
+          for d in quotes archive; do
+            cd ~/exam/$d
+            sed -i 's/outputs\.app_subnet/outputs.network.subnet_ids["app"]/; s/outputs\.data_subnet/outputs.network.subnet_ids["data"]/; s/outputs\.vpc_id/outputs.network.vpc_id/' main.tf
+            iac apply -auto-approve -input=false -no-color >/dev/null
+          done
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/exam/core-network
+          python3 - <<'PY'
+          import re
+          p = "main.tf"; s = open(p).read()
+          s = re.sub(r'\noutput "[a-z_]+" \{\n  value = [^\n]+\n\}\n', '\n', s)
+          s = s.rstrip() + '''
+
+          output "network" {
+            description = "Network contract for consumer stacks. Bump schema_version on breaking changes."
+            value = {
+              schema_version = 1
+              vpc_id         = aws_vpc.core.id
+              subnet_ids = {
+                app  = aws_subnet.app.id
+                data = aws_subnet.data.id
+              }
+            }
+          }
+          '''
+          open(p, "w").write(s)
+          PY
+          iac apply -auto-approve -input=false -no-color >/dev/null
+          for d in quotes archive; do
+            cd ~/exam/$d
+            sed -i 's/outputs\.app_subnet/outputs.network.subnet_ids["app"]/; s/outputs\.data_subnet/outputs.network.subnet_ids["data"]/; s/outputs\.vpc_id/outputs.network.vpc_id/' main.tf
+            iac apply -auto-approve -input=false -no-color >/dev/null
+          done

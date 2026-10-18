@@ -1,0 +1,986 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: iac-split-monolith-modules
+  title: Split a flat configuration into modules with no destroys
+  domain: iac
+  frameworks: [tf-advanced:modules, tf-professional:module-contracts-testing]
+  difficulty: hard
+  estimatedMinutes: 40
+  tags: [terraform, modules, moved, refactoring, state]
+  version: 1
+spec:
+  description: |
+    The grid-telemetry root module in `~/stacks/grid-telemetry` (applied, on
+    `sm-grid`) manages 31 objects in one flat `main.tf`: the namespace, then a
+    network, a storage and a workload section. Nobody dares to touch it. Split
+    it into three local modules:
+
+    | Module | Path | Resources it owns |
+    |---|---|---|
+    | `module.network` | `modules/network` | the Services and every NetworkPolicy |
+    | `module.storage` | `modules/storage` | the ConfigMaps and the Secrets |
+    | `module.workload` | `modules/workload` | the ServiceAccounts and the Deployments |
+
+    - The namespace `grid-telemetry` stays in the root module.
+    - Keep the resource names inside each module (for example
+      `module.network.kubernetes_service_v1.svc`), pass what a module needs as
+      input variables, and wire the Deployments to the storage module's
+      ConfigMaps through a **module output**, not hard-coded names.
+    - Record every address change in **`moved` blocks**, so the refactoring is
+      reviewable and replays for anyone else who has this state.
+    - **Nothing may be destroyed or recreated**: all 31 objects must keep
+      their UIDs.
+
+    The plan before your apply should show only moves; afterwards a plan
+    reports no changes.
+  objectives:
+    - Split a root module into child modules with clear inputs and outputs
+    - Move resources across module boundaries with moved blocks
+    - Prove a refactoring is safe from the plan before applying it
+  params:
+    rawdays:
+      type: choice
+      values: ["30", "45", "90"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+      - name: sm-grid
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: sm-grid
+  setup:
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/main.tf, source: assets/main.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/seed.sh, source: assets/seed.sh, mode: "0755"}
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/stacks
+    - on: workstation
+      as: learner
+      timeoutSec: 300
+      run: /var/tmp/ct-seed/seed.sh
+    - on: sm-grid
+      run: |
+        set -eu
+        kubectl -n kube-system get configmap ct-baseline-uids >/dev/null 2>&1 && exit 0
+        kubectl -n grid-telemetry get service,networkpolicy,configmap,secret,serviceaccount,deployment \
+          -l saltmarsh.example/stack=grid-telemetry -o jsonpath='{range .items[*]}{.kind}/{.metadata.name}={.metadata.uid}{"\n"}{end}' | sort > /tmp/ct-uids
+        [ "$(wc -l < /tmp/ct-uids)" -eq 30 ] || { echo "expected 30 objects, got $(wc -l < /tmp/ct-uids)" >&2; exit 1; }
+        kubectl -n kube-system create configmap ct-baseline-uids --from-file=objects=/tmp/ct-uids \
+          --from-literal=namespace=$(kubectl get namespace grid-telemetry -o jsonpath='{.metadata.uid}')
+  teardown:
+    - on: sm-grid
+      run: kubectl delete namespace grid-telemetry --ignore-not-found --wait=false
+  checks:
+    - id: objects-kept
+      description: All 31 objects (namespace included) keep their original UIDs
+      type: shell
+      on: sm-grid
+      skills: [iac.modules.refactor]
+      weight: 3
+      timeoutSec: 30
+      command: |
+        t=$(mktemp -d)
+        kubectl -n grid-telemetry get service,networkpolicy,configmap,secret,serviceaccount,deployment \
+          -l saltmarsh.example/stack=grid-telemetry -o jsonpath='{range .items[*]}{.kind}/{.metadata.name}={.metadata.uid}{"\n"}{end}' 2>/dev/null | sort > $t/now
+        kubectl -n kube-system get configmap ct-baseline-uids -o jsonpath='{.data.objects}' | sort > $t/was
+        same=$(comm -12 $t/now $t/was | grep -c .)
+        rm -rf $t
+        ns=$(kubectl get namespace grid-telemetry -o jsonpath='{.metadata.uid}' 2>/dev/null)
+        [ "$ns" = "$(kubectl -n kube-system get configmap ct-baseline-uids -o jsonpath='{.data.namespace}')" ] && n=same || n=new
+        echo "unchanged=$same/30 namespace=$n"
+      expect: {match: exact, value: unchanged=30/30 namespace=same}
+    - id: module-layout
+      description: The state splits into the root namespace and the network, storage and workload modules
+      type: shell
+      on: workstation
+      skills: [iac.modules.refactor]
+      weight: 2
+      timeoutSec: 60
+      command: |
+        ct-iac state /home/learner/stacks/grid-telemetry | jq -r '
+          def kinds(m): [m.resources[]? | select(.mode == "managed") | .type] | unique | join(",");
+          def count(m): [m.resources[]? | select(.mode == "managed")] | length;
+          .values.root_module as $r
+          | "root=\(kinds($r)):\(count($r)) "
+            + ([$r.child_modules[]? | "\(.address)=\(kinds(.)):\(count(.))"] | sort | join(" "))' 2>/dev/null
+      expect: {match: exact, value: "root=kubernetes_namespace_v1:1 module.network=kubernetes_network_policy_v1,kubernetes_service_v1:11 module.storage=kubernetes_config_map_v1,kubernetes_secret_v1:9 module.workload=kubernetes_deployment_v1,kubernetes_service_account_v1:10"}
+    - id: output-wiring
+      description: The workload module gets the ConfigMap names from the storage module's output
+      type: shell
+      on: workstation
+      skills: [iac.modules.refactor]
+      weight: 1
+      command: |
+        d=/home/learner/stacks/grid-telemetry
+        o=$(cat $d/modules/storage/*.tf 2>/dev/null | grep -cE '^[[:space:]]*output[[:space:]]+"')
+        r=$(cat $d/*.tf 2>/dev/null | grep -cE 'module\.storage\.[a-z_]+')
+        h=$(cat $d/modules/workload/*.tf 2>/dev/null | grep -cE '"\$\{each\.key\}-settings"|-settings"')
+        echo "storage_outputs=$([ "$o" -ge 1 ] && echo yes || echo no) used=$([ "$r" -ge 1 ] && echo yes || echo no) hard_coded=$h"
+      expect: {match: exact, value: storage_outputs=yes used=yes hard_coded=0}
+    - id: moved-recorded
+      description: The configuration records the address changes in moved blocks
+      type: shell
+      on: workstation
+      skills: [iac.state.refactor]
+      weight: 1
+      command: cat /home/learner/stacks/grid-telemetry/*.tf 2>/dev/null | grep -cE '^[[:space:]]*moved[[:space:]]*\{' || true
+      expect: {match: regex, value: '^([8-9]|[1-9][0-9]+)$'}
+    - id: converged
+      description: A new plan of ~/stacks/grid-telemetry reports no changes
+      type: shell
+      on: workstation
+      skills: [iac.foundations.workflow]
+      weight: 1
+      timeoutSec: 150
+      command: ct-iac plan /home/learner/stacks/grid-telemetry
+      expect: {match: exact, value: no-changes}
+  hints:
+    - title: One moved block per resource block
+      body: |
+        A moved block can move a whole `for_each` resource with all its instances:
+        `moved { from = kubernetes_service_v1.svc  to = module.network.kubernetes_service_v1.svc }`
+        (on separate lines). Eight resource blocks leave the root, so you need eight.
+      cost: 1
+    - title: Cross-module references
+      body: The Deployments use the settings ConfigMaps. Give modules/storage an output such as a map from component to ConfigMap name and pass `module.storage.<output>` into modules/workload as a variable.
+      cost: 1
+    - title: Check before you apply
+      body: '`terraform plan` must end with "0 to add, 0 to change, 0 to destroy" and list only "has moved to" lines. Any destroy means a moved block is missing or points at the wrong address.'
+      command: cd ~/stacks/grid-telemetry && terraform init && terraform plan
+      cost: 1
+  misconceptions:
+    - id: no-moved
+      description: Moves the blocks into modules without moved blocks.
+      feedback: To Terraform a resource at a new address is a new resource, so every object would be destroyed and recreated (new UIDs, restarted Pods). Add a moved block for each resource block that left the root module.
+      expectFail: [objects-kept, moved-recorded]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 600
+        run: |
+          cd ~/stacks/grid-telemetry
+          mkdir -p modules/network modules/storage modules/workload
+          cat > modules/network/main.tf <<'HCL'
+          variable "namespace" {
+            type = string
+          }
+
+          variable "components" {
+            type = map(object({ port = number, clients = list(string) }))
+          }
+
+          variable "labels" {
+            type = map(string)
+          }
+
+          resource "kubernetes_service_v1" "svc" {
+            for_each = var.components
+            metadata {
+              name      = each.key
+              namespace = var.namespace
+              labels    = var.labels
+            }
+            spec {
+              selector = { app = each.key }
+              port {
+                port        = each.value.port
+                target_port = 80
+              }
+            }
+          }
+
+          resource "kubernetes_network_policy_v1" "default_deny" {
+            metadata {
+              name      = "default-deny"
+              namespace = var.namespace
+              labels    = var.labels
+            }
+            spec {
+              pod_selector {}
+              policy_types = ["Ingress"]
+            }
+          }
+
+          resource "kubernetes_network_policy_v1" "allow" {
+            for_each = var.components
+            metadata {
+              name      = "allow-${each.key}"
+              namespace = var.namespace
+              labels    = var.labels
+            }
+            spec {
+              pod_selector {
+                match_labels = { app = each.key }
+              }
+              policy_types = ["Ingress"]
+              dynamic "ingress" {
+                for_each = each.value.clients
+                content {
+                  from {
+                    pod_selector {
+                      match_labels = { app = ingress.value }
+                    }
+                  }
+                  ports {
+                    port     = "80"
+                    protocol = "TCP"
+                  }
+                }
+              }
+            }
+          }
+          HCL
+          cat > modules/storage/main.tf <<'HCL'
+          variable "namespace" {
+            type = string
+          }
+
+          variable "components" {
+            type = map(object({ port = number, clients = list(string) }))
+          }
+
+          variable "credentials" {
+            type = set(string)
+          }
+
+          variable "labels" {
+            type = map(string)
+          }
+
+          output "settings_names" {
+            value = { for k, cm in kubernetes_config_map_v1.settings : k => cm.metadata[0].name }
+          }
+
+          resource "kubernetes_config_map_v1" "settings" {
+            for_each = var.components
+            metadata {
+              name      = "${each.key}-settings"
+              namespace = var.namespace
+              labels    = var.labels
+            }
+            data = {
+              COMPONENT = each.key
+              PORT      = tostring(each.value.port)
+            }
+          }
+
+          resource "kubernetes_config_map_v1" "retention" {
+            metadata {
+              name      = "retention-policy"
+              namespace = var.namespace
+              labels    = var.labels
+            }
+            data = {
+              raw_days        = "{{rawdays}}"
+              aggregated_days = "730"
+            }
+          }
+
+          resource "kubernetes_secret_v1" "creds" {
+            for_each = var.credentials
+            metadata {
+              name      = "${each.key}-credentials"
+              namespace = var.namespace
+              labels    = var.labels
+            }
+            data = {
+              username = "svc-${each.key}"
+            }
+          }
+          HCL
+          cat > modules/workload/main.tf <<'HCL'
+          variable "namespace" {
+            type = string
+          }
+
+          variable "components" {
+            type = map(object({ port = number, clients = list(string) }))
+          }
+
+          variable "labels" {
+            type = map(string)
+          }
+
+          variable "settings_names" {
+            type = map(string)
+          }
+
+          resource "kubernetes_service_account_v1" "sa" {
+            for_each = var.components
+            metadata {
+              name      = each.key
+              namespace = var.namespace
+              labels    = var.labels
+            }
+          }
+
+          resource "kubernetes_deployment_v1" "app" {
+            for_each = var.components
+            metadata {
+              name      = each.key
+              namespace = var.namespace
+              labels    = var.labels
+            }
+            spec {
+              replicas = 1
+              selector {
+                match_labels = { app = each.key }
+              }
+              template {
+                metadata {
+                  labels = { app = each.key }
+                }
+                spec {
+                  service_account_name = kubernetes_service_account_v1.sa[each.key].metadata[0].name
+                  container {
+                    name  = each.key
+                    image = "httpd:2.4-alpine"
+                    env_from {
+                      config_map_ref {
+                        name = var.settings_names[each.key]
+                      }
+                    }
+                  }
+                }
+              }
+            }
+            wait_for_rollout = false
+          }
+          HCL
+          cat > main.tf <<'HCL'
+          terraform {
+            required_providers {
+              kubernetes = {
+                source  = "hashicorp/kubernetes"
+                version = "~> 3.3.0"
+              }
+            }
+          }
+
+          provider "kubernetes" {
+            config_path    = "~/.kube/config"
+            config_context = "sm-grid"
+          }
+
+          # grid-telemetry: one flat root module that grew to 31 objects.
+          locals {
+            components = {
+              collector = { port = 4317, clients = ["gateway"] }
+              historian = { port = 5432, clients = ["collector", "forecast"] }
+              alerting  = { port = 9093, clients = ["collector", "historian"] }
+              forecast  = { port = 8080, clients = ["gateway"] }
+              gateway   = { port = 8443, clients = [] }
+            }
+            credentials = toset(["historian", "alerting", "forecast"])
+            stack_label = { "saltmarsh.example/stack" = "grid-telemetry" }
+          }
+
+          resource "kubernetes_namespace_v1" "grid" {
+            metadata {
+              name = "grid-telemetry"
+            }
+          }
+
+          module "network" {
+            source     = "./modules/network"
+            namespace  = kubernetes_namespace_v1.grid.metadata[0].name
+            components = local.components
+            labels     = local.stack_label
+          }
+
+          module "storage" {
+            source      = "./modules/storage"
+            namespace   = kubernetes_namespace_v1.grid.metadata[0].name
+            components  = local.components
+            credentials = local.credentials
+            labels      = local.stack_label
+          }
+
+          module "workload" {
+            source         = "./modules/workload"
+            namespace      = kubernetes_namespace_v1.grid.metadata[0].name
+            components     = local.components
+            labels         = local.stack_label
+            settings_names = module.storage.settings_names
+          }
+          HCL
+          iac init -input=false -no-color >/dev/null
+          # Recreated objects race their own destroys; the rerun finishes.
+          iac apply -auto-approve -input=false -no-color || iac apply -auto-approve -input=false -no-color || true
+    - id: state-mv
+      description: Moves the state by hand with terraform state mv instead of moved blocks.
+      feedback: state mv works on this copy of the state only and leaves no record; anyone with another workspace or an older state copy gets destroys. moved blocks put the refactoring in the code.
+      expectFail: [moved-recorded]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/stacks/grid-telemetry
+          mkdir -p modules/network modules/storage modules/workload
+          cat > modules/network/main.tf <<'HCL'
+          variable "namespace" {
+            type = string
+          }
+
+          variable "components" {
+            type = map(object({ port = number, clients = list(string) }))
+          }
+
+          variable "labels" {
+            type = map(string)
+          }
+
+          resource "kubernetes_service_v1" "svc" {
+            for_each = var.components
+            metadata {
+              name      = each.key
+              namespace = var.namespace
+              labels    = var.labels
+            }
+            spec {
+              selector = { app = each.key }
+              port {
+                port        = each.value.port
+                target_port = 80
+              }
+            }
+          }
+
+          resource "kubernetes_network_policy_v1" "default_deny" {
+            metadata {
+              name      = "default-deny"
+              namespace = var.namespace
+              labels    = var.labels
+            }
+            spec {
+              pod_selector {}
+              policy_types = ["Ingress"]
+            }
+          }
+
+          resource "kubernetes_network_policy_v1" "allow" {
+            for_each = var.components
+            metadata {
+              name      = "allow-${each.key}"
+              namespace = var.namespace
+              labels    = var.labels
+            }
+            spec {
+              pod_selector {
+                match_labels = { app = each.key }
+              }
+              policy_types = ["Ingress"]
+              dynamic "ingress" {
+                for_each = each.value.clients
+                content {
+                  from {
+                    pod_selector {
+                      match_labels = { app = ingress.value }
+                    }
+                  }
+                  ports {
+                    port     = "80"
+                    protocol = "TCP"
+                  }
+                }
+              }
+            }
+          }
+          HCL
+          cat > modules/storage/main.tf <<'HCL'
+          variable "namespace" {
+            type = string
+          }
+
+          variable "components" {
+            type = map(object({ port = number, clients = list(string) }))
+          }
+
+          variable "credentials" {
+            type = set(string)
+          }
+
+          variable "labels" {
+            type = map(string)
+          }
+
+          output "settings_names" {
+            value = { for k, cm in kubernetes_config_map_v1.settings : k => cm.metadata[0].name }
+          }
+
+          resource "kubernetes_config_map_v1" "settings" {
+            for_each = var.components
+            metadata {
+              name      = "${each.key}-settings"
+              namespace = var.namespace
+              labels    = var.labels
+            }
+            data = {
+              COMPONENT = each.key
+              PORT      = tostring(each.value.port)
+            }
+          }
+
+          resource "kubernetes_config_map_v1" "retention" {
+            metadata {
+              name      = "retention-policy"
+              namespace = var.namespace
+              labels    = var.labels
+            }
+            data = {
+              raw_days        = "{{rawdays}}"
+              aggregated_days = "730"
+            }
+          }
+
+          resource "kubernetes_secret_v1" "creds" {
+            for_each = var.credentials
+            metadata {
+              name      = "${each.key}-credentials"
+              namespace = var.namespace
+              labels    = var.labels
+            }
+            data = {
+              username = "svc-${each.key}"
+            }
+          }
+          HCL
+          cat > modules/workload/main.tf <<'HCL'
+          variable "namespace" {
+            type = string
+          }
+
+          variable "components" {
+            type = map(object({ port = number, clients = list(string) }))
+          }
+
+          variable "labels" {
+            type = map(string)
+          }
+
+          variable "settings_names" {
+            type = map(string)
+          }
+
+          resource "kubernetes_service_account_v1" "sa" {
+            for_each = var.components
+            metadata {
+              name      = each.key
+              namespace = var.namespace
+              labels    = var.labels
+            }
+          }
+
+          resource "kubernetes_deployment_v1" "app" {
+            for_each = var.components
+            metadata {
+              name      = each.key
+              namespace = var.namespace
+              labels    = var.labels
+            }
+            spec {
+              replicas = 1
+              selector {
+                match_labels = { app = each.key }
+              }
+              template {
+                metadata {
+                  labels = { app = each.key }
+                }
+                spec {
+                  service_account_name = kubernetes_service_account_v1.sa[each.key].metadata[0].name
+                  container {
+                    name  = each.key
+                    image = "httpd:2.4-alpine"
+                    env_from {
+                      config_map_ref {
+                        name = var.settings_names[each.key]
+                      }
+                    }
+                  }
+                }
+              }
+            }
+            wait_for_rollout = false
+          }
+          HCL
+          cat > main.tf <<'HCL'
+          terraform {
+            required_providers {
+              kubernetes = {
+                source  = "hashicorp/kubernetes"
+                version = "~> 3.3.0"
+              }
+            }
+          }
+
+          provider "kubernetes" {
+            config_path    = "~/.kube/config"
+            config_context = "sm-grid"
+          }
+
+          # grid-telemetry: one flat root module that grew to 31 objects.
+          locals {
+            components = {
+              collector = { port = 4317, clients = ["gateway"] }
+              historian = { port = 5432, clients = ["collector", "forecast"] }
+              alerting  = { port = 9093, clients = ["collector", "historian"] }
+              forecast  = { port = 8080, clients = ["gateway"] }
+              gateway   = { port = 8443, clients = [] }
+            }
+            credentials = toset(["historian", "alerting", "forecast"])
+            stack_label = { "saltmarsh.example/stack" = "grid-telemetry" }
+          }
+
+          resource "kubernetes_namespace_v1" "grid" {
+            metadata {
+              name = "grid-telemetry"
+            }
+          }
+
+          module "network" {
+            source     = "./modules/network"
+            namespace  = kubernetes_namespace_v1.grid.metadata[0].name
+            components = local.components
+            labels     = local.stack_label
+          }
+
+          module "storage" {
+            source      = "./modules/storage"
+            namespace   = kubernetes_namespace_v1.grid.metadata[0].name
+            components  = local.components
+            credentials = local.credentials
+            labels      = local.stack_label
+          }
+
+          module "workload" {
+            source         = "./modules/workload"
+            namespace      = kubernetes_namespace_v1.grid.metadata[0].name
+            components     = local.components
+            labels         = local.stack_label
+            settings_names = module.storage.settings_names
+          }
+          HCL
+          iac init -input=false -no-color >/dev/null
+          iac state mv -no-color kubernetes_service_v1.svc module.network.kubernetes_service_v1.svc
+          iac state mv -no-color kubernetes_network_policy_v1.default_deny module.network.kubernetes_network_policy_v1.default_deny
+          iac state mv -no-color kubernetes_network_policy_v1.allow module.network.kubernetes_network_policy_v1.allow
+          iac state mv -no-color kubernetes_config_map_v1.settings module.storage.kubernetes_config_map_v1.settings
+          iac state mv -no-color kubernetes_config_map_v1.retention module.storage.kubernetes_config_map_v1.retention
+          iac state mv -no-color kubernetes_secret_v1.creds module.storage.kubernetes_secret_v1.creds
+          iac state mv -no-color kubernetes_service_account_v1.sa module.workload.kubernetes_service_account_v1.sa
+          iac state mv -no-color kubernetes_deployment_v1.app module.workload.kubernetes_deployment_v1.app
+          iac apply -auto-approve -input=false -no-color
+  solution:
+    explanation: |
+      Each module receives the namespace, the component map and the labels as
+      inputs; storage exposes the ConfigMap names as an output that workload
+      consumes. Eight moved blocks (one per resource block, each moving all its
+      instances) turn every change into a move, so the plan lists 30 moved objects
+      (the namespace stays in the root) and no destroy.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/stacks/grid-telemetry
+          mkdir -p modules/network modules/storage modules/workload
+          cat > modules/network/main.tf <<'HCL'
+          variable "namespace" {
+            type = string
+          }
+
+          variable "components" {
+            type = map(object({ port = number, clients = list(string) }))
+          }
+
+          variable "labels" {
+            type = map(string)
+          }
+
+          resource "kubernetes_service_v1" "svc" {
+            for_each = var.components
+            metadata {
+              name      = each.key
+              namespace = var.namespace
+              labels    = var.labels
+            }
+            spec {
+              selector = { app = each.key }
+              port {
+                port        = each.value.port
+                target_port = 80
+              }
+            }
+          }
+
+          resource "kubernetes_network_policy_v1" "default_deny" {
+            metadata {
+              name      = "default-deny"
+              namespace = var.namespace
+              labels    = var.labels
+            }
+            spec {
+              pod_selector {}
+              policy_types = ["Ingress"]
+            }
+          }
+
+          resource "kubernetes_network_policy_v1" "allow" {
+            for_each = var.components
+            metadata {
+              name      = "allow-${each.key}"
+              namespace = var.namespace
+              labels    = var.labels
+            }
+            spec {
+              pod_selector {
+                match_labels = { app = each.key }
+              }
+              policy_types = ["Ingress"]
+              dynamic "ingress" {
+                for_each = each.value.clients
+                content {
+                  from {
+                    pod_selector {
+                      match_labels = { app = ingress.value }
+                    }
+                  }
+                  ports {
+                    port     = "80"
+                    protocol = "TCP"
+                  }
+                }
+              }
+            }
+          }
+          HCL
+          cat > modules/storage/main.tf <<'HCL'
+          variable "namespace" {
+            type = string
+          }
+
+          variable "components" {
+            type = map(object({ port = number, clients = list(string) }))
+          }
+
+          variable "credentials" {
+            type = set(string)
+          }
+
+          variable "labels" {
+            type = map(string)
+          }
+
+          output "settings_names" {
+            value = { for k, cm in kubernetes_config_map_v1.settings : k => cm.metadata[0].name }
+          }
+
+          resource "kubernetes_config_map_v1" "settings" {
+            for_each = var.components
+            metadata {
+              name      = "${each.key}-settings"
+              namespace = var.namespace
+              labels    = var.labels
+            }
+            data = {
+              COMPONENT = each.key
+              PORT      = tostring(each.value.port)
+            }
+          }
+
+          resource "kubernetes_config_map_v1" "retention" {
+            metadata {
+              name      = "retention-policy"
+              namespace = var.namespace
+              labels    = var.labels
+            }
+            data = {
+              raw_days        = "{{rawdays}}"
+              aggregated_days = "730"
+            }
+          }
+
+          resource "kubernetes_secret_v1" "creds" {
+            for_each = var.credentials
+            metadata {
+              name      = "${each.key}-credentials"
+              namespace = var.namespace
+              labels    = var.labels
+            }
+            data = {
+              username = "svc-${each.key}"
+            }
+          }
+          HCL
+          cat > modules/workload/main.tf <<'HCL'
+          variable "namespace" {
+            type = string
+          }
+
+          variable "components" {
+            type = map(object({ port = number, clients = list(string) }))
+          }
+
+          variable "labels" {
+            type = map(string)
+          }
+
+          variable "settings_names" {
+            type = map(string)
+          }
+
+          resource "kubernetes_service_account_v1" "sa" {
+            for_each = var.components
+            metadata {
+              name      = each.key
+              namespace = var.namespace
+              labels    = var.labels
+            }
+          }
+
+          resource "kubernetes_deployment_v1" "app" {
+            for_each = var.components
+            metadata {
+              name      = each.key
+              namespace = var.namespace
+              labels    = var.labels
+            }
+            spec {
+              replicas = 1
+              selector {
+                match_labels = { app = each.key }
+              }
+              template {
+                metadata {
+                  labels = { app = each.key }
+                }
+                spec {
+                  service_account_name = kubernetes_service_account_v1.sa[each.key].metadata[0].name
+                  container {
+                    name  = each.key
+                    image = "httpd:2.4-alpine"
+                    env_from {
+                      config_map_ref {
+                        name = var.settings_names[each.key]
+                      }
+                    }
+                  }
+                }
+              }
+            }
+            wait_for_rollout = false
+          }
+          HCL
+          cat > main.tf <<'HCL'
+          terraform {
+            required_providers {
+              kubernetes = {
+                source  = "hashicorp/kubernetes"
+                version = "~> 3.3.0"
+              }
+            }
+          }
+
+          provider "kubernetes" {
+            config_path    = "~/.kube/config"
+            config_context = "sm-grid"
+          }
+
+          # grid-telemetry: one flat root module that grew to 31 objects.
+          locals {
+            components = {
+              collector = { port = 4317, clients = ["gateway"] }
+              historian = { port = 5432, clients = ["collector", "forecast"] }
+              alerting  = { port = 9093, clients = ["collector", "historian"] }
+              forecast  = { port = 8080, clients = ["gateway"] }
+              gateway   = { port = 8443, clients = [] }
+            }
+            credentials = toset(["historian", "alerting", "forecast"])
+            stack_label = { "saltmarsh.example/stack" = "grid-telemetry" }
+          }
+
+          resource "kubernetes_namespace_v1" "grid" {
+            metadata {
+              name = "grid-telemetry"
+            }
+          }
+
+          module "network" {
+            source     = "./modules/network"
+            namespace  = kubernetes_namespace_v1.grid.metadata[0].name
+            components = local.components
+            labels     = local.stack_label
+          }
+
+          module "storage" {
+            source      = "./modules/storage"
+            namespace   = kubernetes_namespace_v1.grid.metadata[0].name
+            components  = local.components
+            credentials = local.credentials
+            labels      = local.stack_label
+          }
+
+          module "workload" {
+            source         = "./modules/workload"
+            namespace      = kubernetes_namespace_v1.grid.metadata[0].name
+            components     = local.components
+            labels         = local.stack_label
+            settings_names = module.storage.settings_names
+          }
+          HCL
+          cat > moved.tf <<'HCL'
+          moved {
+            from = kubernetes_service_v1.svc
+            to   = module.network.kubernetes_service_v1.svc
+          }
+
+          moved {
+            from = kubernetes_network_policy_v1.default_deny
+            to   = module.network.kubernetes_network_policy_v1.default_deny
+          }
+
+          moved {
+            from = kubernetes_network_policy_v1.allow
+            to   = module.network.kubernetes_network_policy_v1.allow
+          }
+
+          moved {
+            from = kubernetes_config_map_v1.settings
+            to   = module.storage.kubernetes_config_map_v1.settings
+          }
+
+          moved {
+            from = kubernetes_config_map_v1.retention
+            to   = module.storage.kubernetes_config_map_v1.retention
+          }
+
+          moved {
+            from = kubernetes_secret_v1.creds
+            to   = module.storage.kubernetes_secret_v1.creds
+          }
+
+          moved {
+            from = kubernetes_service_account_v1.sa
+            to   = module.workload.kubernetes_service_account_v1.sa
+          }
+
+          moved {
+            from = kubernetes_deployment_v1.app
+            to   = module.workload.kubernetes_deployment_v1.app
+          }
+          HCL
+          iac init -input=false -no-color >/dev/null
+          iac plan -input=false -no-color
+          iac apply -auto-approve -input=false -no-color

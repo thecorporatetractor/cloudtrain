@@ -1,0 +1,181 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: iac-incident-unsatisfiable-constraint
+  title: Resolve conflicting provider version constraints
+  domain: iac
+  frameworks: [tf-professional:upgrades]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [terraform, incident, version-constraints, modules, lock-file]
+  version: 1
+spec:
+  description: |
+    A merge request bumped the `tokens` module of `~/stacks/trading-ids` to
+    **`session-tokens` v2.1.0**, and since then `terraform init` fails: no
+    version of the `random` provider satisfies every module's constraint.
+    The modules live in the internal Git repositories `~/git/id-generator.git`
+    and `~/git/session-tokens.git` (tags are releases; read their
+    `CHANGELOG.md`, for example `git -C ~/git/id-generator.git show v1.5.0:CHANGELOG.md`).
+
+    Fix the incident **without reverting the session-tokens bump**:
+
+    1. Find which constraint conflicts, and upgrade the **outdated** module call
+       to a release whose constraint is compatible.
+    2. Initialise so that **one `random` version** satisfies both modules and
+       the **lock file records it**.
+    3. The existing trade prefix and session salt must survive (no
+       regeneration). A plan afterwards reports no changes.
+  objectives:
+    - Read provider requirements across modules to find a conflict
+    - Resolve it by upgrading the right module release
+    - Refresh the dependency lock file and confirm a converged plan
+  params:
+    desk:
+      type: choice
+      values: [power-spot, gas-forward, intraday]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+  setup:
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/make-repos.sh, source: assets/make-repos.sh, mode: "0755"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/seed.sh, source: assets/seed.sh, mode: "0755"}
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/stacks
+    - on: workstation
+      as: learner
+      timeoutSec: 240
+      run: /var/tmp/ct-seed/seed.sh
+    - on: workstation
+      run: |
+        set -eu
+        b=/home/learner/.ct/baseline
+        [ -s $b ] && exit 0
+        install -d -m 0755 /home/learner/.ct
+        jq -r '[.resources[] | select(.type == "random_id" or .type == "random_string") | .instances[0].attributes | (.hex // .result)] | join(" ")' /home/learner/stacks/trading-ids/terraform.tfstate > $b
+        [ "$(wc -w < $b)" = 2 ]
+  checks:
+    - id: lock-records
+      description: The lock file records one random version that satisfies both modules
+      type: shell
+      on: workstation
+      skills: [iac.operations.upgrades, iac.foundations.provider-install]
+      weight: 2
+      command: |
+        f=/home/learner/stacks/trading-ids/.terraform.lock.hcl
+        [ -f $f ] || { echo "no lock file"; exit 0; }
+        sed -n '/^provider "registry\.\(terraform\.io\|opentofu\.org\)\/hashicorp\/random"/,/^}/s/^ *version *= *"\(.*\)"/\1/p' $f | tr '\n' ' '
+      expect: {match: regex, value: '^3\.(8\.1|9\.1) $'}
+    - id: sources
+      description: tokens stays on session-tokens v2.1.0 and ids moved off v1.4.0
+      type: shell
+      on: workstation
+      skills: [iac.operations.upgrades]
+      weight: 2
+      command: |
+        m=/home/learner/stacks/trading-ids/.terraform/modules/modules.json
+        t=$(jq -r '[.Modules[]? | select(.Key == "tokens") | .Source][0] // "none"' $m 2>/dev/null)
+        i=$(jq -r '[.Modules[]? | select(.Key == "ids") | .Source][0] // "none"' $m 2>/dev/null)
+        case $t in *session-tokens.git?ref=v2.1.0) t=v2.1.0 ;; *) t="other($t)" ;; esac
+        case $i in *id-generator.git?ref=v1.4.0) i=outdated ;; *id-generator.git?ref=v*) i=upgraded ;; *) i="other($i)" ;; esac
+        echo "tokens=$t ids=$i"
+      expect: {match: exact, value: tokens=v2.1.0 ids=upgraded}
+    - id: values-kept
+      description: The trade prefix and the session salt are the original values
+      type: shell
+      on: workstation
+      skills: [iac.operations.upgrades]
+      weight: 2
+      timeoutSec: 60
+      command: |
+        now=$(ct-iac state /home/learner/stacks/trading-ids | jq -r '[.values.root_module.child_modules[]?.resources[]? | select(.type == "random_id" or .type == "random_string") | (.values.hex // .values.result)] | sort | join(" ")' 2>/dev/null)
+        was=$(tr ' ' '\n' < /home/learner/.ct/baseline | sort | tr '\n' ' ' | sed 's/ $//')
+        [ -n "$now" ] && [ "$now" = "$was" ] && echo kept || echo regenerated
+      expect: {match: exact, value: kept}
+    - id: converged
+      description: A new plan of ~/stacks/trading-ids reports no changes
+      type: shell
+      on: workstation
+      skills: [iac.foundations.workflow]
+      weight: 1
+      timeoutSec: 120
+      command: ct-iac plan /home/learner/stacks/trading-ids
+      expect: {match: exact, value: no-changes}
+  hints:
+    - title: Who asks for what
+      body: The error lists the combined constraints. `terraform providers` shows which module contributes each one (run it after a failing init).
+      command: cd ~/stacks/trading-ids && terraform providers
+      cost: 1
+    - title: Releases of the module
+      body: List the tags and read the changelog of each one before you pick a target.
+      command: git -C ~/git/id-generator.git tag && git -C ~/git/id-generator.git show v1.5.0:CHANGELOG.md
+      cost: 1
+    - title: Refreshing the lock
+      body: The lock file still pins the old random version. After changing the source, `terraform init -upgrade` re-selects a version within all constraints and rewrites the lock file.
+      cost: 2
+  misconceptions:
+    - id: revert-the-bump
+      description: Reverts session-tokens to v2.0.0 to make init work again.
+      feedback: Reverting drops the release the security team asked for. The conflict comes from id-generator v1.4.0's narrow ~> 3.7.0; upgrade that call instead.
+      expectFail: [sources, lock-records]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          cd ~/stacks/trading-ids
+          sed -i 's|session-tokens.git?ref=v2.1.0|session-tokens.git?ref=v2.0.0|' main.tf
+          iac init -input=false -no-color >/dev/null
+          iac apply -auto-approve -input=false -no-color
+    - id: latest-major
+      description: Jumps id-generator to the newest major release without reading its changelog.
+      feedback: v2.0.0 renames the resource, so the trade prefix is regenerated. v1.5.0 only widens the constraint; or move random_id.trade_prefix to random_id.prefix with a moved block.
+      expectFail: [values-kept]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          cd ~/stacks/trading-ids
+          sed -i 's|id-generator.git?ref=v1.4.0|id-generator.git?ref=v2.0.0|; s|desk   = |desk_name = |' main.tf
+          iac init -upgrade -input=false -no-color >/dev/null
+          iac apply -auto-approve -input=false -no-color
+  solution:
+    explanation: |
+      session-tokens v2.1.0 requires random >= 3.8.0, while id-generator v1.4.0 pins
+      ~> 3.7.0 (>= 3.7.0, < 3.8.0): the intersection is empty. id-generator v1.5.0
+      widens its constraint to >= 3.7.0, < 4.0.0 without other changes, so the
+      combined range is >= 3.8.0, < 4.0.0. `init -upgrade` selects random 3.9.1 and
+      rewrites the lock file; the random resources keep their values across the
+      provider upgrade and the plan is empty.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/stacks/trading-ids
+          iac init -input=false -no-color || true
+          sed -i 's|id-generator.git?ref=v1.4.0|id-generator.git?ref=v1.5.0|' main.tf
+          iac init -upgrade -input=false -no-color
+          iac apply -auto-approve -input=false -no-color
+    alternatives:
+      - id: major-with-moved
+        description: Upgrade to v2.0.0, adapt the input and move the renamed resource.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 300
+            run: |
+              set -e
+              cd ~/stacks/trading-ids
+              sed -i 's|id-generator.git?ref=v1.4.0|id-generator.git?ref=v2.0.0|; s|desk   = |desk_name = |' main.tf
+              printf '\nmoved {\n  from = module.ids.random_id.trade_prefix\n  to   = module.ids.random_id.prefix\n}\n' >> main.tf
+              iac init -upgrade -input=false -no-color
+              iac apply -auto-approve -input=false -no-color

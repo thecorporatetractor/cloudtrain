@@ -1,0 +1,212 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: iac-query-bulk-import
+  title: Find and adopt every unmanaged trading resource with a query
+  domain: iac
+  frameworks: [tf-advanced:lifecycle-import-drift, tf-associate:maintain]
+  difficulty: hard
+  estimatedMinutes: 30
+  tags: [terraform, query, list-resources, import, generate-config, aws-shaped, terraform-only]
+  version: 1
+spec:
+  description: |
+    Over the years the trading desk started instances on the AWS-shaped
+    endpoint (`http://moto:5000`) by hand; nobody knows how many. They are
+    tagged **`team = trading`**. The ops team's instances run in the same
+    account and are **not** yours.
+
+    In `~/stacks/trading-fleet` (provider block ready, nothing managed yet):
+
+    1. declare a **list resource** for `aws_instance` in a **`.tfquery.hcl`**
+       file that finds exactly the instances tagged `team = trading`, and run
+       `terraform query` to see them;
+    2. let `terraform query -generate-config-out=...` write their resource and
+       import blocks, then **clean the generated file** until it plans: the
+       generated draft sets arguments that conflict with each other (read the
+       errors);
+    3. apply, so every trading instance is adopted (imported, not recreated)
+       and nothing of the ops team's is.
+
+    Afterwards a plan reports no changes. (`terraform query` and list
+    resources need Terraform 1.14 or later.)
+  objectives:
+    - Discover unmanaged resources with list resources and terraform query
+    - Generate import configuration for many resources at once and clean it
+    - Adopt exactly the resources a team owns
+  params:
+    count:
+      type: choice
+      values: ["7", "8", "9"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+      - name: moto
+        driver: container
+        image: moto:5
+  setup:
+    - on: moto
+      file: {path: /root/ct-qbi-fleet.py, source: assets/moto-fleet.py, mode: "0600"}
+    - on: moto
+      file: {path: /root/ct-qbi-check.py, source: assets/moto-check.py, mode: "0600"}
+    - on: moto
+      timeoutSec: 180
+      run: |
+        for i in $(seq 1 60); do curl -s -o /dev/null http://localhost:5000/ && break; sleep 2; done
+        python3 /root/ct-qbi-fleet.py
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/iac-query-bulk-import/stack/providers.tf, source: assets/stack/providers.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/iac-query-bulk-import/stack/main.tf, source: assets/stack/main.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/iac-query-bulk-import/seed.sh, source: assets/seed.sh, mode: "0755"}
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/stacks
+    - on: workstation
+      as: learner
+      timeoutSec: 180
+      run: /var/tmp/ct-seed/iac-query-bulk-import/seed.sh
+  checks:
+    - id: adopted
+      description: The state manages every trading instance and no ops instance
+      type: shell
+      on: workstation
+      skills: [iac.state.query, iac.state.import]
+      weight: 3
+      timeoutSec: 90
+      command: |
+        ct-iac state /home/learner/stacks/trading-fleet | jq -r '[.values.root_module.resources[]? | select(.mode == "managed")] as $r
+          | "trading=\([$r[] | select(.type == "aws_instance" and .values.tags.team == "trading") | .values.id] | unique | length) ops=\([$r[] | select(.type == "aws_instance" and .values.tags.team != "trading")] | length) other=\([$r[] | select(.type != "aws_instance")] | length)"' 2>/dev/null
+      expect: {match: exact, value: "trading={{count}} ops=0 other=0"}
+    - id: originals
+      description: The trading instances are the originals (nothing recreated, nothing new), the ops instances untouched
+      type: shell
+      on: moto
+      skills: [iac.state.import]
+      weight: 1
+      timeoutSec: 60
+      command: python3 /root/ct-qbi-check.py
+      expect: {match: exact, value: "originals_trading={{count}}/{{count}} originals_ops=3/3 running_trading={{count}}"}
+    - id: query-file
+      description: A .tfquery.hcl file declares a list resource for aws_instance filtered on the team tag
+      type: shell
+      on: workstation
+      skills: [iac.state.query]
+      weight: 2
+      command: |
+        c=$(cat /home/learner/stacks/trading-fleet/*.tfquery.hcl 2>/dev/null)
+        l=$(printf '%s\n' "$c" | grep -cE '^[[:space:]]*list[[:space:]]+"aws_instance"')
+        t=$(printf '%s\n' "$c" | grep -cE 'tag:team')
+        echo "list=$l team_filter=$([ "$t" -ge 1 ] && echo yes || echo no)"
+      expect: {match: regex, value: '^list=[1-9] team_filter=yes$'}
+    - id: converged
+      description: A new plan of ~/stacks/trading-fleet reports no changes
+      type: shell
+      on: workstation
+      skills: [iac.foundations.workflow]
+      weight: 1
+      timeoutSec: 180
+      command: ct-iac plan /home/learner/stacks/trading-fleet
+      expect: {match: exact, value: no-changes}
+  hints:
+    - title: A list resource
+      body: |
+        In `find.tfquery.hcl`:
+        ```hcl
+        list "aws_instance" "trading" {
+          provider = aws
+          config {
+            filter {
+              name   = "tag:team"
+              values = ["trading"]
+            }
+          }
+        }
+        ```
+        `terraform query` prints one line per match.
+      cost: 1
+    - title: Generate, then read the errors
+      body: '`terraform query -generate-config-out=fleet.tf` writes a resource and an import block per match. The draft sets mutually exclusive arguments (`associate_public_ip_address` with `primary_network_interface`, `ipv6_address_count` with `ipv6_addresses`) and computed `tags_all`; delete those and every `= null` line, then plan again.'
+      cost: 2
+    - title: What the plan should say
+      body: One import per trading instance, nothing to add or destroy. A one-off in-place update of provider-only settings is fine; the next plan must be empty.
+      cost: 1
+  misconceptions:
+    - id: no-filter
+      description: Queries every instance in the account and adopts them all.
+      feedback: Without the tag filter the query returns the ops team's instances too, and now your stack owns (and could destroy) them. Filter on tag:team = trading.
+      expectFail: [adopted]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 600
+        run: |
+          cd ~/stacks/trading-fleet
+          cat > find.tfquery.hcl <<'HCL'
+          list "aws_instance" "trading" {
+            provider = aws
+            config {
+            }
+          }
+          HCL
+          iac query -no-color
+          iac query -no-color -generate-config-out=fleet.tf >/dev/null
+          python3 - <<'PY'
+          import re
+          p = "fleet.tf"; s = open(p).read()
+          s = "\n".join(l for l in s.split("\n") if not re.match(r'^\s*(#.*__generated__.*|# Please review.*)$', l))
+          s = re.sub(r'\n\s*primary_network_interface \{\n[^}]*\}', '', s)
+          s = re.sub(r'\n\s*tags_all\s*=\s*\{[^}]*\}', '', s)
+          s = re.sub(r'\n\s*timeouts \{\s*\}', '', s)
+          drop = ("associate_public_ip_address", "ipv6_address_count", "ipv6_addresses", "tags_all")
+          s = "\n".join(l for l in s.split("\n") if not re.match(r'^\s*(%s)\s*=' % "|".join(drop), l) and not re.search(r'=\s*null\s*$', l))
+          open(p, "w").write(s.strip() + "\n")
+          PY
+          iac plan -input=false -no-color
+          iac apply -auto-approve -input=false -no-color
+  solution:
+    explanation: |
+      A list resource in a .tfquery.hcl file asks the provider to enumerate
+      existing objects; terraform query prints them and, with
+      -generate-config-out, drafts a resource block plus an import block (by
+      resource identity) for each. The draft mirrors every attribute the API
+      returned, including mutually exclusive ones, so it needs the same review as
+      any generated configuration. Applying imports the instances without
+      touching them.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 600
+        run: |
+          set -e
+          cd ~/stacks/trading-fleet
+          cat > find.tfquery.hcl <<'HCL'
+          list "aws_instance" "trading" {
+            provider = aws
+            config {
+              filter {
+                name   = "tag:team"
+                values = ["trading"]
+              }
+            }
+          }
+          HCL
+          iac query -no-color
+          iac query -no-color -generate-config-out=fleet.tf >/dev/null
+          python3 - <<'PY'
+          import re
+          p = "fleet.tf"; s = open(p).read()
+          s = "\n".join(l for l in s.split("\n") if not re.match(r'^\s*(#.*__generated__.*|# Please review.*)$', l))
+          s = re.sub(r'\n\s*primary_network_interface \{\n[^}]*\}', '', s)
+          s = re.sub(r'\n\s*tags_all\s*=\s*\{[^}]*\}', '', s)
+          s = re.sub(r'\n\s*timeouts \{\s*\}', '', s)
+          drop = ("associate_public_ip_address", "ipv6_address_count", "ipv6_addresses", "tags_all")
+          s = "\n".join(l for l in s.split("\n") if not re.match(r'^\s*(%s)\s*=' % "|".join(drop), l) and not re.search(r'=\s*null\s*$', l))
+          open(p, "w").write(s.strip() + "\n")
+          PY
+          iac plan -input=false -no-color
+          iac apply -auto-approve -input=false -no-color

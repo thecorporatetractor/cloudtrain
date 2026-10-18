@@ -1,0 +1,234 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: iac-provider-auth-logs
+  title: Trace a provider authentication failure with debug logs
+  domain: iac
+  frameworks: [tf-associate:maintain, tf-advanced:providers]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [terraform, troubleshooting, tf-log, providers, tls]
+  version: 1
+spec:
+  description: |
+    Since last night's certificate work, every pipeline run of the inland stack
+    (`~/stacks/inland`, cluster `sm-grid`) fails before it changes anything, so
+    the pending change (turbines = {{turbines}}) never reached the cluster. The
+    stack deploys as the ServiceAccount `inland-deployer` through its own
+    kubeconfig.
+
+    1. Reproduce the failure with provider debug logging and **save the log to
+       `~/stacks/inland/provider-debug.log`** (it must contain the failing
+       run's provider output).
+    2. From the log, find which client configuration the provider loaded and
+       which CA bundle it trusts, and **fix the configuration so the provider
+       verifies the API server with the correct CA** (`~/pki` holds the
+       candidates). Skipping TLS verification is not a fix, and the stack must
+       keep deploying as `inland-deployer`.
+    3. Apply the pending change. A plan afterwards reports no changes.
+  objectives:
+    - Capture provider debug output with TF_LOG and TF_LOG_PATH
+    - Locate a misconfigured CA bundle from the provider's log
+    - Fix provider authentication without weakening TLS
+  params:
+    turbines: {type: int, min: 16, max: 24}
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+      - name: sm-grid
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: sm-grid
+  setup:
+    - on: sm-grid
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata: {name: inland-sites}
+        ---
+        apiVersion: v1
+        kind: ServiceAccount
+        metadata: {name: inland-deployer, namespace: inland-sites}
+        ---
+        apiVersion: v1
+        kind: Secret
+        type: kubernetes.io/service-account-token
+        metadata:
+          name: inland-deployer-token
+          namespace: inland-sites
+          annotations: {kubernetes.io/service-account.name: inland-deployer}
+        ---
+        apiVersion: rbac.authorization.k8s.io/v1
+        kind: RoleBinding
+        metadata: {name: inland-deployer, namespace: inland-sites}
+        roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: edit}
+        subjects:
+          - {kind: ServiceAccount, name: inland-deployer, namespace: inland-sites}
+    - on: sm-grid
+      timeoutSec: 60
+      run: |
+        for i in $(seq 1 30); do
+          [ -n "$(kubectl -n inland-sites get secret inland-deployer-token -o jsonpath='{.data.token}')" ] && exit 0; sleep 2
+        done
+        echo "token secret not populated" >&2; exit 1
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/main.tf, source: assets/main.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/seed.sh, source: assets/seed.sh, mode: "0755"}
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/stacks
+    - on: workstation
+      as: learner
+      timeoutSec: 240
+      run: /var/tmp/ct-seed/seed.sh {{turbines}}
+  teardown:
+    - on: sm-grid
+      run: kubectl delete namespace inland-sites --ignore-not-found --wait=false
+  checks:
+    - id: log-captured
+      description: provider-debug.log holds the provider's debug output of the failing run
+      type: shell
+      on: workstation
+      skills: [iac.operations.troubleshooting]
+      weight: 1.5
+      command: |
+        f=/home/learner/stacks/inland/provider-debug.log
+        [ -s $f ] || { echo missing; exit 0; }
+        k=$(grep -c 'Using kubeconfig' $f); x=$(grep -c 'unknown authority' $f)
+        [ "$k" -ge 1 ] && [ "$x" -ge 1 ] && echo captured || echo "kubeconfig-lines=$k tls-errors=$x"
+      expect: {match: exact, value: captured}
+    - id: tls-verified
+      description: The inland kubeconfig trusts the cluster's real CA and does not skip verification
+      type: shell
+      on: workstation
+      skills: [iac.operations.troubleshooting]
+      weight: 2
+      command: |
+        k=/home/learner/.kube/inland.yaml
+        good=$(cat /home/learner/pki/sm-grid-ca.pem | sha256sum | cut -c1-16)
+        p=$(yq -r '.clusters[] | select(.name == "sm-grid") | .cluster["certificate-authority"] // ""' $k 2>/dev/null)
+        d=$(yq -r '.clusters[] | select(.name == "sm-grid") | .cluster["certificate-authority-data"] // ""' $k 2>/dev/null)
+        i=$(yq -r '[.clusters[].cluster["insecure-skip-tls-verify"] // false] | any' $k 2>/dev/null)
+        t=$(cat /home/learner/stacks/inland/*.tf 2>/dev/null | grep -cE '^[[:space:]]*insecure[[:space:]]*=[[:space:]]*true')
+        if [ -n "$d" ]; then got=$(printf '%s' "$d" | base64 -d 2>/dev/null | sha256sum | cut -c1-16)
+        elif [ -n "$p" ]; then p=$(echo "$p" | sed "s|^~|/home/learner|"); got=$(cat "$p" 2>/dev/null | sha256sum | cut -c1-16)
+        else got=none; fi
+        [ "$got" = "$good" ] && ca=correct || ca=wrong
+        echo "ca=$ca insecure=$i insecure-in-code=$t"
+      expect: {match: exact, value: ca=correct insecure=false insecure-in-code=0}
+    - id: still-deployer
+      description: The stack still authenticates through the inland kubeconfig as inland-deployer
+      type: shell
+      on: workstation
+      skills: [iac.operations.troubleshooting]
+      weight: 1
+      command: |
+        c=$(cat /home/learner/stacks/inland/*.tf 2>/dev/null | grep -vE '^[[:space:]]*#')
+        printf '%s\n' "$c" | grep -qE 'config_path[[:space:]]*=[[:space:]]*"[^"]*inland\.yaml"' && p=inland || p=other
+        u=$(yq -r '.users[0].name' /home/learner/.kube/inland.yaml 2>/dev/null)
+        echo "kubeconfig=$p user=$u"
+      expect: {match: exact, value: kubeconfig=inland user=inland-deployer}
+    - id: change-applied
+      description: The pending turbine change reached the cluster
+      type: k8s-query
+      skills: [iac.operations.troubleshooting]
+      weight: 1.5
+      query: {cluster: sm-grid, resource: configmap, name: inland-sites, namespace: inland-sites, jsonpath: "{.data.turbines}"}
+      expect: {match: exact, value: "{{turbines}}"}
+    - id: converged
+      description: A new plan of ~/stacks/inland reports no changes
+      type: shell
+      on: workstation
+      skills: [iac.foundations.workflow]
+      timeoutSec: 120
+      command: ct-iac plan /home/learner/stacks/inland
+      expect: {match: exact, value: no-changes}
+  hints:
+    - title: Turning on the log
+      body: TF_LOG sets the level (TRACE, DEBUG, ...), TF_LOG_PATH sends it to a file instead of stderr.
+      command: cd ~/stacks/inland && TF_LOG=DEBUG TF_LOG_PATH=provider-debug.log terraform plan
+      cost: 1
+    - title: What to look for
+      body: Search the log for the provider's own lines, for example `grep -n kubeconfig provider-debug.log`, then open the file it names and look at the cluster's `certificate-authority`.
+      cost: 1
+    - title: Which bundle is right
+      body: Compare each candidate with what the API server presents, for example `openssl s_client -connect <host:port> -CAfile ~/pki/<file> </dev/null | grep Verify`.
+      cost: 2
+  misconceptions:
+    - id: skip-verify
+      description: Turns off TLS verification in the kubeconfig.
+      feedback: insecure-skip-tls-verify lets anyone in the path impersonate the API server and read the deployer's token. Point certificate-authority at the correct bundle instead.
+      expectFail: [tls-verified]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          cd ~/stacks/inland
+          TF_LOG=DEBUG TF_LOG_PATH=provider-debug.log iac plan -input=false -no-color >/dev/null 2>&1 || true
+          yq -i '(.clusters[] | select(.name == "sm-grid") | .cluster) |= (del(.["certificate-authority"]) | .["insecure-skip-tls-verify"] = true)' ~/.kube/inland.yaml
+          iac apply -auto-approve -input=false -no-color
+    - id: admin-instead
+      description: Switches the provider to the admin kubeconfig.
+      feedback: Your own kubeconfig works, but the stack would then deploy as a cluster admin. Keep the inland kubeconfig and fix its CA path.
+      expectFail: [still-deployer]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          cd ~/stacks/inland
+          TF_LOG=DEBUG TF_LOG_PATH=provider-debug.log iac plan -input=false -no-color >/dev/null 2>&1 || true
+          sed -i 's|config_path    = "~/.kube/inland.yaml"|config_path    = "~/.kube/config"|; s|config_context = "inland"|config_context = "sm-grid"|' main.tf
+          iac apply -auto-approve -input=false -no-color
+    - id: no-log
+      description: Fixes the CA without capturing the debug log.
+      feedback: The runbook needs the provider log of the failing run attached to the incident. Set TF_LOG=DEBUG and TF_LOG_PATH=provider-debug.log before fixing.
+      expectFail: [log-captured]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          cd ~/stacks/inland
+          yq -i '(.clusters[] | select(.name == "sm-grid") | .cluster["certificate-authority"]) = "/home/learner/pki/sm-grid-ca.pem"' ~/.kube/inland.yaml
+          iac apply -auto-approve -input=false -no-color
+  solution:
+    explanation: |
+      The error only says x509: certificate signed by unknown authority. The provider's
+      debug log names the kubeconfig it loaded (~/.kube/inland.yaml); that file's
+      cluster trusts ~/pki/sm-grid-ca-2025.pem, a CA that did not sign the API
+      server's certificate. Pointing certificate-authority at ~/pki/sm-grid-ca.pem
+      (the CA the server's certificate chains to) restores verification without
+      changing the identity, and the pending change applies.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/stacks/inland
+          TF_LOG=DEBUG TF_LOG_PATH=provider-debug.log iac plan -input=false -no-color >/dev/null 2>&1 || true
+          grep -m1 'Using kubeconfig' provider-debug.log
+          yq -i '(.clusters[] | select(.name == "sm-grid") | .cluster["certificate-authority"]) = "/home/learner/pki/sm-grid-ca.pem"' ~/.kube/inland.yaml
+          iac apply -auto-approve -input=false -no-color
+    alternatives:
+      - id: inline-ca-data
+        description: Embed the correct CA as certificate-authority-data in the inland kubeconfig.
+        steps:
+          - on: workstation
+            as: learner
+            timeoutSec: 300
+            run: |
+              set -e
+              cd ~/stacks/inland
+              TF_LOG=DEBUG TF_LOG_PATH=provider-debug.log iac plan -input=false -no-color >/dev/null 2>&1 || true
+              ca=$(base64 -w0 ~/pki/sm-grid-ca.pem)
+              CA="$ca" yq -i '(.clusters[] | select(.name == "sm-grid") | .cluster) |= (del(.["certificate-authority"]) | .["certificate-authority-data"] = strenv(CA))' ~/.kube/inland.yaml
+              iac apply -auto-approve -input=false -no-color

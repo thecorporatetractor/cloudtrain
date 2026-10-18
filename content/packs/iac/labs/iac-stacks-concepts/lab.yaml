@@ -1,0 +1,220 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: iac-stacks-concepts
+  title: Sketch a Stacks layout for the multi-region telemetry estate
+  domain: iac
+  frameworks: [tf-professional:operations]
+  difficulty: easy
+  estimatedMinutes: 15
+  tags: [terraform, stacks, components, deployments, concepts]
+  version: 1
+spec:
+  description: |
+    Saltmarsh repeats the same four telemetry root modules for six regions and
+    two environments and applies them by hand in a fixed order
+    (`~/estate/RUNBOOK.md`). Terraform **Stacks** would replace this: each
+    root module becomes a **component**, each environment-and-region copy a
+    **deployment**, and the apply order follows from the data the components
+    pass each other instead of a hand-run sequence. Stacks need HCP Terraform,
+    so this lab is a design exercise: no stack is run.
+
+    Write **`~/estate/stack-design.yaml`** in this shape:
+
+    ```yaml
+    components:
+      <name>:                     # one per root module in the runbook
+        source: ./modules/<name>
+        depends_on: [<component>, ...]   # components whose outputs it reads
+    deployments:
+      <env>-<region>:             # e.g. staging-north-sea
+        inputs: {env: <env>, region: <region>}
+        group: <env>              # its deployment group
+    deployment_groups:
+      <group>:
+        auto_approve: true|false  # from the runbook's change rules
+    ```
+
+    `depends_on` lists only real data dependencies from the runbook's table,
+    not the order engineers happen to use today.
+  objectives:
+    - Map repeated root modules onto Stacks components and deployments
+    - Derive orchestration from component data dependencies
+    - Express approval rules as deployment groups
+  params:
+    dashsrc:
+      type: choice
+      values: ["telemetry (service URL)", "telemetry (service URL), network (vpc id)"]
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+  setup:
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/RUNBOOK.md, source: assets/RUNBOOK.md, mode: "0644"}
+    - on: workstation
+      run: |
+        install -d -o learner -g learner /home/learner/estate
+        [ -e /home/learner/estate/RUNBOOK.md ] || install -m 0644 -o learner -g learner /var/tmp/ct-seed/RUNBOOK.md /home/learner/estate/RUNBOOK.md
+  checks:
+    - id: components
+      description: One component per root module with its source
+      type: shell
+      on: workstation
+      skills: [iac.collaboration.stacks-concepts]
+      weight: 1.5
+      command: |
+        yq -o json '.components // {}' /home/learner/estate/stack-design.yaml 2>/dev/null | jq -r 'to_entries | map("\(.key)=\(.value.source // "-")") | sort | join(" ")' 2>/dev/null || echo unreadable
+      expect: {match: exact, value: cluster=./modules/cluster dashboards=./modules/dashboards network=./modules/network telemetry=./modules/telemetry}
+    - id: dependencies
+      description: depends_on matches the data each component reads, and nothing more
+      type: shell
+      on: workstation
+      skills: [iac.collaboration.stacks-concepts]
+      weight: 3
+      command: |
+        if grep -E '^\| dashboards' /var/tmp/ct-seed/RUNBOOK.md | grep -q network; then want="cluster=network dashboards=network,telemetry network= telemetry=cluster,network"
+        else want="cluster=network dashboards=telemetry network= telemetry=cluster,network"; fi
+        got=$(yq -o json '.components // {}' /home/learner/estate/stack-design.yaml 2>/dev/null | jq -r 'to_entries | map("\(.key)=\((.value.depends_on // []) | sort | join(","))") | sort | join(" ")' 2>/dev/null)
+        [ "$got" = "$want" ] && echo matches || echo "got: $got"
+      expect: {match: exact, value: matches}
+    - id: deployments
+      description: Twelve deployments, one per environment and region, with matching inputs
+      type: shell
+      on: workstation
+      skills: [iac.collaboration.stacks-concepts]
+      weight: 2
+      command: |
+        yq -o json '.deployments // {}' /home/learner/estate/stack-design.yaml 2>/dev/null | jq -r '
+          [ ["staging","prod"][] as $e | ["north-sea","irish-sea","celtic-sea","fens","pennines","highlands"][] as $r | "\($e)-\($r)|\($e)|\($r)" ] as $want
+          | [to_entries[] | "\(.key)|\(.value.inputs.env // "-")|\(.value.inputs.region // "-")"] as $got
+          | "deployments=\($got | length) matching=\([$want[] | select(. as $w | $got | index($w))] | length)"' 2>/dev/null || echo unreadable
+      expect: {match: exact, value: deployments=12 matching=12}
+    - id: approval-groups
+      description: Staging deployments auto-approve, production deployments wait for a human
+      type: shell
+      on: workstation
+      skills: [iac.collaboration.stacks-concepts]
+      weight: 2
+      command: |
+        yq -o json '.' /home/learner/estate/stack-design.yaml 2>/dev/null | jq -r '
+          (.deployment_groups // {}) as $g
+          | [(.deployments // {}) | to_entries[] | "\(.value.inputs.env // "-")=\(($g[.value.group // "-"] // {}).auto_approve | if . == null then "none" else tostring end)"] | unique | sort | join(" ")' 2>/dev/null || echo unreadable
+      expect: {match: exact, value: prod=false staging=true}
+  hints:
+    - title: Components and deployments
+      body: A component is one root module call (source plus inputs) inside the stack; a deployment is one instance of the whole stack with its own inputs and state. Six regions times two environments is twelve deployments of four components, not forty-eight anything.
+      cost: 1
+    - title: Where the order comes from
+      body: Inside a stack, a component that references another component's outputs waits for it. Read the "Reads outputs of" column, not the hand-run order.
+      cost: 1
+    - title: Approvals
+      body: Deployment groups carry orchestration rules such as auto-approval; put every staging deployment in one group and every prod deployment in another.
+      cost: 1
+  misconceptions:
+    - id: copy-the-run-order
+      description: Turns today's apply order into a chain of depends_on.
+      feedback: dashboards does not read the cluster's outputs, so it need not wait for it. Stacks orders components by the data they exchange; list only those references.
+      expectFail: [dependencies]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          cd ~/estate
+          cat > stack-design.yaml <<'YML'
+          components:
+            network: {source: ./modules/network, depends_on: []}
+            cluster: {source: ./modules/cluster, depends_on: [network]}
+            telemetry: {source: ./modules/telemetry, depends_on: [network, cluster]}
+            dashboards: {source: ./modules/dashboards, depends_on: [network, cluster, telemetry]}
+          deployment_groups:
+            staging: {auto_approve: true}
+            prod: {auto_approve: false}
+          deployments: {}
+          YML
+          for e in staging prod; do for r in north-sea irish-sea celtic-sea fens pennines highlands; do
+            E=$e R=$r yq -i '.deployments[strenv(E) + "-" + strenv(R)] = {"inputs": {"env": strenv(E), "region": strenv(R)}, "group": strenv(E)}' stack-design.yaml
+          done; done
+    - id: region-only
+      description: Creates one deployment per region and treats the environment as a component setting.
+      feedback: Staging and prod need separate state and separate approval, so each environment-region pair is its own deployment.
+      expectFail: [deployments, approval-groups]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          cd ~/estate
+          if grep -E '^\| dashboards' RUNBOOK.md | grep -q network; then dd="[telemetry, network]"; else dd="[telemetry]"; fi
+          cat > stack-design.yaml <<YML
+          components:
+            network: {source: ./modules/network, depends_on: []}
+            cluster: {source: ./modules/cluster, depends_on: [network]}
+            telemetry: {source: ./modules/telemetry, depends_on: [cluster, network]}
+            dashboards: {source: ./modules/dashboards, depends_on: $dd}
+          deployment_groups:
+            all: {auto_approve: false}
+          deployments: {}
+          YML
+          for r in north-sea irish-sea celtic-sea fens pennines highlands; do
+            R=$r yq -i '.deployments[strenv(R)] = {"inputs": {"region": strenv(R)}, "group": "all"}' stack-design.yaml
+          done
+    - id: approve-everything
+      description: Auto-approves production as well.
+      feedback: The change rules require a human approval for production plans. Give prod deployments a group with auto_approve false.
+      expectFail: [approval-groups]
+      mutation:
+        on: workstation
+        as: learner
+        run: |
+          cd ~/estate
+          if grep -E '^\| dashboards' RUNBOOK.md | grep -q network; then dd="[telemetry, network]"; else dd="[telemetry]"; fi
+          cat > stack-design.yaml <<YML
+          components:
+            network: {source: ./modules/network, depends_on: []}
+            cluster: {source: ./modules/cluster, depends_on: [network]}
+            telemetry: {source: ./modules/telemetry, depends_on: [cluster, network]}
+            dashboards: {source: ./modules/dashboards, depends_on: $dd}
+          deployment_groups:
+            estate: {auto_approve: true}
+          deployments: {}
+          YML
+          for e in staging prod; do for r in north-sea irish-sea celtic-sea fens pennines highlands; do
+            E=$e R=$r yq -i '.deployments[strenv(E) + "-" + strenv(R)] = {"inputs": {"env": strenv(E), "region": strenv(R)}, "group": "estate"}' stack-design.yaml
+          done; done
+  solution:
+    explanation: |
+      Each root module becomes one component; the stack is deployed twelve times
+      (every environment in every region), each deployment with its own inputs and
+      state. Within a deployment, Stacks plans and applies components in the order
+      their references require: network first, cluster and telemetry after the
+      outputs they read, dashboards after telemetry. No hand-run sequence is needed,
+      and components that do not depend on each other can run in parallel. The
+      change rules become two deployment groups: staging auto-approves, prod waits
+      for a human. In HCL this is a `.tfcomponent.hcl` file with component blocks
+      and a `.tfdeploy.hcl` file with deployment, deployment_group and
+      deployment_auto_approve blocks.
+    steps:
+      - on: workstation
+        as: learner
+        run: |
+          set -e
+          cd ~/estate
+          if grep -E '^\| dashboards' RUNBOOK.md | grep -q network; then dd="[telemetry, network]"; else dd="[telemetry]"; fi
+          cat > stack-design.yaml <<YML
+          components:
+            network: {source: ./modules/network, depends_on: []}
+            cluster: {source: ./modules/cluster, depends_on: [network]}
+            telemetry: {source: ./modules/telemetry, depends_on: [cluster, network]}
+            dashboards: {source: ./modules/dashboards, depends_on: $dd}
+          deployment_groups:
+            staging: {auto_approve: true}
+            prod: {auto_approve: false}
+          deployments: {}
+          YML
+          for e in staging prod; do for r in north-sea irish-sea celtic-sea fens pennines highlands; do
+            E=$e R=$r yq -i '.deployments[strenv(E) + "-" + strenv(R)] = {"inputs": {"env": strenv(E), "region": strenv(R)}, "group": strenv(E)}' stack-design.yaml
+          done; done
+          cat stack-design.yaml

@@ -1,0 +1,201 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: tofu-migrate-from-terraform
+  title: Migrate a Terraform-managed estate to OpenTofu
+  domain: iac
+  frameworks: [opentofu:migration]
+  difficulty: hard
+  estimatedMinutes: 40
+  tags: [opentofu, migration, state, lock-file, s3]
+  version: 1
+spec:
+  description: |
+    The trading stack in `~/stacks/trading` was last applied with **Terraform
+    1.5.7** (still on this workstation as `terraform-1.5`); its state is in
+    the S3 bucket `saltmarsh-state` (key `trading/terraform.tfstate`) on the
+    workstation's store. Saltmarsh is moving the stack to **OpenTofu**
+    (`tofu`). Migrate it **without any resource change**:
+
+    1. Before anything else, save the current state as
+       **`~/backups/trading-1.5.7.tfstate`** (for example with
+       `terraform-1.5 state pull`).
+    2. Make the configuration acceptable to OpenTofu: the `required_version`
+       constraint must allow OpenTofu 1.11.
+    3. Modernise the backend while you are at it: replace the deprecated
+       `endpoint` and `force_path_style` arguments with
+       `endpoints = { s3 = "http://127.0.0.1:8333" }` and
+       `use_path_style = true`, and turn on **`use_lockfile = true`**
+       (Terraform 1.5 could not lock this backend). Same bucket, same key.
+    4. Initialise with `tofu`, so the **lock file** records the providers
+       under OpenTofu's registry (same versions as before), check that the
+       first `tofu plan` is empty, then **apply once with tofu** so the state
+       in the bucket is written by OpenTofu.
+
+    The desk's pet name and feed port must stay as they are.
+  objectives:
+    - Back up state before a tool migration
+    - Migrate state and the dependency lock file from Terraform to OpenTofu
+    - Prove a migration is a no-op with an empty plan
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+  setup:
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/main.tf, source: assets/main.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/seed.sh, source: assets/seed.sh, mode: "0755"}
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/stacks
+    - on: workstation
+      as: learner
+      timeoutSec: 240
+      run: /var/tmp/ct-seed/seed.sh
+  checks:
+    - id: backup
+      description: ~/backups/trading-1.5.7.tfstate is the state as Terraform 1.5.7 left it
+      type: shell
+      on: workstation
+      skills: [iac.opentofu.migration]
+      weight: 1.5
+      command: |
+        f=/home/learner/backups/trading-1.5.7.tfstate
+        l=$(sed -n 2p /home/learner/stacks/trading/.ct-seeded)
+        jq -r --arg l "$l" '"version=\(.terraform_version) lineage=\(if .lineage == $l then "same" else "other" end) resources=\(.resources | length)"' $f 2>/dev/null || echo missing
+      expect: {match: exact, value: version=1.5.7 lineage=same resources=2}
+    - id: written-by-tofu
+      description: The bucket's state was last written by OpenTofu 1.11 and keeps its lineage
+      type: shell
+      on: workstation
+      skills: [iac.opentofu.migration]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        ct-s3 ensure >/dev/null 2>&1
+        l=$(sed -n 2p /home/learner/stacks/trading/.ct-seeded)
+        ct-s3 api GET '/saltmarsh-state/trading/terraform.tfstate' | jq -r --arg l "$l" '"version=\(.terraform_version | split(".")[0:2] | join(".")) lineage=\(if .lineage == $l then "same" else "other" end)"' 2>/dev/null || echo unreadable
+      expect: {match: exact, value: version=1.11 lineage=same}
+    - id: nothing-changed
+      description: The desk keeps its pet name and feed port
+      type: shell
+      on: workstation
+      skills: [iac.opentofu.migration]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        ct-s3 ensure >/dev/null 2>&1
+        now=$(ct-s3 api GET '/saltmarsh-state/trading/terraform.tfstate' | jq -r '.outputs.desk.value // "none"' 2>/dev/null)
+        [ "$now" = "$(sed -n 1p /home/learner/stacks/trading/.ct-seeded)" ] && echo same || echo "desk=$now"
+      expect: {match: exact, value: same}
+    - id: lock-file
+      description: The lock file records only OpenTofu registry entries, at the versions Terraform used
+      type: shell
+      on: workstation
+      skills: [iac.opentofu.migration]
+      weight: 1.5
+      command: |
+        f=/home/learner/stacks/trading/.terraform.lock.hcl
+        tr -d '\n' < $f 2>/dev/null | grep -oE 'provider "[^"]+" \{ *version *= *"[^"]+"' | sed -E 's/provider "([^"]+)" \{ *version *= *"([^"]+)"/\1@\2/' | sort | tr '\n' ' '
+      expect: {match: exact, value: "registry.opentofu.org/hashicorp/random@3.7.2 "}
+    - id: backend-modernised
+      description: The stack is initialised with endpoints, use_path_style and use_lockfile on the same key
+      type: shell
+      on: workstation
+      skills: [iac.opentofu.migration, iac.state.locking]
+      weight: 1.5
+      command: |
+        jq -r '.backend.config as $c | "type=\(.backend.type) key=\($c.key) endpoints=\($c.endpoints.s3 // "-") path_style=\($c.use_path_style) lockfile=\($c.use_lockfile) endpoint=\($c.endpoint // "-") force_path_style=\($c.force_path_style // "-")"' /home/learner/stacks/trading/.terraform/terraform.tfstate 2>/dev/null || echo "not initialised"
+      expect: {match: exact, value: "type=s3 key=trading/terraform.tfstate endpoints=http://127.0.0.1:8333 path_style=true lockfile=true endpoint=- force_path_style=-"}
+    - id: converged
+      description: A tofu plan of ~/stacks/trading reports no changes
+      type: shell
+      on: workstation
+      skills: [iac.foundations.workflow]
+      weight: 1
+      timeoutSec: 120
+      command: |
+        ct-iac run /home/learner/stacks/trading sh -c 'tofu plan -lock=false -input=false -no-color -detailed-exitcode >/dev/null 2>&1'
+        case $? in 0) echo no-changes ;; 2) echo changes ;; *) echo error ;; esac
+      expect: {match: exact, value: no-changes}
+  hints:
+    - title: Back up first
+      body: '`cd ~/stacks/trading && terraform-1.5 state pull > ~/backups/trading-1.5.7.tfstate` works while the stack is still initialised for Terraform 1.5.7.'
+      cost: 1
+    - title: Version constraint
+      body: OpenTofu checks `required_version` against its own version (1.11), so `~> 1.5.0` stops it. Widen it, for example to `>= 1.5.0`.
+      cost: 1
+    - title: Re-initialising
+      body: After changing backend arguments, `tofu init -reconfigure` (same bucket and key, so nothing needs copying). tofu rewrites the lock file entries for registry.opentofu.org itself.
+      cost: 2
+    - title: Writing the state with tofu
+      body: A plan never writes state. `tofu apply` with no changes still saves the state, now stamped with OpenTofu's version.
+      cost: 1
+  misconceptions:
+    - id: fresh-start
+      description: Points the backend at a new key and applies from scratch.
+      feedback: A new key is an empty state, so OpenTofu creates new resources (a new pet name and port) next to the old ones. Keep the same key; the existing state is readable by OpenTofu as it is.
+      expectFail: [written-by-tofu, backend-modernised]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          cd ~/stacks/trading
+          terraform-1.5 state pull > ~/backups/trading-1.5.7.tfstate
+          sed -i 's/~> 1.5.0/>= 1.5.0/; s|key *= "trading/terraform.tfstate"|key = "trading-tofu/terraform.tfstate"|; s|endpoint *= "http://127.0.0.1:8333"|endpoints = { s3 = "http://127.0.0.1:8333" }|; s|force_path_style *= true|use_path_style = true\n    use_lockfile = true|' main.tf
+          rm -rf .terraform
+          tofu init -reconfigure -input=false -no-color >/dev/null
+          tofu apply -auto-approve -input=false -no-color
+    - id: plan-only
+      description: Migrates the configuration and plans with tofu, but never applies.
+      feedback: An empty plan proves the migration is safe, but the state in the bucket is still the one Terraform 1.5.7 wrote. Apply once with tofu to take it over.
+      expectFail: [written-by-tofu]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          cd ~/stacks/trading
+          terraform-1.5 state pull > ~/backups/trading-1.5.7.tfstate
+          sed -i 's/~> 1.5.0/>= 1.5.0/; s|endpoint *= "http://127.0.0.1:8333"|endpoints = { s3 = "http://127.0.0.1:8333" }|; s|force_path_style *= true|use_path_style = true\n    use_lockfile = true|' main.tf
+          tofu init -reconfigure -input=false -no-color >/dev/null
+          tofu plan -input=false -no-color
+    - id: no-backup
+      description: Migrates without saving the Terraform 1.5.7 state first.
+      feedback: Once OpenTofu writes the state, Terraform 1.5.7 may refuse it. Keep a copy of the pre-migration state so the move can be rolled back.
+      expectFail: [backup]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          cd ~/stacks/trading
+          sed -i 's/~> 1.5.0/>= 1.5.0/; s|endpoint *= "http://127.0.0.1:8333"|endpoints = { s3 = "http://127.0.0.1:8333" }|; s|force_path_style *= true|use_path_style = true\n    use_lockfile = true|' main.tf
+          tofu init -reconfigure -input=false -no-color >/dev/null
+          tofu apply -auto-approve -input=false -no-color
+  solution:
+    explanation: |
+      OpenTofu reads state written by Terraform up to 1.5.x as it is, so a
+      migration is configuration work: allow OpenTofu in `required_version`,
+      re-initialise (here with modern backend arguments and lockfile locking),
+      and let tofu rewrite the lock file under registry.opentofu.org at the same
+      provider versions. The first tofu plan must be empty; one tofu apply then
+      writes the state with OpenTofu's version stamp, keeping its lineage. The
+      backup taken with Terraform 1.5.7 is the rollback path.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/stacks/trading
+          terraform-1.5 state pull > ~/backups/trading-1.5.7.tfstate
+          sed -i 's/~> 1.5.0/>= 1.5.0/; s|endpoint *= "http://127.0.0.1:8333"|endpoints = { s3 = "http://127.0.0.1:8333" }|; s|force_path_style *= true|use_path_style = true\n    use_lockfile = true|' main.tf
+          tofu fmt >/dev/null
+          tofu init -reconfigure -input=false -no-color >/dev/null
+          tofu plan -input=false -no-color -detailed-exitcode
+          tofu apply -auto-approve -input=false -no-color

@@ -1,0 +1,245 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: iac-remote-state-sharing
+  title: Consume network outputs from another stack's state
+  domain: iac
+  frameworks: [tf-associate:state, tf-advanced:collaboration]
+  difficulty: medium
+  estimatedMinutes: 20
+  tags: [terraform, remote-state, outputs, s3-backend, aws-shaped]
+  version: 1
+spec:
+  description: |
+    Two stacks share the trading desk estate on the AWS-shaped endpoint
+    (`http://moto:5000`); both keep their state in the workstation's S3 store
+    (bucket `sm-trading-tfstate`, see their backend blocks):
+
+    - `~/stacks/trading-net` (network team) creates the VPC and one app
+      subnet per zone (`aws_subnet.app`, keyed by zone);
+    - `~/stacks/trading-app` (trading team) runs two order gateways whose
+      **subnet ids were copied in by hand**.
+
+    Make the dependency explicit:
+
+    1. publish an output **`app_subnet_ids`** from `trading-net`: a map from
+       zone (`eu-west-2a`, `eu-west-2b`) to subnet id;
+    2. in `trading-app`, read it with a **`terraform_remote_state`** data
+       source on the network stack's S3 state and use it for both gateways,
+       so no subnet id is written in the app's configuration.
+
+    Neither gateway may be recreated, and both stacks must plan with no
+    changes afterwards.
+  objectives:
+    - Publish outputs as a contract for other stacks
+    - Read another stack's outputs with terraform_remote_state
+    - Remove copied identifiers without recreating resources
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+      - name: moto
+        driver: container
+        image: moto:5
+  setup:
+    - on: moto
+      file: {path: /root/ct-moto-ids.py, source: assets/moto-ids.py, mode: "0600"}
+    - on: moto
+      timeoutSec: 120
+      run: for i in $(seq 1 60); do curl -s -o /dev/null http://localhost:5000/ && break; sleep 2; done
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/iac-remote-state-sharing/trading-net/providers.tf, source: assets/trading-net/providers.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/iac-remote-state-sharing/trading-net/main.tf, source: assets/trading-net/main.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/iac-remote-state-sharing/trading-app/providers.tf, source: assets/trading-app/providers.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/iac-remote-state-sharing/trading-app/main.tf, source: assets/trading-app/main.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/iac-remote-state-sharing/seed.sh, source: assets/seed.sh, mode: "0755"}
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/stacks
+    - on: workstation
+      as: learner
+      timeoutSec: 400
+      run: /var/tmp/ct-seed/iac-remote-state-sharing/seed.sh
+    - on: moto
+      timeoutSec: 60
+      run: python3 /root/ct-moto-ids.py record order-gateway-a order-gateway-b
+  checks:
+    - id: output-published
+      description: trading-net publishes app_subnet_ids for eu-west-2a and eu-west-2b
+      type: shell
+      on: workstation
+      skills: [iac.state.sharing]
+      weight: 2
+      timeoutSec: 90
+      command: |
+        ct-iac state /home/learner/stacks/trading-net | jq -r '.values.outputs.app_subnet_ids.value // {} | to_entries | map("\(.key)=\(if (.value | startswith("subnet-")) then "id" else "?" end)") | join(" ")' 2>/dev/null
+      expect: {match: exact, value: eu-west-2a=id eu-west-2b=id}
+    - id: reads-remote-state
+      description: trading-app reads the network stack's S3 state through terraform_remote_state
+      type: shell
+      on: workstation
+      skills: [iac.state.sharing]
+      weight: 2
+      timeoutSec: 150
+      command: |
+        ct-iac planjson /home/learner/stacks/trading-app | jq -r '[.prior_state.values.root_module.resources[]? | select(.mode == "data" and .type == "terraform_remote_state") | "\(.values.backend):\(.values.config.key)"] | unique | join(" ")' 2>/dev/null
+      expect: {match: exact, value: "s3:trading-net/terraform.tfstate"}
+    - id: no-literals
+      description: trading-app's configuration contains no subnet id
+      type: shell
+      on: workstation
+      skills: [iac.state.sharing]
+      weight: 2
+      command: cat /home/learner/stacks/trading-app/*.tf 2>/dev/null | sed 's/#.*//' | grep -cE '"subnet-[0-9a-f]+"' || true
+      expect: {match: exact, value: "0"}
+    - id: gateways-kept
+      description: Both order gateways are the original instances
+      type: shell
+      on: moto
+      skills: [iac.state.sharing]
+      weight: 1
+      timeoutSec: 60
+      command: python3 /root/ct-moto-ids.py check order-gateway-a order-gateway-b
+      expect: {match: exact, value: order-gateway-a=same order-gateway-b=same}
+    - id: converged
+      description: Both stacks plan with no changes
+      type: shell
+      on: workstation
+      skills: [iac.foundations.workflow]
+      weight: 1
+      timeoutSec: 240
+      command: echo "net=$(ct-iac plan /home/learner/stacks/trading-net) app=$(ct-iac plan /home/learner/stacks/trading-app)"
+      expect: {match: exact, value: net=no-changes app=no-changes}
+  hints:
+    - title: Outputs are the contract
+      body: Another stack can only read what the network stack publishes as outputs. A `for` expression turns the keyed subnets into a zone => id map.
+      cost: 1
+    - title: The data source
+      body: '`data "terraform_remote_state" "net" { backend = "s3"  config = { ... } }` takes the same settings as the network stack''s backend block (bucket, key, endpoints, path style, skips; no use_lockfile, it only reads). Its outputs are under `data.terraform_remote_state.net.outputs`.'
+      cost: 2
+    - title: Order matters
+      body: Apply the network stack first so its state contains the output; the app stack can only read outputs that exist in that state.
+      cost: 1
+  misconceptions:
+    - id: declared-not-used
+      description: Publishes the output and declares the data source, but keeps the literal ids.
+      feedback: The data source does nothing until you reference it. Replace each literal subnet id with data.terraform_remote_state.net.outputs.app_subnet_ids["<zone>"].
+      expectFail: [no-literals]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 500
+        run: |
+          set -e
+          cd ~/stacks/trading-net
+          cat > outputs.tf <<'HCL'
+          output "app_subnet_ids" {
+            description = "Trading app subnets by availability zone."
+            value       = { for zone, s in aws_subnet.app : zone => s.id }
+          }
+          HCL
+          iac apply -auto-approve -input=false -no-color
+          cd ~/stacks/trading-app
+          cat > network.tf <<'HCL'
+          data "terraform_remote_state" "net" {
+            backend = "s3"
+            config = {
+              bucket                      = "sm-trading-tfstate"
+              key                         = "trading-net/terraform.tfstate"
+              region                      = "us-east-1"
+              endpoints                   = { s3 = "http://127.0.0.1:8333" }
+              use_path_style              = true
+              skip_credentials_validation = true
+              skip_region_validation      = true
+              skip_requesting_account_id  = true
+              skip_metadata_api_check     = true
+            }
+          }
+          HCL
+          iac apply -auto-approve -input=false -no-color
+    - id: output-missing
+      description: Points the app at an output the network stack never published.
+      feedback: The remote state only contains outputs; without app_subnet_ids in trading-net the reference fails and nothing can be planned. Add the output and apply the network stack first.
+      expectFail: [output-published, reads-remote-state, converged]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 500
+        run: |
+          cd ~/stacks/trading-app
+          cat > network.tf <<'HCL'
+          data "terraform_remote_state" "net" {
+            backend = "s3"
+            config = {
+              bucket                      = "sm-trading-tfstate"
+              key                         = "trading-net/terraform.tfstate"
+              region                      = "us-east-1"
+              endpoints                   = { s3 = "http://127.0.0.1:8333" }
+              use_path_style              = true
+              skip_credentials_validation = true
+              skip_region_validation      = true
+              skip_requesting_account_id  = true
+              skip_metadata_api_check     = true
+            }
+          }
+          HCL
+          python3 - <<'PY'
+          import re
+          p = "main.tf"; s = open(p).read()
+          s = re.sub(r'(resource "aws_instance" "gateway_a" \{.*?subnet_id     = )"subnet-[0-9a-f]+"', r'\1data.terraform_remote_state.net.outputs.app_subnet_ids["eu-west-2a"]', s, flags=re.S)
+          s = re.sub(r'(resource "aws_instance" "gateway_b" \{.*?subnet_id     = )"subnet-[0-9a-f]+"', r'\1data.terraform_remote_state.net.outputs.app_subnet_ids["eu-west-2b"]', s, flags=re.S)
+          open(p, "w").write(s)
+          PY
+          iac apply -auto-approve -input=false -no-color || true
+  solution:
+    explanation: |
+      Outputs are the only part of a state other stacks may rely on. Publishing
+      app_subnet_ids and reading it through terraform_remote_state replaces the
+      copied ids with a live reference; the values are the same, so the plan is
+      empty and no gateway changes. When the network team replaces a subnet, the
+      app stack's next plan follows automatically.
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 500
+        run: |
+          set -e
+          cd ~/stacks/trading-net
+          cat > outputs.tf <<'HCL'
+          output "app_subnet_ids" {
+            description = "Trading app subnets by availability zone."
+            value       = { for zone, s in aws_subnet.app : zone => s.id }
+          }
+          HCL
+          iac apply -auto-approve -input=false -no-color
+          cd ~/stacks/trading-app
+          cat > network.tf <<'HCL'
+          data "terraform_remote_state" "net" {
+            backend = "s3"
+            config = {
+              bucket                      = "sm-trading-tfstate"
+              key                         = "trading-net/terraform.tfstate"
+              region                      = "us-east-1"
+              endpoints                   = { s3 = "http://127.0.0.1:8333" }
+              use_path_style              = true
+              skip_credentials_validation = true
+              skip_region_validation      = true
+              skip_requesting_account_id  = true
+              skip_metadata_api_check     = true
+            }
+          }
+          HCL
+          python3 - <<'PY'
+          import re
+          p = "main.tf"; s = open(p).read()
+          s = re.sub(r'(resource "aws_instance" "gateway_a" \{.*?subnet_id     = )"subnet-[0-9a-f]+"', r'\1data.terraform_remote_state.net.outputs.app_subnet_ids["eu-west-2a"]', s, flags=re.S)
+          s = re.sub(r'(resource "aws_instance" "gateway_b" \{.*?subnet_id     = )"subnet-[0-9a-f]+"', r'\1data.terraform_remote_state.net.outputs.app_subnet_ids["eu-west-2b"]', s, flags=re.S)
+          open(p, "w").write(s)
+          PY
+          iac apply -auto-approve -input=false -no-color

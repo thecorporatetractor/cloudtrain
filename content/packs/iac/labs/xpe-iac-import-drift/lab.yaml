@@ -1,0 +1,200 @@
+apiVersion: cloudtrain.dev/v3
+kind: Lab
+metadata:
+  id: xpe-iac-import-drift
+  title: Adopt hand-made cluster objects into state
+  domain: iac
+  frameworks: [ct-platform:iac-provisioning]
+  difficulty: hard
+  estimatedMinutes: 25
+  tags: [exam, capstone, terraform, import, drift]
+  version: 1
+spec:
+  description: |
+    **Directory:** `~/exam/tracking-adopt` · **Cluster:** `qm-tenants`
+
+    During the harbour cut-over someone created ConfigMap
+    **`tracking-settings`** and Service **`tracking-api`** in namespace
+    **`tracking-cfg`** by hand. The stack already holds the reviewed
+    configuration for both, but neither is in state, so a plan wants to create
+    them and fails.
+
+    - Bring both objects under management with **`import` blocks**; they must
+      not be deleted or recreated.
+    - One label on the live objects was changed by hand and differs from the
+      reviewed configuration. The **configuration is right**: do not copy the
+      live value into the code; let the apply reconcile the object.
+
+    Apply; the following plan must report no changes.
+  objectives:
+    - Adopt existing objects with import blocks
+    - Reconcile drift towards the reviewed configuration
+  params:
+    region:
+      type: choice
+      values: [north-quay, east-basin, dry-dock]
+    poll: {type: int, min: 10, max: 60}
+  topology:
+    entry: workstation
+    nodes:
+      - name: workstation
+        driver: container
+        image: terraform-ws:1.15
+        access: [shell]
+      - name: qm-tenants
+        driver: k8s-cluster
+        cluster:
+          mode: virtual
+          version: "v1.37"
+          context: qm-tenants
+  setup:
+    - on: qm-tenants
+      apply: |
+        apiVersion: v1
+        kind: Namespace
+        metadata:
+          name: tracking-cfg
+        ---
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: tracking-settings
+          namespace: tracking-cfg
+          labels: {app.kubernetes.io/name: tracking, quillmoor.example/owner: harbour-ops}
+        data:
+          TRACKING_REGION: "{{region}}"
+          POLL_INTERVAL_SEC: "{{poll}}"
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: tracking-api
+          namespace: tracking-cfg
+          labels: {app.kubernetes.io/name: tracking, quillmoor.example/tier: frontend}
+        spec:
+          selector: {app: tracking-api}
+          ports:
+            - name: http
+              port: 80
+              targetPort: 8080
+    - on: qm-tenants
+      run: |
+        set -eu
+        kubectl -n kube-system get configmap ct-xpe-adopt >/dev/null 2>&1 && exit 0
+        kubectl -n kube-system create configmap ct-xpe-adopt \
+          --from-literal=cm=$(kubectl -n tracking-cfg get configmap tracking-settings -o jsonpath='{.metadata.uid}') \
+          --from-literal=svc=$(kubectl -n tracking-cfg get service tracking-api -o jsonpath='{.metadata.uid}')
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xpe-iac-import-drift/stack/providers.tf, source: assets/stack/providers.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xpe-iac-import-drift/stack/main.tf, source: assets/stack/main.tf, mode: "0644"}
+    - on: workstation
+      file: {path: /var/tmp/ct-seed/xpe-iac-import-drift/seed.sh, source: assets/seed.sh, mode: "0755"}
+    - on: workstation
+      run: install -d -o learner -g learner /home/learner/exam
+    - on: workstation
+      as: learner
+      timeoutSec: 120
+      run: /var/tmp/ct-seed/xpe-iac-import-drift/seed.sh xpe-iac-import-drift tracking-adopt init
+  teardown:
+    - on: qm-tenants
+      run: kubectl delete namespace tracking-cfg --ignore-not-found --wait=false
+  checks:
+    - id: in-state
+      description: The ConfigMap and the Service are managed in the stack's state
+      type: shell
+      on: workstation
+      skills: [iac.state.import]
+      weight: 2
+      timeoutSec: 60
+      command: |
+        ct-iac state /home/learner/exam/tracking-adopt | jq -r '[.values.root_module.resources[]? | select(.mode == "managed") | .address] | sort | join(" ")' 2>/dev/null
+      expect: {match: exact, value: kubernetes_config_map_v1.tracking kubernetes_service_v1.tracking}
+    - id: objects-kept
+      description: Both objects are the hand-made originals and keep their data and port
+      type: shell
+      on: qm-tenants
+      skills: [iac.state.import, k8s.networking.services]
+      weight: 2
+      timeoutSec: 30
+      command: |
+        b() { kubectl -n kube-system get configmap ct-xpe-adopt -o jsonpath="{.data.$1}"; }
+        c=$(kubectl -n tracking-cfg get configmap tracking-settings -o jsonpath='{.metadata.uid}' 2>/dev/null)
+        s=$(kubectl -n tracking-cfg get service tracking-api -o jsonpath='{.metadata.uid}' 2>/dev/null)
+        d=$(kubectl -n tracking-cfg get configmap tracking-settings -o jsonpath='{.data.TRACKING_REGION}:{.data.POLL_INTERVAL_SEC}' 2>/dev/null)
+        p=$(kubectl -n tracking-cfg get service tracking-api -o jsonpath='{.spec.ports[0].port}:{.spec.ports[0].targetPort}' 2>/dev/null)
+        [ -n "$c" ] && [ "$c" = "$(b cm)" ] && c=same || c=new
+        [ -n "$s" ] && [ "$s" = "$(b svc)" ] && s=same || s=new
+        echo "configmap=$c service=$s data=$d ports=$p"
+      expect: {match: exact, value: "configmap=same service=same data={{region}}:{{poll}} ports=80:8080"}
+    - id: drift-reconciled
+      description: The Service carries the reviewed tier label again
+      type: k8s-query
+      skills: [iac.state.drift]
+      weight: 2
+      query: {cluster: qm-tenants, resource: service, name: tracking-api, namespace: tracking-cfg, jsonpath: "{.metadata.labels.quillmoor\\.example/tier}"}
+      expect: {match: exact, value: backend}
+    - id: reviewed-config
+      description: The configuration still declares tier = backend
+      type: shell
+      on: workstation
+      skills: [iac.state.drift]
+      weight: 1
+      command: |
+        cat /home/learner/exam/tracking-adopt/*.tf 2>/dev/null | grep -E '"quillmoor\.example/tier"' | sed 's/[[:space:]]//g' | sort -u | tr '\n' ' '
+      expect: {match: exact, value: '"quillmoor.example/tier"="backend" '}
+    - id: import-blocks
+      description: The adoption is declared with import blocks
+      type: shell
+      on: workstation
+      skills: [iac.state.import]
+      weight: 0.5
+      command: cat /home/learner/exam/tracking-adopt/*.tf 2>/dev/null | grep -cE '^[[:space:]]*import[[:space:]]*\{' || true
+      expect: {match: regex, value: '^[2-9]$'}
+    - id: converged
+      description: A new plan of ~/exam/tracking-adopt reports no changes
+      type: shell
+      on: workstation
+      skills: [iac.state.drift]
+      weight: 1.5
+      timeoutSec: 120
+      command: ct-iac plan /home/learner/exam/tracking-adopt
+      expect: {match: exact, value: no-changes}
+  misconceptions:
+    - id: accept-drift
+      description: Copies the hand-made label value into the configuration.
+      feedback: The reviewed configuration is the source of truth here; changing the code to match a hand edit makes the drift permanent. Keep tier = backend and let the apply correct the object.
+      expectFail: [drift-reconciled, reviewed-config]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          cd ~/exam/tracking-adopt
+          sed -i 's/"quillmoor.example\/tier" = "backend"/"quillmoor.example\/tier" = "frontend"/' main.tf
+          printf 'import {\n  to = kubernetes_config_map_v1.tracking\n  id = "tracking-cfg/tracking-settings"\n}\n\nimport {\n  to = kubernetes_service_v1.tracking\n  id = "tracking-cfg/tracking-api"\n}\n' > imports.tf
+          iac apply -auto-approve -input=false -no-color
+    - id: delete-and-recreate
+      description: Deletes the hand-made objects so Terraform can create them.
+      feedback: Deleting live objects to make a plan pass causes an outage and loses anything not in code. Import them instead.
+      expectFail: [objects-kept, import-blocks]
+      mutation:
+        on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          cd ~/exam/tracking-adopt
+          kubectl --context qm-tenants -n tracking-cfg delete configmap tracking-settings --wait=true
+          kubectl --context qm-tenants -n tracking-cfg delete service tracking-api --wait=true
+          iac apply -auto-approve -input=false -no-color
+  solution:
+    steps:
+      - on: workstation
+        as: learner
+        timeoutSec: 300
+        run: |
+          set -e
+          cd ~/exam/tracking-adopt
+          printf 'import {\n  to = kubernetes_config_map_v1.tracking\n  id = "tracking-cfg/tracking-settings"\n}\n\nimport {\n  to = kubernetes_service_v1.tracking\n  id = "tracking-cfg/tracking-api"\n}\n' > imports.tf
+          iac plan -input=false -no-color
+          iac apply -auto-approve -input=false -no-color
