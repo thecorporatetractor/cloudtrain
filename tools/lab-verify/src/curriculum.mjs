@@ -146,7 +146,7 @@ export async function checkCurriculum(file, ctx, findings) {
         if (a !== b) warn(where, `frameworks differ from the pack lab (${a})`);
       }
     } else if (inPack) err(where, `a lab '${l.id}' already exists in content/packs; its status must be built or verified`);
-    if (l.type === "exam" && !examPoolOf.has(l.id)) err(where, "exam task is in no exam pool");
+    if (l.type === "exam" && !examPoolOf.has(l.id) && !String(l.notes ?? "").startsWith("blocked:")) err(where, "exam task is in no exam pool"); // blocked tasks are held out of the pools until unblocked
     if (l.type !== "exam" && examPoolOf.has(l.id)) err(where, `only type exam labs may be drawn by exams (pool of '${examPoolOf.get(l.id)}')`);
   }
   for (const id of ctx.packLabs.keys()) if (!labs.has(id)) err(`lab/${id}`, `pack lab '${id}' is missing from the curriculum`);

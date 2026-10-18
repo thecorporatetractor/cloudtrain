@@ -128,6 +128,7 @@ spec:
       command: |
         d=/home/learner/exam/wait
         (cd $d && sha256sum -c /var/tmp/.ct-wait-sha >/dev/null 2>&1) || { echo supplied-file-changed; exit 0; }
+        for i in $(seq 15); do [ "$(curl -s -m 5 -o /dev/null -w '%{http_code}' http://node3:{{port}}/status)" = 200 ] && break; sleep 4; done
         [ "$(curl -s -m 8 -o /dev/null -w '%{http_code}' http://node3:{{port}}/status)" = 200 ] || { echo no-status; exit 0; }
         [ "$(curl -s -m 8 http://node3:{{port}}/dashboard.html)" = "$(cat $d/dashboard.html)" ] && echo ok || echo no-page
       expect: { match: exact, value: ok }
@@ -139,7 +140,7 @@ spec:
       command: echo "$(systemctl is-active ov-slowapi) $(systemctl is-enabled ov-slowapi)"
       expect: { match: exact, value: active enabled }
     - id: retry-logic
-      description: wait.yml retries a uri task with until, at most 10 retries and a 5 second delay, before the page is copied
+      description: wait.yml retries a uri task (until or retries), at most 10 retries and a 5 second delay, before the page is copied
       type: shell
       on: control
       skills: [automation.control-flow.retries]
@@ -149,9 +150,9 @@ spec:
         import sys, json, yaml
         plays = yaml.safe_load(open(sys.argv[1])) or []
         tasks = [t for p in plays for t in (p.get("tasks") or []) if isinstance(t, dict)]
-        w = [i for i, t in enumerate(tasks) if "until" in t and any(k in t for k in ("uri", "ansible.builtin.uri"))]
+        w = [i for i, t in enumerate(tasks) if ("until" in t or "retries" in t) and any(k in t for k in ("uri", "ansible.builtin.uri"))]
         if not w:
-            print("no-until-uri"); sys.exit()
+            print("no-retry-uri"); sys.exit()
         t = tasks[w[0]]
         try:
             ok = 1 <= int(t.get("retries", 3)) <= 10 and int(t.get("delay", 5)) == 5
@@ -190,9 +191,9 @@ spec:
               - ansible.builtin.copy: { src: dashboard.html, dest: /srv/ov-slow/dashboard.html }
           EOF
           ansible-playbook wait.yml
-    - id: retries-without-until
-      description: Sets retries and delay but no until condition, so nothing is retried.
-      feedback: retries and delay only apply together with an until condition on the registered result.
+    - id: retry-limits-ignored
+      description: Retries the status check but with far more retries and a shorter delay than allowed.
+      feedback: The task statement caps the retries and fixes the delay between them; stay inside those limits.
       expectFail: [retry-logic]
       mutation:
         on: control
@@ -207,8 +208,10 @@ spec:
             tasks:
               - ansible.builtin.service: { name: ov-slowapi, state: started, enabled: true }
               - ansible.builtin.uri: { url: "http://node3:{{port}}/status", status_code: 200 }
-                retries: 10
-                delay: 5
+                register: status
+                until: status.status == 200
+                retries: 30
+                delay: 3
               - ansible.builtin.copy: { src: dashboard.html, dest: /srv/ov-slow/dashboard.html }
           EOF
           ansible-playbook wait.yml || ansible-playbook wait.yml

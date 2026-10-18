@@ -1236,8 +1236,6 @@ export const fixtureExams: FixtureExam[] = [
     "pool": [
      "xan-roles-requirements",
      "xan-roles-author-web",
-     "xan-roles-system-timesync",
-     "xan-roles-system-selinux",
      "xan-roles-galaxy-role-use",
      "xan-roles-argument-spec"
     ]

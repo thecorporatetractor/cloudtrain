@@ -16,7 +16,8 @@ spec:
     Quillmoor Logistics' security baseline for SSH is not applied on the build hosts yet.
     You work as `learner` on the workstation; the account `devops` on both hosts accepts
     your SSH key and may use sudo without a password. Only members of the group **`ops`**
-    (it holds `devops` and the lab account `learner`) may keep logging in. Every playbook
+    (it holds `devops`, the lab account `learner` and `root`) may keep logging in. Root must
+    keep its key login, because the lab platform administers the hosts through it. Every playbook
     you write is run again by the grader (it must report no changes).
 
     The project directory has an inventory (group `builders`) and an `ansible.cfg` with the
@@ -24,8 +25,8 @@ spec:
     and the playbook **`ssh.yml`** that applies it to the **builders** group so that, on
     both hosts, the **effective** sshd configuration (what `sshd -T` prints) has:
 
-    - **password authentication off** and **root login off**;
-    - **`AllowGroups ops`** and **`MaxAuthTries {{tries}}`**.
+    - **password authentication off** and **root login by password refused** (`PermitRootLogin prohibit-password`, key logins only);
+    - **`AllowGroups ops root`** and **`MaxAuthTries {{tries}}`**.
 
     The role must **validate** a new configuration with sshd itself before it is installed,
     and apply it by **reloading** the SSH service, not by restarting it. The key logins of
@@ -61,6 +62,7 @@ spec:
         groupadd -f ops
         usermod -aG ops devops
         usermod -aG ops learner
+        usermod -aG ops root
         printf '# Quillmoor legacy build host settings\nPasswordAuthentication yes\nPermitRootLogin yes\nMaxAuthTries 10\n' > /etc/ssh/sshd_config.d/40-qm-legacy.conf
         sshd -t
         systemctl reload ssh || systemctl restart ssh
@@ -82,9 +84,9 @@ spec:
       skills: [linux.remote.ssh, linux.security.ssh-hardening]
       weight: 2
       command: &sshd-effective |
-        mkdir -p /run/sshd; sshd -T 2>/dev/null | grep -E '^(allowgroups|maxauthtries|passwordauthentication|permitrootlogin) ' | sort | paste -sd,
-      expect: { match: exact, value: "allowgroups ops,maxauthtries {{tries}},passwordauthentication no,permitrootlogin no" }
-    - { id: effective-build-2, description: "qm-build-2 has the baseline in its effective sshd configuration", type: shell, on: qm-build-2, skills: [linux.remote.ssh, linux.security.ssh-hardening], weight: 2, command: *sshd-effective, expect: { match: exact, value: "allowgroups ops,maxauthtries {{tries}},passwordauthentication no,permitrootlogin no" } }
+        mkdir -p /run/sshd; sshd -T 2>/dev/null | grep -E '^(allowgroups|maxauthtries|passwordauthentication|permitrootlogin) ' | sed 's/prohibit-password/without-password/' | sort | paste -sd,
+      expect: { match: exact, value: "allowgroups ops root,maxauthtries {{tries}},passwordauthentication no,permitrootlogin without-password" }
+    - { id: effective-build-2, description: "qm-build-2 has the baseline in its effective sshd configuration", type: shell, on: qm-build-2, skills: [linux.remote.ssh, linux.security.ssh-hardening], weight: 2, command: *sshd-effective, expect: { match: exact, value: "allowgroups ops root,maxauthtries {{tries}},passwordauthentication no,permitrootlogin without-password" } }
     - id: daemon-live
       description: The running SSH daemons offer only public key login and the key logins of devops and learner still work
       type: shell
@@ -151,9 +153,9 @@ spec:
               line: "{{ item.key }} {{ item.value }}"
               validate: "/usr/sbin/sshd -t -f %s"
             loop:
-              - { key: PermitRootLogin, value: "no" }
+              - { key: PermitRootLogin, value: prohibit-password }
               - { key: PasswordAuthentication, value: "no" }
-              - { key: AllowGroups, value: ops }
+              - { key: AllowGroups, value: "ops root" }
               - { key: MaxAuthTries, value: "{{tries}}" }
             notify: Reload sshd
           EOF
@@ -176,7 +178,7 @@ spec:
           - ansible.builtin.file: { path: /etc/ssh/sshd_config.d/40-qm-legacy.conf, state: absent }
           - ansible.builtin.copy:
               dest: /etc/ssh/sshd_config.d/00-qm-baseline.conf
-              content: "PermitRootLogin no\nPasswordAuthentication no\nAllowGroups ops\nMaxAuthTries {{tries}}\n"
+              content: "PermitRootLogin prohibit-password\nPasswordAuthentication no\nAllowGroups ops root\nMaxAuthTries {{tries}}\n"
               mode: "0644"
             notify: Reload sshd
           EOF
@@ -198,10 +200,10 @@ spec:
           mkdir -p roles/sshd_baseline/tasks roles/sshd_baseline/handlers roles/sshd_baseline/templates
           cat > roles/sshd_baseline/templates/baseline.conf.j2 <<'EOF'
           # Managed by Ansible: Quillmoor SSH baseline
-          PermitRootLogin no
+          PermitRootLogin prohibit-password
           PasswordAuthentication no
           KbdInteractiveAuthentication no
-          AllowGroups ops
+          AllowGroups ops root
           MaxAuthTries {{tries}}
           EOF
           cat > roles/sshd_baseline/tasks/main.yml <<'EOF'

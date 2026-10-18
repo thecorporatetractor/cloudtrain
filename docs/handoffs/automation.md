@@ -173,12 +173,12 @@ Galaxy role is a CloudTrain-written `balancer` role; the time server is a chrony
 
 Blockers recorded in the curriculum notes: `xan-roles-system-timesync` and
 `xan-roles-system-selinux` need `fedora.linux_system_roles` in `ansible-ctl` / the Ansible
-mirror (setup fails fast with a clear message; the roles pool reaches 2x without them). The
+mirror (setup fails fast with a clear message; both are taken out of the `sim-el-automation` roles pool, which keeps 4 tasks for a draw of 2, because the exam draw does not filter by status; add them back to the blueprint once the collection ships). The
 shared Quillmoor estate topology for the `xpe-*` tasks is still undecided (the two automation
 tasks use a standalone workstation plus `qm-build-1/2`); the assessment owner decides.
 Assumptions to confirm live: node names resolve from the managed nodes (repo and backend
 URLs use `node4`, `node2`, `node3`), `/dev/disk/by-id/virtio-ct-data*` links exist, and
-`ansible-navigator run` accepts `--tags` / `--limit`.
+`ansible-navigator run` accepts `--tags` / `--limit`, and the navigator artifact key names (`.plays[].tasks[].task` / `.host`; the `xan-run-limit-tags` check also accepts `__task` / `__host`). `xpe-ansible-ssh-hardening` keeps root key logins (`PermitRootLogin prohibit-password`, `AllowGroups ops root`) because the platform administers VMs as root over SSH; confirm `sshd -T` prints `without-password` on noble.
 
 Verify queue for the testing round: two disjoint `exam run --auto-solve --attempts 2` runs plus
 `--no-solve` for `sim-el-automation`, then a per-task `labctl verify` of all 19 tasks and the 2
