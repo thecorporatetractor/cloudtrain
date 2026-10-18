@@ -267,9 +267,11 @@ export function attemptsFor(userId: string): Attempt[] {
   }
   const n = userId === 'u-ingrid' ? 14 : 4 + Math.round(seeded(`${userId}:n`) * 9);
   const out: Attempt[] = [];
+  // Generated history uses the end-state labs; CTF attempts are added explicitly below.
+  const pool = labSummaries.filter((l) => !l.questionCount);
   for (let i = 0; i < n; i++) {
     const r = seeded(`${userId}:att:${i}`);
-    const lab = labSummaries[Math.floor(seeded(`${userId}:lab:${i}`) * labSummaries.length)]!;
+    const lab = pool[Math.floor(seeded(`${userId}:lab:${i}`) * pool.length)]!;
     const daysAgo = Math.round(r * 58) + (i === 0 ? 0 : 1);
     const checks = 3 + Math.floor(seeded(`${userId}:chk:${i}`) * 3);
     const q = seeded(`${userId}:q:${i}`);
@@ -299,7 +301,43 @@ export function attemptsFor(userId: string): Attempt[] {
       checksTotal: checks,
     });
   }
+  const ctf = ctfAttemptOf(userId);
+  if (ctf) out.push(ctf);
   return out.sort((a, b) => b.startedAt.localeCompare(a.startedAt));
+}
+
+/** A solo CTF attempt (questions answered in the lab view) for the sample learners. */
+function ctfAttemptOf(userId: string): Attempt | undefined {
+  if (!['u-lena', 'u-ingrid', 'u-tomas'].includes(userId)) return undefined;
+  const lab = labSummaries.find((l) => l.id === 'quill-ctf-gateway-breach')!;
+  const startedAt = ago(2 * DAY + 3 * HOUR);
+  const solved = userId === 'u-tomas' ? 5 : 4;
+  const earned = userId === 'u-tomas' ? 530 : 390;
+  return {
+    id: `att-${userId.slice(2)}-ctf`,
+    labId: lab.id,
+    labTitle: lab.title,
+    labVersion: 1,
+    sessionName: `ls-quill-ctf-ga-${userId.slice(2, 6)}`,
+    startedAt,
+    endedAt: new Date(new Date(startedAt).getTime() + 24 * 60_000).toISOString(),
+    outcome: solved === 5 ? 'passed' : 'partial',
+    score: Math.round((solved / 5) * 100),
+    hintsUsed: 2,
+    validations: 1,
+    durationS: 24 * 60,
+    practiceS: 21 * 60,
+    checksPassed: 1,
+    checksTotal: 1,
+    points: { earned, possible: 600, solved, total: 5 },
+  };
+}
+
+/** Personal CTF points from the mock attempts (best per lab), as GET /skills returns them. */
+export function ctfTotalsOf(userId: string): { points: number; solved: number; labs: number } | undefined {
+  const a = attemptsFor(userId).filter((x) => x.points);
+  if (!a.length) return undefined;
+  return { points: a.reduce((n, x) => n + x.points!.earned, 0), solved: a.reduce((n, x) => n + x.points!.solved, 0), labs: new Set(a.map((x) => x.labId)).size };
 }
 
 /** Practice minutes (graded time) in attempts started in the last `days` days: the gateway's single measure of learner time. */

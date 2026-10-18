@@ -47,12 +47,15 @@ Types: [`packages/api-types/platform.d.ts`](../../packages/api-types/platform.d.
 | `PUT /me/goals` | `UpdateLearnerGoalsRequest` (left out = unchanged, null = clear; `source: 'browser'` = one-time import of the old localStorage goals, fills unset fields only) | `LearnerGoals`; `422` on an invalid or past date or a weekly target outside 5-3000 min | `progress.read.self` |
 | `GET /catalog` | | `{ domains, paths, labs }`, filtered by content visibility | `lab.run` |
 | `GET /labs/:id` | | `Lab` (404 when hidden for the org) | `lab.run` |
-| `GET /skills[?member=]` | | `{ skills, states, frameworks, member? }` (`member` needs `progress.read.team` for that user) | `progress.read.self` |
+| `GET /skills[?member=]` | | `{ skills, states, frameworks, member?, ctf? }` (`member` needs `progress.read.team` for that user; `ctf`: personal CTF points, best attempt per CTF lab) | `progress.read.self` |
 | `POST /labs/:id/sessions` | | `201 LabSession`; `429` on quota | `lab.run` |
 | `GET /sessions`, `GET /sessions/:id`, `DELETE /sessions/:id`, `POST /sessions/:id/validate`, `POST /sessions/:id/hints/:index` | | as before (`LabSession.notices` added) | `lab.run` (own sessions) |
 | `GET /sessions/:id/terminal` (WebSocket) | | terminal frames + `{"t":"notice","notice":SessionNotice}` | `lab.run` (own session) |
+| `GET /sessions/:id/questions` | | `QuestionsView` (questions of a CTF lab with their state, attempts, hints and points; 404 for a lab without answer checks) | `lab.run` (own session) |
+| `POST /sessions/:id/questions/:checkId/answer` | `SubmitAnswerRequest` `{ answer }` (1-512 characters) | `SubmitAnswerResponse` `{ correct, message, view }`; `409` locked, solved, closed or not set up yet; `422` empty or too long; `429 rate_limited` (with `Retry-After`) over the per-minute limit; `500 lab_error` when the lab cannot grade (the answer is not counted) | `lab.run` (own session) |
+| `POST /sessions/:id/questions/:checkId/hints/:index` | | `QuestionsView`; hints in order, only while the question is open; idempotent | `lab.run` (own session) |
 | `GET /assignments/mine` | | `MyAssignment[]` | `progress.read.self` |
-| `GET /attempts/mine?lab=&outcome=&from=&to=&cursor=&limit=` | `AttemptQuery` | `Page<Attempt>` | `progress.read.self` |
+| `GET /attempts/mine?lab=&outcome=&from=&to=&cursor=&limit=` | `AttemptQuery` | `Page<Attempt>` (`points` on CTF attempts) | `progress.read.self` |
 | `GET /attempts/:id` | | `AttemptDetail` | `progress.read.self` (own) or `progress.read.team` (team/cohort/org of the attempt's user) |
 
 ## Manager

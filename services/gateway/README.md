@@ -110,8 +110,12 @@ in `src/authz.ts`).
 | `POST /sessions/:id/hints/:index` | records the reveal in the `cloudtrain.dev/revealed-hints` annotation, returns the session with the hint content |
 | `GET /sessions/:id/terminal?node=&cols=&rows=` | WebSocket terminal (below) |
 | `GET /sessions/:id/terminal?observe=1` | read-only shadow of a learner's terminal for `session.observe` (cohort instructor, org admin); audited |
+| `GET /sessions/:id/questions` | questions (answer checks) of a CTF lab with state, attempts left, hints and points (`src/answers`) |
+| `POST /sessions/:id/questions/:checkId/answer` | grades the answer (TypeScript port of the Go matcher, shared vectors), stores it, audits `answer.submit`; rate-limited per learner (`CT_ANSWER_RATE_PER_MINUTE`, default 10, 429 + `Retry-After`) |
+| `POST /sessions/:id/questions/:checkId/hints/:index` | reveals a question hint at its point cost; audits `answer.hint` |
 
-What leaves the gateway is the learner's view only: expected values, check
+What leaves the gateway is the learner's view only: expected values (answer
+checks' values, `status.computedAnswers`, `secret: true` params), check
 commands and queries, setup/teardown, solutions and misconceptions are never sent;
 hint text is withheld until revealed; grader `output` (author-only) is dropped.
 `{{params}}` stay in the lab text; the session carries `params` and the web app
@@ -256,7 +260,12 @@ background sweeps) are narrow `SECURITY DEFINER` functions. `audit_log` is
 append-only for the app role (SELECT + INSERT). `assignment_status` is a
 `security_invoker` view. `learner_goals` (migration `0004_learner_goals`,
 additive and idempotent) holds each learner's exam date and weekly target per
-org (`GET/PUT /api/me/goals`).
+org (`GET/PUT /api/me/goals`). `answer_submissions` and `answer_hint_reveals`
+(migration `0005_ctf_answers`) hold CTF answers and question hints per scope
+(the session, or a team in an event): submissions are append-only for the app
+role (SELECT + INSERT), one correct submission per scope and question is a
+unique index, and grading of one scope is serialised with a transaction
+advisory lock. `lab_attempts` gains the CTF totals shown in history.
 
 ## Learner model
 

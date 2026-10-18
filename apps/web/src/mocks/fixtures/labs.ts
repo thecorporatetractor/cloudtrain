@@ -321,6 +321,38 @@ Work from the \`workstation\` jumphost. The kubeconfig context for the cluster i
   ),
 ];
 
+/*
+ * A CTF lab (answer checks): five questions about a seeded log, plus one end-state check.
+ * The questions' expected answers live in src/mocks/ctf.ts (mock mode only); the real
+ * gateway never sends them to the browser.
+ */
+labs.push({
+  apiVersion: 'cloudtrain.dev/v3',
+  kind: 'Lab',
+  metadata: { id: 'quill-ctf-gateway-breach', title: 'Investigate a break-in on the depot gateway (CTF)', domain: 'linux', frameworks: ['lfcs:commands'], difficulty: 'easy', estimatedMinutes: 20, tags: ['ctf', 'investigation', 'grep', 'awk', 'logs'] },
+  spec: {
+    description: `Overnight, someone got into the Quillmoor depot gateway and exported a file. The gateway writes one line per event to \`/var/log/qm-depot/gateway.log\`:
+
+\`\`\`
+2026-10-18T01:02:03Z depot-gw event=login ip=192.0.2.14 user=bram result=fail ua="..."
+\`\`\`
+
+Answer the questions in order: each one opens once the one before it is answered (or out of attempts). Wrong answers and hints cost points. Finally, put the attacker's address on the blocklist (\`~/incident/blocklist.txt\`) and validate.`,
+    objectives: ['Filter a log by field values with grep', 'Count and rank values with sort and uniq -c', 'Follow one actor through a log and extract fields'],
+    topology: { entry: 'depot-gw-01', nodes: [{ name: 'depot-gw-01', driver: 'container', image: 'deb-lab:24.04', access: ['shell'] }] },
+    checks: [{ id: 'blocklist', description: "~/incident/blocklist.txt holds the attacker's IP address", type: 'shell', on: 'depot-gw-01', skills: ['linux.cmd.shell'], weight: 2 }],
+    hints: [{ title: '', body: '', cost: 0, redacted: true }],
+    questionOrder: 'sequential',
+    questions: [
+      { id: 'q-attacker-ip', prompt: 'Which IP address made the most failed login attempts?', skills: ['linux.cmd.shell'], input: 'text', placeholder: '192.0.2.1', points: 100, penalty: 10, maxAttempts: 5, hintCosts: [10, 25] },
+      { id: 'q-failed-count', prompt: '', skills: ['linux.cmd.shell'], input: 'number', placeholder: '42', points: 100, penalty: 20, maxAttempts: 3, hintCosts: [20] },
+      { id: 'q-victim', prompt: '', skills: ['linux.cmd.shell'], input: 'text', placeholder: 'username', points: 150, penalty: 25, maxAttempts: 3, hintCosts: [30] },
+      { id: 'q-tool', prompt: '', skills: ['linux.ops.logs'], input: 'text', placeholder: 'tool/1.2', points: 100, penalty: 15, maxAttempts: 4, hintCosts: [20] },
+      { id: 'q-exfil', prompt: '', skills: ['linux.cmd.shell'], input: 'text', placeholder: '/srv/exports/example.csv', points: 150, penalty: 25, maxAttempts: 3, hintCosts: [30] },
+    ],
+  },
+});
+
 export const labById = new Map(labs.map((l) => [l.metadata.id, l]));
 
 /* ------------------------------------------------------------------ */
@@ -379,9 +411,10 @@ export const labSummaries: LabSummary[] = labs.map((l) => {
   const completion: LabSummary['completion'] = completed.has(l.metadata.id) ? 'completed' : inProgress.has(l.metadata.id) ? 'in-progress' : 'new';
   return {
     ...l.metadata,
-    skillIds,
+    skillIds: Array.from(new Set([...skillIds, ...(l.spec.questions ?? []).flatMap((q) => q.skills)])),
     pathId,
     completion,
+    ...(l.spec.questions?.length ? { questionCount: l.spec.questions.length } : {}),
     bestScore: completion === 'completed' ? 82 + (l.metadata.id.length % 17) : completion === 'in-progress' ? 40 : undefined,
   };
 });

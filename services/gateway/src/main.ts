@@ -1,6 +1,8 @@
 import path from 'node:path';
 import { sql } from 'kysely';
 import { buildApp } from './app.js';
+import { AnswerService } from './answers/service.js';
+import { PgAnswerStore } from './answers/store.js';
 import { loadConfig } from './config.js';
 import { loadContent } from './content/load.js';
 import { createDb } from './db/index.js';
@@ -77,6 +79,9 @@ async function main() {
     { sessionLabels: config.examSessionLabels, ...(config.examDurationMinutes ? { durationMinutes: config.examDurationMinutes } : {}) },
   );
 
+  // CTF questions: submissions and hint reveals in Postgres (RLS, audited, rate-limited).
+  const answers = new AnswerService(sessions, new PgAnswerStore(platform), { ratePerMinute: config.answerRatePerMinute });
+
   const app = await buildApp({
     content,
     auth: new OidcAuthenticator(db, store, oidc),
@@ -87,6 +92,7 @@ async function main() {
     clusterInfo: new KubeClusterInfo(kc),
     hub: new TerminalHub(),
     exams,
+    answers,
     logger: { level: config.logLevel },
     devImpersonate: config.devImpersonate,
   });

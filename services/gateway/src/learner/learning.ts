@@ -128,7 +128,9 @@ export async function recordRun(tx: Tx, r: RunInput): Promise<RunResult> {
   }
 
   const passed = checks.filter((c) => c.passed).length;
-  const allPassed = checks.length > 0 && passed === endStateChecks(r.lab).length;
+  // A lab with questions also needs every question solved to count as passed.
+  const questions = r.lab.spec.checks.length - endStateChecks(r.lab).length;
+  const allPassed = checks.length > 0 && passed === endStateChecks(r.lab).length && attempt.questions_solved >= questions;
   await tx
     .updateTable('lab_attempts')
     .set({
@@ -159,5 +161,75 @@ export async function endAttempt(tx: Tx, sessionName: string, at: Date, hintsUse
       ...(hintsUsed !== undefined ? { hints_used: Math.max(a.hints_used, hintsUsed) } : {}),
     })
     .where('id', '=', a.id)
+    .execute();
+}
+
+export interface QuestionOutcome {
+  orgId: string;
+  userId: string;
+  sessionName: string;
+  lab: SourceLab;
+  checkId: string;
+  /** true: solved; false: closed (out of attempts). Skill evidence either way. */
+  passed: boolean;
+  /** Question hints revealed (discount the evidence like lab hints do). */
+  hintsUsed: number;
+  at: Date;
+  /** Totals of the scope after this answer (shown in history). */
+  totals: { earned: number; possible: number; solved: number; total: number };
+}
+
+/**
+ * Records a question's outcome for the person who answered it: one skill
+ * evidence per skill of the answer check (outcome 1 solved, 0 closed) and
+ * the CTF totals on their attempt. For a lab with questions only, the
+ * attempt's score is the share of questions solved and it is passed once
+ * every question is solved; a lab with end-state checks keeps its Validate
+ * score.
+ */
+export async function recordQuestion(tx: Tx, q: QuestionOutcome): Promise<void> {
+  const attemptId = await startAttempt(tx, { orgId: q.orgId, userId: q.userId, lab: q.lab, sessionName: q.sessionName, startedAt: q.at });
+  const check = q.lab.spec.checks.find((c) => c.id === q.checkId);
+  const skills = [...(check?.skills ?? [])];
+  const weight = check?.weight ?? 1;
+  const difficulty = labDifficulty(q.lab);
+  if (skills.length) {
+    const rows = await tx.selectFrom('learner_skill_state').selectAll().where('user_id', '=', q.userId).where('skill_id', 'in', skills).forUpdate().execute();
+    const states = new Map<string, SkillBelief>(rows.map((s) => [s.skill_id, { mu: s.mu, sigma: s.sigma, evidence: s.evidence, lastDelta: s.last_delta, updatedAt: s.updated_at }]));
+    for (const skill of skills) {
+      const b = update(states.get(skill) ?? prior(q.at), { passed: q.passed, weight, difficulty, hintsUsed: q.hintsUsed, at: q.at });
+      const v = { mu: b.mu, sigma: b.sigma, evidence: b.evidence, last_delta: b.lastDelta, updated_at: b.updatedAt };
+      await tx
+        .insertInto('learner_skill_state')
+        .values({ org_id: q.orgId, user_id: q.userId, skill_id: skill, ...v })
+        .onConflict((oc) => oc.columns(['org_id', 'user_id', 'skill_id']).doUpdateSet(v))
+        .execute();
+    }
+    await tx
+      .insertInto('skill_evidence')
+      .values(skills.map((skill_id) => ({ org_id: q.orgId, user_id: q.userId, attempt_id: attemptId, skill_id, check_id: q.checkId, outcome: q.passed ? 1 : 0, weight, difficulty, at: q.at })))
+      .execute();
+  }
+  await updateAttemptPoints(tx, attemptId, q.lab, q.totals);
+}
+
+/** Writes the CTF totals onto an attempt (and the score/outcome of a questions-only lab). */
+export async function updateAttemptPoints(tx: Tx, attemptId: string, lab: SourceLab, t: QuestionOutcome['totals']): Promise<void> {
+  const a = await tx.selectFrom('lab_attempts').select(['score', 'outcome', 'checks_passed', 'checks_total']).where('id', '=', attemptId).forUpdate().executeTakeFirstOrThrow();
+  const questionsOnly = endStateChecks(lab).length === 0;
+  const pct = t.total ? Math.round((100 * t.solved) / t.total) : 0;
+  const allSolved = t.total > 0 && t.solved === t.total;
+  const endStateDone = !questionsOnly && a.checks_total > 0 && a.checks_passed >= a.checks_total;
+  await tx
+    .updateTable('lab_attempts')
+    .set({
+      points_earned: t.earned,
+      points_possible: t.possible,
+      questions_solved: t.solved,
+      questions_total: t.total,
+      ...(questionsOnly ? { score: Math.max(a.score, pct) } : {}),
+      ...(allSolved && (questionsOnly || endStateDone) ? { outcome: 'passed' as const } : {}),
+    })
+    .where('id', '=', attemptId)
     .execute();
 }

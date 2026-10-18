@@ -7,6 +7,7 @@ import { Prose } from '@/components/prose';
 import { Badge, Button } from '@/components/ui';
 import { percentages } from '@/lib/readiness';
 import { cn } from '@/lib/utils';
+import { QuestionsPanel } from './QuestionsPanel';
 
 interface Props {
   lab: Lab;
@@ -14,6 +15,8 @@ interface Props {
   validating: boolean;
   onRevealHint: (index: number) => void;
   revealing: boolean;
+  /** The environment is up (questions accept answers). */
+  ready?: boolean;
 }
 
 const resultIcon: Record<CheckResult['status'], ReactNode> = {
@@ -23,7 +26,7 @@ const resultIcon: Record<CheckResult['status'], ReactNode> = {
   pending: <CircleDashed size={12} />,
 };
 
-export function TaskPanel({ lab, session, validating, onRevealHint, revealing }: Props) {
+export function TaskPanel({ lab, session, validating, onRevealHint, revealing, ready = true }: Props) {
   const { spec } = lab;
   const results = new Map(session?.results.map((r) => [r.checkId, r]) ?? []);
   const passed = spec.checks.filter((c) => results.get(c.id)?.status === 'pass').length;
@@ -48,6 +51,9 @@ export function TaskPanel({ lab, session, validating, onRevealHint, revealing }:
         </section>
       )}
 
+      {spec.questions && spec.questions.length > 0 && <QuestionsPanel sessionId={session?.id} ready={ready} />}
+
+      {spec.checks.length > 0 && (
       <section className="task-section" aria-live="polite">
         <div className="row-between" style={{ marginBottom: 8 }}>
           <h2 className="task-h" style={{ margin: 0 }}>
@@ -100,6 +106,7 @@ export function TaskPanel({ lab, session, validating, onRevealHint, revealing }:
           })}
         </ul>
       </section>
+      )}
 
       {spec.hints && spec.hints.length > 0 && (
         <section className="task-section">

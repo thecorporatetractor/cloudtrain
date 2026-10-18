@@ -97,6 +97,11 @@ export function LabRow({ lab, trailing }: { lab: LabSummary; trailing?: ReactNod
         <span className="lab-row-title truncate">{lab.title}</span>
         <span className="row xs subtle lab-row-meta" style={{ gap: 10 }}>
           <DifficultyBadge difficulty={lab.difficulty} />
+          {lab.questionCount ? (
+            <Badge tone="accent" title={`Investigation challenge: ${lab.questionCount} questions with points`}>
+              CTF · {lab.questionCount} questions
+            </Badge>
+          ) : null}
           <span className="row" style={{ gap: 4, whiteSpace: 'nowrap' }}>
             <Clock size={11} /> {formatMinutes(lab.estimatedMinutes)}
           </span>

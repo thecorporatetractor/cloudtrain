@@ -10,8 +10,10 @@
  */
 
 import type { MyAssignment, SessionNotice } from './platform.js';
+import type { LabQuestion } from './ctf.js';
 
 export * from './platform.js';
+export * from './ctf.js';
 
 export type Domain = 'kubernetes' | 'linux' | 'containers' | 'iac' | 'automation' | 'networking';
 export type Difficulty = 'easy' | 'medium' | 'hard';
@@ -114,8 +116,12 @@ export interface Lab {
     description: string;
     objectives?: string[];
     topology: Topology;
+    /** End-state checks (graded by Validate). Answer checks are listed in `questions`. */
     checks: LabCheck[];
     hints?: LabHint[];
+    /** Questions (answer checks) of a CTF lab, in order; their state is per session (`GET /sessions/:id/questions`). */
+    questions?: LabQuestion[];
+    questionOrder?: 'free' | 'sequential';
   };
 }
 
@@ -124,6 +130,8 @@ export interface LabSummary extends LabMetadata {
   pathId?: string;
   completion?: 'completed' | 'in-progress' | 'new';
   bestScore?: number;
+  /** Number of questions when the lab has answer checks (CTF). */
+  questionCount?: number;
 }
 
 export interface Path {

@@ -165,6 +165,41 @@ export interface LabAttemptsTable {
   duration_s: Generated<number>;
   checks_total: Generated<number>;
   checks_passed: Generated<number>;
+  /** CTF totals (0005_ctf_answers). */
+  points_earned: Generated<number>;
+  points_possible: Generated<number>;
+  questions_solved: Generated<number>;
+  questions_total: Generated<number>;
+}
+
+export interface AnswerSubmissionsTable {
+  id: Generated<string>;
+  org_id: string;
+  scope_key: string;
+  user_id: string;
+  session_name: string;
+  lab_id: string;
+  check_id: string;
+  event_id: string | null;
+  team_id: string | null;
+  answer: string;
+  correct: boolean;
+  points: Generated<number>;
+  submitted_at: DefaultedTime;
+}
+
+export interface AnswerHintRevealsTable {
+  org_id: string;
+  scope_key: string;
+  check_id: string;
+  hint_index: number;
+  user_id: string;
+  session_name: string;
+  lab_id: string;
+  event_id: string | null;
+  team_id: string | null;
+  cost: number;
+  revealed_at: DefaultedTime;
 }
 
 export interface CheckResultsTable {
@@ -386,6 +421,8 @@ export interface DB {
   exam_task_results: ExamTaskResultsTable;
   exam_retake_grants: ExamRetakeGrantsTable;
   learner_goals: LearnerGoalsTable;
+  answer_submissions: AnswerSubmissionsTable;
+  answer_hint_reveals: AnswerHintRevealsTable;
 }
 
 export type OrgRow = Selectable<OrgsTable>;

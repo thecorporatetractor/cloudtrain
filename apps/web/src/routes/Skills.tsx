@@ -97,6 +97,7 @@ export function Skills() {
               </div>
               <Stat label="Skills practised" value={`${summary.practised} / ${summary.total}`} hint={summary.practised ? `${summary.total - summary.practised} with no results yet` : 'no results yet'} />
               {assessed && thinnest && <Stat label="Least evidence" value={<span className="stat-value-sm">{skillOf.get(thinnest.skillId)?.name ?? '—'}</span>} hint="one lab would firm it up" />}
+              {data.ctf && <Stat label="CTF points" value={data.ctf.points} hint={`${data.ctf.solved} question${data.ctf.solved === 1 ? '' : 's'} solved in ${data.ctf.labs} CTF lab${data.ctf.labs === 1 ? '' : 's'}`} />}
               <div className="grow" />
               <div className="heat-legend" aria-hidden>
                 <span className="xs subtle">weaker</span>

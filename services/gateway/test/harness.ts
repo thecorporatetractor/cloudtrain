@@ -8,6 +8,8 @@ import { OidcClient } from '../src/oidc/client.js';
 import { OidcAuthenticator, Sealer, SessionStore } from '../src/oidc/sessions.js';
 import { PlatformService } from '../src/platform/service.js';
 import { SessionService } from '../src/sessions/service.js';
+import { AnswerService } from '../src/answers/service.js';
+import { PgAnswerStore } from '../src/answers/store.js';
 import { TerminalHub } from '../src/terminal/hub.js';
 import { FakeCluster, FakeCompiler, realContent, repo } from './fakes.js';
 import type { FakeOidcProvider } from './fake-oidc.js';
@@ -30,6 +32,8 @@ export interface Harness {
   t: TestDb;
   app: FastifyInstance;
   ps: PlatformService;
+  sessions: SessionService;
+  answers: AnswerService;
   cluster: FakeCluster;
   mailer: MemoryMailer;
   hub: TerminalHub;
@@ -52,7 +56,7 @@ export const Q = {
   rhea: 'a1000000-0000-4000-8000-0000000000aa',
 };
 
-export async function harness(opts: { oidc?: FakeOidcProvider; auth?: (t: TestDb) => Authenticator; devImpersonate?: boolean } = {}): Promise<Harness> {
+export async function harness(opts: { oidc?: FakeOidcProvider; auth?: (t: TestDb) => Authenticator; devImpersonate?: boolean; answerRatePerMinute?: number } = {}): Promise<Harness> {
   const t = await createTestDb();
   const content = await realContent();
   await seed(t.owner, content, await readPeople(defaultPeopleFile(repo)));
@@ -77,11 +81,14 @@ export async function harness(opts: { oidc?: FakeOidcProvider; auth?: (t: TestDb
     auth = new OidcAuthenticator(t.db, store, client);
     oidc = { client, store };
   }
-  const app = await buildApp({ content, auth, sessions, cluster, platform: ps, hub, clusterInfo: null, ...(oidc ? { oidc } : {}), ...(opts.devImpersonate ? { devImpersonate: true } : {}) });
+  const answers = new AnswerService(sessions, new PgAnswerStore(ps), { ratePerMinute: opts.answerRatePerMinute ?? 20 });
+  const app = await buildApp({ content, auth, sessions, cluster, platform: ps, hub, answers, clusterInfo: null, ...(oidc ? { oidc } : {}), ...(opts.devImpersonate ? { devImpersonate: true } : {}) });
   return {
     t,
     app,
     ps,
+    sessions,
+    answers,
     cluster,
     mailer,
     hub,

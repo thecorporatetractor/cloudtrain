@@ -2,7 +2,7 @@ import { Link, useNavigate } from '@tanstack/react-router';
 import { Panel, Separator, usePanelRef, type Layout, type PanelSize } from 'react-resizable-panels';
 import { AlertTriangle, CheckCircle2, ChevronLeft, Eye, Keyboard, Lightbulb, Loader2, Maximize2, Megaphone, Minimize2, Network, PanelLeft, PanelLeftClose, PanelRight, Play, Power, X } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ApiError, useEndSession, useLab, useRevealHint, useSession, useStartSession, useValidate } from '@/api/client';
+import { ApiError, useEndSession, useLab, useQuestions, useRevealHint, useSession, useStartSession, useValidate } from '@/api/client';
 import { isRealApi } from '@/api/mode';
 import type { LabSession, SessionNotice, TopologyLink, ValidateResponse } from '@/api/types';
 import { useScreenShortcuts, useShell } from '@/app/shell-context';
@@ -79,6 +79,8 @@ export function Workspace() {
 
   const lab = useLab(labId);
   const session = useSession(search.s);
+  // Shares the questions panel's cache (header points).
+  const questions = useQuestions(search.s, !!lab.data?.spec.questions?.length);
   const start = useStartSession(labId);
   const validate = useValidate(search.s);
   const reveal = useRevealHint(search.s);
@@ -282,13 +284,14 @@ export function Workspace() {
   const envReady = !!s && !ended && provisioning === 0 && (s.phase === undefined || s.phase === 'ready' || s.phase === 'grading');
   const gradingNote = lastResult?.grading && lastResult.grading.state !== 'complete' ? lastResult.grading : undefined;
   const passedCount = s?.results.filter((r) => r.status === 'pass').length ?? 0;
+  const hasChecks = l.spec.checks.length > 0;
   const done = s?.status === 'passed';
   const observers = (s?.notices ?? []).filter((n) => n.kind === 'observed' && n.active !== false);
   const messages = (s?.notices ?? []).filter((n) => n.kind !== 'observed' && !dismissedNotices.has(n.id));
 
   const taskPanel = (
     <Panel id="task" panelRef={taskRef} collapsible collapsedSize="0%" minSize="18%" defaultSize="28%" maxSize="45%" onResize={onTaskResize} className="ws-task-panel">
-      <TaskPanel lab={l} session={s} validating={validate.isPending} onRevealHint={(i) => reveal.mutate(i)} revealing={reveal.isPending} />
+      <TaskPanel lab={l} session={s} validating={validate.isPending} onRevealHint={(i) => reveal.mutate(i)} revealing={reveal.isPending} ready={envReady} />
     </Panel>
   );
 
@@ -334,18 +337,27 @@ export function Workspace() {
               <span className="ws-stat tnum" title="Score">
                 <span className="subtle">score</span> {s.score}
               </span>
-              <span className="ws-stat tnum" title="Checks passing">
-                <span className="subtle">checks</span> {passedCount}/{l.spec.checks.length}
-              </span>
+              {hasChecks && (
+                <span className="ws-stat tnum" title="Checks passing">
+                  <span className="subtle">checks</span> {passedCount}/{l.spec.checks.length}
+                </span>
+              )}
+              {questions.data && (
+                <span className="ws-stat tnum" title="Points from questions">
+                  <span className="subtle">points</span> {questions.data.earned}/{questions.data.possible}
+                </span>
+              )}
               <Timer startedAt={s.startedAt} deadlineMinutes={s.deadlineMinutes} />
               <span className="vdivider" style={{ height: 18, margin: '0 4px' }} />
             </>
           )}
-          <Tooltip content="Validate all checks" shortcut="mod+enter">
-            <Button variant="primary" size="sm" icon={<Play size={13} />} loading={validate.isPending} disabled={!envReady} onClick={runValidate}>
-              Validate
-            </Button>
-          </Tooltip>
+          {hasChecks && (
+            <Tooltip content="Validate all checks" shortcut="mod+enter">
+              <Button variant="primary" size="sm" icon={<Play size={13} />} loading={validate.isPending} disabled={!envReady} onClick={runValidate}>
+                Validate
+              </Button>
+            </Tooltip>
+          )}
           {isRealApi && s && !ended && (
             <Tooltip content="End the lab and remove its environment">
               <Button variant="ghost" size="sm" icon={<Power size={13} />} loading={end.isPending} onClick={endLab}>
