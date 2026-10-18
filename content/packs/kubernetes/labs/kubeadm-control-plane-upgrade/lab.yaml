@@ -67,15 +67,14 @@ spec:
         set -e
         apt-mark hold kubeadm kubelet kubectl
         mkdir -p /var/lib/cloudtrain /opt/cloudtrain/bin
-        # Change-window policy: package installs must not restart the kubelet on
-        # their own; the learner restarts it explicitly (otherwise the kubelet
-        # package's postinst restarts it and "forgot to restart" cannot happen).
-        cat > /usr/sbin/policy-rc.d <<'SH'
-        #!/bin/sh
-        [ "$1" = kubelet ] && exit 101
-        exit 0
-        SH
-        chmod 0755 /usr/sbin/policy-rc.d
+        # Change-window policy: package installs must not restart services on
+        # their own (Ubuntu's needrestart would restart the kubelet right after
+        # the package upgrade); the learner restarts the kubelet explicitly.
+        # Without this "forgot to restart the kubelet" cannot happen.
+        mkdir -p /etc/needrestart/conf.d
+        cat > /etc/needrestart/conf.d/cloudtrain-window.conf <<'CONF'
+        $nrconf{restart} = 'l';
+        CONF
         rm -f /var/lib/cloudtrain/cordoned-at
         # Durable cordon evidence for was-cordoned (Events expire after the
         # apiserver's --event-ttl). The watcher polls the node and records the
@@ -141,7 +140,7 @@ spec:
     - on: qm-ledger/ledger-cp-1
       run: |
         systemctl disable --now cloudtrain-cordon-watch.service 2>/dev/null || true
-        rm -f /usr/sbin/policy-rc.d /etc/systemd/system/cloudtrain-cordon-watch.service /opt/cloudtrain/bin/cordon-watch /var/lib/cloudtrain/cordoned-at
+        rm -f /etc/needrestart/conf.d/cloudtrain-window.conf /etc/systemd/system/cloudtrain-cordon-watch.service /opt/cloudtrain/bin/cordon-watch /var/lib/cloudtrain/cordoned-at
         systemctl daemon-reload
   checks:
     - id: context
